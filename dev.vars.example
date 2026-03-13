@@ -1,1 +1,5 @@
 AUTH_TOKEN=my-secret-token
+OANDA_API_KEY=abcdefg
+OANDA_ACCOUNT_ID=1234
+# if true, live account, if missing or false, demo account
+OANDA_LIVE=false

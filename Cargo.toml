@@ -3,7 +3,11 @@ name = "trade-control-web-hook"
 version = "0.1.0"
 edition = "2024"
 
+[lib]
+crate-type = ["cdylib", "rlib"]
+
 [dependencies]
+oanda-client = { version = "0.1.4", path = "../oanda-client" }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_yaml = "0.9.34"
 worker = "0.7.5"
