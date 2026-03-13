@@ -7,7 +7,7 @@ edition = "2024"
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-oanda-client = { version = "0.1.4", path = "../oanda-client" }
+oanda-client = { version = "0.1.4", path = "../oanda-client", default-features = false, features = ["wasm_js"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_yaml = "0.9.34"
 worker = "0.7.5"

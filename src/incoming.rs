@@ -20,6 +20,7 @@ pub struct Authenticated {
 }
 
 #[derive(Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Action {
     /// Close all open positions
     Close,
