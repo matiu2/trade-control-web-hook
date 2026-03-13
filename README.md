@@ -1,41 +1,52 @@
-# Cloud flare worker
+# Trade Control Web Hook
 
-Allows control of ongoing oanda trades from trading view web hooks.
+Cloudflare Worker that receives TradingView alerts and controls open OANDA trades.
 
-Initially, it'll just allow me to close all positions on an instrument.
+Currently supports closing all positions for an instrument.
 
-Use `worker-build` for building. (Builds to wasm to be a cloudflare worker).
-use `cargo test` for a native test
+## Payload format
+
+Send a POST request with a YAML body:
+
+```yaml
+token: <your AUTH_TOKEN>
+instrument: EUR_USD
+action: close
+```
+
+Use the OANDA instrument name (e.g. `EUR_USD`, `GBP_HKD`, `SPX500_USD`). In TradingView alerts, `{{ticker}}` works for forex pairs but for indices you should hardcode the OANDA name.
 
 ## Test locally
 
 ```sh
 cp dev.vars.example .dev.vars
-{edit .dev.vars}
+# edit .dev.vars with your secrets
 wrangler dev
 ```
 
-## First deploy
+Then send a test request:
 
-```shell
-$ wrangler secret put AUTH_TOKEN
-
-
- ⛅️ wrangler 4.72.0
-───────────────────
-Attempting to login via OAuth...
-Opening a link in your default browser: ...
-Successfully logged in.
-✔ Enter a secret value: … ***
-🌀 Creating the secret for the Worker "phone-web-hook" 
-✔ There doesn't seem to be a Worker called "phone-web-hook". Do you want to create a new Worker with that name and add secrets to it? … yes
-🌀 Creating new Worker "phone-web-hook"...
-✨ Success! Uploaded secret SECRET_TOKEN
+```sh
+http POST localhost:8787 Content-Type:text/plain --raw 'token: <AUTH_TOKEN>
+instrument: EUR_USD
+action: close'
 ```
 
-*repeat for all secrets in `dev.vars`*
+## Deploy
 
-## Subsequent deploys
+### First deploy — push all secrets
+
+```sh
+wrangler secret put AUTH_TOKEN
+wrangler secret put OANDA_API_KEY
+wrangler secret put OANDA_ACCOUNT_ID
+wrangler secret put OANDA_LIVE
+wrangler deploy
+```
+
+Set `OANDA_LIVE` to `true` for live trading, `false` for practice.
+
+### Subsequent deploys
 
 ```sh
 wrangler deploy
