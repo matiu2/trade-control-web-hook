@@ -3,10 +3,12 @@
 
 use color_eyre::eyre::{Result, eyre};
 
+mod control;
 mod interactive;
 mod prompts;
 
 pub use crate::crypto::{KEY_LEN, NONCE_LEN};
+pub use control::{build_status_intent, build_unlock_intent, wrap_in_envelope};
 pub use interactive::fill_missing_fields;
 
 /// Generate a fresh 32-byte key as 64 hex chars, using the OS RNG.
@@ -32,6 +34,20 @@ pub fn build_yaml_template(blob: &str) -> String {
          low: {{{{low}}}}\n\
          time: \"{{{{time}}}}\"\n\
          payload: \"{blob}\"\n"
+    )
+}
+
+/// Build the YAML body for a *control* envelope (status / unlock) that the
+/// CLI POSTs directly to the worker. The shell fields are filled with
+/// concrete zeros plus a real timestamp — TradingView is not in the loop.
+pub fn build_yaml_control_body(blob: &str, now: chrono::DateTime<chrono::Utc>) -> String {
+    format!(
+        "close: 0\n\
+         high: 0\n\
+         low: 0\n\
+         time: \"{}\"\n\
+         payload: \"{blob}\"\n",
+        now.to_rfc3339()
     )
 }
 
