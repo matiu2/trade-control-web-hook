@@ -4,13 +4,17 @@ Cloudflare Worker that receives TradingView alerts and controls OANDA trades,
 with the trade intent encrypted under a shared key so a leaked webhook URL
 can't be weaponised by anyone who doesn't also have the key.
 
-Three actions are supported:
+Five actions are supported:
 
 - `enter` — open a market or stop-entry order with SL/TP, after passing the risk gate.
 - `close` — close all positions for the instrument.
 - `invalidate` — set a per-instrument cooldown (default 12 h) and cancel any pending
   orders. Use this when your setup is no longer valid (price drifted out of the
   expected range) and you want to be sure no entry fires while you sleep.
+- `status` — read-only snapshot of active cooldowns and recent seen ids
+  (replay-protection state). Curl-friendly debugging.
+- `unlock` — clear the cooldown for one instrument. Recovery for an
+  `invalidate` you didn't mean to send.
 
 ## How it works
 
@@ -118,6 +122,45 @@ missing field instead of prompting:
   --template fully-specified.yaml \
   --non-interactive
 ```
+
+### Querying state and unlocking cooldowns
+
+Two more subcommands talk to the *running* worker, using the same encryption
+key as auth. Set `TRADE_CONTROL_ENDPOINT` once to skip retyping `--endpoint`:
+
+```sh
+export TRADE_CONTROL_ENDPOINT=https://trade-control.<account>.workers.dev
+
+# Dump active cooldowns + recent seen ids as YAML.
+./target/release/encrypt-payload status \
+  --key-file ~/.config/trade-control/key.hex
+
+# Clear a cooldown set by an `invalidate` you didn't mean to send.
+./target/release/encrypt-payload unlock EUR_USD \
+  --key-file ~/.config/trade-control/key.hex
+```
+
+`status` returns:
+
+```yaml
+now: "2026-05-14T03:21:00Z"
+cooldowns:
+  - instrument: EUR_USD
+    expires_at: "2026-05-14T15:21:00Z"
+recent_seen:
+  - id: pin-bar-eurusd-2026-05-13-a
+    expires_at: "2026-05-14T02:00:00Z"
+```
+
+`unlock` returns:
+
+```yaml
+unlocked: EUR_USD
+was_cooled_down: true
+```
+
+Both subcommands use the same replay-protection mechanism as the other
+actions — re-running the same `unlock` won't double-fire.
 
 ## Secrets
 

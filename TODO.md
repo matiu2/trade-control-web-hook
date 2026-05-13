@@ -2,7 +2,13 @@
 
 ## Done
 
-- **YAML wire format + interactive template-driven encoder** — landed. 58 lib tests passing, clippy clean, non-interactive smoke test passes. Interactive prompts wired through `dialoguer` (gated behind the `cli` feature).
+- **YAML wire format + interactive template-driven encoder** — landed. Interactive prompts wired through `dialoguer` (gated behind the `cli` feature).
+- **Queryable state endpoint + CLI state-management client** — landed.
+  `status` and `unlock` actions go through the same encrypted envelope as
+  enter/close/invalidate. KV maintains `index:cooldowns` and `index:seen`
+  JSON arrays alongside the TTL keys so `status` can list them. CLI gains
+  `status` and `unlock <INSTRUMENT>` subcommands that POST to the deployed
+  worker via reqwest::blocking. 68 lib tests pass.
 
 ## Phase 2 ideas (parked — captured for later, not building yet)
 
@@ -22,17 +28,11 @@ Implications for the encrypted intent format:
 
 This is significantly more state than what the MVP carries; design it after the simple pin-bar flow is proven in live use.
 
-### Queryable state (curl-friendly, no HTML)
+When this lands, the CLI gains a third subcommand `list-setups` — show all setup state machines and their current state. Reuses the existing `status` / `unlock` plumbing.
 
-Add a `GET /state` (or similar) that dumps the current `StateStore` contents as JSON or YAML. Plaintext-curl-able, but authed by the same `ENCRYPTION_KEY` (probably as a query param or header signed with the key). Useful for:
-- Confirming a cooldown is in place from another machine.
-- Debugging "why didn't my alert fire" without checking CF logs.
+### Carried-over blocker
 
-### CLI as state-management client
-
-Extend `encrypt-payload` (or rename it `trade-control-cli`) with subcommands that talk to the running webhook:
-- `status` — dump active cooldowns + recent `seen` ids.
-- `unlock <instrument>` — clear a cooldown manually. Useful when a setup was invalidated by mistake and the user wants to re-arm.
-- `list-setups` — once the multi-stage workflow lands, show all setup state machines and their current state.
-
-Auth: the CLI already has the encryption key file; reuse it. The webhook accepts a signed control envelope (the encrypted-intent format with a new `Action::Unlock` / `Action::Status`).
+`cargo build --target wasm32-unknown-unknown --lib` currently fails inside
+`oanda-client` with a `BidAskDataSource: Send` regression — pre-existing,
+not introduced by anything in this repo. Needs an upstream fix in
+oanda-client before `wrangler deploy` will work again.
