@@ -8,3 +8,9 @@ command = "cargo install -q worker-build && worker-build --release"
 
 [vars]
 
+# Bind a KV namespace named TRADE_CONTROL_KV before deploying. Create with:
+#   wrangler kv:namespace create TRADE_CONTROL_KV
+# and replace the id below with the one wrangler prints.
+[[kv_namespaces]]
+binding = "TRADE_CONTROL_KV"
+id = "REPLACE_ME"
