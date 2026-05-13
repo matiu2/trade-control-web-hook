@@ -18,6 +18,14 @@ use crate::oanda::{
     place_entry,
 };
 use crate::state::{KvStateStore, StateStore};
+use serde::Serialize;
+
+/// Response body for the `unlock` action. Serialised as YAML.
+#[derive(Serialize)]
+struct UnlockResponse {
+    unlocked: String,
+    was_cooled_down: bool,
+}
 
 const ENCRYPTION_KEY_SECRET: &str = "ENCRYPTION_KEY";
 const MAX_RISK_PCT_PER_TRADE_SECRET: &str = "MAX_RISK_PCT_PER_TRADE";
@@ -70,6 +78,14 @@ pub async fn main(mut req: Request, env: Env, _ctx: Context) -> Result<Response>
             console_error!("KV is_seen: {err}");
             return Response::error("state error", 500);
         }
+    }
+
+    // Status and Unlock are control actions that don't touch OANDA; handle
+    // them up front so we don't waste an OANDA login on them.
+    match verified.intent.action {
+        Action::Status => return handle_status(&store, &verified, now).await,
+        Action::Unlock => return handle_unlock(&store, &verified, now).await,
+        _ => {}
     }
 
     let account_id = match get_secret(OANDA_ACCOUNT_ID, &env) {
@@ -154,8 +170,8 @@ pub async fn main(mut req: Request, env: Env, _ctx: Context) -> Result<Response>
             Ok(())
         }
         Action::Status | Action::Unlock => {
-            // Wired in a separate commit; see plan step 4.
-            return Response::error("not implemented", 501);
+            // Handled in an early-return above. Unreachable here.
+            unreachable!("status/unlock handled before OANDA dispatch")
         }
     };
 
@@ -172,6 +188,65 @@ pub async fn main(mut req: Request, env: Env, _ctx: Context) -> Result<Response>
         }
         Err(_) => Response::error("action failed", 502),
     }
+}
+
+/// Handle the `status` action: dump cooldown + recent-seen indexes as YAML.
+async fn handle_status(
+    store: &KvStateStore,
+    verified: &crate::incoming::Verified,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<Response> {
+    let snap = match store.snapshot().await {
+        Ok(s) => s,
+        Err(err) => {
+            console_error!("KV snapshot: {err}");
+            return Response::error("state error", 500);
+        }
+    };
+    let body = match serde_yaml::to_string(&snap) {
+        Ok(s) => s,
+        Err(err) => {
+            console_error!("snapshot serialise: {err}");
+            return Response::error("internal error", 500);
+        }
+    };
+    let ttl = incoming::replay_ttl_seconds(verified.intent.not_after, now);
+    if let Err(err) = store.mark_seen(&verified.intent.id, ttl).await {
+        console_error!("KV mark_seen after status: {err}");
+    }
+    Response::ok(body)
+}
+
+/// Handle the `unlock` action: clear the cooldown for `verified.intent.instrument`.
+async fn handle_unlock(
+    store: &KvStateStore,
+    verified: &crate::incoming::Verified,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<Response> {
+    let instrument = &verified.intent.instrument;
+    let was = match store.clear_cooldown(instrument).await {
+        Ok(b) => b,
+        Err(err) => {
+            console_error!("KV clear_cooldown: {err}");
+            return Response::error("state error", 500);
+        }
+    };
+    console_log!("unlock {instrument} was_cooled_down={was}");
+    let body = match serde_yaml::to_string(&UnlockResponse {
+        unlocked: instrument.clone(),
+        was_cooled_down: was,
+    }) {
+        Ok(s) => s,
+        Err(err) => {
+            console_error!("unlock serialise: {err}");
+            return Response::error("internal error", 500);
+        }
+    };
+    let ttl = incoming::replay_ttl_seconds(verified.intent.not_after, now);
+    if let Err(err) = store.mark_seen(&verified.intent.id, ttl).await {
+        console_error!("KV mark_seen after unlock: {err}");
+    }
+    Response::ok(body)
 }
 
 fn get_secret(name: &str, env: &Env) -> Option<String> {
