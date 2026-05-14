@@ -35,6 +35,7 @@ pub fn build_status_intent(now: DateTime<Utc>, suffix: &str) -> Intent {
         take_profit: None,
         risk_pct: None,
         cooldown_hours: None,
+        min_r: None,
     }
 }
 
@@ -56,6 +57,7 @@ pub fn build_unlock_intent(instrument: &str, now: DateTime<Utc>, suffix: &str) -
         take_profit: None,
         risk_pct: None,
         cooldown_hours: None,
+        min_r: None,
     }
 }
 

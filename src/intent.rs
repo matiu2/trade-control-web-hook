@@ -7,6 +7,8 @@ use serde::{Deserialize, Serialize};
 
 mod resolution;
 
+#[cfg(feature = "cli")]
+pub use resolution::MIN_R_FLOOR;
 pub use resolution::{Resolved, ResolvedEntry};
 
 /// Plaintext outer YAML — the part TradingView substitutes `{{...}}` into.
@@ -56,6 +58,12 @@ pub struct Intent {
     /// Required for `invalidate`.
     #[serde(default)]
     pub cooldown_hours: Option<u32>,
+    /// Minimum acceptable R-multiple — server rejects entries whose
+    /// implicit `(TP - entry) / (entry - SL)` falls below this. Defaults
+    /// to 1.0 when omitted. Overrides must be `>= 1.0`; below-floor values
+    /// are rejected both at the encoder and on the server.
+    #[serde(default)]
+    pub min_r: Option<f64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]

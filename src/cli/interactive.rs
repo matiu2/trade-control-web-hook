@@ -34,8 +34,19 @@ pub fn fill_missing_fields(template: &mut Value, non_interactive: bool) -> Resul
     // Final validation: deserialize fully into `Intent` to surface any
     // structural mistakes (bad enum variants, wrong value types) before we
     // encrypt and the worker rejects it.
-    let _intent: Intent = serde_yaml::from_value(template.clone())
+    let intent: Intent = serde_yaml::from_value(template.clone())
         .map_err(|e| eyre!("template doesn't parse as a valid Intent: {e}"))?;
+
+    // Fail fast on a below-floor `min_r`. The server also enforces this; we
+    // duplicate it here so typos don't even get encrypted.
+    if let Some(min_r) = intent.min_r
+        && min_r < crate::intent::MIN_R_FLOOR
+    {
+        return Err(eyre!(
+            "min_r={min_r} is below the hard floor of {} (server-enforced)",
+            crate::intent::MIN_R_FLOOR
+        ));
+    }
 
     Ok(())
 }
@@ -243,6 +254,85 @@ mod tests {
         // Round-trips into a real Intent.
         let intent: Intent = serde_yaml::from_value(template).unwrap();
         assert_eq!(intent.action, Action::Enter);
+    }
+
+    #[test]
+    fn non_interactive_rejects_min_r_below_floor() {
+        let yaml = "
+            v: 1
+            id: abc
+            not_after: \"2026-05-13T20:00:00Z\"
+            action: enter
+            instrument: EUR_USD
+            direction: long
+            entry: { type: market }
+            stop_loss: { from: low, offset_pips: -2 }
+            take_profit: { from: close, offset_r: 2.0 }
+            risk_pct: 0.5
+            min_r: 0.5
+        ";
+        let mut template: Value = serde_yaml::from_str(yaml).unwrap();
+        let err = fill_missing_fields(&mut template, true).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("min_r"), "got: {msg}");
+        assert!(msg.contains("floor"), "got: {msg}");
+    }
+
+    #[test]
+    fn non_interactive_rejects_min_r_zero() {
+        let yaml = "
+            v: 1
+            id: abc
+            not_after: \"2026-05-13T20:00:00Z\"
+            action: enter
+            instrument: EUR_USD
+            direction: long
+            entry: { type: market }
+            stop_loss: { from: low, offset_pips: -2 }
+            take_profit: { from: close, offset_r: 2.0 }
+            risk_pct: 0.5
+            min_r: 0
+        ";
+        let mut template: Value = serde_yaml::from_str(yaml).unwrap();
+        assert!(fill_missing_fields(&mut template, true).is_err());
+    }
+
+    #[test]
+    fn non_interactive_accepts_min_r_one() {
+        let yaml = "
+            v: 1
+            id: abc
+            not_after: \"2026-05-13T20:00:00Z\"
+            action: enter
+            instrument: EUR_USD
+            direction: long
+            entry: { type: market }
+            stop_loss: { from: low, offset_pips: -2 }
+            take_profit: { from: close, offset_r: 2.0 }
+            risk_pct: 0.5
+            min_r: 1.0
+        ";
+        let mut template: Value = serde_yaml::from_str(yaml).unwrap();
+        assert!(fill_missing_fields(&mut template, true).is_ok());
+    }
+
+    #[test]
+    fn non_interactive_accepts_min_r_above_floor() {
+        let yaml = "
+            v: 1
+            id: abc
+            not_after: \"2026-05-13T20:00:00Z\"
+            action: enter
+            instrument: EUR_USD
+            direction: long
+            entry: { type: market }
+            stop_loss: { from: low, offset_pips: -2 }
+            take_profit: { from: close, offset_r: 2.0 }
+            risk_pct: 0.5
+            min_r: 1.5
+        ";
+        let mut template: Value = serde_yaml::from_str(yaml).unwrap();
+        assert!(fill_missing_fields(&mut template, true).is_ok());
     }
 
     #[test]

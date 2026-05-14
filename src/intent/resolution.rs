@@ -36,6 +36,11 @@ pub struct Resolved {
     pub risk_pct: f64,
 }
 
+/// Hard server-side floor on `min_r`. Overrides below this are rejected
+/// at both the encoder and the server. Mirrored by `validate_min_r` in the
+/// CLI so typos fail before encryption.
+pub const MIN_R_FLOOR: f64 = 1.0;
+
 #[derive(Debug)]
 pub enum ResolveError {
     /// Field required for `enter` is missing.
@@ -44,6 +49,10 @@ pub enum ResolveError {
     InvalidGeometry,
     /// Action is not `enter`.
     NotAnEntry,
+    /// `min_r` override is below the hard floor (1.0).
+    MinRBelowFloor { requested: f64 },
+    /// Implicit R is below `min_r` (default 1.0 if not overridden).
+    BelowMinR { actual: f64, min: f64 },
 }
 
 impl core::fmt::Display for ResolveError {
@@ -52,6 +61,14 @@ impl core::fmt::Display for ResolveError {
             Self::MissingField(name) => write!(f, "missing field for entry: {name}"),
             Self::InvalidGeometry => f.write_str("stop/entry geometry inconsistent with direction"),
             Self::NotAnEntry => f.write_str("intent is not an entry action"),
+            Self::MinRBelowFloor { requested } => write!(
+                f,
+                "min_r={requested} is below the hard floor of {MIN_R_FLOOR}"
+            ),
+            Self::BelowMinR { actual, min } => write!(
+                f,
+                "trade R={actual:.3} is below the required minimum of {min:.3}"
+            ),
         }
     }
 }
@@ -172,6 +189,25 @@ impl Resolved {
             _ => {}
         }
 
+        // Server-enforced floor: an `min_r` override cannot weaken the
+        // default 1.0R minimum. Defense in depth against a custom encryptor
+        // or stale CLI.
+        let min_r = intent.min_r.unwrap_or(MIN_R_FLOOR);
+        if min_r < MIN_R_FLOOR {
+            return Err(ResolveError::MinRBelowFloor { requested: min_r });
+        }
+        // Implicit R = (TP - entry) / (entry - SL), absolute values for the
+        // short case (direction-agnostic — geometry already checked above).
+        let r_distance = (reference_price - stop_loss).abs();
+        let tp_distance = (take_profit - reference_price).abs();
+        let actual_r = tp_distance / r_distance;
+        if actual_r < min_r {
+            return Err(ResolveError::BelowMinR {
+                actual: actual_r,
+                min: min_r,
+            });
+        }
+
         Ok(Self {
             id: intent.id.clone(),
             not_after: intent.not_after,
@@ -241,6 +277,7 @@ mod tests {
             }),
             risk_pct: Some(0.5),
             cooldown_hours: None,
+            min_r: None,
         }
     }
 
@@ -379,6 +416,102 @@ mod tests {
         assert!(matches!(
             Resolved::from_intent(&intent, &shell(), 0.0001),
             Err(ResolveError::MissingField("risk_pct"))
+        ));
+    }
+
+    #[test]
+    fn default_min_r_passes_when_r_above_one() {
+        // R = 2.0 trade (R-multiple TP at 2.0), no min_r override → passes.
+        let r = Resolved::from_intent(&long_market_intent(), &shell(), 0.0001).unwrap();
+        // entry=1.10, SL=1.0978, TP=1.1044 → R = 22/22 = 2.0
+        let actual = (r.take_profit - 1.10) / (1.10 - r.stop_loss);
+        assert!((actual - 2.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn default_min_r_rejects_when_below_one() {
+        // Anchored TP only 1 pip above entry but SL 22 pips below → 0.045R.
+        let mut intent = long_market_intent();
+        intent.take_profit = Some(TakeProfit::Anchored(PriceRef {
+            from: PriceAnchor::Close,
+            offset_pips: 1.0,
+        }));
+        match Resolved::from_intent(&intent, &shell(), 0.0001) {
+            Err(ResolveError::BelowMinR { actual, min }) => {
+                assert!((min - 1.0).abs() < 1e-9);
+                assert!(actual < 1.0, "actual R was {actual}");
+            }
+            other => panic!("expected BelowMinR, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn min_r_override_above_floor_enforced() {
+        // R = 2.0 trade but we demand 3.0 → rejected.
+        let mut intent = long_market_intent();
+        intent.min_r = Some(3.0);
+        assert!(matches!(
+            Resolved::from_intent(&intent, &shell(), 0.0001),
+            Err(ResolveError::BelowMinR { .. })
+        ));
+    }
+
+    #[test]
+    fn min_r_override_above_floor_passes_when_met() {
+        let mut intent = long_market_intent();
+        intent.min_r = Some(2.0); // exactly meets the actual R
+        assert!(Resolved::from_intent(&intent, &shell(), 0.0001).is_ok());
+    }
+
+    #[test]
+    fn min_r_below_floor_rejected_at_server() {
+        // Defense in depth: even if encoder somehow allowed it.
+        let mut intent = long_market_intent();
+        intent.min_r = Some(0.5);
+        match Resolved::from_intent(&intent, &shell(), 0.0001) {
+            Err(ResolveError::MinRBelowFloor { requested }) => {
+                assert!((requested - 0.5).abs() < 1e-9);
+            }
+            other => panic!("expected MinRBelowFloor, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn min_r_zero_rejected_at_server() {
+        let mut intent = long_market_intent();
+        intent.min_r = Some(0.0);
+        assert!(matches!(
+            Resolved::from_intent(&intent, &shell(), 0.0001),
+            Err(ResolveError::MinRBelowFloor { .. })
+        ));
+    }
+
+    #[test]
+    fn min_r_negative_rejected_at_server() {
+        let mut intent = long_market_intent();
+        intent.min_r = Some(-1.0);
+        assert!(matches!(
+            Resolved::from_intent(&intent, &shell(), 0.0001),
+            Err(ResolveError::MinRBelowFloor { .. })
+        ));
+    }
+
+    #[test]
+    fn short_default_min_r_rejects_when_below_one() {
+        let mut intent = long_market_intent();
+        intent.direction = Some(Direction::Short);
+        intent.stop_loss = Some(PriceRef {
+            from: PriceAnchor::High,
+            offset_pips: 10.0,
+        });
+        // Anchored TP 1 pip below entry — way under 1R for a 30-pip SL.
+        intent.take_profit = Some(TakeProfit::Anchored(PriceRef {
+            from: PriceAnchor::Close,
+            offset_pips: -1.0,
+        }));
+        assert!(matches!(
+            Resolved::from_intent(&intent, &shell(), 0.0001),
+            Err(ResolveError::BelowMinR { .. })
         ));
     }
 

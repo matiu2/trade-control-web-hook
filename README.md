@@ -51,6 +51,12 @@ entry: { type: market }                # or { type: stop, from: high, offset_pip
 stop_loss:   { from: low,  offset_pips: -2 }
 take_profit: { from: close, offset_r: 2.0 }    # 2R take-profit
 risk_pct: 0.5                          # % of NAV; capped server-side
+min_r: 1.0                             # optional. Defaults to 1.0. Worker
+                                       # rejects if (TP-entry)/(entry-SL)
+                                       # falls below this. Overrides must
+                                       # be >= 1.0 — values below the floor
+                                       # are rejected both at the encoder
+                                       # and on the server.
 cooldown_hours: 12                     # only used by "invalidate"
 ```
 
