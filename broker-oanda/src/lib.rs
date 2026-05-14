@@ -8,10 +8,11 @@
 mod oanda;
 mod risk;
 
-pub use oanda::{EntryError, EntryRequest, OANDA_ACCOUNT_ID};
+pub use oanda::OANDA_ACCOUNT_ID;
 
 use oanda::{cancel_pending_for_instrument, close_positions, login as login_client, place_entry};
 use oanda_client::OandaClient;
+use trade_control_core::broker::{Broker, EntryError, EntryRequest};
 use worker::{Env, console_error};
 
 /// Authenticated OANDA broker handle. Holds the API client and the account id
@@ -21,9 +22,8 @@ pub struct OandaBroker {
     account_id: String,
 }
 
-impl OandaBroker {
-    /// Risk-gate + place an entry order. Returns the OANDA order id on success.
-    pub async fn place_entry(
+impl Broker for OandaBroker {
+    async fn place_entry(
         &self,
         max_risk_pct: f64,
         max_open_positions: u32,
@@ -39,13 +39,11 @@ impl OandaBroker {
         .await
     }
 
-    /// Close all positions for `instrument`. Returns true if anything closed.
-    pub async fn close_positions(&self, instrument: &str) -> bool {
+    async fn close_positions(&self, instrument: &str) -> bool {
         close_positions(&self.client, &self.account_id, instrument).await
     }
 
-    /// Cancel pending orders on `instrument`. Returns the number cancelled.
-    pub async fn cancel_pending_for_instrument(&self, instrument: &str) -> usize {
+    async fn cancel_pending_for_instrument(&self, instrument: &str) -> usize {
         cancel_pending_for_instrument(&self.client, &self.account_id, instrument).await
     }
 }

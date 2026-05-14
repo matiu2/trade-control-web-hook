@@ -5,6 +5,7 @@
 //! Worker binary) pulls these in and wires them up to the CF-specific bits
 //! (KV state store, `#[event(fetch)]` entry point, broker dispatch).
 
+pub mod broker;
 pub mod crypto;
 pub mod incoming;
 pub mod intent;

@@ -7,8 +7,9 @@ use chrono::Utc;
 use worker::{Context, Env, Request, Response, Result, console_error, console_log, event};
 
 use crate::state::KvStateStore;
-use broker_oanda::{EntryRequest, login};
+use broker_oanda::login;
 use serde::Serialize;
+use trade_control_core::broker::{Broker, EntryRequest};
 use trade_control_core::crypto;
 use trade_control_core::incoming::{self, parse_and_verify};
 use trade_control_core::intent::{Action, Resolved};

@@ -10,6 +10,7 @@ use worker::Env;
 use worker::console_error;
 
 use crate::risk;
+use trade_control_core::broker::{EntryError, EntryRequest};
 use trade_control_core::intent::{Direction, ResolvedEntry};
 
 const OANDA_API_KEY: &str = "OANDA_API_KEY";
@@ -77,43 +78,6 @@ pub async fn cancel_pending_for_instrument(
         }
     }
     cancelled
-}
-
-#[derive(Debug)]
-pub enum EntryError {
-    AccountFetch,
-    EquityParse,
-    RiskCapExceeded { requested: f64, cap: f64 },
-    OpenPositionsCapExceeded,
-    UnitsBelowMinimum,
-    OrderRejected,
-}
-
-impl core::fmt::Display for EntryError {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self {
-            Self::AccountFetch => f.write_str("failed to fetch account"),
-            Self::EquityParse => f.write_str("failed to parse account equity"),
-            Self::RiskCapExceeded { requested, cap } => {
-                write!(f, "risk {requested}% > cap {cap}%")
-            }
-            Self::OpenPositionsCapExceeded => f.write_str("open positions cap exceeded"),
-            Self::UnitsBelowMinimum => f.write_str("computed units below minimum"),
-            Self::OrderRejected => f.write_str("OANDA rejected the order"),
-        }
-    }
-}
-
-impl std::error::Error for EntryError {}
-
-/// Resolved input for `place_entry`. Holds only what the OANDA call needs.
-pub struct EntryRequest<'a> {
-    pub instrument: &'a str,
-    pub direction: Direction,
-    pub entry: ResolvedEntry,
-    pub stop_loss: f64,
-    pub take_profit: f64,
-    pub risk_pct: f64,
 }
 
 /// Risk-gate + place the entry order. Returns the OANDA order id on success.
