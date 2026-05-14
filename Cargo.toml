@@ -1,3 +1,7 @@
+[workspace]
+resolver = "3"
+members = []
+
 [package]
 name = "trade-control-web-hook"
 version = "0.1.0"
