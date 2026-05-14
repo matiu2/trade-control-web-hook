@@ -43,7 +43,10 @@ pub async fn main(mut req: Request, env: Env, _ctx: Context) -> Result<Response>
 
     let key_hex = match get_secret(ENCRYPTION_KEY_SECRET, &env) {
         Some(s) => s,
-        None => return Response::error("server misconfigured", 500),
+        None => {
+            console_error!("missing required secret: {ENCRYPTION_KEY_SECRET}");
+            return Response::error("server misconfigured", 500);
+        }
     };
     let key = match crypto::parse_key_hex(&key_hex) {
         Ok(k) => k,
@@ -90,7 +93,10 @@ pub async fn main(mut req: Request, env: Env, _ctx: Context) -> Result<Response>
 
     let account_id = match get_secret(OANDA_ACCOUNT_ID, &env) {
         Some(s) => s,
-        None => return Response::error("server misconfigured", 500),
+        None => {
+            console_error!("missing required secret: {OANDA_ACCOUNT_ID}");
+            return Response::error("server misconfigured", 500);
+        }
     };
     let Some(client) = login(&env).await else {
         return Response::error("oanda login failed", 500);
@@ -100,7 +106,14 @@ pub async fn main(mut req: Request, env: Env, _ctx: Context) -> Result<Response>
         Action::Enter => {
             // Cooldown gate
             match store.is_cooled_down(&verified.intent.instrument).await {
-                Ok(true) => return Response::error("instrument cooled down", 423),
+                Ok(true) => {
+                    console_log!(
+                        "entry rejected: {} cooled down (id={})",
+                        verified.intent.instrument,
+                        verified.intent.id
+                    );
+                    return Response::error("instrument cooled down", 423);
+                }
                 Ok(false) => {}
                 Err(err) => {
                     console_error!("KV is_cooled_down: {err}");
@@ -249,11 +262,10 @@ async fn handle_unlock(
     Response::ok(body)
 }
 
+/// Read a secret. Returns `None` if the binding is absent or unreadable.
+/// Silent on absence — callers decide whether a miss is an error worth logging.
 fn get_secret(name: &str, env: &Env) -> Option<String> {
-    env.secret(name)
-        .map(|value| value.to_string())
-        .inspect_err(|err| console_error!("Error reading secret: {name}: {err:?}"))
-        .ok()
+    env.secret(name).map(|value| value.to_string()).ok()
 }
 
 /// Read a numeric secret, falling back to `default` if missing or unparsable.

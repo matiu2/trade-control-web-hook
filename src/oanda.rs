@@ -18,7 +18,13 @@ const OANDA_LIVE: &str = "OANDA_LIVE";
 
 /// Log in to oanda - if it can't it'll log the error and give you nothing
 pub async fn login(env: &Env) -> Option<OandaClient> {
-    let api_key = crate::get_secret(OANDA_API_KEY, env)?;
+    let api_key = match crate::get_secret(OANDA_API_KEY, env) {
+        Some(s) => s,
+        None => {
+            console_error!("missing required secret: {OANDA_API_KEY}");
+            return None;
+        }
+    };
     let live = crate::get_secret(OANDA_LIVE, env)
         .and_then(|s| (s.to_lowercase() == "true").then_some(true))
         .unwrap_or(false);
