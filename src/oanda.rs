@@ -2,7 +2,8 @@
 
 use oanda_client::OandaClient;
 use oanda_client::orders::{
-    OrderPositionFill, OrderType, StopLossDetails, StopOrder, TakeProfitDetails, TimeInForce,
+    LimitOrder, OrderPositionFill, OrderType, StopLossDetails, StopOrder, TakeProfitDetails,
+    TimeInForce,
 };
 use oanda_client::positions::ClosePositionResponse;
 use worker::Env;
@@ -142,6 +143,7 @@ pub async fn place_entry(
     let reference_price = match req.entry {
         ResolvedEntry::Market { reference_price } => reference_price,
         ResolvedEntry::Stop { trigger_price } => trigger_price,
+        ResolvedEntry::Limit { trigger_price } => trigger_price,
     };
 
     let units = risk::units_for_risk(equity, req.risk_pct, reference_price, req.stop_loss);
@@ -209,6 +211,30 @@ pub async fn place_entry(
                 .await
                 .map_err(|err| {
                     console_error!("place_stop_order: {err:?}");
+                    EntryError::OrderRejected
+                })?
+        }
+        (ResolvedEntry::Limit { trigger_price }, dir) => {
+            let signed_units = match dir {
+                Direction::Long => units.to_string(),
+                Direction::Short => format!("-{units}"),
+            };
+            let order = LimitOrder {
+                r#type: OrderType::Limit,
+                instrument: req.instrument.to_string(),
+                units: signed_units,
+                price: format_price(*trigger_price),
+                time_in_force: TimeInForce::Gtc,
+                position_fill: OrderPositionFill::Default,
+                take_profit_on_fill: Some(tp_details),
+                stop_loss_on_fill: Some(sl_details),
+                trailing_stop_loss_on_fill: None,
+            };
+            client
+                .place_limit_order(account_id, order)
+                .await
+                .map_err(|err| {
+                    console_error!("place_limit_order: {err:?}");
                     EntryError::OrderRejected
                 })?
         }

@@ -15,6 +15,8 @@ pub enum ResolvedEntry {
     Market { reference_price: f64 },
     /// Stop-entry pending order at `trigger_price`.
     Stop { trigger_price: f64 },
+    /// Limit-entry pending order at `trigger_price`.
+    Limit { trigger_price: f64 },
 }
 
 /// Fully-resolved trade intent, with all prices computed.
@@ -97,8 +99,41 @@ impl Resolved {
             ),
             EntrySpec::Stop { from, offset_pips } => {
                 let trigger = shell.anchor_price(*from) + offset_pips * pip_size;
+                // Stop sits on the *far* side of current price for the direction:
+                // long stops above close, short stops below.
+                match direction {
+                    Direction::Long if trigger <= shell.close => {
+                        return Err(ResolveError::InvalidGeometry);
+                    }
+                    Direction::Short if trigger >= shell.close => {
+                        return Err(ResolveError::InvalidGeometry);
+                    }
+                    _ => {}
+                }
                 (
                     ResolvedEntry::Stop {
+                        trigger_price: trigger,
+                    },
+                    trigger,
+                )
+            }
+            EntrySpec::Limit { from, offset_pips } => {
+                let trigger = shell.anchor_price(*from) + offset_pips * pip_size;
+                // Limit sits on the *near* side of current price for the direction:
+                // long limits below close, short limits above. If it's the wrong
+                // side, OANDA would fill instantly (turning the limit into a
+                // market order at a worse price) — reject as a typo.
+                match direction {
+                    Direction::Long if trigger >= shell.close => {
+                        return Err(ResolveError::InvalidGeometry);
+                    }
+                    Direction::Short if trigger <= shell.close => {
+                        return Err(ResolveError::InvalidGeometry);
+                    }
+                    _ => {}
+                }
+                (
+                    ResolvedEntry::Limit {
                         trigger_price: trigger,
                     },
                     trigger,
@@ -253,6 +288,75 @@ mod tests {
         // R is computed from the trigger, not the close.
         // SL = 1.0978; trigger = 1.1022; R = 0.0044; TP = 1.1022 + 2*0.0044 = 1.1110
         assert!((r.take_profit - 1.1110).abs() < 1e-9);
+    }
+
+    #[test]
+    fn long_limit_below_close_resolves() {
+        let mut intent = long_market_intent();
+        // Long limit at 1.0985 — below the 1.1000 close.
+        intent.entry = Some(EntrySpec::Limit {
+            from: PriceAnchor::Low,
+            offset_pips: 5.0,
+        });
+        let r = Resolved::from_intent(&intent, &shell(), 0.0001).unwrap();
+        match r.entry {
+            ResolvedEntry::Limit { trigger_price } => {
+                // 1.0980 + 5*0.0001 = 1.0985
+                assert!((trigger_price - 1.0985).abs() < 1e-9);
+            }
+            _ => panic!("expected limit entry"),
+        }
+    }
+
+    #[test]
+    fn long_limit_at_or_above_close_rejected() {
+        let mut intent = long_market_intent();
+        // Long limit at 1.1010 — above the 1.1000 close; would fill instantly.
+        intent.entry = Some(EntrySpec::Limit {
+            from: PriceAnchor::High,
+            offset_pips: -10.0,
+        });
+        assert!(matches!(
+            Resolved::from_intent(&intent, &shell(), 0.0001),
+            Err(ResolveError::InvalidGeometry)
+        ));
+    }
+
+    #[test]
+    fn short_limit_above_close_resolves() {
+        let mut intent = long_market_intent();
+        intent.direction = Some(Direction::Short);
+        intent.stop_loss = Some(PriceRef {
+            from: PriceAnchor::High,
+            offset_pips: 10.0,
+        });
+        // Short limit at 1.1015 — above the 1.1000 close.
+        intent.entry = Some(EntrySpec::Limit {
+            from: PriceAnchor::High,
+            offset_pips: -5.0,
+        });
+        let r = Resolved::from_intent(&intent, &shell(), 0.0001).unwrap();
+        match r.entry {
+            ResolvedEntry::Limit { trigger_price } => {
+                // 1.1020 - 5*0.0001 = 1.1015
+                assert!((trigger_price - 1.1015).abs() < 1e-9);
+            }
+            _ => panic!("expected limit entry"),
+        }
+    }
+
+    #[test]
+    fn long_stop_at_or_below_close_rejected() {
+        let mut intent = long_market_intent();
+        // Long stop at 1.0990 — below the 1.1000 close.
+        intent.entry = Some(EntrySpec::Stop {
+            from: PriceAnchor::Low,
+            offset_pips: 10.0,
+        });
+        assert!(matches!(
+            Resolved::from_intent(&intent, &shell(), 0.0001),
+            Err(ResolveError::InvalidGeometry)
+        ));
     }
 
     #[test]

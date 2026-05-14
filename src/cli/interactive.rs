@@ -133,7 +133,7 @@ fn prompt_direction(theme: &ColorfulTheme) -> Result<Value> {
 }
 
 fn prompt_entry(theme: &ColorfulTheme) -> Result<Value> {
-    let kinds = ["market", "stop"];
+    let kinds = ["market", "stop", "limit"];
     let idx = Select::with_theme(theme)
         .with_prompt("entry type")
         .items(kinds)
@@ -144,7 +144,7 @@ fn prompt_entry(theme: &ColorfulTheme) -> Result<Value> {
         Value::String("type".into()),
         Value::String(kinds[idx].into()),
     );
-    if kinds[idx] == "stop" {
+    if kinds[idx] != "market" {
         let anchor = prompt_anchor(theme, "entry trigger anchor")?;
         let offset = prompt_float(theme, "entry offset_pips (signed)", Some(0.0))?;
         map.insert(Value::String("from".into()), anchor);

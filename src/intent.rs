@@ -124,7 +124,17 @@ pub enum EntrySpec {
     /// risk-math reference; OANDA fills at its own bid/ask).
     Market,
     /// Stop-entry pending order; price resolves against the plaintext shell.
+    /// Triggers when price moves *through* the level — used for breakouts.
+    /// Long stop sits *above* current price; short stop sits *below*.
     Stop {
+        from: PriceAnchor,
+        #[serde(default)]
+        offset_pips: f64,
+    },
+    /// Limit pending order; price resolves against the plaintext shell.
+    /// Fills when price comes *back* to the level — used for pullback entries.
+    /// Long limit sits *below* current price; short limit sits *above*.
+    Limit {
         from: PriceAnchor,
         #[serde(default)]
         offset_pips: f64,
@@ -221,6 +231,30 @@ mod tests {
                 assert!((offset_pips - 2.0).abs() < 1e-9);
             }
             _ => panic!("expected stop entry"),
+        }
+    }
+
+    #[test]
+    fn intent_supports_limit_entry() {
+        let yaml = "
+            v: 1
+            id: abc
+            not_after: \"2026-05-13T20:00:00Z\"
+            action: enter
+            instrument: EUR_USD
+            direction: long
+            entry: { type: limit, from: low, offset_pips: -5 }
+            stop_loss: { from: low, offset_pips: -10 }
+            take_profit: { from: close, offset_r: 2.0 }
+            risk_pct: 0.5
+        ";
+        let intent: Intent = serde_yaml::from_str(yaml).unwrap();
+        match intent.entry {
+            Some(EntrySpec::Limit { from, offset_pips }) => {
+                assert_eq!(from, PriceAnchor::Low);
+                assert!((offset_pips - -5.0).abs() < 1e-9);
+            }
+            _ => panic!("expected limit entry"),
         }
     }
 

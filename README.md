@@ -6,7 +6,7 @@ can't be weaponised by anyone who doesn't also have the key.
 
 Five actions are supported:
 
-- `enter` — open a market or stop-entry order with SL/TP, after passing the risk gate.
+- `enter` — open a market, stop, or limit order with SL/TP, after passing the risk gate.
 - `close` — close all positions for the instrument.
 - `invalidate` — set a per-instrument cooldown (default 12 h) and cancel any pending
   orders. Use this when your setup is no longer valid (price drifted out of the
@@ -47,6 +47,7 @@ action: enter                          # enter | close | invalidate
 instrument: EUR_USD
 direction: long                        # long | short
 entry: { type: market }                # or { type: stop, from: high, offset_pips: 2 }
+                                       # or { type: limit, from: low,  offset_pips: 5 }
 stop_loss:   { from: low,  offset_pips: -2 }
 take_profit: { from: close, offset_r: 2.0 }    # 2R take-profit
 risk_pct: 0.5                          # % of NAV; capped server-side
@@ -57,6 +58,14 @@ cooldown_hours: 12                     # only used by "invalidate"
 anchored TP. `offset_pips` is in instrument pip units; the default pip size is
 0.0001 (good for major FX), override per instrument with the `PIP_SIZE_<NAME>`
 secret (e.g. `PIP_SIZE_USD_JPY=0.01`).
+
+**Stop vs limit entries:** a `stop` order fills when price moves *through*
+the level (breakout: long stops sit *above* current price, short stops
+*below*). A `limit` fills when price comes *back* to the level (pullback:
+long limits sit *below* current price, short limits *above*). The worker
+rejects the trade if the geometry is wrong (e.g. a long limit priced above
+the current candle close), so a typo can't turn a limit into an instant
+market fill at a worse price.
 
 `id` is the **replay-protection key** — the worker remembers each id it's
 fulfilled until just past `not_after`. Use a unique id per intended trade.
