@@ -6,6 +6,9 @@ workers_dev = true
 [build]
 command = "cargo install -q worker-build && worker-build --release"
 
+[observability]
+enabled = true
+
 [vars]
 
 # Bind a KV namespace named TRADE_CONTROL_KV before deploying. Create with:
