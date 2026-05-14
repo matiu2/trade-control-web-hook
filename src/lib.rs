@@ -1,5 +1,3 @@
-mod oanda;
-mod risk;
 mod state;
 
 #[cfg(feature = "cli")]
@@ -8,11 +6,8 @@ pub mod cli;
 use chrono::Utc;
 use worker::{Context, Env, Request, Response, Result, console_error, console_log, event};
 
-use crate::oanda::{
-    EntryRequest, OANDA_ACCOUNT_ID, cancel_pending_for_instrument, close_positions, login,
-    place_entry,
-};
 use crate::state::KvStateStore;
+use broker_oanda::{EntryRequest, login};
 use serde::Serialize;
 use trade_control_core::crypto;
 use trade_control_core::incoming::{self, parse_and_verify};
@@ -90,14 +85,7 @@ pub async fn main(mut req: Request, env: Env, _ctx: Context) -> Result<Response>
         _ => {}
     }
 
-    let account_id = match get_secret(OANDA_ACCOUNT_ID, &env) {
-        Some(s) => s,
-        None => {
-            console_error!("missing required secret: {OANDA_ACCOUNT_ID}");
-            return Response::error("server misconfigured", 500);
-        }
-    };
-    let Some(client) = login(&env).await else {
+    let Some(broker) = login(&env).await else {
         return Response::error("oanda login failed", 500);
     };
 
@@ -140,24 +128,19 @@ pub async fn main(mut req: Request, env: Env, _ctx: Context) -> Result<Response>
                 take_profit: resolved.take_profit,
                 risk_pct: resolved.risk_pct,
             };
-            place_entry(
-                &client,
-                &account_id,
-                max_risk_pct,
-                max_open_positions,
-                &entry_request,
-            )
-            .await
-            .map(|order_id| {
-                console_log!("entry placed id={} order={}", verified.intent.id, order_id);
-            })
-            .map_err(|err| {
-                console_error!("entry failed: {err}");
-                err.to_string()
-            })
+            broker
+                .place_entry(max_risk_pct, max_open_positions, &entry_request)
+                .await
+                .map(|order_id| {
+                    console_log!("entry placed id={} order={}", verified.intent.id, order_id);
+                })
+                .map_err(|err| {
+                    console_error!("entry failed: {err}");
+                    err.to_string()
+                })
         }
         Action::Close => {
-            let ok = close_positions(&client, &account_id, &verified.intent.instrument).await;
+            let ok = broker.close_positions(&verified.intent.instrument).await;
             if ok {
                 Ok(())
             } else {
@@ -170,9 +153,9 @@ pub async fn main(mut req: Request, env: Env, _ctx: Context) -> Result<Response>
                 console_error!("KV set_cooldown: {err}");
                 return Response::error("state error", 500);
             }
-            let cancelled =
-                cancel_pending_for_instrument(&client, &account_id, &verified.intent.instrument)
-                    .await;
+            let cancelled = broker
+                .cancel_pending_for_instrument(&verified.intent.instrument)
+                .await;
             console_log!(
                 "invalidate {} cooldown {}h cancelled {} pending",
                 verified.intent.instrument,
@@ -205,7 +188,7 @@ pub async fn main(mut req: Request, env: Env, _ctx: Context) -> Result<Response>
 /// Handle the `status` action: dump cooldown + recent-seen indexes as YAML.
 async fn handle_status(
     store: &KvStateStore,
-    verified: &crate::incoming::Verified,
+    verified: &incoming::Verified,
     now: chrono::DateTime<chrono::Utc>,
 ) -> Result<Response> {
     let snap = match store.snapshot().await {
@@ -232,7 +215,7 @@ async fn handle_status(
 /// Handle the `unlock` action: clear the cooldown for `verified.intent.instrument`.
 async fn handle_unlock(
     store: &KvStateStore,
-    verified: &crate::incoming::Verified,
+    verified: &incoming::Verified,
     now: chrono::DateTime<chrono::Utc>,
 ) -> Result<Response> {
     let instrument = &verified.intent.instrument;
