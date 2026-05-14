@@ -64,6 +64,22 @@ pub struct Intent {
     /// are rejected both at the encoder and on the server.
     #[serde(default)]
     pub min_r: Option<f64>,
+    /// Which broker the worker should route this intent to. Defaults to
+    /// `oanda` when absent so intents encrypted before the multi-broker
+    /// dispatch landed still work.
+    #[serde(default)]
+    pub broker: BrokerKind,
+}
+
+/// Which broker fulfils an intent. The serialised form is the
+/// lowercase variant name (`oanda`, `tradenation`); absent on the wire
+/// means [`BrokerKind::Oanda`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum BrokerKind {
+    #[default]
+    Oanda,
+    TradeNation,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
@@ -230,6 +246,28 @@ mod tests {
         assert_eq!(intent.id, "abc");
         assert_eq!(intent.action, Action::Enter);
         assert_eq!(intent.direction, Some(Direction::Long));
+        // Pre-existing intents on the wire don't carry a `broker:` field; they
+        // must keep routing to OANDA.
+        assert_eq!(intent.broker, BrokerKind::Oanda);
+    }
+
+    #[test]
+    fn intent_parses_explicit_broker() {
+        let yaml = "
+            v: 1
+            id: tn-1
+            not_after: \"2026-05-13T20:00:00Z\"
+            action: enter
+            instrument: EUR_USD
+            direction: long
+            entry: { type: market }
+            stop_loss: { from: low, offset_pips: -2 }
+            take_profit: { from: close, offset_r: 2.0 }
+            risk_pct: 0.5
+            broker: tradenation
+        ";
+        let intent: Intent = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(intent.broker, BrokerKind::TradeNation);
     }
 
     #[test]

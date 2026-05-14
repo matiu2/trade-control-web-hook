@@ -9,7 +9,7 @@ use serde::Serialize;
 use trade_control_core::broker::{Broker, EntryRequest};
 use trade_control_core::crypto;
 use trade_control_core::incoming::{self, parse_and_verify};
-use trade_control_core::intent::{Action, Resolved};
+use trade_control_core::intent::{Action, BrokerKind, Resolved};
 use trade_control_core::state::StateStore;
 
 /// Response body for the `unlock` action. Serialised as YAML.
@@ -81,6 +81,19 @@ pub async fn main(mut req: Request, env: Env, _ctx: Context) -> Result<Response>
         Action::Status => return handle_status(&store, &verified, now).await,
         Action::Unlock => return handle_unlock(&store, &verified, now).await,
         _ => {}
+    }
+
+    // Broker dispatch. TradeNation is a placeholder until the upstream
+    // wasm port lands and the `broker-tradenation` crate is wired in.
+    match verified.intent.broker {
+        BrokerKind::Oanda => {}
+        BrokerKind::TradeNation => {
+            console_error!(
+                "intent {} requested tradenation broker, not yet implemented",
+                verified.intent.id
+            );
+            return Response::error("tradenation broker not yet implemented", 501);
+        }
     }
 
     let Some(broker) = login(&env).await else {

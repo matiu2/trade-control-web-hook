@@ -6,7 +6,7 @@ use chrono::{DateTime, Utc};
 use super::{Action, Direction, EntrySpec, Intent, Shell, TakeProfit};
 
 #[cfg(test)]
-use super::PriceAnchor;
+use super::{BrokerKind, PriceAnchor};
 
 /// Resolved entry order with concrete prices.
 #[derive(Debug, Clone)]
@@ -289,6 +289,7 @@ mod tests {
             risk_pct: Some(0.5),
             cooldown_hours: None,
             min_r: None,
+            broker: BrokerKind::Oanda,
         }
     }
 
