@@ -1,0 +1,16 @@
+[package]
+name = "trade-control-core"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+base64 = { version = "0.22.1", default-features = false, features = ["alloc"] }
+chacha20poly1305 = { version = "0.10.1", default-features = false, features = ["alloc", "rand_core"] }
+chrono = { version = "0.4.44", default-features = false, features = ["alloc", "serde"] }
+hex = "0.4.3"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_yaml = "0.9.34"
+
+[features]
+default = []
+cli = []

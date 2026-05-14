@@ -1675,11 +1675,21 @@ dependencies = [
 ]
 
 [[package]]
-name = "trade-control-web-hook"
+name = "trade-control-core"
 version = "0.1.0"
 dependencies = [
  "base64",
  "chacha20poly1305",
+ "chrono",
+ "hex",
+ "serde",
+ "serde_yaml",
+]
+
+[[package]]
+name = "trade-control-web-hook"
+version = "0.1.0"
+dependencies = [
  "chrono",
  "clap",
  "color-eyre",
@@ -1691,6 +1701,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_yaml",
+ "trade-control-core",
  "worker",
 ]
 

@@ -7,9 +7,9 @@ mod control;
 mod interactive;
 mod prompts;
 
-pub use crate::crypto::{KEY_LEN, NONCE_LEN};
 pub use control::{build_status_intent, build_unlock_intent, wrap_in_envelope};
 pub use interactive::fill_missing_fields;
+pub use trade_control_core::crypto::{KEY_LEN, NONCE_LEN};
 
 /// Generate a fresh 32-byte key as 64 hex chars, using the OS RNG.
 pub fn generate_key_hex() -> String {
@@ -22,7 +22,8 @@ pub fn generate_key_hex() -> String {
 pub fn encrypt_intent(key: &[u8; KEY_LEN], plaintext: &[u8]) -> Result<String> {
     let mut nonce = [0u8; NONCE_LEN];
     getrandom::fill(&mut nonce).map_err(|e| eyre!("getrandom: {e}"))?;
-    crate::crypto::encrypt_with_nonce(key, &nonce, plaintext).map_err(|e| eyre!("encrypt: {e}"))
+    trade_control_core::crypto::encrypt_with_nonce(key, &nonce, plaintext)
+        .map_err(|e| eyre!("encrypt: {e}"))
 }
 
 /// Build the YAML body the user pastes into the TradingView alert template.
@@ -54,7 +55,7 @@ pub fn build_yaml_control_body(blob: &str, now: chrono::DateTime<chrono::Utc>) -
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::crypto;
+    use trade_control_core::crypto;
 
     #[test]
     fn cli_encrypt_decrypts_via_crypto_module() {

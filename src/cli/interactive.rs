@@ -12,8 +12,8 @@ use super::prompts::{
     required_for_action, resolve_not_after, set_field,
 };
 #[cfg(test)]
-use crate::intent::Action;
-use crate::intent::Intent;
+use trade_control_core::intent::Action;
+use trade_control_core::intent::Intent;
 
 /// Drive the template to completion by prompting for missing fields. After
 /// this returns, the template deserializes into a valid `Intent` for its
@@ -40,11 +40,11 @@ pub fn fill_missing_fields(template: &mut Value, non_interactive: bool) -> Resul
     // Fail fast on a below-floor `min_r`. The server also enforces this; we
     // duplicate it here so typos don't even get encrypted.
     if let Some(min_r) = intent.min_r
-        && min_r < crate::intent::MIN_R_FLOOR
+        && min_r < trade_control_core::intent::MIN_R_FLOOR
     {
         return Err(eyre!(
             "min_r={min_r} is below the hard floor of {} (server-enforced)",
-            crate::intent::MIN_R_FLOOR
+            trade_control_core::intent::MIN_R_FLOOR
         ));
     }
 

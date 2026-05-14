@@ -1,6 +1,3 @@
-mod crypto;
-mod incoming;
-mod intent;
 mod oanda;
 mod risk;
 mod state;
@@ -11,14 +8,16 @@ pub mod cli;
 use chrono::Utc;
 use worker::{Context, Env, Request, Response, Result, console_error, console_log, event};
 
-use crate::incoming::parse_and_verify;
-use crate::intent::{Action, Resolved};
 use crate::oanda::{
     EntryRequest, OANDA_ACCOUNT_ID, cancel_pending_for_instrument, close_positions, login,
     place_entry,
 };
-use crate::state::{KvStateStore, StateStore};
+use crate::state::KvStateStore;
 use serde::Serialize;
+use trade_control_core::crypto;
+use trade_control_core::incoming::{self, parse_and_verify};
+use trade_control_core::intent::{Action, Resolved};
+use trade_control_core::state::StateStore;
 
 /// Response body for the `unlock` action. Serialised as YAML.
 #[derive(Serialize)]

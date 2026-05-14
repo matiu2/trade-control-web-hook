@@ -9,8 +9,8 @@ use oanda_client::positions::ClosePositionResponse;
 use worker::Env;
 use worker::console_error;
 
-use crate::intent::{Direction, ResolvedEntry};
 use crate::risk;
+use trade_control_core::intent::{Direction, ResolvedEntry};
 
 const OANDA_API_KEY: &str = "OANDA_API_KEY";
 pub(crate) const OANDA_ACCOUNT_ID: &str = "OANDA_ACCOUNT_ID";

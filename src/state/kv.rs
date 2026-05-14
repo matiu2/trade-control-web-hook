@@ -9,12 +9,11 @@
 //! the TTL keys never lie.
 
 use chrono::{DateTime, Utc};
-use worker::kv::KvStore;
-
-use super::{
+use trade_control_core::state::{
     CooldownEntry, MIN_TTL_SECONDS, SEEN_INDEX_CAP, SeenEntry, Snapshot, StateError, StateStore,
     prune_expired,
 };
+use worker::kv::KvStore;
 
 const INDEX_COOLDOWNS_KEY: &str = "index:cooldowns";
 const INDEX_SEEN_KEY: &str = "index:seen";

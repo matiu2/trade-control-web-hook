@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = []
+members = ["core"]
 
 [package]
 name = "trade-control-web-hook"
@@ -11,8 +11,7 @@ edition = "2024"
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-base64 = { version = "0.22.1", default-features = false, features = ["alloc"] }
-chacha20poly1305 = { version = "0.10.1", default-features = false, features = ["alloc", "rand_core"] }
+trade-control-core = { path = "core" }
 chrono = { version = "0.4.44", default-features = false, features = ["alloc", "serde"] }
 clap = { version = "4.6.1", features = ["derive"], optional = true }
 color-eyre = { version = "0.6.5", optional = true }
@@ -28,7 +27,7 @@ worker = "^0.8"
 
 [features]
 default = []
-cli = ["dep:clap", "dep:color-eyre", "dep:getrandom", "dep:dialoguer", "dep:reqwest"]
+cli = ["dep:clap", "dep:color-eyre", "dep:getrandom", "dep:dialoguer", "dep:reqwest", "trade-control-core/cli"]
 
 [[bin]]
 name = "encrypt-payload"

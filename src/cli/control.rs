@@ -8,8 +8,8 @@ use chrono::{DateTime, Duration, Utc};
 use color_eyre::eyre::{Result, eyre};
 
 use crate::cli::{build_yaml_control_body, encrypt_intent};
-use crate::crypto::KEY_LEN;
-use crate::intent::{Action, Intent};
+use trade_control_core::crypto::KEY_LEN;
+use trade_control_core::intent::{Action, Intent};
 
 /// How long a control envelope stays valid. Short — these are one-shot
 /// commands run by hand, so we don't need a long replay window.

@@ -17,7 +17,7 @@ use chrono::{DateTime, Duration, Utc};
 use color_eyre::eyre::{Result, eyre};
 use serde_yaml::Value;
 
-use crate::intent::Action;
+use trade_control_core::intent::Action;
 
 /// Fields every intent needs regardless of action.
 pub const ALWAYS_REQUIRED: &[&str] = &["v", "action", "instrument", "id", "not_after"];
