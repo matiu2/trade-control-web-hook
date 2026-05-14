@@ -95,14 +95,23 @@ pub enum PriceAnchor {
     Low,
 }
 
-/// Reference to a price derived from the plaintext shell, optionally offset.
+/// Reference to a price. Either anchored to the plaintext shell with a pip
+/// offset (TradingView fills in the anchor at fire time) or a fixed absolute
+/// price set at encode time (the worker uses it verbatim, ignoring the shell).
 #[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct PriceRef {
-    pub from: PriceAnchor,
-    /// Offset in pips. Sign matters: -2 means "low - 2 pips" regardless of direction.
-    /// The "pip" here is the instrument's pip size; the caller supplies that.
-    #[serde(default)]
-    pub offset_pips: f64,
+#[serde(untagged)]
+pub enum PriceRef {
+    /// `{ absolute: 1.86236 }` — fixed price; shell ignored.
+    Absolute { absolute: f64 },
+    /// `{ from: low, offset_pips: -2 }` — anchor + signed pip offset.
+    Anchored {
+        from: PriceAnchor,
+        /// Offset in pips. Sign matters: -2 means "low - 2 pips" regardless
+        /// of direction. The "pip" here is the instrument's pip size; the
+        /// caller supplies that.
+        #[serde(default)]
+        offset_pips: f64,
+    },
 }
 
 /// Take-profit can be specified either as a plaintext-anchored price (like SL)
@@ -161,7 +170,12 @@ impl Shell {
 
 impl PriceRef {
     pub fn resolve(&self, shell: &Shell, pip_size: f64) -> f64 {
-        shell.anchor_price(self.from) + self.offset_pips * pip_size
+        match self {
+            PriceRef::Absolute { absolute } => *absolute,
+            PriceRef::Anchored { from, offset_pips } => {
+                shell.anchor_price(*from) + offset_pips * pip_size
+            }
+        }
     }
 }
 
@@ -190,7 +204,7 @@ mod tests {
     #[test]
     fn price_ref_applies_pip_offset() {
         let s = shell();
-        let sl = PriceRef {
+        let sl = PriceRef::Anchored {
             from: PriceAnchor::Low,
             offset_pips: -2.0,
         };

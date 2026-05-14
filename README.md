@@ -48,8 +48,9 @@ instrument: EUR_USD
 direction: long                        # long | short
 entry: { type: market }                # or { type: stop, from: high, offset_pips: 2 }
                                        # or { type: limit, from: low,  offset_pips: 5 }
-stop_loss:   { from: low,  offset_pips: -2 }
-take_profit: { from: close, offset_r: 2.0 }    # 2R take-profit
+stop_loss:   { from: low,  offset_pips: -2 }    # anchored — or { absolute: 1.86236 }
+take_profit: { from: close, offset_r: 2.0 }    # 2R — or { absolute: 1.86899 }
+                                       #         or { from: high, offset_pips: 50 }
 risk_pct: 0.5                          # % of NAV; capped server-side
 min_r: 1.0                             # optional. Defaults to 1.0. Worker
                                        # rejects if (TP-entry)/(entry-SL)
@@ -72,6 +73,19 @@ long limits sit *below* current price, short limits *above*). The worker
 rejects the trade if the geometry is wrong (e.g. a long limit priced above
 the current candle close), so a typo can't turn a limit into an instant
 market fill at a worse price.
+
+**Anchored vs absolute prices:** `stop_loss` and `take_profit` accept
+either form. Anchored (`{ from: low, offset_pips: -2 }`) is computed
+from the trigger candle's OHLC at fire time — TradingView fills in the
+anchor when the alert triggers. Absolute (`{ absolute: 1.86236 }`) is a
+fixed price set at encode time — useful for chart analysis where you've
+drawn SL/TP lines and want them honoured exactly.
+
+**Entry-in-range check:** the worker rejects the trade if the trigger
+candle's close falls *outside* the SL..TP range — e.g. a gap past TP
+would otherwise fill straight into the take-profit. This is the same
+gate that protects the absolute-price flow when the trigger candle
+moves past one of your fixed levels.
 
 `id` is the **replay-protection key** — the worker remembers each id it's
 fulfilled until just past `not_after`. Use a unique id per intended trade.

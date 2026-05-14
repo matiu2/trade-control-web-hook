@@ -165,16 +165,34 @@ fn prompt_entry(theme: &ColorfulTheme) -> Result<Value> {
 }
 
 fn prompt_price_ref(theme: &ColorfulTheme, name: &str) -> Result<Value> {
-    let anchor = prompt_anchor(theme, &format!("{name} anchor"))?;
-    let offset = prompt_float(theme, &format!("{name} offset_pips (signed)"), Some(0.0))?;
+    let kinds = [
+        "anchored (from candle's high/low/close + pip offset)",
+        "absolute price",
+    ];
+    let idx = Select::with_theme(theme)
+        .with_prompt(format!("{name} type"))
+        .items(kinds)
+        .default(0)
+        .interact()?;
     let mut map = serde_yaml::Mapping::new();
-    map.insert(Value::String("from".into()), anchor);
-    map.insert(Value::String("offset_pips".into()), offset);
+    if idx == 0 {
+        let anchor = prompt_anchor(theme, &format!("{name} anchor"))?;
+        let offset = prompt_float(theme, &format!("{name} offset_pips (signed)"), Some(0.0))?;
+        map.insert(Value::String("from".into()), anchor);
+        map.insert(Value::String("offset_pips".into()), offset);
+    } else {
+        let price = prompt_float(theme, &format!("{name} absolute price"), None)?;
+        map.insert(Value::String("absolute".into()), price);
+    }
     Ok(Value::Mapping(map))
 }
 
 fn prompt_take_profit(theme: &ColorfulTheme) -> Result<Value> {
-    let kinds = ["R-multiple of stop distance", "Anchored price"];
+    let kinds = [
+        "R-multiple of stop distance",
+        "Anchored price (candle anchor + pip offset)",
+        "Absolute price",
+    ];
     let idx = Select::with_theme(theme)
         .with_prompt("take_profit type")
         .items(kinds)
@@ -188,11 +206,15 @@ fn prompt_take_profit(theme: &ColorfulTheme) -> Result<Value> {
             map.insert(Value::String("from".into()), anchor);
             map.insert(Value::String("offset_r".into()), r);
         }
-        _ => {
+        1 => {
             let anchor = prompt_anchor(theme, "take_profit anchor")?;
             let offset = prompt_float(theme, "take_profit offset_pips (signed)", Some(0.0))?;
             map.insert(Value::String("from".into()), anchor);
             map.insert(Value::String("offset_pips".into()), offset);
+        }
+        _ => {
+            let price = prompt_float(theme, "take_profit absolute price", None)?;
+            map.insert(Value::String("absolute".into()), price);
         }
     }
     Ok(Value::Mapping(map))

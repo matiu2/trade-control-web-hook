@@ -53,6 +53,14 @@ pub enum ResolveError {
     MinRBelowFloor { requested: f64 },
     /// Implicit R is below `min_r` (default 1.0 if not overridden).
     BelowMinR { actual: f64, min: f64 },
+    /// Entry price is outside the SL..TP range — would fill instantly
+    /// against the stop or take-profit. Happens when the trigger candle
+    /// gaps past one of the levels.
+    EntryOutsideRange {
+        entry: f64,
+        stop_loss: f64,
+        take_profit: f64,
+    },
 }
 
 impl core::fmt::Display for ResolveError {
@@ -68,6 +76,14 @@ impl core::fmt::Display for ResolveError {
             Self::BelowMinR { actual, min } => write!(
                 f,
                 "trade R={actual:.3} is below the required minimum of {min:.3}"
+            ),
+            Self::EntryOutsideRange {
+                entry,
+                stop_loss,
+                take_profit,
+            } => write!(
+                f,
+                "entry {entry} is outside the SL..TP range ({stop_loss}..{take_profit})"
             ),
         }
     }
@@ -158,17 +174,6 @@ impl Resolved {
             }
         };
 
-        // SL must be on the correct side of the entry for the direction.
-        match direction {
-            Direction::Long if stop_loss >= reference_price => {
-                return Err(ResolveError::InvalidGeometry);
-            }
-            Direction::Short if stop_loss <= reference_price => {
-                return Err(ResolveError::InvalidGeometry);
-            }
-            _ => {}
-        }
-
         let take_profit = resolve_tp(
             tp_spec,
             shell,
@@ -178,15 +183,21 @@ impl Resolved {
             stop_loss,
         );
 
-        // TP must be on the opposite side of entry from SL.
-        match direction {
-            Direction::Long if take_profit <= reference_price => {
-                return Err(ResolveError::InvalidGeometry);
-            }
-            Direction::Short if take_profit >= reference_price => {
-                return Err(ResolveError::InvalidGeometry);
-            }
-            _ => {}
+        // Entry must sit strictly between SL and TP for the direction:
+        //   long  → SL < entry < TP
+        //   short → TP < entry < SL
+        // A trigger candle that gaps past one of the levels would otherwise
+        // fill straight into the stop or take-profit.
+        let in_range = match direction {
+            Direction::Long => stop_loss < reference_price && reference_price < take_profit,
+            Direction::Short => take_profit < reference_price && reference_price < stop_loss,
+        };
+        if !in_range {
+            return Err(ResolveError::EntryOutsideRange {
+                entry: reference_price,
+                stop_loss,
+                take_profit,
+            });
         }
 
         // Server-enforced floor: an `min_r` override cannot weaken the
@@ -267,7 +278,7 @@ mod tests {
             instrument: "EUR_USD".into(),
             direction: Some(Direction::Long),
             entry: Some(EntrySpec::Market),
-            stop_loss: Some(PriceRef {
+            stop_loss: Some(PriceRef::Anchored {
                 from: PriceAnchor::Low,
                 offset_pips: -2.0,
             }),
@@ -294,11 +305,11 @@ mod tests {
     fn short_market_resolves_anchored_tp() {
         let mut intent = long_market_intent();
         intent.direction = Some(Direction::Short);
-        intent.stop_loss = Some(PriceRef {
+        intent.stop_loss = Some(PriceRef::Anchored {
             from: PriceAnchor::High,
             offset_pips: 2.0,
         });
-        intent.take_profit = Some(TakeProfit::Anchored(PriceRef {
+        intent.take_profit = Some(TakeProfit::Anchored(PriceRef::Anchored {
             from: PriceAnchor::Low,
             offset_pips: -10.0,
         }));
@@ -363,7 +374,7 @@ mod tests {
     fn short_limit_above_close_resolves() {
         let mut intent = long_market_intent();
         intent.direction = Some(Direction::Short);
-        intent.stop_loss = Some(PriceRef {
+        intent.stop_loss = Some(PriceRef::Anchored {
             from: PriceAnchor::High,
             offset_pips: 10.0,
         });
@@ -399,14 +410,86 @@ mod tests {
     #[test]
     fn long_with_sl_above_entry_rejected() {
         let mut intent = long_market_intent();
-        intent.stop_loss = Some(PriceRef {
+        intent.stop_loss = Some(PriceRef::Anchored {
             from: PriceAnchor::High,
             offset_pips: 2.0,
         });
         assert!(matches!(
             Resolved::from_intent(&intent, &shell(), 0.0001),
-            Err(ResolveError::InvalidGeometry)
+            Err(ResolveError::EntryOutsideRange { .. })
         ));
+    }
+
+    #[test]
+    fn long_absolute_sl_tp_resolves() {
+        // Inverted H&S: SL=1.86236 absolute, TP=1.86899 absolute, market entry.
+        // Shell.close = 1.1000 from the fixture — totally unrelated to SL/TP —
+        // but we override it so the entry sits inside the range.
+        let mut intent = long_market_intent();
+        intent.stop_loss = Some(PriceRef::Absolute { absolute: 1.86236 });
+        intent.take_profit = Some(TakeProfit::Anchored(PriceRef::Absolute {
+            absolute: 1.86899,
+        }));
+        let mut s = shell();
+        s.close = 1.86500; // simulates a trigger candle inside the SL..TP range
+        let r = Resolved::from_intent(&intent, &s, 0.0001).unwrap();
+        assert!((r.stop_loss - 1.86236).abs() < 1e-9);
+        assert!((r.take_profit - 1.86899).abs() < 1e-9);
+    }
+
+    #[test]
+    fn long_absolute_sl_tp_entry_above_tp_rejected() {
+        let mut intent = long_market_intent();
+        intent.stop_loss = Some(PriceRef::Absolute { absolute: 1.86236 });
+        intent.take_profit = Some(TakeProfit::Anchored(PriceRef::Absolute {
+            absolute: 1.86899,
+        }));
+        let mut s = shell();
+        s.close = 1.87000; // gapped past TP
+        match Resolved::from_intent(&intent, &s, 0.0001) {
+            Err(ResolveError::EntryOutsideRange { entry, .. }) => {
+                assert!((entry - 1.87000).abs() < 1e-9);
+            }
+            other => panic!("expected EntryOutsideRange, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn long_absolute_sl_tp_entry_below_sl_rejected() {
+        let mut intent = long_market_intent();
+        intent.stop_loss = Some(PriceRef::Absolute { absolute: 1.86236 });
+        intent.take_profit = Some(TakeProfit::Anchored(PriceRef::Absolute {
+            absolute: 1.86899,
+        }));
+        let mut s = shell();
+        s.close = 1.86000; // gapped below SL
+        assert!(matches!(
+            Resolved::from_intent(&intent, &s, 0.0001),
+            Err(ResolveError::EntryOutsideRange { .. })
+        ));
+    }
+
+    #[test]
+    fn short_absolute_sl_tp_entry_below_tp_rejected() {
+        let mut intent = long_market_intent();
+        intent.direction = Some(Direction::Short);
+        intent.stop_loss = Some(PriceRef::Absolute { absolute: 1.87100 });
+        intent.take_profit = Some(TakeProfit::Anchored(PriceRef::Absolute {
+            absolute: 1.86200,
+        }));
+        let mut s = shell();
+        s.close = 1.86100; // below the TP — invalid for short
+        assert!(matches!(
+            Resolved::from_intent(&intent, &s, 0.0001),
+            Err(ResolveError::EntryOutsideRange { .. })
+        ));
+    }
+
+    #[test]
+    fn price_ref_absolute_round_trips_yaml() {
+        let yaml = r#"{ absolute: 1.86236 }"#;
+        let pr: PriceRef = serde_yaml::from_str(yaml).unwrap();
+        assert!(matches!(pr, PriceRef::Absolute { absolute } if (absolute - 1.86236).abs() < 1e-9));
     }
 
     #[test]
@@ -432,7 +515,7 @@ mod tests {
     fn default_min_r_rejects_when_below_one() {
         // Anchored TP only 1 pip above entry but SL 22 pips below → 0.045R.
         let mut intent = long_market_intent();
-        intent.take_profit = Some(TakeProfit::Anchored(PriceRef {
+        intent.take_profit = Some(TakeProfit::Anchored(PriceRef::Anchored {
             from: PriceAnchor::Close,
             offset_pips: 1.0,
         }));
@@ -500,12 +583,12 @@ mod tests {
     fn short_default_min_r_rejects_when_below_one() {
         let mut intent = long_market_intent();
         intent.direction = Some(Direction::Short);
-        intent.stop_loss = Some(PriceRef {
+        intent.stop_loss = Some(PriceRef::Anchored {
             from: PriceAnchor::High,
             offset_pips: 10.0,
         });
         // Anchored TP 1 pip below entry — way under 1R for a 30-pip SL.
-        intent.take_profit = Some(TakeProfit::Anchored(PriceRef {
+        intent.take_profit = Some(TakeProfit::Anchored(PriceRef::Anchored {
             from: PriceAnchor::Close,
             offset_pips: -1.0,
         }));
