@@ -13,4 +13,4 @@ command = "cargo install -q worker-build && worker-build --release"
 # and replace the id below with the one wrangler prints.
 [[kv_namespaces]]
 binding = "TRADE_CONTROL_KV"
-id = "REPLACE_ME"
+id = "e4f27179248e451daf8cf68a98c47e5b"
