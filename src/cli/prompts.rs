@@ -20,7 +20,7 @@ use serde_yaml::Value;
 use crate::intent::Action;
 
 /// Fields every intent needs regardless of action.
-pub const ALWAYS_REQUIRED: &[&str] = &["v", "id", "not_after", "action", "instrument"];
+pub const ALWAYS_REQUIRED: &[&str] = &["v", "action", "instrument", "id", "not_after"];
 
 /// Fields required *in addition* to `ALWAYS_REQUIRED` for the given action.
 pub fn required_for_action(action: Action) -> &'static [&'static str] {
@@ -137,7 +137,7 @@ mod tests {
         let v = map("v: 1\naction: enter\n");
         let missing = missing_fields(&v, ALWAYS_REQUIRED);
         // v and action are present; the others are missing.
-        assert_eq!(missing, vec!["id", "not_after", "instrument"]);
+        assert_eq!(missing, vec!["instrument", "id", "not_after"]);
     }
 
     #[test]
