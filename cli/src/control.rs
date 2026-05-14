@@ -7,7 +7,7 @@
 use chrono::{DateTime, Duration, Utc};
 use color_eyre::eyre::{Result, eyre};
 
-use crate::cli::{build_yaml_control_body, encrypt_intent};
+use crate::{build_yaml_control_body, encrypt_intent};
 use trade_control_core::crypto::KEY_LEN;
 use trade_control_core::intent::{Action, Intent};
 

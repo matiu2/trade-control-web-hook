@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["broker-oanda","core"]
+members = ["broker-oanda", "cli", "core"]
 
 [package]
 name = "trade-control-web-hook"
@@ -11,25 +11,11 @@ edition = "2024"
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-trade-control-core = { path = "core" }
+broker-oanda = { version = "0.1.0", path = "broker-oanda" }
 chrono = { version = "0.4.44", default-features = false, features = ["alloc", "serde"] }
-clap = { version = "4.6.1", features = ["derive"], optional = true }
-color-eyre = { version = "0.6.5", optional = true }
-dialoguer = { version = "0.12.0", default-features = false, optional = true }
-getrandom = { version = "0.4.2", optional = true }
 hex = "0.4.3"
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "blocking"], optional = true }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
 serde_yaml = "0.9.34"
+trade-control-core = { path = "core" }
 worker = "^0.8"
-broker-oanda = { version = "0.1.0", path = "broker-oanda" }
-
-[features]
-default = []
-cli = ["dep:clap", "dep:color-eyre", "dep:getrandom", "dep:dialoguer", "dep:reqwest", "trade-control-core/cli"]
-
-[[bin]]
-name = "encrypt-payload"
-path = "src/bin/encrypt_payload.rs"
-required-features = ["cli"]

@@ -1,8 +1,5 @@
 mod state;
 
-#[cfg(feature = "cli")]
-pub mod cli;
-
 use chrono::Utc;
 use worker::{Context, Env, Request, Response, Result, console_error, console_log, event};
 

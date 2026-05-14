@@ -17,7 +17,7 @@ use std::time::Duration;
 use chrono::Utc;
 use clap::{Parser, Subcommand};
 use color_eyre::eyre::{Context, Result, eyre};
-use trade_control_web_hook::cli::{
+use trade_control_cli::{
     KEY_LEN, build_status_intent, build_unlock_intent, build_yaml_template, encrypt_intent,
     fill_missing_fields, generate_key_hex, wrap_in_envelope,
 };
