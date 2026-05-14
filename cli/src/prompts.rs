@@ -25,7 +25,14 @@ pub const ALWAYS_REQUIRED: &[&str] = &["v", "action", "instrument", "id", "not_a
 /// Fields required *in addition* to `ALWAYS_REQUIRED` for the given action.
 pub fn required_for_action(action: Action) -> &'static [&'static str] {
     match action {
-        Action::Enter => &["direction", "entry", "stop_loss", "take_profit", "risk_pct"],
+        Action::Enter => &[
+            "broker",
+            "direction",
+            "entry",
+            "stop_loss",
+            "take_profit",
+            "risk_pct",
+        ],
         Action::Close => &[],
         Action::Invalidate => &["cooldown_hours"],
         // `instrument` is already in `ALWAYS_REQUIRED`; nothing extra needed.
@@ -117,7 +124,14 @@ mod tests {
     #[test]
     fn required_for_enter_lists_trade_fields() {
         let fields = required_for_action(Action::Enter);
-        for expected in ["direction", "entry", "stop_loss", "take_profit", "risk_pct"] {
+        for expected in [
+            "broker",
+            "direction",
+            "entry",
+            "stop_loss",
+            "take_profit",
+            "risk_pct",
+        ] {
             assert!(fields.contains(&expected), "missing {expected}");
         }
     }

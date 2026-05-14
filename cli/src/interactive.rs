@@ -107,6 +107,7 @@ fn prompt_for_field(field: &str, template: &Value) -> Result<Value> {
                 .interact_text()?;
             Ok(Value::String(s))
         }
+        "broker" => prompt_broker(&theme),
         "direction" => prompt_direction(&theme),
         "entry" => prompt_entry(&theme),
         "stop_loss" => prompt_price_ref(&theme, "stop_loss"),
@@ -127,6 +128,16 @@ fn prompt_action(theme: &ColorfulTheme) -> Result<Value> {
     let choices = ["enter", "close", "invalidate"];
     let idx = Select::with_theme(theme)
         .with_prompt("action")
+        .items(choices)
+        .default(0)
+        .interact()?;
+    Ok(Value::String(choices[idx].into()))
+}
+
+fn prompt_broker(theme: &ColorfulTheme) -> Result<Value> {
+    let choices = ["oanda", "tradenation"];
+    let idx = Select::with_theme(theme)
+        .with_prompt("broker")
         .items(choices)
         .default(0)
         .interact()?;
@@ -265,6 +276,7 @@ mod tests {
             not_after: \"2026-05-13T20:00:00Z\"
             action: enter
             instrument: EUR_USD
+            broker: oanda
             direction: long
             entry: { type: market }
             stop_loss: { from: low, offset_pips: -2 }
@@ -286,6 +298,7 @@ mod tests {
             not_after: \"2026-05-13T20:00:00Z\"
             action: enter
             instrument: EUR_USD
+            broker: oanda
             direction: long
             entry: { type: market }
             stop_loss: { from: low, offset_pips: -2 }
@@ -308,6 +321,7 @@ mod tests {
             not_after: \"2026-05-13T20:00:00Z\"
             action: enter
             instrument: EUR_USD
+            broker: oanda
             direction: long
             entry: { type: market }
             stop_loss: { from: low, offset_pips: -2 }
@@ -327,6 +341,7 @@ mod tests {
             not_after: \"2026-05-13T20:00:00Z\"
             action: enter
             instrument: EUR_USD
+            broker: oanda
             direction: long
             entry: { type: market }
             stop_loss: { from: low, offset_pips: -2 }
@@ -346,6 +361,7 @@ mod tests {
             not_after: \"2026-05-13T20:00:00Z\"
             action: enter
             instrument: EUR_USD
+            broker: oanda
             direction: long
             entry: { type: market }
             stop_loss: { from: low, offset_pips: -2 }
