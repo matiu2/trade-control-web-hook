@@ -196,15 +196,47 @@ actions — re-running the same `unlock` won't double-fire.
 | Name | Required | Notes |
 |---|---|---|
 | `ENCRYPTION_KEY` | yes | 64-hex-char ChaCha20-Poly1305 key. |
-| `OANDA_API_KEY` | yes | OANDA v20 token. |
-| `OANDA_ACCOUNT_ID` | yes | OANDA account id. |
+| `OANDA_API_KEY` | for OANDA | OANDA v20 token. |
+| `OANDA_ACCOUNT_ID` | for OANDA | OANDA account id. |
 | `OANDA_LIVE` | no | `true` for live trading; defaults to practice. |
+| `TN_SESSION_JSON` | for TradeNation | Serialised TradeNation `Session` JSON. See "TradeNation session" below. |
 | `MAX_RISK_PCT_PER_TRADE` | no | Hard cap on requested `risk_pct`. Default `1.0`. |
 | `MAX_OPEN_POSITIONS` | no | Max concurrent open positions. Default `3`. |
 | `PIP_SIZE_<INSTRUMENT>` | no | Override pip size, e.g. `PIP_SIZE_USD_JPY=0.01`. Default `0.0001`. |
 
 The previous `AUTH_TOKEN` secret is no longer used — the encryption key *is*
 the authenticator. You can `wrangler secret delete AUTH_TOKEN`.
+
+## Brokers
+
+The intent YAML carries an optional `broker:` field, one of `oanda`
+(default) or `tradenation`. Each broker is independent — the operator
+picks per intent at encrypt time:
+
+```yaml
+v: 1
+action: enter
+broker: tradenation       # or omit for OANDA
+instrument: EUR/USD
+# ...
+```
+
+## TradeNation session
+
+The Worker can't run TradeNation's native login redirect chain, so the
+operator exports a `Session` from a native machine and uploads it as a
+Worker secret. When the session dies, the Worker returns 503 with
+`tradenation session expired or invalid` and the operator re-runs the
+export.
+
+```sh
+# On a native machine with `tradenation-cli` authenticated:
+tradenation session export "my-tn-account" | wrangler secret put TN_SESSION_JSON
+```
+
+Lifetime is undocumented by TradeNation. Empirically sessions survive
+hours of intermittent use; rotate when the Worker logs SessionExpired,
+not on a timer.
 
 ## KV namespace
 

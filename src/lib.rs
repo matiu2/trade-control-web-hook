@@ -1,10 +1,12 @@
 mod state;
+mod tradenation_adapter;
 
 use chrono::Utc;
 use worker::{Context, Env, Request, Response, Result, console_error, console_log, event};
 
 use crate::state::KvStateStore;
-use broker_oanda::login;
+use crate::tradenation_adapter::TradeNationAdapter;
+use broker_oanda::login as oanda_login;
 use serde::Serialize;
 use trade_control_core::broker::{Broker, EntryRequest};
 use trade_control_core::crypto;
@@ -23,6 +25,7 @@ const ENCRYPTION_KEY_SECRET: &str = "ENCRYPTION_KEY";
 const MAX_RISK_PCT_PER_TRADE_SECRET: &str = "MAX_RISK_PCT_PER_TRADE";
 const MAX_OPEN_POSITIONS_SECRET: &str = "MAX_OPEN_POSITIONS";
 const PIP_SIZE_SECRET_PREFIX: &str = "PIP_SIZE_";
+const TN_SESSION_JSON_SECRET: &str = "TN_SESSION_JSON";
 const KV_NAMESPACE: &str = "TRADE_CONTROL_KV";
 
 /// Default pip size when no `PIP_SIZE_<INSTRUMENT>` secret is set. EUR_USD's
@@ -83,86 +86,78 @@ pub async fn main(mut req: Request, env: Env, _ctx: Context) -> Result<Response>
         _ => {}
     }
 
-    // Broker dispatch. TradeNation is a placeholder until the upstream
-    // wasm port lands and the `broker-tradenation` crate is wired in.
-    match verified.intent.broker {
-        BrokerKind::Oanda => {}
+    // Broker dispatch.
+    let result = match verified.intent.broker {
+        BrokerKind::Oanda => match oanda_login(&env).await {
+            Some(broker) => run_action(&broker, &store, &verified, &env, now).await,
+            None => return Response::error("oanda login failed", 500),
+        },
         BrokerKind::TradeNation => {
-            console_error!(
-                "intent {} requested tradenation broker, not yet implemented",
-                verified.intent.id
-            );
-            return Response::error("tradenation broker not yet implemented", 501);
-        }
-    }
-
-    let Some(broker) = login(&env).await else {
-        return Response::error("oanda login failed", 500);
-    };
-
-    let result = match verified.intent.action {
-        Action::Enter => {
-            // Cooldown gate
-            match store.is_cooled_down(&verified.intent.instrument).await {
-                Ok(true) => {
-                    console_log!(
-                        "entry rejected: {} cooled down (id={})",
-                        verified.intent.instrument,
-                        verified.intent.id
-                    );
-                    return Response::error("instrument cooled down", 423);
+            let Some(session_json) = get_secret(TN_SESSION_JSON_SECRET, &env) else {
+                console_error!("missing required secret: {TN_SESSION_JSON_SECRET}");
+                return Response::error("tradenation session not configured", 503);
+            };
+            match broker_tradenation::login(&session_json).await {
+                Some(broker) => {
+                    let adapter = TradeNationAdapter(broker);
+                    run_action(&adapter, &store, &verified, &env, now).await
                 }
-                Ok(false) => {}
-                Err(err) => {
-                    console_error!("KV is_cooled_down: {err}");
-                    return Response::error("state error", 500);
+                None => {
+                    console_error!("tradenation login failed; rotate {TN_SESSION_JSON_SECRET}");
+                    return Response::error("tradenation session expired or invalid", 503);
                 }
             }
-
-            let max_risk_pct = secret_or_default(&env, MAX_RISK_PCT_PER_TRADE_SECRET, 1.0);
-            let max_open_positions = secret_or_default(&env, MAX_OPEN_POSITIONS_SECRET, 3.0) as u32;
-            let pip_size = pip_size_for(&env, &verified.intent.instrument);
-
-            let resolved = match Resolved::from_intent(&verified.intent, &verified.shell, pip_size)
-            {
-                Ok(r) => r,
-                Err(err) => {
-                    console_error!("resolve: {err}");
-                    return Response::error("rejected", 400);
-                }
-            };
-            let entry_request = EntryRequest {
-                instrument: &resolved.instrument,
-                direction: resolved.direction,
-                entry: resolved.entry.clone(),
-                stop_loss: resolved.stop_loss,
-                take_profit: resolved.take_profit,
-                risk_pct: resolved.risk_pct,
-            };
-            broker
-                .place_entry(max_risk_pct, max_open_positions, &entry_request)
-                .await
-                .map(|order_id| {
-                    console_log!("entry placed id={} order={}", verified.intent.id, order_id);
-                })
-                .map_err(|err| {
-                    console_error!("entry failed: {err}");
-                    err.to_string()
-                })
         }
+    };
+
+    match result {
+        ActionResult::Ok => {
+            // Record id to block replays. Best-effort: if KV write fails after a successful
+            // trade we log but still return 200 — failing here would invite the caller to retry
+            // and re-execute the trade.
+            let ttl = incoming::replay_ttl_seconds(verified.intent.not_after, now);
+            if let Err(err) = store.mark_seen(&verified.intent.id, ttl).await {
+                console_error!("KV mark_seen after success: {err}");
+            }
+            Response::ok("ok")
+        }
+        ActionResult::Failed => Response::error("action failed", 502),
+        ActionResult::EarlyReturn(resp) => resp,
+    }
+}
+
+/// Outcome of an action dispatch — bubbles up early returns (HTTP errors with
+/// specific status codes) alongside the trade-level success/failure.
+enum ActionResult {
+    Ok,
+    Failed,
+    EarlyReturn(Result<Response>),
+}
+
+/// Dispatch `Enter` / `Close` / `Invalidate` against an authenticated broker.
+/// Status / Unlock are handled before this function and never reach it.
+async fn run_action<B: Broker>(
+    broker: &B,
+    store: &KvStateStore,
+    verified: &incoming::Verified,
+    env: &Env,
+    now: chrono::DateTime<chrono::Utc>,
+) -> ActionResult {
+    match verified.intent.action {
+        Action::Enter => run_enter(broker, store, verified, env, now).await,
         Action::Close => {
             let ok = broker.close_positions(&verified.intent.instrument).await;
             if ok {
-                Ok(())
+                ActionResult::Ok
             } else {
-                Err("close failed".to_string())
+                ActionResult::Failed
             }
         }
         Action::Invalidate => {
             let hours = verified.intent.cooldown_hours.unwrap_or(12);
             if let Err(err) = store.set_cooldown(&verified.intent.instrument, hours).await {
                 console_error!("KV set_cooldown: {err}");
-                return Response::error("state error", 500);
+                return ActionResult::EarlyReturn(Response::error("state error", 500));
             }
             let cancelled = broker
                 .cancel_pending_for_instrument(&verified.intent.instrument)
@@ -173,26 +168,70 @@ pub async fn main(mut req: Request, env: Env, _ctx: Context) -> Result<Response>
                 hours,
                 cancelled
             );
-            Ok(())
+            ActionResult::Ok
         }
         Action::Status | Action::Unlock => {
-            // Handled in an early-return above. Unreachable here.
-            unreachable!("status/unlock handled before OANDA dispatch")
+            // Handled before broker dispatch; never reached here.
+            unreachable!("status/unlock handled before broker dispatch")
+        }
+    }
+}
+
+async fn run_enter<B: Broker>(
+    broker: &B,
+    store: &KvStateStore,
+    verified: &incoming::Verified,
+    env: &Env,
+    _now: chrono::DateTime<chrono::Utc>,
+) -> ActionResult {
+    // Cooldown gate
+    match store.is_cooled_down(&verified.intent.instrument).await {
+        Ok(true) => {
+            console_log!(
+                "entry rejected: {} cooled down (id={})",
+                verified.intent.instrument,
+                verified.intent.id
+            );
+            return ActionResult::EarlyReturn(Response::error("instrument cooled down", 423));
+        }
+        Ok(false) => {}
+        Err(err) => {
+            console_error!("KV is_cooled_down: {err}");
+            return ActionResult::EarlyReturn(Response::error("state error", 500));
+        }
+    }
+
+    let max_risk_pct = secret_or_default(env, MAX_RISK_PCT_PER_TRADE_SECRET, 1.0);
+    let max_open_positions = secret_or_default(env, MAX_OPEN_POSITIONS_SECRET, 3.0) as u32;
+    let pip_size = pip_size_for(env, &verified.intent.instrument);
+
+    let resolved = match Resolved::from_intent(&verified.intent, &verified.shell, pip_size) {
+        Ok(r) => r,
+        Err(err) => {
+            console_error!("resolve: {err}");
+            return ActionResult::EarlyReturn(Response::error("rejected", 400));
         }
     };
-
-    match result {
-        Ok(()) => {
-            // Record id to block replays. Best-effort: if KV write fails after a successful
-            // trade we log but still return 200 — failing here would invite the caller to retry
-            // and re-execute the trade.
-            let ttl = incoming::replay_ttl_seconds(verified.intent.not_after, now);
-            if let Err(err) = store.mark_seen(&verified.intent.id, ttl).await {
-                console_error!("KV mark_seen after success: {err}");
-            }
-            Response::ok("ok")
+    let entry_request = EntryRequest {
+        instrument: &resolved.instrument,
+        direction: resolved.direction,
+        entry: resolved.entry.clone(),
+        stop_loss: resolved.stop_loss,
+        take_profit: resolved.take_profit,
+        risk_pct: resolved.risk_pct,
+    };
+    match broker
+        .place_entry(max_risk_pct, max_open_positions, &entry_request)
+        .await
+    {
+        Ok(order_id) => {
+            console_log!("entry placed id={} order={}", verified.intent.id, order_id);
+            ActionResult::Ok
         }
-        Err(_) => Response::error("action failed", 502),
+        Err(err) => {
+            console_error!("entry failed: {err}");
+            ActionResult::Failed
+        }
     }
 }
 
