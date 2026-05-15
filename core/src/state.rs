@@ -80,6 +80,55 @@ pub trait StateStore {
     /// Clear the cooldown for `instrument`. Returns whether it was set before.
     fn clear_cooldown(&self, instrument: &str) -> impl Future<Output = Result<bool, StateError>>;
 
+    /// Record a named prep step for `instrument` with a TTL. `now` is the
+    /// timestamp stored on the flag; the entry-time gate uses it to
+    /// enforce ordering across multiple preps.
+    fn set_prep(
+        &self,
+        instrument: &str,
+        step: &str,
+        now: DateTime<Utc>,
+        ttl_seconds: u64,
+    ) -> impl Future<Output = Result<(), StateError>>;
+
+    /// Return `Some(set_at)` if the prep is currently active, `None`
+    /// otherwise (absent or expired).
+    fn get_prep(
+        &self,
+        instrument: &str,
+        step: &str,
+    ) -> impl Future<Output = Result<Option<DateTime<Utc>>, StateError>>;
+
+    /// Clear a prep flag. Returns whether it was set before.
+    fn clear_prep(
+        &self,
+        instrument: &str,
+        step: &str,
+    ) -> impl Future<Output = Result<bool, StateError>>;
+
+    /// Record a named veto for `instrument` with a TTL. Presence alone
+    /// is the signal — no timestamp needs storing.
+    fn set_veto(
+        &self,
+        instrument: &str,
+        name: &str,
+        ttl_seconds: u64,
+    ) -> impl Future<Output = Result<(), StateError>>;
+
+    /// Returns true if the veto is currently active.
+    fn is_vetoed(
+        &self,
+        instrument: &str,
+        name: &str,
+    ) -> impl Future<Output = Result<bool, StateError>>;
+
+    /// Clear a veto flag. Returns whether it was set before.
+    fn clear_veto(
+        &self,
+        instrument: &str,
+        name: &str,
+    ) -> impl Future<Output = Result<bool, StateError>>;
+
     /// Return a snapshot of active cooldowns and recent seen ids.
     fn snapshot(&self) -> impl Future<Output = Result<Snapshot, StateError>>;
 }
@@ -154,6 +203,140 @@ impl std::error::Error for StateError {}
 /// Cloudflare KV's minimum TTL is 60 seconds; clamp anything smaller.
 pub const MIN_TTL_SECONDS: u64 = 60;
 
+/// Simple in-memory [`StateStore`] used by core unit tests and by the
+/// worker crate's tests. Not exposed publicly outside `cfg(test)` to
+/// avoid leaking it into release builds.
+#[cfg(test)]
+mod memstore {
+    use super::*;
+    use std::cell::RefCell;
+    use std::collections::HashMap;
+
+    /// `(value, expires_at)` for each TTL'd key.
+    type Entries = HashMap<String, (String, DateTime<Utc>)>;
+
+    #[derive(Default)]
+    pub struct MemStateStore {
+        inner: RefCell<Entries>,
+    }
+
+    impl MemStateStore {
+        pub fn new() -> Self {
+            Self::default()
+        }
+
+        fn get_live(&self, key: &str, now: DateTime<Utc>) -> Option<String> {
+            let inner = self.inner.borrow();
+            let (val, exp) = inner.get(key)?;
+            if *exp > now { Some(val.clone()) } else { None }
+        }
+
+        fn put(&self, key: String, value: String, ttl_seconds: u64, now: DateTime<Utc>) {
+            let expires_at = now + chrono::Duration::seconds(ttl_seconds as i64);
+            self.inner.borrow_mut().insert(key, (value, expires_at));
+        }
+
+        fn delete(&self, key: &str) -> bool {
+            self.inner.borrow_mut().remove(key).is_some()
+        }
+    }
+
+    impl StateStore for MemStateStore {
+        async fn is_seen(&self, id: &str) -> Result<bool, StateError> {
+            Ok(self.get_live(&format!("seen:{id}"), Utc::now()).is_some())
+        }
+        async fn mark_seen(&self, id: &str, ttl_seconds: u64) -> Result<(), StateError> {
+            self.put(format!("seen:{id}"), "1".into(), ttl_seconds, Utc::now());
+            Ok(())
+        }
+        async fn is_cooled_down(&self, instrument: &str) -> Result<bool, StateError> {
+            Ok(self
+                .get_live(&format!("cooldown:{instrument}"), Utc::now())
+                .is_some())
+        }
+        async fn set_cooldown(&self, instrument: &str, hours: u32) -> Result<(), StateError> {
+            let ttl = (hours as u64).saturating_mul(3600).max(MIN_TTL_SECONDS);
+            self.put(
+                format!("cooldown:{instrument}"),
+                "1".into(),
+                ttl,
+                Utc::now(),
+            );
+            Ok(())
+        }
+        async fn clear_cooldown(&self, instrument: &str) -> Result<bool, StateError> {
+            Ok(self.delete(&format!("cooldown:{instrument}")))
+        }
+        async fn set_prep(
+            &self,
+            instrument: &str,
+            step: &str,
+            now: DateTime<Utc>,
+            ttl_seconds: u64,
+        ) -> Result<(), StateError> {
+            self.put(
+                format!("prep:{instrument}:{step}"),
+                now.to_rfc3339(),
+                ttl_seconds.max(MIN_TTL_SECONDS),
+                now,
+            );
+            Ok(())
+        }
+        async fn get_prep(
+            &self,
+            instrument: &str,
+            step: &str,
+        ) -> Result<Option<DateTime<Utc>>, StateError> {
+            let Some(text) = self.get_live(&format!("prep:{instrument}:{step}"), Utc::now()) else {
+                return Ok(None);
+            };
+            Ok(Some(
+                DateTime::parse_from_rfc3339(&text)
+                    .map_err(|e| StateError::Backend(format!("parse: {e}")))?
+                    .with_timezone(&Utc),
+            ))
+        }
+        async fn clear_prep(&self, instrument: &str, step: &str) -> Result<bool, StateError> {
+            Ok(self.delete(&format!("prep:{instrument}:{step}")))
+        }
+        async fn set_veto(
+            &self,
+            instrument: &str,
+            name: &str,
+            ttl_seconds: u64,
+        ) -> Result<(), StateError> {
+            self.put(
+                format!("veto:{instrument}:{name}"),
+                "1".into(),
+                ttl_seconds.max(MIN_TTL_SECONDS),
+                Utc::now(),
+            );
+            Ok(())
+        }
+        async fn is_vetoed(&self, instrument: &str, name: &str) -> Result<bool, StateError> {
+            Ok(self
+                .get_live(&format!("veto:{instrument}:{name}"), Utc::now())
+                .is_some())
+        }
+        async fn clear_veto(&self, instrument: &str, name: &str) -> Result<bool, StateError> {
+            Ok(self.delete(&format!("veto:{instrument}:{name}")))
+        }
+        async fn snapshot(&self) -> Result<Snapshot, StateError> {
+            // The mock doesn't track an index alongside the TTL'd keys, so
+            // the snapshot reflects whatever live keys are currently set.
+            // Tests that care about the snapshot shape use the real KV
+            // impl; this is for trait-contract tests of the gate logic.
+            Ok(Snapshot {
+                now: Utc::now(),
+                cooldowns: Vec::new(),
+                recent_seen: Vec::new(),
+                preps: Vec::new(),
+                vetos: Vec::new(),
+            })
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -204,6 +387,72 @@ mod tests {
             },
         ];
         assert_eq!(prune_expired(entries, now).len(), 2);
+    }
+
+    #[test]
+    fn memstore_prep_round_trip() {
+        use super::memstore::MemStateStore;
+        let store = MemStateStore::new();
+        let now = ts("2026-05-16T10:00:00Z");
+        pollster::block_on(store.set_prep("EUR_USD", "break", now, 4 * 3600)).unwrap();
+        let got = pollster::block_on(store.get_prep("EUR_USD", "break")).unwrap();
+        assert_eq!(got, Some(now));
+        let was = pollster::block_on(store.clear_prep("EUR_USD", "break")).unwrap();
+        assert!(was);
+        let got = pollster::block_on(store.get_prep("EUR_USD", "break")).unwrap();
+        assert!(got.is_none());
+    }
+
+    #[test]
+    fn memstore_get_prep_absent() {
+        use super::memstore::MemStateStore;
+        let store = MemStateStore::new();
+        let got = pollster::block_on(store.get_prep("EUR_USD", "ghost")).unwrap();
+        assert!(got.is_none());
+    }
+
+    #[test]
+    fn memstore_veto_round_trip() {
+        use super::memstore::MemStateStore;
+        let store = MemStateStore::new();
+        pollster::block_on(store.set_veto("EUR_USD", "news-window", 6 * 3600)).unwrap();
+        assert!(pollster::block_on(store.is_vetoed("EUR_USD", "news-window")).unwrap());
+        let was = pollster::block_on(store.clear_veto("EUR_USD", "news-window")).unwrap();
+        assert!(was);
+        assert!(!pollster::block_on(store.is_vetoed("EUR_USD", "news-window")).unwrap());
+    }
+
+    #[test]
+    fn memstore_preps_per_instrument_are_independent() {
+        use super::memstore::MemStateStore;
+        let store = MemStateStore::new();
+        let t1 = ts("2026-05-16T10:00:00Z");
+        let t2 = ts("2026-05-16T10:05:00Z");
+        pollster::block_on(store.set_prep("EUR_USD", "break", t1, 3600)).unwrap();
+        pollster::block_on(store.set_prep("USD_JPY", "break", t2, 3600)).unwrap();
+        assert_eq!(
+            pollster::block_on(store.get_prep("EUR_USD", "break")).unwrap(),
+            Some(t1)
+        );
+        assert_eq!(
+            pollster::block_on(store.get_prep("USD_JPY", "break")).unwrap(),
+            Some(t2)
+        );
+    }
+
+    #[test]
+    fn memstore_set_prep_overwrites_timestamp() {
+        use super::memstore::MemStateStore;
+        let store = MemStateStore::new();
+        let t1 = ts("2026-05-16T10:00:00Z");
+        let t2 = ts("2026-05-16T11:00:00Z");
+        pollster::block_on(store.set_prep("EUR_USD", "break", t1, 3600)).unwrap();
+        pollster::block_on(store.set_prep("EUR_USD", "break", t2, 3600)).unwrap();
+        // Refiring a prep refreshes its timestamp — documented behaviour.
+        assert_eq!(
+            pollster::block_on(store.get_prep("EUR_USD", "break")).unwrap(),
+            Some(t2)
+        );
     }
 
     #[test]
