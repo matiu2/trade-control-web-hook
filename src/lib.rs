@@ -78,16 +78,15 @@ pub async fn main(mut req: Request, env: Env, _ctx: Context) -> Result<Response>
         }
     }
 
-    // Status and Unlock are control actions that don't touch OANDA; handle
-    // them up front so we don't waste an OANDA login on them. Prep / Veto
-    // and their clear actions are KV-only too — wired in a later commit;
-    // for now they 501.
+    // Control actions don't touch the broker; handle them up front so we
+    // don't waste a broker login on them.
     match verified.intent.action {
         Action::Status => return handle_status(&store, &verified, now).await,
         Action::Unlock => return handle_unlock(&store, &verified, now).await,
-        Action::Prep | Action::Veto | Action::ClearPrep | Action::ClearVeto => {
-            return Response::error("not implemented", 501);
-        }
+        Action::Prep => return handle_prep(&store, &verified, now).await,
+        Action::Veto => return handle_veto(&store, &verified, now).await,
+        Action::ClearPrep => return handle_clear_prep(&store, &verified, now).await,
+        Action::ClearVeto => return handle_clear_veto(&store, &verified, now).await,
         _ => {}
     }
 
@@ -211,6 +210,59 @@ async fn run_enter<B: Broker>(
         }
     }
 
+    // Prep gate — every name in `requires_preps` must be currently set,
+    // and the stored `set_at` timestamps must be strictly increasing in
+    // list order.
+    let mut prev_ts: Option<chrono::DateTime<chrono::Utc>> = None;
+    for step in &verified.intent.requires_preps {
+        match store.get_prep(&verified.intent.instrument, step).await {
+            Ok(Some(set_at)) => {
+                if let Some(prev) = prev_ts
+                    && set_at <= prev
+                {
+                    console_log!(
+                        "entry rejected: prep {} not after previous (id={})",
+                        step,
+                        verified.intent.id
+                    );
+                    return ActionResult::EarlyReturn(Response::error("prep order violated", 412));
+                }
+                prev_ts = Some(set_at);
+            }
+            Ok(None) => {
+                console_log!(
+                    "entry rejected: missing prep {} (id={})",
+                    step,
+                    verified.intent.id
+                );
+                return ActionResult::EarlyReturn(Response::error("missing prep", 412));
+            }
+            Err(err) => {
+                console_error!("KV get_prep: {err}");
+                return ActionResult::EarlyReturn(Response::error("state error", 500));
+            }
+        }
+    }
+
+    // Veto gate — entry is rejected if any opted-in veto is active.
+    for veto in &verified.intent.vetos {
+        match store.is_vetoed(&verified.intent.instrument, veto).await {
+            Ok(true) => {
+                console_log!(
+                    "entry rejected: veto {} active (id={})",
+                    veto,
+                    verified.intent.id
+                );
+                return ActionResult::EarlyReturn(Response::error("veto active", 412));
+            }
+            Ok(false) => {}
+            Err(err) => {
+                console_error!("KV is_vetoed: {err}");
+                return ActionResult::EarlyReturn(Response::error("state error", 500));
+            }
+        }
+    }
+
     let max_risk_pct = secret_or_default(env, MAX_RISK_PCT_PER_TRADE_SECRET, 1.0);
     let max_open_positions = secret_or_default(env, MAX_OPEN_POSITIONS_SECRET, 3.0) as u32;
     let pip_size = pip_size_for(env, &verified.intent.instrument);
@@ -302,6 +354,130 @@ async fn handle_unlock(
         console_error!("KV mark_seen after unlock: {err}");
     }
     Response::ok(body)
+}
+
+/// Handle the `prep` action: record a named step for an instrument with a TTL.
+async fn handle_prep(
+    store: &KvStateStore,
+    verified: &incoming::Verified,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<Response> {
+    let Some(step) = verified.intent.step.as_deref() else {
+        return Response::error("prep requires `step`", 400);
+    };
+    let Some(ttl_hours) = verified.intent.ttl_hours else {
+        return Response::error("prep requires `ttl_hours`", 400);
+    };
+    let ttl_seconds = (ttl_hours as u64).saturating_mul(3600);
+    if let Err(err) = store
+        .set_prep(&verified.intent.instrument, step, now, ttl_seconds)
+        .await
+    {
+        console_error!("KV set_prep: {err}");
+        return Response::error("state error", 500);
+    }
+    console_log!(
+        "prep set: {} {} ttl={}h",
+        verified.intent.instrument,
+        step,
+        ttl_hours
+    );
+    let ttl = incoming::replay_ttl_seconds(verified.intent.not_after, now);
+    if let Err(err) = store.mark_seen(&verified.intent.id, ttl).await {
+        console_error!("KV mark_seen after prep: {err}");
+    }
+    Response::ok("ok")
+}
+
+/// Handle the `veto` action: record a named veto for an instrument with a TTL.
+async fn handle_veto(
+    store: &KvStateStore,
+    verified: &incoming::Verified,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<Response> {
+    let Some(name) = verified.intent.name.as_deref() else {
+        return Response::error("veto requires `name`", 400);
+    };
+    let Some(ttl_hours) = verified.intent.ttl_hours else {
+        return Response::error("veto requires `ttl_hours`", 400);
+    };
+    let ttl_seconds = (ttl_hours as u64).saturating_mul(3600);
+    if let Err(err) = store
+        .set_veto(&verified.intent.instrument, name, ttl_seconds)
+        .await
+    {
+        console_error!("KV set_veto: {err}");
+        return Response::error("state error", 500);
+    }
+    console_log!(
+        "veto set: {} {} ttl={}h",
+        verified.intent.instrument,
+        name,
+        ttl_hours
+    );
+    let ttl = incoming::replay_ttl_seconds(verified.intent.not_after, now);
+    if let Err(err) = store.mark_seen(&verified.intent.id, ttl).await {
+        console_error!("KV mark_seen after veto: {err}");
+    }
+    Response::ok("ok")
+}
+
+/// Handle the `clear-prep` action: drop a single prep flag.
+async fn handle_clear_prep(
+    store: &KvStateStore,
+    verified: &incoming::Verified,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<Response> {
+    let Some(step) = verified.intent.step.as_deref() else {
+        return Response::error("clear-prep requires `step`", 400);
+    };
+    let was = match store.clear_prep(&verified.intent.instrument, step).await {
+        Ok(b) => b,
+        Err(err) => {
+            console_error!("KV clear_prep: {err}");
+            return Response::error("state error", 500);
+        }
+    };
+    console_log!(
+        "clear-prep {} {} was_set={}",
+        verified.intent.instrument,
+        step,
+        was
+    );
+    let ttl = incoming::replay_ttl_seconds(verified.intent.not_after, now);
+    if let Err(err) = store.mark_seen(&verified.intent.id, ttl).await {
+        console_error!("KV mark_seen after clear-prep: {err}");
+    }
+    Response::ok("ok")
+}
+
+/// Handle the `clear-veto` action: drop a single veto flag.
+async fn handle_clear_veto(
+    store: &KvStateStore,
+    verified: &incoming::Verified,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<Response> {
+    let Some(name) = verified.intent.name.as_deref() else {
+        return Response::error("clear-veto requires `name`", 400);
+    };
+    let was = match store.clear_veto(&verified.intent.instrument, name).await {
+        Ok(b) => b,
+        Err(err) => {
+            console_error!("KV clear_veto: {err}");
+            return Response::error("state error", 500);
+        }
+    };
+    console_log!(
+        "clear-veto {} {} was_set={}",
+        verified.intent.instrument,
+        name,
+        was
+    );
+    let ttl = incoming::replay_ttl_seconds(verified.intent.not_after, now);
+    if let Err(err) = store.mark_seen(&verified.intent.id, ttl).await {
+        console_error!("KV mark_seen after clear-veto: {err}");
+    }
+    Response::ok("ok")
 }
 
 /// Read a secret. Returns `None` if the binding is absent or unreadable.
