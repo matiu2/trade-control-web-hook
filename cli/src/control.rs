@@ -62,6 +62,74 @@ pub fn build_unlock_intent(instrument: &str, now: DateTime<Utc>, suffix: &str) -
     control_skeleton(Action::Unlock, instrument, id, now)
 }
 
+/// Build a `prep` Intent for a single (instrument, step) pair with a TTL.
+pub fn build_prep_intent(
+    instrument: &str,
+    step: &str,
+    ttl_hours: u32,
+    now: DateTime<Utc>,
+    suffix: &str,
+) -> Intent {
+    let id = format!(
+        "prep-{instrument}-{step}-{}-{suffix}",
+        now.format("%Y-%m-%dT%H%M%S")
+    );
+    let mut intent = control_skeleton(Action::Prep, instrument, id, now);
+    intent.step = Some(step.to_string());
+    intent.ttl_hours = Some(ttl_hours);
+    intent
+}
+
+/// Build a `veto` Intent for a single (instrument, name) pair with a TTL.
+pub fn build_veto_intent(
+    instrument: &str,
+    name: &str,
+    ttl_hours: u32,
+    now: DateTime<Utc>,
+    suffix: &str,
+) -> Intent {
+    let id = format!(
+        "veto-{instrument}-{name}-{}-{suffix}",
+        now.format("%Y-%m-%dT%H%M%S")
+    );
+    let mut intent = control_skeleton(Action::Veto, instrument, id, now);
+    intent.name = Some(name.to_string());
+    intent.ttl_hours = Some(ttl_hours);
+    intent
+}
+
+/// Build a `clear-prep` Intent for a single (instrument, step) pair.
+pub fn build_clear_prep_intent(
+    instrument: &str,
+    step: &str,
+    now: DateTime<Utc>,
+    suffix: &str,
+) -> Intent {
+    let id = format!(
+        "clear-prep-{instrument}-{step}-{}-{suffix}",
+        now.format("%Y-%m-%dT%H%M%S")
+    );
+    let mut intent = control_skeleton(Action::ClearPrep, instrument, id, now);
+    intent.step = Some(step.to_string());
+    intent
+}
+
+/// Build a `clear-veto` Intent for a single (instrument, name) pair.
+pub fn build_clear_veto_intent(
+    instrument: &str,
+    name: &str,
+    now: DateTime<Utc>,
+    suffix: &str,
+) -> Intent {
+    let id = format!(
+        "clear-veto-{instrument}-{name}-{}-{suffix}",
+        now.format("%Y-%m-%dT%H%M%S")
+    );
+    let mut intent = control_skeleton(Action::ClearVeto, instrument, id, now);
+    intent.name = Some(name.to_string());
+    intent
+}
+
 /// Serialise the intent as YAML, encrypt under `key`, and wrap in the
 /// hybrid plaintext-shell envelope the worker expects.
 pub fn wrap_in_envelope(
@@ -111,6 +179,45 @@ mod tests {
         let parsed: Intent = serde_yaml::from_str(&yaml).unwrap();
         assert_eq!(parsed.action, Action::Unlock);
         assert_eq!(parsed.instrument, "USD_JPY");
+    }
+
+    #[test]
+    fn prep_intent_round_trips() {
+        let intent = build_prep_intent("EUR_USD", "break-and-close", 4, t(), "ab12");
+        assert_eq!(intent.action, Action::Prep);
+        assert_eq!(intent.instrument, "EUR_USD");
+        assert_eq!(intent.step.as_deref(), Some("break-and-close"));
+        assert_eq!(intent.ttl_hours, Some(4));
+        let yaml = serde_yaml::to_string(&intent).unwrap();
+        let parsed: Intent = serde_yaml::from_str(&yaml).unwrap();
+        assert_eq!(parsed.action, Action::Prep);
+        assert_eq!(parsed.step.as_deref(), Some("break-and-close"));
+    }
+
+    #[test]
+    fn veto_intent_round_trips() {
+        let intent = build_veto_intent("EUR_USD", "news-window", 6, t(), "cd34");
+        assert_eq!(intent.action, Action::Veto);
+        assert_eq!(intent.name.as_deref(), Some("news-window"));
+        assert_eq!(intent.ttl_hours, Some(6));
+        let yaml = serde_yaml::to_string(&intent).unwrap();
+        let parsed: Intent = serde_yaml::from_str(&yaml).unwrap();
+        assert_eq!(parsed.action, Action::Veto);
+    }
+
+    #[test]
+    fn clear_prep_intent_carries_step() {
+        let intent = build_clear_prep_intent("EUR_USD", "retest", t(), "ef56");
+        assert_eq!(intent.action, Action::ClearPrep);
+        assert_eq!(intent.step.as_deref(), Some("retest"));
+        assert_eq!(intent.ttl_hours, None);
+    }
+
+    #[test]
+    fn clear_veto_intent_carries_name() {
+        let intent = build_clear_veto_intent("EUR_USD", "news-window", t(), "gh78");
+        assert_eq!(intent.action, Action::ClearVeto);
+        assert_eq!(intent.name.as_deref(), Some("news-window"));
     }
 
     #[test]

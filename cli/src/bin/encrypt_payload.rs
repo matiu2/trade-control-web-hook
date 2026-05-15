@@ -18,8 +18,9 @@ use chrono::Utc;
 use clap::{Parser, Subcommand};
 use color_eyre::eyre::{Context, Result, eyre};
 use trade_control_cli::{
-    KEY_LEN, build_status_intent, build_unlock_intent, build_yaml_template, encrypt_intent,
-    fill_missing_fields, generate_key_hex, wrap_in_envelope,
+    KEY_LEN, build_clear_prep_intent, build_clear_veto_intent, build_prep_intent,
+    build_status_intent, build_unlock_intent, build_veto_intent, build_yaml_template,
+    encrypt_intent, fill_missing_fields, generate_key_hex, wrap_in_envelope,
 };
 
 #[derive(Parser)]
@@ -42,6 +43,14 @@ enum Cmd {
     Status(EndpointArgs),
     /// Clear the cooldown for one instrument on the deployed worker.
     Unlock(UnlockCmdArgs),
+    /// Record a named prep step for an instrument with a TTL.
+    Prep(PrepCmdArgs),
+    /// Record a named veto for an instrument with a TTL.
+    Veto(VetoCmdArgs),
+    /// Clear a single prep flag.
+    ClearPrep(ClearPrepCmdArgs),
+    /// Clear a single veto flag.
+    ClearVeto(ClearVetoCmdArgs),
 }
 
 #[derive(Parser)]
@@ -59,6 +68,52 @@ struct EndpointArgs {
 struct UnlockCmdArgs {
     /// Instrument to unlock, e.g. EUR_USD.
     instrument: String,
+    #[command(flatten)]
+    common: EndpointArgs,
+}
+
+#[derive(Parser)]
+struct PrepCmdArgs {
+    /// Instrument the prep applies to, e.g. EUR_USD.
+    instrument: String,
+    /// Named step that landed, e.g. break-and-close.
+    step: String,
+    /// TTL in hours before the prep auto-expires.
+    #[arg(long, default_value_t = 4)]
+    ttl_hours: u32,
+    #[command(flatten)]
+    common: EndpointArgs,
+}
+
+#[derive(Parser)]
+struct VetoCmdArgs {
+    /// Instrument the veto applies to, e.g. EUR_USD.
+    instrument: String,
+    /// Named condition blocking entries, e.g. news-window.
+    name: String,
+    /// TTL in hours before the veto auto-expires.
+    #[arg(long, default_value_t = 6)]
+    ttl_hours: u32,
+    #[command(flatten)]
+    common: EndpointArgs,
+}
+
+#[derive(Parser)]
+struct ClearPrepCmdArgs {
+    /// Instrument the prep applies to.
+    instrument: String,
+    /// Named step to clear.
+    step: String,
+    #[command(flatten)]
+    common: EndpointArgs,
+}
+
+#[derive(Parser)]
+struct ClearVetoCmdArgs {
+    /// Instrument the veto applies to.
+    instrument: String,
+    /// Named veto to clear.
+    name: String,
     #[command(flatten)]
     common: EndpointArgs,
 }
@@ -88,6 +143,10 @@ fn main() -> Result<()> {
         Cmd::Encrypt(args) => run_encrypt(args)?,
         Cmd::Status(args) => run_status(args)?,
         Cmd::Unlock(args) => run_unlock(args)?,
+        Cmd::Prep(args) => run_prep(args)?,
+        Cmd::Veto(args) => run_veto(args)?,
+        Cmd::ClearPrep(args) => run_clear_prep(args)?,
+        Cmd::ClearVeto(args) => run_clear_veto(args)?,
     }
     Ok(())
 }
@@ -142,6 +201,50 @@ fn run_unlock(args: UnlockCmdArgs) -> Result<()> {
     let now = Utc::now();
     let suffix = fresh_suffix()?;
     let intent = build_unlock_intent(&args.instrument, now, &suffix);
+    let body = wrap_in_envelope(&intent, &key, now)?;
+    let response = post_control(&args.common.endpoint, &body)?;
+    print!("{response}");
+    Ok(())
+}
+
+fn run_prep(args: PrepCmdArgs) -> Result<()> {
+    let key = load_key(&args.common.key_file)?;
+    let now = Utc::now();
+    let suffix = fresh_suffix()?;
+    let intent = build_prep_intent(&args.instrument, &args.step, args.ttl_hours, now, &suffix);
+    let body = wrap_in_envelope(&intent, &key, now)?;
+    let response = post_control(&args.common.endpoint, &body)?;
+    print!("{response}");
+    Ok(())
+}
+
+fn run_veto(args: VetoCmdArgs) -> Result<()> {
+    let key = load_key(&args.common.key_file)?;
+    let now = Utc::now();
+    let suffix = fresh_suffix()?;
+    let intent = build_veto_intent(&args.instrument, &args.name, args.ttl_hours, now, &suffix);
+    let body = wrap_in_envelope(&intent, &key, now)?;
+    let response = post_control(&args.common.endpoint, &body)?;
+    print!("{response}");
+    Ok(())
+}
+
+fn run_clear_prep(args: ClearPrepCmdArgs) -> Result<()> {
+    let key = load_key(&args.common.key_file)?;
+    let now = Utc::now();
+    let suffix = fresh_suffix()?;
+    let intent = build_clear_prep_intent(&args.instrument, &args.step, now, &suffix);
+    let body = wrap_in_envelope(&intent, &key, now)?;
+    let response = post_control(&args.common.endpoint, &body)?;
+    print!("{response}");
+    Ok(())
+}
+
+fn run_clear_veto(args: ClearVetoCmdArgs) -> Result<()> {
+    let key = load_key(&args.common.key_file)?;
+    let now = Utc::now();
+    let suffix = fresh_suffix()?;
+    let intent = build_clear_veto_intent(&args.instrument, &args.name, now, &suffix);
     let body = wrap_in_envelope(&intent, &key, now)?;
     let response = post_control(&args.common.endpoint, &body)?;
     print!("{response}");
