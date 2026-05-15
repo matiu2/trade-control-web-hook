@@ -35,6 +35,10 @@ pub fn required_for_action(action: Action) -> &'static [&'static str] {
         ],
         Action::Close => &[],
         Action::Invalidate => &["cooldown_hours"],
+        Action::Prep => &["step", "ttl_hours"],
+        Action::Veto => &["name", "ttl_hours"],
+        Action::ClearPrep => &["step"],
+        Action::ClearVeto => &["name"],
         // `instrument` is already in `ALWAYS_REQUIRED`; nothing extra needed.
         Action::Status | Action::Unlock => &[],
     }

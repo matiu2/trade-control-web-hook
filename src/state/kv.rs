@@ -193,6 +193,8 @@ impl StateStore for KvStateStore {
             now,
             cooldowns,
             recent_seen,
+            preps: Vec::new(),
+            vetos: Vec::new(),
         })
     }
 }

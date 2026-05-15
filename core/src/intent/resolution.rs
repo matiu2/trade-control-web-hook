@@ -290,6 +290,11 @@ mod tests {
             cooldown_hours: None,
             min_r: None,
             broker: BrokerKind::Oanda,
+            step: None,
+            name: None,
+            ttl_hours: None,
+            requires_preps: Vec::new(),
+            vetos: Vec::new(),
         }
     }
 

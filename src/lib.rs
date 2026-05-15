@@ -79,10 +79,15 @@ pub async fn main(mut req: Request, env: Env, _ctx: Context) -> Result<Response>
     }
 
     // Status and Unlock are control actions that don't touch OANDA; handle
-    // them up front so we don't waste an OANDA login on them.
+    // them up front so we don't waste an OANDA login on them. Prep / Veto
+    // and their clear actions are KV-only too — wired in a later commit;
+    // for now they 501.
     match verified.intent.action {
         Action::Status => return handle_status(&store, &verified, now).await,
         Action::Unlock => return handle_unlock(&store, &verified, now).await,
+        Action::Prep | Action::Veto | Action::ClearPrep | Action::ClearVeto => {
+            return Response::error("not implemented", 501);
+        }
         _ => {}
     }
 
@@ -170,9 +175,14 @@ async fn run_action<B: Broker>(
             );
             ActionResult::Ok
         }
-        Action::Status | Action::Unlock => {
+        Action::Status
+        | Action::Unlock
+        | Action::Prep
+        | Action::Veto
+        | Action::ClearPrep
+        | Action::ClearVeto => {
             // Handled before broker dispatch; never reached here.
-            unreachable!("status/unlock handled before broker dispatch")
+            unreachable!("non-broker actions handled before broker dispatch")
         }
     }
 }

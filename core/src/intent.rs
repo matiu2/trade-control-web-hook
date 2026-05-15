@@ -69,6 +69,28 @@ pub struct Intent {
     /// dispatch landed still work.
     #[serde(default)]
     pub broker: BrokerKind,
+    /// Required for `prep` / `clear-prep`. The named step that landed
+    /// (e.g. `break-and-close`, `retest`).
+    #[serde(default)]
+    pub step: Option<String>,
+    /// Required for `veto` / `clear-veto`. The named condition
+    /// blocking entries (e.g. `news-window`).
+    #[serde(default)]
+    pub name: Option<String>,
+    /// Required for `prep` / `veto`. TTL in hours for the flag.
+    #[serde(default)]
+    pub ttl_hours: Option<u32>,
+    /// Optional gate on `enter`. Ordered list of named preps that must
+    /// be active for this instrument; each prep's `set_at` timestamp
+    /// must be strictly greater than the previous prep's. Absent /
+    /// empty means no prep gate.
+    #[serde(default)]
+    pub requires_preps: Vec<String>,
+    /// Optional gate on `enter`. Entry is rejected if any of these named
+    /// vetos are active for this instrument. Absent / empty means no
+    /// veto gate.
+    #[serde(default)]
+    pub vetos: Vec<String>,
 }
 
 /// Which broker fulfils an intent. The serialised form is the
@@ -83,7 +105,7 @@ pub enum BrokerKind {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
-#[serde(rename_all = "lowercase")]
+#[serde(rename_all = "kebab-case")]
 pub enum Action {
     Enter,
     Close,
@@ -93,6 +115,17 @@ pub enum Action {
     Status,
     /// Clear a single instrument's cooldown.
     Unlock,
+    /// Record a named "prep" step for an instrument with a TTL. Used to
+    /// build up multi-event setups (e.g. break-and-close → retest →
+    /// entry) where the `enter` checks for prior preps.
+    Prep,
+    /// Record a named "veto" for an instrument with a TTL. Active vetos
+    /// block any `enter` that opts into checking them.
+    Veto,
+    /// Clear a single instrument's prep flag.
+    ClearPrep,
+    /// Clear a single instrument's veto flag.
+    ClearVeto,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
@@ -358,5 +391,140 @@ mod tests {
         let intent: Intent = serde_yaml::from_str(yaml).unwrap();
         assert_eq!(intent.action, Action::Invalidate);
         assert_eq!(intent.cooldown_hours, Some(12));
+    }
+
+    #[test]
+    fn prep_intent_parses_with_step_and_ttl() {
+        let yaml = "
+            v: 1
+            id: prep-1
+            not_after: \"2026-05-14T03:30:00Z\"
+            action: prep
+            instrument: EUR_USD
+            step: break-and-close
+            ttl_hours: 4
+        ";
+        let intent: Intent = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(intent.action, Action::Prep);
+        assert_eq!(intent.step.as_deref(), Some("break-and-close"));
+        assert_eq!(intent.ttl_hours, Some(4));
+    }
+
+    #[test]
+    fn veto_intent_parses_with_name_and_ttl() {
+        let yaml = "
+            v: 1
+            id: veto-1
+            not_after: \"2026-05-14T03:30:00Z\"
+            action: veto
+            instrument: EUR_USD
+            name: news-window
+            ttl_hours: 6
+        ";
+        let intent: Intent = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(intent.action, Action::Veto);
+        assert_eq!(intent.name.as_deref(), Some("news-window"));
+        assert_eq!(intent.ttl_hours, Some(6));
+    }
+
+    #[test]
+    fn clear_prep_action_parses_kebab_case() {
+        let yaml = "
+            v: 1
+            id: clear-prep-1
+            not_after: \"2026-05-14T03:30:00Z\"
+            action: clear-prep
+            instrument: EUR_USD
+            step: retest
+        ";
+        let intent: Intent = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(intent.action, Action::ClearPrep);
+        assert_eq!(intent.step.as_deref(), Some("retest"));
+    }
+
+    #[test]
+    fn clear_veto_action_parses_kebab_case() {
+        let yaml = "
+            v: 1
+            id: clear-veto-1
+            not_after: \"2026-05-14T03:30:00Z\"
+            action: clear-veto
+            instrument: EUR_USD
+            name: news-window
+        ";
+        let intent: Intent = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(intent.action, Action::ClearVeto);
+        assert_eq!(intent.name.as_deref(), Some("news-window"));
+    }
+
+    #[test]
+    fn enter_intent_defaults_empty_gate_lists() {
+        let yaml = "
+            v: 1
+            id: abc
+            not_after: \"2026-05-13T20:00:00Z\"
+            action: enter
+            instrument: EUR_USD
+            direction: long
+            entry: { type: market }
+            stop_loss: { from: low, offset_pips: -2 }
+            take_profit: { from: close, offset_r: 2.0 }
+            risk_pct: 0.5
+        ";
+        let intent: Intent = serde_yaml::from_str(yaml).unwrap();
+        assert!(intent.requires_preps.is_empty());
+        assert!(intent.vetos.is_empty());
+    }
+
+    #[test]
+    fn enter_intent_parses_requires_preps_and_vetos() {
+        let yaml = "
+            v: 1
+            id: abc
+            not_after: \"2026-05-13T20:00:00Z\"
+            action: enter
+            instrument: EUR_USD
+            direction: short
+            entry: { type: market }
+            stop_loss: { from: high, offset_pips: 2 }
+            take_profit: { from: close, offset_r: 2.0 }
+            risk_pct: 0.5
+            requires_preps: [break-and-close, retest]
+            vetos: [news-window]
+        ";
+        let intent: Intent = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(
+            intent.requires_preps,
+            vec!["break-and-close".to_string(), "retest".to_string()]
+        );
+        assert_eq!(intent.vetos, vec!["news-window".to_string()]);
+    }
+
+    #[test]
+    fn existing_actions_still_serialise_lowercase_after_kebab_switch() {
+        // `enter`, `close`, `invalidate`, `status`, `unlock` are single
+        // words — kebab-case and lowercase render identically. This test
+        // pins that contract so wire-compat with pre-existing encrypted
+        // intents survives the rename_all change.
+        assert_eq!(
+            serde_yaml::to_string(&Action::Enter).unwrap().trim(),
+            "enter"
+        );
+        assert_eq!(
+            serde_yaml::to_string(&Action::Close).unwrap().trim(),
+            "close"
+        );
+        assert_eq!(
+            serde_yaml::to_string(&Action::Invalidate).unwrap().trim(),
+            "invalidate"
+        );
+        assert_eq!(
+            serde_yaml::to_string(&Action::Status).unwrap().trim(),
+            "status"
+        );
+        assert_eq!(
+            serde_yaml::to_string(&Action::Unlock).unwrap().trim(),
+            "unlock"
+        );
     }
 }

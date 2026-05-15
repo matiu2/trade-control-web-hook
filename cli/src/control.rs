@@ -19,38 +19,16 @@ const CONTROL_TTL: Duration = Duration::minutes(5);
 /// ignores the field, but `ALWAYS_REQUIRED` insists it be present.
 const STATUS_INSTRUMENT: &str = "ALL";
 
-/// Build a status `Intent`. `suffix` is a short random tag appended to the
-/// id so two concurrent status calls don't collide on replay protection.
-pub fn build_status_intent(now: DateTime<Utc>, suffix: &str) -> Intent {
+/// Skeleton control `Intent` — fills the always-required fields plus
+/// `Action` / `instrument` / `id`, leaves every optional field empty.
+/// Specific builders override only what they care about.
+fn control_skeleton(action: Action, instrument: &str, id: String, now: DateTime<Utc>) -> Intent {
     Intent {
         v: 1,
-        id: format!("status-{}-{suffix}", now.format("%Y-%m-%dT%H%M%S")),
+        id,
         not_before: None,
         not_after: now + CONTROL_TTL,
-        action: Action::Status,
-        instrument: STATUS_INSTRUMENT.to_string(),
-        direction: None,
-        entry: None,
-        stop_loss: None,
-        take_profit: None,
-        risk_pct: None,
-        cooldown_hours: None,
-        min_r: None,
-        broker: BrokerKind::Oanda,
-    }
-}
-
-/// Build an unlock `Intent` for a single instrument.
-pub fn build_unlock_intent(instrument: &str, now: DateTime<Utc>, suffix: &str) -> Intent {
-    Intent {
-        v: 1,
-        id: format!(
-            "unlock-{instrument}-{}-{suffix}",
-            now.format("%Y-%m-%dT%H%M%S")
-        ),
-        not_before: None,
-        not_after: now + CONTROL_TTL,
-        action: Action::Unlock,
+        action,
         instrument: instrument.to_string(),
         direction: None,
         entry: None,
@@ -60,7 +38,28 @@ pub fn build_unlock_intent(instrument: &str, now: DateTime<Utc>, suffix: &str) -
         cooldown_hours: None,
         min_r: None,
         broker: BrokerKind::Oanda,
+        step: None,
+        name: None,
+        ttl_hours: None,
+        requires_preps: Vec::new(),
+        vetos: Vec::new(),
     }
+}
+
+/// Build a status `Intent`. `suffix` is a short random tag appended to the
+/// id so two concurrent status calls don't collide on replay protection.
+pub fn build_status_intent(now: DateTime<Utc>, suffix: &str) -> Intent {
+    let id = format!("status-{}-{suffix}", now.format("%Y-%m-%dT%H%M%S"));
+    control_skeleton(Action::Status, STATUS_INSTRUMENT, id, now)
+}
+
+/// Build an unlock `Intent` for a single instrument.
+pub fn build_unlock_intent(instrument: &str, now: DateTime<Utc>, suffix: &str) -> Intent {
+    let id = format!(
+        "unlock-{instrument}-{}-{suffix}",
+        now.format("%Y-%m-%dT%H%M%S")
+    );
+    control_skeleton(Action::Unlock, instrument, id, now)
 }
 
 /// Serialise the intent as YAML, encrypt under `key`, and wrap in the
