@@ -114,28 +114,75 @@ pub async fn main(mut req: Request, env: Env, _ctx: Context) -> Result<Response>
         }
     };
 
-    match result {
-        ActionResult::Ok => {
-            // Record id to block replays. Best-effort: if KV write fails after a successful
-            // trade we log but still return 200 — failing here would invite the caller to retry
-            // and re-execute the trade.
-            let ttl = incoming::replay_ttl_seconds(verified.intent.not_after, now);
-            if let Err(err) = store.mark_seen(&verified.intent.id, ttl).await {
-                console_error!("KV mark_seen after success: {err}");
-            }
-            Response::ok("ok")
+    // Every dispatch path records a seen entry — success, broker failure,
+    // or pre-broker rejection — so the operator can read back what
+    // happened to this id from the `status` snapshot.
+    let (response, outcome) = match result {
+        ActionResult::Ok(outcome) => (Response::ok("ok"), outcome),
+        ActionResult::Failed(outcome) => (Response::error("action failed", 502), outcome),
+        ActionResult::Rejected { response, outcome } => {
+            return mark_seen_and_return(&store, &verified, now, &outcome, response).await;
         }
-        ActionResult::Failed => Response::error("action failed", 502),
-        ActionResult::EarlyReturn(resp) => resp,
+    };
+    let ttl = incoming::replay_ttl_seconds(verified.intent.not_after, now);
+    if let Err(err) = store
+        .mark_seen(
+            &verified.intent.id,
+            verified.intent.action,
+            now,
+            &outcome,
+            ttl,
+        )
+        .await
+    {
+        console_error!("KV mark_seen after action: {err}");
     }
+    response
 }
 
-/// Outcome of an action dispatch — bubbles up early returns (HTTP errors with
-/// specific status codes) alongside the trade-level success/failure.
+/// Helper: record an outcome on the seen index and return the caller's
+/// response. Used by every early-return path so `status` always reflects
+/// what happened to an id.
+async fn mark_seen_and_return(
+    store: &KvStateStore,
+    verified: &incoming::Verified,
+    now: chrono::DateTime<chrono::Utc>,
+    outcome: &str,
+    response: Result<Response>,
+) -> Result<Response> {
+    let ttl = incoming::replay_ttl_seconds(verified.intent.not_after, now);
+    if let Err(err) = store
+        .mark_seen(
+            &verified.intent.id,
+            verified.intent.action,
+            now,
+            outcome,
+            ttl,
+        )
+        .await
+    {
+        console_error!("KV mark_seen on early return: {err}");
+    }
+    response
+}
+
+/// Outcome of an action dispatch. Every variant carries a short
+/// human-readable `outcome` string that lands in the `seen` index so
+/// `status` can answer "what did this id do?".
 enum ActionResult {
-    Ok,
-    Failed,
-    EarlyReturn(Result<Response>),
+    /// Action completed successfully. The outcome (e.g. `"entered"`) is
+    /// recorded against the seen id.
+    Ok(String),
+    /// Action reached the broker but the broker call failed. Recorded
+    /// against the seen id; HTTP response is 502.
+    Failed(String),
+    /// Action was rejected before reaching the broker (gate, validation,
+    /// state error). The `response` is returned to the caller and the
+    /// `outcome` is recorded against the seen id.
+    Rejected {
+        response: Result<Response>,
+        outcome: String,
+    },
 }
 
 /// Dispatch `Enter` / `Close` / `Invalidate` against an authenticated broker.
@@ -152,16 +199,22 @@ async fn run_action<B: Broker>(
         Action::Close => {
             let ok = broker.close_positions(&verified.intent.instrument).await;
             if ok {
-                ActionResult::Ok
+                ActionResult::Ok("closed".into())
             } else {
-                ActionResult::Failed
+                ActionResult::Failed("close-failed".into())
             }
         }
         Action::Invalidate => {
             let hours = verified.intent.cooldown_hours.unwrap_or(12);
-            if let Err(err) = store.set_cooldown(&verified.intent.instrument, hours).await {
+            if let Err(err) = store
+                .set_cooldown(&verified.intent.instrument, hours, now)
+                .await
+            {
                 console_error!("KV set_cooldown: {err}");
-                return ActionResult::EarlyReturn(Response::error("state error", 500));
+                return ActionResult::Rejected {
+                    response: Response::error("state error", 500),
+                    outcome: "rejected: state-error".into(),
+                };
             }
             let cancelled = broker
                 .cancel_pending_for_instrument(&verified.intent.instrument)
@@ -172,7 +225,9 @@ async fn run_action<B: Broker>(
                 hours,
                 cancelled
             );
-            ActionResult::Ok
+            ActionResult::Ok(format!(
+                "invalidated: cooldown {hours}h, cancelled {cancelled}"
+            ))
         }
         Action::Status
         | Action::Unlock
@@ -201,12 +256,18 @@ async fn run_enter<B: Broker>(
                 verified.intent.instrument,
                 verified.intent.id
             );
-            return ActionResult::EarlyReturn(Response::error("instrument cooled down", 423));
+            return ActionResult::Rejected {
+                response: Response::error("instrument cooled down", 423),
+                outcome: "rejected: cooled-down".into(),
+            };
         }
         Ok(false) => {}
         Err(err) => {
             console_error!("KV is_cooled_down: {err}");
-            return ActionResult::EarlyReturn(Response::error("state error", 500));
+            return ActionResult::Rejected {
+                response: Response::error("state error", 500),
+                outcome: "rejected: state-error".into(),
+            };
         }
     }
 
@@ -225,7 +286,10 @@ async fn run_enter<B: Broker>(
                         step,
                         verified.intent.id
                     );
-                    return ActionResult::EarlyReturn(Response::error("prep order violated", 412));
+                    return ActionResult::Rejected {
+                        response: Response::error("prep order violated", 412),
+                        outcome: format!("rejected: prep-order-violated ({step})"),
+                    };
                 }
                 prev_ts = Some(set_at);
             }
@@ -235,11 +299,17 @@ async fn run_enter<B: Broker>(
                     step,
                     verified.intent.id
                 );
-                return ActionResult::EarlyReturn(Response::error("missing prep", 412));
+                return ActionResult::Rejected {
+                    response: Response::error("missing prep", 412),
+                    outcome: format!("rejected: missing-prep ({step})"),
+                };
             }
             Err(err) => {
                 console_error!("KV get_prep: {err}");
-                return ActionResult::EarlyReturn(Response::error("state error", 500));
+                return ActionResult::Rejected {
+                    response: Response::error("state error", 500),
+                    outcome: "rejected: state-error".into(),
+                };
             }
         }
     }
@@ -253,12 +323,18 @@ async fn run_enter<B: Broker>(
                     veto,
                     verified.intent.id
                 );
-                return ActionResult::EarlyReturn(Response::error("veto active", 412));
+                return ActionResult::Rejected {
+                    response: Response::error("veto active", 412),
+                    outcome: format!("rejected: veto-active ({veto})"),
+                };
             }
             Ok(false) => {}
             Err(err) => {
                 console_error!("KV is_vetoed: {err}");
-                return ActionResult::EarlyReturn(Response::error("state error", 500));
+                return ActionResult::Rejected {
+                    response: Response::error("state error", 500),
+                    outcome: "rejected: state-error".into(),
+                };
             }
         }
     }
@@ -271,7 +347,10 @@ async fn run_enter<B: Broker>(
         Ok(r) => r,
         Err(err) => {
             console_error!("resolve: {err}");
-            return ActionResult::EarlyReturn(Response::error("rejected", 400));
+            return ActionResult::Rejected {
+                response: Response::error("rejected", 400),
+                outcome: "rejected: resolve-failed".into(),
+            };
         }
     };
     let entry_request = EntryRequest {
@@ -288,11 +367,11 @@ async fn run_enter<B: Broker>(
     {
         Ok(order_id) => {
             console_log!("entry placed id={} order={}", verified.intent.id, order_id);
-            ActionResult::Ok
+            ActionResult::Ok(format!("entered: order={order_id}"))
         }
         Err(err) => {
             console_error!("entry failed: {err}");
-            ActionResult::Failed
+            ActionResult::Failed(format!("entry-failed: {err}"))
         }
     }
 }
@@ -317,11 +396,32 @@ async fn handle_status(
             return Response::error("internal error", 500);
         }
     };
-    let ttl = incoming::replay_ttl_seconds(verified.intent.not_after, now);
-    if let Err(err) = store.mark_seen(&verified.intent.id, ttl).await {
-        console_error!("KV mark_seen after status: {err}");
-    }
+    record_seen(store, verified, now, "status").await;
     Response::ok(body)
+}
+
+/// Best-effort wrapper around `mark_seen`. Used by the dedicated control
+/// handlers (status / unlock / prep / veto / clear-*) so each one ends
+/// with one line instead of an `if let Err` repeated everywhere.
+async fn record_seen(
+    store: &KvStateStore,
+    verified: &incoming::Verified,
+    now: chrono::DateTime<chrono::Utc>,
+    outcome: &str,
+) {
+    let ttl = incoming::replay_ttl_seconds(verified.intent.not_after, now);
+    if let Err(err) = store
+        .mark_seen(
+            &verified.intent.id,
+            verified.intent.action,
+            now,
+            outcome,
+            ttl,
+        )
+        .await
+    {
+        console_error!("KV mark_seen ({outcome}): {err}");
+    }
 }
 
 /// Handle the `unlock` action: clear the cooldown for `verified.intent.instrument`.
@@ -349,10 +449,8 @@ async fn handle_unlock(
             return Response::error("internal error", 500);
         }
     };
-    let ttl = incoming::replay_ttl_seconds(verified.intent.not_after, now);
-    if let Err(err) = store.mark_seen(&verified.intent.id, ttl).await {
-        console_error!("KV mark_seen after unlock: {err}");
-    }
+    let outcome = if was { "unlocked" } else { "unlocked: noop" };
+    record_seen(store, verified, now, outcome).await;
     Response::ok(body)
 }
 
@@ -382,10 +480,8 @@ async fn handle_prep(
         step,
         ttl_hours
     );
-    let ttl = incoming::replay_ttl_seconds(verified.intent.not_after, now);
-    if let Err(err) = store.mark_seen(&verified.intent.id, ttl).await {
-        console_error!("KV mark_seen after prep: {err}");
-    }
+    let outcome = format!("prep-set: {step} ttl={ttl_hours}h");
+    record_seen(store, verified, now, &outcome).await;
     Response::ok("ok")
 }
 
@@ -415,10 +511,8 @@ async fn handle_veto(
         name,
         ttl_hours
     );
-    let ttl = incoming::replay_ttl_seconds(verified.intent.not_after, now);
-    if let Err(err) = store.mark_seen(&verified.intent.id, ttl).await {
-        console_error!("KV mark_seen after veto: {err}");
-    }
+    let outcome = format!("veto-set: {name} ttl={ttl_hours}h");
+    record_seen(store, verified, now, &outcome).await;
     Response::ok("ok")
 }
 
@@ -444,10 +538,12 @@ async fn handle_clear_prep(
         step,
         was
     );
-    let ttl = incoming::replay_ttl_seconds(verified.intent.not_after, now);
-    if let Err(err) = store.mark_seen(&verified.intent.id, ttl).await {
-        console_error!("KV mark_seen after clear-prep: {err}");
-    }
+    let outcome = if was {
+        format!("prep-cleared: {step}")
+    } else {
+        format!("prep-cleared: {step} (noop)")
+    };
+    record_seen(store, verified, now, &outcome).await;
     Response::ok("ok")
 }
 
@@ -473,10 +569,12 @@ async fn handle_clear_veto(
         name,
         was
     );
-    let ttl = incoming::replay_ttl_seconds(verified.intent.not_after, now);
-    if let Err(err) = store.mark_seen(&verified.intent.id, ttl).await {
-        console_error!("KV mark_seen after clear-veto: {err}");
-    }
+    let outcome = if was {
+        format!("veto-cleared: {name}")
+    } else {
+        format!("veto-cleared: {name} (noop)")
+    };
+    record_seen(store, verified, now, &outcome).await;
     Response::ok("ok")
 }
 

@@ -9,6 +9,7 @@
 //! the TTL keys never lie.
 
 use chrono::{DateTime, Utc};
+use trade_control_core::intent::Action;
 use trade_control_core::state::{
     CooldownEntry, MIN_TTL_SECONDS, PREP_INDEX_CAP, PrepEntry, SEEN_INDEX_CAP, SeenEntry, Snapshot,
     StateError, StateStore, VETO_INDEX_CAP, VetoEntry, prune_expired,
@@ -121,7 +122,14 @@ impl StateStore for KvStateStore {
         Ok(result.is_some())
     }
 
-    async fn mark_seen(&self, id: &str, ttl_seconds: u64) -> Result<(), StateError> {
+    async fn mark_seen(
+        &self,
+        id: &str,
+        action: Action,
+        seen_at: DateTime<Utc>,
+        outcome: &str,
+        ttl_seconds: u64,
+    ) -> Result<(), StateError> {
         let key = Self::seen_key(id);
         let ttl = ttl_seconds.max(MIN_TTL_SECONDS);
         self.store
@@ -133,14 +141,18 @@ impl StateStore for KvStateStore {
             .map_err(|e| StateError::Backend(format!("put seen execute: {e:?}")))?;
 
         // Update the seen index. Best-effort; the TTL key above is the
-        // authoritative replay-protection record.
-        let now = Utc::now();
-        let expires_at = now + chrono::Duration::seconds(ttl as i64);
-        let mut entries = prune_expired(self.read_seen_index().await?, now);
+        // authoritative replay-protection record. The index also carries
+        // action / seen_at / outcome so `status` can show what happened
+        // to each id rather than just listing bare expiry times.
+        let expires_at = seen_at + chrono::Duration::seconds(ttl as i64);
+        let mut entries = prune_expired(self.read_seen_index().await?, seen_at);
         // Drop any prior entry with the same id, then append.
         entries.retain(|e| e.id != id);
         entries.push(SeenEntry {
             id: id.to_string(),
+            action,
+            seen_at: Some(seen_at),
+            outcome: outcome.to_string(),
             expires_at,
         });
         // Cap to the most recent N — keeps the index small.
@@ -162,7 +174,12 @@ impl StateStore for KvStateStore {
         Ok(result.is_some())
     }
 
-    async fn set_cooldown(&self, instrument: &str, hours: u32) -> Result<(), StateError> {
+    async fn set_cooldown(
+        &self,
+        instrument: &str,
+        hours: u32,
+        now: DateTime<Utc>,
+    ) -> Result<(), StateError> {
         let key = Self::cooldown_key(instrument);
         let ttl = (hours as u64).saturating_mul(3600).max(MIN_TTL_SECONDS);
         self.store
@@ -173,12 +190,12 @@ impl StateStore for KvStateStore {
             .await
             .map_err(|e| StateError::Backend(format!("put cooldown execute: {e:?}")))?;
 
-        let now = Utc::now();
         let expires_at = now + chrono::Duration::seconds(ttl as i64);
         let mut entries = prune_expired(self.read_cooldown_index().await?, now);
         entries.retain(|e| e.instrument != instrument);
         entries.push(CooldownEntry {
             instrument: instrument.to_string(),
+            set_at: Some(now),
             expires_at,
         });
         self.write_cooldown_index(&entries).await

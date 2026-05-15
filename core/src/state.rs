@@ -11,18 +11,45 @@ use std::future::Future;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-/// One active cooldown row in a [`Snapshot`].
+use crate::intent::Action;
+
+/// One active cooldown row in a [`Snapshot`]. `set_at` records when the
+/// cooldown was put in place so the operator can see how long ago it
+/// started; `expires_at` is when it lapses on its own.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CooldownEntry {
     pub instrument: String,
+    /// Backfilled to `expires_at - hours` when missing (older entries in
+    /// live KV predate this field).
+    #[serde(default)]
+    pub set_at: Option<DateTime<Utc>>,
     pub expires_at: DateTime<Utc>,
 }
 
-/// One recently-seen replay-protection id in a [`Snapshot`].
+/// One recently-seen replay-protection id in a [`Snapshot`]. Beyond the
+/// id used for replay protection, we also carry the action that landed,
+/// when it arrived, and a short outcome string so the `status` view can
+/// answer "did this id enter a trade, or get rejected, and when relative
+/// to its cooldown?"
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SeenEntry {
     pub id: String,
+    /// Action that was attempted. Defaults to `Enter` for older entries
+    /// in live KV that were written before this field existed.
+    #[serde(default = "default_action")]
+    pub action: Action,
+    /// When the worker recorded the action. None on pre-existing entries.
+    #[serde(default)]
+    pub seen_at: Option<DateTime<Utc>>,
+    /// One-line outcome — e.g. `entered`, `rejected: cooled-down`,
+    /// `cooldown-set`, `unlocked`, `prep-set`. Empty for legacy entries.
+    #[serde(default)]
+    pub outcome: String,
     pub expires_at: DateTime<Utc>,
+}
+
+fn default_action() -> Action {
+    Action::Enter
 }
 
 /// One active "prep" flag row in a [`Snapshot`]. A prep records that a
@@ -63,18 +90,27 @@ pub trait StateStore {
     /// Returns true if `id` has already been recorded as seen.
     fn is_seen(&self, id: &str) -> impl Future<Output = Result<bool, StateError>>;
 
-    /// Mark `id` as seen with a TTL in seconds.
-    fn mark_seen(&self, id: &str, ttl_seconds: u64)
-    -> impl Future<Output = Result<(), StateError>>;
+    /// Mark `id` as seen with a TTL in seconds, recording the action and
+    /// outcome that ran on this id so `status` can show what happened.
+    fn mark_seen(
+        &self,
+        id: &str,
+        action: Action,
+        seen_at: DateTime<Utc>,
+        outcome: &str,
+        ttl_seconds: u64,
+    ) -> impl Future<Output = Result<(), StateError>>;
 
     /// Returns true if `instrument` is currently under cooldown.
     fn is_cooled_down(&self, instrument: &str) -> impl Future<Output = Result<bool, StateError>>;
 
-    /// Set a cooldown on `instrument` for `hours`.
+    /// Set a cooldown on `instrument` for `hours`. `now` is recorded as
+    /// the cooldown's start time so `status` shows how long ago it began.
     fn set_cooldown(
         &self,
         instrument: &str,
         hours: u32,
+        now: DateTime<Utc>,
     ) -> impl Future<Output = Result<(), StateError>>;
 
     /// Clear the cooldown for `instrument`. Returns whether it was set before.
@@ -245,8 +281,15 @@ mod memstore {
         async fn is_seen(&self, id: &str) -> Result<bool, StateError> {
             Ok(self.get_live(&format!("seen:{id}"), Utc::now()).is_some())
         }
-        async fn mark_seen(&self, id: &str, ttl_seconds: u64) -> Result<(), StateError> {
-            self.put(format!("seen:{id}"), "1".into(), ttl_seconds, Utc::now());
+        async fn mark_seen(
+            &self,
+            id: &str,
+            _action: Action,
+            seen_at: DateTime<Utc>,
+            _outcome: &str,
+            ttl_seconds: u64,
+        ) -> Result<(), StateError> {
+            self.put(format!("seen:{id}"), "1".into(), ttl_seconds, seen_at);
             Ok(())
         }
         async fn is_cooled_down(&self, instrument: &str) -> Result<bool, StateError> {
@@ -254,14 +297,14 @@ mod memstore {
                 .get_live(&format!("cooldown:{instrument}"), Utc::now())
                 .is_some())
         }
-        async fn set_cooldown(&self, instrument: &str, hours: u32) -> Result<(), StateError> {
+        async fn set_cooldown(
+            &self,
+            instrument: &str,
+            hours: u32,
+            now: DateTime<Utc>,
+        ) -> Result<(), StateError> {
             let ttl = (hours as u64).saturating_mul(3600).max(MIN_TTL_SECONDS);
-            self.put(
-                format!("cooldown:{instrument}"),
-                "1".into(),
-                ttl,
-                Utc::now(),
-            );
+            self.put(format!("cooldown:{instrument}"), "1".into(), ttl, now);
             Ok(())
         }
         async fn clear_cooldown(&self, instrument: &str) -> Result<bool, StateError> {
@@ -345,18 +388,30 @@ mod tests {
         s.parse().unwrap()
     }
 
+    fn cd(instrument: &str, expires_at: DateTime<Utc>) -> CooldownEntry {
+        CooldownEntry {
+            instrument: instrument.into(),
+            set_at: None,
+            expires_at,
+        }
+    }
+
+    fn se(id: &str, expires_at: DateTime<Utc>) -> SeenEntry {
+        SeenEntry {
+            id: id.into(),
+            action: Action::Enter,
+            seen_at: None,
+            outcome: String::new(),
+            expires_at,
+        }
+    }
+
     #[test]
     fn prune_expired_drops_past_entries() {
         let now = ts("2026-05-14T12:00:00Z");
         let entries = vec![
-            CooldownEntry {
-                instrument: "EUR_USD".into(),
-                expires_at: ts("2026-05-14T11:00:00Z"), // expired
-            },
-            CooldownEntry {
-                instrument: "USD_JPY".into(),
-                expires_at: ts("2026-05-14T13:00:00Z"), // live
-            },
+            cd("EUR_USD", ts("2026-05-14T11:00:00Z")), // expired
+            cd("USD_JPY", ts("2026-05-14T13:00:00Z")), // live
         ];
         let kept = prune_expired(entries, now);
         assert_eq!(kept.len(), 1);
@@ -366,10 +421,7 @@ mod tests {
     #[test]
     fn prune_expired_drops_exactly_at_now() {
         let now = ts("2026-05-14T12:00:00Z");
-        let entries = vec![SeenEntry {
-            id: "edge".into(),
-            expires_at: now, // exactly now counts as expired
-        }];
+        let entries = vec![se("edge", now)];
         assert!(prune_expired(entries, now).is_empty());
     }
 
@@ -377,14 +429,8 @@ mod tests {
     fn prune_expired_keeps_all_future() {
         let now = ts("2026-05-14T12:00:00Z");
         let entries = vec![
-            SeenEntry {
-                id: "a".into(),
-                expires_at: ts("2026-05-14T13:00:00Z"),
-            },
-            SeenEntry {
-                id: "b".into(),
-                expires_at: ts("2026-05-14T14:00:00Z"),
-            },
+            se("a", ts("2026-05-14T13:00:00Z")),
+            se("b", ts("2026-05-14T14:00:00Z")),
         ];
         assert_eq!(prune_expired(entries, now).len(), 2);
     }
@@ -539,15 +585,64 @@ mod tests {
     fn prune_expired_drops_all_past() {
         let now = ts("2026-05-14T12:00:00Z");
         let entries = vec![
-            CooldownEntry {
-                instrument: "A".into(),
-                expires_at: ts("2026-05-13T12:00:00Z"),
-            },
-            CooldownEntry {
-                instrument: "B".into(),
-                expires_at: ts("2026-05-13T11:00:00Z"),
-            },
+            cd("A", ts("2026-05-13T12:00:00Z")),
+            cd("B", ts("2026-05-13T11:00:00Z")),
         ];
         assert!(prune_expired(entries, now).is_empty());
+    }
+
+    #[test]
+    fn seen_entry_round_trips_legacy_yaml() {
+        // Older entries in live KV may not have action/seen_at/outcome.
+        // They must still deserialise via the serde defaults.
+        let yaml = "id: legacy\nexpires_at: \"2026-05-14T13:00:00Z\"\n";
+        let entry: SeenEntry = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(entry.id, "legacy");
+        assert_eq!(entry.action, Action::Enter);
+        assert_eq!(entry.seen_at, None);
+        assert!(entry.outcome.is_empty());
+    }
+
+    #[test]
+    fn cooldown_entry_round_trips_legacy_yaml() {
+        let yaml = "instrument: EUR_USD\nexpires_at: \"2026-05-14T13:00:00Z\"\n";
+        let entry: CooldownEntry = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(entry.instrument, "EUR_USD");
+        assert_eq!(entry.set_at, None);
+    }
+
+    #[test]
+    fn seen_entry_serialises_with_action_seen_at_outcome() {
+        // The `status` snapshot is the primary consumer. Confirm the YAML
+        // shape is exactly what an operator sees.
+        let entry = SeenEntry {
+            id: "F40-2026-05-15-729f".into(),
+            action: Action::Enter,
+            seen_at: Some(ts("2026-05-15T18:00:00Z")),
+            outcome: "rejected: cooled-down".into(),
+            expires_at: ts("2026-05-16T03:33:01Z"),
+        };
+        let yaml = serde_yaml::to_string(&entry).unwrap();
+        // Round-trip through serde to assert on the parsed shape rather
+        // than YAML formatting quirks (timestamp quoting, etc).
+        let parsed: SeenEntry = serde_yaml::from_str(&yaml).unwrap();
+        assert_eq!(parsed.action, Action::Enter);
+        assert_eq!(parsed.outcome, "rejected: cooled-down");
+        assert_eq!(parsed.seen_at, Some(ts("2026-05-15T18:00:00Z")));
+        assert_eq!(parsed.expires_at, ts("2026-05-16T03:33:01Z"));
+    }
+
+    #[test]
+    fn cooldown_entry_serialises_with_set_at() {
+        let entry = CooldownEntry {
+            instrument: "F40".into(),
+            set_at: Some(ts("2026-05-15T18:00:34Z")),
+            expires_at: ts("2026-05-16T06:00:34Z"),
+        };
+        let yaml = serde_yaml::to_string(&entry).unwrap();
+        let parsed: CooldownEntry = serde_yaml::from_str(&yaml).unwrap();
+        assert_eq!(parsed.instrument, "F40");
+        assert_eq!(parsed.set_at, Some(ts("2026-05-15T18:00:34Z")));
+        assert_eq!(parsed.expires_at, ts("2026-05-16T06:00:34Z"));
     }
 }
