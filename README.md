@@ -4,17 +4,24 @@ Cloudflare Worker that receives TradingView alerts and controls OANDA trades,
 with the trade intent encrypted under a shared key so a leaked webhook URL
 can't be weaponised by anyone who doesn't also have the key.
 
-Five actions are supported:
+Nine actions are supported:
 
 - `enter` — open a market, stop, or limit order with SL/TP, after passing the risk gate.
+  Optionally gated on named `prep` / `veto` flags (see "Conditional entries" below).
 - `close` — close all positions for the instrument.
 - `invalidate` — set a per-instrument cooldown (default 12 h) and cancel any pending
   orders. Use this when your setup is no longer valid (price drifted out of the
   expected range) and you want to be sure no entry fires while you sleep.
-- `status` — read-only snapshot of active cooldowns and recent seen ids
-  (replay-protection state). Curl-friendly debugging.
+- `status` — read-only snapshot of active cooldowns, recent seen ids, preps, and
+  vetos. Curl-friendly debugging.
 - `unlock` — clear the cooldown for one instrument. Recovery for an
   `invalidate` you didn't mean to send.
+- `prep` — record a named step (e.g. `break-and-close`) for an instrument with a
+  TTL, used to build up multi-event setups.
+- `veto` — record a named blocker (e.g. `news-window`) for an instrument with a
+  TTL.
+- `clear-prep` / `clear-veto` — drop a single prep or veto flag before its TTL
+  expires.
 
 ## How it works
 
@@ -90,6 +97,59 @@ moves past one of your fixed levels.
 `id` is the **replay-protection key** — the worker remembers each id it's
 fulfilled until just past `not_after`. Use a unique id per intended trade.
 
+## Conditional entries (preps + vetos)
+
+Some setups want to fire `enter` only after a sequence of prior events.
+The classic example is "break-and-close below the trend line, retest from
+below, then entry candle." Each event is its own TradingView alert; the
+worker stores short-lived named flags per-instrument and the `enter`
+intent declares which flags must be set (and which must not).
+
+A `prep` intent records that a named step happened, with a TTL:
+
+```yaml
+v: 1
+action: prep
+instrument: EUR_USD
+step: break-and-close
+ttl_hours: 4
+```
+
+A `veto` is the inverse — a named blocker that must be absent for entry
+to fire:
+
+```yaml
+v: 1
+action: veto
+instrument: EUR_USD
+name: news-window
+ttl_hours: 6
+```
+
+The `enter` intent then opts in:
+
+```yaml
+v: 1
+action: enter
+instrument: EUR_USD
+direction: short
+entry: { type: market }
+stop_loss:   { from: high, offset_pips: 2 }
+take_profit: { from: close, offset_r: 2.0 }
+risk_pct: 0.5
+requires_preps: [break-and-close, retest]
+vetos: [news-window]
+```
+
+The worker rejects the entry with HTTP 412 if any required prep is
+missing, if the preps' stored `set_at` timestamps are not strictly
+increasing in list order, or if any opted-in veto is active. Preps are
+**not** consumed on entry — they linger until TTL or explicit
+`clear-prep`. Re-firing a prep refreshes its timestamp and TTL.
+
+`requires_preps` and `vetos` are template-only fields; the CLI does not
+prompt for them. Author one template per setup.
+
 ## CLI
 
 Build:
@@ -152,20 +212,32 @@ missing field instead of prompting:
   --non-interactive
 ```
 
-### Querying state and unlocking cooldowns
+### Querying state, unlocking, and managing preps / vetos
 
-Two more subcommands talk to the *running* worker, using the same encryption
+Several subcommands talk to the *running* worker, using the same encryption
 key as auth. Set `TRADE_CONTROL_ENDPOINT` once to skip retyping `--endpoint`:
 
 ```sh
 export TRADE_CONTROL_ENDPOINT=https://trade-control.<account>.workers.dev
 
-# Dump active cooldowns + recent seen ids as YAML.
+# Dump active cooldowns, preps, vetos + recent seen ids as YAML.
 ./target/release/encrypt-payload status \
   --key-file ~/.config/trade-control/key.hex
 
 # Clear a cooldown set by an `invalidate` you didn't mean to send.
 ./target/release/encrypt-payload unlock EUR_USD \
+  --key-file ~/.config/trade-control/key.hex
+
+# Set / clear preps and vetos directly. (TradingView normally fires these,
+# but the CLI is the manual escape hatch — e.g. when a prep went stale and
+# should be dropped before TTL.)
+./target/release/encrypt-payload prep EUR_USD break-and-close --ttl-hours 4 \
+  --key-file ~/.config/trade-control/key.hex
+./target/release/encrypt-payload veto EUR_USD news-window --ttl-hours 6 \
+  --key-file ~/.config/trade-control/key.hex
+./target/release/encrypt-payload clear-prep EUR_USD break-and-close \
+  --key-file ~/.config/trade-control/key.hex
+./target/release/encrypt-payload clear-veto EUR_USD news-window \
   --key-file ~/.config/trade-control/key.hex
 ```
 
@@ -179,6 +251,15 @@ cooldowns:
 recent_seen:
   - id: pin-bar-eurusd-2026-05-13-a
     expires_at: "2026-05-14T02:00:00Z"
+preps:
+  - instrument: EUR_USD
+    step: break-and-close
+    set_at: "2026-05-14T02:30:00Z"
+    expires_at: "2026-05-14T06:30:00Z"
+vetos:
+  - instrument: EUR_USD
+    name: news-window
+    expires_at: "2026-05-14T09:00:00Z"
 ```
 
 `unlock` returns:
@@ -188,8 +269,9 @@ unlocked: EUR_USD
 was_cooled_down: true
 ```
 
-Both subcommands use the same replay-protection mechanism as the other
-actions — re-running the same `unlock` won't double-fire.
+All control subcommands use the same replay-protection mechanism as the
+trade actions — re-running the same `unlock` (or `clear-prep`, etc.)
+within its window won't double-fire.
 
 ## Secrets
 
