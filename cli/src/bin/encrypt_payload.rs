@@ -87,7 +87,7 @@ enum Cmd {
 #[derive(Parser)]
 struct EndpointArgs {
     /// Path to a hex-encoded 32-byte key.
-    #[arg(long)]
+    #[arg(long, env = "TRADE_CONTROL_KEY_FILE")]
     key_file: PathBuf,
     /// Worker URL (e.g. https://trade-control.<account>.workers.dev).
     /// Falls back to `TRADE_CONTROL_ENDPOINT`.
@@ -193,7 +193,7 @@ struct ClearVetoCmdArgs {
 #[derive(Parser)]
 struct VerifyArgs {
     /// Path to a hex-encoded 32-byte key.
-    #[arg(long)]
+    #[arg(long, env = "TRADE_CONTROL_KEY_FILE")]
     key_file: PathBuf,
     /// Path to a file containing the full YAML alert body. If omitted
     /// and no positional `body` is given, stdin is read.
@@ -206,7 +206,7 @@ struct VerifyArgs {
 #[derive(Parser)]
 struct DecryptArgs {
     /// Path to a hex-encoded 32-byte key.
-    #[arg(long)]
+    #[arg(long, env = "TRADE_CONTROL_KEY_FILE")]
     key_file: PathBuf,
     /// Path to a file containing either the bare `v1.…` blob or the
     /// full YAML alert body. If omitted and no positional `blob` is
@@ -221,7 +221,7 @@ struct DecryptArgs {
 #[derive(Parser)]
 struct EncryptArgs {
     /// Path to a hex-encoded 32-byte key.
-    #[arg(long)]
+    #[arg(long, env = "TRADE_CONTROL_KEY_FILE")]
     key_file: PathBuf,
     /// Path to the intent template (YAML). If omitted, fuzzy-pick from
     /// `~/.config/trade-control/templates/**/*.yaml`. Missing required
