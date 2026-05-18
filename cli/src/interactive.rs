@@ -2,6 +2,9 @@
 //! [`super::prompts`] with `dialoguer` prompts and a "fill the template"
 //! driver loop.
 
+use std::fs;
+use std::path::{Path, PathBuf};
+
 use chrono::Utc;
 use color_eyre::eyre::{Result, eyre};
 use dialoguer::{Input, Select, theme::ColorfulTheme};
@@ -12,6 +15,7 @@ use super::prompts::{
     ALWAYS_REQUIRED, default_id, fresh_random_suffix, missing_fields, optional_for_action,
     read_action, required_for_action, resolve_not_after, set_field,
 };
+use super::templates::templates_root;
 #[cfg(test)]
 use trade_control_core::intent::Action;
 use trade_control_core::intent::Intent;
@@ -158,6 +162,49 @@ fn prompt_for_field(field: &str, template: &Value) -> Result<Value> {
         }
         other => Err(eyre!("no prompt configured for field `{other}`")),
     }
+}
+
+/// Default destination shown by `prompt_save_as_template`. Picked to put
+/// the user inside their templates dir so the fuzzy picker sees it next
+/// time without extra config.
+fn default_save_path() -> Result<PathBuf> {
+    Ok(templates_root()?.join("new.yaml"))
+}
+
+/// Prompt the operator to save the completed template YAML to disk.
+/// Empty input means "skip". A non-empty path writes `completed_yaml`
+/// to that path (creating the parent dir if needed) and prints a
+/// one-line confirmation to stderr.
+///
+/// Returns the saved path (if any) so callers can log / test.
+pub fn prompt_save_as_template(completed_yaml: &str) -> Result<Option<PathBuf>> {
+    let theme = ColorfulTheme::default();
+    let default = default_save_path()?;
+    let raw: String = Input::with_theme(&theme)
+        .with_prompt("save as template? (path, blank to skip)")
+        .default(default.display().to_string())
+        .allow_empty(true)
+        .interact_text()?;
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    let path = PathBuf::from(trimmed);
+    write_template(&path, completed_yaml)?;
+    eprintln!("saved template to {}", path.display());
+    Ok(Some(path))
+}
+
+/// Write `yaml` to `path`, creating the parent directory if needed.
+/// Errors include the path for context.
+fn write_template(path: &Path, yaml: &str) -> Result<()> {
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        fs::create_dir_all(parent).map_err(|e| eyre!("creating {}: {e}", parent.display()))?;
+    }
+    fs::write(path, yaml).map_err(|e| eyre!("writing {}: {e}", path.display()))?;
+    Ok(())
 }
 
 /// Prompt for a comma-separated list of names (used for `requires_preps`
@@ -468,6 +515,35 @@ mod tests {
         ";
         let mut template: Value = serde_yaml::from_str(yaml).unwrap();
         assert!(fill_missing_fields(&mut template, true).is_ok());
+    }
+
+    #[test]
+    fn write_template_creates_parent_dir() {
+        let root = std::env::temp_dir().join(format!(
+            "trade-control-save-test-{}-create",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let path = root.join("a/b/c/new.yaml");
+        write_template(&path, "v: 1\naction: enter\n").unwrap();
+        let contents = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(contents, "v: 1\naction: enter\n");
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn write_template_overwrites_existing() {
+        let root = std::env::temp_dir().join(format!(
+            "trade-control-save-test-{}-overwrite",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let path = root.join("foo.yaml");
+        write_template(&path, "first\n").unwrap();
+        write_template(&path, "second\n").unwrap();
+        let contents = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(contents, "second\n");
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]

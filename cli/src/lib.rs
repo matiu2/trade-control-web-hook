@@ -14,7 +14,7 @@ pub use control::{
     build_unlock_intent, build_veto_intent, wrap_in_envelope,
 };
 pub use history::{History, record_prep_use, record_veto_use};
-pub use interactive::fill_missing_fields;
+pub use interactive::{fill_missing_fields, prompt_save_as_template};
 pub use templates::{discover_templates, pick_template_interactive, templates_root};
 pub use trade_control_core::crypto::{KEY_LEN, NONCE_LEN};
 

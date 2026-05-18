@@ -21,7 +21,7 @@ use trade_control_cli::{
     KEY_LEN, build_clear_prep_intent, build_clear_veto_intent, build_prep_intent,
     build_status_intent, build_unlock_intent, build_veto_intent, build_yaml_template,
     encrypt_intent, fill_missing_fields, generate_key_hex, pick_template_interactive,
-    record_prep_use, record_veto_use, wrap_in_envelope,
+    prompt_save_as_template, record_prep_use, record_veto_use, wrap_in_envelope,
 };
 
 #[derive(Parser)]
@@ -281,6 +281,14 @@ fn run_encrypt(args: EncryptArgs) -> Result<()> {
     fill_missing_fields(&mut template, args.non_interactive)?;
 
     let completed = serde_yaml::to_string(&template).context("re-serialising completed intent")?;
+
+    // Offer to save the completed (post-prompt) YAML to disk so the user
+    // can use it as a starting point next time. Done *before* the encrypted
+    // body prints so the prompt doesn't interleave with the paste target.
+    if !args.non_interactive {
+        prompt_save_as_template(&completed)?;
+    }
+
     let blob = encrypt_intent(&key, completed.as_bytes())?;
     let yaml = build_yaml_template(&blob);
     print!("{yaml}");
