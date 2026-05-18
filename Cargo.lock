@@ -2046,6 +2046,7 @@ dependencies = [
  "getrandom 0.4.2",
  "hex",
  "reqwest",
+ "serde",
  "serde_yaml",
  "trade-control-core",
 ]

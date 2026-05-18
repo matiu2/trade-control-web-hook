@@ -20,7 +20,8 @@ use color_eyre::eyre::{Context, Result, eyre};
 use trade_control_cli::{
     KEY_LEN, build_clear_prep_intent, build_clear_veto_intent, build_prep_intent,
     build_status_intent, build_unlock_intent, build_veto_intent, build_yaml_template,
-    encrypt_intent, fill_missing_fields, generate_key_hex, wrap_in_envelope,
+    encrypt_intent, fill_missing_fields, generate_key_hex, record_prep_use, record_veto_use,
+    wrap_in_envelope,
 };
 
 #[derive(Parser)]
@@ -214,6 +215,7 @@ fn run_prep(args: PrepCmdArgs) -> Result<()> {
     let intent = build_prep_intent(&args.instrument, &args.step, args.ttl_hours, now, &suffix);
     let body = wrap_in_envelope(&intent, &key, now)?;
     let response = post_control(&args.common.endpoint, &body)?;
+    record_prep_use(&args.step);
     print!("{response}");
     Ok(())
 }
@@ -225,6 +227,7 @@ fn run_veto(args: VetoCmdArgs) -> Result<()> {
     let intent = build_veto_intent(&args.instrument, &args.name, args.ttl_hours, now, &suffix);
     let body = wrap_in_envelope(&intent, &key, now)?;
     let response = post_control(&args.common.endpoint, &body)?;
+    record_veto_use(&args.name);
     print!("{response}");
     Ok(())
 }

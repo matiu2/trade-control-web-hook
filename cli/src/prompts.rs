@@ -22,6 +22,20 @@ use trade_control_core::intent::Action;
 /// Fields every intent needs regardless of action.
 pub const ALWAYS_REQUIRED: &[&str] = &["v", "action", "instrument", "id", "not_after"];
 
+/// Optional fields the CLI offers to fill for the given action when not
+/// already specified by the template. Unlike `required_for_action`, these
+/// are not blocking — the user can leave them blank.
+///
+/// For `enter`, this is the prep/veto gate. Templates can already encode
+/// these statically (and templates win — present-and-empty `[]` skips the
+/// prompt), but ad-hoc trades typed at the CLI need a way in.
+pub fn optional_for_action(action: Action) -> &'static [&'static str] {
+    match action {
+        Action::Enter => &["requires_preps", "vetos"],
+        _ => &[],
+    }
+}
+
 /// Fields required *in addition* to `ALWAYS_REQUIRED` for the given action.
 pub fn required_for_action(action: Action) -> &'static [&'static str] {
     match action {
@@ -148,6 +162,29 @@ mod tests {
     #[test]
     fn required_for_close_is_empty() {
         assert_eq!(required_for_action(Action::Close), &[] as &[&str]);
+    }
+
+    #[test]
+    fn optional_for_enter_includes_prep_and_veto_lists() {
+        let opts = optional_for_action(Action::Enter);
+        assert!(opts.contains(&"requires_preps"));
+        assert!(opts.contains(&"vetos"));
+    }
+
+    #[test]
+    fn optional_for_other_actions_is_empty() {
+        for a in [
+            Action::Close,
+            Action::Invalidate,
+            Action::Status,
+            Action::Unlock,
+            Action::Prep,
+            Action::Veto,
+            Action::ClearPrep,
+            Action::ClearVeto,
+        ] {
+            assert!(optional_for_action(a).is_empty(), "{a:?}");
+        }
     }
 
     #[test]

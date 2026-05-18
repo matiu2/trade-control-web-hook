@@ -7,9 +7,10 @@ use color_eyre::eyre::{Result, eyre};
 use dialoguer::{Input, Select, theme::ColorfulTheme};
 use serde_yaml::Value;
 
+use super::history;
 use super::prompts::{
-    ALWAYS_REQUIRED, default_id, fresh_random_suffix, missing_fields, read_action,
-    required_for_action, resolve_not_after, set_field,
+    ALWAYS_REQUIRED, default_id, fresh_random_suffix, missing_fields, optional_for_action,
+    read_action, required_for_action, resolve_not_after, set_field,
 };
 #[cfg(test)]
 use trade_control_core::intent::Action;
@@ -30,6 +31,22 @@ pub fn fill_missing_fields(template: &mut Value, non_interactive: bool) -> Resul
     let action = read_action(template).ok_or_else(|| eyre!("action still missing after prompt"))?;
     let action_required: Vec<&'static str> = required_for_action(action).to_vec();
     fill_round(template, &action_required, non_interactive)?;
+
+    // Pass 3: optional action-dependent fields (e.g. `requires_preps` /
+    // `vetos` for `enter`). Skipped entirely in non-interactive mode —
+    // an absent optional field is fine there.
+    if !non_interactive {
+        let optional = optional_for_action(action);
+        for field in optional {
+            // Only prompt if the field is absent. A template that sets
+            // the field (even to an empty list) wins.
+            if template.get(*field).is_some() {
+                continue;
+            }
+            let value = prompt_optional_name_list(field)?;
+            set_field(template, field, value);
+        }
+    }
 
     // Final validation: deserialize fully into `Intent` to surface any
     // structural mistakes (bad enum variants, wrong value types) before we
@@ -141,6 +158,55 @@ fn prompt_for_field(field: &str, template: &Value) -> Result<Value> {
         }
         other => Err(eyre!("no prompt configured for field `{other}`")),
     }
+}
+
+/// Prompt for a comma-separated list of names (used for `requires_preps`
+/// and `vetos`). Empty input is fine and yields an empty sequence — the
+/// worker treats empty as "no gate".
+///
+/// Shows recent names from history as a hint so the operator doesn't have
+/// to remember exact spellings (typos silently break the gate).
+fn prompt_optional_name_list(field: &str) -> Result<Value> {
+    let theme = ColorfulTheme::default();
+    let history = history::load();
+    let suggestions = match field {
+        "requires_preps" => history.prep_names(),
+        "vetos" => history.veto_names(),
+        _ => Vec::new(),
+    };
+    let hint = if suggestions.is_empty() {
+        String::new()
+    } else {
+        let preview: Vec<&str> = suggestions.iter().take(8).map(String::as_str).collect();
+        format!(" [recent: {}]", preview.join(", "))
+    };
+
+    let raw: String = Input::with_theme(&theme)
+        .with_prompt(format!("{field} (comma-separated, blank for none){hint}"))
+        .default(String::new())
+        .allow_empty(true)
+        .interact_text()?;
+
+    let names: Vec<String> = raw
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    // Persist newly-used names so they suggest next time.
+    let now = Utc::now();
+    let mut h = history;
+    for name in &names {
+        match field {
+            "requires_preps" => h.record_prep(name, now),
+            "vetos" => h.record_veto(name, now),
+            _ => {}
+        }
+    }
+    let _ = history::save(&h);
+
+    let seq: Vec<Value> = names.into_iter().map(Value::String).collect();
+    Ok(Value::Sequence(seq))
 }
 
 fn prompt_action(theme: &ColorfulTheme) -> Result<Value> {
@@ -402,6 +468,56 @@ mod tests {
         ";
         let mut template: Value = serde_yaml::from_str(yaml).unwrap();
         assert!(fill_missing_fields(&mut template, true).is_ok());
+    }
+
+    #[test]
+    fn non_interactive_accepts_template_supplied_preps_and_vetos() {
+        let yaml = "
+            v: 1
+            id: abc
+            not_after: \"2026-05-13T20:00:00Z\"
+            action: enter
+            instrument: EUR_USD
+            broker: oanda
+            direction: short
+            entry: { type: market }
+            stop_loss: { from: high, offset_pips: 2 }
+            take_profit: { from: close, offset_r: 2.0 }
+            risk_pct: 0.5
+            requires_preps: [break-and-close, retest]
+            vetos: [news-window]
+        ";
+        let mut template: Value = serde_yaml::from_str(yaml).unwrap();
+        fill_missing_fields(&mut template, true).unwrap();
+        let intent: Intent = serde_yaml::from_value(template).unwrap();
+        assert_eq!(
+            intent.requires_preps,
+            vec!["break-and-close".to_string(), "retest".to_string()]
+        );
+        assert_eq!(intent.vetos, vec!["news-window".to_string()]);
+    }
+
+    #[test]
+    fn non_interactive_leaves_optional_fields_empty_when_absent() {
+        let yaml = "
+            v: 1
+            id: abc
+            not_after: \"2026-05-13T20:00:00Z\"
+            action: enter
+            instrument: EUR_USD
+            broker: oanda
+            direction: long
+            entry: { type: market }
+            stop_loss: { from: low, offset_pips: -2 }
+            take_profit: { from: close, offset_r: 2.0 }
+            risk_pct: 0.5
+        ";
+        let mut template: Value = serde_yaml::from_str(yaml).unwrap();
+        // Non-interactive mode skips the optional prompt entirely.
+        fill_missing_fields(&mut template, true).unwrap();
+        let intent: Intent = serde_yaml::from_value(template).unwrap();
+        assert!(intent.requires_preps.is_empty());
+        assert!(intent.vetos.is_empty());
     }
 
     #[test]

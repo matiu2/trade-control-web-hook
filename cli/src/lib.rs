@@ -4,6 +4,7 @@
 use color_eyre::eyre::{Result, eyre};
 
 mod control;
+mod history;
 mod interactive;
 mod prompts;
 
@@ -11,6 +12,7 @@ pub use control::{
     build_clear_prep_intent, build_clear_veto_intent, build_prep_intent, build_status_intent,
     build_unlock_intent, build_veto_intent, wrap_in_envelope,
 };
+pub use history::{History, record_prep_use, record_veto_use};
 pub use interactive::fill_missing_fields;
 pub use trade_control_core::crypto::{KEY_LEN, NONCE_LEN};
 
