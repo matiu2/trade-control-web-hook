@@ -38,6 +38,21 @@ at unattended hours, or repeated misses between rotations.
 
 ## Done
 
+- **Per-instrument trade-expiry anchor (CLI-only)** — landed. New
+  `cli::expiry` module persists a single `DateTime<Utc>` per instrument
+  under `$XDG_CONFIG_HOME/trade-control/expiry/<INSTRUMENT>.txt`. The
+  interactive flow asks for the anchor up-front when the operator
+  declares a `veto` with `name: trade-expiry`, and stores whatever they
+  enter (relative durations like `2d` accepted, ISO-8601 accepted).
+  Subsequent prep/veto/enter prompts use the anchor as the default for
+  `not_after` (read-only on `enter`), and prep/veto get a derived
+  `ttl_hours` default (hours-from-now rounded up). A stale (past)
+  anchor is silently dropped on load and the prompts fall back to the
+  prior defaults (`8h` / `4`). Pure UX sugar — the worker neither sees
+  nor cares about the anchor. Also fixed the save-as-template prompt
+  so blank-Enter actually skips (previously the default value field
+  meant Enter saved to `new.yaml`). 67 cli lib tests pass; clippy
+  clean.
 - **HMAC-signed cleartext wire format (parallel to encrypted)** —
   landed. New `core::sig` module: canonical form = fixed `v1-sig` tag,
   sorted schema-fingerprint of top-level keys (CSV), then `key=value`

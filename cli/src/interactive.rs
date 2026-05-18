@@ -5,20 +5,26 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use color_eyre::eyre::{Result, eyre};
 use dialoguer::{FuzzySelect, Input, Select, theme::ColorfulTheme};
 use serde_yaml::Value;
 
+use super::expiry;
 use super::history;
 use super::prompts::{
-    ALWAYS_REQUIRED, default_id, fresh_random_suffix, missing_fields, optional_for_action,
-    read_action, required_for_action, resolve_not_after, set_field,
+    default_id, fresh_random_suffix, missing_fields, optional_for_action, read_action,
+    required_for_action, resolve_not_after, set_field,
 };
 use super::templates::templates_root;
-#[cfg(test)]
 use trade_control_core::intent::Action;
 use trade_control_core::intent::Intent;
+
+/// Name reserved for the per-instrument trade-expiry anchor veto.
+/// When this veto fires (action=veto, name=trade-expiry), the CLI
+/// persists the operator-supplied expiry timestamp so subsequent
+/// prep/veto/enter prompts default `ttl_hours` and `not_after` to it.
+const TRADE_EXPIRY_NAME: &str = "trade-expiry";
 
 /// Drive the template to completion by prompting for missing fields. After
 /// this returns, the template deserializes into a valid `Intent` for its
@@ -27,12 +33,32 @@ use trade_control_core::intent::Intent;
 /// `non_interactive`: when true, missing fields cause an error instead of a
 /// prompt. Useful in scripts.
 pub fn fill_missing_fields(template: &mut Value, non_interactive: bool) -> Result<()> {
-    // Pass 1: always-required structural fields.
-    let always = ALWAYS_REQUIRED.to_vec();
-    fill_round(template, &always, non_interactive)?;
-
-    // Pass 2: action-dependent fields. Need a valid action first.
+    // Pass 1a: ask v / action / instrument up front. We need the action
+    // (and for veto, the name) before we can offer a sensible
+    // `not_after` default from the per-instrument trade-expiry anchor.
+    let pre = ["v", "action", "instrument"];
+    fill_round(template, &pre, non_interactive)?;
     let action = read_action(template).ok_or_else(|| eyre!("action still missing after prompt"))?;
+
+    // For veto: ask the `name` early. If the user picks
+    // `trade-expiry`, follow up with a prompt for the anchor timestamp
+    // and persist it. This way the `not_after` / `ttl_hours` prompts
+    // that come next can pre-fill against it.
+    if action == Action::Veto && template.get("name").is_none() && !non_interactive {
+        let value = prompt_for_field("name", template)?;
+        set_field(template, "name", value);
+        if name_is_trade_expiry(template) {
+            capture_trade_expiry_anchor(template)?;
+        }
+    }
+
+    // Pass 1b: rest of the always-required structural fields
+    // (id + not_after). `not_after` is action-aware and consults the
+    // expiry anchor for prep/veto/enter defaults.
+    let post = ["id", "not_after"];
+    fill_round(template, &post, non_interactive)?;
+
+    // Pass 2: remaining action-dependent fields.
     let action_required: Vec<&'static str> = required_for_action(action).to_vec();
     fill_round(template, &action_required, non_interactive)?;
 
@@ -71,6 +97,87 @@ pub fn fill_missing_fields(template: &mut Value, non_interactive: bool) -> Resul
     }
 
     Ok(())
+}
+
+/// True when the current template names the trade-expiry veto.
+fn name_is_trade_expiry(template: &Value) -> bool {
+    template
+        .get("name")
+        .and_then(|v| v.as_str())
+        .map(|s| s == TRADE_EXPIRY_NAME)
+        .unwrap_or(false)
+}
+
+/// Prompt for the trade-expiry timestamp and persist it for the
+/// template's instrument. Idempotent on cancel — the operator can
+/// blank the prompt to skip persistence.
+fn capture_trade_expiry_anchor(template: &Value) -> Result<()> {
+    let Some(instrument) = template.get("instrument").and_then(|v| v.as_str()) else {
+        return Ok(());
+    };
+    let theme = ColorfulTheme::default();
+    let now = Utc::now();
+    let existing = expiry::load(instrument, now);
+    let default = existing.unwrap_or(now + expiry::DEFAULT_HORIZON);
+    let raw: String = Input::with_theme(&theme)
+        .with_prompt(format!(
+            "trade-expiry timestamp for {instrument} \
+             (duration like `2d` `4h`, or ISO-8601; blank to skip persistence)"
+        ))
+        .default(default.to_rfc3339())
+        .allow_empty(true)
+        .interact_text()?;
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(());
+    }
+    let resolved = resolve_not_after(trimmed, now)?;
+    if resolved <= now {
+        return Err(eyre!("trade-expiry must be in the future"));
+    }
+    expiry::save(instrument, resolved)?;
+    eprintln!(
+        "stored trade-expiry anchor for {instrument} at {}",
+        resolved.to_rfc3339()
+    );
+    Ok(())
+}
+
+/// Default `not_after` suggestion. For prep/veto/enter on an
+/// instrument with a live trade-expiry anchor, suggest the anchor
+/// itself. Otherwise fall back to the legacy `8h` relative default.
+fn not_after_default(template: &Value, now: DateTime<Utc>) -> String {
+    let action = read_action(template);
+    let uses_anchor = matches!(
+        action,
+        Some(Action::Prep) | Some(Action::Veto) | Some(Action::Enter)
+    );
+    if uses_anchor
+        && let Some(instrument) = template.get("instrument").and_then(|v| v.as_str())
+        && let Some(anchor) = expiry::load(instrument, now)
+    {
+        return anchor.to_rfc3339();
+    }
+    "8h".into()
+}
+
+/// Default `ttl_hours` suggestion. For prep/veto on an instrument
+/// with a live trade-expiry anchor, suggest the hour-count between
+/// now and the anchor (rounded up). Otherwise fall back to `4`.
+fn ttl_hours_default(template: &Value, now: DateTime<Utc>) -> u32 {
+    let action = read_action(template);
+    let uses_anchor = matches!(action, Some(Action::Prep) | Some(Action::Veto));
+    if uses_anchor
+        && let Some(instrument) = template.get("instrument").and_then(|v| v.as_str())
+        && let Some(anchor) = expiry::load(instrument, now)
+    {
+        let mins = (anchor - now).num_minutes().max(0);
+        // Round up to the next whole hour so the TTL never expires
+        // before the anchor itself.
+        let hours = (mins + 59) / 60;
+        return hours.try_into().unwrap_or(u32::MAX);
+    }
+    4
 }
 
 fn fill_round(template: &mut Value, required: &[&str], non_interactive: bool) -> Result<()> {
@@ -115,9 +222,10 @@ fn prompt_for_field(field: &str, template: &Value) -> Result<Value> {
         }
         "not_after" => {
             let now = Utc::now();
+            let default = not_after_default(template, now);
             let input: String = Input::with_theme(&theme)
                 .with_prompt("not_after (duration like `8h` `2d`, or ISO-8601)")
-                .default("8h".into())
+                .default(default)
                 .interact_text()?;
             let resolved = resolve_not_after(&input, now)?;
             Ok(Value::String(resolved.to_rfc3339()))
@@ -161,9 +269,11 @@ fn prompt_for_field(field: &str, template: &Value) -> Result<Value> {
             Ok(Value::String(s))
         }
         "ttl_hours" => {
+            let now = Utc::now();
+            let default = ttl_hours_default(template, now);
             let n: u32 = Input::with_theme(&theme)
                 .with_prompt("ttl_hours")
-                .default(4)
+                .default(default)
                 .interact_text()?;
             Ok(Value::Number(n.into()))
         }
@@ -186,10 +296,13 @@ fn default_save_path() -> Result<PathBuf> {
 /// Returns the saved path (if any) so callers can log / test.
 pub fn prompt_save_as_template(completed_yaml: &str) -> Result<Option<PathBuf>> {
     let theme = ColorfulTheme::default();
-    let default = default_save_path()?;
+    let hint = default_save_path()?;
     let raw: String = Input::with_theme(&theme)
-        .with_prompt("save as template? (path, blank to skip)")
-        .default(default.display().to_string())
+        .with_prompt(format!(
+            "save as template? (path, blank to skip — e.g. {})",
+            hint.display()
+        ))
+        .default(String::new())
         .allow_empty(true)
         .interact_text()?;
     let trimmed = raw.trim();
@@ -749,5 +862,124 @@ mod tests {
         let intent: Intent = serde_yaml::from_value(template).unwrap();
         assert_eq!(intent.action, Action::Invalidate);
         assert_eq!(intent.cooldown_hours, Some(12));
+    }
+
+    /// Mutex shared with `expiry` tests: any test that pokes
+    /// `$XDG_CONFIG_HOME` has to serialize. Distinct from the `expiry`
+    /// module's own guard because that one is private; the duplication
+    /// is fine — both write to the same env var.
+    static EXPIRY_TEST_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn isolated_xdg(tag: &str) -> (std::path::PathBuf, std::sync::MutexGuard<'static, ()>) {
+        let guard = EXPIRY_TEST_GUARD.lock().unwrap_or_else(|p| p.into_inner());
+        let dir = std::env::temp_dir().join(format!(
+            "trade-control-interactive-test-{}-{tag}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // SAFETY: serialized via EXPIRY_TEST_GUARD.
+        unsafe {
+            std::env::set_var("XDG_CONFIG_HOME", &dir);
+        }
+        (dir, guard)
+    }
+
+    #[test]
+    fn not_after_default_falls_back_to_8h_without_anchor() {
+        let (_root, _g) = isolated_xdg("not-after-fallback");
+        let yaml = "
+            v: 1
+            action: prep
+            instrument: EURUSD
+        ";
+        let template: Value = serde_yaml::from_str(yaml).unwrap();
+        let now: chrono::DateTime<chrono::Utc> = "2026-05-19T10:00:00Z".parse().unwrap();
+        assert_eq!(not_after_default(&template, now), "8h");
+    }
+
+    #[test]
+    fn not_after_default_uses_anchor_for_prep_veto_enter() {
+        let (_root, _g) = isolated_xdg("not-after-anchor");
+        let now: chrono::DateTime<chrono::Utc> = "2026-05-19T10:00:00Z".parse().unwrap();
+        let anchor: chrono::DateTime<chrono::Utc> = "2026-05-22T14:00:00Z".parse().unwrap();
+        expiry::save("GBPJPY", anchor).unwrap();
+
+        for action in ["prep", "veto", "enter"] {
+            let yaml = format!("v: 1\naction: {action}\ninstrument: GBPJPY\n");
+            let template: Value = serde_yaml::from_str(&yaml).unwrap();
+            let suggested = not_after_default(&template, now);
+            assert_eq!(suggested, anchor.to_rfc3339(), "action={action}");
+        }
+    }
+
+    #[test]
+    fn not_after_default_ignores_anchor_for_other_actions() {
+        let (_root, _g) = isolated_xdg("not-after-other-actions");
+        let now: chrono::DateTime<chrono::Utc> = "2026-05-19T10:00:00Z".parse().unwrap();
+        let anchor: chrono::DateTime<chrono::Utc> = "2026-05-22T14:00:00Z".parse().unwrap();
+        expiry::save("EURUSD", anchor).unwrap();
+
+        // `invalidate`, `close`, `status`, `unlock`, `clear-prep`,
+        // `clear-veto` shouldn't inherit the anchor — they're not part
+        // of the setup-build cycle.
+        for action in [
+            "invalidate",
+            "close",
+            "status",
+            "unlock",
+            "clear-prep",
+            "clear-veto",
+        ] {
+            let yaml = format!("v: 1\naction: {action}\ninstrument: EURUSD\n");
+            let template: Value = serde_yaml::from_str(&yaml).unwrap();
+            assert_eq!(not_after_default(&template, now), "8h", "action={action}");
+        }
+    }
+
+    #[test]
+    fn ttl_hours_default_falls_back_to_4() {
+        let (_root, _g) = isolated_xdg("ttl-fallback");
+        let yaml = "v: 1\naction: prep\ninstrument: EURUSD\n";
+        let template: Value = serde_yaml::from_str(yaml).unwrap();
+        let now: chrono::DateTime<chrono::Utc> = "2026-05-19T10:00:00Z".parse().unwrap();
+        assert_eq!(ttl_hours_default(&template, now), 4);
+    }
+
+    #[test]
+    fn ttl_hours_default_rounds_up_to_anchor() {
+        let (_root, _g) = isolated_xdg("ttl-anchor");
+        let now: chrono::DateTime<chrono::Utc> = "2026-05-19T10:00:00Z".parse().unwrap();
+        // Anchor is exactly 3h30m away — should round up to 4.
+        let anchor = now + chrono::Duration::minutes(210);
+        expiry::save("GBPJPY", anchor).unwrap();
+        let yaml = "v: 1\naction: prep\ninstrument: GBPJPY\n";
+        let template: Value = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(ttl_hours_default(&template, now), 4);
+    }
+
+    #[test]
+    fn ttl_hours_default_handles_full_day_anchor() {
+        let (_root, _g) = isolated_xdg("ttl-day");
+        let now: chrono::DateTime<chrono::Utc> = "2026-05-19T10:00:00Z".parse().unwrap();
+        let anchor = now + chrono::Duration::days(2);
+        expiry::save("USDJPY", anchor).unwrap();
+        let yaml = "v: 1\naction: veto\ninstrument: USDJPY\n";
+        let template: Value = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(ttl_hours_default(&template, now), 48);
+    }
+
+    #[test]
+    fn name_is_trade_expiry_recognises_the_reserved_name() {
+        let yaml = "name: trade-expiry\n";
+        let v: Value = serde_yaml::from_str(yaml).unwrap();
+        assert!(name_is_trade_expiry(&v));
+
+        let yaml2 = "name: news-window\n";
+        let v2: Value = serde_yaml::from_str(yaml2).unwrap();
+        assert!(!name_is_trade_expiry(&v2));
+
+        let v3: Value = serde_yaml::from_str("v: 1\n").unwrap();
+        assert!(!name_is_trade_expiry(&v3));
     }
 }

@@ -4,6 +4,7 @@
 use color_eyre::eyre::{Result, eyre};
 
 mod control;
+mod expiry;
 mod history;
 mod interactive;
 mod prompts;

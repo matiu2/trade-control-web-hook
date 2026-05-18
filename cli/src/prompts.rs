@@ -19,7 +19,11 @@ use serde_yaml::Value;
 
 use trade_control_core::intent::Action;
 
-/// Fields every intent needs regardless of action.
+/// Fields every intent needs regardless of action. The interactive
+/// driver splits these around an action-aware mid-pass; this constant
+/// is the authoritative list, referenced by the structural test below
+/// and by `missing_fields` callers.
+#[allow(dead_code)]
 pub const ALWAYS_REQUIRED: &[&str] = &["v", "action", "instrument", "id", "not_after"];
 
 /// Optional fields the CLI offers to fill for the given action when not
