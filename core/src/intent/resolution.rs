@@ -293,6 +293,7 @@ mod tests {
             step: None,
             name: None,
             ttl_hours: None,
+            level: None,
             requires_preps: Vec::new(),
             vetos: Vec::new(),
         }

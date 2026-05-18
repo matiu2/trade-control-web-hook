@@ -9,7 +9,7 @@ use color_eyre::eyre::{Result, eyre};
 
 use crate::{build_yaml_control_body, encrypt_intent};
 use trade_control_core::crypto::KEY_LEN;
-use trade_control_core::intent::{Action, BrokerKind, Intent};
+use trade_control_core::intent::{Action, BrokerKind, Intent, VetoLevel};
 
 /// How long a control envelope stays valid. Short — these are one-shot
 /// commands run by hand, so we don't need a long replay window.
@@ -41,6 +41,7 @@ fn control_skeleton(action: Action, instrument: &str, id: String, now: DateTime<
         step: None,
         name: None,
         ttl_hours: None,
+        level: None,
         requires_preps: Vec::new(),
         vetos: Vec::new(),
     }
@@ -81,10 +82,13 @@ pub fn build_prep_intent(
 }
 
 /// Build a `veto` Intent for a single (instrument, name) pair with a TTL.
+/// `level` controls broker side effects at fire time; pass `None` for the
+/// default flag-only behaviour ([`VetoLevel::StopNextEntry`]).
 pub fn build_veto_intent(
     instrument: &str,
     name: &str,
     ttl_hours: u32,
+    level: Option<VetoLevel>,
     now: DateTime<Utc>,
     suffix: &str,
 ) -> Intent {
@@ -95,6 +99,7 @@ pub fn build_veto_intent(
     let mut intent = control_skeleton(Action::Veto, instrument, id, now);
     intent.name = Some(name.to_string());
     intent.ttl_hours = Some(ttl_hours);
+    intent.level = level;
     intent
 }
 
@@ -196,7 +201,7 @@ mod tests {
 
     #[test]
     fn veto_intent_round_trips() {
-        let intent = build_veto_intent("EUR_USD", "news-window", 6, t(), "cd34");
+        let intent = build_veto_intent("EUR_USD", "news-window", 6, None, t(), "cd34");
         assert_eq!(intent.action, Action::Veto);
         assert_eq!(intent.name.as_deref(), Some("news-window"));
         assert_eq!(intent.ttl_hours, Some(6));

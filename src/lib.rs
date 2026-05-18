@@ -11,7 +11,7 @@ use serde::Serialize;
 use trade_control_core::broker::{Broker, EntryRequest};
 use trade_control_core::crypto;
 use trade_control_core::incoming::{self, parse_and_verify};
-use trade_control_core::intent::{Action, BrokerKind, Resolved};
+use trade_control_core::intent::{Action, BrokerKind, Resolved, VetoLevel};
 use trade_control_core::state::StateStore;
 
 /// Response body for the `unlock` action. Serialised as YAML.
@@ -79,12 +79,23 @@ pub async fn main(mut req: Request, env: Env, _ctx: Context) -> Result<Response>
     }
 
     // Control actions don't touch the broker; handle them up front so we
-    // don't waste a broker login on them.
+    // don't waste a broker login on them. The exception is a `veto` with
+    // `level` above `stop-next-entry` — those cancel pending orders or
+    // close positions, which need broker auth, so they fall through to
+    // the broker dispatch below.
     match verified.intent.action {
         Action::Status => return handle_status(&store, &verified, now).await,
         Action::Unlock => return handle_unlock(&store, &verified, now).await,
         Action::Prep => return handle_prep(&store, &verified, now).await,
-        Action::Veto => return handle_veto(&store, &verified, now).await,
+        Action::Veto => {
+            if matches!(
+                verified.intent.level.unwrap_or_default(),
+                VetoLevel::StopNextEntry
+            ) {
+                return handle_veto(&store, &verified, now).await;
+            }
+            // Higher-level vetos need the broker; fall through.
+        }
         Action::ClearPrep => return handle_clear_prep(&store, &verified, now).await,
         Action::ClearVeto => return handle_clear_veto(&store, &verified, now).await,
         _ => {}
@@ -185,8 +196,9 @@ enum ActionResult {
     },
 }
 
-/// Dispatch `Enter` / `Close` / `Invalidate` against an authenticated broker.
-/// Status / Unlock are handled before this function and never reach it.
+/// Dispatch `Enter` / `Close` / `Invalidate` / escalated `Veto` against an
+/// authenticated broker. Status / Unlock / Prep / `stop-next-entry` Veto /
+/// Clear-* are handled before this function and never reach it.
 async fn run_action<B: Broker>(
     broker: &B,
     store: &KvStateStore,
@@ -229,12 +241,8 @@ async fn run_action<B: Broker>(
                 "invalidated: cooldown {hours}h, cancelled {cancelled}"
             ))
         }
-        Action::Status
-        | Action::Unlock
-        | Action::Prep
-        | Action::Veto
-        | Action::ClearPrep
-        | Action::ClearVeto => {
+        Action::Veto => run_veto_with_broker(broker, store, verified, now).await,
+        Action::Status | Action::Unlock | Action::Prep | Action::ClearPrep | Action::ClearVeto => {
             // Handled before broker dispatch; never reached here.
             unreachable!("non-broker actions handled before broker dispatch")
         }
@@ -485,7 +493,8 @@ async fn handle_prep(
     Response::ok("ok")
 }
 
-/// Handle the `veto` action: record a named veto for an instrument with a TTL.
+/// Handle the `veto` action at level `stop-next-entry`: record a named
+/// veto for an instrument with a TTL. No broker call.
 async fn handle_veto(
     store: &KvStateStore,
     verified: &incoming::Verified,
@@ -514,6 +523,88 @@ async fn handle_veto(
     let outcome = format!("veto-set: {name} ttl={ttl_hours}h");
     record_seen(store, verified, now, &outcome).await;
     Response::ok("ok")
+}
+
+/// Handle the `veto` action at level `cancel-pending` or
+/// `close-positions`: set the KV flag, then execute the broker-side
+/// effects appropriate to the level. Re-fires repeat the side effects
+/// (alerts can drop; reapplying is cheap and defensive).
+async fn run_veto_with_broker<B: Broker>(
+    broker: &B,
+    store: &KvStateStore,
+    verified: &incoming::Verified,
+    now: chrono::DateTime<chrono::Utc>,
+) -> ActionResult {
+    let Some(name) = verified.intent.name.as_deref() else {
+        return ActionResult::Rejected {
+            response: Response::error("veto requires `name`", 400),
+            outcome: "rejected: missing-name".into(),
+        };
+    };
+    let Some(ttl_hours) = verified.intent.ttl_hours else {
+        return ActionResult::Rejected {
+            response: Response::error("veto requires `ttl_hours`", 400),
+            outcome: "rejected: missing-ttl".into(),
+        };
+    };
+    let level = verified.intent.level.unwrap_or_default();
+    let ttl_seconds = (ttl_hours as u64).saturating_mul(3600);
+    if let Err(err) = store
+        .set_veto(&verified.intent.instrument, name, ttl_seconds)
+        .await
+    {
+        console_error!("KV set_veto: {err}");
+        return ActionResult::Rejected {
+            response: Response::error("state error", 500),
+            outcome: "rejected: state-error".into(),
+        };
+    }
+
+    let instrument = &verified.intent.instrument;
+    let cancelled = broker.cancel_pending_for_instrument(instrument).await;
+    let closed_ok = match level {
+        VetoLevel::ClosePositions => broker.close_positions(instrument).await,
+        // No close requested at this level.
+        VetoLevel::CancelPending | VetoLevel::StopNextEntry => true,
+    };
+
+    console_log!(
+        "veto set: {} {} ttl={}h level={:?} cancelled={} closed_ok={}",
+        instrument,
+        name,
+        ttl_hours,
+        level,
+        cancelled,
+        closed_ok
+    );
+    let closed_tag = match level {
+        VetoLevel::ClosePositions => {
+            if closed_ok {
+                " closed=ok"
+            } else {
+                " closed=failed"
+            }
+        }
+        _ => "",
+    };
+    let level_tag = match level {
+        VetoLevel::StopNextEntry => "stop-next-entry",
+        VetoLevel::CancelPending => "cancel-pending",
+        VetoLevel::ClosePositions => "close-positions",
+    };
+    let outcome = format!(
+        "veto-set: {name} ttl={ttl_hours}h level={level_tag} cancelled={cancelled}{closed_tag}"
+    );
+    // `now` parameter is unused here directly (record_seen is invoked by
+    // the caller via the standard ActionResult path), but kept in the
+    // signature for parity with other broker-path handlers.
+    let _ = now;
+
+    if matches!(level, VetoLevel::ClosePositions) && !closed_ok {
+        ActionResult::Failed(outcome)
+    } else {
+        ActionResult::Ok(outcome)
+    }
 }
 
 /// Handle the `clear-prep` action: drop a single prep flag.

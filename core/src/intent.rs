@@ -80,6 +80,13 @@ pub struct Intent {
     /// Required for `prep` / `veto`. TTL in hours for the flag.
     #[serde(default)]
     pub ttl_hours: Option<u32>,
+    /// Escalation level for a `veto` action. Default is
+    /// [`VetoLevel::StopNextEntry`] (flag-only, no broker side effects).
+    /// Higher levels also cancel pending orders and/or close positions
+    /// at fire time. The flag itself only blocks future entries — the
+    /// side effects are one-shot at fire time, re-fire to repeat them.
+    #[serde(default)]
+    pub level: Option<VetoLevel>,
     /// Optional gate on `enter`. Ordered list of named preps that must
     /// be active for this instrument; each prep's `set_at` timestamp
     /// must be strictly greater than the previous prep's. Absent /
@@ -102,6 +109,37 @@ pub enum BrokerKind {
     #[default]
     Oanda,
     TradeNation,
+}
+
+/// Escalation level for a `veto` action. Vetos always set the named
+/// KV flag (the gate on future entries); higher levels also act on the
+/// broker right now.
+///
+/// Levels are ordered:
+///   1. [`StopNextEntry`] — KV flag only. The next `enter` that opts
+///      into checking this name gets rejected. No broker call.
+///   2. [`CancelPending`] — also cancels resting stop/limit orders for
+///      the instrument. Open positions are left alone.
+///   3. [`ClosePositions`] — also closes open positions for the
+///      instrument.
+///
+/// The KV flag survives across all levels — re-firing a level-2 veto
+/// at the same name re-cancels pending orders (alerts can drop;
+/// re-applying side effects is cheap and defensive).
+///
+/// Distinct from `invalidate`, which is an instrument-wide cooldown:
+/// every enter on that instrument is blocked. A veto only blocks
+/// entries that *opt in* by listing the name in their `vetos:` array.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum VetoLevel {
+    /// KV flag only. No broker side effects.
+    #[default]
+    StopNextEntry,
+    /// Flag + cancel resting pending orders for the instrument.
+    CancelPending,
+    /// Flag + cancel pending orders + close open positions.
+    ClosePositions,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
@@ -425,6 +463,69 @@ mod tests {
         assert_eq!(intent.action, Action::Veto);
         assert_eq!(intent.name.as_deref(), Some("news-window"));
         assert_eq!(intent.ttl_hours, Some(6));
+    }
+
+    #[test]
+    fn veto_intent_defaults_level_to_stop_next_entry() {
+        let yaml = "
+            v: 1
+            id: veto-1
+            not_after: \"2026-05-14T03:30:00Z\"
+            action: veto
+            instrument: EUR_USD
+            name: news-window
+            ttl_hours: 6
+        ";
+        let intent: Intent = serde_yaml::from_str(yaml).unwrap();
+        // Absent on the wire defaults to None; the worker reads it as
+        // `unwrap_or_default()` == StopNextEntry.
+        assert_eq!(intent.level, None);
+        assert_eq!(intent.level.unwrap_or_default(), VetoLevel::StopNextEntry);
+    }
+
+    #[test]
+    fn veto_intent_parses_cancel_pending_level() {
+        let yaml = "
+            v: 1
+            id: veto-1
+            not_after: \"2026-05-14T03:30:00Z\"
+            action: veto
+            instrument: EUR_USD
+            name: structure-broken
+            ttl_hours: 4
+            level: cancel-pending
+        ";
+        let intent: Intent = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(intent.level, Some(VetoLevel::CancelPending));
+    }
+
+    #[test]
+    fn veto_intent_parses_close_positions_level() {
+        let yaml = "
+            v: 1
+            id: veto-1
+            not_after: \"2026-05-14T03:30:00Z\"
+            action: veto
+            instrument: EUR_USD
+            name: structure-broken
+            ttl_hours: 4
+            level: close-positions
+        ";
+        let intent: Intent = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(intent.level, Some(VetoLevel::ClosePositions));
+    }
+
+    #[test]
+    fn veto_level_round_trips_through_yaml() {
+        for level in [
+            VetoLevel::StopNextEntry,
+            VetoLevel::CancelPending,
+            VetoLevel::ClosePositions,
+        ] {
+            let yaml = serde_yaml::to_string(&level).unwrap();
+            let parsed: VetoLevel = serde_yaml::from_str(&yaml).unwrap();
+            assert_eq!(parsed, level);
+        }
     }
 
     #[test]

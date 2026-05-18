@@ -15,7 +15,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use chrono::Utc;
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use color_eyre::eyre::{Context, Result, eyre};
 use trade_control_cli::{
     KEY_LEN, build_clear_prep_intent, build_clear_veto_intent, build_prep_intent,
@@ -23,6 +23,7 @@ use trade_control_cli::{
     encrypt_intent, fill_missing_fields, generate_key_hex, pick_template_interactive,
     prompt_save_as_template, record_prep_use, record_veto_use, wrap_in_envelope,
 };
+use trade_control_core::intent::VetoLevel;
 
 #[derive(Parser)]
 #[command(
@@ -95,8 +96,32 @@ struct VetoCmdArgs {
     /// TTL in hours before the veto auto-expires.
     #[arg(long, default_value_t = 6)]
     ttl_hours: u32,
+    /// Escalation level. `stop-next-entry` (default) only sets the KV
+    /// flag. `cancel-pending` also cancels resting pending orders.
+    /// `close-positions` also closes open positions.
+    #[arg(long, value_enum, default_value_t = VetoLevelArg::StopNextEntry)]
+    level: VetoLevelArg,
     #[command(flatten)]
     common: EndpointArgs,
+}
+
+/// Clap-side mirror of [`VetoLevel`]. Keeps clap derive out of `core`.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
+#[clap(rename_all = "kebab-case")]
+enum VetoLevelArg {
+    StopNextEntry,
+    CancelPending,
+    ClosePositions,
+}
+
+impl From<VetoLevelArg> for VetoLevel {
+    fn from(v: VetoLevelArg) -> Self {
+        match v {
+            VetoLevelArg::StopNextEntry => VetoLevel::StopNextEntry,
+            VetoLevelArg::CancelPending => VetoLevel::CancelPending,
+            VetoLevelArg::ClosePositions => VetoLevel::ClosePositions,
+        }
+    }
 }
 
 #[derive(Parser)]
@@ -225,7 +250,20 @@ fn run_veto(args: VetoCmdArgs) -> Result<()> {
     let key = load_key(&args.common.key_file)?;
     let now = Utc::now();
     let suffix = fresh_suffix()?;
-    let intent = build_veto_intent(&args.instrument, &args.name, args.ttl_hours, now, &suffix);
+    // Default level is sent as `None` to keep the wire form minimal —
+    // the worker treats absent and `stop-next-entry` identically.
+    let level: Option<VetoLevel> = match args.level {
+        VetoLevelArg::StopNextEntry => None,
+        other => Some(other.into()),
+    };
+    let intent = build_veto_intent(
+        &args.instrument,
+        &args.name,
+        args.ttl_hours,
+        level,
+        now,
+        &suffix,
+    );
     let body = wrap_in_envelope(&intent, &key, now)?;
     let response = post_control(&args.common.endpoint, &body)?;
     record_veto_use(&args.name);

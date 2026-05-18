@@ -19,7 +19,14 @@ Nine actions are supported:
 - `prep` — record a named step (e.g. `break-and-close`) for an instrument with a
   TTL, used to build up multi-event setups.
 - `veto` — record a named blocker (e.g. `news-window`) for an instrument with a
-  TTL.
+  TTL. Carries an optional `level`:
+  - `stop-next-entry` (default) — KV flag only; future entries that opt in via
+    `vetos: [name]` get rejected. No broker call.
+  - `cancel-pending` — also cancels resting stop / limit orders on the
+    instrument.
+  - `close-positions` — also closes any open positions on the instrument.
+  In all cases the flag survives until TTL / `clear-veto`. Re-firing a level-2
+  or level-3 veto re-runs the broker side effects.
 - `clear-prep` / `clear-veto` — drop a single prep or veto flag before its TTL
   expires.
 
@@ -124,7 +131,29 @@ action: veto
 instrument: EUR_USD
 name: news-window
 ttl_hours: 6
+# level: cancel-pending   # optional; default stop-next-entry
 ```
+
+The optional `level` field escalates a veto beyond a flag-only gate:
+
+- `stop-next-entry` (default) — KV flag only. Blocks any future `enter`
+  that lists this name in its `vetos:`.
+- `cancel-pending` — also cancels resting stop / limit pending orders
+  for the instrument right now. Useful when a setup invalidates while
+  you have an entry sitting at the broker (e.g. price retraced past your
+  pin-bar low). Open positions are left alone.
+- `close-positions` — also closes any open positions for the
+  instrument. The strongest level; closest to a per-name `invalidate`,
+  except that other strategies can still trade the instrument as long
+  as they don't list this veto name.
+
+The flag itself always persists for `ttl_hours`. Broker side effects
+are one-shot at fire time, but re-firing a higher-level veto repeats
+them (alerts can drop; re-applying is cheap).
+
+`invalidate` is still the right tool for "kill everything on this
+instrument right now" — it sets an instrument-wide cooldown that
+blocks **all** future entries regardless of any `vetos:` opt-in.
 
 The `enter` intent then opts in:
 
@@ -234,6 +263,11 @@ export TRADE_CONTROL_ENDPOINT=https://trade-control.<account>.workers.dev
 ./target/release/encrypt-payload prep EUR_USD break-and-close --ttl-hours 4 \
   --key-file ~/.config/trade-control/key.hex
 ./target/release/encrypt-payload veto EUR_USD news-window --ttl-hours 6 \
+  --key-file ~/.config/trade-control/key.hex
+# Escalated veto: also cancel resting pending orders for the instrument.
+# Add --level close-positions to also close open positions.
+./target/release/encrypt-payload veto EUR_USD structure-broken --ttl-hours 4 \
+  --level cancel-pending \
   --key-file ~/.config/trade-control/key.hex
 ./target/release/encrypt-payload clear-prep EUR_USD break-and-close \
   --key-file ~/.config/trade-control/key.hex
