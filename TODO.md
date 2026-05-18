@@ -38,6 +38,20 @@ at unattended hours, or repeated misses between rotations.
 
 ## Done
 
+- **`tracing` → `console_log` subscriber in the worker** — landed. New
+  `src/tracing_console.rs` implements a minimal `tracing::Subscriber`
+  (~110 lines) that formats events as `LEVEL target: field=value …` and
+  routes `WARN`/`ERROR` to `worker::console_error!`, everything else to
+  `worker::console_log!`. Installed once per worker instance via a
+  `OnceLock` at the top of the fetch handler. Why: broker crates
+  (notably `broker-tradenation`) log error detail through `tracing::warn!`
+  / `tracing::error!`, but without a subscriber installed those events
+  are silently dropped in wasm — so the worker's own lossy
+  `entry failed: broker rejected the order` was the only breadcrumb. Now
+  the actual TN rejection reason shows up in Cloudflare's request log.
+  Step 1 of 2; step 2 is propagating the broker error string through
+  `EntryError::OrderRejected(String)` once we've seen what TN actually
+  says. Clippy clean on host + wasm targets.
 - **`clear-prep` also forgets the prep's setter `seen:<id>`** —
   landed. Prep KV values now store `<rfc3339>|<setter_id>` instead of
   bare `<rfc3339>`, so the worker remembers which message-id set each

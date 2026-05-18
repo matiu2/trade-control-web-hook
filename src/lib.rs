@@ -1,6 +1,7 @@
 mod state;
 #[cfg(target_arch = "wasm32")]
 mod tn_login;
+mod tracing_console;
 mod tradenation_adapter;
 
 use chrono::Utc;
@@ -41,6 +42,7 @@ const DEFAULT_PIP_SIZE: f64 = 0.0001;
 
 #[event(fetch)]
 pub async fn main(mut req: Request, env: Env, _ctx: Context) -> Result<Response> {
+    tracing_console::ConsoleSubscriber::install();
     let yaml = req.text().await?;
 
     let key_hex = match get_secret(ENCRYPTION_KEY_SECRET, &env) {
