@@ -20,8 +20,8 @@ use color_eyre::eyre::{Context, Result, eyre};
 use trade_control_cli::{
     KEY_LEN, build_clear_prep_intent, build_clear_veto_intent, build_prep_intent,
     build_status_intent, build_unlock_intent, build_veto_intent, build_yaml_template,
-    encrypt_intent, fill_missing_fields, generate_key_hex, record_prep_use, record_veto_use,
-    wrap_in_envelope,
+    encrypt_intent, fill_missing_fields, generate_key_hex, pick_template_interactive,
+    record_prep_use, record_veto_use, wrap_in_envelope,
 };
 
 #[derive(Parser)]
@@ -124,10 +124,11 @@ struct EncryptArgs {
     /// Path to a hex-encoded 32-byte key.
     #[arg(long)]
     key_file: PathBuf,
-    /// Path to the intent template (YAML). Missing required fields are
-    /// prompted for unless `--non-interactive` is set.
+    /// Path to the intent template (YAML). If omitted, fuzzy-pick from
+    /// `~/.config/trade-control/templates/**/*.yaml`. Missing required
+    /// fields are prompted for unless `--non-interactive` is set.
     #[arg(long, alias = "input")]
-    template: PathBuf,
+    template: Option<PathBuf>,
     /// Hard-fail on any missing required field instead of prompting.
     #[arg(long, default_value_t = false)]
     non_interactive: bool,
@@ -257,8 +258,20 @@ fn run_clear_veto(args: ClearVetoCmdArgs) -> Result<()> {
 fn run_encrypt(args: EncryptArgs) -> Result<()> {
     let key = load_key(&args.key_file)?;
 
-    let template_str = fs::read_to_string(&args.template)
-        .with_context(|| format!("reading template {:?}", args.template))?;
+    let template_path = match args.template {
+        Some(p) => p,
+        None => {
+            if args.non_interactive {
+                return Err(eyre!(
+                    "--template is required when --non-interactive is set"
+                ));
+            }
+            pick_template_interactive()?
+        }
+    };
+
+    let template_str = fs::read_to_string(&template_path)
+        .with_context(|| format!("reading template {template_path:?}"))?;
     let mut template: serde_yaml::Value =
         serde_yaml::from_str(&template_str).context("template is not valid YAML")?;
     if !template.is_mapping() {

@@ -7,6 +7,7 @@ mod control;
 mod history;
 mod interactive;
 mod prompts;
+mod templates;
 
 pub use control::{
     build_clear_prep_intent, build_clear_veto_intent, build_prep_intent, build_status_intent,
@@ -14,6 +15,7 @@ pub use control::{
 };
 pub use history::{History, record_prep_use, record_veto_use};
 pub use interactive::fill_missing_fields;
+pub use templates::{discover_templates, pick_template_interactive, templates_root};
 pub use trade_control_core::crypto::{KEY_LEN, NONCE_LEN};
 
 /// Generate a fresh 32-byte key as 64 hex chars, using the OS RNG.
