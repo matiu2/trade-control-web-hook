@@ -38,6 +38,17 @@ at unattended hours, or repeated misses between rotations.
 
 ## Done
 
+- **`decrypt` subcommand + clap-complete shell completions** — landed.
+  `encrypt-payload decrypt --key-file KEY [BLOB]` accepts either a bare
+  `v1.<base64>` blob as a positional, the full YAML alert body on stdin,
+  or a `--file PATH`. Tolerates TradingView `{{placeholder}}` shells by
+  scanning lines for `payload:` rather than parsing as YAML, so a body
+  pasted straight from the alert template still decrypts. Plus
+  `encrypt-payload completions <shell>` prints a clap-generated
+  completion script — install with
+  `encrypt-payload completions zsh > ~/.zfunc/_encrypt-payload`. 5 new
+  tests for the payload extractor; round-trip with a minted blob
+  verified.
 - **Prep `clears` list to fix stale-ordering bug** — landed. `Intent`
   gains a `clears: Vec<String>` field. The `Prep` handler clears each
   listed prep step before recording the new one; the `Veto` handler

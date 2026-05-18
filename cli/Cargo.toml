@@ -10,6 +10,7 @@ path = "src/bin/encrypt_payload.rs"
 [dependencies]
 chrono = { version = "0.4.44", features = ["serde"] }
 clap = { version = "4.6.1", features = ["derive", "env"] }
+clap_complete = "4.6.5"
 color-eyre = "0.6.5"
 dialoguer = { version = "0.12.0", default-features = false, features = ["fuzzy-select"] }
 getrandom = "0.4.2"

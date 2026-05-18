@@ -11,11 +11,13 @@
 //!     cooldown for one instrument.
 
 use std::fs;
+use std::io::{self, Read};
 use std::path::PathBuf;
 use std::time::Duration;
 
 use chrono::Utc;
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
+use clap_complete::{Shell, generate};
 use color_eyre::eyre::{Context, Result, eyre};
 use trade_control_cli::{
     KEY_LEN, build_clear_prep_intent, build_clear_veto_intent, build_prep_intent,
@@ -23,6 +25,7 @@ use trade_control_cli::{
     encrypt_intent, fill_missing_fields, generate_key_hex, pick_template_interactive,
     prompt_save_as_template, record_prep_use, record_veto_use, wrap_in_envelope,
 };
+use trade_control_core::crypto;
 use trade_control_core::intent::VetoLevel;
 
 #[derive(Parser)]
@@ -53,6 +56,17 @@ enum Cmd {
     ClearPrep(ClearPrepCmdArgs),
     /// Clear a single veto flag.
     ClearVeto(ClearVetoCmdArgs),
+    /// Decrypt a `v1.<base64>` payload back to the plaintext intent YAML.
+    /// Accepts either the bare `v1.…` blob as a positional, the full
+    /// YAML alert body on stdin, or a `--file` path. Useful for inspecting
+    /// what TradingView actually sent.
+    Decrypt(DecryptArgs),
+    /// Print a shell completion script to stdout. Install with e.g.
+    /// `encrypt-payload completions zsh > ~/.zfunc/_encrypt-payload`.
+    Completions {
+        /// Target shell.
+        shell: Shell,
+    },
 }
 
 #[derive(Parser)]
@@ -156,6 +170,21 @@ struct ClearVetoCmdArgs {
 }
 
 #[derive(Parser)]
+struct DecryptArgs {
+    /// Path to a hex-encoded 32-byte key.
+    #[arg(long)]
+    key_file: PathBuf,
+    /// Path to a file containing either the bare `v1.…` blob or the
+    /// full YAML alert body. If omitted and no positional `blob` is
+    /// given, stdin is read.
+    #[arg(long)]
+    file: Option<PathBuf>,
+    /// The encrypted payload as a `v1.<base64>` blob, OR the full YAML
+    /// alert body containing a `payload: "v1.…"` line. Quote it.
+    blob: Option<String>,
+}
+
+#[derive(Parser)]
 struct EncryptArgs {
     /// Path to a hex-encoded 32-byte key.
     #[arg(long)]
@@ -185,8 +214,79 @@ fn main() -> Result<()> {
         Cmd::Veto(args) => run_veto(args)?,
         Cmd::ClearPrep(args) => run_clear_prep(args)?,
         Cmd::ClearVeto(args) => run_clear_veto(args)?,
+        Cmd::Decrypt(args) => run_decrypt(args)?,
+        Cmd::Completions { shell } => run_completions(shell),
     }
     Ok(())
+}
+
+fn run_completions(shell: Shell) {
+    let mut cmd = Cli::command();
+    generate(shell, &mut cmd, "encrypt-payload", &mut io::stdout());
+}
+
+fn run_decrypt(args: DecryptArgs) -> Result<()> {
+    let key = load_key(&args.key_file)?;
+    let raw = match (args.blob, args.file) {
+        (Some(b), _) => b,
+        (None, Some(path)) => {
+            fs::read_to_string(&path).with_context(|| format!("reading input {path:?}"))?
+        }
+        (None, None) => {
+            let mut buf = String::new();
+            io::stdin()
+                .read_to_string(&mut buf)
+                .context("reading stdin")?;
+            buf
+        }
+    };
+    let blob = extract_payload_blob(&raw)?;
+    let plain = crypto::decrypt(&key, &blob).map_err(|e| eyre!("decrypt: {e}"))?;
+    let text = String::from_utf8(plain).context("plaintext is not valid UTF-8")?;
+    print!("{text}");
+    if !text.ends_with('\n') {
+        println!();
+    }
+    Ok(())
+}
+
+/// Pull a `v1.<base64>` blob out of either a bare string or a YAML body
+/// with a `payload: "v1.…"` field. Trims whitespace and surrounding quotes.
+fn extract_payload_blob(input: &str) -> Result<String> {
+    let trimmed = input.trim();
+    if trimmed.starts_with("v1.") {
+        return Ok(strip_quotes(trimmed).to_string());
+    }
+    // Try YAML — pull the `payload` field.
+    if let Ok(serde_yaml::Value::Mapping(map)) = serde_yaml::from_str::<serde_yaml::Value>(trimmed)
+        && let Some(v) = map.get(serde_yaml::Value::String("payload".to_string()))
+        && let Some(s) = v.as_str()
+        && s.starts_with("v1.")
+    {
+        return Ok(s.to_string());
+    }
+    // Fallback: scan line-by-line for `payload:` so a body with TradingView
+    // `{{close}}` placeholders (which aren't valid YAML scalars) still works.
+    for line in trimmed.lines() {
+        let line = line.trim();
+        if let Some(rest) = line.strip_prefix("payload:") {
+            let val = strip_quotes(rest.trim());
+            if val.starts_with("v1.") {
+                return Ok(val.to_string());
+            }
+        }
+    }
+    Err(eyre!(
+        "no `v1.<base64>` payload found in input; pass the blob as a positional, --file, or pipe the YAML body in on stdin"
+    ))
+}
+
+fn strip_quotes(s: &str) -> &str {
+    let s = s.trim();
+    s.strip_prefix('"')
+        .and_then(|s| s.strip_suffix('"'))
+        .or_else(|| s.strip_prefix('\'').and_then(|s| s.strip_suffix('\'')))
+        .unwrap_or(s)
 }
 
 fn load_key(path: &PathBuf) -> Result<[u8; KEY_LEN]> {
@@ -358,4 +458,46 @@ fn run_encrypt(args: EncryptArgs) -> Result<()> {
     let yaml = build_yaml_template(&blob);
     print!("{yaml}");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const BLOB: &str = "v1.iiLvZCndSf+I3toNPFOtMDQixC2eMYO2TovfKKgepdIW";
+
+    #[test]
+    fn extract_payload_from_bare_blob() {
+        assert_eq!(extract_payload_blob(BLOB).unwrap(), BLOB);
+    }
+
+    #[test]
+    fn extract_payload_from_bare_blob_with_whitespace() {
+        let padded = format!("  \n{BLOB}\n  ");
+        assert_eq!(extract_payload_blob(&padded).unwrap(), BLOB);
+    }
+
+    #[test]
+    fn extract_payload_from_yaml_body() {
+        let yaml = format!(
+            "close: 1.23\nhigh: 1.24\nlow: 1.22\ntime: \"2026-05-18T00:00:00Z\"\npayload: \"{BLOB}\"\n"
+        );
+        assert_eq!(extract_payload_blob(&yaml).unwrap(), BLOB);
+    }
+
+    #[test]
+    fn extract_payload_from_tradingview_template_with_placeholders() {
+        // Body still has `{{close}}` placeholders — not valid YAML — but
+        // the line-scan fallback should still pull payload out.
+        let yaml = format!(
+            "close: {{{{close}}}}\nhigh: {{{{high}}}}\nlow: {{{{low}}}}\ntime: \"{{{{time}}}}\"\npayload: \"{BLOB}\"\n"
+        );
+        assert_eq!(extract_payload_blob(&yaml).unwrap(), BLOB);
+    }
+
+    #[test]
+    fn extract_payload_rejects_missing_payload() {
+        let yaml = "close: 1\nhigh: 2\nlow: 0\ntime: \"now\"\n";
+        assert!(extract_payload_blob(yaml).is_err());
+    }
 }
