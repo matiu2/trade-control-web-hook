@@ -494,7 +494,13 @@ async fn handle_prep(
         }
     };
     if let Err(err) = store
-        .set_prep(&verified.intent.instrument, step, now, ttl_seconds)
+        .set_prep(
+            &verified.intent.instrument,
+            step,
+            now,
+            ttl_seconds,
+            &verified.intent.id,
+        )
         .await
     {
         console_error!("KV set_prep: {err}");
@@ -698,13 +704,25 @@ async fn handle_clear_prep(
     let Some(step) = verified.intent.step.as_deref() else {
         return Response::error("clear-prep requires `step`", 400);
     };
-    let was = match store.clear_prep(&verified.intent.instrument, step).await {
-        Ok(b) => b,
+    let cleared_setter = match store.clear_prep(&verified.intent.instrument, step).await {
+        Ok(s) => s,
         Err(err) => {
             console_error!("KV clear_prep: {err}");
             return Response::error("state error", 500);
         }
     };
+    // If the cleared prep recorded its setter's message-id, drop that
+    // `seen:<id>` record too so the operator can re-send the original
+    // prep message without hitting the replay-protection 409.
+    if let Some(setter_id) = cleared_setter.as_deref()
+        && !setter_id.is_empty()
+        && let Err(err) = store.forget_seen(setter_id).await
+    {
+        // Best-effort — the prep is gone, the operator can manually
+        // delete the seen key via wrangler if needed.
+        console_error!("KV forget_seen({setter_id}): {err}");
+    }
+    let was = cleared_setter.is_some();
     console_log!(
         "clear-prep {} {} was_set={}",
         verified.intent.instrument,

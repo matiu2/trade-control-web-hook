@@ -101,6 +101,12 @@ pub trait StateStore {
         ttl_seconds: u64,
     ) -> impl Future<Output = Result<(), StateError>>;
 
+    /// Delete the `seen:<id>` replay-protection record and prune the
+    /// index. Used when a prep is cleared so the operator can re-send
+    /// the original prep message without hitting the duplicate-id 409.
+    /// Best-effort: succeeds even if the key is already gone.
+    fn forget_seen(&self, id: &str) -> impl Future<Output = Result<(), StateError>>;
+
     /// Returns true if `instrument` is currently under cooldown.
     fn is_cooled_down(&self, instrument: &str) -> impl Future<Output = Result<bool, StateError>>;
 
@@ -118,13 +124,18 @@ pub trait StateStore {
 
     /// Record a named prep step for `instrument` with a TTL. `now` is the
     /// timestamp stored on the flag; the entry-time gate uses it to
-    /// enforce ordering across multiple preps.
+    /// enforce ordering across multiple preps. `setter_id` is the
+    /// message-id that set this prep, stashed inside the value so
+    /// `clear_prep` can also forget that id's `seen:<id>` record —
+    /// the operator can then re-send the original prep message
+    /// without hitting the replay-protection 409.
     fn set_prep(
         &self,
         instrument: &str,
         step: &str,
         now: DateTime<Utc>,
         ttl_seconds: u64,
+        setter_id: &str,
     ) -> impl Future<Output = Result<(), StateError>>;
 
     /// Return `Some(set_at)` if the prep is currently active, `None`
@@ -135,12 +146,15 @@ pub trait StateStore {
         step: &str,
     ) -> impl Future<Output = Result<Option<DateTime<Utc>>, StateError>>;
 
-    /// Clear a prep flag. Returns whether it was set before.
+    /// Clear a prep flag. Returns `Some(setter_id)` if the prep was
+    /// active and recorded a setter id, `Some(String::new())` if it
+    /// was active but predates the setter-id wire format, and `None`
+    /// if it wasn't set.
     fn clear_prep(
         &self,
         instrument: &str,
         step: &str,
-    ) -> impl Future<Output = Result<bool, StateError>>;
+    ) -> impl Future<Output = Result<Option<String>, StateError>>;
 
     /// Record a named veto for `instrument` with a TTL. Presence alone
     /// is the signal — no timestamp needs storing.
@@ -239,6 +253,19 @@ impl std::error::Error for StateError {}
 /// Cloudflare KV's minimum TTL is 60 seconds; clamp anything smaller.
 pub const MIN_TTL_SECONDS: u64 = 60;
 
+/// Split a prep KV value into its (timestamp, setter_id) parts.
+///
+/// The value is stored as `<rfc3339>|<setter_id>`. Values written
+/// before the setter-id field was added are bare timestamps; those
+/// parse with an empty setter_id, which signals "no seen-id to
+/// forget" to `clear_prep` callers.
+pub fn parse_prep_value(raw: &str) -> (&str, &str) {
+    match raw.split_once('|') {
+        Some((ts, id)) => (ts, id),
+        None => (raw, ""),
+    }
+}
+
 /// Clear each prep in `names` for `instrument`. Returns the subset of
 /// names that were actually cleared (i.e. had a value). Used by the
 /// `Prep` handler to apply the intent's `clears` list before recording
@@ -257,7 +284,12 @@ pub async fn clear_named_preps<S: StateStore>(
 ) -> Result<Vec<String>, StateError> {
     let mut cleared = Vec::new();
     for name in names {
-        if store.clear_prep(instrument, name).await? {
+        if let Some(setter_id) = store.clear_prep(instrument, name).await? {
+            // Empty setter_id means the prep predates the wire-format
+            // change that stashes the id; nothing to forget.
+            if !setter_id.is_empty() {
+                store.forget_seen(&setter_id).await?;
+            }
             cleared.push(name.clone());
         }
     }
@@ -333,6 +365,10 @@ mod memstore {
             self.put(format!("seen:{id}"), "1".into(), ttl_seconds, seen_at);
             Ok(())
         }
+        async fn forget_seen(&self, id: &str) -> Result<(), StateError> {
+            self.delete(&format!("seen:{id}"));
+            Ok(())
+        }
         async fn is_cooled_down(&self, instrument: &str) -> Result<bool, StateError> {
             Ok(self
                 .get_live(&format!("cooldown:{instrument}"), Utc::now())
@@ -357,10 +393,11 @@ mod memstore {
             step: &str,
             now: DateTime<Utc>,
             ttl_seconds: u64,
+            setter_id: &str,
         ) -> Result<(), StateError> {
             self.put(
                 format!("prep:{instrument}:{step}"),
-                now.to_rfc3339(),
+                format!("{}|{setter_id}", now.to_rfc3339()),
                 ttl_seconds.max(MIN_TTL_SECONDS),
                 now,
             );
@@ -374,14 +411,27 @@ mod memstore {
             let Some(text) = self.get_live(&format!("prep:{instrument}:{step}"), Utc::now()) else {
                 return Ok(None);
             };
+            let (ts_part, _id_part) = parse_prep_value(&text);
             Ok(Some(
-                DateTime::parse_from_rfc3339(&text)
+                DateTime::parse_from_rfc3339(ts_part)
                     .map_err(|e| StateError::Backend(format!("parse: {e}")))?
                     .with_timezone(&Utc),
             ))
         }
-        async fn clear_prep(&self, instrument: &str, step: &str) -> Result<bool, StateError> {
-            Ok(self.delete(&format!("prep:{instrument}:{step}")))
+        async fn clear_prep(
+            &self,
+            instrument: &str,
+            step: &str,
+        ) -> Result<Option<String>, StateError> {
+            let key = format!("prep:{instrument}:{step}");
+            let setter = self
+                .get_live(&key, Utc::now())
+                .map(|raw| parse_prep_value(&raw).1.to_string());
+            if self.delete(&key) {
+                Ok(Some(setter.unwrap_or_default()))
+            } else {
+                Ok(None)
+            }
         }
         async fn set_veto(
             &self,
@@ -477,6 +527,66 @@ mod tests {
     }
 
     #[test]
+    fn memstore_forget_seen_removes_record() {
+        use super::memstore::MemStateStore;
+        let store = MemStateStore::new();
+        pollster::block_on(store.mark_seen("abc", Action::Prep, Utc::now(), "ok", 3600)).unwrap();
+        assert!(pollster::block_on(store.is_seen("abc")).unwrap());
+        pollster::block_on(store.forget_seen("abc")).unwrap();
+        assert!(!pollster::block_on(store.is_seen("abc")).unwrap());
+        // Idempotent: forgetting again is a no-op.
+        pollster::block_on(store.forget_seen("abc")).unwrap();
+    }
+
+    #[test]
+    fn clear_named_preps_also_forgets_setter_seen_ids() {
+        // The whole point of the setter-id wire format: when an
+        // upstream prep (or operator `clear-prep`) drops a stale
+        // downstream prep, the prep's setter message-id should be
+        // dropped from `seen:` too — so the operator can re-send
+        // the original prep message without hitting replay protection.
+        use super::memstore::MemStateStore;
+        let store = MemStateStore::new();
+        let now = Utc::now();
+
+        // Two preps; each had a corresponding `mark_seen` when its
+        // intent first arrived.
+        pollster::block_on(store.mark_seen("retest-msg-id", Action::Prep, now, "ok", 24 * 3600))
+            .unwrap();
+        pollster::block_on(store.set_prep("EUR_USD", "retest", now, 3600, "retest-msg-id"))
+            .unwrap();
+
+        // Clearing the prep via clear_named_preps should also drop
+        // the seen record.
+        let cleared = pollster::block_on(clear_named_preps(
+            &store,
+            "EUR_USD",
+            &["retest".to_string()],
+        ))
+        .unwrap();
+        assert_eq!(cleared, vec!["retest".to_string()]);
+        assert!(
+            !pollster::block_on(store.is_seen("retest-msg-id")).unwrap(),
+            "expected seen:retest-msg-id to be forgotten after clear_named_preps"
+        );
+    }
+
+    #[test]
+    fn legacy_prep_value_without_setter_id_parses_clean() {
+        // Old prep values (pre-setter-id) are bare RFC3339 strings.
+        // The parser must still return them so `get_prep` keeps
+        // working after a deploy that includes the new format —
+        // existing live preps don't suddenly become invalid.
+        let (ts, id) = parse_prep_value("2026-05-19T10:00:00+00:00");
+        assert_eq!(ts, "2026-05-19T10:00:00+00:00");
+        assert_eq!(id, "");
+
+        let (ts, id) = parse_prep_value("2026-05-19T10:00:00+00:00|some-id");
+        assert_eq!(ts, "2026-05-19T10:00:00+00:00");
+        assert_eq!(id, "some-id");
+    }
+
+    #[test]
     fn memstore_prep_round_trip() {
         use super::memstore::MemStateStore;
         let store = MemStateStore::new();
@@ -484,13 +594,16 @@ mod tests {
         // sees the entry as live. The test only cares about round-trip
         // semantics, not TTL expiry.
         let now = Utc::now();
-        pollster::block_on(store.set_prep("EUR_USD", "break", now, 4 * 3600)).unwrap();
+        pollster::block_on(store.set_prep("EUR_USD", "break", now, 4 * 3600, "setter-1")).unwrap();
         let got = pollster::block_on(store.get_prep("EUR_USD", "break")).unwrap();
         assert_eq!(got, Some(now));
-        let was = pollster::block_on(store.clear_prep("EUR_USD", "break")).unwrap();
-        assert!(was);
+        let cleared = pollster::block_on(store.clear_prep("EUR_USD", "break")).unwrap();
+        assert_eq!(cleared.as_deref(), Some("setter-1"));
         let got = pollster::block_on(store.get_prep("EUR_USD", "break")).unwrap();
         assert!(got.is_none());
+        // Clearing again returns None — the prep is gone.
+        let again = pollster::block_on(store.clear_prep("EUR_USD", "break")).unwrap();
+        assert!(again.is_none());
     }
 
     #[test]
@@ -518,8 +631,8 @@ mod tests {
         let store = MemStateStore::new();
         let t1 = Utc::now();
         let t2 = t1 + chrono::Duration::minutes(5);
-        pollster::block_on(store.set_prep("EUR_USD", "break", t1, 3600)).unwrap();
-        pollster::block_on(store.set_prep("USD_JPY", "break", t2, 3600)).unwrap();
+        pollster::block_on(store.set_prep("EUR_USD", "break", t1, 3600, "id-1")).unwrap();
+        pollster::block_on(store.set_prep("USD_JPY", "break", t2, 3600, "id-2")).unwrap();
         assert_eq!(
             pollster::block_on(store.get_prep("EUR_USD", "break")).unwrap(),
             Some(t1)
@@ -539,8 +652,8 @@ mod tests {
         // Use a TTL that comfortably covers the test's relative clock —
         // memstore's `get_live` consults the real wall clock.
         let ttl = 24 * 3600;
-        pollster::block_on(store.set_prep("EUR_USD", "break", t1, ttl)).unwrap();
-        pollster::block_on(store.set_prep("EUR_USD", "break", t2, ttl)).unwrap();
+        pollster::block_on(store.set_prep("EUR_USD", "break", t1, ttl, "id-a")).unwrap();
+        pollster::block_on(store.set_prep("EUR_USD", "break", t2, ttl, "id-b")).unwrap();
         // Refiring a prep refreshes its timestamp — documented behaviour.
         assert_eq!(
             pollster::block_on(store.get_prep("EUR_USD", "break")).unwrap(),
@@ -558,8 +671,8 @@ mod tests {
         let store = MemStateStore::new();
         let now = Utc::now();
         let ttl = 24 * 3600;
-        pollster::block_on(store.set_prep("EUR_USD", "retest", now, ttl)).unwrap();
-        pollster::block_on(store.set_prep("EUR_USD", "other", now, ttl)).unwrap();
+        pollster::block_on(store.set_prep("EUR_USD", "retest", now, ttl, "retest-id")).unwrap();
+        pollster::block_on(store.set_prep("EUR_USD", "other", now, ttl, "other-id")).unwrap();
 
         let cleared = pollster::block_on(clear_named_preps(
             &store,
@@ -590,7 +703,8 @@ mod tests {
         use super::memstore::MemStateStore;
         let store = MemStateStore::new();
         let now = Utc::now();
-        pollster::block_on(store.set_prep("EUR_USD", "retest", now, 24 * 3600)).unwrap();
+        pollster::block_on(store.set_prep("EUR_USD", "retest", now, 24 * 3600, "retest-id"))
+            .unwrap();
         let cleared = pollster::block_on(clear_named_preps(&store, "EUR_USD", &[])).unwrap();
         assert!(cleared.is_empty());
         // Existing prep untouched.
@@ -609,8 +723,8 @@ mod tests {
         let store = MemStateStore::new();
         let now = Utc::now();
         let ttl = 24 * 3600;
-        pollster::block_on(store.set_prep("EUR_USD", "retest", now, ttl)).unwrap();
-        pollster::block_on(store.set_prep("USD_JPY", "retest", now, ttl)).unwrap();
+        pollster::block_on(store.set_prep("EUR_USD", "retest", now, ttl, "eur-id")).unwrap();
+        pollster::block_on(store.set_prep("USD_JPY", "retest", now, ttl, "jpy-id")).unwrap();
 
         let cleared = pollster::block_on(clear_named_preps(
             &store,

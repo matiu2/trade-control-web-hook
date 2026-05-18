@@ -38,6 +38,18 @@ at unattended hours, or repeated misses between rotations.
 
 ## Done
 
+- **`clear-prep` also forgets the prep's setter `seen:<id>`** —
+  landed. Prep KV values now store `<rfc3339>|<setter_id>` instead of
+  bare `<rfc3339>`, so the worker remembers which message-id set each
+  prep. `clear_prep` returns the setter id; `handle_clear_prep` and
+  `clear_named_preps` (the cascade-clear path triggered by a fresh
+  upstream prep's `clears:` list) call a new `forget_seen` method that
+  deletes `seen:<id>` and prunes the index. This means the operator
+  can re-send the original prep message after `clear-prep` without
+  hitting a 409 from replay protection. Wire format is
+  forward-compatible — legacy bare-timestamp values still parse
+  (empty setter_id, no seen-forget). 106 core + 67 cli + 5 cli-bin
+  tests; clippy clean.
 - **Per-instrument trade-expiry anchor (CLI-only)** — landed. New
   `cli::expiry` module persists a single `DateTime<Utc>` per instrument
   under `$XDG_CONFIG_HOME/trade-control/expiry/<INSTRUMENT>.txt`. The

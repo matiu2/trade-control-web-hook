@@ -163,6 +163,24 @@ impl StateStore for KvStateStore {
         self.write_seen_index(&entries).await
     }
 
+    async fn forget_seen(&self, id: &str) -> Result<(), StateError> {
+        let key = Self::seen_key(id);
+        // Best-effort delete: if the key already expired or was
+        // never written, the index drop below is still useful.
+        self.store
+            .delete(&key)
+            .await
+            .map_err(|e| StateError::Backend(format!("delete seen: {e:?}")))?;
+        let now = Utc::now();
+        let mut entries = prune_expired(self.read_seen_index().await?, now);
+        let before = entries.len();
+        entries.retain(|e| e.id != id);
+        if entries.len() != before {
+            self.write_seen_index(&entries).await?;
+        }
+        Ok(())
+    }
+
     async fn is_cooled_down(&self, instrument: &str) -> Result<bool, StateError> {
         let key = Self::cooldown_key(instrument);
         let result = self
@@ -234,12 +252,14 @@ impl StateStore for KvStateStore {
         step: &str,
         now: DateTime<Utc>,
         ttl_seconds: u64,
+        setter_id: &str,
     ) -> Result<(), StateError> {
         let key = Self::prep_key(instrument, step);
         let ttl = ttl_seconds.max(MIN_TTL_SECONDS);
-        // Store the set_at timestamp as the value so the entry-time gate
-        // can enforce prep ordering. RFC3339 round-trips through chrono.
-        let body = now.to_rfc3339();
+        // Store `<rfc3339>|<setter_id>` so the entry-time gate can read
+        // the timestamp AND `clear_prep` can forget the setter's seen
+        // record. See `parse_prep_value`. RFC3339 has no `|`.
+        let body = format!("{}|{setter_id}", now.to_rfc3339());
         self.store
             .put(&key, body)
             .map_err(|e| StateError::Backend(format!("put prep builder: {e:?}")))?
@@ -279,21 +299,25 @@ impl StateStore for KvStateStore {
         let Some(text) = raw else {
             return Ok(None);
         };
-        let ts = DateTime::parse_from_rfc3339(&text)
+        let (ts_part, _id_part) = trade_control_core::state::parse_prep_value(&text);
+        let ts = DateTime::parse_from_rfc3339(ts_part)
             .map_err(|e| StateError::Backend(format!("parse prep timestamp: {e}")))?
             .with_timezone(&Utc);
         Ok(Some(ts))
     }
 
-    async fn clear_prep(&self, instrument: &str, step: &str) -> Result<bool, StateError> {
+    async fn clear_prep(&self, instrument: &str, step: &str) -> Result<Option<String>, StateError> {
         let key = Self::prep_key(instrument, step);
-        let was = self
+        let raw = self
             .store
             .get(&key)
             .text()
             .await
-            .map_err(|e| StateError::Backend(format!("get prep for clear: {e:?}")))?
-            .is_some();
+            .map_err(|e| StateError::Backend(format!("get prep for clear: {e:?}")))?;
+        let setter_id = raw
+            .as_ref()
+            .map(|r| trade_control_core::state::parse_prep_value(r).1.to_string());
+        let was = raw.is_some();
         if was {
             self.store
                 .delete(&key)
@@ -307,7 +331,7 @@ impl StateStore for KvStateStore {
         if entries.len() != before || was {
             self.write_prep_index(&entries).await?;
         }
-        Ok(was)
+        Ok(setter_id)
     }
 
     async fn set_veto(
