@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 
 use chrono::Utc;
 use color_eyre::eyre::{Result, eyre};
-use dialoguer::{Input, Select, theme::ColorfulTheme};
+use dialoguer::{FuzzySelect, Input, Select, theme::ColorfulTheme};
 use serde_yaml::Value;
 
 use super::history;
@@ -37,8 +37,9 @@ pub fn fill_missing_fields(template: &mut Value, non_interactive: bool) -> Resul
     fill_round(template, &action_required, non_interactive)?;
 
     // Pass 3: optional action-dependent fields (e.g. `requires_preps` /
-    // `vetos` for `enter`). Skipped entirely in non-interactive mode —
-    // an absent optional field is fine there.
+    // `vetos` for `enter`, `clears` for `prep` / `veto`). Skipped
+    // entirely in non-interactive mode — an absent optional field is
+    // fine there.
     if !non_interactive {
         let optional = optional_for_action(action);
         for field in optional {
@@ -47,7 +48,7 @@ pub fn fill_missing_fields(template: &mut Value, non_interactive: bool) -> Resul
             if template.get(*field).is_some() {
                 continue;
             }
-            let value = prompt_optional_name_list(field)?;
+            let value = prompt_optional_name_list(field, action)?;
             set_field(template, field, value);
         }
     }
@@ -142,15 +143,21 @@ fn prompt_for_field(field: &str, template: &Value) -> Result<Value> {
             Ok(Value::Number(n.into()))
         }
         "step" => {
-            let s: String = Input::with_theme(&theme)
-                .with_prompt("step (named prep, e.g. break-and-close)")
-                .interact_text()?;
+            let s = prompt_history_backed_name(
+                &theme,
+                NameKind::Prep,
+                "step (named prep)",
+                "e.g. break-and-close",
+            )?;
             Ok(Value::String(s))
         }
         "name" => {
-            let s: String = Input::with_theme(&theme)
-                .with_prompt("name (named veto, e.g. news-window)")
-                .interact_text()?;
+            let s = prompt_history_backed_name(
+                &theme,
+                NameKind::Veto,
+                "name (named veto)",
+                "e.g. news-window",
+            )?;
             Ok(Value::String(s))
         }
         "ttl_hours" => {
@@ -207,19 +214,46 @@ fn write_template(path: &Path, yaml: &str) -> Result<()> {
     Ok(())
 }
 
-/// Prompt for a comma-separated list of names (used for `requires_preps`
-/// and `vetos`). Empty input is fine and yields an empty sequence — the
-/// worker treats empty as "no gate".
+/// Which history list a list-of-names field should pull suggestions from
+/// and write back to. `clears` is contextual: on a `prep` action it
+/// names other preps; on a `veto` action it names other vetos.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NameKind {
+    Prep,
+    Veto,
+    /// No history association — prompt without suggestions and don't
+    /// record entries. Reserved for unknown fields; not currently used.
+    None,
+}
+
+fn name_kind_for(field: &str, action: trade_control_core::intent::Action) -> NameKind {
+    use trade_control_core::intent::Action;
+    match (field, action) {
+        ("requires_preps", _) => NameKind::Prep,
+        ("vetos", _) => NameKind::Veto,
+        ("clears", Action::Prep) => NameKind::Prep,
+        ("clears", Action::Veto) => NameKind::Veto,
+        _ => NameKind::None,
+    }
+}
+
+/// Prompt for a comma-separated list of names (used for `requires_preps`,
+/// `vetos`, and `clears`). Empty input is fine and yields an empty
+/// sequence — the worker treats empty as "no gate" / "no clears".
 ///
 /// Shows recent names from history as a hint so the operator doesn't have
 /// to remember exact spellings (typos silently break the gate).
-fn prompt_optional_name_list(field: &str) -> Result<Value> {
+fn prompt_optional_name_list(
+    field: &str,
+    action: trade_control_core::intent::Action,
+) -> Result<Value> {
     let theme = ColorfulTheme::default();
     let history = history::load();
-    let suggestions = match field {
-        "requires_preps" => history.prep_names(),
-        "vetos" => history.veto_names(),
-        _ => Vec::new(),
+    let kind = name_kind_for(field, action);
+    let suggestions = match kind {
+        NameKind::Prep => history.prep_names(),
+        NameKind::Veto => history.veto_names(),
+        NameKind::None => Vec::new(),
     };
     let hint = if suggestions.is_empty() {
         String::new()
@@ -244,16 +278,79 @@ fn prompt_optional_name_list(field: &str) -> Result<Value> {
     let now = Utc::now();
     let mut h = history;
     for name in &names {
-        match field {
-            "requires_preps" => h.record_prep(name, now),
-            "vetos" => h.record_veto(name, now),
-            _ => {}
+        match kind {
+            NameKind::Prep => h.record_prep(name, now),
+            NameKind::Veto => h.record_veto(name, now),
+            NameKind::None => {}
         }
     }
     let _ = history::save(&h);
 
     let seq: Vec<Value> = names.into_iter().map(Value::String).collect();
     Ok(Value::Sequence(seq))
+}
+
+/// Prompt for a single name, offering recent entries from history as
+/// a fuzzy-selectable list plus a "(type new...)" sentinel that drops
+/// into freeform text entry. Used for `step` (prep) and `name` (veto).
+///
+/// `kind` decides which history list to draw from and write to.
+/// `prompt_label` is shown both on the picker and on the freeform input.
+/// `example` is appended to the freeform prompt for hint text
+/// (e.g. `"e.g. break-and-close"`).
+fn prompt_history_backed_name(
+    theme: &ColorfulTheme,
+    kind: NameKind,
+    prompt_label: &str,
+    example: &str,
+) -> Result<String> {
+    let history = history::load();
+    let suggestions: Vec<String> = match kind {
+        NameKind::Prep => history.prep_names(),
+        NameKind::Veto => history.veto_names(),
+        NameKind::None => Vec::new(),
+    };
+
+    let chosen = if suggestions.is_empty() {
+        // No history — go straight to freeform.
+        Input::<String>::with_theme(theme)
+            .with_prompt(format!("{prompt_label} ({example})"))
+            .interact_text()?
+    } else {
+        const TYPE_NEW: &str = "(type new...)";
+        let mut items: Vec<&str> = suggestions.iter().map(String::as_str).collect();
+        items.push(TYPE_NEW);
+        let idx = FuzzySelect::with_theme(theme)
+            .with_prompt(format!("{prompt_label} (recent — type to filter)"))
+            .items(&items)
+            .default(0)
+            .interact()?;
+        if items[idx] == TYPE_NEW {
+            Input::<String>::with_theme(theme)
+                .with_prompt(format!("{prompt_label} ({example})"))
+                .interact_text()?
+        } else {
+            items[idx].to_string()
+        }
+    };
+
+    let trimmed = chosen.trim().to_string();
+    if trimmed.is_empty() {
+        return Err(eyre!("{prompt_label}: empty value not allowed"));
+    }
+
+    // Promote the chosen name to the top of its history list so the
+    // next prompt offers it first.
+    let mut h = history::load();
+    let now = Utc::now();
+    match kind {
+        NameKind::Prep => h.record_prep(&trimmed, now),
+        NameKind::Veto => h.record_veto(&trimmed, now),
+        NameKind::None => {}
+    }
+    let _ = history::save(&h);
+
+    Ok(trimmed)
 }
 
 fn prompt_action(theme: &ColorfulTheme) -> Result<Value> {
@@ -594,6 +691,47 @@ mod tests {
         let intent: Intent = serde_yaml::from_value(template).unwrap();
         assert!(intent.requires_preps.is_empty());
         assert!(intent.vetos.is_empty());
+    }
+
+    #[test]
+    fn non_interactive_accepts_template_supplied_prep_clears() {
+        // A prep template can pre-declare its `clears:` list — the
+        // non-interactive path must honour it without prompting.
+        let yaml = "
+            v: 1
+            id: prep-1
+            not_after: \"2026-05-14T03:30:00Z\"
+            action: prep
+            instrument: EUR_USD
+            step: break-and-close
+            ttl_hours: 4
+            clears: [retest]
+        ";
+        let mut template: Value = serde_yaml::from_str(yaml).unwrap();
+        fill_missing_fields(&mut template, true).unwrap();
+        let intent: Intent = serde_yaml::from_value(template).unwrap();
+        assert_eq!(intent.action, Action::Prep);
+        assert_eq!(intent.clears, vec!["retest".to_string()]);
+    }
+
+    #[test]
+    fn non_interactive_leaves_clears_empty_when_absent_on_prep() {
+        // Templates that don't mention `clears` round-trip cleanly with
+        // an empty list. The optional prompt is skipped in
+        // non-interactive mode.
+        let yaml = "
+            v: 1
+            id: prep-1
+            not_after: \"2026-05-14T03:30:00Z\"
+            action: prep
+            instrument: EUR_USD
+            step: break-and-close
+            ttl_hours: 4
+        ";
+        let mut template: Value = serde_yaml::from_str(yaml).unwrap();
+        fill_missing_fields(&mut template, true).unwrap();
+        let intent: Intent = serde_yaml::from_value(template).unwrap();
+        assert!(intent.clears.is_empty());
     }
 
     #[test]

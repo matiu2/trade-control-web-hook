@@ -296,6 +296,7 @@ mod tests {
             level: None,
             requires_preps: Vec::new(),
             vetos: Vec::new(),
+            clears: Vec::new(),
         }
     }
 

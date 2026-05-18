@@ -1,4 +1,6 @@
 mod state;
+#[cfg(target_arch = "wasm32")]
+mod tn_login;
 mod tradenation_adapter;
 
 use chrono::Utc;
@@ -12,7 +14,7 @@ use trade_control_core::broker::{Broker, EntryRequest};
 use trade_control_core::crypto;
 use trade_control_core::incoming::{self, parse_and_verify};
 use trade_control_core::intent::{Action, BrokerKind, Resolved, VetoLevel};
-use trade_control_core::state::StateStore;
+use trade_control_core::state::{StateStore, clear_named_preps, clear_named_vetos};
 
 /// Response body for the `unlock` action. Serialised as YAML.
 #[derive(Serialize)]
@@ -26,6 +28,11 @@ const MAX_RISK_PCT_PER_TRADE_SECRET: &str = "MAX_RISK_PCT_PER_TRADE";
 const MAX_OPEN_POSITIONS_SECRET: &str = "MAX_OPEN_POSITIONS";
 const PIP_SIZE_SECRET_PREFIX: &str = "PIP_SIZE_";
 const TN_SESSION_JSON_SECRET: &str = "TN_SESSION_JSON";
+#[cfg(target_arch = "wasm32")]
+const TN_DEMO_LOGIN_ID_SECRET: &str = "TN_DEMO_LOGIN_ID";
+#[cfg(target_arch = "wasm32")]
+const TN_DEMO_PASSWORD_SECRET: &str = "TN_DEMO_PASSWORD";
+const TN_SESSION_KV_KEY: &str = "tn:session:demo";
 const KV_NAMESPACE: &str = "TRADE_CONTROL_KV";
 
 /// Default pip size when no `PIP_SIZE_<INSTRUMENT>` secret is set. EUR_USD's
@@ -107,22 +114,15 @@ pub async fn main(mut req: Request, env: Env, _ctx: Context) -> Result<Response>
             Some(broker) => run_action(&broker, &store, &verified, &env, now).await,
             None => return Response::error("oanda login failed", 500),
         },
-        BrokerKind::TradeNation => {
-            let Some(session_json) = get_secret(TN_SESSION_JSON_SECRET, &env) else {
-                console_error!("missing required secret: {TN_SESSION_JSON_SECRET}");
-                return Response::error("tradenation session not configured", 503);
-            };
-            match broker_tradenation::login(&session_json).await {
-                Some(broker) => {
-                    let adapter = TradeNationAdapter(broker);
-                    run_action(&adapter, &store, &verified, &env, now).await
-                }
-                None => {
-                    console_error!("tradenation login failed; rotate {TN_SESSION_JSON_SECRET}");
-                    return Response::error("tradenation session expired or invalid", 503);
-                }
+        BrokerKind::TradeNation => match acquire_tn_broker(&env).await {
+            Some(broker) => {
+                let adapter = TradeNationAdapter(broker);
+                run_action(&adapter, &store, &verified, &env, now).await
             }
-        }
+            None => {
+                return Response::error("tradenation session expired or invalid", 503);
+            }
+        },
     };
 
     // Every dispatch path records a seen entry — success, broker failure,
@@ -475,6 +475,24 @@ async fn handle_prep(
         return Response::error("prep requires `ttl_hours`", 400);
     };
     let ttl_seconds = (ttl_hours as u64).saturating_mul(3600);
+    // Clear any preps listed in `clears` first so stale downstream
+    // preps (e.g. an old `retest`) can't survive a fresh upstream prep
+    // (`break-and-close`). Logged per-name for traceability; failures
+    // are best-effort logs rather than rejections so a transient KV
+    // hiccup on a clear doesn't block the new prep.
+    let cleared = match clear_named_preps(
+        store,
+        &verified.intent.instrument,
+        &verified.intent.clears,
+    )
+    .await
+    {
+        Ok(c) => c,
+        Err(err) => {
+            console_error!("KV clear_named_preps (in clears): {err}");
+            Vec::new()
+        }
+    };
     if let Err(err) = store
         .set_prep(&verified.intent.instrument, step, now, ttl_seconds)
         .await
@@ -483,14 +501,26 @@ async fn handle_prep(
         return Response::error("state error", 500);
     }
     console_log!(
-        "prep set: {} {} ttl={}h",
+        "prep set: {} {} ttl={}h cleared={:?}",
         verified.intent.instrument,
         step,
-        ttl_hours
+        ttl_hours,
+        cleared
     );
-    let outcome = format!("prep-set: {step} ttl={ttl_hours}h");
+    let outcome = format_prep_set_outcome(step, ttl_hours, &cleared);
     record_seen(store, verified, now, &outcome).await;
     Response::ok("ok")
+}
+
+fn format_prep_set_outcome(step: &str, ttl_hours: u32, cleared: &[String]) -> String {
+    if cleared.is_empty() {
+        format!("prep-set: {step} ttl={ttl_hours}h")
+    } else {
+        format!(
+            "prep-set: {step} ttl={ttl_hours}h cleared=[{}]",
+            cleared.join(",")
+        )
+    }
 }
 
 /// Handle the `veto` action at level `stop-next-entry`: record a named
@@ -507,6 +537,21 @@ async fn handle_veto(
         return Response::error("veto requires `ttl_hours`", 400);
     };
     let ttl_seconds = (ttl_hours as u64).saturating_mul(3600);
+    // Clear any vetos listed in `clears` first — symmetry with prep
+    // ordering, even though vetos don't carry timestamps.
+    let cleared = match clear_named_vetos(
+        store,
+        &verified.intent.instrument,
+        &verified.intent.clears,
+    )
+    .await
+    {
+        Ok(c) => c,
+        Err(err) => {
+            console_error!("KV clear_named_vetos (in clears): {err}");
+            Vec::new()
+        }
+    };
     if let Err(err) = store
         .set_veto(&verified.intent.instrument, name, ttl_seconds)
         .await
@@ -515,14 +560,43 @@ async fn handle_veto(
         return Response::error("state error", 500);
     }
     console_log!(
-        "veto set: {} {} ttl={}h",
+        "veto set: {} {} ttl={}h cleared={:?}",
         verified.intent.instrument,
         name,
-        ttl_hours
+        ttl_hours,
+        cleared
     );
-    let outcome = format!("veto-set: {name} ttl={ttl_hours}h");
+    let outcome = format_veto_set_outcome(name, ttl_hours, "stop-next-entry", &cleared, None, None);
     record_seen(store, verified, now, &outcome).await;
     Response::ok("ok")
+}
+
+/// Format the seen-index outcome string for a veto. Used by both the
+/// flag-only path (`handle_veto`) and the broker-side path
+/// (`run_veto_with_broker`). `cancelled` is the count of pending orders
+/// the broker cancelled (None for the flag-only path); `closed_tag` is
+/// `"closed=ok"` / `"closed=failed"` when a close was attempted (or
+/// None otherwise).
+fn format_veto_set_outcome(
+    name: &str,
+    ttl_hours: u32,
+    level_tag: &str,
+    cleared: &[String],
+    cancelled: Option<usize>,
+    closed_tag: Option<&str>,
+) -> String {
+    let mut out = format!("veto-set: {name} ttl={ttl_hours}h level={level_tag}");
+    if let Some(c) = cancelled {
+        out.push_str(&format!(" cancelled={c}"));
+    }
+    if let Some(t) = closed_tag {
+        out.push(' ');
+        out.push_str(t);
+    }
+    if !cleared.is_empty() {
+        out.push_str(&format!(" cleared=[{}]", cleared.join(",")));
+    }
+    out
 }
 
 /// Handle the `veto` action at level `cancel-pending` or
@@ -549,10 +623,15 @@ async fn run_veto_with_broker<B: Broker>(
     };
     let level = verified.intent.level.unwrap_or_default();
     let ttl_seconds = (ttl_hours as u64).saturating_mul(3600);
-    if let Err(err) = store
-        .set_veto(&verified.intent.instrument, name, ttl_seconds)
-        .await
-    {
+    let instrument = &verified.intent.instrument;
+    let cleared = match clear_named_vetos(store, instrument, &verified.intent.clears).await {
+        Ok(c) => c,
+        Err(err) => {
+            console_error!("KV clear_named_vetos (in clears): {err}");
+            Vec::new()
+        }
+    };
+    if let Err(err) = store.set_veto(instrument, name, ttl_seconds).await {
         console_error!("KV set_veto: {err}");
         return ActionResult::Rejected {
             response: Response::error("state error", 500),
@@ -560,7 +639,6 @@ async fn run_veto_with_broker<B: Broker>(
         };
     }
 
-    let instrument = &verified.intent.instrument;
     let cancelled = broker.cancel_pending_for_instrument(instrument).await;
     let closed_ok = match level {
         VetoLevel::ClosePositions => broker.close_positions(instrument).await,
@@ -569,31 +647,35 @@ async fn run_veto_with_broker<B: Broker>(
     };
 
     console_log!(
-        "veto set: {} {} ttl={}h level={:?} cancelled={} closed_ok={}",
+        "veto set: {} {} ttl={}h level={:?} cancelled={} closed_ok={} cleared={:?}",
         instrument,
         name,
         ttl_hours,
         level,
         cancelled,
-        closed_ok
+        closed_ok,
+        cleared
     );
     let closed_tag = match level {
-        VetoLevel::ClosePositions => {
-            if closed_ok {
-                " closed=ok"
-            } else {
-                " closed=failed"
-            }
-        }
-        _ => "",
+        VetoLevel::ClosePositions => Some(if closed_ok {
+            "closed=ok"
+        } else {
+            "closed=failed"
+        }),
+        _ => None,
     };
     let level_tag = match level {
         VetoLevel::StopNextEntry => "stop-next-entry",
         VetoLevel::CancelPending => "cancel-pending",
         VetoLevel::ClosePositions => "close-positions",
     };
-    let outcome = format!(
-        "veto-set: {name} ttl={ttl_hours}h level={level_tag} cancelled={cancelled}{closed_tag}"
+    let outcome = format_veto_set_outcome(
+        name,
+        ttl_hours,
+        level_tag,
+        &cleared,
+        Some(cancelled),
+        closed_tag,
     );
     // `now` parameter is unused here directly (record_seen is invoked by
     // the caller via the standard ActionResult path), but kept in the
@@ -667,6 +749,95 @@ async fn handle_clear_veto(
     };
     record_seen(store, verified, now, &outcome).await;
     Response::ok("ok")
+}
+
+/// Resolve a `TradeNationBroker`, refreshing the session as needed.
+///
+/// Lookup order:
+/// 1. Cached `Session` JSON in KV under `TN_SESSION_KV_KEY`. If
+///    `broker_tradenation::login` accepts it, we're done.
+/// 2. Fresh login via [`tn_login::login_demo`] using
+///    `TN_DEMO_LOGIN_ID` / `TN_DEMO_PASSWORD` secrets. On success the
+///    new session JSON is written back to KV for the next request.
+/// 3. Fallback to the legacy `TN_SESSION_JSON` secret so the worker
+///    keeps working through any deployment gap before the new secrets
+///    are configured.
+///
+/// Returns `None` only if every path fails — at that point the operator
+/// needs to look at the logs.
+async fn acquire_tn_broker(env: &Env) -> Option<broker_tradenation::TradeNationBroker> {
+    let kv = match env.kv(KV_NAMESPACE) {
+        Ok(kv) => Some(kv),
+        Err(err) => {
+            console_error!("tn: KV binding missing, skipping session cache: {err:?}");
+            None
+        }
+    };
+
+    // 1. Try the KV-cached session first.
+    if let Some(kv) = kv.as_ref() {
+        match kv.get(TN_SESSION_KV_KEY).text().await {
+            Ok(Some(cached)) => {
+                if let Some(broker) = broker_tradenation::login(&cached).await {
+                    console_log!("tn: using cached session from KV");
+                    return Some(broker);
+                }
+                console_log!("tn: cached session rejected, will re-login");
+            }
+            Ok(None) => console_log!("tn: no cached session, will login"),
+            Err(err) => console_error!("tn: KV get session: {err:?}"),
+        }
+    }
+
+    // 2. Fresh demo login from credentials — wasm-only path, since the
+    //    redirect-chain login goes through `worker::Fetch`.
+    #[cfg(target_arch = "wasm32")]
+    if let (Some(login_id), Some(password)) = (
+        get_secret(TN_DEMO_LOGIN_ID_SECRET, env),
+        get_secret(TN_DEMO_PASSWORD_SECRET, env),
+    ) {
+        match tn_login::login_demo(&login_id, &password).await {
+            Ok(session) => match serde_json::to_string(&session) {
+                Ok(json) => {
+                    // Cache before handing off — even if validate_session
+                    // hiccups, the JSON is good and the next request
+                    // benefits.
+                    if let Some(kv) = kv.as_ref() {
+                        match kv.put(TN_SESSION_KV_KEY, json.clone()) {
+                            Ok(builder) => {
+                                if let Err(err) = builder.execute().await {
+                                    console_error!("tn: KV put session execute: {err:?}");
+                                }
+                            }
+                            Err(err) => console_error!("tn: KV put session builder: {err:?}"),
+                        }
+                    }
+                    if let Some(broker) = broker_tradenation::login(&json).await {
+                        console_log!("tn: fresh login via TN_DEMO_LOGIN_ID");
+                        return Some(broker);
+                    }
+                    console_error!("tn: fresh session rejected by broker_tradenation::login");
+                }
+                Err(err) => console_error!("tn: serialise fresh session: {err}"),
+            },
+            Err(err) => console_error!("tn: fresh login failed: {err}"),
+        }
+    } else {
+        console_log!(
+            "tn: {TN_DEMO_LOGIN_ID_SECRET}/{TN_DEMO_PASSWORD_SECRET} not set, skipping self-login"
+        );
+    }
+
+    // 3. Fallback: legacy externally-rotated TN_SESSION_JSON secret.
+    if let Some(session_json) = get_secret(TN_SESSION_JSON_SECRET, env)
+        && let Some(broker) = broker_tradenation::login(&session_json).await
+    {
+        console_log!("tn: using {TN_SESSION_JSON_SECRET} fallback");
+        return Some(broker);
+    }
+
+    console_error!("tn: all login paths exhausted");
+    None
 }
 
 /// Read a secret. Returns `None` if the binding is absent or unreadable.

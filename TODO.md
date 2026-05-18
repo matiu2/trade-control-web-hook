@@ -1,7 +1,54 @@
 # TODO
 
+## Active — TradeNation session auto-rotation
+
+Operational shim until the worker can re-authenticate itself.
+
+- [x] Cron-driven `TN_SESSION_JSON` refresh — `scripts/refresh-tn-session.sh`
+      logs in via the local `tradenation` CLI and pushes the result with
+      `wrangler secret put`. Installed at `0 */2 * * *`.
+- [x] Manual probe (deleted) verified that `web-sys` *can* walk the TN
+      redirect chain inside a Cloudflare Worker — both `ASP.NET_SessionId`
+      and the OTS cookie (`*JPBX=…`, 8-char-uppercase name) are readable
+      via `Headers.getAll("set-cookie")` per hop. `reqwest`'s wasm shim
+      can't be used: it has no manual-redirect option and auto-follows
+      transparently, so we never see the intermediate `Set-Cookie`
+      headers. A wasm login implementation will need raw `web-sys` or
+      the `worker` crate's `Fetch` — not `reqwest`.
+
+## Parked — wasm-side login
+
+Cron works but requires the laptop to be on and gives no reactive
+recovery between ticks. The durable shape is to have the worker
+re-authenticate itself. Design sketch (probe results above):
+
+- New crate `tradenation-wasm` inside the `tradenation-api` submodule,
+  `#![cfg(target_arch = "wasm32")]`, owns:
+  - web-sys redirect-chain login → `tradenation_api::Session`.
+  - `TradeNationBroker` (currently in `broker-tradenation`) gains
+    credentials + retry-on-`SessionExpired` so a stale cached session
+    self-heals in-flight.
+- This worker caches the resulting `Session` JSON in KV between
+  requests; passes it into the broker at construction; writes it back
+  if it changed during a call.
+- Drop the `TN_SESSION_JSON` secret + the cron job once it lands.
+
+Pick this up when the cron path proves insufficient — e.g. live trading
+at unattended hours, or repeated misses between rotations.
+
 ## Done
 
+- **Prep `clears` list to fix stale-ordering bug** — landed. `Intent`
+  gains a `clears: Vec<String>` field. The `Prep` handler clears each
+  listed prep step before recording the new one; the `Veto` handler
+  does the same for vetos (symmetry). Fixes the bug where a stale
+  `retest` from before `break-and-close` was satisfied stuck around
+  forever and falsely satisfied future ordered gates. CLI gains
+  `--clears foo,bar` on the `prep` and `veto` subcommands; the encrypt
+  flow prompts for `clears` on prep/veto actions. Recent prep / veto
+  names are fuzzy-picked from history (typo-proof) for both the
+  `step`/`name` field and the list-of-names prompts. 84 core tests +
+  55 cli tests pass; clippy clean.
 - **YAML wire format + interactive template-driven encoder** — landed. Interactive prompts wired through `dialoguer` (gated behind the `cli` feature).
 - **Queryable state endpoint + CLI state-management client** — landed.
   `status` and `unlock` actions go through the same encrypted envelope as

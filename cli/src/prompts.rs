@@ -32,6 +32,10 @@ pub const ALWAYS_REQUIRED: &[&str] = &["v", "action", "instrument", "id", "not_a
 pub fn optional_for_action(action: Action) -> &'static [&'static str] {
     match action {
         Action::Enter => &["requires_preps", "vetos"],
+        // `clears` is optional on prep/veto — it lets an upstream prep
+        // (like break-and-close) declare which downstream preps it
+        // invalidates, fixing stale-prep ordering bugs.
+        Action::Prep | Action::Veto => &["clears"],
         _ => &[],
     }
 }
@@ -178,13 +182,20 @@ mod tests {
             Action::Invalidate,
             Action::Status,
             Action::Unlock,
-            Action::Prep,
-            Action::Veto,
             Action::ClearPrep,
             Action::ClearVeto,
         ] {
             assert!(optional_for_action(a).is_empty(), "{a:?}");
         }
+    }
+
+    #[test]
+    fn optional_for_prep_and_veto_includes_clears() {
+        // Prep/veto carry a `clears` list so an upstream step (e.g.
+        // break-and-close) can drop downstream stale preps (e.g. an
+        // earlier retest) at fire time.
+        assert!(optional_for_action(Action::Prep).contains(&"clears"));
+        assert!(optional_for_action(Action::Veto).contains(&"clears"));
     }
 
     #[test]

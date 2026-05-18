@@ -44,6 +44,7 @@ fn control_skeleton(action: Action, instrument: &str, id: String, now: DateTime<
         level: None,
         requires_preps: Vec::new(),
         vetos: Vec::new(),
+        clears: Vec::new(),
     }
 }
 
@@ -64,10 +65,15 @@ pub fn build_unlock_intent(instrument: &str, now: DateTime<Utc>, suffix: &str) -
 }
 
 /// Build a `prep` Intent for a single (instrument, step) pair with a TTL.
+///
+/// `clears` is the list of other prep steps to drop before recording
+/// this one — used to encode ordered prep sequences where landing an
+/// upstream step must invalidate stale downstream preps.
 pub fn build_prep_intent(
     instrument: &str,
     step: &str,
     ttl_hours: u32,
+    clears: Vec<String>,
     now: DateTime<Utc>,
     suffix: &str,
 ) -> Intent {
@@ -78,17 +84,20 @@ pub fn build_prep_intent(
     let mut intent = control_skeleton(Action::Prep, instrument, id, now);
     intent.step = Some(step.to_string());
     intent.ttl_hours = Some(ttl_hours);
+    intent.clears = clears;
     intent
 }
 
 /// Build a `veto` Intent for a single (instrument, name) pair with a TTL.
 /// `level` controls broker side effects at fire time; pass `None` for the
-/// default flag-only behaviour ([`VetoLevel::StopNextEntry`]).
+/// default flag-only behaviour ([`VetoLevel::StopNextEntry`]). `clears`
+/// lists other vetos to drop before recording this one.
 pub fn build_veto_intent(
     instrument: &str,
     name: &str,
     ttl_hours: u32,
     level: Option<VetoLevel>,
+    clears: Vec<String>,
     now: DateTime<Utc>,
     suffix: &str,
 ) -> Intent {
@@ -100,6 +109,7 @@ pub fn build_veto_intent(
     intent.name = Some(name.to_string());
     intent.ttl_hours = Some(ttl_hours);
     intent.level = level;
+    intent.clears = clears;
     intent
 }
 
@@ -188,23 +198,43 @@ mod tests {
 
     #[test]
     fn prep_intent_round_trips() {
-        let intent = build_prep_intent("EUR_USD", "break-and-close", 4, t(), "ab12");
+        let intent = build_prep_intent("EUR_USD", "break-and-close", 4, Vec::new(), t(), "ab12");
         assert_eq!(intent.action, Action::Prep);
         assert_eq!(intent.instrument, "EUR_USD");
         assert_eq!(intent.step.as_deref(), Some("break-and-close"));
         assert_eq!(intent.ttl_hours, Some(4));
+        assert!(intent.clears.is_empty());
         let yaml = serde_yaml::to_string(&intent).unwrap();
         let parsed: Intent = serde_yaml::from_str(&yaml).unwrap();
         assert_eq!(parsed.action, Action::Prep);
         assert_eq!(parsed.step.as_deref(), Some("break-and-close"));
+        assert!(parsed.clears.is_empty());
+    }
+
+    #[test]
+    fn prep_intent_carries_clears_through_yaml() {
+        let intent = build_prep_intent(
+            "EUR_USD",
+            "break-and-close",
+            4,
+            vec!["retest".into()],
+            t(),
+            "ab12",
+        );
+        assert_eq!(intent.clears, vec!["retest".to_string()]);
+        let yaml = serde_yaml::to_string(&intent).unwrap();
+        assert!(yaml.contains("clears:"), "yaml was:\n{yaml}");
+        let parsed: Intent = serde_yaml::from_str(&yaml).unwrap();
+        assert_eq!(parsed.clears, vec!["retest".to_string()]);
     }
 
     #[test]
     fn veto_intent_round_trips() {
-        let intent = build_veto_intent("EUR_USD", "news-window", 6, None, t(), "cd34");
+        let intent = build_veto_intent("EUR_USD", "news-window", 6, None, Vec::new(), t(), "cd34");
         assert_eq!(intent.action, Action::Veto);
         assert_eq!(intent.name.as_deref(), Some("news-window"));
         assert_eq!(intent.ttl_hours, Some(6));
+        assert!(intent.clears.is_empty());
         let yaml = serde_yaml::to_string(&intent).unwrap();
         let parsed: Intent = serde_yaml::from_str(&yaml).unwrap();
         assert_eq!(parsed.action, Action::Veto);

@@ -83,6 +83,13 @@ struct PrepCmdArgs {
     /// TTL in hours before the prep auto-expires.
     #[arg(long, default_value_t = 4)]
     ttl_hours: u32,
+    /// Comma-separated list of other prep steps to clear when this
+    /// prep is recorded. Use to express ordered sequences — e.g.
+    /// `--clears retest` on a `break-and-close` prep drops any stale
+    /// `retest` so a future `requires_preps: [break-and-close, retest]`
+    /// gate can't be satisfied by the pre-existing retest.
+    #[arg(long, value_delimiter = ',', num_args = 0..)]
+    clears: Vec<String>,
     #[command(flatten)]
     common: EndpointArgs,
 }
@@ -101,6 +108,10 @@ struct VetoCmdArgs {
     /// `close-positions` also closes open positions.
     #[arg(long, value_enum, default_value_t = VetoLevelArg::StopNextEntry)]
     level: VetoLevelArg,
+    /// Comma-separated list of other vetos to clear when this veto is
+    /// recorded. Mirror of `prep --clears` for veto symmetry.
+    #[arg(long, value_delimiter = ',', num_args = 0..)]
+    clears: Vec<String>,
     #[command(flatten)]
     common: EndpointArgs,
 }
@@ -238,10 +249,22 @@ fn run_prep(args: PrepCmdArgs) -> Result<()> {
     let key = load_key(&args.common.key_file)?;
     let now = Utc::now();
     let suffix = fresh_suffix()?;
-    let intent = build_prep_intent(&args.instrument, &args.step, args.ttl_hours, now, &suffix);
+    let intent = build_prep_intent(
+        &args.instrument,
+        &args.step,
+        args.ttl_hours,
+        args.clears.clone(),
+        now,
+        &suffix,
+    );
     let body = wrap_in_envelope(&intent, &key, now)?;
     let response = post_control(&args.common.endpoint, &body)?;
     record_prep_use(&args.step);
+    // Also remember names from --clears so they suggest next time —
+    // they're equally valid prep names by virtue of being used here.
+    for c in &args.clears {
+        record_prep_use(c);
+    }
     print!("{response}");
     Ok(())
 }
@@ -261,12 +284,16 @@ fn run_veto(args: VetoCmdArgs) -> Result<()> {
         &args.name,
         args.ttl_hours,
         level,
+        args.clears.clone(),
         now,
         &suffix,
     );
     let body = wrap_in_envelope(&intent, &key, now)?;
     let response = post_control(&args.common.endpoint, &body)?;
     record_veto_use(&args.name);
+    for c in &args.clears {
+        record_veto_use(c);
+    }
     print!("{response}");
     Ok(())
 }

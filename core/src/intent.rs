@@ -98,6 +98,24 @@ pub struct Intent {
     /// veto gate.
     #[serde(default)]
     pub vetos: Vec<String>,
+    /// Names to clear *before* setting the new prep/veto. Used to model
+    /// ordered prep sequences where landing an earlier step must
+    /// invalidate any stale later step.
+    ///
+    /// Example: a `prep` action setting `break-and-close` with
+    /// `clears: [retest]` will drop any pre-existing `retest` prep on
+    /// the same instrument before recording the new break-and-close.
+    /// Otherwise a stale retest from before the break-and-close would
+    /// stick around and satisfy a future `requires_preps:
+    /// [break-and-close, retest]` gate without the operator ever
+    /// observing a fresh retest.
+    ///
+    /// On `Prep` actions the names are interpreted as prep steps; on
+    /// `Veto` actions they are veto names. Missing/empty list is a
+    /// no-op and back-compatible with intents encrypted before the
+    /// field landed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub clears: Vec<String>,
 }
 
 /// Which broker fulfils an intent. The serialised form is the
@@ -446,6 +464,58 @@ mod tests {
         assert_eq!(intent.action, Action::Prep);
         assert_eq!(intent.step.as_deref(), Some("break-and-close"));
         assert_eq!(intent.ttl_hours, Some(4));
+    }
+
+    #[test]
+    fn prep_intent_defaults_clears_to_empty() {
+        let yaml = "
+            v: 1
+            id: prep-1
+            not_after: \"2026-05-14T03:30:00Z\"
+            action: prep
+            instrument: EUR_USD
+            step: break-and-close
+            ttl_hours: 4
+        ";
+        let intent: Intent = serde_yaml::from_str(yaml).unwrap();
+        assert!(intent.clears.is_empty());
+    }
+
+    #[test]
+    fn prep_intent_parses_clears_list() {
+        // A break-and-close prep declaring it invalidates any stale retest
+        // — the central piece of the prep-ordering fix.
+        let yaml = "
+            v: 1
+            id: prep-1
+            not_after: \"2026-05-14T03:30:00Z\"
+            action: prep
+            instrument: EUR_USD
+            step: break-and-close
+            ttl_hours: 4
+            clears: [retest]
+        ";
+        let intent: Intent = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(intent.clears, vec!["retest".to_string()]);
+    }
+
+    #[test]
+    fn empty_clears_is_omitted_when_serialised() {
+        // Wire-compat: an intent with no clears must serialise without a
+        // `clears:` line, so pre-existing replay paths that round-trip
+        // through YAML don't change shape.
+        let yaml = "
+            v: 1
+            id: prep-1
+            not_after: \"2026-05-14T03:30:00Z\"
+            action: prep
+            instrument: EUR_USD
+            step: break-and-close
+            ttl_hours: 4
+        ";
+        let intent: Intent = serde_yaml::from_str(yaml).unwrap();
+        let out = serde_yaml::to_string(&intent).unwrap();
+        assert!(!out.contains("clears:"), "got:\n{out}");
     }
 
     #[test]

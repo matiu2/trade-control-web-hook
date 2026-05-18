@@ -239,6 +239,47 @@ impl std::error::Error for StateError {}
 /// Cloudflare KV's minimum TTL is 60 seconds; clamp anything smaller.
 pub const MIN_TTL_SECONDS: u64 = 60;
 
+/// Clear each prep in `names` for `instrument`. Returns the subset of
+/// names that were actually cleared (i.e. had a value). Used by the
+/// `Prep` handler to apply the intent's `clears` list before recording
+/// the new prep — supports the pattern where landing an earlier step in
+/// an ordered sequence invalidates any stale later step (e.g. setting
+/// `break-and-close` also drops a stale `retest`).
+///
+/// Errors from individual clears are returned as `Err` immediately; the
+/// worker may want to log-and-continue, which it can do by mapping
+/// errors at the call site rather than threading that policy through
+/// here.
+pub async fn clear_named_preps<S: StateStore>(
+    store: &S,
+    instrument: &str,
+    names: &[String],
+) -> Result<Vec<String>, StateError> {
+    let mut cleared = Vec::new();
+    for name in names {
+        if store.clear_prep(instrument, name).await? {
+            cleared.push(name.clone());
+        }
+    }
+    Ok(cleared)
+}
+
+/// Mirror of [`clear_named_preps`] for veto names. See its docs for the
+/// motivation.
+pub async fn clear_named_vetos<S: StateStore>(
+    store: &S,
+    instrument: &str,
+    names: &[String],
+) -> Result<Vec<String>, StateError> {
+    let mut cleared = Vec::new();
+    for name in names {
+        if store.clear_veto(instrument, name).await? {
+            cleared.push(name.clone());
+        }
+    }
+    Ok(cleared)
+}
+
 /// Simple in-memory [`StateStore`] used by core unit tests and by the
 /// worker crate's tests. Not exposed publicly outside `cfg(test)` to
 /// avoid leaking it into release builds.
@@ -439,7 +480,10 @@ mod tests {
     fn memstore_prep_round_trip() {
         use super::memstore::MemStateStore;
         let store = MemStateStore::new();
-        let now = ts("2026-05-16T10:00:00Z");
+        // Use `Utc::now()` so the memstore's wall-clock liveness check
+        // sees the entry as live. The test only cares about round-trip
+        // semantics, not TTL expiry.
+        let now = Utc::now();
         pollster::block_on(store.set_prep("EUR_USD", "break", now, 4 * 3600)).unwrap();
         let got = pollster::block_on(store.get_prep("EUR_USD", "break")).unwrap();
         assert_eq!(got, Some(now));
@@ -472,8 +516,8 @@ mod tests {
     fn memstore_preps_per_instrument_are_independent() {
         use super::memstore::MemStateStore;
         let store = MemStateStore::new();
-        let t1 = ts("2026-05-16T10:00:00Z");
-        let t2 = ts("2026-05-16T10:05:00Z");
+        let t1 = Utc::now();
+        let t2 = t1 + chrono::Duration::minutes(5);
         pollster::block_on(store.set_prep("EUR_USD", "break", t1, 3600)).unwrap();
         pollster::block_on(store.set_prep("USD_JPY", "break", t2, 3600)).unwrap();
         assert_eq!(
@@ -490,15 +534,118 @@ mod tests {
     fn memstore_set_prep_overwrites_timestamp() {
         use super::memstore::MemStateStore;
         let store = MemStateStore::new();
-        let t1 = ts("2026-05-16T10:00:00Z");
-        let t2 = ts("2026-05-16T11:00:00Z");
-        pollster::block_on(store.set_prep("EUR_USD", "break", t1, 3600)).unwrap();
-        pollster::block_on(store.set_prep("EUR_USD", "break", t2, 3600)).unwrap();
+        let t1 = Utc::now();
+        let t2 = t1 + chrono::Duration::hours(1);
+        // Use a TTL that comfortably covers the test's relative clock —
+        // memstore's `get_live` consults the real wall clock.
+        let ttl = 24 * 3600;
+        pollster::block_on(store.set_prep("EUR_USD", "break", t1, ttl)).unwrap();
+        pollster::block_on(store.set_prep("EUR_USD", "break", t2, ttl)).unwrap();
         // Refiring a prep refreshes its timestamp — documented behaviour.
         assert_eq!(
             pollster::block_on(store.get_prep("EUR_USD", "break")).unwrap(),
             Some(t2)
         );
+    }
+
+    #[test]
+    fn clear_named_preps_removes_only_listed_names() {
+        // The core of the prep-ordering bug fix: when a fresh
+        // `break-and-close` lands, any stale `retest` from before it
+        // must be wiped so a future `requires_preps: [break-and-close,
+        // retest]` gate doesn't satisfy on the stale retest.
+        use super::memstore::MemStateStore;
+        let store = MemStateStore::new();
+        let now = Utc::now();
+        let ttl = 24 * 3600;
+        pollster::block_on(store.set_prep("EUR_USD", "retest", now, ttl)).unwrap();
+        pollster::block_on(store.set_prep("EUR_USD", "other", now, ttl)).unwrap();
+
+        let cleared = pollster::block_on(clear_named_preps(
+            &store,
+            "EUR_USD",
+            &["retest".to_string(), "ghost".to_string()],
+        ))
+        .unwrap();
+        // `retest` was present; `ghost` was not. Only the present one
+        // is reported in the cleared set.
+        assert_eq!(cleared, vec!["retest".to_string()]);
+
+        // Untargeted prep survives.
+        assert!(
+            pollster::block_on(store.get_prep("EUR_USD", "other"))
+                .unwrap()
+                .is_some()
+        );
+        // Targeted prep is gone.
+        assert!(
+            pollster::block_on(store.get_prep("EUR_USD", "retest"))
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn clear_named_preps_on_empty_list_is_a_noop() {
+        use super::memstore::MemStateStore;
+        let store = MemStateStore::new();
+        let now = Utc::now();
+        pollster::block_on(store.set_prep("EUR_USD", "retest", now, 24 * 3600)).unwrap();
+        let cleared = pollster::block_on(clear_named_preps(&store, "EUR_USD", &[])).unwrap();
+        assert!(cleared.is_empty());
+        // Existing prep untouched.
+        assert!(
+            pollster::block_on(store.get_prep("EUR_USD", "retest"))
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn clear_named_preps_scope_is_per_instrument() {
+        // Clearing on EUR_USD must not touch USD_JPY's prep of the same
+        // name.
+        use super::memstore::MemStateStore;
+        let store = MemStateStore::new();
+        let now = Utc::now();
+        let ttl = 24 * 3600;
+        pollster::block_on(store.set_prep("EUR_USD", "retest", now, ttl)).unwrap();
+        pollster::block_on(store.set_prep("USD_JPY", "retest", now, ttl)).unwrap();
+
+        let cleared = pollster::block_on(clear_named_preps(
+            &store,
+            "EUR_USD",
+            &["retest".to_string()],
+        ))
+        .unwrap();
+        assert_eq!(cleared, vec!["retest".to_string()]);
+        assert!(
+            pollster::block_on(store.get_prep("EUR_USD", "retest"))
+                .unwrap()
+                .is_none()
+        );
+        // USD_JPY untouched.
+        assert!(
+            pollster::block_on(store.get_prep("USD_JPY", "retest"))
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn clear_named_vetos_removes_only_listed_names() {
+        use super::memstore::MemStateStore;
+        let store = MemStateStore::new();
+        let ttl = 24 * 3600;
+        pollster::block_on(store.set_veto("EUR_USD", "news", ttl)).unwrap();
+        pollster::block_on(store.set_veto("EUR_USD", "other", ttl)).unwrap();
+
+        let cleared =
+            pollster::block_on(clear_named_vetos(&store, "EUR_USD", &["news".to_string()]))
+                .unwrap();
+        assert_eq!(cleared, vec!["news".to_string()]);
+        assert!(!pollster::block_on(store.is_vetoed("EUR_USD", "news")).unwrap());
+        assert!(pollster::block_on(store.is_vetoed("EUR_USD", "other")).unwrap());
     }
 
     #[test]
