@@ -47,7 +47,13 @@ enum Cmd {
     /// Generate a fresh 32-byte key as 64 hex characters.
     GenKey,
     /// Encrypt an intent YAML template into the YAML alert body.
+    /// The body is opaque on the wire; debugging requires `decrypt`.
     Encrypt(EncryptArgs),
+    /// Sign an intent YAML template into a *cleartext* YAML alert body.
+    /// Intent fields are readable in TradingView and in Cloudflare's
+    /// request log; authentication is HMAC-SHA256 over the body. Pair
+    /// with `verify` to inspect what arrived on the worker.
+    Sign(EncryptArgs),
     /// Query the deployed worker's cooldown / recent-seen state.
     Status(EndpointArgs),
     /// Clear the cooldown for one instrument on the deployed worker.
@@ -225,13 +231,6 @@ struct EncryptArgs {
     /// Hard-fail on any missing required field instead of prompting.
     #[arg(long, default_value_t = false)]
     non_interactive: bool,
-    /// Emit a *signed* (cleartext) TradingView alert body instead of an
-    /// encrypted one. The intent fields show up in plain text in the
-    /// alert and in Cloudflare's request log — easier debugging at the
-    /// cost of revealing trade direction / SL / TP. Authentication is
-    /// unchanged (HMAC-SHA256 over the body).
-    #[arg(long, default_value_t = false)]
-    signed: bool,
 }
 
 fn main() -> Result<()> {
@@ -242,7 +241,8 @@ fn main() -> Result<()> {
             let hex_key = generate_key_hex();
             println!("{hex_key}");
         }
-        Cmd::Encrypt(args) => run_encrypt(args)?,
+        Cmd::Encrypt(args) => run_encrypt_or_sign(args, false)?,
+        Cmd::Sign(args) => run_encrypt_or_sign(args, true)?,
         Cmd::Status(args) => run_status(args)?,
         Cmd::Unlock(args) => run_unlock(args)?,
         Cmd::Prep(args) => run_prep(args)?,
@@ -506,7 +506,9 @@ fn run_clear_veto(args: ClearVetoCmdArgs) -> Result<()> {
     Ok(())
 }
 
-fn run_encrypt(args: EncryptArgs) -> Result<()> {
+/// Shared body of the `encrypt` and `sign` subcommands. `sign = true`
+/// emits the cleartext signed wire format; otherwise the encrypted blob.
+fn run_encrypt_or_sign(args: EncryptArgs, sign_mode: bool) -> Result<()> {
     let key = load_key(&args.key_file)?;
 
     let template_path = match args.template {
@@ -534,13 +536,13 @@ fn run_encrypt(args: EncryptArgs) -> Result<()> {
     let completed = serde_yaml::to_string(&template).context("re-serialising completed intent")?;
 
     // Offer to save the completed (post-prompt) YAML to disk so the user
-    // can use it as a starting point next time. Done *before* the encrypted
-    // body prints so the prompt doesn't interleave with the paste target.
+    // can use it as a starting point next time. Done *before* the body
+    // prints so the prompt doesn't interleave with the paste target.
     if !args.non_interactive {
         prompt_save_as_template(&completed)?;
     }
 
-    if args.signed {
+    if sign_mode {
         // Deserialise into a typed Intent so wrap_signed_template can
         // serialise it back through the standard path. This also catches
         // intent-validation issues before the user pastes the body.
