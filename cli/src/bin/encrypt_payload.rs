@@ -23,10 +23,14 @@ use trade_control_cli::{
     KEY_LEN, build_clear_prep_intent, build_clear_veto_intent, build_prep_intent,
     build_status_intent, build_unlock_intent, build_veto_intent, build_yaml_template,
     encrypt_intent, fill_missing_fields, generate_key_hex, pick_template_interactive,
-    prompt_save_as_template, record_prep_use, record_veto_use, wrap_in_envelope,
+    prompt_save_as_template, record_prep_use, record_veto_use, wrap_in_envelope, wrap_signed,
+    wrap_signed_template,
 };
 use trade_control_core::crypto;
+use trade_control_core::incoming::signed_pairs_from_text;
+use trade_control_core::intent::Intent;
 use trade_control_core::intent::VetoLevel;
+use trade_control_core::sig::{self, SIG_FIELD};
 
 #[derive(Parser)]
 #[command(
@@ -61,6 +65,11 @@ enum Cmd {
     /// YAML alert body on stdin, or a `--file` path. Useful for inspecting
     /// what TradingView actually sent.
     Decrypt(DecryptArgs),
+    /// Verify a signed (cleartext) body. Reads the YAML body from a
+    /// positional, `--file`, or stdin, recomputes the HMAC, and prints
+    /// the body with a `# verified` marker on success. Exit code is
+    /// non-zero on signature mismatch.
+    Verify(VerifyArgs),
     /// Print a shell completion script to stdout. Install with e.g.
     /// `encrypt-payload completions zsh > ~/.zfunc/_encrypt-payload`.
     Completions {
@@ -78,6 +87,12 @@ struct EndpointArgs {
     /// Falls back to `TRADE_CONTROL_ENDPOINT`.
     #[arg(long, env = "TRADE_CONTROL_ENDPOINT")]
     endpoint: String,
+    /// Use the signed (cleartext) wire format instead of encrypted.
+    /// Cleartext means the intent shows up in Cloudflare's request log
+    /// — easier debugging at the cost of revealing the intent body.
+    /// Authentication is unchanged (HMAC-SHA256 over the body).
+    #[arg(long, default_value_t = false)]
+    signed: bool,
 }
 
 #[derive(Parser)]
@@ -170,6 +185,19 @@ struct ClearVetoCmdArgs {
 }
 
 #[derive(Parser)]
+struct VerifyArgs {
+    /// Path to a hex-encoded 32-byte key.
+    #[arg(long)]
+    key_file: PathBuf,
+    /// Path to a file containing the full YAML alert body. If omitted
+    /// and no positional `body` is given, stdin is read.
+    #[arg(long)]
+    file: Option<PathBuf>,
+    /// The full YAML alert body, including the `sig:` line. Quote it.
+    body: Option<String>,
+}
+
+#[derive(Parser)]
 struct DecryptArgs {
     /// Path to a hex-encoded 32-byte key.
     #[arg(long)]
@@ -197,6 +225,13 @@ struct EncryptArgs {
     /// Hard-fail on any missing required field instead of prompting.
     #[arg(long, default_value_t = false)]
     non_interactive: bool,
+    /// Emit a *signed* (cleartext) TradingView alert body instead of an
+    /// encrypted one. The intent fields show up in plain text in the
+    /// alert and in Cloudflare's request log — easier debugging at the
+    /// cost of revealing trade direction / SL / TP. Authentication is
+    /// unchanged (HMAC-SHA256 over the body).
+    #[arg(long, default_value_t = false)]
+    signed: bool,
 }
 
 fn main() -> Result<()> {
@@ -215,6 +250,7 @@ fn main() -> Result<()> {
         Cmd::ClearPrep(args) => run_clear_prep(args)?,
         Cmd::ClearVeto(args) => run_clear_veto(args)?,
         Cmd::Decrypt(args) => run_decrypt(args)?,
+        Cmd::Verify(args) => run_verify(args)?,
         Cmd::Completions { shell } => run_completions(shell),
     }
     Ok(())
@@ -223,6 +259,41 @@ fn main() -> Result<()> {
 fn run_completions(shell: Shell) {
     let mut cmd = Cli::command();
     generate(shell, &mut cmd, "encrypt-payload", &mut io::stdout());
+}
+
+fn run_verify(args: VerifyArgs) -> Result<()> {
+    let key = load_key(&args.key_file)?;
+    let body = match (args.body, args.file) {
+        (Some(b), _) => b,
+        (None, Some(path)) => {
+            fs::read_to_string(&path).with_context(|| format!("reading input {path:?}"))?
+        }
+        (None, None) => {
+            let mut buf = String::new();
+            io::stdin()
+                .read_to_string(&mut buf)
+                .context("reading stdin")?;
+            buf
+        }
+    };
+    let pairs = signed_pairs_from_text(&body).map_err(|e| eyre!("parse pairs: {e}"))?;
+    let sig_str = pairs
+        .iter()
+        .find(|(k, _)| k == SIG_FIELD)
+        .map(|(_, v)| v.clone())
+        .ok_or_else(|| eyre!("body has no sig field — was it built with --signed?"))?;
+    let without_sig: Vec<_> = pairs
+        .iter()
+        .filter(|(k, _)| k != SIG_FIELD)
+        .cloned()
+        .collect();
+    sig::verify(&key, &without_sig, &sig_str).map_err(|e| eyre!("verify: {e}"))?;
+    println!("# verified");
+    print!("{body}");
+    if !body.ends_with('\n') {
+        println!();
+    }
+    Ok(())
 }
 
 fn run_decrypt(args: DecryptArgs) -> Result<()> {
@@ -304,6 +375,21 @@ fn fresh_suffix() -> Result<String> {
     Ok(hex::encode(bytes))
 }
 
+/// Wrap a control intent in either the encrypted or signed envelope
+/// depending on the `--signed` flag.
+fn wrap_control(
+    intent: &Intent,
+    key: &[u8; KEY_LEN],
+    now: chrono::DateTime<chrono::Utc>,
+    signed: bool,
+) -> Result<String> {
+    if signed {
+        wrap_signed(intent, key, now).map_err(|e| eyre!("wrap-signed: {e}"))
+    } else {
+        wrap_in_envelope(intent, key, now).map_err(|e| eyre!("wrap-envelope: {e}"))
+    }
+}
+
 fn post_control(endpoint: &str, body: &str) -> Result<String> {
     let client = reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(30))
@@ -328,7 +414,7 @@ fn run_status(args: EndpointArgs) -> Result<()> {
     let now = Utc::now();
     let suffix = fresh_suffix()?;
     let intent = build_status_intent(now, &suffix);
-    let body = wrap_in_envelope(&intent, &key, now)?;
+    let body = wrap_control(&intent, &key, now, args.signed)?;
     let response = post_control(&args.endpoint, &body)?;
     print!("{response}");
     Ok(())
@@ -339,7 +425,7 @@ fn run_unlock(args: UnlockCmdArgs) -> Result<()> {
     let now = Utc::now();
     let suffix = fresh_suffix()?;
     let intent = build_unlock_intent(&args.instrument, now, &suffix);
-    let body = wrap_in_envelope(&intent, &key, now)?;
+    let body = wrap_control(&intent, &key, now, args.common.signed)?;
     let response = post_control(&args.common.endpoint, &body)?;
     print!("{response}");
     Ok(())
@@ -357,7 +443,7 @@ fn run_prep(args: PrepCmdArgs) -> Result<()> {
         now,
         &suffix,
     );
-    let body = wrap_in_envelope(&intent, &key, now)?;
+    let body = wrap_control(&intent, &key, now, args.common.signed)?;
     let response = post_control(&args.common.endpoint, &body)?;
     record_prep_use(&args.step);
     // Also remember names from --clears so they suggest next time —
@@ -388,7 +474,7 @@ fn run_veto(args: VetoCmdArgs) -> Result<()> {
         now,
         &suffix,
     );
-    let body = wrap_in_envelope(&intent, &key, now)?;
+    let body = wrap_control(&intent, &key, now, args.common.signed)?;
     let response = post_control(&args.common.endpoint, &body)?;
     record_veto_use(&args.name);
     for c in &args.clears {
@@ -403,7 +489,7 @@ fn run_clear_prep(args: ClearPrepCmdArgs) -> Result<()> {
     let now = Utc::now();
     let suffix = fresh_suffix()?;
     let intent = build_clear_prep_intent(&args.instrument, &args.step, now, &suffix);
-    let body = wrap_in_envelope(&intent, &key, now)?;
+    let body = wrap_control(&intent, &key, now, args.common.signed)?;
     let response = post_control(&args.common.endpoint, &body)?;
     print!("{response}");
     Ok(())
@@ -414,7 +500,7 @@ fn run_clear_veto(args: ClearVetoCmdArgs) -> Result<()> {
     let now = Utc::now();
     let suffix = fresh_suffix()?;
     let intent = build_clear_veto_intent(&args.instrument, &args.name, now, &suffix);
-    let body = wrap_in_envelope(&intent, &key, now)?;
+    let body = wrap_control(&intent, &key, now, args.common.signed)?;
     let response = post_control(&args.common.endpoint, &body)?;
     print!("{response}");
     Ok(())
@@ -454,9 +540,19 @@ fn run_encrypt(args: EncryptArgs) -> Result<()> {
         prompt_save_as_template(&completed)?;
     }
 
-    let blob = encrypt_intent(&key, completed.as_bytes())?;
-    let yaml = build_yaml_template(&blob);
-    print!("{yaml}");
+    if args.signed {
+        // Deserialise into a typed Intent so wrap_signed_template can
+        // serialise it back through the standard path. This also catches
+        // intent-validation issues before the user pastes the body.
+        let intent: Intent =
+            serde_yaml::from_str(&completed).context("completed intent does not parse")?;
+        let body = wrap_signed_template(&intent, &key)?;
+        print!("{body}");
+    } else {
+        let blob = encrypt_intent(&key, completed.as_bytes())?;
+        let yaml = build_yaml_template(&blob);
+        print!("{yaml}");
+    }
     Ok(())
 }
 

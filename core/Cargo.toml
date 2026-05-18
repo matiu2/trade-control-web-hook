@@ -8,8 +8,11 @@ base64 = { version = "0.22.1", default-features = false, features = ["alloc"] }
 chacha20poly1305 = { version = "0.10.1", default-features = false, features = ["alloc", "rand_core"] }
 chrono = { version = "0.4.44", default-features = false, features = ["alloc", "serde"] }
 hex = "0.4.3"
+hmac = "0.13.0"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_yaml = "0.9.34"
+sha2 = "0.11.0"
+subtle = "2.6.1"
 
 [features]
 default = []

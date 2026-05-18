@@ -38,6 +38,23 @@ at unattended hours, or repeated misses between rotations.
 
 ## Done
 
+- **HMAC-signed cleartext wire format (parallel to encrypted)** —
+  landed. New `core::sig` module: canonical form = fixed `v1-sig` tag,
+  sorted schema-fingerprint of top-level keys (CSV), then `key=value`
+  lines for every signed field, HMAC-SHA256 with `subtle::ct_eq` for
+  verify. Shell fields (`close`/`high`/`low`/`time`) have their keys
+  signed but their values excluded — so TradingView's `{{close}}` →
+  number substitution doesn't invalidate the sig, but dropping a shell
+  key does. Worker detects format by field presence (`sig:` vs
+  `payload:`) and both paths run in parallel. CLI gains `--signed` on
+  `encrypt`, `status`, `unlock`, `prep`, `veto`, `clear-prep`,
+  `clear-veto`, plus a `verify` subcommand (mirror of `decrypt` for the
+  signed path). Why: cleartext bodies show up in Cloudflare's request
+  log so operators can read what TradingView sent without round-tripping
+  through `decrypt`. Auth is unchanged (32-byte key, same key file).
+  103 core + 55 cli + 5 cli-bin tests pass; clippy clean. End-to-end
+  round-trip verified: signed encrypt → simulated TV substitution →
+  verify, plus tamper and wrong-key rejection.
 - **`decrypt` subcommand + clap-complete shell completions** — landed.
   `encrypt-payload decrypt --key-file KEY [BLOB]` accepts either a bare
   `v1.<base64>` blob as a positional, the full YAML alert body on stdin,

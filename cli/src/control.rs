@@ -157,6 +157,125 @@ pub fn wrap_in_envelope(
     Ok(build_yaml_control_body(&blob, now))
 }
 
+/// Build the *signed* wire body for control-path intents (status,
+/// unlock, prep, veto, clear-prep, clear-veto). The intent fields go at
+/// the top level next to the shell fields, and a `sig:` line is appended
+/// at the bottom. The shell carries concrete zeros + `now` — TradingView
+/// isn't in this loop.
+///
+/// Equivalent to [`wrap_in_envelope`] but using the cleartext + signed
+/// format (see `core::sig`). Operators get a readable Cloudflare request
+/// log; tampering still rejected.
+pub fn wrap_signed(intent: &Intent, key: &[u8; KEY_LEN], now: DateTime<Utc>) -> Result<String> {
+    build_signed_body(intent, key, &shell_for_control(now))
+}
+
+/// Build a signed body for a TradingView alert. Shell fields are the
+/// literal TradingView placeholders so the alert template substitutes
+/// them at delivery time without invalidating the sig.
+pub fn wrap_signed_template(intent: &Intent, key: &[u8; KEY_LEN]) -> Result<String> {
+    build_signed_body(intent, key, &shell_for_tv_template())
+}
+
+fn build_signed_body(
+    intent: &Intent,
+    key: &[u8; KEY_LEN],
+    shell_lines: &[(&str, String)],
+) -> Result<String> {
+    // Serialise the intent and re-parse so each field becomes a YAML
+    // value. Then emit each top-level field on a single line, where
+    // nested values are flow-style (`{type: market}`). Both the CLI
+    // emit step and the worker verify step line-scan the same text.
+    let intent_yaml = serde_yaml::to_string(intent).map_err(|e| eyre!("serialise intent: {e}"))?;
+    let intent_value: serde_yaml::Value =
+        serde_yaml::from_str(&intent_yaml).map_err(|e| eyre!("re-parse intent: {e}"))?;
+    let intent_map = intent_value
+        .as_mapping()
+        .ok_or_else(|| eyre!("intent did not serialise to a mapping"))?;
+
+    let mut lines: Vec<String> = Vec::new();
+    for (k, v) in shell_lines {
+        lines.push(format!("{k}: {v}"));
+    }
+    for (k, v) in intent_map {
+        let key_str = k.as_str().ok_or_else(|| eyre!("non-string intent key"))?;
+        let val_str = render_value(v)?;
+        lines.push(format!("{key_str}: {val_str}"));
+    }
+    // Build the body without the sig line, then line-scan it the same
+    // way the worker will. This guarantees the canonical pair list is
+    // exactly what the verify side will reconstruct.
+    let body_without_sig = format!("{}\n", lines.join("\n"));
+    let pairs = trade_control_core::incoming::signed_pairs_from_text(&body_without_sig)
+        .map_err(|e| eyre!("build signed pairs: {e}"))?;
+    let sig = trade_control_core::sig::sign(key, &pairs).map_err(|e| eyre!("sign: {e}"))?;
+    Ok(format!("{body_without_sig}sig: \"{sig}\"\n"))
+}
+
+fn shell_for_control(now: DateTime<Utc>) -> Vec<(&'static str, String)> {
+    vec![
+        ("close", "0".to_string()),
+        ("high", "0".to_string()),
+        ("low", "0".to_string()),
+        ("time", format!("\"{}\"", now.to_rfc3339())),
+    ]
+}
+
+fn shell_for_tv_template() -> Vec<(&'static str, String)> {
+    vec![
+        ("close", "{{close}}".to_string()),
+        ("high", "{{high}}".to_string()),
+        ("low", "{{low}}".to_string()),
+        ("time", "\"{{time}}\"".to_string()),
+    ]
+}
+
+/// Render a YAML value as a single-line string, suitable for going on
+/// the right side of a top-level `key: value` line. Scalars use their
+/// raw form; nested values use serde_yaml's flow-style serialisation.
+fn render_value(v: &serde_yaml::Value) -> Result<String> {
+    match v {
+        serde_yaml::Value::Null => Ok("~".to_string()),
+        serde_yaml::Value::Bool(b) => Ok(b.to_string()),
+        serde_yaml::Value::Number(n) => Ok(n.to_string()),
+        serde_yaml::Value::String(s) => {
+            // Quote strings that might confuse the line-scan parser
+            // (timestamps with colons, etc.). Quoting is safe for any
+            // string — the worker strips matching quotes.
+            if needs_quoting(s) {
+                Ok(format!("\"{}\"", s.replace('"', "\\\"")))
+            } else {
+                Ok(s.clone())
+            }
+        }
+        _ => {
+            // serde_yaml emits block-style by default. To force a single
+            // line for nested structures we serialise via JSON (which is
+            // a valid subset of flow YAML).
+            let json = serde_json::to_string(v).map_err(|e| eyre!("flow-style serialise: {e}"))?;
+            Ok(json)
+        }
+    }
+}
+
+fn needs_quoting(s: &str) -> bool {
+    // Quote anything containing characters that aren't safe in a plain
+    // YAML scalar on a single line: colons (timestamps), leading/trailing
+    // whitespace, or starts that YAML would parse as a special type.
+    if s.is_empty() {
+        return true;
+    }
+    if s.chars()
+        .any(|c| matches!(c, ':' | '#' | '\'' | '"' | '\n'))
+    {
+        return true;
+    }
+    if s.starts_with(|c: char| c.is_whitespace()) || s.ends_with(|c: char| c.is_whitespace()) {
+        return true;
+    }
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
