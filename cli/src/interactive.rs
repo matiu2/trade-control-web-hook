@@ -120,12 +120,43 @@ fn prompt_for_field(field: &str, template: &Value) -> Result<Value> {
                 .interact_text()?;
             Ok(Value::Number(n.into()))
         }
+        "step" => {
+            let s: String = Input::with_theme(&theme)
+                .with_prompt("step (named prep, e.g. break-and-close)")
+                .interact_text()?;
+            Ok(Value::String(s))
+        }
+        "name" => {
+            let s: String = Input::with_theme(&theme)
+                .with_prompt("name (named veto, e.g. news-window)")
+                .interact_text()?;
+            Ok(Value::String(s))
+        }
+        "ttl_hours" => {
+            let n: u32 = Input::with_theme(&theme)
+                .with_prompt("ttl_hours")
+                .default(4)
+                .interact_text()?;
+            Ok(Value::Number(n.into()))
+        }
         other => Err(eyre!("no prompt configured for field `{other}`")),
     }
 }
 
 fn prompt_action(theme: &ColorfulTheme) -> Result<Value> {
-    let choices = ["enter", "close", "invalidate"];
+    // Order is roughly "frequency of use" — trade entry first, then the
+    // common control actions, then the recovery / cleanup actions.
+    let choices = [
+        "enter",
+        "close",
+        "invalidate",
+        "prep",
+        "veto",
+        "clear-prep",
+        "clear-veto",
+        "status",
+        "unlock",
+    ];
     let idx = Select::with_theme(theme)
         .with_prompt("action")
         .items(choices)
