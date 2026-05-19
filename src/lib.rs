@@ -4,6 +4,7 @@ mod diag;
 mod state;
 #[cfg(target_arch = "wasm32")]
 mod tn_login;
+mod tn_login_helpers;
 mod tracing_console;
 mod tradenation_adapter;
 
@@ -941,9 +942,9 @@ async fn acquire_tn_broker_for_account(
         }
     };
 
-    // 3. Login per kind. Live path lands in step 4; for now refuse so
-    //    the operator gets a clear log line rather than a silent fall
-    //    through to a demo login that would use the wrong endpoint.
+    // 3. Login per kind. Each path logs in, JSON-serialises the
+    //    session into the per-account KV slot, then hands the JSON to
+    //    `broker_tradenation::login` to build the live broker handle.
     match tn_creds.kind {
         TradeNationKind::Demo => {
             login_and_cache_demo(
@@ -956,10 +957,14 @@ async fn acquire_tn_broker_for_account(
             .await
         }
         TradeNationKind::Live => {
-            console_error!(
-                "tn[{name}]: live login not implemented (deferred to step 4); set kind=demo or wait"
-            );
-            None
+            login_and_cache_live(
+                env,
+                name,
+                &cache_key,
+                &tn_creds.username,
+                &tn_creds.password,
+            )
+            .await
         }
     }
 }
@@ -979,7 +984,47 @@ async fn login_and_cache_demo(
             return None;
         }
     };
-    let json = match serde_json::to_string(&session) {
+    cache_and_open(env, account_name, cache_key, "demo", &session).await
+}
+
+/// Live counterpart to `login_and_cache_demo`. The two have the same
+/// cache-then-open tail; only the login function differs. Live login
+/// is much slower than demo (3 JSON hops + redirect chain vs one
+/// redirect chain) so the cache is even more important here.
+#[cfg(target_arch = "wasm32")]
+async fn login_and_cache_live(
+    env: &Env,
+    account_name: &str,
+    cache_key: &str,
+    username: &str,
+    password: &str,
+) -> Option<broker_tradenation::TradeNationBroker> {
+    let session = match tn_login::login_live(username, password).await {
+        Ok(s) => s,
+        Err(err) => {
+            console_error!("tn[{account_name}]: live login failed: {err}");
+            return None;
+        }
+    };
+    cache_and_open(env, account_name, cache_key, "live", &session).await
+}
+
+/// Serialise the freshly-minted `Session`, write it into the
+/// per-account KV slot, then hand the JSON to
+/// `broker_tradenation::login` to build the broker handle.
+///
+/// KV write failures are logged but don't abort — the operator still
+/// gets a working broker for this request; the next request just pays
+/// the login cost again.
+#[cfg(target_arch = "wasm32")]
+async fn cache_and_open(
+    env: &Env,
+    account_name: &str,
+    cache_key: &str,
+    kind_label: &'static str,
+    session: &tradenation_api::Session,
+) -> Option<broker_tradenation::TradeNationBroker> {
+    let json = match serde_json::to_string(session) {
         Ok(s) => s,
         Err(err) => {
             console_error!("tn[{account_name}]: serialise session: {err}");
@@ -997,7 +1042,7 @@ async fn login_and_cache_demo(
         }
     }
     if let Some(broker) = broker_tradenation::login(&json).await {
-        console_log!("tn[{account_name}]: fresh demo login");
+        console_log!("tn[{account_name}]: fresh {kind_label} login");
         return Some(broker);
     }
     console_error!("tn[{account_name}]: fresh session rejected by broker_tradenation::login");

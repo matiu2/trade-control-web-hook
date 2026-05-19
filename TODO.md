@@ -97,9 +97,25 @@ Steps:
       `/admin/accounts/.../test` now emits the lowercase wire-form
       `broker:` / `kind:` values to match `list`. 149 worker + 74 cli
       tests pass; clippy clean on host + wasm.
-- [ ] **Step 4: live login path** (`login_live` in `tn_login.rs`) —
-      JWT → auth0 → cloudtrade hops, then the existing redirect-chain
-      harvest. Triggered when a resolved account has `kind: live`.
+- [x] **Step 4: live login path** (`login_live` in `tn_login.rs`).
+      Drives the JWT → auth0 → cloudtrade hops, then reuses the
+      existing redirect-chain harvest on the cloudtrade one-time URL.
+      Three new helpers, all wasm-side: `get_jwt` (POST
+      `tradenation.com/signup/api/login` with JSON body), `pick_account_id_from_jwt`
+      (GET `portal.cube.finsatechnology.com/auth0/user` with Bearer),
+      and `get_platform_url` (POST `…/cloudtrade/login` with Bearer +
+      `account_id`). The platform-bootstrap step rejects sessions with
+      no OTS — live writes use the OTS as the request `key`, so a
+      missing OTS would silently break trade time; better to refuse
+      here. Account-picking logic (`pick_funded_account`) is factored
+      into `tn_login_helpers.rs` so it's host-testable (the wasm-only
+      `tn_login` module isn't reachable under `cargo test`); also a
+      shared `truncate_for_log` for trimming TN error bodies in logs.
+      Wired into `acquire_tn_broker_for_account` via a new
+      `login_and_cache_live` helper that mirrors `login_and_cache_demo`;
+      the cache/serialise tail is now a single `cache_and_open` to
+      avoid duplication. 14 worker + 149 core + 74 cli tests pass;
+      clippy + fmt clean on host + wasm.
 - [ ] **Step 5: retire legacy fallback** and port existing accounts
       across.
 - [ ] **Step 6: extend `AccountCaps`.** Two new fields, both
