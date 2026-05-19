@@ -36,6 +36,37 @@ re-authenticate itself. Design sketch (probe results above):
 Pick this up when the cron path proves insufficient — e.g. live trading
 at unattended hours, or repeated misses between rotations.
 
+## Active — First-class accounts
+
+Lift account selection out of "one TN session per worker" and into
+named records, so a single deploy can route different intents to
+different broker accounts (demo / live, OANDA / TradeNation).
+
+Security model: metadata in KV (no secrets), credentials in
+Cloudflare Secret Store (one binding per account). KV-only exfil
+yields no password material. See conversation log 2026-05-19 for
+the design rationale.
+
+Steps:
+
+- [x] **Step 1: core account types & traits.** `core::account` module
+      adds `AccountKind`, `AccountCaps`, `AccountMetadata`,
+      `Credentials` (TradeNation/OANDA variants), `MetadataStore`,
+      `CredentialsResolver`, and the bundled `AccountStore`. In-memory
+      impls for tests. 39 new tests, no worker integration yet.
+- [ ] **Step 2: admin routes + CLI verbs.** `account list / add /
+      delete / test`, gated by an admin key distinct from
+      `ENCRYPTION_KEY`. Verifiable end-to-end before the webhook
+      changes behaviour.
+- [ ] **Step 3: plumb `account:` into the intent.** Switch
+      `acquire_tn_broker` to `acquire_broker(account_id)`. Keep
+      `TN_SESSION_JSON` legacy fallback for one release.
+- [ ] **Step 4: live login path** (`login_live` in `tn_login.rs`) —
+      JWT → auth0 → cloudtrade hops, then the existing redirect-chain
+      harvest. Triggered when a resolved account has `kind: live`.
+- [ ] **Step 5: retire legacy fallback** and port existing accounts
+      across.
+
 ## Done
 
 - **`fx_rate` rewrite to use live chart prices** — landed and deployed
