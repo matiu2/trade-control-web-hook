@@ -44,7 +44,10 @@ mod metadata;
 mod store;
 
 pub use caps::AccountCaps;
-pub use creds::{Credentials, CredentialsResolver, OandaCreds, TradeNationCreds, TradeNationKind};
+pub use creds::{
+    Credentials, CredentialsError, CredentialsResolver, OandaCreds, TradeNationCreds,
+    TradeNationKind,
+};
 pub use kind::AccountKind;
 pub use memstore::{MemCredentialsResolver, MemMetadataStore};
 pub use metadata::{AccountMetadata, MetadataError, MetadataStore};

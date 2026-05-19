@@ -1,3 +1,5 @@
+mod accounts;
+mod admin;
 mod diag;
 mod state;
 #[cfg(target_arch = "wasm32")]
@@ -48,11 +50,21 @@ pub async fn main(mut req: Request, env: Env, _ctx: Context) -> Result<Response>
     // Diagnostic routes — GET-only, gated by X-Diag-Key. Handled before
     // we consume the body so the body parser doesn't apply.
     if req.method() == Method::Get {
-        return match req.path().as_str() {
+        let path = req.path();
+        return match path.as_str() {
             "/diag/fx" => diag::handle_fx(&req, &env).await,
             "/diag/candles" => diag::handle_candles(&req, &env).await,
+            "/admin/accounts" => admin::handle_list(&req, &env).await,
             _ => Response::error("not found", 404),
         };
+    }
+
+    // Admin write routes — POST/DELETE, gated by X-Admin-Key. Handled
+    // before the intent body parser because their bodies (JSON for
+    // POST) don't follow the encrypted-envelope shape.
+    let path = req.path();
+    if path.starts_with("/admin/") {
+        return route_admin(&mut req, &env, &path).await;
     }
 
     let yaml = req.text().await?;
@@ -163,6 +175,35 @@ pub async fn main(mut req: Request, env: Env, _ctx: Context) -> Result<Response>
         console_error!("KV mark_seen after action: {err}");
     }
     response
+}
+
+/// Dispatch on `/admin/...` paths. Method + path together select the
+/// right admin handler. Path parsing is deliberately concrete here
+/// rather than a router crate — we have 4 routes and one path-segment
+/// parameter (`<name>`), and the explicit `match` is easier to audit.
+async fn route_admin(req: &mut Request, env: &Env, path: &str) -> Result<Response> {
+    // POST /admin/accounts                      — add (body)
+    // DELETE /admin/accounts/<name>             — remove
+    // POST   /admin/accounts/<name>/test        — verify creds
+    let method = req.method();
+    if method == Method::Post && path == "/admin/accounts" {
+        return admin::handle_add(req, env).await;
+    }
+    if let Some(rest) = path.strip_prefix("/admin/accounts/")
+        && !rest.is_empty()
+    {
+        if let Some(name) = rest.strip_suffix("/test")
+            && method == Method::Post
+            && !name.is_empty()
+            && !name.contains('/')
+        {
+            return admin::handle_test(req, env, name).await;
+        }
+        if method == Method::Delete && !rest.contains('/') {
+            return admin::handle_remove(req, env, rest).await;
+        }
+    }
+    Response::error("not found", 404)
 }
 
 /// Helper: record an outcome on the seen index and return the caller's

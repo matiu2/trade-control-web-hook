@@ -54,10 +54,24 @@ Steps:
       `Credentials` (TradeNation/OANDA variants), `MetadataStore`,
       `CredentialsResolver`, and the bundled `AccountStore`. In-memory
       impls for tests. 39 new tests, no worker integration yet.
-- [ ] **Step 2: admin routes + CLI verbs.** `account list / add /
-      delete / test`, gated by an admin key distinct from
-      `ENCRYPTION_KEY`. Verifiable end-to-end before the webhook
-      changes behaviour.
+- [x] **Step 2a: admin routes.** Worker-side `KvMetadataStore` +
+      `SecretCredentialsResolver` (wasm) + four routes under `/admin/`
+      gated by an `X-Admin-Key` header backed by a new `ADMIN_KEY`
+      secret (distinct from `ENCRYPTION_KEY`). Routes:
+      - `GET    /admin/accounts`           — list as YAML
+      - `POST   /admin/accounts`           — add (JSON body)
+      - `DELETE /admin/accounts/<name>`    — remove from index
+      - `POST   /admin/accounts/<name>/test` — verify metadata +
+        credential secret + broker match (no broker login yet)
+      `wrangler secret put ADMIN_KEY` required before deploying. The
+      credential secrets follow the schema `TN_ACCOUNT_<NAME>` /
+      `OANDA_ACCOUNT_<NAME>` (name uppercased, `-`→`_`); blob is
+      the JSON serialisation of `core::account::Credentials`.
+- [ ] **Step 2b: CLI verbs.** `account list / add / delete / test`
+      subcommands on the existing `encrypt-payload` binary, talking
+      to the admin routes above. Make `account add` wrap the
+      `wrangler secret put` for the credential half so the operator
+      runs one command, not two.
 - [ ] **Step 3: plumb `account:` into the intent.** Switch
       `acquire_tn_broker` to `acquire_broker(account_id)`. Keep
       `TN_SESSION_JSON` legacy fallback for one release.
@@ -66,6 +80,19 @@ Steps:
       harvest. Triggered when a resolved account has `kind: live`.
 - [ ] **Step 5: retire legacy fallback** and port existing accounts
       across.
+- [ ] **Step 6: extend `AccountCaps`.** Two new fields, both
+      live-account-focused:
+      - `min_position_size` (optional) — refuse entries that would
+        place fewer units than this. Useful on live where the broker's
+        own minimum is too small to absorb spread + slippage
+        profitably.
+      - `risk_mode` — currently every entry risks a percent of
+        equity. Add an alternative "fixed amount" mode that risks a
+        set sum in account currency (e.g. £5 per trade) regardless
+        of equity. Lets a live account run conservatively without
+        scaling up as the balance grows.
+      Both live in metadata (not credentials), and the
+      "narrower-wins" rule still applies for the percent ceiling.
 
 ## Done
 
