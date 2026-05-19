@@ -38,6 +38,34 @@ at unattended hours, or repeated misses between rotations.
 
 ## Done
 
+- **`GET /diag/fx` endpoint + upstream `fx_rate` zero-guard** —
+  landed. New `src/diag.rs` module owns read-only diagnostic routes;
+  `GET /diag/fx?from=GBP&to=USD` runs `tradenation_api::fx_rate`
+  against the cached TN session and returns YAML with the resolved
+  rate (or the error string). Auth via `X-Diag-Key` header whose
+  value must equal the `ENCRYPTION_KEY` secret — re-using the
+  existing key keeps secret management single-secret. Routing splits
+  GET (diag) from POST (the existing encrypted-envelope handler)
+  before body parsing.
+
+  Why: TN's `fx_rate` was returning `Ok(0.0)` for `GBP/USD` during
+  out-of-session hours, which flowed through to `stake_for_risk` as
+  `risk_amount must be positive and finite, got 0` — diagnostic
+  obscured behind two layers. The diag endpoint lets the operator
+  reproduce the actual `fx_rate` output without firing a real entry.
+
+  Upstream fix shipped as `broker-tradenation-v0.2.0`:
+  (a) `fx_rate`'s direct branch now guards against zero mid
+  (symmetric to the existing inverse-branch guard) and falls through
+  to the inverse pair; if both fail it returns a `TradeError::Decode`
+  carrying "direct FX pair X/Y has non-positive mid 0" — exactly what
+  the operator needs to see.
+  (b) `TradeNationBroker::client()` getter so consumers can call
+  `tradenation_api::fx_rate` directly with the same `reqwest::Client`
+  the broker uses (cookie / connection state stays consistent).
+
+  Cargo.toml bumped to `broker-tradenation-v0.2.0`. Wasm + host
+  builds clippy-clean.
 - **`tracing` → `console_log` subscriber in the worker** — landed. New
   `src/tracing_console.rs` implements a minimal `tracing::Subscriber`
   (~110 lines) that formats events as `LEVEL target: field=value …` and

@@ -1,3 +1,4 @@
+mod diag;
 mod state;
 #[cfg(target_arch = "wasm32")]
 mod tn_login;
@@ -5,7 +6,7 @@ mod tracing_console;
 mod tradenation_adapter;
 
 use chrono::Utc;
-use worker::{Context, Env, Request, Response, Result, console_error, console_log, event};
+use worker::{Context, Env, Method, Request, Response, Result, console_error, console_log, event};
 
 use crate::state::KvStateStore;
 use crate::tradenation_adapter::TradeNationAdapter;
@@ -24,7 +25,7 @@ struct UnlockResponse {
     was_cooled_down: bool,
 }
 
-const ENCRYPTION_KEY_SECRET: &str = "ENCRYPTION_KEY";
+pub(crate) const ENCRYPTION_KEY_SECRET: &str = "ENCRYPTION_KEY";
 const MAX_RISK_PCT_PER_TRADE_SECRET: &str = "MAX_RISK_PCT_PER_TRADE";
 const MAX_OPEN_POSITIONS_SECRET: &str = "MAX_OPEN_POSITIONS";
 const PIP_SIZE_SECRET_PREFIX: &str = "PIP_SIZE_";
@@ -43,6 +44,16 @@ const DEFAULT_PIP_SIZE: f64 = 0.0001;
 #[event(fetch)]
 pub async fn main(mut req: Request, env: Env, _ctx: Context) -> Result<Response> {
     tracing_console::ConsoleSubscriber::install();
+
+    // Diagnostic routes — GET-only, gated by X-Diag-Key. Handled before
+    // we consume the body so the body parser doesn't apply.
+    if req.method() == Method::Get {
+        return match req.path().as_str() {
+            "/diag/fx" => diag::handle_fx(&req, &env).await,
+            _ => Response::error("not found", 404),
+        };
+    }
+
     let yaml = req.text().await?;
 
     let key_hex = match get_secret(ENCRYPTION_KEY_SECRET, &env) {
@@ -785,7 +796,7 @@ async fn handle_clear_veto(
 ///
 /// Returns `None` only if every path fails — at that point the operator
 /// needs to look at the logs.
-async fn acquire_tn_broker(env: &Env) -> Option<broker_tradenation::TradeNationBroker> {
+pub(crate) async fn acquire_tn_broker(env: &Env) -> Option<broker_tradenation::TradeNationBroker> {
     let kv = match env.kv(KV_NAMESPACE) {
         Ok(kv) => Some(kv),
         Err(err) => {
@@ -862,7 +873,7 @@ async fn acquire_tn_broker(env: &Env) -> Option<broker_tradenation::TradeNationB
 
 /// Read a secret. Returns `None` if the binding is absent or unreadable.
 /// Silent on absence — callers decide whether a miss is an error worth logging.
-fn get_secret(name: &str, env: &Env) -> Option<String> {
+pub(crate) fn get_secret(name: &str, env: &Env) -> Option<String> {
     env.secret(name).map(|value| value.to_string()).ok()
 }
 
