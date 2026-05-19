@@ -38,6 +38,38 @@ at unattended hours, or repeated misses between rotations.
 
 ## Done
 
+- **`fx_rate` rewrite to use live chart prices** — landed and deployed
+  as `broker-tradenation-v0.3.0`. The root cause of the `risk_amount
+  must be positive and finite, got 0` sizing failures was that
+  TradeNation's `GetMarketQuote` returns `Bid: 0` and `Ask: 0` for
+  every market — live prices were originally pushed over a WebSocket
+  which has been silent since 2026-04-27 (only sends a `connectResponse`
+  frame, then rejects every envelope with `Invalid request`). The v0.2.0
+  zero-guard made the failure visible but couldn't fix it.
+
+  The fix: `fx_rate` now resolves the pair to a `market_id` via
+  `resolve_market` (unchanged) then fetches the latest 1-minute bid
+  and ask candles from the unauthenticated
+  `charts.finsatechnology.com/data/minute/{market_id}/{bid|ask}?l=1`
+  endpoint, computing `mid = (bid_close + ask_close) / 2`. The chart
+  endpoint needs no auth — only `Origin: https://chart-cfd.tradenation.com`
+  and `Referer` headers — and works fine from inside wasm via
+  `reqwest`'s wasm shim. Direct/inverse fallthrough preserved.
+
+  Verified end-to-end via `GET /diag/fx`:
+  - GBP/USD: 1.34182 (was 0.0)
+  - USD/GBP: 0.7453 (inverse path)
+  - EUR/USD: 1.16459
+  - GBP/AUD: 1.87822
+
+  Also extended the diag module with `GET /diag/candles?market_id=N&type=bid|ask&tf=minute&count=1`
+  which hits the chart endpoint directly via `broker.client()` —
+  useful for verifying a single market's chart data without involving
+  `fx_rate`'s resolution logic. Worker bumped to
+  `broker-tradenation-v0.3.0`, deployed to
+  `trade-control-web-hook.msherborne.workers.dev`. 188 worker tests
+  pass; wasm + host builds clippy-clean.
+
 - **`GET /diag/fx` endpoint + upstream `fx_rate` zero-guard** —
   landed. New `src/diag.rs` module owns read-only diagnostic routes;
   `GET /diag/fx?from=GBP&to=USD` runs `tradenation_api::fx_rate`

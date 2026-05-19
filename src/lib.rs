@@ -50,6 +50,7 @@ pub async fn main(mut req: Request, env: Env, _ctx: Context) -> Result<Response>
     if req.method() == Method::Get {
         return match req.path().as_str() {
             "/diag/fx" => diag::handle_fx(&req, &env).await,
+            "/diag/candles" => diag::handle_candles(&req, &env).await,
             _ => Response::error("not found", 404),
         };
     }

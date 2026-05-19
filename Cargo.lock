@@ -188,7 +188,7 @@ dependencies = [
 [[package]]
 name = "broker-tradenation"
 version = "0.1.0"
-source = "git+https://github.com/matiu2/tradenation-api.git?tag=broker-tradenation-v0.2.0#14489bc316213bb0767d538b6e5dc4c3b59e121f"
+source = "git+https://github.com/matiu2/tradenation-api.git?tag=broker-tradenation-v0.3.0#bf70930d6a32966f08ac90d11783ef651d2e649e"
 dependencies = [
  "reqwest",
  "serde",
@@ -223,12 +223,12 @@ dependencies = [
 [[package]]
 name = "candle-model"
 version = "0.1.0"
-source = "git+https://github.com/matiu2/tradenation-api.git?tag=broker-tradenation-v0.2.0#14489bc316213bb0767d538b6e5dc4c3b59e121f"
+source = "git+https://github.com/matiu2/tradenation-api.git?tag=broker-tradenation-v0.3.0#bf70930d6a32966f08ac90d11783ef651d2e649e"
 dependencies = [
  "chrono",
  "color-eyre",
  "serde",
- "trading-base 0.1.0 (git+https://github.com/matiu2/tradenation-api.git?tag=broker-tradenation-v0.2.0)",
+ "trading-base 0.1.0 (git+https://github.com/matiu2/tradenation-api.git?tag=broker-tradenation-v0.3.0)",
 ]
 
 [[package]]
@@ -2197,10 +2197,10 @@ dependencies = [
 [[package]]
 name = "tradenation-api"
 version = "0.1.0"
-source = "git+https://github.com/matiu2/tradenation-api.git?tag=broker-tradenation-v0.2.0#14489bc316213bb0767d538b6e5dc4c3b59e121f"
+source = "git+https://github.com/matiu2/tradenation-api.git?tag=broker-tradenation-v0.3.0#bf70930d6a32966f08ac90d11783ef651d2e649e"
 dependencies = [
  "aes-gcm",
- "candle-model 0.1.0 (git+https://github.com/matiu2/tradenation-api.git?tag=broker-tradenation-v0.2.0)",
+ "candle-model 0.1.0 (git+https://github.com/matiu2/tradenation-api.git?tag=broker-tradenation-v0.3.0)",
  "chrono",
  "color-eyre",
  "dirs",
@@ -2228,7 +2228,7 @@ dependencies = [
 [[package]]
 name = "trading-base"
 version = "0.1.0"
-source = "git+https://github.com/matiu2/tradenation-api.git?tag=broker-tradenation-v0.2.0#14489bc316213bb0767d538b6e5dc4c3b59e121f"
+source = "git+https://github.com/matiu2/tradenation-api.git?tag=broker-tradenation-v0.3.0#bf70930d6a32966f08ac90d11783ef651d2e649e"
 dependencies = [
  "color-eyre",
  "serde",
