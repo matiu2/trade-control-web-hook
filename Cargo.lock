@@ -517,6 +517,7 @@ dependencies = [
  "console",
  "fuzzy-matcher",
  "shell-words",
+ "zeroize",
 ]
 
 [[package]]

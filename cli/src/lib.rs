@@ -3,6 +3,8 @@
 
 use color_eyre::eyre::{Result, eyre};
 
+mod admin_client;
+mod admin_secret;
 mod control;
 mod expiry;
 mod history;
@@ -10,6 +12,8 @@ mod interactive;
 mod prompts;
 mod templates;
 
+pub use admin_client::{add_account, delete_account, list_accounts, test_account};
+pub use admin_secret::{delete_secret, put_secret, secret_binding_for};
 pub use control::{
     build_clear_prep_intent, build_clear_veto_intent, build_prep_intent, build_status_intent,
     build_unlock_intent, build_veto_intent, wrap_in_envelope, wrap_signed, wrap_signed_template,

@@ -67,11 +67,17 @@ Steps:
       credential secrets follow the schema `TN_ACCOUNT_<NAME>` /
       `OANDA_ACCOUNT_<NAME>` (name uppercased, `-`→`_`); blob is
       the JSON serialisation of `core::account::Credentials`.
-- [ ] **Step 2b: CLI verbs.** `account list / add / delete / test`
-      subcommands on the existing `encrypt-payload` binary, talking
-      to the admin routes above. Make `account add` wrap the
-      `wrangler secret put` for the credential half so the operator
-      runs one command, not two.
+- [x] **Step 2b: CLI verbs.** `encrypt-payload account
+      list / add / delete / test` subcommands wired through the admin
+      routes. Auth is `--admin-key-file` (env
+      `TRADE_CONTROL_ADMIN_KEY_FILE`), separate from `--key-file`. `add`
+      prompts for credentials via `dialoguer::Password` and pipes the
+      JSON to `wrangler secret put` over stdin (no argv leakage); use
+      `--no-secret` to skip the wrangler step. `delete --purge-secret`
+      also runs `wrangler secret delete` (requires `--broker` so the
+      binding name can be computed locally). New CLI modules:
+      `admin_client.rs` (HTTP) and `admin_secret.rs` (wrangler shell-out).
+      77 cli + 5 cli-bin tests pass; clippy + fmt clean on host.
 - [ ] **Step 3: plumb `account:` into the intent.** Switch
       `acquire_tn_broker` to `acquire_broker(account_id)`. Keep
       `TN_SESSION_JSON` legacy fallback for one release.
