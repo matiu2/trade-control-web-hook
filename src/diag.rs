@@ -47,10 +47,12 @@ pub async fn handle_fx(req: &Request, env: &Env) -> Result<Response> {
     let url = req.url()?;
     let mut from: Option<String> = None;
     let mut to: Option<String> = None;
+    let mut account: Option<String> = None;
     for (k, v) in url.query_pairs() {
         match k.as_ref() {
             "from" => from = Some(v.into_owned()),
             "to" => to = Some(v.into_owned()),
+            "account" => account = Some(v.into_owned()),
             _ => {}
         }
     }
@@ -61,7 +63,7 @@ pub async fn handle_fx(req: &Request, env: &Env) -> Result<Response> {
         return Response::error("missing query parameter: to", 400);
     };
 
-    let broker = match acquire_tn_broker(env).await {
+    let broker = match acquire_tn_broker(env, account.as_deref()).await {
         Some(b) => b,
         None => return Response::error("tradenation session unavailable", 503),
     };
@@ -100,12 +102,14 @@ pub async fn handle_candles(req: &Request, env: &Env) -> Result<Response> {
     let mut price_type: String = "bid".to_string();
     let mut tf: String = "minute".to_string();
     let mut count: String = "1".to_string();
+    let mut account: Option<String> = None;
     for (k, v) in url.query_pairs() {
         match k.as_ref() {
             "market_id" => market_id = Some(v.into_owned()),
             "type" => price_type = v.into_owned(),
             "tf" => tf = v.into_owned(),
             "count" => count = v.into_owned(),
+            "account" => account = Some(v.into_owned()),
             _ => {}
         }
     }
@@ -119,7 +123,7 @@ pub async fn handle_candles(req: &Request, env: &Env) -> Result<Response> {
         return Response::error("tf must be minute, quarter, hour, or day", 400);
     }
 
-    let broker = match acquire_tn_broker(env).await {
+    let broker = match acquire_tn_broker(env, account.as_deref()).await {
         Some(b) => b,
         None => return Response::error("tradenation session unavailable", 503),
     };

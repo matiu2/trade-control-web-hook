@@ -194,27 +194,54 @@ pub async fn handle_test(req: &Request, env: &Env, name: &str) -> Result<Respons
             meta.broker,
             actual
         );
+        // Surface lowercase wire-form variant names so the operator
+        // sees the same shape they sent in the JSON body, not Rust's
+        // `Debug` rendering.
+        let meta_str = wire_broker(meta.broker);
+        let actual_str = wire_broker(actual);
         return Response::error(
-            format!(
-                "broker mismatch: metadata says {:?} but credential is {:?}",
-                meta.broker, actual
-            ),
+            format!("broker mismatch: metadata says {meta_str} but credential is {actual_str}"),
             409,
         );
     }
     console_log!(
-        "admin: test {name} ok (broker={:?}, kind={:?})",
-        meta.broker,
-        meta.kind
+        "admin: test {name} ok (broker={}, kind={})",
+        wire_broker(meta.broker),
+        wire_kind(meta.kind)
     );
     // Don't echo the credential payload — only the metadata. Leaks
     // of `account test` output (logs, screenshots) should never
-    // expose passwords.
+    // expose passwords. Use the lowercase wire form so the response
+    // matches the YAML emitted by `/admin/accounts` for `list`.
     let body = format!(
-        "name: {}\nbroker: {:?}\nkind: {:?}\nstatus: ok\n",
-        meta.name, meta.broker, meta.kind
+        "name: {}\nbroker: {}\nkind: {}\nstatus: ok\n",
+        meta.name,
+        wire_broker(meta.broker),
+        wire_kind(meta.kind)
     );
     Response::ok(body)
+}
+
+/// Lowercase wire-form variant of `BrokerKind`. Matches the
+/// `#[serde(rename_all = "lowercase")]` shape used everywhere else, so
+/// the admin response body is consistent with the YAML index.
+#[cfg(target_arch = "wasm32")]
+fn wire_broker(broker: trade_control_core::intent::BrokerKind) -> &'static str {
+    use trade_control_core::intent::BrokerKind;
+    match broker {
+        BrokerKind::Oanda => "oanda",
+        BrokerKind::TradeNation => "tradenation",
+    }
+}
+
+/// Lowercase wire-form variant of `AccountKind`.
+#[cfg(target_arch = "wasm32")]
+fn wire_kind(kind: trade_control_core::account::AccountKind) -> &'static str {
+    use trade_control_core::account::AccountKind;
+    match kind {
+        AccountKind::Demo => "demo",
+        AccountKind::Live => "live",
+    }
 }
 
 #[cfg(not(target_arch = "wasm32"))]

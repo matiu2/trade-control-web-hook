@@ -297,6 +297,7 @@ mod tests {
             requires_preps: Vec::new(),
             vetos: Vec::new(),
             clears: Vec::new(),
+            account: None,
         }
     }
 

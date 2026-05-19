@@ -74,8 +74,16 @@ pub fn fill_missing_fields(template: &mut Value, non_interactive: bool) -> Resul
             if template.get(*field).is_some() {
                 continue;
             }
-            let value = prompt_optional_name_list(field, action)?;
-            set_field(template, field, value);
+            let value = match *field {
+                "account" => prompt_optional_account()?,
+                _ => prompt_optional_name_list(field, action)?,
+            };
+            // Blank `account` is encoded as null — skip it so the wire
+            // form stays minimal and `skip_serializing_if = None` kicks
+            // in.
+            if !matches!(value, Value::Null) {
+                set_field(template, field, value);
+            }
         }
     }
 
@@ -348,6 +356,28 @@ fn name_kind_for(field: &str, action: trade_control_core::intent::Action) -> Nam
         ("clears", Action::Veto) => NameKind::Veto,
         _ => NameKind::None,
     }
+}
+
+/// Prompt for an optional `account` name. Blank input is treated as
+/// "no account — use the legacy lookup" and encoded as `Value::Null`;
+/// the caller then skips setting the field so the wire form omits it.
+///
+/// Doesn't probe the worker for the live account list — that would
+/// require the admin key in the encrypt path, which is the wrong trust
+/// boundary. Operators who want auto-complete should run
+/// `encrypt-payload account list` first.
+fn prompt_optional_account() -> Result<Value> {
+    let theme = ColorfulTheme::default();
+    let raw: String = Input::with_theme(&theme)
+        .with_prompt("account (named account from the worker index; blank to skip)")
+        .default(String::new())
+        .allow_empty(true)
+        .interact_text()?;
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(Value::Null);
+    }
+    Ok(Value::String(trimmed.to_string()))
 }
 
 /// Prompt for a comma-separated list of names (used for `requires_preps`,

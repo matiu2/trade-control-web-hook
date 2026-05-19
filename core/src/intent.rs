@@ -69,6 +69,14 @@ pub struct Intent {
     /// dispatch landed still work.
     #[serde(default)]
     pub broker: BrokerKind,
+    /// Named account in the worker's account index to fulfil this
+    /// intent against. When absent, the worker falls back to the
+    /// pre-accounts lookup path (one shared session for `tradenation`,
+    /// the global API key for `oanda`). The account's recorded
+    /// `broker` must match this intent's `broker`; mismatch is
+    /// rejected at dispatch time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account: Option<String>,
     /// Required for `prep` / `clear-prep`. The named step that landed
     /// (e.g. `break-and-close`, `retest`).
     #[serde(default)]
@@ -338,6 +346,89 @@ mod tests {
         // Pre-existing intents on the wire don't carry a `broker:` field; they
         // must keep routing to OANDA.
         assert_eq!(intent.broker, BrokerKind::Oanda);
+    }
+
+    #[test]
+    fn intent_defaults_account_to_none() {
+        // Absent `account:` on the wire — the worker uses the
+        // pre-accounts fallback path. Required for back-compat with
+        // intents minted before the account field landed.
+        let yaml = "
+            v: 1
+            id: a-1
+            not_after: \"2026-05-13T20:00:00Z\"
+            action: enter
+            instrument: EUR_USD
+            direction: long
+            entry: { type: market }
+            stop_loss: { from: low, offset_pips: -2 }
+            take_profit: { from: close, offset_r: 2.0 }
+            risk_pct: 0.5
+        ";
+        let intent: Intent = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(intent.account, None);
+    }
+
+    #[test]
+    fn intent_parses_explicit_account() {
+        let yaml = "
+            v: 1
+            id: a-2
+            not_after: \"2026-05-13T20:00:00Z\"
+            action: enter
+            instrument: EUR_USD
+            direction: long
+            entry: { type: market }
+            stop_loss: { from: low, offset_pips: -2 }
+            take_profit: { from: close, offset_r: 2.0 }
+            risk_pct: 0.5
+            broker: tradenation
+            account: reversals
+        ";
+        let intent: Intent = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(intent.account.as_deref(), Some("reversals"));
+        assert_eq!(intent.broker, BrokerKind::TradeNation);
+    }
+
+    #[test]
+    fn intent_account_round_trip_yaml() {
+        // Round-trip serialisation must preserve the account field; if
+        // it's dropped on re-serialise the encryption / signing paths
+        // would lose the field on the wire.
+        let yaml = "
+            v: 1
+            id: a-3
+            not_after: \"2026-05-13T20:00:00Z\"
+            action: enter
+            instrument: EUR_USD
+            direction: long
+            entry: { type: market }
+            stop_loss: { from: low, offset_pips: -2 }
+            take_profit: { from: close, offset_r: 2.0 }
+            risk_pct: 0.5
+            broker: tradenation
+            account: live-prod
+        ";
+        let intent: Intent = serde_yaml::from_str(yaml).unwrap();
+        let back = serde_yaml::to_string(&intent).unwrap();
+        assert!(back.contains("account: live-prod"));
+    }
+
+    #[test]
+    fn intent_omits_account_when_none() {
+        // `skip_serializing_if = Option::is_none` keeps the wire form
+        // unchanged for pre-accounts intents — no spurious `account:
+        // null` lines that would confuse signed-mode replay.
+        let yaml = "
+            v: 1
+            id: a-4
+            not_after: \"2026-05-13T20:00:00Z\"
+            action: status
+            instrument: ALL
+        ";
+        let intent: Intent = serde_yaml::from_str(yaml).unwrap();
+        let back = serde_yaml::to_string(&intent).unwrap();
+        assert!(!back.contains("account"));
     }
 
     #[test]

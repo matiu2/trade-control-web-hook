@@ -78,9 +78,25 @@ Steps:
       binding name can be computed locally). New CLI modules:
       `admin_client.rs` (HTTP) and `admin_secret.rs` (wrangler shell-out).
       77 cli + 5 cli-bin tests pass; clippy + fmt clean on host.
-- [ ] **Step 3: plumb `account:` into the intent.** Switch
-      `acquire_tn_broker` to `acquire_broker(account_id)`. Keep
-      `TN_SESSION_JSON` legacy fallback for one release.
+- [x] **Step 3: plumb `account:` into the intent.** `Intent` gains an
+      optional `account: Option<String>` field
+      (`skip_serializing_if = Option::is_none` for back-compat).
+      `acquire_tn_broker` now takes `account: Option<&str>`; when set,
+      it routes through `KvMetadataStore` + `SecretCredentialsResolver`,
+      caches the session under `tn:session:<name>` (per-account, so
+      multiple TN accounts don't fight over one slot), and uses the
+      account's own credentials. Demo accounts use the existing
+      redirect-chain login with the account's username/password. Live
+      accounts return `None` with a clear log (step 4 wires the live
+      login). Account-less intents keep the legacy path
+      (TN_SESSION_JSON / TN_DEMO_LOGIN_ID). `/diag/fx` and
+      `/diag/candles` accept an optional `?account=…` query param.
+      CLI `encrypt`: `account` is now an optional prompted field on
+      enter/close/invalidate/veto (the broker-touching actions); blank
+      input skips it so the wire form stays minimal. Worker
+      `/admin/accounts/.../test` now emits the lowercase wire-form
+      `broker:` / `kind:` values to match `list`. 149 worker + 74 cli
+      tests pass; clippy clean on host + wasm.
 - [ ] **Step 4: live login path** (`login_live` in `tn_login.rs`) —
       JWT → auth0 → cloudtrade hops, then the existing redirect-chain
       harvest. Triggered when a resolved account has `kind: live`.

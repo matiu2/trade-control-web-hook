@@ -35,11 +35,19 @@ pub const ALWAYS_REQUIRED: &[&str] = &["v", "action", "instrument", "id", "not_a
 /// prompt), but ad-hoc trades typed at the CLI need a way in.
 pub fn optional_for_action(action: Action) -> &'static [&'static str] {
     match action {
-        Action::Enter => &["requires_preps", "vetos"],
+        // `account` routes an entry through a specific named account
+        // from the worker's account index, not just the broker pool.
+        // Absent means "use the legacy (pre-accounts) lookup".
+        Action::Enter => &["requires_preps", "vetos", "account"],
         // `clears` is optional on prep/veto — it lets an upstream prep
         // (like break-and-close) declare which downstream preps it
-        // invalidates, fixing stale-prep ordering bugs.
-        Action::Prep | Action::Veto => &["clears"],
+        // invalidates, fixing stale-prep ordering bugs. `account` is
+        // also accepted on `veto` because escalated-level vetos
+        // (cancel-pending / close-positions) hit the broker, and on
+        // `close` / `invalidate` for the same reason.
+        Action::Prep => &["clears"],
+        Action::Veto => &["clears", "account"],
+        Action::Close | Action::Invalidate => &["account"],
         _ => &[],
     }
 }
@@ -180,10 +188,19 @@ mod tests {
     }
 
     #[test]
-    fn optional_for_other_actions_is_empty() {
+    fn optional_for_close_and_invalidate_offers_account() {
+        // Close + invalidate hit the broker, so the operator should
+        // be able to direct them at a specific named account when the
+        // worker has multiple TN accounts.
+        assert_eq!(optional_for_action(Action::Close), &["account"]);
+        assert_eq!(optional_for_action(Action::Invalidate), &["account"]);
+    }
+
+    #[test]
+    fn optional_for_pure_state_actions_is_empty() {
+        // Status / Unlock / Clear-* never touch the broker — no
+        // account routing needed.
         for a in [
-            Action::Close,
-            Action::Invalidate,
             Action::Status,
             Action::Unlock,
             Action::ClearPrep,
@@ -191,6 +208,15 @@ mod tests {
         ] {
             assert!(optional_for_action(a).is_empty(), "{a:?}");
         }
+    }
+
+    #[test]
+    fn optional_for_enter_and_veto_offer_account() {
+        // `account` joins the prep/veto/clears gates so the operator
+        // can route an entry (or escalated veto) at a specific named
+        // account.
+        assert!(optional_for_action(Action::Enter).contains(&"account"));
+        assert!(optional_for_action(Action::Veto).contains(&"account"));
     }
 
     #[test]

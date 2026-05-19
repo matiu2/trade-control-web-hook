@@ -140,15 +140,17 @@ pub async fn main(mut req: Request, env: Env, _ctx: Context) -> Result<Response>
             Some(broker) => run_action(&broker, &store, &verified, &env, now).await,
             None => return Response::error("oanda login failed", 500),
         },
-        BrokerKind::TradeNation => match acquire_tn_broker(&env).await {
-            Some(broker) => {
-                let adapter = TradeNationAdapter(broker);
-                run_action(&adapter, &store, &verified, &env, now).await
+        BrokerKind::TradeNation => {
+            match acquire_tn_broker(&env, verified.intent.account.as_deref()).await {
+                Some(broker) => {
+                    let adapter = TradeNationAdapter(broker);
+                    run_action(&adapter, &store, &verified, &env, now).await
+                }
+                None => {
+                    return Response::error("tradenation session expired or invalid", 503);
+                }
             }
-            None => {
-                return Response::error("tradenation session expired or invalid", 503);
-            }
-        },
+        }
     };
 
     // Every dispatch path records a seen entry — success, broker failure,
@@ -826,19 +828,185 @@ async fn handle_clear_veto(
 
 /// Resolve a `TradeNationBroker`, refreshing the session as needed.
 ///
-/// Lookup order:
-/// 1. Cached `Session` JSON in KV under `TN_SESSION_KV_KEY`. If
-///    `broker_tradenation::login` accepts it, we're done.
-/// 2. Fresh login via [`tn_login::login_demo`] using
-///    `TN_DEMO_LOGIN_ID` / `TN_DEMO_PASSWORD` secrets. On success the
-///    new session JSON is written back to KV for the next request.
-/// 3. Fallback to the legacy `TN_SESSION_JSON` secret so the worker
-///    keeps working through any deployment gap before the new secrets
-///    are configured.
+/// When `account` is `Some(name)`, the worker routes through the
+/// first-class account store — looks the metadata + credentials up,
+/// caches the session under `tn:session:<name>`, and uses the
+/// account's own username / password to log in. Live accounts return
+/// `None` for now (step 4 wires the live login path).
 ///
-/// Returns `None` only if every path fails — at that point the operator
-/// needs to look at the logs.
-pub(crate) async fn acquire_tn_broker(env: &Env) -> Option<broker_tradenation::TradeNationBroker> {
+/// When `account` is `None`, the legacy lookup order applies:
+/// 1. Cached `Session` JSON in KV under `TN_SESSION_KV_KEY`.
+/// 2. Fresh demo login from the global
+///    `TN_DEMO_LOGIN_ID` / `TN_DEMO_PASSWORD` secrets.
+/// 3. Fallback to the legacy `TN_SESSION_JSON` secret.
+///
+/// Returns `None` only if every path fails — at that point the
+/// operator needs to look at the logs.
+pub(crate) async fn acquire_tn_broker(
+    env: &Env,
+    account: Option<&str>,
+) -> Option<broker_tradenation::TradeNationBroker> {
+    match account {
+        Some(name) => acquire_tn_broker_for_account(env, name).await,
+        None => acquire_tn_broker_legacy(env).await,
+    }
+}
+
+/// KV cache key for a session. `None` is the legacy shared slot;
+/// named accounts get a per-account namespace so two TN accounts don't
+/// fight over one slot. Only the account-mode path needs it today
+/// (legacy path bakes in the constant), hence the wasm gate.
+#[cfg(target_arch = "wasm32")]
+fn tn_session_cache_key(account: Option<&str>) -> String {
+    match account {
+        Some(name) => format!("tn:session:{name}"),
+        None => TN_SESSION_KV_KEY.to_string(),
+    }
+}
+
+/// Account-aware path. Looks up the metadata + credentials via the
+/// account store, verifies the broker tag is TradeNation, then logs in
+/// using the account's own username / password.
+#[cfg(not(target_arch = "wasm32"))]
+async fn acquire_tn_broker_for_account(
+    _env: &Env,
+    _name: &str,
+) -> Option<broker_tradenation::TradeNationBroker> {
+    // Native test builds — no `worker::Fetch`, so the redirect-chain
+    // login can't run. The wasm cfg below is the production path.
+    None
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn acquire_tn_broker_for_account(
+    env: &Env,
+    name: &str,
+) -> Option<broker_tradenation::TradeNationBroker> {
+    use trade_control_core::account::{
+        Credentials, CredentialsResolver, MetadataStore, TradeNationKind,
+    };
+    use trade_control_core::intent::BrokerKind;
+
+    let kv = match env.kv(KV_NAMESPACE) {
+        Ok(kv) => kv,
+        Err(err) => {
+            console_error!("tn[{name}]: KV binding missing: {err:?}");
+            return None;
+        }
+    };
+    let metadata = accounts::KvMetadataStore::new(kv.clone());
+    let meta = match metadata.get(name).await {
+        Ok(m) => m,
+        Err(err) => {
+            console_error!("tn[{name}]: metadata lookup failed: {err}");
+            return None;
+        }
+    };
+    if meta.broker != BrokerKind::TradeNation {
+        console_error!(
+            "tn[{name}]: account broker={:?} but intent routed to tradenation",
+            meta.broker
+        );
+        return None;
+    }
+
+    // 1. Try the per-account cached session.
+    let cache_key = tn_session_cache_key(Some(name));
+    match kv.get(&cache_key).text().await {
+        Ok(Some(cached)) => {
+            if let Some(broker) = broker_tradenation::login(&cached).await {
+                console_log!("tn[{name}]: using cached session");
+                return Some(broker);
+            }
+            console_log!("tn[{name}]: cached session rejected, will re-login");
+        }
+        Ok(None) => console_log!("tn[{name}]: no cached session, will login"),
+        Err(err) => console_error!("tn[{name}]: KV get session: {err:?}"),
+    }
+
+    // 2. Resolve credentials.
+    let resolver = accounts::SecretCredentialsResolver::new(env, &metadata);
+    let creds = match resolver.resolve(name).await {
+        Ok(c) => c,
+        Err(err) => {
+            console_error!("tn[{name}]: credentials resolve: {err}");
+            return None;
+        }
+    };
+    let tn_creds = match creds {
+        Credentials::TradeNation(c) => c,
+        Credentials::Oanda(_) => {
+            console_error!("tn[{name}]: credential payload is OANDA — broker mismatch");
+            return None;
+        }
+    };
+
+    // 3. Login per kind. Live path lands in step 4; for now refuse so
+    //    the operator gets a clear log line rather than a silent fall
+    //    through to a demo login that would use the wrong endpoint.
+    match tn_creds.kind {
+        TradeNationKind::Demo => {
+            login_and_cache_demo(
+                env,
+                name,
+                &cache_key,
+                &tn_creds.username,
+                &tn_creds.password,
+            )
+            .await
+        }
+        TradeNationKind::Live => {
+            console_error!(
+                "tn[{name}]: live login not implemented (deferred to step 4); set kind=demo or wait"
+            );
+            None
+        }
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn login_and_cache_demo(
+    env: &Env,
+    account_name: &str,
+    cache_key: &str,
+    username: &str,
+    password: &str,
+) -> Option<broker_tradenation::TradeNationBroker> {
+    let session = match tn_login::login_demo(username, password).await {
+        Ok(s) => s,
+        Err(err) => {
+            console_error!("tn[{account_name}]: demo login failed: {err}");
+            return None;
+        }
+    };
+    let json = match serde_json::to_string(&session) {
+        Ok(s) => s,
+        Err(err) => {
+            console_error!("tn[{account_name}]: serialise session: {err}");
+            return None;
+        }
+    };
+    if let Ok(kv) = env.kv(KV_NAMESPACE) {
+        match kv.put(cache_key, json.clone()) {
+            Ok(builder) => {
+                if let Err(err) = builder.execute().await {
+                    console_error!("tn[{account_name}]: KV put session execute: {err:?}");
+                }
+            }
+            Err(err) => console_error!("tn[{account_name}]: KV put session builder: {err:?}"),
+        }
+    }
+    if let Some(broker) = broker_tradenation::login(&json).await {
+        console_log!("tn[{account_name}]: fresh demo login");
+        return Some(broker);
+    }
+    console_error!("tn[{account_name}]: fresh session rejected by broker_tradenation::login");
+    None
+}
+
+/// Legacy (pre-accounts) path. Preserved for one release so intents
+/// without `account:` keep working with the old secrets layout.
+async fn acquire_tn_broker_legacy(env: &Env) -> Option<broker_tradenation::TradeNationBroker> {
     let kv = match env.kv(KV_NAMESPACE) {
         Ok(kv) => Some(kv),
         Err(err) => {
@@ -869,31 +1037,10 @@ pub(crate) async fn acquire_tn_broker(env: &Env) -> Option<broker_tradenation::T
         get_secret(TN_DEMO_LOGIN_ID_SECRET, env),
         get_secret(TN_DEMO_PASSWORD_SECRET, env),
     ) {
-        match tn_login::login_demo(&login_id, &password).await {
-            Ok(session) => match serde_json::to_string(&session) {
-                Ok(json) => {
-                    // Cache before handing off — even if validate_session
-                    // hiccups, the JSON is good and the next request
-                    // benefits.
-                    if let Some(kv) = kv.as_ref() {
-                        match kv.put(TN_SESSION_KV_KEY, json.clone()) {
-                            Ok(builder) => {
-                                if let Err(err) = builder.execute().await {
-                                    console_error!("tn: KV put session execute: {err:?}");
-                                }
-                            }
-                            Err(err) => console_error!("tn: KV put session builder: {err:?}"),
-                        }
-                    }
-                    if let Some(broker) = broker_tradenation::login(&json).await {
-                        console_log!("tn: fresh login via TN_DEMO_LOGIN_ID");
-                        return Some(broker);
-                    }
-                    console_error!("tn: fresh session rejected by broker_tradenation::login");
-                }
-                Err(err) => console_error!("tn: serialise fresh session: {err}"),
-            },
-            Err(err) => console_error!("tn: fresh login failed: {err}"),
+        if let Some(broker) =
+            login_and_cache_demo(env, "legacy", TN_SESSION_KV_KEY, &login_id, &password).await
+        {
+            return Some(broker);
         }
     } else {
         console_log!(
