@@ -58,6 +58,16 @@ pub fn fill_missing_fields(template: &mut Value, non_interactive: bool) -> Resul
     let post = ["id", "not_after"];
     fill_round(template, &post, non_interactive)?;
 
+    // Pass 1c (Enter only): ask the sizing mode up front so the
+    // value-prompt can target the right key (risk_pct / risk_amount /
+    // size_units). Skipped if the template already picks one — the
+    // existing `has_alt_sizing` check in `missing_fields` then skips
+    // the risk_pct prompt in Pass 2.
+    if action == Action::Enter && !non_interactive && !sizing_field_already_set(template) {
+        let (key, value) = prompt_sizing_mode()?;
+        set_field(template, key, value);
+    }
+
     // Pass 2: remaining action-dependent fields.
     let action_required: Vec<&'static str> = required_for_action(action).to_vec();
     fill_round(template, &action_required, non_interactive)?;
@@ -76,6 +86,7 @@ pub fn fill_missing_fields(template: &mut Value, non_interactive: bool) -> Resul
             }
             let value = match *field {
                 "account" => prompt_optional_account()?,
+                "dry_run" => prompt_optional_dry_run()?,
                 _ => prompt_optional_name_list(field, action)?,
             };
             // Blank `account` is encoded as null — skip it so the wire
@@ -355,6 +366,73 @@ fn name_kind_for(field: &str, action: trade_control_core::intent::Action) -> Nam
         ("clears", Action::Prep) => NameKind::Prep,
         ("clears", Action::Veto) => NameKind::Veto,
         _ => NameKind::None,
+    }
+}
+
+/// True iff the template already picks one of the three sizing modes
+/// (`risk_pct`, `risk_amount`, `size_units`). Used to skip the
+/// sizing-mode picker when a template pre-fills the choice.
+fn sizing_field_already_set(template: &Value) -> bool {
+    ["risk_pct", "risk_amount", "size_units"]
+        .iter()
+        .any(|k| !matches!(template.get(*k), None | Some(Value::Null)))
+}
+
+/// Ask the operator which sizing mode to use and prompt for its value.
+/// Returns `(field_name, yaml_value)` so the caller splices the value
+/// under the right key. The three modes are mutually exclusive at the
+/// resolver, so the picker enforces a single choice.
+///
+/// - Percent: `risk_pct` (default), % of equity. Backwards compatible.
+/// - Amount: `risk_amount`, money sum in account currency. "Bet $1".
+/// - Units: `size_units`, literal broker units / TN stake. Bypasses
+///   sizing math; cap-checked via implied money risk on both brokers.
+fn prompt_sizing_mode() -> Result<(&'static str, Value)> {
+    let theme = ColorfulTheme::default();
+    let options = [
+        "risk_pct — % of account equity (default)",
+        "risk_amount — fixed money sum in account currency",
+        "size_units — literal units / TN stake (bypasses sizing math)",
+    ];
+    let idx = Select::with_theme(&theme)
+        .with_prompt("sizing mode")
+        .items(options.as_slice())
+        .default(0)
+        .interact()?;
+    match idx {
+        0 => {
+            let value = prompt_float(&theme, "risk_pct (% of equity)", Some(0.5))?;
+            Ok(("risk_pct", value))
+        }
+        1 => {
+            let value = prompt_float(&theme, "risk_amount (account currency)", Some(1.0))?;
+            Ok(("risk_amount", value))
+        }
+        2 => {
+            let value = prompt_float(&theme, "size_units (broker units / TN stake)", None)?;
+            Ok(("size_units", value))
+        }
+        _ => unreachable!("Select returned out-of-range index"),
+    }
+}
+
+/// Prompt for the optional `dry_run` flag on `enter` intents. Defaults
+/// to `false` (place the order). When `true`, the worker logs the
+/// sizing inputs and skips broker dispatch entirely. Returns
+/// `Value::Null` for the default so the caller's `skip_serializing_if`
+/// logic keeps the wire form minimal.
+fn prompt_optional_dry_run() -> Result<Value> {
+    let theme = ColorfulTheme::default();
+    let options = ["false — place the order (default)", "true — log only"];
+    let idx = Select::with_theme(&theme)
+        .with_prompt("dry_run")
+        .items(options.as_slice())
+        .default(0)
+        .interact()?;
+    match idx {
+        0 => Ok(Value::Null),
+        1 => Ok(Value::Bool(true)),
+        _ => unreachable!("Select returned out-of-range index"),
     }
 }
 
@@ -997,6 +1075,102 @@ mod tests {
         let yaml = "v: 1\naction: veto\ninstrument: USDJPY\n";
         let template: Value = serde_yaml::from_str(yaml).unwrap();
         assert_eq!(ttl_hours_default(&template, now), 48);
+    }
+
+    #[test]
+    fn sizing_field_already_set_detects_each_mode() {
+        // Templates that pre-pick any one of the three sizing fields
+        // suppress the interactive mode picker.
+        for yaml in [
+            "risk_pct: 0.5\n",
+            "risk_amount: 1.0\n",
+            "size_units: 0.01\n",
+        ] {
+            let v: Value = serde_yaml::from_str(yaml).unwrap();
+            assert!(sizing_field_already_set(&v), "should detect: {yaml}");
+        }
+    }
+
+    #[test]
+    fn sizing_field_already_set_returns_false_when_all_absent() {
+        let v: Value = serde_yaml::from_str("v: 1\naction: enter\n").unwrap();
+        assert!(!sizing_field_already_set(&v));
+    }
+
+    #[test]
+    fn sizing_field_already_set_treats_null_as_absent() {
+        // YAML `risk_pct: ~` (explicit null) is "not picked" — same
+        // semantics as `missing_fields` treating null as missing.
+        let v: Value = serde_yaml::from_str("risk_pct: ~\n").unwrap();
+        assert!(!sizing_field_already_set(&v));
+    }
+
+    #[test]
+    fn non_interactive_accepts_template_with_risk_amount() {
+        // risk_amount picks fixed-money sizing; non-interactive should
+        // pass without prompting for risk_pct.
+        let yaml = "
+            v: 1
+            id: abc
+            not_after: \"2026-05-13T20:00:00Z\"
+            action: enter
+            instrument: EUR_USD
+            broker: oanda
+            direction: long
+            entry: { type: market }
+            stop_loss: { from: low, offset_pips: -2 }
+            take_profit: { from: close, offset_r: 2.0 }
+            risk_amount: 1.0
+        ";
+        let mut template: Value = serde_yaml::from_str(yaml).unwrap();
+        fill_missing_fields(&mut template, true).unwrap();
+        let intent: Intent = serde_yaml::from_value(template).unwrap();
+        assert_eq!(intent.risk_amount, Some(1.0));
+        assert_eq!(intent.risk_pct, None);
+    }
+
+    #[test]
+    fn non_interactive_accepts_template_with_size_units() {
+        let yaml = "
+            v: 1
+            id: abc
+            not_after: \"2026-05-13T20:00:00Z\"
+            action: enter
+            instrument: EUR_USD
+            broker: oanda
+            direction: long
+            entry: { type: market }
+            stop_loss: { from: low, offset_pips: -2 }
+            take_profit: { from: close, offset_r: 2.0 }
+            size_units: 0.01
+        ";
+        let mut template: Value = serde_yaml::from_str(yaml).unwrap();
+        fill_missing_fields(&mut template, true).unwrap();
+        let intent: Intent = serde_yaml::from_value(template).unwrap();
+        assert_eq!(intent.size_units, Some(0.01));
+        assert_eq!(intent.risk_pct, None);
+    }
+
+    #[test]
+    fn non_interactive_accepts_template_with_dry_run() {
+        let yaml = "
+            v: 1
+            id: abc
+            not_after: \"2026-05-13T20:00:00Z\"
+            action: enter
+            instrument: EUR_USD
+            broker: oanda
+            direction: long
+            entry: { type: market }
+            stop_loss: { from: low, offset_pips: -2 }
+            take_profit: { from: close, offset_r: 2.0 }
+            risk_pct: 0.5
+            dry_run: true
+        ";
+        let mut template: Value = serde_yaml::from_str(yaml).unwrap();
+        fill_missing_fields(&mut template, true).unwrap();
+        let intent: Intent = serde_yaml::from_value(template).unwrap();
+        assert_eq!(intent.dry_run, Some(true));
     }
 
     #[test]

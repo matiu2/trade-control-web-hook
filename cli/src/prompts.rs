@@ -38,7 +38,9 @@ pub fn optional_for_action(action: Action) -> &'static [&'static str] {
         // `account` routes an entry through a specific named account
         // from the worker's account index, not just the broker pool.
         // Absent means "use the legacy (pre-accounts) lookup".
-        Action::Enter => &["requires_preps", "vetos", "account"],
+        // `dry_run` short-circuits broker dispatch and logs the sizing
+        // inputs instead of placing the order.
+        Action::Enter => &["requires_preps", "vetos", "account", "dry_run"],
         // `clears` is optional on prep/veto — it lets an upstream prep
         // (like break-and-close) declare which downstream preps it
         // invalidates, fixing stale-prep ordering bugs. `account` is
