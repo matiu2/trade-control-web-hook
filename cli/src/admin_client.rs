@@ -1,7 +1,7 @@
 //! HTTP client for the worker's `/admin/accounts*` routes.
 //!
-//! Auth is the `X-Admin-Key` header, distinct from the `ENCRYPTION_KEY`
-//! used by `encrypt`/`status`/etc. — leaking the intent-auth key must
+//! Auth is the `X-Admin-Key` header, distinct from the `SIGNING_KEY`
+//! used by `sign`/`status`/etc. — leaking the intent-auth key must
 //! not let anyone mutate the account index.
 //!
 //! All four routes return plain-text / YAML bodies (no JSON parsing

@@ -319,7 +319,6 @@ mod tests {
             high: 1.1020,
             low: 1.0980,
             time: "2026-05-13T12:00:00Z".parse().unwrap(),
-            payload: "v1.dummy".into(),
         }
     }
 

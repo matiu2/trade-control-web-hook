@@ -1,5 +1,43 @@
 # TODO
 
+## Done — encryption retired; HMAC signing is the only auth
+
+The encrypted envelope path (ChaCha20-Poly1305 over a `v1.<base64>`
+payload) has been removed. Auth is now HMAC-SHA256 only, over the
+cleartext body, via the existing `core::sig` module and the
+`sign` / `verify` CLI verbs.
+
+What changed:
+
+- `core::crypto` module deleted. `parse_key_hex` / `KEY_LEN` moved to
+  `core::sig` since the byte format is shared.
+- `Shell.payload` removed.
+- `IncomingError::Decrypt` removed; `parse_and_verify` no longer
+  branches by envelope shape — every body is signed.
+- `Cmd::Encrypt`, `Cmd::Decrypt`, `EncryptArgs`, `DecryptArgs`,
+  `run_decrypt`, `extract_payload_blob`, `wrap_in_envelope`,
+  `build_yaml_template`, `build_yaml_control_body`, `encrypt_intent`
+  all deleted from the CLI. `EndpointArgs.signed` flag gone (always
+  signed).
+- `ENCRYPTION_KEY` worker secret renamed to `SIGNING_KEY`. The diag
+  routes' `X-Diag-Key` header now compares against `SIGNING_KEY` too.
+- `chacha20poly1305` dropped from `core/Cargo.toml`.
+
+Migration for the deployed worker:
+
+1. `wrangler secret put SIGNING_KEY < ~/.config/trade-control/key.hex`
+   (same bytes as the old `ENCRYPTION_KEY`).
+2. Deploy.
+3. `wrangler secret delete ENCRYPTION_KEY`.
+
+TradingView alert bodies that still use the encrypted format (top-level
+`payload: "v1.…"`) will fail with a sig error after deploy — regenerate
+them via `trade-control sign`. The user confirmed no live alerts in
+the pipeline carry the old format.
+
+269 tests pass after the cut (16 broker-oanda + 81 cli + 158 core +
+14 worker); clippy + fmt clean on host + wasm.
+
 ## Done — TradeNation session lifecycle (wasm-side login)
 
 The worker re-authenticates itself via per-account credentials stored

@@ -12,6 +12,9 @@ pub use resolution::MIN_R_FLOOR;
 pub use resolution::{Resolved, ResolvedEntry, RiskBudget};
 
 /// Plaintext outer YAML — the part TradingView substitutes `{{...}}` into.
+/// The intent fields sit alongside these at the top level of the signed
+/// body; the HMAC over the whole thing lives in a separate `sig` field
+/// (not modelled here — handled raw in `core::sig`).
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Shell {
     pub close: f64,
@@ -20,8 +23,6 @@ pub struct Shell {
     /// ISO-8601 timestamp from TradingView. Used as an upper bound on the
     /// alert's freshness — alerts from yesterday should be obvious.
     pub time: DateTime<Utc>,
-    /// Opaque encrypted blob.
-    pub payload: String,
 }
 
 /// The fully-decrypted intent. `v` lets us reject future protocol versions cleanly.
@@ -333,7 +334,6 @@ mod tests {
             high: 1.1020,
             low: 1.0980,
             time: "2026-05-13T12:00:00Z".parse().unwrap(),
-            payload: "v1.dummy".into(),
         }
     }
 

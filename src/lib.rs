@@ -16,9 +16,9 @@ use crate::tradenation_adapter::TradeNationAdapter;
 use broker_oanda::login as oanda_login;
 use serde::Serialize;
 use trade_control_core::broker::{Broker, EntryRequest};
-use trade_control_core::crypto;
 use trade_control_core::incoming::{self, parse_and_verify};
 use trade_control_core::intent::{Action, BrokerKind, Resolved, VetoLevel};
+use trade_control_core::sig;
 use trade_control_core::state::{
     StateStore, clear_named_preps, clear_named_vetos, veto_ttl_seconds,
 };
@@ -30,7 +30,7 @@ struct UnlockResponse {
     was_cooled_down: bool,
 }
 
-pub(crate) const ENCRYPTION_KEY_SECRET: &str = "ENCRYPTION_KEY";
+pub(crate) const SIGNING_KEY_SECRET: &str = "SIGNING_KEY";
 const MAX_RISK_PCT_PER_TRADE_SECRET: &str = "MAX_RISK_PCT_PER_TRADE";
 const MAX_OPEN_POSITIONS_SECRET: &str = "MAX_OPEN_POSITIONS";
 const PIP_SIZE_SECRET_PREFIX: &str = "PIP_SIZE_";
@@ -58,7 +58,7 @@ pub async fn main(mut req: Request, env: Env, _ctx: Context) -> Result<Response>
 
     // Admin write routes — POST/DELETE, gated by X-Admin-Key. Handled
     // before the intent body parser because their bodies (JSON for
-    // POST) don't follow the encrypted-envelope shape.
+    // POST) don't follow the signed-body shape.
     let path = req.path();
     if path.starts_with("/admin/") {
         return route_admin(&mut req, &env, &path).await;
@@ -66,17 +66,17 @@ pub async fn main(mut req: Request, env: Env, _ctx: Context) -> Result<Response>
 
     let yaml = req.text().await?;
 
-    let key_hex = match get_secret(ENCRYPTION_KEY_SECRET, &env) {
+    let key_hex = match get_secret(SIGNING_KEY_SECRET, &env) {
         Some(s) => s,
         None => {
-            console_error!("missing required secret: {ENCRYPTION_KEY_SECRET}");
+            console_error!("missing required secret: {SIGNING_KEY_SECRET}");
             return Response::error("server misconfigured", 500);
         }
     };
-    let key = match crypto::parse_key_hex(&key_hex) {
+    let key = match sig::parse_key_hex(&key_hex) {
         Ok(k) => k,
         Err(err) => {
-            console_error!("ENCRYPTION_KEY is not valid hex: {err}");
+            console_error!("SIGNING_KEY is not valid hex: {err}");
             return Response::error("server misconfigured", 500);
         }
     };

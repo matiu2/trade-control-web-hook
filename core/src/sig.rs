@@ -60,6 +60,20 @@ const UNSIGNED_VALUE_KEYS: &[&str] = &["close", "high", "low", "time"];
 /// Field name on the wire that holds the signature itself.
 pub const SIG_FIELD: &str = "sig";
 
+/// 32-byte HMAC key length.
+pub const KEY_LEN: usize = 32;
+
+/// Parse a 64-hex-char string into a 32-byte signing key. Trimmed of
+/// whitespace; either case is accepted. Used by both the CLI (when
+/// loading `key.hex`) and the worker (when reading the `SIGNING_KEY`
+/// secret).
+pub fn parse_key_hex(s: &str) -> Result<[u8; KEY_LEN], SigError> {
+    let trimmed = s.trim();
+    let bytes = hex::decode(trimmed).map_err(|_| SigError::BadKeyLen)?;
+    let arr: [u8; KEY_LEN] = bytes.try_into().map_err(|_| SigError::BadKeyLen)?;
+    Ok(arr)
+}
+
 #[derive(Debug)]
 pub enum SigError {
     BadKeyLen,
@@ -177,6 +191,23 @@ mod tests {
     use super::*;
 
     const KEY: [u8; 32] = [7u8; 32];
+
+    #[test]
+    fn parse_key_hex_round_trip() {
+        let key = [0x42u8; KEY_LEN];
+        let hex_str = hex::encode(key);
+        assert_eq!(parse_key_hex(&hex_str).unwrap(), key);
+    }
+
+    #[test]
+    fn parse_key_hex_rejects_wrong_length() {
+        assert!(parse_key_hex("dead").is_err());
+    }
+
+    #[test]
+    fn parse_key_hex_rejects_non_hex() {
+        assert!(parse_key_hex("not-hex-at-all-not-hex-at-all-not-hex-at-all-not-hex").is_err());
+    }
 
     fn pairs() -> Vec<(String, String)> {
         vec![

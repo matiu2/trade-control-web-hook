@@ -1,15 +1,16 @@
-//! Helpers for building `status` / `unlock` control envelopes from CLI args.
+//! Helpers for building `status` / `unlock` control intents and signed
+//! bodies from CLI args.
 //!
-//! TradingView is not in the loop for these — the CLI POSTs them directly.
-//! The shell fields are still required by the worker's parser, so we fill
-//! them with concrete zero values plus a real timestamp.
+//! TradingView is not in the loop for these — the CLI POSTs them
+//! directly. The shell fields are still required by the worker's
+//! parser, so we fill them with concrete zero values plus a real
+//! timestamp.
 
 use chrono::{DateTime, Duration, Utc};
 use color_eyre::eyre::{Result, eyre};
 
-use crate::{build_yaml_control_body, encrypt_intent};
-use trade_control_core::crypto::KEY_LEN;
 use trade_control_core::intent::{Action, BrokerKind, Intent, VetoLevel};
+use trade_control_core::sig::KEY_LEN;
 
 /// How long a control envelope stays valid. Short — these are one-shot
 /// commands run by hand, so we don't need a long replay window.
@@ -149,27 +150,11 @@ pub fn build_clear_veto_intent(
     intent
 }
 
-/// Serialise the intent as YAML, encrypt under `key`, and wrap in the
-/// hybrid plaintext-shell envelope the worker expects.
-pub fn wrap_in_envelope(
-    intent: &Intent,
-    key: &[u8; KEY_LEN],
-    now: DateTime<Utc>,
-) -> Result<String> {
-    let plaintext = serde_yaml::to_string(intent).map_err(|e| eyre!("serialise intent: {e}"))?;
-    let blob = encrypt_intent(key, plaintext.as_bytes())?;
-    Ok(build_yaml_control_body(&blob, now))
-}
-
-/// Build the *signed* wire body for control-path intents (status,
+/// Build the signed wire body for control-path intents (status,
 /// unlock, prep, veto, clear-prep, clear-veto). The intent fields go at
 /// the top level next to the shell fields, and a `sig:` line is appended
 /// at the bottom. The shell carries concrete zeros + `now` — TradingView
-/// isn't in this loop.
-///
-/// Equivalent to [`wrap_in_envelope`] but using the cleartext + signed
-/// format (see `core::sig`). Operators get a readable Cloudflare request
-/// log; tampering still rejected.
+/// isn't in this loop. See `core::sig` for the canonical form.
 pub fn wrap_signed(intent: &Intent, key: &[u8; KEY_LEN], now: DateTime<Utc>) -> Result<String> {
     build_signed_body(intent, key, &shell_for_control(now))
 }
@@ -379,16 +364,16 @@ mod tests {
     }
 
     #[test]
-    fn envelope_contains_concrete_shell_and_payload() {
+    fn signed_control_body_contains_concrete_shell_and_sig() {
         let key = [0u8; KEY_LEN];
         let intent = build_status_intent(t(), "ab12");
-        let body = wrap_in_envelope(&intent, &key, t()).unwrap();
+        let body = wrap_signed(&intent, &key, t()).unwrap();
         // Shell must be concrete (no TradingView placeholders).
         assert!(body.contains("close: 0"), "body was:\n{body}");
         assert!(body.contains("high: 0"), "body was:\n{body}");
         assert!(body.contains("low: 0"), "body was:\n{body}");
         assert!(body.contains("time:"), "body was:\n{body}");
         assert!(!body.contains("{{close}}"), "body was:\n{body}");
-        assert!(body.contains("payload: \"v1."), "body was:\n{body}");
+        assert!(body.contains("sig: \"v1-sig."), "body was:\n{body}");
     }
 }

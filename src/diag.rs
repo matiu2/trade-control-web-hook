@@ -1,6 +1,6 @@
 //! Read-only diagnostic endpoints. Gated by an `X-Diag-Key` header
-//! whose value must equal the `ENCRYPTION_KEY` secret (re-used so
-//! there's only one secret to manage).
+//! whose value must equal the `SIGNING_KEY` secret (re-used so
+//! there's only one intent-auth secret to manage).
 //!
 //! Routes:
 //!
@@ -18,18 +18,18 @@
 
 use worker::{Env, Request, Response, Result, console_error, console_log};
 
-use crate::{ENCRYPTION_KEY_SECRET, acquire_tn_broker, get_secret};
+use crate::{SIGNING_KEY_SECRET, acquire_tn_broker, get_secret};
 
 const DIAG_KEY_HEADER: &str = "X-Diag-Key";
 
-/// True when the request authenticated against the `ENCRYPTION_KEY`
+/// True when the request authenticated against the `SIGNING_KEY`
 /// secret via the `X-Diag-Key` header.
 fn diag_key_ok(req: &Request, env: &Env) -> bool {
     let provided = match req.headers().get(DIAG_KEY_HEADER) {
         Ok(Some(v)) => v,
         _ => return false,
     };
-    let expected = match get_secret(ENCRYPTION_KEY_SECRET, env) {
+    let expected = match get_secret(SIGNING_KEY_SECRET, env) {
         Some(s) => s,
         None => return false,
     };

@@ -1,8 +1,8 @@
 //! Admin routes for the first-class account system.
 //!
 //! Gated by an `X-Admin-Key` header whose value must equal the
-//! `ADMIN_KEY` secret. Distinct from `ENCRYPTION_KEY` (intent auth)
-//! and the diag key (which today reuses `ENCRYPTION_KEY`) — credential
+//! `ADMIN_KEY` secret. Distinct from `SIGNING_KEY` (intent auth)
+//! and the diag key (which today reuses `SIGNING_KEY`) — credential
 //! write paths get their own auth so a leaked diag/intent key can't
 //! pivot into account mutation.
 //!

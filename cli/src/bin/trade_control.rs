@@ -1,14 +1,16 @@
 //! CLI for the trade-control webhook.
 //!
 //! Subcommands:
-//!   - `gen-key` — mint a fresh 32-byte key, print as hex on stdout.
-//!   - `encrypt` — read an intent template (YAML), interactively prompt for
-//!     any missing required fields, then emit the YAML alert body with
-//!     TradingView `{{...}}` placeholders for the plaintext shell.
-//!   - `status` — POST a control envelope to the deployed worker and print
-//!     its YAML snapshot of cooldowns + recent seen ids.
-//!   - `unlock <INSTRUMENT>` — POST a control envelope that clears the
-//!     cooldown for one instrument.
+//!   - `gen-key` — mint a fresh 32-byte signing key, print as hex on stdout.
+//!   - `sign` — read an intent template (YAML), interactively prompt for
+//!     any missing required fields, then emit the cleartext signed YAML
+//!     alert body with TradingView `{{...}}` placeholders for the shell.
+//!   - `verify` — recompute the HMAC over a signed body to confirm
+//!     what arrived on the worker.
+//!   - `status` — POST a signed control body to the deployed worker and
+//!     print its YAML snapshot of cooldowns + recent seen ids.
+//!   - `unlock <INSTRUMENT>` — POST a signed control body that clears
+//!     the cooldown for one instrument.
 
 use std::fs;
 use std::io::{self, Read};
@@ -21,16 +23,14 @@ use clap_complete::{Shell, generate};
 use color_eyre::eyre::{Context, Result, eyre};
 use trade_control_cli::{
     KEY_LEN, add_account, build_clear_prep_intent, build_clear_veto_intent, build_prep_intent,
-    build_status_intent, build_unlock_intent, build_veto_intent, build_yaml_template,
-    delete_account, delete_secret, encrypt_intent, fill_missing_fields, generate_key_hex,
-    list_accounts, pick_template_interactive, prompt_save_as_template, put_secret, record_prep_use,
-    record_veto_use, secret_binding_for, test_account, wrap_in_envelope, wrap_signed,
-    wrap_signed_template,
+    build_status_intent, build_unlock_intent, build_veto_intent, delete_account, delete_secret,
+    fill_missing_fields, generate_key_hex, list_accounts, pick_template_interactive,
+    prompt_save_as_template, put_secret, record_prep_use, record_veto_use, secret_binding_for,
+    test_account, wrap_signed, wrap_signed_template,
 };
 use trade_control_core::account::{
     AccountKind, AccountMetadata, Credentials, OandaCreds, TradeNationCreds, TradeNationKind,
 };
-use trade_control_core::crypto;
 use trade_control_core::incoming::signed_pairs_from_text;
 use trade_control_core::intent::Intent;
 use trade_control_core::intent::{BrokerKind, VetoLevel};
@@ -39,7 +39,7 @@ use trade_control_core::sig::{self, SIG_FIELD};
 #[derive(Parser)]
 #[command(
     name = "trade-control",
-    about = "Encrypt a trade intent for TradingView and manage worker state"
+    about = "Sign a trade intent for TradingView and manage worker state"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -48,16 +48,13 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Generate a fresh 32-byte key as 64 hex characters.
+    /// Generate a fresh 32-byte signing key as 64 hex characters.
     GenKey,
-    /// Encrypt an intent YAML template into the YAML alert body.
-    /// The body is opaque on the wire; debugging requires `decrypt`.
-    Encrypt(EncryptArgs),
-    /// Sign an intent YAML template into a *cleartext* YAML alert body.
+    /// Sign an intent YAML template into a cleartext YAML alert body.
     /// Intent fields are readable in TradingView and in Cloudflare's
     /// request log; authentication is HMAC-SHA256 over the body. Pair
     /// with `verify` to inspect what arrived on the worker.
-    Sign(EncryptArgs),
+    Sign(SignArgs),
     /// Query the deployed worker's cooldown / recent-seen state.
     Status(EndpointArgs),
     /// Clear the cooldown for one instrument on the deployed worker.
@@ -70,15 +67,10 @@ enum Cmd {
     ClearPrep(ClearPrepCmdArgs),
     /// Clear a single veto flag.
     ClearVeto(ClearVetoCmdArgs),
-    /// Decrypt a `v1.<base64>` payload back to the plaintext intent YAML.
-    /// Accepts either the bare `v1.…` blob as a positional, the full
-    /// YAML alert body on stdin, or a `--file` path. Useful for inspecting
-    /// what TradingView actually sent.
-    Decrypt(DecryptArgs),
-    /// Verify a signed (cleartext) body. Reads the YAML body from a
-    /// positional, `--file`, or stdin, recomputes the HMAC, and prints
-    /// the body with a `# verified` marker on success. Exit code is
-    /// non-zero on signature mismatch.
+    /// Verify a signed body. Reads the YAML body from a positional,
+    /// `--file`, or stdin, recomputes the HMAC, and prints the body
+    /// with a `# verified` marker on success. Exit code is non-zero
+    /// on signature mismatch.
     Verify(VerifyArgs),
     /// Manage first-class accounts on the deployed worker. Talks to the
     /// `/admin/accounts*` routes; auth is `--admin-key-file` (distinct
@@ -233,19 +225,13 @@ impl From<AccountKindArg> for TradeNationKind {
 
 #[derive(Parser)]
 struct EndpointArgs {
-    /// Path to a hex-encoded 32-byte key.
+    /// Path to a hex-encoded 32-byte signing key.
     #[arg(long, env = "TRADE_CONTROL_KEY_FILE")]
     key_file: PathBuf,
     /// Worker URL (e.g. https://trade-control.<account>.workers.dev).
     /// Falls back to `TRADE_CONTROL_ENDPOINT`.
     #[arg(long, env = "TRADE_CONTROL_ENDPOINT")]
     endpoint: String,
-    /// Use the signed (cleartext) wire format instead of encrypted.
-    /// Cleartext means the intent shows up in Cloudflare's request log
-    /// — easier debugging at the cost of revealing the intent body.
-    /// Authentication is unchanged (HMAC-SHA256 over the body).
-    #[arg(long, default_value_t = false)]
-    signed: bool,
 }
 
 #[derive(Parser)]
@@ -351,23 +337,8 @@ struct VerifyArgs {
 }
 
 #[derive(Parser)]
-struct DecryptArgs {
-    /// Path to a hex-encoded 32-byte key.
-    #[arg(long, env = "TRADE_CONTROL_KEY_FILE")]
-    key_file: PathBuf,
-    /// Path to a file containing either the bare `v1.…` blob or the
-    /// full YAML alert body. If omitted and no positional `blob` is
-    /// given, stdin is read.
-    #[arg(long)]
-    file: Option<PathBuf>,
-    /// The encrypted payload as a `v1.<base64>` blob, OR the full YAML
-    /// alert body containing a `payload: "v1.…"` line. Quote it.
-    blob: Option<String>,
-}
-
-#[derive(Parser)]
-struct EncryptArgs {
-    /// Path to a hex-encoded 32-byte key.
+struct SignArgs {
+    /// Path to a hex-encoded 32-byte signing key.
     #[arg(long, env = "TRADE_CONTROL_KEY_FILE")]
     key_file: PathBuf,
     /// Path to the intent template (YAML). If omitted, fuzzy-pick from
@@ -388,15 +359,13 @@ fn main() -> Result<()> {
             let hex_key = generate_key_hex();
             println!("{hex_key}");
         }
-        Cmd::Encrypt(args) => run_encrypt_or_sign(args, false)?,
-        Cmd::Sign(args) => run_encrypt_or_sign(args, true)?,
+        Cmd::Sign(args) => run_sign(args)?,
         Cmd::Status(args) => run_status(args)?,
         Cmd::Unlock(args) => run_unlock(args)?,
         Cmd::Prep(args) => run_prep(args)?,
         Cmd::Veto(args) => run_veto(args)?,
         Cmd::ClearPrep(args) => run_clear_prep(args)?,
         Cmd::ClearVeto(args) => run_clear_veto(args)?,
-        Cmd::Decrypt(args) => run_decrypt(args)?,
         Cmd::Verify(args) => run_verify(args)?,
         Cmd::Account(sub) => run_account(sub)?,
         Cmd::Completions { shell } => run_completions(shell),
@@ -444,70 +413,6 @@ fn run_verify(args: VerifyArgs) -> Result<()> {
     Ok(())
 }
 
-fn run_decrypt(args: DecryptArgs) -> Result<()> {
-    let key = load_key(&args.key_file)?;
-    let raw = match (args.blob, args.file) {
-        (Some(b), _) => b,
-        (None, Some(path)) => {
-            fs::read_to_string(&path).with_context(|| format!("reading input {path:?}"))?
-        }
-        (None, None) => {
-            let mut buf = String::new();
-            io::stdin()
-                .read_to_string(&mut buf)
-                .context("reading stdin")?;
-            buf
-        }
-    };
-    let blob = extract_payload_blob(&raw)?;
-    let plain = crypto::decrypt(&key, &blob).map_err(|e| eyre!("decrypt: {e}"))?;
-    let text = String::from_utf8(plain).context("plaintext is not valid UTF-8")?;
-    print!("{text}");
-    if !text.ends_with('\n') {
-        println!();
-    }
-    Ok(())
-}
-
-/// Pull a `v1.<base64>` blob out of either a bare string or a YAML body
-/// with a `payload: "v1.…"` field. Trims whitespace and surrounding quotes.
-fn extract_payload_blob(input: &str) -> Result<String> {
-    let trimmed = input.trim();
-    if trimmed.starts_with("v1.") {
-        return Ok(strip_quotes(trimmed).to_string());
-    }
-    // Try YAML — pull the `payload` field.
-    if let Ok(serde_yaml::Value::Mapping(map)) = serde_yaml::from_str::<serde_yaml::Value>(trimmed)
-        && let Some(v) = map.get(serde_yaml::Value::String("payload".to_string()))
-        && let Some(s) = v.as_str()
-        && s.starts_with("v1.")
-    {
-        return Ok(s.to_string());
-    }
-    // Fallback: scan line-by-line for `payload:` so a body with TradingView
-    // `{{close}}` placeholders (which aren't valid YAML scalars) still works.
-    for line in trimmed.lines() {
-        let line = line.trim();
-        if let Some(rest) = line.strip_prefix("payload:") {
-            let val = strip_quotes(rest.trim());
-            if val.starts_with("v1.") {
-                return Ok(val.to_string());
-            }
-        }
-    }
-    Err(eyre!(
-        "no `v1.<base64>` payload found in input; pass the blob as a positional, --file, or pipe the YAML body in on stdin"
-    ))
-}
-
-fn strip_quotes(s: &str) -> &str {
-    let s = s.trim();
-    s.strip_prefix('"')
-        .and_then(|s| s.strip_suffix('"'))
-        .or_else(|| s.strip_prefix('\'').and_then(|s| s.strip_suffix('\'')))
-        .unwrap_or(s)
-}
-
 fn load_key(path: &PathBuf) -> Result<[u8; KEY_LEN]> {
     let key_hex = fs::read_to_string(path).with_context(|| format!("reading key file {path:?}"))?;
     let key_bytes = hex::decode(key_hex.trim()).context("decoding hex key")?;
@@ -523,19 +428,13 @@ fn fresh_suffix() -> Result<String> {
     Ok(hex::encode(bytes))
 }
 
-/// Wrap a control intent in either the encrypted or signed envelope
-/// depending on the `--signed` flag.
+/// Wrap a control intent in a signed body for the worker.
 fn wrap_control(
     intent: &Intent,
     key: &[u8; KEY_LEN],
     now: chrono::DateTime<chrono::Utc>,
-    signed: bool,
 ) -> Result<String> {
-    if signed {
-        wrap_signed(intent, key, now).map_err(|e| eyre!("wrap-signed: {e}"))
-    } else {
-        wrap_in_envelope(intent, key, now).map_err(|e| eyre!("wrap-envelope: {e}"))
-    }
+    wrap_signed(intent, key, now).map_err(|e| eyre!("wrap-signed: {e}"))
 }
 
 fn post_control(endpoint: &str, body: &str) -> Result<String> {
@@ -562,7 +461,7 @@ fn run_status(args: EndpointArgs) -> Result<()> {
     let now = Utc::now();
     let suffix = fresh_suffix()?;
     let intent = build_status_intent(now, &suffix);
-    let body = wrap_control(&intent, &key, now, args.signed)?;
+    let body = wrap_control(&intent, &key, now)?;
     let response = post_control(&args.endpoint, &body)?;
     print!("{response}");
     Ok(())
@@ -573,7 +472,7 @@ fn run_unlock(args: UnlockCmdArgs) -> Result<()> {
     let now = Utc::now();
     let suffix = fresh_suffix()?;
     let intent = build_unlock_intent(&args.instrument, now, &suffix);
-    let body = wrap_control(&intent, &key, now, args.common.signed)?;
+    let body = wrap_control(&intent, &key, now)?;
     let response = post_control(&args.common.endpoint, &body)?;
     print!("{response}");
     Ok(())
@@ -591,7 +490,7 @@ fn run_prep(args: PrepCmdArgs) -> Result<()> {
         now,
         &suffix,
     );
-    let body = wrap_control(&intent, &key, now, args.common.signed)?;
+    let body = wrap_control(&intent, &key, now)?;
     let response = post_control(&args.common.endpoint, &body)?;
     record_prep_use(&args.step);
     // Also remember names from --clears so they suggest next time —
@@ -622,7 +521,7 @@ fn run_veto(args: VetoCmdArgs) -> Result<()> {
         now,
         &suffix,
     );
-    let body = wrap_control(&intent, &key, now, args.common.signed)?;
+    let body = wrap_control(&intent, &key, now)?;
     let response = post_control(&args.common.endpoint, &body)?;
     record_veto_use(&args.name);
     for c in &args.clears {
@@ -637,7 +536,7 @@ fn run_clear_prep(args: ClearPrepCmdArgs) -> Result<()> {
     let now = Utc::now();
     let suffix = fresh_suffix()?;
     let intent = build_clear_prep_intent(&args.instrument, &args.step, now, &suffix);
-    let body = wrap_control(&intent, &key, now, args.common.signed)?;
+    let body = wrap_control(&intent, &key, now)?;
     let response = post_control(&args.common.endpoint, &body)?;
     print!("{response}");
     Ok(())
@@ -648,15 +547,17 @@ fn run_clear_veto(args: ClearVetoCmdArgs) -> Result<()> {
     let now = Utc::now();
     let suffix = fresh_suffix()?;
     let intent = build_clear_veto_intent(&args.instrument, &args.name, now, &suffix);
-    let body = wrap_control(&intent, &key, now, args.common.signed)?;
+    let body = wrap_control(&intent, &key, now)?;
     let response = post_control(&args.common.endpoint, &body)?;
     print!("{response}");
     Ok(())
 }
 
-/// Shared body of the `encrypt` and `sign` subcommands. `sign = true`
-/// emits the cleartext signed wire format; otherwise the encrypted blob.
-fn run_encrypt_or_sign(args: EncryptArgs, sign_mode: bool) -> Result<()> {
+/// Read an intent template, fill in any missing required fields
+/// (interactively unless `--non-interactive`), then emit the cleartext
+/// signed YAML alert body with TradingView `{{...}}` placeholders for
+/// the shell.
+fn run_sign(args: SignArgs) -> Result<()> {
     let key = load_key(&args.key_file)?;
 
     let template_path = match args.template {
@@ -690,19 +591,13 @@ fn run_encrypt_or_sign(args: EncryptArgs, sign_mode: bool) -> Result<()> {
         prompt_save_as_template(&completed)?;
     }
 
-    if sign_mode {
-        // Deserialise into a typed Intent so wrap_signed_template can
-        // serialise it back through the standard path. This also catches
-        // intent-validation issues before the user pastes the body.
-        let intent: Intent =
-            serde_yaml::from_str(&completed).context("completed intent does not parse")?;
-        let body = wrap_signed_template(&intent, &key)?;
-        print!("{body}");
-    } else {
-        let blob = encrypt_intent(&key, completed.as_bytes())?;
-        let yaml = build_yaml_template(&blob);
-        print!("{yaml}");
-    }
+    // Deserialise into a typed Intent so wrap_signed_template serialises
+    // it back through the standard path. This also catches
+    // intent-validation issues before the user pastes the body.
+    let intent: Intent =
+        serde_yaml::from_str(&completed).context("completed intent does not parse")?;
+    let body = wrap_signed_template(&intent, &key)?;
+    print!("{body}");
     Ok(())
 }
 
@@ -869,46 +764,4 @@ fn run_account_add(args: AccountAddArgs) -> Result<()> {
     }
 
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    const BLOB: &str = "v1.iiLvZCndSf+I3toNPFOtMDQixC2eMYO2TovfKKgepdIW";
-
-    #[test]
-    fn extract_payload_from_bare_blob() {
-        assert_eq!(extract_payload_blob(BLOB).unwrap(), BLOB);
-    }
-
-    #[test]
-    fn extract_payload_from_bare_blob_with_whitespace() {
-        let padded = format!("  \n{BLOB}\n  ");
-        assert_eq!(extract_payload_blob(&padded).unwrap(), BLOB);
-    }
-
-    #[test]
-    fn extract_payload_from_yaml_body() {
-        let yaml = format!(
-            "close: 1.23\nhigh: 1.24\nlow: 1.22\ntime: \"2026-05-18T00:00:00Z\"\npayload: \"{BLOB}\"\n"
-        );
-        assert_eq!(extract_payload_blob(&yaml).unwrap(), BLOB);
-    }
-
-    #[test]
-    fn extract_payload_from_tradingview_template_with_placeholders() {
-        // Body still has `{{close}}` placeholders — not valid YAML — but
-        // the line-scan fallback should still pull payload out.
-        let yaml = format!(
-            "close: {{{{close}}}}\nhigh: {{{{high}}}}\nlow: {{{{low}}}}\ntime: \"{{{{time}}}}\"\npayload: \"{BLOB}\"\n"
-        );
-        assert_eq!(extract_payload_blob(&yaml).unwrap(), BLOB);
-    }
-
-    #[test]
-    fn extract_payload_rejects_missing_payload() {
-        let yaml = "close: 1\nhigh: 2\nlow: 0\ntime: \"now\"\n";
-        assert!(extract_payload_blob(yaml).is_err());
-    }
 }
