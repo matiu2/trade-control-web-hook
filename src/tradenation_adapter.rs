@@ -18,6 +18,7 @@ impl Broker for TradeNationAdapter {
         max_open_positions: u32,
         req: &EntryRequest<'_>,
     ) -> Result<String, EntryError> {
+        check_min_position_size(req.risk, req.min_position_size)?;
         let upstream_req = broker_tradenation::EntryRequest {
             instrument: req.instrument,
             direction: to_upstream_direction(req.direction),
@@ -71,6 +72,16 @@ fn to_upstream_entry(e: &ResolvedEntry) -> broker_tradenation::ResolvedEntry {
     }
 }
 
+/// Client-side floor for `RiskBudget::Units`. Other risk modes compute
+/// units inside the broker (post equity / FX); their floor is the
+/// broker's own minimum surfaced as `UnitsBelowMinimum`.
+fn check_min_position_size(risk: RiskBudget, min: Option<f64>) -> Result<(), EntryError> {
+    match (risk, min) {
+        (RiskBudget::Units(s), Some(min)) if s < min => Err(EntryError::UnitsBelowMinimum),
+        _ => Ok(()),
+    }
+}
+
 fn from_upstream_error(e: broker_tradenation::EntryError) -> EntryError {
     use broker_tradenation::EntryError as U;
     match e {
@@ -80,5 +91,45 @@ fn from_upstream_error(e: broker_tradenation::EntryError) -> EntryError {
         U::OpenPositionsCapExceeded => EntryError::OpenPositionsCapExceeded,
         U::UnitsBelowMinimum => EntryError::UnitsBelowMinimum,
         U::OrderRejected => EntryError::OrderRejected,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn units_below_min_rejects() {
+        let err = check_min_position_size(RiskBudget::Units(4.0), Some(5.0)).unwrap_err();
+        assert!(matches!(err, EntryError::UnitsBelowMinimum));
+    }
+
+    #[test]
+    fn units_at_min_passes() {
+        // Strictly less-than — equal to the floor is allowed.
+        check_min_position_size(RiskBudget::Units(5.0), Some(5.0)).unwrap();
+    }
+
+    #[test]
+    fn units_above_min_passes() {
+        check_min_position_size(RiskBudget::Units(10.0), Some(5.0)).unwrap();
+    }
+
+    #[test]
+    fn no_floor_means_no_check() {
+        check_min_position_size(RiskBudget::Units(0.0001), None).unwrap();
+    }
+
+    #[test]
+    fn percent_mode_skips_floor() {
+        // Floor only applies to explicit Units mode — Percent/Amount
+        // get their floor from the broker's own UnitsBelowMinimum
+        // after sizing computes a unit count.
+        check_min_position_size(RiskBudget::Percent(0.5), Some(100.0)).unwrap();
+    }
+
+    #[test]
+    fn amount_mode_skips_floor() {
+        check_min_position_size(RiskBudget::Amount(1.0), Some(100.0)).unwrap();
     }
 }

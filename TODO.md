@@ -169,15 +169,19 @@ Steps:
       implicit R; works for both brokers. 279 tests pass (77 cli,
       167 core, 16 broker-oanda, 14 worker, 5 cli-bin); clippy +
       fmt clean on host + wasm.
-- [ ] **Step 6: extend `AccountCaps`.** One remaining live-focused
-      field:
-      - `min_position_size` (optional) — refuse entries that would
-        place fewer units than this. Useful on live where the broker's
-        own minimum is too small to absorb spread + slippage
-        profitably.
-      `risk_mode` is now an intent-level field (see above) rather
-      than an account cap; the per-account "ceiling" is still the
-      single `max_risk_pct` cap, applied uniformly to both modes.
+- [x] **Step 6: extend `AccountCaps` with `min_position_size`.**
+      Done. New optional `min_position_size: Option<f64>` field on
+      `AccountCaps`, surfaced via `--min-position-size` on `account
+      add`. Worker loads `meta.caps.min_position_size` from
+      `KvMetadataStore` and threads it through `EntryRequest`. Both
+      brokers (TN adapter + OANDA `place_entry`) enforce the floor
+      against explicit `RiskBudget::Units(s)` — `s < min` returns
+      `UnitsBelowMinimum` before the broker is called. `Percent` /
+      `Amount` modes skip the client floor because they compute
+      units after equity/FX lookup; the broker's own
+      `UnitsBelowMinimum` covers them. 276 tests pass (16
+      broker-oanda + 81 cli + 159 core + 20 worker); clippy + fmt
+      clean on host + wasm.
 
 ## Done
 

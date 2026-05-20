@@ -419,6 +419,7 @@ async fn run_enter<B: Broker>(
             };
         }
     };
+    let caps = load_account_caps(env, verified.intent.account.as_deref()).await;
     let entry_request = EntryRequest {
         instrument: &resolved.instrument,
         direction: resolved.direction,
@@ -426,6 +427,7 @@ async fn run_enter<B: Broker>(
         stop_loss: resolved.stop_loss,
         take_profit: resolved.take_profit,
         risk: resolved.risk,
+        min_position_size: caps.min_position_size,
     };
 
     // Dry-run short-circuit: log the resolved sizing inputs and the
@@ -899,6 +901,46 @@ pub(crate) async fn acquire_tn_broker(
 #[cfg(target_arch = "wasm32")]
 fn tn_session_cache_key(account: &str) -> String {
     format!("tn:session:{account}")
+}
+
+/// Look up the per-account caps from the metadata store. Returns
+/// `AccountCaps::default()` (all `None`) when the account isn't named
+/// (OANDA path), when the KV binding is missing, or when the metadata
+/// lookup fails — caps are advisory tighteners, so a missing record
+/// just falls through to worker-wide defaults.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) async fn load_account_caps(
+    _env: &Env,
+    _account: Option<&str>,
+) -> trade_control_core::account::AccountCaps {
+    trade_control_core::account::AccountCaps::default()
+}
+
+#[cfg(target_arch = "wasm32")]
+pub(crate) async fn load_account_caps(
+    env: &Env,
+    account: Option<&str>,
+) -> trade_control_core::account::AccountCaps {
+    use trade_control_core::account::{AccountCaps, MetadataStore};
+
+    let Some(name) = account else {
+        return AccountCaps::default();
+    };
+    let kv = match env.kv(KV_NAMESPACE) {
+        Ok(kv) => kv,
+        Err(err) => {
+            console_error!("caps[{name}]: KV binding missing: {err:?}");
+            return AccountCaps::default();
+        }
+    };
+    let metadata = accounts::KvMetadataStore::new(kv);
+    match metadata.get(name).await {
+        Ok(m) => m.caps,
+        Err(err) => {
+            console_error!("caps[{name}]: metadata lookup failed: {err}");
+            AccountCaps::default()
+        }
+    }
 }
 
 /// Account-aware path. Looks up the metadata + credentials via the

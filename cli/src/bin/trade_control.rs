@@ -132,6 +132,12 @@ struct AccountAddArgs {
     /// Maximum simultaneous open positions for this account.
     #[arg(long)]
     max_open_positions: Option<u32>,
+    /// Client-side minimum position size, in instrument units. Entries
+    /// with `size_units` below this floor are rejected before reaching
+    /// the broker. Only enforced when an intent uses the explicit
+    /// `size_units` risk mode.
+    #[arg(long)]
+    min_position_size: Option<f64>,
     /// Skip the `wrangler secret put` step. Use when you've already set
     /// the credential secret manually, or you only want to write
     /// metadata first and provision credentials later.
@@ -682,6 +688,7 @@ fn run_account_add(args: AccountAddArgs) -> Result<()> {
     let caps = trade_control_core::account::AccountCaps {
         max_risk_pct: args.max_risk_pct,
         max_open_positions: args.max_open_positions,
+        min_position_size: args.min_position_size,
     };
     let metadata = AccountMetadata {
         name: args.name.clone(),

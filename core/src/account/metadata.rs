@@ -120,6 +120,7 @@ mod tests {
             caps: AccountCaps {
                 max_risk_pct: Some(0.25),
                 max_open_positions: Some(1),
+                min_position_size: None,
             },
         };
         let yaml = serde_yaml::to_string(&m).unwrap();
@@ -137,6 +138,7 @@ mod tests {
             caps: AccountCaps {
                 max_risk_pct: Some(0.25),
                 max_open_positions: Some(1),
+                min_position_size: None,
             },
         };
         let yaml = serde_yaml::to_string(&m).unwrap();
