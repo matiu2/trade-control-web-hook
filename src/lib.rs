@@ -172,6 +172,7 @@ pub async fn main(mut req: Request, env: Env, _ctx: Context) -> Result<Response>
             now,
             &outcome,
             ttl,
+            verified.intent.trade_id.as_deref(),
         )
         .await
     {
@@ -227,6 +228,7 @@ async fn mark_seen_and_return(
             now,
             outcome,
             ttl,
+            verified.intent.trade_id.as_deref(),
         )
         .await
     {
@@ -525,6 +527,7 @@ async fn record_seen(
             now,
             outcome,
             ttl,
+            verified.intent.trade_id.as_deref(),
         )
         .await
     {

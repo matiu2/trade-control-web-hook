@@ -129,6 +129,7 @@ impl StateStore for KvStateStore {
         seen_at: DateTime<Utc>,
         outcome: &str,
         ttl_seconds: u64,
+        trade_id: Option<&str>,
     ) -> Result<(), StateError> {
         let key = Self::seen_key(id);
         let ttl = ttl_seconds.max(MIN_TTL_SECONDS);
@@ -142,8 +143,9 @@ impl StateStore for KvStateStore {
 
         // Update the seen index. Best-effort; the TTL key above is the
         // authoritative replay-protection record. The index also carries
-        // action / seen_at / outcome so `status` can show what happened
-        // to each id rather than just listing bare expiry times.
+        // action / seen_at / outcome / trade_id so `status` can show
+        // what happened to each id rather than just listing bare expiry
+        // times.
         let expires_at = seen_at + chrono::Duration::seconds(ttl as i64);
         let mut entries = prune_expired(self.read_seen_index().await?, seen_at);
         // Drop any prior entry with the same id, then append.
@@ -154,6 +156,7 @@ impl StateStore for KvStateStore {
             seen_at: Some(seen_at),
             outcome: outcome.to_string(),
             expires_at,
+            trade_id: trade_id.map(str::to_string),
         });
         // Cap to the most recent N — keeps the index small.
         if entries.len() > SEEN_INDEX_CAP {

@@ -15,7 +15,7 @@
 
 use chrono::{DateTime, Utc};
 
-use crate::intent::{Intent, Shell};
+use crate::intent::{Intent, IntentValidationError, Shell};
 use crate::sig::{self, SIG_FIELD, SigError};
 
 #[derive(Debug)]
@@ -31,6 +31,10 @@ pub enum IncomingError {
     TooEarly,
     /// `now > not_after`.
     Expired,
+    /// Post-deser validation rejected the intent (e.g. malformed
+    /// `trade_id`). Carries the underlying reason so the operator can
+    /// see what failed without parsing free-form error text.
+    InvalidIntent(IntentValidationError),
 }
 
 impl core::fmt::Display for IncomingError {
@@ -43,6 +47,7 @@ impl core::fmt::Display for IncomingError {
             Self::StaleShellTime => f.write_str("plaintext time too far from now"),
             Self::TooEarly => f.write_str("intent not yet valid"),
             Self::Expired => f.write_str("intent expired"),
+            Self::InvalidIntent(e) => write!(f, "invalid intent: {e}"),
         }
     }
 }
@@ -114,6 +119,7 @@ pub fn parse_and_verify(
     };
 
     check_intent_freshness(&shell, &intent, now)?;
+    intent.validate().map_err(IncomingError::InvalidIntent)?;
     Ok(Verified { shell, intent })
 }
 
@@ -417,6 +423,55 @@ mod tests {
             parse_and_verify(&yaml, &KEY, now),
             Err(IncomingError::TooEarly)
         ));
+    }
+
+    #[test]
+    fn signed_path_invalid_trade_id_rejected() {
+        // Valid sig + valid timestamps, but the trade_id is junk —
+        // post-deser validation must reject it before the dispatch
+        // layer would record it in the seen-index.
+        let yaml = signed_body(&[
+            "close: 1.1000",
+            "high: 1.1020",
+            "low: 1.0980",
+            "time: \"2026-05-13T12:00:00Z\"",
+            "v: 1",
+            "action: status",
+            "instrument: ALL",
+            "id: status-bad-trade-id",
+            "not_after: \"2026-05-13T20:00:00Z\"",
+            "trade_id: BadCase",
+        ]);
+        let now: DateTime<Utc> = "2026-05-13T12:01:00Z".parse().unwrap();
+        assert!(matches!(
+            parse_and_verify(&yaml, &KEY, now),
+            Err(IncomingError::InvalidIntent(
+                crate::intent::IntentValidationError::InvalidTradeId
+            ))
+        ));
+    }
+
+    #[test]
+    fn signed_path_valid_trade_id_accepted() {
+        // The happy path: well-formed trade_id round-trips through
+        // parse_and_verify and lands on Verified intact.
+        let yaml = signed_body(&[
+            "close: 1.1000",
+            "high: 1.1020",
+            "low: 1.0980",
+            "time: \"2026-05-13T12:00:00Z\"",
+            "v: 1",
+            "action: prep",
+            "instrument: EUR_USD",
+            "id: prep-tid-ok",
+            "not_after: \"2026-05-13T20:00:00Z\"",
+            "step: retest",
+            "ttl_hours: 12",
+            "trade_id: eurusd-short-01jb2x",
+        ]);
+        let now: DateTime<Utc> = "2026-05-13T12:01:00Z".parse().unwrap();
+        let v = parse_and_verify(&yaml, &KEY, now).unwrap();
+        assert_eq!(v.intent.trade_id.as_deref(), Some("eurusd-short-01jb2x"));
     }
 
     #[test]

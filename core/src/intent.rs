@@ -156,6 +156,79 @@ pub struct Intent {
     /// field landed.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub clears: Vec<String>,
+    /// Optional grouping id. Every alert that the CLI emits as part of
+    /// one "trade" (e.g. an H&S template's 5 alerts: too-high veto,
+    /// trade-expiry veto, break-and-close prep, retest prep, enter)
+    /// shares the same `trade_id`. The worker uses it as a free-form
+    /// log/group correlator and will later expose it for bulk-cancel /
+    /// status-filter; no trade-level invariants are enforced at the
+    /// wire layer — every alert stands alone.
+    ///
+    /// Format is a slug: lowercase ASCII letters / digits / hyphens,
+    /// 1–64 chars, no leading or trailing hyphen, no consecutive
+    /// hyphens. Validation runs at parse time so junk doesn't end up
+    /// in the seen-index. Absent on the wire means "no group" and is
+    /// back-compatible with intents minted before this field landed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trade_id: Option<String>,
+}
+
+/// Maximum length of a `trade_id` slug. 64 chars is plenty for
+/// `<instrument>-<direction>-<short-random>` style ids and keeps the
+/// seen-index entry small.
+pub const TRADE_ID_MAX_LEN: usize = 64;
+
+/// Returns true if `s` is a valid `trade_id` slug: lowercase ASCII
+/// alphanumerics + hyphens, 1..=64 chars, no leading/trailing hyphen,
+/// no consecutive hyphens. Used by [`Intent::validate`] and by the CLI
+/// emitter (which mints the id) so both ends agree on the shape.
+pub fn is_valid_trade_id(s: &str) -> bool {
+    if s.is_empty() || s.len() > TRADE_ID_MAX_LEN {
+        return false;
+    }
+    if s.starts_with('-') || s.ends_with('-') {
+        return false;
+    }
+    if s.contains("--") {
+        return false;
+    }
+    s.chars()
+        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+}
+
+/// Error returned by [`Intent::validate`].
+#[derive(Debug, PartialEq, Eq)]
+pub enum IntentValidationError {
+    /// `trade_id` failed [`is_valid_trade_id`].
+    InvalidTradeId,
+}
+
+impl core::fmt::Display for IntentValidationError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::InvalidTradeId => f.write_str(
+                "invalid trade_id (must be 1-64 chars of lowercase alphanumerics + hyphens, \
+                 no leading/trailing or consecutive hyphens)",
+            ),
+        }
+    }
+}
+
+impl std::error::Error for IntentValidationError {}
+
+impl Intent {
+    /// Post-deserialise validation for fields that have a shape contract
+    /// beyond what serde can express. Called by the incoming-payload
+    /// pipeline; the field-by-field deser still works on its own so
+    /// round-trip tests don't need to go through this gate.
+    pub fn validate(&self) -> Result<(), IntentValidationError> {
+        if let Some(id) = &self.trade_id
+            && !is_valid_trade_id(id)
+        {
+            return Err(IntentValidationError::InvalidTradeId);
+        }
+        Ok(())
+    }
 }
 
 /// Which broker fulfils an intent. The serialised form is the
@@ -848,6 +921,125 @@ mod tests {
             vec!["break-and-close".to_string(), "retest".to_string()]
         );
         assert_eq!(intent.vetos, vec!["news-window".to_string()]);
+    }
+
+    #[test]
+    fn intent_defaults_trade_id_to_none() {
+        // Pre-existing intents on the wire don't carry `trade_id`; the
+        // field must be back-compatible.
+        let yaml = "
+            v: 1
+            id: t-1
+            not_after: \"2026-05-13T20:00:00Z\"
+            action: enter
+            instrument: EUR_USD
+            direction: long
+            entry: { type: market }
+            stop_loss: { from: low, offset_pips: -2 }
+            take_profit: { from: close, offset_r: 2.0 }
+            risk_pct: 0.5
+        ";
+        let intent: Intent = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(intent.trade_id, None);
+        intent.validate().unwrap();
+    }
+
+    #[test]
+    fn intent_parses_explicit_trade_id() {
+        let yaml = "
+            v: 1
+            id: t-2
+            not_after: \"2026-05-13T20:00:00Z\"
+            action: prep
+            instrument: EUR_USD
+            step: break-and-close
+            ttl_hours: 4
+            trade_id: eurusd-short-01jb2x
+        ";
+        let intent: Intent = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(intent.trade_id.as_deref(), Some("eurusd-short-01jb2x"));
+        intent.validate().unwrap();
+    }
+
+    #[test]
+    fn intent_trade_id_round_trips_through_yaml() {
+        let yaml = "
+            v: 1
+            id: t-3
+            not_after: \"2026-05-13T20:00:00Z\"
+            action: enter
+            instrument: EUR_USD
+            direction: long
+            entry: { type: market }
+            stop_loss: { from: low, offset_pips: -2 }
+            take_profit: { from: close, offset_r: 2.0 }
+            risk_pct: 0.5
+            trade_id: usdjpy-long-abc123
+        ";
+        let intent: Intent = serde_yaml::from_str(yaml).unwrap();
+        let back = serde_yaml::to_string(&intent).unwrap();
+        assert!(back.contains("trade_id: usdjpy-long-abc123"));
+    }
+
+    #[test]
+    fn intent_omits_trade_id_when_none() {
+        // Mirror of the `account` skip — keeps the wire form unchanged
+        // for pre-trade-grouping intents, so signed-mode replay paths
+        // see exactly the same bytes either side.
+        let yaml = "
+            v: 1
+            id: t-4
+            not_after: \"2026-05-13T20:00:00Z\"
+            action: status
+            instrument: ALL
+        ";
+        let intent: Intent = serde_yaml::from_str(yaml).unwrap();
+        let back = serde_yaml::to_string(&intent).unwrap();
+        assert!(!back.contains("trade_id"));
+    }
+
+    #[test]
+    fn is_valid_trade_id_accepts_typical_slugs() {
+        assert!(is_valid_trade_id("eurusd-short-01jb2x"));
+        assert!(is_valid_trade_id("a"));
+        assert!(is_valid_trade_id("usdjpy-long-abc123"));
+        assert!(is_valid_trade_id("h-and-s-1"));
+    }
+
+    #[test]
+    fn is_valid_trade_id_rejects_bad_shapes() {
+        assert!(!is_valid_trade_id("")); // empty
+        assert!(!is_valid_trade_id("-leading")); // leading hyphen
+        assert!(!is_valid_trade_id("trailing-")); // trailing hyphen
+        assert!(!is_valid_trade_id("double--hyphen")); // consecutive
+        assert!(!is_valid_trade_id("UPPER")); // uppercase
+        assert!(!is_valid_trade_id("has space")); // whitespace
+        assert!(!is_valid_trade_id("with_underscore")); // underscore
+        assert!(!is_valid_trade_id("dot.separator"));
+        // 65 chars — one past the limit
+        assert!(!is_valid_trade_id(&"a".repeat(65)));
+        // 64 chars — at the boundary, allowed
+        assert!(is_valid_trade_id(&"a".repeat(64)));
+    }
+
+    #[test]
+    fn intent_validate_rejects_bad_trade_id() {
+        // serde will happily parse any string into trade_id; the
+        // separate validate() step catches shape violations so junk
+        // ids don't end up in the seen-index.
+        let yaml = "
+            v: 1
+            id: t-bad
+            not_after: \"2026-05-13T20:00:00Z\"
+            action: status
+            instrument: ALL
+            trade_id: \"Bad Trade Id!\"
+        ";
+        let intent: Intent = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(
+            intent.validate(),
+            Err(IntentValidationError::InvalidTradeId)
+        );
     }
 
     #[test]

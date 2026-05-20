@@ -355,6 +355,7 @@ mod tests {
             vetos: Vec::new(),
             clears: Vec::new(),
             account: None,
+            trade_id: None,
         }
     }
 

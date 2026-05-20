@@ -50,6 +50,7 @@ fn control_skeleton(action: Action, instrument: &str, id: String, now: DateTime<
         vetos: Vec::new(),
         clears: Vec::new(),
         account: None,
+        trade_id: None,
     }
 }
 

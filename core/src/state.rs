@@ -46,6 +46,11 @@ pub struct SeenEntry {
     #[serde(default)]
     pub outcome: String,
     pub expires_at: DateTime<Utc>,
+    /// Trade grouping id stamped on the alert, when present. Lets
+    /// `status` filter by trade and (later) bulk-cancel by trade. None
+    /// for legacy entries and for alerts that opted out of grouping.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trade_id: Option<String>,
 }
 
 fn default_action() -> Action {
@@ -92,6 +97,9 @@ pub trait StateStore {
 
     /// Mark `id` as seen with a TTL in seconds, recording the action and
     /// outcome that ran on this id so `status` can show what happened.
+    /// `trade_id` is the optional grouping correlator stamped on the
+    /// incoming alert; stashed in the seen-index entry for later
+    /// status-filter / bulk-cancel work.
     fn mark_seen(
         &self,
         id: &str,
@@ -99,6 +107,7 @@ pub trait StateStore {
         seen_at: DateTime<Utc>,
         outcome: &str,
         ttl_seconds: u64,
+        trade_id: Option<&str>,
     ) -> impl Future<Output = Result<(), StateError>>;
 
     /// Delete the `seen:<id>` replay-protection record and prune the
@@ -395,6 +404,7 @@ mod memstore {
             seen_at: DateTime<Utc>,
             _outcome: &str,
             ttl_seconds: u64,
+            _trade_id: Option<&str>,
         ) -> Result<(), StateError> {
             self.put(format!("seen:{id}"), "1".into(), ttl_seconds, seen_at);
             Ok(())
@@ -561,6 +571,7 @@ mod tests {
             seen_at: None,
             outcome: String::new(),
             expires_at,
+            trade_id: None,
         }
     }
 
@@ -597,7 +608,8 @@ mod tests {
     fn memstore_forget_seen_removes_record() {
         use super::memstore::MemStateStore;
         let store = MemStateStore::new();
-        pollster::block_on(store.mark_seen("abc", Action::Prep, Utc::now(), "ok", 3600)).unwrap();
+        pollster::block_on(store.mark_seen("abc", Action::Prep, Utc::now(), "ok", 3600, None))
+            .unwrap();
         assert!(pollster::block_on(store.is_seen("abc")).unwrap());
         pollster::block_on(store.forget_seen("abc")).unwrap();
         assert!(!pollster::block_on(store.is_seen("abc")).unwrap());
@@ -618,8 +630,15 @@ mod tests {
 
         // Two preps; each had a corresponding `mark_seen` when its
         // intent first arrived.
-        pollster::block_on(store.mark_seen("retest-msg-id", Action::Prep, now, "ok", 24 * 3600))
-            .unwrap();
+        pollster::block_on(store.mark_seen(
+            "retest-msg-id",
+            Action::Prep,
+            now,
+            "ok",
+            24 * 3600,
+            None,
+        ))
+        .unwrap();
         pollster::block_on(store.set_prep("EUR_USD", "retest", now, 3600, "retest-msg-id"))
             .unwrap();
 
@@ -949,6 +968,7 @@ mod tests {
             seen_at: Some(ts("2026-05-15T18:00:00Z")),
             outcome: "rejected: cooled-down".into(),
             expires_at: ts("2026-05-16T03:33:01Z"),
+            trade_id: None,
         };
         let yaml = serde_yaml::to_string(&entry).unwrap();
         // Round-trip through serde to assert on the parsed shape rather
