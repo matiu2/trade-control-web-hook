@@ -1,13 +1,13 @@
 //! Adapt `broker-tradenation`'s inherent methods to `core::broker::Broker`.
 //!
 //! Upstream owns its own copies of `EntryRequest` / `Direction` / `ResolvedEntry`
-//! / `EntryError`, structurally identical to ours. We translate between them at
-//! the boundary so the worker dispatch can stay generic over [`Broker`].
+//! / `EntryError` / `RiskBudget`, structurally identical to ours. We translate
+//! between them at the boundary so the worker dispatch can stay generic over
+//! [`Broker`].
 
 use broker_tradenation::TradeNationBroker;
 use trade_control_core::broker::{Broker, EntryError, EntryRequest};
 use trade_control_core::intent::{Direction, ResolvedEntry, RiskBudget};
-use worker::console_error;
 
 pub struct TradeNationAdapter(pub TradeNationBroker);
 
@@ -18,36 +18,13 @@ impl Broker for TradeNationAdapter {
         max_open_positions: u32,
         req: &EntryRequest<'_>,
     ) -> Result<String, EntryError> {
-        // Upstream's `EntryRequest` only carries `risk_pct`. Threading
-        // `RiskBudget::Amount` through would mean bumping
-        // `broker-tradenation` (which fetches equity inside its own
-        // `place_entry`). Reject for now with a clear log — `dry_run`
-        // still works for amount-mode intents on TN since dispatch
-        // short-circuits before calling the broker.
-        let risk_pct = match req.risk {
-            RiskBudget::Percent(pct) => pct,
-            RiskBudget::Amount(_) => {
-                console_error!(
-                    "tradenation adapter: risk_amount not yet supported on TN — \
-                     use risk_pct, or wait for the broker-tradenation bump"
-                );
-                return Err(EntryError::OrderRejected);
-            }
-            RiskBudget::Units(_) => {
-                console_error!(
-                    "tradenation adapter: size_units not yet supported on TN — \
-                     use risk_pct, or wait for the broker-tradenation bump"
-                );
-                return Err(EntryError::OrderRejected);
-            }
-        };
         let upstream_req = broker_tradenation::EntryRequest {
             instrument: req.instrument,
             direction: to_upstream_direction(req.direction),
             entry: to_upstream_entry(&req.entry),
             stop_loss: req.stop_loss,
             take_profit: req.take_profit,
-            risk_pct,
+            risk: to_upstream_risk(req.risk),
         };
         self.0
             .place_entry(max_risk_pct, max_open_positions, &upstream_req)
@@ -61,6 +38,14 @@ impl Broker for TradeNationAdapter {
 
     async fn cancel_pending_for_instrument(&self, instrument: &str) -> usize {
         self.0.cancel_pending_for_instrument(instrument).await
+    }
+}
+
+fn to_upstream_risk(r: RiskBudget) -> broker_tradenation::RiskBudget {
+    match r {
+        RiskBudget::Percent(p) => broker_tradenation::RiskBudget::Percent(p),
+        RiskBudget::Amount(a) => broker_tradenation::RiskBudget::Amount(a),
+        RiskBudget::Units(s) => broker_tradenation::RiskBudget::Units(s),
     }
 }
 
