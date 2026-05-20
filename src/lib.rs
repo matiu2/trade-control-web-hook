@@ -34,12 +34,6 @@ pub(crate) const ENCRYPTION_KEY_SECRET: &str = "ENCRYPTION_KEY";
 const MAX_RISK_PCT_PER_TRADE_SECRET: &str = "MAX_RISK_PCT_PER_TRADE";
 const MAX_OPEN_POSITIONS_SECRET: &str = "MAX_OPEN_POSITIONS";
 const PIP_SIZE_SECRET_PREFIX: &str = "PIP_SIZE_";
-const TN_SESSION_JSON_SECRET: &str = "TN_SESSION_JSON";
-#[cfg(target_arch = "wasm32")]
-const TN_DEMO_LOGIN_ID_SECRET: &str = "TN_DEMO_LOGIN_ID";
-#[cfg(target_arch = "wasm32")]
-const TN_DEMO_PASSWORD_SECRET: &str = "TN_DEMO_PASSWORD";
-const TN_SESSION_KV_KEY: &str = "tn:session:demo";
 const KV_NAMESPACE: &str = "TRADE_CONTROL_KV";
 
 /// Default pip size when no `PIP_SIZE_<INSTRUMENT>` secret is set. EUR_USD's
@@ -150,7 +144,11 @@ pub async fn main(mut req: Request, env: Env, _ctx: Context) -> Result<Response>
                     run_action(&adapter, &store, &verified, &env, now).await
                 }
                 None => {
-                    return Response::error("tradenation session expired or invalid", 503);
+                    return Response::error(
+                        "tradenation login failed (missing account, bad credentials, or expired \
+                         session — check worker logs)",
+                        503,
+                    );
                 }
             }
         }
@@ -875,37 +873,32 @@ async fn handle_clear_veto(
 /// When `account` is `Some(name)`, the worker routes through the
 /// first-class account store — looks the metadata + credentials up,
 /// caches the session under `tn:session:<name>`, and uses the
-/// account's own username / password to log in. Live accounts return
-/// `None` for now (step 4 wires the live login path).
+/// account's own username / password to log in.
 ///
-/// When `account` is `None`, the legacy lookup order applies:
-/// 1. Cached `Session` JSON in KV under `TN_SESSION_KV_KEY`.
-/// 2. Fresh demo login from the global
-///    `TN_DEMO_LOGIN_ID` / `TN_DEMO_PASSWORD` secrets.
-/// 3. Fallback to the legacy `TN_SESSION_JSON` secret.
-///
-/// Returns `None` only if every path fails — at that point the
-/// operator needs to look at the logs.
+/// Returns `None` if the account is missing, the broker tag doesn't
+/// match, credentials can't be resolved, or login fails — each failure
+/// is logged at `console_error!`. Intents without `account:` are
+/// rejected at the caller; the legacy shared-session paths are gone.
 pub(crate) async fn acquire_tn_broker(
     env: &Env,
     account: Option<&str>,
 ) -> Option<broker_tradenation::TradeNationBroker> {
     match account {
         Some(name) => acquire_tn_broker_for_account(env, name).await,
-        None => acquire_tn_broker_legacy(env).await,
+        None => {
+            console_error!(
+                "tn: intent missing `account` — TradeNation routing requires a named account \
+                 (use `trade-control account add <name>` to register one)"
+            );
+            None
+        }
     }
 }
 
-/// KV cache key for a session. `None` is the legacy shared slot;
-/// named accounts get a per-account namespace so two TN accounts don't
-/// fight over one slot. Only the account-mode path needs it today
-/// (legacy path bakes in the constant), hence the wasm gate.
+/// Per-account KV cache slot for a session.
 #[cfg(target_arch = "wasm32")]
-fn tn_session_cache_key(account: Option<&str>) -> String {
-    match account {
-        Some(name) => format!("tn:session:{name}"),
-        None => TN_SESSION_KV_KEY.to_string(),
-    }
+fn tn_session_cache_key(account: &str) -> String {
+    format!("tn:session:{account}")
 }
 
 /// Account-aware path. Looks up the metadata + credentials via the
@@ -955,7 +948,7 @@ async fn acquire_tn_broker_for_account(
     }
 
     // 1. Try the per-account cached session.
-    let cache_key = tn_session_cache_key(Some(name));
+    let cache_key = tn_session_cache_key(name);
     match kv.get(&cache_key).text().await {
         Ok(Some(cached)) => {
             if let Some(broker) = broker_tradenation::login(&cached).await {
@@ -1089,62 +1082,6 @@ async fn cache_and_open(
         return Some(broker);
     }
     console_error!("tn[{account_name}]: fresh session rejected by broker_tradenation::login");
-    None
-}
-
-/// Legacy (pre-accounts) path. Preserved for one release so intents
-/// without `account:` keep working with the old secrets layout.
-async fn acquire_tn_broker_legacy(env: &Env) -> Option<broker_tradenation::TradeNationBroker> {
-    let kv = match env.kv(KV_NAMESPACE) {
-        Ok(kv) => Some(kv),
-        Err(err) => {
-            console_error!("tn: KV binding missing, skipping session cache: {err:?}");
-            None
-        }
-    };
-
-    // 1. Try the KV-cached session first.
-    if let Some(kv) = kv.as_ref() {
-        match kv.get(TN_SESSION_KV_KEY).text().await {
-            Ok(Some(cached)) => {
-                if let Some(broker) = broker_tradenation::login(&cached).await {
-                    console_log!("tn: using cached session from KV");
-                    return Some(broker);
-                }
-                console_log!("tn: cached session rejected, will re-login");
-            }
-            Ok(None) => console_log!("tn: no cached session, will login"),
-            Err(err) => console_error!("tn: KV get session: {err:?}"),
-        }
-    }
-
-    // 2. Fresh demo login from credentials — wasm-only path, since the
-    //    redirect-chain login goes through `worker::Fetch`.
-    #[cfg(target_arch = "wasm32")]
-    if let (Some(login_id), Some(password)) = (
-        get_secret(TN_DEMO_LOGIN_ID_SECRET, env),
-        get_secret(TN_DEMO_PASSWORD_SECRET, env),
-    ) {
-        if let Some(broker) =
-            login_and_cache_demo(env, "legacy", TN_SESSION_KV_KEY, &login_id, &password).await
-        {
-            return Some(broker);
-        }
-    } else {
-        console_log!(
-            "tn: {TN_DEMO_LOGIN_ID_SECRET}/{TN_DEMO_PASSWORD_SECRET} not set, skipping self-login"
-        );
-    }
-
-    // 3. Fallback: legacy externally-rotated TN_SESSION_JSON secret.
-    if let Some(session_json) = get_secret(TN_SESSION_JSON_SECRET, env)
-        && let Some(broker) = broker_tradenation::login(&session_json).await
-    {
-        console_log!("tn: using {TN_SESSION_JSON_SECRET} fallback");
-        return Some(broker);
-    }
-
-    console_error!("tn: all login paths exhausted");
     None
 }
 

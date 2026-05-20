@@ -315,7 +315,7 @@ within its window won't double-fire.
 | `OANDA_API_KEY` | for OANDA | OANDA v20 token. |
 | `OANDA_ACCOUNT_ID` | for OANDA | OANDA account id. |
 | `OANDA_LIVE` | no | `true` for live trading; defaults to practice. |
-| `TN_SESSION_JSON` | for TradeNation | Serialised TradeNation `Session` JSON. See "TradeNation session" below. |
+| `TN_ACCOUNT_<NAME>` | for TradeNation | Per-account credentials blob (JSON-serialised `Credentials::TradeNation`). `<NAME>` is the operator-friendly account name uppercased with `-` → `_`. Managed via `trade-control account add` — set this secret per account, the worker logs in on demand and caches the session in KV. See "TradeNation session" below. |
 | `MAX_RISK_PCT_PER_TRADE` | no | Hard cap on requested `risk_pct`. Default `1.0`. |
 | `MAX_OPEN_POSITIONS` | no | Max concurrent open positions. Default `3`. |
 | `PIP_SIZE_<INSTRUMENT>` | no | Override pip size, e.g. `PIP_SIZE_USD_JPY=0.01`. Default `0.0001`. |
@@ -339,38 +339,33 @@ instrument: EUR/USD
 
 ## TradeNation session
 
-The Worker can't run TradeNation's native login redirect chain (it
-scrapes `Set-Cookie` off a redirect chain, which `reqwest`'s wasm shim
-can't observe — it auto-follows). So the operator's machine logs in,
-exports a `Session`, and uploads it as the `TN_SESSION_JSON` Worker
-secret. When the session dies, the Worker returns 503 with
-`tradenation session expired or invalid` until the next rotation.
+TN routing requires the intent to name an `account:` (registered via
+`trade-control account add`). The worker resolves the account through
+the metadata index in KV, reads the per-account `TN_ACCOUNT_<NAME>`
+credentials secret, logs in on demand, and caches the resulting
+`Session` JSON in KV under `tn:session:<name>`.
 
-A small shell script rotates the secret on a cron. From a native
-machine with `tradenation` CLI authenticated:
+The worker is self-healing: when a cached session is rejected (TN
+expired it), the next request transparently re-logs in using the
+stored credentials and writes the new session back to KV. No external
+rotation is needed — credentials live in the secret, and sessions
+regenerate themselves.
+
+Register an account:
 
 ```sh
-# Manual one-off:
-tradenation session export "my-tn-account" | wrangler secret put TN_SESSION_JSON
-
-# Or use the bundled script (defaults to the "manual demo" account):
-./scripts/refresh-tn-session.sh
-TN_ACCOUNT_NAME="my-tn-account" ./scripts/refresh-tn-session.sh
+trade-control account add my-tn-demo \
+  --broker tradenation --kind demo \
+  --admin-key-file ~/.config/trade-control/admin-key.hex
 ```
 
-Suggested cron — every 2 hours, with reactive manual runs when the
-worker logs `tradenation login failed` between ticks:
+This wraps `wrangler secret put TN_ACCOUNT_MY_TN_DEMO` and writes the
+metadata entry in KV. After that, intents with `account: my-tn-demo`
+route through that account; the worker handles session lifecycle.
 
-```
-0 */2 * * * /path/to/trade-control-web-hook/scripts/refresh-tn-session.sh >> /tmp/tn-session-refresh.log 2>&1
-```
-
-Lifetime is undocumented by TradeNation. Empirically sessions survive
-hours of intermittent use, so 2-hour rotation is safely under the
-horizon. The trade-off: the rotating machine must be online and the
-operator must hand-rotate during sleep / outages. A self-healing
-wasm-side login lives in `TODO.md`'s parked section; pick it up when
-the cron path proves insufficient.
+If you hit a 503 with `tradenation login failed`, check the worker
+logs — likely either a wrong-broker mismatch, a malformed credentials
+blob, or TN itself rejecting the credentials.
 
 ## KV namespace
 

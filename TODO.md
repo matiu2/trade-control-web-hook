@@ -1,40 +1,21 @@
 # TODO
 
-## Active — TradeNation session auto-rotation
+## Done — TradeNation session lifecycle (wasm-side login)
 
-Operational shim until the worker can re-authenticate itself.
+The worker re-authenticates itself via per-account credentials stored
+in `TN_ACCOUNT_<NAME>` secrets — no external rotation needed. On
+cached-session rejection, the next request transparently re-logs in
+using the stored credentials and writes the new session to KV. Both
+demo and live login paths run inside the wasm worker via the
+`worker::Fetch` crate (`reqwest`'s wasm shim auto-follows redirects
+and can't be used).
 
-- [x] Cron-driven `TN_SESSION_JSON` refresh — `scripts/refresh-tn-session.sh`
-      logs in via the local `tradenation` CLI and pushes the result with
-      `wrangler secret put`. Installed at `0 */2 * * *`.
-- [x] Manual probe (deleted) verified that `web-sys` *can* walk the TN
-      redirect chain inside a Cloudflare Worker — both `ASP.NET_SessionId`
-      and the OTS cookie (`*JPBX=…`, 8-char-uppercase name) are readable
-      via `Headers.getAll("set-cookie")` per hop. `reqwest`'s wasm shim
-      can't be used: it has no manual-redirect option and auto-follows
-      transparently, so we never see the intermediate `Set-Cookie`
-      headers. A wasm login implementation will need raw `web-sys` or
-      the `worker` crate's `Fetch` — not `reqwest`.
-
-## Parked — wasm-side login
-
-Cron works but requires the laptop to be on and gives no reactive
-recovery between ticks. The durable shape is to have the worker
-re-authenticate itself. Design sketch (probe results above):
-
-- New crate `tradenation-wasm` inside the `tradenation-api` submodule,
-  `#![cfg(target_arch = "wasm32")]`, owns:
-  - web-sys redirect-chain login → `tradenation_api::Session`.
-  - `TradeNationBroker` (currently in `broker-tradenation`) gains
-    credentials + retry-on-`SessionExpired` so a stale cached session
-    self-heals in-flight.
-- This worker caches the resulting `Session` JSON in KV between
-  requests; passes it into the broker at construction; writes it back
-  if it changed during a call.
-- Drop the `TN_SESSION_JSON` secret + the cron job once it lands.
-
-Pick this up when the cron path proves insufficient — e.g. live trading
-at unattended hours, or repeated misses between rotations.
+The pre-named-accounts cron shim (`scripts/refresh-tn-session.sh`,
+`TN_SESSION_JSON` secret, `TN_DEMO_LOGIN_ID` / `TN_DEMO_PASSWORD`
+globals) was retired alongside Step 5 below. If you have stale
+`TN_SESSION_JSON` / `TN_DEMO_*` secrets in the Cloudflare deployment,
+run `wrangler secret delete` for each — the worker doesn't read them
+anymore.
 
 ## Active — First-class accounts
 
@@ -116,8 +97,15 @@ Steps:
       the cache/serialise tail is now a single `cache_and_open` to
       avoid duplication. 14 worker + 149 core + 74 cli tests pass;
       clippy + fmt clean on host + wasm.
-- [ ] **Step 5: retire legacy fallback** and port existing accounts
-      across.
+- [x] **Step 5: retire legacy fallback.** Removed
+      `acquire_tn_broker_legacy` and its three constants
+      (`TN_SESSION_JSON`, `TN_DEMO_LOGIN_ID`, `TN_DEMO_PASSWORD`,
+      `TN_SESSION_KV_KEY`). TN routing now requires an `account:` on
+      the intent — without one, the worker returns 503 with a clear
+      "missing account" error. `scripts/refresh-tn-session.sh`
+      deleted; the named-account path auto-relogs on cached-session
+      rejection so no external rotation is needed. README updated to
+      reflect the new TN session story.
 - [x] **Three-way sizing modes + dry-run on intent.** `Intent` gains
       three new optional fields, mutually exclusive with each other
       and `risk_pct`:
