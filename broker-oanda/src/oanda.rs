@@ -121,11 +121,22 @@ pub async fn place_entry(
         ResolvedEntry::Limit { trigger_price } => trigger_price,
     };
 
-    // Translate `Amount` to an effective percent so the cap still applies.
-    // If the operator asks to risk $50 on a $1k account, that's 5% — the
-    // cap should catch it.
-    let (budget, effective_pct) = match req.risk {
-        RiskBudget::Percent(pct) => (equity * pct / 100.0, pct),
+    // Resolve units + effective percent. For `Units` we skip sizing
+    // math entirely and reconstruct the implied money risk for the cap
+    // check. For `Amount` we translate to percent so the cap applies.
+    // For `Percent` we already validated above; recompute the budget.
+    let stop_distance = (reference_price - req.stop_loss).abs();
+    if stop_distance <= 0.0 || !stop_distance.is_finite() {
+        return Err(EntryError::OrderRejected);
+    }
+    let (units, effective_pct) = match req.risk {
+        RiskBudget::Percent(pct) => {
+            let budget = equity * pct / 100.0;
+            (
+                risk::units_for_budget(budget, reference_price, req.stop_loss),
+                pct,
+            )
+        }
         RiskBudget::Amount(amount) => {
             if equity <= 0.0 {
                 return Err(EntryError::EquityParse);
@@ -137,13 +148,36 @@ pub async fn place_entry(
                     cap: max_risk_pct,
                 });
             }
-            (amount, pct)
+            (
+                risk::units_for_budget(amount, reference_price, req.stop_loss),
+                pct,
+            )
+        }
+        RiskBudget::Units(literal) => {
+            if equity <= 0.0 {
+                return Err(EntryError::EquityParse);
+            }
+            // Implied money risk = units * stop_distance. Divide by
+            // equity for the percent the cap is expressed in.
+            let implied_amount = literal * stop_distance;
+            let pct = implied_amount / equity * 100.0;
+            if pct > max_risk_pct {
+                return Err(EntryError::RiskCapExceeded {
+                    requested: pct,
+                    cap: max_risk_pct,
+                });
+            }
+            // OANDA only takes integer units; floor the literal.
+            let u = if !literal.is_finite() || literal <= 0.0 {
+                0
+            } else {
+                literal.floor() as u32
+            };
+            (u, pct)
         }
     };
-
-    let units = risk::units_for_budget(budget, reference_price, req.stop_loss);
     console_log!(
-        "oanda sizing: instrument={} mode={:?} equity={equity} effective_pct={effective_pct:.4} budget={budget} entry_ref={reference_price} sl={} units={units}",
+        "oanda sizing: instrument={} mode={:?} equity={equity} effective_pct={effective_pct:.4} entry_ref={reference_price} sl={} units={units}",
         req.instrument,
         req.risk,
         req.stop_loss,

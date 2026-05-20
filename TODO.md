@@ -118,24 +118,31 @@ Steps:
       clippy + fmt clean on host + wasm.
 - [ ] **Step 5: retire legacy fallback** and port existing accounts
       across.
-- [x] **Fixed-amount risk + dry-run on intent.** `Intent` gains two
-      new fields: `risk_amount: Option<f64>` (alternative to
-      `risk_pct` — risk this many account-currency units per trade,
-      e.g. `1.0` to "bet $1") and `dry_run: Option<bool>` (when true,
-      worker resolves + logs sizing inputs/output but skips the
-      broker call). `Resolved` carries a new `RiskBudget` enum
-      (`Percent(f64)` / `Amount(f64)`) instead of a bare `risk_pct`;
-      resolver rejects both-set or invalid amounts at the edge.
-      OANDA broker consumes either mode (computes effective percent
-      and enforces the cap against equity); TN adapter rejects
-      `Amount` for now with a clear log (upstream
-      `broker-tradenation` still takes `risk_pct` only — bumping it
-      is a separate pass). Dry-run short-circuits in the worker
-      dispatch before `place_entry` and logs id / instrument /
-      direction / entry / SL / TP / risk-mode / implicit R; works
-      for both brokers. 271 tests pass (76 cli, 160 core, 16
-      broker-oanda, 14 worker, 5 cli-bin); clippy + fmt clean on
-      host + wasm.
+- [x] **Three-way sizing modes + dry-run on intent.** `Intent` gains
+      three new optional fields, mutually exclusive with each other
+      and `risk_pct`:
+      - `risk_amount: Option<f64>` — fixed money risk per trade in
+        account currency (e.g. `1.0` to "bet $1").
+      - `size_units: Option<f64>` — literal position size (e.g.
+        `0.01` for one micro-lot). Bypasses sizing math entirely.
+      - `dry_run: Option<bool>` — resolve + log sizing inputs/output,
+        skip broker call. Useful for verifying templates safely on
+        a live account.
+      `Resolved` carries a new `RiskBudget` enum
+      (`Percent(f64)` / `Amount(f64)` / `Units(f64)`). Resolver
+      rejects multi-set or invalid values at the edge.
+      OANDA broker consumes all three modes: `Percent` and `Amount`
+      go through `units_for_budget`; `Units` skips sizing but still
+      enforces `MAX_RISK_PCT_PER_TRADE` by reconstructing the
+      implied money risk (`units * stop_distance` ÷ equity). TN
+      adapter rejects both `Amount` and `Units` for now with clear
+      logs (upstream `broker-tradenation` still takes `risk_pct`
+      only — bumping it is a separate pass). Dry-run short-circuits
+      in the worker dispatch before `place_entry` and logs id /
+      instrument / direction / entry / SL / TP / risk-mode /
+      implicit R; works for both brokers. 279 tests pass (77 cli,
+      167 core, 16 broker-oanda, 14 worker, 5 cli-bin); clippy +
+      fmt clean on host + wasm.
 - [ ] **Step 6: extend `AccountCaps`.** One remaining live-focused
       field:
       - `min_position_size` (optional) — refuse entries that would

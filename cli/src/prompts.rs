@@ -84,15 +84,18 @@ pub fn read_action(template: &Value) -> Option<Action> {
 /// Return the list of top-level keys (from `required`) that are absent or
 /// `null` in `template`. Order matches `required`.
 ///
-/// Special case: `risk_pct` and `risk_amount` are alternatives — if the
-/// template already carries `risk_amount`, we don't ask for `risk_pct`.
-/// The server-side resolver rejects both-set so we don't double-prompt.
+/// Special case: `risk_pct`, `risk_amount`, and `size_units` are
+/// alternatives — if the template already carries either of the
+/// alternates, we don't ask for `risk_pct`. The server-side resolver
+/// rejects more-than-one-set so we don't double-prompt.
 pub fn missing_fields<'a>(template: &Value, required: &[&'a str]) -> Vec<&'a str> {
-    let has_risk_amount = !matches!(template.get("risk_amount"), None | Some(Value::Null));
+    let has_alt_sizing = ["risk_amount", "size_units"]
+        .iter()
+        .any(|k| !matches!(template.get(*k), None | Some(Value::Null)));
     required
         .iter()
         .filter(|name| {
-            if **name == "risk_pct" && has_risk_amount {
+            if **name == "risk_pct" && has_alt_sizing {
                 return false;
             }
             matches!(template.get(**name), None | Some(Value::Null))
@@ -270,6 +273,17 @@ mod tests {
         let v = map("v: 1\n");
         let missing = missing_fields(&v, &["risk_pct"]);
         assert_eq!(missing, vec!["risk_pct"]);
+    }
+
+    #[test]
+    fn missing_fields_skips_risk_pct_when_size_units_set() {
+        // size_units is the third alternative to risk_pct/risk_amount.
+        let v = map("size_units: 0.01\n");
+        let missing = missing_fields(&v, &["risk_pct"]);
+        assert!(
+            missing.is_empty(),
+            "risk_pct prompted despite size_units present"
+        );
     }
 
     #[test]

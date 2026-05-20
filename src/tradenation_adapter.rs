@@ -33,6 +33,13 @@ impl Broker for TradeNationAdapter {
                 );
                 return Err(EntryError::OrderRejected);
             }
+            RiskBudget::Units(_) => {
+                console_error!(
+                    "tradenation adapter: size_units not yet supported on TN — \
+                     use risk_pct, or wait for the broker-tradenation bump"
+                );
+                return Err(EntryError::OrderRejected);
+            }
         };
         let upstream_req = broker_tradenation::EntryRequest {
             instrument: req.instrument,

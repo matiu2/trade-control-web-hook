@@ -19,12 +19,12 @@ pub enum ResolvedEntry {
     Limit { trigger_price: f64 },
 }
 
-/// How much to risk on this trade. Resolved from the intent's
-/// `risk_pct` (default) or `risk_amount` (alternative) field.
+/// How units are determined for this trade. Resolved from the
+/// intent's `risk_pct` / `risk_amount` / `size_units` fields
+/// (exactly one of them is required).
 ///
-/// `Percent` is in percent-of-equity (e.g. `0.5` = 0.5%); `Amount` is
-/// a fixed money sum in the account's own currency. The broker layer
-/// converts whichever it receives into a money budget at fire time.
+/// `Percent` and `Amount` feed the sizing math (`budget / stop_distance`).
+/// `Units` bypasses it — the worker sends the literal count.
 #[derive(Debug, Clone, Copy)]
 pub enum RiskBudget {
     /// Risk this percent of account equity.
@@ -32,6 +32,10 @@ pub enum RiskBudget {
     /// Risk this fixed amount in account currency. Worker translates
     /// to an effective `risk_pct` at fire time so the cap still applies.
     Amount(f64),
+    /// Place this many units directly, bypassing sizing math. Cap
+    /// check still runs via the implied money risk
+    /// (`units * stop_distance` ÷ equity).
+    Units(f64),
 }
 
 /// Fully-resolved trade intent, with all prices computed.
@@ -80,11 +84,13 @@ pub enum ResolveError {
         stop_loss: f64,
         take_profit: f64,
     },
-    /// Both `risk_pct` and `risk_amount` set on the same intent.
-    /// They're mutually exclusive — pick one.
+    /// More than one of `risk_pct` / `risk_amount` / `size_units`
+    /// set on the same intent. They're mutually exclusive — pick one.
     BothRiskModesSet,
     /// `risk_amount` set to a non-positive / non-finite value.
     InvalidRiskAmount { value: f64 },
+    /// `size_units` set to a non-positive / non-finite value.
+    InvalidSizeUnits { value: f64 },
 }
 
 impl core::fmt::Display for ResolveError {
@@ -110,10 +116,13 @@ impl core::fmt::Display for ResolveError {
                 "entry {entry} is outside the SL..TP range ({stop_loss}..{take_profit})"
             ),
             Self::BothRiskModesSet => {
-                f.write_str("risk_pct and risk_amount are mutually exclusive")
+                f.write_str("risk_pct / risk_amount / size_units are mutually exclusive")
             }
             Self::InvalidRiskAmount { value } => {
                 write!(f, "risk_amount must be positive and finite, got {value}")
+            }
+            Self::InvalidSizeUnits { value } => {
+                write!(f, "size_units must be positive and finite, got {value}")
             }
         }
     }
@@ -147,16 +156,23 @@ impl Resolved {
             .take_profit
             .as_ref()
             .ok_or(ResolveError::MissingField("take_profit"))?;
-        let risk = match (intent.risk_pct, intent.risk_amount) {
-            (Some(_), Some(_)) => return Err(ResolveError::BothRiskModesSet),
-            (None, None) => return Err(ResolveError::MissingField("risk_pct")),
-            (Some(pct), None) => RiskBudget::Percent(pct),
-            (None, Some(amount)) => {
+        let risk = match (intent.risk_pct, intent.risk_amount, intent.size_units) {
+            (None, None, None) => return Err(ResolveError::MissingField("risk_pct")),
+            (Some(pct), None, None) => RiskBudget::Percent(pct),
+            (None, Some(amount), None) => {
                 if !amount.is_finite() || amount <= 0.0 {
                     return Err(ResolveError::InvalidRiskAmount { value: amount });
                 }
                 RiskBudget::Amount(amount)
             }
+            (None, None, Some(units)) => {
+                if !units.is_finite() || units <= 0.0 {
+                    return Err(ResolveError::InvalidSizeUnits { value: units });
+                }
+                RiskBudget::Units(units)
+            }
+            // Any 2-or-3 combination of the sizing fields.
+            _ => return Err(ResolveError::BothRiskModesSet),
         };
 
         let stop_loss = sl_ref.resolve(shell, pip_size);
@@ -327,6 +343,7 @@ mod tests {
             }),
             risk_pct: Some(0.5),
             risk_amount: None,
+            size_units: None,
             dry_run: None,
             cooldown_hours: None,
             min_r: None,
@@ -605,6 +622,85 @@ mod tests {
         assert!(matches!(
             Resolved::from_intent(&intent, &shell(), 0.0001),
             Err(ResolveError::InvalidRiskAmount { .. })
+        ));
+    }
+
+    #[test]
+    fn size_units_resolves_to_units_budget() {
+        let mut intent = long_market_intent();
+        intent.risk_pct = None;
+        intent.size_units = Some(0.01);
+        let r = Resolved::from_intent(&intent, &shell(), 0.0001).unwrap();
+        match r.risk {
+            RiskBudget::Units(u) => assert!((u - 0.01).abs() < 1e-9),
+            other => panic!("expected Units, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn size_units_with_risk_pct_rejected() {
+        let mut intent = long_market_intent();
+        // risk_pct already Some(0.5) on the fixture.
+        intent.size_units = Some(0.01);
+        assert!(matches!(
+            Resolved::from_intent(&intent, &shell(), 0.0001),
+            Err(ResolveError::BothRiskModesSet)
+        ));
+    }
+
+    #[test]
+    fn size_units_with_risk_amount_rejected() {
+        let mut intent = long_market_intent();
+        intent.risk_pct = None;
+        intent.risk_amount = Some(1.0);
+        intent.size_units = Some(0.01);
+        assert!(matches!(
+            Resolved::from_intent(&intent, &shell(), 0.0001),
+            Err(ResolveError::BothRiskModesSet)
+        ));
+    }
+
+    #[test]
+    fn all_three_sizing_modes_rejected() {
+        let mut intent = long_market_intent();
+        intent.risk_amount = Some(1.0);
+        intent.size_units = Some(0.01);
+        assert!(matches!(
+            Resolved::from_intent(&intent, &shell(), 0.0001),
+            Err(ResolveError::BothRiskModesSet)
+        ));
+    }
+
+    #[test]
+    fn size_units_zero_rejected() {
+        let mut intent = long_market_intent();
+        intent.risk_pct = None;
+        intent.size_units = Some(0.0);
+        assert!(matches!(
+            Resolved::from_intent(&intent, &shell(), 0.0001),
+            Err(ResolveError::InvalidSizeUnits { .. })
+        ));
+    }
+
+    #[test]
+    fn size_units_negative_rejected() {
+        let mut intent = long_market_intent();
+        intent.risk_pct = None;
+        intent.size_units = Some(-0.01);
+        assert!(matches!(
+            Resolved::from_intent(&intent, &shell(), 0.0001),
+            Err(ResolveError::InvalidSizeUnits { .. })
+        ));
+    }
+
+    #[test]
+    fn size_units_nan_rejected() {
+        let mut intent = long_market_intent();
+        intent.risk_pct = None;
+        intent.size_units = Some(f64::NAN);
+        assert!(matches!(
+            Resolved::from_intent(&intent, &shell(), 0.0001),
+            Err(ResolveError::InvalidSizeUnits { .. })
         ));
     }
 

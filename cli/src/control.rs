@@ -36,6 +36,7 @@ fn control_skeleton(action: Action, instrument: &str, id: String, now: DateTime<
         take_profit: None,
         risk_pct: None,
         risk_amount: None,
+        size_units: None,
         dry_run: None,
         cooldown_hours: None,
         min_r: None,

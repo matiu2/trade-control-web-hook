@@ -61,12 +61,23 @@ pub struct Intent {
     /// trade, in the account's own currency (e.g. `1.0` for "bet $1").
     /// Useful on a live account to keep position sizes constant
     /// regardless of equity growth. Exactly one of `risk_pct` /
-    /// `risk_amount` must be set; mixing both is rejected at resolve
-    /// time. The `MAX_RISK_PCT_PER_TRADE` cap still applies — at fire
-    /// time the worker translates the amount to an effective percent
-    /// (`amount / equity * 100`) and rejects if that exceeds the cap.
+    /// `risk_amount` / `size_units` must be set; mixing is rejected
+    /// at resolve time. The `MAX_RISK_PCT_PER_TRADE` cap still
+    /// applies — at fire time the worker translates the amount to an
+    /// effective percent (`amount / equity * 100`) and rejects if
+    /// that exceeds the cap.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub risk_amount: Option<f64>,
+    /// Alternative to `risk_pct` / `risk_amount`: a fixed position
+    /// size in instrument units (e.g. `0.01` for one micro-lot of FX,
+    /// or a literal contract count for CFDs). Bypasses sizing math
+    /// entirely — the worker just sends this many units. The risk-cap
+    /// check is still applied by reconstructing the implied money
+    /// risk (`size_units * stop_distance`) and dividing by equity.
+    /// Exactly one of `risk_pct` / `risk_amount` / `size_units` must
+    /// be set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub size_units: Option<f64>,
     /// When true, the worker resolves the intent, logs the sizing
     /// inputs / calculations / output, then returns success **without
     /// placing the order**. Useful for verifying new sizing modes
