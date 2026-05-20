@@ -33,7 +33,7 @@ pub struct Intent {
     /// Unique id per intended trade, used for replay protection.
     pub id: String,
     /// Optional earliest time the alert is allowed to fire.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub not_before: Option<DateTime<Utc>>,
     /// Hard expiry — alerts that arrive after this are rejected.
     pub not_after: DateTime<Utc>,
@@ -42,21 +42,21 @@ pub struct Intent {
     /// OANDA instrument name, e.g. `EUR_USD`.
     pub instrument: String,
     /// Required for `enter`; ignored otherwise.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub direction: Option<Direction>,
     /// Required for `enter`.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub entry: Option<EntrySpec>,
     /// Required for `enter`.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stop_loss: Option<PriceRef>,
     /// Required for `enter`.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub take_profit: Option<TakeProfit>,
     /// Required for `enter` unless `risk_amount` is set. % of account
     /// equity; the server-side cap clamps it. Exactly one of
     /// `risk_pct` / `risk_amount` must be set.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub risk_pct: Option<f64>,
     /// Alternative to `risk_pct`: a fixed money amount to risk per
     /// trade, in the account's own currency (e.g. `1.0` for "bet $1").
@@ -88,13 +88,13 @@ pub struct Intent {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dry_run: Option<bool>,
     /// Required for `invalidate`.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cooldown_hours: Option<u32>,
     /// Minimum acceptable R-multiple — server rejects entries whose
     /// implicit `(TP - entry) / (entry - SL)` falls below this. Defaults
     /// to 1.0 when omitted. Overrides must be `>= 1.0`; below-floor values
     /// are rejected both at the encoder and on the server.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub min_r: Option<f64>,
     /// Which broker the worker should route this intent to. Defaults to
     /// `oanda` when absent so intents encrypted before the multi-broker
@@ -111,32 +111,32 @@ pub struct Intent {
     pub account: Option<String>,
     /// Required for `prep` / `clear-prep`. The named step that landed
     /// (e.g. `break-and-close`, `retest`).
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub step: Option<String>,
     /// Required for `veto` / `clear-veto`. The named condition
     /// blocking entries (e.g. `news-window`).
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
     /// Required for `prep` / `veto`. TTL in hours for the flag.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ttl_hours: Option<u32>,
     /// Escalation level for a `veto` action. Default is
     /// [`VetoLevel::StopNextEntry`] (flag-only, no broker side effects).
     /// Higher levels also cancel pending orders and/or close positions
     /// at fire time. The flag itself only blocks future entries — the
     /// side effects are one-shot at fire time, re-fire to repeat them.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub level: Option<VetoLevel>,
     /// Optional gate on `enter`. Ordered list of named preps that must
     /// be active for this instrument; each prep's `set_at` timestamp
     /// must be strictly greater than the previous prep's. Absent /
     /// empty means no prep gate.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub requires_preps: Vec<String>,
     /// Optional gate on `enter`. Entry is rejected if any of these named
     /// vetos are active for this instrument. Absent / empty means no
     /// veto gate.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub vetos: Vec<String>,
     /// Names to clear *before* setting the new prep/veto. Used to model
     /// ordered prep sequences where landing an earlier step must
@@ -460,6 +460,63 @@ mod tests {
         let intent: Intent = serde_yaml::from_str(yaml).unwrap();
         let back = serde_yaml::to_string(&intent).unwrap();
         assert!(!back.contains("account"));
+    }
+
+    #[test]
+    fn emitted_intent_has_no_tildes() {
+        // Tildes (YAML null markers) appeared in emitted templates when
+        // `Option<T>` fields without `skip_serializing_if` were re-
+        // serialised after parsing. They're noisy and make the template
+        // body hard for the operator to read. Every `Option<T>` field
+        // on `Intent` must skip when None — this test guards against
+        // accidentally adding a new optional field without the attr.
+        let yaml = "
+            v: 1
+            id: a-tilde
+            not_after: \"2026-05-13T20:00:00Z\"
+            action: enter
+            instrument: EUR_USD
+            direction: long
+            entry: { type: market }
+            stop_loss: { from: low, offset_pips: -2 }
+            take_profit: { from: close, offset_r: 2.0 }
+            risk_pct: 0.5
+        ";
+        let intent: Intent = serde_yaml::from_str(yaml).unwrap();
+        let back = serde_yaml::to_string(&intent).unwrap();
+        assert!(
+            !back.contains('~'),
+            "emitted yaml contains a tilde — a new Option<T> field is \
+             missing `skip_serializing_if = \"Option::is_none\"`. \
+             Output was:\n{back}"
+        );
+        assert!(
+            !back.contains(": null"),
+            "emitted yaml contains an explicit null marker. \
+             Output was:\n{back}"
+        );
+    }
+
+    #[test]
+    fn emitted_intent_omits_empty_prep_and_veto_lists() {
+        // `requires_preps` / `vetos` skip when empty so a vanilla
+        // enter doesn't carry `requires_preps: []` / `vetos: []` lines.
+        let yaml = "
+            v: 1
+            id: a-empty
+            not_after: \"2026-05-13T20:00:00Z\"
+            action: enter
+            instrument: EUR_USD
+            direction: long
+            entry: { type: market }
+            stop_loss: { from: low, offset_pips: -2 }
+            take_profit: { from: close, offset_r: 2.0 }
+            risk_pct: 0.5
+        ";
+        let intent: Intent = serde_yaml::from_str(yaml).unwrap();
+        let back = serde_yaml::to_string(&intent).unwrap();
+        assert!(!back.contains("requires_preps"));
+        assert!(!back.contains("vetos"));
     }
 
     #[test]
