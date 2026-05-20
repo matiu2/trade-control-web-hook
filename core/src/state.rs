@@ -255,18 +255,29 @@ pub const MIN_TTL_SECONDS: u64 = 60;
 
 /// Compute the effective TTL (in seconds) for a veto record.
 ///
-/// A naive `ttl_hours * 3600` expires the veto `ttl_hours` after it
-/// was *set*. But the operator's mental model is usually "this
-/// condition is in effect for the lifetime of the alert (`not_after`)
-/// and the cooldown applies after that." So when `not_after` is in
-/// the future, we extend the TTL so the veto lives until
-/// `not_after + ttl_hours`, not just `now + ttl_hours`.
+/// **Motivating example.** A setup is sent with a `not_after` 4 days
+/// out (the alert is valid for that long). Mid-window, price runs
+/// past the entry zone — TradingView fires a `veto: too-high` with
+/// `ttl_hours: 12`. The naive interpretation would expire that veto
+/// 12h later, *while the original setup is still alive*, leaving the
+/// stale entry unguarded. But "price went too high" invalidates the
+/// setup for as long as that setup itself is valid — what we actually
+/// want is "this veto kills this setup, full stop."
 ///
-/// Formally: `effective = max(ttl, (not_after - now) + ttl)` —
-/// equivalent to `(max(now, not_after) - now) + ttl`. This means a
-/// `not_after` already in the past has no effect (we fall back to
-/// the bare TTL), and a future `not_after` extends the veto by the
-/// remaining lifetime.
+/// So the rule is: the veto lives until the latest of
+///   1. `now + ttl_hours` (the bare cooldown after the veto fires), and
+///   2. `not_after + ttl_hours` (the alert's own expiry, plus a tail
+///      so the veto doesn't lapse the instant the setup does and let
+///      a retry sneak in on a clock skew).
+///
+/// Equivalent closed form: `(max(now, not_after) - now) + ttl`.
+/// When `not_after` is already in the past the second clause adds
+/// nothing and we fall back to the bare TTL.
+///
+/// Note this binds the veto to **this** alert window only — a later,
+/// independent setup at a different price gets its own `not_after`
+/// and isn't affected. The veto isn't "forever," it's "for the life
+/// of the thing it vetoed."
 ///
 /// `not_after - now` is clamped to zero so a past `not_after` doesn't
 /// shorten the TTL. Output is clamped to [`MIN_TTL_SECONDS`].

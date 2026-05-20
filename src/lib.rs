@@ -602,11 +602,10 @@ async fn handle_veto(
     let Some(ttl_hours) = verified.intent.ttl_hours else {
         return Response::error("veto requires `ttl_hours`", 400);
     };
-    // Extend the TTL by any remaining `not_after` lifetime, so a veto
-    // sent with `not_after: 8h, ttl_hours: 12` actually lasts 20h —
-    // matching the operator's mental model of "active for this alert
-    // window, then cool down for `ttl` afterwards." See
-    // `veto_ttl_seconds` docs.
+    // The veto must outlive the setup it invalidates: if price ran
+    // too-high mid-window the original `enter` is dead for the rest
+    // of its `not_after`, not just the next `ttl_hours`. See
+    // `veto_ttl_seconds` for the full motivating example.
     let ttl_seconds = veto_ttl_seconds(ttl_hours, verified.intent.not_after, now);
     // Clear any vetos listed in `clears` first — symmetry with prep
     // ordering, even though vetos don't carry timestamps.
@@ -693,7 +692,8 @@ async fn run_veto_with_broker<B: Broker>(
         };
     };
     let level = verified.intent.level.unwrap_or_default();
-    // Same TTL extension as the flag-only path — see `veto_ttl_seconds`.
+    // See `veto_ttl_seconds` — the veto must outlive the setup it
+    // kills, not just survive a fixed cooldown from "now".
     let ttl_seconds = veto_ttl_seconds(ttl_hours, verified.intent.not_after, now);
     let instrument = &verified.intent.instrument;
     let cleared = match clear_named_vetos(store, instrument, &verified.intent.clears).await {
