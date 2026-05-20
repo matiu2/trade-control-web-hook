@@ -43,12 +43,28 @@ impl OpenRisk {
 /// Position size in units for a given risk budget. Rounded down.
 /// `equity` and `risk_pct` (0.5 means 0.5%) define the budget.
 /// `entry` and `stop_loss` are absolute prices.
+///
+/// Retained as a thin wrapper around [`units_for_budget`] so existing
+/// tests keep working; the worker now resolves percent vs amount at
+/// the call site and calls `units_for_budget` directly.
+#[allow(dead_code)]
 pub fn units_for_risk(equity: f64, risk_pct: f64, entry: f64, stop_loss: f64) -> u32 {
     let stop_distance = (entry - stop_loss).abs();
     if stop_distance <= 0.0 || equity <= 0.0 || risk_pct <= 0.0 {
         return 0;
     }
     let budget = equity * risk_pct / 100.0;
+    units_for_budget(budget, entry, stop_loss)
+}
+
+/// Position size in units for a budget already in account currency.
+/// Returned units are floored. Used by both the percent-of-equity path
+/// (after `equity * pct / 100`) and the fixed-amount path.
+pub fn units_for_budget(budget: f64, entry: f64, stop_loss: f64) -> u32 {
+    let stop_distance = (entry - stop_loss).abs();
+    if stop_distance <= 0.0 || budget <= 0.0 || !budget.is_finite() {
+        return 0;
+    }
     let units = budget / stop_distance;
     if units <= 0.0 || !units.is_finite() {
         0
@@ -123,6 +139,39 @@ mod tests {
     #[test]
     fn units_for_risk_zero_risk_yields_zero() {
         assert_eq!(units_for_risk(10_000.0, 0.0, 1.1, 1.09), 0);
+    }
+
+    #[test]
+    fn units_for_budget_basic() {
+        // $100 budget, 0.1 stop distance → 1000 units.
+        assert_eq!(units_for_budget(100.0, 100.0, 99.9), 1_000);
+    }
+
+    #[test]
+    fn units_for_budget_rounds_down() {
+        // $1 budget, 0.003 stop distance → 333.33 → 333 units. Bet $1
+        // on a 30-pip stop — useful smoke test for the fixed-amount mode.
+        assert_eq!(units_for_budget(1.0, 1.1000, 1.0970), 333);
+    }
+
+    #[test]
+    fn units_for_budget_zero_budget_yields_zero() {
+        assert_eq!(units_for_budget(0.0, 1.1, 1.09), 0);
+    }
+
+    #[test]
+    fn units_for_budget_negative_budget_yields_zero() {
+        assert_eq!(units_for_budget(-1.0, 1.1, 1.09), 0);
+    }
+
+    #[test]
+    fn units_for_budget_nan_budget_yields_zero() {
+        assert_eq!(units_for_budget(f64::NAN, 1.1, 1.09), 0);
+    }
+
+    #[test]
+    fn units_for_budget_zero_stop_distance_yields_zero() {
+        assert_eq!(units_for_budget(100.0, 1.1, 1.1), 0);
     }
 
     #[test]

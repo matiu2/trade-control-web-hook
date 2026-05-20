@@ -9,7 +9,7 @@
 
 use core::future::Future;
 
-use crate::intent::{Direction, ResolvedEntry};
+use crate::intent::{Direction, ResolvedEntry, RiskBudget};
 
 /// Inputs for placing an entry order. Borrowed because it is built per-request
 /// from the resolved intent and never outlives the dispatch frame.
@@ -19,7 +19,9 @@ pub struct EntryRequest<'a> {
     pub entry: ResolvedEntry,
     pub stop_loss: f64,
     pub take_profit: f64,
-    pub risk_pct: f64,
+    /// How much equity to commit. `Percent` is the historic mode;
+    /// `Amount` is a fixed money sum in account currency.
+    pub risk: RiskBudget,
 }
 
 /// Failure modes for [`Broker::place_entry`]. Brokers map their own error

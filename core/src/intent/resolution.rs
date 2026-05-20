@@ -19,6 +19,21 @@ pub enum ResolvedEntry {
     Limit { trigger_price: f64 },
 }
 
+/// How much to risk on this trade. Resolved from the intent's
+/// `risk_pct` (default) or `risk_amount` (alternative) field.
+///
+/// `Percent` is in percent-of-equity (e.g. `0.5` = 0.5%); `Amount` is
+/// a fixed money sum in the account's own currency. The broker layer
+/// converts whichever it receives into a money budget at fire time.
+#[derive(Debug, Clone, Copy)]
+pub enum RiskBudget {
+    /// Risk this percent of account equity.
+    Percent(f64),
+    /// Risk this fixed amount in account currency. Worker translates
+    /// to an effective `risk_pct` at fire time so the cap still applies.
+    Amount(f64),
+}
+
 /// Fully-resolved trade intent, with all prices computed.
 #[derive(Debug, Clone)]
 pub struct Resolved {
@@ -33,7 +48,11 @@ pub struct Resolved {
     pub entry: ResolvedEntry,
     pub stop_loss: f64,
     pub take_profit: f64,
-    pub risk_pct: f64,
+    pub risk: RiskBudget,
+    /// Worker should compute the sizing as normal but skip placing the
+    /// order — the inputs / calculations / output get logged instead.
+    /// Defaults to false. See `Intent::dry_run`.
+    pub dry_run: bool,
 }
 
 /// Hard server-side floor on `min_r`. Overrides below this are rejected
@@ -61,6 +80,11 @@ pub enum ResolveError {
         stop_loss: f64,
         take_profit: f64,
     },
+    /// Both `risk_pct` and `risk_amount` set on the same intent.
+    /// They're mutually exclusive — pick one.
+    BothRiskModesSet,
+    /// `risk_amount` set to a non-positive / non-finite value.
+    InvalidRiskAmount { value: f64 },
 }
 
 impl core::fmt::Display for ResolveError {
@@ -85,6 +109,12 @@ impl core::fmt::Display for ResolveError {
                 f,
                 "entry {entry} is outside the SL..TP range ({stop_loss}..{take_profit})"
             ),
+            Self::BothRiskModesSet => {
+                f.write_str("risk_pct and risk_amount are mutually exclusive")
+            }
+            Self::InvalidRiskAmount { value } => {
+                write!(f, "risk_amount must be positive and finite, got {value}")
+            }
         }
     }
 }
@@ -117,9 +147,17 @@ impl Resolved {
             .take_profit
             .as_ref()
             .ok_or(ResolveError::MissingField("take_profit"))?;
-        let risk_pct = intent
-            .risk_pct
-            .ok_or(ResolveError::MissingField("risk_pct"))?;
+        let risk = match (intent.risk_pct, intent.risk_amount) {
+            (Some(_), Some(_)) => return Err(ResolveError::BothRiskModesSet),
+            (None, None) => return Err(ResolveError::MissingField("risk_pct")),
+            (Some(pct), None) => RiskBudget::Percent(pct),
+            (None, Some(amount)) => {
+                if !amount.is_finite() || amount <= 0.0 {
+                    return Err(ResolveError::InvalidRiskAmount { value: amount });
+                }
+                RiskBudget::Amount(amount)
+            }
+        };
 
         let stop_loss = sl_ref.resolve(shell, pip_size);
 
@@ -227,7 +265,8 @@ impl Resolved {
             entry,
             stop_loss,
             take_profit,
-            risk_pct,
+            risk,
+            dry_run: intent.dry_run.unwrap_or(false),
         })
     }
 }
@@ -287,6 +326,8 @@ mod tests {
                 offset_r: 2.0,
             }),
             risk_pct: Some(0.5),
+            risk_amount: None,
+            dry_run: None,
             cooldown_hours: None,
             min_r: None,
             broker: BrokerKind::Oanda,
@@ -509,6 +550,76 @@ mod tests {
             Resolved::from_intent(&intent, &shell(), 0.0001),
             Err(ResolveError::MissingField("risk_pct"))
         ));
+    }
+
+    #[test]
+    fn risk_amount_resolves_to_amount_budget() {
+        let mut intent = long_market_intent();
+        intent.risk_pct = None;
+        intent.risk_amount = Some(1.0);
+        let r = Resolved::from_intent(&intent, &shell(), 0.0001).unwrap();
+        match r.risk {
+            RiskBudget::Amount(a) => assert!((a - 1.0).abs() < 1e-9),
+            other => panic!("expected Amount, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn both_risk_modes_rejected() {
+        let mut intent = long_market_intent();
+        // risk_pct already Some(0.5) on the fixture; also set risk_amount.
+        intent.risk_amount = Some(1.0);
+        assert!(matches!(
+            Resolved::from_intent(&intent, &shell(), 0.0001),
+            Err(ResolveError::BothRiskModesSet)
+        ));
+    }
+
+    #[test]
+    fn risk_amount_zero_rejected() {
+        let mut intent = long_market_intent();
+        intent.risk_pct = None;
+        intent.risk_amount = Some(0.0);
+        assert!(matches!(
+            Resolved::from_intent(&intent, &shell(), 0.0001),
+            Err(ResolveError::InvalidRiskAmount { .. })
+        ));
+    }
+
+    #[test]
+    fn risk_amount_negative_rejected() {
+        let mut intent = long_market_intent();
+        intent.risk_pct = None;
+        intent.risk_amount = Some(-1.0);
+        assert!(matches!(
+            Resolved::from_intent(&intent, &shell(), 0.0001),
+            Err(ResolveError::InvalidRiskAmount { .. })
+        ));
+    }
+
+    #[test]
+    fn risk_amount_nan_rejected() {
+        let mut intent = long_market_intent();
+        intent.risk_pct = None;
+        intent.risk_amount = Some(f64::NAN);
+        assert!(matches!(
+            Resolved::from_intent(&intent, &shell(), 0.0001),
+            Err(ResolveError::InvalidRiskAmount { .. })
+        ));
+    }
+
+    #[test]
+    fn dry_run_defaults_false() {
+        let r = Resolved::from_intent(&long_market_intent(), &shell(), 0.0001).unwrap();
+        assert!(!r.dry_run);
+    }
+
+    #[test]
+    fn dry_run_propagates_to_resolved() {
+        let mut intent = long_market_intent();
+        intent.dry_run = Some(true);
+        let r = Resolved::from_intent(&intent, &shell(), 0.0001).unwrap();
+        assert!(r.dry_run);
     }
 
     #[test]

@@ -118,19 +118,33 @@ Steps:
       clippy + fmt clean on host + wasm.
 - [ ] **Step 5: retire legacy fallback** and port existing accounts
       across.
-- [ ] **Step 6: extend `AccountCaps`.** Two new fields, both
-      live-account-focused:
+- [x] **Fixed-amount risk + dry-run on intent.** `Intent` gains two
+      new fields: `risk_amount: Option<f64>` (alternative to
+      `risk_pct` — risk this many account-currency units per trade,
+      e.g. `1.0` to "bet $1") and `dry_run: Option<bool>` (when true,
+      worker resolves + logs sizing inputs/output but skips the
+      broker call). `Resolved` carries a new `RiskBudget` enum
+      (`Percent(f64)` / `Amount(f64)`) instead of a bare `risk_pct`;
+      resolver rejects both-set or invalid amounts at the edge.
+      OANDA broker consumes either mode (computes effective percent
+      and enforces the cap against equity); TN adapter rejects
+      `Amount` for now with a clear log (upstream
+      `broker-tradenation` still takes `risk_pct` only — bumping it
+      is a separate pass). Dry-run short-circuits in the worker
+      dispatch before `place_entry` and logs id / instrument /
+      direction / entry / SL / TP / risk-mode / implicit R; works
+      for both brokers. 271 tests pass (76 cli, 160 core, 16
+      broker-oanda, 14 worker, 5 cli-bin); clippy + fmt clean on
+      host + wasm.
+- [ ] **Step 6: extend `AccountCaps`.** One remaining live-focused
+      field:
       - `min_position_size` (optional) — refuse entries that would
         place fewer units than this. Useful on live where the broker's
         own minimum is too small to absorb spread + slippage
         profitably.
-      - `risk_mode` — currently every entry risks a percent of
-        equity. Add an alternative "fixed amount" mode that risks a
-        set sum in account currency (e.g. £5 per trade) regardless
-        of equity. Lets a live account run conservatively without
-        scaling up as the balance grows.
-      Both live in metadata (not credentials), and the
-      "narrower-wins" rule still applies for the percent ceiling.
+      `risk_mode` is now an intent-level field (see above) rather
+      than an account cap; the per-account "ceiling" is still the
+      single `max_risk_pct` cap, applied uniformly to both modes.
 
 ## Done
 

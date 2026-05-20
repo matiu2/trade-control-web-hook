@@ -11,7 +11,8 @@ use worker::console_error;
 
 use crate::risk;
 use trade_control_core::broker::{EntryError, EntryRequest};
-use trade_control_core::intent::{Direction, ResolvedEntry};
+use trade_control_core::intent::{Direction, ResolvedEntry, RiskBudget};
+use worker::console_log;
 
 const OANDA_API_KEY: &str = "OANDA_API_KEY";
 pub const OANDA_ACCOUNT_ID: &str = "OANDA_ACCOUNT_ID";
@@ -88,9 +89,13 @@ pub async fn place_entry(
     max_open_positions: u32,
     req: &EntryRequest<'_>,
 ) -> Result<String, EntryError> {
-    if req.risk_pct > max_risk_pct {
+    // Cheap-to-check ceiling for `Percent` mode. `Amount` is checked
+    // against the equity-derived percent below once we have equity.
+    if let RiskBudget::Percent(pct) = req.risk
+        && pct > max_risk_pct
+    {
         return Err(EntryError::RiskCapExceeded {
-            requested: req.risk_pct,
+            requested: pct,
             cap: max_risk_pct,
         });
     }
@@ -116,7 +121,33 @@ pub async fn place_entry(
         ResolvedEntry::Limit { trigger_price } => trigger_price,
     };
 
-    let units = risk::units_for_risk(equity, req.risk_pct, reference_price, req.stop_loss);
+    // Translate `Amount` to an effective percent so the cap still applies.
+    // If the operator asks to risk $50 on a $1k account, that's 5% — the
+    // cap should catch it.
+    let (budget, effective_pct) = match req.risk {
+        RiskBudget::Percent(pct) => (equity * pct / 100.0, pct),
+        RiskBudget::Amount(amount) => {
+            if equity <= 0.0 {
+                return Err(EntryError::EquityParse);
+            }
+            let pct = amount / equity * 100.0;
+            if pct > max_risk_pct {
+                return Err(EntryError::RiskCapExceeded {
+                    requested: pct,
+                    cap: max_risk_pct,
+                });
+            }
+            (amount, pct)
+        }
+    };
+
+    let units = risk::units_for_budget(budget, reference_price, req.stop_loss);
+    console_log!(
+        "oanda sizing: instrument={} mode={:?} equity={equity} effective_pct={effective_pct:.4} budget={budget} entry_ref={reference_price} sl={} units={units}",
+        req.instrument,
+        req.risk,
+        req.stop_loss,
+    );
     if units == 0 {
         return Err(EntryError::UnitsBelowMinimum);
     }

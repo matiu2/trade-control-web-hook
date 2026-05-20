@@ -427,8 +427,37 @@ async fn run_enter<B: Broker>(
         entry: resolved.entry.clone(),
         stop_loss: resolved.stop_loss,
         take_profit: resolved.take_profit,
-        risk_pct: resolved.risk_pct,
+        risk: resolved.risk,
     };
+
+    // Dry-run short-circuit: log the resolved sizing inputs and the
+    // implicit R-multiple, then succeed without calling the broker.
+    // The per-broker sizing (equity fetch, FX, market lookup) only
+    // happens inside `place_entry`, so we can't log "units = N" here
+    // — but we *can* show the operator everything we have without
+    // touching the live account.
+    if resolved.dry_run {
+        let r_distance = (entry_reference_price(&resolved.entry) - resolved.stop_loss).abs();
+        let tp_distance = (resolved.take_profit - entry_reference_price(&resolved.entry)).abs();
+        let r_multiple = if r_distance > 0.0 {
+            tp_distance / r_distance
+        } else {
+            f64::NAN
+        };
+        console_log!(
+            "DRY-RUN entry id={} instrument={} direction={:?} entry={:?} sl={} tp={} risk={:?} r={:.3}",
+            verified.intent.id,
+            resolved.instrument,
+            resolved.direction,
+            resolved.entry,
+            resolved.stop_loss,
+            resolved.take_profit,
+            resolved.risk,
+            r_multiple,
+        );
+        return ActionResult::Ok(format!("dry-run: id={}", verified.intent.id));
+    }
+
     match broker
         .place_entry(max_risk_pct, max_open_positions, &entry_request)
         .await
@@ -441,6 +470,17 @@ async fn run_enter<B: Broker>(
             console_error!("entry failed: {err}");
             ActionResult::Failed(format!("entry-failed: {err}"))
         }
+    }
+}
+
+/// Reference price for risk math — for market orders it's the close,
+/// for stop/limit it's the trigger. Same pick the broker layer uses.
+fn entry_reference_price(entry: &trade_control_core::intent::ResolvedEntry) -> f64 {
+    use trade_control_core::intent::ResolvedEntry;
+    match entry {
+        ResolvedEntry::Market { reference_price } => *reference_price,
+        ResolvedEntry::Stop { trigger_price } => *trigger_price,
+        ResolvedEntry::Limit { trigger_price } => *trigger_price,
     }
 }
 

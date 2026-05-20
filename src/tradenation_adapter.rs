@@ -6,7 +6,8 @@
 
 use broker_tradenation::TradeNationBroker;
 use trade_control_core::broker::{Broker, EntryError, EntryRequest};
-use trade_control_core::intent::{Direction, ResolvedEntry};
+use trade_control_core::intent::{Direction, ResolvedEntry, RiskBudget};
+use worker::console_error;
 
 pub struct TradeNationAdapter(pub TradeNationBroker);
 
@@ -17,13 +18,29 @@ impl Broker for TradeNationAdapter {
         max_open_positions: u32,
         req: &EntryRequest<'_>,
     ) -> Result<String, EntryError> {
+        // Upstream's `EntryRequest` only carries `risk_pct`. Threading
+        // `RiskBudget::Amount` through would mean bumping
+        // `broker-tradenation` (which fetches equity inside its own
+        // `place_entry`). Reject for now with a clear log — `dry_run`
+        // still works for amount-mode intents on TN since dispatch
+        // short-circuits before calling the broker.
+        let risk_pct = match req.risk {
+            RiskBudget::Percent(pct) => pct,
+            RiskBudget::Amount(_) => {
+                console_error!(
+                    "tradenation adapter: risk_amount not yet supported on TN — \
+                     use risk_pct, or wait for the broker-tradenation bump"
+                );
+                return Err(EntryError::OrderRejected);
+            }
+        };
         let upstream_req = broker_tradenation::EntryRequest {
             instrument: req.instrument,
             direction: to_upstream_direction(req.direction),
             entry: to_upstream_entry(&req.entry),
             stop_loss: req.stop_loss,
             take_profit: req.take_profit,
-            risk_pct: req.risk_pct,
+            risk_pct,
         };
         self.0
             .place_entry(max_risk_pct, max_open_positions, &upstream_req)

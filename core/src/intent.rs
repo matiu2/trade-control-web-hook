@@ -9,7 +9,7 @@ mod resolution;
 
 #[cfg(feature = "cli")]
 pub use resolution::MIN_R_FLOOR;
-pub use resolution::{Resolved, ResolvedEntry};
+pub use resolution::{Resolved, ResolvedEntry, RiskBudget};
 
 /// Plaintext outer YAML — the part TradingView substitutes `{{...}}` into.
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -52,9 +52,29 @@ pub struct Intent {
     /// Required for `enter`.
     #[serde(default)]
     pub take_profit: Option<TakeProfit>,
-    /// Required for `enter`. % of account equity. The server-side cap clamps it.
+    /// Required for `enter` unless `risk_amount` is set. % of account
+    /// equity; the server-side cap clamps it. Exactly one of
+    /// `risk_pct` / `risk_amount` must be set.
     #[serde(default)]
     pub risk_pct: Option<f64>,
+    /// Alternative to `risk_pct`: a fixed money amount to risk per
+    /// trade, in the account's own currency (e.g. `1.0` for "bet $1").
+    /// Useful on a live account to keep position sizes constant
+    /// regardless of equity growth. Exactly one of `risk_pct` /
+    /// `risk_amount` must be set; mixing both is rejected at resolve
+    /// time. The `MAX_RISK_PCT_PER_TRADE` cap still applies — at fire
+    /// time the worker translates the amount to an effective percent
+    /// (`amount / equity * 100`) and rejects if that exceeds the cap.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub risk_amount: Option<f64>,
+    /// When true, the worker resolves the intent, logs the sizing
+    /// inputs / calculations / output, then returns success **without
+    /// placing the order**. Useful for verifying new sizing modes
+    /// (e.g. `risk_amount`) safely on a live account, and for sanity-
+    /// checking a fresh template before live-firing it. Defaults to
+    /// false. Applies to `enter` only; non-entry actions ignore it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dry_run: Option<bool>,
     /// Required for `invalidate`.
     #[serde(default)]
     pub cooldown_hours: Option<u32>,

@@ -83,10 +83,20 @@ pub fn read_action(template: &Value) -> Option<Action> {
 
 /// Return the list of top-level keys (from `required`) that are absent or
 /// `null` in `template`. Order matches `required`.
+///
+/// Special case: `risk_pct` and `risk_amount` are alternatives — if the
+/// template already carries `risk_amount`, we don't ask for `risk_pct`.
+/// The server-side resolver rejects both-set so we don't double-prompt.
 pub fn missing_fields<'a>(template: &Value, required: &[&'a str]) -> Vec<&'a str> {
+    let has_risk_amount = !matches!(template.get("risk_amount"), None | Some(Value::Null));
     required
         .iter()
-        .filter(|name| matches!(template.get(**name), None | Some(Value::Null)))
+        .filter(|name| {
+            if **name == "risk_pct" && has_risk_amount {
+                return false;
+            }
+            matches!(template.get(**name), None | Some(Value::Null))
+        })
         .copied()
         .collect()
 }
@@ -241,6 +251,25 @@ mod tests {
         let v = map("v: 1\nid: ~\naction: enter\n");
         let missing = missing_fields(&v, &["id"]);
         assert_eq!(missing, vec!["id"]);
+    }
+
+    #[test]
+    fn missing_fields_skips_risk_pct_when_risk_amount_set() {
+        // A template that pre-picks `risk_amount: 1.0` shouldn't be
+        // re-prompted for `risk_pct` — they're alternatives.
+        let v = map("risk_amount: 1.0\n");
+        let missing = missing_fields(&v, &["risk_pct"]);
+        assert!(
+            missing.is_empty(),
+            "risk_pct prompted despite risk_amount present"
+        );
+    }
+
+    #[test]
+    fn missing_fields_still_prompts_risk_pct_when_no_risk_amount() {
+        let v = map("v: 1\n");
+        let missing = missing_fields(&v, &["risk_pct"]);
+        assert_eq!(missing, vec!["risk_pct"]);
     }
 
     #[test]

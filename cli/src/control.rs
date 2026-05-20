@@ -35,6 +35,8 @@ fn control_skeleton(action: Action, instrument: &str, id: String, now: DateTime<
         stop_loss: None,
         take_profit: None,
         risk_pct: None,
+        risk_amount: None,
+        dry_run: None,
         cooldown_hours: None,
         min_r: None,
         broker: BrokerKind::Oanda,
