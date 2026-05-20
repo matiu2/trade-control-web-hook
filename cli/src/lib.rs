@@ -22,8 +22,8 @@ pub use interactive::{fill_missing_fields, prompt_save_as_template};
 pub use templates::{discover_templates, pick_template_interactive, templates_root};
 pub use trade_control_core::sig::KEY_LEN;
 pub use trade_patterns::{
-    BuiltAlert, BuiltTrade, TradePattern, build_trade_interactive, pick_pattern_interactive,
-    write_trade,
+    BuiltAlert, BuiltTrade, TradePattern, TradeSpec, build_trade_from_spec,
+    build_trade_interactive, load_spec_from_file, pick_pattern_interactive, write_trade,
 };
 
 /// Generate a fresh 32-byte signing key as 64 hex chars, using the OS RNG.

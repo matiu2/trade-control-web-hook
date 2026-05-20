@@ -24,6 +24,7 @@ use chrono::{DateTime, Duration, Utc};
 use color_eyre::eyre::{Context, Result, eyre};
 use dialoguer::theme::ColorfulTheme;
 use dialoguer::{FuzzySelect, Input};
+use serde::{Deserialize, Serialize};
 
 use trade_control_core::intent::{
     Action, BrokerKind, Direction, EntrySpec, Intent, PriceAnchor, PriceRef, TakeProfit, VetoLevel,
@@ -51,7 +52,8 @@ const DEFAULT_RISK_PCT: f64 = 1.0;
 /// The catalogue of supported trade patterns. The discriminant doubles
 /// as the CLI argument (`hs`, `ihs`, `m`, `w`) and the label in the
 /// fuzzy picker.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum TradePattern {
     /// Head & Shoulders — short.
     Hs,
@@ -181,6 +183,7 @@ pub fn pick_pattern_interactive() -> Result<TradePattern> {
 /// One alert ready to be written to disk. Carries the file basename (no
 /// extension) so the caller can drop it into the output directory and
 /// also reference it from the manifest.
+#[derive(Debug)]
 pub struct BuiltAlert {
     pub basename: String,
     /// Human-readable purpose for the manifest. e.g. "veto: too-high
@@ -190,11 +193,77 @@ pub struct BuiltAlert {
 }
 
 /// Outputs of a build-trade run, before they're flushed to disk.
+#[derive(Debug)]
 pub struct BuiltTrade {
     pub trade_id: String,
     pub instrument: String,
     pub trade_expiry: DateTime<Utc>,
     pub alerts: Vec<BuiltAlert>,
+    /// The spec used to build this trade — captured so the caller can
+    /// persist it next to the alerts as a `trade.yaml` for reproducible
+    /// rebuilds.
+    pub spec: TradeSpec,
+}
+
+/// Declarative form of every answer the [`build_pattern`] questionnaire
+/// collects. Drives both the interactive and `--from-file` paths so the
+/// two cannot drift.
+///
+/// Optional fields apply the same defaults the interactive prompts do.
+/// `tp_price` is required — there's no sensible default for an absolute
+/// take-profit.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TradeSpec {
+    pub pattern: TradePattern,
+    pub instrument: String,
+    pub account: String,
+    /// Broker the alerts target. Defaults to OANDA when omitted.
+    #[serde(default = "default_broker")]
+    pub broker: BrokerKind,
+    /// Wall-clock end of the trade's validity window. Must be in the
+    /// future relative to *now* at build time.
+    pub trade_expiry: DateTime<Utc>,
+    /// Risk per trade as a percent of equity.
+    #[serde(default = "default_risk_pct")]
+    pub risk_pct: f64,
+    /// Entry stop-trigger offset in pips from the geometry anchor.
+    /// Omit to use the pattern's default (1 pip).
+    #[serde(default)]
+    pub entry_offset_pips: Option<f64>,
+    /// Stop-loss offset in pips from the geometry anchor. Same default
+    /// behaviour as `entry_offset_pips`.
+    #[serde(default)]
+    pub sl_offset_pips: Option<f64>,
+    /// Take-profit absolute price. The worker treats this verbatim and
+    /// does not consult the shell.
+    pub tp_price: f64,
+    /// Entry window end as a percentage of (trade_expiry − now). Default
+    /// 80 — leaves a tail of trade_expiry to chase a late retest only if
+    /// the operator extends the window.
+    #[serde(default = "default_entry_deadline_pct")]
+    pub entry_deadline_pct: u32,
+}
+
+fn default_broker() -> BrokerKind {
+    BrokerKind::Oanda
+}
+
+fn default_risk_pct() -> f64 {
+    DEFAULT_RISK_PCT
+}
+
+fn default_entry_deadline_pct() -> u32 {
+    DEFAULT_ENTRY_DEADLINE_PCT
+}
+
+/// Read a `trade.yaml` file and return its [`TradeSpec`]. Pure I/O +
+/// deser — validation lives in [`build_trade_from_spec`].
+pub fn load_spec_from_file(path: &Path) -> Result<TradeSpec> {
+    let text =
+        fs::read_to_string(path).with_context(|| format!("reading spec {}", path.display()))?;
+    let spec: TradeSpec = serde_yaml::from_str(&text)
+        .with_context(|| format!("parsing spec {} as YAML", path.display()))?;
+    Ok(spec)
 }
 
 /// Run the full questionnaire for a pattern and return the assembled
@@ -209,6 +278,45 @@ pub fn build_trade_interactive(pattern: TradePattern, now: DateTime<Utc>) -> Res
             pattern.label()
         )),
     }
+}
+
+/// Build a trade from a pre-filled [`TradeSpec`] with no prompts. Used by
+/// the `--from-file` flag on `build-trade`. Validates the spec against
+/// the same rules the prompts would enforce, then assembles the alerts.
+pub fn build_trade_from_spec(spec: TradeSpec, now: DateTime<Utc>) -> Result<BuiltTrade> {
+    match spec.pattern {
+        TradePattern::Hs | TradePattern::Ihs => {}
+        TradePattern::M | TradePattern::W => {
+            return Err(eyre!(
+                "pattern {} is not yet implemented — only `hs` and `ihs` are wired up so far",
+                spec.pattern.label()
+            ));
+        }
+    }
+    if spec.instrument.trim().is_empty() {
+        return Err(eyre!("instrument is required"));
+    }
+    if spec.account.trim().is_empty() {
+        return Err(eyre!("account is required"));
+    }
+    if spec.trade_expiry <= now {
+        return Err(eyre!("trade_expiry must be in the future"));
+    }
+    if !spec.tp_price.is_finite() {
+        return Err(eyre!("tp_price must be a finite number"));
+    }
+    if spec.entry_deadline_pct == 0 || spec.entry_deadline_pct > 100 {
+        return Err(eyre!("entry_deadline_pct must be in 1..=100"));
+    }
+    if !spec.risk_pct.is_finite() || spec.risk_pct <= 0.0 {
+        return Err(eyre!("risk_pct must be a positive finite number"));
+    }
+    let geometry = PatternGeometry::for_pattern(spec.pattern);
+    let entry_offset_pips = spec
+        .entry_offset_pips
+        .unwrap_or(geometry.entry_offset_default);
+    let sl_offset_pips = spec.sl_offset_pips.unwrap_or(geometry.sl_offset_default);
+    assemble_trade(spec, geometry, entry_offset_pips, sl_offset_pips, now)
 }
 
 /// Persist a built trade: each alert as `<basename>.yaml` (signed,
@@ -227,6 +335,12 @@ pub fn write_trade(trade: &BuiltTrade, key: &[u8; KEY_LEN], out_dir: &Path) -> R
     let manifest_path = out_dir.join("manifest.yaml");
     fs::write(&manifest_path, manifest)
         .with_context(|| format!("writing {}", manifest_path.display()))?;
+    // Persist the spec so a future run can rebuild this trade with
+    // `--from-file trade.yaml` — useful for tweaking one field without
+    // re-running the questionnaire from scratch.
+    let spec_yaml = serde_yaml::to_string(&trade.spec).context("serialising trade.yaml")?;
+    let spec_path = out_dir.join("trade.yaml");
+    fs::write(&spec_path, spec_yaml).with_context(|| format!("writing {}", spec_path.display()))?;
     Ok(out_dir.to_path_buf())
 }
 
@@ -313,50 +427,90 @@ fn build_pattern(
         .interact_text()
         .map_err(|e| eyre!("entry deadline prompt: {e}"))?;
 
-    let trade_id = mint_trade_id(pattern, &instrument)?;
-    let entry_deadline = derive_entry_deadline(now, trade_expiry, entry_deadline_pct);
-    let veto_expiry = trade_expiry + DEFAULT_POST_EXPIRY_GRACE;
+    let spec = TradeSpec {
+        pattern,
+        instrument,
+        account,
+        broker,
+        trade_expiry,
+        risk_pct,
+        entry_offset_pips: Some(entry_offset_pips),
+        sl_offset_pips: Some(sl_offset_pips),
+        tp_price,
+        entry_deadline_pct,
+    };
+    assemble_trade(spec, geometry, entry_offset_pips, sl_offset_pips, now)
+}
+
+/// Common alert-assembly path shared by the interactive and
+/// `--from-file` modes. Both already-resolved offset values are passed
+/// in so callers can apply pattern defaults exactly once.
+fn assemble_trade(
+    spec: TradeSpec,
+    geometry: PatternGeometry,
+    entry_offset_pips: f64,
+    sl_offset_pips: f64,
+    now: DateTime<Utc>,
+) -> Result<BuiltTrade> {
+    let trade_id = mint_trade_id(spec.pattern, &spec.instrument)?;
+    let entry_deadline = derive_entry_deadline(now, spec.trade_expiry, spec.entry_deadline_pct);
+    let veto_expiry = spec.trade_expiry + DEFAULT_POST_EXPIRY_GRACE;
 
     let alerts = vec![
         build_invalidation_alert(
-            &instrument,
+            &spec.instrument,
             &trade_id,
             geometry.invalidation_veto_name,
             veto_expiry,
-            &broker,
-            &account,
+            &spec.broker,
+            &spec.account,
             now,
         ),
         build_trade_expiry_alert(
-            &instrument,
+            &spec.instrument,
             &trade_id,
-            trade_expiry,
+            spec.trade_expiry,
             veto_expiry,
-            &broker,
-            &account,
+            &spec.broker,
+            &spec.account,
             now,
         ),
-        build_break_and_close_alert(&instrument, &trade_id, trade_expiry, &broker, &account, now),
-        build_retest_alert(&instrument, &trade_id, trade_expiry, &broker, &account, now),
+        build_break_and_close_alert(
+            &spec.instrument,
+            &trade_id,
+            spec.trade_expiry,
+            &spec.broker,
+            &spec.account,
+            now,
+        ),
+        build_retest_alert(
+            &spec.instrument,
+            &trade_id,
+            spec.trade_expiry,
+            &spec.broker,
+            &spec.account,
+            now,
+        ),
         build_enter_alert(
-            &instrument,
+            &spec.instrument,
             &trade_id,
             &geometry,
             entry_deadline,
             entry_offset_pips,
             sl_offset_pips,
-            tp_price,
-            risk_pct,
-            &broker,
-            &account,
+            spec.tp_price,
+            spec.risk_pct,
+            &spec.broker,
+            &spec.account,
         ),
     ];
 
     Ok(BuiltTrade {
         trade_id,
-        instrument,
-        trade_expiry,
+        instrument: spec.instrument.clone(),
+        trade_expiry: spec.trade_expiry,
         alerts,
+        spec,
     })
 }
 
@@ -784,6 +938,18 @@ mod tests {
             instrument: "EUR_USD".into(),
             trade_expiry,
             alerts,
+            spec: TradeSpec {
+                pattern: TradePattern::Hs,
+                instrument: "EUR_USD".into(),
+                account: "demo".into(),
+                broker: BrokerKind::Oanda,
+                trade_expiry,
+                risk_pct: DEFAULT_RISK_PCT,
+                entry_offset_pips: Some(1.0),
+                sl_offset_pips: Some(1.0),
+                tp_price: 1.0500,
+                entry_deadline_pct: DEFAULT_ENTRY_DEADLINE_PCT,
+            },
         };
         let manifest = render_manifest(&trade);
         assert!(manifest.contains("trade_id: hs-eur-usd-abcd"));
@@ -914,6 +1080,121 @@ mod tests {
         assert_eq!(alert.intent.name.as_deref(), Some("too-low"));
         assert_eq!(alert.basename, "01-veto-too-low");
         assert!(alert.purpose.contains("too-low"));
+    }
+
+    fn sample_spec(pattern: TradePattern, trade_expiry: DateTime<Utc>) -> TradeSpec {
+        TradeSpec {
+            pattern,
+            instrument: "EUR_USD".into(),
+            account: "demo".into(),
+            broker: BrokerKind::Oanda,
+            trade_expiry,
+            risk_pct: 1.0,
+            entry_offset_pips: None,
+            sl_offset_pips: None,
+            tp_price: 1.0500,
+            entry_deadline_pct: 80,
+        }
+    }
+
+    #[test]
+    fn build_trade_from_spec_emits_five_alerts_for_hs() {
+        let now = ts("2026-05-20T00:00:00Z");
+        let spec = sample_spec(TradePattern::Hs, ts("2026-05-25T00:00:00Z"));
+        let trade = build_trade_from_spec(spec, now).unwrap();
+        assert_eq!(trade.alerts.len(), 5);
+        assert_eq!(trade.alerts[0].basename, "01-veto-too-high");
+        assert_eq!(trade.alerts[4].basename, "05-enter");
+        // The spec is round-tripped onto the BuiltTrade so write_trade
+        // can persist it next to the alerts.
+        assert_eq!(trade.spec.pattern, TradePattern::Hs);
+    }
+
+    #[test]
+    fn build_trade_from_spec_emits_five_alerts_for_ihs() {
+        let now = ts("2026-05-20T00:00:00Z");
+        let spec = sample_spec(TradePattern::Ihs, ts("2026-05-25T00:00:00Z"));
+        let trade = build_trade_from_spec(spec, now).unwrap();
+        // IH&S → too-low veto (not too-high).
+        assert_eq!(trade.alerts[0].basename, "01-veto-too-low");
+    }
+
+    #[test]
+    fn build_trade_from_spec_rejects_unimplemented_pattern() {
+        let now = ts("2026-05-20T00:00:00Z");
+        let spec = sample_spec(TradePattern::M, ts("2026-05-25T00:00:00Z"));
+        let err = build_trade_from_spec(spec, now).unwrap_err();
+        assert!(err.to_string().contains("not yet implemented"), "got {err}");
+    }
+
+    #[test]
+    fn build_trade_from_spec_rejects_past_trade_expiry() {
+        let now = ts("2026-05-20T00:00:00Z");
+        let spec = sample_spec(TradePattern::Hs, ts("2026-05-19T00:00:00Z"));
+        let err = build_trade_from_spec(spec, now).unwrap_err();
+        assert!(err.to_string().contains("future"), "got {err}");
+    }
+
+    #[test]
+    fn build_trade_from_spec_rejects_bad_entry_deadline_pct() {
+        let now = ts("2026-05-20T00:00:00Z");
+        let mut spec = sample_spec(TradePattern::Hs, ts("2026-05-25T00:00:00Z"));
+        spec.entry_deadline_pct = 0;
+        assert!(build_trade_from_spec(spec, now).is_err());
+        let mut spec2 = sample_spec(TradePattern::Hs, ts("2026-05-25T00:00:00Z"));
+        spec2.entry_deadline_pct = 101;
+        assert!(build_trade_from_spec(spec2, now).is_err());
+    }
+
+    #[test]
+    fn build_trade_from_spec_applies_pattern_default_offsets() {
+        // Omitting entry/sl offsets must fall back to the pattern's
+        // geometry defaults (1 pip from short.yaml / long.yaml).
+        let now = ts("2026-05-20T00:00:00Z");
+        let spec = sample_spec(TradePattern::Hs, ts("2026-05-25T00:00:00Z"));
+        let trade = build_trade_from_spec(spec, now).unwrap();
+        let enter = trade.alerts.last().unwrap();
+        match &enter.intent.entry {
+            Some(EntrySpec::Stop { offset_pips, .. }) => {
+                assert!((offset_pips - 1.0).abs() < 1e-9);
+            }
+            other => panic!("expected Stop entry, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn trade_spec_minimal_yaml_round_trips_with_defaults() {
+        // The minimal YAML an operator should be able to write — only
+        // the un-defaulted fields. Everything else must come from the
+        // serde defaults.
+        let yaml = "\
+pattern: hs
+instrument: EUR_USD
+account: demo
+trade_expiry: \"2026-05-25T00:00:00Z\"
+tp_price: 1.05
+";
+        let spec: TradeSpec = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(spec.pattern, TradePattern::Hs);
+        assert_eq!(spec.broker, BrokerKind::Oanda);
+        assert!((spec.risk_pct - DEFAULT_RISK_PCT).abs() < 1e-9);
+        assert_eq!(spec.entry_offset_pips, None);
+        assert_eq!(spec.sl_offset_pips, None);
+        assert_eq!(spec.entry_deadline_pct, DEFAULT_ENTRY_DEADLINE_PCT);
+    }
+
+    #[test]
+    fn trade_spec_round_trips_through_yaml() {
+        // Full spec → YAML → spec must produce the same logical value.
+        let original = sample_spec(TradePattern::Ihs, ts("2026-05-25T00:00:00Z"));
+        let s = serde_yaml::to_string(&original).unwrap();
+        let parsed: TradeSpec = serde_yaml::from_str(&s).unwrap();
+        assert_eq!(parsed.pattern, original.pattern);
+        assert_eq!(parsed.instrument, original.instrument);
+        assert_eq!(parsed.account, original.account);
+        assert_eq!(parsed.broker, original.broker);
+        assert_eq!(parsed.trade_expiry, original.trade_expiry);
+        assert!((parsed.tp_price - original.tp_price).abs() < 1e-9);
     }
 
     #[test]
