@@ -22,11 +22,12 @@ use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use clap_complete::{Shell, generate};
 use color_eyre::eyre::{Context, Result, eyre};
 use trade_control_cli::{
-    KEY_LEN, add_account, build_clear_prep_intent, build_clear_veto_intent, build_prep_intent,
-    build_status_intent, build_unlock_intent, build_veto_intent, delete_account, delete_secret,
-    fill_missing_fields, generate_key_hex, list_accounts, pick_template_interactive,
-    prompt_save_as_template, put_secret, record_prep_use, record_veto_use, secret_binding_for,
-    test_account, wrap_signed, wrap_signed_template,
+    KEY_LEN, TradePattern, add_account, build_clear_prep_intent, build_clear_veto_intent,
+    build_prep_intent, build_status_intent, build_trade_interactive, build_unlock_intent,
+    build_veto_intent, delete_account, delete_secret, fill_missing_fields, generate_key_hex,
+    list_accounts, pick_pattern_interactive, pick_template_interactive, prompt_save_as_template,
+    put_secret, record_prep_use, record_veto_use, secret_binding_for, test_account, wrap_signed,
+    wrap_signed_template, write_trade,
 };
 use trade_control_core::account::{
     AccountKind, AccountMetadata, Credentials, OandaCreds, TradeNationCreds, TradeNationKind,
@@ -78,6 +79,12 @@ enum Cmd {
     /// wraps `wrangler secret put` for the credential half.
     #[command(subcommand)]
     Account(AccountCmd),
+    /// Build a multi-alert trade from a chart pattern (H&S, IH&S, M, W).
+    /// Runs a questionnaire, mints a shared `trade_id`, and emits 5
+    /// signed alert YAMLs plus a manifest into the output directory.
+    /// Each YAML is a complete TradingView-ready alert body — drop them
+    /// into the matching TradingView alerts on the chart.
+    BuildTrade(BuildTradeArgs),
     /// Print a shell completion script to stdout. Install with e.g.
     /// `trade-control completions zsh > ~/.zfunc/_trade-control`.
     Completions {
@@ -343,6 +350,23 @@ struct VerifyArgs {
 }
 
 #[derive(Parser)]
+struct BuildTradeArgs {
+    /// Pattern to build (`hs`, `ihs`, `m`, `w`). Omit to fuzzy-pick
+    /// interactively.
+    pattern: Option<String>,
+    /// Path to a hex-encoded 32-byte signing key. Same key used by
+    /// `sign` and the intent endpoints — emitted alerts go through the
+    /// usual HMAC pipeline.
+    #[arg(long, env = "TRADE_CONTROL_KEY_FILE")]
+    key_file: PathBuf,
+    /// Directory to write the 5 alert YAMLs + manifest into. Created
+    /// if missing. Default is `./trades/<trade_id>/` resolved after the
+    /// id is minted.
+    #[arg(long)]
+    output_dir: Option<PathBuf>,
+}
+
+#[derive(Parser)]
 struct SignArgs {
     /// Path to a hex-encoded 32-byte signing key.
     #[arg(long, env = "TRADE_CONTROL_KEY_FILE")]
@@ -374,7 +398,29 @@ fn main() -> Result<()> {
         Cmd::ClearVeto(args) => run_clear_veto(args)?,
         Cmd::Verify(args) => run_verify(args)?,
         Cmd::Account(sub) => run_account(sub)?,
+        Cmd::BuildTrade(args) => run_build_trade(args)?,
         Cmd::Completions { shell } => run_completions(shell),
+    }
+    Ok(())
+}
+
+fn run_build_trade(args: BuildTradeArgs) -> Result<()> {
+    let key = load_key(&args.key_file)?;
+    let pattern = match args.pattern {
+        Some(s) => TradePattern::parse_arg(&s)
+            .ok_or_else(|| eyre!("unknown pattern {s:?} (expected hs / ihs / m / w)"))?,
+        None => pick_pattern_interactive()?,
+    };
+    let now = Utc::now();
+    let trade = build_trade_interactive(pattern, now)?;
+    let out_dir = args
+        .output_dir
+        .unwrap_or_else(|| PathBuf::from("trades").join(&trade.trade_id));
+    let written = write_trade(&trade, &key, &out_dir)?;
+    println!("trade_id: {}", trade.trade_id);
+    println!("output: {}", written.display());
+    for alert in &trade.alerts {
+        println!("  - {}.yaml — {}", alert.basename, alert.purpose);
     }
     Ok(())
 }

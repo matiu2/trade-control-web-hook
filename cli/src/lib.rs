@@ -9,6 +9,7 @@ mod history;
 mod interactive;
 mod prompts;
 mod templates;
+mod trade_patterns;
 
 pub use admin_client::{add_account, delete_account, list_accounts, test_account};
 pub use admin_secret::{delete_secret, put_secret, secret_binding_for};
@@ -20,6 +21,10 @@ pub use history::{History, record_prep_use, record_veto_use};
 pub use interactive::{fill_missing_fields, prompt_save_as_template};
 pub use templates::{discover_templates, pick_template_interactive, templates_root};
 pub use trade_control_core::sig::KEY_LEN;
+pub use trade_patterns::{
+    BuiltAlert, BuiltTrade, TradePattern, build_trade_interactive, pick_pattern_interactive,
+    write_trade,
+};
 
 /// Generate a fresh 32-byte signing key as 64 hex chars, using the OS RNG.
 pub fn generate_key_hex() -> String {
