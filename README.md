@@ -184,14 +184,14 @@ prompt for them. Author one template per setup.
 Build:
 
 ```sh
-cargo build --features cli --release --bin encrypt-payload
+cargo build --features cli --release --bin trade-control
 ```
 
 Generate a key once, store the same file on your machine and as the
 `ENCRYPTION_KEY` wrangler secret:
 
 ```sh
-./target/release/encrypt-payload gen-key > ~/.config/trade-control/key.hex
+./target/release/trade-control gen-key > ~/.config/trade-control/key.hex
 wrangler secret put ENCRYPTION_KEY < ~/.config/trade-control/key.hex
 ```
 
@@ -218,7 +218,7 @@ risk_pct: 0.5
 Run:
 
 ```sh
-./target/release/encrypt-payload encrypt \
+./target/release/trade-control encrypt \
   --key-file ~/.config/trade-control/key.hex \
   --template pin-bar-long.yaml
 ```
@@ -235,7 +235,7 @@ For scripted use, pass `--non-interactive` to make the CLI hard-fail on any
 missing field instead of prompting:
 
 ```sh
-./target/release/encrypt-payload encrypt \
+./target/release/trade-control encrypt \
   --key-file ~/.config/trade-control/key.hex \
   --template fully-specified.yaml \
   --non-interactive
@@ -250,28 +250,28 @@ key as auth. Set `TRADE_CONTROL_ENDPOINT` once to skip retyping `--endpoint`:
 export TRADE_CONTROL_ENDPOINT=https://trade-control.<account>.workers.dev
 
 # Dump active cooldowns, preps, vetos + recent seen ids as YAML.
-./target/release/encrypt-payload status \
+./target/release/trade-control status \
   --key-file ~/.config/trade-control/key.hex
 
 # Clear a cooldown set by an `invalidate` you didn't mean to send.
-./target/release/encrypt-payload unlock EUR_USD \
+./target/release/trade-control unlock EUR_USD \
   --key-file ~/.config/trade-control/key.hex
 
 # Set / clear preps and vetos directly. (TradingView normally fires these,
 # but the CLI is the manual escape hatch — e.g. when a prep went stale and
 # should be dropped before TTL.)
-./target/release/encrypt-payload prep EUR_USD break-and-close --ttl-hours 4 \
+./target/release/trade-control prep EUR_USD break-and-close --ttl-hours 4 \
   --key-file ~/.config/trade-control/key.hex
-./target/release/encrypt-payload veto EUR_USD news-window --ttl-hours 6 \
+./target/release/trade-control veto EUR_USD news-window --ttl-hours 6 \
   --key-file ~/.config/trade-control/key.hex
 # Escalated veto: also cancel resting pending orders for the instrument.
 # Add --level close-positions to also close open positions.
-./target/release/encrypt-payload veto EUR_USD structure-broken --ttl-hours 4 \
+./target/release/trade-control veto EUR_USD structure-broken --ttl-hours 4 \
   --level cancel-pending \
   --key-file ~/.config/trade-control/key.hex
-./target/release/encrypt-payload clear-prep EUR_USD break-and-close \
+./target/release/trade-control clear-prep EUR_USD break-and-close \
   --key-file ~/.config/trade-control/key.hex
-./target/release/encrypt-payload clear-veto EUR_USD news-window \
+./target/release/trade-control clear-veto EUR_USD news-window \
   --key-file ~/.config/trade-control/key.hex
 ```
 
@@ -339,20 +339,38 @@ instrument: EUR/USD
 
 ## TradeNation session
 
-The Worker can't run TradeNation's native login redirect chain, so the
-operator exports a `Session` from a native machine and uploads it as a
-Worker secret. When the session dies, the Worker returns 503 with
-`tradenation session expired or invalid` and the operator re-runs the
-export.
+The Worker can't run TradeNation's native login redirect chain (it
+scrapes `Set-Cookie` off a redirect chain, which `reqwest`'s wasm shim
+can't observe — it auto-follows). So the operator's machine logs in,
+exports a `Session`, and uploads it as the `TN_SESSION_JSON` Worker
+secret. When the session dies, the Worker returns 503 with
+`tradenation session expired or invalid` until the next rotation.
+
+A small shell script rotates the secret on a cron. From a native
+machine with `tradenation` CLI authenticated:
 
 ```sh
-# On a native machine with `tradenation-cli` authenticated:
+# Manual one-off:
 tradenation session export "my-tn-account" | wrangler secret put TN_SESSION_JSON
+
+# Or use the bundled script (defaults to the "manual demo" account):
+./scripts/refresh-tn-session.sh
+TN_ACCOUNT_NAME="my-tn-account" ./scripts/refresh-tn-session.sh
+```
+
+Suggested cron — every 2 hours, with reactive manual runs when the
+worker logs `tradenation login failed` between ticks:
+
+```
+0 */2 * * * /path/to/trade-control-web-hook/scripts/refresh-tn-session.sh >> /tmp/tn-session-refresh.log 2>&1
 ```
 
 Lifetime is undocumented by TradeNation. Empirically sessions survive
-hours of intermittent use; rotate when the Worker logs SessionExpired,
-not on a timer.
+hours of intermittent use, so 2-hour rotation is safely under the
+horizon. The trade-off: the rotating machine must be online and the
+operator must hand-rotate during sleep / outages. A self-healing
+wasm-side login lives in `TODO.md`'s parked section; pick it up when
+the cron path proves insufficient.
 
 ## KV namespace
 
@@ -380,7 +398,7 @@ wrangler dev
 Then encrypt an intent (set `not_after` in the future) and POST it:
 
 ```sh
-./target/release/encrypt-payload encrypt \
+./target/release/trade-control encrypt \
   --key-file ~/.config/trade-control/key.hex \
   --template intent.yaml --non-interactive \
   | sed 's/{{close}}/1.1000/; s/{{high}}/1.1020/; s/{{low}}/1.0980/; s/{{time}}/2026-05-13T12:00:00Z/' \

@@ -1,4 +1,4 @@
-//! Native-only helpers used by the `encrypt-payload` CLI. Re-exports a small
+//! Native-only helpers used by the `trade-control` CLI. Re-exports a small
 //! surface so the binary doesn't need to poke at internal modules.
 
 use color_eyre::eyre::{Result, eyre};

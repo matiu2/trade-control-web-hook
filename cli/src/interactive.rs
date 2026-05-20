@@ -365,7 +365,7 @@ fn name_kind_for(field: &str, action: trade_control_core::intent::Action) -> Nam
 /// Doesn't probe the worker for the live account list — that would
 /// require the admin key in the encrypt path, which is the wrong trust
 /// boundary. Operators who want auto-complete should run
-/// `encrypt-payload account list` first.
+/// `trade-control account list` first.
 fn prompt_optional_account() -> Result<Value> {
     let theme = ColorfulTheme::default();
     let raw: String = Input::with_theme(&theme)

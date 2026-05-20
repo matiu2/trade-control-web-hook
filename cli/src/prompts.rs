@@ -1,4 +1,4 @@
-//! Interactive prompts for the `encrypt-payload encrypt` flow.
+//! Interactive prompts for the `trade-control encrypt` flow.
 //!
 //! The flow is split into two layers:
 //!   - `required_for_action` and `missing_fields` are pure functions over a

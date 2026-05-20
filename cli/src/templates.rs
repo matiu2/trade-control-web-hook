@@ -1,6 +1,6 @@
 //! Discovery and fuzzy-pick of intent templates on disk.
 //!
-//! When the operator runs `encrypt-payload encrypt` without `--template`,
+//! When the operator runs `trade-control encrypt` without `--template`,
 //! we walk `~/.config/trade-control/templates/` for `*.yaml` files and
 //! offer a fuzzy picker. The displayed name is the path relative to the
 //! templates root, with the `.yaml` suffix stripped — so a file at

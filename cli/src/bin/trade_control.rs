@@ -38,8 +38,8 @@ use trade_control_core::sig::{self, SIG_FIELD};
 
 #[derive(Parser)]
 #[command(
-    name = "encrypt-payload",
-    about = "Encrypt a trade intent for TradingView"
+    name = "trade-control",
+    about = "Encrypt a trade intent for TradingView and manage worker state"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -87,7 +87,7 @@ enum Cmd {
     #[command(subcommand)]
     Account(AccountCmd),
     /// Print a shell completion script to stdout. Install with e.g.
-    /// `encrypt-payload completions zsh > ~/.zfunc/_encrypt-payload`.
+    /// `trade-control completions zsh > ~/.zfunc/_trade-control`.
     Completions {
         /// Target shell.
         shell: Shell,
@@ -406,7 +406,7 @@ fn main() -> Result<()> {
 
 fn run_completions(shell: Shell) {
     let mut cmd = Cli::command();
-    generate(shell, &mut cmd, "encrypt-payload", &mut io::stdout());
+    generate(shell, &mut cmd, "trade-control", &mut io::stdout());
 }
 
 fn run_verify(args: VerifyArgs) -> Result<()> {
