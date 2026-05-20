@@ -19,7 +19,9 @@ use trade_control_core::broker::{Broker, EntryRequest};
 use trade_control_core::crypto;
 use trade_control_core::incoming::{self, parse_and_verify};
 use trade_control_core::intent::{Action, BrokerKind, Resolved, VetoLevel};
-use trade_control_core::state::{StateStore, clear_named_preps, clear_named_vetos};
+use trade_control_core::state::{
+    StateStore, clear_named_preps, clear_named_vetos, veto_ttl_seconds,
+};
 
 /// Response body for the `unlock` action. Serialised as YAML.
 #[derive(Serialize)]
@@ -600,7 +602,12 @@ async fn handle_veto(
     let Some(ttl_hours) = verified.intent.ttl_hours else {
         return Response::error("veto requires `ttl_hours`", 400);
     };
-    let ttl_seconds = (ttl_hours as u64).saturating_mul(3600);
+    // Extend the TTL by any remaining `not_after` lifetime, so a veto
+    // sent with `not_after: 8h, ttl_hours: 12` actually lasts 20h —
+    // matching the operator's mental model of "active for this alert
+    // window, then cool down for `ttl` afterwards." See
+    // `veto_ttl_seconds` docs.
+    let ttl_seconds = veto_ttl_seconds(ttl_hours, verified.intent.not_after, now);
     // Clear any vetos listed in `clears` first — symmetry with prep
     // ordering, even though vetos don't carry timestamps.
     let cleared = match clear_named_vetos(
@@ -686,7 +693,8 @@ async fn run_veto_with_broker<B: Broker>(
         };
     };
     let level = verified.intent.level.unwrap_or_default();
-    let ttl_seconds = (ttl_hours as u64).saturating_mul(3600);
+    // Same TTL extension as the flag-only path — see `veto_ttl_seconds`.
+    let ttl_seconds = veto_ttl_seconds(ttl_hours, verified.intent.not_after, now);
     let instrument = &verified.intent.instrument;
     let cleared = match clear_named_vetos(store, instrument, &verified.intent.clears).await {
         Ok(c) => c,
@@ -741,11 +749,6 @@ async fn run_veto_with_broker<B: Broker>(
         Some(cancelled),
         closed_tag,
     );
-    // `now` parameter is unused here directly (record_seen is invoked by
-    // the caller via the standard ActionResult path), but kept in the
-    // signature for parity with other broker-path handlers.
-    let _ = now;
-
     if matches!(level, VetoLevel::ClosePositions) && !closed_ok {
         ActionResult::Failed(outcome)
     } else {

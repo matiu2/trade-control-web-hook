@@ -253,6 +253,29 @@ impl std::error::Error for StateError {}
 /// Cloudflare KV's minimum TTL is 60 seconds; clamp anything smaller.
 pub const MIN_TTL_SECONDS: u64 = 60;
 
+/// Compute the effective TTL (in seconds) for a veto record.
+///
+/// A naive `ttl_hours * 3600` expires the veto `ttl_hours` after it
+/// was *set*. But the operator's mental model is usually "this
+/// condition is in effect for the lifetime of the alert (`not_after`)
+/// and the cooldown applies after that." So when `not_after` is in
+/// the future, we extend the TTL so the veto lives until
+/// `not_after + ttl_hours`, not just `now + ttl_hours`.
+///
+/// Formally: `effective = max(ttl, (not_after - now) + ttl)` —
+/// equivalent to `(max(now, not_after) - now) + ttl`. This means a
+/// `not_after` already in the past has no effect (we fall back to
+/// the bare TTL), and a future `not_after` extends the veto by the
+/// remaining lifetime.
+///
+/// `not_after - now` is clamped to zero so a past `not_after` doesn't
+/// shorten the TTL. Output is clamped to [`MIN_TTL_SECONDS`].
+pub fn veto_ttl_seconds(ttl_hours: u32, not_after: DateTime<Utc>, now: DateTime<Utc>) -> u64 {
+    let base = (ttl_hours as u64).saturating_mul(3600);
+    let remaining = (not_after - now).num_seconds().max(0) as u64;
+    base.saturating_add(remaining).max(MIN_TTL_SECONDS)
+}
+
 /// Split a prep KV value into its (timestamp, setter_id) parts.
 ///
 /// The value is stored as `<rfc3339>|<setter_id>`. Values written
@@ -477,6 +500,39 @@ mod tests {
 
     fn ts(s: &str) -> DateTime<Utc> {
         s.parse().unwrap()
+    }
+
+    #[test]
+    fn veto_ttl_uses_bare_ttl_when_not_after_already_passed() {
+        // not_after is in the past — the veto effectively starts "now",
+        // so the bare TTL applies (12h × 3600).
+        let now = ts("2026-05-20T10:00:00Z");
+        let not_after = ts("2026-05-20T09:00:00Z");
+        assert_eq!(veto_ttl_seconds(12, not_after, now), 12 * 3600);
+    }
+
+    #[test]
+    fn veto_ttl_extends_when_not_after_in_future() {
+        // not_after = now + 8h, ttl = 12h → expect 20h.
+        let now = ts("2026-05-20T10:00:00Z");
+        let not_after = ts("2026-05-20T18:00:00Z");
+        assert_eq!(veto_ttl_seconds(12, not_after, now), 20 * 3600);
+    }
+
+    #[test]
+    fn veto_ttl_uses_bare_ttl_when_not_after_equals_now() {
+        // Boundary: not_after exactly == now → remaining = 0 → bare TTL.
+        let now = ts("2026-05-20T10:00:00Z");
+        assert_eq!(veto_ttl_seconds(6, now, now), 6 * 3600);
+    }
+
+    #[test]
+    fn veto_ttl_clamps_to_min_ttl() {
+        // ttl_hours = 0 with not_after in the past → would be 0 seconds,
+        // but Cloudflare KV requires at least 60s.
+        let now = ts("2026-05-20T10:00:00Z");
+        let past = ts("2026-05-20T09:00:00Z");
+        assert_eq!(veto_ttl_seconds(0, past, now), MIN_TTL_SECONDS);
     }
 
     fn cd(instrument: &str, expires_at: DateTime<Utc>) -> CooldownEntry {
