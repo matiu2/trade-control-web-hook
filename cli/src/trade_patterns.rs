@@ -7,10 +7,15 @@
 //! one questionnaire and gets five signed YAMLs to drop into
 //! TradingView's alert dialogs.
 //!
-//! Layout: this file holds the orchestration, the pattern enum, and the
-//! H&S implementation. New patterns add a constructor here and a
-//! per-pattern build method. IH&S / M / W are stubbed and emit a clear
-//! "not yet implemented" so the picker doesn't lie.
+//! Layout: this file holds the orchestration, the pattern enum, the
+//! per-pattern geometry table (entry / SL anchors, invalidation veto
+//! name), and one shared questionnaire that branches on the geometry.
+//! Adding a new direction-only variant (e.g. M / W) is one new arm in
+//! [`PatternGeometry::for_pattern`]; adding a structurally different
+//! pattern would need a separate build function. Today H&S and IH&S
+//! are wired up — based on the operator's reference templates
+//! `short.yaml` and `long.yaml`. M / W are in the picker but the
+//! build path emits "not yet implemented" so the picker doesn't lie.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -41,19 +46,7 @@ const DEFAULT_POST_EXPIRY_GRACE: Duration = Duration::minutes(30);
 
 /// Default risk percent prompt. Tuned conservatively; the operator
 /// overrides at the prompt.
-const DEFAULT_RISK_PCT: f64 = 0.5;
-
-/// Default TP as an R-multiple of stop distance. H&S textbook target is
-/// "head-to-neckline distance projected from neckline" — usually
-/// 2-3R. We default to 2.0 and let the operator override.
-const DEFAULT_TP_R: f64 = 2.0;
-
-/// Default stop-loss offset in pips from the entry anchor. Operator
-/// overrides; this just keeps the prompt from being a cold-start blank.
-const DEFAULT_SL_OFFSET_PIPS: f64 = 2.0;
-
-/// Default entry stop-trigger offset in pips from the close anchor.
-const DEFAULT_ENTRY_OFFSET_PIPS: f64 = 0.0;
+const DEFAULT_RISK_PCT: f64 = 1.0;
 
 /// The catalogue of supported trade patterns. The discriminant doubles
 /// as the CLI argument (`hs`, `ihs`, `m`, `w`) and the label in the
@@ -92,14 +85,6 @@ impl TradePattern {
         }
     }
 
-    /// The fixed direction this pattern trades.
-    fn direction(self) -> Direction {
-        match self {
-            Self::Hs | Self::M => Direction::Short,
-            Self::Ihs | Self::W => Direction::Long,
-        }
-    }
-
     /// Short identifier suitable for embedding in a trade_id slug
     /// (lowercase, no whitespace, no separators). Stays distinct from
     /// other patterns.
@@ -109,6 +94,67 @@ impl TradePattern {
             Self::Ihs => "ihs",
             Self::M => "m",
             Self::W => "w",
+        }
+    }
+}
+
+/// Direction-specific bits of a pattern. Hand-rolled per pattern from
+/// the operator's reference templates (`short.yaml`, `long.yaml`) so
+/// the build path is a single shared questionnaire that branches only
+/// on these values.
+///
+/// Reading the H&S template `short.yaml`:
+///   entry = low + 1 pip (stop-entry — fires when price breaks below
+///   the recent low), SL = high + 1 pip, invalidation veto =
+///   `too-high` (price runs back up through structure).
+///
+/// IH&S `long.yaml` mirrors it on the other side:
+///   entry = high + 1 pip, SL = low + 1 pip (the template uses `+1`
+///   not `-1` — a tight SL that sits inside the candle by 1 pip, so a
+///   wick to the low takes you out), invalidation veto = `too-low`.
+#[derive(Debug, Clone, Copy)]
+struct PatternGeometry {
+    direction: Direction,
+    /// Where the stop-entry trigger price comes from in the plaintext
+    /// shell. Operator overrides the offset at the prompt; this is
+    /// just the anchor + default.
+    entry_anchor: PriceAnchor,
+    entry_offset_default: f64,
+    /// Where the SL price comes from. Same: anchor fixed by pattern,
+    /// offset operator-overridable.
+    sl_anchor: PriceAnchor,
+    sl_offset_default: f64,
+    /// Name of the invalidation veto for this pattern. `too-high` for
+    /// shorts (price running back up past the right shoulder),
+    /// `too-low` for longs (price running back down past the right
+    /// shoulder of an inverse H&S).
+    invalidation_veto_name: &'static str,
+}
+
+impl PatternGeometry {
+    fn for_pattern(p: TradePattern) -> Self {
+        match p {
+            TradePattern::Hs => Self {
+                direction: Direction::Short,
+                entry_anchor: PriceAnchor::Low,
+                entry_offset_default: 1.0,
+                sl_anchor: PriceAnchor::High,
+                sl_offset_default: 1.0,
+                invalidation_veto_name: "too-high",
+            },
+            TradePattern::Ihs => Self {
+                direction: Direction::Long,
+                entry_anchor: PriceAnchor::High,
+                entry_offset_default: 1.0,
+                sl_anchor: PriceAnchor::Low,
+                sl_offset_default: 1.0,
+                invalidation_veto_name: "too-low",
+            },
+            TradePattern::M | TradePattern::W => {
+                // Unreachable at runtime — build_trade_interactive
+                // rejects these before geometry is consulted.
+                unreachable!("geometry for {p:?} not configured")
+            }
         }
     }
 }
@@ -155,9 +201,11 @@ pub struct BuiltTrade {
 /// trade. Output dir is not touched here — see [`write_trade`].
 pub fn build_trade_interactive(pattern: TradePattern, now: DateTime<Utc>) -> Result<BuiltTrade> {
     match pattern {
-        TradePattern::Hs => build_hs(now),
-        TradePattern::Ihs | TradePattern::M | TradePattern::W => Err(eyre!(
-            "pattern {} is not yet implemented — only `hs` is wired up so far",
+        TradePattern::Hs | TradePattern::Ihs => {
+            build_pattern(pattern, PatternGeometry::for_pattern(pattern), now)
+        }
+        TradePattern::M | TradePattern::W => Err(eyre!(
+            "pattern {} is not yet implemented — only `hs` and `ihs` are wired up so far",
             pattern.label()
         )),
     }
@@ -212,9 +260,13 @@ fn render_manifest(trade: &BuiltTrade) -> String {
     out
 }
 
-// ===== H&S pattern =====
+// ===== Shared questionnaire =====
 
-fn build_hs(now: DateTime<Utc>) -> Result<BuiltTrade> {
+fn build_pattern(
+    pattern: TradePattern,
+    geometry: PatternGeometry,
+    now: DateTime<Utc>,
+) -> Result<BuiltTrade> {
     let theme = ColorfulTheme::default();
 
     let instrument = prompt_instrument(&theme)?;
@@ -233,20 +285,25 @@ fn build_hs(now: DateTime<Utc>) -> Result<BuiltTrade> {
         .map_err(|e| eyre!("risk_pct prompt: {e}"))?;
 
     let entry_offset_pips: f64 = Input::with_theme(&theme)
-        .with_prompt("entry stop trigger offset (pips from close, +ve = above)")
-        .default(DEFAULT_ENTRY_OFFSET_PIPS)
+        .with_prompt(format!(
+            "entry stop trigger offset (pips from {})",
+            anchor_label(geometry.entry_anchor)
+        ))
+        .default(geometry.entry_offset_default)
         .interact_text()
         .map_err(|e| eyre!("entry offset prompt: {e}"))?;
 
     let sl_offset_pips: f64 = Input::with_theme(&theme)
-        .with_prompt("stop-loss offset (pips from high, +ve = above)")
-        .default(DEFAULT_SL_OFFSET_PIPS)
+        .with_prompt(format!(
+            "stop-loss offset (pips from {})",
+            anchor_label(geometry.sl_anchor)
+        ))
+        .default(geometry.sl_offset_default)
         .interact_text()
         .map_err(|e| eyre!("sl prompt: {e}"))?;
 
-    let tp_r: f64 = Input::with_theme(&theme)
-        .with_prompt("take-profit (R-multiple of stop distance)")
-        .default(DEFAULT_TP_R)
+    let tp_price: f64 = Input::with_theme(&theme)
+        .with_prompt("take-profit absolute price")
         .interact_text()
         .map_err(|e| eyre!("tp prompt: {e}"))?;
 
@@ -256,13 +313,20 @@ fn build_hs(now: DateTime<Utc>) -> Result<BuiltTrade> {
         .interact_text()
         .map_err(|e| eyre!("entry deadline prompt: {e}"))?;
 
-    let trade_id = mint_trade_id(TradePattern::Hs, &instrument)?;
+    let trade_id = mint_trade_id(pattern, &instrument)?;
     let entry_deadline = derive_entry_deadline(now, trade_expiry, entry_deadline_pct);
     let veto_expiry = trade_expiry + DEFAULT_POST_EXPIRY_GRACE;
 
-    let direction = TradePattern::Hs.direction();
     let alerts = vec![
-        build_too_high_alert(&instrument, &trade_id, veto_expiry, &broker, &account, now),
+        build_invalidation_alert(
+            &instrument,
+            &trade_id,
+            geometry.invalidation_veto_name,
+            veto_expiry,
+            &broker,
+            &account,
+            now,
+        ),
         build_trade_expiry_alert(
             &instrument,
             &trade_id,
@@ -277,15 +341,14 @@ fn build_hs(now: DateTime<Utc>) -> Result<BuiltTrade> {
         build_enter_alert(
             &instrument,
             &trade_id,
-            direction,
+            &geometry,
             entry_deadline,
             entry_offset_pips,
             sl_offset_pips,
-            tp_r,
+            tp_price,
             risk_pct,
             &broker,
             &account,
-            now,
         ),
     ];
 
@@ -295,6 +358,15 @@ fn build_hs(now: DateTime<Utc>) -> Result<BuiltTrade> {
         trade_expiry,
         alerts,
     })
+}
+
+/// Display label for a [`PriceAnchor`] in prompt text.
+fn anchor_label(anchor: PriceAnchor) -> &'static str {
+    match anchor {
+        PriceAnchor::Close => "close",
+        PriceAnchor::High => "high",
+        PriceAnchor::Low => "low",
+    }
 }
 
 fn prompt_instrument(theme: &ColorfulTheme) -> Result<String> {
@@ -412,15 +484,20 @@ fn skeleton(
     }
 }
 
-fn build_too_high_alert(
+/// The "price ran past structure and the setup is dead" veto. Named
+/// `too-high` for short patterns and `too-low` for long ones — the
+/// name comes from the geometry struct, so the wire form matches the
+/// reference templates (`too-high.yaml` / `too-low.yaml`).
+fn build_invalidation_alert(
     instrument: &str,
     trade_id: &str,
+    veto_name: &str,
     veto_expiry: DateTime<Utc>,
     broker: &BrokerKind,
     account: &str,
     now: DateTime<Utc>,
 ) -> BuiltAlert {
-    let id = format!("{trade_id}-too-high");
+    let id = format!("{trade_id}-{veto_name}");
     let mut intent = skeleton(
         Action::Veto,
         instrument,
@@ -430,12 +507,12 @@ fn build_too_high_alert(
         account,
         trade_id,
     );
-    intent.name = Some("too-high".into());
+    intent.name = Some(veto_name.to_string());
     intent.ttl_hours = Some(ttl_hours_until(now, veto_expiry));
     intent.level = Some(VetoLevel::ClosePositions);
     BuiltAlert {
-        basename: "01-veto-too-high".into(),
-        purpose: "veto: too-high (close positions if price runs past invalidation)".into(),
+        basename: format!("01-veto-{veto_name}"),
+        purpose: format!("veto: {veto_name} (close positions if price runs past invalidation)"),
         intent,
     }
 }
@@ -531,15 +608,14 @@ fn build_retest_alert(
 fn build_enter_alert(
     instrument: &str,
     trade_id: &str,
-    direction: Direction,
+    geometry: &PatternGeometry,
     entry_deadline: DateTime<Utc>,
     entry_offset_pips: f64,
     sl_offset_pips: f64,
-    tp_r: f64,
+    tp_price: f64,
     risk_pct: f64,
     broker: &BrokerKind,
     account: &str,
-    _now: DateTime<Utc>,
 ) -> BuiltAlert {
     let id = format!("{trade_id}-enter");
     let mut intent = skeleton(
@@ -551,26 +627,26 @@ fn build_enter_alert(
         account,
         trade_id,
     );
-    intent.direction = Some(direction);
+    intent.direction = Some(geometry.direction);
     intent.entry = Some(EntrySpec::Stop {
-        from: PriceAnchor::Close,
+        from: geometry.entry_anchor,
         offset_pips: entry_offset_pips,
     });
-    let (sl_anchor, tp_anchor) = match direction {
-        Direction::Long => (PriceAnchor::Low, PriceAnchor::Close),
-        Direction::Short => (PriceAnchor::High, PriceAnchor::Close),
-    };
     intent.stop_loss = Some(PriceRef::Anchored {
-        from: sl_anchor,
+        from: geometry.sl_anchor,
         offset_pips: sl_offset_pips,
     });
-    intent.take_profit = Some(TakeProfit::RMultiple {
-        from: tp_anchor,
-        offset_r: tp_r,
-    });
+    // TP is an absolute price the operator typed in — the worker uses
+    // it verbatim and ignores the shell.
+    intent.take_profit = Some(TakeProfit::Anchored(PriceRef::Absolute {
+        absolute: tp_price,
+    }));
     intent.risk_pct = Some(risk_pct);
     intent.requires_preps = vec!["break-and-close".into(), "retest".into()];
-    intent.vetos = vec!["too-high".into(), "trade-expiry".into()];
+    intent.vetos = vec![
+        geometry.invalidation_veto_name.into(),
+        "trade-expiry".into(),
+    ];
     BuiltAlert {
         basename: "05-enter".into(),
         purpose: "enter: stop-entry gated by both preps + both vetos".into(),
@@ -609,12 +685,17 @@ mod tests {
 
     #[test]
     fn directions_match_pattern_geometry() {
-        // H&S and M are short; IH&S and W are long. Wrong here would
-        // emit an opposite-direction entry alert.
-        assert_eq!(TradePattern::Hs.direction(), Direction::Short);
-        assert_eq!(TradePattern::M.direction(), Direction::Short);
-        assert_eq!(TradePattern::Ihs.direction(), Direction::Long);
-        assert_eq!(TradePattern::W.direction(), Direction::Long);
+        // H&S is short; IH&S is long. Wrong here would emit an
+        // opposite-direction entry alert. M / W aren't wired up yet —
+        // `for_pattern` panics for those, so we don't assert on them.
+        assert_eq!(
+            PatternGeometry::for_pattern(TradePattern::Hs).direction,
+            Direction::Short
+        );
+        assert_eq!(
+            PatternGeometry::for_pattern(TradePattern::Ihs).direction,
+            Direction::Long
+        );
     }
 
     #[test]
@@ -674,10 +755,12 @@ mod tests {
         // input — and verify the manifest text includes every alert.
         let now = ts("2026-05-20T00:00:00Z");
         let trade_expiry = ts("2026-05-25T00:00:00Z");
+        let geometry = PatternGeometry::for_pattern(TradePattern::Hs);
         let alerts = vec![
-            build_too_high_alert(
+            build_invalidation_alert(
                 "EUR_USD",
                 "hs-eur-usd-abcd",
+                "too-high",
                 trade_expiry,
                 &BrokerKind::Oanda,
                 "demo",
@@ -686,15 +769,14 @@ mod tests {
             build_enter_alert(
                 "EUR_USD",
                 "hs-eur-usd-abcd",
-                Direction::Short,
+                &geometry,
                 trade_expiry,
-                0.0,
-                2.0,
-                2.0,
-                0.5,
+                1.0,
+                1.0,
+                1.0800,
+                1.0,
                 &BrokerKind::Oanda,
                 "demo",
-                now,
             ),
         ];
         let trade = BuiltTrade {
@@ -711,25 +793,49 @@ mod tests {
     }
 
     #[test]
-    fn enter_alert_carries_gates_and_trade_id() {
-        // The enter alert is the only one with both preps + vetos
-        // wired up, plus the trade_id stamped through.
-        let now = ts("2026-05-20T00:00:00Z");
+    fn hs_enter_matches_short_template_geometry() {
+        // The H&S enter alert must mirror the operator's reference
+        // `short.yaml`: stop-entry at low+1, SL at high+1, vetoed by
+        // `too-high` and `trade-expiry`, requires both preps. The TP
+        // is absolute — the operator types it in.
+        let geometry = PatternGeometry::for_pattern(TradePattern::Hs);
         let deadline = ts("2026-05-24T00:00:00Z");
         let alert = build_enter_alert(
             "EUR_USD",
             "hs-eur-usd-zzzz",
-            Direction::Short,
+            &geometry,
             deadline,
-            0.0,
-            2.0,
-            2.0,
-            0.5,
+            1.0,
+            1.0,
+            1.0500,
+            1.0,
             &BrokerKind::Oanda,
             "demo",
-            now,
         );
         assert_eq!(alert.intent.direction, Some(Direction::Short));
+        // Entry: low + 1 pip.
+        match &alert.intent.entry {
+            Some(EntrySpec::Stop { from, offset_pips }) => {
+                assert_eq!(*from, PriceAnchor::Low);
+                assert!((offset_pips - 1.0).abs() < 1e-9);
+            }
+            other => panic!("expected Stop entry, got {other:?}"),
+        }
+        // SL: high + 1 pip — matches short.yaml's tight stop.
+        match &alert.intent.stop_loss {
+            Some(PriceRef::Anchored { from, offset_pips }) => {
+                assert_eq!(*from, PriceAnchor::High);
+                assert!((offset_pips - 1.0).abs() < 1e-9);
+            }
+            other => panic!("expected Anchored SL, got {other:?}"),
+        }
+        // TP: absolute price the operator typed in.
+        match &alert.intent.take_profit {
+            Some(TakeProfit::Anchored(PriceRef::Absolute { absolute })) => {
+                assert!((absolute - 1.0500).abs() < 1e-9);
+            }
+            other => panic!("expected absolute TP, got {other:?}"),
+        }
         assert_eq!(
             alert.intent.requires_preps,
             vec!["break-and-close".to_string(), "retest".to_string()]
@@ -741,6 +847,73 @@ mod tests {
         assert_eq!(alert.intent.trade_id.as_deref(), Some("hs-eur-usd-zzzz"));
         assert_eq!(alert.intent.account.as_deref(), Some("demo"));
         alert.intent.validate().unwrap();
+    }
+
+    #[test]
+    fn ihs_enter_matches_long_template_geometry() {
+        // IH&S mirrors `long.yaml`: stop-entry at high+1, SL at low+1,
+        // vetoed by `too-low` (not `too-high`). Direction flips to
+        // Long.
+        let geometry = PatternGeometry::for_pattern(TradePattern::Ihs);
+        let deadline = ts("2026-05-24T00:00:00Z");
+        let alert = build_enter_alert(
+            "EUR_USD",
+            "ihs-eur-usd-yyyy",
+            &geometry,
+            deadline,
+            1.0,
+            1.0,
+            1.1500,
+            1.0,
+            &BrokerKind::Oanda,
+            "demo",
+        );
+        assert_eq!(alert.intent.direction, Some(Direction::Long));
+        match &alert.intent.entry {
+            Some(EntrySpec::Stop { from, offset_pips }) => {
+                assert_eq!(*from, PriceAnchor::High);
+                assert!((offset_pips - 1.0).abs() < 1e-9);
+            }
+            other => panic!("expected Stop entry, got {other:?}"),
+        }
+        match &alert.intent.stop_loss {
+            Some(PriceRef::Anchored { from, offset_pips }) => {
+                assert_eq!(*from, PriceAnchor::Low);
+                assert!((offset_pips - 1.0).abs() < 1e-9);
+            }
+            other => panic!("expected Anchored SL, got {other:?}"),
+        }
+        match &alert.intent.take_profit {
+            Some(TakeProfit::Anchored(PriceRef::Absolute { absolute })) => {
+                assert!((absolute - 1.1500).abs() < 1e-9);
+            }
+            other => panic!("expected absolute TP, got {other:?}"),
+        }
+        assert_eq!(
+            alert.intent.vetos,
+            vec!["too-low".to_string(), "trade-expiry".to_string()]
+        );
+    }
+
+    #[test]
+    fn ihs_invalidation_alert_uses_too_low_name() {
+        // The veto name is geometry-driven — a misconfig here would
+        // mean the long enter's `vetos: [too-low]` gate never fires
+        // because the IH&S invalidation alert sets `too-high`.
+        let now = ts("2026-05-20T00:00:00Z");
+        let veto_expiry = ts("2026-05-25T00:30:00Z");
+        let alert = build_invalidation_alert(
+            "EUR_USD",
+            "ihs-eur-usd-xxxx",
+            "too-low",
+            veto_expiry,
+            &BrokerKind::Oanda,
+            "demo",
+            now,
+        );
+        assert_eq!(alert.intent.name.as_deref(), Some("too-low"));
+        assert_eq!(alert.basename, "01-veto-too-low");
+        assert!(alert.purpose.contains("too-low"));
     }
 
     #[test]
