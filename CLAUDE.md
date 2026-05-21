@@ -84,27 +84,16 @@ The Python script maps these basenames to drawing roles by prefix.
 If you rename a basename in the Rust pipeline, update
 `build_alert_spec()` in the script to match.
 
-### `--risk-amount` is not plumbed through
+### Risk and dry-run plumbing
 
-The script's `--risk-amount` flag errors out because `TradeSpec` (Rust
-side, `cli/src/trade_patterns.rs`) doesn't have a `risk_amount: Option<f64>`
-field. To make it work end-to-end:
+`TradeSpec` carries both `risk_amount: Option<f64>` and `dry_run: bool`
+since 2026-05. The enter-alert builder honours `risk_amount` over
+`risk_pct` when set (the worker validator rejects both), and propagates
+`dry_run` only onto the enter intent — vetos and preps never carry it.
 
-1. Add `risk_amount: Option<f64>` to `TradeSpec`.
-2. Plumb it through `assemble_trade` → `build_enter_alert` so it lands
-   on the `Intent::Enter` as `risk_amount`.
-3. The worker already handles `risk_amount` on enter intents.
-
-Not done because the user hasn't asked yet — flagged here so the next
-session doesn't re-investigate.
-
-### `--dry-run` doesn't propagate to the worker
-
-Same gap: `Intent::Enter` has a `dry_run: bool` field but `TradeSpec`
-doesn't expose it. The script's `--dry-run` only controls whether
-alerts get posted to TradingView; the entry alert, if it ever fires,
-will execute live on the broker. To make `--dry-run` actually dry-run
-the broker side: add `dry_run: bool` to `TradeSpec`, plumb through.
+On the Python side: `--risk-amount` adds `risk_amount: <n>` to the spec;
+`--broker-dry-run` adds `dry_run: true`. The Python `--dry-run` flag is
+unrelated — that one short-circuits before any POST to TradingView.
 
 ## Conventions
 

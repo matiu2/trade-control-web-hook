@@ -223,9 +223,20 @@ pub struct TradeSpec {
     /// Wall-clock end of the trade's validity window. Must be in the
     /// future relative to *now* at build time.
     pub trade_expiry: DateTime<Utc>,
-    /// Risk per trade as a percent of equity.
+    /// Risk per trade as a percent of equity. Mutually exclusive with
+    /// `risk_amount` — when `risk_amount` is set this is ignored.
     #[serde(default = "default_risk_pct")]
     pub risk_pct: f64,
+    /// Risk per trade as an absolute home-currency amount (e.g. 5.0 =
+    /// 5 AUD risked on the stop-loss distance). When set, takes
+    /// precedence over `risk_pct` and lands on `Intent::risk_amount`.
+    #[serde(default)]
+    pub risk_amount: Option<f64>,
+    /// When true, the entry alert is built with `dry_run: true` so the
+    /// worker logs the order but does not push to the broker. Vetos /
+    /// preps are unaffected.
+    #[serde(default)]
+    pub dry_run: bool,
     /// Entry stop-trigger offset in pips from the geometry anchor.
     /// Omit to use the pattern's default (1 pip).
     #[serde(default)]
@@ -308,8 +319,17 @@ pub fn build_trade_from_spec(spec: TradeSpec, now: DateTime<Utc>) -> Result<Buil
     if spec.entry_deadline_pct == 0 || spec.entry_deadline_pct > 100 {
         return Err(eyre!("entry_deadline_pct must be in 1..=100"));
     }
-    if !spec.risk_pct.is_finite() || spec.risk_pct <= 0.0 {
-        return Err(eyre!("risk_pct must be a positive finite number"));
+    match spec.risk_amount {
+        Some(amount) => {
+            if !amount.is_finite() || amount <= 0.0 {
+                return Err(eyre!("risk_amount must be a positive finite number"));
+            }
+        }
+        None => {
+            if !spec.risk_pct.is_finite() || spec.risk_pct <= 0.0 {
+                return Err(eyre!("risk_pct must be a positive finite number"));
+            }
+        }
     }
     let geometry = PatternGeometry::for_pattern(spec.pattern);
     let entry_offset_pips = spec
@@ -434,6 +454,8 @@ fn build_pattern(
         broker,
         trade_expiry,
         risk_pct,
+        risk_amount: None,
+        dry_run: false,
         entry_offset_pips: Some(entry_offset_pips),
         sl_offset_pips: Some(sl_offset_pips),
         tp_price,
@@ -500,6 +522,8 @@ fn assemble_trade(
             sl_offset_pips,
             spec.tp_price,
             spec.risk_pct,
+            spec.risk_amount,
+            spec.dry_run,
             &spec.broker,
             &spec.account,
         ),
@@ -768,6 +792,8 @@ fn build_enter_alert(
     sl_offset_pips: f64,
     tp_price: f64,
     risk_pct: f64,
+    risk_amount: Option<f64>,
+    dry_run: bool,
     broker: &BrokerKind,
     account: &str,
 ) -> BuiltAlert {
@@ -795,7 +821,15 @@ fn build_enter_alert(
     intent.take_profit = Some(TakeProfit::Anchored(PriceRef::Absolute {
         absolute: tp_price,
     }));
-    intent.risk_pct = Some(risk_pct);
+    // risk_amount, when set, takes precedence over risk_pct — exactly
+    // one is allowed on Intent::Enter, and the validator rejects both.
+    match risk_amount {
+        Some(amount) => intent.risk_amount = Some(amount),
+        None => intent.risk_pct = Some(risk_pct),
+    }
+    if dry_run {
+        intent.dry_run = Some(true);
+    }
     intent.requires_preps = vec!["break-and-close".into(), "retest".into()];
     intent.vetos = vec![
         geometry.invalidation_veto_name.into(),
@@ -929,6 +963,8 @@ mod tests {
                 1.0,
                 1.0800,
                 1.0,
+                None,
+                false,
                 &BrokerKind::Oanda,
                 "demo",
             ),
@@ -945,6 +981,8 @@ mod tests {
                 broker: BrokerKind::Oanda,
                 trade_expiry,
                 risk_pct: DEFAULT_RISK_PCT,
+                risk_amount: None,
+                dry_run: false,
                 entry_offset_pips: Some(1.0),
                 sl_offset_pips: Some(1.0),
                 tp_price: 1.0500,
@@ -975,6 +1013,8 @@ mod tests {
             1.0,
             1.0500,
             1.0,
+            None,
+            false,
             &BrokerKind::Oanda,
             "demo",
         );
@@ -1031,6 +1071,8 @@ mod tests {
             1.0,
             1.1500,
             1.0,
+            None,
+            false,
             &BrokerKind::Oanda,
             "demo",
         );
@@ -1090,6 +1132,8 @@ mod tests {
             broker: BrokerKind::Oanda,
             trade_expiry,
             risk_pct: 1.0,
+            risk_amount: None,
+            dry_run: false,
             entry_offset_pips: None,
             sl_offset_pips: None,
             tp_price: 1.0500,
@@ -1195,6 +1239,47 @@ tp_price: 1.05
         assert_eq!(parsed.broker, original.broker);
         assert_eq!(parsed.trade_expiry, original.trade_expiry);
         assert!((parsed.tp_price - original.tp_price).abs() < 1e-9);
+    }
+
+    #[test]
+    fn build_trade_from_spec_threads_risk_amount_onto_enter_intent() {
+        // When risk_amount is set, the enter intent must carry it and
+        // leave risk_pct unset — the worker rejects both being present.
+        let now = ts("2026-05-20T00:00:00Z");
+        let mut spec = sample_spec(TradePattern::Hs, ts("2026-05-25T00:00:00Z"));
+        spec.risk_amount = Some(5.0);
+        let trade = build_trade_from_spec(spec, now).unwrap();
+        let enter = trade.alerts.last().unwrap();
+        assert_eq!(enter.intent.risk_amount, Some(5.0));
+        assert_eq!(enter.intent.risk_pct, None);
+        enter.intent.validate().unwrap();
+    }
+
+    #[test]
+    fn build_trade_from_spec_threads_dry_run_onto_enter_intent() {
+        // dry_run on the spec must land only on the enter intent —
+        // vetos and preps stay unaffected, since they don't open
+        // broker orders.
+        let now = ts("2026-05-20T00:00:00Z");
+        let mut spec = sample_spec(TradePattern::Hs, ts("2026-05-25T00:00:00Z"));
+        spec.dry_run = true;
+        let trade = build_trade_from_spec(spec, now).unwrap();
+        let enter = trade.alerts.last().unwrap();
+        assert_eq!(enter.intent.dry_run, Some(true));
+        // Spot-check a non-enter alert: dry_run must be None.
+        let veto = &trade.alerts[0];
+        assert_eq!(veto.intent.dry_run, None);
+    }
+
+    #[test]
+    fn build_trade_from_spec_rejects_non_positive_risk_amount() {
+        let now = ts("2026-05-20T00:00:00Z");
+        let mut spec = sample_spec(TradePattern::Hs, ts("2026-05-25T00:00:00Z"));
+        spec.risk_amount = Some(0.0);
+        assert!(build_trade_from_spec(spec, now).is_err());
+        let mut spec2 = sample_spec(TradePattern::Hs, ts("2026-05-25T00:00:00Z"));
+        spec2.risk_amount = Some(-1.0);
+        assert!(build_trade_from_spec(spec2, now).is_err());
     }
 
     #[test]

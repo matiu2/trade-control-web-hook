@@ -729,9 +729,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     risk.add_argument(
         "--risk-amount", dest="risk_amount", type=float,
         help="Risk per trade as an absolute home-currency amount (e.g. 5 = 5 AUD). "
-             "NOTE: requires `risk_amount` support in trade-control's TradeSpec — "
-             "currently the spec only carries risk_pct, so this flag will error "
-             "until the Rust side is updated.",
+             "Lands on intent.risk_amount; takes precedence over risk_pct.",
     )
     g = p.add_mutually_exclusive_group()
     g.add_argument(
@@ -741,6 +739,12 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     g.add_argument(
         "--dry-run", action="store_true",
         help="Build + sign locally only. No POSTs to TV or the worker.",
+    )
+    p.add_argument(
+        "--broker-dry-run", action="store_true",
+        help="Set dry_run on the enter intent so the worker logs the order "
+             "but does not send it to the broker. Useful for first-time "
+             "live runs of a new sizing path. Compatible with --create-alerts.",
     )
     p.add_argument(
         "--skip-break-and-close", action="store_true",
@@ -821,16 +825,6 @@ def main(argv: Optional[list[str]] = None) -> int:
         or os.environ.get("TRADE_CONTROL_ACCOUNT")
         or DEFAULT_ACCOUNT_BY_BROKER[broker]
     )
-    if args.risk_amount is not None:
-        print(
-            "ERROR: --risk-amount isn't supported by `trade-control build-trade` yet.\n"
-            "  The TradeSpec only carries risk_pct. Add a `risk_amount: Option<f64>`\n"
-            "  field to TradeSpec in cli/src/trade_patterns.rs and have build_enter_alert\n"
-            "  set intent.risk_amount instead of risk_pct when it's present.",
-            file=sys.stderr,
-        )
-        return 1
-
     risk_pct = args.risk_pct if args.risk_pct is not None else 1.0
     spec = {
         "pattern": pattern,
@@ -841,6 +835,10 @@ def main(argv: Optional[list[str]] = None) -> int:
         "risk_pct": risk_pct,
         "tp_price": round(tp, 5),
     }
+    if args.risk_amount is not None:
+        spec["risk_amount"] = args.risk_amount
+    if args.broker_dry_run:
+        spec["dry_run"] = True
     write_trade_spec(spec, spec_path)
     print(f"# Spec written to {spec_path}:")
     print(spec_path.read_text().rstrip())
