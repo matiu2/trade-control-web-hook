@@ -5,6 +5,7 @@
 //! reads `OANDA_API_KEY`, `OANDA_ACCOUNT_ID`, and the optional `OANDA_LIVE`
 //! secret from the Worker `Env`.
 
+mod fx;
 mod oanda;
 mod risk;
 

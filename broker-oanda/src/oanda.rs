@@ -9,6 +9,7 @@ use oanda_client::positions::ClosePositionResponse;
 use worker::Env;
 use worker::console_error;
 
+use crate::fx::{quote_currency, resolve_quote_to_account_rate};
 use crate::risk;
 use trade_control_core::broker::{EntryError, EntryRequest};
 use trade_control_core::intent::{Direction, ResolvedEntry, RiskBudget};
@@ -114,6 +115,7 @@ pub async fn place_entry(
         .nav
         .parse()
         .map_err(|_| EntryError::EquityParse)?;
+    let account_ccy = account.account.currency.clone();
 
     let reference_price = match req.entry {
         ResolvedEntry::Market { reference_price } => reference_price,
@@ -129,11 +131,30 @@ pub async fn place_entry(
     if stop_distance <= 0.0 || !stop_distance.is_finite() {
         return Err(EntryError::OrderRejected);
     }
+
+    // Resolve the quote→account FX rate so cross-currency sizing comes
+    // out right. Same-ccy short-circuits to 1.0 inside the helper. A
+    // failure to resolve rejects the entry — silently falling back to
+    // 1.0 would mis-size the trade.
+    let quote_ccy = quote_currency(req.instrument);
+    let fx_rate = match resolve_quote_to_account_rate(client, account_id, quote_ccy, &account_ccy)
+        .await
+    {
+        Ok(r) => r,
+        Err(err) => {
+            console_error!(
+                "oanda fx resolve failed instrument={} quote={quote_ccy} account_ccy={account_ccy}: {err}",
+                req.instrument
+            );
+            return Err(EntryError::OrderRejected);
+        }
+    };
+
     let (units, effective_pct) = match req.risk {
         RiskBudget::Percent(pct) => {
             let budget = equity * pct / 100.0;
             (
-                risk::units_for_budget(budget, reference_price, req.stop_loss),
+                risk::units_for_budget(budget, reference_price, req.stop_loss, fx_rate),
                 pct,
             )
         }
@@ -149,7 +170,7 @@ pub async fn place_entry(
                 });
             }
             (
-                risk::units_for_budget(amount, reference_price, req.stop_loss),
+                risk::units_for_budget(amount, reference_price, req.stop_loss, fx_rate),
                 pct,
             )
         }
@@ -157,9 +178,9 @@ pub async fn place_entry(
             if equity <= 0.0 {
                 return Err(EntryError::EquityParse);
             }
-            // Implied money risk = units * stop_distance. Divide by
-            // equity for the percent the cap is expressed in.
-            let implied_amount = literal * stop_distance;
+            // Implied money risk in account ccy = units * stop_distance
+            // * fx_rate (quote → account). Divide by equity for percent.
+            let implied_amount = literal * stop_distance * fx_rate;
             let pct = implied_amount / equity * 100.0;
             if pct > max_risk_pct {
                 return Err(EntryError::RiskCapExceeded {
@@ -178,7 +199,7 @@ pub async fn place_entry(
     };
     let dry = if req.dry_run { "DRY-RUN " } else { "" };
     console_log!(
-        "{dry}oanda sizing: instrument={} mode={:?} equity={equity} effective_pct={effective_pct:.4} entry_ref={reference_price} sl={} units={units}",
+        "{dry}oanda sizing: instrument={} mode={:?} equity={equity} account_ccy={account_ccy} quote_ccy={quote_ccy} fx_quote_to_account={fx_rate} effective_pct={effective_pct:.4} entry_ref={reference_price} sl={} units={units}",
         req.instrument,
         req.risk,
         req.stop_loss,

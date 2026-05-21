@@ -1,10 +1,9 @@
 //! Pure position-sizing and risk-aggregation math.
 //!
-//! Caveat: this assumes account currency == quote currency of the instrument
-//! (e.g. USD account trading EUR_USD). Cross-currency pairs are out of scope
-//! for the MVP and will under- or over-size compared to a proper pip-value
-//! calculation. Stick to instruments where the quote currency matches the
-//! account currency until this is generalised.
+//! Cross-currency sizing is handled by passing an explicit FX rate
+//! (quote → account) into [`units_for_budget`]. Same-currency pairs
+//! pass `1.0` and behave exactly as before. See [`crate::fx`] for
+//! resolving the rate against OANDA's pricing endpoint.
 
 /// One open position from OANDA, distilled to the fields we need for risk math.
 ///
@@ -44,28 +43,50 @@ impl OpenRisk {
 /// `equity` and `risk_pct` (0.5 means 0.5%) define the budget.
 /// `entry` and `stop_loss` are absolute prices.
 ///
+/// `fx_quote_to_account` converts one unit of the instrument's quote
+/// currency into the account currency. Pass `1.0` when they match.
+///
 /// Retained as a thin wrapper around [`units_for_budget`] so existing
 /// tests keep working; the worker now resolves percent vs amount at
 /// the call site and calls `units_for_budget` directly.
 #[allow(dead_code)]
-pub fn units_for_risk(equity: f64, risk_pct: f64, entry: f64, stop_loss: f64) -> u32 {
+pub fn units_for_risk(
+    equity: f64,
+    risk_pct: f64,
+    entry: f64,
+    stop_loss: f64,
+    fx_quote_to_account: f64,
+) -> u32 {
     let stop_distance = (entry - stop_loss).abs();
     if stop_distance <= 0.0 || equity <= 0.0 || risk_pct <= 0.0 {
         return 0;
     }
     let budget = equity * risk_pct / 100.0;
-    units_for_budget(budget, entry, stop_loss)
+    units_for_budget(budget, entry, stop_loss, fx_quote_to_account)
 }
 
 /// Position size in units for a budget already in account currency.
 /// Returned units are floored. Used by both the percent-of-equity path
 /// (after `equity * pct / 100`) and the fixed-amount path.
-pub fn units_for_budget(budget: f64, entry: f64, stop_loss: f64) -> u32 {
+///
+/// `fx_quote_to_account` is the rate from the instrument's quote
+/// currency into the account currency (e.g. for an AUD account on
+/// NZD_CHF, this is the AUD value of one CHF — typically `1 /
+/// mid(AUD_CHF)`). Pass `1.0` when account ccy == quote ccy.
+///
+/// Math: stop loss in account currency is
+/// `stop_distance * units * fx_quote_to_account`. Setting that equal
+/// to `budget` and solving for units gives `budget / (stop_distance *
+/// rate)`.
+pub fn units_for_budget(budget: f64, entry: f64, stop_loss: f64, fx_quote_to_account: f64) -> u32 {
     let stop_distance = (entry - stop_loss).abs();
     if stop_distance <= 0.0 || budget <= 0.0 || !budget.is_finite() {
         return 0;
     }
-    let units = budget / stop_distance;
+    if fx_quote_to_account <= 0.0 || !fx_quote_to_account.is_finite() {
+        return 0;
+    }
+    let units = budget / (stop_distance * fx_quote_to_account);
     if units <= 0.0 || !units.is_finite() {
         0
     } else {
@@ -116,62 +137,107 @@ mod tests {
     fn units_for_risk_basic_long() {
         // $10k equity, 1% risk → budget = $100. Use clean prices (stop distance = 0.1
         // exactly) to dodge floating-point rounding-down-to-9999 on 1.10/1.09.
-        // budget = $100, stop distance = 0.1, units = 1000
-        assert_eq!(units_for_risk(10_000.0, 1.0, 100.0, 99.9), 1_000);
+        // budget = $100, stop distance = 0.1, units = 1000. Same-ccy rate = 1.0.
+        assert_eq!(units_for_risk(10_000.0, 1.0, 100.0, 99.9, 1.0), 1_000);
     }
 
     #[test]
     fn units_for_risk_rounds_down() {
         // budget = $100, stop distance = 0.003 → 33333.33 → 33333
-        assert_eq!(units_for_risk(10_000.0, 1.0, 1.1000, 1.0970), 33_333);
+        assert_eq!(units_for_risk(10_000.0, 1.0, 1.1000, 1.0970, 1.0), 33_333);
     }
 
     #[test]
     fn units_for_risk_zero_stop_distance_yields_zero() {
-        assert_eq!(units_for_risk(10_000.0, 1.0, 1.1000, 1.1000), 0);
+        assert_eq!(units_for_risk(10_000.0, 1.0, 1.1000, 1.1000, 1.0), 0);
     }
 
     #[test]
     fn units_for_risk_zero_equity_yields_zero() {
-        assert_eq!(units_for_risk(0.0, 1.0, 1.1, 1.09), 0);
+        assert_eq!(units_for_risk(0.0, 1.0, 1.1, 1.09, 1.0), 0);
     }
 
     #[test]
     fn units_for_risk_zero_risk_yields_zero() {
-        assert_eq!(units_for_risk(10_000.0, 0.0, 1.1, 1.09), 0);
+        assert_eq!(units_for_risk(10_000.0, 0.0, 1.1, 1.09, 1.0), 0);
     }
 
     #[test]
     fn units_for_budget_basic() {
         // $100 budget, 0.1 stop distance → 1000 units.
-        assert_eq!(units_for_budget(100.0, 100.0, 99.9), 1_000);
+        assert_eq!(units_for_budget(100.0, 100.0, 99.9, 1.0), 1_000);
     }
 
     #[test]
     fn units_for_budget_rounds_down() {
         // $1 budget, 0.003 stop distance → 333.33 → 333 units. Bet $1
         // on a 30-pip stop — useful smoke test for the fixed-amount mode.
-        assert_eq!(units_for_budget(1.0, 1.1000, 1.0970), 333);
+        assert_eq!(units_for_budget(1.0, 1.1000, 1.0970, 1.0), 333);
     }
 
     #[test]
     fn units_for_budget_zero_budget_yields_zero() {
-        assert_eq!(units_for_budget(0.0, 1.1, 1.09), 0);
+        assert_eq!(units_for_budget(0.0, 1.1, 1.09, 1.0), 0);
     }
 
     #[test]
     fn units_for_budget_negative_budget_yields_zero() {
-        assert_eq!(units_for_budget(-1.0, 1.1, 1.09), 0);
+        assert_eq!(units_for_budget(-1.0, 1.1, 1.09, 1.0), 0);
     }
 
     #[test]
     fn units_for_budget_nan_budget_yields_zero() {
-        assert_eq!(units_for_budget(f64::NAN, 1.1, 1.09), 0);
+        assert_eq!(units_for_budget(f64::NAN, 1.1, 1.09, 1.0), 0);
     }
 
     #[test]
     fn units_for_budget_zero_stop_distance_yields_zero() {
-        assert_eq!(units_for_budget(100.0, 1.1, 1.1), 0);
+        assert_eq!(units_for_budget(100.0, 1.1, 1.1, 1.0), 0);
+    }
+
+    #[test]
+    fn units_for_budget_zero_fx_yields_zero() {
+        // Zero/negative/non-finite FX rates should refuse to size, not
+        // produce u32::MAX or some other surprise.
+        assert_eq!(units_for_budget(100.0, 1.1, 1.09, 0.0), 0);
+        assert_eq!(units_for_budget(100.0, 1.1, 1.09, -1.0), 0);
+        assert_eq!(units_for_budget(100.0, 1.1, 1.09, f64::NAN), 0);
+        assert_eq!(units_for_budget(100.0, 1.1, 1.09, f64::INFINITY), 0);
+    }
+
+    #[test]
+    fn units_for_budget_cross_currency_aud_account_nzd_chf() {
+        // The real-world scenario the bug was discovered on:
+        //
+        // - account ccy = AUD, equity around 391,208.7166 AUD
+        // - risk_amount = 10 AUD (fixed amount)
+        // - instrument = NZD_CHF, quote ccy = CHF
+        // - entry_ref = 0.46132, sl = 0.46194 → stop_distance = 0.00062 (CHF/NZD)
+        // - AUD_CHF mid ≈ 0.5597 → 1 CHF ≈ 1.787 AUD (fx_quote_to_account)
+        //
+        // With FX, units = 10 / (0.00062 * 1.787) ≈ 9024.97 → floor →
+        // 9025 (the actual product comes out a hair above 9024.97 in
+        // f64). Before this fix the same call returned 16129, which
+        // translates to ~17.87 AUD actual risk — 79% oversized.
+        let units = units_for_budget(10.0, 0.46132, 0.46194, 1.787);
+        assert_eq!(units, 9025);
+    }
+
+    #[test]
+    fn units_for_budget_cross_currency_back_compat_same_ccy() {
+        // Passing rate=1.0 must reproduce the legacy same-currency
+        // behaviour bit-for-bit so we know nothing existing has shifted.
+        // $100 budget, 0.1 stop → 1000 units, same as the basic case.
+        assert_eq!(units_for_budget(100.0, 100.0, 99.9, 1.0), 1_000);
+    }
+
+    #[test]
+    fn units_for_budget_cross_currency_jpy_account_eur_usd() {
+        // JPY account trading EUR_USD. Quote ccy = USD.
+        // EUR_JPY ≈ 165 → USD/JPY ≈ 150 → 1 USD = 150 JPY.
+        // Risk 15,000 JPY, 50-pip USD stop (0.0050) → 15000 / (0.0050 * 150)
+        // = 20000 units of EUR. f64 lands at 19999.999... → floor → 19999.
+        assert_eq!(units_for_budget(15_000.0, 1.10, 1.0950, 150.0), 19_999);
     }
 
     #[test]
