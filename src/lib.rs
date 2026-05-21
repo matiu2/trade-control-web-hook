@@ -434,43 +434,45 @@ async fn run_enter<B: Broker>(
         stop_loss: resolved.stop_loss,
         take_profit: resolved.take_profit,
         risk: resolved.risk,
+        dry_run: resolved.dry_run,
     };
 
-    // Dry-run short-circuit: log the resolved sizing inputs and the
-    // implicit R-multiple, then succeed without calling the broker.
-    // The per-broker sizing (equity fetch, FX, market lookup) only
-    // happens inside `place_entry`, so we can't log "units = N" here
-    // — but we *can* show the operator everything we have without
-    // touching the live account.
-    if resolved.dry_run {
-        let r_distance = (entry_reference_price(&resolved.entry) - resolved.stop_loss).abs();
-        let tp_distance = (resolved.take_profit - entry_reference_price(&resolved.entry)).abs();
-        let r_multiple = if r_distance > 0.0 {
-            tp_distance / r_distance
-        } else {
-            f64::NAN
-        };
-        console_log!(
-            "DRY-RUN entry id={} instrument={} direction={:?} entry={:?} sl={} tp={} risk={:?} r={:.3}",
-            verified.intent.id,
-            resolved.instrument,
-            resolved.direction,
-            resolved.entry,
-            resolved.stop_loss,
-            resolved.take_profit,
-            resolved.risk,
-            r_multiple,
-        );
-        return ActionResult::Ok(format!("dry-run: id={}", verified.intent.id));
-    }
+    // Log inputs + R-multiple up front so the operator sees the
+    // planned trade geometry before the broker work begins. The
+    // broker's own `sizing:` log then adds the computed units once
+    // equity / FX have been fetched.
+    let r_distance = (entry_reference_price(&resolved.entry) - resolved.stop_loss).abs();
+    let tp_distance = (resolved.take_profit - entry_reference_price(&resolved.entry)).abs();
+    let r_multiple = if r_distance > 0.0 {
+        tp_distance / r_distance
+    } else {
+        f64::NAN
+    };
+    let prefix = if resolved.dry_run { "DRY-RUN " } else { "" };
+    console_log!(
+        "{prefix}entry id={} instrument={} direction={:?} entry={:?} sl={} tp={} risk={:?} r={:.3}",
+        verified.intent.id,
+        resolved.instrument,
+        resolved.direction,
+        resolved.entry,
+        resolved.stop_loss,
+        resolved.take_profit,
+        resolved.risk,
+        r_multiple,
+    );
 
     match broker
         .place_entry(max_risk_pct, max_open_positions, &entry_request)
         .await
     {
         Ok(order_id) => {
-            console_log!("entry placed id={} order={}", verified.intent.id, order_id);
-            ActionResult::Ok(format!("entered: order={order_id}"))
+            if resolved.dry_run {
+                console_log!("DRY-RUN entry id={} (not placed)", verified.intent.id);
+                ActionResult::Ok(format!("dry-run: id={}", verified.intent.id))
+            } else {
+                console_log!("entry placed id={} order={}", verified.intent.id, order_id);
+                ActionResult::Ok(format!("entered: order={order_id}"))
+            }
         }
         Err(err) => {
             console_error!("entry failed: {err}");

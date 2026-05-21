@@ -8,6 +8,7 @@
 use broker_tradenation::TradeNationBroker;
 use trade_control_core::broker::{Broker, EntryError, EntryRequest};
 use trade_control_core::intent::{Direction, ResolvedEntry, RiskBudget};
+use worker::console_log;
 
 pub struct TradeNationAdapter(pub TradeNationBroker);
 
@@ -18,6 +19,23 @@ impl Broker for TradeNationAdapter {
         max_open_positions: u32,
         req: &EntryRequest<'_>,
     ) -> Result<String, EntryError> {
+        if req.dry_run {
+            // Upstream `place_entry` doesn't yet support a no-op mode,
+            // so we can't run the full sizing path (FX, market resolve,
+            // stake calc) without risking an actual order. Log the
+            // inputs and bail. Once upstream gains a `dry_run` flag,
+            // switch this to the same pattern as OANDA.
+            console_log!(
+                "DRY-RUN tradenation: instrument={} direction={:?} entry={:?} sl={} tp={} risk={:?} (stake not computed — upstream lacks dry-run support)",
+                req.instrument,
+                req.direction,
+                req.entry,
+                req.stop_loss,
+                req.take_profit,
+                req.risk,
+            );
+            return Ok(format!("dry-run-{}", req.instrument));
+        }
         let upstream_req = broker_tradenation::EntryRequest {
             instrument: req.instrument,
             direction: to_upstream_direction(req.direction),

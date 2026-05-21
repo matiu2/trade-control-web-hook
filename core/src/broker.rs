@@ -22,6 +22,11 @@ pub struct EntryRequest<'a> {
     /// How much equity to commit. `Percent` is the historic mode;
     /// `Amount` is a fixed money sum in account currency.
     pub risk: RiskBudget,
+    /// When `true`, the broker runs the full sizing path (account
+    /// fetch, FX, units calc) and logs the result but does **not**
+    /// place the order. Returns a synthetic order id like `"dry-run"`
+    /// so callers can treat it as success.
+    pub dry_run: bool,
 }
 
 /// Failure modes for [`Broker::place_entry`]. Brokers map their own error

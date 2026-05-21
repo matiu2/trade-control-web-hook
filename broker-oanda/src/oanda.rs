@@ -176,14 +176,20 @@ pub async fn place_entry(
             (u, pct)
         }
     };
+    let dry = if req.dry_run { "DRY-RUN " } else { "" };
     console_log!(
-        "oanda sizing: instrument={} mode={:?} equity={equity} effective_pct={effective_pct:.4} entry_ref={reference_price} sl={} units={units}",
+        "{dry}oanda sizing: instrument={} mode={:?} equity={equity} effective_pct={effective_pct:.4} entry_ref={reference_price} sl={} units={units}",
         req.instrument,
         req.risk,
         req.stop_loss,
     );
     if units == 0 {
         return Err(EntryError::UnitsBelowMinimum);
+    }
+    if req.dry_run {
+        // Sizing succeeded — synthetic order id so the caller treats it
+        // as success. The order is intentionally not placed.
+        return Ok(format!("dry-run-{}", req.instrument));
     }
 
     let sl_details = StopLossDetails {
