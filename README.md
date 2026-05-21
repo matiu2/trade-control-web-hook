@@ -442,6 +442,74 @@ Then sign an intent (set `not_after` in the future) and POST it:
   | http POST localhost:8787 Content-Type:text/plain
 ```
 
+## Chart-driven arming: `scripts/tv_arm_hs.py`
+
+The Rust `trade-control` CLI is the low-level signer — one intent at a time.
+For real H&S setups you want **one chart annotation → all five alerts armed**
+(two vetoes, two preps, one entry). `scripts/tv_arm_hs.py` is that frontend.
+
+It reads the active TradingView chart via [tv-mcp](https://github.com/jacksonkasi1/tradingview-mcp)
+(a Chrome DevTools bridge), extracts the H&S geometry from your drawings,
+delegates `trade_id` minting and intent signing to `trade-control build-trade
+--from-file`, and posts the resulting alert bundle straight to TradingView via
+an inside-page fetch.
+
+What you draw on the chart (proposed convention):
+
+| Drawing | Carries |
+|---|---|
+| Horizontal line labeled `too-high` / `too-low` | Invalidation veto trigger (right-shoulder price) |
+| Trendline labeled `neckline` | Break-and-close prep level |
+| Trendline labeled `retest` | Retest prep level |
+| Fib retracement | Take-profit price (computed as `2 × neckline − head`) |
+| Vertical line labeled `trade-expiry` | `not_after` for all alerts |
+
+CLI:
+
+```sh
+python scripts/tv_arm_hs.py \
+  --broker tradenation \              # or oanda; auto-detected from chart exchange
+  --account-id ms-tn-1 \              # defaults to ms-<broker>-1
+  --risk-pct 0.5 \                    # % of NAV (or --risk-amount <home-ccy>)
+  --skip-break-and-close \            # for stocks (no after-hours retests)
+  --skip-retest \                     # implies --skip-break-and-close; for late entries
+  --create-alerts                     # default; pair with --dry-run to inspect only
+```
+
+Skipped preps are pre-fired directly to the worker so the entry's
+`requires_preps:` gate is still satisfied — useful when joining a setup
+after the break-and-close / retest already happened, or for stock setups
+where those preps don't apply.
+
+### Gotchas worth knowing
+
+- **Trendline alerts need `extend_forward: true` in the payload.** TV's
+  server-side cross evaluator only watches the segment between the two
+  drawing anchors otherwise — so a prep that's supposed to fire when price
+  crosses the neckline *after* the drawn anchor segment never fires. The
+  drawing-level `extendRight` property does *not* propagate to the alert
+  payload; we override unconditionally for trendline tools.
+- **Chart-side `_alertId` binding is cosmetic.** The "link icon" on a
+  drawing comes from a separate client-side binding that TV's GUI sets
+  via `LineDataSource.setAlert()`. Programmatic creates can't easily
+  populate it without facade-sync gymnastics. But the alerts still **fire**
+  — the binding is only about whether the drawing shows the icon. Don't
+  chase it.
+- **TP via symmetric reflection.** The script computes TP as `2 × neckline
+  − head` from the fib's two endpoints, independent of which fib levels
+  are visible / configured. Draw the fib spanning head → neckline.
+
+### Dependencies
+
+- Rust `trade-control` CLI on `$PATH` (or pass `--trade-control-bin`).
+- A signing key at `~/.config/trade-control/key.hex`, matching the worker's
+  `SIGNING_KEY` secret.
+- tv-mcp checked out somewhere; the script's `TV_MCP_ROOT` constant points
+  to `~/Downloads/tradingview-mcp-jackson` by default. Adjust if yours
+  lives elsewhere.
+- An active TradingView Desktop session in Firefox with DevTools open
+  (tv-mcp connects via CDP).
+
 ## Known limitations
 
 - **Total open risk** is currently approximated by a count cap
