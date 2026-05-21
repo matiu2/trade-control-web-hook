@@ -1,3 +1,5 @@
 target/
 .wrangler/
 .dev.vars
+scripts/__pycache__/
+scripts/tmp.json
