@@ -17,7 +17,7 @@ pub use control::{
     build_clear_prep_intent, build_clear_veto_intent, build_prep_intent, build_status_intent,
     build_unlock_intent, build_veto_intent, wrap_signed, wrap_signed_template,
 };
-pub use history::{History, record_prep_use, record_veto_use};
+pub use history::{History, record_account_use, record_prep_use, record_veto_use};
 pub use interactive::{fill_missing_fields, prompt_save_as_template};
 pub use templates::{discover_templates, pick_template_interactive, templates_root};
 pub use trade_control_core::sig::KEY_LEN;

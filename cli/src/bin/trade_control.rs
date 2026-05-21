@@ -26,9 +26,9 @@ use trade_control_cli::{
     build_prep_intent, build_status_intent, build_trade_from_spec, build_trade_interactive,
     build_unlock_intent, build_veto_intent, delete_account, delete_secret, fill_missing_fields,
     generate_key_hex, list_accounts, load_spec_from_file, pick_pattern_interactive,
-    pick_template_interactive, prompt_save_as_template, put_secret, record_prep_use,
-    record_veto_use, secret_binding_for, test_account, wrap_signed, wrap_signed_template,
-    write_trade,
+    pick_template_interactive, prompt_save_as_template, put_secret, record_account_use,
+    record_prep_use, record_veto_use, secret_binding_for, test_account, wrap_signed,
+    wrap_signed_template, write_trade,
 };
 use trade_control_core::account::{
     AccountKind, AccountMetadata, Credentials, OandaCreds, TradeNationCreds, TradeNationKind,
@@ -686,6 +686,11 @@ fn run_account(sub: AccountCmd) -> Result<()> {
 fn run_account_list(args: AccountEndpointArgs) -> Result<()> {
     let admin_key = load_admin_key(&args.admin_key_file)?;
     let body = list_accounts(&args.endpoint, &admin_key)?;
+    // Side-effect: warm the sign-flow auto-complete cache with every
+    // canonical name the worker reports. Best-effort — if the response
+    // isn't the expected shape we silently skip the cache update and
+    // still print the body.
+    cache_account_names_from_list(&body);
     print!("{body}");
     if !body.ends_with('\n') {
         println!();
@@ -693,9 +698,30 @@ fn run_account_list(args: AccountEndpointArgs) -> Result<()> {
     Ok(())
 }
 
+/// Parse the YAML body returned by `GET /admin/accounts` and record
+/// every `name:` we find in the operator's local history. Failures are
+/// swallowed — auto-complete is a convenience, not a correctness gate.
+fn cache_account_names_from_list(body: &str) {
+    let Ok(value) = serde_yaml::from_str::<serde_yaml::Value>(body) else {
+        return;
+    };
+    let Some(seq) = value.as_sequence() else {
+        return;
+    };
+    for entry in seq {
+        if let Some(name) = entry.get("name").and_then(|n| n.as_str()) {
+            record_account_use(name);
+        }
+    }
+}
+
 fn run_account_test(args: AccountTestArgs) -> Result<()> {
     let admin_key = load_admin_key(&args.common.admin_key_file)?;
     let body = test_account(&args.common.endpoint, &admin_key, &args.name)?;
+    // `test_account` errored out if the worker rejected — a successful
+    // return means the name resolves. Cache it so the next `sign`
+    // offers it as an auto-complete option.
+    record_account_use(&args.name);
     print!("{body}");
     if !body.ends_with('\n') {
         println!();
@@ -803,6 +829,9 @@ fn run_account_add(args: AccountAddArgs) -> Result<()> {
     // Write metadata first. If this fails (e.g. already-exists) we
     // haven't touched secrets — the operator can re-run.
     let add_body = add_account(&args.common.endpoint, &admin_key, &metadata)?;
+    // Cache the name for sign-flow auto-complete now that the worker
+    // has accepted it.
+    record_account_use(&args.name);
     print!("{add_body}");
     if !add_body.ends_with('\n') {
         println!();

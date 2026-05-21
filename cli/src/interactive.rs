@@ -442,20 +442,70 @@ fn prompt_optional_dry_run() -> Result<Value> {
 ///
 /// Doesn't probe the worker for the live account list — that would
 /// require the admin key in the encrypt path, which is the wrong trust
-/// boundary. Operators who want auto-complete should run
-/// `trade-control account list` first.
+/// boundary. Instead, accounts the operator has already touched
+/// locally (`account add`, `account test`, prior `sign`) are stored in
+/// the history file and offered here as a fuzzy-pick list.
 fn prompt_optional_account() -> Result<Value> {
     let theme = ColorfulTheme::default();
-    let raw: String = Input::with_theme(&theme)
+    let known = history::load().account_names();
+    let chosen = if known.is_empty() {
+        prompt_account_freeform(&theme)?
+    } else {
+        pick_or_freeform_account(&theme, &known)?
+    };
+    match chosen {
+        Some(name) => {
+            // Recording on use keeps the auto-complete list warm even
+            // when the operator skipped `account add` (e.g. signing
+            // for an account someone else provisioned).
+            history::record_account_use(&name);
+            Ok(Value::String(name))
+        }
+        None => Ok(Value::Null),
+    }
+}
+
+/// Free-text input for an account name. Blank → `None`. Trims
+/// whitespace so a stray trailing space doesn't become its own
+/// history entry.
+fn prompt_account_freeform(theme: &ColorfulTheme) -> Result<Option<String>> {
+    let raw: String = Input::with_theme(theme)
         .with_prompt("account (named account from the worker index; blank to skip)")
         .default(String::new())
         .allow_empty(true)
         .interact_text()?;
     let trimmed = raw.trim();
     if trimmed.is_empty() {
-        return Ok(Value::Null);
+        Ok(None)
+    } else {
+        Ok(Some(trimmed.to_string()))
     }
-    Ok(Value::String(trimmed.to_string()))
+}
+
+/// Fuzzy-pick from `known` account names with two extra entries:
+/// `<none>` (skip the field) and `<other...>` (drop into free-text for
+/// a name not yet in history).
+fn pick_or_freeform_account(theme: &ColorfulTheme, known: &[String]) -> Result<Option<String>> {
+    const NONE_LABEL: &str = "<none — skip>";
+    const OTHER_LABEL: &str = "<other — type a name>";
+    // None / Other are sentinels at the tail so the most-recent
+    // account stays the default.
+    let mut items: Vec<String> = known.to_vec();
+    items.push(NONE_LABEL.into());
+    items.push(OTHER_LABEL.into());
+    let idx = FuzzySelect::with_theme(theme)
+        .with_prompt("account (type to filter; pick <other> for a new name)")
+        .items(&items)
+        .default(0)
+        .interact()?;
+    let chosen = &items[idx];
+    if chosen == NONE_LABEL {
+        Ok(None)
+    } else if chosen == OTHER_LABEL {
+        prompt_account_freeform(theme)
+    } else {
+        Ok(Some(chosen.clone()))
+    }
 }
 
 /// Prompt for a comma-separated list of names (used for `requires_preps`,

@@ -41,6 +41,12 @@ pub struct History {
     pub preps: Vec<HistoryEntry>,
     #[serde(default)]
     pub vetos: Vec<HistoryEntry>,
+    /// Account names the operator has interacted with locally — added,
+    /// tested, or referenced in a signed intent. Used by the sign-flow
+    /// `account` prompt to offer auto-complete without needing the
+    /// admin key to round-trip the worker.
+    #[serde(default)]
+    pub accounts: Vec<HistoryEntry>,
 }
 
 impl History {
@@ -52,12 +58,20 @@ impl History {
         self.vetos.iter().map(|e| e.name.clone()).collect()
     }
 
+    pub fn account_names(&self) -> Vec<String> {
+        self.accounts.iter().map(|e| e.name.clone()).collect()
+    }
+
     pub fn record_prep(&mut self, name: &str, now: DateTime<Utc>) {
         record(&mut self.preps, name, now);
     }
 
     pub fn record_veto(&mut self, name: &str, now: DateTime<Utc>) {
         record(&mut self.vetos, name, now);
+    }
+
+    pub fn record_account(&mut self, name: &str, now: DateTime<Utc>) {
+        record(&mut self.accounts, name, now);
     }
 }
 
@@ -128,6 +142,15 @@ pub fn record_veto_use(name: &str) {
     let _ = save(&h);
 }
 
+/// Convenience: load, append an account name, save. Swallows errors.
+/// Recall is best-effort — a broken history file just means no
+/// auto-complete on the next sign.
+pub fn record_account_use(name: &str) {
+    let mut h = load();
+    h.record_account(name, Utc::now());
+    let _ = save(&h);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -187,10 +210,32 @@ mod tests {
         let mut h = History::default();
         h.record_prep("retest", t("2026-05-15T12:00:00Z"));
         h.record_veto("news-window", t("2026-05-15T12:01:00Z"));
+        h.record_account("oanda-demo", t("2026-05-15T12:02:00Z"));
         let yaml = serde_yaml::to_string(&h).unwrap();
         let parsed: History = serde_yaml::from_str(&yaml).unwrap();
         assert_eq!(parsed.prep_names(), vec!["retest"]);
         assert_eq!(parsed.veto_names(), vec!["news-window"]);
+        assert_eq!(parsed.account_names(), vec!["oanda-demo"]);
+    }
+
+    #[test]
+    fn record_account_dedupes_and_promotes() {
+        // Same insertion semantics as preps/vetos — most-recent first,
+        // duplicates collapse.
+        let mut h = History::default();
+        h.record_account("demo", t("2026-05-15T12:00:00Z"));
+        h.record_account("live", t("2026-05-15T12:01:00Z"));
+        h.record_account("demo", t("2026-05-15T12:02:00Z"));
+        assert_eq!(h.account_names(), vec!["demo", "live"]);
+    }
+
+    #[test]
+    fn old_history_without_accounts_field_loads() {
+        // Existing on-disk history files predate the `accounts` field —
+        // serde default keeps them readable.
+        let yaml = "preps: []\nvetos: []\n";
+        let parsed: History = serde_yaml::from_str(yaml).unwrap();
+        assert!(parsed.accounts.is_empty());
     }
 
     #[test]
