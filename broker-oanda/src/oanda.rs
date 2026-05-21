@@ -100,16 +100,6 @@ pub async fn place_entry(
         });
     }
 
-    // Client-side floor for explicit `size_units`. The other risk
-    // modes compute units after equity/FX lookup; their floor is the
-    // broker's own minimum surfaced as `UnitsBelowMinimum` later.
-    if let Some(min) = req.min_position_size
-        && let RiskBudget::Units(s) = req.risk
-        && s < min
-    {
-        return Err(EntryError::UnitsBelowMinimum);
-    }
-
     let account = client.get_account(account_id).await.map_err(|err| {
         console_error!("get_account: {err:?}");
         EntryError::AccountFetch

@@ -22,12 +22,6 @@ pub struct EntryRequest<'a> {
     /// How much equity to commit. `Percent` is the historic mode;
     /// `Amount` is a fixed money sum in account currency.
     pub risk: RiskBudget,
-    /// Optional client-side minimum position size (in instrument
-    /// units). Brokers enforce it before placing when the resolved
-    /// units would fall below this floor. Threaded through from
-    /// `AccountCaps.min_position_size`. `None` means "no client-side
-    /// floor — defer to the broker's own minimum".
-    pub min_position_size: Option<f64>,
 }
 
 /// Failure modes for [`Broker::place_entry`]. Brokers map their own error

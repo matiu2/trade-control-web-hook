@@ -15,14 +15,6 @@ pub struct AccountCaps {
     /// reject new entries until something closes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_open_positions: Option<u32>,
-    /// Client-side minimum position size, in instrument units. When the
-    /// operator submits an explicit `size_units` below this floor, the
-    /// adapter rejects before calling the broker. Only enforced for
-    /// `RiskBudget::Units` — the other risk modes let the broker
-    /// surface its own `UnitsBelowMinimum` after computing units from
-    /// equity and FX. `None` means "no client-side floor".
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub min_position_size: Option<f64>,
 }
 
 impl AccountCaps {
@@ -56,7 +48,6 @@ mod tests {
         let caps = AccountCaps::default();
         assert!(caps.max_risk_pct.is_none());
         assert!(caps.max_open_positions.is_none());
-        assert!(caps.min_position_size.is_none());
     }
 
     #[test]
@@ -64,7 +55,6 @@ mod tests {
         let caps = AccountCaps {
             max_risk_pct: Some(0.5),
             max_open_positions: Some(1),
-            min_position_size: None,
         };
         assert_eq!(caps.resolve_max_risk_pct(1.0), 0.5);
         assert_eq!(caps.resolve_max_open_positions(3), 1);
@@ -78,7 +68,6 @@ mod tests {
         let caps = AccountCaps {
             max_risk_pct: Some(5.0),
             max_open_positions: Some(99),
-            min_position_size: None,
         };
         assert_eq!(caps.resolve_max_risk_pct(1.0), 1.0);
         assert_eq!(caps.resolve_max_open_positions(3), 3);
@@ -98,7 +87,6 @@ mod tests {
         let caps = AccountCaps {
             max_risk_pct: Some(1.0),
             max_open_positions: Some(3),
-            min_position_size: None,
         };
         assert_eq!(caps.resolve_max_risk_pct(1.0), 1.0);
         assert_eq!(caps.resolve_max_open_positions(3), 3);
@@ -108,11 +96,9 @@ mod tests {
     fn yaml_omits_none_fields() {
         let caps = AccountCaps::default();
         let yaml = serde_yaml::to_string(&caps).unwrap();
-        // No `max_risk_pct: null` / `max_open_positions: null` /
-        // `min_position_size: null` lines.
+        // No `max_risk_pct: null` / `max_open_positions: null` lines.
         assert!(!yaml.contains("max_risk_pct"));
         assert!(!yaml.contains("max_open_positions"));
-        assert!(!yaml.contains("min_position_size"));
     }
 
     #[test]
@@ -120,23 +106,20 @@ mod tests {
         let caps = AccountCaps {
             max_risk_pct: Some(0.25),
             max_open_positions: None,
-            min_position_size: Some(10.0),
         };
         let yaml = serde_yaml::to_string(&caps).unwrap();
         assert!(yaml.contains("max_risk_pct: 0.25"));
         assert!(!yaml.contains("max_open_positions"));
-        assert!(yaml.contains("min_position_size: 10"));
     }
 
     #[test]
-    fn min_position_size_round_trips_through_yaml() {
-        let caps = AccountCaps {
-            max_risk_pct: None,
-            max_open_positions: None,
-            min_position_size: Some(5.0),
-        };
-        let yaml = serde_yaml::to_string(&caps).unwrap();
-        let parsed: AccountCaps = serde_yaml::from_str(&yaml).unwrap();
-        assert_eq!(parsed.min_position_size, Some(5.0));
+    fn unknown_fields_are_ignored() {
+        // Legacy account metadata may still carry a `min_position_size`
+        // line from before the field was removed. Tolerate it silently
+        // — serde drops unknown fields by default — so existing KV
+        // records don't need a migration step.
+        let yaml = "max_risk_pct: 0.5\nmin_position_size: 1000\n";
+        let caps: AccountCaps = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(caps.max_risk_pct, Some(0.5));
     }
 }

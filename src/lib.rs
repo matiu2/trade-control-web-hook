@@ -407,8 +407,8 @@ async fn run_enter<B: Broker>(
         }
     }
 
-    let max_risk_pct = secret_or_default(env, MAX_RISK_PCT_PER_TRADE_SECRET, 1.0);
-    let max_open_positions = secret_or_default(env, MAX_OPEN_POSITIONS_SECRET, 3.0) as u32;
+    let worker_max_risk_pct = secret_or_default(env, MAX_RISK_PCT_PER_TRADE_SECRET, 1.0);
+    let worker_max_open_positions = secret_or_default(env, MAX_OPEN_POSITIONS_SECRET, 3.0) as u32;
     let pip_size = pip_size_for(env, &verified.intent.instrument);
 
     let resolved = match Resolved::from_intent(&verified.intent, &verified.shell, pip_size) {
@@ -422,6 +422,11 @@ async fn run_enter<B: Broker>(
         }
     };
     let caps = load_account_caps(env, verified.intent.account.as_deref()).await;
+    // Apply the per-account narrowing now that we have the caps: an
+    // account record can tighten the worker-wide ceiling but never
+    // relax it.
+    let max_risk_pct = caps.resolve_max_risk_pct(worker_max_risk_pct);
+    let max_open_positions = caps.resolve_max_open_positions(worker_max_open_positions);
     let entry_request = EntryRequest {
         instrument: &resolved.instrument,
         direction: resolved.direction,
@@ -429,7 +434,6 @@ async fn run_enter<B: Broker>(
         stop_loss: resolved.stop_loss,
         take_profit: resolved.take_profit,
         risk: resolved.risk,
-        min_position_size: caps.min_position_size,
     };
 
     // Dry-run short-circuit: log the resolved sizing inputs and the
