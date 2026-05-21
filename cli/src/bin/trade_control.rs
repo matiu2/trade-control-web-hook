@@ -31,7 +31,7 @@ use trade_control_cli::{
     wrap_signed_template, write_trade,
 };
 use trade_control_core::account::{
-    AccountKind, AccountMetadata, Credentials, OandaCreds, TradeNationCreds, TradeNationKind,
+    AccountKind, AccountMetadata, Credentials, TradeNationCreds, TradeNationKind,
 };
 use trade_control_core::incoming::signed_pairs_from_text;
 use trade_control_core::intent::Intent;
@@ -149,12 +149,10 @@ struct AccountAddArgs {
     /// interactively if absent and the broker is TradeNation.
     #[arg(long)]
     username: Option<String>,
-    /// OANDA: API key. Prompted interactively if absent and the broker
-    /// is OANDA.
-    #[arg(long)]
-    api_key: Option<String>,
-    /// OANDA: account id (e.g. `001-001-XXXX-001`). Prompted
-    /// interactively if absent and the broker is OANDA.
+    /// OANDA: sub-account id (e.g. `101-011-31142393-003`). Prompted
+    /// interactively if absent and the broker is OANDA. Stored on the
+    /// account metadata — the shared worker-wide `OANDA_API_KEY`
+    /// secret is the token used for all OANDA accounts.
     #[arg(long)]
     account_id: Option<String>,
     #[command(flatten)]
@@ -763,6 +761,7 @@ fn run_account_add(args: AccountAddArgs) -> Result<()> {
     let admin_key = load_admin_key(&args.common.admin_key_file)?;
     let broker: BrokerKind = args.broker.into();
     let kind: AccountKind = args.kind.into();
+    let theme = ColorfulTheme::default();
 
     // Caps — only attach if either field was supplied; otherwise default
     // skip-serialise keeps the wire form minimal.
@@ -770,60 +769,57 @@ fn run_account_add(args: AccountAddArgs) -> Result<()> {
         max_risk_pct: args.max_risk_pct,
         max_open_positions: args.max_open_positions,
     };
+
+    // OANDA: capture the sub-account id (lives on metadata, not as a
+    // secret — there's no per-account OANDA token, just one shared
+    // worker-wide `OANDA_API_KEY` that covers every sub-account).
+    // TradeNation: skipped; the account is identified by login creds.
+    let oanda_account_id = match broker {
+        BrokerKind::Oanda => {
+            let id = match args.account_id {
+                Some(id) => id,
+                None => Input::with_theme(&theme)
+                    .with_prompt("OANDA sub-account id (e.g. 101-011-XXXXXXXX-003)")
+                    .interact_text()
+                    .map_err(|e| eyre!("read account id: {e}"))?,
+            };
+            Some(id)
+        }
+        BrokerKind::TradeNation => None,
+    };
+
     let metadata = AccountMetadata {
         name: args.name.clone(),
         broker,
         kind,
         caps,
+        oanda_account_id,
     };
 
     // Build credentials *first* so we fail before touching the worker
     // if the operator aborts at the prompt. The credential half is the
-    // expensive thing to redo.
-    let creds = if args.no_secret {
+    // expensive thing to redo. OANDA accounts skip this entirely —
+    // they reuse the shared worker-wide `OANDA_API_KEY` and don't
+    // need a per-account secret.
+    let tn_creds = if args.no_secret || broker != BrokerKind::TradeNation {
         None
     } else {
-        let theme = ColorfulTheme::default();
-        match broker {
-            BrokerKind::TradeNation => {
-                let username = match args.username {
-                    Some(u) => u,
-                    None => Input::with_theme(&theme)
-                        .with_prompt("TradeNation username")
-                        .interact_text()
-                        .map_err(|e| eyre!("read username: {e}"))?,
-                };
-                let password = Password::with_theme(&theme)
-                    .with_prompt("TradeNation password")
-                    .interact()
-                    .map_err(|e| eyre!("read password: {e}"))?;
-                Some(Credentials::TradeNation(TradeNationCreds {
-                    kind: args.kind.into(),
-                    username,
-                    password,
-                }))
-            }
-            BrokerKind::Oanda => {
-                let api_key = match args.api_key {
-                    Some(k) => k,
-                    None => Password::with_theme(&theme)
-                        .with_prompt("OANDA API key")
-                        .interact()
-                        .map_err(|e| eyre!("read api key: {e}"))?,
-                };
-                let account_id = match args.account_id {
-                    Some(id) => id,
-                    None => Input::with_theme(&theme)
-                        .with_prompt("OANDA account id")
-                        .interact_text()
-                        .map_err(|e| eyre!("read account id: {e}"))?,
-                };
-                Some(Credentials::Oanda(OandaCreds {
-                    api_key,
-                    account_id,
-                }))
-            }
-        }
+        let username = match args.username {
+            Some(u) => u,
+            None => Input::with_theme(&theme)
+                .with_prompt("TradeNation username")
+                .interact_text()
+                .map_err(|e| eyre!("read username: {e}"))?,
+        };
+        let password = Password::with_theme(&theme)
+            .with_prompt("TradeNation password")
+            .interact()
+            .map_err(|e| eyre!("read password: {e}"))?;
+        Some(Credentials::TradeNation(TradeNationCreds {
+            kind: args.kind.into(),
+            username,
+            password,
+        }))
     };
 
     // Write metadata first. If this fails (e.g. already-exists) we
@@ -837,20 +833,28 @@ fn run_account_add(args: AccountAddArgs) -> Result<()> {
         println!();
     }
 
-    // Then push the credential to Secret Store. The two-step shape is
-    // deliberate — a failure here leaves the operator with a metadata
-    // entry pointing at a missing secret, which `account test` will
-    // surface as a 424. They can then re-run with `--no-secret` skipped
-    // to retry the secret-put alone.
-    if let Some(creds) = creds {
-        let binding = secret_binding_for(broker, &args.name);
-        eprintln!("uploading credential secret {binding} via wrangler…");
-        put_secret(&binding, &creds)?;
-    } else {
-        eprintln!(
-            "skipped credential secret (use `wrangler secret put {}` to set it)",
-            secret_binding_for(broker, &args.name)
-        );
+    // Then push the credential to Secret Store (TradeNation only).
+    // The two-step shape is deliberate — a failure here leaves the
+    // operator with a metadata entry pointing at a missing secret,
+    // which `account test` will surface. They can then re-run with
+    // `--no-secret` skipped to retry the secret-put alone.
+    match (broker, tn_creds) {
+        (BrokerKind::TradeNation, Some(creds)) => {
+            let binding = secret_binding_for(broker, &args.name);
+            eprintln!("uploading credential secret {binding} via wrangler…");
+            put_secret(&binding, &creds)?;
+        }
+        (BrokerKind::TradeNation, None) => {
+            eprintln!(
+                "skipped credential secret (use `wrangler secret put {}` to set it)",
+                secret_binding_for(broker, &args.name)
+            );
+        }
+        (BrokerKind::Oanda, _) => {
+            eprintln!(
+                "oanda accounts share the worker-wide OANDA_API_KEY — no per-account secret needed"
+            );
+        }
     }
 
     Ok(())

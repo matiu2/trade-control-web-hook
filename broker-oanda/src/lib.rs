@@ -50,6 +50,10 @@ impl Broker for OandaBroker {
 
 /// Read the OANDA secrets from `env` and construct a broker. Returns `None`
 /// (with errors logged) when a required secret is missing or login fails.
+///
+/// Uses the worker-global `OANDA_ACCOUNT_ID` secret for the sub-account
+/// id — call [`login_with_account_id`] instead when the intent names a
+/// specific account whose id lives on its metadata record.
 pub async fn login(env: &Env) -> Option<OandaBroker> {
     let account_id = match get_secret(OANDA_ACCOUNT_ID, env) {
         Some(s) => s,
@@ -58,6 +62,13 @@ pub async fn login(env: &Env) -> Option<OandaBroker> {
             return None;
         }
     };
+    login_with_account_id(env, account_id).await
+}
+
+/// Like [`login`] but uses an explicitly-supplied `account_id` (e.g.
+/// from per-account metadata) instead of reading `OANDA_ACCOUNT_ID`.
+/// The API token is still the shared worker-wide `OANDA_API_KEY`.
+pub async fn login_with_account_id(env: &Env, account_id: String) -> Option<OandaBroker> {
     let client = login_client(env).await?;
     Some(OandaBroker { client, account_id })
 }

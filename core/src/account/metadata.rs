@@ -27,6 +27,13 @@ pub struct AccountMetadata {
     /// "narrower wins" semantics.
     #[serde(default, skip_serializing_if = "is_default_caps")]
     pub caps: AccountCaps,
+    /// OANDA sub-account id (e.g. `"101-011-31142393-003"`). Required
+    /// when `broker == Oanda` so the dispatch can route each intent to
+    /// the right sub-account under the shared `OANDA_API_KEY`. Left
+    /// `None` for TradeNation, where the account is identified by the
+    /// session credentials, not an id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oanda_account_id: Option<String>,
 }
 
 fn is_default_caps(caps: &AccountCaps) -> bool {
@@ -41,6 +48,7 @@ impl AccountMetadata {
             broker,
             kind,
             caps: AccountCaps::default(),
+            oanda_account_id: None,
         }
     }
 }
@@ -121,6 +129,7 @@ mod tests {
                 max_risk_pct: Some(0.25),
                 max_open_positions: Some(1),
             },
+            oanda_account_id: None,
         };
         let yaml = serde_yaml::to_string(&m).unwrap();
         assert!(yaml.contains("caps:"));
@@ -138,10 +147,33 @@ mod tests {
                 max_risk_pct: Some(0.25),
                 max_open_positions: Some(1),
             },
+            oanda_account_id: None,
         };
         let yaml = serde_yaml::to_string(&m).unwrap();
         let back: AccountMetadata = serde_yaml::from_str(&yaml).unwrap();
         assert_eq!(back, m);
+    }
+
+    #[test]
+    fn oanda_account_id_round_trips() {
+        let m = AccountMetadata {
+            name: "oanda-reversals-demo".into(),
+            broker: BrokerKind::Oanda,
+            kind: AccountKind::Demo,
+            caps: AccountCaps::default(),
+            oanda_account_id: Some("101-011-31142393-003".into()),
+        };
+        let yaml = serde_yaml::to_string(&m).unwrap();
+        assert!(yaml.contains("oanda_account_id: 101-011-31142393-003"));
+        let back: AccountMetadata = serde_yaml::from_str(&yaml).unwrap();
+        assert_eq!(back, m);
+    }
+
+    #[test]
+    fn metadata_yaml_omits_none_oanda_account_id() {
+        let m = AccountMetadata::new("demo-1", BrokerKind::TradeNation, AccountKind::Demo);
+        let yaml = serde_yaml::to_string(&m).unwrap();
+        assert!(!yaml.contains("oanda_account_id"));
     }
 
     #[test]

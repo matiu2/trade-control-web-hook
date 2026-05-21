@@ -178,6 +178,33 @@ pub async fn handle_test(req: &Request, env: &Env, name: &str) -> Result<Respons
         Ok(m) => m,
         Err(e) => return metadata_error_to_response(e),
     };
+
+    // OANDA accounts have no per-account credential secret — the
+    // shared worker-wide `OANDA_API_KEY` covers every sub-account.
+    // The metadata is the only thing to check.
+    if meta.broker == BrokerKind::Oanda {
+        if meta.oanda_account_id.is_none() {
+            console_error!("admin test {name}: oanda metadata missing oanda_account_id");
+            return Response::error(
+                "oanda account missing `oanda_account_id` in metadata — re-run \
+                 `trade-control account add`",
+                424,
+            );
+        }
+        console_log!(
+            "admin: test {name} ok (broker=oanda, kind={}, account_id={})",
+            wire_kind(meta.kind),
+            meta.oanda_account_id.as_deref().unwrap_or("?")
+        );
+        let body = format!(
+            "name: {}\nbroker: oanda\nkind: {}\noanda_account_id: {}\nstatus: ok\n",
+            meta.name,
+            wire_kind(meta.kind),
+            meta.oanda_account_id.as_deref().unwrap_or("")
+        );
+        return Response::ok(body);
+    }
+
     let resolver = SecretCredentialsResolver::new(env, &store);
     use trade_control_core::account::CredentialsResolver;
     let creds = match resolver.resolve(name).await {

@@ -13,7 +13,9 @@ use worker::{Context, Env, Method, Request, Response, Result, console_error, con
 
 use crate::state::KvStateStore;
 use crate::tradenation_adapter::TradeNationAdapter;
-use broker_oanda::login as oanda_login;
+#[cfg(target_arch = "wasm32")]
+use broker_oanda::login_with_account_id as oanda_login_with;
+use broker_oanda::{OandaBroker, login as oanda_login};
 use serde::Serialize;
 use trade_control_core::broker::{Broker, EntryRequest};
 use trade_control_core::incoming::{self, parse_and_verify};
@@ -133,10 +135,12 @@ pub async fn main(mut req: Request, env: Env, _ctx: Context) -> Result<Response>
 
     // Broker dispatch.
     let result = match verified.intent.broker {
-        BrokerKind::Oanda => match oanda_login(&env).await {
-            Some(broker) => run_action(&broker, &store, &verified, &env, now).await,
-            None => return Response::error("oanda login failed", 500),
-        },
+        BrokerKind::Oanda => {
+            match acquire_oanda_broker(&env, verified.intent.account.as_deref()).await {
+                Some(broker) => run_action(&broker, &store, &verified, &env, now).await,
+                None => return Response::error("oanda login failed", 500),
+            }
+        }
         BrokerKind::TradeNation => {
             match acquire_tn_broker(&env, verified.intent.account.as_deref()).await {
                 Some(broker) => {
@@ -877,6 +881,71 @@ async fn handle_clear_veto(
     };
     record_seen(store, verified, now, &outcome).await;
     Response::ok("ok")
+}
+
+/// Resolve an [`OandaBroker`] for the request.
+///
+/// - When `account` is `Some(name)`, looks up the account's metadata
+///   in the KV index and uses its `oanda_account_id` as the sub-account
+///   id. Falls back to the worker-global `OANDA_ACCOUNT_ID` secret if
+///   the metadata exists but lacks an id (operator forgot to set it).
+/// - When `account` is `None`, uses the worker-global secret directly
+///   (legacy behaviour, preserved for intents that pre-date the
+///   first-class account system).
+///
+/// In both cases the API token comes from the shared worker-wide
+/// `OANDA_API_KEY` — OANDA only issues one token per user, and that
+/// token can address every sub-account.
+pub(crate) async fn acquire_oanda_broker(env: &Env, account: Option<&str>) -> Option<OandaBroker> {
+    match account {
+        Some(name) => acquire_oanda_broker_for_account(env, name).await,
+        None => oanda_login(env).await,
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+async fn acquire_oanda_broker_for_account(_env: &Env, _name: &str) -> Option<OandaBroker> {
+    None
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn acquire_oanda_broker_for_account(env: &Env, name: &str) -> Option<OandaBroker> {
+    use trade_control_core::account::MetadataStore;
+    use trade_control_core::intent::BrokerKind;
+
+    let kv = match env.kv(KV_NAMESPACE) {
+        Ok(kv) => kv,
+        Err(err) => {
+            console_error!("oanda[{name}]: KV binding missing: {err:?}");
+            return None;
+        }
+    };
+    let metadata = accounts::KvMetadataStore::new(kv);
+    let meta = match metadata.get(name).await {
+        Ok(m) => m,
+        Err(err) => {
+            console_error!("oanda[{name}]: metadata lookup failed: {err}");
+            return None;
+        }
+    };
+    if meta.broker != BrokerKind::Oanda {
+        console_error!(
+            "oanda[{name}]: account broker={:?} but intent routed to oanda",
+            meta.broker
+        );
+        return None;
+    }
+    match meta.oanda_account_id {
+        Some(id) => oanda_login_with(env, id).await,
+        None => {
+            console_error!(
+                "oanda[{name}]: metadata has no `oanda_account_id` — re-run `trade-control account add` \
+                 to set it, or fall back via worker-global OANDA_ACCOUNT_ID by omitting `account:` \
+                 from the intent"
+            );
+            oanda_login(env).await
+        }
+    }
 }
 
 /// Resolve a `TradeNationBroker`, refreshing the session as needed.
