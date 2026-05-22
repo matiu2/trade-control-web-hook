@@ -34,12 +34,14 @@ impl KvStateStore {
         format!("seen:{id}")
     }
 
-    fn cooldown_key(instrument: &str) -> String {
-        format!("cooldown:{instrument}")
+    fn cooldown_key(account: Option<&str>, instrument: &str) -> String {
+        let scope = account_scope(account);
+        format!("cooldown:{scope}:{instrument}")
     }
 
-    fn prep_key(instrument: &str, step: &str) -> String {
-        format!("prep:{instrument}:{step}")
+    fn prep_key(account: Option<&str>, instrument: &str, step: &str) -> String {
+        let scope = account_scope(account);
+        format!("prep:{scope}:{instrument}:{step}")
     }
 
     fn veto_key(account: Option<&str>, instrument: &str, name: &str) -> String {
@@ -185,24 +187,47 @@ impl StateStore for KvStateStore {
         Ok(())
     }
 
-    async fn is_cooled_down(&self, instrument: &str) -> Result<bool, StateError> {
-        let key = Self::cooldown_key(instrument);
-        let result = self
+    async fn is_cooled_down(
+        &self,
+        account: Option<&str>,
+        instrument: &str,
+    ) -> Result<bool, StateError> {
+        // Global-first: a worker-wide cooldown pauses every account.
+        let global = Self::cooldown_key(None, instrument);
+        if self
             .store
-            .get(&key)
+            .get(&global)
             .text()
             .await
-            .map_err(|e| StateError::Backend(format!("get cooldown: {e:?}")))?;
-        Ok(result.is_some())
+            .map_err(|e| StateError::Backend(format!("get cooldown (global): {e:?}")))?
+            .is_some()
+        {
+            return Ok(true);
+        }
+        if account.is_some() {
+            let scoped = Self::cooldown_key(account, instrument);
+            if self
+                .store
+                .get(&scoped)
+                .text()
+                .await
+                .map_err(|e| StateError::Backend(format!("get cooldown (scoped): {e:?}")))?
+                .is_some()
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     async fn set_cooldown(
         &self,
+        account: Option<&str>,
         instrument: &str,
         hours: u32,
         now: DateTime<Utc>,
     ) -> Result<(), StateError> {
-        let key = Self::cooldown_key(instrument);
+        let key = Self::cooldown_key(account, instrument);
         let ttl = (hours as u64).saturating_mul(3600).max(MIN_TTL_SECONDS);
         self.store
             .put(&key, "1")
@@ -213,18 +238,25 @@ impl StateStore for KvStateStore {
             .map_err(|e| StateError::Backend(format!("put cooldown execute: {e:?}")))?;
 
         let expires_at = now + chrono::Duration::seconds(ttl as i64);
+        let account_owned = account.map(str::to_string);
         let mut entries = prune_expired(self.read_cooldown_index().await?, now);
-        entries.retain(|e| e.instrument != instrument);
+        entries.retain(|e| !(e.instrument == instrument && e.account == account_owned));
         entries.push(CooldownEntry {
             instrument: instrument.to_string(),
             set_at: Some(now),
             expires_at,
+            account: account_owned,
         });
         self.write_cooldown_index(&entries).await
     }
 
-    async fn clear_cooldown(&self, instrument: &str) -> Result<bool, StateError> {
-        let key = Self::cooldown_key(instrument);
+    async fn clear_cooldown(
+        &self,
+        account: Option<&str>,
+        instrument: &str,
+    ) -> Result<bool, StateError> {
+        // Scoped clear — same shape as clear_veto.
+        let key = Self::cooldown_key(account, instrument);
         let was = self
             .store
             .get(&key)
@@ -238,12 +270,11 @@ impl StateStore for KvStateStore {
                 .await
                 .map_err(|e| StateError::Backend(format!("delete cooldown: {e:?}")))?;
         }
-        // Always rewrite the index — both to remove this instrument if listed
-        // and to drop any other expired entries we observe.
         let now = Utc::now();
+        let account_owned = account.map(str::to_string);
         let mut entries = prune_expired(self.read_cooldown_index().await?, now);
         let before = entries.len();
-        entries.retain(|e| e.instrument != instrument);
+        entries.retain(|e| !(e.instrument == instrument && e.account == account_owned));
         if entries.len() != before || was {
             self.write_cooldown_index(&entries).await?;
         }
@@ -252,13 +283,14 @@ impl StateStore for KvStateStore {
 
     async fn set_prep(
         &self,
+        account: Option<&str>,
         instrument: &str,
         step: &str,
         now: DateTime<Utc>,
         ttl_seconds: u64,
         setter_id: &str,
     ) -> Result<(), StateError> {
-        let key = Self::prep_key(instrument, step);
+        let key = Self::prep_key(account, instrument, step);
         let ttl = ttl_seconds.max(MIN_TTL_SECONDS);
         // Store `<rfc3339>|<setter_id>` so the entry-time gate can read
         // the timestamp AND `clear_prep` can forget the setter's seen
@@ -273,13 +305,17 @@ impl StateStore for KvStateStore {
             .map_err(|e| StateError::Backend(format!("put prep execute: {e:?}")))?;
 
         let expires_at = now + chrono::Duration::seconds(ttl as i64);
+        let account_owned = account.map(str::to_string);
         let mut entries = prune_expired(self.read_prep_index().await?, now);
-        entries.retain(|e| !(e.instrument == instrument && e.step == step));
+        entries.retain(|e| {
+            !(e.instrument == instrument && e.step == step && e.account == account_owned)
+        });
         entries.push(PrepEntry {
             instrument: instrument.to_string(),
             step: step.to_string(),
             set_at: now,
             expires_at,
+            account: account_owned,
         });
         if entries.len() > PREP_INDEX_CAP {
             let drop = entries.len() - PREP_INDEX_CAP;
@@ -290,16 +326,29 @@ impl StateStore for KvStateStore {
 
     async fn get_prep(
         &self,
+        account: Option<&str>,
         instrument: &str,
         step: &str,
     ) -> Result<Option<DateTime<Utc>>, StateError> {
-        let key = Self::prep_key(instrument, step);
-        let raw = self
+        // Global-first: a worker-wide prep satisfies the gate on every
+        // account. Then fall back to the account-scoped key if one
+        // was supplied.
+        let global = Self::prep_key(None, instrument, step);
+        let mut raw = self
             .store
-            .get(&key)
+            .get(&global)
             .text()
             .await
-            .map_err(|e| StateError::Backend(format!("get prep: {e:?}")))?;
+            .map_err(|e| StateError::Backend(format!("get prep (global): {e:?}")))?;
+        if raw.is_none() && account.is_some() {
+            let scoped = Self::prep_key(account, instrument, step);
+            raw = self
+                .store
+                .get(&scoped)
+                .text()
+                .await
+                .map_err(|e| StateError::Backend(format!("get prep (scoped): {e:?}")))?;
+        }
         let Some(text) = raw else {
             return Ok(None);
         };
@@ -310,8 +359,13 @@ impl StateStore for KvStateStore {
         Ok(Some(ts))
     }
 
-    async fn clear_prep(&self, instrument: &str, step: &str) -> Result<Option<String>, StateError> {
-        let key = Self::prep_key(instrument, step);
+    async fn clear_prep(
+        &self,
+        account: Option<&str>,
+        instrument: &str,
+        step: &str,
+    ) -> Result<Option<String>, StateError> {
+        let key = Self::prep_key(account, instrument, step);
         let raw = self
             .store
             .get(&key)
@@ -329,9 +383,12 @@ impl StateStore for KvStateStore {
                 .map_err(|e| StateError::Backend(format!("delete prep: {e:?}")))?;
         }
         let now = Utc::now();
+        let account_owned = account.map(str::to_string);
         let mut entries = prune_expired(self.read_prep_index().await?, now);
         let before = entries.len();
-        entries.retain(|e| !(e.instrument == instrument && e.step == step));
+        entries.retain(|e| {
+            !(e.instrument == instrument && e.step == step && e.account == account_owned)
+        });
         if entries.len() != before || was {
             self.write_prep_index(&entries).await?;
         }

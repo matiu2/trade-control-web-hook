@@ -282,8 +282,9 @@ async fn run_action<B: Broker>(
         }
         Action::Invalidate => {
             let hours = verified.intent.cooldown_hours.unwrap_or(12);
+            let account = verified.intent.account.as_deref();
             if let Err(err) = store
-                .set_cooldown(&verified.intent.instrument, hours, now)
+                .set_cooldown(account, &verified.intent.instrument, hours, now)
                 .await
             {
                 console_error!("KV set_cooldown: {err}");
@@ -296,8 +297,9 @@ async fn run_action<B: Broker>(
                 .cancel_pending_for_instrument(&verified.intent.instrument)
                 .await;
             console_log!(
-                "invalidate {} cooldown {}h cancelled {} pending",
+                "invalidate instrument={} account={} cooldown={}h cancelled={} pending",
                 verified.intent.instrument,
+                account.unwrap_or("<global>"),
                 hours,
                 cancelled
             );
@@ -320,8 +322,16 @@ async fn run_enter<B: Broker>(
     env: &Env,
     _now: chrono::DateTime<chrono::Utc>,
 ) -> ActionResult {
-    // Cooldown gate
-    match store.is_cooled_down(&verified.intent.instrument).await {
+    // Cooldown gate — scoped to this intent's account so a cooldown on
+    // a different account doesn't pause this one. A global cooldown
+    // (set without `account:`) still pauses every account.
+    match store
+        .is_cooled_down(
+            verified.intent.account.as_deref(),
+            &verified.intent.instrument,
+        )
+        .await
+    {
         Ok(true) => {
             console_log!(
                 "entry rejected: {} cooled down (id={})",
@@ -348,7 +358,14 @@ async fn run_enter<B: Broker>(
     // list order.
     let mut prev_ts: Option<chrono::DateTime<chrono::Utc>> = None;
     for step in &verified.intent.requires_preps {
-        match store.get_prep(&verified.intent.instrument, step).await {
+        match store
+            .get_prep(
+                verified.intent.account.as_deref(),
+                &verified.intent.instrument,
+                step,
+            )
+            .await
+        {
             Ok(Some(set_at)) => {
                 if let Some(prev) = prev_ts
                     && set_at <= prev
@@ -562,14 +579,18 @@ async fn handle_unlock(
     now: chrono::DateTime<chrono::Utc>,
 ) -> Result<Response> {
     let instrument = &verified.intent.instrument;
-    let was = match store.clear_cooldown(instrument).await {
+    let account = verified.intent.account.as_deref();
+    let was = match store.clear_cooldown(account, instrument).await {
         Ok(b) => b,
         Err(err) => {
             console_error!("KV clear_cooldown: {err}");
             return Response::error("state error", 500);
         }
     };
-    console_log!("unlock {instrument} was_cooled_down={was}");
+    console_log!(
+        "unlock instrument={instrument} account={} was_cooled_down={was}",
+        account.unwrap_or("<global>")
+    );
     let body = match serde_yaml::to_string(&UnlockResponse {
         unlocked: instrument.clone(),
         was_cooled_down: was,
@@ -603,8 +624,10 @@ async fn handle_prep(
     // (`break-and-close`). Logged per-name for traceability; failures
     // are best-effort logs rather than rejections so a transient KV
     // hiccup on a clear doesn't block the new prep.
+    let account = verified.intent.account.as_deref();
     let cleared = match clear_named_preps(
         store,
+        account,
         &verified.intent.instrument,
         &verified.intent.clears,
     )
@@ -618,6 +641,7 @@ async fn handle_prep(
     };
     if let Err(err) = store
         .set_prep(
+            account,
             &verified.intent.instrument,
             step,
             now,
@@ -630,8 +654,9 @@ async fn handle_prep(
         return Response::error("state error", 500);
     }
     console_log!(
-        "prep set: {} {} ttl={}h cleared={:?}",
+        "prep set: instrument={} account={} step={} ttl={}h cleared={:?}",
         verified.intent.instrument,
+        account.unwrap_or("<global>"),
         step,
         ttl_hours,
         cleared
@@ -835,7 +860,11 @@ async fn handle_clear_prep(
     let Some(step) = verified.intent.step.as_deref() else {
         return Response::error("clear-prep requires `step`", 400);
     };
-    let cleared_setter = match store.clear_prep(&verified.intent.instrument, step).await {
+    let account = verified.intent.account.as_deref();
+    let cleared_setter = match store
+        .clear_prep(account, &verified.intent.instrument, step)
+        .await
+    {
         Ok(s) => s,
         Err(err) => {
             console_error!("KV clear_prep: {err}");
@@ -855,8 +884,9 @@ async fn handle_clear_prep(
     }
     let was = cleared_setter.is_some();
     console_log!(
-        "clear-prep {} {} was_set={}",
+        "clear-prep instrument={} account={} step={} was_set={}",
         verified.intent.instrument,
+        account.unwrap_or("<global>"),
         step,
         was
     );

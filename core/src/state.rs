@@ -16,6 +16,11 @@ use crate::intent::Action;
 /// One active cooldown row in a [`Snapshot`]. `set_at` records when the
 /// cooldown was put in place so the operator can see how long ago it
 /// started; `expires_at` is when it lapses on its own.
+///
+/// `account` scopes the cooldown the same way [`VetoEntry`] does:
+/// `None` = worker-global (pauses every account), `Some(name)` =
+/// account-scoped. See [`ACCOUNT_SCOPE_GLOBAL`] for the on-disk
+/// sentinel.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CooldownEntry {
     pub instrument: String,
@@ -24,6 +29,10 @@ pub struct CooldownEntry {
     #[serde(default)]
     pub set_at: Option<DateTime<Utc>>,
     pub expires_at: DateTime<Utc>,
+    /// `None` for worker-global, `Some(name)` for account-scoped. No
+    /// `serde(default)` — pre-scoping cooldowns in KV are wiped at
+    /// deploy time, same as vetos.
+    pub account: Option<String>,
 }
 
 /// One recently-seen replay-protection id in a [`Snapshot`]. Beyond the
@@ -60,12 +69,20 @@ fn default_action() -> Action {
 /// One active "prep" flag row in a [`Snapshot`]. A prep records that a
 /// named step (e.g. `break-and-close`) landed for an instrument at a
 /// specific time; the `enter` gate checks both presence and order.
+///
+/// `account` scopes the prep — a setup in progress on one account is
+/// not the same as a setup on another account, even on the same pair.
+/// Same scoping rules as [`VetoEntry`] / [`CooldownEntry`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PrepEntry {
     pub instrument: String,
     pub step: String,
     pub set_at: DateTime<Utc>,
     pub expires_at: DateTime<Utc>,
+    /// `None` for worker-global, `Some(name)` for account-scoped. No
+    /// `serde(default)` — pre-scoping preps in KV are wiped at deploy
+    /// time, same as vetos and cooldowns.
+    pub account: Option<String>,
 }
 
 /// One active "veto" flag row in a [`Snapshot`]. Presence alone is the
@@ -138,30 +155,47 @@ pub trait StateStore {
     /// Best-effort: succeeds even if the key is already gone.
     fn forget_seen(&self, id: &str) -> impl Future<Output = Result<(), StateError>>;
 
-    /// Returns true if `instrument` is currently under cooldown.
-    fn is_cooled_down(&self, instrument: &str) -> impl Future<Output = Result<bool, StateError>>;
+    /// Returns true if `instrument` is currently under cooldown for
+    /// `account`. Same global-first semantics as [`Self::is_vetoed`]: a
+    /// global cooldown (no `account:` on the setter intent) pauses
+    /// every account, an account-scoped cooldown pauses only that
+    /// account.
+    fn is_cooled_down(
+        &self,
+        account: Option<&str>,
+        instrument: &str,
+    ) -> impl Future<Output = Result<bool, StateError>>;
 
-    /// Set a cooldown on `instrument` for `hours`. `now` is recorded as
-    /// the cooldown's start time so `status` shows how long ago it began.
+    /// Set a cooldown on `(account, instrument)` for `hours`. `now` is
+    /// recorded as the cooldown's start time so `status` shows how
+    /// long ago it began.
     fn set_cooldown(
         &self,
+        account: Option<&str>,
         instrument: &str,
         hours: u32,
         now: DateTime<Utc>,
     ) -> impl Future<Output = Result<(), StateError>>;
 
-    /// Clear the cooldown for `instrument`. Returns whether it was set before.
-    fn clear_cooldown(&self, instrument: &str) -> impl Future<Output = Result<bool, StateError>>;
+    /// Clear the cooldown for `(account, instrument)`. Returns whether
+    /// it was set before. Scoped — clearing on one account doesn't
+    /// touch a different account's cooldown or the global cooldown.
+    fn clear_cooldown(
+        &self,
+        account: Option<&str>,
+        instrument: &str,
+    ) -> impl Future<Output = Result<bool, StateError>>;
 
-    /// Record a named prep step for `instrument` with a TTL. `now` is the
-    /// timestamp stored on the flag; the entry-time gate uses it to
-    /// enforce ordering across multiple preps. `setter_id` is the
-    /// message-id that set this prep, stashed inside the value so
-    /// `clear_prep` can also forget that id's `seen:<id>` record —
+    /// Record a named prep step for `(account, instrument)` with a TTL.
+    /// `now` is the timestamp stored on the flag; the entry-time gate
+    /// uses it to enforce ordering across multiple preps. `setter_id`
+    /// is the message-id that set this prep, stashed inside the value
+    /// so `clear_prep` can also forget that id's `seen:<id>` record —
     /// the operator can then re-send the original prep message
     /// without hitting the replay-protection 409.
     fn set_prep(
         &self,
+        account: Option<&str>,
         instrument: &str,
         step: &str,
         now: DateTime<Utc>,
@@ -169,20 +203,24 @@ pub trait StateStore {
         setter_id: &str,
     ) -> impl Future<Output = Result<(), StateError>>;
 
-    /// Return `Some(set_at)` if the prep is currently active, `None`
-    /// otherwise (absent or expired).
+    /// Return `Some(set_at)` if the prep is currently active for
+    /// `(account, instrument)`, `None` otherwise (absent or expired).
+    /// Global-first lookup, same shape as [`Self::is_vetoed`].
     fn get_prep(
         &self,
+        account: Option<&str>,
         instrument: &str,
         step: &str,
     ) -> impl Future<Output = Result<Option<DateTime<Utc>>, StateError>>;
 
-    /// Clear a prep flag. Returns `Some(setter_id)` if the prep was
-    /// active and recorded a setter id, `Some(String::new())` if it
-    /// was active but predates the setter-id wire format, and `None`
-    /// if it wasn't set.
+    /// Clear a prep flag for `(account, instrument)`. Returns
+    /// `Some(setter_id)` if the prep was active and recorded a setter
+    /// id, `Some(String::new())` if it was active but predates the
+    /// setter-id wire format, and `None` if it wasn't set. Scoped to
+    /// the supplied account.
     fn clear_prep(
         &self,
+        account: Option<&str>,
         instrument: &str,
         step: &str,
     ) -> impl Future<Output = Result<Option<String>, StateError>>;
@@ -357,12 +395,13 @@ pub fn parse_prep_value(raw: &str) -> (&str, &str) {
 /// here.
 pub async fn clear_named_preps<S: StateStore>(
     store: &S,
+    account: Option<&str>,
     instrument: &str,
     names: &[String],
 ) -> Result<Vec<String>, StateError> {
     let mut cleared = Vec::new();
     for name in names {
-        if let Some(setter_id) = store.clear_prep(instrument, name).await? {
+        if let Some(setter_id) = store.clear_prep(account, instrument, name).await? {
             // Empty setter_id means the prep predates the wire-format
             // change that stashes the id; nothing to forget.
             if !setter_id.is_empty() {
@@ -453,34 +492,62 @@ mod memstore {
             self.delete(&format!("seen:{id}"));
             Ok(())
         }
-        async fn is_cooled_down(&self, instrument: &str) -> Result<bool, StateError> {
-            Ok(self
-                .get_live(&format!("cooldown:{instrument}"), Utc::now())
-                .is_some())
+        async fn is_cooled_down(
+            &self,
+            account: Option<&str>,
+            instrument: &str,
+        ) -> Result<bool, StateError> {
+            let now = Utc::now();
+            // Global cooldowns pause every account; check both keys.
+            let global = format!("cooldown:{ACCOUNT_SCOPE_GLOBAL}:{instrument}");
+            if self.get_live(&global, now).is_some() {
+                return Ok(true);
+            }
+            if let Some(name_str) = account {
+                let scoped = format!("cooldown:{name_str}:{instrument}");
+                if self.get_live(&scoped, now).is_some() {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
         }
         async fn set_cooldown(
             &self,
+            account: Option<&str>,
             instrument: &str,
             hours: u32,
             now: DateTime<Utc>,
         ) -> Result<(), StateError> {
+            let scope = account_scope(account);
             let ttl = (hours as u64).saturating_mul(3600).max(MIN_TTL_SECONDS);
-            self.put(format!("cooldown:{instrument}"), "1".into(), ttl, now);
+            self.put(
+                format!("cooldown:{scope}:{instrument}"),
+                "1".into(),
+                ttl,
+                now,
+            );
             Ok(())
         }
-        async fn clear_cooldown(&self, instrument: &str) -> Result<bool, StateError> {
-            Ok(self.delete(&format!("cooldown:{instrument}")))
+        async fn clear_cooldown(
+            &self,
+            account: Option<&str>,
+            instrument: &str,
+        ) -> Result<bool, StateError> {
+            let scope = account_scope(account);
+            Ok(self.delete(&format!("cooldown:{scope}:{instrument}")))
         }
         async fn set_prep(
             &self,
+            account: Option<&str>,
             instrument: &str,
             step: &str,
             now: DateTime<Utc>,
             ttl_seconds: u64,
             setter_id: &str,
         ) -> Result<(), StateError> {
+            let scope = account_scope(account);
             self.put(
-                format!("prep:{instrument}:{step}"),
+                format!("prep:{scope}:{instrument}:{step}"),
                 format!("{}|{setter_id}", now.to_rfc3339()),
                 ttl_seconds.max(MIN_TTL_SECONDS),
                 now,
@@ -489,10 +556,20 @@ mod memstore {
         }
         async fn get_prep(
             &self,
+            account: Option<&str>,
             instrument: &str,
             step: &str,
         ) -> Result<Option<DateTime<Utc>>, StateError> {
-            let Some(text) = self.get_live(&format!("prep:{instrument}:{step}"), Utc::now()) else {
+            let now = Utc::now();
+            // Global preps satisfy the gate on every account; check
+            // global first, then scoped if present.
+            let global = format!("prep:{ACCOUNT_SCOPE_GLOBAL}:{instrument}:{step}");
+            let text = self.get_live(&global, now).or_else(|| {
+                account
+                    .map(|n| format!("prep:{n}:{instrument}:{step}"))
+                    .and_then(|k| self.get_live(&k, now))
+            });
+            let Some(text) = text else {
                 return Ok(None);
             };
             let (ts_part, _id_part) = parse_prep_value(&text);
@@ -504,10 +581,12 @@ mod memstore {
         }
         async fn clear_prep(
             &self,
+            account: Option<&str>,
             instrument: &str,
             step: &str,
         ) -> Result<Option<String>, StateError> {
-            let key = format!("prep:{instrument}:{step}");
+            let scope = account_scope(account);
+            let key = format!("prep:{scope}:{instrument}:{step}");
             let setter = self
                 .get_live(&key, Utc::now())
                 .map(|raw| parse_prep_value(&raw).1.to_string());
@@ -624,6 +703,7 @@ mod tests {
             instrument: instrument.into(),
             set_at: None,
             expires_at,
+            account: None,
         }
     }
 
@@ -702,13 +782,14 @@ mod tests {
             None,
         ))
         .unwrap();
-        pollster::block_on(store.set_prep("EUR_USD", "retest", now, 3600, "retest-msg-id"))
+        pollster::block_on(store.set_prep(None, "EUR_USD", "retest", now, 3600, "retest-msg-id"))
             .unwrap();
 
         // Clearing the prep via clear_named_preps should also drop
         // the seen record.
         let cleared = pollster::block_on(clear_named_preps(
             &store,
+            None,
             "EUR_USD",
             &["retest".to_string()],
         ))
@@ -743,15 +824,16 @@ mod tests {
         // sees the entry as live. The test only cares about round-trip
         // semantics, not TTL expiry.
         let now = Utc::now();
-        pollster::block_on(store.set_prep("EUR_USD", "break", now, 4 * 3600, "setter-1")).unwrap();
-        let got = pollster::block_on(store.get_prep("EUR_USD", "break")).unwrap();
+        pollster::block_on(store.set_prep(None, "EUR_USD", "break", now, 4 * 3600, "setter-1"))
+            .unwrap();
+        let got = pollster::block_on(store.get_prep(None, "EUR_USD", "break")).unwrap();
         assert_eq!(got, Some(now));
-        let cleared = pollster::block_on(store.clear_prep("EUR_USD", "break")).unwrap();
+        let cleared = pollster::block_on(store.clear_prep(None, "EUR_USD", "break")).unwrap();
         assert_eq!(cleared.as_deref(), Some("setter-1"));
-        let got = pollster::block_on(store.get_prep("EUR_USD", "break")).unwrap();
+        let got = pollster::block_on(store.get_prep(None, "EUR_USD", "break")).unwrap();
         assert!(got.is_none());
         // Clearing again returns None — the prep is gone.
-        let again = pollster::block_on(store.clear_prep("EUR_USD", "break")).unwrap();
+        let again = pollster::block_on(store.clear_prep(None, "EUR_USD", "break")).unwrap();
         assert!(again.is_none());
     }
 
@@ -759,8 +841,106 @@ mod tests {
     fn memstore_get_prep_absent() {
         use super::memstore::MemStateStore;
         let store = MemStateStore::new();
-        let got = pollster::block_on(store.get_prep("EUR_USD", "ghost")).unwrap();
+        let got = pollster::block_on(store.get_prep(None, "EUR_USD", "ghost")).unwrap();
         assert!(got.is_none());
+    }
+
+    #[test]
+    fn memstore_prep_scoped_per_account() {
+        // The bug-fix case for preps: a prep landed for one account is
+        // not relevant to a different account's setup on the same pair.
+        use super::memstore::MemStateStore;
+        let store = MemStateStore::new();
+        let now = Utc::now();
+        pollster::block_on(store.set_prep(
+            Some("acct-a"),
+            "EUR_USD",
+            "break-and-close",
+            now,
+            3600,
+            "id-a",
+        ))
+        .unwrap();
+        assert_eq!(
+            pollster::block_on(store.get_prep(Some("acct-a"), "EUR_USD", "break-and-close"))
+                .unwrap(),
+            Some(now),
+            "prep should be visible on the account that set it"
+        );
+        assert_eq!(
+            pollster::block_on(store.get_prep(Some("acct-b"), "EUR_USD", "break-and-close"))
+                .unwrap(),
+            None,
+            "prep on acct-a must NOT satisfy the entry gate on acct-b — bug fix"
+        );
+        assert_eq!(
+            pollster::block_on(store.get_prep(None, "EUR_USD", "break-and-close")).unwrap(),
+            None,
+            "a scoped prep must not register as a global prep"
+        );
+    }
+
+    #[test]
+    fn memstore_prep_clear_is_scoped() {
+        use super::memstore::MemStateStore;
+        let store = MemStateStore::new();
+        let now = Utc::now();
+        pollster::block_on(store.set_prep(Some("acct-a"), "EUR_USD", "break", now, 3600, "id-a"))
+            .unwrap();
+        pollster::block_on(store.set_prep(Some("acct-b"), "EUR_USD", "break", now, 3600, "id-b"))
+            .unwrap();
+        // Clearing on acct-a returns Some(setter_id) and removes only
+        // that scope. acct-b's prep is untouched.
+        let cleared =
+            pollster::block_on(store.clear_prep(Some("acct-a"), "EUR_USD", "break")).unwrap();
+        assert_eq!(cleared.as_deref(), Some("id-a"));
+        assert!(
+            pollster::block_on(store.get_prep(Some("acct-b"), "EUR_USD", "break"))
+                .unwrap()
+                .is_some(),
+            "acct-b's prep must survive an acct-a clear"
+        );
+    }
+
+    #[test]
+    fn memstore_cooldown_scoped_per_account() {
+        // Mirror of the veto scoping test for cooldowns.
+        use super::memstore::MemStateStore;
+        let store = MemStateStore::new();
+        let now = Utc::now();
+        pollster::block_on(store.set_cooldown(Some("acct-a"), "EUR_USD", 1, now)).unwrap();
+        assert!(pollster::block_on(store.is_cooled_down(Some("acct-a"), "EUR_USD")).unwrap());
+        assert!(
+            !pollster::block_on(store.is_cooled_down(Some("acct-b"), "EUR_USD")).unwrap(),
+            "a cooldown on acct-a must not pause acct-b"
+        );
+        assert!(!pollster::block_on(store.is_cooled_down(None, "EUR_USD")).unwrap());
+    }
+
+    #[test]
+    fn memstore_global_cooldown_pauses_every_account() {
+        use super::memstore::MemStateStore;
+        let store = MemStateStore::new();
+        let now = Utc::now();
+        pollster::block_on(store.set_cooldown(None, "EUR_USD", 1, now)).unwrap();
+        assert!(pollster::block_on(store.is_cooled_down(Some("acct-a"), "EUR_USD")).unwrap());
+        assert!(pollster::block_on(store.is_cooled_down(Some("acct-b"), "EUR_USD")).unwrap());
+    }
+
+    #[test]
+    fn memstore_global_prep_satisfies_every_account() {
+        // Symmetric with the global-veto + global-cooldown behaviour: a
+        // `None` prep is visible to every account. Unlikely to be used
+        // in practice (preps are setup-specific), but kept for shape
+        // consistency.
+        use super::memstore::MemStateStore;
+        let store = MemStateStore::new();
+        let now = Utc::now();
+        pollster::block_on(store.set_prep(None, "EUR_USD", "break", now, 3600, "id-g")).unwrap();
+        assert_eq!(
+            pollster::block_on(store.get_prep(Some("acct-a"), "EUR_USD", "break")).unwrap(),
+            Some(now)
+        );
     }
 
     #[test]
@@ -838,14 +1018,14 @@ mod tests {
         let store = MemStateStore::new();
         let t1 = Utc::now();
         let t2 = t1 + chrono::Duration::minutes(5);
-        pollster::block_on(store.set_prep("EUR_USD", "break", t1, 3600, "id-1")).unwrap();
-        pollster::block_on(store.set_prep("USD_JPY", "break", t2, 3600, "id-2")).unwrap();
+        pollster::block_on(store.set_prep(None, "EUR_USD", "break", t1, 3600, "id-1")).unwrap();
+        pollster::block_on(store.set_prep(None, "USD_JPY", "break", t2, 3600, "id-2")).unwrap();
         assert_eq!(
-            pollster::block_on(store.get_prep("EUR_USD", "break")).unwrap(),
+            pollster::block_on(store.get_prep(None, "EUR_USD", "break")).unwrap(),
             Some(t1)
         );
         assert_eq!(
-            pollster::block_on(store.get_prep("USD_JPY", "break")).unwrap(),
+            pollster::block_on(store.get_prep(None, "USD_JPY", "break")).unwrap(),
             Some(t2)
         );
     }
@@ -859,11 +1039,11 @@ mod tests {
         // Use a TTL that comfortably covers the test's relative clock —
         // memstore's `get_live` consults the real wall clock.
         let ttl = 24 * 3600;
-        pollster::block_on(store.set_prep("EUR_USD", "break", t1, ttl, "id-a")).unwrap();
-        pollster::block_on(store.set_prep("EUR_USD", "break", t2, ttl, "id-b")).unwrap();
+        pollster::block_on(store.set_prep(None, "EUR_USD", "break", t1, ttl, "id-a")).unwrap();
+        pollster::block_on(store.set_prep(None, "EUR_USD", "break", t2, ttl, "id-b")).unwrap();
         // Refiring a prep refreshes its timestamp — documented behaviour.
         assert_eq!(
-            pollster::block_on(store.get_prep("EUR_USD", "break")).unwrap(),
+            pollster::block_on(store.get_prep(None, "EUR_USD", "break")).unwrap(),
             Some(t2)
         );
     }
@@ -878,11 +1058,13 @@ mod tests {
         let store = MemStateStore::new();
         let now = Utc::now();
         let ttl = 24 * 3600;
-        pollster::block_on(store.set_prep("EUR_USD", "retest", now, ttl, "retest-id")).unwrap();
-        pollster::block_on(store.set_prep("EUR_USD", "other", now, ttl, "other-id")).unwrap();
+        pollster::block_on(store.set_prep(None, "EUR_USD", "retest", now, ttl, "retest-id"))
+            .unwrap();
+        pollster::block_on(store.set_prep(None, "EUR_USD", "other", now, ttl, "other-id")).unwrap();
 
         let cleared = pollster::block_on(clear_named_preps(
             &store,
+            None,
             "EUR_USD",
             &["retest".to_string(), "ghost".to_string()],
         ))
@@ -893,13 +1075,13 @@ mod tests {
 
         // Untargeted prep survives.
         assert!(
-            pollster::block_on(store.get_prep("EUR_USD", "other"))
+            pollster::block_on(store.get_prep(None, "EUR_USD", "other"))
                 .unwrap()
                 .is_some()
         );
         // Targeted prep is gone.
         assert!(
-            pollster::block_on(store.get_prep("EUR_USD", "retest"))
+            pollster::block_on(store.get_prep(None, "EUR_USD", "retest"))
                 .unwrap()
                 .is_none()
         );
@@ -910,13 +1092,13 @@ mod tests {
         use super::memstore::MemStateStore;
         let store = MemStateStore::new();
         let now = Utc::now();
-        pollster::block_on(store.set_prep("EUR_USD", "retest", now, 24 * 3600, "retest-id"))
+        pollster::block_on(store.set_prep(None, "EUR_USD", "retest", now, 24 * 3600, "retest-id"))
             .unwrap();
-        let cleared = pollster::block_on(clear_named_preps(&store, "EUR_USD", &[])).unwrap();
+        let cleared = pollster::block_on(clear_named_preps(&store, None, "EUR_USD", &[])).unwrap();
         assert!(cleared.is_empty());
         // Existing prep untouched.
         assert!(
-            pollster::block_on(store.get_prep("EUR_USD", "retest"))
+            pollster::block_on(store.get_prep(None, "EUR_USD", "retest"))
                 .unwrap()
                 .is_some()
         );
@@ -930,24 +1112,25 @@ mod tests {
         let store = MemStateStore::new();
         let now = Utc::now();
         let ttl = 24 * 3600;
-        pollster::block_on(store.set_prep("EUR_USD", "retest", now, ttl, "eur-id")).unwrap();
-        pollster::block_on(store.set_prep("USD_JPY", "retest", now, ttl, "jpy-id")).unwrap();
+        pollster::block_on(store.set_prep(None, "EUR_USD", "retest", now, ttl, "eur-id")).unwrap();
+        pollster::block_on(store.set_prep(None, "USD_JPY", "retest", now, ttl, "jpy-id")).unwrap();
 
         let cleared = pollster::block_on(clear_named_preps(
             &store,
+            None,
             "EUR_USD",
             &["retest".to_string()],
         ))
         .unwrap();
         assert_eq!(cleared, vec!["retest".to_string()]);
         assert!(
-            pollster::block_on(store.get_prep("EUR_USD", "retest"))
+            pollster::block_on(store.get_prep(None, "EUR_USD", "retest"))
                 .unwrap()
                 .is_none()
         );
         // USD_JPY untouched.
         assert!(
-            pollster::block_on(store.get_prep("USD_JPY", "retest"))
+            pollster::block_on(store.get_prep(None, "USD_JPY", "retest"))
                 .unwrap()
                 .is_some()
         );
@@ -982,12 +1165,14 @@ mod tests {
                 step: "stale".into(),
                 set_at: ts("2026-05-14T10:00:00Z"),
                 expires_at: ts("2026-05-14T11:00:00Z"), // expired
+                account: None,
             },
             PrepEntry {
                 instrument: "EUR_USD".into(),
                 step: "fresh".into(),
                 set_at: ts("2026-05-14T11:30:00Z"),
                 expires_at: ts("2026-05-14T15:00:00Z"), // live
+                account: None,
             },
         ];
         let kept = prune_expired(entries, now);
@@ -1030,6 +1215,7 @@ mod tests {
                 step: "break-and-close".into(),
                 set_at: ts("2026-05-14T11:00:00Z"),
                 expires_at: ts("2026-05-14T15:00:00Z"),
+                account: Some("oanda-reversals-demo".into()),
             }],
             vetos: vec![VetoEntry {
                 instrument: "EUR_USD".into(),
@@ -1080,10 +1266,15 @@ mod tests {
 
     #[test]
     fn cooldown_entry_round_trips_legacy_yaml() {
-        let yaml = "instrument: EUR_USD\nexpires_at: \"2026-05-14T13:00:00Z\"\n";
+        // Pre-set_at cooldowns must still parse, but the new `account`
+        // field is required (no on-disk back-compat — KV is wiped at
+        // deploy). Explicit None matches what an un-deployed entry
+        // would look like after a one-off migration.
+        let yaml = "instrument: EUR_USD\nexpires_at: \"2026-05-14T13:00:00Z\"\naccount: null\n";
         let entry: CooldownEntry = serde_yaml::from_str(yaml).unwrap();
         assert_eq!(entry.instrument, "EUR_USD");
         assert_eq!(entry.set_at, None);
+        assert_eq!(entry.account, None);
     }
 
     #[test]
@@ -1114,11 +1305,13 @@ mod tests {
             instrument: "F40".into(),
             set_at: Some(ts("2026-05-15T18:00:34Z")),
             expires_at: ts("2026-05-16T06:00:34Z"),
+            account: Some("oanda-reversals-demo".into()),
         };
         let yaml = serde_yaml::to_string(&entry).unwrap();
         let parsed: CooldownEntry = serde_yaml::from_str(&yaml).unwrap();
         assert_eq!(parsed.instrument, "F40");
         assert_eq!(parsed.set_at, Some(ts("2026-05-15T18:00:34Z")));
         assert_eq!(parsed.expires_at, ts("2026-05-16T06:00:34Z"));
+        assert_eq!(parsed.account, Some("oanda-reversals-demo".into()));
     }
 }
