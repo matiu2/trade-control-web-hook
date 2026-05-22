@@ -12,7 +12,7 @@ use chrono::{DateTime, Utc};
 use trade_control_core::intent::Action;
 use trade_control_core::state::{
     CooldownEntry, MIN_TTL_SECONDS, PREP_INDEX_CAP, PrepEntry, SEEN_INDEX_CAP, SeenEntry, Snapshot,
-    StateError, StateStore, VETO_INDEX_CAP, VetoEntry, prune_expired,
+    StateError, StateStore, VETO_INDEX_CAP, VetoEntry, account_scope, prune_expired,
 };
 use worker::kv::KvStore;
 
@@ -42,8 +42,9 @@ impl KvStateStore {
         format!("prep:{instrument}:{step}")
     }
 
-    fn veto_key(instrument: &str, name: &str) -> String {
-        format!("veto:{instrument}:{name}")
+    fn veto_key(account: Option<&str>, instrument: &str, name: &str) -> String {
+        let scope = account_scope(account);
+        format!("veto:{scope}:{instrument}:{name}")
     }
 
     async fn read_cooldown_index(&self) -> Result<Vec<CooldownEntry>, StateError> {
@@ -339,11 +340,12 @@ impl StateStore for KvStateStore {
 
     async fn set_veto(
         &self,
+        account: Option<&str>,
         instrument: &str,
         name: &str,
         ttl_seconds: u64,
     ) -> Result<(), StateError> {
-        let key = Self::veto_key(instrument, name);
+        let key = Self::veto_key(account, instrument, name);
         let ttl = ttl_seconds.max(MIN_TTL_SECONDS);
         self.store
             .put(&key, "1")
@@ -355,12 +357,16 @@ impl StateStore for KvStateStore {
 
         let now = Utc::now();
         let expires_at = now + chrono::Duration::seconds(ttl as i64);
+        let account_owned = account.map(str::to_string);
         let mut entries = prune_expired(self.read_veto_index().await?, now);
-        entries.retain(|e| !(e.instrument == instrument && e.name == name));
+        entries.retain(|e| {
+            !(e.instrument == instrument && e.name == name && e.account == account_owned)
+        });
         entries.push(VetoEntry {
             instrument: instrument.to_string(),
             name: name.to_string(),
             expires_at,
+            account: account_owned,
         });
         if entries.len() > VETO_INDEX_CAP {
             let drop = entries.len() - VETO_INDEX_CAP;
@@ -369,19 +375,52 @@ impl StateStore for KvStateStore {
         self.write_veto_index(&entries).await
     }
 
-    async fn is_vetoed(&self, instrument: &str, name: &str) -> Result<bool, StateError> {
-        let key = Self::veto_key(instrument, name);
-        let result = self
+    async fn is_vetoed(
+        &self,
+        account: Option<&str>,
+        instrument: &str,
+        name: &str,
+    ) -> Result<bool, StateError> {
+        // Global vetos affect every account; check the global key
+        // first, then the account-scoped key if one was requested. Two
+        // GETs in the rare-collision case; one GET on the common path
+        // where there's no account-specific veto.
+        let global = Self::veto_key(None, instrument, name);
+        if self
             .store
-            .get(&key)
+            .get(&global)
             .text()
             .await
-            .map_err(|e| StateError::Backend(format!("get veto: {e:?}")))?;
-        Ok(result.is_some())
+            .map_err(|e| StateError::Backend(format!("get veto (global): {e:?}")))?
+            .is_some()
+        {
+            return Ok(true);
+        }
+        if account.is_some() {
+            let scoped = Self::veto_key(account, instrument, name);
+            let scoped_hit = self
+                .store
+                .get(&scoped)
+                .text()
+                .await
+                .map_err(|e| StateError::Backend(format!("get veto (scoped): {e:?}")))?
+                .is_some();
+            if scoped_hit {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
-    async fn clear_veto(&self, instrument: &str, name: &str) -> Result<bool, StateError> {
-        let key = Self::veto_key(instrument, name);
+    async fn clear_veto(
+        &self,
+        account: Option<&str>,
+        instrument: &str,
+        name: &str,
+    ) -> Result<bool, StateError> {
+        // Scoped clear — clearing on one account doesn't touch a
+        // different account's veto or the global veto.
+        let key = Self::veto_key(account, instrument, name);
         let was = self
             .store
             .get(&key)
@@ -396,9 +435,12 @@ impl StateStore for KvStateStore {
                 .map_err(|e| StateError::Backend(format!("delete veto: {e:?}")))?;
         }
         let now = Utc::now();
+        let account_owned = account.map(str::to_string);
         let mut entries = prune_expired(self.read_veto_index().await?, now);
         let before = entries.len();
-        entries.retain(|e| !(e.instrument == instrument && e.name == name));
+        entries.retain(|e| {
+            !(e.instrument == instrument && e.name == name && e.account == account_owned)
+        });
         if entries.len() != before || was {
             self.write_veto_index(&entries).await?;
         }

@@ -70,11 +70,33 @@ pub struct PrepEntry {
 
 /// One active "veto" flag row in a [`Snapshot`]. Presence alone is the
 /// signal — no timestamp ordering applies on vetos.
+///
+/// `account` scopes the veto to a single configured account name.
+/// `None` means the veto is worker-global — it applies to any account
+/// (or to a single-account worker that never names accounts in its
+/// intents). See [`ACCOUNT_SCOPE_GLOBAL`] for the on-disk sentinel.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VetoEntry {
     pub instrument: String,
     pub name: String,
     pub expires_at: DateTime<Utc>,
+    /// `None` for worker-global, `Some(name)` for account-scoped.
+    /// Pre-scoping entries in KV (written before this field existed)
+    /// are wiped at deploy time — there is no on-disk back-compat.
+    pub account: Option<String>,
+}
+
+/// KV-key sentinel used in place of an account name when a veto is
+/// worker-global (no `account:` field on the intent). Picked because
+/// account names use kebab-case and never appear as a bare underscore,
+/// so `veto:_:EUR_USD:news` is unambiguously the global key.
+pub const ACCOUNT_SCOPE_GLOBAL: &str = "_";
+
+/// Resolve an optional account name into the string segment used in KV
+/// keys. `None` → [`ACCOUNT_SCOPE_GLOBAL`]; `Some(name)` → the name
+/// unchanged. Centralised so the encoding lives in one place.
+pub fn account_scope(account: Option<&str>) -> &str {
+    account.unwrap_or(ACCOUNT_SCOPE_GLOBAL)
 }
 
 /// Read-only snapshot of the state store for the `status` action.
@@ -167,23 +189,36 @@ pub trait StateStore {
 
     /// Record a named veto for `instrument` with a TTL. Presence alone
     /// is the signal — no timestamp needs storing.
+    ///
+    /// `account` scopes the veto: `None` means worker-global (any
+    /// account on this instrument), `Some(name)` means only that
+    /// account is affected. Two accounts trading the same pair therefore
+    /// don't shadow each other's vetos.
     fn set_veto(
         &self,
+        account: Option<&str>,
         instrument: &str,
         name: &str,
         ttl_seconds: u64,
     ) -> impl Future<Output = Result<(), StateError>>;
 
-    /// Returns true if the veto is currently active.
+    /// Returns true if the veto is currently active for `account` on
+    /// `instrument`. A `Some(name)` query matches a `None` (global)
+    /// veto as well as a matching `Some(name)` veto — global vetos
+    /// affect every account by design.
     fn is_vetoed(
         &self,
+        account: Option<&str>,
         instrument: &str,
         name: &str,
     ) -> impl Future<Output = Result<bool, StateError>>;
 
-    /// Clear a veto flag. Returns whether it was set before.
+    /// Clear a veto flag for `account` on `instrument`. Returns whether
+    /// it was set before. Clearing is scoped — clearing on one account
+    /// doesn't drop a different account's veto or the global veto.
     fn clear_veto(
         &self,
+        account: Option<&str>,
         instrument: &str,
         name: &str,
     ) -> impl Future<Output = Result<bool, StateError>>;
@@ -341,14 +376,19 @@ pub async fn clear_named_preps<S: StateStore>(
 
 /// Mirror of [`clear_named_preps`] for veto names. See its docs for the
 /// motivation.
+///
+/// `account` scopes the clear: clearing a veto on `Some("acct-a")`
+/// doesn't drop the same-named veto on `Some("acct-b")` or the global
+/// (`None`) veto. The caller decides the scope.
 pub async fn clear_named_vetos<S: StateStore>(
     store: &S,
+    account: Option<&str>,
     instrument: &str,
     names: &[String],
 ) -> Result<Vec<String>, StateError> {
     let mut cleared = Vec::new();
     for name in names {
-        if store.clear_veto(instrument, name).await? {
+        if store.clear_veto(account, instrument, name).await? {
             cleared.push(name.clone());
         }
     }
@@ -479,25 +519,48 @@ mod memstore {
         }
         async fn set_veto(
             &self,
+            account: Option<&str>,
             instrument: &str,
             name: &str,
             ttl_seconds: u64,
         ) -> Result<(), StateError> {
+            let scope = account_scope(account);
             self.put(
-                format!("veto:{instrument}:{name}"),
+                format!("veto:{scope}:{instrument}:{name}"),
                 "1".into(),
                 ttl_seconds.max(MIN_TTL_SECONDS),
                 Utc::now(),
             );
             Ok(())
         }
-        async fn is_vetoed(&self, instrument: &str, name: &str) -> Result<bool, StateError> {
-            Ok(self
-                .get_live(&format!("veto:{instrument}:{name}"), Utc::now())
-                .is_some())
+        async fn is_vetoed(
+            &self,
+            account: Option<&str>,
+            instrument: &str,
+            name: &str,
+        ) -> Result<bool, StateError> {
+            let now = Utc::now();
+            // Global vetos cover every account; check both keys.
+            let global = format!("veto:{ACCOUNT_SCOPE_GLOBAL}:{instrument}:{name}");
+            if self.get_live(&global, now).is_some() {
+                return Ok(true);
+            }
+            if let Some(name_str) = account {
+                let scoped = format!("veto:{name_str}:{instrument}:{name}");
+                if self.get_live(&scoped, now).is_some() {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
         }
-        async fn clear_veto(&self, instrument: &str, name: &str) -> Result<bool, StateError> {
-            Ok(self.delete(&format!("veto:{instrument}:{name}")))
+        async fn clear_veto(
+            &self,
+            account: Option<&str>,
+            instrument: &str,
+            name: &str,
+        ) -> Result<bool, StateError> {
+            let scope = account_scope(account);
+            Ok(self.delete(&format!("veto:{scope}:{instrument}:{name}")))
         }
         async fn snapshot(&self) -> Result<Snapshot, StateError> {
             // The mock doesn't track an index alongside the TTL'd keys, so
@@ -704,11 +767,69 @@ mod tests {
     fn memstore_veto_round_trip() {
         use super::memstore::MemStateStore;
         let store = MemStateStore::new();
-        pollster::block_on(store.set_veto("EUR_USD", "news-window", 6 * 3600)).unwrap();
-        assert!(pollster::block_on(store.is_vetoed("EUR_USD", "news-window")).unwrap());
-        let was = pollster::block_on(store.clear_veto("EUR_USD", "news-window")).unwrap();
+        // Global veto (no account scope) — back-compat with single-account workers.
+        pollster::block_on(store.set_veto(None, "EUR_USD", "news-window", 6 * 3600)).unwrap();
+        assert!(pollster::block_on(store.is_vetoed(None, "EUR_USD", "news-window")).unwrap());
+        let was = pollster::block_on(store.clear_veto(None, "EUR_USD", "news-window")).unwrap();
         assert!(was);
-        assert!(!pollster::block_on(store.is_vetoed("EUR_USD", "news-window")).unwrap());
+        assert!(!pollster::block_on(store.is_vetoed(None, "EUR_USD", "news-window")).unwrap());
+    }
+
+    #[test]
+    fn memstore_veto_scoped_per_account() {
+        // The bug-fix case: a veto on account A must not block account B
+        // on the same instrument. Both accounts trade EUR_USD; account A
+        // sets `news`. Account B should be unaffected.
+        use super::memstore::MemStateStore;
+        let store = MemStateStore::new();
+        pollster::block_on(store.set_veto(Some("acct-a"), "EUR_USD", "news", 6 * 3600)).unwrap();
+        assert!(
+            pollster::block_on(store.is_vetoed(Some("acct-a"), "EUR_USD", "news")).unwrap(),
+            "veto should be active on the account that set it"
+        );
+        assert!(
+            !pollster::block_on(store.is_vetoed(Some("acct-b"), "EUR_USD", "news")).unwrap(),
+            "veto on acct-a must NOT bleed into acct-b — this is the bug we're fixing"
+        );
+        assert!(
+            !pollster::block_on(store.is_vetoed(None, "EUR_USD", "news")).unwrap(),
+            "a scoped veto must not register as a global veto"
+        );
+    }
+
+    #[test]
+    fn memstore_global_veto_covers_every_account() {
+        // The other side of the scoping rule: a worker-wide veto
+        // (`account = None`) does affect every account. The CLI keeps
+        // this as a deliberate kill-switch.
+        use super::memstore::MemStateStore;
+        let store = MemStateStore::new();
+        pollster::block_on(store.set_veto(None, "EUR_USD", "halt", 6 * 3600)).unwrap();
+        assert!(pollster::block_on(store.is_vetoed(Some("acct-a"), "EUR_USD", "halt")).unwrap());
+        assert!(pollster::block_on(store.is_vetoed(Some("acct-b"), "EUR_USD", "halt")).unwrap());
+    }
+
+    #[test]
+    fn memstore_veto_clear_is_scoped() {
+        // Clearing on one account doesn't touch another account's veto
+        // or the global veto with the same name.
+        use super::memstore::MemStateStore;
+        let store = MemStateStore::new();
+        let ttl = 6 * 3600;
+        pollster::block_on(store.set_veto(Some("acct-a"), "EUR_USD", "news", ttl)).unwrap();
+        pollster::block_on(store.set_veto(Some("acct-b"), "EUR_USD", "news", ttl)).unwrap();
+        pollster::block_on(store.set_veto(None, "EUR_USD", "news", ttl)).unwrap();
+
+        let was = pollster::block_on(store.clear_veto(Some("acct-a"), "EUR_USD", "news")).unwrap();
+        assert!(was);
+        // After clearing on acct-a, acct-b still sees a veto (its own
+        // scoped veto AND the global). Switch out the global so we can
+        // verify acct-b's specifically is left in place.
+        assert!(pollster::block_on(store.clear_veto(None, "EUR_USD", "news")).unwrap());
+        assert!(
+            pollster::block_on(store.is_vetoed(Some("acct-b"), "EUR_USD", "news")).unwrap(),
+            "acct-b's scoped veto must survive both an acct-a clear and a global clear"
+        );
     }
 
     #[test]
@@ -837,15 +958,19 @@ mod tests {
         use super::memstore::MemStateStore;
         let store = MemStateStore::new();
         let ttl = 24 * 3600;
-        pollster::block_on(store.set_veto("EUR_USD", "news", ttl)).unwrap();
-        pollster::block_on(store.set_veto("EUR_USD", "other", ttl)).unwrap();
+        pollster::block_on(store.set_veto(None, "EUR_USD", "news", ttl)).unwrap();
+        pollster::block_on(store.set_veto(None, "EUR_USD", "other", ttl)).unwrap();
 
-        let cleared =
-            pollster::block_on(clear_named_vetos(&store, "EUR_USD", &["news".to_string()]))
-                .unwrap();
+        let cleared = pollster::block_on(clear_named_vetos(
+            &store,
+            None,
+            "EUR_USD",
+            &["news".to_string()],
+        ))
+        .unwrap();
         assert_eq!(cleared, vec!["news".to_string()]);
-        assert!(!pollster::block_on(store.is_vetoed("EUR_USD", "news")).unwrap());
-        assert!(pollster::block_on(store.is_vetoed("EUR_USD", "other")).unwrap());
+        assert!(!pollster::block_on(store.is_vetoed(None, "EUR_USD", "news")).unwrap());
+        assert!(pollster::block_on(store.is_vetoed(None, "EUR_USD", "other")).unwrap());
     }
 
     #[test]
@@ -878,11 +1003,13 @@ mod tests {
                 instrument: "EUR_USD".into(),
                 name: "stale".into(),
                 expires_at: ts("2026-05-14T11:00:00Z"),
+                account: None,
             },
             VetoEntry {
                 instrument: "USD_JPY".into(),
                 name: "fresh".into(),
                 expires_at: ts("2026-05-14T13:00:00Z"),
+                account: None,
             },
         ];
         let kept = prune_expired(entries, now);
@@ -908,6 +1035,7 @@ mod tests {
                 instrument: "EUR_USD".into(),
                 name: "news-window".into(),
                 expires_at: ts("2026-05-14T13:00:00Z"),
+                account: Some("oanda-reversals-demo".into()),
             }],
         };
         let yaml = serde_yaml::to_string(&snap).unwrap();
