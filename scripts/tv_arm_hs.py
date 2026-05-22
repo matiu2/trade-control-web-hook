@@ -50,8 +50,6 @@ DEFAULT_KEY_FILE = Path.home() / ".config" / "trade-control" / "key.hex"
 
 ARM_OUT_ROOT = Path("/tmp/trade-control-arm")
 
-WEBHOOK_URL = "https://trade-control-web-hook.msherborne.workers.dev"
-
 # Default account when none is supplied via env / CLI. Matches the operator's
 # working OANDA worker index.
 DEFAULT_ACCOUNT_BY_BROKER = {
@@ -734,7 +732,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     g = p.add_mutually_exclusive_group()
     g.add_argument(
         "--create-alerts", action="store_true",
-        help="Post the alerts to TradingView + pre-fire any skipped preps.",
+        help="Post the alerts to TradingView.",
     )
     g.add_argument(
         "--dry-run", action="store_true",
@@ -748,13 +746,15 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     )
     p.add_argument(
         "--skip-break-and-close", action="store_true",
-        help="Don't post the break-and-close prep; pre-fire it to the worker. "
-             "Use when the break already happened.",
+        help="Drop the break-and-close prep from the bundle (no alert "
+             "emitted and the entry no longer requires it). Use when "
+             "the break already happened.",
     )
     p.add_argument(
         "--skip-retest", action="store_true",
-        help="Same as --skip-break-and-close for the retest prep; implies "
-             "--skip-break-and-close. Use for stocks or late setups.",
+        help="Drop the retest prep from the bundle. Implies "
+             "--skip-break-and-close (if you're past the retest, the "
+             "break already fired). Use for stocks or late setups.",
     )
     return p.parse_args(argv)
 
@@ -826,6 +826,14 @@ def main(argv: Optional[list[str]] = None) -> int:
         or DEFAULT_ACCOUNT_BY_BROKER[broker]
     )
     risk_pct = args.risk_pct if args.risk_pct is not None else 1.0
+    # --skip-retest implies --skip-break-and-close: if we're past the retest,
+    # the break already fired. Use case: stocks (no neckline retest expected),
+    # or arriving late to a setup that has already broken+retested.
+    skip_preps: list[str] = []
+    if args.skip_break_and_close or args.skip_retest:
+        skip_preps.append("break-and-close")
+    if args.skip_retest:
+        skip_preps.append("retest")
     spec = {
         "pattern": pattern,
         "instrument": instrument,
@@ -839,6 +847,8 @@ def main(argv: Optional[list[str]] = None) -> int:
         spec["risk_amount"] = args.risk_amount
     if args.broker_dry_run:
         spec["dry_run"] = True
+    if skip_preps:
+        spec["skip_preps"] = skip_preps
     write_trade_spec(spec, spec_path)
     print(f"# Spec written to {spec_path}:")
     print(spec_path.read_text().rstrip())
@@ -868,56 +878,15 @@ def main(argv: Optional[list[str]] = None) -> int:
             print("# (default is dry-run; pass --create-alerts to push to TV)")
         return 0
 
-    # --skip-retest implies --skip-break-and-close: if we're past the retest,
-    # the break already fired. Use case: stocks (no neckline retest expected),
-    # or arriving late to a setup that has already broken+retested.
-    skip_bnc = args.skip_break_and_close or args.skip_retest
-    skip_retest = args.skip_retest
-
     print("─" * 72)
     print("## Creating TV alerts")
-    if skip_bnc or skip_retest:
-        skipped = []
-        if skip_bnc:
-            skipped.append("break-and-close")
-        if skip_retest:
-            skipped.append("retest")
-        print(f"# skipping preps: {', '.join(skipped)}")
+    if skip_preps:
+        print(f"# skipped preps (not in bundle): {', '.join(skip_preps)}")
     print()
-
-    # Pre-fire any skipped preps so the worker doesn't gate the entry on a
-    # prep that won't ever arrive. The signed YAML already exists on disk;
-    # we just POST its body to the webhook directly.
-    for fname, should_skip in (
-        ("03-prep-break-and-close.yaml", skip_bnc),
-        ("04-prep-retest.yaml", skip_retest),
-    ):
-        if not should_skip:
-            continue
-        signed_path = out_dir / fname
-        if not signed_path.exists():
-            print(f"# can't pre-fire {fname}: file missing")
-            continue
-        body = signed_path.read_text()
-        # The webhook accepts the same plaintext body TradingView would post.
-        # Hand off to curl so we get the same retries / TLS behaviour.
-        result = subprocess.run(
-            ["curl", "-sS", "-X", "POST", "-H", "Content-Type: text/plain",
-             "--data-binary", "@" + str(signed_path), WEBHOOK_URL],
-            capture_output=True, text=True, timeout=30,
-        )
-        status = "ok" if result.returncode == 0 else f"err({result.returncode})"
-        print(f"# pre-fired {fname}: {status}  {result.stdout.strip()[:200]}")
 
     payloads = []
     for entry in manifest["alerts"]:
         fname = entry["file"]
-        if skip_bnc and fname == "03-prep-break-and-close.yaml":
-            print(f"# skipping {fname} (--skip-break-and-close, pre-fired)")
-            continue
-        if skip_retest and fname == "04-prep-retest.yaml":
-            print(f"# skipping {fname} (--skip-retest, pre-fired)")
-            continue
         spec_dict = build_alert_spec(entry, direction, roles)
         if spec_dict is None:
             print(f"# skipping {fname} (no drawing mapping)")

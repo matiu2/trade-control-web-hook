@@ -237,6 +237,14 @@ pub struct TradeSpec {
     /// preps are unaffected.
     #[serde(default)]
     pub dry_run: bool,
+    /// Preps to omit from the bundle entirely. Each name listed here is
+    /// dropped from both the emitted prep alerts *and* the entry's
+    /// `requires_preps` gate. Use for setups where a step doesn't apply
+    /// (e.g. skip "retest" on stocks that don't retest necklines, or
+    /// skip both when arriving late to a setup that has already played
+    /// out its preps). Unknown names are rejected.
+    #[serde(default)]
+    pub skip_preps: Vec<String>,
     /// Entry stop-trigger offset in pips from the geometry anchor.
     /// Omit to use the pattern's default (1 pip).
     #[serde(default)]
@@ -331,6 +339,13 @@ pub fn build_trade_from_spec(spec: TradeSpec, now: DateTime<Utc>) -> Result<Buil
             }
         }
     }
+    for name in &spec.skip_preps {
+        if !KNOWN_PREP_NAMES.contains(&name.as_str()) {
+            return Err(eyre!(
+                "skip_preps name {name:?} is not a known prep; expected one of {KNOWN_PREP_NAMES:?}"
+            ));
+        }
+    }
     let geometry = PatternGeometry::for_pattern(spec.pattern);
     let entry_offset_pips = spec
         .entry_offset_pips
@@ -338,6 +353,11 @@ pub fn build_trade_from_spec(spec: TradeSpec, now: DateTime<Utc>) -> Result<Buil
     let sl_offset_pips = spec.sl_offset_pips.unwrap_or(geometry.sl_offset_default);
     assemble_trade(spec, geometry, entry_offset_pips, sl_offset_pips, now)
 }
+
+/// Preps the H&S / IH&S pipeline can emit. Used to validate
+/// `skip_preps` so a typo doesn't silently leave a requirement in
+/// place.
+const KNOWN_PREP_NAMES: &[&str] = &["break-and-close", "retest"];
 
 /// Persist a built trade: each alert as `<basename>.yaml` (signed,
 /// TradingView shell placeholders), plus a `manifest.yaml` summarising
@@ -456,6 +476,7 @@ fn build_pattern(
         risk_pct,
         risk_amount: None,
         dry_run: false,
+        skip_preps: Vec::new(),
         entry_offset_pips: Some(entry_offset_pips),
         sl_offset_pips: Some(sl_offset_pips),
         tp_price,
@@ -478,7 +499,9 @@ fn assemble_trade(
     let entry_deadline = derive_entry_deadline(now, spec.trade_expiry, spec.entry_deadline_pct);
     let veto_expiry = spec.trade_expiry + DEFAULT_POST_EXPIRY_GRACE;
 
-    let alerts = vec![
+    let skip_bnc = spec.skip_preps.iter().any(|n| n == "break-and-close");
+    let skip_retest = spec.skip_preps.iter().any(|n| n == "retest");
+    let mut alerts = vec![
         build_invalidation_alert(
             &spec.instrument,
             &trade_id,
@@ -497,37 +520,42 @@ fn assemble_trade(
             &spec.account,
             now,
         ),
-        build_break_and_close_alert(
-            &spec.instrument,
-            &trade_id,
-            spec.trade_expiry,
-            &spec.broker,
-            &spec.account,
-            now,
-        ),
-        build_retest_alert(
-            &spec.instrument,
-            &trade_id,
-            spec.trade_expiry,
-            &spec.broker,
-            &spec.account,
-            now,
-        ),
-        build_enter_alert(
-            &spec.instrument,
-            &trade_id,
-            &geometry,
-            entry_deadline,
-            entry_offset_pips,
-            sl_offset_pips,
-            spec.tp_price,
-            spec.risk_pct,
-            spec.risk_amount,
-            spec.dry_run,
-            &spec.broker,
-            &spec.account,
-        ),
     ];
+    if !skip_bnc {
+        alerts.push(build_break_and_close_alert(
+            &spec.instrument,
+            &trade_id,
+            spec.trade_expiry,
+            &spec.broker,
+            &spec.account,
+            now,
+        ));
+    }
+    if !skip_retest {
+        alerts.push(build_retest_alert(
+            &spec.instrument,
+            &trade_id,
+            spec.trade_expiry,
+            &spec.broker,
+            &spec.account,
+            now,
+        ));
+    }
+    alerts.push(build_enter_alert(
+        &spec.instrument,
+        &trade_id,
+        &geometry,
+        entry_deadline,
+        entry_offset_pips,
+        sl_offset_pips,
+        spec.tp_price,
+        spec.risk_pct,
+        spec.risk_amount,
+        spec.dry_run,
+        &spec.skip_preps,
+        &spec.broker,
+        &spec.account,
+    ));
 
     Ok(BuiltTrade {
         trade_id,
@@ -794,6 +822,7 @@ fn build_enter_alert(
     risk_pct: f64,
     risk_amount: Option<f64>,
     dry_run: bool,
+    skip_preps: &[String],
     broker: &BrokerKind,
     account: &str,
 ) -> BuiltAlert {
@@ -830,7 +859,11 @@ fn build_enter_alert(
     if dry_run {
         intent.dry_run = Some(true);
     }
-    intent.requires_preps = vec!["break-and-close".into(), "retest".into()];
+    intent.requires_preps = ["break-and-close", "retest"]
+        .into_iter()
+        .filter(|step| !skip_preps.iter().any(|s| s == step))
+        .map(String::from)
+        .collect();
     intent.vetos = vec![
         geometry.invalidation_veto_name.into(),
         "trade-expiry".into(),
@@ -965,6 +998,7 @@ mod tests {
                 1.0,
                 None,
                 false,
+                &[],
                 &BrokerKind::Oanda,
                 "demo",
             ),
@@ -983,6 +1017,7 @@ mod tests {
                 risk_pct: DEFAULT_RISK_PCT,
                 risk_amount: None,
                 dry_run: false,
+                skip_preps: Vec::new(),
                 entry_offset_pips: Some(1.0),
                 sl_offset_pips: Some(1.0),
                 tp_price: 1.0500,
@@ -1015,6 +1050,7 @@ mod tests {
             1.0,
             None,
             false,
+            &[],
             &BrokerKind::Oanda,
             "demo",
         );
@@ -1073,6 +1109,7 @@ mod tests {
             1.0,
             None,
             false,
+            &[],
             &BrokerKind::Oanda,
             "demo",
         );
@@ -1134,6 +1171,7 @@ mod tests {
             risk_pct: 1.0,
             risk_amount: None,
             dry_run: false,
+            skip_preps: Vec::new(),
             entry_offset_pips: None,
             sl_offset_pips: None,
             tp_price: 1.0500,
@@ -1280,6 +1318,58 @@ tp_price: 1.05
         let mut spec2 = sample_spec(TradePattern::Hs, ts("2026-05-25T00:00:00Z"));
         spec2.risk_amount = Some(-1.0);
         assert!(build_trade_from_spec(spec2, now).is_err());
+    }
+
+    #[test]
+    fn skip_preps_drops_break_and_close_alert_and_requirement() {
+        // --skip-break-and-close alone: retest still required, only the
+        // retest prep alert is emitted, and the entry's requires_preps
+        // shrinks to just the retest.
+        let now = ts("2026-05-20T00:00:00Z");
+        let mut spec = sample_spec(TradePattern::Hs, ts("2026-05-25T00:00:00Z"));
+        spec.skip_preps = vec!["break-and-close".into()];
+        let trade = build_trade_from_spec(spec, now).unwrap();
+        let basenames: Vec<&str> = trade
+            .alerts
+            .iter()
+            .map(|a| a.basename.as_str())
+            .collect();
+        assert!(!basenames.contains(&"03-prep-break-and-close"));
+        assert!(basenames.contains(&"04-prep-retest"));
+        let enter = trade.alerts.last().unwrap();
+        assert_eq!(enter.intent.requires_preps, vec!["retest".to_string()]);
+    }
+
+    #[test]
+    fn skip_preps_drops_both_when_both_listed() {
+        // --skip-retest implies --skip-break-and-close (the script
+        // already encodes that, but the spec must accept both names
+        // and produce a no-prep entry alert).
+        let now = ts("2026-05-20T00:00:00Z");
+        let mut spec = sample_spec(TradePattern::Hs, ts("2026-05-25T00:00:00Z"));
+        spec.skip_preps = vec!["break-and-close".into(), "retest".into()];
+        let trade = build_trade_from_spec(spec, now).unwrap();
+        let basenames: Vec<&str> = trade
+            .alerts
+            .iter()
+            .map(|a| a.basename.as_str())
+            .collect();
+        assert!(!basenames.contains(&"03-prep-break-and-close"));
+        assert!(!basenames.contains(&"04-prep-retest"));
+        // 3 alerts left: invalidation, trade-expiry, enter.
+        assert_eq!(trade.alerts.len(), 3);
+        let enter = trade.alerts.last().unwrap();
+        assert!(enter.intent.requires_preps.is_empty());
+        enter.intent.validate().unwrap();
+    }
+
+    #[test]
+    fn skip_preps_rejects_unknown_name() {
+        let now = ts("2026-05-20T00:00:00Z");
+        let mut spec = sample_spec(TradePattern::Hs, ts("2026-05-25T00:00:00Z"));
+        spec.skip_preps = vec!["bogus".into()];
+        let err = build_trade_from_spec(spec, now).unwrap_err();
+        assert!(err.to_string().contains("bogus"), "got {err}");
     }
 
     #[test]
