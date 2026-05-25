@@ -1,0 +1,400 @@
+//@version=6
+indicator("Candle Signals", shorttitle="Candle Signals", overlay=true, max_labels_count=500)
+// Combined detector for: Pinbars, Tweezers, Regular Engulfers, Floating Engulfers
+// Outputs unified bullish/bearish signals
+//
+// v2: latches the most-recent signal candle's high/low/time onto persistent
+// `plot()` series (titles: sig_high, sig_low, sig_time) so the four golden
+// alertconditions can embed them in the alert message via
+// {{plot("sig_high")}} etc. When the confirmation alertcondition fires on a
+// later bar than the signal candle, the built-in {{high}}/{{low}} reflect
+// the *firing* bar; the new plots let us still recover the *signal* bar's
+// extremes at fire time. v1 of this indicator did not have these plots.
+
+// =============================================================================
+// SIGNAL STATE RULES
+// =============================================================================
+// 1. Every detected signal starts in the pending state when it prints.
+// 2. If price trades above the high of a bearish signal, it becomes invalid.
+// 3. If price trades below the low of a bullish signal, it becomes invalid.
+// 4. A bullish pending signal becomes valid when price pushes above its high within 3 candles.
+// 5. A bearish pending signal becomes valid when price pushes below its low within 3 candles.
+// 6. Any pending signal that neither validates nor invalidates within 3 candles becomes invalid.
+
+// ===== Inputs ================================================================
+show_symbols = input.bool(true, "Show Symbols")
+max_signals = input.int(100, "Max Signals to Track", minval=10, maxval=500, tooltip="Limits memory usage by only tracking recent signals")
+
+// Pattern toggles
+detect_pinbars = input.bool(true, "Detect Pinbars")
+detect_tweezers = input.bool(true, "Detect Tweezers")
+detect_regular_engulfers = input.bool(true, "Detect Regular Engulfers")
+detect_floating_engulfers = input.bool(true, "Detect Floating Engulfers")
+
+// Size filter
+show_golden_candles = input.bool(true, "Show Golden Candles", tooltip="Show signals where candle size >= ATR")
+show_small_candles = input.bool(false, "Show Small Candles", tooltip="Show signals where candle size < ATR")
+
+// State visibility
+hide_pending = input.bool(false, "Hide Pending Signals")
+hide_invalid = input.bool(true, "Hide Invalid Signals")
+
+// Tweezer similarity threshold
+similarity_pct = input.float(20.0, "Tweezer High/Low Similarity (%)", minval=0.0, maxval=100.0, step=0.1)
+
+// Colors and shapes
+bullish_color = input.color(color.new(color.blue, 0), "Bullish Color")
+bullish_shape = input.string("Triangle", "Bullish Pending Shape", options=["Arrow", "Triangle", "Diamond", "Square", "Circle", "Cross", "Label"])
+bearish_color = input.color(color.new(color.orange, 0), "Bearish Color")
+bearish_shape = input.string("Triangle", "Bearish Pending Shape", options=["Arrow", "Triangle", "Diamond", "Square", "Circle", "Cross", "Label"])
+
+// ===== Constants =============================================================
+const int STATE_PENDING = 0
+const int STATE_VALID = 1
+const int STATE_INVALID = 2
+
+// ===== Helper Functions ======================================================
+resolve_label_style(string option, bool is_bullish) =>
+    switch option
+        "Arrow" => is_bullish ? label.style_arrowup : label.style_arrowdown
+        "Triangle" => is_bullish ? label.style_triangleup : label.style_triangledown
+        "Diamond" => label.style_diamond
+        "Square" => label.style_square
+        "Circle" => label.style_circle
+        "Cross" => label.style_cross
+        "Label" => is_bullish ? label.style_label_up : label.style_label_down
+        => is_bullish ? label.style_triangleup : label.style_triangledown
+
+
+bullish_pending_style = resolve_label_style(bullish_shape, true)
+bearish_pending_style = resolve_label_style(bearish_shape, false)
+
+f_apply_label_style(label sig_label, bool is_bullish, int state, bool is_golden) =>
+    if not na(sig_label)
+        // Shape: pending = chosen shape, valid = triangle, invalid = cross
+        string lbl_style = switch state
+            STATE_VALID   => is_bullish ? label.style_triangleup : label.style_triangledown
+            STATE_INVALID => label.style_cross
+            => is_bullish ? bullish_pending_style : bearish_pending_style
+        label.set_style(sig_label, lbl_style)
+
+        // Size: golden = small; everything else = tiny
+        string base_size = is_golden ? size.small : size.tiny
+        string lbl_size = base_size
+        label.set_size(sig_label, lbl_size)
+
+        // Color: valid golden = full opacity; valid small + pending = 50%; invalid = gray
+        color base_col = is_bullish ? bullish_color : bearish_color
+        color fill = switch state
+            STATE_VALID   => is_golden ? base_col : color.new(base_col, 50)
+            STATE_INVALID => color.new(color.gray, 60)
+            => color.new(base_col, 50)
+        label.set_color(sig_label, fill)
+
+        // Visibility
+        bool hidden = (state == STATE_PENDING and hide_pending) or (state == STATE_INVALID and hide_invalid)
+        label.set_size(sig_label, hidden ? size.auto : lbl_size)
+        label.set_color(sig_label, hidden ? color.new(color.white, 100) : fill)
+
+f_create_label(int bar_idx, float price, bool is_bullish, bool is_golden) =>
+    label lbl = na
+    if show_symbols
+        string base_size = is_golden ? size.small : size.tiny
+        string init_style = is_bullish ? bullish_pending_style : bearish_pending_style
+        lbl := label.new(bar_idx, price, "", xloc=xloc.bar_index, yloc=yloc.price, style=init_style, size=base_size)
+    lbl
+
+// ===== ATR Calculation with Timeframe-Based Length ===========================
+f_get_atr_length() =>
+    int tf_mins = timeframe.in_seconds() / 60
+    if tf_mins <= 15
+        96  // 15m: 24 * 4 = 96 (one day)
+    else if tf_mins <= 60
+        24  // 1h: 24 (one day)
+    else if tf_mins <= 240
+        36  // 4h: 6 * 6 = 36 (6 days a week, 6 candles a day)
+    else if tf_mins <= 1440
+        24  // 1d: 6 * 4 = 24 (6 days a week, 4 weeks a month)
+    else if tf_mins <= 10080
+        52  // 1w: 52 (one year)
+    else
+        24  // 1m: 24 (two years)
+
+atr_length = f_get_atr_length()
+atr_value = ta.atr(atr_length)
+
+// ===== Common Calculations ===================================================
+candle_range = high - low
+body_size = math.abs(close - open)
+body_top = math.max(open, close)
+body_bottom = math.min(open, close)
+upper_wick = high - body_top
+lower_wick = body_bottom - low
+
+top_25 = high - candle_range * 0.25
+bottom_25 = low + candle_range * 0.25
+midpoint = low + candle_range * 0.5
+
+valid_candle = candle_range > 0 and body_size > 0
+
+// Close position within candle range (0 = at low, 1 = at high)
+close_position = candle_range > 0 ? (close - low) / candle_range : na
+close_in_top_25 = candle_range > 0 and close_position >= 0.75
+close_in_bottom_25 = candle_range > 0 and close_position <= 0.25
+
+// Previous candle data
+prev_open = open[1]
+prev_close = close[1]
+prev_high = high[1]
+prev_low = low[1]
+prev_candle_range = high[1] - low[1]
+
+prev_is_bullish = prev_close > prev_open
+prev_is_bearish = prev_close < prev_open
+curr_is_bullish = close > open
+curr_is_bearish = close < open
+
+valid_prev = not na(prev_open) and not na(prev_close) and not na(prev_high) and not na(prev_low)
+valid_inputs = valid_prev and valid_candle
+
+// ===== Pinbar Detection ======================================================
+bullish_pinbar = detect_pinbars and valid_candle and body_top >= top_25 and body_bottom >= midpoint and lower_wick >= candle_range * 0.5 and low < low[1]
+bearish_pinbar = detect_pinbars and valid_candle and body_bottom <= bottom_25 and body_top <= midpoint and upper_wick >= candle_range * 0.5 and high > high[1]
+
+// ===== Tweezer Detection =====================================================
+const float TWEEZER_WICK_THRESHOLD = 0.35
+prev_bullish_pinbar = valid_candle[1] and body_top[1] >= top_25[1] and body_bottom[1] >= midpoint[1] and lower_wick[1] >= candle_range[1] * TWEEZER_WICK_THRESHOLD
+prev_bearish_pinbar = valid_candle[1] and body_bottom[1] <= bottom_25[1] and body_top[1] <= midpoint[1] and upper_wick[1] >= candle_range[1] * TWEEZER_WICK_THRESHOLD
+
+curr_bullish_pinbar_tweezer = valid_candle and body_top >= top_25 and body_bottom >= midpoint and lower_wick >= candle_range * TWEEZER_WICK_THRESHOLD
+curr_bearish_pinbar_tweezer = valid_candle and body_bottom <= bottom_25 and body_top <= midpoint and upper_wick >= candle_range * TWEEZER_WICK_THRESHOLD
+
+has_prev_bar = bar_index > 0
+pair_range = has_prev_bar ? math.max(candle_range, prev_candle_range) : na
+has_pair_data = has_prev_bar and pair_range > 0
+range_similarity_threshold = has_pair_data ? pair_range * similarity_pct * 0.01 : na
+highs_close = has_pair_data ? math.abs(high - prev_high) <= range_similarity_threshold : false
+lows_close = has_pair_data ? math.abs(low - prev_low) <= range_similarity_threshold : false
+
+confirmed_bar = barstate.isconfirmed
+valid_pair = confirmed_bar and has_pair_data and valid_candle[1] and highs_close and lows_close
+
+bullish_tweezer = detect_tweezers and valid_pair and curr_bullish_pinbar_tweezer and prev_bullish_pinbar
+bearish_tweezer = detect_tweezers and valid_pair and curr_bearish_pinbar_tweezer and prev_bearish_pinbar
+
+// ===== Regular Engulfer Detection ============================================
+bullish_regular = detect_regular_engulfers and valid_inputs and prev_is_bearish and curr_is_bullish and open <= prev_close and close > prev_high and close_in_top_25
+bearish_regular = detect_regular_engulfers and valid_inputs and prev_is_bullish and curr_is_bearish and open >= prev_close and close < prev_low and close_in_bottom_25
+
+// ===== Floating Engulfer Detection ===========================================
+bullish_floating = detect_floating_engulfers and valid_inputs and prev_is_bullish and curr_is_bullish and close > prev_high and close_in_top_25
+bearish_floating = detect_floating_engulfers and valid_inputs and prev_is_bearish and curr_is_bearish and close < prev_low and close_in_bottom_25
+
+// ===== Combined Signals ======================================================
+is_golden_candle = candle_range >= atr_value
+show_this_candle = (is_golden_candle and show_golden_candles) or (not is_golden_candle and show_small_candles)
+// Tweezers take priority (don't double-count with pinbars)
+bullish_signal = show_this_candle and (bullish_tweezer or (bullish_pinbar and not bullish_tweezer) or bullish_regular or bullish_floating)
+bearish_signal = show_this_candle and (bearish_tweezer or (bearish_pinbar and not bearish_tweezer) or bearish_regular or bearish_floating)
+bullish_golden_signal = is_golden_candle and bullish_signal
+bearish_golden_signal = is_golden_candle and bearish_signal
+
+// ===== Signal Persistence & State Tracking ===================================
+var float[] bullish_highs = array.new_float()
+var float[] bullish_lows = array.new_float()
+var int[] bullish_states = array.new_int()
+var int[] bullish_bars = array.new_int()
+var label[] bullish_labels = array.new<label>()
+var bool[] bullish_golden = array.new_bool()
+
+var float[] bearish_highs = array.new_float()
+var float[] bearish_lows = array.new_float()
+var int[] bearish_states = array.new_int()
+var int[] bearish_bars = array.new_int()
+var label[] bearish_labels = array.new<label>()
+var bool[] bearish_golden = array.new_bool()
+
+
+bool bullish_just_valid = false
+bool bullish_just_invalid = false
+bool bearish_just_valid = false
+bool bearish_just_invalid = false
+bool bullish_just_valid_golden = false
+bool bullish_just_invalid_golden = false
+bool bearish_just_valid_golden = false
+bool bearish_just_invalid_golden = false
+
+// Update existing bullish signals
+int bullish_index = array.size(bullish_states) - 1
+while bullish_index >= 0
+    int idx = bullish_index
+    int state = array.get(bullish_states, idx)
+    int signal_bar = array.get(bullish_bars, idx)
+    float sig_high = array.get(bullish_highs, idx)
+    float sig_low = array.get(bullish_lows, idx)
+    label sig_label = array.get(bullish_labels, idx)
+    bool is_golden = array.get(bullish_golden, idx)
+
+    int new_state = state
+    int bars_elapsed = bar_index - signal_bar
+
+    if state == STATE_PENDING
+        if bars_elapsed <= 3 and high > sig_high
+            new_state := STATE_VALID
+        else if bars_elapsed > 3
+            new_state := STATE_INVALID
+
+    if low < sig_low
+        new_state := STATE_INVALID
+
+    if new_state != state
+        array.set(bullish_states, idx, new_state)
+        if new_state == STATE_VALID
+            bullish_just_valid := true
+            if is_golden
+                bullish_just_valid_golden := true
+        else if state != STATE_INVALID and new_state == STATE_INVALID
+            bullish_just_invalid := true
+            if is_golden
+                bullish_just_invalid_golden := true
+
+    f_apply_label_style(sig_label, true, new_state, is_golden)
+    bullish_index -= 1
+
+// Update existing bearish signals
+int bearish_index = array.size(bearish_states) - 1
+while bearish_index >= 0
+    int idx = bearish_index
+    int state = array.get(bearish_states, idx)
+    int signal_bar = array.get(bearish_bars, idx)
+    float sig_high = array.get(bearish_highs, idx)
+    float sig_low = array.get(bearish_lows, idx)
+    label sig_label = array.get(bearish_labels, idx)
+    bool is_golden = array.get(bearish_golden, idx)
+
+    int new_state = state
+    int bars_elapsed = bar_index - signal_bar
+
+    if state == STATE_PENDING
+        if bars_elapsed <= 3 and low < sig_low
+            new_state := STATE_VALID
+        else if bars_elapsed > 3
+            new_state := STATE_INVALID
+
+    if high > sig_high
+        new_state := STATE_INVALID
+
+    if new_state != state
+        array.set(bearish_states, idx, new_state)
+        if new_state == STATE_VALID
+            bearish_just_valid := true
+            if is_golden
+                bearish_just_valid_golden := true
+        else if state != STATE_INVALID and new_state == STATE_INVALID
+            bearish_just_invalid := true
+            if is_golden
+                bearish_just_invalid_golden := true
+
+    f_apply_label_style(sig_label, false, new_state, is_golden)
+    bearish_index -= 1
+
+// ===== Persistent signal-extremes for webhook embedding ======================
+// These latch when a new signal prints (bullish or bearish) and retain their
+// last value across all subsequent bars until the *next* signal overwrites
+// them. The four golden alertconditions reference them via
+// {{plot("sig_high")}} / {{plot("sig_low")}} / {{plot("sig_time")}} in their
+// message= argument, so the webhook payload carries the *signal* candle's
+// extremes even when the alert fires on a later (confirmation) bar.
+var float sig_high_v = na
+var float sig_low_v  = na
+var int   sig_time_v = na
+
+// Capture new signals
+if bullish_signal
+    float sig_high = bullish_tweezer ? math.max(high, nz(high[1], high)) : high
+    float sig_low = bullish_tweezer ? math.min(low, nz(low[1], low)) : low
+    float signal_size = bullish_tweezer ? (candle_range + prev_candle_range) : bullish_floating ? (sig_high - sig_low) : candle_range
+    bool is_golden = signal_size >= atr_value
+    array.push(bullish_highs, sig_high)
+    array.push(bullish_lows, sig_low)
+    array.push(bullish_states, STATE_PENDING)
+    array.push(bullish_bars, bar_index)
+    array.push(bullish_golden, is_golden)
+    label lbl = f_create_label(bar_index, sig_low, true, is_golden)
+    f_apply_label_style(lbl, true, STATE_PENDING, is_golden)
+    array.push(bullish_labels, lbl)
+    // Latch for webhook embedding (overwrites whichever signal was last).
+    sig_high_v := sig_high
+    sig_low_v  := sig_low
+    sig_time_v := time
+
+if bearish_signal
+    float sig_high = bearish_tweezer ? math.max(high, nz(high[1], high)) : high
+    float sig_low = bearish_tweezer ? math.min(low, nz(low[1], low)) : low
+    float signal_size = bearish_tweezer ? (candle_range + prev_candle_range) : bearish_floating ? (sig_high - sig_low) : candle_range
+    bool is_golden = signal_size >= atr_value
+    array.push(bearish_highs, sig_high)
+    array.push(bearish_lows, sig_low)
+    array.push(bearish_states, STATE_PENDING)
+    array.push(bearish_bars, bar_index)
+    array.push(bearish_golden, is_golden)
+    label lbl = f_create_label(bar_index, sig_high, false, is_golden)
+    f_apply_label_style(lbl, false, STATE_PENDING, is_golden)
+    array.push(bearish_labels, lbl)
+    sig_high_v := sig_high
+    sig_low_v  := sig_low
+    sig_time_v := time
+
+// Hidden plots so {{plot("sig_high")}} etc. work in alert messages.
+plot(sig_high_v, title="sig_high", display=display.none)
+plot(sig_low_v,  title="sig_low",  display=display.none)
+plot(sig_time_v, title="sig_time", display=display.none)
+
+// Trim arrays to max_signals to limit memory and computation
+while array.size(bullish_states) > max_signals
+    array.shift(bullish_highs)
+    array.shift(bullish_lows)
+    array.shift(bullish_states)
+    array.shift(bullish_bars)
+    array.shift(bullish_golden)
+    label old_lbl = array.shift(bullish_labels)
+    if not na(old_lbl)
+        label.delete(old_lbl)
+
+while array.size(bearish_states) > max_signals
+    array.shift(bearish_highs)
+    array.shift(bearish_lows)
+    array.shift(bearish_states)
+    array.shift(bearish_bars)
+    array.shift(bearish_golden)
+    label old_lbl = array.shift(bearish_labels)
+    if not na(old_lbl)
+        label.delete(old_lbl)
+
+// ===== Alerts ================================================================
+// The four golden alertconditions carry sig_high / sig_low / sig_time in their
+// message body. The non-golden ones are left untouched — we only use the
+// golden variants in the automated H&S pipeline.
+SIG_MSG = 'sig_high={{plot("sig_high")}}\nsig_low={{plot("sig_low")}}\nsig_time={{plot("sig_time")}}'
+
+// Heartbeat — fires on every bar. Lets us smoke-test the {{plot()}}
+// embedding without waiting for a real signal (e.g. weekends, dead
+// markets). Body includes both the latched signal-candle extremes and
+// the firing bar's OHLC so we can verify they diverge after a signal
+// prints. Not used in the automated H&S pipeline — leave it disabled
+// in production.
+HEARTBEAT_MSG = '--- heartbeat ---\nbar_time={{time}}\nbar_high={{high}}\nbar_low={{low}}\nbar_close={{close}}\nsig_high={{plot("sig_high")}}\nsig_low={{plot("sig_low")}}\nsig_time={{plot("sig_time")}}'
+
+alertcondition(bullish_signal, "Bullish Signal", "Bullish candle signal detected")
+alertcondition(bearish_signal, "Bearish Signal", "Bearish candle signal detected")
+alertcondition(bullish_just_valid, "Bullish Confirmed", "Bullish signal confirmed within three candles")
+alertcondition(bearish_just_valid, "Bearish Confirmed", "Bearish signal confirmed within three candles")
+alertcondition(bullish_just_invalid, "Bullish Invalid", "Bullish signal invalidated")
+alertcondition(bearish_just_invalid, "Bearish Invalid", "Bearish signal invalidated")
+alertcondition(bullish_golden_signal, "Bullish Golden Signal", SIG_MSG)
+alertcondition(bearish_golden_signal, "Bearish Golden Signal", SIG_MSG)
+alertcondition(bullish_just_valid_golden, "Bullish Golden Confirmed", SIG_MSG)
+alertcondition(bearish_just_valid_golden, "Bearish Golden Confirmed", SIG_MSG)
+alertcondition(bullish_just_invalid_golden, "Bullish Golden Invalid", "Bullish golden signal invalidated")
+alertcondition(bearish_just_invalid_golden, "Bearish Golden Invalid", "Bearish golden signal invalidated")
+alertcondition(true, "Heartbeat (smoke test)", HEARTBEAT_MSG)
