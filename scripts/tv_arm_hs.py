@@ -501,10 +501,19 @@ for (const item of payloads) {{
         var chart = window.TradingViewApi._activeChartWidgetWV.value();
         var name = ${{JSON.stringify(item.indicator_name)}};
         var sources = chart._chartWidget.model().dataSources();
+        var titles = [];
         for (var i = 0; i < sources.length; i++) {{
           var s = sources[i];
+          var t = null;
+          try {{ t = s.title && s.title(); }} catch(e) {{}}
+          var isStudy = false;
+          try {{ isStudy = !!chart.getStudyById(s.id()); }} catch(e) {{}}
+          titles.push({{ title: t == null ? null : String(t), isStudy: isStudy }});
           try {{
-            if (String(s.title && s.title()) !== name) continue;
+            var rawTitle = s.title && s.title();
+            if (rawTitle == null) continue;
+            var baseTitle = String(rawTitle).replace(/\\\\s*\\\\(.*$/, '');
+            if (baseTitle !== name) continue;
             var id = s.id();
             var study = chart.getStudyById(id);
             if (!study) continue;
@@ -521,11 +530,18 @@ for (const item of payloads) {{
             return {{ id: id, inputs: inputs, pineId: pineId, pineVersion: pineVersion, pineFeatures: pineFeatures }};
           }} catch(e) {{}}
         }}
-        return null;
+        return {{ __notFound: true, titles: titles }};
       }})()
     `);
-    if (!studyInfo) {{
-      results.push({{ name: item.name, error: 'study not found: ' + item.indicator_name }});
+    if (!studyInfo || studyInfo.__notFound) {{
+      const titles = (studyInfo && studyInfo.titles) || [];
+      const summary = titles.map(function(t) {{
+        return (t.isStudy ? '[study] ' : '[other] ') + (t.title === null ? '<no-title>' : JSON.stringify(t.title));
+      }}).join(', ');
+      results.push({{
+        name: item.name,
+        error: 'study not found: ' + item.indicator_name + ' | data sources on active chart: [' + summary + ']',
+      }});
       continue;
     }}
     const orderedInputs = {{ pineFeatures: studyInfo.pineFeatures }};
