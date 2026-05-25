@@ -1330,11 +1330,7 @@ tp_price: 1.05
         let mut spec = sample_spec(TradePattern::Hs, ts("2026-05-25T00:00:00Z"));
         spec.skip_preps = vec!["break-and-close".into()];
         let trade = build_trade_from_spec(spec, now).unwrap();
-        let basenames: Vec<&str> = trade
-            .alerts
-            .iter()
-            .map(|a| a.basename.as_str())
-            .collect();
+        let basenames: Vec<&str> = trade.alerts.iter().map(|a| a.basename.as_str()).collect();
         assert!(!basenames.contains(&"03-prep-break-and-close"));
         assert!(basenames.contains(&"04-prep-retest"));
         let enter = trade.alerts.last().unwrap();
@@ -1350,11 +1346,7 @@ tp_price: 1.05
         let mut spec = sample_spec(TradePattern::Hs, ts("2026-05-25T00:00:00Z"));
         spec.skip_preps = vec!["break-and-close".into(), "retest".into()];
         let trade = build_trade_from_spec(spec, now).unwrap();
-        let basenames: Vec<&str> = trade
-            .alerts
-            .iter()
-            .map(|a| a.basename.as_str())
-            .collect();
+        let basenames: Vec<&str> = trade.alerts.iter().map(|a| a.basename.as_str()).collect();
         assert!(!basenames.contains(&"03-prep-break-and-close"));
         assert!(!basenames.contains(&"04-prep-retest"));
         // 3 alerts left: invalidation, trade-expiry, enter.
