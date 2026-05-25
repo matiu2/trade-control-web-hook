@@ -237,6 +237,14 @@ pub struct TradeSpec {
     /// preps are unaffected.
     #[serde(default)]
     pub dry_run: bool,
+    /// Opt into multi-shot entry behaviour: the worker re-arms the
+    /// entry up to this many attempts after stop-outs, until either
+    /// the cap is reached or a veto/trade_expiry clears the setup.
+    /// Absent (the default) preserves single-shot behaviour. Rejected
+    /// at build time if `Some(0)`; the upper bound and the non-Enter /
+    /// missing-trade_id rules are enforced by `Intent::validate`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_retries: Option<u32>,
     /// Preps to omit from the bundle entirely. Each name listed here is
     /// dropped from both the emitted prep alerts *and* the entry's
     /// `requires_preps` gate. Use for setups where a step doesn't apply
@@ -338,6 +346,9 @@ pub fn build_trade_from_spec(spec: TradeSpec, now: DateTime<Utc>) -> Result<Buil
                 return Err(eyre!("risk_pct must be a positive finite number"));
             }
         }
+    }
+    if let Some(0) = spec.max_retries {
+        return Err(eyre!("max_retries must be at least 1"));
     }
     for name in &spec.skip_preps {
         if !KNOWN_PREP_NAMES.contains(&name.as_str()) {
@@ -476,6 +487,7 @@ fn build_pattern(
         risk_pct,
         risk_amount: None,
         dry_run: false,
+        max_retries: None,
         skip_preps: Vec::new(),
         entry_offset_pips: Some(entry_offset_pips),
         sl_offset_pips: Some(sl_offset_pips),
@@ -552,6 +564,7 @@ fn assemble_trade(
         spec.risk_pct,
         spec.risk_amount,
         spec.dry_run,
+        spec.max_retries,
         &spec.skip_preps,
         &spec.broker,
         &spec.account,
@@ -823,6 +836,7 @@ fn build_enter_alert(
     risk_pct: f64,
     risk_amount: Option<f64>,
     dry_run: bool,
+    max_retries: Option<u32>,
     skip_preps: &[String],
     broker: &BrokerKind,
     account: &str,
@@ -860,6 +874,7 @@ fn build_enter_alert(
     if dry_run {
         intent.dry_run = Some(true);
     }
+    intent.max_retries = max_retries;
     intent.requires_preps = ["break-and-close", "retest"]
         .into_iter()
         .filter(|step| !skip_preps.iter().any(|s| s == step))
@@ -999,6 +1014,7 @@ mod tests {
                 1.0,
                 None,
                 false,
+                None,
                 &[],
                 &BrokerKind::Oanda,
                 "demo",
@@ -1018,6 +1034,7 @@ mod tests {
                 risk_pct: DEFAULT_RISK_PCT,
                 risk_amount: None,
                 dry_run: false,
+                max_retries: None,
                 skip_preps: Vec::new(),
                 entry_offset_pips: Some(1.0),
                 sl_offset_pips: Some(1.0),
@@ -1051,6 +1068,7 @@ mod tests {
             1.0,
             None,
             false,
+            None,
             &[],
             &BrokerKind::Oanda,
             "demo",
@@ -1110,6 +1128,7 @@ mod tests {
             1.0,
             None,
             false,
+            None,
             &[],
             &BrokerKind::Oanda,
             "demo",
@@ -1172,6 +1191,7 @@ mod tests {
             risk_pct: 1.0,
             risk_amount: None,
             dry_run: false,
+            max_retries: None,
             skip_preps: Vec::new(),
             entry_offset_pips: None,
             sl_offset_pips: None,
@@ -1308,6 +1328,57 @@ tp_price: 1.05
         // Spot-check a non-enter alert: dry_run must be None.
         let veto = &trade.alerts[0];
         assert_eq!(veto.intent.dry_run, None);
+    }
+
+    #[test]
+    fn build_trade_from_spec_threads_max_retries_onto_enter_intent() {
+        // max_retries on the spec lands on the enter intent only —
+        // vetos and preps must stay None, mirroring the dry_run rule.
+        // Intent::validate enforces the upper bound + trade_id + enter-
+        // only rules, so the build call must produce a valid intent.
+        let now = ts("2026-05-20T00:00:00Z");
+        let mut spec = sample_spec(TradePattern::Hs, ts("2026-05-25T00:00:00Z"));
+        spec.max_retries = Some(3);
+        let trade = build_trade_from_spec(spec, now).unwrap();
+        let enter = trade.alerts.last().unwrap();
+        assert_eq!(enter.intent.max_retries, Some(3));
+        enter.intent.validate().unwrap();
+        for alert in trade.alerts.iter().take(trade.alerts.len() - 1) {
+            assert_eq!(
+                alert.intent.max_retries, None,
+                "non-enter alert {} carried max_retries",
+                alert.basename
+            );
+        }
+    }
+
+    #[test]
+    fn build_trade_from_spec_rejects_zero_max_retries() {
+        let now = ts("2026-05-20T00:00:00Z");
+        let mut spec = sample_spec(TradePattern::Hs, ts("2026-05-25T00:00:00Z"));
+        spec.max_retries = Some(0);
+        let err = build_trade_from_spec(spec, now).unwrap_err();
+        assert!(err.to_string().contains("max_retries"), "got {err}");
+    }
+
+    #[test]
+    fn build_trade_from_spec_default_max_retries_is_none() {
+        // Minimal YAML — no max_retries field. After round-tripping
+        // through serde and through the build pipeline, the enter
+        // intent's max_retries stays None (single-shot is the default).
+        let yaml = "\
+pattern: hs
+instrument: EUR_USD
+account: demo
+trade_expiry: \"2026-05-25T00:00:00Z\"
+tp_price: 1.05
+";
+        let spec: TradeSpec = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(spec.max_retries, None);
+        let now = ts("2026-05-20T00:00:00Z");
+        let trade = build_trade_from_spec(spec, now).unwrap();
+        let enter = trade.alerts.last().unwrap();
+        assert_eq!(enter.intent.max_retries, None);
     }
 
     #[test]
