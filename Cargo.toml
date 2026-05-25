@@ -22,3 +22,6 @@ serde_yaml = "0.9.34"
 trade-control-core = { path = "core" }
 worker = "^0.8"
 tracing = { version = "0.1.44", default-features = false, features = ["std"] }
+
+[dev-dependencies]
+pollster = "0.4.0"

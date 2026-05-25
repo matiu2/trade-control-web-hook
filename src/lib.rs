@@ -1,6 +1,7 @@
 mod accounts;
 mod admin;
 mod diag;
+mod retry_gate;
 mod state;
 #[cfg(target_arch = "wasm32")]
 mod tn_login;
@@ -320,8 +321,33 @@ async fn run_enter<B: Broker>(
     store: &KvStateStore,
     verified: &incoming::Verified,
     env: &Env,
-    _now: chrono::DateTime<chrono::Utc>,
+    now: chrono::DateTime<chrono::Utc>,
 ) -> ActionResult {
+    // Retry gate — when the intent opts into multi-shot mode via
+    // `max_retries`, the gate inspects prior attempts (cancel-and-
+    // replace a still-pending one, reject a fresh placement when an
+    // earlier attempt is still open) and enforces the placement cap.
+    // The single-shot path (`max_retries: None`) skips this branch
+    // entirely so no new KV/broker calls land on the byte-identical
+    // baseline.
+    let retry_attempt_no = if verified.intent.max_retries.is_some() {
+        match retry_gate::evaluate(broker, store, &verified.intent, verified.shell.time).await {
+            retry_gate::RetryGateOutcome::Proceed { next_attempt_no } => Some(next_attempt_no),
+            retry_gate::RetryGateOutcome::Rejected {
+                status,
+                message,
+                outcome,
+            } => {
+                return ActionResult::Rejected {
+                    response: Response::error(message, status),
+                    outcome,
+                };
+            }
+        }
+    } else {
+        None
+    };
+
     // Cooldown gate — scoped to this intent's account so a cooldown on
     // a different account doesn't pause this one. A global cooldown
     // (set without `account:`) still pauses every account.
@@ -502,6 +528,19 @@ async fn run_enter<B: Broker>(
                 ActionResult::Ok(format!("dry-run: id={}", verified.intent.id))
             } else {
                 console_log!("entry placed id={} order={}", verified.intent.id, order_id);
+                if let Some(attempt_no) = retry_attempt_no {
+                    retry_gate::record_placement(
+                        store,
+                        &verified.intent,
+                        verified.shell.time,
+                        verified.intent.not_after,
+                        now,
+                        attempt_no,
+                        &order_id,
+                        resolved.direction,
+                    )
+                    .await;
+                }
                 ActionResult::Ok(format!("entered: order={order_id}"))
             }
         }
