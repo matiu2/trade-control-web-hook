@@ -50,6 +50,25 @@ impl KvStateStore {
         format!("veto:{scope}:{instrument}:{name}")
     }
 
+    fn entry_attempt_key(account: Option<&str>, trade_id: &str, attempt_no: u32) -> String {
+        let scope = account_scope(account);
+        format!("entry_attempt:{scope}:{trade_id}:{attempt_no}")
+    }
+
+    fn entry_attempt_prefix(account: Option<&str>, trade_id: &str) -> String {
+        let scope = account_scope(account);
+        format!("entry_attempt:{scope}:{trade_id}:")
+    }
+
+    fn retry_fire_seen_key(
+        account: Option<&str>,
+        trade_id: &str,
+        shell_time: DateTime<Utc>,
+    ) -> String {
+        let scope = account_scope(account);
+        format!("seen-retry:{scope}:{trade_id}:{}", shell_time.to_rfc3339())
+    }
+
     async fn read_cooldown_index(&self) -> Result<Vec<CooldownEntry>, StateError> {
         read_index(&self.store, INDEX_COOLDOWNS_KEY).await
     }
@@ -520,54 +539,153 @@ impl StateStore for KvStateStore {
         })
     }
 
-    // TODO(1b): real KV-backed impls for the max_retries surface land in
-    // sub-step 1b. For now the stubs return safe defaults (no attempts,
-    // never-seen) so the type-checker passes — they are not wired into
-    // `run_enter` yet, so behaviour is unchanged.
-    async fn record_entry_attempt(&self, _attempt: EntryAttempt) -> Result<(), StateError> {
-        Err(StateError::Backend(
-            "record_entry_attempt: not implemented (TODO 1b)".into(),
-        ))
+    async fn record_entry_attempt(&self, attempt: EntryAttempt) -> Result<(), StateError> {
+        let key = Self::entry_attempt_key(
+            attempt.account.as_deref(),
+            &attempt.trade_id,
+            attempt.attempt_no,
+        );
+        // TTL the row to `expires_at` so dead attempts age out of KV
+        // (and out of `list_entry_attempts`) without explicit cleanup.
+        let now = Utc::now();
+        let ttl = (attempt.expires_at - now)
+            .num_seconds()
+            .max(MIN_TTL_SECONDS as i64) as u64;
+        let body = serde_json::to_string(&attempt)
+            .map_err(|e| StateError::Backend(format!("encode entry_attempt: {e}")))?;
+        self.store
+            .put(&key, body)
+            .map_err(|e| StateError::Backend(format!("put entry_attempt builder: {e:?}")))?
+            .expiration_ttl(ttl)
+            .execute()
+            .await
+            .map_err(|e| StateError::Backend(format!("put entry_attempt execute: {e:?}")))?;
+        Ok(())
     }
 
     async fn list_entry_attempts(
         &self,
-        _account: Option<&str>,
-        _trade_id: &str,
+        account: Option<&str>,
+        trade_id: &str,
     ) -> Result<Vec<EntryAttempt>, StateError> {
-        Ok(Vec::new())
+        let prefix = Self::entry_attempt_prefix(account, trade_id);
+        // Page through `kv.list` until `list_complete` so we don't miss
+        // attempts above the default page size. Worker KV pages are
+        // 1000 keys by default — well above any sane `max_retries` —
+        // but pagination is cheap and future-proofs the gate.
+        let mut keys: Vec<String> = Vec::new();
+        let mut cursor: Option<String> = None;
+        loop {
+            let mut builder = self.store.list().prefix(prefix.clone());
+            if let Some(c) = cursor.take() {
+                builder = builder.cursor(c);
+            }
+            let resp = builder
+                .execute()
+                .await
+                .map_err(|e| StateError::Backend(format!("list entry_attempt: {e:?}")))?;
+            keys.extend(resp.keys.into_iter().map(|k| k.name));
+            if resp.list_complete {
+                break;
+            }
+            match resp.cursor {
+                Some(c) => cursor = Some(c),
+                None => break,
+            }
+        }
+
+        let mut attempts: Vec<EntryAttempt> = Vec::with_capacity(keys.len());
+        for key in keys {
+            let raw = self
+                .store
+                .get(&key)
+                .text()
+                .await
+                .map_err(|e| StateError::Backend(format!("get {key}: {e:?}")))?;
+            // A key listed but with no value means it expired between
+            // list and get — skip silently.
+            let Some(text) = raw else { continue };
+            let attempt: EntryAttempt = serde_json::from_str(&text)
+                .map_err(|e| StateError::Backend(format!("decode {key}: {e}")))?;
+            attempts.push(attempt);
+        }
+        attempts.sort_by_key(|a| a.attempt_no);
+        Ok(attempts)
     }
 
     async fn set_entry_attempt_broker_trade_id(
         &self,
-        _account: Option<&str>,
-        _trade_id: &str,
-        _attempt_no: u32,
-        _broker_trade_id: &str,
+        account: Option<&str>,
+        trade_id: &str,
+        attempt_no: u32,
+        broker_trade_id: &str,
     ) -> Result<(), StateError> {
-        Err(StateError::Backend(
-            "set_entry_attempt_broker_trade_id: not implemented (TODO 1b)".into(),
-        ))
+        let key = Self::entry_attempt_key(account, trade_id, attempt_no);
+        let raw = self
+            .store
+            .get(&key)
+            .text()
+            .await
+            .map_err(|e| StateError::Backend(format!("get {key}: {e:?}")))?;
+        let Some(text) = raw else {
+            return Err(StateError::Backend(format!(
+                "entry_attempt missing for {key} (expired or never recorded)"
+            )));
+        };
+        let mut attempt: EntryAttempt = serde_json::from_str(&text)
+            .map_err(|e| StateError::Backend(format!("decode {key}: {e}")))?;
+        attempt.broker_trade_id = Some(broker_trade_id.to_string());
+        // Preserve the row's remaining lifetime: re-derive TTL from
+        // `expires_at` (clamped to KV's minimum) rather than letting
+        // the rewrite reset to "forever".
+        let now = Utc::now();
+        let ttl = (attempt.expires_at - now)
+            .num_seconds()
+            .max(MIN_TTL_SECONDS as i64) as u64;
+        let body = serde_json::to_string(&attempt)
+            .map_err(|e| StateError::Backend(format!("encode {key}: {e}")))?;
+        self.store
+            .put(&key, body)
+            .map_err(|e| StateError::Backend(format!("put {key} builder: {e:?}")))?
+            .expiration_ttl(ttl)
+            .execute()
+            .await
+            .map_err(|e| StateError::Backend(format!("put {key} execute: {e:?}")))?;
+        Ok(())
     }
 
     async fn is_retry_fire_seen(
         &self,
-        _account: Option<&str>,
-        _trade_id: &str,
-        _shell_time: DateTime<Utc>,
+        account: Option<&str>,
+        trade_id: &str,
+        shell_time: DateTime<Utc>,
     ) -> Result<bool, StateError> {
-        Ok(false)
+        let key = Self::retry_fire_seen_key(account, trade_id, shell_time);
+        let raw = self
+            .store
+            .get(&key)
+            .text()
+            .await
+            .map_err(|e| StateError::Backend(format!("get seen-retry: {e:?}")))?;
+        Ok(raw.is_some())
     }
 
     async fn mark_retry_fire_seen(
         &self,
-        _account: Option<&str>,
-        _trade_id: &str,
-        _shell_time: DateTime<Utc>,
-        _ttl_seconds: u64,
+        account: Option<&str>,
+        trade_id: &str,
+        shell_time: DateTime<Utc>,
+        ttl_seconds: u64,
     ) -> Result<(), StateError> {
-        Err(StateError::Backend(
-            "mark_retry_fire_seen: not implemented (TODO 1b)".into(),
-        ))
+        let key = Self::retry_fire_seen_key(account, trade_id, shell_time);
+        let ttl = ttl_seconds.max(MIN_TTL_SECONDS);
+        self.store
+            .put(&key, "1")
+            .map_err(|e| StateError::Backend(format!("put seen-retry builder: {e:?}")))?
+            .expiration_ttl(ttl)
+            .execute()
+            .await
+            .map_err(|e| StateError::Backend(format!("put seen-retry execute: {e:?}")))?;
+        Ok(())
     }
 }
