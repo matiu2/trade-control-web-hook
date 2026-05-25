@@ -112,6 +112,29 @@ impl core::fmt::Display for LookupError {
 
 impl std::error::Error for LookupError {}
 
+/// Failure modes for [`Broker::cancel_order`]. Modelled the same way
+/// as [`LookupError`]: the caller treats `Transient` as "the order
+/// may or may not be cancelled — re-run `lookup_attempt_state` and
+/// decide from there" rather than retrying the cancel itself.
+#[derive(Debug, Clone, PartialEq)]
+pub enum CancelError {
+    /// Network / 5xx / order-already-gone / other transient failure.
+    /// The plan's race-handling note: between observing `Pending` and
+    /// issuing the cancel, the order can fill — treat the cancel
+    /// failure as "probably filled" and re-lookup.
+    Transient,
+}
+
+impl core::fmt::Display for CancelError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Transient => f.write_str("broker cancel failed (transient)"),
+        }
+    }
+}
+
+impl std::error::Error for CancelError {}
+
 /// Authenticated broker handle. The constructor lives on each implementation
 /// (it depends on broker-specific secrets), so the trait only carries actions.
 pub trait Broker {
@@ -157,4 +180,21 @@ pub trait Broker {
         broker_order_id: &str,
         broker_trade_id: Option<&str>,
     ) -> impl Future<Output = Result<AttemptState, LookupError>>;
+
+    /// Cancel a specific pending order by broker id. Used by the
+    /// `max_retries` retry gate's "replace pending" branch — when a
+    /// new entry message arrives and the previous attempt's stop /
+    /// limit is still resting, we cancel it then place the
+    /// replacement.
+    ///
+    /// The plan's race-handling note: between observing `Pending`
+    /// from `lookup_attempt_state` and issuing this cancel, the
+    /// order can fill. A `CancelError::Transient` is treated as
+    /// "probably filled, re-lookup" rather than as something to
+    /// retry.
+    fn cancel_order(
+        &self,
+        account_id: &str,
+        broker_order_id: &str,
+    ) -> impl Future<Output = Result<(), CancelError>>;
 }

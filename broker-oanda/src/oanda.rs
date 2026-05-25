@@ -2,18 +2,26 @@
 
 use oanda_client::OandaClient;
 use oanda_client::orders::{
-    LimitOrder, OrderPositionFill, OrderType, StopLossDetails, StopOrder, TakeProfitDetails,
-    TimeInForce,
+    LimitOrder, OrderPositionFill, OrderType, PendingOrder, StopLossDetails, StopOrder,
+    TakeProfitDetails, TimeInForce,
 };
 use oanda_client::positions::ClosePositionResponse;
+use oanda_client::trades::{Trade, TradeQueryParams, TradeState};
 use worker::Env;
 use worker::console_error;
 
 use crate::fx::{quote_currency, resolve_quote_to_account_rate};
 use crate::risk;
-use trade_control_core::broker::{EntryError, EntryRequest};
+use trade_control_core::broker::{
+    AttemptState, CancelError, EntryError, EntryRequest, LookupError,
+};
 use trade_control_core::intent::{Direction, ResolvedEntry, RiskBudget};
 use worker::console_log;
+
+/// Closed-trade scan window. Plan §3 recommends ~50 — large enough to
+/// catch any reasonable retry-window trade, small enough to keep the
+/// per-fire round-trip cheap.
+const CLOSED_TRADE_SCAN_COUNT: i32 = 50;
 
 const OANDA_API_KEY: &str = "OANDA_API_KEY";
 pub const OANDA_ACCOUNT_ID: &str = "OANDA_ACCOUNT_ID";
@@ -310,4 +318,263 @@ pub async fn place_entry(
 /// OANDA will round to the instrument's tick on its end; over-precision is fine.
 fn format_price(price: f64) -> String {
     format!("{price:.5}")
+}
+
+/// Look up the broker-side state of an entry attempt placed earlier.
+/// Implements plan §3's four-step algorithm against the OANDA REST API.
+/// Any network / 5xx failure surfaces as `LookupError::Transient` so the
+/// caller rejects the current fire without placing.
+pub async fn lookup_attempt_state(
+    client: &OandaClient,
+    account_id: &str,
+    instrument: &str,
+    broker_order_id: &str,
+    broker_trade_id: Option<&str>,
+) -> Result<AttemptState, LookupError> {
+    let pending = client.get_pending_orders(account_id).await.map_err(|err| {
+        console_error!("oanda lookup get_pending_orders: {err:?}");
+        LookupError::Transient
+    })?;
+
+    let open_params = TradeQueryParams::new()
+        .state(TradeState::Open)
+        .instrument(instrument);
+    let open = client
+        .get_trades(account_id, Some(open_params))
+        .await
+        .map_err(|err| {
+            console_error!("oanda lookup get_trades(Open): {err:?}");
+            LookupError::Transient
+        })?;
+
+    // Only fetch closed trades if we have a broker_trade_id to match —
+    // step 3 only runs in that case, and the closed-trades request is
+    // the most expensive of the three.
+    let closed = if broker_trade_id.is_some() {
+        let closed_params = TradeQueryParams::new()
+            .state(TradeState::Closed)
+            .instrument(instrument)
+            .count(CLOSED_TRADE_SCAN_COUNT);
+        let trades = client
+            .get_trades(account_id, Some(closed_params))
+            .await
+            .map_err(|err| {
+                console_error!("oanda lookup get_trades(Closed): {err:?}");
+                LookupError::Transient
+            })?;
+        Some(trades)
+    } else {
+        None
+    };
+
+    Ok(compute_attempt_state(
+        broker_order_id,
+        broker_trade_id,
+        &pending,
+        &open,
+        closed.as_deref(),
+    ))
+}
+
+/// Cancel a specific pending order by id. Wraps the OANDA REST call
+/// and maps any non-success into `CancelError::Transient` (per the
+/// plan's race-handling note — the caller treats this as "probably
+/// filled, re-lookup" rather than retrying).
+pub async fn cancel_order(
+    client: &OandaClient,
+    account_id: &str,
+    broker_order_id: &str,
+) -> Result<(), CancelError> {
+    client
+        .cancel_order(account_id, broker_order_id)
+        .await
+        .map(|_| ())
+        .map_err(|err| {
+            console_error!("oanda cancel_order({broker_order_id}): {err:?}");
+            CancelError::Transient
+        })
+}
+
+/// Pure helper running the four-step algorithm against pre-fetched
+/// data. Split out from [`lookup_attempt_state`] so unit tests can
+/// exercise every branch without needing a live OANDA client.
+///
+/// `closed` is `None` when no `broker_trade_id` is available — the
+/// caller skips the fetch entirely in that case (cheaper, and step
+/// 3 cannot match anyway).
+fn compute_attempt_state(
+    broker_order_id: &str,
+    broker_trade_id: Option<&str>,
+    pending: &[PendingOrder],
+    open: &[Trade],
+    closed: Option<&[Trade]>,
+) -> AttemptState {
+    // 1. Pending → resting unfilled.
+    if pending.iter().any(|o| o.id == broker_order_id) {
+        return AttemptState::Pending;
+    }
+
+    // 2. Open trade whose originating order id matches → still open.
+    //    OANDA reuses the create-order transaction id as the trade id,
+    //    so trade.id == broker_order_id here. Matching on trade.id
+    //    keeps the structure parallel to the TN side (which has to
+    //    match an explicit originating field).
+    if let Some(trade) = open.iter().find(|t| t.id == broker_order_id) {
+        return AttemptState::OpenPosition {
+            broker_trade_id: trade.id.clone(),
+        };
+    }
+
+    // 3. Closed trade lookup — only if we previously snapshotted a
+    //    broker_trade_id. Bucket realised P&L: > 0 wins, otherwise
+    //    loss/breakeven.
+    if let (Some(btid), Some(closed_trades)) = (broker_trade_id, closed)
+        && let Some(trade) = closed_trades.iter().find(|t| t.id == btid)
+    {
+        return if trade.realized_pl > 0.0 {
+            AttemptState::ClosedWin {
+                realized_pl: trade.realized_pl,
+            }
+        } else {
+            AttemptState::ClosedLossOrBreakeven {
+                realized_pl: trade.realized_pl,
+            }
+        };
+    }
+
+    // 4. Nowhere to be found. Distinguish so logs can tell us
+    //    whether we lost a snapshot or never had one.
+    if broker_trade_id.is_some() {
+        AttemptState::Cancelled
+    } else {
+        AttemptState::Unknown
+    }
+}
+
+#[cfg(test)]
+mod attempt_state_tests {
+    use super::*;
+    use oanda_client::trades::{Trade, TradeState};
+
+    fn make_pending(id: &str) -> PendingOrder {
+        PendingOrder {
+            id: id.into(),
+            r#type: OrderType::Stop,
+            instrument: "EUR_USD".into(),
+            units: "100".into(),
+            price: "1.10000".into(),
+            time_in_force: TimeInForce::Gtc,
+            create_time: String::new(),
+            take_profit_on_fill: None,
+            stop_loss_on_fill: None,
+        }
+    }
+
+    fn make_trade(id: &str, state: TradeState, realized_pl: f64) -> Trade {
+        Trade {
+            id: id.into(),
+            instrument: "EUR_USD".into(),
+            current_units: "100".into(),
+            price: 1.10000,
+            open_time: String::new(),
+            state,
+            initial_units: "100".into(),
+            initial_margin_required: 0.0,
+            margin_used: None,
+            unrealized_pl: None,
+            realized_pl,
+            average_close_price: None,
+            close_time: None,
+            closing_transaction_ids: None,
+            financing: 0.0,
+            dividend_adjustment: 0.0,
+            take_profit_order: None,
+            stop_loss_order: None,
+            trailing_stop_loss_order: None,
+        }
+    }
+
+    #[test]
+    fn pending_when_order_id_in_pending_list() {
+        let pending = vec![make_pending("ord-1"), make_pending("ord-2")];
+        let s = compute_attempt_state("ord-1", None, &pending, &[], None);
+        assert_eq!(s, AttemptState::Pending);
+    }
+
+    #[test]
+    fn open_position_returns_trade_id_as_broker_trade_id() {
+        // OANDA: trade.id == originating order id, so the returned
+        // broker_trade_id equals the lookup's order id.
+        let open = vec![make_trade("ord-7", TradeState::Open, 0.0)];
+        let s = compute_attempt_state("ord-7", None, &[], &open, None);
+        assert_eq!(
+            s,
+            AttemptState::OpenPosition {
+                broker_trade_id: "ord-7".into()
+            }
+        );
+    }
+
+    #[test]
+    fn closed_win_when_positive_realized_pl() {
+        let closed = vec![make_trade("ord-3", TradeState::Closed, 12.5)];
+        let s = compute_attempt_state("ord-3", Some("ord-3"), &[], &[], Some(&closed));
+        assert_eq!(s, AttemptState::ClosedWin { realized_pl: 12.5 });
+    }
+
+    #[test]
+    fn closed_loss_or_breakeven_when_non_positive_pl() {
+        let closed = vec![
+            make_trade("ord-4", TradeState::Closed, -7.0),
+            make_trade("ord-5", TradeState::Closed, 0.0),
+        ];
+        let loss = compute_attempt_state("ord-4", Some("ord-4"), &[], &[], Some(&closed));
+        assert_eq!(
+            loss,
+            AttemptState::ClosedLossOrBreakeven { realized_pl: -7.0 }
+        );
+        let breakeven = compute_attempt_state("ord-5", Some("ord-5"), &[], &[], Some(&closed));
+        assert_eq!(
+            breakeven,
+            AttemptState::ClosedLossOrBreakeven { realized_pl: 0.0 }
+        );
+    }
+
+    #[test]
+    fn cancelled_when_snapshotted_but_not_in_closed_window() {
+        // We had a broker_trade_id (so it was open at some point) but
+        // it isn't pending, isn't open, and isn't in the closed-trade
+        // scan window. Treat as cancelled.
+        let s = compute_attempt_state("ord-9", Some("ord-9"), &[], &[], Some(&[]));
+        assert_eq!(s, AttemptState::Cancelled);
+    }
+
+    #[test]
+    fn unknown_when_no_snapshot_and_not_pending_or_open() {
+        // No broker_trade_id snapshot and nothing to be found anywhere.
+        // We lost track; distinct from Cancelled because the cause is
+        // "we never snapshotted" rather than "it aged out of history".
+        let s = compute_attempt_state("ord-X", None, &[], &[], None);
+        assert_eq!(s, AttemptState::Unknown);
+    }
+
+    #[test]
+    fn pending_takes_priority_over_other_branches() {
+        // Defensive — the algorithm is ordered, but verify pending
+        // wins even if a same-id trade somehow appears in the open
+        // list (shouldn't happen, but ordering matters).
+        let pending = vec![make_pending("ord-1")];
+        let open = vec![make_trade("ord-1", TradeState::Open, 0.0)];
+        let s = compute_attempt_state("ord-1", None, &pending, &open, None);
+        assert_eq!(s, AttemptState::Pending);
+    }
+
+    #[test]
+    fn no_match_in_pending_or_open_falls_through() {
+        // Different ids, no snapshot → Unknown.
+        let pending = vec![make_pending("other-1")];
+        let open = vec![make_trade("other-2", TradeState::Open, 0.0)];
+        let s = compute_attempt_state("ord-target", None, &pending, &open, None);
+        assert_eq!(s, AttemptState::Unknown);
+    }
 }
