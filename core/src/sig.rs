@@ -15,10 +15,12 @@
 //!   3. The values of all *signed* keys, sorted, one `key=value` per line.
 //!
 //! Signed values exclude the TradingView shell (`close`, `high`, `low`,
-//! `time`) — TradingView fills those *after* the CLI emits the body, so
-//! their values can't be known at sign time. Their *presence* still
-//! matters and is covered by the schema fingerprint. `sig` is always
-//! excluded from the values (it's the output, not the input).
+//! `time`, `pattern_high`, `pattern_low`, `pattern_time`,
+//! `pattern_confirmed`) — TradingView fills those *after* the CLI emits
+//! the body via `{{close}}` / `{{plot("pattern_high")}}` etc., so their
+//! values can't be known at sign time. Their *presence* still matters
+//! and is covered by the schema fingerprint. `sig` is always excluded
+//! from the values (it's the output, not the input).
 //!
 //! ## Wire form
 //!
@@ -54,8 +56,19 @@ const AAD: &[u8] = b"trade-control-sig-v1";
 
 /// Keys whose values are NOT signed (TradingView fills them after the
 /// CLI emits the body). The keys themselves still appear in the schema
-/// fingerprint, so an attacker can't drop them.
-const UNSIGNED_VALUE_KEYS: &[&str] = &["close", "high", "low", "time"];
+/// fingerprint, so an attacker can't drop them. The pattern_* keys are
+/// substituted from the candle-signals-v2.pine indicator's hidden
+/// plots via `{{plot("pattern_high")}}` etc.
+const UNSIGNED_VALUE_KEYS: &[&str] = &[
+    "close",
+    "high",
+    "low",
+    "time",
+    "pattern_high",
+    "pattern_low",
+    "pattern_time",
+    "pattern_confirmed",
+];
 
 /// Field name on the wire that holds the signature itself.
 pub const SIG_FIELD: &str = "sig";

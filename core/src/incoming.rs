@@ -102,21 +102,27 @@ pub fn parse_and_verify(
     let mapping = value.as_mapping().ok_or(IncomingError::BadYaml)?;
 
     let mut intent_map = serde_yaml::Mapping::new();
+    let mut shell_map = serde_yaml::Mapping::new();
     for (k, v) in mapping {
         let key_str = k.as_str().unwrap_or("");
-        if matches!(key_str, "close" | "high" | "low" | "time" | "sig") {
-            continue;
+        match key_str {
+            "sig" => continue,
+            "close" | "high" | "low" | "time" | "pattern_high" | "pattern_low" | "pattern_time"
+            | "pattern_confirmed" => {
+                shell_map.insert(k.clone(), v.clone());
+            }
+            _ => {
+                intent_map.insert(k.clone(), v.clone());
+            }
         }
-        intent_map.insert(k.clone(), v.clone());
     }
     let intent: Intent = serde_yaml::from_value(serde_yaml::Value::Mapping(intent_map))
         .map_err(|_| IncomingError::BadIntentYaml)?;
-    let shell = Shell {
-        close: mapping_f64(mapping, "close")?,
-        high: mapping_f64(mapping, "high")?,
-        low: mapping_f64(mapping, "low")?,
-        time: mapping_time(mapping, "time")?,
-    };
+    // Deserialise the Shell directly so its serde adapters
+    // (pattern_time_serde, pattern_confirmed_serde) handle Pine's
+    // millisecond-int and 0/1 wire forms.
+    let shell: Shell = serde_yaml::from_value(serde_yaml::Value::Mapping(shell_map))
+        .map_err(|_| IncomingError::BadYaml)?;
 
     check_intent_freshness(&shell, &intent, now)?;
     intent.validate().map_err(IncomingError::InvalidIntent)?;
@@ -157,21 +163,6 @@ pub fn signed_pairs_from_text(yaml: &str) -> Result<Vec<(String, String)>, Incom
         out.push((key, val));
     }
     Ok(out)
-}
-
-fn mapping_f64(map: &serde_yaml::Mapping, key: &str) -> Result<f64, IncomingError> {
-    map.get(serde_yaml::Value::String(key.to_string()))
-        .and_then(|v| v.as_f64())
-        .ok_or(IncomingError::BadYaml)
-}
-
-fn mapping_time(map: &serde_yaml::Mapping, key: &str) -> Result<DateTime<Utc>, IncomingError> {
-    let s = map
-        .get(serde_yaml::Value::String(key.to_string()))
-        .and_then(|v| v.as_str())
-        .ok_or(IncomingError::BadYaml)?;
-    s.parse::<DateTime<Utc>>()
-        .map_err(|_| IncomingError::BadYaml)
 }
 
 fn strip_yaml_quotes(s: &str) -> &str {
@@ -366,6 +357,107 @@ mod tests {
         let now: DateTime<Utc> = "2026-05-13T12:01:00Z".parse().unwrap();
         let v = parse_and_verify(&on_wire, &KEY, now).unwrap();
         assert_eq!(v.intent.id, "prep-abc");
+    }
+
+    #[test]
+    fn signed_path_pattern_fields_round_trip() {
+        // CLI signs with pattern_* {{plot(...)}} placeholders; TV
+        // substitutes Pine's wire forms: pattern_time as a millisecond
+        // integer, pattern_confirmed as 0 or 1. The Shell's serde
+        // adapters must accept both.
+        let pre_substitution = [
+            "close: {{close}}",
+            "high: {{high}}",
+            "low: {{low}}",
+            "time: \"{{time}}\"",
+            "pattern_high: {{plot(\"pattern_high\")}}",
+            "pattern_low: {{plot(\"pattern_low\")}}",
+            "pattern_time: {{plot(\"pattern_time\")}}",
+            "pattern_confirmed: {{plot(\"pattern_confirmed\")}}",
+            "v: 1",
+            "action: prep",
+            "instrument: EUR_USD",
+            "id: prep-pat",
+            "not_after: \"2026-05-13T20:00:00Z\"",
+            "step: retest",
+            "ttl_hours: 12",
+            "",
+        ]
+        .join("\n");
+        let pairs = signed_pairs_from_text(&pre_substitution).unwrap();
+        let sig = crate::sig::sign(&KEY, &pairs).unwrap();
+        let on_wire = [
+            "close: 1.16438",
+            "high: 1.16440",
+            "low: 1.16430",
+            "time: \"2026-05-13T12:00:00Z\"",
+            "pattern_high: 1.16437",
+            "pattern_low: 1.16432",
+            // ms epoch matches 2026-05-13T11:59:00Z (the prior signal bar).
+            "pattern_time: 1779728340000",
+            "pattern_confirmed: 1",
+            "v: 1",
+            "action: prep",
+            "instrument: EUR_USD",
+            "id: prep-pat",
+            "not_after: \"2026-05-13T20:00:00Z\"",
+            "step: retest",
+            "ttl_hours: 12",
+            &format!("sig: \"{sig}\""),
+            "",
+        ]
+        .join("\n");
+        let now: DateTime<Utc> = "2026-05-13T12:01:00Z".parse().unwrap();
+        let v = parse_and_verify(&on_wire, &KEY, now).unwrap();
+        assert_eq!(v.shell.pattern_high, Some(1.16437));
+        assert_eq!(v.shell.pattern_low, Some(1.16432));
+        assert_eq!(v.shell.pattern_confirmed, Some(true));
+        let pat_time = v.shell.pattern_time.unwrap();
+        assert_eq!(pat_time.timestamp_millis(), 1779728340000);
+    }
+
+    #[test]
+    fn signed_path_pattern_confirmed_zero_is_false() {
+        let pre_substitution = [
+            "close: {{close}}",
+            "high: {{high}}",
+            "low: {{low}}",
+            "time: \"{{time}}\"",
+            "pattern_confirmed: {{plot(\"pattern_confirmed\")}}",
+            "v: 1",
+            "action: prep",
+            "instrument: EUR_USD",
+            "id: prep-pat0",
+            "not_after: \"2026-05-13T20:00:00Z\"",
+            "step: retest",
+            "ttl_hours: 12",
+            "",
+        ]
+        .join("\n");
+        let pairs = signed_pairs_from_text(&pre_substitution).unwrap();
+        let sig = crate::sig::sign(&KEY, &pairs).unwrap();
+        let on_wire = [
+            "close: 1.0",
+            "high: 1.0",
+            "low: 1.0",
+            "time: \"2026-05-13T12:00:00Z\"",
+            "pattern_confirmed: 0",
+            "v: 1",
+            "action: prep",
+            "instrument: EUR_USD",
+            "id: prep-pat0",
+            "not_after: \"2026-05-13T20:00:00Z\"",
+            "step: retest",
+            "ttl_hours: 12",
+            &format!("sig: \"{sig}\""),
+            "",
+        ]
+        .join("\n");
+        let now: DateTime<Utc> = "2026-05-13T12:01:00Z".parse().unwrap();
+        let v = parse_and_verify(&on_wire, &KEY, now).unwrap();
+        assert_eq!(v.shell.pattern_confirmed, Some(false));
+        assert_eq!(v.shell.pattern_high, None);
+        assert_eq!(v.shell.pattern_time, None);
     }
 
     #[test]

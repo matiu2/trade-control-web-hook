@@ -3,13 +3,17 @@ indicator("Candle Signals", shorttitle="Candle Signals", overlay=true, max_label
 // Combined detector for: Pinbars, Tweezers, Regular Engulfers, Floating Engulfers
 // Outputs unified bullish/bearish signals
 //
-// v2: latches the most-recent signal candle's high/low/time onto persistent
-// `plot()` series (titles: sig_high, sig_low, sig_time) so the four golden
-// alertconditions can embed them in the alert message via
-// {{plot("sig_high")}} etc. When the confirmation alertcondition fires on a
-// later bar than the signal candle, the built-in {{high}}/{{low}} reflect
-// the *firing* bar; the new plots let us still recover the *signal* bar's
-// extremes at fire time. v1 of this indicator did not have these plots.
+// v2: latches the most-recent signal candle's high/low/time/confirmed onto
+// persistent `plot()` series (titles: pattern_high, pattern_low, pattern_time,
+// pattern_confirmed) so the alertconditions can embed them in the alert
+// message via {{plot("pattern_high")}} etc. When the confirmation
+// alertcondition fires on a later bar than the signal candle, the built-in
+// {{high}}/{{low}} reflect the *firing* bar; the plots let us still recover
+// the *signal* bar's extremes at fire time. `pattern_confirmed` is 1.0 when
+// the latched pattern has been validated within the confirmation window,
+// 0.0 otherwise — the worker-side Rhai engine reads this as a bool via
+// `pattern_confirmed > 0.5` so operators can write
+// `allow_entry: !script "pattern_confirmed"` to gate retries on confirmation.
 
 // =============================================================================
 // SIGNAL STATE RULES
@@ -17,9 +21,9 @@ indicator("Candle Signals", shorttitle="Candle Signals", overlay=true, max_label
 // 1. Every detected signal starts in the pending state when it prints.
 // 2. If price trades above the high of a bearish signal, it becomes invalid.
 // 3. If price trades below the low of a bullish signal, it becomes invalid.
-// 4. A bullish pending signal becomes valid when price pushes above its high within 3 candles.
-// 5. A bearish pending signal becomes valid when price pushes below its low within 3 candles.
-// 6. Any pending signal that neither validates nor invalidates within 3 candles becomes invalid.
+// 4. A bullish pending signal becomes valid when price pushes above its high within `confirm_bars`.
+// 5. A bearish pending signal becomes valid when price pushes below its low within `confirm_bars`.
+// 6. Any pending signal that neither validates nor invalidates within `confirm_bars` becomes invalid.
 
 // ===== Inputs ================================================================
 show_symbols = input.bool(true, "Show Symbols")
@@ -38,6 +42,11 @@ show_small_candles = input.bool(false, "Show Small Candles", tooltip="Show signa
 // State visibility
 hide_pending = input.bool(false, "Hide Pending Signals")
 hide_invalid = input.bool(true, "Hide Invalid Signals")
+
+// Confirmation window — how many bars after a pending signal prints we still
+// accept a confirming push above/below its extreme. Used by both the visual
+// state machine and the *_just_valid alertconditions.
+confirm_bars = input.int(2, "Confirmation Bars", minval=1, maxval=10, tooltip="Bars after signal print within which a confirming push validates the signal. Worker uses this same window via the Confirmed alertconditions.")
 
 // Tweezer similarity threshold
 similarity_pct = input.float(20.0, "Tweezer High/Low Similarity (%)", minval=0.0, maxval=100.0, step=0.1)
@@ -214,6 +223,20 @@ var int[] bearish_bars = array.new_int()
 var label[] bearish_labels = array.new<label>()
 var bool[] bearish_golden = array.new_bool()
 
+// Persistent pattern-extremes for webhook embedding. These latch when a new
+// signal prints (bullish or bearish) and retain their last value across all
+// subsequent bars until the *next* signal overwrites them. Alertconditions
+// reference them via {{plot("pattern_high")}} etc. in their message= arg, so
+// the webhook payload carries the *signal* candle's extremes even when the
+// alert fires on a later (confirmation) bar. pattern_confirmed is 1.0 if
+// the latched pattern has been validated within `confirm_bars`, else 0.0.
+// Declared here (above the state loops) because the loops mutate
+// pattern_confirmed_v — Pine has no hoisting.
+var float pattern_high_v      = na
+var float pattern_low_v       = na
+var int   pattern_time_v      = na
+var float pattern_confirmed_v = 0.0
+
 
 bool bullish_just_valid = false
 bool bullish_just_invalid = false
@@ -239,9 +262,9 @@ while bullish_index >= 0
     int bars_elapsed = bar_index - signal_bar
 
     if state == STATE_PENDING
-        if bars_elapsed <= 3 and high > sig_high
+        if bars_elapsed <= confirm_bars and high > sig_high
             new_state := STATE_VALID
-        else if bars_elapsed > 3
+        else if bars_elapsed > confirm_bars
             new_state := STATE_INVALID
 
     if low < sig_low
@@ -253,6 +276,12 @@ while bullish_index >= 0
             bullish_just_valid := true
             if is_golden
                 bullish_just_valid_golden := true
+            // Latch confirmation only if the validating signal IS the
+            // currently-latched pattern. Guards against a stale older
+            // pending signal validating after a newer signal has
+            // overwritten the latch.
+            if pattern_high_v == sig_high and pattern_low_v == sig_low
+                pattern_confirmed_v := 1.0
         else if state != STATE_INVALID and new_state == STATE_INVALID
             bullish_just_invalid := true
             if is_golden
@@ -276,9 +305,9 @@ while bearish_index >= 0
     int bars_elapsed = bar_index - signal_bar
 
     if state == STATE_PENDING
-        if bars_elapsed <= 3 and low < sig_low
+        if bars_elapsed <= confirm_bars and low < sig_low
             new_state := STATE_VALID
-        else if bars_elapsed > 3
+        else if bars_elapsed > confirm_bars
             new_state := STATE_INVALID
 
     if high > sig_high
@@ -290,6 +319,10 @@ while bearish_index >= 0
             bearish_just_valid := true
             if is_golden
                 bearish_just_valid_golden := true
+            // Latch confirmation only if the validating signal IS the
+            // currently-latched pattern (see bullish branch above).
+            if pattern_high_v == sig_high and pattern_low_v == sig_low
+                pattern_confirmed_v := 1.0
         else if state != STATE_INVALID and new_state == STATE_INVALID
             bearish_just_invalid := true
             if is_golden
@@ -298,18 +331,11 @@ while bearish_index >= 0
     f_apply_label_style(sig_label, false, new_state, is_golden)
     bearish_index -= 1
 
-// ===== Persistent signal-extremes for webhook embedding ======================
-// These latch when a new signal prints (bullish or bearish) and retain their
-// last value across all subsequent bars until the *next* signal overwrites
-// them. The four golden alertconditions reference them via
-// {{plot("sig_high")}} / {{plot("sig_low")}} / {{plot("sig_time")}} in their
-// message= argument, so the webhook payload carries the *signal* candle's
-// extremes even when the alert fires on a later (confirmation) bar.
-var float sig_high_v = na
-var float sig_low_v  = na
-var int   sig_time_v = na
-
-// Capture new signals
+// ===== Capture new signals & latch pattern-extremes ==========================
+// When a new signal prints this bar, push it into the per-direction tracking
+// arrays *and* overwrite the webhook-embedding latches (pattern_*_v declared
+// above the state loops). pattern_confirmed resets to 0.0 — a fresh signal
+// is unconfirmed until a later bar pushes through its extreme.
 if bullish_signal
     float sig_high = bullish_tweezer ? math.max(high, nz(high[1], high)) : high
     float sig_low = bullish_tweezer ? math.min(low, nz(low[1], low)) : low
@@ -324,9 +350,12 @@ if bullish_signal
     f_apply_label_style(lbl, true, STATE_PENDING, is_golden)
     array.push(bullish_labels, lbl)
     // Latch for webhook embedding (overwrites whichever signal was last).
-    sig_high_v := sig_high
-    sig_low_v  := sig_low
-    sig_time_v := time
+    // pattern_confirmed resets to 0.0 — a fresh signal is unconfirmed until
+    // a later bar pushes through the extreme within `confirm_bars`.
+    pattern_high_v      := sig_high
+    pattern_low_v       := sig_low
+    pattern_time_v      := time
+    pattern_confirmed_v := 0.0
 
 if bearish_signal
     float sig_high = bearish_tweezer ? math.max(high, nz(high[1], high)) : high
@@ -341,14 +370,16 @@ if bearish_signal
     label lbl = f_create_label(bar_index, sig_high, false, is_golden)
     f_apply_label_style(lbl, false, STATE_PENDING, is_golden)
     array.push(bearish_labels, lbl)
-    sig_high_v := sig_high
-    sig_low_v  := sig_low
-    sig_time_v := time
+    pattern_high_v      := sig_high
+    pattern_low_v       := sig_low
+    pattern_time_v      := time
+    pattern_confirmed_v := 0.0
 
-// Hidden plots so {{plot("sig_high")}} etc. work in alert messages.
-plot(sig_high_v, title="sig_high", display=display.none)
-plot(sig_low_v,  title="sig_low",  display=display.none)
-plot(sig_time_v, title="sig_time", display=display.none)
+// Hidden plots so {{plot("pattern_high")}} etc. work in alert messages.
+plot(pattern_high_v,      title="pattern_high",      display=display.none)
+plot(pattern_low_v,       title="pattern_low",       display=display.none)
+plot(pattern_time_v,      title="pattern_time",      display=display.none)
+plot(pattern_confirmed_v, title="pattern_confirmed", display=display.none)
 
 // Trim arrays to max_signals to limit memory and computation
 while array.size(bullish_states) > max_signals
@@ -372,29 +403,23 @@ while array.size(bearish_states) > max_signals
         label.delete(old_lbl)
 
 // ===== Alerts ================================================================
-// The four golden alertconditions carry sig_high / sig_low / sig_time in their
-// message body. The non-golden ones are left untouched — we only use the
-// golden variants in the automated H&S pipeline.
-SIG_MSG = 'sig_high={{plot("sig_high")}}\nsig_low={{plot("sig_low")}}\nsig_time={{plot("sig_time")}}'
+// All signal/confirmed alertconditions carry pattern_high / pattern_low /
+// pattern_time / pattern_confirmed in their message body. The worker-side
+// Rhai engine reads these to gate retries (e.g. `allow_entry: !script
+// "pattern_confirmed"` waits for a confirming push before placing the order).
+// Invalid alertconditions stay plain text — the automated H&S pipeline
+// doesn't consume them.
+PATTERN_MSG = 'pattern_high={{plot("pattern_high")}}\npattern_low={{plot("pattern_low")}}\npattern_time={{plot("pattern_time")}}\npattern_confirmed={{plot("pattern_confirmed")}}'
 
-// Heartbeat — fires on every bar. Lets us smoke-test the {{plot()}}
-// embedding without waiting for a real signal (e.g. weekends, dead
-// markets). Body includes both the latched signal-candle extremes and
-// the firing bar's OHLC so we can verify they diverge after a signal
-// prints. Not used in the automated H&S pipeline — leave it disabled
-// in production.
-HEARTBEAT_MSG = '--- heartbeat ---\nbar_time={{time}}\nbar_high={{high}}\nbar_low={{low}}\nbar_close={{close}}\nsig_high={{plot("sig_high")}}\nsig_low={{plot("sig_low")}}\nsig_time={{plot("sig_time")}}'
-
-alertcondition(bullish_signal, "Bullish Signal", "Bullish candle signal detected")
-alertcondition(bearish_signal, "Bearish Signal", "Bearish candle signal detected")
-alertcondition(bullish_just_valid, "Bullish Confirmed", "Bullish signal confirmed within three candles")
-alertcondition(bearish_just_valid, "Bearish Confirmed", "Bearish signal confirmed within three candles")
-alertcondition(bullish_just_invalid, "Bullish Invalid", "Bullish signal invalidated")
-alertcondition(bearish_just_invalid, "Bearish Invalid", "Bearish signal invalidated")
-alertcondition(bullish_golden_signal, "Bullish Golden Signal", SIG_MSG)
-alertcondition(bearish_golden_signal, "Bearish Golden Signal", SIG_MSG)
-alertcondition(bullish_just_valid_golden, "Bullish Golden Confirmed", SIG_MSG)
-alertcondition(bearish_just_valid_golden, "Bearish Golden Confirmed", SIG_MSG)
-alertcondition(bullish_just_invalid_golden, "Bullish Golden Invalid", "Bullish golden signal invalidated")
-alertcondition(bearish_just_invalid_golden, "Bearish Golden Invalid", "Bearish golden signal invalidated")
-alertcondition(true, "Heartbeat (smoke test)", HEARTBEAT_MSG)
+alertcondition(bullish_signal,              "Bullish Signal",           PATTERN_MSG)
+alertcondition(bearish_signal,              "Bearish Signal",           PATTERN_MSG)
+alertcondition(bullish_just_valid,          "Bullish Confirmed",        PATTERN_MSG)
+alertcondition(bearish_just_valid,          "Bearish Confirmed",        PATTERN_MSG)
+alertcondition(bullish_just_invalid,        "Bullish Invalid",          "Bullish signal invalidated")
+alertcondition(bearish_just_invalid,        "Bearish Invalid",          "Bearish signal invalidated")
+alertcondition(bullish_golden_signal,       "Bullish Golden Signal",    PATTERN_MSG)
+alertcondition(bearish_golden_signal,       "Bearish Golden Signal",    PATTERN_MSG)
+alertcondition(bullish_just_valid_golden,   "Bullish Golden Confirmed", PATTERN_MSG)
+alertcondition(bearish_just_valid_golden,   "Bearish Golden Confirmed", PATTERN_MSG)
+alertcondition(bullish_just_invalid_golden, "Bullish Golden Invalid",   "Bullish golden signal invalidated")
+alertcondition(bearish_just_invalid_golden, "Bearish Golden Invalid",   "Bearish golden signal invalidated")

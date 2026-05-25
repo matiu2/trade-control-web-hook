@@ -218,6 +218,17 @@ fn shell_for_tv_template() -> Vec<(&'static str, String)> {
         ("high", "{{high}}".to_string()),
         ("low", "{{low}}".to_string()),
         ("time", "\"{{time}}\"".to_string()),
+        // pattern_* come from candle-signals-v2.pine's hidden plots,
+        // populated when the alertcondition fires on a (Bullish|Bearish)
+        // (Golden)? (Signal|Confirmed) event. The worker treats them as
+        // optional — pre-existing v2 signed templates parse unchanged.
+        ("pattern_high", "{{plot(\"pattern_high\")}}".to_string()),
+        ("pattern_low", "{{plot(\"pattern_low\")}}".to_string()),
+        ("pattern_time", "{{plot(\"pattern_time\")}}".to_string()),
+        (
+            "pattern_confirmed",
+            "{{plot(\"pattern_confirmed\")}}".to_string(),
+        ),
     ]
 }
 

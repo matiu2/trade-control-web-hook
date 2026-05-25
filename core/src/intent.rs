@@ -23,6 +23,98 @@ pub struct Shell {
     /// ISO-8601 timestamp from TradingView. Used as an upper bound on the
     /// alert's freshness — alerts from yesterday should be obvious.
     pub time: DateTime<Utc>,
+    /// Pattern (signal candle) extremes latched by the Pine indicator and
+    /// substituted into the alert message via {{plot("pattern_high")}}
+    /// etc. Optional because pre-2026-05 signed templates didn't include
+    /// these and control-action shells (cancel/status) don't either.
+    /// Populated by Pine `candle-signals-v2.pine` and read by the
+    /// worker's Rhai engine to gate retries on confirmation, dynamic
+    /// entry/SL/TP prices, etc.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pattern_high: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pattern_low: Option<f64>,
+    /// Signal candle's bar-open time. Pine ships this as milliseconds
+    /// since epoch (integer), not RFC3339 — see `pattern_time_de`.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "pattern_time_serde"
+    )]
+    pub pattern_time: Option<DateTime<Utc>>,
+    /// True iff the latched pattern has been validated by a confirming
+    /// push within the indicator's `confirm_bars` window. Pine emits
+    /// 1/0 as numbers — see `pattern_confirmed_serde`.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "pattern_confirmed_serde"
+    )]
+    pub pattern_confirmed: Option<bool>,
+}
+
+/// Pine emits `pattern_time` as a millisecond-precision Unix epoch
+/// integer (e.g. `1779742740000`). Convert to/from `DateTime<Utc>`.
+mod pattern_time_serde {
+    use chrono::{DateTime, TimeZone, Utc};
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(v: &Option<DateTime<Utc>>, s: S) -> Result<S::Ok, S::Error> {
+        match v {
+            Some(dt) => s.serialize_i64(dt.timestamp_millis()),
+            None => s.serialize_none(),
+        }
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Option<DateTime<Utc>>, D::Error> {
+        let v: Option<serde_yaml::Value> = Option::deserialize(d)?;
+        let Some(v) = v else { return Ok(None) };
+        let ms = match v {
+            serde_yaml::Value::Number(n) => n.as_i64().or_else(|| n.as_f64().map(|f| f as i64)),
+            serde_yaml::Value::String(s) => s.parse::<i64>().ok(),
+            _ => None,
+        }
+        .ok_or_else(|| serde::de::Error::custom("pattern_time: expected integer ms epoch"))?;
+        Utc.timestamp_millis_opt(ms)
+            .single()
+            .map(Some)
+            .ok_or_else(|| serde::de::Error::custom("pattern_time: ms out of range"))
+    }
+}
+
+/// Pine emits `pattern_confirmed` as `0` or `1` (number, not bool).
+/// Accept numbers and the strings "0"/"1"/"true"/"false" defensively.
+mod pattern_confirmed_serde {
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(v: &Option<bool>, s: S) -> Result<S::Ok, S::Error> {
+        match v {
+            Some(b) => s.serialize_u8(u8::from(*b)),
+            None => s.serialize_none(),
+        }
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Option<bool>, D::Error> {
+        let v: Option<serde_yaml::Value> = Option::deserialize(d)?;
+        let Some(v) = v else { return Ok(None) };
+        match v {
+            serde_yaml::Value::Bool(b) => Ok(Some(b)),
+            serde_yaml::Value::Number(n) => {
+                let f = n.as_f64().unwrap_or(0.0);
+                Ok(Some(f > 0.5))
+            }
+            serde_yaml::Value::String(s) => match s.as_str() {
+                "1" | "true" | "True" | "TRUE" => Ok(Some(true)),
+                "0" | "false" | "False" | "FALSE" => Ok(Some(false)),
+                other => Err(serde::de::Error::custom(format!(
+                    "pattern_confirmed: unrecognised value {other:?}"
+                ))),
+            },
+            _ => Err(serde::de::Error::custom(
+                "pattern_confirmed: expected bool/number/string",
+            )),
+        }
+    }
 }
 
 /// The fully-decrypted intent. `v` lets us reject future protocol versions cleanly.
@@ -443,6 +535,10 @@ mod tests {
             high: 1.1020,
             low: 1.0980,
             time: "2026-05-13T12:00:00Z".parse().unwrap(),
+            pattern_high: None,
+            pattern_low: None,
+            pattern_time: None,
+            pattern_confirmed: None,
         }
     }
 
