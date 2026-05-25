@@ -745,6 +745,13 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
              "live runs of a new sizing path. Compatible with --create-alerts.",
     )
     p.add_argument(
+        "--max-retries", dest="max_retries", type=int, default=None,
+        help="Opt in to multi-shot entries: if the broker rejects the order "
+             "(e.g. spread too wide), the worker will retry on subsequent "
+             "enter-alert firings up to this many times. Default (flag absent) "
+             "keeps today's single-shot behaviour. Bounded by trade_expiry.",
+    )
+    p.add_argument(
         "--skip-break-and-close", action="store_true",
         help="Drop the break-and-close prep from the bundle (no alert "
              "emitted and the entry no longer requires it). Use when "
@@ -847,6 +854,8 @@ def main(argv: Optional[list[str]] = None) -> int:
         spec["risk_amount"] = args.risk_amount
     if args.broker_dry_run:
         spec["dry_run"] = True
+    if args.max_retries is not None:
+        spec["max_retries"] = args.max_retries
     if skip_preps:
         spec["skip_preps"] = skip_preps
     write_trade_spec(spec, spec_path)
@@ -882,6 +891,8 @@ def main(argv: Optional[list[str]] = None) -> int:
     print("## Creating TV alerts")
     if skip_preps:
         print(f"# skipped preps (not in bundle): {', '.join(skip_preps)}")
+    if args.max_retries is not None:
+        print(f"# max_retries: {args.max_retries}")
     print()
 
     payloads = []
