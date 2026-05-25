@@ -13,6 +13,12 @@ serde_yaml = "0.9.34"
 sha2 = "0.11.0"
 subtle = "2.6.1"
 
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+rhai = { version = "1.25.0", default-features = false, features = ["std", "wasm-bindgen", "serde"] }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+rhai = { version = "1.25.0", default-features = false, features = ["std", "serde"] }
+
 [features]
 default = []
 cli = []
