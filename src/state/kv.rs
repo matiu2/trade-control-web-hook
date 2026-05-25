@@ -11,8 +11,9 @@
 use chrono::{DateTime, Utc};
 use trade_control_core::intent::Action;
 use trade_control_core::state::{
-    CooldownEntry, MIN_TTL_SECONDS, PREP_INDEX_CAP, PrepEntry, SEEN_INDEX_CAP, SeenEntry, Snapshot,
-    StateError, StateStore, VETO_INDEX_CAP, VetoEntry, account_scope, prune_expired,
+    CooldownEntry, EntryAttempt, MIN_TTL_SECONDS, PREP_INDEX_CAP, PrepEntry, SEEN_INDEX_CAP,
+    SeenEntry, Snapshot, StateError, StateStore, VETO_INDEX_CAP, VetoEntry, account_scope,
+    prune_expired,
 };
 use worker::kv::KvStore;
 
@@ -517,5 +518,56 @@ impl StateStore for KvStateStore {
             preps,
             vetos,
         })
+    }
+
+    // TODO(1b): real KV-backed impls for the max_retries surface land in
+    // sub-step 1b. For now the stubs return safe defaults (no attempts,
+    // never-seen) so the type-checker passes — they are not wired into
+    // `run_enter` yet, so behaviour is unchanged.
+    async fn record_entry_attempt(&self, _attempt: EntryAttempt) -> Result<(), StateError> {
+        Err(StateError::Backend(
+            "record_entry_attempt: not implemented (TODO 1b)".into(),
+        ))
+    }
+
+    async fn list_entry_attempts(
+        &self,
+        _account: Option<&str>,
+        _trade_id: &str,
+    ) -> Result<Vec<EntryAttempt>, StateError> {
+        Ok(Vec::new())
+    }
+
+    async fn set_entry_attempt_broker_trade_id(
+        &self,
+        _account: Option<&str>,
+        _trade_id: &str,
+        _attempt_no: u32,
+        _broker_trade_id: &str,
+    ) -> Result<(), StateError> {
+        Err(StateError::Backend(
+            "set_entry_attempt_broker_trade_id: not implemented (TODO 1b)".into(),
+        ))
+    }
+
+    async fn is_retry_fire_seen(
+        &self,
+        _account: Option<&str>,
+        _trade_id: &str,
+        _shell_time: DateTime<Utc>,
+    ) -> Result<bool, StateError> {
+        Ok(false)
+    }
+
+    async fn mark_retry_fire_seen(
+        &self,
+        _account: Option<&str>,
+        _trade_id: &str,
+        _shell_time: DateTime<Utc>,
+        _ttl_seconds: u64,
+    ) -> Result<(), StateError> {
+        Err(StateError::Backend(
+            "mark_retry_fire_seen: not implemented (TODO 1b)".into(),
+        ))
     }
 }

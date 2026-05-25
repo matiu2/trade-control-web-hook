@@ -356,6 +356,7 @@ mod tests {
             clears: Vec::new(),
             account: None,
             trade_id: None,
+            max_retries: None,
         }
     }
 

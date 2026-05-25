@@ -171,6 +171,15 @@ pub struct Intent {
     /// back-compatible with intents minted before this field landed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trade_id: Option<String>,
+    /// When set, the worker treats the enter as multi-shot: the alert
+    /// may fire on multiple firing bars within the `not_after` window,
+    /// dedup'd by `(trade_id, shell.time)`. Total **placed** entries are
+    /// capped at this value. Requires `trade_id` to be set and `action`
+    /// to be [`Action::Enter`]; rejected at validate time otherwise.
+    /// Zero is rejected — pass `None` for the default single-shot
+    /// behaviour instead.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_retries: Option<u32>,
 }
 
 /// Maximum length of a `trade_id` slug. 64 chars is plenty for
@@ -201,6 +210,15 @@ pub fn is_valid_trade_id(s: &str) -> bool {
 pub enum IntentValidationError {
     /// `trade_id` failed [`is_valid_trade_id`].
     InvalidTradeId,
+    /// `max_retries: Some(0)` — must be at least 1, or absent for the
+    /// default single-shot behaviour.
+    ZeroMaxRetries,
+    /// `max_retries: Some(_)` without a `trade_id` — the retry gate
+    /// is keyed on `(account, trade_id)` so the field is mandatory.
+    MaxRetriesWithoutTradeId,
+    /// `max_retries: Some(_)` on a non-Enter action — retries only
+    /// make sense for `enter`.
+    MaxRetriesOnNonEnter,
 }
 
 impl core::fmt::Display for IntentValidationError {
@@ -210,6 +228,13 @@ impl core::fmt::Display for IntentValidationError {
                 "invalid trade_id (must be 1-64 chars of lowercase alphanumerics + hyphens, \
                  no leading/trailing or consecutive hyphens)",
             ),
+            Self::ZeroMaxRetries => {
+                f.write_str("max_retries must be >= 1; omit for single-shot behaviour")
+            }
+            Self::MaxRetriesWithoutTradeId => {
+                f.write_str("max_retries requires trade_id to be set")
+            }
+            Self::MaxRetriesOnNonEnter => f.write_str("max_retries is only valid on action: enter"),
         }
     }
 }
@@ -226,6 +251,17 @@ impl Intent {
             && !is_valid_trade_id(id)
         {
             return Err(IntentValidationError::InvalidTradeId);
+        }
+        if let Some(n) = self.max_retries {
+            if n == 0 {
+                return Err(IntentValidationError::ZeroMaxRetries);
+            }
+            if self.trade_id.is_none() {
+                return Err(IntentValidationError::MaxRetriesWithoutTradeId);
+            }
+            if self.action != Action::Enter {
+                return Err(IntentValidationError::MaxRetriesOnNonEnter);
+            }
         }
         Ok(())
     }
@@ -1039,6 +1075,133 @@ mod tests {
         assert_eq!(
             intent.validate(),
             Err(IntentValidationError::InvalidTradeId)
+        );
+    }
+
+    #[test]
+    fn intent_defaults_max_retries_to_none() {
+        let yaml = "
+            v: 1
+            id: mr-1
+            not_after: \"2026-05-13T20:00:00Z\"
+            action: enter
+            instrument: EUR_USD
+            direction: long
+            entry: { type: market }
+            stop_loss: { from: low, offset_pips: -2 }
+            take_profit: { from: close, offset_r: 2.0 }
+            risk_pct: 0.5
+        ";
+        let intent: Intent = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(intent.max_retries, None);
+    }
+
+    #[test]
+    fn intent_max_retries_round_trips_through_yaml() {
+        let yaml = "
+            v: 1
+            id: mr-2
+            not_after: \"2026-05-13T20:00:00Z\"
+            action: enter
+            instrument: EUR_USD
+            direction: long
+            entry: { type: market }
+            stop_loss: { from: low, offset_pips: -2 }
+            take_profit: { from: close, offset_r: 2.0 }
+            risk_pct: 0.5
+            trade_id: eurusd-long-mr2
+            max_retries: 3
+        ";
+        let intent: Intent = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(intent.max_retries, Some(3));
+        intent.validate().unwrap();
+        let back = serde_yaml::to_string(&intent).unwrap();
+        assert!(back.contains("max_retries: 3"));
+    }
+
+    #[test]
+    fn intent_omits_max_retries_when_none() {
+        // skip_serializing_if guard — keeps the wire form unchanged for
+        // single-shot intents minted before this field landed.
+        let yaml = "
+            v: 1
+            id: mr-3
+            not_after: \"2026-05-13T20:00:00Z\"
+            action: enter
+            instrument: EUR_USD
+            direction: long
+            entry: { type: market }
+            stop_loss: { from: low, offset_pips: -2 }
+            take_profit: { from: close, offset_r: 2.0 }
+            risk_pct: 0.5
+        ";
+        let intent: Intent = serde_yaml::from_str(yaml).unwrap();
+        let back = serde_yaml::to_string(&intent).unwrap();
+        assert!(!back.contains("max_retries"));
+    }
+
+    #[test]
+    fn validate_rejects_zero_max_retries() {
+        let yaml = "
+            v: 1
+            id: mr-zero
+            not_after: \"2026-05-13T20:00:00Z\"
+            action: enter
+            instrument: EUR_USD
+            direction: long
+            entry: { type: market }
+            stop_loss: { from: low, offset_pips: -2 }
+            take_profit: { from: close, offset_r: 2.0 }
+            risk_pct: 0.5
+            trade_id: eurusd-long-mrz
+            max_retries: 0
+        ";
+        let intent: Intent = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(
+            intent.validate(),
+            Err(IntentValidationError::ZeroMaxRetries)
+        );
+    }
+
+    #[test]
+    fn validate_rejects_max_retries_without_trade_id() {
+        let yaml = "
+            v: 1
+            id: mr-no-tid
+            not_after: \"2026-05-13T20:00:00Z\"
+            action: enter
+            instrument: EUR_USD
+            direction: long
+            entry: { type: market }
+            stop_loss: { from: low, offset_pips: -2 }
+            take_profit: { from: close, offset_r: 2.0 }
+            risk_pct: 0.5
+            max_retries: 2
+        ";
+        let intent: Intent = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(
+            intent.validate(),
+            Err(IntentValidationError::MaxRetriesWithoutTradeId)
+        );
+    }
+
+    #[test]
+    fn validate_rejects_max_retries_on_non_enter_action() {
+        let yaml = "
+            v: 1
+            id: mr-prep
+            not_after: \"2026-05-13T20:00:00Z\"
+            action: prep
+            instrument: EUR_USD
+            step: break-and-close
+            ttl_hours: 4
+            trade_id: eurusd-long-mrp
+            max_retries: 2
+        ";
+        let intent: Intent = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(
+            intent.validate(),
+            Err(IntentValidationError::MaxRetriesOnNonEnter)
         );
     }
 

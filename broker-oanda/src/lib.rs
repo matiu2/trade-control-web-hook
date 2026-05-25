@@ -13,7 +13,7 @@ pub use oanda::OANDA_ACCOUNT_ID;
 
 use oanda::{cancel_pending_for_instrument, close_positions, login as login_client, place_entry};
 use oanda_client::OandaClient;
-use trade_control_core::broker::{Broker, EntryError, EntryRequest};
+use trade_control_core::broker::{AttemptState, Broker, EntryError, EntryRequest, LookupError};
 use worker::{Env, console_error};
 
 /// Authenticated OANDA broker handle. Holds the API client and the account id
@@ -46,6 +46,19 @@ impl Broker for OandaBroker {
 
     async fn cancel_pending_for_instrument(&self, instrument: &str) -> usize {
         cancel_pending_for_instrument(&self.client, &self.account_id, instrument).await
+    }
+
+    // TODO(1b): real implementation lives in the next sub-step. Returning
+    // `Transient` makes the retry gate reject the fire (no order placed)
+    // and surfaces the missing impl in logs immediately, rather than
+    // silently advancing the attempt counter on a hard-coded answer.
+    async fn lookup_attempt_state(
+        &self,
+        _instrument: &str,
+        _broker_order_id: &str,
+        _broker_trade_id: Option<&str>,
+    ) -> Result<AttemptState, LookupError> {
+        Err(LookupError::Transient)
     }
 }
 

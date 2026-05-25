@@ -687,6 +687,7 @@ fn skeleton(
         clears: Vec::new(),
         account: Some(account.to_string()),
         trade_id: Some(trade_id.to_string()),
+        max_retries: None,
     }
 }
 

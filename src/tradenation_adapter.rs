@@ -6,7 +6,7 @@
 //! [`Broker`].
 
 use broker_tradenation::TradeNationBroker;
-use trade_control_core::broker::{Broker, EntryError, EntryRequest};
+use trade_control_core::broker::{AttemptState, Broker, EntryError, EntryRequest, LookupError};
 use trade_control_core::intent::{Direction, ResolvedEntry, RiskBudget};
 use worker::console_log;
 
@@ -56,6 +56,19 @@ impl Broker for TradeNationAdapter {
 
     async fn cancel_pending_for_instrument(&self, instrument: &str) -> usize {
         self.0.cancel_pending_for_instrument(instrument).await
+    }
+
+    // TODO(1b): real implementation lives in the next sub-step. Returning
+    // `Transient` makes the retry gate reject the fire (no order placed)
+    // and surfaces the missing impl in logs immediately, rather than
+    // silently advancing the attempt counter on a hard-coded answer.
+    async fn lookup_attempt_state(
+        &self,
+        _instrument: &str,
+        _broker_order_id: &str,
+        _broker_trade_id: Option<&str>,
+    ) -> Result<AttemptState, LookupError> {
+        Err(LookupError::Transient)
     }
 }
 

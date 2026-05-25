@@ -11,7 +11,7 @@ use std::future::Future;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::intent::Action;
+use crate::intent::{Action, Direction};
 
 /// One active cooldown row in a [`Snapshot`]. `set_at` records when the
 /// cooldown was put in place so the operator can see how long ago it
@@ -101,6 +101,54 @@ pub struct VetoEntry {
     /// Pre-scoping entries in KV (written before this field existed)
     /// are wiped at deploy time — there is no on-disk back-compat.
     pub account: Option<String>,
+}
+
+/// One placed entry attempt for a `(account, trade_id)` group, written
+/// after `place_order` succeeds when `intent.max_retries.is_some()`.
+/// The worker uses the list of these rows to count attempts against
+/// the cap and to cross-reference broker state for each prior attempt
+/// (still pending, filled and open, filled and closed, vanished).
+///
+/// `broker_trade_id` is snapshotted lazily: the first lookup that
+/// finds this attempt as an open trade writes the upstream
+/// `BrokerTrade.id` back onto the row so subsequent closed-trade
+/// lookups can correlate (`ClosedTrade` carries no
+/// `originating_order_id` field on either broker).
+///
+/// On OANDA `broker_trade_id` happens to equal `broker_order_id`; on
+/// TradeNation the trade id is the distinct PositionID. Don't assume
+/// identity in callers — always correlate via the stored field.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EntryAttempt {
+    pub trade_id: String,
+    /// `None` for worker-global, `Some(name)` for account-scoped. Same
+    /// shape as [`VetoEntry`] / [`PrepEntry`] / [`CooldownEntry`].
+    pub account: Option<String>,
+    pub instrument: String,
+    /// 1-based: the first attempt is `1`, the Nth is `N`.
+    pub attempt_no: u32,
+    /// What `place_order` returned.
+    pub broker_order_id: String,
+    /// Snapshotted the first time the worker observes this attempt
+    /// has filled into an open trade. `None` until then.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub broker_trade_id: Option<String>,
+    pub direction: Direction,
+    pub placed_at: DateTime<Utc>,
+    /// The firing bar's `shell.time`. Used together with
+    /// `(account, trade_id)` to dedup multi-fire arrivals within
+    /// one bar.
+    pub shell_time: DateTime<Utc>,
+    /// When this row stops mattering — typically `intent.not_after`
+    /// plus a grace period so the lookup window outlives the
+    /// alert window itself.
+    pub expires_at: DateTime<Utc>,
+}
+
+impl HasExpiry for EntryAttempt {
+    fn expires_at(&self) -> DateTime<Utc> {
+        self.expires_at
+    }
 }
 
 /// KV-key sentinel used in place of an account name when a veto is
@@ -263,6 +311,54 @@ pub trait StateStore {
 
     /// Return a snapshot of active cooldowns and recent seen ids.
     fn snapshot(&self) -> impl Future<Output = Result<Snapshot, StateError>>;
+
+    /// Record a placed entry attempt for a `(account, trade_id)`
+    /// group. Used by the retry gate after `place_order` succeeds.
+    fn record_entry_attempt(
+        &self,
+        attempt: EntryAttempt,
+    ) -> impl Future<Output = Result<(), StateError>>;
+
+    /// Return all entry attempts for `(account, trade_id)`, ordered
+    /// by `attempt_no` ascending. Used by the retry gate to count
+    /// prior attempts and cross-reference each against broker state.
+    fn list_entry_attempts(
+        &self,
+        account: Option<&str>,
+        trade_id: &str,
+    ) -> impl Future<Output = Result<Vec<EntryAttempt>, StateError>>;
+
+    /// Update a previously-recorded attempt with the broker's trade
+    /// id, snapshotted lazily the first time the worker observes the
+    /// attempt has filled into an open trade. Idempotent — calling
+    /// twice with the same value is fine.
+    fn set_entry_attempt_broker_trade_id(
+        &self,
+        account: Option<&str>,
+        trade_id: &str,
+        attempt_no: u32,
+        broker_trade_id: &str,
+    ) -> impl Future<Output = Result<(), StateError>>;
+
+    /// Returns true if this `(account, trade_id, shell_time)` retry
+    /// fire has already been seen. Replaces the `seen:<id>` dedup for
+    /// the multi-shot path so two arrivals on the same firing bar
+    /// don't double-place.
+    fn is_retry_fire_seen(
+        &self,
+        account: Option<&str>,
+        trade_id: &str,
+        shell_time: DateTime<Utc>,
+    ) -> impl Future<Output = Result<bool, StateError>>;
+
+    /// Record a retry fire as seen. TTL is in seconds.
+    fn mark_retry_fire_seen(
+        &self,
+        account: Option<&str>,
+        trade_id: &str,
+        shell_time: DateTime<Utc>,
+        ttl_seconds: u64,
+    ) -> impl Future<Output = Result<(), StateError>>;
 }
 
 /// Maximum number of recent seen ids retained in the index. Tuning knob;
@@ -446,9 +542,13 @@ mod memstore {
     /// `(value, expires_at)` for each TTL'd key.
     type Entries = HashMap<String, (String, DateTime<Utc>)>;
 
+    /// Attempts keyed by `(account_scope, trade_id)` → ordered list.
+    type AttemptMap = HashMap<(String, String), Vec<EntryAttempt>>;
+
     #[derive(Default)]
     pub struct MemStateStore {
         inner: RefCell<Entries>,
+        attempts: RefCell<AttemptMap>,
     }
 
     impl MemStateStore {
@@ -653,6 +753,74 @@ mod memstore {
                 preps: Vec::new(),
                 vetos: Vec::new(),
             })
+        }
+
+        async fn record_entry_attempt(&self, attempt: EntryAttempt) -> Result<(), StateError> {
+            let scope = account_scope(attempt.account.as_deref()).to_string();
+            let key = (scope, attempt.trade_id.clone());
+            let mut attempts = self.attempts.borrow_mut();
+            let list = attempts.entry(key).or_default();
+            list.push(attempt);
+            list.sort_by_key(|a| a.attempt_no);
+            Ok(())
+        }
+
+        async fn list_entry_attempts(
+            &self,
+            account: Option<&str>,
+            trade_id: &str,
+        ) -> Result<Vec<EntryAttempt>, StateError> {
+            let scope = account_scope(account).to_string();
+            let key = (scope, trade_id.to_string());
+            let attempts = self.attempts.borrow();
+            Ok(attempts.get(&key).cloned().unwrap_or_default())
+        }
+
+        async fn set_entry_attempt_broker_trade_id(
+            &self,
+            account: Option<&str>,
+            trade_id: &str,
+            attempt_no: u32,
+            broker_trade_id: &str,
+        ) -> Result<(), StateError> {
+            let scope = account_scope(account).to_string();
+            let key = (scope, trade_id.to_string());
+            let mut attempts = self.attempts.borrow_mut();
+            if let Some(list) = attempts.get_mut(&key)
+                && let Some(row) = list.iter_mut().find(|a| a.attempt_no == attempt_no)
+            {
+                row.broker_trade_id = Some(broker_trade_id.to_string());
+            }
+            Ok(())
+        }
+
+        async fn is_retry_fire_seen(
+            &self,
+            account: Option<&str>,
+            trade_id: &str,
+            shell_time: DateTime<Utc>,
+        ) -> Result<bool, StateError> {
+            let scope = account_scope(account);
+            let key = format!("seen-retry:{scope}:{trade_id}:{}", shell_time.to_rfc3339());
+            Ok(self.get_live(&key, Utc::now()).is_some())
+        }
+
+        async fn mark_retry_fire_seen(
+            &self,
+            account: Option<&str>,
+            trade_id: &str,
+            shell_time: DateTime<Utc>,
+            ttl_seconds: u64,
+        ) -> Result<(), StateError> {
+            let scope = account_scope(account);
+            let key = format!("seen-retry:{scope}:{trade_id}:{}", shell_time.to_rfc3339());
+            self.put(
+                key,
+                "1".into(),
+                ttl_seconds.max(MIN_TTL_SECONDS),
+                Utc::now(),
+            );
+            Ok(())
         }
     }
 }
@@ -1297,6 +1465,179 @@ mod tests {
         assert_eq!(parsed.outcome, "rejected: cooled-down");
         assert_eq!(parsed.seen_at, Some(ts("2026-05-15T18:00:00Z")));
         assert_eq!(parsed.expires_at, ts("2026-05-16T03:33:01Z"));
+    }
+
+    fn attempt(
+        trade_id: &str,
+        account: Option<&str>,
+        attempt_no: u32,
+        broker_order_id: &str,
+    ) -> EntryAttempt {
+        let now = Utc::now();
+        EntryAttempt {
+            trade_id: trade_id.into(),
+            account: account.map(|s| s.to_string()),
+            instrument: "EUR_USD".into(),
+            attempt_no,
+            broker_order_id: broker_order_id.into(),
+            broker_trade_id: None,
+            direction: Direction::Long,
+            placed_at: now,
+            shell_time: now,
+            expires_at: now + chrono::Duration::hours(24),
+        }
+    }
+
+    #[test]
+    fn memstore_entry_attempt_round_trip() {
+        use super::memstore::MemStateStore;
+        let store = MemStateStore::new();
+        let a = attempt("tid-1", None, 1, "ord-1");
+        pollster::block_on(store.record_entry_attempt(a.clone())).unwrap();
+        let got = pollster::block_on(store.list_entry_attempts(None, "tid-1")).unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].broker_order_id, "ord-1");
+        assert_eq!(got[0].attempt_no, 1);
+    }
+
+    #[test]
+    fn memstore_list_entry_attempts_orders_by_attempt_no() {
+        use super::memstore::MemStateStore;
+        let store = MemStateStore::new();
+        // Insert out of order; expect them returned sorted.
+        pollster::block_on(store.record_entry_attempt(attempt("tid-2", None, 3, "ord-3"))).unwrap();
+        pollster::block_on(store.record_entry_attempt(attempt("tid-2", None, 1, "ord-1"))).unwrap();
+        pollster::block_on(store.record_entry_attempt(attempt("tid-2", None, 2, "ord-2"))).unwrap();
+        let got = pollster::block_on(store.list_entry_attempts(None, "tid-2")).unwrap();
+        assert_eq!(
+            got.iter().map(|a| a.attempt_no).collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+    }
+
+    #[test]
+    fn memstore_entry_attempts_isolated_per_account() {
+        // Same trade_id on two different accounts must not interfere.
+        use super::memstore::MemStateStore;
+        let store = MemStateStore::new();
+        pollster::block_on(store.record_entry_attempt(attempt(
+            "tid-shared",
+            Some("acct-a"),
+            1,
+            "ord-a1",
+        )))
+        .unwrap();
+        pollster::block_on(store.record_entry_attempt(attempt(
+            "tid-shared",
+            Some("acct-b"),
+            1,
+            "ord-b1",
+        )))
+        .unwrap();
+        let a =
+            pollster::block_on(store.list_entry_attempts(Some("acct-a"), "tid-shared")).unwrap();
+        let b =
+            pollster::block_on(store.list_entry_attempts(Some("acct-b"), "tid-shared")).unwrap();
+        assert_eq!(a.len(), 1);
+        assert_eq!(b.len(), 1);
+        assert_eq!(a[0].broker_order_id, "ord-a1");
+        assert_eq!(b[0].broker_order_id, "ord-b1");
+        // And the global scope is empty — scoped attempts must not bleed.
+        let g = pollster::block_on(store.list_entry_attempts(None, "tid-shared")).unwrap();
+        assert!(g.is_empty());
+    }
+
+    #[test]
+    fn memstore_set_entry_attempt_broker_trade_id() {
+        use super::memstore::MemStateStore;
+        let store = MemStateStore::new();
+        pollster::block_on(store.record_entry_attempt(attempt("tid-3", None, 1, "ord-1"))).unwrap();
+        pollster::block_on(store.set_entry_attempt_broker_trade_id(None, "tid-3", 1, "trade-xyz"))
+            .unwrap();
+        let got = pollster::block_on(store.list_entry_attempts(None, "tid-3")).unwrap();
+        assert_eq!(got[0].broker_trade_id.as_deref(), Some("trade-xyz"));
+        // Idempotent: setting again is fine.
+        pollster::block_on(store.set_entry_attempt_broker_trade_id(None, "tid-3", 1, "trade-xyz"))
+            .unwrap();
+        // Setting a non-existent attempt_no is a no-op (silent).
+        pollster::block_on(store.set_entry_attempt_broker_trade_id(None, "tid-3", 99, "trade-zzz"))
+            .unwrap();
+        let got = pollster::block_on(store.list_entry_attempts(None, "tid-3")).unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].broker_trade_id.as_deref(), Some("trade-xyz"));
+    }
+
+    #[test]
+    fn memstore_retry_fire_seen_round_trip() {
+        use super::memstore::MemStateStore;
+        let store = MemStateStore::new();
+        let shell_time = ts("2026-05-20T10:00:00Z");
+        // Not seen initially.
+        assert!(!pollster::block_on(store.is_retry_fire_seen(None, "tid-r", shell_time)).unwrap());
+        pollster::block_on(store.mark_retry_fire_seen(None, "tid-r", shell_time, 3600)).unwrap();
+        assert!(pollster::block_on(store.is_retry_fire_seen(None, "tid-r", shell_time)).unwrap());
+        // A different shell_time is independent.
+        let other = ts("2026-05-20T11:00:00Z");
+        assert!(!pollster::block_on(store.is_retry_fire_seen(None, "tid-r", other)).unwrap());
+    }
+
+    #[test]
+    fn memstore_retry_fire_seen_isolated_per_account() {
+        use super::memstore::MemStateStore;
+        let store = MemStateStore::new();
+        let shell_time = ts("2026-05-20T10:00:00Z");
+        pollster::block_on(store.mark_retry_fire_seen(Some("acct-a"), "tid-r", shell_time, 3600))
+            .unwrap();
+        assert!(
+            pollster::block_on(store.is_retry_fire_seen(Some("acct-a"), "tid-r", shell_time))
+                .unwrap()
+        );
+        assert!(
+            !pollster::block_on(store.is_retry_fire_seen(Some("acct-b"), "tid-r", shell_time))
+                .unwrap()
+        );
+        assert!(!pollster::block_on(store.is_retry_fire_seen(None, "tid-r", shell_time)).unwrap());
+    }
+
+    #[test]
+    fn entry_attempt_round_trips_through_yaml() {
+        let now = ts("2026-05-20T10:00:00Z");
+        let a = EntryAttempt {
+            trade_id: "eurusd-long-mr".into(),
+            account: Some("acct-a".into()),
+            instrument: "EUR_USD".into(),
+            attempt_no: 2,
+            broker_order_id: "ord-42".into(),
+            broker_trade_id: Some("trade-42".into()),
+            direction: Direction::Long,
+            placed_at: now,
+            shell_time: now,
+            expires_at: now + chrono::Duration::hours(24),
+        };
+        let yaml = serde_yaml::to_string(&a).unwrap();
+        let parsed: EntryAttempt = serde_yaml::from_str(&yaml).unwrap();
+        assert_eq!(parsed, a);
+    }
+
+    #[test]
+    fn entry_attempt_omits_broker_trade_id_when_none() {
+        let now = ts("2026-05-20T10:00:00Z");
+        let a = EntryAttempt {
+            trade_id: "eurusd-long-mr".into(),
+            account: None,
+            instrument: "EUR_USD".into(),
+            attempt_no: 1,
+            broker_order_id: "ord-1".into(),
+            broker_trade_id: None,
+            direction: Direction::Long,
+            placed_at: now,
+            shell_time: now,
+            expires_at: now + chrono::Duration::hours(24),
+        };
+        let yaml = serde_yaml::to_string(&a).unwrap();
+        assert!(!yaml.contains("broker_trade_id"));
+        let parsed: EntryAttempt = serde_yaml::from_str(&yaml).unwrap();
+        assert_eq!(parsed.broker_trade_id, None);
     }
 
     #[test]

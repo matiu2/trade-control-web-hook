@@ -58,6 +58,60 @@ impl core::fmt::Display for EntryError {
 
 impl std::error::Error for EntryError {}
 
+/// State of a previously-placed entry attempt, as observed at the
+/// broker. Returned by [`Broker::lookup_attempt_state`].
+///
+/// See plan B (`max_retries`) for the algorithm: the worker walks the
+/// list of `EntryAttempt` rows for a `(account, trade_id)` group and
+/// asks the broker about each prior attempt's outcome. The newest
+/// attempt dominates — the worker stops at the first attempt whose
+/// state blocks a fresh placement.
+#[derive(Debug, Clone, PartialEq)]
+pub enum AttemptState {
+    /// Resting stop/limit order, not yet filled.
+    Pending,
+    /// Filled, position still open. `broker_trade_id` is the upstream
+    /// `BrokerTrade.id`; the caller snapshots it onto the EntryAttempt
+    /// row so the next (post-close) lookup can correlate via
+    /// `get_closed_trades`.
+    OpenPosition { broker_trade_id: String },
+    /// Filled, position closed at a profit. Only resolvable if we
+    /// snapshotted `broker_trade_id` while it was open and it still
+    /// appears in the closed-trades window.
+    ClosedWin { realized_pl: f64 },
+    /// Filled, position closed at a loss (or breakeven).
+    ClosedLossOrBreakeven { realized_pl: f64 },
+    /// Order vanished from pending without filling
+    /// (rejected/expired/cancelled). TradeNation can do this upstream;
+    /// OANDA can via TIF expiry. Treat as "this attempt is dead;
+    /// the next entry message can try again".
+    Cancelled,
+    /// Order not found anywhere — neither pending nor open, and
+    /// either never had a snapshotted trade id or its closed-trade
+    /// row aged out. Equivalent to `Cancelled` for retry-counting,
+    /// but logged distinctly since it means we lost track.
+    Unknown,
+}
+
+/// Failure modes for [`Broker::lookup_attempt_state`].
+#[derive(Debug, Clone, PartialEq)]
+pub enum LookupError {
+    /// Network / 5xx / other transient broker failure. The caller
+    /// should reject the current fire (no order placed) and let the
+    /// next arrival retry.
+    Transient,
+}
+
+impl core::fmt::Display for LookupError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Transient => f.write_str("broker lookup failed (transient)"),
+        }
+    }
+}
+
+impl std::error::Error for LookupError {}
+
 /// Authenticated broker handle. The constructor lives on each implementation
 /// (it depends on broker-specific secrets), so the trait only carries actions.
 pub trait Broker {
@@ -74,4 +128,33 @@ pub trait Broker {
 
     /// Cancel pending orders on `instrument`. Returns the number cancelled.
     fn cancel_pending_for_instrument(&self, instrument: &str) -> impl Future<Output = usize>;
+
+    /// Look up an attempt this worker previously placed. Used by the
+    /// `max_retries` retry gate to ask "is this order still resting,
+    /// filled, or closed?".
+    ///
+    /// `broker_order_id` is what [`Broker::place_entry`] returned;
+    /// `broker_trade_id` is the upstream `BrokerTrade.id` if the
+    /// worker has already snapshotted it onto the
+    /// `EntryAttempt` row (it does so on the first lookup that
+    /// finds the attempt as an open trade).
+    ///
+    /// Algorithm (same on both brokers):
+    /// 1. If any pending order has `id == broker_order_id` → `Pending`.
+    /// 2. If any open trade has `originating_order_id ==
+    ///    Some(broker_order_id)` → `OpenPosition { broker_trade_id:
+    ///    trade.id }`. **Match via `originating_order_id`, not
+    ///    `trade.id` — on TradeNation those differ (PositionID vs
+    ///    OrderID).**
+    /// 3. Otherwise, if we have a stored `broker_trade_id`, look it
+    ///    up in `get_closed_trades` and bucket realised P&L:
+    ///    `> 0` → `ClosedWin`, `<= 0` → `ClosedLossOrBreakeven`.
+    /// 4. Otherwise → `Cancelled` (or `Unknown` if we never
+    ///    snapshotted a trade id).
+    fn lookup_attempt_state(
+        &self,
+        instrument: &str,
+        broker_order_id: &str,
+        broker_trade_id: Option<&str>,
+    ) -> impl Future<Output = Result<AttemptState, LookupError>>;
 }
