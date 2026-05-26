@@ -129,7 +129,7 @@ mod tests {
                 from: PriceAnchor::Close,
                 offset_r: 2.0,
             }),
-            risk_pct: Some(0.5),
+            risk_pct: Some(Tunable::Static(0.5)),
             risk_amount: None,
             size_units: None,
             dry_run: None,

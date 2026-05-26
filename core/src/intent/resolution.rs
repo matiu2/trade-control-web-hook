@@ -4,6 +4,8 @@
 use chrono::{DateTime, Utc};
 
 use super::{Action, Direction, EntrySpec, Intent, Shell, TakeProfit};
+use crate::rules::{self, RhaiScope, RuleError};
+use crate::tunable::Tunable;
 
 #[cfg(test)]
 use super::{BrokerKind, PriceAnchor};
@@ -91,6 +93,18 @@ pub enum ResolveError {
     InvalidRiskAmount { value: f64 },
     /// `size_units` set to a non-positive / non-finite value.
     InvalidSizeUnits { value: f64 },
+    /// A `Tunable::Script` on the intent failed to evaluate. Carries
+    /// the field name and short error kind (`parse` / `eval` /
+    /// `wrong-type`) so the worker can map it to a 412 with a
+    /// telemetry-friendly outcome string.
+    ScriptFailed {
+        field: &'static str,
+        kind: &'static str,
+        message: String,
+    },
+    /// A `Tunable<f64>` field resolved to a non-positive / non-finite
+    /// value (e.g. a `risk_pct` script that returned `0.0`).
+    InvalidTunableValue { field: &'static str, value: f64 },
 }
 
 impl core::fmt::Display for ResolveError {
@@ -124,6 +138,16 @@ impl core::fmt::Display for ResolveError {
             Self::InvalidSizeUnits { value } => {
                 write!(f, "size_units must be positive and finite, got {value}")
             }
+            Self::ScriptFailed {
+                field,
+                kind,
+                message,
+            } => {
+                write!(f, "{field} script ({kind}): {message}")
+            }
+            Self::InvalidTunableValue { field, value } => {
+                write!(f, "{field} must be positive and finite, got {value}")
+            }
         }
     }
 }
@@ -156,20 +180,32 @@ impl Resolved {
             .take_profit
             .as_ref()
             .ok_or(ResolveError::MissingField("take_profit"))?;
-        let risk = match (intent.risk_pct, intent.risk_amount, intent.size_units) {
-            (None, None, None) => return Err(ResolveError::MissingField("risk_pct")),
-            (Some(pct), None, None) => RiskBudget::Percent(pct),
-            (None, Some(amount), None) => {
+        // "Exactly one sizing field set" check runs first (cheap, no
+        // script evaluation needed). The actual value of `risk_pct` —
+        // which can be a `Tunable<f64>` script — is resolved at the
+        // bottom of this function, after the geometry is finalised so
+        // scripts can reference `r_multiple` / `tp_distance` / etc.
+        let sizing_set = (
+            intent.risk_pct.is_some(),
+            intent.risk_amount.is_some(),
+            intent.size_units.is_some(),
+        );
+        let risk_amount_scalar = match sizing_set {
+            (false, false, false) => return Err(ResolveError::MissingField("risk_pct")),
+            (true, false, false) => None,
+            (false, true, false) => {
+                let amount = intent.risk_amount.unwrap_or(0.0);
                 if !amount.is_finite() || amount <= 0.0 {
                     return Err(ResolveError::InvalidRiskAmount { value: amount });
                 }
-                RiskBudget::Amount(amount)
+                Some(RiskBudget::Amount(amount))
             }
-            (None, None, Some(units)) => {
+            (false, false, true) => {
+                let units = intent.size_units.unwrap_or(0.0);
                 if !units.is_finite() || units <= 0.0 {
                     return Err(ResolveError::InvalidSizeUnits { value: units });
                 }
-                RiskBudget::Units(units)
+                Some(RiskBudget::Units(units))
             }
             // Any 2-or-3 combination of the sizing fields.
             _ => return Err(ResolveError::BothRiskModesSet),
@@ -273,18 +309,82 @@ impl Resolved {
             });
         }
 
-        Ok(Self {
+        // Build the partial Resolved that Tunable scripts evaluate
+        // against — Phase 2 bindings (`entry_price`, `r_multiple`,
+        // etc.) come from this snapshot. We rebuild it from the
+        // pieces we just computed rather than reading back from a
+        // finished Resolved, so the script sees exactly the values
+        // we're about to store.
+        let geometry_snapshot = Self {
             id: intent.id.clone(),
             not_after: intent.not_after,
             instrument: intent.instrument.clone(),
             direction,
-            entry,
+            entry: entry.clone(),
             stop_loss,
             take_profit,
-            risk,
+            // Placeholder — overwritten below once risk_pct (which
+            // may be a script that reads `r_multiple` / `tp_distance`)
+            // is resolved. Scripts never see `risk`.
+            risk: RiskBudget::Percent(0.0),
             dry_run: intent.dry_run.unwrap_or(false),
+        };
+
+        let risk = match risk_amount_scalar {
+            Some(budget) => budget,
+            None => {
+                // risk_pct branch — resolve the Tunable against the
+                // standard three-phase scope.
+                let tunable = intent
+                    .risk_pct
+                    .as_ref()
+                    .ok_or(ResolveError::MissingField("risk_pct"))?;
+                let pct =
+                    resolve_f64_tunable("risk_pct", tunable, shell, &geometry_snapshot, pip_size)?;
+                if !pct.is_finite() || pct <= 0.0 {
+                    return Err(ResolveError::InvalidTunableValue {
+                        field: "risk_pct",
+                        value: pct,
+                    });
+                }
+                RiskBudget::Percent(pct)
+            }
+        };
+
+        Ok(Self {
+            risk,
+            ..geometry_snapshot
         })
     }
+}
+
+/// Resolve a `Tunable<f64>` field against the standard three-phase
+/// scope. Maps [`RuleError`] variants onto [`ResolveError::ScriptFailed`]
+/// with a short `kind` label so the worker's outcome string matches the
+/// CLI validator's vocabulary (`parse` / `eval` / `wrong-type`).
+fn resolve_f64_tunable(
+    field: &'static str,
+    tunable: &Tunable<f64>,
+    shell: &Shell,
+    resolved: &Resolved,
+    pip_size: f64,
+) -> Result<f64, ResolveError> {
+    let engine = rules::build_engine();
+    let mut scope = RhaiScope::new();
+    rules::bind_shell_anchors(&mut scope, shell);
+    rules::bind_intent_derived(&mut scope, resolved, pip_size);
+    rules::resolve_tunable::<f64>(&engine, &mut scope, tunable).map_err(|err| {
+        let kind = match &err {
+            RuleError::Parse(_) => "parse",
+            RuleError::Eval(_) => "eval",
+            RuleError::WrongType { .. } => "wrong-type",
+        };
+        ResolveError::ScriptFailed {
+            field,
+            kind,
+            message: err.to_string(),
+        }
+    })
 }
 
 fn resolve_tp(
@@ -348,7 +448,7 @@ mod tests {
                 from: PriceAnchor::Close,
                 offset_r: 2.0,
             }),
-            risk_pct: Some(0.5),
+            risk_pct: Some(Tunable::Static(0.5)),
             risk_amount: None,
             size_units: None,
             dry_run: None,
@@ -832,5 +932,139 @@ mod tests {
             Resolved::from_intent(&intent, &shell(), 0.0001),
             Err(ResolveError::NotAnEntry)
         ));
+    }
+
+    // ---- risk_pct as Tunable ----
+
+    #[test]
+    fn risk_pct_static_path_unchanged() {
+        // Sanity: the existing tests already cover this via
+        // long_market_intent(), but pin it explicitly.
+        let intent = long_market_intent();
+        let r = Resolved::from_intent(&intent, &shell(), 0.0001).unwrap();
+        match r.risk {
+            RiskBudget::Percent(p) => assert!((p - 0.5).abs() < 1e-9),
+            other => panic!("expected Percent(0.5), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn risk_pct_script_evaluates_against_geometry() {
+        // R = 2.0 on the fixture; script picks 1.0% if R >= 2 else 0.5%.
+        let mut intent = long_market_intent();
+        intent.risk_pct = Some(Tunable::from_script(
+            "if r_multiple >= 2.0 { 1.0 } else { 0.5 }",
+        ));
+        let r = Resolved::from_intent(&intent, &shell(), 0.0001).unwrap();
+        match r.risk {
+            RiskBudget::Percent(p) => assert!((p - 1.0).abs() < 1e-9),
+            other => panic!("expected Percent(1.0), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn risk_pct_script_can_read_shell_anchors() {
+        // golden=Some(true) on a fixture-extended shell — go aggressive
+        // (1.0%) on golden, conservative (0.25%) otherwise.
+        let mut intent = long_market_intent();
+        intent.risk_pct = Some(Tunable::from_script(
+            "if golden == true { 1.0 } else { 0.25 }",
+        ));
+        let mut s = shell();
+        s.golden = Some(true);
+        let r = Resolved::from_intent(&intent, &s, 0.0001).unwrap();
+        assert!(matches!(r.risk, RiskBudget::Percent(p) if (p - 1.0).abs() < 1e-9));
+    }
+
+    #[test]
+    fn risk_pct_script_returning_zero_rejected() {
+        let mut intent = long_market_intent();
+        intent.risk_pct = Some(Tunable::from_script("0.0"));
+        match Resolved::from_intent(&intent, &shell(), 0.0001) {
+            Err(ResolveError::InvalidTunableValue { field, value }) => {
+                assert_eq!(field, "risk_pct");
+                assert_eq!(value, 0.0);
+            }
+            other => panic!("expected InvalidTunableValue, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn risk_pct_script_returning_negative_rejected() {
+        let mut intent = long_market_intent();
+        intent.risk_pct = Some(Tunable::from_script("-0.5"));
+        assert!(matches!(
+            Resolved::from_intent(&intent, &shell(), 0.0001),
+            Err(ResolveError::InvalidTunableValue {
+                field: "risk_pct",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn risk_pct_script_parse_error_surfaces() {
+        let mut intent = long_market_intent();
+        intent.risk_pct = Some(Tunable::from_script("if if if"));
+        match Resolved::from_intent(&intent, &shell(), 0.0001) {
+            Err(ResolveError::ScriptFailed { field, kind, .. }) => {
+                assert_eq!(field, "risk_pct");
+                assert_eq!(kind, "parse");
+            }
+            other => panic!("expected ScriptFailed(parse), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn risk_pct_script_wrong_return_type_surfaces() {
+        // Script returns bool, not f64.
+        let mut intent = long_market_intent();
+        intent.risk_pct = Some(Tunable::from_script("true"));
+        match Resolved::from_intent(&intent, &shell(), 0.0001) {
+            Err(ResolveError::ScriptFailed { field, kind, .. }) => {
+                assert_eq!(field, "risk_pct");
+                assert_eq!(kind, "wrong-type");
+            }
+            other => panic!("expected ScriptFailed(wrong-type), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn risk_pct_yaml_static_parses() {
+        // Wire-form regression — `risk_pct: 0.5` (no tag) must still
+        // deserialise as Static. This is the byte-identical-back-compat
+        // claim that the whole Tunable design rests on.
+        let yaml = r#"
+v: 1
+id: msg-1
+not_after: "2026-06-01T00:00:00Z"
+action: enter
+instrument: EUR_USD
+direction: long
+entry: { type: market }
+stop_loss: { from: low, offset_pips: -2.0 }
+take_profit: { from: close, offset_r: 2.0 }
+risk_pct: 0.5
+"#;
+        let intent: Intent = serde_yaml::from_str(yaml).unwrap();
+        assert!(matches!(intent.risk_pct, Some(Tunable::Static(p)) if (p - 0.5).abs() < 1e-9));
+    }
+
+    #[test]
+    fn risk_pct_yaml_script_parses() {
+        let yaml = r#"
+v: 1
+id: msg-1
+not_after: "2026-06-01T00:00:00Z"
+action: enter
+instrument: EUR_USD
+direction: long
+entry: { type: market }
+stop_loss: { from: low, offset_pips: -2.0 }
+take_profit: { from: close, offset_r: 2.0 }
+risk_pct: !script "if r_multiple >= 2.0 { 1.0 } else { 0.5 }"
+"#;
+        let intent: Intent = serde_yaml::from_str(yaml).unwrap();
+        assert!(matches!(intent.risk_pct, Some(Tunable::Script(_))));
     }
 }

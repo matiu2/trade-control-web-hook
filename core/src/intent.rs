@@ -245,8 +245,14 @@ pub struct Intent {
     /// Required for `enter` unless `risk_amount` is set. % of account
     /// equity; the server-side cap clamps it. Exactly one of
     /// `risk_pct` / `risk_amount` must be set.
+    ///
+    /// A [`Tunable<f64>`] — operators can supply a static literal
+    /// (`risk_pct: 0.5`) or a Rhai script (`risk_pct: !script "..."`)
+    /// that resolves against the standard three-phase scope (shell
+    /// anchors + derived geometry). Scripts that return a non-finite
+    /// or non-positive value are rejected at resolve time.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub risk_pct: Option<f64>,
+    pub risk_pct: Option<crate::tunable::Tunable<f64>>,
     /// Alternative to `risk_pct`: a fixed money amount to risk per
     /// trade, in the account's own currency (e.g. `1.0` for "bet $1").
     /// Useful on a live account to keep position sizes constant

@@ -890,7 +890,7 @@ fn build_enter_alert(
     // one is allowed on Intent::Enter, and the validator rejects both.
     match risk_amount {
         Some(amount) => intent.risk_amount = Some(amount),
-        None => intent.risk_pct = Some(risk_pct),
+        None => intent.risk_pct = Some(trade_control_core::tunable::Tunable::Static(risk_pct)),
     }
     if dry_run {
         intent.dry_run = Some(true);
