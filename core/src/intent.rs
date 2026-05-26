@@ -278,8 +278,14 @@ pub struct Intent {
     /// risk (`size_units * stop_distance`) and dividing by equity.
     /// Exactly one of `risk_pct` / `risk_amount` / `size_units` must
     /// be set.
+    ///
+    /// A [`Tunable<f64>`] — operators can supply a static literal
+    /// (`size_units: 0.01`) or a Rhai script (`size_units: !script
+    /// "..."`) that resolves against the standard three-phase scope
+    /// (shell anchors + derived geometry). Scripts returning a
+    /// non-finite or non-positive value are rejected at resolve time.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub size_units: Option<f64>,
+    pub size_units: Option<crate::tunable::Tunable<f64>>,
     /// When true, the worker resolves the intent, logs the sizing
     /// inputs / calculations / output, then returns success **without
     /// placing the order**. Useful for verifying new sizing modes

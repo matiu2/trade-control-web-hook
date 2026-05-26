@@ -1202,8 +1202,13 @@ mod tests {
         let mut template: Value = serde_yaml::from_str(yaml).unwrap();
         fill_missing_fields(&mut template, true).unwrap();
         let intent: Intent = serde_yaml::from_value(template).unwrap();
-        assert_eq!(intent.size_units, Some(0.01));
-        assert_eq!(intent.risk_pct, None);
+        match intent.size_units {
+            Some(trade_control_core::tunable::Tunable::Static(u)) => {
+                assert!((u - 0.01).abs() < 1e-9);
+            }
+            other => panic!("expected Static(0.01) size_units, got {other:?}"),
+        }
+        assert!(intent.risk_pct.is_none());
     }
 
     #[test]

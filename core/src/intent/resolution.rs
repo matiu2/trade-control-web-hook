@@ -182,10 +182,10 @@ impl Resolved {
             .ok_or(ResolveError::MissingField("take_profit"))?;
         // "Exactly one sizing field set" check runs first (cheap, no
         // script evaluation needed). The actual values of `risk_pct` /
-        // `risk_amount` — both can be a `Tunable<f64>` script — are
-        // resolved at the bottom of this function, after the geometry
-        // is finalised so scripts can reference `r_multiple` /
-        // `tp_distance` / etc.
+        // `risk_amount` / `size_units` — all can be a `Tunable<f64>`
+        // script — are resolved at the bottom of this function, after
+        // the geometry is finalised so scripts can reference
+        // `r_multiple` / `tp_distance` / etc.
         let sizing_set = (
             intent.risk_pct.is_some(),
             intent.risk_amount.is_some(),
@@ -194,19 +194,13 @@ impl Resolved {
         enum SizingMode {
             Pct,
             Amount,
-            Units(f64),
+            Units,
         }
         let sizing_mode = match sizing_set {
             (false, false, false) => return Err(ResolveError::MissingField("risk_pct")),
             (true, false, false) => SizingMode::Pct,
             (false, true, false) => SizingMode::Amount,
-            (false, false, true) => {
-                let units = intent.size_units.unwrap_or(0.0);
-                if !units.is_finite() || units <= 0.0 {
-                    return Err(ResolveError::InvalidSizeUnits { value: units });
-                }
-                SizingMode::Units(units)
-            }
+            (false, false, true) => SizingMode::Units,
             // Any 2-or-3 combination of the sizing fields.
             _ => return Err(ResolveError::BothRiskModesSet),
         };
@@ -331,7 +325,23 @@ impl Resolved {
         };
 
         let risk = match sizing_mode {
-            SizingMode::Units(units) => RiskBudget::Units(units),
+            SizingMode::Units => {
+                let tunable = intent
+                    .size_units
+                    .as_ref()
+                    .ok_or(ResolveError::MissingField("size_units"))?;
+                let units = resolve_f64_tunable(
+                    "size_units",
+                    tunable,
+                    shell,
+                    &geometry_snapshot,
+                    pip_size,
+                )?;
+                if !units.is_finite() || units <= 0.0 {
+                    return Err(ResolveError::InvalidSizeUnits { value: units });
+                }
+                RiskBudget::Units(units)
+            }
             SizingMode::Pct => {
                 let tunable = intent
                     .risk_pct
@@ -754,7 +764,7 @@ mod tests {
     fn size_units_resolves_to_units_budget() {
         let mut intent = long_market_intent();
         intent.risk_pct = None;
-        intent.size_units = Some(0.01);
+        intent.size_units = Some(Tunable::Static(0.01));
         let r = Resolved::from_intent(&intent, &shell(), 0.0001).unwrap();
         match r.risk {
             RiskBudget::Units(u) => assert!((u - 0.01).abs() < 1e-9),
@@ -766,7 +776,7 @@ mod tests {
     fn size_units_with_risk_pct_rejected() {
         let mut intent = long_market_intent();
         // risk_pct already Some(0.5) on the fixture.
-        intent.size_units = Some(0.01);
+        intent.size_units = Some(Tunable::Static(0.01));
         assert!(matches!(
             Resolved::from_intent(&intent, &shell(), 0.0001),
             Err(ResolveError::BothRiskModesSet)
@@ -778,7 +788,7 @@ mod tests {
         let mut intent = long_market_intent();
         intent.risk_pct = None;
         intent.risk_amount = Some(Tunable::Static(1.0));
-        intent.size_units = Some(0.01);
+        intent.size_units = Some(Tunable::Static(0.01));
         assert!(matches!(
             Resolved::from_intent(&intent, &shell(), 0.0001),
             Err(ResolveError::BothRiskModesSet)
@@ -789,7 +799,7 @@ mod tests {
     fn all_three_sizing_modes_rejected() {
         let mut intent = long_market_intent();
         intent.risk_amount = Some(Tunable::Static(1.0));
-        intent.size_units = Some(0.01);
+        intent.size_units = Some(Tunable::Static(0.01));
         assert!(matches!(
             Resolved::from_intent(&intent, &shell(), 0.0001),
             Err(ResolveError::BothRiskModesSet)
@@ -800,7 +810,7 @@ mod tests {
     fn size_units_zero_rejected() {
         let mut intent = long_market_intent();
         intent.risk_pct = None;
-        intent.size_units = Some(0.0);
+        intent.size_units = Some(Tunable::Static(0.0));
         assert!(matches!(
             Resolved::from_intent(&intent, &shell(), 0.0001),
             Err(ResolveError::InvalidSizeUnits { .. })
@@ -811,7 +821,7 @@ mod tests {
     fn size_units_negative_rejected() {
         let mut intent = long_market_intent();
         intent.risk_pct = None;
-        intent.size_units = Some(-0.01);
+        intent.size_units = Some(Tunable::Static(-0.01));
         assert!(matches!(
             Resolved::from_intent(&intent, &shell(), 0.0001),
             Err(ResolveError::InvalidSizeUnits { .. })
@@ -822,7 +832,7 @@ mod tests {
     fn size_units_nan_rejected() {
         let mut intent = long_market_intent();
         intent.risk_pct = None;
-        intent.size_units = Some(f64::NAN);
+        intent.size_units = Some(Tunable::Static(f64::NAN));
         assert!(matches!(
             Resolved::from_intent(&intent, &shell(), 0.0001),
             Err(ResolveError::InvalidSizeUnits { .. })
@@ -1216,5 +1226,133 @@ risk_amount: !script "if r_multiple >= 2.0 { 2.0 } else { 1.0 }"
 "#;
         let intent: Intent = serde_yaml::from_str(yaml).unwrap();
         assert!(matches!(intent.risk_amount, Some(Tunable::Script(_))));
+    }
+
+    // ---- size_units as Tunable ----
+
+    #[test]
+    fn size_units_static_path_unchanged() {
+        let mut intent = long_market_intent();
+        intent.risk_pct = None;
+        intent.size_units = Some(Tunable::Static(0.05));
+        let r = Resolved::from_intent(&intent, &shell(), 0.0001).unwrap();
+        match r.risk {
+            RiskBudget::Units(u) => assert!((u - 0.05).abs() < 1e-9),
+            other => panic!("expected Units(0.05), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn size_units_script_evaluates_against_geometry() {
+        // R = 2.0 on the fixture; scale size with R.
+        let mut intent = long_market_intent();
+        intent.risk_pct = None;
+        intent.size_units = Some(Tunable::from_script(
+            "if r_multiple >= 2.0 { 0.02 } else { 0.01 }",
+        ));
+        let r = Resolved::from_intent(&intent, &shell(), 0.0001).unwrap();
+        match r.risk {
+            RiskBudget::Units(u) => assert!((u - 0.02).abs() < 1e-9),
+            other => panic!("expected Units(0.02), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn size_units_script_can_read_shell_anchors() {
+        let mut intent = long_market_intent();
+        intent.risk_pct = None;
+        intent.size_units = Some(Tunable::from_script(
+            "if golden == true { 0.05 } else { 0.01 }",
+        ));
+        let mut s = shell();
+        s.golden = Some(true);
+        let r = Resolved::from_intent(&intent, &s, 0.0001).unwrap();
+        assert!(matches!(r.risk, RiskBudget::Units(u) if (u - 0.05).abs() < 1e-9));
+    }
+
+    #[test]
+    fn size_units_script_returning_zero_rejected() {
+        let mut intent = long_market_intent();
+        intent.risk_pct = None;
+        intent.size_units = Some(Tunable::from_script("0.0"));
+        match Resolved::from_intent(&intent, &shell(), 0.0001) {
+            Err(ResolveError::InvalidSizeUnits { value }) => assert_eq!(value, 0.0),
+            other => panic!("expected InvalidSizeUnits, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn size_units_script_returning_negative_rejected() {
+        let mut intent = long_market_intent();
+        intent.risk_pct = None;
+        intent.size_units = Some(Tunable::from_script("-0.01"));
+        assert!(matches!(
+            Resolved::from_intent(&intent, &shell(), 0.0001),
+            Err(ResolveError::InvalidSizeUnits { .. })
+        ));
+    }
+
+    #[test]
+    fn size_units_script_parse_error_surfaces() {
+        let mut intent = long_market_intent();
+        intent.risk_pct = None;
+        intent.size_units = Some(Tunable::from_script("if if if"));
+        match Resolved::from_intent(&intent, &shell(), 0.0001) {
+            Err(ResolveError::ScriptFailed { field, kind, .. }) => {
+                assert_eq!(field, "size_units");
+                assert_eq!(kind, "parse");
+            }
+            other => panic!("expected ScriptFailed(parse), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn size_units_script_wrong_return_type_surfaces() {
+        let mut intent = long_market_intent();
+        intent.risk_pct = None;
+        intent.size_units = Some(Tunable::from_script("true"));
+        match Resolved::from_intent(&intent, &shell(), 0.0001) {
+            Err(ResolveError::ScriptFailed { field, kind, .. }) => {
+                assert_eq!(field, "size_units");
+                assert_eq!(kind, "wrong-type");
+            }
+            other => panic!("expected ScriptFailed(wrong-type), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn size_units_yaml_static_parses() {
+        let yaml = r#"
+v: 1
+id: msg-1
+not_after: "2026-06-01T00:00:00Z"
+action: enter
+instrument: EUR_USD
+direction: long
+entry: { type: market }
+stop_loss: { from: low, offset_pips: -2.0 }
+take_profit: { from: close, offset_r: 2.0 }
+size_units: 0.01
+"#;
+        let intent: Intent = serde_yaml::from_str(yaml).unwrap();
+        assert!(matches!(intent.size_units, Some(Tunable::Static(u)) if (u - 0.01).abs() < 1e-9));
+    }
+
+    #[test]
+    fn size_units_yaml_script_parses() {
+        let yaml = r#"
+v: 1
+id: msg-1
+not_after: "2026-06-01T00:00:00Z"
+action: enter
+instrument: EUR_USD
+direction: long
+entry: { type: market }
+stop_loss: { from: low, offset_pips: -2.0 }
+take_profit: { from: close, offset_r: 2.0 }
+size_units: !script "if r_multiple >= 2.0 { 0.02 } else { 0.01 }"
+"#;
+        let intent: Intent = serde_yaml::from_str(yaml).unwrap();
+        assert!(matches!(intent.size_units, Some(Tunable::Script(_))));
     }
 }

@@ -72,6 +72,11 @@ pub fn validate(intent: &Intent) -> Vec<ScriptError> {
     {
         errors.push(e);
     }
+    if let Some(t) = &intent.size_units
+        && let Some(e) = check_one::<f64>("size_units", t, &shell, &resolved, pip_size)
+    {
+        errors.push(e);
+    }
     // Future per-field tunables go here as additional check_one calls.
 
     errors
@@ -346,6 +351,38 @@ mod tests {
         let fields: Vec<&str> = errs.iter().map(|e| e.field).collect();
         assert!(fields.contains(&"risk_pct"));
         assert!(fields.contains(&"risk_amount"));
+    }
+
+    #[test]
+    fn size_units_script_passes_when_valid() {
+        let mut intent = intent_with_allow_entry(None);
+        intent.risk_pct = None;
+        intent.size_units = Some(Tunable::from_script(
+            "if r_multiple >= 2.0 { 0.02 } else { 0.01 }",
+        ));
+        assert!(validate(&intent).is_empty());
+    }
+
+    #[test]
+    fn size_units_script_parse_error_surfaces() {
+        let mut intent = intent_with_allow_entry(None);
+        intent.risk_pct = None;
+        intent.size_units = Some(Tunable::from_script("if if if"));
+        let errs = validate(&intent);
+        assert_eq!(errs.len(), 1);
+        assert_eq!(errs[0].field, "size_units");
+        assert_eq!(errs[0].kind, "parse");
+    }
+
+    #[test]
+    fn size_units_script_wrong_type_surfaces() {
+        let mut intent = intent_with_allow_entry(None);
+        intent.risk_pct = None;
+        intent.size_units = Some(Tunable::from_script("true"));
+        let errs = validate(&intent);
+        assert_eq!(errs.len(), 1);
+        assert_eq!(errs[0].field, "size_units");
+        assert_eq!(errs[0].kind, "wrong-type");
     }
 
     #[test]
