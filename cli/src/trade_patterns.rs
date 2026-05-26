@@ -269,6 +269,15 @@ pub struct TradeSpec {
     /// the operator extends the window.
     #[serde(default = "default_entry_deadline_pct")]
     pub entry_deadline_pct: u32,
+    /// Rhai script that gates entry placement. Lands on
+    /// `Intent::allow_entry` as `Tunable::Script(...)`. The shell-side
+    /// vocabulary (`signal_confirmed`, `pattern_range`, `tp_distance`,
+    /// `r_multiple`, etc.) is documented in `core::rules`. Omit to let
+    /// the worker fall through to the unconditional accept default.
+    /// Static-bool isn't supported here because the only sensible value
+    /// is a script — a literal `true` would just be redundant.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allow_entry: Option<String>,
 }
 
 fn default_broker() -> BrokerKind {
@@ -493,6 +502,7 @@ fn build_pattern(
         sl_offset_pips: Some(sl_offset_pips),
         tp_price,
         entry_deadline_pct,
+        allow_entry: None,
     };
     assemble_trade(spec, geometry, entry_offset_pips, sl_offset_pips, now)
 }
@@ -565,6 +575,7 @@ fn assemble_trade(
         spec.risk_amount,
         spec.dry_run,
         spec.max_retries,
+        spec.allow_entry.as_deref(),
         &spec.skip_preps,
         &spec.broker,
         &spec.account,
@@ -866,6 +877,7 @@ fn build_enter_alert(
     risk_amount: Option<f64>,
     dry_run: bool,
     max_retries: Option<u32>,
+    allow_entry: Option<&str>,
     skip_preps: &[String],
     broker: &BrokerKind,
     account: &str,
@@ -906,6 +918,7 @@ fn build_enter_alert(
         intent.dry_run = Some(true);
     }
     intent.max_retries = max_retries.map(trade_control_core::tunable::Tunable::Static);
+    intent.allow_entry = allow_entry.map(trade_control_core::tunable::Tunable::from_script);
     intent.requires_preps = ["break-and-close", "retest"]
         .into_iter()
         .filter(|step| !skip_preps.iter().any(|s| s == step))
@@ -1046,6 +1059,7 @@ mod tests {
                 None,
                 false,
                 None,
+                None,
                 &[],
                 &BrokerKind::Oanda,
                 "demo",
@@ -1071,6 +1085,7 @@ mod tests {
                 sl_offset_pips: Some(1.0),
                 tp_price: 1.0500,
                 entry_deadline_pct: DEFAULT_ENTRY_DEADLINE_PCT,
+                allow_entry: None,
             },
         };
         let manifest = render_manifest(&trade);
@@ -1099,6 +1114,7 @@ mod tests {
             1.0,
             None,
             false,
+            None,
             None,
             &[],
             &BrokerKind::Oanda,
@@ -1159,6 +1175,7 @@ mod tests {
             1.0,
             None,
             false,
+            None,
             None,
             &[],
             &BrokerKind::Oanda,
@@ -1228,6 +1245,7 @@ mod tests {
             sl_offset_pips: None,
             tp_price: 1.0500,
             entry_deadline_pct: 80,
+            allow_entry: None,
         }
     }
 
@@ -1389,6 +1407,61 @@ tp_price: 1.05
                 alert.basename
             );
         }
+    }
+
+    #[test]
+    fn build_trade_from_spec_threads_allow_entry_script_onto_enter_intent() {
+        // A spec-level `allow_entry` string lands on the enter intent
+        // as a `Tunable::Script`. Vetos and preps must not carry it —
+        // they don't gate broker orders.
+        let now = ts("2026-05-20T00:00:00Z");
+        let mut spec = sample_spec(TradePattern::Hs, ts("2026-05-25T00:00:00Z"));
+        spec.allow_entry = Some("signal_confirmed".into());
+        let trade = build_trade_from_spec(spec, now).unwrap();
+        let enter = trade.alerts.last().unwrap();
+        match &enter.intent.allow_entry {
+            Some(trade_control_core::tunable::Tunable::Script(s)) => {
+                assert_eq!(s.source, "signal_confirmed");
+            }
+            other => panic!("expected Script allow_entry, got {other:?}"),
+        }
+        for alert in trade.alerts.iter().take(trade.alerts.len() - 1) {
+            assert!(
+                alert.intent.allow_entry.is_none(),
+                "non-enter alert {} carried allow_entry",
+                alert.basename
+            );
+        }
+    }
+
+    #[test]
+    fn build_trade_from_spec_rejects_invalid_allow_entry_script() {
+        // Sign-time validation catches a parse error in `allow_entry`
+        // before any alert is signed. This is the contract operators
+        // rely on when authoring spec yaml.
+        let now = ts("2026-05-20T00:00:00Z");
+        let mut spec = sample_spec(TradePattern::Hs, ts("2026-05-25T00:00:00Z"));
+        spec.allow_entry = Some("if foo {{{ bad".into());
+        let err = build_trade_from_spec(spec, now).unwrap_err();
+        assert!(err.to_string().contains("allow_entry"), "got {err}");
+    }
+
+    #[test]
+    fn trade_spec_yaml_script_tag_parses_into_allow_entry() {
+        // YAML with the `!script` tag deserialises as
+        // `Option<String>` containing the source. (TradeSpec carries
+        // the raw string and the builder wraps it; we want the spec
+        // shape to accept the same wire form an operator would write.)
+        let yaml = "\
+pattern: hs
+instrument: EUR_USD
+account: demo
+trade_expiry: \"2026-05-25T00:00:00Z\"
+tp_price: 1.05
+allow_entry: \"signal_confirmed\"
+";
+        let spec: TradeSpec = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(spec.allow_entry.as_deref(), Some("signal_confirmed"));
     }
 
     #[test]

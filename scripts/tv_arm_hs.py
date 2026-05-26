@@ -275,7 +275,10 @@ def write_trade_spec(spec: dict, path: Path) -> None:
     lines = []
     for k, v in spec.items():
         if isinstance(v, str):
-            lines.append(f'{k}: "{v}"')
+            # Escape backslashes and double-quotes so script sources
+            # (e.g. allow_entry) survive YAML double-quoted parsing.
+            escaped = v.replace("\\", "\\\\").replace('"', '\\"')
+            lines.append(f'{k}: "{escaped}"')
         elif isinstance(v, bool):
             lines.append(f"{k}: {'true' if v else 'false'}")
         elif isinstance(v, float):
@@ -768,6 +771,16 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
              "keeps today's single-shot behaviour. Bounded by trade_expiry.",
     )
     p.add_argument(
+        "--entry-filter-script", dest="entry_filter_script", default=None,
+        help="Rhai script that gates whether the worker places the entry "
+             "order. Lands on the enter intent's `allow_entry` as a "
+             "Tunable::Script. Common patterns: 'signal_confirmed' (only "
+             "fire on confirmed signals), or "
+             "'signal_confirmed || pct(signal_range, tp_distance) >= 10' "
+             "(confirmed, or candle large enough to skip waiting). "
+             "Validated at sign-time — a bad script blocks the build.",
+    )
+    p.add_argument(
         "--skip-break-and-close", action="store_true",
         help="Drop the break-and-close prep from the bundle (no alert "
              "emitted and the entry no longer requires it). Use when "
@@ -872,6 +885,8 @@ def main(argv: Optional[list[str]] = None) -> int:
         spec["dry_run"] = True
     if args.max_retries is not None:
         spec["max_retries"] = args.max_retries
+    if args.entry_filter_script is not None:
+        spec["allow_entry"] = args.entry_filter_script
     if skip_preps:
         spec["skip_preps"] = skip_preps
     write_trade_spec(spec, spec_path)
@@ -909,6 +924,8 @@ def main(argv: Optional[list[str]] = None) -> int:
         print(f"# skipped preps (not in bundle): {', '.join(skip_preps)}")
     if args.max_retries is not None:
         print(f"# max_retries: {args.max_retries}")
+    if args.entry_filter_script is not None:
+        print(f"# allow_entry script: {args.entry_filter_script}")
     print()
 
     payloads = []
