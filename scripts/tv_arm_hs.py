@@ -842,12 +842,15 @@ def main(argv: Optional[list[str]] = None) -> int:
     drawings = list_drawings()
     roles = classify(drawings)
 
+    # A skipped prep doesn't need a drawing — the bundle won't include
+    # that alert and the entry doesn't require it. So drop the
+    # corresponding drawing from the required-drawings check.
     missing = []
     if roles.invalidation is None:
         missing.append("horizontal_line labeled 'too-high' or 'too-low'")
-    if roles.break_and_close is None:
+    if roles.break_and_close is None and not args.skip_break_and_close:
         missing.append("trend_line labeled 'neckline' (or 'break-and-close')")
-    if roles.retest is None:
+    if roles.retest is None and not args.skip_retest:
         missing.append("trend_line labeled 'retest'")
     if roles.tp_fib is None:
         missing.append("fib_retracement (TP)")
@@ -859,8 +862,9 @@ def main(argv: Optional[list[str]] = None) -> int:
             print(f"  - {m}", file=sys.stderr)
         return 1
 
-    assert (roles.invalidation and roles.break_and_close and roles.retest
-            and roles.tp_fib and roles.trade_expiry)
+    assert roles.invalidation and roles.tp_fib and roles.trade_expiry
+    assert args.skip_break_and_close or roles.break_and_close
+    assert args.skip_retest or roles.retest
 
     inv_label = roles.invalidation_label or ""
     direction = direction_from_invalidation_label(inv_label)
