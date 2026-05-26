@@ -62,9 +62,7 @@ pub fn validate(intent: &Intent) -> Vec<ScriptError> {
     {
         errors.push(e);
     }
-    if let Some(t) = &intent.risk_pct
-        && let Some(e) = check_one::<f64>("risk_pct", t, &shell, &resolved, pip_size)
-    {
+    if let Some(e) = check_one::<f64>("risk_pct", &intent.risk_pct, &shell, &resolved, pip_size) {
         errors.push(e);
     }
     if let Some(t) = &intent.risk_amount
@@ -96,9 +94,7 @@ pub fn validate(intent: &Intent) -> Vec<ScriptError> {
     {
         errors.push(e);
     }
-    if let Some(t) = &intent.ttl_hours
-        && let Some(e) = check_one::<u32>("ttl_hours", t, &shell, &resolved, pip_size)
-    {
+    if let Some(e) = check_one::<u32>("ttl_hours", &intent.ttl_hours, &shell, &resolved, pip_size) {
         errors.push(e);
     }
     // Future per-field tunables go here as additional check_one calls.
@@ -208,7 +204,7 @@ mod tests {
             take_profit: Some(TakeProfit::Anchored(PriceRef::Absolute {
                 absolute: 1.1044,
             })),
-            risk_pct: Some(Tunable::Static(0.5)),
+            risk_pct: Tunable::Static(0.5),
             risk_amount: None,
             size_units: None,
             dry_run: None,
@@ -218,7 +214,7 @@ mod tests {
             account: None,
             step: None,
             name: None,
-            ttl_hours: None,
+            ttl_hours: Tunable::Static(0),
             level: None,
             requires_preps: Vec::new(),
             vetos: Vec::new(),
@@ -291,16 +287,14 @@ mod tests {
     #[test]
     fn risk_pct_script_passes_when_valid() {
         let mut intent = intent_with_allow_entry(None);
-        intent.risk_pct = Some(Tunable::from_script(
-            "if r_multiple >= 2.0 { 1.0 } else { 0.5 }",
-        ));
+        intent.risk_pct = Tunable::from_script("if r_multiple >= 2.0 { 1.0 } else { 0.5 }");
         assert!(validate(&intent).is_empty());
     }
 
     #[test]
     fn risk_pct_script_parse_error_surfaces() {
         let mut intent = intent_with_allow_entry(None);
-        intent.risk_pct = Some(Tunable::from_script("if if if"));
+        intent.risk_pct = Tunable::from_script("if if if");
         let errs = validate(&intent);
         assert_eq!(errs.len(), 1);
         assert_eq!(errs[0].field, "risk_pct");
@@ -311,7 +305,7 @@ mod tests {
     fn risk_pct_script_wrong_type_surfaces() {
         // Script returns bool, risk_pct expects f64.
         let mut intent = intent_with_allow_entry(None);
-        intent.risk_pct = Some(Tunable::from_script("true"));
+        intent.risk_pct = Tunable::from_script("true");
         let errs = validate(&intent);
         assert_eq!(errs.len(), 1);
         assert_eq!(errs[0].field, "risk_pct");
@@ -323,7 +317,7 @@ mod tests {
         // The validator doesn't short-circuit — operators get the full
         // punch list rather than fix-one-find-the-next.
         let mut intent = intent_with_allow_entry(Some(Tunable::from_script("if if if")));
-        intent.risk_pct = Some(Tunable::from_script("nope"));
+        intent.risk_pct = Tunable::from_script("nope");
         let errs = validate(&intent);
         assert_eq!(errs.len(), 2);
         let fields: Vec<&str> = errs.iter().map(|e| e.field).collect();
@@ -334,7 +328,6 @@ mod tests {
     #[test]
     fn risk_amount_script_passes_when_valid() {
         let mut intent = intent_with_allow_entry(None);
-        intent.risk_pct = None;
         intent.risk_amount = Some(Tunable::from_script(
             "if r_multiple >= 2.0 { 2.0 } else { 1.0 }",
         ));
@@ -344,7 +337,6 @@ mod tests {
     #[test]
     fn risk_amount_script_parse_error_surfaces() {
         let mut intent = intent_with_allow_entry(None);
-        intent.risk_pct = None;
         intent.risk_amount = Some(Tunable::from_script("if if if"));
         let errs = validate(&intent);
         assert_eq!(errs.len(), 1);
@@ -356,7 +348,6 @@ mod tests {
     fn risk_amount_script_wrong_type_surfaces() {
         // Script returns bool, risk_amount expects f64.
         let mut intent = intent_with_allow_entry(None);
-        intent.risk_pct = None;
         intent.risk_amount = Some(Tunable::from_script("true"));
         let errs = validate(&intent);
         assert_eq!(errs.len(), 1);
@@ -366,12 +357,12 @@ mod tests {
 
     #[test]
     fn risk_pct_and_risk_amount_both_failing_produces_two_errors() {
-        // The validator doesn't enforce the "exactly one sizing field"
-        // rule — that's the resolver's job. So setting both with broken
-        // scripts surfaces both, regardless of the mutual-exclusion
-        // contract elsewhere.
+        // Each field is validated independently — broken scripts on
+        // both surface both errors. (Sizing-mode selection is the
+        // resolver's job; risk_amount supersedes risk_pct's default
+        // there, but that doesn't affect script-validity checks.)
         let mut intent = intent_with_allow_entry(None);
-        intent.risk_pct = Some(Tunable::from_script("nope"));
+        intent.risk_pct = Tunable::from_script("nope");
         intent.risk_amount = Some(Tunable::from_script("also nope"));
         let errs = validate(&intent);
         assert_eq!(errs.len(), 2);
@@ -383,7 +374,6 @@ mod tests {
     #[test]
     fn size_units_script_passes_when_valid() {
         let mut intent = intent_with_allow_entry(None);
-        intent.risk_pct = None;
         intent.size_units = Some(Tunable::from_script(
             "if r_multiple >= 2.0 { 0.02 } else { 0.01 }",
         ));
@@ -393,7 +383,6 @@ mod tests {
     #[test]
     fn size_units_script_parse_error_surfaces() {
         let mut intent = intent_with_allow_entry(None);
-        intent.risk_pct = None;
         intent.size_units = Some(Tunable::from_script("if if if"));
         let errs = validate(&intent);
         assert_eq!(errs.len(), 1);
@@ -404,7 +393,6 @@ mod tests {
     #[test]
     fn size_units_script_wrong_type_surfaces() {
         let mut intent = intent_with_allow_entry(None);
-        intent.risk_pct = None;
         intent.size_units = Some(Tunable::from_script("true"));
         let errs = validate(&intent);
         assert_eq!(errs.len(), 1);
@@ -504,16 +492,14 @@ mod tests {
     #[test]
     fn ttl_hours_script_passes_when_valid() {
         let mut intent = intent_with_allow_entry(None);
-        intent.ttl_hours = Some(Tunable::from_script(
-            "if signal_confirmed == true { 8 } else { 4 }",
-        ));
+        intent.ttl_hours = Tunable::from_script("if signal_confirmed == true { 8 } else { 4 }");
         assert!(validate(&intent).is_empty());
     }
 
     #[test]
     fn ttl_hours_script_parse_error_surfaces() {
         let mut intent = intent_with_allow_entry(None);
-        intent.ttl_hours = Some(Tunable::from_script("if if if"));
+        intent.ttl_hours = Tunable::from_script("if if if");
         let errs = validate(&intent);
         assert_eq!(errs.len(), 1);
         assert_eq!(errs[0].field, "ttl_hours");
@@ -523,7 +509,7 @@ mod tests {
     #[test]
     fn ttl_hours_script_wrong_type_surfaces() {
         let mut intent = intent_with_allow_entry(None);
-        intent.ttl_hours = Some(Tunable::from_script("1.5"));
+        intent.ttl_hours = Tunable::from_script("1.5");
         let errs = validate(&intent);
         assert_eq!(errs.len(), 1);
         assert_eq!(errs[0].field, "ttl_hours");

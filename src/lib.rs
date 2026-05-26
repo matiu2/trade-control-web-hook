@@ -739,12 +739,9 @@ async fn handle_prep(
     let Some(step) = verified.intent.step.as_deref() else {
         return Response::error("prep requires `step`", 400);
     };
-    if verified.intent.ttl_hours.is_none() {
-        return Response::error("prep requires `ttl_hours`", 400);
-    }
     let ttl_hours = match resolve_phase1_u32(
         "ttl_hours",
-        verified.intent.ttl_hours.as_ref(),
+        Some(&verified.intent.ttl_hours),
         &verified.shell,
         0,
     ) {
@@ -822,12 +819,9 @@ async fn handle_veto(
     let Some(name) = verified.intent.name.as_deref() else {
         return Response::error("veto requires `name`", 400);
     };
-    if verified.intent.ttl_hours.is_none() {
-        return Response::error("veto requires `ttl_hours`", 400);
-    }
     let ttl_hours = match resolve_phase1_u32(
         "ttl_hours",
-        verified.intent.ttl_hours.as_ref(),
+        Some(&verified.intent.ttl_hours),
         &verified.shell,
         0,
     ) {
@@ -921,15 +915,9 @@ async fn run_veto_with_broker<B: Broker>(
             outcome: "rejected: missing-name".into(),
         };
     };
-    if verified.intent.ttl_hours.is_none() {
-        return ActionResult::Rejected {
-            response: Response::error("veto requires `ttl_hours`", 400),
-            outcome: "rejected: missing-ttl".into(),
-        };
-    }
     let ttl_hours = match resolve_phase1_u32(
         "ttl_hours",
-        verified.intent.ttl_hours.as_ref(),
+        Some(&verified.intent.ttl_hours),
         &verified.shell,
         0,
     ) {

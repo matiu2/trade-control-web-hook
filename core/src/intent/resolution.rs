@@ -180,29 +180,24 @@ impl Resolved {
             .take_profit
             .as_ref()
             .ok_or(ResolveError::MissingField("take_profit"))?;
-        // "Exactly one sizing field set" check runs first (cheap, no
-        // script evaluation needed). The actual values of `risk_pct` /
-        // `risk_amount` / `size_units` — all can be a `Tunable<f64>`
-        // script — are resolved at the bottom of this function, after
-        // the geometry is finalised so scripts can reference
-        // `r_multiple` / `tp_distance` / etc.
-        let sizing_set = (
-            intent.risk_pct.is_some(),
-            intent.risk_amount.is_some(),
-            intent.size_units.is_some(),
-        );
+        // Sizing-mode selection. `risk_pct` is always present (default
+        // `Static(1.0)`), so it's the fallback. `risk_amount` and
+        // `size_units` are mutually exclusive with each other and with
+        // each other only — either overrides the risk_pct default. The
+        // actual values — all can be a `Tunable<f64>` script — are
+        // resolved at the bottom of this function, after the geometry
+        // is finalised so scripts can reference `r_multiple` /
+        // `tp_distance` / etc.
         enum SizingMode {
             Pct,
             Amount,
             Units,
         }
-        let sizing_mode = match sizing_set {
-            (false, false, false) => return Err(ResolveError::MissingField("risk_pct")),
-            (true, false, false) => SizingMode::Pct,
-            (false, true, false) => SizingMode::Amount,
-            (false, false, true) => SizingMode::Units,
-            // Any 2-or-3 combination of the sizing fields.
-            _ => return Err(ResolveError::BothRiskModesSet),
+        let sizing_mode = match (intent.risk_amount.is_some(), intent.size_units.is_some()) {
+            (false, false) => SizingMode::Pct,
+            (true, false) => SizingMode::Amount,
+            (false, true) => SizingMode::Units,
+            (true, true) => return Err(ResolveError::BothRiskModesSet),
         };
 
         let stop_loss = sl_ref.resolve(shell, pip_size);
@@ -351,12 +346,13 @@ impl Resolved {
                 RiskBudget::Units(units)
             }
             SizingMode::Pct => {
-                let tunable = intent
-                    .risk_pct
-                    .as_ref()
-                    .ok_or(ResolveError::MissingField("risk_pct"))?;
-                let pct =
-                    resolve_f64_tunable("risk_pct", tunable, shell, &geometry_snapshot, pip_size)?;
+                let pct = resolve_f64_tunable(
+                    "risk_pct",
+                    &intent.risk_pct,
+                    shell,
+                    &geometry_snapshot,
+                    pip_size,
+                )?;
                 if !pct.is_finite() || pct <= 0.0 {
                     return Err(ResolveError::InvalidTunableValue {
                         field: "risk_pct",
@@ -483,7 +479,7 @@ mod tests {
                 from: PriceAnchor::Close,
                 offset_r: 2.0,
             }),
-            risk_pct: Some(Tunable::Static(0.5)),
+            risk_pct: Tunable::Static(0.5),
             risk_amount: None,
             size_units: None,
             dry_run: None,
@@ -492,7 +488,7 @@ mod tests {
             broker: BrokerKind::Oanda,
             step: None,
             name: None,
-            ttl_hours: None,
+            ttl_hours: Tunable::Static(0),
             level: None,
             requires_preps: Vec::new(),
             vetos: Vec::new(),
@@ -706,19 +702,11 @@ mod tests {
     }
 
     #[test]
-    fn missing_field_rejected() {
+    fn risk_amount_overrides_risk_pct_default() {
+        // risk_pct is always present (default Static(1.0)). risk_amount,
+        // when set, supersedes it. Sanity-pin that the resolver picks
+        // Amount rather than failing or doubling up.
         let mut intent = long_market_intent();
-        intent.risk_pct = None;
-        assert!(matches!(
-            Resolved::from_intent(&intent, &shell(), 0.0001),
-            Err(ResolveError::MissingField("risk_pct"))
-        ));
-    }
-
-    #[test]
-    fn risk_amount_resolves_to_amount_budget() {
-        let mut intent = long_market_intent();
-        intent.risk_pct = None;
         intent.risk_amount = Some(Tunable::Static(1.0));
         let r = Resolved::from_intent(&intent, &shell(), 0.0001).unwrap();
         match r.risk {
@@ -728,20 +716,8 @@ mod tests {
     }
 
     #[test]
-    fn both_risk_modes_rejected() {
-        let mut intent = long_market_intent();
-        // risk_pct already Some(0.5) on the fixture; also set risk_amount.
-        intent.risk_amount = Some(Tunable::Static(1.0));
-        assert!(matches!(
-            Resolved::from_intent(&intent, &shell(), 0.0001),
-            Err(ResolveError::BothRiskModesSet)
-        ));
-    }
-
-    #[test]
     fn risk_amount_zero_rejected() {
         let mut intent = long_market_intent();
-        intent.risk_pct = None;
         intent.risk_amount = Some(Tunable::Static(0.0));
         assert!(matches!(
             Resolved::from_intent(&intent, &shell(), 0.0001),
@@ -752,7 +728,6 @@ mod tests {
     #[test]
     fn risk_amount_negative_rejected() {
         let mut intent = long_market_intent();
-        intent.risk_pct = None;
         intent.risk_amount = Some(Tunable::Static(-1.0));
         assert!(matches!(
             Resolved::from_intent(&intent, &shell(), 0.0001),
@@ -763,7 +738,6 @@ mod tests {
     #[test]
     fn risk_amount_nan_rejected() {
         let mut intent = long_market_intent();
-        intent.risk_pct = None;
         intent.risk_amount = Some(Tunable::Static(f64::NAN));
         assert!(matches!(
             Resolved::from_intent(&intent, &shell(), 0.0001),
@@ -774,7 +748,6 @@ mod tests {
     #[test]
     fn size_units_resolves_to_units_budget() {
         let mut intent = long_market_intent();
-        intent.risk_pct = None;
         intent.size_units = Some(Tunable::Static(0.01));
         let r = Resolved::from_intent(&intent, &shell(), 0.0001).unwrap();
         match r.risk {
@@ -784,30 +757,24 @@ mod tests {
     }
 
     #[test]
-    fn size_units_with_risk_pct_rejected() {
+    fn size_units_overrides_risk_pct_default() {
+        // risk_pct (default Static(1.0)) is silently overridden when
+        // size_units is set — only risk_amount and size_units are
+        // mutually exclusive post-flatten.
         let mut intent = long_market_intent();
-        // risk_pct already Some(0.5) on the fixture.
         intent.size_units = Some(Tunable::Static(0.01));
-        assert!(matches!(
-            Resolved::from_intent(&intent, &shell(), 0.0001),
-            Err(ResolveError::BothRiskModesSet)
-        ));
+        let r = Resolved::from_intent(&intent, &shell(), 0.0001).unwrap();
+        match r.risk {
+            RiskBudget::Units(u) => assert!((u - 0.01).abs() < 1e-9),
+            other => panic!("expected Units, got {other:?}"),
+        }
     }
 
     #[test]
     fn size_units_with_risk_amount_rejected() {
-        let mut intent = long_market_intent();
-        intent.risk_pct = None;
-        intent.risk_amount = Some(Tunable::Static(1.0));
-        intent.size_units = Some(Tunable::Static(0.01));
-        assert!(matches!(
-            Resolved::from_intent(&intent, &shell(), 0.0001),
-            Err(ResolveError::BothRiskModesSet)
-        ));
-    }
-
-    #[test]
-    fn all_three_sizing_modes_rejected() {
+        // The remaining mutual-exclusion edge — risk_amount and
+        // size_units cannot both be set since they're alternative
+        // sizing modes (not overrides of a default).
         let mut intent = long_market_intent();
         intent.risk_amount = Some(Tunable::Static(1.0));
         intent.size_units = Some(Tunable::Static(0.01));
@@ -820,7 +787,6 @@ mod tests {
     #[test]
     fn size_units_zero_rejected() {
         let mut intent = long_market_intent();
-        intent.risk_pct = None;
         intent.size_units = Some(Tunable::Static(0.0));
         assert!(matches!(
             Resolved::from_intent(&intent, &shell(), 0.0001),
@@ -831,7 +797,6 @@ mod tests {
     #[test]
     fn size_units_negative_rejected() {
         let mut intent = long_market_intent();
-        intent.risk_pct = None;
         intent.size_units = Some(Tunable::Static(-0.01));
         assert!(matches!(
             Resolved::from_intent(&intent, &shell(), 0.0001),
@@ -842,7 +807,6 @@ mod tests {
     #[test]
     fn size_units_nan_rejected() {
         let mut intent = long_market_intent();
-        intent.risk_pct = None;
         intent.size_units = Some(Tunable::Static(f64::NAN));
         assert!(matches!(
             Resolved::from_intent(&intent, &shell(), 0.0001),
@@ -988,9 +952,7 @@ mod tests {
     fn risk_pct_script_evaluates_against_geometry() {
         // R = 2.0 on the fixture; script picks 1.0% if R >= 2 else 0.5%.
         let mut intent = long_market_intent();
-        intent.risk_pct = Some(Tunable::from_script(
-            "if r_multiple >= 2.0 { 1.0 } else { 0.5 }",
-        ));
+        intent.risk_pct = Tunable::from_script("if r_multiple >= 2.0 { 1.0 } else { 0.5 }");
         let r = Resolved::from_intent(&intent, &shell(), 0.0001).unwrap();
         match r.risk {
             RiskBudget::Percent(p) => assert!((p - 1.0).abs() < 1e-9),
@@ -1003,9 +965,7 @@ mod tests {
         // golden=Some(true) on a fixture-extended shell — go aggressive
         // (1.0%) on golden, conservative (0.25%) otherwise.
         let mut intent = long_market_intent();
-        intent.risk_pct = Some(Tunable::from_script(
-            "if golden == true { 1.0 } else { 0.25 }",
-        ));
+        intent.risk_pct = Tunable::from_script("if golden == true { 1.0 } else { 0.25 }");
         let mut s = shell();
         s.golden = Some(true);
         let r = Resolved::from_intent(&intent, &s, 0.0001).unwrap();
@@ -1015,7 +975,7 @@ mod tests {
     #[test]
     fn risk_pct_script_returning_zero_rejected() {
         let mut intent = long_market_intent();
-        intent.risk_pct = Some(Tunable::from_script("0.0"));
+        intent.risk_pct = Tunable::from_script("0.0");
         match Resolved::from_intent(&intent, &shell(), 0.0001) {
             Err(ResolveError::InvalidTunableValue { field, value }) => {
                 assert_eq!(field, "risk_pct");
@@ -1028,7 +988,7 @@ mod tests {
     #[test]
     fn risk_pct_script_returning_negative_rejected() {
         let mut intent = long_market_intent();
-        intent.risk_pct = Some(Tunable::from_script("-0.5"));
+        intent.risk_pct = Tunable::from_script("-0.5");
         assert!(matches!(
             Resolved::from_intent(&intent, &shell(), 0.0001),
             Err(ResolveError::InvalidTunableValue {
@@ -1041,7 +1001,7 @@ mod tests {
     #[test]
     fn risk_pct_script_parse_error_surfaces() {
         let mut intent = long_market_intent();
-        intent.risk_pct = Some(Tunable::from_script("if if if"));
+        intent.risk_pct = Tunable::from_script("if if if");
         match Resolved::from_intent(&intent, &shell(), 0.0001) {
             Err(ResolveError::ScriptFailed { field, kind, .. }) => {
                 assert_eq!(field, "risk_pct");
@@ -1055,7 +1015,7 @@ mod tests {
     fn risk_pct_script_wrong_return_type_surfaces() {
         // Script returns bool, not f64.
         let mut intent = long_market_intent();
-        intent.risk_pct = Some(Tunable::from_script("true"));
+        intent.risk_pct = Tunable::from_script("true");
         match Resolved::from_intent(&intent, &shell(), 0.0001) {
             Err(ResolveError::ScriptFailed { field, kind, .. }) => {
                 assert_eq!(field, "risk_pct");
@@ -1063,6 +1023,31 @@ mod tests {
             }
             other => panic!("expected ScriptFailed(wrong-type), got {other:?}"),
         }
+    }
+
+    #[test]
+    fn risk_pct_yaml_omitted_defaults_to_one_percent() {
+        // Wire form for an operator who omits risk_pct entirely. Post-
+        // flatten, this lands as the default Static(1.0) — the
+        // operator's standard setting — instead of being a deserialise
+        // error. Same back-compat shape as max_retries / ttl_hours.
+        let yaml = r#"
+v: 1
+id: msg-1
+not_after: "2026-06-01T00:00:00Z"
+action: enter
+instrument: EUR_USD
+direction: long
+entry: { type: market }
+stop_loss: { from: low, offset_pips: -2.0 }
+take_profit: { from: close, offset_r: 2.0 }
+"#;
+        let intent: Intent = serde_yaml::from_str(yaml).unwrap();
+        assert!(matches!(intent.risk_pct, Tunable::Static(p) if (p - 1.0).abs() < 1e-9));
+        // And the serialised form drops the field — byte-identical wire
+        // to pre-flatten intents that omitted it.
+        let back = serde_yaml::to_string(&intent).unwrap();
+        assert!(!back.contains("risk_pct"));
     }
 
     #[test]
@@ -1083,7 +1068,7 @@ take_profit: { from: close, offset_r: 2.0 }
 risk_pct: 0.5
 "#;
         let intent: Intent = serde_yaml::from_str(yaml).unwrap();
-        assert!(matches!(intent.risk_pct, Some(Tunable::Static(p)) if (p - 0.5).abs() < 1e-9));
+        assert!(matches!(intent.risk_pct, Tunable::Static(p) if (p - 0.5).abs() < 1e-9));
     }
 
     #[test]
@@ -1101,7 +1086,7 @@ take_profit: { from: close, offset_r: 2.0 }
 risk_pct: !script "if r_multiple >= 2.0 { 1.0 } else { 0.5 }"
 "#;
         let intent: Intent = serde_yaml::from_str(yaml).unwrap();
-        assert!(matches!(intent.risk_pct, Some(Tunable::Script(_))));
+        assert!(matches!(intent.risk_pct, Tunable::Script(_)));
     }
 
     // ---- risk_amount as Tunable ----
@@ -1112,7 +1097,6 @@ risk_pct: !script "if r_multiple >= 2.0 { 1.0 } else { 0.5 }"
         // to RiskBudget::Amount(amount) with the same arithmetic as before
         // the Tunable promotion.
         let mut intent = long_market_intent();
-        intent.risk_pct = None;
         intent.risk_amount = Some(Tunable::Static(2.5));
         let r = Resolved::from_intent(&intent, &shell(), 0.0001).unwrap();
         match r.risk {
@@ -1126,7 +1110,6 @@ risk_pct: !script "if r_multiple >= 2.0 { 1.0 } else { 0.5 }"
         // R = 2.0 on the fixture; bet $2 if R >= 2 else $1. Proves
         // risk_amount scripts see Phase 2 bindings, same as risk_pct.
         let mut intent = long_market_intent();
-        intent.risk_pct = None;
         intent.risk_amount = Some(Tunable::from_script(
             "if r_multiple >= 2.0 { 2.0 } else { 1.0 }",
         ));
@@ -1141,7 +1124,6 @@ risk_pct: !script "if r_multiple >= 2.0 { 1.0 } else { 0.5 }"
     fn risk_amount_script_can_read_shell_anchors() {
         // Pump amount up to $5 when golden, otherwise $1.
         let mut intent = long_market_intent();
-        intent.risk_pct = None;
         intent.risk_amount = Some(Tunable::from_script(
             "if golden == true { 5.0 } else { 1.0 }",
         ));
@@ -1154,7 +1136,6 @@ risk_pct: !script "if r_multiple >= 2.0 { 1.0 } else { 0.5 }"
     #[test]
     fn risk_amount_script_returning_zero_rejected() {
         let mut intent = long_market_intent();
-        intent.risk_pct = None;
         intent.risk_amount = Some(Tunable::from_script("0.0"));
         match Resolved::from_intent(&intent, &shell(), 0.0001) {
             Err(ResolveError::InvalidRiskAmount { value }) => assert_eq!(value, 0.0),
@@ -1165,7 +1146,6 @@ risk_pct: !script "if r_multiple >= 2.0 { 1.0 } else { 0.5 }"
     #[test]
     fn risk_amount_script_returning_negative_rejected() {
         let mut intent = long_market_intent();
-        intent.risk_pct = None;
         intent.risk_amount = Some(Tunable::from_script("-1.0"));
         assert!(matches!(
             Resolved::from_intent(&intent, &shell(), 0.0001),
@@ -1176,7 +1156,6 @@ risk_pct: !script "if r_multiple >= 2.0 { 1.0 } else { 0.5 }"
     #[test]
     fn risk_amount_script_parse_error_surfaces() {
         let mut intent = long_market_intent();
-        intent.risk_pct = None;
         intent.risk_amount = Some(Tunable::from_script("if if if"));
         match Resolved::from_intent(&intent, &shell(), 0.0001) {
             Err(ResolveError::ScriptFailed { field, kind, .. }) => {
@@ -1190,7 +1169,6 @@ risk_pct: !script "if r_multiple >= 2.0 { 1.0 } else { 0.5 }"
     #[test]
     fn risk_amount_script_wrong_return_type_surfaces() {
         let mut intent = long_market_intent();
-        intent.risk_pct = None;
         intent.risk_amount = Some(Tunable::from_script("true"));
         match Resolved::from_intent(&intent, &shell(), 0.0001) {
             Err(ResolveError::ScriptFailed { field, kind, .. }) => {
@@ -1244,7 +1222,6 @@ risk_amount: !script "if r_multiple >= 2.0 { 2.0 } else { 1.0 }"
     #[test]
     fn size_units_static_path_unchanged() {
         let mut intent = long_market_intent();
-        intent.risk_pct = None;
         intent.size_units = Some(Tunable::Static(0.05));
         let r = Resolved::from_intent(&intent, &shell(), 0.0001).unwrap();
         match r.risk {
@@ -1257,7 +1234,6 @@ risk_amount: !script "if r_multiple >= 2.0 { 2.0 } else { 1.0 }"
     fn size_units_script_evaluates_against_geometry() {
         // R = 2.0 on the fixture; scale size with R.
         let mut intent = long_market_intent();
-        intent.risk_pct = None;
         intent.size_units = Some(Tunable::from_script(
             "if r_multiple >= 2.0 { 0.02 } else { 0.01 }",
         ));
@@ -1271,7 +1247,6 @@ risk_amount: !script "if r_multiple >= 2.0 { 2.0 } else { 1.0 }"
     #[test]
     fn size_units_script_can_read_shell_anchors() {
         let mut intent = long_market_intent();
-        intent.risk_pct = None;
         intent.size_units = Some(Tunable::from_script(
             "if golden == true { 0.05 } else { 0.01 }",
         ));
@@ -1284,7 +1259,6 @@ risk_amount: !script "if r_multiple >= 2.0 { 2.0 } else { 1.0 }"
     #[test]
     fn size_units_script_returning_zero_rejected() {
         let mut intent = long_market_intent();
-        intent.risk_pct = None;
         intent.size_units = Some(Tunable::from_script("0.0"));
         match Resolved::from_intent(&intent, &shell(), 0.0001) {
             Err(ResolveError::InvalidSizeUnits { value }) => assert_eq!(value, 0.0),
@@ -1295,7 +1269,6 @@ risk_amount: !script "if r_multiple >= 2.0 { 2.0 } else { 1.0 }"
     #[test]
     fn size_units_script_returning_negative_rejected() {
         let mut intent = long_market_intent();
-        intent.risk_pct = None;
         intent.size_units = Some(Tunable::from_script("-0.01"));
         assert!(matches!(
             Resolved::from_intent(&intent, &shell(), 0.0001),
@@ -1306,7 +1279,6 @@ risk_amount: !script "if r_multiple >= 2.0 { 2.0 } else { 1.0 }"
     #[test]
     fn size_units_script_parse_error_surfaces() {
         let mut intent = long_market_intent();
-        intent.risk_pct = None;
         intent.size_units = Some(Tunable::from_script("if if if"));
         match Resolved::from_intent(&intent, &shell(), 0.0001) {
             Err(ResolveError::ScriptFailed { field, kind, .. }) => {
@@ -1320,7 +1292,6 @@ risk_amount: !script "if r_multiple >= 2.0 { 2.0 } else { 1.0 }"
     #[test]
     fn size_units_script_wrong_return_type_surfaces() {
         let mut intent = long_market_intent();
-        intent.risk_pct = None;
         intent.size_units = Some(Tunable::from_script("true"));
         match Resolved::from_intent(&intent, &shell(), 0.0001) {
             Err(ResolveError::ScriptFailed { field, kind, .. }) => {

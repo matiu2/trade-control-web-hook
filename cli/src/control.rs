@@ -35,7 +35,7 @@ fn control_skeleton(action: Action, instrument: &str, id: String, now: DateTime<
         entry: None,
         stop_loss: None,
         take_profit: None,
-        risk_pct: None,
+        risk_pct: trade_control_core::tunable::Tunable::Static(1.0),
         risk_amount: None,
         size_units: None,
         dry_run: None,
@@ -44,7 +44,7 @@ fn control_skeleton(action: Action, instrument: &str, id: String, now: DateTime<
         broker: BrokerKind::Oanda,
         step: None,
         name: None,
-        ttl_hours: None,
+        ttl_hours: trade_control_core::tunable::Tunable::Static(0),
         level: None,
         requires_preps: Vec::new(),
         vetos: Vec::new(),
@@ -92,7 +92,7 @@ pub fn build_prep_intent(
     );
     let mut intent = control_skeleton(Action::Prep, instrument, id, now);
     intent.step = Some(step.to_string());
-    intent.ttl_hours = Some(trade_control_core::tunable::Tunable::Static(ttl_hours));
+    intent.ttl_hours = trade_control_core::tunable::Tunable::Static(ttl_hours);
     intent.clears = clears;
     intent
 }
@@ -116,7 +116,7 @@ pub fn build_veto_intent(
     );
     let mut intent = control_skeleton(Action::Veto, instrument, id, now);
     intent.name = Some(name.to_string());
-    intent.ttl_hours = Some(trade_control_core::tunable::Tunable::Static(ttl_hours));
+    intent.ttl_hours = trade_control_core::tunable::Tunable::Static(ttl_hours);
     intent.level = level;
     intent.clears = clears;
     intent
@@ -339,7 +339,7 @@ mod tests {
         assert_eq!(intent.instrument, "EUR_USD");
         assert_eq!(intent.step.as_deref(), Some("break-and-close"));
         match &intent.ttl_hours {
-            Some(trade_control_core::tunable::Tunable::Static(n)) => assert_eq!(*n, 4),
+            trade_control_core::tunable::Tunable::Static(n) => assert_eq!(*n, 4),
             other => panic!("expected Static(4) ttl_hours, got {other:?}"),
         }
         assert!(intent.clears.is_empty());
@@ -373,7 +373,7 @@ mod tests {
         assert_eq!(intent.action, Action::Veto);
         assert_eq!(intent.name.as_deref(), Some("news-window"));
         match &intent.ttl_hours {
-            Some(trade_control_core::tunable::Tunable::Static(n)) => assert_eq!(*n, 6),
+            trade_control_core::tunable::Tunable::Static(n) => assert_eq!(*n, 6),
             other => panic!("expected Static(6) ttl_hours, got {other:?}"),
         }
         assert!(intent.clears.is_empty());
@@ -387,7 +387,10 @@ mod tests {
         let intent = build_clear_prep_intent("EUR_USD", "retest", t(), "ef56");
         assert_eq!(intent.action, Action::ClearPrep);
         assert_eq!(intent.step.as_deref(), Some("retest"));
-        assert_eq!(intent.ttl_hours, None);
+        assert!(matches!(
+            intent.ttl_hours,
+            trade_control_core::tunable::Tunable::Static(0)
+        ));
     }
 
     #[test]

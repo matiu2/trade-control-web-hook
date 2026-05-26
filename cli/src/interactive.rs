@@ -1186,7 +1186,13 @@ mod tests {
             }
             other => panic!("expected Static(1.0) risk_amount, got {other:?}"),
         }
-        assert!(intent.risk_pct.is_none());
+        // risk_pct is always present post-flatten — falls back to the
+        // default Static(1.0) when omitted from the YAML. The worker's
+        // sizing-mode selector picks risk_amount and ignores it.
+        assert!(matches!(
+            intent.risk_pct,
+            trade_control_core::tunable::Tunable::Static(p) if (p - 1.0).abs() < 1e-9
+        ));
     }
 
     #[test]
@@ -1213,7 +1219,12 @@ mod tests {
             }
             other => panic!("expected Static(0.01) size_units, got {other:?}"),
         }
-        assert!(intent.risk_pct.is_none());
+        // Same as the risk_amount path — risk_pct is always present,
+        // and the worker silently skips it when size_units is set.
+        assert!(matches!(
+            intent.risk_pct,
+            trade_control_core::tunable::Tunable::Static(p) if (p - 1.0).abs() < 1e-9
+        ));
     }
 
     #[test]

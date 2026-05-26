@@ -251,17 +251,22 @@ pub struct Intent {
     /// Required for `enter`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub take_profit: Option<TakeProfit>,
-    /// Required for `enter` unless `risk_amount` is set. % of account
-    /// equity; the server-side cap clamps it. Exactly one of
-    /// `risk_pct` / `risk_amount` must be set.
+    /// Risk per trade as % of account equity; the server-side cap
+    /// clamps it. Defaults to `Tunable::Static(1.0)` — 1% — which is
+    /// the operator's standard setting. `risk_amount` and `size_units`,
+    /// when set, override this (they're mutually exclusive with each
+    /// other, but either supersedes the risk_pct default).
     ///
     /// A [`Tunable<f64>`] — operators can supply a static literal
     /// (`risk_pct: 0.5`) or a Rhai script (`risk_pct: !script "..."`)
     /// that resolves against the standard three-phase scope (shell
     /// anchors + derived geometry). Scripts that return a non-finite
     /// or non-positive value are rejected at resolve time.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub risk_pct: Option<crate::tunable::Tunable<f64>>,
+    #[serde(
+        default = "default_risk_pct",
+        skip_serializing_if = "is_default_risk_pct"
+    )]
+    pub risk_pct: crate::tunable::Tunable<f64>,
     /// Alternative to `risk_pct`: a fixed money amount to risk per
     /// trade, in the account's own currency (e.g. `1.0` for "bet $1").
     /// Useful on a live account to keep position sizes constant
@@ -345,15 +350,18 @@ pub struct Intent {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
     /// Required for `prep` / `veto`. TTL in hours for the flag.
+    /// Default is `Static(0)` — the wire-elided sentinel that means
+    /// "not set"; validation rejects it on prep/veto. Other actions
+    /// ignore the field. Scripts always count as opted-in, so a script
+    /// that happens to resolve to 0 produces a TTL of 0 ("expire
+    /// immediately") rather than being treated as the default.
     ///
     /// A [`Tunable<u32>`] — operators can supply a static literal
     /// (`ttl_hours: 6`) or a Rhai script (`ttl_hours: !script "..."`)
     /// that resolves against Phase 1 scope only (shell anchors —
-    /// prep/veto run without geometry). Scripts returning zero are
-    /// accepted (a TTL of 0 means "expire immediately" — operators
-    /// who want to reject zero should script it in).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub ttl_hours: Option<crate::tunable::Tunable<u32>>,
+    /// prep/veto run without geometry).
+    #[serde(default, skip_serializing_if = "is_default_ttl_hours")]
+    pub ttl_hours: crate::tunable::Tunable<u32>,
     /// Escalation level for a `veto` action. Default is
     /// [`VetoLevel::StopNextEntry`] (flag-only, no broker side effects).
     /// Higher levels also cancel pending orders and/or close positions
@@ -463,6 +471,27 @@ fn is_default_max_retries(t: &crate::tunable::Tunable<u32>) -> bool {
     matches!(t, crate::tunable::Tunable::Static(0))
 }
 
+/// Default `risk_pct` — 1% per trade is the operator's standard
+/// setting, so we ship it as the default and only require operators to
+/// write the field when they want something different.
+fn default_risk_pct() -> crate::tunable::Tunable<f64> {
+    crate::tunable::Tunable::Static(1.0)
+}
+
+/// Skip-serializing predicate for [`Intent::risk_pct`]. Returns true on
+/// the default `Static(1.0)` so the wire form stays byte-identical to
+/// intents that omit the field. Scripts are never elided.
+fn is_default_risk_pct(t: &crate::tunable::Tunable<f64>) -> bool {
+    matches!(t, crate::tunable::Tunable::Static(v) if *v == 1.0)
+}
+
+/// Skip-serializing predicate for [`Intent::ttl_hours`]. `Static(0)` is
+/// the "not set" sentinel — required on prep/veto (validated), ignored
+/// elsewhere. Scripts are never elided.
+fn is_default_ttl_hours(t: &crate::tunable::Tunable<u32>) -> bool {
+    matches!(t, crate::tunable::Tunable::Static(0))
+}
+
 /// Maximum length of a `trade_id` slug. 64 chars is plenty for
 /// `<instrument>-<direction>-<short-random>` style ids and keeps the
 /// seen-index entry small.
@@ -504,6 +533,9 @@ pub enum IntentValidationError {
     /// `needs_golden: true` on a non-Enter action — the gate is only
     /// checked on `enter`.
     NeedsGoldenOnNonEnter,
+    /// `ttl_hours` missing (i.e. defaulted to `Static(0)`) on a prep or
+    /// veto action where it's required to set the KV flag's lifetime.
+    MissingTtlHours,
 }
 
 impl core::fmt::Display for IntentValidationError {
@@ -521,6 +553,7 @@ impl core::fmt::Display for IntentValidationError {
             Self::NeedsGoldenOnNonEnter => {
                 f.write_str("needs_golden is only valid on action: enter")
             }
+            Self::MissingTtlHours => f.write_str("ttl_hours is required on prep / veto actions"),
         }
     }
 }
@@ -555,6 +588,17 @@ impl Intent {
         }
         if self.needs_golden && self.action != Action::Enter {
             return Err(IntentValidationError::NeedsGoldenOnNonEnter);
+        }
+        // ttl_hours is required for prep / veto: the KV flag we write
+        // expires on this clock. `Static(0)` is the wire-elided default
+        // sentinel meaning "operator didn't set it" — reject. Scripts
+        // are accepted unconditionally; the operator who wrote a script
+        // meant it, even if it might resolve to 0 at gate time (treated
+        // there as "expire immediately").
+        if matches!(self.action, Action::Prep | Action::Veto)
+            && is_default_ttl_hours(&self.ttl_hours)
+        {
+            return Err(IntentValidationError::MissingTtlHours);
         }
         Ok(())
     }
@@ -1110,7 +1154,7 @@ mod tests {
         assert_eq!(intent.action, Action::Prep);
         assert_eq!(intent.step.as_deref(), Some("break-and-close"));
         match &intent.ttl_hours {
-            Some(crate::tunable::Tunable::Static(n)) => assert_eq!(*n, 4),
+            crate::tunable::Tunable::Static(n) => assert_eq!(*n, 4),
             other => panic!("expected Static(4) ttl_hours, got {other:?}"),
         }
     }
@@ -1182,7 +1226,7 @@ mod tests {
         assert_eq!(intent.action, Action::Veto);
         assert_eq!(intent.name.as_deref(), Some("news-window"));
         match &intent.ttl_hours {
-            Some(crate::tunable::Tunable::Static(n)) => assert_eq!(*n, 6),
+            crate::tunable::Tunable::Static(n) => assert_eq!(*n, 6),
             other => panic!("expected Static(6) ttl_hours, got {other:?}"),
         }
     }
@@ -1569,6 +1613,81 @@ mod tests {
             intent.validate(),
             Err(IntentValidationError::MaxRetriesOnNonEnter)
         );
+    }
+
+    #[test]
+    fn validate_rejects_missing_ttl_hours_on_prep() {
+        // Prep without ttl_hours: the field defaults to Static(0) which
+        // is the wire-elided sentinel meaning "not set" — required on
+        // prep/veto where the KV flag needs a lifetime.
+        let yaml = "
+            v: 1
+            id: prep-no-ttl
+            not_after: \"2026-05-13T20:00:00Z\"
+            action: prep
+            instrument: EUR_USD
+            step: break-and-close
+        ";
+        let intent: Intent = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(
+            intent.validate(),
+            Err(IntentValidationError::MissingTtlHours)
+        );
+    }
+
+    #[test]
+    fn validate_rejects_missing_ttl_hours_on_veto() {
+        let yaml = "
+            v: 1
+            id: veto-no-ttl
+            not_after: \"2026-05-13T20:00:00Z\"
+            action: veto
+            instrument: EUR_USD
+            name: news-window
+        ";
+        let intent: Intent = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(
+            intent.validate(),
+            Err(IntentValidationError::MissingTtlHours)
+        );
+    }
+
+    #[test]
+    fn validate_accepts_script_ttl_hours_on_prep() {
+        // A script is "opted in" by definition — we can't know what it
+        // resolves to, but the operator wrote it intentionally. Treat
+        // it as not-default.
+        let yaml = "
+            v: 1
+            id: prep-script-ttl
+            not_after: \"2026-05-13T20:00:00Z\"
+            action: prep
+            instrument: EUR_USD
+            step: break-and-close
+            ttl_hours: !script \"if golden == true { 6 } else { 4 }\"
+        ";
+        let intent: Intent = serde_yaml::from_str(yaml).unwrap();
+        intent.validate().unwrap();
+    }
+
+    #[test]
+    fn validate_accepts_missing_ttl_hours_on_enter() {
+        // Enter / status / unlock / invalidate / clear-* don't need
+        // ttl_hours — the field is meaningful only for prep/veto.
+        let yaml = "
+            v: 1
+            id: enter-no-ttl
+            not_after: \"2026-05-13T20:00:00Z\"
+            action: enter
+            instrument: EUR_USD
+            direction: long
+            entry: { type: market }
+            stop_loss: { from: low, offset_pips: -2 }
+            take_profit: { from: close, offset_r: 2.0 }
+            risk_pct: 0.5
+        ";
+        let intent: Intent = serde_yaml::from_str(yaml).unwrap();
+        intent.validate().unwrap();
     }
 
     #[test]

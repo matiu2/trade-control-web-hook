@@ -787,7 +787,7 @@ fn skeleton(
         entry: None,
         stop_loss: None,
         take_profit: None,
-        risk_pct: None,
+        risk_pct: trade_control_core::tunable::Tunable::Static(1.0),
         risk_amount: None,
         size_units: None,
         dry_run: None,
@@ -796,7 +796,7 @@ fn skeleton(
         broker,
         step: None,
         name: None,
-        ttl_hours: None,
+        ttl_hours: trade_control_core::tunable::Tunable::Static(0),
         level: None,
         requires_preps: Vec::new(),
         vetos: Vec::new(),
@@ -833,9 +833,8 @@ fn build_invalidation_alert(
         trade_id,
     );
     intent.name = Some(veto_name.to_string());
-    intent.ttl_hours = Some(trade_control_core::tunable::Tunable::Static(
-        ttl_hours_until(now, veto_expiry),
-    ));
+    intent.ttl_hours =
+        trade_control_core::tunable::Tunable::Static(ttl_hours_until(now, veto_expiry));
     intent.level = Some(VetoLevel::ClosePositions);
     BuiltAlert {
         basename: format!("01-veto-{veto_name}"),
@@ -865,9 +864,8 @@ fn build_trade_expiry_alert(
     );
     intent.not_before = Some(trade_expiry);
     intent.name = Some("trade-expiry".into());
-    intent.ttl_hours = Some(trade_control_core::tunable::Tunable::Static(
-        ttl_hours_until(now, veto_expiry),
-    ));
+    intent.ttl_hours =
+        trade_control_core::tunable::Tunable::Static(ttl_hours_until(now, veto_expiry));
     intent.level = Some(VetoLevel::ClosePositions);
     BuiltAlert {
         basename: "02-veto-trade-expiry".into(),
@@ -895,9 +893,8 @@ fn build_break_and_close_alert(
         trade_id,
     );
     intent.step = Some("break-and-close".into());
-    intent.ttl_hours = Some(trade_control_core::tunable::Tunable::Static(
-        ttl_hours_until(now, trade_expiry),
-    ));
+    intent.ttl_hours =
+        trade_control_core::tunable::Tunable::Static(ttl_hours_until(now, trade_expiry));
     // Landing a fresh break-and-close invalidates any stale retest
     // from a prior, abandoned setup on the same instrument.
     intent.clears = vec!["retest".into()];
@@ -927,9 +924,8 @@ fn build_retest_alert(
         trade_id,
     );
     intent.step = Some("retest".into());
-    intent.ttl_hours = Some(trade_control_core::tunable::Tunable::Static(
-        ttl_hours_until(now, trade_expiry),
-    ));
+    intent.ttl_hours =
+        trade_control_core::tunable::Tunable::Static(ttl_hours_until(now, trade_expiry));
     BuiltAlert {
         basename: "04-prep-retest".into(),
         purpose: "prep: retest (price returns to neckline; gates entry)".into(),
@@ -984,13 +980,15 @@ fn build_enter_alert(
     intent.take_profit = Some(TakeProfit::Anchored(PriceRef::Absolute {
         absolute: tp_price,
     }));
-    // risk_amount, when set, takes precedence over risk_pct — exactly
-    // one is allowed on Intent::Enter, and the validator rejects both.
+    // risk_amount, when set, supersedes risk_pct (which always carries a
+    // value post-flatten — Static(1.0) by default). Leaving risk_pct
+    // alone in that branch is fine: the worker's sizing-mode selector
+    // ignores it when risk_amount is set.
     match risk_amount {
         Some(amount) => {
             intent.risk_amount = Some(trade_control_core::tunable::Tunable::Static(amount))
         }
-        None => intent.risk_pct = Some(trade_control_core::tunable::Tunable::Static(risk_pct)),
+        None => intent.risk_pct = trade_control_core::tunable::Tunable::Static(risk_pct),
     }
     if dry_run {
         intent.dry_run = Some(true);
@@ -1455,7 +1453,13 @@ tp_price: 1.05
             }
             other => panic!("expected Static(5.0) risk_amount, got {other:?}"),
         }
-        assert!(enter.intent.risk_pct.is_none());
+        // risk_pct is always present (default Static(1.0)) — the build
+        // path leaves it alone when risk_amount is set, and the worker's
+        // sizing-mode selector silently overrides it.
+        assert!(matches!(
+            enter.intent.risk_pct,
+            trade_control_core::tunable::Tunable::Static(p) if (p - 1.0).abs() < 1e-9
+        ));
         enter.intent.validate().unwrap();
     }
 
