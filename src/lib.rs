@@ -21,11 +21,39 @@ use broker_oanda::{OandaBroker, login as oanda_login};
 use serde::Serialize;
 use trade_control_core::broker::{Broker, EntryRequest};
 use trade_control_core::incoming::{self, parse_and_verify};
-use trade_control_core::intent::{Action, BrokerKind, Resolved, VetoLevel};
+use trade_control_core::intent::{Action, BrokerKind, Resolved, Shell, VetoLevel};
+use trade_control_core::rules::{self, RuleError};
 use trade_control_core::sig;
 use trade_control_core::state::{
     StateStore, clear_named_preps, clear_named_vetos, veto_ttl_seconds,
 };
+use trade_control_core::tunable::Tunable;
+
+/// Resolve a [`Tunable<u32>`] against Phase 1 scope only (shell
+/// anchors). Used by the `Invalidate`, `Prep`, and `Veto` action
+/// paths — none of which builds a `Resolved`, so derived geometry
+/// bindings aren't available. `default` is the fallback when the
+/// field is absent. On script error returns a telemetry string the
+/// caller wraps into an `ActionResult::Rejected`.
+fn resolve_phase1_u32(
+    field: &'static str,
+    tunable: Option<&Tunable<u32>>,
+    shell: &Shell,
+    default: u32,
+) -> Result<u32, String> {
+    let Some(t) = tunable else { return Ok(default) };
+    let engine = rules::build_engine();
+    let mut scope = rules::RhaiScope::new();
+    rules::bind_shell_anchors(&mut scope, shell);
+    rules::resolve_tunable::<u32>(&engine, &mut scope, t).map_err(|err| {
+        let kind = match &err {
+            RuleError::Parse(_) => "parse",
+            RuleError::Eval(_) => "eval",
+            RuleError::WrongType { .. } => "wrong-type",
+        };
+        format!("rejected: {field}-script-{kind}")
+    })
+}
 
 /// Response body for the `unlock` action. Serialised as YAML.
 #[derive(Serialize)]
@@ -283,7 +311,20 @@ async fn run_action<B: Broker>(
             }
         }
         Action::Invalidate => {
-            let hours = verified.intent.cooldown_hours.unwrap_or(12);
+            let hours = match resolve_phase1_u32(
+                "cooldown_hours",
+                verified.intent.cooldown_hours.as_ref(),
+                &verified.shell,
+                12,
+            ) {
+                Ok(n) => n,
+                Err(outcome) => {
+                    return ActionResult::Rejected {
+                        response: Response::error("cooldown_hours script error", 412),
+                        outcome,
+                    };
+                }
+            };
             let account = verified.intent.account.as_deref();
             if let Err(err) = store
                 .set_cooldown(account, &verified.intent.instrument, hours, now)

@@ -1021,7 +1021,10 @@ mod tests {
         fill_missing_fields(&mut template, true).unwrap();
         let intent: Intent = serde_yaml::from_value(template).unwrap();
         assert_eq!(intent.action, Action::Invalidate);
-        assert_eq!(intent.cooldown_hours, Some(12));
+        match &intent.cooldown_hours {
+            Some(trade_control_core::tunable::Tunable::Static(n)) => assert_eq!(*n, 12),
+            other => panic!("expected Static(12) cooldown_hours, got {other:?}"),
+        }
     }
 
     /// Mutex shared with `expiry` tests: any test that pokes

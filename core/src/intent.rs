@@ -295,8 +295,13 @@ pub struct Intent {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dry_run: Option<bool>,
     /// Required for `invalidate`.
+    ///
+    /// A [`Tunable<u32>`] — operators can supply a static literal
+    /// (`cooldown_hours: 12`) or a Rhai script (`cooldown_hours:
+    /// !script "..."`) that resolves against Phase 1 scope only
+    /// (shell anchors — invalidate runs without geometry).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cooldown_hours: Option<u32>,
+    pub cooldown_hours: Option<crate::tunable::Tunable<u32>>,
     /// Minimum acceptable R-multiple — server rejects entries whose
     /// implicit `(TP - entry) / (entry - SL)` falls below this. Defaults
     /// to 1.0 when omitted. Overrides must be `>= 1.0`; below-floor values
@@ -993,7 +998,10 @@ mod tests {
         ";
         let intent: Intent = serde_yaml::from_str(yaml).unwrap();
         assert_eq!(intent.action, Action::Invalidate);
-        assert_eq!(intent.cooldown_hours, Some(12));
+        match &intent.cooldown_hours {
+            Some(crate::tunable::Tunable::Static(n)) => assert_eq!(*n, 12),
+            other => panic!("expected Static(12) cooldown_hours, got {other:?}"),
+        }
     }
 
     #[test]
