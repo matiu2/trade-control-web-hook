@@ -13,17 +13,19 @@
 //!    `r_multiple`, `pip_size`, `instrument`, `direction`) into the
 //!    scope. Phase 2 of the three-phase build; called after Phase 1
 //!    so scripts can mix shell anchors with derived distances.
-//! 4. [`eval_script`] — generic `Script<T>` evaluator. Parses the
-//!    script source, runs it against the supplied scope, and casts
-//!    the result back to `T`.
-//!
-//! Phase 3 (Tunable resolution — `risk_pct`, `max_retries`, etc.) lands
-//! with the C-tunable-fields sub-step. It builds on the surface here.
+//! 4. [`eval_script`] — generic `CompiledScript` evaluator. Parses
+//!    the script source, runs it against the supplied scope, and
+//!    casts the result back to `T`.
+//! 5. [`resolve_tunable`] — Phase 3. Resolves a [`Tunable<T>`] field
+//!    against an already-built scope: `Static(v)` returns `v` as-is;
+//!    `Script(s)` runs through [`eval_script`]. This is the call
+//!    sites use when reading per-field tunables (`risk_pct`,
+//!    `max_retries`, `allow_entry`, etc.).
 
 use rhai::{Dynamic, Engine, EvalAltResult, ParseError, Scope};
 
 use crate::intent::{Direction, Resolved, ResolvedEntry, Shell, SignalKind};
-use crate::tunable::CompiledScript;
+use crate::tunable::{CompiledScript, Tunable};
 
 /// Maximum number of Rhai opcodes a single script may execute. Real
 /// `allow_entry` / sizing scripts run a few comparisons and arithmetic
@@ -324,6 +326,36 @@ pub fn eval_script<T: FromRhai>(
 ) -> Result<T, RuleError> {
     let value: Dynamic = engine.eval_expression_with_scope(scope, &script.source)?;
     T::from_rhai(value)
+}
+
+/// Resolve a [`Tunable<T>`] against an already-built scope.
+///
+/// - [`Tunable::Static`] returns the embedded value as-is (cloned). No
+///   engine call, no allocation past the clone.
+/// - [`Tunable::Script`] dispatches to [`eval_script`], which runs the
+///   script and casts the result to `T` via [`FromRhai`].
+///
+/// Call sites typically look like:
+///
+/// ```ignore
+/// let engine = build_engine();
+/// let mut scope = Scope::new();
+/// bind_shell_anchors(&mut scope, shell);
+/// bind_intent_derived(&mut scope, &resolved, pip_size);
+/// let risk_pct: f64 = resolve_tunable(&engine, &mut scope, &intent.risk_pct)?;
+/// ```
+///
+/// The `Clone` bound covers the `Static` branch — for the small,
+/// numeric / boolean field types we promote to `Tunable<T>` it's free.
+pub fn resolve_tunable<T: FromRhai + Clone>(
+    engine: &Engine,
+    scope: &mut Scope,
+    tunable: &Tunable<T>,
+) -> Result<T, RuleError> {
+    match tunable {
+        Tunable::Static(v) => Ok(v.clone()),
+        Tunable::Script(s) => eval_script(engine, scope, s),
+    }
 }
 
 #[cfg(test)]
@@ -781,5 +813,103 @@ mod tests {
         )
         .unwrap();
         assert!((v - 22.0).abs() < 1e-9, "got {v}");
+    }
+
+    // ---- Phase 3: resolve_tunable ----
+
+    #[test]
+    fn resolve_tunable_static_f64_returns_value() {
+        let engine = build_engine();
+        let mut scope = Scope::new();
+        bind_shell_anchors(&mut scope, &shell_full());
+        let t: Tunable<f64> = Tunable::Static(0.5);
+        let v: f64 = resolve_tunable(&engine, &mut scope, &t).unwrap();
+        assert_eq!(v, 0.5);
+    }
+
+    #[test]
+    fn resolve_tunable_static_bool_returns_value() {
+        let engine = build_engine();
+        let mut scope = Scope::new();
+        bind_shell_anchors(&mut scope, &shell_full());
+        let t: Tunable<bool> = Tunable::Static(true);
+        let v: bool = resolve_tunable(&engine, &mut scope, &t).unwrap();
+        assert!(v);
+    }
+
+    #[test]
+    fn resolve_tunable_static_u32_returns_value() {
+        let engine = build_engine();
+        let mut scope = Scope::new();
+        bind_shell_anchors(&mut scope, &shell_full());
+        let t: Tunable<u32> = Tunable::Static(3);
+        let v: u32 = resolve_tunable(&engine, &mut scope, &t).unwrap();
+        assert_eq!(v, 3);
+    }
+
+    #[test]
+    fn resolve_tunable_script_evaluates_against_scope() {
+        // Canonical wait-for-confirmation gate.
+        let engine = build_engine();
+        let mut scope = Scope::new();
+        let mut shell = shell_full();
+        shell.signal_confirmed = Some(true);
+        bind_shell_anchors(&mut scope, &shell);
+        let t: Tunable<bool> = Tunable::from_script("signal_confirmed == true");
+        let v: bool = resolve_tunable(&engine, &mut scope, &t).unwrap();
+        assert!(v);
+    }
+
+    #[test]
+    fn resolve_tunable_script_sees_derived_geometry() {
+        // Script reads r_multiple (Phase 2) — proves the three phases
+        // compose end-to-end.
+        let engine = build_engine();
+        let mut scope = Scope::new();
+        bind_shell_anchors(&mut scope, &shell_full());
+        bind_intent_derived(&mut scope, &resolved_long_market(), 0.0001);
+        // R = 2.0 on the fixture; 1.5 risk if R >= 2 else 0.5.
+        let t: Tunable<f64> = Tunable::from_script("if r_multiple >= 2.0 { 1.5 } else { 0.5 }");
+        let v: f64 = resolve_tunable(&engine, &mut scope, &t).unwrap();
+        assert!((v - 1.5).abs() < 1e-9, "got {v}");
+    }
+
+    #[test]
+    fn resolve_tunable_script_parse_error_surfaces() {
+        let engine = build_engine();
+        let mut scope = Scope::new();
+        bind_shell_anchors(&mut scope, &shell_full());
+        let t: Tunable<bool> = Tunable::from_script("if if if");
+        let err = resolve_tunable::<bool>(&engine, &mut scope, &t).unwrap_err();
+        assert!(matches!(err, RuleError::Parse(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn resolve_tunable_script_wrong_type_surfaces() {
+        // Script returns f64 for a bool-typed Tunable.
+        let engine = build_engine();
+        let mut scope = Scope::new();
+        bind_shell_anchors(&mut scope, &shell_full());
+        let t: Tunable<bool> = Tunable::from_script("1.5");
+        let err = resolve_tunable::<bool>(&engine, &mut scope, &t).unwrap_err();
+        match err {
+            RuleError::WrongType { expected, got } => {
+                assert_eq!(expected, "bool");
+                assert_eq!(got, "f64");
+            }
+            other => panic!("expected WrongType, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_tunable_static_no_engine_dependency() {
+        // Sanity: a Static tunable resolves even against an empty scope.
+        // The engine is required by the signature but never called on the
+        // Static branch.
+        let engine = build_engine();
+        let mut scope = Scope::new();
+        let t: Tunable<f64> = Tunable::Static(42.0);
+        let v: f64 = resolve_tunable(&engine, &mut scope, &t).unwrap();
+        assert_eq!(v, 42.0);
     }
 }
