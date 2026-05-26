@@ -897,7 +897,7 @@ fn build_enter_alert(
     if dry_run {
         intent.dry_run = Some(true);
     }
-    intent.max_retries = max_retries;
+    intent.max_retries = max_retries.map(trade_control_core::tunable::Tunable::Static);
     intent.requires_preps = ["break-and-close", "retest"]
         .into_iter()
         .filter(|step| !skip_preps.iter().any(|s| s == step))
@@ -1369,11 +1369,14 @@ tp_price: 1.05
         spec.max_retries = Some(3);
         let trade = build_trade_from_spec(spec, now).unwrap();
         let enter = trade.alerts.last().unwrap();
-        assert_eq!(enter.intent.max_retries, Some(3));
+        match &enter.intent.max_retries {
+            Some(trade_control_core::tunable::Tunable::Static(n)) => assert_eq!(*n, 3),
+            other => panic!("expected Static(3) max_retries, got {other:?}"),
+        }
         enter.intent.validate().unwrap();
         for alert in trade.alerts.iter().take(trade.alerts.len() - 1) {
-            assert_eq!(
-                alert.intent.max_retries, None,
+            assert!(
+                alert.intent.max_retries.is_none(),
                 "non-enter alert {} carried max_retries",
                 alert.basename
             );

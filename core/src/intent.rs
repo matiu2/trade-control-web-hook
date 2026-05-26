@@ -391,8 +391,15 @@ pub struct Intent {
     /// to be [`Action::Enter`]; rejected at validate time otherwise.
     /// Zero is rejected — pass `None` for the default single-shot
     /// behaviour instead.
+    ///
+    /// A [`Tunable<u32>`] — operators can supply a static literal
+    /// (`max_retries: 3`) or a Rhai script (`max_retries: !script
+    /// "..."`) that resolves at gate time against Phase 1 scope only
+    /// (shell anchors — the gate runs before geometry is built, so
+    /// derived bindings are unavailable). Scripts returning zero are
+    /// rejected at resolve time, mirroring the static-literal rule.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub max_retries: Option<u32>,
+    pub max_retries: Option<crate::tunable::Tunable<u32>>,
     /// Optional Rhai gate on `enter`. When set, the worker resolves
     /// the [`Tunable<bool>`] (Static or `!script`) after passing the
     /// retry / prep / veto gates and rejects the entry with a 412 if
@@ -488,8 +495,13 @@ impl Intent {
         {
             return Err(IntentValidationError::InvalidTradeId);
         }
-        if let Some(n) = self.max_retries {
-            if n == 0 {
+        if let Some(t) = &self.max_retries {
+            // Only the Static variant can be validated at parse time;
+            // Script values defer to gate-time resolution (which also
+            // rejects zero).
+            if let crate::tunable::Tunable::Static(n) = t
+                && *n == 0
+            {
                 return Err(IntentValidationError::ZeroMaxRetries);
             }
             if self.trade_id.is_none() {
@@ -1360,7 +1372,10 @@ mod tests {
             max_retries: 3
         ";
         let intent: Intent = serde_yaml::from_str(yaml).unwrap();
-        assert_eq!(intent.max_retries, Some(3));
+        match &intent.max_retries {
+            Some(crate::tunable::Tunable::Static(n)) => assert_eq!(*n, 3),
+            other => panic!("expected Static(3) max_retries, got {other:?}"),
+        }
         intent.validate().unwrap();
         let back = serde_yaml::to_string(&intent).unwrap();
         assert!(back.contains("max_retries: 3"));

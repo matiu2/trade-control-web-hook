@@ -82,6 +82,11 @@ pub fn validate(intent: &Intent) -> Vec<ScriptError> {
     {
         errors.push(e);
     }
+    if let Some(t) = &intent.max_retries
+        && let Some(e) = check_one::<u32>("max_retries", t, &shell, &resolved, pip_size)
+    {
+        errors.push(e);
+    }
     // Future per-field tunables go here as additional check_one calls.
 
     errors
@@ -416,6 +421,37 @@ mod tests {
         let errs = validate(&intent);
         assert_eq!(errs.len(), 1);
         assert_eq!(errs[0].field, "min_r");
+        assert_eq!(errs[0].kind, "wrong-type");
+    }
+
+    #[test]
+    fn max_retries_script_passes_when_valid() {
+        let mut intent = intent_with_allow_entry(None);
+        intent.max_retries = Some(Tunable::from_script("if golden == true { 5 } else { 3 }"));
+        intent.trade_id = Some("trade-mx-1".into());
+        assert!(validate(&intent).is_empty());
+    }
+
+    #[test]
+    fn max_retries_script_parse_error_surfaces() {
+        let mut intent = intent_with_allow_entry(None);
+        intent.max_retries = Some(Tunable::from_script("if if if"));
+        intent.trade_id = Some("trade-mx-2".into());
+        let errs = validate(&intent);
+        assert_eq!(errs.len(), 1);
+        assert_eq!(errs[0].field, "max_retries");
+        assert_eq!(errs[0].kind, "parse");
+    }
+
+    #[test]
+    fn max_retries_script_wrong_type_surfaces() {
+        // Script returns f64, max_retries expects u32.
+        let mut intent = intent_with_allow_entry(None);
+        intent.max_retries = Some(Tunable::from_script("1.5"));
+        intent.trade_id = Some("trade-mx-3".into());
+        let errs = validate(&intent);
+        assert_eq!(errs.len(), 1);
+        assert_eq!(errs[0].field, "max_retries");
         assert_eq!(errs[0].kind, "wrong-type");
     }
 

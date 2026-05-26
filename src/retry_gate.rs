@@ -27,8 +27,10 @@
 
 use chrono::{DateTime, Utc};
 use trade_control_core::broker::{AttemptState, Broker, LookupError};
-use trade_control_core::intent::Intent;
+use trade_control_core::intent::{Intent, Shell};
+use trade_control_core::rules::{self, RuleError};
 use trade_control_core::state::{EntryAttempt, StateStore};
+use trade_control_core::tunable::Tunable;
 
 /// Tracing-shaped wrappers around `worker::console_*!`. The worker
 /// macros call into `web_sys::console::log_1`, which panics on
@@ -79,6 +81,28 @@ pub enum RetryGateOutcome {
     },
 }
 
+/// Resolve a [`Tunable<u32>`] against Phase 1 scope only (shell
+/// anchors). The gate runs before geometry is built so derived
+/// bindings aren't bound. Maps `RuleError` onto a `Rejected` outcome
+/// with a telemetry-friendly string.
+fn resolve_max_retries(tunable: &Tunable<u32>, shell: &Shell) -> Result<u32, RetryGateOutcome> {
+    let engine = rules::build_engine();
+    let mut scope = rules::RhaiScope::new();
+    rules::bind_shell_anchors(&mut scope, shell);
+    rules::resolve_tunable::<u32>(&engine, &mut scope, tunable).map_err(|err| {
+        let kind = match &err {
+            RuleError::Parse(_) => "parse",
+            RuleError::Eval(_) => "eval",
+            RuleError::WrongType { .. } => "wrong-type",
+        };
+        RetryGateOutcome::Rejected {
+            status: 412,
+            message: "max_retries script error",
+            outcome: format!("rejected: max-retries-script-{kind}"),
+        }
+    })
+}
+
 /// Walk the gate. See module docs for the algorithm. Only call this
 /// when `intent.max_retries.is_some()` — the caller is responsible
 /// for keeping the single-shot path free of any state-store / broker
@@ -87,12 +111,24 @@ pub async fn evaluate<B: Broker, S: StateStore>(
     broker: &B,
     store: &S,
     intent: &Intent,
-    shell_time: DateTime<Utc>,
+    shell: &Shell,
 ) -> RetryGateOutcome {
-    let Some(max_retries) = intent.max_retries else {
+    let shell_time = shell.time;
+    let Some(max_retries_t) = intent.max_retries.as_ref() else {
         // Guarded by the caller; reached only on a programming error.
         return RetryGateOutcome::Proceed { next_attempt_no: 1 };
     };
+    let max_retries = match resolve_max_retries(max_retries_t, shell) {
+        Ok(n) => n,
+        Err(outcome) => return outcome,
+    };
+    if max_retries == 0 {
+        return RetryGateOutcome::Rejected {
+            status: 412,
+            message: "max_retries resolved to zero",
+            outcome: "rejected: max-retries-zero".into(),
+        };
+    }
     let Some(trade_id) = intent.trade_id.as_deref() else {
         // Same shape — validated upstream by `Intent::validate`.
         return RetryGateOutcome::Proceed { next_attempt_no: 1 };
@@ -599,6 +635,10 @@ mod tests {
     }
 
     fn intent_with_retries(max_retries: Option<u32>) -> Intent {
+        intent_with_max_retries_tunable(max_retries.map(Tunable::Static))
+    }
+
+    fn intent_with_max_retries_tunable(max_retries: Option<Tunable<u32>>) -> Intent {
         Intent {
             v: 1,
             id: "msg-1".into(),
@@ -671,6 +711,27 @@ mod tests {
         ts("2026-05-25T14:00:00Z")
     }
 
+    fn shell_at(time: DateTime<Utc>) -> Shell {
+        Shell {
+            close: 1.10,
+            high: 1.11,
+            low: 1.09,
+            time,
+            signal_high: None,
+            signal_low: None,
+            signal_range: None,
+            signal_start_time: None,
+            signal_kind: None,
+            golden: None,
+            atr: None,
+            signal_confirmed: None,
+        }
+    }
+
+    fn fixture_shell() -> Shell {
+        shell_at(shell_time())
+    }
+
     /// Single-shot baseline — `max_retries: None` must skip the gate
     /// entirely. Zero list_entry_attempts / is_retry_fire_seen
     /// calls, zero broker lookups. Proves the byte-identical
@@ -686,7 +747,7 @@ mod tests {
         // strongest invariant: even an accidental change that called
         // evaluate() unconditionally would fail this test.
         if intent.max_retries.is_some() {
-            run(evaluate(&broker, &store, &intent, shell_time()));
+            run(evaluate(&broker, &store, &intent, &fixture_shell()));
         }
 
         assert_eq!(*store.list_calls.borrow(), 0);
@@ -706,7 +767,7 @@ mod tests {
         let store = CountingStore::default();
         let intent = intent_with_retries(Some(3));
 
-        let out = run(evaluate(&broker, &store, &intent, shell_time()));
+        let out = run(evaluate(&broker, &store, &intent, &fixture_shell()));
         assert_proceed(out, 1);
         assert!(broker.lookup_calls.borrow().is_empty());
         assert_eq!(*store.list_calls.borrow(), 1);
@@ -724,7 +785,7 @@ mod tests {
         let now = ts("2026-05-25T14:00:05Z");
 
         // 1st fire.
-        let out = run(evaluate(&broker, &store, &intent, shell_time()));
+        let out = run(evaluate(&broker, &store, &intent, &fixture_shell()));
         assert_proceed(out, 1);
         run(record_placement(
             &store,
@@ -738,7 +799,7 @@ mod tests {
         ));
 
         // 2nd fire on the same shell bar — 409.
-        let out = run(evaluate(&broker, &store, &intent, shell_time()));
+        let out = run(evaluate(&broker, &store, &intent, &fixture_shell()));
         assert_rejected(out, 409, "retry-fire-replay");
         // No broker lookup happened on the dedup path.
         assert!(broker.lookup_calls.borrow().is_empty());
@@ -766,7 +827,7 @@ mod tests {
         broker.push_lookup(AttemptState::Pending);
         broker.push_cancel_ok();
 
-        let out = run(evaluate(&broker, &store, &intent, shell_time()));
+        let out = run(evaluate(&broker, &store, &intent, &fixture_shell()));
         assert_proceed(out, 2);
 
         let cancels = broker.cancel_calls.borrow();
@@ -799,7 +860,7 @@ mod tests {
             broker_trade_id: "btid-42".into(),
         });
 
-        let out = run(evaluate(&broker, &store, &intent, shell_time()));
+        let out = run(evaluate(&broker, &store, &intent, &fixture_shell()));
         assert_rejected(out, 412, "raced-with-cancel");
         assert_eq!(*store.set_btid_calls.borrow(), 1);
         let stored = store
@@ -833,7 +894,7 @@ mod tests {
             broker_trade_id: "btid-77".into(),
         });
 
-        let out = run(evaluate(&broker, &store, &intent, shell_time()));
+        let out = run(evaluate(&broker, &store, &intent, &fixture_shell()));
         assert_rejected(out, 412, "trade-already-open");
         assert_eq!(*store.set_btid_calls.borrow(), 1);
     }
@@ -865,7 +926,7 @@ mod tests {
             ));
             broker.push_lookup(state.clone());
 
-            let out = run(evaluate(&broker, &store, &intent, shell_time()));
+            let out = run(evaluate(&broker, &store, &intent, &fixture_shell()));
             assert_proceed(out, 2);
             assert!(
                 broker.cancel_calls.borrow().is_empty(),
@@ -895,7 +956,7 @@ mod tests {
             broker.push_lookup(AttemptState::Cancelled);
         }
 
-        let out = run(evaluate(&broker, &store, &intent, shell_time()));
+        let out = run(evaluate(&broker, &store, &intent, &fixture_shell()));
         assert_rejected(out, 429, "retry-cap");
     }
 
@@ -919,10 +980,65 @@ mod tests {
         ));
         broker.push_lookup_err();
 
-        let out = run(evaluate(&broker, &store, &intent, shell_time()));
+        let out = run(evaluate(&broker, &store, &intent, &fixture_shell()));
         assert_rejected(out, 503, "broker-transient");
         // Only the initial record_placement wrote an attempt; the
         // rejected fire did not.
         assert_eq!(*store.record_calls.borrow(), 1);
+    }
+
+    // ---- max_retries as Tunable ----
+
+    #[test]
+    fn max_retries_static_path_unchanged() {
+        // Static(3) resolves to 3 — same as the old `Some(3)` path.
+        let broker = MockBroker::default();
+        let store = CountingStore::default();
+        let intent = intent_with_max_retries_tunable(Some(Tunable::Static(3)));
+        let out = run(evaluate(&broker, &store, &intent, &fixture_shell()));
+        assert_proceed(out, 1);
+    }
+
+    #[test]
+    fn max_retries_script_evaluates_against_shell_anchors() {
+        // Script: pump retries to 5 when golden, else 3.
+        let broker = MockBroker::default();
+        let store = CountingStore::default();
+        let intent = intent_with_max_retries_tunable(Some(Tunable::from_script(
+            "if golden == true { 5 } else { 3 }",
+        )));
+        let mut shell = fixture_shell();
+        shell.golden = Some(true);
+        let out = run(evaluate(&broker, &store, &intent, &shell));
+        // First fire proceeds — the cap (5) hasn't been hit.
+        assert_proceed(out, 1);
+    }
+
+    #[test]
+    fn max_retries_script_returning_zero_rejected() {
+        let broker = MockBroker::default();
+        let store = CountingStore::default();
+        let intent = intent_with_max_retries_tunable(Some(Tunable::from_script("0")));
+        let out = run(evaluate(&broker, &store, &intent, &fixture_shell()));
+        assert_rejected(out, 412, "max-retries-zero");
+    }
+
+    #[test]
+    fn max_retries_script_parse_error_yields_412() {
+        let broker = MockBroker::default();
+        let store = CountingStore::default();
+        let intent = intent_with_max_retries_tunable(Some(Tunable::from_script("if if if")));
+        let out = run(evaluate(&broker, &store, &intent, &fixture_shell()));
+        assert_rejected(out, 412, "max-retries-script-parse");
+    }
+
+    #[test]
+    fn max_retries_script_wrong_type_yields_412() {
+        // Script returns f64, max_retries expects u32.
+        let broker = MockBroker::default();
+        let store = CountingStore::default();
+        let intent = intent_with_max_retries_tunable(Some(Tunable::from_script("1.5")));
+        let out = run(evaluate(&broker, &store, &intent, &fixture_shell()));
+        assert_rejected(out, 412, "max-retries-script-wrong-type");
     }
 }

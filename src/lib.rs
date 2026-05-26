@@ -332,7 +332,7 @@ async fn run_enter<B: Broker>(
     // entirely so no new KV/broker calls land on the byte-identical
     // baseline.
     let retry_attempt_no = if verified.intent.max_retries.is_some() {
-        match retry_gate::evaluate(broker, store, &verified.intent, verified.shell.time).await {
+        match retry_gate::evaluate(broker, store, &verified.intent, &verified.shell).await {
             retry_gate::RetryGateOutcome::Proceed { next_attempt_no } => Some(next_attempt_no),
             retry_gate::RetryGateOutcome::Rejected {
                 status,
