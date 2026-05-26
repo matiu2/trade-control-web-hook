@@ -138,8 +138,18 @@ pub fn build_engine() -> Engine {
 ///
 /// - Required fields (close/high/low) bind as `f64`.
 /// - `time` binds as `i64` ms-epoch.
-/// - The 8 signal_* / golden / atr fields bind as their value when
-///   present, or [`Dynamic::UNIT`] (Rhai `()`) when absent.
+/// - Optional `f64` / `i64` fields (`signal_high`, `signal_low`,
+///   `signal_range`, `signal_start_time`, `atr`, `recent_high`,
+///   `recent_low`) bind as their value when present, or
+///   [`Dynamic::UNIT`] (Rhai `()`) when absent.
+/// - Optional **bool** fields (`golden`, `signal_confirmed`) bind as
+///   plain `bool` — absent in the shell becomes `false` in the scope.
+///   This trades the tri-state encoding for a friendlier surface:
+///   `if golden { ... }` and `signal_confirmed` as bare expressions
+///   both work without tripping a `()` type error. Operators who
+///   want a hard reject when the field is absent should use the
+///   typed `Intent::needs_golden` field, which checks the underlying
+///   `Option<bool>` directly.
 /// - `signal_kind` binds as a lowercase snake_case string
 ///   (`"pinbar"`, `"tweezer"`, `"regular_engulfer"`,
 ///   `"floating_engulfer"`, `"double_tweezer"`) so scripts can write
@@ -181,10 +191,11 @@ fn push_opt_i64(scope: &mut Scope, name: &'static str, v: Option<i64>) {
 }
 
 fn push_opt_bool(scope: &mut Scope, name: &'static str, v: Option<bool>) {
-    match v {
-        Some(x) => scope.push_constant(name, x),
-        None => scope.push_constant_dynamic(name, unit()),
-    };
+    // Flatten None → false so bool fields in Rhai are always a real
+    // bool — closes the `()` landmine where a bare `golden` would
+    // type-error if the shell omitted the field. See bind_shell_anchors
+    // docs for the rationale.
+    scope.push_constant(name, v.unwrap_or(false));
 }
 
 fn push_opt_kind(scope: &mut Scope, v: Option<SignalKind>) {
@@ -458,6 +469,45 @@ mod tests {
         let s = CompiledScript::new("golden");
         let v: bool = eval_script(&engine, &mut scope, &s).unwrap();
         assert!(v);
+    }
+
+    #[test]
+    fn absent_golden_binds_as_false_not_unit() {
+        // The `()` landmine: in earlier rev, `golden` on a shell with
+        // `golden: None` would type-error at runtime because Rhai saw
+        // unit, not bool. push_opt_bool now flattens None → false so
+        // bare-name scripts (`golden`, `signal_confirmed`) just work.
+        let engine = build_engine();
+        let mut scope = Scope::new();
+        bind_shell_anchors(&mut scope, &shell_minimal());
+        let v: bool = eval_script(&engine, &mut scope, &CompiledScript::new("golden")).unwrap();
+        assert!(!v);
+    }
+
+    #[test]
+    fn absent_signal_confirmed_binds_as_false_not_unit() {
+        let engine = build_engine();
+        let mut scope = Scope::new();
+        bind_shell_anchors(&mut scope, &shell_minimal());
+        let v: bool = eval_script(
+            &engine,
+            &mut scope,
+            &CompiledScript::new("signal_confirmed"),
+        )
+        .unwrap();
+        assert!(!v);
+    }
+
+    #[test]
+    fn absent_golden_works_in_if_expression() {
+        // The other common pattern — `if golden { ... }` no longer
+        // needs `== true` when the field might be absent.
+        let engine = build_engine();
+        let mut scope = Scope::new();
+        bind_shell_anchors(&mut scope, &shell_minimal());
+        let s = CompiledScript::new("if golden { 1.0 } else { 0.0 }");
+        let v: f64 = eval_script(&engine, &mut scope, &s).unwrap();
+        assert_eq!(v, 0.0);
     }
 
     #[test]
