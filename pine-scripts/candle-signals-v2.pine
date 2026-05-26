@@ -1,19 +1,32 @@
 //@version=6
 indicator("Candle Signals", shorttitle="Candle Signals", overlay=true, max_labels_count=500)
-// Combined detector for: Pinbars, Tweezers, Regular Engulfers, Floating Engulfers
+// Combined detector for: Pinbars, Tweezers, Double Tweezers, Regular Engulfers, Floating Engulfers
 // Outputs unified bullish/bearish signals
 //
-// v2: latches the most-recent signal candle's high/low/time/confirmed onto
-// persistent `plot()` series (titles: pattern_high, pattern_low, pattern_time,
-// pattern_confirmed) so the alertconditions can embed them in the alert
-// message via {{plot("pattern_high")}} etc. When the confirmation
-// alertcondition fires on a later bar than the signal candle, the built-in
-// {{high}}/{{low}} reflect the *firing* bar; the plots let us still recover
-// the *signal* bar's extremes at fire time. `pattern_confirmed` is 1.0 when
-// the latched pattern has been validated within the confirmation window,
-// 0.0 otherwise — the worker-side Rhai engine reads this as a bool via
-// `pattern_confirmed > 0.5` so operators can write
-// `allow_entry: !script "pattern_confirmed"` to gate retries on confirmation.
+// v2.2: collapses to 2 alertconditions ("Long Pattern", "Short Pattern") and
+// latches the most-recent signal's geometry + classifier metadata onto
+// persistent plot() series so the alertconditions can embed them in the
+// alert message via {{plot("signal_high")}} etc.
+//
+// Wire-format vars latched at signal time:
+//   signal_high, signal_low, signal_range  — geometry of the signal
+//     (spans 1 bar for pinbar/floating, 2 bars for tweezer/regular,
+//     3 bars for double_tweezer).
+//   signal_start_time                      — ms epoch of the *earliest*
+//     bar that's part of the signal. Renamed from pattern_time to
+//     disambiguate from current-bar `time`.
+//   signal_kind  — float-encoded enum:
+//     1 = pinbar, 2 = tweezer, 3 = regular_engulfer,
+//     4 = floating_engulfer, 5 = double_tweezer.
+//   golden       — 1.0 if signal_range >= ATR at signal time, else 0.0.
+//   atr          — ATR value at signal time.
+//   signal_confirmed — 1.0 once a confirming push has validated the
+//     latched signal within `confirm_bars`, 0.0 otherwise. Resets to
+//     0.0 every time a fresh signal overwrites the latch.
+//
+// Single alert per direction; the worker-side Rhai engine reads the
+// shell vars to decide whether to act (golden filter, kind filter,
+// confirmation requirement, candle-size override, etc.).
 
 // =============================================================================
 // SIGNAL STATE RULES
@@ -32,6 +45,7 @@ max_signals = input.int(100, "Max Signals to Track", minval=10, maxval=500, tool
 // Pattern toggles
 detect_pinbars = input.bool(true, "Detect Pinbars")
 detect_tweezers = input.bool(true, "Detect Tweezers")
+detect_double_tweezers = input.bool(true, "Detect Double Tweezers", tooltip="3 consecutive bars in the same direction all qualify as pinbar-ish. Treated as a single signal kind; priority over plain tweezer.")
 detect_regular_engulfers = input.bool(true, "Detect Regular Engulfers")
 detect_floating_engulfers = input.bool(true, "Detect Floating Engulfers")
 
@@ -45,8 +59,9 @@ hide_invalid = input.bool(true, "Hide Invalid Signals")
 
 // Confirmation window — how many bars after a pending signal prints we still
 // accept a confirming push above/below its extreme. Used by both the visual
-// state machine and the *_just_valid alertconditions.
-confirm_bars = input.int(2, "Confirmation Bars", minval=1, maxval=10, tooltip="Bars after signal print within which a confirming push validates the signal. Worker uses this same window via the Confirmed alertconditions.")
+// state machine and the Long/Short Pattern alertconditions (signal_confirmed
+// flips to 1.0 inside this window).
+confirm_bars = input.int(2, "Confirmation Bars", minval=1, maxval=10, tooltip="Bars after signal print within which a confirming push validates the signal.")
 
 // Tweezer similarity threshold
 similarity_pct = input.float(20.0, "Tweezer High/Low Similarity (%)", minval=0.0, maxval=100.0, step=0.1)
@@ -61,6 +76,13 @@ bearish_shape = input.string("Triangle", "Bearish Pending Shape", options=["Arro
 const int STATE_PENDING = 0
 const int STATE_VALID = 1
 const int STATE_INVALID = 2
+
+// signal_kind float encoding — keep in sync with Rust SignalKind serde adapter.
+const float KIND_PINBAR            = 1.0
+const float KIND_TWEEZER           = 2.0
+const float KIND_REGULAR_ENGULFER  = 3.0
+const float KIND_FLOATING_ENGULFER = 4.0
+const float KIND_DOUBLE_TWEEZER    = 5.0
 
 // ===== Helper Functions ======================================================
 resolve_label_style(string option, bool is_bullish) =>
@@ -175,6 +197,10 @@ const float TWEEZER_WICK_THRESHOLD = 0.35
 prev_bullish_pinbar = valid_candle[1] and body_top[1] >= top_25[1] and body_bottom[1] >= midpoint[1] and lower_wick[1] >= candle_range[1] * TWEEZER_WICK_THRESHOLD
 prev_bearish_pinbar = valid_candle[1] and body_bottom[1] <= bottom_25[1] and body_top[1] <= midpoint[1] and upper_wick[1] >= candle_range[1] * TWEEZER_WICK_THRESHOLD
 
+// Bar N-2 (for double-tweezer): the "previous-previous" pinbar test.
+prev2_bullish_pinbar = valid_candle[2] and body_top[2] >= top_25[2] and body_bottom[2] >= midpoint[2] and lower_wick[2] >= candle_range[2] * TWEEZER_WICK_THRESHOLD
+prev2_bearish_pinbar = valid_candle[2] and body_bottom[2] <= bottom_25[2] and body_top[2] <= midpoint[2] and upper_wick[2] >= candle_range[2] * TWEEZER_WICK_THRESHOLD
+
 curr_bullish_pinbar_tweezer = valid_candle and body_top >= top_25 and body_bottom >= midpoint and lower_wick >= candle_range * TWEEZER_WICK_THRESHOLD
 curr_bearish_pinbar_tweezer = valid_candle and body_bottom <= bottom_25 and body_top <= midpoint and upper_wick >= candle_range * TWEEZER_WICK_THRESHOLD
 
@@ -185,11 +211,25 @@ range_similarity_threshold = has_pair_data ? pair_range * similarity_pct * 0.01 
 highs_close = has_pair_data ? math.abs(high - prev_high) <= range_similarity_threshold : false
 lows_close = has_pair_data ? math.abs(low - prev_low) <= range_similarity_threshold : false
 
+// Triple-bar similarity for double-tweezer: highs and lows of all 3 bars
+// (N, N-1, N-2) must lie within similarity_pct of the largest range.
+has_triple_bar = bar_index > 1
+prev2_candle_range = high[2] - low[2]
+triple_range = has_triple_bar ? math.max(candle_range, prev_candle_range, prev2_candle_range) : na
+has_triple_data = has_triple_bar and triple_range > 0
+triple_similarity_threshold = has_triple_data ? triple_range * similarity_pct * 0.01 : na
+triple_highs_close = has_triple_data ? math.abs(high - prev_high) <= triple_similarity_threshold and math.abs(prev_high - high[2]) <= triple_similarity_threshold : false
+triple_lows_close = has_triple_data ? math.abs(low - prev_low) <= triple_similarity_threshold and math.abs(prev_low - low[2]) <= triple_similarity_threshold : false
+
 confirmed_bar = barstate.isconfirmed
 valid_pair = confirmed_bar and has_pair_data and valid_candle[1] and highs_close and lows_close
+valid_triple = confirmed_bar and has_triple_data and valid_candle[1] and valid_candle[2] and triple_highs_close and triple_lows_close
 
-bullish_tweezer = detect_tweezers and valid_pair and curr_bullish_pinbar_tweezer and prev_bullish_pinbar
-bearish_tweezer = detect_tweezers and valid_pair and curr_bearish_pinbar_tweezer and prev_bearish_pinbar
+bullish_double_tweezer = detect_double_tweezers and valid_triple and curr_bullish_pinbar_tweezer and prev_bullish_pinbar and prev2_bullish_pinbar
+bearish_double_tweezer = detect_double_tweezers and valid_triple and curr_bearish_pinbar_tweezer and prev_bearish_pinbar and prev2_bearish_pinbar
+
+bullish_tweezer = detect_tweezers and valid_pair and curr_bullish_pinbar_tweezer and prev_bullish_pinbar and not bullish_double_tweezer
+bearish_tweezer = detect_tweezers and valid_pair and curr_bearish_pinbar_tweezer and prev_bearish_pinbar and not bearish_double_tweezer
 
 // ===== Regular Engulfer Detection ============================================
 bullish_regular = detect_regular_engulfers and valid_inputs and prev_is_bearish and curr_is_bullish and open <= prev_close and close > prev_high and close_in_top_25
@@ -202,11 +242,12 @@ bearish_floating = detect_floating_engulfers and valid_inputs and prev_is_bearis
 // ===== Combined Signals ======================================================
 is_golden_candle = candle_range >= atr_value
 show_this_candle = (is_golden_candle and show_golden_candles) or (not is_golden_candle and show_small_candles)
-// Tweezers take priority (don't double-count with pinbars)
-bullish_signal = show_this_candle and (bullish_tweezer or (bullish_pinbar and not bullish_tweezer) or bullish_regular or bullish_floating)
-bearish_signal = show_this_candle and (bearish_tweezer or (bearish_pinbar and not bearish_tweezer) or bearish_regular or bearish_floating)
-bullish_golden_signal = is_golden_candle and bullish_signal
-bearish_golden_signal = is_golden_candle and bearish_signal
+// Priority order: double_tweezer > tweezer > pinbar > engulfers (engulfers
+// orthogonal). The `and not` chains above on tweezer ensure double-tweezer
+// shadows plain tweezer, and the priority below ensures plain tweezer
+// shadows pinbar (pinbar fires only when neither tweezer kind triggers).
+bullish_signal = show_this_candle and (bullish_double_tweezer or bullish_tweezer or (bullish_pinbar and not bullish_tweezer and not bullish_double_tweezer) or bullish_regular or bullish_floating)
+bearish_signal = show_this_candle and (bearish_double_tweezer or bearish_tweezer or (bearish_pinbar and not bearish_tweezer and not bearish_double_tweezer) or bearish_regular or bearish_floating)
 
 // ===== Signal Persistence & State Tracking ===================================
 var float[] bullish_highs = array.new_float()
@@ -223,29 +264,29 @@ var int[] bearish_bars = array.new_int()
 var label[] bearish_labels = array.new<label>()
 var bool[] bearish_golden = array.new_bool()
 
-// Persistent pattern-extremes for webhook embedding. These latch when a new
+// Persistent signal metadata for webhook embedding. These latch when a new
 // signal prints (bullish or bearish) and retain their last value across all
 // subsequent bars until the *next* signal overwrites them. Alertconditions
-// reference them via {{plot("pattern_high")}} etc. in their message= arg, so
-// the webhook payload carries the *signal* candle's extremes even when the
-// alert fires on a later (confirmation) bar. pattern_confirmed is 1.0 if
-// the latched pattern has been validated within `confirm_bars`, else 0.0.
-// Declared here (above the state loops) because the loops mutate
-// pattern_confirmed_v — Pine has no hoisting.
-var float pattern_high_v      = na
-var float pattern_low_v       = na
-var int   pattern_time_v      = na
-var float pattern_confirmed_v = 0.0
+// reference them via {{plot("signal_high")}} etc. in their message= arg, so
+// the webhook payload carries the *signal* geometry even when the alert
+// fires on a later (confirmation) bar. signal_confirmed flips to 1.0 once
+// a confirming push validates the latched signal within `confirm_bars`.
+// Declared above the state loops because the loops mutate them — Pine has
+// no hoisting.
+var float signal_high_v       = na
+var float signal_low_v        = na
+var float signal_range_v      = na
+var int   signal_start_time_v = na
+var float signal_kind_v       = na
+var float signal_golden_v     = 0.0
+var float signal_atr_v        = na
+var float signal_confirmed_v  = 0.0
 
 
 bool bullish_just_valid = false
 bool bullish_just_invalid = false
 bool bearish_just_valid = false
 bool bearish_just_invalid = false
-bool bullish_just_valid_golden = false
-bool bullish_just_invalid_golden = false
-bool bearish_just_valid_golden = false
-bool bearish_just_invalid_golden = false
 
 // Update existing bullish signals
 int bullish_index = array.size(bullish_states) - 1
@@ -274,18 +315,14 @@ while bullish_index >= 0
         array.set(bullish_states, idx, new_state)
         if new_state == STATE_VALID
             bullish_just_valid := true
-            if is_golden
-                bullish_just_valid_golden := true
             // Latch confirmation only if the validating signal IS the
-            // currently-latched pattern. Guards against a stale older
+            // currently-latched signal. Guards against a stale older
             // pending signal validating after a newer signal has
             // overwritten the latch.
-            if pattern_high_v == sig_high and pattern_low_v == sig_low
-                pattern_confirmed_v := 1.0
+            if signal_high_v == sig_high and signal_low_v == sig_low
+                signal_confirmed_v := 1.0
         else if state != STATE_INVALID and new_state == STATE_INVALID
             bullish_just_invalid := true
-            if is_golden
-                bullish_just_invalid_golden := true
 
     f_apply_label_style(sig_label, true, new_state, is_golden)
     bullish_index -= 1
@@ -317,29 +354,54 @@ while bearish_index >= 0
         array.set(bearish_states, idx, new_state)
         if new_state == STATE_VALID
             bearish_just_valid := true
-            if is_golden
-                bearish_just_valid_golden := true
             // Latch confirmation only if the validating signal IS the
-            // currently-latched pattern (see bullish branch above).
-            if pattern_high_v == sig_high and pattern_low_v == sig_low
-                pattern_confirmed_v := 1.0
+            // currently-latched signal (see bullish branch above).
+            if signal_high_v == sig_high and signal_low_v == sig_low
+                signal_confirmed_v := 1.0
         else if state != STATE_INVALID and new_state == STATE_INVALID
             bearish_just_invalid := true
-            if is_golden
-                bearish_just_invalid_golden := true
 
     f_apply_label_style(sig_label, false, new_state, is_golden)
     bearish_index -= 1
 
-// ===== Capture new signals & latch pattern-extremes ==========================
+// ===== Capture new signals & latch metadata ==================================
 // When a new signal prints this bar, push it into the per-direction tracking
-// arrays *and* overwrite the webhook-embedding latches (pattern_*_v declared
-// above the state loops). pattern_confirmed resets to 0.0 — a fresh signal
+// arrays *and* overwrite the webhook-embedding latches (signal_*_v declared
+// above the state loops). signal_confirmed resets to 0.0 — a fresh signal
 // is unconfirmed until a later bar pushes through its extreme.
+//
+// Signal kind classifier — must mirror the priority in `bullish_signal` /
+// `bearish_signal` above. Encoded as float per the KIND_* constants.
+f_bullish_kind() =>
+    bullish_double_tweezer       ? KIND_DOUBLE_TWEEZER
+      : bullish_tweezer          ? KIND_TWEEZER
+      : bullish_floating         ? KIND_FLOATING_ENGULFER
+      : bullish_regular          ? KIND_REGULAR_ENGULFER
+      : bullish_pinbar           ? KIND_PINBAR
+      : na
+
+f_bearish_kind() =>
+    bearish_double_tweezer       ? KIND_DOUBLE_TWEEZER
+      : bearish_tweezer          ? KIND_TWEEZER
+      : bearish_floating         ? KIND_FLOATING_ENGULFER
+      : bearish_regular          ? KIND_REGULAR_ENGULFER
+      : bearish_pinbar           ? KIND_PINBAR
+      : na
+
 if bullish_signal
-    float sig_high = bullish_tweezer ? math.max(high, nz(high[1], high)) : high
-    float sig_low = bullish_tweezer ? math.min(low, nz(low[1], low)) : low
-    float signal_size = bullish_tweezer ? (candle_range + prev_candle_range) : bullish_floating ? (sig_high - sig_low) : candle_range
+    float sig_high = bullish_double_tweezer ? math.max(high, nz(high[1], high), nz(high[2], high))
+                   : bullish_tweezer        ? math.max(high, nz(high[1], high))
+                   : high
+    float sig_low  = bullish_double_tweezer ? math.min(low, nz(low[1], low), nz(low[2], low))
+                   : bullish_tweezer        ? math.min(low, nz(low[1], low))
+                   : low
+    float signal_size = bullish_double_tweezer ? (candle_range + prev_candle_range + nz(prev2_candle_range, 0))
+                      : bullish_tweezer        ? (candle_range + prev_candle_range)
+                      : bullish_floating       ? (sig_high - sig_low)
+                      : candle_range
+    int sig_start_time = bullish_double_tweezer ? nz(time[2], time)
+                       : (bullish_tweezer or bullish_regular or bullish_floating) ? nz(time[1], time)
+                       : time
     bool is_golden = signal_size >= atr_value
     array.push(bullish_highs, sig_high)
     array.push(bullish_lows, sig_low)
@@ -350,17 +412,29 @@ if bullish_signal
     f_apply_label_style(lbl, true, STATE_PENDING, is_golden)
     array.push(bullish_labels, lbl)
     // Latch for webhook embedding (overwrites whichever signal was last).
-    // pattern_confirmed resets to 0.0 — a fresh signal is unconfirmed until
-    // a later bar pushes through the extreme within `confirm_bars`.
-    pattern_high_v      := sig_high
-    pattern_low_v       := sig_low
-    pattern_time_v      := time
-    pattern_confirmed_v := 0.0
+    signal_high_v       := sig_high
+    signal_low_v        := sig_low
+    signal_range_v      := sig_high - sig_low
+    signal_start_time_v := sig_start_time
+    signal_kind_v       := f_bullish_kind()
+    signal_golden_v     := is_golden ? 1.0 : 0.0
+    signal_atr_v        := atr_value
+    signal_confirmed_v  := 0.0
 
 if bearish_signal
-    float sig_high = bearish_tweezer ? math.max(high, nz(high[1], high)) : high
-    float sig_low = bearish_tweezer ? math.min(low, nz(low[1], low)) : low
-    float signal_size = bearish_tweezer ? (candle_range + prev_candle_range) : bearish_floating ? (sig_high - sig_low) : candle_range
+    float sig_high = bearish_double_tweezer ? math.max(high, nz(high[1], high), nz(high[2], high))
+                   : bearish_tweezer        ? math.max(high, nz(high[1], high))
+                   : high
+    float sig_low  = bearish_double_tweezer ? math.min(low, nz(low[1], low), nz(low[2], low))
+                   : bearish_tweezer        ? math.min(low, nz(low[1], low))
+                   : low
+    float signal_size = bearish_double_tweezer ? (candle_range + prev_candle_range + nz(prev2_candle_range, 0))
+                      : bearish_tweezer        ? (candle_range + prev_candle_range)
+                      : bearish_floating       ? (sig_high - sig_low)
+                      : candle_range
+    int sig_start_time = bearish_double_tweezer ? nz(time[2], time)
+                       : (bearish_tweezer or bearish_regular or bearish_floating) ? nz(time[1], time)
+                       : time
     bool is_golden = signal_size >= atr_value
     array.push(bearish_highs, sig_high)
     array.push(bearish_lows, sig_low)
@@ -370,16 +444,24 @@ if bearish_signal
     label lbl = f_create_label(bar_index, sig_high, false, is_golden)
     f_apply_label_style(lbl, false, STATE_PENDING, is_golden)
     array.push(bearish_labels, lbl)
-    pattern_high_v      := sig_high
-    pattern_low_v       := sig_low
-    pattern_time_v      := time
-    pattern_confirmed_v := 0.0
+    signal_high_v       := sig_high
+    signal_low_v        := sig_low
+    signal_range_v      := sig_high - sig_low
+    signal_start_time_v := sig_start_time
+    signal_kind_v       := f_bearish_kind()
+    signal_golden_v     := is_golden ? 1.0 : 0.0
+    signal_atr_v        := atr_value
+    signal_confirmed_v  := 0.0
 
-// Hidden plots so {{plot("pattern_high")}} etc. work in alert messages.
-plot(pattern_high_v,      title="pattern_high",      display=display.none)
-plot(pattern_low_v,       title="pattern_low",       display=display.none)
-plot(pattern_time_v,      title="pattern_time",      display=display.none)
-plot(pattern_confirmed_v, title="pattern_confirmed", display=display.none)
+// Hidden plots so {{plot("signal_*")}} works in alert messages.
+plot(signal_high_v,       title="signal_high",       display=display.none)
+plot(signal_low_v,        title="signal_low",        display=display.none)
+plot(signal_range_v,      title="signal_range",      display=display.none)
+plot(signal_start_time_v, title="signal_start_time", display=display.none)
+plot(signal_kind_v,       title="signal_kind",       display=display.none)
+plot(signal_golden_v,     title="signal_golden",     display=display.none)
+plot(signal_atr_v,        title="signal_atr",        display=display.none)
+plot(signal_confirmed_v,  title="signal_confirmed",  display=display.none)
 
 // Trim arrays to max_signals to limit memory and computation
 while array.size(bullish_states) > max_signals
@@ -403,33 +485,12 @@ while array.size(bearish_states) > max_signals
         label.delete(old_lbl)
 
 // ===== Alerts ================================================================
-// All signal/confirmed alertconditions carry pattern_high / pattern_low /
-// pattern_time / pattern_confirmed in their message body. The worker-side
-// Rhai engine reads these to gate retries (e.g. `allow_entry: !script
-// "pattern_confirmed"` waits for a confirming push before placing the order).
-// Invalid alertconditions stay plain text — the automated H&S pipeline
-// doesn't consume them.
-PATTERN_MSG = 'pattern_high={{plot("pattern_high")}}\npattern_low={{plot("pattern_low")}}\npattern_time={{plot("pattern_time")}}\npattern_confirmed={{plot("pattern_confirmed")}}'
+// Two alertconditions: "Long Pattern" and "Short Pattern". Each fires on BOTH
+// the signal bar (signal_confirmed=0) AND the confirmation bar
+// (signal_confirmed=1). The worker-side Rhai engine reads the shell vars to
+// decide whether to act (golden filter, kind filter, confirmation gate,
+// candle-size override, etc.).
+PATTERN_MSG = 'signal_high={{plot("signal_high")}}\nsignal_low={{plot("signal_low")}}\nsignal_range={{plot("signal_range")}}\nsignal_start_time={{plot("signal_start_time")}}\nsignal_kind={{plot("signal_kind")}}\ngolden={{plot("signal_golden")}}\natr={{plot("signal_atr")}}\nsignal_confirmed={{plot("signal_confirmed")}}'
 
-alertcondition(bullish_signal,              "Bullish Signal",           PATTERN_MSG)
-alertcondition(bearish_signal,              "Bearish Signal",           PATTERN_MSG)
-alertcondition(bullish_just_valid,          "Bullish Confirmed",        PATTERN_MSG)
-alertcondition(bearish_just_valid,          "Bearish Confirmed",        PATTERN_MSG)
-alertcondition(bullish_just_invalid,        "Bullish Invalid",          "Bullish signal invalidated")
-alertcondition(bearish_just_invalid,        "Bearish Invalid",          "Bearish signal invalidated")
-alertcondition(bullish_golden_signal,       "Bullish Golden Signal",    PATTERN_MSG)
-alertcondition(bearish_golden_signal,       "Bearish Golden Signal",    PATTERN_MSG)
-alertcondition(bullish_just_valid_golden,   "Bullish Golden Confirmed", PATTERN_MSG)
-alertcondition(bearish_just_valid_golden,   "Bearish Golden Confirmed", PATTERN_MSG)
-alertcondition(bullish_just_invalid_golden, "Bullish Golden Invalid",   "Bullish golden signal invalidated")
-alertcondition(bearish_just_invalid_golden, "Bearish Golden Invalid",   "Bearish golden signal invalidated")
-
-// "General" alerts — one per direction × goldenness, fire on BOTH the
-// signal bar (pattern_confirmed=0) and the confirmation bar
-// (pattern_confirmed=1). Use these when arming a single TV alert that
-// covers both fires; the worker's allow_entry script decides what to
-// do based on pattern_confirmed.
-alertcondition(bullish_signal or bullish_just_valid,               "Bullish General",        PATTERN_MSG)
-alertcondition(bearish_signal or bearish_just_valid,               "Bearish General",        PATTERN_MSG)
-alertcondition(bullish_golden_signal or bullish_just_valid_golden, "Bullish Golden General", PATTERN_MSG)
-alertcondition(bearish_golden_signal or bearish_just_valid_golden, "Bearish Golden General", PATTERN_MSG)
+alertcondition(bullish_signal or bullish_just_valid, "Long Pattern",  PATTERN_MSG)
+alertcondition(bearish_signal or bearish_just_valid, "Short Pattern", PATTERN_MSG)
