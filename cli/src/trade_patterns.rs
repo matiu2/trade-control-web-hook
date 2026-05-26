@@ -889,7 +889,9 @@ fn build_enter_alert(
     // risk_amount, when set, takes precedence over risk_pct — exactly
     // one is allowed on Intent::Enter, and the validator rejects both.
     match risk_amount {
-        Some(amount) => intent.risk_amount = Some(amount),
+        Some(amount) => {
+            intent.risk_amount = Some(trade_control_core::tunable::Tunable::Static(amount))
+        }
         None => intent.risk_pct = Some(trade_control_core::tunable::Tunable::Static(risk_pct)),
     }
     if dry_run {
@@ -1330,8 +1332,13 @@ tp_price: 1.05
         spec.risk_amount = Some(5.0);
         let trade = build_trade_from_spec(spec, now).unwrap();
         let enter = trade.alerts.last().unwrap();
-        assert_eq!(enter.intent.risk_amount, Some(5.0));
-        assert_eq!(enter.intent.risk_pct, None);
+        match &enter.intent.risk_amount {
+            Some(trade_control_core::tunable::Tunable::Static(a)) => {
+                assert!((a - 5.0).abs() < 1e-9);
+            }
+            other => panic!("expected Static(5.0) risk_amount, got {other:?}"),
+        }
+        assert!(enter.intent.risk_pct.is_none());
         enter.intent.validate().unwrap();
     }
 

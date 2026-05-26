@@ -262,8 +262,14 @@ pub struct Intent {
     /// applies — at fire time the worker translates the amount to an
     /// effective percent (`amount / equity * 100`) and rejects if
     /// that exceeds the cap.
+    ///
+    /// A [`Tunable<f64>`] — operators can supply a static literal
+    /// (`risk_amount: 1.0`) or a Rhai script (`risk_amount: !script
+    /// "..."`) that resolves against the standard three-phase scope
+    /// (shell anchors + derived geometry). Scripts returning a
+    /// non-finite or non-positive value are rejected at resolve time.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub risk_amount: Option<f64>,
+    pub risk_amount: Option<crate::tunable::Tunable<f64>>,
     /// Alternative to `risk_pct` / `risk_amount`: a fixed position
     /// size in instrument units (e.g. `0.01` for one micro-lot of FX,
     /// or a literal contract count for CFDs). Bypasses sizing math

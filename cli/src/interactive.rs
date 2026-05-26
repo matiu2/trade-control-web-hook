@@ -1175,8 +1175,13 @@ mod tests {
         let mut template: Value = serde_yaml::from_str(yaml).unwrap();
         fill_missing_fields(&mut template, true).unwrap();
         let intent: Intent = serde_yaml::from_value(template).unwrap();
-        assert_eq!(intent.risk_amount, Some(1.0));
-        assert_eq!(intent.risk_pct, None);
+        match intent.risk_amount {
+            Some(trade_control_core::tunable::Tunable::Static(a)) => {
+                assert!((a - 1.0).abs() < 1e-9);
+            }
+            other => panic!("expected Static(1.0) risk_amount, got {other:?}"),
+        }
+        assert!(intent.risk_pct.is_none());
     }
 
     #[test]
