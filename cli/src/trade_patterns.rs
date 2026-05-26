@@ -570,6 +570,26 @@ fn assemble_trade(
         &spec.account,
     ));
 
+    // Sign-time script validation. Catches typos / wrong-return-type /
+    // unknown-variable refs in any `Tunable::Script` field (today just
+    // `allow_entry`) before the alerts are signed. Errors from every
+    // alert are aggregated so the operator sees the full punch list,
+    // not one-at-a-time.
+    let script_errors: Vec<String> = alerts
+        .iter()
+        .flat_map(|alert| {
+            crate::script_validator::validate(&alert.intent)
+                .into_iter()
+                .map(move |e| format!("{}: {e}", alert.basename))
+        })
+        .collect();
+    if !script_errors.is_empty() {
+        return Err(eyre!(
+            "sign-time script validation failed:\n  - {}",
+            script_errors.join("\n  - ")
+        ));
+    }
+
     Ok(BuiltTrade {
         trade_id,
         instrument: spec.instrument.clone(),

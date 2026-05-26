@@ -8,6 +8,7 @@ mod expiry;
 mod history;
 mod interactive;
 mod prompts;
+mod script_validator;
 mod templates;
 mod trade_patterns;
 
@@ -19,6 +20,7 @@ pub use control::{
 };
 pub use history::{History, record_account_use, record_prep_use, record_veto_use};
 pub use interactive::{fill_missing_fields, prompt_save_as_template};
+pub use script_validator::{ScriptError, validate as validate_intent_scripts};
 pub use templates::{discover_templates, pick_template_interactive, templates_root};
 pub use trade_control_core::sig::KEY_LEN;
 pub use trade_patterns::{
