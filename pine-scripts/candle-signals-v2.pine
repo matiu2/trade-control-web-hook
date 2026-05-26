@@ -423,3 +423,13 @@ alertcondition(bullish_just_valid_golden,   "Bullish Golden Confirmed", PATTERN_
 alertcondition(bearish_just_valid_golden,   "Bearish Golden Confirmed", PATTERN_MSG)
 alertcondition(bullish_just_invalid_golden, "Bullish Golden Invalid",   "Bullish golden signal invalidated")
 alertcondition(bearish_just_invalid_golden, "Bearish Golden Invalid",   "Bearish golden signal invalidated")
+
+// "General" alerts — one per direction × goldenness, fire on BOTH the
+// signal bar (pattern_confirmed=0) and the confirmation bar
+// (pattern_confirmed=1). Use these when arming a single TV alert that
+// covers both fires; the worker's allow_entry script decides what to
+// do based on pattern_confirmed.
+alertcondition(bullish_signal or bullish_just_valid,               "Bullish General",        PATTERN_MSG)
+alertcondition(bearish_signal or bearish_just_valid,               "Bearish General",        PATTERN_MSG)
+alertcondition(bullish_golden_signal or bullish_just_valid_golden, "Bullish Golden General", PATTERN_MSG)
+alertcondition(bearish_golden_signal or bearish_just_valid_golden, "Bearish Golden General", PATTERN_MSG)
