@@ -725,6 +725,8 @@ mod tests {
             golden: None,
             atr: None,
             signal_confirmed: None,
+            recent_high: None,
+            recent_low: None,
         }
     }
 

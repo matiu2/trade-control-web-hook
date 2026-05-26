@@ -162,6 +162,8 @@ pub fn bind_shell_anchors(scope: &mut Scope, shell: &Shell) {
     push_opt_bool(scope, "golden", shell.golden);
     push_opt_f64(scope, "atr", shell.atr);
     push_opt_bool(scope, "signal_confirmed", shell.signal_confirmed);
+    push_opt_f64(scope, "recent_high", shell.recent_high);
+    push_opt_f64(scope, "recent_low", shell.recent_low);
 }
 
 fn push_opt_f64(scope: &mut Scope, name: &'static str, v: Option<f64>) {
@@ -382,6 +384,8 @@ mod tests {
             golden: Some(true),
             atr: Some(0.0012),
             signal_confirmed: Some(false),
+            recent_high: Some(1.2360),
+            recent_low: Some(1.2330),
         }
     }
 
@@ -399,6 +403,8 @@ mod tests {
             golden: None,
             atr: None,
             signal_confirmed: None,
+            recent_high: None,
+            recent_low: None,
         }
     }
 

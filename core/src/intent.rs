@@ -85,6 +85,15 @@ pub struct Shell {
         with = "bool_one_zero_serde"
     )]
     pub signal_confirmed: Option<bool>,
+    /// Highest high over the indicator's `sl_lookback` window of bars
+    /// *strictly preceding* the signal bar. Intended as a robust SL
+    /// anchor for short trades that doesn't depend on the signal
+    /// candle's own wick. Pine emits via `{{plot("recent_high")}}`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recent_high: Option<f64>,
+    /// Lowest low over the same window. SL anchor for long trades.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recent_low: Option<f64>,
 }
 
 /// Which candle signal detector fired. Mirrors the `KIND_*` constants
@@ -604,12 +613,22 @@ pub enum Direction {
 }
 
 /// Where in the plaintext shell to anchor a price.
+///
+/// `RecentHigh` / `RecentLow` reference Pine's `recent_high` / `recent_low`
+/// fields, which span the indicator's `sl_lookback` window of bars
+/// *strictly preceding* the signal bar. Useful as an SL anchor that
+/// doesn't depend on the signal candle's own wick. If the shell doesn't
+/// carry them (older Pine indicator), they fall back to the signal
+/// bar's `high` / `low` so behaviour degrades gracefully rather than
+/// producing a panic. Pine v2 from 2026-05-26 onwards ships them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
-#[serde(rename_all = "lowercase")]
+#[serde(rename_all = "snake_case")]
 pub enum PriceAnchor {
     Close,
     High,
     Low,
+    RecentHigh,
+    RecentLow,
 }
 
 /// Reference to a price. Either anchored to the plaintext shell with a pip
@@ -681,6 +700,11 @@ impl Shell {
             PriceAnchor::Close => self.close,
             PriceAnchor::High => self.high,
             PriceAnchor::Low => self.low,
+            // Fall back to signal-bar extremes if Pine didn't ship the
+            // recent_* field — keeps older indicators usable (with a
+            // tighter SL, which is the conservative direction to err in).
+            PriceAnchor::RecentHigh => self.recent_high.unwrap_or(self.high),
+            PriceAnchor::RecentLow => self.recent_low.unwrap_or(self.low),
         }
     }
 }
@@ -714,6 +738,8 @@ mod tests {
             golden: None,
             atr: None,
             signal_confirmed: None,
+            recent_high: None,
+            recent_low: None,
         }
     }
 
@@ -723,6 +749,43 @@ mod tests {
         assert_eq!(s.anchor_price(PriceAnchor::Close), 1.1000);
         assert_eq!(s.anchor_price(PriceAnchor::High), 1.1020);
         assert_eq!(s.anchor_price(PriceAnchor::Low), 1.0980);
+    }
+
+    #[test]
+    fn anchor_price_recent_uses_shell_field_when_present() {
+        let mut s = shell();
+        s.recent_high = Some(1.1050);
+        s.recent_low = Some(1.0950);
+        assert_eq!(s.anchor_price(PriceAnchor::RecentHigh), 1.1050);
+        assert_eq!(s.anchor_price(PriceAnchor::RecentLow), 1.0950);
+    }
+
+    #[test]
+    fn anchor_price_recent_falls_back_to_bar_extreme_when_missing() {
+        // Older Pine indicators don't ship recent_*. We fall back to the
+        // signal bar's own high/low so the worker doesn't panic — degrades
+        // to a tighter SL, never a looser one.
+        let s = shell();
+        assert!(s.recent_high.is_none());
+        assert!(s.recent_low.is_none());
+        assert_eq!(s.anchor_price(PriceAnchor::RecentHigh), s.high);
+        assert_eq!(s.anchor_price(PriceAnchor::RecentLow), s.low);
+    }
+
+    #[test]
+    fn price_anchor_recent_round_trips_through_yaml() {
+        let from: PriceAnchor = serde_yaml::from_str("recent_high").unwrap();
+        assert_eq!(from, PriceAnchor::RecentHigh);
+        let out = serde_yaml::to_string(&PriceAnchor::RecentLow).unwrap();
+        assert!(out.contains("recent_low"), "got: {out}");
+    }
+
+    #[test]
+    fn shell_round_trips_recent_fields() {
+        let y = "close: 1.1\nhigh: 1.11\nlow: 1.09\ntime: \"2026-05-26T10:00:00Z\"\nrecent_high: 1.115\nrecent_low: 1.085\n";
+        let s: Shell = serde_yaml::from_str(y).unwrap();
+        assert_eq!(s.recent_high, Some(1.115));
+        assert_eq!(s.recent_low, Some(1.085));
     }
 
     #[test]

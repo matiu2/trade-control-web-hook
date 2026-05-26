@@ -241,6 +241,8 @@ fn shell_for_tv_template() -> Vec<(&'static str, String)> {
             "signal_confirmed",
             "{{plot(\"signal_confirmed\")}}".to_string(),
         ),
+        ("recent_high", "{{plot(\"recent_high\")}}".to_string()),
+        ("recent_low", "{{plot(\"recent_low\")}}".to_string()),
     ]
 }
 

@@ -274,6 +274,15 @@ pub struct TradeSpec {
     /// behaviour as `entry_offset_pips`.
     #[serde(default)]
     pub sl_offset_pips: Option<f64>,
+    /// Override the pattern's default SL anchor. Omit to use the pattern
+    /// default (`High` for H&S, `Low` for iH&S — the signal bar's own
+    /// extreme). Set to `recent_high` / `recent_low` to anchor against
+    /// Pine's `recent_high` / `recent_low` shell fields, which span the
+    /// indicator's `sl_lookback` window of bars *strictly preceding* the
+    /// signal bar. Useful when the signal candle is unusually small and
+    /// a tight wick-based SL would be hit by ordinary noise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sl_anchor: Option<PriceAnchor>,
     /// Take-profit absolute price. The worker treats this verbatim and
     /// does not consult the shell.
     pub tp_price: f64,
@@ -390,7 +399,32 @@ pub fn build_trade_from_spec(spec: TradeSpec, now: DateTime<Utc>) -> Result<Buil
             ));
         }
     }
-    let geometry = PatternGeometry::for_pattern(spec.pattern);
+    let mut geometry = PatternGeometry::for_pattern(spec.pattern);
+    if let Some(override_anchor) = spec.sl_anchor {
+        // Validate the override makes directional sense — a short can't
+        // have its SL anchored to a low, and vice versa. (We don't gate
+        // close-anchored here because that's already an odd choice the
+        // operator might want for ATR-style stops.)
+        let ok = matches!(
+            (geometry.direction, override_anchor),
+            (
+                Direction::Short,
+                PriceAnchor::High | PriceAnchor::RecentHigh
+            ) | (Direction::Long, PriceAnchor::Low | PriceAnchor::RecentLow)
+                | (_, PriceAnchor::Close)
+        );
+        if !ok {
+            return Err(eyre!(
+                "sl_anchor {:?} is incompatible with {} direction",
+                override_anchor,
+                match geometry.direction {
+                    Direction::Long => "long",
+                    Direction::Short => "short",
+                }
+            ));
+        }
+        geometry.sl_anchor = override_anchor;
+    }
     let entry_offset_pips = spec
         .entry_offset_pips
         .unwrap_or(geometry.entry_offset_default);
@@ -528,6 +562,7 @@ fn build_pattern(
         entry_deadline_pct,
         allow_entry: None,
         entry_mode: EntryMode::default(),
+        sl_anchor: None,
     };
     assemble_trade(spec, geometry, entry_offset_pips, sl_offset_pips, now)
 }
@@ -642,6 +677,8 @@ fn anchor_label(anchor: PriceAnchor) -> &'static str {
         PriceAnchor::Close => "close",
         PriceAnchor::High => "high",
         PriceAnchor::Low => "low",
+        PriceAnchor::RecentHigh => "recent_high",
+        PriceAnchor::RecentLow => "recent_low",
     }
 }
 
@@ -1118,6 +1155,7 @@ mod tests {
                 entry_deadline_pct: DEFAULT_ENTRY_DEADLINE_PCT,
                 allow_entry: None,
                 entry_mode: EntryMode::Stop,
+                sl_anchor: None,
             },
         };
         let manifest = render_manifest(&trade);
@@ -1281,6 +1319,7 @@ mod tests {
             entry_deadline_pct: 80,
             allow_entry: None,
             entry_mode: EntryMode::Stop,
+            sl_anchor: None,
         }
     }
 
@@ -1659,5 +1698,59 @@ tp_price: 1.05
         assert_eq!(alert.intent.not_before, Some(trade_expiry));
         assert_eq!(alert.intent.not_after, veto_expiry);
         assert_eq!(alert.intent.name.as_deref(), Some("trade-expiry"));
+    }
+
+    #[test]
+    fn sl_anchor_override_lands_on_enter_intent() {
+        // Override the H&S default (PriceAnchor::High → signal bar high)
+        // with RecentHigh — the SL price ref on the enter intent must
+        // pick up the override.
+        let now = ts("2026-05-20T00:00:00Z");
+        let mut spec = sample_spec(TradePattern::Hs, ts("2026-05-25T00:00:00Z"));
+        spec.sl_anchor = Some(PriceAnchor::RecentHigh);
+        let trade = build_trade_from_spec(spec, now).unwrap();
+        let enter = trade.alerts.last().unwrap();
+        match &enter.intent.stop_loss {
+            Some(PriceRef::Anchored { from, .. }) => assert_eq!(*from, PriceAnchor::RecentHigh),
+            other => panic!("expected Anchored SL, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sl_anchor_rejects_wrong_direction() {
+        // Short trade with RecentLow SL is nonsensical (SL would be
+        // below the entry, on the wrong side of the trade).
+        let now = ts("2026-05-20T00:00:00Z");
+        let mut spec = sample_spec(TradePattern::Hs, ts("2026-05-25T00:00:00Z"));
+        spec.sl_anchor = Some(PriceAnchor::RecentLow);
+        let err = build_trade_from_spec(spec, now).unwrap_err();
+        assert!(err.to_string().contains("short"), "got {err}");
+    }
+
+    #[test]
+    fn sl_anchor_accepts_recent_low_for_long() {
+        let now = ts("2026-05-20T00:00:00Z");
+        let mut spec = sample_spec(TradePattern::Ihs, ts("2026-05-25T00:00:00Z"));
+        spec.sl_anchor = Some(PriceAnchor::RecentLow);
+        let trade = build_trade_from_spec(spec, now).unwrap();
+        let enter = trade.alerts.last().unwrap();
+        match &enter.intent.stop_loss {
+            Some(PriceRef::Anchored { from, .. }) => assert_eq!(*from, PriceAnchor::RecentLow),
+            other => panic!("expected Anchored SL, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn trade_spec_yaml_parses_sl_anchor_recent_high() {
+        let yaml = "\
+pattern: hs
+instrument: EUR_USD
+account: demo
+trade_expiry: \"2026-05-25T00:00:00Z\"
+tp_price: 1.05
+sl_anchor: recent_high
+";
+        let spec: TradeSpec = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(spec.sl_anchor, Some(PriceAnchor::RecentHigh));
     }
 }

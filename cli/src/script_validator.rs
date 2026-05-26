@@ -152,6 +152,8 @@ fn fixture_shell() -> Shell {
         golden: Some(true),
         atr: Some(0.0012),
         signal_confirmed: Some(true),
+        recent_high: Some(1.1030),
+        recent_low: Some(1.0975),
     }
 }
 

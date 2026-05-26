@@ -92,6 +92,8 @@ mod tests {
             golden: None,
             atr: None,
             signal_confirmed,
+            recent_high: None,
+            recent_low: None,
         }
     }
 

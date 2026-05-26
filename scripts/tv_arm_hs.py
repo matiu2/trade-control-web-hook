@@ -783,6 +783,15 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
              "slippage. SL still anchors to geometry.",
     )
     p.add_argument(
+        "--sl-from-recent", action="store_true",
+        help="Anchor SL to Pine's recent_high (shorts) / recent_low (longs) "
+             "instead of the signal bar's own wick. Spans the indicator's "
+             "sl_lookback window of bars *preceding* the signal bar — gives "
+             "the trade more breathing room when the signal candle is small. "
+             "Requires the v2 indicator from 2026-05-26+; older indicators "
+             "silently fall back to the bar extreme (tighter SL).",
+    )
+    p.add_argument(
         "--entry-filter-script", dest="entry_filter_script", default=None,
         help="Rhai script that gates whether the worker places the entry "
              "order. Lands on the enter intent's `allow_entry` as a "
@@ -901,6 +910,10 @@ def main(argv: Optional[list[str]] = None) -> int:
         spec["allow_entry"] = args.entry_filter_script
     if args.entry_market:
         spec["entry_mode"] = "market"
+    if args.sl_from_recent:
+        # pattern is "hs" → short → recent_high; "ihs" → long → recent_low.
+        # Rust side validates direction compatibility too.
+        spec["sl_anchor"] = "recent_high" if pattern == "hs" else "recent_low"
     if skip_preps:
         spec["skip_preps"] = skip_preps
     write_trade_spec(spec, spec_path)

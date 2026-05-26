@@ -63,6 +63,10 @@ hide_invalid = input.bool(true, "Hide Invalid Signals")
 // flips to 1.0 inside this window).
 confirm_bars = input.int(2, "Confirmation Bars", minval=1, maxval=10, tooltip="Bars after signal print within which a confirming push validates the signal.")
 
+// SL lookback — how many prior bars to scan when reporting recent_high / recent_low
+// for SL anchoring. Worker-side scripts can use these as stop-loss reference levels.
+sl_lookback = input.int(5, "SL Lookback Bars", minval=1, maxval=200, tooltip="Window of prior bars whose extreme is reported as recent_high / recent_low for stop-loss anchoring.")
+
 // Tweezer similarity threshold
 similarity_pct = input.float(20.0, "Tweezer High/Low Similarity (%)", minval=0.0, maxval=100.0, step=0.1)
 
@@ -453,6 +457,13 @@ if bearish_signal
     signal_atr_v        := atr_value
     signal_confirmed_v  := 0.0
 
+// Recent-extreme reference levels for SL anchoring. Strictly prior bars —
+// `[1]` indexes the bar before the current one, so this is the highest/lowest
+// of the sl_lookback bars *preceding* the signal bar. Worker scripts can read
+// these as a robust SL anchor that doesn't depend on the signal candle itself.
+recent_high_v = ta.highest(high[1], sl_lookback)
+recent_low_v  = ta.lowest(low[1],   sl_lookback)
+
 // Hidden plots so {{plot("signal_*")}} works in alert messages.
 plot(signal_high_v,       title="signal_high",       display=display.none)
 plot(signal_low_v,        title="signal_low",        display=display.none)
@@ -462,6 +473,8 @@ plot(signal_kind_v,       title="signal_kind",       display=display.none)
 plot(signal_golden_v,     title="signal_golden",     display=display.none)
 plot(signal_atr_v,        title="signal_atr",        display=display.none)
 plot(signal_confirmed_v,  title="signal_confirmed",  display=display.none)
+plot(recent_high_v,       title="recent_high",       display=display.none)
+plot(recent_low_v,        title="recent_low",        display=display.none)
 
 // Trim arrays to max_signals to limit memory and computation
 while array.size(bullish_states) > max_signals
@@ -490,7 +503,7 @@ while array.size(bearish_states) > max_signals
 // (signal_confirmed=1). The worker-side Rhai engine reads the shell vars to
 // decide whether to act (golden filter, kind filter, confirmation gate,
 // candle-size override, etc.).
-PATTERN_MSG = 'signal_high={{plot("signal_high")}}\nsignal_low={{plot("signal_low")}}\nsignal_range={{plot("signal_range")}}\nsignal_start_time={{plot("signal_start_time")}}\nsignal_kind={{plot("signal_kind")}}\ngolden={{plot("signal_golden")}}\natr={{plot("signal_atr")}}\nsignal_confirmed={{plot("signal_confirmed")}}'
+PATTERN_MSG = 'signal_high={{plot("signal_high")}}\nsignal_low={{plot("signal_low")}}\nsignal_range={{plot("signal_range")}}\nsignal_start_time={{plot("signal_start_time")}}\nsignal_kind={{plot("signal_kind")}}\ngolden={{plot("signal_golden")}}\natr={{plot("signal_atr")}}\nsignal_confirmed={{plot("signal_confirmed")}}\nrecent_high={{plot("recent_high")}}\nrecent_low={{plot("recent_low")}}'
 
 alertcondition(bullish_signal or bullish_just_valid, "Long Pattern",  PATTERN_MSG)
 alertcondition(bearish_signal or bearish_just_valid, "Short Pattern", PATTERN_MSG)
