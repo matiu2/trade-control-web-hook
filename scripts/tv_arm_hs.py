@@ -456,8 +456,13 @@ def build_alert_spec(
         }
 
     if base == "05-enter":
-        # Bearish Golden Signal = plot_7 (confirmed); bullish = plot_6 (guess).
-        plot_id = "plot_7" if direction == "short" else "plot_6"
+        # candle-signals v2 has 8 plot()s (plot_0..plot_7 — the
+        # signal_* latches) followed by 2 alertcondition()s in
+        # source order:
+        #   plot_8 = "Long Pattern"  (line 495)
+        #   plot_9 = "Short Pattern" (line 496)
+        # TV indexes plot+alertcondition into a single namespace.
+        plot_id = "plot_9" if direction == "short" else "plot_8"
         return {
             "kind": "pine_alertcondition",
             "indicator_name": "Candle Signals",
