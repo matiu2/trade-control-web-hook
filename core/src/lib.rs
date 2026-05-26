@@ -9,6 +9,7 @@ pub mod account;
 pub mod broker;
 pub mod incoming;
 pub mod intent;
+pub mod rules;
 pub mod sig;
 pub mod state;
 pub mod tunable;
