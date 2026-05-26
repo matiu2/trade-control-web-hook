@@ -8,17 +8,21 @@
 //!    evaluations within one request.
 //! 2. [`bind_shell_anchors`] — pushes the Shell's 12 anchors into a
 //!    fresh [`rhai::Scope`]. Phase 1 of the three-phase scope build.
-//! 3. [`eval_script`] — generic `Script<T>` evaluator. Parses the
+//! 3. [`bind_intent_derived`] — pushes the resolved entry / SL / TP
+//!    geometry (`entry_price`, `sl_distance`, `tp_distance`,
+//!    `r_multiple`, `pip_size`, `instrument`, `direction`) into the
+//!    scope. Phase 2 of the three-phase build; called after Phase 1
+//!    so scripts can mix shell anchors with derived distances.
+//! 4. [`eval_script`] — generic `Script<T>` evaluator. Parses the
 //!    script source, runs it against the supplied scope, and casts
 //!    the result back to `T`.
 //!
-//! Phases 2 (derived intent geometry) and 3 (Tunable resolution) land
-//! with the C-tunable-fields and C-allow-entry sub-steps. They build
-//! on the surface here.
+//! Phase 3 (Tunable resolution — `risk_pct`, `max_retries`, etc.) lands
+//! with the C-tunable-fields sub-step. It builds on the surface here.
 
 use rhai::{Dynamic, Engine, EvalAltResult, ParseError, Scope};
 
-use crate::intent::{Shell, SignalKind};
+use crate::intent::{Direction, Resolved, ResolvedEntry, Shell, SignalKind};
 use crate::tunable::CompiledScript;
 
 /// Maximum number of Rhai opcodes a single script may execute. Real
@@ -189,6 +193,57 @@ fn signal_kind_to_str(k: SignalKind) -> &'static str {
         SignalKind::FloatingEngulfer => "floating_engulfer",
         SignalKind::DoubleTweezer => "double_tweezer",
     }
+}
+
+/// Phase 2 of scope building: push the resolved geometry into the scope.
+///
+/// Bindings:
+/// - `entry_price: f64` — the resolved entry price. For [`ResolvedEntry::Market`]
+///   it's the reference price (shell close); for `Stop` / `Limit` it's the
+///   trigger price.
+/// - `stop_loss: f64` — absolute SL price.
+/// - `take_profit: f64` — absolute TP price.
+/// - `sl_distance: f64` — `|entry_price - stop_loss|`, always positive.
+/// - `tp_distance: f64` — `|take_profit - entry_price|`, always positive.
+/// - `r_multiple: f64` — `tp_distance / sl_distance`, or `0.0` if SL distance
+///   is zero (defensive — `Resolved` guards against degenerate geometry but
+///   we don't want a script to panic on a future regression).
+/// - `pip_size: f64` — instrument pip size as supplied by the caller.
+/// - `instrument: String` — e.g. `"EUR_USD"`.
+/// - `direction: String` — `"long"` or `"short"`. Mirrors the
+///   [`SignalKind`] string-binding convention so scripts can write
+///   `direction == "long"`.
+///
+/// Must be called after [`bind_shell_anchors`] — Phase 2 layers on top
+/// of Phase 1 in the same scope.
+pub fn bind_intent_derived(scope: &mut Scope, resolved: &Resolved, pip_size: f64) {
+    let entry_price = match resolved.entry {
+        ResolvedEntry::Market { reference_price } => reference_price,
+        ResolvedEntry::Stop { trigger_price } | ResolvedEntry::Limit { trigger_price } => {
+            trigger_price
+        }
+    };
+    let sl_distance = (entry_price - resolved.stop_loss).abs();
+    let tp_distance = (resolved.take_profit - entry_price).abs();
+    let r_multiple = if sl_distance == 0.0 {
+        0.0
+    } else {
+        tp_distance / sl_distance
+    };
+    let direction = match resolved.direction {
+        Direction::Long => "long",
+        Direction::Short => "short",
+    };
+
+    scope.push_constant("entry_price", entry_price);
+    scope.push_constant("stop_loss", resolved.stop_loss);
+    scope.push_constant("take_profit", resolved.take_profit);
+    scope.push_constant("sl_distance", sl_distance);
+    scope.push_constant("tp_distance", tp_distance);
+    scope.push_constant("r_multiple", r_multiple);
+    scope.push_constant("pip_size", pip_size);
+    scope.push_constant("instrument", resolved.instrument.clone());
+    scope.push_constant("direction", direction.to_string());
 }
 
 /// Trait for "what Rhai return types can a `Tunable<T>` ultimately
@@ -505,5 +560,226 @@ mod tests {
         let s = CompiledScript::new("signal_confirmed == true || pct(signal_range, 0.006) >= 10.0");
         let v: bool = eval_script(&engine, &mut scope, &s).unwrap();
         assert!(v);
+    }
+
+    // ---- Phase 2: bind_intent_derived ----
+
+    fn resolved_long_market() -> Resolved {
+        // entry=1.1000, SL=1.0978, TP=1.1044 → sl=0.0022, tp=0.0044, R=2.0
+        Resolved {
+            id: "t1".into(),
+            not_after: "2026-05-13T20:00:00Z".parse().unwrap(),
+            instrument: "EUR_USD".into(),
+            direction: Direction::Long,
+            entry: ResolvedEntry::Market {
+                reference_price: 1.1000,
+            },
+            stop_loss: 1.0978,
+            take_profit: 1.1044,
+            risk: crate::intent::RiskBudget::Percent(0.5),
+            dry_run: false,
+        }
+    }
+
+    #[test]
+    fn derived_market_entry_binds_reference_price() {
+        let engine = build_engine();
+        let mut scope = Scope::new();
+        bind_shell_anchors(&mut scope, &shell_full());
+        bind_intent_derived(&mut scope, &resolved_long_market(), 0.0001);
+        let v: f64 = eval_script(&engine, &mut scope, &CompiledScript::new("entry_price")).unwrap();
+        assert!((v - 1.1000).abs() < 1e-9);
+    }
+
+    #[test]
+    fn derived_stop_entry_binds_trigger_price() {
+        let engine = build_engine();
+        let mut scope = Scope::new();
+        let mut r = resolved_long_market();
+        r.entry = ResolvedEntry::Stop {
+            trigger_price: 1.1022,
+        };
+        bind_shell_anchors(&mut scope, &shell_full());
+        bind_intent_derived(&mut scope, &r, 0.0001);
+        let v: f64 = eval_script(&engine, &mut scope, &CompiledScript::new("entry_price")).unwrap();
+        assert!((v - 1.1022).abs() < 1e-9);
+    }
+
+    #[test]
+    fn derived_limit_entry_binds_trigger_price() {
+        let engine = build_engine();
+        let mut scope = Scope::new();
+        let mut r = resolved_long_market();
+        r.entry = ResolvedEntry::Limit {
+            trigger_price: 1.0985,
+        };
+        bind_shell_anchors(&mut scope, &shell_full());
+        bind_intent_derived(&mut scope, &r, 0.0001);
+        let v: f64 = eval_script(&engine, &mut scope, &CompiledScript::new("entry_price")).unwrap();
+        assert!((v - 1.0985).abs() < 1e-9);
+    }
+
+    #[test]
+    fn derived_distances_always_positive_for_long() {
+        let engine = build_engine();
+        let mut scope = Scope::new();
+        bind_shell_anchors(&mut scope, &shell_full());
+        bind_intent_derived(&mut scope, &resolved_long_market(), 0.0001);
+        let sl: f64 =
+            eval_script(&engine, &mut scope, &CompiledScript::new("sl_distance")).unwrap();
+        let tp: f64 =
+            eval_script(&engine, &mut scope, &CompiledScript::new("tp_distance")).unwrap();
+        assert!((sl - 0.0022).abs() < 1e-9, "got {sl}");
+        assert!((tp - 0.0044).abs() < 1e-9, "got {tp}");
+    }
+
+    #[test]
+    fn derived_distances_always_positive_for_short() {
+        // Short: entry above SL, TP below entry. Both distances must
+        // still bind as positive magnitudes.
+        let engine = build_engine();
+        let mut scope = Scope::new();
+        let r = Resolved {
+            id: "t1".into(),
+            not_after: "2026-05-13T20:00:00Z".parse().unwrap(),
+            instrument: "EUR_USD".into(),
+            direction: Direction::Short,
+            entry: ResolvedEntry::Market {
+                reference_price: 1.1000,
+            },
+            stop_loss: 1.1022,
+            take_profit: 1.0956,
+            risk: crate::intent::RiskBudget::Percent(0.5),
+            dry_run: false,
+        };
+        bind_shell_anchors(&mut scope, &shell_full());
+        bind_intent_derived(&mut scope, &r, 0.0001);
+        let sl: f64 =
+            eval_script(&engine, &mut scope, &CompiledScript::new("sl_distance")).unwrap();
+        let tp: f64 =
+            eval_script(&engine, &mut scope, &CompiledScript::new("tp_distance")).unwrap();
+        assert!((sl - 0.0022).abs() < 1e-9, "got {sl}");
+        assert!((tp - 0.0044).abs() < 1e-9, "got {tp}");
+    }
+
+    #[test]
+    fn derived_r_multiple_computes_correctly() {
+        let engine = build_engine();
+        let mut scope = Scope::new();
+        bind_shell_anchors(&mut scope, &shell_full());
+        bind_intent_derived(&mut scope, &resolved_long_market(), 0.0001);
+        let v: f64 = eval_script(&engine, &mut scope, &CompiledScript::new("r_multiple")).unwrap();
+        assert!((v - 2.0).abs() < 1e-9, "got {v}");
+    }
+
+    #[test]
+    fn derived_r_multiple_zero_sl_distance_returns_zero() {
+        // Degenerate geometry — `Resolved` won't normally produce this
+        // (the resolver rejects EntryOutsideRange) but the script
+        // surface should be defensive.
+        let engine = build_engine();
+        let mut scope = Scope::new();
+        let mut r = resolved_long_market();
+        r.stop_loss = 1.1000; // == entry_price
+        bind_shell_anchors(&mut scope, &shell_full());
+        bind_intent_derived(&mut scope, &r, 0.0001);
+        let v: f64 = eval_script(&engine, &mut scope, &CompiledScript::new("r_multiple")).unwrap();
+        assert_eq!(v, 0.0);
+    }
+
+    #[test]
+    fn derived_pip_size_visible() {
+        let engine = build_engine();
+        let mut scope = Scope::new();
+        bind_shell_anchors(&mut scope, &shell_full());
+        bind_intent_derived(&mut scope, &resolved_long_market(), 0.0001);
+        let v: f64 = eval_script(&engine, &mut scope, &CompiledScript::new("pip_size")).unwrap();
+        assert!((v - 0.0001).abs() < 1e-12);
+    }
+
+    #[test]
+    fn derived_instrument_binds_as_string() {
+        let engine = build_engine();
+        let mut scope = Scope::new();
+        bind_shell_anchors(&mut scope, &shell_full());
+        bind_intent_derived(&mut scope, &resolved_long_market(), 0.0001);
+        let v: bool = eval_script(
+            &engine,
+            &mut scope,
+            &CompiledScript::new("instrument == \"EUR_USD\""),
+        )
+        .unwrap();
+        assert!(v);
+    }
+
+    #[test]
+    fn derived_direction_binds_long() {
+        let engine = build_engine();
+        let mut scope = Scope::new();
+        bind_shell_anchors(&mut scope, &shell_full());
+        bind_intent_derived(&mut scope, &resolved_long_market(), 0.0001);
+        let v: bool = eval_script(
+            &engine,
+            &mut scope,
+            &CompiledScript::new("direction == \"long\""),
+        )
+        .unwrap();
+        assert!(v);
+    }
+
+    #[test]
+    fn derived_direction_binds_short() {
+        let engine = build_engine();
+        let mut scope = Scope::new();
+        let mut r = resolved_long_market();
+        r.direction = Direction::Short;
+        // Flip geometry so the binding is the only thing under test —
+        // bind_intent_derived doesn't validate the geometry itself.
+        r.stop_loss = 1.1022;
+        r.take_profit = 1.0956;
+        bind_shell_anchors(&mut scope, &shell_full());
+        bind_intent_derived(&mut scope, &r, 0.0001);
+        let v: bool = eval_script(
+            &engine,
+            &mut scope,
+            &CompiledScript::new("direction == \"short\""),
+        )
+        .unwrap();
+        assert!(v);
+    }
+
+    #[test]
+    fn shell_and_derived_compose_in_same_scope() {
+        // Canonical allow_entry-style script that mixes Phase 1
+        // (signal_range) with Phase 2 (tp_distance) bindings.
+        let engine = build_engine();
+        let mut scope = Scope::new();
+        let mut shell = shell_full();
+        shell.signal_range = Some(0.0006);
+        shell.signal_confirmed = Some(false);
+        bind_shell_anchors(&mut scope, &shell);
+        bind_intent_derived(&mut scope, &resolved_long_market(), 0.0001);
+        // signal_range 0.0006 / tp_distance 0.0044 = ~13.6%
+        let s = CompiledScript::new(
+            "signal_confirmed == true || pct(signal_range, tp_distance) >= 10.0",
+        );
+        let v: bool = eval_script(&engine, &mut scope, &s).unwrap();
+        assert!(v);
+    }
+
+    #[test]
+    fn pips_helper_works_with_bound_pip_size() {
+        let engine = build_engine();
+        let mut scope = Scope::new();
+        bind_shell_anchors(&mut scope, &shell_full());
+        bind_intent_derived(&mut scope, &resolved_long_market(), 0.0001);
+        // sl_distance = 0.0022; 0.0022 / 0.0001 = 22 pips
+        let v: f64 = eval_script(
+            &engine,
+            &mut scope,
+            &CompiledScript::new("pips(sl_distance, pip_size)"),
+        )
+        .unwrap();
+        assert!((v - 22.0).abs() < 1e-9, "got {v}");
     }
 }
