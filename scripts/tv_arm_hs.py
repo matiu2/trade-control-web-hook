@@ -812,9 +812,9 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     )
     p.add_argument(
         "--skip-retest", action="store_true",
-        help="Drop the retest prep from the bundle. Implies "
-             "--skip-break-and-close (if you're past the retest, the "
-             "break already fired). Use for stocks or late setups.",
+        help="Drop the retest prep from the bundle. Does NOT imply "
+             "--skip-break-and-close — pass both if you want to skip "
+             "both (e.g. stocks, or late setups past the retest).",
     )
     return p.parse_args(argv)
 
@@ -886,11 +886,12 @@ def main(argv: Optional[list[str]] = None) -> int:
         or DEFAULT_ACCOUNT_BY_BROKER[broker]
     )
     risk_pct = args.risk_pct if args.risk_pct is not None else 1.0
-    # --skip-retest implies --skip-break-and-close: if we're past the retest,
-    # the break already fired. Use case: stocks (no neckline retest expected),
-    # or arriving late to a setup that has already broken+retested.
+    # Each --skip-* flag is independent: --skip-retest only skips the
+    # retest prep, --skip-break-and-close only skips the break-and-close
+    # prep. Pass both to skip both (e.g. stocks, or setups arriving past
+    # both stages).
     skip_preps: list[str] = []
-    if args.skip_break_and_close or args.skip_retest:
+    if args.skip_break_and_close:
         skip_preps.append("break-and-close")
     if args.skip_retest:
         skip_preps.append("retest")
