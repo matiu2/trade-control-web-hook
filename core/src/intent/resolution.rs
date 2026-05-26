@@ -501,6 +501,7 @@ mod tests {
             trade_id: None,
             max_retries: None,
             allow_entry: None,
+            needs_golden: false,
         }
     }
 

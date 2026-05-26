@@ -22,6 +22,11 @@ pub enum AllowEntryOutcome {
     Proceed,
     /// Gate returned `false`. 412 "entry blocked".
     Blocked,
+    /// `needs_golden` was set on the intent but the incoming shell did
+    /// not carry `golden: Some(true)`. 412 "entry blocked: needs-golden".
+    /// Distinct from `Blocked` so the rejection log makes the cause
+    /// obvious without the operator having to read a script.
+    NeedsGoldenUnmet,
     /// Script error. 412 "entry blocked: script error".
     ScriptError {
         /// Short label for the rejection-outcome telemetry string
@@ -34,12 +39,18 @@ pub enum AllowEntryOutcome {
 }
 
 /// Run the gate. Caller logs / maps the outcome to an HTTP response.
+///
+/// Order: `needs_golden` is checked first (cheap, no scripting), then
+/// the `allow_entry` script. Both gates must pass — semantics are AND.
 pub fn evaluate(
     intent: &Intent,
     shell: &Shell,
     resolved: &Resolved,
     pip_size: f64,
 ) -> AllowEntryOutcome {
+    if intent.needs_golden && shell.golden != Some(true) {
+        return AllowEntryOutcome::NeedsGoldenUnmet;
+    }
     let Some(gate) = &intent.allow_entry else {
         return AllowEntryOutcome::Proceed;
     };
@@ -149,6 +160,7 @@ mod tests {
             trade_id: None,
             max_retries: None,
             allow_entry: gate,
+            needs_golden: false,
         }
     }
 
@@ -248,6 +260,105 @@ mod tests {
             AllowEntryOutcome::ScriptError { kind, .. } => assert_eq!(kind, "parse"),
             other => panic!("expected ScriptError(parse), got {other:?}"),
         }
+    }
+
+    fn shell_with_golden(golden: Option<bool>) -> Shell {
+        let mut shell = shell_with(None);
+        shell.golden = golden;
+        shell
+    }
+
+    fn intent_needs_golden(needs_golden: bool, gate: Option<Tunable<bool>>) -> Intent {
+        let mut intent = intent_with_gate(gate);
+        intent.needs_golden = needs_golden;
+        intent
+    }
+
+    #[test]
+    fn needs_golden_blocks_when_shell_missing_golden() {
+        // `golden: None` is the realistic case — older Pine indicators
+        // that don't carry the field at all. Conservative reject.
+        let outcome = evaluate(
+            &intent_needs_golden(true, None),
+            &shell_with_golden(None),
+            &resolved_long_market(),
+            0.0001,
+        );
+        assert_eq!(outcome, AllowEntryOutcome::NeedsGoldenUnmet);
+    }
+
+    #[test]
+    fn needs_golden_blocks_when_shell_golden_false() {
+        let outcome = evaluate(
+            &intent_needs_golden(true, None),
+            &shell_with_golden(Some(false)),
+            &resolved_long_market(),
+            0.0001,
+        );
+        assert_eq!(outcome, AllowEntryOutcome::NeedsGoldenUnmet);
+    }
+
+    #[test]
+    fn needs_golden_proceeds_when_shell_golden_true() {
+        let outcome = evaluate(
+            &intent_needs_golden(true, None),
+            &shell_with_golden(Some(true)),
+            &resolved_long_market(),
+            0.0001,
+        );
+        assert_eq!(outcome, AllowEntryOutcome::Proceed);
+    }
+
+    #[test]
+    fn needs_golden_false_ignored() {
+        // Default-off — should be a noop even with golden: None.
+        let outcome = evaluate(
+            &intent_needs_golden(false, None),
+            &shell_with_golden(None),
+            &resolved_long_market(),
+            0.0001,
+        );
+        assert_eq!(outcome, AllowEntryOutcome::Proceed);
+    }
+
+    #[test]
+    fn needs_golden_runs_before_allow_entry_script() {
+        // Golden check is cheap and ordered first; even if the script
+        // would error, the gate short-circuits on needs_golden_unmet.
+        let broken_script = Tunable::from_script("if if if");
+        let outcome = evaluate(
+            &intent_needs_golden(true, Some(broken_script)),
+            &shell_with_golden(Some(false)),
+            &resolved_long_market(),
+            0.0001,
+        );
+        assert_eq!(outcome, AllowEntryOutcome::NeedsGoldenUnmet);
+    }
+
+    #[test]
+    fn needs_golden_and_allow_entry_script_compose_and() {
+        // Both pass → proceed. Golden=true and script returns true.
+        let gate = Tunable::from_script("signal_confirmed == true");
+        let mut shell = shell_with_golden(Some(true));
+        shell.signal_confirmed = Some(true);
+        let outcome = evaluate(
+            &intent_needs_golden(true, Some(gate.clone())),
+            &shell,
+            &resolved_long_market(),
+            0.0001,
+        );
+        assert_eq!(outcome, AllowEntryOutcome::Proceed);
+
+        // Golden=true, script returns false → blocked by script.
+        let mut shell_block = shell_with_golden(Some(true));
+        shell_block.signal_confirmed = Some(false);
+        let outcome_block = evaluate(
+            &intent_needs_golden(true, Some(gate)),
+            &shell_block,
+            &resolved_long_market(),
+            0.0001,
+        );
+        assert_eq!(outcome_block, AllowEntryOutcome::Blocked);
     }
 
     #[test]

@@ -817,6 +817,13 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
              "both (e.g. stocks, or late setups past the retest).",
     )
     p.add_argument(
+        "--require-golden", dest="require_golden", action="store_true",
+        help="Require a golden signal candle on entry. Sets "
+             "`needs_golden: true` on the trade spec; the worker rejects "
+             "the entry unless the incoming shell carries golden=true. "
+             "Composes with --entry-filter-script (both must pass).",
+    )
+    p.add_argument(
         "--print-completions", action="store_true",
         help="Print a zsh completion script to stdout and exit. "
              "Install with: tv_arm_hs.py --print-completions > "
@@ -850,6 +857,7 @@ _tv_arm_hs() {
         '--entry-filter-script[Rhai script gating entry placement]:script:'
         '--skip-break-and-close[drop the break-and-close prep]'
         '--skip-retest[drop the retest prep]'
+        '--require-golden[require golden candle on entry (needs_golden:true)]'
         '--print-completions[print this zsh completion script and exit]'
         '(- *)'{-h,--help}'[show help and exit]'
     )
@@ -961,6 +969,8 @@ def main(argv: Optional[list[str]] = None) -> int:
         spec["max_retries"] = args.max_retries
     if args.entry_filter_script is not None:
         spec["allow_entry"] = args.entry_filter_script
+    if args.require_golden:
+        spec["needs_golden"] = True
     if args.entry_market:
         spec["entry_mode"] = "market"
     if args.sl_from_recent:

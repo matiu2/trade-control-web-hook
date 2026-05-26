@@ -307,6 +307,12 @@ pub struct TradeSpec {
     /// just add slippage.
     #[serde(default, skip_serializing_if = "is_default_entry_mode")]
     pub entry_mode: EntryMode,
+    /// When true, the worker rejects the entry unless the incoming shell
+    /// carries `golden: Some(true)`. AND-composed with [`Self::allow_entry`]
+    /// — both gates must pass. Default `false` = no gate, byte-identical
+    /// to pre-feature spec yaml.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub needs_golden: bool,
 }
 
 fn is_default_entry_mode(m: &EntryMode) -> bool {
@@ -555,6 +561,7 @@ fn build_pattern(
         risk_amount: None,
         dry_run: false,
         max_retries: None,
+        needs_golden: false,
         skip_preps: Vec::new(),
         entry_offset_pips: Some(entry_offset_pips),
         sl_offset_pips: Some(sl_offset_pips),
@@ -637,6 +644,7 @@ fn assemble_trade(
         spec.max_retries,
         spec.allow_entry.as_deref(),
         spec.entry_mode,
+        spec.needs_golden,
         &spec.skip_preps,
         &spec.broker,
         &spec.account,
@@ -796,6 +804,7 @@ fn skeleton(
         trade_id: Some(trade_id.to_string()),
         max_retries: None,
         allow_entry: None,
+        needs_golden: false,
     }
 }
 
@@ -942,6 +951,7 @@ fn build_enter_alert(
     max_retries: Option<u32>,
     allow_entry: Option<&str>,
     entry_mode: EntryMode,
+    needs_golden: bool,
     skip_preps: &[String],
     broker: &BrokerKind,
     account: &str,
@@ -986,6 +996,7 @@ fn build_enter_alert(
     }
     intent.max_retries = max_retries.map(trade_control_core::tunable::Tunable::Static);
     intent.allow_entry = allow_entry.map(trade_control_core::tunable::Tunable::from_script);
+    intent.needs_golden = needs_golden;
     intent.requires_preps = ["break-and-close", "retest"]
         .into_iter()
         .filter(|step| !skip_preps.iter().any(|s| s == step))
@@ -1128,6 +1139,7 @@ mod tests {
                 None,
                 None,
                 EntryMode::Stop,
+                false,
                 &[],
                 &BrokerKind::Oanda,
                 "demo",
@@ -1148,6 +1160,7 @@ mod tests {
                 risk_amount: None,
                 dry_run: false,
                 max_retries: None,
+                needs_golden: false,
                 skip_preps: Vec::new(),
                 entry_offset_pips: Some(1.0),
                 sl_offset_pips: Some(1.0),
@@ -1187,6 +1200,7 @@ mod tests {
             None,
             None,
             EntryMode::Stop,
+            false,
             &[],
             &BrokerKind::Oanda,
             "demo",
@@ -1249,6 +1263,7 @@ mod tests {
             None,
             None,
             EntryMode::Stop,
+            false,
             &[],
             &BrokerKind::Oanda,
             "demo",
@@ -1312,6 +1327,7 @@ mod tests {
             risk_amount: None,
             dry_run: false,
             max_retries: None,
+            needs_golden: false,
             skip_preps: Vec::new(),
             entry_offset_pips: None,
             sl_offset_pips: None,
@@ -1456,6 +1472,27 @@ tp_price: 1.05
         // Spot-check a non-enter alert: dry_run must be None.
         let veto = &trade.alerts[0];
         assert_eq!(veto.intent.dry_run, None);
+    }
+
+    #[test]
+    fn build_trade_from_spec_threads_needs_golden_onto_enter_intent() {
+        // needs_golden on the spec lands on the enter intent only —
+        // vetos and preps stay false, since they don't gate on shell
+        // signal data.
+        let now = ts("2026-05-20T00:00:00Z");
+        let mut spec = sample_spec(TradePattern::Hs, ts("2026-05-25T00:00:00Z"));
+        spec.needs_golden = true;
+        let trade = build_trade_from_spec(spec, now).unwrap();
+        let enter = trade.alerts.last().unwrap();
+        assert!(enter.intent.needs_golden);
+        enter.intent.validate().unwrap();
+        for alert in trade.alerts.iter().take(trade.alerts.len() - 1) {
+            assert!(
+                !alert.intent.needs_golden,
+                "non-enter alert {} carried needs_golden",
+                alert.basename
+            );
+        }
     }
 
     #[test]

@@ -538,6 +538,16 @@ async fn run_enter<B: Broker>(
                 outcome: "rejected: allow-entry-false".into(),
             };
         }
+        allow_entry_gate::AllowEntryOutcome::NeedsGoldenUnmet => {
+            console_log!(
+                "entry rejected: needs_golden set but shell.golden != Some(true) (id={})",
+                verified.intent.id
+            );
+            return ActionResult::Rejected {
+                response: Response::error("entry blocked: needs-golden", 412),
+                outcome: "rejected: needs-golden".into(),
+            };
+        }
         allow_entry_gate::AllowEntryOutcome::ScriptError { kind, message } => {
             console_error!(
                 "allow_entry script error (id={}): {message}",

@@ -440,6 +440,16 @@ pub struct Intent {
     /// to pre-`allow_entry` intents.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub allow_entry: Option<crate::tunable::Tunable<bool>>,
+    /// When true, the worker rejects the entry unless the incoming shell
+    /// carries `golden: Some(true)`. AND-composed with [`Self::allow_entry`]
+    /// — both gates must pass. Promoted to a typed field (rather than a
+    /// script idiom like `golden == true`) because operators reach for it
+    /// often; the typed form avoids the Rhai `()` landmine when the shell
+    /// omits the field. Default `false` = no gate, byte-identical wire
+    /// form to pre-feature intents. Only meaningful on `Action::Enter`;
+    /// rejected at validate time on other actions.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub needs_golden: bool,
 }
 
 /// Maximum length of a `trade_id` slug. 64 chars is plenty for
@@ -482,6 +492,9 @@ pub enum IntentValidationError {
     /// `allow_entry: Some(_)` on a non-Enter action — the gate is
     /// only checked on `enter`.
     AllowEntryOnNonEnter,
+    /// `needs_golden: true` on a non-Enter action — the gate is only
+    /// checked on `enter`.
+    NeedsGoldenOnNonEnter,
 }
 
 impl core::fmt::Display for IntentValidationError {
@@ -499,6 +512,9 @@ impl core::fmt::Display for IntentValidationError {
             }
             Self::MaxRetriesOnNonEnter => f.write_str("max_retries is only valid on action: enter"),
             Self::AllowEntryOnNonEnter => f.write_str("allow_entry is only valid on action: enter"),
+            Self::NeedsGoldenOnNonEnter => {
+                f.write_str("needs_golden is only valid on action: enter")
+            }
         }
     }
 }
@@ -534,6 +550,9 @@ impl Intent {
         }
         if self.allow_entry.is_some() && self.action != Action::Enter {
             return Err(IntentValidationError::AllowEntryOnNonEnter);
+        }
+        if self.needs_golden && self.action != Action::Enter {
+            return Err(IntentValidationError::NeedsGoldenOnNonEnter);
         }
         Ok(())
     }
@@ -1661,6 +1680,73 @@ mod tests {
         let intent: Intent = serde_yaml::from_str(yaml).unwrap();
         let back = serde_yaml::to_string(&intent).unwrap();
         assert!(!back.contains("allow_entry"), "got:\n{back}");
+    }
+
+    #[test]
+    fn intent_needs_golden_round_trips_through_yaml() {
+        let yaml = "
+            v: 1
+            id: ng-1
+            not_after: \"2026-05-13T20:00:00Z\"
+            action: enter
+            instrument: EUR_USD
+            direction: long
+            entry: { type: market }
+            stop_loss: { from: low, offset_pips: -2 }
+            take_profit: { from: close, offset_r: 2.0 }
+            risk_pct: 0.5
+            needs_golden: true
+        ";
+        let intent: Intent = serde_yaml::from_str(yaml).unwrap();
+        assert!(intent.needs_golden);
+        let back = serde_yaml::to_string(&intent).unwrap();
+        assert!(back.contains("needs_golden: true"), "got: {back}");
+    }
+
+    #[test]
+    fn intent_defaults_needs_golden_to_false_and_omits_on_serialise() {
+        // Wire-compat: pre-feature intents have no needs_golden field.
+        // Absent → false (single-source-of-truth default), and serialising
+        // a false value back doesn't introduce the field — that keeps
+        // already-signed intents byte-identical.
+        let yaml = "
+            v: 1
+            id: ng-default
+            not_after: \"2026-05-13T20:00:00Z\"
+            action: enter
+            instrument: EUR_USD
+            direction: long
+            entry: { type: market }
+            stop_loss: { from: low, offset_pips: -2 }
+            take_profit: { from: close, offset_r: 2.0 }
+            risk_pct: 0.5
+        ";
+        let intent: Intent = serde_yaml::from_str(yaml).unwrap();
+        assert!(!intent.needs_golden);
+        let back = serde_yaml::to_string(&intent).unwrap();
+        assert!(!back.contains("needs_golden"), "got: {back}");
+    }
+
+    #[test]
+    fn validate_rejects_needs_golden_on_non_enter_action() {
+        // Same defense-in-depth as allow_entry / max_retries — the gate
+        // only runs on Enter, so silently ignoring it on a prep would
+        // mislead the operator.
+        let yaml = "
+            v: 1
+            id: ng-prep
+            not_after: \"2026-05-13T20:00:00Z\"
+            action: prep
+            instrument: EUR_USD
+            step: break-and-close
+            ttl_hours: 4
+            needs_golden: true
+        ";
+        let intent: Intent = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(
+            intent.validate(),
+            Err(IntentValidationError::NeedsGoldenOnNonEnter)
+        );
     }
 
     #[test]

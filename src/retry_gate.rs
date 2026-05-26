@@ -671,6 +671,7 @@ mod tests {
             trade_id: Some("trade-xyz".into()),
             max_retries,
             allow_entry: None,
+            needs_golden: false,
         }
     }
 

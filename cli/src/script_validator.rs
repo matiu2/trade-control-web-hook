@@ -222,6 +222,7 @@ mod tests {
             trade_id: None,
             max_retries: None,
             allow_entry: gate,
+            needs_golden: false,
         }
     }
 
