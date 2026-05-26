@@ -301,8 +301,14 @@ pub struct Intent {
     /// implicit `(TP - entry) / (entry - SL)` falls below this. Defaults
     /// to 1.0 when omitted. Overrides must be `>= 1.0`; below-floor values
     /// are rejected both at the encoder and on the server.
+    ///
+    /// A [`Tunable<f64>`] — operators can supply a static literal
+    /// (`min_r: 1.5`) or a Rhai script (`min_r: !script "..."`) that
+    /// resolves against the standard three-phase scope (shell anchors
+    /// plus derived geometry). Scripts returning a non-finite value or
+    /// one below the floor are rejected at resolve time.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub min_r: Option<f64>,
+    pub min_r: Option<crate::tunable::Tunable<f64>>,
     /// Which broker the worker should route this intent to. Defaults to
     /// `oanda` when absent so intents encrypted before the multi-broker
     /// dispatch landed still work.

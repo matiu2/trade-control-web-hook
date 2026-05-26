@@ -284,31 +284,13 @@ impl Resolved {
             });
         }
 
-        // Server-enforced floor: an `min_r` override cannot weaken the
-        // default 1.0R minimum. Defense in depth against a custom encryptor
-        // or stale CLI.
-        let min_r = intent.min_r.unwrap_or(MIN_R_FLOOR);
-        if min_r < MIN_R_FLOOR {
-            return Err(ResolveError::MinRBelowFloor { requested: min_r });
-        }
-        // Implicit R = (TP - entry) / (entry - SL), absolute values for the
-        // short case (direction-agnostic — geometry already checked above).
-        let r_distance = (reference_price - stop_loss).abs();
-        let tp_distance = (take_profit - reference_price).abs();
-        let actual_r = tp_distance / r_distance;
-        if actual_r < min_r {
-            return Err(ResolveError::BelowMinR {
-                actual: actual_r,
-                min: min_r,
-            });
-        }
-
         // Build the partial Resolved that Tunable scripts evaluate
         // against — Phase 2 bindings (`entry_price`, `r_multiple`,
         // etc.) come from this snapshot. We rebuild it from the
         // pieces we just computed rather than reading back from a
         // finished Resolved, so the script sees exactly the values
-        // we're about to store.
+        // we're about to store. min_r / risk_pct / risk_amount /
+        // size_units scripts all evaluate against this snapshot.
         let geometry_snapshot = Self {
             id: intent.id.clone(),
             not_after: intent.not_after,
@@ -323,6 +305,32 @@ impl Resolved {
             risk: RiskBudget::Percent(0.0),
             dry_run: intent.dry_run.unwrap_or(false),
         };
+
+        // Server-enforced floor: an `min_r` override cannot weaken the
+        // default 1.0R minimum. Defense in depth against a custom encryptor
+        // or stale CLI. min_r may be a Tunable<f64> script — resolve it
+        // against the geometry snapshot so scripts can reference
+        // `r_multiple` / `tp_distance` etc.
+        let min_r = match &intent.min_r {
+            None => MIN_R_FLOOR,
+            Some(tunable) => {
+                resolve_f64_tunable("min_r", tunable, shell, &geometry_snapshot, pip_size)?
+            }
+        };
+        if !min_r.is_finite() || min_r < MIN_R_FLOOR {
+            return Err(ResolveError::MinRBelowFloor { requested: min_r });
+        }
+        // Implicit R = (TP - entry) / (entry - SL), absolute values for the
+        // short case (direction-agnostic — geometry already checked above).
+        let r_distance = (reference_price - stop_loss).abs();
+        let tp_distance = (take_profit - reference_price).abs();
+        let actual_r = tp_distance / r_distance;
+        if actual_r < min_r {
+            return Err(ResolveError::BelowMinR {
+                actual: actual_r,
+                min: min_r,
+            });
+        }
 
         let risk = match sizing_mode {
             SizingMode::Units => {
@@ -883,7 +891,7 @@ mod tests {
     fn min_r_override_above_floor_enforced() {
         // R = 2.0 trade but we demand 3.0 → rejected.
         let mut intent = long_market_intent();
-        intent.min_r = Some(3.0);
+        intent.min_r = Some(Tunable::Static(3.0));
         assert!(matches!(
             Resolved::from_intent(&intent, &shell(), 0.0001),
             Err(ResolveError::BelowMinR { .. })
@@ -893,7 +901,7 @@ mod tests {
     #[test]
     fn min_r_override_above_floor_passes_when_met() {
         let mut intent = long_market_intent();
-        intent.min_r = Some(2.0); // exactly meets the actual R
+        intent.min_r = Some(Tunable::Static(2.0)); // exactly meets the actual R
         assert!(Resolved::from_intent(&intent, &shell(), 0.0001).is_ok());
     }
 
@@ -901,7 +909,7 @@ mod tests {
     fn min_r_below_floor_rejected_at_server() {
         // Defense in depth: even if encoder somehow allowed it.
         let mut intent = long_market_intent();
-        intent.min_r = Some(0.5);
+        intent.min_r = Some(Tunable::Static(0.5));
         match Resolved::from_intent(&intent, &shell(), 0.0001) {
             Err(ResolveError::MinRBelowFloor { requested }) => {
                 assert!((requested - 0.5).abs() < 1e-9);
@@ -913,7 +921,7 @@ mod tests {
     #[test]
     fn min_r_zero_rejected_at_server() {
         let mut intent = long_market_intent();
-        intent.min_r = Some(0.0);
+        intent.min_r = Some(Tunable::Static(0.0));
         assert!(matches!(
             Resolved::from_intent(&intent, &shell(), 0.0001),
             Err(ResolveError::MinRBelowFloor { .. })
@@ -923,7 +931,7 @@ mod tests {
     #[test]
     fn min_r_negative_rejected_at_server() {
         let mut intent = long_market_intent();
-        intent.min_r = Some(-1.0);
+        intent.min_r = Some(Tunable::Static(-1.0));
         assert!(matches!(
             Resolved::from_intent(&intent, &shell(), 0.0001),
             Err(ResolveError::MinRBelowFloor { .. })
@@ -1354,5 +1362,113 @@ size_units: !script "if r_multiple >= 2.0 { 0.02 } else { 0.01 }"
 "#;
         let intent: Intent = serde_yaml::from_str(yaml).unwrap();
         assert!(matches!(intent.size_units, Some(Tunable::Script(_))));
+    }
+
+    // ---- min_r as Tunable ----
+
+    #[test]
+    fn min_r_static_path_unchanged() {
+        let mut intent = long_market_intent();
+        intent.min_r = Some(Tunable::Static(1.5));
+        // Fixture R = 2.0, override demands 1.5 → passes.
+        assert!(Resolved::from_intent(&intent, &shell(), 0.0001).is_ok());
+    }
+
+    #[test]
+    fn min_r_script_evaluates_against_geometry() {
+        // Script demands 1.5R when long, otherwise 1.0R.
+        let mut intent = long_market_intent();
+        intent.min_r = Some(Tunable::from_script(
+            "if direction == \"long\" { 1.5 } else { 1.0 }",
+        ));
+        assert!(Resolved::from_intent(&intent, &shell(), 0.0001).is_ok());
+    }
+
+    #[test]
+    fn min_r_script_below_floor_rejected() {
+        // Script returns 0.5, below floor → MinRBelowFloor.
+        let mut intent = long_market_intent();
+        intent.min_r = Some(Tunable::from_script("0.5"));
+        match Resolved::from_intent(&intent, &shell(), 0.0001) {
+            Err(ResolveError::MinRBelowFloor { requested }) => {
+                assert!((requested - 0.5).abs() < 1e-9);
+            }
+            other => panic!("expected MinRBelowFloor, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn min_r_script_returning_nan_rejected() {
+        // NaN is non-finite — must be rejected as MinRBelowFloor.
+        let mut intent = long_market_intent();
+        intent.min_r = Some(Tunable::from_script("0.0 / 0.0"));
+        assert!(matches!(
+            Resolved::from_intent(&intent, &shell(), 0.0001),
+            Err(ResolveError::MinRBelowFloor { .. })
+        ));
+    }
+
+    #[test]
+    fn min_r_script_parse_error_surfaces() {
+        let mut intent = long_market_intent();
+        intent.min_r = Some(Tunable::from_script("if if if"));
+        match Resolved::from_intent(&intent, &shell(), 0.0001) {
+            Err(ResolveError::ScriptFailed { field, kind, .. }) => {
+                assert_eq!(field, "min_r");
+                assert_eq!(kind, "parse");
+            }
+            other => panic!("expected ScriptFailed(parse), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn min_r_script_wrong_return_type_surfaces() {
+        let mut intent = long_market_intent();
+        intent.min_r = Some(Tunable::from_script("true"));
+        match Resolved::from_intent(&intent, &shell(), 0.0001) {
+            Err(ResolveError::ScriptFailed { field, kind, .. }) => {
+                assert_eq!(field, "min_r");
+                assert_eq!(kind, "wrong-type");
+            }
+            other => panic!("expected ScriptFailed(wrong-type), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn min_r_yaml_static_parses() {
+        let yaml = r#"
+v: 1
+id: msg-1
+not_after: "2026-06-01T00:00:00Z"
+action: enter
+instrument: EUR_USD
+direction: long
+entry: { type: market }
+stop_loss: { from: low, offset_pips: -2.0 }
+take_profit: { from: close, offset_r: 2.0 }
+risk_pct: 0.5
+min_r: 1.5
+"#;
+        let intent: Intent = serde_yaml::from_str(yaml).unwrap();
+        assert!(matches!(intent.min_r, Some(Tunable::Static(v)) if (v - 1.5).abs() < 1e-9));
+    }
+
+    #[test]
+    fn min_r_yaml_script_parses() {
+        let yaml = r#"
+v: 1
+id: msg-1
+not_after: "2026-06-01T00:00:00Z"
+action: enter
+instrument: EUR_USD
+direction: long
+entry: { type: market }
+stop_loss: { from: low, offset_pips: -2.0 }
+take_profit: { from: close, offset_r: 2.0 }
+risk_pct: 0.5
+min_r: !script "if direction == \"long\" { 1.5 } else { 1.0 }"
+"#;
+        let intent: Intent = serde_yaml::from_str(yaml).unwrap();
+        assert!(matches!(intent.min_r, Some(Tunable::Script(_))));
     }
 }

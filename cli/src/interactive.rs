@@ -105,8 +105,10 @@ pub fn fill_missing_fields(template: &mut Value, non_interactive: bool) -> Resul
         .map_err(|e| eyre!("template doesn't parse as a valid Intent: {e}"))?;
 
     // Fail fast on a below-floor `min_r`. The server also enforces this; we
-    // duplicate it here so typos don't even get encrypted.
-    if let Some(min_r) = intent.min_r
+    // duplicate it here so typos don't even get encrypted. Static literals
+    // can be checked at sign time; Tunable::Script values are left to the
+    // sign-time script_validator + worker resolve path.
+    if let Some(trade_control_core::tunable::Tunable::Static(min_r)) = intent.min_r
         && min_r < trade_control_core::intent::MIN_R_FLOOR
     {
         return Err(eyre!(

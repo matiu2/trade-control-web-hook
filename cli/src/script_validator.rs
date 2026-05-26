@@ -77,6 +77,11 @@ pub fn validate(intent: &Intent) -> Vec<ScriptError> {
     {
         errors.push(e);
     }
+    if let Some(t) = &intent.min_r
+        && let Some(e) = check_one::<f64>("min_r", t, &shell, &resolved, pip_size)
+    {
+        errors.push(e);
+    }
     // Future per-field tunables go here as additional check_one calls.
 
     errors
@@ -382,6 +387,35 @@ mod tests {
         let errs = validate(&intent);
         assert_eq!(errs.len(), 1);
         assert_eq!(errs[0].field, "size_units");
+        assert_eq!(errs[0].kind, "wrong-type");
+    }
+
+    #[test]
+    fn min_r_script_passes_when_valid() {
+        let mut intent = intent_with_allow_entry(None);
+        intent.min_r = Some(Tunable::from_script(
+            "if r_multiple >= 2.0 { 1.5 } else { 1.0 }",
+        ));
+        assert!(validate(&intent).is_empty());
+    }
+
+    #[test]
+    fn min_r_script_parse_error_surfaces() {
+        let mut intent = intent_with_allow_entry(None);
+        intent.min_r = Some(Tunable::from_script("if if if"));
+        let errs = validate(&intent);
+        assert_eq!(errs.len(), 1);
+        assert_eq!(errs[0].field, "min_r");
+        assert_eq!(errs[0].kind, "parse");
+    }
+
+    #[test]
+    fn min_r_script_wrong_type_surfaces() {
+        let mut intent = intent_with_allow_entry(None);
+        intent.min_r = Some(Tunable::from_script("true"));
+        let errs = validate(&intent);
+        assert_eq!(errs.len(), 1);
+        assert_eq!(errs[0].field, "min_r");
         assert_eq!(errs[0].kind, "wrong-type");
     }
 
