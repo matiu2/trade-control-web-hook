@@ -218,16 +218,27 @@ fn shell_for_tv_template() -> Vec<(&'static str, String)> {
         ("high", "{{high}}".to_string()),
         ("low", "{{low}}".to_string()),
         ("time", "\"{{time}}\"".to_string()),
-        // pattern_* come from candle-signals-v2.pine's hidden plots,
-        // populated when the alertcondition fires on a (Bullish|Bearish)
-        // (Golden)? (Signal|Confirmed) event. The worker treats them as
-        // optional — pre-existing v2 signed templates parse unchanged.
-        ("pattern_high", "{{plot(\"pattern_high\")}}".to_string()),
-        ("pattern_low", "{{plot(\"pattern_low\")}}".to_string()),
-        ("pattern_time", "{{plot(\"pattern_time\")}}".to_string()),
+        // signal_* / golden / atr come from candle-signals-v2.pine's
+        // hidden plots, populated when the Long/Short Pattern
+        // alertcondition fires. The worker treats them as optional —
+        // pre-2026-05 v2 signed templates parse unchanged. Note:
+        // {{plot("…")}} names the Pine plot title; the YAML key on
+        // the left is the wire-key the worker deserialises into the
+        // Shell. They don't have to match — `golden` / `atr` live
+        // under `signal_golden` / `signal_atr` Pine titles.
+        ("signal_high", "{{plot(\"signal_high\")}}".to_string()),
+        ("signal_low", "{{plot(\"signal_low\")}}".to_string()),
+        ("signal_range", "{{plot(\"signal_range\")}}".to_string()),
         (
-            "pattern_confirmed",
-            "{{plot(\"pattern_confirmed\")}}".to_string(),
+            "signal_start_time",
+            "{{plot(\"signal_start_time\")}}".to_string(),
+        ),
+        ("signal_kind", "{{plot(\"signal_kind\")}}".to_string()),
+        ("golden", "{{plot(\"signal_golden\")}}".to_string()),
+        ("atr", "{{plot(\"signal_atr\")}}".to_string()),
+        (
+            "signal_confirmed",
+            "{{plot(\"signal_confirmed\")}}".to_string(),
         ),
     ]
 }

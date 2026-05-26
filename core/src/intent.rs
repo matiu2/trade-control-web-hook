@@ -23,39 +23,110 @@ pub struct Shell {
     /// ISO-8601 timestamp from TradingView. Used as an upper bound on the
     /// alert's freshness — alerts from yesterday should be obvious.
     pub time: DateTime<Utc>,
-    /// Pattern (signal candle) extremes latched by the Pine indicator and
-    /// substituted into the alert message via {{plot("pattern_high")}}
-    /// etc. Optional because pre-2026-05 signed templates didn't include
-    /// these and control-action shells (cancel/status) don't either.
-    /// Populated by Pine `candle-signals-v2.pine` and read by the
-    /// worker's Rhai engine to gate retries on confirmation, dynamic
-    /// entry/SL/TP prices, etc.
+    /// Signal extremes latched by the Pine indicator and substituted into
+    /// the alert message via {{plot("signal_high")}} / {{plot("signal_low")}}.
+    /// For a 1-bar pinbar these are the signal bar's high/low; for a
+    /// 2-bar tweezer or engulfer they span both bars; for a 3-bar
+    /// double-tweezer they span all three. Optional because pre-2026-05
+    /// signed templates didn't carry them and control-action shells
+    /// (status / unlock / etc.) don't either. Populated by Pine
+    /// `candle-signals-v2.pine` (v2.2+) and read by the Rhai engine to
+    /// drive entry-gate scripts, dynamic SL/TP, etc.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub pattern_high: Option<f64>,
+    pub signal_high: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub pattern_low: Option<f64>,
-    /// Signal candle's bar-open time. Pine ships this as milliseconds
-    /// since epoch (integer), not RFC3339 — see `pattern_time_de`.
+    pub signal_low: Option<f64>,
+    /// `signal_high - signal_low`, pre-computed Pine-side so scripts can
+    /// reference the signal's geometry without recomputing it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signal_range: Option<f64>,
+    /// Bar-open time of the *earliest* bar that's part of the signal —
+    /// `time[0]` for a pinbar, `time[1]` for tweezer/engulfers,
+    /// `time[2]` for a double-tweezer. Disambiguates from the
+    /// current-bar-of-fire `time` field. Pine ships this as milliseconds
+    /// since epoch (integer), not RFC3339 — see `signal_time_serde`.
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
-        with = "pattern_time_serde"
+        with = "signal_time_serde"
     )]
-    pub pattern_time: Option<DateTime<Utc>>,
-    /// True iff the latched pattern has been validated by a confirming
+    pub signal_start_time: Option<DateTime<Utc>>,
+    /// Which signal detector fired. Pine emits a float code (1..=5);
+    /// the serde adapter maps it to a [`SignalKind`] variant on the way
+    /// in and back to the float on the way out. Pine `alertcondition`
+    /// messages can't ride string or enum values — only float plots and
+    /// built-ins — so the float-on-wire detour is unavoidable.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "signal_kind_serde"
+    )]
+    pub signal_kind: Option<SignalKind>,
+    /// True iff the latched signal is "golden" by the indicator's
+    /// definition (close near the extreme, etc.). Pine emits 1/0 as a
+    /// number — see `bool_one_zero_serde`.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "bool_one_zero_serde"
+    )]
+    pub golden: Option<bool>,
+    /// ATR value latched at signal time. Lets Rhai scripts compare
+    /// candle range / SL distance against volatility without needing
+    /// their own indicator pipeline.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub atr: Option<f64>,
+    /// True iff the latched signal has been validated by a confirming
     /// push within the indicator's `confirm_bars` window. Pine emits
-    /// 1/0 as numbers — see `pattern_confirmed_serde`.
+    /// 1/0 as a number — see `bool_one_zero_serde`.
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
-        with = "pattern_confirmed_serde"
+        with = "bool_one_zero_serde"
     )]
-    pub pattern_confirmed: Option<bool>,
+    pub signal_confirmed: Option<bool>,
 }
 
-/// Pine emits `pattern_time` as a millisecond-precision Unix epoch
+/// Which candle signal detector fired. Mirrors the `KIND_*` constants
+/// in `candle-signals-v2.pine`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SignalKind {
+    Pinbar,
+    Tweezer,
+    RegularEngulfer,
+    FloatingEngulfer,
+    DoubleTweezer,
+}
+
+impl SignalKind {
+    /// Pine-side float code — keep in lockstep with the `KIND_*` consts
+    /// in `candle-signals-v2.pine`.
+    pub fn from_code(code: f64) -> Option<Self> {
+        match code.round() as i64 {
+            1 => Some(Self::Pinbar),
+            2 => Some(Self::Tweezer),
+            3 => Some(Self::RegularEngulfer),
+            4 => Some(Self::FloatingEngulfer),
+            5 => Some(Self::DoubleTweezer),
+            _ => None,
+        }
+    }
+
+    pub fn to_code(self) -> u8 {
+        match self {
+            Self::Pinbar => 1,
+            Self::Tweezer => 2,
+            Self::RegularEngulfer => 3,
+            Self::FloatingEngulfer => 4,
+            Self::DoubleTweezer => 5,
+        }
+    }
+}
+
+/// Pine emits `signal_start_time` as a millisecond-precision Unix epoch
 /// integer (e.g. `1779742740000`). Convert to/from `DateTime<Utc>`.
-mod pattern_time_serde {
+mod signal_time_serde {
     use chrono::{DateTime, TimeZone, Utc};
     use serde::{Deserialize, Deserializer, Serializer};
 
@@ -74,17 +145,17 @@ mod pattern_time_serde {
             serde_yaml::Value::String(s) => s.parse::<i64>().ok(),
             _ => None,
         }
-        .ok_or_else(|| serde::de::Error::custom("pattern_time: expected integer ms epoch"))?;
+        .ok_or_else(|| serde::de::Error::custom("signal_start_time: expected integer ms epoch"))?;
         Utc.timestamp_millis_opt(ms)
             .single()
             .map(Some)
-            .ok_or_else(|| serde::de::Error::custom("pattern_time: ms out of range"))
+            .ok_or_else(|| serde::de::Error::custom("signal_start_time: ms out of range"))
     }
 }
 
-/// Pine emits `pattern_confirmed` as `0` or `1` (number, not bool).
-/// Accept numbers and the strings "0"/"1"/"true"/"false" defensively.
-mod pattern_confirmed_serde {
+/// Pine emits boolean shell fields as `0` or `1` (number). Accept
+/// numbers and the strings "0"/"1"/"true"/"false" defensively.
+mod bool_one_zero_serde {
     use serde::{Deserialize, Deserializer, Serializer};
 
     pub fn serialize<S: Serializer>(v: &Option<bool>, s: S) -> Result<S::Ok, S::Error> {
@@ -107,13 +178,39 @@ mod pattern_confirmed_serde {
                 "1" | "true" | "True" | "TRUE" => Ok(Some(true)),
                 "0" | "false" | "False" | "FALSE" => Ok(Some(false)),
                 other => Err(serde::de::Error::custom(format!(
-                    "pattern_confirmed: unrecognised value {other:?}"
+                    "expected 0/1/true/false, got {other:?}"
                 ))),
             },
-            _ => Err(serde::de::Error::custom(
-                "pattern_confirmed: expected bool/number/string",
-            )),
+            _ => Err(serde::de::Error::custom("expected bool/number/string")),
         }
+    }
+}
+
+/// Pine emits `signal_kind` as a float code (1.0..=5.0). Map to/from
+/// [`SignalKind`].
+mod signal_kind_serde {
+    use super::SignalKind;
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(v: &Option<SignalKind>, s: S) -> Result<S::Ok, S::Error> {
+        match v {
+            Some(k) => s.serialize_u8(k.to_code()),
+            None => s.serialize_none(),
+        }
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Option<SignalKind>, D::Error> {
+        let v: Option<serde_yaml::Value> = Option::deserialize(d)?;
+        let Some(v) = v else { return Ok(None) };
+        let code = match v {
+            serde_yaml::Value::Number(n) => n.as_f64(),
+            serde_yaml::Value::String(s) => s.parse::<f64>().ok(),
+            _ => None,
+        }
+        .ok_or_else(|| serde::de::Error::custom("signal_kind: expected numeric code"))?;
+        SignalKind::from_code(code)
+            .map(Some)
+            .ok_or_else(|| serde::de::Error::custom(format!("signal_kind: unknown code {code}")))
     }
 }
 
@@ -535,10 +632,14 @@ mod tests {
             high: 1.1020,
             low: 1.0980,
             time: "2026-05-13T12:00:00Z".parse().unwrap(),
-            pattern_high: None,
-            pattern_low: None,
-            pattern_time: None,
-            pattern_confirmed: None,
+            signal_high: None,
+            signal_low: None,
+            signal_range: None,
+            signal_start_time: None,
+            signal_kind: None,
+            golden: None,
+            atr: None,
+            signal_confirmed: None,
         }
     }
 

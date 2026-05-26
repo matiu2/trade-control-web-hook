@@ -107,8 +107,8 @@ pub fn parse_and_verify(
         let key_str = k.as_str().unwrap_or("");
         match key_str {
             "sig" => continue,
-            "close" | "high" | "low" | "time" | "pattern_high" | "pattern_low" | "pattern_time"
-            | "pattern_confirmed" => {
+            "close" | "high" | "low" | "time" | "signal_high" | "signal_low" | "signal_range"
+            | "signal_start_time" | "signal_kind" | "golden" | "atr" | "signal_confirmed" => {
                 shell_map.insert(k.clone(), v.clone());
             }
             _ => {
@@ -119,8 +119,8 @@ pub fn parse_and_verify(
     let intent: Intent = serde_yaml::from_value(serde_yaml::Value::Mapping(intent_map))
         .map_err(|_| IncomingError::BadIntentYaml)?;
     // Deserialise the Shell directly so its serde adapters
-    // (pattern_time_serde, pattern_confirmed_serde) handle Pine's
-    // millisecond-int and 0/1 wire forms.
+    // (signal_time_serde, signal_kind_serde, bool_one_zero_serde)
+    // handle Pine's millisecond-int / float-code / 0-or-1 wire forms.
     let shell: Shell = serde_yaml::from_value(serde_yaml::Value::Mapping(shell_map))
         .map_err(|_| IncomingError::BadYaml)?;
 
@@ -360,24 +360,28 @@ mod tests {
     }
 
     #[test]
-    fn signed_path_pattern_fields_round_trip() {
-        // CLI signs with pattern_* {{plot(...)}} placeholders; TV
-        // substitutes Pine's wire forms: pattern_time as a millisecond
-        // integer, pattern_confirmed as 0 or 1. The Shell's serde
-        // adapters must accept both.
+    fn signed_path_signal_fields_round_trip() {
+        // CLI signs with signal_* {{plot(...)}} placeholders; TV
+        // substitutes Pine's wire forms: signal_start_time as a
+        // millisecond integer, signal_kind as a float code, booleans
+        // as 0/1. The Shell's serde adapters accept all of them.
         let pre_substitution = [
             "close: {{close}}",
             "high: {{high}}",
             "low: {{low}}",
             "time: \"{{time}}\"",
-            "pattern_high: {{plot(\"pattern_high\")}}",
-            "pattern_low: {{plot(\"pattern_low\")}}",
-            "pattern_time: {{plot(\"pattern_time\")}}",
-            "pattern_confirmed: {{plot(\"pattern_confirmed\")}}",
+            "signal_high: {{plot(\"signal_high\")}}",
+            "signal_low: {{plot(\"signal_low\")}}",
+            "signal_range: {{plot(\"signal_range\")}}",
+            "signal_start_time: {{plot(\"signal_start_time\")}}",
+            "signal_kind: {{plot(\"signal_kind\")}}",
+            "golden: {{plot(\"signal_golden\")}}",
+            "atr: {{plot(\"signal_atr\")}}",
+            "signal_confirmed: {{plot(\"signal_confirmed\")}}",
             "v: 1",
             "action: prep",
             "instrument: EUR_USD",
-            "id: prep-pat",
+            "id: prep-sig",
             "not_after: \"2026-05-13T20:00:00Z\"",
             "step: retest",
             "ttl_hours: 12",
@@ -391,15 +395,20 @@ mod tests {
             "high: 1.16440",
             "low: 1.16430",
             "time: \"2026-05-13T12:00:00Z\"",
-            "pattern_high: 1.16437",
-            "pattern_low: 1.16432",
+            "signal_high: 1.16437",
+            "signal_low: 1.16432",
+            "signal_range: 0.00005",
             // ms epoch matches 2026-05-13T11:59:00Z (the prior signal bar).
-            "pattern_time: 1779728340000",
-            "pattern_confirmed: 1",
+            "signal_start_time: 1779728340000",
+            // Pinbar = 1.
+            "signal_kind: 1",
+            "golden: 1",
+            "atr: 0.00012",
+            "signal_confirmed: 1",
             "v: 1",
             "action: prep",
             "instrument: EUR_USD",
-            "id: prep-pat",
+            "id: prep-sig",
             "not_after: \"2026-05-13T20:00:00Z\"",
             "step: retest",
             "ttl_hours: 12",
@@ -409,25 +418,29 @@ mod tests {
         .join("\n");
         let now: DateTime<Utc> = "2026-05-13T12:01:00Z".parse().unwrap();
         let v = parse_and_verify(&on_wire, &KEY, now).unwrap();
-        assert_eq!(v.shell.pattern_high, Some(1.16437));
-        assert_eq!(v.shell.pattern_low, Some(1.16432));
-        assert_eq!(v.shell.pattern_confirmed, Some(true));
-        let pat_time = v.shell.pattern_time.unwrap();
-        assert_eq!(pat_time.timestamp_millis(), 1779728340000);
+        assert_eq!(v.shell.signal_high, Some(1.16437));
+        assert_eq!(v.shell.signal_low, Some(1.16432));
+        assert_eq!(v.shell.signal_range, Some(0.00005));
+        assert_eq!(v.shell.signal_kind, Some(crate::intent::SignalKind::Pinbar));
+        assert_eq!(v.shell.golden, Some(true));
+        assert_eq!(v.shell.atr, Some(0.00012));
+        assert_eq!(v.shell.signal_confirmed, Some(true));
+        let sig_time = v.shell.signal_start_time.unwrap();
+        assert_eq!(sig_time.timestamp_millis(), 1779728340000);
     }
 
     #[test]
-    fn signed_path_pattern_confirmed_zero_is_false() {
+    fn signed_path_signal_confirmed_zero_is_false() {
         let pre_substitution = [
             "close: {{close}}",
             "high: {{high}}",
             "low: {{low}}",
             "time: \"{{time}}\"",
-            "pattern_confirmed: {{plot(\"pattern_confirmed\")}}",
+            "signal_confirmed: {{plot(\"signal_confirmed\")}}",
             "v: 1",
             "action: prep",
             "instrument: EUR_USD",
-            "id: prep-pat0",
+            "id: prep-sig0",
             "not_after: \"2026-05-13T20:00:00Z\"",
             "step: retest",
             "ttl_hours: 12",
@@ -441,11 +454,11 @@ mod tests {
             "high: 1.0",
             "low: 1.0",
             "time: \"2026-05-13T12:00:00Z\"",
-            "pattern_confirmed: 0",
+            "signal_confirmed: 0",
             "v: 1",
             "action: prep",
             "instrument: EUR_USD",
-            "id: prep-pat0",
+            "id: prep-sig0",
             "not_after: \"2026-05-13T20:00:00Z\"",
             "step: retest",
             "ttl_hours: 12",
@@ -455,9 +468,63 @@ mod tests {
         .join("\n");
         let now: DateTime<Utc> = "2026-05-13T12:01:00Z".parse().unwrap();
         let v = parse_and_verify(&on_wire, &KEY, now).unwrap();
-        assert_eq!(v.shell.pattern_confirmed, Some(false));
-        assert_eq!(v.shell.pattern_high, None);
-        assert_eq!(v.shell.pattern_time, None);
+        assert_eq!(v.shell.signal_confirmed, Some(false));
+        assert_eq!(v.shell.signal_high, None);
+        assert_eq!(v.shell.signal_start_time, None);
+    }
+
+    #[test]
+    fn signed_path_signal_kind_codes_map_to_variants() {
+        // Sanity sweep: every Pine KIND_* code maps to the right enum
+        // variant. The wire is a float, but Pine emits integer values
+        // so we send `1`..`5` and verify.
+        use crate::intent::SignalKind;
+        for (code, expected) in [
+            (1u8, SignalKind::Pinbar),
+            (2, SignalKind::Tweezer),
+            (3, SignalKind::RegularEngulfer),
+            (4, SignalKind::FloatingEngulfer),
+            (5, SignalKind::DoubleTweezer),
+        ] {
+            let pre_substitution = [
+                "close: {{close}}",
+                "high: {{high}}",
+                "low: {{low}}",
+                "time: \"{{time}}\"",
+                "signal_kind: {{plot(\"signal_kind\")}}",
+                "v: 1",
+                "action: prep",
+                "instrument: EUR_USD",
+                "id: prep-kind",
+                "not_after: \"2026-05-13T20:00:00Z\"",
+                "step: retest",
+                "ttl_hours: 12",
+                "",
+            ]
+            .join("\n");
+            let pairs = signed_pairs_from_text(&pre_substitution).unwrap();
+            let sig = crate::sig::sign(&KEY, &pairs).unwrap();
+            let on_wire = [
+                "close: 1.0".to_string(),
+                "high: 1.0".to_string(),
+                "low: 1.0".to_string(),
+                "time: \"2026-05-13T12:00:00Z\"".to_string(),
+                format!("signal_kind: {code}"),
+                "v: 1".to_string(),
+                "action: prep".to_string(),
+                "instrument: EUR_USD".to_string(),
+                "id: prep-kind".to_string(),
+                "not_after: \"2026-05-13T20:00:00Z\"".to_string(),
+                "step: retest".to_string(),
+                "ttl_hours: 12".to_string(),
+                format!("sig: \"{sig}\""),
+                String::new(),
+            ]
+            .join("\n");
+            let now: DateTime<Utc> = "2026-05-13T12:01:00Z".parse().unwrap();
+            let v = parse_and_verify(&on_wire, &KEY, now).unwrap();
+            assert_eq!(v.shell.signal_kind, Some(expected));
+        }
     }
 
     #[test]

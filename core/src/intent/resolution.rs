@@ -319,10 +319,14 @@ mod tests {
             high: 1.1020,
             low: 1.0980,
             time: "2026-05-13T12:00:00Z".parse().unwrap(),
-            pattern_high: None,
-            pattern_low: None,
-            pattern_time: None,
-            pattern_confirmed: None,
+            signal_high: None,
+            signal_low: None,
+            signal_range: None,
+            signal_start_time: None,
+            signal_kind: None,
+            golden: None,
+            atr: None,
+            signal_confirmed: None,
         }
     }
 
