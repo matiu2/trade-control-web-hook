@@ -205,6 +205,19 @@ pub struct BuiltTrade {
     pub spec: TradeSpec,
 }
 
+/// Entry order mode on the enter alert. `Stop` (the default) places a
+/// pending stop order at the geometry anchor; `Market` fires a market
+/// order at the next opportunity the worker sees the alert. `Market`
+/// disables the entry-offset pips since there is no pending level to
+/// offset from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum EntryMode {
+    #[default]
+    Stop,
+    Market,
+}
+
 /// Declarative form of every answer the [`build_pattern`] questionnaire
 /// collects. Drives both the interactive and `--from-file` paths so the
 /// two cannot drift.
@@ -278,6 +291,17 @@ pub struct TradeSpec {
     /// is a script — a literal `true` would just be redundant.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub allow_entry: Option<String>,
+    /// Entry order mode. Default `Stop` preserves today's pending stop-
+    /// entry behaviour (the spec yaml stays byte-identical when the
+    /// field is absent). `Market` swaps to a market order — useful for
+    /// confirmed-candle entries where waiting for a stop level would
+    /// just add slippage.
+    #[serde(default, skip_serializing_if = "is_default_entry_mode")]
+    pub entry_mode: EntryMode,
+}
+
+fn is_default_entry_mode(m: &EntryMode) -> bool {
+    *m == EntryMode::default()
 }
 
 fn default_broker() -> BrokerKind {
@@ -503,6 +527,7 @@ fn build_pattern(
         tp_price,
         entry_deadline_pct,
         allow_entry: None,
+        entry_mode: EntryMode::default(),
     };
     assemble_trade(spec, geometry, entry_offset_pips, sl_offset_pips, now)
 }
@@ -576,6 +601,7 @@ fn assemble_trade(
         spec.dry_run,
         spec.max_retries,
         spec.allow_entry.as_deref(),
+        spec.entry_mode,
         &spec.skip_preps,
         &spec.broker,
         &spec.account,
@@ -878,6 +904,7 @@ fn build_enter_alert(
     dry_run: bool,
     max_retries: Option<u32>,
     allow_entry: Option<&str>,
+    entry_mode: EntryMode,
     skip_preps: &[String],
     broker: &BrokerKind,
     account: &str,
@@ -893,9 +920,12 @@ fn build_enter_alert(
         trade_id,
     );
     intent.direction = Some(geometry.direction);
-    intent.entry = Some(EntrySpec::Stop {
-        from: geometry.entry_anchor,
-        offset_pips: entry_offset_pips,
+    intent.entry = Some(match entry_mode {
+        EntryMode::Stop => EntrySpec::Stop {
+            from: geometry.entry_anchor,
+            offset_pips: entry_offset_pips,
+        },
+        EntryMode::Market => EntrySpec::Market,
     });
     intent.stop_loss = Some(PriceRef::Anchored {
         from: geometry.sl_anchor,
@@ -1060,6 +1090,7 @@ mod tests {
                 false,
                 None,
                 None,
+                EntryMode::Stop,
                 &[],
                 &BrokerKind::Oanda,
                 "demo",
@@ -1086,6 +1117,7 @@ mod tests {
                 tp_price: 1.0500,
                 entry_deadline_pct: DEFAULT_ENTRY_DEADLINE_PCT,
                 allow_entry: None,
+                entry_mode: EntryMode::Stop,
             },
         };
         let manifest = render_manifest(&trade);
@@ -1116,6 +1148,7 @@ mod tests {
             false,
             None,
             None,
+            EntryMode::Stop,
             &[],
             &BrokerKind::Oanda,
             "demo",
@@ -1177,6 +1210,7 @@ mod tests {
             false,
             None,
             None,
+            EntryMode::Stop,
             &[],
             &BrokerKind::Oanda,
             "demo",
@@ -1246,6 +1280,7 @@ mod tests {
             tp_price: 1.0500,
             entry_deadline_pct: 80,
             allow_entry: None,
+            entry_mode: EntryMode::Stop,
         }
     }
 
@@ -1407,6 +1442,59 @@ tp_price: 1.05
                 alert.basename
             );
         }
+    }
+
+    #[test]
+    fn build_trade_from_spec_default_entry_mode_is_stop() {
+        // Omitting entry_mode preserves today's pending-stop entry —
+        // critical for wire compat with all pre-existing spec yamls.
+        let now = ts("2026-05-20T00:00:00Z");
+        let spec = sample_spec(TradePattern::Hs, ts("2026-05-25T00:00:00Z"));
+        let trade = build_trade_from_spec(spec, now).unwrap();
+        let enter = trade.alerts.last().unwrap();
+        assert!(
+            matches!(&enter.intent.entry, Some(EntrySpec::Stop { .. })),
+            "expected Stop entry, got {:?}",
+            enter.intent.entry
+        );
+    }
+
+    #[test]
+    fn build_trade_from_spec_market_entry_mode_emits_market_entry() {
+        // entry_mode: market swaps EntrySpec::Stop for EntrySpec::Market.
+        // The SL still anchors to geometry — only the entry-side order
+        // type changes.
+        let now = ts("2026-05-20T00:00:00Z");
+        let mut spec = sample_spec(TradePattern::Hs, ts("2026-05-25T00:00:00Z"));
+        spec.entry_mode = EntryMode::Market;
+        let trade = build_trade_from_spec(spec, now).unwrap();
+        let enter = trade.alerts.last().unwrap();
+        assert!(
+            matches!(&enter.intent.entry, Some(EntrySpec::Market)),
+            "expected Market entry, got {:?}",
+            enter.intent.entry
+        );
+        // SL geometry untouched.
+        assert!(matches!(
+            &enter.intent.stop_loss,
+            Some(PriceRef::Anchored { .. })
+        ));
+    }
+
+    #[test]
+    fn trade_spec_yaml_parses_entry_mode_market() {
+        // Wire form an operator (or the Python tool) writes for a
+        // market entry.
+        let yaml = "\
+pattern: hs
+instrument: EUR_USD
+account: demo
+trade_expiry: \"2026-05-25T00:00:00Z\"
+tp_price: 1.05
+entry_mode: market
+";
+        let spec: TradeSpec = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(spec.entry_mode, EntryMode::Market);
     }
 
     #[test]

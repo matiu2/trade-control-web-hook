@@ -771,6 +771,13 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
              "keeps today's single-shot behaviour. Bounded by trade_expiry.",
     )
     p.add_argument(
+        "--entry-market", action="store_true",
+        help="Use a market order for entry instead of the default pending "
+             "stop-entry at the geometry anchor. Useful for confirmed-"
+             "candle entries where waiting for a stop level just adds "
+             "slippage. SL still anchors to geometry.",
+    )
+    p.add_argument(
         "--entry-filter-script", dest="entry_filter_script", default=None,
         help="Rhai script that gates whether the worker places the entry "
              "order. Lands on the enter intent's `allow_entry` as a "
@@ -887,6 +894,8 @@ def main(argv: Optional[list[str]] = None) -> int:
         spec["max_retries"] = args.max_retries
     if args.entry_filter_script is not None:
         spec["allow_entry"] = args.entry_filter_script
+    if args.entry_market:
+        spec["entry_mode"] = "market"
     if skip_preps:
         spec["skip_preps"] = skip_preps
     write_trade_spec(spec, spec_path)
@@ -926,6 +935,8 @@ def main(argv: Optional[list[str]] = None) -> int:
         print(f"# max_retries: {args.max_retries}")
     if args.entry_filter_script is not None:
         print(f"# allow_entry script: {args.entry_filter_script}")
+    if args.entry_market:
+        print("# entry_mode: market")
     print()
 
     payloads = []
