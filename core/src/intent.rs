@@ -369,6 +369,25 @@ pub struct Intent {
     /// behaviour instead.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_retries: Option<u32>,
+    /// Optional Rhai gate on `enter`. When set, the worker resolves
+    /// the [`Tunable<bool>`] (Static or `!script`) after passing the
+    /// retry / prep / veto gates and rejects the entry with a 412 if
+    /// it evaluates to `false`. Composes with `max_retries`: each
+    /// retry re-evaluates against its own incoming shell, so a
+    /// `!script "signal_confirmed == true"` gate naturally implements
+    /// wait-for-confirmation by letting the worker burn attempts
+    /// until a confirming signal arrives.
+    ///
+    /// Resolved against the standard three-phase scope (shell anchors
+    /// plus derived geometry). Scripts can reference any field bound
+    /// by `crate::rules::bind_shell_anchors` and
+    /// `crate::rules::bind_intent_derived`, plus the `pct` / `pips`
+    /// helpers. Returning non-bool is a 412.
+    ///
+    /// Default-absent = unconditional allow; byte-identical wire form
+    /// to pre-`allow_entry` intents.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allow_entry: Option<crate::tunable::Tunable<bool>>,
 }
 
 /// Maximum length of a `trade_id` slug. 64 chars is plenty for
@@ -408,6 +427,9 @@ pub enum IntentValidationError {
     /// `max_retries: Some(_)` on a non-Enter action — retries only
     /// make sense for `enter`.
     MaxRetriesOnNonEnter,
+    /// `allow_entry: Some(_)` on a non-Enter action — the gate is
+    /// only checked on `enter`.
+    AllowEntryOnNonEnter,
 }
 
 impl core::fmt::Display for IntentValidationError {
@@ -424,6 +446,7 @@ impl core::fmt::Display for IntentValidationError {
                 f.write_str("max_retries requires trade_id to be set")
             }
             Self::MaxRetriesOnNonEnter => f.write_str("max_retries is only valid on action: enter"),
+            Self::AllowEntryOnNonEnter => f.write_str("allow_entry is only valid on action: enter"),
         }
     }
 }
@@ -451,6 +474,9 @@ impl Intent {
             if self.action != Action::Enter {
                 return Err(IntentValidationError::MaxRetriesOnNonEnter);
             }
+        }
+        if self.allow_entry.is_some() && self.action != Action::Enter {
+            return Err(IntentValidationError::AllowEntryOnNonEnter);
         }
         Ok(())
     }
@@ -1399,6 +1425,140 @@ mod tests {
         assert_eq!(
             intent.validate(),
             Err(IntentValidationError::MaxRetriesOnNonEnter)
+        );
+    }
+
+    #[test]
+    fn intent_defaults_allow_entry_to_none() {
+        let yaml = "
+            v: 1
+            id: ae-1
+            not_after: \"2026-05-13T20:00:00Z\"
+            action: enter
+            instrument: EUR_USD
+            direction: long
+            entry: { type: market }
+            stop_loss: { from: low, offset_pips: -2 }
+            take_profit: { from: close, offset_r: 2.0 }
+            risk_pct: 0.5
+        ";
+        let intent: Intent = serde_yaml::from_str(yaml).unwrap();
+        assert!(intent.allow_entry.is_none());
+        intent.validate().unwrap();
+    }
+
+    #[test]
+    fn intent_parses_allow_entry_static_true() {
+        let yaml = "
+            v: 1
+            id: ae-2
+            not_after: \"2026-05-13T20:00:00Z\"
+            action: enter
+            instrument: EUR_USD
+            direction: long
+            entry: { type: market }
+            stop_loss: { from: low, offset_pips: -2 }
+            take_profit: { from: close, offset_r: 2.0 }
+            risk_pct: 0.5
+            allow_entry: true
+        ";
+        let intent: Intent = serde_yaml::from_str(yaml).unwrap();
+        match intent.allow_entry {
+            Some(crate::tunable::Tunable::Static(v)) => assert!(v),
+            other => panic!("expected Static(true), got {other:?}"),
+        }
+        intent.validate().unwrap();
+    }
+
+    #[test]
+    fn intent_parses_allow_entry_script() {
+        let yaml = "
+            v: 1
+            id: ae-3
+            not_after: \"2026-05-13T20:00:00Z\"
+            action: enter
+            instrument: EUR_USD
+            direction: long
+            entry: { type: market }
+            stop_loss: { from: low, offset_pips: -2 }
+            take_profit: { from: close, offset_r: 2.0 }
+            risk_pct: 0.5
+            allow_entry: !script \"signal_confirmed == true\"
+        ";
+        let intent: Intent = serde_yaml::from_str(yaml).unwrap();
+        match &intent.allow_entry {
+            Some(crate::tunable::Tunable::Script(s)) => {
+                assert_eq!(s.source, "signal_confirmed == true");
+            }
+            other => panic!("expected Script, got {other:?}"),
+        }
+        intent.validate().unwrap();
+    }
+
+    #[test]
+    fn intent_allow_entry_round_trips_through_yaml() {
+        let yaml = "
+            v: 1
+            id: ae-4
+            not_after: \"2026-05-13T20:00:00Z\"
+            action: enter
+            instrument: EUR_USD
+            direction: long
+            entry: { type: market }
+            stop_loss: { from: low, offset_pips: -2 }
+            take_profit: { from: close, offset_r: 2.0 }
+            risk_pct: 0.5
+            allow_entry: !script \"signal_confirmed == true\"
+        ";
+        let intent: Intent = serde_yaml::from_str(yaml).unwrap();
+        let back = serde_yaml::to_string(&intent).unwrap();
+        assert!(back.contains("!script"), "got:\n{back}");
+        assert!(back.contains("signal_confirmed == true"), "got:\n{back}");
+        // Re-parse the emitted form to confirm full round-trip.
+        let again: Intent = serde_yaml::from_str(&back).unwrap();
+        assert_eq!(intent.allow_entry, again.allow_entry);
+    }
+
+    #[test]
+    fn intent_omits_allow_entry_when_none() {
+        // skip_serializing_if guard — pre-allow_entry intents must
+        // serialise byte-identical to before this field landed.
+        let yaml = "
+            v: 1
+            id: ae-5
+            not_after: \"2026-05-13T20:00:00Z\"
+            action: enter
+            instrument: EUR_USD
+            direction: long
+            entry: { type: market }
+            stop_loss: { from: low, offset_pips: -2 }
+            take_profit: { from: close, offset_r: 2.0 }
+            risk_pct: 0.5
+        ";
+        let intent: Intent = serde_yaml::from_str(yaml).unwrap();
+        let back = serde_yaml::to_string(&intent).unwrap();
+        assert!(!back.contains("allow_entry"), "got:\n{back}");
+    }
+
+    #[test]
+    fn validate_rejects_allow_entry_on_non_enter_action() {
+        // Same defense-in-depth as max_retries — the gate only runs on
+        // the Enter path so allowing it on prep / veto would be silently
+        // ignored at the worker. Better to reject at validate time.
+        let yaml = "
+            v: 1
+            id: ae-prep
+            not_after: \"2026-05-13T20:00:00Z\"
+            action: prep
+            instrument: EUR_USD
+            step: break-and-close
+            ttl_hours: 4
+            allow_entry: true
+        ";
+        let intent: Intent = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(
+            intent.validate(),
+            Err(IntentValidationError::AllowEntryOnNonEnter)
         );
     }
 

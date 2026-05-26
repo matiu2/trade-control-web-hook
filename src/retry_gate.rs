@@ -630,6 +630,7 @@ mod tests {
             clears: Vec::new(),
             trade_id: Some("trade-xyz".into()),
             max_retries,
+            allow_entry: None,
         }
     }
 

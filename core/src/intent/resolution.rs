@@ -365,6 +365,7 @@ mod tests {
             account: None,
             trade_id: None,
             max_retries: None,
+            allow_entry: None,
         }
     }
 

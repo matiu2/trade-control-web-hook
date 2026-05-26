@@ -27,6 +27,12 @@ use rhai::{Dynamic, Engine, EvalAltResult, ParseError, Scope};
 use crate::intent::{Direction, Resolved, ResolvedEntry, Shell, SignalKind};
 use crate::tunable::{CompiledScript, Tunable};
 
+// Re-export the two types call sites need to build and use a scope. The
+// worker only ever touches the engine via `build_engine` + the helpers
+// here — keeping the re-export contained means downstream crates don't
+// need to depend on `rhai` directly.
+pub use rhai::Scope as RhaiScope;
+
 /// Maximum number of Rhai opcodes a single script may execute. Real
 /// `allow_entry` / sizing scripts run a few comparisons and arithmetic
 /// ops — well under 50. 1000 is a wide margin while still blowing up

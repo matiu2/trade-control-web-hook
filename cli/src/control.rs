@@ -52,6 +52,7 @@ fn control_skeleton(action: Action, instrument: &str, id: String, now: DateTime<
         account: None,
         trade_id: None,
         max_retries: None,
+        allow_entry: None,
     }
 }
 

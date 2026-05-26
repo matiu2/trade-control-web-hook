@@ -1,5 +1,6 @@
 mod accounts;
 mod admin;
+mod allow_entry_gate;
 mod diag;
 mod retry_gate;
 mod state;
@@ -478,6 +479,36 @@ async fn run_enter<B: Broker>(
             };
         }
     };
+
+    // allow_entry gate — operator's Tunable<bool> script sees the full
+    // shell + resolved geometry. Sits after Resolved::from_intent
+    // (Phase 2 bindings need it) and ahead of the broker call (cheap
+    // 412 on false). Doesn't consume a retry slot — only a successful
+    // broker placement does.
+    match allow_entry_gate::evaluate(&verified.intent, &verified.shell, &resolved, pip_size) {
+        allow_entry_gate::AllowEntryOutcome::Proceed => {}
+        allow_entry_gate::AllowEntryOutcome::Blocked => {
+            console_log!(
+                "entry rejected: allow_entry returned false (id={})",
+                verified.intent.id
+            );
+            return ActionResult::Rejected {
+                response: Response::error("entry blocked", 412),
+                outcome: "rejected: allow-entry-false".into(),
+            };
+        }
+        allow_entry_gate::AllowEntryOutcome::ScriptError { kind, message } => {
+            console_error!(
+                "allow_entry script error (id={}): {message}",
+                verified.intent.id
+            );
+            return ActionResult::Rejected {
+                response: Response::error("entry blocked: script error", 412),
+                outcome: format!("rejected: allow-entry-{kind}"),
+            };
+        }
+    }
+
     let caps = load_account_caps(env, verified.intent.account.as_deref()).await;
     // Apply the per-account narrowing now that we have the caps: an
     // account record can tighten the worker-wide ceiling but never
