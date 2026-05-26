@@ -92,6 +92,11 @@ pub fn validate(intent: &Intent) -> Vec<ScriptError> {
     {
         errors.push(e);
     }
+    if let Some(t) = &intent.ttl_hours
+        && let Some(e) = check_one::<u32>("ttl_hours", t, &shell, &resolved, pip_size)
+    {
+        errors.push(e);
+    }
     // Future per-field tunables go here as additional check_one calls.
 
     errors
@@ -486,6 +491,35 @@ mod tests {
         let errs = validate(&intent);
         assert_eq!(errs.len(), 1);
         assert_eq!(errs[0].field, "cooldown_hours");
+        assert_eq!(errs[0].kind, "wrong-type");
+    }
+
+    #[test]
+    fn ttl_hours_script_passes_when_valid() {
+        let mut intent = intent_with_allow_entry(None);
+        intent.ttl_hours = Some(Tunable::from_script(
+            "if signal_confirmed == true { 8 } else { 4 }",
+        ));
+        assert!(validate(&intent).is_empty());
+    }
+
+    #[test]
+    fn ttl_hours_script_parse_error_surfaces() {
+        let mut intent = intent_with_allow_entry(None);
+        intent.ttl_hours = Some(Tunable::from_script("if if if"));
+        let errs = validate(&intent);
+        assert_eq!(errs.len(), 1);
+        assert_eq!(errs[0].field, "ttl_hours");
+        assert_eq!(errs[0].kind, "parse");
+    }
+
+    #[test]
+    fn ttl_hours_script_wrong_type_surfaces() {
+        let mut intent = intent_with_allow_entry(None);
+        intent.ttl_hours = Some(Tunable::from_script("1.5"));
+        let errs = validate(&intent);
+        assert_eq!(errs.len(), 1);
+        assert_eq!(errs[0].field, "ttl_hours");
         assert_eq!(errs[0].kind, "wrong-type");
     }
 

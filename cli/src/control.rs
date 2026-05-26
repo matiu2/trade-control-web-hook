@@ -91,7 +91,7 @@ pub fn build_prep_intent(
     );
     let mut intent = control_skeleton(Action::Prep, instrument, id, now);
     intent.step = Some(step.to_string());
-    intent.ttl_hours = Some(ttl_hours);
+    intent.ttl_hours = Some(trade_control_core::tunable::Tunable::Static(ttl_hours));
     intent.clears = clears;
     intent
 }
@@ -115,7 +115,7 @@ pub fn build_veto_intent(
     );
     let mut intent = control_skeleton(Action::Veto, instrument, id, now);
     intent.name = Some(name.to_string());
-    intent.ttl_hours = Some(ttl_hours);
+    intent.ttl_hours = Some(trade_control_core::tunable::Tunable::Static(ttl_hours));
     intent.level = level;
     intent.clears = clears;
     intent
@@ -335,7 +335,10 @@ mod tests {
         assert_eq!(intent.action, Action::Prep);
         assert_eq!(intent.instrument, "EUR_USD");
         assert_eq!(intent.step.as_deref(), Some("break-and-close"));
-        assert_eq!(intent.ttl_hours, Some(4));
+        match &intent.ttl_hours {
+            Some(trade_control_core::tunable::Tunable::Static(n)) => assert_eq!(*n, 4),
+            other => panic!("expected Static(4) ttl_hours, got {other:?}"),
+        }
         assert!(intent.clears.is_empty());
         let yaml = serde_yaml::to_string(&intent).unwrap();
         let parsed: Intent = serde_yaml::from_str(&yaml).unwrap();
@@ -366,7 +369,10 @@ mod tests {
         let intent = build_veto_intent("EUR_USD", "news-window", 6, None, Vec::new(), t(), "cd34");
         assert_eq!(intent.action, Action::Veto);
         assert_eq!(intent.name.as_deref(), Some("news-window"));
-        assert_eq!(intent.ttl_hours, Some(6));
+        match &intent.ttl_hours {
+            Some(trade_control_core::tunable::Tunable::Static(n)) => assert_eq!(*n, 6),
+            other => panic!("expected Static(6) ttl_hours, got {other:?}"),
+        }
         assert!(intent.clears.is_empty());
         let yaml = serde_yaml::to_string(&intent).unwrap();
         let parsed: Intent = serde_yaml::from_str(&yaml).unwrap();

@@ -749,7 +749,9 @@ fn build_invalidation_alert(
         trade_id,
     );
     intent.name = Some(veto_name.to_string());
-    intent.ttl_hours = Some(ttl_hours_until(now, veto_expiry));
+    intent.ttl_hours = Some(trade_control_core::tunable::Tunable::Static(
+        ttl_hours_until(now, veto_expiry),
+    ));
     intent.level = Some(VetoLevel::ClosePositions);
     BuiltAlert {
         basename: format!("01-veto-{veto_name}"),
@@ -779,7 +781,9 @@ fn build_trade_expiry_alert(
     );
     intent.not_before = Some(trade_expiry);
     intent.name = Some("trade-expiry".into());
-    intent.ttl_hours = Some(ttl_hours_until(now, veto_expiry));
+    intent.ttl_hours = Some(trade_control_core::tunable::Tunable::Static(
+        ttl_hours_until(now, veto_expiry),
+    ));
     intent.level = Some(VetoLevel::ClosePositions);
     BuiltAlert {
         basename: "02-veto-trade-expiry".into(),
@@ -807,7 +811,9 @@ fn build_break_and_close_alert(
         trade_id,
     );
     intent.step = Some("break-and-close".into());
-    intent.ttl_hours = Some(ttl_hours_until(now, trade_expiry));
+    intent.ttl_hours = Some(trade_control_core::tunable::Tunable::Static(
+        ttl_hours_until(now, trade_expiry),
+    ));
     // Landing a fresh break-and-close invalidates any stale retest
     // from a prior, abandoned setup on the same instrument.
     intent.clears = vec!["retest".into()];
@@ -837,7 +843,9 @@ fn build_retest_alert(
         trade_id,
     );
     intent.step = Some("retest".into());
-    intent.ttl_hours = Some(ttl_hours_until(now, trade_expiry));
+    intent.ttl_hours = Some(trade_control_core::tunable::Tunable::Static(
+        ttl_hours_until(now, trade_expiry),
+    ));
     BuiltAlert {
         basename: "04-prep-retest".into(),
         purpose: "prep: retest (price returns to neckline; gates entry)".into(),

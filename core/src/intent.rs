@@ -336,8 +336,15 @@ pub struct Intent {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
     /// Required for `prep` / `veto`. TTL in hours for the flag.
+    ///
+    /// A [`Tunable<u32>`] — operators can supply a static literal
+    /// (`ttl_hours: 6`) or a Rhai script (`ttl_hours: !script "..."`)
+    /// that resolves against Phase 1 scope only (shell anchors —
+    /// prep/veto run without geometry). Scripts returning zero are
+    /// accepted (a TTL of 0 means "expire immediately" — operators
+    /// who want to reject zero should script it in).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub ttl_hours: Option<u32>,
+    pub ttl_hours: Option<crate::tunable::Tunable<u32>>,
     /// Escalation level for a `veto` action. Default is
     /// [`VetoLevel::StopNextEntry`] (flag-only, no broker side effects).
     /// Higher levels also cancel pending orders and/or close positions
@@ -1018,7 +1025,10 @@ mod tests {
         let intent: Intent = serde_yaml::from_str(yaml).unwrap();
         assert_eq!(intent.action, Action::Prep);
         assert_eq!(intent.step.as_deref(), Some("break-and-close"));
-        assert_eq!(intent.ttl_hours, Some(4));
+        match &intent.ttl_hours {
+            Some(crate::tunable::Tunable::Static(n)) => assert_eq!(*n, 4),
+            other => panic!("expected Static(4) ttl_hours, got {other:?}"),
+        }
     }
 
     #[test]
@@ -1087,7 +1097,10 @@ mod tests {
         let intent: Intent = serde_yaml::from_str(yaml).unwrap();
         assert_eq!(intent.action, Action::Veto);
         assert_eq!(intent.name.as_deref(), Some("news-window"));
-        assert_eq!(intent.ttl_hours, Some(6));
+        match &intent.ttl_hours {
+            Some(crate::tunable::Tunable::Static(n)) => assert_eq!(*n, 6),
+            other => panic!("expected Static(6) ttl_hours, got {other:?}"),
+        }
     }
 
     #[test]

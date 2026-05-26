@@ -726,8 +726,19 @@ async fn handle_prep(
     let Some(step) = verified.intent.step.as_deref() else {
         return Response::error("prep requires `step`", 400);
     };
-    let Some(ttl_hours) = verified.intent.ttl_hours else {
+    if verified.intent.ttl_hours.is_none() {
         return Response::error("prep requires `ttl_hours`", 400);
+    }
+    let ttl_hours = match resolve_phase1_u32(
+        "ttl_hours",
+        verified.intent.ttl_hours.as_ref(),
+        &verified.shell,
+        0,
+    ) {
+        Ok(n) => n,
+        Err(_outcome) => {
+            return Response::error("ttl_hours script error", 412);
+        }
     };
     let ttl_seconds = (ttl_hours as u64).saturating_mul(3600);
     // Clear any preps listed in `clears` first so stale downstream
@@ -798,8 +809,17 @@ async fn handle_veto(
     let Some(name) = verified.intent.name.as_deref() else {
         return Response::error("veto requires `name`", 400);
     };
-    let Some(ttl_hours) = verified.intent.ttl_hours else {
+    if verified.intent.ttl_hours.is_none() {
         return Response::error("veto requires `ttl_hours`", 400);
+    }
+    let ttl_hours = match resolve_phase1_u32(
+        "ttl_hours",
+        verified.intent.ttl_hours.as_ref(),
+        &verified.shell,
+        0,
+    ) {
+        Ok(n) => n,
+        Err(_outcome) => return Response::error("ttl_hours script error", 412),
     };
     // The veto must outlive the setup it invalidates: if price ran
     // too-high mid-window the original `enter` is dead for the rest
@@ -888,11 +908,25 @@ async fn run_veto_with_broker<B: Broker>(
             outcome: "rejected: missing-name".into(),
         };
     };
-    let Some(ttl_hours) = verified.intent.ttl_hours else {
+    if verified.intent.ttl_hours.is_none() {
         return ActionResult::Rejected {
             response: Response::error("veto requires `ttl_hours`", 400),
             outcome: "rejected: missing-ttl".into(),
         };
+    }
+    let ttl_hours = match resolve_phase1_u32(
+        "ttl_hours",
+        verified.intent.ttl_hours.as_ref(),
+        &verified.shell,
+        0,
+    ) {
+        Ok(n) => n,
+        Err(outcome) => {
+            return ActionResult::Rejected {
+                response: Response::error("ttl_hours script error", 412),
+                outcome,
+            };
+        }
     };
     let level = verified.intent.level.unwrap_or_default();
     // See `veto_ttl_seconds` — the veto must outlive the setup it
