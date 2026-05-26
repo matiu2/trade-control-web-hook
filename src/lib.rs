@@ -369,10 +369,13 @@ async fn run_enter<B: Broker>(
     // `max_retries`, the gate inspects prior attempts (cancel-and-
     // replace a still-pending one, reject a fresh placement when an
     // earlier attempt is still open) and enforces the placement cap.
-    // The single-shot path (`max_retries: None`) skips this branch
-    // entirely so no new KV/broker calls land on the byte-identical
-    // baseline.
-    let retry_attempt_no = if verified.intent.max_retries.is_some() {
+    // The single-shot path (`max_retries: Static(0)`, the default)
+    // skips this branch entirely so no new KV/broker calls land on the
+    // byte-identical baseline.
+    let retry_attempt_no = if !matches!(
+        verified.intent.max_retries,
+        trade_control_core::tunable::Tunable::Static(0)
+    ) {
         match retry_gate::evaluate(broker, store, &verified.intent, &verified.shell).await {
             retry_gate::RetryGateOutcome::Proceed { next_attempt_no } => Some(next_attempt_no),
             retry_gate::RetryGateOutcome::Rejected {

@@ -158,7 +158,7 @@ mod tests {
             vetos: Vec::new(),
             clears: Vec::new(),
             trade_id: None,
-            max_retries: None,
+            max_retries: trade_control_core::tunable::Tunable::Static(0),
             allow_entry: gate,
             needs_golden: false,
         }

@@ -1,7 +1,8 @@
 //! Multi-shot retry gate for `enter` intents that set `max_retries`.
 //!
 //! When the operator opts a setup into multi-shot mode by setting
-//! `max_retries: Some(N)` and a `trade_id`, the alert may legitimately
+//! `max_retries: N` (any non-default Tunable, i.e. anything that isn't
+//! `Static(0)`) and a `trade_id`, the alert may legitimately
 //! fire on multiple firing bars within the `not_after` window. Each
 //! arrival flows through this gate before reaching the cooldown / prep
 //! / veto checks and the broker placement.
@@ -104,9 +105,10 @@ fn resolve_max_retries(tunable: &Tunable<u32>, shell: &Shell) -> Result<u32, Ret
 }
 
 /// Walk the gate. See module docs for the algorithm. Only call this
-/// when `intent.max_retries.is_some()` — the caller is responsible
-/// for keeping the single-shot path free of any state-store / broker
-/// lookups so the byte-identical baseline holds.
+/// when `intent.max_retries` is non-default (i.e. not `Static(0)`) —
+/// the caller is responsible for keeping the single-shot path free of
+/// any state-store / broker lookups so the byte-identical baseline
+/// holds.
 pub async fn evaluate<B: Broker, S: StateStore>(
     broker: &B,
     store: &S,
@@ -114,11 +116,7 @@ pub async fn evaluate<B: Broker, S: StateStore>(
     shell: &Shell,
 ) -> RetryGateOutcome {
     let shell_time = shell.time;
-    let Some(max_retries_t) = intent.max_retries.as_ref() else {
-        // Guarded by the caller; reached only on a programming error.
-        return RetryGateOutcome::Proceed { next_attempt_no: 1 };
-    };
-    let max_retries = match resolve_max_retries(max_retries_t, shell) {
+    let max_retries = match resolve_max_retries(&intent.max_retries, shell) {
         Ok(n) => n,
         Err(outcome) => return outcome,
     };
@@ -634,11 +632,14 @@ mod tests {
         s.parse().unwrap()
     }
 
-    fn intent_with_retries(max_retries: Option<u32>) -> Intent {
-        intent_with_max_retries_tunable(max_retries.map(Tunable::Static))
+    /// Build an Intent with `max_retries: Static(n)`. Pass `0` for the
+    /// default single-shot behaviour, matching the post-flatten wire
+    /// semantics (`Static(0)` is the elided default).
+    fn intent_with_retries(max_retries: u32) -> Intent {
+        intent_with_max_retries_tunable(Tunable::Static(max_retries))
     }
 
-    fn intent_with_max_retries_tunable(max_retries: Option<Tunable<u32>>) -> Intent {
+    fn intent_with_max_retries_tunable(max_retries: Tunable<u32>) -> Intent {
         Intent {
             v: 1,
             id: "msg-1".into(),
@@ -735,21 +736,22 @@ mod tests {
         shell_at(shell_time())
     }
 
-    /// Single-shot baseline — `max_retries: None` must skip the gate
-    /// entirely. Zero list_entry_attempts / is_retry_fire_seen
+    /// Single-shot baseline — `max_retries: Static(0)` must skip the
+    /// gate entirely. Zero list_entry_attempts / is_retry_fire_seen
     /// calls, zero broker lookups. Proves the byte-identical
     /// regression invariant the plan asks for.
     #[test]
-    fn baseline_max_retries_none_makes_no_new_calls() {
+    fn baseline_max_retries_default_makes_no_new_calls() {
         let broker = MockBroker::default();
         let store = CountingStore::default();
-        let intent = intent_with_retries(None);
+        let intent = intent_with_retries(0);
 
-        // Skip the gate when max_retries.is_none() — mirrors the wired
-        // call site. Asserting via the store/broker counters is the
-        // strongest invariant: even an accidental change that called
-        // evaluate() unconditionally would fail this test.
-        if intent.max_retries.is_some() {
+        // Skip the gate when max_retries is the default Static(0) —
+        // mirrors the wired call site. Asserting via the store/broker
+        // counters is the strongest invariant: even an accidental
+        // change that called evaluate() unconditionally would fail this
+        // test.
+        if !matches!(intent.max_retries, Tunable::Static(0)) {
             run(evaluate(&broker, &store, &intent, &fixture_shell()));
         }
 
@@ -768,7 +770,7 @@ mod tests {
     fn first_fire_proceeds_with_attempt_one() {
         let broker = MockBroker::default();
         let store = CountingStore::default();
-        let intent = intent_with_retries(Some(3));
+        let intent = intent_with_retries(3);
 
         let out = run(evaluate(&broker, &store, &intent, &fixture_shell()));
         assert_proceed(out, 1);
@@ -784,7 +786,7 @@ mod tests {
     fn same_firing_bar_twice_dedups_with_409() {
         let broker = MockBroker::default();
         let store = CountingStore::default();
-        let intent = intent_with_retries(Some(3));
+        let intent = intent_with_retries(3);
         let now = ts("2026-05-25T14:00:05Z");
 
         // 1st fire.
@@ -815,7 +817,7 @@ mod tests {
     fn pending_attempt_cancelled_then_proceed() {
         let broker = MockBroker::default();
         let store = CountingStore::default();
-        let intent = intent_with_retries(Some(3));
+        let intent = intent_with_retries(3);
         run(record_placement(
             &store,
             &intent,
@@ -845,7 +847,7 @@ mod tests {
     fn pending_cancel_race_open_position_yields_412() {
         let broker = MockBroker::default();
         let store = CountingStore::default();
-        let intent = intent_with_retries(Some(3));
+        let intent = intent_with_retries(3);
         run(record_placement(
             &store,
             &intent,
@@ -881,7 +883,7 @@ mod tests {
     fn open_position_yields_412_and_snapshots_trade_id() {
         let broker = MockBroker::default();
         let store = CountingStore::default();
-        let intent = intent_with_retries(Some(3));
+        let intent = intent_with_retries(3);
         run(record_placement(
             &store,
             &intent,
@@ -916,7 +918,7 @@ mod tests {
         ] {
             let broker = MockBroker::default();
             let store = CountingStore::default();
-            let intent = intent_with_retries(Some(3));
+            let intent = intent_with_retries(3);
             run(record_placement(
                 &store,
                 &intent,
@@ -943,7 +945,7 @@ mod tests {
     fn retry_cap_yields_429() {
         let broker = MockBroker::default();
         let store = CountingStore::default();
-        let intent = intent_with_retries(Some(3));
+        let intent = intent_with_retries(3);
         for n in 1..=3 {
             run(record_placement(
                 &store,
@@ -970,7 +972,7 @@ mod tests {
     fn transient_broker_error_yields_503() {
         let broker = MockBroker::default();
         let store = CountingStore::default();
-        let intent = intent_with_retries(Some(3));
+        let intent = intent_with_retries(3);
         run(record_placement(
             &store,
             &intent,
@@ -997,7 +999,7 @@ mod tests {
         // Static(3) resolves to 3 — same as the old `Some(3)` path.
         let broker = MockBroker::default();
         let store = CountingStore::default();
-        let intent = intent_with_max_retries_tunable(Some(Tunable::Static(3)));
+        let intent = intent_with_max_retries_tunable(Tunable::Static(3));
         let out = run(evaluate(&broker, &store, &intent, &fixture_shell()));
         assert_proceed(out, 1);
     }
@@ -1007,9 +1009,9 @@ mod tests {
         // Script: pump retries to 5 when golden, else 3.
         let broker = MockBroker::default();
         let store = CountingStore::default();
-        let intent = intent_with_max_retries_tunable(Some(Tunable::from_script(
+        let intent = intent_with_max_retries_tunable(Tunable::from_script(
             "if golden == true { 5 } else { 3 }",
-        )));
+        ));
         let mut shell = fixture_shell();
         shell.golden = Some(true);
         let out = run(evaluate(&broker, &store, &intent, &shell));
@@ -1021,7 +1023,7 @@ mod tests {
     fn max_retries_script_returning_zero_rejected() {
         let broker = MockBroker::default();
         let store = CountingStore::default();
-        let intent = intent_with_max_retries_tunable(Some(Tunable::from_script("0")));
+        let intent = intent_with_max_retries_tunable(Tunable::from_script("0"));
         let out = run(evaluate(&broker, &store, &intent, &fixture_shell()));
         assert_rejected(out, 412, "max-retries-zero");
     }
@@ -1030,7 +1032,7 @@ mod tests {
     fn max_retries_script_parse_error_yields_412() {
         let broker = MockBroker::default();
         let store = CountingStore::default();
-        let intent = intent_with_max_retries_tunable(Some(Tunable::from_script("if if if")));
+        let intent = intent_with_max_retries_tunable(Tunable::from_script("if if if"));
         let out = run(evaluate(&broker, &store, &intent, &fixture_shell()));
         assert_rejected(out, 412, "max-retries-script-parse");
     }
@@ -1040,7 +1042,7 @@ mod tests {
         // Script returns f64, max_retries expects u32.
         let broker = MockBroker::default();
         let store = CountingStore::default();
-        let intent = intent_with_max_retries_tunable(Some(Tunable::from_script("1.5")));
+        let intent = intent_with_max_retries_tunable(Tunable::from_script("1.5"));
         let out = run(evaluate(&broker, &store, &intent, &fixture_shell()));
         assert_rejected(out, 412, "max-retries-script-wrong-type");
     }

@@ -405,22 +405,24 @@ pub struct Intent {
     /// back-compatible with intents minted before this field landed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trade_id: Option<String>,
-    /// When set, the worker treats the enter as multi-shot: the alert
-    /// may fire on multiple firing bars within the `not_after` window,
-    /// dedup'd by `(trade_id, shell.time)`. Total **placed** entries are
-    /// capped at this value. Requires `trade_id` to be set and `action`
-    /// to be [`Action::Enter`]; rejected at validate time otherwise.
-    /// Zero is rejected — pass `None` for the default single-shot
-    /// behaviour instead.
+    /// Cap on placed enter attempts within the trade window. The default
+    /// is `Tunable::Static(0)` — single-shot behaviour, byte-identical
+    /// wire form to pre-feature intents. Any non-default value opts the
+    /// enter into multi-shot: the alert may fire on multiple firing bars
+    /// within the `not_after` window, dedup'd by `(trade_id,
+    /// shell.time)`. Total **placed** entries are capped at the resolved
+    /// value. Multi-shot requires `trade_id` to be set and `action` to
+    /// be [`Action::Enter`]; rejected at validate time otherwise.
     ///
     /// A [`Tunable<u32>`] — operators can supply a static literal
     /// (`max_retries: 3`) or a Rhai script (`max_retries: !script
     /// "..."`) that resolves at gate time against Phase 1 scope only
     /// (shell anchors — the gate runs before geometry is built, so
-    /// derived bindings are unavailable). Scripts returning zero are
-    /// rejected at resolve time, mirroring the static-literal rule.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub max_retries: Option<crate::tunable::Tunable<u32>>,
+    /// derived bindings are unavailable). Scripts that resolve to zero
+    /// are rejected at resolve time (a script that wants to opt out of
+    /// retries should not be in the field in the first place).
+    #[serde(default, skip_serializing_if = "is_default_max_retries")]
+    pub max_retries: crate::tunable::Tunable<u32>,
     /// Optional Rhai gate on `enter`. When set, the worker resolves
     /// the [`Tunable<bool>`] (Static or `!script`) after passing the
     /// retry / prep / veto gates and rejects the entry with a 412 if
@@ -452,6 +454,15 @@ pub struct Intent {
     pub needs_golden: bool,
 }
 
+/// Skip-serializing predicate for [`Intent::max_retries`]. Returns true
+/// when the field carries its default single-shot value (`Static(0)`)
+/// so the wire form stays byte-identical to pre-feature intents. A
+/// `Script` is never elided — we can't know its resolved value at
+/// serialise time, and an operator who wrote a script clearly meant it.
+fn is_default_max_retries(t: &crate::tunable::Tunable<u32>) -> bool {
+    matches!(t, crate::tunable::Tunable::Static(0))
+}
+
 /// Maximum length of a `trade_id` slug. 64 chars is plenty for
 /// `<instrument>-<direction>-<short-random>` style ids and keeps the
 /// seen-index entry small.
@@ -480,13 +491,11 @@ pub fn is_valid_trade_id(s: &str) -> bool {
 pub enum IntentValidationError {
     /// `trade_id` failed [`is_valid_trade_id`].
     InvalidTradeId,
-    /// `max_retries: Some(0)` — must be at least 1, or absent for the
-    /// default single-shot behaviour.
-    ZeroMaxRetries,
-    /// `max_retries: Some(_)` without a `trade_id` — the retry gate
-    /// is keyed on `(account, trade_id)` so the field is mandatory.
+    /// `max_retries` non-default without a `trade_id` — the retry gate
+    /// is keyed on `(account, trade_id)` so the field is mandatory once
+    /// the operator opts into multi-shot.
     MaxRetriesWithoutTradeId,
-    /// `max_retries: Some(_)` on a non-Enter action — retries only
+    /// `max_retries` non-default on a non-Enter action — retries only
     /// make sense for `enter`.
     MaxRetriesOnNonEnter,
     /// `allow_entry: Some(_)` on a non-Enter action — the gate is
@@ -504,9 +513,6 @@ impl core::fmt::Display for IntentValidationError {
                 "invalid trade_id (must be 1-64 chars of lowercase alphanumerics + hyphens, \
                  no leading/trailing or consecutive hyphens)",
             ),
-            Self::ZeroMaxRetries => {
-                f.write_str("max_retries must be >= 1; omit for single-shot behaviour")
-            }
             Self::MaxRetriesWithoutTradeId => {
                 f.write_str("max_retries requires trade_id to be set")
             }
@@ -532,15 +538,11 @@ impl Intent {
         {
             return Err(IntentValidationError::InvalidTradeId);
         }
-        if let Some(t) = &self.max_retries {
-            // Only the Static variant can be validated at parse time;
-            // Script values defer to gate-time resolution (which also
-            // rejects zero).
-            if let crate::tunable::Tunable::Static(n) = t
-                && *n == 0
-            {
-                return Err(IntentValidationError::ZeroMaxRetries);
-            }
+        // Multi-shot gate: anything other than the default `Static(0)`
+        // counts as opting in. Scripts always count — we can't know at
+        // validate time whether they'll resolve to zero, and writing a
+        // script means the operator meant it.
+        if !is_default_max_retries(&self.max_retries) {
             if self.trade_id.is_none() {
                 return Err(IntentValidationError::MaxRetriesWithoutTradeId);
             }
@@ -1441,7 +1443,7 @@ mod tests {
     }
 
     #[test]
-    fn intent_defaults_max_retries_to_none() {
+    fn intent_defaults_max_retries_to_static_zero() {
         let yaml = "
             v: 1
             id: mr-1
@@ -1455,7 +1457,7 @@ mod tests {
             risk_pct: 0.5
         ";
         let intent: Intent = serde_yaml::from_str(yaml).unwrap();
-        assert_eq!(intent.max_retries, None);
+        assert_eq!(intent.max_retries, crate::tunable::Tunable::Static(0));
     }
 
     #[test]
@@ -1476,7 +1478,7 @@ mod tests {
         ";
         let intent: Intent = serde_yaml::from_str(yaml).unwrap();
         match &intent.max_retries {
-            Some(crate::tunable::Tunable::Static(n)) => assert_eq!(*n, 3),
+            crate::tunable::Tunable::Static(n) => assert_eq!(*n, 3),
             other => panic!("expected Static(3) max_retries, got {other:?}"),
         }
         intent.validate().unwrap();
@@ -1485,7 +1487,7 @@ mod tests {
     }
 
     #[test]
-    fn intent_omits_max_retries_when_none() {
+    fn intent_omits_max_retries_when_default() {
         // skip_serializing_if guard — keeps the wire form unchanged for
         // single-shot intents minted before this field landed.
         let yaml = "
@@ -1506,7 +1508,10 @@ mod tests {
     }
 
     #[test]
-    fn validate_rejects_zero_max_retries() {
+    fn validate_accepts_zero_max_retries_as_default() {
+        // Static(0) is the default single-shot value — must validate
+        // cleanly regardless of trade_id / action since it's the
+        // wire-equivalent of "no retries opted in".
         let yaml = "
             v: 1
             id: mr-zero
@@ -1518,14 +1523,10 @@ mod tests {
             stop_loss: { from: low, offset_pips: -2 }
             take_profit: { from: close, offset_r: 2.0 }
             risk_pct: 0.5
-            trade_id: eurusd-long-mrz
             max_retries: 0
         ";
         let intent: Intent = serde_yaml::from_str(yaml).unwrap();
-        assert_eq!(
-            intent.validate(),
-            Err(IntentValidationError::ZeroMaxRetries)
-        );
+        intent.validate().unwrap();
     }
 
     #[test]

@@ -499,7 +499,7 @@ mod tests {
             clears: Vec::new(),
             account: None,
             trade_id: None,
-            max_retries: None,
+            max_retries: crate::tunable::Tunable::Static(0),
             allow_entry: None,
             needs_golden: false,
         }

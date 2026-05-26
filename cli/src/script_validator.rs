@@ -82,9 +82,13 @@ pub fn validate(intent: &Intent) -> Vec<ScriptError> {
     {
         errors.push(e);
     }
-    if let Some(t) = &intent.max_retries
-        && let Some(e) = check_one::<u32>("max_retries", t, &shell, &resolved, pip_size)
-    {
+    if let Some(e) = check_one::<u32>(
+        "max_retries",
+        &intent.max_retries,
+        &shell,
+        &resolved,
+        pip_size,
+    ) {
         errors.push(e);
     }
     if let Some(t) = &intent.cooldown_hours
@@ -220,7 +224,7 @@ mod tests {
             vetos: Vec::new(),
             clears: Vec::new(),
             trade_id: None,
-            max_retries: None,
+            max_retries: Tunable::Static(0),
             allow_entry: gate,
             needs_golden: false,
         }
@@ -440,7 +444,7 @@ mod tests {
     #[test]
     fn max_retries_script_passes_when_valid() {
         let mut intent = intent_with_allow_entry(None);
-        intent.max_retries = Some(Tunable::from_script("if golden == true { 5 } else { 3 }"));
+        intent.max_retries = Tunable::from_script("if golden == true { 5 } else { 3 }");
         intent.trade_id = Some("trade-mx-1".into());
         assert!(validate(&intent).is_empty());
     }
@@ -448,7 +452,7 @@ mod tests {
     #[test]
     fn max_retries_script_parse_error_surfaces() {
         let mut intent = intent_with_allow_entry(None);
-        intent.max_retries = Some(Tunable::from_script("if if if"));
+        intent.max_retries = Tunable::from_script("if if if");
         intent.trade_id = Some("trade-mx-2".into());
         let errs = validate(&intent);
         assert_eq!(errs.len(), 1);
@@ -460,7 +464,7 @@ mod tests {
     fn max_retries_script_wrong_type_surfaces() {
         // Script returns f64, max_retries expects u32.
         let mut intent = intent_with_allow_entry(None);
-        intent.max_retries = Some(Tunable::from_script("1.5"));
+        intent.max_retries = Tunable::from_script("1.5");
         intent.trade_id = Some("trade-mx-3".into());
         let errs = validate(&intent);
         assert_eq!(errs.len(), 1);

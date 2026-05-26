@@ -51,7 +51,7 @@ fn control_skeleton(action: Action, instrument: &str, id: String, now: DateTime<
         clears: Vec::new(),
         account: None,
         trade_id: None,
-        max_retries: None,
+        max_retries: trade_control_core::tunable::Tunable::Static(0),
         allow_entry: None,
         needs_golden: false,
     }

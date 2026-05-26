@@ -55,6 +55,12 @@ pub enum Tunable<T> {
     Script(CompiledScript),
 }
 
+impl<T: Default> Default for Tunable<T> {
+    fn default() -> Self {
+        Self::Static(T::default())
+    }
+}
+
 impl<T> Tunable<T> {
     pub fn from_static(value: T) -> Self {
         Self::Static(value)
