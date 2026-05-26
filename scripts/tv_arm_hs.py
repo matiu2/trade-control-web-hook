@@ -456,13 +456,16 @@ def build_alert_spec(
         }
 
     if base == "05-enter":
-        # candle-signals v2 has 8 plot()s (plot_0..plot_7 — the
-        # signal_* latches) followed by 2 alertcondition()s in
-        # source order:
-        #   plot_8 = "Long Pattern"  (line 495)
-        #   plot_9 = "Short Pattern" (line 496)
+        # candle-signals v2 (2026-05-26+) has 10 plot()s
+        # (plot_0..plot_9 — the 8 signal_* latches plus recent_high /
+        # recent_low for SL anchoring) followed by 2 alertcondition()s
+        # in source order:
+        #   plot_10 = "Long Pattern"  (alertcondition line)
+        #   plot_11 = "Short Pattern"
         # TV indexes plot+alertcondition into a single namespace.
-        plot_id = "plot_9" if direction == "short" else "plot_8"
+        # If the chart still has the OLD v2 (8 plots), this will fire
+        # the wrong alert ID — re-add the indicator after a Pine update.
+        plot_id = "plot_11" if direction == "short" else "plot_10"
         return {
             "kind": "pine_alertcondition",
             "indicator_name": "Candle Signals",
