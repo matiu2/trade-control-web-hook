@@ -37,6 +37,12 @@ indicator("Candle Signals", shorttitle="Candle Signals", overlay=true, max_label
 // 4. A bullish pending signal becomes valid when price pushes above its high within `confirm_bars`.
 // 5. A bearish pending signal becomes valid when price pushes below its low within `confirm_bars`.
 // 6. Any pending signal that neither validates nor invalidates within `confirm_bars` becomes invalid.
+// 7. An opposing-direction signal printing inside the `confirm_bars` window
+//    invalidates the original (this can flip a previously-VALID signal back
+//    to INVALID — confirmation only counts if no opposer printed in-window).
+//    Exception: if the original is golden and the opposer is NOT golden, the
+//    opposer is ignored and the original stands. All other combos
+//    (gold-vs-gold, non-gold-vs-gold, non-gold-vs-non-gold) invalidate.
 
 // ===== Inputs ================================================================
 show_symbols = input.bool(true, "Show Symbols")
@@ -253,6 +259,29 @@ show_this_candle = (is_golden_candle and show_golden_candles) or (not is_golden_
 bullish_signal = show_this_candle and (bullish_double_tweezer or bullish_tweezer or (bullish_pinbar and not bullish_tweezer and not bullish_double_tweezer) or bullish_regular or bullish_floating)
 bearish_signal = show_this_candle and (bearish_double_tweezer or bearish_tweezer or (bearish_pinbar and not bearish_tweezer and not bearish_double_tweezer) or bearish_regular or bearish_floating)
 
+// ===== Per-direction signal geometry (precomputed for both the update loops
+// and the capture blocks below). Computed unconditionally so they're in scope
+// for the opposing-signal invalidation check during update. Values are only
+// meaningful when the corresponding *_signal flag is true.
+float bull_sig_high = bullish_double_tweezer ? math.max(high, nz(high[1], high), nz(high[2], high)) : bullish_tweezer ? math.max(high, nz(high[1], high)) : high
+float bull_sig_low  = bullish_double_tweezer ? math.min(low, nz(low[1], low), nz(low[2], low)) : bullish_tweezer ? math.min(low, nz(low[1], low)) : low
+float bull_sig_size = bullish_double_tweezer ? (candle_range + prev_candle_range + nz(prev2_candle_range, 0)) : bullish_tweezer ? (candle_range + prev_candle_range) : bullish_floating ? (bull_sig_high - bull_sig_low) : candle_range
+bool  bull_sig_golden = bull_sig_size >= atr_value
+
+float bear_sig_high = bearish_double_tweezer ? math.max(high, nz(high[1], high), nz(high[2], high)) : bearish_tweezer ? math.max(high, nz(high[1], high)) : high
+float bear_sig_low  = bearish_double_tweezer ? math.min(low, nz(low[1], low), nz(low[2], low)) : bearish_tweezer ? math.min(low, nz(low[1], low)) : low
+float bear_sig_size = bearish_double_tweezer ? (candle_range + prev_candle_range + nz(prev2_candle_range, 0)) : bearish_tweezer ? (candle_range + prev_candle_range) : bearish_floating ? (bear_sig_high - bear_sig_low) : candle_range
+bool  bear_sig_golden = bear_sig_size >= atr_value
+
+// Opposing-signal invalidation: a pending-or-recently-valid signal inside
+// its confirm window is invalidated if an opposite-direction signal prints
+// on the current bar, UNLESS the pending signal is golden and the opposer
+// is not. This can flip a previously STATE_VALID signal back to
+// STATE_INVALID — the rule amends the *confirmation definition* itself
+// (a confirmation only counts if no opposer printed within the window).
+// Per-signal application happens inside the update loops below, since the
+// rule depends on each tracked signal's own `is_golden`.
+
 // ===== Signal Persistence & State Tracking ===================================
 var float[] bullish_highs = array.new_float()
 var float[] bullish_lows = array.new_float()
@@ -315,6 +344,14 @@ while bullish_index >= 0
     if low < sig_low
         new_state := STATE_INVALID
 
+    // Opposing-signal invalidation inside the confirm window. Gold-protect
+    // clause: skip invalidation only when the pending signal is golden and
+    // the opposer is not. Applies to PENDING or recently-VALID signals; a
+    // valid signal can flip back to invalid if an opposer prints in-window.
+    if bars_elapsed <= confirm_bars and bearish_signal and new_state != STATE_INVALID
+        if not (is_golden and not bear_sig_golden)
+            new_state := STATE_INVALID
+
     if new_state != state
         array.set(bullish_states, idx, new_state)
         if new_state == STATE_VALID
@@ -327,6 +364,11 @@ while bullish_index >= 0
                 signal_confirmed_v := 1.0
         else if state != STATE_INVALID and new_state == STATE_INVALID
             bullish_just_invalid := true
+            // Clear latched confirmation if the invalidated signal is the
+            // currently-latched one — an in-window opposer retroactively
+            // un-confirms it.
+            if signal_high_v == sig_high and signal_low_v == sig_low
+                signal_confirmed_v := 0.0
 
     f_apply_label_style(sig_label, true, new_state, is_golden)
     bullish_index -= 1
@@ -354,6 +396,12 @@ while bearish_index >= 0
     if high > sig_high
         new_state := STATE_INVALID
 
+    // Opposing-signal invalidation inside the confirm window. See bullish
+    // branch for rationale.
+    if bars_elapsed <= confirm_bars and bullish_signal and new_state != STATE_INVALID
+        if not (is_golden and not bull_sig_golden)
+            new_state := STATE_INVALID
+
     if new_state != state
         array.set(bearish_states, idx, new_state)
         if new_state == STATE_VALID
@@ -364,6 +412,8 @@ while bearish_index >= 0
                 signal_confirmed_v := 1.0
         else if state != STATE_INVALID and new_state == STATE_INVALID
             bearish_just_invalid := true
+            if signal_high_v == sig_high and signal_low_v == sig_low
+                signal_confirmed_v := 0.0
 
     f_apply_label_style(sig_label, false, new_state, is_golden)
     bearish_index -= 1
@@ -377,83 +427,47 @@ while bearish_index >= 0
 // Signal kind classifier — must mirror the priority in `bullish_signal` /
 // `bearish_signal` above. Encoded as float per the KIND_* constants.
 f_bullish_kind() =>
-    bullish_double_tweezer       ? KIND_DOUBLE_TWEEZER
-      : bullish_tweezer          ? KIND_TWEEZER
-      : bullish_floating         ? KIND_FLOATING_ENGULFER
-      : bullish_regular          ? KIND_REGULAR_ENGULFER
-      : bullish_pinbar           ? KIND_PINBAR
-      : na
+    bullish_double_tweezer ? KIND_DOUBLE_TWEEZER : bullish_tweezer ? KIND_TWEEZER : bullish_floating ? KIND_FLOATING_ENGULFER : bullish_regular ? KIND_REGULAR_ENGULFER : bullish_pinbar ? KIND_PINBAR : na
 
 f_bearish_kind() =>
-    bearish_double_tweezer       ? KIND_DOUBLE_TWEEZER
-      : bearish_tweezer          ? KIND_TWEEZER
-      : bearish_floating         ? KIND_FLOATING_ENGULFER
-      : bearish_regular          ? KIND_REGULAR_ENGULFER
-      : bearish_pinbar           ? KIND_PINBAR
-      : na
+    bearish_double_tweezer ? KIND_DOUBLE_TWEEZER : bearish_tweezer ? KIND_TWEEZER : bearish_floating ? KIND_FLOATING_ENGULFER : bearish_regular ? KIND_REGULAR_ENGULFER : bearish_pinbar ? KIND_PINBAR : na
 
 if bullish_signal
-    float sig_high = bullish_double_tweezer ? math.max(high, nz(high[1], high), nz(high[2], high))
-                   : bullish_tweezer        ? math.max(high, nz(high[1], high))
-                   : high
-    float sig_low  = bullish_double_tweezer ? math.min(low, nz(low[1], low), nz(low[2], low))
-                   : bullish_tweezer        ? math.min(low, nz(low[1], low))
-                   : low
-    float signal_size = bullish_double_tweezer ? (candle_range + prev_candle_range + nz(prev2_candle_range, 0))
-                      : bullish_tweezer        ? (candle_range + prev_candle_range)
-                      : bullish_floating       ? (sig_high - sig_low)
-                      : candle_range
-    int sig_start_time = bullish_double_tweezer ? nz(time[2], time)
-                       : (bullish_tweezer or bullish_regular or bullish_floating) ? nz(time[1], time)
-                       : time
-    bool is_golden = signal_size >= atr_value
-    array.push(bullish_highs, sig_high)
-    array.push(bullish_lows, sig_low)
+    int sig_start_time = bullish_double_tweezer ? nz(time[2], time) : (bullish_tweezer or bullish_regular or bullish_floating) ? nz(time[1], time) : time
+    array.push(bullish_highs, bull_sig_high)
+    array.push(bullish_lows, bull_sig_low)
     array.push(bullish_states, STATE_PENDING)
     array.push(bullish_bars, bar_index)
-    array.push(bullish_golden, is_golden)
-    label lbl = f_create_label(bar_index, sig_low, true, is_golden)
-    f_apply_label_style(lbl, true, STATE_PENDING, is_golden)
+    array.push(bullish_golden, bull_sig_golden)
+    label lbl = f_create_label(bar_index, bull_sig_low, true, bull_sig_golden)
+    f_apply_label_style(lbl, true, STATE_PENDING, bull_sig_golden)
     array.push(bullish_labels, lbl)
     // Latch for webhook embedding (overwrites whichever signal was last).
-    signal_high_v       := sig_high
-    signal_low_v        := sig_low
-    signal_range_v      := sig_high - sig_low
+    signal_high_v       := bull_sig_high
+    signal_low_v        := bull_sig_low
+    signal_range_v      := bull_sig_high - bull_sig_low
     signal_start_time_v := sig_start_time
     signal_kind_v       := f_bullish_kind()
-    signal_golden_v     := is_golden ? 1.0 : 0.0
+    signal_golden_v     := bull_sig_golden ? 1.0 : 0.0
     signal_atr_v        := atr_value
     signal_confirmed_v  := 0.0
 
 if bearish_signal
-    float sig_high = bearish_double_tweezer ? math.max(high, nz(high[1], high), nz(high[2], high))
-                   : bearish_tweezer        ? math.max(high, nz(high[1], high))
-                   : high
-    float sig_low  = bearish_double_tweezer ? math.min(low, nz(low[1], low), nz(low[2], low))
-                   : bearish_tweezer        ? math.min(low, nz(low[1], low))
-                   : low
-    float signal_size = bearish_double_tweezer ? (candle_range + prev_candle_range + nz(prev2_candle_range, 0))
-                      : bearish_tweezer        ? (candle_range + prev_candle_range)
-                      : bearish_floating       ? (sig_high - sig_low)
-                      : candle_range
-    int sig_start_time = bearish_double_tweezer ? nz(time[2], time)
-                       : (bearish_tweezer or bearish_regular or bearish_floating) ? nz(time[1], time)
-                       : time
-    bool is_golden = signal_size >= atr_value
-    array.push(bearish_highs, sig_high)
-    array.push(bearish_lows, sig_low)
+    int sig_start_time = bearish_double_tweezer ? nz(time[2], time) : (bearish_tweezer or bearish_regular or bearish_floating) ? nz(time[1], time) : time
+    array.push(bearish_highs, bear_sig_high)
+    array.push(bearish_lows, bear_sig_low)
     array.push(bearish_states, STATE_PENDING)
     array.push(bearish_bars, bar_index)
-    array.push(bearish_golden, is_golden)
-    label lbl = f_create_label(bar_index, sig_high, false, is_golden)
-    f_apply_label_style(lbl, false, STATE_PENDING, is_golden)
+    array.push(bearish_golden, bear_sig_golden)
+    label lbl = f_create_label(bar_index, bear_sig_high, false, bear_sig_golden)
+    f_apply_label_style(lbl, false, STATE_PENDING, bear_sig_golden)
     array.push(bearish_labels, lbl)
-    signal_high_v       := sig_high
-    signal_low_v        := sig_low
-    signal_range_v      := sig_high - sig_low
+    signal_high_v       := bear_sig_high
+    signal_low_v        := bear_sig_low
+    signal_range_v      := bear_sig_high - bear_sig_low
     signal_start_time_v := sig_start_time
     signal_kind_v       := f_bearish_kind()
-    signal_golden_v     := is_golden ? 1.0 : 0.0
+    signal_golden_v     := bear_sig_golden ? 1.0 : 0.0
     signal_atr_v        := atr_value
     signal_confirmed_v  := 0.0
 
