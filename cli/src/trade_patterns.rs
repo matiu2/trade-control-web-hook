@@ -33,6 +33,7 @@ use trade_control_core::sig::KEY_LEN;
 
 use crate::control::wrap_signed_template;
 use crate::expiry;
+use crate::instruments::validate_instrument;
 
 /// Default lifetime of the entry window expressed as a percentage of the
 /// span between *now* and `trade_expiry`. 80% means: if the trade is
@@ -362,7 +363,7 @@ pub fn build_trade_interactive(pattern: TradePattern, now: DateTime<Utc>) -> Res
 /// Build a trade from a pre-filled [`TradeSpec`] with no prompts. Used by
 /// the `--from-file` flag on `build-trade`. Validates the spec against
 /// the same rules the prompts would enforce, then assembles the alerts.
-pub fn build_trade_from_spec(spec: TradeSpec, now: DateTime<Utc>) -> Result<BuiltTrade> {
+pub fn build_trade_from_spec(mut spec: TradeSpec, now: DateTime<Utc>) -> Result<BuiltTrade> {
     match spec.pattern {
         TradePattern::Hs | TradePattern::Ihs => {}
         TradePattern::M | TradePattern::W => {
@@ -374,6 +375,17 @@ pub fn build_trade_from_spec(spec: TradeSpec, now: DateTime<Utc>) -> Result<Buil
     }
     if spec.instrument.trim().is_empty() {
         return Err(eyre!("instrument is required"));
+    }
+    if let Some(canonical) = validate_instrument(spec.broker, &spec.instrument)? {
+        // The cache redirected (e.g. "XAG/USD" → "Spot Silver"). Swap the
+        // spec to the canonical name so every downstream alert, manifest,
+        // and persisted trade.yaml uses the spelling TN's API accepts.
+        tracing::warn!(
+            input = %spec.instrument,
+            canonical = %canonical,
+            "instrument resolved to canonical broker name",
+        );
+        spec.instrument = canonical;
     }
     if spec.account.trim().is_empty() {
         return Err(eyre!("account is required"));

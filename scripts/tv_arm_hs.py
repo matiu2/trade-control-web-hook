@@ -219,6 +219,59 @@ def instrument_for(broker: str, raw_sym: str) -> str:
     return raw_sym.replace("/", "_")
 
 
+def resolve_tn_instrument(name: str) -> Optional[str]:
+    """Map a guess to a TradeNation catalog name via `trade-control`.
+
+    TradeNation's display names don't match TradingView's: the chart shows
+    "XAGUSD" but the broker only knows "Spot Silver". This shells out to
+    `trade-control instruments resolve --json` (which wraps the
+    tradenation-instrument-cache library — fast after the first call).
+
+    Returns the canonical name on hit, or None on miss (printing the
+    "did you mean…" candidate list from the cache to stderr).
+    """
+    try:
+        binary = find_trade_control()
+    except FileNotFoundError as e:
+        print(f"ERROR: cannot validate TradeNation instrument: {e}", file=sys.stderr)
+        return None
+    result = subprocess.run(
+        [binary, "instruments", "resolve", name,
+         "--broker", "tradenation", "--json"],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    # exit 0 = match, exit 2 = miss; anything else = infra error.
+    if result.returncode not in (0, 2):
+        print(
+            "ERROR: `trade-control instruments resolve` failed "
+            f"(exit {result.returncode}): {result.stderr.strip()}",
+            file=sys.stderr,
+        )
+        return None
+    try:
+        payload = json.loads(result.stdout)
+    except json.JSONDecodeError as e:
+        print(
+            f"ERROR: `trade-control instruments resolve` returned non-JSON "
+            f"({e}): {result.stdout[:200]}",
+            file=sys.stderr,
+        )
+        return None
+    if payload.get("ok"):
+        return payload["name"]
+    cands = payload.get("candidates") or []
+    print(f"ERROR: TradeNation has no instrument named {name!r}.", file=sys.stderr)
+    if cands:
+        print("  did you mean:", file=sys.stderr)
+        for c in cands:
+            print(f"    - {c['name']}", file=sys.stderr)
+    else:
+        print("  no close candidates.", file=sys.stderr)
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Geometry helpers
 
@@ -824,6 +877,13 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
              "Composes with --entry-filter-script (both must pass).",
     )
     p.add_argument(
+        "--no-instrument-check", dest="no_instrument_check", action="store_true",
+        help="Skip the TradeNation catalog lookup that maps the chart "
+             "symbol (e.g. XAGUSD) to the broker's canonical name "
+             "(e.g. 'Spot Silver'). Use as an escape hatch when the "
+             "cache or broker login is unavailable.",
+    )
+    p.add_argument(
         "--print-completions", action="store_true",
         help="Print a zsh completion script to stdout and exit. "
              "Install with: tv_arm_hs.py --print-completions > "
@@ -858,6 +918,7 @@ _tv_arm_hs() {
         '--skip-break-and-close[drop the break-and-close prep]'
         '--skip-retest[drop the retest prep]'
         '--require-golden[require golden candle on entry (needs_golden:true)]'
+        '--no-instrument-check[skip the TN catalog lookup for the chart symbol]'
         '--print-completions[print this zsh completion script and exit]'
         '(- *)'{-h,--help}'[show help and exit]'
     )
@@ -887,6 +948,17 @@ def main(argv: Optional[list[str]] = None) -> int:
         print(f"ERROR: unsupported broker {broker!r}", file=sys.stderr)
         return 1
     instrument = instrument_for(broker, raw_sym)
+    if broker == "tradenation" and not args.no_instrument_check:
+        canonical = resolve_tn_instrument(instrument)
+        if canonical is None:
+            return 1
+        if canonical != instrument:
+            print(
+                f"# instrument {instrument!r} resolved to canonical "
+                f"TN name {canonical!r}",
+                file=sys.stderr,
+            )
+            instrument = canonical
 
     print(f"# Chart: {state['symbol']} {state['resolution']}")
     print(f"# Broker: {broker}  Instrument: {instrument}")

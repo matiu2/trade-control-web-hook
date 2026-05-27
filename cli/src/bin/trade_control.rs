@@ -25,10 +25,10 @@ use trade_control_cli::{
     KEY_LEN, TradePattern, add_account, build_clear_prep_intent, build_clear_veto_intent,
     build_prep_intent, build_status_intent, build_trade_from_spec, build_trade_interactive,
     build_unlock_intent, build_veto_intent, delete_account, delete_secret, fill_missing_fields,
-    generate_key_hex, list_accounts, load_spec_from_file, pick_pattern_interactive,
+    generate_key_hex, list_accounts, load_cache, load_spec_from_file, pick_pattern_interactive,
     pick_template_interactive, prompt_save_as_template, put_secret, record_account_use,
-    record_prep_use, record_veto_use, secret_binding_for, test_account, wrap_signed,
-    wrap_signed_template, write_trade,
+    record_prep_use, record_veto_use, secret_binding_for, test_account, validate_instrument,
+    wrap_signed, wrap_signed_template, write_trade,
 };
 use trade_control_core::account::{
     AccountKind, AccountMetadata, Credentials, TradeNationCreds, TradeNationKind,
@@ -86,11 +86,45 @@ enum Cmd {
     /// Each YAML is a complete TradingView-ready alert body — drop them
     /// into the matching TradingView alerts on the chart.
     BuildTrade(BuildTradeArgs),
+    /// Look up / manage broker instrument catalogs. Today only
+    /// `--broker tradenation` is implemented; OANDA names round-trip
+    /// cleanly through string mapping and don't need a catalog.
+    #[command(subcommand)]
+    Instruments(InstrumentsCmd),
     /// Print a shell completion script to stdout. Install with e.g.
     /// `trade-control completions zsh > ~/.zfunc/_trade-control`.
     Completions {
         /// Target shell.
         shell: Shell,
+    },
+}
+
+#[derive(Subcommand)]
+enum InstrumentsCmd {
+    /// Force-refresh the on-disk catalog (re-walks the broker's market
+    /// tree, ~1200 entries for TradeNation, takes a few seconds).
+    Refresh {
+        #[arg(long, value_enum, default_value_t = BrokerKindArg::TradeNation)]
+        broker: BrokerKindArg,
+    },
+    /// Resolve a user-supplied name. Exit 0 on hit (prints canonical
+    /// name + market_id), exit 2 on miss (prints candidate list to
+    /// stderr).
+    Resolve {
+        /// Name to resolve, e.g. "XAG/USD", "Spot Gold", "EURUSD".
+        name: String,
+        #[arg(long, value_enum, default_value_t = BrokerKindArg::TradeNation)]
+        broker: BrokerKindArg,
+        /// Emit machine-readable JSON instead of plain text. Used by
+        /// `tv_arm_hs.py` and other tooling.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Print every known instrument name (one per line). Drives the zsh
+    /// completion hook on the control subcommands' `instrument` positional.
+    List {
+        #[arg(long, value_enum, default_value_t = BrokerKindArg::TradeNation)]
+        broker: BrokerKindArg,
     },
 }
 
@@ -244,6 +278,11 @@ struct EndpointArgs {
 struct UnlockCmdArgs {
     /// Instrument to unlock, e.g. EUR_USD.
     instrument: String,
+    /// Broker the instrument belongs to. Defaults to OANDA to preserve
+    /// existing scripts; pass `--broker tradenation` to validate the
+    /// name against the TN catalog before sending.
+    #[arg(long, value_enum, default_value_t = BrokerKindArg::Oanda)]
+    broker: BrokerKindArg,
     #[command(flatten)]
     common: EndpointArgs,
 }
@@ -264,6 +303,9 @@ struct PrepCmdArgs {
     /// gate can't be satisfied by the pre-existing retest.
     #[arg(long, value_delimiter = ',', num_args = 0..)]
     clears: Vec<String>,
+    /// Broker the instrument belongs to (see `unlock --broker`).
+    #[arg(long, value_enum, default_value_t = BrokerKindArg::Oanda)]
+    broker: BrokerKindArg,
     #[command(flatten)]
     common: EndpointArgs,
 }
@@ -286,6 +328,9 @@ struct VetoCmdArgs {
     /// recorded. Mirror of `prep --clears` for veto symmetry.
     #[arg(long, value_delimiter = ',', num_args = 0..)]
     clears: Vec<String>,
+    /// Broker the instrument belongs to (see `unlock --broker`).
+    #[arg(long, value_enum, default_value_t = BrokerKindArg::Oanda)]
+    broker: BrokerKindArg,
     #[command(flatten)]
     common: EndpointArgs,
 }
@@ -315,6 +360,9 @@ struct ClearPrepCmdArgs {
     instrument: String,
     /// Named step to clear.
     step: String,
+    /// Broker the instrument belongs to (see `unlock --broker`).
+    #[arg(long, value_enum, default_value_t = BrokerKindArg::Oanda)]
+    broker: BrokerKindArg,
     #[command(flatten)]
     common: EndpointArgs,
 }
@@ -325,6 +373,9 @@ struct ClearVetoCmdArgs {
     instrument: String,
     /// Named veto to clear.
     name: String,
+    /// Broker the instrument belongs to (see `unlock --broker`).
+    #[arg(long, value_enum, default_value_t = BrokerKindArg::Oanda)]
+    broker: BrokerKindArg,
     #[command(flatten)]
     common: EndpointArgs,
 }
@@ -398,6 +449,7 @@ fn main() -> Result<()> {
         Cmd::Verify(args) => run_verify(args)?,
         Cmd::Account(sub) => run_account(sub)?,
         Cmd::BuildTrade(args) => run_build_trade(args)?,
+        Cmd::Instruments(sub) => run_instruments(sub)?,
         Cmd::Completions { shell } => run_completions(shell),
     }
     Ok(())
@@ -435,6 +487,162 @@ fn run_build_trade(args: BuildTradeArgs) -> Result<()> {
 fn run_completions(shell: Shell) {
     let mut cmd = Cli::command();
     generate(shell, &mut cmd, "trade-control", &mut io::stdout());
+    // For zsh, append a dynamic completer that fills the `instrument`
+    // positional on control subcommands with the live TradeNation catalog
+    // when --broker tradenation is in argv. Other shells get the static
+    // clap output; the catalog walk is too slow to be useful as a
+    // bash/fish completer that runs on every TAB.
+    if matches!(shell, Shell::Zsh) {
+        print!("{ZSH_TN_INSTRUMENTS_HOOK}");
+    }
+}
+
+/// Hand-rolled zsh helper appended after the clap-generated script. Defines
+/// `_trade_control_tn_instruments`, which fetches live TradeNation names
+/// when `--broker tradenation` is present in the current argv.
+///
+/// clap's generated zsh marks the `instrument` positional with an empty
+/// action (no completer), so this function isn't automatically hooked in.
+/// To wire it up, add to your zshrc *after* sourcing the trade-control
+/// completion file:
+///
+/// ```zsh
+/// # Use the helper for any trade-control subcommand whose first positional
+/// # is named "instrument". -e replaces the existing rule.
+/// for sub in unlock prep veto clear-prep clear-veto; do
+///     compdef -e "_arguments -S '(-h --help)'{-h,--help}'[show help]' \
+///         ':instrument:_trade_control_tn_instruments' '*::: :->args'" \
+///         "trade-control $sub"
+/// done
+/// ```
+///
+/// (We don't write this dispatch ourselves because clap regenerates the
+/// completion on every flag rename — keeping our hook independent means
+/// the user's override survives upstream changes.)
+const ZSH_TN_INSTRUMENTS_HOOK: &str = r#"
+# trade-control: TradeNation instrument-name completer for control
+# subcommands. See the run_completions doc comment in the source for
+# wiring instructions.
+_trade_control_tn_instruments() {
+    # Bail out unless `--broker tradenation` is in argv, so OANDA users
+    # aren't shown a TN-only list.
+    local has_tn=0 i
+    for ((i = 2; i <= ${#words}; i++)); do
+        if [[ ${words[i]} == "--broker=tradenation" ]]; then
+            has_tn=1
+            break
+        fi
+        if [[ ${words[i]} == "--broker" && ${words[i+1]} == "tradenation" ]]; then
+            has_tn=1
+            break
+        fi
+    done
+    (( has_tn )) || return 1
+
+    local -a names
+    names=("${(@f)$(trade-control instruments list --broker tradenation 2>/dev/null)}")
+    compadd -- "${names[@]}"
+}
+"#;
+
+fn run_instruments(sub: InstrumentsCmd) -> Result<()> {
+    match sub {
+        InstrumentsCmd::Refresh { broker } => match broker.into() {
+            BrokerKind::TradeNation => {
+                let cache = load_cache(true, None)?;
+                println!(
+                    "refreshed: {} markets at {}",
+                    cache.catalog().markets.len(),
+                    cache.path().display(),
+                );
+                Ok(())
+            }
+            BrokerKind::Oanda => Err(eyre!(
+                "OANDA catalog is not implemented yet; only --broker tradenation is supported",
+            )),
+        },
+        InstrumentsCmd::Resolve { name, broker, json } => match broker.into() {
+            BrokerKind::TradeNation => run_resolve_tradenation(&name, json),
+            BrokerKind::Oanda => Err(eyre!(
+                "OANDA catalog is not implemented yet; only --broker tradenation is supported",
+            )),
+        },
+        InstrumentsCmd::List { broker } => match broker.into() {
+            BrokerKind::TradeNation => {
+                let cache = load_cache(false, None)?;
+                for name in cache.names() {
+                    println!("{name}");
+                }
+                Ok(())
+            }
+            BrokerKind::Oanda => Err(eyre!(
+                "OANDA catalog is not implemented yet; only --broker tradenation is supported",
+            )),
+        },
+    }
+}
+
+/// Resolve `name` against the TN cache and print the result. `json = true`
+/// uses a machine-readable shape consumed by `tv_arm_hs.py`. Exit code 2 on
+/// miss (distinct from "broker / cache failed" → exit 1) so callers can
+/// distinguish a clean "not found" from an infra problem.
+fn run_resolve_tradenation(name: &str, json: bool) -> Result<()> {
+    use tradenation_instrument_cache::ResolveError;
+
+    let cache = load_cache(false, None)?;
+    match cache.resolve(name) {
+        Ok(market) => {
+            if json {
+                let payload = serde_json::json!({
+                    "ok": true,
+                    "name": market.name,
+                    "market_id": market.market_id,
+                    "symbol": market.symbol,
+                    "currency": market.currency,
+                });
+                println!("{payload}");
+            } else {
+                println!("name:      {}", market.name);
+                println!("market_id: {}", market.market_id);
+                if let Some(sym) = &market.symbol {
+                    println!("symbol:    {sym}");
+                }
+                println!("currency:  {}", market.currency);
+            }
+            Ok(())
+        }
+        Err(ResolveError::NotFound { query, candidates }) => {
+            if json {
+                let cands: Vec<_> = candidates
+                    .iter()
+                    .map(|c| {
+                        serde_json::json!({
+                            "name": c.name,
+                            "market_id": c.market_id,
+                            "symbol": c.symbol,
+                        })
+                    })
+                    .collect();
+                let payload = serde_json::json!({
+                    "ok": false,
+                    "query": query,
+                    "candidates": cands,
+                });
+                println!("{payload}");
+            } else {
+                eprintln!("no match for {query:?}");
+                if candidates.is_empty() {
+                    eprintln!("  no candidates");
+                } else {
+                    eprintln!("  did you mean:");
+                    for c in &candidates {
+                        eprintln!("    - {}", c.name);
+                    }
+                }
+            }
+            std::process::exit(2);
+        }
+    }
 }
 
 fn run_verify(args: VerifyArgs) -> Result<()> {
@@ -526,11 +734,32 @@ fn run_status(args: EndpointArgs) -> Result<()> {
     Ok(())
 }
 
+/// Validate `instrument` against `broker`'s catalog, returning the canonical
+/// name (or the input verbatim when the broker has no catalog / the name
+/// already matched exactly). On miss this returns the cache's
+/// "did you mean ..." error, which the caller propagates so the worker
+/// never sees an unknown instrument.
+fn canonicalize_instrument(broker: BrokerKindArg, instrument: &str) -> Result<String> {
+    let broker_kind: BrokerKind = broker.into();
+    match validate_instrument(broker_kind, instrument)? {
+        Some(canonical) => {
+            tracing::warn!(
+                input = %instrument,
+                canonical = %canonical,
+                "instrument resolved to canonical broker name",
+            );
+            Ok(canonical)
+        }
+        None => Ok(instrument.to_string()),
+    }
+}
+
 fn run_unlock(args: UnlockCmdArgs) -> Result<()> {
     let key = load_key(&args.common.key_file)?;
+    let instrument = canonicalize_instrument(args.broker, &args.instrument)?;
     let now = Utc::now();
     let suffix = fresh_suffix()?;
-    let intent = build_unlock_intent(&args.instrument, now, &suffix);
+    let intent = build_unlock_intent(&instrument, now, &suffix);
     let body = wrap_control(&intent, &key, now)?;
     let response = post_control(&args.common.endpoint, &body)?;
     print!("{response}");
@@ -539,10 +768,11 @@ fn run_unlock(args: UnlockCmdArgs) -> Result<()> {
 
 fn run_prep(args: PrepCmdArgs) -> Result<()> {
     let key = load_key(&args.common.key_file)?;
+    let instrument = canonicalize_instrument(args.broker, &args.instrument)?;
     let now = Utc::now();
     let suffix = fresh_suffix()?;
     let intent = build_prep_intent(
-        &args.instrument,
+        &instrument,
         &args.step,
         args.ttl_hours,
         args.clears.clone(),
@@ -563,6 +793,7 @@ fn run_prep(args: PrepCmdArgs) -> Result<()> {
 
 fn run_veto(args: VetoCmdArgs) -> Result<()> {
     let key = load_key(&args.common.key_file)?;
+    let instrument = canonicalize_instrument(args.broker, &args.instrument)?;
     let now = Utc::now();
     let suffix = fresh_suffix()?;
     // Default level is sent as `None` to keep the wire form minimal —
@@ -572,7 +803,7 @@ fn run_veto(args: VetoCmdArgs) -> Result<()> {
         other => Some(other.into()),
     };
     let intent = build_veto_intent(
-        &args.instrument,
+        &instrument,
         &args.name,
         args.ttl_hours,
         level,
@@ -592,9 +823,10 @@ fn run_veto(args: VetoCmdArgs) -> Result<()> {
 
 fn run_clear_prep(args: ClearPrepCmdArgs) -> Result<()> {
     let key = load_key(&args.common.key_file)?;
+    let instrument = canonicalize_instrument(args.broker, &args.instrument)?;
     let now = Utc::now();
     let suffix = fresh_suffix()?;
-    let intent = build_clear_prep_intent(&args.instrument, &args.step, now, &suffix);
+    let intent = build_clear_prep_intent(&instrument, &args.step, now, &suffix);
     let body = wrap_control(&intent, &key, now)?;
     let response = post_control(&args.common.endpoint, &body)?;
     print!("{response}");
@@ -603,9 +835,10 @@ fn run_clear_prep(args: ClearPrepCmdArgs) -> Result<()> {
 
 fn run_clear_veto(args: ClearVetoCmdArgs) -> Result<()> {
     let key = load_key(&args.common.key_file)?;
+    let instrument = canonicalize_instrument(args.broker, &args.instrument)?;
     let now = Utc::now();
     let suffix = fresh_suffix()?;
-    let intent = build_clear_veto_intent(&args.instrument, &args.name, now, &suffix);
+    let intent = build_clear_veto_intent(&instrument, &args.name, now, &suffix);
     let body = wrap_control(&intent, &key, now)?;
     let response = post_control(&args.common.endpoint, &body)?;
     print!("{response}");
