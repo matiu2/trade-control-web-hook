@@ -194,6 +194,40 @@ impl HasExpiry for PauseEntry {
     }
 }
 
+/// One active "news window" row. Keyed by `trade_id` + `news_id`, this
+/// records that a known volatility window (2-star+ scheduled news on
+/// a currency the parent trade is exposed to) is currently open.
+///
+/// Independent of [`PauseEntry`]: a news window does **not** by itself
+/// block new entries. It exists so that *another* alert — a
+/// golden-reversal candle on the opposite-direction side of the same
+/// Pine study — can flatten the open trade only inside the window,
+/// while the same reversal candle outside the window is ignored. The
+/// gate lives on `Close` intents that carry `require_news_window:
+/// true`; see `src/lib.rs` for the read.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NewsEntry {
+    pub trade_id: String,
+    pub news_id: String,
+    /// Free-form human label (e.g. `"USD-NFP-2026-06-06"`) surfaced on
+    /// the seen-index outcome string so operators can answer "why did
+    /// this trade flatten?" weeks later.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    pub set_at: DateTime<Utc>,
+    /// News windows don't auto-expire on a TTL — the matching
+    /// `news-end` alert is the authoritative clear. The safety TTL
+    /// (driven by the alert's `not_after` plus grace) just stops an
+    /// orphaned window pinning the trade forever.
+    pub expires_at: DateTime<Utc>,
+}
+
+impl HasExpiry for NewsEntry {
+    fn expires_at(&self) -> DateTime<Utc> {
+        self.expires_at
+    }
+}
+
 /// KV-key sentinel used in place of an account name when a veto is
 /// worker-global (no `account:` field on the intent). Picked because
 /// account names use kebab-case and never appear as a bare underscore,
@@ -221,6 +255,12 @@ pub struct Snapshot {
     /// back-compat with snapshots serialised before the field landed.
     #[serde(default)]
     pub pauses: Vec<PauseEntry>,
+    /// Active news windows across all trades. Same shape as
+    /// [`Self::pauses`] but a separate namespace — news windows
+    /// don't block entries; they gate reversal-candle closes. See
+    /// [`NewsEntry`].
+    #[serde(default)]
+    pub news_windows: Vec<NewsEntry>,
 }
 
 /// Async storage interface. Implementations are `?Send` because the CF Worker
@@ -386,6 +426,39 @@ pub trait StateStore {
         &self,
         trade_id: &str,
         blackout_id: &str,
+    ) -> impl Future<Output = Result<bool, StateError>>;
+
+    /// Open a news window for `(trade_id, news_id)`. While at least one
+    /// window for a trade is open, a `Close` intent with
+    /// `require_news_window: true` is allowed to flatten the position;
+    /// outside any window, the same intent is rejected. Re-firing
+    /// (same trade_id + news_id) overwrites the prior entry and
+    /// refreshes the TTL. `ttl_seconds` is a safety net — the matching
+    /// `news-end` is the authoritative clear.
+    fn set_news_window(
+        &self,
+        trade_id: &str,
+        news_id: &str,
+        reason: Option<&str>,
+        now: DateTime<Utc>,
+        ttl_seconds: u64,
+    ) -> impl Future<Output = Result<(), StateError>>;
+
+    /// Return all currently-open news windows for `trade_id`. The
+    /// reversal-close gate calls this and accepts the close iff the
+    /// list is non-empty.
+    fn list_news_windows_for_trade(
+        &self,
+        trade_id: &str,
+    ) -> impl Future<Output = Result<Vec<NewsEntry>, StateError>>;
+
+    /// Close a single `(trade_id, news_id)` window. Returns whether
+    /// it was open before. Sibling windows on the same trade are
+    /// untouched.
+    fn clear_news_window(
+        &self,
+        trade_id: &str,
+        news_id: &str,
     ) -> impl Future<Output = Result<bool, StateError>>;
 
     /// Return a snapshot of active cooldowns and recent seen ids.
@@ -850,6 +923,7 @@ mod memstore {
                 preps: Vec::new(),
                 vetos: Vec::new(),
                 pauses: Vec::new(),
+                news_windows: Vec::new(),
             })
         }
 
@@ -896,6 +970,56 @@ mod memstore {
 
         async fn clear_pause(&self, trade_id: &str, blackout_id: &str) -> Result<bool, StateError> {
             let key = format!("pause:{trade_id}:{blackout_id}");
+            Ok(self.delete(&key))
+        }
+
+        async fn set_news_window(
+            &self,
+            trade_id: &str,
+            news_id: &str,
+            reason: Option<&str>,
+            now: DateTime<Utc>,
+            ttl_seconds: u64,
+        ) -> Result<(), StateError> {
+            let key = format!("news:{trade_id}:{news_id}");
+            let entry = NewsEntry {
+                trade_id: trade_id.to_string(),
+                news_id: news_id.to_string(),
+                reason: reason.map(str::to_string),
+                set_at: now,
+                expires_at: now + chrono::Duration::seconds(ttl_seconds as i64),
+            };
+            let body = serde_json::to_string(&entry)
+                .map_err(|e| StateError::Backend(format!("encode news: {e}")))?;
+            self.put(key, body, ttl_seconds.max(MIN_TTL_SECONDS), now);
+            Ok(())
+        }
+
+        async fn list_news_windows_for_trade(
+            &self,
+            trade_id: &str,
+        ) -> Result<Vec<NewsEntry>, StateError> {
+            let prefix = format!("news:{trade_id}:");
+            let now = Utc::now();
+            let inner = self.inner.borrow();
+            let mut out = Vec::new();
+            for (key, (val, exp)) in inner.iter() {
+                if !key.starts_with(&prefix) || *exp <= now {
+                    continue;
+                }
+                let entry: NewsEntry = serde_json::from_str(val)
+                    .map_err(|e| StateError::Backend(format!("decode news: {e}")))?;
+                out.push(entry);
+            }
+            Ok(out)
+        }
+
+        async fn clear_news_window(
+            &self,
+            trade_id: &str,
+            news_id: &str,
+        ) -> Result<bool, StateError> {
+            let key = format!("news:{trade_id}:{news_id}");
             Ok(self.delete(&key))
         }
 
@@ -1565,6 +1689,13 @@ mod tests {
                 set_at: ts("2026-05-14T11:00:00Z"),
                 expires_at: ts("2026-05-15T11:00:00Z"),
             }],
+            news_windows: vec![NewsEntry {
+                trade_id: "eurusd-hs-1".into(),
+                news_id: "usd-nfp-2026-06-06".into(),
+                reason: Some("USD-NFP".into()),
+                set_at: ts("2026-05-14T11:30:00Z"),
+                expires_at: ts("2026-05-14T12:30:00Z"),
+            }],
         };
         let yaml = serde_yaml::to_string(&snap).unwrap();
         assert!(yaml.contains("preps:"));
@@ -1573,18 +1704,22 @@ mod tests {
         assert!(yaml.contains("name: news-window"));
         assert!(yaml.contains("pauses:"));
         assert!(yaml.contains("blackout_id: nfp-2026-06-06"));
+        assert!(yaml.contains("news_windows:"));
+        assert!(yaml.contains("news_id: usd-nfp-2026-06-06"));
     }
 
     #[test]
     fn snapshot_deserialises_without_new_sections_for_back_compat() {
         // Pre-existing serialised snapshots (e.g. in unit tests, or any
-        // stored copies) have no `preps:` / `vetos:` / `pauses:` fields.
-        // Make sure they still parse — the new fields default to empty.
+        // stored copies) have no `preps:` / `vetos:` / `pauses:` /
+        // `news_windows:` fields. Make sure they still parse — the new
+        // fields default to empty.
         let yaml = "now: \"2026-05-14T12:00:00Z\"\ncooldowns: []\nrecent_seen: []\n";
         let snap: Snapshot = serde_yaml::from_str(yaml).unwrap();
         assert!(snap.preps.is_empty());
         assert!(snap.vetos.is_empty());
         assert!(snap.pauses.is_empty());
+        assert!(snap.news_windows.is_empty());
     }
 
     #[test]
@@ -1915,6 +2050,57 @@ mod tests {
         let b = pollster::block_on(store.list_pauses_for_trade("trade-b")).unwrap();
         assert_eq!(a.len(), 1);
         assert!(b.is_empty());
+    }
+
+    #[test]
+    fn memstore_news_round_trip_lists_then_clears() {
+        use super::memstore::MemStateStore;
+        let store = MemStateStore::new();
+        let now = Utc::now();
+        pollster::block_on(store.set_news_window(
+            "eurusd-hs-1",
+            "usd-nfp-2026-06-06",
+            Some("USD-NFP"),
+            now,
+            3600,
+        ))
+        .unwrap();
+        let listed = pollster::block_on(store.list_news_windows_for_trade("eurusd-hs-1")).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].news_id, "usd-nfp-2026-06-06");
+        assert_eq!(listed[0].reason.as_deref(), Some("USD-NFP"));
+        let was = pollster::block_on(store.clear_news_window("eurusd-hs-1", "usd-nfp-2026-06-06"))
+            .unwrap();
+        assert!(was);
+        let listed = pollster::block_on(store.list_news_windows_for_trade("eurusd-hs-1")).unwrap();
+        assert!(listed.is_empty());
+        // Clearing an absent window is a no-op.
+        let was = pollster::block_on(store.clear_news_window("eurusd-hs-1", "usd-nfp-2026-06-06"))
+            .unwrap();
+        assert!(!was);
+    }
+
+    #[test]
+    fn memstore_news_isolated_from_pauses() {
+        // News windows live in their own namespace — setting a pause
+        // must not show up in the news listing and vice versa. The
+        // KV keys (`pause:` vs `news:`) keep them separate.
+        use super::memstore::MemStateStore;
+        let store = MemStateStore::new();
+        let now = Utc::now();
+        pollster::block_on(store.set_pause("trade-a", "nfp", None, now, 3600)).unwrap();
+        pollster::block_on(store.set_news_window("trade-a", "nfp", None, now, 3600)).unwrap();
+        // Both visible only via their own listing.
+        let pauses = pollster::block_on(store.list_pauses_for_trade("trade-a")).unwrap();
+        let news = pollster::block_on(store.list_news_windows_for_trade("trade-a")).unwrap();
+        assert_eq!(pauses.len(), 1);
+        assert_eq!(news.len(), 1);
+        // Clearing the news window must not touch the pause.
+        pollster::block_on(store.clear_news_window("trade-a", "nfp")).unwrap();
+        let pauses = pollster::block_on(store.list_pauses_for_trade("trade-a")).unwrap();
+        let news = pollster::block_on(store.list_news_windows_for_trade("trade-a")).unwrap();
+        assert_eq!(pauses.len(), 1);
+        assert!(news.is_empty());
     }
 
     #[test]

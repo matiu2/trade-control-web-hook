@@ -314,6 +314,17 @@ pub struct TradeSpec {
     /// to pre-feature spec yaml.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub needs_golden: bool,
+    /// When true, emit a 6th alert (`06-close-on-reversal`) that
+    /// closes the trade if a golden-reversal candle prints in the
+    /// *opposite* direction inside an active news window. The
+    /// emitted intent carries `require_news_window: true` so the
+    /// worker rejects it outside any window. `tv_arm_hs.py` wires
+    /// this YAML to the same `Candle Signals` Pine study used for
+    /// entry, but to the opposite-direction `alertcondition` plot.
+    /// Default `false` = no extra alert, byte-identical to
+    /// pre-feature spec yaml.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub close_on_news: bool,
 }
 
 fn is_zero_u32(n: &u32) -> bool {
@@ -463,12 +474,15 @@ const KNOWN_PREP_NAMES: &[&str] = &["break-and-close", "retest"];
 pub fn write_trade(trade: &BuiltTrade, key: &[u8; KEY_LEN], out_dir: &Path) -> Result<PathBuf> {
     fs::create_dir_all(out_dir).with_context(|| format!("creating {}", out_dir.display()))?;
     for alert in &trade.alerts {
-        // Only the enter alert binds to a Pine study (`Candle Signals`'s
-        // `Long/Short Pattern` alertcondition), so it can resolve the
+        // Only Pine-bound alerts (the entry, and the optional
+        // close-on-reversal which fires from the *opposite* direction
+        // of the same `Candle Signals` study) can resolve
         // `{{plot("…")}}` placeholders. Vetos and preps fire from
-        // drawings — TV delivers any `{{plot(…)}}` literally, which
-        // crashes the worker's YAML parser. Strip those for drawings.
-        let is_pine_bound = alert.basename == "05-enter";
+        // chart drawings — TV delivers any `{{plot(…)}}` literally
+        // there, which crashes the worker's YAML parser. Strip those
+        // for drawings.
+        let is_pine_bound =
+            alert.basename == "05-enter" || alert.basename == "06-close-on-reversal";
         let body = if is_pine_bound {
             wrap_signed_template(&alert.intent, key)
         } else {
@@ -585,6 +599,7 @@ fn build_pattern(
         dry_run: false,
         max_retries: 0,
         needs_golden: false,
+        close_on_news: false,
         skip_preps: Vec::new(),
         entry_offset_pips: Some(entry_offset_pips),
         sl_offset_pips: Some(sl_offset_pips),
@@ -672,6 +687,15 @@ fn assemble_trade(
         &spec.broker,
         &spec.account,
     ));
+    if spec.close_on_news {
+        alerts.push(build_close_on_reversal_alert(
+            &spec.instrument,
+            &trade_id,
+            spec.trade_expiry,
+            &spec.broker,
+            &spec.account,
+        ));
+    }
 
     // Sign-time script validation. Catches typos / wrong-return-type /
     // unknown-variable refs in any `Tunable::Script` field (today just
@@ -829,6 +853,8 @@ fn skeleton(
         allow_entry: None,
         needs_golden: false,
         blackout_id: None,
+        news_id: None,
+        require_news_window: None,
         reason: None,
     }
 }
@@ -1036,6 +1062,42 @@ fn build_enter_alert(
     }
 }
 
+/// Build the optional 6th alert: an opposing-direction
+/// golden-reversal close that the worker only honours while at least
+/// one `news:<trade_id>:*` KV entry is open. The Python side wires
+/// this YAML to the same `Candle Signals` Pine study as `05-enter`
+/// but to the *opposite* direction's `alertcondition` plot — so when
+/// a confirming golden reversal candle prints against the open
+/// trade *during news*, the worker flattens it; the same candle
+/// outside news is rejected at the gate.
+fn build_close_on_reversal_alert(
+    instrument: &str,
+    trade_id: &str,
+    trade_expiry: DateTime<Utc>,
+    broker: &BrokerKind,
+    account: &str,
+) -> BuiltAlert {
+    let id = format!("{trade_id}-close-on-reversal");
+    let mut intent = skeleton(
+        Action::Close,
+        instrument,
+        id,
+        trade_expiry,
+        *broker,
+        account,
+        trade_id,
+    );
+    intent.require_news_window = Some(true);
+    intent.reason = Some("news-window reversal".into());
+    BuiltAlert {
+        basename: "06-close-on-reversal".into(),
+        purpose:
+            "close: opposing golden reversal candle, gated on an active news window for this trade"
+                .into(),
+        intent,
+    }
+}
+
 /// Hours between `now` and `until`, rounded up to the next hour and
 /// clamped to at least 1. The worker veto TTL also adds the alert's
 /// `not_after - now` tail, so this is just the bare TTL component;
@@ -1184,6 +1246,7 @@ mod tests {
                 dry_run: false,
                 max_retries: 0,
                 needs_golden: false,
+                close_on_news: false,
                 skip_preps: Vec::new(),
                 entry_offset_pips: Some(1.0),
                 sl_offset_pips: Some(1.0),
@@ -1351,6 +1414,7 @@ mod tests {
             dry_run: false,
             max_retries: 0,
             needs_golden: false,
+            close_on_news: false,
             skip_preps: Vec::new(),
             entry_offset_pips: None,
             sl_offset_pips: None,
@@ -1373,6 +1437,22 @@ mod tests {
         // The spec is round-tripped onto the BuiltTrade so write_trade
         // can persist it next to the alerts.
         assert_eq!(trade.spec.pattern, TradePattern::Hs);
+    }
+
+    #[test]
+    fn build_trade_from_spec_emits_six_alerts_when_close_on_news() {
+        let now = ts("2026-05-20T00:00:00Z");
+        let mut spec = sample_spec(TradePattern::Hs, ts("2026-05-25T00:00:00Z"));
+        spec.close_on_news = true;
+        let trade = build_trade_from_spec(spec, now).unwrap();
+        assert_eq!(trade.alerts.len(), 6);
+        assert_eq!(trade.alerts[5].basename, "06-close-on-reversal");
+        let close = &trade.alerts[5].intent;
+        assert_eq!(close.action, Action::Close);
+        assert_eq!(close.require_news_window, Some(true));
+        assert!(close.trade_id.is_some());
+        // Sanity: validate() accepts it.
+        close.validate().expect("close-on-reversal intent valid");
     }
 
     #[test]

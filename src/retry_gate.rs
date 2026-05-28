@@ -574,6 +574,7 @@ mod tests {
                 preps: Vec::new(),
                 vetos: Vec::new(),
                 pauses: Vec::new(),
+                news_windows: Vec::new(),
             })
         }
         async fn set_pause(
@@ -598,6 +599,29 @@ mod tests {
             &self,
             _trade_id: &str,
             _blackout_id: &str,
+        ) -> Result<bool, StateError> {
+            Ok(false)
+        }
+        async fn set_news_window(
+            &self,
+            _trade_id: &str,
+            _news_id: &str,
+            _reason: Option<&str>,
+            _now: DateTime<Utc>,
+            _ttl_seconds: u64,
+        ) -> Result<(), StateError> {
+            Ok(())
+        }
+        async fn list_news_windows_for_trade(
+            &self,
+            _trade_id: &str,
+        ) -> Result<Vec<trade_control_core::state::NewsEntry>, StateError> {
+            Ok(Vec::new())
+        }
+        async fn clear_news_window(
+            &self,
+            _trade_id: &str,
+            _news_id: &str,
         ) -> Result<bool, StateError> {
             Ok(false)
         }
@@ -731,6 +755,8 @@ mod tests {
             allow_entry: None,
             needs_golden: false,
             blackout_id: None,
+            news_id: None,
+            require_news_window: None,
             reason: None,
         }
     }

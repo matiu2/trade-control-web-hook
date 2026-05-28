@@ -11,7 +11,7 @@
 use chrono::{DateTime, Utc};
 use trade_control_core::intent::Action;
 use trade_control_core::state::{
-    CooldownEntry, EntryAttempt, MIN_TTL_SECONDS, PREP_INDEX_CAP, PauseEntry, PrepEntry,
+    CooldownEntry, EntryAttempt, MIN_TTL_SECONDS, NewsEntry, PREP_INDEX_CAP, PauseEntry, PrepEntry,
     SEEN_INDEX_CAP, SeenEntry, Snapshot, StateError, StateStore, VETO_INDEX_CAP, VetoEntry,
     account_scope, prune_expired,
 };
@@ -85,6 +85,22 @@ impl KvStateStore {
     /// next segment is the trade_id.
     fn pause_all_prefix() -> &'static str {
         "pause:"
+    }
+
+    fn news_key(trade_id: &str, news_id: &str) -> String {
+        format!("news:{trade_id}:{news_id}")
+    }
+
+    /// Prefix used to list every news window for a single `trade_id`.
+    /// Trailing colon for the same reason as [`Self::pause_trade_prefix`].
+    fn news_trade_prefix(trade_id: &str) -> String {
+        format!("news:{trade_id}:")
+    }
+
+    /// Global prefix used by `snapshot()` to enumerate every active
+    /// news window across every trade.
+    fn news_all_prefix() -> &'static str {
+        "news:"
     }
 
     async fn read_cooldown_index(&self) -> Result<Vec<CooldownEntry>, StateError> {
@@ -558,6 +574,13 @@ impl StateStore for KvStateStore {
             list_pauses_with_prefix(&self.store, Self::pause_all_prefix()).await?,
             now,
         );
+        // News windows live in a separate KV namespace from pauses (see
+        // NewsEntry); the snapshot scans them with their own prefix so
+        // the operator can see why a reversal-close might fire.
+        let news_windows = prune_expired(
+            list_news_with_prefix(&self.store, Self::news_all_prefix()).await?,
+            now,
+        );
         Ok(Snapshot {
             now,
             cooldowns,
@@ -565,6 +588,7 @@ impl StateStore for KvStateStore {
             preps,
             vetos,
             pauses,
+            news_windows,
         })
     }
 
@@ -828,6 +852,60 @@ impl StateStore for KvStateStore {
         }
         Ok(was)
     }
+
+    async fn set_news_window(
+        &self,
+        trade_id: &str,
+        news_id: &str,
+        reason: Option<&str>,
+        now: DateTime<Utc>,
+        ttl_seconds: u64,
+    ) -> Result<(), StateError> {
+        let key = Self::news_key(trade_id, news_id);
+        let ttl = ttl_seconds.max(MIN_TTL_SECONDS);
+        let entry = NewsEntry {
+            trade_id: trade_id.to_string(),
+            news_id: news_id.to_string(),
+            reason: reason.map(str::to_string),
+            set_at: now,
+            expires_at: now + chrono::Duration::seconds(ttl as i64),
+        };
+        let body = serde_json::to_string(&entry)
+            .map_err(|e| StateError::Backend(format!("encode news: {e}")))?;
+        self.store
+            .put(&key, body)
+            .map_err(|e| StateError::Backend(format!("put news builder: {e:?}")))?
+            .expiration_ttl(ttl)
+            .execute()
+            .await
+            .map_err(|e| StateError::Backend(format!("put news execute: {e:?}")))?;
+        Ok(())
+    }
+
+    async fn list_news_windows_for_trade(
+        &self,
+        trade_id: &str,
+    ) -> Result<Vec<NewsEntry>, StateError> {
+        list_news_with_prefix(&self.store, &Self::news_trade_prefix(trade_id)).await
+    }
+
+    async fn clear_news_window(&self, trade_id: &str, news_id: &str) -> Result<bool, StateError> {
+        let key = Self::news_key(trade_id, news_id);
+        let was = self
+            .store
+            .get(&key)
+            .text()
+            .await
+            .map_err(|e| StateError::Backend(format!("get news for clear: {e:?}")))?
+            .is_some();
+        if was {
+            self.store
+                .delete(&key)
+                .await
+                .map_err(|e| StateError::Backend(format!("delete news: {e:?}")))?;
+        }
+        Ok(was)
+    }
 }
 
 /// Page through `kv.list` with `prefix`, decoding each value as a
@@ -840,6 +918,26 @@ async fn list_pauses_with_prefix(
     store: &KvStore,
     prefix: &str,
 ) -> Result<Vec<PauseEntry>, StateError> {
+    list_json_with_prefix(store, prefix, "pause").await
+}
+
+/// Same shape as [`list_pauses_with_prefix`], for news windows.
+async fn list_news_with_prefix(
+    store: &KvStore,
+    prefix: &str,
+) -> Result<Vec<NewsEntry>, StateError> {
+    list_json_with_prefix(store, prefix, "news").await
+}
+
+/// Generic prefix-paginated JSON list — page through `kv.list`,
+/// decode each value as `T`. `kind_label` rides on error messages so
+/// "list pause: ..." vs "list news: ..." still tell the operator
+/// which namespace failed.
+async fn list_json_with_prefix<T: for<'de> serde::Deserialize<'de>>(
+    store: &KvStore,
+    prefix: &str,
+    kind_label: &'static str,
+) -> Result<Vec<T>, StateError> {
     let mut keys: Vec<String> = Vec::new();
     let mut cursor: Option<String> = None;
     loop {
@@ -850,7 +948,7 @@ async fn list_pauses_with_prefix(
         let resp = builder
             .execute()
             .await
-            .map_err(|e| StateError::Backend(format!("list pause: {e:?}")))?;
+            .map_err(|e| StateError::Backend(format!("list {kind_label}: {e:?}")))?;
         keys.extend(resp.keys.into_iter().map(|k| k.name));
         if resp.list_complete {
             break;
@@ -860,7 +958,7 @@ async fn list_pauses_with_prefix(
             None => break,
         }
     }
-    let mut out: Vec<PauseEntry> = Vec::with_capacity(keys.len());
+    let mut out: Vec<T> = Vec::with_capacity(keys.len());
     for key in keys {
         let raw = store
             .get(&key)
@@ -868,7 +966,7 @@ async fn list_pauses_with_prefix(
             .await
             .map_err(|e| StateError::Backend(format!("get {key}: {e:?}")))?;
         let Some(text) = raw else { continue };
-        let entry: PauseEntry = serde_json::from_str(&text)
+        let entry: T = serde_json::from_str(&text)
             .map_err(|e| StateError::Backend(format!("decode {key}: {e}")))?;
         out.push(entry);
     }

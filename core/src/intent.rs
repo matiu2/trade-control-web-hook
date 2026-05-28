@@ -469,6 +469,25 @@ pub struct Intent {
     /// ignored on other actions.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub blackout_id: Option<String>,
+    /// Per-window id on `news-start` / `news-end` actions. Same role
+    /// as `blackout_id` but for the independent news-window
+    /// namespace: the pair-start sets `news:<trade_id>:<news_id>`
+    /// and only its matching `news-end` clears that one. Slug-shaped
+    /// (same rules as `trade_id`). Required on `news-start` /
+    /// `news-end`; ignored on other actions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub news_id: Option<String>,
+    /// On `close` intents, gate the close on an active news window
+    /// existing for `trade_id`. When `Some(true)`, the worker rejects
+    /// the close with 423 unless
+    /// `list_news_windows_for_trade(trade_id)` returns at least one
+    /// entry. Lets an opposing-direction golden-reversal alert
+    /// flatten a trade *only* inside a known news window — the same
+    /// candle outside the window is ignored. Default-absent =
+    /// unconditional close. Only meaningful on `Action::Close`;
+    /// rejected at validate time on other actions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub require_news_window: Option<bool>,
     /// Free-form human-readable label for a `pause` (or any other
     /// action that wants to record context). Surfaces in the seen
     /// index outcome string so operators can answer "why is this
@@ -561,6 +580,17 @@ pub enum IntentValidationError {
     /// `blackout_id` is shaped like a `trade_id` slug (lowercase
     /// alphanumerics + hyphens) — reuses [`is_valid_trade_id`].
     InvalidBlackoutId,
+    /// `news-start` / `news-end` requires both `trade_id` (the parent
+    /// setup) and `news_id` (this specific window). Without `trade_id`
+    /// the worker can't key the KV entry; without `news_id` a
+    /// `news-end` couldn't tell sibling windows apart.
+    MissingNewsFields,
+    /// `news_id` is shaped like a `trade_id` slug — reuses
+    /// [`is_valid_trade_id`].
+    InvalidNewsId,
+    /// `require_news_window: Some(_)` on a non-Close action — the gate
+    /// is only checked on `close`.
+    RequireNewsWindowOnNonClose,
 }
 
 impl core::fmt::Display for IntentValidationError {
@@ -586,6 +616,16 @@ impl core::fmt::Display for IntentValidationError {
                 "invalid blackout_id (same shape as trade_id: 1-64 chars of lowercase \
                  alphanumerics + hyphens, no leading/trailing or consecutive hyphens)",
             ),
+            Self::MissingNewsFields => {
+                f.write_str("news-start / news-end require both trade_id and news_id")
+            }
+            Self::InvalidNewsId => f.write_str(
+                "invalid news_id (same shape as trade_id: 1-64 chars of lowercase \
+                 alphanumerics + hyphens, no leading/trailing or consecutive hyphens)",
+            ),
+            Self::RequireNewsWindowOnNonClose => {
+                f.write_str("require_news_window is only valid on action: close")
+            }
         }
     }
 }
@@ -646,6 +686,24 @@ impl Intent {
             if !is_valid_trade_id(blackout) {
                 return Err(IntentValidationError::InvalidBlackoutId);
             }
+        }
+        // news-start / news-end: parallel to pause/resume; KV key is
+        // `news:<trade_id>:<news_id>`.
+        if matches!(self.action, Action::NewsStart | Action::NewsEnd) {
+            let Some(news) = self.news_id.as_deref() else {
+                return Err(IntentValidationError::MissingNewsFields);
+            };
+            if self.trade_id.is_none() {
+                return Err(IntentValidationError::MissingNewsFields);
+            }
+            if !is_valid_trade_id(news) {
+                return Err(IntentValidationError::InvalidNewsId);
+            }
+        }
+        // require_news_window gates only the close action; rejecting
+        // it on other actions catches operator/template mistakes early.
+        if self.require_news_window.is_some() && self.action != Action::Close {
+            return Err(IntentValidationError::RequireNewsWindowOnNonClose);
         }
         Ok(())
     }
@@ -724,6 +782,15 @@ pub enum Action {
     /// halves of the pair carry the same `blackout_id` so multiple
     /// concurrent blackouts on one trade don't clobber each other.
     Resume,
+    /// Open a news window for a `trade_id` + `news_id` pair. While
+    /// at least one window is open, a `close` with
+    /// `require_news_window: true` is allowed to flatten the trade;
+    /// outside any window the same close is rejected. Independent
+    /// of [`Action::Pause`] — news windows don't block entries.
+    /// Paired with [`Action::NewsEnd`] to clear.
+    NewsStart,
+    /// Clear the matching `news:<trade_id>:<news_id>` entry.
+    NewsEnd,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
@@ -1632,6 +1699,141 @@ mod tests {
         assert!(back.contains("action: pause"));
         assert!(back.contains("blackout_id: nfp-2026-06-06"));
         assert!(back.contains("reason: news:USD-NFP"));
+    }
+
+    #[test]
+    fn intent_validate_news_requires_trade_id_and_news_id() {
+        let base = "
+            v: 1
+            id: news-1
+            not_after: \"2026-06-01T00:00:00Z\"
+            action: news-start
+            instrument: EUR_USD
+        ";
+        // Missing both trade_id and news_id.
+        let intent: Intent = serde_yaml::from_str(base).unwrap();
+        assert_eq!(
+            intent.validate(),
+            Err(IntentValidationError::MissingNewsFields)
+        );
+
+        // Missing news_id only.
+        let yaml = format!("{base}\n            trade_id: eurusd-h-and-s-1");
+        let intent: Intent = serde_yaml::from_str(&yaml).unwrap();
+        assert_eq!(
+            intent.validate(),
+            Err(IntentValidationError::MissingNewsFields)
+        );
+
+        // Missing trade_id only.
+        let yaml = format!("{base}\n            news_id: usd-nfp-2026-06-06");
+        let intent: Intent = serde_yaml::from_str(&yaml).unwrap();
+        assert_eq!(
+            intent.validate(),
+            Err(IntentValidationError::MissingNewsFields)
+        );
+    }
+
+    #[test]
+    fn intent_validate_news_rejects_bad_news_id() {
+        let yaml = "
+            v: 1
+            id: news-bad
+            not_after: \"2026-06-01T00:00:00Z\"
+            action: news-start
+            instrument: EUR_USD
+            trade_id: eurusd-h-and-s-1
+            news_id: \"NFP 2026!\"
+        ";
+        let intent: Intent = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(intent.validate(), Err(IntentValidationError::InvalidNewsId));
+    }
+
+    #[test]
+    fn intent_validate_news_accepts_well_shaped_pair() {
+        for action in ["news-start", "news-end"] {
+            let yaml = format!(
+                "
+                v: 1
+                id: news-ok-{action}
+                not_after: \"2026-06-01T00:00:00Z\"
+                action: {action}
+                instrument: EUR_USD
+                trade_id: eurusd-h-and-s-1
+                news_id: usd-nfp-2026-06-06
+                reason: USD-NFP
+            "
+            );
+            let intent: Intent = serde_yaml::from_str(&yaml).unwrap();
+            intent
+                .validate()
+                .unwrap_or_else(|e| panic!("{action} should validate, got {e:?}"));
+        }
+    }
+
+    #[test]
+    fn intent_news_round_trips_through_yaml() {
+        let yaml = "
+            v: 1
+            id: news-rt
+            not_after: \"2026-06-01T00:00:00Z\"
+            action: news-start
+            instrument: EUR_USD
+            trade_id: eurusd-h-and-s-1
+            news_id: usd-nfp-2026-06-06
+            reason: \"USD-NFP\"
+        ";
+        let intent: Intent = serde_yaml::from_str(yaml).unwrap();
+        let back = serde_yaml::to_string(&intent).unwrap();
+        assert!(back.contains("action: news-start"));
+        assert!(back.contains("news_id: usd-nfp-2026-06-06"));
+    }
+
+    #[test]
+    fn intent_validate_require_news_window_only_on_close() {
+        // OK on close.
+        let yaml = "
+            v: 1
+            id: c-1
+            not_after: \"2026-06-01T00:00:00Z\"
+            action: close
+            instrument: EUR_USD
+            trade_id: eurusd-h-and-s-1
+            require_news_window: true
+        ";
+        let intent: Intent = serde_yaml::from_str(yaml).unwrap();
+        intent.validate().expect("close+require_news_window valid");
+
+        // Rejected on non-close (status here).
+        let yaml = "
+            v: 1
+            id: s-1
+            not_after: \"2026-06-01T00:00:00Z\"
+            action: status
+            instrument: EUR_USD
+            require_news_window: true
+        ";
+        let intent: Intent = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(
+            intent.validate(),
+            Err(IntentValidationError::RequireNewsWindowOnNonClose)
+        );
+    }
+
+    #[test]
+    fn close_without_require_news_window_validates_unchanged() {
+        // Backwards compat: a plain close intent (no `require_news_window`)
+        // still validates — operator emergency-close path stays
+        // unconditional.
+        let yaml = "
+            v: 1
+            id: c-2
+            not_after: \"2026-06-01T00:00:00Z\"
+            action: close
+            instrument: EUR_USD
+        ";
+        let intent: Intent = serde_yaml::from_str(yaml).unwrap();
+        intent.validate().expect("plain close validates");
     }
 
     #[test]

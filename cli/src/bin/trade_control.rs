@@ -23,13 +23,13 @@ use clap_complete::{Shell, generate};
 use color_eyre::eyre::{Context, Result, eyre};
 use trade_control_cli::{
     KEY_LEN, TradePattern, add_account, build_clear_prep_intent, build_clear_veto_intent,
-    build_pause_from_spec, build_prep_intent, build_status_intent, build_trade_from_spec,
-    build_trade_interactive, build_unlock_intent, build_veto_intent, delete_account, delete_secret,
-    fill_missing_fields, generate_key_hex, list_accounts, load_cache, load_pause_spec_from_file,
-    load_spec_from_file, pick_pattern_interactive, pick_template_interactive,
-    prompt_save_as_template, put_secret, record_account_use, record_prep_use, record_veto_use,
-    secret_binding_for, test_account, validate_instrument, wrap_signed, wrap_signed_template,
-    write_pause, write_trade,
+    build_news_from_spec, build_pause_from_spec, build_prep_intent, build_status_intent,
+    build_trade_from_spec, build_trade_interactive, build_unlock_intent, build_veto_intent,
+    delete_account, delete_secret, fill_missing_fields, generate_key_hex, list_accounts,
+    load_cache, load_news_spec_from_file, load_pause_spec_from_file, load_spec_from_file,
+    pick_pattern_interactive, pick_template_interactive, prompt_save_as_template, put_secret,
+    record_account_use, record_prep_use, record_veto_use, secret_binding_for, test_account,
+    validate_instrument, wrap_signed, wrap_signed_template, write_news, write_pause, write_trade,
 };
 use trade_control_core::account::{
     AccountKind, AccountMetadata, Credentials, TradeNationCreds, TradeNationKind,
@@ -95,6 +95,15 @@ enum Cmd {
     /// writes one of these per pair of `blackout-start` /
     /// `blackout-end` vertical lines on the chart and shells out here.
     BuildPause(BuildPauseArgs),
+    /// Build a `news-start` + `news-end` alert pair for a scheduled
+    /// news window on an existing trade. The two alerts share a
+    /// `news_id`; the worker keys its KV entry on
+    /// `news:<trade_id>:<news_id>`. Unlike pause/resume, the entry
+    /// gate is NOT affected — news windows enable a separate
+    /// reversal-close intent that flattens the trade only when news
+    /// is in play. Driven by a `news.yaml` spec — `tv_arm_hs.py`
+    /// writes one per `news-start` / `news-end` vertical-line pair.
+    BuildNews(BuildNewsArgs),
     /// Look up / manage broker instrument catalogs. Today only
     /// `--broker tradenation` is implemented; OANDA names round-trip
     /// cleanly through string mapping and don't need a catalog.
@@ -403,6 +412,23 @@ struct VerifyArgs {
 }
 
 #[derive(Parser)]
+struct BuildNewsArgs {
+    /// Path to the `news.yaml` spec describing the news window.
+    /// Required — there's no interactive mode (the inputs come from
+    /// chart drawings, not a human questionnaire).
+    #[arg(long)]
+    from_file: PathBuf,
+    /// Path to a hex-encoded 32-byte signing key.
+    #[arg(long, env = "TRADE_CONTROL_KEY_FILE")]
+    key_file: PathBuf,
+    /// Directory to write the 2 alert YAMLs + manifest into. Created
+    /// if missing. Default is `./news/<trade_id>/<news_id>/`
+    /// resolved after the id is minted.
+    #[arg(long)]
+    output_dir: Option<PathBuf>,
+}
+
+#[derive(Parser)]
 struct BuildPauseArgs {
     /// Path to the `pause.yaml` spec describing the blackout window.
     /// Required — there's no interactive mode (the inputs come from
@@ -478,6 +504,7 @@ fn main() -> Result<()> {
         Cmd::Account(sub) => run_account(sub)?,
         Cmd::BuildTrade(args) => run_build_trade(args)?,
         Cmd::BuildPause(args) => run_build_pause(args)?,
+        Cmd::BuildNews(args) => run_build_news(args)?,
         Cmd::Instruments(sub) => run_instruments(sub)?,
         Cmd::Completions { shell } => run_completions(shell),
     }
@@ -509,6 +536,31 @@ fn run_build_trade(args: BuildTradeArgs) -> Result<()> {
     println!("trade_id: {}", trade.trade_id);
     println!("output: {}", written.display());
     for alert in &trade.alerts {
+        println!("  - {}.yaml — {}", alert.basename, alert.purpose);
+    }
+    Ok(())
+}
+
+fn run_build_news(args: BuildNewsArgs) -> Result<()> {
+    let key = load_key(&args.key_file)?;
+    let now = Utc::now();
+    let spec = load_news_spec_from_file(&args.from_file)?;
+    // Same account gate as build-pause / build-trade so an unregistered
+    // account fails early. The worker's news-start / news-end handlers
+    // never call the broker, but a typo would mean the parent trade
+    // can't correlate its close-on-reversal intent later.
+    check_account_known(&spec.account)?;
+    let built = build_news_from_spec(spec, now)?;
+    let out_dir = args.output_dir.unwrap_or_else(|| {
+        PathBuf::from("news")
+            .join(&built.trade_id)
+            .join(&built.news_id)
+    });
+    let written = write_news(&built, &key, &out_dir)?;
+    println!("trade_id: {}", built.trade_id);
+    println!("news_id: {}", built.news_id);
+    println!("output: {}", written.display());
+    for alert in &built.alerts {
         println!("  - {}.yaml — {}", alert.basename, alert.purpose);
     }
     Ok(())

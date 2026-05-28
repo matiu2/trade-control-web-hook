@@ -180,6 +180,8 @@ pub async fn main(mut req: Request, env: Env, _ctx: Context) -> Result<Response>
         Action::ClearVeto => return handle_clear_veto(&store, &verified, now).await,
         Action::Pause => return handle_pause(&store, &verified, now).await,
         Action::Resume => return handle_resume(&store, &verified, now).await,
+        Action::NewsStart => return handle_news_start(&store, &verified, now).await,
+        Action::NewsEnd => return handle_news_end(&store, &verified, now).await,
         _ => {}
     }
 
@@ -322,14 +324,7 @@ async fn run_action<B: Broker>(
 ) -> ActionResult {
     match verified.intent.action {
         Action::Enter => run_enter(broker, store, verified, env, now).await,
-        Action::Close => {
-            let ok = broker.close_positions(&verified.intent.instrument).await;
-            if ok {
-                ActionResult::Ok("closed".into())
-            } else {
-                ActionResult::Failed("close-failed".into())
-            }
-        }
+        Action::Close => run_close(broker, store, verified).await,
         Action::Invalidate => {
             let hours = match resolve_phase1_u32(
                 "cooldown_hours",
@@ -377,10 +372,72 @@ async fn run_action<B: Broker>(
         | Action::ClearPrep
         | Action::ClearVeto
         | Action::Pause
-        | Action::Resume => {
+        | Action::Resume
+        | Action::NewsStart
+        | Action::NewsEnd => {
             // Handled before broker dispatch; never reached here.
             unreachable!("non-broker actions handled before broker dispatch")
         }
+    }
+}
+
+/// Dispatch a `Close` intent. When `require_news_window: true`, gates
+/// the close on an active news window for the trade — used by the
+/// opposing-direction golden-reversal alert so that the same alert
+/// outside news is ignored. Without that flag the close is
+/// unconditional (operator emergency-close path).
+async fn run_close<B: Broker>(
+    broker: &B,
+    store: &KvStateStore,
+    verified: &incoming::Verified,
+) -> ActionResult {
+    if matches!(verified.intent.require_news_window, Some(true)) {
+        let Some(tid) = verified.intent.trade_id.as_deref() else {
+            return ActionResult::Rejected {
+                response: Response::error(
+                    "close with require_news_window requires `trade_id`",
+                    400,
+                ),
+                outcome: "rejected: missing-trade-id".into(),
+            };
+        };
+        match store.list_news_windows_for_trade(tid).await {
+            Ok(windows) if windows.is_empty() => {
+                console_log!(
+                    "close rejected: trade {tid} has no active news window (require_news_window: true)"
+                );
+                return ActionResult::Rejected {
+                    response: Response::error("no news window active", 423),
+                    outcome: "rejected: no-news-window".into(),
+                };
+            }
+            Ok(windows) => {
+                let names: Vec<String> = windows
+                    .iter()
+                    .map(|w| match &w.reason {
+                        Some(r) => format!("{}({r})", w.news_id),
+                        None => w.news_id.clone(),
+                    })
+                    .collect();
+                console_log!(
+                    "close gated by news window: trade {tid} active=[{}]",
+                    names.join(", ")
+                );
+            }
+            Err(err) => {
+                console_error!("KV list_news_windows_for_trade: {err}");
+                return ActionResult::Rejected {
+                    response: Response::error("state error", 500),
+                    outcome: "rejected: state-error".into(),
+                };
+            }
+        }
+    }
+    let ok = broker.close_positions(&verified.intent.instrument).await;
+    if ok {
+        ActionResult::Ok("closed".into())
+    } else {
+        ActionResult::Failed("close-failed".into())
     }
 }
 
@@ -1211,6 +1268,75 @@ async fn handle_resume(
         format!("pause-cleared: {blackout_id}")
     } else {
         format!("pause-cleared: {blackout_id} (noop)")
+    };
+    record_seen(store, verified, now, &outcome).await;
+    Response::ok("ok")
+}
+
+/// Handle the `news-start` action: open a news window for
+/// `(trade_id, news_id)`. No broker work. Mirrors `handle_pause` but
+/// writes to the news-window KV namespace, which only the gated
+/// `close` reads — entries are not blocked by news windows.
+async fn handle_news_start(
+    store: &KvStateStore,
+    verified: &incoming::Verified,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<Response> {
+    let Some(trade_id) = verified.intent.trade_id.as_deref() else {
+        return Response::error("news-start requires `trade_id`", 400);
+    };
+    let Some(news_id) = verified.intent.news_id.as_deref() else {
+        return Response::error("news-start requires `news_id`", 400);
+    };
+    // Same TTL math as pause: the matching `news-end` is the
+    // authoritative clear; the safety tail is just to stop an
+    // orphaned window pinning the trade forever.
+    let ttl_seconds = veto_ttl_seconds(0, verified.intent.not_after, now);
+    let reason = verified.intent.reason.as_deref();
+    if let Err(err) = store
+        .set_news_window(trade_id, news_id, reason, now, ttl_seconds)
+        .await
+    {
+        console_error!("KV set_news_window: {err}");
+        return Response::error("state error", 500);
+    }
+    console_log!(
+        "news-start: trade_id={trade_id} news_id={news_id} reason={:?}",
+        reason
+    );
+    let outcome = match reason {
+        Some(r) => format!("news-start: {news_id} ({r})"),
+        None => format!("news-start: {news_id}"),
+    };
+    record_seen(store, verified, now, &outcome).await;
+    Response::ok("ok")
+}
+
+/// Handle the `news-end` action: close a single
+/// `(trade_id, news_id)` news window.
+async fn handle_news_end(
+    store: &KvStateStore,
+    verified: &incoming::Verified,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<Response> {
+    let Some(trade_id) = verified.intent.trade_id.as_deref() else {
+        return Response::error("news-end requires `trade_id`", 400);
+    };
+    let Some(news_id) = verified.intent.news_id.as_deref() else {
+        return Response::error("news-end requires `news_id`", 400);
+    };
+    let was = match store.clear_news_window(trade_id, news_id).await {
+        Ok(b) => b,
+        Err(err) => {
+            console_error!("KV clear_news_window: {err}");
+            return Response::error("state error", 500);
+        }
+    };
+    console_log!("news-end: trade_id={trade_id} news_id={news_id} was_set={was}");
+    let outcome = if was {
+        format!("news-end: {news_id}")
+    } else {
+        format!("news-end: {news_id} (noop)")
     };
     record_seen(store, verified, now, &outcome).await;
     Response::ok("ok")

@@ -162,6 +162,8 @@ mod tests {
             allow_entry: gate,
             needs_golden: false,
             blackout_id: None,
+            news_id: None,
+            require_news_window: None,
             reason: None,
         }
     }

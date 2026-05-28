@@ -80,6 +80,9 @@ pub fn required_for_action(action: Action) -> &'static [&'static str] {
         // Listing nothing here means the questionnaire path won't
         // prompt for them, matching how `enter` doesn't list `trade_id`.
         Action::Pause | Action::Resume => &[],
+        // news-start / news-end are produced by `trade-control
+        // build-news` from a NewsSpec — same shape as pause/resume.
+        Action::NewsStart | Action::NewsEnd => &[],
     }
 }
 

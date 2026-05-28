@@ -55,6 +55,8 @@ fn control_skeleton(action: Action, instrument: &str, id: String, now: DateTime<
         allow_entry: None,
         needs_golden: false,
         blackout_id: None,
+        news_id: None,
+        require_news_window: None,
         reason: None,
     }
 }

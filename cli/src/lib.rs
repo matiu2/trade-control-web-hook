@@ -8,6 +8,7 @@ mod expiry;
 mod history;
 mod instruments;
 mod interactive;
+mod news_pattern;
 mod pause_pattern;
 mod prompts;
 mod script_validator;
@@ -25,6 +26,10 @@ pub use history::{
 };
 pub use instruments::{load_cache, validate_instrument};
 pub use interactive::{fill_missing_fields, prompt_save_as_template};
+pub use news_pattern::{
+    BuiltNews, BuiltNewsAlert, NewsSpec, build_news_from_spec,
+    load_spec_from_file as load_news_spec_from_file, write_news,
+};
 pub use pause_pattern::{
     BuiltPause, BuiltPauseAlert, PauseSpec, build_pause_from_spec,
     load_spec_from_file as load_pause_spec_from_file, write_pause,
