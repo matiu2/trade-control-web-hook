@@ -2,4 +2,9 @@
 //! Promote to wrangler.toml `[vars]` if operational tuning becomes
 //! frequent.
 
-// (PR B will add session-staleness constants here.)
+use chrono::Duration;
+
+/// A cached TN session older than this is force-refreshed on the
+/// next cron tick. Hint, not a correctness boundary — the existing
+/// re-login-on-rejection path stays the safety net.
+pub const STALE_AFTER: Duration = Duration::hours(12);

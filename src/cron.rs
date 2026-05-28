@@ -7,6 +7,8 @@
 //! — see the `[[triggers.crons]]` table.
 
 mod constants;
+pub(crate) mod session_meta;
+mod session_refresh;
 mod sweep;
 
 use worker::{Env, ScheduleContext, ScheduledEvent, event};
@@ -20,5 +22,6 @@ use worker::{Env, ScheduleContext, ScheduledEvent, event};
 pub async fn scheduled(_event: ScheduledEvent, env: Env, _ctx: ScheduleContext) {
     crate::tracing_console::ConsoleSubscriber::install();
     let now = chrono::Utc::now();
+    session_refresh::refresh_stale_sessions(&env, now, constants::STALE_AFTER).await;
     sweep::sweep_pending_orders(&env, now).await;
 }

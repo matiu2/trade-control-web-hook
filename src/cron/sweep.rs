@@ -212,7 +212,7 @@ enum BrokerHandle {
 /// the account's broker kind, looked up from metadata.
 async fn acquire_broker_for_attempt(env: &Env, attempt: &EntryAttempt) -> Option<BrokerHandle> {
     let account = attempt.account.as_deref();
-    let broker_kind = resolve_broker_kind(env, account).await;
+    let broker_kind = resolve_broker_kind(env, account).await?;
     match broker_kind {
         BrokerKind::Oanda => crate::acquire_oanda_broker(env, account)
             .await
@@ -223,18 +223,23 @@ async fn acquire_broker_for_attempt(env: &Env, attempt: &EntryAttempt) -> Option
     }
 }
 
-/// Resolve broker kind from the account metadata. Falls back to OANDA
-/// when the account is unnamed (worker-global) or metadata can't be
-/// read — same shape the fetch-path uses when `account: None` is on
-/// an intent.
-async fn resolve_broker_kind(env: &Env, account: Option<&str>) -> BrokerKind {
+/// Resolve broker kind from the account metadata. Returns:
+/// * `Some(Oanda)` when the attempt is unnamed (worker-global) — the
+///   fetch-path treats `account: None` as the global OANDA account.
+/// * `Some(kind)` on a successful metadata lookup.
+/// * `None` on the native test target, or when KV / metadata lookup
+///   fails — `None` is logged by the caller and the row is skipped
+///   rather than silently misrouted to the wrong broker. PR A had a
+///   non-wasm `BrokerKind::Oanda` fallback here that would have routed
+///   TN accounts to OANDA in tests.
+async fn resolve_broker_kind(env: &Env, account: Option<&str>) -> Option<BrokerKind> {
     let Some(name) = account else {
-        return BrokerKind::Oanda;
+        return Some(BrokerKind::Oanda);
     };
     #[cfg(not(target_arch = "wasm32"))]
     {
         let _ = (env, name);
-        BrokerKind::Oanda
+        None
     }
     #[cfg(target_arch = "wasm32")]
     {
@@ -243,15 +248,15 @@ async fn resolve_broker_kind(env: &Env, account: Option<&str>) -> BrokerKind {
             Ok(kv) => kv,
             Err(err) => {
                 console_error!("cron sweep[{name}]: KV binding missing: {err:?}");
-                return BrokerKind::Oanda;
+                return None;
             }
         };
         let metadata = crate::accounts::KvMetadataStore::new(kv);
         match metadata.get(name).await {
-            Ok(m) => m.broker,
+            Ok(m) => Some(m.broker),
             Err(err) => {
                 console_error!("cron sweep[{name}]: metadata lookup failed: {err}");
-                BrokerKind::Oanda
+                None
             }
         }
     }

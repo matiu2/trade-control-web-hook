@@ -1529,6 +1529,7 @@ async fn cache_and_open(
             }
             Err(err) => console_error!("tn[{account_name}]: KV put session builder: {err:?}"),
         }
+        write_session_meta(&kv, account_name).await;
     }
     if let Some(broker) = broker_tradenation::login(&json).await {
         console_log!("tn[{account_name}]: fresh {kind_label} login");
@@ -1536,6 +1537,33 @@ async fn cache_and_open(
     }
     console_error!("tn[{account_name}]: fresh session rejected by broker_tradenation::login");
     None
+}
+
+/// Best-effort write of the sibling `tn:session_meta:{account}` slot so
+/// the cron pre-warm has a `cached_at` timestamp to compare against
+/// `STALE_AFTER`. Failures are logged but never abort — the cron path
+/// just treats a missing meta record as "stale" and re-logs in.
+#[cfg(target_arch = "wasm32")]
+async fn write_session_meta(kv: &worker::kv::KvStore, account_name: &str) {
+    let meta = cron::session_meta::SessionMeta {
+        cached_at: chrono::Utc::now(),
+    };
+    let json = match serde_json::to_string(&meta) {
+        Ok(s) => s,
+        Err(err) => {
+            console_error!("tn[{account_name}]: serialise session_meta: {err}");
+            return;
+        }
+    };
+    let key = cron::session_meta::key(account_name);
+    match kv.put(&key, json) {
+        Ok(builder) => {
+            if let Err(err) = builder.execute().await {
+                console_error!("tn[{account_name}]: KV put session_meta execute: {err:?}");
+            }
+        }
+        Err(err) => console_error!("tn[{account_name}]: KV put session_meta builder: {err:?}"),
+    }
 }
 
 /// Read a secret. Returns `None` if the binding is absent or unreadable.
