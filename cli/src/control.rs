@@ -54,6 +54,8 @@ fn control_skeleton(action: Action, instrument: &str, id: String, now: DateTime<
         max_retries: trade_control_core::tunable::Tunable::Static(0),
         allow_entry: None,
         needs_golden: false,
+        blackout_id: None,
+        reason: None,
     }
 }
 
@@ -163,11 +165,23 @@ pub fn wrap_signed(intent: &Intent, key: &[u8; KEY_LEN], now: DateTime<Utc>) -> 
     build_signed_body(intent, key, &shell_for_control(now))
 }
 
-/// Build a signed body for a TradingView alert. Shell fields are the
-/// literal TradingView placeholders so the alert template substitutes
-/// them at delivery time without invalidating the sig.
+/// Build a signed body for a TradingView alert that fires from a Pine
+/// study (e.g. `Candle Signals`'s `Long/Short Pattern` alertcondition).
+/// Shell includes the `{{plot("…")}}` placeholders that only resolve
+/// when the alert is bound to a study — see [`shell_for_tv_template_pine`].
 pub fn wrap_signed_template(intent: &Intent, key: &[u8; KEY_LEN]) -> Result<String> {
-    build_signed_body(intent, key, &shell_for_tv_template())
+    build_signed_body(intent, key, &shell_for_tv_template_pine())
+}
+
+/// Build a signed body for a TradingView alert that fires from a
+/// drawing (horizontal line, vertical line, trendline). Drawings have
+/// no Pine context, so `{{plot("…")}}` placeholders would be delivered
+/// literally and crash the worker's YAML parser. Only the four
+/// universally-substituted placeholders (`close`/`high`/`low`/`time`)
+/// are included; signal-bar fields are simply absent and the worker's
+/// optional `Shell` fields stay `None`.
+pub fn wrap_signed_template_drawing(intent: &Intent, key: &[u8; KEY_LEN]) -> Result<String> {
+    build_signed_body(intent, key, &shell_for_tv_template_drawing())
 }
 
 fn build_signed_body(
@@ -214,20 +228,17 @@ fn shell_for_control(now: DateTime<Utc>) -> Vec<(&'static str, String)> {
     ]
 }
 
-fn shell_for_tv_template() -> Vec<(&'static str, String)> {
-    vec![
-        ("close", "{{close}}".to_string()),
-        ("high", "{{high}}".to_string()),
-        ("low", "{{low}}".to_string()),
-        ("time", "\"{{time}}\"".to_string()),
-        // signal_* / golden / atr come from candle-signals-v2.pine's
-        // hidden plots, populated when the Long/Short Pattern
-        // alertcondition fires. The worker treats them as optional —
-        // pre-2026-05 v2 signed templates parse unchanged. Note:
-        // {{plot("…")}} names the Pine plot title; the YAML key on
-        // the left is the wire-key the worker deserialises into the
-        // Shell. They don't have to match — `golden` / `atr` live
-        // under `signal_golden` / `signal_atr` Pine titles.
+fn shell_for_tv_template_pine() -> Vec<(&'static str, String)> {
+    let mut lines = shell_for_tv_template_drawing();
+    // signal_* / golden / atr come from candle-signals-v2.pine's
+    // hidden plots, populated when the Long/Short Pattern
+    // alertcondition fires. The worker treats them as optional —
+    // pre-2026-05 v2 signed templates parse unchanged. Note:
+    // {{plot("…")}} names the Pine plot title; the YAML key on
+    // the left is the wire-key the worker deserialises into the
+    // Shell. They don't have to match — `golden` / `atr` live
+    // under `signal_golden` / `signal_atr` Pine titles.
+    lines.extend([
         ("signal_high", "{{plot(\"signal_high\")}}".to_string()),
         ("signal_low", "{{plot(\"signal_low\")}}".to_string()),
         ("signal_range", "{{plot(\"signal_range\")}}".to_string()),
@@ -244,6 +255,16 @@ fn shell_for_tv_template() -> Vec<(&'static str, String)> {
         ),
         ("recent_high", "{{plot(\"recent_high\")}}".to_string()),
         ("recent_low", "{{plot(\"recent_low\")}}".to_string()),
+    ]);
+    lines
+}
+
+fn shell_for_tv_template_drawing() -> Vec<(&'static str, String)> {
+    vec![
+        ("close", "{{close}}".to_string()),
+        ("high", "{{high}}".to_string()),
+        ("low", "{{low}}".to_string()),
+        ("time", "\"{{time}}\"".to_string()),
     ]
 }
 

@@ -31,7 +31,7 @@ use trade_control_core::intent::{
 };
 use trade_control_core::sig::KEY_LEN;
 
-use crate::control::wrap_signed_template;
+use crate::control::{wrap_signed_template, wrap_signed_template_drawing};
 use crate::expiry;
 use crate::instruments::validate_instrument;
 
@@ -463,8 +463,18 @@ const KNOWN_PREP_NAMES: &[&str] = &["break-and-close", "retest"];
 pub fn write_trade(trade: &BuiltTrade, key: &[u8; KEY_LEN], out_dir: &Path) -> Result<PathBuf> {
     fs::create_dir_all(out_dir).with_context(|| format!("creating {}", out_dir.display()))?;
     for alert in &trade.alerts {
-        let body = wrap_signed_template(&alert.intent, key)
-            .map_err(|e| eyre!("sign {}: {e}", alert.basename))?;
+        // Only the enter alert binds to a Pine study (`Candle Signals`'s
+        // `Long/Short Pattern` alertcondition), so it can resolve the
+        // `{{plot("…")}}` placeholders. Vetos and preps fire from
+        // drawings — TV delivers any `{{plot(…)}}` literally, which
+        // crashes the worker's YAML parser. Strip those for drawings.
+        let is_pine_bound = alert.basename == "05-enter";
+        let body = if is_pine_bound {
+            wrap_signed_template(&alert.intent, key)
+        } else {
+            wrap_signed_template_drawing(&alert.intent, key)
+        }
+        .map_err(|e| eyre!("sign {}: {e}", alert.basename))?;
         let path = out_dir.join(format!("{}.yaml", alert.basename));
         fs::write(&path, body).with_context(|| format!("writing {}", path.display()))?;
     }
@@ -818,6 +828,8 @@ fn skeleton(
         max_retries: trade_control_core::tunable::Tunable::Static(0),
         allow_entry: None,
         needs_golden: false,
+        blackout_id: None,
+        reason: None,
     }
 }
 
@@ -1791,6 +1803,43 @@ tp_price: 1.05
         match &enter.intent.stop_loss {
             Some(PriceRef::Anchored { from, .. }) => assert_eq!(*from, PriceAnchor::RecentLow),
             other => panic!("expected Anchored SL, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn drawing_alerts_emit_no_pine_plot_placeholders() {
+        // Regression: vetos and preps fire from drawings, which have no
+        // Pine context. If their YAML carried `{{plot("…")}}`, TV would
+        // deliver it literally and crash the worker's YAML parser
+        // (observed 2026-05-27, 19 rejections/day). Only the enter alert
+        // (#05) is bound to a Pine study and may carry plot placeholders.
+        let now = ts("2026-05-20T00:00:00Z");
+        let spec = sample_spec(TradePattern::Hs, ts("2026-05-25T00:00:00Z"));
+        let trade = build_trade_from_spec(spec, now).unwrap();
+        let key = [9u8; KEY_LEN];
+        for alert in &trade.alerts {
+            let is_pine_bound = alert.basename == "05-enter";
+            let body = if is_pine_bound {
+                wrap_signed_template(&alert.intent, &key).unwrap()
+            } else {
+                wrap_signed_template_drawing(&alert.intent, &key).unwrap()
+            };
+            if is_pine_bound {
+                assert!(
+                    body.contains("{{plot("),
+                    "enter alert should carry plot placeholders, got: {body}"
+                );
+            } else {
+                assert!(
+                    !body.contains("{{plot("),
+                    "drawing alert {} must not carry plot placeholders, got: {body}",
+                    alert.basename
+                );
+                // Sanity: drawing alerts still carry the four
+                // universally-substituted shell placeholders.
+                assert!(body.contains("close: {{close}}"));
+                assert!(body.contains("time: \"{{time}}\""));
+            }
         }
     }
 

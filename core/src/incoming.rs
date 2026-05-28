@@ -20,10 +20,14 @@ use crate::sig::{self, SIG_FIELD, SigError};
 
 #[derive(Debug)]
 pub enum IncomingError {
-    BadYaml,
+    /// Top-level YAML parse / shape failure. Carries a short reason so
+    /// operators can tell apart "not a mapping", a serde error message,
+    /// or a malformed top-level pair without re-parsing free-form text.
+    BadYaml(String),
     /// Sig verification failed.
     Sig(SigError),
-    BadIntentYaml,
+    /// Intent fields didn't deserialise. Carries the serde error message.
+    BadIntentYaml(String),
     UnsupportedVersion(u32),
     /// `time` (from TradingView) is too far from `now`.
     StaleShellTime,
@@ -40,9 +44,9 @@ pub enum IncomingError {
 impl core::fmt::Display for IncomingError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
-            Self::BadYaml => f.write_str("invalid YAML"),
+            Self::BadYaml(why) => write!(f, "invalid YAML: {why}"),
             Self::Sig(e) => write!(f, "sig: {e}"),
-            Self::BadIntentYaml => f.write_str("intent fields don't parse"),
+            Self::BadIntentYaml(why) => write!(f, "intent fields don't parse: {why}"),
             Self::UnsupportedVersion(v) => write!(f, "unsupported intent version {v}"),
             Self::StaleShellTime => f.write_str("plaintext time too far from now"),
             Self::TooEarly => f.write_str("intent not yet valid"),
@@ -98,8 +102,10 @@ pub fn parse_and_verify(
     // Shell and Intent. Drop the `sig` field for Intent deserialisation
     // because the Intent struct doesn't know about it.
     let value: serde_yaml::Value =
-        serde_yaml::from_str(yaml).map_err(|_| IncomingError::BadYaml)?;
-    let mapping = value.as_mapping().ok_or(IncomingError::BadYaml)?;
+        serde_yaml::from_str(yaml).map_err(|e| IncomingError::BadYaml(format!("from_str: {e}")))?;
+    let mapping = value
+        .as_mapping()
+        .ok_or_else(|| IncomingError::BadYaml("top-level value is not a mapping".into()))?;
 
     let mut intent_map = serde_yaml::Mapping::new();
     let mut shell_map = serde_yaml::Mapping::new();
@@ -108,7 +114,8 @@ pub fn parse_and_verify(
         match key_str {
             "sig" => continue,
             "close" | "high" | "low" | "time" | "signal_high" | "signal_low" | "signal_range"
-            | "signal_start_time" | "signal_kind" | "golden" | "atr" | "signal_confirmed" => {
+            | "signal_start_time" | "signal_kind" | "golden" | "atr" | "signal_confirmed"
+            | "recent_high" | "recent_low" => {
                 shell_map.insert(k.clone(), v.clone());
             }
             _ => {
@@ -117,12 +124,12 @@ pub fn parse_and_verify(
         }
     }
     let intent: Intent = serde_yaml::from_value(serde_yaml::Value::Mapping(intent_map))
-        .map_err(|_| IncomingError::BadIntentYaml)?;
+        .map_err(|e| IncomingError::BadIntentYaml(e.to_string()))?;
     // Deserialise the Shell directly so its serde adapters
     // (signal_time_serde, signal_kind_serde, bool_one_zero_serde)
     // handle Pine's millisecond-int / float-code / 0-or-1 wire forms.
     let shell: Shell = serde_yaml::from_value(serde_yaml::Value::Mapping(shell_map))
-        .map_err(|_| IncomingError::BadYaml)?;
+        .map_err(|e| IncomingError::BadYaml(format!("shell deser: {e}")))?;
 
     check_intent_freshness(&shell, &intent, now)?;
     intent.validate().map_err(IncomingError::InvalidIntent)?;
@@ -157,7 +164,9 @@ pub fn signed_pairs_from_text(yaml: &str) -> Result<Vec<(String, String)>, Incom
         };
         let key = k.trim().to_string();
         if key.is_empty() {
-            return Err(IncomingError::BadYaml);
+            return Err(IncomingError::BadYaml(format!(
+                "empty key in top-level line: {line:?}"
+            )));
         }
         let val = strip_yaml_quotes(v.trim()).to_string();
         out.push((key, val));
@@ -427,6 +436,55 @@ mod tests {
         assert_eq!(v.shell.signal_confirmed, Some(true));
         let sig_time = v.shell.signal_start_time.unwrap();
         assert_eq!(sig_time.timestamp_millis(), 1779728340000);
+    }
+
+    #[test]
+    fn signed_path_recent_high_low_substitution_ok() {
+        // CLI signs with {{plot("recent_high")}} / {{plot("recent_low")}}
+        // placeholders; TV substitutes real numbers. Sig must survive
+        // (they're in UNSIGNED_VALUE_KEYS) and the Shell deser must
+        // route them off the intent map.
+        let pre_substitution = [
+            "close: {{close}}",
+            "high: {{high}}",
+            "low: {{low}}",
+            "time: \"{{time}}\"",
+            "recent_high: {{plot(\"recent_high\")}}",
+            "recent_low: {{plot(\"recent_low\")}}",
+            "v: 1",
+            "action: prep",
+            "instrument: EUR_USD",
+            "id: prep-recent",
+            "not_after: \"2026-05-13T20:00:00Z\"",
+            "step: retest",
+            "ttl_hours: 12",
+            "",
+        ]
+        .join("\n");
+        let pairs = signed_pairs_from_text(&pre_substitution).unwrap();
+        let sig = crate::sig::sign(&KEY, &pairs).unwrap();
+        let on_wire = [
+            "close: 1.16438",
+            "high: 1.16440",
+            "low: 1.16430",
+            "time: \"2026-05-13T12:00:00Z\"",
+            "recent_high: 1.16500",
+            "recent_low: 1.16400",
+            "v: 1",
+            "action: prep",
+            "instrument: EUR_USD",
+            "id: prep-recent",
+            "not_after: \"2026-05-13T20:00:00Z\"",
+            "step: retest",
+            "ttl_hours: 12",
+            &format!("sig: \"{sig}\""),
+            "",
+        ]
+        .join("\n");
+        let now: DateTime<Utc> = "2026-05-13T12:01:00Z".parse().unwrap();
+        let v = parse_and_verify(&on_wire, &KEY, now).unwrap();
+        assert_eq!(v.shell.recent_high, Some(1.16500));
+        assert_eq!(v.shell.recent_low, Some(1.16400));
     }
 
     #[test]

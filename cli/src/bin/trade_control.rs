@@ -23,12 +23,13 @@ use clap_complete::{Shell, generate};
 use color_eyre::eyre::{Context, Result, eyre};
 use trade_control_cli::{
     KEY_LEN, TradePattern, add_account, build_clear_prep_intent, build_clear_veto_intent,
-    build_prep_intent, build_status_intent, build_trade_from_spec, build_trade_interactive,
-    build_unlock_intent, build_veto_intent, delete_account, delete_secret, fill_missing_fields,
-    generate_key_hex, list_accounts, load_cache, load_spec_from_file, pick_pattern_interactive,
-    pick_template_interactive, prompt_save_as_template, put_secret, record_account_use,
-    record_prep_use, record_veto_use, secret_binding_for, test_account, validate_instrument,
-    wrap_signed, wrap_signed_template, write_trade,
+    build_pause_from_spec, build_prep_intent, build_status_intent, build_trade_from_spec,
+    build_trade_interactive, build_unlock_intent, build_veto_intent, delete_account, delete_secret,
+    fill_missing_fields, generate_key_hex, list_accounts, load_cache, load_pause_spec_from_file,
+    load_spec_from_file, pick_pattern_interactive, pick_template_interactive,
+    prompt_save_as_template, put_secret, record_account_use, record_prep_use, record_veto_use,
+    secret_binding_for, test_account, validate_instrument, wrap_signed, wrap_signed_template,
+    write_pause, write_trade,
 };
 use trade_control_core::account::{
     AccountKind, AccountMetadata, Credentials, TradeNationCreds, TradeNationKind,
@@ -86,6 +87,14 @@ enum Cmd {
     /// Each YAML is a complete TradingView-ready alert body — drop them
     /// into the matching TradingView alerts on the chart.
     BuildTrade(BuildTradeArgs),
+    /// Build a `pause` + `resume` alert pair for a news-event blackout
+    /// on an existing trade. The two alerts share a `blackout_id`; the
+    /// worker keys its KV entry on `pause:<trade_id>:<blackout_id>`,
+    /// and the `enter` gate rejects while any pause for the trade_id
+    /// is active. Driven by a `pause.yaml` spec — `tv_arm_hs.py`
+    /// writes one of these per pair of `blackout-start` /
+    /// `blackout-end` vertical lines on the chart and shells out here.
+    BuildPause(BuildPauseArgs),
     /// Look up / manage broker instrument catalogs. Today only
     /// `--broker tradenation` is implemented; OANDA names round-trip
     /// cleanly through string mapping and don't need a catalog.
@@ -394,6 +403,25 @@ struct VerifyArgs {
 }
 
 #[derive(Parser)]
+struct BuildPauseArgs {
+    /// Path to the `pause.yaml` spec describing the blackout window.
+    /// Required — there's no interactive mode (the inputs come from
+    /// chart drawings, not a human questionnaire).
+    #[arg(long)]
+    from_file: PathBuf,
+    /// Path to a hex-encoded 32-byte signing key. Same key the
+    /// `build-trade` and `sign` paths use — pauses go through the
+    /// same HMAC pipeline.
+    #[arg(long, env = "TRADE_CONTROL_KEY_FILE")]
+    key_file: PathBuf,
+    /// Directory to write the 2 alert YAMLs + manifest into. Created
+    /// if missing. Default is `./pauses/<trade_id>/<blackout_id>/`
+    /// resolved after the id is minted.
+    #[arg(long)]
+    output_dir: Option<PathBuf>,
+}
+
+#[derive(Parser)]
 struct BuildTradeArgs {
     /// Pattern to build (`hs`, `ihs`, `m`, `w`). Omit to fuzzy-pick
     /// interactively. Ignored when `--from-file` is set (the spec
@@ -449,6 +477,7 @@ fn main() -> Result<()> {
         Cmd::Verify(args) => run_verify(args)?,
         Cmd::Account(sub) => run_account(sub)?,
         Cmd::BuildTrade(args) => run_build_trade(args)?,
+        Cmd::BuildPause(args) => run_build_pause(args)?,
         Cmd::Instruments(sub) => run_instruments(sub)?,
         Cmd::Completions { shell } => run_completions(shell),
     }
@@ -461,6 +490,7 @@ fn run_build_trade(args: BuildTradeArgs) -> Result<()> {
     let trade = match args.from_file {
         Some(path) => {
             let spec = load_spec_from_file(&path)?;
+            check_account_known(&spec.account)?;
             build_trade_from_spec(spec, now)?
         }
         None => {
@@ -482,6 +512,52 @@ fn run_build_trade(args: BuildTradeArgs) -> Result<()> {
         println!("  - {}.yaml — {}", alert.basename, alert.purpose);
     }
     Ok(())
+}
+
+fn run_build_pause(args: BuildPauseArgs) -> Result<()> {
+    let key = load_key(&args.key_file)?;
+    let now = Utc::now();
+    let spec = load_pause_spec_from_file(&args.from_file)?;
+    // Reuse the build-trade gate so the operator can't accidentally
+    // route a pause at an account they haven't registered. Pauses
+    // don't touch the broker but a typo here would still leave the
+    // worker scratching its head when the parent enter fires.
+    check_account_known(&spec.account)?;
+    let built = build_pause_from_spec(spec, now)?;
+    let out_dir = args.output_dir.unwrap_or_else(|| {
+        PathBuf::from("pauses")
+            .join(&built.trade_id)
+            .join(&built.blackout_id)
+    });
+    let written = write_pause(&built, &key, &out_dir)?;
+    println!("trade_id: {}", built.trade_id);
+    println!("blackout_id: {}", built.blackout_id);
+    println!("output: {}", written.display());
+    for alert in &built.alerts {
+        println!("  - {}.yaml — {}", alert.basename, alert.purpose);
+    }
+    Ok(())
+}
+
+/// Reject the spec early if its `account` isn't in the local history
+/// cache (`~/.config/trade-control/history.yaml`). The cache is
+/// populated by `trade-control account list` / `account test`. An
+/// empty cache means the operator has never run those — we let the
+/// build proceed in that case rather than block on a missing cache.
+fn check_account_known(account: &str) -> Result<()> {
+    let history = trade_control_cli::load_history();
+    let known = history.account_names();
+    if known.is_empty() {
+        return Ok(());
+    }
+    if known.iter().any(|n| n == account) {
+        return Ok(());
+    }
+    Err(eyre!(
+        "account {account:?} is not in the local cache. Known accounts: {}. \
+         Run `trade-control account list` to refresh, or fix the spec.",
+        known.join(", ")
+    ))
 }
 
 fn run_completions(shell: Shell) {

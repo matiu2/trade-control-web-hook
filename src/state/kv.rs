@@ -11,9 +11,9 @@
 use chrono::{DateTime, Utc};
 use trade_control_core::intent::Action;
 use trade_control_core::state::{
-    CooldownEntry, EntryAttempt, MIN_TTL_SECONDS, PREP_INDEX_CAP, PrepEntry, SEEN_INDEX_CAP,
-    SeenEntry, Snapshot, StateError, StateStore, VETO_INDEX_CAP, VetoEntry, account_scope,
-    prune_expired,
+    CooldownEntry, EntryAttempt, MIN_TTL_SECONDS, PREP_INDEX_CAP, PauseEntry, PrepEntry,
+    SEEN_INDEX_CAP, SeenEntry, Snapshot, StateError, StateStore, VETO_INDEX_CAP, VetoEntry,
+    account_scope, prune_expired,
 };
 use worker::kv::KvStore;
 
@@ -67,6 +67,24 @@ impl KvStateStore {
     ) -> String {
         let scope = account_scope(account);
         format!("seen-retry:{scope}:{trade_id}:{}", shell_time.to_rfc3339())
+    }
+
+    fn pause_key(trade_id: &str, blackout_id: &str) -> String {
+        format!("pause:{trade_id}:{blackout_id}")
+    }
+
+    /// Prefix used to list every blackout for a single `trade_id`. The
+    /// trailing colon keeps `eurusd-hs-1` from accidentally matching
+    /// `eurusd-hs-11` blackout entries.
+    fn pause_trade_prefix(trade_id: &str) -> String {
+        format!("pause:{trade_id}:")
+    }
+
+    /// Global prefix used by `snapshot()` to enumerate every active
+    /// pause across every trade — no second `:` here, since the
+    /// next segment is the trade_id.
+    fn pause_all_prefix() -> &'static str {
+        "pause:"
     }
 
     async fn read_cooldown_index(&self) -> Result<Vec<CooldownEntry>, StateError> {
@@ -530,12 +548,23 @@ impl StateStore for KvStateStore {
         let recent_seen = prune_expired(self.read_seen_index().await?, now);
         let preps = prune_expired(self.read_prep_index().await?, now);
         let vetos = prune_expired(self.read_veto_index().await?, now);
+        // Pauses don't use an index — there's no per-(account,instrument)
+        // listing surface that makes one natural — so the snapshot does a
+        // `kv.list(prefix="pause:")` scan instead. KV's TTL on each pause
+        // entry handles automatic expiry; the explicit prune below is
+        // defensive against a list/get race where a key is reported live
+        // but its TTL has just lapsed.
+        let pauses = prune_expired(
+            list_pauses_with_prefix(&self.store, Self::pause_all_prefix()).await?,
+            now,
+        );
         Ok(Snapshot {
             now,
             cooldowns,
             recent_seen,
             preps,
             vetos,
+            pauses,
         })
     }
 
@@ -688,4 +717,103 @@ impl StateStore for KvStateStore {
             .map_err(|e| StateError::Backend(format!("put seen-retry execute: {e:?}")))?;
         Ok(())
     }
+
+    async fn set_pause(
+        &self,
+        trade_id: &str,
+        blackout_id: &str,
+        reason: Option<&str>,
+        now: DateTime<Utc>,
+        ttl_seconds: u64,
+    ) -> Result<(), StateError> {
+        let key = Self::pause_key(trade_id, blackout_id);
+        let ttl = ttl_seconds.max(MIN_TTL_SECONDS);
+        let entry = PauseEntry {
+            trade_id: trade_id.to_string(),
+            blackout_id: blackout_id.to_string(),
+            reason: reason.map(str::to_string),
+            set_at: now,
+            expires_at: now + chrono::Duration::seconds(ttl as i64),
+        };
+        let body = serde_json::to_string(&entry)
+            .map_err(|e| StateError::Backend(format!("encode pause: {e}")))?;
+        self.store
+            .put(&key, body)
+            .map_err(|e| StateError::Backend(format!("put pause builder: {e:?}")))?
+            .expiration_ttl(ttl)
+            .execute()
+            .await
+            .map_err(|e| StateError::Backend(format!("put pause execute: {e:?}")))?;
+        Ok(())
+    }
+
+    async fn list_pauses_for_trade(&self, trade_id: &str) -> Result<Vec<PauseEntry>, StateError> {
+        list_pauses_with_prefix(&self.store, &Self::pause_trade_prefix(trade_id)).await
+    }
+
+    async fn clear_pause(&self, trade_id: &str, blackout_id: &str) -> Result<bool, StateError> {
+        let key = Self::pause_key(trade_id, blackout_id);
+        // Check presence first so we can return whether the clear was a
+        // no-op (operator visibility). Matches the shape of clear_veto /
+        // clear_cooldown rather than the cheaper unconditional delete.
+        let was = self
+            .store
+            .get(&key)
+            .text()
+            .await
+            .map_err(|e| StateError::Backend(format!("get pause for clear: {e:?}")))?
+            .is_some();
+        if was {
+            self.store
+                .delete(&key)
+                .await
+                .map_err(|e| StateError::Backend(format!("delete pause: {e:?}")))?;
+        }
+        Ok(was)
+    }
+}
+
+/// Page through `kv.list` with `prefix`, decoding each value as a
+/// `PauseEntry`. Shared between [`KvStateStore::list_pauses_for_trade`]
+/// (per-trade prefix) and the `pauses:` section of `snapshot`
+/// (global `pause:` prefix). The pagination loop mirrors
+/// `list_entry_attempts` — KV's default page is 1000 keys, well above
+/// any realistic blackout count, but the loop future-proofs the call.
+async fn list_pauses_with_prefix(
+    store: &KvStore,
+    prefix: &str,
+) -> Result<Vec<PauseEntry>, StateError> {
+    let mut keys: Vec<String> = Vec::new();
+    let mut cursor: Option<String> = None;
+    loop {
+        let mut builder = store.list().prefix(prefix.to_string());
+        if let Some(c) = cursor.take() {
+            builder = builder.cursor(c);
+        }
+        let resp = builder
+            .execute()
+            .await
+            .map_err(|e| StateError::Backend(format!("list pause: {e:?}")))?;
+        keys.extend(resp.keys.into_iter().map(|k| k.name));
+        if resp.list_complete {
+            break;
+        }
+        match resp.cursor {
+            Some(c) => cursor = Some(c),
+            None => break,
+        }
+    }
+    let mut out: Vec<PauseEntry> = Vec::with_capacity(keys.len());
+    for key in keys {
+        let raw = store
+            .get(&key)
+            .text()
+            .await
+            .map_err(|e| StateError::Backend(format!("get {key}: {e:?}")))?;
+        let Some(text) = raw else { continue };
+        let entry: PauseEntry = serde_json::from_str(&text)
+            .map_err(|e| StateError::Backend(format!("decode {key}: {e}")))?;
+        out.push(entry);
+    }
+    Ok(out)
 }

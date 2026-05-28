@@ -223,6 +223,8 @@ mod tests {
             max_retries: Tunable::Static(0),
             allow_entry: gate,
             needs_golden: false,
+            blackout_id: None,
+            reason: None,
         }
     }
 

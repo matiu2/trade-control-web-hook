@@ -73,6 +73,8 @@ const UNSIGNED_VALUE_KEYS: &[&str] = &[
     "golden",
     "atr",
     "signal_confirmed",
+    "recent_high",
+    "recent_low",
 ];
 
 /// Field name on the wire that holds the signature itself.
@@ -376,5 +378,27 @@ mod tests {
         // Signed fields ARE present as lines
         assert!(s.contains("instrument=GBPJPY"));
         assert!(s.contains("step=retest"));
+    }
+
+    #[test]
+    fn recent_high_low_value_changes_do_not_break_sig() {
+        // recent_high / recent_low are TV-substituted shell fields (Pine
+        // emits them via {{plot(...)}}). Their values must be excluded
+        // from signing so placeholder-at-sign-time vs real-number-at-wire
+        // doesn't break verification.
+        let mut signed_with_placeholders = pairs();
+        signed_with_placeholders.push(("recent_high".into(), "{{plot(\"recent_high\")}}".into()));
+        signed_with_placeholders.push(("recent_low".into(), "{{plot(\"recent_low\")}}".into()));
+        let sig = sign(&KEY, &signed_with_placeholders).unwrap();
+
+        let mut filled = signed_with_placeholders.clone();
+        for p in filled.iter_mut() {
+            match p.0.as_str() {
+                "recent_high" => p.1 = "1.2500".into(),
+                "recent_low" => p.1 = "1.2400".into(),
+                _ => {}
+            }
+        }
+        verify(&KEY, &filled, &sig).unwrap();
     }
 }

@@ -34,7 +34,7 @@ import os
 import shutil
 import subprocess
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
@@ -66,6 +66,13 @@ BROKER_BY_EXCHANGE = {
 TRADE_EXPIRY_LABELS = {"trade-expiry", "trade-expired"}
 RETEST_LABELS = {"retest", "neckline-retest", "retrace"}
 BREAK_LABELS = {"neckline", "break-and-close"}
+# Blackout / pause window markers. The two label aliases are
+# interchangeable — operators can write whichever reads better on the
+# chart. Detected as vertical lines and paired chronologically into
+# (start, end) windows; each pair becomes one `pause`/`resume` alert
+# pair via `trade-control build-pause`.
+BLACKOUT_START_LABELS = {"blackout-start", "pause"}
+BLACKOUT_END_LABELS = {"blackout-end", "resume"}
 
 
 def tv(*args: str) -> dict:
@@ -101,6 +108,13 @@ class Roles:
     retest: Optional[dict] = None
     tp_fib: Optional[dict] = None
     trade_expiry: Optional[dict] = None
+    # Blackout windows. Each pair is (start_drawing, end_drawing),
+    # chronologically ordered. May be empty (no news on the chart).
+    # Populated by `classify()` from `blackout-start` / `blackout-end`
+    # vertical lines (and their `pause` / `resume` aliases). An odd
+    # count is a hard error — `classify()` raises before the bundle is
+    # emitted so a misdrawn chart can't silently arm half a blackout.
+    blackout_pairs: list[tuple[dict, dict]] = field(default_factory=list)
 
 
 def label_of(d: dict) -> str:
@@ -113,7 +127,13 @@ def latest_time(d: dict) -> int:
 
 def classify(drawings: list[dict]) -> Roles:
     """Group drawings by role. When multiple drawings claim the same role,
-    keep the latest one (older drawings are stale leftovers from prior setups)."""
+    keep the latest one (older drawings are stale leftovers from prior setups).
+
+    Blackout lines (`blackout-start` / `blackout-end`, or their `pause` /
+    `resume` aliases) are collected as a list rather than singled out —
+    multiple news events per trade are valid and each becomes its own
+    `pause`/`resume` pair. An odd count is a hard error: a misdrawn
+    chart shouldn't be allowed to arm half a blackout."""
     by_role: dict[str, list[tuple[dict, str]]] = {
         "invalidation": [],
         "break_and_close": [],
@@ -121,6 +141,8 @@ def classify(drawings: list[dict]) -> Roles:
         "tp_fib": [],
         "trade_expiry": [],
     }
+    blackout_starts: list[dict] = []
+    blackout_ends: list[dict] = []
 
     for stub in drawings:
         d = get_drawing(stub["id"])
@@ -137,6 +159,10 @@ def classify(drawings: list[dict]) -> Roles:
             by_role["tp_fib"].append((d, ""))
         elif kind == "vertical_line" and lbl in TRADE_EXPIRY_LABELS:
             by_role["trade_expiry"].append((d, lbl))
+        elif kind == "vertical_line" and lbl in BLACKOUT_START_LABELS:
+            blackout_starts.append(d)
+        elif kind == "vertical_line" and lbl in BLACKOUT_END_LABELS:
+            blackout_ends.append(d)
 
     roles = Roles()
     for name in ("invalidation", "break_and_close", "retest", "tp_fib", "trade_expiry"):
@@ -158,7 +184,48 @@ def classify(drawings: list[dict]) -> Roles:
             roles.tp_fib = chosen
         elif name == "trade_expiry":
             roles.trade_expiry = chosen
+
+    roles.blackout_pairs = pair_blackouts(blackout_starts, blackout_ends)
     return roles
+
+
+def pair_blackouts(
+    starts: list[dict], ends: list[dict]
+) -> list[tuple[dict, dict]]:
+    """Pair start/end blackout lines chronologically.
+
+    Sort each list by its anchor time (vertical lines have one point);
+    pair them positionally. If the counts differ — i.e. an orphan
+    start or end — raise immediately. The matching `tv_arm_hs.py`
+    caller bails out before arming any alert (including the H&S
+    bundle) on this exception, mirroring how a misdrawn neckline
+    aborts the whole run.
+
+    Each pair must also have `start.time < end.time` — a reversed
+    pair almost certainly means the operator mislabeled a line.
+    """
+    if len(starts) != len(ends):
+        starts_desc = ", ".join(utc_iso(s["points"][0]["time"]) for s in starts)
+        ends_desc = ", ".join(utc_iso(e["points"][0]["time"]) for e in ends)
+        raise RuntimeError(
+            f"blackout lines must come in matched start/end pairs; "
+            f"found {len(starts)} start(s) [{starts_desc}] and "
+            f"{len(ends)} end(s) [{ends_desc}]. "
+            "Fix the chart (add the missing line or relabel) and re-run."
+        )
+    starts_sorted = sorted(starts, key=lambda d: d["points"][0]["time"])
+    ends_sorted = sorted(ends, key=lambda d: d["points"][0]["time"])
+    pairs: list[tuple[dict, dict]] = []
+    for i, (s, e) in enumerate(zip(starts_sorted, ends_sorted)):
+        if s["points"][0]["time"] >= e["points"][0]["time"]:
+            raise RuntimeError(
+                f"blackout pair #{i + 1} is reversed: "
+                f"start={utc_iso(s['points'][0]['time'])} is at or after "
+                f"end={utc_iso(e['points'][0]['time'])}. "
+                "Each blackout-start must precede its blackout-end."
+            )
+        pairs.append((s, e))
+    return pairs
 
 
 # ---------------------------------------------------------------------------
@@ -219,7 +286,7 @@ def instrument_for(broker: str, raw_sym: str) -> str:
     return raw_sym.replace("/", "_")
 
 
-def resolve_tn_instrument(name: str) -> Optional[str]:
+def resolve_tn_instrument(name: str, *, quiet_on_miss: bool = False) -> Optional[str]:
     """Map a guess to a TradeNation catalog name via `trade-control`.
 
     TradeNation's display names don't match TradingView's: the chart shows
@@ -227,8 +294,9 @@ def resolve_tn_instrument(name: str) -> Optional[str]:
     `trade-control instruments resolve --json` (which wraps the
     tradenation-instrument-cache library — fast after the first call).
 
-    Returns the canonical name on hit, or None on miss (printing the
-    "did you mean…" candidate list from the cache to stderr).
+    Returns the canonical name on hit, or None on miss. With `quiet_on_miss`
+    a clean miss is silent (so callers can try a fallback guess before
+    surfacing the "did you mean…" list to the user); infra errors still print.
     """
     try:
         binary = find_trade_control()
@@ -261,6 +329,8 @@ def resolve_tn_instrument(name: str) -> Optional[str]:
         return None
     if payload.get("ok"):
         return payload["name"]
+    if quiet_on_miss:
+        return None
     cands = payload.get("candidates") or []
     print(f"ERROR: TradeNation has no instrument named {name!r}.", file=sys.stderr)
     if cands:
@@ -369,6 +439,51 @@ def run_build_trade(spec_path: Path, out_dir: Path) -> None:
         print(result.stderr.rstrip(), file=sys.stderr)
 
 
+def write_pause_spec(spec: dict, path: Path) -> None:
+    """Emit a `pause.yaml` that `build-pause --from-file` accepts.
+
+    Reuses `write_trade_spec`'s shape but kept separate for clarity —
+    the field set is different (no `pattern`, `risk_pct`, etc.) and
+    a future schema drift on one side shouldn't silently land on the
+    other.
+    """
+    write_trade_spec(spec, path)
+
+
+def run_build_pause(spec_path: Path, out_dir: Path) -> None:
+    """Shell out to `trade-control build-pause` for one blackout window.
+
+    Each call emits two signed alerts (`01-pause-<id>.yaml` and
+    `02-resume-<id>.yaml`) plus a manifest into `out_dir`. The matching
+    pause-detection in `main()` calls this once per blackout pair, with
+    a distinct `out_dir` per pair so multiple windows on one chart don't
+    overwrite each other.
+    """
+    binary = find_trade_control()
+    key = key_file()
+    result = subprocess.run(
+        [
+            binary, "build-pause",
+            "--from-file", str(spec_path),
+            "--key-file", str(key),
+            "--output-dir", str(out_dir),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(
+            "trade-control build-pause failed:\n"
+            f"  stderr: {result.stderr.strip()}\n"
+            f"  stdout: {result.stdout.strip()}"
+        )
+    if result.stdout.strip():
+        print(result.stdout.rstrip())
+    if result.stderr.strip():
+        print(result.stderr.rstrip(), file=sys.stderr)
+
+
 # ---------------------------------------------------------------------------
 # Manifest parsing
 #
@@ -444,10 +559,18 @@ def build_alert_spec(
     manifest_entry: dict,
     direction: str,
     roles: Roles,
+    blackout_pair: Optional[tuple[dict, dict]] = None,
 ) -> Optional[dict]:
     """Translate one manifest entry into the alert-payload shape the
     create_alerts JS expects. Returns None if the entry isn't postable
-    (e.g. unrecognised role)."""
+    (e.g. unrecognised role).
+
+    `blackout_pair` is `(start_drawing, end_drawing)` from
+    `roles.blackout_pairs` when this entry is one of a pause-bundle's
+    alerts (`01-pause-*` / `02-resume-*`). Each pause-bundle manifest
+    is processed independently — the caller pairs each manifest with
+    the right `blackout_pair` before calling here.
+    """
     fname: str = manifest_entry["file"]
     base = fname.removesuffix(".yaml")
     tv_name = base.split("-", 1)[1] if "-" in base else base  # strip "NN-"
@@ -503,6 +626,42 @@ def build_alert_spec(
             "drawing_id": roles.retest["entity_id"],
             "tool": "LineToolTrendLine",
             "condition_type": cross_dir,
+            "frequency": "on_first_fire",
+            "auto_deactivate": False,
+            "tv_name": tv_name,
+        }
+
+    if base.startswith("01-pause-"):
+        # Pause-bundle: armed by the blackout-start vertical line.
+        # `blackout_pair` carries (start, end) — pause fires on the
+        # start anchor. The build-pause CLI mints the trailing slug
+        # (`01-pause-<blackout_id>`) so two windows on one chart get
+        # distinct files.
+        if blackout_pair is None:
+            return None
+        start, _end = blackout_pair
+        return {
+            "kind": "drawing",
+            "drawing_id": start["entity_id"],
+            "tool": "LineToolVertLine",
+            "condition_type": "cross",
+            "frequency": "on_first_fire",
+            "auto_deactivate": False,
+            "tv_name": tv_name,
+        }
+
+    if base.startswith("02-resume-"):
+        # Resume half of the pause-bundle; fires on the blackout-end
+        # vertical line and clears the matching `pause:<trade_id>:<id>`
+        # KV entry in the worker.
+        if blackout_pair is None:
+            return None
+        _start, end = blackout_pair
+        return {
+            "kind": "drawing",
+            "drawing_id": end["entity_id"],
+            "tool": "LineToolVertLine",
+            "condition_type": "cross",
             "frequency": "on_first_fire",
             "auto_deactivate": False,
             "tv_name": tv_name,
@@ -949,7 +1108,24 @@ def main(argv: Optional[list[str]] = None) -> int:
         return 1
     instrument = instrument_for(broker, raw_sym)
     if broker == "tradenation" and not args.no_instrument_check:
-        canonical = resolve_tn_instrument(instrument)
+        # First try the chart symbol ("DE40", "XAGUSD", "EUR/USD"). TN's
+        # catalog has symbols for FX/stocks but not indices/commodities, so
+        # on miss fall back to the chart's human description ("Germany 40",
+        # "Spot Silver") which usually matches TN's display name directly.
+        canonical = resolve_tn_instrument(instrument, quiet_on_miss=True)
+        if canonical is None:
+            description = (tv("info").get("description") or "").strip()
+            if description and description != instrument:
+                print(
+                    f"# {instrument!r} not in TN catalog; retrying with chart "
+                    f"description {description!r}",
+                    file=sys.stderr,
+                )
+                canonical = resolve_tn_instrument(description)
+            else:
+                # No useful fallback — re-run loudly so the user sees the
+                # candidate list.
+                canonical = resolve_tn_instrument(instrument)
         if canonical is None:
             return 1
         if canonical != instrument:
@@ -965,7 +1141,15 @@ def main(argv: Optional[list[str]] = None) -> int:
     print()
 
     drawings = list_drawings()
-    roles = classify(drawings)
+    try:
+        roles = classify(drawings)
+    except RuntimeError as e:
+        # Hard-error on malformed blackout pairs: a misdrawn chart
+        # shouldn't be allowed to arm half a window. The H&S bundle
+        # isn't emitted either — easier for the operator to fix the
+        # chart and re-run from scratch than to half-arm + clean up.
+        print(f"ERROR: {e}", file=sys.stderr)
+        return 1
 
     # A skipped prep doesn't need a drawing — the bundle won't include
     # that alert and the entry doesn't require it. So drop the
@@ -1073,6 +1257,54 @@ def main(argv: Optional[list[str]] = None) -> int:
     print(f"# {len(manifest['alerts'])} alerts in manifest")
     print()
 
+    # Build a pause/resume bundle per blackout pair on the chart. Each
+    # bundle goes in its own sub-dir under the H&S out_dir so two
+    # windows on one chart don't collide on basenames.
+    # `pause_bundles` is a list of (blackout_pair, pause_manifest,
+    # pause_out_dir) tuples that the create_alerts loop below stacks
+    # onto the H&S alerts.
+    pause_bundles: list[tuple[tuple[dict, dict], dict, Path]] = []
+    if roles.blackout_pairs and trade_id:
+        print(f"# {len(roles.blackout_pairs)} blackout pair(s) on chart "
+              "— emitting pause/resume bundles")
+        for i, pair in enumerate(roles.blackout_pairs, start=1):
+            start_drawing, end_drawing = pair
+            start_iso = utc_iso(start_drawing["points"][0]["time"])
+            end_iso = utc_iso(end_drawing["points"][0]["time"])
+            print(f"#   pair {i}: {start_iso} → {end_iso}")
+            pause_dir = out_dir / f"pause-{i}"
+            pause_dir.mkdir(parents=True, exist_ok=True)
+            pause_spec_path = pause_dir / "_input-pause.yaml"
+            pause_spec = {
+                "trade_id": trade_id,
+                "instrument": instrument,
+                "account": account,
+                "broker": broker,
+                "start_time": start_iso,
+                "end_time": end_iso,
+                "reason": f"news:{instrument}-{start_iso}",
+            }
+            write_pause_spec(pause_spec, pause_spec_path)
+            try:
+                run_build_pause(pause_spec_path, pause_dir)
+            except (FileNotFoundError, RuntimeError) as e:
+                print(f"ERROR: build-pause failed for pair {i}: {e}", file=sys.stderr)
+                return 2
+            pause_manifest_path = pause_dir / "manifest.yaml"
+            if not pause_manifest_path.exists():
+                print(f"ERROR: no manifest at {pause_manifest_path}", file=sys.stderr)
+                return 3
+            pause_manifest = parse_manifest(pause_manifest_path.read_text())
+            pause_bundles.append((pair, pause_manifest, pause_dir))
+        print()
+    elif roles.blackout_pairs and not trade_id:
+        # build-trade emitted a manifest but without a trade_id — this
+        # is a defensive guard; the build-trade pipeline always stamps
+        # one today. Don't silently arm pauses with no trade key.
+        print("ERROR: have blackout pairs but H&S manifest has no trade_id; "
+              "refusing to arm pause bundle", file=sys.stderr)
+        return 3
+
     if not args.create_alerts:
         if args.dry_run:
             print("# --dry-run: skipping alert creation and webhook POSTs.")
@@ -1110,6 +1342,33 @@ def main(argv: Optional[list[str]] = None) -> int:
         spec_dict["name"] = entry["file"]
         spec_dict["message"] = signed_path.read_text()
         payloads.append(spec_dict)
+
+    # Stack pause-bundle alerts onto the H&S payloads. Each bundle was
+    # built with its own blackout_pair, so we pass that pair through
+    # to `build_alert_spec`. The signed YAML lives in the bundle's own
+    # sub-dir; tv_name is stamped `<trade_id>-pause-<id>` /
+    # `<trade_id>-resume-<id>` for chronological grouping with the
+    # parent trade's alerts.
+    for pair, pause_manifest, pause_dir in pause_bundles:
+        for entry in pause_manifest.get("alerts", []):
+            fname = entry["file"]
+            spec_dict = build_alert_spec(
+                entry, direction, roles, blackout_pair=pair
+            )
+            if spec_dict is None:
+                print(f"# skipping {fname} (no drawing mapping)")
+                continue
+            signed_path = pause_dir / fname
+            if not signed_path.exists():
+                print(f"# skipping {fname} (file missing)")
+                continue
+            role_slug = spec_dict["tv_name"]
+            spec_dict["tv_name"] = (
+                f"{trade_id}-{role_slug}" if trade_id else role_slug
+            )
+            spec_dict["name"] = entry["file"]
+            spec_dict["message"] = signed_path.read_text()
+            payloads.append(spec_dict)
 
     if not payloads:
         print("# nothing to post.")

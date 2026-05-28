@@ -72,6 +72,19 @@ const KV_NAMESPACE: &str = "TRADE_CONTROL_KV";
 /// pip size; works for most majors. JPY pairs / indices need an override.
 const DEFAULT_PIP_SIZE: f64 = 0.0001;
 
+/// Trim a rejected body for the error log. Bodies are cleartext YAML
+/// already (the wire format puts them in CF's request log too), so the
+/// exposure cost is zero — but we still cap length to keep one log line
+/// manageable. 800 chars covers a typical enter payload comfortably.
+fn body_excerpt(yaml: &str) -> String {
+    const MAX: usize = 800;
+    if yaml.len() <= MAX {
+        yaml.to_string()
+    } else {
+        format!("{}…[truncated {} bytes]", &yaml[..MAX], yaml.len() - MAX)
+    }
+}
+
 #[event(fetch)]
 pub async fn main(mut req: Request, env: Env, _ctx: Context) -> Result<Response> {
     tracing_console::ConsoleSubscriber::install();
@@ -117,7 +130,11 @@ pub async fn main(mut req: Request, env: Env, _ctx: Context) -> Result<Response>
     let verified = match parse_and_verify(&yaml, &key, now) {
         Ok(v) => v,
         Err(err) => {
-            console_error!("incoming rejected: {err}");
+            console_error!(
+                "incoming rejected: {err} | body_len={} body_excerpt={:?}",
+                yaml.len(),
+                body_excerpt(&yaml)
+            );
             return Response::error("rejected", 400);
         }
     };
@@ -160,6 +177,8 @@ pub async fn main(mut req: Request, env: Env, _ctx: Context) -> Result<Response>
         }
         Action::ClearPrep => return handle_clear_prep(&store, &verified, now).await,
         Action::ClearVeto => return handle_clear_veto(&store, &verified, now).await,
+        Action::Pause => return handle_pause(&store, &verified, now).await,
+        Action::Resume => return handle_resume(&store, &verified, now).await,
         _ => {}
     }
 
@@ -351,7 +370,13 @@ async fn run_action<B: Broker>(
             ))
         }
         Action::Veto => run_veto_with_broker(broker, store, verified, now).await,
-        Action::Status | Action::Unlock | Action::Prep | Action::ClearPrep | Action::ClearVeto => {
+        Action::Status
+        | Action::Unlock
+        | Action::Prep
+        | Action::ClearPrep
+        | Action::ClearVeto
+        | Action::Pause
+        | Action::Resume => {
             // Handled before broker dispatch; never reached here.
             unreachable!("non-broker actions handled before broker dispatch")
         }
@@ -365,6 +390,42 @@ async fn run_enter<B: Broker>(
     env: &Env,
     now: chrono::DateTime<chrono::Utc>,
 ) -> ActionResult {
+    // Blackout gate — if any pause for this trade_id is active, reject
+    // before doing any other work. Pauses are intentionally cheap to
+    // check (one prefix list on the trade's own keys) so they can sit
+    // ahead of the retry/cooldown/prep/veto chain. Trades minted
+    // without a `trade_id` (legacy single-shot entries) bypass this
+    // gate entirely — there's no key to look pauses up by.
+    if let Some(tid) = verified.intent.trade_id.as_deref() {
+        match store.list_pauses_for_trade(tid).await {
+            Ok(pauses) if !pauses.is_empty() => {
+                let blackouts: Vec<String> = pauses
+                    .iter()
+                    .map(|p| match &p.reason {
+                        Some(r) => format!("{}({r})", p.blackout_id),
+                        None => p.blackout_id.clone(),
+                    })
+                    .collect();
+                console_log!(
+                    "entry rejected: trade {tid} paused (active blackouts: {})",
+                    blackouts.join(", ")
+                );
+                return ActionResult::Rejected {
+                    response: Response::error("trade paused", 423),
+                    outcome: format!("rejected: paused [{}]", blackouts.join(",")),
+                };
+            }
+            Ok(_) => {}
+            Err(err) => {
+                console_error!("KV list_pauses_for_trade: {err}");
+                return ActionResult::Rejected {
+                    response: Response::error("state error", 500),
+                    outcome: "rejected: state-error".into(),
+                };
+            }
+        }
+    }
+
     // Retry gate — when the intent opts into multi-shot mode via
     // `max_retries`, the gate inspects prior attempts (cancel-and-
     // replace a still-pending one, reject a fresh placement when an
@@ -1076,6 +1137,78 @@ async fn handle_clear_veto(
         format!("veto-cleared: {name}")
     } else {
         format!("veto-cleared: {name} (noop)")
+    };
+    record_seen(store, verified, now, &outcome).await;
+    Response::ok("ok")
+}
+
+/// Handle the `pause` action: arm a blackout for `(trade_id, blackout_id)`.
+/// No broker work. The KV entry's TTL is keyed off `not_after` (plus a
+/// grace tail) so an orphaned pause from a dropped `resume` eventually
+/// ages out instead of pinning the trade forever. The matching `resume`
+/// is the authoritative clear.
+async fn handle_pause(
+    store: &KvStateStore,
+    verified: &incoming::Verified,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<Response> {
+    let Some(trade_id) = verified.intent.trade_id.as_deref() else {
+        return Response::error("pause requires `trade_id`", 400);
+    };
+    let Some(blackout_id) = verified.intent.blackout_id.as_deref() else {
+        return Response::error("pause requires `blackout_id`", 400);
+    };
+    // Safety TTL: the resume should clear this long before, but a
+    // dropped alert shouldn't pin the trade forever. Reuse the veto
+    // TTL math — `ttl_hours` may be absent (defaults to the bare
+    // floor below), but `not_after + grace` is always honoured so
+    // the pause survives at least the alert window.
+    let ttl_seconds = veto_ttl_seconds(0, verified.intent.not_after, now);
+    let reason = verified.intent.reason.as_deref();
+    if let Err(err) = store
+        .set_pause(trade_id, blackout_id, reason, now, ttl_seconds)
+        .await
+    {
+        console_error!("KV set_pause: {err}");
+        return Response::error("state error", 500);
+    }
+    console_log!(
+        "pause set: trade_id={trade_id} blackout_id={blackout_id} reason={:?}",
+        reason
+    );
+    let outcome = match reason {
+        Some(r) => format!("pause-set: {blackout_id} ({r})"),
+        None => format!("pause-set: {blackout_id}"),
+    };
+    record_seen(store, verified, now, &outcome).await;
+    Response::ok("ok")
+}
+
+/// Handle the `resume` action: clear a single `(trade_id, blackout_id)`
+/// pause. Sibling blackouts on the same trade survive.
+async fn handle_resume(
+    store: &KvStateStore,
+    verified: &incoming::Verified,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<Response> {
+    let Some(trade_id) = verified.intent.trade_id.as_deref() else {
+        return Response::error("resume requires `trade_id`", 400);
+    };
+    let Some(blackout_id) = verified.intent.blackout_id.as_deref() else {
+        return Response::error("resume requires `blackout_id`", 400);
+    };
+    let was = match store.clear_pause(trade_id, blackout_id).await {
+        Ok(b) => b,
+        Err(err) => {
+            console_error!("KV clear_pause: {err}");
+            return Response::error("state error", 500);
+        }
+    };
+    console_log!("resume: trade_id={trade_id} blackout_id={blackout_id} was_set={was}");
+    let outcome = if was {
+        format!("pause-cleared: {blackout_id}")
+    } else {
+        format!("pause-cleared: {blackout_id} (noop)")
     };
     record_seen(store, verified, now, &outcome).await;
     Response::ok("ok")

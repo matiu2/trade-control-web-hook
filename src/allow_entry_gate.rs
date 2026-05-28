@@ -161,6 +161,8 @@ mod tests {
             max_retries: trade_control_core::tunable::Tunable::Static(0),
             allow_entry: gate,
             needs_golden: false,
+            blackout_id: None,
+            reason: None,
         }
     }
 

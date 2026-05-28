@@ -562,7 +562,33 @@ mod tests {
                 recent_seen: Vec::new(),
                 preps: Vec::new(),
                 vetos: Vec::new(),
+                pauses: Vec::new(),
             })
+        }
+        async fn set_pause(
+            &self,
+            _trade_id: &str,
+            _blackout_id: &str,
+            _reason: Option<&str>,
+            _now: DateTime<Utc>,
+            _ttl_seconds: u64,
+        ) -> Result<(), StateError> {
+            Ok(())
+        }
+        async fn list_pauses_for_trade(
+            &self,
+            _trade_id: &str,
+        ) -> Result<Vec<trade_control_core::state::PauseEntry>, StateError> {
+            // The retry-gate tests never set a pause; an empty list keeps
+            // the existing gate semantics unchanged.
+            Ok(Vec::new())
+        }
+        async fn clear_pause(
+            &self,
+            _trade_id: &str,
+            _blackout_id: &str,
+        ) -> Result<bool, StateError> {
+            Ok(false)
         }
         async fn record_entry_attempt(&self, attempt: EntryAttempt) -> Result<(), StateError> {
             *self.record_calls.borrow_mut() += 1;
@@ -673,6 +699,8 @@ mod tests {
             max_retries,
             allow_entry: None,
             needs_golden: false,
+            blackout_id: None,
+            reason: None,
         }
     }
 

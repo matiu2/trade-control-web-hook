@@ -73,6 +73,13 @@ pub fn required_for_action(action: Action) -> &'static [&'static str] {
         Action::ClearVeto => &["name"],
         // `instrument` is already in `ALWAYS_REQUIRED`; nothing extra needed.
         Action::Status | Action::Unlock => &[],
+        // pause/resume require `trade_id` + `blackout_id`, but those
+        // aren't in `ALWAYS_REQUIRED` and the CLI's interactive
+        // questionnaire doesn't know how to mint them — they're only
+        // ever produced by `trade-control build-pause` from a PauseSpec.
+        // Listing nothing here means the questionnaire path won't
+        // prompt for them, matching how `enter` doesn't list `trade_id`.
+        Action::Pause | Action::Resume => &[],
     }
 }
 

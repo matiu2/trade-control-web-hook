@@ -498,6 +498,8 @@ mod tests {
             max_retries: crate::tunable::Tunable::Static(0),
             allow_entry: None,
             needs_golden: false,
+            blackout_id: None,
+            reason: None,
         }
     }
 

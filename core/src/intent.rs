@@ -460,6 +460,23 @@ pub struct Intent {
     /// rejected at validate time on other actions.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub needs_golden: bool,
+    /// Per-blackout id on `pause` / `resume` actions. Lets a single
+    /// `trade_id` carry multiple independent blackout windows
+    /// concurrently (e.g. NFP + central-bank decision on the same
+    /// trade): the pair-start sets `pause:<trade_id>:<blackout_id>`
+    /// and only its matching `resume` clears that one. Must be a
+    /// valid `trade_id`-shaped slug. Required on `pause` / `resume`;
+    /// ignored on other actions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blackout_id: Option<String>,
+    /// Free-form human-readable label for a `pause` (or any other
+    /// action that wants to record context). Surfaces in the seen
+    /// index outcome string so operators can answer "why is this
+    /// trade paused?" without cross-referencing chart drawings.
+    /// Optional; bounded length is enforced on the wire by the
+    /// general YAML body cap, not here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
 }
 
 /// Skip-serializing predicate for [`Intent::max_retries`]. Returns true
@@ -536,6 +553,14 @@ pub enum IntentValidationError {
     /// `ttl_hours` missing (i.e. defaulted to `Static(0)`) on a prep or
     /// veto action where it's required to set the KV flag's lifetime.
     MissingTtlHours,
+    /// `pause` / `resume` requires both `trade_id` (the parent setup)
+    /// and `blackout_id` (this specific window). Without `trade_id`
+    /// the worker can't key the KV entry; without `blackout_id` a
+    /// resume couldn't tell sibling blackouts apart.
+    MissingPauseFields,
+    /// `blackout_id` is shaped like a `trade_id` slug (lowercase
+    /// alphanumerics + hyphens) — reuses [`is_valid_trade_id`].
+    InvalidBlackoutId,
 }
 
 impl core::fmt::Display for IntentValidationError {
@@ -554,6 +579,13 @@ impl core::fmt::Display for IntentValidationError {
                 f.write_str("needs_golden is only valid on action: enter")
             }
             Self::MissingTtlHours => f.write_str("ttl_hours is required on prep / veto actions"),
+            Self::MissingPauseFields => {
+                f.write_str("pause / resume require both trade_id and blackout_id")
+            }
+            Self::InvalidBlackoutId => f.write_str(
+                "invalid blackout_id (same shape as trade_id: 1-64 chars of lowercase \
+                 alphanumerics + hyphens, no leading/trailing or consecutive hyphens)",
+            ),
         }
     }
 }
@@ -599,6 +631,21 @@ impl Intent {
             && is_default_ttl_hours(&self.ttl_hours)
         {
             return Err(IntentValidationError::MissingTtlHours);
+        }
+        // pause / resume: KV key is `pause:<trade_id>:<blackout_id>`,
+        // so both fields are load-bearing. Reuse the trade_id slug
+        // rules for blackout_id so the on-disk key segments stay
+        // predictable and url-safe.
+        if matches!(self.action, Action::Pause | Action::Resume) {
+            let Some(blackout) = self.blackout_id.as_deref() else {
+                return Err(IntentValidationError::MissingPauseFields);
+            };
+            if self.trade_id.is_none() {
+                return Err(IntentValidationError::MissingPauseFields);
+            }
+            if !is_valid_trade_id(blackout) {
+                return Err(IntentValidationError::InvalidBlackoutId);
+            }
         }
         Ok(())
     }
@@ -668,6 +715,15 @@ pub enum Action {
     ClearPrep,
     /// Clear a single instrument's veto flag.
     ClearVeto,
+    /// Arm a blackout window for a `trade_id` + `blackout_id` pair.
+    /// The `enter` gate rejects while any pause for the trade_id is
+    /// active. Used to suspend a setup across news events without
+    /// invalidating it. Paired with [`Action::Resume`] to clear.
+    Pause,
+    /// Clear the matching `pause:<trade_id>:<blackout_id>` entry. Both
+    /// halves of the pair carry the same `blackout_id` so multiple
+    /// concurrent blackouts on one trade don't clobber each other.
+    Resume,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
@@ -1484,6 +1540,98 @@ mod tests {
             intent.validate(),
             Err(IntentValidationError::InvalidTradeId)
         );
+    }
+
+    #[test]
+    fn intent_validate_pause_requires_trade_id_and_blackout_id() {
+        let base = "
+            v: 1
+            id: pause-1
+            not_after: \"2026-06-01T00:00:00Z\"
+            action: pause
+            instrument: EUR_USD
+        ";
+        // Missing both trade_id and blackout_id.
+        let intent: Intent = serde_yaml::from_str(base).unwrap();
+        assert_eq!(
+            intent.validate(),
+            Err(IntentValidationError::MissingPauseFields)
+        );
+
+        // Missing blackout_id only.
+        let yaml = format!("{base}\n            trade_id: eurusd-h-and-s-1");
+        let intent: Intent = serde_yaml::from_str(&yaml).unwrap();
+        assert_eq!(
+            intent.validate(),
+            Err(IntentValidationError::MissingPauseFields)
+        );
+
+        // Missing trade_id only.
+        let yaml = format!("{base}\n            blackout_id: nfp-2026-06-06");
+        let intent: Intent = serde_yaml::from_str(&yaml).unwrap();
+        assert_eq!(
+            intent.validate(),
+            Err(IntentValidationError::MissingPauseFields)
+        );
+    }
+
+    #[test]
+    fn intent_validate_pause_rejects_bad_blackout_id() {
+        let yaml = "
+            v: 1
+            id: pause-bad
+            not_after: \"2026-06-01T00:00:00Z\"
+            action: pause
+            instrument: EUR_USD
+            trade_id: eurusd-h-and-s-1
+            blackout_id: \"NFP 2026!\"
+        ";
+        let intent: Intent = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(
+            intent.validate(),
+            Err(IntentValidationError::InvalidBlackoutId)
+        );
+    }
+
+    #[test]
+    fn intent_validate_pause_accepts_well_shaped_pair() {
+        for action in ["pause", "resume"] {
+            let yaml = format!(
+                "
+                v: 1
+                id: pause-ok-{action}
+                not_after: \"2026-06-01T00:00:00Z\"
+                action: {action}
+                instrument: EUR_USD
+                trade_id: eurusd-h-and-s-1
+                blackout_id: nfp-2026-06-06
+                reason: news:USD-NFP
+            "
+            );
+            let intent: Intent = serde_yaml::from_str(&yaml).unwrap();
+            intent
+                .validate()
+                .unwrap_or_else(|e| panic!("{action} should validate, got {e:?}"));
+        }
+    }
+
+    #[test]
+    fn intent_pause_round_trips_through_yaml() {
+        let yaml = "
+            v: 1
+            id: pause-rt
+            not_after: \"2026-06-01T00:00:00Z\"
+            action: pause
+            instrument: EUR_USD
+            trade_id: eurusd-h-and-s-1
+            blackout_id: nfp-2026-06-06
+            reason: \"news:USD-NFP\"
+        ";
+        let intent: Intent = serde_yaml::from_str(yaml).unwrap();
+        let back = serde_yaml::to_string(&intent).unwrap();
+        assert!(back.contains("action: pause"));
+        assert!(back.contains("blackout_id: nfp-2026-06-06"));
+        assert!(back.contains("reason: news:USD-NFP"));
     }
 
     #[test]

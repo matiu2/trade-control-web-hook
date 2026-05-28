@@ -151,6 +151,42 @@ impl HasExpiry for EntryAttempt {
     }
 }
 
+/// One active "pause" row. A pause suspends `enter` actions for the
+/// parent `trade_id` until a matching
+/// [`Action::Resume`][crate::intent::Action::Resume] alert clears it.
+///
+/// Unlike veto/prep/cooldown the key is scoped by `trade_id` +
+/// `blackout_id` rather than `(account, instrument)` — `trade_id` is
+/// globally unique and a pause inherently targets one specific setup,
+/// not "every entry on this pair". Multiple concurrent blackouts on a
+/// single trade are allowed: `pause:<trade_id>:nfp` and
+/// `pause:<trade_id>:cb-rate-decision` coexist, each cleared by its
+/// own resume.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PauseEntry {
+    pub trade_id: String,
+    pub blackout_id: String,
+    /// Free-form human label (e.g. `"news:USD-NFP-2026-06-06"`)
+    /// surfaced on the seen-index outcome string so operators can
+    /// answer "why is this trade paused?" without inspecting chart
+    /// drawings.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    pub set_at: DateTime<Utc>,
+    /// Pauses don't auto-expire on a TTL — the matching `resume`
+    /// alert is the authoritative clear. We apply a long safety TTL
+    /// (driven by the alert's `not_after` window plus grace) so an
+    /// orphaned pause from a dropped `resume` eventually ages out
+    /// instead of pinning the trade forever.
+    pub expires_at: DateTime<Utc>,
+}
+
+impl HasExpiry for PauseEntry {
+    fn expires_at(&self) -> DateTime<Utc> {
+        self.expires_at
+    }
+}
+
 /// KV-key sentinel used in place of an account name when a veto is
 /// worker-global (no `account:` field on the intent). Picked because
 /// account names use kebab-case and never appear as a bare underscore,
@@ -174,6 +210,10 @@ pub struct Snapshot {
     pub preps: Vec<PrepEntry>,
     #[serde(default)]
     pub vetos: Vec<VetoEntry>,
+    /// Active blackout pauses across all trades. `default`-empty for
+    /// back-compat with snapshots serialised before the field landed.
+    #[serde(default)]
+    pub pauses: Vec<PauseEntry>,
 }
 
 /// Async storage interface. Implementations are `?Send` because the CF Worker
@@ -307,6 +347,38 @@ pub trait StateStore {
         account: Option<&str>,
         instrument: &str,
         name: &str,
+    ) -> impl Future<Output = Result<bool, StateError>>;
+
+    /// Set a blackout pause for `(trade_id, blackout_id)`. The
+    /// `enter` gate rejects while any pause for `trade_id` is active.
+    /// `ttl_seconds` is a safety net — the matching `resume` is the
+    /// authoritative clear. Refiring (same trade_id + blackout_id)
+    /// overwrites the prior entry, refreshing the TTL.
+    fn set_pause(
+        &self,
+        trade_id: &str,
+        blackout_id: &str,
+        reason: Option<&str>,
+        now: DateTime<Utc>,
+        ttl_seconds: u64,
+    ) -> impl Future<Output = Result<(), StateError>>;
+
+    /// Return all currently-active pauses for `trade_id`, in
+    /// unspecified order. The list is non-empty iff at least one
+    /// blackout window is active. The `enter` gate calls this and
+    /// rejects on any hit.
+    fn list_pauses_for_trade(
+        &self,
+        trade_id: &str,
+    ) -> impl Future<Output = Result<Vec<PauseEntry>, StateError>>;
+
+    /// Clear a single `(trade_id, blackout_id)` pause. Returns whether
+    /// it was set before. Siblings (different `blackout_id` on the
+    /// same trade) are untouched.
+    fn clear_pause(
+        &self,
+        trade_id: &str,
+        blackout_id: &str,
     ) -> impl Future<Output = Result<bool, StateError>>;
 
     /// Return a snapshot of active cooldowns and recent seen ids.
@@ -752,7 +824,54 @@ mod memstore {
                 recent_seen: Vec::new(),
                 preps: Vec::new(),
                 vetos: Vec::new(),
+                pauses: Vec::new(),
             })
+        }
+
+        async fn set_pause(
+            &self,
+            trade_id: &str,
+            blackout_id: &str,
+            reason: Option<&str>,
+            now: DateTime<Utc>,
+            ttl_seconds: u64,
+        ) -> Result<(), StateError> {
+            let key = format!("pause:{trade_id}:{blackout_id}");
+            let entry = PauseEntry {
+                trade_id: trade_id.to_string(),
+                blackout_id: blackout_id.to_string(),
+                reason: reason.map(str::to_string),
+                set_at: now,
+                expires_at: now + chrono::Duration::seconds(ttl_seconds as i64),
+            };
+            let body = serde_json::to_string(&entry)
+                .map_err(|e| StateError::Backend(format!("encode pause: {e}")))?;
+            self.put(key, body, ttl_seconds.max(MIN_TTL_SECONDS), now);
+            Ok(())
+        }
+
+        async fn list_pauses_for_trade(
+            &self,
+            trade_id: &str,
+        ) -> Result<Vec<PauseEntry>, StateError> {
+            let prefix = format!("pause:{trade_id}:");
+            let now = Utc::now();
+            let inner = self.inner.borrow();
+            let mut out = Vec::new();
+            for (key, (val, exp)) in inner.iter() {
+                if !key.starts_with(&prefix) || *exp <= now {
+                    continue;
+                }
+                let entry: PauseEntry = serde_json::from_str(val)
+                    .map_err(|e| StateError::Backend(format!("decode pause: {e}")))?;
+                out.push(entry);
+            }
+            Ok(out)
+        }
+
+        async fn clear_pause(&self, trade_id: &str, blackout_id: &str) -> Result<bool, StateError> {
+            let key = format!("pause:{trade_id}:{blackout_id}");
+            Ok(self.delete(&key))
         }
 
         async fn record_entry_attempt(&self, attempt: EntryAttempt) -> Result<(), StateError> {
@@ -1391,23 +1510,33 @@ mod tests {
                 expires_at: ts("2026-05-14T13:00:00Z"),
                 account: Some("oanda-reversals-demo".into()),
             }],
+            pauses: vec![PauseEntry {
+                trade_id: "eurusd-hs-1".into(),
+                blackout_id: "nfp-2026-06-06".into(),
+                reason: Some("news:USD-NFP".into()),
+                set_at: ts("2026-05-14T11:00:00Z"),
+                expires_at: ts("2026-05-15T11:00:00Z"),
+            }],
         };
         let yaml = serde_yaml::to_string(&snap).unwrap();
         assert!(yaml.contains("preps:"));
         assert!(yaml.contains("step: break-and-close"));
         assert!(yaml.contains("vetos:"));
         assert!(yaml.contains("name: news-window"));
+        assert!(yaml.contains("pauses:"));
+        assert!(yaml.contains("blackout_id: nfp-2026-06-06"));
     }
 
     #[test]
     fn snapshot_deserialises_without_new_sections_for_back_compat() {
         // Pre-existing serialised snapshots (e.g. in unit tests, or any
-        // stored copies) have no `preps:` / `vetos:` fields. Make sure
-        // they still parse — the new fields default to empty.
+        // stored copies) have no `preps:` / `vetos:` / `pauses:` fields.
+        // Make sure they still parse — the new fields default to empty.
         let yaml = "now: \"2026-05-14T12:00:00Z\"\ncooldowns: []\nrecent_seen: []\n";
         let snap: Snapshot = serde_yaml::from_str(yaml).unwrap();
         assert!(snap.preps.is_empty());
         assert!(snap.vetos.is_empty());
+        assert!(snap.pauses.is_empty());
     }
 
     #[test]
@@ -1638,6 +1767,80 @@ mod tests {
         assert!(!yaml.contains("broker_trade_id"));
         let parsed: EntryAttempt = serde_yaml::from_str(&yaml).unwrap();
         assert_eq!(parsed.broker_trade_id, None);
+    }
+
+    #[test]
+    fn memstore_pause_round_trip_lists_then_clears() {
+        use super::memstore::MemStateStore;
+        let store = MemStateStore::new();
+        let now = Utc::now();
+        pollster::block_on(store.set_pause(
+            "eurusd-hs-1",
+            "nfp-2026-06-06",
+            Some("news:USD-NFP"),
+            now,
+            6 * 3600,
+        ))
+        .unwrap();
+        let listed = pollster::block_on(store.list_pauses_for_trade("eurusd-hs-1")).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].blackout_id, "nfp-2026-06-06");
+        assert_eq!(listed[0].reason.as_deref(), Some("news:USD-NFP"));
+        let was = pollster::block_on(store.clear_pause("eurusd-hs-1", "nfp-2026-06-06")).unwrap();
+        assert!(was);
+        let listed = pollster::block_on(store.list_pauses_for_trade("eurusd-hs-1")).unwrap();
+        assert!(listed.is_empty());
+        // Clearing an absent pause is a no-op.
+        let was = pollster::block_on(store.clear_pause("eurusd-hs-1", "nfp-2026-06-06")).unwrap();
+        assert!(!was);
+    }
+
+    #[test]
+    fn memstore_pause_multiple_blackouts_per_trade() {
+        // Two concurrent blackouts on one trade (e.g. NFP + central-bank
+        // decision) must coexist. Clearing one leaves the other active —
+        // which is the whole point of the per-blackout_id scoping.
+        use super::memstore::MemStateStore;
+        let store = MemStateStore::new();
+        let now = Utc::now();
+        pollster::block_on(store.set_pause(
+            "eurusd-hs-1",
+            "nfp",
+            Some("news:USD-NFP"),
+            now,
+            6 * 3600,
+        ))
+        .unwrap();
+        pollster::block_on(store.set_pause(
+            "eurusd-hs-1",
+            "cb-rate",
+            Some("news:ECB-rate"),
+            now,
+            6 * 3600,
+        ))
+        .unwrap();
+        let listed = pollster::block_on(store.list_pauses_for_trade("eurusd-hs-1")).unwrap();
+        assert_eq!(listed.len(), 2);
+
+        // Clear only NFP — cb-rate must remain.
+        let was = pollster::block_on(store.clear_pause("eurusd-hs-1", "nfp")).unwrap();
+        assert!(was);
+        let listed = pollster::block_on(store.list_pauses_for_trade("eurusd-hs-1")).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].blackout_id, "cb-rate");
+    }
+
+    #[test]
+    fn memstore_pause_isolated_per_trade_id() {
+        // A pause on trade A must not be visible when querying trade B.
+        use super::memstore::MemStateStore;
+        let store = MemStateStore::new();
+        let now = Utc::now();
+        pollster::block_on(store.set_pause("trade-a", "b1", None, now, 6 * 3600)).unwrap();
+        let a = pollster::block_on(store.list_pauses_for_trade("trade-a")).unwrap();
+        let b = pollster::block_on(store.list_pauses_for_trade("trade-b")).unwrap();
+        assert_eq!(a.len(), 1);
+        assert!(b.is_empty());
     }
 
     #[test]
