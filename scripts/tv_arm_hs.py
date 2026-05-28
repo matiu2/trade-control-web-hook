@@ -73,6 +73,14 @@ BREAK_LABELS = {"neckline", "break-and-close"}
 # pair via `trade-control build-pause`.
 BLACKOUT_START_LABELS = {"blackout-start", "pause"}
 BLACKOUT_END_LABELS = {"blackout-end", "resume"}
+# News window markers. Like blackouts but independent: news windows
+# don't pause entries — they ENABLE a separate close-on-reversal alert
+# that flattens an open trade only while a known news event is in
+# play. Operator draws two vertical lines labelled `news-start` and
+# `news-end`; the script pairs them chronologically and shells out
+# to `trade-control build-news` for each pair.
+NEWS_START_LABELS = {"news-start"}
+NEWS_END_LABELS = {"news-end"}
 
 
 def tv(*args: str) -> dict:
@@ -115,6 +123,11 @@ class Roles:
     # count is a hard error — `classify()` raises before the bundle is
     # emitted so a misdrawn chart can't silently arm half a blackout.
     blackout_pairs: list[tuple[dict, dict]] = field(default_factory=list)
+    # News windows. Same shape as `blackout_pairs` but a separate
+    # namespace: news windows ENABLE the `06-close-on-reversal` alert
+    # rather than pausing entries. Populated from `news-start` /
+    # `news-end` vertical lines.
+    news_pairs: list[tuple[dict, dict]] = field(default_factory=list)
 
 
 def label_of(d: dict) -> str:
@@ -143,6 +156,8 @@ def classify(drawings: list[dict]) -> Roles:
     }
     blackout_starts: list[dict] = []
     blackout_ends: list[dict] = []
+    news_starts: list[dict] = []
+    news_ends: list[dict] = []
 
     for stub in drawings:
         d = get_drawing(stub["id"])
@@ -163,6 +178,10 @@ def classify(drawings: list[dict]) -> Roles:
             blackout_starts.append(d)
         elif kind == "vertical_line" and lbl in BLACKOUT_END_LABELS:
             blackout_ends.append(d)
+        elif kind == "vertical_line" and lbl in NEWS_START_LABELS:
+            news_starts.append(d)
+        elif kind == "vertical_line" and lbl in NEWS_END_LABELS:
+            news_ends.append(d)
 
     roles = Roles()
     for name in ("invalidation", "break_and_close", "retest", "tp_fib", "trade_expiry"):
@@ -185,30 +204,35 @@ def classify(drawings: list[dict]) -> Roles:
         elif name == "trade_expiry":
             roles.trade_expiry = chosen
 
-    roles.blackout_pairs = pair_blackouts(blackout_starts, blackout_ends)
+    roles.blackout_pairs = pair_vertical_lines(
+        blackout_starts, blackout_ends, kind="blackout"
+    )
+    roles.news_pairs = pair_vertical_lines(news_starts, news_ends, kind="news")
     return roles
 
 
-def pair_blackouts(
-    starts: list[dict], ends: list[dict]
+def pair_vertical_lines(
+    starts: list[dict], ends: list[dict], kind: str
 ) -> list[tuple[dict, dict]]:
-    """Pair start/end blackout lines chronologically.
+    """Pair start/end vertical lines chronologically.
 
     Sort each list by its anchor time (vertical lines have one point);
     pair them positionally. If the counts differ — i.e. an orphan
-    start or end — raise immediately. The matching `tv_arm_hs.py`
-    caller bails out before arming any alert (including the H&S
-    bundle) on this exception, mirroring how a misdrawn neckline
-    aborts the whole run.
+    start or end — raise immediately. The caller bails out before
+    arming any alert (including the H&S bundle), mirroring how a
+    misdrawn neckline aborts the whole run.
 
     Each pair must also have `start.time < end.time` — a reversed
     pair almost certainly means the operator mislabeled a line.
+
+    `kind` is the label used in error messages ("blackout" /
+    "news") so the operator knows which drawings to fix.
     """
     if len(starts) != len(ends):
         starts_desc = ", ".join(utc_iso(s["points"][0]["time"]) for s in starts)
         ends_desc = ", ".join(utc_iso(e["points"][0]["time"]) for e in ends)
         raise RuntimeError(
-            f"blackout lines must come in matched start/end pairs; "
+            f"{kind} lines must come in matched start/end pairs; "
             f"found {len(starts)} start(s) [{starts_desc}] and "
             f"{len(ends)} end(s) [{ends_desc}]. "
             "Fix the chart (add the missing line or relabel) and re-run."
@@ -219,10 +243,10 @@ def pair_blackouts(
     for i, (s, e) in enumerate(zip(starts_sorted, ends_sorted)):
         if s["points"][0]["time"] >= e["points"][0]["time"]:
             raise RuntimeError(
-                f"blackout pair #{i + 1} is reversed: "
+                f"{kind} pair #{i + 1} is reversed: "
                 f"start={utc_iso(s['points'][0]['time'])} is at or after "
                 f"end={utc_iso(e['points'][0]['time'])}. "
-                "Each blackout-start must precede its blackout-end."
+                f"Each {kind}-start must precede its {kind}-end."
             )
         pairs.append((s, e))
     return pairs
@@ -450,6 +474,49 @@ def write_pause_spec(spec: dict, path: Path) -> None:
     write_trade_spec(spec, path)
 
 
+def write_news_spec(spec: dict, path: Path) -> None:
+    """Emit a `news.yaml` that `build-news --from-file` accepts.
+
+    Kept distinct from `write_pause_spec` for the same reason its
+    pause sibling is distinct from `write_trade_spec` — schema drift
+    on one shape shouldn't silently land on another.
+    """
+    write_trade_spec(spec, path)
+
+
+def run_build_news(spec_path: Path, out_dir: Path) -> None:
+    """Shell out to `trade-control build-news` for one news window.
+
+    Each call emits two signed alerts (`01-news-start-<id>.yaml` and
+    `02-news-end-<id>.yaml`) plus a manifest into `out_dir`. Called
+    once per news pair, with a distinct `out_dir` per pair so
+    multiple windows on one chart don't overwrite each other.
+    """
+    binary = find_trade_control()
+    key = key_file()
+    result = subprocess.run(
+        [
+            binary, "build-news",
+            "--from-file", str(spec_path),
+            "--key-file", str(key),
+            "--output-dir", str(out_dir),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(
+            "trade-control build-news failed:\n"
+            f"  stderr: {result.stderr.strip()}\n"
+            f"  stdout: {result.stdout.strip()}"
+        )
+    if result.stdout.strip():
+        print(result.stdout.rstrip())
+    if result.stderr.strip():
+        print(result.stderr.rstrip(), file=sys.stderr)
+
+
 def run_build_pause(spec_path: Path, out_dir: Path) -> None:
     """Shell out to `trade-control build-pause` for one blackout window.
 
@@ -560,6 +627,7 @@ def build_alert_spec(
     direction: str,
     roles: Roles,
     blackout_pair: Optional[tuple[dict, dict]] = None,
+    news_pair: Optional[tuple[dict, dict]] = None,
 ) -> Optional[dict]:
     """Translate one manifest entry into the alert-payload shape the
     create_alerts JS expects. Returns None if the entry isn't postable
@@ -570,6 +638,12 @@ def build_alert_spec(
     alerts (`01-pause-*` / `02-resume-*`). Each pause-bundle manifest
     is processed independently — the caller pairs each manifest with
     the right `blackout_pair` before calling here.
+
+    `news_pair` plays the same role for news-bundle alerts
+    (`01-news-start-*` / `02-news-end-*`). The
+    `06-close-on-reversal` alert from the main trade bundle is
+    independently Pine-bound (no drawing) — it doesn't need
+    `news_pair`.
     """
     fname: str = manifest_entry["file"]
     base = fname.removesuffix(".yaml")
@@ -667,6 +741,37 @@ def build_alert_spec(
             "tv_name": tv_name,
         }
 
+    if base.startswith("01-news-start-"):
+        # News-bundle: armed by the news-start vertical line. Worker
+        # writes the `news:<trade_id>:<news_id>` KV entry, which the
+        # separate `06-close-on-reversal` alert checks at fire time.
+        if news_pair is None:
+            return None
+        start, _end = news_pair
+        return {
+            "kind": "drawing",
+            "drawing_id": start["entity_id"],
+            "tool": "LineToolVertLine",
+            "condition_type": "cross",
+            "frequency": "on_first_fire",
+            "auto_deactivate": False,
+            "tv_name": tv_name,
+        }
+
+    if base.startswith("02-news-end-"):
+        if news_pair is None:
+            return None
+        _start, end = news_pair
+        return {
+            "kind": "drawing",
+            "drawing_id": end["entity_id"],
+            "tool": "LineToolVertLine",
+            "condition_type": "cross",
+            "frequency": "on_first_fire",
+            "auto_deactivate": False,
+            "tv_name": tv_name,
+        }
+
     if base == "05-enter":
         # candle-signals v2 (2026-05-26+) has 10 plot()s
         # (plot_0..plot_9 — the 8 signal_* latches plus recent_high /
@@ -678,6 +783,23 @@ def build_alert_spec(
         # If the chart still has the OLD v2 (8 plots), this will fire
         # the wrong alert ID — re-add the indicator after a Pine update.
         plot_id = "plot_11" if direction == "short" else "plot_10"
+        return {
+            "kind": "pine_alertcondition",
+            "indicator_name": "Candle Signals",
+            "alert_cond_id": plot_id,
+            "frequency": "on_bar_close",
+            "auto_deactivate": False,
+            "tv_name": tv_name,
+        }
+
+    if base == "06-close-on-reversal":
+        # Same Pine study as `05-enter` but the OPPOSITE direction:
+        # if the trade is long we want to fire on a "Short Pattern"
+        # (a confirming bearish reversal candle); if short, on a
+        # "Long Pattern". The intent's `require_news_window: true`
+        # gates the worker's close — outside any active news window
+        # the alert lands but the worker rejects it.
+        plot_id = "plot_10" if direction == "short" else "plot_11"
         return {
             "kind": "pine_alertcondition",
             "indicator_name": "Candle Signals",
@@ -1036,6 +1158,17 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
              "Composes with --entry-filter-script (both must pass).",
     )
     p.add_argument(
+        "--close-on-reversal", dest="close_on_reversal", action="store_true",
+        help="Emit a 6th alert that closes the trade if an opposing "
+             "golden-reversal candle prints during an active news "
+             "window. Sets `close_on_news: true` on the trade spec; "
+             "build-trade emits `06-close-on-reversal.yaml` (Pine "
+             "alertcondition, opposite direction) and the worker only "
+             "honours it when `news:<trade_id>:*` KV is populated by "
+             "the matching `news-start` alert. Pair with `news-start` "
+             "and `news-end` vertical lines on the chart.",
+    )
+    p.add_argument(
         "--no-instrument-check", dest="no_instrument_check", action="store_true",
         help="Skip the TradeNation catalog lookup that maps the chart "
              "symbol (e.g. XAGUSD) to the broker's canonical name "
@@ -1077,6 +1210,7 @@ _tv_arm_hs() {
         '--skip-break-and-close[drop the break-and-close prep]'
         '--skip-retest[drop the retest prep]'
         '--require-golden[require golden candle on entry (needs_golden:true)]'
+        '--close-on-reversal[emit a 6th alert that closes the trade on an opposing golden reversal during news]'
         '--no-instrument-check[skip the TN catalog lookup for the chart symbol]'
         '--print-completions[print this zsh completion script and exit]'
         '(- *)'{-h,--help}'[show help and exit]'
@@ -1227,6 +1361,8 @@ def main(argv: Optional[list[str]] = None) -> int:
         spec["allow_entry"] = args.entry_filter_script
     if args.require_golden:
         spec["needs_golden"] = True
+    if args.close_on_reversal:
+        spec["close_on_news"] = True
     if args.entry_market:
         spec["entry_mode"] = "market"
     if args.sl_from_recent:
@@ -1305,6 +1441,55 @@ def main(argv: Optional[list[str]] = None) -> int:
               "refusing to arm pause bundle", file=sys.stderr)
         return 3
 
+    # News-window bundles. Parallel to pause_bundles but in their own
+    # KV namespace and tied to the close-on-reversal alert rather than
+    # entry gating. Operator opts in by drawing `news-start` /
+    # `news-end` vertical lines; the matching `06-close-on-reversal`
+    # alert in the trade bundle (when --close-on-reversal is set) is
+    # what acts on the window.
+    news_bundles: list[tuple[tuple[dict, dict], dict, Path]] = []
+    if roles.news_pairs and trade_id:
+        print(f"# {len(roles.news_pairs)} news pair(s) on chart "
+              "— emitting news-start/news-end bundles")
+        for i, pair in enumerate(roles.news_pairs, start=1):
+            start_drawing, end_drawing = pair
+            start_iso = utc_iso(start_drawing["points"][0]["time"])
+            end_iso = utc_iso(end_drawing["points"][0]["time"])
+            print(f"#   pair {i}: {start_iso} → {end_iso}")
+            news_dir = out_dir / f"news-{i}"
+            news_dir.mkdir(parents=True, exist_ok=True)
+            news_spec_path = news_dir / "_input-news.yaml"
+            news_spec = {
+                "trade_id": trade_id,
+                "instrument": instrument,
+                "account": account,
+                "broker": broker,
+                "start_time": start_iso,
+                "end_time": end_iso,
+                "reason": f"news:{instrument}-{start_iso}",
+            }
+            write_news_spec(news_spec, news_spec_path)
+            try:
+                run_build_news(news_spec_path, news_dir)
+            except (FileNotFoundError, RuntimeError) as e:
+                print(f"ERROR: build-news failed for pair {i}: {e}", file=sys.stderr)
+                return 2
+            news_manifest_path = news_dir / "manifest.yaml"
+            if not news_manifest_path.exists():
+                print(f"ERROR: no manifest at {news_manifest_path}", file=sys.stderr)
+                return 3
+            news_manifest = parse_manifest(news_manifest_path.read_text())
+            news_bundles.append((pair, news_manifest, news_dir))
+        if not args.close_on_reversal:
+            print("# WARN: news-* lines drawn but --close-on-reversal not set; "
+                  "the news windows will arm in the worker but nothing fires on "
+                  "them.", file=sys.stderr)
+        print()
+    elif roles.news_pairs and not trade_id:
+        print("ERROR: have news pairs but H&S manifest has no trade_id; "
+              "refusing to arm news bundle", file=sys.stderr)
+        return 3
+
     if not args.create_alerts:
         if args.dry_run:
             print("# --dry-run: skipping alert creation and webhook POSTs.")
@@ -1359,6 +1544,30 @@ def main(argv: Optional[list[str]] = None) -> int:
                 print(f"# skipping {fname} (no drawing mapping)")
                 continue
             signed_path = pause_dir / fname
+            if not signed_path.exists():
+                print(f"# skipping {fname} (file missing)")
+                continue
+            role_slug = spec_dict["tv_name"]
+            spec_dict["tv_name"] = (
+                f"{trade_id}-{role_slug}" if trade_id else role_slug
+            )
+            spec_dict["name"] = entry["file"]
+            spec_dict["message"] = signed_path.read_text()
+            payloads.append(spec_dict)
+
+    # Same flow for news-bundles. The mapping in `build_alert_spec`
+    # dispatches on basename prefix (`01-news-start-` / `02-news-end-`)
+    # and uses `news_pair` to anchor the vertical-line drawings.
+    for pair, news_manifest, news_dir in news_bundles:
+        for entry in news_manifest.get("alerts", []):
+            fname = entry["file"]
+            spec_dict = build_alert_spec(
+                entry, direction, roles, news_pair=pair
+            )
+            if spec_dict is None:
+                print(f"# skipping {fname} (no drawing mapping)")
+                continue
+            signed_path = news_dir / fname
             if not signed_path.exists():
                 print(f"# skipping {fname} (file missing)")
                 continue
