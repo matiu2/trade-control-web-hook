@@ -1,6 +1,7 @@
 mod accounts;
 mod admin;
 mod allow_entry_gate;
+mod cron;
 mod diag;
 mod retry_gate;
 mod state;
@@ -66,7 +67,7 @@ pub(crate) const SIGNING_KEY_SECRET: &str = "SIGNING_KEY";
 const MAX_RISK_PCT_PER_TRADE_SECRET: &str = "MAX_RISK_PCT_PER_TRADE";
 const MAX_OPEN_POSITIONS_SECRET: &str = "MAX_OPEN_POSITIONS";
 const PIP_SIZE_SECRET_PREFIX: &str = "PIP_SIZE_";
-const KV_NAMESPACE: &str = "TRADE_CONTROL_KV";
+pub(crate) const KV_NAMESPACE: &str = "TRADE_CONTROL_KV";
 
 /// Default pip size when no `PIP_SIZE_<INSTRUMENT>` secret is set. EUR_USD's
 /// pip size; works for most majors. JPY pairs / indices need an override.
@@ -684,6 +685,7 @@ async fn run_enter<B: Broker>(
                         attempt_no,
                         &order_id,
                         resolved.direction,
+                        resolved.stop_loss,
                     )
                     .await;
                 }

@@ -128,6 +128,28 @@ impl Broker for TradeNationAdapter {
                 CancelError::Transient
             })
     }
+
+    async fn get_current_price(&self, instrument: &str) -> Result<f64, LookupError> {
+        // Two hops: name → market_id, then market_id → (bid, ask).
+        // Upstream `latest_bid_ask` returns the most recent 1m bid/ask
+        // candle close as a (f64, f64) tuple; we return the mid.
+        let market = tradenation_api::resolve_market(self.0.client(), self.0.session(), instrument)
+            .await
+            .map_err(|err| {
+                console_error!("tn resolve_market({instrument}): {err:?}");
+                LookupError::Transient
+            })?;
+        let (bid, ask) = tradenation_api::latest_bid_ask(self.0.client(), market.market_id)
+            .await
+            .map_err(|err| {
+                console_error!(
+                    "tn latest_bid_ask({instrument}, market_id={}): {err:?}",
+                    market.market_id
+                );
+                LookupError::Transient
+            })?;
+        Ok((bid + ask) / 2.0)
+    }
 }
 
 fn to_upstream_risk(r: RiskBudget) -> broker_tradenation::RiskBudget {

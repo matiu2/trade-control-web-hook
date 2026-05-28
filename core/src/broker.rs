@@ -197,4 +197,15 @@ pub trait Broker {
         account_id: &str,
         broker_order_id: &str,
     ) -> impl Future<Output = Result<(), CancelError>>;
+
+    /// Fetch the current mid-market price for an instrument. Used by the
+    /// scheduled SL-breach sweep to decide if a still-pending stop-entry
+    /// order has been overtaken by price.
+    ///
+    /// Returns the mid of bid/ask for FX-style brokers. For brokers
+    /// without a quote endpoint, may use the most recent traded /
+    /// settlement price — the sweep only needs "good enough to detect a
+    /// breach", not tick-accurate execution price.
+    fn get_current_price(&self, instrument: &str)
+    -> impl Future<Output = Result<f64, LookupError>>;
 }

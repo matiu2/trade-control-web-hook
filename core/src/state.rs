@@ -118,7 +118,7 @@ pub struct VetoEntry {
 /// On OANDA `broker_trade_id` happens to equal `broker_order_id`; on
 /// TradeNation the trade id is the distinct PositionID. Don't assume
 /// identity in callers — always correlate via the stored field.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct EntryAttempt {
     pub trade_id: String,
     /// `None` for worker-global, `Some(name)` for account-scoped. Same
@@ -143,6 +143,13 @@ pub struct EntryAttempt {
     /// plus a grace period so the lookup window outlives the
     /// alert window itself.
     pub expires_at: DateTime<Utc>,
+    /// Resolved absolute stop-loss price at placement time. Used by the
+    /// scheduled SL-breach sweep to decide whether a still-pending order
+    /// has been overtaken by price. `None` on rows written before this
+    /// field existed — the sweep treats `None` as "skip" so legacy rows
+    /// expire normally.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop_loss_price: Option<f64>,
 }
 
 impl HasExpiry for EntryAttempt {
@@ -399,6 +406,24 @@ pub trait StateStore {
         account: Option<&str>,
         trade_id: &str,
     ) -> impl Future<Output = Result<Vec<EntryAttempt>, StateError>>;
+
+    /// Return every still-tracked entry attempt across all
+    /// `(account, trade_id)` groups, in unspecified order. Used by
+    /// the scheduled sweep to walk pending orders for SL-breach and
+    /// expiry checks.
+    fn list_all_entry_attempts(
+        &self,
+    ) -> impl Future<Output = Result<Vec<EntryAttempt>, StateError>>;
+
+    /// Delete a single `EntryAttempt` row by `(account, trade_id,
+    /// attempt_no)`. Used by the scheduled sweep after a successful
+    /// cancel. Best-effort: succeeds even if the row is already gone.
+    fn delete_entry_attempt(
+        &self,
+        account: Option<&str>,
+        trade_id: &str,
+        attempt_no: u32,
+    ) -> impl Future<Output = Result<(), StateError>>;
 
     /// Update a previously-recorded attempt with the broker's trade
     /// id, snapshotted lazily the first time the worker observes the
@@ -909,6 +934,29 @@ mod memstore {
                 && let Some(row) = list.iter_mut().find(|a| a.attempt_no == attempt_no)
             {
                 row.broker_trade_id = Some(broker_trade_id.to_string());
+            }
+            Ok(())
+        }
+
+        async fn list_all_entry_attempts(&self) -> Result<Vec<EntryAttempt>, StateError> {
+            Ok(self
+                .attempts
+                .borrow()
+                .values()
+                .flat_map(|list| list.iter().cloned())
+                .collect())
+        }
+
+        async fn delete_entry_attempt(
+            &self,
+            account: Option<&str>,
+            trade_id: &str,
+            attempt_no: u32,
+        ) -> Result<(), StateError> {
+            let scope = account_scope(account).to_string();
+            let key = (scope, trade_id.to_string());
+            if let Some(list) = self.attempts.borrow_mut().get_mut(&key) {
+                list.retain(|a| a.attempt_no != attempt_no);
             }
             Ok(())
         }
@@ -1614,6 +1662,7 @@ mod tests {
             placed_at: now,
             shell_time: now,
             expires_at: now + chrono::Duration::hours(24),
+            stop_loss_price: None,
         }
     }
 
@@ -1742,10 +1791,34 @@ mod tests {
             placed_at: now,
             shell_time: now,
             expires_at: now + chrono::Duration::hours(24),
+            stop_loss_price: Some(1.0500),
         };
         let yaml = serde_yaml::to_string(&a).unwrap();
         let parsed: EntryAttempt = serde_yaml::from_str(&yaml).unwrap();
         assert_eq!(parsed, a);
+    }
+
+    #[test]
+    fn entry_attempt_decodes_pre_stop_loss_json() {
+        // Pre-`stop_loss_price` serialised rows (everything written
+        // before the cron sweep landed) lack the field entirely. They
+        // must decode with `stop_loss_price = None` so the sweep
+        // treats them as "skip the breach check" and lets the row
+        // expire via TTL.
+        let json = r#"{
+            "trade_id":"eurusd-long-mr",
+            "account":"acct-a",
+            "instrument":"EUR_USD",
+            "attempt_no":1,
+            "broker_order_id":"ord-1",
+            "direction":"long",
+            "placed_at":"2026-05-20T10:00:00Z",
+            "shell_time":"2026-05-20T10:00:00Z",
+            "expires_at":"2026-05-21T10:00:00Z"
+        }"#;
+        let attempt: EntryAttempt = serde_json::from_str(json).unwrap();
+        assert!(attempt.stop_loss_price.is_none());
+        assert_eq!(attempt.broker_order_id, "ord-1");
     }
 
     #[test]
@@ -1762,6 +1835,7 @@ mod tests {
             placed_at: now,
             shell_time: now,
             expires_at: now + chrono::Duration::hours(24),
+            stop_loss_price: None,
         };
         let yaml = serde_yaml::to_string(&a).unwrap();
         assert!(!yaml.contains("broker_trade_id"));

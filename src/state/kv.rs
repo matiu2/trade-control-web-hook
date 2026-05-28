@@ -642,6 +642,63 @@ impl StateStore for KvStateStore {
         Ok(attempts)
     }
 
+    async fn list_all_entry_attempts(&self) -> Result<Vec<EntryAttempt>, StateError> {
+        // Walk every `entry_attempt:` row regardless of scope or
+        // trade_id — the scheduled sweep needs a global view. Same
+        // pagination shape as `list_entry_attempts`.
+        let prefix = "entry_attempt:";
+        let mut keys: Vec<String> = Vec::new();
+        let mut cursor: Option<String> = None;
+        loop {
+            let mut builder = self.store.list().prefix(prefix.to_string());
+            if let Some(c) = cursor.take() {
+                builder = builder.cursor(c);
+            }
+            let resp = builder
+                .execute()
+                .await
+                .map_err(|e| StateError::Backend(format!("list entry_attempt (all): {e:?}")))?;
+            keys.extend(resp.keys.into_iter().map(|k| k.name));
+            if resp.list_complete {
+                break;
+            }
+            match resp.cursor {
+                Some(c) => cursor = Some(c),
+                None => break,
+            }
+        }
+
+        let mut attempts: Vec<EntryAttempt> = Vec::with_capacity(keys.len());
+        for key in keys {
+            let raw = self
+                .store
+                .get(&key)
+                .text()
+                .await
+                .map_err(|e| StateError::Backend(format!("get {key}: {e:?}")))?;
+            let Some(text) = raw else { continue };
+            let attempt: EntryAttempt = serde_json::from_str(&text)
+                .map_err(|e| StateError::Backend(format!("decode {key}: {e}")))?;
+            attempts.push(attempt);
+        }
+        Ok(attempts)
+    }
+
+    async fn delete_entry_attempt(
+        &self,
+        account: Option<&str>,
+        trade_id: &str,
+        attempt_no: u32,
+    ) -> Result<(), StateError> {
+        let key = Self::entry_attempt_key(account, trade_id, attempt_no);
+        // Best-effort: KV delete is a no-op if the key is already gone.
+        self.store
+            .delete(&key)
+            .await
+            .map_err(|e| StateError::Backend(format!("delete entry_attempt: {e:?}")))?;
+        Ok(())
+    }
+
     async fn set_entry_attempt_broker_trade_id(
         &self,
         account: Option<&str>,

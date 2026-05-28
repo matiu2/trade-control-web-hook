@@ -288,6 +288,11 @@ pub async fn evaluate<B: Broker, S: StateStore>(
 /// are logged but never abort the request — the order is already on
 /// the broker, so the operator should hear "entered" even if the
 /// state-store didn't catch up.
+///
+/// `stop_loss_price` is the resolved absolute SL stamped onto the
+/// `EntryAttempt` so the scheduled SL-breach sweep can decide whether
+/// a still-pending order has been overtaken by price without
+/// re-resolving the intent.
 #[allow(clippy::too_many_arguments)]
 pub async fn record_placement<S: StateStore>(
     store: &S,
@@ -298,6 +303,7 @@ pub async fn record_placement<S: StateStore>(
     attempt_no: u32,
     broker_order_id: &str,
     direction: trade_control_core::intent::Direction,
+    stop_loss_price: f64,
 ) {
     let Some(trade_id) = intent.trade_id.as_deref() else {
         return;
@@ -320,6 +326,7 @@ pub async fn record_placement<S: StateStore>(
         placed_at: now,
         shell_time,
         expires_at,
+        stop_loss_price: Some(stop_loss_price),
     };
     if let Err(err) = store.record_entry_attempt(attempt).await {
         console_error!("KV record_entry_attempt: {err}");
@@ -431,6 +438,10 @@ mod tests {
                 CancelScript::Ok => Ok(()),
                 CancelScript::Err(e) => Err(e),
             }
+        }
+        async fn get_current_price(&self, _instrument: &str) -> Result<f64, LookupError> {
+            // Retry-gate tests don't exercise the sweep; not used here.
+            Err(LookupError::Transient)
         }
     }
 
@@ -652,6 +663,26 @@ mod tests {
             self.retry_fire_seen.borrow_mut().insert(key, ());
             Ok(())
         }
+        async fn list_all_entry_attempts(&self) -> Result<Vec<EntryAttempt>, StateError> {
+            Ok(self
+                .attempts
+                .borrow()
+                .values()
+                .flat_map(|list| list.iter().cloned())
+                .collect())
+        }
+        async fn delete_entry_attempt(
+            &self,
+            account: Option<&str>,
+            trade_id: &str,
+            attempt_no: u32,
+        ) -> Result<(), StateError> {
+            let key = Self::attempt_key(account, trade_id);
+            if let Some(list) = self.attempts.borrow_mut().get_mut(&key) {
+                list.retain(|a| a.attempt_no != attempt_no);
+            }
+            Ok(())
+        }
     }
 
     fn ts(s: &str) -> DateTime<Utc> {
@@ -829,6 +860,7 @@ mod tests {
             1,
             "order-1",
             Direction::Long,
+            1.05,
         ));
 
         // 2nd fire on the same shell bar — 409.
@@ -855,6 +887,7 @@ mod tests {
             1,
             "order-1",
             Direction::Long,
+            1.05,
         ));
 
         broker.push_lookup(AttemptState::Pending);
@@ -885,6 +918,7 @@ mod tests {
             1,
             "order-1",
             Direction::Long,
+            1.05,
         ));
 
         broker.push_lookup(AttemptState::Pending);
@@ -921,6 +955,7 @@ mod tests {
             1,
             "order-1",
             Direction::Long,
+            1.05,
         ));
 
         broker.push_lookup(AttemptState::OpenPosition {
@@ -956,6 +991,7 @@ mod tests {
                 1,
                 "order-1",
                 Direction::Long,
+                1.05,
             ));
             broker.push_lookup(state.clone());
 
@@ -984,6 +1020,7 @@ mod tests {
                 n,
                 &format!("order-{n}"),
                 Direction::Long,
+                1.05,
             ));
             // All three are collapsed so we walk past them.
             broker.push_lookup(AttemptState::Cancelled);
@@ -1010,6 +1047,7 @@ mod tests {
             1,
             "order-1",
             Direction::Long,
+            1.05,
         ));
         broker.push_lookup_err();
 

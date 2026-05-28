@@ -17,3 +17,8 @@ enabled = true
 [[kv_namespaces]]
 binding = "TRADE_CONTROL_KV"
 id = "e4f27179248e451daf8cf68a98c47e5b"
+
+# Scheduled (cron) trigger. Fires the `scheduled` event in `src/cron.rs`
+# which sweeps pending broker orders for expiry + SL-breach.
+[[triggers.crons]]
+cron = "*/15 * * * *"

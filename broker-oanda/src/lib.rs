@@ -13,7 +13,8 @@ pub use oanda::OANDA_ACCOUNT_ID;
 
 use oanda::{
     cancel_order as cancel_order_impl, cancel_pending_for_instrument, close_positions,
-    login as login_client, lookup_attempt_state as lookup_attempt_state_impl, place_entry,
+    get_current_price as get_current_price_impl, login as login_client,
+    lookup_attempt_state as lookup_attempt_state_impl, place_entry,
 };
 use oanda_client::OandaClient;
 use trade_control_core::broker::{
@@ -80,6 +81,10 @@ impl Broker for OandaBroker {
         // The trait still takes it because TradeNation may want to
         // pass per-call account context one day.
         cancel_order_impl(&self.client, &self.account_id, broker_order_id).await
+    }
+
+    async fn get_current_price(&self, instrument: &str) -> Result<f64, LookupError> {
+        get_current_price_impl(&self.client, &self.account_id, instrument).await
     }
 }
 

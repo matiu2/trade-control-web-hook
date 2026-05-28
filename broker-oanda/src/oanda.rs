@@ -395,6 +395,30 @@ pub async fn cancel_order(
         })
 }
 
+/// Fetch the mid-market price for `instrument` via OANDA's pricing
+/// endpoint. Used by the scheduled SL-breach sweep.
+pub async fn get_current_price(
+    client: &OandaClient,
+    account_id: &str,
+    instrument: &str,
+) -> Result<f64, LookupError> {
+    let pricing = client
+        .get_pricing(account_id, &[instrument])
+        .await
+        .map_err(|err| {
+            console_error!("oanda get_pricing({instrument}): {err:?}");
+            LookupError::Transient
+        })?;
+    let tick = pricing.prices.first().ok_or_else(|| {
+        console_error!("oanda get_pricing({instrument}): empty prices array");
+        LookupError::Transient
+    })?;
+    tick.mid().ok_or_else(|| {
+        console_error!("oanda get_pricing({instrument}): missing bid or ask");
+        LookupError::Transient
+    })
+}
+
 /// Pure helper running the four-step algorithm against pre-fetched
 /// data. Split out from [`lookup_attempt_state`] so unit tests can
 /// exercise every branch without needing a live OANDA client.
