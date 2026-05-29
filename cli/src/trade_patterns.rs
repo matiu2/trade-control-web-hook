@@ -26,6 +26,7 @@ use dialoguer::theme::ColorfulTheme;
 use dialoguer::{FuzzySelect, Input};
 use serde::{Deserialize, Serialize};
 
+use trade_control_conventions::AlertBasename;
 use trade_control_core::intent::{
     Action, BrokerKind, Direction, EntrySpec, Intent, PriceAnchor, PriceRef, TakeProfit, VetoLevel,
 };
@@ -932,8 +933,18 @@ fn build_invalidation_alert(
     intent.ttl_hours =
         trade_control_core::tunable::Tunable::Static(ttl_hours_until(now, veto_expiry));
     intent.level = Some(VetoLevel::ClosePositions);
+    let basename = match veto_name {
+        "too-high" => AlertBasename::VetoTooHigh.as_str().into_owned(),
+        "too-low" => AlertBasename::VetoTooLow.as_str().into_owned(),
+        // Defensive: PatternGeometry only ever picks too-high/too-low
+        // today, so this branch is unreachable in practice. Falling
+        // back to the literal format preserves the previous behaviour
+        // if a future pattern introduces a new veto label without
+        // updating the conventions crate.
+        other => format!("01-veto-{other}"),
+    };
     BuiltAlert {
-        basename: format!("01-veto-{veto_name}"),
+        basename,
         purpose: format!("veto: {veto_name} (close positions if price runs past invalidation)"),
         intent,
     }
@@ -964,7 +975,7 @@ fn build_trade_expiry_alert(
         trade_control_core::tunable::Tunable::Static(ttl_hours_until(now, veto_expiry));
     intent.level = Some(VetoLevel::ClosePositions);
     BuiltAlert {
-        basename: "02-veto-trade-expiry".into(),
+        basename: AlertBasename::VetoTradeExpiry.as_str().into_owned(),
         purpose: "veto: trade-expiry (time-fired close-positions at wall-clock expiry)".into(),
         intent,
     }
@@ -995,7 +1006,7 @@ fn build_break_and_close_alert(
     // from a prior, abandoned setup on the same instrument.
     intent.clears = vec!["retest".into()];
     BuiltAlert {
-        basename: "03-prep-break-and-close".into(),
+        basename: AlertBasename::PrepBreakAndClose.as_str().into_owned(),
         purpose: "prep: break-and-close (close beyond neckline; clears stale retest)".into(),
         intent,
     }
@@ -1023,7 +1034,7 @@ fn build_retest_alert(
     intent.ttl_hours =
         trade_control_core::tunable::Tunable::Static(ttl_hours_until(now, trade_expiry));
     BuiltAlert {
-        basename: "04-prep-retest".into(),
+        basename: AlertBasename::PrepRetest.as_str().into_owned(),
         purpose: "prep: retest (price returns to neckline; gates entry)".into(),
         intent,
     }
@@ -1103,7 +1114,7 @@ fn build_enter_alert(
         "trade-expiry".into(),
     ];
     BuiltAlert {
-        basename: "05-enter".into(),
+        basename: AlertBasename::Enter.as_str().into_owned(),
         purpose: "enter: stop-entry gated by both preps + both vetos".into(),
         intent,
     }
@@ -1137,7 +1148,7 @@ fn build_close_on_reversal_alert(
     intent.require_news_window = Some(true);
     intent.reason = Some("news-window reversal".into());
     BuiltAlert {
-        basename: "06-close-on-reversal".into(),
+        basename: AlertBasename::CloseOnReversal.as_str().into_owned(),
         purpose:
             "close: opposing golden reversal candle, gated on an active news window for this trade"
                 .into(),

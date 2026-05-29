@@ -30,6 +30,7 @@ use chrono::{DateTime, Duration, Utc};
 use color_eyre::eyre::{Context, Result, eyre};
 use serde::{Deserialize, Serialize};
 
+use trade_control_conventions::AlertBasename;
 use trade_control_core::intent::{Action, BrokerKind, Intent, is_valid_trade_id};
 use trade_control_core::sig::KEY_LEN;
 
@@ -184,12 +185,16 @@ pub fn build_pause_from_spec(spec: PauseSpec, now: DateTime<Utc>) -> Result<Buil
     };
     let alerts = vec![
         BuiltPauseAlert {
-            basename: format!("01-pause-{blackout_id}"),
+            basename: AlertBasename::PauseStart(blackout_id.clone())
+                .as_str()
+                .into_owned(),
             purpose: format!("pause: arm blackout {blackout_id}{purpose_suffix}"),
             intent: pause_intent,
         },
         BuiltPauseAlert {
-            basename: format!("02-resume-{blackout_id}"),
+            basename: AlertBasename::PauseResume(blackout_id.clone())
+                .as_str()
+                .into_owned(),
             purpose: format!("resume: clear blackout {blackout_id}{purpose_suffix}"),
             intent: resume_intent,
         },

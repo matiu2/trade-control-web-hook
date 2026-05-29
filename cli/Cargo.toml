@@ -23,6 +23,7 @@ serde_yaml = "0.9.34"
 tokio = { version = "1.52.3", features = ["rt", "rt-multi-thread", "macros"] }
 tracing = "0.1.44"
 trade-calendar-maker = { version = "0.1.0", path = "../../../trade-calendar-maker" }
+trade-control-conventions = { version = "0.1.0", path = "../conventions" }
 trade-control-core = { version = "0.1.0", path = "../core", features = ["cli"] }
 tradenation-api = { git = "https://github.com/matiu2/tradenation-api.git", branch = "main", version = "0.1.0" }
 tradenation-instrument-cache = { git = "https://github.com/matiu2/tradenation-api.git", branch = "main", version = "0.1.0" }

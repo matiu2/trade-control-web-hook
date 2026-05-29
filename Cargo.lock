@@ -3291,10 +3291,15 @@ dependencies = [
  "tokio",
  "tracing",
  "trade-calendar-maker",
+ "trade-control-conventions",
  "trade-control-core",
  "tradenation-api 0.1.0 (git+https://github.com/matiu2/tradenation-api.git?branch=main)",
  "tradenation-instrument-cache",
 ]
+
+[[package]]
+name = "trade-control-conventions"
+version = "0.1.0"
 
 [[package]]
 name = "trade-control-core"

@@ -25,6 +25,7 @@ use chrono::{DateTime, Duration, Utc};
 use color_eyre::eyre::{Context, Result, eyre};
 use serde::{Deserialize, Serialize};
 
+use trade_control_conventions::AlertBasename;
 use trade_control_core::intent::{Action, BrokerKind, Intent, is_valid_trade_id};
 use trade_control_core::sig::KEY_LEN;
 
@@ -173,12 +174,16 @@ pub fn build_news_from_spec(spec: NewsSpec, now: DateTime<Utc>) -> Result<BuiltN
     };
     let alerts = vec![
         BuiltNewsAlert {
-            basename: format!("01-news-start-{news_id}"),
+            basename: AlertBasename::NewsStart(news_id.clone())
+                .as_str()
+                .into_owned(),
             purpose: format!("news-start: arm window {news_id}{purpose_suffix}"),
             intent: start_intent,
         },
         BuiltNewsAlert {
-            basename: format!("02-news-end-{news_id}"),
+            basename: AlertBasename::NewsEnd(news_id.clone())
+                .as_str()
+                .into_owned(),
             purpose: format!("news-end: clear window {news_id}{purpose_suffix}"),
             intent: end_intent,
         },
