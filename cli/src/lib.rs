@@ -44,9 +44,10 @@ pub use script_validator::{ScriptError, validate as validate_intent_scripts};
 pub use templates::{discover_templates, pick_template_interactive, templates_root};
 pub use trade_control_core::sig::KEY_LEN;
 pub use trade_patterns::{
-    BuiltAlert, BuiltTrade, TradePattern, TradeSpec, build_trade_from_spec,
+    BuiltAlert, BuiltTrade, EntryMode, TradePattern, TradeSpec, build_trade_from_spec,
     build_trade_interactive, load_spec_from_file, pick_pattern_interactive, write_trade,
 };
+pub use trade_control_core::intent::{BrokerKind, PriceAnchor};
 
 /// Generate a fresh 32-byte signing key as 64 hex chars, using the OS RNG.
 pub fn generate_key_hex() -> String {

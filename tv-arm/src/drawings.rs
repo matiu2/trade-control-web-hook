@@ -50,12 +50,20 @@ pub struct DrawingStub {
 }
 
 /// A fully-detailed drawing from `draw get <id>`.
+///
+/// `draw list` returns each stub with an `id` field, but `draw get`
+/// returns the same drawing with `entity_id`. `serde(alias)` accepts
+/// either spelling so this struct works for both shapes.
 #[derive(Debug, Clone, Deserialize, PartialEq)]
 pub struct Drawing {
     /// tv-mcp's opaque drawing ID.
+    #[serde(alias = "entity_id")]
     pub id: String,
     /// Anchor points. One for horizontal/vertical lines; two for
-    /// trend lines and fibs.
+    /// trend lines and fibs. Some drawing kinds (`long_position`,
+    /// risk-reward tools) emit no points at all — `default` keeps
+    /// the parse from failing on those.
+    #[serde(default)]
     pub points: Vec<Point>,
     /// Drawing properties — notably `text` for role labels.
     #[serde(default)]

@@ -7,25 +7,33 @@
 //! and alert-spec dispatch live here; the signing layer is delegated
 //! to the `trade-control-cli` crate as a library.
 
-// Phase 3 port in progress — each module lands ahead of its consumer
-// (`pipeline.rs`), so the pure-logic modules look dead until the
-// orchestrator wires them up. Remove this allow when `pipeline.rs`
-// lands.
+// Some library-style helpers (`horizontal_price`, `Manifest::trade_id`,
+// `DrawShapeResult.shape`/`.entity_id`, etc.) aren't consumed by the
+// current pipeline but are public API for downstream tools; suppress
+// the dead-code warnings rather than dropping useful surface.
 #![allow(dead_code)]
 
+use std::process::ExitCode;
+
+use clap::{CommandFactory, Parser};
+use clap_complete::{Shell, generate};
 use color_eyre::eyre::Result;
 
 mod alert_spec;
+mod args;
 mod create_alerts;
 mod drawings;
 mod geometry;
 mod manifest;
 mod pair_lines;
+mod pipeline;
 mod roles;
 mod timeframe;
 mod tv_mcp;
 
-fn main() -> Result<()> {
+use crate::args::Args;
+
+fn main() -> Result<ExitCode> {
     color_eyre::install()?;
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -34,6 +42,15 @@ fn main() -> Result<()> {
         )
         .init();
 
-    println!("tv-arm — port of tv_arm_hs.py in progress. See plan file.");
-    Ok(())
+    let parsed = Args::parse();
+
+    if parsed.print_completions {
+        let mut cmd = Args::command();
+        let name = cmd.get_name().to_string();
+        generate(Shell::Zsh, &mut cmd, name, &mut std::io::stdout());
+        return Ok(ExitCode::SUCCESS);
+    }
+
+    let code = pipeline::run(parsed)?;
+    Ok(ExitCode::from(code as u8))
 }

@@ -97,6 +97,47 @@ impl TvMcp {
     pub fn get_state(&self) -> Result<ChartState> {
         self.call_json(&["state"])
     }
+
+    /// Draw a vertical line on the chart anchored at `time` (UNIX
+    /// seconds), labeled with `text`. Returns the new drawing's
+    /// entity-id so the caller can verify it landed.
+    ///
+    /// `price` doesn't matter for vertical lines (TV ignores it for
+    /// alert evaluation) but the CLI requires a value — pass any
+    /// non-NaN number such as the current bid mid.
+    pub fn draw_vertical_line(&self, time: i64, price: f64, text: &str) -> Result<DrawShapeResult> {
+        self.call_json(&[
+            "draw",
+            "shape",
+            "-t",
+            "vertical_line",
+            "--time",
+            &time.to_string(),
+            "-p",
+            &price.to_string(),
+            "--text",
+            text,
+        ])
+    }
+}
+
+/// Result of `tv-mcp draw shape`. The CLI returns `{success, shape,
+/// entity_id}` on success and `{success: false, error: "..."}` on
+/// failure — both are normalized here so the caller can check
+/// `success` once.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct DrawShapeResult {
+    /// Whether the shape landed on the chart.
+    pub success: bool,
+    /// The shape kind that was drawn (echoed from the input).
+    #[serde(default)]
+    pub shape: Option<String>,
+    /// tv-mcp's opaque ID of the new drawing.
+    #[serde(default)]
+    pub entity_id: Option<String>,
+    /// Error message when `success: false`.
+    #[serde(default)]
+    pub error: Option<String>,
 }
 
 impl Default for TvMcp {
