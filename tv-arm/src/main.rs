@@ -15,6 +15,8 @@
 
 use color_eyre::eyre::Result;
 
+mod alert_spec;
+mod create_alerts;
 mod drawings;
 mod geometry;
 mod manifest;
