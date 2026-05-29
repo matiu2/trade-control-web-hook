@@ -488,6 +488,16 @@ pub struct Intent {
     /// rejected at validate time on other actions.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub require_news_window: Option<bool>,
+    /// On `close` intents, gate the close on the current broker price
+    /// falling inside at least one `[lo, hi]` band. The worker fetches
+    /// the current price at dispatch and rejects with 423 if it sits
+    /// outside every band. Lets an opposing-direction reversal alert
+    /// flatten a trade only when price is near a user-marked
+    /// support/resistance level — the same candle elsewhere is
+    /// ignored. Default-absent = no range gate. Only meaningful on
+    /// `Action::Close`; rejected at validate time on other actions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub require_price_in_ranges: Option<Vec<[f64; 2]>>,
     /// Free-form human-readable label for a `pause` (or any other
     /// action that wants to record context). Surfaces in the seen
     /// index outcome string so operators can answer "why is this
@@ -591,6 +601,13 @@ pub enum IntentValidationError {
     /// `require_news_window: Some(_)` on a non-Close action — the gate
     /// is only checked on `close`.
     RequireNewsWindowOnNonClose,
+    /// `require_price_in_ranges: Some(_)` on a non-Close action — the
+    /// gate is only checked on `close`.
+    RequirePriceInRangesOnNonClose,
+    /// `require_price_in_ranges: Some(ranges)` is empty or contains a
+    /// band where `lo > hi`. An empty list means "never matches" and
+    /// is almost certainly a builder bug; a flipped band is the same.
+    InvalidPriceRanges,
 }
 
 impl core::fmt::Display for IntentValidationError {
@@ -626,6 +643,12 @@ impl core::fmt::Display for IntentValidationError {
             Self::RequireNewsWindowOnNonClose => {
                 f.write_str("require_news_window is only valid on action: close")
             }
+            Self::RequirePriceInRangesOnNonClose => {
+                f.write_str("require_price_in_ranges is only valid on action: close")
+            }
+            Self::InvalidPriceRanges => f.write_str(
+                "require_price_in_ranges must be non-empty and every band must have lo <= hi",
+            ),
         }
     }
 }
@@ -704,6 +727,17 @@ impl Intent {
         // it on other actions catches operator/template mistakes early.
         if self.require_news_window.is_some() && self.action != Action::Close {
             return Err(IntentValidationError::RequireNewsWindowOnNonClose);
+        }
+        // require_price_in_ranges: same close-only rule. Also reject
+        // an empty list (never matches → silent dead alert) and any
+        // band where lo > hi (builder bug).
+        if let Some(ranges) = &self.require_price_in_ranges {
+            if self.action != Action::Close {
+                return Err(IntentValidationError::RequirePriceInRangesOnNonClose);
+            }
+            if ranges.is_empty() || ranges.iter().any(|[lo, hi]| lo > hi) {
+                return Err(IntentValidationError::InvalidPriceRanges);
+            }
         }
         Ok(())
     }
@@ -1818,6 +1852,98 @@ mod tests {
             intent.validate(),
             Err(IntentValidationError::RequireNewsWindowOnNonClose)
         );
+    }
+
+    #[test]
+    fn intent_validate_require_price_in_ranges_only_on_close() {
+        // OK on close.
+        let yaml = "
+            v: 1
+            id: c-pr-1
+            not_after: \"2026-06-01T00:00:00Z\"
+            action: close
+            instrument: EUR_USD
+            trade_id: eurusd-h-and-s-1
+            require_price_in_ranges:
+              - [1.0950, 1.0970]
+              - [1.1000, 1.1020]
+        ";
+        let intent: Intent = serde_yaml::from_str(yaml).unwrap();
+        intent
+            .validate()
+            .expect("close + require_price_in_ranges valid");
+
+        // Rejected on non-close.
+        let yaml = "
+            v: 1
+            id: s-pr-1
+            not_after: \"2026-06-01T00:00:00Z\"
+            action: status
+            instrument: EUR_USD
+            require_price_in_ranges:
+              - [1.0, 2.0]
+        ";
+        let intent: Intent = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(
+            intent.validate(),
+            Err(IntentValidationError::RequirePriceInRangesOnNonClose)
+        );
+    }
+
+    #[test]
+    fn intent_validate_rejects_empty_or_flipped_price_ranges() {
+        // Empty list.
+        let yaml = "
+            v: 1
+            id: c-pr-2
+            not_after: \"2026-06-01T00:00:00Z\"
+            action: close
+            instrument: EUR_USD
+            trade_id: t-1
+            require_price_in_ranges: []
+        ";
+        let intent: Intent = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(
+            intent.validate(),
+            Err(IntentValidationError::InvalidPriceRanges)
+        );
+
+        // Flipped band (lo > hi).
+        let yaml = "
+            v: 1
+            id: c-pr-3
+            not_after: \"2026-06-01T00:00:00Z\"
+            action: close
+            instrument: EUR_USD
+            trade_id: t-1
+            require_price_in_ranges:
+              - [1.2, 1.1]
+        ";
+        let intent: Intent = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(
+            intent.validate(),
+            Err(IntentValidationError::InvalidPriceRanges)
+        );
+    }
+
+    #[test]
+    fn require_price_in_ranges_round_trips_through_yaml() {
+        let yaml = "
+            v: 1
+            id: c-pr-4
+            not_after: \"2026-06-01T00:00:00Z\"
+            action: close
+            instrument: EUR_USD
+            trade_id: t-1
+            require_price_in_ranges:
+              - [1.0950, 1.0970]
+              - [1.1000, 1.1020]
+        ";
+        let intent: Intent = serde_yaml::from_str(yaml).unwrap();
+        let back = serde_yaml::to_string(&intent).unwrap();
+        assert!(back.contains("require_price_in_ranges:"));
+        assert!(back.contains("1.095"));
+        assert!(back.contains("1.102"));
     }
 
     #[test]

@@ -240,6 +240,7 @@ fn build_news_intent(
         blackout_id: None,
         news_id: Some(news_id.to_string()),
         require_news_window: None,
+        require_price_in_ranges: None,
         reason: spec.reason.clone(),
     }
 }

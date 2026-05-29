@@ -81,6 +81,13 @@ BLACKOUT_END_LABELS = {"blackout-end", "resume"}
 # to `trade-control build-news` for each pair.
 NEWS_START_LABELS = {"news-start"}
 NEWS_END_LABELS = {"news-end"}
+# Support / resistance levels for the price-band reversal close.
+# Each horizontal line labelled with one of these becomes a band
+# [price - pct, price + pct] around its price; the worker rejects
+# the 07-close-on-sr-reversal alert unless the current broker price
+# is inside at least one band. Operator draws multiple lines (one per
+# level); the bands are unioned.
+SR_LEVEL_LABELS = {"support", "resistance"}
 
 
 def infer_calendar_timeframe(resolution: str) -> Optional[str]:
@@ -161,6 +168,14 @@ class Roles:
     # rather than pausing entries. Populated from `news-start` /
     # `news-end` vertical lines.
     news_pairs: list[tuple[dict, dict]] = field(default_factory=list)
+    # Support / resistance levels for the `07-close-on-sr-reversal`
+    # alert. Each entry is a single horizontal-line drawing labelled
+    # `support` or `resistance`; the build step expands each price into
+    # an `[lo, hi]` band using `--reversal-band-pct`. Empty = no S/R
+    # alert is emitted. Operator may draw many of these — every level
+    # becomes its own band and the worker accepts the close if price
+    # sits inside any of them.
+    sr_levels: list[dict] = field(default_factory=list)
 
 
 def label_of(d: dict) -> str:
@@ -191,6 +206,7 @@ def classify(drawings: list[dict]) -> Roles:
     blackout_ends: list[dict] = []
     news_starts: list[dict] = []
     news_ends: list[dict] = []
+    sr_levels: list[dict] = []
 
     for stub in drawings:
         d = get_drawing(stub["id"])
@@ -199,6 +215,8 @@ def classify(drawings: list[dict]) -> Roles:
 
         if kind == "horizontal_line" and lbl in {"too-high", "too-low"}:
             by_role["invalidation"].append((d, lbl))
+        elif kind == "horizontal_line" and lbl in SR_LEVEL_LABELS:
+            sr_levels.append(d)
         elif kind == "trend_line" and lbl in BREAK_LABELS:
             by_role["break_and_close"].append((d, lbl))
         elif kind == "trend_line" and lbl in RETEST_LABELS:
@@ -241,6 +259,7 @@ def classify(drawings: list[dict]) -> Roles:
         blackout_starts, blackout_ends, kind="blackout"
     )
     roles.news_pairs = pair_vertical_lines(news_starts, news_ends, kind="news")
+    roles.sr_levels = sr_levels
     return roles
 
 
@@ -1042,6 +1061,23 @@ def build_alert_spec(
             "tv_name": tv_name,
         }
 
+    if base == "07-close-on-sr-reversal":
+        # Identical TV-side shape to `06-close-on-reversal`: same Pine
+        # opposite-direction `Candle Signals` plot, same on_bar_close
+        # frequency. The gate lives entirely on the worker, where the
+        # intent's `require_price_in_ranges` keeps the close from
+        # firing unless current price is inside one of the user's
+        # chart-drawn S/R bands.
+        plot_id = "plot_10" if direction == "short" else "plot_11"
+        return {
+            "kind": "pine_alertcondition",
+            "indicator_name": "Candle Signals",
+            "alert_cond_id": plot_id,
+            "frequency": "on_bar_close",
+            "auto_deactivate": False,
+            "tv_name": tv_name,
+        }
+
     return None
 
 
@@ -1451,6 +1487,17 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
              "cache or broker login is unavailable.",
     )
     p.add_argument(
+        "--reversal-band-pct", dest="reversal_band_pct", type=float, default=0.1,
+        help="Half-width of the price band around each chart-drawn "
+             "`support` / `resistance` line, as a percent of the line's "
+             "price. Each level becomes an [lo, hi] band with "
+             "lo = price * (1 - pct/100), hi = price * (1 + pct/100). "
+             "The worker rejects the 07-close-on-sr-reversal alert "
+             "unless current price sits inside at least one band. "
+             "Default 0.1 (= ±0.1%% of price). Ignored when no "
+             "support/resistance drawings are present.",
+    )
+    p.add_argument(
         "--print-completions", action="store_true",
         help="Print a zsh completion script to stdout and exit. "
              "Install with: tv_arm_hs.py --print-completions > "
@@ -1487,6 +1534,7 @@ _tv_arm_hs() {
         '--require-golden[require golden candle on entry (needs_golden:true)]'
         '--skip-calendar-bars[skip the automatic forex-factory calendar-bars step]'
         '--no-instrument-check[skip the TN catalog lookup for the chart symbol]'
+        '--reversal-band-pct[half-width %% around support/resistance lines]:pct:'
         '--print-completions[print this zsh completion script and exit]'
         '(- *)'{-h,--help}'[show help and exit]'
     )
@@ -1643,6 +1691,18 @@ def main(argv: Optional[list[str]] = None) -> int:
     # actually fires between the news-start and news-end of any pair.
     if roles.news_pairs:
         spec["close_on_news"] = True
+    # S/R bands for the 07-close-on-sr-reversal alert. Each chart-drawn
+    # `support`/`resistance` horizontal line becomes one [lo, hi] band,
+    # width = price * pct/100 on either side. The Rust CLI shuttles the
+    # numbers through to the worker; the band-width math lives here so
+    # the user has one knob (--reversal-band-pct) instead of two.
+    if roles.sr_levels:
+        pct = args.reversal_band_pct / 100.0
+        ranges: list[list[float]] = []
+        for d in roles.sr_levels:
+            price = float(d["points"][0]["price"])
+            ranges.append([round(price * (1.0 - pct), 5), round(price * (1.0 + pct), 5)])
+        spec["sr_reversal_ranges"] = ranges
     if args.entry_market:
         spec["entry_mode"] = "market"
     if args.sl_from_recent:

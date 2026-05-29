@@ -381,11 +381,19 @@ async fn run_action<B: Broker>(
     }
 }
 
-/// Dispatch a `Close` intent. When `require_news_window: true`, gates
-/// the close on an active news window for the trade — used by the
-/// opposing-direction golden-reversal alert so that the same alert
-/// outside news is ignored. Without that flag the close is
-/// unconditional (operator emergency-close path).
+/// Dispatch a `Close` intent. Two independent gates may be set on the
+/// intent and are checked in order; both must pass before the close
+/// reaches the broker:
+///
+/// - `require_news_window: true` — reject unless an active news window
+///   exists for `trade_id` in KV (the `06-close-on-reversal` alert).
+/// - `require_price_in_ranges: Some(ranges)` — reject unless the
+///   broker's current price for the instrument sits inside at least
+///   one `[lo, hi]` band (the `07-close-on-sr-reversal` alert,
+///   gated on chart-drawn support/resistance levels).
+///
+/// Without either flag the close is unconditional (operator
+/// emergency-close path).
 async fn run_close<B: Broker>(
     broker: &B,
     store: &KvStateStore,
@@ -433,11 +441,100 @@ async fn run_close<B: Broker>(
             }
         }
     }
+    // require_price_in_ranges gate: reject the close unless the
+    // broker's current price for this instrument is inside at least
+    // one [lo, hi] band. Mirrors the news-window gate's shape but
+    // sources its input from the broker rather than KV. Set by the
+    // `07-close-on-sr-reversal` alert builder; absent means no
+    // positional gate (default).
+    if let Some(ranges) = verified.intent.require_price_in_ranges.as_deref() {
+        match broker.get_current_price(&verified.intent.instrument).await {
+            Ok(price) => {
+                let hit = price_band_hit(price, ranges);
+                match hit {
+                    Some([lo, hi]) => {
+                        console_log!(
+                            "close gated by price range: {} price={price} in [{lo}, {hi}]",
+                            verified.intent.instrument
+                        );
+                    }
+                    None => {
+                        console_log!(
+                            "close rejected: {} price={price} outside all bands {ranges:?}",
+                            verified.intent.instrument
+                        );
+                        return ActionResult::Rejected {
+                            response: Response::error("price out of range", 423),
+                            outcome: "rejected: price-out-of-range".into(),
+                        };
+                    }
+                }
+            }
+            Err(err) => {
+                console_error!(
+                    "broker get_current_price for {}: {err:?}",
+                    verified.intent.instrument
+                );
+                return ActionResult::Rejected {
+                    response: Response::error("price-fetch failed", 500),
+                    outcome: "rejected: price-fetch-failed".into(),
+                };
+            }
+        }
+    }
     let ok = broker.close_positions(&verified.intent.instrument).await;
     if ok {
         ActionResult::Ok("closed".into())
     } else {
         ActionResult::Failed("close-failed".into())
+    }
+}
+
+/// Find the first `[lo, hi]` band in `ranges` that contains `price`
+/// (inclusive on both ends). Returns `None` when `price` sits outside
+/// every band. Pulled out of [`run_close`] so the gate logic itself
+/// can be unit-tested without standing up a full broker + KV fixture.
+fn price_band_hit(price: f64, ranges: &[[f64; 2]]) -> Option<[f64; 2]> {
+    ranges
+        .iter()
+        .copied()
+        .find(|[lo, hi]| price >= *lo && price <= *hi)
+}
+
+#[cfg(test)]
+mod price_band_tests {
+    use super::price_band_hit;
+
+    #[test]
+    fn price_inside_single_band_hits() {
+        let ranges = [[1.0950, 1.0970]];
+        assert_eq!(price_band_hit(1.0960, &ranges), Some([1.0950, 1.0970]));
+    }
+
+    #[test]
+    fn price_on_band_endpoints_hits() {
+        let ranges = [[1.0950, 1.0970]];
+        assert!(price_band_hit(1.0950, &ranges).is_some());
+        assert!(price_band_hit(1.0970, &ranges).is_some());
+    }
+
+    #[test]
+    fn price_outside_all_bands_misses() {
+        let ranges = [[1.0950, 1.0970], [1.1000, 1.1020]];
+        assert_eq!(price_band_hit(1.0980, &ranges), None);
+        assert_eq!(price_band_hit(1.0900, &ranges), None);
+        assert_eq!(price_band_hit(1.1100, &ranges), None);
+    }
+
+    #[test]
+    fn price_picks_first_matching_band_when_multiple_overlap() {
+        let ranges = [[1.0950, 1.0970], [1.0960, 1.0980]];
+        assert_eq!(price_band_hit(1.0965, &ranges), Some([1.0950, 1.0970]));
+    }
+
+    #[test]
+    fn empty_ranges_always_misses() {
+        assert_eq!(price_band_hit(1.0, &[]), None);
     }
 }
 

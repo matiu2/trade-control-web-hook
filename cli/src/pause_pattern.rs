@@ -255,6 +255,7 @@ fn build_pause_intent(
         blackout_id: Some(blackout_id.to_string()),
         news_id: None,
         require_news_window: None,
+        require_price_in_ranges: None,
         // Reason rides on both halves so a `resume` log line is also
         // self-describing (operators see "what was this for?" without
         // grepping the matching pause).

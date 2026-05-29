@@ -335,6 +335,17 @@ pub struct TradeSpec {
     /// pre-feature spec yaml.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub close_on_news: bool,
+    /// When non-empty, emit a `07-close-on-sr-reversal` alert that
+    /// closes the trade if a golden-reversal candle prints in the
+    /// *opposite* direction and the broker's current price is inside
+    /// at least one of these `[lo, hi]` bands. Bands are computed by
+    /// the Python side from chart-drawn `support` / `resistance`
+    /// single lines plus a width percentage. The emitted intent
+    /// carries `require_price_in_ranges: Some(ranges)` so the worker
+    /// rejects the close outside every band. Default empty = no
+    /// extra alert, byte-identical to pre-feature spec yaml.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sr_reversal_ranges: Vec<[f64; 2]>,
 }
 
 fn is_zero_u32(n: &u32) -> bool {
@@ -610,6 +621,7 @@ fn build_pattern(
         max_retries: 0,
         needs_golden: false,
         close_on_news: false,
+        sr_reversal_ranges: Vec::new(),
         skip_preps: Vec::new(),
         entry_offset_pips: Some(entry_offset_pips),
         sl_offset_pips: Some(sl_offset_pips),
@@ -717,6 +729,16 @@ fn assemble_trade(
             spec.trade_expiry,
             &spec.broker,
             &spec.account,
+        ));
+    }
+    if !spec.sr_reversal_ranges.is_empty() {
+        alerts.push(build_close_on_sr_reversal_alert(
+            &spec.instrument,
+            &trade_id,
+            spec.trade_expiry,
+            &spec.broker,
+            &spec.account,
+            spec.sr_reversal_ranges.clone(),
         ));
     }
 
@@ -878,6 +900,7 @@ fn skeleton(
         blackout_id: None,
         news_id: None,
         require_news_window: None,
+        require_price_in_ranges: None,
         reason: None,
     }
 }
@@ -1122,6 +1145,42 @@ fn build_close_on_reversal_alert(
     }
 }
 
+/// Build the `07-close-on-sr-reversal` alert. Mirrors
+/// [`build_close_on_reversal_alert`] but the gate is positional rather
+/// than temporal: the worker rejects the close unless the current
+/// broker price is inside at least one `[lo, hi]` band. `tv_arm_hs.py`
+/// wires the same opposite-direction `Candle Signals` alertcondition
+/// to this YAML; the `ranges` come from chart-drawn `support` /
+/// `resistance` lines plus a width percentage.
+fn build_close_on_sr_reversal_alert(
+    instrument: &str,
+    trade_id: &str,
+    trade_expiry: DateTime<Utc>,
+    broker: &BrokerKind,
+    account: &str,
+    ranges: Vec<[f64; 2]>,
+) -> BuiltAlert {
+    let id = format!("{trade_id}-close-on-sr-reversal");
+    let mut intent = skeleton(
+        Action::Close,
+        instrument,
+        id,
+        trade_expiry,
+        *broker,
+        account,
+        trade_id,
+    );
+    intent.require_price_in_ranges = Some(ranges);
+    intent.reason = Some("support/resistance reversal".into());
+    BuiltAlert {
+        basename: "07-close-on-sr-reversal".into(),
+        purpose:
+            "close: opposing golden reversal candle, gated on price inside an S/R band for this trade"
+                .into(),
+        intent,
+    }
+}
+
 /// Hours between `now` and `until`, rounded up to the next hour and
 /// clamped to at least 1. The worker veto TTL also adds the alert's
 /// `not_after - now` tail, so this is just the bare TTL component;
@@ -1271,6 +1330,7 @@ mod tests {
                 max_retries: 0,
                 needs_golden: false,
                 close_on_news: false,
+                sr_reversal_ranges: Vec::new(),
                 skip_preps: Vec::new(),
                 entry_offset_pips: Some(1.0),
                 sl_offset_pips: Some(1.0),
@@ -1447,6 +1507,7 @@ mod tests {
             max_retries: 0,
             needs_golden: false,
             close_on_news: false,
+            sr_reversal_ranges: Vec::new(),
             skip_preps: Vec::new(),
             entry_offset_pips: None,
             sl_offset_pips: None,
@@ -1488,6 +1549,40 @@ mod tests {
         assert!(close.trade_id.is_some());
         // Sanity: validate() accepts it.
         close.validate().expect("close-on-reversal intent valid");
+    }
+
+    #[test]
+    fn build_trade_from_spec_emits_seven_alerts_when_sr_reversal_ranges_set() {
+        // sr_reversal_ranges populated → an extra 07-close-on-sr-reversal
+        // alert lands. close_on_news stays false here so 06 is absent.
+        let now = ts("2026-05-20T00:00:00Z");
+        let mut spec = sample_spec(TradePattern::Hs, ts("2026-05-25T00:00:00Z"));
+        spec.sr_reversal_ranges = vec![[1.0950, 1.0970], [1.1000, 1.1020]];
+        let trade = build_trade_from_spec(spec, now).unwrap();
+        assert_eq!(trade.alerts.len(), 7);
+        assert_eq!(trade.alerts[6].basename, "07-close-on-sr-reversal");
+        let close = &trade.alerts[6].intent;
+        assert_eq!(close.action, Action::Close);
+        assert_eq!(close.require_news_window, None);
+        assert_eq!(
+            close.require_price_in_ranges,
+            Some(vec![[1.0950, 1.0970], [1.1000, 1.1020]])
+        );
+        assert!(close.trade_id.is_some());
+        close.validate().expect("close-on-sr-reversal intent valid");
+    }
+
+    #[test]
+    fn build_trade_from_spec_emits_eight_alerts_when_both_close_flags_set() {
+        // Both flags set: 06 (news-window) and 07 (S/R) both land.
+        let now = ts("2026-05-20T00:00:00Z");
+        let mut spec = sample_spec(TradePattern::Hs, ts("2026-05-25T00:00:00Z"));
+        spec.close_on_news = true;
+        spec.sr_reversal_ranges = vec![[1.0950, 1.0970]];
+        let trade = build_trade_from_spec(spec, now).unwrap();
+        assert_eq!(trade.alerts.len(), 8);
+        assert_eq!(trade.alerts[6].basename, "06-close-on-reversal");
+        assert_eq!(trade.alerts[7].basename, "07-close-on-sr-reversal");
     }
 
     #[test]
