@@ -20,5 +20,10 @@ id = "e4f27179248e451daf8cf68a98c47e5b"
 
 # Scheduled (cron) trigger. Fires the `scheduled` event in `src/cron.rs`
 # which sweeps pending broker orders for expiry + SL-breach.
-[[triggers.crons]]
-cron = "*/15 * * * *"
+#
+# NOTE: must be the flat `crons = ["..."]` form, NOT `[[triggers.crons]]`
+# with a `cron = "..."` inline value. The latter trips a wrangler bug that
+# double-wraps the body as `[{"cron":{"cron":"..."}}]`, which the CF API
+# rejects with code 10026 ("could not parse request body").
+[triggers]
+crons = ["*/15 * * * *"]
