@@ -684,9 +684,12 @@ def build_alert_spec(
         #     midpoint toward TP).
         # The invalidation veto's name matches the trade direction's
         # natural label (too-high for shorts, too-low for longs); the
-        # other 01-veto entry is the pcl-exhausted one.
+        # other 01-veto entry is the pcl-exhausted one. `tv_name` here
+        # is `veto-too-high` (the TV alert title slug) — strip the
+        # `veto-` prefix for the bare veto name.
+        bare_name = tv_name.removeprefix("veto-")
         invalidation_name = "too-high" if direction == "short" else "too-low"
-        if tv_name == invalidation_name:
+        if bare_name == invalidation_name:
             if roles.invalidation is None:
                 return None
             cross_dir = "cross_up" if direction == "short" else "cross_down"
