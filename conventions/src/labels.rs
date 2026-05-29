@@ -30,6 +30,10 @@ pub const NEWS_END_LABELS: &[&str] = &["news-end"];
 /// short-trade invalidation; `too-low` is long-trade invalidation.
 pub const INVALIDATION_LABELS: &[&str] = &["too-high", "too-low"];
 
+/// Horizontal-line labels for support / resistance levels — each
+/// becomes a price band for the `07-close-on-sr-reversal` alert.
+pub const SR_LEVEL_LABELS: &[&str] = &["support", "resistance"];
+
 /// Case-insensitive membership test. Returns true when `label`
 /// (trimmed, lowercase) matches any entry in `vocab`.
 pub fn matches(label: &str, vocab: &[&str]) -> bool {

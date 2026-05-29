@@ -15,10 +15,13 @@
 
 use color_eyre::eyre::Result;
 
+mod drawings;
 mod geometry;
 mod manifest;
 mod pair_lines;
+mod roles;
 mod timeframe;
+mod tv_mcp;
 
 fn main() -> Result<()> {
     color_eyre::install()?;

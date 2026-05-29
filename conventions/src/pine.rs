@@ -49,6 +49,20 @@ impl Direction {
             Self::Short => Self::Long,
         }
     }
+
+    /// Direction implied by an invalidation label. `too-high` invalidates a
+    /// short trade (price went above the cap), `too-low` invalidates a long
+    /// trade. Case-insensitive on ASCII; returns `None` for any other label.
+    pub fn from_invalidation_label(lbl: &str) -> Option<Self> {
+        let t = lbl.trim();
+        if t.eq_ignore_ascii_case("too-high") {
+            Some(Self::Short)
+        } else if t.eq_ignore_ascii_case("too-low") {
+            Some(Self::Long)
+        } else {
+            None
+        }
+    }
 }
 
 /// Pine plot ID for the entry signal in `direction`.
@@ -88,5 +102,27 @@ mod tests {
         assert_eq!(Direction::Short.as_str(), "short");
         assert_eq!(Direction::Long.opposite(), Direction::Short);
         assert_eq!(Direction::Short.opposite(), Direction::Long);
+    }
+
+    #[test]
+    fn direction_from_invalidation_label() {
+        assert_eq!(
+            Direction::from_invalidation_label("too-high"),
+            Some(Direction::Short)
+        );
+        assert_eq!(
+            Direction::from_invalidation_label("too-low"),
+            Some(Direction::Long)
+        );
+        assert_eq!(
+            Direction::from_invalidation_label("TOO-HIGH"),
+            Some(Direction::Short)
+        );
+        assert_eq!(
+            Direction::from_invalidation_label("  too-low  "),
+            Some(Direction::Long)
+        );
+        assert_eq!(Direction::from_invalidation_label("neckline"), None);
+        assert_eq!(Direction::from_invalidation_label(""), None);
     }
 }
