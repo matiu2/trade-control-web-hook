@@ -124,6 +124,27 @@ pub struct ChartState {
     pub resolution: String,
 }
 
+/// `info` response — symbol metadata. We only care about `description`
+/// today (the human-readable name used as a TradeNation catalog
+/// fallback when the bare symbol doesn't resolve), but the other
+/// fields are exposed in case future strategies need them.
+#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
+pub struct ChartInfo {
+    /// Bare TradingView symbol (`EURUSD`, `USDCAD`).
+    #[serde(default)]
+    pub symbol: String,
+    /// Human-readable description (`"EURO VS US DOLLAR"`,
+    /// `"U.S. Dollar / Canadian Dollar"`). Empty when TV omits it.
+    #[serde(default)]
+    pub description: String,
+    /// Full `EXCHANGE:SYMBOL` form. Matches `ChartState.symbol`.
+    #[serde(default)]
+    pub full_name: String,
+    /// Type tag (`"forex"`, `"index"`, `"cfd"`, ...).
+    #[serde(default, rename = "type")]
+    pub kind: String,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

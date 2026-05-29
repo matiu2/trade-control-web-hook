@@ -23,7 +23,7 @@ use chrono::{DateTime, TimeZone, Utc};
 use color_eyre::eyre::{Context, Result, eyre};
 use tracing::{info, warn};
 use trade_control_cli as cli;
-use trade_control_conventions::{Broker, Direction, instrument_for, split_symbol};
+use trade_control_conventions::{Broker, Direction, split_symbol};
 use trade_control_core::sig::KEY_LEN;
 
 use crate::alert_spec::{AlertPayload, CalendarWindow, DispatchContext, build_alert_spec};
@@ -54,7 +54,12 @@ pub fn run(args: Args) -> Result<i32> {
     let (_exchange, raw_sym) = split_symbol(&state.symbol);
     let raw_sym = raw_sym.to_string();
     let broker = resolve_broker(&args, &state.symbol)?;
-    let instrument = instrument_for(broker, &raw_sym);
+    // Use TV's bare symbol (e.g. `EURUSD`) for everything downstream:
+    // trade spec, calendar-bars lookup, alert payloads. The worker
+    // accepts either bare or slash form for TN, and OANDA only ever
+    // sees this through the calendar-bars OANDA-style parser. Avoids
+    // the slash-vs-underscore-vs-bare mapping zoo entirely.
+    let instrument = raw_sym.clone();
 
     info!(
         chart = %state.symbol,
