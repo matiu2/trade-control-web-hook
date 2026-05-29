@@ -130,8 +130,16 @@ struct PatternGeometry {
     /// Name of the invalidation veto for this pattern. `too-high` for
     /// shorts (price running back up past the right shoulder),
     /// `too-low` for longs (price running back down past the right
-    /// shoulder of an inverse H&S).
+    /// shoulder of an inverse H&S). This veto is drawing-bound on the
+    /// chart side (operator-drawn horizontal at the shoulder).
     invalidation_veto_name: &'static str,
+    /// Name of the opposite-direction veto, fired when price has run
+    /// most of the way to TP without us in. For a short trade this is
+    /// `too-low`; for a long trade `too-high`. Symmetric in shape to
+    /// the invalidation veto (same Veto / ClosePositions level), but
+    /// the chart side binds it to a computed price (pcl-exhausted)
+    /// rather than a drawing.
+    pcl_exhausted_veto_name: &'static str,
 }
 
 impl PatternGeometry {
@@ -144,6 +152,7 @@ impl PatternGeometry {
                 sl_anchor: PriceAnchor::High,
                 sl_offset_default: 1.0,
                 invalidation_veto_name: "too-high",
+                pcl_exhausted_veto_name: "too-low",
             },
             TradePattern::Ihs => Self {
                 direction: Direction::Long,
@@ -152,6 +161,7 @@ impl PatternGeometry {
                 sl_anchor: PriceAnchor::Low,
                 sl_offset_default: 1.0,
                 invalidation_veto_name: "too-low",
+                pcl_exhausted_veto_name: "too-high",
             },
             TradePattern::M | TradePattern::W => {
                 // Unreachable at runtime — build_trade_interactive
@@ -638,6 +648,19 @@ fn assemble_trade(
             &spec.account,
             now,
         ),
+        // Opposite-direction veto: price ran most of the way to TP
+        // without us in. Same builder shape as the invalidation veto;
+        // the chart side binds this one to a computed price (pcl-
+        // exhausted) rather than a drawing.
+        build_invalidation_alert(
+            &spec.instrument,
+            &trade_id,
+            geometry.pcl_exhausted_veto_name,
+            veto_expiry,
+            &spec.broker,
+            &spec.account,
+            now,
+        ),
         build_trade_expiry_alert(
             &spec.instrument,
             &trade_id,
@@ -1053,6 +1076,7 @@ fn build_enter_alert(
         .collect();
     intent.vetos = vec![
         geometry.invalidation_veto_name.into(),
+        geometry.pcl_exhausted_veto_name.into(),
         "trade-expiry".into(),
     ];
     BuiltAlert {
@@ -1321,7 +1345,11 @@ mod tests {
         );
         assert_eq!(
             alert.intent.vetos,
-            vec!["too-high".to_string(), "trade-expiry".to_string()]
+            vec![
+                "too-high".to_string(),
+                "too-low".to_string(),
+                "trade-expiry".to_string()
+            ]
         );
         assert_eq!(alert.intent.trade_id.as_deref(), Some("hs-eur-usd-zzzz"));
         assert_eq!(alert.intent.account.as_deref(), Some("demo"));
@@ -1377,7 +1405,11 @@ mod tests {
         }
         assert_eq!(
             alert.intent.vetos,
-            vec!["too-low".to_string(), "trade-expiry".to_string()]
+            vec![
+                "too-low".to_string(),
+                "too-high".to_string(),
+                "trade-expiry".to_string()
+            ]
         );
     }
 
@@ -1427,27 +1459,30 @@ mod tests {
     }
 
     #[test]
-    fn build_trade_from_spec_emits_five_alerts_for_hs() {
+    fn build_trade_from_spec_emits_six_alerts_for_hs() {
         let now = ts("2026-05-20T00:00:00Z");
         let spec = sample_spec(TradePattern::Hs, ts("2026-05-25T00:00:00Z"));
         let trade = build_trade_from_spec(spec, now).unwrap();
-        assert_eq!(trade.alerts.len(), 5);
+        // 6 alerts: invalidation (too-high), pcl-exhausted (too-low),
+        // trade-expiry, break-and-close, retest, enter.
+        assert_eq!(trade.alerts.len(), 6);
         assert_eq!(trade.alerts[0].basename, "01-veto-too-high");
-        assert_eq!(trade.alerts[4].basename, "05-enter");
+        assert_eq!(trade.alerts[1].basename, "01-veto-too-low");
+        assert_eq!(trade.alerts[5].basename, "05-enter");
         // The spec is round-tripped onto the BuiltTrade so write_trade
         // can persist it next to the alerts.
         assert_eq!(trade.spec.pattern, TradePattern::Hs);
     }
 
     #[test]
-    fn build_trade_from_spec_emits_six_alerts_when_close_on_news() {
+    fn build_trade_from_spec_emits_seven_alerts_when_close_on_news() {
         let now = ts("2026-05-20T00:00:00Z");
         let mut spec = sample_spec(TradePattern::Hs, ts("2026-05-25T00:00:00Z"));
         spec.close_on_news = true;
         let trade = build_trade_from_spec(spec, now).unwrap();
-        assert_eq!(trade.alerts.len(), 6);
-        assert_eq!(trade.alerts[5].basename, "06-close-on-reversal");
-        let close = &trade.alerts[5].intent;
+        assert_eq!(trade.alerts.len(), 7);
+        assert_eq!(trade.alerts[6].basename, "06-close-on-reversal");
+        let close = &trade.alerts[6].intent;
         assert_eq!(close.action, Action::Close);
         assert_eq!(close.require_news_window, Some(true));
         assert!(close.trade_id.is_some());
@@ -1456,12 +1491,34 @@ mod tests {
     }
 
     #[test]
-    fn build_trade_from_spec_emits_five_alerts_for_ihs() {
+    fn build_trade_from_spec_emits_six_alerts_for_ihs() {
         let now = ts("2026-05-20T00:00:00Z");
         let spec = sample_spec(TradePattern::Ihs, ts("2026-05-25T00:00:00Z"));
         let trade = build_trade_from_spec(spec, now).unwrap();
-        // IH&S → too-low veto (not too-high).
+        // IH&S flips the veto direction: invalidation = too-low,
+        // pcl-exhausted = too-high.
         assert_eq!(trade.alerts[0].basename, "01-veto-too-low");
+        assert_eq!(trade.alerts[1].basename, "01-veto-too-high");
+    }
+
+    #[test]
+    fn build_trade_from_spec_pcl_exhausted_veto_matches_invalidation_shape() {
+        // The pcl-exhausted veto (built by the same builder as the
+        // invalidation veto) must carry the same level (ClosePositions)
+        // and trade_id, just with a different name. This is what
+        // tv_arm_hs.py relies on to treat them symmetrically on the
+        // chart side (one drawing-bound, one value-bound).
+        let now = ts("2026-05-20T00:00:00Z");
+        let spec = sample_spec(TradePattern::Hs, ts("2026-05-25T00:00:00Z"));
+        let trade = build_trade_from_spec(spec, now).unwrap();
+        let invalidation = &trade.alerts[0];
+        let pcl_exhausted = &trade.alerts[1];
+        assert_eq!(invalidation.intent.name.as_deref(), Some("too-high"));
+        assert_eq!(pcl_exhausted.intent.name.as_deref(), Some("too-low"));
+        assert_eq!(invalidation.intent.level, pcl_exhausted.intent.level);
+        assert_eq!(invalidation.intent.trade_id, pcl_exhausted.intent.trade_id);
+        // Same Veto action, same TTL window.
+        assert_eq!(invalidation.intent.action, pcl_exhausted.intent.action);
     }
 
     #[test]
@@ -1805,8 +1862,8 @@ tp_price: 1.05
         let basenames: Vec<&str> = trade.alerts.iter().map(|a| a.basename.as_str()).collect();
         assert!(!basenames.contains(&"03-prep-break-and-close"));
         assert!(!basenames.contains(&"04-prep-retest"));
-        // 3 alerts left: invalidation, trade-expiry, enter.
-        assert_eq!(trade.alerts.len(), 3);
+        // 4 alerts left: invalidation, pcl-exhausted, trade-expiry, enter.
+        assert_eq!(trade.alerts.len(), 4);
         let enter = trade.alerts.last().unwrap();
         assert!(enter.intent.requires_preps.is_empty());
         enter.intent.validate().unwrap();

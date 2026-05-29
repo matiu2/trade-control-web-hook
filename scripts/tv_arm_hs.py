@@ -283,6 +283,32 @@ def tp_price_from_fib(fib: dict, direction: str) -> float:
     return 2.0 * neckline - head
 
 
+def pcl_exhausted_price_from_fib(fib: dict, direction: str) -> float:
+    """Return the pcl-exhausted price: 80% of the way from the fib's
+    midpoint toward the TP.
+
+    Geometry: midpoint = (head + neckline) / 2; TP = 2*neckline − head
+    (see tp_price_from_fib). The pcl-exhausted level sits 80% of the
+    distance from midpoint to TP — beyond it, the pattern's projected
+    move is essentially complete and there's no R:R left for a fresh
+    entry. For a short trade this is below the neckline (between
+    neckline and TP). Bullish mirrors it above.
+
+    Closed form (short): neckline − 0.7 × (head − neckline)
+    Closed form (long):  neckline + 0.7 × (neckline − head)
+    """
+    prices = [p["price"] for p in fib["points"]]
+    if direction == "long":
+        head = min(prices)
+        neckline = max(prices)
+    else:  # short
+        head = max(prices)
+        neckline = min(prices)
+    midpoint = (head + neckline) / 2.0
+    tp = 2.0 * neckline - head
+    return midpoint + 0.8 * (tp - midpoint)
+
+
 # ---------------------------------------------------------------------------
 # Symbol / broker / instrument formatting
 
@@ -650,15 +676,42 @@ def build_alert_spec(
     tv_name = base.split("-", 1)[1] if "-" in base else base  # strip "NN-"
 
     if base.startswith("01-veto-"):
-        if roles.invalidation is None:
+        # Two 01-veto entries land here for every trade:
+        #   - the invalidation veto (drawing-bound to the user-drawn
+        #     horizontal line above/below the shoulder),
+        #   - the pcl-exhausted veto (value-bound to a price computed
+        #     from the fib retracement: 80% of the way from the fib's
+        #     midpoint toward TP).
+        # The invalidation veto's name matches the trade direction's
+        # natural label (too-high for shorts, too-low for longs); the
+        # other 01-veto entry is the pcl-exhausted one.
+        invalidation_name = "too-high" if direction == "short" else "too-low"
+        if tv_name == invalidation_name:
+            if roles.invalidation is None:
+                return None
+            cross_dir = "cross_up" if direction == "short" else "cross_down"
+            return {
+                "kind": "drawing",
+                "drawing_id": roles.invalidation["entity_id"],
+                "tool": "LineToolHorzLine",
+                "condition_type": cross_dir,
+                "frequency": "on_first_fire",
+                "auto_deactivate": False,
+                "tv_name": tv_name,
+            }
+        # The opposite name is the pcl-exhausted veto. Value-bound to
+        # a price computed from the fib (no drawing on the chart).
+        if roles.tp_fib is None:
             return None
-        # too-high (short) → cross_up; too-low (long) → cross_down.
-        cross_dir = "cross_up" if direction == "short" else "cross_down"
+        price = pcl_exhausted_price_from_fib(roles.tp_fib, direction)
+        # Bidirectional cross — the price level is between neckline
+        # and TP, and we want the alert to fire whichever way price
+        # gets there first. Matches the TV "price crossing value"
+        # alert payload (no direction qualifier on cross).
         return {
-            "kind": "drawing",
-            "drawing_id": roles.invalidation["entity_id"],
-            "tool": "LineToolHorzLine",
-            "condition_type": cross_dir,
+            "kind": "price_value",
+            "value": price,
+            "condition_type": "cross",
             "frequency": "on_first_fire",
             "auto_deactivate": False,
             "tv_name": tv_name,
@@ -908,6 +961,20 @@ for (const item of payloads) {{
       frequency: item.frequency,
       alert_cond_id: item.alert_cond_id,
       series: [studySeries],
+      resolution: ctx.resolution,
+    }};
+  }} else if (item.kind === 'price_value') {{
+    // No drawing lookup — the alert is bound to a numeric price
+    // level the script computed (pcl-exhausted at 80% of midpoint→TP).
+    // Mirrors the create_alert payload TV's UI sends for "price
+    // crossing value" alerts.
+    condition = {{
+      type: item.condition_type,
+      frequency: item.frequency,
+      series: [
+        {{ type: 'barset' }},
+        {{ type: 'value', value: item.value }},
+      ],
       resolution: ctx.resolution,
     }};
   }} else {{
