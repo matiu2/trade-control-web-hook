@@ -3,6 +3,7 @@
 
 mod admin_client;
 mod admin_secret;
+mod calendar_bars;
 mod control;
 mod expiry;
 mod history;
@@ -17,6 +18,11 @@ mod trade_patterns;
 
 pub use admin_client::{add_account, delete_account, list_accounts, test_account};
 pub use admin_secret::{delete_secret, put_secret, secret_binding_for};
+pub use calendar_bars::{
+    CalendarBarPlan, CalendarBarRow, CalendarBarsArgs, CalendarBrokerArg, PlanInputs, TimeframeArg,
+    fetch_week_events, parse_instrument, plan_calendar_bars, print_summary_table,
+    run_calendar_bars,
+};
 pub use control::{
     build_clear_prep_intent, build_clear_veto_intent, build_prep_intent, build_status_intent,
     build_unlock_intent, build_veto_intent, wrap_signed, wrap_signed_template,

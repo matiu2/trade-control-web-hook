@@ -22,14 +22,15 @@ use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use clap_complete::{Shell, generate};
 use color_eyre::eyre::{Context, Result, eyre};
 use trade_control_cli::{
-    KEY_LEN, TradePattern, add_account, build_clear_prep_intent, build_clear_veto_intent,
-    build_news_from_spec, build_pause_from_spec, build_prep_intent, build_status_intent,
-    build_trade_from_spec, build_trade_interactive, build_unlock_intent, build_veto_intent,
-    delete_account, delete_secret, fill_missing_fields, generate_key_hex, list_accounts,
-    load_cache, load_news_spec_from_file, load_pause_spec_from_file, load_spec_from_file,
-    pick_pattern_interactive, pick_template_interactive, prompt_save_as_template, put_secret,
-    record_account_use, record_prep_use, record_veto_use, secret_binding_for, test_account,
-    validate_instrument, wrap_signed, wrap_signed_template, write_news, write_pause, write_trade,
+    CalendarBarsArgs, KEY_LEN, TradePattern, add_account, build_clear_prep_intent,
+    build_clear_veto_intent, build_news_from_spec, build_pause_from_spec, build_prep_intent,
+    build_status_intent, build_trade_from_spec, build_trade_interactive, build_unlock_intent,
+    build_veto_intent, delete_account, delete_secret, fill_missing_fields, generate_key_hex,
+    list_accounts, load_cache, load_news_spec_from_file, load_pause_spec_from_file,
+    load_spec_from_file, pick_pattern_interactive, pick_template_interactive,
+    prompt_save_as_template, put_secret, record_account_use, record_prep_use, record_veto_use,
+    run_calendar_bars, secret_binding_for, test_account, validate_instrument, wrap_signed,
+    wrap_signed_template, write_news, write_pause, write_trade,
 };
 use trade_control_core::account::{
     AccountKind, AccountMetadata, Credentials, TradeNationCreds, TradeNationKind,
@@ -104,6 +105,15 @@ enum Cmd {
     /// is in play. Driven by a `news.yaml` spec — `tv_arm_hs.py`
     /// writes one per `news-start` / `news-end` vertical-line pair.
     BuildNews(BuildNewsArgs),
+    /// Auto-emit pause + news alert pairs from `trade-calendar-maker`'s
+    /// economic calendar. For each upcoming Medium+ (M15) or High (H1+)
+    /// event affecting the instrument's currencies within the timeframe's
+    /// buffer window, splits the event window in two: pause runs from
+    /// `event - buffer_before` to `event`, news runs from `event` to
+    /// `event + buffer_after`. Each event gets a deterministic id so
+    /// re-running is idempotent and never collides with operator-drawn
+    /// bars.
+    CalendarBars(CalendarBarsArgs),
     /// Look up / manage broker instrument catalogs. Today only
     /// `--broker tradenation` is implemented; OANDA names round-trip
     /// cleanly through string mapping and don't need a catalog.
@@ -505,6 +515,11 @@ fn main() -> Result<()> {
         Cmd::BuildTrade(args) => run_build_trade(args)?,
         Cmd::BuildPause(args) => run_build_pause(args)?,
         Cmd::BuildNews(args) => run_build_news(args)?,
+        Cmd::CalendarBars(args) => {
+            let key = load_key(&args.key_file)?;
+            check_account_known(&args.account)?;
+            run_calendar_bars(args, key, Utc::now())?;
+        }
         Cmd::Instruments(sub) => run_instruments(sub)?,
         Cmd::Completions { shell } => run_completions(shell),
     }
