@@ -5,11 +5,20 @@ TradeNation trades. The body is cleartext YAML with an HMAC-SHA256
 signature, so a leaked webhook URL can't be weaponised by anyone who
 doesn't also have the signing key.
 
-Nine actions are supported:
+Thirteen actions are supported. The first five are the day-to-day trading
+verbs; the rest are state management for multi-event setups and scheduled
+windows.
+
+Trading:
 
 - `enter` — open a market, stop, or limit order with SL/TP, after passing the risk gate.
   Optionally gated on named `prep` / `veto` flags (see "Conditional entries" below).
-- `close` — close all positions for the instrument.
+- `close` — close all positions for the instrument. May also carry one of two
+  worker-side gates: `require_news_window: true` (only fires inside an active
+  news window for the `trade_id`) or `require_price_in_ranges: [[lo, hi], ...]`
+  (only fires when the broker's current price sits inside at least one band).
+  Both are armed by `tv_arm_hs.py` for the `06-close-on-reversal` and
+  `07-close-on-sr-reversal` alerts respectively.
 - `invalidate` — set a per-instrument cooldown (default 12 h) and cancel any pending
   orders. Use this when your setup is no longer valid (price drifted out of the
   expected range) and you want to be sure no entry fires while you sleep.
@@ -17,6 +26,9 @@ Nine actions are supported:
   vetos. Curl-friendly debugging.
 - `unlock` — clear the cooldown for one instrument. Recovery for an
   `invalidate` you didn't mean to send.
+
+Per-instrument flag state (TTL-gated):
+
 - `prep` — record a named step (e.g. `break-and-close`) for an instrument with a
   TTL, used to build up multi-event setups.
 - `veto` — record a named blocker (e.g. `news-window`) for an instrument with a
@@ -30,6 +42,72 @@ Nine actions are supported:
   or level-3 veto re-runs the broker side effects.
 - `clear-prep` / `clear-veto` — drop a single prep or veto flag before its TTL
   expires.
+
+Per-trade window state (paired alerts):
+
+- `pause` / `resume` — open/close a blackout for a `(trade_id, blackout_id)`.
+  While any pause is active the `enter` gate on that `trade_id` is blocked.
+  Used to bracket scheduled news events without invalidating the whole setup.
+- `news-start` / `news-end` — open/close a news window for a
+  `(trade_id, news_id)`. Independent of `pause`: news windows don't block
+  entries, they **enable** the `06-close-on-reversal` alert (a Close intent
+  with `require_news_window: true`) to flatten the trade on an opposing
+  reversal candle.
+
+## Alert basenames emitted by `build-trade`
+
+When `tv_arm_hs.py` calls `trade-control build-trade --from-file`, the Rust
+CLI mints a fixed-order bundle of signed YAMLs. Basename ordering matters —
+the Python side maps drawings to alerts by prefix.
+
+| Basename | Action | Fires on | Notes |
+|---|---|---|---|
+| `01-veto-too-high` | `veto` | Horizontal line crossing | Invalidation veto. Drawing-bound. Trade-direction sensitive (`too-low` for bullish IH&S). |
+| `01-veto-too-low` | `veto` | Price crossing pcl-exhausted level | "Pattern completion level exhausted" — 80% of the way from the fib's midpoint to TP. Value-bound, computed by Python from the fib geometry. Direction-mirrors the invalidation veto. |
+| `02-veto-trade-expiry` | `veto` | Vertical line crossing chart time | Hard stop: once the trade-expiry line passes, no more entries. |
+| `03-prep-break-and-close` | `prep` | Trendline crossing (neckline break) | Skippable for stocks / late entries with `--skip-break-and-close`. |
+| `04-prep-retest` | `prep` | Trendline crossing (retest from below) | Skippable with `--skip-retest`. |
+| `05-enter` | `enter` | Pine `Candle Signals` golden candle | The actual trade. Gated on the preps above + opposing-direction veto absent. |
+| `06-close-on-reversal` | `close` | Pine `Candle Signals` opposing reversal | Emitted only when news-pairs are drawn. Worker gates on an active `news:<trade_id>:*` KV entry — fires only inside news windows. |
+| `07-close-on-sr-reversal` | `close` | Pine `Candle Signals` opposing reversal | Emitted only when `support`/`resistance` lines are drawn. Worker gates on the broker's current price being inside one of the `[lo, hi]` bands. |
+
+Each news pair adds two more (`01-news-start-<id>` + `02-news-end-<id>`)
+via a separate `build-news` shell-out, and each pause pair adds
+`01-pause-<id>` + `02-resume-<id>` via `build-pause`.
+
+## General workflow
+
+The day-to-day loop, end to end:
+
+1. **Draw the setup on a TradingView chart.** Mark the invalidation line,
+   the neckline (break-and-close prep), the retest, a fib retracement
+   spanning head → neckline, a `trade-expiry` vertical, and any optional
+   extras (`news-start`/`news-end` pairs around scheduled news,
+   `support`/`resistance` horizontals near key levels).
+2. **Run `scripts/tv_arm_hs.py`.** It reads the chart geometry via tv-mcp,
+   shells out to `trade-control build-trade --from-file` for `trade_id`
+   minting + signing, then posts every signed alert into TradingView via
+   an inside-page `fetch()`. Each alert lands as a configured TV alert
+   pointed at your worker URL.
+3. **TradingView fires alerts** as their conditions trigger (line
+   crossings, Pine `Candle Signals` plots, time anchors). Each alert
+   POSTs the cleartext signed YAML to the worker.
+4. **The worker verifies the HMAC**, runs replay protection (the `id`
+   field), applies any relevant gates (preps must be set, vetos must be
+   clear, `require_news_window` / `require_price_in_ranges` for closes),
+   then dispatches to OANDA or TradeNation. Outcomes are visible in
+   Cloudflare Real-time Logs and via `trade-control status`.
+5. **The scheduled `cron` trigger** (`*/15 * * * *`, declared in
+   `wrangler.toml`) sweeps pending stop-entry orders for SL-breach
+   independently of any TV alert. See `src/cron.rs`.
+6. **End of trade:** the trade-expiry vertical fires the
+   `02-veto-trade-expiry` alert, which sets an invalidation veto that
+   blocks any future `05-enter` for that `trade_id`. Pauses and news
+   windows for the trade auto-expire at trade-expiry (their KV TTLs are
+   tied to the alert's `not_after`).
+
+For ad-hoc one-off trades you can skip step 1–2 and use the Rust
+`trade-control sign` CLI directly (see "Signing an intent" below).
 
 ## How it works
 
@@ -445,8 +523,9 @@ Then sign an intent (set `not_after` in the future) and POST it:
 ## Chart-driven arming: `scripts/tv_arm_hs.py`
 
 The Rust `trade-control` CLI is the low-level signer — one intent at a time.
-For real H&S setups you want **one chart annotation → all five alerts armed**
-(two vetoes, two preps, one entry). `scripts/tv_arm_hs.py` is that frontend.
+For real H&S setups you want **one chart annotation → the whole bundle armed**
+(invalidation + pcl-exhausted vetoes, trade-expiry veto, two preps, an entry,
+plus any opt-in close triggers). `scripts/tv_arm_hs.py` is that frontend.
 
 It reads the active TradingView chart via [tv-mcp](https://github.com/jacksonkasi1/tradingview-mcp)
 (a Chrome DevTools bridge), extracts the H&S geometry from your drawings,
@@ -454,15 +533,18 @@ delegates `trade_id` minting and intent signing to `trade-control build-trade
 --from-file`, and posts the resulting alert bundle straight to TradingView via
 an inside-page fetch.
 
-What you draw on the chart (proposed convention):
+What you draw on the chart:
 
-| Drawing | Carries |
-|---|---|
-| Horizontal line labeled `too-high` / `too-low` | Invalidation veto trigger (right-shoulder price) |
-| Trendline labeled `neckline` | Break-and-close prep level |
-| Trendline labeled `retest` | Retest prep level |
-| Fib retracement | Take-profit price (computed as `2 × neckline − head`) |
-| Vertical line labeled `trade-expiry` | `not_after` for all alerts |
+| Drawing | Label | Carries |
+|---|---|---|
+| Horizontal line | `too-high` or `too-low` | Invalidation veto trigger (right-shoulder price). Direction-sensitive: `too-high` for short H&S, `too-low` for long IH&S. |
+| Trendline | (any in `BREAK_LABELS`) | Break-and-close prep level. Skip with `--skip-break-and-close`. |
+| Trendline | (any in `RETEST_LABELS`) | Retest prep level. Skip with `--skip-retest`. |
+| Fib retracement | (label optional) | Drives both TP (`2 × neckline − head`) and the `pcl-exhausted` veto price (`midpoint + 0.8 × (TP − midpoint)`). Draw spanning **head → neckline**. |
+| Vertical line | `trade-expiry` | `not_after` for every alert in the bundle. |
+| Vertical line pair | `news-start` / `news-end` | Each pair emits a `build-news` bundle. **Presence of any pair also auto-arms `06-close-on-reversal`** — no extra flag. |
+| Vertical line pair | `blackout-start` / `blackout-end` (or `pause` / `resume` aliases) | Each pair emits a `build-pause` bundle. Blocks entries while active. |
+| Horizontal line | `support` or `resistance` | Each line auto-arms `07-close-on-sr-reversal` as an `[lo, hi]` band of ±`--reversal-band-pct` (default `0.1%`). Multiple lines union. |
 
 CLI:
 
@@ -471,8 +553,10 @@ python scripts/tv_arm_hs.py \
   --broker tradenation \              # or oanda; auto-detected from chart exchange
   --account-id ms-tn-1 \              # defaults to ms-<broker>-1
   --risk-pct 0.5 \                    # % of NAV (or --risk-amount <home-ccy>)
+  --reversal-band-pct 0.1 \           # half-width % around support/resistance lines (default 0.1)
   --skip-break-and-close \            # for stocks (no after-hours retests)
   --skip-retest \                     # implies --skip-break-and-close; for late entries
+  --require-golden \                  # require Pine golden-candle signal on entry
   --create-alerts                     # default; pair with --dry-run to inspect only
 ```
 
