@@ -83,6 +83,39 @@ NEWS_START_LABELS = {"news-start"}
 NEWS_END_LABELS = {"news-end"}
 
 
+def infer_calendar_timeframe(resolution: str) -> Optional[str]:
+    """Map a TradingView chart resolution to a `calendar-bars --timeframe`.
+
+    TV resolutions are minute counts as strings ("1", "15", "60", "240"),
+    or letter-suffixed for higher TFs ("D", "W", "M"). The
+    `trade-calendar-maker` library only knows two shapes:
+
+      m15    → 3h pause window, Medium+ impact (CPI-class news).
+      h1plus → 8h pause window, High impact only (NFP-class news).
+
+    Mapping:
+      "15"          → m15
+      anything ≥ 60 → h1plus
+      "D"/"W"/"M"   → h1plus
+      "1" / "5"     → None (TF too low to be the operator's primary chart)
+
+    Returns None when the chart is sub-15m — calendar bars don't help on
+    scalp charts where the operator isn't holding through news anyway.
+    """
+    s = resolution.strip()
+    if not s:
+        return None
+    if s.isdigit():
+        n = int(s)
+        if n < 15:
+            return None
+        if n == 15:
+            return "m15"
+        return "h1plus"
+    # D, W, M, or any letter-suffixed TF — treat as h1plus.
+    return "h1plus"
+
+
 def tv(*args: str) -> dict:
     result = subprocess.run(
         ["node", str(TV_MCP_CLI), *args],
@@ -543,6 +576,122 @@ def run_build_news(spec_path: Path, out_dir: Path) -> None:
         print(result.stderr.rstrip(), file=sys.stderr)
 
 
+def run_calendar_bars(
+    *,
+    trade_id: str,
+    instrument: str,
+    account: str,
+    broker: str,
+    timeframe: str,
+    output_dir: Path,
+) -> None:
+    """Shell out to `trade-control calendar-bars`.
+
+    The subcommand fetches this week's forex-factory events, filters them
+    by impact threshold (M15: Medium+, H1Plus: High only) and currency
+    affinity to `instrument`, and writes one signed pause-pair plus one
+    signed news-pair per kept event under
+    `<output_dir>/calendar-bars/<trade_id>/<event_slug>/{pause,news}/`.
+
+    Idempotent — deterministic event IDs mean re-running with the same
+    trade_id overwrites the same files.
+    """
+    binary = find_trade_control()
+    key = key_file()
+    result = subprocess.run(
+        [
+            binary, "calendar-bars",
+            "--instrument", instrument,
+            "--trade-id", trade_id,
+            "--account", account,
+            "--broker", broker,
+            "--timeframe", timeframe,
+            "--key-file", str(key),
+            "--output-dir", str(output_dir),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(
+            "trade-control calendar-bars failed:\n"
+            f"  stderr: {result.stderr.strip()}\n"
+            f"  stdout: {result.stdout.strip()}"
+        )
+    if result.stdout.strip():
+        print(result.stdout.rstrip())
+    if result.stderr.strip():
+        print(result.stderr.rstrip(), file=sys.stderr)
+
+
+def _parse_iso(ts: str) -> datetime:
+    """Parse a `YYYY-MM-DDTHH:MM:SSZ` ISO timestamp into a UTC datetime."""
+    return datetime.strptime(ts.strip().strip('"'), "%Y-%m-%dT%H:%M:%SZ").replace(
+        tzinfo=timezone.utc
+    )
+
+
+def _read_window_yaml(path: Path) -> tuple[str, str]:
+    """Extract `start_time` and `end_time` from a calendar-bars
+    round-trip spec (`pause.yaml` or `news.yaml`).
+
+    These are flat YAML files; we already do tiny hand-parsing for the
+    manifest, so reuse the same approach to avoid a PyYAML dep.
+    """
+    start = end = None
+    for raw in path.read_text().splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        key, _, val = line.partition(":")
+        if key.strip() == "start_time":
+            start = val.strip().strip('"')
+        elif key.strip() == "end_time":
+            end = val.strip().strip('"')
+    if start is None or end is None:
+        raise RuntimeError(
+            f"calendar-bars spec at {path} missing start_time/end_time"
+        )
+    return start, end
+
+
+def discover_calendar_bundles(
+    root: Path, trade_id: str
+) -> list[tuple[str, str, dict, Path, str, str]]:
+    """Walk the `calendar-bars/<trade_id>/<event_slug>/{pause,news}/`
+    layout and return one tuple per bundle:
+
+      (event_slug, kind, manifest_dict, bundle_dir, start_iso, end_iso)
+
+    `kind` is "pause" or "news". Sorted by (event_slug, kind) for stable
+    ordering across runs. Returns [] if the root dir is missing
+    (subcommand was skipped or fetched no events).
+    """
+    bundles: list[tuple[str, str, dict, Path, str, str]] = []
+    base = root / "calendar-bars" / trade_id
+    if not base.is_dir():
+        return bundles
+    for event_dir in sorted(base.iterdir()):
+        if not event_dir.is_dir():
+            continue
+        event_slug = event_dir.name
+        for kind in ("pause", "news"):
+            bundle_dir = event_dir / kind
+            if not bundle_dir.is_dir():
+                continue
+            manifest_path = bundle_dir / "manifest.yaml"
+            spec_path = bundle_dir / f"{kind}.yaml"
+            if not manifest_path.exists() or not spec_path.exists():
+                continue
+            manifest = parse_manifest(manifest_path.read_text())
+            start_iso, end_iso = _read_window_yaml(spec_path)
+            bundles.append(
+                (event_slug, kind, manifest, bundle_dir, start_iso, end_iso)
+            )
+    return bundles
+
+
 def run_build_pause(spec_path: Path, out_dir: Path) -> None:
     """Shell out to `trade-control build-pause` for one blackout window.
 
@@ -654,6 +803,7 @@ def build_alert_spec(
     roles: Roles,
     blackout_pair: Optional[tuple[dict, dict]] = None,
     news_pair: Optional[tuple[dict, dict]] = None,
+    calendar_window: Optional[tuple[str, str, str]] = None,
 ) -> Optional[dict]:
     """Translate one manifest entry into the alert-payload shape the
     create_alerts JS expects. Returns None if the entry isn't postable
@@ -674,6 +824,33 @@ def build_alert_spec(
     fname: str = manifest_entry["file"]
     base = fname.removesuffix(".yaml")
     tv_name = base.split("-", 1)[1] if "-" in base else base  # strip "NN-"
+
+    # Calendar-derived vertical bars: no chart drawing exists; the alert
+    # anchors at a synthetic vertical line placed at the window edge
+    # (event_time ± buffer). `calendar_window` carries the start and
+    # end ISO timestamps from the round-trip spec; pick the right edge
+    # for this basename and emit a `vert_line_at` payload that the JS
+    # template builds without a drawing lookup.
+    if calendar_window is not None:
+        start_iso, end_iso, _kind = calendar_window
+        # Pause/news-start fire on the LEFT edge of the window; resume/
+        # news-end fire on the RIGHT edge.
+        if base.startswith("01-pause-") or base.startswith("01-news-start-"):
+            edge_iso = start_iso
+        elif base.startswith("02-resume-") or base.startswith("02-news-end-"):
+            edge_iso = end_iso
+        else:
+            return None
+        edge_epoch = int(_parse_iso(edge_iso).timestamp())
+        return {
+            "kind": "vert_line_at",
+            "base_time_epoch": edge_epoch,
+            "tool": "LineToolVertLine",
+            "condition_type": "cross",
+            "frequency": "on_first_fire",
+            "auto_deactivate": False,
+            "tv_name": tv_name,
+        }
 
     if base.startswith("01-veto-"):
         # Two 01-veto entries land here for every trade:
@@ -966,6 +1143,34 @@ for (const item of payloads) {{
       series: [studySeries],
       resolution: ctx.resolution,
     }};
+  }} else if (item.kind === 'vert_line_at') {{
+    // Synthetic vertical line — no drawing on the chart. Used for
+    // calendar-derived bars where we have only a timestamp. The line
+    // entry mirrors what stateForAlert() returns for a real
+    // LineToolVertLine, with price1/price2 set to a neutral value
+    // (TV's vertical-line evaluator ignores price; the handle is
+    // placed at the centre of the visible price range anyway).
+    const baseIso = new Date(item.base_time_epoch * 1000).toISOString();
+    condition = {{
+      type: item.condition_type,
+      frequency: item.frequency,
+      series: [
+        {{ type: 'barset' }},
+        {{
+          type: 'line',
+          tool: 'LineToolVertLine',
+          base_time: baseIso,
+          offset1: 0,
+          price1: 0,
+          offset2: 1,
+          price2: 0,
+          extend_forward: false,
+          extend_backward: false,
+          layout_id: ctx.layout_id,
+        }},
+      ],
+      resolution: ctx.resolution,
+    }};
   }} else if (item.kind === 'price_value') {{
     // No drawing lookup — the alert is bound to a numeric price
     // level the script computed (pcl-exhausted at 80% of midpoint→TP).
@@ -1228,6 +1433,17 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
              "Composes with --entry-filter-script (both must pass).",
     )
     p.add_argument(
+        "--skip-calendar-bars", dest="skip_calendar_bars", action="store_true",
+        help="Skip the automatic calendar-bars step. By default, after "
+             "build-trade the script shells out to "
+             "`trade-control calendar-bars` to fetch this week's "
+             "forex-factory events for the chart's currency pair and "
+             "arm one pause-pair + one news-pair per event. The chart's "
+             "resolution selects the impact filter (15m → Medium+, "
+             "≥1h → High only). Use this flag for offline use, or when "
+             "the operator wants to hand-draw the news bars instead.",
+    )
+    p.add_argument(
         "--no-instrument-check", dest="no_instrument_check", action="store_true",
         help="Skip the TradeNation catalog lookup that maps the chart "
              "symbol (e.g. XAGUSD) to the broker's canonical name "
@@ -1269,6 +1485,7 @@ _tv_arm_hs() {
         '--skip-break-and-close[drop the break-and-close prep]'
         '--skip-retest[drop the retest prep]'
         '--require-golden[require golden candle on entry (needs_golden:true)]'
+        '--skip-calendar-bars[skip the automatic forex-factory calendar-bars step]'
         '--no-instrument-check[skip the TN catalog lookup for the chart symbol]'
         '--print-completions[print this zsh completion script and exit]'
         '(- *)'{-h,--help}'[show help and exit]'
@@ -1549,6 +1766,48 @@ def main(argv: Optional[list[str]] = None) -> int:
               "refusing to arm news bundle", file=sys.stderr)
         return 3
 
+    # Calendar-derived pause+news bundles. Auto-enabled (skippable via
+    # --skip-calendar-bars) — fetches this week's forex-factory events
+    # for `instrument`, filtered by the chart's resolution. Each event
+    # gets a deterministic id (`cal-<ccy>-<slug>-<epoch>`), so re-runs
+    # of this script on the same trade are idempotent. The discovered
+    # bundles get armed as vertical-line alerts anchored at the window
+    # edges (synthetic — no chart drawings needed).
+    #
+    # Failure mode is warn-and-continue: a network blip on forex-factory
+    # shouldn't block arming the trade itself or the operator-drawn bars.
+    calendar_bundles: list[tuple[str, str, dict, Path, str, str]] = []
+    if not args.skip_calendar_bars and trade_id:
+        timeframe = infer_calendar_timeframe(state["resolution"])
+        if timeframe is None:
+            print(f"# skipping calendar-bars: chart resolution "
+                  f"{state['resolution']!r} is below 15m")
+        else:
+            cal_root = out_dir
+            print(f"# fetching calendar-bars: timeframe={timeframe} "
+                  f"instrument={instrument}")
+            try:
+                run_calendar_bars(
+                    trade_id=trade_id,
+                    instrument=instrument,
+                    account=account,
+                    broker=broker,
+                    timeframe=timeframe,
+                    output_dir=cal_root,
+                )
+                calendar_bundles = discover_calendar_bundles(cal_root, trade_id)
+                if calendar_bundles:
+                    print(f"# {len(calendar_bundles)} calendar-bar bundle(s) "
+                          "armed:")
+                    for slug, kind, _m, _d, s_iso, e_iso in calendar_bundles:
+                        print(f"#   {kind:5s} {slug} {s_iso} → {e_iso}")
+                else:
+                    print("# no calendar events in window")
+            except (FileNotFoundError, RuntimeError) as e:
+                print(f"WARNING: calendar-bars failed (continuing without "
+                      f"calendar bundles): {e}", file=sys.stderr)
+        print()
+
     if not args.create_alerts:
         if args.dry_run:
             print("# --dry-run: skipping alert creation and webhook POSTs.")
@@ -1631,6 +1890,34 @@ def main(argv: Optional[list[str]] = None) -> int:
                 print(f"# skipping {fname} (file missing)")
                 continue
             role_slug = spec_dict["tv_name"]
+            spec_dict["tv_name"] = (
+                f"{trade_id}-{role_slug}" if trade_id else role_slug
+            )
+            spec_dict["name"] = entry["file"]
+            spec_dict["message"] = signed_path.read_text()
+            payloads.append(spec_dict)
+
+    # Calendar-derived bundles. No chart drawing — `build_alert_spec`
+    # short-circuits on `calendar_window` and emits a `vert_line_at`
+    # payload anchored at the window edge (event_time ± buffer).
+    for _event_slug, kind, cal_manifest, cal_dir, start_iso, end_iso in calendar_bundles:
+        for entry in cal_manifest.get("alerts", []):
+            fname = entry["file"]
+            spec_dict = build_alert_spec(
+                entry, direction, roles,
+                calendar_window=(start_iso, end_iso, kind),
+            )
+            if spec_dict is None:
+                print(f"# skipping {fname} (no calendar mapping)")
+                continue
+            signed_path = cal_dir / fname
+            if not signed_path.exists():
+                print(f"# skipping {fname} (file missing)")
+                continue
+            role_slug = spec_dict["tv_name"]
+            # Stamp `<trade_id>-cal-<event>-<role>` so calendar bars
+            # sort next to their parent trade and operator can tell
+            # them apart from hand-drawn news bars at a glance.
             spec_dict["tv_name"] = (
                 f"{trade_id}-{role_slug}" if trade_id else role_slug
             )
