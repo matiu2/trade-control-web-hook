@@ -311,6 +311,11 @@ struct UnlockCmdArgs {
     /// name against the TN catalog before sending.
     #[arg(long, value_enum, default_value_t = BrokerKindArg::Oanda)]
     broker: BrokerKindArg,
+    /// Skip catalog validation and send the instrument string verbatim.
+    /// Use when a non-canonical name is already stuck in KV (e.g.
+    /// `XAUUSD.F`) and the canonical name won't match it.
+    #[arg(long)]
+    force: bool,
     #[command(flatten)]
     common: EndpointArgs,
 }
@@ -391,6 +396,10 @@ struct ClearPrepCmdArgs {
     /// Broker the instrument belongs to (see `unlock --broker`).
     #[arg(long, value_enum, default_value_t = BrokerKindArg::Oanda)]
     broker: BrokerKindArg,
+    /// Skip catalog validation and send the instrument string verbatim.
+    /// See `unlock --force` for the use case.
+    #[arg(long)]
+    force: bool,
     #[command(flatten)]
     common: EndpointArgs,
 }
@@ -404,6 +413,10 @@ struct ClearVetoCmdArgs {
     /// Broker the instrument belongs to (see `unlock --broker`).
     #[arg(long, value_enum, default_value_t = BrokerKindArg::Oanda)]
     broker: BrokerKindArg,
+    /// Skip catalog validation and send the instrument string verbatim.
+    /// See `unlock --force` for the use case.
+    #[arg(long)]
+    force: bool,
     #[command(flatten)]
     common: EndpointArgs,
 }
@@ -874,7 +887,97 @@ fn run_status(args: EndpointArgs) -> Result<()> {
     let body = wrap_control(&intent, &key, now)?;
     let response = post_control(&args.endpoint, &body)?;
     print!("{response}");
+    if !response.ends_with('\n') {
+        println!();
+    }
+    if let Some(footer) = build_status_instruments_footer(&response) {
+        print!("{footer}");
+    }
     Ok(())
+}
+
+/// Build a `# instruments:` footer that annotates each unique instrument
+/// string in the snapshot with its canonical TN name (if any). Returns
+/// `None` when the response can't be parsed or carries no instrument
+/// fields, so the status output stays a plain pass-through in those
+/// cases.
+///
+/// Names that resolve cleanly through the TN catalog are tagged
+/// `→ Canonical Name`. Names that don't resolve AND don't look like
+/// OANDA identifiers (which always contain `_`) are tagged
+/// `(no TN catalog match)` — that's the case that catches stranded
+/// strings like `XAUUSD.F` so the operator knows to reach for
+/// `clear-veto --force` instead of guessing at canonical names.
+fn build_status_instruments_footer(response: &str) -> Option<String> {
+    use trade_control_core::state::Snapshot;
+
+    let snap: Snapshot = serde_yaml::from_str(response).ok()?;
+
+    let mut names: Vec<String> = snap
+        .cooldowns
+        .iter()
+        .map(|c| c.instrument.clone())
+        .chain(snap.preps.iter().map(|p| p.instrument.clone()))
+        .chain(snap.vetos.iter().map(|v| v.instrument.clone()))
+        .collect();
+    names.sort();
+    names.dedup();
+
+    if names.is_empty() {
+        return None;
+    }
+
+    // Best-effort cache load. If TN login or disk read fails we still
+    // print the section header + raw names so the operator sees which
+    // strings exist, but without a `→` annotation.
+    let cache = load_cache(false, None).ok();
+    Some(format_instruments_footer(&names, cache.as_ref()))
+}
+
+/// Pure format helper for [`build_status_instruments_footer`]. Split
+/// out so tests can drive it with a seeded `InstrumentCache` instead
+/// of needing a live TN session.
+fn format_instruments_footer(
+    names: &[String],
+    cache: Option<&tradenation_instrument_cache::InstrumentCache>,
+) -> String {
+    let mut out = String::from("# instruments:\n");
+    for name in names {
+        let annotation = annotate_instrument(cache, name);
+        out.push_str(&format!("#   - {name}{annotation}\n"));
+    }
+    out
+}
+
+/// Annotation suffix for one stored instrument string.
+/// - Empty string when `cache` is `None` (offline) or when the name
+///   already matches the canonical TN form.
+/// - ` → Canonical Name` when TN catalog resolution succeeded with
+///   a different name (e.g. `EUR_USD` → `EUR/USD`, `XAGUSD` →
+///   `Spot Silver`). Tells the operator what to type for
+///   `clear-veto` / `clear-prep` / `unlock`.
+/// - ` (no TN catalog match)` when the catalog couldn't resolve the
+///   string at all. That's the stuck-key case (e.g. `XAUUSD.F`):
+///   `clear-veto` will reject the name; operator needs `--force`.
+///   Also covers OANDA-exclusive names that don't exist on TN — they
+///   self-identify by failing here.
+fn annotate_instrument(
+    cache: Option<&tradenation_instrument_cache::InstrumentCache>,
+    name: &str,
+) -> String {
+    let Some(cache) = cache else {
+        return String::new();
+    };
+    match cache.resolve(name) {
+        Ok(market) => {
+            if market.name.eq_ignore_ascii_case(name.trim()) {
+                String::new()
+            } else {
+                format!(" → {}", market.name)
+            }
+        }
+        Err(_) => " (no TN catalog match)".to_string(),
+    }
 }
 
 /// Validate `instrument` against `broker`'s catalog, returning the canonical
@@ -897,9 +1000,28 @@ fn canonicalize_instrument(broker: BrokerKindArg, instrument: &str) -> Result<St
     }
 }
 
+/// Same as [`canonicalize_instrument`] but returns the input verbatim
+/// when `force` is set. Used by `unlock --force`, `clear-prep --force`,
+/// and `clear-veto --force` to clear stranded non-canonical keys that
+/// the catalog can't resolve.
+fn canonicalize_instrument_or_force(
+    broker: BrokerKindArg,
+    instrument: &str,
+    force: bool,
+) -> Result<String> {
+    if force {
+        tracing::warn!(
+            input = %instrument,
+            "--force: sending instrument verbatim, skipping catalog validation",
+        );
+        return Ok(instrument.to_string());
+    }
+    canonicalize_instrument(broker, instrument)
+}
+
 fn run_unlock(args: UnlockCmdArgs) -> Result<()> {
     let key = load_key(&args.common.key_file)?;
-    let instrument = canonicalize_instrument(args.broker, &args.instrument)?;
+    let instrument = canonicalize_instrument_or_force(args.broker, &args.instrument, args.force)?;
     let now = Utc::now();
     let suffix = fresh_suffix()?;
     let intent = build_unlock_intent(&instrument, now, &suffix);
@@ -966,7 +1088,7 @@ fn run_veto(args: VetoCmdArgs) -> Result<()> {
 
 fn run_clear_prep(args: ClearPrepCmdArgs) -> Result<()> {
     let key = load_key(&args.common.key_file)?;
-    let instrument = canonicalize_instrument(args.broker, &args.instrument)?;
+    let instrument = canonicalize_instrument_or_force(args.broker, &args.instrument, args.force)?;
     let now = Utc::now();
     let suffix = fresh_suffix()?;
     let intent = build_clear_prep_intent(&instrument, &args.step, now, &suffix);
@@ -978,7 +1100,7 @@ fn run_clear_prep(args: ClearPrepCmdArgs) -> Result<()> {
 
 fn run_clear_veto(args: ClearVetoCmdArgs) -> Result<()> {
     let key = load_key(&args.common.key_file)?;
-    let instrument = canonicalize_instrument(args.broker, &args.instrument)?;
+    let instrument = canonicalize_instrument_or_force(args.broker, &args.instrument, args.force)?;
     let now = Utc::now();
     let suffix = fresh_suffix()?;
     let intent = build_clear_veto_intent(&instrument, &args.name, now, &suffix);
@@ -1234,4 +1356,125 @@ fn run_account_add(args: AccountAddArgs) -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+    use tradenation_api::{Market, Session};
+    use tradenation_instrument_cache::{Catalog, InstrumentCache};
+
+    fn stub_market(market_id: u64, name: &str, symbol: Option<&str>) -> Market {
+        Market {
+            market_id,
+            quote_id: 1,
+            name: name.to_string(),
+            currency: "USD".to_string(),
+            super_group_id: 1,
+            spread: 0.0,
+            margin: 0.0,
+            bet_per: 0.0,
+            decimal_places: 2,
+            tradable: true,
+            trade_on_web: true,
+            bid: 0.0,
+            ask: 0.0,
+            symbol: symbol.map(str::to_string),
+        }
+    }
+
+    /// Build an `InstrumentCache` seeded from `markets`. Mirrors the
+    /// `seeded_cache` helper in `instruments.rs` so this test module
+    /// stays self-contained.
+    fn seeded_cache(markets: Vec<Market>) -> (InstrumentCache, tempfile::TempDir) {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("catalog.json");
+        let cat = Catalog::new(markets);
+        std::fs::write(&path, serde_json::to_vec(&cat).unwrap()).unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let cache = rt
+            .block_on(async {
+                let session = Session::demo("x", "x", "x", None);
+                InstrumentCache::load_or_fetch(
+                    &session,
+                    Duration::from_secs(3600),
+                    Some(path.clone()),
+                )
+                .await
+            })
+            .unwrap();
+        (cache, tmp)
+    }
+
+    #[test]
+    fn annotate_oanda_name_resolves_via_tn_normalize() {
+        // EUR_USD lands on TN's `EUR/USD` via the catalog's
+        // normalize-alphanumeric tier (strips `_`, matches symbol
+        // `EURUSD`). Surface the canonical so the operator knows
+        // what string to type for clear-veto.
+        let (cache, _tmp) = seeded_cache(vec![stub_market(1, "EUR/USD", Some("EURUSD"))]);
+        assert_eq!(annotate_instrument(Some(&cache), "EUR_USD"), " → EUR/USD");
+    }
+
+    #[test]
+    fn annotate_unresolved_name_is_flagged() {
+        let (cache, _tmp) = seeded_cache(vec![stub_market(1, "Spot Gold", None)]);
+        // The bug case: KV stored XAUUSD.F, TN catalog has no symbol
+        // for Spot Gold, so this can't resolve.
+        assert_eq!(
+            annotate_instrument(Some(&cache), "XAUUSD.F"),
+            " (no TN catalog match)"
+        );
+    }
+
+    #[test]
+    fn annotate_canonical_name_is_silent() {
+        let (cache, _tmp) = seeded_cache(vec![stub_market(1, "Spot Gold", None)]);
+        // Already canonical — no rewrite needed.
+        assert_eq!(annotate_instrument(Some(&cache), "Spot Gold"), "");
+    }
+
+    #[test]
+    fn annotate_symbol_resolves_to_canonical() {
+        let (cache, _tmp) = seeded_cache(vec![stub_market(1, "EUR/USD", Some("EURUSD"))]);
+        // Operator (or some upstream) used the symbol — show the
+        // canonical name so they know what to type next.
+        assert_eq!(annotate_instrument(Some(&cache), "EURUSD"), " → EUR/USD");
+    }
+
+    #[test]
+    fn annotate_no_cache_is_silent() {
+        // When TN login fails the footer still prints the name list;
+        // each line just has no annotation suffix.
+        assert_eq!(annotate_instrument(None, "XAUUSD.F"), "");
+        assert_eq!(annotate_instrument(None, "EUR_USD"), "");
+    }
+
+    #[test]
+    fn footer_formats_unique_sorted_names() {
+        let (cache, _tmp) = seeded_cache(vec![
+            stub_market(1, "Spot Gold", None),
+            stub_market(2, "EUR/USD", Some("EURUSD")),
+        ]);
+        // Mixed bag: canonical TN, OANDA-style, symbol, stranded.
+        let names = vec![
+            "EUR_USD".to_string(),
+            "EURUSD".to_string(),
+            "Spot Gold".to_string(),
+            "XAUUSD.F".to_string(),
+        ];
+        let footer = format_instruments_footer(&names, Some(&cache));
+        let expected = "\
+# instruments:
+#   - EUR_USD → EUR/USD
+#   - EURUSD → EUR/USD
+#   - Spot Gold
+#   - XAUUSD.F (no TN catalog match)
+";
+        assert_eq!(footer, expected);
+    }
 }

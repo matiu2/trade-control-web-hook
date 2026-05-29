@@ -388,6 +388,16 @@ export TRADE_CONTROL_ENDPOINT=https://trade-control.<account>.workers.dev
   --key-file ~/.config/trade-control/key.hex
 ./target/release/trade-control clear-veto EUR_USD news-window \
   --key-file ~/.config/trade-control/key.hex
+
+# Stranded bad-name entries: `unlock` / `clear-prep` / `clear-veto` normally
+# validate the instrument against the TradeNation catalog before sending,
+# so a non-canonical name like `XAUUSD.F` is rejected with a candidate list.
+# When the worker already holds such a string in KV, pass `--force` to
+# skip validation and send the name verbatim — the only way to clear a
+# stuck key short of `wrangler kv:key delete`.
+./target/release/trade-control clear-veto "XAUUSD.F" too-low \
+  --broker tradenation --force \
+  --key-file ~/.config/trade-control/key.hex
 ```
 
 `status` returns:
@@ -409,7 +419,20 @@ vetos:
   - instrument: EUR_USD
     name: news-window
     expires_at: "2026-05-14T09:00:00Z"
+# instruments:
+#   - EUR_USD → EUR/USD
+#   - XAUUSD.F (no TN catalog match)
 ```
+
+The trailing `# instruments:` block annotates each unique instrument
+string in the snapshot. `→ Canonical Name` tells you what to type for
+`clear-veto` / `clear-prep` / `unlock` (the TradeNation catalog often
+holds the same FX pair under a slash-form name). `(no TN catalog
+match)` flags strings the catalog can't resolve — typically OANDA-only
+exotics, or stranded non-canonical names that need `--force` to clear.
+The block is best-effort: if the TradeNation login or catalog read
+fails the names are listed without annotations, and the block is
+omitted entirely when the snapshot has no instrument fields.
 
 `unlock` returns:
 
