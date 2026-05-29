@@ -1228,17 +1228,6 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
              "Composes with --entry-filter-script (both must pass).",
     )
     p.add_argument(
-        "--close-on-reversal", dest="close_on_reversal", action="store_true",
-        help="Emit a 6th alert that closes the trade if an opposing "
-             "golden-reversal candle prints during an active news "
-             "window. Sets `close_on_news: true` on the trade spec; "
-             "build-trade emits `06-close-on-reversal.yaml` (Pine "
-             "alertcondition, opposite direction) and the worker only "
-             "honours it when `news:<trade_id>:*` KV is populated by "
-             "the matching `news-start` alert. Pair with `news-start` "
-             "and `news-end` vertical lines on the chart.",
-    )
-    p.add_argument(
         "--no-instrument-check", dest="no_instrument_check", action="store_true",
         help="Skip the TradeNation catalog lookup that maps the chart "
              "symbol (e.g. XAGUSD) to the broker's canonical name "
@@ -1280,7 +1269,6 @@ _tv_arm_hs() {
         '--skip-break-and-close[drop the break-and-close prep]'
         '--skip-retest[drop the retest prep]'
         '--require-golden[require golden candle on entry (needs_golden:true)]'
-        '--close-on-reversal[emit a 6th alert that closes the trade on an opposing golden reversal during news]'
         '--no-instrument-check[skip the TN catalog lookup for the chart symbol]'
         '--print-completions[print this zsh completion script and exit]'
         '(- *)'{-h,--help}'[show help and exit]'
@@ -1431,7 +1419,12 @@ def main(argv: Optional[list[str]] = None) -> int:
         spec["allow_entry"] = args.entry_filter_script
     if args.require_golden:
         spec["needs_golden"] = True
-    if args.close_on_reversal:
+    # Auto-enable the close-on-reversal alert whenever the operator
+    # has drawn news-start/news-end pairs on the chart. The alert
+    # itself is gated by the worker on an active `news:<trade_id>:*`
+    # KV entry — so even though it's armed unconditionally, it only
+    # actually fires between the news-start and news-end of any pair.
+    if roles.news_pairs:
         spec["close_on_news"] = True
     if args.entry_market:
         spec["entry_mode"] = "market"
@@ -1514,9 +1507,9 @@ def main(argv: Optional[list[str]] = None) -> int:
     # News-window bundles. Parallel to pause_bundles but in their own
     # KV namespace and tied to the close-on-reversal alert rather than
     # entry gating. Operator opts in by drawing `news-start` /
-    # `news-end` vertical lines; the matching `06-close-on-reversal`
-    # alert in the trade bundle (when --close-on-reversal is set) is
-    # what acts on the window.
+    # `news-end` vertical lines; the trade bundle's
+    # `06-close-on-reversal` alert (auto-enabled when news pairs are
+    # present) is what acts on the window.
     news_bundles: list[tuple[tuple[dict, dict], dict, Path]] = []
     if roles.news_pairs and trade_id:
         print(f"# {len(roles.news_pairs)} news pair(s) on chart "
@@ -1550,10 +1543,6 @@ def main(argv: Optional[list[str]] = None) -> int:
                 return 3
             news_manifest = parse_manifest(news_manifest_path.read_text())
             news_bundles.append((pair, news_manifest, news_dir))
-        if not args.close_on_reversal:
-            print("# WARN: news-* lines drawn but --close-on-reversal not set; "
-                  "the news windows will arm in the worker but nothing fires on "
-                  "them.", file=sys.stderr)
         print()
     elif roles.news_pairs and not trade_id:
         print("ERROR: have news pairs but H&S manifest has no trade_id; "
