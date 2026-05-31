@@ -54,15 +54,17 @@ pub fn run(args: Args) -> Result<i32> {
     let (_exchange, raw_sym) = split_symbol(&state.symbol);
     let raw_sym = raw_sym.to_string();
     let broker = resolve_broker(&args, &state.symbol)?;
-    // Use TV's bare symbol (e.g. `EURUSD`) for everything downstream:
-    // trade spec, calendar-bars lookup, alert payloads. The worker
-    // accepts either bare or slash form for TN, and OANDA only ever
-    // sees this through the calendar-bars OANDA-style parser. Avoids
-    // the slash-vs-underscore-vs-bare mapping zoo entirely.
-    let instrument = raw_sym.clone();
+    // Resolve through the instrument-lookup catalog: this both
+    // validates that the asset is listed on the chosen broker and
+    // gives us the broker-canonical symbol (`EUR/USD` for TN,
+    // `EUR_USD` for OANDA, `Switzerland 20` for SMI on TN, etc.).
+    // Hard errors if the chart's symbol isn't in the catalog.
+    let resolved = crate::instrument_resolution::resolve_for_broker(&state.symbol, broker)?;
+    let instrument = resolved.broker_symbol.clone();
 
     info!(
         chart = %state.symbol,
+        asset_id = %resolved.asset.id,
         resolution = %state.resolution,
         broker = broker.as_str(),
         instrument = %instrument,
