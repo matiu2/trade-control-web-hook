@@ -9,6 +9,7 @@ clap = { version = "4.6.1", features = ["derive", "env"] }
 clap_complete = "4.6.5"
 color-eyre = "0.6.5"
 hex = "0.4.3"
+instrument-lookup = { version = "0.1.0", path = "../../instrument-lookup" }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
 serde_yaml = "0.9.34"
@@ -16,6 +17,7 @@ tokio = { version = "1.52.3", features = ["full"] }
 tracing = "0.1.44"
 tracing-error = "0.2.1"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+trade-calendar-maker = { version = "0.1.0", path = "../../../trade-calendar-maker" }
 trade-control-cli = { version = "0.1.0", path = "../cli" }
 trade-control-conventions = { version = "0.1.0", path = "../conventions" }
 trade-control-core = { version = "0.1.0", path = "../core" }

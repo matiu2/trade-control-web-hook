@@ -24,6 +24,7 @@ mod args;
 mod create_alerts;
 mod drawings;
 mod geometry;
+mod instrument_resolution;
 mod manifest;
 mod pair_lines;
 mod pipeline;
