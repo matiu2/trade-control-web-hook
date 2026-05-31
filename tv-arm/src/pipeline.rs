@@ -80,7 +80,7 @@ pub fn run(args: Args) -> Result<i32> {
     let should_auto_draw =
         !args.skip_calendar_bars && roles.blackout_pairs.is_empty() && roles.news_pairs.is_empty();
     if should_auto_draw {
-        if let Err(e) = auto_draw_calendar_lines(&mcp, &state.resolution, &instrument) {
+        if let Err(e) = auto_draw_calendar_lines(&mcp, &state.resolution, &resolved) {
             warn!(error = ?e, "calendar auto-draw failed; continuing with chart as-is");
         } else {
             drawings = mcp.list_drawings().wrap_err("re-list TV drawings")?;
@@ -546,13 +546,20 @@ fn build_news_bundles(
 /// Auto-draw vertical lines on the chart from this week's
 /// forex-factory events. Used when the operator hasn't drawn any
 /// blackout/news pairs themselves.
-fn auto_draw_calendar_lines(mcp: &TvMcp, resolution: &str, instrument: &str) -> Result<()> {
+fn auto_draw_calendar_lines(
+    mcp: &TvMcp,
+    resolution: &str,
+    resolved: &crate::instrument_resolution::ResolvedInstrument,
+) -> Result<()> {
     let timeframe = infer_calendar_timeframe(resolution).ok_or_else(|| {
         eyre!("chart resolution {resolution:?} is below 15m; calendar bars skipped")
     })?;
     let now = Utc::now();
-    let instrument_parsed = cli::parse_instrument(instrument)
-        .map_err(|e| eyre!("parse_instrument({instrument:?}): {e}"))?;
+    // Synthesise the tcm Instrument straight from the catalog Asset
+    // so non-FX assets (SMI, gold, indices) get correct news-currency
+    // exposure without the FX-only cli::parse_instrument path.
+    let instrument_parsed =
+        crate::instrument_resolution::synthesize_calendar_instrument(resolved.asset);
     let runtime = tokio::runtime::Runtime::new().context("starting tokio runtime")?;
     let events = runtime
         .block_on(cli::fetch_week_events(now))
@@ -560,7 +567,7 @@ fn auto_draw_calendar_lines(mcp: &TvMcp, resolution: &str, instrument: &str) -> 
     let inputs = cli::PlanInputs {
         // trade_id isn't used for the line geometry — empty string is fine.
         trade_id: String::new(),
-        instrument: instrument.to_string(),
+        instrument: resolved.broker_symbol.clone(),
         account: String::new(),
         broker: cli::BrokerKind::Oanda,
     };
