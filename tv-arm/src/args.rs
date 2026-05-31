@@ -118,11 +118,6 @@ pub struct Args {
     #[arg(long)]
     pub skip_calendar_bars: bool,
 
-    /// Skip the TradeNation catalog lookup that maps the chart symbol
-    /// to the broker's canonical name.
-    #[arg(long)]
-    pub no_instrument_check: bool,
-
     /// Half-width of the price band around each chart-drawn
     /// `support` / `resistance` line, as a percent of the line's
     /// price. Default 0.1 (= ±0.1% of price). Ignored when no
