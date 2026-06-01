@@ -166,7 +166,75 @@ pub fn plan_calendar_bars_within(
         });
     }
     rows.sort_by_key(|r| r.event_time);
+    rows = merge_overlapping_rows(rows);
     Ok(CalendarBarPlan { rows })
+}
+
+/// Collapse rows whose combined blocking windows overlap into a single
+/// consolidated pause+news pair per cluster.
+///
+/// Two adjacent (in time-sorted order) rows are in the same cluster
+/// when the later row's pause-window starts at or before the earlier
+/// row's news-window ends. Each cluster emits one row:
+///
+///   - `event_time`  = last event's time (the pivot the merged pause
+///     runs up to, and the merged news runs from),
+///   - pause window  = `[first event's pause.start, last event's time]`,
+///   - news window   = `[last event's time, max news.end across cluster]`.
+///
+/// Metadata (name, currency, impact, slug, ids, reasons) is taken from
+/// the last event in the cluster — the one whose resolution actually
+/// closes the merged window. Cluster ids gain a `-merged` suffix when
+/// they cover more than one event so they stay distinct from the
+/// single-event case on other charts.
+fn merge_overlapping_rows(rows: Vec<CalendarBarRow>) -> Vec<CalendarBarRow> {
+    struct Cluster {
+        first_pause_start: DateTime<Utc>,
+        news_end: DateTime<Utc>,
+        size: usize,
+        last: CalendarBarRow,
+    }
+
+    let mut clusters: Vec<Cluster> = Vec::new();
+    for row in rows {
+        let pause_start = row.pause_spec.start_time;
+        let news_end = row.news_spec.end_time;
+        if let Some(cur) = clusters.last_mut()
+            && pause_start <= cur.news_end
+        {
+            cur.news_end = cur.news_end.max(news_end);
+            cur.size += 1;
+            cur.last = row;
+        } else {
+            clusters.push(Cluster {
+                first_pause_start: pause_start,
+                news_end,
+                size: 1,
+                last: row,
+            });
+        }
+    }
+
+    clusters
+        .into_iter()
+        .map(|c| {
+            let mut out = c.last;
+            let pivot = out.event_time;
+            out.pause_spec.start_time = c.first_pause_start;
+            out.pause_spec.end_time = pivot;
+            out.news_spec.start_time = pivot;
+            out.news_spec.end_time = c.news_end;
+            if c.size > 1 {
+                if let Some(ref mut id) = out.pause_spec.blackout_id {
+                    *id = format!("{id}-merged");
+                }
+                if let Some(ref mut id) = out.news_spec.news_id {
+                    *id = format!("{id}-merged");
+                }
+            }
+            out
+        })
+        .collect()
 }
 
 /// Lowercase, replace runs of non-`[a-z0-9]` with a single `-`, trim
@@ -539,7 +607,12 @@ mod tests {
         let now = ts("2026-06-01T06:00:00Z");
         let expiry = ts("2026-06-03T11:00:00Z");
         let events = vec![
-            ev("BOE Gov Bailey Speaks", "GBP", Impact::High, "2026-06-02T14:00:00Z"),
+            ev(
+                "BOE Gov Bailey Speaks",
+                "GBP",
+                Impact::High,
+                "2026-06-02T14:00:00Z",
+            ),
             ev("Beyond Expiry", "GBP", Impact::High, "2026-06-04T08:00:00Z"),
         ];
         let inst = Instrument {
@@ -556,15 +629,9 @@ mod tests {
             "default 9h window must drop the +32h Bailey event"
         );
 
-        let plan_wide = plan_calendar_bars_within(
-            &events,
-            &inst,
-            Timeframe::H1Plus,
-            now,
-            expiry,
-            &inputs(),
-        )
-        .unwrap();
+        let plan_wide =
+            plan_calendar_bars_within(&events, &inst, Timeframe::H1Plus, now, expiry, &inputs())
+                .unwrap();
         assert_eq!(
             plan_wide.rows.len(),
             1,
@@ -579,21 +646,10 @@ mod tests {
         // (callers passing trade_expiry <= now should get a clean empty
         // plan, not a panic or an off-by-one).
         let now = ts("2026-06-01T06:00:00Z");
-        let events = vec![ev(
-            "Future",
-            "USD",
-            Impact::High,
-            "2026-06-01T07:00:00Z",
-        )];
-        let plan = plan_calendar_bars_within(
-            &events,
-            &eur_usd(),
-            Timeframe::H1Plus,
-            now,
-            now,
-            &inputs(),
-        )
-        .unwrap();
+        let events = vec![ev("Future", "USD", Impact::High, "2026-06-01T07:00:00Z")];
+        let plan =
+            plan_calendar_bars_within(&events, &eur_usd(), Timeframe::H1Plus, now, now, &inputs())
+                .unwrap();
         assert!(plan.rows.is_empty());
     }
 
@@ -612,13 +668,24 @@ mod tests {
 
     #[test]
     fn m15_drops_low_keeps_medium_and_high() {
-        let now = ts("2026-06-06T12:00:00Z");
+        // Events are spaced > 4h apart (M15 buf_before+buf_after) so
+        // the merge pass doesn't collapse them — this test exercises
+        // the impact filter, not the merge behaviour.
+        let now = ts("2026-06-06T08:00:00Z");
         let events = vec![
             ev("Low evt", "USD", Impact::Low, "2026-06-06T13:00:00Z"),
             ev("Med evt", "USD", Impact::Medium, "2026-06-06T13:10:00Z"),
-            ev("High evt", "USD", Impact::High, "2026-06-06T13:20:00Z"),
+            ev("High evt", "USD", Impact::High, "2026-06-06T18:00:00Z"),
         ];
-        let plan = plan_calendar_bars(&events, &eur_usd(), Timeframe::M15, now, &inputs()).unwrap();
+        let plan = plan_calendar_bars_within(
+            &events,
+            &eur_usd(),
+            Timeframe::M15,
+            now,
+            ts("2026-06-06T20:00:00Z"),
+            &inputs(),
+        )
+        .unwrap();
         let kept: Vec<&str> = plan.rows.iter().map(|r| r.event_name.as_str()).collect();
         assert_eq!(kept, vec!["Med evt", "High evt"]);
     }
@@ -640,13 +707,23 @@ mod tests {
 
     #[test]
     fn drops_events_for_unaffected_currency() {
-        let now = ts("2026-06-06T12:00:00Z");
+        // Events spaced > 4h apart so the merge pass doesn't collapse
+        // the surviving USD + EUR events into one row.
+        let now = ts("2026-06-06T08:00:00Z");
         let events = vec![
             ev("USD evt", "USD", Impact::High, "2026-06-06T13:00:00Z"),
             ev("JPY evt", "JPY", Impact::High, "2026-06-06T13:10:00Z"),
-            ev("EUR evt", "EUR", Impact::High, "2026-06-06T13:20:00Z"),
+            ev("EUR evt", "EUR", Impact::High, "2026-06-06T18:00:00Z"),
         ];
-        let plan = plan_calendar_bars(&events, &eur_usd(), Timeframe::M15, now, &inputs()).unwrap();
+        let plan = plan_calendar_bars_within(
+            &events,
+            &eur_usd(),
+            Timeframe::M15,
+            now,
+            ts("2026-06-06T20:00:00Z"),
+            &inputs(),
+        )
+        .unwrap();
         let kept: Vec<&str> = plan.rows.iter().map(|r| r.event_name.as_str()).collect();
         assert_eq!(kept, vec!["USD evt", "EUR evt"]);
     }
@@ -707,13 +784,23 @@ mod tests {
 
     #[test]
     fn rows_sorted_by_event_time() {
-        let now = ts("2026-06-06T12:00:00Z");
+        // Events spaced > 4h apart so each is its own cluster and the
+        // sort-then-merge pass preserves chronological order.
+        let now = ts("2026-06-06T08:00:00Z");
         let events = vec![
-            ev("Later", "USD", Impact::High, "2026-06-06T15:00:00Z"),
+            ev("Later", "USD", Impact::High, "2026-06-07T03:00:00Z"),
             ev("Earlier", "USD", Impact::High, "2026-06-06T13:30:00Z"),
-            ev("Middle", "USD", Impact::High, "2026-06-06T14:15:00Z"),
+            ev("Middle", "USD", Impact::High, "2026-06-06T18:30:00Z"),
         ];
-        let plan = plan_calendar_bars(&events, &eur_usd(), Timeframe::M15, now, &inputs()).unwrap();
+        let plan = plan_calendar_bars_within(
+            &events,
+            &eur_usd(),
+            Timeframe::M15,
+            now,
+            ts("2026-06-07T06:00:00Z"),
+            &inputs(),
+        )
+        .unwrap();
         let times: Vec<_> = plan.rows.iter().map(|r| r.event_name.clone()).collect();
         assert_eq!(times, vec!["Earlier", "Middle", "Later"]);
     }
@@ -807,6 +894,171 @@ mod tests {
         assert_eq!(kept.len(), 2);
         assert_eq!(kept[0].name, "CPI m/m");
         assert_eq!(kept[1].name, "NFP");
+    }
+
+    #[test]
+    fn merges_overlapping_back_to_back_events_into_single_pair() {
+        // Two H1+ events 1h apart. Each event's pause window is 8h
+        // before the event, so event B's pause-window (06:00 .. 14:00)
+        // starts well inside event A's blackout (05:00 .. 13:00) and
+        // also overlaps A's news (13:00 .. 14:00). The result should be
+        // one merged pair: pause [05:00, 14:00], news [14:00, 15:00].
+        let now = ts("2026-06-06T03:00:00Z");
+        let events = vec![
+            ev("A", "USD", Impact::High, "2026-06-06T13:00:00Z"),
+            ev("B", "USD", Impact::High, "2026-06-06T14:00:00Z"),
+        ];
+        let plan = plan_calendar_bars_within(
+            &events,
+            &eur_usd(),
+            Timeframe::H1Plus,
+            now,
+            ts("2026-06-06T16:00:00Z"),
+            &inputs(),
+        )
+        .unwrap();
+        assert_eq!(plan.rows.len(), 1, "two overlapping events must merge");
+        let row = &plan.rows[0];
+        assert_eq!(
+            row.event_name, "B",
+            "last event in cluster becomes the pivot"
+        );
+        assert_eq!(row.pause_spec.start_time, ts("2026-06-06T05:00:00Z"));
+        assert_eq!(row.pause_spec.end_time, ts("2026-06-06T14:00:00Z"));
+        assert_eq!(row.news_spec.start_time, ts("2026-06-06T14:00:00Z"));
+        assert_eq!(row.news_spec.end_time, ts("2026-06-06T15:00:00Z"));
+        assert_eq!(row.pause_spec.end_time, row.news_spec.start_time);
+        // Merged ids get a -merged suffix to stay distinct from the
+        // un-merged single-event case on other charts.
+        assert!(
+            row.pause_spec
+                .blackout_id
+                .as_deref()
+                .is_some_and(|id| id.ends_with("-merged")),
+            "blackout_id should end with -merged: {:?}",
+            row.pause_spec.blackout_id,
+        );
+        assert!(
+            row.news_spec
+                .news_id
+                .as_deref()
+                .is_some_and(|id| id.ends_with("-merged")),
+            "news_id should end with -merged: {:?}",
+            row.news_spec.news_id,
+        );
+        assert!(
+            trade_control_core::intent::is_valid_trade_id(
+                row.pause_spec.blackout_id.as_deref().unwrap()
+            ),
+            "merged blackout_id must still be a valid slug",
+        );
+        assert!(
+            trade_control_core::intent::is_valid_trade_id(
+                row.news_spec.news_id.as_deref().unwrap()
+            ),
+            "merged news_id must still be a valid slug",
+        );
+    }
+
+    #[test]
+    fn merges_three_overlapping_events_into_one_pair() {
+        // A new pause arriving between an earlier pause's news tail
+        // and that pause's resume — the literal case from the user's
+        // brief. All three events should collapse into one pair
+        // anchored on the last event.
+        let now = ts("2026-06-06T00:00:00Z");
+        let events = vec![
+            ev("A", "USD", Impact::High, "2026-06-06T10:00:00Z"),
+            ev("B", "USD", Impact::High, "2026-06-06T10:30:00Z"),
+            ev("C", "USD", Impact::High, "2026-06-06T11:00:00Z"),
+        ];
+        let plan = plan_calendar_bars_within(
+            &events,
+            &eur_usd(),
+            Timeframe::H1Plus,
+            now,
+            ts("2026-06-06T13:00:00Z"),
+            &inputs(),
+        )
+        .unwrap();
+        assert_eq!(plan.rows.len(), 1);
+        let row = &plan.rows[0];
+        assert_eq!(row.event_name, "C");
+        // Pause runs from A's pause-start (02:00) to C's event_time.
+        assert_eq!(row.pause_spec.start_time, ts("2026-06-06T02:00:00Z"));
+        assert_eq!(row.pause_spec.end_time, ts("2026-06-06T11:00:00Z"));
+        // News runs from C's event_time to max-news-end (C's news_end = 12:00).
+        assert_eq!(row.news_spec.start_time, ts("2026-06-06T11:00:00Z"));
+        assert_eq!(row.news_spec.end_time, ts("2026-06-06T12:00:00Z"));
+    }
+
+    #[test]
+    fn disjoint_events_are_not_merged() {
+        // Two M15 events spaced 6h apart — neither pause window
+        // reaches into the other event's news window, so they must
+        // remain separate rows. M15 buf_before=3h, buf_after=1h:
+        // event A at 04:00 covers [01:00, 05:00]; event B at 10:00
+        // covers [07:00, 11:00] — strict gap of 2h, no merge.
+        let now = ts("2026-06-06T00:00:00Z");
+        let events = vec![
+            ev("A", "USD", Impact::High, "2026-06-06T04:00:00Z"),
+            ev("B", "USD", Impact::High, "2026-06-06T10:00:00Z"),
+        ];
+        // Need a wider lookahead than the default 4h to keep both.
+        let plan = plan_calendar_bars_within(
+            &events,
+            &eur_usd(),
+            Timeframe::M15,
+            now,
+            ts("2026-06-06T12:00:00Z"),
+            &inputs(),
+        )
+        .unwrap();
+        assert_eq!(plan.rows.len(), 2, "disjoint events stay separate");
+        assert_eq!(plan.rows[0].event_name, "A");
+        assert_eq!(plan.rows[1].event_name, "B");
+        // Neither should carry a -merged suffix.
+        for row in &plan.rows {
+            assert!(
+                !row.pause_spec
+                    .blackout_id
+                    .as_deref()
+                    .unwrap_or("")
+                    .contains("-merged"),
+                "unmerged row must not carry -merged suffix",
+            );
+        }
+    }
+
+    #[test]
+    fn adjacent_events_at_resume_boundary_merge() {
+        // Event B's pause window starts exactly when event A's news
+        // window ends (A.news_end == B.pause_start). The user's "back
+        // to back" case: no gap at all between A's resume and B's new
+        // pause. Treat adjacency as overlap so we don't emit a
+        // zero-length gap pair.
+        // M15: A at 04:00 → news_end 05:00. B's pause_start = 05:00
+        // means B at 08:00 (8h? no, M15 buf_before=3h so B at 08:00 →
+        // pause_start 05:00). Pick B at 08:00.
+        let now = ts("2026-06-06T00:00:00Z");
+        let events = vec![
+            ev("A", "USD", Impact::High, "2026-06-06T04:00:00Z"),
+            ev("B", "USD", Impact::High, "2026-06-06T08:00:00Z"),
+        ];
+        let plan = plan_calendar_bars_within(
+            &events,
+            &eur_usd(),
+            Timeframe::M15,
+            now,
+            ts("2026-06-06T12:00:00Z"),
+            &inputs(),
+        )
+        .unwrap();
+        assert_eq!(plan.rows.len(), 1, "adjacent boundary must still merge");
+        let row = &plan.rows[0];
+        assert_eq!(row.pause_spec.start_time, ts("2026-06-06T01:00:00Z"));
+        assert_eq!(row.pause_spec.end_time, ts("2026-06-06T08:00:00Z"));
+        assert_eq!(row.news_spec.end_time, ts("2026-06-06T09:00:00Z"));
     }
 
     #[test]
