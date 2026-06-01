@@ -88,7 +88,14 @@ pub fn run(args: Args) -> Result<i32> {
     let should_auto_draw =
         !args.skip_calendar_bars && roles.blackout_pairs.is_empty() && roles.news_pairs.is_empty();
     if should_auto_draw {
-        if let Err(e) = auto_draw_calendar_lines(&mcp, &state.resolution, &resolved) {
+        // Read the trade-expiry drawing before auto-draw so we can widen
+        // the calendar lookahead to cover the full trade lifetime, not
+        // just the next ~9h H1+ buffer window. If the expiry drawing is
+        // missing or unparseable, fall back to None — auto-draw will use
+        // its default buffer window, and check_required (step 3) will
+        // surface the missing drawing as a hard error shortly anyway.
+        let expiry_hint = read_trade_expiry(&roles).ok();
+        if let Err(e) = auto_draw_calendar_lines(&mcp, &state.resolution, &resolved, expiry_hint) {
             warn!(error = ?e, "calendar auto-draw failed; continuing with chart as-is");
         } else {
             drawings = mcp.list_drawings().wrap_err("re-list TV drawings")?;
@@ -111,19 +118,7 @@ pub fn run(args: Args) -> Result<i32> {
         .as_ref()
         .ok_or_else(|| eyre!("missing tp_fib (already checked in step 3)"))?;
     let tp = tp_price_from_fib(&tp_fib.prices(), direction);
-    let trade_expiry_d = roles
-        .trade_expiry
-        .as_ref()
-        .ok_or_else(|| eyre!("missing trade_expiry (already checked in step 3)"))?;
-    let expiry_unix = trade_expiry_d
-        .points
-        .first()
-        .ok_or_else(|| eyre!("trade_expiry has no points"))?
-        .time;
-    let expiry = Utc
-        .timestamp_opt(expiry_unix, 0)
-        .single()
-        .ok_or_else(|| eyre!("invalid trade_expiry timestamp {expiry_unix}"))?;
+    let expiry = read_trade_expiry(&roles)?;
 
     info!(
         direction = direction.as_str(),
@@ -666,13 +661,39 @@ fn build_news_bundles(
     Ok(bundles)
 }
 
-/// Auto-draw vertical lines on the chart from this week's
-/// forex-factory events. Used when the operator hasn't drawn any
+/// Parse the trade-expiry timestamp from the classified drawings.
+/// Used both as the hard expiry for the trade bundle and (when known
+/// pre-auto-draw) as the lookahead horizon for calendar bars so the
+/// auto-draw covers the trade's full lifetime instead of just the
+/// next H1+ buffer window.
+fn read_trade_expiry(roles: &Roles) -> Result<DateTime<Utc>> {
+    let trade_expiry_d = roles
+        .trade_expiry
+        .as_ref()
+        .ok_or_else(|| eyre!("missing trade_expiry"))?;
+    let expiry_unix = trade_expiry_d
+        .points
+        .first()
+        .ok_or_else(|| eyre!("trade_expiry has no points"))?
+        .time;
+    Utc.timestamp_opt(expiry_unix, 0)
+        .single()
+        .ok_or_else(|| eyre!("invalid trade_expiry timestamp {expiry_unix}"))
+}
+
+/// Auto-draw vertical lines on the chart from forex-factory events
+/// over the trade's lifetime. Used when the operator hasn't drawn any
 /// blackout/news pairs themselves.
+///
+/// When `expiry_hint` is `Some`, the lookahead horizon is the trade
+/// expiry (so multi-day H1+ trades pick up events past the default
+/// 9h buffer). When `None` (rare: expiry drawing missing), falls back
+/// to the default buffer-only window from `plan_calendar_bars`.
 fn auto_draw_calendar_lines(
     mcp: &TvMcp,
     resolution: &str,
     resolved: &crate::instrument_resolution::ResolvedInstrument,
+    expiry_hint: Option<DateTime<Utc>>,
 ) -> Result<()> {
     let timeframe = infer_calendar_timeframe(resolution).ok_or_else(|| {
         eyre!("chart resolution {resolution:?} is below 15m; calendar bars skipped")
@@ -684,9 +705,14 @@ fn auto_draw_calendar_lines(
     let instrument_parsed =
         crate::instrument_resolution::synthesize_calendar_instrument(resolved.asset);
     let runtime = tokio::runtime::Runtime::new().context("starting tokio runtime")?;
-    let events = runtime
-        .block_on(cli::fetch_week_events(now))
-        .wrap_err("fetch_week_events")?;
+    let events = match expiry_hint {
+        Some(expiry) if expiry > now => runtime
+            .block_on(cli::fetch_events_for_range(now, expiry))
+            .wrap_err("fetch_events_for_range")?,
+        _ => runtime
+            .block_on(cli::fetch_week_events(now))
+            .wrap_err("fetch_week_events")?,
+    };
     let inputs = cli::PlanInputs {
         // trade_id isn't used for the line geometry — empty string is fine.
         trade_id: String::new(),
@@ -694,8 +720,25 @@ fn auto_draw_calendar_lines(
         account: String::new(),
         broker: cli::BrokerKind::Oanda,
     };
-    let plan = cli::plan_calendar_bars(&events, &instrument_parsed, timeframe.into(), now, &inputs)
-        .wrap_err("plan_calendar_bars")?;
+    let plan = match expiry_hint {
+        Some(expiry) if expiry > now => cli::plan_calendar_bars_within(
+            &events,
+            &instrument_parsed,
+            timeframe.into(),
+            now,
+            expiry,
+            &inputs,
+        )
+        .wrap_err("plan_calendar_bars_within")?,
+        _ => cli::plan_calendar_bars(&events, &instrument_parsed, timeframe.into(), now, &inputs)
+            .wrap_err("plan_calendar_bars")?,
+    };
+    info!(
+        events_fetched = events.len(),
+        events_kept = plan.rows.len(),
+        horizon = ?expiry_hint.map(|e| e.to_rfc3339()),
+        "calendar fetch + plan",
+    );
     if plan.rows.is_empty() {
         info!("no calendar events in window — nothing to auto-draw");
         return Ok(());

@@ -22,7 +22,7 @@ pub use admin_secret::{delete_secret, put_secret, secret_binding_for};
 pub use calendar_bars::{
     CalendarBarPlan, CalendarBarRow, CalendarBarsArgs, CalendarBrokerArg, PlanInputs, TimeframeArg,
     dedupe_and_filter_events, fetch_events_for_range, fetch_week_events, parse_instrument,
-    plan_calendar_bars, print_summary_table, run_calendar_bars,
+    plan_calendar_bars, plan_calendar_bars_within, print_summary_table, run_calendar_bars,
 };
 pub use control::{
     build_clear_prep_intent, build_clear_veto_intent, build_prep_intent, build_status_intent,

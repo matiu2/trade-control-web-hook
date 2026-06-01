@@ -69,10 +69,12 @@ pub struct PlanInputs {
     pub broker: BrokerKind,
 }
 
-/// Plan calendar bars: filter events by lookahead window, impact, and
-/// instrument-affected-by-currency, then split each kept event into a
-/// pause-spec and a news-spec. Pure — no I/O, no signing — so tests can
-/// hand it a fixture `Vec<EconomicEvent>` and assert on the result.
+/// Plan calendar bars over the default "next buffer window" horizon —
+/// `now + buffer_before + buffer_after`. Suitable for callers that
+/// only want to pause around imminent events (e.g. the standalone
+/// `calendar-bars` CLI). For callers whose horizon is governed by a
+/// separate signal (e.g. tv-arm's trade-expiry), use
+/// [`plan_calendar_bars_within`] and pass an explicit `lookahead_end`.
 pub fn plan_calendar_bars(
     events: &[EconomicEvent],
     instrument: &Instrument,
@@ -80,10 +82,31 @@ pub fn plan_calendar_bars(
     now: DateTime<Utc>,
     inputs: &PlanInputs,
 ) -> Result<CalendarBarPlan> {
-    let min_impact = timeframe.min_blocking_impact();
     let buf_before = timeframe.buffer_before();
     let buf_after = timeframe.buffer_after();
     let lookahead_end = now + buf_before + buf_after;
+    plan_calendar_bars_within(events, instrument, timeframe, now, lookahead_end, inputs)
+}
+
+/// Plan calendar bars across an explicit horizon `[now, lookahead_end]`.
+/// Filters by impact (per `timeframe.min_blocking_impact()`) and the
+/// instrument's `is_affected_by(currency)` rule, then splits each kept
+/// event into a pause-spec (`[event - buffer_before, event]`) and a
+/// news-spec (`[event, event + buffer_after]`).
+///
+/// Pure — no I/O, no signing. Empty range (`lookahead_end <= now`)
+/// returns an empty plan.
+pub fn plan_calendar_bars_within(
+    events: &[EconomicEvent],
+    instrument: &Instrument,
+    timeframe: Timeframe,
+    now: DateTime<Utc>,
+    lookahead_end: DateTime<Utc>,
+    inputs: &PlanInputs,
+) -> Result<CalendarBarPlan> {
+    let min_impact = timeframe.min_blocking_impact();
+    let buf_before = timeframe.buffer_before();
+    let buf_after = timeframe.buffer_after();
 
     let mut rows: Vec<CalendarBarRow> = Vec::new();
     for ev in events {
@@ -504,6 +527,74 @@ mod tests {
         let plan = plan_calendar_bars(&events, &eur_usd(), Timeframe::M15, now, &inputs()).unwrap();
         assert_eq!(plan.rows.len(), 1);
         assert_eq!(plan.rows[0].event_name, "Future NFP");
+    }
+
+    #[test]
+    fn within_extends_horizon_beyond_default_buffer() {
+        // The motivating case for plan_calendar_bars_within: an H1Plus
+        // chart arming a trade whose expiry is 2 days out. The default
+        // plan_calendar_bars window is 9h (8h buf_before + 1h
+        // buf_after), so events at +30h and +50h are dropped. The
+        // _within variant with lookahead_end = expiry should keep them.
+        let now = ts("2026-06-01T06:00:00Z");
+        let expiry = ts("2026-06-03T11:00:00Z");
+        let events = vec![
+            ev("BOE Gov Bailey Speaks", "GBP", Impact::High, "2026-06-02T14:00:00Z"),
+            ev("Beyond Expiry", "GBP", Impact::High, "2026-06-04T08:00:00Z"),
+        ];
+        let inst = Instrument {
+            symbol: "GBPCAD".to_string(),
+            instrument_type: InstrumentType::Forex,
+            affected_currencies: vec!["GBP".to_string(), "CAD".to_string()],
+        };
+
+        let plan_default =
+            plan_calendar_bars(&events, &inst, Timeframe::H1Plus, now, &inputs()).unwrap();
+        assert_eq!(
+            plan_default.rows.len(),
+            0,
+            "default 9h window must drop the +32h Bailey event"
+        );
+
+        let plan_wide = plan_calendar_bars_within(
+            &events,
+            &inst,
+            Timeframe::H1Plus,
+            now,
+            expiry,
+            &inputs(),
+        )
+        .unwrap();
+        assert_eq!(
+            plan_wide.rows.len(),
+            1,
+            "expiry-wide window must keep the Bailey event"
+        );
+        assert_eq!(plan_wide.rows[0].event_name, "BOE Gov Bailey Speaks");
+    }
+
+    #[test]
+    fn within_empty_window_returns_no_rows() {
+        // Defensive: a lookahead_end <= now must produce zero rows
+        // (callers passing trade_expiry <= now should get a clean empty
+        // plan, not a panic or an off-by-one).
+        let now = ts("2026-06-01T06:00:00Z");
+        let events = vec![ev(
+            "Future",
+            "USD",
+            Impact::High,
+            "2026-06-01T07:00:00Z",
+        )];
+        let plan = plan_calendar_bars_within(
+            &events,
+            &eur_usd(),
+            Timeframe::H1Plus,
+            now,
+            now,
+            &inputs(),
+        )
+        .unwrap();
+        assert!(plan.rows.is_empty());
     }
 
     #[test]
