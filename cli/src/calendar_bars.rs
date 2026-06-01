@@ -26,11 +26,12 @@ use std::path::PathBuf;
 use chrono::{DateTime, Local, Utc};
 use clap::{Parser, ValueEnum};
 use color_eyre::eyre::{Context, Result, eyre};
-use forex_factory::{CalendarService, EconomicEvent, Impact};
+use forex_factory::{EconomicEvent, Impact};
 use trade_calendar_maker::{Instrument, Timeframe};
 use trade_control_core::intent::BrokerKind;
 use trade_control_core::sig::KEY_LEN;
 
+use crate::forex_factory_cache::get_week_events_cached;
 use crate::news_pattern::{NewsSpec, build_news_from_spec, write_news};
 use crate::pause_pattern::{PauseSpec, build_pause_from_spec, write_pause};
 
@@ -272,16 +273,13 @@ pub struct CalendarBarsArgs {
     pub dry_run: bool,
 }
 
-/// Async wrapper around `forex_factory::CalendarService::get_week_events_for`.
-/// Splits I/O from the pure planner so callers can mock events in tests.
+/// Async wrapper around `forex_factory::CalendarService::get_week_events_for`,
+/// routed through the disk cache at `~/.cache/tv-arm/forex-factory/`
+/// (see [`crate::forex_factory_cache`]). Splits I/O from the pure
+/// planner so callers can mock events in tests.
 pub async fn fetch_week_events(now: DateTime<Utc>) -> Result<Vec<EconomicEvent>> {
-    let service =
-        CalendarService::new().map_err(|e| eyre!("creating forex-factory CalendarService: {e}"))?;
     let local_today = now.with_timezone(&Local).date_naive();
-    service
-        .get_week_events_for(local_today)
-        .await
-        .map_err(|e| eyre!("fetching week events: {e}"))
+    get_week_events_cached(local_today).await
 }
 
 /// Fetch every forex-factory event whose timestamp falls in `[from, to]`,
@@ -311,15 +309,9 @@ pub async fn fetch_events_for_range(
         ));
     }
 
-    let service =
-        CalendarService::new().map_err(|e| eyre!("creating forex-factory CalendarService: {e}"))?;
-
     let mut all = Vec::new();
     for anchor in anchors {
-        let week = service
-            .get_week_events_for(anchor)
-            .await
-            .map_err(|e| eyre!("fetching week events for {anchor}: {e}"))?;
+        let week = get_week_events_cached(anchor).await?;
         all.extend(week);
     }
     Ok(dedupe_and_filter_events(all, from, to))

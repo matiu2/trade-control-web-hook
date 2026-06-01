@@ -656,6 +656,18 @@ cargo run -p tv-news --                    # default: draws lines
 No `--broker` flag — news currencies are broker-agnostic. The chart can be on
 any exchange (`TRADENATION:`, `OANDA:`, or bare symbol).
 
+### Forex-factory disk cache
+
+Both `tv-arm` and `tv-news` route every week-fetch through a shared on-disk
+cache at `~/.cache/tv-arm/forex-factory/` (or `$XDG_CACHE_HOME/tv-arm/...`).
+One JSON file per ISO week, named `YYYY-Www.json` (e.g. `2026-W22.json`).
+TTL is **4 weeks from file mtime**, so historical-week files keep serving
+replay/backtest runs for a month after first fetch.
+
+To bust the cache for a specific week, delete its file; the next run
+refetches and overwrites. Corrupt files (unparseable JSON) are silently
+treated as a miss.
+
 ## Known limitations
 
 - **Total open risk** is currently approximated by a count cap
