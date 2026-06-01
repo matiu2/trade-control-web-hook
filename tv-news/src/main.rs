@@ -21,9 +21,11 @@ use clap_complete::{Shell, generate};
 use color_eyre::eyre::Result;
 
 mod args;
+mod bucket;
 mod filter;
 mod label;
 mod pipeline;
+mod resolution;
 
 use crate::args::Args;
 

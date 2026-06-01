@@ -19,8 +19,10 @@ use trading_view::drawings::Drawing;
 use trading_view::mcp::TvMcp;
 
 use crate::args::Args;
-use crate::filter::{events_needing_drawing, filter_events, news_anchor};
-use crate::label::{is_news_label, news_label};
+use crate::bucket::{EventBucket, bucket_events};
+use crate::filter::{events_needing_drawing, filter_events};
+use crate::label::is_news_label;
+use crate::resolution::{DEFAULT_BAR_SECS, resolution_to_secs};
 
 /// Result of resolving the chart into a planning context — what
 /// follow-up phases need before they can fetch and draw events.
@@ -36,6 +38,10 @@ pub struct ChartContext {
     pub visible_from: DateTime<Utc>,
     /// The end of the chart's currently-visible window in UTC.
     pub visible_to: DateTime<Utc>,
+    /// TradingView resolution string (`"15"`, `"60"`, `"D"`, ...).
+    /// Drives the bar-bucketing so events in the same chart bar share
+    /// a single drawing.
+    pub resolution: String,
 }
 
 /// Entry point for `main.rs`. Returns the process exit code so the
@@ -97,13 +103,22 @@ pub fn run(args: Args) -> Result<i32> {
         return Ok(0);
     }
 
+    let bar_secs = resolution_to_secs(&ctx.resolution).unwrap_or(DEFAULT_BAR_SECS);
+    let buckets = bucket_events(to_draw, bar_secs);
+    info!(
+        resolution = %ctx.resolution,
+        bar_secs,
+        buckets = buckets.len(),
+        "grouped events into chart-bar buckets",
+    );
+
     if args.dry_run {
-        log_planned_draws(&to_draw);
+        log_planned_draws(&buckets);
         info!("dry-run: skipping chart drawing");
         return Ok(0);
     }
 
-    let drawn = draw_events(&mcp, &to_draw)?;
+    let drawn = draw_buckets(&mcp, &buckets)?;
     info!(drawn, "vertical lines landed on chart");
     Ok(0)
 }
@@ -149,38 +164,36 @@ fn collect_existing_news_anchors(mcp: &TvMcp) -> Result<Vec<i64>> {
     Ok(out)
 }
 
-/// Log the events we'd draw under `--dry-run` so the operator can
+/// Log the buckets we'd draw under `--dry-run` so the operator can
 /// verify the plan before re-running for real.
-fn log_planned_draws(events: &[EconomicEvent]) {
-    for ev in events {
+fn log_planned_draws(buckets: &[EventBucket]) {
+    for b in buckets {
         info!(
-            event = %ev.name,
-            currency = %ev.currency,
-            impact = ?ev.impact,
-            anchor = %news_anchor(ev),
-            label = %news_label(ev),
+            anchor = %b.anchor(),
+            event_count = b.events.len(),
+            label = %b.label(),
             "would draw",
         );
     }
 }
 
-/// Draw one labelled vertical line per event at the event's anchor
+/// Draw one labelled vertical line per bucket at the bucket's anchor
 /// time. Returns the count of lines that landed successfully. tv-mcp
 /// errors short-circuit so the operator can re-run after fixing the
 /// cause rather than ending up with a half-drawn chart.
-fn draw_events(mcp: &TvMcp, events: &[EconomicEvent]) -> Result<usize> {
+fn draw_buckets(mcp: &TvMcp, buckets: &[EventBucket]) -> Result<usize> {
     let mut drawn = 0usize;
-    for ev in events {
-        let anchor = news_anchor(ev);
-        let label = news_label(ev);
+    for b in buckets {
+        let anchor = b.anchor();
+        let label = b.label();
         // tv-mcp wants a price; vertical lines ignore it for evaluation
         // but require something parseable. Use 1.0 — matches tv-arm's
         // auto-draw helper.
         let s = mcp.draw_vertical_line(anchor.timestamp(), 1.0, &label)?;
         if !s.success {
             return Err(eyre!(
-                "tv-mcp draw {label} failed for {}: {}",
-                ev.name,
+                "tv-mcp draw vertical_line failed at {}: {}",
+                anchor,
                 s.error.as_deref().unwrap_or("(no message)"),
             ));
         }
@@ -224,6 +237,7 @@ fn read_chart_context(mcp: &TvMcp) -> Result<ChartContext> {
         asset,
         visible_from,
         visible_to,
+        resolution: state.resolution.clone(),
     })
 }
 

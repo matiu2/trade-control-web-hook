@@ -636,9 +636,14 @@ What it does:
 5. Skips events that already have a tv-news vertical line within ±5
    minutes (idempotent re-run). Both the new `<ccy>-<n>-star-…` labels and
    the legacy `news-start` / `news-end` labels are recognised for dedupe.
-6. Draws the survivors as a single vertical line each, labelled
-   `<currency>-<stars>-star-<name-slug>` — e.g. `usd-3-star-fomc`,
-   `eur-2-star-cpi-y-y`.
+6. Buckets the survivors by chart bar (per `state.resolution` — `"15"`,
+   `"60"`, `"D"`, ...). Events sharing a bar get one drawing with a
+   combined label.
+7. Draws each bucket as a single vertical line. Single-event buckets are
+   labelled `<currency>-<stars>-star-<name-slug>` (e.g. `usd-3-star-fomc`,
+   `eur-2-star-cpi-y-y`); multi-event buckets concatenate every event's
+   label, joined with `, ` and a newline every 3 events to keep the TV
+   drawing-properties text box readable.
 
 Note: this is purely chart annotation. The worker's news-window vetos and
 the `tv-arm` arming flow continue to use the `news-start` / `news-end` /
