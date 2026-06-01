@@ -142,6 +142,13 @@ pub fn run(args: Args) -> Result<i32> {
         tp,
         &roles,
     );
+    info!(
+        sr_levels_classified = roles.sr_levels.len(),
+        sr_reversal_ranges = trade_spec.sr_reversal_ranges.len(),
+        news_pairs = roles.news_pairs.len(),
+        blackout_pairs = roles.blackout_pairs.len(),
+        "trade spec built — close-on-reversal coverage",
+    );
     let built_trade = cli::build_trade_from_spec(trade_spec, now).wrap_err("build trade bundle")?;
     let trade_id = built_trade.trade_id.clone();
     cli::write_trade(&built_trade, &key, &out_dir).wrap_err("write trade bundle")?;
