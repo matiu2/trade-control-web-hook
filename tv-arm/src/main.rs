@@ -27,6 +27,7 @@ mod instrument_recovery;
 mod instrument_resolution;
 mod manifest;
 mod pipeline;
+mod post_outcome;
 mod roles;
 mod timeframe;
 

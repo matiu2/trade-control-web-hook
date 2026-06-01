@@ -21,7 +21,7 @@ use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, TimeZone, Utc};
 use color_eyre::eyre::{Context, Result, eyre};
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 use trade_control_cli as cli;
 use trade_control_conventions::{Broker, Direction, split_symbol};
 use trade_control_core::sig::KEY_LEN;
@@ -31,6 +31,7 @@ use crate::args::Args;
 use crate::create_alerts::create_alerts;
 use crate::geometry::tp_price_from_fib;
 use crate::manifest::{CalendarBundle, discover_calendar_bundles};
+use crate::post_outcome::{Outcome, classify as classify_outcome};
 use crate::roles::{Roles, classify};
 use crate::timeframe::infer_calendar_timeframe;
 use trading_view::drawings::Drawing;
@@ -222,20 +223,45 @@ pub fn run(args: Args) -> Result<i32> {
         return Ok(0);
     }
     let results = create_alerts(&payloads, mcp.root()).wrap_err("create alerts via tv-mcp")?;
+    let mut failures = 0usize;
     for r in &results {
-        match (&r.status, &r.error) {
-            (Some(status), _) => {
-                let body = r.body.as_deref().unwrap_or("");
-                let body_head = body.chars().take(200).collect::<String>();
-                info!(name = ?r.name, status, body = %body_head, "alert POSTed");
+        let outcome = classify_outcome(r);
+        let body_head = r
+            .body
+            .as_deref()
+            .unwrap_or("")
+            .chars()
+            .take(400)
+            .collect::<String>();
+        match &outcome {
+            Outcome::Ok => {
+                info!(name = ?r.name, status = ?r.status, body = %body_head, "alert POSTed");
             }
-            (None, Some(err)) => {
-                warn!(name = ?r.name, error = %err, "alert FAILED");
+            Outcome::TvError { errmsg, err_code } => {
+                failures += 1;
+                error!(
+                    name = ?r.name,
+                    status = ?r.status,
+                    errmsg = errmsg.as_deref().unwrap_or(""),
+                    err_code = err_code.as_deref().unwrap_or(""),
+                    body = %body_head,
+                    debug = ?r.debug,
+                    "alert REJECTED by TradingView",
+                );
             }
-            (None, None) => {
+            Outcome::TransportError(err) => {
+                failures += 1;
+                error!(name = ?r.name, error = %err, "alert FAILED before POST");
+            }
+            Outcome::NoSignal => {
+                failures += 1;
                 warn!(name = ?r.name, "alert returned with no status or error");
             }
         }
+    }
+    if failures > 0 {
+        error!(failures, total = results.len(), "some alerts did not arm");
+        return Ok(1);
     }
     Ok(0)
 }
