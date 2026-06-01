@@ -3701,6 +3701,7 @@ dependencies = [
 name = "trading-view"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "color-eyre",
  "serde",
  "serde_json",

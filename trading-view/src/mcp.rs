@@ -98,6 +98,13 @@ impl TvMcp {
         self.call_json(&["state"])
     }
 
+    /// `range` — the chart's currently-visible time window plus
+    /// underlying bar coverage. Used by `tv-news` to scope its
+    /// calendar query to what the operator is actually looking at.
+    pub fn get_range(&self) -> Result<crate::range::ChartRange> {
+        self.call_json(&["range"])
+    }
+
     /// Draw a vertical line on the chart anchored at `time` (UNIX
     /// seconds), labeled with `text`. Returns the new drawing's
     /// entity-id so the caller can verify it landed.

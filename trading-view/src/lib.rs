@@ -23,3 +23,4 @@
 pub mod drawings;
 pub mod mcp;
 pub mod pair_lines;
+pub mod range;
