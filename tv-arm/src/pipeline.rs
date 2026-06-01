@@ -58,8 +58,15 @@ pub fn run(args: Args) -> Result<i32> {
     // validates that the asset is listed on the chosen broker and
     // gives us the broker-canonical symbol (`EUR/USD` for TN,
     // `EUR_USD` for OANDA, `Switzerland 20` for SMI on TN, etc.).
-    // Hard errors if the chart's symbol isn't in the catalog.
-    let resolved = crate::instrument_resolution::resolve_for_broker(&state.symbol, broker)?;
+    //
+    // On a catalog miss we try to recover by asking tv-mcp for the
+    // chart's symbol-info (`tv info`) — its `description` field
+    // usually matches the broker's name for the asset (e.g. the
+    // chart shows `GOOGL` but the catalog has `ALPHABET`). On a
+    // successful recovery the user overlay is patched so future runs
+    // resolve directly. If that also misses, we error with a
+    // copy-pasteable TOML snippet built from the chart info.
+    let resolved = resolve_with_recovery(&state.symbol, broker, &mcp)?;
     let instrument = resolved.broker_symbol.clone();
 
     info!(
@@ -251,6 +258,96 @@ fn resolve_broker(args: &Args, full_symbol: &str) -> Result<Broker> {
     Ok(exchange
         .and_then(Broker::from_exchange)
         .unwrap_or(Broker::Oanda))
+}
+
+/// Resolve via the catalog; on miss, ask tv-mcp for the chart's
+/// symbol-info and try to recover by patching the user overlay.
+///
+/// The recovery path covers the common case of a chart whose bare
+/// TV symbol (e.g. `GOOGL`) doesn't match the catalog's id
+/// (e.g. `ALPHABET`) — `tv info`'s `description` field carries the
+/// broker's name, which usually does match. On success we patch the
+/// overlay and re-resolve so the rest of the run sees the patched
+/// asset. On failure we surface the original catalog-miss error,
+/// supplemented with a copy-pasteable TOML snippet built from the
+/// chart info.
+fn resolve_with_recovery(
+    tv_symbol: &str,
+    broker: Broker,
+    mcp: &TvMcp,
+) -> Result<crate::instrument_resolution::ResolvedInstrument> {
+    let first_err = match crate::instrument_resolution::resolve_for_broker(tv_symbol, broker) {
+        Ok(resolved) => return Ok(resolved),
+        Err(e) => e,
+    };
+    // Catalog miss — try the recovery path. If anything in here
+    // fails, fall through to the original error so the operator sees
+    // the actionable "add an overlay entry" hint.
+    let info = match mcp.get_symbol_info() {
+        Ok(info) => info,
+        Err(e) => {
+            warn!(error = ?e, "tv-mcp `info` call failed; can't auto-recover");
+            return Err(first_err);
+        }
+    };
+    let Some(patched) = crate::instrument_recovery::build_patched_asset(&info)? else {
+        let snippet = crate::instrument_recovery::overlay_snippet_hint(&info);
+        return Err(eyre!(
+            "{first_err}\n\
+             \n\
+             Chart symbol-info: full_name={full_name:?}, description={desc:?}, \
+             type={ty:?}.\n\
+             Neither `description` nor `symbol` resolved either. Paste this \
+             into your overlay (and edit the broker symbols / news_currencies \
+             to match):\n\n{snippet}\n",
+            full_name = info.full_name,
+            desc = info.description,
+            ty = info.asset_type,
+        ));
+    };
+    let asset_id = patched.asset.id.clone();
+    let overlay_path = match crate::instrument_recovery::save_patch(&patched) {
+        Ok(p) => p,
+        Err(e) => {
+            warn!(error = ?e, asset_id = %asset_id, "failed to persist overlay patch; aborting recovery");
+            return Err(first_err);
+        }
+    };
+    info!(
+        chart_symbol = %tv_symbol,
+        asset_id = %asset_id,
+        overlay = %overlay_path.display(),
+        "recovered unknown chart symbol via `tv info` and patched user overlay"
+    );
+    // The in-memory catalog is a LazyLock — already initialized
+    // without our patch. We can't reload it cheaply, so resolve
+    // directly off the patched asset we already built instead of
+    // calling back into the catalog.
+    let il_broker = match broker {
+        Broker::Oanda => instrument_lookup::Broker::Oanda,
+        Broker::TradeNation => instrument_lookup::Broker::TradeNation,
+    };
+    let broker_symbol = patched
+        .asset
+        .symbol_for(il_broker)
+        .ok_or_else(|| {
+            eyre!(
+                "recovered asset {asset_id} via chart info, but it's not listed on {} \
+                 (overlay patched at {} so the catalog now knows the TV symbol)",
+                broker.as_str(),
+                overlay_path.display(),
+            )
+        })?
+        .to_string();
+    // Leak the patched asset to satisfy the 'static reference in
+    // ResolvedInstrument. This happens at most once per
+    // tv-arm-invocation per unknown symbol, so the leak is bounded
+    // and tiny.
+    let leaked: &'static instrument_lookup::Asset = Box::leak(Box::new(patched.asset));
+    Ok(crate::instrument_resolution::ResolvedInstrument {
+        asset: leaked,
+        broker_symbol,
+    })
 }
 
 /// `--account-id` > `TRADE_CONTROL_ACCOUNT` env > per-broker default.

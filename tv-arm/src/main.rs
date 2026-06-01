@@ -23,6 +23,7 @@ mod alert_spec;
 mod args;
 mod create_alerts;
 mod geometry;
+mod instrument_recovery;
 mod instrument_resolution;
 mod manifest;
 mod pipeline;

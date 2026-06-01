@@ -3727,6 +3727,7 @@ dependencies = [
  "serde_json",
  "serde_yaml",
  "tokio",
+ "toml",
  "tracing",
  "tracing-error",
  "tracing-subscriber",

@@ -18,6 +18,7 @@ use color_eyre::eyre::{Result, WrapErr, eyre};
 use serde::de::DeserializeOwned;
 
 use crate::drawings::{ChartState, Drawing, DrawingStub, ListDrawingsResponse};
+use crate::symbol_info::SymbolInfo;
 
 /// Default tv-mcp checkout location — matches `tv_arm_hs.py`'s
 /// `TV_MCP_ROOT` constant.
@@ -96,6 +97,14 @@ impl TvMcp {
     /// `state` — the current chart's symbol and resolution.
     pub fn get_state(&self) -> Result<ChartState> {
         self.call_json(&["state"])
+    }
+
+    /// `info` — TradingView's symbol-info dialog payload for the
+    /// current chart. The `description` field carries the broker's
+    /// own name for the asset, which tv-arm uses to recover when the
+    /// chart's bare TV symbol isn't in the instrument-lookup catalog.
+    pub fn get_symbol_info(&self) -> Result<SymbolInfo> {
+        self.call_json(&["info"])
     }
 
     /// `range` — the chart's currently-visible time window plus
