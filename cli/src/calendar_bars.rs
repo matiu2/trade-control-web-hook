@@ -284,6 +284,104 @@ pub async fn fetch_week_events(now: DateTime<Utc>) -> Result<Vec<EconomicEvent>>
         .map_err(|e| eyre!("fetching week events: {e}"))
 }
 
+/// Fetch every forex-factory event whose timestamp falls in `[from, to]`,
+/// walking the weeks the range spans. Each fetch is a separate HTTP
+/// round-trip; consecutive fetches may return overlapping events when
+/// the range straddles a week boundary, so the result is run through
+/// [`dedupe_and_filter_events`] before being returned.
+///
+/// Used by `tv-news` to align the events it annotates with the chart's
+/// visible window — typically 2.5–3 weeks. Bounded to 10 weeks to
+/// catch operator misuse (e.g. accidentally fetching a whole year's
+/// worth of calendar pages).
+pub async fn fetch_events_for_range(
+    from: DateTime<Utc>,
+    to: DateTime<Utc>,
+) -> Result<Vec<EconomicEvent>> {
+    if to < from {
+        return Err(eyre!(
+            "fetch_events_for_range: `to` ({to}) is before `from` ({from})"
+        ));
+    }
+    let anchors = week_anchors(from, to);
+    if anchors.len() > 10 {
+        return Err(eyre!(
+            "fetch_events_for_range: range spans {} weeks, more than the 10-week guard rail",
+            anchors.len(),
+        ));
+    }
+
+    let service =
+        CalendarService::new().map_err(|e| eyre!("creating forex-factory CalendarService: {e}"))?;
+
+    let mut all = Vec::new();
+    for anchor in anchors {
+        let week = service
+            .get_week_events_for(anchor)
+            .await
+            .map_err(|e| eyre!("fetching week events for {anchor}: {e}"))?;
+        all.extend(week);
+    }
+    Ok(dedupe_and_filter_events(all, from, to))
+}
+
+/// The set of dates to pass to `get_week_events_for` so that every week
+/// overlapping `[from, to]` is fetched exactly once.
+///
+/// Anchors are Mondays (UTC) — forex-factory's `week=YYYYMMDD` URL
+/// parameter picks the week the date falls in, so any day in that week
+/// works, but Mondays make the dedupe step's "fetched twice in
+/// overlapping calls" property easy to eyeball in logs.
+fn week_anchors(from: DateTime<Utc>, to: DateTime<Utc>) -> Vec<chrono::NaiveDate> {
+    use chrono::{Datelike, Duration, Weekday};
+
+    let mut day = from.date_naive();
+    // Walk back to the Monday of `from`'s week.
+    let from_weekday = day.weekday().num_days_from_monday() as i64;
+    day -= Duration::days(from_weekday);
+
+    let to_day = to.date_naive();
+    let mut out = Vec::new();
+    while day <= to_day {
+        out.push(day);
+        day += Duration::days(7);
+        // Defensive: bail if we somehow overshoot — `to` can be at most
+        // a few weeks past `from`, so this never fires in practice.
+        if out.len() > 60 {
+            break;
+        }
+        let _ = Weekday::Mon; // silence unused-import lint if needed
+    }
+    out
+}
+
+/// Deduplicate `events` by `(datetime, name, currency)` and retain only
+/// those whose timestamp falls inside `[from, to]`. Pure — every effect
+/// is in the input.
+///
+/// Order is preserved (first-seen wins) so callers can rely on the
+/// upstream forex-factory ordering for stable per-week chronology.
+pub fn dedupe_and_filter_events(
+    events: Vec<EconomicEvent>,
+    from: DateTime<Utc>,
+    to: DateTime<Utc>,
+) -> Vec<EconomicEvent> {
+    use std::collections::HashSet;
+    let mut seen: HashSet<(i64, String, String)> = HashSet::new();
+    let mut out = Vec::with_capacity(events.len());
+    for ev in events {
+        let event_utc = ev.datetime.with_timezone(&Utc);
+        if event_utc < from || event_utc > to {
+            continue;
+        }
+        let key = (event_utc.timestamp(), ev.name.clone(), ev.currency.clone());
+        if seen.insert(key) {
+            out.push(ev);
+        }
+    }
+    out
+}
+
 /// Pretty-print the plan as a one-event-per-row summary. Same shape as
 /// the per-alert lines `build-pause` / `build-news` print — operators
 /// (and `tv_arm_hs.py`, eventually) can parse the per-event header to
@@ -560,5 +658,83 @@ mod tests {
         assert_eq!(slugify("CPI m/m"), "cpi-m-m");
         assert_eq!(slugify("   --leading--   "), "leading");
         assert_eq!(slugify(""), "event");
+    }
+
+    #[test]
+    fn week_anchors_walks_back_to_monday() {
+        // 2026-06-06 was a Saturday. Range Sat → Sun (next week) should
+        // anchor on the Mondays of both weeks.
+        let from = ts("2026-06-06T12:00:00Z"); // Sat
+        let to = ts("2026-06-14T12:00:00Z"); // next-week Sun
+        let anchors = week_anchors(from, to);
+        assert_eq!(
+            anchors,
+            vec![
+                chrono::NaiveDate::from_ymd_opt(2026, 6, 1).unwrap(),
+                chrono::NaiveDate::from_ymd_opt(2026, 6, 8).unwrap(),
+            ]
+        );
+    }
+
+    #[test]
+    fn week_anchors_handles_three_week_range() {
+        // Typical tv-news window — Sun in week-1 to Sat in week-3.
+        let from = ts("2026-06-07T00:00:00Z"); // Sun (week 22-anchor: 2026-06-01)
+        let to = ts("2026-06-27T23:59:59Z"); // Sat (week 24-anchor: 2026-06-22)
+        let anchors = week_anchors(from, to);
+        // Should hit Mondays 2026-06-01, 2026-06-08, 2026-06-15, 2026-06-22.
+        assert_eq!(anchors.len(), 4);
+        assert_eq!(
+            anchors.first().copied(),
+            Some(chrono::NaiveDate::from_ymd_opt(2026, 6, 1).unwrap())
+        );
+        assert_eq!(
+            anchors.last().copied(),
+            Some(chrono::NaiveDate::from_ymd_opt(2026, 6, 22).unwrap())
+        );
+    }
+
+    #[test]
+    fn dedupe_and_filter_drops_out_of_range() {
+        let from = ts("2026-06-06T00:00:00Z");
+        let to = ts("2026-06-13T00:00:00Z");
+        let events = vec![
+            ev("Before", "USD", Impact::High, "2026-06-05T12:00:00Z"),
+            ev("In range", "USD", Impact::High, "2026-06-10T12:00:00Z"),
+            ev("After", "USD", Impact::High, "2026-06-14T12:00:00Z"),
+        ];
+        let kept = dedupe_and_filter_events(events, from, to);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].name, "In range");
+    }
+
+    #[test]
+    fn dedupe_collapses_repeats_in_overlapping_fetches() {
+        // Simulate two weekly fetches whose results overlap: same event
+        // appearing twice when both weeks include 2026-06-10.
+        let from = ts("2026-06-06T00:00:00Z");
+        let to = ts("2026-06-20T00:00:00Z");
+        let same = ev("CPI m/m", "USD", Impact::High, "2026-06-10T12:30:00Z");
+        let events = vec![
+            same.clone(),
+            ev("NFP", "USD", Impact::High, "2026-06-11T12:30:00Z"),
+            same, // duplicate (would come from the next week's page)
+        ];
+        let kept = dedupe_and_filter_events(events, from, to);
+        assert_eq!(kept.len(), 2);
+        assert_eq!(kept[0].name, "CPI m/m");
+        assert_eq!(kept[1].name, "NFP");
+    }
+
+    #[test]
+    fn dedupe_distinguishes_same_name_different_currency() {
+        let from = ts("2026-06-06T00:00:00Z");
+        let to = ts("2026-06-20T00:00:00Z");
+        let events = vec![
+            ev("CPI m/m", "USD", Impact::High, "2026-06-10T12:30:00Z"),
+            ev("CPI m/m", "EUR", Impact::High, "2026-06-10T12:30:00Z"),
+        ];
+        let kept = dedupe_and_filter_events(events, from, to);
+        assert_eq!(kept.len(), 2);
     }
 }

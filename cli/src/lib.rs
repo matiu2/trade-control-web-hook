@@ -20,13 +20,18 @@ pub use admin_client::{add_account, delete_account, list_accounts, test_account}
 pub use admin_secret::{delete_secret, put_secret, secret_binding_for};
 pub use calendar_bars::{
     CalendarBarPlan, CalendarBarRow, CalendarBarsArgs, CalendarBrokerArg, PlanInputs, TimeframeArg,
-    fetch_week_events, parse_instrument, plan_calendar_bars, print_summary_table,
-    run_calendar_bars,
+    dedupe_and_filter_events, fetch_events_for_range, fetch_week_events, parse_instrument,
+    plan_calendar_bars, print_summary_table, run_calendar_bars,
 };
 pub use control::{
     build_clear_prep_intent, build_clear_veto_intent, build_prep_intent, build_status_intent,
     build_unlock_intent, build_veto_intent, wrap_signed, wrap_signed_template,
 };
+/// Re-export forex-factory's event + impact types so downstream
+/// consumers (tv-news, future strategy binaries) don't have to pin the
+/// same git rev separately. They are part of the public API anyway —
+/// `fetch_events_for_range` returns them.
+pub use forex_factory::{EconomicEvent, Impact};
 pub use history::{
     History, load as load_history, record_account_use, record_prep_use, record_veto_use,
 };

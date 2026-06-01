@@ -10,6 +10,7 @@ use chrono::{DateTime, Utc};
 use color_eyre::eyre::{Result, eyre};
 use instrument_lookup::Asset;
 use tracing::info;
+use trade_control_cli::fetch_events_for_range;
 use trading_view::mcp::TvMcp;
 
 use crate::args::Args;
@@ -52,16 +53,33 @@ pub fn run(args: Args) -> Result<i32> {
         "news currencies in scope (incl. USD 3★ baseline)"
     );
 
+    let events = fetch_events(&ctx)?;
+    info!(
+        events_fetched = events.len(),
+        "fetched forex-factory events spanning the visible window",
+    );
+
     if args.dry_run {
-        info!("dry-run: skipping event fetch and chart drawing");
+        info!("dry-run: skipping chart drawing");
         return Ok(0);
     }
 
-    // Phase-2 (#53) and phase-3 (#55) work goes here. For now the
-    // scaffold exits cleanly so the operator can verify the read path
-    // against a live chart before the side-effect plumbing lands.
-    info!("event fetch + draw not yet implemented (tasks #53 + #55)");
+    // Phase-3 (#55) — filter to `currencies`, dedupe against existing
+    // chart drawings within `args.dedupe_tolerance_min`, and draw the
+    // remaining events as news-start / news-end pairs — lands next.
+    let _ = args.dedupe_tolerance_min;
+    info!("filter + dedupe + draw not yet implemented (task #55)");
     Ok(0)
+}
+
+/// Run the multi-week forex-factory fetch on a fresh tokio runtime.
+/// Keeps the rest of tv-news sync so the binary doesn't have to be
+/// `#[tokio::main]` — matches the same pattern `cli::run_calendar_bars`
+/// uses.
+fn fetch_events(ctx: &ChartContext) -> Result<Vec<trade_control_cli::EconomicEvent>> {
+    let runtime = tokio::runtime::Runtime::new()
+        .map_err(|e| eyre!("starting tokio runtime for forex-factory fetch: {e}"))?;
+    runtime.block_on(fetch_events_for_range(ctx.visible_from, ctx.visible_to))
 }
 
 /// Build the tv-mcp wrapper, honouring `--tv-mcp-root` when supplied.
