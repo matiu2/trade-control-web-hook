@@ -257,6 +257,11 @@ pub fn build_alert_spec(
             Frequency::OnBarClose,
             tv_name,
         )),
+        AlertBasename::CloseOnSrReversal => Some(pine_payload(
+            reversal_close_plot_for(direction),
+            Frequency::OnBarClose,
+            tv_name,
+        )),
         AlertBasename::PauseStart(_) => ctx.blackout_pair.map(|(start, _)| AlertPayload::Drawing {
             drawing_id: start.id.clone(),
             tool: Tool::LineToolVertLine,

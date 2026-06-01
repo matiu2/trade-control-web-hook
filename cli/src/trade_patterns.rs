@@ -1184,7 +1184,7 @@ fn build_close_on_sr_reversal_alert(
     intent.require_price_in_ranges = Some(ranges);
     intent.reason = Some("support/resistance reversal".into());
     BuiltAlert {
-        basename: "07-close-on-sr-reversal".into(),
+        basename: AlertBasename::CloseOnSrReversal.as_str().into_owned(),
         purpose:
             "close: opposing golden reversal candle, gated on price inside an S/R band for this trade"
                 .into(),

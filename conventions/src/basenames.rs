@@ -33,6 +33,9 @@ pub enum AlertBasename {
     /// `06-close-on-reversal` — Pine reversal close, gated on an
     /// active news window.
     CloseOnReversal,
+    /// `07-close-on-sr-reversal` — Pine reversal close, gated on
+    /// price sitting inside a chart-drawn support/resistance band.
+    CloseOnSrReversal,
     /// `01-pause-<id>` — pause window start.
     PauseStart(String),
     /// `02-resume-<id>` — pause window end (resume entries).
@@ -54,6 +57,7 @@ impl AlertBasename {
             Self::PrepRetest => Cow::Borrowed("04-prep-retest"),
             Self::Enter => Cow::Borrowed("05-enter"),
             Self::CloseOnReversal => Cow::Borrowed("06-close-on-reversal"),
+            Self::CloseOnSrReversal => Cow::Borrowed("07-close-on-sr-reversal"),
             Self::PauseStart(id) => Cow::Owned(format!("01-pause-{id}")),
             Self::PauseResume(id) => Cow::Owned(format!("02-resume-{id}")),
             Self::NewsStart(id) => Cow::Owned(format!("01-news-start-{id}")),
@@ -76,6 +80,7 @@ impl AlertBasename {
             "04-prep-retest" => Some(Self::PrepRetest),
             "05-enter" => Some(Self::Enter),
             "06-close-on-reversal" => Some(Self::CloseOnReversal),
+            "07-close-on-sr-reversal" => Some(Self::CloseOnSrReversal),
             other => other
                 .strip_prefix("01-pause-")
                 .map(|id| Self::PauseStart(id.into()))
@@ -102,7 +107,7 @@ impl AlertBasename {
 mod tests {
     use super::*;
 
-    fn variants() -> [AlertBasename; 11] {
+    fn variants() -> [AlertBasename; 12] {
         [
             AlertBasename::VetoTooHigh,
             AlertBasename::VetoTooLow,
@@ -111,6 +116,7 @@ mod tests {
             AlertBasename::PrepRetest,
             AlertBasename::Enter,
             AlertBasename::CloseOnReversal,
+            AlertBasename::CloseOnSrReversal,
             AlertBasename::PauseStart("cal-foo-1780034400-pause".into()),
             AlertBasename::PauseResume("cal-foo-1780034400-pause".into()),
             AlertBasename::NewsStart("cal-foo-1780034400-news".into()),
@@ -144,6 +150,10 @@ mod tests {
         assert_eq!(
             AlertBasename::CloseOnReversal.as_str(),
             "06-close-on-reversal"
+        );
+        assert_eq!(
+            AlertBasename::CloseOnSrReversal.as_str(),
+            "07-close-on-sr-reversal"
         );
     }
 
