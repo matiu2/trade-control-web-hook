@@ -65,6 +65,8 @@ pub enum AlertPayload {
         frequency: Frequency,
         auto_deactivate: bool,
         tv_name: String,
+        name: String,
+        message: String,
     },
     /// Numeric-price-bound (the alert tracks a computed value with no
     /// drawing on the chart — currently pcl-exhausted veto only).
@@ -74,6 +76,8 @@ pub enum AlertPayload {
         frequency: Frequency,
         auto_deactivate: bool,
         tv_name: String,
+        name: String,
+        message: String,
     },
     /// Synthetic vertical-line at a specific epoch time (calendar
     /// bars). The JS template builds the `LineToolVertLine` shape
@@ -85,6 +89,8 @@ pub enum AlertPayload {
         frequency: Frequency,
         auto_deactivate: bool,
         tv_name: String,
+        name: String,
+        message: String,
     },
     /// Pine-indicator-bound (the alert listens to an
     /// `alertcondition()` plot — used for `05-enter`,
@@ -95,7 +101,49 @@ pub enum AlertPayload {
         frequency: Frequency,
         auto_deactivate: bool,
         tv_name: String,
+        name: String,
+        message: String,
     },
+}
+
+impl AlertPayload {
+    /// Mutable accessor for the alert title — set by the orchestrator
+    /// after dispatch to prefix `<trade_id>-`.
+    pub fn tv_name_mut(&mut self) -> &mut String {
+        match self {
+            AlertPayload::Drawing { tv_name, .. }
+            | AlertPayload::PriceValue { tv_name, .. }
+            | AlertPayload::VertLineAt { tv_name, .. }
+            | AlertPayload::PineAlertcondition { tv_name, .. } => tv_name,
+        }
+    }
+
+    /// Mutable accessor for the manifest filename — set by the
+    /// orchestrator from the manifest entry. The JS template forwards
+    /// it back in each [`crate::create_alerts::AlertResult`] so the
+    /// operator can attribute failures.
+    pub fn name_mut(&mut self) -> &mut String {
+        match self {
+            AlertPayload::Drawing { name, .. }
+            | AlertPayload::PriceValue { name, .. }
+            | AlertPayload::VertLineAt { name, .. }
+            | AlertPayload::PineAlertcondition { name, .. } => name,
+        }
+    }
+
+    /// Mutable accessor for the signed-YAML body — set by the
+    /// orchestrator from the on-disk signed file. The JS template
+    /// uses it as the TradingView `message` field, which is what the
+    /// alert posts to the webhook when it fires; an empty value makes
+    /// TV reject the create-alert request with `invalid_request`.
+    pub fn message_mut(&mut self) -> &mut String {
+        match self {
+            AlertPayload::Drawing { message, .. }
+            | AlertPayload::PriceValue { message, .. }
+            | AlertPayload::VertLineAt { message, .. }
+            | AlertPayload::PineAlertcondition { message, .. } => message,
+        }
+    }
 }
 
 /// TradingView drawing-tool enum, serialised verbatim into the
@@ -164,6 +212,8 @@ pub fn build_alert_spec(
                 frequency: Frequency::OnFirstFire,
                 auto_deactivate: false,
                 tv_name,
+                name: String::new(),
+                message: String::new(),
             })
         }
         AlertBasename::PrepBreakAndClose => {
@@ -180,6 +230,8 @@ pub fn build_alert_spec(
                     frequency: Frequency::OnBarClose,
                     auto_deactivate: false,
                     tv_name,
+                    name: String::new(),
+                    message: String::new(),
                 })
         }
         AlertBasename::PrepRetest => roles.retest.as_ref().map(|d| AlertPayload::Drawing {
@@ -192,6 +244,8 @@ pub fn build_alert_spec(
             frequency: Frequency::OnFirstFire,
             auto_deactivate: false,
             tv_name,
+            name: String::new(),
+            message: String::new(),
         }),
         AlertBasename::Enter => Some(pine_payload(
             entry_plot_for(direction),
@@ -210,6 +264,8 @@ pub fn build_alert_spec(
             frequency: Frequency::OnFirstFire,
             auto_deactivate: false,
             tv_name,
+            name: String::new(),
+            message: String::new(),
         }),
         AlertBasename::PauseResume(_) => ctx.blackout_pair.map(|(_, end)| AlertPayload::Drawing {
             drawing_id: end.id.clone(),
@@ -218,6 +274,8 @@ pub fn build_alert_spec(
             frequency: Frequency::OnFirstFire,
             auto_deactivate: false,
             tv_name,
+            name: String::new(),
+            message: String::new(),
         }),
         AlertBasename::NewsStart(_) => ctx.news_pair.map(|(start, _)| AlertPayload::Drawing {
             drawing_id: start.id.clone(),
@@ -226,6 +284,8 @@ pub fn build_alert_spec(
             frequency: Frequency::OnFirstFire,
             auto_deactivate: false,
             tv_name,
+            name: String::new(),
+            message: String::new(),
         }),
         AlertBasename::NewsEnd(_) => ctx.news_pair.map(|(_, end)| AlertPayload::Drawing {
             drawing_id: end.id.clone(),
@@ -234,6 +294,8 @@ pub fn build_alert_spec(
             frequency: Frequency::OnFirstFire,
             auto_deactivate: false,
             tv_name,
+            name: String::new(),
+            message: String::new(),
         }),
     })
 }
@@ -267,6 +329,8 @@ fn invalidation_or_pcl(
             frequency: Frequency::OnFirstFire,
             auto_deactivate: false,
             tv_name,
+            name: String::new(),
+            message: String::new(),
         })
     } else {
         // Opposite-name veto = pcl-exhausted, price-value bound.
@@ -278,6 +342,8 @@ fn invalidation_or_pcl(
             frequency: Frequency::OnFirstFire,
             auto_deactivate: false,
             tv_name,
+            name: String::new(),
+            message: String::new(),
         })
     }
 }
@@ -304,6 +370,8 @@ fn calendar_payload(
         frequency: Frequency::OnFirstFire,
         auto_deactivate: false,
         tv_name,
+        name: String::new(),
+        message: String::new(),
     }))
 }
 
@@ -313,6 +381,8 @@ fn pine_payload(plot_id: &str, frequency: Frequency, tv_name: String) -> AlertPa
         alert_cond_id: plot_id.to_string(),
         frequency,
         auto_deactivate: false,
+        name: String::new(),
+        message: String::new(),
         tv_name,
     }
 }

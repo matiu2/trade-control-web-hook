@@ -786,11 +786,10 @@ fn build_all_payloads(
         let file = format!("{}.yaml", alert.basename);
         let ctx = DispatchContext::default();
         if let Some(mut p) = build_alert_spec(&file, direction, roles, &ctx)? {
-            stamp_tv_name(&mut p, trade_id);
+            stamp_payload(&mut p, trade_id, &file, out_dir)?;
             payloads.push(p);
         }
     }
-    let _ = out_dir; // YAMLs are on-disk; the JS reads them via `message` field.
 
     // 2. Pause bundles.
     for bundle in pause_bundles {
@@ -801,7 +800,7 @@ fn build_all_payloads(
         for alert in &bundle.built.alerts {
             let file = format!("{}.yaml", alert.basename);
             if let Some(mut p) = build_alert_spec(&file, direction, roles, &ctx)? {
-                stamp_tv_name(&mut p, trade_id);
+                stamp_payload(&mut p, trade_id, &file, &bundle.out_dir)?;
                 payloads.push(p);
             }
         }
@@ -815,7 +814,7 @@ fn build_all_payloads(
         for alert in &bundle.built.alerts {
             let file = format!("{}.yaml", alert.basename);
             if let Some(mut p) = build_alert_spec(&file, direction, roles, &ctx)? {
-                stamp_tv_name(&mut p, trade_id);
+                stamp_payload(&mut p, trade_id, &file, &bundle.out_dir)?;
                 payloads.push(p);
             }
         }
@@ -831,7 +830,7 @@ fn build_all_payloads(
         };
         for entry in &bundle.manifest.alerts {
             if let Some(mut p) = build_alert_spec(&entry.file, direction, roles, &ctx)? {
-                stamp_tv_name(&mut p, trade_id);
+                stamp_payload(&mut p, trade_id, &entry.file, &bundle.bundle_dir)?;
                 payloads.push(p);
             }
         }
@@ -839,21 +838,31 @@ fn build_all_payloads(
     Ok(payloads)
 }
 
-/// Mutate `tv_name` to `<trade_id>-<role_slug>` so all alerts sort
-/// together in TV's alert list.
-fn stamp_tv_name(payload: &mut AlertPayload, trade_id: &str) {
-    if trade_id.is_empty() {
-        return;
+/// Stamp the orchestrator-owned fields onto a dispatched payload:
+///
+/// - `tv_name` → `<trade_id>-<role_slug>` so all alerts sort together
+///   in TV's alert list (empty `trade_id` is a no-op).
+/// - `name` → the manifest filename; the JS template echoes it back
+///   in each result so the operator can attribute failures.
+/// - `message` → the full text of the signed YAML on disk, which TV
+///   posts to the webhook when the alert fires. An empty `message`
+///   makes TV reject `create_alert` with `invalid_request`.
+fn stamp_payload(
+    payload: &mut AlertPayload,
+    trade_id: &str,
+    file: &str,
+    out_dir: &Path,
+) -> Result<()> {
+    if !trade_id.is_empty() {
+        let tv_name = payload.tv_name_mut();
+        *tv_name = format!("{trade_id}-{tv_name}");
     }
-    let stamp = |name: &mut String| {
-        *name = format!("{trade_id}-{name}");
-    };
-    match payload {
-        AlertPayload::Drawing { tv_name, .. }
-        | AlertPayload::PriceValue { tv_name, .. }
-        | AlertPayload::VertLineAt { tv_name, .. }
-        | AlertPayload::PineAlertcondition { tv_name, .. } => stamp(tv_name),
-    }
+    *payload.name_mut() = file.to_string();
+    let signed_path = out_dir.join(file);
+    let body = fs::read_to_string(&signed_path)
+        .with_context(|| format!("read signed alert body {}", signed_path.display()))?;
+    *payload.message_mut() = body;
+    Ok(())
 }
 
 fn utc_iso(unix: i64) -> Result<String> {
