@@ -617,6 +617,40 @@ where those preps don't apply.
 - An active TradingView Desktop session in Firefox with DevTools open
   (tv-mcp connects via CDP).
 
+## Chart annotation: `tv-news`
+
+Sister binary to `tv-arm`. Annotates the active chart with `news-start` /
+`news-end` vertical-line pairs for upcoming forex-factory events affecting the
+chart's instrument, so the downstream `tv_extract_*_trade.py` scripts (and
+`tv-arm` itself when armed manually) have something to read from.
+
+What it does:
+
+1. Reads the chart's symbol + visible window via tv-mcp.
+2. Resolves the symbol through `instrument-lookup` to get the asset's
+   `news_currencies`.
+3. Fetches forex-factory events spanning the visible window (multi-week —
+   typical operator scroll is 2.5–3 weeks).
+4. Filters to **2★ + 3★** for the asset's own currencies, plus **3★ USD**
+   regardless of asset (so FOMC always lands on every chart).
+5. Skips events that already have a `news-start` vertical line within ±5
+   minutes (idempotent re-run).
+6. Draws the survivors as `news-start` / `news-end` pairs, defaulting to a
+   60-minute window (matches `trade-calendar-maker`'s `buffer_after`).
+
+CLI:
+
+```sh
+cargo run -p tv-news --                    # default: draws lines
+  --dry-run                                # plan only, no drawing
+  --dedupe-tolerance-min 5                 # ±tolerance for "already on chart"
+  --news-window-min 60                     # width of the news-start → news-end pair
+  --tv-mcp-root ~/Downloads/tradingview-mcp-jackson
+```
+
+No `--broker` flag — news currencies are broker-agnostic. The chart can be on
+any exchange (`TRADENATION:`, `OANDA:`, or bare symbol).
+
 ## Known limitations
 
 - **Total open risk** is currently approximated by a count cap

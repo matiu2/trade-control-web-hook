@@ -14,4 +14,5 @@ tracing = "0.1.44"
 tracing-error = "0.2.1"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 trade-control-cli = { version = "0.1.0", path = "../cli" }
+trade-control-conventions = { version = "0.1.0", path = "../conventions" }
 trading-view = { version = "0.1.0", path = "../trading-view" }

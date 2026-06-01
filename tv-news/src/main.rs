@@ -20,6 +20,7 @@ use clap_complete::{Shell, generate};
 use color_eyre::eyre::Result;
 
 mod args;
+mod filter;
 mod pipeline;
 
 use crate::args::Args;

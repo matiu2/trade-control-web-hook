@@ -1,19 +1,26 @@
 //! Top-level orchestration for `tv-news`.
 //!
-//! Phase-1 scaffold: read the chart's symbol and visible range via
-//! tv-mcp, resolve the symbol against the `instrument-lookup` catalog
-//! to learn which currencies the asset reacts to, and log the
-//! resulting filter. Tasks #53 (multi-week event fetch) and #55
-//! (filter + dedupe + draw) layer the actual side-effects on top.
+//! 1. tv-mcp `state` + `range` → chart symbol + visible window.
+//! 2. `instrument-lookup` → asset → news currencies.
+//! 3. `cli::fetch_events_for_range` → forex-factory events spanning
+//!    the visible window.
+//! 4. [`crate::filter::filter_events`] → 2★+ for asset currencies,
+//!    3★ for USD baseline.
+//! 5. [`crate::filter::events_needing_drawing`] → drop events already
+//!    annotated on the chart within ±tolerance.
+//! 6. tv-mcp `draw vertical_line` × 2 per surviving event.
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Duration, Utc};
 use color_eyre::eyre::{Result, eyre};
 use instrument_lookup::Asset;
-use tracing::info;
-use trade_control_cli::fetch_events_for_range;
+use tracing::{info, warn};
+use trade_control_cli::{EconomicEvent, fetch_events_for_range};
+use trade_control_conventions::{NEWS_START_LABELS, matches};
+use trading_view::drawings::Drawing;
 use trading_view::mcp::TvMcp;
 
 use crate::args::Args;
+use crate::filter::{events_needing_drawing, filter_events, news_window};
 
 /// Result of resolving the chart into a planning context — what
 /// follow-up phases need before they can fetch and draw events.
@@ -53,22 +60,52 @@ pub fn run(args: Args) -> Result<i32> {
         "news currencies in scope (incl. USD 3★ baseline)"
     );
 
-    let events = fetch_events(&ctx)?;
+    let raw_events = fetch_events(&ctx)?;
     info!(
-        events_fetched = events.len(),
+        events_fetched = raw_events.len(),
         "fetched forex-factory events spanning the visible window",
     );
 
+    let baseline = vec!["USD".to_string()];
+    let news_ccys: Vec<String> = ctx
+        .asset
+        .news_currencies
+        .iter()
+        .map(|c| c.to_uppercase())
+        .collect();
+    let filtered = filter_events(&raw_events, &news_ccys, &baseline);
+    info!(
+        events_kept = filtered.len(),
+        "applied currency + impact filter",
+    );
+
+    let existing_starts = collect_existing_news_starts(&mcp)?;
+    info!(
+        existing_news_starts = existing_starts.len(),
+        "scanned chart for existing news-start drawings",
+    );
+
+    let tolerance = Duration::minutes(args.dedupe_tolerance_min);
+    let to_draw = events_needing_drawing(filtered, &existing_starts, tolerance);
+    info!(
+        events_to_draw = to_draw.len(),
+        "after dedupe against existing chart drawings",
+    );
+
+    if to_draw.is_empty() {
+        info!("nothing to draw — chart is already in sync");
+        return Ok(0);
+    }
+
     if args.dry_run {
+        log_planned_draws(&to_draw, Duration::minutes(args.news_window_min));
         info!("dry-run: skipping chart drawing");
         return Ok(0);
     }
 
-    // Phase-3 (#55) — filter to `currencies`, dedupe against existing
-    // chart drawings within `args.dedupe_tolerance_min`, and draw the
-    // remaining events as news-start / news-end pairs — lands next.
-    let _ = args.dedupe_tolerance_min;
-    info!("filter + dedupe + draw not yet implemented (task #55)");
+    let window = Duration::minutes(args.news_window_min);
+    let drawn = draw_events(&mcp, &to_draw, window)?;
+    info!(drawn, "vertical-line pairs landed on chart");
     Ok(0)
 }
 
@@ -76,10 +113,89 @@ pub fn run(args: Args) -> Result<i32> {
 /// Keeps the rest of tv-news sync so the binary doesn't have to be
 /// `#[tokio::main]` — matches the same pattern `cli::run_calendar_bars`
 /// uses.
-fn fetch_events(ctx: &ChartContext) -> Result<Vec<trade_control_cli::EconomicEvent>> {
+fn fetch_events(ctx: &ChartContext) -> Result<Vec<EconomicEvent>> {
     let runtime = tokio::runtime::Runtime::new()
         .map_err(|e| eyre!("starting tokio runtime for forex-factory fetch: {e}"))?;
     runtime.block_on(fetch_events_for_range(ctx.visible_from, ctx.visible_to))
+}
+
+/// Scan the chart for vertical-line drawings whose label looks like a
+/// `news-start` marker (per [`NEWS_START_LABELS`]) and collect their
+/// anchor timestamps in unix seconds. Used to dedupe re-runs.
+///
+/// Drawings that fail to fetch are logged and skipped — a stale id in
+/// the `draw list` response shouldn't fail the whole run, since the
+/// worst case is a duplicate line on a transient race.
+fn collect_existing_news_starts(mcp: &TvMcp) -> Result<Vec<i64>> {
+    let stubs = mcp.list_drawings()?;
+    let mut out = Vec::new();
+    for stub in stubs {
+        if stub.name != "vertical_line" {
+            continue;
+        }
+        let drawing: Drawing = match mcp.get_drawing(&stub.id) {
+            Ok(d) => d,
+            Err(e) => {
+                warn!(id = %stub.id, error = %e, "could not fetch drawing — skipping");
+                continue;
+            }
+        };
+        if !matches(drawing.label(), NEWS_START_LABELS) {
+            continue;
+        }
+        if let Some(p) = drawing.points.first() {
+            out.push(p.time);
+        }
+    }
+    Ok(out)
+}
+
+/// Log the events we'd draw under `--dry-run` so the operator can
+/// verify the plan before re-running for real.
+fn log_planned_draws(events: &[EconomicEvent], window: Duration) {
+    for ev in events {
+        let (start, end) = news_window(ev, window);
+        info!(
+            event = %ev.name,
+            currency = %ev.currency,
+            impact = ?ev.impact,
+            news_start = %start,
+            news_end = %end,
+            "would draw",
+        );
+    }
+}
+
+/// Draw one `news-start`/`news-end` vertical-line pair per event.
+/// Returns the count of pairs that landed successfully. tv-mcp errors
+/// short-circuit so the operator can re-run after fixing the cause
+/// rather than ending up with a half-drawn chart.
+fn draw_events(mcp: &TvMcp, events: &[EconomicEvent], window: Duration) -> Result<usize> {
+    let mut drawn = 0usize;
+    for ev in events {
+        let (start, end) = news_window(ev, window);
+        // tv-mcp wants a price; vertical lines ignore it for evaluation
+        // but require something parseable. Use 1.0 — matches tv-arm's
+        // auto-draw helper.
+        let s = mcp.draw_vertical_line(start.timestamp(), 1.0, "news-start")?;
+        if !s.success {
+            return Err(eyre!(
+                "tv-mcp draw news-start failed for {}: {}",
+                ev.name,
+                s.error.as_deref().unwrap_or("(no message)"),
+            ));
+        }
+        let e = mcp.draw_vertical_line(end.timestamp(), 1.0, "news-end")?;
+        if !e.success {
+            return Err(eyre!(
+                "tv-mcp draw news-end failed for {}: {}",
+                ev.name,
+                e.error.as_deref().unwrap_or("(no message)"),
+            ));
+        }
+        drawn += 1;
+    }
+    Ok(drawn)
 }
 
 /// Build the tv-mcp wrapper, honouring `--tv-mcp-root` when supplied.
