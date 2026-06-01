@@ -10,7 +10,7 @@
 //!    annotated on the chart within ±tolerance.
 //! 6. tv-mcp `draw vertical_line` × 2 per surviving event.
 
-use chrono::{DateTime, Duration, Utc};
+use chrono::{DateTime, Duration, Local, Utc};
 use color_eyre::eyre::{Result, eyre};
 use instrument_lookup::Asset;
 use tracing::{info, warn};
@@ -23,6 +23,10 @@ use crate::bucket::{EventBucket, bucket_events};
 use crate::filter::{events_needing_drawing, filter_events};
 use crate::label::is_news_label;
 use crate::resolution::{DEFAULT_BAR_SECS, resolution_to_secs};
+use crate::sentiment::{
+    Confidence, CurrencySentiment, SentimentAnalysis, SentimentDirection, analyze_sentiment,
+    sentiment_lookback_start,
+};
 
 /// Result of resolving the chart into a planning context — what
 /// follow-up phases need before they can fetch and draw events.
@@ -100,27 +104,127 @@ pub fn run(args: Args) -> Result<i32> {
 
     if to_draw.is_empty() {
         info!("nothing to draw — chart is already in sync");
-        return Ok(0);
+    } else {
+        let bar_secs = resolution_to_secs(&ctx.resolution).unwrap_or(DEFAULT_BAR_SECS);
+        let buckets = bucket_events(to_draw, bar_secs);
+        info!(
+            resolution = %ctx.resolution,
+            bar_secs,
+            buckets = buckets.len(),
+            "grouped events into chart-bar buckets",
+        );
+
+        if args.dry_run {
+            log_planned_draws(&buckets);
+            info!("dry-run: skipping chart drawing");
+        } else {
+            let drawn = draw_buckets(&mcp, &buckets)?;
+            info!(drawn, "vertical lines landed on chart");
+        }
     }
 
-    let bar_secs = resolution_to_secs(&ctx.resolution).unwrap_or(DEFAULT_BAR_SECS);
-    let buckets = bucket_events(to_draw, bar_secs);
+    if !args.no_sentiment {
+        run_sentiment_phase(&ctx);
+    }
+
+    Ok(0)
+}
+
+/// Run a fresh fetch of recent events (covering the sentiment lookback
+/// window, which is independent of the chart's visible range) and log
+/// the per-currency + overall sentiment verdict. Logs errors instead of
+/// returning them — the chart drawings are the primary output, and a
+/// sentiment failure shouldn't fail the whole run.
+fn run_sentiment_phase(ctx: &ChartContext) {
+    let now_local = Local::now();
+    let window_start = sentiment_lookback_start(now_local);
+
+    let recent = match fetch_events_in_range(window_start.to_utc(), now_local.to_utc()) {
+        Ok(evs) => evs,
+        Err(e) => {
+            warn!(error = %e, "sentiment: failed to fetch recent events; skipping");
+            return;
+        }
+    };
+
+    let news_currencies: Vec<String> = ctx
+        .asset
+        .news_currencies
+        .iter()
+        .map(|c| c.to_uppercase())
+        .collect();
+
+    let analysis = analyze_sentiment(&news_currencies, &recent, now_local);
+    log_sentiment(&ctx.asset.id, &news_currencies, &analysis);
+}
+
+fn fetch_events_in_range(from: DateTime<Utc>, to: DateTime<Utc>) -> Result<Vec<EconomicEvent>> {
+    let runtime = tokio::runtime::Runtime::new()
+        .map_err(|e| eyre!("starting tokio runtime for sentiment fetch: {e}"))?;
+    runtime.block_on(fetch_events_for_range(from, to))
+}
+
+fn log_sentiment(asset_id: &str, news_currencies: &[String], a: &SentimentAnalysis) {
+    let overall = direction_str(a.overall_direction);
+    let conf = confidence_str(a.confidence);
+    let total_events: usize = a
+        .currency_sentiments
+        .values()
+        .map(|cs| cs.events.len())
+        .sum();
+
     info!(
-        resolution = %ctx.resolution,
-        bar_secs,
-        buckets = buckets.len(),
-        "grouped events into chart-bar buckets",
+        asset = %asset_id,
+        direction = %overall,
+        confidence = %conf,
+        events = total_events,
+        period_start = %a.period_start,
+        period_end = %a.period_end,
+        "sentiment verdict",
     );
 
-    if args.dry_run {
-        log_planned_draws(&buckets);
-        info!("dry-run: skipping chart drawing");
-        return Ok(0);
+    for ccy in news_currencies {
+        match a.currency_sentiments.get(ccy) {
+            Some(cs) => log_currency_sentiment(cs),
+            None => info!(currency = %ccy, "  no released events in lookback window"),
+        }
     }
+}
 
-    let drawn = draw_buckets(&mcp, &buckets)?;
-    info!(drawn, "vertical lines landed on chart");
-    Ok(0)
+fn log_currency_sentiment(cs: &CurrencySentiment) {
+    info!(
+        currency = %cs.currency,
+        direction = %direction_str(cs.direction),
+        net_score = cs.net_score(),
+        bullish = cs.bullish_score,
+        bearish = cs.bearish_score,
+        events = cs.events.len(),
+        "  per-currency",
+    );
+    for ev in &cs.events {
+        info!(
+            event = %ev.event_name,
+            direction = %direction_str(ev.direction),
+            reason = %ev.reason,
+            "    event",
+        );
+    }
+}
+
+fn direction_str(d: SentimentDirection) -> &'static str {
+    match d {
+        SentimentDirection::Bullish => "bullish",
+        SentimentDirection::Bearish => "bearish",
+        SentimentDirection::Neutral => "neutral",
+    }
+}
+
+fn confidence_str(c: Confidence) -> &'static str {
+    match c {
+        Confidence::High => "high",
+        Confidence::Medium => "medium",
+        Confidence::Low => "low",
+    }
 }
 
 /// Run the multi-week forex-factory fetch on a fresh tokio runtime.

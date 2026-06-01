@@ -26,6 +26,7 @@ mod filter;
 mod label;
 mod pipeline;
 mod resolution;
+mod sentiment;
 
 use crate::args::Args;
 

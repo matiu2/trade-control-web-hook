@@ -652,14 +652,36 @@ the `tv-arm` arming flow continue to use the `news-start` / `news-end` /
 CLI:
 
 ```sh
-cargo run -p tv-news --                    # default: draws lines
+cargo run -p tv-news --                    # default: draws lines + logs sentiment
   --dry-run                                # plan only, no drawing
   --dedupe-tolerance-min 5                 # ±tolerance for "already on chart"
   --tv-mcp-root ~/Downloads/tradingview-mcp-jackson
+  --no-sentiment                           # skip the end-of-run sentiment summary
 ```
 
 No `--broker` flag — news currencies are broker-agnostic. The chart can be on
 any exchange (`TRADENATION:`, `OANDA:`, or bare symbol).
+
+### Sentiment summary
+
+After the drawing phase, `tv-news` does a small follow-up fetch over the
+recent past (24 hours by default, or back to Friday on Mondays so the weekend
+isn't dropped), scores each **released** event for the chart's currencies,
+and logs a verdict line:
+
+- Per-event direction: `actual` vs `forecast` (falling back to `previous`),
+  inverted for events where lower is better (unemployment, claims, deficit).
+- Per-currency aggregate: weighted by impact (3★=3, 2★=2, 1★=1).
+- Overall direction for the instrument: for FX pairs the quote-currency
+  sentiment is inverted (bullish USD on EUR/USD = bearish pair); for
+  indices/commodities the primary currency wins.
+- Confidence: `high` (≥2 3★ events and ≥3 total, all aligned) / `medium`
+  (≥1 3★ or ≥2 total) / `low`.
+
+This is purely informational — it influences neither the drawings nor any
+arming decision. The worker's news-window vetos still flow through
+`tv-arm` and the `news-start`/`news-end` convention. Suppress with
+`--no-sentiment`.
 
 ### Forex-factory disk cache
 

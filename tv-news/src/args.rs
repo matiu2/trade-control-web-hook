@@ -31,6 +31,12 @@ pub struct Args {
     #[arg(long)]
     pub tv_mcp_root: Option<PathBuf>,
 
+    /// Skip the sentiment summary at end-of-run. By default we score the
+    /// last 24h (3d on Mondays) of released news against the chart's
+    /// currencies and log a bullish/bearish/neutral verdict.
+    #[arg(long)]
+    pub no_sentiment: bool,
+
     /// Print a zsh completion script to stdout and exit.
     #[arg(long)]
     pub print_completions: bool,
@@ -47,6 +53,13 @@ mod tests {
         assert!(!args.dry_run);
         assert_eq!(args.dedupe_tolerance_min, 5);
         assert_eq!(args.tv_mcp_root, None);
+        assert!(!args.no_sentiment, "sentiment is on by default");
+    }
+
+    #[test]
+    fn no_sentiment_flag_parses() {
+        let args = Args::try_parse_from(["tv-news", "--no-sentiment"]).expect("parse");
+        assert!(args.no_sentiment);
     }
 
     #[test]
