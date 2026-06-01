@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["broker-oanda", "cli", "conventions", "core", "tv-arm"]
+members = ["broker-oanda", "cli", "conventions", "core", "trading-view", "tv-arm"]
 
 [package]
 name = "trade-control-web-hook"
