@@ -3738,6 +3738,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "tv-news"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "clap",
+ "clap_complete",
+ "color-eyre",
+ "instrument-lookup",
+ "tokio",
+ "tracing",
+ "tracing-error",
+ "tracing-subscriber",
+ "trade-control-cli",
+ "trading-view",
+]
+
+[[package]]
 name = "typed-builder"
 version = "0.21.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
