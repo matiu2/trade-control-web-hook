@@ -19,7 +19,7 @@
 //! arm half a window.
 
 use color_eyre::eyre::Result;
-use tracing::info;
+use tracing::{debug, info};
 use trade_control_conventions::{
     BLACKOUT_END_LABELS, BLACKOUT_START_LABELS, BREAK_LABELS, INVALIDATION_LABELS, NEWS_END_LABELS,
     NEWS_START_LABELS, RETEST_LABELS, SR_LEVEL_LABELS, TRADE_EXPIRY_LABELS, matches,
@@ -96,28 +96,57 @@ pub fn classify<F: DrawingFetcher>(fetcher: &F, stubs: &[DrawingStub]) -> Result
         let lbl_owned = d.label().to_string();
         let lbl = lbl_owned.as_str();
 
-        match kind {
+        let role = match kind {
             kind::HORIZONTAL_LINE if matches(lbl, INVALIDATION_LABELS) => {
                 invalidations.push((d, lbl.to_lowercase()));
+                Some("invalidation")
             }
             kind::HORIZONTAL_LINE if matches(lbl, SR_LEVEL_LABELS) => {
                 sr_levels.push(d);
+                Some("sr_level")
             }
-            kind::TREND_LINE if matches(lbl, BREAK_LABELS) => break_lines.push(d),
-            kind::TREND_LINE if matches(lbl, RETEST_LABELS) => retest_lines.push(d),
-            kind::FIB_RETRACEMENT => tp_fibs.push(d),
+            kind::TREND_LINE if matches(lbl, BREAK_LABELS) => {
+                break_lines.push(d);
+                Some("break_and_close")
+            }
+            kind::TREND_LINE if matches(lbl, RETEST_LABELS) => {
+                retest_lines.push(d);
+                Some("retest")
+            }
+            kind::FIB_RETRACEMENT => {
+                tp_fibs.push(d);
+                Some("tp_fib")
+            }
             kind::VERTICAL_LINE if matches(lbl, TRADE_EXPIRY_LABELS) => {
                 trade_expiries.push(d);
+                Some("trade_expiry")
             }
             kind::VERTICAL_LINE if matches(lbl, BLACKOUT_START_LABELS) => {
                 blackout_starts.push(d);
+                Some("blackout_start")
             }
             kind::VERTICAL_LINE if matches(lbl, BLACKOUT_END_LABELS) => {
                 blackout_ends.push(d);
+                Some("blackout_end")
             }
-            kind::VERTICAL_LINE if matches(lbl, NEWS_START_LABELS) => news_starts.push(d),
-            kind::VERTICAL_LINE if matches(lbl, NEWS_END_LABELS) => news_ends.push(d),
-            _ => {}
+            kind::VERTICAL_LINE if matches(lbl, NEWS_START_LABELS) => {
+                news_starts.push(d);
+                Some("news_start")
+            }
+            kind::VERTICAL_LINE if matches(lbl, NEWS_END_LABELS) => {
+                news_ends.push(d);
+                Some("news_end")
+            }
+            _ => None,
+        };
+        match role {
+            Some(r) => debug!(id = %stub.id, kind, label = lbl, role = r, "drawing classified"),
+            None => info!(
+                id = %stub.id,
+                kind,
+                label = lbl,
+                "drawing ignored — kind+label combination does not match any role vocabulary",
+            ),
         }
     }
 
