@@ -3700,6 +3700,9 @@ dependencies = [
 [[package]]
 name = "trading-view"
 version = "0.1.0"
+dependencies = [
+ "color-eyre",
+]
 
 [[package]]
 name = "try-lock"
@@ -3728,6 +3731,7 @@ dependencies = [
  "trade-control-cli",
  "trade-control-conventions",
  "trade-control-core",
+ "trading-view",
 ]
 
 [[package]]

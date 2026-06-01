@@ -21,3 +21,4 @@ trade-calendar-maker = { version = "0.1.0", path = "../../../trade-calendar-make
 trade-control-cli = { version = "0.1.0", path = "../cli" }
 trade-control-conventions = { version = "0.1.0", path = "../conventions" }
 trade-control-core = { version = "0.1.0", path = "../core" }
+trading-view = { version = "0.1.0", path = "../trading-view" }

@@ -19,3 +19,5 @@
 //! What does **not** live here: anything strategy-specific. The
 //! H&S role classifier (`tv-arm/src/roles.rs`) consumes from this
 //! crate but doesn't belong inside it.
+
+pub mod pair_lines;

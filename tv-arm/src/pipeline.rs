@@ -781,7 +781,7 @@ trait AnchorTimeShim {
 }
 impl AnchorTimeShim for Drawing {
     fn anchor_time_seconds(&self) -> i64 {
-        use crate::pair_lines::TimedAnchor;
+        use trading_view::pair_lines::TimedAnchor;
         self.anchor_time()
     }
 }

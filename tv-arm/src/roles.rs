@@ -14,7 +14,7 @@
 //!
 //! Blackout and news vertical-line pairs are collected as multi-slot
 //! lists and chronologically paired via
-//! [`crate::pair_lines::pair_vertical_lines`]; an odd count or a
+//! [`trading_view::pair_lines::pair_vertical_lines`]; an odd count or a
 //! reversed pair is a hard error so a misdrawn chart can't silently
 //! arm half a window.
 
@@ -26,8 +26,8 @@ use trade_control_conventions::{
 };
 
 use crate::drawings::{Drawing, DrawingStub};
-use crate::pair_lines::pair_vertical_lines;
 use crate::tv_mcp::TvMcp;
+use trading_view::pair_lines::pair_vertical_lines;
 
 /// Drawing kinds emitted by tv-mcp.
 mod kind {

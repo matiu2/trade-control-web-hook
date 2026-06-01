@@ -26,7 +26,6 @@ mod drawings;
 mod geometry;
 mod instrument_resolution;
 mod manifest;
-mod pair_lines;
 mod pipeline;
 mod roles;
 mod timeframe;

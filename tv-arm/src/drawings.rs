@@ -14,7 +14,7 @@
 
 use serde::Deserialize;
 
-use crate::pair_lines::TimedAnchor;
+use trading_view::pair_lines::TimedAnchor;
 
 /// One drawing's anchor point. Time is UNIX seconds (tv-mcp emits
 /// integer seconds even when the chart uses millisecond bars).
@@ -95,7 +95,7 @@ impl Drawing {
 }
 
 /// Vertical lines have a single anchor; `TimedAnchor` returns that
-/// point's time. Lets [`crate::pair_lines::pair_vertical_lines`]
+/// point's time. Lets [`trading_view::pair_lines::pair_vertical_lines`]
 /// operate directly on `Drawing` without re-implementing the
 /// anchor-time accessor.
 impl TimedAnchor for Drawing {
