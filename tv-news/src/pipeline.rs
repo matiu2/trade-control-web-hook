@@ -35,9 +35,19 @@ pub struct ChartContext {
     /// The chart's TradingView symbol as reported by tv-mcp (e.g.
     /// `"TRADENATION:EURUSD"`, `"OANDA:EUR_USD"`, or bare `"EURUSD"`).
     pub tv_symbol: String,
-    /// The catalog entry the chart resolved to. Carries
-    /// `news_currencies` for filtering.
-    pub asset: &'static Asset,
+    /// The catalog entry the chart resolved to, if any. Carries
+    /// `news_currencies` for filtering. `None` when the chart symbol
+    /// isn't in the instrument-lookup catalog — we fall back to USD
+    /// 3★-only annotation so the operator still gets something useful.
+    pub asset: Option<&'static Asset>,
+    /// The currencies whose news should land on the chart, already
+    /// upper-cased. Mirrors `asset.news_currencies` when the catalog
+    /// hit; defaults to `["USD"]` on miss.
+    pub news_currencies: Vec<String>,
+    /// Stable identifier for log lines. The catalog `Asset.id` when
+    /// resolved, otherwise the raw TV symbol so the operator can still
+    /// grep logs.
+    pub asset_id: String,
     /// The chart's currently-visible window in UTC.
     pub visible_from: DateTime<Utc>,
     /// The end of the chart's currently-visible window in UTC.
@@ -57,14 +67,15 @@ pub fn run(args: Args) -> Result<i32> {
 
     info!(
         tv_symbol = %ctx.tv_symbol,
-        asset_id = %ctx.asset.id,
-        news_currencies = ?ctx.asset.news_currencies,
+        asset_id = %ctx.asset_id,
+        news_currencies = ?ctx.news_currencies,
         visible_from = %ctx.visible_from,
         visible_to = %ctx.visible_to,
+        catalog_hit = ctx.asset.is_some(),
         "resolved chart context",
     );
 
-    let currencies = filter_currencies(ctx.asset);
+    let currencies = filter_currencies(&ctx.news_currencies);
     info!(
         ?currencies,
         "news currencies in scope (incl. USD 3★ baseline)"
@@ -77,13 +88,7 @@ pub fn run(args: Args) -> Result<i32> {
     );
 
     let baseline = vec!["USD".to_string()];
-    let news_ccys: Vec<String> = ctx
-        .asset
-        .news_currencies
-        .iter()
-        .map(|c| c.to_uppercase())
-        .collect();
-    let filtered = filter_events(&raw_events, &news_ccys, &baseline);
+    let filtered = filter_events(&raw_events, &ctx.news_currencies, &baseline);
     info!(
         events_kept = filtered.len(),
         "applied currency + impact filter",
@@ -147,15 +152,8 @@ fn run_sentiment_phase(ctx: &ChartContext) {
         }
     };
 
-    let news_currencies: Vec<String> = ctx
-        .asset
-        .news_currencies
-        .iter()
-        .map(|c| c.to_uppercase())
-        .collect();
-
-    let analysis = analyze_sentiment(&news_currencies, &recent, now_local);
-    log_sentiment(&ctx.asset.id, &news_currencies, &analysis);
+    let analysis = analyze_sentiment(&ctx.news_currencies, &recent, now_local);
+    log_sentiment(&ctx.asset_id, &ctx.news_currencies, &analysis);
 }
 
 fn fetch_events_in_range(from: DateTime<Utc>, to: DateTime<Utc>) -> Result<Vec<EconomicEvent>> {
@@ -315,30 +313,43 @@ fn build_mcp(args: &Args) -> TvMcp {
 }
 
 /// Read chart state + range from tv-mcp and resolve the symbol into a
-/// catalog entry. Hard-errors if the symbol isn't catalogued so the
-/// operator gets a clear "add it to the overlay" hint rather than a
-/// silent skip.
+/// catalog entry. If the symbol isn't catalogued we **warn and fall
+/// back to USD-only** annotation rather than failing the whole run —
+/// the operator still gets a useful chart, and the warning points at
+/// the overlay file to teach tv-news about the new asset.
 fn read_chart_context(mcp: &TvMcp) -> Result<ChartContext> {
     let state = mcp.get_state()?;
     let range = mcp.get_range()?;
     let (visible_from, visible_to) = range.visible_range.to_utc()?;
 
     let bare = strip_exchange(&state.symbol);
-    let asset = instrument_lookup::resolve(bare)?.ok_or_else(|| {
-        let hint = instrument_lookup::user_config_path()
-            .map(|p| p.display().to_string())
-            .unwrap_or_else(|| "~/.config/instrument-lookup/mappings.toml".to_string());
-        eyre!(
-            "chart symbol {:?} is not in the instrument-lookup catalog. \
-             Add an `[[asset]]` entry to {} to teach tv-news about it.",
-            state.symbol,
-            hint,
-        )
-    })?;
+    let asset = instrument_lookup::resolve(bare)?;
+
+    let (news_currencies, asset_id) = match asset {
+        Some(a) => (
+            a.news_currencies.iter().map(|c| c.to_uppercase()).collect(),
+            a.id.to_string(),
+        ),
+        None => {
+            let hint = instrument_lookup::user_config_path()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "~/.config/instrument-lookup/mappings.toml".to_string());
+            warn!(
+                tv_symbol = %state.symbol,
+                overlay = %hint,
+                "chart symbol not in the instrument-lookup catalog — \
+                 falling back to USD-only 3★ annotation. Add an `[[asset]]` \
+                 entry to the overlay to teach tv-news about this asset.",
+            );
+            (vec!["USD".to_string()], state.symbol.clone())
+        }
+    };
 
     Ok(ChartContext {
         tv_symbol: state.symbol.clone(),
         asset,
+        news_currencies,
+        asset_id,
         visible_from,
         visible_to,
         resolution: state.resolution.clone(),
@@ -360,16 +371,11 @@ fn strip_exchange(tv_symbol: &str) -> &str {
 /// on the chart. Always includes USD so 3★ FOMC-class events show up
 /// regardless of the asset's own news currencies.
 ///
-/// Returns currencies in upper-case to match `EconomicEvent::currency`
-/// shape from `forex-factory`. The dedupe / filter phase (#55) will
-/// apply the per-currency star threshold (3★ for USD-only entries,
-/// 2★+3★ for the asset's own currencies).
-pub fn filter_currencies(asset: &Asset) -> Vec<String> {
-    let mut out: Vec<String> = asset
-        .news_currencies
-        .iter()
-        .map(|c| c.to_uppercase())
-        .collect();
+/// Takes the already-upper-cased news currencies (catalog hit) or the
+/// USD-only fallback (catalog miss). Returns currencies in upper-case
+/// to match `EconomicEvent::currency` shape from `forex-factory`.
+pub fn filter_currencies(news_currencies: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = news_currencies.iter().map(|c| c.to_uppercase()).collect();
     let usd = "USD".to_string();
     if !out.iter().any(|c| c == &usd) {
         out.push(usd);
@@ -389,12 +395,9 @@ mod tests {
     }
 
     #[test]
-    fn filter_currencies_includes_usd_baseline() {
-        // EURUSD: asset already has USD, should not be duplicated.
-        let eurusd = instrument_lookup::resolve("EURUSD")
-            .expect("catalog ok")
-            .expect("EURUSD exists");
-        let cs = filter_currencies(eurusd);
+    fn filter_currencies_dedupes_usd_baseline() {
+        let input = vec!["EUR".to_string(), "USD".to_string()];
+        let cs = filter_currencies(&input);
         assert!(cs.iter().any(|c| c == "EUR"));
         let usd_count = cs.iter().filter(|c| **c == "USD").count();
         assert_eq!(usd_count, 1, "USD must be present exactly once");
@@ -402,16 +405,20 @@ mod tests {
 
     #[test]
     fn filter_currencies_appends_usd_when_absent() {
-        // SMI: CHF + EUR per catalog — USD should be appended.
-        let smi = instrument_lookup::resolve("CH20")
-            .or_else(|_| instrument_lookup::resolve("SMI"))
-            .expect("catalog ok");
-        if let Some(asset) = smi {
-            let cs = filter_currencies(asset);
-            assert!(
-                cs.iter().any(|c| c == "USD"),
-                "USD baseline missing: {cs:?}"
-            );
-        }
+        // SMI-like: CHF + EUR; USD should be appended.
+        let input = vec!["CHF".to_string(), "EUR".to_string()];
+        let cs = filter_currencies(&input);
+        assert!(
+            cs.iter().any(|c| c == "USD"),
+            "USD baseline missing: {cs:?}"
+        );
+    }
+
+    #[test]
+    fn filter_currencies_usd_only_on_catalog_miss() {
+        // Fallback path: catalog had no entry, so news_currencies = ["USD"].
+        let input = vec!["USD".to_string()];
+        let cs = filter_currencies(&input);
+        assert_eq!(cs, vec!["USD".to_string()]);
     }
 }

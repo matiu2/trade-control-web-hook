@@ -662,6 +662,12 @@ cargo run -p tv-news --                    # default: draws lines + logs sentime
 No `--broker` flag — news currencies are broker-agnostic. The chart can be on
 any exchange (`TRADENATION:`, `OANDA:`, or bare symbol).
 
+If the chart symbol isn't in the `instrument-lookup` catalog (e.g. a niche
+commodity like `COCOA`), `tv-news` **warns and falls back to USD 3★-only
+annotation** instead of aborting. The warning includes the overlay file path
+so you can add an `[[asset]]` entry whenever you want the asset's own news
+currencies to land on the chart.
+
 ### Sentiment summary
 
 After the drawing phase, `tv-news` does a small follow-up fetch over the
