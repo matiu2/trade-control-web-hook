@@ -15,12 +15,12 @@ use color_eyre::eyre::{Result, eyre};
 use instrument_lookup::Asset;
 use tracing::{info, warn};
 use trade_control_cli::{EconomicEvent, fetch_events_for_range};
-use trade_control_conventions::{NEWS_START_LABELS, matches};
 use trading_view::drawings::Drawing;
 use trading_view::mcp::TvMcp;
 
 use crate::args::Args;
-use crate::filter::{events_needing_drawing, filter_events, news_window};
+use crate::filter::{events_needing_drawing, filter_events, news_anchor};
+use crate::label::{is_news_label, news_label};
 
 /// Result of resolving the chart into a planning context — what
 /// follow-up phases need before they can fetch and draw events.
@@ -79,14 +79,14 @@ pub fn run(args: Args) -> Result<i32> {
         "applied currency + impact filter",
     );
 
-    let existing_starts = collect_existing_news_starts(&mcp)?;
+    let existing_anchors = collect_existing_news_anchors(&mcp)?;
     info!(
-        existing_news_starts = existing_starts.len(),
-        "scanned chart for existing news-start drawings",
+        existing_news_lines = existing_anchors.len(),
+        "scanned chart for existing news drawings",
     );
 
     let tolerance = Duration::minutes(args.dedupe_tolerance_min);
-    let to_draw = events_needing_drawing(filtered, &existing_starts, tolerance);
+    let to_draw = events_needing_drawing(filtered, &existing_anchors, tolerance);
     info!(
         events_to_draw = to_draw.len(),
         "after dedupe against existing chart drawings",
@@ -98,14 +98,13 @@ pub fn run(args: Args) -> Result<i32> {
     }
 
     if args.dry_run {
-        log_planned_draws(&to_draw, Duration::minutes(args.news_window_min));
+        log_planned_draws(&to_draw);
         info!("dry-run: skipping chart drawing");
         return Ok(0);
     }
 
-    let window = Duration::minutes(args.news_window_min);
-    let drawn = draw_events(&mcp, &to_draw, window)?;
-    info!(drawn, "vertical-line pairs landed on chart");
+    let drawn = draw_events(&mcp, &to_draw)?;
+    info!(drawn, "vertical lines landed on chart");
     Ok(0)
 }
 
@@ -120,13 +119,13 @@ fn fetch_events(ctx: &ChartContext) -> Result<Vec<EconomicEvent>> {
 }
 
 /// Scan the chart for vertical-line drawings whose label looks like a
-/// `news-start` marker (per [`NEWS_START_LABELS`]) and collect their
+/// tv-news event marker (per [`is_news_label`]) and collect their
 /// anchor timestamps in unix seconds. Used to dedupe re-runs.
 ///
 /// Drawings that fail to fetch are logged and skipped — a stale id in
 /// the `draw list` response shouldn't fail the whole run, since the
 /// worst case is a duplicate line on a transient race.
-fn collect_existing_news_starts(mcp: &TvMcp) -> Result<Vec<i64>> {
+fn collect_existing_news_anchors(mcp: &TvMcp) -> Result<Vec<i64>> {
     let stubs = mcp.list_drawings()?;
     let mut out = Vec::new();
     for stub in stubs {
@@ -140,7 +139,7 @@ fn collect_existing_news_starts(mcp: &TvMcp) -> Result<Vec<i64>> {
                 continue;
             }
         };
-        if !matches(drawing.label(), NEWS_START_LABELS) {
+        if !is_news_label(drawing.label()) {
             continue;
         }
         if let Some(p) = drawing.points.first() {
@@ -152,45 +151,37 @@ fn collect_existing_news_starts(mcp: &TvMcp) -> Result<Vec<i64>> {
 
 /// Log the events we'd draw under `--dry-run` so the operator can
 /// verify the plan before re-running for real.
-fn log_planned_draws(events: &[EconomicEvent], window: Duration) {
+fn log_planned_draws(events: &[EconomicEvent]) {
     for ev in events {
-        let (start, end) = news_window(ev, window);
         info!(
             event = %ev.name,
             currency = %ev.currency,
             impact = ?ev.impact,
-            news_start = %start,
-            news_end = %end,
+            anchor = %news_anchor(ev),
+            label = %news_label(ev),
             "would draw",
         );
     }
 }
 
-/// Draw one `news-start`/`news-end` vertical-line pair per event.
-/// Returns the count of pairs that landed successfully. tv-mcp errors
-/// short-circuit so the operator can re-run after fixing the cause
-/// rather than ending up with a half-drawn chart.
-fn draw_events(mcp: &TvMcp, events: &[EconomicEvent], window: Duration) -> Result<usize> {
+/// Draw one labelled vertical line per event at the event's anchor
+/// time. Returns the count of lines that landed successfully. tv-mcp
+/// errors short-circuit so the operator can re-run after fixing the
+/// cause rather than ending up with a half-drawn chart.
+fn draw_events(mcp: &TvMcp, events: &[EconomicEvent]) -> Result<usize> {
     let mut drawn = 0usize;
     for ev in events {
-        let (start, end) = news_window(ev, window);
+        let anchor = news_anchor(ev);
+        let label = news_label(ev);
         // tv-mcp wants a price; vertical lines ignore it for evaluation
         // but require something parseable. Use 1.0 — matches tv-arm's
         // auto-draw helper.
-        let s = mcp.draw_vertical_line(start.timestamp(), 1.0, "news-start")?;
+        let s = mcp.draw_vertical_line(anchor.timestamp(), 1.0, &label)?;
         if !s.success {
             return Err(eyre!(
-                "tv-mcp draw news-start failed for {}: {}",
+                "tv-mcp draw {label} failed for {}: {}",
                 ev.name,
                 s.error.as_deref().unwrap_or("(no message)"),
-            ));
-        }
-        let e = mcp.draw_vertical_line(end.timestamp(), 1.0, "news-end")?;
-        if !e.success {
-            return Err(eyre!(
-                "tv-mcp draw news-end failed for {}: {}",
-                ev.name,
-                e.error.as_deref().unwrap_or("(no message)"),
             ));
         }
         drawn += 1;

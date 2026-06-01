@@ -1,5 +1,5 @@
-//! `tv-news` — annotate the active TradingView chart with vertical-line
-//! pairs for upcoming forex-factory news events that affect the chart's
+//! `tv-news` — annotate the active TradingView chart with a single
+//! vertical line per forex-factory news event affecting the chart's
 //! instrument.
 //!
 //! Operator workflow: open a chart, scroll to a 2.5–3 week window
@@ -7,9 +7,10 @@
 //! range, resolves the chart's symbol via `instrument-lookup`, fetches
 //! 2-star + 3-star events for the asset's news currencies (plus 3-star
 //! USD events globally so FOMC is always annotated), de-duplicates
-//! against existing chart drawings, then draws `news-start` /
-//! `news-end` pairs. The downstream `tv_extract_*_trade.py` scripts
-//! read those bars when annotating a past trade.
+//! against existing chart drawings, then draws one labelled vertical
+//! line per event (e.g. `usd-3-star-fomc`). The downstream
+//! `tv_extract_*_trade.py` scripts read those bars when annotating a
+//! past trade.
 
 #![allow(dead_code)]
 
@@ -21,6 +22,7 @@ use color_eyre::eyre::Result;
 
 mod args;
 mod filter;
+mod label;
 mod pipeline;
 
 use crate::args::Args;

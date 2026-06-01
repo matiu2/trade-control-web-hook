@@ -21,17 +21,10 @@ pub struct Args {
     pub dry_run: bool,
 
     /// Tolerance (in minutes) for matching an existing chart drawing
-    /// against a candidate event. Pairs within this window are
+    /// against a candidate event. Lines within this window are
     /// considered duplicates and skipped. Default 5.
     #[arg(long, default_value_t = 5)]
     pub dedupe_tolerance_min: i64,
-
-    /// Width of the `news-start` → `news-end` window, in minutes.
-    /// Matches `trade-calendar-maker`'s buffer-after value (1h) by
-    /// default. Bumping this widens the window the downstream
-    /// `tv_extract_*_trade.py` scripts treat as "news-affected".
-    #[arg(long, default_value_t = 60)]
-    pub news_window_min: i64,
 
     /// Override the tv-mcp module root. Defaults to the hard-coded
     /// `~/Downloads/tradingview-mcp-jackson` path.
@@ -53,14 +46,7 @@ mod tests {
         let args = Args::try_parse_from(["tv-news"]).expect("parse ok");
         assert!(!args.dry_run);
         assert_eq!(args.dedupe_tolerance_min, 5);
-        assert_eq!(args.news_window_min, 60);
         assert_eq!(args.tv_mcp_root, None);
-    }
-
-    #[test]
-    fn news_window_min_overrides() {
-        let args = Args::try_parse_from(["tv-news", "--news-window-min", "30"]).expect("parse");
-        assert_eq!(args.news_window_min, 30);
     }
 
     #[test]

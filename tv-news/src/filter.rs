@@ -7,11 +7,11 @@
 //! - [`filter_events`]: keep events whose currency is in the asset's
 //!   `news_currencies` at 2★+ impact, OR a baseline currency (USD) at
 //!   3★. Today the baseline is USD; a future revision may widen this.
-//! - [`events_needing_drawing`]: drop events whose `news-start`
-//!   timestamp is already on the chart within ±tolerance, so re-runs
-//!   are idempotent.
+//! - [`events_needing_drawing`]: drop events whose anchor timestamp is
+//!   already covered by a tv-news vertical line on the chart within
+//!   ±tolerance, so re-runs are idempotent.
 
-use chrono::{DateTime, Duration, Utc};
+use chrono::{DateTime, Utc};
 use trade_control_cli::{EconomicEvent, Impact};
 
 /// Keep the events tv-news should put on the chart.
@@ -51,25 +51,25 @@ fn keep_event(ev: &EconomicEvent, news: &[String], baseline: &[String]) -> bool 
     false
 }
 
-/// Drop events whose `news-start` timestamp already has a matching
-/// vertical line on the chart within ±`tolerance`. Used so a second
-/// `tv-news` run on the same chart doesn't pile duplicate lines on top
-/// of the first run's output.
+/// Drop events whose anchor timestamp already has a tv-news vertical
+/// line on the chart within ±`tolerance`. Used so a second `tv-news`
+/// run on the same chart doesn't pile duplicate lines on top of the
+/// first run's output.
 ///
-/// `existing_news_start_secs` is the list of unix-second timestamps
-/// from drawings already on the chart whose label matches
-/// `conventions::NEWS_START_LABELS`. Caller is responsible for filtering
-/// the chart's drawing list down to that set — this helper only cares
-/// about timestamps.
+/// `existing_news_anchor_secs` is the list of unix-second timestamps
+/// from drawings already on the chart whose label looks like a
+/// tv-news event marker (see `label::is_news_label`). Caller is
+/// responsible for filtering the chart's drawing list down to that
+/// set — this helper only cares about timestamps.
 pub fn events_needing_drawing(
     events: Vec<EconomicEvent>,
-    existing_news_start_secs: &[i64],
-    tolerance: Duration,
+    existing_news_anchor_secs: &[i64],
+    tolerance: chrono::Duration,
 ) -> Vec<EconomicEvent> {
     let tol = tolerance.num_seconds();
     events
         .into_iter()
-        .filter(|ev| !is_duplicate(ev, existing_news_start_secs, tol))
+        .filter(|ev| !is_duplicate(ev, existing_news_anchor_secs, tol))
         .collect()
 }
 
@@ -78,12 +78,11 @@ fn is_duplicate(ev: &EconomicEvent, existing: &[i64], tolerance_secs: i64) -> bo
     existing.iter().any(|e| (e - ts).abs() <= tolerance_secs)
 }
 
-/// Compute the news-window endpoints for an event: a vertical line at
-/// `event_time` (label `news-start`) and another at
-/// `event_time + window` (label `news-end`).
-pub fn news_window(ev: &EconomicEvent, window: Duration) -> (DateTime<Utc>, DateTime<Utc>) {
-    let start = ev.datetime.with_timezone(&Utc);
-    (start, start + window)
+/// The chart-anchor timestamp for an event — the `datetime` field
+/// re-normalised to UTC. tv-news draws one vertical line per event at
+/// this instant.
+pub fn news_anchor(ev: &EconomicEvent) -> DateTime<Utc> {
+    ev.datetime.with_timezone(&Utc)
 }
 
 #[cfg(test)]
@@ -171,7 +170,7 @@ mod tests {
         let event_ts = events[0].datetime.with_timezone(&Utc).timestamp();
         // Existing line 3 minutes off — within ±5 min tolerance.
         let existing = vec![event_ts + 180];
-        let kept = events_needing_drawing(events, &existing, Duration::minutes(5));
+        let kept = events_needing_drawing(events, &existing, chrono::Duration::minutes(5));
         assert!(kept.is_empty(), "expected dedupe to drop the event");
     }
 
@@ -181,22 +180,20 @@ mod tests {
         let event_ts = events[0].datetime.with_timezone(&Utc).timestamp();
         // Existing line 7 minutes off — outside ±5 min tolerance.
         let existing = vec![event_ts + 420];
-        let kept = events_needing_drawing(events, &existing, Duration::minutes(5));
+        let kept = events_needing_drawing(events, &existing, chrono::Duration::minutes(5));
         assert_eq!(kept.len(), 1);
     }
 
     #[test]
     fn dedupe_keeps_when_no_existing_lines() {
         let events = vec![ev("CPI", "USD", Impact::High, "2026-06-10T12:30:00Z")];
-        let kept = events_needing_drawing(events, &[], Duration::minutes(5));
+        let kept = events_needing_drawing(events, &[], chrono::Duration::minutes(5));
         assert_eq!(kept.len(), 1);
     }
 
     #[test]
-    fn news_window_starts_at_event_time() {
+    fn news_anchor_is_event_time_in_utc() {
         let e = ev("CPI", "USD", Impact::High, "2026-06-10T12:30:00Z");
-        let (start, end) = news_window(&e, Duration::minutes(60));
-        assert_eq!(start, ts("2026-06-10T12:30:00Z"));
-        assert_eq!(end, ts("2026-06-10T13:30:00Z"));
+        assert_eq!(news_anchor(&e), ts("2026-06-10T12:30:00Z"));
     }
 }

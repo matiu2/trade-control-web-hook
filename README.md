@@ -619,10 +619,10 @@ where those preps don't apply.
 
 ## Chart annotation: `tv-news`
 
-Sister binary to `tv-arm`. Annotates the active chart with `news-start` /
-`news-end` vertical-line pairs for upcoming forex-factory events affecting the
-chart's instrument, so the downstream `tv_extract_*_trade.py` scripts (and
-`tv-arm` itself when armed manually) have something to read from.
+Sister binary to `tv-arm`. Annotates the active chart with one labelled
+vertical line per upcoming forex-factory event affecting the chart's
+instrument, so the downstream `tv_extract_*_trade.py` scripts (and `tv-arm`
+itself when armed manually) have something to read from.
 
 What it does:
 
@@ -633,10 +633,16 @@ What it does:
    typical operator scroll is 2.5–3 weeks).
 4. Filters to **2★ + 3★** for the asset's own currencies, plus **3★ USD**
    regardless of asset (so FOMC always lands on every chart).
-5. Skips events that already have a `news-start` vertical line within ±5
-   minutes (idempotent re-run).
-6. Draws the survivors as `news-start` / `news-end` pairs, defaulting to a
-   60-minute window (matches `trade-calendar-maker`'s `buffer_after`).
+5. Skips events that already have a tv-news vertical line within ±5
+   minutes (idempotent re-run). Both the new `<ccy>-<n>-star-…` labels and
+   the legacy `news-start` / `news-end` labels are recognised for dedupe.
+6. Draws the survivors as a single vertical line each, labelled
+   `<currency>-<stars>-star-<name-slug>` — e.g. `usd-3-star-fomc`,
+   `eur-2-star-cpi-y-y`.
+
+Note: this is purely chart annotation. The worker's news-window vetos and
+the `tv-arm` arming flow continue to use the `news-start` / `news-end` /
+`pause` / `resume` label vocabulary defined in `conventions`.
 
 CLI:
 
@@ -644,7 +650,6 @@ CLI:
 cargo run -p tv-news --                    # default: draws lines
   --dry-run                                # plan only, no drawing
   --dedupe-tolerance-min 5                 # ±tolerance for "already on chart"
-  --news-window-min 60                     # width of the news-start → news-end pair
   --tv-mcp-root ~/Downloads/tradingview-mcp-jackson
 ```
 
