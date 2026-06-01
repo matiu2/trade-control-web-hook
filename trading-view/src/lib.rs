@@ -20,4 +20,6 @@
 //! H&S role classifier (`tv-arm/src/roles.rs`) consumes from this
 //! crate but doesn't belong inside it.
 
+pub mod drawings;
+pub mod mcp;
 pub mod pair_lines;

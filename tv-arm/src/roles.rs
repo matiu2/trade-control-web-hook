@@ -25,8 +25,8 @@ use trade_control_conventions::{
     NEWS_START_LABELS, RETEST_LABELS, SR_LEVEL_LABELS, TRADE_EXPIRY_LABELS, matches,
 };
 
-use crate::drawings::{Drawing, DrawingStub};
-use crate::tv_mcp::TvMcp;
+use trading_view::drawings::{Drawing, DrawingStub};
+use trading_view::mcp::TvMcp;
 use trading_view::pair_lines::pair_vertical_lines;
 
 /// Drawing kinds emitted by tv-mcp.
@@ -174,8 +174,8 @@ fn latest_with_label(mut cands: Vec<(Drawing, String)>, role: &str) -> Option<(D
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::drawings::{Point, Properties};
     use std::collections::HashMap;
+    use trading_view::drawings::{Point, Properties};
 
     /// In-memory fetcher backed by a HashMap<id, Drawing>.
     struct MockFetcher {

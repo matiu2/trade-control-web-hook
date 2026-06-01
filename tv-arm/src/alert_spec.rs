@@ -19,9 +19,9 @@ use trade_control_conventions::{
     AlertBasename, Direction, PINE_INDICATOR_NAME, entry_plot_for, reversal_close_plot_for,
 };
 
-use crate::drawings::Drawing;
 use crate::geometry::pcl_exhausted_price_from_fib;
 use crate::roles::Roles;
+use trading_view::drawings::Drawing;
 
 /// Calendar-window context for an alert that's bound to a synthetic
 /// vertical line (the operator never drew it on the chart). Carried
@@ -331,7 +331,7 @@ fn role_slug(base: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::drawings::{Point, Properties};
+    use trading_view::drawings::{Point, Properties};
 
     fn drawing(id: &str, label: &str, points: Vec<(i64, f64)>) -> Drawing {
         Drawing {

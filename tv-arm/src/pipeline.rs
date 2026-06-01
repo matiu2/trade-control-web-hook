@@ -29,12 +29,12 @@ use trade_control_core::sig::KEY_LEN;
 use crate::alert_spec::{AlertPayload, CalendarWindow, DispatchContext, build_alert_spec};
 use crate::args::Args;
 use crate::create_alerts::create_alerts;
-use crate::drawings::Drawing;
 use crate::geometry::tp_price_from_fib;
 use crate::manifest::{CalendarBundle, discover_calendar_bundles};
 use crate::roles::{Roles, classify};
 use crate::timeframe::infer_calendar_timeframe;
-use crate::tv_mcp::TvMcp;
+use trading_view::drawings::Drawing;
+use trading_view::mcp::TvMcp;
 
 /// Output root for built bundles. Matches the Python `ARM_OUT_ROOT`
 /// so a side-by-side run reuses the same paths.
@@ -48,7 +48,7 @@ pub fn run(args: Args) -> Result<i32> {
     let mcp = TvMcp::new(
         args.tv_mcp_root
             .clone()
-            .unwrap_or_else(|| PathBuf::from(crate::tv_mcp::DEFAULT_TV_MCP_ROOT)),
+            .unwrap_or_else(|| PathBuf::from(trading_view::mcp::DEFAULT_TV_MCP_ROOT)),
     );
     let state = mcp.get_state().wrap_err("read TV chart state")?;
     let (_exchange, raw_sym) = split_symbol(&state.symbol);
@@ -628,7 +628,7 @@ fn draw_pair_lines(
 #[allow(clippy::too_many_arguments)]
 fn discover_or_fetch_calendar_bundles(
     args: &Args,
-    state: &crate::drawings::ChartState,
+    state: &trading_view::drawings::ChartState,
     trade_id: &str,
     instrument: &str,
     account: &str,

@@ -3702,6 +3702,8 @@ name = "trading-view"
 version = "0.1.0"
 dependencies = [
  "color-eyre",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

@@ -22,14 +22,12 @@ use color_eyre::eyre::Result;
 mod alert_spec;
 mod args;
 mod create_alerts;
-mod drawings;
 mod geometry;
 mod instrument_resolution;
 mod manifest;
 mod pipeline;
 mod roles;
 mod timeframe;
-mod tv_mcp;
 
 use crate::args::Args;
 
