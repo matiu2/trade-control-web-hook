@@ -36,7 +36,7 @@ pub use forex_factory::{EconomicEvent, Impact};
 pub use history::{
     History, load as load_history, record_account_use, record_prep_use, record_veto_use,
 };
-pub use instruments::{load_cache, validate_instrument};
+pub use instruments::{load_cache, require_local_tn_account, validate_instrument};
 pub use interactive::{fill_missing_fields, prompt_save_as_template};
 pub use news_pattern::{
     BuiltNews, BuiltNewsAlert, NewsSpec, build_news_from_spec,

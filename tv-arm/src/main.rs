@@ -33,6 +33,32 @@ mod timeframe;
 
 use crate::args::Args;
 
+/// Hand-rolled zsh helper appended after the clap-generated tv-arm
+/// completion. Mirrors the pattern in `trade-control` for
+/// `_trade_control_tn_instruments`: define a helper, let the user wire
+/// it in zshrc. We don't auto-wire because clap regenerates its script
+/// every time we rename a flag, and an automatic compdef override
+/// would race that.
+///
+/// To use, add to zshrc *after* sourcing the tv-arm completion file:
+///
+/// ```zsh
+/// compdef -e "_arguments -S '--account-id=[server-side account name]:account:_tv_arm_account_names'" tv-arm
+/// ```
+///
+/// (Or use `compctl`/zstyle if you prefer; the helper is the load-
+/// bearing bit.)
+const ZSH_ACCOUNT_ID_HOOK: &str = r#"
+# tv-arm: --account-id completer. Lists every locally-known account name
+# (operator history ∪ local TN store) via `trade-control account names`.
+# No admin key or network call — safe to invoke on every TAB.
+_tv_arm_account_names() {
+    local -a names
+    names=("${(@f)$(trade-control account names 2>/dev/null)}")
+    compadd -- "${names[@]}"
+}
+"#;
+
 fn main() -> Result<ExitCode> {
     color_eyre::install()?;
     tracing_subscriber::fmt()
@@ -48,6 +74,13 @@ fn main() -> Result<ExitCode> {
         let mut cmd = Args::command();
         let name = cmd.get_name().to_string();
         generate(Shell::Zsh, &mut cmd, name, &mut std::io::stdout());
+        // Append a dynamic completer for --account-id. The clap-generated
+        // script lists it as a value but with no completion source; this
+        // hook overrides its action to call `trade-control account names`,
+        // which prints the union of locally-known account names with no
+        // auth or network. See `pipeline.rs:resolve_account` for the
+        // selection precedence the flag follows.
+        print!("{ZSH_ACCOUNT_ID_HOOK}");
         return Ok(ExitCode::SUCCESS);
     }
 

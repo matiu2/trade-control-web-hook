@@ -494,17 +494,104 @@ stored credentials and writes the new session back to KV. No external
 rotation is needed — credentials live in the secret, and sessions
 regenerate themselves.
 
-Register an account:
+Register an account. The intended order is **broker first, worker
+second**:
 
 ```sh
+# 1. Provision the demo at TradeNation (or use an existing live
+#    account). This populates the local encrypted store at
+#    ~/.config/tradenation/accounts.enc with the credentials.
+tradenation account create my-tn-demo
+
+# 2. Register the same name with the worker. By default this reads
+#    username + password from the local TN store — no re-typing, no
+#    chance of a typo leaking bad credentials to Cloudflare.
 trade-control account add my-tn-demo \
   --broker tradenation --kind demo \
   --admin-key-file ~/.config/trade-control/admin-key.hex
 ```
 
+`account add --broker tradenation <name>` **errors** if `<name>` isn't
+in the local TN store. Pass `--username <override>` if you intentionally
+want to register a different identity than what's stored locally (it
+will prompt for a fresh password).
+
 This wraps `wrangler secret put TN_ACCOUNT_MY_TN_DEMO` and writes the
 metadata entry in KV. After that, intents with `account: my-tn-demo`
 route through that account; the worker handles session lifecycle.
+
+### Local TN store vs server-side account list
+
+Two account namespaces exist:
+
+- **`tradenation account list`** — local encrypted store
+  (`~/.config/tradenation/accounts.enc`). Holds username + password
+  for every TN session this machine can open.
+- **`trade-control account list`** — the worker's metadata index.
+  Maps `account:` strings on the wire to a broker + kind + caps +
+  `TN_ACCOUNT_<NAME>` secret.
+
+The names must match for TradeNation accounts. `account add` enforces
+this. CLI-side TN catalog walks (used by `tv-arm --account-id=X` and
+`trade-control instruments`) also log in via the named local entry, so
+the log line names the account the operator passed instead of whatever
+the default-demo pointer happens to be. If the local store doesn't
+have a matching entry, the CLI errors with a hint to run
+`tradenation account create <name>` first.
+
+OANDA accounts are unaffected — they share one worker-wide
+`OANDA_API_KEY` secret and don't need a local-store counterpart.
+
+### `--account-id` shell completion
+
+`tv-arm --account-id <TAB>` can complete from locally-known accounts
+once the helper from `tv-arm --print-completions` is wired in. Source
+your tv-arm completion file in zshrc, then add:
+
+```zsh
+compdef -e "_arguments -S '--account-id=[server-side account name]:account:_tv_arm_account_names'" tv-arm
+```
+
+The helper calls `trade-control account names`, which prints the union
+of operator history and local TN store names — no admin key, no
+network, safe to invoke on every TAB.
+
+### Prerequisites
+
+`trade-control account add` shells out to `wrangler` to push the
+credential secret, so two things must be true on the machine running
+the CLI:
+
+- **Logged in to Cloudflare:** `wrangler login` (one-time per machine,
+  or whenever the OAuth token expires). Without this `wrangler secret
+  put` fails with an auth error after the metadata POST has already
+  succeeded.
+- **Run from this repo root:** wrangler reads `name =
+  "trade-control-web-hook"` from `./wrangler.toml`. Running `account
+  add` from any other directory fails with `Required Worker name
+  missing` — again, *after* the metadata POST has succeeded. (You can
+  also pass `--name trade-control-web-hook` via wrangler config, but
+  cd-ing into the repo is simpler.)
+
+### Recovering from a half-done `account add`
+
+If the metadata POST succeeded but the `wrangler secret put` shell-out
+failed (wrong directory, not logged in, etc.), do **not** re-run
+`trade-control account add` — the worker will reject it with `409
+Conflict: already exists`. Push the secret directly instead:
+
+```sh
+cd /path/to/trade-control-web-hook   # so wrangler.toml is visible
+read -s TN_PW
+echo "{\"broker\":\"tradenation\",\"kind\":\"demo\",\"username\":\"<tn-username>\",\"password\":\"$TN_PW\"}" \
+  | wrangler secret put TN_ACCOUNT_<NAME-UPPERCASED>
+unset TN_PW
+```
+
+`<NAME-UPPERCASED>` is the account name uppercased with `-` → `_`
+(e.g. account `my-tn-demo` → binding `TN_ACCOUNT_MY_TN_DEMO`).
+
+Then verify with `trade-control account test <name>`.
 
 If you hit a 503 with `tradenation login failed`, check the worker
 logs — likely either a wrong-broker mismatch, a malformed credentials

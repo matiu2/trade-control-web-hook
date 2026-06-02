@@ -14,7 +14,7 @@ use std::time::Duration;
 
 use color_eyre::eyre::{Result, eyre};
 use trade_control_core::intent::BrokerKind;
-use tradenation_api::login_demo;
+use tradenation_api::{login_demo, login_demo_named};
 use tradenation_instrument_cache::{InstrumentCache, ResolveError};
 
 /// How old the cached catalog can be before we re-walk the TN tree.
@@ -25,12 +25,38 @@ const CACHE_MAX_AGE: Duration = Duration::from_secs(7 * 24 * 3600);
 /// Load the on-disk catalog (or fetch a fresh one when missing/stale).
 /// `refresh = true` forces a re-walk even if the disk copy is fresh.
 ///
+/// `account = Some(name)` logs in via the named entry in the local TN
+/// store (so `tv-arm --account-id=X` walks the catalog under the same
+/// identity that arms the trade). Errors when the name is missing
+/// locally — the operator should `tradenation account create <name>`
+/// first.
+///
+/// `account = None` keeps the legacy `login_demo()` behavior (picks the
+/// default demo). Used by call sites that don't know an account yet,
+/// e.g. the `status` instrument-footer.
+///
 /// `path` lets tests pin the cache to a tempdir. Pass `None` in production.
-pub fn load_cache(refresh: bool, path: Option<PathBuf>) -> Result<InstrumentCache> {
+pub fn load_cache(
+    refresh: bool,
+    account: Option<&str>,
+    path: Option<PathBuf>,
+) -> Result<InstrumentCache> {
+    // Validate the local-store entry up-front so the error message
+    // doesn't get tangled with the redirect-chain noise from a
+    // doomed login attempt.
+    if let Some(name) = account {
+        require_local_tn_account(name)?;
+    }
+    let account = account.map(str::to_owned);
     run_blocking(async move {
-        let session = login_demo()
-            .await
-            .map_err(|e| eyre!("logging in to TradeNation for catalog walk: {e}"))?;
+        let session = match account.as_deref() {
+            Some(name) => login_demo_named(name).await.map_err(|e| {
+                eyre!("logging in to TradeNation as '{name}' for catalog walk: {e}")
+            })?,
+            None => login_demo()
+                .await
+                .map_err(|e| eyre!("logging in to TradeNation for catalog walk: {e}"))?,
+        };
         let mut cache = InstrumentCache::load_or_fetch(&session, CACHE_MAX_AGE, path)
             .await
             .map_err(|e| eyre!("loading TN instrument cache: {e}"))?;
@@ -44,7 +70,30 @@ pub fn load_cache(refresh: bool, path: Option<PathBuf>) -> Result<InstrumentCach
     })
 }
 
+/// Check that `name` exists in the local TN store; otherwise return an
+/// actionable error pointing at `tradenation account create`. Kept
+/// public so `account add` can run the same check before touching
+/// Cloudflare.
+pub fn require_local_tn_account(name: &str) -> Result<()> {
+    let names = tradenation_api::accounts::list_accounts()
+        .map_err(|e| eyre!("reading local TradeNation account store: {e}"))?;
+    if names.iter().any(|(n, _)| n == name) {
+        return Ok(());
+    }
+    Err(eyre!(
+        "no TradeNation account named '{name}' in local store \
+         (~/.config/tradenation/accounts.enc). \
+         Create it first with `tradenation account create {name}` \
+         (or pass --account-id matching an existing local entry)."
+    ))
+}
+
 /// Validate a user-supplied instrument name for the given broker.
+///
+/// `account` is the operator-facing account name; for TradeNation it
+/// drives the local-store login that walks the catalog (see
+/// [`load_cache`]). `None` falls back to the default demo for callers
+/// that don't have account context yet.
 ///
 /// Return value:
 /// - `Ok(None)` — exact match (or broker is OANDA, no validation done).
@@ -54,11 +103,15 @@ pub fn load_cache(refresh: bool, path: Option<PathBuf>) -> Result<InstrumentCach
 ///   happened.
 /// - `Err(report)` — no match. The error message already includes the
 ///   top candidates from `ResolveError::NotFound`.
-pub fn validate_instrument(broker: BrokerKind, name: &str) -> Result<Option<String>> {
+pub fn validate_instrument(
+    broker: BrokerKind,
+    account: Option<&str>,
+    name: &str,
+) -> Result<Option<String>> {
     match broker {
         BrokerKind::Oanda => Ok(None),
         BrokerKind::TradeNation => {
-            let cache = load_cache(false, None)?;
+            let cache = load_cache(false, account, None)?;
             resolve_with_cache(&cache, name)
         }
     }
@@ -140,14 +193,28 @@ mod tests {
     fn oanda_validation_is_noop() {
         // Any string passes; no network or cache touched.
         assert!(
-            validate_instrument(BrokerKind::Oanda, "anything")
+            validate_instrument(BrokerKind::Oanda, None, "anything")
                 .unwrap()
                 .is_none()
         );
         assert!(
-            validate_instrument(BrokerKind::Oanda, "")
+            validate_instrument(BrokerKind::Oanda, Some("reversals"), "")
                 .unwrap()
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn require_local_tn_account_errors_for_unknown() {
+        // Pick a name with random suffix to keep the test stable
+        // even if the user happens to have other named demos locally.
+        let bogus = "nonexistent-tv-arm-test-account-zzz12345";
+        let err = require_local_tn_account(bogus).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains(bogus), "got: {msg}");
+        assert!(
+            msg.contains("tradenation account create"),
+            "expected fix-it hint; got: {msg}",
         );
     }
 

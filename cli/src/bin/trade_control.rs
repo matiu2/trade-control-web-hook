@@ -29,8 +29,8 @@ use trade_control_cli::{
     list_accounts, load_cache, load_news_spec_from_file, load_pause_spec_from_file,
     load_spec_from_file, pick_pattern_interactive, pick_template_interactive,
     prompt_save_as_template, put_secret, record_account_use, record_prep_use, record_veto_use,
-    run_calendar_bars, secret_binding_for, test_account, validate_instrument, wrap_signed,
-    wrap_signed_template, write_news, write_pause, write_trade,
+    require_local_tn_account, run_calendar_bars, secret_binding_for, test_account,
+    validate_instrument, wrap_signed, wrap_signed_template, write_news, write_pause, write_trade,
 };
 use trade_control_core::account::{
     AccountKind, AccountMetadata, Credentials, TradeNationCreds, TradeNationKind,
@@ -169,6 +169,12 @@ enum AccountCmd {
     /// Verify an account is wired up correctly: metadata exists, credential
     /// secret resolves, broker tags match. Does not log into the broker.
     Test(AccountTestArgs),
+    /// Print every account name known locally — union of the operator
+    /// history (populated by `account list` / `add` / `test`) and the
+    /// local TN store. One per line, no auth, no network. Intended for
+    /// shell tab-completion of `--account-id`.
+    #[command(hide = true)]
+    Names,
 }
 
 #[derive(Parser)]
@@ -207,8 +213,11 @@ struct AccountAddArgs {
     /// metadata first and provision credentials later.
     #[arg(long, default_value_t = false)]
     no_secret: bool,
-    /// TradeNation: account username (the one that logs in). Prompted
-    /// interactively if absent and the broker is TradeNation.
+    /// TradeNation: account username (the one that logs in). Override
+    /// for the default behavior, which pulls username + password from
+    /// the local TN store (`~/.config/tradenation/accounts.enc`).
+    /// When set, prompts for a fresh password instead of reading
+    /// either field from the store.
     #[arg(long)]
     username: Option<String>,
     /// OANDA: sub-account id (e.g. `101-011-31142393-003`). Prompted
@@ -705,7 +714,10 @@ fn run_instruments(sub: InstrumentsCmd) -> Result<()> {
     match sub {
         InstrumentsCmd::Refresh { broker } => match broker.into() {
             BrokerKind::TradeNation => {
-                let cache = load_cache(true, None)?;
+                // No --account-id on this admin command; fall back to
+                // the default-demo login. The catalog is account-
+                // agnostic, so any working demo produces the same data.
+                let cache = load_cache(true, None, None)?;
                 println!(
                     "refreshed: {} markets at {}",
                     cache.catalog().markets.len(),
@@ -725,7 +737,7 @@ fn run_instruments(sub: InstrumentsCmd) -> Result<()> {
         },
         InstrumentsCmd::List { broker } => match broker.into() {
             BrokerKind::TradeNation => {
-                let cache = load_cache(false, None)?;
+                let cache = load_cache(false, None, None)?;
                 for name in cache.names() {
                     println!("{name}");
                 }
@@ -745,7 +757,7 @@ fn run_instruments(sub: InstrumentsCmd) -> Result<()> {
 fn run_resolve_tradenation(name: &str, json: bool) -> Result<()> {
     use tradenation_instrument_cache::ResolveError;
 
-    let cache = load_cache(false, None)?;
+    let cache = load_cache(false, None, None)?;
     match cache.resolve(name) {
         Ok(market) => {
             if json {
@@ -930,7 +942,7 @@ fn build_status_instruments_footer(response: &str) -> Option<String> {
     // Best-effort cache load. If TN login or disk read fails we still
     // print the section header + raw names so the operator sees which
     // strings exist, but without a `→` annotation.
-    let cache = load_cache(false, None).ok();
+    let cache = load_cache(false, None, None).ok();
     Some(format_instruments_footer(&names, cache.as_ref()))
 }
 
@@ -987,7 +999,11 @@ fn annotate_instrument(
 /// never sees an unknown instrument.
 fn canonicalize_instrument(broker: BrokerKindArg, instrument: &str) -> Result<String> {
     let broker_kind: BrokerKind = broker.into();
-    match validate_instrument(broker_kind, instrument)? {
+    // No account context on these admin commands — fall back to the
+    // default-demo login. The catalog is account-agnostic so this is
+    // safe; if the local default demo is missing the operator gets a
+    // clear error pointing at the local store.
+    match validate_instrument(broker_kind, None, instrument)? {
         Some(canonical) => {
             tracing::warn!(
                 input = %instrument,
@@ -1170,12 +1186,33 @@ fn load_admin_key(path: &PathBuf) -> Result<String> {
     Ok(trimmed)
 }
 
+/// Print the union of operator history and local TN store names, one
+/// per line. No auth, no network — designed for shell tab-completion
+/// hooks that run on every TAB. Errors are swallowed: an empty list
+/// is the right behavior when there's nothing cached yet.
+fn run_account_names() -> Result<()> {
+    let mut names: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for entry in trade_control_cli::load_history().accounts {
+        names.insert(entry.name);
+    }
+    if let Ok(local) = tradenation_api::accounts::list_accounts() {
+        for (name, _) in local {
+            names.insert(name);
+        }
+    }
+    for n in names {
+        println!("{n}");
+    }
+    Ok(())
+}
+
 fn run_account(sub: AccountCmd) -> Result<()> {
     match sub {
         AccountCmd::List(args) => run_account_list(args),
         AccountCmd::Add(args) => run_account_add(args),
         AccountCmd::Delete(args) => run_account_delete(args),
         AccountCmd::Test(args) => run_account_test(args),
+        AccountCmd::Names => run_account_names(),
     }
 }
 
@@ -1261,6 +1298,14 @@ fn run_account_add(args: AccountAddArgs) -> Result<()> {
     let kind: AccountKind = args.kind.into();
     let theme = ColorfulTheme::default();
 
+    // Enforce the intended order: create the broker account first
+    // (`tradenation account create <name>`), then register it here.
+    // Catches drift before we upload metadata to the worker — and lets
+    // us pull credentials from the local store instead of re-prompting.
+    if broker == BrokerKind::TradeNation {
+        require_local_tn_account(&args.name)?;
+    }
+
     // Caps — only attach if either field was supplied; otherwise default
     // skip-serialise keeps the wire form minimal.
     let caps = trade_control_core::account::AccountCaps {
@@ -1302,17 +1347,29 @@ fn run_account_add(args: AccountAddArgs) -> Result<()> {
     let tn_creds = if args.no_secret || broker != BrokerKind::TradeNation {
         None
     } else {
-        let username = match args.username {
-            Some(u) => u,
-            None => Input::with_theme(&theme)
-                .with_prompt("TradeNation username")
-                .interact_text()
-                .map_err(|e| eyre!("read username: {e}"))?,
+        // Default path: pull both username and password from the local
+        // TN store. Removes a class of "operator re-typed the password
+        // wrong" bugs that silently uploaded bad creds to Cloudflare.
+        // `--username` is an explicit override — operator wants to
+        // register a different identity than what's stored locally.
+        let (username, password) = match args.username {
+            Some(u) => {
+                let password = Password::with_theme(&theme)
+                    .with_prompt("TradeNation password")
+                    .interact()
+                    .map_err(|e| eyre!("read password: {e}"))?;
+                (u, password)
+            }
+            None => {
+                let acct = tradenation_api::accounts::get_account(&args.name)
+                    .map_err(|e| eyre!("reading local TN store for '{}': {e}", args.name))?;
+                eprintln!(
+                    "using local TN store credentials for '{}' (username={})",
+                    args.name, acct.username,
+                );
+                (acct.username, acct.password)
+            }
         };
-        let password = Password::with_theme(&theme)
-            .with_prompt("TradeNation password")
-            .interact()
-            .map_err(|e| eyre!("read password: {e}"))?;
         Some(Credentials::TradeNation(TradeNationCreds {
             kind: args.kind.into(),
             username,

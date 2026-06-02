@@ -409,7 +409,9 @@ pub fn build_trade_from_spec(mut spec: TradeSpec, now: DateTime<Utc>) -> Result<
     if spec.instrument.trim().is_empty() {
         return Err(eyre!("instrument is required"));
     }
-    if let Some(canonical) = validate_instrument(spec.broker, &spec.instrument)? {
+    if let Some(canonical) =
+        validate_instrument(spec.broker, Some(&spec.account), &spec.instrument)?
+    {
         // The cache redirected (e.g. "XAG/USD" → "Spot Silver"). Swap the
         // spec to the canonical name so every downstream alert, manifest,
         // and persisted trade.yaml uses the spelling TN's API accepts.
