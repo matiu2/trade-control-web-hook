@@ -133,6 +133,26 @@ where
                 )));
             }
         }
+        // Wire-form fallback: the signed-body emitter flattens nested values
+        // onto a single line via serde_json::to_string, which turns a YAML
+        // `!script "<source>"` tagged scalar into the JSON map form
+        // `{"!script":"<source>"}`. Re-parsed as YAML, that is a flow
+        // mapping with one entry — accept it as the Script variant so
+        // worker-side parsing matches what the CLI emits.
+        if let serde_yaml::Value::Mapping(map) = &value
+            && map.len() == 1
+            && let Some((k, v)) = map.iter().next()
+            && let Some(key) = k.as_str()
+            && key == SCRIPT_TAG
+        {
+            let source = v
+                .as_str()
+                .ok_or_else(|| {
+                    de::Error::custom("\"!script\" map form requires a string scalar source")
+                })?
+                .to_string();
+            return Ok(Self::Script(CompiledScript::new(source)));
+        }
         let inner = T::deserialize(value).map_err(de::Error::custom)?;
         Ok(Self::Static(inner))
     }
@@ -183,6 +203,48 @@ mod tests {
             Tunable::Script(s) => assert_eq!(s.source, "if r >= 3.0 { 1.0 } else { 0.5 }"),
             _ => panic!("expected Script variant"),
         }
+    }
+
+    #[test]
+    fn map_form_script_parses_as_script() {
+        // The signed-body emitter flattens nested values via JSON, so a
+        // !script-tagged Tunable arrives on the wire as a flow map.
+        let y = "v: {\"!script\": \"signal_confirmed\"}\n";
+        let w: Wrap<bool> = serde_yaml::from_str(y).unwrap();
+        assert_eq!(w.v, Tunable::from_script("signal_confirmed"));
+    }
+
+    #[test]
+    fn map_form_script_round_trips_through_wire_emitter() {
+        // End-to-end: encode a Tunable::Script, render the way
+        // cli::control::render_value does (serde_json), reparse as YAML
+        // line, and confirm it survives.
+        let original: Tunable<bool> = Tunable::from_script("signal_confirmed");
+        let intermediate_yaml = serde_yaml::to_string(&original).unwrap();
+        let v: serde_yaml::Value = serde_yaml::from_str(&intermediate_yaml).unwrap();
+        let json_line = serde_json::to_string(&v).unwrap();
+        let line = format!("v: {json_line}\n");
+        let w: Wrap<bool> = serde_yaml::from_str(&line).unwrap();
+        assert_eq!(w.v, original);
+    }
+
+    #[test]
+    fn map_form_with_non_string_source_errors() {
+        let y = "v: {\"!script\": 1.0}\n";
+        let err = serde_yaml::from_str::<Wrap<bool>>(y).unwrap_err();
+        assert!(
+            err.to_string().contains("string scalar source"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn map_form_with_extra_keys_falls_through_to_inner() {
+        // A two-entry map isn't the script form — defer to T's deserializer,
+        // which will produce its own error for a bool field.
+        let y = "v: {\"!script\": \"foo\", extra: 1}\n";
+        let err = serde_yaml::from_str::<Wrap<bool>>(y).unwrap_err();
+        assert!(err.to_string().contains("expected a boolean"), "got: {err}");
     }
 
     #[test]

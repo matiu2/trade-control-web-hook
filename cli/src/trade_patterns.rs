@@ -1877,6 +1877,54 @@ entry_mode: market
     }
 
     #[test]
+    fn enter_alert_with_allow_entry_script_survives_parse_and_verify() {
+        // Regression for the CHF/JPY enter rejection observed 2026-06-02:
+        // the signed-body emitter flattens `allow_entry: Tunable::Script(...)`
+        // through serde_json::to_string into a flow-mapping wire form
+        // (`{"!script":"signal_confirmed"}`) — the worker must accept that
+        // shape, not just the YAML `!script` tag form. Without the
+        // permissive fallback in Tunable's deserializer, this 400s with
+        // "invalid type: map, expected a boolean".
+        use trade_control_core::incoming::parse_and_verify;
+        let now = ts("2026-06-02T00:00:00Z");
+        let mut spec = sample_spec(TradePattern::Hs, ts("2026-06-09T00:00:00Z"));
+        spec.allow_entry = Some("signal_confirmed".into());
+        let trade = build_trade_from_spec(spec, now).unwrap();
+        let enter = trade.alerts.last().unwrap();
+        assert_eq!(enter.basename, "05-enter");
+        let key = [9u8; KEY_LEN];
+        let signed = wrap_signed_template(&enter.intent, &key).unwrap();
+        // Simulate TradingView's substitution of the Pine placeholders.
+        // signal_confirmed = 1 means the gate would pass; the value
+        // matters less here than the *shape* — we're proving the
+        // top-level `allow_entry: {...}` line parses at all.
+        let on_wire = signed
+            .replace("{{close}}", "203.391")
+            .replace("{{high}}", "203.395")
+            .replace("{{low}}", "203.380")
+            .replace("{{time}}", "2026-06-02T15:00:00Z")
+            .replace("{{plot(\"signal_high\")}}", "203.395")
+            .replace("{{plot(\"signal_low\")}}", "203.380")
+            .replace("{{plot(\"signal_range\")}}", "0.015")
+            .replace("{{plot(\"signal_start_time\")}}", "1780405200000")
+            .replace("{{plot(\"signal_kind\")}}", "1")
+            .replace("{{plot(\"signal_golden\")}}", "1")
+            .replace("{{plot(\"signal_atr\")}}", "0.012")
+            .replace("{{plot(\"signal_confirmed\")}}", "1")
+            .replace("{{plot(\"recent_high\")}}", "203.500")
+            .replace("{{plot(\"recent_low\")}}", "203.000");
+        let verify_now = ts("2026-06-02T15:00:30Z");
+        let verified = parse_and_verify(&on_wire, &key, verify_now)
+            .unwrap_or_else(|e| panic!("verify enter: {e}\n\nbody was:\n{on_wire}"));
+        match &verified.intent.allow_entry {
+            Some(trade_control_core::tunable::Tunable::Script(s)) => {
+                assert_eq!(s.source, "signal_confirmed");
+            }
+            other => panic!("expected Script allow_entry after round trip, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn build_trade_from_spec_rejects_invalid_allow_entry_script() {
         // Sign-time validation catches a parse error in `allow_entry`
         // before any alert is signed. This is the contract operators
