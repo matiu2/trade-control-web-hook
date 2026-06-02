@@ -271,12 +271,12 @@ fn slugify(s: &str) -> String {
     out
 }
 
-/// Parse the CLI's broker-facing instrument symbol (e.g. `EUR_USD`)
-/// into a [`trade_calendar_maker::Instrument`]. Strips the underscore
-/// OANDA forex pairs carry — `from_oanda_symbol` expects the bare
-/// concatenated form (`EURUSD`).
+/// Parse the CLI's broker-facing instrument symbol (e.g. `EUR_USD`,
+/// `CHF/JPY`) into a [`trade_calendar_maker::Instrument`]. Strips the
+/// separators OANDA (`_`) and TradeNation (`/`) forex pairs carry —
+/// `from_oanda_symbol` expects the bare concatenated form (`EURUSD`).
 pub fn parse_instrument(raw: &str) -> Result<Instrument> {
-    let normalised = raw.replace('_', "");
+    let normalised: String = raw.chars().filter(|c| !matches!(c, '_' | '/')).collect();
     Instrument::from_oanda_symbol(&normalised)
         .ok_or_else(|| eyre!("unsupported instrument symbol {raw:?}"))
 }
@@ -811,6 +811,14 @@ mod tests {
         assert!(inst.is_affected_by("EUR"));
         assert!(inst.is_affected_by("USD"));
         assert!(!inst.is_affected_by("JPY"));
+    }
+
+    #[test]
+    fn parse_instrument_strips_tradenation_slash() {
+        let inst = parse_instrument("CHF/JPY").unwrap();
+        assert!(inst.is_affected_by("CHF"));
+        assert!(inst.is_affected_by("JPY"));
+        assert!(!inst.is_affected_by("USD"));
     }
 
     #[test]
