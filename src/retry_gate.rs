@@ -1,30 +1,65 @@
 //! Multi-shot retry gate for `enter` intents that set `max_retries`.
 //!
+//! **What "retry" means here (read this first).** A retry is *not* a
+//! re-attempt of a placement that failed to reach the broker. It is a
+//! **fresh entry into a setup that has already been entered once and
+//! whose first entry has since closed** — typically by hitting stop
+//! loss — while the original setup is still considered valid (the
+//! alert's `not_after` window has not yet elapsed and the geometry
+//! hasn't been invalidated). The pattern is: place → fill → hit SL →
+//! a new signal bar arrives within the same alert window → place
+//! again, up to `max_retries` total placements.
+//!
+//! Things this gate is **not**:
+//!
+//! - It is not a retry of broker placement errors (HTTP failures,
+//!   broker rejections). Those produce a 502 response and consume the
+//!   intent's seen-by-id slot like any other terminal outcome.
+//! - It is not a retry of pre-broker rejections (vetos, cooldowns,
+//!   the `allow_entry` script gate, prep gates). Strategy-side
+//!   rejections don't burn a slot — see point 3 below.
+//! - It is not a way to refire the *same alert payload* multiple
+//!   times. The top-level `is_seen` dedup at the worker dispatcher
+//!   (`src/lib.rs`) still applies per intent id; a TradingView alert
+//!   that re-sends the byte-identical body will 409 there, before
+//!   this gate runs. Multi-shot operates on **distinct fires** of the
+//!   same `trade_id` from successive signal bars, each carrying a
+//!   fresh intent id.
+//!
 //! When the operator opts a setup into multi-shot mode by setting
 //! `max_retries: N` (any non-default Tunable, i.e. anything that isn't
-//! `Static(0)`) and a `trade_id`, the alert may legitimately
-//! fire on multiple firing bars within the `not_after` window. Each
-//! arrival flows through this gate before reaching the cooldown / prep
-//! / veto checks and the broker placement.
+//! `Static(0)`) and a `trade_id`, the alert may legitimately fire on
+//! multiple firing bars within the `not_after` window. Each arrival
+//! flows through this gate before reaching the cooldown / prep / veto
+//! checks and the broker placement.
 //!
 //! The gate has three jobs:
 //!
 //! 1. Dedup same-bar re-fires via
 //!    [`StateStore::is_retry_fire_seen`] / [`StateStore::mark_retry_fire_seen`].
+//!    Two arrivals carrying the same `shell.time` for the same
+//!    `(account, trade_id)` collapse to one placement.
 //! 2. Cross-reference each prior attempt (newest-first) against broker
-//!    state via [`Broker::lookup_attempt_state`] and either replace a
-//!    still-pending order or reject a fresh placement when an open or
-//!    not-yet-resolved attempt is observed.
-//! 3. Enforce the placement cap. Crucially: only the
-//!    `EntryAttempt` rows count — strategy-side gates that prevent a
-//!    placement (cooldown, prep order, veto) don't burn a slot. This
-//!    is also what the `attempts.len() >= max_retries` check expresses
-//!    naturally: we count attempts that actually reached `place_entry`.
+//!    state via [`Broker::lookup_attempt_state`]. A previous attempt
+//!    that is still **open** (filled and live) rejects this fire with
+//!    412 — we won't stack a second entry on top of the first while
+//!    the first is still running. A still-**pending** order is
+//!    cancelled (the new signal bar supersedes it) and the gate falls
+//!    through to a fresh placement. **Closed** attempts (SL hit, TP
+//!    hit, cancelled, unknown) are skipped over toward older
+//!    attempts; those are the legitimate "prior entry already done,
+//!    new opportunity" cases this gate exists to allow.
+//! 3. Enforce the placement cap. Crucially: only the `EntryAttempt`
+//!    rows count — strategy-side gates that prevent a placement
+//!    (cooldown, prep order, veto, `allow_entry` script) don't burn a
+//!    slot. This is also what the `attempts.len() >= max_retries`
+//!    check expresses naturally: we count attempts that actually
+//!    reached `place_entry`.
 //!
-//! When `intent.max_retries.is_none()`, callers must skip this module
-//! entirely — the byte-for-byte single-shot behaviour predates the
-//! gate and is verified by an explicit regression test in the worker
-//! suite.
+//! When `intent.max_retries` is the default `Static(0)`, callers must
+//! skip this module entirely — the byte-for-byte single-shot
+//! behaviour predates the gate and is verified by an explicit
+//! regression test in the worker suite.
 
 use chrono::{DateTime, Utc};
 use trade_control_core::broker::{AttemptState, Broker, LookupError};
@@ -62,12 +97,19 @@ macro_rules! console_error {
 /// index. Returning the status + body rather than a built `Response`
 /// keeps this function constructable in native test builds (the
 /// `worker::Response::error` constructor calls into wasm-bindgen and
-/// panics off-wasm). Same-bar re-fire dedup is surfaced as
-/// `Rejected { status: 409, outcome: "rejected: retry-fire-replay" }`
-/// — the top-level `mark_seen` still runs on the intent id (each
-/// retry fire has a fresh id), so leaving this on the rejected path
-/// keeps the audit trail consistent rather than silently dropping
-/// the event.
+/// panics off-wasm).
+///
+/// Two consecutive fires that resolve to the **same** `shell.time`
+/// (e.g. an alert that re-evaluates twice on the same close) collapse
+/// to one placement: the second is rejected here as
+/// `Rejected { status: 409, outcome: "rejected: retry-fire-replay" }`.
+/// Note that this is a *distinct* layer from the top-level intent-id
+/// replay check in `src/lib.rs` — multi-shot alerts mint a fresh
+/// intent id per fire, so the top-level check waves them through and
+/// this `shell.time` check is the dedup that catches truly redundant
+/// arrivals. The top-level `mark_seen` still runs on the rejected
+/// fire's id so the audit trail records the event rather than
+/// silently dropping it.
 pub enum RetryGateOutcome {
     /// Pass; this fire should attempt a placement. `next_attempt_no`
     /// is the 1-based index to stamp onto the new `EntryAttempt` row
