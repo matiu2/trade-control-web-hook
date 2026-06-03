@@ -61,7 +61,7 @@ pub struct Roles {
     /// Support / resistance horizontal lines. Each one contributes
     /// an `[lo, hi]` price band to the consolidated
     /// `06-close-on-reversal` alert (`inside_window` gets `price`
-    /// added; `price_bands` carries the bands).
+    /// added; `sr_bands` carries the bands).
     pub sr_levels: Vec<Drawing>,
 }
 

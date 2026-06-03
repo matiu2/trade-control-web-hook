@@ -264,7 +264,7 @@ fn build_pause_intent(
         require_price_in_ranges: None,
         needs_confirmed: false,
         inside_window: Vec::new(),
-        price_bands: Vec::new(),
+        sr_bands: Vec::new(),
         // Reason rides on both halves so a `resume` log line is also
         // self-describing (operators see "what was this for?" without
         // grepping the matching pause).

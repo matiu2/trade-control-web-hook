@@ -257,7 +257,7 @@ pub fn build_alert_spec(
         // `CloseOnSrReversal` is the legacy split-form basename;
         // the CLI no longer emits it (the consolidated
         // `06-close-on-reversal` carries both news and S/R gates in
-        // one alert via `inside_window` + `price_bands`). The arm
+        // one alert via `inside_window` + `sr_bands`). The arm
         // stays so the match is exhaustive and so any hand-crafted
         // legacy alert routed through tv-arm still dispatches to
         // the same Pine plot.

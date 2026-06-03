@@ -47,7 +47,7 @@ account: ...
 
 # New consolidated gate (replaces require_news_window + require_price_in_ranges)
 inside_window: [news, price]              # OR-composed; at least one must be set
-price_bands: [[1.0950, 1.0970]]           # required when "price" is in inside_window
+sr_bands: [[1.0950, 1.0970]]              # required when "price" is in inside_window
 
 # Candle quality (default: golden only). Mutually exclusive.
 needs_golden: true                        # default for reversal closes
@@ -65,7 +65,7 @@ needs_golden: true                        # default for reversal closes
   with opposite composition. Documented explicitly in the field doc-comment
   and the README. The two-axis metaphor: news is a time-window, price is a
   price-window.
-- `price_bands: Vec<[f64; 2]>` — the data for the "price" window type.
+- `sr_bands: Vec<[f64; 2]>` — the data for the "price" window type.
   Required when `price` ∈ `inside_window`; rejected when it's not.
 - `needs_confirmed: bool` — symmetric with existing `needs_golden`. Both
   rejected on actions ≠ Enter|Close.
@@ -89,13 +89,13 @@ needs_golden: true                        # default for reversal closes
     `Action::Close` (currently rejected at `core/src/intent.rs:699`).
   - Add `needs_confirmed: bool` to `Intent`. Same shape as `needs_golden`.
     Validate-time: only valid on Enter|Close.
-  - Add `inside_window: Vec<EventWindow>` and `price_bands: Vec<[f64;2]>`.
+  - Add `inside_window: Vec<EventWindow>` and `sr_bands: Vec<[f64;2]>`.
     `EventWindow` is an enum `News | Price` with kebab serde.
   - Validate-time on Close: if either of the new fields is set, the old
     fields must be empty (mutual exclusion). At least one window-type
     gate must resolve to a real check.
   - Tests: round-trip, mutual-exclusion rejection, missing-data rejection
-    (`price` in `inside_window` without `price_bands`).
+    (`price` in `inside_window` without `sr_bands`).
   - No worker dispatch changes yet — just types.
 - [x] **Step 2: worker — Close dispatch consumes new fields + candle gates.**
   - Extend `run_close` (`src/lib.rs:480`) to evaluate the new
@@ -111,7 +111,7 @@ needs_golden: true                        # default for reversal closes
     failing rejects, allow_close composes AND with the rest.
 - [x] **Step 3: CLI — consolidate `06`/`07` builders.**
   - `build_close_on_reversal_alert` becomes the sole reversal-close
-    builder. Accepts `inside_window` + `price_bands` derived from the
+    builder. Accepts `inside_window` + `sr_bands` derived from the
     `TradeSpec` `close_on_news` + `sr_reversal_ranges` deprecated input
     fields. `TradeSpec.needs_confirmed_close: bool` flips the candle
     gate from `needs_golden: true` (default) to `needs_confirmed: true`.
@@ -130,7 +130,7 @@ needs_golden: true                        # default for reversal closes
     same input-side fields (`close_on_news`, `sr_reversal_ranges`)
     on `cli::TradeSpec`. Step 3's consolidated
     `build_close_on_reversal_alert` then routes those into
-    `inside_window` + `price_bands` on the emitted intent — so the
+    `inside_window` + `sr_bands` on the emitted intent — so the
     Rust path produces the new wire form transparently with no
     further changes.
   - Marked `scripts/tv_arm_hs.py` deprecated: module docstring
@@ -140,7 +140,7 @@ needs_golden: true                        # default for reversal closes
     future sessions.
 - [x] **Step 5: README + per-commit doc sync.**
   - `close` action documented with the three gate layers:
-    contextual-window (`inside_window` + `price_bands`, OR-composed),
+    contextual-window (`inside_window` + `sr_bands`, OR-composed),
     candle-quality (`needs_golden` / `needs_confirmed`, AND-composed),
     ad-hoc filter (`allow_close` Rhai script).
   - Deprecated-form note on `require_news_window` /

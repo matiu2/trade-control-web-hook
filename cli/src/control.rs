@@ -61,7 +61,7 @@ fn control_skeleton(action: Action, instrument: &str, id: String, now: DateTime<
         require_price_in_ranges: None,
         needs_confirmed: false,
         inside_window: Vec::new(),
-        price_bands: Vec::new(),
+        sr_bands: Vec::new(),
         reason: None,
     }
 }

@@ -335,7 +335,7 @@ pub struct TradeSpec {
     /// When non-empty, mark the consolidated `06-close-on-reversal`
     /// alert as gated on the broker's current price sitting inside
     /// at least one of these `[lo, hi]` bands. Adds `price` to the
-    /// emitted intent's `inside_window` and populates `price_bands`.
+    /// emitted intent's `inside_window` and populates `sr_bands`.
     /// Bands are computed by the Python side from chart-drawn
     /// `support` / `resistance` single lines plus a width percentage.
     /// If [`Self::close_on_news`] is also true, the close is
@@ -905,7 +905,7 @@ fn skeleton(
         require_price_in_ranges: None,
         needs_confirmed: false,
         inside_window: Vec::new(),
-        price_bands: Vec::new(),
+        sr_bands: Vec::new(),
         reason: None,
     }
 }
@@ -1137,7 +1137,7 @@ fn build_enter_alert(
 ///
 /// - `news` — an open `news:<trade_id>:*` KV entry.
 /// - `price` — current broker price inside at least one
-///   `price_bands` entry.
+///   `sr_bands` entry.
 ///
 /// At least one of the two must be requested (the caller has
 /// already checked).
@@ -1152,7 +1152,7 @@ fn build_close_on_reversal_alert(
     broker: &BrokerKind,
     account: &str,
     include_news_window: bool,
-    price_bands: Vec<[f64; 2]>,
+    sr_bands: Vec<[f64; 2]>,
     needs_confirmed: bool,
 ) -> BuiltAlert {
     let id = format!("{trade_id}-close-on-reversal");
@@ -1169,19 +1169,19 @@ fn build_close_on_reversal_alert(
     if include_news_window {
         inside_window.push(trade_control_core::intent::EventWindow::News);
     }
-    let has_price_bands = !price_bands.is_empty();
-    if has_price_bands {
+    let has_sr_bands = !sr_bands.is_empty();
+    if has_sr_bands {
         inside_window.push(trade_control_core::intent::EventWindow::Price);
     }
     intent.inside_window = inside_window;
-    intent.price_bands = price_bands;
+    intent.sr_bands = sr_bands;
     if needs_confirmed {
         intent.needs_confirmed = true;
     } else {
         intent.needs_golden = true;
     }
     intent.reason = Some(
-        match (include_news_window, has_price_bands) {
+        match (include_news_window, has_sr_bands) {
             (true, true) => "news-or-price reversal",
             (true, false) => "news-window reversal",
             (false, true) => "support/resistance reversal",
@@ -1569,7 +1569,7 @@ mod tests {
             close.inside_window,
             vec![trade_control_core::intent::EventWindow::News]
         );
-        assert!(close.price_bands.is_empty());
+        assert!(close.sr_bands.is_empty());
         assert!(close.needs_golden);
         assert!(!close.needs_confirmed);
         // Deprecated fields stay absent on the new wire form.
@@ -1582,7 +1582,7 @@ mod tests {
     #[test]
     fn build_trade_from_spec_emits_seven_alerts_when_sr_reversal_ranges_set() {
         // sr_reversal_ranges only → consolidated 06-close-on-reversal
-        // with inside_window = [price] + price_bands populated.
+        // with inside_window = [price] + sr_bands populated.
         let now = ts("2026-05-20T00:00:00Z");
         let mut spec = sample_spec(TradePattern::Hs, ts("2026-05-25T00:00:00Z"));
         spec.sr_reversal_ranges = vec![[1.0950, 1.0970], [1.1000, 1.1020]];
@@ -1595,7 +1595,7 @@ mod tests {
             close.inside_window,
             vec![trade_control_core::intent::EventWindow::Price]
         );
-        assert_eq!(close.price_bands, vec![[1.0950, 1.0970], [1.1000, 1.1020]]);
+        assert_eq!(close.sr_bands, vec![[1.0950, 1.0970], [1.1000, 1.1020]]);
         assert!(close.needs_golden);
         assert_eq!(close.require_news_window, None);
         assert_eq!(close.require_price_in_ranges, None);
@@ -1622,7 +1622,7 @@ mod tests {
                 trade_control_core::intent::EventWindow::Price,
             ]
         );
-        assert_eq!(close.price_bands, vec![[1.0950, 1.0970]]);
+        assert_eq!(close.sr_bands, vec![[1.0950, 1.0970]]);
         assert!(close.needs_golden);
         assert!(
             !trade

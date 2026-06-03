@@ -468,10 +468,10 @@ async fn run_action<B: Broker>(
 ///    must pass.
 ///      - News window — an active `news:<trade_id>:<news_id>` pair.
 ///      - Price window — broker's current price sits inside one of
-///        `price_bands`.
+///        `sr_bands`.
 ///
 ///    The new wire form is `inside_window: [news, price]` +
-///    `price_bands: [[lo, hi]]`. The deprecated form
+///    `sr_bands: [[lo, hi]]`. The deprecated form
 ///    (`require_news_window` + `require_price_in_ranges`) is still
 ///    accepted; validation guarantees an intent only carries one form.
 /// 2. **Candle quality** (AND-composed) — `needs_golden` and
@@ -534,7 +534,7 @@ async fn run_close<B: Broker>(
     };
     // Price window. Old form: `require_price_in_ranges: Some(ranges)`.
     // New form: `inside_window` contains `Price` (with bands in
-    // `price_bands`). Validation guarantees `price_bands` is non-empty
+    // `sr_bands`). Validation guarantees `sr_bands` is non-empty
     // exactly when `inside_window` lists Price.
     let price_ranges: Option<&[[f64; 2]]> = match verified.intent.require_price_in_ranges.as_deref()
     {
@@ -544,7 +544,7 @@ async fn run_close<B: Broker>(
             .inside_window
             .contains(&trade_control_core::intent::EventWindow::Price) =>
         {
-            Some(verified.intent.price_bands.as_slice())
+            Some(verified.intent.sr_bands.as_slice())
         }
         None => None,
     };
@@ -2400,7 +2400,7 @@ mod dispatcher_outcome_tests {
                 require_price_in_ranges: None,
                 needs_confirmed: false,
                 inside_window: Vec::new(),
-                price_bands: Vec::new(),
+                sr_bands: Vec::new(),
                 reason: None,
             },
         }

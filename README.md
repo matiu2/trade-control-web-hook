@@ -16,9 +16,9 @@ Trading:
 - `close` — close all positions for the instrument. May also carry worker-side
   gates that decide whether *this* close fires:
   - **Contextual-window gate** (OR-composed): `inside_window: [news, price]`
-    names which window-types are acceptable; `price_bands: [[lo, hi], ...]`
+    names which window-types are acceptable; `sr_bands: [[lo, hi], ...]`
     carries the data for the `price` member. The two fields are paired —
-    `price` ∈ `inside_window` iff `price_bands` is non-empty. The close
+    `price` ∈ `inside_window` iff `sr_bands` is non-empty. The close
     passes when *any* listed window matches (active news window for the
     `trade_id`, or current broker price inside a band).
   - **Candle-quality gate** (AND-composed with the window): `needs_golden:
@@ -84,7 +84,7 @@ Basename ordering matters — `tv-arm` maps drawings to alerts by prefix.
 | `03-prep-break-and-close` | `prep` | Trendline crossing (neckline break) | Skippable for stocks / late entries with `--skip-break-and-close`. |
 | `04-prep-retest` | `prep` | Trendline crossing (retest from below) | Skippable with `--skip-retest`. |
 | `05-enter` | `enter` | Pine `Candle Signals` golden candle | The actual trade. Gated on the preps above + opposing-direction veto absent. |
-| `06-close-on-reversal` | `close` | Pine `Candle Signals` opposing reversal | Emitted when news-pairs and/or `support`/`resistance` lines are drawn. Carries `inside_window: [news?, price?]` (OR-composed) and, when `price` is listed, `price_bands: [[lo, hi], ...]`. Defaults `needs_golden: true` for the candle-quality gate. |
+| `06-close-on-reversal` | `close` | Pine `Candle Signals` opposing reversal | Emitted when news-pairs and/or `support`/`resistance` lines are drawn. Carries `inside_window: [news?, price?]` (OR-composed) and, when `price` is listed, `sr_bands: [[lo, hi], ...]`. Defaults `needs_golden: true` for the candle-quality gate. |
 
 The legacy `07-close-on-sr-reversal` basename is no longer emitted —
 its functionality folds into a single `06-close-on-reversal` whose
@@ -730,7 +730,7 @@ What you draw on the chart:
 | Vertical line | `trade-expiry` | `not_after` for every alert in the bundle. |
 | Vertical line pair | `news-start` / `news-end` | Each pair emits a `build-news` bundle. **Presence of any pair also adds `news` to the consolidated `06-close-on-reversal` alert's `inside_window`** — no extra flag. |
 | Vertical line pair | `blackout-start` / `blackout-end` (or `pause` / `resume` aliases) | Each pair emits a `build-pause` bundle. Blocks entries while active. |
-| Horizontal line | `support` or `resistance` | Each line adds an `[lo, hi]` band of ±`--reversal-band-pct` (default `0.1%`) to the `06-close-on-reversal` alert's `price_bands` list, and adds `price` to its `inside_window`. Multiple lines union. |
+| Horizontal line | `support` or `resistance` | Each line adds an `[lo, hi]` band of ±`--reversal-band-pct` (default `0.1%`) to the `06-close-on-reversal` alert's `sr_bands` list, and adds `price` to its `inside_window`. Multiple lines union. |
 
 When news pairs *and* `support`/`resistance` lines are both present, a
 single `06-close-on-reversal` alert is emitted with

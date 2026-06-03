@@ -119,7 +119,7 @@ mod tests {
             require_price_in_ranges: None,
             needs_confirmed,
             inside_window: Vec::new(),
-            price_bands: Vec::new(),
+            sr_bands: Vec::new(),
             reason: None,
         }
     }

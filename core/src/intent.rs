@@ -545,8 +545,8 @@ pub struct Intent {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub require_news_window: Option<bool>,
     /// **Deprecated** — superseded by [`Self::inside_window`] +
-    /// [`Self::price_bands`]. New trade templates should emit
-    /// `inside_window: [..., price]` + `price_bands: [[lo, hi], ...]`
+    /// [`Self::sr_bands`]. New trade templates should emit
+    /// `inside_window: [..., price]` + `sr_bands: [[lo, hi], ...]`
     /// instead.
     ///
     /// On `close` intents, one of two **OR-composed** gates (see
@@ -571,7 +571,7 @@ pub struct Intent {
     /// - [`EventWindow::News`] — active news window for `trade_id`
     ///   (`list_news_windows_for_trade(trade_id)` returns non-empty).
     /// - [`EventWindow::Price`] — broker's current price for
-    ///   `instrument` sits inside at least one [`Self::price_bands`]
+    ///   `instrument` sits inside at least one [`Self::sr_bands`]
     ///   entry.
     ///
     /// Replaces the deprecated [`Self::require_news_window`] +
@@ -589,17 +589,18 @@ pub struct Intent {
     /// Validation:
     /// - Only meaningful on `Action::Close`; rejected elsewhere.
     /// - Mutually exclusive with the deprecated `require_*` fields.
-    /// - If `Price` is listed, [`Self::price_bands`] must be non-empty.
-    /// - If `Price` is *not* listed, `price_bands` must be empty.
+    /// - If `Price` is listed, [`Self::sr_bands`] must be non-empty.
+    /// - If `Price` is *not* listed, `sr_bands` must be empty.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub inside_window: Vec<EventWindow>,
-    /// Price bands `[[lo, hi], ...]` for the [`EventWindow::Price`] gate.
-    /// Required when `inside_window` contains `Price`; rejected when it
-    /// doesn't. Every band must satisfy `lo <= hi`. Replaces the
-    /// deprecated [`Self::require_price_in_ranges`]; the data shape is
-    /// identical so the worker's existing band-hit machinery is reused.
+    /// Support/resistance price bands `[[lo, hi], ...]` for the
+    /// [`EventWindow::Price`] gate. Required when `inside_window`
+    /// contains `Price`; rejected when it doesn't. Every band must
+    /// satisfy `lo <= hi`. Replaces the deprecated
+    /// [`Self::require_price_in_ranges`]; the data shape is identical
+    /// so the worker's existing band-hit machinery is reused.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub price_bands: Vec<[f64; 2]>,
+    pub sr_bands: Vec<[f64; 2]>,
     /// Free-form human-readable label for a `pause` (or any other
     /// action that wants to record context). Surfaces in the seen
     /// index outcome string so operators can answer "why is this
@@ -692,15 +693,15 @@ pub enum IntentValidationError {
     /// `inside_window: [...]` on a non-Close action — the gate is only
     /// checked on `close`.
     InsideWindowOnNonClose,
-    /// `inside_window` listed `price` but [`Intent::price_bands`] was
-    /// empty, OR `price_bands` was non-empty but `inside_window` did
+    /// `inside_window` listed `price` but [`Intent::sr_bands`] was
+    /// empty, OR `sr_bands` was non-empty but `inside_window` did
     /// not list `price`. The two fields are the type-tag and the data
     /// for the same gate; either both present or both absent.
-    InsideWindowPriceBandsMismatch,
-    /// One of the bands in [`Intent::price_bands`] has `lo > hi`.
-    InvalidPriceBands,
+    InsideWindowSrBandsMismatch,
+    /// One of the bands in [`Intent::sr_bands`] has `lo > hi`.
+    InvalidSrBands,
     /// New consolidated close-gate fields ([`Intent::inside_window`] or
-    /// [`Intent::price_bands`]) were set alongside the deprecated
+    /// [`Intent::sr_bands`]) were set alongside the deprecated
     /// [`Intent::require_news_window`] or [`Intent::require_price_in_ranges`].
     /// Pick one form per intent — the worker accepts either independently
     /// but mixing them invites silent semantic drift.
@@ -758,12 +759,12 @@ impl core::fmt::Display for IntentValidationError {
             Self::InsideWindowOnNonClose => {
                 f.write_str("inside_window is only valid on action: close")
             }
-            Self::InsideWindowPriceBandsMismatch => {
-                f.write_str("inside_window must contain `price` iff price_bands is non-empty")
+            Self::InsideWindowSrBandsMismatch => {
+                f.write_str("inside_window must contain `price` iff sr_bands is non-empty")
             }
-            Self::InvalidPriceBands => f.write_str("price_bands must have lo <= hi on every band"),
+            Self::InvalidSrBands => f.write_str("sr_bands must have lo <= hi on every band"),
             Self::MixedOldAndNewCloseGates => f.write_str(
-                "the new close-gate fields (inside_window / price_bands) cannot be mixed with \
+                "the new close-gate fields (inside_window / sr_bands) cannot be mixed with \
                  the deprecated require_news_window / require_price_in_ranges — pick one form",
             ),
             Self::MissingTtlHours => f.write_str("ttl_hours is required on prep / veto actions"),
@@ -891,14 +892,14 @@ impl Intent {
                 return Err(IntentValidationError::InvalidPriceRanges);
             }
         }
-        // inside_window / price_bands: new consolidated close-gate.
+        // inside_window / sr_bands: new consolidated close-gate.
         // - Either field non-empty pins the intent to Close.
         // - The two are paired: `price` in the type-list iff the data
         //   list is non-empty. Either inconsistency is a builder bug.
         // - Bands must have lo <= hi (same rule as the deprecated form).
         // - Mutually exclusive with the deprecated fields — mixing the
         //   two forms invites silent semantic drift in future refactors.
-        let has_new = !self.inside_window.is_empty() || !self.price_bands.is_empty();
+        let has_new = !self.inside_window.is_empty() || !self.sr_bands.is_empty();
         let has_old = self.require_news_window.is_some() || self.require_price_in_ranges.is_some();
         if has_new && has_old {
             return Err(IntentValidationError::MixedOldAndNewCloseGates);
@@ -907,12 +908,12 @@ impl Intent {
             return Err(IntentValidationError::InsideWindowOnNonClose);
         }
         let price_in_window = self.inside_window.contains(&EventWindow::Price);
-        let bands_present = !self.price_bands.is_empty();
+        let bands_present = !self.sr_bands.is_empty();
         if price_in_window != bands_present {
-            return Err(IntentValidationError::InsideWindowPriceBandsMismatch);
+            return Err(IntentValidationError::InsideWindowSrBandsMismatch);
         }
-        if self.price_bands.iter().any(|[lo, hi]| lo > hi) {
-            return Err(IntentValidationError::InvalidPriceBands);
+        if self.sr_bands.iter().any(|[lo, hi]| lo > hi) {
+            return Err(IntentValidationError::InvalidSrBands);
         }
         Ok(())
     }
@@ -927,7 +928,7 @@ impl Intent {
 /// - [`Self::News`] — a *time* window (we're inside an
 ///   operator-armed `news:<trade_id>:<news_id>` pair).
 /// - [`Self::Price`] — a *price* window (broker's current price sits
-///   inside one of [`Intent::price_bands`]).
+///   inside one of [`Intent::sr_bands`]).
 ///
 /// Wire form is kebab-case (`news`, `price`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
@@ -937,7 +938,7 @@ pub enum EventWindow {
     /// `list_news_windows_for_trade(trade_id)` at dispatch time).
     News,
     /// Price-band gate (broker's current price must sit inside one of
-    /// [`Intent::price_bands`]).
+    /// [`Intent::sr_bands`]).
     Price,
 }
 
@@ -2707,15 +2708,15 @@ mod tests {
         ";
         let intent: Intent = serde_yaml::from_str(yaml).unwrap();
         assert_eq!(intent.inside_window, vec![EventWindow::News]);
-        assert!(intent.price_bands.is_empty());
+        assert!(intent.sr_bands.is_empty());
         intent
             .validate()
             .expect("close + inside_window:[news] valid");
         let back = serde_yaml::to_string(&intent).unwrap();
         assert!(back.contains("inside_window:"), "got: {back}");
         assert!(
-            !back.contains("price_bands"),
-            "empty price_bands should be elided: {back}"
+            !back.contains("sr_bands"),
+            "empty sr_bands should be elided: {back}"
         );
     }
 
@@ -2733,12 +2734,12 @@ mod tests {
         let intent: Intent = serde_yaml::from_str(yaml).unwrap();
         assert_eq!(
             intent.validate(),
-            Err(IntentValidationError::InsideWindowPriceBandsMismatch)
+            Err(IntentValidationError::InsideWindowSrBandsMismatch)
         );
     }
 
     #[test]
-    fn price_bands_require_inside_window_entry() {
+    fn sr_bands_require_inside_window_entry() {
         // The mirror of the previous test: data without the type-tag.
         let yaml = "
             v: 1
@@ -2747,12 +2748,12 @@ mod tests {
             not_after: \"2026-05-13T20:00:00Z\"
             action: close
             instrument: EUR_USD
-            price_bands: [[1.0, 1.1]]
+            sr_bands: [[1.0, 1.1]]
         ";
         let intent: Intent = serde_yaml::from_str(yaml).unwrap();
         assert_eq!(
             intent.validate(),
-            Err(IntentValidationError::InsideWindowPriceBandsMismatch)
+            Err(IntentValidationError::InsideWindowSrBandsMismatch)
         );
     }
 
@@ -2766,14 +2767,14 @@ mod tests {
             action: close
             instrument: EUR_USD
             inside_window: [news, price]
-            price_bands: [[1.0950, 1.0970], [1.1000, 1.1020]]
+            sr_bands: [[1.0950, 1.0970], [1.1000, 1.1020]]
         ";
         let intent: Intent = serde_yaml::from_str(yaml).unwrap();
         assert_eq!(
             intent.inside_window,
             vec![EventWindow::News, EventWindow::Price]
         );
-        assert_eq!(intent.price_bands.len(), 2);
+        assert_eq!(intent.sr_bands.len(), 2);
         intent
             .validate()
             .expect("close + inside_window:[news,price] valid");
@@ -2811,12 +2812,12 @@ mod tests {
             action: close
             instrument: EUR_USD
             inside_window: [price]
-            price_bands: [[1.1, 1.0]]
+            sr_bands: [[1.1, 1.0]]
         ";
         let intent: Intent = serde_yaml::from_str(yaml).unwrap();
         assert_eq!(
             intent.validate(),
-            Err(IntentValidationError::InvalidPriceBands)
+            Err(IntentValidationError::InvalidSrBands)
         );
     }
 
@@ -2851,7 +2852,7 @@ mod tests {
             action: close
             instrument: EUR_USD
             inside_window: [price]
-            price_bands: [[1.0, 1.1]]
+            sr_bands: [[1.0, 1.1]]
             require_price_in_ranges: [[1.2, 1.3]]
         ";
         let intent: Intent = serde_yaml::from_str(yaml).unwrap();
