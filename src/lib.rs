@@ -214,12 +214,39 @@ pub async fn main(mut req: Request, env: Env, _ctx: Context) -> Result<Response>
     // Every dispatch path records a seen entry — success, broker failure,
     // or pre-broker rejection — so the operator can read back what
     // happened to this id from the `status` snapshot.
-    let (response, outcome) = match result {
-        ActionResult::Ok(outcome) => (Response::ok("ok"), outcome),
-        ActionResult::Failed(outcome) => (Response::error("action failed", 502), outcome),
-        ActionResult::Rejected { response, outcome } => {
-            return mark_seen_and_return(&store, &verified, now, &outcome, response).await;
-        }
+    record_dispatcher_outcome(&store, &verified, now, &result).await;
+    match result {
+        ActionResult::Ok(_) => Response::ok("ok"),
+        ActionResult::Failed(_) => Response::error("action failed", 502),
+        ActionResult::Rejected { response, .. } => response,
+    }
+}
+
+/// Record the dispatcher's outcome on the seen-by-id index. Called once
+/// per dispatched entry-bearing action with the [`ActionResult`] handed
+/// back by [`run_action`].
+///
+/// Today every variant writes — `Ok`, `Failed`, `Rejected`. That mirrors
+/// the original "every outcome shows up in `status` snapshots" intent.
+/// The `Rejected` case currently poisons the id for the rest of the
+/// alert's `not_after` window even when the rejection reason is
+/// transient (gate condition might flip later in the window). The fix
+/// for that lives in a follow-up commit; this commit only extracts the
+/// helper so the behaviour change is small and bisectable.
+///
+/// Generic over [`StateStore`] so native (non-wasm) tests can pass a
+/// `MemStateStore`-style fake — `worker::Response` construction stays
+/// in the caller, keeping this function callable off-wasm.
+async fn record_dispatcher_outcome<S: StateStore>(
+    store: &S,
+    verified: &incoming::Verified,
+    now: chrono::DateTime<chrono::Utc>,
+    result: &ActionResult,
+) {
+    let outcome = match result {
+        ActionResult::Ok(outcome) => outcome.as_str(),
+        ActionResult::Failed(outcome) => outcome.as_str(),
+        ActionResult::Rejected { outcome, .. } => outcome.as_str(),
     };
     let ttl = incoming::replay_ttl_seconds(verified.intent.not_after, now);
     if let Err(err) = store
@@ -227,7 +254,7 @@ pub async fn main(mut req: Request, env: Env, _ctx: Context) -> Result<Response>
             &verified.intent.id,
             verified.intent.action,
             now,
-            &outcome,
+            outcome,
             ttl,
             verified.intent.trade_id.as_deref(),
         )
@@ -235,7 +262,6 @@ pub async fn main(mut req: Request, env: Env, _ctx: Context) -> Result<Response>
     {
         console_error!("KV mark_seen after action: {err}");
     }
-    response
 }
 
 /// Dispatch on `/admin/...` paths. Method + path together select the
@@ -269,33 +295,6 @@ async fn route_admin(req: &mut Request, env: &Env, path: &str) -> Result<Respons
         }
     }
     Response::error("not found", 404)
-}
-
-/// Helper: record an outcome on the seen index and return the caller's
-/// response. Used by every early-return path so `status` always reflects
-/// what happened to an id.
-async fn mark_seen_and_return(
-    store: &KvStateStore,
-    verified: &incoming::Verified,
-    now: chrono::DateTime<chrono::Utc>,
-    outcome: &str,
-    response: Result<Response>,
-) -> Result<Response> {
-    let ttl = incoming::replay_ttl_seconds(verified.intent.not_after, now);
-    if let Err(err) = store
-        .mark_seen(
-            &verified.intent.id,
-            verified.intent.action,
-            now,
-            outcome,
-            ttl,
-            verified.intent.trade_id.as_deref(),
-        )
-        .await
-    {
-        console_error!("KV mark_seen on early return: {err}");
-    }
-    response
 }
 
 /// Outcome of an action dispatch. Every variant carries a short
@@ -1947,4 +1946,364 @@ fn pip_size_for(env: &Env, instrument: &str) -> f64 {
     get_secret(&key, env)
         .and_then(|s| s.parse().ok())
         .unwrap_or(DEFAULT_PIP_SIZE)
+}
+
+#[cfg(test)]
+mod dispatcher_outcome_tests {
+    //! Pins the behaviour of [`record_dispatcher_outcome`] against the
+    //! seen-by-id index. After the bisectable refactor commit lands,
+    //! every variant of [`ActionResult`] writes to the index — the
+    //! follow-up fix commit will tighten this to `Ok`-only and these
+    //! tests will flip to assert non-write.
+    use super::*;
+    use chrono::{DateTime, TimeZone, Utc};
+    use std::cell::RefCell;
+    use trade_control_core::incoming::Verified;
+    use trade_control_core::intent::{
+        Action, BrokerKind, Direction, EntrySpec, Intent, PriceRef, Shell,
+    };
+    use trade_control_core::state::{EntryAttempt, Snapshot, StateError, StateStore};
+    use trade_control_core::tunable::Tunable;
+    use worker::Result as WorkerResult;
+
+    /// Captures every `mark_seen` call. All other [`StateStore`]
+    /// methods are stubbed out — the dispatcher-outcome path only
+    /// touches `mark_seen`.
+    #[derive(Default)]
+    struct SeenSpyStore {
+        marks: RefCell<Vec<(String, String)>>,
+    }
+
+    impl SeenSpyStore {
+        fn marks(&self) -> Vec<(String, String)> {
+            self.marks.borrow().clone()
+        }
+    }
+
+    impl StateStore for SeenSpyStore {
+        async fn is_seen(&self, _id: &str) -> Result<bool, StateError> {
+            Ok(false)
+        }
+        async fn mark_seen(
+            &self,
+            id: &str,
+            _action: Action,
+            _seen_at: DateTime<Utc>,
+            outcome: &str,
+            _ttl_seconds: u64,
+            _trade_id: Option<&str>,
+        ) -> Result<(), StateError> {
+            self.marks
+                .borrow_mut()
+                .push((id.to_string(), outcome.to_string()));
+            Ok(())
+        }
+        async fn forget_seen(&self, _id: &str) -> Result<(), StateError> {
+            Ok(())
+        }
+        async fn is_cooled_down(
+            &self,
+            _account: Option<&str>,
+            _instrument: &str,
+        ) -> Result<bool, StateError> {
+            Ok(false)
+        }
+        async fn set_cooldown(
+            &self,
+            _account: Option<&str>,
+            _instrument: &str,
+            _hours: u32,
+            _now: DateTime<Utc>,
+        ) -> Result<(), StateError> {
+            Ok(())
+        }
+        async fn clear_cooldown(
+            &self,
+            _account: Option<&str>,
+            _instrument: &str,
+        ) -> Result<bool, StateError> {
+            Ok(false)
+        }
+        async fn set_prep(
+            &self,
+            _account: Option<&str>,
+            _instrument: &str,
+            _step: &str,
+            _now: DateTime<Utc>,
+            _ttl_seconds: u64,
+            _setter_id: &str,
+        ) -> Result<(), StateError> {
+            Ok(())
+        }
+        async fn get_prep(
+            &self,
+            _account: Option<&str>,
+            _instrument: &str,
+            _step: &str,
+        ) -> Result<Option<DateTime<Utc>>, StateError> {
+            Ok(None)
+        }
+        async fn clear_prep(
+            &self,
+            _account: Option<&str>,
+            _instrument: &str,
+            _step: &str,
+        ) -> Result<Option<String>, StateError> {
+            Ok(None)
+        }
+        async fn set_veto(
+            &self,
+            _account: Option<&str>,
+            _instrument: &str,
+            _name: &str,
+            _ttl_seconds: u64,
+        ) -> Result<(), StateError> {
+            Ok(())
+        }
+        async fn is_vetoed(
+            &self,
+            _account: Option<&str>,
+            _instrument: &str,
+            _name: &str,
+        ) -> Result<bool, StateError> {
+            Ok(false)
+        }
+        async fn clear_veto(
+            &self,
+            _account: Option<&str>,
+            _instrument: &str,
+            _name: &str,
+        ) -> Result<bool, StateError> {
+            Ok(false)
+        }
+        async fn snapshot(&self) -> Result<Snapshot, StateError> {
+            Ok(Snapshot {
+                now: Utc::now(),
+                cooldowns: Vec::new(),
+                recent_seen: Vec::new(),
+                preps: Vec::new(),
+                vetos: Vec::new(),
+                pauses: Vec::new(),
+                news_windows: Vec::new(),
+            })
+        }
+        async fn set_pause(
+            &self,
+            _trade_id: &str,
+            _blackout_id: &str,
+            _reason: Option<&str>,
+            _now: DateTime<Utc>,
+            _ttl_seconds: u64,
+        ) -> Result<(), StateError> {
+            Ok(())
+        }
+        async fn list_pauses_for_trade(
+            &self,
+            _trade_id: &str,
+        ) -> Result<Vec<trade_control_core::state::PauseEntry>, StateError> {
+            Ok(Vec::new())
+        }
+        async fn clear_pause(
+            &self,
+            _trade_id: &str,
+            _blackout_id: &str,
+        ) -> Result<bool, StateError> {
+            Ok(false)
+        }
+        async fn set_news_window(
+            &self,
+            _trade_id: &str,
+            _news_id: &str,
+            _reason: Option<&str>,
+            _now: DateTime<Utc>,
+            _ttl_seconds: u64,
+        ) -> Result<(), StateError> {
+            Ok(())
+        }
+        async fn list_news_windows_for_trade(
+            &self,
+            _trade_id: &str,
+        ) -> Result<Vec<trade_control_core::state::NewsEntry>, StateError> {
+            Ok(Vec::new())
+        }
+        async fn clear_news_window(
+            &self,
+            _trade_id: &str,
+            _news_id: &str,
+        ) -> Result<bool, StateError> {
+            Ok(false)
+        }
+        async fn record_entry_attempt(&self, _attempt: EntryAttempt) -> Result<(), StateError> {
+            Ok(())
+        }
+        async fn list_entry_attempts(
+            &self,
+            _account: Option<&str>,
+            _trade_id: &str,
+        ) -> Result<Vec<EntryAttempt>, StateError> {
+            Ok(Vec::new())
+        }
+        async fn set_entry_attempt_broker_trade_id(
+            &self,
+            _account: Option<&str>,
+            _trade_id: &str,
+            _attempt_no: u32,
+            _broker_trade_id: &str,
+        ) -> Result<(), StateError> {
+            Ok(())
+        }
+        async fn is_retry_fire_seen(
+            &self,
+            _account: Option<&str>,
+            _trade_id: &str,
+            _shell_time: DateTime<Utc>,
+        ) -> Result<bool, StateError> {
+            Ok(false)
+        }
+        async fn mark_retry_fire_seen(
+            &self,
+            _account: Option<&str>,
+            _trade_id: &str,
+            _shell_time: DateTime<Utc>,
+            _ttl_seconds: u64,
+        ) -> Result<(), StateError> {
+            Ok(())
+        }
+        async fn list_all_entry_attempts(&self) -> Result<Vec<EntryAttempt>, StateError> {
+            Ok(Vec::new())
+        }
+        async fn delete_entry_attempt(
+            &self,
+            _account: Option<&str>,
+            _trade_id: &str,
+            _attempt_no: u32,
+        ) -> Result<(), StateError> {
+            Ok(())
+        }
+    }
+
+    fn now() -> DateTime<Utc> {
+        Utc.with_ymd_and_hms(2026, 6, 2, 17, 0, 0).unwrap()
+    }
+
+    fn not_after() -> DateTime<Utc> {
+        Utc.with_ymd_and_hms(2026, 6, 4, 16, 50, 53).unwrap()
+    }
+
+    fn verified(id: &str) -> Verified {
+        Verified {
+            shell: Shell {
+                close: 203.0,
+                high: 203.2,
+                low: 202.9,
+                time: now(),
+                signal_high: None,
+                signal_low: None,
+                signal_range: None,
+                signal_start_time: None,
+                signal_kind: None,
+                golden: None,
+                atr: None,
+                signal_confirmed: None,
+                recent_high: None,
+                recent_low: None,
+            },
+            intent: Intent {
+                v: 1,
+                id: id.into(),
+                not_before: None,
+                not_after: not_after(),
+                action: Action::Enter,
+                instrument: "CHF_JPY".into(),
+                direction: Some(Direction::Short),
+                entry: Some(EntrySpec::Market),
+                stop_loss: Some(PriceRef::Absolute { absolute: 203.5 }),
+                take_profit: None,
+                risk_pct: Tunable::Static(0.25),
+                risk_amount: None,
+                size_units: None,
+                dry_run: None,
+                cooldown_hours: None,
+                min_r: None,
+                broker: BrokerKind::TradeNation,
+                account: Some("reversals".into()),
+                step: None,
+                name: None,
+                ttl_hours: Tunable::Static(0),
+                level: None,
+                requires_preps: Vec::new(),
+                vetos: Vec::new(),
+                clears: Vec::new(),
+                trade_id: Some("hs-chf-jpy-test".into()),
+                max_retries: Tunable::Static(0),
+                allow_entry: None,
+                needs_golden: false,
+                blackout_id: None,
+                news_id: None,
+                require_news_window: None,
+                require_price_in_ranges: None,
+                reason: None,
+            },
+        }
+    }
+
+    fn run<F: std::future::Future>(f: F) -> F::Output {
+        pollster::block_on(f)
+    }
+
+    fn dummy_rejected_response() -> WorkerResult<worker::Response> {
+        // `worker::Response` construction panics off-wasm. The tests
+        // never read this value; they only assert on the store side
+        // effects of `record_dispatcher_outcome`. Stash an `Err`
+        // (which constructs without touching wasm-bindgen) as a stand-in.
+        Err(worker::Error::RustError("test".into()))
+    }
+
+    #[test]
+    fn ok_outcome_marks_seen() {
+        let store = SeenSpyStore::default();
+        let v = verified("ok-id");
+        let result = ActionResult::Ok("entered: order=42".into());
+        run(record_dispatcher_outcome(&store, &v, now(), &result));
+        assert_eq!(
+            store.marks(),
+            vec![("ok-id".into(), "entered: order=42".into())]
+        );
+    }
+
+    #[test]
+    fn failed_outcome_marks_seen_in_refactor_baseline() {
+        // Refactor commit pins current (buggy) behaviour: Failed writes.
+        // The follow-up fix commit will flip this assertion.
+        let store = SeenSpyStore::default();
+        let v = verified("failed-id");
+        let result = ActionResult::Failed("entry-failed: broker 500".into());
+        run(record_dispatcher_outcome(&store, &v, now(), &result));
+        assert_eq!(
+            store.marks(),
+            vec![("failed-id".into(), "entry-failed: broker 500".into())]
+        );
+    }
+
+    #[test]
+    fn rejected_outcome_marks_seen_in_refactor_baseline() {
+        // Refactor commit pins current (buggy) behaviour: Rejected writes.
+        // The follow-up fix commit will flip this assertion. The specific
+        // outcome string mirrors the CHF/JPY 2026-06-02 incident: fire 4
+        // was rejected on a missing-prep and poisoned the id for ~47h.
+        let store = SeenSpyStore::default();
+        let v = verified("rejected-id");
+        let result = ActionResult::Rejected {
+            response: dummy_rejected_response(),
+            outcome: "rejected: missing-prep (break-and-close)".into(),
+        };
+        run(record_dispatcher_outcome(&store, &v, now(), &result));
+        assert_eq!(
+            store.marks(),
+            vec![(
+                "rejected-id".into(),
+                "rejected: missing-prep (break-and-close)".into(),
+            )]
+        );
+    }
 }
