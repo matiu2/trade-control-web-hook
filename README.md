@@ -602,8 +602,9 @@ blob, or TN itself rejecting the credentials.
 The worker only tracks trades it placed itself — it does not poll the
 broker for open positions. If you open a trade manually in the broker
 UI (or by any non-worker path) and want the webhook lifecycle to run
-against it (`close`, `pause`/`resume`, retry-gate, SL-breach sweep),
-register it with `POST /admin/adopt-trade` via the CLI:
+against it (`close`, `pause`/`resume`, multi-shot re-entry gate after
+the manual trade closes, SL-breach sweep), register it with
+`POST /admin/adopt-trade` via the CLI:
 
 ```sh
 trade-control adopt-trade \

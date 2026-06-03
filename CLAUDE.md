@@ -16,6 +16,36 @@ Read the README first for the user-facing story. This file is for hazards.
 
 ## Things the README doesn't shout
 
+### "retry" / `max_retries` does NOT mean retrying failed placements
+
+This naming has bitten more than one debugging session. `max_retries`,
+the "retry gate" in `src/retry_gate.rs`, the `EntryAttempt` rows, and
+the `is_retry_fire_seen` / `mark_retry_fire_seen` KV keys are all
+**multi-shot re-entry** mechanisms: place → fill → close (typically
+at SL) → a fresh signal bar arrives in the same alert window → place
+again, up to `max_retries` total placements.
+
+What "retry" is **not**:
+
+- Not a retry of broker placement errors. A failed `place_order`
+  returns 502 and terminates that intent id — the next fire of the
+  same alert body 409s on `is_seen` at the top-level dispatcher
+  (`src/lib.rs::is_seen` check), never reaches the retry gate.
+- Not a retry of pre-broker rejections (veto, cooldown,
+  `allow_entry` script failures). Those don't burn an `EntryAttempt`
+  slot at all.
+- Not a way to refire the same alert payload. Top-level intent-id
+  dedup applies first; multi-shot needs distinct intent ids per fire
+  (which `build-trade` mints for multi-shot setups, not for
+  single-shot).
+
+If you find yourself looking at a 409 on an `enter` and wondering
+"but the prior fires all failed — why didn't the retry gate let it
+through", remember: that gate isn't the layer you're hitting. You're
+hitting `is_seen` on the intent id, several hundred lines earlier in
+the dispatcher. See `src/retry_gate.rs`'s module doc for the full
+rules.
+
 ### tv_arm_hs.py: server-side trendline-cross eval is anchor-bounded
 
 Burned a lot of time on this. When you POST a `create_alert` with

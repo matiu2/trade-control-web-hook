@@ -589,10 +589,15 @@ async fn run_enter<B: Broker>(
     // Retry gate — when the intent opts into multi-shot mode via
     // `max_retries`, the gate inspects prior attempts (cancel-and-
     // replace a still-pending one, reject a fresh placement when an
-    // earlier attempt is still open) and enforces the placement cap.
-    // The single-shot path (`max_retries: Static(0)`, the default)
-    // skips this branch entirely so no new KV/broker calls land on the
-    // byte-identical baseline.
+    // earlier attempt is still open, allow another placement when
+    // earlier attempts have closed) and enforces the placement cap.
+    // "Retry" here means re-entry into a setup after a prior fill
+    // closed (typically at SL), *not* a re-attempt of a failed
+    // placement — broker failures are terminal and 502 out. See
+    // `src/retry_gate.rs` for the full semantics. The single-shot
+    // path (`max_retries: Static(0)`, the default) skips this branch
+    // entirely so no new KV/broker calls land on the byte-identical
+    // baseline.
     let retry_attempt_no = if !matches!(
         verified.intent.max_retries,
         trade_control_core::tunable::Tunable::Static(0)

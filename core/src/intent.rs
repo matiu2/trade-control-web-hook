@@ -422,6 +422,17 @@ pub struct Intent {
     /// value. Multi-shot requires `trade_id` to be set and `action` to
     /// be [`Action::Enter`]; rejected at validate time otherwise.
     ///
+    /// **What "retries" means here.** This is *not* a retry of
+    /// placements that failed to reach the broker — those produce a
+    /// terminal 502 and don't refire. It models the case where the
+    /// first entry placed and filled, the trade has since closed
+    /// (typically at stop loss), and a fresh signal bar inside the
+    /// same alert window represents a new entry opportunity on the
+    /// same setup. The gate that enforces this lives in
+    /// `src/retry_gate.rs` — see that module's docs for the full
+    /// rules, especially around what kinds of prior attempts allow
+    /// another placement vs. block one.
+    ///
     /// A [`Tunable<u32>`] — operators can supply a static literal
     /// (`max_retries: 3`) or a Rhai script (`max_retries: !script
     /// "..."`) that resolves at gate time against Phase 1 scope only

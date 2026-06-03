@@ -465,15 +465,19 @@ pub trait StateStore {
     fn snapshot(&self) -> impl Future<Output = Result<Snapshot, StateError>>;
 
     /// Record a placed entry attempt for a `(account, trade_id)`
-    /// group. Used by the retry gate after `place_order` succeeds.
+    /// group. Used by the multi-shot retry gate after `place_order`
+    /// succeeds — see `src/retry_gate.rs` for what "retry" means in
+    /// this codebase (re-entry into a setup after a prior fill closed,
+    /// not a re-attempt of a failed placement).
     fn record_entry_attempt(
         &self,
         attempt: EntryAttempt,
     ) -> impl Future<Output = Result<(), StateError>>;
 
     /// Return all entry attempts for `(account, trade_id)`, ordered
-    /// by `attempt_no` ascending. Used by the retry gate to count
-    /// prior attempts and cross-reference each against broker state.
+    /// by `attempt_no` ascending. Used by the multi-shot retry gate
+    /// to count prior placed entries and cross-reference each against
+    /// broker state (open / pending / closed).
     fn list_entry_attempts(
         &self,
         account: Option<&str>,
@@ -510,10 +514,14 @@ pub trait StateStore {
         broker_trade_id: &str,
     ) -> impl Future<Output = Result<(), StateError>>;
 
-    /// Returns true if this `(account, trade_id, shell_time)` retry
-    /// fire has already been seen. Replaces the `seen:<id>` dedup for
-    /// the multi-shot path so two arrivals on the same firing bar
-    /// don't double-place.
+    /// Returns true if this `(account, trade_id, shell_time)` fire
+    /// has already been seen. This is the multi-shot dedup layer: it
+    /// catches two arrivals that resolve to the **same** signal bar
+    /// (e.g. an alert re-evaluating on a single close) for the same
+    /// trade group, so they collapse to one placement. It is not the
+    /// same thing as the intent-id replay check in `is_seen` — that
+    /// blocks byte-identical alert bodies, while this blocks
+    /// distinct-id fires that happen to share a `shell.time`.
     fn is_retry_fire_seen(
         &self,
         account: Option<&str>,
@@ -521,7 +529,9 @@ pub trait StateStore {
         shell_time: DateTime<Utc>,
     ) -> impl Future<Output = Result<bool, StateError>>;
 
-    /// Record a retry fire as seen. TTL is in seconds.
+    /// Record a `(account, trade_id, shell_time)` fire as seen, so
+    /// the next arrival on the same signal bar dedups via
+    /// [`Self::is_retry_fire_seen`]. TTL is in seconds.
     fn mark_retry_fire_seen(
         &self,
         account: Option<&str>,
