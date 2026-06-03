@@ -519,6 +519,7 @@ fn build_trade_spec(
         needs_golden: args.require_golden,
         close_on_news: !roles.news_pairs.is_empty(),
         sr_reversal_ranges: build_sr_ranges(roles, args.reversal_band_pct),
+        needs_confirmed_close: false,
     };
     if args.sl_from_recent {
         spec.sl_anchor = Some(match direction {

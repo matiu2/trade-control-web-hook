@@ -109,15 +109,17 @@ needs_golden: true                        # default for reversal closes
   - Add `allow_close` script evaluation symmetric with `allow_entry`.
   - Tests: golden-only blocks confirmed-non-golden, news+price OR, both
     failing rejects, allow_close composes AND with the rest.
-- [ ] **Step 3: CLI — consolidate `06`/`07` builders.**
+- [x] **Step 3: CLI — consolidate `06`/`07` builders.**
   - `build_close_on_reversal_alert` becomes the sole reversal-close
-    builder. Accepts `inside_window` + `price_bands` from `TradeSpec`.
-    Sets `needs_golden: true` by default (operator-overridable via
-    `TradeSpec::needs_confirmed_close: bool` or similar; bikeshed name
-    during impl).
-  - Delete `build_close_on_sr_reversal_alert`. `TradeSpec.sr_reversal_ranges`
-    folds into the new `price_bands` field on the close intent.
-  - Test rewrites: the `06`/`07` split tests become one-alert tests.
+    builder. Accepts `inside_window` + `price_bands` derived from the
+    `TradeSpec` `close_on_news` + `sr_reversal_ranges` deprecated input
+    fields. `TradeSpec.needs_confirmed_close: bool` flips the candle
+    gate from `needs_golden: true` (default) to `needs_confirmed: true`.
+  - Deleted `build_close_on_sr_reversal_alert`. CLI no longer emits the
+    `07-close-on-sr-reversal` basename (the enum variant stays for
+    inbound decode of in-flight alerts; see step 2's wire compat note).
+  - Test rewrites: the `06`/`07` split tests became one-alert tests,
+    plus a new `needs_confirmed_close` test. 209 cli tests pass.
 - [ ] **Step 4: Python — `tv_arm_hs.py` emits the new shape.**
   - Single `06-close-on-reversal.yaml` instead of two. `inside_window`
     populated from whether news pairs and/or S/R lines are present on the
