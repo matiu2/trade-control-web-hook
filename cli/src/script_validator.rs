@@ -227,6 +227,9 @@ mod tests {
             news_id: None,
             require_news_window: None,
             require_price_in_ranges: None,
+            needs_confirmed: false,
+            inside_window: Vec::new(),
+            price_bands: Vec::new(),
             reason: None,
         }
     }

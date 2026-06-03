@@ -58,6 +58,9 @@ fn control_skeleton(action: Action, instrument: &str, id: String, now: DateTime<
         news_id: None,
         require_news_window: None,
         require_price_in_ranges: None,
+        needs_confirmed: false,
+        inside_window: Vec::new(),
+        price_bands: Vec::new(),
         reason: None,
     }
 }

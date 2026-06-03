@@ -246,6 +246,9 @@ fn build_news_intent(
         news_id: Some(news_id.to_string()),
         require_news_window: None,
         require_price_in_ranges: None,
+        needs_confirmed: false,
+        inside_window: Vec::new(),
+        price_bands: Vec::new(),
         reason: spec.reason.clone(),
     }
 }

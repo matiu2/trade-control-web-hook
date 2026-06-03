@@ -13,16 +13,22 @@ Trading:
 
 - `enter` — open a market, stop, or limit order with SL/TP, after passing the risk gate.
   Optionally gated on named `prep` / `veto` flags (see "Conditional entries" below).
-- `close` — close all positions for the instrument. May also carry up to two
-  worker-side gates, **OR-composed**: `require_news_window: true` (passes when
-  an active news window exists for the `trade_id`) and/or
-  `require_price_in_ranges: [[lo, hi], ...]` (passes when the broker's current
-  price sits inside at least one band). The close reaches the broker as long
-  as *at least one* set gate passes — so a single reversal alert body can
-  carry both gates and the worker decides per-fire whether *this* candle is a
-  real close signal (we're inside a news window **or** price is at a marked
-  S/R zone). With neither flag set the close is unconditional (operator
-  emergency-close path).
+- `close` — close all positions for the instrument. May also carry worker-side
+  gates that decide whether *this* close fires, **OR-composed** across the list
+  so a single reversal alert can carry both kinds of gate and pass if *either*
+  holds:
+  - **New consolidated form** (preferred): `inside_window: [news, price]`
+    names which window-types are acceptable; `price_bands: [[lo, hi], ...]`
+    carries the data for the `price` member. The two fields are paired —
+    `price` ∈ `inside_window` iff `price_bands` is non-empty. Plus optional
+    candle-quality gates `needs_golden: true` and `needs_confirmed: true`
+    (AND-composed with the window check), and an optional `allow_close`
+    script (future, symmetric with `allow_entry`).
+  - **Deprecated form** (still accepted for in-flight alerts):
+    `require_news_window: true` and/or `require_price_in_ranges: [[lo, hi], ...]`.
+    Mixing the old and new forms on one intent is a validation error —
+    pick one. Migrate to the new form on next regen.
+  With no gate set the close is unconditional (operator emergency-close path).
 - `invalidate` — set a per-instrument cooldown (default 12 h) and cancel any pending
   orders. Use this when your setup is no longer valid (price drifted out of the
   expected range) and you want to be sure no entry fires while you sleep.

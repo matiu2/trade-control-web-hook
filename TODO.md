@@ -1,5 +1,144 @@
 # TODO
 
+## Active — Consolidated close-on-reversal + first-class candle-quality gates
+
+**Bug observed (2026-06-03):** GBP/NZD demo entry SL didn't match any obvious
+swing structure, and a closer audit of the close-on-reversal path showed two
+deeper issues:
+
+1. The Pine `Long Pattern` / `Short Pattern` plots (used as the
+   close-on-reversal trigger) fire on **any** opposite-direction signal,
+   golden or not — there is no operator-facing way to require "golden only"
+   on a Close, because `Intent::validate` rejects `needs_golden: true` on
+   any action ≠ `Enter` (`core/src/intent.rs:699`).
+2. We have two separate alert basenames (`06-close-on-reversal`,
+   `07-close-on-sr-reversal`) for what is semantically one operation
+   ("close when a reversal candle prints inside a meaningful contextual
+   window"). The two-alert split is artificial and produces awkward CLI
+   plumbing.
+
+### Design
+
+Single `06-close-on-reversal` alert that fires when ALL of:
+
+1. **Inside a configured window** — at least one of:
+   - active news window for this `trade_id`, OR
+   - current broker price inside a configured price band.
+2. **Candle quality** — golden (default), or operator-overridden to
+   confirmed-but-not-golden.
+3. **(optional) `allow_close` script** — ad-hoc filter, symmetric with
+   `allow_entry`.
+
+Plus: promote `require_confirmation` from a script-only check on the
+`allow_entry` body to a first-class `needs_confirmed: bool` field on
+`Intent`, applicable to both Enter and Close. Symmetric with the existing
+`needs_golden`.
+
+### YAML shape (new form)
+
+```yaml
+v: 1
+action: close
+id: <trade_id>-close-on-reversal
+trade_id: <trade_id>
+instrument: ...
+broker: ...
+account: ...
+
+# New consolidated gate (replaces require_news_window + require_price_in_ranges)
+inside_window: [news, price]              # OR-composed; at least one must be set
+price_bands: [[1.0950, 1.0970]]           # required when "price" is in inside_window
+
+# Candle quality (default: golden only). Mutually exclusive.
+needs_golden: true                        # default for reversal closes
+# needs_confirmed: true                   # operator opt-in to "confirmed, not necessarily golden"
+
+# Optional ad-hoc filter (symmetric with allow_entry)
+# allow_close: |
+#   <script expr>
+```
+
+### Field naming
+
+- `inside_window: [news, price]` — list of window types under which the close
+  is valid. List-implies-any (OR), same surface area as `requires_preps` but
+  with opposite composition. Documented explicitly in the field doc-comment
+  and the README. The two-axis metaphor: news is a time-window, price is a
+  price-window.
+- `price_bands: Vec<[f64; 2]>` — the data for the "price" window type.
+  Required when `price` ∈ `inside_window`; rejected when it's not.
+- `needs_confirmed: bool` — symmetric with existing `needs_golden`. Both
+  rejected on actions ≠ Enter|Close.
+- `allow_close: Tunable<bool>` — symmetric with existing `allow_entry`.
+
+### Wire-compat / deprecation
+
+- Old fields `require_news_window` and `require_price_in_ranges` stay
+  working unchanged (the worker already OR-composes them via
+  `evaluate_close_gates` at `src/lib.rs:596` — verified). They are marked
+  deprecated in doc-comments. Old in-flight alerts continue to fire
+  correctly.
+- An intent cannot mix old and new forms; validate-time rejection.
+- `07-close-on-sr-reversal` basename stays in the `AlertBasename` enum for
+  inbound decode of in-flight alerts; CLI stops emitting it.
+
+### Steps
+
+- [ ] **Step 1: worker — validation relaxation + new fields.**
+  - Relax `Intent::validate` to allow `needs_golden: true` on
+    `Action::Close` (currently rejected at `core/src/intent.rs:699`).
+  - Add `needs_confirmed: bool` to `Intent`. Same shape as `needs_golden`.
+    Validate-time: only valid on Enter|Close.
+  - Add `inside_window: Vec<EventWindow>` and `price_bands: Vec<[f64;2]>`.
+    `EventWindow` is an enum `News | Price` with kebab serde.
+  - Validate-time on Close: if either of the new fields is set, the old
+    fields must be empty (mutual exclusion). At least one window-type
+    gate must resolve to a real check.
+  - Tests: round-trip, mutual-exclusion rejection, missing-data rejection
+    (`price` in `inside_window` without `price_bands`).
+  - No worker dispatch changes yet — just types.
+- [ ] **Step 2: worker — Close dispatch consumes new fields + candle gates.**
+  - Extend `run_close` (`src/lib.rs:480`) to evaluate the new
+    `inside_window` field via the same `GateOutcome` machinery. New form
+    routes to the same `evaluate_close_gates` outcome that the old form
+    already uses (so the OR semantics are guaranteed identical).
+  - Add `needs_golden` / `needs_confirmed` shell-check before the broker
+    call. Extract the existing `needs_golden` check from
+    `src/allow_entry_gate.rs:51` into a shared helper used by both
+    Enter and Close paths.
+  - Add `allow_close` script evaluation symmetric with `allow_entry`.
+  - Tests: golden-only blocks confirmed-non-golden, news+price OR, both
+    failing rejects, allow_close composes AND with the rest.
+- [ ] **Step 3: CLI — consolidate `06`/`07` builders.**
+  - `build_close_on_reversal_alert` becomes the sole reversal-close
+    builder. Accepts `inside_window` + `price_bands` from `TradeSpec`.
+    Sets `needs_golden: true` by default (operator-overridable via
+    `TradeSpec::needs_confirmed_close: bool` or similar; bikeshed name
+    during impl).
+  - Delete `build_close_on_sr_reversal_alert`. `TradeSpec.sr_reversal_ranges`
+    folds into the new `price_bands` field on the close intent.
+  - Test rewrites: the `06`/`07` split tests become one-alert tests.
+- [ ] **Step 4: Python — `tv_arm_hs.py` emits the new shape.**
+  - Single `06-close-on-reversal.yaml` instead of two. `inside_window`
+    populated from whether news pairs and/or S/R lines are present on the
+    chart. `price_bands` carries the S/R ranges.
+  - Update the `build_alert_spec()` basename map.
+- [ ] **Step 5: README + per-commit doc sync.**
+  - New section: reversal-close design with the `inside_window` mental
+    model and the two-axis-window metaphor.
+  - Deprecation note on the old fields with a 2-release sunset window.
+  - Update the worked example showing the new YAML shape.
+
+### Open follow-ups (not blocking the bug fix)
+
+- Investigate the **6-7 min lag** between H1 close and broker fill on the
+  2026-06-03 demo entries — see `entry_fill_lag_after_h1_close` memory.
+  Most likely TV alert-eval lag; confirm via Cloudflare log timestamps.
+- Audit the **GBP/NZD long SL drawing** (2.27736) — looks like it doesn't
+  match the right-shoulder structure on chart, possibly a fib-anchor
+  drag error on the operator side, not a code bug. Re-check after
+  next setup is armed.
+
 ## Done — encryption retired; HMAC signing is the only auth
 
 The encrypted envelope path (ChaCha20-Poly1305 over a `v1.<base64>`

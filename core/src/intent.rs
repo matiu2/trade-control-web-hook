@@ -461,16 +461,35 @@ pub struct Intent {
     /// to pre-`allow_entry` intents.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub allow_entry: Option<crate::tunable::Tunable<bool>>,
-    /// When true, the worker rejects the entry unless the incoming shell
+    /// When true, the worker rejects the action unless the incoming shell
     /// carries `golden: Some(true)`. AND-composed with [`Self::allow_entry`]
-    /// — both gates must pass. Promoted to a typed field (rather than a
-    /// script idiom like `golden == true`) because operators reach for it
-    /// often; the typed form avoids the Rhai `()` landmine when the shell
-    /// omits the field. Default `false` = no gate, byte-identical wire
-    /// form to pre-feature intents. Only meaningful on `Action::Enter`;
-    /// rejected at validate time on other actions.
+    /// (Enter) / [`Self::allow_close`] (Close) — both gates must pass.
+    /// Promoted to a typed field (rather than a script idiom like
+    /// `golden == true`) because operators reach for it often; the typed
+    /// form avoids the Rhai `()` landmine when the shell omits the field.
+    /// Default `false` = no gate, byte-identical wire form to pre-feature
+    /// intents.
+    ///
+    /// Meaningful on `Action::Enter` and `Action::Close`; rejected at
+    /// validate time on other actions. On Close the typical use is the
+    /// consolidated reversal-close path: the operator wants the trade
+    /// flattened only when the reversal candle is golden.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub needs_golden: bool,
+    /// When true, the worker rejects the action unless the incoming shell
+    /// carries `confirmed: Some(true)`. Same shape as [`Self::needs_golden`]
+    /// — typed boolean, AND-composed with the action's script gate,
+    /// rejected on actions other than Enter|Close. Promoted out of
+    /// script-land (`confirmed == true` inside `allow_entry`) so the
+    /// operator-facing YAML reads cleaner.
+    ///
+    /// On Close: pairs with the consolidated reversal-close to express
+    /// "confirmed reversal — golden is too strict for this setup". A
+    /// reversal close that sets *neither* `needs_golden` nor
+    /// `needs_confirmed` lets through any opposite-pattern candle (rare —
+    /// usually the operator wants at least one).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub needs_confirmed: bool,
     /// Per-blackout id on `pause` / `resume` actions. Lets a single
     /// `trade_id` carry multiple independent blackout windows
     /// concurrently (e.g. NFP + central-bank decision on the same
@@ -488,6 +507,9 @@ pub struct Intent {
     /// `news-end`; ignored on other actions.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub news_id: Option<String>,
+    /// **Deprecated** — superseded by [`Self::inside_window`]. New trade
+    /// templates should emit `inside_window: [news, ...]` instead.
+    ///
     /// On `close` intents, one of two **OR-composed** gates. When
     /// `Some(true)`, the gate passes only if
     /// `list_news_windows_for_trade(trade_id)` returns at least one
@@ -499,8 +521,17 @@ pub struct Intent {
     /// must-both-hold preconditions. Default-absent = no news-window
     /// requirement (gate skipped). Only meaningful on `Action::Close`;
     /// rejected at validate time on other actions.
+    ///
+    /// Wire-compat: kept working for in-flight alerts. Mutually exclusive
+    /// with [`Self::inside_window`] — validate rejects an intent that
+    /// sets both forms.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub require_news_window: Option<bool>,
+    /// **Deprecated** — superseded by [`Self::inside_window`] +
+    /// [`Self::price_bands`]. New trade templates should emit
+    /// `inside_window: [..., price]` + `price_bands: [[lo, hi], ...]`
+    /// instead.
+    ///
     /// On `close` intents, one of two **OR-composed** gates (see
     /// [`Self::require_news_window`] for the other). The worker
     /// fetches the broker's current price at dispatch; this gate
@@ -511,8 +542,47 @@ pub struct Intent {
     /// *either* gate passes. Default-absent = no range gate. Only
     /// meaningful on `Action::Close`; rejected at validate time on
     /// other actions.
+    ///
+    /// Wire-compat: kept working for in-flight alerts. Mutually exclusive
+    /// with [`Self::inside_window`] — validate rejects an intent that
+    /// sets both forms.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub require_price_in_ranges: Option<Vec<[f64; 2]>>,
+    /// On `close` intents, the consolidated contextual-window gate.
+    /// **OR-composed** list — the close reaches the broker as long as
+    /// *at least one* listed window passes:
+    /// - [`EventWindow::News`] — active news window for `trade_id`
+    ///   (`list_news_windows_for_trade(trade_id)` returns non-empty).
+    /// - [`EventWindow::Price`] — broker's current price for
+    ///   `instrument` sits inside at least one [`Self::price_bands`]
+    ///   entry.
+    ///
+    /// Replaces the deprecated [`Self::require_news_window`] +
+    /// [`Self::require_price_in_ranges`] pair with a single explicit
+    /// list. The two-axis metaphor is the design intent: news is a
+    /// *time* window, price is a *price* window; either kind of
+    /// "we're inside something meaningful" is enough to justify the
+    /// close. See [`EventWindow`] for details.
+    ///
+    /// Empty list = no contextual gate (unconditional close, same as
+    /// omitting both deprecated fields). Operators almost always want
+    /// at least one window — see the README for the reversal-close
+    /// template.
+    ///
+    /// Validation:
+    /// - Only meaningful on `Action::Close`; rejected elsewhere.
+    /// - Mutually exclusive with the deprecated `require_*` fields.
+    /// - If `Price` is listed, [`Self::price_bands`] must be non-empty.
+    /// - If `Price` is *not* listed, `price_bands` must be empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub inside_window: Vec<EventWindow>,
+    /// Price bands `[[lo, hi], ...]` for the [`EventWindow::Price`] gate.
+    /// Required when `inside_window` contains `Price`; rejected when it
+    /// doesn't. Every band must satisfy `lo <= hi`. Replaces the
+    /// deprecated [`Self::require_price_in_ranges`]; the data shape is
+    /// identical so the worker's existing band-hit machinery is reused.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub price_bands: Vec<[f64; 2]>,
     /// Free-form human-readable label for a `pause` (or any other
     /// action that wants to record context). Surfaces in the seen
     /// index outcome string so operators can answer "why is this
@@ -591,9 +661,30 @@ pub enum IntentValidationError {
     /// `allow_entry: Some(_)` on a non-Enter action — the gate is
     /// only checked on `enter`.
     AllowEntryOnNonEnter,
-    /// `needs_golden: true` on a non-Enter action — the gate is only
-    /// checked on `enter`.
-    NeedsGoldenOnNonEnter,
+    /// `needs_golden: true` on an action other than Enter or Close — the
+    /// gate only runs on those two paths. Promoted from "Enter-only" on
+    /// 2026-06-03 so the consolidated reversal close can require a
+    /// golden candle.
+    NeedsGoldenOnDisallowedAction,
+    /// `needs_confirmed: true` on an action other than Enter or Close.
+    /// Symmetric with [`Self::NeedsGoldenOnDisallowedAction`].
+    NeedsConfirmedOnDisallowedAction,
+    /// `inside_window: [...]` on a non-Close action — the gate is only
+    /// checked on `close`.
+    InsideWindowOnNonClose,
+    /// `inside_window` listed `price` but [`Intent::price_bands`] was
+    /// empty, OR `price_bands` was non-empty but `inside_window` did
+    /// not list `price`. The two fields are the type-tag and the data
+    /// for the same gate; either both present or both absent.
+    InsideWindowPriceBandsMismatch,
+    /// One of the bands in [`Intent::price_bands`] has `lo > hi`.
+    InvalidPriceBands,
+    /// New consolidated close-gate fields ([`Intent::inside_window`] or
+    /// [`Intent::price_bands`]) were set alongside the deprecated
+    /// [`Intent::require_news_window`] or [`Intent::require_price_in_ranges`].
+    /// Pick one form per intent — the worker accepts either independently
+    /// but mixing them invites silent semantic drift.
+    MixedOldAndNewCloseGates,
     /// `ttl_hours` missing (i.e. defaulted to `Static(0)`) on a prep or
     /// veto action where it's required to set the KV flag's lifetime.
     MissingTtlHours,
@@ -637,9 +728,23 @@ impl core::fmt::Display for IntentValidationError {
             }
             Self::MaxRetriesOnNonEnter => f.write_str("max_retries is only valid on action: enter"),
             Self::AllowEntryOnNonEnter => f.write_str("allow_entry is only valid on action: enter"),
-            Self::NeedsGoldenOnNonEnter => {
-                f.write_str("needs_golden is only valid on action: enter")
+            Self::NeedsGoldenOnDisallowedAction => {
+                f.write_str("needs_golden is only valid on action: enter | close")
             }
+            Self::NeedsConfirmedOnDisallowedAction => {
+                f.write_str("needs_confirmed is only valid on action: enter | close")
+            }
+            Self::InsideWindowOnNonClose => {
+                f.write_str("inside_window is only valid on action: close")
+            }
+            Self::InsideWindowPriceBandsMismatch => {
+                f.write_str("inside_window must contain `price` iff price_bands is non-empty")
+            }
+            Self::InvalidPriceBands => f.write_str("price_bands must have lo <= hi on every band"),
+            Self::MixedOldAndNewCloseGates => f.write_str(
+                "the new close-gate fields (inside_window / price_bands) cannot be mixed with \
+                 the deprecated require_news_window / require_price_in_ranges — pick one form",
+            ),
             Self::MissingTtlHours => f.write_str("ttl_hours is required on prep / veto actions"),
             Self::MissingPauseFields => {
                 f.write_str("pause / resume require both trade_id and blackout_id")
@@ -696,8 +801,16 @@ impl Intent {
         if self.allow_entry.is_some() && self.action != Action::Enter {
             return Err(IntentValidationError::AllowEntryOnNonEnter);
         }
-        if self.needs_golden && self.action != Action::Enter {
-            return Err(IntentValidationError::NeedsGoldenOnNonEnter);
+        // needs_golden / needs_confirmed: both check the shell at gate
+        // time, both meaningful on Enter (entry-quality filter) and Close
+        // (reversal-quality filter on the consolidated close-on-reversal
+        // path). Rejected elsewhere — silent ignore would mask config
+        // bugs.
+        if self.needs_golden && !matches!(self.action, Action::Enter | Action::Close) {
+            return Err(IntentValidationError::NeedsGoldenOnDisallowedAction);
+        }
+        if self.needs_confirmed && !matches!(self.action, Action::Enter | Action::Close) {
+            return Err(IntentValidationError::NeedsConfirmedOnDisallowedAction);
         }
         // ttl_hours is required for prep / veto: the KV flag we write
         // expires on this clock. `Static(0)` is the wire-elided default
@@ -754,8 +867,54 @@ impl Intent {
                 return Err(IntentValidationError::InvalidPriceRanges);
             }
         }
+        // inside_window / price_bands: new consolidated close-gate.
+        // - Either field non-empty pins the intent to Close.
+        // - The two are paired: `price` in the type-list iff the data
+        //   list is non-empty. Either inconsistency is a builder bug.
+        // - Bands must have lo <= hi (same rule as the deprecated form).
+        // - Mutually exclusive with the deprecated fields — mixing the
+        //   two forms invites silent semantic drift in future refactors.
+        let has_new = !self.inside_window.is_empty() || !self.price_bands.is_empty();
+        let has_old = self.require_news_window.is_some() || self.require_price_in_ranges.is_some();
+        if has_new && has_old {
+            return Err(IntentValidationError::MixedOldAndNewCloseGates);
+        }
+        if has_new && self.action != Action::Close {
+            return Err(IntentValidationError::InsideWindowOnNonClose);
+        }
+        let price_in_window = self.inside_window.contains(&EventWindow::Price);
+        let bands_present = !self.price_bands.is_empty();
+        if price_in_window != bands_present {
+            return Err(IntentValidationError::InsideWindowPriceBandsMismatch);
+        }
+        if self.price_bands.iter().any(|[lo, hi]| lo > hi) {
+            return Err(IntentValidationError::InvalidPriceBands);
+        }
         Ok(())
     }
+}
+
+/// Contextual-window type for the consolidated close-on-reversal gate
+/// (see [`Intent::inside_window`]). Each variant names *one* family of
+/// "is this candle a real reversal?" check; the list on the intent is
+/// **OR-composed** (any window passing is sufficient).
+///
+/// The two-axis metaphor is intentional:
+/// - [`Self::News`] — a *time* window (we're inside an
+///   operator-armed `news:<trade_id>:<news_id>` pair).
+/// - [`Self::Price`] — a *price* window (broker's current price sits
+///   inside one of [`Intent::price_bands`]).
+///
+/// Wire form is kebab-case (`news`, `price`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum EventWindow {
+    /// Active news-window gate (looks up
+    /// `list_news_windows_for_trade(trade_id)` at dispatch time).
+    News,
+    /// Price-band gate (broker's current price must sit inside one of
+    /// [`Intent::price_bands`]).
+    Price,
 }
 
 /// Which broker fulfils an intent. The serialised form is the
@@ -2339,10 +2498,10 @@ mod tests {
     }
 
     #[test]
-    fn validate_rejects_needs_golden_on_non_enter_action() {
-        // Same defense-in-depth as allow_entry / max_retries — the gate
-        // only runs on Enter, so silently ignoring it on a prep would
-        // mislead the operator.
+    fn validate_rejects_needs_golden_on_disallowed_action() {
+        // Promoted from "Enter-only" to "Enter|Close" on 2026-06-03 so
+        // the consolidated reversal close can require a golden candle.
+        // Other actions still reject — silent ignore would mislead.
         let yaml = "
             v: 1
             id: ng-prep
@@ -2356,8 +2515,28 @@ mod tests {
         let intent: Intent = serde_yaml::from_str(yaml).unwrap();
         assert_eq!(
             intent.validate(),
-            Err(IntentValidationError::NeedsGoldenOnNonEnter)
+            Err(IntentValidationError::NeedsGoldenOnDisallowedAction)
         );
+    }
+
+    #[test]
+    fn validate_accepts_needs_golden_on_close_action() {
+        // The 2026-06-03 promotion: golden gate now valid on Close so
+        // the reversal-close path can demand a golden candle.
+        let yaml = "
+            v: 1
+            id: ng-close
+            trade_id: t1
+            not_after: \"2026-05-13T20:00:00Z\"
+            action: close
+            instrument: EUR_USD
+            needs_golden: true
+            inside_window: [news]
+        ";
+        let intent: Intent = serde_yaml::from_str(yaml).unwrap();
+        intent
+            .validate()
+            .expect("close + needs_golden + window valid");
     }
 
     #[test]
@@ -2380,6 +2559,273 @@ mod tests {
             intent.validate(),
             Err(IntentValidationError::AllowEntryOnNonEnter)
         );
+    }
+
+    #[test]
+    fn needs_confirmed_round_trips_through_yaml() {
+        let yaml = "
+            v: 1
+            id: nc-1
+            not_after: \"2026-05-13T20:00:00Z\"
+            action: enter
+            instrument: EUR_USD
+            direction: long
+            entry: { type: market }
+            stop_loss: { from: low, offset_pips: -2 }
+            take_profit: { from: close, offset_r: 2.0 }
+            risk_pct: 0.5
+            needs_confirmed: true
+        ";
+        let intent: Intent = serde_yaml::from_str(yaml).unwrap();
+        assert!(intent.needs_confirmed);
+        let back = serde_yaml::to_string(&intent).unwrap();
+        assert!(back.contains("needs_confirmed: true"), "got: {back}");
+    }
+
+    #[test]
+    fn needs_confirmed_default_false_and_elided_on_serialise() {
+        // Same wire-compat rule as needs_golden: pre-feature intents
+        // omit the field; absent → false; serialising false doesn't
+        // introduce it.
+        let yaml = "
+            v: 1
+            id: nc-default
+            not_after: \"2026-05-13T20:00:00Z\"
+            action: enter
+            instrument: EUR_USD
+            direction: long
+            entry: { type: market }
+            stop_loss: { from: low, offset_pips: -2 }
+            take_profit: { from: close, offset_r: 2.0 }
+            risk_pct: 0.5
+        ";
+        let intent: Intent = serde_yaml::from_str(yaml).unwrap();
+        assert!(!intent.needs_confirmed);
+        let back = serde_yaml::to_string(&intent).unwrap();
+        assert!(!back.contains("needs_confirmed"), "got: {back}");
+    }
+
+    #[test]
+    fn validate_rejects_needs_confirmed_on_disallowed_action() {
+        let yaml = "
+            v: 1
+            id: nc-prep
+            not_after: \"2026-05-13T20:00:00Z\"
+            action: prep
+            instrument: EUR_USD
+            step: break-and-close
+            ttl_hours: 4
+            needs_confirmed: true
+        ";
+        let intent: Intent = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(
+            intent.validate(),
+            Err(IntentValidationError::NeedsConfirmedOnDisallowedAction)
+        );
+    }
+
+    #[test]
+    fn inside_window_news_only_round_trips() {
+        let yaml = "
+            v: 1
+            id: iw-news
+            trade_id: t1
+            not_after: \"2026-05-13T20:00:00Z\"
+            action: close
+            instrument: EUR_USD
+            inside_window: [news]
+        ";
+        let intent: Intent = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(intent.inside_window, vec![EventWindow::News]);
+        assert!(intent.price_bands.is_empty());
+        intent
+            .validate()
+            .expect("close + inside_window:[news] valid");
+        let back = serde_yaml::to_string(&intent).unwrap();
+        assert!(back.contains("inside_window:"), "got: {back}");
+        assert!(
+            !back.contains("price_bands"),
+            "empty price_bands should be elided: {back}"
+        );
+    }
+
+    #[test]
+    fn inside_window_price_requires_bands() {
+        let yaml = "
+            v: 1
+            id: iw-price-missing
+            trade_id: t1
+            not_after: \"2026-05-13T20:00:00Z\"
+            action: close
+            instrument: EUR_USD
+            inside_window: [price]
+        ";
+        let intent: Intent = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(
+            intent.validate(),
+            Err(IntentValidationError::InsideWindowPriceBandsMismatch)
+        );
+    }
+
+    #[test]
+    fn price_bands_require_inside_window_entry() {
+        // The mirror of the previous test: data without the type-tag.
+        let yaml = "
+            v: 1
+            id: pb-orphan
+            trade_id: t1
+            not_after: \"2026-05-13T20:00:00Z\"
+            action: close
+            instrument: EUR_USD
+            price_bands: [[1.0, 1.1]]
+        ";
+        let intent: Intent = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(
+            intent.validate(),
+            Err(IntentValidationError::InsideWindowPriceBandsMismatch)
+        );
+    }
+
+    #[test]
+    fn inside_window_news_and_price_round_trips() {
+        let yaml = "
+            v: 1
+            id: iw-both
+            trade_id: t1
+            not_after: \"2026-05-13T20:00:00Z\"
+            action: close
+            instrument: EUR_USD
+            inside_window: [news, price]
+            price_bands: [[1.0950, 1.0970], [1.1000, 1.1020]]
+        ";
+        let intent: Intent = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(
+            intent.inside_window,
+            vec![EventWindow::News, EventWindow::Price]
+        );
+        assert_eq!(intent.price_bands.len(), 2);
+        intent
+            .validate()
+            .expect("close + inside_window:[news,price] valid");
+    }
+
+    #[test]
+    fn validate_rejects_inside_window_on_non_close() {
+        let yaml = "
+            v: 1
+            id: iw-enter
+            not_after: \"2026-05-13T20:00:00Z\"
+            action: enter
+            instrument: EUR_USD
+            direction: long
+            entry: { type: market }
+            stop_loss: { from: low, offset_pips: -2 }
+            take_profit: { from: close, offset_r: 2.0 }
+            risk_pct: 0.5
+            inside_window: [news]
+        ";
+        let intent: Intent = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(
+            intent.validate(),
+            Err(IntentValidationError::InsideWindowOnNonClose)
+        );
+    }
+
+    #[test]
+    fn validate_rejects_flipped_price_band() {
+        let yaml = "
+            v: 1
+            id: pb-flip
+            trade_id: t1
+            not_after: \"2026-05-13T20:00:00Z\"
+            action: close
+            instrument: EUR_USD
+            inside_window: [price]
+            price_bands: [[1.1, 1.0]]
+        ";
+        let intent: Intent = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(
+            intent.validate(),
+            Err(IntentValidationError::InvalidPriceBands)
+        );
+    }
+
+    #[test]
+    fn validate_rejects_mixing_old_and_new_close_gates() {
+        // An operator porting from the deprecated form to the new form
+        // who leaves a stray field behind: catch it early.
+        let yaml = "
+            v: 1
+            id: iw-mixed
+            trade_id: t1
+            not_after: \"2026-05-13T20:00:00Z\"
+            action: close
+            instrument: EUR_USD
+            inside_window: [news]
+            require_news_window: true
+        ";
+        let intent: Intent = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(
+            intent.validate(),
+            Err(IntentValidationError::MixedOldAndNewCloseGates)
+        );
+    }
+
+    #[test]
+    fn validate_rejects_mixing_old_price_with_new_window() {
+        let yaml = "
+            v: 1
+            id: iw-mixed-price
+            trade_id: t1
+            not_after: \"2026-05-13T20:00:00Z\"
+            action: close
+            instrument: EUR_USD
+            inside_window: [price]
+            price_bands: [[1.0, 1.1]]
+            require_price_in_ranges: [[1.2, 1.3]]
+        ";
+        let intent: Intent = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(
+            intent.validate(),
+            Err(IntentValidationError::MixedOldAndNewCloseGates)
+        );
+    }
+
+    #[test]
+    fn close_without_any_gate_still_validates() {
+        // Empty new-form gates leave the close unconditional, matching
+        // the old form (require_*: absent). Operators can build "always
+        // flatten" closes if they want; the consolidated reversal-close
+        // adds gates only when needed.
+        let yaml = "
+            v: 1
+            id: close-bare
+            trade_id: t1
+            not_after: \"2026-05-13T20:00:00Z\"
+            action: close
+            instrument: EUR_USD
+        ";
+        let intent: Intent = serde_yaml::from_str(yaml).unwrap();
+        intent.validate().expect("bare close still valid");
+    }
+
+    #[test]
+    fn event_window_serialises_kebab_case() {
+        // Wire form for the consolidated close-on-reversal gate. The
+        // operator types `inside_window: [news, price]` and these are
+        // the exact tokens that must round-trip.
+        assert_eq!(
+            serde_yaml::to_string(&EventWindow::News).unwrap().trim(),
+            "news"
+        );
+        assert_eq!(
+            serde_yaml::to_string(&EventWindow::Price).unwrap().trim(),
+            "price"
+        );
+        let back: EventWindow = serde_yaml::from_str("news").unwrap();
+        assert_eq!(back, EventWindow::News);
+        let back: EventWindow = serde_yaml::from_str("price").unwrap();
+        assert_eq!(back, EventWindow::Price);
     }
 
     #[test]
