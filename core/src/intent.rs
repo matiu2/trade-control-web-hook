@@ -488,25 +488,29 @@ pub struct Intent {
     /// `news-end`; ignored on other actions.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub news_id: Option<String>,
-    /// On `close` intents, gate the close on an active news window
-    /// existing for `trade_id`. When `Some(true)`, the worker rejects
-    /// the close with 423 unless
+    /// On `close` intents, one of two **OR-composed** gates. When
+    /// `Some(true)`, the gate passes only if
     /// `list_news_windows_for_trade(trade_id)` returns at least one
-    /// entry. Lets an opposing-direction golden-reversal alert
-    /// flatten a trade *only* inside a known news window — the same
-    /// candle outside the window is ignored. Default-absent =
-    /// unconditional close. Only meaningful on `Action::Close`;
+    /// active window. If this is the **only** gate set the close is
+    /// rejected with 423 when no window is active. When combined with
+    /// [`Self::require_price_in_ranges`] the close still reaches the
+    /// broker as long as *either* gate passes — the worker uses both
+    /// as parallel "is this candle a real reversal" tests, not as
+    /// must-both-hold preconditions. Default-absent = no news-window
+    /// requirement (gate skipped). Only meaningful on `Action::Close`;
     /// rejected at validate time on other actions.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub require_news_window: Option<bool>,
-    /// On `close` intents, gate the close on the current broker price
-    /// falling inside at least one `[lo, hi]` band. The worker fetches
-    /// the current price at dispatch and rejects with 423 if it sits
-    /// outside every band. Lets an opposing-direction reversal alert
-    /// flatten a trade only when price is near a user-marked
-    /// support/resistance level — the same candle elsewhere is
-    /// ignored. Default-absent = no range gate. Only meaningful on
-    /// `Action::Close`; rejected at validate time on other actions.
+    /// On `close` intents, one of two **OR-composed** gates (see
+    /// [`Self::require_news_window`] for the other). The worker
+    /// fetches the broker's current price at dispatch; this gate
+    /// passes when the price sits inside at least one `[lo, hi]`
+    /// band. If this is the **only** gate set the close is rejected
+    /// with 423 when the price is outside every band. When combined
+    /// with `require_news_window`, the close succeeds as long as
+    /// *either* gate passes. Default-absent = no range gate. Only
+    /// meaningful on `Action::Close`; rejected at validate time on
+    /// other actions.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub require_price_in_ranges: Option<Vec<[f64; 2]>>,
     /// Free-form human-readable label for a `pause` (or any other

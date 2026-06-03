@@ -386,95 +386,86 @@ async fn run_action<B: Broker>(
     }
 }
 
-/// Dispatch a `Close` intent. Two independent gates may be set on the
-/// intent and are checked in order; both must pass before the close
-/// reaches the broker:
+/// Dispatch a `Close` intent. Up to two independent gates may be set
+/// on the intent, evaluated **OR-composed**: the close reaches the
+/// broker as long as *at least one* set gate passes.
 ///
-/// - `require_news_window: true` — reject unless an active news window
-///   exists for `trade_id` in KV (the `06-close-on-reversal` alert).
-/// - `require_price_in_ranges: Some(ranges)` — reject unless the
+/// - `require_news_window: true` — passes when an active news window
+///   exists for `trade_id` in KV (the news-start/end pair).
+/// - `require_price_in_ranges: Some(ranges)` — passes when the
 ///   broker's current price for the instrument sits inside at least
-///   one `[lo, hi]` band (the `07-close-on-sr-reversal` alert,
-///   gated on chart-drawn support/resistance levels).
+///   one `[lo, hi]` band (chart-drawn support/resistance levels).
 ///
-/// Without either flag the close is unconditional (operator
-/// emergency-close path).
+/// Rationale: one TradingView reversal alert can carry both gates and
+/// the worker decides whether *this* candle is a real close signal —
+/// either because we're inside a news window, or because price is at
+/// a marked S/R zone. Without either flag the close is unconditional
+/// (operator emergency-close path).
+///
+/// Both gates are evaluated even after one passes, so the log line
+/// records the full state and the outcome string can name every
+/// failed gate when none passes.
 async fn run_close<B: Broker>(
     broker: &B,
     store: &KvStateStore,
     verified: &incoming::Verified,
 ) -> ActionResult {
-    if matches!(verified.intent.require_news_window, Some(true)) {
-        let Some(tid) = verified.intent.trade_id.as_deref() else {
-            return ActionResult::Rejected {
-                response: Response::error(
-                    "close with require_news_window requires `trade_id`",
-                    400,
-                ),
-                outcome: "rejected: missing-trade-id".into(),
+    let news_outcome = match &verified.intent.require_news_window {
+        Some(true) => {
+            let Some(tid) = verified.intent.trade_id.as_deref() else {
+                return ActionResult::Rejected {
+                    response: Response::error(
+                        "close with require_news_window requires `trade_id`",
+                        400,
+                    ),
+                    outcome: "rejected: missing-trade-id".into(),
+                };
             };
-        };
-        match store.list_news_windows_for_trade(tid).await {
-            Ok(windows) if windows.is_empty() => {
-                console_log!(
-                    "close rejected: trade {tid} has no active news window (require_news_window: true)"
-                );
-                return ActionResult::Rejected {
-                    response: Response::error("no news window active", 423),
-                    outcome: "rejected: no-news-window".into(),
-                };
-            }
-            Ok(windows) => {
-                let names: Vec<String> = windows
-                    .iter()
-                    .map(|w| match &w.reason {
-                        Some(r) => format!("{}({r})", w.news_id),
-                        None => w.news_id.clone(),
-                    })
-                    .collect();
-                console_log!(
-                    "close gated by news window: trade {tid} active=[{}]",
-                    names.join(", ")
-                );
-            }
-            Err(err) => {
-                console_error!("KV list_news_windows_for_trade: {err}");
-                return ActionResult::Rejected {
-                    response: Response::error("state error", 500),
-                    outcome: "rejected: state-error".into(),
-                };
-            }
-        }
-    }
-    // require_price_in_ranges gate: reject the close unless the
-    // broker's current price for this instrument is inside at least
-    // one [lo, hi] band. Mirrors the news-window gate's shape but
-    // sources its input from the broker rather than KV. Set by the
-    // `07-close-on-sr-reversal` alert builder; absent means no
-    // positional gate (default).
-    if let Some(ranges) = verified.intent.require_price_in_ranges.as_deref() {
-        match broker.get_current_price(&verified.intent.instrument).await {
-            Ok(price) => {
-                let hit = price_band_hit(price, ranges);
-                match hit {
-                    Some([lo, hi]) => {
-                        console_log!(
-                            "close gated by price range: {} price={price} in [{lo}, {hi}]",
-                            verified.intent.instrument
-                        );
-                    }
-                    None => {
-                        console_log!(
-                            "close rejected: {} price={price} outside all bands {ranges:?}",
-                            verified.intent.instrument
-                        );
-                        return ActionResult::Rejected {
-                            response: Response::error("price out of range", 423),
-                            outcome: "rejected: price-out-of-range".into(),
-                        };
-                    }
+            match store.list_news_windows_for_trade(tid).await {
+                Ok(windows) if windows.is_empty() => GateOutcome::Failed("no-news-window"),
+                Ok(windows) => {
+                    let names: Vec<String> = windows
+                        .iter()
+                        .map(|w| match &w.reason {
+                            Some(r) => format!("{}({r})", w.news_id),
+                            None => w.news_id.clone(),
+                        })
+                        .collect();
+                    console_log!(
+                        "close news-window gate passed: trade {tid} active=[{}]",
+                        names.join(", ")
+                    );
+                    GateOutcome::Passed
+                }
+                Err(err) => {
+                    console_error!("KV list_news_windows_for_trade: {err}");
+                    return ActionResult::Rejected {
+                        response: Response::error("state error", 500),
+                        outcome: "rejected: state-error".into(),
+                    };
                 }
             }
+        }
+        _ => GateOutcome::NotSet,
+    };
+    let price_outcome = match verified.intent.require_price_in_ranges.as_deref() {
+        Some(ranges) => match broker.get_current_price(&verified.intent.instrument).await {
+            Ok(price) => match price_band_hit(price, ranges) {
+                Some([lo, hi]) => {
+                    console_log!(
+                        "close price-range gate passed: {} price={price} in [{lo}, {hi}]",
+                        verified.intent.instrument
+                    );
+                    GateOutcome::Passed
+                }
+                None => {
+                    console_log!(
+                        "close price-range gate failed: {} price={price} outside all bands {ranges:?}",
+                        verified.intent.instrument
+                    );
+                    GateOutcome::Failed("price-out-of-range")
+                }
+            },
             Err(err) => {
                 console_error!(
                     "broker get_current_price for {}: {err:?}",
@@ -485,14 +476,67 @@ async fn run_close<B: Broker>(
                     outcome: "rejected: price-fetch-failed".into(),
                 };
             }
+        },
+        None => GateOutcome::NotSet,
+    };
+    match evaluate_close_gates(news_outcome, price_outcome) {
+        GateDecision::Pass => {
+            let ok = broker.close_positions(&verified.intent.instrument).await;
+            if ok {
+                ActionResult::Ok("closed".into())
+            } else {
+                ActionResult::Failed("close-failed".into())
+            }
         }
+        GateDecision::Reject { reason_code } => ActionResult::Rejected {
+            response: Response::error("close gates not satisfied", 423),
+            outcome: format!("rejected: {reason_code}"),
+        },
     }
-    let ok = broker.close_positions(&verified.intent.instrument).await;
-    if ok {
-        ActionResult::Ok("closed".into())
-    } else {
-        ActionResult::Failed("close-failed".into())
+}
+
+/// Per-gate evaluation result. `Failed` carries a short reason code
+/// that lands in the outcome string when *no* set gate passes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GateOutcome {
+    /// Gate was not configured on this intent.
+    NotSet,
+    /// Gate was configured and its condition was met.
+    Passed,
+    /// Gate was configured and its condition was not met.
+    Failed(&'static str),
+}
+
+/// OR-composed gate decision. Used by [`run_close`] and unit tests.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum GateDecision {
+    /// At least one set gate passed (or no gates were set).
+    Pass,
+    /// One or more gates were set and all of them failed. The
+    /// `reason_code` joins each failing gate's short code with `|`
+    /// so an operator reading the seen index sees what was tried.
+    Reject { reason_code: String },
+}
+
+/// Compose per-gate outcomes into a single Pass/Reject decision using
+/// **OR** semantics: pass when no gates are set, pass when at least
+/// one set gate passed, reject only when every set gate failed.
+fn evaluate_close_gates(news: GateOutcome, price: GateOutcome) -> GateDecision {
+    let outcomes = [news, price];
+    let any_passed = outcomes.iter().any(|o| matches!(o, GateOutcome::Passed));
+    let any_set = outcomes.iter().any(|o| !matches!(o, GateOutcome::NotSet));
+    if any_passed || !any_set {
+        return GateDecision::Pass;
     }
+    let reason_code = outcomes
+        .iter()
+        .filter_map(|o| match o {
+            GateOutcome::Failed(code) => Some(*code),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("|");
+    GateDecision::Reject { reason_code }
 }
 
 /// Find the first `[lo, hi]` band in `ranges` that contains `price`
@@ -540,6 +584,90 @@ mod price_band_tests {
     #[test]
     fn empty_ranges_always_misses() {
         assert_eq!(price_band_hit(1.0, &[]), None);
+    }
+}
+
+#[cfg(test)]
+mod close_gate_tests {
+    use super::{GateDecision, GateOutcome, evaluate_close_gates};
+
+    #[test]
+    fn no_gates_set_passes() {
+        assert_eq!(
+            evaluate_close_gates(GateOutcome::NotSet, GateOutcome::NotSet),
+            GateDecision::Pass,
+        );
+    }
+
+    #[test]
+    fn single_news_gate_passing_passes() {
+        assert_eq!(
+            evaluate_close_gates(GateOutcome::Passed, GateOutcome::NotSet),
+            GateDecision::Pass,
+        );
+    }
+
+    #[test]
+    fn single_news_gate_failing_rejects_with_its_code() {
+        assert_eq!(
+            evaluate_close_gates(GateOutcome::Failed("no-news-window"), GateOutcome::NotSet),
+            GateDecision::Reject {
+                reason_code: "no-news-window".into(),
+            },
+        );
+    }
+
+    #[test]
+    fn single_price_gate_failing_rejects_with_its_code() {
+        assert_eq!(
+            evaluate_close_gates(
+                GateOutcome::NotSet,
+                GateOutcome::Failed("price-out-of-range"),
+            ),
+            GateDecision::Reject {
+                reason_code: "price-out-of-range".into(),
+            },
+        );
+    }
+
+    #[test]
+    fn both_gates_set_news_passes_price_fails_passes() {
+        assert_eq!(
+            evaluate_close_gates(
+                GateOutcome::Passed,
+                GateOutcome::Failed("price-out-of-range"),
+            ),
+            GateDecision::Pass,
+        );
+    }
+
+    #[test]
+    fn both_gates_set_news_fails_price_passes_passes() {
+        assert_eq!(
+            evaluate_close_gates(GateOutcome::Failed("no-news-window"), GateOutcome::Passed),
+            GateDecision::Pass,
+        );
+    }
+
+    #[test]
+    fn both_gates_set_both_pass_passes() {
+        assert_eq!(
+            evaluate_close_gates(GateOutcome::Passed, GateOutcome::Passed),
+            GateDecision::Pass,
+        );
+    }
+
+    #[test]
+    fn both_gates_set_both_fail_rejects_with_joined_codes() {
+        assert_eq!(
+            evaluate_close_gates(
+                GateOutcome::Failed("no-news-window"),
+                GateOutcome::Failed("price-out-of-range"),
+            ),
+            GateDecision::Reject {
+                reason_code: "no-news-window|price-out-of-range".into(),
+            },
+        );
     }
 }
 

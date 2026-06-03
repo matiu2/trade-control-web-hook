@@ -13,12 +13,16 @@ Trading:
 
 - `enter` — open a market, stop, or limit order with SL/TP, after passing the risk gate.
   Optionally gated on named `prep` / `veto` flags (see "Conditional entries" below).
-- `close` — close all positions for the instrument. May also carry one of two
-  worker-side gates: `require_news_window: true` (only fires inside an active
-  news window for the `trade_id`) or `require_price_in_ranges: [[lo, hi], ...]`
-  (only fires when the broker's current price sits inside at least one band).
-  Both are armed by `tv_arm_hs.py` for the `06-close-on-reversal` and
-  `07-close-on-sr-reversal` alerts respectively.
+- `close` — close all positions for the instrument. May also carry up to two
+  worker-side gates, **OR-composed**: `require_news_window: true` (passes when
+  an active news window exists for the `trade_id`) and/or
+  `require_price_in_ranges: [[lo, hi], ...]` (passes when the broker's current
+  price sits inside at least one band). The close reaches the broker as long
+  as *at least one* set gate passes — so a single reversal alert body can
+  carry both gates and the worker decides per-fire whether *this* candle is a
+  real close signal (we're inside a news window **or** price is at a marked
+  S/R zone). With neither flag set the close is unconditional (operator
+  emergency-close path).
 - `invalidate` — set a per-instrument cooldown (default 12 h) and cancel any pending
   orders. Use this when your setup is no longer valid (price drifted out of the
   expected range) and you want to be sure no entry fires while you sleep.
@@ -71,6 +75,14 @@ the Python side maps drawings to alerts by prefix.
 | `06-close-on-reversal` | `close` | Pine `Candle Signals` opposing reversal | Emitted only when news-pairs are drawn. Worker gates on an active `news:<trade_id>:*` KV entry — fires only inside news windows. |
 | `07-close-on-sr-reversal` | `close` | Pine `Candle Signals` opposing reversal | Emitted only when `support`/`resistance` lines are drawn. Worker gates on the broker's current price being inside one of the `[lo, hi]` bands. |
 
+Because the close gates are OR-composed (see `close` above), a single
+hand-signed body can carry **both** `require_news_window: true` and
+`require_price_in_ranges` and be wired to one TV alert on the
+opposing-reversal candle — closes when *either* condition holds. The
+current `build-trade` pipeline still emits 06 and 07 as separate alerts
+for backwards compatibility; collapsing them into one combined alert is
+recommended for new setups.
+
 Each news pair adds two more (`01-news-start-<id>` + `02-news-end-<id>`)
 via a separate `build-news` shell-out, and each pause pair adds
 `01-pause-<id>` + `02-resume-<id>` via `build-pause`.
@@ -94,7 +106,8 @@ The day-to-day loop, end to end:
    POSTs the cleartext signed YAML to the worker.
 4. **The worker verifies the HMAC**, runs replay protection (the `id`
    field), applies any relevant gates (preps must be set, vetos must be
-   clear, `require_news_window` / `require_price_in_ranges` for closes),
+   clear, `require_news_window` / `require_price_in_ranges` OR-composed
+   for closes),
    then dispatches to OANDA or TradeNation. Outcomes are visible in
    Cloudflare Real-time Logs and via `trade-control status`.
 5. **The scheduled `cron` trigger** (`*/15 * * * *`, declared in
