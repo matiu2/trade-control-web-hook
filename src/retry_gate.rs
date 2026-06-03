@@ -795,6 +795,7 @@ mod tests {
             trade_id: Some("trade-xyz".into()),
             max_retries,
             allow_entry: None,
+            allow_close: None,
             needs_golden: false,
             blackout_id: None,
             news_id: None,

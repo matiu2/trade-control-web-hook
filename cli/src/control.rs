@@ -53,6 +53,7 @@ fn control_skeleton(action: Action, instrument: &str, id: String, now: DateTime<
         trade_id: None,
         max_retries: trade_control_core::tunable::Tunable::Static(0),
         allow_entry: None,
+        allow_close: None,
         needs_golden: false,
         blackout_id: None,
         news_id: None,

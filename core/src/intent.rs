@@ -461,6 +461,23 @@ pub struct Intent {
     /// to pre-`allow_entry` intents.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub allow_entry: Option<crate::tunable::Tunable<bool>>,
+    /// Optional Rhai gate on `close`, symmetric with [`Self::allow_entry`].
+    /// When set, the worker resolves the [`Tunable<bool>`] (Static or
+    /// `!script`) **after** the contextual-window gate ([`Self::inside_window`])
+    /// and the candle-quality gates ([`Self::needs_golden`] /
+    /// [`Self::needs_confirmed`]); a `false` evaluation rejects the close
+    /// with 412. Semantics are AND with every other Close gate — `allow_close`
+    /// can only *tighten* the dispatch, never widen it.
+    ///
+    /// Resolved against the shell-anchor scope only (no resolved geometry
+    /// — closes don't compute SL/TP). Scripts can reference any field
+    /// bound by `crate::rules::bind_shell_anchors` plus the `pct` / `pips`
+    /// helpers. Returning non-bool is a 412.
+    ///
+    /// Default-absent = unconditional allow; byte-identical wire form to
+    /// pre-feature intents. Validated to be Close-only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allow_close: Option<crate::tunable::Tunable<bool>>,
     /// When true, the worker rejects the action unless the incoming shell
     /// carries `golden: Some(true)`. AND-composed with [`Self::allow_entry`]
     /// (Enter) / [`Self::allow_close`] (Close) — both gates must pass.
@@ -661,6 +678,9 @@ pub enum IntentValidationError {
     /// `allow_entry: Some(_)` on a non-Enter action — the gate is
     /// only checked on `enter`.
     AllowEntryOnNonEnter,
+    /// `allow_close: Some(_)` on a non-Close action — the gate is
+    /// only checked on `close`. Symmetric with [`Self::AllowEntryOnNonEnter`].
+    AllowCloseOnNonClose,
     /// `needs_golden: true` on an action other than Enter or Close — the
     /// gate only runs on those two paths. Promoted from "Enter-only" on
     /// 2026-06-03 so the consolidated reversal close can require a
@@ -728,6 +748,7 @@ impl core::fmt::Display for IntentValidationError {
             }
             Self::MaxRetriesOnNonEnter => f.write_str("max_retries is only valid on action: enter"),
             Self::AllowEntryOnNonEnter => f.write_str("allow_entry is only valid on action: enter"),
+            Self::AllowCloseOnNonClose => f.write_str("allow_close is only valid on action: close"),
             Self::NeedsGoldenOnDisallowedAction => {
                 f.write_str("needs_golden is only valid on action: enter | close")
             }
@@ -800,6 +821,9 @@ impl Intent {
         }
         if self.allow_entry.is_some() && self.action != Action::Enter {
             return Err(IntentValidationError::AllowEntryOnNonEnter);
+        }
+        if self.allow_close.is_some() && self.action != Action::Close {
+            return Err(IntentValidationError::AllowCloseOnNonClose);
         }
         // needs_golden / needs_confirmed: both check the shell at gate
         // time, both meaningful on Enter (entry-quality filter) and Close
@@ -2559,6 +2583,52 @@ mod tests {
             intent.validate(),
             Err(IntentValidationError::AllowEntryOnNonEnter)
         );
+    }
+
+    #[test]
+    fn validate_rejects_allow_close_on_non_close_action() {
+        // Symmetric guard with the Enter-side variant: `allow_close`
+        // only runs on the Close path, so allowing it on Enter / Prep
+        // would be silently ignored at the worker.
+        let yaml = "
+            v: 1
+            id: ac-enter
+            not_after: \"2026-05-13T20:00:00Z\"
+            action: enter
+            instrument: EUR_USD
+            direction: long
+            entry: { type: market }
+            stop_loss: { from: low, offset_pips: -2 }
+            take_profit: { from: close, offset_r: 2.0 }
+            allow_close: true
+        ";
+        let intent: Intent = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(
+            intent.validate(),
+            Err(IntentValidationError::AllowCloseOnNonClose)
+        );
+    }
+
+    #[test]
+    fn allow_close_round_trips_through_yaml() {
+        // Static-bool form lands as Tunable::Static; the script form
+        // exercises the same path that allow_entry already does so we
+        // don't repeat that test here.
+        let yaml = "
+            v: 1
+            id: ac-1
+            not_after: \"2026-05-13T20:00:00Z\"
+            action: close
+            instrument: EUR_USD
+            trade_id: t-1
+            allow_close: true
+        ";
+        let intent: Intent = serde_yaml::from_str(yaml).unwrap();
+        intent.validate().expect("close + allow_close valid");
+        match intent.allow_close {
+            Some(crate::tunable::Tunable::Static(true)) => {}
+            other => panic!("expected Static(true) allow_close, got {other:?}"),
+        }
     }
 
     #[test]

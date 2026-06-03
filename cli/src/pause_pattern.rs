@@ -256,6 +256,7 @@ fn build_pause_intent(
         trade_id: Some(spec.trade_id.clone()),
         max_retries: trade_control_core::tunable::Tunable::Static(0),
         allow_entry: None,
+        allow_close: None,
         needs_golden: false,
         blackout_id: Some(blackout_id.to_string()),
         news_id: None,

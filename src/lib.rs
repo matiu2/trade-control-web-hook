@@ -1,7 +1,9 @@
 mod accounts;
 mod admin;
 mod adopt;
+mod allow_close_gate;
 mod allow_entry_gate;
+mod candle_gate;
 mod cron;
 mod diag;
 mod retry_gate;
@@ -458,69 +460,95 @@ async fn run_action<B: Broker>(
     }
 }
 
-/// Dispatch a `Close` intent. Up to two independent gates may be set
-/// on the intent, evaluated **OR-composed**: the close reaches the
-/// broker as long as *at least one* set gate passes.
+/// Dispatch a `Close` intent. The close reaches the broker only when
+/// **every** layer of gating agrees:
 ///
-/// - `require_news_window: true` — passes when an active news window
-///   exists for `trade_id` in KV (the news-start/end pair).
-/// - `require_price_in_ranges: Some(ranges)` — passes when the
-///   broker's current price for the instrument sits inside at least
-///   one `[lo, hi]` band (chart-drawn support/resistance levels).
+/// 1. **Contextual window** (OR-composed) — the close is "at a real
+///    reversal point". Up to two windows may be listed; *at least one*
+///    must pass.
+///      - News window — an active `news:<trade_id>:<news_id>` pair.
+///      - Price window — broker's current price sits inside one of
+///        `price_bands`.
 ///
-/// Rationale: one TradingView reversal alert can carry both gates and
-/// the worker decides whether *this* candle is a real close signal —
-/// either because we're inside a news window, or because price is at
-/// a marked S/R zone. Without either flag the close is unconditional
-/// (operator emergency-close path).
+///    The new wire form is `inside_window: [news, price]` +
+///    `price_bands: [[lo, hi]]`. The deprecated form
+///    (`require_news_window` + `require_price_in_ranges`) is still
+///    accepted; validation guarantees an intent only carries one form.
+/// 2. **Candle quality** (AND-composed) — `needs_golden` and
+///    `needs_confirmed` shell-checks. Promoted to typed fields so the
+///    consolidated reversal close can require a golden / confirmed
+///    candle without dropping into Rhai.
+/// 3. **`allow_close` script** (AND-composed) — operator's Tunable<bool>
+///    sees the shell-anchor scope (same scope `allow_entry` sees, minus
+///    derived geometry — closes don't compute SL/TP).
 ///
-/// Both gates are evaluated even after one passes, so the log line
-/// records the full state and the outcome string can name every
-/// failed gate when none passes.
+/// Both contextual gates are evaluated even after one passes, so the
+/// log line records the full state and the outcome string can name
+/// every failed gate when none passes.
 async fn run_close<B: Broker>(
     broker: &B,
     store: &KvStateStore,
     verified: &incoming::Verified,
 ) -> ActionResult {
-    let news_outcome = match &verified.intent.require_news_window {
-        Some(true) => {
-            let Some(tid) = verified.intent.trade_id.as_deref() else {
-                return ActionResult::Rejected {
-                    response: Response::error(
-                        "close with require_news_window requires `trade_id`",
-                        400,
-                    ),
-                    outcome: "rejected: missing-trade-id".into(),
-                };
+    // News window. Old form: `require_news_window: Some(true)`. New
+    // form: `inside_window` contains `News`. Mutual exclusion is
+    // enforced at validate time, so at most one branch fires.
+    let want_news = verified.intent.require_news_window == Some(true)
+        || verified
+            .intent
+            .inside_window
+            .contains(&trade_control_core::intent::EventWindow::News);
+    let news_outcome = if want_news {
+        let Some(tid) = verified.intent.trade_id.as_deref() else {
+            return ActionResult::Rejected {
+                response: Response::error("close with news-window gate requires `trade_id`", 400),
+                outcome: "rejected: missing-trade-id".into(),
             };
-            match store.list_news_windows_for_trade(tid).await {
-                Ok(windows) if windows.is_empty() => GateOutcome::Failed("no-news-window"),
-                Ok(windows) => {
-                    let names: Vec<String> = windows
-                        .iter()
-                        .map(|w| match &w.reason {
-                            Some(r) => format!("{}({r})", w.news_id),
-                            None => w.news_id.clone(),
-                        })
-                        .collect();
-                    console_log!(
-                        "close news-window gate passed: trade {tid} active=[{}]",
-                        names.join(", ")
-                    );
-                    GateOutcome::Passed
-                }
-                Err(err) => {
-                    console_error!("KV list_news_windows_for_trade: {err}");
-                    return ActionResult::Rejected {
-                        response: Response::error("state error", 500),
-                        outcome: "rejected: state-error".into(),
-                    };
-                }
+        };
+        match store.list_news_windows_for_trade(tid).await {
+            Ok(windows) if windows.is_empty() => GateOutcome::Failed("no-news-window"),
+            Ok(windows) => {
+                let names: Vec<String> = windows
+                    .iter()
+                    .map(|w| match &w.reason {
+                        Some(r) => format!("{}({r})", w.news_id),
+                        None => w.news_id.clone(),
+                    })
+                    .collect();
+                console_log!(
+                    "close news-window gate passed: trade {tid} active=[{}]",
+                    names.join(", ")
+                );
+                GateOutcome::Passed
+            }
+            Err(err) => {
+                console_error!("KV list_news_windows_for_trade: {err}");
+                return ActionResult::Rejected {
+                    response: Response::error("state error", 500),
+                    outcome: "rejected: state-error".into(),
+                };
             }
         }
-        _ => GateOutcome::NotSet,
+    } else {
+        GateOutcome::NotSet
     };
-    let price_outcome = match verified.intent.require_price_in_ranges.as_deref() {
+    // Price window. Old form: `require_price_in_ranges: Some(ranges)`.
+    // New form: `inside_window` contains `Price` (with bands in
+    // `price_bands`). Validation guarantees `price_bands` is non-empty
+    // exactly when `inside_window` lists Price.
+    let price_ranges: Option<&[[f64; 2]]> = match verified.intent.require_price_in_ranges.as_deref()
+    {
+        Some(ranges) => Some(ranges),
+        None if verified
+            .intent
+            .inside_window
+            .contains(&trade_control_core::intent::EventWindow::Price) =>
+        {
+            Some(verified.intent.price_bands.as_slice())
+        }
+        None => None,
+    };
+    let price_outcome = match price_ranges {
         Some(ranges) => match broker.get_current_price(&verified.intent.instrument).await {
             Ok(price) => match price_band_hit(price, ranges) {
                 Some([lo, hi]) => {
@@ -551,19 +579,65 @@ async fn run_close<B: Broker>(
         },
         None => GateOutcome::NotSet,
     };
-    match evaluate_close_gates(news_outcome, price_outcome) {
-        GateDecision::Pass => {
-            let ok = broker.close_positions(&verified.intent.instrument).await;
-            if ok {
-                ActionResult::Ok("closed".into())
-            } else {
-                ActionResult::Failed("close-failed".into())
-            }
-        }
-        GateDecision::Reject { reason_code } => ActionResult::Rejected {
+    // Contextual gate (OR-composed).
+    if let GateDecision::Reject { reason_code } = evaluate_close_gates(news_outcome, price_outcome)
+    {
+        return ActionResult::Rejected {
             response: Response::error("close gates not satisfied", 423),
             outcome: format!("rejected: {reason_code}"),
-        },
+        };
+    }
+    // Candle quality + allow_close script (AND-composed with the
+    // contextual gate). Pulled into `allow_close_gate::evaluate` so the
+    // gate-mapping logic lives next to the entry-side analogue.
+    match allow_close_gate::evaluate(&verified.intent, &verified.shell) {
+        allow_close_gate::AllowCloseOutcome::Proceed => {}
+        allow_close_gate::AllowCloseOutcome::Blocked => {
+            console_log!(
+                "close rejected: allow_close returned false (id={})",
+                verified.intent.id
+            );
+            return ActionResult::Rejected {
+                response: Response::error("close blocked", 412),
+                outcome: "rejected: allow-close-false".into(),
+            };
+        }
+        allow_close_gate::AllowCloseOutcome::NeedsGoldenUnmet => {
+            console_log!(
+                "close rejected: needs_golden set but shell.golden != Some(true) (id={})",
+                verified.intent.id
+            );
+            return ActionResult::Rejected {
+                response: Response::error("close blocked: needs-golden", 412),
+                outcome: "rejected: needs-golden".into(),
+            };
+        }
+        allow_close_gate::AllowCloseOutcome::NeedsConfirmedUnmet => {
+            console_log!(
+                "close rejected: needs_confirmed set but shell.signal_confirmed != Some(true) (id={})",
+                verified.intent.id
+            );
+            return ActionResult::Rejected {
+                response: Response::error("close blocked: needs-confirmed", 412),
+                outcome: "rejected: needs-confirmed".into(),
+            };
+        }
+        allow_close_gate::AllowCloseOutcome::ScriptError { kind, message } => {
+            console_error!(
+                "allow_close script error (id={}): {message}",
+                verified.intent.id
+            );
+            return ActionResult::Rejected {
+                response: Response::error("close blocked: script error", 412),
+                outcome: format!("rejected: allow-close-{kind}"),
+            };
+        }
+    }
+    let ok = broker.close_positions(&verified.intent.instrument).await;
+    if ok {
+        ActionResult::Ok("closed".into())
+    } else {
+        ActionResult::Failed("close-failed".into())
     }
 }
 
@@ -975,6 +1049,16 @@ async fn run_enter<B: Broker>(
             return ActionResult::Rejected {
                 response: Response::error("entry blocked: needs-golden", 412),
                 outcome: "rejected: needs-golden".into(),
+            };
+        }
+        allow_entry_gate::AllowEntryOutcome::NeedsConfirmedUnmet => {
+            console_log!(
+                "entry rejected: needs_confirmed set but shell.signal_confirmed != Some(true) (id={})",
+                verified.intent.id
+            );
+            return ActionResult::Rejected {
+                response: Response::error("entry blocked: needs-confirmed", 412),
+                outcome: "rejected: needs-confirmed".into(),
             };
         }
         allow_entry_gate::AllowEntryOutcome::ScriptError { kind, message } => {
@@ -2308,6 +2392,7 @@ mod dispatcher_outcome_tests {
                 trade_id: Some("hs-chf-jpy-test".into()),
                 max_retries: Tunable::Static(0),
                 allow_entry: None,
+                allow_close: None,
                 needs_golden: false,
                 blackout_id: None,
                 news_id: None,

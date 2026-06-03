@@ -13,6 +13,8 @@
 use trade_control_core::intent::{Intent, Resolved, Shell};
 use trade_control_core::rules::{self, RuleError};
 
+use crate::candle_gate::{self, CandleGateOutcome};
+
 /// Outcome of the allow_entry gate. Maps 1:1 onto the worker's
 /// `ActionResult` after the caller adds the intent id to the rejection
 /// log line.
@@ -27,6 +29,11 @@ pub enum AllowEntryOutcome {
     /// Distinct from `Blocked` so the rejection log makes the cause
     /// obvious without the operator having to read a script.
     NeedsGoldenUnmet,
+    /// `needs_confirmed` was set on the intent but the incoming shell
+    /// did not carry `signal_confirmed: Some(true)`. 412 "entry blocked:
+    /// needs-confirmed". Distinct from `NeedsGoldenUnmet` so the
+    /// rejection log distinguishes the two candle-quality checks.
+    NeedsConfirmedUnmet,
     /// Script error. 412 "entry blocked: script error".
     ScriptError {
         /// Short label for the rejection-outcome telemetry string
@@ -40,16 +47,20 @@ pub enum AllowEntryOutcome {
 
 /// Run the gate. Caller logs / maps the outcome to an HTTP response.
 ///
-/// Order: `needs_golden` is checked first (cheap, no scripting), then
-/// the `allow_entry` script. Both gates must pass — semantics are AND.
+/// Order: the typed candle-quality checks (`needs_golden`,
+/// `needs_confirmed`) run first via the shared [`candle_gate`] helper
+/// (cheap, no Rhai), then the `allow_entry` script. All three gates
+/// must pass — semantics are AND.
 pub fn evaluate(
     intent: &Intent,
     shell: &Shell,
     resolved: &Resolved,
     pip_size: f64,
 ) -> AllowEntryOutcome {
-    if intent.needs_golden && shell.golden != Some(true) {
-        return AllowEntryOutcome::NeedsGoldenUnmet;
+    match candle_gate::evaluate(intent, shell) {
+        CandleGateOutcome::Proceed => {}
+        CandleGateOutcome::NeedsGoldenUnmet => return AllowEntryOutcome::NeedsGoldenUnmet,
+        CandleGateOutcome::NeedsConfirmedUnmet => return AllowEntryOutcome::NeedsConfirmedUnmet,
     }
     let Some(gate) = &intent.allow_entry else {
         return AllowEntryOutcome::Proceed;
@@ -160,6 +171,7 @@ mod tests {
             trade_id: None,
             max_retries: trade_control_core::tunable::Tunable::Static(0),
             allow_entry: gate,
+            allow_close: None,
             needs_golden: false,
             blackout_id: None,
             news_id: None,

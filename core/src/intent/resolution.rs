@@ -497,6 +497,7 @@ mod tests {
             trade_id: None,
             max_retries: crate::tunable::Tunable::Static(0),
             allow_entry: None,
+            allow_close: None,
             needs_golden: false,
             blackout_id: None,
             news_id: None,
