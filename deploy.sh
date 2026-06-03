@@ -13,7 +13,13 @@ cd "$(dirname "$0")"
 echo "==> Deploying worker via wrangler"
 wrangler deploy
 
+echo "==> Installing cli CLI from ./cli"
+cargo install --path cli
+
 echo "==> Installing tv-news CLI from ./tv-news"
 cargo install --path tv-news
+
+echo "==> Installing tv-arm CLI from ./tv-arm"
+cargo install --path tv-arm
 
 echo "==> Done"
