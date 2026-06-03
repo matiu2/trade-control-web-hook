@@ -28,23 +28,70 @@ again, up to `max_retries` total placements.
 What "retry" is **not**:
 
 - Not a retry of broker placement errors. A failed `place_order`
-  returns 502 and terminates that intent id — the next fire of the
-  same alert body 409s on `is_seen` at the top-level dispatcher
-  (`src/lib.rs::is_seen` check), never reaches the retry gate.
+  returns 502 and does **not** mark the id seen — the next fire of
+  the same alert body is allowed through (see "Replay protection
+  scope" below). This was different before the 2026-06 fix; older
+  worker versions wrote `mark_seen` on every dispatcher outcome
+  including failures, which silently broke within-window legitimate
+  refires.
 - Not a retry of pre-broker rejections (veto, cooldown,
   `allow_entry` script failures). Those don't burn an `EntryAttempt`
-  slot at all.
-- Not a way to refire the same alert payload. Top-level intent-id
-  dedup applies first; multi-shot needs distinct intent ids per fire
-  (which `build-trade` mints for multi-shot setups, not for
-  single-shot).
+  slot at all, and as of the same 2026-06 fix they don't poison the
+  intent id either.
+- Not a way to refire the same alert payload after a *successful*
+  entry. Top-level intent-id dedup still applies on `Ok` outcomes —
+  multi-shot needs distinct intent ids per fire (which `build-trade`
+  mints for multi-shot setups, not for single-shot).
+
+### Replay protection scope
+
+The intent-id seen index (`is_seen` / `mark_seen`) covers two
+distinct cases with different semantics — keep them straight:
+
+1. **Entry-bearing actions** (`Enter`, `Close`, `Invalidate`,
+   escalated `Veto`) — `mark_seen` is written **only on
+   `ActionResult::Ok`**. `Failed` (broker error → 502) and every
+   flavour of `Rejected` (gate failure, validation, state error)
+   are logged via `console_log!` / `tracing::info!` for post-mortem
+   visibility but deliberately do **not** consume the intent id.
+   The next fire of the same alert body is allowed through.
+   Implemented by `record_dispatcher_outcome` →
+   `seen_decision` in `src/lib.rs`.
+
+2. **Control actions** (`prep`, level-1 `veto`, `pause`, `resume`,
+   `clear-prep`, `clear-veto`, `status`, `news-start`, `news-end`,
+   `unlock`) — `mark_seen` is written on **every** completion via
+   the `record_seen` helper. These are state-set ops where
+   idempotency is legitimate (a replayed `prep` message shouldn't
+   double-refresh the TTL).
+
+**Why this matters.** A real incident on 2026-06-02 (CHF/JPY): an
+`enter` alert fired 6 times in a 9h window. Fire 4 reached the worker
+post-parse-fix, was correctly rejected with `rejected: missing-prep
+(break-and-close)` because the prep alert had not fired yet — and
+the old "every outcome marks seen" rule poisoned the intent id for
+the remaining ~47h of the alert window. Fires 5
+(`signal_confirmed=1`, the entry the operator wanted) and 6 both
+409'd on `is_seen` at `src/lib.rs:154` before reaching the
+`allow_entry` script gate. Operator entered the trade manually.
+
+Pattern an unwary refactorer might fall back into: "let's mark seen
+on every dispatcher outcome too, for visibility in `status`." Don't.
+The cost of poisoning legitimate retryable rejections far outweighs
+the visibility gain — and gate rejections are already visible in
+Cloudflare Real-time Logs via the `console_log!` line in
+`log_skip`.
 
 If you find yourself looking at a 409 on an `enter` and wondering
 "but the prior fires all failed — why didn't the retry gate let it
-through", remember: that gate isn't the layer you're hitting. You're
-hitting `is_seen` on the intent id, several hundred lines earlier in
-the dispatcher. See `src/retry_gate.rs`'s module doc for the full
-rules.
+through", remember: the *seen-id replay check* and the *retry gate*
+are two different things. With the 2026-06 fix in place, failures
+no longer poison the id at all — so a 409 on an `enter` now means
+**a prior fire of this id succeeded** (entered, closed, etc).
+Before that fix, a 409 could just mean "we logged some prior
+non-Ok outcome." If you're still seeing surprising 409s post-fix,
+look at the *latest* recorded outcome via `trade-control status` to
+see what the prior successful fulfilment actually was.
 
 ### tv_arm_hs.py: server-side trendline-cross eval is anchor-bounded
 

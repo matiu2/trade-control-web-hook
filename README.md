@@ -217,8 +217,15 @@ would otherwise fill straight into the take-profit. This is the same
 gate that protects the absolute-price flow when the trigger candle
 moves past one of your fixed levels.
 
-`id` is the **replay-protection key** — the worker remembers each id it's
-fulfilled until just past `not_after`. Use a unique id per intended trade.
+`id` is the **replay-protection key** — the worker remembers each id it
+**successfully fulfilled** until just past `not_after`. Gate rejections
+(missing prep, active veto, `allow_entry` script returning false,
+cooldown, paused, etc.) and broker failures do **not** consume the id —
+the same alert can refire and try again. Successful entries, completed
+closes, and accepted state-set actions (prep, veto, pause, news-*,
+clear-*, unlock) all consume the id, so byte-identical replays of those
+return 409 instead of executing twice. Use a unique id per intended
+trade.
 
 ## Conditional entries (preps + vetos)
 
