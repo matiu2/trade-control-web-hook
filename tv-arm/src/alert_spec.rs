@@ -93,8 +93,10 @@ pub enum AlertPayload {
         message: String,
     },
     /// Pine-indicator-bound (the alert listens to an
-    /// `alertcondition()` plot — used for `05-enter`,
-    /// `06-close-on-reversal`, `07-close-on-sr-reversal`).
+    /// `alertcondition()` plot — used for `05-enter` and
+    /// `06-close-on-reversal`). The legacy
+    /// `07-close-on-sr-reversal` basename also lands here on the
+    /// off chance an old hand-crafted alert is still in flight.
     PineAlertcondition {
         indicator_name: String,
         alert_cond_id: String,
@@ -252,12 +254,14 @@ pub fn build_alert_spec(
             Frequency::OnBarClose,
             tv_name,
         )),
-        AlertBasename::CloseOnReversal => Some(pine_payload(
-            reversal_close_plot_for(direction),
-            Frequency::OnBarClose,
-            tv_name,
-        )),
-        AlertBasename::CloseOnSrReversal => Some(pine_payload(
+        // `CloseOnSrReversal` is the legacy split-form basename;
+        // the CLI no longer emits it (the consolidated
+        // `06-close-on-reversal` carries both news and S/R gates in
+        // one alert via `inside_window` + `price_bands`). The arm
+        // stays so the match is exhaustive and so any hand-crafted
+        // legacy alert routed through tv-arm still dispatches to
+        // the same Pine plot.
+        AlertBasename::CloseOnReversal | AlertBasename::CloseOnSrReversal => Some(pine_payload(
             reversal_close_plot_for(direction),
             Frequency::OnBarClose,
             tv_name,

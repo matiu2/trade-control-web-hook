@@ -58,8 +58,10 @@ pub struct Roles {
     pub blackout_pairs: Vec<(Drawing, Drawing)>,
     /// Chronologically paired news-window pairs.
     pub news_pairs: Vec<(Drawing, Drawing)>,
-    /// Support / resistance horizontal lines for the
-    /// `07-close-on-sr-reversal` alert.
+    /// Support / resistance horizontal lines. Each one contributes
+    /// an `[lo, hi]` price band to the consolidated
+    /// `06-close-on-reversal` alert (`inside_window` gets `price`
+    /// added; `price_bands` carries the bands).
     pub sr_levels: Vec<Drawing>,
 }
 
