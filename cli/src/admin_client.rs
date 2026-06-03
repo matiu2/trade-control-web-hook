@@ -11,9 +11,27 @@
 use std::time::Duration;
 
 use color_eyre::eyre::{Result, eyre};
+use serde::Serialize;
 use trade_control_core::account::AccountMetadata;
+use trade_control_core::intent::Direction;
 
 const ADMIN_KEY_HEADER: &str = "X-Admin-Key";
+
+/// Body shape for `POST /admin/adopt-trade`. Mirrors the worker-side
+/// `AdoptRequest` (kept in `src/adopt.rs` on the worker). Duplicated
+/// here rather than shared via a new crate — the wire format is small
+/// and a copy in each direction is easier to read than a new dep.
+#[derive(Debug, Clone, Serialize)]
+pub struct AdoptBody {
+    pub account: String,
+    pub trade_id: String,
+    pub instrument: String,
+    pub direction: Direction,
+    pub broker_order_id: String,
+    pub broker_trade_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stop_loss_price: Option<f64>,
+}
 
 /// Build a `reqwest::blocking::Client` with a 30s timeout — same as
 /// the encrypted-control client. Sharing the constant keeps timeout
@@ -70,6 +88,22 @@ pub fn delete_account(endpoint: &str, admin_key: &str, name: &str) -> Result<Str
         .header(ADMIN_KEY_HEADER, admin_key)
         .send()
         .map_err(|e| eyre!("DELETE /admin/accounts/{name}: {e}"))?;
+    consume(resp)
+}
+
+/// `POST /admin/adopt-trade` — register an externally-opened broker
+/// position so the worker manages it from here on. Returns the
+/// echoed YAML on success.
+pub fn adopt_trade(endpoint: &str, admin_key: &str, body: &AdoptBody) -> Result<String> {
+    let json = serde_json::to_string(body).map_err(|e| eyre!("encode adopt body: {e}"))?;
+    let client = http_client()?;
+    let resp = client
+        .post(url(endpoint, "/admin/adopt-trade"))
+        .header(ADMIN_KEY_HEADER, admin_key)
+        .header("content-type", "application/json")
+        .body(json)
+        .send()
+        .map_err(|e| eyre!("POST /admin/adopt-trade: {e}"))?;
     consume(resp)
 }
 

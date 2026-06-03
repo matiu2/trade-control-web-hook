@@ -1,5 +1,6 @@
 mod accounts;
 mod admin;
+mod adopt;
 mod allow_entry_gate;
 mod cron;
 mod diag;
@@ -245,9 +246,13 @@ async fn route_admin(req: &mut Request, env: &Env, path: &str) -> Result<Respons
     // POST /admin/accounts                      — add (body)
     // DELETE /admin/accounts/<name>             — remove
     // POST   /admin/accounts/<name>/test        — verify creds
+    // POST   /admin/adopt-trade                 — adopt a broker-side trade
     let method = req.method();
     if method == Method::Post && path == "/admin/accounts" {
         return admin::handle_add(req, env).await;
+    }
+    if method == Method::Post && path == "/admin/adopt-trade" {
+        return admin::handle_adopt(req, env).await;
     }
     if let Some(rest) = path.strip_prefix("/admin/accounts/")
         && !rest.is_empty()

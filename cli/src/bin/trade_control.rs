@@ -22,22 +22,23 @@ use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use clap_complete::{Shell, generate};
 use color_eyre::eyre::{Context, Result, eyre};
 use trade_control_cli::{
-    CalendarBarsArgs, KEY_LEN, TradePattern, add_account, build_clear_prep_intent,
-    build_clear_veto_intent, build_news_from_spec, build_pause_from_spec, build_prep_intent,
-    build_status_intent, build_trade_from_spec, build_trade_interactive, build_unlock_intent,
-    build_veto_intent, delete_account, delete_secret, fill_missing_fields, generate_key_hex,
-    list_accounts, load_cache, load_news_spec_from_file, load_pause_spec_from_file,
-    load_spec_from_file, pick_pattern_interactive, pick_template_interactive,
-    prompt_save_as_template, put_secret, record_account_use, record_prep_use, record_veto_use,
-    require_local_tn_account, run_calendar_bars, secret_binding_for, test_account,
-    validate_instrument, wrap_signed, wrap_signed_template, write_news, write_pause, write_trade,
+    AdoptBody, CalendarBarsArgs, KEY_LEN, TradePattern, add_account, adopt_trade,
+    build_clear_prep_intent, build_clear_veto_intent, build_news_from_spec, build_pause_from_spec,
+    build_prep_intent, build_status_intent, build_trade_from_spec, build_trade_interactive,
+    build_unlock_intent, build_veto_intent, delete_account, delete_secret, fill_missing_fields,
+    generate_key_hex, list_accounts, load_cache, load_news_spec_from_file,
+    load_pause_spec_from_file, load_spec_from_file, pick_pattern_interactive,
+    pick_template_interactive, prompt_save_as_template, put_secret, record_account_use,
+    record_prep_use, record_veto_use, require_local_tn_account, run_calendar_bars,
+    secret_binding_for, test_account, validate_instrument, wrap_signed, wrap_signed_template,
+    write_news, write_pause, write_trade,
 };
 use trade_control_core::account::{
     AccountKind, AccountMetadata, Credentials, TradeNationCreds, TradeNationKind,
 };
 use trade_control_core::incoming::signed_pairs_from_text;
 use trade_control_core::intent::Intent;
-use trade_control_core::intent::{BrokerKind, VetoLevel};
+use trade_control_core::intent::{BrokerKind, Direction, VetoLevel};
 use trade_control_core::sig::{self, SIG_FIELD};
 
 #[derive(Parser)]
@@ -82,6 +83,15 @@ enum Cmd {
     /// wraps `wrangler secret put` for the credential half.
     #[command(subcommand)]
     Account(AccountCmd),
+    /// Adopt an externally-opened broker position into worker
+    /// management. Posts to `/admin/adopt-trade`; the worker verifies
+    /// the position against the live broker before writing the
+    /// `EntryAttempt` row. After adopt, every other worker path
+    /// (close, pause/resume, retry-gate, SL-breach sweep) treats the
+    /// trade as if the worker had placed it itself. Use after opening
+    /// a trade manually in the broker UI when you want the webhook
+    /// lifecycle to run against it.
+    AdoptTrade(AdoptTradeArgs),
     /// Build a multi-alert trade from a chart pattern (H&S, IH&S, M, W).
     /// Runs a questionnaire, mints a shared `trade_id`, and emits 5
     /// signed alert YAMLs plus a manifest into the output directory.
@@ -254,6 +264,62 @@ struct AccountTestArgs {
     name: String,
     #[command(flatten)]
     common: AccountEndpointArgs,
+}
+
+#[derive(Parser)]
+struct AdoptTradeArgs {
+    /// Worker account name the position lives under, e.g.
+    /// `tn-reversals-demo`. Must already be registered via
+    /// `account add`.
+    #[arg(long)]
+    account: String,
+    /// Trade grouping id minted by the original alert pipeline (e.g.
+    /// `hs-chf-jpy-efd5e647`). The string from the `build-trade`
+    /// manifest. Subsequent close / pause / news alerts for this
+    /// trade must use the same id.
+    #[arg(long)]
+    trade_id: String,
+    /// Broker market name as displayed by the broker UI, e.g.
+    /// `CHF/JPY` or `Spot Gold`. Matched case-insensitively against
+    /// the live position's `MarketName`.
+    #[arg(long)]
+    instrument: String,
+    /// Trade direction: `long` (broker Buy) or `short` (broker Sell).
+    #[arg(long, value_enum)]
+    direction: DirectionArg,
+    /// Originating order id from the broker UI (TradeNation shows
+    /// it as `Add Order` on the trade detail panel).
+    #[arg(long)]
+    order_id: String,
+    /// Open position id from the broker UI (`Open Position`).
+    /// On TradeNation this is distinct from the order id; on OANDA
+    /// they happen to be equal.
+    #[arg(long)]
+    position_id: String,
+    /// Resolved stop-loss price. Optional, but recommended — without
+    /// it the cron SL-breach sweep can't act on the adopted trade.
+    #[arg(long)]
+    stop_loss: Option<f64>,
+    #[command(flatten)]
+    common: AccountEndpointArgs,
+}
+
+/// Clap-side mirror of [`Direction`]. Same pattern as
+/// [`BrokerKindArg`] — keeps the `clap` derive out of `core`.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
+#[clap(rename_all = "lowercase")]
+enum DirectionArg {
+    Long,
+    Short,
+}
+
+impl From<DirectionArg> for Direction {
+    fn from(v: DirectionArg) -> Self {
+        match v {
+            DirectionArg::Long => Direction::Long,
+            DirectionArg::Short => Direction::Short,
+        }
+    }
 }
 
 /// Clap-side mirror of [`BrokerKind`]. Same pattern as
@@ -534,6 +600,7 @@ fn main() -> Result<()> {
         Cmd::ClearVeto(args) => run_clear_veto(args)?,
         Cmd::Verify(args) => run_verify(args)?,
         Cmd::Account(sub) => run_account(sub)?,
+        Cmd::AdoptTrade(args) => run_adopt_trade(args)?,
         Cmd::BuildTrade(args) => run_build_trade(args)?,
         Cmd::BuildPause(args) => run_build_pause(args)?,
         Cmd::BuildNews(args) => run_build_news(args)?,
@@ -1246,6 +1313,29 @@ fn cache_account_names_from_list(body: &str) {
             record_account_use(name);
         }
     }
+}
+
+fn run_adopt_trade(args: AdoptTradeArgs) -> Result<()> {
+    let admin_key = load_admin_key(&args.common.admin_key_file)?;
+    let body = AdoptBody {
+        account: args.account.clone(),
+        trade_id: args.trade_id,
+        instrument: args.instrument,
+        direction: args.direction.into(),
+        broker_order_id: args.order_id,
+        broker_trade_id: args.position_id,
+        stop_loss_price: args.stop_loss,
+    };
+    let resp = adopt_trade(&args.common.endpoint, &admin_key, &body)?;
+    // The verb hits the worker for a state mutation against a known
+    // account, so cache the account name for shell completion the
+    // same way `account test` does.
+    record_account_use(&args.account);
+    print!("{resp}");
+    if !resp.ends_with('\n') {
+        println!();
+    }
+    Ok(())
 }
 
 fn run_account_test(args: AccountTestArgs) -> Result<()> {

@@ -17,7 +17,9 @@ mod script_validator;
 mod templates;
 mod trade_patterns;
 
-pub use admin_client::{add_account, delete_account, list_accounts, test_account};
+pub use admin_client::{
+    AdoptBody, add_account, adopt_trade, delete_account, list_accounts, test_account,
+};
 pub use admin_secret::{delete_secret, put_secret, secret_binding_for};
 pub use calendar_bars::{
     CalendarBarPlan, CalendarBarRow, CalendarBarsArgs, CalendarBrokerArg, PlanInputs, TimeframeArg,

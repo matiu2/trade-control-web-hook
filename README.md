@@ -597,6 +597,44 @@ If you hit a 503 with `tradenation login failed`, check the worker
 logs — likely either a wrong-broker mismatch, a malformed credentials
 blob, or TN itself rejecting the credentials.
 
+### Adopting a manually-opened trade
+
+The worker only tracks trades it placed itself — it does not poll the
+broker for open positions. If you open a trade manually in the broker
+UI (or by any non-worker path) and want the webhook lifecycle to run
+against it (`close`, `pause`/`resume`, retry-gate, SL-breach sweep),
+register it with `POST /admin/adopt-trade` via the CLI:
+
+```sh
+trade-control adopt-trade \
+  --account tn-reversals-demo \
+  --trade-id hs-chf-jpy-efd5e647 \
+  --instrument CHF/JPY \
+  --direction short \
+  --order-id 26773227 \
+  --position-id 27169081 \
+  --stop-loss 173.50 \
+  --admin-key-file ~/.config/trade-control/admin-key.hex
+```
+
+The IDs come from the broker UI: on TradeNation the trade-detail panel
+shows them as `Add Order` (= `--order-id`) and `Open Position` (=
+`--position-id`). The worker calls `list_open_positions` on the named
+account and rejects with **409** if instrument, direction, order id, or
+position id don't all line up — typo'd ids do not silently land a row
+that close alerts will then no-op against.
+
+On success the worker writes a synthetic `EntryAttempt` keyed by
+`(account, trade_id, 1)` — same shape every other alert path already
+reads. `expires_at` is inferred from the seen-index by finding the
+latest `expires_at` across any prior prep/veto/enter alerts that
+landed for this `trade_id`, so close alerts sent within the original
+H&S `not_after` window will find the row. With no prior alerts on
+file the row falls back to a 4-day lifetime.
+
+V1 supports TradeNation accounts only; OANDA adoption returns 501
+(the verify path is mechanical but unwired).
+
 ## KV namespace
 
 The worker uses Cloudflare KV for replay protection and instrument cooldowns.

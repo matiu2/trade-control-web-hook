@@ -295,3 +295,169 @@ fn creds_error_to_response(name: &str, err: CredentialsError) -> Result<Response
         }
     }
 }
+
+/// `POST /admin/adopt-trade` — register an externally-opened broker
+/// position so the worker manages it from here on.
+///
+/// Body: JSON [`AdoptRequest`]. Verifies the position against the
+/// live broker (instrument + direction + ids must all line up), then
+/// writes a synthetic [`EntryAttempt`] keyed by `(account, trade_id,
+/// 1)` so every other path (close, pause/resume, retry-gate,
+/// SL-breach sweep) reads it identically to a self-placed row.
+///
+/// Native builds get a 501 stub — the wasm handler depends on
+/// `acquire_tn_broker` / `tradenation_api` which only build under
+/// `wasm32`. See `handle_test` for the same pattern.
+/// Bridge `tradenation_api::Position` to the broker-agnostic
+/// [`crate::adopt::BrokerPosition`] view. Kept here (not in
+/// `adopt.rs`) so the pure-helper module doesn't depend on
+/// `tradenation_api` and its unit tests stay native-runnable.
+#[cfg(target_arch = "wasm32")]
+impl crate::adopt::BrokerPosition for tradenation_api::Position {
+    fn order_id(&self) -> String {
+        self.order_id.to_string()
+    }
+    fn position_id(&self) -> String {
+        self.position_id.to_string()
+    }
+    fn market_name(&self) -> &str {
+        &self.market_name
+    }
+    fn direction_label(&self) -> &str {
+        &self.direction
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+pub async fn handle_adopt(req: &mut Request, env: &Env) -> Result<Response> {
+    use trade_control_core::account::MetadataStore;
+    use trade_control_core::intent::BrokerKind;
+    use trade_control_core::state::{EntryAttempt, StateStore};
+
+    use crate::adopt::{AdoptRequest, VerifyOutcome, resolve_not_after, verify_position};
+
+    if !admin_key_ok(req, env) {
+        return unauthorized();
+    }
+    let body = req.text().await?;
+    let adopt: AdoptRequest = match serde_json::from_str(&body) {
+        Ok(r) => r,
+        Err(e) => return Response::error(format!("bad adopt request: {e}"), 400),
+    };
+
+    // Step 1: confirm the account exists and routes to a supported
+    // broker. OANDA-side adoption isn't wired yet (the worker
+    // separately accesses OANDA per-account already; adding the
+    // verify path is mechanical but out of scope here). Reject
+    // explicitly so the operator gets a clear error rather than a
+    // silent write.
+    let store = metadata_store(env)?;
+    let meta = match store.get(&adopt.account).await {
+        Ok(m) => m,
+        Err(e) => return metadata_error_to_response(e),
+    };
+    if meta.broker != BrokerKind::TradeNation {
+        return Response::error(
+            format!(
+                "adopt-trade only supports tradenation accounts in v1; \
+                 {} routes to {:?}",
+                adopt.account, meta.broker
+            ),
+            501,
+        );
+    }
+
+    // Step 2: spin up a TN broker session (reuses the cron-warmed
+    // cache when fresh) and pull the live positions.
+    let broker = match crate::acquire_tn_broker(env, Some(&adopt.account)).await {
+        Some(b) => b,
+        None => {
+            return Response::error(
+                "tradenation login failed (missing account, bad credentials, or expired \
+                 session — check worker logs)",
+                503,
+            );
+        }
+    };
+    let details = match tradenation_api::get_account_details(broker.session()).await {
+        Ok(d) => d,
+        Err(err) => {
+            console_error!(
+                "adopt-trade[{}] get_account_details: {err:?}",
+                adopt.account
+            );
+            return Response::error("broker lookup failed", 502);
+        }
+    };
+
+    // Step 3: verify. Mismatch is a hard 409 — write nothing.
+    let verdict = verify_position(&adopt, &details.positions.records);
+    if verdict != VerifyOutcome::Ok {
+        console_error!(
+            "adopt-trade[{}] verify failed for trade_id={}: {}",
+            adopt.account,
+            adopt.trade_id,
+            verdict.reason()
+        );
+        return Response::error(verdict.reason(), 409);
+    }
+
+    // Step 4: build the EntryAttempt and write it.
+    let now = chrono::Utc::now();
+    let state = crate::state::KvStateStore::new(
+        env.kv(crate::KV_NAMESPACE)
+            .map_err(|e| worker::Error::RustError(format!("kv binding missing: {e:?}")))?,
+    );
+    let snapshot = match state.snapshot().await {
+        Ok(s) => s,
+        Err(e) => {
+            console_error!("adopt-trade[{}] snapshot: {e}", adopt.account);
+            return Response::error("state read failed", 500);
+        }
+    };
+    let not_after = resolve_not_after(&adopt.trade_id, &snapshot.recent_seen, now);
+    let expires_at = not_after
+        + chrono::Duration::seconds(trade_control_core::state::MIN_TTL_SECONDS as i64)
+        + chrono::Duration::hours(1);
+
+    let attempt = EntryAttempt {
+        trade_id: adopt.trade_id.clone(),
+        account: Some(adopt.account.clone()),
+        instrument: adopt.instrument.clone(),
+        attempt_no: 1,
+        broker_order_id: adopt.broker_order_id.clone(),
+        broker_trade_id: Some(adopt.broker_trade_id.clone()),
+        direction: adopt.direction,
+        placed_at: now,
+        shell_time: now,
+        expires_at,
+        stop_loss_price: adopt.stop_loss_price,
+    };
+
+    if let Err(err) = state.record_entry_attempt(attempt.clone()).await {
+        console_error!("adopt-trade[{}] record_entry_attempt: {err}", adopt.account);
+        return Response::error("state write failed", 500);
+    }
+
+    console_log!(
+        "admin: adopted trade_id={} on {} ({} {:?}) order_id={} position_id={} \
+         expires_at={}",
+        adopt.trade_id,
+        adopt.account,
+        adopt.instrument,
+        adopt.direction,
+        adopt.broker_order_id,
+        adopt.broker_trade_id,
+        expires_at.to_rfc3339()
+    );
+
+    // Echo the row back as YAML so the operator can sanity-check.
+    let yaml = serde_yaml::to_string(&attempt)
+        .map_err(|e| worker::Error::RustError(format!("encode entry_attempt yaml: {e}")))?;
+    Response::ok(format!("status: adopted\n{yaml}"))
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub async fn handle_adopt(_req: &mut Request, _env: &Env) -> Result<Response> {
+    Response::error("admin adopt-trade only available in wasm builds", 501)
+}
