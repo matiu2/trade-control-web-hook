@@ -1,5 +1,19 @@
 #!/usr/bin/env python3
 """
+DEPRECATED — this script has been superseded by the Rust `tv-arm` crate
+(`tv-arm/` in this repo). All ongoing feature work (instrument-lookup
+integration, calendar auto-draw, error logging, consolidated
+06-close-on-reversal, etc.) lands in the Rust binary; this file is kept
+only as historical reference and is NOT updated for new behaviour.
+
+If you reached this script via a shell alias, README link, or shell
+history, switch to `tv-arm` instead. Run `tv-arm --help` for the
+current flag surface — flags have diverged from this script's `--help`.
+
+Original purpose follows for historical context only.
+
+----
+
 Arm a reversal setup (H&S / inverse) from the current TradingView chart.
 
 Reads chart annotations via tv-mcp, writes a `trade.yaml` spec, hands it to
@@ -1378,7 +1392,10 @@ def pattern_for(direction: str) -> str:
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="Arm a reversal setup from the active TradingView chart.",
+        description=(
+            "[DEPRECATED — use the Rust `tv-arm` binary instead] "
+            "Arm a reversal setup from the active TradingView chart."
+        ),
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     p.add_argument(
@@ -1546,6 +1563,14 @@ _tv_arm_hs "$@"
 
 
 def main(argv: Optional[list[str]] = None) -> int:
+    # Deprecation banner — the Rust `tv-arm` crate is the supported tool.
+    # This script is kept for historical reference and is not updated for
+    # new behaviour (consolidated 06-close-on-reversal, instrument-lookup
+    # integration, calendar auto-draw, etc.).
+    sys.stderr.write(
+        "WARNING: scripts/tv_arm_hs.py is DEPRECATED. Use the Rust `tv-arm`\n"
+        "         binary instead (run `tv-arm --help`). Continuing anyway...\n\n"
+    )
     args = parse_args(argv if argv is not None else sys.argv[1:])
 
     if args.print_completions:
