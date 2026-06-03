@@ -84,7 +84,7 @@ needs_golden: true                        # default for reversal closes
 
 ### Steps
 
-- [ ] **Step 1: worker — validation relaxation + new fields.**
+- [x] **Step 1: worker — validation relaxation + new fields.**
   - Relax `Intent::validate` to allow `needs_golden: true` on
     `Action::Close` (currently rejected at `core/src/intent.rs:699`).
   - Add `needs_confirmed: bool` to `Intent`. Same shape as `needs_golden`.
@@ -97,7 +97,7 @@ needs_golden: true                        # default for reversal closes
   - Tests: round-trip, mutual-exclusion rejection, missing-data rejection
     (`price` in `inside_window` without `price_bands`).
   - No worker dispatch changes yet — just types.
-- [ ] **Step 2: worker — Close dispatch consumes new fields + candle gates.**
+- [x] **Step 2: worker — Close dispatch consumes new fields + candle gates.**
   - Extend `run_close` (`src/lib.rs:480`) to evaluate the new
     `inside_window` field via the same `GateOutcome` machinery. New form
     routes to the same `evaluate_close_gates` outcome that the old form
