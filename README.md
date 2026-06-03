@@ -14,16 +14,22 @@ Trading:
 - `enter` — open a market, stop, or limit order with SL/TP, after passing the risk gate.
   Optionally gated on named `prep` / `veto` flags (see "Conditional entries" below).
 - `close` — close all positions for the instrument. May also carry worker-side
-  gates that decide whether *this* close fires, **OR-composed** across the list
-  so a single reversal alert can carry both kinds of gate and pass if *either*
-  holds:
-  - **New consolidated form** (preferred): `inside_window: [news, price]`
+  gates that decide whether *this* close fires:
+  - **Contextual-window gate** (OR-composed): `inside_window: [news, price]`
     names which window-types are acceptable; `price_bands: [[lo, hi], ...]`
     carries the data for the `price` member. The two fields are paired —
-    `price` ∈ `inside_window` iff `price_bands` is non-empty. Plus optional
-    candle-quality gates `needs_golden: true` and `needs_confirmed: true`
-    (AND-composed with the window check), and an optional `allow_close`
-    script (future, symmetric with `allow_entry`).
+    `price` ∈ `inside_window` iff `price_bands` is non-empty. The close
+    passes when *any* listed window matches (active news window for the
+    `trade_id`, or current broker price inside a band).
+  - **Candle-quality gate** (AND-composed with the window): `needs_golden:
+    true` or `needs_confirmed: true` requires the incoming shell to carry
+    `golden: true` / `signal_confirmed: true` from the Pine study.
+    `needs_golden` is the default emitted by the CLI's reversal-close
+    builder; `needs_confirmed` is the operator opt-in to "confirmed but
+    not necessarily golden".
+  - **Ad-hoc filter** (AND-composed): `allow_close: <Rhai script>` —
+    symmetric with `allow_entry` but bound to the shell-anchor scope
+    only (no resolved SL/TP geometry to read).
   - **Deprecated form** (still accepted for in-flight alerts):
     `require_news_window: true` and/or `require_price_in_ranges: [[lo, hi], ...]`.
     Mixing the old and new forms on one intent is a validation error —
@@ -61,33 +67,30 @@ Per-trade window state (paired alerts):
 - `news-start` / `news-end` — open/close a news window for a
   `(trade_id, news_id)`. Independent of `pause`: news windows don't block
   entries, they **enable** the `06-close-on-reversal` alert (a Close intent
-  with `require_news_window: true`) to flatten the trade on an opposing
-  reversal candle.
+  with `news` in its `inside_window` list) to flatten the trade on an
+  opposing reversal candle.
 
 ## Alert basenames emitted by `build-trade`
 
-When `tv_arm_hs.py` calls `trade-control build-trade --from-file`, the Rust
-CLI mints a fixed-order bundle of signed YAMLs. Basename ordering matters —
-the Python side maps drawings to alerts by prefix.
+When `tv-arm` (the chart-arming binary) calls `trade-control build-trade
+--from-file`, the Rust CLI mints a fixed-order bundle of signed YAMLs.
+Basename ordering matters — `tv-arm` maps drawings to alerts by prefix.
 
 | Basename | Action | Fires on | Notes |
 |---|---|---|---|
 | `01-veto-too-high` | `veto` | Horizontal line crossing | Invalidation veto. Drawing-bound. Trade-direction sensitive (`too-low` for bullish IH&S). |
-| `01-veto-too-low` | `veto` | Price crossing pcl-exhausted level | "Pattern completion level exhausted" — 80% of the way from the fib's midpoint to TP. Value-bound, computed by Python from the fib geometry. Direction-mirrors the invalidation veto. |
+| `01-veto-too-low` | `veto` | Price crossing pcl-exhausted level | "Pattern completion level exhausted" — 80% of the way from the fib's midpoint to TP. Value-bound, computed by `tv-arm` from the fib geometry. Direction-mirrors the invalidation veto. |
 | `02-veto-trade-expiry` | `veto` | Vertical line crossing chart time | Hard stop: once the trade-expiry line passes, no more entries. |
 | `03-prep-break-and-close` | `prep` | Trendline crossing (neckline break) | Skippable for stocks / late entries with `--skip-break-and-close`. |
 | `04-prep-retest` | `prep` | Trendline crossing (retest from below) | Skippable with `--skip-retest`. |
 | `05-enter` | `enter` | Pine `Candle Signals` golden candle | The actual trade. Gated on the preps above + opposing-direction veto absent. |
-| `06-close-on-reversal` | `close` | Pine `Candle Signals` opposing reversal | Emitted only when news-pairs are drawn. Worker gates on an active `news:<trade_id>:*` KV entry — fires only inside news windows. |
-| `07-close-on-sr-reversal` | `close` | Pine `Candle Signals` opposing reversal | Emitted only when `support`/`resistance` lines are drawn. Worker gates on the broker's current price being inside one of the `[lo, hi]` bands. |
+| `06-close-on-reversal` | `close` | Pine `Candle Signals` opposing reversal | Emitted when news-pairs and/or `support`/`resistance` lines are drawn. Carries `inside_window: [news?, price?]` (OR-composed) and, when `price` is listed, `price_bands: [[lo, hi], ...]`. Defaults `needs_golden: true` for the candle-quality gate. |
 
-Because the close gates are OR-composed (see `close` above), a single
-hand-signed body can carry **both** `require_news_window: true` and
-`require_price_in_ranges` and be wired to one TV alert on the
-opposing-reversal candle — closes when *either* condition holds. The
-current `build-trade` pipeline still emits 06 and 07 as separate alerts
-for backwards compatibility; collapsing them into one combined alert is
-recommended for new setups.
+The legacy `07-close-on-sr-reversal` basename is no longer emitted —
+its functionality folds into a single `06-close-on-reversal` whose
+`inside_window` list includes `price`. The enum variant is still
+recognised by the worker for inbound decode of any in-flight alerts
+left over from the old shape.
 
 Each news pair adds two more (`01-news-start-<id>` + `02-news-end-<id>`)
 via a separate `build-news` shell-out, and each pause pair adds
@@ -102,20 +105,22 @@ The day-to-day loop, end to end:
    spanning head → neckline, a `trade-expiry` vertical, and any optional
    extras (`news-start`/`news-end` pairs around scheduled news,
    `support`/`resistance` horizontals near key levels).
-2. **Run `scripts/tv_arm_hs.py`.** It reads the chart geometry via tv-mcp,
-   shells out to `trade-control build-trade --from-file` for `trade_id`
-   minting + signing, then posts every signed alert into TradingView via
-   an inside-page `fetch()`. Each alert lands as a configured TV alert
-   pointed at your worker URL.
+2. **Run `tv-arm`.** The Rust binary (`cargo run -p tv-arm --`) reads
+   the chart geometry via tv-mcp, shells out to `trade-control
+   build-trade --from-file` for `trade_id` minting + signing, then posts
+   every signed alert into TradingView via an inside-page `fetch()`.
+   Each alert lands as a configured TV alert pointed at your worker URL.
+   (The legacy `scripts/tv_arm_hs.py` is deprecated; `tv-arm` superseded
+   it.)
 3. **TradingView fires alerts** as their conditions trigger (line
    crossings, Pine `Candle Signals` plots, time anchors). Each alert
    POSTs the cleartext signed YAML to the worker.
 4. **The worker verifies the HMAC**, runs replay protection (the `id`
-   field), applies any relevant gates (preps must be set, vetos must be
-   clear, `require_news_window` / `require_price_in_ranges` OR-composed
-   for closes),
-   then dispatches to OANDA or TradeNation. Outcomes are visible in
-   Cloudflare Real-time Logs and via `trade-control status`.
+   field), applies any relevant gates (preps must be set, vetos must
+   be clear, `inside_window` entries OR-composed for closes, candle-
+   quality gates AND-composed on top), then dispatches to OANDA or
+   TradeNation. Outcomes are visible in Cloudflare Real-time Logs and
+   via `trade-control status`.
 5. **The scheduled `cron` trigger** (`*/15 * * * *`, declared in
    `wrangler.toml`) sweeps pending stop-entry orders for SL-breach
    independently of any TV alert. See `src/cron.rs`.
@@ -695,18 +700,24 @@ Then sign an intent (set `not_after` in the future) and POST it:
   | http POST localhost:8787 Content-Type:text/plain
 ```
 
-## Chart-driven arming: `scripts/tv_arm_hs.py`
+## Chart-driven arming: `tv-arm`
 
 The Rust `trade-control` CLI is the low-level signer — one intent at a time.
 For real H&S setups you want **one chart annotation → the whole bundle armed**
 (invalidation + pcl-exhausted vetoes, trade-expiry veto, two preps, an entry,
-plus any opt-in close triggers). `scripts/tv_arm_hs.py` is that frontend.
+plus any opt-in close triggers). `tv-arm` (the Rust binary in `tv-arm/`) is
+that frontend.
 
 It reads the active TradingView chart via [tv-mcp](https://github.com/jacksonkasi1/tradingview-mcp)
 (a Chrome DevTools bridge), extracts the H&S geometry from your drawings,
 delegates `trade_id` minting and intent signing to `trade-control build-trade
 --from-file`, and posts the resulting alert bundle straight to TradingView via
 an inside-page fetch.
+
+> **Deprecated:** `scripts/tv_arm_hs.py` was the original Python frontend.
+> It was ported to `tv-arm` and is no longer updated for new behaviour
+> (consolidated `06-close-on-reversal`, calendar auto-draw,
+> instrument-lookup integration, etc.). Use `tv-arm` instead.
 
 What you draw on the chart:
 
@@ -717,14 +728,19 @@ What you draw on the chart:
 | Trendline | (any in `RETEST_LABELS`) | Retest prep level. Skip with `--skip-retest`. |
 | Fib retracement | (label optional) | Drives both TP (`2 × neckline − head`) and the `pcl-exhausted` veto price (`midpoint + 0.8 × (TP − midpoint)`). Draw spanning **head → neckline**. |
 | Vertical line | `trade-expiry` | `not_after` for every alert in the bundle. |
-| Vertical line pair | `news-start` / `news-end` | Each pair emits a `build-news` bundle. **Presence of any pair also auto-arms `06-close-on-reversal`** — no extra flag. |
+| Vertical line pair | `news-start` / `news-end` | Each pair emits a `build-news` bundle. **Presence of any pair also adds `news` to the consolidated `06-close-on-reversal` alert's `inside_window`** — no extra flag. |
 | Vertical line pair | `blackout-start` / `blackout-end` (or `pause` / `resume` aliases) | Each pair emits a `build-pause` bundle. Blocks entries while active. |
-| Horizontal line | `support` or `resistance` | Each line auto-arms `07-close-on-sr-reversal` as an `[lo, hi]` band of ±`--reversal-band-pct` (default `0.1%`). Multiple lines union. |
+| Horizontal line | `support` or `resistance` | Each line adds an `[lo, hi]` band of ±`--reversal-band-pct` (default `0.1%`) to the `06-close-on-reversal` alert's `price_bands` list, and adds `price` to its `inside_window`. Multiple lines union. |
+
+When news pairs *and* `support`/`resistance` lines are both present, a
+single `06-close-on-reversal` alert is emitted with
+`inside_window: [news, price]` — the close fires on an opposing reversal
+candle when *either* gate matches (worker-side OR composition).
 
 CLI:
 
 ```sh
-python scripts/tv_arm_hs.py \
+cargo run -p tv-arm -- \
   --broker tradenation \              # or oanda; auto-detected from chart exchange
   --account-id ms-tn-1 \              # defaults to ms-<broker>-1
   --risk-pct 0.5 \                    # % of NAV (or --risk-amount <home-ccy>)
@@ -734,6 +750,9 @@ python scripts/tv_arm_hs.py \
   --require-golden \                  # require Pine golden-candle signal on entry
   --create-alerts                     # default; pair with --dry-run to inspect only
 ```
+
+Run `tv-arm --help` for the full flag surface — it has diverged from the
+deprecated Python script.
 
 Skipped preps are pre-fired directly to the worker so the entry's
 `requires_preps:` gate is still satisfied — useful when joining a setup
@@ -754,7 +773,7 @@ where those preps don't apply.
   populate it without facade-sync gymnastics. But the alerts still **fire**
   — the binding is only about whether the drawing shows the icon. Don't
   chase it.
-- **TP via symmetric reflection.** The script computes TP as `2 × neckline
+- **TP via symmetric reflection.** `tv-arm` computes TP as `2 × neckline
   − head` from the fib's two endpoints, independent of which fib levels
   are visible / configured. Draw the fib spanning head → neckline.
 
@@ -763,9 +782,9 @@ where those preps don't apply.
 - Rust `trade-control` CLI on `$PATH` (or pass `--trade-control-bin`).
 - A signing key at `~/.config/trade-control/key.hex`, matching the worker's
   `SIGNING_KEY` secret.
-- tv-mcp checked out somewhere; the script's `TV_MCP_ROOT` constant points
-  to `~/Downloads/tradingview-mcp-jackson` by default. Adjust if yours
-  lives elsewhere.
+- tv-mcp checked out somewhere; `tv-arm` looks at
+  `~/Downloads/tradingview-mcp-jackson` by default. Adjust the
+  `--tv-mcp-root` flag if yours lives elsewhere.
 - An active TradingView Desktop session in Firefox with DevTools open
   (tv-mcp connects via CDP).
 

@@ -120,16 +120,38 @@ needs_golden: true                        # default for reversal closes
     inbound decode of in-flight alerts; see step 2's wire compat note).
   - Test rewrites: the `06`/`07` split tests became one-alert tests,
     plus a new `needs_confirmed_close` test. 209 cli tests pass.
-- [ ] **Step 4: Python — `tv_arm_hs.py` emits the new shape.**
-  - Single `06-close-on-reversal.yaml` instead of two. `inside_window`
-    populated from whether news pairs and/or S/R lines are present on the
-    chart. `price_bands` carries the S/R ranges.
-  - Update the `build_alert_spec()` basename map.
-- [ ] **Step 5: README + per-commit doc sync.**
-  - New section: reversal-close design with the `inside_window` mental
-    model and the two-axis-window metaphor.
-  - Deprecation note on the old fields with a 2-release sunset window.
-  - Update the worked example showing the new YAML shape.
+- [x] **Step 4: Python emitter — obsoleted via deprecation.**
+  - The chart-arming frontend has already been ported from
+    `scripts/tv_arm_hs.py` to the Rust `tv-arm` crate. The Python
+    script hasn't been behaviourally touched since 2026-05-29
+    (`7034cef add 07-close-on-sr-reversal`); subsequent work has all
+    landed in `tv-arm/`.
+  - `tv-arm/src/pipeline.rs::build_trade_spec` still populates the
+    same input-side fields (`close_on_news`, `sr_reversal_ranges`)
+    on `cli::TradeSpec`. Step 3's consolidated
+    `build_close_on_reversal_alert` then routes those into
+    `inside_window` + `price_bands` on the emitted intent — so the
+    Rust path produces the new wire form transparently with no
+    further changes.
+  - Marked `scripts/tv_arm_hs.py` deprecated: module docstring
+    banner, runtime stderr warning at top of `main()`, argparse
+    description tag. Script still runs if invoked.
+  - Memory updated: `tv_arm_rust_supersedes_python` flags this for
+    future sessions.
+- [x] **Step 5: README + per-commit doc sync.**
+  - `close` action documented with the three gate layers:
+    contextual-window (`inside_window` + `price_bands`, OR-composed),
+    candle-quality (`needs_golden` / `needs_confirmed`, AND-composed),
+    ad-hoc filter (`allow_close` Rhai script).
+  - Deprecated-form note on `require_news_window` /
+    `require_price_in_ranges` (still accepted for in-flight alerts).
+  - Alert-basename table collapsed from 06+07 split to a single
+    consolidated `06-close-on-reversal` row.
+  - Chart-arming section renamed from `scripts/tv_arm_hs.py` to
+    `tv-arm`; CLI example switched to `cargo run -p tv-arm --`.
+    Deprecation callout points operators away from the Python script.
+  - News-pair / S-R-line drawing-table rows updated to describe the
+    consolidated alert behaviour.
 
 ### Open follow-ups (not blocking the bug fix)
 
