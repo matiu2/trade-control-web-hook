@@ -1,5 +1,42 @@
 # TODO
 
+## Active — fix `too-low` / pcl-exhausted veto closing open positions
+
+Bug: the pcl-exhausted veto (`too-low` for shorts, `too-high` for longs) is
+emitted with `level: ClosePositions`. It is an *entry-gate* condition ("price
+already ran most of the way to TP, don't open a late entry"), not a thesis
+invalidation, so it must never close an open position. Real incident: demo
+trade 046 (CHF/JPY H&S short) closed ~31 ticks before TP, costing ~1.29R.
+See `BUG-too-low-closes-positions.md`.
+
+Root cause: `build_invalidation_alert()` (`cli/src/trade_patterns.rs`)
+hard-codes `ClosePositions` and is reused for *both* the invalidation veto
+(correct: close) and the pcl-exhausted veto (wrong: should be entry-block only).
+
+Steps:
+
+- [x] Give `build_invalidation_alert` a `level: VetoLevel` parameter; purpose
+      string reflects the level.
+- [x] Invalidation veto call site → `ClosePositions` (unchanged behaviour).
+- [x] pcl-exhausted veto call site → `StopNextEntry` (the fix).
+- [x] Fix the misleading `pcl_exhausted_veto_name` doc-comment (the two vetos
+      are *not* the same level).
+- [x] Rework existing `..._pcl_exhausted_veto_matches_invalidation_shape` test
+      (renamed `..._shares_shape_but_not_level`) — now asserts levels *differ*.
+- [x] New regression test `pcl_exhausted_veto_never_closes_positions_for_both_patterns`:
+      pcl-exhausted = `StopNextEntry`, invalidation = `ClosePositions`, HS + IHS.
+- [x] Audit other `ClosePositions` vetos (`trade-expiry`). Verdict below.
+- [x] `cargo test` / `cargo clippy` / `cargo fmt`; README rows 81-82 synced.
+
+Audit verdict (other `ClosePositions` vetos):
+- `trade-expiry` — fires at wall-clock expiry (`not_before = trade_expiry`),
+  meaning "the setup's planned window is over". Not a price-relative trigger,
+  so it can't spuriously fire in the trade's favour. Flattening a stale trade
+  past its window is the intended belt-and-braces. **Correct, leave as-is.**
+- `invalidation` (`too-high` short / `too-low` long) — fires when price runs
+  back past the right shoulder, i.e. *against* the trade, structure broken.
+  Genuine thesis invalidation. **Correct, leave as-is.**
+
 ## Active — Consolidated close-on-reversal + first-class candle-quality gates
 
 **Bug observed (2026-06-03):** GBP/NZD demo entry SL didn't match any obvious

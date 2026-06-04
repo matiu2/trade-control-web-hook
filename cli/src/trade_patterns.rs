@@ -136,10 +136,14 @@ struct PatternGeometry {
     invalidation_veto_name: &'static str,
     /// Name of the opposite-direction veto, fired when price has run
     /// most of the way to TP without us in. For a short trade this is
-    /// `too-low`; for a long trade `too-high`. Symmetric in shape to
-    /// the invalidation veto (same Veto / ClosePositions level), but
-    /// the chart side binds it to a computed price (pcl-exhausted)
-    /// rather than a drawing.
+    /// `too-low`; for a long trade `too-high`. Built by the same
+    /// `build_invalidation_alert` builder as the invalidation veto, but
+    /// it is *not* the same level: this one is `StopNextEntry` (an
+    /// entry-gate — "don't open a late entry"), whereas the invalidation
+    /// veto is `ClosePositions` (thesis dead → flatten). A pcl breach is
+    /// in the trade's favour, so it must never close an open position.
+    /// See `BUG-too-low-closes-positions.md`. The chart side binds this
+    /// veto to a computed price (pcl-exhausted) rather than a drawing.
     pcl_exhausted_veto_name: &'static str,
 }
 
@@ -659,23 +663,30 @@ fn assemble_trade(
     let skip_bnc = spec.skip_preps.iter().any(|n| n == "break-and-close");
     let skip_retest = spec.skip_preps.iter().any(|n| n == "retest");
     let mut alerts = vec![
+        // Invalidation veto: price ran back past the right shoulder →
+        // structure broken, thesis dead. ClosePositions: flatten any
+        // open trade.
         build_invalidation_alert(
             &spec.instrument,
             &trade_id,
             geometry.invalidation_veto_name,
+            VetoLevel::ClosePositions,
             veto_expiry,
             &spec.broker,
             &spec.account,
             now,
         ),
-        // Opposite-direction veto: price ran most of the way to TP
-        // without us in. Same builder shape as the invalidation veto;
-        // the chart side binds this one to a computed price (pcl-
-        // exhausted) rather than a drawing.
+        // Pcl-exhausted veto: price ran most of the way to TP without us
+        // in. StopNextEntry only — it blocks a *late* entry and must
+        // never close (or cancel) an open position. A breach in the
+        // trade's favour is profit, not a reason to exit. The chart side
+        // binds this one to a computed price (pcl-exhausted) rather than
+        // a drawing. See BUG-too-low-closes-positions.md (demo trade 046).
         build_invalidation_alert(
             &spec.instrument,
             &trade_id,
             geometry.pcl_exhausted_veto_name,
+            VetoLevel::StopNextEntry,
             veto_expiry,
             &spec.broker,
             &spec.account,
@@ -910,14 +921,28 @@ fn skeleton(
     }
 }
 
-/// The "price ran past structure and the setup is dead" veto. Named
-/// `too-high` for short patterns and `too-low` for long ones — the
-/// name comes from the geometry struct, so the wire form matches the
-/// reference templates (`too-high.yaml` / `too-low.yaml`).
+/// Builds one of the two geometry-driven price vetos. Named `too-high`
+/// for short patterns and `too-low` for long ones — the name comes from
+/// the geometry struct, so the wire form matches the reference templates
+/// (`too-high.yaml` / `too-low.yaml`).
+///
+/// `level` is supplied by the caller because the two vetos this builder
+/// serves are *not* symmetric in meaning:
+///
+/// - The **invalidation** veto (price ran back past the right shoulder →
+///   structure broken, thesis dead) gets `ClosePositions`: an open trade
+///   should be flattened.
+/// - The **pcl-exhausted** veto (price already ran most of the way to TP
+///   without us in) gets `StopNextEntry`: it only blocks a *late* entry
+///   and must never touch an open position — a breach in the trade's
+///   favour is profit, not a reason to exit. See
+///   `BUG-too-low-closes-positions.md` (demo trade 046).
+#[allow(clippy::too_many_arguments)]
 fn build_invalidation_alert(
     instrument: &str,
     trade_id: &str,
     veto_name: &str,
+    level: VetoLevel,
     veto_expiry: DateTime<Utc>,
     broker: &BrokerKind,
     account: &str,
@@ -936,7 +961,7 @@ fn build_invalidation_alert(
     intent.name = Some(veto_name.to_string());
     intent.ttl_hours =
         trade_control_core::tunable::Tunable::Static(ttl_hours_until(now, veto_expiry));
-    intent.level = Some(VetoLevel::ClosePositions);
+    intent.level = Some(level);
     let basename = match veto_name {
         "too-high" => AlertBasename::VetoTooHigh.as_str().into_owned(),
         "too-low" => AlertBasename::VetoTooLow.as_str().into_owned(),
@@ -947,9 +972,14 @@ fn build_invalidation_alert(
         // updating the conventions crate.
         other => format!("01-veto-{other}"),
     };
+    let level_note = match level {
+        VetoLevel::ClosePositions => "close positions if price runs past invalidation",
+        VetoLevel::CancelPending => "cancel pending entry if price runs past invalidation",
+        VetoLevel::StopNextEntry => "block a late entry; never touch an open position",
+    };
     BuiltAlert {
         basename,
-        purpose: format!("veto: {veto_name} (close positions if price runs past invalidation)"),
+        purpose: format!("veto: {veto_name} ({level_note})"),
         intent,
     }
 }
@@ -1304,6 +1334,7 @@ mod tests {
                 "EUR_USD",
                 "hs-eur-usd-abcd",
                 "too-high",
+                VetoLevel::ClosePositions,
                 trade_expiry,
                 &BrokerKind::Oanda,
                 "demo",
@@ -1501,6 +1532,7 @@ mod tests {
             "EUR_USD",
             "ihs-eur-usd-xxxx",
             "too-low",
+            VetoLevel::ClosePositions,
             veto_expiry,
             &BrokerKind::Oanda,
             "demo",
@@ -1662,12 +1694,15 @@ mod tests {
     }
 
     #[test]
-    fn build_trade_from_spec_pcl_exhausted_veto_matches_invalidation_shape() {
-        // The pcl-exhausted veto (built by the same builder as the
-        // invalidation veto) must carry the same level (ClosePositions)
-        // and trade_id, just with a different name. This is what
-        // tv_arm_hs.py relies on to treat them symmetrically on the
-        // chart side (one drawing-bound, one value-bound).
+    fn build_trade_from_spec_pcl_exhausted_veto_shares_shape_but_not_level() {
+        // The pcl-exhausted veto is built by the same builder as the
+        // invalidation veto and shares its action/trade_id (so the chart
+        // side can treat them symmetrically — one drawing-bound, one
+        // value-bound). But it must NOT share the level: invalidation is
+        // ClosePositions (thesis dead → flatten), pcl-exhausted is
+        // StopNextEntry (entry-gate only — a breach is in the trade's
+        // favour and must never close an open winner). Regression for
+        // BUG-too-low-closes-positions.md (demo trade 046).
         let now = ts("2026-05-20T00:00:00Z");
         let spec = sample_spec(TradePattern::Hs, ts("2026-05-25T00:00:00Z"));
         let trade = build_trade_from_spec(spec, now).unwrap();
@@ -1675,10 +1710,37 @@ mod tests {
         let pcl_exhausted = &trade.alerts[1];
         assert_eq!(invalidation.intent.name.as_deref(), Some("too-high"));
         assert_eq!(pcl_exhausted.intent.name.as_deref(), Some("too-low"));
-        assert_eq!(invalidation.intent.level, pcl_exhausted.intent.level);
+        // Shared shape: same trade_id and same Veto action.
         assert_eq!(invalidation.intent.trade_id, pcl_exhausted.intent.trade_id);
-        // Same Veto action, same TTL window.
         assert_eq!(invalidation.intent.action, pcl_exhausted.intent.action);
+        // Divergent level — the whole point of the fix.
+        assert_eq!(invalidation.intent.level, Some(VetoLevel::ClosePositions));
+        assert_eq!(pcl_exhausted.intent.level, Some(VetoLevel::StopNextEntry));
+        assert_ne!(invalidation.intent.level, pcl_exhausted.intent.level);
+    }
+
+    #[test]
+    fn pcl_exhausted_veto_never_closes_positions_for_both_patterns() {
+        // Regression guard across both configured patterns: the
+        // entry-gate (pcl-exhausted) veto is StopNextEntry, the
+        // invalidation veto is ClosePositions — regardless of which
+        // direction the pattern trades. alerts[0] is always the
+        // invalidation veto, alerts[1] the pcl-exhausted one.
+        let now = ts("2026-05-20T00:00:00Z");
+        for pattern in [TradePattern::Hs, TradePattern::Ihs] {
+            let spec = sample_spec(pattern, ts("2026-05-25T00:00:00Z"));
+            let trade = build_trade_from_spec(spec, now).unwrap();
+            assert_eq!(
+                trade.alerts[0].intent.level,
+                Some(VetoLevel::ClosePositions),
+                "{pattern:?}: invalidation veto must be ClosePositions"
+            );
+            assert_eq!(
+                trade.alerts[1].intent.level,
+                Some(VetoLevel::StopNextEntry),
+                "{pattern:?}: pcl-exhausted veto must be StopNextEntry, never close an open winner"
+            );
+        }
     }
 
     #[test]
