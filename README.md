@@ -748,6 +748,7 @@ cargo run -p tv-arm -- \
   --skip-break-and-close \            # for stocks (no after-hours retests)
   --skip-retest \                     # implies --skip-break-and-close; for late entries
   --require-golden \                  # require Pine golden-candle signal on entry
+  --require-confirmation \            # require a confirmed signal candle on entry (independent of golden)
   --create-alerts                     # default; pair with --dry-run to inspect only
 ```
 

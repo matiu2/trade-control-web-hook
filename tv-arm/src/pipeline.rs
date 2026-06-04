@@ -517,6 +517,7 @@ fn build_trade_spec(
             cli::EntryMode::Stop
         },
         needs_golden: args.require_golden,
+        needs_confirmed: args.require_confirmation,
         close_on_news: !roles.news_pairs.is_empty(),
         sr_reversal_ranges: build_sr_ranges(roles, args.reversal_band_pct),
         needs_confirmed_close: false,

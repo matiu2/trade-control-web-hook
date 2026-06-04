@@ -329,6 +329,16 @@ pub struct TradeSpec {
     /// to pre-feature spec yaml.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub needs_golden: bool,
+    /// When true, the worker rejects the entry unless the incoming shell
+    /// carries `confirmed: Some(true)`. Symmetric with [`Self::needs_golden`]
+    /// and independent of it — the candle gate checks golden first, then
+    /// confirmed, so setting both is a stricter "golden AND confirmed"
+    /// entry. AND-composed with [`Self::allow_entry`]. Lands on the enter
+    /// intent only. Default `false` = no gate, byte-identical to
+    /// pre-feature spec yaml. (Distinct from [`Self::needs_confirmed_close`],
+    /// which gates the close-on-reversal alert.)
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub needs_confirmed: bool,
     /// When true, mark the consolidated `06-close-on-reversal` alert
     /// as gated on an active news window for this `trade_id`. Adds
     /// `news` to the emitted intent's `inside_window` list. If
@@ -631,6 +641,7 @@ fn build_pattern(
         dry_run: false,
         max_retries: 0,
         needs_golden: false,
+        needs_confirmed: false,
         close_on_news: false,
         sr_reversal_ranges: Vec::new(),
         needs_confirmed_close: false,
@@ -737,6 +748,7 @@ fn assemble_trade(
         spec.allow_entry.as_deref(),
         spec.entry_mode,
         spec.needs_golden,
+        spec.needs_confirmed,
         &spec.skip_preps,
         &spec.broker,
         &spec.account,
@@ -1090,6 +1102,7 @@ fn build_enter_alert(
     allow_entry: Option<&str>,
     entry_mode: EntryMode,
     needs_golden: bool,
+    needs_confirmed: bool,
     skip_preps: &[String],
     broker: &BrokerKind,
     account: &str,
@@ -1137,6 +1150,7 @@ fn build_enter_alert(
     intent.max_retries = trade_control_core::tunable::Tunable::Static(max_retries);
     intent.allow_entry = allow_entry.map(trade_control_core::tunable::Tunable::from_script);
     intent.needs_golden = needs_golden;
+    intent.needs_confirmed = needs_confirmed;
     intent.requires_preps = ["break-and-close", "retest"]
         .into_iter()
         .filter(|step| !skip_preps.iter().any(|s| s == step))
@@ -1355,6 +1369,7 @@ mod tests {
                 None,
                 EntryMode::Stop,
                 false,
+                false,
                 &[],
                 &BrokerKind::Oanda,
                 "demo",
@@ -1376,6 +1391,7 @@ mod tests {
                 dry_run: false,
                 max_retries: 0,
                 needs_golden: false,
+                needs_confirmed: false,
                 close_on_news: false,
                 sr_reversal_ranges: Vec::new(),
                 needs_confirmed_close: false,
@@ -1418,6 +1434,7 @@ mod tests {
             0,
             None,
             EntryMode::Stop,
+            false,
             false,
             &[],
             &BrokerKind::Oanda,
@@ -1485,6 +1502,7 @@ mod tests {
             0,
             None,
             EntryMode::Stop,
+            false,
             false,
             &[],
             &BrokerKind::Oanda,
@@ -1555,6 +1573,7 @@ mod tests {
             dry_run: false,
             max_retries: 0,
             needs_golden: false,
+            needs_confirmed: false,
             close_on_news: false,
             sr_reversal_ranges: Vec::new(),
             needs_confirmed_close: false,
@@ -1881,6 +1900,43 @@ tp_price: 1.05
                 alert.basename
             );
         }
+    }
+
+    #[test]
+    fn build_trade_from_spec_threads_needs_confirmed_onto_enter_intent() {
+        // needs_confirmed on the spec lands on the enter intent only,
+        // mirroring needs_golden. Vetos and preps stay false.
+        let now = ts("2026-05-20T00:00:00Z");
+        let mut spec = sample_spec(TradePattern::Hs, ts("2026-05-25T00:00:00Z"));
+        spec.needs_confirmed = true;
+        let trade = build_trade_from_spec(spec, now).unwrap();
+        let enter = trade.alerts.last().unwrap();
+        assert!(enter.intent.needs_confirmed);
+        // needs_golden is independent — not set unless asked for.
+        assert!(!enter.intent.needs_golden);
+        enter.intent.validate().unwrap();
+        for alert in trade.alerts.iter().take(trade.alerts.len() - 1) {
+            assert!(
+                !alert.intent.needs_confirmed,
+                "non-enter alert {} carried needs_confirmed",
+                alert.basename
+            );
+        }
+    }
+
+    #[test]
+    fn build_trade_from_spec_both_candle_gates_can_coexist_on_enter() {
+        // golden and confirmed are independent gates — both can ride the
+        // enter intent for a stricter "golden AND confirmed" entry.
+        let now = ts("2026-05-20T00:00:00Z");
+        let mut spec = sample_spec(TradePattern::Hs, ts("2026-05-25T00:00:00Z"));
+        spec.needs_golden = true;
+        spec.needs_confirmed = true;
+        let trade = build_trade_from_spec(spec, now).unwrap();
+        let enter = trade.alerts.last().unwrap();
+        assert!(enter.intent.needs_golden);
+        assert!(enter.intent.needs_confirmed);
+        enter.intent.validate().unwrap();
     }
 
     #[test]

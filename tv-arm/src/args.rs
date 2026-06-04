@@ -111,6 +111,13 @@ pub struct Args {
     #[arg(long)]
     pub require_golden: bool,
 
+    /// Require a confirmed signal candle on entry. Sets
+    /// `needs_confirmed: true` on the enter intent. Symmetric with
+    /// `--require-golden` and independent of it — pass both for a
+    /// stricter "golden AND confirmed" entry gate.
+    #[arg(long)]
+    pub require_confirmation: bool,
+
     /// Skip the automatic calendar-bars step. By default, after
     /// build-trade `tv-arm` fetches this week's forex-factory events
     /// for the chart's currency pair and arms one pause-pair + one
@@ -155,6 +162,23 @@ mod tests {
         assert_eq!(args.broker, Some(BrokerArg::Oanda));
         let args = Args::try_parse_from(["tv-arm", "--broker", "tradenation"]).expect("parse tn");
         assert_eq!(args.broker, Some(BrokerArg::TradeNation));
+    }
+
+    #[test]
+    fn require_confirmation_defaults_off_and_parses() {
+        let args = Args::try_parse_from(["tv-arm"]).expect("parse");
+        assert!(!args.require_confirmation);
+        let args = Args::try_parse_from(["tv-arm", "--require-confirmation"]).expect("parse");
+        assert!(args.require_confirmation);
+    }
+
+    #[test]
+    fn require_golden_and_confirmation_compose() {
+        // Independent gates — both flags accepted together.
+        let args = Args::try_parse_from(["tv-arm", "--require-golden", "--require-confirmation"])
+            .expect("parse");
+        assert!(args.require_golden);
+        assert!(args.require_confirmation);
     }
 
     #[test]

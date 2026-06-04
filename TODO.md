@@ -1,5 +1,18 @@
 # TODO
 
+## Done — `--require-confirmation` flag on tv-arm
+
+`needs_confirmed` was first-class on `Intent` and on the close path
+(`needs_confirmed_close`) but the enter path only had `--require-golden`.
+Added the symmetric entry-side gate end to end:
+
+- [x] `TradeSpec.needs_confirmed: bool` (entry-side, symmetric with
+      `needs_golden`, distinct from `needs_confirmed_close`).
+- [x] Threaded through `build_enter_alert` → `intent.needs_confirmed`.
+- [x] `tv-arm --require-confirmation` flag → `spec.needs_confirmed`.
+- [x] Tests: enter-only threading, golden+confirmed coexist, arg parsing.
+- [x] README tv-arm flag list updated; `cargo test`/`clippy`/`fmt` green.
+
 ## Active — fix `too-low` / pcl-exhausted veto closing open positions
 
 Bug: the pcl-exhausted veto (`too-low` for shorts, `too-high` for longs) is
