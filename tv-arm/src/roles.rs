@@ -143,7 +143,7 @@ pub fn classify<F: DrawingFetcher>(fetcher: &F, stubs: &[DrawingStub]) -> Result
         };
         match role {
             Some(r) => debug!(id = %stub.id, kind, label = lbl, role = r, "drawing classified"),
-            None => info!(
+            None => debug!(
                 id = %stub.id,
                 kind,
                 label = lbl,
