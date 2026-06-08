@@ -270,6 +270,7 @@ fn build_pause_intent(
         // self-describing (operators see "what was this for?" without
         // grepping the matching pause).
         reason: spec.reason.clone(),
+        mw: None,
     }
 }
 

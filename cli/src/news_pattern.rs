@@ -252,6 +252,7 @@ fn build_news_intent(
         inside_window: Vec::new(),
         sr_bands: Vec::new(),
         reason: spec.reason.clone(),
+        mw: None,
     }
 }
 

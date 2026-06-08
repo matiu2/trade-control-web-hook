@@ -238,6 +238,7 @@ mod tests {
             inside_window: Vec::new(),
             sr_bands: Vec::new(),
             reason: None,
+            mw: None,
         }
     }
 

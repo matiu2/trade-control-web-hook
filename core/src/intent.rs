@@ -265,6 +265,39 @@ mod signal_kind_serde {
     }
 }
 
+/// Static M / W (double-top / double-bottom) parameters baked into a
+/// signed `enter` intent at arm time by `tv-arm`.
+///
+/// The load-bearing reason this lives on the intent (rather than being
+/// computed chart-side): the Pine study is attached to the chart/view,
+/// not to a specific path drawing, so it can't take per-trade anchors
+/// as inputs. `tv-arm` reads the 3 path anchors and the broker spread
+/// at arm time and bakes them here; the worker combines these static
+/// params with the live shell OHLC (every-bar-close) to compute the
+/// stop-entry / SL / TP and place the order. See
+/// `core/src/intent/mw_resolution.rs` for the mid→bid/ask formulas.
+///
+/// All three anchor prices are **MID** prices, exactly as read off the
+/// chart. The spread correction happens in resolution, not here.
+#[derive(Debug, Clone, Copy, PartialEq, Deserialize, Serialize)]
+pub struct MwParams {
+    /// `C` — the neckline. Entry trigger anchor and abort level (mid).
+    pub neckline: f64,
+    /// `B` — the first peak (M) / first trough (W). The SL anchor base
+    /// (mid): SL sits one pip + spread beyond it.
+    pub first_point: f64,
+    /// `A` — the runup start. Audit / log only; the worker doesn't use
+    /// it for entry geometry (it fed the arm-time neckline-% gate).
+    pub runup_start: f64,
+    /// Broker spread in pips, read at arm time. The worker has no live
+    /// spread at entry, so this baked value drives the mid→bid/ask
+    /// correction on every level. `>= 0`.
+    pub spread_pips: f64,
+    /// Instrument pip size at arm time (e.g. `0.0001` for EUR/USD,
+    /// `0.01` for JPY pairs). `> 0`.
+    pub pip_size: f64,
+}
+
 /// The fully-decrypted intent. `v` lets us reject future protocol versions cleanly.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Intent {
@@ -669,6 +702,17 @@ pub struct Intent {
     /// general YAML body cap, not here.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+    /// M / W (double-top / double-bottom) static parameters, baked by
+    /// `tv-arm` at arm time. Present only on M/W `enter` intents; the
+    /// worker's resolution path takes a dedicated branch when this is
+    /// `Some(_)`, deriving stop-entry / SL / TP from these params + the
+    /// live shell OHLC instead of reading `entry` / `stop_loss` /
+    /// `take_profit` (which are absent for M/W). See [`MwParams`].
+    ///
+    /// Default-absent = a non-M/W intent; byte-identical wire form to
+    /// pre-feature intents.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mw: Option<MwParams>,
 }
 
 /// Skip-serializing predicate for [`Intent::max_retries`]. Returns true
@@ -798,6 +842,14 @@ pub enum IntentValidationError {
     /// `prep-expire` is missing `step` — the worker can't tell which
     /// prep to block without it.
     MissingPrepExpireStep,
+    /// `mw: Some(_)` on a non-Enter action — the M/W static params only
+    /// drive the worker's stop-entry geometry, which is an `enter`
+    /// concept. A veto/prep/close carrying `mw` is a builder bug.
+    MwOnNonEnter,
+    /// One of the [`MwParams`] fields failed its shape contract: an
+    /// anchor price was non-finite, `spread_pips` was negative or
+    /// non-finite, or `pip_size` was non-positive or non-finite.
+    MwFieldInvalid,
 }
 
 impl core::fmt::Display for IntentValidationError {
@@ -857,6 +909,10 @@ impl core::fmt::Display for IntentValidationError {
             Self::MissingPrepExpireStep => {
                 f.write_str("prep-expire requires `step` (which prep to block)")
             }
+            Self::MwOnNonEnter => f.write_str("mw params are only valid on action: enter"),
+            Self::MwFieldInvalid => f.write_str(
+                "mw params invalid: anchor prices must be finite, spread_pips >= 0, pip_size > 0",
+            ),
         }
     }
 }
@@ -990,6 +1046,26 @@ impl Intent {
         }
         if self.sr_bands.iter().any(|[lo, hi]| lo > hi) {
             return Err(IntentValidationError::InvalidSrBands);
+        }
+        // M/W static params: only on `enter` (they drive stop-entry
+        // geometry), and every field must be sane — non-finite anchors,
+        // a negative spread, or a non-positive pip size would feed NaN /
+        // garbage into the worker's mid-correct resolution. The worker
+        // derives entry/SL/TP from these, so the "enter requires
+        // entry/stop_loss/take_profit" rule is relaxed when `mw` is set
+        // (those fields are absent for M/W) — that relaxation lives in
+        // `resolution::from_intent`, not here.
+        if let Some(mw) = &self.mw {
+            if self.action != Action::Enter {
+                return Err(IntentValidationError::MwOnNonEnter);
+            }
+            let anchors_finite =
+                mw.neckline.is_finite() && mw.first_point.is_finite() && mw.runup_start.is_finite();
+            let spread_ok = mw.spread_pips.is_finite() && mw.spread_pips >= 0.0;
+            let pip_ok = mw.pip_size.is_finite() && mw.pip_size > 0.0;
+            if !(anchors_finite && spread_ok && pip_ok) {
+                return Err(IntentValidationError::MwFieldInvalid);
+            }
         }
         Ok(())
     }
@@ -3085,5 +3161,102 @@ mod tests {
             serde_yaml::to_string(&Action::Unlock).unwrap().trim(),
             "unlock"
         );
+    }
+
+    /// A well-formed M/W enter carries the baked `mw` params and *no*
+    /// entry/stop_loss/take_profit — the worker derives those. The
+    /// `enter requires entry/SL/TP` relaxation lives in resolution, so
+    /// `validate` accepts this shape on its own.
+    fn mw_enter_yaml() -> &'static str {
+        "
+            v: 1
+            id: mw-eurusd-abc
+            not_after: \"2026-05-13T20:00:00Z\"
+            action: enter
+            instrument: EUR_USD
+            direction: short
+            mw:
+              neckline: 1.1120
+              first_point: 1.1200
+              runup_start: 1.1000
+              spread_pips: 0.8
+              pip_size: 0.0001
+        "
+    }
+
+    #[test]
+    fn validate_accepts_well_formed_mw_enter() {
+        let intent: Intent = serde_yaml::from_str(mw_enter_yaml()).unwrap();
+        let mw = intent.mw.expect("mw params present");
+        assert!((mw.neckline - 1.1120).abs() < 1e-9);
+        assert!((mw.first_point - 1.1200).abs() < 1e-9);
+        assert!((mw.spread_pips - 0.8).abs() < 1e-9);
+        intent.validate().unwrap();
+    }
+
+    #[test]
+    fn validate_rejects_mw_on_non_enter() {
+        // Same mw block, but action = close. mw only drives stop-entry
+        // geometry, so it has no business on a non-enter.
+        let yaml = mw_enter_yaml().replace("action: enter", "action: close");
+        let intent: Intent = serde_yaml::from_str(&yaml).unwrap();
+        assert_eq!(intent.validate(), Err(IntentValidationError::MwOnNonEnter));
+    }
+
+    #[test]
+    fn validate_rejects_mw_non_finite_anchor() {
+        let yaml = mw_enter_yaml().replace("neckline: 1.1120", "neckline: .nan");
+        let intent: Intent = serde_yaml::from_str(&yaml).unwrap();
+        assert_eq!(
+            intent.validate(),
+            Err(IntentValidationError::MwFieldInvalid)
+        );
+    }
+
+    #[test]
+    fn validate_rejects_mw_negative_spread() {
+        let yaml = mw_enter_yaml().replace("spread_pips: 0.8", "spread_pips: -0.1");
+        let intent: Intent = serde_yaml::from_str(&yaml).unwrap();
+        assert_eq!(
+            intent.validate(),
+            Err(IntentValidationError::MwFieldInvalid)
+        );
+    }
+
+    #[test]
+    fn validate_rejects_mw_non_positive_pip_size() {
+        let yaml = mw_enter_yaml().replace("pip_size: 0.0001", "pip_size: 0.0");
+        let intent: Intent = serde_yaml::from_str(&yaml).unwrap();
+        assert_eq!(
+            intent.validate(),
+            Err(IntentValidationError::MwFieldInvalid)
+        );
+    }
+
+    #[test]
+    fn mw_field_elided_when_none() {
+        // A non-M/W intent must serialise byte-identically to pre-feature
+        // intents — no `mw:` key at all.
+        let yaml = "
+            v: 1
+            id: hs-eurusd-abc
+            not_after: \"2026-05-13T20:00:00Z\"
+            action: enter
+            instrument: EUR_USD
+            direction: long
+            entry: { type: market }
+        ";
+        let intent: Intent = serde_yaml::from_str(yaml).unwrap();
+        assert!(intent.mw.is_none());
+        let out = serde_yaml::to_string(&intent).unwrap();
+        assert!(!out.contains("mw:"), "mw key leaked into wire form:\n{out}");
+    }
+
+    #[test]
+    fn mw_enter_round_trips() {
+        let intent: Intent = serde_yaml::from_str(mw_enter_yaml()).unwrap();
+        let out = serde_yaml::to_string(&intent).unwrap();
+        let back: Intent = serde_yaml::from_str(&out).unwrap();
+        assert_eq!(intent.mw, back.mw);
     }
 }

@@ -22,7 +22,8 @@ Commits (each tested, clippy+fmt green):
 - [x] 2. tv-arm/src/mw_geometry.rs — neckline_retrace_pct, cancel_level,
   abort_level (temp `None` stub in alert_spec for the two new basenames;
   replaced properly in commit 8)
-- [ ] 3. core — MwParams + Intent.mw + validate
+- [x] 3. core — MwParams + Intent.mw + validate (MwOnNonEnter /
+  MwFieldInvalid; `mw: None` threaded through all Intent literals)
 - [ ] 4. core/src/intent/mw_resolution.rs — mid-correct entry/SL/TP +
   from_intent branch
 - [ ] 5. tv-arm roles.rs — PATH kind + mw_path (verify tv-mcp kind string)
