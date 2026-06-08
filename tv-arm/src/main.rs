@@ -26,6 +26,7 @@ mod geometry;
 mod instrument_recovery;
 mod instrument_resolution;
 mod manifest;
+mod mw_geometry;
 mod pipeline;
 mod post_outcome;
 mod roles;

@@ -17,10 +17,11 @@ mid-correct spread (±½spread on every level); single-shot, only a broker
 rejection of a placed order disarms; alignment == the cancel level.
 
 Commits (each tested, clippy+fmt green):
-- [ ] 1. conventions — MW_PATH_LABELS, mw_direction_from_label; basenames
-  VetoMwCancel/VetoMwAbort
-- [ ] 2. tv-arm/src/mw_geometry.rs — neckline_retrace_pct, cancel_level,
-  abort_level
+- [x] 1. conventions — MW_PATH_LABELS, mw_direction_from_label; basenames
+  VetoMwCancel/VetoMwAbort  (fa8f505)
+- [x] 2. tv-arm/src/mw_geometry.rs — neckline_retrace_pct, cancel_level,
+  abort_level (temp `None` stub in alert_spec for the two new basenames;
+  replaced properly in commit 8)
 - [ ] 3. core — MwParams + Intent.mw + validate
 - [ ] 4. core/src/intent/mw_resolution.rs — mid-correct entry/SL/TP +
   from_intent branch

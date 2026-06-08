@@ -320,6 +320,11 @@ pub fn build_alert_spec(
             name: String::new(),
             message: String::new(),
         }),
+        // TODO(commit 8): M/W cancel/abort PriceValue arms — cancel at
+        // `mw_geometry::cancel_level` (intra-bar `OnFirstFire`), abort at
+        // `abort_level(neckline)` (`OnBarClose`). Stubbed to `None` for now
+        // so the geometry module (commit 2) compiles and tests run.
+        AlertBasename::VetoMwCancel | AlertBasename::VetoMwAbort => None,
     })
 }
 
