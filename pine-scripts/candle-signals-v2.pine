@@ -33,6 +33,15 @@ indicator("Candle Signals", shorttitle="Candle Signals", overlay=true, max_label
 //   worker indexes this menu with the signed `expiry_bars` to cancel a
 //   resting entry order N bars after placement. na on non-time charts.
 //
+// v2.4: adds an "Every Bar Close" alertcondition firing every closed bar
+//   with only TradingView built-ins (close/high/low/time, no plots). It is
+//   the per-bar heartbeat that M/W (double-top / double-bottom) reversal
+//   enter intents bind to — those trades carry no chart-side pattern
+//   detection; tv-arm bakes the path geometry into the signed intent and the
+//   worker recomputes the stop-entry/SL/TP each bar close. H&S is unaffected
+//   (it keeps firing on Long/Short Pattern). Requires a manual republish of
+//   the study after pulling this version.
+//
 // Single alert per direction; the worker-side Rhai engine reads the
 // shell vars to decide whether to act (golden filter, kind filter,
 // confirmation requirement, candle-size override, etc.).
@@ -545,3 +554,13 @@ PATTERN_MSG = 'signal_high={{plot("signal_high")}}\nsignal_low={{plot("signal_lo
 
 alertcondition(bullish_signal or bullish_just_valid, "Long Pattern",  PATTERN_MSG)
 alertcondition(bearish_signal or bearish_just_valid, "Short Pattern", PATTERN_MSG)
+
+// M/W (double-top / double-bottom) reversal trades have no prep chain and no
+// pattern-detection on the chart — tv-arm bakes the path geometry into the
+// signed enter intent, and the worker recomputes the stop-entry/SL/TP each bar
+// close from those baked params plus live OHLC. This alertcondition is the
+// per-bar-close heartbeat the M/W enter intent binds to: it fires every closed
+// bar carrying only TradingView built-ins (no plots), since the worker needs
+// nothing from the chart beyond the live shell. Unused by H&S, which keeps
+// firing on the Long/Short Pattern conditions above.
+alertcondition(true, "Every Bar Close", 'close={{close}}\nhigh={{high}}\nlow={{low}}\ntime={{time}}')

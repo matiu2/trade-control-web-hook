@@ -56,7 +56,12 @@ Commits (each tested, clippy+fmt green):
   commit 9). NOTE for commit 9: interactive build still errors for M/W — the
   `_ => unreachable!` arm in PatternGeometry::for_pattern stays (M/W never
   call it). NOTE: TradePattern::for_pattern still panics for M/W by design.
-- [ ] 7. Pine — alertcondition(true, "Every Bar Close", ...) (manual republish)
+- [x] 7. Pine — `alertcondition(true, "Every Bar Close", 'close/high/low/time')`
+  added to candle-signals-v2.pine (TV built-ins only, no new plots). H&S keeps
+  firing on Long/Short Pattern; M/W enter binds to this in commit 8. Added a
+  v2.4 header changelog note flagging the **manual republish** requirement.
+  README left as-is (no stale M/W claim; operator-facing M/W story lands in
+  the final README sync after commits 8–10).
 - [ ] 8. tv-arm alert_spec — cancel(intra-bar OnFirstFire)/abort(OnBarClose)
   PriceValue arms (replace the temp `None` stub) + Enter→"Every Bar Close"
   when is_mw
