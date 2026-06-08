@@ -278,6 +278,52 @@ step: break-and-close
 ttl_hours: 4
 ```
 
+### Prep cutoffs (`prep-expire` / `<prep>-expiry` line)
+
+A setup is only valid if the prep lands *in time*. An H&S break-and-close
+that arrives 124 bars after the pattern start (max 120 on H1) is too late
+— the pattern has grown too big to be a clean H&S, and a trade taken off
+it tends to lose. `prep-expire` is the operator-drawn cutoff for that.
+
+A `prep-expire` intent **blocks all future `prep` fires** for one named
+step on the instrument:
+
+```yaml
+v: 1
+action: prep-expire
+instrument: EUR_USD
+step: break-and-close
+ttl_hours: 24
+```
+
+Once the block is set (KV flag `prep-blocked:<scope>:<instrument>:<step>`,
+TTL-gated), any later `prep` for that step is rejected with a 409, so an
+`enter` whose `requires_preps` lists the step can never be satisfied —
+the trade silently never opens. **A prep that already fired *before* the
+block is untouched**, so a setup that legitimately landed its prep in time
+still enters. No broker call; it's pure flag state.
+
+The rejection is logged but does **not** poison the seen-id (same
+replay-scope rule as other gate rejections), so a replayed prep just
+re-logs. The three log lines — `prep-expire stored`, `prep rejected —
+expired`, and the enter gate's `missing-prep` — let you reconstruct the
+timeline later.
+
+**On the chart:** draw a vertical line labelled `<prep>-expiry` at the
+last bar the prep may land —
+`break-and-close-expiry` or `retest-expiry` (aliases `neckline-expiry` /
+`retrace-expiry`). `tv-arm` classifies it, resolves the stem to its
+canonical prep step (latest line wins per step), and emits one
+`08-prep-expire-<step>` alert bound to the line. When price/time crosses
+the line, the alert fires and the block lands.
+
+`tv-arm` guards the geometry: a `<prep>-expiry` line in the **future**
+whose matching prep trend line is **missing** is a hard error (the setup
+could never enter, so arming it is pointless); a line already in the
+**past** is a warning (re-arm later in time). `trade-expiry` is *not* a
+prep cutoff — it keeps its dedicated whole-trade-close meaning and never
+collides with this vocabulary.
+
 A `veto` is the inverse — a named blocker that must be absent for entry
 to fire:
 
