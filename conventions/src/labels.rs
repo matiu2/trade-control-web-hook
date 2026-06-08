@@ -34,6 +34,14 @@ pub const INVALIDATION_LABELS: &[&str] = &["too-high", "too-low"];
 /// becomes a price band for the `07-close-on-sr-reversal` alert.
 pub const SR_LEVEL_LABELS: &[&str] = &["support", "resistance"];
 
+/// Path-tool labels that mark an M / W reversal setup. The operator
+/// draws a 3-anchor PATH (runup start → first peak/trough → neckline
+/// retrace) and labels it `m` (double-top, short) or `w` (double-
+/// bottom, long); `mw` is an accepted neutral alias whose direction is
+/// then taken from pattern geometry by the caller. Direction resolution
+/// from the label lives in [`crate::mw_direction_from_label`].
+pub const MW_PATH_LABELS: &[&str] = &["m", "w", "mw"];
+
 /// Suffix that turns a prep label into a prep-expiry vertical-line
 /// label: `break-and-close` → `break-and-close-expiry`. The chart
 /// reader strips this suffix and matches the remainder against the
@@ -112,6 +120,17 @@ mod tests {
     fn case_insensitive() {
         assert!(matches("NECKLINE", BREAK_LABELS));
         assert!(matches("Too-High", INVALIDATION_LABELS));
+    }
+
+    #[test]
+    fn matches_mw_path_labels() {
+        assert!(matches("m", MW_PATH_LABELS));
+        assert!(matches("w", MW_PATH_LABELS));
+        assert!(matches("mw", MW_PATH_LABELS));
+        assert!(matches("M", MW_PATH_LABELS));
+        assert!(matches("  W  ", MW_PATH_LABELS));
+        assert!(!matches("mm", MW_PATH_LABELS));
+        assert!(!matches("", MW_PATH_LABELS));
     }
 
     #[test]

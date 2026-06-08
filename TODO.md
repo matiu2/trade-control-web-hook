@@ -1,5 +1,40 @@
 # TODO
 
+## In progress — M and W (double-top / double-bottom) reversal trades
+
+Adds M (double-top, short) / W (double-bottom, long) as a first-class trade
+type alongside H&S. Operator marks 3 points with the PATH tool (runup start
+A, first peak/trough B, neckline retrace C). Plan:
+`~/.home-claude/plans/we-don-t-have-any-typed-shell.md`.
+
+Key constraint: Pine is chart-attached (instrument-agnostic) so it can't
+read path anchors. tv-arm bakes static M/W params into the signed enter
+intent + emits cancel/abort as fast level vetos; a per-bar Pine hook pushes
+only OHLC; the **worker** computes entry/SL/TP from baked params + shell.
+
+Decisions: neckline gate errors ≥40% (`--allow-50-pct-m-trades` → ≤50%);
+mid-correct spread (±½spread on every level); single-shot, only a broker
+rejection of a placed order disarms; alignment == the cancel level.
+
+Commits (each tested, clippy+fmt green):
+- [ ] 1. conventions — MW_PATH_LABELS, mw_direction_from_label; basenames
+  VetoMwCancel/VetoMwAbort
+- [ ] 2. tv-arm/src/mw_geometry.rs — neckline_retrace_pct, cancel_level,
+  abort_level
+- [ ] 3. core — MwParams + Intent.mw + validate
+- [ ] 4. core/src/intent/mw_resolution.rs — mid-correct entry/SL/TP +
+  from_intent branch
+- [ ] 5. tv-arm roles.rs — PATH kind + mw_path (verify tv-mcp kind string)
+- [ ] 6. cli — TradeSpec.mw + build_mw_pattern + dispatch
+- [ ] 7. Pine — alertcondition(true, "Every Bar Close", ...)
+- [ ] 8. tv-arm alert_spec — cancel/abort PriceValue + Enter→Every Bar Close
+- [ ] 9. tv-arm args+pipeline — --allow-50-pct-m-trades, neckline gate
+  (--spread-pips stopgap)
+- [ ] 10. tv-arm — live broker spread read (replaces stopgap)
+- [ ] README sync
+
+Checkpoint tag before starting: `pre-m-and-w-trades`.
+
 ## Done — bar-based pending-order expiry (`expiry_bars`)
 
 Cancel a resting stop/limit order N bars (1..=5) after placement if it

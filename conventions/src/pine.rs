@@ -65,6 +65,22 @@ impl Direction {
     }
 }
 
+/// Direction implied by an M / W path-tool label. `m` (double-top) is a
+/// short; `w` (double-bottom) is a long. The neutral alias `mw` carries
+/// no direction on its own — the caller must derive it from geometry, so
+/// this returns `None` for `mw` (and any non-M/W label). Case-insensitive
+/// on ASCII.
+pub fn mw_direction_from_label(lbl: &str) -> Option<Direction> {
+    let t = lbl.trim();
+    if t.eq_ignore_ascii_case("m") {
+        Some(Direction::Short)
+    } else if t.eq_ignore_ascii_case("w") {
+        Some(Direction::Long)
+    } else {
+        None
+    }
+}
+
 /// Pine plot ID for the entry signal in `direction`.
 pub fn entry_plot_for(direction: Direction) -> &'static str {
     match direction {
@@ -102,6 +118,18 @@ mod tests {
         assert_eq!(Direction::Short.as_str(), "short");
         assert_eq!(Direction::Long.opposite(), Direction::Short);
         assert_eq!(Direction::Short.opposite(), Direction::Long);
+    }
+
+    #[test]
+    fn mw_direction_from_label_resolves() {
+        assert_eq!(mw_direction_from_label("m"), Some(Direction::Short));
+        assert_eq!(mw_direction_from_label("w"), Some(Direction::Long));
+        assert_eq!(mw_direction_from_label("M"), Some(Direction::Short));
+        assert_eq!(mw_direction_from_label("  w  "), Some(Direction::Long));
+        // The neutral `mw` alias carries no direction on its own.
+        assert_eq!(mw_direction_from_label("mw"), None);
+        assert_eq!(mw_direction_from_label("neckline"), None);
+        assert_eq!(mw_direction_from_label(""), None);
     }
 
     #[test]

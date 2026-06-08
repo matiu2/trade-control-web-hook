@@ -24,6 +24,17 @@ pub enum AlertBasename {
     /// `02-veto-trade-expiry` — drops the bundle at expiry. Bound to
     /// the operator's `trade-expiry` vertical line.
     VetoTradeExpiry,
+    /// `01-veto-mw-cancel` — M/W cancel: price ran past the 1.3
+    /// extension of the neckline→first-point leg (the pattern failed /
+    /// the two-peaks alignment ceiling was breached). Cancels the
+    /// pending stop and disarms future entries. Bound chart-side to a
+    /// computed price (value-bound), fires intra-bar on first cross.
+    VetoMwCancel,
+    /// `01-veto-mw-abort` — M/W abort: a candle closed back through the
+    /// neckline, so the breakout failed. Cancels the pending stop and
+    /// disarms future entries. Value-bound at the neckline price; fires
+    /// on bar close.
+    VetoMwAbort,
     /// `03-prep-break-and-close` — neckline break-and-close prep.
     PrepBreakAndClose,
     /// `04-prep-retest` — neckline retest prep.
@@ -59,6 +70,8 @@ impl AlertBasename {
             Self::VetoTooHigh => Cow::Borrowed("01-veto-too-high"),
             Self::VetoTooLow => Cow::Borrowed("01-veto-too-low"),
             Self::VetoTradeExpiry => Cow::Borrowed("02-veto-trade-expiry"),
+            Self::VetoMwCancel => Cow::Borrowed("01-veto-mw-cancel"),
+            Self::VetoMwAbort => Cow::Borrowed("01-veto-mw-abort"),
             Self::PrepBreakAndClose => Cow::Borrowed("03-prep-break-and-close"),
             Self::PrepRetest => Cow::Borrowed("04-prep-retest"),
             Self::PrepExpire(step) => Cow::Owned(format!("08-prep-expire-{step}")),
@@ -83,6 +96,8 @@ impl AlertBasename {
             "01-veto-too-high" => Some(Self::VetoTooHigh),
             "01-veto-too-low" => Some(Self::VetoTooLow),
             "02-veto-trade-expiry" => Some(Self::VetoTradeExpiry),
+            "01-veto-mw-cancel" => Some(Self::VetoMwCancel),
+            "01-veto-mw-abort" => Some(Self::VetoMwAbort),
             "03-prep-break-and-close" => Some(Self::PrepBreakAndClose),
             "04-prep-retest" => Some(Self::PrepRetest),
             "05-enter" => Some(Self::Enter),
@@ -119,11 +134,13 @@ impl AlertBasename {
 mod tests {
     use super::*;
 
-    fn variants() -> [AlertBasename; 14] {
+    fn variants() -> [AlertBasename; 16] {
         [
             AlertBasename::VetoTooHigh,
             AlertBasename::VetoTooLow,
             AlertBasename::VetoTradeExpiry,
+            AlertBasename::VetoMwCancel,
+            AlertBasename::VetoMwAbort,
             AlertBasename::PrepBreakAndClose,
             AlertBasename::PrepRetest,
             AlertBasename::PrepExpire("break-and-close".into()),
@@ -155,6 +172,8 @@ mod tests {
             AlertBasename::VetoTradeExpiry.as_str(),
             "02-veto-trade-expiry"
         );
+        assert_eq!(AlertBasename::VetoMwCancel.as_str(), "01-veto-mw-cancel");
+        assert_eq!(AlertBasename::VetoMwAbort.as_str(), "01-veto-mw-abort");
         assert_eq!(
             AlertBasename::PrepBreakAndClose.as_str(),
             "03-prep-break-and-close"
