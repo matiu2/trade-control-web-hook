@@ -939,12 +939,18 @@ fn build_all_payloads(
     calendar_bundles: &[CalendarBundle],
     trade_id: &str,
 ) -> Result<Vec<AlertPayload>> {
+    use cli::TradePattern;
+    // M/W enters bind to the per-bar "Every Bar Close" alertcondition
+    // instead of the direction's pattern plot. The flag only affects the
+    // `05-enter` payload; the auxiliary pause/news/calendar bundles never
+    // carry an enter, so threading the same value through them is a no-op.
+    let is_mw = matches!(built_trade.spec.pattern, TradePattern::M | TradePattern::W);
     let mut payloads = Vec::new();
     // 1. Main trade alerts.
     for alert in &built_trade.alerts {
         let file = format!("{}.yaml", alert.basename);
         let ctx = DispatchContext::default();
-        if let Some(mut p) = build_alert_spec(&file, direction, roles, &ctx)? {
+        if let Some(mut p) = build_alert_spec(&file, direction, roles, &ctx, is_mw)? {
             stamp_payload(&mut p, trade_id, &file, out_dir)?;
             payloads.push(p);
         }
@@ -958,7 +964,7 @@ fn build_all_payloads(
         };
         for alert in &bundle.built.alerts {
             let file = format!("{}.yaml", alert.basename);
-            if let Some(mut p) = build_alert_spec(&file, direction, roles, &ctx)? {
+            if let Some(mut p) = build_alert_spec(&file, direction, roles, &ctx, is_mw)? {
                 stamp_payload(&mut p, trade_id, &file, &bundle.out_dir)?;
                 payloads.push(p);
             }
@@ -972,7 +978,7 @@ fn build_all_payloads(
         };
         for alert in &bundle.built.alerts {
             let file = format!("{}.yaml", alert.basename);
-            if let Some(mut p) = build_alert_spec(&file, direction, roles, &ctx)? {
+            if let Some(mut p) = build_alert_spec(&file, direction, roles, &ctx, is_mw)? {
                 stamp_payload(&mut p, trade_id, &file, &bundle.out_dir)?;
                 payloads.push(p);
             }
@@ -988,7 +994,7 @@ fn build_all_payloads(
             ..Default::default()
         };
         for entry in &bundle.manifest.alerts {
-            if let Some(mut p) = build_alert_spec(&entry.file, direction, roles, &ctx)? {
+            if let Some(mut p) = build_alert_spec(&entry.file, direction, roles, &ctx, is_mw)? {
                 stamp_payload(&mut p, trade_id, &entry.file, &bundle.bundle_dir)?;
                 payloads.push(p);
             }

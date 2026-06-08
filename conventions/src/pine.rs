@@ -22,6 +22,23 @@ pub const PLOT_LONG_PATTERN: &str = "plot_10";
 /// long trades.
 pub const PLOT_SHORT_PATTERN: &str = "plot_11";
 
+/// Plot ID for the "Every Bar Close" alertcondition (Pine v2.4+). This
+/// fires every closed bar carrying only TradingView built-ins
+/// (`close`/`high`/`low`/`time`, no plots) and is the per-bar heartbeat
+/// the M/W enter intent binds to — M/W trades have no chart-side pattern
+/// detection, so the worker recomputes the stop-entry/SL/TP each bar
+/// close from baked path geometry plus the live shell.
+///
+/// The id follows the same declaration-order indexing as
+/// [`PLOT_LONG_PATTERN`]/[`PLOT_SHORT_PATTERN`]: "Every Bar Close" is
+/// declared immediately after the two pattern alertconditions, so it is
+/// the next slot (`plot_12`). Verify against a live chart with a dry
+/// `tv-arm` build after republishing the v2.4 study (the
+/// `next_candle_timestamp` plots that landed in v2.3 sit *before* these,
+/// so a stale-study mismatch surfaces as a "condition not found" on the
+/// 05-enter alert — re-check this constant first if that happens).
+pub const PLOT_EVERY_BAR_CLOSE: &str = "plot_12";
+
 /// Trade direction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Direction {

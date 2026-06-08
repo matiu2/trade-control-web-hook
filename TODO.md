@@ -62,9 +62,20 @@ Commits (each tested, clippy+fmt green):
   v2.4 header changelog note flagging the **manual republish** requirement.
   README left as-is (no stale M/W claim; operator-facing M/W story lands in
   the final README sync after commits 8–10).
-- [ ] 8. tv-arm alert_spec — cancel(intra-bar OnFirstFire)/abort(OnBarClose)
-  PriceValue arms (replace the temp `None` stub) + Enter→"Every Bar Close"
-  when is_mw
+- [x] 8. tv-arm alert_spec — M/W `VetoMwCancel`→PriceValue at `cancel_level`
+  (intra-bar `OnFirstFire`); `VetoMwAbort`→PriceValue at `abort_level(neckline)`
+  (`OnBarClose`); both read anchors from `roles.mw_path.points = [A,B,C]` via
+  new `MwVeto`+`mw_price_veto`. `build_alert_spec` gained an `is_mw` flag:
+  Enter binds to `PLOT_EVERY_BAR_CLOSE` (new conventions const `plot_12`) when
+  is_mw, else `entry_plot_for(direction)`. pipeline `build_all_payloads`
+  derives is_mw from `built_trade.spec.pattern` (M|W). 118 tv-arm tests (5
+  new), 33 conventions tests, clippy+fmt clean. NOTE for commit 9: pipeline's
+  H&S `build_trade_spec`/`build_trade_from_spec` path is unchanged — M/W never
+  reaches build_all_payloads yet (no M/W branch), so is_mw is always false in
+  practice until commit 9 wires the M/W pipeline branch. ⚠️ plot_12 is a
+  declaration-order ASSUMPTION (next_candle_timestamp plots shifted indices in
+  v2.3) — verify on a live chart in the commit-9 dry build; mismatch shows as
+  "condition not found" on 05-enter.
 - [ ] 9. tv-arm args+pipeline — --allow-50-pct-m-trades (≥40% errors w/o it,
   ≤50% with, >50% always errors); --spread-pips REQUIRED on M/W arm
   (hard-error if omitted; live read = step 10); M/W branch keyed on

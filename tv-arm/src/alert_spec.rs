@@ -16,10 +16,12 @@ use chrono::DateTime;
 use color_eyre::eyre::{Result, eyre};
 use serde::Serialize;
 use trade_control_conventions::{
-    AlertBasename, Direction, PINE_INDICATOR_NAME, entry_plot_for, reversal_close_plot_for,
+    AlertBasename, Direction, PINE_INDICATOR_NAME, PLOT_EVERY_BAR_CLOSE, entry_plot_for,
+    reversal_close_plot_for,
 };
 
 use crate::geometry::pcl_exhausted_price_from_fib;
+use crate::mw_geometry::{abort_level, cancel_level};
 use crate::roles::Roles;
 use trading_view::drawings::Drawing;
 
@@ -183,11 +185,18 @@ pub enum Frequency {
 /// chart (the orchestrator logs and skips); `Ok(Some(_))` on success;
 /// `Err` only for parse failures of supplied data (e.g. unparseable
 /// ISO timestamp).
+///
+/// `is_mw` switches the `05-enter` binding: H&S enters bind to the
+/// direction's pattern plot ([`entry_plot_for`]); M/W enters bind to the
+/// per-bar `"Every Bar Close"` alertcondition ([`PLOT_EVERY_BAR_CLOSE`])
+/// instead, since M/W has no chart-side pattern detection — the worker
+/// recomputes the geometry each bar close from baked path params.
 pub fn build_alert_spec(
     file: &str,
     direction: Direction,
     roles: &Roles,
     ctx: &DispatchContext<'_>,
+    is_mw: bool,
 ) -> Result<Option<AlertPayload>> {
     let base = file.strip_suffix(".yaml").unwrap_or(file);
     let basename = match AlertBasename::parse(base) {
@@ -263,11 +272,17 @@ pub fn build_alert_spec(
             name: String::new(),
             message: String::new(),
         }),
-        AlertBasename::Enter => Some(pine_payload(
-            entry_plot_for(direction),
-            Frequency::OnBarClose,
-            tv_name,
-        )),
+        AlertBasename::Enter => {
+            // M/W enters bind to the per-bar "Every Bar Close"
+            // alertcondition (no chart-side pattern detection); H&S
+            // enters bind to the direction's pattern plot.
+            let plot = if is_mw {
+                PLOT_EVERY_BAR_CLOSE
+            } else {
+                entry_plot_for(direction)
+            };
+            Some(pine_payload(plot, Frequency::OnBarClose, tv_name))
+        }
         // `CloseOnSrReversal` is the legacy split-form basename;
         // the CLI no longer emits it (the consolidated
         // `06-close-on-reversal` carries both news and S/R gates in
@@ -320,11 +335,12 @@ pub fn build_alert_spec(
             name: String::new(),
             message: String::new(),
         }),
-        // TODO(commit 8): M/W cancel/abort PriceValue arms — cancel at
-        // `mw_geometry::cancel_level` (intra-bar `OnFirstFire`), abort at
-        // `abort_level(neckline)` (`OnBarClose`). Stubbed to `None` for now
-        // so the geometry module (commit 2) compiles and tests run.
-        AlertBasename::VetoMwCancel | AlertBasename::VetoMwAbort => None,
+        // M/W cancel / abort: numeric price-level vetos computed from
+        // the path anchors [A (runup start), B (first point), C
+        // (neckline)]. Both are `PriceValue` (no chart drawing); they
+        // differ only in level and fire frequency.
+        AlertBasename::VetoMwCancel => mw_price_veto(roles, MwVeto::Cancel, tv_name),
+        AlertBasename::VetoMwAbort => mw_price_veto(roles, MwVeto::Abort, tv_name),
     })
 }
 
@@ -374,6 +390,46 @@ fn invalidation_or_pcl(
             message: String::new(),
         })
     }
+}
+
+/// Which M/W price-level veto to build.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MwVeto {
+    /// 1.3-extension of the neckline→B leg. Fires intra-bar (the
+    /// pending stop must die the moment price reaches it), so
+    /// `OnFirstFire`. Also the implicit two-peaks alignment ceiling.
+    Cancel,
+    /// The neckline itself. A *candle close* back through here means the
+    /// breakout failed, so `OnBarClose`.
+    Abort,
+}
+
+/// Build the `PriceValue` payload for an M/W cancel / abort veto from
+/// the path anchors. Returns `None` when no M/W path is on the chart
+/// (the orchestrator logs and skips, same as a missing H&S role).
+///
+/// Anchor order is load-bearing: `points = [A (runup start), B (first
+/// point), C (neckline)]` in draw order — the cancel level needs B and
+/// C, the abort level needs C alone.
+fn mw_price_veto(roles: &Roles, which: MwVeto, tv_name: String) -> Option<AlertPayload> {
+    let path = roles.mw_path.as_ref()?;
+    // A path classified into `mw_path` always has exactly 3 anchors
+    // (`is_mw_path` enforces it), but guard the indices defensively.
+    let first_point = path.points.get(1)?.price;
+    let neckline = path.points.get(2)?.price;
+    let (value, frequency) = match which {
+        MwVeto::Cancel => (cancel_level(first_point, neckline), Frequency::OnFirstFire),
+        MwVeto::Abort => (abort_level(neckline), Frequency::OnBarClose),
+    };
+    Some(AlertPayload::PriceValue {
+        value,
+        condition_type: ConditionType::Cross,
+        frequency,
+        auto_deactivate: false,
+        tv_name,
+        name: String::new(),
+        message: String::new(),
+    })
 }
 
 /// Build the synthetic-vertical-line payload for a calendar-derived
@@ -464,9 +520,15 @@ mod tests {
     fn short_invalidation_is_drawing_bound() {
         let roles = short_roles_full();
         let ctx = DispatchContext::default();
-        let p = build_alert_spec("01-veto-too-high.yaml", Direction::Short, &roles, &ctx)
-            .unwrap()
-            .unwrap();
+        let p = build_alert_spec(
+            "01-veto-too-high.yaml",
+            Direction::Short,
+            &roles,
+            &ctx,
+            false,
+        )
+        .unwrap()
+        .unwrap();
         match p {
             AlertPayload::Drawing {
                 drawing_id,
@@ -491,9 +553,15 @@ mod tests {
         // computed from the fib.
         let roles = short_roles_full();
         let ctx = DispatchContext::default();
-        let p = build_alert_spec("01-veto-too-low.yaml", Direction::Short, &roles, &ctx)
-            .unwrap()
-            .unwrap();
+        let p = build_alert_spec(
+            "01-veto-too-low.yaml",
+            Direction::Short,
+            &roles,
+            &ctx,
+            false,
+        )
+        .unwrap()
+        .unwrap();
         match p {
             AlertPayload::PriceValue { value, tv_name, .. } => {
                 // fib at [1.20, 1.10], short: midpoint=1.15, tp=1.00,
@@ -511,7 +579,7 @@ mod tests {
         // `01-veto-too-low`.
         let roles = short_roles_full(); // labels don't matter for dispatch
         let ctx = DispatchContext::default();
-        let p = build_alert_spec("01-veto-too-low.yaml", Direction::Long, &roles, &ctx)
+        let p = build_alert_spec("01-veto-too-low.yaml", Direction::Long, &roles, &ctx, false)
             .unwrap()
             .unwrap();
         match p {
@@ -526,9 +594,15 @@ mod tests {
     fn trade_expiry_drawing_bound_to_vertical_line() {
         let roles = short_roles_full();
         let ctx = DispatchContext::default();
-        let p = build_alert_spec("02-veto-trade-expiry.yaml", Direction::Short, &roles, &ctx)
-            .unwrap()
-            .unwrap();
+        let p = build_alert_spec(
+            "02-veto-trade-expiry.yaml",
+            Direction::Short,
+            &roles,
+            &ctx,
+            false,
+        )
+        .unwrap()
+        .unwrap();
         match p {
             AlertPayload::Drawing { tool, .. } => {
                 assert_eq!(tool, Tool::LineToolVertLine);
@@ -546,6 +620,7 @@ mod tests {
             Direction::Short,
             &roles,
             &ctx,
+            false,
         )
         .unwrap()
         .unwrap();
@@ -554,6 +629,7 @@ mod tests {
             Direction::Long,
             &roles,
             &ctx,
+            false,
         )
         .unwrap()
         .unwrap();
@@ -573,7 +649,7 @@ mod tests {
     fn retest_cross_direction_is_opposite_of_break() {
         let roles = short_roles_full();
         let ctx = DispatchContext::default();
-        let p = build_alert_spec("04-prep-retest.yaml", Direction::Short, &roles, &ctx)
+        let p = build_alert_spec("04-prep-retest.yaml", Direction::Short, &roles, &ctx, false)
             .unwrap()
             .unwrap();
         if let AlertPayload::Drawing { condition_type, .. } = p {
@@ -587,10 +663,10 @@ mod tests {
     fn enter_uses_pine_plot_for_direction() {
         let roles = short_roles_full();
         let ctx = DispatchContext::default();
-        let p_short = build_alert_spec("05-enter.yaml", Direction::Short, &roles, &ctx)
+        let p_short = build_alert_spec("05-enter.yaml", Direction::Short, &roles, &ctx, false)
             .unwrap()
             .unwrap();
-        let p_long = build_alert_spec("05-enter.yaml", Direction::Long, &roles, &ctx)
+        let p_long = build_alert_spec("05-enter.yaml", Direction::Long, &roles, &ctx, false)
             .unwrap()
             .unwrap();
         match p_short {
@@ -616,9 +692,15 @@ mod tests {
     fn close_on_reversal_uses_opposite_plot() {
         let roles = short_roles_full();
         let ctx = DispatchContext::default();
-        let p = build_alert_spec("06-close-on-reversal.yaml", Direction::Short, &roles, &ctx)
-            .unwrap()
-            .unwrap();
+        let p = build_alert_spec(
+            "06-close-on-reversal.yaml",
+            Direction::Short,
+            &roles,
+            &ctx,
+            false,
+        )
+        .unwrap()
+        .unwrap();
         if let AlertPayload::PineAlertcondition { alert_cond_id, .. } = p {
             // Short trade closes on a Long Pattern reversal.
             assert_eq!(alert_cond_id, "plot_10");
@@ -636,10 +718,10 @@ mod tests {
             blackout_pair: Some((&start, &end)),
             ..Default::default()
         };
-        let p_start = build_alert_spec("01-pause-abc.yaml", Direction::Short, &roles, &ctx)
+        let p_start = build_alert_spec("01-pause-abc.yaml", Direction::Short, &roles, &ctx, false)
             .unwrap()
             .unwrap();
-        let p_end = build_alert_spec("02-resume-abc.yaml", Direction::Short, &roles, &ctx)
+        let p_end = build_alert_spec("02-resume-abc.yaml", Direction::Short, &roles, &ctx, false)
             .unwrap()
             .unwrap();
         if let AlertPayload::Drawing { drawing_id, .. } = p_start {
@@ -663,9 +745,15 @@ mod tests {
             news_pair: Some((&start, &end)),
             ..Default::default()
         };
-        let p_start = build_alert_spec("01-news-start-eur.yaml", Direction::Short, &roles, &ctx)
-            .unwrap()
-            .unwrap();
+        let p_start = build_alert_spec(
+            "01-news-start-eur.yaml",
+            Direction::Short,
+            &roles,
+            &ctx,
+            false,
+        )
+        .unwrap()
+        .unwrap();
         if let AlertPayload::Drawing { drawing_id, .. } = p_start {
             assert_eq!(drawing_id, "ns");
         } else {
@@ -683,9 +771,15 @@ mod tests {
             }),
             ..Default::default()
         };
-        let p = build_alert_spec("01-pause-cal-x-pause.yaml", Direction::Short, &roles, &ctx)
-            .unwrap()
-            .unwrap();
+        let p = build_alert_spec(
+            "01-pause-cal-x-pause.yaml",
+            Direction::Short,
+            &roles,
+            &ctx,
+            false,
+        )
+        .unwrap()
+        .unwrap();
         if let AlertPayload::VertLineAt {
             base_time_epoch, ..
         } = p
@@ -707,9 +801,15 @@ mod tests {
             }),
             ..Default::default()
         };
-        let p = build_alert_spec("02-resume-cal-x-pause.yaml", Direction::Short, &roles, &ctx)
-            .unwrap()
-            .unwrap();
+        let p = build_alert_spec(
+            "02-resume-cal-x-pause.yaml",
+            Direction::Short,
+            &roles,
+            &ctx,
+            false,
+        )
+        .unwrap()
+        .unwrap();
         if let AlertPayload::VertLineAt {
             base_time_epoch, ..
         } = p
@@ -733,6 +833,7 @@ mod tests {
             Direction::Short,
             &roles,
             &ctx,
+            false,
         )
         .unwrap()
         .unwrap();
@@ -752,8 +853,14 @@ mod tests {
         // No prep_expiries on the chart → the alert is skipped.
         let roles = short_roles_full();
         let ctx = DispatchContext::default();
-        let p =
-            build_alert_spec("08-prep-expire-retest.yaml", Direction::Short, &roles, &ctx).unwrap();
+        let p = build_alert_spec(
+            "08-prep-expire-retest.yaml",
+            Direction::Short,
+            &roles,
+            &ctx,
+            false,
+        )
+        .unwrap();
         assert!(p.is_none());
     }
 
@@ -761,7 +868,14 @@ mod tests {
     fn missing_role_returns_none() {
         let empty = Roles::default();
         let ctx = DispatchContext::default();
-        let p = build_alert_spec("01-veto-too-high.yaml", Direction::Short, &empty, &ctx).unwrap();
+        let p = build_alert_spec(
+            "01-veto-too-high.yaml",
+            Direction::Short,
+            &empty,
+            &ctx,
+            false,
+        )
+        .unwrap();
         assert!(p.is_none());
     }
 
@@ -769,7 +883,8 @@ mod tests {
     fn unrecognized_basename_returns_none() {
         let roles = short_roles_full();
         let ctx = DispatchContext::default();
-        let p = build_alert_spec("99-nonsense.yaml", Direction::Short, &roles, &ctx).unwrap();
+        let p =
+            build_alert_spec("99-nonsense.yaml", Direction::Short, &roles, &ctx, false).unwrap();
         assert!(p.is_none());
     }
 
@@ -780,7 +895,7 @@ mod tests {
         // the `kind` tag is set correctly.
         let roles = short_roles_full();
         let ctx = DispatchContext::default();
-        let p = build_alert_spec("05-enter.yaml", Direction::Short, &roles, &ctx)
+        let p = build_alert_spec("05-enter.yaml", Direction::Short, &roles, &ctx, false)
             .unwrap()
             .unwrap();
         let v = serde_json::to_value(&p).unwrap();
@@ -799,6 +914,7 @@ mod tests {
             Direction::Short,
             &roles,
             &ctx,
+            false,
         )
         .unwrap()
         .unwrap();
@@ -807,5 +923,153 @@ mod tests {
         assert_eq!(v["condition_type"], "cross_down");
         assert_eq!(v["frequency"], "on_bar_close");
         assert_eq!(v["tool"], "LineToolTrendLine");
+    }
+
+    // ===== M / W (double-top / double-bottom) ===========================
+
+    /// Roles carrying an M-path with the worked-example anchors
+    /// (A=1.1000, B=1.1200, C=1.1120 in draw order) so the cancel level
+    /// computes to 1.1224 and the abort level to 1.1120.
+    fn roles_with_m_path() -> Roles {
+        Roles {
+            mw_path: Some(drawing(
+                "p",
+                "",
+                vec![(10, 1.1000), (20, 1.1200), (30, 1.1120)],
+            )),
+            ..Roles::default()
+        }
+    }
+
+    #[test]
+    fn mw_cancel_is_price_value_at_1_3_extension_on_first_fire() {
+        let roles = roles_with_m_path();
+        let ctx = DispatchContext::default();
+        let p = build_alert_spec(
+            "01-veto-mw-cancel.yaml",
+            Direction::Short,
+            &roles,
+            &ctx,
+            true,
+        )
+        .unwrap()
+        .unwrap();
+        match p {
+            AlertPayload::PriceValue {
+                value,
+                condition_type,
+                frequency,
+                tv_name,
+                ..
+            } => {
+                // cancel = 1.1120 + 1.3 * (1.1200 - 1.1120) = 1.1224
+                assert!((value - 1.1224).abs() < 1e-9, "value = {value}");
+                assert_eq!(condition_type, ConditionType::Cross);
+                // Pending stop must die intra-bar → OnFirstFire.
+                assert_eq!(frequency, Frequency::OnFirstFire);
+                assert_eq!(tv_name, "veto-mw-cancel");
+            }
+            _ => panic!("expected PriceValue, got {p:?}"),
+        }
+    }
+
+    #[test]
+    fn mw_abort_is_price_value_at_neckline_on_bar_close() {
+        let roles = roles_with_m_path();
+        let ctx = DispatchContext::default();
+        let p = build_alert_spec(
+            "01-veto-mw-abort.yaml",
+            Direction::Short,
+            &roles,
+            &ctx,
+            true,
+        )
+        .unwrap()
+        .unwrap();
+        match p {
+            AlertPayload::PriceValue {
+                value,
+                frequency,
+                tv_name,
+                ..
+            } => {
+                // abort = neckline = C = 1.1120
+                assert!((value - 1.1120).abs() < 1e-9, "value = {value}");
+                // A *close* back through the neckline aborts → OnBarClose.
+                assert_eq!(frequency, Frequency::OnBarClose);
+                assert_eq!(tv_name, "veto-mw-abort");
+            }
+            _ => panic!("expected PriceValue, got {p:?}"),
+        }
+    }
+
+    #[test]
+    fn mw_vetos_without_path_return_none() {
+        // No mw_path on the chart → the veto is skipped (logged by the
+        // orchestrator), same as any missing H&S role.
+        let roles = short_roles_full(); // has no mw_path
+        let ctx = DispatchContext::default();
+        assert!(
+            build_alert_spec(
+                "01-veto-mw-cancel.yaml",
+                Direction::Short,
+                &roles,
+                &ctx,
+                true
+            )
+            .unwrap()
+            .is_none()
+        );
+        assert!(
+            build_alert_spec(
+                "01-veto-mw-abort.yaml",
+                Direction::Short,
+                &roles,
+                &ctx,
+                true
+            )
+            .unwrap()
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn mw_enter_binds_to_every_bar_close_not_pattern_plot() {
+        let roles = roles_with_m_path();
+        let ctx = DispatchContext::default();
+        // M is short; H&S short enter would bind to plot_11, but the M/W
+        // enter must bind to the "Every Bar Close" alertcondition.
+        let p = build_alert_spec("05-enter.yaml", Direction::Short, &roles, &ctx, true)
+            .unwrap()
+            .unwrap();
+        match p {
+            AlertPayload::PineAlertcondition {
+                alert_cond_id,
+                indicator_name,
+                frequency,
+                ..
+            } => {
+                assert_eq!(alert_cond_id, "plot_12");
+                assert_eq!(indicator_name, "Candle Signals");
+                assert_eq!(frequency, Frequency::OnBarClose);
+            }
+            _ => panic!("expected PineAlertcondition for M/W enter, got {p:?}"),
+        }
+    }
+
+    #[test]
+    fn hs_enter_still_binds_to_pattern_plot_when_not_mw() {
+        // Guard the H&S path is untouched: is_mw=false keeps the
+        // direction's pattern plot.
+        let roles = short_roles_full();
+        let ctx = DispatchContext::default();
+        let p = build_alert_spec("05-enter.yaml", Direction::Short, &roles, &ctx, false)
+            .unwrap()
+            .unwrap();
+        if let AlertPayload::PineAlertcondition { alert_cond_id, .. } = p {
+            assert_eq!(alert_cond_id, "plot_11");
+        } else {
+            panic!("expected PineAlertcondition, got {p:?}");
+        }
     }
 }
