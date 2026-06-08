@@ -165,6 +165,12 @@ impl Resolved {
         if intent.action != Action::Enter {
             return Err(ResolveError::NotAnEntry);
         }
+        // M/W setups derive entry/SL/TP from baked path params + the live
+        // shell OHLC instead of `entry` / `stop_loss` / `take_profit`
+        // (which are absent). Dedicated branch — see `mw_resolution`.
+        if let Some(mw) = &intent.mw {
+            return Self::from_mw_intent(intent, shell, mw);
+        }
         let direction = intent
             .direction
             .ok_or(ResolveError::MissingField("direction"))?;
@@ -180,25 +186,6 @@ impl Resolved {
             .take_profit
             .as_ref()
             .ok_or(ResolveError::MissingField("take_profit"))?;
-        // Sizing-mode selection. `risk_pct` is always present (default
-        // `Static(1.0)`), so it's the fallback. `risk_amount` and
-        // `size_units` are mutually exclusive with each other and with
-        // each other only — either overrides the risk_pct default. The
-        // actual values — all can be a `Tunable<f64>` script — are
-        // resolved at the bottom of this function, after the geometry
-        // is finalised so scripts can reference `r_multiple` /
-        // `tp_distance` / etc.
-        enum SizingMode {
-            Pct,
-            Amount,
-            Units,
-        }
-        let sizing_mode = match (intent.risk_amount.is_some(), intent.size_units.is_some()) {
-            (false, false) => SizingMode::Pct,
-            (true, false) => SizingMode::Amount,
-            (false, true) => SizingMode::Units,
-            (true, true) => return Err(ResolveError::BothRiskModesSet),
-        };
 
         let stop_loss = sl_ref.resolve(shell, pip_size);
 
@@ -261,6 +248,51 @@ impl Resolved {
             reference_price,
             stop_loss,
         );
+
+        Self::finish_with_sizing(
+            intent,
+            shell,
+            pip_size,
+            direction,
+            entry,
+            reference_price,
+            stop_loss,
+            take_profit,
+        )
+    }
+
+    /// Shared tail for both the standard and the M/W resolution paths:
+    /// range-check the entry, build the geometry snapshot scripts
+    /// evaluate against, enforce `min_r`, and resolve the sizing mode.
+    /// `reference_price` is the price the risk math keys off (the
+    /// trigger for Stop/Limit, the close for Market). `entry` is the
+    /// already-built [`ResolvedEntry`].
+    #[allow(clippy::too_many_arguments)]
+    pub(in crate::intent) fn finish_with_sizing(
+        intent: &Intent,
+        shell: &Shell,
+        pip_size: f64,
+        direction: Direction,
+        entry: ResolvedEntry,
+        reference_price: f64,
+        stop_loss: f64,
+        take_profit: f64,
+    ) -> Result<Self, ResolveError> {
+        // Sizing-mode selection. `risk_pct` is always present (default
+        // `Static(1.0)`), so it's the fallback. `risk_amount` and
+        // `size_units` are mutually exclusive with each other and with
+        // each other only — either overrides the risk_pct default.
+        enum SizingMode {
+            Pct,
+            Amount,
+            Units,
+        }
+        let sizing_mode = match (intent.risk_amount.is_some(), intent.size_units.is_some()) {
+            (false, false) => SizingMode::Pct,
+            (true, false) => SizingMode::Amount,
+            (false, true) => SizingMode::Units,
+            (true, true) => return Err(ResolveError::BothRiskModesSet),
+        };
 
         // Entry must sit strictly between SL and TP for the direction:
         //   long  → SL < entry < TP

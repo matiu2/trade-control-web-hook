@@ -24,8 +24,9 @@ Commits (each tested, clippy+fmt green):
   replaced properly in commit 8)
 - [x] 3. core — MwParams + Intent.mw + validate (MwOnNonEnter /
   MwFieldInvalid; `mw: None` threaded through all Intent literals)
-- [ ] 4. core/src/intent/mw_resolution.rs — mid-correct entry/SL/TP +
-  from_intent branch
+- [x] 4. core/src/intent/mw_resolution.rs — mid-correct entry/SL/TP +
+  from_intent branch (shared sizing tail factored into
+  finish_with_sizing; wrong-side stop → InvalidGeometry = stay armed)
 - [ ] 5. tv-arm roles.rs — PATH kind + mw_path (verify tv-mcp kind string)
 - [ ] 6. cli — TradeSpec.mw + build_mw_pattern + dispatch
 - [ ] 7. Pine — alertcondition(true, "Every Bar Close", ...)

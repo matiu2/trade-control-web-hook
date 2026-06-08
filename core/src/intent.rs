@@ -6,6 +6,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 mod expiry;
+mod mw_resolution;
 mod resolution;
 
 pub use expiry::{ExpiryError, MAX_EXPIRY_BARS, resolve_cancel_at};
