@@ -158,13 +158,13 @@ pub struct Args {
     #[arg(long)]
     pub spread_pips: Option<f64>,
 
-    /// (M/W only, TEMPORARY) Instrument pip size, baked into the enter
-    /// intent. Defaults to 0.0001 (matches the worker's
-    /// `DEFAULT_PIP_SIZE`); pass 0.01 for JPY-quoted pairs, etc. This
-    /// is a stopgap until tick-size metadata is read from
-    /// `instrument-lookup`; ignored for H&S.
-    #[arg(long, default_value_t = 0.0001)]
-    pub pip_size: f64,
+    /// (M/W only) Override the instrument pip size baked into the enter
+    /// intent. When omitted, the pip size comes from `instrument-lookup`
+    /// (`asset.pip_size`) — the canonical per-instrument value (0.0001
+    /// for major FX, 0.01 for JPY pairs and gold, etc.). Pass this only
+    /// to force a non-catalog value; ignored for H&S.
+    #[arg(long)]
+    pub pip_size: Option<f64>,
 
     /// Print a zsh completion script to stdout and exit.
     #[arg(long)]
@@ -220,7 +220,8 @@ mod tests {
         let args = Args::try_parse_from(["tv-arm"]).expect("parse");
         assert!(!args.allow_50_pct_m_trades);
         assert_eq!(args.spread_pips, None);
-        assert_eq!(args.pip_size, 0.0001);
+        // No --pip-size → None → pipeline uses the catalog pip_size.
+        assert_eq!(args.pip_size, None);
 
         let args = Args::try_parse_from([
             "tv-arm",
@@ -233,7 +234,7 @@ mod tests {
         .expect("parse mw flags");
         assert!(args.allow_50_pct_m_trades);
         assert_eq!(args.spread_pips, Some(0.8));
-        assert_eq!(args.pip_size, 0.01);
+        assert_eq!(args.pip_size, Some(0.01));
     }
 
     #[test]

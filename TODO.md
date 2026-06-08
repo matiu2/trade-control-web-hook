@@ -92,11 +92,22 @@ Commits (each tested, clippy+fmt green):
   new tick_size is the pip-size project below, NOT done here.
 - [ ] 10. tv-arm — live broker spread read (replaces required --spread-pips)
 - [ ] README sync
-- [ ] pip-size everywhere (separate project, delegated to a background agent on
-  the instrument-lookup crate): add tick_size + decimal_places to the Asset
-  schema, TradeNation-sourced. Then migrate worker pip_size_for, cli
-  script_validator (hardcoded 0.0001), and tv-arm --pip-size to read from
-  instrument-lookup. Until then tv-arm bakes args.pip_size (default 0.0001).
+- [~] pip-size everywhere (separate project). DONE in instrument-lookup:
+  tick_size + decimal_places baked v0.2.0 (TradeNation-sourced, 1223 API /
+  96 class-default), authoritative `pip_size` field being added now (agent,
+  → v0.3.0). KEY: pip_size != tick_size — fractional-pip FX (5dp/3dp) quotes
+  10× finer than a pip; gold/index pip == tick. Read `asset.pip_size`, never
+  re-derive. Consumer migration scope:
+    - tv-arm: DONE (v0.3.0 committed: EURUSD 0.0001, USDJPY/gold 0.01,
+      JP225 1.0). Bakes `resolved.asset.pip_size`; --pip-size is now Option
+      (None=catalog) and overrides only when set. Dep 0.2->0.3 in tv-arm +
+      tv-news. 131 tests (+2: catalog-pip-baked, flag-overrides).
+    - worker `src/lib.rs::pip_size_for`: NOT migrating now. Worker is WASM and
+      reads pip from the instrument *string*, not an Asset; secret+0.0001
+      default path already works. Adding catalog resolution per-alert is a
+      separate, riskier change. Follow-up.
+    - cli `script_validator.rs:57` (hardcoded 0.0001): sign-time validation
+      only, low value. Follow-up.
 
 Checkpoint tag (current HEAD efa38ff): `pre-m-and-w-trades`.
 

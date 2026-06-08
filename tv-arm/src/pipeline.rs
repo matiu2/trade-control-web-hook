@@ -125,7 +125,17 @@ pub fn run(args: Args) -> Result<i32> {
     let out_dir = arm_out_dir(&raw_sym)?;
     let now = Utc::now();
     let resolved_spec = if roles.mw_path.is_some() {
-        resolve_mw_trade(&args, &roles, &instrument, &account, broker)
+        // Pip size for the baked MwSpec comes from the canonical
+        // instrument-lookup catalog (`asset.pip_size`), overridable via
+        // --pip-size for the rare non-catalog case.
+        resolve_mw_trade(
+            &args,
+            &roles,
+            &instrument,
+            &account,
+            broker,
+            resolved.asset.pip_size,
+        )
     } else {
         resolve_hs_trade(&args, &roles, &instrument, &account, broker)
     };
@@ -451,7 +461,10 @@ fn resolve_mw_trade(
     instrument: &str,
     account: &str,
     broker: Broker,
+    catalog_pip: f64,
 ) -> std::result::Result<(Direction, cli::TradeSpec), ResolveError> {
+    // --pip-size overrides the canonical catalog value when set.
+    let pip_size = args.pip_size.unwrap_or(catalog_pip);
     let path = roles
         .mw_path
         .as_ref()
@@ -505,7 +518,7 @@ fn resolve_mw_trade(
         runup_start, first_point, neckline,
         retrace_pct = %format!("{:.1}%", pct * 100.0),
         spread_pips,
-        pip_size = args.pip_size,
+        pip_size,
         "M/W path resolved",
     );
     let spec = build_mw_trade_spec(
@@ -520,18 +533,22 @@ fn resolve_mw_trade(
             first_point,
             neckline,
             spread_pips,
+            pip_size,
         },
     );
     Ok((direction, spec))
 }
 
-/// Anchors + spread fed to `build_mw_trade_spec`. `pip_size` comes from
-/// `args` so it isn't repeated here.
+/// The static M/W geometry baked into the signed enter intent — a
+/// complete mirror of `cli::MwSpec`. `pip_size` is the canonical catalog
+/// value (or the `--pip-size` override); `spread_pips` the arm-time
+/// broker spread.
 struct MwSpecAnchors {
     runup_start: f64,
     first_point: f64,
     neckline: f64,
     spread_pips: f64,
+    pip_size: f64,
 }
 
 /// Gate the neckline-retracement percentage. Default ceiling is
@@ -620,7 +637,7 @@ fn build_mw_trade_spec(
             first_point: anchors.first_point,
             runup_start: anchors.runup_start,
             spread_pips: anchors.spread_pips,
-            pip_size: args.pip_size,
+            pip_size: anchors.pip_size,
         }),
     }
 }
@@ -1411,13 +1428,20 @@ mod tests {
     #[test]
     fn resolve_mw_m_is_short_and_bakes_geometry() {
         // Worked M: A=1.1000, B=1.1200, C=1.1120 → pct 0.40 (needs flag).
+        // No --pip-size, so the catalog pip (passed here) is baked.
         let roles = mw_roles(path("p", [1.1000, 1.1200, 1.1120]));
-        let args = mw_args(&["--allow-50-pct-m-trades", "--pip-size", "0.0001"]);
-        let (dir, spec) =
-            match resolve_mw_trade(&args, &roles, "EUR_USD", "ms-tn-1", Broker::TradeNation) {
-                Ok(v) => v,
-                Err(_) => panic!("expected Ok"),
-            };
+        let args = mw_args(&["--allow-50-pct-m-trades"]);
+        let (dir, spec) = match resolve_mw_trade(
+            &args,
+            &roles,
+            "EUR_USD",
+            "ms-tn-1",
+            Broker::TradeNation,
+            0.0001,
+        ) {
+            Ok(v) => v,
+            Err(_) => panic!("expected Ok"),
+        };
         assert_eq!(dir, Direction::Short);
         assert_eq!(spec.pattern, cli::TradePattern::M);
         assert_eq!(spec.max_retries, 0);
@@ -1427,7 +1451,42 @@ mod tests {
         assert!((mw.first_point - 1.1200).abs() < 1e-9);
         assert!((mw.runup_start - 1.1000).abs() < 1e-9);
         assert!((mw.spread_pips - 1.0).abs() < 1e-9);
+        // Catalog pip flows through unchanged.
         assert!((mw.pip_size - 0.0001).abs() < 1e-12);
+    }
+
+    #[test]
+    fn resolve_mw_bakes_catalog_pip_when_no_override() {
+        // A JPY-like catalog pip of 0.01 is baked when --pip-size is absent.
+        let roles = mw_roles(path("p", [1.1000, 1.1200, 1.1180])); // pct 0.10
+        let args = mw_args(&[]);
+        let (_dir, spec) = resolve_mw_trade(
+            &args,
+            &roles,
+            "USD_JPY",
+            "ms-tn-1",
+            Broker::TradeNation,
+            0.01,
+        )
+        .expect("ok");
+        assert!((spec.mw.expect("mw").pip_size - 0.01).abs() < 1e-12);
+    }
+
+    #[test]
+    fn resolve_mw_pip_size_flag_overrides_catalog() {
+        // --pip-size beats the catalog value passed in.
+        let roles = mw_roles(path("p", [1.1000, 1.1200, 1.1180])); // pct 0.10
+        let args = mw_args(&["--pip-size", "0.25"]);
+        let (_dir, spec) = resolve_mw_trade(
+            &args,
+            &roles,
+            "EUR_USD",
+            "ms-tn-1",
+            Broker::TradeNation,
+            0.0001,
+        )
+        .expect("ok");
+        assert!((spec.mw.expect("mw").pip_size - 0.25).abs() < 1e-12);
     }
 
     #[test]
@@ -1435,8 +1494,15 @@ mod tests {
         // Worked W: A=1.1200, B=1.1000, C=1.1080 → pct 0.40 (needs flag).
         let roles = mw_roles(path("p", [1.1200, 1.1000, 1.1080]));
         let args = mw_args(&["--allow-50-pct-m-trades"]);
-        let (dir, spec) =
-            resolve_mw_trade(&args, &roles, "EUR_USD", "ms-tn-1", Broker::TradeNation).expect("ok");
+        let (dir, spec) = resolve_mw_trade(
+            &args,
+            &roles,
+            "EUR_USD",
+            "ms-tn-1",
+            Broker::TradeNation,
+            0.0001,
+        )
+        .expect("ok");
         assert_eq!(dir, Direction::Long);
         assert_eq!(spec.pattern, cli::TradePattern::W);
     }
@@ -1445,7 +1511,14 @@ mod tests {
     fn resolve_mw_rejects_40_pct_without_flag() {
         let roles = mw_roles(path("p", [1.1000, 1.1200, 1.1120])); // pct 0.40
         let args = mw_args(&[]); // no --allow-50-pct-m-trades
-        match resolve_mw_trade(&args, &roles, "EUR_USD", "ms-tn-1", Broker::TradeNation) {
+        match resolve_mw_trade(
+            &args,
+            &roles,
+            "EUR_USD",
+            "ms-tn-1",
+            Broker::TradeNation,
+            0.0001,
+        ) {
             Err(ResolveError::Reject(msg)) => {
                 assert!(msg.contains("40%"), "msg = {msg}");
                 assert!(msg.contains("--allow-50-pct-m-trades"), "msg = {msg}");
@@ -1459,7 +1532,14 @@ mod tests {
         let roles = mw_roles(path("p", [1.1000, 1.1200, 1.1180])); // shallow, pct 0.10
         // No --spread-pips.
         let args = Args::try_parse_from(["tv-arm"]).expect("parse");
-        match resolve_mw_trade(&args, &roles, "EUR_USD", "ms-tn-1", Broker::TradeNation) {
+        match resolve_mw_trade(
+            &args,
+            &roles,
+            "EUR_USD",
+            "ms-tn-1",
+            Broker::TradeNation,
+            0.0001,
+        ) {
             Err(ResolveError::Reject(msg)) => assert!(msg.contains("--spread-pips"), "msg = {msg}"),
             other => panic!("expected Reject, got {:?}", other.map(|_| ())),
         }
@@ -1473,7 +1553,14 @@ mod tests {
             ..Default::default()
         };
         let args = mw_args(&[]);
-        match resolve_mw_trade(&args, &roles, "EUR_USD", "ms-tn-1", Broker::TradeNation) {
+        match resolve_mw_trade(
+            &args,
+            &roles,
+            "EUR_USD",
+            "ms-tn-1",
+            Broker::TradeNation,
+            0.0001,
+        ) {
             Err(ResolveError::Reject(msg)) => assert!(msg.contains("trade-expiry"), "msg = {msg}"),
             other => panic!("expected Reject, got {:?}", other.map(|_| ())),
         }
@@ -1484,7 +1571,14 @@ mod tests {
         // retrace deeper than runup: A=1.1120, B=1.1200, C=1.1000.
         let roles = mw_roles(path("p", [1.1120, 1.1200, 1.1000]));
         let args = mw_args(&["--allow-50-pct-m-trades"]);
-        match resolve_mw_trade(&args, &roles, "EUR_USD", "ms-tn-1", Broker::TradeNation) {
+        match resolve_mw_trade(
+            &args,
+            &roles,
+            "EUR_USD",
+            "ms-tn-1",
+            Broker::TradeNation,
+            0.0001,
+        ) {
             Err(ResolveError::Reject(msg)) => assert!(msg.contains("runup leg"), "msg = {msg}"),
             other => panic!("expected Reject, got {:?}", other.map(|_| ())),
         }
