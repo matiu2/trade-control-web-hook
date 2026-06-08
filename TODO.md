@@ -35,12 +35,13 @@ Commits (each tested, clippy+fmt green):
   Verified: path kind string = `"path"`; anchors come in draw order A,B,C;
   `mcp.get_range() -> ChartRange` already exists at trading-view/src/mcp.rs:113.
 
-- [ ] 5. tv-arm roles.rs + mw_geometry.rs — kind::PATH="path"; Roles.mw_path;
+- [x] 5. tv-arm roles.rs + mw_geometry.rs — kind::PATH="path"; Roles.mw_path;
   classify a `path` with EXACTLY 3 anchors all inside the live visible range
-  (thread `get_range()` into classify; latest-wins). Add
-  `mw_direction_from_anchors(a,b,c)` (A above B → W/long; A below B → M/short)
-  + "first leg A→B longer by price than B→C" structure gate (hard-error w/
-  A/B/C + leg lengths) to mw_geometry.rs. NO label lookup.
+  (threaded `get_range().visible_range` into `classify(.., view)`; latest-wins).
+  Added `mw_direction_from_anchors(A,B)` (A above B → W/long; A below B → M/short)
+  + `check_mw_structure(A,B,C)` "first leg longer by price than B→C" gate
+  (hard-error w/ A/B/C + leg lengths) to mw_geometry.rs. NO label lookup.
+  tv-arm 113 tests green; clippy+fmt clean.
 - [ ] 6. cli — TradeSpec.mw + build_mw_pattern + 4 builders (mw-cancel/
   mw-abort CancelPending, reuse trade-expiry, mw-enter mw:Some / empty preps /
   max_retries:0 / Stop) + replace not-implemented/unreachable! arms + dispatch

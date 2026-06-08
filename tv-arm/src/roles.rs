@@ -36,6 +36,10 @@ mod kind {
     pub const TREND_LINE: &str = "trend_line";
     pub const VERTICAL_LINE: &str = "vertical_line";
     pub const FIB_RETRACEMENT: &str = "fib_retracement";
+    /// The polyline / path tool used to mark an M/W reversal. It has no
+    /// text property, so it's detected purely by geometry (3 anchors,
+    /// all inside the visible range) — see [`super::classify`].
+    pub const PATH: &str = "path";
 }
 
 /// Everything `classify()` extracts from the chart, grouped by role.
@@ -70,6 +74,12 @@ pub struct Roles {
     /// to the drawing. Multiple lines for the same step keep only the
     /// latest (older ones are stale leftovers).
     pub prep_expiries: Vec<(String, Drawing)>,
+    /// The M/W reversal path: a 3-anchor `path` drawing wholly inside
+    /// the visible range. The path tool has no label, so detection is
+    /// geometry-only — anchors are `[A (runup start), B (first
+    /// point), C (neckline)]` in draw order. Latest-wins when several
+    /// qualify. `None` for a plain H&S chart.
+    pub mw_path: Option<Drawing>,
 }
 
 /// Anything that can hand us a `Drawing` by ID. The production impl is
@@ -87,7 +97,18 @@ impl DrawingFetcher for TvMcp {
 
 /// Walk `stubs`, fetch each drawing, and group by role. See module
 /// docs for the resolution rules.
-pub fn classify<F: DrawingFetcher>(fetcher: &F, stubs: &[DrawingStub]) -> Result<Roles> {
+///
+/// `visible_range` is the chart's currently-visible time window (unix
+/// seconds). It's only consulted for M/W path detection: a `path`
+/// drawing qualifies as the M/W marker only when **all** its anchors
+/// fall inside that window, so a stale path scrolled off-screen is
+/// ignored. Pass the window from [`trading_view::mcp::TvMcp::get_range`]
+/// (`visible_range`).
+pub fn classify<F: DrawingFetcher>(
+    fetcher: &F,
+    stubs: &[DrawingStub],
+    visible_range: (i64, i64),
+) -> Result<Roles> {
     let mut invalidations: Vec<(Drawing, String)> = Vec::new();
     let mut break_lines: Vec<Drawing> = Vec::new();
     let mut retest_lines: Vec<Drawing> = Vec::new();
@@ -101,6 +122,9 @@ pub fn classify<F: DrawingFetcher>(fetcher: &F, stubs: &[DrawingStub]) -> Result
     // Prep-expiry lines, grouped by resolved canonical prep step so a
     // duplicate (re-armed) line keeps only the latest per step.
     let mut prep_expiry_lines: Vec<(&'static str, Drawing)> = Vec::new();
+    // Candidate M/W paths: 3-anchor `path` drawings inside the visible
+    // range. Latest-wins resolved after the loop.
+    let mut mw_paths: Vec<Drawing> = Vec::new();
 
     for stub in stubs {
         let d = fetcher.get_drawing(&stub.id)?;
@@ -159,6 +183,14 @@ pub fn classify<F: DrawingFetcher>(fetcher: &F, stubs: &[DrawingStub]) -> Result
                 news_ends.push(d);
                 Some("news_end")
             }
+            // M/W reversal path: no label (the tool has no text field),
+            // so it's accepted purely on geometry — exactly 3 anchors,
+            // all inside the visible range. A path that's the wrong
+            // shape or scrolled off-screen is ignored (logged below).
+            kind::PATH if is_mw_path(&d, visible_range) => {
+                mw_paths.push(d);
+                Some("mw_path")
+            }
             _ => None,
         };
         match role {
@@ -187,8 +219,18 @@ pub fn classify<F: DrawingFetcher>(fetcher: &F, stubs: &[DrawingStub]) -> Result
     roles.news_pairs = pair_vertical_lines(news_starts, news_ends, "news")?;
     roles.sr_levels = sr_levels;
     roles.prep_expiries = latest_prep_expiry_per_step(prep_expiry_lines);
+    roles.mw_path = latest_only(mw_paths, "mw_path");
 
     Ok(roles)
+}
+
+/// A `path` drawing qualifies as the M/W marker iff it has exactly 3
+/// anchors and every anchor's time falls inside the visible range
+/// `[from, to]` (inclusive). Off-screen paths are stale leftovers; a
+/// path with 2 or 4+ anchors is a fat-fingered shape and is ignored
+/// rather than guessed at.
+fn is_mw_path(d: &Drawing, (from, to): (i64, i64)) -> bool {
+    d.points.len() == 3 && d.points.iter().all(|p| p.time >= from && p.time <= to)
 }
 
 /// Collapse the per-step prep-expiry candidates to one drawing each —
@@ -258,6 +300,11 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
     use trading_view::drawings::{Point, Properties};
+
+    /// A visible range wide enough to contain every H&S fixture anchor —
+    /// M/W path detection is the only thing that consults it, and the
+    /// H&S tests carry no paths, so any all-encompassing window works.
+    const ANY_RANGE: (i64, i64) = (0, i64::MAX);
 
     /// In-memory fetcher backed by a HashMap<id, Drawing>.
     struct MockFetcher {
@@ -351,7 +398,7 @@ mod tests {
             ),
         ]);
 
-        let roles = classify(&mcp, &stubs).expect("classify ok");
+        let roles = classify(&mcp, &stubs, ANY_RANGE).expect("classify ok");
 
         assert!(roles.invalidation.is_some());
         assert_eq!(roles.invalidation_label.as_deref(), Some("too-high"));
@@ -375,7 +422,7 @@ mod tests {
     #[test]
     fn empty_chart_yields_empty_roles() {
         let (stubs, mcp) = fixture(vec![]);
-        let roles = classify(&mcp, &stubs).expect("classify ok");
+        let roles = classify(&mcp, &stubs, ANY_RANGE).expect("classify ok");
         assert!(roles.invalidation.is_none());
         assert!(roles.break_and_close.is_none());
         assert!(roles.blackout_pairs.is_empty());
@@ -396,7 +443,7 @@ mod tests {
                 drawing("new", "neckline", vec![(400, 1.0), (500, 1.0)]),
             ),
         ]);
-        let roles = classify(&mcp, &stubs).expect("ok");
+        let roles = classify(&mcp, &stubs, ANY_RANGE).expect("ok");
         assert_eq!(roles.break_and_close.unwrap().id, "new");
     }
 
@@ -412,7 +459,7 @@ mod tests {
                 drawing("new", "too-high", vec![(500, 1.5)]),
             ),
         ]);
-        let roles = classify(&mcp, &stubs).expect("ok");
+        let roles = classify(&mcp, &stubs, ANY_RANGE).expect("ok");
         assert_eq!(roles.invalidation.as_ref().unwrap().id, "new");
         assert_eq!(roles.invalidation_label.as_deref(), Some("too-high"));
     }
@@ -430,7 +477,7 @@ mod tests {
                 drawing("pe", "resume", vec![(350, 1.0)]),
             ),
         ]);
-        let roles = classify(&mcp, &stubs).expect("ok");
+        let roles = classify(&mcp, &stubs, ANY_RANGE).expect("ok");
         assert_eq!(roles.blackout_pairs.len(), 1);
     }
 
@@ -442,7 +489,7 @@ mod tests {
             stub("a", "trend_line"),
             drawing("a", "scratchpad", vec![(50, 1.0), (100, 1.0)]),
         )]);
-        let roles = classify(&mcp, &stubs).expect("ok");
+        let roles = classify(&mcp, &stubs, ANY_RANGE).expect("ok");
         assert!(roles.break_and_close.is_none());
         assert!(roles.retest.is_none());
     }
@@ -453,7 +500,7 @@ mod tests {
             stub("bs", "vertical_line"),
             drawing("bs", "blackout-start", vec![(300, 1.0)]),
         )]);
-        let err = classify(&mcp, &stubs).unwrap_err();
+        let err = classify(&mcp, &stubs, ANY_RANGE).unwrap_err();
         assert!(format!("{err}").contains("blackout"));
     }
 
@@ -469,7 +516,7 @@ mod tests {
                 drawing("ne", "news-end", vec![(400, 1.0)]),
             ),
         ]);
-        let err = classify(&mcp, &stubs).unwrap_err();
+        let err = classify(&mcp, &stubs, ANY_RANGE).unwrap_err();
         let msg = format!("{err}");
         assert!(msg.contains("news"), "msg = {msg}");
         assert!(msg.contains("reversed"), "msg = {msg}");
@@ -487,7 +534,7 @@ mod tests {
                 drawing("s2", "resistance", vec![(200, 1.20)]),
             ),
         ]);
-        let roles = classify(&mcp, &stubs).expect("ok");
+        let roles = classify(&mcp, &stubs, ANY_RANGE).expect("ok");
         assert_eq!(roles.sr_levels.len(), 2);
     }
 
@@ -506,7 +553,7 @@ mod tests {
                 drawing("exp", "trade-expiry", vec![(900, 1.0)]),
             ),
         ]);
-        let roles = classify(&mcp, &stubs).expect("ok");
+        let roles = classify(&mcp, &stubs, ANY_RANGE).expect("ok");
         assert_eq!(roles.prep_expiries.len(), 1);
         assert_eq!(roles.prep_expiries[0].0, "break-and-close");
         assert_eq!(roles.prep_expiries[0].1.id, "bnce");
@@ -525,7 +572,7 @@ mod tests {
                 drawing("new", "retest-expiry", vec![(500, 1.0)]),
             ),
         ]);
-        let roles = classify(&mcp, &stubs).expect("ok");
+        let roles = classify(&mcp, &stubs, ANY_RANGE).expect("ok");
         assert_eq!(roles.prep_expiries.len(), 1);
         assert_eq!(roles.prep_expiries[0].0, "retest");
         assert_eq!(roles.prep_expiries[0].1.id, "new");
@@ -538,7 +585,77 @@ mod tests {
             stub("f", "fib_retracement"),
             drawing("f", "leftover note", vec![(50, 1.2), (200, 1.1)]),
         )]);
-        let roles = classify(&mcp, &stubs).expect("ok");
+        let roles = classify(&mcp, &stubs, ANY_RANGE).expect("ok");
         assert!(roles.tp_fib.is_some());
+    }
+
+    #[test]
+    fn three_anchor_path_in_range_is_mw() {
+        // A 3-anchor path, all anchors inside the visible window, with
+        // no label — accepted as the M/W marker.
+        let (stubs, mcp) = fixture(vec![(
+            stub("p", "path"),
+            drawing("p", "", vec![(100, 1.10), (200, 1.12), (300, 1.112)]),
+        )]);
+        let roles = classify(&mcp, &stubs, (50, 400)).expect("ok");
+        assert_eq!(roles.mw_path.as_ref().unwrap().id, "p");
+        // Anchors preserved in draw order = A, B, C.
+        let pts = &roles.mw_path.unwrap().points;
+        assert_eq!(pts[0].price, 1.10);
+        assert_eq!(pts[2].price, 1.112);
+    }
+
+    #[test]
+    fn path_partly_off_screen_is_ignored() {
+        // Last anchor sits past the visible window → not the live
+        // setup, ignore it (stale scrolled-away path).
+        let (stubs, mcp) = fixture(vec![(
+            stub("p", "path"),
+            drawing("p", "", vec![(100, 1.10), (200, 1.12), (900, 1.112)]),
+        )]);
+        let roles = classify(&mcp, &stubs, (50, 400)).expect("ok");
+        assert!(roles.mw_path.is_none());
+    }
+
+    #[test]
+    fn two_anchor_path_is_ignored() {
+        let (stubs, mcp) = fixture(vec![(
+            stub("p", "path"),
+            drawing("p", "", vec![(100, 1.10), (200, 1.12)]),
+        )]);
+        let roles = classify(&mcp, &stubs, ANY_RANGE).expect("ok");
+        assert!(roles.mw_path.is_none());
+    }
+
+    #[test]
+    fn four_anchor_path_is_ignored() {
+        let (stubs, mcp) = fixture(vec![(
+            stub("p", "path"),
+            drawing(
+                "p",
+                "",
+                vec![(100, 1.1), (200, 1.12), (300, 1.11), (400, 1.13)],
+            ),
+        )]);
+        let roles = classify(&mcp, &stubs, ANY_RANGE).expect("ok");
+        assert!(roles.mw_path.is_none());
+    }
+
+    #[test]
+    fn duplicate_mw_paths_keep_latest() {
+        // Two valid 3-anchor paths in range; the one with the later
+        // anchor time wins (older is a stale leftover).
+        let (stubs, mcp) = fixture(vec![
+            (
+                stub("old", "path"),
+                drawing("old", "", vec![(100, 1.1), (150, 1.12), (200, 1.112)]),
+            ),
+            (
+                stub("new", "path"),
+                drawing("new", "", vec![(600, 1.1), (650, 1.12), (700, 1.112)]),
+            ),
+        ]);
+        let roles = classify(&mcp, &stubs, (50, 800)).expect("ok");
+        assert_eq!(roles.mw_path.unwrap().id, "new");
     }
 }

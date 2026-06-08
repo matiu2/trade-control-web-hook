@@ -456,6 +456,7 @@ mod tests {
             news_pairs: vec![],
             sr_levels: vec![],
             prep_expiries: vec![],
+            mw_path: None,
         }
     }
 

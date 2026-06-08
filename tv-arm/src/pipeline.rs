@@ -82,8 +82,17 @@ pub fn run(args: Args) -> Result<i32> {
     // 2. First-pass classify. If no blackout/news pairs are present
     //    and the operator didn't opt out, auto-draw from
     //    forex-factory calendar.
+    //
+    //    The visible range scopes M/W path detection — only a path
+    //    whose anchors all sit in the on-screen window counts (see
+    //    `classify`). H&S drawings ignore it.
+    let visible = mcp
+        .get_range()
+        .wrap_err("read TV visible range")?
+        .visible_range;
+    let view = (visible.from, visible.to);
     let mut drawings = mcp.list_drawings().wrap_err("list TV drawings")?;
-    let mut roles = classify(&mcp, &drawings)?;
+    let mut roles = classify(&mcp, &drawings, view)?;
 
     let should_auto_draw =
         !args.skip_calendar_bars && roles.blackout_pairs.is_empty() && roles.news_pairs.is_empty();
@@ -99,7 +108,7 @@ pub fn run(args: Args) -> Result<i32> {
             warn!(error = ?e, "calendar auto-draw failed; continuing with chart as-is");
         } else {
             drawings = mcp.list_drawings().wrap_err("re-list TV drawings")?;
-            roles = classify(&mcp, &drawings)?;
+            roles = classify(&mcp, &drawings, view)?;
         }
     }
 
