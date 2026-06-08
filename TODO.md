@@ -76,14 +76,27 @@ Commits (each tested, clippy+fmt green):
   declaration-order ASSUMPTION (next_candle_timestamp plots shifted indices in
   v2.3) — verify on a live chart in the commit-9 dry build; mismatch shows as
   "condition not found" on 05-enter.
-- [ ] 9. tv-arm args+pipeline — --allow-50-pct-m-trades (≥40% errors w/o it,
-  ≤50% with, >50% always errors); --spread-pips REQUIRED on M/W arm
-  (hard-error if omitted; live read = step 10); M/W branch keyed on
-  roles.mw_path.is_some(); ⚠️ BYPASS the H&S check_required branch
-  (pipeline.rs:404) when mw_path present (else misleading missing-drawing
-  error); M/W-only required set = mw_path + trade_expiry; bake MwSpec
+- [x] 9. tv-arm args+pipeline. args.rs: --allow-50-pct-m-trades, --spread-pips
+  (temp, Option), --pip-size (temp, default 0.0001). pipeline.rs: `run` step 3
+  now dispatches on `roles.mw_path.is_some()` to `resolve_mw_trade` vs
+  `resolve_hs_trade` (H&S logic lifted unchanged into a resolver). New
+  `ResolveError{Reject,Fatal}`: Reject→print+exit1, Fatal→propagate. M/W
+  resolver: 3-anchor guard, trade_expiry required, --spread-pips required,
+  direction from mw_direction_from_anchors, check_mw_structure,
+  gate_neckline_pct (≥40% w/o flag errors, ≤50% with, >50% always, NaN errors),
+  build_mw_trade_spec (no preps, max_retries 0, mw baked, no SR/news close).
+  cli: exported MwSpec. Bumped instrument-lookup dep 0.1→0.2 in tv-arm AND
+  tv-news Cargo.toml (the pip-size agent bumped that crate to 0.2.0). 129
+  tv-arm tests (12 new), clippy+fmt clean; cli green. NOTE: the M/W enter still
+  bakes args.pip_size (default 0.0001) — wiring it to read instrument-lookup's
+  new tick_size is the pip-size project below, NOT done here.
 - [ ] 10. tv-arm — live broker spread read (replaces required --spread-pips)
 - [ ] README sync
+- [ ] pip-size everywhere (separate project, delegated to a background agent on
+  the instrument-lookup crate): add tick_size + decimal_places to the Asset
+  schema, TradeNation-sourced. Then migrate worker pip_size_for, cli
+  script_validator (hardcoded 0.0001), and tv-arm --pip-size to read from
+  instrument-lookup. Until then tv-arm bakes args.pip_size (default 0.0001).
 
 Checkpoint tag (current HEAD efa38ff): `pre-m-and-w-trades`.
 

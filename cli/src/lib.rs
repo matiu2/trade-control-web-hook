@@ -53,7 +53,7 @@ pub use templates::{discover_templates, pick_template_interactive, templates_roo
 pub use trade_control_core::intent::{BrokerKind, PriceAnchor};
 pub use trade_control_core::sig::KEY_LEN;
 pub use trade_patterns::{
-    BuiltAlert, BuiltTrade, EntryMode, TradePattern, TradeSpec, build_trade_from_spec,
+    BuiltAlert, BuiltTrade, EntryMode, MwSpec, TradePattern, TradeSpec, build_trade_from_spec,
     build_trade_interactive, load_spec_from_file, pick_pattern_interactive, write_trade,
 };
 

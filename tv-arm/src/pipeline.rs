@@ -31,6 +31,7 @@ use crate::args::Args;
 use crate::create_alerts::create_alerts;
 use crate::geometry::tp_price_from_fib;
 use crate::manifest::{CalendarBundle, discover_calendar_bundles};
+use crate::mw_geometry;
 use crate::post_outcome::{Outcome, classify as classify_outcome};
 use crate::roles::{Roles, classify};
 use crate::timeframe::infer_calendar_timeframe;
@@ -112,58 +113,39 @@ pub fn run(args: Args) -> Result<i32> {
         }
     }
 
-    // 3. Validate required drawings are present.
-    if let Err(msg) = check_required(&roles, &args) {
-        eprintln!("ERROR: {msg}");
-        return Ok(1);
-    }
-    // 3b. Validate prep-expiry lines against their preps. A future
-    //     cutoff with no matching prep drawing would arm a setup that
-    //     can never enter; a past cutoff is just a re-arm later in time.
-    if let Err(msg) = check_prep_expiries(&roles, Utc::now()) {
-        eprintln!("ERROR: {msg}");
-        return Ok(1);
-    }
-
-    // 4. Direction + TP + expiry from the classified drawings.
-    let inv_label = roles.invalidation_label.clone().unwrap_or_default();
-    let direction = Direction::from_invalidation_label(&inv_label)
-        .ok_or_else(|| eyre!("invalid invalidation label {inv_label:?}"))?;
-    let tp_fib = roles
-        .tp_fib
-        .as_ref()
-        .ok_or_else(|| eyre!("missing tp_fib (already checked in step 3)"))?;
-    let tp = tp_price_from_fib(&tp_fib.prices(), direction);
-    let expiry = read_trade_expiry(&roles)?;
-
-    info!(
-        direction = direction.as_str(),
-        tp = %format!("{tp:.5}"),
-        trade_expiry = %expiry.to_rfc3339(),
-        "trade geometry resolved"
-    );
-
-    // 5. Build the trade bundle.
+    // 3. Validate required drawings + resolve direction + build the
+    //    trade spec. M/W (a path drawing is present) and H&S diverge
+    //    completely here: M/W has no invalidation / TP-fib / prep
+    //    drawings — direction and geometry come from the path anchors,
+    //    and the worker computes entry/SL/TP from baked params. The
+    //    `?`-returning resolver hard-errors on a bad setup; a clean
+    //    operator-facing rejection returns Ok(1).
     let key = read_key()?;
     let account = resolve_account(&args, broker);
     let out_dir = arm_out_dir(&raw_sym)?;
     let now = Utc::now();
-    let trade_spec = build_trade_spec(
-        &args,
-        &instrument,
-        &account,
-        broker,
-        direction,
-        expiry,
-        tp,
-        &roles,
-    );
+    let resolved_spec = if roles.mw_path.is_some() {
+        resolve_mw_trade(&args, &roles, &instrument, &account, broker)
+    } else {
+        resolve_hs_trade(&args, &roles, &instrument, &account, broker)
+    };
+    let (direction, trade_spec) = match resolved_spec {
+        Ok(ds) => ds,
+        Err(ResolveError::Reject(msg)) => {
+            eprintln!("ERROR: {msg}");
+            return Ok(1);
+        }
+        Err(ResolveError::Fatal(e)) => return Err(e),
+    };
+
     info!(
-        sr_levels_classified = roles.sr_levels.len(),
+        direction = direction.as_str(),
+        pattern = ?trade_spec.pattern,
+        trade_expiry = %trade_spec.trade_expiry.to_rfc3339(),
         sr_reversal_ranges = trade_spec.sr_reversal_ranges.len(),
         news_pairs = roles.news_pairs.len(),
         blackout_pairs = roles.blackout_pairs.len(),
-        "trade spec built — close-on-reversal coverage",
+        "trade spec built",
     );
     let built_trade = cli::build_trade_from_spec(trade_spec, now).wrap_err("build trade bundle")?;
     let trade_id = built_trade.trade_id.clone();
@@ -406,6 +388,241 @@ fn resolve_account(args: &Args, broker: Broker) -> String {
         }
     }
     broker.default_account_index().to_string()
+}
+
+/// Outcome of trade-spec resolution. `Reject` is an operator-facing
+/// "fix your chart / flags" message (printed, process exits 1); `Fatal`
+/// is an internal failure that propagates as an error.
+#[derive(Debug)]
+enum ResolveError {
+    Reject(String),
+    Fatal(color_eyre::eyre::Error),
+}
+
+impl From<color_eyre::eyre::Error> for ResolveError {
+    fn from(e: color_eyre::eyre::Error) -> Self {
+        ResolveError::Fatal(e)
+    }
+}
+
+/// H&S / IH&S path: validate the constellation of drawings, read
+/// direction from the invalidation label, TP from the fib, expiry from
+/// the vertical line, and build the spec. This is the pre-M/W flow,
+/// unchanged in behaviour — just lifted into a resolver so `run` can
+/// dispatch on pattern.
+fn resolve_hs_trade(
+    args: &Args,
+    roles: &Roles,
+    instrument: &str,
+    account: &str,
+    broker: Broker,
+) -> std::result::Result<(Direction, cli::TradeSpec), ResolveError> {
+    if let Err(msg) = check_required(roles, args) {
+        return Err(ResolveError::Reject(msg));
+    }
+    // A future prep-expiry cutoff with no matching prep drawing would
+    // arm a setup that can never enter; a past cutoff is just a re-arm.
+    if let Err(msg) = check_prep_expiries(roles, Utc::now()) {
+        return Err(ResolveError::Reject(msg));
+    }
+    let inv_label = roles.invalidation_label.clone().unwrap_or_default();
+    let direction = Direction::from_invalidation_label(&inv_label)
+        .ok_or_else(|| eyre!("invalid invalidation label {inv_label:?}"))?;
+    let tp_fib = roles
+        .tp_fib
+        .as_ref()
+        .ok_or_else(|| eyre!("missing tp_fib (already checked by check_required)"))?;
+    let tp = tp_price_from_fib(&tp_fib.prices(), direction);
+    let expiry = read_trade_expiry(roles)?;
+    let spec = build_trade_spec(
+        args, instrument, account, broker, direction, expiry, tp, roles,
+    );
+    Ok((direction, spec))
+}
+
+/// M/W path: direction and geometry come from the 3-anchor path drawing
+/// (`mw_path`), not from the H&S drawing constellation. Required
+/// drawings are just the path + the trade-expiry line. Gates the
+/// neckline-retracement depth, then bakes the static `MwSpec` into the
+/// spec; the worker computes entry/SL/TP from it at fill time.
+fn resolve_mw_trade(
+    args: &Args,
+    roles: &Roles,
+    instrument: &str,
+    account: &str,
+    broker: Broker,
+) -> std::result::Result<(Direction, cli::TradeSpec), ResolveError> {
+    let path = roles
+        .mw_path
+        .as_ref()
+        .ok_or_else(|| eyre!("resolve_mw_trade called without an mw_path"))?;
+    // The path must carry exactly 3 anchors [A, B, C] (is_mw_path
+    // enforces this at classification, but be defensive).
+    if path.points.len() != 3 {
+        return Err(ResolveError::Reject(format!(
+            "M/W path must have exactly 3 anchors [A runup-start, B first-point, C neckline]; \
+             found {}",
+            path.points.len()
+        )));
+    }
+    if roles.trade_expiry.is_none() {
+        return Err(ResolveError::Reject(
+            "missing required drawing for M/W:\n  - vertical_line labeled 'trade-expiry'\n".into(),
+        ));
+    }
+    let spread_pips = args.spread_pips.ok_or_else(|| {
+        ResolveError::Reject(
+            "M/W setups require --spread-pips <pips> (the arm-time broker spread baked into the \
+             enter intent; live spread read lands in a later release)\n"
+                .into(),
+        )
+    })?;
+
+    let runup_start = path.points[0].price;
+    let first_point = path.points[1].price;
+    let neckline = path.points[2].price;
+
+    let direction = mw_geometry::mw_direction_from_anchors(runup_start, first_point)
+        .ok_or_else(|| ResolveError::Reject(mw_flat_first_leg_msg(runup_start, first_point)))?;
+    // Coarse "is this even an M/W shape" gate (runup leg > retrace leg).
+    if let Err(e) = mw_geometry::check_mw_structure(runup_start, first_point, neckline) {
+        return Err(ResolveError::Reject(format!("{e}\n")));
+    }
+    // Neckline-retracement depth gate.
+    let pct = mw_geometry::neckline_retrace_pct(runup_start, first_point, neckline);
+    if let Err(msg) = gate_neckline_pct(pct, args.allow_50_pct_m_trades) {
+        return Err(ResolveError::Reject(msg));
+    }
+
+    let expiry = read_trade_expiry(roles)?;
+    let pattern = match direction {
+        Direction::Short => cli::TradePattern::M,
+        Direction::Long => cli::TradePattern::W,
+    };
+    info!(
+        direction = direction.as_str(),
+        pattern = ?pattern,
+        runup_start, first_point, neckline,
+        retrace_pct = %format!("{:.1}%", pct * 100.0),
+        spread_pips,
+        pip_size = args.pip_size,
+        "M/W path resolved",
+    );
+    let spec = build_mw_trade_spec(
+        args,
+        instrument,
+        account,
+        broker,
+        pattern,
+        expiry,
+        MwSpecAnchors {
+            runup_start,
+            first_point,
+            neckline,
+            spread_pips,
+        },
+    );
+    Ok((direction, spec))
+}
+
+/// Anchors + spread fed to `build_mw_trade_spec`. `pip_size` comes from
+/// `args` so it isn't repeated here.
+struct MwSpecAnchors {
+    runup_start: f64,
+    first_point: f64,
+    neckline: f64,
+    spread_pips: f64,
+}
+
+/// Gate the neckline-retracement percentage. Default ceiling is
+/// `< 40%`; `--allow-50-pct-m-trades` raises it to `<= 50%`; `> 50%` is
+/// always rejected. A `NaN` pct (degenerate zero-runup path) is
+/// rejected too.
+fn gate_neckline_pct(pct: f64, allow_50: bool) -> std::result::Result<(), String> {
+    if pct.is_nan() {
+        return Err("M/W neckline retracement is undefined (zero-length runup leg)\n".into());
+    }
+    if pct > 0.50 {
+        return Err(format!(
+            "M/W neckline retracement {:.1}% exceeds the hard 50% ceiling — not a valid \
+             reversal\n",
+            pct * 100.0
+        ));
+    }
+    if pct >= 0.40 && !allow_50 {
+        return Err(format!(
+            "M/W neckline retracement {:.1}% is >= 40% — pass --allow-50-pct-m-trades to arm a \
+             marginal setup up to 50%\n",
+            pct * 100.0
+        ));
+    }
+    Ok(())
+}
+
+fn mw_flat_first_leg_msg(runup_start: f64, first_point: f64) -> String {
+    format!(
+        "M/W path has a flat first leg (A == B): runup_start={runup_start}, \
+         first_point={first_point} — cannot infer direction\n"
+    )
+}
+
+/// Build the M/W trade spec: no preps, single-shot, baked `MwSpec`. The
+/// worker derives entry/SL/TP from the path geometry, so `tp_price` is a
+/// placeholder the M/W build path ignores (it's `None` on the enter
+/// intent).
+fn build_mw_trade_spec(
+    args: &Args,
+    instrument: &str,
+    account: &str,
+    broker: Broker,
+    pattern: cli::TradePattern,
+    expiry: DateTime<Utc>,
+    anchors: MwSpecAnchors,
+) -> cli::TradeSpec {
+    cli::TradeSpec {
+        pattern,
+        instrument: instrument.to_string(),
+        account: account.to_string(),
+        broker: broker_to_kind(broker),
+        trade_expiry: expiry,
+        risk_pct: args.risk_pct.unwrap_or(1.0),
+        risk_amount: args.risk_amount,
+        dry_run: args.broker_dry_run,
+        // M/W is single-shot: a broker rejection of a placed order is
+        // terminal (no re-entry).
+        max_retries: 0,
+        // Order expiry is governed by trade_expiry + the cancel/abort
+        // vetos; the bar-count menu is an H&S feature.
+        expiry_bars: None,
+        skip_preps: Vec::new(),
+        entry_offset_pips: None,
+        sl_offset_pips: None,
+        sl_anchor: None,
+        // Worker computes the real TP (hard 1R); this field is unused on
+        // the M/W build path. Set to the neckline as a harmless,
+        // non-zero placeholder so any accidental serialization is sane.
+        tp_price: round5(anchors.neckline),
+        entry_deadline_pct: 80,
+        allow_entry: args.entry_filter_script.clone(),
+        // M/W entry is always a stop order at the worker-computed level;
+        // --entry-market is an H&S flag and is ignored here.
+        entry_mode: cli::EntryMode::Stop,
+        needs_golden: args.require_golden,
+        needs_confirmed: args.require_confirmation,
+        // No close-on-reversal for M/W (TP is a hard 1R), so news/SR
+        // close coverage is not wired.
+        close_on_news: false,
+        sr_reversal_ranges: Vec::new(),
+        needs_confirmed_close: false,
+        prep_expiries: Vec::new(),
+        mw: Some(cli::MwSpec {
+            neckline: anchors.neckline,
+            first_point: anchors.first_point,
+            runup_start: anchors.runup_start,
+            spread_pips: anchors.spread_pips,
+            pip_size: args.pip_size,
+        }),
+    }
 }
 
 /// Validate the chart has every drawing the bundle will need.
@@ -1060,6 +1277,7 @@ impl AnchorTimeShim for Drawing {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::Parser;
     use trading_view::drawings::{Point, Properties};
 
     fn vline(id: &str, unix: i64) -> Drawing {
@@ -1128,5 +1346,147 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(prep_expiry_steps(&roles), vec!["break-and-close", "retest"]);
+    }
+
+    // ===== M / W neckline-% gate ========================================
+
+    #[test]
+    fn gate_neckline_pct_default_ceiling_is_40() {
+        // < 40% passes without the flag.
+        assert!(gate_neckline_pct(0.399, false).is_ok());
+        // >= 40% needs the flag.
+        assert!(gate_neckline_pct(0.40, false).is_err());
+        assert!(gate_neckline_pct(0.499, false).is_err());
+    }
+
+    #[test]
+    fn gate_neckline_pct_flag_raises_ceiling_to_50() {
+        assert!(gate_neckline_pct(0.40, true).is_ok());
+        assert!(gate_neckline_pct(0.499, true).is_ok());
+        assert!(gate_neckline_pct(0.50, true).is_ok());
+    }
+
+    #[test]
+    fn gate_neckline_pct_above_50_always_errors() {
+        assert!(gate_neckline_pct(0.501, true).is_err());
+        assert!(gate_neckline_pct(0.501, false).is_err());
+    }
+
+    #[test]
+    fn gate_neckline_pct_nan_errors() {
+        assert!(gate_neckline_pct(f64::NAN, true).is_err());
+    }
+
+    // ===== M / W trade-spec resolution ==================================
+
+    fn path(id: &str, prices: [f64; 3]) -> Drawing {
+        Drawing {
+            id: id.to_string(),
+            points: prices
+                .iter()
+                .enumerate()
+                .map(|(i, &p)| Point {
+                    time: (i as i64 + 1) * 10,
+                    price: p,
+                })
+                .collect(),
+            properties: Properties { text: None },
+        }
+    }
+
+    fn mw_args(extra: &[&str]) -> Args {
+        let mut argv = vec!["tv-arm", "--spread-pips", "1.0"];
+        argv.extend_from_slice(extra);
+        Args::try_parse_from(argv).expect("parse mw args")
+    }
+
+    fn mw_roles(p: Drawing) -> Roles {
+        Roles {
+            mw_path: Some(p),
+            trade_expiry: Some(vline("exp", now().timestamp() + 86_400)),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn resolve_mw_m_is_short_and_bakes_geometry() {
+        // Worked M: A=1.1000, B=1.1200, C=1.1120 → pct 0.40 (needs flag).
+        let roles = mw_roles(path("p", [1.1000, 1.1200, 1.1120]));
+        let args = mw_args(&["--allow-50-pct-m-trades", "--pip-size", "0.0001"]);
+        let (dir, spec) =
+            match resolve_mw_trade(&args, &roles, "EUR_USD", "ms-tn-1", Broker::TradeNation) {
+                Ok(v) => v,
+                Err(_) => panic!("expected Ok"),
+            };
+        assert_eq!(dir, Direction::Short);
+        assert_eq!(spec.pattern, cli::TradePattern::M);
+        assert_eq!(spec.max_retries, 0);
+        assert!(spec.prep_expiries.is_empty());
+        let mw = spec.mw.expect("mw baked");
+        assert!((mw.neckline - 1.1120).abs() < 1e-9);
+        assert!((mw.first_point - 1.1200).abs() < 1e-9);
+        assert!((mw.runup_start - 1.1000).abs() < 1e-9);
+        assert!((mw.spread_pips - 1.0).abs() < 1e-9);
+        assert!((mw.pip_size - 0.0001).abs() < 1e-12);
+    }
+
+    #[test]
+    fn resolve_mw_w_is_long() {
+        // Worked W: A=1.1200, B=1.1000, C=1.1080 → pct 0.40 (needs flag).
+        let roles = mw_roles(path("p", [1.1200, 1.1000, 1.1080]));
+        let args = mw_args(&["--allow-50-pct-m-trades"]);
+        let (dir, spec) =
+            resolve_mw_trade(&args, &roles, "EUR_USD", "ms-tn-1", Broker::TradeNation).expect("ok");
+        assert_eq!(dir, Direction::Long);
+        assert_eq!(spec.pattern, cli::TradePattern::W);
+    }
+
+    #[test]
+    fn resolve_mw_rejects_40_pct_without_flag() {
+        let roles = mw_roles(path("p", [1.1000, 1.1200, 1.1120])); // pct 0.40
+        let args = mw_args(&[]); // no --allow-50-pct-m-trades
+        match resolve_mw_trade(&args, &roles, "EUR_USD", "ms-tn-1", Broker::TradeNation) {
+            Err(ResolveError::Reject(msg)) => {
+                assert!(msg.contains("40%"), "msg = {msg}");
+                assert!(msg.contains("--allow-50-pct-m-trades"), "msg = {msg}");
+            }
+            other => panic!("expected Reject, got {:?}", other.map(|_| ())),
+        }
+    }
+
+    #[test]
+    fn resolve_mw_requires_spread_pips() {
+        let roles = mw_roles(path("p", [1.1000, 1.1200, 1.1180])); // shallow, pct 0.10
+        // No --spread-pips.
+        let args = Args::try_parse_from(["tv-arm"]).expect("parse");
+        match resolve_mw_trade(&args, &roles, "EUR_USD", "ms-tn-1", Broker::TradeNation) {
+            Err(ResolveError::Reject(msg)) => assert!(msg.contains("--spread-pips"), "msg = {msg}"),
+            other => panic!("expected Reject, got {:?}", other.map(|_| ())),
+        }
+    }
+
+    #[test]
+    fn resolve_mw_requires_trade_expiry() {
+        let roles = Roles {
+            mw_path: Some(path("p", [1.1000, 1.1200, 1.1180])),
+            // no trade_expiry
+            ..Default::default()
+        };
+        let args = mw_args(&[]);
+        match resolve_mw_trade(&args, &roles, "EUR_USD", "ms-tn-1", Broker::TradeNation) {
+            Err(ResolveError::Reject(msg)) => assert!(msg.contains("trade-expiry"), "msg = {msg}"),
+            other => panic!("expected Reject, got {:?}", other.map(|_| ())),
+        }
+    }
+
+    #[test]
+    fn resolve_mw_rejects_bad_structure() {
+        // retrace deeper than runup: A=1.1120, B=1.1200, C=1.1000.
+        let roles = mw_roles(path("p", [1.1120, 1.1200, 1.1000]));
+        let args = mw_args(&["--allow-50-pct-m-trades"]);
+        match resolve_mw_trade(&args, &roles, "EUR_USD", "ms-tn-1", Broker::TradeNation) {
+            Err(ResolveError::Reject(msg)) => assert!(msg.contains("runup leg"), "msg = {msg}"),
+            other => panic!("expected Reject, got {:?}", other.map(|_| ())),
+        }
     }
 }

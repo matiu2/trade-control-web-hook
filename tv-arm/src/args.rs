@@ -141,6 +141,31 @@ pub struct Args {
     #[arg(long, default_value_t = 0.1)]
     pub reversal_band_pct: f64,
 
+    /// (M/W only) Raise the neckline-retracement ceiling from the
+    /// default `< 40%` to `<= 50%`. A retrace deeper than 40% of the
+    /// runup is a marginal double-top/bottom; pass this to arm it
+    /// anyway. A retrace `> 50%` is always rejected regardless of this
+    /// flag. Ignored for H&S setups.
+    #[arg(long)]
+    pub allow_50_pct_m_trades: bool,
+
+    /// (M/W only, TEMPORARY) Broker spread in pips, baked into the
+    /// enter intent so the worker can mid→bid/ask correct the
+    /// stop-entry/SL/TP at fill time. Required when arming an M/W path
+    /// until the live broker-spread read lands (see commit 10); ignored
+    /// for H&S. The worker has no live spread at entry, so this is the
+    /// spread captured at arm time.
+    #[arg(long)]
+    pub spread_pips: Option<f64>,
+
+    /// (M/W only, TEMPORARY) Instrument pip size, baked into the enter
+    /// intent. Defaults to 0.0001 (matches the worker's
+    /// `DEFAULT_PIP_SIZE`); pass 0.01 for JPY-quoted pairs, etc. This
+    /// is a stopgap until tick-size metadata is read from
+    /// `instrument-lookup`; ignored for H&S.
+    #[arg(long, default_value_t = 0.0001)]
+    pub pip_size: f64,
+
     /// Print a zsh completion script to stdout and exit.
     #[arg(long)]
     pub print_completions: bool,
@@ -188,6 +213,27 @@ mod tests {
             .expect("parse");
         assert!(args.require_golden);
         assert!(args.require_confirmation);
+    }
+
+    #[test]
+    fn mw_flags_default_off_and_parse() {
+        let args = Args::try_parse_from(["tv-arm"]).expect("parse");
+        assert!(!args.allow_50_pct_m_trades);
+        assert_eq!(args.spread_pips, None);
+        assert_eq!(args.pip_size, 0.0001);
+
+        let args = Args::try_parse_from([
+            "tv-arm",
+            "--allow-50-pct-m-trades",
+            "--spread-pips",
+            "0.8",
+            "--pip-size",
+            "0.01",
+        ])
+        .expect("parse mw flags");
+        assert!(args.allow_50_pct_m_trades);
+        assert_eq!(args.spread_pips, Some(0.8));
+        assert_eq!(args.pip_size, 0.01);
     }
 
     #[test]
