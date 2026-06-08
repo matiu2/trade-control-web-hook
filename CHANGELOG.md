@@ -1,5 +1,76 @@
 # Changelog
 
+## v4 — 2026-06-08 — `prep-expire`: a `<prep>-expiry` cutoff line
+
+### Why
+
+An H&S setup is only valid if the break-and-close lands within a bounded
+number of bars of the pattern start (M15/H1 30–120, H4 30–180, Daily
+30–210, Weekly 30–∞). A real demo trade lost because the break-and-close
+came **124 bars** after the pattern start on H1 (max 120) — the pattern
+had grown too big to be a clean H&S, but nothing on the chart stopped the
+entry. Operators needed a way to draw that cutoff.
+
+### What changed
+
+**`prep-expire` action (new)**
+
+- New `Action::PrepExpire` (wire `prep-expire`). Carries `step` (which
+  prep) + `trade_id` + `ttl_hours`. State-only, no broker call.
+- New `StateStore` methods `block_prep` / `is_prep_blocked` /
+  `clear_prep_block` over a dedicated `prep-blocked:<scope>:<instrument>:<step>`
+  keyspace (global-first lookup, account-scoped, TTL-gated — same shape as
+  vetos but its own namespace). New `PrepBlockEntry` +
+  `Snapshot.prep_blocks` so blocks show in `status`. `PREP_BLOCK_INDEX_CAP`.
+- Worker: `handle_prep_expire` stores the block and logs `prep-expire
+  stored`; `handle_prep` now rejects a blocked step with a 409
+  `prep-expired` and a `prep rejected — expired` log. The rejection is
+  `Rejected` (does **not** poison the seen-id, per the 2026-06 replay-scope
+  rule), so a re-fire just re-logs. The enter gate's existing
+  `missing-prep` log completes the three-line timeline a future debugger
+  can grep to reconstruct the trade.
+- A prep that already fired *before* the block is untouched — the block
+  only stops *future* preps, so a trade that legitimately entered is not
+  disturbed.
+
+**Chart side (`<prep>-expiry` line)**
+
+- New drawing label vocabulary: a vertical line `<prep>-expiry`
+  (`break-and-close-expiry`, `retest-expiry`, plus `neckline-expiry` /
+  `retrace-expiry` aliases). `trade-expiry` keeps its dedicated
+  whole-trade-close meaning — a prep named `trade` would collide, but
+  that's illogical. `conventions::prep_name_from_expiry_label` resolves
+  the canonical prep step.
+- New `AlertBasename::PrepExpire(step)` → `08-prep-expire-<step>`.
+- CLI `TradeSpec.prep_expiries: Vec<String>` emits one drawing-bound
+  `08-prep-expire-<step>` alert per cutoff line. Rejected if a name isn't a
+  known prep or is also in `skip_preps`.
+- `tv-arm` classifies `<prep>-expiry` lines into `Roles.prep_expiries`,
+  binds each to its drawing, and **validates**: a future cutoff with no
+  matching prep trend line is a hard error (the setup could never enter);
+  a past cutoff is a warning (re-arming later in time).
+
+### Wire / config
+
+- `Intent` gains `action: prep-expire`; `validate` requires `step` +
+  `ttl_hours` (`MissingPrepExpireStep`).
+- `TradeSpec` gains `prep_expiries` (omitted from serialised yaml when
+  empty — byte-identical for existing trades).
+
+### Tests
+
+conventions label-resolution + basename round-trip; core validate (well
+-formed / no-step / no-ttl) + block round-trip + account scoping + snapshot
+yaml; CLI emitter + reject-unknown + reject-skipped; tv-arm classify +
+latest-wins + future-error / past-warn / future-with-prep-ok + alert
+binding. Host + wasm build, clippy + fmt clean across all five crates.
+
+### Follow-up
+
+The cutoff timestamp is operator-drawn; nothing yet auto-computes the
+bar-count limit per timeframe. A future pass could draw the `<prep>-expiry`
+line automatically at `pattern_start + max_bars × resolution`.
+
 ## v3 — 2026-05-28 — News-event blackout pauses + drawing-alert hardening
 
 ### Why

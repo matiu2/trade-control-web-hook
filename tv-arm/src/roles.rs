@@ -23,6 +23,7 @@ use tracing::{debug, info};
 use trade_control_conventions::{
     BLACKOUT_END_LABELS, BLACKOUT_START_LABELS, BREAK_LABELS, INVALIDATION_LABELS, NEWS_END_LABELS,
     NEWS_START_LABELS, RETEST_LABELS, SR_LEVEL_LABELS, TRADE_EXPIRY_LABELS, matches,
+    prep_name_from_expiry_label,
 };
 
 use trading_view::drawings::{Drawing, DrawingStub};
@@ -63,6 +64,12 @@ pub struct Roles {
     /// `06-close-on-reversal` alert (`inside_window` gets `price`
     /// added; `sr_bands` carries the bands).
     pub sr_levels: Vec<Drawing>,
+    /// Prep-expiry cutoff lines: each `<prep>-expiry` vertical line,
+    /// resolved to its canonical prep step name (`break-and-close` /
+    /// `retest`). One `prep-expire` alert is emitted per entry, bound
+    /// to the drawing. Multiple lines for the same step keep only the
+    /// latest (older ones are stale leftovers).
+    pub prep_expiries: Vec<(String, Drawing)>,
 }
 
 /// Anything that can hand us a `Drawing` by ID. The production impl is
@@ -91,6 +98,9 @@ pub fn classify<F: DrawingFetcher>(fetcher: &F, stubs: &[DrawingStub]) -> Result
     let mut news_starts: Vec<Drawing> = Vec::new();
     let mut news_ends: Vec<Drawing> = Vec::new();
     let mut sr_levels: Vec<Drawing> = Vec::new();
+    // Prep-expiry lines, grouped by resolved canonical prep step so a
+    // duplicate (re-armed) line keeps only the latest per step.
+    let mut prep_expiry_lines: Vec<(&'static str, Drawing)> = Vec::new();
 
     for stub in stubs {
         let d = fetcher.get_drawing(&stub.id)?;
@@ -118,6 +128,16 @@ pub fn classify<F: DrawingFetcher>(fetcher: &F, stubs: &[DrawingStub]) -> Result
             kind::FIB_RETRACEMENT => {
                 tp_fibs.push(d);
                 Some("tp_fib")
+            }
+            // Prep-expiry lines (`<prep>-expiry`) must be tested before
+            // the trade-expiry arm: `trade-expiry` resolves to None here
+            // (it's not a prep), so the two never collide, but checking
+            // prep-expiry first keeps the intent obvious.
+            kind::VERTICAL_LINE if prep_name_from_expiry_label(lbl).is_some() => {
+                if let Some(step) = prep_name_from_expiry_label(lbl) {
+                    prep_expiry_lines.push((step, d));
+                }
+                Some("prep_expiry")
             }
             kind::VERTICAL_LINE if matches(lbl, TRADE_EXPIRY_LABELS) => {
                 trade_expiries.push(d);
@@ -166,8 +186,39 @@ pub fn classify<F: DrawingFetcher>(fetcher: &F, stubs: &[DrawingStub]) -> Result
     roles.blackout_pairs = pair_vertical_lines(blackout_starts, blackout_ends, "blackout")?;
     roles.news_pairs = pair_vertical_lines(news_starts, news_ends, "news")?;
     roles.sr_levels = sr_levels;
+    roles.prep_expiries = latest_prep_expiry_per_step(prep_expiry_lines);
 
     Ok(roles)
+}
+
+/// Collapse the per-step prep-expiry candidates to one drawing each —
+/// the latest line wins (an earlier line on the same step is a stale
+/// leftover from a prior arming). Returns `(canonical_step, drawing)`
+/// pairs in stable step order (`break-and-close` before `retest`).
+fn latest_prep_expiry_per_step(cands: Vec<(&'static str, Drawing)>) -> Vec<(String, Drawing)> {
+    use trade_control_conventions::{PREP_BREAK_AND_CLOSE, PREP_RETEST};
+    let mut out = Vec::new();
+    for step in [PREP_BREAK_AND_CLOSE, PREP_RETEST] {
+        let mut for_step: Vec<Drawing> = cands
+            .iter()
+            .filter(|(s, _)| *s == step)
+            .map(|(_, d)| d.clone())
+            .collect();
+        if for_step.is_empty() {
+            continue;
+        }
+        if for_step.len() > 1 {
+            info!(
+                count = for_step.len(),
+                step, "multiple prep-expiry lines for step; picking the latest"
+            );
+        }
+        for_step.sort_by_key(|d| d.latest_time());
+        if let Some(d) = for_step.pop() {
+            out.push((step.to_string(), d));
+        }
+    }
+    out
 }
 
 /// Pick the drawing with the latest anchor time, logging a note when
@@ -438,6 +489,46 @@ mod tests {
         ]);
         let roles = classify(&mcp, &stubs).expect("ok");
         assert_eq!(roles.sr_levels.len(), 2);
+    }
+
+    #[test]
+    fn prep_expiry_line_classifies_to_canonical_step() {
+        // A `break-and-close-expiry` vertical line lands in prep_expiries
+        // resolved to the canonical step name; a `trade-expiry` line on
+        // the same chart stays a trade_expiry (no collision).
+        let (stubs, mcp) = fixture(vec![
+            (
+                stub("bnce", "vertical_line"),
+                drawing("bnce", "break-and-close-expiry", vec![(600, 1.0)]),
+            ),
+            (
+                stub("exp", "vertical_line"),
+                drawing("exp", "trade-expiry", vec![(900, 1.0)]),
+            ),
+        ]);
+        let roles = classify(&mcp, &stubs).expect("ok");
+        assert_eq!(roles.prep_expiries.len(), 1);
+        assert_eq!(roles.prep_expiries[0].0, "break-and-close");
+        assert_eq!(roles.prep_expiries[0].1.id, "bnce");
+        assert_eq!(roles.trade_expiry.as_ref().unwrap().id, "exp");
+    }
+
+    #[test]
+    fn duplicate_prep_expiry_keeps_latest() {
+        let (stubs, mcp) = fixture(vec![
+            (
+                stub("old", "vertical_line"),
+                drawing("old", "retest-expiry", vec![(100, 1.0)]),
+            ),
+            (
+                stub("new", "vertical_line"),
+                drawing("new", "retest-expiry", vec![(500, 1.0)]),
+            ),
+        ]);
+        let roles = classify(&mcp, &stubs).expect("ok");
+        assert_eq!(roles.prep_expiries.len(), 1);
+        assert_eq!(roles.prep_expiries[0].0, "retest");
+        assert_eq!(roles.prep_expiries[0].1.id, "new");
     }
 
     #[test]

@@ -60,16 +60,19 @@ per TF: M15/H1 30–120, H4 30–180, Daily 30–210, Weekly 30–∞.)
       "prep-expired" with "prep rejected — expired" log, no seen-poison;
       enter gate's existing `missing-prep` log is step 3. Host + wasm
       build + clippy clean; 109 worker tests pass.
-- [ ] CLI: emit `08-prep-expire-<step>` alert from the trade pipeline when
-      a prep-expiry is requested (drawing-bound vertical line); CLI
-      `prep-expire` verb plumbing. Tests.
-- [ ] tv-arm: classify `<prep>-expiry` lines → bind the prep-expire alert
-      to the drawing; future-with-no-prep error / past warn. Tests.
-- [ ] README + CHANGELOG (`vNN`).
+- [x] CLI: `TradeSpec.prep_expiries`; emits one drawing-bound
+      `08-prep-expire-<step>` alert per cutoff; rejects unknown / skipped
+      names; `prompts.rs` PrepExpire arm. Tests.
+- [x] tv-arm: classify `<prep>-expiry` lines → `Roles.prep_expiries`
+      (latest-wins per step); `alert_spec` binds the prep-expire alert to
+      the drawing; `check_prep_expiries` future-with-no-prep error / past
+      warn; `prep_expiry_steps` feeds `cli::TradeSpec`. Tests.
+- [x] README (actions list, basename table, drawing-roles table) +
+      CHANGELOG `v4`.
 
-Status: in-progress — conventions + core + worker landed (action,
-validate, KV keyspace, dispatch, prep-block gate, timeline logs). CLI
-emitter + tv-arm classification next.
+Status: DONE — all layers landed and green (conventions, core, worker,
+cli, tv-arm). Follow-up idea: auto-draw the `<prep>-expiry` line at
+`pattern_start + max_bars × resolution` per timeframe (CHANGELOG v4).
 
 ## Done — `--require-confirmation` flag on tv-arm
 

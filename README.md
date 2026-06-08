@@ -47,6 +47,13 @@ Per-instrument flag state (TTL-gated):
 
 - `prep` — record a named step (e.g. `break-and-close`) for an instrument with a
   TTL, used to build up multi-event setups.
+- `prep-expire` — block all *future* `prep` fires for one named `step` on an
+  instrument (KV flag `prep-blocked:<scope>:<instrument>:<step>`, TTL-gated). Once
+  set, any later `prep` for that step is rejected, so an entry whose
+  `requires_preps` lists the step can never open. A prep that already fired
+  *before* the block is untouched. No broker call. Fired by a `<prep>-expiry`
+  chart line when the window for landing the prep has lapsed (e.g. an H&S
+  break-and-close that never came within the allowed bar count).
 - `veto` — record a named blocker (e.g. `news-window`) for an instrument with a
   TTL. Carries an optional `level`:
   - `stop-next-entry` (default) — KV flag only; future entries that opt in via
@@ -85,6 +92,7 @@ Basename ordering matters — `tv-arm` maps drawings to alerts by prefix.
 | `04-prep-retest` | `prep` | Trendline crossing (retest from below) | Skippable with `--skip-retest`. |
 | `05-enter` | `enter` | Pine `Candle Signals` golden candle | The actual trade. Gated on the preps above + opposing-direction veto absent. |
 | `06-close-on-reversal` | `close` | Pine `Candle Signals` opposing reversal | Emitted when news-pairs and/or `support`/`resistance` lines are drawn. Carries `inside_window: [news?, price?]` (OR-composed) and, when `price` is listed, `sr_bands: [[lo, hi], ...]`. Defaults `needs_golden: true` for the candle-quality gate. |
+| `08-prep-expire-<step>` | `prep-expire` | Vertical line crossing chart time | Emitted once per chart-drawn `<prep>-expiry` line (`break-and-close-expiry`, `retest-expiry`). When crossed, blocks any further `<step>` prep on the trade — so a setup whose prep lands too late never enters. Drawing-bound. `<step>` is the canonical prep name and may contain hyphens. |
 
 The legacy `07-close-on-sr-reversal` basename is no longer emitted —
 its functionality folds into a single `06-close-on-reversal` whose
@@ -728,6 +736,7 @@ What you draw on the chart:
 | Trendline | (any in `RETEST_LABELS`) | Retest prep level. Skip with `--skip-retest`. |
 | Fib retracement | (label optional) | Drives both TP (`2 × neckline − head`) and the `pcl-exhausted` veto price (`midpoint + 0.8 × (TP − midpoint)`). Draw spanning **head → neckline**. |
 | Vertical line | `trade-expiry` | `not_after` for every alert in the bundle. |
+| Vertical line | `<prep>-expiry` (`break-and-close-expiry`, `retest-expiry`; aliases `neckline-expiry` / `retrace-expiry`) | Cutoff for that prep: emits an `08-prep-expire-<step>` alert that blocks the prep once crossed, so a setup whose prep lands too late never enters. **tv-arm errors** if the line is in the future but its prep trend line is missing (the setup could never enter); **warns** if the line is in the past (re-arm later). |
 | Vertical line pair | `news-start` / `news-end` | Each pair emits a `build-news` bundle. **Presence of any pair also adds `news` to the consolidated `06-close-on-reversal` alert's `inside_window`** — no extra flag. |
 | Vertical line pair | `blackout-start` / `blackout-end` (or `pause` / `resume` aliases) | Each pair emits a `build-pause` bundle. Blocks entries while active. |
 | Horizontal line | `support` or `resistance` | Each line adds an `[lo, hi]` band of ±`--reversal-band-pct` (default `0.1%`) to the `06-close-on-reversal` alert's `sr_bands` list, and adds `price` to its `inside_window`. Multiple lines union. |

@@ -108,6 +108,13 @@ pub fn run(args: Args) -> Result<i32> {
         eprintln!("ERROR: {msg}");
         return Ok(1);
     }
+    // 3b. Validate prep-expiry lines against their preps. A future
+    //     cutoff with no matching prep drawing would arm a setup that
+    //     can never enter; a past cutoff is just a re-arm later in time.
+    if let Err(msg) = check_prep_expiries(&roles, Utc::now()) {
+        eprintln!("ERROR: {msg}");
+        return Ok(1);
+    }
 
     // 4. Direction + TP + expiry from the classified drawings.
     let inv_label = roles.invalidation_label.clone().unwrap_or_default();
@@ -423,6 +430,64 @@ fn check_required(roles: &Roles, args: &Args) -> std::result::Result<(), String>
     Err(msg)
 }
 
+/// Canonical prep-step names that have a `<prep>-expiry` cutoff line on
+/// the chart — fed into `cli::TradeSpec.prep_expiries` so the CLI emits
+/// one `08-prep-expire-<step>` alert per line.
+fn prep_expiry_steps(roles: &Roles) -> Vec<String> {
+    roles
+        .prep_expiries
+        .iter()
+        .map(|(step, _)| step.clone())
+        .collect()
+}
+
+/// Validate each `<prep>-expiry` cutoff line against the prep it guards.
+///
+/// - **Future cutoff, no matching prep drawing** → hard error. The line
+///   would block the prep before it could ever land, so the setup could
+///   never enter — almost certainly the operator drew the cutoff but
+///   forgot the neckline / retest trend line.
+/// - **Past cutoff** → warn only. We're re-arming a setup later in time
+///   (the cutoff already lapsed); the line is harmless context, not a
+///   reason to abort.
+///
+/// `now` is injected so the rule is unit-testable without a clock.
+fn check_prep_expiries(roles: &Roles, now: DateTime<Utc>) -> std::result::Result<(), String> {
+    let now_unix = now.timestamp();
+    let mut errors = Vec::new();
+    for (step, drawing) in &roles.prep_expiries {
+        let line_unix = drawing.anchor_time_seconds();
+        let prep_present = match step.as_str() {
+            trade_control_conventions::PREP_BREAK_AND_CLOSE => roles.break_and_close.is_some(),
+            trade_control_conventions::PREP_RETEST => roles.retest.is_some(),
+            // Unknown step shouldn't occur (classify only emits known
+            // prep names), but treat it as "prep absent" defensively.
+            _ => false,
+        };
+        if line_unix > now_unix {
+            if !prep_present {
+                errors.push(format!(
+                    "  - '{step}-expiry' cutoff line is in the future but no '{step}' \
+                     trend line is on the chart — this setup could never enter \
+                     (draw the '{step}' line, or remove the expiry cutoff)"
+                ));
+            }
+        } else {
+            warn!(
+                step = %step,
+                "'{step}-expiry' cutoff line is in the past — assuming a re-arm later in time"
+            );
+        }
+    }
+    if errors.is_empty() {
+        return Ok(());
+    }
+    Err(format!(
+        "prep-expiry validation failed:\n{}\n",
+        errors.join("\n")
+    ))
+}
+
 /// Load the signing key from `TRADE_CONTROL_KEY_FILE` env or the
 /// default `~/.config/trade-control/key.hex`.
 fn read_key() -> Result<[u8; KEY_LEN]> {
@@ -521,6 +586,9 @@ fn build_trade_spec(
         close_on_news: !roles.news_pairs.is_empty(),
         sr_reversal_ranges: build_sr_ranges(roles, args.reversal_band_pct),
         needs_confirmed_close: false,
+        // Populated from the chart's `<prep>-expiry` vertical lines —
+        // see `prep_expiry_steps`.
+        prep_expiries: prep_expiry_steps(roles),
     };
     if args.sl_from_recent {
         spec.sl_anchor = Some(match direction {
@@ -967,5 +1035,79 @@ impl AnchorTimeShim for Drawing {
     fn anchor_time_seconds(&self) -> i64 {
         use trading_view::pair_lines::TimedAnchor;
         self.anchor_time()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use trading_view::drawings::{Point, Properties};
+
+    fn vline(id: &str, unix: i64) -> Drawing {
+        Drawing {
+            id: id.to_string(),
+            points: vec![Point {
+                time: unix,
+                price: 1.0,
+            }],
+            properties: Properties { text: None },
+        }
+    }
+
+    fn now() -> DateTime<Utc> {
+        "2026-06-08T00:00:00Z".parse().unwrap()
+    }
+
+    #[test]
+    fn prep_expiry_future_without_prep_errors() {
+        // Cutoff in the future but no break-and-close trend line → error.
+        let roles = Roles {
+            prep_expiries: vec![(
+                "break-and-close".into(),
+                vline("e", now().timestamp() + 3600),
+            )],
+            ..Default::default()
+        };
+        let err = check_prep_expiries(&roles, now()).unwrap_err();
+        assert!(err.contains("break-and-close-expiry"), "msg = {err}");
+        assert!(err.contains("never enter"), "msg = {err}");
+    }
+
+    #[test]
+    fn prep_expiry_future_with_prep_ok() {
+        // Same future cutoff, but the break-and-close line is present →
+        // a legitimate "pattern got too big" cutoff. No error.
+        let roles = Roles {
+            break_and_close: Some(vline("neck", now().timestamp() - 7200)),
+            prep_expiries: vec![(
+                "break-and-close".into(),
+                vline("e", now().timestamp() + 3600),
+            )],
+            ..Default::default()
+        };
+        check_prep_expiries(&roles, now()).unwrap();
+    }
+
+    #[test]
+    fn prep_expiry_in_past_is_warn_not_error() {
+        // Cutoff already lapsed → we're re-arming later in time; warn
+        // only, even with no prep drawing present.
+        let roles = Roles {
+            prep_expiries: vec![("retest".into(), vline("e", now().timestamp() - 3600))],
+            ..Default::default()
+        };
+        check_prep_expiries(&roles, now()).unwrap();
+    }
+
+    #[test]
+    fn prep_expiry_steps_lists_canonical_names() {
+        let roles = Roles {
+            prep_expiries: vec![
+                ("break-and-close".into(), vline("a", 1)),
+                ("retest".into(), vline("b", 2)),
+            ],
+            ..Default::default()
+        };
+        assert_eq!(prep_expiry_steps(&roles), vec!["break-and-close", "retest"]);
     }
 }

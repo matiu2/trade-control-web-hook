@@ -365,6 +365,15 @@ pub struct TradeSpec {
     /// the two flags set. Default `false`.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub needs_confirmed_close: bool,
+    /// Prep steps that have a `<prep>-expiry` cutoff line on the chart.
+    /// Each name here gets an extra `08-prep-expire-<step>` alert: a
+    /// drawing-bound `prep-expire` that, when its vertical line is
+    /// crossed, blocks any further `prep` for that step — so a setup
+    /// whose prep lands too late never enters. Names must be in
+    /// [`KNOWN_PREP_NAMES`] and must not also be in [`Self::skip_preps`]
+    /// (you can't expire a prep you've dropped). Default empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub prep_expiries: Vec<String>,
 }
 
 fn is_zero_u32(n: &u32) -> bool {
@@ -468,6 +477,20 @@ pub fn build_trade_from_spec(mut spec: TradeSpec, now: DateTime<Utc>) -> Result<
         if !KNOWN_PREP_NAMES.contains(&name.as_str()) {
             return Err(eyre!(
                 "skip_preps name {name:?} is not a known prep; expected one of {KNOWN_PREP_NAMES:?}"
+            ));
+        }
+    }
+    for name in &spec.prep_expiries {
+        if !KNOWN_PREP_NAMES.contains(&name.as_str()) {
+            return Err(eyre!(
+                "prep_expiries name {name:?} is not a known prep; expected one of \
+                 {KNOWN_PREP_NAMES:?}"
+            ));
+        }
+        if spec.skip_preps.iter().any(|s| s == name) {
+            return Err(eyre!(
+                "prep_expiries name {name:?} is also in skip_preps — can't expire a prep \
+                 that's been dropped"
             ));
         }
     }
@@ -645,6 +668,7 @@ fn build_pattern(
         close_on_news: false,
         sr_reversal_ranges: Vec::new(),
         needs_confirmed_close: false,
+        prep_expiries: Vec::new(),
         skip_preps: Vec::new(),
         entry_offset_pips: Some(entry_offset_pips),
         sl_offset_pips: Some(sl_offset_pips),
@@ -728,6 +752,20 @@ fn assemble_trade(
             &spec.instrument,
             &trade_id,
             spec.trade_expiry,
+            &spec.broker,
+            &spec.account,
+            now,
+        ));
+    }
+    // One prep-expire alert per chart-drawn `<prep>-expiry` line. When
+    // its vertical line is crossed, the worker blocks further preps for
+    // that step, so a setup whose prep lands too late never enters.
+    for step in &spec.prep_expiries {
+        alerts.push(build_prep_expire_alert(
+            &spec.instrument,
+            &trade_id,
+            step,
+            veto_expiry,
             &spec.broker,
             &spec.account,
             now,
@@ -1086,6 +1124,44 @@ fn build_retest_alert(
     }
 }
 
+/// Build a `prep-expire` alert for `step`. Drawing-bound on the chart
+/// to a `<step>-expiry` vertical line; when crossed, the worker blocks
+/// any further `prep` for that step on the trade, so a setup whose prep
+/// lands too late (e.g. an H&S break-and-close past the allowed bar
+/// count) can never enter. TTL'd to `veto_expiry` like the other
+/// time-bounded flags — well past `trade_expiry` so the block outlives
+/// the entry window it guards.
+fn build_prep_expire_alert(
+    instrument: &str,
+    trade_id: &str,
+    step: &str,
+    veto_expiry: DateTime<Utc>,
+    broker: &BrokerKind,
+    account: &str,
+    now: DateTime<Utc>,
+) -> BuiltAlert {
+    let id = format!("{trade_id}-{step}-expiry");
+    let mut intent = skeleton(
+        Action::PrepExpire,
+        instrument,
+        id,
+        veto_expiry,
+        *broker,
+        account,
+        trade_id,
+    );
+    intent.step = Some(step.to_string());
+    intent.ttl_hours =
+        trade_control_core::tunable::Tunable::Static(ttl_hours_until(now, veto_expiry));
+    BuiltAlert {
+        basename: AlertBasename::PrepExpire(step.to_string())
+            .as_str()
+            .into_owned(),
+        purpose: format!("prep-expire: block future {step} preps once the cutoff line is crossed"),
+        intent,
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn build_enter_alert(
     instrument: &str,
@@ -1395,6 +1471,7 @@ mod tests {
                 close_on_news: false,
                 sr_reversal_ranges: Vec::new(),
                 needs_confirmed_close: false,
+                prep_expiries: Vec::new(),
                 skip_preps: Vec::new(),
                 entry_offset_pips: Some(1.0),
                 sl_offset_pips: Some(1.0),
@@ -1577,6 +1654,7 @@ mod tests {
             close_on_news: false,
             sr_reversal_ranges: Vec::new(),
             needs_confirmed_close: false,
+            prep_expiries: Vec::new(),
             skip_preps: Vec::new(),
             entry_offset_pips: None,
             sl_offset_pips: None,
@@ -1879,6 +1957,46 @@ tp_price: 1.05
         // Spot-check a non-enter alert: dry_run must be None.
         let veto = &trade.alerts[0];
         assert_eq!(veto.intent.dry_run, None);
+    }
+
+    #[test]
+    fn build_trade_from_spec_emits_prep_expire_alert_per_entry() {
+        // A prep_expiries entry must produce an `08-prep-expire-<step>`
+        // alert with action prep-expire, the right step, and a TTL.
+        let now = ts("2026-05-20T00:00:00Z");
+        let mut spec = sample_spec(TradePattern::Hs, ts("2026-05-25T00:00:00Z"));
+        spec.prep_expiries = vec!["break-and-close".into()];
+        let trade = build_trade_from_spec(spec, now).unwrap();
+        let pe = trade
+            .alerts
+            .iter()
+            .find(|a| a.basename == "08-prep-expire-break-and-close")
+            .expect("prep-expire alert emitted");
+        assert_eq!(pe.intent.action, Action::PrepExpire);
+        assert_eq!(pe.intent.step.as_deref(), Some("break-and-close"));
+        assert!(matches!(
+            pe.intent.ttl_hours,
+            trade_control_core::tunable::Tunable::Static(h) if h > 0
+        ));
+        pe.intent.validate().unwrap();
+    }
+
+    #[test]
+    fn build_trade_from_spec_rejects_unknown_prep_expiry() {
+        let now = ts("2026-05-20T00:00:00Z");
+        let mut spec = sample_spec(TradePattern::Hs, ts("2026-05-25T00:00:00Z"));
+        spec.prep_expiries = vec!["nonsense".into()];
+        assert!(build_trade_from_spec(spec, now).is_err());
+    }
+
+    #[test]
+    fn build_trade_from_spec_rejects_expiring_a_skipped_prep() {
+        // Can't expire a prep that's also been dropped.
+        let now = ts("2026-05-20T00:00:00Z");
+        let mut spec = sample_spec(TradePattern::Hs, ts("2026-05-25T00:00:00Z"));
+        spec.skip_preps = vec!["retest".into()];
+        spec.prep_expiries = vec!["retest".into()];
+        assert!(build_trade_from_spec(spec, now).is_err());
     }
 
     #[test]

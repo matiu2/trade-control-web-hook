@@ -236,6 +236,20 @@ pub fn build_alert_spec(
                     message: String::new(),
                 })
         }
+        AlertBasename::PrepExpire(step) => roles
+            .prep_expiries
+            .iter()
+            .find(|(s, _)| *s == step)
+            .map(|(_, d)| AlertPayload::Drawing {
+                drawing_id: d.id.clone(),
+                tool: Tool::LineToolVertLine,
+                condition_type: ConditionType::Cross,
+                frequency: Frequency::OnFirstFire,
+                auto_deactivate: false,
+                tv_name,
+                name: String::new(),
+                message: String::new(),
+            }),
         AlertBasename::PrepRetest => roles.retest.as_ref().map(|d| AlertPayload::Drawing {
             drawing_id: d.id.clone(),
             tool: Tool::LineToolTrendLine,
@@ -436,6 +450,7 @@ mod tests {
             blackout_pairs: vec![],
             news_pairs: vec![],
             sr_levels: vec![],
+            prep_expiries: vec![],
         }
     }
 
@@ -697,6 +712,43 @@ mod tests {
         } else {
             panic!("expected VertLineAt for calendar resume");
         }
+    }
+
+    #[test]
+    fn prep_expire_binds_to_matching_drawing() {
+        let mut roles = short_roles_full();
+        roles.prep_expiries = vec![(
+            "break-and-close".into(),
+            drawing("bnce", "break-and-close-expiry", vec![(600, 1.0)]),
+        )];
+        let ctx = DispatchContext::default();
+        let p = build_alert_spec(
+            "08-prep-expire-break-and-close.yaml",
+            Direction::Short,
+            &roles,
+            &ctx,
+        )
+        .unwrap()
+        .unwrap();
+        match p {
+            AlertPayload::Drawing {
+                drawing_id, tool, ..
+            } => {
+                assert_eq!(drawing_id, "bnce");
+                assert_eq!(tool, Tool::LineToolVertLine);
+            }
+            _ => panic!("expected Drawing variant, got {p:?}"),
+        }
+    }
+
+    #[test]
+    fn prep_expire_without_matching_drawing_returns_none() {
+        // No prep_expiries on the chart → the alert is skipped.
+        let roles = short_roles_full();
+        let ctx = DispatchContext::default();
+        let p =
+            build_alert_spec("08-prep-expire-retest.yaml", Direction::Short, &roles, &ctx).unwrap();
+        assert!(p.is_none());
     }
 
     #[test]
