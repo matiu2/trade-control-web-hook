@@ -1,5 +1,76 @@
 # TODO
 
+## Active — `prep-expire` action + `<prep>-expiry` vertical line
+
+A vertical line labelled `<prep>-expiry` (e.g. `break-and-close-expiry`,
+`retest-expiry`) fires its own alert into the worker carrying a new
+`prep-expire` action with `step: <prep>`. The worker records a
+`prep-blocked:<account>:<instrument>:<step>` KV flag. From then on, any
+`prep` fire for that step is **rejected** (logged, no broker call), so the
+entry's `requires_preps` gate for that step can never be satisfied and the
+`enter` is rejected too. If the prep already fired *before* the line, it's
+already recorded and the trade is legitimately in — the block only stops
+*future* preps.
+
+Runtime timeline (the log lines must let us reconstruct this later):
+
+1. `break-and-close-expiry` line fires → worker stores
+   `prep-blocked:<acct>:<instr>:break-and-close`. Log: "prep-expire stored".
+2. `break-and-close` prep fires → worker rejects (blocked). Log:
+   "prep rejected — expired/blocked". Does NOT poison seen-id.
+3. `enter` fires → worker rejects (missing required prep). Log:
+   "enter rejected — required prep break-and-close not satisfied".
+
+Motivating bug: an H&S break-and-close landed 124 bars after the pattern
+start (max 120 on H1) — too late, the trade lost. The expiry line lets the
+operator draw the "pattern got too big" cutoff on the chart. (Bar counts
+per TF: M15/H1 30–120, H4 30–180, Daily 30–210, Weekly 30–∞.)
+
+### Design decisions (locked with user)
+
+- New `Action::PrepExpire` (wire `prep-expire`), `step: <prep>` required,
+  no broker side effects (state only). Marks-seen on completion (idempotent
+  control action, like prep/veto).
+- Blocked-prep rejection is `ActionResult::Rejected` (logged, no seen-id
+  poison) — re-fires are harmless re-logs. Consistent with the 2026-06
+  replay-scope fix.
+- Label inference: `<name>-expiry` → strip `-expiry`, match `<name>`
+  against prep vocabularies (`break-and-close`/`neckline`,
+  `retest`/`retrace`) → canonical prep step. `trade-expiry` keeps its
+  dedicated whole-trade-close veto meaning (no collision: `trade` ∉ preps).
+
+### tv-arm validation (Part B)
+
+- A `<prep>-expiry` line **in the future** with **no matching prep drawing**
+  present → hard **error** (you'd arm a setup that can never enter).
+- A `<prep>-expiry` line **in the past** → **warn** only (re-arm later).
+
+### Steps
+
+- [x] conventions: `PREP_EXPIRY_SUFFIX` + `prep_name_from_expiry_label()`
+      + `AlertBasename::PrepExpire(step)` (`08-prep-expire-<step>`). Tests.
+- [x] core: `Action::PrepExpire`; `Intent::validate` (needs step + ttl;
+      `MissingPrepExpireStep`); `StateStore` block-prep methods
+      (`block_prep`/`is_prep_blocked`/`clear_prep_block`) +
+      KV/memstore/retry-mock impls; `PrepBlockEntry` + `Snapshot.prep_blocks`
+      surfacing; `PREP_BLOCK_INDEX_CAP`. Tests (validate + round-trip +
+      scoping + snapshot yaml).
+- [x] worker: `handle_prep_expire` dispatch + "prep-expire stored"
+      timeline log; `handle_prep` consults `is_prep_blocked` → 409
+      "prep-expired" with "prep rejected — expired" log, no seen-poison;
+      enter gate's existing `missing-prep` log is step 3. Host + wasm
+      build + clippy clean; 109 worker tests pass.
+- [ ] CLI: emit `08-prep-expire-<step>` alert from the trade pipeline when
+      a prep-expiry is requested (drawing-bound vertical line); CLI
+      `prep-expire` verb plumbing. Tests.
+- [ ] tv-arm: classify `<prep>-expiry` lines → bind the prep-expire alert
+      to the drawing; future-with-no-prep error / past warn. Tests.
+- [ ] README + CHANGELOG (`vNN`).
+
+Status: in-progress — conventions + core + worker landed (action,
+validate, KV keyspace, dispatch, prep-block gate, timeline logs). CLI
+emitter + tv-arm classification next.
+
 ## Done — `--require-confirmation` flag on tv-arm
 
 `needs_confirmed` was first-class on `Intent` and on the close path

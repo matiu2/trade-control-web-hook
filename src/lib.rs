@@ -170,6 +170,7 @@ pub async fn main(mut req: Request, env: Env, _ctx: Context) -> Result<Response>
         Action::Status => return handle_status(&store, &verified, now).await,
         Action::Unlock => return handle_unlock(&store, &verified, now).await,
         Action::Prep => return handle_prep(&store, &verified, now).await,
+        Action::PrepExpire => return handle_prep_expire(&store, &verified, now).await,
         Action::Veto => {
             if matches!(
                 verified.intent.level.unwrap_or_default(),
@@ -448,6 +449,7 @@ async fn run_action<B: Broker>(
         Action::Status
         | Action::Unlock
         | Action::Prep
+        | Action::PrepExpire
         | Action::ClearPrep
         | Action::ClearVeto
         | Action::Pause
@@ -1262,12 +1264,40 @@ async fn handle_prep(
         }
     };
     let ttl_seconds = (ttl_hours as u64).saturating_mul(3600);
+    let account = verified.intent.account.as_deref();
+    // Prep-expiry gate (step 2 of the prep-expire flow): if a
+    // `<step>-expiry` line has fired for this step, the window for
+    // landing it has lapsed — reject the prep so the entry's
+    // `requires_preps` can never be satisfied. Rejected (not Ok): does
+    // NOT poison the seen-id (a re-fire just re-logs and re-rejects),
+    // consistent with the replay-scope rule in CLAUDE.md. An operator
+    // reconstructing a trade greps `prep rejected — expired`.
+    match store
+        .is_prep_blocked(account, &verified.intent.instrument, step)
+        .await
+    {
+        Ok(true) => {
+            console_log!(
+                "prep rejected — expired: instrument={} account={} step={} trade_id={} \
+                 (a {step}-expiry line already fired)",
+                verified.intent.instrument,
+                account.unwrap_or("<global>"),
+                step,
+                verified.intent.trade_id.as_deref().unwrap_or("<none>"),
+            );
+            return Response::error(format!("prep-expired: {step}"), 409);
+        }
+        Ok(false) => {}
+        Err(err) => {
+            console_error!("KV is_prep_blocked: {err}");
+            return Response::error("state error", 500);
+        }
+    }
     // Clear any preps listed in `clears` first so stale downstream
     // preps (e.g. an old `retest`) can't survive a fresh upstream prep
     // (`break-and-close`). Logged per-name for traceability; failures
     // are best-effort logs rather than rejections so a transient KV
     // hiccup on a clear doesn't block the new prep.
-    let account = verified.intent.account.as_deref();
     let cleared = match clear_named_preps(
         store,
         account,
@@ -1318,6 +1348,64 @@ fn format_prep_set_outcome(step: &str, ttl_hours: u32, cleared: &[String]) -> St
             cleared.join(",")
         )
     }
+}
+
+/// Handle the `prep-expire` action: block all *future* `prep` fires for
+/// a named step on an instrument, with a TTL. Fired by a `<prep>-expiry`
+/// chart line when the window for landing that prep has lapsed (e.g. an
+/// H&S break-and-close that never came within the allowed bar count).
+///
+/// State-only — no broker call. A prep that *already* fired before this
+/// block is untouched: the block only stops new ones, so a trade that
+/// already legitimately entered is not disturbed. After the block,
+/// `handle_prep` rejects the step and the enter gate's `requires_preps`
+/// for that step can never be satisfied — see the timeline note in the
+/// repo `CLAUDE.md`.
+///
+/// Marks-seen on completion (idempotent control action, like `prep`):
+/// replaying the same `prep-expire` body just re-applies the same block.
+async fn handle_prep_expire(
+    store: &KvStateStore,
+    verified: &incoming::Verified,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<Response> {
+    let Some(step) = verified.intent.step.as_deref() else {
+        return Response::error("prep-expire requires `step`", 400);
+    };
+    let ttl_hours = match resolve_phase1_u32(
+        "ttl_hours",
+        Some(&verified.intent.ttl_hours),
+        &verified.shell,
+        0,
+    ) {
+        Ok(n) => n,
+        Err(_outcome) => {
+            return Response::error("ttl_hours script error", 412);
+        }
+    };
+    let ttl_seconds = (ttl_hours as u64).saturating_mul(3600);
+    let account = verified.intent.account.as_deref();
+    if let Err(err) = store
+        .block_prep(account, &verified.intent.instrument, step, now, ttl_seconds)
+        .await
+    {
+        console_error!("KV block_prep: {err}");
+        return Response::error("state error", 500);
+    }
+    // Timeline log (step 1 of the prep-expire flow): an operator
+    // reconstructing a trade later greps `prep-expire stored` to see
+    // when the cutoff fired.
+    console_log!(
+        "prep-expire stored: instrument={} account={} step={} ttl={}h trade_id={}",
+        verified.intent.instrument,
+        account.unwrap_or("<global>"),
+        step,
+        ttl_hours,
+        verified.intent.trade_id.as_deref().unwrap_or("<none>"),
+    );
+    let outcome = format!("prep-expire: {step} blocked ttl={ttl_hours}h");
+    record_seen(store, verified, now, &outcome).await;
+    Response::ok("ok")
 }
 
 /// Handle the `veto` action at level `stop-next-entry`: record a named
@@ -2231,6 +2319,32 @@ mod dispatcher_outcome_tests {
         ) -> Result<bool, StateError> {
             Ok(false)
         }
+        async fn block_prep(
+            &self,
+            _account: Option<&str>,
+            _instrument: &str,
+            _step: &str,
+            _now: chrono::DateTime<chrono::Utc>,
+            _ttl_seconds: u64,
+        ) -> Result<(), StateError> {
+            Ok(())
+        }
+        async fn is_prep_blocked(
+            &self,
+            _account: Option<&str>,
+            _instrument: &str,
+            _step: &str,
+        ) -> Result<bool, StateError> {
+            Ok(false)
+        }
+        async fn clear_prep_block(
+            &self,
+            _account: Option<&str>,
+            _instrument: &str,
+            _step: &str,
+        ) -> Result<bool, StateError> {
+            Ok(false)
+        }
         async fn snapshot(&self) -> Result<Snapshot, StateError> {
             Ok(Snapshot {
                 now: Utc::now(),
@@ -2240,6 +2354,7 @@ mod dispatcher_outcome_tests {
                 vetos: Vec::new(),
                 pauses: Vec::new(),
                 news_windows: Vec::new(),
+                prep_blocks: Vec::new(),
             })
         }
         async fn set_pause(

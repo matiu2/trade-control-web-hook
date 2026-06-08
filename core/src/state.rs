@@ -103,6 +103,19 @@ pub struct VetoEntry {
     pub account: Option<String>,
 }
 
+/// One active "prep-blocked" row in a [`Snapshot`]. Written by the
+/// `prep-expire` action; while present, any new `prep` for the same
+/// `(account, instrument, step)` is rejected. Presence alone is the
+/// signal — no ordering applies. Same scoping rules as [`VetoEntry`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PrepBlockEntry {
+    pub instrument: String,
+    pub step: String,
+    pub expires_at: DateTime<Utc>,
+    /// `None` for worker-global, `Some(name)` for account-scoped.
+    pub account: Option<String>,
+}
+
 /// One placed entry attempt for a `(account, trade_id)` group, written
 /// after `place_order` succeeds when `intent.max_retries.is_some()`.
 /// The worker uses the list of these rows to count attempts against
@@ -261,6 +274,10 @@ pub struct Snapshot {
     /// [`NewsEntry`].
     #[serde(default)]
     pub news_windows: Vec<NewsEntry>,
+    /// Active prep-blocks across all instruments. `default`-empty for
+    /// back-compat with snapshots serialised before the field landed.
+    #[serde(default)]
+    pub prep_blocks: Vec<PrepBlockEntry>,
 }
 
 /// Async storage interface. Implementations are `?Send` because the CF Worker
@@ -394,6 +411,42 @@ pub trait StateStore {
         account: Option<&str>,
         instrument: &str,
         name: &str,
+    ) -> impl Future<Output = Result<bool, StateError>>;
+
+    /// Block all future `prep` fires for `(account, instrument, step)`
+    /// with a TTL. Written by the `prep-expire` action when a
+    /// `<prep>-expiry` chart line fires. Presence alone is the signal.
+    /// A prep recorded *before* the block is unaffected — the gate only
+    /// rejects *new* preps for the step. Distinct keyspace from vetos
+    /// (`prep-blocked:` vs `veto:`) so it surfaces separately in
+    /// [`Snapshot`] and clears independently.
+    fn block_prep(
+        &self,
+        account: Option<&str>,
+        instrument: &str,
+        step: &str,
+        now: DateTime<Utc>,
+        ttl_seconds: u64,
+    ) -> impl Future<Output = Result<(), StateError>>;
+
+    /// Returns true if `(account, instrument, step)` is currently
+    /// prep-blocked. Global-first lookup, same shape as
+    /// [`Self::is_vetoed`]: a `Some(account)` query also matches a
+    /// `None` (global) block.
+    fn is_prep_blocked(
+        &self,
+        account: Option<&str>,
+        instrument: &str,
+        step: &str,
+    ) -> impl Future<Output = Result<bool, StateError>>;
+
+    /// Clear a prep-block for `(account, instrument, step)`. Returns
+    /// whether it was set before. Scoped to the supplied account.
+    fn clear_prep_block(
+        &self,
+        account: Option<&str>,
+        instrument: &str,
+        step: &str,
     ) -> impl Future<Output = Result<bool, StateError>>;
 
     /// Set a blackout pause for `(trade_id, blackout_id)`. The
@@ -553,6 +606,11 @@ pub const PREP_INDEX_CAP: usize = 50;
 /// `veto:<instrument>:<name>` keys remain authoritative for gate checks.
 pub const VETO_INDEX_CAP: usize = 50;
 
+/// Maximum number of active prep-block flags retained in the index. The
+/// TTL'd `prep-blocked:<scope>:<instrument>:<step>` keys remain
+/// authoritative for gate checks.
+pub const PREP_BLOCK_INDEX_CAP: usize = 50;
+
 /// Drop entries whose `expires_at` is at or before `now`. Used by both the
 /// cooldown and seen indexes; generic over the entry type so the same pure
 /// helper covers both.
@@ -588,6 +646,12 @@ impl HasExpiry for PrepEntry {
 }
 
 impl HasExpiry for VetoEntry {
+    fn expires_at(&self) -> DateTime<Utc> {
+        self.expires_at
+    }
+}
+
+impl HasExpiry for PrepBlockEntry {
     fn expires_at(&self) -> DateTime<Utc> {
         self.expires_at
     }
@@ -921,6 +985,52 @@ mod memstore {
             let scope = account_scope(account);
             Ok(self.delete(&format!("veto:{scope}:{instrument}:{name}")))
         }
+        async fn block_prep(
+            &self,
+            account: Option<&str>,
+            instrument: &str,
+            step: &str,
+            now: DateTime<Utc>,
+            ttl_seconds: u64,
+        ) -> Result<(), StateError> {
+            let scope = account_scope(account);
+            self.put(
+                format!("prep-blocked:{scope}:{instrument}:{step}"),
+                "1".into(),
+                ttl_seconds.max(MIN_TTL_SECONDS),
+                now,
+            );
+            Ok(())
+        }
+        async fn is_prep_blocked(
+            &self,
+            account: Option<&str>,
+            instrument: &str,
+            step: &str,
+        ) -> Result<bool, StateError> {
+            let now = Utc::now();
+            // Global blocks cover every account; check both keys.
+            let global = format!("prep-blocked:{ACCOUNT_SCOPE_GLOBAL}:{instrument}:{step}");
+            if self.get_live(&global, now).is_some() {
+                return Ok(true);
+            }
+            if let Some(name_str) = account {
+                let scoped = format!("prep-blocked:{name_str}:{instrument}:{step}");
+                if self.get_live(&scoped, now).is_some() {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        }
+        async fn clear_prep_block(
+            &self,
+            account: Option<&str>,
+            instrument: &str,
+            step: &str,
+        ) -> Result<bool, StateError> {
+            let scope = account_scope(account);
+            Ok(self.delete(&format!("prep-blocked:{scope}:{instrument}:{step}")))
+        }
         async fn snapshot(&self) -> Result<Snapshot, StateError> {
             // The mock doesn't track an index alongside the TTL'd keys, so
             // the snapshot reflects whatever live keys are currently set.
@@ -934,6 +1044,7 @@ mod memstore {
                 vetos: Vec::new(),
                 pauses: Vec::new(),
                 news_windows: Vec::new(),
+                prep_blocks: Vec::new(),
             })
         }
 
@@ -1312,6 +1423,84 @@ mod tests {
         let store = MemStateStore::new();
         let got = pollster::block_on(store.get_prep(None, "EUR_USD", "ghost")).unwrap();
         assert!(got.is_none());
+    }
+
+    #[test]
+    fn memstore_prep_block_round_trip() {
+        use super::memstore::MemStateStore;
+        let store = MemStateStore::new();
+        let now = Utc::now();
+        assert!(
+            !pollster::block_on(store.is_prep_blocked(None, "EUR_USD", "break-and-close")).unwrap(),
+            "no block set yet"
+        );
+        pollster::block_on(store.block_prep(None, "EUR_USD", "break-and-close", now, 48 * 3600))
+            .unwrap();
+        assert!(
+            pollster::block_on(store.is_prep_blocked(None, "EUR_USD", "break-and-close")).unwrap(),
+            "block should be visible after being set"
+        );
+        // A different step on the same instrument is unaffected.
+        assert!(
+            !pollster::block_on(store.is_prep_blocked(None, "EUR_USD", "retest")).unwrap(),
+            "blocking break-and-close must not block retest"
+        );
+        let cleared =
+            pollster::block_on(store.clear_prep_block(None, "EUR_USD", "break-and-close")).unwrap();
+        assert!(cleared, "clear returns true when a block was present");
+        assert!(
+            !pollster::block_on(store.is_prep_blocked(None, "EUR_USD", "break-and-close")).unwrap(),
+            "block gone after clear"
+        );
+        assert!(
+            !pollster::block_on(store.clear_prep_block(None, "EUR_USD", "break-and-close"))
+                .unwrap(),
+            "clearing an absent block returns false"
+        );
+    }
+
+    #[test]
+    fn memstore_global_prep_block_covers_scoped_query() {
+        // A global (account-less) block must reject a prep fired under a
+        // specific account, mirroring is_vetoed's global-first rule.
+        use super::memstore::MemStateStore;
+        let store = MemStateStore::new();
+        let now = Utc::now();
+        pollster::block_on(store.block_prep(None, "EUR_USD", "break-and-close", now, 3600))
+            .unwrap();
+        assert!(
+            pollster::block_on(store.is_prep_blocked(Some("acct-a"), "EUR_USD", "break-and-close"))
+                .unwrap(),
+            "global block should cover an account-scoped query"
+        );
+    }
+
+    #[test]
+    fn memstore_scoped_prep_block_does_not_leak_across_accounts() {
+        use super::memstore::MemStateStore;
+        let store = MemStateStore::new();
+        let now = Utc::now();
+        pollster::block_on(store.block_prep(
+            Some("acct-a"),
+            "EUR_USD",
+            "break-and-close",
+            now,
+            3600,
+        ))
+        .unwrap();
+        assert!(
+            pollster::block_on(store.is_prep_blocked(Some("acct-a"), "EUR_USD", "break-and-close"))
+                .unwrap(),
+        );
+        assert!(
+            !pollster::block_on(store.is_prep_blocked(
+                Some("acct-b"),
+                "EUR_USD",
+                "break-and-close"
+            ))
+            .unwrap(),
+            "a block on acct-a must not block acct-b"
+        );
     }
 
     #[test]
@@ -1706,6 +1895,12 @@ mod tests {
                 set_at: ts("2026-05-14T11:30:00Z"),
                 expires_at: ts("2026-05-14T12:30:00Z"),
             }],
+            prep_blocks: vec![PrepBlockEntry {
+                instrument: "EUR_USD".into(),
+                step: "break-and-close".into(),
+                expires_at: ts("2026-05-14T15:00:00Z"),
+                account: Some("oanda-reversals-demo".into()),
+            }],
         };
         let yaml = serde_yaml::to_string(&snap).unwrap();
         assert!(yaml.contains("preps:"));
@@ -1716,6 +1911,7 @@ mod tests {
         assert!(yaml.contains("blackout_id: nfp-2026-06-06"));
         assert!(yaml.contains("news_windows:"));
         assert!(yaml.contains("news_id: usd-nfp-2026-06-06"));
+        assert!(yaml.contains("prep_blocks:"));
     }
 
     #[test]
@@ -1730,6 +1926,7 @@ mod tests {
         assert!(snap.vetos.is_empty());
         assert!(snap.pauses.is_empty());
         assert!(snap.news_windows.is_empty());
+        assert!(snap.prep_blocks.is_empty());
     }
 
     #[test]

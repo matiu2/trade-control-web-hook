@@ -28,6 +28,12 @@ pub enum AlertBasename {
     PrepBreakAndClose,
     /// `04-prep-retest` — neckline retest prep.
     PrepRetest,
+    /// `NN-prep-expire-<step>` — prep-expiry vertical line. When this
+    /// fires, the worker blocks any further `prep` for `<step>` on the
+    /// trade, so the entry's `requires_preps` gate for that step can
+    /// never be satisfied. `<step>` is the canonical prep step name
+    /// (`break-and-close` / `retest`) and may itself contain hyphens.
+    PrepExpire(String),
     /// `05-enter` — Pine `Candle Signals` entry alert.
     Enter,
     /// `06-close-on-reversal` — Pine reversal close, gated on an
@@ -55,6 +61,7 @@ impl AlertBasename {
             Self::VetoTradeExpiry => Cow::Borrowed("02-veto-trade-expiry"),
             Self::PrepBreakAndClose => Cow::Borrowed("03-prep-break-and-close"),
             Self::PrepRetest => Cow::Borrowed("04-prep-retest"),
+            Self::PrepExpire(step) => Cow::Owned(format!("08-prep-expire-{step}")),
             Self::Enter => Cow::Borrowed("05-enter"),
             Self::CloseOnReversal => Cow::Borrowed("06-close-on-reversal"),
             Self::CloseOnSrReversal => Cow::Borrowed("07-close-on-sr-reversal"),
@@ -82,8 +89,13 @@ impl AlertBasename {
             "06-close-on-reversal" => Some(Self::CloseOnReversal),
             "07-close-on-sr-reversal" => Some(Self::CloseOnSrReversal),
             other => other
-                .strip_prefix("01-pause-")
-                .map(|id| Self::PauseStart(id.into()))
+                .strip_prefix("08-prep-expire-")
+                .map(|step| Self::PrepExpire(step.into()))
+                .or_else(|| {
+                    other
+                        .strip_prefix("01-pause-")
+                        .map(|id| Self::PauseStart(id.into()))
+                })
                 .or_else(|| {
                     other
                         .strip_prefix("02-resume-")
@@ -107,13 +119,15 @@ impl AlertBasename {
 mod tests {
     use super::*;
 
-    fn variants() -> [AlertBasename; 12] {
+    fn variants() -> [AlertBasename; 14] {
         [
             AlertBasename::VetoTooHigh,
             AlertBasename::VetoTooLow,
             AlertBasename::VetoTradeExpiry,
             AlertBasename::PrepBreakAndClose,
             AlertBasename::PrepRetest,
+            AlertBasename::PrepExpire("break-and-close".into()),
+            AlertBasename::PrepExpire("retest".into()),
             AlertBasename::Enter,
             AlertBasename::CloseOnReversal,
             AlertBasename::CloseOnSrReversal,
@@ -161,6 +175,18 @@ mod tests {
     fn pause_id_format() {
         let v = AlertBasename::PauseStart("xyz".into());
         assert_eq!(v.as_str(), "01-pause-xyz");
+    }
+
+    #[test]
+    fn prep_expire_basename_carries_hyphenated_step() {
+        // The step name itself contains hyphens — round-trip must keep
+        // them intact (greedy strip of the fixed prefix).
+        let v = AlertBasename::PrepExpire("break-and-close".into());
+        assert_eq!(v.as_str(), "08-prep-expire-break-and-close");
+        assert_eq!(
+            AlertBasename::parse("08-prep-expire-break-and-close"),
+            Some(AlertBasename::PrepExpire("break-and-close".into()))
+        );
     }
 
     #[test]

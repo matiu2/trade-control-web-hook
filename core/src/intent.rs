@@ -735,6 +735,9 @@ pub enum IntentValidationError {
     /// band where `lo > hi`. An empty list means "never matches" and
     /// is almost certainly a builder bug; a flipped band is the same.
     InvalidPriceRanges,
+    /// `prep-expire` is missing `step` — the worker can't tell which
+    /// prep to block without it.
+    MissingPrepExpireStep,
 }
 
 impl core::fmt::Display for IntentValidationError {
@@ -791,6 +794,9 @@ impl core::fmt::Display for IntentValidationError {
             Self::InvalidPriceRanges => f.write_str(
                 "require_price_in_ranges must be non-empty and every band must have lo <= hi",
             ),
+            Self::MissingPrepExpireStep => {
+                f.write_str("prep-expire requires `step` (which prep to block)")
+            }
         }
     }
 }
@@ -843,10 +849,20 @@ impl Intent {
         // are accepted unconditionally; the operator who wrote a script
         // meant it, even if it might resolve to 0 at gate time (treated
         // there as "expire immediately").
-        if matches!(self.action, Action::Prep | Action::Veto)
-            && is_default_ttl_hours(&self.ttl_hours)
+        if matches!(
+            self.action,
+            Action::Prep | Action::Veto | Action::PrepExpire
+        ) && is_default_ttl_hours(&self.ttl_hours)
         {
             return Err(IntentValidationError::MissingTtlHours);
+        }
+        // prep-expire keys its KV block on `prep-blocked:<acct>:<instr>:<step>`,
+        // so `step` is load-bearing — without it the worker can't tell
+        // which prep to block. (Parallels the runtime `step`-required
+        // check `prep` has in the worker, lifted to validate so a
+        // malformed alert is caught before dispatch.)
+        if self.action == Action::PrepExpire && self.step.is_none() {
+            return Err(IntentValidationError::MissingPrepExpireStep);
         }
         // pause / resume: KV key is `pause:<trade_id>:<blackout_id>`,
         // so both fields are load-bearing. Reuse the trade_id slug
@@ -1002,6 +1018,15 @@ pub enum Action {
     /// Record a named "veto" for an instrument with a TTL. Active vetos
     /// block any `enter` that opts into checking them.
     Veto,
+    /// Block all future `prep` fires for one named `step` on an
+    /// instrument. Fired by a `<prep>-expiry` chart line when the
+    /// pattern's window for landing that prep has lapsed (e.g. an
+    /// H&S break-and-close that never came within the allowed bar
+    /// count). Once blocked, the entry's `requires_preps` gate for
+    /// that step can never be satisfied, so the setup can't enter.
+    /// A prep that *already* fired before the block is untouched —
+    /// the block only stops *future* preps. No broker side effects.
+    PrepExpire,
     /// Clear a single instrument's prep flag.
     ClearPrep,
     /// Clear a single instrument's veto flag.
@@ -2319,6 +2344,61 @@ mod tests {
             action: veto
             instrument: EUR_USD
             name: news-window
+        ";
+        let intent: Intent = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(
+            intent.validate(),
+            Err(IntentValidationError::MissingTtlHours)
+        );
+    }
+
+    #[test]
+    fn validate_accepts_well_formed_prep_expire() {
+        let yaml = "
+            v: 1
+            id: bnc-expired
+            not_after: \"2026-05-13T20:00:00Z\"
+            action: prep-expire
+            instrument: EUR_USD
+            step: break-and-close
+            ttl_hours: 48
+            trade_id: hs-eurusd-abc
+        ";
+        let intent: Intent = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(intent.action, Action::PrepExpire);
+        intent.validate().unwrap();
+    }
+
+    #[test]
+    fn validate_rejects_prep_expire_without_step() {
+        let yaml = "
+            v: 1
+            id: bnc-expired-no-step
+            not_after: \"2026-05-13T20:00:00Z\"
+            action: prep-expire
+            instrument: EUR_USD
+            ttl_hours: 48
+            trade_id: hs-eurusd-abc
+        ";
+        let intent: Intent = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(
+            intent.validate(),
+            Err(IntentValidationError::MissingPrepExpireStep)
+        );
+    }
+
+    #[test]
+    fn validate_rejects_missing_ttl_hours_on_prep_expire() {
+        // prep-expire shares the prep/veto ttl requirement — the KV
+        // block needs a lifetime.
+        let yaml = "
+            v: 1
+            id: bnc-expired-no-ttl
+            not_after: \"2026-05-13T20:00:00Z\"
+            action: prep-expire
+            instrument: EUR_USD
+            step: break-and-close
+            trade_id: hs-eurusd-abc
         ";
         let intent: Intent = serde_yaml::from_str(yaml).unwrap();
         assert_eq!(

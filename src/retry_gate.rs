@@ -608,6 +608,32 @@ mod tests {
         ) -> Result<bool, StateError> {
             Ok(false)
         }
+        async fn block_prep(
+            &self,
+            _account: Option<&str>,
+            _instrument: &str,
+            _step: &str,
+            _now: DateTime<Utc>,
+            _ttl_seconds: u64,
+        ) -> Result<(), StateError> {
+            Ok(())
+        }
+        async fn is_prep_blocked(
+            &self,
+            _account: Option<&str>,
+            _instrument: &str,
+            _step: &str,
+        ) -> Result<bool, StateError> {
+            Ok(false)
+        }
+        async fn clear_prep_block(
+            &self,
+            _account: Option<&str>,
+            _instrument: &str,
+            _step: &str,
+        ) -> Result<bool, StateError> {
+            Ok(false)
+        }
         async fn snapshot(&self) -> Result<Snapshot, StateError> {
             Ok(Snapshot {
                 now: Utc::now(),
@@ -617,6 +643,7 @@ mod tests {
                 vetos: Vec::new(),
                 pauses: Vec::new(),
                 news_windows: Vec::new(),
+                prep_blocks: Vec::new(),
             })
         }
         async fn set_pause(

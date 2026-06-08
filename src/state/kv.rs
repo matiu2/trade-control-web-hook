@@ -11,9 +11,9 @@
 use chrono::{DateTime, Utc};
 use trade_control_core::intent::Action;
 use trade_control_core::state::{
-    CooldownEntry, EntryAttempt, MIN_TTL_SECONDS, NewsEntry, PREP_INDEX_CAP, PauseEntry, PrepEntry,
-    SEEN_INDEX_CAP, SeenEntry, Snapshot, StateError, StateStore, VETO_INDEX_CAP, VetoEntry,
-    account_scope, prune_expired,
+    CooldownEntry, EntryAttempt, MIN_TTL_SECONDS, NewsEntry, PREP_BLOCK_INDEX_CAP, PREP_INDEX_CAP,
+    PauseEntry, PrepBlockEntry, PrepEntry, SEEN_INDEX_CAP, SeenEntry, Snapshot, StateError,
+    StateStore, VETO_INDEX_CAP, VetoEntry, account_scope, prune_expired,
 };
 use worker::kv::KvStore;
 
@@ -21,6 +21,7 @@ const INDEX_COOLDOWNS_KEY: &str = "index:cooldowns";
 const INDEX_SEEN_KEY: &str = "index:seen";
 const INDEX_PREPS_KEY: &str = "index:preps";
 const INDEX_VETOS_KEY: &str = "index:vetos";
+const INDEX_PREP_BLOCKS_KEY: &str = "index:prep-blocks";
 
 pub struct KvStateStore {
     store: KvStore,
@@ -48,6 +49,11 @@ impl KvStateStore {
     fn veto_key(account: Option<&str>, instrument: &str, name: &str) -> String {
         let scope = account_scope(account);
         format!("veto:{scope}:{instrument}:{name}")
+    }
+
+    fn prep_block_key(account: Option<&str>, instrument: &str, step: &str) -> String {
+        let scope = account_scope(account);
+        format!("prep-blocked:{scope}:{instrument}:{step}")
     }
 
     fn entry_attempt_key(account: Option<&str>, trade_id: &str, attempt_no: u32) -> String {
@@ -133,6 +139,14 @@ impl KvStateStore {
 
     async fn write_veto_index(&self, entries: &[VetoEntry]) -> Result<(), StateError> {
         write_index(&self.store, INDEX_VETOS_KEY, entries).await
+    }
+
+    async fn read_prep_block_index(&self) -> Result<Vec<PrepBlockEntry>, StateError> {
+        read_index(&self.store, INDEX_PREP_BLOCKS_KEY).await
+    }
+
+    async fn write_prep_block_index(&self, entries: &[PrepBlockEntry]) -> Result<(), StateError> {
+        write_index(&self.store, INDEX_PREP_BLOCKS_KEY, entries).await
     }
 }
 
@@ -558,12 +572,119 @@ impl StateStore for KvStateStore {
         Ok(was)
     }
 
+    async fn block_prep(
+        &self,
+        account: Option<&str>,
+        instrument: &str,
+        step: &str,
+        now: DateTime<Utc>,
+        ttl_seconds: u64,
+    ) -> Result<(), StateError> {
+        let key = Self::prep_block_key(account, instrument, step);
+        let ttl = ttl_seconds.max(MIN_TTL_SECONDS);
+        self.store
+            .put(&key, "1")
+            .map_err(|e| StateError::Backend(format!("put prep-block builder: {e:?}")))?
+            .expiration_ttl(ttl)
+            .execute()
+            .await
+            .map_err(|e| StateError::Backend(format!("put prep-block execute: {e:?}")))?;
+
+        let expires_at = now + chrono::Duration::seconds(ttl as i64);
+        let account_owned = account.map(str::to_string);
+        let mut entries = prune_expired(self.read_prep_block_index().await?, now);
+        entries.retain(|e| {
+            !(e.instrument == instrument && e.step == step && e.account == account_owned)
+        });
+        entries.push(PrepBlockEntry {
+            instrument: instrument.to_string(),
+            step: step.to_string(),
+            expires_at,
+            account: account_owned,
+        });
+        if entries.len() > PREP_BLOCK_INDEX_CAP {
+            let drop = entries.len() - PREP_BLOCK_INDEX_CAP;
+            entries.drain(..drop);
+        }
+        self.write_prep_block_index(&entries).await
+    }
+
+    async fn is_prep_blocked(
+        &self,
+        account: Option<&str>,
+        instrument: &str,
+        step: &str,
+    ) -> Result<bool, StateError> {
+        // Global block covers every account; check the global key first,
+        // then the account-scoped key if one was requested. Mirrors
+        // `is_vetoed`.
+        let global = Self::prep_block_key(None, instrument, step);
+        if self
+            .store
+            .get(&global)
+            .text()
+            .await
+            .map_err(|e| StateError::Backend(format!("get prep-block (global): {e:?}")))?
+            .is_some()
+        {
+            return Ok(true);
+        }
+        if account.is_some() {
+            let scoped = Self::prep_block_key(account, instrument, step);
+            let scoped_hit = self
+                .store
+                .get(&scoped)
+                .text()
+                .await
+                .map_err(|e| StateError::Backend(format!("get prep-block (scoped): {e:?}")))?
+                .is_some();
+            if scoped_hit {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    async fn clear_prep_block(
+        &self,
+        account: Option<&str>,
+        instrument: &str,
+        step: &str,
+    ) -> Result<bool, StateError> {
+        let key = Self::prep_block_key(account, instrument, step);
+        let was = self
+            .store
+            .get(&key)
+            .text()
+            .await
+            .map_err(|e| StateError::Backend(format!("get prep-block for clear: {e:?}")))?
+            .is_some();
+        if was {
+            self.store
+                .delete(&key)
+                .await
+                .map_err(|e| StateError::Backend(format!("delete prep-block: {e:?}")))?;
+        }
+        let now = Utc::now();
+        let account_owned = account.map(str::to_string);
+        let mut entries = prune_expired(self.read_prep_block_index().await?, now);
+        let before = entries.len();
+        entries.retain(|e| {
+            !(e.instrument == instrument && e.step == step && e.account == account_owned)
+        });
+        if entries.len() != before || was {
+            self.write_prep_block_index(&entries).await?;
+        }
+        Ok(was)
+    }
+
     async fn snapshot(&self) -> Result<Snapshot, StateError> {
         let now: DateTime<Utc> = Utc::now();
         let cooldowns = prune_expired(self.read_cooldown_index().await?, now);
         let recent_seen = prune_expired(self.read_seen_index().await?, now);
         let preps = prune_expired(self.read_prep_index().await?, now);
         let vetos = prune_expired(self.read_veto_index().await?, now);
+        let prep_blocks = prune_expired(self.read_prep_block_index().await?, now);
         // Pauses don't use an index — there's no per-(account,instrument)
         // listing surface that makes one natural — so the snapshot does a
         // `kv.list(prefix="pause:")` scan instead. KV's TTL on each pause
@@ -589,6 +710,7 @@ impl StateStore for KvStateStore {
             vetos,
             pauses,
             news_windows,
+            prep_blocks,
         })
     }
 

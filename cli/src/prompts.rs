@@ -68,6 +68,9 @@ pub fn required_for_action(action: Action) -> &'static [&'static str] {
         Action::Close => &[],
         Action::Invalidate => &["cooldown_hours"],
         Action::Prep => &["step", "ttl_hours"],
+        // prep-expire blocks future preps for `step`; `ttl_hours` bounds
+        // the block. `trade_id` is minted by build-trade, not prompted.
+        Action::PrepExpire => &["step", "ttl_hours"],
         Action::Veto => &["name", "ttl_hours"],
         Action::ClearPrep => &["step"],
         Action::ClearVeto => &["name"],
