@@ -599,6 +599,9 @@ fn build_trade_spec(
         // Populated from the chart's `<prep>-expiry` vertical lines —
         // see `prep_expiry_steps`.
         prep_expiries: prep_expiry_steps(roles),
+        // H&S path: no M/W static geometry. The M/W branch (commit 9)
+        // builds its spec separately, keyed on `roles.mw_path`.
+        mw: None,
     };
     if args.sl_from_recent {
         spec.sl_anchor = Some(match direction {

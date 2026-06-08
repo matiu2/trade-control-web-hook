@@ -42,9 +42,20 @@ Commits (each tested, clippy+fmt green):
   + `check_mw_structure(A,B,C)` "first leg longer by price than B→C" gate
   (hard-error w/ A/B/C + leg lengths) to mw_geometry.rs. NO label lookup.
   tv-arm 113 tests green; clippy+fmt clean.
-- [ ] 6. cli — TradeSpec.mw + build_mw_pattern + 4 builders (mw-cancel/
-  mw-abort CancelPending, reuse trade-expiry, mw-enter mw:Some / empty preps /
-  max_retries:0 / Stop) + replace not-implemented/unreachable! arms + dispatch
+- [x] 6. cli — TradeSpec.mw + build_mw_pattern + 4 builders. DONE.
+  Added `MwSpec` (mirrors core MwParams) + `TradeSpec.mw: Option<MwSpec>`
+  (serde-elided when None). `build_mw_pattern` emits exactly 4 alerts:
+  `build_mw_cancel_alert`/`build_mw_abort_alert` (both Veto/CancelPending),
+  reused `build_trade_expiry_alert`, `build_mw_enter_alert` (direction from
+  pattern, `mw: Some`, entry/SL/TP all None, vetos=[mw-cancel,mw-abort,
+  trade-expiry], empty preps, max_retries:0). Dispatch: `build_trade_from_spec`
+  validates mw↔pattern agreement then routes M/W to build_mw_pattern before
+  PatternGeometry (no unreachable! consulted); interactive M/W rejects (chart-
+  built only). NO 06-close-on-reversal (TP is hard 1R). cli 227 tests green;
+  clippy+fmt clean. tv-arm pipeline.rs H&S spec gets `mw: None` (M/W branch is
+  commit 9). NOTE for commit 9: interactive build still errors for M/W — the
+  `_ => unreachable!` arm in PatternGeometry::for_pattern stays (M/W never
+  call it). NOTE: TradePattern::for_pattern still panics for M/W by design.
 - [ ] 7. Pine — alertcondition(true, "Every Bar Close", ...) (manual republish)
 - [ ] 8. tv-arm alert_spec — cancel(intra-bar OnFirstFire)/abort(OnBarClose)
   PriceValue arms (replace the temp `None` stub) + Enter→"Every Bar Close"

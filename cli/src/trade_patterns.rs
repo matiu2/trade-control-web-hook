@@ -385,6 +385,48 @@ pub struct TradeSpec {
     /// (you can't expire a prep you've dropped). Default empty.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub prep_expiries: Vec<String>,
+    /// M / W (double-top / double-bottom) static geometry, baked at arm
+    /// time. Present only for `TradePattern::{M,W}` — its presence is
+    /// what routes [`build_trade_from_spec`] through [`build_mw_pattern`]
+    /// instead of the H&S questionnaire path. The worker recomputes
+    /// entry/SL/TP from these anchors + the live shell OHLC, so the
+    /// enter alert carries no fixed entry/stop_loss/take_profit. See
+    /// [`MwSpec`] and `core::intent::MwParams`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mw: Option<MwSpec>,
+}
+
+/// CLI-side mirror of [`trade_control_core::intent::MwParams`]. Kept as a
+/// distinct type so the spec yaml is decoupled from the wire intent — the
+/// builder copies it onto the enter intent's `mw` field. All prices are
+/// **MID** prices read off the chart; the worker does the mid→bid/ask
+/// correction at resolution time.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct MwSpec {
+    /// `C` — the neckline (entry trigger anchor + abort level).
+    pub neckline: f64,
+    /// `B` — the first peak (M) / first trough (W); SL anchor base.
+    pub first_point: f64,
+    /// `A` — the runup start. Audit / log only; fed the arm-time
+    /// neckline-% gate, not the worker's entry geometry.
+    pub runup_start: f64,
+    /// Broker spread in pips, read at arm time. `>= 0`.
+    pub spread_pips: f64,
+    /// Instrument pip size at arm time (e.g. `0.0001`). `> 0`.
+    pub pip_size: f64,
+}
+
+impl MwSpec {
+    /// Lower into the signed wire form the worker resolves.
+    fn to_params(self) -> trade_control_core::intent::MwParams {
+        trade_control_core::intent::MwParams {
+            neckline: self.neckline,
+            first_point: self.first_point,
+            runup_start: self.runup_start,
+            spread_pips: self.spread_pips,
+            pip_size: self.pip_size,
+        }
+    }
 }
 
 fn is_zero_u32(n: &u32) -> bool {
@@ -424,8 +466,15 @@ pub fn build_trade_interactive(pattern: TradePattern, now: DateTime<Utc>) -> Res
         TradePattern::Hs | TradePattern::Ihs => {
             build_pattern(pattern, PatternGeometry::for_pattern(pattern), now)
         }
+        // M / W have no chart-side geometry to prompt for — the path
+        // anchors come from `tv-arm` reading the drawing, never an
+        // interactive questionnaire. There's nothing sensible to ask the
+        // operator here, so the only supported path is `--from-file` (a
+        // spec `tv-arm` writes, carrying `mw`). Reject the interactive
+        // entry explicitly rather than prompt for anchors by hand.
         TradePattern::M | TradePattern::W => Err(eyre!(
-            "pattern {} is not yet implemented — only `hs` and `ihs` are wired up so far",
+            "pattern {} is built from a chart by `tv-arm`, not interactively — \
+             run `tv-arm` (or pass a prebuilt spec with `--from-file`)",
             pattern.label()
         )),
     }
@@ -435,14 +484,25 @@ pub fn build_trade_interactive(pattern: TradePattern, now: DateTime<Utc>) -> Res
 /// the `--from-file` flag on `build-trade`. Validates the spec against
 /// the same rules the prompts would enforce, then assembles the alerts.
 pub fn build_trade_from_spec(mut spec: TradeSpec, now: DateTime<Utc>) -> Result<BuiltTrade> {
-    match spec.pattern {
-        TradePattern::Hs | TradePattern::Ihs => {}
-        TradePattern::M | TradePattern::W => {
+    let is_mw = matches!(spec.pattern, TradePattern::M | TradePattern::W);
+    // `mw` and the pattern must agree: M/W require the baked path
+    // geometry, H&S/IH&S must not carry it. Catch a hand-edited spec
+    // that mixes them before any alert is built.
+    match (is_mw, spec.mw.is_some()) {
+        (true, false) => {
             return Err(eyre!(
-                "pattern {} is not yet implemented — only `hs` and `ihs` are wired up so far",
+                "pattern {} requires `mw` path geometry in the spec (neckline, first_point, \
+                 runup_start, spread_pips, pip_size) — it's normally written by `tv-arm`",
                 spec.pattern.label()
             ));
         }
+        (false, true) => {
+            return Err(eyre!(
+                "pattern {} must not carry `mw` geometry — that's only for M / W setups",
+                spec.pattern.label()
+            ));
+        }
+        _ => {}
     }
     if spec.instrument.trim().is_empty() {
         return Err(eyre!("instrument is required"));
@@ -504,6 +564,12 @@ pub fn build_trade_from_spec(mut spec: TradeSpec, now: DateTime<Utc>) -> Result<
                  that's been dropped"
             ));
         }
+    }
+    // M / W are structurally different from H&S — no prep chain, no
+    // drawing-bound vetos, worker-computed entry/SL/TP. They get their
+    // own builder rather than being forced through `PatternGeometry`.
+    if is_mw {
+        return build_mw_pattern(spec, now);
     }
     let mut geometry = PatternGeometry::for_pattern(spec.pattern);
     if let Some(override_anchor) = spec.sl_anchor {
@@ -689,6 +755,7 @@ fn build_pattern(
         allow_entry: None,
         entry_mode: EntryMode::default(),
         sl_anchor: None,
+        mw: None,
     };
     assemble_trade(spec, geometry, entry_offset_pips, sl_offset_pips, now)
 }
@@ -844,6 +911,243 @@ fn assemble_trade(
         alerts,
         spec,
     })
+}
+
+// ===== M / W (double-top / double-bottom) assembly =====
+
+/// Assemble an M / W trade bundle. Structurally distinct from H&S: no
+/// prep chain, no drawing-bound invalidation vetos, and the worker — not
+/// the chart — computes entry/SL/TP from the baked `mw` anchors plus the
+/// live shell OHLC (see `core::intent::mw_resolution`).
+///
+/// The bundle is exactly four alerts:
+///
+/// 1. `01-veto-mw-cancel` — `CancelPending`. Fires intra-bar when price
+///    crosses the 1.3-extension of the neckline→first-point leg; cancels
+///    the pending stop and disarms. Also enforces the two-peaks
+///    alignment ceiling implicitly.
+/// 2. `01-veto-mw-abort` — `CancelPending`. Fires when a candle *closes*
+///    back through the neckline; the breakout failed. `CancelPending`
+///    not `ClosePositions` — once filled the trade rides its own SL/TP.
+/// 3. `02-veto-trade-expiry` — unchanged from H&S (time-fired
+///    `ClosePositions` at wall-clock expiry).
+/// 4. `05-enter` — per-bar stop entry carrying the baked `mw` params and
+///    no fixed entry/stop_loss/take_profit; gated only by the three
+///    vetos above (no preps), `max_retries: 0`.
+fn build_mw_pattern(spec: TradeSpec, now: DateTime<Utc>) -> Result<BuiltTrade> {
+    // `is_mw` already guaranteed `spec.mw` is Some at the dispatch site;
+    // ? here is belt-and-braces and keeps this fn self-contained.
+    let mw = spec
+        .mw
+        .ok_or_else(|| eyre!("build_mw_pattern called without mw geometry"))?;
+    let direction = match spec.pattern {
+        TradePattern::M => Direction::Short,
+        TradePattern::W => Direction::Long,
+        other => {
+            return Err(eyre!(
+                "build_mw_pattern called for non-M/W pattern {other:?}"
+            ));
+        }
+    };
+
+    let trade_id = mint_trade_id(spec.pattern, &spec.instrument)?;
+    let entry_deadline = derive_entry_deadline(now, spec.trade_expiry, spec.entry_deadline_pct);
+    let veto_expiry = spec.trade_expiry + DEFAULT_POST_EXPIRY_GRACE;
+
+    let alerts = vec![
+        build_mw_cancel_alert(
+            &spec.instrument,
+            &trade_id,
+            veto_expiry,
+            &spec.broker,
+            &spec.account,
+            now,
+        ),
+        build_mw_abort_alert(
+            &spec.instrument,
+            &trade_id,
+            veto_expiry,
+            &spec.broker,
+            &spec.account,
+            now,
+        ),
+        build_trade_expiry_alert(
+            &spec.instrument,
+            &trade_id,
+            spec.trade_expiry,
+            veto_expiry,
+            &spec.broker,
+            &spec.account,
+            now,
+        ),
+        build_mw_enter_alert(
+            &spec.instrument,
+            &trade_id,
+            direction,
+            mw,
+            entry_deadline,
+            spec.risk_pct,
+            spec.risk_amount,
+            spec.dry_run,
+            spec.allow_entry.as_deref(),
+            spec.needs_golden,
+            spec.needs_confirmed,
+            &spec.broker,
+            &spec.account,
+        ),
+    ];
+
+    // Same sign-time script validation as the H&S path: catch a bad
+    // `allow_entry` script before signing.
+    let script_errors: Vec<String> = alerts
+        .iter()
+        .flat_map(|alert| {
+            crate::script_validator::validate(&alert.intent)
+                .into_iter()
+                .map(move |e| format!("{}: {e}", alert.basename))
+        })
+        .collect();
+    if !script_errors.is_empty() {
+        return Err(eyre!(
+            "sign-time script validation failed:\n  - {}",
+            script_errors.join("\n  - ")
+        ));
+    }
+
+    Ok(BuiltTrade {
+        trade_id,
+        instrument: spec.instrument.clone(),
+        trade_expiry: spec.trade_expiry,
+        alerts,
+        spec,
+    })
+}
+
+/// `01-veto-mw-cancel` — `CancelPending`. The chart side binds this to a
+/// computed price (the 1.3-extension cancel level) firing intra-bar. The
+/// price + frequency are set on the chart in `tv-arm`'s `alert_spec`;
+/// here we only mint the intent shape.
+fn build_mw_cancel_alert(
+    instrument: &str,
+    trade_id: &str,
+    veto_expiry: DateTime<Utc>,
+    broker: &BrokerKind,
+    account: &str,
+    now: DateTime<Utc>,
+) -> BuiltAlert {
+    let id = format!("{trade_id}-mw-cancel");
+    let mut intent = skeleton(
+        Action::Veto,
+        instrument,
+        id,
+        veto_expiry,
+        *broker,
+        account,
+        trade_id,
+    );
+    intent.name = Some("mw-cancel".into());
+    intent.ttl_hours =
+        trade_control_core::tunable::Tunable::Static(ttl_hours_until(now, veto_expiry));
+    intent.level = Some(VetoLevel::CancelPending);
+    BuiltAlert {
+        basename: AlertBasename::VetoMwCancel.as_str().into_owned(),
+        purpose: "veto: mw-cancel (cancel pending if price crosses the 1.3 extension)".into(),
+        intent,
+    }
+}
+
+/// `01-veto-mw-abort` — `CancelPending`. Fires when a candle closes back
+/// through the neckline (breakout failed). `CancelPending` not
+/// `ClosePositions`: abort only matters while the entry is pending; a
+/// filled trade rides its own SL/TP.
+fn build_mw_abort_alert(
+    instrument: &str,
+    trade_id: &str,
+    veto_expiry: DateTime<Utc>,
+    broker: &BrokerKind,
+    account: &str,
+    now: DateTime<Utc>,
+) -> BuiltAlert {
+    let id = format!("{trade_id}-mw-abort");
+    let mut intent = skeleton(
+        Action::Veto,
+        instrument,
+        id,
+        veto_expiry,
+        *broker,
+        account,
+        trade_id,
+    );
+    intent.name = Some("mw-abort".into());
+    intent.ttl_hours =
+        trade_control_core::tunable::Tunable::Static(ttl_hours_until(now, veto_expiry));
+    intent.level = Some(VetoLevel::CancelPending);
+    BuiltAlert {
+        basename: AlertBasename::VetoMwAbort.as_str().into_owned(),
+        purpose: "veto: mw-abort (cancel pending if a candle closes back through the neckline)"
+            .into(),
+        intent,
+    }
+}
+
+/// `05-enter` for M / W. A per-bar stop entry carrying the baked `mw`
+/// params; the worker derives entry/SL/TP from them + the live shell, so
+/// `entry`, `stop_loss`, and `take_profit` are all left `None`. Gated by
+/// the three M/W vetos and no preps. `max_retries: 0` — a stop-out is
+/// terminal (no re-entry).
+#[allow(clippy::too_many_arguments)]
+fn build_mw_enter_alert(
+    instrument: &str,
+    trade_id: &str,
+    direction: Direction,
+    mw: MwSpec,
+    entry_deadline: DateTime<Utc>,
+    risk_pct: f64,
+    risk_amount: Option<f64>,
+    dry_run: bool,
+    allow_entry: Option<&str>,
+    needs_golden: bool,
+    needs_confirmed: bool,
+    broker: &BrokerKind,
+    account: &str,
+) -> BuiltAlert {
+    let id = format!("{trade_id}-enter");
+    let mut intent = skeleton(
+        Action::Enter,
+        instrument,
+        id,
+        entry_deadline,
+        *broker,
+        account,
+        trade_id,
+    );
+    intent.direction = Some(direction);
+    // entry / stop_loss / take_profit deliberately left None — the worker
+    // computes all three from `mw` + the shell OHLC (mid-correct).
+    intent.mw = Some(mw.to_params());
+    match risk_amount {
+        Some(amount) => {
+            intent.risk_amount = Some(trade_control_core::tunable::Tunable::Static(amount))
+        }
+        None => intent.risk_pct = trade_control_core::tunable::Tunable::Static(risk_pct),
+    }
+    if dry_run {
+        intent.dry_run = Some(true);
+    }
+    // Single-shot: a stop-out ends the setup. No re-entry, no preps.
+    intent.max_retries = trade_control_core::tunable::Tunable::Static(0);
+    intent.allow_entry = allow_entry.map(trade_control_core::tunable::Tunable::from_script);
+    intent.needs_golden = needs_golden;
+    intent.needs_confirmed = needs_confirmed;
+    intent.requires_preps = Vec::new();
+    intent.vetos = vec!["mw-cancel".into(), "mw-abort".into(), "trade-expiry".into()];
+    BuiltAlert {
+        basename: AlertBasename::Enter.as_str().into_owned(),
+        purpose: "enter: M/W per-bar stop entry (worker-computed geometry; vetoed by \
+                  mw-cancel/mw-abort/trade-expiry)"
+            .into(),
+        intent,
+    }
 }
 
 /// Display label for a [`PriceAnchor`] in prompt text.
@@ -1499,6 +1803,7 @@ mod tests {
                 allow_entry: None,
                 entry_mode: EntryMode::Stop,
                 sl_anchor: None,
+                mw: None,
             },
         };
         let manifest = render_manifest(&trade);
@@ -1685,6 +1990,7 @@ mod tests {
             allow_entry: None,
             entry_mode: EntryMode::Stop,
             sl_anchor: None,
+            mw: None,
         }
     }
 
@@ -1863,11 +2169,127 @@ mod tests {
     }
 
     #[test]
-    fn build_trade_from_spec_rejects_unimplemented_pattern() {
+    fn build_trade_from_spec_rejects_mw_pattern_without_geometry() {
+        // M / W now build, but only when the spec carries `mw`. A bare
+        // M spec (no path geometry) is rejected — it's normally written
+        // by `tv-arm`, not hand-edited.
         let now = ts("2026-05-20T00:00:00Z");
         let spec = sample_spec(TradePattern::M, ts("2026-05-25T00:00:00Z"));
         let err = build_trade_from_spec(spec, now).unwrap_err();
-        assert!(err.to_string().contains("not yet implemented"), "got {err}");
+        assert!(err.to_string().contains("requires `mw`"), "got {err}");
+    }
+
+    #[test]
+    fn build_trade_from_spec_rejects_hs_pattern_carrying_mw_geometry() {
+        // The inverse guard: an H&S spec must not carry `mw` — that
+        // would be a hand-edit mixing two incompatible shapes.
+        let now = ts("2026-05-20T00:00:00Z");
+        let mut spec = sample_spec(TradePattern::Hs, ts("2026-05-25T00:00:00Z"));
+        spec.mw = Some(sample_mw());
+        let err = build_trade_from_spec(spec, now).unwrap_err();
+        assert!(err.to_string().contains("must not carry `mw`"), "got {err}");
+    }
+
+    /// A well-formed M (short) path geometry for tests. Worked numbers
+    /// from `mw_geometry`: A=1.1000, B=1.1200, C=1.1120.
+    fn sample_mw() -> MwSpec {
+        MwSpec {
+            neckline: 1.1120,
+            first_point: 1.1200,
+            runup_start: 1.1000,
+            spread_pips: 1.0,
+            pip_size: 0.0001,
+        }
+    }
+
+    fn mw_spec(pattern: TradePattern, trade_expiry: DateTime<Utc>) -> TradeSpec {
+        let mut spec = sample_spec(pattern, trade_expiry);
+        spec.mw = Some(sample_mw());
+        spec
+    }
+
+    #[test]
+    fn build_mw_emits_exactly_four_alerts() {
+        // M / W bundle: mw-cancel, mw-abort, trade-expiry, enter. No
+        // prep chain, no pcl-exhausted/invalidation vetos, no
+        // close-on-reversal.
+        let now = ts("2026-05-20T00:00:00Z");
+        for pattern in [TradePattern::M, TradePattern::W] {
+            let spec = mw_spec(pattern, ts("2026-05-25T00:00:00Z"));
+            let trade = build_trade_from_spec(spec, now).unwrap();
+            assert_eq!(trade.alerts.len(), 4, "{pattern:?}");
+            let basenames: Vec<&str> = trade.alerts.iter().map(|a| a.basename.as_str()).collect();
+            assert_eq!(
+                basenames,
+                vec![
+                    "01-veto-mw-cancel",
+                    "01-veto-mw-abort",
+                    "02-veto-trade-expiry",
+                    "05-enter",
+                ],
+                "{pattern:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn build_mw_cancel_and_abort_are_cancel_pending() {
+        // Both M/W vetos are CancelPending — never ClosePositions. The
+        // abort especially: once filled the trade rides its own SL/TP, a
+        // neckline reclaim must not flatten an open position.
+        let now = ts("2026-05-20T00:00:00Z");
+        let spec = mw_spec(TradePattern::M, ts("2026-05-25T00:00:00Z"));
+        let trade = build_trade_from_spec(spec, now).unwrap();
+        assert_eq!(trade.alerts[0].intent.name.as_deref(), Some("mw-cancel"));
+        assert_eq!(trade.alerts[0].intent.level, Some(VetoLevel::CancelPending));
+        assert_eq!(trade.alerts[1].intent.name.as_deref(), Some("mw-abort"));
+        assert_eq!(trade.alerts[1].intent.level, Some(VetoLevel::CancelPending));
+    }
+
+    #[test]
+    fn build_mw_enter_carries_baked_geometry_and_no_fixed_prices() {
+        // The enter intent must carry the baked `mw` params and leave
+        // entry/SL/TP None (worker computes them). Direction follows the
+        // pattern; vetos are the three M/W ones; no preps; single-shot.
+        let now = ts("2026-05-20T00:00:00Z");
+        let spec = mw_spec(TradePattern::M, ts("2026-05-25T00:00:00Z"));
+        let trade = build_trade_from_spec(spec, now).unwrap();
+        let enter = &trade.alerts[3].intent;
+        assert_eq!(enter.action, Action::Enter);
+        assert_eq!(enter.direction, Some(Direction::Short));
+        let mw = enter.mw.expect("enter carries mw params");
+        assert!((mw.neckline - 1.1120).abs() < 1e-9);
+        assert!((mw.first_point - 1.1200).abs() < 1e-9);
+        assert!((mw.runup_start - 1.1000).abs() < 1e-9);
+        assert!((mw.spread_pips - 1.0).abs() < 1e-9);
+        assert!((mw.pip_size - 0.0001).abs() < 1e-9);
+        assert!(enter.entry.is_none());
+        assert!(enter.stop_loss.is_none());
+        assert!(enter.take_profit.is_none());
+        assert!(enter.requires_preps.is_empty());
+        assert_eq!(
+            enter.vetos,
+            vec![
+                "mw-cancel".to_string(),
+                "mw-abort".to_string(),
+                "trade-expiry".to_string(),
+            ]
+        );
+        assert!(matches!(
+            enter.max_retries,
+            trade_control_core::tunable::Tunable::Static(0)
+        ));
+        enter.validate().expect("mw enter intent valid");
+    }
+
+    #[test]
+    fn build_mw_w_pattern_is_long() {
+        // W (double-bottom) is long — the only direction difference from
+        // M in the bundle.
+        let now = ts("2026-05-20T00:00:00Z");
+        let spec = mw_spec(TradePattern::W, ts("2026-05-25T00:00:00Z"));
+        let trade = build_trade_from_spec(spec, now).unwrap();
+        assert_eq!(trade.alerts[3].intent.direction, Some(Direction::Long));
     }
 
     #[test]
@@ -1938,6 +2360,21 @@ tp_price: 1.05
         assert_eq!(parsed.broker, original.broker);
         assert_eq!(parsed.trade_expiry, original.trade_expiry);
         assert!((parsed.tp_price - original.tp_price).abs() < 1e-9);
+        // `mw` is None on an H&S spec and must elide from the wire form.
+        assert!(parsed.mw.is_none());
+        assert!(!s.contains("mw:"), "mw must elide when None:\n{s}");
+    }
+
+    #[test]
+    fn mw_spec_round_trips_through_yaml() {
+        // An M spec carrying baked path geometry survives YAML round-trip
+        // with every anchor intact — this is the form `tv-arm` writes.
+        let original = mw_spec(TradePattern::M, ts("2026-05-25T00:00:00Z"));
+        let s = serde_yaml::to_string(&original).unwrap();
+        assert!(s.contains("mw:"), "mw must serialise when Some:\n{s}");
+        let parsed: TradeSpec = serde_yaml::from_str(&s).unwrap();
+        let mw = parsed.mw.expect("mw round-trips");
+        assert_eq!(mw, sample_mw());
     }
 
     #[test]
