@@ -113,9 +113,25 @@ pub fn parse_and_verify(
         let key_str = k.as_str().unwrap_or("");
         match key_str {
             "sig" => continue,
-            "close" | "high" | "low" | "time" | "signal_high" | "signal_low" | "signal_range"
-            | "signal_start_time" | "signal_kind" | "golden" | "atr" | "signal_confirmed"
-            | "recent_high" | "recent_low" => {
+            "close"
+            | "high"
+            | "low"
+            | "time"
+            | "signal_high"
+            | "signal_low"
+            | "signal_range"
+            | "signal_start_time"
+            | "signal_kind"
+            | "golden"
+            | "atr"
+            | "signal_confirmed"
+            | "recent_high"
+            | "recent_low"
+            | "next_candle_timestamp_1"
+            | "next_candle_timestamp_2"
+            | "next_candle_timestamp_3"
+            | "next_candle_timestamp_4"
+            | "next_candle_timestamp_5" => {
                 shell_map.insert(k.clone(), v.clone());
             }
             _ => {
@@ -485,6 +501,81 @@ mod tests {
         let v = parse_and_verify(&on_wire, &KEY, now).unwrap();
         assert_eq!(v.shell.recent_high, Some(1.16500));
         assert_eq!(v.shell.recent_low, Some(1.16400));
+    }
+
+    #[test]
+    fn signed_path_next_candle_menu_substitution_ok() {
+        // CLI signs with {{plot("next_candle_timestamp_N")}} placeholders;
+        // Pine substitutes ms-epoch integers (the forward bar-close times).
+        // Sig must survive (they're in UNSIGNED_VALUE_KEYS) and the Shell
+        // deser must route them off the intent map and parse the ms epochs.
+        let pre_substitution = [
+            "close: {{close}}",
+            "high: {{high}}",
+            "low: {{low}}",
+            "time: \"{{time}}\"",
+            "next_candle_timestamp_1: {{plot(\"next_candle_timestamp_1\")}}",
+            "next_candle_timestamp_2: {{plot(\"next_candle_timestamp_2\")}}",
+            "next_candle_timestamp_3: {{plot(\"next_candle_timestamp_3\")}}",
+            "next_candle_timestamp_4: {{plot(\"next_candle_timestamp_4\")}}",
+            "next_candle_timestamp_5: {{plot(\"next_candle_timestamp_5\")}}",
+            "v: 1",
+            "action: enter",
+            "instrument: EUR_USD",
+            "id: enter-menu",
+            "not_after: \"2026-05-13T20:00:00Z\"",
+            "direction: long",
+            "entry: {type: market}",
+            "stop_loss: {from: low, offset_pips: -2}",
+            "take_profit: {from: close, offset_r: 2.0}",
+            "expiry_bars: 3",
+            "",
+        ]
+        .join("\n");
+        let pairs = signed_pairs_from_text(&pre_substitution).unwrap();
+        let sig = crate::sig::sign(&KEY, &pairs).unwrap();
+        let on_wire = [
+            "close: 1.16438",
+            "high: 1.16440",
+            "low: 1.16430",
+            "time: \"2026-05-13T12:00:00Z\"",
+            // 2026-05-13T13:00:00Z .. T17:00:00Z as ms epochs (hourly bars).
+            "next_candle_timestamp_1: 1779757200000",
+            "next_candle_timestamp_2: 1779760800000",
+            "next_candle_timestamp_3: 1779764400000",
+            "next_candle_timestamp_4: 1779768000000",
+            "next_candle_timestamp_5: 1779771600000",
+            "v: 1",
+            "action: enter",
+            "instrument: EUR_USD",
+            "id: enter-menu",
+            "not_after: \"2026-05-13T20:00:00Z\"",
+            "direction: long",
+            "entry: {type: market}",
+            "stop_loss: {from: low, offset_pips: -2}",
+            "take_profit: {from: close, offset_r: 2.0}",
+            "expiry_bars: 3",
+            &format!("sig: \"{sig}\""),
+            "",
+        ]
+        .join("\n");
+        let now: DateTime<Utc> = "2026-05-13T12:01:00Z".parse().unwrap();
+        let v = parse_and_verify(&on_wire, &KEY, now).unwrap();
+        // The menu lands on the Shell, not the Intent.
+        assert_eq!(
+            v.shell.next_candle_timestamp_1.unwrap().timestamp_millis(),
+            1779757200000
+        );
+        assert_eq!(
+            v.shell.next_candle_timestamp_3.unwrap().timestamp_millis(),
+            1779764400000
+        );
+        assert_eq!(
+            v.shell.next_candle_timestamp(3),
+            v.shell.next_candle_timestamp_3
+        );
+        // expiry_bars is signed → lands on the Intent.
+        assert!(v.intent.expiry_bars.is_some());
     }
 
     #[test]

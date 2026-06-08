@@ -116,6 +116,11 @@ mod tests {
             signal_confirmed,
             recent_high: None,
             recent_low: None,
+            next_candle_timestamp_1: None,
+            next_candle_timestamp_2: None,
+            next_candle_timestamp_3: None,
+            next_candle_timestamp_4: None,
+            next_candle_timestamp_5: None,
         }
     }
 
@@ -170,6 +175,7 @@ mod tests {
             clears: Vec::new(),
             trade_id: None,
             max_retries: trade_control_core::tunable::Tunable::Static(0),
+            expiry_bars: None,
             allow_entry: gate,
             allow_close: None,
             needs_golden: false,

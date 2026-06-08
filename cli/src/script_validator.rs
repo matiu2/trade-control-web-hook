@@ -154,6 +154,11 @@ fn fixture_shell() -> Shell {
         signal_confirmed: Some(true),
         recent_high: Some(1.1030),
         recent_low: Some(1.0975),
+        next_candle_timestamp_1: None,
+        next_candle_timestamp_2: None,
+        next_candle_timestamp_3: None,
+        next_candle_timestamp_4: None,
+        next_candle_timestamp_5: None,
     }
 }
 
@@ -221,6 +226,7 @@ mod tests {
             clears: Vec::new(),
             trade_id: None,
             max_retries: Tunable::Static(0),
+            expiry_bars: None,
             allow_entry: gate,
             allow_close: None,
             needs_golden: false,

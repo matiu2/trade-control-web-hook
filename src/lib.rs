@@ -1081,6 +1081,44 @@ async fn run_enter<B: Broker>(
     // relax it.
     let max_risk_pct = caps.resolve_max_risk_pct(worker_max_risk_pct);
     let max_open_positions = caps.resolve_max_open_positions(worker_max_open_positions);
+
+    // Resolve the optional bar-based order expiry into a concrete
+    // `cancel_at` *before* any broker work, so a bad `expiry_bars`
+    // rejects (without poisoning the seen-id) rather than placing an
+    // order we can't honour. `None` = no bar-expiry requested.
+    let cancel_at = match verified.intent.expiry_bars.as_ref() {
+        None => None,
+        Some(tunable) => {
+            let n = match resolve_phase1_u32("expiry-bars", Some(tunable), &verified.shell, 0) {
+                Ok(n) => n,
+                Err(outcome) => {
+                    console_log!("entry rejected: {outcome} (id={})", verified.intent.id);
+                    return ActionResult::Rejected {
+                        response: Response::error("entry blocked: expiry-bars script", 412),
+                        outcome,
+                    };
+                }
+            };
+            match trade_control_core::intent::resolve_cancel_at(
+                n,
+                &verified.shell,
+                verified.intent.not_after,
+            ) {
+                Ok(ts) => Some(ts),
+                Err(err) => {
+                    console_log!(
+                        "entry rejected: expiry-bars out of range (id={}): {err}",
+                        verified.intent.id
+                    );
+                    return ActionResult::Rejected {
+                        response: Response::error("entry blocked: expiry-bars out of range", 400),
+                        outcome: "rejected: expiry-bars-out-of-range".into(),
+                    };
+                }
+            }
+        }
+    };
+
     let entry_request = EntryRequest {
         instrument: &resolved.instrument,
         direction: resolved.direction,
@@ -1136,6 +1174,7 @@ async fn run_enter<B: Broker>(
                         &order_id,
                         resolved.direction,
                         resolved.stop_loss,
+                        cancel_at,
                     )
                     .await;
                 }
@@ -2477,6 +2516,11 @@ mod dispatcher_outcome_tests {
                 signal_confirmed: None,
                 recent_high: None,
                 recent_low: None,
+                next_candle_timestamp_1: None,
+                next_candle_timestamp_2: None,
+                next_candle_timestamp_3: None,
+                next_candle_timestamp_4: None,
+                next_candle_timestamp_5: None,
             },
             intent: Intent {
                 v: 1,
@@ -2506,6 +2550,7 @@ mod dispatcher_outcome_tests {
                 clears: Vec::new(),
                 trade_id: Some("hs-chf-jpy-test".into()),
                 max_retries: Tunable::Static(0),
+                expiry_bars: None,
                 allow_entry: None,
                 allow_close: None,
                 needs_golden: false,
@@ -2632,6 +2677,8 @@ mod dispatcher_outcome_tests {
             "rejected: max-retries-zero",
             "rejected: missing-trade-id",
             "rejected: price-fetch-failed",
+            "rejected: expiry-bars-out-of-range",
+            "rejected: expiry-bars-script-parse",
         ];
         // Use Failed as the carrier — the decision rule treats
         // Failed and Rejected identically (both Skip), and Failed is

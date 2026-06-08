@@ -78,6 +78,15 @@ pub struct Args {
     #[arg(long)]
     pub max_retries: Option<u32>,
 
+    /// Cancel the resting entry order if it hasn't filled within this
+    /// many bars (1..=5). The worker indexes the Pine-filled
+    /// `next_candle_timestamp_1..5` menu with this N to derive a
+    /// session-calendar-aware `cancel_at` (weekend gaps skipped). Default
+    /// (flag absent) leaves the order resting until `trade_expiry`.
+    /// Requires the v2 indicator that ships the menu plots.
+    #[arg(long)]
+    pub expiry_bars: Option<u32>,
+
     /// Use a market order for entry instead of the default pending
     /// stop-entry at the geometry anchor. SL still anchors to
     /// geometry.

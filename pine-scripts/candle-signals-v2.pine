@@ -23,6 +23,15 @@ indicator("Candle Signals", shorttitle="Candle Signals", overlay=true, max_label
 //   signal_confirmed — 1.0 once a confirming push has validated the
 //     latched signal within `confirm_bars`, 0.0 otherwise. Resets to
 //     0.0 every time a fresh signal overwrites the latch.
+//   recent_high, recent_low — extreme of the `sl_lookback` bars
+//     preceding the signal, a robust SL anchor.
+//
+// v2.3: adds next_candle_timestamp_1..5 — the expected close timestamps
+//   (ms epoch) of the next 1..5 bars on this timeframe, computed via
+//   time_close(timeframe.period, bars_back=-N) so they respect the
+//   symbol's session calendar (weekend / session-break aware). The
+//   worker indexes this menu with the signed `expiry_bars` to cancel a
+//   resting entry order N bars after placement. na on non-time charts.
 //
 // Single alert per direction; the worker-side Rhai engine reads the
 // shell vars to decide whether to act (golden filter, kind filter,
@@ -489,6 +498,21 @@ plot(signal_atr_v,        title="signal_atr",        display=display.none)
 plot(signal_confirmed_v,  title="signal_confirmed",  display=display.none)
 plot(recent_high_v,       title="recent_high",       display=display.none)
 plot(recent_low_v,        title="recent_low",        display=display.none)
+
+// Forward bar-close menu: the *expected* close timestamp of the bar N
+// ahead on this chart's timeframe, computed against the symbol's session
+// calendar so weekends and daily session breaks are skipped (a Friday
+// 17:00 + 3 bars lands on the next session open, not Friday 20:00). The
+// worker indexes this menu with the signed `expiry_bars` to derive a
+// resting order's `cancel_at`. Negative `bars_back` projects forward
+// (-1..-500); returns na on non-time-based charts, which the worker
+// treats as "no bar-expiry" and falls back to not_after. Emitted as ms
+// epoch (time_close returns a Unix ms int).
+plot(time_close(timeframe.period, bars_back=-1), title="next_candle_timestamp_1", display=display.none)
+plot(time_close(timeframe.period, bars_back=-2), title="next_candle_timestamp_2", display=display.none)
+plot(time_close(timeframe.period, bars_back=-3), title="next_candle_timestamp_3", display=display.none)
+plot(time_close(timeframe.period, bars_back=-4), title="next_candle_timestamp_4", display=display.none)
+plot(time_close(timeframe.period, bars_back=-5), title="next_candle_timestamp_5", display=display.none)
 
 // Trim arrays to max_signals to limit memory and computation
 while array.size(bullish_states) > max_signals

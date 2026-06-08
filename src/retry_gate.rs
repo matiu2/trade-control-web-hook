@@ -346,6 +346,7 @@ pub async fn record_placement<S: StateStore>(
     broker_order_id: &str,
     direction: trade_control_core::intent::Direction,
     stop_loss_price: f64,
+    cancel_at: Option<DateTime<Utc>>,
 ) {
     let Some(trade_id) = intent.trade_id.as_deref() else {
         return;
@@ -369,6 +370,7 @@ pub async fn record_placement<S: StateStore>(
         shell_time,
         expires_at,
         stop_loss_price: Some(stop_loss_price),
+        cancel_at,
     };
     if let Err(err) = store.record_entry_attempt(attempt).await {
         console_error!("KV record_entry_attempt: {err}");
@@ -821,6 +823,7 @@ mod tests {
             clears: Vec::new(),
             trade_id: Some("trade-xyz".into()),
             max_retries,
+            expiry_bars: None,
             allow_entry: None,
             allow_close: None,
             needs_golden: false,
@@ -888,6 +891,11 @@ mod tests {
             signal_confirmed: None,
             recent_high: None,
             recent_low: None,
+            next_candle_timestamp_1: None,
+            next_candle_timestamp_2: None,
+            next_candle_timestamp_3: None,
+            next_candle_timestamp_4: None,
+            next_candle_timestamp_5: None,
         }
     }
 
@@ -961,6 +969,7 @@ mod tests {
             "order-1",
             Direction::Long,
             1.05,
+            None,
         ));
 
         // 2nd fire on the same shell bar — 409.
@@ -988,6 +997,7 @@ mod tests {
             "order-1",
             Direction::Long,
             1.05,
+            None,
         ));
 
         broker.push_lookup(AttemptState::Pending);
@@ -1019,6 +1029,7 @@ mod tests {
             "order-1",
             Direction::Long,
             1.05,
+            None,
         ));
 
         broker.push_lookup(AttemptState::Pending);
@@ -1056,6 +1067,7 @@ mod tests {
             "order-1",
             Direction::Long,
             1.05,
+            None,
         ));
 
         broker.push_lookup(AttemptState::OpenPosition {
@@ -1092,6 +1104,7 @@ mod tests {
                 "order-1",
                 Direction::Long,
                 1.05,
+                None,
             ));
             broker.push_lookup(state.clone());
 
@@ -1121,6 +1134,7 @@ mod tests {
                 &format!("order-{n}"),
                 Direction::Long,
                 1.05,
+                None,
             ));
             // All three are collapsed so we walk past them.
             broker.push_lookup(AttemptState::Cancelled);
@@ -1148,6 +1162,7 @@ mod tests {
             "order-1",
             Direction::Long,
             1.05,
+            None,
         ));
         broker.push_lookup_err();
 

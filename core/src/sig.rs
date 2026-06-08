@@ -75,6 +75,11 @@ const UNSIGNED_VALUE_KEYS: &[&str] = &[
     "signal_confirmed",
     "recent_high",
     "recent_low",
+    "next_candle_timestamp_1",
+    "next_candle_timestamp_2",
+    "next_candle_timestamp_3",
+    "next_candle_timestamp_4",
+    "next_candle_timestamp_5",
 ];
 
 /// Field name on the wire that holds the signature itself.

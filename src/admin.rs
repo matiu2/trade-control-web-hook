@@ -432,6 +432,7 @@ pub async fn handle_adopt(req: &mut Request, env: &Env) -> Result<Response> {
         shell_time: now,
         expires_at,
         stop_loss_price: adopt.stop_loss_price,
+        cancel_at: None,
     };
 
     if let Err(err) = state.record_entry_attempt(attempt.clone()).await {

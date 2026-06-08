@@ -274,6 +274,17 @@ pub struct TradeSpec {
     /// rules are enforced by `Intent::validate`.
     #[serde(default, skip_serializing_if = "is_zero_u32")]
     pub max_retries: u32,
+    /// Optional bar-based expiry for the resting entry order (1..=5).
+    /// When set, the worker cancels the pending stop/limit if it hasn't
+    /// filled within N bars of placement — pulling a never-triggered
+    /// breakout-stop rather than letting it rest until the entry
+    /// deadline. Lands on the `05-enter` intent only. Requires the Pine
+    /// study to ship the `next_candle_timestamp_1..5` plots (the worker
+    /// indexes that menu with this N). Omit to keep today's behaviour
+    /// (rest until the entry deadline). Out-of-range values are rejected
+    /// by the worker at fire time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expiry_bars: Option<u32>,
     /// Preps to omit from the bundle entirely. Each name listed here is
     /// dropped from both the emitted prep alerts *and* the entry's
     /// `requires_preps` gate. Use for setups where a step doesn't apply
@@ -663,6 +674,7 @@ fn build_pattern(
         risk_amount: None,
         dry_run: false,
         max_retries: 0,
+        expiry_bars: None,
         needs_golden: false,
         needs_confirmed: false,
         close_on_news: false,
@@ -783,6 +795,7 @@ fn assemble_trade(
         spec.risk_amount,
         spec.dry_run,
         spec.max_retries,
+        spec.expiry_bars,
         spec.allow_entry.as_deref(),
         spec.entry_mode,
         spec.needs_golden,
@@ -957,6 +970,7 @@ fn skeleton(
         account: Some(account.to_string()),
         trade_id: Some(trade_id.to_string()),
         max_retries: trade_control_core::tunable::Tunable::Static(0),
+        expiry_bars: None,
         allow_entry: None,
         allow_close: None,
         needs_golden: false,
@@ -1175,6 +1189,7 @@ fn build_enter_alert(
     risk_amount: Option<f64>,
     dry_run: bool,
     max_retries: u32,
+    expiry_bars: Option<u32>,
     allow_entry: Option<&str>,
     entry_mode: EntryMode,
     needs_golden: bool,
@@ -1224,6 +1239,7 @@ fn build_enter_alert(
         intent.dry_run = Some(true);
     }
     intent.max_retries = trade_control_core::tunable::Tunable::Static(max_retries);
+    intent.expiry_bars = expiry_bars.map(trade_control_core::tunable::Tunable::Static);
     intent.allow_entry = allow_entry.map(trade_control_core::tunable::Tunable::from_script);
     intent.needs_golden = needs_golden;
     intent.needs_confirmed = needs_confirmed;
@@ -1443,6 +1459,7 @@ mod tests {
                 false,
                 0,
                 None,
+                None,
                 EntryMode::Stop,
                 false,
                 false,
@@ -1466,6 +1483,7 @@ mod tests {
                 risk_amount: None,
                 dry_run: false,
                 max_retries: 0,
+                expiry_bars: None,
                 needs_golden: false,
                 needs_confirmed: false,
                 close_on_news: false,
@@ -1509,6 +1527,7 @@ mod tests {
             None,
             false,
             0,
+            None,
             None,
             EntryMode::Stop,
             false,
@@ -1577,6 +1596,7 @@ mod tests {
             None,
             false,
             0,
+            None,
             None,
             EntryMode::Stop,
             false,
@@ -1649,6 +1669,7 @@ mod tests {
             risk_amount: None,
             dry_run: false,
             max_retries: 0,
+            expiry_bars: None,
             needs_golden: false,
             needs_confirmed: false,
             close_on_news: false,
@@ -2087,6 +2108,41 @@ tp_price: 1.05
     }
 
     #[test]
+    fn build_trade_from_spec_threads_expiry_bars_onto_enter_intent() {
+        // expiry_bars on the spec lands on the enter intent only as
+        // `Static(N)`. Non-enter alerts (vetos/preps) must NOT carry it
+        // — bar-expiry is a property of the pending entry order alone.
+        let now = ts("2026-05-20T00:00:00Z");
+        let mut spec = sample_spec(TradePattern::Hs, ts("2026-05-25T00:00:00Z"));
+        spec.expiry_bars = Some(3);
+        let trade = build_trade_from_spec(spec, now).unwrap();
+        let enter = trade.alerts.last().unwrap();
+        match &enter.intent.expiry_bars {
+            Some(trade_control_core::tunable::Tunable::Static(n)) => assert_eq!(*n, 3),
+            other => panic!("expected Some(Static(3)) expiry_bars, got {other:?}"),
+        }
+        enter.intent.validate().unwrap();
+        for alert in trade.alerts.iter().take(trade.alerts.len() - 1) {
+            assert!(
+                alert.intent.expiry_bars.is_none(),
+                "non-enter alert {} carried expiry_bars",
+                alert.basename
+            );
+        }
+    }
+
+    #[test]
+    fn build_trade_from_spec_default_expiry_bars_is_none() {
+        // Omitting expiry_bars keeps today's behaviour: the enter intent
+        // carries no expiry_bars, so the order rests until trade_expiry.
+        let now = ts("2026-05-20T00:00:00Z");
+        let spec = sample_spec(TradePattern::Hs, ts("2026-05-25T00:00:00Z"));
+        let trade = build_trade_from_spec(spec, now).unwrap();
+        let enter = trade.alerts.last().unwrap();
+        assert!(enter.intent.expiry_bars.is_none());
+    }
+
+    #[test]
     fn build_trade_from_spec_default_entry_mode_is_stop() {
         // Omitting entry_mode preserves today's pending-stop entry —
         // critical for wire compat with all pre-existing spec yamls.
@@ -2210,6 +2266,77 @@ entry_mode: market
             }
             other => panic!("expected Script allow_entry after round trip, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn enter_alert_with_expiry_bars_carries_menu_and_survives_round_trip() {
+        // When expiry_bars is set, the signed enter body must carry the
+        // next_candle_timestamp_1..5 menu placeholders, and after TV
+        // substitutes them (ms epochs) the worker routes them onto the
+        // Shell and keeps expiry_bars on the Intent.
+        use trade_control_core::incoming::parse_and_verify;
+        let now = ts("2026-06-02T00:00:00Z");
+        let mut spec = sample_spec(TradePattern::Hs, ts("2026-06-09T00:00:00Z"));
+        spec.expiry_bars = Some(3);
+        let trade = build_trade_from_spec(spec, now).unwrap();
+        let enter = trade.alerts.last().unwrap();
+        assert_eq!(enter.basename, "05-enter");
+        let key = [9u8; KEY_LEN];
+        let signed = wrap_signed_template(&enter.intent, &key).unwrap();
+        assert!(
+            signed.contains("next_candle_timestamp_3:"),
+            "menu placeholder missing from signed body:\n{signed}"
+        );
+        let on_wire = signed
+            .replace("{{close}}", "203.391")
+            .replace("{{high}}", "203.395")
+            .replace("{{low}}", "203.380")
+            .replace("{{time}}", "2026-06-02T15:00:00Z")
+            .replace("{{plot(\"signal_high\")}}", "203.395")
+            .replace("{{plot(\"signal_low\")}}", "203.380")
+            .replace("{{plot(\"signal_range\")}}", "0.015")
+            .replace("{{plot(\"signal_start_time\")}}", "1780405200000")
+            .replace("{{plot(\"signal_kind\")}}", "1")
+            .replace("{{plot(\"signal_golden\")}}", "1")
+            .replace("{{plot(\"signal_atr\")}}", "0.012")
+            .replace("{{plot(\"signal_confirmed\")}}", "1")
+            .replace("{{plot(\"recent_high\")}}", "203.500")
+            .replace("{{plot(\"recent_low\")}}", "203.000")
+            // Hourly forward bar-closes from 16:00Z..20:00Z (ms epochs).
+            .replace("{{plot(\"next_candle_timestamp_1\")}}", "1780416000000")
+            .replace("{{plot(\"next_candle_timestamp_2\")}}", "1780419600000")
+            .replace("{{plot(\"next_candle_timestamp_3\")}}", "1780423200000")
+            .replace("{{plot(\"next_candle_timestamp_4\")}}", "1780426800000")
+            .replace("{{plot(\"next_candle_timestamp_5\")}}", "1780430400000");
+        let verify_now = ts("2026-06-02T15:00:30Z");
+        let verified = parse_and_verify(&on_wire, &key, verify_now)
+            .unwrap_or_else(|e| panic!("verify enter: {e}\n\nbody was:\n{on_wire}"));
+        assert!(verified.intent.expiry_bars.is_some());
+        assert_eq!(
+            verified
+                .shell
+                .next_candle_timestamp(3)
+                .unwrap()
+                .timestamp_millis(),
+            1780423200000
+        );
+    }
+
+    #[test]
+    fn enter_alert_without_expiry_bars_omits_menu() {
+        // No expiry_bars → byte-for-byte unchanged: the menu lines must
+        // not appear, so trades that don't use the feature don't depend
+        // on an indicator that ships the menu plots.
+        let now = ts("2026-06-02T00:00:00Z");
+        let spec = sample_spec(TradePattern::Hs, ts("2026-06-09T00:00:00Z"));
+        let trade = build_trade_from_spec(spec, now).unwrap();
+        let enter = trade.alerts.last().unwrap();
+        let key = [9u8; KEY_LEN];
+        let signed = wrap_signed_template(&enter.intent, &key).unwrap();
+        assert!(
+            !signed.contains("next_candle_timestamp"),
+            "menu placeholder leaked into a no-expiry enter body:\n{signed}"
+        );
     }
 
     #[test]

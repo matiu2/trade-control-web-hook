@@ -1,5 +1,91 @@
 # Changelog
 
+## v5 — 2026-06-08 — bar-based pending-order expiry (`expiry_bars`)
+
+### Why
+
+A resting stop-entry whose breakout never happens otherwise sits until
+`not_after` (the whole alert window). For a breakout setup, the clean edge
+is gone within a few bars — we want to cancel a never-filled order N bars
+after placement. Neither broker has a native per-order expiry (TradeNation
+orders are hardcoded Good-Till-Cancel; the OANDA worker path uses GTC
+too), so the worker must enforce it.
+
+The hard part: "N bars from now" must skip weekends / session breaks, and
+a resting order gets **no further webhooks** to count bars from — so the
+worker can neither count fires nor (lacking a session calendar) convert
+bars→wall-clock across a Friday→Monday gap. Only the indicator can: Pine's
+`time_close(timeframe.period, bars_back=-N)` projects forward respecting
+the symbol's session schedule.
+
+### What changed
+
+**Wire format (new field + menu)**
+
+- New signed `Intent::expiry_bars: Option<Tunable<u32>>` (1..=5) on the
+  enter intent — the author's policy, chosen at arm time.
+- New unsigned shell menu `next_candle_timestamp_1..5` (in
+  `UNSIGNED_VALUE_KEYS`, routed onto `Shell` in `incoming`) — Pine fills
+  the absolute forward bar-close timestamps at fire time. New
+  `Shell::next_candle_timestamp(n)` accessor.
+
+**Worker**
+
+- New `core::intent::resolve_cancel_at(expiry_bars, shell, not_after)`:
+  picks `menu[expiry_bars]`, falls back to `not_after` on a missing slot,
+  caps at `not_after`, and returns `ExpiryError::OutOfRange` for 0 / >5.
+- `run_enter` resolves `expiry_bars` (Phase-1 scope, like `max_retries`)
+  and computes `cancel_at` **before** any broker work; an out-of-range
+  value → `Rejected` 400 `expiry-bars-out-of-range` (does **not** mark the
+  id seen — next bar can retry).
+- New `EntryAttempt::cancel_at` (additive, `#[serde(default)]`), threaded
+  through `retry_gate::record_placement`. Deliberately **separate** from
+  `expires_at`, which stays tied to `not_after + grace` (it drives the KV
+  row TTL and replay/retry-gate record lifetime — shortening it would age
+  records out early).
+- Cron sweep: new OR-branch cancels a pending order once `cancel_at` has
+  passed, logged `reason=bar-expiry` (distinct from `expired`). Pure
+  `bar_expiry_due` predicate added.
+
+**CLI / tv-arm / Pine**
+
+- `TradeSpec::expiry_bars` → threaded onto the `05-enter` intent only.
+  `wrap_signed_template` appends the menu placeholders **only when
+  `expiry_bars` is set**, so non-expiry trades stay byte-identical and
+  don't depend on the new plots.
+- `tv-arm --expiry-bars N`.
+- `candle-signals-v2.pine` v2.3: five `next_candle_timestamp_1..5` hidden
+  plots via `time_close(timeframe.period, bars_back=-k)`.
+
+### Breaking
+
+None. `expiry_bars` absent = today's behaviour (rest until `not_after`);
+old KV `EntryAttempt` rows without `cancel_at` decode as `None`.
+
+### Config
+
+- `expiry_bars: <1..5>` on an enter intent / trade spec; `--expiry-bars`
+  on `tv-arm`. Requires the v2.3 indicator that ships the menu plots.
+
+### Tests
+
+- core: sig keeps the menu unsigned; incoming routes the menu onto Shell;
+  `expiry_bars` round-trips on Intent; `resolve_cancel_at` slot pick /
+  out-of-range / missing-slot fallback / not_after cap; `EntryAttempt`
+  JSON round-trips with and without `cancel_at` (incl. legacy-row default).
+- worker: `bar_expiry_due` predicate; `expiry-bars-out-of-range` outcome
+  classifies as Skip (no id poison).
+- cli: `expiry_bars` threads onto enter only; menu present/absent in the
+  signed body by opt-in; end-to-end sign→substitute→verify round-trip.
+
+### Follow-up
+
+- `on_broker_rejection` recovery (skip/market/limit on `#19-10`, with a
+  ≥1R recheck and limit-override) — deferred; brief in
+  `BUG-entry-too-close-to-market.md`.
+- Pine `time_close` forward projection can't anticipate an *unscheduled*
+  one-off holiday inside the window; `not_after` is the backstop.
+
 ## v4 — 2026-06-08 — `prep-expire`: a `<prep>-expiry` cutoff line
 
 ### Why

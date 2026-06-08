@@ -52,6 +52,7 @@ fn control_skeleton(action: Action, instrument: &str, id: String, now: DateTime<
         account: None,
         trade_id: None,
         max_retries: trade_control_core::tunable::Tunable::Static(0),
+        expiry_bars: None,
         allow_entry: None,
         allow_close: None,
         needs_golden: false,
@@ -176,8 +177,20 @@ pub fn wrap_signed(intent: &Intent, key: &[u8; KEY_LEN], now: DateTime<Utc>) -> 
 /// study (e.g. `Candle Signals`'s `Long/Short Pattern` alertcondition).
 /// Shell includes the `{{plot("…")}}` placeholders that only resolve
 /// when the alert is bound to a study — see [`shell_for_tv_template_pine`].
+///
+/// When the intent opts into bar-based order expiry (`expiry_bars`
+/// set), the shell additionally carries the
+/// `next_candle_timestamp_1..5` menu placeholders. They're appended
+/// only in that case so trades that don't use the feature stay
+/// byte-identical on the wire and don't depend on an indicator that
+/// ships the menu plots — an operator who sets `expiry_bars` is
+/// asserting they're on the v2+ indicator that does.
 pub fn wrap_signed_template(intent: &Intent, key: &[u8; KEY_LEN]) -> Result<String> {
-    build_signed_body(intent, key, &shell_for_tv_template_pine())
+    let mut shell = shell_for_tv_template_pine();
+    if intent.expiry_bars.is_some() {
+        shell.extend(shell_for_next_candle_menu());
+    }
+    build_signed_body(intent, key, &shell)
 }
 
 /// Build a signed body for a TradingView alert that fires from a
@@ -264,6 +277,28 @@ fn shell_for_tv_template_pine() -> Vec<(&'static str, String)> {
         ("recent_low", "{{plot(\"recent_low\")}}".to_string()),
     ]);
     lines
+}
+
+/// The five forward bar-close menu placeholders, filled by Pine at
+/// fire-time via `time_close(timeframe.period, bars_back=-k)`. Appended
+/// to the Pine-bound enter shell only when `expiry_bars` is set. The
+/// worker indexes this menu with the signed `expiry_bars` to derive the
+/// order's `cancel_at`. Like the `signal_*` plots, the YAML key on the
+/// left is what the worker deserialises; the `{{plot("…")}}` names the
+/// Pine plot title.
+fn shell_for_next_candle_menu() -> Vec<(&'static str, String)> {
+    (1..=5)
+        .map(|n| {
+            let key: &'static str = match n {
+                1 => "next_candle_timestamp_1",
+                2 => "next_candle_timestamp_2",
+                3 => "next_candle_timestamp_3",
+                4 => "next_candle_timestamp_4",
+                _ => "next_candle_timestamp_5",
+            };
+            (key, format!("{{{{plot(\"next_candle_timestamp_{n}\")}}}}"))
+        })
+        .collect()
 }
 
 fn shell_for_tv_template_drawing() -> Vec<(&'static str, String)> {

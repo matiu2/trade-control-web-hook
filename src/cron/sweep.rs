@@ -63,6 +63,13 @@ pub fn breach_detected(direction: Direction, current_price: f64, stop_loss: f64)
     }
 }
 
+/// Pure bar-expiry predicate: true iff the row carries a `cancel_at`
+/// that has passed. Mirrors [`breach_detected`] — tiny and pure so the
+/// sweep ordering can be asserted without a broker/env.
+pub fn bar_expiry_due(cancel_at: Option<DateTime<Utc>>, now: DateTime<Utc>) -> bool {
+    cancel_at.is_some_and(|c| c < now)
+}
+
 /// Per-attempt sweep. Splits the three reasons to act (expired, SL
 /// breached, otherwise leave alone) and returns an error string so
 /// the caller can log with row context.
@@ -74,6 +81,12 @@ async fn sweep_one(
 ) -> Result<(), String> {
     if attempt.expires_at < now {
         cancel_and_delete(env, store, attempt, "expired").await
+    } else if bar_expiry_due(attempt.cancel_at, now) {
+        // Bar-based expiry: the resting order has outlived its
+        // `expiry_bars` window without filling. Cancel like an expiry
+        // (no current-price fetch needed) but with a distinct reason so
+        // it's greppable apart from the alert-window `expired` case.
+        cancel_and_delete(env, store, attempt, "bar-expiry").await
     } else if let Some(sl) = attempt.stop_loss_price {
         // Only acquire a broker when there's a chance we'll need to
         // call `get_current_price` — i.e. the row carries an SL.
@@ -278,5 +291,29 @@ mod tests {
         assert!(breach_detected(Direction::Short, 1.0500, 1.0500));
         assert!(breach_detected(Direction::Short, 1.0501, 1.0500));
         assert!(!breach_detected(Direction::Short, 1.0499, 1.0500));
+    }
+
+    fn ts(s: &str) -> DateTime<Utc> {
+        s.parse().unwrap()
+    }
+
+    #[test]
+    fn bar_expiry_due_when_cancel_at_passed() {
+        let now = ts("2026-05-13T15:00:00Z");
+        assert!(bar_expiry_due(Some(ts("2026-05-13T14:59:59Z")), now));
+    }
+
+    #[test]
+    fn bar_expiry_not_due_when_cancel_at_future() {
+        let now = ts("2026-05-13T15:00:00Z");
+        assert!(!bar_expiry_due(Some(ts("2026-05-13T15:00:01Z")), now));
+    }
+
+    #[test]
+    fn bar_expiry_not_due_when_unset() {
+        // Legacy rows / orders without a bar-expiry carry None — the
+        // sweep must fall through to the SL/expires_at paths untouched.
+        let now = ts("2026-05-13T15:00:00Z");
+        assert!(!bar_expiry_due(None, now));
     }
 }

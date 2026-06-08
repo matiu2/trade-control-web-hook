@@ -1,5 +1,35 @@
 # TODO
 
+## Done — bar-based pending-order expiry (`expiry_bars`)
+
+Cancel a resting stop/limit order N bars (1..=5) after placement if it
+hasn't filled, instead of letting it rest until `not_after`. Neither
+broker has native per-order expiry, so the worker enforces it via the
+existing cron sweep. A resting order gets no further webhooks and the
+worker has no session calendar, so Pine computes the forward bar-close
+times (`time_close(timeframe.period, bars_back=-N)`, weekend-aware) and
+ships them as an unsigned `next_candle_timestamp_1..5` menu; the signed
+`expiry_bars` selects a slot, capped at `not_after`.
+
+Status: DONE — all layers landed and green (core, worker, cli, tv-arm).
+- `Shell.next_candle_timestamp_1..5` (unsigned) + `Intent.expiry_bars`
+  (signed); `resolve_cancel_at`; new `EntryAttempt.cancel_at` (separate
+  from `expires_at` on purpose); cron sweep `bar-expiry` branch; CLI
+  `TradeSpec.expiry_bars`; `tv-arm --expiry-bars`; Pine v2.3 plots.
+- Out-of-range `expiry_bars` → `rejected: expiry-bars-out-of-range` 400,
+  no seen-id poison.
+
+Cross-repo coordination: the Pine plots live in
+`pine-scripts/candle-signals-v2.pine` (v2.3). The worker falls back to
+`not_after` when the menu is absent, and the menu is only emitted into the
+signed body when `expiry_bars` is set — so an operator on an older
+indicator who doesn't use the flag is unaffected. **Republish the v2.3
+study to TradingView before using `expiry_bars` live.**
+
+Follow-up (deferred, not built): `on_broker_rejection` recovery
+(skip/market/limit on a `#19-10` reject, with a ≥1R recheck and the
+limit-override) — see `BUG-entry-too-close-to-market.md`.
+
 ## Active — `prep-expire` action + `<prep>-expiry` vertical line
 
 A vertical line labelled `<prep>-expiry` (e.g. `break-and-close-expiry`,

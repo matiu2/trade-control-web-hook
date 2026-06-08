@@ -397,6 +397,11 @@ mod tests {
             signal_confirmed: Some(false),
             recent_high: Some(1.2360),
             recent_low: Some(1.2330),
+            next_candle_timestamp_1: None,
+            next_candle_timestamp_2: None,
+            next_candle_timestamp_3: None,
+            next_candle_timestamp_4: None,
+            next_candle_timestamp_5: None,
         }
     }
 
@@ -416,6 +421,11 @@ mod tests {
             signal_confirmed: None,
             recent_high: None,
             recent_low: None,
+            next_candle_timestamp_1: None,
+            next_candle_timestamp_2: None,
+            next_candle_timestamp_3: None,
+            next_candle_timestamp_4: None,
+            next_candle_timestamp_5: None,
         }
     }
 

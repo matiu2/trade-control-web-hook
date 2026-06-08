@@ -5,8 +5,10 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+mod expiry;
 mod resolution;
 
+pub use expiry::{ExpiryError, MAX_EXPIRY_BARS, resolve_cancel_at};
 #[cfg(feature = "cli")]
 pub use resolution::MIN_R_FLOOR;
 pub use resolution::{Resolved, ResolvedEntry, RiskBudget};
@@ -94,6 +96,46 @@ pub struct Shell {
     /// Lowest low over the same window. SL anchor for long trades.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub recent_low: Option<f64>,
+    /// Forward-projected close timestamps of the next 1..=5 bars, filled
+    /// by Pine at fire-time via `time_close(timeframe.period, bars_back=-k)`.
+    /// These respect the symbol's session calendar — so "the bar 3 ahead"
+    /// of a Friday-close correctly lands on the next session open, not
+    /// inside the weekend. The worker indexes this menu with the signed
+    /// `Intent::expiry_bars` to derive a pending-order `cancel_at`. Pine
+    /// ships each as a millisecond Unix-epoch integer (see
+    /// `signal_time_serde`), or `na`/absent on non-time-based charts (in
+    /// which case expiry falls back to `not_after`). Optional throughout —
+    /// only Pine-bound enter alerts carry them.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "signal_time_serde"
+    )]
+    pub next_candle_timestamp_1: Option<DateTime<Utc>>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "signal_time_serde"
+    )]
+    pub next_candle_timestamp_2: Option<DateTime<Utc>>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "signal_time_serde"
+    )]
+    pub next_candle_timestamp_3: Option<DateTime<Utc>>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "signal_time_serde"
+    )]
+    pub next_candle_timestamp_4: Option<DateTime<Utc>>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "signal_time_serde"
+    )]
+    pub next_candle_timestamp_5: Option<DateTime<Utc>>,
 }
 
 /// Which candle signal detector fired. Mirrors the `KIND_*` constants
@@ -442,6 +484,24 @@ pub struct Intent {
     /// retries should not be in the field in the first place).
     #[serde(default, skip_serializing_if = "is_default_max_retries")]
     pub max_retries: crate::tunable::Tunable<u32>,
+    /// Optional bar-based expiry for a pending `enter` order. When set
+    /// (1..=5), the worker derives a `cancel_at` for the resting order
+    /// by indexing the shell's `next_candle_timestamp_1..5` menu (which
+    /// Pine fills with session-calendar-aware forward bar-close times),
+    /// capped at [`Self::not_after`]. The cron sweep cancels the order
+    /// once `cancel_at` passes — so a breakout-stop that never fills is
+    /// pulled within N bars instead of resting until the alert window
+    /// closes. Out-of-range values (0, or > the 5-slot menu) are
+    /// rejected at dispatch. Absent = today's behaviour (rest until
+    /// `not_after`).
+    ///
+    /// A [`Tunable<u32>`] — the author picks N at arm time (static
+    /// literal `expiry_bars: 3`, or a Rhai `!script` resolved against
+    /// Phase 1 shell-anchor scope). The *absolute* timestamps come from
+    /// Pine at fire-time, not from this field — this field only selects
+    /// which menu slot to use.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expiry_bars: Option<crate::tunable::Tunable<u32>>,
     /// Optional Rhai gate on `enter`. When set, the worker resolves
     /// the [`Tunable<bool>`] (Static or `!script`) after passing the
     /// retry / prep / veto gates and rejects the entry with a 412 if
@@ -1153,6 +1213,21 @@ impl Shell {
             PriceAnchor::RecentLow => self.recent_low.unwrap_or(self.low),
         }
     }
+
+    /// Return the Pine-filled forward bar-close timestamp for `n` (1..=5),
+    /// or `None` if `n` is out of range or the slot wasn't populated (e.g.
+    /// `na` on a non-time-based chart, or a control/drawing shell that
+    /// never carries the menu).
+    pub fn next_candle_timestamp(&self, n: u32) -> Option<DateTime<Utc>> {
+        match n {
+            1 => self.next_candle_timestamp_1,
+            2 => self.next_candle_timestamp_2,
+            3 => self.next_candle_timestamp_3,
+            4 => self.next_candle_timestamp_4,
+            5 => self.next_candle_timestamp_5,
+            _ => None,
+        }
+    }
 }
 
 impl PriceRef {
@@ -1186,6 +1261,11 @@ mod tests {
             signal_confirmed: None,
             recent_high: None,
             recent_low: None,
+            next_candle_timestamp_1: None,
+            next_candle_timestamp_2: None,
+            next_candle_timestamp_3: None,
+            next_candle_timestamp_4: None,
+            next_candle_timestamp_5: None,
         }
     }
 

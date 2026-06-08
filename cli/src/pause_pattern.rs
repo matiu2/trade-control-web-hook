@@ -255,6 +255,7 @@ fn build_pause_intent(
         clears: Vec::new(),
         trade_id: Some(spec.trade_id.clone()),
         max_retries: trade_control_core::tunable::Tunable::Static(0),
+        expiry_bars: None,
         allow_entry: None,
         allow_close: None,
         needs_golden: false,

@@ -207,6 +207,11 @@ min_r: 1.0                             # optional. Defaults to 1.0. Worker
                                        # be >= 1.0 — values below the floor
                                        # are rejected both at the encoder
                                        # and on the server.
+expiry_bars: 3                         # optional, 1..=5. Cancel a resting
+                                       # stop/limit order if it hasn't filled
+                                       # within N bars. See "Bar-based order
+                                       # expiry" below. Omit to rest until
+                                       # not_after.
 cooldown_hours: 12                     # only used by "invalidate"
 ```
 
@@ -222,6 +227,15 @@ long limits sit *below* current price, short limits *above*). The worker
 rejects the trade if the geometry is wrong (e.g. a long limit priced above
 the current candle close), so a typo can't turn a limit into an instant
 market fill at a worse price.
+
+**Bar-based order expiry (`expiry_bars`):** a resting stop/limit order
+that never fills otherwise sits until `not_after`. Set `expiry_bars: N`
+(1..=5) to cancel it N bars after placement instead — useful for a
+breakout-stop whose edge is gone if the break doesn't happen promptly.
+Neither broker supports a native per-order expiry (TradeNation orders are
+all Good-Till-Cancel; the OANDA path uses GTC too), so the worker enforces
+it via its scheduled sweep. See [Using `expiry_bars`](#using-expiry_bars)
+below for how to set it and what it needs from the chart.
 
 **Anchored vs absolute prices:** `stop_loss` and `take_profit` accept
 either form. Anchored (`{ from: low, offset_pips: -2 }`) is computed
@@ -320,6 +334,82 @@ increasing in list order, or if any opted-in veto is active. Preps are
 
 `requires_preps` and `vetos` are template-only fields; the CLI does not
 prompt for them. Author one template per setup.
+
+## Using `expiry_bars`
+
+`expiry_bars` cancels a resting **entry** order if it hasn't filled
+within N bars (1..=5) of being placed, instead of letting it rest until
+`not_after`. It's for breakout setups: a `stop` entry is only worth
+keeping for a few bars after the signal — if the break hasn't happened by
+then, the edge is gone and a late fill is usually a worse trade.
+
+### When to use it
+
+- You're using a **`stop`** (breakout) or **`limit`** (pullback) entry —
+  it does nothing for a `market` entry, which fills immediately.
+- The order's value decays with time: you want "fill in the next 2–3
+  bars or forget it," not "fill any time in the next 12 hours."
+
+### How to set it
+
+Three equivalent ways, depending on where you author the trade:
+
+1. **Directly in an `enter` intent** (hand-authored template):
+
+   ```yaml
+   v: 1
+   action: enter
+   instrument: EUR_USD
+   direction: long
+   entry: { type: stop, from: high, offset_pips: 2 }
+   stop_loss:   { from: low,  offset_pips: -2 }
+   take_profit: { from: close, offset_r: 2.0 }
+   risk_pct: 0.5
+   expiry_bars: 3        # cancel if unfilled 3 bars after placement
+   ```
+
+2. **In a `build-trade` trade spec** (`expiry_bars: 3`) — it lands on the
+   `05-enter` alert only; vetos and preps never carry it.
+
+3. **From `tv-arm`** when arming a chart: `tv-arm … --expiry-bars 3`.
+
+Omit it entirely to keep the old behaviour (rest until `not_after`).
+
+### What it needs from the chart (important)
+
+The worker can't compute "3 bars from now" itself: a resting order gets
+no further alerts to count bars from, and "3 bars after a Friday close"
+is *Monday's* session open, not Friday evening — the worker has no
+session calendar to know that. **Only the indicator does.** So the Pine
+study (`candle-signals-v2.pine` **v2.3+**) ships five hidden plots
+`next_candle_timestamp_1..5`, each
+`time_close(timeframe.period, bars_back=-k)` — the forward bar-close
+times, computed against the symbol's session schedule (weekends and
+session breaks skipped). At fire time TradingView fills those into the
+alert; the worker reads slot `expiry_bars` and sets the order's
+`cancel_at = min(menu[expiry_bars], not_after)`. The scheduled sweep then
+cancels the order once `cancel_at` passes (logged `reason=bar-expiry`).
+
+So before using `expiry_bars` live: **republish the v2.3 `Candle Signals`
+study to TradingView.** Until you do, the `next_candle_timestamp_*` plots
+don't exist and the menu arrives empty — the worker then safely falls
+back to `not_after` (no crash, just no tightened expiry). The menu is
+only attached to the signed enter body **when `expiry_bars` is set**, so
+trades that don't use the feature are byte-identical and don't depend on
+the v2.3 plots at all.
+
+### Edge cases
+
+- **Out of range:** `expiry_bars` outside 1..=5 is rejected at fire time
+  (`rejected: expiry-bars-out-of-range`, HTTP 400). The rejection does
+  **not** consume the id, so the next bar's alert can still get in.
+- **Capped at `not_after`:** the expiry never outlives the alert window —
+  if N bars would land past `not_after`, `not_after` wins.
+- **Non-time charts** (tick / Renko): `time_close` returns `na`, the menu
+  slot is empty, and the worker falls back to `not_after`.
+- **One-off holidays:** Pine projects against the *regular* session
+  schedule, so an unscheduled holiday inside the window can shift the
+  timestamp; `not_after` is the backstop.
 
 ## CLI
 

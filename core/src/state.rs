@@ -163,6 +163,19 @@ pub struct EntryAttempt {
     /// expire normally.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stop_loss_price: Option<f64>,
+    /// Bar-based pending-order expiry, distinct from [`Self::expires_at`].
+    /// Derived at placement from the intent's `expiry_bars` against the
+    /// shell's `next_candle_timestamp` menu (capped at `not_after`). The
+    /// scheduled sweep cancels a still-pending order once `cancel_at`
+    /// passes — pulling a never-filled breakout-stop within N bars rather
+    /// than letting it rest until `expires_at`. `None` = no bar-expiry
+    /// requested (the order rests until the alert window closes, as
+    /// before). Kept separate from `expires_at` on purpose: `expires_at`
+    /// drives the KV row's TTL and replay/retry-gate record lifetime and
+    /// must stay tied to `not_after + grace`; shortening it here would age
+    /// the record out early.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cancel_at: Option<DateTime<Utc>>,
 }
 
 impl HasExpiry for EntryAttempt {
@@ -2005,6 +2018,7 @@ mod tests {
             shell_time: now,
             expires_at: now + chrono::Duration::hours(24),
             stop_loss_price: None,
+            cancel_at: None,
         }
     }
 
@@ -2134,6 +2148,7 @@ mod tests {
             shell_time: now,
             expires_at: now + chrono::Duration::hours(24),
             stop_loss_price: Some(1.0500),
+            cancel_at: Some(now + chrono::Duration::hours(3)),
         };
         let yaml = serde_yaml::to_string(&a).unwrap();
         let parsed: EntryAttempt = serde_yaml::from_str(&yaml).unwrap();
@@ -2160,6 +2175,10 @@ mod tests {
         }"#;
         let attempt: EntryAttempt = serde_json::from_str(json).unwrap();
         assert!(attempt.stop_loss_price.is_none());
+        // Rows written before bar-expiry landed lack `cancel_at` too;
+        // they must decode as `None` so the sweep skips the bar-expiry
+        // check and the row still ages out via TTL.
+        assert!(attempt.cancel_at.is_none());
         assert_eq!(attempt.broker_order_id, "ord-1");
     }
 
@@ -2178,6 +2197,7 @@ mod tests {
             shell_time: now,
             expires_at: now + chrono::Duration::hours(24),
             stop_loss_price: None,
+            cancel_at: None,
         };
         let yaml = serde_yaml::to_string(&a).unwrap();
         assert!(!yaml.contains("broker_trade_id"));

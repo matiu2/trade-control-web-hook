@@ -103,6 +103,11 @@ mod tests {
             signal_confirmed: confirmed,
             recent_high: None,
             recent_low: None,
+            next_candle_timestamp_1: None,
+            next_candle_timestamp_2: None,
+            next_candle_timestamp_3: None,
+            next_candle_timestamp_4: None,
+            next_candle_timestamp_5: None,
         }
     }
 
@@ -139,6 +144,7 @@ mod tests {
             clears: Vec::new(),
             trade_id: Some("t-1".into()),
             max_retries: Tunable::Static(0),
+            expiry_bars: None,
             allow_entry: None,
             allow_close,
             needs_golden,

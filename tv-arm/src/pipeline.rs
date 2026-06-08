@@ -569,6 +569,7 @@ fn build_trade_spec(
         risk_amount: args.risk_amount,
         dry_run: args.broker_dry_run,
         max_retries: args.max_retries.unwrap_or(0),
+        expiry_bars: args.expiry_bars,
         skip_preps,
         entry_offset_pips: None,
         sl_offset_pips: None,
