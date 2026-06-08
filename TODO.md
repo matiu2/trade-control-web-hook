@@ -27,16 +27,37 @@ Commits (each tested, clippy+fmt green):
 - [x] 4. core/src/intent/mw_resolution.rs — mid-correct entry/SL/TP +
   from_intent branch (shared sizing tail factored into
   finish_with_sizing; wrong-side stop → InvalidGeometry = stay armed)
-- [ ] 5. tv-arm roles.rs — PATH kind + mw_path (verify tv-mcp kind string)
-- [ ] 6. cli — TradeSpec.mw + build_mw_pattern + dispatch
-- [ ] 7. Pine — alertcondition(true, "Every Bar Close", ...)
-- [ ] 8. tv-arm alert_spec — cancel/abort PriceValue + Enter→Every Bar Close
-- [ ] 9. tv-arm args+pipeline — --allow-50-pct-m-trades, neckline gate
-  (--spread-pips stopgap)
-- [ ] 10. tv-arm — live broker spread read (replaces stopgap)
+  ⚠️ PLAN CORRECTION (verified live via tv-mcp 2026-06-08, GBP/CAD chart):
+  The TV **path tool has NO text/label property** (only lineColor/width/
+  style/ends/visible/frozen). So commit 1's `MW_PATH_LABELS` +
+  `mw_direction_from_label` are **DEAD for paths**. Detection is now
+  GEOMETRY-ONLY. See memory `mw-path-detection-is-geometry-only`.
+  Verified: path kind string = `"path"`; anchors come in draw order A,B,C;
+  `mcp.get_range() -> ChartRange` already exists at trading-view/src/mcp.rs:113.
+
+- [ ] 5. tv-arm roles.rs + mw_geometry.rs — kind::PATH="path"; Roles.mw_path;
+  classify a `path` with EXACTLY 3 anchors all inside the live visible range
+  (thread `get_range()` into classify; latest-wins). Add
+  `mw_direction_from_anchors(a,b,c)` (A above B → W/long; A below B → M/short)
+  + "first leg A→B longer by price than B→C" structure gate (hard-error w/
+  A/B/C + leg lengths) to mw_geometry.rs. NO label lookup.
+- [ ] 6. cli — TradeSpec.mw + build_mw_pattern + 4 builders (mw-cancel/
+  mw-abort CancelPending, reuse trade-expiry, mw-enter mw:Some / empty preps /
+  max_retries:0 / Stop) + replace not-implemented/unreachable! arms + dispatch
+- [ ] 7. Pine — alertcondition(true, "Every Bar Close", ...) (manual republish)
+- [ ] 8. tv-arm alert_spec — cancel(intra-bar OnFirstFire)/abort(OnBarClose)
+  PriceValue arms (replace the temp `None` stub) + Enter→"Every Bar Close"
+  when is_mw
+- [ ] 9. tv-arm args+pipeline — --allow-50-pct-m-trades (≥40% errors w/o it,
+  ≤50% with, >50% always errors); --spread-pips REQUIRED on M/W arm
+  (hard-error if omitted; live read = step 10); M/W branch keyed on
+  roles.mw_path.is_some(); ⚠️ BYPASS the H&S check_required branch
+  (pipeline.rs:404) when mw_path present (else misleading missing-drawing
+  error); M/W-only required set = mw_path + trade_expiry; bake MwSpec
+- [ ] 10. tv-arm — live broker spread read (replaces required --spread-pips)
 - [ ] README sync
 
-Checkpoint tag before starting: `pre-m-and-w-trades`.
+Checkpoint tag (current HEAD efa38ff): `pre-m-and-w-trades`.
 
 ## Done — bar-based pending-order expiry (`expiry_bars`)
 
