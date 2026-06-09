@@ -107,7 +107,19 @@ Commits (each tested, clippy+fmt green):
   tag, native/no-wasm), reqwest 0.12 (rustls-tls, matches ecosystem). 137 tv-arm
   tests (6 new spread + check_mw_required tests; dropped obsolete
   requires_spread_pips), clippy+fmt clean; root worker (wasm lib) still checks.
-- [ ] README sync
+- [x] README sync. Added an **M/W bundle** table to "Alert basenames"
+  (01-veto-mw-cancel intra-bar OnFirstFire / 01-veto-mw-abort OnBarClose,
+  both cancel-pending; 02-veto-trade-expiry; 05-enter bound to the Pine
+  "Every Bar Close" alertcondition with the baked `mw:` block; no
+  06-close-on-reversal since TP is a hard 1R). Added an **M/W setups**
+  subsection to "Chart-driven arming: tv-arm": the 3-anchor PATH tool
+  (A runup-start / B first peak-trough / C neckline, draw order),
+  geometry-only direction (A>B → W/long, A<B → M/short; no label), the
+  neckline-depth gate + --allow-50-pct-m-trades, the live broker spread
+  read (OANDA /pricing needs OANDA_TOKEN|OANDA_API_KEY; TN chart bid/ask;
+  no override, hard-fail), no prep chain / max_retries 0. Also fixed a
+  stale H&S CLI comment ("pair with --dry-run" → "omit --create-alerts to
+  only write to disk"; tv-arm has no --dry-run).
 - [~] pip-size everywhere (separate project). DONE in instrument-lookup:
   tick_size + decimal_places baked v0.2.0 (TradeNation-sourced, 1223 API /
   96 class-default), authoritative `pip_size` field being added now (agent,

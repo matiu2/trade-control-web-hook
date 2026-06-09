@@ -104,6 +104,21 @@ Each news pair adds two more (`01-news-start-<id>` + `02-news-end-<id>`)
 via a separate `build-news` shell-out, and each pause pair adds
 `01-pause-<id>` + `02-resume-<id>` via `build-pause`.
 
+### M/W (double-top / double-bottom) bundle
+
+M (double-top → short) and W (double-bottom → long) reversal setups
+emit a **different, smaller** bundle — no prep chain, single-shot:
+
+| Basename | Action | Fires on | Notes |
+|---|---|---|---|
+| `01-veto-mw-cancel` | `veto` | Price crossing the 1.3-extension of the neckline→peak leg (**intra-bar, on first tick**) | Level `cancel-pending`. The same 1.3 extension the second peak must stay within, so it doubles as the two-peaks alignment ceiling. Cancels the resting entry + disarms. Value-bound, computed by `tv-arm`. |
+| `01-veto-mw-abort` | `veto` | A candle **closing** back through the neckline | Level `cancel-pending` (matters only while pending — once filled the trade rides its SL/TP). Value-bound at the neckline. |
+| `02-veto-trade-expiry` | `veto` | Vertical line crossing chart time | Same hard stop as H&S. |
+| `05-enter` | `enter` | Pine **`Every Bar Close`** alertcondition (every closed bar, not the golden/short-pattern plots) | Carries the baked static M/W params (`mw:` block); the **worker** computes entry/SL/TP from those + the live shell OHLC each bar, mid→bid/ask corrected with the arm-time spread. `max_retries: 0`, no preps. |
+
+There is **no `06-close-on-reversal`** for M/W — the take-profit is a
+hard 1R, so there's no opposing-reversal close to arm.
+
 ## General workflow
 
 The day-to-day loop, end to end:
@@ -894,7 +909,7 @@ cargo run -p tv-arm -- \
   --skip-retest \                     # implies --skip-break-and-close; for late entries
   --require-golden \                  # require Pine golden-candle signal on entry
   --require-confirmation \            # require a confirmed signal candle on entry (independent of golden)
-  --create-alerts                     # default; pair with --dry-run to inspect only
+  --create-alerts                     # POST to TradingView; omit to only write the signed bundle to disk
 ```
 
 Run `tv-arm --help` for the full flag surface — it has diverged from the
@@ -922,6 +937,46 @@ where those preps don't apply.
 - **TP via symmetric reflection.** `tv-arm` computes TP as `2 × neckline
   − head` from the fib's two endpoints, independent of which fib levels
   are visible / configured. Draw the fib spanning head → neckline.
+
+### M/W (double-top / double-bottom) setups
+
+M/W reversals use a completely different drawing input from H&S: **one
+PATH (polyline) tool with exactly 3 anchors**, plus a `trade-expiry`
+vertical. No invalidation line, no neckline/retest trendlines, no fib.
+
+The 3 path anchors, **in draw order**:
+
+1. **A — runup start** (audit/log only).
+2. **B — first peak (M) / first trough (W)** — the SL anchor base.
+3. **C — neckline retracement** — the entry/abort anchor.
+
+Direction is inferred from the A→B leg geometry (A above B → W/long; A
+below B → M/short) — the **path tool has no text label**, so detection
+is geometry-only, and only a path whose 3 anchors all sit inside the
+visible chart range is picked up. `tv-arm` gates the setup at arm time:
+
+- **Neckline-retracement depth.** Retrace as a % of the runup must be
+  `< 40%`. `--allow-50-pct-m-trades` raises the ceiling to `<= 50%` for
+  a marginal setup; `> 50%` is always rejected.
+- **Live broker spread.** The mid→bid/ask correction the worker applies
+  needs the spread captured at arm time, so `tv-arm` **reads it live**
+  from the broker (OANDA `/pricing`; TradeNation's chart bid/ask
+  endpoint) and bakes it into the enter intent. There is **no override
+  flag** — a failed read (no token, market closed, degenerate spread)
+  **aborts the arm**. OANDA needs `OANDA_TOKEN` (or `OANDA_API_KEY`) in
+  the environment.
+
+Unlike H&S there is no prep chain and no re-entry (`max_retries: 0`):
+the cancel/abort vetos or a fill end the setup. See the M/W bundle table
+under "Alert basenames" above for what gets emitted.
+
+```sh
+cargo run -p tv-arm -- \
+  --broker oanda \
+  --allow-50-pct-m-trades \           # opt in to a 40–50% neckline retrace
+  --create-alerts
+# (draw the 3-anchor path + a trade-expiry vertical on the chart first)
+```
 
 ### Dependencies
 
