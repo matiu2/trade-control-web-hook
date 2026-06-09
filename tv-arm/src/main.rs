@@ -30,6 +30,7 @@ mod mw_geometry;
 mod pipeline;
 mod post_outcome;
 mod roles;
+mod spread;
 mod timeframe;
 
 use crate::args::Args;

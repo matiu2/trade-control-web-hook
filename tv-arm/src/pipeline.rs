@@ -452,9 +452,13 @@ fn resolve_hs_trade(
 
 /// M/W path: direction and geometry come from the 3-anchor path drawing
 /// (`mw_path`), not from the H&S drawing constellation. Required
-/// drawings are just the path + the trade-expiry line. Gates the
-/// neckline-retracement depth, then bakes the static `MwSpec` into the
-/// spec; the worker computes entry/SL/TP from it at fill time.
+/// drawings are just the path + the trade-expiry line.
+///
+/// This is the live wrapper: it runs the cheap chart guards first (so an
+/// operator chart mistake fails fast without a network round-trip), then
+/// reads the broker spread live and delegates to
+/// [`resolve_mw_trade_with_spread`] for the geometry gates + baking. The
+/// pure inner fn is what the unit tests drive.
 fn resolve_mw_trade(
     args: &Args,
     roles: &Roles,
@@ -465,12 +469,32 @@ fn resolve_mw_trade(
 ) -> std::result::Result<(Direction, cli::TradeSpec), ResolveError> {
     // --pip-size overrides the canonical catalog value when set.
     let pip_size = args.pip_size.unwrap_or(catalog_pip);
+    check_mw_required(roles)?;
+    // The arm-time broker spread is read live (OANDA /pricing or the
+    // TradeNation chart endpoint) and baked into the enter intent so the
+    // worker can mid→bid/ask correct entry/SL/TP at fill time. There is
+    // no operator override — a failed read hard-errors rather than bake a
+    // guessed spread.
+    let spread_pips = read_spread_blocking(broker, instrument, pip_size)?;
+    resolve_mw_trade_with_spread(
+        args,
+        roles,
+        instrument,
+        account,
+        broker,
+        pip_size,
+        spread_pips,
+    )
+}
+
+/// Cheap, offline guards every M/W arm needs before the live spread
+/// read: exactly 3 path anchors and a trade-expiry line. Run first so a
+/// fat-fingered chart fails without a network round-trip.
+fn check_mw_required(roles: &Roles) -> std::result::Result<(), ResolveError> {
     let path = roles
         .mw_path
         .as_ref()
         .ok_or_else(|| eyre!("resolve_mw_trade called without an mw_path"))?;
-    // The path must carry exactly 3 anchors [A, B, C] (is_mw_path
-    // enforces this at classification, but be defensive).
     if path.points.len() != 3 {
         return Err(ResolveError::Reject(format!(
             "M/W path must have exactly 3 anchors [A runup-start, B first-point, C neckline]; \
@@ -483,14 +507,28 @@ fn resolve_mw_trade(
             "missing required drawing for M/W:\n  - vertical_line labeled 'trade-expiry'\n".into(),
         ));
     }
-    let spread_pips = args.spread_pips.ok_or_else(|| {
-        ResolveError::Reject(
-            "M/W setups require --spread-pips <pips> (the arm-time broker spread baked into the \
-             enter intent; live spread read lands in a later release)\n"
-                .into(),
-        )
-    })?;
+    Ok(())
+}
 
+/// Pure M/W resolution given an already-read `spread_pips`: direction
+/// from the anchors, structure + neckline-depth gates, then bakes the
+/// static `MwSpec`. No I/O — the live spread read happens in the
+/// [`resolve_mw_trade`] wrapper. Unit-tested directly.
+#[allow(clippy::too_many_arguments)]
+fn resolve_mw_trade_with_spread(
+    args: &Args,
+    roles: &Roles,
+    instrument: &str,
+    account: &str,
+    broker: Broker,
+    pip_size: f64,
+    spread_pips: f64,
+) -> std::result::Result<(Direction, cli::TradeSpec), ResolveError> {
+    check_mw_required(roles)?;
+    let path = roles
+        .mw_path
+        .as_ref()
+        .ok_or_else(|| eyre!("resolve_mw_trade_with_spread called without an mw_path"))?;
     let runup_start = path.points[0].price;
     let first_point = path.points[1].price;
     let neckline = path.points[2].price;
@@ -537,6 +575,29 @@ fn resolve_mw_trade(
         },
     );
     Ok((direction, spec))
+}
+
+/// Read the live broker spread (in pips) on a short-lived runtime.
+///
+/// `resolve_mw_trade` is sync (it's called from the sync `run`), but the
+/// broker reads are async — so we spin a throwaway tokio runtime here,
+/// the same bridge `auto_draw_calendar_lines` uses for its calendar
+/// fetch. Any read failure (no token, network error, market closed,
+/// degenerate spread) surfaces as a `Fatal` resolve error carrying the
+/// actionable message from `spread::read_spread_pips`.
+fn read_spread_blocking(
+    broker: Broker,
+    instrument: &str,
+    pip_size: f64,
+) -> std::result::Result<f64, ResolveError> {
+    let runtime = tokio::runtime::Runtime::new()
+        .context("starting tokio runtime for live spread read")
+        .map_err(ResolveError::Fatal)?;
+    runtime
+        .block_on(crate::spread::read_spread_pips(
+            broker, instrument, pip_size,
+        ))
+        .map_err(ResolveError::Fatal)
 }
 
 /// The static M/W geometry baked into the signed enter intent — a
@@ -1411,8 +1472,13 @@ mod tests {
         }
     }
 
+    /// A representative arm-time spread (1 pip) the pure resolver bakes.
+    /// The live read that produces this in `run` is exercised separately
+    /// (the `spread` module's own tests + the demo protocol), not here.
+    const SPREAD: f64 = 1.0;
+
     fn mw_args(extra: &[&str]) -> Args {
-        let mut argv = vec!["tv-arm", "--spread-pips", "1.0"];
+        let mut argv = vec!["tv-arm"];
         argv.extend_from_slice(extra);
         Args::try_parse_from(argv).expect("parse mw args")
     }
@@ -1425,20 +1491,27 @@ mod tests {
         }
     }
 
+    /// Drive the pure resolver with an injected spread — what the tests
+    /// use in place of `resolve_mw_trade` (which now reads the spread
+    /// live over the network).
+    fn resolve(
+        args: &Args,
+        roles: &Roles,
+        instrument: &str,
+        broker: Broker,
+        catalog_pip: f64,
+    ) -> std::result::Result<(Direction, cli::TradeSpec), ResolveError> {
+        let pip_size = args.pip_size.unwrap_or(catalog_pip);
+        resolve_mw_trade_with_spread(args, roles, instrument, "ms-tn-1", broker, pip_size, SPREAD)
+    }
+
     #[test]
     fn resolve_mw_m_is_short_and_bakes_geometry() {
         // Worked M: A=1.1000, B=1.1200, C=1.1120 → pct 0.40 (needs flag).
         // No --pip-size, so the catalog pip (passed here) is baked.
         let roles = mw_roles(path("p", [1.1000, 1.1200, 1.1120]));
         let args = mw_args(&["--allow-50-pct-m-trades"]);
-        let (dir, spec) = match resolve_mw_trade(
-            &args,
-            &roles,
-            "EUR_USD",
-            "ms-tn-1",
-            Broker::TradeNation,
-            0.0001,
-        ) {
+        let (dir, spec) = match resolve(&args, &roles, "EUR_USD", Broker::TradeNation, 0.0001) {
             Ok(v) => v,
             Err(_) => panic!("expected Ok"),
         };
@@ -1450,7 +1523,8 @@ mod tests {
         assert!((mw.neckline - 1.1120).abs() < 1e-9);
         assert!((mw.first_point - 1.1200).abs() < 1e-9);
         assert!((mw.runup_start - 1.1000).abs() < 1e-9);
-        assert!((mw.spread_pips - 1.0).abs() < 1e-9);
+        // The injected live spread flows through to the baked intent.
+        assert!((mw.spread_pips - SPREAD).abs() < 1e-9);
         // Catalog pip flows through unchanged.
         assert!((mw.pip_size - 0.0001).abs() < 1e-12);
     }
@@ -1460,15 +1534,8 @@ mod tests {
         // A JPY-like catalog pip of 0.01 is baked when --pip-size is absent.
         let roles = mw_roles(path("p", [1.1000, 1.1200, 1.1180])); // pct 0.10
         let args = mw_args(&[]);
-        let (_dir, spec) = resolve_mw_trade(
-            &args,
-            &roles,
-            "USD_JPY",
-            "ms-tn-1",
-            Broker::TradeNation,
-            0.01,
-        )
-        .expect("ok");
+        let (_dir, spec) =
+            resolve(&args, &roles, "USD_JPY", Broker::TradeNation, 0.01).expect("ok");
         assert!((spec.mw.expect("mw").pip_size - 0.01).abs() < 1e-12);
     }
 
@@ -1477,15 +1544,8 @@ mod tests {
         // --pip-size beats the catalog value passed in.
         let roles = mw_roles(path("p", [1.1000, 1.1200, 1.1180])); // pct 0.10
         let args = mw_args(&["--pip-size", "0.25"]);
-        let (_dir, spec) = resolve_mw_trade(
-            &args,
-            &roles,
-            "EUR_USD",
-            "ms-tn-1",
-            Broker::TradeNation,
-            0.0001,
-        )
-        .expect("ok");
+        let (_dir, spec) =
+            resolve(&args, &roles, "EUR_USD", Broker::TradeNation, 0.0001).expect("ok");
         assert!((spec.mw.expect("mw").pip_size - 0.25).abs() < 1e-12);
     }
 
@@ -1494,15 +1554,8 @@ mod tests {
         // Worked W: A=1.1200, B=1.1000, C=1.1080 → pct 0.40 (needs flag).
         let roles = mw_roles(path("p", [1.1200, 1.1000, 1.1080]));
         let args = mw_args(&["--allow-50-pct-m-trades"]);
-        let (dir, spec) = resolve_mw_trade(
-            &args,
-            &roles,
-            "EUR_USD",
-            "ms-tn-1",
-            Broker::TradeNation,
-            0.0001,
-        )
-        .expect("ok");
+        let (dir, spec) =
+            resolve(&args, &roles, "EUR_USD", Broker::TradeNation, 0.0001).expect("ok");
         assert_eq!(dir, Direction::Long);
         assert_eq!(spec.pattern, cli::TradePattern::W);
     }
@@ -1511,14 +1564,7 @@ mod tests {
     fn resolve_mw_rejects_40_pct_without_flag() {
         let roles = mw_roles(path("p", [1.1000, 1.1200, 1.1120])); // pct 0.40
         let args = mw_args(&[]); // no --allow-50-pct-m-trades
-        match resolve_mw_trade(
-            &args,
-            &roles,
-            "EUR_USD",
-            "ms-tn-1",
-            Broker::TradeNation,
-            0.0001,
-        ) {
+        match resolve(&args, &roles, "EUR_USD", Broker::TradeNation, 0.0001) {
             Err(ResolveError::Reject(msg)) => {
                 assert!(msg.contains("40%"), "msg = {msg}");
                 assert!(msg.contains("--allow-50-pct-m-trades"), "msg = {msg}");
@@ -1528,39 +1574,42 @@ mod tests {
     }
 
     #[test]
-    fn resolve_mw_requires_spread_pips() {
-        let roles = mw_roles(path("p", [1.1000, 1.1200, 1.1180])); // shallow, pct 0.10
-        // No --spread-pips.
-        let args = Args::try_parse_from(["tv-arm"]).expect("parse");
-        match resolve_mw_trade(
-            &args,
-            &roles,
-            "EUR_USD",
-            "ms-tn-1",
-            Broker::TradeNation,
-            0.0001,
-        ) {
-            Err(ResolveError::Reject(msg)) => assert!(msg.contains("--spread-pips"), "msg = {msg}"),
+    fn check_mw_required_rejects_wrong_anchor_count() {
+        // A 2-anchor path fails the cheap guard before any spread read.
+        let roles = Roles {
+            mw_path: Some(Drawing {
+                id: "p".into(),
+                points: vec![
+                    Point {
+                        time: 10,
+                        price: 1.1,
+                    },
+                    Point {
+                        time: 20,
+                        price: 1.12,
+                    },
+                ],
+                properties: Properties { text: None },
+            }),
+            trade_expiry: Some(vline("exp", now().timestamp() + 86_400)),
+            ..Default::default()
+        };
+        match check_mw_required(&roles) {
+            Err(ResolveError::Reject(msg)) => {
+                assert!(msg.contains("exactly 3 anchors"), "msg = {msg}")
+            }
             other => panic!("expected Reject, got {:?}", other.map(|_| ())),
         }
     }
 
     #[test]
-    fn resolve_mw_requires_trade_expiry() {
+    fn check_mw_required_rejects_missing_trade_expiry() {
         let roles = Roles {
             mw_path: Some(path("p", [1.1000, 1.1200, 1.1180])),
             // no trade_expiry
             ..Default::default()
         };
-        let args = mw_args(&[]);
-        match resolve_mw_trade(
-            &args,
-            &roles,
-            "EUR_USD",
-            "ms-tn-1",
-            Broker::TradeNation,
-            0.0001,
-        ) {
+        match check_mw_required(&roles) {
             Err(ResolveError::Reject(msg)) => assert!(msg.contains("trade-expiry"), "msg = {msg}"),
             other => panic!("expected Reject, got {:?}", other.map(|_| ())),
         }
@@ -1571,14 +1620,7 @@ mod tests {
         // retrace deeper than runup: A=1.1120, B=1.1200, C=1.1000.
         let roles = mw_roles(path("p", [1.1120, 1.1200, 1.1000]));
         let args = mw_args(&["--allow-50-pct-m-trades"]);
-        match resolve_mw_trade(
-            &args,
-            &roles,
-            "EUR_USD",
-            "ms-tn-1",
-            Broker::TradeNation,
-            0.0001,
-        ) {
+        match resolve(&args, &roles, "EUR_USD", Broker::TradeNation, 0.0001) {
             Err(ResolveError::Reject(msg)) => assert!(msg.contains("runup leg"), "msg = {msg}"),
             other => panic!("expected Reject, got {:?}", other.map(|_| ())),
         }

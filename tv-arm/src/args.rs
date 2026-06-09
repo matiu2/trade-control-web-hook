@@ -149,15 +149,6 @@ pub struct Args {
     #[arg(long)]
     pub allow_50_pct_m_trades: bool,
 
-    /// (M/W only, TEMPORARY) Broker spread in pips, baked into the
-    /// enter intent so the worker can mid→bid/ask correct the
-    /// stop-entry/SL/TP at fill time. Required when arming an M/W path
-    /// until the live broker-spread read lands (see commit 10); ignored
-    /// for H&S. The worker has no live spread at entry, so this is the
-    /// spread captured at arm time.
-    #[arg(long)]
-    pub spread_pips: Option<f64>,
-
     /// (M/W only) Override the instrument pip size baked into the enter
     /// intent. When omitted, the pip size comes from `instrument-lookup`
     /// (`asset.pip_size`) — the canonical per-instrument value (0.0001
@@ -219,21 +210,13 @@ mod tests {
     fn mw_flags_default_off_and_parse() {
         let args = Args::try_parse_from(["tv-arm"]).expect("parse");
         assert!(!args.allow_50_pct_m_trades);
-        assert_eq!(args.spread_pips, None);
         // No --pip-size → None → pipeline uses the catalog pip_size.
         assert_eq!(args.pip_size, None);
 
-        let args = Args::try_parse_from([
-            "tv-arm",
-            "--allow-50-pct-m-trades",
-            "--spread-pips",
-            "0.8",
-            "--pip-size",
-            "0.01",
-        ])
-        .expect("parse mw flags");
+        let args =
+            Args::try_parse_from(["tv-arm", "--allow-50-pct-m-trades", "--pip-size", "0.01"])
+                .expect("parse mw flags");
         assert!(args.allow_50_pct_m_trades);
-        assert_eq!(args.spread_pips, Some(0.8));
         assert_eq!(args.pip_size, Some(0.01));
     }
 

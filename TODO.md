@@ -90,7 +90,23 @@ Commits (each tested, clippy+fmt green):
   tv-arm tests (12 new), clippy+fmt clean; cli green. NOTE: the M/W enter still
   bakes args.pip_size (default 0.0001) — wiring it to read instrument-lookup's
   new tick_size is the pip-size project below, NOT done here.
-- [ ] 10. tv-arm — live broker spread read (replaces required --spread-pips)
+- [x] 10. tv-arm — live broker spread read (replaces required --spread-pips).
+  New `tv-arm/src/spread.rs`: `read_spread_pips(broker, instrument, pip_size)`
+  reads live bid/ask and returns spread/pip_size. OANDA via `get_pricing`
+  (token from OANDA_TOKEN|OANDA_API_KEY, first account from `get_accounts` —
+  spread is account-agnostic; `PriceTick::best_bid/best_ask`). TradeNation via
+  `TradeNationClient::new_demo().resolve_market(name)` → market_id, then the
+  unauthenticated `ohlcv::latest_bid_ask(&reqwest::Client, market_id)`.
+  Non-finite / zero / inverted spread = hard error (market closed / stale feed).
+  **No operator override** — `--spread-pips` REMOVED entirely; a failed read
+  aborts the arm (user decision: "read from broker or hard fail"). pipeline.rs:
+  `resolve_mw_trade` (live wrapper) runs cheap `check_mw_required` guards first,
+  then `read_spread_blocking` (short-lived tokio rt like auto-draw), delegates to
+  pure `resolve_mw_trade_with_spread(.., spread_pips)` (unit-tested w/ injected
+  SPREAD const). Deps added to tv-arm: oanda-client (path), tradenation-api (git
+  tag, native/no-wasm), reqwest 0.12 (rustls-tls, matches ecosystem). 137 tv-arm
+  tests (6 new spread + check_mw_required tests; dropped obsolete
+  requires_spread_pips), clippy+fmt clean; root worker (wasm lib) still checks.
 - [ ] README sync
 - [~] pip-size everywhere (separate project). DONE in instrument-lookup:
   tick_size + decimal_places baked v0.2.0 (TradeNation-sourced, 1223 API /

@@ -3723,6 +3723,8 @@ dependencies = [
  "color-eyre",
  "hex",
  "instrument-lookup",
+ "oanda-client",
+ "reqwest 0.12.28",
  "serde",
  "serde_json",
  "serde_yaml",
@@ -3735,6 +3737,7 @@ dependencies = [
  "trade-control-cli",
  "trade-control-conventions",
  "trade-control-core",
+ "tradenation-api 0.1.0 (git+https://github.com/matiu2/tradenation-api.git?tag=broker-tradenation-v0.7.0)",
  "trading-view",
 ]
 

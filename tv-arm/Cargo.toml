@@ -10,6 +10,8 @@ clap_complete = "4.6.5"
 color-eyre = "0.6.5"
 hex = "0.4.3"
 instrument-lookup = { version = "0.3", path = "../../instrument-lookup" }
+oanda-client = { version = "0.1.4", path = "../../oanda-client" }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
 serde_yaml = "0.9.34"
@@ -21,6 +23,7 @@ trade-calendar-maker = { version = "0.1.0", path = "../../../trade-calendar-make
 trade-control-cli = { version = "0.1.0", path = "../cli" }
 trade-control-conventions = { version = "0.1.0", path = "../conventions" }
 trade-control-core = { version = "0.1.0", path = "../core" }
+tradenation-api = { git = "https://github.com/matiu2/tradenation-api.git", tag = "broker-tradenation-v0.7.0", version = "0.1.0" }
 trading-view = { version = "0.1.0", path = "../trading-view" }
 
 [dev-dependencies]
