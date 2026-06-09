@@ -3,11 +3,20 @@
 //! re-publishes the script with reordered plots, this file is the
 //! single update point across the stack.
 //!
-//! Current shape (v2, 2026-05-26+):
+//! Current shape (v2.4, 2026-06-09+):
 //! - `plot_0..plot_9` — the 8 `signal_*` latches plus
 //!   `recent_high` / `recent_low` for SL anchoring.
-//! - `plot_10` — `Long Pattern` alertcondition.
-//! - `plot_11` — `Short Pattern` alertcondition.
+//! - `plot_10..plot_14` — the 5 `next_candle_timestamp_1..5` plots
+//!   (added in v2.3). These sit *before* the alertconditions and push
+//!   every alertcondition index up by 5.
+//! - `plot_15` — `Long Pattern` alertcondition.
+//! - `plot_16` — `Short Pattern` alertcondition.
+//! - `plot_17` — `Every Bar Close` alertcondition.
+//!
+//! `alertcondition()` shares the `plot_N` namespace with `plot()` and
+//! is indexed in source order, so any `plot()` added ahead of the
+//! alertconditions shifts these indices. (v2.3's 5 timestamp plots are
+//! exactly why these are 15/16/17 and not 10/11/12.)
 
 /// Pine study title as it appears in TradingView's data-source list.
 pub const PINE_INDICATOR_NAME: &str = "Candle Signals";
@@ -15,12 +24,12 @@ pub const PINE_INDICATOR_NAME: &str = "Candle Signals";
 /// Plot ID for the "Long Pattern" alertcondition. Used as the entry
 /// trigger on long trades and as the close-on-reversal trigger on
 /// short trades.
-pub const PLOT_LONG_PATTERN: &str = "plot_10";
+pub const PLOT_LONG_PATTERN: &str = "plot_15";
 
 /// Plot ID for the "Short Pattern" alertcondition. Used as the entry
 /// trigger on short trades and as the close-on-reversal trigger on
 /// long trades.
-pub const PLOT_SHORT_PATTERN: &str = "plot_11";
+pub const PLOT_SHORT_PATTERN: &str = "plot_16";
 
 /// Plot ID for the "Every Bar Close" alertcondition (Pine v2.4+). This
 /// fires every closed bar carrying only TradingView built-ins
@@ -32,12 +41,12 @@ pub const PLOT_SHORT_PATTERN: &str = "plot_11";
 /// The id follows the same declaration-order indexing as
 /// [`PLOT_LONG_PATTERN`]/[`PLOT_SHORT_PATTERN`]: "Every Bar Close" is
 /// declared immediately after the two pattern alertconditions, so it is
-/// the next slot (`plot_12`). Verify against a live chart with a dry
+/// the next slot (`plot_17`). Verify against a live chart with a dry
 /// `tv-arm` build after republishing the v2.4 study (the
 /// `next_candle_timestamp` plots that landed in v2.3 sit *before* these,
 /// so a stale-study mismatch surfaces as a "condition not found" on the
 /// 05-enter alert — re-check this constant first if that happens).
-pub const PLOT_EVERY_BAR_CLOSE: &str = "plot_12";
+pub const PLOT_EVERY_BAR_CLOSE: &str = "plot_17";
 
 /// Trade direction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -119,14 +128,14 @@ mod tests {
 
     #[test]
     fn entry_plot_matches_direction() {
-        assert_eq!(entry_plot_for(Direction::Long), "plot_10");
-        assert_eq!(entry_plot_for(Direction::Short), "plot_11");
+        assert_eq!(entry_plot_for(Direction::Long), "plot_15");
+        assert_eq!(entry_plot_for(Direction::Short), "plot_16");
     }
 
     #[test]
     fn reversal_close_plot_inverts() {
-        assert_eq!(reversal_close_plot_for(Direction::Long), "plot_11");
-        assert_eq!(reversal_close_plot_for(Direction::Short), "plot_10");
+        assert_eq!(reversal_close_plot_for(Direction::Long), "plot_16");
+        assert_eq!(reversal_close_plot_for(Direction::Short), "plot_15");
     }
 
     #[test]

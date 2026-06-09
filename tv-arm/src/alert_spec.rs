@@ -675,14 +675,14 @@ mod tests {
                 indicator_name,
                 ..
             } => {
-                assert_eq!(alert_cond_id, "plot_11");
+                assert_eq!(alert_cond_id, "plot_16");
                 assert_eq!(indicator_name, "Candle Signals");
             }
             _ => panic!("expected PineAlertcondition for short enter"),
         }
         match p_long {
             AlertPayload::PineAlertcondition { alert_cond_id, .. } => {
-                assert_eq!(alert_cond_id, "plot_10");
+                assert_eq!(alert_cond_id, "plot_15");
             }
             _ => panic!("expected PineAlertcondition for long enter"),
         }
@@ -703,7 +703,7 @@ mod tests {
         .unwrap();
         if let AlertPayload::PineAlertcondition { alert_cond_id, .. } = p {
             // Short trade closes on a Long Pattern reversal.
-            assert_eq!(alert_cond_id, "plot_10");
+            assert_eq!(alert_cond_id, "plot_15");
         } else {
             panic!("expected PineAlertcondition");
         }
@@ -900,7 +900,7 @@ mod tests {
             .unwrap();
         let v = serde_json::to_value(&p).unwrap();
         assert_eq!(v["kind"], "pine_alertcondition");
-        assert_eq!(v["alert_cond_id"], "plot_11");
+        assert_eq!(v["alert_cond_id"], "plot_16");
         assert_eq!(v["indicator_name"], "Candle Signals");
         assert_eq!(v["frequency"], "on_bar_close");
     }
@@ -1037,7 +1037,7 @@ mod tests {
     fn mw_enter_binds_to_every_bar_close_not_pattern_plot() {
         let roles = roles_with_m_path();
         let ctx = DispatchContext::default();
-        // M is short; H&S short enter would bind to plot_11, but the M/W
+        // M is short; H&S short enter would bind to plot_16, but the M/W
         // enter must bind to the "Every Bar Close" alertcondition.
         let p = build_alert_spec("05-enter.yaml", Direction::Short, &roles, &ctx, true)
             .unwrap()
@@ -1049,7 +1049,7 @@ mod tests {
                 frequency,
                 ..
             } => {
-                assert_eq!(alert_cond_id, "plot_12");
+                assert_eq!(alert_cond_id, "plot_17");
                 assert_eq!(indicator_name, "Candle Signals");
                 assert_eq!(frequency, Frequency::OnBarClose);
             }
@@ -1067,7 +1067,7 @@ mod tests {
             .unwrap()
             .unwrap();
         if let AlertPayload::PineAlertcondition { alert_cond_id, .. } = p {
-            assert_eq!(alert_cond_id, "plot_11");
+            assert_eq!(alert_cond_id, "plot_16");
         } else {
             panic!("expected PineAlertcondition, got {p:?}");
         }

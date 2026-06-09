@@ -76,6 +76,13 @@ Commits (each tested, clippy+fmt green):
   declaration-order ASSUMPTION (next_candle_timestamp plots shifted indices in
   v2.3) — verify on a live chart in the commit-9 dry build; mismatch shows as
   "condition not found" on 05-enter.
+  RESOLVED 2026-06-09: the assumption was wrong. The 5 v2.3
+  `next_candle_timestamp_1..5` plots sit between `recent_low` (plot_9) and the
+  alertconditions, so the two pattern alertconditions are `plot_15`/`plot_16`
+  and Every Bar Close is `plot_17` — not 10/11/12. A live `tv-arm` run failed
+  05-enter + 06-close-on-reversal with `err.code="general"` (the catch-all TV
+  returns when an alertcondition plot index doesn't resolve). Fixed the three
+  conventions consts + tests.
 - [x] 9. tv-arm args+pipeline. args.rs: --allow-50-pct-m-trades, --spread-pips
   (temp, Option), --pip-size (temp, default 0.0001). pipeline.rs: `run` step 3
   now dispatches on `roles.mw_path.is_some()` to `resolve_mw_trade` vs
