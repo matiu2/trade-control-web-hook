@@ -172,6 +172,29 @@ On the Python side: `--risk-amount` adds `risk_amount: <n>` to the spec;
 `--broker-dry-run` adds `dry_run: true`. The Python `--dry-run` flag is
 unrelated — that one short-circuits before any POST to TradingView.
 
+### Pip size is baked into the enter intent, not looked up by the worker
+
+Since 2026-06 the worker does **not** consult `instrument-lookup` (it's
+WASM, no catalog linked) and no longer relies on the
+`PIP_SIZE_<instrument>` secret as the *source of truth*. `tv-arm` reads
+`asset.pip_size` from `instrument-lookup` at arm time and bakes it onto the
+signed enter intent:
+
+- **Top-level `Intent.pip_size: Option<f64>`** — set for **both** H&S and
+  M/W enters. The worker reads this first (`run_enter`, `src/lib.rs`);
+  `pip_size_for` (secret → `0.0001` default) is only the fallback for
+  intents with no baked value.
+- **`MwParams.pip_size`** — M/W also carries pip inside `mw` (its
+  mid-correct resolution reads that copy directly). `tv-arm`/the cli set
+  both fields to the same number, so don't "fix" one without the other.
+
+`pip_size` is a signed field (whole-body HMAC), so a baked value can't be
+tampered. It's also bound into gate scripts as the `pip_size` variable
+(`core/src/rules.rs`). The catalog itself: indices report `pip_size = 1.0`
+(the sizing point), *not* their sub-point tick — see the
+`[[pip_size_vs_tick_size]]` memory and the `instrument-lookup` fix. Don't
+reintroduce a worker-side pip lookup or a tick-derived index pip.
+
 ## Conventions
 
 - The Rust side follows the parent's CLAUDE.md (2024 edition, no

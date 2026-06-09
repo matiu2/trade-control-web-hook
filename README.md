@@ -231,9 +231,24 @@ cooldown_hours: 12                     # only used by "invalidate"
 ```
 
 `take_profit` can also be `{ from: high, offset_pips: 50 }` for a fixed
-anchored TP. `offset_pips` is in instrument pip units; the default pip size is
-0.0001 (good for major FX), override per instrument with the `PIP_SIZE_<NAME>`
-secret (e.g. `PIP_SIZE_USD_JPY=0.01`).
+anchored TP. `offset_pips` is in instrument pip units, scaled by the
+instrument's pip size to a price.
+
+**Pip size precedence.** The worker resolves the pip size from, in order:
+
+1. the **`pip_size`** field baked into the signed enter intent — `tv-arm`
+   sets this from `instrument-lookup` (`asset.pip_size`) for both H&S and
+   M/W enters, so JPY pairs (`0.01`) and indices (`1.0`) size correctly
+   without any per-instrument config. This is the authority and is covered
+   by the signature (tampering it fails verification);
+2. the **`PIP_SIZE_<INSTRUMENT>`** secret — an explicit operator override /
+   fallback for intents armed outside `tv-arm`;
+3. the **`0.0001`** forex default — last resort.
+
+When you arm through `tv-arm` you no longer need to set `PIP_SIZE_` secrets
+for JPY pairs or indices; the correct pip is baked in. The baked `pip_size`
+is also bound as a variable in gate scripts (`allow_entry`, `min_r`,
+`risk_pct`, …) alongside `entry_price`, `r_multiple`, etc.
 
 **Stop vs limit entries:** a `stop` order fills when price moves *through*
 the level (breakout: long stops sit *above* current price, short stops
@@ -646,7 +661,7 @@ within its window won't double-fire.
 | `TN_ACCOUNT_<NAME>` | for TradeNation | Per-account credentials blob (JSON-serialised `Credentials::TradeNation`). `<NAME>` is the operator-friendly account name uppercased with `-` → `_`. Managed via `trade-control account add` — set this secret per account, the worker logs in on demand and caches the session in KV. See "TradeNation session" below. |
 | `MAX_RISK_PCT_PER_TRADE` | no | Hard cap on requested `risk_pct`. Default `1.0`. |
 | `MAX_OPEN_POSITIONS` | no | Max concurrent open positions. Default `3`. |
-| `PIP_SIZE_<INSTRUMENT>` | no | Override pip size, e.g. `PIP_SIZE_USD_JPY=0.01`. Default `0.0001`. |
+| `PIP_SIZE_<INSTRUMENT>` | no | Override / fallback pip size, e.g. `PIP_SIZE_USD_JPY=0.01`. Used only when the enter intent carries no baked `pip_size` (intents armed through `tv-arm` always do). Default `0.0001`. |
 
 The previous `ENCRYPTION_KEY` and `AUTH_TOKEN` secrets are no longer
 used — `SIGNING_KEY` replaces both. After deploying, run
@@ -1081,8 +1096,11 @@ treated as a miss.
 - **Cross-currency pip values** are not handled — position sizing assumes the
   account currency equals the instrument's quote currency. Stick to majors
   where that holds (e.g. USD account + `*_USD` pairs) until generalised.
-- **Pip size** has a single global default of 0.0001 with per-instrument
-  overrides via `PIP_SIZE_<NAME>`. Set overrides for JPY pairs and indices.
+- **Pip size** is baked into the signed enter intent by `tv-arm` (from
+  `instrument-lookup`), so JPY pairs and indices size correctly with no
+  config. The `PIP_SIZE_<NAME>` secret is now only an override/fallback for
+  intents armed outside `tv-arm`; the `0.0001` global default is the last
+  resort. See "Pip size precedence" above.
 
 ## Self-hosting
 

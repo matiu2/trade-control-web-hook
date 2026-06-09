@@ -271,6 +271,7 @@ fn build_pause_intent(
         // grepping the matching pause).
         reason: spec.reason.clone(),
         mw: None,
+        pip_size: None,
     }
 }
 

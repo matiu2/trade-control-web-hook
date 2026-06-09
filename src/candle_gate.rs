@@ -128,6 +128,7 @@ mod tests {
             sr_bands: Vec::new(),
             reason: None,
             mw: None,
+            pip_size: None,
         }
     }
 

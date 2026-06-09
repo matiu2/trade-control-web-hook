@@ -137,7 +137,17 @@ pub fn run(args: Args) -> Result<i32> {
             resolved.asset.pip_size,
         )
     } else {
-        resolve_hs_trade(&args, &roles, &instrument, &account, broker)
+        // Bake the canonical instrument-lookup pip onto the H&S enter so
+        // the worker scales offset_pips correctly (JPY/indices in
+        // particular); --pip-size overrides for the rare non-catalog case.
+        resolve_hs_trade(
+            &args,
+            &roles,
+            &instrument,
+            &account,
+            broker,
+            resolved.asset.pip_size,
+        )
     };
     let (direction, trade_spec) = match resolved_spec {
         Ok(ds) => ds,
@@ -426,6 +436,7 @@ fn resolve_hs_trade(
     instrument: &str,
     account: &str,
     broker: Broker,
+    catalog_pip: f64,
 ) -> std::result::Result<(Direction, cli::TradeSpec), ResolveError> {
     if let Err(msg) = check_required(roles, args) {
         return Err(ResolveError::Reject(msg));
@@ -444,8 +455,10 @@ fn resolve_hs_trade(
         .ok_or_else(|| eyre!("missing tp_fib (already checked by check_required)"))?;
     let tp = tp_price_from_fib(&tp_fib.prices(), direction);
     let expiry = read_trade_expiry(roles)?;
+    // --pip-size overrides the canonical catalog value when set.
+    let pip_size = args.pip_size.unwrap_or(catalog_pip);
     let spec = build_trade_spec(
-        args, instrument, account, broker, direction, expiry, tp, roles,
+        args, instrument, account, broker, direction, expiry, tp, roles, pip_size,
     );
     Ok((direction, spec))
 }
@@ -700,6 +713,9 @@ fn build_mw_trade_spec(
             spread_pips: anchors.spread_pips,
             pip_size: anchors.pip_size,
         }),
+        // Mirror the M/W pip onto the top-level field (the cli M/W builder
+        // also does this); keeps the worker's sizing tail on the baked pip.
+        pip_size: Some(anchors.pip_size),
     }
 }
 
@@ -850,6 +866,7 @@ fn build_trade_spec(
     expiry: DateTime<Utc>,
     tp: f64,
     roles: &Roles,
+    pip_size: f64,
 ) -> cli::TradeSpec {
     use cli::TradePattern;
     let pattern = match direction {
@@ -897,6 +914,9 @@ fn build_trade_spec(
         // H&S path: no M/W static geometry. The M/W branch (commit 9)
         // builds its spec separately, keyed on `roles.mw_path`.
         mw: None,
+        // Baked from instrument-lookup (or --pip-size) so the worker scales
+        // the entry/SL offset_pips with the right pip, not its forex default.
+        pip_size: Some(pip_size),
     };
     if args.sl_from_recent {
         spec.sl_anchor = Some(match direction {
@@ -1527,6 +1547,51 @@ mod tests {
         assert!((mw.spread_pips - SPREAD).abs() < 1e-9);
         // Catalog pip flows through unchanged.
         assert!((mw.pip_size - 0.0001).abs() < 1e-12);
+        // ...and is mirrored onto the top-level spec field.
+        assert_eq!(spec.pip_size, Some(0.0001));
+    }
+
+    #[test]
+    fn build_trade_spec_bakes_catalog_pip_for_hs() {
+        // The H&S spec carries the pip passed to build_trade_spec on its
+        // top-level field (the worker scales offset_pips with it). A
+        // JPY-scale 0.01 must survive, not collapse to the forex default.
+        let args = mw_args(&[]);
+        let spec = build_trade_spec(
+            &args,
+            "USD_JPY",
+            "ms-oanda-1",
+            Broker::Oanda,
+            Direction::Short,
+            now() + chrono::Duration::days(1),
+            150.0,
+            &Roles::default(),
+            0.01,
+        );
+        assert_eq!(spec.pattern, cli::TradePattern::Hs);
+        assert!(spec.mw.is_none());
+        assert_eq!(spec.pip_size, Some(0.01));
+    }
+
+    #[test]
+    fn resolve_hs_pip_size_flag_overrides_catalog() {
+        // --pip-size beats the catalog value on the H&S path too (the
+        // override is applied in resolve_hs_trade before build_trade_spec).
+        let args = mw_args(&["--pip-size", "0.25"]);
+        // Mirror resolve_hs_trade's override step, then build the spec.
+        let pip_size = args.pip_size.unwrap_or(0.0001);
+        let spec = build_trade_spec(
+            &args,
+            "EUR_USD",
+            "ms-oanda-1",
+            Broker::Oanda,
+            Direction::Long,
+            now() + chrono::Duration::days(1),
+            1.05,
+            &Roles::default(),
+            pip_size,
+        );
+        assert_eq!(spec.pip_size, Some(0.25));
     }
 
     #[test]

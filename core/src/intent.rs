@@ -714,6 +714,20 @@ pub struct Intent {
     /// pre-feature intents.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mw: Option<MwParams>,
+    /// Instrument pip size, baked by `tv-arm`/`trade-control` at arm time
+    /// from `instrument-lookup` (`asset.pip_size`): `0.0001` for major FX,
+    /// `0.01` for JPY pairs, `1.0` for indices, etc. When present, the
+    /// worker uses this value to scale every `offset_pips` into a price
+    /// (entry/SL/TP) and binds it into the gate-script scope, instead of
+    /// reading the per-instrument `PIP_SIZE_<instrument>` secret. Absent =
+    /// the worker falls back to that secret, then the forex default —
+    /// keeping the wire form byte-identical to pre-feature intents.
+    ///
+    /// For M/W intents the same value is also carried in
+    /// [`MwParams::pip_size`] (the M/W resolution reads that copy directly);
+    /// `tv-arm` sets both to the same number.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pip_size: Option<f64>,
 }
 
 /// Skip-serializing predicate for [`Intent::max_retries`]. Returns true
@@ -851,6 +865,11 @@ pub enum IntentValidationError {
     /// anchor price was non-finite, `spread_pips` was negative or
     /// non-finite, or `pip_size` was non-positive or non-finite.
     MwFieldInvalid,
+    /// The top-level `pip_size` was present but non-positive or
+    /// non-finite. A baked pip drives every `offset_pips`→price scale, so
+    /// a zero/negative/NaN value would silently zero or invert the trade
+    /// geometry.
+    PipSizeInvalid,
 }
 
 impl core::fmt::Display for IntentValidationError {
@@ -914,6 +933,7 @@ impl core::fmt::Display for IntentValidationError {
             Self::MwFieldInvalid => f.write_str(
                 "mw params invalid: anchor prices must be finite, spread_pips >= 0, pip_size > 0",
             ),
+            Self::PipSizeInvalid => f.write_str("pip_size must be finite and > 0"),
         }
     }
 }
@@ -1067,6 +1087,15 @@ impl Intent {
             if !(anchors_finite && spread_ok && pip_ok) {
                 return Err(IntentValidationError::MwFieldInvalid);
             }
+        }
+        // Top-level baked pip: if present it scales every offset_pips into
+        // a price, so a zero/negative/NaN value would silently zero or
+        // invert the geometry. Independent of `mw` (which validates its
+        // own copy above) — a non-M/W enter carries pip here.
+        if let Some(pip) = self.pip_size
+            && !(pip.is_finite() && pip > 0.0)
+        {
+            return Err(IntentValidationError::PipSizeInvalid);
         }
         Ok(())
     }
@@ -3259,5 +3288,88 @@ mod tests {
         let out = serde_yaml::to_string(&intent).unwrap();
         let back: Intent = serde_yaml::from_str(&out).unwrap();
         assert_eq!(intent.mw, back.mw);
+    }
+
+    /// A plain H&S enter with a baked top-level `pip_size`. No `mw` block.
+    fn pip_size_enter_yaml() -> &'static str {
+        "
+            v: 1
+            id: hs-usdjpy-abc
+            not_after: \"2026-05-13T20:00:00Z\"
+            action: enter
+            instrument: USD_JPY
+            direction: long
+            entry: { type: stop, from: high, offset_pips: 1.0 }
+            stop_loss: { from: low, offset_pips: -1.0 }
+            take_profit: { absolute: 152.0 }
+            pip_size: 0.01
+        "
+    }
+
+    #[test]
+    fn validate_accepts_top_level_pip_size() {
+        let intent: Intent = serde_yaml::from_str(pip_size_enter_yaml()).unwrap();
+        assert_eq!(intent.pip_size, Some(0.01));
+        intent.validate().unwrap();
+    }
+
+    #[test]
+    fn validate_rejects_zero_pip_size() {
+        let yaml = pip_size_enter_yaml().replace("pip_size: 0.01", "pip_size: 0.0");
+        let intent: Intent = serde_yaml::from_str(&yaml).unwrap();
+        assert_eq!(
+            intent.validate(),
+            Err(IntentValidationError::PipSizeInvalid)
+        );
+    }
+
+    #[test]
+    fn validate_rejects_negative_pip_size() {
+        let yaml = pip_size_enter_yaml().replace("pip_size: 0.01", "pip_size: -0.01");
+        let intent: Intent = serde_yaml::from_str(&yaml).unwrap();
+        assert_eq!(
+            intent.validate(),
+            Err(IntentValidationError::PipSizeInvalid)
+        );
+    }
+
+    #[test]
+    fn validate_rejects_nan_pip_size() {
+        let yaml = pip_size_enter_yaml().replace("pip_size: 0.01", "pip_size: .nan");
+        let intent: Intent = serde_yaml::from_str(&yaml).unwrap();
+        assert_eq!(
+            intent.validate(),
+            Err(IntentValidationError::PipSizeInvalid)
+        );
+    }
+
+    #[test]
+    fn pip_size_elided_when_none() {
+        // A pip-less intent must serialise byte-identically to pre-feature
+        // intents — no `pip_size:` key at all.
+        let yaml = "
+            v: 1
+            id: hs-eurusd-abc
+            not_after: \"2026-05-13T20:00:00Z\"
+            action: enter
+            instrument: EUR_USD
+            direction: long
+            entry: { type: market }
+        ";
+        let intent: Intent = serde_yaml::from_str(yaml).unwrap();
+        assert!(intent.pip_size.is_none());
+        let out = serde_yaml::to_string(&intent).unwrap();
+        assert!(
+            !out.contains("pip_size:"),
+            "pip_size key leaked into wire form:\n{out}"
+        );
+    }
+
+    #[test]
+    fn pip_size_round_trips() {
+        let intent: Intent = serde_yaml::from_str(pip_size_enter_yaml()).unwrap();
+        let out = serde_yaml::to_string(&intent).unwrap();
+        let back: Intent = serde_yaml::from_str(&out).unwrap();
+        assert_eq!(intent.pip_size, back.pip_size);
     }
 }

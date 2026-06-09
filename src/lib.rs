@@ -1013,7 +1013,15 @@ async fn run_enter<B: Broker>(
 
     let worker_max_risk_pct = secret_or_default(env, MAX_RISK_PCT_PER_TRADE_SECRET, 1.0);
     let worker_max_open_positions = secret_or_default(env, MAX_OPEN_POSITIONS_SECRET, 3.0) as u32;
-    let pip_size = pip_size_for(env, &verified.intent.instrument);
+    // Pip size precedence: the value baked into the signed intent at arm
+    // time (the authority — `tv-arm` reads it from `instrument-lookup`) wins;
+    // a missing field falls back to the per-instrument `PIP_SIZE_<instrument>`
+    // secret, then the forex default. The fallback keeps any pre-baked
+    // in-flight intent resolving during rollout. See `pip_size_for`.
+    let pip_size = verified
+        .intent
+        .pip_size
+        .unwrap_or_else(|| pip_size_for(env, &verified.intent.instrument));
 
     let resolved = match Resolved::from_intent(&verified.intent, &verified.shell, pip_size) {
         Ok(r) => r,
@@ -2225,6 +2233,12 @@ fn secret_or_default(env: &Env, name: &str, default: f64) -> f64 {
 
 /// Pip size for an instrument. Override via `PIP_SIZE_<INSTRUMENT>` secret
 /// (e.g. `PIP_SIZE_USD_JPY=0.01`). Indices like SPX500_USD also need overrides.
+/// Fallback pip size when the signed intent carries no baked `pip_size`
+/// (steps 2–3 of the precedence in `run_enter`): the per-instrument
+/// `PIP_SIZE_<instrument>` secret, then the forex `DEFAULT_PIP_SIZE`. The
+/// baked `intent.pip_size` is the primary source and is preferred at the
+/// call site — this is only reached for intents armed before pip-baking
+/// landed, or armed outside `tv-arm`.
 fn pip_size_for(env: &Env, instrument: &str) -> f64 {
     let key = format!("{PIP_SIZE_SECRET_PREFIX}{instrument}");
     get_secret(&key, env)
@@ -2563,6 +2577,7 @@ mod dispatcher_outcome_tests {
                 sr_bands: Vec::new(),
                 reason: None,
                 mw: None,
+                pip_size: None,
             },
         }
     }

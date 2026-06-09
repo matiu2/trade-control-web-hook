@@ -724,6 +724,20 @@ mod tests {
     }
 
     #[test]
+    fn derived_binds_pip_size_for_scripts() {
+        // pip_size is visible to gate scripts (allow_entry / min_r / …).
+        // The bound value is whatever the worker resolves — the baked
+        // intent.pip_size when present. A JPY-scale 0.01 must reach the
+        // script verbatim, not the forex default.
+        let engine = build_engine();
+        let mut scope = Scope::new();
+        bind_shell_anchors(&mut scope, &shell_full());
+        bind_intent_derived(&mut scope, &resolved_long_market(), 0.01);
+        let v: f64 = eval_script(&engine, &mut scope, &CompiledScript::new("pip_size")).unwrap();
+        assert!((v - 0.01).abs() < 1e-12);
+    }
+
+    #[test]
     fn derived_distances_always_positive_for_long() {
         let engine = build_engine();
         let mut scope = Scope::new();

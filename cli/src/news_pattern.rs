@@ -253,6 +253,7 @@ fn build_news_intent(
         sr_bands: Vec::new(),
         reason: spec.reason.clone(),
         mw: None,
+        pip_size: None,
     }
 }
 

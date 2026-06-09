@@ -394,6 +394,15 @@ pub struct TradeSpec {
     /// [`MwSpec`] and `core::intent::MwParams`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mw: Option<MwSpec>,
+    /// Instrument pip size, resolved from `instrument-lookup` at arm time
+    /// (`asset.pip_size`) or the `--pip-size` override. Baked onto the
+    /// enter intent's top-level `pip_size` so the worker scales every
+    /// `offset_pips` correctly instead of relying on its forex-default
+    /// fallback. Set for both H&S and M/W; for M/W it matches
+    /// [`MwSpec::pip_size`]. Absent = the worker falls back to its secret /
+    /// default (pre-feature behaviour).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pip_size: Option<f64>,
 }
 
 /// CLI-side mirror of [`trade_control_core::intent::MwParams`]. Kept as a
@@ -756,6 +765,7 @@ fn build_pattern(
         entry_mode: EntryMode::default(),
         sl_anchor: None,
         mw: None,
+        pip_size: None,
     };
     assemble_trade(spec, geometry, entry_offset_pips, sl_offset_pips, now)
 }
@@ -868,6 +878,7 @@ fn assemble_trade(
         spec.needs_golden,
         spec.needs_confirmed,
         &spec.skip_preps,
+        spec.pip_size,
         &spec.broker,
         &spec.account,
     ));
@@ -1125,6 +1136,9 @@ fn build_mw_enter_alert(
     // entry / stop_loss / take_profit deliberately left None — the worker
     // computes all three from `mw` + the shell OHLC (mid-correct).
     intent.mw = Some(mw.to_params());
+    // Carry the same pip on the top-level field so the worker's shared
+    // sizing tail (`pip_size_for`) sees the baked value, not its default.
+    intent.pip_size = Some(mw.pip_size);
     match risk_amount {
         Some(amount) => {
             intent.risk_amount = Some(trade_control_core::tunable::Tunable::Static(amount))
@@ -1287,6 +1301,7 @@ fn skeleton(
         sr_bands: Vec::new(),
         reason: None,
         mw: None,
+        pip_size: None,
     }
 }
 
@@ -1500,6 +1515,7 @@ fn build_enter_alert(
     needs_golden: bool,
     needs_confirmed: bool,
     skip_preps: &[String],
+    pip_size: Option<f64>,
     broker: &BrokerKind,
     account: &str,
 ) -> BuiltAlert {
@@ -1514,6 +1530,9 @@ fn build_enter_alert(
         trade_id,
     );
     intent.direction = Some(geometry.direction);
+    // Baked pip scales the entry/SL offset_pips at the worker; absent =
+    // worker falls back to its secret/default.
+    intent.pip_size = pip_size;
     intent.entry = Some(match entry_mode {
         EntryMode::Stop => EntrySpec::Stop {
             from: geometry.entry_anchor,
@@ -1769,6 +1788,7 @@ mod tests {
                 false,
                 false,
                 &[],
+                None,
                 &BrokerKind::Oanda,
                 "demo",
             ),
@@ -1804,6 +1824,7 @@ mod tests {
                 entry_mode: EntryMode::Stop,
                 sl_anchor: None,
                 mw: None,
+                pip_size: None,
             },
         };
         let manifest = render_manifest(&trade);
@@ -1839,6 +1860,7 @@ mod tests {
             false,
             false,
             &[],
+            None,
             &BrokerKind::Oanda,
             "demo",
         );
@@ -1908,6 +1930,7 @@ mod tests {
             false,
             false,
             &[],
+            None,
             &BrokerKind::Oanda,
             "demo",
         );
@@ -1991,6 +2014,7 @@ mod tests {
             entry_mode: EntryMode::Stop,
             sl_anchor: None,
             mw: None,
+            pip_size: None,
         }
     }
 
@@ -2263,6 +2287,9 @@ mod tests {
         assert!((mw.runup_start - 1.1000).abs() < 1e-9);
         assert!((mw.spread_pips - 1.0).abs() < 1e-9);
         assert!((mw.pip_size - 0.0001).abs() < 1e-9);
+        // The same pip is mirrored onto the top-level field for the
+        // worker's sizing tail.
+        assert_eq!(enter.pip_size, Some(0.0001));
         assert!(enter.entry.is_none());
         assert!(enter.stop_loss.is_none());
         assert!(enter.take_profit.is_none());
@@ -2290,6 +2317,32 @@ mod tests {
         let spec = mw_spec(TradePattern::W, ts("2026-05-25T00:00:00Z"));
         let trade = build_trade_from_spec(spec, now).unwrap();
         assert_eq!(trade.alerts[3].intent.direction, Some(Direction::Long));
+    }
+
+    #[test]
+    fn build_hs_enter_carries_baked_pip_size() {
+        // An H&S enter built from a spec with a baked pip_size carries it
+        // on the top-level field so the worker scales offset_pips with it
+        // instead of its forex default.
+        let now = ts("2026-05-20T00:00:00Z");
+        let mut spec = sample_spec(TradePattern::Hs, ts("2026-05-25T00:00:00Z"));
+        spec.pip_size = Some(0.01); // JPY-scale
+        let trade = build_trade_from_spec(spec, now).unwrap();
+        let enter = &trade.alerts[5].intent;
+        assert_eq!(enter.action, Action::Enter);
+        assert_eq!(enter.pip_size, Some(0.01));
+        enter.validate().expect("hs enter with pip valid");
+    }
+
+    #[test]
+    fn build_hs_enter_omits_pip_size_when_spec_has_none() {
+        // No baked pip → no top-level field → worker falls back to its
+        // secret/default (pre-feature behaviour).
+        let now = ts("2026-05-20T00:00:00Z");
+        let spec = sample_spec(TradePattern::Hs, ts("2026-05-25T00:00:00Z"));
+        assert_eq!(spec.pip_size, None);
+        let trade = build_trade_from_spec(spec, now).unwrap();
+        assert_eq!(trade.alerts[5].intent.pip_size, None);
     }
 
     #[test]

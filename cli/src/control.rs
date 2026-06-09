@@ -65,6 +65,7 @@ fn control_skeleton(action: Action, instrument: &str, id: String, now: DateTime<
         sr_bands: Vec::new(),
         reason: None,
         mw: None,
+        pip_size: None,
     }
 }
 

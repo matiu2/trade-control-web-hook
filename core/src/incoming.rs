@@ -327,6 +327,52 @@ mod tests {
         ));
     }
 
+    /// Build a signed `enter` carrying a baked top-level `pip_size`.
+    fn build_signed_enter_with_pip(pip_size: &str) -> String {
+        let body_without_sig = [
+            "close: 152.000",
+            "high: 152.050",
+            "low: 151.950",
+            "time: \"2026-05-13T12:00:00Z\"",
+            "v: 1",
+            "action: enter",
+            "instrument: USD_JPY",
+            "id: hs-usdjpy-abc",
+            "not_after: \"2026-05-13T20:00:00Z\"",
+            "direction: long",
+            "entry: {\"type\":\"stop\",\"from\":\"high\",\"offset_pips\":1.0}",
+            "stop_loss: {\"from\":\"low\",\"offset_pips\":-1.0}",
+            "take_profit: {\"absolute\":153.0}",
+            &format!("pip_size: {pip_size}"),
+            "",
+        ]
+        .join("\n");
+        let pairs = signed_pairs_from_text(&body_without_sig).unwrap();
+        let sig = crate::sig::sign(&KEY, &pairs).unwrap();
+        format!("{body_without_sig}sig: \"{sig}\"\n")
+    }
+
+    #[test]
+    fn signed_path_pip_size_round_trips() {
+        let yaml = build_signed_enter_with_pip("0.01");
+        let now: DateTime<Utc> = "2026-05-13T12:01:00Z".parse().unwrap();
+        let v = parse_and_verify(&yaml, &KEY, now).unwrap();
+        assert_eq!(v.intent.pip_size, Some(0.01));
+    }
+
+    #[test]
+    fn signed_path_pip_size_tamper_rejected() {
+        // pip_size is a signed value — flipping it after signing (e.g. to
+        // mis-size the trade) must fail verification.
+        let yaml =
+            build_signed_enter_with_pip("0.01").replace("pip_size: 0.01", "pip_size: 0.0001");
+        let now: DateTime<Utc> = "2026-05-13T12:01:00Z".parse().unwrap();
+        assert!(matches!(
+            parse_and_verify(&yaml, &KEY, now),
+            Err(IncomingError::Sig(SigError::Mismatch))
+        ));
+    }
+
     #[test]
     fn signed_path_dropped_shell_key_rejected() {
         let yaml = build_signed_prep("2026-05-13T20:00:00Z", "2026-05-13T12:00:00Z");

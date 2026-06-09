@@ -149,11 +149,12 @@ pub struct Args {
     #[arg(long)]
     pub allow_50_pct_m_trades: bool,
 
-    /// (M/W only) Override the instrument pip size baked into the enter
-    /// intent. When omitted, the pip size comes from `instrument-lookup`
-    /// (`asset.pip_size`) — the canonical per-instrument value (0.0001
-    /// for major FX, 0.01 for JPY pairs and gold, etc.). Pass this only
-    /// to force a non-catalog value; ignored for H&S.
+    /// Override the instrument pip size baked into the enter intent. When
+    /// omitted, the pip size comes from `instrument-lookup`
+    /// (`asset.pip_size`) — the canonical per-instrument value (0.0001 for
+    /// major FX, 0.01 for JPY pairs and gold, 1.0 for indices, etc.).
+    /// Applies to both H&S and M/W enters; pass this only to force a
+    /// non-catalog value.
     #[arg(long)]
     pub pip_size: Option<f64>,
 
