@@ -1,5 +1,66 @@
 # Changelog
 
+## v6 — 2026-06-09 — bake `pip_size` into the signed enter intent
+
+### Why
+
+The worker scales every `offset_pips` into a price with
+`price = anchor + offset_pips * pip_size` and binds `pip_size` into the
+gate-script scope. For H&S enters that pip came from `pip_size_for`: a
+`PIP_SIZE_<instrument>` secret falling back to a forex-shaped `0.0001`
+default — silently 100× wrong for JPY pairs and 10000× wrong for indices
+unless an operator remembered to set the secret. The worker is WASM and
+links no instrument catalog, so it never read the (now-correct)
+`instrument-lookup` pip. M/W already solved this by baking pip into the
+signed `MwParams`; this extends the same approach to H&S and any non-M/W
+enter.
+
+### What changed
+
+- Pip is now baked at arm time and read from the signed intent. Worker
+  precedence (`run_enter`): baked `intent.pip_size` → `PIP_SIZE_<instrument>`
+  secret → `0.0001` default. The fallback keeps pre-baked in-flight intents
+  resolving during rollout.
+- `tv-arm` resolves `asset.pip_size` from `instrument-lookup` for the H&S
+  path too (previously M/W-only) and bakes it; `--pip-size` override now
+  applies to both H&S and M/W.
+- `pip_size` is already a gate-script variable (`allow_entry`, `min_r`, …);
+  the bound value is now the baked pip.
+- No worker-side catalog lookup and no live spread fetch on the hot path —
+  pip arrives baked in the signed message.
+
+### Config
+
+- New optional signed field `pip_size` on the enter intent (top-level).
+  Absent = the worker falls back to the secret/default (pre-feature
+  behaviour); the wire form stays byte-identical when absent.
+- `PIP_SIZE_<INSTRUMENT>` secret is now an override/fallback, no longer the
+  primary source. Arming through `tv-arm` no longer needs per-instrument
+  secrets for JPY pairs or indices.
+- New CLI/`TradeSpec` field `pip_size: Option<f64>`.
+
+### Breaking
+
+- None on the wire (additive optional field). `IntentValidationError` gains
+  a `PipSizeInvalid` variant; `build_enter_alert` (cli, internal) gains a
+  `pip_size` parameter.
+
+### Tests
+
+- core: validate accept/reject (zero/negative/NaN), serde elision +
+  round-trip, signed wire round-trip + tamper-rejection, script-visibility
+  of `pip_size`.
+- cli: H&S enter carries baked pip; omitted when spec has none; M/W enter
+  carries matching top-level + `mw.pip_size`.
+- tv-arm: H&S spec bakes catalog pip; `--pip-size` overrides on H&S.
+- Totals: core 371, cli 233, tv-arm 139, worker 112 — all green; WASM root
+  builds.
+
+### Follow-up
+
+- Once all live intents are armed through the updated `tv-arm`, the
+  `PIP_SIZE_<instrument>` secrets can be dropped.
+
 ## v5 — 2026-06-08 — bar-based pending-order expiry (`expiry_bars`)
 
 ### Why
