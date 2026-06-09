@@ -1,5 +1,32 @@
 # Changelog
 
+## v7 — 2026-06-09 — `--version` reports the git tag/commit
+
+### Why
+
+The CLIs had no useful way to report which build was running. `tv-arm`
+exposed clap's `--version` but it printed the never-bumped crate version
+(`0.1.0`); `trade-control` had no `--version` at all. After a deploy/build
+you want to confirm you're on the version you think you are.
+
+### What changed
+
+- Both `trade-control` and `tv-arm` now report the git tag/commit on
+  `--version`, captured at build time via a `build.rs` running
+  `git describe --tags --dirty --always` (e.g. `tv-arm v7`,
+  `trade-control v7-2-gabc123-dirty`). Falls back to the crate version when
+  git isn't available (source-tarball builds).
+
+### Config / Breaking
+
+- None. Adds a `build.rs` to the `cli` and `tv-arm` crates and a
+  `GIT_VERSION` compile-time env var.
+
+### Tests
+
+- cli 227, tv-arm 139 — green; `--version` verified to print the describe
+  string for both binaries.
+
 ## v6 — 2026-06-09 — bake `pip_size` into the signed enter intent
 
 ### Why

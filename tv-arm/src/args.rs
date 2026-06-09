@@ -37,7 +37,7 @@ impl BrokerArg {
 
 /// Arm a reversal setup from the active TradingView chart.
 #[derive(Debug, Parser)]
-#[command(version, about, long_about = None)]
+#[command(version = env!("GIT_VERSION"), about, long_about = None)]
 pub struct Args {
     /// Broker to target. Defaults to the chart's exchange (also
     /// `TRADE_CONTROL_BROKER` env).

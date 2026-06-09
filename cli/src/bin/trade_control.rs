@@ -44,6 +44,7 @@ use trade_control_core::sig::{self, SIG_FIELD};
 #[derive(Parser)]
 #[command(
     name = "trade-control",
+    version = env!("GIT_VERSION"),
     about = "Sign a trade intent for TradingView and manage worker state"
 )]
 struct Cli {
