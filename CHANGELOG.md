@@ -1,5 +1,63 @@
 # Changelog
 
+## v8 — 2026-06-09 — bind Pine alertconditions by title, not positional `plot_N`
+
+### Why
+
+A live `tv-arm` run failed `05-enter` and `06-close-on-reversal` with
+`err.code="general"` — the catch-all TradingView returns when an
+alertcondition's `plot_N` index doesn't resolve. Root cause: the
+`PLOT_LONG_PATTERN`/`PLOT_SHORT_PATTERN`/`PLOT_EVERY_BAR_CLOSE` constants
+were positional plot indices, and v2.3's five `next_candle_timestamp_1..5`
+plots (added between `recent_low` at plot_9 and the alertconditions) had
+silently shifted the three alertconditions from `plot_10/11/12` to
+`plot_15/16/17`. The constants were never updated, so the alert payloads
+pointed at numeric series instead of alertconditions. The error code is
+identical to a stale-compile-cache, so it masqueraded as the
+"republish the script" case (which it survived).
+
+### What changed
+
+- **Immediate fix:** corrected the three plot constants to `plot_15/16/17`.
+- **Structural fix (the real one):** alertconditions are now bound by their
+  **title** (`"Long Pattern"`, `"Short Pattern"`, `"Every Bar Close"`)
+  rather than a positional `plot_N`. The `tv-arm` JS template resolves the
+  title → live `plot_N` at create time from the study's `metaInfo()`
+  (`metaInfo().plots` filtered to `type === "alertcondition"`,
+  cross-referenced with `metaInfo().styles[id].title`). Adding or removing
+  `plot()` calls in the Pine source can no longer break the binding.
+- A title absent from the published study fails that alert **loudly**,
+  listing the alertcondition titles it did find — no positional fallback
+  (a guessed index is exactly the silent failure this removes).
+- Verified against the live chart: the resolver maps the three titles to
+  `plot_15/16/17`.
+
+### Breaking
+
+- `conventions`: `PLOT_LONG_PATTERN`/`PLOT_SHORT_PATTERN`/
+  `PLOT_EVERY_BAR_CLOSE` and `entry_plot_for`/`reversal_close_plot_for` are
+  removed, replaced by `ALERT_LONG_PATTERN`/`ALERT_SHORT_PATTERN`/
+  `ALERT_EVERY_BAR_CLOSE` (title strings) and `entry_alert_for`/
+  `reversal_close_alert_for`.
+- `tv-arm`: `AlertPayload::PineAlertcondition`'s `alert_cond_id` field is
+  renamed `alert_cond_title`.
+
+### Config
+
+- None. Operators must keep the alertcondition **titles** in
+  `conventions/src/pine.rs` in lockstep with the `alertcondition()` calls
+  in `pine-scripts/candle-signals-v2.pine` — but no longer track plot
+  indices.
+
+### Tests
+
+- conventions 33, tv-arm 139 — green. Renamed the plot-id asserts to
+  title asserts; no positional `plot_N` left in Rust.
+
+### Follow-up
+
+- None outstanding; the plot-index-drift failure class is closed.
+
 ## v7 — 2026-06-09 — `--version` reports the git tag/commit
 
 ### Why
