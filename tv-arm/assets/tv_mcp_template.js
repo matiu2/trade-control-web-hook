@@ -55,7 +55,25 @@ for (const item of payloads) {
               else if (k === 'pineFeatures') pineFeatures = v;
               else if (/^in_\\d+$/.test(k)) inputs[k] = v;
             }
-            return { id: id, inputs: inputs, pineId: pineId, pineVersion: pineVersion, pineFeatures: pineFeatures };
+            // Map alertcondition TITLE -> live plot_N id from the study's
+            // metaInfo, so tv-arm can bind by stable title and survive
+            // plot reordering. metaInfo().plots carries {id, type}; the
+            // alertcondition-typed entries' human title lives in
+            // metaInfo().styles[id].title.
+            var alertTitleToId = {};
+            try {
+              var mi = s.metaInfo();
+              var mplots = (mi && mi.plots) || [];
+              var mstyles = (mi && mi.styles) || {};
+              for (var pi = 0; pi < mplots.length; pi++) {
+                var pl = mplots[pi];
+                if (!pl || pl.type !== 'alertcondition') continue;
+                var st = mstyles[pl.id];
+                var ttl = st && st.title;
+                if (ttl != null) alertTitleToId[String(ttl)] = pl.id;
+              }
+            } catch(e) {}
+            return { id: id, inputs: inputs, pineId: pineId, pineVersion: pineVersion, pineFeatures: pineFeatures, alertTitleToId: alertTitleToId };
           } catch(e) {}
         }
         return { __notFound: true, titles: titles };
@@ -69,6 +87,23 @@ for (const item of payloads) {
       results.push({
         name: item.name,
         error: 'study not found: ' + item.indicator_name + ' | data sources on active chart: [' + summary + ']',
+      });
+      continue;
+    }
+    // Resolve the alertcondition TITLE to the study's live plot_N id.
+    // Fail loudly (no positional fallback) if the title isn't present —
+    // a guessed index is exactly the silent err.code="general" failure
+    // this resolver exists to eliminate.
+    const titleToId = studyInfo.alertTitleToId || {};
+    const resolvedCondId = titleToId[item.alert_cond_title];
+    if (!resolvedCondId) {
+      const known = Object.keys(titleToId);
+      results.push({
+        name: item.name,
+        error: 'alertcondition title not found: ' + JSON.stringify(item.alert_cond_title)
+          + ' on study ' + item.indicator_name
+          + ' | available alertcondition titles: ['
+          + known.map(function(t) { return JSON.stringify(t) + '=' + titleToId[t]; }).join(', ') + ']',
       });
       continue;
     }
@@ -89,7 +124,7 @@ for (const item of payloads) {
     condition = {
       type: 'alert_cond',
       frequency: item.frequency,
-      alert_cond_id: item.alert_cond_id,
+      alert_cond_id: resolvedCondId,
       series: [studySeries],
       resolution: ctx.resolution,
     };

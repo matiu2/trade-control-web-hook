@@ -134,7 +134,14 @@ The day-to-day loop, end to end:
    every signed alert into TradingView via an inside-page `fetch()`.
    Each alert lands as a configured TV alert pointed at your worker URL.
    (The legacy `scripts/tv_arm_hs.py` is deprecated; `tv-arm` superseded
-   it.)
+   it.) Pine alertconditions (`05-enter`, `06-close-on-reversal`) are
+   bound by their **title** (`"Long Pattern"`, `"Short Pattern"`,
+   `"Every Bar Close"`), not a positional `plot_N` id: the tv-arm JS
+   resolves title → live `plot_N` from the study's `metaInfo()` at
+   create time, so adding/removing plots in the Pine source can't break
+   the binding. A title that isn't on the published study fails that
+   alert loudly with the list of titles it did find — republish the
+   study or fix the title in `conventions/src/pine.rs`.
 3. **TradingView fires alerts** as their conditions trigger (line
    crossings, Pine `Candle Signals` plots, time anchors). Each alert
    POSTs the cleartext signed YAML to the worker.

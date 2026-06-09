@@ -16,8 +16,8 @@ use chrono::DateTime;
 use color_eyre::eyre::{Result, eyre};
 use serde::Serialize;
 use trade_control_conventions::{
-    AlertBasename, Direction, PINE_INDICATOR_NAME, PLOT_EVERY_BAR_CLOSE, entry_plot_for,
-    reversal_close_plot_for,
+    ALERT_EVERY_BAR_CLOSE, AlertBasename, Direction, PINE_INDICATOR_NAME, entry_alert_for,
+    reversal_close_alert_for,
 };
 
 use crate::geometry::pcl_exhausted_price_from_fib;
@@ -101,7 +101,12 @@ pub enum AlertPayload {
     /// off chance an old hand-crafted alert is still in flight.
     PineAlertcondition {
         indicator_name: String,
-        alert_cond_id: String,
+        /// Alertcondition **title** (`"Long Pattern"` etc.), not a
+        /// positional `plot_N` id. The JS template resolves it to the
+        /// live `plot_N` from the study's `metaInfo()` at create-alert
+        /// time, so adding/removing plots in the Pine source can't
+        /// break the binding.
+        alert_cond_title: String,
         frequency: Frequency,
         auto_deactivate: bool,
         tv_name: String,
@@ -187,10 +192,11 @@ pub enum Frequency {
 /// ISO timestamp).
 ///
 /// `is_mw` switches the `05-enter` binding: H&S enters bind to the
-/// direction's pattern plot ([`entry_plot_for`]); M/W enters bind to the
-/// per-bar `"Every Bar Close"` alertcondition ([`PLOT_EVERY_BAR_CLOSE`])
-/// instead, since M/W has no chart-side pattern detection — the worker
-/// recomputes the geometry each bar close from baked path params.
+/// direction's pattern alertcondition ([`entry_alert_for`]); M/W enters
+/// bind to the per-bar `"Every Bar Close"` alertcondition
+/// ([`ALERT_EVERY_BAR_CLOSE`]) instead, since M/W has no chart-side
+/// pattern detection — the worker recomputes the geometry each bar
+/// close from baked path params.
 pub fn build_alert_spec(
     file: &str,
     direction: Direction,
@@ -276,12 +282,12 @@ pub fn build_alert_spec(
             // M/W enters bind to the per-bar "Every Bar Close"
             // alertcondition (no chart-side pattern detection); H&S
             // enters bind to the direction's pattern plot.
-            let plot = if is_mw {
-                PLOT_EVERY_BAR_CLOSE
+            let alert_title = if is_mw {
+                ALERT_EVERY_BAR_CLOSE
             } else {
-                entry_plot_for(direction)
+                entry_alert_for(direction)
             };
-            Some(pine_payload(plot, Frequency::OnBarClose, tv_name))
+            Some(pine_payload(alert_title, Frequency::OnBarClose, tv_name))
         }
         // `CloseOnSrReversal` is the legacy split-form basename;
         // the CLI no longer emits it (the consolidated
@@ -291,7 +297,7 @@ pub fn build_alert_spec(
         // legacy alert routed through tv-arm still dispatches to
         // the same Pine plot.
         AlertBasename::CloseOnReversal | AlertBasename::CloseOnSrReversal => Some(pine_payload(
-            reversal_close_plot_for(direction),
+            reversal_close_alert_for(direction),
             Frequency::OnBarClose,
             tv_name,
         )),
@@ -459,10 +465,10 @@ fn calendar_payload(
     }))
 }
 
-fn pine_payload(plot_id: &str, frequency: Frequency, tv_name: String) -> AlertPayload {
+fn pine_payload(alert_title: &str, frequency: Frequency, tv_name: String) -> AlertPayload {
     AlertPayload::PineAlertcondition {
         indicator_name: PINE_INDICATOR_NAME.to_string(),
-        alert_cond_id: plot_id.to_string(),
+        alert_cond_title: alert_title.to_string(),
         frequency,
         auto_deactivate: false,
         name: String::new(),
@@ -660,7 +666,7 @@ mod tests {
     }
 
     #[test]
-    fn enter_uses_pine_plot_for_direction() {
+    fn enter_uses_pine_alert_for_direction() {
         let roles = short_roles_full();
         let ctx = DispatchContext::default();
         let p_short = build_alert_spec("05-enter.yaml", Direction::Short, &roles, &ctx, false)
@@ -671,25 +677,27 @@ mod tests {
             .unwrap();
         match p_short {
             AlertPayload::PineAlertcondition {
-                alert_cond_id,
+                alert_cond_title,
                 indicator_name,
                 ..
             } => {
-                assert_eq!(alert_cond_id, "plot_16");
+                assert_eq!(alert_cond_title, "Short Pattern");
                 assert_eq!(indicator_name, "Candle Signals");
             }
             _ => panic!("expected PineAlertcondition for short enter"),
         }
         match p_long {
-            AlertPayload::PineAlertcondition { alert_cond_id, .. } => {
-                assert_eq!(alert_cond_id, "plot_15");
+            AlertPayload::PineAlertcondition {
+                alert_cond_title, ..
+            } => {
+                assert_eq!(alert_cond_title, "Long Pattern");
             }
             _ => panic!("expected PineAlertcondition for long enter"),
         }
     }
 
     #[test]
-    fn close_on_reversal_uses_opposite_plot() {
+    fn close_on_reversal_uses_opposite_alert() {
         let roles = short_roles_full();
         let ctx = DispatchContext::default();
         let p = build_alert_spec(
@@ -701,9 +709,12 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        if let AlertPayload::PineAlertcondition { alert_cond_id, .. } = p {
+        if let AlertPayload::PineAlertcondition {
+            alert_cond_title, ..
+        } = p
+        {
             // Short trade closes on a Long Pattern reversal.
-            assert_eq!(alert_cond_id, "plot_15");
+            assert_eq!(alert_cond_title, "Long Pattern");
         } else {
             panic!("expected PineAlertcondition");
         }
@@ -900,7 +911,7 @@ mod tests {
             .unwrap();
         let v = serde_json::to_value(&p).unwrap();
         assert_eq!(v["kind"], "pine_alertcondition");
-        assert_eq!(v["alert_cond_id"], "plot_16");
+        assert_eq!(v["alert_cond_title"], "Short Pattern");
         assert_eq!(v["indicator_name"], "Candle Signals");
         assert_eq!(v["frequency"], "on_bar_close");
     }
@@ -1037,19 +1048,19 @@ mod tests {
     fn mw_enter_binds_to_every_bar_close_not_pattern_plot() {
         let roles = roles_with_m_path();
         let ctx = DispatchContext::default();
-        // M is short; H&S short enter would bind to plot_16, but the M/W
-        // enter must bind to the "Every Bar Close" alertcondition.
+        // M is short; H&S short enter would bind to "Short Pattern", but
+        // the M/W enter must bind to the "Every Bar Close" alertcondition.
         let p = build_alert_spec("05-enter.yaml", Direction::Short, &roles, &ctx, true)
             .unwrap()
             .unwrap();
         match p {
             AlertPayload::PineAlertcondition {
-                alert_cond_id,
+                alert_cond_title,
                 indicator_name,
                 frequency,
                 ..
             } => {
-                assert_eq!(alert_cond_id, "plot_17");
+                assert_eq!(alert_cond_title, "Every Bar Close");
                 assert_eq!(indicator_name, "Candle Signals");
                 assert_eq!(frequency, Frequency::OnBarClose);
             }
@@ -1058,16 +1069,19 @@ mod tests {
     }
 
     #[test]
-    fn hs_enter_still_binds_to_pattern_plot_when_not_mw() {
+    fn hs_enter_still_binds_to_pattern_alert_when_not_mw() {
         // Guard the H&S path is untouched: is_mw=false keeps the
-        // direction's pattern plot.
+        // direction's pattern alertcondition.
         let roles = short_roles_full();
         let ctx = DispatchContext::default();
         let p = build_alert_spec("05-enter.yaml", Direction::Short, &roles, &ctx, false)
             .unwrap()
             .unwrap();
-        if let AlertPayload::PineAlertcondition { alert_cond_id, .. } = p {
-            assert_eq!(alert_cond_id, "plot_16");
+        if let AlertPayload::PineAlertcondition {
+            alert_cond_title, ..
+        } = p
+        {
+            assert_eq!(alert_cond_title, "Short Pattern");
         } else {
             panic!("expected PineAlertcondition, got {p:?}");
         }

@@ -83,6 +83,16 @@ Commits (each tested, clippy+fmt green):
   05-enter + 06-close-on-reversal with `err.code="general"` (the catch-all TV
   returns when an alertcondition plot index doesn't resolve). Fixed the three
   conventions consts + tests.
+  FOLLOW-UP 2026-06-09: eliminated the whole failure class. Alertconditions
+  are now bound by **title** (`"Long Pattern"`/`"Short Pattern"`/`"Every Bar
+  Close"`) instead of positional `plot_N`. conventions exposes
+  ALERT_*_PATTERN/ALERT_EVERY_BAR_CLOSE + entry_alert_for/reversal_close_alert_for
+  (the PLOT_*/entry_plot_for/reversal_close_plot_for consts are gone); the
+  AlertPayload field is `alert_cond_title`; the tv-arm JS template resolves
+  title → live plot_N from the study's `metaInfo().plots`(type=alertcondition)
+  + `metaInfo().styles[id].title`, failing loudly if the title is absent. Plot
+  reordering can no longer break the binding. Verified the live resolver maps
+  the 3 titles to plot_15/16/17 on the real chart.
 - [x] 9. tv-arm args+pipeline. args.rs: --allow-50-pct-m-trades, --spread-pips
   (temp, Option), --pip-size (temp, default 0.0001). pipeline.rs: `run` step 3
   now dispatches on `roles.mw_path.is_some()` to `resolve_mw_trade` vs

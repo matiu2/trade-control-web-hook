@@ -1,52 +1,45 @@
-//! Pine `Candle Signals` indicator wiring. The plot IDs are tied to
-//! the indicator's source-code plot order; whenever the operator
-//! re-publishes the script with reordered plots, this file is the
-//! single update point across the stack.
+//! Pine `Candle Signals` indicator wiring.
 //!
-//! Current shape (v2.4, 2026-06-09+):
-//! - `plot_0..plot_9` — the 8 `signal_*` latches plus
-//!   `recent_high` / `recent_low` for SL anchoring.
-//! - `plot_10..plot_14` — the 5 `next_candle_timestamp_1..5` plots
-//!   (added in v2.3). These sit *before* the alertconditions and push
-//!   every alertcondition index up by 5.
-//! - `plot_15` — `Long Pattern` alertcondition.
-//! - `plot_16` — `Short Pattern` alertcondition.
-//! - `plot_17` — `Every Bar Close` alertcondition.
+//! Alertconditions are bound by their **title** (`"Long Pattern"`,
+//! `"Short Pattern"`, `"Every Bar Close"`), not by a positional
+//! `plot_N` id. The tv-arm JS template resolves title → live `plot_N`
+//! at create-alert time from the study's `metaInfo()` — it filters
+//! `metaInfo().plots` to the `alertcondition`-typed entries and maps
+//! `metaInfo().styles[id].title` back to the id.
 //!
-//! `alertcondition()` shares the `plot_N` namespace with `plot()` and
-//! is indexed in source order, so any `plot()` added ahead of the
-//! alertconditions shifts these indices. (v2.3's 5 timestamp plots are
-//! exactly why these are 15/16/17 and not 10/11/12.)
+//! This makes the binding immune to plot reordering: any `plot()`
+//! added or removed ahead of the alertconditions shifts the `plot_N`
+//! indices, but the title is stable. (Before 2026-06 these were
+//! hardcoded `plot_10`/`plot_11`/`plot_12`; v2.3's five
+//! `next_candle_timestamp_1..5` plots silently shifted them to
+//! 15/16/17, which surfaced as `err.code="general"` on 05-enter. The
+//! title-based resolver removes that whole failure class.)
+//!
+//! The only thing this file still pins by string is the alertcondition
+//! *titles* — change those only in lockstep with the `alertcondition()`
+//! calls in `pine-scripts/candle-signals-v2.pine`.
 
 /// Pine study title as it appears in TradingView's data-source list.
 pub const PINE_INDICATOR_NAME: &str = "Candle Signals";
 
-/// Plot ID for the "Long Pattern" alertcondition. Used as the entry
+/// Title of the "Long Pattern" alertcondition. Used as the entry
 /// trigger on long trades and as the close-on-reversal trigger on
-/// short trades.
-pub const PLOT_LONG_PATTERN: &str = "plot_15";
+/// short trades. Matches the second arg of the `alertcondition()` call
+/// in the Pine source.
+pub const ALERT_LONG_PATTERN: &str = "Long Pattern";
 
-/// Plot ID for the "Short Pattern" alertcondition. Used as the entry
+/// Title of the "Short Pattern" alertcondition. Used as the entry
 /// trigger on short trades and as the close-on-reversal trigger on
 /// long trades.
-pub const PLOT_SHORT_PATTERN: &str = "plot_16";
+pub const ALERT_SHORT_PATTERN: &str = "Short Pattern";
 
-/// Plot ID for the "Every Bar Close" alertcondition (Pine v2.4+). This
+/// Title of the "Every Bar Close" alertcondition (Pine v2.4+). This
 /// fires every closed bar carrying only TradingView built-ins
 /// (`close`/`high`/`low`/`time`, no plots) and is the per-bar heartbeat
 /// the M/W enter intent binds to — M/W trades have no chart-side pattern
 /// detection, so the worker recomputes the stop-entry/SL/TP each bar
 /// close from baked path geometry plus the live shell.
-///
-/// The id follows the same declaration-order indexing as
-/// [`PLOT_LONG_PATTERN`]/[`PLOT_SHORT_PATTERN`]: "Every Bar Close" is
-/// declared immediately after the two pattern alertconditions, so it is
-/// the next slot (`plot_17`). Verify against a live chart with a dry
-/// `tv-arm` build after republishing the v2.4 study (the
-/// `next_candle_timestamp` plots that landed in v2.3 sit *before* these,
-/// so a stale-study mismatch surfaces as a "condition not found" on the
-/// 05-enter alert — re-check this constant first if that happens).
-pub const PLOT_EVERY_BAR_CLOSE: &str = "plot_17";
+pub const ALERT_EVERY_BAR_CLOSE: &str = "Every Bar Close";
 
 /// Trade direction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -107,19 +100,20 @@ pub fn mw_direction_from_label(lbl: &str) -> Option<Direction> {
     }
 }
 
-/// Pine plot ID for the entry signal in `direction`.
-pub fn entry_plot_for(direction: Direction) -> &'static str {
+/// Alertcondition title for the entry signal in `direction`. The JS
+/// template resolves this to the live `plot_N` at create-alert time.
+pub fn entry_alert_for(direction: Direction) -> &'static str {
     match direction {
-        Direction::Long => PLOT_LONG_PATTERN,
-        Direction::Short => PLOT_SHORT_PATTERN,
+        Direction::Long => ALERT_LONG_PATTERN,
+        Direction::Short => ALERT_SHORT_PATTERN,
     }
 }
 
-/// Pine plot ID for the reversal-close signal of an open trade in
-/// `direction`. (A long position closes on a bearish reversal, so it
-/// listens to the Short Pattern plot; mirror for short.)
-pub fn reversal_close_plot_for(direction: Direction) -> &'static str {
-    entry_plot_for(direction.opposite())
+/// Alertcondition title for the reversal-close signal of an open trade
+/// in `direction`. (A long position closes on a bearish reversal, so it
+/// listens to the Short Pattern condition; mirror for short.)
+pub fn reversal_close_alert_for(direction: Direction) -> &'static str {
+    entry_alert_for(direction.opposite())
 }
 
 #[cfg(test)]
@@ -127,15 +121,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn entry_plot_matches_direction() {
-        assert_eq!(entry_plot_for(Direction::Long), "plot_15");
-        assert_eq!(entry_plot_for(Direction::Short), "plot_16");
+    fn entry_alert_matches_direction() {
+        assert_eq!(entry_alert_for(Direction::Long), "Long Pattern");
+        assert_eq!(entry_alert_for(Direction::Short), "Short Pattern");
     }
 
     #[test]
-    fn reversal_close_plot_inverts() {
-        assert_eq!(reversal_close_plot_for(Direction::Long), "plot_16");
-        assert_eq!(reversal_close_plot_for(Direction::Short), "plot_15");
+    fn reversal_close_alert_inverts() {
+        assert_eq!(reversal_close_alert_for(Direction::Long), "Short Pattern");
+        assert_eq!(reversal_close_alert_for(Direction::Short), "Long Pattern");
     }
 
     #[test]
