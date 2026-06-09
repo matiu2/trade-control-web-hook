@@ -1241,11 +1241,17 @@ fn mint_trade_id(pattern: TradePattern, instrument: &str) -> Result<String> {
     let mut bytes = [0u8; 4];
     getrandom::fill(&mut bytes).map_err(|e| eyre!("getrandom: {e}"))?;
     let suffix = hex::encode(bytes);
-    let instr = instrument
-        .to_lowercase()
-        .chars()
-        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
-        .collect::<String>();
+    let mut instr = String::new();
+    for c in instrument.to_lowercase().chars() {
+        if c.is_ascii_alphanumeric() {
+            instr.push(c);
+        } else if !instr.ends_with('-') {
+            // Collapse any run of non-alphanumerics (e.g. " (" in
+            // "Sugar (No 5)") into a single hyphen — consecutive hyphens
+            // are not a valid slug.
+            instr.push('-');
+        }
+    }
     let instr = instr.trim_matches('-');
     let id = format!("{}-{instr}-{suffix}", pattern.slug());
     Ok(id)
@@ -1712,6 +1718,19 @@ mod tests {
             );
             assert!(id.starts_with("hs-eur-usd-"), "got {id}");
         }
+    }
+
+    #[test]
+    fn mint_trade_id_collapses_punctuation_runs() {
+        // TradeNation display names contain spaces and parentheses, e.g.
+        // "Sugar (No 5)" — the " (" run must collapse to a single hyphen,
+        // not produce "sugar--no-5" which fails slug validation.
+        let id = mint_trade_id(TradePattern::Hs, "Sugar (No 5)").unwrap();
+        assert!(
+            trade_control_core::intent::is_valid_trade_id(&id),
+            "minted id {id} failed validation"
+        );
+        assert!(id.starts_with("hs-sugar-no-5-"), "got {id}");
     }
 
     #[test]
