@@ -27,7 +27,7 @@ use chrono::{DateTime, Local, Utc};
 use clap::{Parser, ValueEnum};
 use color_eyre::eyre::{Context, Result, eyre};
 use forex_factory::{EconomicEvent, Impact};
-use trade_calendar_maker::{Instrument, Timeframe};
+use trade_calendar_maker::{Instrument, InstrumentType, Timeframe};
 use trade_control_core::intent::BrokerKind;
 use trade_control_core::sig::KEY_LEN;
 
@@ -271,14 +271,64 @@ fn slugify(s: &str) -> String {
     out
 }
 
-/// Parse the CLI's broker-facing instrument symbol (e.g. `EUR_USD`,
-/// `CHF/JPY`) into a [`trade_calendar_maker::Instrument`]. Strips the
-/// separators OANDA (`_`) and TradeNation (`/`) forex pairs carry —
-/// `from_oanda_symbol` expects the bare concatenated form (`EURUSD`).
-pub fn parse_instrument(raw: &str) -> Result<Instrument> {
-    let normalised: String = raw.chars().filter(|c| !matches!(c, '_' | '/')).collect();
-    Instrument::from_oanda_symbol(&normalised)
-        .ok_or_else(|| eyre!("unsupported instrument symbol {raw:?}"))
+/// Resolve the CLI's broker-facing instrument symbol (e.g. `EUR_USD`,
+/// `CHF/JPY`, `Wall St 30 / Germany 40 Rolling Future Diff`) into a
+/// [`trade_calendar_maker::Instrument`] via the canonical
+/// `instrument-lookup` catalog.
+///
+/// We resolve through the catalog by the *broker's own* symbol first
+/// (the form the caller passes), then fall back to a broker-agnostic
+/// `resolve` (canonical id / cross-broker symbol). Only the resulting
+/// `affected_currencies` matter downstream — `plan_calendar_bars` uses
+/// the instrument solely through `is_affected_by(currency)` — but we
+/// populate `symbol` and `instrument_type` faithfully from the asset.
+///
+/// There is deliberately **no** legacy `from_oanda_symbol` fallback: an
+/// instrument the catalog doesn't know is a hard error, surfacing the
+/// missing-entry up to the operator (who fixes it in
+/// `~/.config/instrument-lookup/mappings.toml`) rather than silently
+/// mis-deriving its news currencies from a string heuristic.
+pub fn parse_instrument(raw: &str, broker: BrokerKind) -> Result<Instrument> {
+    let asset = instrument_lookup::by_broker_symbol(broker_for(broker), raw)
+        .map_err(|e| eyre!("instrument-lookup overlay error resolving {raw:?}: {e}"))?
+        .or(instrument_lookup::resolve(raw)
+            .map_err(|e| eyre!("instrument-lookup overlay error resolving {raw:?}: {e}"))?)
+        .ok_or_else(|| {
+            eyre!(
+                "unsupported instrument symbol {raw:?}: not in the instrument-lookup catalog. \
+                 Add an `[[asset]]` entry to ~/.config/instrument-lookup/mappings.toml."
+            )
+        })?;
+
+    Ok(Instrument::new(
+        asset.id.clone(),
+        instrument_type_for(asset.class),
+        asset.news_currencies.clone(),
+    ))
+}
+
+/// Map our [`BrokerKind`] onto `instrument-lookup`'s [`Broker`].
+fn broker_for(broker: BrokerKind) -> instrument_lookup::Broker {
+    match broker {
+        BrokerKind::Oanda => instrument_lookup::Broker::Oanda,
+        BrokerKind::TradeNation => instrument_lookup::Broker::TradeNation,
+    }
+}
+
+/// Map `instrument-lookup`'s [`AssetClass`] onto the calendar crate's
+/// [`InstrumentType`]. Only `affected_currencies` drives calendar-bar
+/// planning, so the type is informational here; `Crypto`/`Stock` have no
+/// legacy equivalent and fold into `Index` (the non-forex,
+/// dual-currency-capable bucket).
+fn instrument_type_for(class: instrument_lookup::AssetClass) -> InstrumentType {
+    use instrument_lookup::AssetClass;
+    match class {
+        AssetClass::Forex => InstrumentType::Forex,
+        AssetClass::Gold => InstrumentType::Gold,
+        AssetClass::Bond => InstrumentType::Bond,
+        AssetClass::Commodity => InstrumentType::Commodity,
+        AssetClass::Index | AssetClass::Crypto | AssetClass::Stock => InstrumentType::Index,
+    }
 }
 
 /// Clap-side mirror of [`trade_calendar_maker::Timeframe`]. Lives here
@@ -494,7 +544,7 @@ pub fn run_calendar_bars(
     key: [u8; KEY_LEN],
     now: DateTime<Utc>,
 ) -> Result<()> {
-    let instrument = parse_instrument(&args.instrument)?;
+    let instrument = parse_instrument(&args.instrument, args.broker.into())?;
     let timeframe: Timeframe = args.timeframe.into();
     let inputs = PlanInputs {
         trade_id: args.trade_id.clone(),
@@ -806,24 +856,44 @@ mod tests {
     }
 
     #[test]
-    fn parse_instrument_strips_underscore() {
-        let inst = parse_instrument("EUR_USD").unwrap();
+    fn parse_instrument_resolves_oanda_forex() {
+        let inst = parse_instrument("EUR_USD", BrokerKind::Oanda).unwrap();
         assert!(inst.is_affected_by("EUR"));
         assert!(inst.is_affected_by("USD"));
         assert!(!inst.is_affected_by("JPY"));
     }
 
     #[test]
-    fn parse_instrument_strips_tradenation_slash() {
-        let inst = parse_instrument("CHF/JPY").unwrap();
+    fn parse_instrument_resolves_tradenation_forex_slash() {
+        let inst = parse_instrument("CHF/JPY", BrokerKind::TradeNation).unwrap();
         assert!(inst.is_affected_by("CHF"));
         assert!(inst.is_affected_by("JPY"));
         assert!(!inst.is_affected_by("USD"));
     }
 
     #[test]
-    fn parse_instrument_rejects_garbage() {
-        let err = parse_instrument("NOT_A_THING").unwrap_err();
+    fn parse_instrument_resolves_tradenation_index_name() {
+        // A multi-word TradeNation index MarketName the legacy
+        // `from_oanda_symbol` parser could never handle.
+        let inst = parse_instrument("Germany 40", BrokerKind::TradeNation).unwrap();
+        assert!(inst.is_affected_by("EUR"));
+        assert!(!inst.is_affected_by("USD"));
+    }
+
+    #[test]
+    fn parse_instrument_resolves_canonical_id() {
+        // `US30` is the canonical Wall Street 30 id (not OANDA's
+        // `US30_USD`), which the catalog resolves to USD-only. The legacy
+        // `from_oanda_symbol` path mangled bare canonical ids; the catalog
+        // handles them. Exercises the `resolve` arm of the lookup.
+        let inst = parse_instrument("US30", BrokerKind::TradeNation).unwrap();
+        assert!(inst.is_affected_by("USD"));
+        assert!(!inst.is_affected_by("EUR"));
+    }
+
+    #[test]
+    fn parse_instrument_rejects_unknown() {
+        let err = parse_instrument("NOT_A_THING", BrokerKind::Oanda).unwrap_err();
         assert!(err.to_string().contains("unsupported"), "{err}");
     }
 

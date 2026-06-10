@@ -3556,6 +3556,7 @@ dependencies = [
  "forex-factory",
  "getrandom 0.4.2",
  "hex",
+ "instrument-lookup",
  "reqwest 0.12.28",
  "serde",
  "serde_json",

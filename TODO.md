@@ -1,5 +1,45 @@
 # TODO
 
+## In progress — migrate calendar_bars::parse_instrument to instrument-lookup
+
+Bug: `calendar_bars::parse_instrument` (`cli/src/calendar_bars.rs:278`) uses
+the legacy `trade_calendar_maker::Instrument::from_oanda_symbol`, which only
+knows OANDA forex-style symbols. TradeNation diff/index names (e.g.
+`Wall St 30 / Germany 40 Rolling Future Diff`, `US30DE40`) fail, so the
+`calendar-bars` step is skipped with a WARN during a tv-arm run. Downstream
+the parsed `Instrument` is consumed only via `is_affected_by(currency)` →
+only `affected_currencies` matters. `CalendarBarsArgs` already carries the
+broker, so resolution can be precise.
+
+Decision (user): **instrument-lookup only** — drop the legacy fallback.
+
+Status: DONE — all green, verified end-to-end.
+
+- [x] Add `instrument-lookup` dep to `cli/Cargo.toml` (path `../../instrument-lookup`).
+- [x] Rewrite `parse_instrument(raw, broker)` → resolve via
+      `by_broker_symbol(broker, raw)` then `resolve(raw)`; build `Instrument`
+      from `asset.news_currencies` + `class`→`InstrumentType`. Hard error if
+      it misses (no legacy fallback). `broker_for` + `instrument_type_for`
+      helpers; Crypto/Stock → Index.
+- [x] Update call site in `run_calendar_bars` to pass `args.broker.into()`.
+- [x] Tests: OANDA `EUR_USD`, TN `CHF/JPY`, TN multi-word `Germany 40`
+      index, canonical `US30` id, rejects-unknown. 230 cli lib tests pass.
+- [x] cargo clippy + cargo fmt clean.
+- [x] Verified: `trade-control calendar-bars --instrument "Wall St 30 /
+      Germany 40 Rolling Future Diff" --broker tradenation` (the name that
+      used to throw `unsupported instrument symbol`) now resolves, kept the
+      USD CPI event, wrote pause+news bundles.
+- [x] README: no change needed — `calendar-bars` is an internal tv-arm
+      sub-step (no README section), and the README already states tv-arm
+      resolves chart symbols via instrument-lookup. This makes the internal
+      path consistent with the documented behaviour.
+- [ ] Commit + push; advance parent submodule pointer.
+
+Note: the original tv-arm chart has since moved to `US30UK100` (a
+different diff); user added that overlay entry separately. Out of scope
+for this change — the parse_instrument fix covers any catalog-resolvable
+instrument, diff or not.
+
 ## In progress — M and W (double-top / double-bottom) reversal trades
 
 Adds M (double-top, short) / W (double-bottom, long) as a first-class trade
