@@ -778,12 +778,13 @@ the CLI:
   or whenever the OAuth token expires). Without this `wrangler secret
   put` fails with an auth error after the metadata POST has already
   succeeded.
-- **Run from this repo root:** wrangler reads `name =
-  "trade-control-web-hook"` from `./wrangler.toml`. Running `account
-  add` from any other directory fails with `Required Worker name
-  missing` — again, *after* the metadata POST has succeeded. (You can
-  also pass `--name trade-control-web-hook` via wrangler config, but
-  cd-ing into the repo is simpler.)
+
+The CLI passes `--name` to wrangler itself (defaulting to
+`trade-control-web-hook`), so `account add` / `account delete` work from
+any directory — you no longer need to `cd` into the repo root. Override
+the target Worker with `--worker-name <name>` or the
+`TRADE_CONTROL_WORKER_NAME` env var if you've deployed under a different
+name.
 
 ### Recovering from a half-done `account add`
 
@@ -793,12 +794,14 @@ failed (wrong directory, not logged in, etc.), do **not** re-run
 Conflict: already exists`. Push the secret directly instead:
 
 ```sh
-cd /path/to/trade-control-web-hook   # so wrangler.toml is visible
 read -s TN_PW
 echo "{\"broker\":\"tradenation\",\"kind\":\"demo\",\"username\":\"<tn-username>\",\"password\":\"$TN_PW\"}" \
-  | wrangler secret put TN_ACCOUNT_<NAME-UPPERCASED>
+  | wrangler secret put TN_ACCOUNT_<NAME-UPPERCASED> --name trade-control-web-hook
 unset TN_PW
 ```
+
+(The `--name` flag is what `trade-control account add` passes for you —
+it lets the command run outside the repo root.)
 
 `<NAME-UPPERCASED>` is the account name uppercased with `-` → `_`
 (e.g. account `my-tn-demo` → binding `TN_ACCOUNT_MY_TN_DEMO`).

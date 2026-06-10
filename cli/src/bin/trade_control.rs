@@ -199,6 +199,16 @@ struct AccountEndpointArgs {
     /// Falls back to `TRADE_CONTROL_ENDPOINT`.
     #[arg(long, env = "TRADE_CONTROL_ENDPOINT")]
     endpoint: String,
+    /// Cloudflare Worker name for `wrangler secret put/delete`. Without
+    /// it, wrangler reads the name from a `wrangler.toml` in the current
+    /// dir — so `account add`/`delete` only work from the repo root.
+    /// Passing it makes those commands cwd-independent.
+    #[arg(
+        long,
+        env = "TRADE_CONTROL_WORKER_NAME",
+        default_value = "trade-control-web-hook"
+    )]
+    worker_name: String,
 }
 
 #[derive(Parser)]
@@ -1370,7 +1380,7 @@ fn run_account_delete(args: AccountDeleteArgs) -> Result<()> {
             println!();
         }
         eprintln!("purging credential secret {binding}…");
-        delete_secret(&binding)?;
+        delete_secret(&binding, &args.common.worker_name)?;
     } else {
         let body = delete_account(&args.common.endpoint, &admin_key, &args.name)?;
         print!("{body}");
@@ -1488,7 +1498,7 @@ fn run_account_add(args: AccountAddArgs) -> Result<()> {
         (BrokerKind::TradeNation, Some(creds)) => {
             let binding = secret_binding_for(broker, &args.name);
             eprintln!("uploading credential secret {binding} via wrangler…");
-            put_secret(&binding, &creds)?;
+            put_secret(&binding, &args.common.worker_name, &creds)?;
         }
         (BrokerKind::TradeNation, None) => {
             eprintln!(

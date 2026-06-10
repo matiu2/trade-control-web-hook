@@ -10,6 +10,12 @@
 //! `wrangler secret put <BINDING>` reads the secret value from stdin
 //! when stdin is non-interactive (a pipe). We rely on that path so the
 //! credential JSON never lands on disk.
+//!
+//! Both wrappers pass `--name <worker>` explicitly. Without it, wrangler
+//! resolves the target Worker from a `wrangler.toml` in the *current*
+//! directory — so running `trade-control account add` from anywhere but
+//! the repo root fails with "Required Worker name missing". Passing the
+//! name makes these commands cwd-independent.
 
 use std::io::Write;
 use std::process::{Command, Stdio};
@@ -44,12 +50,14 @@ pub fn secret_binding_for(broker: BrokerKind, account_name: &str) -> String {
 /// writes its own status to stderr — we don't capture it; the operator
 /// sees the same "Uploaded secret X" line they'd see running wrangler
 /// by hand.
-pub fn put_secret(binding: &str, creds: &Credentials) -> Result<()> {
+pub fn put_secret(binding: &str, worker: &str, creds: &Credentials) -> Result<()> {
     let json = serde_json::to_string(creds).map_err(|e| eyre!("encode credentials: {e}"))?;
     let mut child = Command::new("wrangler")
         .arg("secret")
         .arg("put")
         .arg(binding)
+        .arg("--name")
+        .arg(worker)
         .stdin(Stdio::piped())
         .spawn()
         .map_err(|e| eyre!("spawn wrangler: {e} — is wrangler on PATH?"))?;
@@ -78,11 +86,13 @@ pub fn put_secret(binding: &str, creds: &Credentials) -> Result<()> {
 /// Delete a credential secret. Mirror of [`put_secret`] for the
 /// `account delete` cleanup path. Non-zero exit is surfaced — including
 /// the "secret not found" case, which the caller can choose to ignore.
-pub fn delete_secret(binding: &str) -> Result<()> {
+pub fn delete_secret(binding: &str, worker: &str) -> Result<()> {
     let status = Command::new("wrangler")
         .arg("secret")
         .arg("delete")
         .arg(binding)
+        .arg("--name")
+        .arg(worker)
         .status()
         .map_err(|e| eyre!("spawn wrangler: {e} — is wrangler on PATH?"))?;
     if !status.success() {
