@@ -1,6 +1,6 @@
 # TODO
 
-## In progress — migrate calendar_bars::parse_instrument to instrument-lookup
+## Done — migrate calendar_bars::parse_instrument to instrument-lookup (v9, 0.2.0)
 
 Bug: `calendar_bars::parse_instrument` (`cli/src/calendar_bars.rs:278`) uses
 the legacy `trade_calendar_maker::Instrument::from_oanda_symbol`, which only
@@ -33,7 +33,10 @@ Status: DONE — all green, verified end-to-end.
       sub-step (no README section), and the README already states tv-arm
       resolves chart symbols via instrument-lookup. This makes the internal
       path consistent with the documented behaviour.
-- [ ] Commit + push; advance parent submodule pointer.
+- [x] Commit (26fa357) + push; parent submodule pointer advanced.
+- [x] Release v9: bump 0.1.0 → 0.2.0 (root + cli; tv-arm/tv-news dep reqs
+      bumped to match), CHANGELOG v9, annotated tag `v9` pushed (b75d56b),
+      parent pointer re-advanced (23a4ccf).
 
 Note: the original tv-arm chart has since moved to `US30UK100` (a
 different diff); user added that overlay entry separately. Out of scope
