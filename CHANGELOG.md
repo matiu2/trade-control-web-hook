@@ -1,5 +1,63 @@
 # Changelog
 
+## v9 — 2026-06-10 — calendar-bars resolves instruments via instrument-lookup
+
+### Why
+
+`calendar_bars::parse_instrument` resolved the trade's instrument through
+the legacy `trade_calendar_maker::Instrument::from_oanda_symbol`, which
+only understands OANDA forex-style symbols (`EURUSD` after stripping
+`_`/`/`). TradeNation index and spread/diff MarketNames — e.g.
+`Wall St 30 / Germany 40 Rolling Future Diff` (chart symbol `US30DE40`) —
+failed with `unsupported instrument symbol`, so the `calendar-bars` step
+was silently skipped (caught as a WARN) during a `tv-arm` run, producing
+no auto pause/news bars for that setup.
+
+### What changed
+
+`parse_instrument(raw, broker)` now resolves through the canonical
+`instrument-lookup` catalog: by the broker's own symbol first (the form
+the caller passes; `broker` is carried on `CalendarBarsArgs`), then a
+broker-agnostic `resolve` for canonical ids / cross-broker symbols. The
+`Instrument` is built from `asset.news_currencies` (→ `affected_currencies`,
+the only field consumed downstream via `is_affected_by`) and `asset.class`
+(→ `InstrumentType`; `Crypto`/`Stock` fold into `Index`). Retires one of
+the partial instrument maps flagged for migration in `CLAUDE.md`.
+
+### Breaking
+
+- `cli::parse_instrument` gains a second argument:
+  `parse_instrument(raw: &str, broker: BrokerKind)`. There is **no** legacy
+  `from_oanda_symbol` fallback — an instrument the catalog doesn't know is
+  now a hard error pointing the operator at
+  `~/.config/instrument-lookup/mappings.toml`, instead of silently
+  mis-deriving news currencies from a string heuristic.
+
+### Config
+
+- New `instrument-lookup` path dependency on the `cli` crate. Instruments
+  not in the baked-in catalog (e.g. TradeNation diff/spread CFDs) need an
+  `[[asset]]` overlay entry in `~/.config/instrument-lookup/mappings.toml`.
+
+### Tests
+
+- `parse_instrument` tests rewritten for the new signature and catalog
+  backing: OANDA `EUR_USD`, TradeNation `CHF/JPY`, a multi-word TradeNation
+  index name (`Germany 40`) the legacy parser couldn't handle, a canonical
+  id (`US30`), and rejects-unknown. 230 cli lib tests pass.
+
+### Verified
+
+- `trade-control calendar-bars --instrument
+  "Wall St 30 / Germany 40 Rolling Future Diff" --broker tradenation` — the
+  name that previously threw — now resolves, keeps the USD CPI event, and
+  writes pause+news bundles.
+
+### Note
+
+- Cargo `version` bumped `0.1.0 → 0.2.0` (root `trade-control-web-hook` and
+  `cli/trade-control-cli`).
+
 ## v8 — 2026-06-09 — bind Pine alertconditions by title, not positional `plot_N`
 
 ### Why

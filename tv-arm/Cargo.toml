@@ -20,7 +20,7 @@ tracing = "0.1.44"
 tracing-error = "0.2.1"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 trade-calendar-maker = { version = "0.1.0", path = "../../../trade-calendar-maker" }
-trade-control-cli = { version = "0.1.0", path = "../cli" }
+trade-control-cli = { version = "0.2.0", path = "../cli" }
 trade-control-conventions = { version = "0.1.0", path = "../conventions" }
 trade-control-core = { version = "0.1.0", path = "../core" }
 tradenation-api = { git = "https://github.com/matiu2/tradenation-api.git", tag = "broker-tradenation-v0.7.0", version = "0.1.0" }
