@@ -48,8 +48,15 @@ use trade_control_core::sig::{self, SIG_FIELD};
     about = "Sign a trade intent for TradingView and manage worker state"
 )]
 struct Cli {
+    /// Print a shell completion script for the current shell (detected
+    /// from `$SHELL`) to stdout, then exit. Designed for `eval`:
+    /// `eval "$(trade-control --print-completions)"` in your shell rc.
+    /// For an explicit shell or to write to a file, use the
+    /// `completions <shell>` subcommand instead.
+    #[arg(long, exclusive = true)]
+    print_completions: bool,
     #[command(subcommand)]
-    cmd: Cmd,
+    cmd: Option<Cmd>,
 }
 
 #[derive(Subcommand)]
@@ -597,7 +604,14 @@ struct SignArgs {
 fn main() -> Result<()> {
     color_eyre::install()?;
     let cli = Cli::parse();
-    match cli.cmd {
+    if cli.print_completions {
+        run_completions(detect_shell()?);
+        return Ok(());
+    }
+    let cmd = cli
+        .cmd
+        .ok_or_else(|| eyre!("no subcommand given (try `trade-control --help`)"))?;
+    match cmd {
         Cmd::GenKey => {
             let hex_key = generate_key_hex();
             println!("{hex_key}");
@@ -725,6 +739,30 @@ fn check_account_known(account: &str) -> Result<()> {
          Run `trade-control account list` to refresh, or fix the spec.",
         known.join(", ")
     ))
+}
+
+/// Detect the running shell from `$SHELL` for `--print-completions`.
+/// `$SHELL` is the login shell (e.g. `/usr/bin/zsh`); we take the
+/// basename and let clap_complete parse it. Falls back to a clear error
+/// listing the supported shells so the operator can use the explicit
+/// `completions <shell>` subcommand instead.
+fn detect_shell() -> Result<Shell> {
+    let shell_path = std::env::var("SHELL")
+        .map_err(|_| eyre!("$SHELL is not set — run `completions <shell>`"))?;
+    shell_from_path(&shell_path)
+}
+
+/// Parse a `Shell` from a `$SHELL`-style path by taking its basename
+/// (e.g. `/usr/bin/zsh` → `zsh`). Split out from [`detect_shell`] so the
+/// path-parsing logic is testable without mutating the process env.
+fn shell_from_path(shell_path: &str) -> Result<Shell> {
+    let name = std::path::Path::new(shell_path)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .ok_or_else(|| eyre!("could not read shell name from $SHELL={shell_path:?}"))?;
+    name.parse::<Shell>().map_err(|_| {
+        eyre!("unsupported shell {name:?} from $SHELL — run `completions <shell>` with one of: bash, zsh, fish, elvish, powershell")
+    })
 }
 
 fn run_completions(shell: Shell) {
@@ -1522,6 +1560,18 @@ mod tests {
     use std::time::Duration;
     use tradenation_api::{Market, Session};
     use tradenation_instrument_cache::{Catalog, InstrumentCache};
+
+    #[test]
+    fn shell_from_path_takes_basename() {
+        assert_eq!(shell_from_path("/usr/bin/zsh").unwrap(), Shell::Zsh);
+        assert_eq!(shell_from_path("/bin/bash").unwrap(), Shell::Bash);
+        assert_eq!(shell_from_path("fish").unwrap(), Shell::Fish);
+    }
+
+    #[test]
+    fn shell_from_path_rejects_unknown_shell() {
+        assert!(shell_from_path("/usr/bin/nu").is_err());
+    }
 
     fn stub_market(market_id: u64, name: &str, symbol: Option<&str>) -> Market {
         Market {

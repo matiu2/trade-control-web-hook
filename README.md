@@ -502,6 +502,28 @@ Build:
 cargo build --features cli --release --bin trade-control
 ```
 
+### Shell completions
+
+For the quickest setup, eval the completions for your current shell
+(detected from `$SHELL`) straight from your shell rc:
+
+```sh
+# ~/.zshrc (or ~/.bashrc)
+eval "$(trade-control --print-completions)"
+```
+
+To write a static completion file for an explicit shell instead, use the
+`completions <shell>` subcommand:
+
+```sh
+trade-control completions zsh > ~/.zfunc/_trade-control
+```
+
+Both emit the same script. For zsh it also appends a dynamic completer
+that fills the `instrument` positional from the live TradeNation catalog
+when `--broker tradenation` is in argv (see the `run_completions` doc
+comment for wiring it into `compdef`).
+
 Generate a signing key once, store the same file on your machine and as
 the `SIGNING_KEY` wrangler secret:
 
