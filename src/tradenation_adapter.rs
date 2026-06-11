@@ -285,7 +285,8 @@ mod attempt_state_tests {
             limit_order_price: None,
             current_price: None,
             currency_symbol: String::new(),
-            period: String::new(),
+            period: None,
+            period_original: String::new(),
             creation_time_utc: String::new(),
             quote_id: 0,
         }
@@ -306,7 +307,8 @@ mod attempt_state_tests {
             limit_order_price: None,
             imr: 0.0,
             currency_symbol: String::new(),
-            creation_time: String::new(),
+            creation_time: None,
+            creation_time_original: String::new(),
             quote_id: 0,
             tradable: true,
         }
@@ -319,8 +321,10 @@ mod attempt_state_tests {
             action: "Trade Receivable".into(),
             // `is_trade()` requires TransactionType=2 and non-empty open/close prices.
             transaction_type: "2".into(),
-            transaction_date: String::new(),
-            open_period: String::new(),
+            transaction_date: None,
+            transaction_date_original: String::new(),
+            open_period: None,
+            open_period_original: String::new(),
             open_price: "1.0".into(),
             close_price: "1.1".into(),
             profit_loss: profit_loss.into(),

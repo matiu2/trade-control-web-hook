@@ -1,6 +1,38 @@
 # Changelog
 
-## v10 — 2026-06-11 — vetos scoped to trade_id (fix cross-trade veto bleed)
+## v11 — 2026-06-12 — bump tradenation-api to broker-tradenation-v0.8.0
+
+### Why
+
+Upstream `tradenation-api` shipped `broker-tradenation-v0.8.0`
+(tradenation-api 0.2.0 / broker-tradenation 0.8.0), which converts all
+broker timestamps from London-local to Brisbane (UTC+10) inside the crate
+and renames six record fields: the base name now holds the converted
+`Option<DateTime<FixedOffset>>` and a new `*_original` sibling keeps the
+raw broker string.
+
+### What changed
+
+- Both `broker-tradenation` and `tradenation-api` pins moved from
+  `tag = "broker-tradenation-v0.7.0"` to `v0.8.0`.
+- Only the **test helpers** in `src/tradenation_adapter.rs` touched the
+  renamed fields: `opening_order()`, `position()`, and `closed_trade()`
+  now build `period`/`creation_time`/`transaction_date`/`open_period` as
+  `None` and set the matching `*_original` to `String::new()`.
+- The production matching logic (order-id / ref-id correlation in
+  `compute_attempt_state`) reads none of the renamed timestamp fields, so
+  it is unchanged. No worker-visible behaviour, wire-format, action, CLI,
+  gate, secret, or drawing change — README untouched.
+
+### Breaking
+
+None for this crate's API. The dependency's record structs changed shape
+(see upstream), but the worker only constructs them in tests.
+
+### Tests
+
+Existing 112-test suite passes unchanged; wasm32 build verified.
+
 
 ### Why
 
