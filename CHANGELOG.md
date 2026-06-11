@@ -1,5 +1,79 @@
 # Changelog
 
+## v10 — 2026-06-11 — vetos scoped to trade_id (fix cross-trade veto bleed)
+
+### Why
+
+A `too-high` / `too-low` veto set during one setup could block a later,
+unrelated entry on the same instrument. The veto KV key was
+`veto:<account>:<instrument>:<name>` — no `trade_id` — and the veto's TTL
+is stretched to outlive the setup that set it (`veto_ttl_seconds` extends
+to the alert's `not_after` plus a tail). A setup with a multi-day
+`not_after` therefore left a live veto key sitting in KV for days, and the
+operator's next entry on that pair was silently rejected (HTTP 412
+`veto-active`) against a veto they'd forgotten existed. Reported
+2026-06-11: a missed trade, the blocking veto set "a long time ago" and
+invisible in the recent logs.
+
+### What changed
+
+The veto key now carries the setup id:
+`veto:<account>:<trade_id>:<instrument>:<name>`. A veto recorded under one
+`trade_id` only blocks entries that carry the **same** `trade_id`; a
+veto from a different setup on the same instrument no longer matches. The
+`enter` gate looks vetos up by the entry's own `trade_id` (every alert in
+a `build-trade` bundle already shares one minted id, so the veto and the
+entry it guards agree).
+
+`trade_id` is now **required** on `enter`, `veto`, and `clear-veto` —
+`Intent::validate` rejects an intent that omits it
+(`IntentValidationError::MissingTradeId`, surfaced as HTTP 400). This is a
+hard fail by design (operator decision): every trade needs an id, no
+instrument-wide fallback. `MissingTradeId` is checked before the older
+`MaxRetriesWithoutTradeId` / `MissingTtlHours` checks, so an untagged
+enter/veto now reports the missing id first.
+
+### Breaking
+
+- `StateStore::set_veto` / `is_vetoed` / `clear_veto` gain a `trade_id:
+  &str` parameter (after `account`). All impls (KV, in-memory, mocks)
+  updated.
+- `core::state::clear_named_vetos` gains a `trade_id: &str` parameter.
+- `core::state::VetoEntry` gains a `trade_id: String` field (surfaced in
+  the `status` snapshot under each `vetos:` entry).
+- `cli::build_veto_intent` / `build_clear_veto_intent` gain a `trade_id:
+  &str` parameter.
+
+### Config / CLI
+
+- `trade-control veto` and `trade-control clear-veto` gain a required
+  `--trade-id <slug>` flag.
+- The interactive `sign`/`encrypt` questionnaire now prompts for
+  `trade_id` on `veto` / `clear-veto`.
+
+### KV migration
+
+Old `veto:<account>:<instrument>:<name>` keys in the deployed KV are no
+longer read (lookups use the new trade_id-bearing key) and TTL out on
+their own — no wipe required. Any veto an operator wants gone *now* can be
+read back from `trade-control status` (the `vetos:` block lists each
+`trade_id`) and cleared with `clear-veto --trade-id`.
+
+### Tests
+
+- core: `validate_rejects_enter_without_trade_id`,
+  `validate_rejects_veto_without_trade_id`,
+  `validate_rejects_clear_veto_without_trade_id`,
+  `validate_accepts_veto_with_trade_id`;
+  `memstore_veto_scoped_per_trade_id` (veto under trade A does not block
+  trade B on the same instrument + account). Existing enter/veto validate
+  tests updated to carry a `trade_id`.
+- cli: `veto_intent_round_trips` / `clear_veto_intent_carries_name` now
+  assert the `trade_id` is set and the built intent validates.
+
+All green: core 375, worker 112, cli 230 + 8; clippy + fmt clean on host
++ wasm.
+
 ## v9 — 2026-06-10 — calendar-bars resolves instruments via instrument-lookup
 
 ### Why

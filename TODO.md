@@ -1,5 +1,43 @@
 # TODO
 
+## Active — scope vetos to trade_id (fix cross-trade veto bleed)
+
+Bug (operator, 2026-06-11): a `veto-too-high` set during an earlier setup
+blocked a later, unrelated entry on the same instrument. Vetos key on
+`(account, instrument, name)` with no trade_id, so a stale veto whose TTL
+outlived its setup (long `not_after`) silently blocked the next trade.
+
+**Decision (operator): hard-fail — every trade needs a trade_id.** No
+untagged fallback. A veto / clear-veto / enter that reaches the veto path
+with no `trade_id` is a hard error, not an instrument-wide veto.
+
+### Key shape change
+`veto:<account_or_"_">:<instrument>:<name>`
+  → `veto:<account_or_"_">:<trade_id>:<instrument>:<name>`
+(account scope kept — the 2026-05-22 cross-account fix stays.)
+
+### Steps
+- [x] core/src/state.rs: `trade_id: &str` on `StateStore::set_veto` /
+      `is_vetoed` / `clear_veto`; `VetoEntry.trade_id`; `clear_named_vetos`
+      signature. Updated memstore + retry-mock impls.
+- [x] core/src/intent.rs validate(): require `trade_id` on `Veto`,
+      `ClearVeto`, `Enter` (`MissingTradeId`, checked first). Tests.
+- [x] src/state/kv.rs: threaded trade_id into `veto_key` + the three
+      methods + index writes (retain matches on trade_id too).
+- [x] src/lib.rs: veto gate, `handle_veto`, `run_veto_with_broker`,
+      `handle_clear_veto` pass `verified.intent.trade_id` (validated
+      non-None by core; defensive guard hard-fails 400 if absent).
+- [x] cli/src/control.rs `build_veto_intent` + `build_clear_veto_intent`
+      + bins `run_veto` / `run_clear_veto`: take + set trade_id;
+      `--trade-id` flag on both subcommands. Interactive prompt added.
+- [x] Tests: `memstore_veto_scoped_per_trade_id` (veto under A doesn't
+      block B); missing trade_id hard-fails (3 new validate tests).
+- [x] README (veto YAML + scoping para + CLI examples + status snapshot),
+      CHANGELOG v10, memory `state_scoping_bug` updated.
+
+### Status: DONE — all green (core 375, worker 112, cli 230+8),
+clippy+fmt clean on host + wasm. Ready to commit + tag v10.
+
 ## Done — migrate calendar_bars::parse_instrument to instrument-lookup (v9, 0.2.0)
 
 Bug: `calendar_bars::parse_instrument` (`cli/src/calendar_bars.rs:278`) uses

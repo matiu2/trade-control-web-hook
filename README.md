@@ -368,10 +368,23 @@ to fire:
 v: 1
 action: veto
 instrument: EUR_USD
+trade_id: eurusd-hs-1     # required — the setup this veto belongs to
 name: news-window
 ttl_hours: 6
 # level: cancel-pending   # optional; default stop-next-entry
 ```
+
+**Vetos are scoped per setup, not per instrument.** The KV key is
+`veto:<account>:<trade_id>:<instrument>:<name>`, so a veto recorded under
+one `trade_id` only blocks entries that carry the **same** `trade_id`. A
+`too-high` veto fired during setup A can no longer bleed into a later,
+independent setup B on the same pair — the bug that previously stranded a
+stale veto in KV (a long `not_after` kept the old key alive past the setup
+that set it). `trade_id` is **required** on `enter`, `veto`, and
+`clear-veto`; the worker rejects an intent that omits it (HTTP 400). The
+`enter` gate looks vetos up by the entry's own `trade_id`, so the veto and
+the entry it guards must agree on the value — which they do, because every
+alert in a `build-trade` bundle shares one minted `trade_id`.
 
 The optional `level` field escalates a veto beyond a flag-only gate:
 
@@ -611,16 +624,22 @@ export TRADE_CONTROL_ENDPOINT=https://trade-control.<account>.workers.dev
 # should be dropped before TTL.)
 ./target/release/trade-control prep EUR_USD break-and-close --ttl-hours 4 \
   --key-file ~/.config/trade-control/key.hex
-./target/release/trade-control veto EUR_USD news-window --ttl-hours 6 \
+# Vetos are scoped per setup, so `veto` / `clear-veto` require --trade-id
+# (the setup the veto belongs to). It must match the trade_id the entry
+# carries, or the veto won't gate it.
+./target/release/trade-control veto EUR_USD news-window \
+  --trade-id eurusd-hs-1 --ttl-hours 6 \
   --key-file ~/.config/trade-control/key.hex
 # Escalated veto: also cancel resting pending orders for the instrument.
 # Add --level close-positions to also close open positions.
-./target/release/trade-control veto EUR_USD structure-broken --ttl-hours 4 \
+./target/release/trade-control veto EUR_USD structure-broken \
+  --trade-id eurusd-hs-1 --ttl-hours 4 \
   --level cancel-pending \
   --key-file ~/.config/trade-control/key.hex
 ./target/release/trade-control clear-prep EUR_USD break-and-close \
   --key-file ~/.config/trade-control/key.hex
 ./target/release/trade-control clear-veto EUR_USD news-window \
+  --trade-id eurusd-hs-1 \
   --key-file ~/.config/trade-control/key.hex
 
 # Stranded bad-name entries: `unlock` / `clear-prep` / `clear-veto` normally
@@ -630,7 +649,7 @@ export TRADE_CONTROL_ENDPOINT=https://trade-control.<account>.workers.dev
 # skip validation and send the name verbatim — the only way to clear a
 # stuck key short of `wrangler kv:key delete`.
 ./target/release/trade-control clear-veto "XAUUSD.F" too-low \
-  --broker tradenation --force \
+  --trade-id xauusd-hs-1 --broker tradenation --force \
   --key-file ~/.config/trade-control/key.hex
 ```
 
@@ -650,7 +669,8 @@ preps:
     set_at: "2026-05-14T02:30:00Z"
     expires_at: "2026-05-14T06:30:00Z"
 vetos:
-  - instrument: EUR_USD
+  - trade_id: eurusd-hs-1
+    instrument: EUR_USD
     name: news-window
     expires_at: "2026-05-14T09:00:00Z"
 # instruments:

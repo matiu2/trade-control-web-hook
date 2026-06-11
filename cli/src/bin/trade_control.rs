@@ -442,6 +442,12 @@ struct VetoCmdArgs {
     instrument: String,
     /// Named condition blocking entries, e.g. news-window.
     name: String,
+    /// Trade setup this veto belongs to. The veto is scoped to this
+    /// trade_id so it only blocks entries from the same setup — it
+    /// never bleeds into a later, independent trade on the same
+    /// instrument.
+    #[arg(long)]
+    trade_id: String,
     /// TTL in hours before the veto auto-expires.
     #[arg(long, default_value_t = 6)]
     ttl_hours: u32,
@@ -503,6 +509,10 @@ struct ClearVetoCmdArgs {
     instrument: String,
     /// Named veto to clear.
     name: String,
+    /// Trade setup the veto belongs to. Must match the trade_id the
+    /// veto was set under — clearing is scoped per-setup.
+    #[arg(long)]
+    trade_id: String,
     /// Broker the instrument belongs to (see `unlock --broker`).
     #[arg(long, value_enum, default_value_t = BrokerKindArg::Oanda)]
     broker: BrokerKindArg,
@@ -1201,6 +1211,7 @@ fn run_veto(args: VetoCmdArgs) -> Result<()> {
     };
     let intent = build_veto_intent(
         &instrument,
+        &args.trade_id,
         &args.name,
         args.ttl_hours,
         level,
@@ -1235,7 +1246,7 @@ fn run_clear_veto(args: ClearVetoCmdArgs) -> Result<()> {
     let instrument = canonicalize_instrument_or_force(args.broker, &args.instrument, args.force)?;
     let now = Utc::now();
     let suffix = fresh_suffix()?;
-    let intent = build_clear_veto_intent(&instrument, &args.name, now, &suffix);
+    let intent = build_clear_veto_intent(&instrument, &args.trade_id, &args.name, now, &suffix);
     let body = wrap_control(&intent, &key, now)?;
     let response = post_control(&args.common.endpoint, &body)?;
     print!("{response}");

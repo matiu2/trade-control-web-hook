@@ -71,9 +71,11 @@ pub fn required_for_action(action: Action) -> &'static [&'static str] {
         // prep-expire blocks future preps for `step`; `ttl_hours` bounds
         // the block. `trade_id` is minted by build-trade, not prompted.
         Action::PrepExpire => &["step", "ttl_hours"],
-        Action::Veto => &["name", "ttl_hours"],
+        // `trade_id` scopes the veto KV key to one setup; the worker
+        // rejects a veto / clear-veto without it.
+        Action::Veto => &["name", "trade_id", "ttl_hours"],
         Action::ClearPrep => &["step"],
-        Action::ClearVeto => &["name"],
+        Action::ClearVeto => &["name", "trade_id"],
         // `instrument` is already in `ALWAYS_REQUIRED`; nothing extra needed.
         Action::Status | Action::Unlock => &[],
         // pause/resume require `trade_id` + `blackout_id`, but those

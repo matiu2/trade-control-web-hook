@@ -109,12 +109,16 @@ pub fn build_prep_intent(
     intent
 }
 
-/// Build a `veto` Intent for a single (instrument, name) pair with a TTL.
-/// `level` controls broker side effects at fire time; pass `None` for the
-/// default flag-only behaviour ([`VetoLevel::StopNextEntry`]). `clears`
-/// lists other vetos to drop before recording this one.
+/// Build a `veto` Intent for a single (trade_id, instrument, name) with a
+/// TTL. `level` controls broker side effects at fire time; pass `None` for
+/// the default flag-only behaviour ([`VetoLevel::StopNextEntry`]). `clears`
+/// lists other vetos to drop before recording this one. `trade_id` scopes
+/// the veto to one setup so it can't bleed into another on the same
+/// instrument — the worker rejects a veto without one.
+#[allow(clippy::too_many_arguments)]
 pub fn build_veto_intent(
     instrument: &str,
+    trade_id: &str,
     name: &str,
     ttl_hours: u32,
     level: Option<VetoLevel>,
@@ -128,6 +132,7 @@ pub fn build_veto_intent(
     );
     let mut intent = control_skeleton(Action::Veto, instrument, id, now);
     intent.name = Some(name.to_string());
+    intent.trade_id = Some(trade_id.to_string());
     intent.ttl_hours = trade_control_core::tunable::Tunable::Static(ttl_hours);
     intent.level = level;
     intent.clears = clears;
@@ -153,6 +158,7 @@ pub fn build_clear_prep_intent(
 /// Build a `clear-veto` Intent for a single (instrument, name) pair.
 pub fn build_clear_veto_intent(
     instrument: &str,
+    trade_id: &str,
     name: &str,
     now: DateTime<Utc>,
     suffix: &str,
@@ -163,6 +169,7 @@ pub fn build_clear_veto_intent(
     );
     let mut intent = control_skeleton(Action::ClearVeto, instrument, id, now);
     intent.name = Some(name.to_string());
+    intent.trade_id = Some(trade_id.to_string());
     intent
 }
 
@@ -434,9 +441,19 @@ mod tests {
 
     #[test]
     fn veto_intent_round_trips() {
-        let intent = build_veto_intent("EUR_USD", "news-window", 6, None, Vec::new(), t(), "cd34");
+        let intent = build_veto_intent(
+            "EUR_USD",
+            "eurusd-hs-1",
+            "news-window",
+            6,
+            None,
+            Vec::new(),
+            t(),
+            "cd34",
+        );
         assert_eq!(intent.action, Action::Veto);
         assert_eq!(intent.name.as_deref(), Some("news-window"));
+        assert_eq!(intent.trade_id.as_deref(), Some("eurusd-hs-1"));
         match &intent.ttl_hours {
             trade_control_core::tunable::Tunable::Static(n) => assert_eq!(*n, 6),
             other => panic!("expected Static(6) ttl_hours, got {other:?}"),
@@ -445,6 +462,9 @@ mod tests {
         let yaml = serde_yaml::to_string(&intent).unwrap();
         let parsed: Intent = serde_yaml::from_str(&yaml).unwrap();
         assert_eq!(parsed.action, Action::Veto);
+        // The built intent must pass worker-side validation (trade_id
+        // is now mandatory on veto).
+        intent.validate().expect("veto intent should validate");
     }
 
     #[test]
@@ -460,9 +480,13 @@ mod tests {
 
     #[test]
     fn clear_veto_intent_carries_name() {
-        let intent = build_clear_veto_intent("EUR_USD", "news-window", t(), "gh78");
+        let intent = build_clear_veto_intent("EUR_USD", "eurusd-hs-1", "news-window", t(), "gh78");
         assert_eq!(intent.action, Action::ClearVeto);
         assert_eq!(intent.name.as_deref(), Some("news-window"));
+        assert_eq!(intent.trade_id.as_deref(), Some("eurusd-hs-1"));
+        intent
+            .validate()
+            .expect("clear-veto intent should validate");
     }
 
     #[test]

@@ -46,9 +46,9 @@ impl KvStateStore {
         format!("prep:{scope}:{instrument}:{step}")
     }
 
-    fn veto_key(account: Option<&str>, instrument: &str, name: &str) -> String {
+    fn veto_key(account: Option<&str>, trade_id: &str, instrument: &str, name: &str) -> String {
         let scope = account_scope(account);
-        format!("veto:{scope}:{instrument}:{name}")
+        format!("veto:{scope}:{trade_id}:{instrument}:{name}")
     }
 
     fn prep_block_key(account: Option<&str>, instrument: &str, step: &str) -> String {
@@ -466,11 +466,12 @@ impl StateStore for KvStateStore {
     async fn set_veto(
         &self,
         account: Option<&str>,
+        trade_id: &str,
         instrument: &str,
         name: &str,
         ttl_seconds: u64,
     ) -> Result<(), StateError> {
-        let key = Self::veto_key(account, instrument, name);
+        let key = Self::veto_key(account, trade_id, instrument, name);
         let ttl = ttl_seconds.max(MIN_TTL_SECONDS);
         self.store
             .put(&key, "1")
@@ -485,9 +486,13 @@ impl StateStore for KvStateStore {
         let account_owned = account.map(str::to_string);
         let mut entries = prune_expired(self.read_veto_index().await?, now);
         entries.retain(|e| {
-            !(e.instrument == instrument && e.name == name && e.account == account_owned)
+            !(e.trade_id == trade_id
+                && e.instrument == instrument
+                && e.name == name
+                && e.account == account_owned)
         });
         entries.push(VetoEntry {
+            trade_id: trade_id.to_string(),
             instrument: instrument.to_string(),
             name: name.to_string(),
             expires_at,
@@ -503,14 +508,16 @@ impl StateStore for KvStateStore {
     async fn is_vetoed(
         &self,
         account: Option<&str>,
+        trade_id: &str,
         instrument: &str,
         name: &str,
     ) -> Result<bool, StateError> {
         // Global vetos affect every account; check the global key
         // first, then the account-scoped key if one was requested. Two
         // GETs in the rare-collision case; one GET on the common path
-        // where there's no account-specific veto.
-        let global = Self::veto_key(None, instrument, name);
+        // where there's no account-specific veto. Both keys are scoped
+        // to `trade_id` so a veto from a different setup never matches.
+        let global = Self::veto_key(None, trade_id, instrument, name);
         if self
             .store
             .get(&global)
@@ -522,7 +529,7 @@ impl StateStore for KvStateStore {
             return Ok(true);
         }
         if account.is_some() {
-            let scoped = Self::veto_key(account, instrument, name);
+            let scoped = Self::veto_key(account, trade_id, instrument, name);
             let scoped_hit = self
                 .store
                 .get(&scoped)
@@ -540,12 +547,14 @@ impl StateStore for KvStateStore {
     async fn clear_veto(
         &self,
         account: Option<&str>,
+        trade_id: &str,
         instrument: &str,
         name: &str,
     ) -> Result<bool, StateError> {
         // Scoped clear — clearing on one account doesn't touch a
-        // different account's veto or the global veto.
-        let key = Self::veto_key(account, instrument, name);
+        // different account's veto or the global veto, and clearing
+        // under one trade_id doesn't touch another setup's veto.
+        let key = Self::veto_key(account, trade_id, instrument, name);
         let was = self
             .store
             .get(&key)
@@ -564,7 +573,10 @@ impl StateStore for KvStateStore {
         let mut entries = prune_expired(self.read_veto_index().await?, now);
         let before = entries.len();
         entries.retain(|e| {
-            !(e.instrument == instrument && e.name == name && e.account == account_owned)
+            !(e.trade_id == trade_id
+                && e.instrument == instrument
+                && e.name == name
+                && e.account == account_owned)
         });
         if entries.len() != before || was {
             self.write_veto_index(&entries).await?;

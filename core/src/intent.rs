@@ -870,6 +870,13 @@ pub enum IntentValidationError {
     /// a zero/negative/NaN value would silently zero or invert the trade
     /// geometry.
     PipSizeInvalid,
+    /// `enter` / `veto` / `clear-veto` reached validation without a
+    /// `trade_id`. The veto KV key is
+    /// `veto:<account>:<trade_id>:<instrument>:<name>` — without a
+    /// `trade_id` a veto would either bleed across every setup on the
+    /// instrument (the 2026-06-11 bug) or fail to match the entry it's
+    /// meant to block. Every veto and every entry carries one.
+    MissingTradeId,
 }
 
 impl core::fmt::Display for IntentValidationError {
@@ -934,6 +941,9 @@ impl core::fmt::Display for IntentValidationError {
                 "mw params invalid: anchor prices must be finite, spread_pips >= 0, pip_size > 0",
             ),
             Self::PipSizeInvalid => f.write_str("pip_size must be finite and > 0"),
+            Self::MissingTradeId => {
+                f.write_str("trade_id is required on action: enter | veto | clear-veto")
+            }
         }
     }
 }
@@ -950,6 +960,20 @@ impl Intent {
             && !is_valid_trade_id(id)
         {
             return Err(IntentValidationError::InvalidTradeId);
+        }
+        // Every veto-touching action must carry a trade_id: the veto KV
+        // key is scoped per-setup (`veto:<account>:<trade_id>:<instrument>:
+        // <name>`) so a veto from one setup can't bleed into another on
+        // the same instrument. Enter is included because the entry gate
+        // looks vetos up by the entry's own trade_id — an untagged entry
+        // could never match a (correctly tagged) veto. See the 2026-06-11
+        // cross-trade veto-bleed fix.
+        if matches!(
+            self.action,
+            Action::Enter | Action::Veto | Action::ClearVeto
+        ) && self.trade_id.is_none()
+        {
+            return Err(IntentValidationError::MissingTradeId);
         }
         // Multi-shot gate: anything other than the default `Static(0)`
         // counts as opting in. Scripts always count — we can't know at
@@ -1936,19 +1960,17 @@ mod tests {
 
     #[test]
     fn intent_defaults_trade_id_to_none() {
-        // Pre-existing intents on the wire don't carry `trade_id`; the
-        // field must be back-compatible.
+        // The `trade_id` field is serde-optional — an intent that omits
+        // it deserialises with `trade_id: None`. (Enter / veto / clear-veto
+        // then require one at validate time — see
+        // `validate_rejects_enter_without_trade_id` — but a control action
+        // like `status` doesn't, so it round-trips and validates here.)
         let yaml = "
             v: 1
             id: t-1
             not_after: \"2026-05-13T20:00:00Z\"
-            action: enter
+            action: status
             instrument: EUR_USD
-            direction: long
-            entry: { type: market }
-            stop_loss: { from: low, offset_pips: -2 }
-            take_profit: { from: close, offset_r: 2.0 }
-            risk_pct: 0.5
         ";
         let intent: Intent = serde_yaml::from_str(yaml).unwrap();
         assert_eq!(intent.trade_id, None);
@@ -2445,6 +2467,7 @@ mod tests {
         let yaml = "
             v: 1
             id: mr-zero
+            trade_id: eurusd-hs-1
             not_after: \"2026-05-13T20:00:00Z\"
             action: enter
             instrument: EUR_USD
@@ -2460,7 +2483,12 @@ mod tests {
     }
 
     #[test]
-    fn validate_rejects_max_retries_without_trade_id() {
+    fn validate_rejects_enter_without_trade_id() {
+        // An enter with no trade_id is rejected outright now (2026-06-11):
+        // the veto gate looks vetos up by the entry's trade_id, so an
+        // untagged entry could never match its setup's vetos. This fires
+        // before the older max_retries-without-trade_id check (both would
+        // be true here — MissingTradeId is the more fundamental contract).
         let yaml = "
             v: 1
             id: mr-no-tid
@@ -2477,7 +2505,7 @@ mod tests {
         let intent: Intent = serde_yaml::from_str(yaml).unwrap();
         assert_eq!(
             intent.validate(),
-            Err(IntentValidationError::MaxRetriesWithoutTradeId)
+            Err(IntentValidationError::MissingTradeId)
         );
     }
 
@@ -2526,6 +2554,7 @@ mod tests {
         let yaml = "
             v: 1
             id: veto-no-ttl
+            trade_id: eurusd-hs-1
             not_after: \"2026-05-13T20:00:00Z\"
             action: veto
             instrument: EUR_USD
@@ -2536,6 +2565,60 @@ mod tests {
             intent.validate(),
             Err(IntentValidationError::MissingTtlHours)
         );
+    }
+
+    #[test]
+    fn validate_rejects_veto_without_trade_id() {
+        // The veto KV key is scoped per-setup; a veto with no trade_id
+        // would bleed across every setup on the instrument (the
+        // 2026-06-11 bug). MissingTradeId fires before the ttl check.
+        let yaml = "
+            v: 1
+            id: veto-no-tid
+            not_after: \"2026-05-13T20:00:00Z\"
+            action: veto
+            instrument: EUR_USD
+            name: too-high
+            ttl_hours: 12
+        ";
+        let intent: Intent = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(
+            intent.validate(),
+            Err(IntentValidationError::MissingTradeId)
+        );
+    }
+
+    #[test]
+    fn validate_rejects_clear_veto_without_trade_id() {
+        let yaml = "
+            v: 1
+            id: clear-veto-no-tid
+            not_after: \"2026-05-13T20:00:00Z\"
+            action: clear-veto
+            instrument: EUR_USD
+            name: too-high
+        ";
+        let intent: Intent = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(
+            intent.validate(),
+            Err(IntentValidationError::MissingTradeId)
+        );
+    }
+
+    #[test]
+    fn validate_accepts_veto_with_trade_id() {
+        let yaml = "
+            v: 1
+            id: veto-ok
+            trade_id: eurusd-hs-1
+            not_after: \"2026-05-13T20:00:00Z\"
+            action: veto
+            instrument: EUR_USD
+            name: too-high
+            ttl_hours: 12
+        ";
+        let intent: Intent = serde_yaml::from_str(yaml).unwrap();
+        intent.validate().unwrap();
     }
 
     #[test]
@@ -2618,6 +2701,7 @@ mod tests {
         let yaml = "
             v: 1
             id: enter-no-ttl
+            trade_id: eurusd-hs-1
             not_after: \"2026-05-13T20:00:00Z\"
             action: enter
             instrument: EUR_USD
@@ -2636,6 +2720,7 @@ mod tests {
         let yaml = "
             v: 1
             id: ae-1
+            trade_id: eurusd-hs-1
             not_after: \"2026-05-13T20:00:00Z\"
             action: enter
             instrument: EUR_USD
@@ -2655,6 +2740,7 @@ mod tests {
         let yaml = "
             v: 1
             id: ae-2
+            trade_id: eurusd-hs-1
             not_after: \"2026-05-13T20:00:00Z\"
             action: enter
             instrument: EUR_USD
@@ -2678,6 +2764,7 @@ mod tests {
         let yaml = "
             v: 1
             id: ae-3
+            trade_id: eurusd-hs-1
             not_after: \"2026-05-13T20:00:00Z\"
             action: enter
             instrument: EUR_USD
@@ -2860,6 +2947,7 @@ mod tests {
         let yaml = "
             v: 1
             id: ac-enter
+            trade_id: eurusd-hs-1
             not_after: \"2026-05-13T20:00:00Z\"
             action: enter
             instrument: EUR_USD
@@ -3051,6 +3139,7 @@ mod tests {
         let yaml = "
             v: 1
             id: iw-enter
+            trade_id: eurusd-hs-1
             not_after: \"2026-05-13T20:00:00Z\"
             action: enter
             instrument: EUR_USD
@@ -3201,6 +3290,7 @@ mod tests {
         "
             v: 1
             id: mw-eurusd-abc
+            trade_id: mw-eurusd-1
             not_after: \"2026-05-13T20:00:00Z\"
             action: enter
             instrument: EUR_USD
@@ -3295,6 +3385,7 @@ mod tests {
         "
             v: 1
             id: hs-usdjpy-abc
+            trade_id: usdjpy-hs-1
             not_after: \"2026-05-13T20:00:00Z\"
             action: enter
             instrument: USD_JPY

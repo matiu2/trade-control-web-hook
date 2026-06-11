@@ -588,6 +588,7 @@ mod tests {
         async fn set_veto(
             &self,
             _account: Option<&str>,
+            _trade_id: &str,
             _instrument: &str,
             _name: &str,
             _ttl_seconds: u64,
@@ -597,6 +598,7 @@ mod tests {
         async fn is_vetoed(
             &self,
             _account: Option<&str>,
+            _trade_id: &str,
             _instrument: &str,
             _name: &str,
         ) -> Result<bool, StateError> {
@@ -605,6 +607,7 @@ mod tests {
         async fn clear_veto(
             &self,
             _account: Option<&str>,
+            _trade_id: &str,
             _instrument: &str,
             _name: &str,
         ) -> Result<bool, StateError> {

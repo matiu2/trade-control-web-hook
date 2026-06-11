@@ -298,6 +298,16 @@ fn prompt_for_field(field: &str, template: &Value) -> Result<Value> {
                 .interact_text()?;
             Ok(Value::Number(n.into()))
         }
+        "trade_id" => {
+            // The setup this veto / clear-veto belongs to. Scopes the
+            // veto KV key so it only blocks entries from the same trade.
+            // Must be a valid slug (lowercase alphanumerics + hyphens);
+            // the worker rejects a malformed one.
+            let s: String = Input::with_theme(&theme)
+                .with_prompt("trade_id (the setup this veto belongs to, e.g. eurusd-hs-1)")
+                .interact_text()?;
+            Ok(Value::String(s))
+        }
         other => Err(eyre!("no prompt configured for field `{other}`")),
     }
 }

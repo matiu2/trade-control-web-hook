@@ -979,11 +979,26 @@ async fn run_enter<B: Broker>(
     // Veto gate — entry is rejected if any opted-in veto is active.
     // Scope the check to the entry's `account` so a veto on a different
     // account doesn't block this trade; a global veto (set with no
-    // `account:`) still blocks every account by design.
+    // `account:`) still blocks every account by design. The veto lookup
+    // is also scoped to this entry's `trade_id` so a veto from a
+    // different setup on the same instrument can't block it
+    // (2026-06-11 fix). `Intent::validate` guarantees `trade_id` is
+    // present on `enter`; the guard here is defence-in-depth.
+    let Some(trade_id) = verified.intent.trade_id.as_deref() else {
+        console_error!(
+            "enter missing trade_id at veto gate (id={})",
+            verified.intent.id
+        );
+        return ActionResult::Rejected {
+            response: Response::error("enter requires trade_id", 400),
+            outcome: "rejected: missing-trade-id".into(),
+        };
+    };
     for veto in &verified.intent.vetos {
         match store
             .is_vetoed(
                 verified.intent.account.as_deref(),
+                trade_id,
                 &verified.intent.instrument,
                 veto,
             )
@@ -1465,6 +1480,12 @@ async fn handle_veto(
     let Some(name) = verified.intent.name.as_deref() else {
         return Response::error("veto requires `name`", 400);
     };
+    // `Intent::validate` guarantees `trade_id` on `veto`; guard here is
+    // defence-in-depth. The veto key is scoped per-setup so it can't
+    // bleed into a different setup on the same instrument.
+    let Some(trade_id) = verified.intent.trade_id.as_deref() else {
+        return Response::error("veto requires trade_id", 400);
+    };
     let ttl_hours = match resolve_phase1_u32(
         "ttl_hours",
         Some(&verified.intent.ttl_hours),
@@ -1481,11 +1502,13 @@ async fn handle_veto(
     let ttl_seconds = veto_ttl_seconds(ttl_hours, verified.intent.not_after, now);
     // Clear any vetos listed in `clears` first — symmetry with prep
     // ordering, even though vetos don't carry timestamps. Scoped to
-    // this intent's account, same as the `set_veto` that follows.
+    // this intent's account + trade_id, same as the `set_veto` that
+    // follows.
     let account = verified.intent.account.as_deref();
     let cleared = match clear_named_vetos(
         store,
         account,
+        trade_id,
         &verified.intent.instrument,
         &verified.intent.clears,
     )
@@ -1498,7 +1521,13 @@ async fn handle_veto(
         }
     };
     if let Err(err) = store
-        .set_veto(account, &verified.intent.instrument, name, ttl_seconds)
+        .set_veto(
+            account,
+            trade_id,
+            &verified.intent.instrument,
+            name,
+            ttl_seconds,
+        )
         .await
     {
         console_error!("KV set_veto: {err}");
@@ -1561,6 +1590,14 @@ async fn run_veto_with_broker<B: Broker>(
             outcome: "rejected: missing-name".into(),
         };
     };
+    // `Intent::validate` guarantees `trade_id` on `veto`; guard here is
+    // defence-in-depth (the veto key is scoped per-setup).
+    let Some(trade_id) = verified.intent.trade_id.as_deref() else {
+        return ActionResult::Rejected {
+            response: Response::error("veto requires trade_id", 400),
+            outcome: "rejected: missing-trade-id".into(),
+        };
+    };
     let ttl_hours = match resolve_phase1_u32(
         "ttl_hours",
         Some(&verified.intent.ttl_hours),
@@ -1581,7 +1618,14 @@ async fn run_veto_with_broker<B: Broker>(
     let ttl_seconds = veto_ttl_seconds(ttl_hours, verified.intent.not_after, now);
     let instrument = &verified.intent.instrument;
     let account = verified.intent.account.as_deref();
-    let cleared = match clear_named_vetos(store, account, instrument, &verified.intent.clears).await
+    let cleared = match clear_named_vetos(
+        store,
+        account,
+        trade_id,
+        instrument,
+        &verified.intent.clears,
+    )
+    .await
     {
         Ok(c) => c,
         Err(err) => {
@@ -1589,7 +1633,10 @@ async fn run_veto_with_broker<B: Broker>(
             Vec::new()
         }
     };
-    if let Err(err) = store.set_veto(account, instrument, name, ttl_seconds).await {
+    if let Err(err) = store
+        .set_veto(account, trade_id, instrument, name, ttl_seconds)
+        .await
+    {
         console_error!("KV set_veto: {err}");
         return ActionResult::Rejected {
             response: Response::error("state error", 500),
@@ -1700,9 +1747,14 @@ async fn handle_clear_veto(
     let Some(name) = verified.intent.name.as_deref() else {
         return Response::error("clear-veto requires `name`", 400);
     };
+    // `Intent::validate` guarantees `trade_id` on `clear-veto`; the veto
+    // key is scoped per-setup so a clear only drops this setup's veto.
+    let Some(trade_id) = verified.intent.trade_id.as_deref() else {
+        return Response::error("clear-veto requires trade_id", 400);
+    };
     let account = verified.intent.account.as_deref();
     let was = match store
-        .clear_veto(account, &verified.intent.instrument, name)
+        .clear_veto(account, trade_id, &verified.intent.instrument, name)
         .await
     {
         Ok(b) => b,
@@ -2350,6 +2402,7 @@ mod dispatcher_outcome_tests {
         async fn set_veto(
             &self,
             _account: Option<&str>,
+            _trade_id: &str,
             _instrument: &str,
             _name: &str,
             _ttl_seconds: u64,
@@ -2359,6 +2412,7 @@ mod dispatcher_outcome_tests {
         async fn is_vetoed(
             &self,
             _account: Option<&str>,
+            _trade_id: &str,
             _instrument: &str,
             _name: &str,
         ) -> Result<bool, StateError> {
@@ -2367,6 +2421,7 @@ mod dispatcher_outcome_tests {
         async fn clear_veto(
             &self,
             _account: Option<&str>,
+            _trade_id: &str,
             _instrument: &str,
             _name: &str,
         ) -> Result<bool, StateError> {
