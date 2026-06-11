@@ -1,5 +1,44 @@
 # Changelog
 
+## v12 — 2026-06-12 — align remaining workspace crates to broker-tradenation-v0.8.0
+
+### Why
+
+v11 bumped the worker lib's `tradenation-api` pin but missed two other
+workspace members that depend on the same git repo: `cli/` (the
+`trade-control` CLI) and `tv-arm/`. Both still pinned the old source —
+`cli` via `branch = "main"` + `version = "0.1.0"`, `tv-arm` via
+`tag = "broker-tradenation-v0.7.0"`. With the lib now resolving the repo to
+0.2.0 (`v0.8.0`), `deploy.sh`'s `cargo install --path ./cli` step failed:
+
+```
+failed to select a version for the requirement `tradenation-api = "^0.1.0"`
+candidate versions found which didn't match: 0.2.0
+```
+
+A git dependency unifies to one source per repo across a workspace, so the
+mismatched pins also forced Cargo to compile the repo **twice** (v0.7.0 +
+v0.8.0 trees side by side).
+
+### What changed
+
+- `cli/Cargo.toml`: `tradenation-api` and `tradenation-instrument-cache`
+  moved from `branch = "main"` / `0.1.0` to `tag = "broker-tradenation-v0.8.0"`
+  / `0.2.0`.
+- `tv-arm/Cargo.toml`: `tradenation-api` moved from `v0.7.0` / `0.1.0` to
+  `v0.8.0` / `0.2.0`.
+- Neither crate touches the renamed timestamp record fields — `cli` uses the
+  client/order/instrument-cache APIs, `tv-arm` only `TradeNationClient` +
+  `latest_bid_ask` (in a test). No code changes needed; both compile clean.
+- `Cargo.lock` drops the entire duplicate v0.7.0 subtree (−93 lines); the
+  workspace now has a single `tradenation-api` source.
+
+### Verification
+
+`cargo install --path ./cli` (the failing deploy step) now succeeds.
+Whole-workspace `build --all-targets`, `test` (375 + 112 + 139 + 76 + 23
+…), `clippy -D warnings`, `fmt --check`, and the wasm32 lib build all pass.
+
 ## v11 — 2026-06-12 — bump tradenation-api to broker-tradenation-v0.8.0
 
 ### Why
