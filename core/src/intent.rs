@@ -695,6 +695,32 @@ pub struct Intent {
     /// so the worker's existing band-hit machinery is reused.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub sr_bands: Vec<[f64; 2]>,
+    /// **Experimental, default OFF.** On a reversal-close (`Action::Close`
+    /// carrying a `Price` window — i.e. `inside_window` contains `Price`,
+    /// or the deprecated `require_price_in_ranges` is set), also write a
+    /// `reversal` veto for this `trade_id` when the close gate passes.
+    ///
+    /// The motivating case: a reversal off support/resistance that lands
+    /// *before* the entry fires. Today the reversal-close just flattens an
+    /// open position; if no position is open yet it's a no-op and the
+    /// later `enter` goes in anyway — even though the reversal was a strong
+    /// "this trade won't work" signal (see the 2026-06 incident note in
+    /// the README). With this flag, the same gate-pass also records a
+    /// `reversal` veto, so the later `enter` for this `trade_id` is
+    /// rejected by the existing [`StateStore::is_vetoed`] gate.
+    ///
+    /// Semantics are **StopNextEntry-style**: the veto only blocks future
+    /// entries. It never force-closes a position beyond the close this
+    /// intent already performs — consistent with the rule that an
+    /// entry-gate veto must not close a trade. The veto is written on
+    /// **every** gate-pass (idempotent key, TTL refreshed); post-entry it
+    /// harmlessly prevents a re-entry for the rest of the window.
+    ///
+    /// Validation: only legal on `Action::Close`, and only when a price
+    /// window is actually configured (otherwise there's no reversal to
+    /// veto on). Default `false` = byte-identical to pre-feature wire.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub veto_on_reversal: bool,
     /// Free-form human-readable label for a `pause` (or any other
     /// action that wants to record context). Surfaces in the seen
     /// index outcome string so operators can answer "why is this
@@ -819,6 +845,14 @@ pub enum IntentValidationError {
     InsideWindowSrBandsMismatch,
     /// One of the bands in [`Intent::sr_bands`] has `lo > hi`.
     InvalidSrBands,
+    /// `veto_on_reversal: true` on an action other than `Close` — the
+    /// veto-on-reversal hook only fires from a reversal-close.
+    VetoOnReversalOnNonClose,
+    /// `veto_on_reversal: true` on a `Close` that has no price window
+    /// configured (`inside_window` lacks `Price` and
+    /// `require_price_in_ranges` is unset) — there's no reversal band to
+    /// hang the veto on, so the flag would never do anything.
+    VetoOnReversalWithoutPriceWindow,
     /// New consolidated close-gate fields ([`Intent::inside_window`] or
     /// [`Intent::sr_bands`]) were set alongside the deprecated
     /// [`Intent::require_news_window`] or [`Intent::require_price_in_ranges`].
@@ -905,6 +939,13 @@ impl core::fmt::Display for IntentValidationError {
                 f.write_str("inside_window must contain `price` iff sr_bands is non-empty")
             }
             Self::InvalidSrBands => f.write_str("sr_bands must have lo <= hi on every band"),
+            Self::VetoOnReversalOnNonClose => {
+                f.write_str("veto_on_reversal is only valid on action: close")
+            }
+            Self::VetoOnReversalWithoutPriceWindow => f.write_str(
+                "veto_on_reversal requires a price window (inside_window: [..., price] + sr_bands, \
+                 or require_price_in_ranges)",
+            ),
             Self::MixedOldAndNewCloseGates => f.write_str(
                 "the new close-gate fields (inside_window / sr_bands) cannot be mixed with \
                  the deprecated require_news_window / require_price_in_ranges — pick one form",
@@ -1091,6 +1132,19 @@ impl Intent {
         }
         if self.sr_bands.iter().any(|[lo, hi]| lo > hi) {
             return Err(IntentValidationError::InvalidSrBands);
+        }
+        // veto_on_reversal: experimental hook that turns a reversal-close
+        // into an entry veto. Only meaningful on a `close` that actually
+        // has a price window to reverse off — otherwise the flag is dead.
+        if self.veto_on_reversal {
+            if self.action != Action::Close {
+                return Err(IntentValidationError::VetoOnReversalOnNonClose);
+            }
+            let has_price_window = self.inside_window.contains(&EventWindow::Price)
+                || self.require_price_in_ranges.is_some();
+            if !has_price_window {
+                return Err(IntentValidationError::VetoOnReversalWithoutPriceWindow);
+            }
         }
         // M/W static params: only on `enter` (they drive stop-entry
         // geometry), and every field must be sane — non-finite anchors,
@@ -3173,6 +3227,115 @@ mod tests {
         assert_eq!(
             intent.validate(),
             Err(IntentValidationError::InvalidSrBands)
+        );
+    }
+
+    #[test]
+    fn veto_on_reversal_defaults_off_and_skips_serialization() {
+        // Absent on the wire → false; and a false flag must not serialize
+        // so existing reversal-close alerts stay byte-identical.
+        let yaml = "
+            v: 1
+            id: rev-default
+            trade_id: t1
+            not_after: \"2026-05-13T20:00:00Z\"
+            action: close
+            instrument: EUR_USD
+            inside_window: [price]
+            sr_bands: [[1.0950, 1.0970]]
+        ";
+        let intent: Intent = serde_yaml::from_str(yaml).unwrap();
+        assert!(!intent.veto_on_reversal);
+        let out = serde_yaml::to_string(&intent).unwrap();
+        assert!(
+            !out.contains("veto_on_reversal"),
+            "false flag must skip-serialize, got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn veto_on_reversal_round_trips_when_set() {
+        let yaml = "
+            v: 1
+            id: rev-on
+            trade_id: t1
+            not_after: \"2026-05-13T20:00:00Z\"
+            action: close
+            instrument: EUR_USD
+            inside_window: [price]
+            sr_bands: [[1.0950, 1.0970]]
+            veto_on_reversal: true
+        ";
+        let intent: Intent = serde_yaml::from_str(yaml).unwrap();
+        assert!(intent.veto_on_reversal);
+        intent
+            .validate()
+            .expect("close + price window + veto_on_reversal is valid");
+        let out = serde_yaml::to_string(&intent).unwrap();
+        assert!(out.contains("veto_on_reversal: true"));
+    }
+
+    #[test]
+    fn veto_on_reversal_accepts_deprecated_price_window() {
+        // The old wire form (require_price_in_ranges) is still a price
+        // window, so veto_on_reversal is valid alongside it.
+        let yaml = "
+            v: 1
+            id: rev-old
+            trade_id: t1
+            not_after: \"2026-05-13T20:00:00Z\"
+            action: close
+            instrument: EUR_USD
+            require_price_in_ranges: [[1.0950, 1.0970]]
+            veto_on_reversal: true
+        ";
+        let intent: Intent = serde_yaml::from_str(yaml).unwrap();
+        intent
+            .validate()
+            .expect("close + require_price_in_ranges + veto_on_reversal is valid");
+    }
+
+    #[test]
+    fn validate_rejects_veto_on_reversal_on_non_close() {
+        let yaml = "
+            v: 1
+            id: rev-enter
+            trade_id: eurusd-hs-1
+            not_after: \"2026-05-13T20:00:00Z\"
+            action: enter
+            instrument: EUR_USD
+            direction: long
+            entry: { type: market }
+            stop_loss: { from: low, offset_pips: -2 }
+            take_profit: { from: close, offset_r: 2.0 }
+            risk_pct: 0.5
+            veto_on_reversal: true
+        ";
+        let intent: Intent = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(
+            intent.validate(),
+            Err(IntentValidationError::VetoOnReversalOnNonClose)
+        );
+    }
+
+    #[test]
+    fn validate_rejects_veto_on_reversal_without_price_window() {
+        // A news-only reversal-close has no band to reverse off — the
+        // flag would be inert, so reject it as a builder bug.
+        let yaml = "
+            v: 1
+            id: rev-news-only
+            trade_id: t1
+            not_after: \"2026-05-13T20:00:00Z\"
+            action: close
+            instrument: EUR_USD
+            inside_window: [news]
+            veto_on_reversal: true
+        ";
+        let intent: Intent = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(
+            intent.validate(),
+            Err(IntentValidationError::VetoOnReversalWithoutPriceWindow)
         );
     }
 

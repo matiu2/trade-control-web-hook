@@ -704,6 +704,7 @@ fn build_mw_trade_spec(
         // close coverage is not wired.
         close_on_news: false,
         sr_reversal_ranges: Vec::new(),
+        veto_on_reversal: false,
         needs_confirmed_close: false,
         prep_expiries: Vec::new(),
         mw: Some(cli::MwSpec {
@@ -907,6 +908,7 @@ fn build_trade_spec(
         needs_confirmed: args.require_confirmation,
         close_on_news: !roles.news_pairs.is_empty(),
         sr_reversal_ranges: build_sr_ranges(roles, args.reversal_band_pct),
+        veto_on_reversal: args.veto_on_reversal,
         needs_confirmed_close: false,
         // Populated from the chart's `<prep>-expiry` vertical lines —
         // see `prep_expiry_steps`.

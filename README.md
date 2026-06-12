@@ -30,6 +30,19 @@ Trading:
   - **Ad-hoc filter** (AND-composed): `allow_close: <Rhai script>` —
     symmetric with `allow_entry` but bound to the shell-anchor scope
     only (no resolved SL/TP geometry to read).
+  - **Veto-on-reversal hook** (experimental, default off): `veto_on_reversal:
+    true` on a price-windowed reversal-close. When the close gate passes,
+    the worker *also* writes a `reversal` veto for this `trade_id`, so a
+    *later* `enter` for the same setup is blocked by the entry-side veto
+    gate. The motivating case: a reversal off support/resistance that lands
+    **before** the entry fires — today the close is a no-op (no position
+    yet) and the entry goes in anyway, even though the reversal was a strong
+    "this trade won't work" signal. The veto is StopNextEntry-style: it only
+    blocks future entries, never force-closes beyond the close this intent
+    already performs. Written on every gate-pass (idempotent, TTL = life of
+    the alert window). Requires a price window (`inside_window` ∋ `price` +
+    `sr_bands`, or the deprecated `require_price_in_ranges`) and a
+    `trade_id`; rejected at validate time otherwise.
   - **Deprecated form** (still accepted for in-flight alerts):
     `require_news_window: true` and/or `require_price_in_ranges: [[lo, hi], ...]`.
     Mixing the old and new forms on one intent is a validation error —
@@ -91,7 +104,7 @@ Basename ordering matters — `tv-arm` maps drawings to alerts by prefix.
 | `03-prep-break-and-close` | `prep` | Trendline crossing (neckline break) | Skippable for stocks / late entries with `--skip-break-and-close`. |
 | `04-prep-retest` | `prep` | Trendline crossing (retest from below) | Skippable with `--skip-retest`. |
 | `05-enter` | `enter` | Pine `Candle Signals` golden candle | The actual trade. Gated on the preps above + opposing-direction veto absent. |
-| `06-close-on-reversal` | `close` | Pine `Candle Signals` opposing reversal | Emitted when news-pairs and/or `support`/`resistance` lines are drawn. Carries `inside_window: [news?, price?]` (OR-composed) and, when `price` is listed, `sr_bands: [[lo, hi], ...]`. Defaults `needs_golden: true` for the candle-quality gate. |
+| `06-close-on-reversal` | `close` | Pine `Candle Signals` opposing reversal | Emitted when news-pairs and/or `support`/`resistance` lines are drawn. Carries `inside_window: [news?, price?]` (OR-composed) and, when `price` is listed, `sr_bands: [[lo, hi], ...]`. Defaults `needs_golden: true` for the candle-quality gate. With `tv-arm --veto-on-reversal` (experimental) it also carries `veto_on_reversal: true`, so a reversal off a band before entry vetoes the upcoming trade — see the `close` action notes above. |
 | `08-prep-expire-<step>` | `prep-expire` | Vertical line crossing chart time | Emitted once per chart-drawn `<prep>-expiry` line (`break-and-close-expiry`, `retest-expiry`). When crossed, blocks any further `<step>` prep on the trade — so a setup whose prep lands too late never enters. Drawing-bound. `<step>` is the canonical prep name and may contain hyphens. |
 
 The legacy `07-close-on-sr-reversal` basename is no longer emitted —
@@ -972,6 +985,7 @@ cargo run -p tv-arm -- \
   --account-id ms-tn-1 \              # defaults to ms-<broker>-1
   --risk-pct 0.5 \                    # % of NAV (or --risk-amount <home-ccy>)
   --reversal-band-pct 0.1 \           # half-width % around support/resistance lines (default 0.1)
+  --veto-on-reversal \                # experimental: a reversal off a band before entry also vetoes the upcoming trade (default off)
   --skip-break-and-close \            # for stocks (no after-hours retests)
   --skip-retest \                     # implies --skip-break-and-close; for late entries
   --require-golden \                  # require Pine golden-candle signal on entry

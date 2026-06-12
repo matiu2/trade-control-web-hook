@@ -141,6 +141,16 @@ pub struct Args {
     #[arg(long, default_value_t = 0.1)]
     pub reversal_band_pct: f64,
 
+    /// **Experimental, default OFF.** Make a reversal off a chart-drawn
+    /// `support` / `resistance` band *also* veto the upcoming entry, not
+    /// just close an open position. When set, the emitted
+    /// `06-close-on-reversal` intent carries `veto_on_reversal: true`, so
+    /// a reversal that lands before the entry fires blocks the trade
+    /// entirely (the worker writes a `reversal` veto for the trade_id).
+    /// Only takes effect when support/resistance bands are present.
+    #[arg(long)]
+    pub veto_on_reversal: bool,
+
     /// (M/W only) Raise the neckline-retracement ceiling from the
     /// default `< 40%` to `<= 50%`. A retrace deeper than 40% of the
     /// runup is a marginal double-top/bottom; pass this to arm it

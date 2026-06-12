@@ -190,6 +190,7 @@ mod tests {
             require_price_in_ranges: None,
             inside_window: Vec::new(),
             sr_bands: Vec::new(),
+            veto_on_reversal: false,
             reason: None,
             mw: Some(mw),
             pip_size: Some(mw.pip_size),

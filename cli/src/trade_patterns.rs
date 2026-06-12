@@ -367,6 +367,15 @@ pub struct TradeSpec {
     /// OR-gated. Default empty.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub sr_reversal_ranges: Vec<[f64; 2]>,
+    /// **Experimental, default OFF.** When true, the emitted
+    /// `06-close-on-reversal` intent carries `veto_on_reversal: true`, so
+    /// a reversal off one of the `sr_reversal_ranges` bands *also* writes
+    /// a `reversal` veto blocking the upcoming `enter` (not just flattens
+    /// an open position). Only takes effect when [`Self::sr_reversal_ranges`]
+    /// is non-empty — there must be a price window for the reversal to
+    /// fire off. Default `false` = byte-identical to pre-feature spec yaml.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub veto_on_reversal: bool,
     /// When true, the emitted `06-close-on-reversal` intent carries
     /// `needs_confirmed: true` instead of the default
     /// `needs_golden: true`. Lets the operator opt the close trigger
@@ -754,6 +763,7 @@ fn build_pattern(
         needs_confirmed: false,
         close_on_news: false,
         sr_reversal_ranges: Vec::new(),
+        veto_on_reversal: false,
         needs_confirmed_close: false,
         prep_expiries: Vec::new(),
         skip_preps: Vec::new(),
@@ -892,6 +902,7 @@ fn assemble_trade(
             spec.close_on_news,
             spec.sr_reversal_ranges.clone(),
             spec.needs_confirmed_close,
+            spec.veto_on_reversal,
         ));
     }
 
@@ -1305,6 +1316,7 @@ fn skeleton(
         needs_confirmed: false,
         inside_window: Vec::new(),
         sr_bands: Vec::new(),
+        veto_on_reversal: false,
         reason: None,
         mw: None,
         pip_size: None,
@@ -1620,6 +1632,7 @@ fn build_close_on_reversal_alert(
     include_news_window: bool,
     sr_bands: Vec<[f64; 2]>,
     needs_confirmed: bool,
+    veto_on_reversal: bool,
 ) -> BuiltAlert {
     let id = format!("{trade_id}-close-on-reversal");
     let mut intent = skeleton(
@@ -1641,6 +1654,12 @@ fn build_close_on_reversal_alert(
     }
     intent.inside_window = inside_window;
     intent.sr_bands = sr_bands;
+    // veto_on_reversal only bites with a price window (sr_bands). Gate it
+    // on `has_sr_bands` so a news-only reversal-close can't carry a flag
+    // the worker would reject at validate time.
+    if veto_on_reversal && has_sr_bands {
+        intent.veto_on_reversal = true;
+    }
     if needs_confirmed {
         intent.needs_confirmed = true;
     } else {
@@ -1832,6 +1851,7 @@ mod tests {
                 needs_confirmed: false,
                 close_on_news: false,
                 sr_reversal_ranges: Vec::new(),
+                veto_on_reversal: false,
                 needs_confirmed_close: false,
                 prep_expiries: Vec::new(),
                 skip_preps: Vec::new(),
@@ -2022,6 +2042,7 @@ mod tests {
             needs_confirmed: false,
             close_on_news: false,
             sr_reversal_ranges: Vec::new(),
+            veto_on_reversal: false,
             needs_confirmed_close: false,
             prep_expiries: Vec::new(),
             skip_preps: Vec::new(),
@@ -2148,6 +2169,49 @@ mod tests {
         close
             .validate()
             .expect("needs_confirmed close intent valid");
+    }
+
+    #[test]
+    fn build_trade_from_spec_close_off_by_default_has_no_veto_on_reversal() {
+        // Even with sr bands, the experimental flag stays off unless asked.
+        let now = ts("2026-05-20T00:00:00Z");
+        let mut spec = sample_spec(TradePattern::Hs, ts("2026-05-25T00:00:00Z"));
+        spec.sr_reversal_ranges = vec![[1.0950, 1.0970]];
+        let trade = build_trade_from_spec(spec, now).unwrap();
+        let close = &trade.alerts[6].intent;
+        assert!(!close.veto_on_reversal);
+        close.validate().expect("default close intent valid");
+    }
+
+    #[test]
+    fn build_trade_from_spec_close_sets_veto_on_reversal_when_armed() {
+        let now = ts("2026-05-20T00:00:00Z");
+        let mut spec = sample_spec(TradePattern::Hs, ts("2026-05-25T00:00:00Z"));
+        spec.sr_reversal_ranges = vec![[1.0950, 1.0970]];
+        spec.veto_on_reversal = true;
+        let trade = build_trade_from_spec(spec, now).unwrap();
+        let close = &trade.alerts[6].intent;
+        assert!(close.veto_on_reversal);
+        // Still a valid intent (close + price window present).
+        close
+            .validate()
+            .expect("veto_on_reversal close intent valid");
+    }
+
+    #[test]
+    fn build_trade_from_spec_veto_on_reversal_suppressed_without_bands() {
+        // News-only reversal-close: no sr bands, so the flag must NOT be
+        // emitted (the worker would reject it at validate time).
+        let now = ts("2026-05-20T00:00:00Z");
+        let mut spec = sample_spec(TradePattern::Hs, ts("2026-05-25T00:00:00Z"));
+        spec.close_on_news = true;
+        spec.veto_on_reversal = true;
+        let trade = build_trade_from_spec(spec, now).unwrap();
+        let close = &trade.alerts[6].intent;
+        assert!(!close.veto_on_reversal);
+        close
+            .validate()
+            .expect("news-only close intent valid without veto flag");
     }
 
     #[test]

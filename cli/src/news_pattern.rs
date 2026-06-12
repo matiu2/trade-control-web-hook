@@ -251,6 +251,7 @@ fn build_news_intent(
         needs_confirmed: false,
         inside_window: Vec::new(),
         sr_bands: Vec::new(),
+        veto_on_reversal: false,
         reason: spec.reason.clone(),
         mw: None,
         pip_size: None,

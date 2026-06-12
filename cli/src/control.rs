@@ -63,6 +63,7 @@ fn control_skeleton(action: Action, instrument: &str, id: String, now: DateTime<
         needs_confirmed: false,
         inside_window: Vec::new(),
         sr_bands: Vec::new(),
+        veto_on_reversal: false,
         reason: None,
         mw: None,
         pip_size: None,

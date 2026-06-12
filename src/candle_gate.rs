@@ -126,6 +126,7 @@ mod tests {
             needs_confirmed,
             inside_window: Vec::new(),
             sr_bands: Vec::new(),
+            veto_on_reversal: false,
             reason: None,
             mw: None,
             pip_size: None,

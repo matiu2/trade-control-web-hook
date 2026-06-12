@@ -25,7 +25,7 @@ use broker_oanda::{OandaBroker, login as oanda_login};
 use serde::Serialize;
 use trade_control_core::broker::{Broker, EntryRequest};
 use trade_control_core::incoming::{self, parse_and_verify};
-use trade_control_core::intent::{Action, BrokerKind, Resolved, Shell, VetoLevel};
+use trade_control_core::intent::{Action, BrokerKind, Intent, Resolved, Shell, VetoLevel};
 use trade_control_core::rules::{self, RuleError};
 use trade_control_core::sig;
 use trade_control_core::state::{
@@ -444,7 +444,7 @@ async fn run_action<B: Broker>(
 ) -> ActionResult {
     match verified.intent.action {
         Action::Enter => run_enter(broker, store, verified, env, now).await,
-        Action::Close => run_close(broker, store, verified).await,
+        Action::Close => run_close(broker, store, verified, now).await,
         Action::Invalidate => {
             let hours = match resolve_phase1_u32(
                 "cooldown_hours",
@@ -531,6 +531,7 @@ async fn run_close<B: Broker>(
     broker: &B,
     store: &KvStateStore,
     verified: &incoming::Verified,
+    now: chrono::DateTime<chrono::Utc>,
 ) -> ActionResult {
     // News window. Old form: `require_news_window: Some(true)`. New
     // form: `inside_window` contains `News`. Mutual exclusion is
@@ -676,11 +677,98 @@ async fn run_close<B: Broker>(
         }
     }
     let ok = broker.close_positions(&verified.intent.instrument).await;
+    // veto_on_reversal (experimental, opt-in): a reversal-close whose
+    // gate passed is a real reversal signal. If the operator armed this
+    // flag, also record a `reversal` veto for this trade_id so a *later*
+    // enter is blocked — the case where the reversal lands before entry
+    // and `close_positions` was a no-op. Written on every gate-pass
+    // (idempotent key, TTL refreshed); independent of whether a position
+    // was actually open. The close result itself still drives the
+    // response below. Validation guarantees veto_on_reversal implies a
+    // price window and a Close action; a missing trade_id is the only
+    // remaining reason we'd skip — log it rather than fail the close.
+    if verified.intent.veto_on_reversal {
+        write_reversal_veto(store, verified, now).await;
+    }
     if ok {
         ActionResult::Ok("closed".into())
     } else {
         ActionResult::Failed("close-failed".into())
     }
+}
+
+/// Name of the entry veto written by the `veto_on_reversal` hook. A later
+/// `enter` for the same `trade_id` hits the existing `is_vetoed` gate on
+/// this name. Distinct, fixed name so it surfaces clearly in `status`.
+const REVERSAL_VETO_NAME: &str = "reversal";
+
+/// The veto a gate-passed reversal-close should write under the
+/// `veto_on_reversal` hook. Borrowed from the intent so the KV call is a
+/// thin wrapper; `None` means there's no `trade_id` to scope the veto to
+/// (we log + skip rather than write a global veto). Pulled out of the
+/// KV-calling path so the decision is unit-testable without a KV fixture.
+struct ReversalVetoPlan<'a> {
+    account: Option<&'a str>,
+    trade_id: &'a str,
+    instrument: &'a str,
+    ttl_seconds: u64,
+}
+
+/// Decide the reversal veto for a gate-passed reversal-close. Returns
+/// `None` when the intent carries no `trade_id` (vetos are trade-scoped;
+/// a global reversal veto would bleed across setups). TTL follows the
+/// same rule as a `too-high` veto — live for the life of the alert
+/// window (`not_after` tail), with a zero `ttl_hours` component since a
+/// reversal-close fires mid-window.
+fn reversal_veto_plan<'a>(
+    intent: &'a Intent,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Option<ReversalVetoPlan<'a>> {
+    let trade_id = intent.trade_id.as_deref()?;
+    Some(ReversalVetoPlan {
+        account: intent.account.as_deref(),
+        trade_id,
+        instrument: &intent.instrument,
+        ttl_seconds: veto_ttl_seconds(0, intent.not_after, now),
+    })
+}
+
+/// Write the experimental `reversal` veto for a gate-passed
+/// reversal-close. Best-effort: a KV failure or a missing `trade_id` is
+/// logged and swallowed — the close has already happened and the veto is
+/// an additive guard, not a precondition for it.
+async fn write_reversal_veto(
+    store: &KvStateStore,
+    verified: &incoming::Verified,
+    now: chrono::DateTime<chrono::Utc>,
+) {
+    let Some(plan) = reversal_veto_plan(&verified.intent, now) else {
+        console_log!(
+            "veto_on_reversal set but close has no trade_id (id={}); skipping reversal veto",
+            verified.intent.id
+        );
+        return;
+    };
+    if let Err(err) = store
+        .set_veto(
+            plan.account,
+            plan.trade_id,
+            plan.instrument,
+            REVERSAL_VETO_NAME,
+            plan.ttl_seconds,
+        )
+        .await
+    {
+        console_error!("KV set_veto (reversal): {err}");
+        return;
+    }
+    console_log!(
+        "reversal veto set: instrument={} account={} trade_id={} name={REVERSAL_VETO_NAME} ttl={}s",
+        plan.instrument,
+        plan.account.unwrap_or("<global>"),
+        plan.trade_id,
+        plan.ttl_seconds,
+    );
 }
 
 /// Per-gate evaluation result. `Failed` carries a short reason code
@@ -856,6 +944,74 @@ mod close_gate_tests {
                 reason_code: "no-news-window|price-out-of-range".into(),
             },
         );
+    }
+}
+
+#[cfg(test)]
+mod reversal_veto_tests {
+    use super::{REVERSAL_VETO_NAME, reversal_veto_plan};
+    use trade_control_core::intent::Intent;
+
+    fn close_intent(yaml_extra: &str) -> Intent {
+        let yaml = format!(
+            "
+            v: 1
+            id: rev-close
+            not_after: \"2026-05-13T20:00:00Z\"
+            action: close
+            instrument: EUR_USD
+            inside_window: [price]
+            sr_bands: [[1.0950, 1.0970]]
+            veto_on_reversal: true
+{yaml_extra}
+        "
+        );
+        serde_yaml::from_str(&yaml).expect("close intent parses")
+    }
+
+    fn now() -> chrono::DateTime<chrono::Utc> {
+        "2026-05-13T12:00:00Z".parse().unwrap()
+    }
+
+    #[test]
+    fn plan_is_none_without_trade_id() {
+        // No trade_id → no trade-scoped veto to write (we don't fall back
+        // to a global reversal veto that would bleed across setups).
+        let intent = close_intent("");
+        assert!(reversal_veto_plan(&intent, now()).is_none());
+    }
+
+    #[test]
+    fn plan_scopes_to_trade_id_and_account() {
+        let intent =
+            close_intent("            trade_id: eurusd-hs-1\n            account: reversals");
+        let plan = reversal_veto_plan(&intent, now()).expect("plan present");
+        assert_eq!(plan.trade_id, "eurusd-hs-1");
+        assert_eq!(plan.account, Some("reversals"));
+        assert_eq!(plan.instrument, "EUR_USD");
+    }
+
+    #[test]
+    fn plan_account_is_none_when_unset() {
+        let intent = close_intent("            trade_id: eurusd-hs-1");
+        let plan = reversal_veto_plan(&intent, now()).expect("plan present");
+        assert_eq!(plan.account, None);
+    }
+
+    #[test]
+    fn plan_ttl_lives_to_window_end() {
+        // not_after is 2026-05-13T20:00:00Z, now is 12:00:00Z → 8h window.
+        // veto_ttl_seconds(0, ..) = ttl_hours(0) + remaining(8h) = 8h, so
+        // the reversal veto lives exactly to the end of the alert window —
+        // killing this setup's remaining entries, no longer.
+        let intent = close_intent("            trade_id: eurusd-hs-1");
+        let plan = reversal_veto_plan(&intent, now()).expect("plan present");
+        assert_eq!(plan.ttl_seconds, 8 * 3600);
+    }
+
+    #[test]
+    fn veto_name_is_reversal() {
+        assert_eq!(REVERSAL_VETO_NAME, "reversal");
     }
 }
 
@@ -2670,6 +2826,7 @@ mod dispatcher_outcome_tests {
                 needs_confirmed: false,
                 inside_window: Vec::new(),
                 sr_bands: Vec::new(),
+                veto_on_reversal: false,
                 reason: None,
                 mw: None,
                 pip_size: None,

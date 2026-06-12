@@ -1,5 +1,71 @@
 # Changelog
 
+## v13 — 2026-06-12 — experimental `veto_on_reversal` on reversal-close
+
+### Why
+
+A real setup got its `break-and-close` and `retest` preps, then price
+reversed off a support line **before** the entry fired, and the trade
+entered anyway and lost. The reversal-close machinery only flattens an
+*open* position — fired before entry it's a no-op, so the entry sailed
+through despite a strong "this trade won't work" signal. We want the same
+reversal that would close the trade to optionally *veto the upcoming
+entry* when it lands pre-entry.
+
+### What changed
+
+- New **opt-in, default-off** field `Intent.veto_on_reversal: bool`. On a
+  price-windowed `close` (the reversal-close), when the close gate passes
+  the worker also writes a `reversal` veto scoped to the intent's
+  `trade_id`. A later `enter` for that setup then hits the existing
+  `is_vetoed` gate and is rejected.
+- Semantics are **StopNextEntry-style**: the veto only blocks future
+  entries; it never force-closes a position beyond the close the intent
+  already performs (consistent with "entry-gate vetos must not close
+  positions"). Written on **every** gate-pass — pre-entry it blocks the
+  entry; post-entry it harmlessly prevents a re-entry for the rest of the
+  window. TTL = life of the alert window (`veto_ttl_seconds`).
+- The worker reuses the existing `set_veto` / `is_vetoed` machinery — no
+  new state primitive. The veto name is the fixed string `reversal`.
+- CLI: `TradeSpec.veto_on_reversal` plumbs the flag onto the emitted
+  `06-close-on-reversal` intent, but only when `sr_bands` are present (a
+  news-only reversal-close has no band to reverse off).
+- tv-arm: new `--veto-on-reversal` flag (default off) sets it at arm time.
+
+### Breaking
+
+None. The field default-skips on serialize, so existing alerts are
+byte-identical and in-flight bundles are unaffected.
+
+### Config
+
+- Intent wire: `veto_on_reversal: true` (optional, only on a
+  price-windowed `close`).
+- CLI spec: `veto_on_reversal: true` in `trade.yaml`.
+- tv-arm: `--veto-on-reversal`.
+
+### Validation
+
+`veto_on_reversal` is rejected on a non-`close` action
+(`VetoOnReversalOnNonClose`) and on a `close` with no price window
+(`VetoOnReversalWithoutPriceWindow`).
+
+### Tests
+
+- core: default-off skip-serialize, round-trip when set, accepts the
+  deprecated `require_price_in_ranges` price window, rejects on non-close,
+  rejects without a price window.
+- cli: flag rides onto the emitted close when armed + bands present, stays
+  off by default, and is suppressed for a news-only reversal-close.
+- worker: `reversal_veto_plan` scoping (trade_id / account / instrument),
+  None without a `trade_id`, and TTL spanning to the window end.
+
+### Follow-up
+
+Experimental — promote past default-off only after a demo run shows it
+blocks losers without killing legitimate post-stop re-entries on
+multi-shot setups.
+
 ## v12 — 2026-06-12 — align remaining workspace crates to broker-tradenation-v0.8.0
 
 ### Why
