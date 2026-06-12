@@ -93,6 +93,53 @@ non-Ok outcome." If you're still seeing surprising 409s post-fix,
 look at the *latest* recorded outcome via `trade-control status` to
 see what the prior successful fulfilment actually was.
 
+### `veto_on_reversal`: a rejected enter may be a self-inflicted reversal veto
+
+Added 2026-06 (worker v13). The reversal-close (`close` with a price
+window) can carry an opt-in `veto_on_reversal: true`. When that
+close's gate passes, the worker *also* writes a veto under the fixed
+name **`reversal`**, scoped to the intent's `trade_id`. A later
+`enter` for the same setup then gets rejected by the ordinary
+`is_vetoed` gate — **not** by replay-dedup and **not** by the retry
+gate.
+
+The debugging trap: an `enter` is rejected (`rejected: veto-active
+(reversal)` in the logs / `412`), the prep gates all look satisfied,
+and no prior `enter` succeeded — so neither the seen-id check nor the
+retry gate explains it. The answer is a `reversal` veto written by an
+*earlier reversal-close fire in the same window*, exactly the
+pre-entry case the flag exists for. This is **working as designed**
+when the flag is on. Confirm via `trade-control status` (the
+`reversal` veto shows under the trade_id) and, if you want the trade
+anyway, clear it with `trade-control clear-veto <instr> reversal
+--trade-id <tid>`.
+
+Key facts a refactorer must preserve:
+- **It takes two halves.** The worker only checks veto names the
+  `enter` lists in its `vetos`. So the close writing the `reversal`
+  veto does nothing on its own — the matching `05-enter` must also
+  carry `reversal` in `vetos`. `build_trade_from_spec` adds both
+  together (gated on `veto_on_reversal && !sr_reversal_ranges.is_empty()`).
+  If you hand-craft a close with `veto_on_reversal: true` but no
+  matching enter half, you write a veto nothing reads.
+- The veto name is the fixed string `reversal`
+  (`trade_control_core::intent::REVERSAL_VETO_NAME` — single source of
+  truth shared by the worker write side and the CLI enter-builder).
+  `status` / `clear-veto` key on it.
+- It's written on **every** gate-pass, not only pre-entry — so
+  post-entry it harmlessly blocks a re-entry for the rest of the
+  window. Don't "optimise" this into a flat-only write without
+  re-reading the multi-shot interaction (a winning-then-reversing
+  trade's close would then permit a fresh entry the operator may not
+  want).
+- It is **StopNextEntry-only** — it must never escalate to closing a
+  position. The close the intent already performs is the only
+  position action. (See the `veto_close_only_when_thesis_invalidated`
+  rule.)
+- Default OFF, experimental. The decision logic is the pure
+  `reversal_veto_plan()` helper (KV-free, unit-tested); the KV write
+  is a thin wrapper.
+
 ### tv_arm_hs.py: server-side trendline-cross eval is anchor-bounded
 
 Burned a lot of time on this. When you POST a `create_alert` with
