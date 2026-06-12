@@ -42,7 +42,11 @@ Trading:
     already performs. Written on every gate-pass (idempotent, TTL = life of
     the alert window). Requires a price window (`inside_window` ∋ `price` +
     `sr_bands`, or the deprecated `require_price_in_ranges`) and a
-    `trade_id`; rejected at validate time otherwise.
+    `trade_id`; rejected at validate time otherwise. The worker only checks
+    veto names an `enter` lists in its own `vetos`, so when this hook is
+    armed the CLI/tv-arm pipeline **also adds `reversal` to the matching
+    `05-enter`'s `vetos`** — both halves move together. Arming the close
+    flag by hand without the enter half writes a veto nothing reads.
   - **Deprecated form** (still accepted for in-flight alerts):
     `require_news_window: true` and/or `require_price_in_ranges: [[lo, hi], ...]`.
     Mixing the old and new forms on one intent is a validation error —
@@ -652,6 +656,12 @@ export TRADE_CONTROL_ENDPOINT=https://trade-control.<account>.workers.dev
 ./target/release/trade-control clear-prep EUR_USD break-and-close \
   --key-file ~/.config/trade-control/key.hex
 ./target/release/trade-control clear-veto EUR_USD news-window \
+  --trade-id eurusd-hs-1 \
+  --key-file ~/.config/trade-control/key.hex
+# The experimental veto-on-reversal hook writes its veto under the fixed
+# name `reversal`. If a reversal-close vetoed a setup you still want to take,
+# clear it the same way (the name is always `reversal`):
+./target/release/trade-control clear-veto EUR_USD reversal \
   --trade-id eurusd-hs-1 \
   --key-file ~/.config/trade-control/key.hex
 

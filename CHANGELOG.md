@@ -26,10 +26,17 @@ entry* when it lands pre-entry.
   entry; post-entry it harmlessly prevents a re-entry for the rest of the
   window. TTL = life of the alert window (`veto_ttl_seconds`).
 - The worker reuses the existing `set_veto` / `is_vetoed` machinery — no
-  new state primitive. The veto name is the fixed string `reversal`.
-- CLI: `TradeSpec.veto_on_reversal` plumbs the flag onto the emitted
-  `06-close-on-reversal` intent, but only when `sr_bands` are present (a
-  news-only reversal-close has no band to reverse off).
+  new state primitive. The veto name is the fixed string `reversal`
+  (`trade_control_core::intent::REVERSAL_VETO_NAME`, shared so the write
+  side and the enter-builder can't drift).
+- **Both halves move together.** The worker only checks veto names the
+  `enter` lists in its `vetos`, so writing the veto is inert unless the
+  matching `05-enter` also lists `reversal`. `build_trade_from_spec` adds
+  `reversal` to the close's `veto_on_reversal` *and* to the enter's
+  `vetos` whenever the flag is armed and `sr_reversal_ranges` is non-empty.
+- CLI: `TradeSpec.veto_on_reversal` plumbs both halves, but only when
+  `sr_bands` are present (a news-only reversal-close has no band to
+  reverse off).
 - tv-arm: new `--veto-on-reversal` flag (default off) sets it at arm time.
 
 ### Breaking
@@ -56,7 +63,8 @@ byte-identical and in-flight bundles are unaffected.
   deprecated `require_price_in_ranges` price window, rejects on non-close,
   rejects without a price window.
 - cli: flag rides onto the emitted close when armed + bands present, stays
-  off by default, and is suppressed for a news-only reversal-close.
+  off by default, and is suppressed for a news-only reversal-close; the
+  paired `05-enter` lists `reversal` in its `vetos` exactly when armed.
 - worker: `reversal_veto_plan` scoping (trade_id / account / instrument),
   None without a `trade_id`, and TTL spanning to the window end.
 

@@ -791,6 +791,12 @@ fn is_default_ttl_hours(t: &crate::tunable::Tunable<u32>) -> bool {
 /// seen-index entry small.
 pub const TRADE_ID_MAX_LEN: usize = 64;
 
+/// Fixed veto name written by the worker's [`Intent::veto_on_reversal`]
+/// hook and checked by the matching `enter` (whose `vetos` list must
+/// include it for the veto to gate the entry). Single source of truth so
+/// the worker's write side and the CLI's enter-builder can't drift apart.
+pub const REVERSAL_VETO_NAME: &str = "reversal";
+
 /// Returns true if `s` is a valid `trade_id` slug: lowercase ASCII
 /// alphanumerics + hyphens, 1..=64 chars, no leading/trailing hyphen,
 /// no consecutive hyphens. Used by [`Intent::validate`] and by the CLI

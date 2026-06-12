@@ -25,7 +25,9 @@ use broker_oanda::{OandaBroker, login as oanda_login};
 use serde::Serialize;
 use trade_control_core::broker::{Broker, EntryRequest};
 use trade_control_core::incoming::{self, parse_and_verify};
-use trade_control_core::intent::{Action, BrokerKind, Intent, Resolved, Shell, VetoLevel};
+use trade_control_core::intent::{
+    Action, BrokerKind, Intent, REVERSAL_VETO_NAME, Resolved, Shell, VetoLevel,
+};
 use trade_control_core::rules::{self, RuleError};
 use trade_control_core::sig;
 use trade_control_core::state::{
@@ -696,11 +698,6 @@ async fn run_close<B: Broker>(
         ActionResult::Failed("close-failed".into())
     }
 }
-
-/// Name of the entry veto written by the `veto_on_reversal` hook. A later
-/// `enter` for the same `trade_id` hits the existing `is_vetoed` gate on
-/// this name. Distinct, fixed name so it surfaces clearly in `status`.
-const REVERSAL_VETO_NAME: &str = "reversal";
 
 /// The veto a gate-passed reversal-close should write under the
 /// `veto_on_reversal` hook. Borrowed from the intent so the KV call is a

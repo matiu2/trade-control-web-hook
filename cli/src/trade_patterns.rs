@@ -891,6 +891,10 @@ fn assemble_trade(
         spec.pip_size,
         &spec.broker,
         &spec.account,
+        // The enter must check the `reversal` veto only when a
+        // reversal-close that writes it actually exists for this setup —
+        // i.e. the flag is armed AND there are sr bands to reverse off.
+        spec.veto_on_reversal && !spec.sr_reversal_ranges.is_empty(),
     ));
     if spec.close_on_news || !spec.sr_reversal_ranges.is_empty() {
         alerts.push(build_close_on_reversal_alert(
@@ -1536,6 +1540,7 @@ fn build_enter_alert(
     pip_size: Option<f64>,
     broker: &BrokerKind,
     account: &str,
+    check_reversal_veto: bool,
 ) -> BuiltAlert {
     let id = format!("{trade_id}-enter");
     let mut intent = skeleton(
@@ -1595,6 +1600,14 @@ fn build_enter_alert(
         geometry.pcl_exhausted_veto_name.into(),
         "trade-expiry".into(),
     ];
+    // Experimental: when the reversal-close is armed to veto-on-reversal,
+    // the enter must also list `reversal` so the veto it writes actually
+    // gates this entry (the worker only checks veto names the enter lists).
+    if check_reversal_veto {
+        intent
+            .vetos
+            .push(trade_control_core::intent::REVERSAL_VETO_NAME.into());
+    }
     BuiltAlert {
         basename: AlertBasename::Enter.as_str().into_owned(),
         purpose: "enter: stop-entry gated by both preps + both vetos".into(),
@@ -1829,6 +1842,7 @@ mod tests {
                 None,
                 &BrokerKind::Oanda,
                 "demo",
+                false,
             ),
         ];
         let trade = BuiltTrade {
@@ -1902,6 +1916,7 @@ mod tests {
             None,
             &BrokerKind::Oanda,
             "demo",
+            false,
         );
         assert_eq!(alert.intent.direction, Some(Direction::Short));
         // Entry: low + 1 pip.
@@ -1972,6 +1987,7 @@ mod tests {
             None,
             &BrokerKind::Oanda,
             "demo",
+            false,
         );
         assert_eq!(alert.intent.direction, Some(Direction::Long));
         match &alert.intent.entry {
@@ -2180,6 +2196,10 @@ mod tests {
         let trade = build_trade_from_spec(spec, now).unwrap();
         let close = &trade.alerts[6].intent;
         assert!(!close.veto_on_reversal);
+        // The enter (05-enter) must NOT list `reversal` when the flag is off.
+        assert_eq!(trade.alerts[5].basename, "05-enter");
+        let enter = &trade.alerts[5].intent;
+        assert!(!enter.vetos.iter().any(|v| v == "reversal"));
         close.validate().expect("default close intent valid");
     }
 
@@ -2192,16 +2212,26 @@ mod tests {
         let trade = build_trade_from_spec(spec, now).unwrap();
         let close = &trade.alerts[6].intent;
         assert!(close.veto_on_reversal);
+        // The paired half: the enter MUST list `reversal` in its vetos, or
+        // the veto the worker writes would never gate the entry.
+        let enter = &trade.alerts[5].intent;
+        assert!(
+            enter.vetos.iter().any(|v| v == "reversal"),
+            "enter must check the reversal veto when armed, got {:?}",
+            enter.vetos
+        );
         // Still a valid intent (close + price window present).
         close
             .validate()
             .expect("veto_on_reversal close intent valid");
+        enter.validate().expect("enter with reversal veto valid");
     }
 
     #[test]
     fn build_trade_from_spec_veto_on_reversal_suppressed_without_bands() {
         // News-only reversal-close: no sr bands, so the flag must NOT be
-        // emitted (the worker would reject it at validate time).
+        // emitted (the worker would reject it at validate time) and the
+        // enter must NOT list `reversal` (there's no writer for it).
         let now = ts("2026-05-20T00:00:00Z");
         let mut spec = sample_spec(TradePattern::Hs, ts("2026-05-25T00:00:00Z"));
         spec.close_on_news = true;
@@ -2209,6 +2239,8 @@ mod tests {
         let trade = build_trade_from_spec(spec, now).unwrap();
         let close = &trade.alerts[6].intent;
         assert!(!close.veto_on_reversal);
+        let enter = &trade.alerts[5].intent;
+        assert!(!enter.vetos.iter().any(|v| v == "reversal"));
         close
             .validate()
             .expect("news-only close intent valid without veto flag");
