@@ -926,6 +926,33 @@ Create the namespace once and paste its id into `wrangler.toml` under the
 wrangler kv:namespace create TRADE_CONTROL_KV
 ```
 
+### Index blobs are decode-tolerant
+
+State for the `status` view is kept in five JSON-array index blobs
+(`index:vetos`, `index:seen`, `index:preps`, `index:cooldowns`,
+`index:prep-blocks`). These are read-modify-written on every veto / cooldown /
+prep write. As the entry structs gain required fields, a single legacy element
+written before a field existed could fail a strict whole-array decode and 500
+*every* write that touches the index (this happened on 2026-06-12 — one
+`trade_id`-less `index:vetos` element took all veto/cancel writes down
+platform-wide).
+
+The decode is now **element-wise tolerant**: a single element that fails to
+deserialize is dropped with a `index decode: dropping bad element …` warning in
+the worker log, and the next write rewrites the blob without it (self-healing).
+A genuinely corrupt *container* (not a JSON array) is still a hard error.
+
+If you ever need to clear a poisoned index by hand (it self-heals after one
+write, so this is only an immediate unblock):
+
+```sh
+# namespace id is the TRADE_CONTROL_KV binding in wrangler.toml
+wrangler kv key delete --namespace-id <id> "index:vetos"
+```
+
+Deleting an index key is safe — a missing key reads back as an empty list, and
+the authoritative per-entry TTL keys (`veto:…`, `cooldown:…`) are untouched.
+
 ## Deploy
 
 ```sh

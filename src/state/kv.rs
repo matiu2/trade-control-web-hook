@@ -162,8 +162,55 @@ async fn read_index<T: for<'de> serde::Deserialize<'de>>(
     let Some(text) = raw else {
         return Ok(Vec::new());
     };
-    serde_json::from_str::<Vec<T>>(&text)
-        .map_err(|e| StateError::Backend(format!("decode {key}: {e}")))
+    decode_index(key, &text)
+}
+
+/// Decode a JSON-array index blob **element-wise**, dropping (and logging)
+/// any single element that fails to deserialize into `T` rather than failing
+/// the whole array.
+///
+/// Why: the index structs ([`VetoEntry`] et al.) have gained required fields
+/// over time. A single legacy element written before a field existed — e.g. a
+/// `VetoEntry` with no `trade_id` — would otherwise poison the strict
+/// `from_str::<Vec<T>>` decode and take down *every* read-modify-write that
+/// touches the index. Since `set_veto`/`set_cooldown`/… all RMW their index,
+/// one bad row 500'd every veto/cooldown/prep write platform-wide (bug #6,
+/// 2026-06-12). Dropping the bad element is safe: a row that won't decode
+/// matched no live query anyway, and the next `write_index` rewrites the blob
+/// without it (self-healing).
+///
+/// Only a genuinely broken *container* (not a JSON array, truncated blob) is
+/// still a fatal [`StateError::Backend`] — that's not recoverable schema drift.
+fn decode_index<T: for<'de> serde::Deserialize<'de>>(
+    key: &str,
+    text: &str,
+) -> Result<Vec<T>, StateError> {
+    let elements = serde_json::from_str::<Vec<serde_json::Value>>(text)
+        .map_err(|e| StateError::Backend(format!("decode {key}: {e}")))?;
+    let mut out = Vec::with_capacity(elements.len());
+    for (idx, element) in elements.into_iter().enumerate() {
+        match serde_json::from_value::<T>(element) {
+            Ok(entry) => out.push(entry),
+            Err(e) => warn_dropped_index_element(key, idx, &e),
+        }
+    }
+    Ok(out)
+}
+
+/// Native-safe warning for a dropped index element. Mirrors the
+/// `log_skip` shim in `src/lib.rs`: `worker::console_log!` panics off-wasm
+/// (it calls into `web_sys`), so emit via `tracing::warn!` under `cargo test`
+/// and the real worker console on wasm.
+fn warn_dropped_index_element(key: &str, idx: usize, err: &serde_json::Error) {
+    #[cfg(target_arch = "wasm32")]
+    worker::console_log!(
+        "index decode: dropping bad element key={} idx={} err={}",
+        key,
+        idx,
+        err,
+    );
+    #[cfg(not(target_arch = "wasm32"))]
+    tracing::warn!("index decode: dropping bad element key={key} idx={idx} err={err}");
 }
 
 async fn write_index<T: serde::Serialize>(
@@ -1105,4 +1152,88 @@ async fn list_json_with_prefix<T: for<'de> serde::Deserialize<'de>>(
         out.push(entry);
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod decode_index_tests {
+    use super::*;
+
+    // A valid veto element serialized to the on-disk shape.
+    const GOOD_VETO: &str = r#"{
+        "trade_id": "m-eur-usd-57f5b5a7",
+        "instrument": "EUR_USD",
+        "name": "mw-abort",
+        "expires_at": "2026-06-12T08:00:00Z",
+        "account": "reversals"
+    }"#;
+
+    // The legacy element from bug #6: no `trade_id` field at all.
+    const LEGACY_VETO_NO_TRADE_ID: &str = r#"{
+        "instrument": "EUR_USD",
+        "name": "too-high",
+        "expires_at": "2026-06-12T08:00:00Z",
+        "account": null
+    }"#;
+
+    /// The whole incident: a `trade_id`-less legacy veto must be dropped, not
+    /// fatal, and the good entry survives.
+    #[test]
+    fn drops_legacy_element_keeps_good_one() {
+        let blob = format!("[{LEGACY_VETO_NO_TRADE_ID},{GOOD_VETO}]");
+        let entries: Vec<VetoEntry> =
+            decode_index("index:vetos", &blob).expect("element drift must not be fatal");
+        assert_eq!(entries.len(), 1, "only the good veto should survive");
+        assert_eq!(entries[0].trade_id, "m-eur-usd-57f5b5a7");
+        assert_eq!(entries[0].name, "mw-abort");
+    }
+
+    /// An all-good blob round-trips unchanged.
+    #[test]
+    fn keeps_all_valid_elements() {
+        let blob = format!("[{GOOD_VETO},{GOOD_VETO}]");
+        let entries: Vec<VetoEntry> = decode_index("index:vetos", &blob).expect("valid blob");
+        assert_eq!(entries.len(), 2);
+    }
+
+    /// An empty array decodes to an empty vec (read of a never-written index
+    /// goes through the missing-key path, but an explicit `[]` must also work).
+    #[test]
+    fn empty_array_is_empty() {
+        let entries: Vec<VetoEntry> = decode_index("index:vetos", "[]").expect("empty array");
+        assert!(entries.is_empty());
+    }
+
+    /// A genuinely broken *container* (not a JSON array) is still fatal — we
+    /// only tolerate element-level drift, not a corrupt blob.
+    #[test]
+    fn non_array_container_is_fatal() {
+        let err = decode_index::<VetoEntry>("index:vetos", "{").unwrap_err();
+        assert!(matches!(err, StateError::Backend(_)), "got {err:?}");
+        let err = decode_index::<VetoEntry>("index:vetos", "not json").unwrap_err();
+        assert!(matches!(err, StateError::Backend(_)), "got {err:?}");
+    }
+
+    /// The hardening is generic: the same drop-not-fatal behaviour covers
+    /// every index struct. A `PrepEntry` missing its required `step` is
+    /// dropped while a valid sibling survives.
+    #[test]
+    fn generic_over_other_index_structs() {
+        let good_prep = r#"{
+            "instrument": "EUR_USD",
+            "step": "break-and-close",
+            "set_at": "2026-06-12T07:00:00Z",
+            "expires_at": "2026-06-12T08:00:00Z",
+            "account": null
+        }"#;
+        let bad_prep = r#"{
+            "instrument": "EUR_USD",
+            "set_at": "2026-06-12T07:00:00Z",
+            "expires_at": "2026-06-12T08:00:00Z",
+            "account": null
+        }"#;
+        let blob = format!("[{bad_prep},{good_prep}]");
+        let entries: Vec<PrepEntry> = decode_index("index:preps", &blob).expect("not fatal");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].step, "break-and-close");
+    }
 }

@@ -1,5 +1,57 @@
 # Changelog
 
+## v14 — 2026-06-13 — element-tolerant index decode (bug #6 fix)
+
+### Why
+
+On 2026-06-12 a single legacy-shaped element inside the `index:vetos` KV blob
+was missing the required `trade_id` field. Because `set_veto` (and every other
+index write) is a read-modify-write, the strict
+`serde_json::from_str::<Vec<VetoEntry>>` in `read_index` failed on that one bad
+element and took the *whole* array down. Result: **160 veto writes failed, 0
+succeeded** across every account/instrument — no `mw-abort`, `mw-cancel`,
+`too-high/too-low`, `trade-expiry`, or `close-on-reversal` veto could be
+recorded, returning HTTP 500. A real pending short order (`26800323`, EUR/USD,
+`reversals`) was never cancelled because its `mw-abort` 500'd four times.
+
+### What changed
+
+- `read_index` (the single generic chokepoint for **all five** index blobs —
+  `vetos`, `seen`, `preps`, `cooldowns`, `prep-blocks`) now decodes
+  **element-wise**: the blob is parsed as `Vec<serde_json::Value>` and each
+  element is `from_value`'d into its struct individually. An element that fails
+  to deserialize is **dropped and logged** (`index decode: dropping bad element
+  key=… idx=… err=…`) instead of failing the read. The next `write_index`
+  rewrites the blob without it (self-healing).
+- A genuinely broken *container* (not a JSON array, truncated blob) is still a
+  hard `StateError::Backend` — only element-level schema drift is tolerated.
+- Logging uses the native-safe shim pattern (`worker::console_log!` on wasm,
+  `tracing::warn!` off-wasm) so the decode stays unit-testable.
+
+### Breaking
+
+None. Pure robustness hardening; no API, wire-format, or config change.
+
+### Config
+
+None.
+
+### Tests
+
+New `decode_index_tests` module in `src/state/kv.rs`: a `trade_id`-less legacy
+veto is dropped while the good one survives; all-valid blobs round-trip; empty
+array stays empty; a non-array container is still fatal; and the same
+drop-not-fatal behaviour is proven generic over `PrepEntry` (missing `step`).
+
+### Follow-up
+
+- `list_json_with_prefix` (news/pause keys, read by `snapshot()`) shares the
+  same strict per-key decode and could be hardened the same way — deferred, no
+  incident there yet.
+- Operator: pending order `26800323` and any siblings on `reversals` were left
+  live without veto protection during the 2026-06-12 window — reconcile
+  open/pending orders against intended cancels manually.
+
 ## v13 — 2026-06-12 — experimental `veto_on_reversal` on reversal-close
 
 ### Why
