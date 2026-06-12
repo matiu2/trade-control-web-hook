@@ -153,6 +153,19 @@ pub async fn main(mut req: Request, env: Env, _ctx: Context) -> Result<Response>
 
     // Replay protection.
     match store.is_seen(&verified.intent.id).await {
+        // A seen id normally 409s here. Exception: a multi-shot `enter`
+        // re-fires the *same* baked-in intent id on every signal bar, so
+        // 409ing it here would block every legitimate re-entry after the
+        // first fill closed. Fall through and let `run_enter` →
+        // `retry_gate::evaluate` be the replay authority — it dedups true
+        // same-bar re-fires on `shell.time` and rejects 412 when a prior
+        // attempt is still open. See `is_multishot_enter`.
+        Ok(true) if is_multishot_enter(&verified.intent) => {
+            console_log!(
+                "seen multi-shot enter id={} — deferring replay decision to retry gate",
+                verified.intent.id
+            );
+        }
         Ok(true) => return Response::error("replay", 409),
         Ok(false) => {}
         Err(err) => {
@@ -301,6 +314,33 @@ fn log_skip(kind: &str, id: &str, outcome: &str) {
     );
     #[cfg(not(target_arch = "wasm32"))]
     tracing::info!("entry-path {kind} (no mark_seen): id={id} outcome={outcome}");
+}
+
+/// True when this intent is a multi-shot `enter` — an `enter` that
+/// opted into `max_retries` (anything other than the default
+/// `Static(0)`) and carries a `trade_id`.
+///
+/// For these the top-level intent-id replay guard in [`fetch`] must
+/// **not** 409: the alert bakes one static intent id and re-fires it on
+/// every signal bar, so the first accepted fire would otherwise poison
+/// the id and block every legitimate re-entry. The real replay
+/// authority for multi-shot is `retry_gate::evaluate` (run from
+/// `run_enter`), which dedups true same-bar re-fires on `shell.time`
+/// and rejects 412 when a prior attempt is still open.
+///
+/// The `trade_id.is_some()` clause is load-bearing: without a
+/// `trade_id` the retry gate does no per-bar dedup (see
+/// `retry_gate::evaluate`), so such an intent must stay on the
+/// top-level 409 path. Single-shot enters and every control action
+/// return `false` and keep the byte-identical top-level 409.
+///
+/// Pure (`&Intent -> bool`) so native unit tests can exercise the rule
+/// without building a `worker::Response` — same rationale as
+/// [`seen_decision`].
+fn is_multishot_enter(intent: &trade_control_core::intent::Intent) -> bool {
+    matches!(intent.action, Action::Enter)
+        && !matches!(intent.max_retries, Tunable::Static(0))
+        && intent.trade_id.is_some()
 }
 
 /// Pure helper: classify an [`ActionResult`] into "write to seen" vs
@@ -2792,5 +2832,76 @@ mod dispatcher_outcome_tests {
             "Control-action record_seen must still mark seen — replay protection \
              on state-set ops (prep/veto/pause/etc) is legitimate idempotency",
         );
+    }
+
+    // ---- is_multishot_enter: the top-level replay-guard exemption ----
+
+    /// An `enter` that opted into `max_retries` and carries a `trade_id`
+    /// is the case the bug fix targets: its baked-in id re-fires every
+    /// bar, so the top-level `is_seen` 409 must defer to the retry gate.
+    #[test]
+    fn multishot_enter_is_detected() {
+        let mut v = verified("ent-id");
+        v.intent.action = Action::Enter;
+        v.intent.max_retries = Tunable::Static(3);
+        v.intent.trade_id = Some("trade-xyz".into());
+        assert!(is_multishot_enter(&v.intent));
+    }
+
+    /// Single-shot enter (`max_retries` default `Static(0)`) keeps the
+    /// byte-identical top-level 409 — the retry gate never runs for it.
+    #[test]
+    fn single_shot_enter_is_not_multishot() {
+        let mut v = verified("ent-id");
+        v.intent.action = Action::Enter;
+        v.intent.max_retries = Tunable::Static(0);
+        v.intent.trade_id = Some("trade-xyz".into());
+        assert!(!is_multishot_enter(&v.intent));
+    }
+
+    /// Without a `trade_id` the retry gate does no per-bar dedup, so the
+    /// intent must stay on the top-level 409 path even with `max_retries`.
+    #[test]
+    fn multishot_enter_without_trade_id_is_not_multishot() {
+        let mut v = verified("ent-id");
+        v.intent.action = Action::Enter;
+        v.intent.max_retries = Tunable::Static(3);
+        v.intent.trade_id = None;
+        assert!(!is_multishot_enter(&v.intent));
+    }
+
+    /// Any non-`Static(0)` Tunable (including a script) counts as
+    /// multi-shot — mirrors the `max_retries != Static(0)` test the
+    /// run_enter gate uses.
+    #[test]
+    fn enter_with_script_max_retries_is_multishot() {
+        let mut v = verified("ent-id");
+        v.intent.action = Action::Enter;
+        v.intent.max_retries = Tunable::from_script("3");
+        v.intent.trade_id = Some("trade-xyz".into());
+        assert!(is_multishot_enter(&v.intent));
+    }
+
+    /// Only `Enter` is exempted. A control action that happens to carry a
+    /// stray `max_retries` + `trade_id` still 409s at the top level.
+    #[test]
+    fn control_actions_are_not_multishot() {
+        for action in [
+            Action::Close,
+            Action::Invalidate,
+            Action::Veto,
+            Action::Prep,
+            Action::Status,
+            Action::Pause,
+        ] {
+            let mut v = verified("ctl-id");
+            v.intent.action = action;
+            v.intent.max_retries = Tunable::Static(3);
+            v.intent.trade_id = Some("trade-xyz".into());
+            assert!(
+                !is_multishot_enter(&v.intent),
+                "{action:?} must not be treated as a multi-shot enter",
+            );
+        }
     }
 }
