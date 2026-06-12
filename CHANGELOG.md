@@ -1,5 +1,60 @@
 # Changelog
 
+## v16 — 2026-06-13 — M/W second-peak confirmation window before arming
+
+### Why
+
+The M/W enter alert fires every bar close, and the worker armed the
+breakout stop as soon as a bar merely *closed* on the entry side of the
+neckline (`entry < close` for a short). It never looked at the bar's
+high/low. On a real AUD/CAD demo setup (neckline 0.98339, peak 0.98509)
+a bar closed just past the neckline with a high of only 0.98430 — short
+of any real second peak — so the worker armed a sell stop at 0.983255
+that later filled and stopped out. The book's rule is that price must
+retrace back *into* the pattern far enough to form a genuine second
+peak/trough before the breakout is valid.
+
+### What changed
+
+- `Resolved::from_mw_intent` now gates on a **second-peak confirmation
+  window** before the existing stop-side check. The bar's extreme (high
+  for an M, low for a W) must lie in `[min_retrace, cancel)` on the
+  neckline→peak (C→B) leg:
+  - `min_retrace = neckline + 0.7 × (peak − neckline)` — floor; a
+    shallower poke past the neckline is declined (stay armed).
+  - `cancel = neckline + 1.3 × (peak − neckline)` — ceiling; the same
+    1.3 extension the `mw-cancel` veto guards, declined here as a safety
+    net in case that veto hasn't fired. Upper bound exclusive.
+- All comparisons are MID-price (neckline, peak and high/low are all
+  mid) — no spread correction on this gate.
+- Declines reuse `ResolveError::InvalidGeometry`, so (post the 2026-06
+  seen-id fix) a declined bar does **not** mark the intent id seen — the
+  setup stays armed for the next bar.
+
+### Breaking
+
+None. Pure tightening of the enter gate; intent wire format unchanged.
+
+### Config
+
+Two fixed worker constants, not signed fields:
+`SECOND_PEAK_MIN_FRAC = 0.7` and `CANCEL_EXT_FRAC = 1.3` in
+`core/src/intent/mw_resolution.rs`. Changing them needs a redeploy.
+
+### Tests
+
+5 new cases in `mw_resolution`: M high below floor declined (the AUD/CAD
+regression), M high inside window armed, M high at/above cancel declined,
+W low above floor declined, W low below cancel declined. Existing worked
+M/W tests updated to pass explicit high/low (new `shell_hlc` helper).
+385 core + 130 worker tests green.
+
+### Follow-up
+
+The `0.7` floor is currently a hardcoded constant shared by every M/W
+setup. If a future setup wants a per-pattern floor, promote it to a
+baked `MwParams` field (signed) the way `pip_size` is.
+
 ## v15 — 2026-06-13 — extend bug #6 hardening to per-key prefix listings
 
 ### Why

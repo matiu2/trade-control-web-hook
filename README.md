@@ -1093,6 +1093,23 @@ Unlike H&S there is no prep chain and no re-entry (`max_retries: 0`):
 the cancel/abort vetos or a fill end the setup. See the M/W bundle table
 under "Alert basenames" above for what gets emitted.
 
+**Worker-side second-peak confirmation.** The enter alert fires every
+bar close, but the worker only arms the breakout stop when the bar shows
+a real second peak/trough — its extreme (high for an M, low for a W)
+must fall inside a window on the neckline→peak (C→B) leg:
+
+- **Floor `0.7`** — `neckline + 0.7 × (peak − neckline)`. A bar that
+  closes just past the neckline but whose high (M) / low (W) never
+  retraced this far back into the pattern is **declined** and the setup
+  stays armed for the next bar. (Without this, a shallow poke past the
+  neckline could arm and fill a premature entry.)
+- **Ceiling `1.3`** — `neckline + 1.3 × (peak − neckline)`, the same 1.3
+  extension the `mw-cancel` veto guards. A bar reaching it has
+  invalidated the pattern; declined here too as a safety net in case the
+  veto hasn't fired. Both fractions are fixed worker constants
+  (`SECOND_PEAK_MIN_FRAC` / `CANCEL_EXT_FRAC` in
+  `core/src/intent/mw_resolution.rs`); all comparisons are MID-price.
+
 ```sh
 cargo run -p tv-arm -- \
   --broker oanda \

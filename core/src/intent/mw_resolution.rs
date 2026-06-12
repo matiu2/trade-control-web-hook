@@ -32,11 +32,33 @@
 //! TP is exactly 1R off the *entry*, so the spread already embedded in
 //! entry and SL carries straight through — no extra TP shift needed.
 //!
+//! ## Second-peak confirmation window
+//!
+//! Before arming the breakout stop, the bar must show a real second
+//! peak/trough — price that has retraced back *into* the pattern, not
+//! just any bar that happens to close on the entry side of the neckline.
+//! The bar's extreme (high for an M, low for a W) must fall inside a
+//! window measured as fractions of the neckline→first-point (C→B) leg:
+//!
+//! ```text
+//!   min_retrace = neckline + 0.7 × (first_point − neckline)
+//!   cancel      = neckline + 1.3 × (first_point − neckline)
+//!   armed  ⇔  high (M) / low (W) ∈ [min_retrace, cancel)
+//! ```
+//!
+//! Below `min_retrace` the second peak is too shallow; at/above `cancel`
+//! the 1.3 extension is breached and the pattern is invalidated (the same
+//! level the `mw-cancel` veto guards — checked here too as a safety net).
+//! Either way the bar is declined and the setup stays armed. This fixes a
+//! real AUD/CAD case where a bar closing just past the neckline but with a
+//! high short of the second peak armed (and filled) a premature short.
+//!
 //! ## "Stay armed" semantics
 //!
-//! The enter alert fires every bar close. A bar whose close has *not*
-//! yet broken the neckline (so the breakout stop would sit on the wrong
-//! side of the current price) is declined here with
+//! The enter alert fires every bar close. A bar that fails the
+//! confirmation window above, or whose close has *not* yet broken the
+//! neckline (so the breakout stop would sit on the wrong side of the
+//! current price), is declined here with
 //! [`ResolveError::InvalidGeometry`]. Post the 2026-06 seen-id fix a
 //! non-`Ok` resolve does **not** mark the intent id seen, so the next
 //! bar's fire is allowed through — i.e. the setup stays armed until a
@@ -44,6 +66,19 @@
 
 use super::resolution::{ResolveError, Resolved, ResolvedEntry};
 use super::{Direction, Intent, MwParams, Shell};
+
+/// Minimum second-peak retracement, as a fraction of the neckline→first-point
+/// (C→B) leg, that a bar must reach before the breakout stop is armed. A bar
+/// whose extreme (high for M, low for W) hasn't pulled this far back into the
+/// pattern is declined and the setup stays armed. See [`Resolved::from_mw_intent`].
+const SECOND_PEAK_MIN_FRAC: f64 = 0.7;
+
+/// Upper clamp on the second peak, as a fraction of the C→B leg: the 1.3
+/// extension past the neckline. A bar reaching this far has invalidated the
+/// pattern (same level the `mw-cancel` veto guards) — declined here as a
+/// safety net in case that veto hasn't fired yet. Mirrors `cancel_level`
+/// in `tv-arm`'s `mw_geometry`.
+const CANCEL_EXT_FRAC: f64 = 1.3;
 
 impl Resolved {
     /// Resolve an M/W `enter` intent. `mw` is the intent's baked
@@ -82,6 +117,43 @@ impl Resolved {
                 (entry, sl, tp)
             }
         };
+
+        // Second-peak confirmation *window*. Before arming the breakout stop
+        // we require the price to have rallied (M) / dropped (W) back *into*
+        // the pattern — far enough to count as a real second peak/trough, but
+        // not so far that it blew past the pattern entirely.
+        //
+        // The window is expressed as fractions of the neckline→first-point
+        // (C→B) leg:
+        //
+        //   lower = neckline + 0.7 × (first_point − neckline)   (min retrace)
+        //   upper = neckline + 1.3 × (first_point − neckline)   (cancel level)
+        //
+        // For an M (short) B > C, so the window sits *above* the neckline and
+        // we test the bar's `high`. For a W (long) B < C, the window sits
+        // *below* the neckline and we test the bar's `low`. B, C and high/low
+        // are all MID prices — no spread correction on this gate.
+        //
+        // - Below `lower`: the second peak isn't deep enough yet → decline,
+        //   stay armed for the next bar.
+        // - At/above `upper`: price reached the 1.3 extension — the pattern is
+        //   invalidated (this is the same level the `mw-cancel` veto guards).
+        //   Decline as a safety net in case that veto hasn't fired yet.
+        // A bar inside [lower, upper) is a confirmed second peak → proceed to
+        // the breakout-stop side check below (see module docs).
+        let min_retrace = neckline + SECOND_PEAK_MIN_FRAC * (peak - neckline);
+        let cancel = neckline + CANCEL_EXT_FRAC * (peak - neckline);
+        let second_peak_confirmed = match direction {
+            // M: second peak is above the neckline. The high must reach the
+            // min-retrace level but stay below the 1.3 cancel extension.
+            Direction::Short => shell.high >= min_retrace && shell.high < cancel,
+            // W: mirror — second trough below the neckline. The low must drop
+            // to the min-retrace level but stay above the cancel extension.
+            Direction::Long => shell.low <= min_retrace && shell.low > cancel,
+        };
+        if !second_peak_confirmed {
+            return Err(ResolveError::InvalidGeometry);
+        }
 
         // The entry is a breakout *stop*: it must sit on the far side of
         // the current close (above for a long, below for a short). If the
@@ -124,13 +196,14 @@ mod tests {
         s.parse().unwrap()
     }
 
-    /// A bare shell at `close`; OHLC equal except the close (the M/W
-    /// resolution only reads `close` for the stop-side check).
-    fn shell_at(close: f64) -> Shell {
+    /// A bare shell at `close` with explicit `high`/`low`. The M/W
+    /// resolution reads `close` for the stop-side check and `high` (M) /
+    /// `low` (W) for the second-peak confirmation window.
+    fn shell_hlc(high: f64, low: f64, close: f64) -> Shell {
         Shell {
             close,
-            high: close,
-            low: close,
+            high,
+            low,
             time: ts("2026-05-13T12:00:00Z"),
             signal_high: None,
             signal_low: None,
@@ -234,7 +307,9 @@ mod tests {
         // Close above the entry (neckline not yet decisively broken from
         // below) → stop sits below close → placeable.
         let intent = mw_intent(Direction::Short, m_params());
-        let r = Resolved::from_mw_intent(&intent, &shell_at(1.1120), &m_params()).unwrap();
+        // high = 1.1200 (the peak) sits inside the [1.1176, 1.1224) window.
+        let r = Resolved::from_mw_intent(&intent, &shell_hlc(1.1200, 1.1120, 1.1120), &m_params())
+            .unwrap();
         let trigger = match r.entry {
             ResolvedEntry::Stop { trigger_price } => trigger_price,
             other => panic!("expected Stop, got {other:?}"),
@@ -253,7 +328,9 @@ mod tests {
     #[test]
     fn w_long_levels_match_hand_calc() {
         let intent = mw_intent(Direction::Long, w_params());
-        let r = Resolved::from_mw_intent(&intent, &shell_at(1.1080), &w_params()).unwrap();
+        // low = 1.1000 (the trough) sits inside the (1.0976, 1.1024] window.
+        let r = Resolved::from_mw_intent(&intent, &shell_hlc(1.1080, 1.1000, 1.1080), &w_params())
+            .unwrap();
         let trigger = match r.entry {
             ResolvedEntry::Stop { trigger_price } => trigger_price,
             other => panic!("expected Stop, got {other:?}"),
@@ -275,7 +352,7 @@ mod tests {
         let mut mw = m_params();
         mw.spread_pips = 0.0;
         let intent = mw_intent(Direction::Short, mw);
-        let r = Resolved::from_mw_intent(&intent, &shell_at(1.1120), &mw).unwrap();
+        let r = Resolved::from_mw_intent(&intent, &shell_hlc(1.1200, 1.1120, 1.1120), &mw).unwrap();
         let trigger = match r.entry {
             ResolvedEntry::Stop { trigger_price } => trigger_price,
             other => panic!("expected Stop, got {other:?}"),
@@ -291,14 +368,86 @@ mod tests {
         // Close already below the entry (price gapped through) → the stop
         // can't be placed below the close → InvalidGeometry (stay armed).
         let intent = mw_intent(Direction::Short, m_params());
-        let err = Resolved::from_mw_intent(&intent, &shell_at(1.1100), &m_params());
+        // high passes the window; close 1.1100 is below entry → stop-side fail.
+        let err =
+            Resolved::from_mw_intent(&intent, &shell_hlc(1.1200, 1.1100, 1.1100), &m_params());
         assert!(matches!(err, Err(ResolveError::InvalidGeometry)), "{err:?}");
     }
 
     #[test]
     fn long_stop_on_wrong_side_is_declined() {
         let intent = mw_intent(Direction::Long, w_params());
-        let err = Resolved::from_mw_intent(&intent, &shell_at(1.1090), &w_params());
+        // low passes the window; close 1.1090 is above entry → stop-side fail.
+        let err =
+            Resolved::from_mw_intent(&intent, &shell_hlc(1.1090, 1.1000, 1.1090), &w_params());
+        assert!(matches!(err, Err(ResolveError::InvalidGeometry)), "{err:?}");
+    }
+
+    // ---- Second-peak confirmation window (the 0.7 / 1.3 gate) ----
+    //
+    // The real AUD/CAD setup that motivated this gate:
+    //   neckline C = 0.98339, first_point B = 0.98509, spread 1.7 pips.
+    //   min_retrace = C + 0.7×(B−C) = 0.98339 + 0.7×0.00170 = 0.98458
+    //   cancel      = C + 1.3×(B−C) = 0.98339 + 1.3×0.00170 = 0.98560
+    //   The motivating bar had high 0.98430 (< 0.98458) yet a close above
+    //   the entry, so the old code armed; the new gate declines it.
+    fn audcad_m() -> MwParams {
+        MwParams {
+            neckline: 0.98339,
+            first_point: 0.98509,
+            runup_start: 0.97856,
+            spread_pips: 1.7,
+            pip_size: 0.0001,
+        }
+    }
+
+    #[test]
+    fn m_high_below_min_retrace_is_declined() {
+        // The motivating bug: high 0.98430 < min_retrace 0.98458 → decline,
+        // even though the close sits above the entry stop (~0.98326).
+        let intent = mw_intent(Direction::Short, audcad_m());
+        let err =
+            Resolved::from_mw_intent(&intent, &shell_hlc(0.98430, 0.98300, 0.98400), &audcad_m());
+        assert!(matches!(err, Err(ResolveError::InvalidGeometry)), "{err:?}");
+    }
+
+    #[test]
+    fn m_high_inside_window_is_armed() {
+        // high 0.98470 ≥ min_retrace 0.98458 and < cancel 0.98560 → armed.
+        let intent = mw_intent(Direction::Short, audcad_m());
+        let r =
+            Resolved::from_mw_intent(&intent, &shell_hlc(0.98470, 0.98300, 0.98400), &audcad_m())
+                .expect("bar inside window arms");
+        assert!(matches!(r.entry, ResolvedEntry::Stop { .. }));
+    }
+
+    #[test]
+    fn m_high_at_or_above_cancel_is_declined() {
+        // high 0.98560 == cancel → past the 1.3 extension → decline (safety
+        // net for the mw-cancel veto). Upper bound is exclusive.
+        let intent = mw_intent(Direction::Short, audcad_m());
+        let err =
+            Resolved::from_mw_intent(&intent, &shell_hlc(0.98560, 0.98300, 0.98400), &audcad_m());
+        assert!(matches!(err, Err(ResolveError::InvalidGeometry)), "{err:?}");
+    }
+
+    #[test]
+    fn w_low_above_min_retrace_is_declined() {
+        // W mirror: min_retrace = C + 0.7×(B−C), B < C so it's below C.
+        //   neckline 1.1080, B 1.1000 → min_retrace 1.1024, cancel 1.0976.
+        // A low of 1.1030 hasn't dropped to 1.1024 → decline.
+        let intent = mw_intent(Direction::Long, w_params());
+        let err =
+            Resolved::from_mw_intent(&intent, &shell_hlc(1.1080, 1.1030, 1.1080), &w_params());
+        assert!(matches!(err, Err(ResolveError::InvalidGeometry)), "{err:?}");
+    }
+
+    #[test]
+    fn w_low_below_cancel_is_declined() {
+        // low 1.0976 == cancel → past the 1.3 extension downward → decline.
+        let intent = mw_intent(Direction::Long, w_params());
+        let err =
+            Resolved::from_mw_intent(&intent, &shell_hlc(1.1080, 1.0976, 1.1080), &w_params());
         assert!(matches!(err, Err(ResolveError::InvalidGeometry)), "{err:?}");
     }
 }
