@@ -942,6 +942,11 @@ deserialize is dropped with a `index decode: dropping bad element …` warning i
 the worker log, and the next write rewrites the blob without it (self-healing).
 A genuinely corrupt *container* (not a JSON array) is still a hard error.
 
+The same tolerance applies to the per-key `pause:` / `news:` listings (read by
+`status` and the news-window close gate): one value that won't decode is
+dropped with a `kv list decode: dropping bad value key=… …` warning rather than
+failing the whole listing. A KV I/O error on a read is still fatal.
+
 If you ever need to clear a poisoned index by hand (it self-heals after one
 write, so this is only an immediate unblock):
 

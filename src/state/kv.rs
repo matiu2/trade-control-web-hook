@@ -213,6 +213,17 @@ fn warn_dropped_index_element(key: &str, idx: usize, err: &serde_json::Error) {
     tracing::warn!("index decode: dropping bad element key={key} idx={idx} err={err}");
 }
 
+/// Native-safe warning for a single prefix-listed KV value that won't
+/// decode. Same rationale as [`warn_dropped_index_element`], but the
+/// per-key listings (`pause:…`, `news:…`) store one object per key, so
+/// the key name itself identifies the dropped record — no array index.
+fn warn_dropped_keyed_value(key: &str, err: &serde_json::Error) {
+    #[cfg(target_arch = "wasm32")]
+    worker::console_log!("kv list decode: dropping bad value key={} err={}", key, err,);
+    #[cfg(not(target_arch = "wasm32"))]
+    tracing::warn!("kv list decode: dropping bad value key={key} err={err}");
+}
+
 async fn write_index<T: serde::Serialize>(
     store: &KvStore,
     key: &str,
@@ -1141,17 +1152,37 @@ async fn list_json_with_prefix<T: for<'de> serde::Deserialize<'de>>(
     }
     let mut out: Vec<T> = Vec::with_capacity(keys.len());
     for key in keys {
+        // A KV I/O failure is a genuine backend error — stays fatal.
         let raw = store
             .get(&key)
             .text()
             .await
             .map_err(|e| StateError::Backend(format!("get {key}: {e:?}")))?;
         let Some(text) = raw else { continue };
-        let entry: T = serde_json::from_str(&text)
-            .map_err(|e| StateError::Backend(format!("decode {key}: {e}")))?;
-        out.push(entry);
+        // Schema drift on one key (a legacy value missing a since-added
+        // required field) must not sink the whole listing — drop it with a
+        // warning, same policy as `read_index`. Bug #6 was the array-blob
+        // version of this; this is the per-key version.
+        if let Some(entry) = decode_keyed_value::<T>(&key, &text) {
+            out.push(entry);
+        }
     }
     Ok(out)
+}
+
+/// Decode one prefix-listed KV value, returning `None` (and logging a
+/// warning) if it won't deserialize into `T`. The drop-not-fatal twin of
+/// the per-element handling in [`decode_index`], for the one-object-per-key
+/// listings (`pause:…`, `news:…`). Pure, so it's unit-testable without a
+/// `KvStore`.
+fn decode_keyed_value<T: for<'de> serde::Deserialize<'de>>(key: &str, text: &str) -> Option<T> {
+    match serde_json::from_str::<T>(text) {
+        Ok(entry) => Some(entry),
+        Err(e) => {
+            warn_dropped_keyed_value(key, &e);
+            None
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1235,5 +1266,49 @@ mod decode_index_tests {
         let entries: Vec<PrepEntry> = decode_index("index:preps", &blob).expect("not fatal");
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].step, "break-and-close");
+    }
+
+    // --- per-key prefix-listing decode (pause:/news: keys) ---
+
+    const GOOD_PAUSE: &str = r#"{
+        "trade_id": "m-eur-usd-57f5b5a7",
+        "blackout_id": "nfp",
+        "set_at": "2026-06-12T07:00:00Z",
+        "expires_at": "2026-06-12T08:00:00Z"
+    }"#;
+
+    /// A valid prefix-listed value decodes.
+    #[test]
+    fn keyed_value_decodes_good() {
+        let entry: Option<PauseEntry> =
+            decode_keyed_value("pause:m-eur-usd-57f5b5a7:nfp", GOOD_PAUSE);
+        let entry = entry.expect("valid pause value");
+        assert_eq!(entry.blackout_id, "nfp");
+    }
+
+    /// A legacy value missing a since-added required field is dropped
+    /// (None + warning), not fatal — so one bad key can't sink the whole
+    /// `pause:`/`news:` listing (the per-key cousin of bug #6).
+    #[test]
+    fn keyed_value_drops_legacy_missing_field() {
+        let legacy_no_blackout = r#"{
+            "trade_id": "m-eur-usd-57f5b5a7",
+            "set_at": "2026-06-12T07:00:00Z",
+            "expires_at": "2026-06-12T08:00:00Z"
+        }"#;
+        let entry: Option<PauseEntry> =
+            decode_keyed_value("pause:m-eur-usd-57f5b5a7:nfp", legacy_no_blackout);
+        assert!(
+            entry.is_none(),
+            "a value missing blackout_id must be dropped"
+        );
+    }
+
+    /// Malformed JSON for a single key is also dropped, not propagated —
+    /// the listing keeps going.
+    #[test]
+    fn keyed_value_drops_malformed_json() {
+        let entry: Option<NewsEntry> = decode_keyed_value("news:t:x", "{not json");
+        assert!(entry.is_none());
     }
 }

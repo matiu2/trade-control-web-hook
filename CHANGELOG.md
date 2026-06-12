@@ -1,5 +1,45 @@
 # Changelog
 
+## v15 — 2026-06-13 — extend bug #6 hardening to per-key prefix listings
+
+### Why
+
+v14 made the array-blob index reads (`index:vetos` et al.) tolerant of one
+bad legacy element. The *other* state reader — `list_json_with_prefix`, which
+backs the `pause:` / `news:` listings read by `snapshot()` and
+`list_pauses_for_trade` — still did a strict per-key `serde_json::from_str` and
+bailed the **whole listing** with `?` on the first value that wouldn't decode.
+Same latent failure mode as bug #6, just keyed-per-object instead of one shared
+array. `PauseEntry` / `NewsEntry` haven't drifted yet, so it hadn't fired — but
+the next required field added to either would have broken `status` and the
+news-window close gate. Closed it now rather than wait for the incident.
+
+### What changed
+
+- `list_json_with_prefix` now decodes each listed value through a new pure
+  `decode_keyed_value` helper that **drops and logs** (`kv list decode:
+  dropping bad value key=… err=…`) any single value that won't deserialize,
+  instead of failing the whole listing. A KV *I/O* error on a `get` is still
+  fatal (genuine backend failure, not schema drift) — mirrors how `read_index`
+  keeps the container-level error fatal.
+- New native-safe `warn_dropped_keyed_value` shim alongside the v14
+  `warn_dropped_index_element` (per-key listings identify the dropped record by
+  key name, so no array index).
+
+### Breaking
+
+None. Pure robustness hardening; no API, wire-format, or config change.
+
+### Config
+
+None.
+
+### Tests
+
+Three new cases in `decode_index_tests`: a valid `PauseEntry` decodes; a legacy
+`PauseEntry` missing required `blackout_id` is dropped (None, not fatal);
+malformed JSON for one key is dropped, not propagated.
+
 ## v14 — 2026-06-13 — element-tolerant index decode (bug #6 fix)
 
 ### Why
@@ -46,8 +86,8 @@ drop-not-fatal behaviour is proven generic over `PrepEntry` (missing `step`).
 ### Follow-up
 
 - `list_json_with_prefix` (news/pause keys, read by `snapshot()`) shares the
-  same strict per-key decode and could be hardened the same way — deferred, no
-  incident there yet.
+  same strict per-key decode and could be hardened the same way — **done in
+  v15**.
 - Operator: pending order `26800323` and any siblings on `reversals` were left
   live without veto protection during the 2026-06-12 window — reconcile
   open/pending orders against intended cancels manually.
