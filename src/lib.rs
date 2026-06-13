@@ -7,6 +7,7 @@ mod candle_gate;
 mod cron;
 mod diag;
 mod retry_gate;
+mod spread_blackout;
 mod state;
 #[cfg(target_arch = "wasm32")]
 mod tn_login;
@@ -1335,6 +1336,68 @@ async fn run_enter<B: Broker>(
             }
         }
     };
+
+    // System 1 of the spread blackout: reject a brand-new entry that
+    // fires during the post-NY-close liquidity trough when the live
+    // spread on THIS instrument is elevated. Runs here — after every
+    // gate (retry/cooldown/prep/veto/allow_entry) and `Resolved::from_intent`,
+    // immediately before the broker order. The pure decision lives in
+    // `spread_blackout::spread_blackout_decision`; this is the thin
+    // KV-read + quote-sample wrapper around it.
+    //
+    // REJECT, NOT a delay: we do not persist anything, do not schedule a
+    // re-fire, and do not touch KV here. The next legitimate signal bar
+    // re-triggers the alert and re-runs this check — by then the spread
+    // may have recovered and the same entry passes. Stateless + idempotent.
+    //
+    // SEEN-ID: returning `ActionResult::Rejected` is a `Skip` in
+    // `seen_decision` (no `mark_seen`), so this reject does NOT poison the
+    // intent id — the next fire is allowed through. See CLAUDE.md
+    // "Replay protection scope". Do NOT add any KV write on this path.
+    match store.get_spread_blackout_window().await {
+        // Fail open on a transient KV read error — a blackout-window read
+        // hiccup must never block a legitimate entry.
+        Err(err) => {
+            console_error!(
+                "spread-blackout: window read failed (id={}): {err} — failing open (allowing entry)",
+                verified.intent.id
+            );
+        }
+        // Window closed — the overwhelmingly common path. Fall through
+        // WITHOUT a broker round-trip (no `get_quote` call).
+        Ok(None) => {}
+        // Window open — sample the live spread for this instrument and
+        // decide. A fine-spread instrument/day is not blacked out.
+        Ok(Some(_window)) => match broker.get_quote(&resolved.instrument).await {
+            // Fail open on a quote error at decision time: a transient
+            // broker quote hiccup must not strand a real entry. (A
+            // fail-closed variant is recorded in the sub-plan open
+            // questions; flip this branch to reject if demo shows the
+            // trough also degrades the quote endpoint.)
+            Err(err) => {
+                console_error!(
+                    "spread-blackout: get_quote failed for {} (id={}): {err:?} — failing open (allowing entry)",
+                    resolved.instrument,
+                    verified.intent.id
+                );
+            }
+            Ok(quote) => {
+                let spread_pips = quote.spread() / pip_size;
+                let threshold = spread_blackout::elevated_threshold_pips(&resolved.instrument);
+                if spread_blackout::spread_blackout_decision(true, spread_pips, threshold) {
+                    console_log!(
+                        "entry rejected: spread-blackout instrument={} spread={spread_pips:.1}p > {threshold:.1}p (id={})",
+                        resolved.instrument,
+                        verified.intent.id
+                    );
+                    return ActionResult::Rejected {
+                        response: Response::error("entry blocked: spread blackout", 423),
+                        outcome: "rejected: spread-blackout".into(),
+                    };
+                }
+            }
+        },
+    }
 
     let entry_request = EntryRequest {
         instrument: &resolved.instrument,

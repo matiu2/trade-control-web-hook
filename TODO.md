@@ -1,5 +1,31 @@
 # TODO
 
+## Done — spread-blackout System 1: reject new entries during the window (v20)
+
+Sub-plan 3 of the DST-aware spread-blackout feature. The entry-reject
+consumer of v19's global window marker. **No** stop-widen / order-cancel
+(those are sub-plans 4/5). Builds on v18 (`get_quote`) + v19 (window
+marker + `get_spread_blackout_window`).
+
+### Steps
+- [x] `src/spread_blackout.rs` (new): pure
+      `spread_blackout_decision(window_open, spread_pips, threshold_pips)`
+      (strictly `>`), `elevated_threshold_pips`, provisional
+      `SPREAD_BLACKOUT_ELEVATED_PIPS = 8.0`. Five native unit tests
+      (closed→pass, open+wide→reject, open+tight→pass, boundary→pass,
+      threshold-lookup). `mod spread_blackout;` in `src/lib.rs`.
+- [x] `src/lib.rs` `run_enter`: wrapper inserted after the
+      `expiry_bars`/`cancel_at` block and before `EntryRequest` — read
+      window marker (fail-open on `Err`, skip on `None`, no `get_quote`
+      on closed path), sample live spread (`get_quote`, fail-open on
+      `Err`), pip-convert, decide, return
+      `Rejected { 423, "rejected: spread-blackout" }` when elevated.
+      Reject-not-delay + no-seen-id-poison documented in-code.
+- [x] README spread-blackout System 1 subsection (new reject reason +
+      423 + fail-open + reject-not-delay + provisional threshold);
+      CHANGELOG v20; this entry. worker tests + clippy + fmt; cli builds;
+      native + wasm builds.
+
 ## Done — spread-blackout state + crons skeleton (v19)
 
 Sub-plan 2 of the DST-aware spread-blackout feature. The state machine +
@@ -37,7 +63,11 @@ v18 broker trait (`get_quote`).
       intent in hand). Placeholder `recovered_cutoff` in
       `blackout_watch.rs` — leading candidate is to bake the cutoff onto
       `SpreadBlackoutRecord` at apply time (sub-plan 4/5 has the context).
-- [ ] Sub-plan 3: entry-reject reading `spread-blackout:window`.
+- [x] Sub-plan 3: entry-reject reading `spread-blackout:window` (done —
+      v20; see the new top section). Elevated cutoff
+      `SPREAD_BLACKOUT_ELEVATED_PIPS` in `src/spread_blackout.rs` is the
+      same open-question placeholder as `recovered_cutoff` above — tune
+      together (elevated > recovered).
 - [ ] Sub-plan 4: at the Cron 1 marked point, `list_open_positions` →
       widen via `amend_stop` → record `original_stops` + set
       `applied = true`; restore at the watcher's marked points.

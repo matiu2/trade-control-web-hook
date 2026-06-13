@@ -1,5 +1,70 @@
 # Changelog
 
+## v20 — 2026-06-13 — spread-blackout System 1: reject new entries during the window
+
+### Why
+
+Sub-plan 3 of the DST-aware spread-blackout feature (builds on the v18
+broker-trait `get_quote` and the v19 global window marker). The window
+marker armed in v19 had no consumer yet. This lands **System 1**: the
+"don't open a new position during the post-NY-close liquidity trough"
+half. A real trade (`hs-eur-nzd-c1e0f25b`, EUR/NZD short) entered
+straight into a ~20p blowout and stopped out for ~−1.38R, almost all of
+it spread, not a real price move — exactly the case this rejects.
+
+### What changed
+
+- **Pure decision helper** (`src/spread_blackout.rs`, new):
+  `spread_blackout_decision(window_open, spread_pips, threshold_pips) -> bool`
+  (strictly `>`, so exactly-at-threshold passes), the threshold lookup
+  `elevated_threshold_pips(instrument)`, and the provisional constant
+  `SPREAD_BLACKOUT_ELEVATED_PIPS = 8.0`. KV/broker-free, native unit-tested.
+- **Entry wrapper** (`src/lib.rs`, `run_enter`): at the very end of entry
+  processing — after every gate and `Resolved::from_intent`, immediately
+  before the broker `EntryRequest` — read the global window marker. If
+  open, sample the live spread (`Broker::get_quote`, `ask − bid` ÷
+  `pip_size`) for the incoming instrument and reject when elevated.
+  - **Outcome:** `rejected: spread-blackout`, **HTTP 423 Locked**
+    (mirrors the pause / cooldown / news transient-state-block family).
+  - **No instrument classification** — the live spread sample *is* the
+    filter; majors pass, blown-out thin crosses reject, fine days don't
+    black out at all.
+  - **Reject, NOT delay** — no KV write, no re-fire queued; the next
+    signal bar re-runs the check.
+  - **Does NOT poison the seen-id** — `ActionResult::Rejected` is a `Skip`
+    in `seen_decision` (no `mark_seen`); the next fire is allowed through.
+  - **Fail-open** on a window-marker read error OR a `get_quote` error at
+    decision time (logs `console_error!`, allows the entry) — a transient
+    hiccup must never block a legitimate trade.
+  - **Window closed = no broker round-trip** (no `get_quote` on the
+    overwhelmingly-common path).
+
+### Breaking
+
+None. No new wire field, no new KV namespace (consumes v19's marker), no
+new secret.
+
+### Config
+
+The elevated cutoff is a provisional single constant
+(`SPREAD_BLACKOUT_ELEVATED_PIPS`, 8 pips). It and v19's recovery cutoff
+(`blackout_watch::recovered_cutoff`) are the **same open question** and
+must be calibrated together (elevated > recovered, for hysteresis; units
+currently differ — see the `TODO(open-question)` in both modules).
+
+### Tests
+
+Five new native unit tests on the pure helper: window-closed → pass,
+window-open + wide → reject, window-open + tight → pass, boundary
+(exactly-at-threshold → pass), threshold-lookup returns the constant for
+any instrument. Native + wasm builds clean; clippy clean.
+
+### Follow-up
+
+Threshold calibration on demo (the open question); fail-closed variant
+if the trough also degrades the quote endpoint; Sub-plans 4/5 (widen
+open stops / cancel resting orders).
+
 ## v19 — 2026-06-13 — spread-blackout state + crons skeleton (no entry-reject/widen/cancel yet)
 
 ### Why

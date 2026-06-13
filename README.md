@@ -820,15 +820,54 @@ four; OANDA implements all four via its v20 trade/order/pricing endpoints.
 endpoint is unverified against an *open position's* SL — a later sub-plan
 must demo-confirm it before any live stop-widening.
 
-### Spread-blackout window (skeleton — state + crons only)
+### Spread-blackout window
 
 Right after New York's 17:00 close there is a ~1-hour global liquidity
 trough where the broker's spread on thin FX crosses (EUR/NZD, AUD/NZD)
 blows out and snaps back at the next hour. The dangerous hour tracks
 **New York's clock** (DST-aware): 07:00 BNE under EDT, 08:00 BNE under
-EST. This release lands the **state machine + cron skeleton** the rest
-of the feature hangs off. It does **not** reject entries, widen stops,
-or cancel orders yet (those are later sub-plans).
+EST. The state machine + cron skeleton arms a global window marker at
+that edge; **System 1** (below) is the entry-reject consumer. Widening
+open stops / cancelling resting orders are still later sub-plans.
+
+#### System 1 — reject new entries during the window
+
+When the global window is open, a brand-new `enter` is checked at the
+**very end** of entry processing — after every gate
+(retry/cooldown/prep/veto/`allow_entry`) and geometry resolution have
+passed, immediately before the broker order. The worker samples the
+**live spread** (`ask − bid` via `Broker::get_quote`) for the incoming
+instrument and, if it exceeds the elevated cutoff (in pips), rejects:
+
+- **Outcome:** `rejected: spread-blackout`, **HTTP 423 Locked** (mirrors
+  the pause / cooldown / news state-block family — the intent is valid,
+  the condition is transient, a later fire can succeed).
+- **No instrument classification.** The spread *sample itself* is the
+  filter: a major (EUR/USD ~1p) firing during the window passes; a thin
+  cross blown out to ~20p is rejected. A day where the spread stays fine
+  is not blacked out at all.
+- **Reject, NOT delay.** Nothing is persisted, no re-fire is queued, no
+  KV is touched. The next legitimate signal bar re-triggers the alert and
+  re-runs the check — by then the spread may have recovered and it passes.
+- **Does NOT consume the intent id.** Like every `Rejected`, this is a
+  `Skip` in the replay-dedup path (no `mark_seen`), so the next fire is
+  allowed through (see "Replay protection scope" in `CLAUDE.md`).
+- **Fail-open on errors.** A transient window-marker read error *or* a
+  `get_quote` error at decision time logs a `console_error!` and **allows**
+  the entry — a transient hiccup must never block a legitimate trade. (A
+  fail-closed variant is an open question; see `src/spread_blackout.rs`.)
+- **Window closed = zero cost.** When the marker is absent the worker
+  falls through without any broker round-trip (no `get_quote` call).
+
+The elevated cutoff is a **provisional single constant**
+(`SPREAD_BLACKOUT_ELEVATED_PIPS`, 8 pips) — calibrate on demo before
+relying on it. It and Sub-plan 2's recovery cutoff are the *same* open
+question and must be tuned together (elevated > recovered, for
+hysteresis); see the `TODO(open-question)` in `src/spread_blackout.rs`.
+
+This release lands the **state machine + cron skeleton** plus System 1.
+It does **not** widen stops or cancel orders yet (those are later
+sub-plans).
 
 Two kinds of KV state live under the `spread-blackout:` namespace:
 
