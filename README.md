@@ -832,6 +832,33 @@ that edge; **System 1** rejects *new* entries during the window;
 price and restores them after; **System 3** (below) cancels *resting entry
 orders* during the window and re-drives them after.
 
+> **Status (2026-06-13): all four pieces shipped, in demo-validation.**
+> The state machine + both crons + Systems 1/2/3 are coded, unit-tested,
+> and on `main` (tags `v17`–`v22`). The build is green on native + wasm +
+> cli. It is **NOT yet proven live** — a week of demo testing on the
+> `reversals` TradeNation account is in progress. Two things **must** be
+> confirmed on demo before any live use, and the thresholds **must** be
+> calibrated against real trough data:
+>
+> 1. **`amend_stop` on an OPEN position works** (System 2). The upstream TN
+>    `AmendCloseOrder` had zero prior callers; it is unconfirmed whether it
+>    amends an *open position's* SL or only a resting order's. Until a demo
+>    confirms the read-back, **live stop-widening must stay off.** The apply
+>    cron logs an `INTENT amend_stop …` line before every amend precisely so
+>    a dry-run/demo can confirm without risk.
+> 2. **cancel + re-drive of a resting order works** (System 3), including the
+>    `on_too_close` fallback when the level has been overrun. Re-drive
+>    re-runs the real HMAC verify on the stored signed body (no fabricated
+>    auth) — confirm a cancelled order actually re-places (or correctly
+>    drops) on demo.
+> 3. **Thresholds are provisional placeholders**, not calibrated:
+>    `SPREAD_BLACKOUT_ELEVATED_PIPS` (8p, System 1 reject),
+>    `SPREAD_BLACKOUT_RECOVERED_PIPS` (4p, System 2/3 restore), and the
+>    `clamp_widen` floor/ceiling (22p / 40p). Tune against observed
+>    EUR/NZD / AUD/NZD trough spreads during the demo week.
+>
+> See the **Demo-validation checklist** in `TODO.md` for the step-by-step.
+
 #### System 1 — reject new entries during the window
 
 When the global window is open, a brand-new `enter` is checked at the

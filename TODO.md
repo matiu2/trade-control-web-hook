@@ -1,5 +1,66 @@
 # TODO
 
+## ACTIVE — spread-blackout demo-validation checklist (week of 2026-06-13)
+
+The full DST-aware spread-blackout feature (Systems 1/2/3 + state machine +
+both crons) is **built, unit-tested, and on `main`** (tags `v17`–`v22`,
+green native + wasm + cli). It is **not yet proven live.** A week of demo
+testing on the `reversals` TradeNation account is in progress. Work through
+this before any live enablement. (Per-sub-plan detail is in the "Done"
+sections below; this is the consolidated runbook.)
+
+### Blocking preconditions (must pass on demo before live)
+- [ ] **System 2 — `amend_stop` on an OPEN position works.** TN's
+      `AmendCloseOrder` had zero prior callers; unconfirmed whether it amends
+      an *open position's* SL or only a resting order's. Demo: open a small
+      position on `reversals` with a known SL → `amend_stop` to a new level →
+      read back via account state → confirm it moved. The apply cron logs an
+      `INTENT amend_stop …` line before every amend so this can be observed
+      dry. **Live stop-widening stays OFF until this passes.**
+- [ ] **System 3 — cancel + re-drive of a resting order works.** Place a
+      resting stop-entry on `reversals` before the NY-close edge → force
+      Cron 1 → confirm it's cancelled and stored (`trade-control status`).
+      Force recovery → confirm it re-places when price is still on the entry
+      side, OR routes to the `on_too_close` fallback when the level overran,
+      OR drops a stale limit (trade left looking for entry). Re-drive re-runs
+      the real HMAC verify on the stored signed body — confirm no auth/verify
+      errors in CF logs.
+
+### Threshold calibration (provisional placeholders — tune on demo data)
+- [ ] `SPREAD_BLACKOUT_ELEVATED_PIPS` (8p) — System 1 reject cutoff.
+- [ ] `SPREAD_BLACKOUT_RECOVERED_PIPS` (4p) — System 2/3 restore cutoff.
+      Keep `recovered < elevated` (hysteresis). Both live together in
+      `src/spread_blackout.rs`.
+- [ ] `clamp_widen` floor/ceiling (22p / 40p) in `src/cron/blackout_widen.rs`.
+- [ ] Capture observed EUR/NZD + AUD/NZD trough spreads across the demo week
+      (and at least one NY DST boundary if it falls in-window) to set these.
+
+### End-to-end demo flows to exercise
+- [ ] **System 1:** fire an `enter` during the window on a thin cross →
+      expect `rejected: spread-blackout` (423) in CF logs; confirm a major
+      firing in the same window is NOT rejected (spread-sample self-scoping).
+- [ ] **Idempotency:** force Cron 1 twice in a window → no double-widen, no
+      double-cancel (the `applied` flag guards).
+- [ ] **Safety nets:** verify the backstop timeout clears a stuck record and
+      the hard-restore-floor restores stops even if the clock is off.
+- [ ] **Reconcile** via `trading-tax-tracker` `timeline`: the window should
+      read as clean "vetoed/withheld, didn't enter" + "cancelled→restored"
+      blocks, not a filled-then-instantly-stopped loss.
+
+### Known deferrals (not blocking demo; revisit after)
+- [ ] Multi-shot retry-slot suppression for re-drives (single-shot H&S / M-W
+      — the motivating case — is unaffected). Needs a `restoring` flag.
+- [ ] `on_too_close: limit` still degrades to `skip` (v17 carry-over) — an
+      overrun stop with `action: limit` skips-and-stays-retryable. Acceptable.
+- [ ] cli pins `broker-tradenation-v0.8.0` while the worker pins `v0.9.0`
+      (compiles fine; align when convenient).
+- [ ] Pip source for cron-sampled instruments relies on the pip baked onto
+      the per-trade record at apply time; an `adopt`ed position with no baked
+      pip can't be widened (self-scoping skip) — plumb a pip onto adopt if
+      needed.
+
+---
+
 ## Done — spread-blackout System 3: cancel resting orders, re-drive on recovery (v22)
 
 Sub-plan 5 (the **last**) of the DST-aware spread-blackout feature, and the
