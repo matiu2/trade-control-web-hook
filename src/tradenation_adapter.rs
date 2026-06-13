@@ -190,6 +190,7 @@ fn from_upstream_error(e: broker_tradenation::EntryError) -> EntryError {
         U::RiskCapExceeded { requested, cap } => EntryError::RiskCapExceeded { requested, cap },
         U::OpenPositionsCapExceeded => EntryError::OpenPositionsCapExceeded,
         U::UnitsBelowMinimum => EntryError::UnitsBelowMinimum,
+        U::EntryTooCloseToMarket => EntryError::EntryTooCloseToMarket,
         U::OrderRejected => EntryError::OrderRejected,
     }
 }

@@ -1560,6 +1560,10 @@ fn build_enter_alert(
         EntryMode::Stop => EntrySpec::Stop {
             from: geometry.entry_anchor,
             offset_pips: entry_offset_pips,
+            // No `on_too_close` opt-in from the H&S builder yet — bare
+            // setups keep today's skip behaviour. A future CLI flag can
+            // populate this (see the on_too_close follow-up).
+            on_too_close: None,
         },
         EntryMode::Market => EntrySpec::Market,
     });
@@ -1921,7 +1925,9 @@ mod tests {
         assert_eq!(alert.intent.direction, Some(Direction::Short));
         // Entry: low + 1 pip.
         match &alert.intent.entry {
-            Some(EntrySpec::Stop { from, offset_pips }) => {
+            Some(EntrySpec::Stop {
+                from, offset_pips, ..
+            }) => {
                 assert_eq!(*from, PriceAnchor::Low);
                 assert!((offset_pips - 1.0).abs() < 1e-9);
             }
@@ -1991,7 +1997,9 @@ mod tests {
         );
         assert_eq!(alert.intent.direction, Some(Direction::Long));
         match &alert.intent.entry {
-            Some(EntrySpec::Stop { from, offset_pips }) => {
+            Some(EntrySpec::Stop {
+                from, offset_pips, ..
+            }) => {
                 assert_eq!(*from, PriceAnchor::High);
                 assert!((offset_pips - 1.0).abs() < 1e-9);
             }

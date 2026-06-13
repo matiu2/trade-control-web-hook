@@ -181,6 +181,9 @@ impl Resolved {
             entry,
             stop_loss,
             take_profit,
+            // M/W bakes its own static stop-entry geometry and carries no
+            // `EntrySpec`, so there's no `on_too_close` fallback to thread.
+            None,
         )
     }
 }

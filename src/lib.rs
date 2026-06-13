@@ -11,6 +11,7 @@ mod state;
 #[cfg(target_arch = "wasm32")]
 mod tn_login;
 mod tn_login_helpers;
+mod too_close;
 mod tracing_console;
 mod tradenation_adapter;
 
@@ -23,7 +24,7 @@ use crate::tradenation_adapter::TradeNationAdapter;
 use broker_oanda::login_with_account_id as oanda_login_with;
 use broker_oanda::{OandaBroker, login as oanda_login};
 use serde::Serialize;
-use trade_control_core::broker::{Broker, EntryRequest};
+use trade_control_core::broker::{Broker, EntryError, EntryRequest};
 use trade_control_core::incoming::{self, parse_and_verify};
 use trade_control_core::intent::{
     Action, BrokerKind, Intent, REVERSAL_VETO_NAME, Resolved, Shell, VetoLevel,
@@ -1369,10 +1370,31 @@ async fn run_enter<B: Broker>(
         r_multiple,
     );
 
-    match broker
+    // First placement. On `EntryTooCloseToMarket` (TN `#19-10`), the
+    // stop trigger was overtaken by price; the optional `on_too_close`
+    // fallback may recover with a *single* synchronous market re-place
+    // (never a loop — a too-close means price is moving). The re-place
+    // is the SAME intended entry, so it shares `retry_attempt_no` and
+    // does not consume an extra multi-shot slot.
+    let placement = match broker
         .place_entry(max_risk_pct, max_open_positions, &entry_request)
         .await
     {
+        Ok(order_id) => Ok(order_id),
+        Err(EntryError::EntryTooCloseToMarket) => {
+            place_entry_too_close_fallback(
+                broker,
+                &resolved,
+                &verified.intent.id,
+                max_risk_pct,
+                max_open_positions,
+            )
+            .await
+        }
+        Err(err) => Err(err),
+    };
+
+    match placement {
         Ok(order_id) => {
             if resolved.dry_run {
                 console_log!("DRY-RUN entry id={} (not placed)", verified.intent.id);
@@ -1398,8 +1420,110 @@ async fn run_enter<B: Broker>(
             }
         }
         Err(err) => {
-            console_error!("entry failed: {err}");
-            ActionResult::Failed(format!("entry-failed: {err}"))
+            // Stays `ActionResult::Failed` (a Skip in `seen_decision`):
+            // a too-close / broker failure must never poison the seen-id
+            // so the next signal bar can retry. The too-close case gets
+            // a distinct outcome string for log-grep observability.
+            let outcome = too_close::outcome_for_entry_error(&err);
+            console_error!("entry failed: {err} ({outcome})");
+            ActionResult::Failed(outcome)
+        }
+    }
+}
+
+/// Single synchronous market re-place for a stop-entry rejected with
+/// `#19-10` ("entry too close to / wrong side of market"). Reads the
+/// current market price, applies the `on_too_close` slippage guard
+/// (pure [`too_close::market_replace_plan`]), and on a within-threshold
+/// `market` action re-places as a **market order** sized against the
+/// actual fill reference — a worse market fill changes the stop distance
+/// and therefore the 1%-equity position size, so the broker re-runs
+/// sizing from the market reference rather than the stop-trigger math.
+///
+/// Returns the original [`EntryError::EntryTooCloseToMarket`] (so the
+/// caller surfaces the distinct outcome) when the fallback is absent,
+/// out of threshold, `skip`, `limit` (unimplemented), or the re-place
+/// itself fails / the price read fails. One attempt only.
+async fn place_entry_too_close_fallback<B: Broker>(
+    broker: &B,
+    resolved: &trade_control_core::intent::Resolved,
+    intent_id: &str,
+    max_risk_pct: f64,
+    max_open_positions: u32,
+) -> Result<String, EntryError> {
+    use trade_control_core::intent::ResolvedEntry;
+
+    // Only stop entries carry the fallback; a too-close on anything else
+    // (shouldn't happen) is terminal.
+    let trigger_price = match &resolved.entry {
+        ResolvedEntry::Stop { trigger_price } => *trigger_price,
+        _ => return Err(EntryError::EntryTooCloseToMarket),
+    };
+
+    // The current price drives both the slippage guard and the new
+    // market reference. A failed read is "price unavailable" → skip.
+    let current_price = match broker.get_current_price(&resolved.instrument).await {
+        Ok(p) => p,
+        Err(err) => {
+            console_error!(
+                "too-close fallback: get_current_price({}) failed: {err} (id={intent_id})",
+                resolved.instrument
+            );
+            return Err(EntryError::EntryTooCloseToMarket);
+        }
+    };
+
+    match too_close::market_replace_plan(
+        resolved.on_too_close.as_ref(),
+        resolved.direction,
+        trigger_price,
+        current_price,
+    ) {
+        too_close::TooClosePlan::Skip { reason } => {
+            console_log!(
+                "too-close fallback: not recovering (id={intent_id} reason={reason} trigger={trigger_price} price={current_price})"
+            );
+            Err(EntryError::EntryTooCloseToMarket)
+        }
+        too_close::TooClosePlan::Market { reference_price } => {
+            console_log!(
+                "too-close fallback: re-placing as MARKET (id={intent_id} trigger={trigger_price} price={reference_price})"
+            );
+            // Re-size against the actual fill reference: build a fresh
+            // request whose entry is a market order at the current
+            // price. The broker computes stop_distance from this
+            // reference (TN re-fetches live bid/ask; OANDA uses it
+            // directly), so the position size reflects the worse fill.
+            let market_request = EntryRequest {
+                instrument: &resolved.instrument,
+                direction: resolved.direction,
+                entry: ResolvedEntry::Market { reference_price },
+                stop_loss: resolved.stop_loss,
+                take_profit: resolved.take_profit,
+                risk: resolved.risk,
+                dry_run: resolved.dry_run,
+            };
+            match broker
+                .place_entry(max_risk_pct, max_open_positions, &market_request)
+                .await
+            {
+                Ok(order_id) => {
+                    console_log!(
+                        "too-close fallback: market re-place succeeded (id={intent_id} order={order_id})"
+                    );
+                    Ok(order_id)
+                }
+                Err(err) => {
+                    // One attempt only — do not loop. Surface the
+                    // original too-close identity so telemetry shows the
+                    // recovery was attempted and failed, and the seen-id
+                    // stays un-poisoned for the next bar.
+                    console_error!(
+                        "too-close fallback: market re-place failed: {err} (id={intent_id})"
+                    );
+                    Err(EntryError::EntryTooCloseToMarket)
+                }
+            }
         }
     }
 }
@@ -2856,6 +2980,22 @@ mod dispatcher_outcome_tests {
                 outcome: "entry-failed: broker 500"
             },
             "Failed must classify as Skip — broker errors don't poison the id",
+        );
+    }
+
+    /// A too-close (`#19-10`) entry failure must classify as Skip so it
+    /// never poisons the seen-id — the recovery contract is "let the
+    /// next bar retry". Uses the exact string the worker emits via
+    /// `too_close::outcome_for_entry_error`.
+    #[test]
+    fn too_close_outcome_classifies_as_skip() {
+        let result = ActionResult::Failed("entry-failed: too-close-to-market".into());
+        assert!(
+            matches!(
+                seen_decision(&result),
+                SeenDecision::Skip { kind: "failed", .. }
+            ),
+            "too-close must Skip — recovery relies on the next bar retrying",
         );
     }
 

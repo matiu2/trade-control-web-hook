@@ -35,9 +35,20 @@ pub struct EntryRequest<'a> {
 pub enum EntryError {
     AccountFetch,
     EquityParse,
-    RiskCapExceeded { requested: f64, cap: f64 },
+    RiskCapExceeded {
+        requested: f64,
+        cap: f64,
+    },
     OpenPositionsCapExceeded,
     UnitsBelowMinimum,
+    /// The entry trigger is on the wrong side of the market (a buy-stop
+    /// resting below price / sell-stop above, or the limit analogue).
+    /// On TradeNation this is `#19-10` / `#19-9` (`d.Status == -19`).
+    /// Distinct from [`Self::OrderRejected`] so the worker's
+    /// `on_too_close` fallback can recover (re-place as market / limit,
+    /// or skip) instead of dropping the entry. The stop-loss distance is
+    /// **not** the cause.
+    EntryTooCloseToMarket,
     OrderRejected,
 }
 
@@ -51,6 +62,9 @@ impl core::fmt::Display for EntryError {
             }
             Self::OpenPositionsCapExceeded => f.write_str("open positions cap exceeded"),
             Self::UnitsBelowMinimum => f.write_str("computed units below minimum"),
+            Self::EntryTooCloseToMarket => {
+                f.write_str("entry trigger too close to (or wrong side of) the market price")
+            }
             Self::OrderRejected => f.write_str("broker rejected the order"),
         }
     }

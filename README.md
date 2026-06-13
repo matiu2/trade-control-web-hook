@@ -236,6 +236,7 @@ instrument: EUR_USD
 direction: long                        # long | short
 entry: { type: market }                # or { type: stop, from: high, offset_pips: 2 }
                                        # or { type: limit, from: low,  offset_pips: 5 }
+                                       # stop entries may add on_too_close: see below
 stop_loss:   { from: low,  offset_pips: -2 }    # anchored — or { absolute: 1.86236 }
 take_profit: { from: close, offset_r: 2.0 }    # 2R — or { absolute: 1.86899 }
                                        #         or { from: high, offset_pips: 50 }
@@ -281,6 +282,44 @@ long limits sit *below* current price, short limits *above*). The worker
 rejects the trade if the geometry is wrong (e.g. a long limit priced above
 the current candle close), so a typo can't turn a limit into an instant
 market fill at a worse price.
+
+**Stop-entry "too close to market" fallback (`on_too_close`):** when a
+stop-entry's trigger has already been overtaken by price by the time the
+order tries to rest, the broker rejects it as "entry too close to / on
+the wrong side of the market" (TradeNation `#19-10`). By default that
+placement fails (HTTP 502) without poisoning the intent id, so the next
+signal bar can retry. A `stop` entry can opt into a recovery instead:
+
+```yaml
+entry:
+  type: stop
+  from: high
+  offset_pips: 1.0
+  on_too_close:               # optional; default = skip (today's behaviour)
+    action: market            # market | limit | skip
+    max_slippage_pips: 8.0    # required for action: market — guard rail
+```
+
+- `action: skip` (default, also when `on_too_close` is omitted) — fail
+  the placement, don't poison the id, let the next bar try.
+- `action: market` — re-place as a **market order**, but only if the
+  current price is within `max_slippage_pips` of the original stop
+  trigger; otherwise fall back to skip and log why. The guard rail is
+  **required** (rejected at validate time if missing) so a runaway
+  breakout can't be chased into a much worse fill. The re-place is a
+  **single** synchronous attempt and is re-sized against the actual
+  market fill reference (a worse fill changes the stop distance and
+  therefore the 1%-equity position size). It does **not** consume a
+  multi-shot `max_retries` slot — it's the same intended entry.
+- `action: limit` — **not yet implemented**; currently treated the same
+  as `skip` (the entry stays retryable). Reserved for a follow-up that
+  re-places the level as a pullback limit with geometry validation.
+
+The distinct rejection is observable in the logs as
+`entry-failed: too-close-to-market` (vs the generic
+`entry-failed: broker rejected the order`). Only TradeNation has a
+confirmed `#19-10` today; the OANDA path maps its broker rejections to
+the generic case and does not trigger this fallback.
 
 **Bar-based order expiry (`expiry_bars`):** a resting stop/limit order
 that never fills otherwise sits until `not_after`. Set `expiry_bars: N`

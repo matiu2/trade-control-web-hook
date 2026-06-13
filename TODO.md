@@ -1,5 +1,35 @@
 # TODO
 
+## Done — `on_too_close` stop-entry fallback (`#19-10` recovery) (v17)
+
+Sub-plan 0 of the DST-aware spread-blackout feature. A stop-entry whose
+trigger price was overtaken before the order rested is rejected by TN as
+`#19-10`; the worker now plumbs that as a distinct error and can
+optionally recover with a slippage-guarded market re-place.
+
+### Steps
+- [x] broker-tradenation (v0.9.0): `EntryError::EntryTooCloseToMarket` +
+      `map_place_error` arm; new tag + CHANGELOG; worker Cargo pin bumped.
+- [x] core/broker.rs: `EntryError::EntryTooCloseToMarket` + Display.
+- [x] tradenation_adapter.rs: `from_upstream_error` pass-through arm.
+- [x] core/intent.rs: `OnTooClose` / `OnTooCloseAction` wire types on
+      `EntrySpec::Stop`; validation rejects `market` without
+      `max_slippage_pips`.
+- [x] core/intent/resolution.rs: `ResolvedOnTooClose` carried on
+      `Resolved` (pips→price), threaded via `finish_with_sizing`.
+- [x] src/too_close.rs: pure `outcome_for_entry_error` +
+      `market_replace_plan` (slippage guard) with unit tests.
+- [x] src/lib.rs `run_enter`: distinct outcome string (Step 1) + single
+      synchronous market re-place (Step 3). Stays `Failed` (no seen-id
+      poison); shares the multi-shot `EntryAttempt` slot.
+- [x] README + CHANGELOG (v17) updated in the same commit.
+
+### Follow-ups (NOT done — deferred)
+- [ ] Step 4: `action: limit` re-place with geometry validation (don't
+      create a `#19-9`); currently degrades to skip.
+- [ ] `build-trade` / `tv-arm` flag to opt a setup into `on_too_close`.
+- [ ] Demo verification (dry-run → demo) per `dry_run_first_protocol`.
+
 ## Active — scope vetos to trade_id (fix cross-trade veto bleed)
 
 Bug (operator, 2026-06-11): a `veto-too-high` set during an earlier setup

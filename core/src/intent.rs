@@ -12,7 +12,7 @@ mod resolution;
 pub use expiry::{ExpiryError, MAX_EXPIRY_BARS, resolve_cancel_at};
 #[cfg(feature = "cli")]
 pub use resolution::MIN_R_FLOOR;
-pub use resolution::{Resolved, ResolvedEntry, RiskBudget};
+pub use resolution::{Resolved, ResolvedEntry, ResolvedOnTooClose, RiskBudget};
 
 /// Plaintext outer YAML — the part TradingView substitutes `{{...}}` into.
 /// The intent fields sit alongside these at the top level of the signed
@@ -910,6 +910,11 @@ pub enum IntentValidationError {
     /// a zero/negative/NaN value would silently zero or invert the trade
     /// geometry.
     PipSizeInvalid,
+    /// `entry: { type: stop, on_too_close: { action: market } }` was
+    /// missing the required `max_slippage_pips` guard rail. Without it a
+    /// runaway breakout could be chased into an arbitrarily worse fill,
+    /// so `market` requires the bound.
+    OnTooCloseMissingSlippage,
     /// `enter` / `veto` / `clear-veto` reached validation without a
     /// `trade_id`. The veto KV key is
     /// `veto:<account>:<trade_id>:<instrument>:<name>` — without a
@@ -988,6 +993,9 @@ impl core::fmt::Display for IntentValidationError {
                 "mw params invalid: anchor prices must be finite, spread_pips >= 0, pip_size > 0",
             ),
             Self::PipSizeInvalid => f.write_str("pip_size must be finite and > 0"),
+            Self::OnTooCloseMissingSlippage => {
+                f.write_str("entry on_too_close: action market requires max_slippage_pips")
+            }
             Self::MissingTradeId => {
                 f.write_str("trade_id is required on action: enter | veto | clear-veto")
             }
@@ -1180,6 +1188,18 @@ impl Intent {
             && !(pip.is_finite() && pip > 0.0)
         {
             return Err(IntentValidationError::PipSizeInvalid);
+        }
+        // on_too_close (stop-entry fallback): a `market` recovery must
+        // carry its `max_slippage_pips` guard rail. Catch the malformed
+        // form here so a missing bound fails before dispatch rather than
+        // silently degrading to `skip` at the worker.
+        if let Some(EntrySpec::Stop {
+            on_too_close: Some(otc),
+            ..
+        }) = &self.entry
+            && otc.is_missing_required_slippage()
+        {
+            return Err(IntentValidationError::OnTooCloseMissingSlippage);
         }
         Ok(())
     }
@@ -1379,6 +1399,14 @@ pub enum EntrySpec {
         from: PriceAnchor,
         #[serde(default)]
         offset_pips: f64,
+        /// Optional fallback for when the broker rejects the resting
+        /// stop because the trigger has already been overtaken by price
+        /// (TradeNation `#19-10` "entry too close to / wrong side of
+        /// market"). Absent = today's behaviour: the placement fails
+        /// (502, no seen-id poison) and the next signal bar may retry.
+        /// See [`OnTooClose`].
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        on_too_close: Option<OnTooClose>,
     },
     /// Limit pending order; price resolves against the plaintext shell.
     /// Fills when price comes *back* to the level — used for pullback entries.
@@ -1388,6 +1416,58 @@ pub enum EntrySpec {
         #[serde(default)]
         offset_pips: f64,
     },
+}
+
+/// What to do when a stop-entry's resting placement is rejected because
+/// the trigger has already been overtaken by price (the breakout
+/// happened in the gap between bar-close and the order resting —
+/// TradeNation `#19-10`). Opt-in on [`EntrySpec::Stop`]; absent means
+/// "skip" (today's behaviour). The strategy author encodes the intent
+/// in the alert; it is not a universal default.
+#[derive(Debug, Clone, Copy, PartialEq, Deserialize, Serialize)]
+pub struct OnTooClose {
+    /// Which recovery to attempt.
+    pub action: OnTooCloseAction,
+    /// Guard rail for [`OnTooCloseAction::Market`]: only re-place as a
+    /// market order if current price is within this many pips of the
+    /// original stop trigger; otherwise fall back to skip. Required for
+    /// `market` (rejected at validate time if missing) so a runaway
+    /// breakout can't be chased into a much worse fill. Ignored for
+    /// `skip`; reserved for `limit` (a never-filling pullback limit has
+    /// no slippage to bound).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_slippage_pips: Option<f64>,
+}
+
+/// The recovery action for [`OnTooClose`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum OnTooCloseAction {
+    /// Re-place as a market order, bounded by
+    /// [`OnTooClose::max_slippage_pips`]. The break already happened;
+    /// enter the confirmed breakout at market rather than dropping it.
+    Market,
+    /// Re-place the level as a limit order (wait for a pullback to the
+    /// intended entry). Geometry-validated so it doesn't become a
+    /// wrong-side limit (`#19-9`). **Not yet implemented** — see the
+    /// `on_too_close` follow-up; the worker currently treats `limit`
+    /// the same as `skip` and logs that it's unimplemented.
+    Limit,
+    /// Do nothing — let the placement fail (502, no seen-id poison) so
+    /// the next signal bar can retry. Identical to omitting
+    /// `on_too_close` entirely.
+    Skip,
+}
+
+impl OnTooClose {
+    /// True iff this fallback is missing its required guard rail: a
+    /// `market` action without `max_slippage_pips`. Used by
+    /// [`Intent::validate`] and the CLI builder so a malformed fallback
+    /// fails before it reaches the worker (where the missing guard
+    /// would silently degrade to `skip`).
+    pub fn is_missing_required_slippage(&self) -> bool {
+        matches!(self.action, OnTooCloseAction::Market) && self.max_slippage_pips.is_none()
+    }
 }
 
 impl Shell {
@@ -1713,12 +1793,94 @@ mod tests {
         ";
         let intent: Intent = serde_yaml::from_str(yaml).unwrap();
         match intent.entry {
-            Some(EntrySpec::Stop { from, offset_pips }) => {
+            Some(EntrySpec::Stop {
+                from,
+                offset_pips,
+                on_too_close,
+            }) => {
                 assert_eq!(from, PriceAnchor::High);
                 assert!((offset_pips - 2.0).abs() < 1e-9);
+                assert!(on_too_close.is_none());
             }
             _ => panic!("expected stop entry"),
         }
+    }
+
+    #[test]
+    fn stop_entry_without_on_too_close_omits_field() {
+        // Back-compat: a bare stop entry serialises without the
+        // `on_too_close` key, so the wire form is byte-identical to
+        // pre-feature intents.
+        let spec = EntrySpec::Stop {
+            from: PriceAnchor::High,
+            offset_pips: 1.0,
+            on_too_close: None,
+        };
+        let yaml = serde_yaml::to_string(&spec).unwrap();
+        assert!(!yaml.contains("on_too_close"), "yaml was: {yaml}");
+    }
+
+    #[test]
+    fn stop_entry_with_on_too_close_market_round_trips() {
+        let yaml = "
+            type: stop
+            from: high
+            offset_pips: 1.0
+            on_too_close: { action: market, max_slippage_pips: 8.0 }
+        ";
+        let spec: EntrySpec = serde_yaml::from_str(yaml).unwrap();
+        match spec {
+            EntrySpec::Stop {
+                on_too_close: Some(otc),
+                ..
+            } => {
+                assert_eq!(otc.action, OnTooCloseAction::Market);
+                assert!((otc.max_slippage_pips.unwrap() - 8.0).abs() < 1e-9);
+                assert!(!otc.is_missing_required_slippage());
+            }
+            other => panic!("expected stop with on_too_close, got {other:?}"),
+        }
+        // And it round-trips back through serialise.
+        let spec = EntrySpec::Stop {
+            from: PriceAnchor::High,
+            offset_pips: 1.0,
+            on_too_close: Some(OnTooClose {
+                action: OnTooCloseAction::Market,
+                max_slippage_pips: Some(8.0),
+            }),
+        };
+        let out = serde_yaml::to_string(&spec).unwrap();
+        let back: EntrySpec = serde_yaml::from_str(&out).unwrap();
+        assert!(matches!(
+            back,
+            EntrySpec::Stop {
+                on_too_close: Some(OnTooClose {
+                    action: OnTooCloseAction::Market,
+                    ..
+                }),
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn on_too_close_skip_and_limit_parse() {
+        let skip: OnTooClose = serde_yaml::from_str("{ action: skip }").unwrap();
+        assert_eq!(skip.action, OnTooCloseAction::Skip);
+        assert!(!skip.is_missing_required_slippage());
+
+        let limit: OnTooClose = serde_yaml::from_str("{ action: limit }").unwrap();
+        assert_eq!(limit.action, OnTooCloseAction::Limit);
+        assert!(!limit.is_missing_required_slippage());
+    }
+
+    #[test]
+    fn on_too_close_market_without_slippage_flagged() {
+        // `market` without `max_slippage_pips` parses (serde-wise) but
+        // is_missing_required_slippage() flags it for validation.
+        let otc: OnTooClose = serde_yaml::from_str("{ action: market }").unwrap();
+        assert_eq!(otc.action, OnTooCloseAction::Market);
+        assert!(otc.is_missing_required_slippage());
     }
 
     #[test]
@@ -2676,6 +2838,63 @@ mod tests {
             instrument: EUR_USD
             name: too-high
             ttl_hours: 12
+        ";
+        let intent: Intent = serde_yaml::from_str(yaml).unwrap();
+        intent.validate().unwrap();
+    }
+
+    #[test]
+    fn validate_rejects_on_too_close_market_without_slippage() {
+        let yaml = "
+            v: 1
+            id: enter-1
+            trade_id: eurusd-hs-1
+            not_after: \"2026-05-13T20:00:00Z\"
+            action: enter
+            instrument: EUR_USD
+            direction: long
+            entry: { type: stop, from: high, offset_pips: 1, on_too_close: { action: market } }
+            stop_loss: { from: low, offset_pips: -2 }
+            take_profit: { from: close, offset_r: 2.0 }
+        ";
+        let intent: Intent = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(
+            intent.validate(),
+            Err(IntentValidationError::OnTooCloseMissingSlippage)
+        );
+    }
+
+    #[test]
+    fn validate_accepts_on_too_close_market_with_slippage() {
+        let yaml = "
+            v: 1
+            id: enter-1
+            trade_id: eurusd-hs-1
+            not_after: \"2026-05-13T20:00:00Z\"
+            action: enter
+            instrument: EUR_USD
+            direction: long
+            entry: { type: stop, from: high, offset_pips: 1, on_too_close: { action: market, max_slippage_pips: 8.0 } }
+            stop_loss: { from: low, offset_pips: -2 }
+            take_profit: { from: close, offset_r: 2.0 }
+        ";
+        let intent: Intent = serde_yaml::from_str(yaml).unwrap();
+        intent.validate().unwrap();
+    }
+
+    #[test]
+    fn validate_accepts_on_too_close_skip() {
+        let yaml = "
+            v: 1
+            id: enter-1
+            trade_id: eurusd-hs-1
+            not_after: \"2026-05-13T20:00:00Z\"
+            action: enter
+            instrument: EUR_USD
+            direction: long
+            entry: { type: stop, from: high, offset_pips: 1, on_too_close: { action: skip } }
+            stop_loss: { from: low, offset_pips: -2 }
+            take_profit: { from: close, offset_r: 2.0 }
         ";
         let intent: Intent = serde_yaml::from_str(yaml).unwrap();
         intent.validate().unwrap();

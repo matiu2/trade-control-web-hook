@@ -1,5 +1,79 @@
 # Changelog
 
+## v17 — 2026-06-13 — `on_too_close` stop-entry fallback (`#19-10` recovery)
+
+### Why
+
+A stop-entry whose trigger has been overtaken by price (the breakout
+happened in the gap between bar-close and the order resting) is rejected
+by TradeNation with `#19-10` ("entry too close to / wrong side of
+market"). Until now the worker (a) lost the error's identity — it
+collapsed into the generic `OrderRejected` and surfaced as an opaque
+`502 broker rejected the order` — and (b) had no recovery: the entry was
+simply dropped. This is sub-plan 0 of the DST-aware spread-blackout
+feature, which needs a "stop-can't-place → market / skip" fallback to
+re-drive entries when it re-creates cancelled orders at the NY-close
+edge.
+
+### What changed
+
+- **Distinct error, all three layers.** `tradenation_api` already
+  classified `#19-10` as `TradeError::EntryTooCloseToMarket`;
+  `broker-tradenation` (v0.9.0) now maps it to a new
+  `EntryError::EntryTooCloseToMarket` instead of the catch-all, and
+  `core::broker::EntryError` + `tradenation_adapter::from_upstream_error`
+  carry it through. The worker renders the distinct outcome string
+  `entry-failed: too-close-to-market` (still `ActionResult::Failed` →
+  502, **no seen-id poison** — preserved so the next bar retries).
+- **New wire field `on_too_close` on `EntrySpec::Stop`** —
+  `{ action: market|limit|skip, max_slippage_pips: <n> }`. Default
+  (omitted) = `skip`, byte-identical to pre-feature intents. `market`
+  requires `max_slippage_pips` (validated). Resolved into
+  `Resolved::on_too_close` (pips → price units) so the worker never
+  re-reads pip size.
+- **`action: market` recovery.** On a `#19-10` rejection the worker
+  reads the current market price, applies the slippage guard, and — if
+  within threshold — does **one** synchronous market re-place, re-sized
+  against the actual fill reference. Out of threshold / `skip` /
+  `limit` (unimplemented) / price-read failure all fall back to the
+  terminal `Failed` (no poison). The re-place shares the multi-shot
+  `EntryAttempt` slot — it does not consume a fresh one.
+
+### Breaking
+
+- `core::broker::EntryError` and `broker_tradenation::EntryError` each
+  gain an `EntryTooCloseToMarket` variant (exhaustive matches must add
+  an arm).
+- `EntrySpec::Stop` gains an `on_too_close: Option<OnTooClose>` field
+  (constructors must set it; `None` = today's behaviour).
+- `Resolved` gains `on_too_close: Option<ResolvedOnTooClose>`.
+
+### Config
+
+- Worker pins `broker-tradenation` / `tradenation-api` to the new
+  `broker-tradenation-v0.9.0` tag (which carries a transitive
+  `time = "=0.3.41"` pin → `reqwest 0.12.23` in the lockfile).
+
+### Tests
+
+- broker-tradenation: `map_place_error` maps too-close distinctly.
+- core: `on_too_close` parse / serialise round-trips, validation
+  rejects `market` without `max_slippage_pips`, resolution carries the
+  fallback and converts pips→price.
+- worker: distinct outcome string classifies as Skip (no poison); the
+  pure `too_close::market_replace_plan` slippage guard (within /
+  out-of-threshold / short side / boundary / no-bound / non-finite).
+
+### Follow-up
+
+- `action: limit` re-place (sub-plan step 4) — currently degrades to
+  skip; needs geometry validation so it doesn't create a `#19-9`.
+- A `build-trade` / `tv-arm` CLI flag to opt a setup into `on_too_close`
+  (the field is wired but no builder emits it yet).
+- Demo verification per `dry_run_first_protocol`: craft a stop whose
+  trigger sits behind current price on the TN demo and confirm the
+  distinct log + market recovery / skip.
+
 ## v16 — 2026-06-13 — M/W second-peak confirmation window before arming
 
 ### Why

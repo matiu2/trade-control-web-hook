@@ -137,6 +137,7 @@ mod tests {
             take_profit: 1.1044,
             risk: RiskBudget::Percent(0.5),
             dry_run: false,
+            on_too_close: None,
         }
     }
 

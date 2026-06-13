@@ -682,6 +682,7 @@ mod tests {
             take_profit: 1.1044,
             risk: crate::intent::RiskBudget::Percent(0.5),
             dry_run: false,
+            on_too_close: None,
         }
     }
 
@@ -769,6 +770,7 @@ mod tests {
             take_profit: 1.0956,
             risk: crate::intent::RiskBudget::Percent(0.5),
             dry_run: false,
+            on_too_close: None,
         };
         bind_shell_anchors(&mut scope, &shell_full());
         bind_intent_derived(&mut scope, &r, 0.0001);

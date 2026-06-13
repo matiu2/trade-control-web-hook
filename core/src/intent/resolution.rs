@@ -3,7 +3,7 @@
 
 use chrono::{DateTime, Utc};
 
-use super::{Action, Direction, EntrySpec, Intent, Shell, TakeProfit};
+use super::{Action, Direction, EntrySpec, Intent, OnTooCloseAction, Shell, TakeProfit};
 use crate::rules::{self, RhaiScope, RuleError};
 use crate::tunable::Tunable;
 
@@ -40,6 +40,25 @@ pub enum RiskBudget {
     Units(f64),
 }
 
+/// Resolved form of [`super::OnTooClose`] — the stop-entry fallback
+/// carried alongside the [`Resolved`] trade so the worker's `run_enter`
+/// can recover from a `#19-10` rejection without re-reading the intent
+/// or pip size. Threaded *next to* [`ResolvedEntry`] rather than inside
+/// `ResolvedEntry::Stop` so the ~10 existing match sites (and the
+/// upstream broker adapters, which don't carry it) stay untouched.
+#[derive(Debug, Clone, Copy)]
+pub struct ResolvedOnTooClose {
+    /// The recovery action the operator opted into.
+    pub action: OnTooCloseAction,
+    /// Guard rail for `market` recovery in **price units** (already
+    /// `max_slippage_pips × pip_size`). The worker re-places as a market
+    /// order only if the current price is within this distance of the
+    /// original stop trigger. `None` for `skip` / `limit`, and `None`
+    /// for a malformed `market` (validation rejects that upstream, but
+    /// the worker treats a `None` bound on `market` as "skip" defensively).
+    pub max_slippage_price: Option<f64>,
+}
+
 /// Fully-resolved trade intent, with all prices computed.
 #[derive(Debug, Clone)]
 pub struct Resolved {
@@ -59,6 +78,12 @@ pub struct Resolved {
     /// order — the inputs / calculations / output get logged instead.
     /// Defaults to false. See `Intent::dry_run`.
     pub dry_run: bool,
+    /// Stop-entry "too close to market" fallback, resolved from
+    /// `EntrySpec::Stop::on_too_close`. `None` for market / limit entries
+    /// and for stop entries that didn't opt in (today's behaviour: a
+    /// `#19-10` rejection fails the placement and the next bar retries).
+    /// See [`ResolvedOnTooClose`].
+    pub on_too_close: Option<ResolvedOnTooClose>,
 }
 
 /// Hard server-side floor on `min_r`. Overrides below this are rejected
@@ -189,6 +214,11 @@ impl Resolved {
 
         let stop_loss = sl_ref.resolve(shell, pip_size);
 
+        // Only stop entries carry a too-close fallback; market / limit
+        // leave it `None`. Resolved here (pips → price units) so the
+        // worker never needs pip_size again.
+        let mut on_too_close: Option<ResolvedOnTooClose> = None;
+
         let (entry, reference_price) = match entry_spec {
             EntrySpec::Market => (
                 ResolvedEntry::Market {
@@ -196,7 +226,11 @@ impl Resolved {
                 },
                 shell.close,
             ),
-            EntrySpec::Stop { from, offset_pips } => {
+            EntrySpec::Stop {
+                from,
+                offset_pips,
+                on_too_close: otc,
+            } => {
                 let trigger = shell.anchor_price(*from) + offset_pips * pip_size;
                 // Stop sits on the *far* side of current price for the direction:
                 // long stops above close, short stops below.
@@ -209,6 +243,7 @@ impl Resolved {
                     }
                     _ => {}
                 }
+                on_too_close = otc.map(|o| resolve_on_too_close(o, pip_size));
                 (
                     ResolvedEntry::Stop {
                         trigger_price: trigger,
@@ -258,6 +293,7 @@ impl Resolved {
             reference_price,
             stop_loss,
             take_profit,
+            on_too_close,
         )
     }
 
@@ -277,6 +313,7 @@ impl Resolved {
         reference_price: f64,
         stop_loss: f64,
         take_profit: f64,
+        on_too_close: Option<ResolvedOnTooClose>,
     ) -> Result<Self, ResolveError> {
         // Sizing-mode selection. `risk_pct` is always present (default
         // `Static(1.0)`), so it's the fallback. `risk_amount` and
@@ -331,6 +368,7 @@ impl Resolved {
             // is resolved. Scripts never see `risk`.
             risk: RiskBudget::Percent(0.0),
             dry_run: intent.dry_run.unwrap_or(false),
+            on_too_close,
         };
 
         // Server-enforced floor: an `min_r` override cannot weaken the
@@ -446,6 +484,19 @@ fn resolve_f64_tunable(
             message: err.to_string(),
         }
     })
+}
+
+/// Resolve the wire [`super::OnTooClose`] into the price-unit
+/// [`ResolvedOnTooClose`]. The slippage guard is converted from pips to
+/// price units here so the worker compares against the trigger directly.
+/// A `market` action with no `max_slippage_pips` (which validation
+/// rejects upstream) resolves to a `None` bound — the worker treats that
+/// as "skip" defensively rather than chasing an unbounded fill.
+fn resolve_on_too_close(otc: super::OnTooClose, pip_size: f64) -> ResolvedOnTooClose {
+    ResolvedOnTooClose {
+        action: otc.action,
+        max_slippage_price: otc.max_slippage_pips.map(|pips| pips.abs() * pip_size),
+    }
 }
 
 fn resolve_tp(
@@ -585,6 +636,7 @@ mod tests {
         intent.entry = Some(EntrySpec::Stop {
             from: PriceAnchor::High,
             offset_pips: 2.0,
+            on_too_close: None,
         });
         let r = Resolved::from_intent(&intent, &shell(), 0.0001).unwrap();
         // trigger = 1.1020 + 2*0.0001 = 1.1022
@@ -595,6 +647,51 @@ mod tests {
         // R is computed from the trigger, not the close.
         // SL = 1.0978; trigger = 1.1022; R = 0.0044; TP = 1.1022 + 2*0.0044 = 1.1110
         assert!((r.take_profit - 1.1110).abs() < 1e-9);
+    }
+
+    #[test]
+    fn stop_entry_carries_resolved_on_too_close_market() {
+        use crate::intent::{OnTooClose, OnTooCloseAction};
+        let mut intent = long_market_intent();
+        intent.entry = Some(EntrySpec::Stop {
+            from: PriceAnchor::High,
+            offset_pips: 2.0,
+            on_too_close: Some(OnTooClose {
+                action: OnTooCloseAction::Market,
+                max_slippage_pips: Some(8.0),
+            }),
+        });
+        let r = Resolved::from_intent(&intent, &shell(), 0.0001).unwrap();
+        let otc = r.on_too_close.expect("fallback carried onto Resolved");
+        assert_eq!(otc.action, OnTooCloseAction::Market);
+        // 8 pips * 0.0001 pip_size = 0.0008 in price units.
+        assert!((otc.max_slippage_price.unwrap() - 0.0008).abs() < 1e-12);
+    }
+
+    #[test]
+    fn market_entry_has_no_on_too_close() {
+        // The fallback is a stop-entry concept; a market entry never
+        // carries it even if some future caller sets it.
+        let r = Resolved::from_intent(&long_market_intent(), &shell(), 0.0001).unwrap();
+        assert!(r.on_too_close.is_none());
+    }
+
+    #[test]
+    fn stop_entry_skip_resolves_with_no_slippage_bound() {
+        use crate::intent::{OnTooClose, OnTooCloseAction};
+        let mut intent = long_market_intent();
+        intent.entry = Some(EntrySpec::Stop {
+            from: PriceAnchor::High,
+            offset_pips: 2.0,
+            on_too_close: Some(OnTooClose {
+                action: OnTooCloseAction::Skip,
+                max_slippage_pips: None,
+            }),
+        });
+        let r = Resolved::from_intent(&intent, &shell(), 0.0001).unwrap();
+        let otc = r.on_too_close.unwrap();
+        assert_eq!(otc.action, OnTooCloseAction::Skip);
+        assert!(otc.max_slippage_price.is_none());
     }
 
     #[test]
@@ -659,6 +756,7 @@ mod tests {
         intent.entry = Some(EntrySpec::Stop {
             from: PriceAnchor::Low,
             offset_pips: 10.0,
+            on_too_close: None,
         });
         assert!(matches!(
             Resolved::from_intent(&intent, &shell(), 0.0001),

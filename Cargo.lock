@@ -258,16 +258,16 @@ dependencies = [
 
 [[package]]
 name = "broker-tradenation"
-version = "0.8.0"
-source = "git+https://github.com/matiu2/tradenation-api.git?tag=broker-tradenation-v0.8.0#fee5e59d137d73c6a2be172af15ace8181811fcb"
+version = "0.9.0"
+source = "git+https://github.com/matiu2/tradenation-api.git?tag=broker-tradenation-v0.9.0#92ea2b660f1332ee1588f6afba6e8d26ee6d49d8"
 dependencies = [
  "color-eyre",
- "reqwest 0.12.28",
+ "reqwest 0.12.23",
  "serde",
  "serde_json",
  "thiserror",
  "tracing",
- "tradenation-api",
+ "tradenation-api 0.2.0 (git+https://github.com/matiu2/tradenation-api.git?tag=broker-tradenation-v0.9.0)",
 ]
 
 [[package]]
@@ -322,6 +322,17 @@ dependencies = [
  "color-eyre",
  "serde",
  "trading-base 0.1.0 (git+https://github.com/matiu2/tradenation-api.git?tag=broker-tradenation-v0.8.0)",
+]
+
+[[package]]
+name = "candle-model"
+version = "0.1.0"
+source = "git+https://github.com/matiu2/tradenation-api.git?tag=broker-tradenation-v0.9.0#92ea2b660f1332ee1588f6afba6e8d26ee6d49d8"
+dependencies = [
+ "chrono",
+ "color-eyre",
+ "serde",
+ "trading-base 0.1.0 (git+https://github.com/matiu2/tradenation-api.git?tag=broker-tradenation-v0.9.0)",
 ]
 
 [[package]]
@@ -556,9 +567,27 @@ dependencies = [
 
 [[package]]
 name = "cookie_store"
-version = "0.22.1"
+version = "0.21.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "15b2c103cf610ec6cae3da84a766285b42fd16aad564758459e6ecf128c75206"
+checksum = "2eac901828f88a5241ee0600950ab981148a18f2f756900ffba1b125ca6a3ef9"
+dependencies = [
+ "cookie",
+ "document-features",
+ "idna",
+ "log",
+ "publicsuffix",
+ "serde",
+ "serde_derive",
+ "serde_json",
+ "time",
+ "url",
+]
+
+[[package]]
+name = "cookie_store"
+version = "0.22.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3fc4bff745c9b4c7fb1e97b25d13153da2bc7796260141df62378998d070207f"
 dependencies = [
  "cookie",
  "document-features",
@@ -752,9 +781,9 @@ dependencies = [
 
 [[package]]
 name = "deranged"
-version = "0.5.8"
+version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7cd812cc2bc1d69d4764bd80df88b4317eaef9e773c75226407d9bc0876b211c"
+checksum = "9c9e6a11ca8224451684bc0d7d5a7adbf8f2fd6887261a1cfc3c0432f9d4068e"
 dependencies = [
  "powerfmt",
 ]
@@ -1860,9 +1889,9 @@ dependencies = [
 
 [[package]]
 name = "num-conv"
-version = "0.2.1"
+version = "0.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c6673768db2d862beb9b39a78fdcb1a69439615d5794a1be50caa9bc92c81967"
+checksum = "51d515d32fb182ee37cda2ccdcb92950d6a3c2893aa280e540671c2cd0f3b1d9"
 
 [[package]]
 name = "num-traits"
@@ -1883,7 +1912,7 @@ dependencies = [
  "color-eyre",
  "getrandom 0.4.2",
  "gloo-timers",
- "reqwest 0.12.28",
+ "reqwest 0.12.23",
  "serde",
  "serde_json",
  "tokio",
@@ -2414,14 +2443,14 @@ checksum = "dc897dd8d9e8bd1ed8cdad82b5966c3e0ecae09fb1907d58efaa013543185d0a"
 
 [[package]]
 name = "reqwest"
-version = "0.12.28"
+version = "0.12.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "eddd3ca559203180a307f12d114c268abf583f59b03cb906fd0b3ff8646c1147"
+checksum = "d429f34c8092b2d42c7c93cec323bb4adeb7c67698f70839adec842ec10c7ceb"
 dependencies = [
  "base64",
  "bytes",
  "cookie",
- "cookie_store",
+ "cookie_store 0.21.1",
  "futures-channel",
  "futures-core",
  "futures-util",
@@ -2463,7 +2492,7 @@ dependencies = [
  "base64",
  "bytes",
  "cookie",
- "cookie_store",
+ "cookie_store 0.22.0",
  "encoding_rs",
  "futures-channel",
  "futures-core",
@@ -3211,30 +3240,30 @@ dependencies = [
 
 [[package]]
 name = "time"
-version = "0.3.47"
+version = "0.3.41"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "743bd48c283afc0388f9b8827b976905fb217ad9e647fae3a379a9283c4def2c"
+checksum = "8a7619e19bc266e0f9c5e6686659d394bc57973859340060a69221e57dbc0c40"
 dependencies = [
  "deranged",
  "itoa",
  "num-conv",
  "powerfmt",
- "serde_core",
+ "serde",
  "time-core",
  "time-macros",
 ]
 
 [[package]]
 name = "time-core"
-version = "0.1.8"
+version = "0.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7694e1cfe791f8d31026952abf09c69ca6f6fa4e1a1229e18988f06a04a12dca"
+checksum = "c9e9a38711f559d9e3ce1cdb06dd7c5b8ea546bc90052da6d06bb76da74bb07c"
 
 [[package]]
 name = "time-macros"
-version = "0.2.27"
+version = "0.2.22"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2e70e4c5a0e0a8a4823ad65dfe1a6930e4f4d756dcd9dd7939022b5e8c501215"
+checksum = "3526739392ec93fd8b359c8e98514cb3e8e021beb4e5f597b00a0221f8ed8a49"
 dependencies = [
  "num-conv",
  "time-core",
@@ -3546,7 +3575,7 @@ dependencies = [
  "getrandom 0.4.2",
  "hex",
  "instrument-lookup",
- "reqwest 0.12.28",
+ "reqwest 0.12.23",
  "serde",
  "serde_json",
  "serde_yaml",
@@ -3556,7 +3585,7 @@ dependencies = [
  "trade-calendar-maker",
  "trade-control-conventions",
  "trade-control-core",
- "tradenation-api",
+ "tradenation-api 0.2.0 (git+https://github.com/matiu2/tradenation-api.git?tag=broker-tradenation-v0.8.0)",
  "tradenation-instrument-cache",
 ]
 
@@ -3595,7 +3624,7 @@ dependencies = [
  "serde_yaml",
  "tracing",
  "trade-control-core",
- "tradenation-api",
+ "tradenation-api 0.2.0 (git+https://github.com/matiu2/tradenation-api.git?tag=broker-tradenation-v0.9.0)",
  "worker",
 ]
 
@@ -3613,11 +3642,36 @@ dependencies = [
  "dotenvy",
  "futures-util",
  "getrandom 0.4.2",
- "reqwest 0.12.28",
+ "reqwest 0.12.23",
  "serde",
  "serde_json",
  "tempfile",
  "thiserror",
+ "tokio",
+ "toml",
+ "tracing",
+]
+
+[[package]]
+name = "tradenation-api"
+version = "0.2.0"
+source = "git+https://github.com/matiu2/tradenation-api.git?tag=broker-tradenation-v0.9.0#92ea2b660f1332ee1588f6afba6e8d26ee6d49d8"
+dependencies = [
+ "aes-gcm",
+ "candle-model 0.1.0 (git+https://github.com/matiu2/tradenation-api.git?tag=broker-tradenation-v0.9.0)",
+ "chrono",
+ "chrono-tz",
+ "color-eyre",
+ "dirs",
+ "dotenvy",
+ "futures-util",
+ "getrandom 0.4.2",
+ "reqwest 0.12.23",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "time",
  "tokio",
  "toml",
  "tracing",
@@ -3630,12 +3684,12 @@ source = "git+https://github.com/matiu2/tradenation-api.git?tag=broker-tradenati
 dependencies = [
  "chrono",
  "dirs",
- "reqwest 0.12.28",
+ "reqwest 0.12.23",
  "serde",
  "serde_json",
  "thiserror",
  "tracing",
- "tradenation-api",
+ "tradenation-api 0.2.0 (git+https://github.com/matiu2/tradenation-api.git?tag=broker-tradenation-v0.8.0)",
 ]
 
 [[package]]
@@ -3650,6 +3704,15 @@ dependencies = [
 name = "trading-base"
 version = "0.1.0"
 source = "git+https://github.com/matiu2/tradenation-api.git?tag=broker-tradenation-v0.8.0#fee5e59d137d73c6a2be172af15ace8181811fcb"
+dependencies = [
+ "color-eyre",
+ "serde",
+]
+
+[[package]]
+name = "trading-base"
+version = "0.1.0"
+source = "git+https://github.com/matiu2/tradenation-api.git?tag=broker-tradenation-v0.9.0#92ea2b660f1332ee1588f6afba6e8d26ee6d49d8"
 dependencies = [
  "color-eyre",
  "serde",
@@ -3682,7 +3745,7 @@ dependencies = [
  "hex",
  "instrument-lookup",
  "oanda-client",
- "reqwest 0.12.28",
+ "reqwest 0.12.23",
  "serde",
  "serde_json",
  "serde_yaml",
@@ -3695,7 +3758,7 @@ dependencies = [
  "trade-control-cli",
  "trade-control-conventions",
  "trade-control-core",
- "tradenation-api",
+ "tradenation-api 0.2.0 (git+https://github.com/matiu2/tradenation-api.git?tag=broker-tradenation-v0.8.0)",
  "trading-view",
 ]
 
