@@ -827,8 +827,10 @@ trough where the broker's spread on thin FX crosses (EUR/NZD, AUD/NZD)
 blows out and snaps back at the next hour. The dangerous hour tracks
 **New York's clock** (DST-aware): 07:00 BNE under EDT, 08:00 BNE under
 EST. The state machine + cron skeleton arms a global window marker at
-that edge; **System 1** (below) is the entry-reject consumer. Widening
-open stops / cancelling resting orders are still later sub-plans.
+that edge; **System 1** rejects *new* entries during the window;
+**System 2** (below) widens *already-open* positions' stops away from
+price and restores them after. Cancelling resting orders is still a later
+sub-plan.
 
 #### System 1 — reject new entries during the window
 
@@ -860,14 +862,69 @@ instrument and, if it exceeds the elevated cutoff (in pips), rejects:
   falls through without any broker round-trip (no `get_quote` call).
 
 The elevated cutoff is a **provisional single constant**
-(`SPREAD_BLACKOUT_ELEVATED_PIPS`, 8 pips) — calibrate on demo before
-relying on it. It and Sub-plan 2's recovery cutoff are the *same* open
-question and must be tuned together (elevated > recovered, for
-hysteresis); see the `TODO(open-question)` in `src/spread_blackout.rs`.
+(`SPREAD_BLACKOUT_ELEVATED_PIPS`, 8 pips). It and the recovery cutoff
+(`SPREAD_BLACKOUT_RECOVERED_PIPS`, 4 pips) now live **together** in
+`src/spread_blackout.rs` so the hysteresis pair (`recovered < elevated`,
+so the window doesn't flap) is tuned in one place. The whole feature works
+in **pips** consistently — the cron side converts the broker's absolute
+`ask − bid` to pips via the `pip_size` baked onto each per-trade record at
+apply time. Both cutoffs are provisional — calibrate on demo before
+relying on them.
 
-This release lands the **state machine + cron skeleton** plus System 1.
-It does **not** widen stops or cancel orders yet (those are later
-sub-plans).
+#### System 2 — widen open stops during the window, restore after
+
+Right after the NY-close edge, the daily cron also protects every
+**already-open** position from the spread blowout: it **widens the
+stop-loss away from price** so spread noise can't clip it, then the 15-min
+recovery watcher **restores the stop to its exact original level** once the
+spread normalises (or a ~3h backstop fires).
+
+- **Direction (away from price).** A **short**'s stop sits above entry, so
+  widening moves it **UP**; a **long**'s sits below, so widening moves it
+  **DOWN**. (Widening the wrong way would tighten into the spread and clip
+  the position instantly — the pure `widened_stop` helper + its
+  direction-matrix test guard the sign.)
+- **Amount.** Widen by the **live sampled spread in pips**, floored at
+  **22p** (the observed EUR/NZD blowout — don't under-widen on a brief
+  snap-back) and capped at **40p** (a freak print mustn't blow the stop out
+  absurdly). `clamp_widen(live_spread_pips)`.
+- **Restore from the remembered original, never `current − widen`.** The
+  pre-widen SL is captured into the per-trade record's `original_stops` at
+  apply time; recovery amends straight back to that verbatim. This is a hard
+  rule: a partial widen, a missed watcher tick, or a double-fire all stay
+  correct because the remembered original is idempotent.
+- **Bounded extra loss.** Widening temporarily enlarges the *designed* loss
+  by **≤ one spread-width** (capped at 40 pips) for **≤ ~1h** (the
+  backstop). If a genuine price move runs *through* the widened band during
+  the window, the position closes further from entry than its original stop
+  — you eat those extra pips. This is the **deliberate, bounded cost**,
+  accepted by the operator: the alternative (the original tight stop) is the
+  near-certain spread-clip that motivated the feature. It is mitigated
+  structurally — the window is driven by the NY-close edge (not a fixed
+  Brisbane HH:MM) and Cron 2 restores the moment the spread normalises.
+- **Move-only, never close or tighten.** System 2 only ever *moves a stop
+  away* then *back*. No code path here closes a position or tightens a stop
+  (the same StopNextEntry-only spirit as `veto_on_reversal`).
+- **Idempotent.** A re-fired Cron 1 (CF double-deliver / mid-window restart)
+  checks the per-trade record's `applied` flag and skips an already-widened
+  trade — it never double-widens, and never re-captures the
+  already-widened SL as the "original".
+- **Crash-safe ordering.** The original is recorded to KV **before** the
+  broker amend, so a crash between them can't strand a widened stop with no
+  remembered original (the worst case is a restore that's a harmless no-op).
+
+> **PRECONDITION — demo-confirm `amend_stop` on an OPEN position first.**
+> TradeNation's `AmendCloseOrder` has zero existing callers and it is
+> **UNVERIFIED** whether it moves an *open position's* SL (vs only a resting
+> order's). System 2 depends on it. Before trusting the widen live: open a
+> demo position on `reversals` with a known SL, `amend_stop` it, read it
+> back, confirm the SL moved and the TP is unchanged. The apply cron logs an
+> `INTENT amend_stop …` line before every amend precisely so a dry-run/demo
+> can confirm the read-back. **Do not enable live widening until this is
+> demo-confirmed.** See `TODO.md`.
+
+This release lands the **state machine + cron skeleton** plus System 1 and
+System 2. It does **not** cancel resting orders yet (a later sub-plan).
 
 Two kinds of KV state live under the `spread-blackout:` namespace:
 
@@ -878,22 +935,29 @@ Two kinds of KV state live under the `spread-blackout:` namespace:
   brand-new entries).
 - **Per-trade record** `spread-blackout:rec:<trade_id>` —
   `{ trade_id, instrument, account, applied, opened_at, expires_at,
-  original_stops, cancelled_orders }`. The `applied` flag is the *fine*
-  "we actually touched THIS trade" signal; `original_stops` /
-  `cancelled_orders` are **reserved** for the stop-widen / order-cancel
-  sub-plans and are empty for now.
+  pip_size, original_stops, cancelled_orders }`. The `applied` flag is the
+  *fine* "we actually touched THIS trade" signal; `pip_size` is baked on at
+  apply time so the cron can work in pips with no intent in hand;
+  `original_stops` holds the **pre-widen** SLs to restore (populated by
+  System 2). `cancelled_orders` stays **reserved** for the order-cancel
+  sub-plan and is empty for now.
 
-Both surface in `trade-control status` (the `spread_blackouts` list and
-the `spread_blackout_window` marker).
+Both surface in `trade-control status` (the `spread_blackouts` list — where
+the `original_stops` and `pip_size` are operator-visible — and the
+`spread_blackout_window` marker).
 
-The 15-min cron's **recovery watcher** walks each `applied` record and
-clears it once the spread has recovered (sampled live via
-`Broker::get_quote`) **or** a ~3h backstop has fired — whichever comes
-first, regardless of the clock. Records the box never marked `applied`
-(e.g. because the edge cron was missed while it was down) are left
-untouched. The spread *recovered* threshold is a coarse placeholder
-pending operator tuning — see the `TODO(open-question)` in
-`src/cron/blackout_watch.rs`.
+The 15-min cron's **recovery watcher** walks each `applied` record,
+**restores every remembered stop to its original** (verbatim), then clears
+the record — once the spread has recovered (sampled live via
+`Broker::get_quote`, converted to pips via the record's `pip_size`) **or** a
+~3h backstop has fired, whichever comes first, regardless of the clock. A
+closed position (`AmendError::NotFound`) is benign — nothing to restore. A
+*failed* restore is logged loudly (`console_error!`) and the record is still
+cleared (a stranded record would re-detect forever; the backstop TTL is the
+final net). Records the box never marked `applied` (e.g. because the edge
+cron was missed while it was down) are left untouched. The recovered/elevated
+cutoffs are coarse placeholders pending operator tuning — see the
+`TODO(open-question)` in `src/spread_blackout.rs`.
 
 ## TradeNation session
 

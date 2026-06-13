@@ -371,6 +371,10 @@ pub async fn record_placement<S: StateStore>(
         expires_at,
         stop_loss_price: Some(stop_loss_price),
         cancel_at,
+        // Snapshot the baked pip so the spread-blackout apply cron can
+        // source it for a cron-found open position (it has no intent in
+        // hand). `None` ⇒ the cron skips the widen and logs.
+        pip_size: intent.pip_size,
     };
     if let Err(err) = store.record_entry_attempt(attempt).await {
         console_error!("KV record_entry_attempt: {err}");

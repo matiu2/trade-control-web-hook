@@ -433,6 +433,13 @@ pub async fn handle_adopt(req: &mut Request, env: &Env) -> Result<Response> {
         expires_at,
         stop_loss_price: adopt.stop_loss_price,
         cancel_at: None,
+        // TODO(open-question, spread-blackout sub-plan 4): adopt-trade has
+        // no intent in hand, so no baked `pip_size`. A position adopted via
+        // this path therefore can't be widened by the blackout apply cron
+        // (it falls back / skips, never widens with a wrong pip). If
+        // adopted trades need widen coverage, plumb a `pip_size` onto the
+        // adopt payload.
+        pip_size: None,
     };
 
     if let Err(err) = state.record_entry_attempt(attempt.clone()).await {

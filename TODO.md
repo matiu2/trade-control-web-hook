@@ -1,5 +1,75 @@
 # TODO
 
+## Done — spread-blackout System 2: widen open stops, restore on recovery (v21)
+
+Sub-plan 4 of the DST-aware spread-blackout feature. Fills in the
+widen-on-apply (Cron 1) and restore-on-clear (Cron 2) that v19 stubbed.
+Builds on v18 (`amend_stop`/`list_open_positions`), v19 (record + crons),
+v20 (entry-reject). **No** resting-order cancel (sub-plan 5).
+
+### Steps
+- [x] `src/cron/blackout_widen.rs` (new): pure `widened_stop` (SHORT up /
+      LONG down) + `clamp_widen` (22–40p) + consts. 7 native unit tests
+      (direction matrix incl. wrong-direction sign guard, pip-scaling,
+      clamp floor/in-band/ceiling/boundaries). `mod blackout_widen;`.
+- [x] `core/src/state.rs`: `SpreadBlackoutRecord.pip_size: f64`
+      (`#[serde(default)]`) + `EntryAttempt.pip_size: Option<f64>`
+      (snapshotted from `Intent.pip_size` in `retry_gate`; `None` on the
+      admin adopt path). serde round-trip + old-row default-decode tests.
+- [x] Cron 1 widen (`blackout_apply.rs`): list positions per affected
+      account (from `EntryAttempt` rows), join → trade_id+pip, `applied`
+      idempotency guard, **record-first-then-amend** (crash-safe), pip
+      baked on record. `join_position_to_attempt` pure helper + 4 tests.
+- [x] Cron 2 restore (`blackout_watch.rs`): restore each remembered stop
+      to its original **verbatim** before clearing, at BOTH the recovered
+      and backstop branches. Benign `NotFound`; loud log on failed restore;
+      clear proceeds regardless.
+- [x] Units reconciliation: `blackout_watch` works in pips via
+      `record.pip_size`; elevated (8p) + recovered (4p) cutoffs unified in
+      `src/spread_blackout.rs` with `recovered < elevated` hysteresis.
+- [x] README System 2 subsection (widen/restore, bounded-extra-loss note,
+      precondition note, `original_stops`/`pip_size` visible in `status`);
+      CHANGELOG v21; this entry. worker + core + cli tests, clippy + fmt;
+      native + wasm + cli build.
+
+### PRECONDITION — demo-confirm before enabling live widening (BLOCKING)
+- [ ] **`amend_stop` on an OPEN position is UNVERIFIED.** TradeNation's
+      `AmendCloseOrder` has zero upstream callers; it's not confirmed it
+      moves an *open position's* SL (vs only a resting order's). On the
+      `reversals` demo: open a small position with a known SL → `amend_stop`
+      it → read back via `tradenation` MCP `list_open_positions` → confirm
+      the SL moved to the requested level **and the TP is unchanged** →
+      amend back + close. If it doesn't work, STOP — that's an upstream
+      `tradenation-api` fix + tag bump, not a worker improvisation. The
+      widen helpers + KV plumbing already landed (unit-tested); the cron
+      must NOT be trusted live until this passes. The apply cron logs an
+      `INTENT amend_stop …` line before every amend for exactly this
+      read-back. (dry-run → demo → live, in that order.)
+- [ ] Full System-2 demo flow once the precondition clears: widen in the
+      live trough (correct direction + clamped amount, `status` shows
+      `applied`+`original_stops`+`pip_size`), restore on recovery + on
+      backstop, and idempotency (force Cron 1 twice → no double-widen).
+
+### Open questions (carried — not resolved this sub-plan)
+- **Position ↔ record join key.** Chose `position_id →
+      EntryAttempt.broker_trade_id` (exact once the fill snapshot lands),
+      falling back to `instrument+direction+account` (coarse — aliases if
+      two concurrent trades run the same pair/direction/account; rare for
+      the affected thin crosses). A fully unambiguous join would need a
+      synthetic per-`position_id` record when nothing correlates; deferred.
+- **Pip source for the cron.** Resolved the *units* (pip baked on the
+      record) via candidate (a): added `pip_size` to `EntryAttempt` at
+      placement. The admin adopt-trade path has no intent ⇒ `pip_size: None`
+      ⇒ that position isn't widenable; plumb a pip onto the adopt payload if
+      adopted trades need coverage.
+- **22/40 floor/ceiling per-instrument?** Left flat — a major barely blows
+      out, so its sampled spread likely never trips the elevated threshold
+      and is never widened (self-scoping). Tie to the elevated/recovered
+      per-instrument open question if those become per-instrument.
+- **OANDA amend parity.** TN is the confirmed broker; if sub-plan 1 stubbed
+      OANDA's `amend_stop`/`list_open_positions` to `Err(Transient)`, the
+      widen/restore loops log+skip OANDA accounts cleanly.
+
 ## Done — spread-blackout System 1: reject new entries during the window (v20)
 
 Sub-plan 3 of the DST-aware spread-blackout feature. The entry-reject

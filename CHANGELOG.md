@@ -1,5 +1,82 @@
 # Changelog
 
+## v21 — 2026-06-13 — spread-blackout System 2: widen open stops on blackout, restore on recovery
+
+### Why
+
+Sub-plan 4 of the DST-aware spread-blackout feature (builds on the v18
+broker-trait `amend_stop`/`list_open_positions`, the v19 window marker +
+per-trade record, and the v20 entry-reject). v19 left the widen/restore as
+flag-lifecycle stubs. This lands **System 2**: protect an *already-open*
+position from the post-NY-close spread blowout by widening its stop away
+from price at the window edge and restoring it to the exact original after.
+The motivating trade (`hs-eur-nzd-c1e0f25b`, EUR/NZD short) stopped out for
+~−1.38R, almost all of it spread — its stop sat right where the blown-out
+ask clipped it.
+
+### What changed
+
+- **Pure widen helpers** (`src/cron/blackout_widen.rs`, new): `widened_stop`
+  (SHORT → SL up, LONG → SL down; the sign-bug seam with a direction-matrix
+  + pip-scaling test) and `clamp_widen` (the 22–40-pip clamp), with
+  `WIDEN_FLOOR_PIPS`/`WIDEN_CEIL_PIPS` consts. KV-free, native unit-tested.
+- **Cron 1 widen** (`src/cron/blackout_apply.rs`): after opening the window
+  marker, list open positions per affected account (sourced from the
+  `EntryAttempt` rows), join each to its originating attempt (by
+  `position_id → broker_trade_id`, fallback `instrument+direction+account`),
+  guard on the record's `applied` flag (idempotent — no double-widen),
+  **record the original SL first then amend** (crash-safe), and bake
+  `pip_size` onto the record. Pure `join_position_to_attempt` helper +
+  tests. Logs an `INTENT amend_stop …` line before every amend
+  (precondition read-back).
+- **Cron 2 restore** (`src/cron/blackout_watch.rs`): at both clear points
+  (spread-recovered AND backstop), restore each remembered stop to its
+  original **verbatim** (never `current − widen`) before clearing. Closed
+  position (`NotFound`) is benign; a failed restore is logged loudly and the
+  record still clears.
+- **Units reconciliation (cross-sub-plan fix):** the cron side previously
+  compared spread in absolute price while System 1 worked in pips. Added
+  `pip_size` to `SpreadBlackoutRecord` (baked at apply time from the joined
+  `EntryAttempt`) and `pip_size: Option<f64>` to `EntryAttempt` (snapshotted
+  from `Intent.pip_size` at placement). `blackout_watch` now converts
+  `ask − bid` to pips via the record's pip. The elevated (8p) and recovered
+  (4p) cutoffs are unified in `src/spread_blackout.rs` with the hysteresis
+  invariant `recovered < elevated`.
+
+### Breaking
+
+None on the wire. KV: `SpreadBlackoutRecord` gains `pip_size`, `EntryAttempt`
+gains `pip_size` — both `#[serde(default)]`, so older rows decode (pip
+`0.0`/`None` ⇒ the cron skips the widen / falls back to backstop-only clear,
+never widens with a wrong pip).
+
+### Config
+
+`WIDEN_FLOOR_PIPS = 22.0`, `WIDEN_CEIL_PIPS = 40.0` (flat, per the
+self-scoping argument — majors never trip the elevated sample). The
+elevated/recovered spread cutoffs (`SPREAD_BLACKOUT_ELEVATED_PIPS = 8.0`,
+`SPREAD_BLACKOUT_RECOVERED_PIPS = 4.0`) are co-located in
+`src/spread_blackout.rs` and provisional — calibrate on demo.
+
+### Precondition (not yet cleared)
+
+`amend_stop` on an OPEN position via TradeNation's `AmendCloseOrder` is
+UNVERIFIED (zero upstream callers). **Live widening must not be trusted
+until demo-confirmed** on `reversals` (open a position, amend the SL, read
+it back, confirm SL moved + TP unchanged). The apply cron logs every
+intended amend prominently for the read-back. See `TODO.md`.
+
+### Tests
+
+`blackout_widen`: 7 (direction matrix incl. wrong-direction sign guard,
+pip-scaling FX/index/JPY, clamp floor/in-band/ceiling/boundaries).
+`blackout_apply`: 4 join tests (broker_trade_id-first, fallback,
+miss, account-scope). `blackout_watch`: pips-units recovery + `spread_in_pips`
+(unusable-pip → INFINITY). `spread_blackout`: hysteresis invariant.
+`core`: `SpreadBlackoutRecord`/`EntryAttempt` serde round-trip + old-row
+default decode. Worker 179, core 412, cli 233 — all green; native + wasm +
+cli build clean; clippy clean both targets.
+
 ## v20 — 2026-06-13 — spread-blackout System 1: reject new entries during the window
 
 ### Why

@@ -17,6 +17,7 @@
 
 mod blackout_apply;
 mod blackout_watch;
+mod blackout_widen;
 mod constants;
 pub(crate) mod session_meta;
 mod session_refresh;

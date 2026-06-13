@@ -21,7 +21,7 @@
 //!    here the loop is effectively a no-op — the skeleton 4/5 fill.
 
 use chrono::{DateTime, Duration, Utc};
-use trade_control_core::broker::Broker;
+use trade_control_core::broker::{AmendError, Broker};
 use trade_control_core::state::{SpreadBlackoutRecord, StateStore};
 use worker::{Env, console_error, console_log};
 
@@ -72,7 +72,11 @@ async fn watch_one(
     // SAFETY RULE 2 — backstop timeout. Clear regardless of spread so a
     // stuck record never pins a trade forever.
     if backstop_due(record.opened_at, now) {
-        // Sub-plans 4/5: restore stops/orders here before clearing.
+        // System 2: restore widened stops to their remembered originals
+        // BEFORE clearing — a stranded record would otherwise re-detect
+        // forever. Restore runs even on the backstop branch (Sub-plan 5
+        // adds resting-order restore at this same point later).
+        restore_remembered_stops(env, record).await;
         clear(store, record, "backstop").await?;
         console_log!(
             "blackout watch[{}]: backstop fired, cleared",
@@ -84,16 +88,103 @@ async fn watch_one(
     // SAFETY RULE 1 — hard restore floor. Act whenever applied &&
     // spread-normal, REGARDLESS of the clock; we don't gate on
     // is_ny_close_edge.
-    let spread = sample_spread(env, record).await?;
-    if spread_recovered(spread, &record.instrument) {
-        // Sub-plans 4/5: restore stops/orders here before clearing.
+    let spread_abs = sample_spread(env, record).await?;
+    // Convert the broker's absolute `ask − bid` to pips via the pip baked
+    // onto the record at apply time (Cron 1). The whole feature works in
+    // pips consistently; a `0.0`/non-finite pip means the apply path never
+    // baked one (a Sub-plan-2-era row, or a position with no joinable
+    // EntryAttempt) — fall back to a never-recover so the backstop is the
+    // only clear, rather than declaring recovery on a bogus pip division.
+    let spread_pips = spread_in_pips(spread_abs, record.pip_size);
+    if spread_recovered(spread_pips) {
+        // System 2: restore widened stops to their remembered originals
+        // before clearing (Sub-plan 5 adds resting-order restore here too).
+        restore_remembered_stops(env, record).await;
         clear(store, record, "recovery").await?;
         console_log!(
-            "blackout watch[{}]: spread {spread} recovered, cleared",
+            "blackout watch[{}]: spread {spread_pips}p recovered, cleared",
             record.trade_id
         );
     }
     Ok(())
+}
+
+/// Convert an absolute `ask − bid` spread to pips using the record's baked
+/// pip size. Returns `f64::INFINITY` when `pip_size` is unusable
+/// (`0.0`/non-finite) so the caller never declares recovery on a bogus
+/// division — the backstop becomes the only clear path for that record.
+/// Pure — unit-testable without KV/broker.
+fn spread_in_pips(spread_abs: f64, pip_size: f64) -> f64 {
+    if pip_size > 0.0 && pip_size.is_finite() {
+        spread_abs / pip_size
+    } else {
+        f64::INFINITY
+    }
+}
+
+/// Restore every remembered widened stop to its **remembered original**,
+/// then return. The hard rule: restore from `remembered.original_stop`
+/// VERBATIM, never `current − widen` — a partial widen / missed tick /
+/// double-fire all stay correct because the remembered original is
+/// idempotent (restoring twice lands on the same number). Per-id errors are
+/// logged and skipped so the clear still proceeds; a closed position yields
+/// `AmendError::NotFound` and is treated as benign (nothing to restore).
+/// System 2 only ever moves a stop — it never closes or tightens.
+async fn restore_remembered_stops(env: &Env, record: &SpreadBlackoutRecord) {
+    if record.original_stops.is_empty() {
+        return;
+    }
+    let Some(broker) = acquire_broker_for_account(env, record.account.as_deref()).await else {
+        console_error!(
+            "blackout restore[{}]: broker acquisition failed — {} stop(s) left widened until \
+             the operator restores them (backstop TTL is the final net)",
+            record.trade_id,
+            record.original_stops.len(),
+        );
+        return;
+    };
+    let account = record.account.as_deref().unwrap_or("");
+    for remembered in &record.original_stops {
+        let result = match &broker {
+            BrokerHandle::Oanda(b) => {
+                b.amend_stop(
+                    account,
+                    &remembered.position_or_order_id,
+                    remembered.original_stop,
+                )
+                .await
+            }
+            BrokerHandle::TradeNation(b) => {
+                b.amend_stop(
+                    account,
+                    &remembered.position_or_order_id,
+                    remembered.original_stop,
+                )
+                .await
+            }
+        };
+        match result {
+            Ok(()) => console_log!(
+                "blackout restore[{}]: amend_stop ok id={} -> original {} (verbatim, no recompute)",
+                record.trade_id,
+                remembered.position_or_order_id,
+                remembered.original_stop,
+            ),
+            Err(AmendError::NotFound) => console_log!(
+                "blackout restore[{}]: id={} gone (closed during window) — benign, nothing to \
+                 restore",
+                record.trade_id,
+                remembered.position_or_order_id,
+            ),
+            Err(err) => console_error!(
+                "blackout restore[{}]: amend_stop id={} -> {} FAILED ({err}) — stop left WIDENED, \
+                 operator must restore manually",
+                record.trade_id,
+                remembered.position_or_order_id,
+                remembered.original_stop,
+            ),
+        }
+    }
 }
 
 /// Acquire the record's-account broker and read the current spread via
@@ -130,39 +221,32 @@ pub fn backstop_due(opened_at: DateTime<Utc>, now: DateTime<Utc>) -> bool {
 }
 
 /// Pure recovery predicate — unit-testable without KV/broker. True when
-/// the sampled spread has dropped back to/under the recovered cutoff.
+/// the sampled spread (**in pips**) has dropped back to/under the recovered
+/// cutoff.
 ///
-/// OPEN QUESTION (do NOT resolve in Sub-plan 2): where the cutoff comes
-/// from for a cron-SAMPLED instrument. The watcher iterates KV records
-/// and has **no intent in hand**, so it can't read the baked
-/// `Intent.pip_size`. See [`recovered_cutoff`].
-pub fn spread_recovered(spread: f64, instrument: &str) -> bool {
-    spread <= recovered_cutoff(instrument)
+/// UNITS (reconciled in Sub-plan 4): the whole spread-blackout feature now
+/// works in pips. The caller converts the broker's absolute `ask − bid` to
+/// pips via [`spread_in_pips`] using the `pip_size` baked onto the record at
+/// apply time (Cron 1) — resolving Sub-plan 2's "no intent in hand" open
+/// question. The cutoff itself lives beside System 1's *elevated* cutoff in
+/// `crate::spread_blackout` so the hysteresis pair is tuned in ONE place
+/// (`RECOVERED < ELEVATED`).
+pub fn spread_recovered(spread_pips: f64) -> bool {
+    spread_pips <= recovered_cutoff()
 }
 
-/// PLACEHOLDER cutoff — needs operator tuning + a pip-source decision.
+/// The recovered-spread cutoff in pips. Single source of truth:
+/// `crate::spread_blackout::SPREAD_BLACKOUT_RECOVERED_PIPS`, co-located with
+/// System 1's elevated cutoff so the hysteresis invariant is visible and
+/// tuned in one file.
 ///
-/// TODO(open-question, spread-blackout sub-plan 2): the recovered/elevated
-/// spread thresholds are not yet calibrated, and the cron has no
-/// `pip_size` for an arbitrary instrument (the baked `Intent.pip_size`
-/// lives on the enter intent, which the watcher doesn't see). Candidate
-/// fixes, strongest first:
-///   1. Bake the absolute recovered cutoff (or `pip_size`) onto the
-///      `SpreadBlackoutRecord` at apply time — Cron 1 in Sub-plan 4/5
-///      *does* have the trade context — then read it off the record here.
-///   2. A small worker-side constants table keyed by instrument string
-///      (no `instrument-lookup` in WASM).
-///   3. A `SPREAD_CUTOFF_<instrument>` secret (mirrors the old
-///      `PIP_SIZE_*` pattern).
-///
-/// Until then this returns a single coarse absolute-price placeholder so
-/// the lifecycle is compilable and testable. Sub-plan 3 inherits the
-/// same open question for the entry-reject `elevated_cutoff`.
-fn recovered_cutoff(_instrument: &str) -> f64 {
-    // 0.0010 absolute price ≈ 10 pips on a 5-dp FX cross. Deliberately
-    // generous so the placeholder errs toward clearing, not pinning;
-    // NOT a tuned value — see the TODO above.
-    0.0010
+/// TODO(open-question, spread-blackout): the recovered/elevated cutoffs are
+/// still uncalibrated placeholders and flat across instruments. If they
+/// become per-instrument (tied to the per-instrument widen-clamp open
+/// question in `blackout_widen` / `blackout_apply`), thread the instrument
+/// through here. Calibrate on demo before relying on these.
+fn recovered_cutoff() -> f64 {
+    crate::spread_blackout::SPREAD_BLACKOUT_RECOVERED_PIPS
 }
 
 #[cfg(test)]
@@ -175,17 +259,31 @@ mod tests {
 
     #[test]
     fn spread_recovered_below_cutoff() {
-        assert!(spread_recovered(0.0005, "EUR_NZD"));
+        // Pips now (reconciled units). Recovered cutoff is 4p.
+        assert!(spread_recovered(2.0));
         assert!(
-            spread_recovered(0.0010, "EUR_NZD"),
+            spread_recovered(crate::spread_blackout::SPREAD_BLACKOUT_RECOVERED_PIPS),
             "at cutoff counts as recovered"
         );
     }
 
     #[test]
     fn spread_not_recovered_above_cutoff() {
-        // ~20 pips during the trough — still elevated.
-        assert!(!spread_recovered(0.0020, "EUR_NZD"));
+        // ~20 pips during the trough — still elevated; also the 8p elevated
+        // band (between recovered 4p and elevated 8p) is NOT yet recovered.
+        assert!(!spread_recovered(20.0));
+        assert!(!spread_recovered(6.0), "hysteresis band is not recovered");
+    }
+
+    #[test]
+    fn spread_in_pips_uses_record_pip_size() {
+        // 0.0022 absolute at 0.0001 pip = 22 pips.
+        assert!((spread_in_pips(0.0022, 0.0001) - 22.0).abs() < 1e-9);
+        // Unusable pip (0.0 / non-finite) -> INFINITY so recovery never
+        // fires on a bogus division; backstop is the only clear.
+        assert_eq!(spread_in_pips(0.0022, 0.0), f64::INFINITY);
+        assert_eq!(spread_in_pips(0.0022, f64::NAN), f64::INFINITY);
+        assert!(!spread_recovered(spread_in_pips(0.0001, 0.0)));
     }
 
     #[test]
@@ -218,6 +316,7 @@ mod tests {
             applied: false,
             opened_at: ts("2026-03-12T21:05:00Z"),
             expires_at: ts("2026-03-13T00:05:00Z"),
+            pip_size: 0.0001,
             original_stops: Vec::new(),
             cancelled_orders: Vec::new(),
         };

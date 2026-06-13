@@ -49,8 +49,21 @@ pub fn elevated_threshold_pips(_instrument: &str) -> f64 {
 /// self-scoping. Calibrate on demo before relying on it.
 ///
 /// Provisional — see [`elevated_threshold_pips`] for the open question and
-/// the hysteresis relationship to Sub-plan 2's `recovered_cutoff`.
+/// the hysteresis relationship to [`SPREAD_BLACKOUT_RECOVERED_PIPS`].
 pub const SPREAD_BLACKOUT_ELEVATED_PIPS: f64 = 8.0;
+
+/// "Recovered" spread cutoff in pips for the Sub-plan-2 recovery watcher
+/// (`src/cron/blackout_watch.rs`). The spread is considered back to normal
+/// once the sampled `ask − bid` (in pips) drops to/under this.
+///
+/// **Hysteresis (single tuning point):** lives here, beside the *elevated*
+/// cutoff, so the two are tuned together and the invariant
+/// `RECOVERED < ELEVATED` is visible in one file. Recovered sits **below**
+/// elevated so the window doesn't flap right at the boundary: an entry is
+/// blacked out above 8p, and the watcher only declares recovery once the
+/// spread has fallen all the way back to ≤4p. Both are provisional and
+/// MUST be calibrated together on demo — see [`elevated_threshold_pips`].
+pub const SPREAD_BLACKOUT_RECOVERED_PIPS: f64 = 4.0;
 
 #[cfg(test)]
 mod tests {
@@ -77,6 +90,17 @@ mod tests {
     fn boundary_exactly_at_threshold_passes() {
         // Strictly `>`, so exactly-at-threshold falls through (allowed).
         assert!(!spread_blackout_decision(true, 8.0, 8.0));
+    }
+
+    #[test]
+    #[allow(clippy::assertions_on_constants)]
+    fn recovered_cutoff_sits_below_elevated_for_hysteresis() {
+        // The window must not flap at the boundary: recovery is only
+        // declared once the spread has fallen below the (lower) recovered
+        // cutoff, not the moment it dips under the elevated one. Constant
+        // assertion on purpose — it guards the tuning invariant if a future
+        // edit to either const inverts the pair.
+        assert!(SPREAD_BLACKOUT_RECOVERED_PIPS < SPREAD_BLACKOUT_ELEVATED_PIPS);
     }
 
     #[test]

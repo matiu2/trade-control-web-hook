@@ -179,6 +179,18 @@ pub struct EntryAttempt {
     /// the record out early.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cancel_at: Option<DateTime<Utc>>,
+    /// Pip size for this trade's instrument, snapshotted from
+    /// `Intent.pip_size` at placement. The sole purpose is to let the
+    /// spread-blackout apply cron (Sub-plan 4 / System 2) source a
+    /// `pip_size` for a cron-found open position — it joins an
+    /// `OpenPosition` back to this row and bakes the pip onto the
+    /// `SpreadBlackoutRecord`, since the cron has no intent in hand. `None`
+    /// on rows written before this field existed, and on the admin
+    /// `adopt-trade` path which has no intent (Cron 1 falls back / skips the
+    /// widen and logs — never widens with a wrong pip). See the pip-source
+    /// open question in `src/cron/blackout_apply.rs`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pip_size: Option<f64>,
 }
 
 impl HasExpiry for EntryAttempt {
@@ -279,10 +291,10 @@ impl HasExpiry for SpreadBlackoutWindow {
 }
 
 /// Per-trade-id blackout record. Written when a trade's stops/orders
-/// were actually touched (Sub-plans 4/5 set `applied = true` and fill
-/// the `original_stops` / `cancelled_orders` payloads). Sub-plan 2 only
-/// reads it (recovery watcher) and clears it; the apply-side fields are
-/// **reserved now** so 4/5 don't reshape the schema.
+/// were actually touched. Sub-plan 4 (System 2) populates `applied = true`,
+/// `pip_size`, and `original_stops` (the widened stops' originals to restore
+/// on recovery). `cancelled_orders` stays **reserved** for Sub-plan 5
+/// (resting-order cancel/restore) so 5 doesn't reshape the schema.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SpreadBlackoutRecord {
     pub trade_id: String,
@@ -302,6 +314,17 @@ pub struct SpreadBlackoutRecord {
     pub applied: bool,
     pub opened_at: DateTime<Utc>,
     pub expires_at: DateTime<Utc>,
+    /// Pip size for the trade's instrument, baked on at apply time (Cron 1
+    /// sources it from the joined [`EntryAttempt::pip_size`]). The recovery
+    /// watcher has no intent in hand, so it converts the sampled `ask − bid`
+    /// to pips via this field — the whole spread-blackout feature works in
+    /// pips consistently (System 1's entry-reject already did; this aligns
+    /// the cron side). `#[serde(default)]` so Sub-plan-2-era rows decode to
+    /// `0.0`; both the widen (Cron 1) and the pip-converting recovery check
+    /// (Cron 2) treat `0.0`/non-finite as "couldn't determine — skip / fall
+    /// back", never silently widen or compare with a wrong pip.
+    #[serde(default)]
+    pub pip_size: f64,
     /// RESERVED for Sub-plan 4. Original SLs to restore on recovery,
     /// keyed by broker position/order id. Empty until then. `default`
     /// so Sub-plan-2-era rows decode after 4 adds population.
@@ -2199,6 +2222,7 @@ mod tests {
                 applied: true,
                 opened_at: ts("2026-05-14T11:00:00Z"),
                 expires_at: ts("2026-05-14T14:00:00Z"),
+                pip_size: 0.0001,
                 original_stops: Vec::new(),
                 cancelled_orders: Vec::new(),
             }],
@@ -2314,6 +2338,7 @@ mod tests {
             expires_at: now + chrono::Duration::hours(24),
             stop_loss_price: None,
             cancel_at: None,
+            pip_size: None,
         }
     }
 
@@ -2444,6 +2469,7 @@ mod tests {
             expires_at: now + chrono::Duration::hours(24),
             stop_loss_price: Some(1.0500),
             cancel_at: Some(now + chrono::Duration::hours(3)),
+            pip_size: None,
         };
         let yaml = serde_yaml::to_string(&a).unwrap();
         let parsed: EntryAttempt = serde_yaml::from_str(&yaml).unwrap();
@@ -2493,6 +2519,7 @@ mod tests {
             expires_at: now + chrono::Duration::hours(24),
             stop_loss_price: None,
             cancel_at: None,
+            pip_size: None,
         };
         let yaml = serde_yaml::to_string(&a).unwrap();
         assert!(!yaml.contains("broker_trade_id"));
@@ -2661,6 +2688,7 @@ mod tests {
             applied: true,
             opened_at: ts("2026-03-12T21:05:00Z"),
             expires_at: ts("2026-03-13T00:05:00Z"),
+            pip_size: 0.0001,
             original_stops: vec![RememberedStop {
                 position_or_order_id: "pos-1".into(),
                 original_stop: 1.8234,
@@ -2673,6 +2701,7 @@ mod tests {
         let json = serde_json::to_string(&record).unwrap();
         let parsed: SpreadBlackoutRecord = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed, record);
+        assert_eq!(parsed.pip_size, 0.0001);
     }
 
     /// A Sub-plan-2-era record (no apply-side payload written yet)
@@ -2691,6 +2720,7 @@ mod tests {
         assert_eq!(parsed.trade_id, "hs-eur-nzd-c1e0f25b");
         assert!(!parsed.applied);
         assert_eq!(parsed.account, None);
+        assert_eq!(parsed.pip_size, 0.0, "old rows decode pip_size to 0.0");
         assert!(parsed.original_stops.is_empty());
         assert!(parsed.cancelled_orders.is_empty());
     }
