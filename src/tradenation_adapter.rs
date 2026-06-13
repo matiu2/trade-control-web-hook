@@ -7,7 +7,8 @@
 
 use broker_tradenation::TradeNationBroker;
 use trade_control_core::broker::{
-    AttemptState, Broker, CancelError, EntryError, EntryRequest, LookupError,
+    AmendError, AttemptState, Broker, CancelError, EntryError, EntryRequest, LookupError,
+    OpenPosition, PendingOrder, Quote,
 };
 use trade_control_core::intent::{Direction, ResolvedEntry, RiskBudget};
 use tradenation_api::{OpeningOrder, Position, TransactionRecord};
@@ -129,10 +130,12 @@ impl Broker for TradeNationAdapter {
             })
     }
 
-    async fn get_current_price(&self, instrument: &str) -> Result<f64, LookupError> {
+    async fn get_quote(&self, instrument: &str) -> Result<Quote, LookupError> {
         // Two hops: name → market_id, then market_id → (bid, ask).
         // Upstream `latest_bid_ask` returns the most recent 1m bid/ask
-        // candle close as a (f64, f64) tuple; we return the mid.
+        // candle close as a (f64, f64) tuple. The trait's default
+        // `get_current_price` takes the mid; the spread-blackout systems
+        // read `spread()`.
         let market = tradenation_api::resolve_market(self.0.client(), self.0.session(), instrument)
             .await
             .map_err(|err| {
@@ -148,8 +151,203 @@ impl Broker for TradeNationAdapter {
                 );
                 LookupError::Transient
             })?;
-        Ok((bid + ask) / 2.0)
+        Ok(Quote { bid, ask })
     }
+
+    async fn list_open_positions(
+        &self,
+        _account_id: &str,
+    ) -> Result<Vec<OpenPosition>, LookupError> {
+        // TradeNation binds the account via the session, so the
+        // trait-level `account_id` is intentionally ignored.
+        let details = tradenation_api::get_account_details(self.0.session())
+            .await
+            .map_err(|err| {
+                console_error!("tn list_open_positions get_account_details: {err:?}");
+                LookupError::Transient
+            })?;
+        Ok(details
+            .positions
+            .records
+            .iter()
+            .map(tn_position_to_open)
+            .collect())
+    }
+
+    async fn list_pending_orders(
+        &self,
+        _account_id: &str,
+    ) -> Result<Vec<PendingOrder>, LookupError> {
+        let details = tradenation_api::get_account_details(self.0.session())
+            .await
+            .map_err(|err| {
+                console_error!("tn list_pending_orders get_account_details: {err:?}");
+                LookupError::Transient
+            })?;
+        Ok(details
+            .opening_orders
+            .records
+            .iter()
+            .filter_map(|o| {
+                let mapped = tn_order_to_pending(o);
+                if mapped.is_none() {
+                    console_error!(
+                        "tn list_pending_orders: skipping malformed order_id={} market={} (no stop/limit trigger)",
+                        o.order_id,
+                        o.market,
+                    );
+                }
+                mapped
+            })
+            .collect())
+    }
+
+    async fn amend_stop(
+        &self,
+        _account_id: &str,
+        position_or_order_id: &str,
+        new_stop: f64,
+    ) -> Result<(), AmendError> {
+        // `amend_order` needs the originating order id, market name, stake
+        // and BOTH prices ("pass existing to leave unchanged"). The
+        // trait-level id alone doesn't carry that, so re-fetch and locate
+        // the record. Positions first (the cron's primary target), then
+        // pending orders.
+        //
+        // UNVERIFIED: the upstream `amend_order` (`AmendCloseOrder`) has no
+        // callers and it is not yet confirmed it amends an OPEN position's
+        // SL keyed by the position's originating order id. Sub-plan 4 must
+        // demo-confirm before any live widening relies on this path.
+        let details = tradenation_api::get_account_details(self.0.session())
+            .await
+            .map_err(|err| {
+                console_error!("tn amend_stop get_account_details: {err:?}");
+                AmendError::Transient
+            })?;
+
+        let target = find_amend_target(
+            position_or_order_id,
+            &details.positions.records,
+            &details.opening_orders.records,
+        )
+        .ok_or(AmendError::NotFound)?;
+
+        // TradeNation requires BOTH prices on `AmendCloseOrder`. We move
+        // the stop and leave TP unchanged by passing its existing value.
+        // A `None` TP becomes 0.0 — UNVERIFIED whether the platform reads
+        // that as "no TP" or "TP at 0". Sub-plan 4's demo must check; until
+        // then, an amend on a position with no TP is the riskier case.
+        let existing_tp = target.existing_take_profit.unwrap_or(0.0);
+
+        tradenation_api::amend_order(
+            self.0.client(),
+            self.0.session(),
+            target.order_id,
+            &target.market,
+            target.stake,
+            new_stop,
+            existing_tp,
+        )
+        .await
+        .map(|_| ())
+        .map_err(|err| {
+            console_error!(
+                "tn amend_stop(order_id={}, market={}, new_stop={new_stop}): {err:?}",
+                target.order_id,
+                target.market,
+            );
+            AmendError::Transient
+        })
+    }
+}
+
+/// The bits of a position / opening order `amend_stop` needs to call the
+/// upstream `amend_order`. Split out so the lookup is unit-testable.
+struct AmendTarget {
+    order_id: u64,
+    market: String,
+    stake: f64,
+    existing_take_profit: Option<f64>,
+}
+
+/// Locate the amend target for `id` among open positions (matched on
+/// `position_id` OR originating `order_id`), then pending orders (matched on
+/// `order_id`). Returns `None` if nothing matches. Pure — unit-tested.
+fn find_amend_target(
+    id: &str,
+    positions: &[Position],
+    pending: &[OpeningOrder],
+) -> Option<AmendTarget> {
+    if let Some(p) = positions
+        .iter()
+        .find(|p| p.position_id.to_string() == id || p.order_id.to_string() == id)
+    {
+        return Some(AmendTarget {
+            order_id: p.order_id,
+            market: p.market_name.clone(),
+            stake: p.stake,
+            existing_take_profit: p.limit_order_price,
+        });
+    }
+    pending
+        .iter()
+        .find(|o| o.order_id.to_string() == id)
+        .map(|o| AmendTarget {
+            order_id: o.order_id,
+            market: o.market.clone(),
+            stake: o.stake,
+            // For a pending entry order the parsed stop/limit prices are the
+            // ENTRY TRIGGER, not the SL/TP (see `PendingOrder` doc + the IDO*
+            // note). We have no parsed SL/TP to preserve, so leave TP as None.
+            existing_take_profit: None,
+        })
+}
+
+/// Map a TradeNation [`Position`] to a broker-agnostic [`OpenPosition`].
+/// Pure — unit-tested for the Buy/Sell → direction and SL/TP optionality
+/// branches. `direction` is `"Buy"` / `"Sell"` in upstream fixtures.
+fn tn_position_to_open(p: &Position) -> OpenPosition {
+    OpenPosition {
+        instrument: p.market_name.clone(),
+        direction: if p.direction == "Sell" {
+            Direction::Short
+        } else {
+            Direction::Long
+        },
+        stop_loss: p.stop_order_price,
+        take_profit: p.limit_order_price,
+        position_id: p.position_id.to_string(),
+        order_id: p.order_id.to_string(),
+        stake: p.stake,
+    }
+}
+
+/// Map a TradeNation [`OpeningOrder`] to a broker-agnostic [`PendingOrder`].
+/// Returns `None` for a malformed order with neither stop nor limit trigger
+/// (caller skips it rather than failing the whole list).
+///
+/// **Trigger semantics:** on a pending entry order, whichever of
+/// `stop_order_price` / `limit_order_price` is set is the ENTRY TRIGGER —
+/// stop-entry if `stop_order_price` is set, else limit-entry. This is the
+/// trigger, NOT the attached SL/TP (those live in unparsed `IDO*` fields).
+fn tn_order_to_pending(o: &OpeningOrder) -> Option<PendingOrder> {
+    let (trigger, is_stop) = match (o.stop_order_price, o.limit_order_price) {
+        (Some(s), _) => (s, true),
+        (None, Some(l)) => (l, false),
+        (None, None) => return None,
+    };
+    Some(PendingOrder {
+        order_id: o.order_id.to_string(),
+        instrument: o.market.clone(),
+        direction: if o.direction == "Sell" {
+            Direction::Short
+        } else {
+            Direction::Long
+        },
+        trigger,
+        is_stop,
+        stake: o.stake,
+    })
 }
 
 fn to_upstream_risk(r: RiskBudget) -> broker_tradenation::RiskBudget {
@@ -432,5 +630,175 @@ mod attempt_state_tests {
         funding.transaction_type = "1".into();
         let s = compute_attempt_state("EUR/USD", "101", Some("ref-7"), &[], &[], Some(&[funding]));
         assert_eq!(s, AttemptState::Cancelled);
+    }
+}
+
+#[cfg(test)]
+mod mapping_tests {
+    use super::*;
+
+    fn position_with(
+        position_id: u64,
+        order_id: u64,
+        market_name: &str,
+        direction: &str,
+        sl: Option<f64>,
+        tp: Option<f64>,
+    ) -> Position {
+        Position {
+            position_id,
+            order_id,
+            market_id: 0,
+            market_name: market_name.into(),
+            direction: direction.into(),
+            stake: 2.5,
+            opening_price: 1.1,
+            current_price: 1.1,
+            open_pl: 0.0,
+            stop_order_price: sl,
+            limit_order_price: tp,
+            imr: 0.0,
+            currency_symbol: String::new(),
+            creation_time: None,
+            creation_time_original: String::new(),
+            quote_id: 0,
+            tradable: true,
+        }
+    }
+
+    fn opening_order_with(
+        order_id: u64,
+        market: &str,
+        direction: &str,
+        stop: Option<f64>,
+        limit: Option<f64>,
+    ) -> OpeningOrder {
+        OpeningOrder {
+            order_id,
+            market_id: 0,
+            market: market.into(),
+            direction: direction.into(),
+            stake: 3.0,
+            stop_order_price: stop,
+            limit_order_price: limit,
+            current_price: None,
+            currency_symbol: String::new(),
+            period: None,
+            period_original: String::new(),
+            creation_time_utc: String::new(),
+            quote_id: 0,
+        }
+    }
+
+    #[test]
+    fn position_maps_buy_to_long_and_keeps_sl_tp() {
+        let p = position_with(9999, 101, "EUR/USD", "Buy", Some(1.05), Some(1.20));
+        let o = tn_position_to_open(&p);
+        assert_eq!(
+            o,
+            OpenPosition {
+                instrument: "EUR/USD".into(),
+                direction: Direction::Long,
+                stop_loss: Some(1.05),
+                take_profit: Some(1.20),
+                position_id: "9999".into(),
+                order_id: "101".into(),
+                stake: 2.5,
+            }
+        );
+    }
+
+    #[test]
+    fn position_maps_sell_to_short_and_optional_sl_tp() {
+        let p = position_with(1, 2, "Spot Gold", "Sell", None, None);
+        let o = tn_position_to_open(&p);
+        assert_eq!(o.direction, Direction::Short);
+        assert_eq!(o.stop_loss, None);
+        assert_eq!(o.take_profit, None);
+        assert_eq!(o.position_id, "1");
+        assert_eq!(o.order_id, "2");
+    }
+
+    #[test]
+    fn pending_stop_entry_sets_is_stop_true_and_uses_trigger() {
+        // stop_order_price set → stop-entry, trigger = that price.
+        let ord = opening_order_with(55, "EUR/USD", "Buy", Some(1.1234), None);
+        let p = tn_order_to_pending(&ord).expect("mapped");
+        assert_eq!(
+            p,
+            PendingOrder {
+                order_id: "55".into(),
+                instrument: "EUR/USD".into(),
+                direction: Direction::Long,
+                trigger: 1.1234,
+                is_stop: true,
+                stake: 3.0,
+            }
+        );
+    }
+
+    #[test]
+    fn pending_limit_entry_sets_is_stop_false() {
+        let ord = opening_order_with(56, "AUD/USD", "Sell", None, Some(0.6500));
+        let p = tn_order_to_pending(&ord).expect("mapped");
+        assert!(!p.is_stop);
+        assert_eq!(p.trigger, 0.6500);
+        assert_eq!(p.direction, Direction::Short);
+    }
+
+    #[test]
+    fn pending_prefers_stop_when_both_present() {
+        // Defensive: if both are somehow set, the stop side wins (matches
+        // the "whichever of stop/limit is set" rule, stop-first).
+        let ord = opening_order_with(57, "EUR/USD", "Buy", Some(1.10), Some(1.20));
+        let p = tn_order_to_pending(&ord).expect("mapped");
+        assert!(p.is_stop);
+        assert_eq!(p.trigger, 1.10);
+    }
+
+    #[test]
+    fn pending_with_neither_trigger_is_skipped() {
+        let ord = opening_order_with(58, "EUR/USD", "Buy", None, None);
+        assert_eq!(tn_order_to_pending(&ord), None);
+    }
+
+    #[test]
+    fn amend_target_matches_position_by_position_id() {
+        let positions = vec![position_with(
+            9999,
+            101,
+            "EUR/USD",
+            "Buy",
+            Some(1.05),
+            Some(1.20),
+        )];
+        let t = find_amend_target("9999", &positions, &[]).expect("found");
+        // amend key is the ORIGINATING order id, not the position id.
+        assert_eq!(t.order_id, 101);
+        assert_eq!(t.market, "EUR/USD");
+        assert_eq!(t.stake, 2.5);
+        assert_eq!(t.existing_take_profit, Some(1.20));
+    }
+
+    #[test]
+    fn amend_target_matches_position_by_order_id() {
+        let positions = vec![position_with(9999, 101, "EUR/USD", "Buy", None, None)];
+        let t = find_amend_target("101", &positions, &[]).expect("found");
+        assert_eq!(t.order_id, 101);
+        assert_eq!(t.existing_take_profit, None);
+    }
+
+    #[test]
+    fn amend_target_falls_back_to_pending_order() {
+        let pending = vec![opening_order_with(77, "EUR/USD", "Buy", Some(1.10), None)];
+        let t = find_amend_target("77", &[], &pending).expect("found");
+        assert_eq!(t.order_id, 77);
+        // Pending orders carry no parsed SL/TP — TP left None.
+        assert_eq!(t.existing_take_profit, None);
+    }
+
+    #[test]
+    fn amend_target_none_when_id_absent() {
+        assert!(find_amend_target("404", &[], &[]).is_none());
     }
 }

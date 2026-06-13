@@ -12,13 +12,16 @@ mod risk;
 pub use oanda::OANDA_ACCOUNT_ID;
 
 use oanda::{
-    cancel_order as cancel_order_impl, cancel_pending_for_instrument, close_positions,
-    get_current_price as get_current_price_impl, login as login_client,
+    amend_stop as amend_stop_impl, cancel_order as cancel_order_impl,
+    cancel_pending_for_instrument, close_positions, get_quote as get_quote_impl,
+    list_open_positions as list_open_positions_impl,
+    list_pending_orders as list_pending_orders_impl, login as login_client,
     lookup_attempt_state as lookup_attempt_state_impl, place_entry,
 };
 use oanda_client::OandaClient;
 use trade_control_core::broker::{
-    AttemptState, Broker, CancelError, EntryError, EntryRequest, LookupError,
+    AmendError, AttemptState, Broker, CancelError, EntryError, EntryRequest, LookupError,
+    OpenPosition, PendingOrder, Quote,
 };
 use worker::{Env, console_error};
 
@@ -83,8 +86,39 @@ impl Broker for OandaBroker {
         cancel_order_impl(&self.client, &self.account_id, broker_order_id).await
     }
 
-    async fn get_current_price(&self, instrument: &str) -> Result<f64, LookupError> {
-        get_current_price_impl(&self.client, &self.account_id, instrument).await
+    async fn get_quote(&self, instrument: &str) -> Result<Quote, LookupError> {
+        get_quote_impl(&self.client, &self.account_id, instrument).await
+    }
+
+    async fn list_open_positions(
+        &self,
+        _account_id: &str,
+    ) -> Result<Vec<OpenPosition>, LookupError> {
+        // OANDA's account id is bound at construction; the trait-level
+        // argument is ignored (same as `cancel_order`).
+        list_open_positions_impl(&self.client, &self.account_id).await
+    }
+
+    async fn amend_stop(
+        &self,
+        _account_id: &str,
+        position_or_order_id: &str,
+        new_stop: f64,
+    ) -> Result<(), AmendError> {
+        amend_stop_impl(
+            &self.client,
+            &self.account_id,
+            position_or_order_id,
+            new_stop,
+        )
+        .await
+    }
+
+    async fn list_pending_orders(
+        &self,
+        _account_id: &str,
+    ) -> Result<Vec<PendingOrder>, LookupError> {
+        list_pending_orders_impl(&self.client, &self.account_id).await
     }
 }
 

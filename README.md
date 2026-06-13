@@ -796,6 +796,21 @@ instrument: EUR/USD
 # ...
 ```
 
+### Broker trait surface (contributor note)
+
+Each broker crate implements the `Broker` trait in `core/src/broker.rs`.
+Alongside the entry / close / cancel / lookup actions it exposes
+`get_quote` (live bid/ask → `Quote { bid, ask }`, with `mid()` and
+`spread()`), `list_open_positions`, `amend_stop` (move a stop-loss,
+leaving TP / trigger / stake untouched), and `list_pending_orders`.
+`get_current_price` is a default method = `get_quote().mid()`. These are
+**foundations for the spread-blackout feature and carry no operator-visible
+behaviour** — no worker action calls them yet. TradeNation implements all
+four; OANDA implements all four via its v20 trade/order/pricing endpoints.
+**Caveat (TradeNation `amend_stop`):** the upstream `AmendCloseOrder`
+endpoint is unverified against an *open position's* SL — a later sub-plan
+must demo-confirm it before any live stop-widening.
+
 ## TradeNation session
 
 TN routing requires the intent to name an `account:` (registered via

@@ -389,7 +389,8 @@ mod tests {
     use std::cell::RefCell;
     use std::collections::HashMap;
     use trade_control_core::broker::{
-        AttemptState, Broker, CancelError, EntryError, EntryRequest, LookupError,
+        AmendError, AttemptState, Broker, CancelError, EntryError, EntryRequest, LookupError,
+        OpenPosition, PendingOrder, Quote,
     };
     use trade_control_core::intent::{
         Action, BrokerKind, Direction, EntrySpec, Intent, PriceAnchor, PriceRef, TakeProfit,
@@ -483,9 +484,30 @@ mod tests {
                 CancelScript::Err(e) => Err(e),
             }
         }
-        async fn get_current_price(&self, _instrument: &str) -> Result<f64, LookupError> {
-            // Retry-gate tests don't exercise the sweep; not used here.
+        async fn get_quote(&self, _instrument: &str) -> Result<Quote, LookupError> {
+            // Retry-gate tests don't exercise the sweep / blackout; not
+            // used here. `get_current_price` (default) inherits this.
             Err(LookupError::Transient)
+        }
+        async fn list_open_positions(
+            &self,
+            _account_id: &str,
+        ) -> Result<Vec<OpenPosition>, LookupError> {
+            unimplemented!("MockBroker: list_open_positions unused by retry-gate tests")
+        }
+        async fn amend_stop(
+            &self,
+            _account_id: &str,
+            _position_or_order_id: &str,
+            _new_stop: f64,
+        ) -> Result<(), AmendError> {
+            unimplemented!("MockBroker: amend_stop unused by retry-gate tests")
+        }
+        async fn list_pending_orders(
+            &self,
+            _account_id: &str,
+        ) -> Result<Vec<PendingOrder>, LookupError> {
+            unimplemented!("MockBroker: list_pending_orders unused by retry-gate tests")
         }
     }
 

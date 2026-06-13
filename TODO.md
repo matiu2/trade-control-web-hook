@@ -1,5 +1,38 @@
 # TODO
 
+## Done — broker-trait spread/positions/amend foundations (v18)
+
+Sub-plan 1 of the DST-aware spread-blackout feature. Surfaces four broker
+capabilities through the `Broker` trait with **zero behaviour change** — no
+worker action calls them yet. Unblocks sub-plans 2–5.
+
+### Steps
+- [x] core/broker.rs: `Quote` (`mid`/`spread`), `OpenPosition`,
+      `PendingOrder`, `AmendError` types; `get_quote` /
+      `list_open_positions` / `amend_stop` / `list_pending_orders` methods;
+      `get_current_price` defaulted to `get_quote().mid()`. Unit tests:
+      Quote math + default-mid-over-quote mock.
+- [x] tradenation_adapter.rs: `get_quote` (drop the `/2.0`), three new
+      methods, pure mapping fns `tn_position_to_open` /
+      `tn_order_to_pending` / `find_amend_target` + tests.
+- [x] broker-oanda: full parity (`get_quote` / `list_open_positions` via
+      `get_trades` / `amend_stop` via `modify_trade_stops` /
+      `list_pending_orders` via `get_pending_orders`) + mapping tests.
+- [x] retry_gate.rs MockBroker: stubs so the worker compiles.
+- [x] README broker-trait contributor note; CHANGELOG v18; this entry.
+- [x] core / worker / broker-oanda tests + clippy + fmt; cli builds; wasm
+      builds.
+
+### Follow-up (later sub-plans — NOT done here)
+- [ ] Sub-plan 4: demo-confirm TradeNation `amend_stop` works on an OPEN
+      position's SL via `AmendCloseOrder` (zero upstream callers; if it
+      needs a different endpoint that's an upstream `tradenation-api`
+      change + tag bump). Also confirm the no-TP `0.0` semantics ("no TP"
+      vs "TP at 0") before any live widening.
+- [ ] Sub-plans 2–5: wire `get_quote().spread()` into the reject filter /
+      recovery watcher; `list_open_positions` + `amend_stop` into the
+      stop-widener; `list_pending_orders` + cancel/restore into System 3.
+
 ## Done — `on_too_close` stop-entry fallback (`#19-10` recovery) (v17)
 
 Sub-plan 0 of the DST-aware spread-blackout feature. A stop-entry whose

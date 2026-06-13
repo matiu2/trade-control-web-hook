@@ -13,7 +13,8 @@ use worker::console_error;
 use crate::fx::{quote_currency, resolve_quote_to_account_rate};
 use crate::risk;
 use trade_control_core::broker::{
-    AttemptState, CancelError, EntryError, EntryRequest, LookupError,
+    AmendError, AttemptState, CancelError, EntryError, EntryRequest, LookupError, OpenPosition,
+    PendingOrder as CorePendingOrder, Quote,
 };
 use trade_control_core::intent::{Direction, ResolvedEntry, RiskBudget};
 use worker::console_log;
@@ -395,13 +396,14 @@ pub async fn cancel_order(
         })
 }
 
-/// Fetch the mid-market price for `instrument` via OANDA's pricing
-/// endpoint. Used by the scheduled SL-breach sweep.
-pub async fn get_current_price(
+/// Fetch a live [`Quote`] for `instrument` via OANDA's pricing endpoint.
+/// The trait's default `get_current_price` takes the mid (exact parity with
+/// the old `tick.mid()`); the spread-blackout systems read `spread()`.
+pub async fn get_quote(
     client: &OandaClient,
     account_id: &str,
     instrument: &str,
-) -> Result<f64, LookupError> {
+) -> Result<Quote, LookupError> {
     let pricing = client
         .get_pricing(account_id, &[instrument])
         .await
@@ -413,9 +415,130 @@ pub async fn get_current_price(
         console_error!("oanda get_pricing({instrument}): empty prices array");
         LookupError::Transient
     })?;
-    tick.mid().ok_or_else(|| {
-        console_error!("oanda get_pricing({instrument}): missing bid or ask");
+    let bid = tick.best_bid().ok_or_else(|| {
+        console_error!("oanda get_pricing({instrument}): missing bid");
         LookupError::Transient
+    })?;
+    let ask = tick.best_ask().ok_or_else(|| {
+        console_error!("oanda get_pricing({instrument}): missing ask");
+        LookupError::Transient
+    })?;
+    Ok(Quote { bid, ask })
+}
+
+/// All open positions on the account. OANDA reports open trades; we map
+/// each to an [`OpenPosition`]. Direction comes from the sign of
+/// `current_units` (positive = long), stop / take-profit from the trade's
+/// dependent orders. OANDA has no separate originating-order id once a
+/// trade is open, so `order_id` and `position_id` both carry the trade id.
+pub async fn list_open_positions(
+    client: &OandaClient,
+    account_id: &str,
+) -> Result<Vec<OpenPosition>, LookupError> {
+    let params = TradeQueryParams {
+        state: Some(TradeState::Open),
+        ..Default::default()
+    };
+    let trades = client
+        .get_trades(account_id, Some(params))
+        .await
+        .map_err(|err| {
+            console_error!("oanda list_open_positions get_trades: {err:?}");
+            LookupError::Transient
+        })?;
+    Ok(trades.iter().map(oanda_trade_to_open).collect())
+}
+
+/// All resting (unfilled) entry orders on the account.
+pub async fn list_pending_orders(
+    client: &OandaClient,
+    account_id: &str,
+) -> Result<Vec<CorePendingOrder>, LookupError> {
+    let orders = client.get_pending_orders(account_id).await.map_err(|err| {
+        console_error!("oanda list_pending_orders get_pending_orders: {err:?}");
+        LookupError::Transient
+    })?;
+    Ok(orders.iter().filter_map(oanda_order_to_pending).collect())
+}
+
+/// Move the stop-loss on an open trade to `new_stop`, leaving the take-profit
+/// untouched. `position_or_order_id` is the trade id. Unmatched → `NotFound`.
+pub async fn amend_stop(
+    client: &OandaClient,
+    account_id: &str,
+    position_or_order_id: &str,
+    new_stop: f64,
+) -> Result<(), AmendError> {
+    // Confirm the trade exists so an unknown id is `NotFound`, not a
+    // silently-successful no-op (OANDA would 404 the modify otherwise).
+    let trade = client
+        .get_trade(account_id, position_or_order_id)
+        .await
+        .map_err(|err| {
+            console_error!("oanda amend_stop get_trade({position_or_order_id}): {err:?}");
+            // OANDA returns an error (404) for an unknown trade id; we
+            // can't cheaply distinguish 404 from a transient 5xx here, so
+            // treat "couldn't fetch the trade" as NotFound — the caller
+            // re-lists on the next sweep regardless.
+            AmendError::NotFound
+        })?;
+    let stop_loss = StopLossDetails {
+        price: Some(format_price(new_stop)),
+        distance: None,
+        time_in_force: TimeInForce::Gtc,
+    };
+    client
+        .modify_trade_stops(account_id, &trade.id, Some(stop_loss), None, None)
+        .await
+        .map(|_| ())
+        .map_err(|err| {
+            console_error!("oanda amend_stop modify_trade_stops({}): {err:?}", trade.id);
+            AmendError::Transient
+        })
+}
+
+/// Map an OANDA open [`Trade`] to a broker-agnostic [`OpenPosition`].
+/// Direction from the sign of `current_units`; SL/TP from dependent orders.
+fn oanda_trade_to_open(t: &Trade) -> OpenPosition {
+    let units: f64 = t.current_units.parse().unwrap_or(0.0);
+    OpenPosition {
+        instrument: t.instrument.clone(),
+        direction: if units < 0.0 {
+            Direction::Short
+        } else {
+            Direction::Long
+        },
+        stop_loss: t.stop_loss_order.as_ref().and_then(|o| o.price),
+        take_profit: t.take_profit_order.as_ref().and_then(|o| o.price),
+        position_id: t.id.clone(),
+        order_id: t.id.clone(),
+        stake: units.abs(),
+    }
+}
+
+/// Map an OANDA resting [`PendingOrder`] to a broker-agnostic
+/// [`CorePendingOrder`]. Returns `None` for non-entry order types (e.g.
+/// stray STOP_LOSS / TAKE_PROFIT orders) or an unparseable trigger price.
+fn oanda_order_to_pending(o: &PendingOrder) -> Option<CorePendingOrder> {
+    let is_stop = match o.r#type {
+        OrderType::Stop => true,
+        OrderType::Limit => false,
+        // Not an entry order — skip (SL/TP/trailing orders surface here too).
+        _ => return None,
+    };
+    let trigger: f64 = o.price.parse().ok()?;
+    let units: f64 = o.units.parse().unwrap_or(0.0);
+    Some(CorePendingOrder {
+        order_id: o.id.clone(),
+        instrument: o.instrument.clone(),
+        direction: if units < 0.0 {
+            Direction::Short
+        } else {
+            Direction::Long
+        },
+        trigger,
+        is_stop,
+        stake: units.abs(),
     })
 }
 
@@ -600,5 +723,131 @@ mod attempt_state_tests {
         let open = vec![make_trade("other-2", TradeState::Open, 0.0)];
         let s = compute_attempt_state("ord-target", None, &pending, &open, None);
         assert_eq!(s, AttemptState::Unknown);
+    }
+}
+
+#[cfg(test)]
+mod mapping_tests {
+    use super::*;
+    use oanda_client::trades::{Trade, TradeDependentOrder, TradeState};
+
+    fn dependent(price: f64) -> TradeDependentOrder {
+        TradeDependentOrder {
+            id: "dep".into(),
+            r#type: "STOP_LOSS".into(),
+            trade_id: "t".into(),
+            create_time: String::new(),
+            price: Some(price),
+            distance: None,
+            time_in_force: "GTC".into(),
+            trigger_condition: "DEFAULT".into(),
+            trigger_mode: None,
+            state: "PENDING".into(),
+            cancelling_transaction_id: None,
+            cancelled_time: None,
+        }
+    }
+
+    fn trade(id: &str, instrument: &str, units: &str, sl: Option<f64>, tp: Option<f64>) -> Trade {
+        Trade {
+            id: id.into(),
+            instrument: instrument.into(),
+            current_units: units.into(),
+            price: 1.1,
+            open_time: String::new(),
+            state: TradeState::Open,
+            initial_units: units.into(),
+            initial_margin_required: 0.0,
+            margin_used: None,
+            unrealized_pl: None,
+            realized_pl: 0.0,
+            average_close_price: None,
+            close_time: None,
+            closing_transaction_ids: None,
+            financing: 0.0,
+            dividend_adjustment: 0.0,
+            take_profit_order: tp.map(dependent),
+            stop_loss_order: sl.map(dependent),
+            trailing_stop_loss_order: None,
+        }
+    }
+
+    fn pending(id: &str, ty: OrderType, units: &str, price: &str) -> PendingOrder {
+        PendingOrder {
+            id: id.into(),
+            r#type: ty,
+            instrument: "EUR_USD".into(),
+            units: units.into(),
+            price: price.into(),
+            time_in_force: TimeInForce::Gtc,
+            create_time: String::new(),
+            take_profit_on_fill: None,
+            stop_loss_on_fill: None,
+        }
+    }
+
+    #[test]
+    fn positive_units_is_long_with_sl_tp() {
+        let t = trade("t-1", "EUR_USD", "100", Some(1.05), Some(1.20));
+        let o = oanda_trade_to_open(&t);
+        assert_eq!(
+            o,
+            OpenPosition {
+                instrument: "EUR_USD".into(),
+                direction: Direction::Long,
+                stop_loss: Some(1.05),
+                take_profit: Some(1.20),
+                position_id: "t-1".into(),
+                order_id: "t-1".into(),
+                stake: 100.0,
+            }
+        );
+    }
+
+    #[test]
+    fn negative_units_is_short_and_stake_is_absolute() {
+        let t = trade("t-2", "USD_JPY", "-250", None, None);
+        let o = oanda_trade_to_open(&t);
+        assert_eq!(o.direction, Direction::Short);
+        assert_eq!(o.stake, 250.0);
+        assert_eq!(o.stop_loss, None);
+    }
+
+    #[test]
+    fn stop_entry_maps_is_stop_true() {
+        let p = pending("p-1", OrderType::Stop, "100", "1.1500");
+        let m = oanda_order_to_pending(&p).expect("mapped");
+        assert_eq!(
+            m,
+            CorePendingOrder {
+                order_id: "p-1".into(),
+                instrument: "EUR_USD".into(),
+                direction: Direction::Long,
+                trigger: 1.1500,
+                is_stop: true,
+                stake: 100.0,
+            }
+        );
+    }
+
+    #[test]
+    fn limit_entry_short_maps_is_stop_false() {
+        let p = pending("p-2", OrderType::Limit, "-50", "1.2000");
+        let m = oanda_order_to_pending(&p).expect("mapped");
+        assert!(!m.is_stop);
+        assert_eq!(m.direction, Direction::Short);
+        assert_eq!(m.stake, 50.0);
+    }
+
+    #[test]
+    fn non_entry_order_type_is_skipped() {
+        let p = pending("p-3", OrderType::StopLoss, "100", "1.1000");
+        assert_eq!(oanda_order_to_pending(&p), None);
+    }
+
+    #[test]
+    fn unparseable_trigger_is_skipped() {
+        let p = pending("p-4", OrderType::Stop, "100", "");
+        assert_eq!(oanda_order_to_pending(&p), None);
     }
 }

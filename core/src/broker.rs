@@ -11,6 +11,93 @@ use core::future::Future;
 
 use crate::intent::{Direction, ResolvedEntry, RiskBudget};
 
+/// A live two-sided quote. `spread()` is the spread-blackout feature's
+/// filter signal; everything else in the codebase only needs `mid()`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Quote {
+    pub bid: f64,
+    pub ask: f64,
+}
+
+impl Quote {
+    /// Mid-market price — the historic `get_current_price` value.
+    pub fn mid(&self) -> f64 {
+        (self.bid + self.ask) / 2.0
+    }
+
+    /// Ask minus bid. The blackout systems reject / pause on a wide spread.
+    pub fn spread(&self) -> f64 {
+        self.ask - self.bid
+    }
+}
+
+/// An open position as the broker reports it. Broker ids are `String`s
+/// (trait-wide convention — TradeNation's `u64`s are formatted on the way
+/// out and parsed back inside the impl).
+///
+/// `order_id` is the **originating** order id (TradeNation's amend key);
+/// `position_id` is the distinct position / trade id. On OANDA the two are
+/// the same trade id (there is no separate originating-order concept once a
+/// trade is open), so both are set to the trade id.
+#[derive(Debug, Clone, PartialEq)]
+pub struct OpenPosition {
+    /// TradeNation `market_name` / OANDA `instrument`.
+    pub instrument: String,
+    pub direction: Direction,
+    /// The stop-loss price, if one is attached.
+    pub stop_loss: Option<f64>,
+    /// The take-profit price, if one is attached.
+    pub take_profit: Option<f64>,
+    /// TradeNation `PositionID` / OANDA trade id.
+    pub position_id: String,
+    /// TradeNation originating `OrderID` (the amend key) / OANDA trade id.
+    pub order_id: String,
+    /// TradeNation stake / OANDA units.
+    pub stake: f64,
+}
+
+/// A resting (unfilled) entry order. `trigger` is the entry price; `is_stop`
+/// is `true` for a stop-entry, `false` for a limit-entry.
+///
+/// **Gotcha (TradeNation):** the `trigger` here is the entry trigger, **not**
+/// the attached stop-loss / take-profit. TradeNation reports an opening
+/// order's entry trigger in `stop_order_price` / `limit_order_price`
+/// (whichever side is set); the order's real SL/TP live in separate raw
+/// `IDO*` fields that the upstream struct does not currently parse. Do not
+/// mislabel `trigger` as a stop-loss when consuming this in later sub-plans.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PendingOrder {
+    pub order_id: String,
+    pub instrument: String,
+    pub direction: Direction,
+    pub trigger: f64,
+    pub is_stop: bool,
+    pub stake: f64,
+}
+
+/// Failure modes for [`Broker::amend_stop`]. Same playbook as
+/// [`CancelError`]: `Transient` means "re-list and decide", it is not a
+/// signal to retry the amend blindly.
+#[derive(Debug, Clone, PartialEq)]
+pub enum AmendError {
+    /// Network / 5xx / other transient broker failure. The caller should
+    /// re-list open positions / pending orders and decide from there.
+    Transient,
+    /// The id wasn't found among open positions or pending orders.
+    NotFound,
+}
+
+impl core::fmt::Display for AmendError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Transient => f.write_str("broker amend failed (transient)"),
+            Self::NotFound => f.write_str("no open position or pending order with that id"),
+        }
+    }
+}
+
+impl std::error::Error for AmendError {}
+
 /// Inputs for placing an entry order. Borrowed because it is built per-request
 /// from the resolved intent and never outlives the dispatch frame.
 pub struct EntryRequest<'a> {
@@ -212,14 +299,182 @@ pub trait Broker {
         broker_order_id: &str,
     ) -> impl Future<Output = Result<(), CancelError>>;
 
+    /// Fetch a live two-sided [`Quote`] for an instrument. The
+    /// spread-blackout systems read [`Quote::spread`]; everything else
+    /// reads [`Quote::mid`] via the [`Broker::get_current_price`] default.
+    fn get_quote(&self, instrument: &str) -> impl Future<Output = Result<Quote, LookupError>>;
+
+    /// All open positions on the account.
+    ///
+    /// `account_id` follows the [`Broker::cancel_order`] convention — impls
+    /// may ignore it (TradeNation binds the account via the session, OANDA
+    /// at construction time).
+    fn list_open_positions(
+        &self,
+        account_id: &str,
+    ) -> impl Future<Output = Result<Vec<OpenPosition>, LookupError>>;
+
+    /// Move the stop-loss on an open position (or a pending order's SL) to
+    /// `new_stop`. Take-profit, entry trigger, and stake are left untouched.
+    ///
+    /// `position_or_order_id` is matched against open positions first, then
+    /// pending orders; an unmatched id yields [`AmendError::NotFound`].
+    ///
+    /// **UNVERIFIED on TradeNation:** the upstream `amend_order`
+    /// (`AmendCloseOrder`) has zero callers and it is not yet confirmed that
+    /// it amends an **open position's** SL (keyed by the position's
+    /// originating order id) rather than only a resting entry order's SL.
+    /// Sub-plan 4 must demo-confirm this on the `reversals` account before
+    /// any live stop-widening relies on it. See CHANGELOG v18 / TODO.md.
+    fn amend_stop(
+        &self,
+        account_id: &str,
+        position_or_order_id: &str,
+        new_stop: f64,
+    ) -> impl Future<Output = Result<(), AmendError>>;
+
+    /// All resting (unfilled) entry orders on the account. `account_id` is
+    /// ignored by both impls (see [`Broker::list_open_positions`]).
+    fn list_pending_orders(
+        &self,
+        account_id: &str,
+    ) -> impl Future<Output = Result<Vec<PendingOrder>, LookupError>>;
+
     /// Fetch the current mid-market price for an instrument. Used by the
     /// scheduled SL-breach sweep to decide if a still-pending stop-entry
     /// order has been overtaken by price.
     ///
-    /// Returns the mid of bid/ask for FX-style brokers. For brokers
-    /// without a quote endpoint, may use the most recent traded /
+    /// Default implementation = [`Quote::mid`] over [`Broker::get_quote`],
+    /// so the mid logic lives in exactly one place. Brokers without a true
+    /// quote endpoint override `get_quote` to use the most recent traded /
     /// settlement price — the sweep only needs "good enough to detect a
     /// breach", not tick-accurate execution price.
-    fn get_current_price(&self, instrument: &str)
-    -> impl Future<Output = Result<f64, LookupError>>;
+    fn get_current_price(
+        &self,
+        instrument: &str,
+    ) -> impl Future<Output = Result<f64, LookupError>> {
+        async move { Ok(self.get_quote(instrument).await?.mid()) }
+    }
+}
+
+#[cfg(test)]
+mod quote_tests {
+    use super::*;
+
+    #[test]
+    fn mid_is_half_sum() {
+        let q = Quote {
+            bid: 1.1000,
+            ask: 1.1004,
+        };
+        assert!((q.mid() - 1.1002).abs() < 1e-12);
+    }
+
+    #[test]
+    fn spread_is_ask_minus_bid() {
+        let q = Quote {
+            bid: 1.1000,
+            ask: 1.1004,
+        };
+        assert!((q.spread() - 0.0004).abs() < 1e-12);
+    }
+
+    /// A tiny broker implementing only `get_quote`, proving the default
+    /// `get_current_price` returns the quote's mid.
+    struct MidOnlyBroker {
+        bid: f64,
+        ask: f64,
+    }
+
+    impl Broker for MidOnlyBroker {
+        async fn place_entry(
+            &self,
+            _max_risk_pct: f64,
+            _max_open_positions: u32,
+            _req: &EntryRequest<'_>,
+        ) -> Result<String, EntryError> {
+            Ok("noop".into())
+        }
+        async fn close_positions(&self, _instrument: &str) -> bool {
+            false
+        }
+        async fn cancel_pending_for_instrument(&self, _instrument: &str) -> usize {
+            0
+        }
+        async fn lookup_attempt_state(
+            &self,
+            _instrument: &str,
+            _broker_order_id: &str,
+            _broker_trade_id: Option<&str>,
+        ) -> Result<AttemptState, LookupError> {
+            Ok(AttemptState::Unknown)
+        }
+        async fn cancel_order(
+            &self,
+            _account_id: &str,
+            _broker_order_id: &str,
+        ) -> Result<(), CancelError> {
+            Ok(())
+        }
+        async fn get_quote(&self, _instrument: &str) -> Result<Quote, LookupError> {
+            Ok(Quote {
+                bid: self.bid,
+                ask: self.ask,
+            })
+        }
+        async fn list_open_positions(
+            &self,
+            _account_id: &str,
+        ) -> Result<Vec<OpenPosition>, LookupError> {
+            Ok(vec![])
+        }
+        async fn amend_stop(
+            &self,
+            _account_id: &str,
+            _position_or_order_id: &str,
+            _new_stop: f64,
+        ) -> Result<(), AmendError> {
+            Ok(())
+        }
+        async fn list_pending_orders(
+            &self,
+            _account_id: &str,
+        ) -> Result<Vec<PendingOrder>, LookupError> {
+            Ok(vec![])
+        }
+    }
+
+    #[test]
+    fn default_current_price_is_mid_over_quote() {
+        let broker = MidOnlyBroker {
+            bid: 1.2500,
+            ask: 1.2510,
+        };
+        // Poll the future to completion on a trivial executor.
+        let price = pollster_block(broker.get_current_price("EUR_USD"));
+        assert!((price.expect("price") - 1.2505).abs() < 1e-12);
+    }
+
+    /// Minimal block-on for `?Send` futures without pulling in a runtime.
+    fn pollster_block<F: Future>(fut: F) -> F::Output {
+        use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+        fn raw() -> RawWaker {
+            fn no_op(_: *const ()) {}
+            fn clone(_: *const ()) -> RawWaker {
+                raw()
+            }
+            RawWaker::new(
+                core::ptr::null(),
+                &RawWakerVTable::new(clone, no_op, no_op, no_op),
+            )
+        }
+        let waker = unsafe { Waker::from_raw(raw()) };
+        let mut cx = Context::from_waker(&waker);
+        let mut fut = core::pin::pin!(fut);
+        loop {
+            if let Poll::Ready(v) = fut.as_mut().poll(&mut cx) {
+                return v;
+            }
+        }
+    }
 }

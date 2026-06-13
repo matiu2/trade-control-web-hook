@@ -1,5 +1,83 @@
 # Changelog
 
+## v18 — 2026-06-13 — broker-trait spread/positions/amend foundations (no behaviour change)
+
+### Why
+
+Sub-plan 1 of the DST-aware spread-blackout feature. The blackout systems
+need four broker capabilities the `Broker` trait didn't expose: the live
+bid/ask **spread**, **list open positions** (to widen their stops),
+**amend a stop** (widen + restore), and **list pending orders** (cancel +
+restore). All four already exist one layer down (`tradenation-api`,
+`oanda-client`); this surfaces them through the trait with **zero
+behaviour change** — no worker action calls the new methods yet.
+
+### What changed
+
+- **New trait surface** (`core/src/broker.rs`): types `Quote { bid, ask }`
+  (with `mid()` / `spread()`), `OpenPosition`, `PendingOrder`, and
+  `AmendError` (modelled on `CancelError`, plus a `NotFound` variant);
+  methods `get_quote`, `list_open_positions`, `amend_stop`,
+  `list_pending_orders`. `get_current_price` becomes a **default method** =
+  `get_quote().mid()`, so the mid logic lives once.
+- **TradeNation adapter** (`src/tradenation_adapter.rs`): `get_quote` is the
+  old `get_current_price` minus the `/2.0` (it was discarding the spread);
+  the three new methods go through `get_account_details` / `amend_order`.
+  Pure mapping fns `tn_position_to_open` / `tn_order_to_pending` /
+  `find_amend_target` are split out and unit-tested.
+- **OANDA** (`broker-oanda/src/oanda.rs` + `lib.rs`): full parity —
+  `get_quote` via the pricing endpoint (`best_bid`/`best_ask`),
+  `list_open_positions` via `get_trades`, `amend_stop` via
+  `modify_trade_stops`, `list_pending_orders` via `get_pending_orders`.
+  `oanda_trade_to_open` / `oanda_order_to_pending` are pure + unit-tested.
+- **MockBroker** (`src/retry_gate.rs`, test-only): the three list/amend
+  methods are `unimplemented!()` (unused by retry-gate tests);
+  `get_quote` returns `Transient` (preserving the old behaviour the
+  default `get_current_price` now inherits).
+
+### Breaking
+
+- Trait-level: `Broker` gains four required methods and `get_current_price`
+  is now a defaulted method. Any external `impl Broker` must add the new
+  methods. All three in-repo impls updated.
+
+### Semantics gotchas preserved
+
+- **`PendingOrder.trigger` is the entry trigger, NOT the SL/TP.** On
+  TradeNation a pending entry order reports its trigger in
+  `stop_order_price` / `limit_order_price`; the real SL/TP live in unparsed
+  `IDO*` fields. The mapping labels it `trigger` with `is_stop`, never a
+  stop-loss.
+- **`amend_stop` on TradeNation is UNVERIFIED for open positions.** The
+  upstream `amend_order` (`AmendCloseOrder`) has zero callers and it isn't
+  confirmed it amends an *open position's* SL (keyed by the position's
+  originating order id) vs only a resting entry order. Wired through with
+  doc-comments flagging it; **sub-plan 4 must demo-confirm before any live
+  widening.** A position with no take-profit passes `0.0` to the
+  both-prices-required endpoint — also unverified whether the platform
+  reads `0` as "no TP".
+
+### Config / wire
+
+- None. No new secrets, no new alert fields, no new outcome strings, no
+  reconciliation impact.
+
+### Tests
+
+- `core`: `Quote::mid`/`spread` arithmetic; a mid-only mock proving the
+  default `get_current_price` returns the quote mid.
+- `tradenation_adapter`: Buy/Sell → direction, SL/TP optionality,
+  trigger-or-skip for pending orders, `find_amend_target` (position by
+  position_id / order_id, pending fallback, absent → None).
+- `broker-oanda`: trade → open position (long/short, stake abs, SL/TP),
+  pending order → `is_stop` mapping, non-entry / unparseable skip.
+
+### Follow-up
+
+- Sub-plan 4 demo-confirms TradeNation `amend_stop` on an open position
+  (and the no-TP `0.0` semantics) before any live stop-widening.
+- Sub-plans 2–5 wire these methods into the blackout systems.
+
 ## v17 — 2026-06-13 — `on_too_close` stop-entry fallback (`#19-10` recovery)
 
 ### Why
