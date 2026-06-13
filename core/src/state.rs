@@ -257,6 +257,88 @@ impl HasExpiry for NewsEntry {
     }
 }
 
+/// Global "the post-NY-close spread-blackout window is open" marker.
+///
+/// Singleton key `spread-blackout:window`, written by Cron 1 at the
+/// NY-close edge with a derived ~3h TTL. Sub-plan 3 reads this to gate
+/// brand-new entries that have no per-trade record yet — a coarse "we
+/// think we're in a blackout" flag for the entry-reject side. Distinct
+/// from the per-trade [`SpreadBlackoutRecord::applied`] flag, which is
+/// the *fine* "we actually touched THIS trade" signal the watcher keys
+/// on; see the safety rules in `src/cron/blackout_watch.rs`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SpreadBlackoutWindow {
+    pub opened_at: DateTime<Utc>,
+    pub expires_at: DateTime<Utc>,
+}
+
+impl HasExpiry for SpreadBlackoutWindow {
+    fn expires_at(&self) -> DateTime<Utc> {
+        self.expires_at
+    }
+}
+
+/// Per-trade-id blackout record. Written when a trade's stops/orders
+/// were actually touched (Sub-plans 4/5 set `applied = true` and fill
+/// the `original_stops` / `cancelled_orders` payloads). Sub-plan 2 only
+/// reads it (recovery watcher) and clears it; the apply-side fields are
+/// **reserved now** so 4/5 don't reshape the schema.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SpreadBlackoutRecord {
+    pub trade_id: String,
+    pub instrument: String,
+    /// `None` for worker-global, `Some(name)` for account-scoped. Same
+    /// shape as [`EntryAttempt::account`] — the recovery watcher needs
+    /// it to acquire the right account's broker for the `get_quote`
+    /// sample, and Sub-plans 4/5 need it to amend the right account's
+    /// positions.
+    #[serde(default)]
+    pub account: Option<String>,
+    /// True once Cron 1 (Sub-plans 4/5) actually widened a stop or
+    /// cancelled an order for this trade. The recovery watcher ONLY
+    /// acts on records with `applied == true` — see the
+    /// "never-touch-what-you-didn't-apply" safety rule. Sub-plan 2
+    /// never sets this true; it only honours it.
+    pub applied: bool,
+    pub opened_at: DateTime<Utc>,
+    pub expires_at: DateTime<Utc>,
+    /// RESERVED for Sub-plan 4. Original SLs to restore on recovery,
+    /// keyed by broker position/order id. Empty until then. `default`
+    /// so Sub-plan-2-era rows decode after 4 adds population.
+    #[serde(default)]
+    pub original_stops: Vec<RememberedStop>,
+    /// RESERVED for Sub-plan 5. Cancelled resting orders + their stored
+    /// signed intent, to re-drive on recovery. Empty until then.
+    #[serde(default)]
+    pub cancelled_orders: Vec<CancelledOrder>,
+}
+
+impl HasExpiry for SpreadBlackoutRecord {
+    fn expires_at(&self) -> DateTime<Utc> {
+        self.expires_at
+    }
+}
+
+/// RESERVED shape (Sub-plan 4). A widened stop's original value so the
+/// watcher restores to the remembered original, never `current − widen`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RememberedStop {
+    pub position_or_order_id: String,
+    pub original_stop: f64,
+}
+
+/// RESERVED shape (Sub-plan 5). A cancelled resting order plus the whole
+/// signed Intent needed to re-create it via the Sub-plan-0 fallback.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CancelledOrder {
+    pub order_id: String,
+    /// The whole signed Intent JSON, persisted so the order can be
+    /// re-driven through the entry path. Opaque string here; Sub-plan 5
+    /// re-parses it. (Stored as a String to avoid an Intent dep cycle in
+    /// state.rs.)
+    pub signed_intent: String,
+}
+
 /// KV-key sentinel used in place of an account name when a veto is
 /// worker-global (no `account:` field on the intent). Picked because
 /// account names use kebab-case and never appear as a bare underscore,
@@ -271,7 +353,10 @@ pub fn account_scope(account: Option<&str>) -> &str {
 }
 
 /// Read-only snapshot of the state store for the `status` action.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// Not `Eq`: [`SpreadBlackoutRecord`] carries `f64` stop prices, which
+/// rules out a total-equality derive. `PartialEq` is retained for tests.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Snapshot {
     pub now: DateTime<Utc>,
     pub cooldowns: Vec<CooldownEntry>,
@@ -294,6 +379,16 @@ pub struct Snapshot {
     /// back-compat with snapshots serialised before the field landed.
     #[serde(default)]
     pub prep_blocks: Vec<PrepBlockEntry>,
+    /// Active per-trade spread-blackout records (post-NY-close-edge
+    /// stop-widen / order-cancel bookkeeping). `default`-empty for
+    /// back-compat. The singleton `spread-blackout:window` marker is
+    /// surfaced separately in [`Self::spread_blackout_window`].
+    #[serde(default)]
+    pub spread_blackouts: Vec<SpreadBlackoutRecord>,
+    /// The global spread-blackout window marker, if one is currently
+    /// open. `None` outside a blackout window. `default` for back-compat.
+    #[serde(default)]
+    pub spread_blackout_window: Option<SpreadBlackoutWindow>,
 }
 
 /// Async storage interface. Implementations are `?Send` because the CF Worker
@@ -620,6 +715,48 @@ pub trait StateStore {
         trade_id: &str,
         shell_time: DateTime<Utc>,
         ttl_seconds: u64,
+    ) -> impl Future<Output = Result<(), StateError>>;
+
+    /// Open the global spread-blackout window marker (singleton key).
+    /// `ttl_seconds` derives from the ~3h backstop. Idempotent overwrite.
+    fn set_spread_blackout_window(
+        &self,
+        now: DateTime<Utc>,
+        ttl_seconds: u64,
+    ) -> impl Future<Output = Result<(), StateError>>;
+
+    /// Read the window marker; `None` when no blackout is open (key absent
+    /// or TTL-expired). Sub-plan 3 reads this.
+    fn get_spread_blackout_window(
+        &self,
+    ) -> impl Future<Output = Result<Option<SpreadBlackoutWindow>, StateError>>;
+
+    /// Create-or-update a per-trade blackout record. Sub-plans 4/5 call
+    /// this with `applied = true` and populated payloads.
+    fn upsert_spread_blackout_record(
+        &self,
+        record: &SpreadBlackoutRecord,
+        ttl_seconds: u64,
+    ) -> impl Future<Output = Result<(), StateError>>;
+
+    /// Read one per-trade record by `trade_id`. `None` if absent/expired.
+    fn get_spread_blackout_record(
+        &self,
+        trade_id: &str,
+    ) -> impl Future<Output = Result<Option<SpreadBlackoutRecord>, StateError>>;
+
+    /// Enumerate every active per-trade record (recovery watcher).
+    /// Mirrors [`Self::list_all_entry_attempts`].
+    fn list_all_spread_blackout_records(
+        &self,
+    ) -> impl Future<Output = Result<Vec<SpreadBlackoutRecord>, StateError>>;
+
+    /// Delete a per-trade record (recovery cleared / backstop fired).
+    /// Best-effort; succeeds even if already gone (mirrors
+    /// [`Self::forget_seen`]).
+    fn clear_spread_blackout_record(
+        &self,
+        trade_id: &str,
     ) -> impl Future<Output = Result<(), StateError>>;
 }
 
@@ -1082,6 +1219,8 @@ mod memstore {
                 pauses: Vec::new(),
                 news_windows: Vec::new(),
                 prep_blocks: Vec::new(),
+                spread_blackouts: Vec::new(),
+                spread_blackout_window: None,
             })
         }
 
@@ -1269,6 +1408,81 @@ mod memstore {
                 ttl_seconds.max(MIN_TTL_SECONDS),
                 Utc::now(),
             );
+            Ok(())
+        }
+
+        async fn set_spread_blackout_window(
+            &self,
+            now: DateTime<Utc>,
+            ttl_seconds: u64,
+        ) -> Result<(), StateError> {
+            let ttl = ttl_seconds.max(MIN_TTL_SECONDS);
+            let entry = SpreadBlackoutWindow {
+                opened_at: now,
+                expires_at: now + chrono::Duration::seconds(ttl as i64),
+            };
+            let body =
+                serde_json::to_string(&entry).map_err(|e| StateError::Backend(e.to_string()))?;
+            self.put("spread-blackout:window".into(), body, ttl, now);
+            Ok(())
+        }
+
+        async fn get_spread_blackout_window(
+            &self,
+        ) -> Result<Option<SpreadBlackoutWindow>, StateError> {
+            match self.get_live("spread-blackout:window", Utc::now()) {
+                Some(text) => serde_json::from_str(&text)
+                    .map(Some)
+                    .map_err(|e| StateError::Backend(e.to_string())),
+                None => Ok(None),
+            }
+        }
+
+        async fn upsert_spread_blackout_record(
+            &self,
+            record: &SpreadBlackoutRecord,
+            ttl_seconds: u64,
+        ) -> Result<(), StateError> {
+            let ttl = ttl_seconds.max(MIN_TTL_SECONDS);
+            let key = format!("spread-blackout:rec:{}", record.trade_id);
+            let body =
+                serde_json::to_string(record).map_err(|e| StateError::Backend(e.to_string()))?;
+            self.put(key, body, ttl, Utc::now());
+            Ok(())
+        }
+
+        async fn get_spread_blackout_record(
+            &self,
+            trade_id: &str,
+        ) -> Result<Option<SpreadBlackoutRecord>, StateError> {
+            let key = format!("spread-blackout:rec:{trade_id}");
+            match self.get_live(&key, Utc::now()) {
+                Some(text) => serde_json::from_str(&text)
+                    .map(Some)
+                    .map_err(|e| StateError::Backend(e.to_string())),
+                None => Ok(None),
+            }
+        }
+
+        async fn list_all_spread_blackout_records(
+            &self,
+        ) -> Result<Vec<SpreadBlackoutRecord>, StateError> {
+            let now = Utc::now();
+            let inner = self.inner.borrow();
+            let mut out = Vec::new();
+            for (key, (val, exp)) in inner.iter() {
+                if !key.starts_with("spread-blackout:rec:") || *exp <= now {
+                    continue;
+                }
+                let record: SpreadBlackoutRecord =
+                    serde_json::from_str(val).map_err(|e| StateError::Backend(e.to_string()))?;
+                out.push(record);
+            }
+            Ok(out)
+        }
+
+        async fn clear_spread_blackout_record(&self, trade_id: &str) -> Result<(), StateError> {
+            self.delete(&format!("spread-blackout:rec:{trade_id}"));
             Ok(())
         }
     }
@@ -1978,6 +2192,20 @@ mod tests {
                 expires_at: ts("2026-05-14T15:00:00Z"),
                 account: Some("oanda-reversals-demo".into()),
             }],
+            spread_blackouts: vec![SpreadBlackoutRecord {
+                trade_id: "hs-eur-nzd-c1e0f25b".into(),
+                instrument: "EUR_NZD".into(),
+                account: Some("reversals".into()),
+                applied: true,
+                opened_at: ts("2026-05-14T11:00:00Z"),
+                expires_at: ts("2026-05-14T14:00:00Z"),
+                original_stops: Vec::new(),
+                cancelled_orders: Vec::new(),
+            }],
+            spread_blackout_window: Some(SpreadBlackoutWindow {
+                opened_at: ts("2026-05-14T11:00:00Z"),
+                expires_at: ts("2026-05-14T14:00:00Z"),
+            }),
         };
         let yaml = serde_yaml::to_string(&snap).unwrap();
         assert!(yaml.contains("preps:"));
@@ -1989,6 +2217,9 @@ mod tests {
         assert!(yaml.contains("news_windows:"));
         assert!(yaml.contains("news_id: usd-nfp-2026-06-06"));
         assert!(yaml.contains("prep_blocks:"));
+        assert!(yaml.contains("spread_blackouts:"));
+        assert!(yaml.contains("trade_id: hs-eur-nzd-c1e0f25b"));
+        assert!(yaml.contains("spread_blackout_window:"));
     }
 
     #[test]
@@ -2408,5 +2639,59 @@ mod tests {
         assert_eq!(parsed.set_at, Some(ts("2026-05-15T18:00:34Z")));
         assert_eq!(parsed.expires_at, ts("2026-05-16T06:00:34Z"));
         assert_eq!(parsed.account, Some("oanda-reversals-demo".into()));
+    }
+
+    #[test]
+    fn spread_blackout_window_round_trips() {
+        let entry = SpreadBlackoutWindow {
+            opened_at: ts("2026-03-12T21:05:00Z"),
+            expires_at: ts("2026-03-13T00:05:00Z"),
+        };
+        let json = serde_json::to_string(&entry).unwrap();
+        let parsed: SpreadBlackoutWindow = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, entry);
+    }
+
+    #[test]
+    fn spread_blackout_record_round_trips_with_reserved_fields() {
+        let record = SpreadBlackoutRecord {
+            trade_id: "hs-eur-nzd-c1e0f25b".into(),
+            instrument: "EUR_NZD".into(),
+            account: Some("reversals".into()),
+            applied: true,
+            opened_at: ts("2026-03-12T21:05:00Z"),
+            expires_at: ts("2026-03-13T00:05:00Z"),
+            original_stops: vec![RememberedStop {
+                position_or_order_id: "pos-1".into(),
+                original_stop: 1.8234,
+            }],
+            cancelled_orders: vec![CancelledOrder {
+                order_id: "ord-9".into(),
+                signed_intent: "{\"x\":1}".into(),
+            }],
+        };
+        let json = serde_json::to_string(&record).unwrap();
+        let parsed: SpreadBlackoutRecord = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, record);
+    }
+
+    /// A Sub-plan-2-era record (no apply-side payload written yet)
+    /// decodes with the reserved fields defaulting to empty vecs and a
+    /// missing `account` defaulting to `None`.
+    #[test]
+    fn spread_blackout_record_decodes_with_defaulted_reserved_fields() {
+        let minimal = r#"{
+            "trade_id": "hs-eur-nzd-c1e0f25b",
+            "instrument": "EUR_NZD",
+            "applied": false,
+            "opened_at": "2026-03-12T21:05:00Z",
+            "expires_at": "2026-03-13T00:05:00Z"
+        }"#;
+        let parsed: SpreadBlackoutRecord = serde_json::from_str(minimal).unwrap();
+        assert_eq!(parsed.trade_id, "hs-eur-nzd-c1e0f25b");
+        assert!(!parsed.applied);
+        assert_eq!(parsed.account, None);
+        assert!(parsed.original_stops.is_empty());
+        assert!(parsed.cancelled_orders.is_empty());
     }
 }

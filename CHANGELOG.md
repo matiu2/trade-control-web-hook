@@ -1,5 +1,85 @@
 # Changelog
 
+## v19 — 2026-06-13 — spread-blackout state + crons skeleton (no entry-reject/widen/cancel yet)
+
+### Why
+
+Sub-plan 2 of the DST-aware spread-blackout feature (builds on the v18
+broker-trait foundations). Right after New York's 17:00 close a ~1h
+liquidity trough blows the spread out on thin FX crosses (a real trade,
+`hs-eur-nzd-c1e0f25b`, stopped out for ~−1.38R almost entirely on
+spread). This lands the **state machine + cron skeleton** the rest of
+the feature hangs off — it does **not** reject entries (sub-plan 3),
+widen stops (sub-plan 4), or cancel/restore orders (sub-plan 5).
+
+### What changed
+
+- **DST module** (`core/src/ny_clock.rs`, new): hand-rolled US Eastern
+  DST rule (2nd Sun Mar → 1st Sun Nov), KV/clock-free pure fns
+  `is_ny_close_edge(now)` and `ny_is_edt(date)`. No `chrono-tz` (keeps
+  the WASM bundle small). NY close = 21:00 UTC under EDT, 22:00 UTC
+  under EST. Full proven-fixture-table unit tests + DST-boundary
+  exactness.
+- **KV state** (`core/src/state.rs`, `src/state/kv.rs`): two new kinds
+  under the `spread-blackout:` namespace — the singleton global window
+  marker `spread-blackout:window` (`SpreadBlackoutWindow`) and the
+  per-trade record `spread-blackout:rec:<trade_id>`
+  (`SpreadBlackoutRecord`). Six new `StateStore` methods (set/get
+  window, upsert/get/list-all/clear record). `original_stops` /
+  `cancelled_orders` (+ `RememberedStop` / `CancelledOrder`) are
+  **reserved** for sub-plans 4/5 and empty for now. Surfaced in the
+  `status` `Snapshot` (`spread_blackouts` + `spread_blackout_window`).
+- **Crons** (`wrangler.toml`, `src/cron.rs`): a second + third daily
+  cron added to the flat `crons` array (`5 21` and `5 22 * * *`, both
+  DST candidate minutes); `scheduled` now dispatches on `event.cron()`.
+  **Cron 1** (`src/cron/blackout_apply.rs`) opens the window marker when
+  `is_ny_close_edge(now)`. **Cron 2** (the 15-min job) gains the
+  **recovery watcher** (`src/cron/blackout_watch.rs`): for each
+  `applied` record, clear on spread-recovery (live `get_quote`) or the
+  ~3h backstop. Three safety rules (hard restore floor / backstop
+  timeout / never-touch-what-you-didn't-apply) coded + unit-tested as
+  pure predicates. `acquire_broker_for_account` / `open_store` /
+  `BrokerHandle` factored out of `sweep.rs` for reuse.
+- **`BLACKOUT_BACKSTOP_SECONDS`** (`src/cron/constants.rs`, ~3h): single
+  source of truth for the window TTL, the record TTL, and the watcher
+  backstop so they can't drift.
+
+### Breaking
+
+- `Snapshot` is no longer `Eq` (it now carries `f64` stop prices via
+  `SpreadBlackoutRecord`); still `PartialEq`.
+- `StateStore` gains six methods — every impl (`KvStateStore`, the
+  test stores `MemStateStore` / `CountingStore` / `SeenSpyStore`) was
+  updated.
+
+### Config
+
+- `wrangler.toml` `crons` array gains `5 21 * * *` and `5 22 * * *`.
+  Kept the flat-array form (the `[[triggers.crons]]` double-wrap-bug
+  comment is preserved).
+
+### Open question (recorded, not resolved)
+
+- The spread *recovered* / *elevated* thresholds and the pip-size source
+  for a cron-sampled instrument (the watcher has no intent in hand) are
+  left as a coarse placeholder constant with a `TODO(open-question)` in
+  `src/cron/blackout_watch.rs`. Sub-plan 3 inherits the same question
+  for the entry-reject side.
+
+### Tests
+
+- `core`: 412 pass (+14: 11 `ny_clock` fixtures + 3 state serde
+  round-trips).
+- worker: 161 pass (+5 `blackout_watch` pure-predicate tests; +4 kv
+  decode tests for the new entry types).
+
+### Follow-up
+
+- Sub-plan 3: entry-reject reading the window marker.
+- Sub-plans 4/5: populate `applied` / `original_stops` /
+  `cancelled_orders`; restore stops/orders at the marked watcher points.
+- Resolve the spread-threshold + pip-source open question.
+
 ## v18 — 2026-06-13 — broker-trait spread/positions/amend foundations (no behaviour change)
 
 ### Why

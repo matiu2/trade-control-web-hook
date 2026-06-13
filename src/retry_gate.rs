@@ -671,6 +671,8 @@ mod tests {
                 pauses: Vec::new(),
                 news_windows: Vec::new(),
                 prep_blocks: Vec::new(),
+                spread_blackouts: Vec::new(),
+                spread_blackout_window: None,
             })
         }
         async fn set_pause(
@@ -801,6 +803,41 @@ mod tests {
             if let Some(list) = self.attempts.borrow_mut().get_mut(&key) {
                 list.retain(|a| a.attempt_no != attempt_no);
             }
+            Ok(())
+        }
+        // Spread-blackout state is untouched by the retry-gate tests —
+        // stub the methods so the trait is satisfied.
+        async fn set_spread_blackout_window(
+            &self,
+            _now: DateTime<Utc>,
+            _ttl_seconds: u64,
+        ) -> Result<(), StateError> {
+            Ok(())
+        }
+        async fn get_spread_blackout_window(
+            &self,
+        ) -> Result<Option<trade_control_core::state::SpreadBlackoutWindow>, StateError> {
+            Ok(None)
+        }
+        async fn upsert_spread_blackout_record(
+            &self,
+            _record: &trade_control_core::state::SpreadBlackoutRecord,
+            _ttl_seconds: u64,
+        ) -> Result<(), StateError> {
+            Ok(())
+        }
+        async fn get_spread_blackout_record(
+            &self,
+            _trade_id: &str,
+        ) -> Result<Option<trade_control_core::state::SpreadBlackoutRecord>, StateError> {
+            Ok(None)
+        }
+        async fn list_all_spread_blackout_records(
+            &self,
+        ) -> Result<Vec<trade_control_core::state::SpreadBlackoutRecord>, StateError> {
+            Ok(Vec::new())
+        }
+        async fn clear_spread_blackout_record(&self, _trade_id: &str) -> Result<(), StateError> {
             Ok(())
         }
     }

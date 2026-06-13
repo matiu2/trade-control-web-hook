@@ -12,8 +12,9 @@ use chrono::{DateTime, Utc};
 use trade_control_core::intent::Action;
 use trade_control_core::state::{
     CooldownEntry, EntryAttempt, MIN_TTL_SECONDS, NewsEntry, PREP_BLOCK_INDEX_CAP, PREP_INDEX_CAP,
-    PauseEntry, PrepBlockEntry, PrepEntry, SEEN_INDEX_CAP, SeenEntry, Snapshot, StateError,
-    StateStore, VETO_INDEX_CAP, VetoEntry, account_scope, prune_expired,
+    PauseEntry, PrepBlockEntry, PrepEntry, SEEN_INDEX_CAP, SeenEntry, Snapshot,
+    SpreadBlackoutRecord, SpreadBlackoutWindow, StateError, StateStore, VETO_INDEX_CAP, VetoEntry,
+    account_scope, prune_expired,
 };
 use worker::kv::KvStore;
 
@@ -95,6 +96,25 @@ impl KvStateStore {
 
     fn news_key(trade_id: &str, news_id: &str) -> String {
         format!("news:{trade_id}:{news_id}")
+    }
+
+    /// Singleton key for the global spread-blackout window marker.
+    fn spread_blackout_window_key() -> &'static str {
+        "spread-blackout:window"
+    }
+
+    /// Per-trade record key. The `rec:` segment keeps the record
+    /// namespace cleanly separable from the singleton `window` key —
+    /// a `list().prefix("spread-blackout:rec:")` never matches the
+    /// window marker.
+    fn spread_blackout_record_key(trade_id: &str) -> String {
+        format!("spread-blackout:rec:{trade_id}")
+    }
+
+    /// Prefix used by the recovery watcher to enumerate every per-trade
+    /// record. Disjoint from the window key by the `rec:` segment.
+    fn spread_blackout_record_prefix() -> &'static str {
+        "spread-blackout:rec:"
     }
 
     /// Prefix used to list every news window for a single `trade_id`.
@@ -772,6 +792,18 @@ impl StateStore for KvStateStore {
             list_news_with_prefix(&self.store, Self::news_all_prefix()).await?,
             now,
         );
+        // Per-trade spread-blackout records + the singleton window
+        // marker. Same `kv.list` scan as pauses/news; the `rec:` prefix
+        // keeps the record scan disjoint from the window key.
+        let spread_blackouts = prune_expired(
+            list_spread_blackouts_with_prefix(&self.store, Self::spread_blackout_record_prefix())
+                .await?,
+            now,
+        );
+        let spread_blackout_window = self
+            .get_spread_blackout_window()
+            .await?
+            .filter(|w| w.expires_at > now);
         Ok(Snapshot {
             now,
             cooldowns,
@@ -781,6 +813,8 @@ impl StateStore for KvStateStore {
             pauses,
             news_windows,
             prep_blocks,
+            spread_blackouts,
+            spread_blackout_window,
         })
     }
 
@@ -1098,6 +1132,97 @@ impl StateStore for KvStateStore {
         }
         Ok(was)
     }
+
+    async fn set_spread_blackout_window(
+        &self,
+        now: DateTime<Utc>,
+        ttl_seconds: u64,
+    ) -> Result<(), StateError> {
+        let key = Self::spread_blackout_window_key();
+        let ttl = ttl_seconds.max(MIN_TTL_SECONDS);
+        let entry = SpreadBlackoutWindow {
+            opened_at: now,
+            expires_at: now + chrono::Duration::seconds(ttl as i64),
+        };
+        let body = serde_json::to_string(&entry)
+            .map_err(|e| StateError::Backend(format!("encode spread-blackout window: {e}")))?;
+        self.store
+            .put(key, body)
+            .map_err(|e| StateError::Backend(format!("put spread-blackout window builder: {e:?}")))?
+            .expiration_ttl(ttl)
+            .execute()
+            .await
+            .map_err(|e| {
+                StateError::Backend(format!("put spread-blackout window execute: {e:?}"))
+            })?;
+        Ok(())
+    }
+
+    async fn get_spread_blackout_window(&self) -> Result<Option<SpreadBlackoutWindow>, StateError> {
+        let key = Self::spread_blackout_window_key();
+        let raw = self
+            .store
+            .get(key)
+            .text()
+            .await
+            .map_err(|e| StateError::Backend(format!("get spread-blackout window: {e:?}")))?;
+        let Some(text) = raw else { return Ok(None) };
+        serde_json::from_str(&text)
+            .map(Some)
+            .map_err(|e| StateError::Backend(format!("decode spread-blackout window: {e}")))
+    }
+
+    async fn upsert_spread_blackout_record(
+        &self,
+        record: &SpreadBlackoutRecord,
+        ttl_seconds: u64,
+    ) -> Result<(), StateError> {
+        let key = Self::spread_blackout_record_key(&record.trade_id);
+        let ttl = ttl_seconds.max(MIN_TTL_SECONDS);
+        let body = serde_json::to_string(record)
+            .map_err(|e| StateError::Backend(format!("encode spread-blackout record: {e}")))?;
+        self.store
+            .put(&key, body)
+            .map_err(|e| StateError::Backend(format!("put {key} builder: {e:?}")))?
+            .expiration_ttl(ttl)
+            .execute()
+            .await
+            .map_err(|e| StateError::Backend(format!("put {key} execute: {e:?}")))?;
+        Ok(())
+    }
+
+    async fn get_spread_blackout_record(
+        &self,
+        trade_id: &str,
+    ) -> Result<Option<SpreadBlackoutRecord>, StateError> {
+        let key = Self::spread_blackout_record_key(trade_id);
+        let raw = self
+            .store
+            .get(&key)
+            .text()
+            .await
+            .map_err(|e| StateError::Backend(format!("get {key}: {e:?}")))?;
+        let Some(text) = raw else { return Ok(None) };
+        serde_json::from_str(&text)
+            .map(Some)
+            .map_err(|e| StateError::Backend(format!("decode {key}: {e}")))
+    }
+
+    async fn list_all_spread_blackout_records(
+        &self,
+    ) -> Result<Vec<SpreadBlackoutRecord>, StateError> {
+        list_spread_blackouts_with_prefix(&self.store, Self::spread_blackout_record_prefix()).await
+    }
+
+    async fn clear_spread_blackout_record(&self, trade_id: &str) -> Result<(), StateError> {
+        let key = Self::spread_blackout_record_key(trade_id);
+        // Best-effort: KV delete is a no-op if the key is already gone.
+        self.store
+            .delete(&key)
+            .await
+            .map_err(|e| StateError::Backend(format!("delete {key}: {e:?}")))?;
+        Ok(())
+    }
 }
 
 /// Page through `kv.list` with `prefix`, decoding each value as a
@@ -1119,6 +1244,15 @@ async fn list_news_with_prefix(
     prefix: &str,
 ) -> Result<Vec<NewsEntry>, StateError> {
     list_json_with_prefix(store, prefix, "news").await
+}
+
+/// Same shape as [`list_pauses_with_prefix`], for the recovery watcher's
+/// per-trade spread-blackout records.
+async fn list_spread_blackouts_with_prefix(
+    store: &KvStore,
+    prefix: &str,
+) -> Result<Vec<SpreadBlackoutRecord>, StateError> {
+    list_json_with_prefix(store, prefix, "spread-blackout").await
 }
 
 /// Generic prefix-paginated JSON list — page through `kv.list`,
@@ -1310,5 +1444,86 @@ mod decode_index_tests {
     fn keyed_value_drops_malformed_json() {
         let entry: Option<NewsEntry> = decode_keyed_value("news:t:x", "{not json");
         assert!(entry.is_none());
+    }
+
+    // --- spread-blackout window + per-trade record decode ---
+
+    const GOOD_BLACKOUT_WINDOW: &str = r#"{
+        "opened_at": "2026-03-12T21:05:00Z",
+        "expires_at": "2026-03-13T00:05:00Z"
+    }"#;
+
+    /// A full per-trade record (apply-side payload populated, as
+    /// Sub-plans 4/5 will write it) decodes off a prefix-listed key.
+    const GOOD_BLACKOUT_RECORD: &str = r#"{
+        "trade_id": "hs-eur-nzd-c1e0f25b",
+        "instrument": "EUR_NZD",
+        "account": "reversals",
+        "applied": true,
+        "opened_at": "2026-03-12T21:05:00Z",
+        "expires_at": "2026-03-13T00:05:00Z",
+        "original_stops": [{"position_or_order_id": "pos-1", "original_stop": 1.8234}],
+        "cancelled_orders": []
+    }"#;
+
+    /// The window marker decodes (singleton-key value path).
+    #[test]
+    fn blackout_window_decodes_good() {
+        let entry: Option<SpreadBlackoutWindow> =
+            decode_keyed_value("spread-blackout:window", GOOD_BLACKOUT_WINDOW);
+        let entry = entry.expect("valid window value");
+        assert_eq!(entry.opened_at.to_rfc3339(), "2026-03-12T21:05:00+00:00");
+    }
+
+    /// A full per-trade record decodes off the prefix-listed key path.
+    #[test]
+    fn blackout_record_decodes_good() {
+        let entry: Option<SpreadBlackoutRecord> = decode_keyed_value(
+            "spread-blackout:rec:hs-eur-nzd-c1e0f25b",
+            GOOD_BLACKOUT_RECORD,
+        );
+        let entry = entry.expect("valid record value");
+        assert_eq!(entry.trade_id, "hs-eur-nzd-c1e0f25b");
+        assert!(entry.applied);
+        assert_eq!(entry.account.as_deref(), Some("reversals"));
+        assert_eq!(entry.original_stops.len(), 1);
+    }
+
+    /// A Sub-plan-2-era record (no apply-side payload) decodes with the
+    /// reserved fields defaulting to empty + `account` defaulting None.
+    #[test]
+    fn blackout_record_decodes_minimal_with_defaults() {
+        let minimal = r#"{
+            "trade_id": "hs-eur-nzd-c1e0f25b",
+            "instrument": "EUR_NZD",
+            "applied": false,
+            "opened_at": "2026-03-12T21:05:00Z",
+            "expires_at": "2026-03-13T00:05:00Z"
+        }"#;
+        let entry: Option<SpreadBlackoutRecord> =
+            decode_keyed_value("spread-blackout:rec:hs-eur-nzd-c1e0f25b", minimal);
+        let entry = entry.expect("minimal record decodes");
+        assert!(!entry.applied);
+        assert_eq!(entry.account, None);
+        assert!(entry.original_stops.is_empty());
+        assert!(entry.cancelled_orders.is_empty());
+    }
+
+    /// A record missing a required field (`applied`) is dropped, not
+    /// fatal — one bad row never sinks the watcher's whole listing.
+    #[test]
+    fn blackout_record_drops_when_missing_required_field() {
+        let bad = r#"{
+            "trade_id": "hs-eur-nzd-c1e0f25b",
+            "instrument": "EUR_NZD",
+            "opened_at": "2026-03-12T21:05:00Z",
+            "expires_at": "2026-03-13T00:05:00Z"
+        }"#;
+        let entry: Option<SpreadBlackoutRecord> =
+            decode_keyed_value("spread-blackout:rec:hs-eur-nzd-c1e0f25b", bad);
+        assert!(
+            entry.is_none(),
+            "a record missing `applied` must be dropped"
+        );
     }
 }

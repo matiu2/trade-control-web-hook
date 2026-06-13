@@ -168,9 +168,18 @@ The day-to-day loop, end to end:
    quality gates AND-composed on top), then dispatches to OANDA or
    TradeNation. Outcomes are visible in Cloudflare Real-time Logs and
    via `trade-control status`.
-5. **The scheduled `cron` trigger** (`*/15 * * * *`, declared in
-   `wrangler.toml`) sweeps pending stop-entry orders for SL-breach
-   independently of any TV alert. See `src/cron.rs`.
+5. **The scheduled `cron` triggers** (declared in `wrangler.toml`,
+   dispatched on `event.cron()` in `src/cron.rs`):
+   - `*/15 * * * *` — sweeps pending stop-entry orders for SL-breach /
+     bar-expiry independently of any TV alert, **and** runs the
+     spread-recovery watcher (see below).
+   - `5 21 * * *` **and** `5 22 * * *` — the daily **NY-close-edge**
+     check for the spread-blackout feature. CF crons are UTC-only and
+     can't carry a timezone, so both candidate minutes fire (21:05 UTC
+     covers New York's EDT close, 22:05 UTC covers EST). The handler
+     re-checks `is_ny_close_edge(now)` in Rust, so the wrong-season fire
+     no-ops and the one-hour DST shift is decided in code, not by the
+     schedule. See the "Spread-blackout window" note below.
 6. **End of trade:** the trade-expiry vertical fires the
    `02-veto-trade-expiry` alert, which sets an invalidation veto that
    blocks any future `05-enter` for that `trade_id`. Pauses and news
@@ -810,6 +819,42 @@ four; OANDA implements all four via its v20 trade/order/pricing endpoints.
 **Caveat (TradeNation `amend_stop`):** the upstream `AmendCloseOrder`
 endpoint is unverified against an *open position's* SL — a later sub-plan
 must demo-confirm it before any live stop-widening.
+
+### Spread-blackout window (skeleton — state + crons only)
+
+Right after New York's 17:00 close there is a ~1-hour global liquidity
+trough where the broker's spread on thin FX crosses (EUR/NZD, AUD/NZD)
+blows out and snaps back at the next hour. The dangerous hour tracks
+**New York's clock** (DST-aware): 07:00 BNE under EDT, 08:00 BNE under
+EST. This release lands the **state machine + cron skeleton** the rest
+of the feature hangs off. It does **not** reject entries, widen stops,
+or cancel orders yet (those are later sub-plans).
+
+Two kinds of KV state live under the `spread-blackout:` namespace:
+
+- **Global window marker** `spread-blackout:window` — `{ opened_at,
+  expires_at }`, ~3h TTL. Written by the daily NY-close-edge cron when
+  `is_ny_close_edge(now)` is true. A coarse "we think we're in a
+  blackout" flag (a later entry-reject sub-plan reads it to gate
+  brand-new entries).
+- **Per-trade record** `spread-blackout:rec:<trade_id>` —
+  `{ trade_id, instrument, account, applied, opened_at, expires_at,
+  original_stops, cancelled_orders }`. The `applied` flag is the *fine*
+  "we actually touched THIS trade" signal; `original_stops` /
+  `cancelled_orders` are **reserved** for the stop-widen / order-cancel
+  sub-plans and are empty for now.
+
+Both surface in `trade-control status` (the `spread_blackouts` list and
+the `spread_blackout_window` marker).
+
+The 15-min cron's **recovery watcher** walks each `applied` record and
+clears it once the spread has recovered (sampled live via
+`Broker::get_quote`) **or** a ~3h backstop has fired — whichever comes
+first, regardless of the clock. Records the box never marked `applied`
+(e.g. because the edge cron was missed while it was down) are left
+untouched. The spread *recovered* threshold is a coarse placeholder
+pending operator tuning — see the `TODO(open-question)` in
+`src/cron/blackout_watch.rs`.
 
 ## TradeNation session
 

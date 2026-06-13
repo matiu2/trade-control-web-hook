@@ -1,5 +1,52 @@
 # TODO
 
+## Done — spread-blackout state + crons skeleton (v19)
+
+Sub-plan 2 of the DST-aware spread-blackout feature. The state machine +
+cron skeleton the rest of the feature hangs off. **No** entry-reject,
+stop-widen, or order-cancel — those are sub-plans 3/4/5. Builds on the
+v18 broker trait (`get_quote`).
+
+### Steps
+- [x] `core/ny_clock.rs`: hand-rolled US DST (`is_ny_close_edge` /
+      `ny_is_edt` / `nth_weekday_of_month`), no `chrono-tz`. Proven
+      fixture-table tests (5-Mar EST→22:00, 12-Mar EDT→21:00, 2/9-Apr
+      EDT→21:00) + boundary exactness + wrong-hour/season negatives.
+- [x] `core/state.rs`: `SpreadBlackoutWindow`, `SpreadBlackoutRecord`
+      (+ reserved `RememberedStop` / `CancelledOrder`), six `StateStore`
+      methods, `Snapshot.spread_blackouts` + `spread_blackout_window`.
+      Serde round-trip + defaulted-reserved-field tests. `MemStateStore`
+      impls.
+- [x] `src/state/kv.rs`: six `KvStateStore` impls, key builders
+      (`spread-blackout:window` + `spread-blackout:rec:<id>`),
+      `list_spread_blackouts_with_prefix`, snapshot scan, decode tests.
+- [x] `src/cron.rs`: `match event.cron()` dispatch; `wrangler.toml` two
+      daily crons (`5 21` / `5 22`, flat array, comment preserved).
+- [x] `src/cron/blackout_apply.rs` (Cron 1, window marker only) +
+      `BLACKOUT_BACKSTOP_SECONDS` constant.
+- [x] `src/cron/blackout_watch.rs` (Cron 2 recovery watcher): three
+      safety rules + pure `spread_recovered` / `backstop_due` predicates.
+      `acquire_broker_for_account` / `open_store` / `BrokerHandle`
+      factored out of `sweep.rs`.
+- [x] README cron + spread-blackout-window section; CHANGELOG v19; this
+      entry. core + worker tests + clippy + fmt; cli builds; wasm builds.
+
+### Follow-up (later sub-plans — NOT done here)
+- [ ] **Open question (sub-plan 2/3):** spread recovered/elevated
+      thresholds + pip-size source for a cron-sampled instrument (no
+      intent in hand). Placeholder `recovered_cutoff` in
+      `blackout_watch.rs` — leading candidate is to bake the cutoff onto
+      `SpreadBlackoutRecord` at apply time (sub-plan 4/5 has the context).
+- [ ] Sub-plan 3: entry-reject reading `spread-blackout:window`.
+- [ ] Sub-plan 4: at the Cron 1 marked point, `list_open_positions` →
+      widen via `amend_stop` → record `original_stops` + set
+      `applied = true`; restore at the watcher's marked points.
+- [ ] Sub-plan 5: `list_pending_orders` → cancel → store signed intent in
+      `cancelled_orders`; re-drive on recovery.
+- [ ] Demo verification (dry-run → demo): force Cron 1 in the live trough,
+      confirm marker via `status`; hand-write `applied=true`/`false`
+      records and confirm watcher clear / leave-alone / backstop.
+
 ## Done — broker-trait spread/positions/amend foundations (v18)
 
 Sub-plan 1 of the DST-aware spread-blackout feature. Surfaces four broker

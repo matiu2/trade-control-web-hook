@@ -203,7 +203,9 @@ async fn delete_row(store: &KvStateStore, attempt: &EntryAttempt) {
     }
 }
 
-fn open_store(env: &Env) -> Option<KvStateStore> {
+/// Open the KV-backed state store. Shared with the spread-blackout
+/// cron steps (`blackout_apply`, `blackout_watch`).
+pub(crate) fn open_store(env: &Env) -> Option<KvStateStore> {
     match env.kv(crate::KV_NAMESPACE) {
         Ok(kv) => Some(KvStateStore::new(kv)),
         Err(err) => {
@@ -215,16 +217,27 @@ fn open_store(env: &Env) -> Option<KvStateStore> {
 
 /// One enum so the dispatcher can return either broker type without
 /// boxing across the async boundary (which `impl Trait` precludes).
-enum BrokerHandle {
+/// Shared with the spread-recovery watcher, which calls `get_quote`
+/// through the same per-broker match.
+pub(crate) enum BrokerHandle {
     Oanda(broker_oanda::OandaBroker),
     TradeNation(crate::tradenation_adapter::TradeNationAdapter),
 }
 
-/// Pick a broker for the attempt's account. `None` → worker-global
-/// OANDA (matches the existing fetch-path default). `Some(name)` →
-/// the account's broker kind, looked up from metadata.
+/// Pick a broker for the attempt's account. Thin wrapper over
+/// [`acquire_broker_for_account`].
 async fn acquire_broker_for_attempt(env: &Env, attempt: &EntryAttempt) -> Option<BrokerHandle> {
-    let account = attempt.account.as_deref();
+    acquire_broker_for_account(env, attempt.account.as_deref()).await
+}
+
+/// Pick a broker for `account`. `None` → worker-global OANDA (matches
+/// the existing fetch-path default). `Some(name)` → the account's
+/// broker kind, looked up from metadata. Shared between the order
+/// sweep and the spread-recovery watcher.
+pub(crate) async fn acquire_broker_for_account(
+    env: &Env,
+    account: Option<&str>,
+) -> Option<BrokerHandle> {
     let broker_kind = resolve_broker_kind(env, account).await?;
     match broker_kind {
         BrokerKind::Oanda => crate::acquire_oanda_broker(env, account)
