@@ -829,8 +829,8 @@ blows out and snaps back at the next hour. The dangerous hour tracks
 EST. The state machine + cron skeleton arms a global window marker at
 that edge; **System 1** rejects *new* entries during the window;
 **System 2** (below) widens *already-open* positions' stops away from
-price and restores them after. Cancelling resting orders is still a later
-sub-plan.
+price and restores them after; **System 3** (below) cancels *resting entry
+orders* during the window and re-drives them after.
 
 #### System 1 — reject new entries during the window
 
@@ -923,8 +923,73 @@ spread normalises (or a ~3h backstop fires).
 > can confirm the read-back. **Do not enable live widening until this is
 > demo-confirmed.** See `TODO.md`.
 
-This release lands the **state machine + cron skeleton** plus System 1 and
-System 2. It does **not** cancel resting orders yet (a later sub-plan).
+#### System 3 — cancel resting entry orders during the window, restore after
+
+A resting **stop- or limit-entry order** that sits through the trough can
+fill *into* the spread blowout and stop out instantly (the EUR/NZD trade
+that motivated the whole feature). So right after the NY-close edge — on the
+same affected-account scan as the widen — the cron also **cancels every
+resting entry order whose instrument spread is actually elevated** and
+stores the order's whole **signed alert body** so the recovery watcher can
+**re-drive the exact same entry** once the spread normalises.
+
+- **Only elevated-spread orders are cancelled.** Each found order's
+  instrument is spread-sampled via `get_quote`; an order on a still-tight
+  major (≤ the elevated cutoff, ~8p) is **left resting**. No
+  instrument-classification — the live spread is the filter.
+- **Re-drive, don't re-place.** On recovery the watcher reconstructs an
+  authentic verified intent from the stored signed body (re-running the same
+  HMAC verify the HTTP path does) and calls the **same entry path**
+  (`run_enter`) the original alert took — so sizing at the live fill
+  reference, the prep/veto/cooldown/allow_entry gates, **and** the
+  `on_too_close` stop fallback all apply, with no duplicated place logic.
+- **Fill-side recreate geometry (the sign-bug-prone seam).** Before
+  re-driving, a pure predicate checks whether the order is still worth
+  placing, using **fill-side** bid/ask (a long buys at `ask`, a short sells
+  at `bid` — spread counts *against* re-entering a deep order):
+  - **Stop still placeable** (fill-side hasn't blown past trigger beyond the
+    SL band) → re-drive as a stop.
+  - **Stop overrun** (the move is gone) → route to the order's `on_too_close`
+    fallback (market / limit / skip) via the broker's own `#19-10` rejection.
+    If `on_too_close` is `skip` (the default), it's dropped without a
+    pointless broker round-trip and the next signal bar can retry.
+  - **Limit still on the pullback side** (fill-side strictly between entry
+    and TP) → re-drive as a limit.
+  - **Limit stale** (wrong side / past TP) → **dropped**, leaving the trade
+    "looking for entry". A limit is itself a fallback, so a stale one is fine
+    to drop; it is **never** routed to the stop `on_too_close` path.
+- **Crash-safe ordering.** The `CancelledOrder` (signed body + order id) is
+  stored on the per-trade record **before** the broker `cancel_order`, so a
+  crash between them can't lose a wanted entry — the worst case is a
+  recoverable duplicate (a re-drive of an order that never actually
+  cancelled), which the re-drive's own gates bound. An order with **no**
+  stored signed body is **never cancelled** (we won't strand an entry we
+  can't put back).
+- **Re-drive ≠ multi-shot re-entry.** A restored order is the *same*
+  intended entry, not a re-entry after a stop-out. It's off the HTTP
+  seen-id/replay path entirely (the cron calls `run_enter` directly and never
+  `mark_seen`s), so a prior successful placement's seen-id doesn't 409 it.
+  For single-shot orders (the common resting-order case) it consumes no
+  `max_retries` slot. (Multi-shot restore can still burn a slot — an open
+  follow-up; see `TODO.md`.)
+- **New entry-path KV write.** Every successful single-shot placement now
+  also writes an `order:<broker_order_id>` KV row holding the raw signed
+  body, TTL'd to the alert window (`not_after` + grace). This is the only
+  place the original signed bytes survive long enough for the apply cron to
+  find them. It's small (~1KB) and ages out with the order's `EntryAttempt`.
+
+> **PRECONDITION — demo-confirm the cancel + re-drive on `reversals` first.**
+> Like the widen, the resting-order cancel/restore is **UNVERIFIED live**.
+> Demo protocol (dry-run → demo): place a resting stop-entry before the edge,
+> force Cron 1, confirm it's cancelled at the broker and stored in KV
+> (`trade-control status` shows the `cancelled_orders` entry); then force
+> recovery and confirm it's re-placed (price still on the entry side),
+> routed to `on_too_close` (price overran), or dropped (stale limit). **Do
+> not enable live until demo-confirmed.** See `TODO.md`.
+
+This release lands the **state machine + cron skeleton** plus Systems 1, 2,
+and 3 — the full cancel/restore half. All three systems (reject new entries,
+widen open stops, cancel + restore resting orders) are now in place.
 
 Two kinds of KV state live under the `spread-blackout:` namespace:
 
@@ -939,12 +1004,18 @@ Two kinds of KV state live under the `spread-blackout:` namespace:
   *fine* "we actually touched THIS trade" signal; `pip_size` is baked on at
   apply time so the cron can work in pips with no intent in hand;
   `original_stops` holds the **pre-widen** SLs to restore (populated by
-  System 2). `cancelled_orders` stays **reserved** for the order-cancel
-  sub-plan and is empty for now.
+  System 2); `cancelled_orders` holds each cancelled resting order's id +
+  signed body to re-drive (populated by System 3). A trade may carry both at
+  once (multi-shot: a widened open position **and** a cancelled re-entry
+  order share one record); the watcher restores both before clearing.
+- **Per-order signed body** `order:<broker_order_id>` — the raw signed alert
+  body, TTL'd to the alert window. Written on successful placement, read by
+  the apply cron to recover the intent behind a broker pending order, deleted
+  once the recovery watcher has re-driven (or dropped) it.
 
-Both surface in `trade-control status` (the `spread_blackouts` list — where
-the `original_stops` and `pip_size` are operator-visible — and the
-`spread_blackout_window` marker).
+The `spread-blackout:rec:` records (incl. `original_stops`, `pip_size`, and
+`cancelled_orders`) and the `spread_blackout_window` marker surface in
+`trade-control status`.
 
 The 15-min cron's **recovery watcher** walks each `applied` record,
 **restores every remembered stop to its original** (verbatim), then clears

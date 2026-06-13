@@ -119,19 +119,9 @@ pub async fn main(mut req: Request, env: Env, _ctx: Context) -> Result<Response>
 
     let yaml = req.text().await?;
 
-    let key_hex = match get_secret(SIGNING_KEY_SECRET, &env) {
-        Some(s) => s,
-        None => {
-            console_error!("missing required secret: {SIGNING_KEY_SECRET}");
-            return Response::error("server misconfigured", 500);
-        }
-    };
-    let key = match sig::parse_key_hex(&key_hex) {
-        Ok(k) => k,
-        Err(err) => {
-            console_error!("SIGNING_KEY is not valid hex: {err}");
-            return Response::error("server misconfigured", 500);
-        }
+    let key = match signing_key(&env) {
+        Some(k) => k,
+        None => return Response::error("server misconfigured", 500),
     };
 
     let now = Utc::now();
@@ -210,7 +200,7 @@ pub async fn main(mut req: Request, env: Env, _ctx: Context) -> Result<Response>
     let result = match verified.intent.broker {
         BrokerKind::Oanda => {
             match acquire_oanda_broker(&env, verified.intent.account.as_deref()).await {
-                Some(broker) => run_action(&broker, &store, &verified, &env, now).await,
+                Some(broker) => run_action(&broker, &store, &verified, &env, now, &yaml).await,
                 None => return Response::error("oanda login failed", 500),
             }
         }
@@ -218,7 +208,7 @@ pub async fn main(mut req: Request, env: Env, _ctx: Context) -> Result<Response>
             match acquire_tn_broker(&env, verified.intent.account.as_deref()).await {
                 Some(broker) => {
                     let adapter = TradeNationAdapter(broker);
-                    run_action(&adapter, &store, &verified, &env, now).await
+                    run_action(&adapter, &store, &verified, &env, now, &yaml).await
                 }
                 None => {
                     return Response::error(
@@ -416,7 +406,7 @@ async fn route_admin(req: &mut Request, env: &Env, path: &str) -> Result<Respons
 /// [`record_dispatcher_outcome`] for why. `Failed` and `Rejected`
 /// outcomes are logged via `console_log!` for post-mortem visibility
 /// but do not consume the intent id.
-enum ActionResult {
+pub(crate) enum ActionResult {
     /// Action completed successfully. The outcome (e.g. `"entered"`)
     /// is recorded against the seen id so a replay of the same alert
     /// body 409s instead of placing a duplicate order.
@@ -436,6 +426,20 @@ enum ActionResult {
     },
 }
 
+impl ActionResult {
+    /// Short, `Response`-free description for logging (the `Rejected` variant
+    /// holds a `worker::Response`, which isn't `Debug`). Used by the
+    /// spread-blackout restore re-drive, which logs the outcome but does not
+    /// route it through the HTTP dispatcher.
+    pub(crate) fn describe(&self) -> String {
+        match self {
+            Self::Ok(s) => format!("Ok({s})"),
+            Self::Failed(s) => format!("Failed({s})"),
+            Self::Rejected { outcome, .. } => format!("Rejected({outcome})"),
+        }
+    }
+}
+
 /// Dispatch `Enter` / `Close` / `Invalidate` / escalated `Veto` against an
 /// authenticated broker. Status / Unlock / Prep / `stop-next-entry` Veto /
 /// Clear-* are handled before this function and never reach it.
@@ -445,9 +449,10 @@ async fn run_action<B: Broker>(
     verified: &incoming::Verified,
     env: &Env,
     now: chrono::DateTime<chrono::Utc>,
+    raw_body: &str,
 ) -> ActionResult {
     match verified.intent.action {
-        Action::Enter => run_enter(broker, store, verified, env, now).await,
+        Action::Enter => run_enter(broker, store, verified, env, now, Some(raw_body)).await,
         Action::Close => run_close(broker, store, verified, now).await,
         Action::Invalidate => {
             let hours = match resolve_phase1_u32(
@@ -1014,12 +1019,24 @@ mod reversal_veto_tests {
     }
 }
 
-async fn run_enter<B: Broker>(
+/// Run an `enter` intent end-to-end (gates → sizing → broker placement →
+/// `on_too_close` fallback).
+///
+/// `raw_body` is the **exact signed YAML bytes** this intent arrived as, when
+/// known. On a successful real placement we persist it under an
+/// `order:{broker_order_id}` KV row so the spread-blackout apply cron can
+/// recover it (it finds a broker *pending order*, not a signed intent) and
+/// re-drive this same entry on recovery. `None` is passed only where no signed
+/// body is available (there is none today — both the HTTP path and the
+/// blackout re-drive supply it); a `None` simply skips the order-body write, so
+/// such an order can't be blackout-cancelled-and-restored.
+pub(crate) async fn run_enter<B: Broker>(
     broker: &B,
     store: &KvStateStore,
     verified: &incoming::Verified,
     env: &Env,
     now: chrono::DateTime<chrono::Utc>,
+    raw_body: Option<&str>,
 ) -> ActionResult {
     // Blackout gate — if any pause for this trade_id is active, reject
     // before doing any other work. Pauses are intentionally cheap to
@@ -1478,6 +1495,24 @@ async fn run_enter<B: Broker>(
                         cancel_at,
                     )
                     .await;
+                }
+                // Spread-blackout System 3 (Sub-plan 5): persist the raw signed
+                // body keyed by the broker order id so the apply cron can
+                // recover THIS order's intent (it finds a broker pending order,
+                // never a signed intent) and re-drive it on recovery. Only when
+                // we have the signed bytes in hand; TTL tracks the alert window
+                // (`not_after` + grace) so a never-cancelled order's body ages
+                // out with its EntryAttempt. Best-effort: a write failure only
+                // costs the blackout-restore ability for this one order, never
+                // the placement.
+                if let Some(body) = raw_body {
+                    let ttl = incoming::replay_ttl_seconds(verified.intent.not_after, now);
+                    if let Err(err) = store.put_order_body(&order_id, body, ttl).await {
+                        console_error!(
+                            "order-body store for blackout-restore failed (order={order_id}): {err} \
+                             — this order can't be blackout-cancelled+restored"
+                        );
+                    }
                 }
                 ActionResult::Ok(format!("entered: order={order_id}"))
             }
@@ -2654,6 +2689,28 @@ async fn write_session_meta(kv: &worker::kv::KvStore, account_name: &str) {
 /// Silent on absence — callers decide whether a miss is an error worth logging.
 pub(crate) fn get_secret(name: &str, env: &Env) -> Option<String> {
     env.secret(name).map(|value| value.to_string()).ok()
+}
+
+/// Read + parse the HMAC signing key the worker verifies incoming bodies with.
+/// Same secret the fetch path reads at `src/lib.rs` top of `fetch`; factored
+/// out so the spread-blackout crons can re-verify a stored signed body via
+/// [`incoming::parse_and_verify`] (the only constructor of a [`incoming::Verified`]).
+/// `None` (logged) when the secret is missing or not valid hex.
+pub(crate) fn signing_key(env: &Env) -> Option<Vec<u8>> {
+    let key_hex = match get_secret(SIGNING_KEY_SECRET, env) {
+        Some(s) => s,
+        None => {
+            console_error!("missing required secret: {SIGNING_KEY_SECRET}");
+            return None;
+        }
+    };
+    match sig::parse_key_hex(&key_hex) {
+        Ok(k) => Some(k.to_vec()),
+        Err(err) => {
+            console_error!("SIGNING_KEY is not valid hex: {err}");
+            None
+        }
+    }
 }
 
 /// Read a numeric secret, falling back to `default` if missing or unparsable.

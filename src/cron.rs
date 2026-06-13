@@ -16,6 +16,8 @@
 //!   (`blackout_watch`).
 
 mod blackout_apply;
+mod blackout_cancel;
+mod blackout_restore;
 mod blackout_watch;
 mod blackout_widen;
 mod constants;

@@ -1,5 +1,88 @@
 # TODO
 
+## Done — spread-blackout System 3: cancel resting orders, re-drive on recovery (v22)
+
+Sub-plan 5 (the **last**) of the DST-aware spread-blackout feature, and the
+one that fixes the motivating resting-stop-into-the-trough trade. Cancels
+resting **entry** orders during the blackout (Cron 1) and re-drives them via
+`run_enter` on recovery (Cron 2), routing overrun stops to the v17
+`on_too_close` fallback and dropping stale limits. Extends — does not
+duplicate — v21's Cron-1 widen / Cron-2 restore loops.
+
+### Steps
+- [x] `core/src/blackout_recreate.rs` (new): pure `recreate_stop` /
+      `recreate_limit` (FILL-SIDE bid/ask) + `restore_plan` branch decision.
+      19 unit tests (four-kind × true/false table, swapped entry/tp guard,
+      boundary equality, fill-side discrimination, full `restore_plan`
+      matrix). `pub mod blackout_recreate;`.
+- [x] Entry-path signed-body store: `run_enter` writes
+      `order:<broker_order_id>` (raw signed body, alert-window TTL) on every
+      successful single-shot placement; `KvStateStore::{put,get,delete}_order_body`
+      (inherent, off the `StateStore` trait — no in-memory/CLI ripple).
+      `run_enter`/`run_action` thread `raw_body`; `signing_key(env)` factored
+      out and reused by both crons.
+- [x] Cron 1 cancel (`src/cron/blackout_cancel.rs`, new): per affected
+      account, `list_pending_orders`; recover signed body by order id,
+      re-parse for trade_id+pip, spread-gate via `get_quote` (elevated only),
+      **store-before-cancel** crash-safe merge then `cancel_order`. Pure
+      `merge_cancelled_order` helper + 4 tests (fresh push, Sub-plan-4
+      `original_stops` coexistence, same-id de-dup, pip backfill). Wired
+      after the widen in `apply_if_ny_close_edge`.
+- [x] Cron 2 restore (`src/cron/blackout_restore.rs`, new): re-verify stored
+      body, `restore_plan` pre-check, **re-drive via `run_enter`** (sizing /
+      gates / `on_too_close` all apply); drop expired-window / stale-limit /
+      overrun-skip with a log; delete the order body after. Wired at BOTH the
+      recovery and backstop clear points, alongside the System-2 stop restore
+      (independent lists on one record — a trade may carry both).
+- [x] Seen-id / retry-slot reasoning: cron calls `run_enter` **directly**
+      (off the HTTP `is_seen` path) and never `mark_seen`s → no 409 on the
+      already-seen original id; single-shot re-drive consumes no
+      `max_retries` slot. Commented at the call site + module docs.
+- [x] README System 3 subsection (cancel/restore, fill-side geometry,
+      crash-safe ordering, re-drive≠multi-shot, new `order:` KV row,
+      precondition note, `cancelled_orders` visible in `status`); CHANGELOG
+      v22; this entry. core + worker + cli tests, clippy native+wasm, fmt;
+      native + wasm + cli build.
+
+### PRECONDITION — demo-confirm before enabling live cancel/restore (BLOCKING)
+- [ ] **Cancel + re-drive is UNVERIFIED live.** dry-run → demo → live, on
+      `reversals`. (1) place a resting stop-entry before the edge, force
+      Cron 1, confirm `status` shows the `cancelled_orders` entry + the body
+      stored (dry-run: no live cancel). (2) real demo cancel: confirm the
+      order is gone from `list_pending_orders` AND stored. (3) recovery with
+      price still on the entry side → re-placed (fresh pending) + `re-drive …
+      → Ok`. (4) recovery with price overran the trigger → routed to
+      `on_too_close` (market/skip) with the `stop overrun …` log. (5) stale
+      limit on the wrong side → `limit stale … dropped`, trade left with no
+      pending. Use `tradenation` MCP `get_candles` to confirm the live trough
+      hour. STOP if the cancel or re-drive misbehaves — don't improvise.
+- [ ] Reconcile the motivating resting-order case via `trading-tax-tracker`
+      `timeline`: should now show cancel-during-blackout → restore-after, not
+      fill-then-instant-stop.
+
+### Open questions (sub-plan 5 — carried, NOT resolved this sub-plan)
+1. **Multi-shot re-drive retry-slot.** A re-drive of a *multi-shot* cancelled
+   order can still consume a `max_retries` slot (it's the same intended
+   entry, not a re-entry — it should not count). Single-shot is unaffected
+   (skips the retry gate). Fix: a `restoring` flag threaded into
+   `run_enter`/`retry_gate::record_placement` to suppress the slot increment
+   for blackout restores. Deferred until multi-shot resting orders are
+   demo-exercised.
+2. **Re-drive vs already-passed gates.** The original entry already passed
+   prep/veto/cooldown/allow_entry. The re-drive re-runs them; a gate that now
+   fails (e.g. a `reversal` veto written meanwhile, an unrelated cooldown) is
+   treated as **real signal — don't restore** (chosen default: don't bypass).
+   Watch the `veto_on_reversal` self-collision risk if both are enabled on
+   the same setup.
+3. **Idempotent re-place if Cron 1's cancel silently failed.** Store-before-
+   cancel means a failed cancel leaves a live order + a stored record; the
+   re-drive could double it. Mitigated by the re-drive's own gates + the
+   broker's pending state; logged loudly. A truly idempotent re-place
+   (check-pending-first) is deferred.
+4. **`on_too_close: limit`** still degrades to `skip` (v17 carry-over). An
+   overrun stop whose fallback is `limit` skips-and-stays-retryable, which is
+   acceptable; implement `limit` when the v17 follow-up lands.
+
 ## Done — spread-blackout System 2: widen open stops, restore on recovery (v21)
 
 Sub-plan 4 of the DST-aware spread-blackout feature. Fills in the

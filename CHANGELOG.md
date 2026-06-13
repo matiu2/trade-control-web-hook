@@ -1,5 +1,77 @@
 # Changelog
 
+## v22 — 2026-06-13 — spread-blackout System 3: cancel resting entry orders on blackout, re-drive on recovery
+
+### Why
+
+Sub-plan 5 (the **last**) of the DST-aware spread-blackout feature, and the
+one that **actually fixes the motivating trade**: a resting stop-entry that
+sat through the post-NY-close liquidity trough filled into the spread
+blowout and stopped out instantly (~−1.38R, almost all spread). System 3
+cancels resting **entry** orders during the blackout and re-drives the exact
+same entry once the spread recovers — routing an overrun stop to the
+`on_too_close` fallback (v17) and dropping a stale limit. Builds on v17
+(`on_too_close`), v18 (`get_quote`/`list_pending_orders`/`cancel_order`),
+v19 (record + crons + reserved `cancelled_orders`), v21 (Cron 1 widen + Cron
+2 restore, which this extends rather than duplicates).
+
+### What changed (behaviour)
+
+- **Cron 1 (apply edge), `src/cron/blackout_cancel.rs` (new):** after the
+  System-2 widen, on the same affected-account scan, `list_pending_orders`
+  for each account; for each resting entry order whose **instrument spread is
+  elevated** (sampled via `get_quote`), store a `CancelledOrder` (id + whole
+  signed body) onto the per-trade `SpreadBlackoutRecord` **then**
+  `cancel_order` (store-before-cancel crash-safety). An order with no stored
+  signed body is **never cancelled** (can't be restored ⇒ don't strand it).
+- **Cron 2 (recovery), `src/cron/blackout_restore.rs` (new):** for each
+  `CancelledOrder`, reconstruct an authentic `Verified` from the stored
+  signed body via `incoming::parse_and_verify` (same signing key the HTTP
+  path uses), pre-check the fill-side recreate geometry, and **re-drive
+  through `run_enter`** so sizing/gates/`on_too_close` all apply. Runs at
+  both the recovery and backstop clear points, alongside the System-2 stop
+  restore, on the same record. Expired-window bodies are dropped, not placed.
+- **Recreate geometry (`core/src/blackout_recreate.rs`, new):** pure
+  `recreate_stop` / `recreate_limit` predicates (FILL-SIDE bid/ask, not mid)
+  + a `restore_plan` branch decision, fully truth-tabled.
+- **New entry-path KV write:** every successful single-shot placement now
+  writes an `order:<broker_order_id>` row holding the raw signed body, TTL'd
+  to the alert window. This is the only place the original signed bytes
+  survive long enough for the apply cron to recover them.
+
+### Breaking
+
+- `run_enter` gains a `raw_body: Option<&str>` parameter (HTTP path passes
+  the request body; the cron re-drive passes the stored body). `run_action`
+  gains `raw_body: &str`. `ActionResult` and `run_enter` are now
+  `pub(crate)` so the cron can re-drive. No wire-format change.
+
+### Config / secrets
+
+- No new secrets. The cron re-uses the existing `SIGNING_KEY` to re-verify
+  stored bodies (factored into `signing_key(env)`).
+
+### Tests
+
+- `core` (`blackout_recreate`): 19 unit tests — four-kind × recreate
+  true/false table, swapped entry/tp guard rows (the sign-bug canary),
+  boundary equality, fill-side discrimination (long reads ask / short reads
+  bid), and the full `restore_plan` branch matrix.
+- worker (`blackout_cancel`): 4 unit tests — pure record-merge (fresh +
+  existing-record push, Sub-plan-4 `original_stops` coexistence, same-id
+  de-dup on re-fire, pip backfill).
+- Native + wasm + cli all build; clippy clean on native and wasm; fmt clean.
+
+### Follow-up (still open)
+
+- **Demo-confirm** the cancel + re-drive on `reversals` before live (dry-run
+  → demo). Not yet exercised against a real broker.
+- **Multi-shot re-drive retry-slot:** a re-drive of a *multi-shot* cancelled
+  order can still consume a `max_retries` slot (single-shot is unaffected).
+  The fix is a `restoring` flag into `record_placement`; deferred.
+- `on_too_close: limit` still degrades to `skip` (v17 carry-over); an overrun
+  stop with `action: limit` skips-and-stays-retryable.
+
 ## v21 — 2026-06-13 — spread-blackout System 2: widen open stops on blackout, restore on recovery
 
 ### Why

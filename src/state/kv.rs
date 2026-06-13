@@ -117,6 +117,63 @@ impl KvStateStore {
         "spread-blackout:rec:"
     }
 
+    /// Per-order key holding the raw signed alert body that placed a broker
+    /// order, keyed by `broker_order_id`. Written on successful single-shot
+    /// placement (`run_enter`) and read by the spread-blackout apply cron,
+    /// which finds a broker *pending order* and needs the original signed
+    /// bytes to re-drive that entry on recovery via
+    /// `incoming::parse_and_verify`. TTL'd to the alert window + grace.
+    fn order_body_key(order_id: &str) -> String {
+        format!("order:{order_id}")
+    }
+
+    /// Persist the raw signed alert body for a placed order so the
+    /// spread-blackout apply cron can recover + re-drive it. `order_id` is
+    /// the broker order id [`crate::tradenation_adapter`] / OANDA returned.
+    /// Inherent (not on [`StateStore`]) because only the worker's entry path
+    /// and the blackout crons touch it — keeping it off the trait avoids
+    /// rippling into the in-memory test store + CLI.
+    pub async fn put_order_body(
+        &self,
+        order_id: &str,
+        signed_body: &str,
+        ttl_seconds: u64,
+    ) -> Result<(), StateError> {
+        let key = Self::order_body_key(order_id);
+        let ttl = ttl_seconds.max(MIN_TTL_SECONDS);
+        self.store
+            .put(&key, signed_body)
+            .map_err(|e| StateError::Backend(format!("put {key} builder: {e:?}")))?
+            .expiration_ttl(ttl)
+            .execute()
+            .await
+            .map_err(|e| StateError::Backend(format!("put {key} execute: {e:?}")))?;
+        Ok(())
+    }
+
+    /// Read the raw signed alert body for `order_id`, or `None` if absent /
+    /// TTL-expired (the order's alert window closed before any blackout, so
+    /// it can't and shouldn't be restored).
+    pub async fn get_order_body(&self, order_id: &str) -> Result<Option<String>, StateError> {
+        let key = Self::order_body_key(order_id);
+        self.store
+            .get(&key)
+            .text()
+            .await
+            .map_err(|e| StateError::Backend(format!("get {key}: {e:?}")))
+    }
+
+    /// Best-effort delete of an order-body row once it has been re-driven on
+    /// recovery (or the order is otherwise gone). A no-op if already expired.
+    pub async fn delete_order_body(&self, order_id: &str) -> Result<(), StateError> {
+        let key = Self::order_body_key(order_id);
+        self.store
+            .delete(&key)
+            .await
+            .map_err(|e| StateError::Backend(format!("delete {key}: {e:?}")))?;
+        Ok(())
+    }
+
     /// Prefix used to list every news window for a single `trade_id`.
     /// Trailing colon for the same reason as [`Self::pause_trade_prefix`].
     fn news_trade_prefix(trade_id: &str) -> String {

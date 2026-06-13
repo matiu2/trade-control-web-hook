@@ -72,11 +72,18 @@ async fn watch_one(
     // SAFETY RULE 2 — backstop timeout. Clear regardless of spread so a
     // stuck record never pins a trade forever.
     if backstop_due(record.opened_at, now) {
-        // System 2: restore widened stops to their remembered originals
-        // BEFORE clearing — a stranded record would otherwise re-detect
-        // forever. Restore runs even on the backstop branch (Sub-plan 5
-        // adds resting-order restore at this same point later).
+        // Restore BEFORE clearing — a stranded record would otherwise
+        // re-detect forever. Both restore halves run on the backstop branch:
+        //  - System 2 (Sub-plan 4): widened stops back to their remembered
+        //    originals.
+        //  - System 3 (Sub-plan 5): cancelled resting orders re-driven (or
+        //    dropped) via the entry path.
+        // They operate on independent lists of the SAME record
+        // (`original_stops` vs `cancelled_orders`), so they don't stomp each
+        // other; a trade may carry both (multi-shot: an open position whose
+        // stop was widened AND a resting re-entry order that was cancelled).
         restore_remembered_stops(env, record).await;
+        super::blackout_restore::restore_cancelled_orders(env, store, record, now).await;
         clear(store, record, "backstop").await?;
         console_log!(
             "blackout watch[{}]: backstop fired, cleared",
@@ -97,9 +104,12 @@ async fn watch_one(
     // only clear, rather than declaring recovery on a bogus pip division.
     let spread_pips = spread_in_pips(spread_abs, record.pip_size);
     if spread_recovered(spread_pips) {
-        // System 2: restore widened stops to their remembered originals
-        // before clearing (Sub-plan 5 adds resting-order restore here too).
+        // Restore both halves before clearing (see the backstop branch for the
+        // independence + coexistence note):
+        //  - System 2: widened stops → remembered originals.
+        //  - System 3: cancelled resting orders → re-driven via the entry path.
         restore_remembered_stops(env, record).await;
+        super::blackout_restore::restore_cancelled_orders(env, store, record, now).await;
         clear(store, record, "recovery").await?;
         console_log!(
             "blackout watch[{}]: spread {spread_pips}p recovered, cleared",

@@ -6,6 +6,7 @@
 //! (KV state store, `#[event(fetch)]` entry point, broker dispatch).
 
 pub mod account;
+pub mod blackout_recreate;
 pub mod broker;
 pub mod incoming;
 pub mod intent;

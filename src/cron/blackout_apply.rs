@@ -52,7 +52,12 @@ pub async fn apply_if_ny_close_edge(env: &Env, now: DateTime<Utc>) {
 
     // System 2 — widen open stops away from price.
     widen_open_stops(env, &store, now).await;
-    // Sub-plan 5 inserts list_pending_orders → cancel → store-intent here.
+    // System 3 — cancel resting entry orders on elevated-spread instruments
+    // and store their signed intent for the recovery watcher to re-drive.
+    // Runs on the SAME affected-account set as the widen; the two share one
+    // `SpreadBlackoutRecord` per trade (widened stops in `original_stops`,
+    // cancelled orders in `cancelled_orders`) and the watcher restores both.
+    super::blackout_cancel::cancel_resting_orders(env, now).await;
 }
 
 /// List open positions per affected account, join each to its originating
