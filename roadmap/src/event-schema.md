@@ -52,14 +52,19 @@ Both consumers independently said the natural unit is the **position/setup**, no
 the fire — one setup spawns N fires (multi-shot, degraded refill, reversal). So
 `trade_id` alone is insufficient.
 
-| key | scope | role |
-|---|---|---|
-| `correlation_id` | one setup / position | aggregate-by key (journal entry) |
-| `intent_id` | one fire (one alert firing) | the fire key |
-| `request_id` | one worker invocation | causal chain within a fire (worker already emits this, e.g. `a0a6a1fd99750ba9`) |
-| `seq` | monotonic within a request | **intra-fire ordering** — wall-clock can't (events share a second; the post-close tail races) |
-| `fire_seq` | monotonic per `correlation_id` | which fire (fire 1 placed; fires 2–N were 409 no-ops) — a fact, not inferred from spacing |
-| `ts` | UTC RFC3339 + offset | cross-fire / cross-stage ordering; never localize at emit |
+> **Naming corrected from the real code** (see
+> [Phase 0 notes](./phase0-implementation-notes.md)): the intent already carries
+> `id` and `trade_id`. Adopt those as the canonical event keys rather than
+> inventing new names. `request_id` does **not** exist yet — it's new work.
+
+| key | maps to real field | scope | role |
+|---|---|---|---|
+| `correlation_id` | `trade_id` (**`Option`** — absent on control actions) | one setup / position | aggregate-by key (journal entry) |
+| `intent_id` | `id` (always present) | one fire (one alert firing) | the fire key |
+| `request_id` | **new — mint at `fetch` entry** | one worker invocation | causal chain within a fire |
+| `seq` | **new — per-request counter** | monotonic within a request | **intra-fire ordering** — wall-clock can't (events share a second; the post-close tail races) |
+| `fire_seq` | derivable (`entry_attempt:` count + `seen-retry:`) | monotonic per `trade_id` | which fire (fire 1 placed; fires 2–N were 409 no-ops) — a fact, not inferred from spacing |
+| `ts` | — | UTC RFC3339 + offset | cross-fire / cross-stage ordering; never localize at emit |
 
 Optional `parent_event_id` makes causality explicit (`BrokerCall` → its
 `GateDecision`; `BrokerResponse` → its `BrokerCall`) instead of inferred from
@@ -70,10 +75,10 @@ adjacency.
 | variant | carries | why it matters for debugging |
 |---|---|---|
 | `AlertReceived` | raw signed body, headers, source | the input to replay |
-| `GateDecision` | gate name, passed/rejected, **reason code** | why an action was/wasn't taken |
+| `GateDecision` | gate name, passed/rejected, **reason code**, **`VetoLevel`** (veto gates) | why an action was/wasn't taken; the `level` lets a veto-driven close be traced (trade 046) |
 | `KvTransition` | key, `from_state`, `to_state`, **`success: bool`, `error`** | **the highest-value debug record** — surfaces intent that *didn't* execute (Bug #6: wanted to cancel, couldn't) |
 | `BrokerCall` | method, args, `parent_event_id` | what we asked the broker |
-| `BrokerResponse` | fill price / order id / error | what the broker said (incl. the 502 path) |
+| `BrokerResponse` | fill price / order id / **most-specific error variant** | what the broker said (incl. the 502 path) |
 | `OrderPlaced` | `broker_order_id` at the moment known | load-bearing join key |
 | `PositionClosed` | `broker_position_id`, `exit_type`, exit price/time | what actually happened, even on a stop-out the worker didn't initiate |
 | `OutcomeRecorded` | decoded outcome (Ok / Failed / Rejected) + `status_code` | the dispatcher result |
@@ -90,6 +95,16 @@ Two emphases both consumers stressed:
   event is the source of truth and the broker row is a cross-check. Emit it
   **even for worker-uninitiated stop-outs** — those swallowed-cancel stop-outs
   are exactly the cases that are otherwise unreconstructable.
+
+> **Error fidelity is a recordability prerequisite** (the `#19-10` lesson from
+> the [recordability audit](./recordability-audit.md)). Recording makes
+> *observed* facts queryable; it **cannot** reconstruct detail the broker adapter
+> threw away. The `#19-10` "too close" rejection is invisible in logs today
+> because `map_place_error` flattens it to generic `OrderRejected` *before* the
+> worker sees it — so `BrokerResponse` would faithfully record the wrong, generic
+> thing. `BrokerResponse.error` must carry the **most specific** broker error
+> variant, and the adapter must stop flattening errors. Error-fidelity work and
+> recording work are the same project.
 
 ### Phase 0 acceptance
 
@@ -140,9 +155,23 @@ it's captured by its own producer, not bolted onto the wire format.
 
 ## Open questions
 
-- Does `correlation_id` exist for **control actions** (prep/veto/pause), or only
-  entry-bearing paths? They may need a synthetic id.
-- Where is `GateDecision` emitted — the pure helper or the worker wrapper?
-  (Prefer: helper returns the decision, worker emits the event.)
+Most of the original open questions are now **answered** in the
+[Phase 0 notes](./phase0-implementation-notes.md):
+
+- ~~Does `correlation_id` exist for control actions?~~ **Answered: no, by
+  design.** `trade_id` is absent on `Prep`/`ClearPrep`/`Invalidate`/`Status`/
+  `Unlock`/`PrepExpire`. So `correlation_id` is `Option`; control-action events
+  correlate by `(account, instrument)` + `id`.
+- ~~Where is `GateDecision` emitted?~~ **Answered:** the pure gates
+  (`allow_entry`/`allow_close`/`candle`/`too_close`/`spread_blackout`) already
+  return an outcome value — record it. The I/O gates (`cooldown`/`veto`/`prep`/
+  `retry`) emit at the call site from the observed result.
+- ~~Does `request_id` already exist?~~ **Answered: no.** Must be minted at the
+  `fetch` entry point — small new work.
+
+Still open:
+
 - Snapshot *all* touched KV per request, or only keys the request reads/writes?
-  (Touched-only is cheaper and sufficient if reads are recorded too.)
+  (Touched-only is cheaper and sufficient if reads are recorded too. The
+  `index:*` advisory lists must be included either way — see
+  [seams](./seams.md).)
