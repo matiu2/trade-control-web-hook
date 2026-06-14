@@ -1,4 +1,9 @@
-name = "trade-control-web-hook"
+# === STAGING environment ===
+# This branch (`staging`) deploys an isolated worker: its own name, KV
+# namespace, and R2 bucket, separate from prod. Promotion to prod happens
+# by merging a green-for-a-week staging into the `prod` branch (which
+# carries its own prod-pointed wrangler.toml). See DEPLOYED.md.
+name = "trade-control-web-hook-staging"
 main = "build/worker/shim.mjs"
 compatibility_date = "2026-03-13"
 workers_dev = true
@@ -11,22 +16,20 @@ enabled = true
 
 [vars]
 
-# Bind a KV namespace named TRADE_CONTROL_KV before deploying. Create with:
-#   wrangler kv:namespace create TRADE_CONTROL_KV
-# and replace the id below with the one wrangler prints.
+# STAGING KV namespace — distinct from dev/prod so state never collides.
+# Create it and paste the printed id here (replace REPLACE_ME):
+#   wrangler kv namespace create TRADE_CONTROL_KV_STAGING
 [[kv_namespaces]]
 binding = "TRADE_CONTROL_KV"
-id = "e4f27179248e451daf8cf68a98c47e5b"
+id = "REPLACE_ME_STAGING_KV_ID"
 
-# R2 bucket for per-request recording (body + headers + response + logs).
-# The worker writes one JSON object per intent request here; if this
-# binding is absent the worker logs one line and skips recording (fail-soft
-# — trading is unaffected). Create the bucket with:
-#   wrangler r2 bucket create trade-control-recording
-# The deploying API token needs "Workers R2 Storage: Edit".
+# STAGING R2 bucket for per-request recording. Create with:
+#   wrangler r2 bucket create trade-control-recording-staging
+# The deploying API token needs "Workers R2 Storage: Edit". Absent
+# binding is fail-soft (worker logs one line, skips recording).
 [[r2_buckets]]
 binding = "TRADE_CONTROL_R2"
-bucket_name = "trade-control-recording"
+bucket_name = "trade-control-recording-staging"
 
 # Scheduled (cron) trigger. Fires the `scheduled` event in `src/cron.rs`
 # which sweeps pending broker orders for expiry + SL-breach.
