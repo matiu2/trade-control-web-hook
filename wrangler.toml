@@ -18,6 +18,16 @@ enabled = true
 binding = "TRADE_CONTROL_KV"
 id = "e4f27179248e451daf8cf68a98c47e5b"
 
+# R2 bucket for per-request recording (body + headers + response + logs).
+# The worker writes one JSON object per intent request here; if this
+# binding is absent the worker logs one line and skips recording (fail-soft
+# — trading is unaffected). Create the bucket with:
+#   wrangler r2 bucket create trade-control-recording
+# The deploying API token needs "Workers R2 Storage: Edit".
+[[r2_buckets]]
+binding = "TRADE_CONTROL_R2"
+bucket_name = "trade-control-recording"
+
 # Scheduled (cron) trigger. Fires the `scheduled` event in `src/cron.rs`
 # which sweeps pending broker orders for expiry + SL-breach.
 #
