@@ -7,8 +7,6 @@
 
 use chrono::{DateTime, Duration, Utc};
 use worker::Env;
-#[cfg(target_arch = "wasm32")]
-use worker::{console_error, console_log};
 
 /// Walk every TN account in the operator's metadata store; force a
 /// re-login for any whose cached session is older than `threshold`.
@@ -34,7 +32,7 @@ async fn refresh_stale_sessions_wasm(env: &Env, now: DateTime<Utc>, threshold: D
     let kv = match env.kv(crate::KV_NAMESPACE) {
         Ok(kv) => kv,
         Err(err) => {
-            console_error!("cron session_refresh: KV binding missing: {err:?}");
+            rlog_err!("cron session_refresh: KV binding missing: {err:?}");
             return;
         }
     };
@@ -42,7 +40,7 @@ async fn refresh_stale_sessions_wasm(env: &Env, now: DateTime<Utc>, threshold: D
     let accounts = match metadata.list().await {
         Ok(v) => v,
         Err(err) => {
-            console_error!("cron session_refresh: metadata list: {err}");
+            rlog_err!("cron session_refresh: metadata list: {err}");
             return;
         }
     };
@@ -51,7 +49,7 @@ async fn refresh_stale_sessions_wasm(env: &Env, now: DateTime<Utc>, threshold: D
         .into_iter()
         .filter(|m| m.broker == BrokerKind::TradeNation)
         .collect();
-    console_log!(
+    rlog!(
         "cron session_refresh: {} TN accounts to consider",
         tn_accounts.len()
     );
@@ -64,7 +62,7 @@ async fn refresh_stale_sessions_wasm(env: &Env, now: DateTime<Utc>, threshold: D
             {
                 Ok(m) => Some(m.cached_at),
                 Err(err) => {
-                    console_error!(
+                    rlog_err!(
                         "cron session_refresh[{name}]: parse session_meta: {err} — treating as stale"
                     );
                     None
@@ -72,7 +70,7 @@ async fn refresh_stale_sessions_wasm(env: &Env, now: DateTime<Utc>, threshold: D
             },
             Ok(None) => None,
             Err(err) => {
-                console_error!(
+                rlog_err!(
                     "cron session_refresh[{name}]: KV get session_meta: {err:?} — treating as stale"
                 );
                 None
@@ -84,13 +82,13 @@ async fn refresh_stale_sessions_wasm(env: &Env, now: DateTime<Utc>, threshold: D
             None => true,
         };
         if !stale {
-            console_log!("cron session_refresh[{name}]: fresh");
+            rlog!("cron session_refresh[{name}]: fresh");
             continue;
         }
 
         match crate::acquire_tn_broker(env, Some(name)).await {
-            Some(_) => console_log!("cron session_refresh[{name}]: refreshed"),
-            None => console_error!("cron session_refresh[{name}]: error (see prior logs)"),
+            Some(_) => rlog!("cron session_refresh[{name}]: refreshed"),
+            None => rlog_err!("cron session_refresh[{name}]: error (see prior logs)"),
         }
     }
 }

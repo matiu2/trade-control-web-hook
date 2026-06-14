@@ -274,20 +274,10 @@ fn decode_index<T: for<'de> serde::Deserialize<'de>>(
     Ok(out)
 }
 
-/// Native-safe warning for a dropped index element. Mirrors the
-/// `log_skip` shim in `src/lib.rs`: `worker::console_log!` panics off-wasm
-/// (it calls into `web_sys`), so emit via `tracing::warn!` under `cargo test`
-/// and the real worker console on wasm.
+/// Warn about a dropped index element. `rlog_err!` is native-safe and
+/// buffers the line into the per-request R2 record.
 fn warn_dropped_index_element(key: &str, idx: usize, err: &serde_json::Error) {
-    #[cfg(target_arch = "wasm32")]
-    worker::console_log!(
-        "index decode: dropping bad element key={} idx={} err={}",
-        key,
-        idx,
-        err,
-    );
-    #[cfg(not(target_arch = "wasm32"))]
-    tracing::warn!("index decode: dropping bad element key={key} idx={idx} err={err}");
+    rlog_err!("index decode: dropping bad element key={key} idx={idx} err={err}");
 }
 
 /// Native-safe warning for a single prefix-listed KV value that won't
@@ -295,10 +285,7 @@ fn warn_dropped_index_element(key: &str, idx: usize, err: &serde_json::Error) {
 /// per-key listings (`pause:…`, `news:…`) store one object per key, so
 /// the key name itself identifies the dropped record — no array index.
 fn warn_dropped_keyed_value(key: &str, err: &serde_json::Error) {
-    #[cfg(target_arch = "wasm32")]
-    worker::console_log!("kv list decode: dropping bad value key={} err={}", key, err,);
-    #[cfg(not(target_arch = "wasm32"))]
-    tracing::warn!("kv list decode: dropping bad value key={key} err={err}");
+    rlog_err!("kv list decode: dropping bad value key={key} err={err}");
 }
 
 async fn write_index<T: serde::Serialize>(

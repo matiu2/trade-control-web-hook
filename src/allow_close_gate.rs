@@ -38,7 +38,7 @@ pub enum AllowCloseOutcome {
         /// Short label for the rejection-outcome telemetry string
         /// (`parse` / `eval` / `wrong-type`).
         kind: &'static str,
-        /// Display string for the worker's `console_error!` log.
+        /// Display string for the worker's `rlog_err!` log.
         message: String,
     },
 }

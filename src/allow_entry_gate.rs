@@ -40,7 +40,7 @@ pub enum AllowEntryOutcome {
         /// (`parse` / `eval` / `wrong-type`). Distinct from the inner
         /// error so the worker doesn't have to re-match.
         kind: &'static str,
-        /// Display string for the worker's `console_error!` log.
+        /// Display string for the worker's `rlog_err!` log.
         message: String,
     },
 }

@@ -1,3 +1,11 @@
+// `recording` is declared first and with `#[macro_use]` so the `rlog!` /
+// `rlog_err!` macros it defines are in scope for every module below
+// without a per-file `use`. These replace the worker's bare
+// `console_log!` / `console_error!` and additionally buffer each line
+// into the per-request R2 record.
+#[macro_use]
+mod recording;
+
 mod accounts;
 mod admin;
 mod adopt;
@@ -17,7 +25,7 @@ mod tracing_console;
 mod tradenation_adapter;
 
 use chrono::Utc;
-use worker::{Context, Env, Method, Request, Response, Result, console_error, console_log, event};
+use worker::{Context, Env, Method, Request, Response, Result, event};
 
 use crate::state::KvStateStore;
 use crate::tradenation_adapter::TradeNationAdapter;
@@ -94,11 +102,13 @@ fn body_excerpt(yaml: &str) -> String {
 }
 
 #[event(fetch)]
-pub async fn main(mut req: Request, env: Env, _ctx: Context) -> Result<Response> {
+pub async fn main(mut req: Request, env: Env, ctx: Context) -> Result<Response> {
     tracing_console::ConsoleSubscriber::install();
+    recording::begin();
 
     // Diagnostic routes — GET-only, gated by X-Diag-Key. Handled before
-    // we consume the body so the body parser doesn't apply.
+    // we consume the body so the body parser doesn't apply. Not recorded
+    // (read-only diagnostics, not trades).
     if req.method() == Method::Get {
         let path = req.path();
         return match path.as_str() {
@@ -111,132 +121,169 @@ pub async fn main(mut req: Request, env: Env, _ctx: Context) -> Result<Response>
 
     // Admin write routes — POST/DELETE, gated by X-Admin-Key. Handled
     // before the intent body parser because their bodies (JSON for
-    // POST) don't follow the signed-body shape.
+    // POST) don't follow the signed-body shape. Not recorded.
     let path = req.path();
     if path.starts_with("/admin/") {
         return route_admin(&mut req, &env, &path).await;
     }
 
+    // --- Intent path: capture inputs, dispatch, record to R2. ---
+    let method = req.method().to_string();
+    let headers: Vec<(String, String)> = req.headers().entries().collect();
     let yaml = req.text().await?;
+    let request_id = recording::mint_request_id(&yaml, &headers);
+    let received_ts = Utc::now().to_rfc3339();
+    rlog!("request_id={request_id}");
 
-    let key = match signing_key(&env) {
-        Some(k) => k,
-        None => return Response::error("server misconfigured", 500),
-    };
+    // Dispatch the intent. All inner `return`s land in `resp` so we can
+    // record the outcome on every path. `'intent` lets the existing
+    // early-returns become `break`s with minimal churn.
+    let resp: Result<Response> = 'intent: {
+        let key = match signing_key(&env) {
+            Some(k) => k,
+            None => break 'intent Response::error("server misconfigured", 500),
+        };
 
-    let now = Utc::now();
-    let verified = match parse_and_verify(&yaml, &key, now) {
-        Ok(v) => v,
-        Err(err) => {
-            console_error!(
-                "incoming rejected: {err} | body_len={} body_excerpt={:?}",
-                yaml.len(),
-                body_excerpt(&yaml)
-            );
-            return Response::error("rejected", 400);
-        }
-    };
-
-    let store = match env.kv(KV_NAMESPACE) {
-        Ok(kv) => KvStateStore::new(kv),
-        Err(err) => {
-            console_error!("missing KV namespace {KV_NAMESPACE}: {err:?}");
-            return Response::error("server misconfigured", 500);
-        }
-    };
-
-    // Replay protection.
-    match store.is_seen(&verified.intent.id).await {
-        // A seen id normally 409s here. Exception: a multi-shot `enter`
-        // re-fires the *same* baked-in intent id on every signal bar, so
-        // 409ing it here would block every legitimate re-entry after the
-        // first fill closed. Fall through and let `run_enter` →
-        // `retry_gate::evaluate` be the replay authority — it dedups true
-        // same-bar re-fires on `shell.time` and rejects 412 when a prior
-        // attempt is still open. See `is_multishot_enter`.
-        Ok(true) if is_multishot_enter(&verified.intent) => {
-            console_log!(
-                "seen multi-shot enter id={} — deferring replay decision to retry gate",
-                verified.intent.id
-            );
-        }
-        Ok(true) => return Response::error("replay", 409),
-        Ok(false) => {}
-        Err(err) => {
-            console_error!("KV is_seen: {err}");
-            return Response::error("state error", 500);
-        }
-    }
-
-    // Control actions don't touch the broker; handle them up front so we
-    // don't waste a broker login on them. The exception is a `veto` with
-    // `level` above `stop-next-entry` — those cancel pending orders or
-    // close positions, which need broker auth, so they fall through to
-    // the broker dispatch below.
-    match verified.intent.action {
-        Action::Status => return handle_status(&store, &verified, now).await,
-        Action::Unlock => return handle_unlock(&store, &verified, now).await,
-        Action::Prep => return handle_prep(&store, &verified, now).await,
-        Action::PrepExpire => return handle_prep_expire(&store, &verified, now).await,
-        Action::Veto => {
-            if matches!(
-                verified.intent.level.unwrap_or_default(),
-                VetoLevel::StopNextEntry
-            ) {
-                return handle_veto(&store, &verified, now).await;
+        let now = Utc::now();
+        let verified = match parse_and_verify(&yaml, &key, now) {
+            Ok(v) => v,
+            Err(err) => {
+                rlog_err!(
+                    "incoming rejected: {err} | body_len={} body_excerpt={:?}",
+                    yaml.len(),
+                    body_excerpt(&yaml)
+                );
+                break 'intent Response::error("rejected", 400);
             }
-            // Higher-level vetos need the broker; fall through.
-        }
-        Action::ClearPrep => return handle_clear_prep(&store, &verified, now).await,
-        Action::ClearVeto => return handle_clear_veto(&store, &verified, now).await,
-        Action::Pause => return handle_pause(&store, &verified, now).await,
-        Action::Resume => return handle_resume(&store, &verified, now).await,
-        Action::NewsStart => return handle_news_start(&store, &verified, now).await,
-        Action::NewsEnd => return handle_news_end(&store, &verified, now).await,
-        _ => {}
-    }
+        };
 
-    // Broker dispatch.
-    let result = match verified.intent.broker {
-        BrokerKind::Oanda => {
-            match acquire_oanda_broker(&env, verified.intent.account.as_deref()).await {
-                Some(broker) => run_action(&broker, &store, &verified, &env, now, &yaml).await,
-                None => return Response::error("oanda login failed", 500),
+        let store = match env.kv(KV_NAMESPACE) {
+            Ok(kv) => KvStateStore::new(kv),
+            Err(err) => {
+                rlog_err!("missing KV namespace {KV_NAMESPACE}: {err:?}");
+                break 'intent Response::error("server misconfigured", 500);
+            }
+        };
+
+        // Replay protection.
+        match store.is_seen(&verified.intent.id).await {
+            // A seen id normally 409s here. Exception: a multi-shot `enter`
+            // re-fires the *same* baked-in intent id on every signal bar, so
+            // 409ing it here would block every legitimate re-entry after the
+            // first fill closed. Fall through and let `run_enter` →
+            // `retry_gate::evaluate` be the replay authority — it dedups true
+            // same-bar re-fires on `shell.time` and rejects 412 when a prior
+            // attempt is still open. See `is_multishot_enter`.
+            Ok(true) if is_multishot_enter(&verified.intent) => {
+                rlog!(
+                    "seen multi-shot enter id={} — deferring replay decision to retry gate",
+                    verified.intent.id
+                );
+            }
+            Ok(true) => break 'intent Response::error("replay", 409),
+            Ok(false) => {}
+            Err(err) => {
+                rlog_err!("KV is_seen: {err}");
+                break 'intent Response::error("state error", 500);
             }
         }
-        BrokerKind::TradeNation => {
-            match acquire_tn_broker(&env, verified.intent.account.as_deref()).await {
-                Some(broker) => {
-                    let adapter = TradeNationAdapter(broker);
-                    run_action(&adapter, &store, &verified, &env, now, &yaml).await
+
+        // Control actions don't touch the broker; handle them up front so we
+        // don't waste a broker login on them. The exception is a `veto` with
+        // `level` above `stop-next-entry` — those cancel pending orders or
+        // close positions, which need broker auth, so they fall through to
+        // the broker dispatch below.
+        match verified.intent.action {
+            Action::Status => break 'intent handle_status(&store, &verified, now).await,
+            Action::Unlock => break 'intent handle_unlock(&store, &verified, now).await,
+            Action::Prep => break 'intent handle_prep(&store, &verified, now).await,
+            Action::PrepExpire => break 'intent handle_prep_expire(&store, &verified, now).await,
+            Action::Veto => {
+                if matches!(
+                    verified.intent.level.unwrap_or_default(),
+                    VetoLevel::StopNextEntry
+                ) {
+                    break 'intent handle_veto(&store, &verified, now).await;
                 }
-                None => {
-                    return Response::error(
-                        "tradenation login failed (missing account, bad credentials, or expired \
+                // Higher-level vetos need the broker; fall through.
+            }
+            Action::ClearPrep => break 'intent handle_clear_prep(&store, &verified, now).await,
+            Action::ClearVeto => break 'intent handle_clear_veto(&store, &verified, now).await,
+            Action::Pause => break 'intent handle_pause(&store, &verified, now).await,
+            Action::Resume => break 'intent handle_resume(&store, &verified, now).await,
+            Action::NewsStart => break 'intent handle_news_start(&store, &verified, now).await,
+            Action::NewsEnd => break 'intent handle_news_end(&store, &verified, now).await,
+            _ => {}
+        }
+
+        // Broker dispatch.
+        let result = match verified.intent.broker {
+            BrokerKind::Oanda => {
+                match acquire_oanda_broker(&env, verified.intent.account.as_deref()).await {
+                    Some(broker) => run_action(&broker, &store, &verified, &env, now, &yaml).await,
+                    None => break 'intent Response::error("oanda login failed", 500),
+                }
+            }
+            BrokerKind::TradeNation => {
+                match acquire_tn_broker(&env, verified.intent.account.as_deref()).await {
+                    Some(broker) => {
+                        let adapter = TradeNationAdapter(broker);
+                        run_action(&adapter, &store, &verified, &env, now, &yaml).await
+                    }
+                    None => {
+                        break 'intent Response::error(
+                            "tradenation login failed (missing account, bad credentials, or expired \
                          session — check worker logs)",
-                        503,
-                    );
+                            503,
+                        );
+                    }
                 }
             }
+        };
+
+        // Every dispatch path records a seen entry — success, broker failure,
+        // or pre-broker rejection — so the operator can read back what
+        // happened to this id from the `status` snapshot.
+        record_dispatcher_outcome(&store, &verified, now, &result).await;
+        match result {
+            ActionResult::Ok(_) => Response::ok("ok"),
+            ActionResult::Failed(_) => Response::error("action failed", 502),
+            ActionResult::Rejected { response, .. } => response,
         }
     };
 
-    // Every dispatch path records a seen entry — success, broker failure,
-    // or pre-broker rejection — so the operator can read back what
-    // happened to this id from the `status` snapshot.
-    record_dispatcher_outcome(&store, &verified, now, &result).await;
-    match result {
-        ActionResult::Ok(_) => Response::ok("ok"),
-        ActionResult::Failed(_) => Response::error("action failed", 502),
-        ActionResult::Rejected { response, .. } => response,
-    }
+    // Record the request to R2 (fail-soft, async). On a transport error
+    // there's nothing useful to record.
+    let (status, outcome) = match &resp {
+        Ok(r) => (r.status_code(), format!("status {}", r.status_code())),
+        Err(_) => (0, "transport-error".to_string()),
+    };
+    let (intent_id, trade_id) = recording::ids_from_body(&yaml);
+    recording::record_to_r2(
+        &env,
+        &ctx,
+        recording::RequestRecord {
+            ts: received_ts,
+            request_id,
+            method,
+            path,
+            headers,
+            body: yaml,
+            intent_id,
+            trade_id,
+            status,
+            outcome,
+            logs: recording::take_logs(),
+        },
+    );
+    resp
 }
 
 /// Record the dispatcher's outcome on the seen-by-id index.
 ///
 /// **Only `Ok` writes.** `Failed` (502 from a broker call) and
 /// `Rejected` (any gate or pre-broker reason) are logged via
-/// `console_log!` for post-mortem visibility but deliberately do not
+/// `rlog!` for post-mortem visibility but deliberately do not
 /// consume the intent id. The next fire of the same alert is allowed
 /// through.
 ///
@@ -284,7 +331,7 @@ async fn record_dispatcher_outcome<S: StateStore>(
                 )
                 .await
             {
-                console_error!("KV mark_seen after action: {err}");
+                rlog_err!("KV mark_seen after action: {err}");
             }
         }
         SeenDecision::Skip { kind, outcome } => {
@@ -293,21 +340,11 @@ async fn record_dispatcher_outcome<S: StateStore>(
     }
 }
 
-/// Native-safe logging shim. `worker::console_log!` calls into
-/// `web_sys::console::log_1`, which panics on non-wasm builds and
-/// breaks `cargo test` for this helper. On wasm we emit to the real
-/// worker console; off-wasm we emit via `tracing` so the tests for
-/// this module stay runnable.
+/// Log a skipped (non-`Ok`) dispatcher outcome. `rlog!` is native-safe
+/// (off-wasm it routes through `tracing`) and buffers the line into the
+/// per-request R2 record.
 fn log_skip(kind: &str, id: &str, outcome: &str) {
-    #[cfg(target_arch = "wasm32")]
-    worker::console_log!(
-        "entry-path {} (no mark_seen): id={} outcome={}",
-        kind,
-        id,
-        outcome,
-    );
-    #[cfg(not(target_arch = "wasm32"))]
-    tracing::info!("entry-path {kind} (no mark_seen): id={id} outcome={outcome}");
+    rlog!("entry-path {kind} (no mark_seen): id={id} outcome={outcome}");
 }
 
 /// True when this intent is a multi-shot `enter` — an `enter` that
@@ -404,7 +441,7 @@ async fn route_admin(req: &mut Request, env: &Env, path: &str) -> Result<Respons
 ///
 /// Only [`ActionResult::Ok`] lands in the seen-by-id index — see
 /// [`record_dispatcher_outcome`] for why. `Failed` and `Rejected`
-/// outcomes are logged via `console_log!` for post-mortem visibility
+/// outcomes are logged via `rlog!` for post-mortem visibility
 /// but do not consume the intent id.
 pub(crate) enum ActionResult {
     /// Action completed successfully. The outcome (e.g. `"entered"`)
@@ -474,7 +511,7 @@ async fn run_action<B: Broker>(
                 .set_cooldown(account, &verified.intent.instrument, hours, now)
                 .await
             {
-                console_error!("KV set_cooldown: {err}");
+                rlog_err!("KV set_cooldown: {err}");
                 return ActionResult::Rejected {
                     response: Response::error("state error", 500),
                     outcome: "rejected: state-error".into(),
@@ -483,7 +520,7 @@ async fn run_action<B: Broker>(
             let cancelled = broker
                 .cancel_pending_for_instrument(&verified.intent.instrument)
                 .await;
-            console_log!(
+            rlog!(
                 "invalidate instrument={} account={} cooldown={}h cancelled={} pending",
                 verified.intent.instrument,
                 account.unwrap_or("<global>"),
@@ -567,14 +604,14 @@ async fn run_close<B: Broker>(
                         None => w.news_id.clone(),
                     })
                     .collect();
-                console_log!(
+                rlog!(
                     "close news-window gate passed: trade {tid} active=[{}]",
                     names.join(", ")
                 );
                 GateOutcome::Passed
             }
             Err(err) => {
-                console_error!("KV list_news_windows_for_trade: {err}");
+                rlog_err!("KV list_news_windows_for_trade: {err}");
                 return ActionResult::Rejected {
                     response: Response::error("state error", 500),
                     outcome: "rejected: state-error".into(),
@@ -604,14 +641,14 @@ async fn run_close<B: Broker>(
         Some(ranges) => match broker.get_current_price(&verified.intent.instrument).await {
             Ok(price) => match price_band_hit(price, ranges) {
                 Some([lo, hi]) => {
-                    console_log!(
+                    rlog!(
                         "close price-range gate passed: {} price={price} in [{lo}, {hi}]",
                         verified.intent.instrument
                     );
                     GateOutcome::Passed
                 }
                 None => {
-                    console_log!(
+                    rlog!(
                         "close price-range gate failed: {} price={price} outside all bands {ranges:?}",
                         verified.intent.instrument
                     );
@@ -619,7 +656,7 @@ async fn run_close<B: Broker>(
                 }
             },
             Err(err) => {
-                console_error!(
+                rlog_err!(
                     "broker get_current_price for {}: {err:?}",
                     verified.intent.instrument
                 );
@@ -645,7 +682,7 @@ async fn run_close<B: Broker>(
     match allow_close_gate::evaluate(&verified.intent, &verified.shell) {
         allow_close_gate::AllowCloseOutcome::Proceed => {}
         allow_close_gate::AllowCloseOutcome::Blocked => {
-            console_log!(
+            rlog!(
                 "close rejected: allow_close returned false (id={})",
                 verified.intent.id
             );
@@ -655,7 +692,7 @@ async fn run_close<B: Broker>(
             };
         }
         allow_close_gate::AllowCloseOutcome::NeedsGoldenUnmet => {
-            console_log!(
+            rlog!(
                 "close rejected: needs_golden set but shell.golden != Some(true) (id={})",
                 verified.intent.id
             );
@@ -665,7 +702,7 @@ async fn run_close<B: Broker>(
             };
         }
         allow_close_gate::AllowCloseOutcome::NeedsConfirmedUnmet => {
-            console_log!(
+            rlog!(
                 "close rejected: needs_confirmed set but shell.signal_confirmed != Some(true) (id={})",
                 verified.intent.id
             );
@@ -675,7 +712,7 @@ async fn run_close<B: Broker>(
             };
         }
         allow_close_gate::AllowCloseOutcome::ScriptError { kind, message } => {
-            console_error!(
+            rlog_err!(
                 "allow_close script error (id={}): {message}",
                 verified.intent.id
             );
@@ -747,7 +784,7 @@ async fn write_reversal_veto(
     now: chrono::DateTime<chrono::Utc>,
 ) {
     let Some(plan) = reversal_veto_plan(&verified.intent, now) else {
-        console_log!(
+        rlog!(
             "veto_on_reversal set but close has no trade_id (id={}); skipping reversal veto",
             verified.intent.id
         );
@@ -763,10 +800,10 @@ async fn write_reversal_veto(
         )
         .await
     {
-        console_error!("KV set_veto (reversal): {err}");
+        rlog_err!("KV set_veto (reversal): {err}");
         return;
     }
-    console_log!(
+    rlog!(
         "reversal veto set: instrument={} account={} trade_id={} name={REVERSAL_VETO_NAME} ttl={}s",
         plan.instrument,
         plan.account.unwrap_or("<global>"),
@@ -1054,7 +1091,7 @@ pub(crate) async fn run_enter<B: Broker>(
                         None => p.blackout_id.clone(),
                     })
                     .collect();
-                console_log!(
+                rlog!(
                     "entry rejected: trade {tid} paused (active blackouts: {})",
                     blackouts.join(", ")
                 );
@@ -1065,7 +1102,7 @@ pub(crate) async fn run_enter<B: Broker>(
             }
             Ok(_) => {}
             Err(err) => {
-                console_error!("KV list_pauses_for_trade: {err}");
+                rlog_err!("KV list_pauses_for_trade: {err}");
                 return ActionResult::Rejected {
                     response: Response::error("state error", 500),
                     outcome: "rejected: state-error".into(),
@@ -1118,7 +1155,7 @@ pub(crate) async fn run_enter<B: Broker>(
         .await
     {
         Ok(true) => {
-            console_log!(
+            rlog!(
                 "entry rejected: {} cooled down (id={})",
                 verified.intent.instrument,
                 verified.intent.id
@@ -1130,7 +1167,7 @@ pub(crate) async fn run_enter<B: Broker>(
         }
         Ok(false) => {}
         Err(err) => {
-            console_error!("KV is_cooled_down: {err}");
+            rlog_err!("KV is_cooled_down: {err}");
             return ActionResult::Rejected {
                 response: Response::error("state error", 500),
                 outcome: "rejected: state-error".into(),
@@ -1155,7 +1192,7 @@ pub(crate) async fn run_enter<B: Broker>(
                 if let Some(prev) = prev_ts
                     && set_at <= prev
                 {
-                    console_log!(
+                    rlog!(
                         "entry rejected: prep {} not after previous (id={})",
                         step,
                         verified.intent.id
@@ -1168,7 +1205,7 @@ pub(crate) async fn run_enter<B: Broker>(
                 prev_ts = Some(set_at);
             }
             Ok(None) => {
-                console_log!(
+                rlog!(
                     "entry rejected: missing prep {} (id={})",
                     step,
                     verified.intent.id
@@ -1179,7 +1216,7 @@ pub(crate) async fn run_enter<B: Broker>(
                 };
             }
             Err(err) => {
-                console_error!("KV get_prep: {err}");
+                rlog_err!("KV get_prep: {err}");
                 return ActionResult::Rejected {
                     response: Response::error("state error", 500),
                     outcome: "rejected: state-error".into(),
@@ -1197,7 +1234,7 @@ pub(crate) async fn run_enter<B: Broker>(
     // (2026-06-11 fix). `Intent::validate` guarantees `trade_id` is
     // present on `enter`; the guard here is defence-in-depth.
     let Some(trade_id) = verified.intent.trade_id.as_deref() else {
-        console_error!(
+        rlog_err!(
             "enter missing trade_id at veto gate (id={})",
             verified.intent.id
         );
@@ -1217,7 +1254,7 @@ pub(crate) async fn run_enter<B: Broker>(
             .await
         {
             Ok(true) => {
-                console_log!(
+                rlog!(
                     "entry rejected: veto {} active (id={})",
                     veto,
                     verified.intent.id
@@ -1229,7 +1266,7 @@ pub(crate) async fn run_enter<B: Broker>(
             }
             Ok(false) => {}
             Err(err) => {
-                console_error!("KV is_vetoed: {err}");
+                rlog_err!("KV is_vetoed: {err}");
                 return ActionResult::Rejected {
                     response: Response::error("state error", 500),
                     outcome: "rejected: state-error".into(),
@@ -1253,7 +1290,7 @@ pub(crate) async fn run_enter<B: Broker>(
     let resolved = match Resolved::from_intent(&verified.intent, &verified.shell, pip_size) {
         Ok(r) => r,
         Err(err) => {
-            console_error!("resolve: {err}");
+            rlog_err!("resolve: {err}");
             return ActionResult::Rejected {
                 response: Response::error("rejected", 400),
                 outcome: "rejected: resolve-failed".into(),
@@ -1269,7 +1306,7 @@ pub(crate) async fn run_enter<B: Broker>(
     match allow_entry_gate::evaluate(&verified.intent, &verified.shell, &resolved, pip_size) {
         allow_entry_gate::AllowEntryOutcome::Proceed => {}
         allow_entry_gate::AllowEntryOutcome::Blocked => {
-            console_log!(
+            rlog!(
                 "entry rejected: allow_entry returned false (id={})",
                 verified.intent.id
             );
@@ -1279,7 +1316,7 @@ pub(crate) async fn run_enter<B: Broker>(
             };
         }
         allow_entry_gate::AllowEntryOutcome::NeedsGoldenUnmet => {
-            console_log!(
+            rlog!(
                 "entry rejected: needs_golden set but shell.golden != Some(true) (id={})",
                 verified.intent.id
             );
@@ -1289,7 +1326,7 @@ pub(crate) async fn run_enter<B: Broker>(
             };
         }
         allow_entry_gate::AllowEntryOutcome::NeedsConfirmedUnmet => {
-            console_log!(
+            rlog!(
                 "entry rejected: needs_confirmed set but shell.signal_confirmed != Some(true) (id={})",
                 verified.intent.id
             );
@@ -1299,7 +1336,7 @@ pub(crate) async fn run_enter<B: Broker>(
             };
         }
         allow_entry_gate::AllowEntryOutcome::ScriptError { kind, message } => {
-            console_error!(
+            rlog_err!(
                 "allow_entry script error (id={}): {message}",
                 verified.intent.id
             );
@@ -1327,7 +1364,7 @@ pub(crate) async fn run_enter<B: Broker>(
             let n = match resolve_phase1_u32("expiry-bars", Some(tunable), &verified.shell, 0) {
                 Ok(n) => n,
                 Err(outcome) => {
-                    console_log!("entry rejected: {outcome} (id={})", verified.intent.id);
+                    rlog!("entry rejected: {outcome} (id={})", verified.intent.id);
                     return ActionResult::Rejected {
                         response: Response::error("entry blocked: expiry-bars script", 412),
                         outcome,
@@ -1341,7 +1378,7 @@ pub(crate) async fn run_enter<B: Broker>(
             ) {
                 Ok(ts) => Some(ts),
                 Err(err) => {
-                    console_log!(
+                    rlog!(
                         "entry rejected: expiry-bars out of range (id={}): {err}",
                         verified.intent.id
                     );
@@ -1375,7 +1412,7 @@ pub(crate) async fn run_enter<B: Broker>(
         // Fail open on a transient KV read error — a blackout-window read
         // hiccup must never block a legitimate entry.
         Err(err) => {
-            console_error!(
+            rlog_err!(
                 "spread-blackout: window read failed (id={}): {err} — failing open (allowing entry)",
                 verified.intent.id
             );
@@ -1392,7 +1429,7 @@ pub(crate) async fn run_enter<B: Broker>(
             // questions; flip this branch to reject if demo shows the
             // trough also degrades the quote endpoint.)
             Err(err) => {
-                console_error!(
+                rlog_err!(
                     "spread-blackout: get_quote failed for {} (id={}): {err:?} — failing open (allowing entry)",
                     resolved.instrument,
                     verified.intent.id
@@ -1402,7 +1439,7 @@ pub(crate) async fn run_enter<B: Broker>(
                 let spread_pips = quote.spread() / pip_size;
                 let threshold = spread_blackout::elevated_threshold_pips(&resolved.instrument);
                 if spread_blackout::spread_blackout_decision(true, spread_pips, threshold) {
-                    console_log!(
+                    rlog!(
                         "entry rejected: spread-blackout instrument={} spread={spread_pips:.1}p > {threshold:.1}p (id={})",
                         resolved.instrument,
                         verified.intent.id
@@ -1438,7 +1475,7 @@ pub(crate) async fn run_enter<B: Broker>(
         f64::NAN
     };
     let prefix = if resolved.dry_run { "DRY-RUN " } else { "" };
-    console_log!(
+    rlog!(
         "{prefix}entry id={} instrument={} direction={:?} entry={:?} sl={} tp={} risk={:?} r={:.3}",
         verified.intent.id,
         resolved.instrument,
@@ -1477,10 +1514,10 @@ pub(crate) async fn run_enter<B: Broker>(
     match placement {
         Ok(order_id) => {
             if resolved.dry_run {
-                console_log!("DRY-RUN entry id={} (not placed)", verified.intent.id);
+                rlog!("DRY-RUN entry id={} (not placed)", verified.intent.id);
                 ActionResult::Ok(format!("dry-run: id={}", verified.intent.id))
             } else {
-                console_log!("entry placed id={} order={}", verified.intent.id, order_id);
+                rlog!("entry placed id={} order={}", verified.intent.id, order_id);
                 if let Some(attempt_no) = retry_attempt_no {
                     retry_gate::record_placement(
                         store,
@@ -1508,7 +1545,7 @@ pub(crate) async fn run_enter<B: Broker>(
                 if let Some(body) = raw_body {
                     let ttl = incoming::replay_ttl_seconds(verified.intent.not_after, now);
                     if let Err(err) = store.put_order_body(&order_id, body, ttl).await {
-                        console_error!(
+                        rlog_err!(
                             "order-body store for blackout-restore failed (order={order_id}): {err} \
                              — this order can't be blackout-cancelled+restored"
                         );
@@ -1523,7 +1560,7 @@ pub(crate) async fn run_enter<B: Broker>(
             // so the next signal bar can retry. The too-close case gets
             // a distinct outcome string for log-grep observability.
             let outcome = too_close::outcome_for_entry_error(&err);
-            console_error!("entry failed: {err} ({outcome})");
+            rlog_err!("entry failed: {err} ({outcome})");
             ActionResult::Failed(outcome)
         }
     }
@@ -1563,7 +1600,7 @@ async fn place_entry_too_close_fallback<B: Broker>(
     let current_price = match broker.get_current_price(&resolved.instrument).await {
         Ok(p) => p,
         Err(err) => {
-            console_error!(
+            rlog_err!(
                 "too-close fallback: get_current_price({}) failed: {err} (id={intent_id})",
                 resolved.instrument
             );
@@ -1578,13 +1615,13 @@ async fn place_entry_too_close_fallback<B: Broker>(
         current_price,
     ) {
         too_close::TooClosePlan::Skip { reason } => {
-            console_log!(
+            rlog!(
                 "too-close fallback: not recovering (id={intent_id} reason={reason} trigger={trigger_price} price={current_price})"
             );
             Err(EntryError::EntryTooCloseToMarket)
         }
         too_close::TooClosePlan::Market { reference_price } => {
-            console_log!(
+            rlog!(
                 "too-close fallback: re-placing as MARKET (id={intent_id} trigger={trigger_price} price={reference_price})"
             );
             // Re-size against the actual fill reference: build a fresh
@@ -1606,7 +1643,7 @@ async fn place_entry_too_close_fallback<B: Broker>(
                 .await
             {
                 Ok(order_id) => {
-                    console_log!(
+                    rlog!(
                         "too-close fallback: market re-place succeeded (id={intent_id} order={order_id})"
                     );
                     Ok(order_id)
@@ -1616,9 +1653,7 @@ async fn place_entry_too_close_fallback<B: Broker>(
                     // original too-close identity so telemetry shows the
                     // recovery was attempted and failed, and the seen-id
                     // stays un-poisoned for the next bar.
-                    console_error!(
-                        "too-close fallback: market re-place failed: {err} (id={intent_id})"
-                    );
+                    rlog_err!("too-close fallback: market re-place failed: {err} (id={intent_id})");
                     Err(EntryError::EntryTooCloseToMarket)
                 }
             }
@@ -1646,14 +1681,14 @@ async fn handle_status(
     let snap = match store.snapshot().await {
         Ok(s) => s,
         Err(err) => {
-            console_error!("KV snapshot: {err}");
+            rlog_err!("KV snapshot: {err}");
             return Response::error("state error", 500);
         }
     };
     let body = match serde_yaml::to_string(&snap) {
         Ok(s) => s,
         Err(err) => {
-            console_error!("snapshot serialise: {err}");
+            rlog_err!("snapshot serialise: {err}");
             return Response::error("internal error", 500);
         }
     };
@@ -1682,7 +1717,7 @@ async fn record_seen<S: StateStore>(
         )
         .await
     {
-        console_error!("KV mark_seen ({outcome}): {err}");
+        rlog_err!("KV mark_seen ({outcome}): {err}");
     }
 }
 
@@ -1697,11 +1732,11 @@ async fn handle_unlock(
     let was = match store.clear_cooldown(account, instrument).await {
         Ok(b) => b,
         Err(err) => {
-            console_error!("KV clear_cooldown: {err}");
+            rlog_err!("KV clear_cooldown: {err}");
             return Response::error("state error", 500);
         }
     };
-    console_log!(
+    rlog!(
         "unlock instrument={instrument} account={} was_cooled_down={was}",
         account.unwrap_or("<global>")
     );
@@ -1711,7 +1746,7 @@ async fn handle_unlock(
     }) {
         Ok(s) => s,
         Err(err) => {
-            console_error!("unlock serialise: {err}");
+            rlog_err!("unlock serialise: {err}");
             return Response::error("internal error", 500);
         }
     };
@@ -1754,7 +1789,7 @@ async fn handle_prep(
         .await
     {
         Ok(true) => {
-            console_log!(
+            rlog!(
                 "prep rejected — expired: instrument={} account={} step={} trade_id={} \
                  (a {step}-expiry line already fired)",
                 verified.intent.instrument,
@@ -1766,7 +1801,7 @@ async fn handle_prep(
         }
         Ok(false) => {}
         Err(err) => {
-            console_error!("KV is_prep_blocked: {err}");
+            rlog_err!("KV is_prep_blocked: {err}");
             return Response::error("state error", 500);
         }
     }
@@ -1785,7 +1820,7 @@ async fn handle_prep(
     {
         Ok(c) => c,
         Err(err) => {
-            console_error!("KV clear_named_preps (in clears): {err}");
+            rlog_err!("KV clear_named_preps (in clears): {err}");
             Vec::new()
         }
     };
@@ -1800,10 +1835,10 @@ async fn handle_prep(
         )
         .await
     {
-        console_error!("KV set_prep: {err}");
+        rlog_err!("KV set_prep: {err}");
         return Response::error("state error", 500);
     }
-    console_log!(
+    rlog!(
         "prep set: instrument={} account={} step={} ttl={}h cleared={:?}",
         verified.intent.instrument,
         account.unwrap_or("<global>"),
@@ -1866,13 +1901,13 @@ async fn handle_prep_expire(
         .block_prep(account, &verified.intent.instrument, step, now, ttl_seconds)
         .await
     {
-        console_error!("KV block_prep: {err}");
+        rlog_err!("KV block_prep: {err}");
         return Response::error("state error", 500);
     }
     // Timeline log (step 1 of the prep-expire flow): an operator
     // reconstructing a trade later greps `prep-expire stored` to see
     // when the cutoff fired.
-    console_log!(
+    rlog!(
         "prep-expire stored: instrument={} account={} step={} ttl={}h trade_id={}",
         verified.intent.instrument,
         account.unwrap_or("<global>"),
@@ -1931,7 +1966,7 @@ async fn handle_veto(
     {
         Ok(c) => c,
         Err(err) => {
-            console_error!("KV clear_named_vetos (in clears): {err}");
+            rlog_err!("KV clear_named_vetos (in clears): {err}");
             Vec::new()
         }
     };
@@ -1945,10 +1980,10 @@ async fn handle_veto(
         )
         .await
     {
-        console_error!("KV set_veto: {err}");
+        rlog_err!("KV set_veto: {err}");
         return Response::error("state error", 500);
     }
-    console_log!(
+    rlog!(
         "veto set: instrument={} account={} name={} ttl={}h cleared={:?}",
         verified.intent.instrument,
         account.unwrap_or("<global>"),
@@ -2044,7 +2079,7 @@ async fn run_veto_with_broker<B: Broker>(
     {
         Ok(c) => c,
         Err(err) => {
-            console_error!("KV clear_named_vetos (in clears): {err}");
+            rlog_err!("KV clear_named_vetos (in clears): {err}");
             Vec::new()
         }
     };
@@ -2052,7 +2087,7 @@ async fn run_veto_with_broker<B: Broker>(
         .set_veto(account, trade_id, instrument, name, ttl_seconds)
         .await
     {
-        console_error!("KV set_veto: {err}");
+        rlog_err!("KV set_veto: {err}");
         return ActionResult::Rejected {
             response: Response::error("state error", 500),
             outcome: "rejected: state-error".into(),
@@ -2066,7 +2101,7 @@ async fn run_veto_with_broker<B: Broker>(
         VetoLevel::CancelPending | VetoLevel::StopNextEntry => true,
     };
 
-    console_log!(
+    rlog!(
         "veto set: instrument={} account={} name={} ttl={}h level={:?} cancelled={} closed_ok={} cleared={:?}",
         instrument,
         account.unwrap_or("<global>"),
@@ -2121,7 +2156,7 @@ async fn handle_clear_prep(
     {
         Ok(s) => s,
         Err(err) => {
-            console_error!("KV clear_prep: {err}");
+            rlog_err!("KV clear_prep: {err}");
             return Response::error("state error", 500);
         }
     };
@@ -2134,10 +2169,10 @@ async fn handle_clear_prep(
     {
         // Best-effort — the prep is gone, the operator can manually
         // delete the seen key via wrangler if needed.
-        console_error!("KV forget_seen({setter_id}): {err}");
+        rlog_err!("KV forget_seen({setter_id}): {err}");
     }
     let was = cleared_setter.is_some();
-    console_log!(
+    rlog!(
         "clear-prep instrument={} account={} step={} was_set={}",
         verified.intent.instrument,
         account.unwrap_or("<global>"),
@@ -2174,11 +2209,11 @@ async fn handle_clear_veto(
     {
         Ok(b) => b,
         Err(err) => {
-            console_error!("KV clear_veto: {err}");
+            rlog_err!("KV clear_veto: {err}");
             return Response::error("state error", 500);
         }
     };
-    console_log!(
+    rlog!(
         "clear-veto instrument={} account={} name={} was_set={}",
         verified.intent.instrument,
         account.unwrap_or("<global>"),
@@ -2221,10 +2256,10 @@ async fn handle_pause(
         .set_pause(trade_id, blackout_id, reason, now, ttl_seconds)
         .await
     {
-        console_error!("KV set_pause: {err}");
+        rlog_err!("KV set_pause: {err}");
         return Response::error("state error", 500);
     }
-    console_log!(
+    rlog!(
         "pause set: trade_id={trade_id} blackout_id={blackout_id} reason={:?}",
         reason
     );
@@ -2252,11 +2287,11 @@ async fn handle_resume(
     let was = match store.clear_pause(trade_id, blackout_id).await {
         Ok(b) => b,
         Err(err) => {
-            console_error!("KV clear_pause: {err}");
+            rlog_err!("KV clear_pause: {err}");
             return Response::error("state error", 500);
         }
     };
-    console_log!("resume: trade_id={trade_id} blackout_id={blackout_id} was_set={was}");
+    rlog!("resume: trade_id={trade_id} blackout_id={blackout_id} was_set={was}");
     let outcome = if was {
         format!("pause-cleared: {blackout_id}")
     } else {
@@ -2290,10 +2325,10 @@ async fn handle_news_start(
         .set_news_window(trade_id, news_id, reason, now, ttl_seconds)
         .await
     {
-        console_error!("KV set_news_window: {err}");
+        rlog_err!("KV set_news_window: {err}");
         return Response::error("state error", 500);
     }
-    console_log!(
+    rlog!(
         "news-start: trade_id={trade_id} news_id={news_id} reason={:?}",
         reason
     );
@@ -2321,11 +2356,11 @@ async fn handle_news_end(
     let was = match store.clear_news_window(trade_id, news_id).await {
         Ok(b) => b,
         Err(err) => {
-            console_error!("KV clear_news_window: {err}");
+            rlog_err!("KV clear_news_window: {err}");
             return Response::error("state error", 500);
         }
     };
-    console_log!("news-end: trade_id={trade_id} news_id={news_id} was_set={was}");
+    rlog!("news-end: trade_id={trade_id} news_id={news_id} was_set={was}");
     let outcome = if was {
         format!("news-end: {news_id}")
     } else {
@@ -2368,7 +2403,7 @@ async fn acquire_oanda_broker_for_account(env: &Env, name: &str) -> Option<Oanda
     let kv = match env.kv(KV_NAMESPACE) {
         Ok(kv) => kv,
         Err(err) => {
-            console_error!("oanda[{name}]: KV binding missing: {err:?}");
+            rlog_err!("oanda[{name}]: KV binding missing: {err:?}");
             return None;
         }
     };
@@ -2376,12 +2411,12 @@ async fn acquire_oanda_broker_for_account(env: &Env, name: &str) -> Option<Oanda
     let meta = match metadata.get(name).await {
         Ok(m) => m,
         Err(err) => {
-            console_error!("oanda[{name}]: metadata lookup failed: {err}");
+            rlog_err!("oanda[{name}]: metadata lookup failed: {err}");
             return None;
         }
     };
     if meta.broker != BrokerKind::Oanda {
-        console_error!(
+        rlog_err!(
             "oanda[{name}]: account broker={:?} but intent routed to oanda",
             meta.broker
         );
@@ -2390,7 +2425,7 @@ async fn acquire_oanda_broker_for_account(env: &Env, name: &str) -> Option<Oanda
     match meta.oanda_account_id {
         Some(id) => oanda_login_with(env, id).await,
         None => {
-            console_error!(
+            rlog_err!(
                 "oanda[{name}]: metadata has no `oanda_account_id` — re-run `trade-control account add` \
                  to set it, or fall back via worker-global OANDA_ACCOUNT_ID by omitting `account:` \
                  from the intent"
@@ -2409,7 +2444,7 @@ async fn acquire_oanda_broker_for_account(env: &Env, name: &str) -> Option<Oanda
 ///
 /// Returns `None` if the account is missing, the broker tag doesn't
 /// match, credentials can't be resolved, or login fails — each failure
-/// is logged at `console_error!`. Intents without `account:` are
+/// is logged at `rlog_err!`. Intents without `account:` are
 /// rejected at the caller; the legacy shared-session paths are gone.
 pub(crate) async fn acquire_tn_broker(
     env: &Env,
@@ -2418,7 +2453,7 @@ pub(crate) async fn acquire_tn_broker(
     match account {
         Some(name) => acquire_tn_broker_for_account(env, name).await,
         None => {
-            console_error!(
+            rlog_err!(
                 "tn: intent missing `account` — TradeNation routing requires a named account \
                  (use `trade-control account add <name>` to register one)"
             );
@@ -2459,7 +2494,7 @@ pub(crate) async fn load_account_caps(
     let kv = match env.kv(KV_NAMESPACE) {
         Ok(kv) => kv,
         Err(err) => {
-            console_error!("caps[{name}]: KV binding missing: {err:?}");
+            rlog_err!("caps[{name}]: KV binding missing: {err:?}");
             return AccountCaps::default();
         }
     };
@@ -2467,7 +2502,7 @@ pub(crate) async fn load_account_caps(
     match metadata.get(name).await {
         Ok(m) => m.caps,
         Err(err) => {
-            console_error!("caps[{name}]: metadata lookup failed: {err}");
+            rlog_err!("caps[{name}]: metadata lookup failed: {err}");
             AccountCaps::default()
         }
     }
@@ -2499,7 +2534,7 @@ async fn acquire_tn_broker_for_account(
     let kv = match env.kv(KV_NAMESPACE) {
         Ok(kv) => kv,
         Err(err) => {
-            console_error!("tn[{name}]: KV binding missing: {err:?}");
+            rlog_err!("tn[{name}]: KV binding missing: {err:?}");
             return None;
         }
     };
@@ -2507,12 +2542,12 @@ async fn acquire_tn_broker_for_account(
     let meta = match metadata.get(name).await {
         Ok(m) => m,
         Err(err) => {
-            console_error!("tn[{name}]: metadata lookup failed: {err}");
+            rlog_err!("tn[{name}]: metadata lookup failed: {err}");
             return None;
         }
     };
     if meta.broker != BrokerKind::TradeNation {
-        console_error!(
+        rlog_err!(
             "tn[{name}]: account broker={:?} but intent routed to tradenation",
             meta.broker
         );
@@ -2524,13 +2559,13 @@ async fn acquire_tn_broker_for_account(
     match kv.get(&cache_key).text().await {
         Ok(Some(cached)) => {
             if let Some(broker) = broker_tradenation::login(&cached).await {
-                console_log!("tn[{name}]: using cached session");
+                rlog!("tn[{name}]: using cached session");
                 return Some(broker);
             }
-            console_log!("tn[{name}]: cached session rejected, will re-login");
+            rlog!("tn[{name}]: cached session rejected, will re-login");
         }
-        Ok(None) => console_log!("tn[{name}]: no cached session, will login"),
-        Err(err) => console_error!("tn[{name}]: KV get session: {err:?}"),
+        Ok(None) => rlog!("tn[{name}]: no cached session, will login"),
+        Err(err) => rlog_err!("tn[{name}]: KV get session: {err:?}"),
     }
 
     // 2. Resolve credentials.
@@ -2538,14 +2573,14 @@ async fn acquire_tn_broker_for_account(
     let creds = match resolver.resolve(name).await {
         Ok(c) => c,
         Err(err) => {
-            console_error!("tn[{name}]: credentials resolve: {err}");
+            rlog_err!("tn[{name}]: credentials resolve: {err}");
             return None;
         }
     };
     let tn_creds = match creds {
         Credentials::TradeNation(c) => c,
         Credentials::Oanda(_) => {
-            console_error!("tn[{name}]: credential payload is OANDA — broker mismatch");
+            rlog_err!("tn[{name}]: credential payload is OANDA — broker mismatch");
             return None;
         }
     };
@@ -2588,7 +2623,7 @@ async fn login_and_cache_demo(
     let session = match tn_login::login_demo(username, password).await {
         Ok(s) => s,
         Err(err) => {
-            console_error!("tn[{account_name}]: demo login failed: {err}");
+            rlog_err!("tn[{account_name}]: demo login failed: {err}");
             return None;
         }
     };
@@ -2610,7 +2645,7 @@ async fn login_and_cache_live(
     let session = match tn_login::login_live(username, password).await {
         Ok(s) => s,
         Err(err) => {
-            console_error!("tn[{account_name}]: live login failed: {err}");
+            rlog_err!("tn[{account_name}]: live login failed: {err}");
             return None;
         }
     };
@@ -2635,7 +2670,7 @@ async fn cache_and_open(
     let json = match serde_json::to_string(session) {
         Ok(s) => s,
         Err(err) => {
-            console_error!("tn[{account_name}]: serialise session: {err}");
+            rlog_err!("tn[{account_name}]: serialise session: {err}");
             return None;
         }
     };
@@ -2643,18 +2678,18 @@ async fn cache_and_open(
         match kv.put(cache_key, json.clone()) {
             Ok(builder) => {
                 if let Err(err) = builder.execute().await {
-                    console_error!("tn[{account_name}]: KV put session execute: {err:?}");
+                    rlog_err!("tn[{account_name}]: KV put session execute: {err:?}");
                 }
             }
-            Err(err) => console_error!("tn[{account_name}]: KV put session builder: {err:?}"),
+            Err(err) => rlog_err!("tn[{account_name}]: KV put session builder: {err:?}"),
         }
         write_session_meta(&kv, account_name).await;
     }
     if let Some(broker) = broker_tradenation::login(&json).await {
-        console_log!("tn[{account_name}]: fresh {kind_label} login");
+        rlog!("tn[{account_name}]: fresh {kind_label} login");
         return Some(broker);
     }
-    console_error!("tn[{account_name}]: fresh session rejected by broker_tradenation::login");
+    rlog_err!("tn[{account_name}]: fresh session rejected by broker_tradenation::login");
     None
 }
 
@@ -2670,7 +2705,7 @@ async fn write_session_meta(kv: &worker::kv::KvStore, account_name: &str) {
     let json = match serde_json::to_string(&meta) {
         Ok(s) => s,
         Err(err) => {
-            console_error!("tn[{account_name}]: serialise session_meta: {err}");
+            rlog_err!("tn[{account_name}]: serialise session_meta: {err}");
             return;
         }
     };
@@ -2678,10 +2713,10 @@ async fn write_session_meta(kv: &worker::kv::KvStore, account_name: &str) {
     match kv.put(&key, json) {
         Ok(builder) => {
             if let Err(err) = builder.execute().await {
-                console_error!("tn[{account_name}]: KV put session_meta execute: {err:?}");
+                rlog_err!("tn[{account_name}]: KV put session_meta execute: {err:?}");
             }
         }
-        Err(err) => console_error!("tn[{account_name}]: KV put session_meta builder: {err:?}"),
+        Err(err) => rlog_err!("tn[{account_name}]: KV put session_meta builder: {err:?}"),
     }
 }
 
@@ -2700,14 +2735,14 @@ pub(crate) fn signing_key(env: &Env) -> Option<Vec<u8>> {
     let key_hex = match get_secret(SIGNING_KEY_SECRET, env) {
         Some(s) => s,
         None => {
-            console_error!("missing required secret: {SIGNING_KEY_SECRET}");
+            rlog_err!("missing required secret: {SIGNING_KEY_SECRET}");
             return None;
         }
     };
     match sig::parse_key_hex(&key_hex) {
         Ok(k) => Some(k.to_vec()),
         Err(err) => {
-            console_error!("SIGNING_KEY is not valid hex: {err}");
+            rlog_err!("SIGNING_KEY is not valid hex: {err}");
             None
         }
     }

@@ -12,8 +12,6 @@ use trade_control_core::broker::{
 };
 use trade_control_core::intent::{Direction, ResolvedEntry, RiskBudget};
 use tradenation_api::{OpeningOrder, Position, TransactionRecord};
-use worker::console_error;
-use worker::console_log;
 
 /// Closed-trade scan window. Plan §3 recommends ~50; one TN page
 /// returns ~50 records so we fetch a single page. **Caveat: TN's
@@ -38,7 +36,7 @@ impl Broker for TradeNationAdapter {
             // stake calc) without risking an actual order. Log the
             // inputs and bail. Once upstream gains a `dry_run` flag,
             // switch this to the same pattern as OANDA.
-            console_log!(
+            rlog!(
                 "DRY-RUN tradenation: instrument={} direction={:?} entry={:?} sl={} tp={} risk={:?} (stake not computed — upstream lacks dry-run support)",
                 req.instrument,
                 req.direction,
@@ -82,7 +80,7 @@ impl Broker for TradeNationAdapter {
         let details = tradenation_api::get_account_details(self.0.session())
             .await
             .map_err(|err| {
-                console_error!("tn lookup get_account_details: {err:?}");
+                rlog_err!("tn lookup get_account_details: {err:?}");
                 LookupError::Transient
             })?;
 
@@ -97,7 +95,7 @@ impl Broker for TradeNationAdapter {
             )
             .await
             .map_err(|err| {
-                console_error!("tn lookup get_transaction_history: {err:?}");
+                rlog_err!("tn lookup get_transaction_history: {err:?}");
                 LookupError::Transient
             })?;
             Some(recs)
@@ -125,7 +123,7 @@ impl Broker for TradeNationAdapter {
         tradenation_api::cancel_order(self.0.client(), self.0.session(), broker_order_id)
             .await
             .map_err(|err| {
-                console_error!("tn cancel_order({broker_order_id}): {err:?}");
+                rlog_err!("tn cancel_order({broker_order_id}): {err:?}");
                 CancelError::Transient
             })
     }
@@ -139,13 +137,13 @@ impl Broker for TradeNationAdapter {
         let market = tradenation_api::resolve_market(self.0.client(), self.0.session(), instrument)
             .await
             .map_err(|err| {
-                console_error!("tn resolve_market({instrument}): {err:?}");
+                rlog_err!("tn resolve_market({instrument}): {err:?}");
                 LookupError::Transient
             })?;
         let (bid, ask) = tradenation_api::latest_bid_ask(self.0.client(), market.market_id)
             .await
             .map_err(|err| {
-                console_error!(
+                rlog_err!(
                     "tn latest_bid_ask({instrument}, market_id={}): {err:?}",
                     market.market_id
                 );
@@ -163,7 +161,7 @@ impl Broker for TradeNationAdapter {
         let details = tradenation_api::get_account_details(self.0.session())
             .await
             .map_err(|err| {
-                console_error!("tn list_open_positions get_account_details: {err:?}");
+                rlog_err!("tn list_open_positions get_account_details: {err:?}");
                 LookupError::Transient
             })?;
         Ok(details
@@ -181,7 +179,7 @@ impl Broker for TradeNationAdapter {
         let details = tradenation_api::get_account_details(self.0.session())
             .await
             .map_err(|err| {
-                console_error!("tn list_pending_orders get_account_details: {err:?}");
+                rlog_err!("tn list_pending_orders get_account_details: {err:?}");
                 LookupError::Transient
             })?;
         Ok(details
@@ -191,7 +189,7 @@ impl Broker for TradeNationAdapter {
             .filter_map(|o| {
                 let mapped = tn_order_to_pending(o);
                 if mapped.is_none() {
-                    console_error!(
+                    rlog_err!(
                         "tn list_pending_orders: skipping malformed order_id={} market={} (no stop/limit trigger)",
                         o.order_id,
                         o.market,
@@ -221,7 +219,7 @@ impl Broker for TradeNationAdapter {
         let details = tradenation_api::get_account_details(self.0.session())
             .await
             .map_err(|err| {
-                console_error!("tn amend_stop get_account_details: {err:?}");
+                rlog_err!("tn amend_stop get_account_details: {err:?}");
                 AmendError::Transient
             })?;
 
@@ -251,7 +249,7 @@ impl Broker for TradeNationAdapter {
         .await
         .map(|_| ())
         .map_err(|err| {
-            console_error!(
+            rlog_err!(
                 "tn amend_stop(order_id={}, market={}, new_stop={new_stop}): {err:?}",
                 target.order_id,
                 target.market,

@@ -791,6 +791,39 @@ used — `SIGNING_KEY` replaces both. After deploying, run
 ~/.config/trade-control/key.hex` — the byte format is identical, only
 the name and the algorithm using it have changed.
 
+## Request recording (R2)
+
+Every inbound **intent** request (the signed POST path — not `GET /diag/*`
+or `/admin/*`) is captured as a single JSON object in R2: the verbatim
+signed body, the request headers, the final HTTP status + outcome, and
+**every** log line the handler emitted while processing it. The object is
+written asynchronously (`ctx.wait_until`) so recording adds no latency to
+the response the way back to TradingView.
+
+This is the authoritative archive the tax-tracker / timeline tools consume
+— it removes the old need to *reconstruct* the message body from the TV
+alert template (which fails once the alert is deleted).
+
+**Object layout:** `req/<YYYY-MM-DD>/<ts>-<request_id>.json`. A day's
+requests list under one date prefix and sort by time; filter the records'
+`trade_id` field to gather one setup's fires.
+
+**Capture mechanism.** The worker's logging goes through `rlog!` /
+`rlog_err!` (record-aware replacements for `console_log!` /
+`console_error!`) plus broker-crate `tracing::warn!`/`error!` events — all
+tee'd into a per-request buffer that lands in the record. `wrangler tail`
+still shows the same console output.
+
+**Fail-soft.** A missing bucket binding, a serialization error, or a
+failed R2 put are logged and swallowed — recording never blocks or fails a
+trade. If the binding is absent the worker logs one
+`recording: no TRADE_CONTROL_R2 bucket bound — skipped` line and carries on.
+
+**Binding.** Requires an R2 bucket bound as `TRADE_CONTROL_R2` in
+`wrangler.toml` (`[[r2_buckets]]`), the bucket created
+(`wrangler r2 bucket create …`), and the deploy API token to hold
+*Workers R2 Storage: Edit*. See the deploy notes for the exact steps.
+
 ## Brokers
 
 The intent YAML carries an optional `broker:` field, one of `oanda`

@@ -22,7 +22,7 @@
 #[cfg(target_arch = "wasm32")]
 use trade_control_core::account::CredentialsError;
 use trade_control_core::account::{AccountMetadata, MetadataError};
-use worker::{Env, Request, Response, Result, console_error, console_log};
+use worker::{Env, Request, Response, Result};
 
 use crate::KV_NAMESPACE;
 use crate::accounts::KvMetadataStore;
@@ -66,7 +66,7 @@ fn metadata_error_to_response(err: MetadataError) -> Result<Response> {
             Response::error(format!("already exists: {name}"), 409)
         }
         MetadataError::Backend(msg) => {
-            console_error!("admin metadata backend: {msg}");
+            rlog_err!("admin metadata backend: {msg}");
             Response::error("state error", 500)
         }
     }
@@ -86,7 +86,7 @@ pub async fn handle_list(req: &Request, env: &Env) -> Result<Response> {
     match serde_yaml::to_string(&listed) {
         Ok(yaml) => Response::ok(yaml),
         Err(e) => {
-            console_error!("admin list serialise: {e}");
+            rlog_err!("admin list serialise: {e}");
             Response::error("internal error", 500)
         }
     }
@@ -111,7 +111,7 @@ pub async fn handle_add(req: &mut Request, env: &Env) -> Result<Response> {
     use trade_control_core::account::MetadataStore;
     match store.add(metadata.clone()).await {
         Ok(()) => {
-            console_log!(
+            rlog!(
                 "admin: added account {} (broker={:?}, kind={:?})",
                 metadata.name,
                 metadata.broker,
@@ -138,7 +138,7 @@ pub async fn handle_remove(req: &Request, env: &Env, name: &str) -> Result<Respo
     use trade_control_core::account::MetadataStore;
     match store.remove(name).await {
         Ok(()) => {
-            console_log!("admin: removed account {name} from index");
+            rlog!("admin: removed account {name} from index");
             Response::ok(format!(
                 "removed: {name}\nremember to clear the credential secret with wrangler\n"
             ))
@@ -184,14 +184,14 @@ pub async fn handle_test(req: &Request, env: &Env, name: &str) -> Result<Respons
     // The metadata is the only thing to check.
     if meta.broker == BrokerKind::Oanda {
         if meta.oanda_account_id.is_none() {
-            console_error!("admin test {name}: oanda metadata missing oanda_account_id");
+            rlog_err!("admin test {name}: oanda metadata missing oanda_account_id");
             return Response::error(
                 "oanda account missing `oanda_account_id` in metadata — re-run \
                  `trade-control account add`",
                 424,
             );
         }
-        console_log!(
+        rlog!(
             "admin: test {name} ok (broker=oanda, kind={}, account_id={})",
             wire_kind(meta.kind),
             meta.oanda_account_id.as_deref().unwrap_or("?")
@@ -216,7 +216,7 @@ pub async fn handle_test(req: &Request, env: &Env, name: &str) -> Result<Respons
         Credentials::Oanda(_) => BrokerKind::Oanda,
     };
     if actual != meta.broker {
-        console_error!(
+        rlog_err!(
             "admin test {name}: broker mismatch meta={:?} cred={:?}",
             meta.broker,
             actual
@@ -231,7 +231,7 @@ pub async fn handle_test(req: &Request, env: &Env, name: &str) -> Result<Respons
             409,
         );
     }
-    console_log!(
+    rlog!(
         "admin: test {name} ok (broker={}, kind={})",
         wire_broker(meta.broker),
         wire_kind(meta.kind)
@@ -290,7 +290,7 @@ fn creds_error_to_response(name: &str, err: CredentialsError) -> Result<Response
             Response::error(format!("credential secret malformed: {reason}"), 400)
         }
         CredentialsError::Backend(msg) => {
-            console_error!("admin test {name}: creds backend: {msg}");
+            rlog_err!("admin test {name}: creds backend: {msg}");
             Response::error("internal error", 500)
         }
     }
@@ -382,7 +382,7 @@ pub async fn handle_adopt(req: &mut Request, env: &Env) -> Result<Response> {
     let details = match tradenation_api::get_account_details(broker.session()).await {
         Ok(d) => d,
         Err(err) => {
-            console_error!(
+            rlog_err!(
                 "adopt-trade[{}] get_account_details: {err:?}",
                 adopt.account
             );
@@ -393,7 +393,7 @@ pub async fn handle_adopt(req: &mut Request, env: &Env) -> Result<Response> {
     // Step 3: verify. Mismatch is a hard 409 — write nothing.
     let verdict = verify_position(&adopt, &details.positions.records);
     if verdict != VerifyOutcome::Ok {
-        console_error!(
+        rlog_err!(
             "adopt-trade[{}] verify failed for trade_id={}: {}",
             adopt.account,
             adopt.trade_id,
@@ -411,7 +411,7 @@ pub async fn handle_adopt(req: &mut Request, env: &Env) -> Result<Response> {
     let snapshot = match state.snapshot().await {
         Ok(s) => s,
         Err(e) => {
-            console_error!("adopt-trade[{}] snapshot: {e}", adopt.account);
+            rlog_err!("adopt-trade[{}] snapshot: {e}", adopt.account);
             return Response::error("state read failed", 500);
         }
     };
@@ -443,11 +443,11 @@ pub async fn handle_adopt(req: &mut Request, env: &Env) -> Result<Response> {
     };
 
     if let Err(err) = state.record_entry_attempt(attempt.clone()).await {
-        console_error!("adopt-trade[{}] record_entry_attempt: {err}", adopt.account);
+        rlog_err!("adopt-trade[{}] record_entry_attempt: {err}", adopt.account);
         return Response::error("state write failed", 500);
     }
 
-    console_log!(
+    rlog!(
         "admin: adopted trade_id={} on {} ({} {:?}) order_id={} position_id={} \
          expires_at={}",
         adopt.trade_id,

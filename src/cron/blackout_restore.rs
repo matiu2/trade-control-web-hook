@@ -47,7 +47,7 @@ use trade_control_core::blackout_recreate::{RestorePlan, restore_plan};
 use trade_control_core::incoming::{self, IncomingError};
 use trade_control_core::intent::Resolved;
 use trade_control_core::state::{CancelledOrder, SpreadBlackoutRecord};
-use worker::{Env, console_error, console_log};
+use worker::Env;
 
 use super::sweep::{BrokerHandle, acquire_broker_for_account};
 use crate::state::KvStateStore;
@@ -67,7 +67,7 @@ pub async fn restore_cancelled_orders(
     }
     for cancelled in &record.cancelled_orders {
         if let Err(err) = restore_one_order(env, store, record, cancelled, now).await {
-            console_error!(
+            rlog_err!(
                 "blackout restore[{}]: order {} re-drive error: {err}",
                 record.trade_id,
                 cancelled.order_id,
@@ -94,7 +94,7 @@ async fn restore_one_order(
     let verified = match incoming::parse_and_verify(&cancelled.signed_intent, &key, now) {
         Ok(v) => v,
         Err(IncomingError::Expired) | Err(IncomingError::StaleShellTime) => {
-            console_log!(
+            rlog!(
                 "blackout restore[{tid}]: stored intent expired, dropped order {} \
                  (window closed during blackout)",
                 cancelled.order_id,
@@ -135,7 +135,7 @@ async fn restore_one_order(
     );
     match plan {
         RestorePlan::DropStopOverrunSkip => {
-            console_log!(
+            rlog!(
                 "blackout restore[{tid}]: stop overrun, on_too_close=skip, dropped order {} \
                  (bid={} ask={})",
                 cancelled.order_id,
@@ -146,7 +146,7 @@ async fn restore_one_order(
             return Ok(());
         }
         RestorePlan::DropStaleLimit => {
-            console_log!(
+            rlog!(
                 "blackout restore[{tid}]: limit stale (bid/ask wrong side), dropped order {} \
                  — trade left looking for entry (bid={} ask={})",
                 cancelled.order_id,
@@ -157,7 +157,7 @@ async fn restore_one_order(
             return Ok(());
         }
         RestorePlan::DropUnexpectedMarket => {
-            console_log!(
+            rlog!(
                 "blackout restore[{tid}]: unexpected resting market order {}, dropped \
                  (market entries never rest)",
                 cancelled.order_id,
@@ -184,7 +184,7 @@ async fn restore_one_order(
         &cancelled.signed_intent,
     )
     .await;
-    console_log!(
+    rlog!(
         "blackout restore[{tid}]: re-drive order {} → {}",
         cancelled.order_id,
         result.describe(),
@@ -199,7 +199,7 @@ async fn restore_one_order(
 /// dropped, or expired). Logged, never fatal — the TTL is the backstop.
 async fn cleanup_body(store: &KvStateStore, order_id: &str) {
     if let Err(err) = store.delete_order_body(order_id).await {
-        console_error!("blackout restore: delete_order_body({order_id}) failed: {err}");
+        rlog_err!("blackout restore: delete_order_body({order_id}) failed: {err}");
     }
 }
 

@@ -16,7 +16,7 @@
 //!   {minute, quarter, hour, day}; defaults: type=bid, tf=minute,
 //!   count=1.
 
-use worker::{Env, Request, Response, Result, console_error, console_log};
+use worker::{Env, Request, Response, Result};
 
 use crate::{SIGNING_KEY_SECRET, acquire_tn_broker, get_secret};
 
@@ -68,7 +68,7 @@ pub async fn handle_fx(req: &Request, env: &Env) -> Result<Response> {
         None => return Response::error("tradenation session unavailable", 503),
     };
 
-    console_log!("diag fx_rate {from}->{to}");
+    rlog!("diag fx_rate {from}->{to}");
     match tradenation_api::fx_rate(broker.client(), broker.session(), &from, &to).await {
         Ok(rate) => {
             let body = format!("from: {from}\nto: {to}\nrate: {rate}\n");
@@ -76,7 +76,7 @@ pub async fn handle_fx(req: &Request, env: &Env) -> Result<Response> {
         }
         Err(err) => {
             let body = format!("from: {from}\nto: {to}\nerror: {err}\n");
-            console_error!("diag fx_rate {from}->{to}: {err}");
+            rlog_err!("diag fx_rate {from}->{to}: {err}");
             // 200 with body — this is a diagnostic, the worker is fine,
             // the upstream call failed and the operator wants the
             // detail.
@@ -129,7 +129,7 @@ pub async fn handle_candles(req: &Request, env: &Env) -> Result<Response> {
     };
 
     let chart_url = format!("{CHARTS_BASE}/{tf}/{market_id}/{price_type}?l={count}");
-    console_log!("diag candles GET {chart_url}");
+    rlog!("diag candles GET {chart_url}");
 
     let resp = broker
         .client()
@@ -152,7 +152,7 @@ pub async fn handle_candles(req: &Request, env: &Env) -> Result<Response> {
             }
         }
         Err(err) => {
-            console_error!("diag candles {chart_url}: {err}");
+            rlog_err!("diag candles {chart_url}: {err}");
             Response::ok(format!("url: {chart_url}\nerror: {err}\n"))
         }
     }

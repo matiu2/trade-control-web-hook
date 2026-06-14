@@ -23,7 +23,7 @@
 use chrono::{DateTime, Duration, Utc};
 use trade_control_core::broker::{AmendError, Broker};
 use trade_control_core::state::{SpreadBlackoutRecord, StateStore};
-use worker::{Env, console_error, console_log};
+use worker::Env;
 
 use super::constants::BLACKOUT_BACKSTOP_SECONDS;
 use super::sweep::{BrokerHandle, acquire_broker_for_account, open_store};
@@ -40,14 +40,14 @@ pub async fn watch_recovery(env: &Env, now: DateTime<Utc>) {
     let records = match store.list_all_spread_blackout_records().await {
         Ok(v) => v,
         Err(err) => {
-            console_error!("blackout watch: list failed: {err}");
+            rlog_err!("blackout watch: list failed: {err}");
             return;
         }
     };
-    console_log!("blackout watch: {} records", records.len());
+    rlog!("blackout watch: {} records", records.len());
     for record in records {
         if let Err(err) = watch_one(env, &store, &record, now).await {
-            console_error!(
+            rlog_err!(
                 "blackout watch[{}/{}]: {err}",
                 record.trade_id,
                 record.instrument
@@ -85,7 +85,7 @@ async fn watch_one(
         restore_remembered_stops(env, record).await;
         super::blackout_restore::restore_cancelled_orders(env, store, record, now).await;
         clear(store, record, "backstop").await?;
-        console_log!(
+        rlog!(
             "blackout watch[{}]: backstop fired, cleared",
             record.trade_id
         );
@@ -111,7 +111,7 @@ async fn watch_one(
         restore_remembered_stops(env, record).await;
         super::blackout_restore::restore_cancelled_orders(env, store, record, now).await;
         clear(store, record, "recovery").await?;
-        console_log!(
+        rlog!(
             "blackout watch[{}]: spread {spread_pips}p recovered, cleared",
             record.trade_id
         );
@@ -145,7 +145,7 @@ async fn restore_remembered_stops(env: &Env, record: &SpreadBlackoutRecord) {
         return;
     }
     let Some(broker) = acquire_broker_for_account(env, record.account.as_deref()).await else {
-        console_error!(
+        rlog_err!(
             "blackout restore[{}]: broker acquisition failed — {} stop(s) left widened until \
              the operator restores them (backstop TTL is the final net)",
             record.trade_id,
@@ -174,19 +174,19 @@ async fn restore_remembered_stops(env: &Env, record: &SpreadBlackoutRecord) {
             }
         };
         match result {
-            Ok(()) => console_log!(
+            Ok(()) => rlog!(
                 "blackout restore[{}]: amend_stop ok id={} -> original {} (verbatim, no recompute)",
                 record.trade_id,
                 remembered.position_or_order_id,
                 remembered.original_stop,
             ),
-            Err(AmendError::NotFound) => console_log!(
+            Err(AmendError::NotFound) => rlog!(
                 "blackout restore[{}]: id={} gone (closed during window) — benign, nothing to \
                  restore",
                 record.trade_id,
                 remembered.position_or_order_id,
             ),
-            Err(err) => console_error!(
+            Err(err) => rlog_err!(
                 "blackout restore[{}]: amend_stop id={} -> {} FAILED ({err}) — stop left WIDENED, \
                  operator must restore manually",
                 record.trade_id,

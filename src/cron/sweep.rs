@@ -16,7 +16,7 @@ use chrono::{DateTime, Utc};
 use trade_control_core::broker::Broker;
 use trade_control_core::intent::{BrokerKind, Direction};
 use trade_control_core::state::{EntryAttempt, StateStore};
-use worker::{Env, console_error, console_log};
+use worker::Env;
 
 use crate::state::KvStateStore;
 
@@ -35,16 +35,16 @@ pub async fn sweep_pending_orders(env: &Env, now: DateTime<Utc>) {
     let attempts = match store.list_all_entry_attempts().await {
         Ok(v) => v,
         Err(err) => {
-            console_error!("cron sweep: list_all_entry_attempts: {err}");
+            rlog_err!("cron sweep: list_all_entry_attempts: {err}");
             return;
         }
     };
 
-    console_log!("cron sweep: {} tracked attempts", attempts.len());
+    rlog!("cron sweep: {} tracked attempts", attempts.len());
 
     for attempt in attempts {
         if let Err(err) = sweep_one(env, &store, &attempt, now).await {
-            console_error!(
+            rlog_err!(
                 "cron sweep[{}/{}/#{}]: {err}",
                 attempt.account.as_deref().unwrap_or("<global>"),
                 attempt.trade_id,
@@ -164,7 +164,7 @@ async fn cancel_with_broker<B: Broker>(
 ) {
     let account = attempt.account.as_deref().unwrap_or("");
     match broker.cancel_order(account, &attempt.broker_order_id).await {
-        Ok(()) => console_log!(
+        Ok(()) => rlog!(
             "cron sweep cancel ok: reason={reason} account={} trade_id={} attempt_no={} \
              instrument={} order_id={} current_price={current_price}",
             attempt.account.as_deref().unwrap_or("<global>"),
@@ -173,7 +173,7 @@ async fn cancel_with_broker<B: Broker>(
             attempt.instrument,
             attempt.broker_order_id,
         ),
-        Err(err) => console_error!(
+        Err(err) => rlog_err!(
             "cron sweep cancel failed (will retry next tick): reason={reason} \
              account={} trade_id={} attempt_no={} instrument={} order_id={} err={err}",
             attempt.account.as_deref().unwrap_or("<global>"),
@@ -194,7 +194,7 @@ async fn delete_row(store: &KvStateStore, attempt: &EntryAttempt) {
         )
         .await
     {
-        console_error!(
+        rlog_err!(
             "cron sweep delete_entry_attempt({}/{}/#{}): {err}",
             attempt.account.as_deref().unwrap_or("<global>"),
             attempt.trade_id,
@@ -209,7 +209,7 @@ pub(crate) fn open_store(env: &Env) -> Option<KvStateStore> {
     match env.kv(crate::KV_NAMESPACE) {
         Ok(kv) => Some(KvStateStore::new(kv)),
         Err(err) => {
-            console_error!("cron sweep: KV binding missing: {err:?}");
+            rlog_err!("cron sweep: KV binding missing: {err:?}");
             None
         }
     }
@@ -273,7 +273,7 @@ async fn resolve_broker_kind(env: &Env, account: Option<&str>) -> Option<BrokerK
         let kv = match env.kv(crate::KV_NAMESPACE) {
             Ok(kv) => kv,
             Err(err) => {
-                console_error!("cron sweep[{name}]: KV binding missing: {err:?}");
+                rlog_err!("cron sweep[{name}]: KV binding missing: {err:?}");
                 return None;
             }
         };
@@ -281,7 +281,7 @@ async fn resolve_broker_kind(env: &Env, account: Option<&str>) -> Option<BrokerK
         match metadata.get(name).await {
             Ok(m) => Some(m.broker),
             Err(err) => {
-                console_error!("cron sweep[{name}]: metadata lookup failed: {err}");
+                rlog_err!("cron sweep[{name}]: metadata lookup failed: {err}");
                 None
             }
         }

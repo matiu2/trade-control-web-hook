@@ -68,29 +68,6 @@ use trade_control_core::rules::{self, RuleError};
 use trade_control_core::state::{EntryAttempt, StateStore};
 use trade_control_core::tunable::Tunable;
 
-/// Tracing-shaped wrappers around `worker::console_*!`. The worker
-/// macros call into `web_sys::console::log_1`, which panics on
-/// non-wasm builds — without these wrappers the native test build
-/// aborts the moment a code path emits a log line. We log via
-/// `tracing` everywhere off-wasm so tests stay debuggable, and the
-/// real console on wasm.
-macro_rules! console_log {
-    ($($t:tt)*) => {{
-        #[cfg(target_arch = "wasm32")]
-        { worker::console_log!($($t)*); }
-        #[cfg(not(target_arch = "wasm32"))]
-        { tracing::info!("{}", format_args!($($t)*)); }
-    }};
-}
-macro_rules! console_error {
-    ($($t:tt)*) => {{
-        #[cfg(target_arch = "wasm32")]
-        { worker::console_error!($($t)*); }
-        #[cfg(not(target_arch = "wasm32"))]
-        { tracing::error!("{}", format_args!($($t)*)); }
-    }};
-}
-
 /// Outcome of the retry gate. `Proceed` falls through into the rest of
 /// `run_enter`; `Rejected` carries an HTTP status code, a body message,
 /// and a short outcome string the dispatcher records against the seen
@@ -180,9 +157,7 @@ pub async fn evaluate<B: Broker, S: StateStore>(
         .await
     {
         Ok(true) => {
-            console_log!(
-                "retry: same-bar re-fire dedup'd (trade_id={trade_id} shell_time={shell_time})"
-            );
+            rlog!("retry: same-bar re-fire dedup'd (trade_id={trade_id} shell_time={shell_time})");
             return RetryGateOutcome::Rejected {
                 status: 409,
                 message: "replay (retry-fire)",
@@ -191,7 +166,7 @@ pub async fn evaluate<B: Broker, S: StateStore>(
         }
         Ok(false) => {}
         Err(err) => {
-            console_error!("KV is_retry_fire_seen: {err}");
+            rlog_err!("KV is_retry_fire_seen: {err}");
             return RetryGateOutcome::Rejected {
                 status: 500,
                 message: "state error",
@@ -203,7 +178,7 @@ pub async fn evaluate<B: Broker, S: StateStore>(
     let attempts = match store.list_entry_attempts(account, trade_id).await {
         Ok(a) => a,
         Err(err) => {
-            console_error!("KV list_entry_attempts: {err}");
+            rlog_err!("KV list_entry_attempts: {err}");
             return RetryGateOutcome::Rejected {
                 status: 500,
                 message: "state error",
@@ -252,7 +227,7 @@ pub async fn evaluate<B: Broker, S: StateStore>(
                                         )
                                         .await
                                 {
-                                    console_error!(
+                                    rlog_err!(
                                         "KV set_entry_attempt_broker_trade_id (raced): {err}"
                                     );
                                 }
@@ -285,7 +260,7 @@ pub async fn evaluate<B: Broker, S: StateStore>(
                         )
                         .await
                 {
-                    console_error!("KV set_entry_attempt_broker_trade_id: {err}");
+                    rlog_err!("KV set_entry_attempt_broker_trade_id: {err}");
                 }
                 return RetryGateOutcome::Rejected {
                     status: 412,
@@ -377,13 +352,13 @@ pub async fn record_placement<S: StateStore>(
         pip_size: intent.pip_size,
     };
     if let Err(err) = store.record_entry_attempt(attempt).await {
-        console_error!("KV record_entry_attempt: {err}");
+        rlog_err!("KV record_entry_attempt: {err}");
     }
     if let Err(err) = store
         .mark_retry_fire_seen(account, trade_id, shell_time, ttl_seconds)
         .await
     {
-        console_error!("KV mark_retry_fire_seen: {err}");
+        rlog_err!("KV mark_retry_fire_seen: {err}");
     }
 }
 

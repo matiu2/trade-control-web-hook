@@ -39,10 +39,7 @@
 //!        helper as demo, harvesting `ASP.NET_SessionId` + OTS.
 
 use tradenation_api::Session;
-use worker::{
-    Fetch, Headers, Method, Request, RequestInit, RequestRedirect, Result, Url, console_error,
-    console_log,
-};
+use worker::{Fetch, Headers, Method, Request, RequestInit, RequestRedirect, Result, Url};
 
 const MAX_HOPS: usize = 10;
 const USER_AGENT: &str = "Mozilla/5.0 (X11; Linux x86_64; rv:148.0) Gecko/20100101 Firefox/148.0";
@@ -90,7 +87,7 @@ const LIVE_CLOUDTRADE_LOGIN_URL: &str = "https://portal.cube.finsatechnology.com
 pub async fn login_live(username: &str, password: &str) -> Result<Session> {
     let access_token = get_jwt(username, password).await?;
     let account_id = pick_account_id_from_jwt(&access_token).await?;
-    console_log!("tn live login: selected account_id={account_id}");
+    rlog!("tn live login: selected account_id={account_id}");
     let platform_url = get_platform_url(&access_token, account_id).await?;
     let (asp_session_id, ots_name, ots_value) = bootstrap_live_session(&platform_url).await?;
     Ok(Session::live(
@@ -252,7 +249,7 @@ async fn follow_redirect_chain(start_url: &str) -> Result<Vec<(String, String)>>
 
         for cookie_line in resp.headers().get_all("set-cookie")? {
             if let Some((name, value)) = parse_set_cookie(&cookie_line) {
-                console_log!("tn login hop {hop}: cookie {name}");
+                rlog!("tn login hop {hop}: cookie {name}");
                 cookies.push((name, value));
             }
         }
@@ -327,7 +324,7 @@ fn extract_session_cookies(
         .map(|(n, v)| (n.clone(), v.clone()));
 
     if ots.is_none() {
-        console_error!(
+        rlog_err!(
             "tn login: ASP.NET_SessionId captured but OTS cookie missing — order writes will fail"
         );
     }

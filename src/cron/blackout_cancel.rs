@@ -33,7 +33,7 @@ use chrono::{DateTime, Duration, Utc};
 use trade_control_core::broker::{Broker, PendingOrder};
 use trade_control_core::incoming;
 use trade_control_core::state::{CancelledOrder, SpreadBlackoutRecord, StateStore};
-use worker::{Env, console_error, console_log};
+use worker::Env;
 
 use super::constants::BLACKOUT_BACKSTOP_SECONDS;
 use super::sweep::{BrokerHandle, acquire_broker_for_account, open_store};
@@ -53,14 +53,14 @@ pub async fn cancel_resting_orders(env: &Env, now: DateTime<Utc>) {
         // (and the restore side couldn't re-verify it either). Skip the whole
         // cancel step rather than cancel orders we can't book for restore.
         None => {
-            console_error!("blackout cancel: no signing key; skipping resting-order cancel");
+            rlog_err!("blackout cancel: no signing key; skipping resting-order cancel");
             return;
         }
     };
     let attempts = match store.list_all_entry_attempts().await {
         Ok(v) => v,
         Err(err) => {
-            console_error!("blackout cancel: list_all_entry_attempts: {err}");
+            rlog_err!("blackout cancel: list_all_entry_attempts: {err}");
             return;
         }
     };
@@ -70,7 +70,7 @@ pub async fn cancel_resting_orders(env: &Env, now: DateTime<Utc>) {
             accounts.push(a.account.clone());
         }
     }
-    console_log!("blackout cancel: {} affected account(s)", accounts.len());
+    rlog!("blackout cancel: {} affected account(s)", accounts.len());
     for account in accounts {
         cancel_account(env, &store, &key, account.as_deref(), now).await;
     }
@@ -85,7 +85,7 @@ async fn cancel_account(
     now: DateTime<Utc>,
 ) {
     let Some(broker) = acquire_broker_for_account(env, account).await else {
-        console_error!(
+        rlog_err!(
             "blackout cancel[{}]: broker acquisition failed; skipping account",
             account.unwrap_or("<global>"),
         );
@@ -95,7 +95,7 @@ async fn cancel_account(
     let pendings = match list_pending(&broker, account_id).await {
         Ok(p) => p,
         Err(err) => {
-            console_error!(
+            rlog_err!(
                 "blackout cancel[{}]: list_pending_orders: {err}",
                 account.unwrap_or("<global>"),
             );
@@ -124,7 +124,7 @@ async fn cancel_one(
     let signed_body = match store.get_order_body(&order.order_id).await {
         Ok(Some(b)) => b,
         Ok(None) => {
-            console_log!(
+            rlog!(
                 "blackout cancel[{scope}]: no stored body for order {} — leaving it resting \
                  (can't restore what we can't re-parse)",
                 order.order_id,
@@ -132,7 +132,7 @@ async fn cancel_one(
             return;
         }
         Err(err) => {
-            console_error!(
+            rlog_err!(
                 "blackout cancel[{scope}]: get_order_body({}) failed: {err}; skip",
                 order.order_id,
             );
@@ -146,7 +146,7 @@ async fn cancel_one(
     let verified = match incoming::parse_and_verify(&signed_body, key, now) {
         Ok(v) => v,
         Err(err) => {
-            console_log!(
+            rlog!(
                 "blackout cancel[{scope}]: stored body for order {} won't verify ({err}); \
                  leaving it resting",
                 order.order_id,
@@ -164,7 +164,7 @@ async fn cancel_one(
         .pip_size
         .filter(|p| *p > 0.0 && p.is_finite())
     else {
-        console_log!(
+        rlog!(
             "blackout cancel[{scope}]: order {} (trade {trade_id}) has no usable pip_size; \
              skip (won't classify spread with a wrong pip)",
             order.order_id,
@@ -176,7 +176,7 @@ async fn cancel_one(
     let quote = match get_quote(broker, &order.instrument).await {
         Ok(q) => q,
         Err(err) => {
-            console_error!(
+            rlog_err!(
                 "blackout cancel[{scope}]: get_quote({}) failed: {err:?}; skip trade {trade_id}",
                 order.instrument,
             );
@@ -186,7 +186,7 @@ async fn cancel_one(
     let spread_pips = quote.spread() / pip_size;
     let threshold = crate::spread_blackout::elevated_threshold_pips(&order.instrument);
     if spread_pips <= threshold {
-        console_log!(
+        rlog!(
             "blackout cancel[{scope}]: order {} ({}) spread {spread_pips:.1}p <= {threshold:.1}p \
              not elevated; leaving it resting",
             order.order_id,
@@ -200,7 +200,7 @@ async fn cancel_one(
     let existing = match store.get_spread_blackout_record(&trade_id).await {
         Ok(r) => r,
         Err(err) => {
-            console_error!(
+            rlog_err!(
                 "blackout cancel[{scope}]: get_record({trade_id}): {err}; skip (won't cancel \
                  without a durable record)",
             );
@@ -223,7 +223,7 @@ async fn cancel_one(
         .upsert_spread_blackout_record(&record, BLACKOUT_BACKSTOP_SECONDS)
         .await
     {
-        console_error!(
+        rlog_err!(
             "blackout cancel[{scope}]: upsert_record({trade_id}) FAILED ({err}); NOT cancelling \
              (no durable record ⇒ would strand the order)",
         );
@@ -233,14 +233,14 @@ async fn cancel_one(
     // Now cancel. A failure leaves the (idempotent) record in place; the
     // recovery re-drive of a still-live order is bounded by its own gates.
     match cancel(broker, account_id_of(account), &order.order_id).await {
-        Ok(()) => console_log!(
+        Ok(()) => rlog!(
             "blackout cancel[{scope}][{trade_id}]: cancelled resting {} order {} \
              (trigger={} spread={spread_pips:.1}p)",
             if order.is_stop { "stop" } else { "limit" },
             order.order_id,
             order.trigger,
         ),
-        Err(err) => console_error!(
+        Err(err) => rlog_err!(
             "blackout cancel[{scope}][{trade_id}]: cancel order {} FAILED ({err}); record stays \
              (recovery re-drive is bounded by gates if the order was actually still live)",
             order.order_id,

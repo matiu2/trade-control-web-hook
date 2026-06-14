@@ -67,7 +67,13 @@ impl Subscriber for ConsoleSubscriber {
         };
         event.record(&mut visitor);
 
-        if meta.level() <= &tracing::Level::WARN {
+        // Tee into the per-request recording buffer so broker-crate
+        // `tracing::warn!`/`error!` lines land in the R2 record alongside
+        // the worker's own `rlog!` lines.
+        let is_err = meta.level() <= &tracing::Level::WARN;
+        crate::recording::push(if is_err { "error" } else { "log" }, buf.clone());
+
+        if is_err {
             console_error!("{buf}");
         } else {
             console_log!("{buf}");

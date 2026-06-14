@@ -22,7 +22,7 @@ use chrono::{DateTime, Duration, Utc};
 use trade_control_core::broker::{AmendError, Broker, OpenPosition};
 use trade_control_core::ny_clock::is_ny_close_edge;
 use trade_control_core::state::{EntryAttempt, RememberedStop, SpreadBlackoutRecord, StateStore};
-use worker::{Env, console_error, console_log};
+use worker::Env;
 
 use super::blackout_widen::{clamp_widen, widened_stop};
 use super::constants::BLACKOUT_BACKSTOP_SECONDS;
@@ -36,7 +36,7 @@ use crate::state::KvStateStore;
 /// no-ops the other.
 pub async fn apply_if_ny_close_edge(env: &Env, now: DateTime<Utc>) {
     if !is_ny_close_edge(now) {
-        console_log!("blackout: cron fired but not NY-close edge ({now}); no-op");
+        rlog!("blackout: cron fired but not NY-close edge ({now}); no-op");
         return;
     }
     let Some(store) = open_store(env) else {
@@ -46,8 +46,8 @@ pub async fn apply_if_ny_close_edge(env: &Env, now: DateTime<Utc>) {
     // uses, so the marker and the per-record backstop can never drift.
     let ttl = BLACKOUT_BACKSTOP_SECONDS;
     match store.set_spread_blackout_window(now, ttl).await {
-        Ok(()) => console_log!("blackout: window opened at {now} (ttl {ttl}s)"),
-        Err(err) => console_error!("blackout: failed to open window: {err}"),
+        Ok(()) => rlog!("blackout: window opened at {now} (ttl {ttl}s)"),
+        Err(err) => rlog_err!("blackout: failed to open window: {err}"),
     }
 
     // System 2 — widen open stops away from price.
@@ -73,7 +73,7 @@ async fn widen_open_stops(env: &Env, store: &KvStateStore, now: DateTime<Utc>) {
     let attempts = match store.list_all_entry_attempts().await {
         Ok(v) => v,
         Err(err) => {
-            console_error!("blackout widen: list_all_entry_attempts: {err}");
+            rlog_err!("blackout widen: list_all_entry_attempts: {err}");
             return;
         }
     };
@@ -84,7 +84,7 @@ async fn widen_open_stops(env: &Env, store: &KvStateStore, now: DateTime<Utc>) {
             accounts.push(a.account.clone());
         }
     }
-    console_log!(
+    rlog!(
         "blackout widen: {} attempt(s), {} affected account(s)",
         attempts.len(),
         accounts.len(),
@@ -103,7 +103,7 @@ async fn widen_account(
     now: DateTime<Utc>,
 ) {
     let Some(broker) = acquire_broker_for_account(env, account).await else {
-        console_error!(
+        rlog_err!(
             "blackout widen[{}]: broker acquisition failed; skipping account",
             account.unwrap_or("<global>"),
         );
@@ -113,7 +113,7 @@ async fn widen_account(
     let positions = match list_positions(&broker, account_id).await {
         Ok(p) => p,
         Err(err) => {
-            console_error!(
+            rlog_err!(
                 "blackout widen[{}]: list_open_positions: {err}",
                 account.unwrap_or("<global>"),
             );
@@ -160,7 +160,7 @@ async fn widen_one(
 
     // Join → originating attempt (for trade_id + baked pip_size).
     let Some(attempt) = join_position_to_attempt(position, account, attempts) else {
-        console_log!(
+        rlog!(
             "blackout widen[{}]: position {} ({}) has no joinable EntryAttempt; skip (can't \
              resolve trade_id/pip)",
             account.unwrap_or("<global>"),
@@ -176,7 +176,7 @@ async fn widen_one(
     // double-widen or re-capture the (already-widened) SL as "original".
     match store.get_spread_blackout_record(&trade_id).await {
         Ok(Some(rec)) if rec.applied => {
-            console_log!(
+            rlog!(
                 "blackout widen[{}]: trade {trade_id} already applied; skip",
                 account.unwrap_or("<global>"),
             );
@@ -184,7 +184,7 @@ async fn widen_one(
         }
         Ok(_) => {}
         Err(err) => {
-            console_error!(
+            rlog_err!(
                 "blackout widen[{}]: get_record({trade_id}): {err}",
                 account.unwrap_or("<global>")
             );
@@ -194,7 +194,7 @@ async fn widen_one(
 
     // Pip from the joined attempt — never widen with a wrong/absent pip.
     let Some(pip_size) = attempt.pip_size.filter(|p| *p > 0.0 && p.is_finite()) else {
-        console_log!(
+        rlog!(
             "blackout widen[{}]: trade {trade_id} has no usable pip_size; skip (won't widen with \
              a wrong pip)",
             account.unwrap_or("<global>"),
@@ -206,7 +206,7 @@ async fn widen_one(
     let Some(spread_abs) =
         sample_instrument_spread(broker, &position.instrument, spread_cache).await
     else {
-        console_error!(
+        rlog_err!(
             "blackout widen[{}]: get_quote({}) failed; skip trade {trade_id}",
             account.unwrap_or("<global>"),
             position.instrument,
@@ -237,7 +237,7 @@ async fn widen_one(
         .upsert_spread_blackout_record(&record, BLACKOUT_BACKSTOP_SECONDS)
         .await
     {
-        console_error!(
+        rlog_err!(
             "blackout widen[{}]: upsert_record({trade_id}) FAILED ({err}); NOT amending (no \
              remembered original ⇒ no widen)",
             account.unwrap_or("<global>"),
@@ -248,7 +248,7 @@ async fn widen_one(
     // PRECONDITION-guarded amend: log the intended amend prominently so a
     // demo run can read it back and confirm `AmendCloseOrder`-on-open-position
     // actually moved the SL (and left TP) before this is trusted live.
-    console_log!(
+    rlog!(
         "blackout widen[{}]: INTENT amend_stop trade={trade_id} id={} instrument={} dir={:?} \
          original_sl={original_sl} spread_pips={spread_pips:.1} widen_pips={widen_pips} \
          new_sl={new_sl} (DEMO-CONFIRM AmendCloseOrder-on-open-position before trusting live)",
@@ -258,18 +258,18 @@ async fn widen_one(
         position.direction,
     );
     match amend(broker, account.unwrap_or(""), &position.order_id, new_sl).await {
-        Ok(()) => console_log!(
+        Ok(()) => rlog!(
             "blackout widen[{}]: amend_stop ok trade={trade_id} id={} -> {new_sl}",
             account.unwrap_or("<global>"),
             position.order_id,
         ),
-        Err(AmendError::NotFound) => console_log!(
+        Err(AmendError::NotFound) => rlog!(
             "blackout widen[{}]: amend_stop id={} not found (position closed?) trade={trade_id} — \
              benign; record stays for restore-as-noop / backstop clear",
             account.unwrap_or("<global>"),
             position.order_id,
         ),
-        Err(err) => console_error!(
+        Err(err) => rlog_err!(
             "blackout widen[{}]: amend_stop trade={trade_id} id={} -> {new_sl} FAILED ({err}); \
              record persisted so recovery still restores to original",
             account.unwrap_or("<global>"),
