@@ -21,7 +21,7 @@ enabled = true
 #   wrangler kv namespace create TRADE_CONTROL_KV_STAGING
 [[kv_namespaces]]
 binding = "TRADE_CONTROL_KV"
-id = "REPLACE_ME_STAGING_KV_ID"
+id = "4343d146bf244529a43fce11ced1587d"
 
 # STAGING R2 bucket for per-request recording. Create with:
 #   wrangler r2 bucket create trade-control-recording-staging
@@ -31,23 +31,20 @@ id = "REPLACE_ME_STAGING_KV_ID"
 binding = "TRADE_CONTROL_R2"
 bucket_name = "trade-control-recording-staging"
 
-# Scheduled (cron) trigger. Fires the `scheduled` event in `src/cron.rs`
-# which sweeps pending broker orders for expiry + SL-breach.
+# Scheduled (cron) trigger. Fires the `scheduled` event in `src/cron.rs`.
+# A SINGLE */15 trigger drives every job; each self-gates on `now`:
+#   - every tick: session refresh + order sweep + spread-recovery watch
+#   - NY-close edge (:00 tick of 21:00 UTC EDT / 22:00 UTC EST): open the
+#     spread-blackout window. `is_ny_close_edge(now)` decides the season
+#     in Rust; `now.minute() < 15` makes it once-per-close-hour.
+#
+# Why one cron, not three: Cloudflare caps an account at 5 cron triggers
+# across ALL workers. Collapsing to one leaves headroom for the
+# dev/staging/prod three-way split (3 envs × 1 cron = 3 ≤ 5).
 #
 # NOTE: must be the flat `crons = ["..."]` form, NOT `[[triggers.crons]]`
 # with a `cron = "..."` inline value. The latter trips a wrangler bug that
 # double-wraps the body as `[{"cron":{"cron":"..."}}]`, which the CF API
 # rejects with code 10026 ("could not parse request body").
-#
-# CF cron exprs are UTC-only and can't carry a timezone. New York's
-# 17:00 close (the spread-blackout edge) is 21:00 UTC under EDT and
-# 22:00 UTC under EST, so the daily NY-close-edge check fires at BOTH
-# candidate minutes (21:05 and 22:05 UTC). On the wrong-season fire,
-# `is_ny_close_edge(now)` returns false in Rust and the handler no-ops,
-# so the one-hour DST shift is decided in code, not by the schedule.
 [triggers]
-crons = [
-    "*/15 * * * *",   # order sweep + spread-recovery watcher (Cron 2)
-    "5 21 * * *",     # NY-close edge under EDT (21:00 UTC + 5min) (Cron 1)
-    "5 22 * * *",     # NY-close edge under EST (22:00 UTC + 5min) (Cron 1)
-]
+crons = ["*/15 * * * *"]
