@@ -11,8 +11,8 @@
 use chrono::{DateTime, Utc};
 use trade_control_core::intent::Action;
 use trade_control_core::state::{
-    CooldownEntry, EntryAttempt, MIN_TTL_SECONDS, NewsEntry, PREP_BLOCK_INDEX_CAP, PREP_INDEX_CAP,
-    PauseEntry, PrepBlockEntry, PrepEntry, SEEN_INDEX_CAP, SeenEntry, Snapshot,
+    CooldownEntry, EntryAttempt, MIN_TTL_SECONDS, MwState, NewsEntry, PREP_BLOCK_INDEX_CAP,
+    PREP_INDEX_CAP, PauseEntry, PrepBlockEntry, PrepEntry, SEEN_INDEX_CAP, SeenEntry, Snapshot,
     SpreadBlackoutRecord, SpreadBlackoutWindow, StateError, StateStore, VETO_INDEX_CAP, VetoEntry,
     account_scope, prune_expired,
 };
@@ -115,6 +115,15 @@ impl KvStateStore {
     /// record. Disjoint from the window key by the `rec:` segment.
     fn spread_blackout_record_prefix() -> &'static str {
         "spread-blackout:rec:"
+    }
+
+    /// Per-(account, trade_id) key holding the evolving M/W geometry
+    /// ([`MwState`]): the running right-shoulder + revised-neckline
+    /// correction applied on top of the baked params. Scoped like vetos
+    /// minus the instrument+name segments — `trade_id` is globally unique.
+    fn mw_state_key(account: Option<&str>, trade_id: &str) -> String {
+        let scope = account_scope(account);
+        format!("mw-state:{scope}:{trade_id}")
     }
 
     /// Per-order key holding the raw signed alert body that placed a broker
@@ -1260,6 +1269,70 @@ impl StateStore for KvStateStore {
 
     async fn clear_spread_blackout_record(&self, trade_id: &str) -> Result<(), StateError> {
         let key = Self::spread_blackout_record_key(trade_id);
+        // Best-effort: KV delete is a no-op if the key is already gone.
+        self.store
+            .delete(&key)
+            .await
+            .map_err(|e| StateError::Backend(format!("delete {key}: {e:?}")))?;
+        Ok(())
+    }
+
+    async fn get_mw_state(
+        &self,
+        account: Option<&str>,
+        trade_id: &str,
+    ) -> Result<Option<MwState>, StateError> {
+        // Global-first: a global row satisfies an account-scoped query,
+        // mirroring `is_vetoed` / `get_prep`.
+        let global = Self::mw_state_key(None, trade_id);
+        let mut raw = self
+            .store
+            .get(&global)
+            .text()
+            .await
+            .map_err(|e| StateError::Backend(format!("get mw-state (global): {e:?}")))?;
+        if raw.is_none() && account.is_some() {
+            let scoped = Self::mw_state_key(account, trade_id);
+            raw = self
+                .store
+                .get(&scoped)
+                .text()
+                .await
+                .map_err(|e| StateError::Backend(format!("get mw-state (scoped): {e:?}")))?;
+        }
+        let Some(text) = raw else { return Ok(None) };
+        serde_json::from_str(&text)
+            .map(Some)
+            .map_err(|e| StateError::Backend(format!("decode mw-state: {e}")))
+    }
+
+    async fn upsert_mw_state(
+        &self,
+        account: Option<&str>,
+        trade_id: &str,
+        state: &MwState,
+        ttl_seconds: u64,
+    ) -> Result<(), StateError> {
+        let key = Self::mw_state_key(account, trade_id);
+        let ttl = ttl_seconds.max(MIN_TTL_SECONDS);
+        let body = serde_json::to_string(state)
+            .map_err(|e| StateError::Backend(format!("encode mw-state: {e}")))?;
+        self.store
+            .put(&key, body)
+            .map_err(|e| StateError::Backend(format!("put {key} builder: {e:?}")))?
+            .expiration_ttl(ttl)
+            .execute()
+            .await
+            .map_err(|e| StateError::Backend(format!("put {key} execute: {e:?}")))?;
+        Ok(())
+    }
+
+    async fn clear_mw_state(
+        &self,
+        account: Option<&str>,
+        trade_id: &str,
+    ) -> Result<(), StateError> {
+        let key = Self::mw_state_key(account, trade_id);
         // Best-effort: KV delete is a no-op if the key is already gone.
         self.store
             .delete(&key)

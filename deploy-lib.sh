@@ -39,9 +39,15 @@ CARGO_BIN="${CARGO_HOME:-$HOME/.cargo}/bin"
 CLI_PACKAGES=(trade-control-cli tv-arm tv-news)
 CLI_BINARIES=(trade-control tv-arm tv-news)
 
-# deploy_env <env-name> <required-branch> <webhook-url> <suffix>
+# deploy_env <env-name> <required-branch> <webhook-url> <suffix> <pine-name>
+#
+# <pine-name> is the Pine study title this environment's tv-arm arms
+# against (baked via TRADE_CONTROL_PINE_NAME → BAKED_PINE_NAME). Lets each
+# environment pin a distinct Pine version living as a separate study on the
+# same chart (e.g. "Candle Signals v24" vs "Candle Signals v25"). Optional —
+# defaults to the canonical "Candle Signals" when empty/unset.
 deploy_env() {
-  local env_name="$1" req_branch="$2" webhook="$3" suffix="$4"
+  local env_name="$1" req_branch="$2" webhook="$3" suffix="$4" pine_name="${5:-Candle Signals}"
 
   cd "$REPO_ROOT"
 
@@ -70,14 +76,17 @@ deploy_env() {
   echo "==> [$env_name] wrangler deploy"
   wrangler deploy
 
-  # 3. Build all CLIs with this environment's webhook baked in.
+  # 3. Build all CLIs with this environment's webhook + Pine study name
+  #    baked in (build.rs → BAKED_WEBHOOK / BAKED_PINE_NAME).
   echo "==> [$env_name] building CLIs with TRADE_CONTROL_WEBHOOK=$webhook"
+  echo "==> [$env_name] Pine study target: $pine_name"
   local pkg_args=()
   local pkg
   for pkg in "${CLI_PACKAGES[@]}"; do
     pkg_args+=(-p "$pkg")
   done
-  TRADE_CONTROL_WEBHOOK="$webhook" cargo build --release "${pkg_args[@]}"
+  TRADE_CONTROL_WEBHOOK="$webhook" TRADE_CONTROL_PINE_NAME="$pine_name" \
+    cargo build --release "${pkg_args[@]}"
 
   # 4. Install suffixed copies into ~/.cargo/bin.
   mkdir -p "$CARGO_BIN"

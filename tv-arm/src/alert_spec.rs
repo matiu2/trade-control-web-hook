@@ -16,12 +16,18 @@ use chrono::DateTime;
 use color_eyre::eyre::{Result, eyre};
 use serde::Serialize;
 use trade_control_conventions::{
-    ALERT_EVERY_BAR_CLOSE, AlertBasename, Direction, PINE_INDICATOR_NAME, entry_alert_for,
-    reversal_close_alert_for,
+    ALERT_EVERY_BAR_CLOSE, AlertBasename, Direction, entry_alert_for, reversal_close_alert_for,
 };
 
 use crate::geometry::pcl_exhausted_price_from_fib;
 use crate::mw_geometry::{abort_level, cancel_level};
+
+/// Pine study title this binary arms against, baked per environment by
+/// `build.rs` (`TRADE_CONTROL_PINE_NAME` → `BAKED_PINE_NAME`). Defaults to
+/// `trade_control_conventions::PINE_INDICATOR_NAME` ("Candle Signals").
+/// Lets each suffixed `tv-arm` target a distinct study version on the same
+/// chart — see `build.rs` and the README "per-environment Pine versions".
+const BAKED_PINE_NAME: &str = env!("BAKED_PINE_NAME");
 use crate::roles::Roles;
 use trading_view::drawings::Drawing;
 
@@ -467,7 +473,7 @@ fn calendar_payload(
 
 fn pine_payload(alert_title: &str, frequency: Frequency, tv_name: String) -> AlertPayload {
     AlertPayload::PineAlertcondition {
-        indicator_name: PINE_INDICATOR_NAME.to_string(),
+        indicator_name: BAKED_PINE_NAME.to_string(),
         alert_cond_title: alert_title.to_string(),
         frequency,
         auto_deactivate: false,

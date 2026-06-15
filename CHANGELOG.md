@@ -1,5 +1,113 @@
 # Changelog
 
+## v25 — 2026-06-15 — M/W dynamic geometry: live right-shoulder / neckline + rogue-wick + candle `open`
+
+### Why
+
+The book reads the higher shoulder and the deepest neckline off a *finished*
+chart. We arm with only the left shoulder + neckline known and the right
+tower still forming, so the worker must recover those two facts live. v24
+fixed *when* to arm; this fixes the *geometry* it arms with.
+
+### What changed (behaviour)
+
+- **Candle `open` threaded through the shell** (Phase B0). `Shell.open:
+  Option<f64>`; added to `sig::UNSIGNED_VALUE_KEYS`, the `incoming` shell-key
+  whitelist, the CLI TV-template body (`open: {{open}}`), the Rhai scope, and
+  Pine `candle-signals-v2` v2.5's `Every Bar Close` message. Optional →
+  backward-compatible; old bodies verify unchanged.
+- **`mw-state:<scope>:<trade_id>` KV keyspace** (Phase B1): `MwState`
+  (revised neckline + recorded right shoulder) with get/upsert/clear.
+- **`plan_mw_update` / `effective_mw_params`** (Phase B2, pure): per-bar
+  decision over the prior state + the bar's **body** extremes —
+  - higher right shoulder → SL anchor (higher of the two shoulders for M);
+  - deeper body still ≥ 60% of the runup→shoulder leg → revise the neckline;
+  - body past the 60% floor → cancel;
+  - all body-based, so a rogue wick can't move geometry or cancel.
+- **Wired into `run_enter`** (Phase B3): `maybe_update_mw_state` reads/updates
+  KV, then resolves the bar against the effective params. On cancel it cancels
+  pending + writes a trade-scoped `mw-cancel` veto (`MW_CANCEL_VETO_NAME`, new
+  shared const) and **never closes an open position**.
+
+### Breaking
+
+- `Resolved::from_mw_intent` is now `pub` (worker passes effective params).
+  New `MW_CANCEL_VETO_NAME` const (CLI enter-builder + worker share it).
+  No wire-format break — `open` is optional; contract stays `v3`.
+
+### Config
+
+- Pine must be **republished** to v2.5 for charts to start sending `open`
+  (the dynamic update is a no-op until then). New KV keyspace needs no
+  config — the existing `TRADE_CONTROL_KV` binding covers it.
+
+### Tests
+
+- core: `plan_mw_update` (cancel / floor / rogue-wick-doesn't-cancel /
+  right-shoulder record / neckline revise / W mirror), `effective_mw_params`,
+  `body_high`/`body_low`, MwState memstore round-trip, `open` sig round-trip.
+- The `maybe_update_mw_state` glue (KV read → plan → write/cancel) is thin
+  and verified by dev-deploy replay rather than a native mock (the worker's
+  `run_enter` needs a Cloudflare `Env`; the decision logic it calls is
+  fully covered in core).
+
+### Follow-up
+
+- `incoming`'s shell-key whitelist duplicates `sig::UNSIGNED_VALUE_KEYS` —
+  a future refactor could derive one from the other (drift bit B0 once).
+
+## v24 — 2026-06-15 — M/W real-time arming: right-tower window + "middle of the M" downward cross
+
+### Why
+
+M/W setups arm in **real time**, when only the left shoulder (B) and
+neckline (C) are printed — the right tower hasn't formed yet. The strategy
+book is the opposite: a **post-hoc** method that stops at the neckline once
+*both* towers are complete ("no retest required"). Applying the post-hoc
+rule live is what armed premature entries. v16 added a first guard (the
+0.7→1.3 second-peak window); this completes the real-time arming by also
+requiring price to **roll back off** the confirmed right tower before the
+breakout stop arms.
+
+### What changed (behaviour)
+
+- **`Resolved::from_mw_intent` (`core/src/intent/mw_resolution.rs`)** now
+  gates the per-bar enter on **two** confirmations, both MID-price on the
+  neckline→peak (C→B) leg:
+  1. **Right-tower window** (unchanged math, reframed): the bar's extreme
+     (high for M, low for W) must reach within 30% of the left-shoulder high
+     — `[neckline + 0.7×(peak−neckline), neckline + 1.3×(peak−neckline))`.
+  2. **"Middle of the M" downward-cross trigger** (new): the bar must cross
+     back through `mid50 = neckline + 0.5×(peak−neckline)`. M (short):
+     `high ≥ mid50 AND close < mid50`; W (long): `low ≤ mid50 AND
+     close > mid50`. A bar that hasn't crossed is declined → stay armed.
+- Entry/SL/TP price math (mid→bid/ask, exactly 1R TP) is **unchanged**; the
+  fill is still a breakout stop at the neckline. Non-`Ok` resolves still
+  don't mark the intent seen, so the setup stays armed across bars.
+
+### Breaking
+
+- Constant `SECOND_PEAK_MIN_FRAC` renamed to `RIGHT_TOWER_MIN_FRAC`; added
+  `MID_CROSS_FRAC = 0.5`. Internal only — no wire-format or CLI change.
+
+### Config
+
+- None. No new intent fields, no contract bump (`v3` unchanged) — the gate
+  is worker-internal on the existing `mw:` enter.
+
+### Tests
+
+- New `mw_resolution` tests: right tower confirmed but not crossed (M and W)
+  → declined; crossed → armed (M and W); `close == mid50` boundary →
+  declined. Existing worked-example + AUD/CAD tests still pass (their shells
+  already cross mid50). 436 core tests green.
+
+### Follow-up
+
+- Phase B (planned): KV-backed dynamic neckline/right-shoulder recording
+  (higher right shoulder → SL anchor; deeper body-low ≥60% revises neckline;
+  <60% cancels) + body-based rogue-wick handling.
+
 ## v22 — 2026-06-13 — spread-blackout System 3: cancel resting entry orders on blackout, re-drive on recovery
 
 ### Why

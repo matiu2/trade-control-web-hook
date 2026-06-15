@@ -31,4 +31,21 @@ fn main() {
         .unwrap_or_else(|_| "https://trade-control-web-hook.msherborne.workers.dev".to_string());
     println!("cargo:rustc-env=BAKED_WEBHOOK={webhook}");
     println!("cargo:rerun-if-env-changed=TRADE_CONTROL_WEBHOOK");
+
+    // Bake the per-environment Pine study title this binary arms against.
+    // Each environment can run a distinct Pine version on the same chart as
+    // separate studies with distinct base titles (e.g. "Candle Signals v24"
+    // vs "Candle Signals v25"); tv-arm matches a study by its base title
+    // (the `(args)` suffix is stripped — see tv_mcp_template.js). The deploy
+    // scripts set `TRADE_CONTROL_PINE_NAME` so `tv-arm-staging` and
+    // `tv-arm-dev` can target different study versions, pinning each
+    // environment's Pine version via tooling rather than chart hygiene.
+    //
+    // Default MUST stay in sync with `trade_control_conventions::pine::
+    // PINE_INDICATOR_NAME` — that const is the canonical name the worker and
+    // a plain `cargo install` (no env set) use.
+    let pine_name =
+        std::env::var("TRADE_CONTROL_PINE_NAME").unwrap_or_else(|_| "Candle Signals".to_string());
+    println!("cargo:rustc-env=BAKED_PINE_NAME={pine_name}");
+    println!("cargo:rerun-if-env-changed=TRADE_CONTROL_PINE_NAME");
 }

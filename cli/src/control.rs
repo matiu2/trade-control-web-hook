@@ -141,9 +141,15 @@ pub fn build_veto_intent(
 }
 
 /// Build a `clear-prep` Intent for a single (instrument, step) pair.
+///
+/// `account` scopes the clear: `None` targets the global (`_`) prep,
+/// `Some("reversals")` an account-scoped one. It must match the scope the
+/// prep was set under (the worker keys preps by `(account, instrument,
+/// step)`), else the clear is a silent no-op.
 pub fn build_clear_prep_intent(
     instrument: &str,
     step: &str,
+    account: Option<&str>,
     now: DateTime<Utc>,
     suffix: &str,
 ) -> Intent {
@@ -153,14 +159,19 @@ pub fn build_clear_prep_intent(
     );
     let mut intent = control_skeleton(Action::ClearPrep, instrument, id, now);
     intent.step = Some(step.to_string());
+    intent.account = account.map(str::to_string);
     intent
 }
 
 /// Build a `clear-veto` Intent for a single (instrument, name) pair.
+///
+/// `account` scopes the clear the same way as [`build_clear_prep_intent`]
+/// (the worker keys vetos by `(account, trade_id, instrument, name)`).
 pub fn build_clear_veto_intent(
     instrument: &str,
     trade_id: &str,
     name: &str,
+    account: Option<&str>,
     now: DateTime<Utc>,
     suffix: &str,
 ) -> Intent {
@@ -171,6 +182,7 @@ pub fn build_clear_veto_intent(
     let mut intent = control_skeleton(Action::ClearVeto, instrument, id, now);
     intent.name = Some(name.to_string());
     intent.trade_id = Some(trade_id.to_string());
+    intent.account = account.map(str::to_string);
     intent
 }
 
@@ -316,6 +328,13 @@ fn shell_for_tv_template_drawing() -> Vec<(&'static str, String)> {
         ("close", "{{close}}".to_string()),
         ("high", "{{high}}".to_string()),
         ("low", "{{low}}".to_string()),
+        // `open` is a TradingView built-in (no plot-index risk). It rides
+        // every TV-template shell so the M/W enter can compute candle-body
+        // extremes (rogue-wick handling, dynamic neckline revision). Its
+        // value is unsigned (TV fills it post-sign); see
+        // `trade_control_core::sig::UNSIGNED_VALUE_KEYS`. Optional on the
+        // worker side, so older charts without it still verify.
+        ("open", "{{open}}".to_string()),
         ("time", "\"{{time}}\"".to_string()),
     ]
 }
@@ -470,9 +489,11 @@ mod tests {
 
     #[test]
     fn clear_prep_intent_carries_step() {
-        let intent = build_clear_prep_intent("EUR_USD", "retest", t(), "ef56");
+        // Default (global) scope: no account.
+        let intent = build_clear_prep_intent("EUR_USD", "retest", None, t(), "ef56");
         assert_eq!(intent.action, Action::ClearPrep);
         assert_eq!(intent.step.as_deref(), Some("retest"));
+        assert_eq!(intent.account, None);
         assert!(matches!(
             intent.ttl_hours,
             trade_control_core::tunable::Tunable::Static(0)
@@ -480,8 +501,15 @@ mod tests {
     }
 
     #[test]
+    fn clear_prep_intent_carries_account_scope() {
+        let intent = build_clear_prep_intent("EUR_USD", "retest", Some("reversals"), t(), "ef56");
+        assert_eq!(intent.account.as_deref(), Some("reversals"));
+    }
+
+    #[test]
     fn clear_veto_intent_carries_name() {
-        let intent = build_clear_veto_intent("EUR_USD", "eurusd-hs-1", "news-window", t(), "gh78");
+        let intent =
+            build_clear_veto_intent("EUR_USD", "eurusd-hs-1", "news-window", None, t(), "gh78");
         assert_eq!(intent.action, Action::ClearVeto);
         assert_eq!(intent.name.as_deref(), Some("news-window"));
         assert_eq!(intent.trade_id.as_deref(), Some("eurusd-hs-1"));

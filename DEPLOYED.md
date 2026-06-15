@@ -43,14 +43,24 @@ from `main` carrying the week's accumulated changes.
 
 <!-- Update the cells below on every deploy/promote. Dates are Brisbane. -->
 
+### dev
+
+| part | version | deployed (Brisbane) | notes |
+|---|---|---|---|
+| pine | `v2.5` (study title `Candle Signals v25`) | — | manual republish; sends `open` for M/W body logic. `tv-arm-dev` bakes this study title (`ENV_PINE_NAME`) — rename the chart study to match. |
+| tv-arm | `0.1.0` | 2026-06-15 | installed as `tv-arm-dev` (dev URL + `Candle Signals v25` baked) |
+| trade-control | `0.2.0` | 2026-06-15 | installed as `trade-control-dev` (dev URL baked) |
+| backend | `v25` | 2026-06-15 | M/W real-time arming (v24) + dynamic geometry / `open` (v25) |
+| contract | `v3` | — | unchanged by v24/v25 (`open` is optional) |
+
 ### staging
 
 | part | version | deployed (Brisbane) | notes |
 |---|---|---|---|
-| pine | `candle-signals-v2` | — | manual; record the TV version note |
-| tv-arm | `0.1.0` | — | |
-| trade-control | `0.2.0` | — | |
-| backend | `v23` | 2026-06-15 | first recording-enabled build; R2 recording verified live |
+| pine | `v2.4` (study title `Candle Signals v24`) | — | pinned to the pre-`open` version. `tv-arm-staging` bakes this study title; rename the chart study to match. |
+| tv-arm | `0.1.0` | — | installs as `tv-arm-staging` (staging URL + `Candle Signals v24` baked) on staging deploy |
+| trade-control | `0.2.0` | — | installs as `trade-control-staging` (staging URL baked) |
+| backend | `v25` | — | M/W real-time arming (v24) + dynamic geometry / `open` (v25); promotion-gate week restarts from this deploy |
 | contract | `v3` | — | unchanged by v23 (recording is observe-only) |
 
 ### prod

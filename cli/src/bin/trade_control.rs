@@ -500,6 +500,12 @@ struct ClearPrepCmdArgs {
     instrument: String,
     /// Named step to clear.
     step: String,
+    /// Account scope the prep was set under. Preps are keyed by
+    /// `(account, instrument, step)`; omit for a global (`_`) prep, or pass
+    /// the account name (e.g. `reversals`) to clear an account-scoped one.
+    /// `status` shows each prep's `account:` field — match it exactly.
+    #[arg(long)]
+    account: Option<String>,
     /// Broker the instrument belongs to (see `unlock --broker`).
     #[arg(long, value_enum, default_value_t = BrokerKindArg::Oanda)]
     broker: BrokerKindArg,
@@ -521,6 +527,12 @@ struct ClearVetoCmdArgs {
     /// veto was set under — clearing is scoped per-setup.
     #[arg(long)]
     trade_id: String,
+    /// Account scope the veto was set under. Vetos are keyed by
+    /// `(account, trade_id, instrument, name)`; omit for a global (`_`)
+    /// veto, or pass the account name to clear an account-scoped one.
+    /// `status` shows each veto's `account:` field — match it exactly.
+    #[arg(long)]
+    account: Option<String>,
     /// Broker the instrument belongs to (see `unlock --broker`).
     #[arg(long, value_enum, default_value_t = BrokerKindArg::Oanda)]
     broker: BrokerKindArg,
@@ -1259,7 +1271,13 @@ fn run_clear_prep(args: ClearPrepCmdArgs) -> Result<()> {
     let instrument = canonicalize_instrument_or_force(args.broker, &args.instrument, args.force)?;
     let now = Utc::now();
     let suffix = fresh_suffix()?;
-    let intent = build_clear_prep_intent(&instrument, &args.step, now, &suffix);
+    let intent = build_clear_prep_intent(
+        &instrument,
+        &args.step,
+        args.account.as_deref(),
+        now,
+        &suffix,
+    );
     let body = wrap_control(&intent, &key, now)?;
     let response = post_control(&args.common.endpoint, &body)?;
     print!("{response}");
@@ -1271,7 +1289,14 @@ fn run_clear_veto(args: ClearVetoCmdArgs) -> Result<()> {
     let instrument = canonicalize_instrument_or_force(args.broker, &args.instrument, args.force)?;
     let now = Utc::now();
     let suffix = fresh_suffix()?;
-    let intent = build_clear_veto_intent(&instrument, &args.trade_id, &args.name, now, &suffix);
+    let intent = build_clear_veto_intent(
+        &instrument,
+        &args.trade_id,
+        &args.name,
+        args.account.as_deref(),
+        now,
+        &suffix,
+    );
     let body = wrap_control(&intent, &key, now)?;
     let response = post_control(&args.common.endpoint, &body)?;
     print!("{response}");

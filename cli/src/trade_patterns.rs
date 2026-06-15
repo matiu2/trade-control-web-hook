@@ -28,7 +28,8 @@ use serde::{Deserialize, Serialize};
 
 use trade_control_conventions::AlertBasename;
 use trade_control_core::intent::{
-    Action, BrokerKind, Direction, EntrySpec, Intent, PriceAnchor, PriceRef, TakeProfit, VetoLevel,
+    Action, BrokerKind, Direction, EntrySpec, Intent, MW_CANCEL_VETO_NAME, PriceAnchor, PriceRef,
+    TakeProfit, VetoLevel,
 };
 use trade_control_core::sig::KEY_LEN;
 
@@ -1071,7 +1072,7 @@ fn build_mw_cancel_alert(
         account,
         trade_id,
     );
-    intent.name = Some("mw-cancel".into());
+    intent.name = Some(MW_CANCEL_VETO_NAME.into());
     intent.ttl_hours =
         trade_control_core::tunable::Tunable::Static(ttl_hours_until(now, veto_expiry));
     intent.level = Some(VetoLevel::CancelPending);
@@ -1169,7 +1170,11 @@ fn build_mw_enter_alert(
     intent.needs_golden = needs_golden;
     intent.needs_confirmed = needs_confirmed;
     intent.requires_preps = Vec::new();
-    intent.vetos = vec!["mw-cancel".into(), "mw-abort".into(), "trade-expiry".into()];
+    intent.vetos = vec![
+        MW_CANCEL_VETO_NAME.into(),
+        "mw-abort".into(),
+        "trade-expiry".into(),
+    ];
     BuiltAlert {
         basename: AlertBasename::Enter.as_str().into_owned(),
         purpose: "enter: M/W per-bar stop entry (worker-computed geometry; vetoed by \
@@ -2860,6 +2865,7 @@ entry_mode: market
             .replace("{{close}}", "203.391")
             .replace("{{high}}", "203.395")
             .replace("{{low}}", "203.380")
+            .replace("{{open}}", "203.385")
             .replace("{{time}}", "2026-06-02T15:00:00Z")
             .replace("{{plot(\"signal_high\")}}", "203.395")
             .replace("{{plot(\"signal_low\")}}", "203.380")
@@ -2905,6 +2911,7 @@ entry_mode: market
             .replace("{{close}}", "203.391")
             .replace("{{high}}", "203.395")
             .replace("{{low}}", "203.380")
+            .replace("{{open}}", "203.385")
             .replace("{{time}}", "2026-06-02T15:00:00Z")
             .replace("{{plot(\"signal_high\")}}", "203.395")
             .replace("{{plot(\"signal_low\")}}", "203.380")
@@ -3146,6 +3153,14 @@ tp_price: 1.05
             } else {
                 wrap_signed_template_drawing(&alert.intent, &key).unwrap()
             };
+            // Every TV-template shell — Pine-bound enter and drawing alike —
+            // carries `open: {{open}}` (a built-in, added for M/W body-extreme
+            // logic). The M/W `05-enter` is the one that actually consumes it.
+            assert!(
+                body.contains("open: {{open}}"),
+                "alert {} must carry the open placeholder, got: {body}",
+                alert.basename
+            );
             if is_pine_bound {
                 assert!(
                     body.contains("{{plot("),
@@ -3157,8 +3172,8 @@ tp_price: 1.05
                     "drawing alert {} must not carry plot placeholders, got: {body}",
                     alert.basename
                 );
-                // Sanity: drawing alerts still carry the four
-                // universally-substituted shell placeholders.
+                // Sanity: drawing alerts still carry the universally-
+                // substituted shell placeholders.
                 assert!(body.contains("close: {{close}}"));
                 assert!(body.contains("time: \"{{time}}\""));
             }

@@ -42,6 +42,14 @@ indicator("Candle Signals", shorttitle="Candle Signals", overlay=true, max_label
 //   (it keeps firing on Long/Short Pattern). Requires a manual republish of
 //   the study after pulling this version.
 //
+// v2.5: adds `open={{open}}` to the "Every Bar Close" message. `open` is a
+//   TradingView built-in (no plot-index risk), letting the worker compute
+//   candle-body extremes (max(open,close) / min(open,close)) for M/W
+//   rogue-wick handling and dynamic neckline revision. Backward-compatible:
+//   the worker treats `open` as optional, so a chart still running v2.4
+//   keeps working (those bars just can't drive body-based logic). Requires a
+//   manual republish to start sending `open`.
+//
 // Single alert per direction; the worker-side Rhai engine reads the
 // shell vars to decide whether to act (golden filter, kind filter,
 // confirmation requirement, candle-size override, etc.).
@@ -563,4 +571,4 @@ alertcondition(bearish_signal or bearish_just_valid, "Short Pattern", PATTERN_MS
 // bar carrying only TradingView built-ins (no plots), since the worker needs
 // nothing from the chart beyond the live shell. Unused by H&S, which keeps
 // firing on the Long/Short Pattern conditions above.
-alertcondition(true, "Every Bar Close", 'close={{close}}\nhigh={{high}}\nlow={{low}}\ntime={{time}}')
+alertcondition(true, "Every Bar Close", 'close={{close}}\nhigh={{high}}\nlow={{low}}\nopen={{open}}\ntime={{time}}')

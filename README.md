@@ -721,6 +721,13 @@ export TRADE_CONTROL_ENDPOINT=https://trade-control.<account>.workers.dev
   --key-file ~/.config/trade-control/key.hex
 ./target/release/trade-control clear-prep EUR_USD break-and-close \
   --key-file ~/.config/trade-control/key.hex
+# Preps/vetos are keyed by account scope. An account-scoped prep/veto (one
+# whose `status` row shows `account: reversals`) is NOT cleared by the
+# default (global `_`) clear — pass --account to match the scope it was set
+# under, or the clear is a silent no-op:
+./target/release/trade-control clear-prep "NZD/JPY" break-and-close \
+  --broker tradenation --account reversals \
+  --key-file ~/.config/trade-control/key.hex
 ./target/release/trade-control clear-veto EUR_USD news-window \
   --trade-id eurusd-hs-1 \
   --key-file ~/.config/trade-control/key.hex
@@ -1350,6 +1357,39 @@ a fresh `web-hook-dev`" remap is a one-line edit per script.
 > The legacy top-level `deploy.sh` is deprecated and now just points at the
 > per-env scripts.
 
+### Per-environment Pine versions
+
+The Pine source (`pine-scripts/candle-signals-v2.pine`) carries **no
+webhook URL** — the URL is baked into `tv-arm-<env>` and substituted into
+the alert at create time. So one Pine source serves every environment; what
+differs per environment is **which Pine *version*** a chart runs.
+
+To pin a Pine version per environment, run **two studies on the chart with
+distinct base titles** — e.g. `Candle Signals v24` and `Candle Signals
+v25` — and point each environment's `tv-arm` at the one it should arm. The
+deploy scripts bake the target study title the same way they bake the
+webhook:
+
+- `deploy-dev.sh` sets `ENV_PINE_NAME` → `build.rs` `BAKED_PINE_NAME`, so
+  `tv-arm-dev` arms only the study whose **base title** (the part before the
+  ` (args)` suffix, which `tv-arm` strips) equals that name.
+- `deploy-staging.sh` bakes a different name, pinning staging to its own
+  version regardless of what's published on the chart.
+
+A plain `cargo install` with no env set falls back to the canonical
+`Candle Signals` (kept in sync with
+`trade_control_conventions::PINE_INDICATOR_NAME`).
+
+> **The chart study must be renamed to match the baked name.** `tv-arm`
+> matches by base title; if the baked name is `Candle Signals v25` but the
+> study on the chart is still titled `Candle Signals`, the arm fails loudly
+> with the list of titles it *did* find. Rename the study (TradingView →
+> study settings → title) in lockstep with flipping `ENV_PINE_NAME`.
+>
+> Keep an **active alert on only the targeted study**. `Every Bar Close`
+> fires per study, so an alert live on *both* versions would double-fire
+> each M/W enter.
+
 ## Test locally
 
 ```sh
@@ -1479,22 +1519,59 @@ Unlike H&S there is no prep chain and no re-entry (`max_retries: 0`):
 the cancel/abort vetos or a fill end the setup. See the M/W bundle table
 under "Alert basenames" above for what gets emitted.
 
-**Worker-side second-peak confirmation.** The enter alert fires every
-bar close, but the worker only arms the breakout stop when the bar shows
-a real second peak/trough — its extreme (high for an M, low for a W)
-must fall inside a window on the neckline→peak (C→B) leg:
+**Worker-side real-time arming.** Unlike the book — a post-hoc method
+that just stops at the neckline once *both* towers are printed — we arm in
+real time with only the left shoulder (B) and neckline (C) known. So the
+enter alert fires every bar close but the worker only arms the breakout
+stop after **two** live confirmations, both on the neckline→peak (C→B)
+leg, all MID-price:
 
-- **Floor `0.7`** — `neckline + 0.7 × (peak − neckline)`. A bar that
-  closes just past the neckline but whose high (M) / low (W) never
-  retraced this far back into the pattern is **declined** and the setup
-  stays armed for the next bar. (Without this, a shallow poke past the
-  neckline could arm and fill a premature entry.)
-- **Ceiling `1.3`** — `neckline + 1.3 × (peak − neckline)`, the same 1.3
-  extension the `mw-cancel` veto guards. A bar reaching it has
-  invalidated the pattern; declined here too as a safety net in case the
-  veto hasn't fired. Both fractions are fixed worker constants
-  (`SECOND_PEAK_MIN_FRAC` / `CANCEL_EXT_FRAC` in
-  `core/src/intent/mw_resolution.rs`); all comparisons are MID-price.
+1. **Right-tower window** — the bar's extreme (high for an M, low for a W)
+   must reach **within 30% of the left-shoulder high** and stay below the
+   1.3 extension:
+   - **Floor `0.7`** — `neckline + 0.7 × (peak − neckline)`. A bar whose
+     high (M) / low (W) never retraced this far back into the pattern is
+     **declined** and the setup stays armed for the next bar. (Without
+     this, a shallow poke past the neckline could arm a premature entry.)
+   - **Ceiling `1.3`** — `neckline + 1.3 × (peak − neckline)`, the same
+     extension the `mw-cancel` veto guards. A bar reaching it has
+     invalidated the pattern; declined here too as a safety net in case
+     the veto hasn't fired.
+2. **"Middle of the M" cross** — a confirmed right tower says the shape is
+   valid; the arming *trigger* is the bar that rolls back off it through
+   the 50% level, `mid50 = neckline + 0.5 × (peak − neckline)`:
+   - **M (short):** `high ≥ mid50 AND close < mid50` (crossed down).
+   - **W (long):** `low ≤ mid50 AND close > mid50` (crossed up).
+   - A bar that hasn't crossed is **declined** and the setup stays armed.
+
+   Only after both confirm does the worker place the breakout stop at the
+   neckline (book level, mid→bid/ask corrected). The fractions are fixed
+   worker constants (`RIGHT_TOWER_MIN_FRAC` / `CANCEL_EXT_FRAC` /
+   `MID_CROSS_FRAC` in `core/src/intent/mw_resolution.rs`).
+
+**Worker-side dynamic geometry (KV-backed).** The book reads the *higher
+shoulder* and the *deepest neckline* off a finished chart; we arm with only
+the left shoulder + neckline known, so the worker recovers them bar by bar
+and stores them per `trade_id` in KV (`mw-state:<scope>:<trade_id>`). On
+each `Every Bar Close` fire of an M/W enter, before resolving:
+
+- **Higher right shoulder** → recorded (body-based) and used as the SL
+  anchor (the higher of left vs right for an M, lower for a W).
+- **Deeper neckline** → a body that pulls below the current neckline but
+  stays inside the **60% validity floor** of the runup→shoulder leg lowers
+  (M) / raises (W) the neckline; entry/SL/TP re-derive off it.
+- **Cancel** → a body past the 60% floor kills the setup: the worker
+  cancels any pending order and writes a trade-scoped `mw-cancel` veto
+  (which the `05-enter` lists, so later fires are blocked). It **never
+  closes an open position** — `mw-cancel` is StopNextEntry-class.
+- **Rogue wicks** → every comparison uses candle **bodies**
+  (`max/min(open,close)`), so a lone wick can't move the shoulder/neckline
+  or trip the cancel. Needs the `open` field (Pine v2.5+); a pre-`open`
+  chart simply skips the dynamic update and rides the baked geometry.
+
+The decision is the pure `plan_mw_update` / `effective_mw_params`
+(`core/src/intent/mw_state.rs`); the worker wraps it with the KV read/write
+in `maybe_update_mw_state` (`src/lib.rs`). Baked params are the seed.
 
 ```sh
 cargo run -p tv-arm -- \

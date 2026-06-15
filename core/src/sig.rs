@@ -64,6 +64,7 @@ const UNSIGNED_VALUE_KEYS: &[&str] = &[
     "close",
     "high",
     "low",
+    "open",
     "time",
     "signal_high",
     "signal_low",

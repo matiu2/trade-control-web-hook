@@ -84,6 +84,7 @@ mod tests {
             close: 1.1,
             high: 1.1,
             low: 1.1,
+            open: None,
             time: ts("2026-05-13T12:00:00Z"),
             signal_high: None,
             signal_low: None,

@@ -7,9 +7,11 @@ use serde::{Deserialize, Serialize};
 
 mod expiry;
 mod mw_resolution;
+mod mw_state;
 mod resolution;
 
 pub use expiry::{ExpiryError, MAX_EXPIRY_BARS, resolve_cancel_at};
+pub use mw_state::{MwAnchors, MwUpdate, effective_mw_params, plan_mw_update};
 #[cfg(feature = "cli")]
 pub use resolution::MIN_R_FLOOR;
 pub use resolution::{Resolved, ResolvedEntry, ResolvedOnTooClose, RiskBudget};
@@ -23,6 +25,15 @@ pub struct Shell {
     pub close: f64,
     pub high: f64,
     pub low: f64,
+    /// Bar **open** — added 2026-06 for M/W body-extreme logic (rogue-wick
+    /// handling and dynamic neckline revision read `max(open,close)` /
+    /// `min(open,close)`, not the wick high/low). Optional: control-action
+    /// shells don't carry it, and charts armed under a pre-`open` Pine send
+    /// no `open` field — body-based logic must fall back gracefully (treat
+    /// `None` as "can't compute bodies this bar"). TV built-in `{{open}}`,
+    /// so no plot-index risk. Value is in [`crate::sig::UNSIGNED_VALUE_KEYS`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub open: Option<f64>,
     /// ISO-8601 timestamp from TradingView. Used as an upper bound on the
     /// alert's freshness — alerts from yesterday should be obvious.
     pub time: DateTime<Utc>,
@@ -797,6 +808,15 @@ pub const TRADE_ID_MAX_LEN: usize = 64;
 /// the worker's write side and the CLI's enter-builder can't drift apart.
 pub const REVERSAL_VETO_NAME: &str = "reversal";
 
+/// Fixed veto name for an M/W pattern cancellation. Written by the worker
+/// when the live geometry breaches the 60% validity floor (a body too deep
+/// into the runup) and by the chart-side `01-veto-mw-cancel` alert at the
+/// 1.3 extension. The M/W `05-enter` lists this in its `vetos`, so either
+/// write blocks future entries (StopNextEntry / CancelPending — never
+/// closes an open position). Single source of truth so the worker write
+/// side and the CLI enter-builder can't drift apart.
+pub const MW_CANCEL_VETO_NAME: &str = "mw-cancel";
+
 /// Returns true if `s` is a valid `trade_id` slug: lowercase ASCII
 /// alphanumerics + hyphens, 1..=64 chars, no leading/trailing hyphen,
 /// no consecutive hyphens. Used by [`Intent::validate`] and by the CLI
@@ -1471,6 +1491,20 @@ impl OnTooClose {
 }
 
 impl Shell {
+    /// Body top — `max(open, close)` — or `None` if this shell didn't
+    /// carry `open` (control shells, or a chart still on the pre-`open`
+    /// Pine). M/W dynamic geometry uses bodies, not wicks, so a lone rogue
+    /// wick can't move the right shoulder or trip the cancel.
+    pub fn body_high(&self) -> Option<f64> {
+        self.open.map(|o| o.max(self.close))
+    }
+
+    /// Body bottom — `min(open, close)` — or `None` if `open` is absent.
+    /// See [`Self::body_high`].
+    pub fn body_low(&self) -> Option<f64> {
+        self.open.map(|o| o.min(self.close))
+    }
+
     pub fn anchor_price(&self, anchor: PriceAnchor) -> f64 {
         match anchor {
             PriceAnchor::Close => self.close,
@@ -1520,6 +1554,7 @@ mod tests {
             close: 1.1000,
             high: 1.1020,
             low: 1.0980,
+            open: None,
             time: "2026-05-13T12:00:00Z".parse().unwrap(),
             signal_high: None,
             signal_low: None,
@@ -1554,6 +1589,26 @@ mod tests {
         s.recent_low = Some(1.0950);
         assert_eq!(s.anchor_price(PriceAnchor::RecentHigh), 1.1050);
         assert_eq!(s.anchor_price(PriceAnchor::RecentLow), 1.0950);
+    }
+
+    #[test]
+    fn body_extremes_none_without_open() {
+        // The default shell() has open: None.
+        let s = shell();
+        assert_eq!(s.body_high(), None);
+        assert_eq!(s.body_low(), None);
+    }
+
+    #[test]
+    fn body_extremes_use_open_and_close_not_wicks() {
+        let mut s = shell();
+        // Bullish body: open 1.0990 < close 1.1000; wicks (high/low) are wider.
+        s.open = Some(1.0990);
+        s.close = 1.1000;
+        s.high = 1.1020;
+        s.low = 1.0980;
+        assert_eq!(s.body_high(), Some(1.1000)); // max(open, close), not high
+        assert_eq!(s.body_low(), Some(1.0990)); // min(open, close), not low
     }
 
     #[test]

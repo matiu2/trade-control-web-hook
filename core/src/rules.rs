@@ -160,6 +160,10 @@ pub fn bind_shell_anchors(scope: &mut Scope, shell: &Shell) {
     scope.push_constant("low", shell.low);
     scope.push_constant("time", shell.time.timestamp_millis());
 
+    // `open` is optional: control shells and charts armed under a pre-`open`
+    // Pine don't carry it, so it binds as `()` when absent (a script that
+    // references it then gets a unit, same as the other optional anchors).
+    push_opt_f64(scope, "open", shell.open);
     push_opt_f64(scope, "signal_high", shell.signal_high);
     push_opt_f64(scope, "signal_low", shell.signal_low);
     push_opt_f64(scope, "signal_range", shell.signal_range);
@@ -386,6 +390,7 @@ mod tests {
             close: 1.2345,
             high: 1.2350,
             low: 1.2340,
+            open: Some(1.2343),
             time: "2026-05-26T10:00:00Z".parse().unwrap(),
             signal_high: Some(1.2348),
             signal_low: Some(1.2342),
@@ -410,6 +415,7 @@ mod tests {
             close: 1.0,
             high: 1.0,
             low: 1.0,
+            open: None,
             time: "2026-05-26T10:00:00Z".parse().unwrap(),
             signal_high: None,
             signal_low: None,

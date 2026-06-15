@@ -105,6 +105,7 @@ mod tests {
             close: 1.1000,
             high: 1.1020,
             low: 1.0980,
+            open: None,
             time: ts("2026-05-26T10:00:00Z"),
             signal_high: Some(1.1018),
             signal_low: Some(1.0982),

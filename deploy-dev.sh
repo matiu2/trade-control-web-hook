@@ -14,6 +14,11 @@ ENV_NAME="dev"
 ENV_BRANCH="main"
 ENV_WEBHOOK="https://trade-control-web-hook.msherborne.workers.dev"
 ENV_SUFFIX="dev"
+# Pine study title tv-arm-dev arms against. Dev runs the newer Pine (v25,
+# which sends `open` for M/W body-extreme logic). The chart study MUST be
+# renamed to exactly this base title (the `(args)` suffix is ignored) or
+# tv-arm-dev won't find it. See README "per-environment Pine versions".
+ENV_PINE_NAME="Candle Signals v25"
 
 source "$(dirname "$0")/deploy-lib.sh"
-deploy_env "$ENV_NAME" "$ENV_BRANCH" "$ENV_WEBHOOK" "$ENV_SUFFIX"
+deploy_env "$ENV_NAME" "$ENV_BRANCH" "$ENV_WEBHOOK" "$ENV_SUFFIX" "$ENV_PINE_NAME"
