@@ -28,8 +28,8 @@ use serde::{Deserialize, Serialize};
 
 use trade_control_conventions::AlertBasename;
 use trade_control_core::intent::{
-    Action, BrokerKind, Direction, EntrySpec, Intent, MW_CANCEL_VETO_NAME, PriceAnchor, PriceRef,
-    TakeProfit, VetoLevel,
+    Action, BrokerKind, Direction, EntrySpec, Intent, MW_CANCEL_VETO_NAME, MW_OVERSHOOT_VETO_NAME,
+    PriceAnchor, PriceRef, TakeProfit, VetoLevel,
 };
 use trade_control_core::sig::KEY_LEN;
 
@@ -947,7 +947,7 @@ fn assemble_trade(
 /// the chart — computes entry/SL/TP from the baked `mw` anchors plus the
 /// live shell OHLC (see `core::intent::mw_resolution`).
 ///
-/// The bundle is exactly four alerts:
+/// The bundle is exactly five alerts:
 ///
 /// 1. `01-veto-mw-cancel` — `CancelPending`. Fires intra-bar when price
 ///    crosses the 1.3-extension of the neckline→first-point leg; cancels
@@ -956,10 +956,14 @@ fn assemble_trade(
 /// 2. `01-veto-mw-abort` — `CancelPending`. Fires when a candle *closes*
 ///    back through the neckline; the breakout failed. `CancelPending`
 ///    not `ClosePositions` — once filled the trade rides its own SL/TP.
-/// 3. `02-veto-trade-expiry` — unchanged from H&S (time-fired
+/// 3. `01-veto-mw-overshoot` — `CancelPending`. Fires intra-bar when price
+///    runs 180% of the top→neckline leg (the move is essentially complete;
+///    a late entry's R:R no longer justifies opening). Static arm-time
+///    level — over-vetoes (the safe direction) as the pattern grows.
+/// 4. `02-veto-trade-expiry` — unchanged from H&S (time-fired
 ///    `ClosePositions` at wall-clock expiry).
-/// 4. `05-enter` — per-bar stop entry carrying the baked `mw` params and
-///    no fixed entry/stop_loss/take_profit; gated only by the three
+/// 5. `05-enter` — per-bar stop entry carrying the baked `mw` params and
+///    no fixed entry/stop_loss/take_profit; gated only by the four
 ///    vetos above (no preps), `max_retries: 0`.
 fn build_mw_pattern(spec: TradeSpec, now: DateTime<Utc>) -> Result<BuiltTrade> {
     // `is_mw` already guaranteed `spec.mw` is Some at the dispatch site;
@@ -991,6 +995,14 @@ fn build_mw_pattern(spec: TradeSpec, now: DateTime<Utc>) -> Result<BuiltTrade> {
             now,
         ),
         build_mw_abort_alert(
+            &spec.instrument,
+            &trade_id,
+            veto_expiry,
+            &spec.broker,
+            &spec.account,
+            now,
+        ),
+        build_mw_overshoot_alert(
             &spec.instrument,
             &trade_id,
             veto_expiry,
@@ -1117,6 +1129,42 @@ fn build_mw_abort_alert(
     }
 }
 
+/// `01-veto-mw-overshoot` — `CancelPending`. Fires intra-bar when price
+/// crosses the 180%-of-top→neckline level (the move is essentially
+/// complete; a late entry's R:R no longer justifies opening). The chart
+/// binds this to a computed static price (the arm-time overshoot level);
+/// `tv-arm`'s `alert_spec` sets the value + frequency. `CancelPending` not
+/// `ClosePositions` — overshoot only matters while the entry is pending; a
+/// filled trade rides its own SL/TP.
+fn build_mw_overshoot_alert(
+    instrument: &str,
+    trade_id: &str,
+    veto_expiry: DateTime<Utc>,
+    broker: &BrokerKind,
+    account: &str,
+    now: DateTime<Utc>,
+) -> BuiltAlert {
+    let id = format!("{trade_id}-mw-overshoot");
+    let mut intent = skeleton(
+        Action::Veto,
+        instrument,
+        id,
+        veto_expiry,
+        *broker,
+        account,
+        trade_id,
+    );
+    intent.name = Some(MW_OVERSHOOT_VETO_NAME.into());
+    intent.ttl_hours =
+        trade_control_core::tunable::Tunable::Static(ttl_hours_until(now, veto_expiry));
+    intent.level = Some(VetoLevel::CancelPending);
+    BuiltAlert {
+        basename: AlertBasename::VetoMwOvershoot.as_str().into_owned(),
+        purpose: "veto: mw-overshoot (cancel pending if price runs 180% of top→neckline)".into(),
+        intent,
+    }
+}
+
 /// `05-enter` for M / W. A per-bar stop entry carrying the baked `mw`
 /// params; the worker derives entry/SL/TP from them + the live shell, so
 /// `entry`, `stop_loss`, and `take_profit` are all left `None`. Gated by
@@ -1173,12 +1221,13 @@ fn build_mw_enter_alert(
     intent.vetos = vec![
         MW_CANCEL_VETO_NAME.into(),
         "mw-abort".into(),
+        MW_OVERSHOOT_VETO_NAME.into(),
         "trade-expiry".into(),
     ];
     BuiltAlert {
         basename: AlertBasename::Enter.as_str().into_owned(),
         purpose: "enter: M/W per-bar stop entry (worker-computed geometry; vetoed by \
-                  mw-cancel/mw-abort/trade-expiry)"
+                  mw-cancel/mw-abort/mw-overshoot/trade-expiry)"
             .into(),
         intent,
     }
@@ -2361,21 +2410,22 @@ mod tests {
     }
 
     #[test]
-    fn build_mw_emits_exactly_four_alerts() {
-        // M / W bundle: mw-cancel, mw-abort, trade-expiry, enter. No
-        // prep chain, no pcl-exhausted/invalidation vetos, no
+    fn build_mw_emits_exactly_five_alerts() {
+        // M / W bundle: mw-cancel, mw-abort, mw-overshoot, trade-expiry,
+        // enter. No prep chain, no pcl-exhausted/invalidation vetos, no
         // close-on-reversal.
         let now = ts("2026-05-20T00:00:00Z");
         for pattern in [TradePattern::M, TradePattern::W] {
             let spec = mw_spec(pattern, ts("2026-05-25T00:00:00Z"));
             let trade = build_trade_from_spec(spec, now).unwrap();
-            assert_eq!(trade.alerts.len(), 4, "{pattern:?}");
+            assert_eq!(trade.alerts.len(), 5, "{pattern:?}");
             let basenames: Vec<&str> = trade.alerts.iter().map(|a| a.basename.as_str()).collect();
             assert_eq!(
                 basenames,
                 vec![
                     "01-veto-mw-cancel",
                     "01-veto-mw-abort",
+                    "01-veto-mw-overshoot",
                     "02-veto-trade-expiry",
                     "05-enter",
                 ],
@@ -2385,10 +2435,12 @@ mod tests {
     }
 
     #[test]
-    fn build_mw_cancel_and_abort_are_cancel_pending() {
-        // Both M/W vetos are CancelPending — never ClosePositions. The
-        // abort especially: once filled the trade rides its own SL/TP, a
-        // neckline reclaim must not flatten an open position.
+    fn build_mw_cancel_abort_overshoot_are_cancel_pending() {
+        // All three price-level M/W vetos are CancelPending — never
+        // ClosePositions. The abort especially: once filled the trade
+        // rides its own SL/TP, a neckline reclaim must not flatten an open
+        // position. Same for overshoot (it's an entry-gate, not a thesis
+        // invalidation).
         let now = ts("2026-05-20T00:00:00Z");
         let spec = mw_spec(TradePattern::M, ts("2026-05-25T00:00:00Z"));
         let trade = build_trade_from_spec(spec, now).unwrap();
@@ -2396,6 +2448,8 @@ mod tests {
         assert_eq!(trade.alerts[0].intent.level, Some(VetoLevel::CancelPending));
         assert_eq!(trade.alerts[1].intent.name.as_deref(), Some("mw-abort"));
         assert_eq!(trade.alerts[1].intent.level, Some(VetoLevel::CancelPending));
+        assert_eq!(trade.alerts[2].intent.name.as_deref(), Some("mw-overshoot"));
+        assert_eq!(trade.alerts[2].intent.level, Some(VetoLevel::CancelPending));
     }
 
     #[test]
@@ -2406,7 +2460,7 @@ mod tests {
         let now = ts("2026-05-20T00:00:00Z");
         let spec = mw_spec(TradePattern::M, ts("2026-05-25T00:00:00Z"));
         let trade = build_trade_from_spec(spec, now).unwrap();
-        let enter = &trade.alerts[3].intent;
+        let enter = &trade.alerts[4].intent;
         assert_eq!(enter.action, Action::Enter);
         assert_eq!(enter.direction, Some(Direction::Short));
         let mw = enter.mw.expect("enter carries mw params");
@@ -2427,6 +2481,7 @@ mod tests {
             vec![
                 "mw-cancel".to_string(),
                 "mw-abort".to_string(),
+                "mw-overshoot".to_string(),
                 "trade-expiry".to_string(),
             ]
         );
@@ -2444,7 +2499,7 @@ mod tests {
         let now = ts("2026-05-20T00:00:00Z");
         let spec = mw_spec(TradePattern::W, ts("2026-05-25T00:00:00Z"));
         let trade = build_trade_from_spec(spec, now).unwrap();
-        assert_eq!(trade.alerts[3].intent.direction, Some(Direction::Long));
+        assert_eq!(trade.alerts[4].intent.direction, Some(Direction::Long));
     }
 
     #[test]
