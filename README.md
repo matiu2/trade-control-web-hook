@@ -1350,6 +1350,39 @@ a fresh `web-hook-dev`" remap is a one-line edit per script.
 > The legacy top-level `deploy.sh` is deprecated and now just points at the
 > per-env scripts.
 
+### Per-environment Pine versions
+
+The Pine source (`pine-scripts/candle-signals-v2.pine`) carries **no
+webhook URL** — the URL is baked into `tv-arm-<env>` and substituted into
+the alert at create time. So one Pine source serves every environment; what
+differs per environment is **which Pine *version*** a chart runs.
+
+To pin a Pine version per environment, run **two studies on the chart with
+distinct base titles** — e.g. `Candle Signals v24` and `Candle Signals
+v25` — and point each environment's `tv-arm` at the one it should arm. The
+deploy scripts bake the target study title the same way they bake the
+webhook:
+
+- `deploy-dev.sh` sets `ENV_PINE_NAME` → `build.rs` `BAKED_PINE_NAME`, so
+  `tv-arm-dev` arms only the study whose **base title** (the part before the
+  ` (args)` suffix, which `tv-arm` strips) equals that name.
+- `deploy-staging.sh` bakes a different name, pinning staging to its own
+  version regardless of what's published on the chart.
+
+A plain `cargo install` with no env set falls back to the canonical
+`Candle Signals` (kept in sync with
+`trade_control_conventions::PINE_INDICATOR_NAME`).
+
+> **The chart study must be renamed to match the baked name.** `tv-arm`
+> matches by base title; if the baked name is `Candle Signals v25` but the
+> study on the chart is still titled `Candle Signals`, the arm fails loudly
+> with the list of titles it *did* find. Rename the study (TradingView →
+> study settings → title) in lockstep with flipping `ENV_PINE_NAME`.
+>
+> Keep an **active alert on only the targeted study**. `Every Bar Close`
+> fires per study, so an alert live on *both* versions would double-fire
+> each M/W enter.
+
 ## Test locally
 
 ```sh
