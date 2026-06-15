@@ -20,4 +20,16 @@ fn main() {
     // Re-run when HEAD or the tag set moves so the baked string stays fresh.
     println!("cargo:rerun-if-changed=../.git/HEAD");
     println!("cargo:rerun-if-changed=../.git/refs/tags");
+
+    // Bake the per-environment webhook URL into the binary. The deploy
+    // scripts (`deploy-dev.sh` / `deploy-staging.sh` / future
+    // `deploy-live.sh`) set `TRADE_CONTROL_WEBHOOK` before building so each
+    // suffixed binary (`trade-control-staging`, `-dev`, …) contains its own
+    // environment's URL as the compiled-in default endpoint. A plain
+    // `cargo install` with no env set falls back to the dev URL.
+    let webhook = std::env::var("TRADE_CONTROL_WEBHOOK")
+        .unwrap_or_else(|_| "https://trade-control-web-hook.msherborne.workers.dev".to_string());
+    println!("cargo:rustc-env=BAKED_WEBHOOK={webhook}");
+    // The value is an env input, not a file — re-run when it changes.
+    println!("cargo:rerun-if-env-changed=TRADE_CONTROL_WEBHOOK");
 }

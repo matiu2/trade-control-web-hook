@@ -251,7 +251,7 @@ for (const item of payloads) {
       email: false,
       sms_over_email: false,
       mobile_push: true,
-      web_hook: 'https://trade-control-web-hook.msherborne.workers.dev',
+      web_hook: '{web_hook}',
       name: item.tv_name || null,
       conditions: [condition],
       active: true,

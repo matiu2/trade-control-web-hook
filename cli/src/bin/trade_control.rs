@@ -203,8 +203,12 @@ struct AccountEndpointArgs {
     #[arg(long, env = "TRADE_CONTROL_ADMIN_KEY_FILE")]
     admin_key_file: PathBuf,
     /// Worker URL (e.g. https://trade-control.<account>.workers.dev).
-    /// Falls back to `TRADE_CONTROL_ENDPOINT`.
-    #[arg(long, env = "TRADE_CONTROL_ENDPOINT")]
+    /// Precedence: this flag > `TRADE_CONTROL_ENDPOINT` env > the
+    /// compiled-in default baked by `build.rs` from `TRADE_CONTROL_WEBHOOK`
+    /// at build time (the dev URL for a plain `cargo install`). This is why
+    /// the per-environment binaries (`trade-control-staging`, `-dev`, …)
+    /// work standalone with no env var set.
+    #[arg(long, env = "TRADE_CONTROL_ENDPOINT", default_value = env!("BAKED_WEBHOOK"))]
     endpoint: String,
     /// Cloudflare Worker name for `wrangler secret put/delete`. Without
     /// it, wrangler reads the name from a `wrangler.toml` in the current
@@ -390,8 +394,12 @@ struct EndpointArgs {
     #[arg(long, env = "TRADE_CONTROL_KEY_FILE")]
     key_file: PathBuf,
     /// Worker URL (e.g. https://trade-control.<account>.workers.dev).
-    /// Falls back to `TRADE_CONTROL_ENDPOINT`.
-    #[arg(long, env = "TRADE_CONTROL_ENDPOINT")]
+    /// Precedence: this flag > `TRADE_CONTROL_ENDPOINT` env > the
+    /// compiled-in default baked by `build.rs` from `TRADE_CONTROL_WEBHOOK`
+    /// at build time (the dev URL for a plain `cargo install`). This is why
+    /// the per-environment binaries (`trade-control-staging`, `-dev`, …)
+    /// work standalone with no env var set.
+    #[arg(long, env = "TRADE_CONTROL_ENDPOINT", default_value = env!("BAKED_WEBHOOK"))]
     endpoint: String,
 }
 
@@ -775,9 +783,26 @@ fn shell_from_path(shell_path: &str) -> Result<Shell> {
     })
 }
 
+/// The name the completion script should bind to. Uses the actual invoked
+/// binary's file stem (`argv[0]`) so a renamed-on-install copy
+/// (`trade-control-staging`, `trade-control-dev`) emits completions for
+/// *its own* name rather than the static `trade-control`. Falls back to
+/// `trade-control` if argv[0] is unreadable.
+fn invoked_name() -> String {
+    std::env::args()
+        .next()
+        .and_then(|a| {
+            std::path::Path::new(&a)
+                .file_name()
+                .and_then(|s| s.to_str())
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| "trade-control".to_string())
+}
+
 fn run_completions(shell: Shell) {
     let mut cmd = Cli::command();
-    generate(shell, &mut cmd, "trade-control", &mut io::stdout());
+    generate(shell, &mut cmd, invoked_name(), &mut io::stdout());
     // For zsh, append a dynamic completer that fills the `instrument`
     // positional on control subcommands with the live TradeNation catalog
     // when --broker tradenation is in argv. Other shells get the static
