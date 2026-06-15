@@ -43,6 +43,16 @@ from `main` carrying the week's accumulated changes.
 
 <!-- Update the cells below on every deploy/promote. Dates are Brisbane. -->
 
+### dev
+
+| part | version | deployed (Brisbane) | notes |
+|---|---|---|---|
+| pine | `candle-signals-v2` | — | manual; record the TV version note |
+| tv-arm | `0.1.0` | 2026-06-15 | installed as `tv-arm-dev` (dev URL baked) |
+| trade-control | `0.2.0` | 2026-06-15 | installed as `trade-control-dev` (dev URL baked) |
+| backend | `v23` | 2026-06-15 | recording + single-cron; same code as staging |
+| contract | `v3` | — | unchanged by v23 (recording is observe-only) |
+
 ### staging
 
 | part | version | deployed (Brisbane) | notes |
