@@ -269,6 +269,48 @@ impl HasExpiry for NewsEntry {
     }
 }
 
+/// Evolving real-time geometry for one M/W setup, keyed by
+/// `(account, trade_id)`.
+///
+/// M/W setups arm in real time with only the **left shoulder** and
+/// **neckline** known; the right tower forms bar by bar. This row lets
+/// the worker recover, live, the two facts the book reads off a finished
+/// chart: a **higher right shoulder** (the book measures the stop from the
+/// higher of the two shoulders) and a **revised, deeper neckline** (a
+/// deeper pullback between the towers reshapes it). The baked
+/// [`MwParams`][crate::intent::MwParams] are the *seed*; this row holds
+/// the running correction applied on top. Absent until the first
+/// per-bar update writes it — when absent, resolution falls back to the
+/// baked params unchanged.
+///
+/// All prices are **MID** (same basis as `MwParams`). The mid→bid/ask
+/// spread correction stays in `mw_resolution`.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct MwState {
+    /// Current neckline (`C`). Seeded from the baked neckline; lowered
+    /// (M) / raised (W) when a deeper body-low (M) / body-high (W) prints
+    /// between the towers while the pattern is still valid (≥ 60% of the
+    /// runup→shoulder leg).
+    pub neckline: f64,
+    /// The right tower's extreme so far, MID, body-based (`max(open,close)`
+    /// for M / `min(open,close)` for W). `None` until a bar inside the
+    /// confirmation window prints. The SL anchor is the *higher* (M) /
+    /// *lower* (W) of this and the baked left shoulder.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub right_shoulder: Option<f64>,
+    /// When this row was last updated (audit / debugging).
+    pub updated_at: DateTime<Utc>,
+    /// Safety TTL — the cancel / abort / expiry vetos and a fill are the
+    /// authoritative end of a setup; this just ages an orphaned row out.
+    pub expires_at: DateTime<Utc>,
+}
+
+impl HasExpiry for MwState {
+    fn expires_at(&self) -> DateTime<Utc> {
+        self.expires_at
+    }
+}
+
 /// Global "the post-NY-close spread-blackout window is open" marker.
 ///
 /// Singleton key `spread-blackout:window`, written by Cron 1 at the
@@ -779,6 +821,39 @@ pub trait StateStore {
     /// [`Self::forget_seen`]).
     fn clear_spread_blackout_record(
         &self,
+        trade_id: &str,
+    ) -> impl Future<Output = Result<(), StateError>>;
+
+    /// Read the evolving M/W geometry for `(account, trade_id)`, or
+    /// `None` if absent / expired (the setup hasn't updated it yet, so
+    /// resolution falls back to the baked params). Global-first like the
+    /// veto / prep lookups: a `Some(account)` query also matches a global
+    /// (`None`) row.
+    fn get_mw_state(
+        &self,
+        account: Option<&str>,
+        trade_id: &str,
+    ) -> impl Future<Output = Result<Option<MwState>, StateError>>;
+
+    /// Create-or-update the evolving M/W geometry for `(account,
+    /// trade_id)`. Overwrites the prior row (and refreshes its TTL). The
+    /// caller computes the merged state from the prior row + the live bar
+    /// before calling this — the store is a dumb upsert.
+    fn upsert_mw_state(
+        &self,
+        account: Option<&str>,
+        trade_id: &str,
+        state: &MwState,
+        ttl_seconds: u64,
+    ) -> impl Future<Output = Result<(), StateError>>;
+
+    /// Delete the M/W geometry row for `(account, trade_id)`. Best-effort
+    /// (no-op if already gone). Called when the setup ends (fill / cancel /
+    /// abort) so a stale row can't leak into a re-armed setup reusing the
+    /// trade_id.
+    fn clear_mw_state(
+        &self,
+        account: Option<&str>,
         trade_id: &str,
     ) -> impl Future<Output = Result<(), StateError>>;
 }
@@ -1508,6 +1583,50 @@ mod memstore {
             self.delete(&format!("spread-blackout:rec:{trade_id}"));
             Ok(())
         }
+
+        async fn get_mw_state(
+            &self,
+            account: Option<&str>,
+            trade_id: &str,
+        ) -> Result<Option<MwState>, StateError> {
+            let now = Utc::now();
+            // Global-first: a global row satisfies an account-scoped query.
+            let global = format!("mw-state:{}:{trade_id}", account_scope(None));
+            let mut raw = self.get_live(&global, now);
+            if raw.is_none() && account.is_some() {
+                let scoped = format!("mw-state:{}:{trade_id}", account_scope(account));
+                raw = self.get_live(&scoped, now);
+            }
+            match raw {
+                Some(text) => serde_json::from_str(&text)
+                    .map(Some)
+                    .map_err(|e| StateError::Backend(format!("decode mw-state: {e}"))),
+                None => Ok(None),
+            }
+        }
+
+        async fn upsert_mw_state(
+            &self,
+            account: Option<&str>,
+            trade_id: &str,
+            state: &MwState,
+            ttl_seconds: u64,
+        ) -> Result<(), StateError> {
+            let key = format!("mw-state:{}:{trade_id}", account_scope(account));
+            let body = serde_json::to_string(state)
+                .map_err(|e| StateError::Backend(format!("encode mw-state: {e}")))?;
+            self.put(key, body, ttl_seconds.max(MIN_TTL_SECONDS), Utc::now());
+            Ok(())
+        }
+
+        async fn clear_mw_state(
+            &self,
+            account: Option<&str>,
+            trade_id: &str,
+        ) -> Result<(), StateError> {
+            self.delete(&format!("mw-state:{}:{trade_id}", account_scope(account)));
+            Ok(())
+        }
     }
 }
 
@@ -1612,6 +1731,62 @@ mod tests {
         assert!(!pollster::block_on(store.is_seen("abc")).unwrap());
         // Idempotent: forgetting again is a no-op.
         pollster::block_on(store.forget_seen("abc")).unwrap();
+    }
+
+    #[test]
+    fn memstore_mw_state_round_trips_and_clears() {
+        use super::memstore::MemStateStore;
+        let store = MemStateStore::new();
+        let now = Utc::now();
+        let tid = "m-eur-usd-abc123";
+
+        // Absent before any write.
+        assert_eq!(
+            pollster::block_on(store.get_mw_state(None, tid)).unwrap(),
+            None
+        );
+
+        let state = MwState {
+            neckline: 1.1120,
+            right_shoulder: Some(1.1185),
+            updated_at: now,
+            expires_at: now + chrono::Duration::hours(6),
+        };
+        pollster::block_on(store.upsert_mw_state(None, tid, &state, 6 * 3600)).unwrap();
+
+        let got = pollster::block_on(store.get_mw_state(None, tid))
+            .unwrap()
+            .expect("row present after upsert");
+        assert_eq!(got.neckline, 1.1120);
+        assert_eq!(got.right_shoulder, Some(1.1185));
+
+        // Global-first: an account-scoped query finds the global row.
+        let got_scoped = pollster::block_on(store.get_mw_state(Some("reversals"), tid))
+            .unwrap()
+            .expect("account query falls back to global row");
+        assert_eq!(got_scoped.neckline, 1.1120);
+
+        // Upsert overwrites (deeper neckline, no right shoulder yet).
+        let revised = MwState {
+            neckline: 1.1105,
+            right_shoulder: None,
+            updated_at: now,
+            expires_at: now + chrono::Duration::hours(6),
+        };
+        pollster::block_on(store.upsert_mw_state(None, tid, &revised, 6 * 3600)).unwrap();
+        let got = pollster::block_on(store.get_mw_state(None, tid))
+            .unwrap()
+            .unwrap();
+        assert_eq!(got.neckline, 1.1105);
+        assert_eq!(got.right_shoulder, None);
+
+        // Clear removes it; clearing again is a no-op.
+        pollster::block_on(store.clear_mw_state(None, tid)).unwrap();
+        assert_eq!(
+            pollster::block_on(store.get_mw_state(None, tid)).unwrap(),
+            None
+        );
+        pollster::block_on(store.clear_mw_state(None, tid)).unwrap();
     }
 
     #[test]

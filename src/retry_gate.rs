@@ -819,6 +819,29 @@ mod tests {
         async fn clear_spread_blackout_record(&self, _trade_id: &str) -> Result<(), StateError> {
             Ok(())
         }
+        async fn get_mw_state(
+            &self,
+            _account: Option<&str>,
+            _trade_id: &str,
+        ) -> Result<Option<trade_control_core::state::MwState>, StateError> {
+            Ok(None)
+        }
+        async fn upsert_mw_state(
+            &self,
+            _account: Option<&str>,
+            _trade_id: &str,
+            _state: &trade_control_core::state::MwState,
+            _ttl_seconds: u64,
+        ) -> Result<(), StateError> {
+            Ok(())
+        }
+        async fn clear_mw_state(
+            &self,
+            _account: Option<&str>,
+            _trade_id: &str,
+        ) -> Result<(), StateError> {
+            Ok(())
+        }
     }
 
     fn ts(s: &str) -> DateTime<Utc> {
