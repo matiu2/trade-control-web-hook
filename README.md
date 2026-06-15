@@ -721,6 +721,13 @@ export TRADE_CONTROL_ENDPOINT=https://trade-control.<account>.workers.dev
   --key-file ~/.config/trade-control/key.hex
 ./target/release/trade-control clear-prep EUR_USD break-and-close \
   --key-file ~/.config/trade-control/key.hex
+# Preps/vetos are keyed by account scope. An account-scoped prep/veto (one
+# whose `status` row shows `account: reversals`) is NOT cleared by the
+# default (global `_`) clear — pass --account to match the scope it was set
+# under, or the clear is a silent no-op:
+./target/release/trade-control clear-prep "NZD/JPY" break-and-close \
+  --broker tradenation --account reversals \
+  --key-file ~/.config/trade-control/key.hex
 ./target/release/trade-control clear-veto EUR_USD news-window \
   --trade-id eurusd-hs-1 \
   --key-file ~/.config/trade-control/key.hex
