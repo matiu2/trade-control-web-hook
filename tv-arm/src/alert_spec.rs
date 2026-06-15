@@ -20,7 +20,7 @@ use trade_control_conventions::{
 };
 
 use crate::geometry::pcl_exhausted_price_from_fib;
-use crate::mw_geometry::{abort_level, cancel_level};
+use crate::mw_geometry::{abort_level, cancel_level, overshoot_level};
 
 /// Pine study title this binary arms against, baked per environment by
 /// `build.rs` (`TRADE_CONTROL_PINE_NAME` → `BAKED_PINE_NAME`). Defaults to
@@ -353,6 +353,7 @@ pub fn build_alert_spec(
         // differ only in level and fire frequency.
         AlertBasename::VetoMwCancel => mw_price_veto(roles, MwVeto::Cancel, tv_name),
         AlertBasename::VetoMwAbort => mw_price_veto(roles, MwVeto::Abort, tv_name),
+        AlertBasename::VetoMwOvershoot => mw_price_veto(roles, MwVeto::Overshoot, tv_name),
     })
 }
 
@@ -414,6 +415,12 @@ enum MwVeto {
     /// The neckline itself. A *candle close* back through here means the
     /// breakout failed, so `OnBarClose`.
     Abort,
+    /// The 180%-of-top→neckline level (0.8 legs past the neckline toward
+    /// TP). The projected move is essentially complete, so a fresh entry's
+    /// R:R no longer justifies opening. Fires intra-bar the moment a
+    /// low (M) / high (W) reaches it, so `OnFirstFire`. The level is static
+    /// (baked at arm time); it can only over-veto as the pattern grows.
+    Overshoot,
 }
 
 /// Build the `PriceValue` payload for an M/W cancel / abort veto from
@@ -432,6 +439,10 @@ fn mw_price_veto(roles: &Roles, which: MwVeto, tv_name: String) -> Option<AlertP
     let (value, frequency) = match which {
         MwVeto::Cancel => (cancel_level(first_point, neckline), Frequency::OnFirstFire),
         MwVeto::Abort => (abort_level(neckline), Frequency::OnBarClose),
+        MwVeto::Overshoot => (
+            overshoot_level(first_point, neckline),
+            Frequency::OnFirstFire,
+        ),
     };
     Some(AlertPayload::PriceValue {
         value,
@@ -1021,6 +1032,38 @@ mod tests {
     }
 
     #[test]
+    fn mw_overshoot_is_price_value_at_180pct_on_first_fire() {
+        let roles = roles_with_m_path();
+        let ctx = DispatchContext::default();
+        let p = build_alert_spec(
+            "01-veto-mw-overshoot.yaml",
+            Direction::Short,
+            &roles,
+            &ctx,
+            true,
+        )
+        .unwrap()
+        .unwrap();
+        match p {
+            AlertPayload::PriceValue {
+                value,
+                condition_type,
+                frequency,
+                tv_name,
+                ..
+            } => {
+                // overshoot = 1.1120 - 0.8 * (1.1200 - 1.1120) = 1.1056
+                assert!((value - 1.1056).abs() < 1e-9, "value = {value}");
+                assert_eq!(condition_type, ConditionType::Cross);
+                // Pending stop must die the moment a low reaches it → OnFirstFire.
+                assert_eq!(frequency, Frequency::OnFirstFire);
+                assert_eq!(tv_name, "veto-mw-overshoot");
+            }
+            _ => panic!("expected PriceValue, got {p:?}"),
+        }
+    }
+
+    #[test]
     fn mw_vetos_without_path_return_none() {
         // No mw_path on the chart → the veto is skipped (logged by the
         // orchestrator), same as any missing H&S role.
@@ -1040,6 +1083,17 @@ mod tests {
         assert!(
             build_alert_spec(
                 "01-veto-mw-abort.yaml",
+                Direction::Short,
+                &roles,
+                &ctx,
+                true
+            )
+            .unwrap()
+            .is_none()
+        );
+        assert!(
+            build_alert_spec(
+                "01-veto-mw-overshoot.yaml",
                 Direction::Short,
                 &roles,
                 &ctx,

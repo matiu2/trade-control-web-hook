@@ -817,6 +817,15 @@ pub const REVERSAL_VETO_NAME: &str = "reversal";
 /// side and the CLI enter-builder can't drift apart.
 pub const MW_CANCEL_VETO_NAME: &str = "mw-cancel";
 
+/// Fixed veto name for an M/W pattern overshoot. Written by the chart-side
+/// `01-veto-mw-overshoot` alert when price runs 180% of the top→neckline
+/// leg (the projected move is essentially complete; a fresh entry's R:R no
+/// longer justifies opening). The M/W `05-enter` lists this in its `vetos`,
+/// so the alert blocks future entries (CancelPending — never closes an open
+/// position). Single source of truth so the chart write side and the CLI
+/// enter-builder can't drift apart.
+pub const MW_OVERSHOOT_VETO_NAME: &str = "mw-overshoot";
+
 /// Returns true if `s` is a valid `trade_id` slug: lowercase ASCII
 /// alphanumerics + hyphens, 1..=64 chars, no leading/trailing hyphen,
 /// no consecutive hyphens. Used by [`Intent::validate`] and by the CLI

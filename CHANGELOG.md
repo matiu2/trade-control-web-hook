@@ -1,5 +1,54 @@
 # Changelog
 
+## v26 — 2026-06-15 — M/W overshoot veto (180% of top→neckline)
+
+### Why
+
+An M/W entry that triggers after price has already run most of the way to TP
+has poor R:R — the projected move is nearly done. H&S already guards this with
+the `pcl-exhausted` veto; M/W had no equivalent. Operator request: veto if any
+low (M) / high (W) reaches **180% of the top→neckline leg** at any point
+(except for an already-open position).
+
+### What changed (behaviour)
+
+- **New `01-veto-mw-overshoot` alert** in the M/W bundle (now five alerts:
+  cancel, abort, **overshoot**, trade-expiry, enter). A `price crosses` alert
+  at the **180% of top→neckline** level — `top − 1.8·(top − neckline)`, which
+  equals `neckline − 0.8·(top − neckline)` (0.8 legs past the neckline toward
+  TP). Fires intra-bar (`OnFirstFire`); the `05-enter` lists `mw-overshoot` in
+  its `vetos`.
+- **`CancelPending`** — cancels a pending stop + blocks future entries, never
+  closes an open position (entry-gate, not thesis invalidation).
+- **Static, safe-direction.** The level is baked at arm time. Pine can't move
+  an alert and the WASM worker can't re-issue one, so as the pattern grows a
+  higher right shoulder / lower neckline the baked level only fires *early* —
+  over-vetoing (blocks some valid late entries, never lets a genuinely overshot
+  trade through). No worker-side live re-arming (deferred).
+
+### Config
+
+- New veto name `mw-overshoot` (`MW_OVERSHOOT_VETO_NAME`, single source of
+  truth). New basename `01-veto-mw-overshoot` (`AlertBasename::VetoMwOvershoot`).
+- No wire-format change (contract unchanged): it's another `veto` intent +
+  another chart price alert, both already-supported shapes.
+
+### Tests
+
+- `mw_geometry::overshoot_level` M/W worked examples + 180%-from-top /
+  0.8-legs-past-neckline equivalences.
+- `alert_spec`: overshoot is a `PriceValue` at 1.1056 (M worked anchors),
+  `Cross` / `OnFirstFire`; without-path returns `None`.
+- conventions basename round-trip (16→17 variants) + literal.
+- cli bundle: five alerts in order, all three price vetos `CancelPending`,
+  enter `vetos` includes `mw-overshoot`.
+
+### Follow-up
+
+- Worker-side live recomputation of the level (chase the moving geometry) —
+  needs the worker to re-issue chart alerts, which it can't today (WASM, no TV
+  creds). Only if static over-vetoing proves painful in practice.
+
 ## v25 — 2026-06-15 — M/W dynamic geometry: live right-shoulder / neckline + rogue-wick + candle `open`
 
 ### Why

@@ -130,6 +130,7 @@ emit a **different, smaller** bundle — no prep chain, single-shot:
 |---|---|---|---|
 | `01-veto-mw-cancel` | `veto` | Price crossing the 1.3-extension of the neckline→peak leg (**intra-bar, on first tick**) | Level `cancel-pending`. The same 1.3 extension the second peak must stay within, so it doubles as the two-peaks alignment ceiling. Cancels the resting entry + disarms. Value-bound, computed by `tv-arm`. |
 | `01-veto-mw-abort` | `veto` | A candle **closing** back through the neckline | Level `cancel-pending` (matters only while pending — once filled the trade rides its SL/TP). Value-bound at the neckline. |
+| `01-veto-mw-overshoot` | `veto` | Price reaching **180% of the top→neckline leg** (= 80% of the way neckline→TP) (**intra-bar, on first tick**) | Level `cancel-pending`. The projected move is essentially complete, so a fresh entry's R:R no longer justifies opening — cancels the resting entry + disarms, never closes an open position. Value-bound at a **static** arm-time price; as the pattern grows it only over-vetoes (the safe direction). M fires on a **low** reaching it, W on a **high**. |
 | `02-veto-trade-expiry` | `veto` | Vertical line crossing chart time | Same hard stop as H&S. |
 | `05-enter` | `enter` | Pine **`Every Bar Close`** alertcondition (every closed bar, not the golden/short-pattern plots) | Carries the baked static M/W params (`mw:` block); the **worker** computes entry/SL/TP from those + the live shell OHLC each bar, mid→bid/ask corrected with the arm-time spread. `max_retries: 0`, no preps. |
 
@@ -1569,7 +1570,19 @@ each `Every Bar Close` fire of an M/W enter, before resolving:
   or trip the cancel. Needs the `open` field (Pine v2.5+); a pre-`open`
   chart simply skips the dynamic update and rides the baked geometry.
 
-The decision is the pure `plan_mw_update` / `effective_mw_params`
+Separately, an **`01-veto-mw-overshoot`** chart alert guards the *late-entry*
+case: a `price crosses` alert at the **180% of top→neckline** level (= 80% of
+the way from neckline to TP — the projected move is essentially complete). It
+fires intra-bar (M on a low reaching it, W on a high), cancels the pending
+order, and disarms — never closing an open position. Unlike the dynamic
+neckline/shoulder above, this level is **static** (baked at arm time): Pine
+can't move an alert and the WASM worker can't re-issue one, so if the pattern
+later grows a higher shoulder / lower neckline the baked level only fires
+*early* — over-vetoing (the safe direction: it blocks some valid late entries
+but never lets a genuinely overshot trade through). It's the M/W analogue of
+the H&S `pcl-exhausted` veto.
+
+The dynamic-geometry decision is the pure `plan_mw_update` / `effective_mw_params`
 (`core/src/intent/mw_state.rs`); the worker wraps it with the KV read/write
 in `maybe_update_mw_state` (`src/lib.rs`). Baked params are the seed.
 

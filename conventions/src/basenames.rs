@@ -35,6 +35,15 @@ pub enum AlertBasename {
     /// disarms future entries. Value-bound at the neckline price; fires
     /// on bar close.
     VetoMwAbort,
+    /// `01-veto-mw-overshoot` — M/W overshoot: price ran 180% of the
+    /// top→neckline leg (= 80% of the way from neckline toward TP), so the
+    /// projected move is essentially complete and a fresh entry's R:R no
+    /// longer justifies opening. Cancels the pending stop and disarms
+    /// future entries (never closes an open position). Value-bound at the
+    /// arm-time 180% price; fires intra-bar on first cross. The level is
+    /// **static** (baked at arm time) — as the pattern grows it only
+    /// over-vetoes (the safe direction).
+    VetoMwOvershoot,
     /// `03-prep-break-and-close` — neckline break-and-close prep.
     PrepBreakAndClose,
     /// `04-prep-retest` — neckline retest prep.
@@ -72,6 +81,7 @@ impl AlertBasename {
             Self::VetoTradeExpiry => Cow::Borrowed("02-veto-trade-expiry"),
             Self::VetoMwCancel => Cow::Borrowed("01-veto-mw-cancel"),
             Self::VetoMwAbort => Cow::Borrowed("01-veto-mw-abort"),
+            Self::VetoMwOvershoot => Cow::Borrowed("01-veto-mw-overshoot"),
             Self::PrepBreakAndClose => Cow::Borrowed("03-prep-break-and-close"),
             Self::PrepRetest => Cow::Borrowed("04-prep-retest"),
             Self::PrepExpire(step) => Cow::Owned(format!("08-prep-expire-{step}")),
@@ -98,6 +108,7 @@ impl AlertBasename {
             "02-veto-trade-expiry" => Some(Self::VetoTradeExpiry),
             "01-veto-mw-cancel" => Some(Self::VetoMwCancel),
             "01-veto-mw-abort" => Some(Self::VetoMwAbort),
+            "01-veto-mw-overshoot" => Some(Self::VetoMwOvershoot),
             "03-prep-break-and-close" => Some(Self::PrepBreakAndClose),
             "04-prep-retest" => Some(Self::PrepRetest),
             "05-enter" => Some(Self::Enter),
@@ -134,13 +145,14 @@ impl AlertBasename {
 mod tests {
     use super::*;
 
-    fn variants() -> [AlertBasename; 16] {
+    fn variants() -> [AlertBasename; 17] {
         [
             AlertBasename::VetoTooHigh,
             AlertBasename::VetoTooLow,
             AlertBasename::VetoTradeExpiry,
             AlertBasename::VetoMwCancel,
             AlertBasename::VetoMwAbort,
+            AlertBasename::VetoMwOvershoot,
             AlertBasename::PrepBreakAndClose,
             AlertBasename::PrepRetest,
             AlertBasename::PrepExpire("break-and-close".into()),
@@ -174,6 +186,10 @@ mod tests {
         );
         assert_eq!(AlertBasename::VetoMwCancel.as_str(), "01-veto-mw-cancel");
         assert_eq!(AlertBasename::VetoMwAbort.as_str(), "01-veto-mw-abort");
+        assert_eq!(
+            AlertBasename::VetoMwOvershoot.as_str(),
+            "01-veto-mw-overshoot"
+        );
         assert_eq!(
             AlertBasename::PrepBreakAndClose.as_str(),
             "03-prep-break-and-close"

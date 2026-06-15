@@ -1,5 +1,54 @@
 # TODO
 
+## ACTIVE — M/W overshoot veto (180% of top→neckline)
+
+Add an M-trade (and W mirror) "overshoot" veto: when any low (M) / high (W)
+crosses the **180% of top→neckline** level, cancel pending + block future
+entries (never close an open position). Like H&S pcl-exhausted but expressed
+from the peak.
+
+Geometry (locked with user): with `top`(peak)=0%, `neckline`=100%, the veto
+sits at 180%: `veto = top − 1.8·(top − neckline)`. Equivalently
+`neckline − 0.8·(top − neckline)` (sign-symmetric with `cancel_level`, so M is
+below the neckline / W above). M fires when **low ≤** level; W when **high ≥**.
+
+Decision (locked): **static baked, safe-direction.** ONE intra-bar
+`price crosses` alert at the arm-time 180% level (`OnFirstFire`). Pine can't
+move alerts and the WASM worker can't re-issue them, so the level is fixed at
+arm time. As the pattern grows (higher right shoulder / lower neckline) the
+static level only **over-vetoes** (blocks some valid late entries, never takes
+a truly overshot one) — the safe direction. No worker-side live re-arming.
+
+Scope: `CancelPending` (cancel pending stop + block future entries, never close
+an open position) — matches `mw-cancel`/`mw-abort` and "except already-open
+positions".
+
+### Steps
+- [x] conventions/basenames.rs: `VetoMwOvershoot` → `01-veto-mw-overshoot`
+      (as_str + parse + variants() 16→17 + known_literal test)
+- [x] core/intent.rs: `MW_OVERSHOOT_VETO_NAME = "mw-overshoot"` const
+- [x] tv-arm/mw_geometry.rs: `overshoot_level(first_point, neckline)` + tests
+      (M + W worked examples; sign symmetry)
+- [x] tv-arm/alert_spec.rs: `MwVeto::Overshoot` → (overshoot_level, OnFirstFire);
+      wire `VetoMwOvershoot` → `mw_price_veto`; test asserts level + freq
+- [x] cli/trade_patterns.rs: `build_mw_overshoot_alert` (Veto/CancelPending,
+      name = MW_OVERSHOOT_VETO_NAME); add to `build_mw_pattern` bundle; add the
+      name to the enter `vetos`; update bundle tests (basenames + vetos lists)
+- [x] README: M/W bundle table gains `01-veto-mw-overshoot`
+- [x] CHANGELOG: v26 entry
+- [x] cargo test (workspace) + clippy (native+wasm) + fmt — all green
+- [ ] commit + push + tag v26; advance parent submodule pointer
+- [ ] deploy to BOTH dev and staging (user: no trades taken this week)
+
+### Not doing (per user, deferred)
+- No worker-side live recomputation / re-arming of the level. (Phase-2 only if
+  over-vetoing proves painful — would need the worker to chase the level, which
+  it can't today: WASM, no TV creds.)
+- No Pine-side moving level (Pine has no per-trade anchors — the rejected
+  per-trade-state-in-Pine problem).
+
+---
+
 ## ACTIVE — spread-blackout demo-validation checklist (week of 2026-06-13)
 
 The full DST-aware spread-blackout feature (Systems 1/2/3 + state machine +

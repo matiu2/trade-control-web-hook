@@ -128,6 +128,36 @@ pub fn abort_level(neckline: f64) -> f64 {
     neckline
 }
 
+/// Overshoot level: the **180% of top→neckline** price — the point past
+/// which the projected move is essentially complete and a fresh entry's
+/// R:R no longer justifies opening (the M/W analogue of the H&S
+/// pcl-exhausted veto).
+///
+/// With `top` (= `first_point`, the peak/trough) at 0% and `neckline` at
+/// 100%, the unit leg is `first_point − neckline`. The 180% level is:
+///
+/// ```text
+///   level = first_point − 1.8 × (first_point − neckline)
+///         = neckline − 0.8 × (first_point − neckline)
+/// ```
+///
+/// The two forms are algebraically identical; the second is written off
+/// the neckline so the sign falls out the same way as [`cancel_level`] —
+/// for an M (short) `first_point > neckline`, so the level sits *below*
+/// the neckline (0.8 legs past it, toward TP); for a W (long) it sits
+/// *above*. No direction parameter needed.
+///
+/// The chart binds this to a `price crosses` alert firing intra-bar: an M
+/// fires when a **low** reaches it, a W when a **high** does. The level is
+/// **static** (baked at arm time). If the pattern later grows a higher
+/// right shoulder or a lower neckline the true 180% level moves further
+/// away, so this baked level only ever fires *early* — over-vetoing (the
+/// safe direction: it blocks some valid late entries but never lets a
+/// genuinely overshot trade through).
+pub fn overshoot_level(first_point: f64, neckline: f64) -> f64 {
+    neckline - 0.8 * (first_point - neckline)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -217,6 +247,51 @@ mod tests {
     fn abort_level_is_neckline() {
         assert_eq!(abort_level(M_C), M_C);
         assert_eq!(abort_level(W_C), W_C);
+    }
+
+    #[test]
+    fn overshoot_level_m_worked_example() {
+        // M (short): top B = 1.1200, neckline C = 1.1120, leg = 0.0080.
+        //   level = 1.1120 − 0.8 × 0.0080 = 1.1120 − 0.0064 = 1.1056
+        let level = overshoot_level(M_B, M_C);
+        assert!((level - 1.1056).abs() < 1e-9, "overshoot = {level}");
+        // Sits below the neckline (0.8 legs past it, toward TP).
+        assert!(level < M_C);
+    }
+
+    #[test]
+    fn overshoot_level_w_worked_example() {
+        // W (long), mirror: top B = 1.1000, neckline C = 1.1080, leg = −0.0080.
+        //   level = 1.1080 − 0.8 × (−0.0080) = 1.1080 + 0.0064 = 1.1144
+        let level = overshoot_level(W_B, W_C);
+        assert!((level - 1.1144).abs() < 1e-9, "overshoot = {level}");
+        // Sits above the neckline.
+        assert!(level > W_C);
+    }
+
+    #[test]
+    fn overshoot_level_is_180pct_from_top() {
+        // The 180% level measured from the top equals the off-neckline form.
+        //   top − 1.8 × (top − neckline)  ==  neckline − 0.8 × (top − neckline)
+        let from_top = M_B - 1.8 * (M_B - M_C);
+        assert!((overshoot_level(M_B, M_C) - from_top).abs() < 1e-12);
+        let from_top_w = W_B - 1.8 * (W_B - W_C);
+        assert!((overshoot_level(W_B, W_C) - from_top_w).abs() < 1e-12);
+    }
+
+    #[test]
+    fn overshoot_is_0_8_legs_past_neckline_toward_tp() {
+        // TP is one full leg past the neckline (2 × neckline − top). The
+        // overshoot level is 0.8 of the way from neckline to TP.
+        let leg = M_B - M_C; // positive for M
+        let tp = 2.0 * M_C - M_B;
+        let expected = M_C + 0.8 * (tp - M_C);
+        assert!((overshoot_level(M_B, M_C) - expected).abs() < 1e-12);
+        // And it sits between the neckline and the TP (further than neckline,
+        // not as far as TP).
+        assert!(overshoot_level(M_B, M_C) < M_C);
+        assert!(overshoot_level(M_B, M_C) > tp);
+        let _ = leg;
     }
 
     #[test]
