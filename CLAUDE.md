@@ -14,6 +14,73 @@ Two layers live in this repo:
 
 Read the README first for the user-facing story. This file is for hazards.
 
+## Branches are environments — know which one you're on
+
+Each git **branch is a deploy environment**, and each carries its **own
+`wrangler.toml`** (own worker name, KV namespace, R2 bucket). A plain
+`wrangler deploy` on a branch targets that environment — so the branch you
+have checked out decides which live worker you'd affect. Check it before
+deploying anything.
+
+| branch | environment | worker | CLIs | who uses it |
+|---|---|---|---|---|
+| `main` | **dev** | `trade-control-web-hook` | `*-dev` | coding / development |
+| `staging` | **staging (demo)** | `trade-control-web-hook-staging` | `*-staging` | the week's live demo trading |
+| `prod` | **prod (real money)** | `trade-control-web-hook-prod` | `*-prod` | **not stood up yet** — first promotion target |
+
+Current working split (2026-06): **trading runs on `staging`** (demo
+account, real-time), **coding happens on `main`**. So treat the `staging`
+worker as live — don't redeploy it casually mid-week, because a week of
+unchanged + profitable running is the promotion gate. Develop on `main`,
+let it bake on `staging`.
+
+**Deploy** with the per-environment scripts, never bare `wrangler deploy`
+(the scripts also rebuild + install the matching suffixed CLIs and bake the
+right webhook URL into them):
+
+```sh
+git checkout main    && ./deploy-dev.sh       # dev
+git checkout staging && ./deploy-staging.sh   # staging
+# ./deploy-live.sh is added at the first prod promotion.
+```
+
+The scripts branch-guard, so they refuse to deploy from the wrong branch.
+`deploy-lib.sh` holds shared logic; the per-env wrappers hold only the
+branch + URL.
+
+### Per-environment CLIs (`trade-control-staging`, `tv-arm-staging`, …)
+
+The CLIs are installed under **suffixed names** with the environment's
+worker URL **baked in at compile time** (`build.rs` →
+`cargo:rustc-env=BAKED_WEBHOOK`, fed from `TRADE_CONTROL_WEBHOOK` by the
+deploy script). So `trade-control-staging status` hits the staging worker
+with no env var or `--endpoint` flag. Endpoint precedence is
+`--endpoint` > `TRADE_CONTROL_ENDPOINT` env > baked default.
+
+**Do not export `TRADE_CONTROL_ENDPOINT` globally** (e.g. in `~/.zshrc`) —
+it overrides every suffixed binary's baked URL and silently points them all
+at one worker. The unsuffixed `trade-control` / `tv-arm` / `tv-news`
+binaries have been removed; use the suffixed ones.
+
+This is a **Cargo workspace** (root `Cargo.toml`; `cli`, `tv-arm`,
+`tv-news` are members → shared `./target/`). The parent repo's CLAUDE.md
+saying "NOT a workspace, no root Cargo.toml" is about the *outer*
+trading-libraries repo and does **not** apply to this submodule. Build CLIs
+with `cargo build -p <pkg>` (note `cli`'s package is `trade-control-cli`,
+binary `trade-control`).
+
+### Promotion (staging → prod), the upcoming `prod` branch
+
+`prod` doesn't exist yet. The plan: when `staging` has run a full week
+unchanged + profitable, it gets merged into a new `prod` branch with a
+prod-pointed `wrangler.toml`, and a fresh `staging` is cut from `main`.
+**Known wrinkle for whoever sets up prod:** the current intent is that
+`trade-control-web-hook` (today's dev worker) *becomes prod*, and a new
+`trade-control-web-hook-dev` worker is cut for dev. When that happens,
+`deploy-dev.sh`'s `ENV_WEBHOOK` changes to the new dev URL and
+`deploy-live.sh` points at `trade-control-web-hook`. Keep each branch's
+`wrangler.toml` divergent and pointed at its own worker.
+
 ## Things the README doesn't shout
 
 ### "retry" / `max_retries` does NOT mean retrying failed placements
