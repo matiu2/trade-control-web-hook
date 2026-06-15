@@ -1,5 +1,50 @@
 # Changelog
 
+## v27 — 2026-06-15 — M/W not-armed-yet declines are 200, not 400 (bug #7)
+
+### Why
+
+Every M/W `enter` bar that isn't yet a valid arming bar was declined with
+`ResolveError::InvalidGeometry`, and the worker mapped **all** resolve errors
+to a single `400 rejected: resolve-failed`. So a routine "decline this bar,
+stay armed for the next" — the *most common* M/W enter outcome — read as an
+HTTP 400 bad request, indistinguishable from a genuinely malformed enter
+(wrong-side SL, entry outside SL..TP, sub-1R, bad script). This polluted the
+`trading-tax-tracker` timeline/verdict and masked real geometry bugs in the
+noise of routine declines. Surfaced by `m-japan-225-ccabdfb7` on 2026-06-15.
+
+### What changed (behaviour)
+
+- **New `ResolveError::NotArmedYet`** variant. The three M/W arming gates in
+  `from_mw_intent` (right-tower confirmation, middle-of-the-M cross, breakout
+  stop on the correct side of the close) now return `NotArmedYet` instead of
+  `InvalidGeometry`.
+- **Worker maps it to a benign `200 declined: mw-not-armed`** (distinct
+  `outcome` string), while genuinely malformed enters keep `400
+  rejected: resolve-failed`. The decline is still a seen-id no-op, so the
+  setup stays armed for the next bar exactly as before — only the wire status
+  and outcome string change.
+
+### Breaking
+
+None. `InvalidGeometry` retains its bad-request meaning for the standard
+(non-M/W) wrong-side SL/limit/stop cases. No wire-format or signed-field
+change.
+
+### Tests
+
+- `core`: the nine M/W gate-decline tests now assert `NotArmedYet`; added
+  `all_three_arming_gates_return_not_armed_yet` pinning all three gates to the
+  new variant (bug #7).
+- The standard-path wrong-side tests still assert `InvalidGeometry`,
+  preserving the distinction at the `lib.rs` match site.
+
+### Follow-up
+
+Pairs with bug #8 (`trading-tax-tracker` timeline drops the `mw-abort`
+veto-set event) — the timeline side consumes this 200/400 split to stop
+labelling routine declines as bad requests.
+
 ## v26 — 2026-06-15 — M/W overshoot veto (180% of top→neckline)
 
 ### Why

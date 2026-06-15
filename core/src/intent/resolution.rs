@@ -97,6 +97,15 @@ pub enum ResolveError {
     MissingField(&'static str),
     /// Direction and SL placement disagree (e.g. long with SL above entry).
     InvalidGeometry,
+    /// An M/W `enter` bar that hasn't completed its real-time arming
+    /// sequence yet — the right tower isn't confirmed, price hasn't
+    /// crossed the middle-of-the-M, or the breakout stop would sit on the
+    /// wrong side of the close. This is the **expected, recurring** outcome
+    /// on most M/W fires ("decline this bar, stay armed for the next"), not
+    /// a malformed request. The worker maps it to a benign 2xx decline
+    /// rather than the 400 it gives genuine `InvalidGeometry`. See
+    /// [`Resolved::from_mw_intent`].
+    NotArmedYet,
     /// Action is not `enter`.
     NotAnEntry,
     /// `min_r` override is below the hard floor (1.0).
@@ -137,6 +146,7 @@ impl core::fmt::Display for ResolveError {
         match self {
             Self::MissingField(name) => write!(f, "missing field for entry: {name}"),
             Self::InvalidGeometry => f.write_str("stop/entry geometry inconsistent with direction"),
+            Self::NotArmedYet => f.write_str("M/W setup has not completed its arming sequence yet"),
             Self::NotAnEntry => f.write_str("intent is not an entry action"),
             Self::MinRBelowFloor { requested } => write!(
                 f,

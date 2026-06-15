@@ -14,7 +14,7 @@ pub use expiry::{ExpiryError, MAX_EXPIRY_BARS, resolve_cancel_at};
 pub use mw_state::{MwAnchors, MwUpdate, effective_mw_params, plan_mw_update};
 #[cfg(feature = "cli")]
 pub use resolution::MIN_R_FLOOR;
-pub use resolution::{Resolved, ResolvedEntry, ResolvedOnTooClose, RiskBudget};
+pub use resolution::{ResolveError, Resolved, ResolvedEntry, ResolvedOnTooClose, RiskBudget};
 
 /// Plaintext outer YAML — the part TradingView substitutes `{{...}}` into.
 /// The intent fields sit alongside these at the top level of the signed

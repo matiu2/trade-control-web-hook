@@ -37,7 +37,7 @@ use trade_control_core::broker::{Broker, EntryError, EntryRequest};
 use trade_control_core::incoming::{self, parse_and_verify};
 use trade_control_core::intent::{
     Action, BrokerKind, Intent, MW_CANCEL_VETO_NAME, MwAnchors, MwUpdate, REVERSAL_VETO_NAME,
-    Resolved, Shell, VetoLevel, effective_mw_params, plan_mw_update,
+    ResolveError, Resolved, Shell, VetoLevel, effective_mw_params, plan_mw_update,
 };
 use trade_control_core::rules::{self, RuleError};
 use trade_control_core::sig;
@@ -1312,6 +1312,24 @@ pub(crate) async fn run_enter<B: Broker>(
     };
     let resolved = match resolve_result {
         Ok(r) => r,
+        // An M/W bar that hasn't completed its real-time arming sequence is
+        // a *benign, expected* decline ("stay armed for the next bar"), not a
+        // bad request. Report it as a 200 with a distinct `declined:` outcome
+        // so the timeline/verdict downstream can tell routine M/W declines
+        // apart from a genuinely malformed enter. It is still a seen-id
+        // `Skip` (Rejected), so the setup stays armed. See bug #7.
+        Err(ResolveError::NotArmedYet) => {
+            rlog!(
+                "resolve: M/W not armed yet — declining this bar (id={})",
+                verified.intent.id
+            );
+            return ActionResult::Rejected {
+                response: Response::ok("declined: mw-not-armed"),
+                outcome: "declined: mw-not-armed".into(),
+            };
+        }
+        // Genuinely malformed enter (wrong-side SL/limit/stop, entry outside
+        // SL..TP, sub-1R, missing field, bad script): a real 400 bad request.
         Err(err) => {
             rlog_err!("resolve: {err}");
             return ActionResult::Rejected {

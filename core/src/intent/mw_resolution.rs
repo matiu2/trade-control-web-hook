@@ -90,10 +90,13 @@
 //! confirmation window above, or whose close has *not* yet broken the
 //! neckline (so the breakout stop would sit on the wrong side of the
 //! current price), is declined here with
-//! [`ResolveError::InvalidGeometry`]. Post the 2026-06 seen-id fix a
-//! non-`Ok` resolve does **not** mark the intent id seen, so the next
-//! bar's fire is allowed through — i.e. the setup stays armed until a
-//! bar actually breaks out (or a cancel / abort / expiry veto ends it).
+//! [`ResolveError::NotArmedYet`] — a benign "decline this bar" outcome
+//! distinct from the genuine bad-request [`ResolveError::InvalidGeometry`]
+//! (operator typo: SL on the wrong side). The worker maps `NotArmedYet`
+//! to a 2xx decline, not a 400. Post the 2026-06 seen-id fix a non-`Ok`
+//! resolve does **not** mark the intent id seen, so the next bar's fire
+//! is allowed through — i.e. the setup stays armed until a bar actually
+//! breaks out (or a cancel / abort / expiry veto ends it).
 
 use super::resolution::{ResolveError, Resolved, ResolvedEntry};
 use super::{Direction, Intent, MwParams, Shell};
@@ -200,7 +203,7 @@ impl Resolved {
             Direction::Long => shell.low <= right_tower && shell.low > cancel,
         };
         if !right_tower_confirmed {
-            return Err(ResolveError::InvalidGeometry);
+            return Err(ResolveError::NotArmedYet);
         }
 
         // "Middle of the M" downward-cross trigger. A confirmed right tower
@@ -221,7 +224,7 @@ impl Resolved {
             Direction::Long => shell.low <= mid50 && shell.close > mid50,
         };
         if !crossed_middle {
-            return Err(ResolveError::InvalidGeometry);
+            return Err(ResolveError::NotArmedYet);
         }
 
         // The entry is a breakout *stop*: it must sit on the far side of
@@ -233,7 +236,7 @@ impl Resolved {
             Direction::Short => entry < shell.close,
         };
         if !stop_on_correct_side {
-            return Err(ResolveError::InvalidGeometry);
+            return Err(ResolveError::NotArmedYet);
         }
 
         // Shared tail: SL..TP range check, geometry snapshot, min_r, and
@@ -439,12 +442,12 @@ mod tests {
     #[test]
     fn short_stop_on_wrong_side_is_declined() {
         // Close already below the entry (price gapped through) → the stop
-        // can't be placed below the close → InvalidGeometry (stay armed).
+        // can't be placed below the close → NotArmedYet (stay armed).
         let intent = mw_intent(Direction::Short, m_params());
         // high passes the window; close 1.1100 is below entry → stop-side fail.
         let err =
             Resolved::from_mw_intent(&intent, &shell_hlc(1.1200, 1.1100, 1.1100), &m_params());
-        assert!(matches!(err, Err(ResolveError::InvalidGeometry)), "{err:?}");
+        assert!(matches!(err, Err(ResolveError::NotArmedYet)), "{err:?}");
     }
 
     #[test]
@@ -453,7 +456,7 @@ mod tests {
         // low passes the window; close 1.1090 is above entry → stop-side fail.
         let err =
             Resolved::from_mw_intent(&intent, &shell_hlc(1.1090, 1.1000, 1.1090), &w_params());
-        assert!(matches!(err, Err(ResolveError::InvalidGeometry)), "{err:?}");
+        assert!(matches!(err, Err(ResolveError::NotArmedYet)), "{err:?}");
     }
 
     // ---- Second-peak confirmation window (the 0.7 / 1.3 gate) ----
@@ -481,7 +484,7 @@ mod tests {
         let intent = mw_intent(Direction::Short, audcad_m());
         let err =
             Resolved::from_mw_intent(&intent, &shell_hlc(0.98430, 0.98300, 0.98400), &audcad_m());
-        assert!(matches!(err, Err(ResolveError::InvalidGeometry)), "{err:?}");
+        assert!(matches!(err, Err(ResolveError::NotArmedYet)), "{err:?}");
     }
 
     #[test]
@@ -501,7 +504,7 @@ mod tests {
         let intent = mw_intent(Direction::Short, audcad_m());
         let err =
             Resolved::from_mw_intent(&intent, &shell_hlc(0.98560, 0.98300, 0.98400), &audcad_m());
-        assert!(matches!(err, Err(ResolveError::InvalidGeometry)), "{err:?}");
+        assert!(matches!(err, Err(ResolveError::NotArmedYet)), "{err:?}");
     }
 
     #[test]
@@ -512,7 +515,7 @@ mod tests {
         let intent = mw_intent(Direction::Long, w_params());
         let err =
             Resolved::from_mw_intent(&intent, &shell_hlc(1.1080, 1.1030, 1.1080), &w_params());
-        assert!(matches!(err, Err(ResolveError::InvalidGeometry)), "{err:?}");
+        assert!(matches!(err, Err(ResolveError::NotArmedYet)), "{err:?}");
     }
 
     #[test]
@@ -521,7 +524,7 @@ mod tests {
         let intent = mw_intent(Direction::Long, w_params());
         let err =
             Resolved::from_mw_intent(&intent, &shell_hlc(1.1080, 1.0976, 1.1080), &w_params());
-        assert!(matches!(err, Err(ResolveError::InvalidGeometry)), "{err:?}");
+        assert!(matches!(err, Err(ResolveError::NotArmedYet)), "{err:?}");
     }
 
     // ---- "Middle of the M" downward-cross trigger ----
@@ -539,7 +542,7 @@ mod tests {
         let intent = mw_intent(Direction::Short, audcad_m());
         let err =
             Resolved::from_mw_intent(&intent, &shell_hlc(0.98470, 0.98300, 0.98450), &audcad_m());
-        assert!(matches!(err, Err(ResolveError::InvalidGeometry)), "{err:?}");
+        assert!(matches!(err, Err(ResolveError::NotArmedYet)), "{err:?}");
     }
 
     #[test]
@@ -559,7 +562,7 @@ mod tests {
         let intent = mw_intent(Direction::Short, audcad_m());
         let err =
             Resolved::from_mw_intent(&intent, &shell_hlc(0.98470, 0.98300, 0.98424), &audcad_m());
-        assert!(matches!(err, Err(ResolveError::InvalidGeometry)), "{err:?}");
+        assert!(matches!(err, Err(ResolveError::NotArmedYet)), "{err:?}");
     }
 
     // W mirror: w_params neckline 1.1080, peak 1.1000.
@@ -573,7 +576,7 @@ mod tests {
         let intent = mw_intent(Direction::Long, w_params());
         let err =
             Resolved::from_mw_intent(&intent, &shell_hlc(1.1080, 1.1020, 1.1030), &w_params());
-        assert!(matches!(err, Err(ResolveError::InvalidGeometry)), "{err:?}");
+        assert!(matches!(err, Err(ResolveError::NotArmedYet)), "{err:?}");
     }
 
     #[test]
@@ -585,5 +588,28 @@ mod tests {
         let r = Resolved::from_mw_intent(&intent, &shell_hlc(1.1080, 1.1020, 1.1080), &w_params())
             .expect("right trough + upward cross arms");
         assert!(matches!(r.entry, ResolvedEntry::Stop { .. }));
+    }
+
+    // ---- Bug #7: arming-gate declines are NotArmedYet, not InvalidGeometry ----
+
+    #[test]
+    fn all_three_arming_gates_return_not_armed_yet() {
+        // The three "decline this bar, stay armed" gates must surface
+        // `NotArmedYet` (a benign 2xx decline at the worker), never
+        // `InvalidGeometry` (a 400 bad-request). See bug-007.
+        let intent = mw_intent(Direction::Short, audcad_m());
+        // (1) right tower not confirmed: high 0.98430 < right_tower 0.98458.
+        let g1 =
+            Resolved::from_mw_intent(&intent, &shell_hlc(0.98430, 0.98300, 0.98400), &audcad_m());
+        assert!(matches!(g1, Err(ResolveError::NotArmedYet)), "gate1 {g1:?}");
+        // (2) right tower confirmed but middle not crossed: close 0.98450 ≥ mid50.
+        let g2 =
+            Resolved::from_mw_intent(&intent, &shell_hlc(0.98470, 0.98300, 0.98450), &audcad_m());
+        assert!(matches!(g2, Err(ResolveError::NotArmedYet)), "gate2 {g2:?}");
+        // (3) tower + cross OK but breakout stop on the wrong side of close.
+        // entry ≈ 0.98326; a close below it fails the stop-side check.
+        let g3 =
+            Resolved::from_mw_intent(&intent, &shell_hlc(0.98470, 0.98300, 0.98320), &audcad_m());
+        assert!(matches!(g3, Err(ResolveError::NotArmedYet)), "gate3 {g3:?}");
     }
 }

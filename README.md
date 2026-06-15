@@ -1550,6 +1550,18 @@ leg, all MID-price:
    worker constants (`RIGHT_TOWER_MIN_FRAC` / `CANCEL_EXT_FRAC` /
    `MID_CROSS_FRAC` in `core/src/intent/mw_resolution.rs`).
 
+   **A not-armed-yet bar is a benign decline, not an error.** Declining a
+   bar here (right tower unconfirmed, middle not crossed, or breakout stop
+   on the wrong side of the close) is the *expected* outcome on most M/W
+   enter fires. The worker reports it as **HTTP 200** with
+   `outcome: declined: mw-not-armed` — distinct from the **400
+   `rejected: resolve-failed`** it returns for a genuinely malformed enter
+   (wrong-side SL, entry outside SL..TP, sub-1R, missing field, bad
+   script). Either way the setup stays armed (the decline is a seen-id
+   no-op), but the wire status lets timeline/verdict tooling tell a routine
+   decline apart from a real geometry bug. (Internally: the three arming
+   gates return `ResolveError::NotArmedYet`.)
+
 **Worker-side dynamic geometry (KV-backed).** The book reads the *higher
 shoulder* and the *deepest neckline* off a finished chart; we arm with only
 the left shoulder + neckline known, so the worker recovers them bar by bar
