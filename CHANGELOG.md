@@ -1,5 +1,57 @@
 # Changelog
 
+## v24 — 2026-06-15 — M/W real-time arming: right-tower window + "middle of the M" downward cross
+
+### Why
+
+M/W setups arm in **real time**, when only the left shoulder (B) and
+neckline (C) are printed — the right tower hasn't formed yet. The strategy
+book is the opposite: a **post-hoc** method that stops at the neckline once
+*both* towers are complete ("no retest required"). Applying the post-hoc
+rule live is what armed premature entries. v16 added a first guard (the
+0.7→1.3 second-peak window); this completes the real-time arming by also
+requiring price to **roll back off** the confirmed right tower before the
+breakout stop arms.
+
+### What changed (behaviour)
+
+- **`Resolved::from_mw_intent` (`core/src/intent/mw_resolution.rs`)** now
+  gates the per-bar enter on **two** confirmations, both MID-price on the
+  neckline→peak (C→B) leg:
+  1. **Right-tower window** (unchanged math, reframed): the bar's extreme
+     (high for M, low for W) must reach within 30% of the left-shoulder high
+     — `[neckline + 0.7×(peak−neckline), neckline + 1.3×(peak−neckline))`.
+  2. **"Middle of the M" downward-cross trigger** (new): the bar must cross
+     back through `mid50 = neckline + 0.5×(peak−neckline)`. M (short):
+     `high ≥ mid50 AND close < mid50`; W (long): `low ≤ mid50 AND
+     close > mid50`. A bar that hasn't crossed is declined → stay armed.
+- Entry/SL/TP price math (mid→bid/ask, exactly 1R TP) is **unchanged**; the
+  fill is still a breakout stop at the neckline. Non-`Ok` resolves still
+  don't mark the intent seen, so the setup stays armed across bars.
+
+### Breaking
+
+- Constant `SECOND_PEAK_MIN_FRAC` renamed to `RIGHT_TOWER_MIN_FRAC`; added
+  `MID_CROSS_FRAC = 0.5`. Internal only — no wire-format or CLI change.
+
+### Config
+
+- None. No new intent fields, no contract bump (`v3` unchanged) — the gate
+  is worker-internal on the existing `mw:` enter.
+
+### Tests
+
+- New `mw_resolution` tests: right tower confirmed but not crossed (M and W)
+  → declined; crossed → armed (M and W); `close == mid50` boundary →
+  declined. Existing worked-example + AUD/CAD tests still pass (their shells
+  already cross mid50). 436 core tests green.
+
+### Follow-up
+
+- Phase B (planned): KV-backed dynamic neckline/right-shoulder recording
+  (higher right shoulder → SL anchor; deeper body-low ≥60% revises neckline;
+  <60% cancels) + body-based rogue-wick handling.
+
 ## v22 — 2026-06-13 — spread-blackout System 3: cancel resting entry orders on blackout, re-drive on recovery
 
 ### Why

@@ -32,26 +32,57 @@
 //! TP is exactly 1R off the *entry*, so the spread already embedded in
 //! entry and SL carries straight through — no extra TP shift needed.
 //!
-//! ## Second-peak confirmation window
+//! ## Why a real-time arming gate at all
+//!
+//! The strategy book is a **post-hoc** method: the analyst looks at a
+//! chart where *both* towers of the M are already printed and simply puts
+//! a stop at the neckline ("entry on the break of the neckline … no
+//! retest required"). We arm in **real time**, when only the **left
+//! shoulder (B)** and the **neckline (C)** are complete — the right tower
+//! hasn't formed yet. So we cannot just "enter on neckline break": at the
+//! moment of a break we don't yet know whether a genuine right tower
+//! formed. The two gates below are the live stand-ins for the validity
+//! the book gets for free from a finished chart.
+//!
+//! ## Right-tower confirmation window
 //!
 //! Before arming the breakout stop, the bar must show a real second
-//! peak/trough — price that has retraced back *into* the pattern, not
-//! just any bar that happens to close on the entry side of the neckline.
-//! The bar's extreme (high for an M, low for a W) must fall inside a
-//! window measured as fractions of the neckline→first-point (C→B) leg:
+//! peak/trough — price that has rallied (M) / dropped (W) back *into* the
+//! pattern far enough to count as a right tower, the live equivalent of
+//! the book's "the right side's top is close to the left side's top"
+//! check. The bar's extreme (high for an M, low for a W) must reach
+//! **within 30% of the left-shoulder high** — i.e. into the top 30% of the
+//! neckline→first-point (C→B) leg — and stay below the 1.3 extension:
 //!
 //! ```text
-//!   min_retrace = neckline + 0.7 × (first_point − neckline)
+//!   right_tower = neckline + 0.7 × (first_point − neckline)   // within 30% of B
 //!   cancel      = neckline + 1.3 × (first_point − neckline)
-//!   armed  ⇔  high (M) / low (W) ∈ [min_retrace, cancel)
+//!   confirmed  ⇔  high (M) / low (W) ∈ [right_tower, cancel)
 //! ```
 //!
-//! Below `min_retrace` the second peak is too shallow; at/above `cancel`
+//! Below `right_tower` the second peak is too shallow; at/above `cancel`
 //! the 1.3 extension is breached and the pattern is invalidated (the same
 //! level the `mw-cancel` veto guards — checked here too as a safety net).
 //! Either way the bar is declined and the setup stays armed. This fixes a
 //! real AUD/CAD case where a bar closing just past the neckline but with a
 //! high short of the second peak armed (and filled) a premature short.
+//!
+//! ## "Middle of the M" downward-cross trigger
+//!
+//! A confirmed right tower says the shape is valid; it does not say price
+//! is *rolling back off* it yet. The arming trigger is the bar that
+//! crosses back down (M) / up (W) through the **50% level of the C→B
+//! leg** — the "middle of the M":
+//!
+//! ```text
+//!   mid50 = neckline + 0.5 × (first_point − neckline)
+//!   M (short): high ≥ mid50  AND  close < mid50   // crossed down through the middle
+//!   W (long):  low  ≤ mid50  AND  close > mid50   // crossed up through the middle
+//! ```
+//!
+//! Only once price has both confirmed a right tower *and* crossed back
+//! through the middle do we arm the breakout stop. A bar that fails the
+//! cross is declined and the setup stays armed for the next bar.
 //!
 //! ## "Stay armed" semantics
 //!
@@ -67,11 +98,18 @@
 use super::resolution::{ResolveError, Resolved, ResolvedEntry};
 use super::{Direction, Intent, MwParams, Shell};
 
-/// Minimum second-peak retracement, as a fraction of the neckline→first-point
-/// (C→B) leg, that a bar must reach before the breakout stop is armed. A bar
-/// whose extreme (high for M, low for W) hasn't pulled this far back into the
-/// pattern is declined and the setup stays armed. See [`Resolved::from_mw_intent`].
-const SECOND_PEAK_MIN_FRAC: f64 = 0.7;
+/// Minimum right-tower retracement, as a fraction of the neckline→first-point
+/// (C→B) leg, that a bar must reach before the setup can arm. `0.7` means the
+/// bar's extreme (high for M, low for W) must come **within 30% of the
+/// left-shoulder high** — into the top 30% of the C→B leg. A bar that hasn't
+/// pulled this far back into the pattern is declined and the setup stays armed.
+/// See [`Resolved::from_mw_intent`].
+const RIGHT_TOWER_MIN_FRAC: f64 = 0.7;
+
+/// The "middle of the M": the 50% level of the neckline→first-point (C→B) leg.
+/// The arming trigger is the bar that crosses back down (M) / up (W) through
+/// this level. See [`Resolved::from_mw_intent`].
+const MID_CROSS_FRAC: f64 = 0.5;
 
 /// Upper clamp on the second peak, as a fraction of the C→B leg: the 1.3
 /// extension past the neckline. A bar reaching this far has invalidated the
@@ -118,15 +156,16 @@ impl Resolved {
             }
         };
 
-        // Second-peak confirmation *window*. Before arming the breakout stop
+        // Right-tower confirmation *window*. Before arming the breakout stop
         // we require the price to have rallied (M) / dropped (W) back *into*
-        // the pattern — far enough to count as a real second peak/trough, but
-        // not so far that it blew past the pattern entirely.
+        // the pattern — far enough to count as a real right tower (within 30%
+        // of the left-shoulder high), but not so far that it blew past the
+        // pattern entirely.
         //
         // The window is expressed as fractions of the neckline→first-point
         // (C→B) leg:
         //
-        //   lower = neckline + 0.7 × (first_point − neckline)   (min retrace)
+        //   lower = neckline + 0.7 × (first_point − neckline)   (within 30% of B)
         //   upper = neckline + 1.3 × (first_point − neckline)   (cancel level)
         //
         // For an M (short) B > C, so the window sits *above* the neckline and
@@ -134,24 +173,45 @@ impl Resolved {
         // *below* the neckline and we test the bar's `low`. B, C and high/low
         // are all MID prices — no spread correction on this gate.
         //
-        // - Below `lower`: the second peak isn't deep enough yet → decline,
+        // - Below `lower`: the right tower isn't tall enough yet → decline,
         //   stay armed for the next bar.
         // - At/above `upper`: price reached the 1.3 extension — the pattern is
         //   invalidated (this is the same level the `mw-cancel` veto guards).
         //   Decline as a safety net in case that veto hasn't fired yet.
-        // A bar inside [lower, upper) is a confirmed second peak → proceed to
-        // the breakout-stop side check below (see module docs).
-        let min_retrace = neckline + SECOND_PEAK_MIN_FRAC * (peak - neckline);
+        // A bar inside [lower, upper) is a confirmed right tower → proceed to
+        // the middle-of-the-M cross check below (see module docs).
+        let right_tower = neckline + RIGHT_TOWER_MIN_FRAC * (peak - neckline);
         let cancel = neckline + CANCEL_EXT_FRAC * (peak - neckline);
-        let second_peak_confirmed = match direction {
-            // M: second peak is above the neckline. The high must reach the
-            // min-retrace level but stay below the 1.3 cancel extension.
-            Direction::Short => shell.high >= min_retrace && shell.high < cancel,
-            // W: mirror — second trough below the neckline. The low must drop
-            // to the min-retrace level but stay above the cancel extension.
-            Direction::Long => shell.low <= min_retrace && shell.low > cancel,
+        let right_tower_confirmed = match direction {
+            // M: right tower is above the neckline. The high must reach the
+            // right-tower level but stay below the 1.3 cancel extension.
+            Direction::Short => shell.high >= right_tower && shell.high < cancel,
+            // W: mirror — right trough below the neckline. The low must drop
+            // to the right-tower level but stay above the cancel extension.
+            Direction::Long => shell.low <= right_tower && shell.low > cancel,
         };
-        if !second_peak_confirmed {
+        if !right_tower_confirmed {
+            return Err(ResolveError::InvalidGeometry);
+        }
+
+        // "Middle of the M" downward-cross trigger. A confirmed right tower
+        // says the shape is valid; the arming trigger is the bar that rolls
+        // back *off* it through the 50% level of the C→B leg:
+        //
+        //   mid50 = neckline + 0.5 × (first_point − neckline)
+        //   M (short): high ≥ mid50 AND close < mid50   (crossed down through it)
+        //   W (long):  low  ≤ mid50 AND close > mid50   (crossed up through it)
+        //
+        // The high/low condition proves the bar traded on the far side of the
+        // middle (so it's a genuine crossing, not a bar already wholly past
+        // it); the close condition proves it ended up back on the breakout
+        // side. A bar that hasn't crossed is declined → stay armed.
+        let mid50 = neckline + MID_CROSS_FRAC * (peak - neckline);
+        let crossed_middle = match direction {
+            Direction::Short => shell.high >= mid50 && shell.close < mid50,
+            Direction::Long => shell.low <= mid50 && shell.close > mid50,
+        };
+        if !crossed_middle {
             return Err(ResolveError::InvalidGeometry);
         }
 
@@ -452,5 +512,68 @@ mod tests {
         let err =
             Resolved::from_mw_intent(&intent, &shell_hlc(1.1080, 1.0976, 1.1080), &w_params());
         assert!(matches!(err, Err(ResolveError::InvalidGeometry)), "{err:?}");
+    }
+
+    // ---- "Middle of the M" downward-cross trigger ----
+    //
+    // audcad_m: neckline 0.98339, peak 0.98509.
+    //   right_tower = C + 0.7×(B−C) = 0.98458
+    //   mid50       = C + 0.5×(B−C) = 0.98424
+    //   cancel      = C + 1.3×(B−C) = 0.98560
+
+    #[test]
+    fn m_right_tower_confirmed_but_not_crossed_is_declined() {
+        // high 0.98470 confirms the right tower (≥ 0.98458, < 0.98560), but
+        // close 0.98450 is still ≥ mid50 0.98424 → price hasn't rolled back
+        // through the middle of the M yet → decline, stay armed.
+        let intent = mw_intent(Direction::Short, audcad_m());
+        let err =
+            Resolved::from_mw_intent(&intent, &shell_hlc(0.98470, 0.98300, 0.98450), &audcad_m());
+        assert!(matches!(err, Err(ResolveError::InvalidGeometry)), "{err:?}");
+    }
+
+    #[test]
+    fn m_crossed_middle_arms() {
+        // high 0.98470 confirms the right tower; close 0.98400 < mid50 0.98424
+        // → crossed down through the middle → armed.
+        let intent = mw_intent(Direction::Short, audcad_m());
+        let r =
+            Resolved::from_mw_intent(&intent, &shell_hlc(0.98470, 0.98300, 0.98400), &audcad_m())
+                .expect("right tower + downward cross arms");
+        assert!(matches!(r.entry, ResolvedEntry::Stop { .. }));
+    }
+
+    #[test]
+    fn m_close_at_mid50_is_declined() {
+        // Boundary: close == mid50 0.98424 is not strictly below → not crossed.
+        let intent = mw_intent(Direction::Short, audcad_m());
+        let err =
+            Resolved::from_mw_intent(&intent, &shell_hlc(0.98470, 0.98300, 0.98424), &audcad_m());
+        assert!(matches!(err, Err(ResolveError::InvalidGeometry)), "{err:?}");
+    }
+
+    // W mirror: w_params neckline 1.1080, peak 1.1000.
+    //   right_tower = 1.1024, mid50 = 1.1040, cancel = 1.0976.
+
+    #[test]
+    fn w_right_tower_confirmed_but_not_crossed_is_declined() {
+        // low 1.1020 confirms the right trough (≤ 1.1024, > 1.0976), but close
+        // 1.1030 is still ≤ mid50 1.1040 → hasn't crossed up through the middle
+        // → decline, stay armed.
+        let intent = mw_intent(Direction::Long, w_params());
+        let err =
+            Resolved::from_mw_intent(&intent, &shell_hlc(1.1080, 1.1020, 1.1030), &w_params());
+        assert!(matches!(err, Err(ResolveError::InvalidGeometry)), "{err:?}");
+    }
+
+    #[test]
+    fn w_crossed_middle_arms() {
+        // low 1.1020 confirms the right trough; close 1.1080 > mid50 1.1040 →
+        // crossed up through the middle; close < entry 1.10809 so the breakout
+        // stop sits above the close → armed.
+        let intent = mw_intent(Direction::Long, w_params());
+        let r = Resolved::from_mw_intent(&intent, &shell_hlc(1.1080, 1.1020, 1.1080), &w_params())
+            .expect("right trough + upward cross arms");
+        assert!(matches!(r.entry, ResolvedEntry::Stop { .. }));
     }
 }
