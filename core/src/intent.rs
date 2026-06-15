@@ -7,9 +7,11 @@ use serde::{Deserialize, Serialize};
 
 mod expiry;
 mod mw_resolution;
+mod mw_state;
 mod resolution;
 
 pub use expiry::{ExpiryError, MAX_EXPIRY_BARS, resolve_cancel_at};
+pub use mw_state::{MwAnchors, MwUpdate, plan_mw_update};
 #[cfg(feature = "cli")]
 pub use resolution::MIN_R_FLOOR;
 pub use resolution::{Resolved, ResolvedEntry, ResolvedOnTooClose, RiskBudget};
@@ -1480,6 +1482,20 @@ impl OnTooClose {
 }
 
 impl Shell {
+    /// Body top — `max(open, close)` — or `None` if this shell didn't
+    /// carry `open` (control shells, or a chart still on the pre-`open`
+    /// Pine). M/W dynamic geometry uses bodies, not wicks, so a lone rogue
+    /// wick can't move the right shoulder or trip the cancel.
+    pub fn body_high(&self) -> Option<f64> {
+        self.open.map(|o| o.max(self.close))
+    }
+
+    /// Body bottom — `min(open, close)` — or `None` if `open` is absent.
+    /// See [`Self::body_high`].
+    pub fn body_low(&self) -> Option<f64> {
+        self.open.map(|o| o.min(self.close))
+    }
+
     pub fn anchor_price(&self, anchor: PriceAnchor) -> f64 {
         match anchor {
             PriceAnchor::Close => self.close,
@@ -1564,6 +1580,26 @@ mod tests {
         s.recent_low = Some(1.0950);
         assert_eq!(s.anchor_price(PriceAnchor::RecentHigh), 1.1050);
         assert_eq!(s.anchor_price(PriceAnchor::RecentLow), 1.0950);
+    }
+
+    #[test]
+    fn body_extremes_none_without_open() {
+        // The default shell() has open: None.
+        let s = shell();
+        assert_eq!(s.body_high(), None);
+        assert_eq!(s.body_low(), None);
+    }
+
+    #[test]
+    fn body_extremes_use_open_and_close_not_wicks() {
+        let mut s = shell();
+        // Bullish body: open 1.0990 < close 1.1000; wicks (high/low) are wider.
+        s.open = Some(1.0990);
+        s.close = 1.1000;
+        s.high = 1.1020;
+        s.low = 1.0980;
+        assert_eq!(s.body_high(), Some(1.1000)); // max(open, close), not high
+        assert_eq!(s.body_low(), Some(1.0990)); // min(open, close), not low
     }
 
     #[test]
