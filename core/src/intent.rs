@@ -11,7 +11,7 @@ mod mw_state;
 mod resolution;
 
 pub use expiry::{ExpiryError, MAX_EXPIRY_BARS, resolve_cancel_at};
-pub use mw_state::{MwAnchors, MwUpdate, plan_mw_update};
+pub use mw_state::{MwAnchors, MwUpdate, effective_mw_params, plan_mw_update};
 #[cfg(feature = "cli")]
 pub use resolution::MIN_R_FLOOR;
 pub use resolution::{Resolved, ResolvedEntry, ResolvedOnTooClose, RiskBudget};
@@ -807,6 +807,15 @@ pub const TRADE_ID_MAX_LEN: usize = 64;
 /// include it for the veto to gate the entry). Single source of truth so
 /// the worker's write side and the CLI's enter-builder can't drift apart.
 pub const REVERSAL_VETO_NAME: &str = "reversal";
+
+/// Fixed veto name for an M/W pattern cancellation. Written by the worker
+/// when the live geometry breaches the 60% validity floor (a body too deep
+/// into the runup) and by the chart-side `01-veto-mw-cancel` alert at the
+/// 1.3 extension. The M/W `05-enter` lists this in its `vetos`, so either
+/// write blocks future entries (StopNextEntry / CancelPending — never
+/// closes an open position). Single source of truth so the worker write
+/// side and the CLI enter-builder can't drift apart.
+pub const MW_CANCEL_VETO_NAME: &str = "mw-cancel";
 
 /// Returns true if `s` is a valid `trade_id` slug: lowercase ASCII
 /// alphanumerics + hyphens, 1..=64 chars, no leading/trailing hyphen,

@@ -45,7 +45,7 @@
 
 use chrono::{DateTime, Utc};
 
-use super::{Direction, Shell};
+use super::{Direction, MwParams, Shell};
 use crate::state::MwState;
 
 /// Fraction of the runup→shoulder leg that price must hold to keep the
@@ -187,6 +187,32 @@ pub fn plan_mw_update(
                 changed,
             }
         }
+    }
+}
+
+/// Build the **effective** [`MwParams`] to resolve the entry against this
+/// bar: the baked params with the neckline and SL anchor overridden by the
+/// live [`MwState`] recovered so far.
+///
+/// - `neckline` ← the revised (possibly-deeper) neckline from `state`.
+/// - `first_point` (the SL anchor `from_mw_intent` measures the stop from)
+///   ← the **higher** of the baked left shoulder and the recorded right
+///   shoulder for an M, the **lower** of the two for a W — the book's
+///   "measure the stop from the higher shoulder" rule. With no right
+///   shoulder recorded yet, it stays the baked left shoulder.
+///
+/// `spread_pips`, `pip_size` and `runup_start` carry through from the baked
+/// params unchanged.
+pub fn effective_mw_params(baked: &MwParams, state: &MwState, direction: Direction) -> MwParams {
+    let first_point = match (state.right_shoulder, direction) {
+        (Some(rs), Direction::Short) => baked.first_point.max(rs),
+        (Some(rs), Direction::Long) => baked.first_point.min(rs),
+        (None, _) => baked.first_point,
+    };
+    MwParams {
+        neckline: state.neckline,
+        first_point,
+        ..*baked
     }
 }
 
@@ -386,5 +412,81 @@ mod tests {
             }
             other => panic!("expected Proceed, got {other:?}"),
         }
+    }
+
+    // ---- effective_mw_params ----
+
+    fn baked_m() -> MwParams {
+        MwParams {
+            neckline: M_C,
+            first_point: M_B,
+            runup_start: M_A,
+            spread_pips: 0.8,
+            pip_size: 0.0001,
+        }
+    }
+
+    #[test]
+    fn effective_uses_revised_neckline_and_higher_m_shoulder() {
+        let baked = baked_m();
+        let state = MwState {
+            neckline: 1.1105,             // revised lower than baked 1.1120
+            right_shoulder: Some(1.1230), // higher than left B = 1.1200
+            updated_at: now(),
+            expires_at: exp(),
+        };
+        let eff = effective_mw_params(&baked, &state, Direction::Short);
+        assert_eq!(eff.neckline, 1.1105);
+        assert_eq!(eff.first_point, 1.1230); // higher shoulder wins for M
+        // Untouched fields carry through.
+        assert_eq!(eff.runup_start, M_A);
+        assert_eq!(eff.spread_pips, 0.8);
+        assert_eq!(eff.pip_size, 0.0001);
+    }
+
+    #[test]
+    fn effective_keeps_baked_shoulder_when_right_is_lower_m() {
+        let baked = baked_m();
+        let state = MwState {
+            neckline: M_C,
+            right_shoulder: Some(1.1180), // lower than left B = 1.1200
+            updated_at: now(),
+            expires_at: exp(),
+        };
+        let eff = effective_mw_params(&baked, &state, Direction::Short);
+        assert_eq!(eff.first_point, 1.1200); // keep the higher (left) shoulder
+    }
+
+    #[test]
+    fn effective_no_right_shoulder_keeps_baked_first_point() {
+        let baked = baked_m();
+        let state = MwState {
+            neckline: 1.1110,
+            right_shoulder: None,
+            updated_at: now(),
+            expires_at: exp(),
+        };
+        let eff = effective_mw_params(&baked, &state, Direction::Short);
+        assert_eq!(eff.first_point, M_B);
+        assert_eq!(eff.neckline, 1.1110);
+    }
+
+    #[test]
+    fn effective_w_takes_lower_trough() {
+        let baked = MwParams {
+            neckline: W_C,
+            first_point: W_B,
+            runup_start: W_A,
+            spread_pips: 0.8,
+            pip_size: 0.0001,
+        };
+        let state = MwState {
+            neckline: W_C,
+            right_shoulder: Some(1.0980), // lower than left trough B = 1.1000
+            updated_at: now(),
+            expires_at: exp(),
+        };
+        let eff = effective_mw_params(&baked, &state, Direction::Long);
+        assert_eq!(eff.first_point, 1.0980); // lower trough wins for W
     }
 }

@@ -1,5 +1,61 @@
 # Changelog
 
+## v25 — 2026-06-15 — M/W dynamic geometry: live right-shoulder / neckline + rogue-wick + candle `open`
+
+### Why
+
+The book reads the higher shoulder and the deepest neckline off a *finished*
+chart. We arm with only the left shoulder + neckline known and the right
+tower still forming, so the worker must recover those two facts live. v24
+fixed *when* to arm; this fixes the *geometry* it arms with.
+
+### What changed (behaviour)
+
+- **Candle `open` threaded through the shell** (Phase B0). `Shell.open:
+  Option<f64>`; added to `sig::UNSIGNED_VALUE_KEYS`, the `incoming` shell-key
+  whitelist, the CLI TV-template body (`open: {{open}}`), the Rhai scope, and
+  Pine `candle-signals-v2` v2.5's `Every Bar Close` message. Optional →
+  backward-compatible; old bodies verify unchanged.
+- **`mw-state:<scope>:<trade_id>` KV keyspace** (Phase B1): `MwState`
+  (revised neckline + recorded right shoulder) with get/upsert/clear.
+- **`plan_mw_update` / `effective_mw_params`** (Phase B2, pure): per-bar
+  decision over the prior state + the bar's **body** extremes —
+  - higher right shoulder → SL anchor (higher of the two shoulders for M);
+  - deeper body still ≥ 60% of the runup→shoulder leg → revise the neckline;
+  - body past the 60% floor → cancel;
+  - all body-based, so a rogue wick can't move geometry or cancel.
+- **Wired into `run_enter`** (Phase B3): `maybe_update_mw_state` reads/updates
+  KV, then resolves the bar against the effective params. On cancel it cancels
+  pending + writes a trade-scoped `mw-cancel` veto (`MW_CANCEL_VETO_NAME`, new
+  shared const) and **never closes an open position**.
+
+### Breaking
+
+- `Resolved::from_mw_intent` is now `pub` (worker passes effective params).
+  New `MW_CANCEL_VETO_NAME` const (CLI enter-builder + worker share it).
+  No wire-format break — `open` is optional; contract stays `v3`.
+
+### Config
+
+- Pine must be **republished** to v2.5 for charts to start sending `open`
+  (the dynamic update is a no-op until then). New KV keyspace needs no
+  config — the existing `TRADE_CONTROL_KV` binding covers it.
+
+### Tests
+
+- core: `plan_mw_update` (cancel / floor / rogue-wick-doesn't-cancel /
+  right-shoulder record / neckline revise / W mirror), `effective_mw_params`,
+  `body_high`/`body_low`, MwState memstore round-trip, `open` sig round-trip.
+- The `maybe_update_mw_state` glue (KV read → plan → write/cancel) is thin
+  and verified by dev-deploy replay rather than a native mock (the worker's
+  `run_enter` needs a Cloudflare `Env`; the decision logic it calls is
+  fully covered in core).
+
+### Follow-up
+
+- `incoming`'s shell-key whitelist duplicates `sig::UNSIGNED_VALUE_KEYS` —
+  a future refactor could derive one from the other (drift bit B0 once).
+
 ## v24 — 2026-06-15 — M/W real-time arming: right-tower window + "middle of the M" downward cross
 
 ### Why

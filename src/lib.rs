@@ -36,7 +36,8 @@ use serde::Serialize;
 use trade_control_core::broker::{Broker, EntryError, EntryRequest};
 use trade_control_core::incoming::{self, parse_and_verify};
 use trade_control_core::intent::{
-    Action, BrokerKind, Intent, REVERSAL_VETO_NAME, Resolved, Shell, VetoLevel,
+    Action, BrokerKind, Intent, MW_CANCEL_VETO_NAME, MwAnchors, MwUpdate, REVERSAL_VETO_NAME,
+    Resolved, Shell, VetoLevel, effective_mw_params, plan_mw_update,
 };
 use trade_control_core::rules::{self, RuleError};
 use trade_control_core::sig;
@@ -1287,7 +1288,29 @@ pub(crate) async fn run_enter<B: Broker>(
         .pip_size
         .unwrap_or_else(|| pip_size_for(env, &verified.intent.instrument));
 
-    let resolved = match Resolved::from_intent(&verified.intent, &verified.shell, pip_size) {
+    // M/W real-time geometry. For M/W enters carrying a `trade_id`, evolve
+    // the live neckline / right-shoulder per bar (Phase B): a deeper body
+    // still inside the 60% validity floor revises the neckline; a higher
+    // body records the right shoulder (→ SL anchor); a body past the floor
+    // cancels the setup (cancel pending + `mw-cancel` veto, never closes an
+    // open position). All comparisons are body-based, so a rogue wick can't
+    // move geometry or cancel. A bar with no `open` (pre-v2.5 chart) leaves
+    // the state untouched and resolves against baked params. Returns the
+    // effective `MwParams` to resolve this bar against, or short-circuits.
+    let mw_effective = match maybe_update_mw_state(broker, store, verified, now).await {
+        MwStateOutcome::Proceed(mw) => Some(mw),
+        MwStateOutcome::NotMw => None,
+        MwStateOutcome::Cancelled(result) => return result,
+    };
+
+    let resolve_result = match &mw_effective {
+        // M/W with live geometry: resolve against the effective params.
+        Some(mw) => Resolved::from_mw_intent(&verified.intent, &verified.shell, mw),
+        // Everything else (and M/W with no trade_id / no `open`): the
+        // standard dispatch, which itself routes baked M/W to from_mw_intent.
+        None => Resolved::from_intent(&verified.intent, &verified.shell, pip_size),
+    };
+    let resolved = match resolve_result {
         Ok(r) => r,
         Err(err) => {
             rlog_err!("resolve: {err}");
@@ -1562,6 +1585,130 @@ pub(crate) async fn run_enter<B: Broker>(
             let outcome = too_close::outcome_for_entry_error(&err);
             rlog_err!("entry failed: {err} ({outcome})");
             ActionResult::Failed(outcome)
+        }
+    }
+}
+
+/// Result of the per-bar M/W geometry update ([`maybe_update_mw_state`]).
+enum MwStateOutcome {
+    /// Not an M/W enter with a `trade_id`, or the bar carried no `open`:
+    /// resolve against the baked params (the standard dispatch).
+    NotMw,
+    /// M/W setup still valid; resolve this bar against these effective
+    /// (live-corrected) params.
+    Proceed(trade_control_core::intent::MwParams),
+    /// The setup was cancelled this bar (60% validity floor breached).
+    /// Carries the terminal [`ActionResult`] the caller should return.
+    Cancelled(ActionResult),
+}
+
+/// Evolve the live M/W geometry for this bar and decide how to resolve.
+///
+/// Only acts on M/W enters that carry a `trade_id` (the KV state is
+/// trade-scoped). Reads the prior [`MwState`], runs the pure
+/// [`plan_mw_update`], and:
+///
+/// - **Proceed** → persists the updated state (when it changed) and returns
+///   the effective [`MwParams`][trade_control_core::intent::MwParams] to
+///   resolve against.
+/// - **Cancel** → cancels any pending order for the instrument, writes a
+///   trade-scoped `mw-cancel` veto (so later fires of this `05-enter` are
+///   blocked — it lists `mw-cancel` in its `vetos`), clears the state row,
+///   and returns a rejection. It **never closes an open position** — the
+///   veto is StopNextEntry-class; cancelling pending is the only broker
+///   side effect (see `veto_close_only_when_thesis_invalidated`).
+/// - **NoChange / NotMw** → `NotMw`, falling back to baked resolution.
+///
+/// Fail-soft: a KV read/write error logs and falls back to baked geometry
+/// rather than blocking a legitimate entry.
+async fn maybe_update_mw_state<B: Broker>(
+    broker: &B,
+    store: &impl StateStore,
+    verified: &incoming::Verified,
+    now: chrono::DateTime<chrono::Utc>,
+) -> MwStateOutcome {
+    let intent = &verified.intent;
+    let Some(mw) = intent.mw else {
+        return MwStateOutcome::NotMw;
+    };
+    let Some(trade_id) = intent.trade_id.as_deref() else {
+        // No trade_id → no trade-scoped state to evolve; baked resolution.
+        return MwStateOutcome::NotMw;
+    };
+    let Some(direction) = intent.direction else {
+        return MwStateOutcome::NotMw;
+    };
+    let account = intent.account.as_deref();
+
+    let prior = match store.get_mw_state(account, trade_id).await {
+        Ok(p) => p,
+        Err(err) => {
+            // Fail-soft: don't block a valid entry on a KV blip.
+            rlog_err!("mw-state get failed (trade_id={trade_id}): {err} — using baked geometry");
+            return MwStateOutcome::NotMw;
+        }
+    };
+
+    let ttl_seconds = veto_ttl_seconds(0, intent.not_after, now);
+    let expires_at = now + chrono::Duration::seconds(ttl_seconds as i64);
+    let anchors = MwAnchors {
+        direction,
+        runup_start: mw.runup_start,
+        left_shoulder: mw.first_point,
+        baked_neckline: mw.neckline,
+    };
+
+    match plan_mw_update(anchors, prior, &verified.shell, now, expires_at) {
+        MwUpdate::NoChange => MwStateOutcome::NotMw,
+        MwUpdate::Proceed { state, changed } => {
+            if changed {
+                if let Err(err) = store
+                    .upsert_mw_state(account, trade_id, &state, ttl_seconds)
+                    .await
+                {
+                    // Persist failure is non-fatal: we still resolve this bar
+                    // against the freshly-computed geometry; next bar re-derives
+                    // from the prior row (or baked if the write never lands).
+                    rlog_err!("mw-state upsert failed (trade_id={trade_id}): {err}");
+                }
+                rlog!(
+                    "mw-state updated trade_id={trade_id} neckline={} right_shoulder={:?}",
+                    state.neckline,
+                    state.right_shoulder
+                );
+            }
+            MwStateOutcome::Proceed(effective_mw_params(&mw, &state, direction))
+        }
+        MwUpdate::Cancel => {
+            let cancelled = broker
+                .cancel_pending_for_instrument(&intent.instrument)
+                .await;
+            if let Err(err) = store
+                .set_veto(
+                    account,
+                    trade_id,
+                    &intent.instrument,
+                    MW_CANCEL_VETO_NAME,
+                    ttl_seconds,
+                )
+                .await
+            {
+                rlog_err!("mw-state cancel: set_veto failed (trade_id={trade_id}): {err}");
+            }
+            // Clear the state row so a re-armed setup reusing the trade_id
+            // starts clean. Best-effort.
+            if let Err(err) = store.clear_mw_state(account, trade_id).await {
+                rlog_err!("mw-state cancel: clear failed (trade_id={trade_id}): {err}");
+            }
+            rlog!(
+                "mw-state CANCEL trade_id={trade_id} instrument={} account={} cancelled={cancelled} pending; mw-cancel veto set",
+                intent.instrument,
+                account.unwrap_or("<global>")
+            );
+            MwStateOutcome::Cancelled(ActionResult::Rejected {
+                response: Response::error("mw pattern cancelled (validity floor breached)", 412),
+                outcome: "rejected: mw-cancel (validity-floor)".into(),
+            })
         }
     }
 }

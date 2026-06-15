@@ -119,10 +119,19 @@ const MID_CROSS_FRAC: f64 = 0.5;
 const CANCEL_EXT_FRAC: f64 = 1.3;
 
 impl Resolved {
-    /// Resolve an M/W `enter` intent. `mw` is the intent's baked
-    /// [`MwParams`]; validation (Enter-only, finite fields, `pip_size >
-    /// 0`) has already run in [`Intent::validate`].
-    pub(in crate::intent) fn from_mw_intent(
+    /// Resolve an M/W `enter` intent against an explicit [`MwParams`].
+    ///
+    /// `mw` is normally the intent's baked params (the [`from_intent`] M/W
+    /// branch passes those). The worker passes an **effective** `MwParams`
+    /// instead — the baked params with the neckline and SL-anchor
+    /// (`first_point`) overridden by the live [`MwState`] geometry recovered
+    /// bar by bar (revised-lower neckline, higher right shoulder). Either
+    /// way the math is identical; only the anchors differ. Validation
+    /// (Enter-only, finite fields, `pip_size > 0`) has already run in
+    /// [`Intent::validate`].
+    ///
+    /// [`from_intent`]: Resolved::from_intent
+    pub fn from_mw_intent(
         intent: &Intent,
         shell: &Shell,
         mw: &MwParams,

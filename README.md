@@ -1509,6 +1509,30 @@ leg, all MID-price:
    worker constants (`RIGHT_TOWER_MIN_FRAC` / `CANCEL_EXT_FRAC` /
    `MID_CROSS_FRAC` in `core/src/intent/mw_resolution.rs`).
 
+**Worker-side dynamic geometry (KV-backed).** The book reads the *higher
+shoulder* and the *deepest neckline* off a finished chart; we arm with only
+the left shoulder + neckline known, so the worker recovers them bar by bar
+and stores them per `trade_id` in KV (`mw-state:<scope>:<trade_id>`). On
+each `Every Bar Close` fire of an M/W enter, before resolving:
+
+- **Higher right shoulder** → recorded (body-based) and used as the SL
+  anchor (the higher of left vs right for an M, lower for a W).
+- **Deeper neckline** → a body that pulls below the current neckline but
+  stays inside the **60% validity floor** of the runup→shoulder leg lowers
+  (M) / raises (W) the neckline; entry/SL/TP re-derive off it.
+- **Cancel** → a body past the 60% floor kills the setup: the worker
+  cancels any pending order and writes a trade-scoped `mw-cancel` veto
+  (which the `05-enter` lists, so later fires are blocked). It **never
+  closes an open position** — `mw-cancel` is StopNextEntry-class.
+- **Rogue wicks** → every comparison uses candle **bodies**
+  (`max/min(open,close)`), so a lone wick can't move the shoulder/neckline
+  or trip the cancel. Needs the `open` field (Pine v2.5+); a pre-`open`
+  chart simply skips the dynamic update and rides the baked geometry.
+
+The decision is the pure `plan_mw_update` / `effective_mw_params`
+(`core/src/intent/mw_state.rs`); the worker wraps it with the KV read/write
+in `maybe_update_mw_state` (`src/lib.rs`). Baked params are the seed.
+
 ```sh
 cargo run -p tv-arm -- \
   --broker oanda \

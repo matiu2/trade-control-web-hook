@@ -28,7 +28,8 @@ use serde::{Deserialize, Serialize};
 
 use trade_control_conventions::AlertBasename;
 use trade_control_core::intent::{
-    Action, BrokerKind, Direction, EntrySpec, Intent, PriceAnchor, PriceRef, TakeProfit, VetoLevel,
+    Action, BrokerKind, Direction, EntrySpec, Intent, MW_CANCEL_VETO_NAME, PriceAnchor, PriceRef,
+    TakeProfit, VetoLevel,
 };
 use trade_control_core::sig::KEY_LEN;
 
@@ -1071,7 +1072,7 @@ fn build_mw_cancel_alert(
         account,
         trade_id,
     );
-    intent.name = Some("mw-cancel".into());
+    intent.name = Some(MW_CANCEL_VETO_NAME.into());
     intent.ttl_hours =
         trade_control_core::tunable::Tunable::Static(ttl_hours_until(now, veto_expiry));
     intent.level = Some(VetoLevel::CancelPending);
@@ -1169,7 +1170,11 @@ fn build_mw_enter_alert(
     intent.needs_golden = needs_golden;
     intent.needs_confirmed = needs_confirmed;
     intent.requires_preps = Vec::new();
-    intent.vetos = vec!["mw-cancel".into(), "mw-abort".into(), "trade-expiry".into()];
+    intent.vetos = vec![
+        MW_CANCEL_VETO_NAME.into(),
+        "mw-abort".into(),
+        "trade-expiry".into(),
+    ];
     BuiltAlert {
         basename: AlertBasename::Enter.as_str().into_owned(),
         purpose: "enter: M/W per-bar stop entry (worker-computed geometry; vetoed by \
