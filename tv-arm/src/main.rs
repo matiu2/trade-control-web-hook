@@ -74,7 +74,19 @@ fn main() -> Result<ExitCode> {
 
     if parsed.print_completions {
         let mut cmd = Args::command();
-        let name = cmd.get_name().to_string();
+        // Bind the completion to the actual invoked binary name (argv[0]
+        // stem) so a renamed-on-install copy (`tv-arm-staging`,
+        // `tv-arm-dev`) emits completions for *its own* name, not the
+        // static `tv-arm`. Falls back to the clap command name.
+        let name = std::env::args()
+            .next()
+            .and_then(|a| {
+                std::path::Path::new(&a)
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .map(str::to_string)
+            })
+            .unwrap_or_else(|| cmd.get_name().to_string());
         generate(Shell::Zsh, &mut cmd, name, &mut std::io::stdout());
         // Append a dynamic completer for --account-id. The clap-generated
         // script lists it as a value but with no completion source; this

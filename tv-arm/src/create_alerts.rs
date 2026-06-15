@@ -88,13 +88,22 @@ pub fn create_alerts(payloads: &[AlertPayload], tv_mcp_root: &Path) -> Result<Ve
     run_node(&script_path)
 }
 
-/// Substitute `{tv_mcp_root}` and `{payloads_path}` placeholders in
-/// the template. Plain string replacement — the placeholders are
-/// uniquely-named (no `{foo}` collisions in the JS).
+/// The TradingView alert destination (`web_hook` field), baked in at
+/// build time by `build.rs` from `TRADE_CONTROL_WEBHOOK`. Each
+/// per-environment binary (`tv-arm-staging`, `tv-arm-dev`, …) embeds its
+/// own worker URL; a plain `cargo install` defaults to the dev URL. This
+/// is the single source of truth for where armed alerts POST — there is
+/// no longer a hard-coded URL in the JS template.
+const BAKED_WEBHOOK: &str = env!("BAKED_WEBHOOK");
+
+/// Substitute `{tv_mcp_root}`, `{payloads_path}` and `{web_hook}`
+/// placeholders in the template. Plain string replacement — the
+/// placeholders are uniquely-named (no `{foo}` collisions in the JS).
 fn render_template(template: &str, tv_mcp_root: &Path, payloads_path: &Path) -> String {
     template
         .replace("{tv_mcp_root}", &tv_mcp_root.display().to_string())
         .replace("{payloads_path}", &payloads_path.display().to_string())
+        .replace("{web_hook}", BAKED_WEBHOOK)
 }
 
 /// Spawn `node <script>` with a timeout. Parse stdout as a JSON array

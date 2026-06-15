@@ -582,19 +582,27 @@ cargo build --features cli --release --bin trade-control
 
 ### Shell completions
 
-For the quickest setup, eval the completions for your current shell
-(detected from `$SHELL`) straight from your shell rc:
+The CLIs are installed per-environment with suffixed names
+(`trade-control-staging`, `tv-arm-staging`, … and the `-dev` set — see
+**Deploy**). Each binary's completion binds to **its own** name (taken from
+`argv[0]`), so `trade-control-staging --print-completions` defines
+completions for `trade-control-staging`, not the bare `trade-control`. Eval
+each from your shell rc:
 
 ```sh
-# ~/.zshrc (or ~/.bashrc)
-eval "$(trade-control --print-completions)"
+# ~/.zshrc — one line per installed binary (absent ones no-op):
+eval "$(trade-control-dev --print-completions 2>/dev/null)"
+eval "$(trade-control-staging --print-completions 2>/dev/null)"
+eval "$(tv-arm-dev --print-completions 2>/dev/null)"
+eval "$(tv-arm-staging --print-completions 2>/dev/null)"
+# …and tv-news-{dev,staging} likewise.
 ```
 
 To write a static completion file for an explicit shell instead, use the
 `completions <shell>` subcommand:
 
 ```sh
-trade-control completions zsh > ~/.zfunc/_trade-control
+trade-control-staging completions zsh > ~/.zfunc/_trade-control-staging
 ```
 
 Both emit the same script. For zsh it also appends a dynamic completer
@@ -671,9 +679,19 @@ curl ... | ./target/release/trade-control verify \
 ### Querying state, unlocking, and managing preps / vetos
 
 Several subcommands talk to the *running* worker, using the same signing
-key as auth. Set `TRADE_CONTROL_ENDPOINT` once to skip retyping `--endpoint`:
+key as auth. The worker URL comes from the binary's **baked-in default**
+(each suffixed CLI targets its own environment — `trade-control-staging`
+hits the staging worker, no config needed). Precedence is `--endpoint` flag
+> `TRADE_CONTROL_ENDPOINT` env > baked default. Don't export
+`TRADE_CONTROL_ENDPOINT` globally in your rc — it would override every
+suffixed binary's baked URL and point them all at one worker. Use the flag
+for ad-hoc overrides:
 
 ```sh
+# Normal use — the baked default targets the right worker:
+trade-control-staging status --key-file ~/.config/trade-control/key.hex
+
+# Ad-hoc override (examples below use --endpoint explicitly):
 export TRADE_CONTROL_ENDPOINT=https://trade-control.<account>.workers.dev
 
 # Dump active cooldowns, preps, vetos + recent seen ids as YAML.
@@ -1293,9 +1311,44 @@ the authoritative per-entry TTL keys (`veto:…`, `cooldown:…`) are untouched.
 
 ## Deploy
 
+There are three environments, one per git branch, each an isolated worker
+(own name, KV namespace, R2 bucket). The branch carries its own
+`wrangler.toml`, so a plain `wrangler deploy` on a branch targets that
+environment. See `DEPLOYED.md` for the full branch → environment model and
+the staging → prod promotion rule.
+
+Use the per-environment deploy script — **never** call `wrangler deploy`
+directly for a real deploy, because the scripts also rebuild and install
+the matching CLIs:
+
 ```sh
-wrangler deploy
+git checkout main    && ./deploy-dev.sh       # dev     -> trade-control-web-hook
+git checkout staging && ./deploy-staging.sh   # staging -> trade-control-web-hook-staging
+# ./deploy-live.sh is added at the first prod promotion.
 ```
+
+Each script:
+
+1. **Asserts the branch** matches the environment (won't let you deploy
+   staging code to the dev worker).
+2. `wrangler deploy`s the worker.
+3. Rebuilds `trade-control`, `tv-arm`, `tv-news` with
+   `TRADE_CONTROL_WEBHOOK` set so each binary **bakes that environment's
+   worker URL** as its compiled-in default endpoint (`build.rs` →
+   `BAKED_WEBHOOK`).
+4. Installs the binaries into `~/.cargo/bin` under **suffixed names** —
+   `trade-control-staging`, `tv-arm-staging`, `tv-news-staging` (and the
+   `-dev` set). So you pick an environment by which command you run; no env
+   var to set. The webhook the armed TradingView alerts POST to is baked
+   into `tv-arm-<env>` too — there is no longer a hard-coded URL in the JS
+   template.
+
+`deploy-lib.sh` holds the shared logic; the per-env wrappers hold only the
+branch + URL (one place each), so next week's "`web-hook` becomes prod, cut
+a fresh `web-hook-dev`" remap is a one-line edit per script.
+
+> The legacy top-level `deploy.sh` is deprecated and now just points at the
+> per-env scripts.
 
 ## Test locally
 

@@ -1,25 +1,15 @@
 #!/usr/bin/env bash
-# Deploy the trade-control-web-hook worker to Cloudflare and (re)install
-# the local tv-news CLI so the chart-side tooling moves in lockstep with
-# whatever was just deployed.
+# Deprecated. Replaced by per-environment deploy scripts that bake the
+# correct webhook URL into the CLIs and install them under suffixed names:
 #
-# Order matters: deploy first so a build/test failure aborts before the
-# local install side-effects. Both steps are idempotent.
+#   ./deploy-dev.sh       # main   branch -> trade-control-web-hook        + *-dev CLIs
+#   ./deploy-staging.sh   # staging branch -> trade-control-web-hook-staging + *-staging CLIs
+#   ./deploy-live.sh      # (added at first prod promotion)
+#
+# Pick the one matching your current branch. See DEPLOYED.md for the
+# branch -> environment model.
 
 set -euo pipefail
-
-cd "$(dirname "$0")"
-
-echo "==> Deploying worker via wrangler"
-wrangler deploy
-
-echo "==> Installing cli CLI from ./cli"
-cargo install --path cli
-
-echo "==> Installing tv-news CLI from ./tv-news"
-cargo install --path tv-news
-
-echo "==> Installing tv-arm CLI from ./tv-arm"
-cargo install --path tv-arm
-
-echo "==> Done"
+echo "deploy.sh is deprecated — use ./deploy-dev.sh or ./deploy-staging.sh." >&2
+echo "(They bake the per-env webhook into the CLIs and install suffixed names.)" >&2
+exit 1
