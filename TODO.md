@@ -37,8 +37,15 @@ positions".
 - [x] README: M/W bundle table gains `01-veto-mw-overshoot`
 - [x] CHANGELOG: v26 entry
 - [x] cargo test (workspace) + clippy (native+wasm) + fmt — all green
-- [ ] commit + push + tag v26; advance parent submodule pointer
-- [ ] deploy to BOTH dev and staging (user: no trades taken this week)
+- [x] commit + push + tag v26; advance parent submodule pointer
+- [x] deploy to BOTH dev and staging (user: no trades taken this week) —
+      dev `6d9c3792`, staging `0244d454`. DONE.
+
+### Manual follow-up (operator, TradingView)
+- [ ] Re-run `tv-arm-dev` / `tv-arm-staging` on an M/W chart to emit the new
+      `01-veto-mw-overshoot` alert (existing armed setups won't have it until
+      re-armed). The static 180% level is computed from the path anchors at
+      arm time.
 
 ### Not doing (per user, deferred)
 - No worker-side live recomputation / re-arming of the level. (Phase-2 only if
