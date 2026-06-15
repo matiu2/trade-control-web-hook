@@ -205,9 +205,16 @@ pub fn record_to_r2(env: &worker::Env, ctx: &worker::Context, record: RequestRec
             return;
         }
     };
+    // Synchronous breadcrumb — flushes with the response, never swallowed.
+    // Confirms we reached the put-scheduling point and with what key/size.
+    worker::console_log!(
+        "recording: scheduling R2 put key={key} bytes={}",
+        json.len()
+    );
     ctx.wait_until(async move {
-        if let Err(err) = bucket.put(key, json).execute().await {
-            worker::console_error!("recording: R2 put failed: {err}");
+        match bucket.put(key.clone(), json).execute().await {
+            Ok(_) => worker::console_log!("recording: R2 put OK key={key}"),
+            Err(err) => worker::console_error!("recording: R2 put failed key={key}: {err}"),
         }
     });
 }

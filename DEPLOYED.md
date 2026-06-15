@@ -50,7 +50,7 @@ from `main` carrying the week's accumulated changes.
 | pine | `candle-signals-v2` | — | manual; record the TV version note |
 | tv-arm | `0.1.0` | — | |
 | trade-control | `0.2.0` | — | |
-| backend | `v23` | _pending first deploy_ | first recording-enabled build |
+| backend | `v23` | 2026-06-15 | first recording-enabled build; R2 recording verified live |
 | contract | `v3` | — | unchanged by v23 (recording is observe-only) |
 
 ### prod

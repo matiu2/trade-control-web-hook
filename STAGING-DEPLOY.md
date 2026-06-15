@@ -94,6 +94,15 @@ wrangler r2 object get trade-control-recording-staging \
 It should contain `body`, `headers`, `status`, `outcome`, and a `logs`
 array.
 
+> **Do NOT trust `wrangler r2 bucket info` to confirm recording works.**
+> Its `object_count` / `bucket_size` are eventually-consistent and lag by
+> minutes-to-hours — it will show `0` long after objects have landed. This
+> burned a whole debugging session (objects were writing fine the entire
+> time). The authoritative check is `r2 object get` / `r2 object list`
+> above, plus the synchronous `recording: R2 put OK key=...` line in
+> `wrangler tail` — that line is emitted from inside the worker the moment
+> the put succeeds, so if you see it, the object exists.
+
 ## 6. Record the deploy
 
 Update `DEPLOYED.md` (staging row) with the backend tag (`v23`), the
