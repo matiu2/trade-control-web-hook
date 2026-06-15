@@ -1,9 +1,9 @@
-# === STAGING environment ===
-# This branch (`staging`) deploys an isolated worker: its own name, KV
-# namespace, and R2 bucket, separate from prod. Promotion to prod happens
-# by merging a green-for-a-week staging into the `prod` branch (which
-# carries its own prod-pointed wrangler.toml). See DEPLOYED.md.
-name = "trade-control-web-hook-staging"
+# === DEV environment ===
+# This branch (`main`) deploys the dev worker: its own name, KV namespace,
+# and R2 bucket, separate from staging/prod. The staging branch carries a
+# staging-pointed wrangler.toml; promotion to prod uses a prod-pointed one.
+# See DEPLOYED.md for the branch -> environment model.
+name = "trade-control-web-hook"
 main = "build/worker/shim.mjs"
 compatibility_date = "2026-03-13"
 workers_dev = true
@@ -16,20 +16,20 @@ enabled = true
 
 [vars]
 
-# STAGING KV namespace — distinct from dev/prod so state never collides.
-# Create it and paste the printed id here (replace REPLACE_ME):
-#   wrangler kv namespace create TRADE_CONTROL_KV_STAGING
+# DEV KV namespace — distinct from staging/prod so state never collides.
 [[kv_namespaces]]
 binding = "TRADE_CONTROL_KV"
-id = "4343d146bf244529a43fce11ced1587d"
+id = "e4f27179248e451daf8cf68a98c47e5b"
 
-# STAGING R2 bucket for per-request recording. Create with:
-#   wrangler r2 bucket create trade-control-recording-staging
-# The deploying API token needs "Workers R2 Storage: Edit". Absent
-# binding is fail-soft (worker logs one line, skips recording).
+# DEV R2 bucket for per-request recording (body + headers + response +
+# logs). The worker writes one JSON object per intent request here; if this
+# binding is absent the worker logs one line and skips recording (fail-soft
+# — trading is unaffected). Create with:
+#   wrangler r2 bucket create trade-control-recording
+# The deploying API token needs "Workers R2 Storage: Edit".
 [[r2_buckets]]
 binding = "TRADE_CONTROL_R2"
-bucket_name = "trade-control-recording-staging"
+bucket_name = "trade-control-recording"
 
 # Scheduled (cron) trigger. Fires the `scheduled` event in `src/cron.rs`.
 # A SINGLE */15 trigger drives every job; each self-gates on `now`:
