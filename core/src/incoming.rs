@@ -116,6 +116,7 @@ pub fn parse_and_verify(
             "close"
             | "high"
             | "low"
+            | "open"
             | "time"
             | "signal_high"
             | "signal_low"
@@ -429,6 +430,57 @@ mod tests {
         let now: DateTime<Utc> = "2026-05-13T12:01:00Z".parse().unwrap();
         let v = parse_and_verify(&on_wire, &KEY, now).unwrap();
         assert_eq!(v.intent.id, "prep-abc");
+        // No `open` on this body → shell.open is None (backward compat: a
+        // chart armed before the v2.5 Pine sends no open and still verifies).
+        assert_eq!(v.shell.open, None);
+    }
+
+    #[test]
+    fn signed_path_open_round_trips() {
+        // A body carrying `open: {{open}}` (v2.5 Pine / current tv-arm) must
+        // verify and populate shell.open. The schema fingerprint includes the
+        // `open` key on both sign and verify, so it round-trips cleanly.
+        // Use a `prep` body (minimal valid intent) so the test isolates the
+        // `open` shell round-trip, not enter-intent validation.
+        let pre_substitution = [
+            "close: {{close}}",
+            "high: {{high}}",
+            "low: {{low}}",
+            "open: {{open}}",
+            "time: \"{{time}}\"",
+            "v: 1",
+            "action: prep",
+            "instrument: EUR_USD",
+            "id: prep-open-abc",
+            "not_after: \"2026-05-13T20:00:00Z\"",
+            "step: retest",
+            "ttl_hours: 12",
+            "",
+        ]
+        .join("\n");
+        let pairs = signed_pairs_from_text(&pre_substitution).unwrap();
+        let sig = crate::sig::sign(&KEY, &pairs).unwrap();
+        let on_wire = [
+            "close: 1.1000",
+            "high: 1.1020",
+            "low: 1.0980",
+            "open: 1.0995",
+            "time: \"2026-05-13T12:00:00Z\"",
+            "v: 1",
+            "action: prep",
+            "instrument: EUR_USD",
+            "id: prep-open-abc",
+            "not_after: \"2026-05-13T20:00:00Z\"",
+            "step: retest",
+            "ttl_hours: 12",
+            &format!("sig: \"{sig}\""),
+            "",
+        ]
+        .join("\n");
+        let now: DateTime<Utc> = "2026-05-13T12:01:00Z".parse().unwrap();
+        let v = parse_and_verify(&on_wire, &KEY, now).unwrap();
+        assert_eq!(v.intent.id, "prep-open-abc");
+        assert_eq!(v.shell.open, Some(1.0995));
     }
 
     #[test]

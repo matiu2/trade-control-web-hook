@@ -408,6 +408,7 @@ mod tests {
                 .replace("{{close}}", "1.16438")
                 .replace("{{high}}", "1.16440")
                 .replace("{{low}}", "1.16430")
+                .replace("{{open}}", "1.16435")
                 .replace("{{time}}", "2026-06-06T12:30:00Z");
             let verify_now = ts("2026-06-06T12:30:30Z");
             let verified = parse_and_verify(&on_wire, &key, verify_now)

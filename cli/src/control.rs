@@ -316,6 +316,13 @@ fn shell_for_tv_template_drawing() -> Vec<(&'static str, String)> {
         ("close", "{{close}}".to_string()),
         ("high", "{{high}}".to_string()),
         ("low", "{{low}}".to_string()),
+        // `open` is a TradingView built-in (no plot-index risk). It rides
+        // every TV-template shell so the M/W enter can compute candle-body
+        // extremes (rogue-wick handling, dynamic neckline revision). Its
+        // value is unsigned (TV fills it post-sign); see
+        // `trade_control_core::sig::UNSIGNED_VALUE_KEYS`. Optional on the
+        // worker side, so older charts without it still verify.
+        ("open", "{{open}}".to_string()),
         ("time", "\"{{time}}\"".to_string()),
     ]
 }

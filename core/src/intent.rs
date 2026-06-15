@@ -23,6 +23,15 @@ pub struct Shell {
     pub close: f64,
     pub high: f64,
     pub low: f64,
+    /// Bar **open** — added 2026-06 for M/W body-extreme logic (rogue-wick
+    /// handling and dynamic neckline revision read `max(open,close)` /
+    /// `min(open,close)`, not the wick high/low). Optional: control-action
+    /// shells don't carry it, and charts armed under a pre-`open` Pine send
+    /// no `open` field — body-based logic must fall back gracefully (treat
+    /// `None` as "can't compute bodies this bar"). TV built-in `{{open}}`,
+    /// so no plot-index risk. Value is in [`crate::sig::UNSIGNED_VALUE_KEYS`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub open: Option<f64>,
     /// ISO-8601 timestamp from TradingView. Used as an upper bound on the
     /// alert's freshness — alerts from yesterday should be obvious.
     pub time: DateTime<Utc>,
@@ -1520,6 +1529,7 @@ mod tests {
             close: 1.1000,
             high: 1.1020,
             low: 1.0980,
+            open: None,
             time: "2026-05-13T12:00:00Z".parse().unwrap(),
             signal_high: None,
             signal_low: None,

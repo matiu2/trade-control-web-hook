@@ -3081,6 +3081,7 @@ mod dispatcher_outcome_tests {
                 close: 203.0,
                 high: 203.2,
                 low: 202.9,
+                open: None,
                 time: now(),
                 signal_high: None,
                 signal_low: None,

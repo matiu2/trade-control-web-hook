@@ -924,6 +924,7 @@ mod tests {
             close: 1.10,
             high: 1.11,
             low: 1.09,
+            open: None,
             time,
             signal_high: None,
             signal_low: None,

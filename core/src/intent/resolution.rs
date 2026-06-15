@@ -530,6 +530,7 @@ mod tests {
             close: 1.1000,
             high: 1.1020,
             low: 1.0980,
+            open: None,
             time: "2026-05-13T12:00:00Z".parse().unwrap(),
             signal_high: None,
             signal_low: None,

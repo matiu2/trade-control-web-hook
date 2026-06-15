@@ -2860,6 +2860,7 @@ entry_mode: market
             .replace("{{close}}", "203.391")
             .replace("{{high}}", "203.395")
             .replace("{{low}}", "203.380")
+            .replace("{{open}}", "203.385")
             .replace("{{time}}", "2026-06-02T15:00:00Z")
             .replace("{{plot(\"signal_high\")}}", "203.395")
             .replace("{{plot(\"signal_low\")}}", "203.380")
@@ -2905,6 +2906,7 @@ entry_mode: market
             .replace("{{close}}", "203.391")
             .replace("{{high}}", "203.395")
             .replace("{{low}}", "203.380")
+            .replace("{{open}}", "203.385")
             .replace("{{time}}", "2026-06-02T15:00:00Z")
             .replace("{{plot(\"signal_high\")}}", "203.395")
             .replace("{{plot(\"signal_low\")}}", "203.380")
@@ -3146,6 +3148,14 @@ tp_price: 1.05
             } else {
                 wrap_signed_template_drawing(&alert.intent, &key).unwrap()
             };
+            // Every TV-template shell — Pine-bound enter and drawing alike —
+            // carries `open: {{open}}` (a built-in, added for M/W body-extreme
+            // logic). The M/W `05-enter` is the one that actually consumes it.
+            assert!(
+                body.contains("open: {{open}}"),
+                "alert {} must carry the open placeholder, got: {body}",
+                alert.basename
+            );
             if is_pine_bound {
                 assert!(
                     body.contains("{{plot("),
@@ -3157,8 +3167,8 @@ tp_price: 1.05
                     "drawing alert {} must not carry plot placeholders, got: {body}",
                     alert.basename
                 );
-                // Sanity: drawing alerts still carry the four
-                // universally-substituted shell placeholders.
+                // Sanity: drawing alerts still carry the universally-
+                // substituted shell placeholders.
                 assert!(body.contains("close: {{close}}"));
                 assert!(body.contains("time: \"{{time}}\""));
             }
