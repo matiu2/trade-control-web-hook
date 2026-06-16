@@ -67,6 +67,7 @@ fn control_skeleton(action: Action, instrument: &str, id: String, now: DateTime<
         reason: None,
         mw: None,
         pip_size: None,
+        trade_plan: None,
     }
 }
 

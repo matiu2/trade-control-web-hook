@@ -36,7 +36,8 @@ pub struct Candle {
 ///
 /// TradeNation natively serves minute / quarter (15m) / hour / day; M5 and H4
 /// are aggregated upstream by `tradenation-api`. OANDA serves all six directly.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Granularity {
     M1,
     M5,

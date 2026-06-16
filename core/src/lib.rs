@@ -14,4 +14,5 @@ pub mod ny_clock;
 pub mod rules;
 pub mod sig;
 pub mod state;
+pub mod trade_plan;
 pub mod tunable;

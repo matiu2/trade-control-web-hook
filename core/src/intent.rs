@@ -765,6 +765,17 @@ pub struct Intent {
     /// `tv-arm` sets both to the same number.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pip_size: Option<f64>,
+    /// Server-side [`TradePlan`](crate::trade_plan::TradePlan) — present only
+    /// on an [`Action::Register`] intent, absent on every other action. The
+    /// engine reads this, persists the plan, and from then on evaluates the
+    /// plan's conditions itself on each cron tick (replacing the per-condition
+    /// TradingView alerts). Signed as part of the whole-body HMAC like every
+    /// other field, so the plan can't be tampered in flight.
+    ///
+    /// Default-absent = a non-register intent; byte-identical wire form to
+    /// pre-feature intents.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trade_plan: Option<crate::trade_plan::TradePlan>,
 }
 
 /// Skip-serializing predicate for [`Intent::max_retries`]. Returns true
@@ -1348,6 +1359,13 @@ pub enum Action {
     NewsStart,
     /// Clear the matching `news:<trade_id>:<news_id>` entry.
     NewsEnd,
+    /// Register a server-side [`TradePlan`](crate::trade_plan::TradePlan) with
+    /// the engine. The plan rides in [`Intent::trade_plan`]; the engine then
+    /// evaluates its conditions on each cron tick and dispatches the embedded
+    /// intents itself, replacing the per-condition TradingView alerts. A
+    /// control-style action — no broker call at register time; idempotent
+    /// (re-registering the same plan refreshes its row). See the engine crate.
+    Register,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]

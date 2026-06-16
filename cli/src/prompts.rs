@@ -88,6 +88,10 @@ pub fn required_for_action(action: Action) -> &'static [&'static str] {
         // news-start / news-end are produced by `trade-control
         // build-news` from a NewsSpec — same shape as pause/resume.
         Action::NewsStart | Action::NewsEnd => &[],
+        // register carries a whole `TradePlan` in `trade_plan`, minted by
+        // `tv-arm` from the chart geometry — never hand-built through the
+        // interactive questionnaire, so nothing extra is prompted here.
+        Action::Register => &[],
     }
 }
 

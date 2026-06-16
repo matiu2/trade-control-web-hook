@@ -255,6 +255,7 @@ fn build_news_intent(
         reason: spec.reason.clone(),
         mw: None,
         pip_size: None,
+        trade_plan: None,
     }
 }
 

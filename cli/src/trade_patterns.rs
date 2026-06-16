@@ -1378,6 +1378,7 @@ fn skeleton(
         reason: None,
         mw: None,
         pip_size: None,
+        trade_plan: None,
     }
 }
 

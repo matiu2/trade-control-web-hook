@@ -414,6 +414,61 @@ mod tests {
         ));
     }
 
+    /// Build a signed `register` carrying a flow-style `trade_plan`. The plan
+    /// rides as single-line JSON (valid flow YAML) exactly as the CLI's
+    /// `render_value` emits any nested field, so the whole plan sits on the
+    /// `trade_plan:` line and is covered by the whole-body HMAC.
+    fn build_signed_register(plan_json: &str) -> String {
+        let body_without_sig = [
+            "close: 0",
+            "high: 0",
+            "low: 0",
+            "time: \"2026-05-13T12:00:00Z\"",
+            "v: 1",
+            "action: register",
+            "instrument: EUR_USD",
+            "id: register-abc",
+            "trade_id: eurusd-hs-1",
+            "not_after: \"2026-05-13T20:00:00Z\"",
+            &format!("trade_plan: {plan_json}"),
+            "",
+        ]
+        .join("\n");
+        let pairs = signed_pairs_from_text(&body_without_sig).unwrap();
+        let sig = crate::sig::sign(&KEY, &pairs).unwrap();
+        format!("{body_without_sig}sig: \"{sig}\"\n")
+    }
+
+    /// A minimal flow-style plan: zero rules is enough to prove the field
+    /// signs, verifies, and deserialises back into a `TradePlan`. Rule
+    /// evaluation is Stage D.
+    const MINIMAL_PLAN_JSON: &str = r#"{"trade_id":"eurusd-hs-1","instrument":"EUR_USD","direction":"long","granularity":"h1","pip_size":0.0001,"rules":[]}"#;
+
+    #[test]
+    fn signed_path_register_trade_plan_round_trips() {
+        let yaml = build_signed_register(MINIMAL_PLAN_JSON);
+        let now: DateTime<Utc> = "2026-05-13T12:01:00Z".parse().unwrap();
+        let v = parse_and_verify(&yaml, &KEY, now).unwrap();
+        assert_eq!(v.intent.action, crate::intent::Action::Register);
+        let plan = v.intent.trade_plan.expect("trade_plan present");
+        assert_eq!(plan.trade_id, "eurusd-hs-1");
+        assert_eq!(plan.instrument, "EUR_USD");
+        assert!(plan.rules.is_empty());
+    }
+
+    #[test]
+    fn signed_path_register_trade_plan_tamper_rejected() {
+        // The plan is signed as part of the whole body — editing the
+        // single-line plan value after signing must fail verification.
+        let yaml = build_signed_register(MINIMAL_PLAN_JSON)
+            .replace(r#""pip_size":0.0001"#, r#""pip_size":0.01"#);
+        let now: DateTime<Utc> = "2026-05-13T12:01:00Z".parse().unwrap();
+        assert!(matches!(
+            parse_and_verify(&yaml, &KEY, now),
+            Err(IncomingError::Sig(SigError::Mismatch))
+        ));
+    }
+
     #[test]
     fn signed_path_dropped_shell_key_rejected() {
         let yaml = build_signed_prep("2026-05-13T20:00:00Z", "2026-05-13T12:00:00Z");

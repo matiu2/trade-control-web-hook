@@ -69,7 +69,49 @@ ClosePositions veto wants prompt reaction and is already SL-bounded.
       `register`; Stage D adds `evaluate_plan` + cron wiring.
 - [x] Green: engine test (1, shared-surface smoke), engine build native+wasm,
       clippy, fmt; `cargo check --workspace` + worker wasm lib unaffected.
-### Stage C — TradePlan + register (PENDING)
+### Stage C — TradePlan + register (IN PROGRESS — commit 1/2 done)
+Decisions (locked with user):
+- `Action::Register` is a **unit variant** (Action stays `Copy`); the plan
+  rides in a new `Intent.trade_plan: Option<TradePlan>` — same pattern as the
+  existing optional `mw`/`pip_size`. Validate `trade_plan.is_some()` ⟺ register.
+- **Split TV's `Frequency`** into `BarEvent` (Intrabar/OnClose) + `FireMode`
+  (Once/EveryBar) — the engine is **stateful**, so a fired `Once` rule
+  **latches** (no TV-style re-fire on every touch). See
+  [[engine_fired_rules_latch]].
+- `TradePlan` lives in **`core`** (the Intent must hold it; core can't depend
+  on the engine crate). The engine re-exports it; the pure `evaluate_plan` is
+  Stage D.
+
+#### Commit 1 — type layer + register plumbing (DONE — all green)
+- [x] `core/src/trade_plan.rs`: `TradePlan { trade_id, instrument, direction,
+      granularity, pip_size, rules }`, `ConditionRule { rule_id, trigger,
+      fire_mode, intent }`, `Trigger` (`HorizontalCross`/`PriceValueCross`/
+      `TrendlineCross`/`TimeReached`/`MwEveryBar`/`PinePattern`, `#[serde(tag
+      = "type")]`), `LinePoint`, `CrossDir`, `BarEvent`, `FireMode`. 1:1 port of
+      `alert_spec.rs` trigger triples. 5 unit tests (tag/wire-form round-trips).
+- [x] `Granularity` now derives `Serialize`/`Deserialize` (snake_case) so the
+      plan serialises.
+- [x] `core/intent.rs`: `Action::Register` unit variant + `Intent.trade_plan:
+      Option<TradePlan>` (skip-if-none → byte-identical pre-feature wire).
+- [x] Worker `handle_register` (pre-broker, control-style, idempotent
+      `record_seen`): validates plan present + `trade_id` matches; logs +
+      acks. **KV persistence deferred to Stage D** — outcome string says
+      `not-yet-persisted`. Added to the pre-dispatch match + the `run_action`
+      unreachable arm.
+- [x] Updated all 13 `Intent { .. }` literals (builders/tests) with
+      `trade_plan: None`; `prompts::required_for_action` Register arm.
+- [x] **Signing needs no `sig.rs` change:** `render_value` already emits nested
+      fields as single-line flow JSON, so `trade_plan: {...}` is one top-level
+      line and fully HMAC'd. 2 `incoming` tests: register round-trips +
+      plan-tamper rejected. See [[signed_body_is_top_level_lines_only]].
+- [x] Engine re-exports `TradePlan`/`ConditionRule`/`Trigger`/`BarEvent`/
+      `FireMode`/`CrossDir`/`LinePoint`.
+- [x] Green: core (467), worker (195), cli (234+8), engine (1); wasm lib build;
+      clippy native+wasm; fmt; `cargo check --workspace`.
+
+#### Commit 2 — tv-arm folds roles into one plan + POSTs it (PENDING)
+- [ ] `build_trade_plan()` from `roles` (map each alert role → ConditionRule);
+      POST one `register` intent. Old alert path stays until Stage F.
 ### Stage D — engine: pure evaluator + cron wiring (PENDING)
 ### Stage E — port H&S Pine candle detector to Rust (PENDING)
 ### Stage F — retire the webhook (PENDING)

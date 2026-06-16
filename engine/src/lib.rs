@@ -47,6 +47,9 @@
 pub use trade_control_core::broker::{Broker, Candle, CandleError, Granularity};
 pub use trade_control_core::intent::{self, Action, Intent};
 pub use trade_control_core::state::{StateError, StateStore};
+pub use trade_control_core::trade_plan::{
+    BarEvent, ConditionRule, CrossDir, FireMode, LinePoint, TradePlan, Trigger,
+};
 
 #[cfg(test)]
 mod tests {

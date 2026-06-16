@@ -243,6 +243,7 @@ pub async fn main(mut req: Request, env: Env, ctx: Context) -> Result<Response> 
             Action::Resume => break 'intent handle_resume(&store, &verified, now).await,
             Action::NewsStart => break 'intent handle_news_start(&store, &verified, now).await,
             Action::NewsEnd => break 'intent handle_news_end(&store, &verified, now).await,
+            Action::Register => break 'intent handle_register(&store, &verified, now).await,
             _ => {}
         }
 
@@ -571,7 +572,8 @@ async fn run_action<B: Broker>(
         | Action::Pause
         | Action::Resume
         | Action::NewsStart
-        | Action::NewsEnd => {
+        | Action::NewsEnd
+        | Action::Register => {
             // Handled before broker dispatch; never reached here.
             unreachable!("non-broker actions handled before broker dispatch")
         }
@@ -2564,6 +2566,51 @@ async fn handle_news_end(
     Response::ok("ok")
 }
 
+/// Handle the `register` action: accept a server-side
+/// [`TradePlan`](trade_control_core::trade_plan::TradePlan) for the engine to
+/// evaluate on each cron tick. A control action — no broker work; idempotent
+/// (re-registering refreshes the row), so it marks-seen on every completion
+/// like the other control handlers.
+///
+/// **Stage C scope:** this validates the intent actually carries a plan and
+/// that the plan's `trade_id` matches the intent's, then acknowledges it. The
+/// KV persistence of the plan + its per-rule `PlanState` is Stage D — until
+/// then a register is a logged no-op so the wire path and the dispatch routing
+/// can be exercised end-to-end without the engine's storage schema. The
+/// `not-yet-persisted` outcome string makes that explicit in `status`.
+async fn handle_register(
+    store: &KvStateStore,
+    verified: &incoming::Verified,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<Response> {
+    let Some(plan) = verified.intent.trade_plan.as_ref() else {
+        return Response::error("register requires a `trade_plan`", 400);
+    };
+    // The plan and its carrier intent must agree on which trade they describe,
+    // otherwise the engine couldn't key the plan's state to the intent's id.
+    if let Some(intent_trade_id) = verified.intent.trade_id.as_deref()
+        && intent_trade_id != plan.trade_id
+    {
+        return Response::error(
+            "register: intent trade_id does not match plan trade_id",
+            400,
+        );
+    }
+    rlog!(
+        "register: trade_id={} instrument={} rules={} (Stage C: not yet persisted)",
+        plan.trade_id,
+        plan.instrument,
+        plan.rules.len()
+    );
+    let outcome = format!(
+        "registered: {} ({} rules, not-yet-persisted)",
+        plan.trade_id,
+        plan.rules.len()
+    );
+    record_seen(store, verified, now, &outcome).await;
+    Response::ok("ok")
+}
+
 /// Resolve an [`OandaBroker`] for the request.
 ///
 /// - When `account` is `Some(name)`, looks up the account's metadata
@@ -3359,6 +3406,7 @@ mod dispatcher_outcome_tests {
                 reason: None,
                 mw: None,
                 pip_size: None,
+                trade_plan: None,
             },
         }
     }
