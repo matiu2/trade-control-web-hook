@@ -41,6 +41,45 @@ pub enum IncomingError {
     InvalidIntent(IntentValidationError),
 }
 
+/// How the worker should report an [`IncomingError`] on the wire.
+///
+/// Splits the benign time-window declines (a well-formed, correctly-signed
+/// intent that simply fired outside its `[not_before, not_after]` window —
+/// the expected end-of-life outcome for any scheduled alert) from the
+/// genuinely bad / forged requests. The worker maps the former to an HTTP
+/// 200 `declined:` outcome and the latter to a 400 `rejected`, so timeline /
+/// verdict tooling can tell a routine stale fire apart from a real bad-body
+/// defect. See bug #9 — same status-code convention as M/W's
+/// `declined: mw-not-armed` (bug #7), here at the parse/verify gate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IncomingDisposition {
+    /// 200 — fired after `not_after`. Outcome `declined: intent-expired`.
+    DeclinedExpired,
+    /// 200 — fired before `not_before`. Outcome `declined: intent-too-early`.
+    DeclinedTooEarly,
+    /// 400 — a genuinely malformed/forged request. `StaleShellTime` lands
+    /// here too: a >24h-old plaintext `time` smells of replay, not a benign
+    /// late fire.
+    Rejected,
+}
+
+impl IncomingError {
+    /// Classify this error for the worker's wire response. Pure (no KV / no
+    /// clock), so it is unit-testable off-wasm.
+    pub fn disposition(&self) -> IncomingDisposition {
+        match self {
+            Self::Expired => IncomingDisposition::DeclinedExpired,
+            Self::TooEarly => IncomingDisposition::DeclinedTooEarly,
+            Self::BadYaml(_)
+            | Self::Sig(_)
+            | Self::BadIntentYaml(_)
+            | Self::UnsupportedVersion(_)
+            | Self::StaleShellTime
+            | Self::InvalidIntent(_) => IncomingDisposition::Rejected,
+        }
+    }
+}
+
 impl core::fmt::Display for IncomingError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
@@ -881,6 +920,46 @@ mod tests {
         let now: DateTime<Utc> = "2026-05-13T12:01:00Z".parse().unwrap();
         let v = parse_and_verify(&yaml, &KEY, now).unwrap();
         assert_eq!(v.intent.trade_id.as_deref(), Some("eurusd-short-01jb2x"));
+    }
+
+    #[test]
+    fn disposition_splits_time_window_from_bad_request() {
+        use crate::intent::IntentValidationError;
+
+        // Benign time-window declines → 200 declined.
+        assert_eq!(
+            IncomingError::Expired.disposition(),
+            IncomingDisposition::DeclinedExpired
+        );
+        assert_eq!(
+            IncomingError::TooEarly.disposition(),
+            IncomingDisposition::DeclinedTooEarly
+        );
+
+        // Genuinely bad / forged → 400 rejected.
+        for err in [
+            IncomingError::BadYaml("x".into()),
+            IncomingError::Sig(SigError::Mismatch),
+            IncomingError::BadIntentYaml("x".into()),
+            IncomingError::UnsupportedVersion(99),
+            IncomingError::InvalidIntent(IntentValidationError::InvalidTradeId),
+        ] {
+            assert_eq!(
+                err.disposition(),
+                IncomingDisposition::Rejected,
+                "{err:?} should be a 400 rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn disposition_stale_shell_time_is_rejected_not_benign() {
+        // A >24h-old plaintext `time` smells of replay/forgery — it must not
+        // be reclassified as a benign decline alongside Expired/TooEarly.
+        assert_eq!(
+            IncomingError::StaleShellTime.disposition(),
+            IncomingDisposition::Rejected
+        );
     }
 
     #[test]

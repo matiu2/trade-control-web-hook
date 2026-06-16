@@ -363,6 +363,20 @@ clear-*, unlock) all consume the id, so byte-identical replays of those
 return 409 instead of executing twice. Use a unique id per intended
 trade.
 
+**Firing outside the time window is a benign decline, not an error.** A
+well-formed, correctly-signed intent that arrives after its `not_after`
+(expired) or before its `not_before` (too early) is the *expected*
+end-of-life outcome for any scheduled alert that keeps firing past its
+intent's lifetime. The worker reports it as **HTTP 200** with
+`outcome: declined: intent-expired` (or `declined: intent-too-early`) —
+distinct from the **400 `rejected`** it returns for a genuinely malformed
+or forged request (bad YAML, bad HMAC sig, unsupported version, malformed
+`trade_id`). A `time` plaintext stamp more than 24h from now stays a 400
+`rejected` (it smells of replay), not a benign decline. The split lets
+timeline/verdict tooling tell a routine stale fire apart from a real
+bad-body defect — the same status-code convention as M/W's
+`declined: mw-not-armed`, here at the parse/verify gate.
+
 ## Conditional entries (preps + vetos)
 
 Some setups want to fire `enter` only after a sequence of prior events.

@@ -34,7 +34,7 @@ use broker_oanda::login_with_account_id as oanda_login_with;
 use broker_oanda::{OandaBroker, login as oanda_login};
 use serde::Serialize;
 use trade_control_core::broker::{Broker, EntryError, EntryRequest};
-use trade_control_core::incoming::{self, parse_and_verify};
+use trade_control_core::incoming::{self, IncomingDisposition, parse_and_verify};
 use trade_control_core::intent::{
     Action, BrokerKind, Intent, MW_CANCEL_VETO_NAME, MwAnchors, MwUpdate, REVERSAL_VETO_NAME,
     ResolveError, Resolved, Shell, VetoLevel, effective_mw_params, plan_mw_update,
@@ -148,14 +148,43 @@ pub async fn main(mut req: Request, env: Env, ctx: Context) -> Result<Response> 
         let now = Utc::now();
         let verified = match parse_and_verify(&yaml, &key, now) {
             Ok(v) => v,
-            Err(err) => {
-                rlog_err!(
-                    "incoming rejected: {err} | body_len={} body_excerpt={:?}",
-                    yaml.len(),
-                    body_excerpt(&yaml)
-                );
-                break 'intent Response::error("rejected", 400);
-            }
+            // A benign time-window decline (`Expired` / `TooEarly`) is a
+            // well-formed, correctly-signed intent that simply fired outside
+            // its `[not_before, not_after]` window — the *expected*
+            // end-of-life outcome for any scheduled alert that keeps firing
+            // past its intent's lifetime. Report it as a 200 with a distinct
+            // `declined:` outcome so the timeline/verdict downstream can tell
+            // it apart from a genuinely malformed/forged request (which stays
+            // a 400 `rejected`). `StaleShellTime` is *not* folded in here — a
+            // >24h-old plaintext `time` smells of replay. Same status-code
+            // convention as bug #7's `declined: mw-not-armed`, here at the
+            // parse/verify gate. Bug #9.
+            Err(err) => match err.disposition() {
+                IncomingDisposition::DeclinedExpired => {
+                    rlog!(
+                        "incoming declined: {err} | body_len={} body_excerpt={:?}",
+                        yaml.len(),
+                        body_excerpt(&yaml)
+                    );
+                    break 'intent Response::ok("declined: intent-expired");
+                }
+                IncomingDisposition::DeclinedTooEarly => {
+                    rlog!(
+                        "incoming declined: {err} | body_len={} body_excerpt={:?}",
+                        yaml.len(),
+                        body_excerpt(&yaml)
+                    );
+                    break 'intent Response::ok("declined: intent-too-early");
+                }
+                IncomingDisposition::Rejected => {
+                    rlog_err!(
+                        "incoming rejected: {err} | body_len={} body_excerpt={:?}",
+                        yaml.len(),
+                        body_excerpt(&yaml)
+                    );
+                    break 'intent Response::error("rejected", 400);
+                }
+            },
         };
 
         let store = match env.kv(KV_NAMESPACE) {
