@@ -1,5 +1,51 @@
 # Changelog
 
+## v28 — 2026-06-16 — expired/too-early intents return 200 declined, not 400 (bug #9)
+
+### Why
+
+A well-formed, correctly-signed intent that arrives after its `not_after`
+(expired) or before its `not_before` (too early) is the *expected*
+end-of-life outcome for any scheduled TradingView alert that keeps firing
+past its intent's lifetime. The worker mapped **all seven** `IncomingError`
+variants to a single `400 "rejected"`, so a routine stale fire read as an
+HTTP 400 bad request — indistinguishable from a genuinely malformed/forged
+request (bad YAML, bad HMAC sig, unsupported version, malformed `trade_id`).
+This polluted the `trading-tax-tracker` timeline/verdict and masked real
+bad-body / forgery defects in the 4xx noise. Surfaced by `m-aud-usd-007dfa5e`
+on 2026-06-16. Same status-code-conflation defect as bug #7 (v27), here at
+the `parse_and_verify` gate rather than the `resolve` gate.
+
+### What changed (behaviour)
+
+- **New `IncomingError::disposition()`** → `IncomingDisposition`
+  (`DeclinedExpired` / `DeclinedTooEarly` / `Rejected`), a pure
+  (KV-free, clock-free) classifier. `Expired`/`TooEarly` are benign 200
+  declines; **every** other variant — including `StaleShellTime` (a >24h-old
+  plaintext `time` smells of replay) — stays a 400 reject.
+- The `parse_and_verify` match site in `src/lib.rs` now matches on
+  `err.disposition()`: `Expired` → `200 "declined: intent-expired"`,
+  `TooEarly` → `200 "declined: intent-too-early"` (logged at info via
+  `rlog!`), all others → unchanged `400 "rejected"` (`rlog_err!`).
+
+### Breaking
+
+None. New public `IncomingDisposition` enum + `IncomingError::disposition()`
+method; existing variants and `Display` unchanged.
+
+### Tests
+
+- `disposition_splits_time_window_from_bad_request` — `Expired`/`TooEarly`
+  classify as their declined dispositions; the five bad-request variants
+  classify as `Rejected`.
+- `disposition_stale_shell_time_is_rejected_not_benign` — `StaleShellTime`
+  is explicitly **not** folded in with the benign declines.
+
+### Follow-up
+
+Not yet deployed to staging — bakes on `main` first per the
+develop-on-main / let-it-bake-on-staging split.
+
 ## v27 — 2026-06-15 — M/W not-armed-yet declines are 200, not 400 (bug #7)
 
 ### Why
