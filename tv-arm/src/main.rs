@@ -32,6 +32,7 @@ mod post_outcome;
 mod roles;
 mod spread;
 mod timeframe;
+mod trade_plan_build;
 
 use crate::args::Args;
 

@@ -109,9 +109,35 @@ Decisions (locked with user):
 - [x] Green: core (467), worker (195), cli (234+8), engine (1); wasm lib build;
       clippy native+wasm; fmt; `cargo check --workspace`.
 
-#### Commit 2 — tv-arm folds roles into one plan + POSTs it (PENDING)
-- [ ] `build_trade_plan()` from `roles` (map each alert role → ConditionRule);
-      POST one `register` intent. Old alert path stays until Stage F.
+#### Commit 2 — tv-arm folds roles into one plan + POSTs it
+Note: discovered tv-arm has **no direct HTTP path to the worker** today (it
+only talks to the worker indirectly, via TV delivering the alert `message`).
+So Commit 2 splits: 2a = pure builder (tested, no network), 2b = the direct
+`register` POST + pipeline wiring. `build_trade_plan` lives in **tv-arm**
+(needs both the `Roles` geometry for trigger levels AND the built intents).
+
+##### Commit 2a — pure plan builder + resolution mapper (DONE — all green)
+- [x] `tv-arm/src/trade_plan_build.rs`: `build_trade_plan(trade_id, instrument,
+      alerts, direction, roles, granularity, is_mw) -> TradePlan` — walks the
+      same `BuiltAlert` set + `Roles` as `build_alert_spec` and emits one
+      `ConditionRule` per alert, **cloning the embedded intent verbatim**.
+      1:1 port of `alert_spec.rs`'s basename→(ConditionType,Frequency) dispatch,
+      re-expressed as `Trigger` + `CrossDir` + `BarEvent` + `FireMode`. Missing
+      role ⇒ skip (same `Ok(None)` semantics). Takes `&[BuiltAlert]` not the
+      whole `BuiltTrade` so it's decoupled from `TradeSpec` + trivially tested.
+- [x] `resolution_to_granularity()` — TV minute-string → engine `Granularity`
+      (unsupported ⇒ None ⇒ caller rejects, no silently-unpollable plan).
+- [x] 7 tests: resolution map/reject, close/retest dirs opposite, fire-mode
+      latches except MwEveryBar, full H&S-short rule mapping, M/W heartbeat +
+      price vetos (abort=OnClose), missing-role skip.
+- [x] Green: tv-arm (151); clippy; fmt; `cargo check --workspace`. **Not wired
+      into the pipeline yet** — no behaviour change; old alert path untouched.
+
+##### Commit 2b — direct register POST + pipeline wiring (PENDING)
+- [ ] Sign the register intent (reuse `cli::wrap_signed`) carrying the plan in
+      `Intent.trade_plan`; reqwest POST to `BAKED_WEBHOOK`; wire into
+      `pipeline::run` alongside `create_alerts` (build plan from the resolved
+      direction + granularity + built trade). Old alert path stays until Stage F.
 ### Stage D — engine: pure evaluator + cron wiring (PENDING)
 ### Stage E — port H&S Pine candle detector to Rust (PENDING)
 ### Stage F — retire the webhook (PENDING)
