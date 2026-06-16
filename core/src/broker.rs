@@ -9,7 +9,12 @@
 
 use core::future::Future;
 
+use chrono::{DateTime, Utc};
+
 use crate::intent::{Direction, ResolvedEntry, RiskBudget};
+
+mod candles;
+pub use candles::*;
 
 /// A live two-sided quote. `spread()` is the spread-blackout feature's
 /// filter signal; everything else in the codebase only needs `mid()`.
@@ -355,6 +360,28 @@ pub trait Broker {
     ) -> impl Future<Output = Result<f64, LookupError>> {
         async move { Ok(self.get_quote(instrument).await?.mid()) }
     }
+
+    /// Fetch **closed** MID candles for `instrument` at `granularity` whose
+    /// open-time falls in `(since, now]`. The trade-plan engine calls this each
+    /// cron tick to replay whatever closed since its per-plan watermark.
+    ///
+    /// Contract (impls must honour all four):
+    /// - **Closed only** — the still-forming current bar is dropped.
+    /// - **Strictly after `since`** — a candle whose `time == since` was
+    ///   already processed; impls run results through
+    ///   [`filter_new_candles`] (or equivalent) before returning.
+    /// - **Ascending by `time`** — oldest first.
+    /// - **MID prices** — not bid/ask.
+    ///
+    /// A degenerate window (`since >= now`) yields [`CandleError::BadRange`];
+    /// a feed failure yields [`CandleError::Transient`] (skip this tick).
+    fn get_candles(
+        &self,
+        instrument: &str,
+        granularity: Granularity,
+        since: DateTime<Utc>,
+        now: DateTime<Utc>,
+    ) -> impl Future<Output = Result<Vec<Candle>, CandleError>>;
 }
 
 #[cfg(test)]
@@ -440,6 +467,15 @@ mod quote_tests {
             &self,
             _account_id: &str,
         ) -> Result<Vec<PendingOrder>, LookupError> {
+            Ok(vec![])
+        }
+        async fn get_candles(
+            &self,
+            _instrument: &str,
+            _granularity: Granularity,
+            _since: DateTime<Utc>,
+            _now: DateTime<Utc>,
+        ) -> Result<Vec<Candle>, CandleError> {
             Ok(vec![])
         }
     }

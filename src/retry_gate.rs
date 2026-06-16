@@ -368,8 +368,8 @@ mod tests {
     use std::cell::RefCell;
     use std::collections::HashMap;
     use trade_control_core::broker::{
-        AmendError, AttemptState, Broker, CancelError, EntryError, EntryRequest, LookupError,
-        OpenPosition, PendingOrder, Quote,
+        AmendError, AttemptState, Broker, CancelError, Candle, CandleError, EntryError,
+        EntryRequest, Granularity, LookupError, OpenPosition, PendingOrder, Quote,
     };
     use trade_control_core::intent::{
         Action, BrokerKind, Direction, EntrySpec, Intent, PriceAnchor, PriceRef, TakeProfit,
@@ -487,6 +487,15 @@ mod tests {
             _account_id: &str,
         ) -> Result<Vec<PendingOrder>, LookupError> {
             unimplemented!("MockBroker: list_pending_orders unused by retry-gate tests")
+        }
+        async fn get_candles(
+            &self,
+            _instrument: &str,
+            _granularity: Granularity,
+            _since: DateTime<Utc>,
+            _now: DateTime<Utc>,
+        ) -> Result<Vec<Candle>, CandleError> {
+            unimplemented!("MockBroker: get_candles unused by retry-gate tests")
         }
     }
 

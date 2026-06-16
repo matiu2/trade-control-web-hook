@@ -1,5 +1,65 @@
 # TODO
 
+## ACTIVE — server-side trade-plan engine (replace paid TradingView alerts)
+
+Big multi-stage shift: `tv-arm` keeps drawing/annotating the chart but, instead
+of creating ~5–15 TradingView alerts per trade, serialises the whole trade into
+ONE signed `TradePlan` and registers it with the worker. A server-side engine,
+run from the existing single cron, fetches broker candles each tick, evaluates
+every registered plan's conditions itself, and dispatches fired intents through
+the same path the webhook uses. Eventually the webhook shrinks to register +
+operator controls. Dev-only, exploratory; old + new run in parallel until the
+engine is proven on demo. Full plan:
+`~/.home-claude/plans/i-want-to-be-wiggly-squid.md`.
+
+Decisions: new engine **crate** invoked from the existing **single cron**;
+shared types lifted to a **shared crate** so old+new coexist; **port the H&S
+Pine candle detector to Rust** (full TV removal; M/W is already worker-side);
+cadence = **faster self-gated `*/1`–`*/5` cron** (no Durable Object; DO
+websocket is an additive Stage G only if demo proves a need).
+
+Intrabar analysis (locked): of the 5 intrabar price triggers, pcl-exhausted +
+retest fold into an at-entry lookback; mw-cancel + mw-overshoot are satisfied by
+a per-tick "still-pending?" lookback (no-op once filled); only the invalidation
+ClosePositions veto wants prompt reaction and is already SL-bounded.
+
+### Stage A — candle fetch on the `Broker` trait  (DONE — all green)
+- [x] `core/src/broker/candles.rs`: `Candle { time, o, h, l, c }` (MID, UTC),
+      `Granularity` (M1/M5/M15/H1/H4/D1) + `seconds()`,
+      `CandleError { Transient, BadRange }`, pure
+      `filter_new_candles(candles, watermark)` (strict `>`, ascending) + 4
+      unit tests. Declared `mod candles; pub use candles::*;` in `broker.rs`.
+- [x] `Broker::get_candles(instrument, granularity, since, now)` trait method
+      (closed-only / strict-after-since / ascending / MID contract documented).
+- [x] OANDA impl (`broker-oanda/src/candles.rs`): map →
+      `oanda_client::candles::Granularity`, `get_candles_range` (price MBA →
+      MID), drop `complete:false`, `filter_new_candles`. Added `chrono` dep.
+      Granularity-map unit test.
+- [x] TradeNation impl (`src/tradenation_adapter.rs`): map →
+      `candle_model::Granularity`, free `ohlcv::get_candles_range`
+      (count-back-from-`now` via `candle_count_for_window` then
+      `filter_new_candles`), times → UTC. M5/H4 flagged non-native (raw ohlcv
+      doesn't aggregate; the WASM-gated client method that would isn't
+      reachable) → `BadRange`. 5 unit tests (map + count window/clamp/floor).
+- [x] Test doubles updated: `MidOnlyBroker` (core), `MockBroker`
+      (`src/retry_gate.rs`).
+- [x] **candle-model two-version fix:** `tradenation-api` (git dep) vendors its
+      own `candle-model`; the worker also needs the local one to name
+      `Granularity`. Added a `[patch."…tradenation-api.git"] candle-model =
+      { path = "../candle-model" }` so they unify (was E0308).
+- [x] Green: core candle tests (4), worker (195), broker-oanda (37), TN
+      candle-fetch (5); WASM lib build; clippy native+wasm; fmt;
+      `cargo check --workspace` (cli/tv-arm/tv-news unaffected by the patch).
+
+### Stage B — shared crate extraction (PENDING)
+### Stage C — TradePlan + register (PENDING)
+### Stage D — engine: pure evaluator + cron wiring (PENDING)
+### Stage E — port H&S Pine candle detector to Rust (PENDING)
+### Stage F — retire the webhook (PENDING)
+### Stage G — Durable Object websocket (only if demo proves a need) (PENDING)
+
+---
+
 ## ACTIVE — M/W overshoot veto (180% of top→neckline)
 
 Add an M-trade (and W mirror) "overshoot" veto: when any low (M) / high (W)

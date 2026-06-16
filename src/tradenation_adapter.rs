@@ -6,11 +6,14 @@
 //! [`Broker`].
 
 use broker_tradenation::TradeNationBroker;
+use candle_model::Granularity as CmGranularity;
+use chrono::{DateTime, Utc};
 use trade_control_core::broker::{
-    AmendError, AttemptState, Broker, CancelError, EntryError, EntryRequest, LookupError,
-    OpenPosition, PendingOrder, Quote,
+    AmendError, AttemptState, Broker, CancelError, Candle, CandleError, EntryError, EntryRequest,
+    Granularity, LookupError, OpenPosition, PendingOrder, Quote,
 };
 use trade_control_core::intent::{Direction, ResolvedEntry, RiskBudget};
+use tradenation_api::ohlcv::PriceType;
 use tradenation_api::{OpeningOrder, Position, TransactionRecord};
 
 /// Closed-trade scan window. Plan §3 recommends ~50; one TN page
@@ -200,6 +203,70 @@ impl Broker for TradeNationAdapter {
             .collect())
     }
 
+    async fn get_candles(
+        &self,
+        instrument: &str,
+        granularity: Granularity,
+        since: DateTime<Utc>,
+        now: DateTime<Utc>,
+    ) -> Result<Vec<Candle>, CandleError> {
+        if since >= now {
+            return Err(CandleError::BadRange);
+        }
+        // TN's chart OHLCV is count-back-from-`end_time`, not a true range,
+        // so fetch enough candles to cover the window then trim to `> since`
+        // with `filter_new_candles`. M5/H4 aren't served natively by the raw
+        // `ohlcv::get_candles_range` (only the higher-level client method
+        // aggregates them, and `TradeNationBroker` doesn't expose it) — the
+        // engine only arms TN trades on native TFs, so reject the rest loudly.
+        let (cm_gran, native) = to_cm_granularity(granularity);
+        if !native {
+            rlog_err!("tn get_candles({instrument}): granularity {granularity:?} not TN-native");
+            return Err(CandleError::BadRange);
+        }
+        let count = candle_count_for_window(granularity, since, now);
+
+        // name → market_id (same first hop as `get_quote`).
+        let market = tradenation_api::resolve_market(self.0.client(), self.0.session(), instrument)
+            .await
+            .map_err(|err| {
+                rlog_err!("tn get_candles resolve_market({instrument}): {err:?}");
+                CandleError::Transient
+            })?;
+
+        let raw = tradenation_api::ohlcv::get_candles_range(
+            self.0.client(),
+            market.market_id,
+            cm_gran,
+            PriceType::Mid,
+            count,
+            now,
+        )
+        .await
+        .map_err(|err| {
+            rlog_err!(
+                "tn get_candles({instrument}, market_id={}, count={count}): {err:?}",
+                market.market_id
+            );
+            CandleError::Transient
+        })?;
+
+        let candles = raw
+            .iter()
+            .map(|c| Candle {
+                time: c.timestamp.with_timezone(&Utc),
+                o: c.open,
+                h: c.high,
+                l: c.low,
+                c: c.close,
+            })
+            .collect();
+
+        Ok(trade_control_core::broker::filter_new_candles(
+            candles, since,
+        ))
+    }
+
     async fn amend_stop(
         &self,
         _account_id: &str,
@@ -376,6 +443,36 @@ fn to_upstream_entry(e: &ResolvedEntry) -> broker_tradenation::ResolvedEntry {
             price: *trigger_price,
         },
     }
+}
+
+/// Engine [`Granularity`] → `candle_model::Granularity` + whether TN serves it
+/// natively via the raw `ohlcv::get_candles_range`. TN's native timeframes are
+/// minute / quarter(15m) / hour / day; M5 and H4 are only available through the
+/// higher-level aggregating client method (not reachable from
+/// `TradeNationBroker`), so they map but are flagged non-native. Pure.
+fn to_cm_granularity(g: Granularity) -> (CmGranularity, bool) {
+    match g {
+        Granularity::M1 => (CmGranularity::OneMinute, true),
+        Granularity::M15 => (CmGranularity::FifteenMinutes, true),
+        Granularity::H1 => (CmGranularity::OneHour, true),
+        Granularity::D1 => (CmGranularity::OneDay, true),
+        Granularity::M5 => (CmGranularity::FiveMinutes, false),
+        Granularity::H4 => (CmGranularity::FourHours, false),
+    }
+}
+
+/// How many candles to fetch ending at `now` to be sure of covering
+/// `(since, now]`. TN's OHLCV is count-back-from-end, so we ask for one bar per
+/// `granularity` step in the window plus a small slack for boundary alignment,
+/// clamped to TN's per-request ceiling. `filter_new_candles` trims any extra.
+/// Pure — unit-tested.
+fn candle_count_for_window(g: Granularity, since: DateTime<Utc>, now: DateTime<Utc>) -> usize {
+    const SLACK: i64 = 3;
+    /// TN's chart endpoint caps a single request; keep well under it.
+    const MAX: i64 = 1000;
+    let span = (now - since).num_seconds().max(0);
+    let bars = span / g.seconds() + 1 + SLACK;
+    bars.clamp(1, MAX) as usize
 }
 
 fn from_upstream_error(e: broker_tradenation::EntryError) -> EntryError {
@@ -628,6 +725,65 @@ mod attempt_state_tests {
         funding.transaction_type = "1".into();
         let s = compute_attempt_state("EUR/USD", "101", Some("ref-7"), &[], &[], Some(&[funding]));
         assert_eq!(s, AttemptState::Cancelled);
+    }
+}
+
+#[cfg(test)]
+mod candle_fetch_tests {
+    use super::*;
+
+    fn ts(s: &str) -> DateTime<Utc> {
+        s.parse().unwrap()
+    }
+
+    #[test]
+    fn native_granularities_map_and_flag() {
+        assert_eq!(
+            to_cm_granularity(Granularity::M1),
+            (CmGranularity::OneMinute, true)
+        );
+        assert_eq!(
+            to_cm_granularity(Granularity::M15),
+            (CmGranularity::FifteenMinutes, true)
+        );
+        assert_eq!(
+            to_cm_granularity(Granularity::H1),
+            (CmGranularity::OneHour, true)
+        );
+        assert_eq!(
+            to_cm_granularity(Granularity::D1),
+            (CmGranularity::OneDay, true)
+        );
+    }
+
+    #[test]
+    fn non_native_granularities_are_flagged() {
+        assert!(!to_cm_granularity(Granularity::M5).1);
+        assert!(!to_cm_granularity(Granularity::H4).1);
+    }
+
+    #[test]
+    fn count_covers_window_plus_slack() {
+        // 5 H1 bars of span → 5 + 1 + 3 slack = 9.
+        let since = ts("2026-06-16T00:00:00Z");
+        let now = ts("2026-06-16T05:00:00Z");
+        assert_eq!(candle_count_for_window(Granularity::H1, since, now), 9);
+    }
+
+    #[test]
+    fn count_is_at_least_one_for_zero_span() {
+        let t = ts("2026-06-16T00:00:00Z");
+        // Degenerate span is guarded earlier (BadRange) but the helper must
+        // still never return 0.
+        assert!(candle_count_for_window(Granularity::H1, t, t) >= 1);
+    }
+
+    #[test]
+    fn count_clamps_to_ceiling() {
+        // A year of M1 bars would be ~525k; must clamp to the 1000 cap.
+        let since = ts("2025-06-16T00:00:00Z");
+        let now = ts("2026-06-16T00:00:00Z");
+        assert_eq!(candle_count_for_window(Granularity::M1, since, now), 1000);
     }
 }
 
