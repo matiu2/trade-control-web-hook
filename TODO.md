@@ -51,7 +51,24 @@ ClosePositions veto wants prompt reaction and is already SL-bounded.
       candle-fetch (5); WASM lib build; clippy native+wasm; fmt;
       `cargo check --workspace` (cli/tv-arm/tv-news unaffected by the patch).
 
-### Stage B — shared crate extraction (PENDING)
+### Stage B — shared crate boundary  (DONE — all green)
+- [x] **Finding: nothing to extract.** `trade-control-core` already IS the
+      shared crate the plan asked for — `worker`-free, broker-SDK-free,
+      WASM-buildable, and already holds every shared type the engine needs:
+      `Intent`/`Action`, the `Broker` trait (+ Stage-A `Candle`/`Granularity`/
+      `get_candles`), `StateStore`, sign/verify (`sig`), and the pure
+      `MwState`/`plan_mw_update` evaluator. Already consumed by worker, cli,
+      broker-oanda, tv-arm. Verified `core` builds standalone native (default
+      + `cli` feature) and wasm.
+- [x] **New engine crate scaffolded:** `engine/` (`trade-control-engine`),
+      workspace member, depends **only** on `trade-control-core` (path) — the
+      "run old webhook + new engine in parallel" guarantee proven end-to-end.
+      `lib.rs` documents the boundary finding and re-exports the shared surface
+      (`Broker`/`Candle`/`CandleError`/`Granularity`, `intent`/`Action`/
+      `Intent`, `StateError`/`StateStore`). Stage C fills it with `TradePlan` +
+      `register`; Stage D adds `evaluate_plan` + cron wiring.
+- [x] Green: engine test (1, shared-surface smoke), engine build native+wasm,
+      clippy, fmt; `cargo check --workspace` + worker wasm lib unaffected.
 ### Stage C — TradePlan + register (PENDING)
 ### Stage D — engine: pure evaluator + cron wiring (PENDING)
 ### Stage E — port H&S Pine candle detector to Rust (PENDING)
