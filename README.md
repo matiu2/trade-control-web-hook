@@ -1473,11 +1473,39 @@ cargo run -p tv-arm -- \
   --skip-retest \                     # implies --skip-break-and-close; for late entries
   --require-golden \                  # require Pine golden-candle signal on entry
   --require-confirmation \            # require a confirmed signal candle on entry (independent of golden)
-  --create-alerts                     # POST to TradingView; omit to only write the signed bundle to disk
+  --create-alerts \                   # POST to TradingView; omit to only write the signed bundle to disk
+  --register-plan                     # experimental: also register one signed TradePlan with the server-side engine
 ```
 
 Run `tv-arm --help` for the full flag surface — it has diverged from the
 deprecated Python script.
+
+### Server-side engine registration (`--register-plan`, experimental)
+
+The long-term direction is to drop the dependency on paid TradingView alerts
+by evaluating every trigger **server-side** in the worker. `--register-plan`
+is the first step on the arming side: instead of (only) creating one TV alert
+per condition, `tv-arm` folds the **whole trade** — every condition each alert
+would have encoded, re-expressed as an engine `Trigger` — into one signed
+`TradePlan` and POSTs it directly to the worker (action `register`). The plan
+rides the same whole-body HMAC as every other intent (it's carried in the
+intent's `trade_plan` field), so it can't be tampered.
+
+It's **additive and opt-in**: the TV alert path (`--create-alerts`) is
+unaffected and stays the default. Old (TV alerts) and new (engine) run in
+parallel until the engine is proven on demo; only then does the alert path
+retire. A failed register is a hard error, but the signed alert bundle is
+already on disk by the time the POST happens, so the trade is never lost. The
+plan's destination is the same baked-at-build-time webhook the TV alerts use,
+so `tv-arm-staging --register-plan` registers against the staging worker with
+no extra flag. The chart timeframe must map to an engine granularity
+(`1`/`5`/`15`/`60`/`240`/`D`), else the register is rejected.
+
+As of this stage the worker validates + logs the registered plan but does
+**not** yet persist or evaluate it — the cron-driven evaluator is the next
+stage. The plan builder is `tv-arm/src/trade_plan_build.rs` (the inverse of
+`alert_spec.rs`); the `TradePlan` / `Trigger` model lives in
+`core/src/trade_plan.rs`.
 
 Skipped preps are pre-fired directly to the worker so the entry's
 `requires_preps:` gate is still satisfied — useful when joining a setup

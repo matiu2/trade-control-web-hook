@@ -70,6 +70,15 @@ pub struct Args {
     #[arg(long)]
     pub broker_dry_run: bool,
 
+    /// Also register the trade as ONE signed `TradePlan` with the worker's
+    /// server-side engine (POSTed directly to the baked webhook), in addition
+    /// to creating the TradingView alerts. Experimental / dev-only: old (TV
+    /// alerts) and new (engine) paths run in parallel until the engine is
+    /// proven on demo. Independent of `--create-alerts` — you can register a
+    /// plan without arming TV alerts, or vice versa.
+    #[arg(long)]
+    pub register_plan: bool,
+
     /// Opt in to multi-shot entries: if the broker rejects the order
     /// (e.g. spread too wide), the worker will retry on subsequent
     /// enter-alert firings up to this many times. Default (flag

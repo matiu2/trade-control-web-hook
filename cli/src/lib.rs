@@ -27,8 +27,8 @@ pub use calendar_bars::{
     plan_calendar_bars, plan_calendar_bars_within, print_summary_table, run_calendar_bars,
 };
 pub use control::{
-    build_clear_prep_intent, build_clear_veto_intent, build_prep_intent, build_status_intent,
-    build_unlock_intent, build_veto_intent, wrap_signed, wrap_signed_template,
+    build_clear_prep_intent, build_clear_veto_intent, build_prep_intent, build_register_intent,
+    build_status_intent, build_unlock_intent, build_veto_intent, wrap_signed, wrap_signed_template,
 };
 /// Re-export forex-factory's event + impact types so downstream
 /// consumers (tv-news, future strategy binaries) don't have to pin the

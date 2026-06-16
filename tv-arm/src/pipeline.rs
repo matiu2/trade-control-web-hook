@@ -33,8 +33,10 @@ use crate::geometry::tp_price_from_fib;
 use crate::manifest::{CalendarBundle, discover_calendar_bundles};
 use crate::mw_geometry;
 use crate::post_outcome::{Outcome, classify as classify_outcome};
+use crate::register_post::post_register_blocking;
 use crate::roles::{Roles, classify};
 use crate::timeframe::infer_calendar_timeframe;
+use crate::trade_plan_build::{build_trade_plan, resolution_to_granularity};
 use trading_view::drawings::Drawing;
 use trading_view::mcp::TvMcp;
 
@@ -176,6 +178,22 @@ pub fn run(args: Args) -> Result<i32> {
         alerts = built_trade.alerts.len(),
         "trade bundle written"
     );
+
+    // 5b. (Experimental, --register-plan) Fold the whole trade into ONE signed
+    //     TradePlan and register it with the worker's server-side engine. This
+    //     runs *alongside* the TV alert path (old + new in parallel until the
+    //     engine is proven on demo — Stage F retires the alerts). A failed
+    //     register is a hard error, but the signed bundle is already on disk.
+    if args.register_plan {
+        register_trade_plan(
+            &built_trade,
+            direction,
+            &roles,
+            &state.resolution,
+            &key,
+            now,
+        )?;
+    }
 
     // 6. Pause bundles per blackout pair.
     let pause_bundles = build_pause_bundles(
@@ -1242,6 +1260,67 @@ fn discover_or_fetch_calendar_bundles(
     let bundles = discover_calendar_bundles(out_dir, trade_id)?;
     info!(count = bundles.len(), "calendar bundles discovered");
     Ok(bundles)
+}
+
+/// Fold the built trade into one signed `register` `TradePlan` and POST it to
+/// the worker's server-side engine.
+///
+/// The plan re-expresses every alert's condition as an engine [`Trigger`] (via
+/// [`build_trade_plan`], the inverse of `alert_spec`) and carries each alert's
+/// embedded intent verbatim. It's signed with the same key + whole-body HMAC as
+/// the control intents (the plan rides `trade_plan` as single-line flow JSON,
+/// so it's fully signed) and POSTed directly to the baked webhook.
+///
+/// Hard-errors on an unsupported chart resolution or a worker rejection — but
+/// the signed alert bundle is already on disk by the time this runs, so the
+/// trade isn't lost on a register failure.
+fn register_trade_plan(
+    built_trade: &cli::BuiltTrade,
+    direction: Direction,
+    roles: &Roles,
+    resolution: &str,
+    key: &[u8; KEY_LEN],
+    now: DateTime<Utc>,
+) -> Result<()> {
+    use cli::TradePattern;
+    let is_mw = matches!(built_trade.spec.pattern, TradePattern::M | TradePattern::W);
+    let granularity = resolution_to_granularity(resolution).ok_or_else(|| {
+        eyre!(
+            "chart resolution {resolution:?} has no engine granularity; \
+             cannot register a server-side plan (supported: 1/5/15/60/240/D)"
+        )
+    })?;
+    let plan = build_trade_plan(
+        &built_trade.trade_id,
+        &built_trade.instrument,
+        &built_trade.alerts,
+        direction,
+        roles,
+        granularity,
+        is_mw,
+    );
+    let rule_count = plan.rules.len();
+    // Mint a fresh register intent carrying the plan, sign it, POST it.
+    let suffix = register_suffix(now);
+    let intent = cli::build_register_intent(plan, now, &suffix);
+    let body = cli::wrap_signed(&intent, key, now).wrap_err("sign register intent")?;
+    info!(
+        trade_id = %built_trade.trade_id,
+        instrument = %built_trade.instrument,
+        granularity = ?granularity,
+        rules = rule_count,
+        "registering server-side trade plan",
+    );
+    post_register_blocking(body).wrap_err("register trade plan with worker")?;
+    info!(trade_id = %built_trade.trade_id, "trade plan registered");
+    Ok(())
+}
+
+/// A short per-call tag for the register intent id so two arms of the same
+/// trade_id in the same second don't collide on the worker's seen-id check.
+/// Derived from the sub-second clock — no rand dependency.
+fn register_suffix(now: DateTime<Utc>) -> String {
+    format!("{:06}", now.timestamp_subsec_micros() % 1_000_000)
 }
 
 /// Walk every alert in every bundle and build the payload list.

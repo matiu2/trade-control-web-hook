@@ -69,7 +69,7 @@ ClosePositions veto wants prompt reaction and is already SL-bounded.
       `register`; Stage D adds `evaluate_plan` + cron wiring.
 - [x] Green: engine test (1, shared-surface smoke), engine build native+wasm,
       clippy, fmt; `cargo check --workspace` + worker wasm lib unaffected.
-### Stage C — TradePlan + register (IN PROGRESS — commit 1/2 done)
+### Stage C — TradePlan + register (DONE — commits 1, 2a, 2b all green)
 Decisions (locked with user):
 - `Action::Register` is a **unit variant** (Action stays `Copy`); the plan
   rides in a new `Intent.trade_plan: Option<TradePlan>` — same pattern as the
@@ -133,11 +133,29 @@ So Commit 2 splits: 2a = pure builder (tested, no network), 2b = the direct
 - [x] Green: tv-arm (151); clippy; fmt; `cargo check --workspace`. **Not wired
       into the pipeline yet** — no behaviour change; old alert path untouched.
 
-##### Commit 2b — direct register POST + pipeline wiring (PENDING)
-- [ ] Sign the register intent (reuse `cli::wrap_signed`) carrying the plan in
-      `Intent.trade_plan`; reqwest POST to `BAKED_WEBHOOK`; wire into
-      `pipeline::run` alongside `create_alerts` (build plan from the resolved
-      direction + granularity + built trade). Old alert path stays until Stage F.
+##### Commit 2b — direct register POST + pipeline wiring (DONE — all green)
+- [x] `cli::build_register_intent(plan, now, suffix)` — mints an `Action::Register`
+      intent, sets `trade_id`/`instrument` from the plan so the worker's
+      `handle_register` cross-check passes, carries the plan in `trade_plan`.
+      Exported from cli's lib. Signed via the existing `cli::wrap_signed`
+      (plan rides the whole-body HMAC as single-line flow JSON — no sig.rs change).
+- [x] `tv-arm/src/register_post.rs` — `post_register_blocking(body)`: async
+      `reqwest` POST to the baked `BAKED_WEBHOOK` on a throwaway tokio runtime
+      (same sync→async bridge as the live spread read). Non-2xx / transport
+      failure ⇒ `Err` carrying the worker's response body.
+- [x] `--register-plan` flag (default off, experimental, opt-in). Wired into
+      `pipeline::run` via `register_trade_plan(...)` right after the trade
+      bundle is written: maps `state.resolution`→granularity, builds the plan,
+      signs, POSTs. Runs *alongside* `--create-alerts`; old alert path
+      untouched. Hard-errors on unsupported resolution / worker rejection (the
+      signed bundle is already on disk by then).
+- [x] 3 cli tests: register intent binds trade_id + carries plan; signed body
+      round-trips through `parse_and_verify` (plan reconstructed intact); a
+      tampered plan level is rejected with a Sig error.
+- [x] README: `--register-plan` flag + a "Server-side engine registration"
+      subsection (additive/opt-in, old+new in parallel, worker logs-but-not-yet
+      -persists). Green: cli + tv-arm (151) tests; clippy workspace; fmt;
+      `cargo check -p trade-control-web-hook --target wasm32` (worker).
 ### Stage D — engine: pure evaluator + cron wiring (PENDING)
 ### Stage E — port H&S Pine candle detector to Rust (PENDING)
 ### Stage F — retire the webhook (PENDING)

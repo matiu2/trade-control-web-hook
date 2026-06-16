@@ -29,6 +29,7 @@ mod manifest;
 mod mw_geometry;
 mod pipeline;
 mod post_outcome;
+mod register_post;
 mod roles;
 mod spread;
 mod timeframe;

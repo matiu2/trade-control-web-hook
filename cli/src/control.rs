@@ -87,6 +87,32 @@ pub fn build_unlock_intent(instrument: &str, now: DateTime<Utc>, suffix: &str) -
     control_skeleton(Action::Unlock, instrument, id, now)
 }
 
+/// Build a `register` Intent carrying a server-side [`TradePlan`].
+///
+/// The worker's `handle_register` requires the plan to be present and, if
+/// the carrier intent has a `trade_id`, that it match the plan's — so we set
+/// both `trade_id` and `instrument` from the plan. The id is unique per call
+/// (timestamp + suffix) so a re-arm of the same trade isn't rejected by the
+/// seen-id replay check. The plan rides the whole-body HMAC via `trade_plan`
+/// (rendered as single-line flow JSON by `build_signed_body`).
+pub fn build_register_intent(
+    plan: trade_control_core::trade_plan::TradePlan,
+    now: DateTime<Utc>,
+    suffix: &str,
+) -> Intent {
+    let id = format!(
+        "register-{}-{}-{suffix}",
+        plan.trade_id,
+        now.format("%Y-%m-%dT%H%M%S")
+    );
+    let instrument = plan.instrument.clone();
+    let trade_id = plan.trade_id.clone();
+    let mut intent = control_skeleton(Action::Register, &instrument, id, now);
+    intent.trade_id = Some(trade_id);
+    intent.trade_plan = Some(plan);
+    intent
+}
+
 /// Build a `prep` Intent for a single (instrument, step) pair with a TTL.
 ///
 /// `clears` is the list of other prep steps to drop before recording
@@ -531,5 +557,85 @@ mod tests {
         assert!(body.contains("time:"), "body was:\n{body}");
         assert!(!body.contains("{{close}}"), "body was:\n{body}");
         assert!(body.contains("sig: \"v1-sig."), "body was:\n{body}");
+    }
+
+    /// A minimal one-rule plan for register signing tests.
+    fn sample_plan() -> trade_control_core::trade_plan::TradePlan {
+        use trade_control_core::broker::Granularity;
+        use trade_control_core::trade_plan::{
+            BarEvent, ConditionRule, CrossDir, FireMode, TradePlan, Trigger,
+        };
+        let rule_intent = control_skeleton(Action::Veto, "EUR_USD", "veto-1".into(), t());
+        TradePlan {
+            trade_id: "eurusd-hs-7".into(),
+            instrument: "EUR_USD".into(),
+            direction: trade_control_core::intent::Direction::Short,
+            granularity: Granularity::H1,
+            pip_size: 0.0001,
+            rules: vec![ConditionRule {
+                rule_id: "01-veto-too-high".into(),
+                trigger: Trigger::HorizontalCross {
+                    level: 1.2000,
+                    dir: CrossDir::Up,
+                    bar: BarEvent::Intrabar,
+                },
+                fire_mode: FireMode::Once,
+                intent: rule_intent,
+            }],
+        }
+    }
+
+    #[test]
+    fn register_intent_binds_trade_id_and_carries_plan() {
+        let intent = build_register_intent(sample_plan(), t(), "cd34");
+        assert_eq!(intent.action, Action::Register);
+        // The carrier's trade_id / instrument must match the plan so the
+        // worker's handle_register cross-check passes.
+        assert_eq!(intent.trade_id.as_deref(), Some("eurusd-hs-7"));
+        assert_eq!(intent.instrument, "EUR_USD");
+        let plan = intent.trade_plan.as_ref().expect("plan present");
+        assert_eq!(plan.rules.len(), 1);
+    }
+
+    /// The whole plan must ride the signature: a signed register body
+    /// round-trips through the worker's `parse_and_verify`, reconstructing
+    /// the nested `trade_plan` intact — proving the single-line flow-JSON
+    /// rendering is both signed and re-parseable.
+    #[test]
+    fn signed_register_body_round_trips_through_verify() {
+        let key = [7u8; KEY_LEN];
+        let intent = build_register_intent(sample_plan(), t(), "cd34");
+        let body = wrap_signed(&intent, &key, t()).unwrap();
+        // The plan is a single top-level line (flow JSON), not block YAML.
+        assert!(body.contains("trade_plan: {"), "body was:\n{body}");
+        let verified = trade_control_core::incoming::parse_and_verify(&body, &key, t())
+            .expect("register body should verify");
+        assert_eq!(verified.intent.action, Action::Register);
+        let plan = verified
+            .intent
+            .trade_plan
+            .as_ref()
+            .expect("plan survived verify");
+        assert_eq!(plan.trade_id, "eurusd-hs-7");
+        assert_eq!(plan.rules.len(), 1);
+        assert_eq!(plan.rules[0].rule_id, "01-veto-too-high");
+    }
+
+    /// Tampering with the plan after signing must fail verification — the
+    /// plan is inside the HMAC, not appended unsigned.
+    #[test]
+    fn tampered_register_plan_is_rejected() {
+        let key = [7u8; KEY_LEN];
+        let intent = build_register_intent(sample_plan(), t(), "cd34");
+        let body = wrap_signed(&intent, &key, t()).unwrap();
+        // Flip a digit in the plan's baked level (1.2 → 9.2) without re-signing.
+        let tampered = body.replace("\"level\":1.2", "\"level\":9.2");
+        assert_ne!(tampered, body, "tamper substitution must have matched");
+        let err = trade_control_core::incoming::parse_and_verify(&tampered, &key, t())
+            .expect_err("tampered plan must be rejected");
+        assert!(
+            matches!(err, trade_control_core::incoming::IncomingError::Sig(_)),
+            "expected a signature error, got {err:?}"
+        );
     }
 }
