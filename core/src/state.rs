@@ -12,6 +12,8 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::intent::{Action, Direction};
+use crate::plan_state::PlanState;
+use crate::trade_plan::TradePlan;
 
 /// One active cooldown row in a [`Snapshot`]. `set_at` records when the
 /// cooldown was put in place so the operator can see how long ago it
@@ -415,6 +417,18 @@ pub const ACCOUNT_SCOPE_GLOBAL: &str = "_";
 /// unchanged. Centralised so the encoding lives in one place.
 pub fn account_scope(account: Option<&str>) -> &str {
     account.unwrap_or(ACCOUNT_SCOPE_GLOBAL)
+}
+
+/// Inverse of [`account_scope`]: turn a key's `{scope}` segment back into an
+/// optional account name. The global sentinel maps to `None`; any other
+/// segment is an account name. Used when enumerating plans (whose account is
+/// encoded only in the key) — see [`StateStore::list_all_trade_plans`].
+pub fn account_from_scope(scope: &str) -> Option<String> {
+    if scope == ACCOUNT_SCOPE_GLOBAL {
+        None
+    } else {
+        Some(scope.to_string())
+    }
 }
 
 /// Read-only snapshot of the state store for the `status` action.
@@ -856,6 +870,83 @@ pub trait StateStore {
         account: Option<&str>,
         trade_id: &str,
     ) -> impl Future<Output = Result<(), StateError>>;
+
+    // ----- Server-side engine: registered plans + per-trade FSM state -----
+
+    /// Persist a registered [`TradePlan`] for the cron engine to evaluate.
+    /// Keyed `plan:{scope}:{trade_id}`; `account` is the carrier intent's
+    /// account (the plan struct itself has no account field). Overwrites a
+    /// prior registration of the same `(account, trade_id)` and refreshes TTL.
+    fn put_trade_plan(
+        &self,
+        account: Option<&str>,
+        plan: &TradePlan,
+        ttl_seconds: u64,
+    ) -> impl Future<Output = Result<(), StateError>>;
+
+    /// Read one registered plan by `(account, trade_id)`, or `None` if absent /
+    /// expired. Account-scoped only (no global-first): a plan key always
+    /// carries the registering intent's scope.
+    fn get_trade_plan(
+        &self,
+        account: Option<&str>,
+        trade_id: &str,
+    ) -> impl Future<Output = Result<Option<TradePlan>, StateError>>;
+
+    /// Enumerate every active registered plan, each paired with the account it
+    /// was registered under (parsed back from the key scope). The engine's
+    /// per-tick entry point — mirrors [`Self::list_all_entry_attempts`].
+    fn list_all_trade_plans(&self) -> impl Future<Output = Result<Vec<StoredPlan>, StateError>>;
+
+    /// Delete a registered plan. Best-effort (no-op if already gone). Called
+    /// when the plan reaches a terminal phase so a finished setup stops ticking.
+    fn clear_trade_plan(
+        &self,
+        account: Option<&str>,
+        trade_id: &str,
+    ) -> impl Future<Output = Result<(), StateError>>;
+
+    /// Read the engine's evolving [`PlanState`] for `(account, trade_id)`, or
+    /// `None` if the plan has never ticked (the engine seeds it). Keyed
+    /// `plan-state:{scope}:{trade_id}`, account-scoped (the carrier scope is
+    /// always known from the plan).
+    fn get_plan_state(
+        &self,
+        account: Option<&str>,
+        trade_id: &str,
+    ) -> impl Future<Output = Result<Option<PlanState>, StateError>>;
+
+    /// Create-or-update the engine's [`PlanState`] for `(account, trade_id)`.
+    /// Overwrites the prior row + refreshes TTL. Written every tick that the
+    /// watermark advances (re-set keeps an active plan's state from ageing out).
+    fn put_plan_state(
+        &self,
+        account: Option<&str>,
+        trade_id: &str,
+        state: &PlanState,
+        ttl_seconds: u64,
+    ) -> impl Future<Output = Result<(), StateError>>;
+
+    /// Delete the engine's [`PlanState`] row. Best-effort. Called alongside
+    /// [`Self::clear_trade_plan`] when a plan finishes.
+    fn clear_plan_state(
+        &self,
+        account: Option<&str>,
+        trade_id: &str,
+    ) -> impl Future<Output = Result<(), StateError>>;
+}
+
+/// A registered plan paired with the account scope it was stored under, as
+/// returned by [`StateStore::list_all_trade_plans`]. The cron engine needs the
+/// account to acquire the right broker and to key the plan's [`PlanState`].
+///
+/// No `PartialEq` — `TradePlan` carries an `Intent`, which isn't `PartialEq`.
+#[derive(Debug, Clone)]
+pub struct StoredPlan {
+    /// `None` for a globally-scoped plan; `Some(name)` for an account-scoped one
+    /// (parsed back from the key's `{scope}` segment).
+    pub account: Option<String>,
+    pub plan: TradePlan,
 }
 
 /// Maximum number of recent seen ids retained in the index. Tuning knob;
@@ -1625,6 +1716,106 @@ mod memstore {
             trade_id: &str,
         ) -> Result<(), StateError> {
             self.delete(&format!("mw-state:{}:{trade_id}", account_scope(account)));
+            Ok(())
+        }
+
+        async fn put_trade_plan(
+            &self,
+            account: Option<&str>,
+            plan: &TradePlan,
+            ttl_seconds: u64,
+        ) -> Result<(), StateError> {
+            let key = format!("plan:{}:{}", account_scope(account), plan.trade_id);
+            let body = serde_json::to_string(plan)
+                .map_err(|e| StateError::Backend(format!("encode plan: {e}")))?;
+            self.put(key, body, ttl_seconds.max(MIN_TTL_SECONDS), Utc::now());
+            Ok(())
+        }
+
+        async fn get_trade_plan(
+            &self,
+            account: Option<&str>,
+            trade_id: &str,
+        ) -> Result<Option<TradePlan>, StateError> {
+            let key = format!("plan:{}:{trade_id}", account_scope(account));
+            match self.get_live(&key, Utc::now()) {
+                Some(text) => serde_json::from_str(&text)
+                    .map(Some)
+                    .map_err(|e| StateError::Backend(format!("decode plan: {e}"))),
+                None => Ok(None),
+            }
+        }
+
+        async fn list_all_trade_plans(&self) -> Result<Vec<StoredPlan>, StateError> {
+            let now = Utc::now();
+            let inner = self.inner.borrow();
+            let mut out = Vec::new();
+            for (key, (val, exp)) in inner.iter() {
+                // Key form: `plan:{scope}:{trade_id}`. The scope is the second
+                // colon-segment; trade_id may itself contain `:` (rare), so
+                // splitn(3) keeps the remainder intact.
+                let Some(rest) = key.strip_prefix("plan:") else {
+                    continue;
+                };
+                if *exp <= now {
+                    continue;
+                }
+                let Some((scope, _trade_id)) = rest.split_once(':') else {
+                    continue;
+                };
+                let plan: TradePlan = serde_json::from_str(val)
+                    .map_err(|e| StateError::Backend(format!("decode plan: {e}")))?;
+                out.push(StoredPlan {
+                    account: account_from_scope(scope),
+                    plan,
+                });
+            }
+            Ok(out)
+        }
+
+        async fn clear_trade_plan(
+            &self,
+            account: Option<&str>,
+            trade_id: &str,
+        ) -> Result<(), StateError> {
+            self.delete(&format!("plan:{}:{trade_id}", account_scope(account)));
+            Ok(())
+        }
+
+        async fn get_plan_state(
+            &self,
+            account: Option<&str>,
+            trade_id: &str,
+        ) -> Result<Option<PlanState>, StateError> {
+            let key = format!("plan-state:{}:{trade_id}", account_scope(account));
+            match self.get_live(&key, Utc::now()) {
+                Some(text) => serde_json::from_str(&text)
+                    .map(Some)
+                    .map_err(|e| StateError::Backend(format!("decode plan-state: {e}"))),
+                None => Ok(None),
+            }
+        }
+
+        async fn put_plan_state(
+            &self,
+            account: Option<&str>,
+            trade_id: &str,
+            state: &PlanState,
+            ttl_seconds: u64,
+        ) -> Result<(), StateError> {
+            let key = format!("plan-state:{}:{trade_id}", account_scope(account));
+            let body = serde_json::to_string(state)
+                .map_err(|e| StateError::Backend(format!("encode plan-state: {e}")))?;
+            self.put(key, body, ttl_seconds.max(MIN_TTL_SECONDS), Utc::now());
+            Ok(())
+        }
+
+        async fn clear_plan_state(
+            &self,
+            account: Option<&str>,
+            trade_id: &str,
+        ) -> Result<(), StateError> {
+            self.delete(&format!("plan-state:{}:{trade_id}", account_scope(account)));
             Ok(())
         }
     }
@@ -2898,5 +3089,80 @@ mod tests {
         assert_eq!(parsed.pip_size, 0.0, "old rows decode pip_size to 0.0");
         assert!(parsed.original_stops.is_empty());
         assert!(parsed.cancelled_orders.is_empty());
+    }
+
+    /// A minimal rules-empty plan, built off JSON so the test doesn't have to
+    /// hand-construct a full `Intent` (rules carry one each).
+    fn sample_plan(trade_id: &str) -> TradePlan {
+        let json = format!(
+            r#"{{"trade_id":"{trade_id}","instrument":"EUR_USD","direction":"short",
+                "granularity":"h1","pip_size":0.0001,"rules":[]}}"#
+        );
+        serde_json::from_str(&json).unwrap()
+    }
+
+    #[test]
+    fn memstore_trade_plan_round_trips_and_lists_with_account() {
+        use super::memstore::MemStateStore;
+        let store = MemStateStore::new();
+        // Global + account-scoped plans coexist; list recovers both scopes.
+        pollster::block_on(store.put_trade_plan(None, &sample_plan("hs-global"), 3600)).unwrap();
+        pollster::block_on(store.put_trade_plan(
+            Some("reversals"),
+            &sample_plan("hs-scoped"),
+            3600,
+        ))
+        .unwrap();
+
+        let got = pollster::block_on(store.get_trade_plan(Some("reversals"), "hs-scoped"))
+            .unwrap()
+            .expect("scoped plan present");
+        assert_eq!(got.trade_id, "hs-scoped");
+        assert_eq!(got.instrument, "EUR_USD");
+        // Account-scoped get is NOT global-first: a global plan does not satisfy
+        // a scoped query (the engine always knows the carrier scope).
+        assert!(
+            pollster::block_on(store.get_trade_plan(Some("reversals"), "hs-global"))
+                .unwrap()
+                .is_none()
+        );
+
+        let mut all = pollster::block_on(store.list_all_trade_plans()).unwrap();
+        all.sort_by(|a, b| a.plan.trade_id.cmp(&b.plan.trade_id));
+        assert_eq!(all.len(), 2);
+        let global = all.iter().find(|s| s.plan.trade_id == "hs-global").unwrap();
+        assert_eq!(global.account, None);
+        let scoped = all.iter().find(|s| s.plan.trade_id == "hs-scoped").unwrap();
+        assert_eq!(scoped.account.as_deref(), Some("reversals"));
+
+        pollster::block_on(store.clear_trade_plan(Some("reversals"), "hs-scoped")).unwrap();
+        assert!(
+            pollster::block_on(store.get_trade_plan(Some("reversals"), "hs-scoped"))
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn memstore_plan_state_round_trips() {
+        use super::memstore::MemStateStore;
+        use crate::plan_state::{Phase, PlanState};
+        let store = MemStateStore::new();
+        let mut st = PlanState::seed(Phase::AwaitBreakAndClose, ts("2026-06-20T00:00:00Z"));
+        st.watermark = Some(ts("2026-06-16T12:00:00Z"));
+        st.last_close.insert("01-veto-too-high".into(), 1.2345);
+
+        pollster::block_on(store.put_plan_state(Some("reversals"), "hs-1", &st, 3600)).unwrap();
+        let got = pollster::block_on(store.get_plan_state(Some("reversals"), "hs-1"))
+            .unwrap()
+            .expect("plan-state present");
+        assert_eq!(got, st);
+
+        pollster::block_on(store.clear_plan_state(Some("reversals"), "hs-1")).unwrap();
+        assert!(
+            pollster::block_on(store.get_plan_state(Some("reversals"), "hs-1"))
+                .unwrap()
+                .is_none()
+        );
     }
 }

@@ -851,6 +851,59 @@ mod tests {
         ) -> Result<(), StateError> {
             Ok(())
         }
+
+        // Engine plan/state methods — unused by the retry-gate tests; minimal
+        // stubs to satisfy the trait.
+        async fn put_trade_plan(
+            &self,
+            _account: Option<&str>,
+            _plan: &trade_control_core::trade_plan::TradePlan,
+            _ttl_seconds: u64,
+        ) -> Result<(), StateError> {
+            Ok(())
+        }
+        async fn get_trade_plan(
+            &self,
+            _account: Option<&str>,
+            _trade_id: &str,
+        ) -> Result<Option<trade_control_core::trade_plan::TradePlan>, StateError> {
+            Ok(None)
+        }
+        async fn list_all_trade_plans(
+            &self,
+        ) -> Result<Vec<trade_control_core::state::StoredPlan>, StateError> {
+            Ok(Vec::new())
+        }
+        async fn clear_trade_plan(
+            &self,
+            _account: Option<&str>,
+            _trade_id: &str,
+        ) -> Result<(), StateError> {
+            Ok(())
+        }
+        async fn get_plan_state(
+            &self,
+            _account: Option<&str>,
+            _trade_id: &str,
+        ) -> Result<Option<trade_control_core::plan_state::PlanState>, StateError> {
+            Ok(None)
+        }
+        async fn put_plan_state(
+            &self,
+            _account: Option<&str>,
+            _trade_id: &str,
+            _state: &trade_control_core::plan_state::PlanState,
+            _ttl_seconds: u64,
+        ) -> Result<(), StateError> {
+            Ok(())
+        }
+        async fn clear_plan_state(
+            &self,
+            _account: Option<&str>,
+            _trade_id: &str,
+        ) -> Result<(), StateError> {
+            Ok(())
+        }
     }
 
     fn ts(s: &str) -> DateTime<Utc> {

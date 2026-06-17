@@ -10,12 +10,14 @@
 
 use chrono::{DateTime, Utc};
 use trade_control_core::intent::Action;
+use trade_control_core::plan_state::PlanState;
 use trade_control_core::state::{
     CooldownEntry, EntryAttempt, MIN_TTL_SECONDS, MwState, NewsEntry, PREP_BLOCK_INDEX_CAP,
     PREP_INDEX_CAP, PauseEntry, PrepBlockEntry, PrepEntry, SEEN_INDEX_CAP, SeenEntry, Snapshot,
-    SpreadBlackoutRecord, SpreadBlackoutWindow, StateError, StateStore, VETO_INDEX_CAP, VetoEntry,
-    account_scope, prune_expired,
+    SpreadBlackoutRecord, SpreadBlackoutWindow, StateError, StateStore, StoredPlan, VETO_INDEX_CAP,
+    VetoEntry, account_from_scope, account_scope, prune_expired,
 };
+use trade_control_core::trade_plan::TradePlan;
 use worker::kv::KvStore;
 
 const INDEX_COOLDOWNS_KEY: &str = "index:cooldowns";
@@ -124,6 +126,20 @@ impl KvStateStore {
     fn mw_state_key(account: Option<&str>, trade_id: &str) -> String {
         let scope = account_scope(account);
         format!("mw-state:{scope}:{trade_id}")
+    }
+
+    /// Key for a registered server-side [`TradePlan`]: `plan:{scope}:{trade_id}`.
+    /// The cron engine enumerates these by the `plan:` prefix and recovers the
+    /// account from the `{scope}` segment.
+    fn trade_plan_key(account: Option<&str>, trade_id: &str) -> String {
+        let scope = account_scope(account);
+        format!("plan:{scope}:{trade_id}")
+    }
+
+    /// Key for the engine's per-trade FSM state: `plan-state:{scope}:{trade_id}`.
+    fn plan_state_key(account: Option<&str>, trade_id: &str) -> String {
+        let scope = account_scope(account);
+        format!("plan-state:{scope}:{trade_id}")
     }
 
     /// Per-order key holding the raw signed alert body that placed a broker
@@ -1334,6 +1350,163 @@ impl StateStore for KvStateStore {
     ) -> Result<(), StateError> {
         let key = Self::mw_state_key(account, trade_id);
         // Best-effort: KV delete is a no-op if the key is already gone.
+        self.store
+            .delete(&key)
+            .await
+            .map_err(|e| StateError::Backend(format!("delete {key}: {e:?}")))?;
+        Ok(())
+    }
+
+    async fn put_trade_plan(
+        &self,
+        account: Option<&str>,
+        plan: &TradePlan,
+        ttl_seconds: u64,
+    ) -> Result<(), StateError> {
+        let key = Self::trade_plan_key(account, &plan.trade_id);
+        let ttl = ttl_seconds.max(MIN_TTL_SECONDS);
+        let body = serde_json::to_string(plan)
+            .map_err(|e| StateError::Backend(format!("encode plan: {e}")))?;
+        self.store
+            .put(&key, body)
+            .map_err(|e| StateError::Backend(format!("put {key} builder: {e:?}")))?
+            .expiration_ttl(ttl)
+            .execute()
+            .await
+            .map_err(|e| StateError::Backend(format!("put {key} execute: {e:?}")))?;
+        Ok(())
+    }
+
+    async fn get_trade_plan(
+        &self,
+        account: Option<&str>,
+        trade_id: &str,
+    ) -> Result<Option<TradePlan>, StateError> {
+        let key = Self::trade_plan_key(account, trade_id);
+        let raw = self
+            .store
+            .get(&key)
+            .text()
+            .await
+            .map_err(|e| StateError::Backend(format!("get {key}: {e:?}")))?;
+        let Some(text) = raw else { return Ok(None) };
+        serde_json::from_str(&text)
+            .map(Some)
+            .map_err(|e| StateError::Backend(format!("decode plan: {e}")))
+    }
+
+    async fn list_all_trade_plans(&self) -> Result<Vec<StoredPlan>, StateError> {
+        // Walk every `plan:` row across scopes — the engine needs a global
+        // view each tick. Same pagination shape as `list_all_entry_attempts`;
+        // we keep the KEYS (not just values) so the account scope can be
+        // recovered from the `plan:{scope}:{trade_id}` segment.
+        let prefix = "plan:";
+        let mut keys: Vec<String> = Vec::new();
+        let mut cursor: Option<String> = None;
+        loop {
+            let mut builder = self.store.list().prefix(prefix.to_string());
+            if let Some(c) = cursor.take() {
+                builder = builder.cursor(c);
+            }
+            let resp = builder
+                .execute()
+                .await
+                .map_err(|e| StateError::Backend(format!("list plan (all): {e:?}")))?;
+            keys.extend(resp.keys.into_iter().map(|k| k.name));
+            if resp.list_complete {
+                break;
+            }
+            match resp.cursor {
+                Some(c) => cursor = Some(c),
+                None => break,
+            }
+        }
+
+        let mut plans: Vec<StoredPlan> = Vec::with_capacity(keys.len());
+        for key in keys {
+            // `plan:{scope}:{trade_id}` — the scope is the segment between the
+            // first and second colon.
+            let Some(rest) = key.strip_prefix("plan:") else {
+                continue;
+            };
+            let Some((scope, _trade_id)) = rest.split_once(':') else {
+                continue;
+            };
+            let raw = self
+                .store
+                .get(&key)
+                .text()
+                .await
+                .map_err(|e| StateError::Backend(format!("get {key}: {e:?}")))?;
+            let Some(text) = raw else { continue };
+            let plan: TradePlan = serde_json::from_str(&text)
+                .map_err(|e| StateError::Backend(format!("decode {key}: {e}")))?;
+            plans.push(StoredPlan {
+                account: account_from_scope(scope),
+                plan,
+            });
+        }
+        Ok(plans)
+    }
+
+    async fn clear_trade_plan(
+        &self,
+        account: Option<&str>,
+        trade_id: &str,
+    ) -> Result<(), StateError> {
+        let key = Self::trade_plan_key(account, trade_id);
+        self.store
+            .delete(&key)
+            .await
+            .map_err(|e| StateError::Backend(format!("delete {key}: {e:?}")))?;
+        Ok(())
+    }
+
+    async fn get_plan_state(
+        &self,
+        account: Option<&str>,
+        trade_id: &str,
+    ) -> Result<Option<PlanState>, StateError> {
+        let key = Self::plan_state_key(account, trade_id);
+        let raw = self
+            .store
+            .get(&key)
+            .text()
+            .await
+            .map_err(|e| StateError::Backend(format!("get {key}: {e:?}")))?;
+        let Some(text) = raw else { return Ok(None) };
+        serde_json::from_str(&text)
+            .map(Some)
+            .map_err(|e| StateError::Backend(format!("decode plan-state: {e}")))
+    }
+
+    async fn put_plan_state(
+        &self,
+        account: Option<&str>,
+        trade_id: &str,
+        state: &PlanState,
+        ttl_seconds: u64,
+    ) -> Result<(), StateError> {
+        let key = Self::plan_state_key(account, trade_id);
+        let ttl = ttl_seconds.max(MIN_TTL_SECONDS);
+        let body = serde_json::to_string(state)
+            .map_err(|e| StateError::Backend(format!("encode plan-state: {e}")))?;
+        self.store
+            .put(&key, body)
+            .map_err(|e| StateError::Backend(format!("put {key} builder: {e:?}")))?
+            .expiration_ttl(ttl)
+            .execute()
+            .await
+            .map_err(|e| StateError::Backend(format!("put {key} execute: {e:?}")))?;
+        Ok(())
+    }
+
+    async fn clear_plan_state(
+        &self,
+        account: Option<&str>,
+        trade_id: &str,
+    ) -> Result<(), StateError> {
+        let key = Self::plan_state_key(account, trade_id);
         self.store
             .delete(&key)
             .await

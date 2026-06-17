@@ -156,7 +156,44 @@ So Commit 2 splits: 2a = pure builder (tested, no network), 2b = the direct
       subsection (additive/opt-in, old+new in parallel, worker logs-but-not-yet
       -persists). Green: cli + tv-arm (151) tests; clippy workspace; fmt;
       `cargo check -p trade-control-web-hook --target wasm32` (worker).
-### Stage D — engine: pure evaluator + cron wiring (PENDING)
+### Stage D — engine: FSM-per-trade evaluator + cron wiring (IN PROGRESS)
+
+The reframe (user's insight): Pine alerts are *stateless* — each dings on a
+cross, can't see the trade status, so ordering is faked with the `clears`
+kludge + `requires_preps` timestamp gate. The stateful engine replaces that
+with **one state machine per trade_id**: an ordered prep spine
+(`AwaitBreakAndClose → AwaitEntry → Done`) where a fired rule *dies*, plus
+always-armed veto guards. Retest becomes a retroactive lookback
+(`retest_seen_at` on PlanState), not a live prep. M/W boundary: the engine
+emits the enter heartbeat per closed bar and *delegates* all neckline/cancel
+logic to the existing `run_enter → maybe_update_mw_state` (decided in review).
+M/W ships first; `PinePattern` (H&S entry) is stubbed until Stage E.
+
+##### C1 — plan/state persistence + register persists (DONE — all green)
+- [x] `core/src/plan_state.rs`: `PlanState {watermark, phase, fired:BTreeSet,
+      last_close:BTreeMap, break_close_at, retest_seen_at, mw(reserved),
+      expires_at}` + `Phase {AwaitBreakAndClose, AwaitEntry, Done}` + `seed()`.
+      Lives in `core` (not engine) so the `StateStore` trait can name it with
+      no dep cycle, mirroring `MwState`. BTree for deterministic KV bodies. 4
+      unit tests (seed empties, JSON round-trip w/ elided empties, snake_case
+      phase wire form, populated round-trip).
+- [x] `StateStore`: 7 new methods (`put/get/clear/list_all_trade_plans`,
+      `get/put/clear_plan_state`) + `StoredPlan{account, plan}` +
+      `account_from_scope` helper. Implemented in MemStore, the wasm
+      `KvStateStore` (`src/state/kv.rs`, keys `plan:{scope}:{tid}` /
+      `plan-state:{scope}:{tid}`, list-all parses scope back from the key), and
+      the two test-stub stores (retry_gate, lib SeenSpyStore). 2 MemStore
+      round-trip tests (plan list recovers account scope + scoped get is not
+      global-first; plan-state round-trip).
+- [x] `handle_register` (`src/lib.rs`) persists via `put_trade_plan` (TTL =
+      `replay_ttl_seconds(not_after)`); outcome string now "persisted".
+- [x] engine crate re-exports `Phase`/`PlanState`/`StoredPlan`. README updated
+      (register now persists). Green: core (473) + worker (195) tests; clippy;
+      fmt; `cargo check --target wasm32` (worker).
+
+##### C2 — pure `evaluate_plan` for M/W (engine crate) (PENDING)
+##### C3 — `run_engine_tick` wrapper + Shell synthesis + dispatch (PENDING)
+##### C4 — cron wiring + webhook-vs-engine parity test (PENDING)
 ### Stage E — port H&S Pine candle detector to Rust (PENDING)
 ### Stage F — retire the webhook (PENDING)
 ### Stage G — Durable Object websocket (only if demo proves a need) (PENDING)

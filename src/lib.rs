@@ -2596,14 +2596,26 @@ async fn handle_register(
             400,
         );
     }
+    // Persist the plan for the cron engine to evaluate. TTL mirrors the
+    // replay window: the plan must outlive its alert window plus grace and die
+    // with it (an expired-window plan stops being enumerated by the engine).
+    let account = verified.intent.account.as_deref();
+    let ttl = incoming::replay_ttl_seconds(verified.intent.not_after, now);
+    if let Err(err) = store.put_trade_plan(account, plan, ttl).await {
+        rlog_err!(
+            "register: put_trade_plan failed (trade_id={}): {err}",
+            plan.trade_id
+        );
+        return Response::error("state error", 500);
+    }
     rlog!(
-        "register: trade_id={} instrument={} rules={} (Stage C: not yet persisted)",
+        "register: trade_id={} instrument={} rules={} persisted (ttl={ttl}s)",
         plan.trade_id,
         plan.instrument,
         plan.rules.len()
     );
     let outcome = format!(
-        "registered: {} ({} rules, not-yet-persisted)",
+        "registered: {} ({} rules, persisted)",
         plan.trade_id,
         plan.rules.len()
     );
@@ -3323,6 +3335,58 @@ mod dispatcher_outcome_tests {
             Ok(())
         }
         async fn clear_mw_state(
+            &self,
+            _account: Option<&str>,
+            _trade_id: &str,
+        ) -> Result<(), StateError> {
+            Ok(())
+        }
+
+        // Engine plan/state methods — unused by these tests; minimal stubs.
+        async fn put_trade_plan(
+            &self,
+            _account: Option<&str>,
+            _plan: &trade_control_core::trade_plan::TradePlan,
+            _ttl_seconds: u64,
+        ) -> Result<(), StateError> {
+            Ok(())
+        }
+        async fn get_trade_plan(
+            &self,
+            _account: Option<&str>,
+            _trade_id: &str,
+        ) -> Result<Option<trade_control_core::trade_plan::TradePlan>, StateError> {
+            Ok(None)
+        }
+        async fn list_all_trade_plans(
+            &self,
+        ) -> Result<Vec<trade_control_core::state::StoredPlan>, StateError> {
+            Ok(Vec::new())
+        }
+        async fn clear_trade_plan(
+            &self,
+            _account: Option<&str>,
+            _trade_id: &str,
+        ) -> Result<(), StateError> {
+            Ok(())
+        }
+        async fn get_plan_state(
+            &self,
+            _account: Option<&str>,
+            _trade_id: &str,
+        ) -> Result<Option<trade_control_core::plan_state::PlanState>, StateError> {
+            Ok(None)
+        }
+        async fn put_plan_state(
+            &self,
+            _account: Option<&str>,
+            _trade_id: &str,
+            _state: &trade_control_core::plan_state::PlanState,
+            _ttl_seconds: u64,
+        ) -> Result<(), StateError> {
+            Ok(())
+        }
+        async fn clear_plan_state(
             &self,
             _account: Option<&str>,
             _trade_id: &str,

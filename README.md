@@ -1501,11 +1501,14 @@ so `tv-arm-staging --register-plan` registers against the staging worker with
 no extra flag. The chart timeframe must map to an engine granularity
 (`1`/`5`/`15`/`60`/`240`/`D`), else the register is rejected.
 
-As of this stage the worker validates + logs the registered plan but does
-**not** yet persist or evaluate it — the cron-driven evaluator is the next
-stage. The plan builder is `tv-arm/src/trade_plan_build.rs` (the inverse of
-`alert_spec.rs`); the `TradePlan` / `Trigger` model lives in
-`core/src/trade_plan.rs`.
+The worker validates the registered plan and **persists** it to KV (key
+`plan:{scope}:{trade_id}`, TTL = the alert window plus grace) for the
+server-side engine to enumerate each cron tick. The engine that *evaluates*
+those plans — a state machine per trade — is the next stage; until it ships
+the persisted plans are inert and the TradingView alert path is still what
+fires trades. The plan builder is `tv-arm/src/trade_plan_build.rs` (the
+inverse of `alert_spec.rs`); the `TradePlan` / `Trigger` model lives in
+`core/src/trade_plan.rs`; per-trade engine state is `core/src/plan_state.rs`.
 
 Skipped preps are pre-fired directly to the worker so the entry's
 `requires_preps:` gate is still satisfied — useful when joining a setup
