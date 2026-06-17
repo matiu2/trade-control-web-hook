@@ -62,8 +62,18 @@ reject gate covers both. Plan: `~/.home-claude/plans/market-hours-entry-blackout
       position (the `veto_close_only_when_thesis_invalidated` guard). Fail-open
       on KV read error. README "Cron sweep" subsection added. Broker trait
       needed no addition (had `close_positions`/`cancel_pending_for_instrument`).
-- [ ] **Commit 6 — CLI + tv-arm + README.** `--blackout-close {cancel|close}`;
-      `build_trade_plan` carries the policy onto enter rules; README section.
+- [x] **Commit 6 — CLI + tv-arm + README.** `TradeSpec.blackout_close`
+      (skip-default serde) threaded through both enter builders
+      (`build_enter_alert` H&S, `build_mw_enter_alert` M/W) onto the enter
+      intent's `blackout_close`; non-enter alerts stay at the wire default.
+      CLI build-trade picks it up from the spec yaml (`blackout_close:
+      cancel_resting | cancel_and_close`). tv-arm gets a `--blackout-close
+      {cancel|close}` `ValueEnum` flag (default `cancel`) wired into both
+      H&S and M/W `TradeSpec` assembly in pipeline.rs. Tests: tv-arm arg
+      parse+map, cli spec→enter-intent threading (default + non-default) and
+      enter-only scoping. README: spec-yaml field doc + tv-arm flag example.
+      Whole feature is now end to end: arm (CLI/tv-arm) → signed enter intent
+      → daily cron derives windows → reject gate → sweep close action.
 
 ## ACTIVE — server-side trade-plan engine (replace paid TradingView alerts)
 

@@ -317,6 +317,14 @@ expiry_bars: 3                         # optional, 1..=5. Cancel a resting
                                        # within N bars. See "Bar-based order
                                        # expiry" below. Omit to rest until
                                        # not_after.
+blackout_close: cancel_resting         # optional. What the market-hours
+                                       # blackout sweep does with a still-
+                                       # resting order caught in the daily
+                                       # close→open gap. cancel_resting
+                                       # (default) cancels the unfilled order
+                                       # only; cancel_and_close also flattens
+                                       # an open position. See "Market-hours
+                                       # entry blackout" below.
 cooldown_hours: 12                     # only used by "invalidate"
 ```
 
@@ -1684,6 +1692,7 @@ cargo run -p tv-arm -- \
   --skip-retest \                     # implies --skip-break-and-close; for late entries
   --require-golden \                  # require Pine golden-candle signal on entry
   --require-confirmation \            # require a confirmed signal candle on entry (independent of golden)
+  --blackout-close close \            # market-hours blackout: also flatten an open position if caught in the close→open gap (default: cancel = cancel the resting order only)
   --create-alerts \                   # POST to TradingView; omit to only write the signed bundle to disk
   --register-plan \                   # experimental: also register one signed TradePlan with the server-side engine
   --shadow                            # register observe-only: engine evaluates + logs, but never places orders (safe parallel run)

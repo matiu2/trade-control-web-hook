@@ -28,8 +28,8 @@ use serde::{Deserialize, Serialize};
 
 use trade_control_conventions::AlertBasename;
 use trade_control_core::intent::{
-    Action, BrokerKind, Direction, EntrySpec, Intent, MW_CANCEL_VETO_NAME, MW_OVERSHOOT_VETO_NAME,
-    PriceAnchor, PriceRef, TakeProfit, VetoLevel,
+    Action, BlackoutCloseAction, BrokerKind, Direction, EntrySpec, Intent, MW_CANCEL_VETO_NAME,
+    MW_OVERSHOOT_VETO_NAME, PriceAnchor, PriceRef, TakeProfit, VetoLevel,
 };
 use trade_control_core::sig::KEY_LEN;
 
@@ -420,6 +420,22 @@ pub struct TradeSpec {
     /// default (pre-feature behaviour).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pip_size: Option<f64>,
+    /// What the market-hours blackout sweep should do with this trade's
+    /// still-pending resting order if it's caught inside the instrument's
+    /// daily close→open gap. Lands on the `05-enter` intent's
+    /// `blackout_close`. Default [`BlackoutCloseAction::CancelResting`]
+    /// (the incident fix: cancel the unfilled order, never close a filled
+    /// position); set `cancel-and-close` to also flatten an open position
+    /// on the instrument. Byte-identical to pre-feature spec yaml when left
+    /// at the default.
+    #[serde(default, skip_serializing_if = "is_default_blackout_close")]
+    pub blackout_close: BlackoutCloseAction,
+}
+
+/// Skip-serializing predicate for [`TradeSpec::blackout_close`] — keeps a
+/// default spec yaml byte-identical to pre-feature specs.
+fn is_default_blackout_close(a: &BlackoutCloseAction) -> bool {
+    matches!(a, BlackoutCloseAction::CancelResting)
 }
 
 /// CLI-side mirror of [`trade_control_core::intent::MwParams`]. Kept as a
@@ -786,6 +802,10 @@ fn build_pattern(
         sl_anchor: None,
         mw: None,
         pip_size: None,
+        // Interactive path keeps the safe default (cancel a resting order,
+        // never close a position). The `--blackout-close` flag lives on the
+        // `--from-file` / scripted path.
+        blackout_close: BlackoutCloseAction::default(),
     };
     assemble_trade(spec, geometry, entry_offset_pips, sl_offset_pips, now)
 }
@@ -899,6 +919,7 @@ fn assemble_trade(
         spec.needs_confirmed,
         &spec.skip_preps,
         spec.pip_size,
+        spec.blackout_close,
         &spec.broker,
         &spec.account,
         // The enter must check the `reversal` veto only when a
@@ -1040,6 +1061,7 @@ fn build_mw_pattern(spec: TradeSpec, now: DateTime<Utc>) -> Result<BuiltTrade> {
             spec.allow_entry.as_deref(),
             spec.needs_golden,
             spec.needs_confirmed,
+            spec.blackout_close,
             &spec.broker,
             &spec.account,
         ),
@@ -1192,6 +1214,7 @@ fn build_mw_enter_alert(
     allow_entry: Option<&str>,
     needs_golden: bool,
     needs_confirmed: bool,
+    blackout_close: BlackoutCloseAction,
     broker: &BrokerKind,
     account: &str,
 ) -> BuiltAlert {
@@ -1226,6 +1249,8 @@ fn build_mw_enter_alert(
     intent.allow_entry = allow_entry.map(trade_control_core::tunable::Tunable::from_script);
     intent.needs_golden = needs_golden;
     intent.needs_confirmed = needs_confirmed;
+    // Market-hours blackout close policy — see build_enter_alert.
+    intent.blackout_close = blackout_close;
     intent.requires_preps = Vec::new();
     intent.vetos = vec![
         MW_CANCEL_VETO_NAME.into(),
@@ -1605,6 +1630,7 @@ fn build_enter_alert(
     needs_confirmed: bool,
     skip_preps: &[String],
     pip_size: Option<f64>,
+    blackout_close: BlackoutCloseAction,
     broker: &BrokerKind,
     account: &str,
     check_reversal_veto: bool,
@@ -1661,6 +1687,9 @@ fn build_enter_alert(
     intent.allow_entry = allow_entry.map(trade_control_core::tunable::Tunable::from_script);
     intent.needs_golden = needs_golden;
     intent.needs_confirmed = needs_confirmed;
+    // Market-hours blackout close policy — what the sweep does with this
+    // order if it's caught resting in the close→open gap.
+    intent.blackout_close = blackout_close;
     intent.requires_preps = ["break-and-close", "retest"]
         .into_iter()
         .filter(|step| !skip_preps.iter().any(|s| s == step))
@@ -1911,6 +1940,7 @@ mod tests {
                 false,
                 &[],
                 None,
+                BlackoutCloseAction::default(),
                 &BrokerKind::Oanda,
                 "demo",
                 false,
@@ -1949,6 +1979,7 @@ mod tests {
                 sl_anchor: None,
                 mw: None,
                 pip_size: None,
+                blackout_close: BlackoutCloseAction::default(),
             },
         };
         let manifest = render_manifest(&trade);
@@ -1985,6 +2016,7 @@ mod tests {
             false,
             &[],
             None,
+            BlackoutCloseAction::default(),
             &BrokerKind::Oanda,
             "demo",
             false,
@@ -2060,6 +2092,7 @@ mod tests {
             false,
             &[],
             None,
+            BlackoutCloseAction::default(),
             &BrokerKind::Oanda,
             "demo",
             false,
@@ -2151,6 +2184,7 @@ mod tests {
             sl_anchor: None,
             mw: None,
             pip_size: None,
+            blackout_close: BlackoutCloseAction::default(),
         }
     }
 
@@ -2670,6 +2704,42 @@ tp_price: 1.05
         // Spot-check a non-enter alert: dry_run must be None.
         let veto = &trade.alerts[0];
         assert_eq!(veto.intent.dry_run, None);
+    }
+
+    #[test]
+    fn build_trade_from_spec_threads_blackout_close_onto_enter_intent() {
+        // A non-default close policy on the spec must land on the enter
+        // intent (the worker reads it there) and leave the non-enter alerts
+        // at the wire default.
+        let now = ts("2026-05-20T00:00:00Z");
+        let mut spec = sample_spec(TradePattern::Hs, ts("2026-05-25T00:00:00Z"));
+        spec.blackout_close = BlackoutCloseAction::CancelAndClose;
+        let trade = build_trade_from_spec(spec, now).unwrap();
+        let enter = trade.alerts.last().unwrap();
+        assert_eq!(
+            enter.intent.blackout_close,
+            BlackoutCloseAction::CancelAndClose
+        );
+        enter.intent.validate().unwrap();
+        // A veto alert keeps the default — the policy is enter-only.
+        let veto = &trade.alerts[0];
+        assert_eq!(
+            veto.intent.blackout_close,
+            BlackoutCloseAction::CancelResting
+        );
+    }
+
+    #[test]
+    fn build_trade_from_spec_default_blackout_close_is_cancel_resting() {
+        // The default spec mints an enter at the safe incident-fix default.
+        let now = ts("2026-05-20T00:00:00Z");
+        let spec = sample_spec(TradePattern::Hs, ts("2026-05-25T00:00:00Z"));
+        let trade = build_trade_from_spec(spec, now).unwrap();
+        let enter = trade.alerts.last().unwrap();
+        assert_eq!(
+            enter.intent.blackout_close,
+            BlackoutCloseAction::CancelResting
+        );
     }
 
     #[test]

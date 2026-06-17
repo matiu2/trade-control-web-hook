@@ -35,6 +35,28 @@ impl BrokerArg {
     }
 }
 
+/// Market-hours blackout close policy. Crate-local so the value-enum can be
+/// used in the `clap` derive; maps to
+/// [`trade_control_core::intent::BlackoutCloseAction`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+#[clap(rename_all = "lowercase")]
+pub enum BlackoutClose {
+    /// Cancel the unfilled resting order only; never close a position. Default.
+    Cancel,
+    /// Cancel the resting order **and** market-close an open position.
+    Close,
+}
+
+impl BlackoutClose {
+    /// Translate to the signed wire enum.
+    pub fn into_core(self) -> trade_control_core::intent::BlackoutCloseAction {
+        match self {
+            Self::Cancel => trade_control_core::intent::BlackoutCloseAction::CancelResting,
+            Self::Close => trade_control_core::intent::BlackoutCloseAction::CancelAndClose,
+        }
+    }
+}
+
 /// Arm a reversal setup from the active TradingView chart.
 #[derive(Debug, Parser)]
 #[command(version = env!("GIT_VERSION"), about, long_about = None)]
@@ -105,6 +127,15 @@ pub struct Args {
     /// Requires the v2 indicator that ships the menu plots.
     #[arg(long)]
     pub expiry_bars: Option<u32>,
+
+    /// What the market-hours blackout sweep should do with this trade's
+    /// resting entry order if it's caught inside the instrument's daily
+    /// close→open gap. `cancel` (default) cancels the unfilled order and
+    /// never touches a filled position; `close` also market-closes any open
+    /// position on the instrument. Lands on the enter intent's
+    /// `blackout_close`.
+    #[arg(long, value_enum, default_value_t = BlackoutClose::Cancel)]
+    pub blackout_close: BlackoutClose,
 
     /// Use a market order for entry instead of the default pending
     /// stop-entry at the geometry anchor. SL still anchors to
@@ -209,6 +240,26 @@ mod tests {
         assert!(!args.broker_dry_run);
         assert!(!args.skip_calendar_bars);
         assert_eq!(args.reversal_band_pct, 0.1);
+    }
+
+    #[test]
+    fn blackout_close_defaults_to_cancel_and_parses() {
+        use trade_control_core::intent::BlackoutCloseAction;
+        // Default (flag absent) is the safe incident-fix policy.
+        let args = Args::try_parse_from(["tv-arm"]).expect("parse");
+        assert_eq!(args.blackout_close, BlackoutClose::Cancel);
+        assert_eq!(
+            args.blackout_close.into_core(),
+            BlackoutCloseAction::CancelResting
+        );
+        // `--blackout-close close` opts into also flattening an open position.
+        let args =
+            Args::try_parse_from(["tv-arm", "--blackout-close", "close"]).expect("parse close");
+        assert_eq!(args.blackout_close, BlackoutClose::Close);
+        assert_eq!(
+            args.blackout_close.into_core(),
+            BlackoutCloseAction::CancelAndClose
+        );
     }
 
     #[test]

@@ -736,6 +736,7 @@ fn build_mw_trade_spec(
         // Mirror the M/W pip onto the top-level field (the cli M/W builder
         // also does this); keeps the worker's sizing tail on the baked pip.
         pip_size: Some(anchors.pip_size),
+        blackout_close: args.blackout_close.into_core(),
     }
 }
 
@@ -938,6 +939,7 @@ fn build_trade_spec(
         // Baked from instrument-lookup (or --pip-size) so the worker scales
         // the entry/SL offset_pips with the right pip, not its forex default.
         pip_size: Some(pip_size),
+        blackout_close: args.blackout_close.into_core(),
     };
     if args.sl_from_recent {
         spec.sl_anchor = Some(match direction {
