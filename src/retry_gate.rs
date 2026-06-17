@@ -807,20 +807,20 @@ mod tests {
         ) -> Result<Option<trade_control_core::state::SpreadBlackoutWindow>, StateError> {
             Ok(None)
         }
-        async fn set_blackout_window(
+        async fn set_blackout_windows(
             &self,
             _instrument: &str,
-            _window: trade_control_core::intent::NoEntryWindow,
+            _windows: &[trade_control_core::intent::NoEntryWindow],
             _now: DateTime<Utc>,
             _ttl_seconds: u64,
         ) -> Result<(), StateError> {
             Ok(())
         }
-        async fn get_blackout_window(
+        async fn get_blackout_windows(
             &self,
             _instrument: &str,
-        ) -> Result<Option<trade_control_core::intent::NoEntryWindow>, StateError> {
-            Ok(None)
+        ) -> Result<Vec<trade_control_core::intent::NoEntryWindow>, StateError> {
+            Ok(Vec::new())
         }
         async fn upsert_spread_blackout_record(
             &self,

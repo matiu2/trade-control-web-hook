@@ -129,6 +129,20 @@ pub fn is_inside_window(now_min: u32, w: &NoEntryWindow) -> bool {
     }
 }
 
+/// `now ∈ ANY of these windows?` — the predicate the reject gate and sweep use.
+///
+/// A market can have **several** daily close→open gaps (e.g. a maintenance gap
+/// plus the overnight close), so its stored blackout is a *set* of
+/// [`NoEntryWindow`]s. Entry is blocked when `now` falls inside any one of them.
+/// An empty slice → never inside (the fail-open case: no window, no blackout).
+pub fn is_inside_any(now_min: u32, windows: &[NoEntryWindow]) -> bool {
+    windows.iter().any(|w| is_inside_window(now_min, w))
+}
+
+mod derive;
+
+pub use derive::{Buffers, windows_from_session};
+
 #[cfg(test)]
 mod tests {
     use super::*;

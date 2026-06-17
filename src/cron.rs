@@ -11,6 +11,9 @@
 //!
 //! * **Every tick (every 15 min)** — session refresh + order sweep +
 //!   the spread-recovery watcher (`blackout_watch`).
+//! * **Daily, 06:00 UTC** — refresh each traded instrument's market-hours
+//!   blackout windows in KV (`blackout_hours`). Self-gates on the hour;
+//!   shares the `now.minute() < 15` once-per-hour guard with `blackout_apply`.
 //! * **NY-close edge only** — open the global spread-blackout window
 //!   marker (`blackout_apply`). This used to be its own daily cron
 //!   (`5 21`/`5 22`); it's now run from the 15-min arm, gated by
@@ -23,6 +26,7 @@
 
 mod blackout_apply;
 mod blackout_cancel;
+mod blackout_hours;
 mod blackout_restore;
 mod blackout_watch;
 mod blackout_widen;
@@ -60,5 +64,9 @@ pub async fn scheduled(_event: ScheduledEvent, env: Env, ctx: ScheduleContext) {
     // of the close hour.
     if now.minute() < 15 {
         blackout_apply::apply_if_ny_close_edge(&env, now).await;
+        // Daily market-hours blackout refresh — self-gates on its own hour
+        // (06:00 UTC). Resolves each traded instrument's current-season
+        // session into UTC no-entry windows and writes them to KV.
+        blackout_hours::refresh_if_due(&env, now).await;
     }
 }

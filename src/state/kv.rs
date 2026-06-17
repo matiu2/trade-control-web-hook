@@ -1249,10 +1249,10 @@ impl StateStore for KvStateStore {
             .map_err(|e| StateError::Backend(format!("decode spread-blackout window: {e}")))
     }
 
-    async fn set_blackout_window(
+    async fn set_blackout_windows(
         &self,
         instrument: &str,
-        window: NoEntryWindow,
+        windows: &[NoEntryWindow],
         now: DateTime<Utc>,
         ttl_seconds: u64,
     ) -> Result<(), StateError> {
@@ -1260,12 +1260,12 @@ impl StateStore for KvStateStore {
         let ttl = ttl_seconds.max(MIN_TTL_SECONDS);
         let entry = BlackoutHoursEntry {
             instrument: instrument.to_string(),
-            window,
+            windows: windows.to_vec(),
             updated_at: now,
             expires_at: now + chrono::Duration::seconds(ttl as i64),
         };
         let body = serde_json::to_string(&entry)
-            .map_err(|e| StateError::Backend(format!("encode blackout-hours window: {e}")))?;
+            .map_err(|e| StateError::Backend(format!("encode blackout-hours windows: {e}")))?;
         self.store
             .put(&key, body)
             .map_err(|e| StateError::Backend(format!("put {key} builder: {e:?}")))?
@@ -1276,10 +1276,10 @@ impl StateStore for KvStateStore {
         Ok(())
     }
 
-    async fn get_blackout_window(
+    async fn get_blackout_windows(
         &self,
         instrument: &str,
-    ) -> Result<Option<NoEntryWindow>, StateError> {
+    ) -> Result<Vec<NoEntryWindow>, StateError> {
         let key = Self::blackout_hours_key(instrument);
         let raw = self
             .store
@@ -1287,10 +1287,12 @@ impl StateStore for KvStateStore {
             .text()
             .await
             .map_err(|e| StateError::Backend(format!("get {key}: {e:?}")))?;
-        let Some(text) = raw else { return Ok(None) };
+        let Some(text) = raw else {
+            return Ok(Vec::new());
+        };
         serde_json::from_str::<BlackoutHoursEntry>(&text)
-            .map(|e| Some(e.window))
-            .map_err(|e| StateError::Backend(format!("decode blackout-hours window: {e}")))
+            .map(|e| e.windows)
+            .map_err(|e| StateError::Backend(format!("decode blackout-hours windows: {e}")))
     }
 
     async fn upsert_spread_blackout_record(
@@ -1819,21 +1821,25 @@ mod decode_index_tests {
 
     // --- market-hours entry blackout window decode ---
 
-    /// A stored market-hours window decodes (the per-instrument value path
-    /// `get_blackout_window` reads).
+    /// A stored market-hours window set decodes (the per-instrument value path
+    /// `get_blackout_windows` reads).
     #[test]
-    fn blackout_hours_window_decodes_good() {
+    fn blackout_hours_windows_decode_good() {
         let good = r#"{
             "instrument": "US 500",
-            "window": {"open_min": 1080, "close_min": 120},
+            "windows": [
+                {"open_min": 1080, "close_min": 120},
+                {"open_min": 540, "close_min": 600}
+            ],
             "updated_at": "2026-06-18T06:00:00Z",
             "expires_at": "2026-06-19T08:00:00Z"
         }"#;
         let entry: Option<BlackoutHoursEntry> = decode_keyed_value("blackout-hours:US 500", good);
         let entry = entry.expect("valid market-hours window value");
-        assert_eq!(entry.window.open_min, 1080);
-        assert_eq!(entry.window.close_min, 120);
-        assert!(entry.window.wraps_midnight());
+        assert_eq!(entry.windows.len(), 2);
+        assert_eq!(entry.windows[0].open_min, 1080);
+        assert_eq!(entry.windows[0].close_min, 120);
+        assert!(entry.windows[0].wraps_midnight());
     }
 
     /// The per-instrument key carries the raw instrument name and no account

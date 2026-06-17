@@ -11,7 +11,10 @@ mod mw_resolution;
 mod mw_state;
 mod resolution;
 
-pub use blackout::{BlackoutCloseAction, MINUTES_PER_DAY, NoEntryWindow, is_inside_window};
+pub use blackout::{
+    BlackoutCloseAction, Buffers, MINUTES_PER_DAY, NoEntryWindow, is_inside_any, is_inside_window,
+    windows_from_session,
+};
 pub use expiry::{ExpiryError, MAX_EXPIRY_BARS, resolve_cancel_at};
 pub use mw_state::{MwAnchors, MwUpdate, effective_mw_params, plan_mw_update};
 #[cfg(feature = "cli")]

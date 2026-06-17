@@ -16,19 +16,31 @@ reject gate covers both. Plan: `~/.home-claude/plans/market-hours-entry-blackout
       (midnight-wrap + degenerate exhaustive tests). `Intent.blackout_close`
       signed field (`#[serde(default)]` = CancelResting) + signed round-trip /
       tamper tests through `parse_and_verify`. 514 core tests green.
-- [x] **Commit 2 — KV window storage.** `get/set_blackout_window(instrument, …)`
+- [x] **Commit 2 — KV window storage.** `get/set_blackout_windows(instrument, …)`
       on the `StateStore` trait + `KvStateStore` impl (per-instrument key
       `blackout-hours:{instrument}`, no account scope) + `MemStateStore` double +
       both worker test fakes. New `BlackoutHoursEntry` storage wrapper in
-      `core/src/state.rs`. ~26h TTL, fail-open (absent/expired → no blackout).
-      Tests: core serde round-trip, mem-store per-instrument isolation +
-      overwrite + expiry-fail-open; worker decode + key-format. WASM build green.
-- [ ] **Commit 3 — daily cron derivation.** `src/cron/blackout_hours.rs`:
-      `refresh_market_hours` (distinct instruments from entry attempts +
-      registered plans; `market_info` → UTC window via pure `window_from_session`
-      with −3h/+1h buffers). Wired into `src/cron.rs`, hour-gated.
+      `core/src/state.rs`. **Stores a `Vec<NoEntryWindow>`** (a market can have
+      several daily gaps — see commit 3's "every gap" decision). ~26h TTL,
+      fail-open (absent/expired/empty → no blackout). Tests: core serde
+      round-trip, mem-store per-instrument isolation + overwrite +
+      expiry-fail-open; worker decode + key-format. WASM build green.
+- [x] **Commit 3 — daily cron derivation.** `core/src/intent/blackout/derive.rs`:
+      pure `windows_from_session(ranges_brisbane, Buffers) -> Vec<NoEntryWindow>`
+      — **emit a window per close→open gap** (operator decision: "every gap"),
+      Brisbane→UTC by `−600 min` (no `chrono_tz` in worker; DST already baked by
+      the `tradenation-api` Brisbane conversion), **merge** overlapping buffered
+      windows on a 1440-min ring, 24h/no-range/whole-day → fail-open empty.
+      `is_inside_any` predicate added. Worker `src/cron/blackout_hours.rs`:
+      `refresh_if_due` (06:00 UTC, once/day, shares `minute()<15` guard) →
+      distinct `(account, instrument)` from entry attempts + registered plans →
+      TN-only `resolve_market` + `market_info` → derive → `set_blackout_windows`
+      (26h TTL). Per-instrument failures log + continue. Wired into `src/cron.rs`.
+      Tests: 10 deriver tests incl. real WS30 two-gap-merge + Brisbane→UTC +
+      fail-open paths. WASM + native build green.
 - [ ] **Commit 4 — worker reject gate in `run_enter`.** Mirror `spread_blackout`;
-      423 `market-blackout`, no KV write / no seen poison. Covers webhook AND
+      read `get_blackout_windows(instrument)`, `is_inside_any(now_utc_min, &ws)`
+      → 423 `market-blackout`, no KV write / no seen poison. Covers webhook AND
       engine (engine dispatches through `run_enter`). MemStateStore handler tests
       (uses the new `test-support` feature from main).
 - [ ] **Commit 5 — cron sweep close action.** Persist `blackout_close` onto the
