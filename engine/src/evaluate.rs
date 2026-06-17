@@ -38,16 +38,22 @@
 //! decision: the worker's existing `run_enter → maybe_update_mw_state` owns all
 //! of that (one implementation). So [`PlanState::mw`] stays unused here.
 //!
-//! # H&S is stubbed
+//! # H&S candle-pattern entry (Stage E)
 //!
-//! The [`Trigger::PinePattern`] entry (H&S candle detector) is a **Stage-D
-//! stub** — it never fires until the Pine port (Stage E). M/W ships fully now.
+//! The [`Trigger::PinePattern`] entry (the H&S `05-enter`) is evaluated by the
+//! Rust port of the Pine detector ([`trade_control_core::signals`]) over the
+//! `detector_window` — see [`eval_pine_entry`]. When it fires it carries the
+//! latched signal geometry (`signal_high`/`signal_low`/`golden`/
+//! `signal_confirmed`/`recent_*`/…) on the [`FiredIntent`], so the dispatched
+//! enter resolves against the *pattern* extremes exactly as the TV alert's
+//! `{{plot(...)}}` substitutions did.
 
 use chrono::{DateTime, Utc};
 
 use trade_control_core::broker::Candle;
-use trade_control_core::intent::{Action, Intent};
+use trade_control_core::intent::{Action, Direction, Intent, SignalKind};
 use trade_control_core::plan_state::{Phase, PlanState};
+use trade_control_core::signals::{DetectorConfig, LatchedSignal, latched_signal_at};
 use trade_control_core::trade_plan::{
     BarEvent, ConditionRule, CrossDir, LinePoint, TradePlan, Trigger,
 };
@@ -71,6 +77,14 @@ pub struct FiredIntent {
     /// The candle on which the trigger fired (its close/high/low/open/time
     /// become the dispatched `Shell`).
     pub candle: Candle,
+    /// The latched candle-pattern signal, set only when a `PinePattern` (H&S
+    /// enter) rule fired. The wrapper folds its geometry
+    /// (`signal_high`/`signal_low`/`golden`/`signal_confirmed`/`recent_*`/…)
+    /// onto the dispatched `Shell` so the H&S enter resolves its entry/SL/TP
+    /// against the *pattern* extremes — exactly as the TV alert's `{{plot(...)}}`
+    /// substitutions did. `None` for every non-Pine trigger (M/W, vetos, preps),
+    /// which carry no pattern geometry.
+    pub signal: Option<LatchedSignal>,
 }
 
 /// The result of one [`evaluate_plan`] run.
@@ -140,16 +154,26 @@ pub fn seed_plan_state(
 /// and ascending (the broker layer guarantees this; the wrapper re-filters
 /// defensively). `now` is the tick time; `expires_at` the TTL stamp for the
 /// returned state.
+///
+/// `detector_window` is the **full back-window** of recent closed candles
+/// (history *and* `new_candles`, ascending) used only by [`Trigger::PinePattern`]
+/// (the H&S candle detector) — which is stateful and needs lookback the
+/// watermark-bounded `new_candles` slice doesn't carry. For an M/W plan (no Pine
+/// rule) it is unused, so the wrapper may pass `new_candles` itself. Every new
+/// candle must appear in it (matched by `time`); a new candle absent from the
+/// window simply can't fire a Pine entry that tick.
 pub fn evaluate_plan(
     plan: &TradePlan,
     prior: &PlanState,
     new_candles: &[Candle],
+    detector_window: &[Candle],
     _now: DateTime<Utc>,
     expires_at: DateTime<Utc>,
 ) -> PlanEval {
     let mut state = prior.clone();
     state.expires_at = expires_at;
     let mut fired = Vec::new();
+    let detector_cfg = DetectorConfig::pine_defaults(plan.granularity);
 
     for candle in new_candles {
         // Always-armed guards first: a terminal veto can end the plan on any
@@ -169,7 +193,14 @@ pub fn evaluate_plan(
                 // Stamp the retest lookback before testing entry, so a retest
                 // and entry that land on the same bar are both seen.
                 stamp_retest(plan, &mut state, candle);
-                evaluate_entry(plan, &mut state, candle, &mut fired);
+                evaluate_entry(
+                    plan,
+                    &mut state,
+                    candle,
+                    detector_window,
+                    &detector_cfg,
+                    &mut fired,
+                );
             }
             Phase::Done => {}
         }
@@ -240,28 +271,48 @@ fn evaluate_break_and_close(
 }
 
 /// Evaluate the entry rule (the `Action::Enter` rule). For M/W this is the
-/// per-bar heartbeat (fires every closed bar); for H&S it's the stubbed
-/// pattern. The entry is gated by the retest lookback when a retest rule is
-/// present.
+/// per-bar heartbeat (fires every closed bar); for H&S it's the `PinePattern`
+/// candle detector (recomputed from `detector_window`). The entry is gated by
+/// the retest lookback when a retest rule is present.
 fn evaluate_entry(
     plan: &TradePlan,
     state: &mut PlanState,
     candle: &Candle,
+    detector_window: &[Candle],
+    detector_cfg: &DetectorConfig,
     fired: &mut Vec<FiredIntent>,
 ) {
     let Some(rule) = plan.rules.iter().find(|r| r.intent.action == Action::Enter) else {
         return;
     };
-    if !fire_rule(rule, state, candle) {
-        return;
-    }
+
+    // A `PinePattern` enter is decided by the stateful candle detector over the
+    // back-window, not by a per-candle level cross. It also produces the latched
+    // signal geometry that rides onto the dispatched shell.
+    let signal = match &rule.trigger {
+        Trigger::PinePattern { pattern, dir } => {
+            match eval_pine_entry(candle, detector_window, detector_cfg, *pattern, *dir) {
+                Some(sig) => Some(sig),
+                None => return,
+            }
+        }
+        // Every other entry trigger (the M/W heartbeat) is a plain per-candle
+        // predicate with no pattern geometry.
+        _ => {
+            if !fire_rule(rule, state, candle) {
+                return;
+            }
+            None
+        }
+    };
+
     // Retest gate: if the plan carries a retest rule, a retest must have been
     // seen in (break_close_at, this candle]. The stamp is persisted, so a
     // retest that closed in an earlier tick still counts.
     if plan.rules.iter().any(is_retest) && !retest_satisfied(state, candle.time) {
         return;
     }
-    push_fire(rule, candle, fired);
+    push_fire_signal(rule, candle, signal, fired);
     // A heartbeat (EveryBar) enter does not latch or finish the spine — the
     // worker's run_enter owns the actual placement/dedup, and M/W rides its TTL
     // / a veto to end. A single-shot (Once) enter ends the spine.
@@ -272,6 +323,31 @@ fn evaluate_entry(
         state.fired.insert(rule.rule_id.clone());
         state.phase = Phase::Done;
     }
+}
+
+/// Decide a `PinePattern` entry on this candle: recompute the latched candle
+/// signal over `detector_window` at this candle's index and fire iff the alert
+/// fires on it, the latched direction matches the plan's, and (when set) the
+/// kind matches. Returns the latched signal to ride onto the shell, or `None`
+/// to not fire.
+fn eval_pine_entry(
+    candle: &Candle,
+    detector_window: &[Candle],
+    cfg: &DetectorConfig,
+    pattern: Option<SignalKind>,
+    dir: Direction,
+) -> Option<LatchedSignal> {
+    let idx = detector_window.iter().position(|c| c.time == candle.time)?;
+    let sig = latched_signal_at(detector_window, idx, cfg)?;
+    if !sig.fires || sig.direction != dir {
+        return None;
+    }
+    if let Some(want) = pattern
+        && sig.kind != want
+    {
+        return None;
+    }
+    Some(sig)
 }
 
 /// Stamp `retest_seen_at` if this candle satisfies the retest trendline
@@ -371,8 +447,11 @@ pub fn eval_trigger(trigger: &Trigger, candle: &Candle, prev_close: Option<f64>)
         // The M/W heartbeat fires on every closed bar — the wrapper feeds only
         // closed candles, so any candle is a heartbeat tick.
         Trigger::MwEveryBar => true,
-        // H&S candle-pattern detection is Stage E. Until then it never fires, so
-        // an H&S plan registered now is inert (the TV alert still drives it).
+        // The H&S candle-pattern entry is **not** a per-candle predicate: it is
+        // stateful and needs the back-window, so it is handled in
+        // [`eval_pine_entry`] off `detector_window`, not here. A `PinePattern`
+        // never reaches `eval_trigger` (only `Action::Enter` rules carry it, and
+        // the entry path special-cases it). Returning `false` keeps this total.
         Trigger::PinePattern { .. } => false,
     }
 }
@@ -438,12 +517,25 @@ fn line_price_at(
     Some(a.price + (b.price - a.price) * frac)
 }
 
-/// Push a fired rule's intent onto the result, cloning the intent verbatim.
+/// Push a fired rule's intent onto the result, cloning the intent verbatim. No
+/// pattern signal (guards / preps / M/W heartbeat).
 fn push_fire(rule: &ConditionRule, candle: &Candle, fired: &mut Vec<FiredIntent>) {
+    push_fire_signal(rule, candle, None, fired);
+}
+
+/// Push a fired rule's intent, carrying an optional latched candle-pattern
+/// signal (set for a `PinePattern` H&S enter, `None` otherwise).
+fn push_fire_signal(
+    rule: &ConditionRule,
+    candle: &Candle,
+    signal: Option<LatchedSignal>,
+    fired: &mut Vec<FiredIntent>,
+) {
     fired.push(FiredIntent {
         rule_id: rule.rule_id.clone(),
         intent: rule.intent.clone(),
         candle: *candle,
+        signal,
     });
 }
 
@@ -579,10 +671,22 @@ mod tests {
     }
 
     fn run(p: &TradePlan, prior: &PlanState, candles: &[Candle]) -> PlanEval {
+        // Non-Pine tests pass the same slice as both the new-candles and the
+        // detector window; only a `PinePattern` entry reads the latter.
+        run_window(p, prior, candles, candles)
+    }
+
+    fn run_window(
+        p: &TradePlan,
+        prior: &PlanState,
+        new_candles: &[Candle],
+        detector_window: &[Candle],
+    ) -> PlanEval {
         evaluate_plan(
             p,
             prior,
-            candles,
+            new_candles,
+            detector_window,
             ts("2026-06-16T20:00:00Z"),
             ts("2026-06-30T00:00:00Z"),
         )
@@ -1149,5 +1253,138 @@ mod tests {
         let st = seed_plan_state(&p, &[], ts("2026-06-30T00:00:00Z"));
         assert!(st.watermark.is_none());
         assert!(st.last_close.is_empty());
+    }
+
+    // ===== Stage E: PinePattern entry =====
+
+    /// A back-window ending in a bearish pinbar on the last bar: a small body in
+    /// the bottom quartile, a long upper wick (≥ 50% range), and a high above the
+    /// prior bar's high (the bearish breakout). The earlier bars are flat context
+    /// so no other signal prints.
+    fn bearish_pinbar_window() -> Vec<Candle> {
+        vec![
+            candle("2026-06-16T08:00:00Z", 1.10, 1.11, 1.09, 1.10),
+            candle("2026-06-16T09:00:00Z", 1.10, 1.11, 1.09, 1.10),
+            // prior bar — its high 1.12 is the level the pinbar must exceed.
+            candle("2026-06-16T10:00:00Z", 1.10, 1.12, 1.09, 1.105),
+            // bearish pinbar: range 1.10..1.30 = 0.20. body 1.115..1.12 (bottom
+            // quartile: bottom_25 = 1.10 + 0.05 = 1.15 → body_bottom 1.115 ≤
+            // 1.15). upper wick = high - body_top = 1.30 - 1.12 = 0.18 ≥ 0.10.
+            // high 1.30 > prior high 1.12. close 1.115 < open 1.12 → bearish.
+            candle("2026-06-16T11:00:00Z", 1.12, 1.30, 1.10, 1.115),
+        ]
+    }
+
+    #[test]
+    fn pine_short_entry_fires_with_signal_geometry() {
+        // H&S short: PinePattern{dir: Short} single-shot enter, in AwaitEntry.
+        let p = plan(vec![rule(
+            "05-enter",
+            Trigger::PinePattern {
+                pattern: None,
+                dir: Direction::Short,
+            },
+            FireMode::Once,
+            Action::Enter,
+        )]);
+        let window = bearish_pinbar_window();
+        let prior = seed_at(Phase::AwaitEntry, "2026-06-16T10:00:00Z");
+        // Only the last (pinbar) candle is new this tick; the whole window is the
+        // detector back-window.
+        let new = &window[3..];
+        let eval = run_window(&p, &prior, new, &window);
+        assert_eq!(eval.fired.len(), 1, "the pinbar fires the short enter");
+        let f = &eval.fired[0];
+        assert_eq!(f.rule_id, "05-enter");
+        let sig = f
+            .signal
+            .expect("a PinePattern fire carries latched geometry");
+        assert_eq!(sig.direction, Direction::Short);
+        assert_eq!(sig.kind, SignalKind::Pinbar);
+        // single-bar pinbar geometry → the pinbar's own extremes.
+        assert!((sig.signal_high - 1.30).abs() < 1e-12);
+        assert!((sig.signal_low - 1.10).abs() < 1e-12);
+        // single-shot enter ends the spine.
+        assert!(eval.done);
+    }
+
+    #[test]
+    fn pine_entry_does_not_fire_for_opposite_direction_plan() {
+        // Same bearish-pinbar window, but the plan is a LONG H&S — the latched
+        // signal is Short, so the entry must not fire.
+        let p = plan(vec![rule(
+            "05-enter",
+            Trigger::PinePattern {
+                pattern: None,
+                dir: Direction::Long,
+            },
+            FireMode::Once,
+            Action::Enter,
+        )]);
+        let window = bearish_pinbar_window();
+        let prior = seed_at(Phase::AwaitEntry, "2026-06-16T10:00:00Z");
+        let eval = run_window(&p, &prior, &window[3..], &window);
+        assert!(eval.fired.is_empty(), "short signal can't fire a long plan");
+        assert!(!eval.done);
+    }
+
+    #[test]
+    fn pine_entry_kind_filter_blocks_mismatched_pattern() {
+        // The window prints a pinbar; a plan demanding a Tweezer must not fire.
+        let p = plan(vec![rule(
+            "05-enter",
+            Trigger::PinePattern {
+                pattern: Some(SignalKind::Tweezer),
+                dir: Direction::Short,
+            },
+            FireMode::Once,
+            Action::Enter,
+        )]);
+        let window = bearish_pinbar_window();
+        let prior = seed_at(Phase::AwaitEntry, "2026-06-16T10:00:00Z");
+        let eval = run_window(&p, &prior, &window[3..], &window);
+        assert!(eval.fired.is_empty(), "kind filter blocks a pinbar");
+    }
+
+    #[test]
+    fn pine_entry_blocked_until_retest_seen() {
+        // H&S short with a retest rule: the pinbar entry is gated until a retest
+        // up-cross has been stamped after the break-and-close.
+        let neckline_up = Trigger::TrendlineCross {
+            a: LinePoint {
+                at_epoch: ts("2026-06-16T00:00:00Z").timestamp(),
+                price: 1.25,
+            },
+            b: LinePoint {
+                at_epoch: ts("2026-06-16T01:00:00Z").timestamp(),
+                price: 1.25,
+            },
+            extend_forward: true,
+            dir: CrossDir::Up,
+            bar: BarEvent::Intrabar,
+        };
+        let p = plan(vec![
+            rule("04-prep-retest", neckline_up, FireMode::Once, Action::Prep),
+            rule(
+                "05-enter",
+                Trigger::PinePattern {
+                    pattern: None,
+                    dir: Direction::Short,
+                },
+                FireMode::Once,
+                Action::Enter,
+            ),
+        ]);
+        let window = bearish_pinbar_window();
+        // break_close set, but the pinbar bar (high 1.30) DOES straddle 1.25 with
+        // close 1.115 — wait, that's a down-close, so the Up retest doesn't stamp.
+        // So entry stays blocked.
+        let mut prior = seed_at(Phase::AwaitEntry, "2026-06-16T10:00:00Z");
+        prior.break_close_at = Some(ts("2026-06-16T10:30:00Z"));
+        let eval = run_window(&p, &prior, &window[3..], &window);
+        assert!(
+            eval.fired.is_empty(),
+            "entry blocked: no retest up-cross stamped"
+        );
     }
 }

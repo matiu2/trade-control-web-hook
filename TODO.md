@@ -241,7 +241,47 @@ M/W ships first; `PinePattern` (H&S entry) is stubbed until Stage E.
       (the `*/1`–`*/5` bump is Stage F). README updated.
 - [x] Parity is wasm-bound (constructs `worker::Response`) and can't be a native
       test; verified by parallel-running engine + TV alerts on demo instead.
-### Stage E — port H&S Pine candle detector to Rust (PENDING)
+### Stage E — port H&S Pine candle detector to Rust (DONE — all green)
+
+Ported `pine-scripts/candle-signals-v2.pine` into the shared `core` crate so
+`Trigger::PinePattern` (the H&S `05-enter`) is evaluated server-side. M/W
+needed none of this (already `MwEveryBar`).
+
+- [x] `core/src/signals/metrics.rs` — per-candle derived quantities (range,
+      body, wicks, 25% bands, close-position, valid_candle) = Pine "Common
+      Calculations". Unit tests.
+- [x] `core/src/signals/atr.rs` — Wilder ATR + the timeframe-dependent length
+      (`f_get_atr_length`). Unit tests (seed mean, RMA, warmup → None).
+- [x] `core/src/signals/detect.rs` — the five detectors (pinbar / tweezer /
+      double-tweezer / regular- & floating-engulfer) with the priority order,
+      the signal geometry (extremes / range / kind / start_time), and the
+      golden size. Table-driven tests per pattern.
+- [x] `core/src/signals/state_machine.rs` — recompute-from-window
+      pending→valid→invalid driver: confirmation latch (**closed-bar only —
+      fixes bug #10B**), opposing-signal invalidation with golden-protect,
+      recent_high/low lookback. `latched_signal_at(window, as_of, cfg)` →
+      `LatchedSignal { signal_*, golden, signal_confirmed, recent_*, atr,
+      fires }`. State transition tests.
+- [x] `engine/src/evaluate.rs` — `evaluate_plan` gains a `detector_window`;
+      `eval_pine_entry` recomputes the latch at the candle's index, gated by
+      direction + optional pattern kind; the fired `LatchedSignal` rides on
+      `FiredIntent.signal`. Pine-entry tests (fires + geometry, wrong
+      direction, kind filter, retest gate).
+- [x] `core/src/intent.rs` — `Shell::from_candle_and_signal` folds the latched
+      geometry onto the shell so the H&S enter resolves entry/SL/TP against the
+      pattern extremes (works with the bug-010 `SignalHigh`/`SignalLow`
+      anchors). Test.
+- [x] `src/cron/engine.rs` — `tick_one` fetches a wider detector back-window
+      (`min_lookback_bars`) for Pine plans; `dispatch_fired` builds the rich
+      shell when a signal is present.
+- [x] core 494 / engine 28 / worker 199 green; clippy + fmt + wasm32 clean.
+
+**Follow-up (tracked):** historical-replay parity — replay recorded candle
+history through the Rust detector and diff the fires/geometry against the
+recorded Pine fires (esp. the ADIDAS bug-10B case, where the closed-bar
+confirm intentionally diverges). Needs the recorded-Pine-fire dataset
+assembled first.
+
 ### Stage F — retire the webhook (PENDING)
 ### Stage G — Durable Object websocket (only if demo proves a need) (PENDING)
 

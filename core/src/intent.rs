@@ -1549,10 +1549,11 @@ impl Shell {
     /// populated (the candle carries it), so M/W body-extreme logic
     /// ([`body_high`](Self::body_high) / [`body_low`](Self::body_low)) works.
     /// Every Pine-latched field (`signal_*`, `recent_*`, `golden`, `atr`,
-    /// `next_candle_timestamp_*`) is `None`: the engine doesn't run the Pine
-    /// indicator, so those are genuinely unavailable here. H&S entries that
-    /// depend on `signal_*` are gated out of the engine until Stage E ports
-    /// the detector; M/W reads only OHLC, so it's fully served.
+    /// `next_candle_timestamp_*`) is `None`: a plain candle carries no pattern
+    /// geometry. This is the right shell for M/W (reads only OHLC), vetos, and
+    /// preps. An **H&S enter** instead uses [`Self::from_candle_and_signal`],
+    /// which folds the latched signal geometry the Pine-detector port computed
+    /// onto these fields.
     pub fn from_candle(candle: &crate::broker::Candle) -> Self {
         Self {
             close: candle.c,
@@ -1576,6 +1577,37 @@ impl Shell {
             next_candle_timestamp_4: None,
             next_candle_timestamp_5: None,
         }
+    }
+
+    /// Synthesize an **H&S enter** shell from the triggering candle plus the
+    /// latched candle-pattern signal the engine's Pine-detector port computed.
+    ///
+    /// Starts from [`Self::from_candle`] (OHLC + time + `open`) and folds the
+    /// signal geometry onto the `signal_*` / `recent_*` / `golden` / `atr` /
+    /// `signal_confirmed` fields — the same values the TV alert's
+    /// `{{plot("signal_high")}}` substitutions carried. The H&S enter resolves
+    /// its entry/SL/TP against these (`PriceAnchor::SignalHigh` etc.), so a
+    /// server-side fire resolves to identical geometry as the TV-driven one.
+    ///
+    /// `next_candle_timestamp_*` stays `None`: the engine derives a pending
+    /// order's `cancel_at` from `expiry_bars` against the live tick clock, not
+    /// from a Pine-projected bar-close menu.
+    pub fn from_candle_and_signal(
+        candle: &crate::broker::Candle,
+        sig: &crate::signals::LatchedSignal,
+    ) -> Self {
+        let mut shell = Self::from_candle(candle);
+        shell.signal_high = Some(sig.signal_high);
+        shell.signal_low = Some(sig.signal_low);
+        shell.signal_range = Some(sig.signal_range);
+        shell.signal_start_time = Some(sig.signal_start_time);
+        shell.signal_kind = Some(sig.kind);
+        shell.golden = Some(sig.golden);
+        shell.signal_confirmed = Some(sig.signal_confirmed);
+        shell.atr = sig.atr;
+        shell.recent_high = sig.recent_high;
+        shell.recent_low = sig.recent_low;
+        shell
     }
 
     /// Body top — `max(open, close)` — or `None` if this shell didn't
@@ -1744,6 +1776,49 @@ mod tests {
         assert_eq!(s.atr, None);
         assert_eq!(s.recent_high, None);
         assert_eq!(s.next_candle_timestamp_1, None);
+    }
+
+    #[test]
+    fn from_candle_and_signal_folds_pattern_geometry() {
+        let candle = crate::broker::Candle {
+            time: "2026-06-17T12:00:00Z".parse().unwrap(),
+            o: 1.1200,
+            h: 1.3000,
+            l: 1.1000,
+            c: 1.1150,
+        };
+        let sig = crate::signals::LatchedSignal {
+            direction: Direction::Short,
+            kind: SignalKind::Pinbar,
+            signal_high: 1.3000,
+            signal_low: 1.1000,
+            signal_range: 0.2000,
+            signal_start_time: candle.time,
+            golden: true,
+            signal_confirmed: true,
+            atr: Some(0.05),
+            recent_high: Some(1.2500),
+            recent_low: Some(1.0500),
+            fires: true,
+        };
+        let s = Shell::from_candle_and_signal(&candle, &sig);
+        // OHLC still from the candle.
+        assert_eq!(s.close, 1.1150);
+        assert_eq!(s.open, Some(1.1200));
+        // Pattern geometry folded on — the H&S enter anchors entry/SL to these.
+        assert_eq!(s.signal_high, Some(1.3000));
+        assert_eq!(s.signal_low, Some(1.1000));
+        assert_eq!(s.signal_kind, Some(SignalKind::Pinbar));
+        assert_eq!(s.golden, Some(true));
+        assert_eq!(s.signal_confirmed, Some(true));
+        assert_eq!(s.recent_high, Some(1.2500));
+        assert_eq!(s.recent_low, Some(1.0500));
+        assert_eq!(s.atr, Some(0.05));
+        // The bug-010 SignalHigh/SignalLow anchors now resolve to the *pattern*
+        // extremes (not the triggering candle's own wick), so a server-side H&S
+        // fire anchors entry/SL identically to the TV-driven one.
+        assert_eq!(s.anchor_price(PriceAnchor::SignalHigh), 1.3000);
+        assert_eq!(s.anchor_price(PriceAnchor::SignalLow), 1.1000);
     }
 
     #[test]

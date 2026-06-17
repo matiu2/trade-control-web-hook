@@ -192,9 +192,20 @@ The day-to-day loop, end to end:
      alerts (no behaviour change to existing trades) until proven on
      demo; the `*/15` cadence stays for now. A plan's first tick *seeds*
      its watermark without firing, so conditions already true at register
-     don't back-fire. M/W ships first (the enter heartbeat fires every
-     closed bar); H&S `PinePattern` entries are inert until the Pine
-     detector is ported to Rust.
+     don't back-fire. Both strategy families are now evaluated
+     server-side: **M/W** fires the enter heartbeat every closed bar
+     (`run_enter` owns the live neckline geometry), and **H&S** fires its
+     `PinePattern` enter from the Rust port of the `candle-signals-v2.pine`
+     detector (pinbar / tweezer / double-tweezer / regular- &
+     floating-engulfer, plus the pending→valid→invalid confirmation state
+     machine). A fired H&S enter carries the latched signal geometry
+     (`signal_high` / `signal_low` / `golden` / `signal_confirmed` /
+     `recent_*` / `atr`) onto its shell, so it resolves entry/SL/TP against
+     the *pattern* extremes exactly as the TV alert's `{{plot(...)}}`
+     substitutions did. The port confirms only on **fully-closed** pushing
+     bars (the engine never sees an unclosed bar), which fixes the Pine
+     one-bar-early confirm timing (bug #10B). Validation against recorded
+     Pine fires by historical replay is a tracked follow-up.
    - `5 21 * * *` **and** `5 22 * * *` — the daily **NY-close-edge**
      check for the spread-blackout feature. CF crons are UTC-only and
      can't carry a timezone, so both candidate minutes fire (21:05 UTC
@@ -1572,11 +1583,17 @@ no extra flag. The chart timeframe must map to an engine granularity
 The worker validates the registered plan and **persists** it to KV (key
 `plan:{scope}:{trade_id}`, TTL = the alert window plus grace) for the
 server-side engine to enumerate each cron tick. The engine that *evaluates*
-those plans — a state machine per trade — is the next stage; until it ships
-the persisted plans are inert and the TradingView alert path is still what
-fires trades. The plan builder is `tv-arm/src/trade_plan_build.rs` (the
-inverse of `alert_spec.rs`); the `TradePlan` / `Trigger` model lives in
-`core/src/trade_plan.rs`; per-trade engine state is `core/src/plan_state.rs`.
+those plans — a state machine per trade — now ships (Stage D/E): it runs on
+the `*/15` tick, **in parallel** with the TV alerts, and evaluates both M/W
+(per-bar enter heartbeat) and H&S (the Rust port of the
+`candle-signals-v2.pine` detector) entries plus the trendline / level / time
+triggers and vetos. The TradingView alert path still runs alongside it until
+the engine is proven on demo (Stage F retires the alerts). The plan builder
+is `tv-arm/src/trade_plan_build.rs` (the inverse of `alert_spec.rs`); the
+`TradePlan` / `Trigger` model lives in `core/src/trade_plan.rs`; per-trade
+engine state is `core/src/plan_state.rs`; the FSM evaluator is
+`engine/src/evaluate.rs`; the candle-pattern detector port is
+`core/src/signals.rs`.
 
 Skipped preps are pre-fired directly to the worker so the entry's
 `requires_preps:` gate is still satisfied — useful when joining a setup
