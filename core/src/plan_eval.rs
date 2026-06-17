@@ -53,4 +53,19 @@ pub struct PlanEval {
     /// — the wrapper clears the plan + state. (M/W plans never reach this via
     /// the spine; they end by TTL or a veto.)
     pub done: bool,
+    /// Non-fatal diagnostics from this run that the pure evaluator can't log
+    /// itself (the `engine` crate has no worker logging). Today this carries
+    /// **trendline out-of-window anchor** warnings: a `TrendlineCross` whose
+    /// anchor predates / postdates the fetched candle window can only have its
+    /// bar-index *estimated* by the signed `bar_seconds` divisor (reintroducing
+    /// wall-clock spacing across any gap in the un-fetched span), and with
+    /// `bar_seconds == 0` (pre-field plans) the trendline silently can't fire at
+    /// all. The wrapper (`run_engine_tick`) `rlog!`s these so the degraded path
+    /// is visible in Cloudflare logs instead of being a silent extrapolation.
+    /// `#[serde(default)]` keeps tick bundles recorded before this field
+    /// deserialisable; it is **not** part of the replay diff (the diff compares
+    /// `fired` / `new_state` / `done` only — warnings recompute from the same
+    /// recorded inputs).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
 }

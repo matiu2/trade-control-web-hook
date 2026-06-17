@@ -1,5 +1,55 @@
 # Changelog
 
+## v35 — 2026-06-18 — Trendline `bar_seconds` fallback is now observable, not silent
+
+### Why
+
+v34 made trendline crosses interpolate in bar-index space, with a `bar_seconds`
+wall-clock divisor *only* as a fallback for an anchor that falls outside the
+fetched candle window. That fallback was correct but **silent**, and it has two
+sharp edges worth surfacing: (1) it re-introduces wall-clock spacing across any
+closed session in the *un-fetched* span (the exact assumption the bar-index work
+removed), and (2) on a plan signed before the `bar_seconds` field existed
+(`bar_seconds = 0`) an out-of-window anchor makes the trendline silently
+**un-evaluable** — it just never fires, with no trace. Both are rare (a normal
+H&S/M/W `detector_window` straddles its anchors) but a silent degraded path is
+exactly the kind of thing that costs a debugging session later.
+
+### What changed
+
+- **`engine` — pure warning surface.** New `trendline_anchor_warnings(plan,
+  window)` classifies each `TrendlineCross` anchor against the window
+  (in-window / extrapolated / unresolvable) and returns human-readable
+  diagnostics. `evaluate_plan` attaches them to the new `PlanEval.warnings`
+  field. Pure and window-derived, so it recomputes deterministically on replay.
+- **`core` — `PlanEval.warnings: Vec<String>`.** `#[serde(default,
+  skip_serializing_if = "Vec::is_empty")]` — old tick bundles still deserialise,
+  and a clean tick adds nothing to the recorded JSON.
+- **worker — log them.** `run_engine_tick` (`src/cron/engine.rs`) `rlog!`s each
+  warning (`cron engine: plan <id> trendline …`) so the degraded path shows up
+  in Cloudflare Real-time Logs instead of being invisible. Logged for both live
+  and shadow plans, before dispatch.
+
+### Breaking
+
+- None. `PlanEval` gains a defaulted field; the replay diff still compares only
+  `fired` / `new_state` / `done` (warnings recompute from the same recorded
+  inputs, so they are deliberately *not* diffed).
+
+### Tests
+
+- `engine`: in-window anchors warn-free; an out-of-window anchor warns about the
+  `bar_seconds` extrapolation; `bar_seconds = 0` warns "unresolvable / won't
+  fire"; both-anchors-out warns twice; a non-trendline (M/W) plan never warns;
+  end-to-end `evaluate_plan` surfaces the warning on `PlanEval.warnings`.
+
+### Follow-up
+
+- The real fix for a warning in the logs is to **widen the candle fetch** in
+  `detector_window_for` so anchors are always in-window — which would make the
+  `bar_seconds` fallback (and these warnings) dead code. Deferred until the logs
+  show it actually happening on a live plan.
+
 ## v34 — 2026-06-18 — Trendline crosses evaluated in bar-index space, not wall-clock
 
 ### Why

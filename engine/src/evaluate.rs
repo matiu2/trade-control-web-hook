@@ -177,11 +177,100 @@ pub fn evaluate_plan(
     }
 
     let done = state.phase == Phase::Done;
+    let warnings = trendline_anchor_warnings(plan, detector_window);
     PlanEval {
         fired,
         new_state: state,
         done,
+        warnings,
     }
+}
+
+/// How a trendline anchor resolved against the candle window — the diagnostic
+/// the warning surface reports.
+enum AnchorResolution {
+    /// The anchor matched a real bar or fell inside the window's span — the
+    /// bar-index is exact (or one-hole interpolated). No warning.
+    InWindow,
+    /// The anchor fell outside the window's span and its bar-index was
+    /// *estimated* from `bar_seconds`. The estimate reintroduces wall-clock
+    /// spacing across any closed session in the un-fetched span, so it can slide
+    /// the line — a soft warning.
+    Extrapolated,
+    /// The anchor fell outside the window's span and `bar_seconds == 0` (a plan
+    /// signed before the field existed), so the bar-index can't be estimated at
+    /// all and the trendline silently can't fire this tick — a hard warning.
+    Unresolvable,
+}
+
+/// Classify a single anchor against the window using the same bar-index logic
+/// [`bar_index_at`] applies, but reporting *how* it resolved rather than the
+/// index itself.
+fn classify_anchor(epoch: i64, window: &[Candle], bar_seconds: i64) -> AnchorResolution {
+    if window.is_empty() {
+        // No window at all → the wrapper would never have called us with a
+        // trendline plan, but be total: treat as unresolvable.
+        return AnchorResolution::Unresolvable;
+    }
+    let first = window[0].time.timestamp();
+    let last = window[window.len() - 1].time.timestamp();
+    if epoch >= first && epoch <= last {
+        return AnchorResolution::InWindow;
+    }
+    if bar_seconds <= 0 {
+        AnchorResolution::Unresolvable
+    } else {
+        AnchorResolution::Extrapolated
+    }
+}
+
+/// Detect every [`Trigger::TrendlineCross`] whose anchor falls outside the
+/// fetched `window`, so the wrapper can log that the line's level was estimated
+/// (or couldn't be resolved). This is the **observability half** of the
+/// bar-index fix: in-window anchors are exact, but an out-of-window anchor falls
+/// back to the `bar_seconds` divisor — which re-introduces wall-clock spacing
+/// across any gap in the un-fetched span (the very assumption the bar-index work
+/// removed), or, on a pre-`bar_seconds` plan, makes the trendline silently
+/// un-evaluable. Both are rare in practice (a normal H&S/M/W `detector_window`
+/// straddles its anchors) but must not be silent when they do happen.
+///
+/// Pure and window-derived, so it recomputes deterministically on replay and is
+/// deliberately *not* part of the replay diff.
+fn trendline_anchor_warnings(plan: &TradePlan, window: &[Candle]) -> Vec<String> {
+    let mut warnings = Vec::new();
+    for rule in &plan.rules {
+        let Trigger::TrendlineCross {
+            a, b, bar_seconds, ..
+        } = &rule.trigger
+        else {
+            continue;
+        };
+        for (label, anchor) in [("a", a), ("b", b)] {
+            match classify_anchor(anchor.at_epoch, window, *bar_seconds) {
+                AnchorResolution::InWindow => {}
+                AnchorResolution::Extrapolated => warnings.push(format!(
+                    "trendline {rule_id}: anchor {label} (epoch {epoch}) is outside the \
+                     {n}-bar window; its bar-index was estimated from bar_seconds={bar_seconds} \
+                     (wall-clock spacing across any gap in the un-fetched span). Widen the \
+                     candle fetch so anchors are in-window.",
+                    rule_id = rule.rule_id,
+                    epoch = anchor.at_epoch,
+                    n = window.len(),
+                    bar_seconds = bar_seconds,
+                )),
+                AnchorResolution::Unresolvable => warnings.push(format!(
+                    "trendline {rule_id}: anchor {label} (epoch {epoch}) is outside the \
+                     {n}-bar window and bar_seconds=0 (plan signed before the field existed), \
+                     so this trendline cannot be evaluated this tick (silently won't fire). \
+                     Re-arm the plan to bake bar_seconds, or widen the candle fetch.",
+                    rule_id = rule.rule_id,
+                    epoch = anchor.at_epoch,
+                    n = window.len(),
+                )),
+            }
+        }
+    }
+    warnings
 }
 
 /// Evaluate every veto guard rule against this candle. A guard that fires
@@ -963,6 +1052,133 @@ mod tests {
             eval_trigger(&mk(true), &c, None, &win),
             "extended → still evaluates"
         );
+    }
+
+    // ===== trendline out-of-window anchor warnings (bar_seconds hardening) =====
+
+    /// A trendline rule whose anchors are at `a_epoch` / `b_epoch`, carrying the
+    /// given `bar_seconds`. Geometry is irrelevant to the warning surface.
+    fn trendline_rule(a_epoch: i64, b_epoch: i64, bar_seconds: i64) -> ConditionRule {
+        rule(
+            "03-prep-break-and-close",
+            Trigger::TrendlineCross {
+                a: LinePoint {
+                    at_epoch: a_epoch,
+                    price: 1.0,
+                },
+                b: LinePoint {
+                    at_epoch: b_epoch,
+                    price: 1.0,
+                },
+                extend_forward: true,
+                bar_seconds,
+                dir: CrossDir::Down,
+                bar: BarEvent::OnClose,
+            },
+            FireMode::Once,
+            Action::Prep,
+        )
+    }
+
+    #[test]
+    fn in_window_anchors_produce_no_warning() {
+        // Window spans epochs 0..200; both anchors inside it → silent.
+        let win = flat_window(0, 100, 3, 1.0);
+        let p = plan(vec![trendline_rule(0, 200, 100)]);
+        assert!(trendline_anchor_warnings(&p, &win).is_empty());
+    }
+
+    #[test]
+    fn out_of_window_anchor_warns_about_bar_seconds_extrapolation() {
+        // Window spans epochs 0..200; anchor `a` predates it (epoch -1000), so it
+        // can only be estimated from bar_seconds → a soft "extrapolated" warning.
+        let win = flat_window(0, 100, 3, 1.0);
+        let p = plan(vec![trendline_rule(-1000, 200, 100)]);
+        let w = trendline_anchor_warnings(&p, &win);
+        assert_eq!(w.len(), 1, "exactly one out-of-window anchor");
+        assert!(w[0].contains("anchor a"), "names the offending anchor");
+        assert!(
+            w[0].contains("bar_seconds=100"),
+            "reports the divisor used: {}",
+            w[0]
+        );
+        assert!(
+            w[0].contains("Widen the candle fetch"),
+            "points at the real fix: {}",
+            w[0]
+        );
+    }
+
+    #[test]
+    fn out_of_window_anchor_with_zero_bar_seconds_warns_unresolvable() {
+        // Pre-bar_seconds plan (bar_seconds=0): an out-of-window anchor can't be
+        // estimated at all → the trendline silently won't fire. The hard warning
+        // documents that exact failure mode.
+        let win = flat_window(0, 100, 3, 1.0);
+        let p = plan(vec![trendline_rule(-1000, 200, 0)]);
+        let w = trendline_anchor_warnings(&p, &win);
+        assert_eq!(w.len(), 1);
+        assert!(
+            w[0].contains("bar_seconds=0") || w[0].contains("bar_seconds=0 ("),
+            "names the zero divisor: {}",
+            w[0]
+        );
+        assert!(
+            w[0].contains("cannot be evaluated") && w[0].contains("won't fire"),
+            "documents the silent-non-fire: {}",
+            w[0]
+        );
+    }
+
+    #[test]
+    fn both_anchors_out_of_window_warns_twice() {
+        // Window spans 0..200; both anchors outside (one before, one after).
+        let win = flat_window(0, 100, 3, 1.0);
+        let p = plan(vec![trendline_rule(-500, 99_999, 100)]);
+        let w = trendline_anchor_warnings(&p, &win);
+        assert_eq!(w.len(), 2, "both anchors flagged");
+        assert!(w.iter().any(|s| s.contains("anchor a")));
+        assert!(w.iter().any(|s| s.contains("anchor b")));
+    }
+
+    #[test]
+    fn non_trendline_plan_never_warns() {
+        // An M/W plan (no trendline rule) produces no trendline warnings, even
+        // with an empty window.
+        let p = plan(vec![rule(
+            "05-enter",
+            Trigger::MwEveryBar,
+            FireMode::EveryBar,
+            Action::Enter,
+        )]);
+        assert!(trendline_anchor_warnings(&p, &[]).is_empty());
+    }
+
+    #[test]
+    fn evaluate_plan_surfaces_the_warning_on_planeval() {
+        // End-to-end: a plan whose neckline anchor predates the fed window
+        // surfaces the warning on PlanEval.warnings (what the wrapper logs).
+        // Window: three H1 bars; anchor `a` is a day earlier (out of window).
+        let win = vec![
+            candle("2026-06-16T13:00:00Z", 1.0, 1.0, 1.0, 1.0),
+            candle("2026-06-16T14:00:00Z", 1.0, 1.0, 1.0, 1.0),
+            candle("2026-06-16T15:00:00Z", 1.0, 1.0, 1.0, 1.0),
+        ];
+        let a_epoch = ts("2026-06-15T13:00:00Z").timestamp(); // out of window
+        let b_epoch = ts("2026-06-16T15:00:00Z").timestamp(); // in window
+        let p = plan(vec![
+            trendline_rule(a_epoch, b_epoch, 3600),
+            rule(
+                "05-enter",
+                Trigger::MwEveryBar,
+                FireMode::EveryBar,
+                Action::Enter,
+            ),
+        ]);
+        let prior = seed_at(Phase::AwaitBreakAndClose, "2026-06-16T12:00:00Z");
+        let eval = run_window(&p, &prior, &win, &win);
+        assert_eq!(eval.warnings.len(), 1, "the out-of-window anchor warns");
+        assert!(eval.warnings[0].contains("anchor a"));
     }
 
     // ===== eval_trigger: time + mw + pine =====

@@ -1711,7 +1711,14 @@ where those preps don't apply.
   interpolation would slide the break-and-close / retest level badly wrong
   on any gapped instrument (everything but 24/5 FX — and even FX gaps at the
   weekend). No market-hours table is needed: the candle feed *is* the
-  ordinal axis.
+  ordinal axis. The `bar_seconds` fallback is now **observable**: when an
+  anchor falls outside the fetched window, the engine attaches a warning to
+  its `PlanEval` and the cron wrapper `rlog!`s it (`cron engine: plan <id>
+  trendline …`) — a soft note when `bar_seconds` extrapolates across a gap,
+  a hard one when a pre-`bar_seconds` plan (`bar_seconds = 0`) makes the
+  trendline silently un-evaluable. The proper fix if you see these is to
+  widen the candle fetch so anchors land in-window, not to trust the
+  extrapolation.
 - **Chart-side `_alertId` binding is cosmetic.** The "link icon" on a
   drawing comes from a separate client-side binding that TV's GUI sets
   via `LineDataSource.setAlert()`. Programmatic creates can't easily

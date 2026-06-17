@@ -148,6 +148,15 @@ async fn tick_one(
 
     let eval = evaluate_plan(plan, &prior, &fresh, &detector_window, now, expires_at);
 
+    // Surface any trendline out-of-window anchor diagnostics the pure evaluator
+    // can't log itself. An out-of-window anchor falls back to the `bar_seconds`
+    // divisor (wall-clock spacing across any gap in the un-fetched span) or, on
+    // a pre-`bar_seconds` plan, silently can't fire — both rare, neither should
+    // be invisible. Logged here (not in the engine crate, which has no rlog!).
+    for w in &eval.warnings {
+        rlog!("cron engine: plan {} {}", plan.trade_id, w);
+    }
+
     // Persist the advanced state (or clear it + the plan when the spine is
     // done) before dispatching, so a dispatch failure can't replay a fired bar.
     // Capture the transition (before/after/success/error) for the tick-bundle.

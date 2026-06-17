@@ -345,6 +345,25 @@ feed). Stays entirely off the other LLM's market-hours / KV-window worktree.
 - [x] BX3 — verified (workspace green / clippy / fmt / wasm32), README trendline
       gotcha note, CHANGELOG v34, validated on live ALPHABET feed before coding.
 
+### Stage E.8 — make the `bar_seconds` fallback observable (DONE — all green)
+
+The v34 `bar_seconds` divisor is a correct-but-silent fallback for an anchor
+outside the fetched window: it re-introduces wall-clock spacing across any gap
+in the un-fetched span, and on a pre-`bar_seconds` plan (`bar_seconds = 0`) it
+makes the trendline silently un-evaluable. Hardening = surface it, don't change
+the geometry. The pure evaluator can't log (no `rlog!` in the `engine` crate), so
+it returns warnings the wrapper logs.
+
+- [x] BH1 — `engine`: pure `trendline_anchor_warnings(plan, window)` classifies
+      each anchor (in-window / extrapolated / unresolvable); `evaluate_plan`
+      attaches them to new `PlanEval.warnings` (`core`, `#[serde(default)]`).
+      Six tests incl. end-to-end surfacing + the `bar_seconds = 0` non-fire case.
+- [x] BH2 — worker: `run_engine_tick` `rlog!`s each warning so the degraded path
+      is visible in CF logs; logged for live + shadow plans, before dispatch.
+- [x] BH3 — verified (workspace green / clippy / fmt / wasm32), README fallback
+      note, CHANGELOG v35. Follow-up: widen `detector_window_for` so anchors are
+      always in-window (retires the fallback) — deferred until logs show it.
+
 ### Stage F — retire the webhook (PENDING)
 ### Stage G — Durable Object websocket (only if demo proves a need) (PENDING)
 
