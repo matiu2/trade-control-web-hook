@@ -1707,3 +1707,24 @@ When this lands, the CLI gains a third subcommand `list-setups` — show all set
 `oanda-client` with a `BidAskDataSource: Send` regression — pre-existing,
 not introduced by anything in this repo. Needs an upstream fix in
 oanda-client before `wrangler deploy` will work again.
+
+---
+
+## TASK — `trade-control plan delete <plan-id>`
+
+Use case: re-plan a trade. `tv-arm` registers a server `TradePlan`; operator
+tweaks/deletes news lines in TradingView, then wants to wipe the server plan
+and re-arm. `plan delete` is the inverse of `register` — drops both the
+`plan:` row and its `plan-state:` row across every account scope (mirrors
+`plan show`'s all-scope scan). Idempotent: deleting a missing plan is a no-op.
+
+- [x] `core/src/intent.rs` — add `Action::PlanDelete` (kebab → `plan-delete`) + doc.
+- [x] `core/src/intent.rs` — `validate()` requires `trade_id` for `PlanDelete`; test.
+- [x] `cli/src/control.rs` — `build_plan_delete_intent(trade_id, now, suffix)`.
+- [x] `cli/src/lib.rs` — re-export it.
+- [x] `cli/src/bin/trade_control.rs` — `PlanCmd::Delete(PlanDeleteArgs)` + `run_plan_delete`.
+- [x] `cli/src/prompts.rs` — `PlanDelete` arm in `required_for_action`.
+- [x] `src/lib.rs` — dispatch + KV-only unreachable arm + `handle_plan_delete` (all-scope).
+- [x] README — document `plan delete`.
+- [x] workspace `cargo test` / clippy / fmt all green (incl. wasm `check`/`clippy`).
+- [ ] commit + push.

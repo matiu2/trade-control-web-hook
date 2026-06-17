@@ -248,6 +248,7 @@ pub async fn main(mut req: Request, env: Env, ctx: Context) -> Result<Response> 
             Action::Register => break 'intent handle_register(&store, &verified, now).await,
             Action::PlanList => break 'intent handle_plan_list(&store, &verified, now).await,
             Action::PlanShow => break 'intent handle_plan_show(&store, &verified, now).await,
+            Action::PlanDelete => break 'intent handle_plan_delete(&store, &verified, now).await,
             _ => {}
         }
 
@@ -550,6 +551,7 @@ async fn run_action<B: Broker>(
         | Action::Register
         | Action::PlanList
         | Action::PlanShow
+        | Action::PlanDelete
         // MarketInfo needs the concrete TradeNation broker (its `market_info`
         // is not on the generic `Broker` trait), so it's dispatched in the
         // broker-acquire section before this generic function — never here.
@@ -2824,6 +2826,63 @@ async fn handle_plan_show(
     };
     record_seen(store, verified, now, &format!("plan-show: {target}")).await;
     Response::ok(body)
+}
+
+/// Handle the `plan-delete` action: drop a registered plan and its engine
+/// state — the inverse of `register`. The target is named by
+/// `intent.trade_id`; we scan every account scope (as `plan-show` does) and
+/// delete each matching `plan:` + `plan-state:` row, so the operator can
+/// re-arm a setup after editing its chart. Idempotent and KV-only: a delete
+/// of a non-existent plan returns `ok` (count 0), never an error — re-running
+/// `plan delete` is always safe.
+async fn handle_plan_delete(
+    store: &KvStateStore,
+    verified: &incoming::Verified,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<Response> {
+    let Some(target) = verified.intent.trade_id.as_deref() else {
+        return Response::error("plan-delete requires a `trade_id`", 400);
+    };
+
+    let plans = match store.list_all_trade_plans().await {
+        Ok(v) => v,
+        Err(err) => {
+            rlog_err!("plan-delete: list_all_trade_plans: {err}");
+            return Response::error("state error", 500);
+        }
+    };
+
+    // Drop every scope that holds this trade_id. trade_ids are unique in
+    // practice, but if two scopes share one we clear both — nothing is left
+    // dangling. Each plan carries its own state row, so clear both per match.
+    let mut deleted = 0usize;
+    for stored in &plans {
+        if stored.plan.trade_id != target {
+            continue;
+        }
+        let account = stored.account.as_deref();
+        if let Err(err) = store.clear_trade_plan(account, target).await {
+            rlog_err!("plan-delete: clear_trade_plan({target}): {err}");
+            return Response::error("state error", 500);
+        }
+        if let Err(err) = store.clear_plan_state(account, target).await {
+            rlog_err!("plan-delete: clear_plan_state({target}): {err}");
+            return Response::error("state error", 500);
+        }
+        deleted += 1;
+        rlog!(
+            "plan-delete: trade_id={target} account={} deleted",
+            account.unwrap_or("<global>")
+        );
+    }
+
+    let outcome = if deleted == 0 {
+        format!("plan-deleted: {target} (noop)")
+    } else {
+        format!("plan-deleted: {target} ({deleted})")
+    };
+    record_seen(store, verified, now, &outcome).await;
+    Response::ok(outcome)
 }
 
 /// Resolve an [`OandaBroker`] for the request.
