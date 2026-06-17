@@ -980,11 +980,16 @@ binding. Both shadow (observe-only) and live ticks are recorded; a live tick's
 `dispatch_outcomes` carry each fire's broker result, while a shadow tick's is
 empty (it dispatches nothing).
 
-**Replaying a bundle.** The native CLI replays one offline:
+**Replaying a bundle.** Replay lives in the **`trade-analyzer`** CLI (in the
+`trading-tax-tracker` repo), *not* in `trade-control` — that's the downstream
+R2-recording consumer, and keeping replay there gives it a single home next to
+the bundle/timeline tooling. It replays one bundle offline, either from a local
+file or fetched straight from R2 by object key:
 
 ```sh
-trade-control replay <bundle.json>              # diff the pure evaluation
-trade-control replay --simulate <bundle.json>   # + simulate each enter's fill/exit
+trade-analyzer replay <bundle.json>                       # local file
+trade-analyzer replay --from-r2 ticks/<date>/<...>.json   # fetch from R2
+trade-analyzer replay --simulate <bundle.json>            # + simulate each enter's fill/exit
 ```
 
 `replay` re-runs the *same* `evaluate_plan` on the recorded inputs and diffs the

@@ -26,8 +26,7 @@ tracing = "0.1.44"
 trade-calendar-maker = { version = "0.1.0", path = "../../../trade-calendar-maker" }
 trade-control-conventions = { version = "0.1.0", path = "../conventions" }
 trade-control-core = { version = "0.1.0", path = "../core", features = ["cli"] }
-trade-control-engine = { version = "0.1.0", path = "../engine" }
-tradenation-api = { git = "https://github.com/matiu2/tradenation-api.git", tag = "broker-tradenation-v0.10.0", version = "0.3.0" }
+tradenation-api ={ git = "https://github.com/matiu2/tradenation-api.git", tag = "broker-tradenation-v0.10.0", version = "0.3.0" }
 tradenation-instrument-cache = { git = "https://github.com/matiu2/tradenation-api.git", tag = "broker-tradenation-v0.10.0", version = "0.2.0" }
 
 [dev-dependencies]

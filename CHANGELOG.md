@@ -1,5 +1,48 @@
 # Changelog
 
+## v37 — 2026-06-18 — Retire the `trade-control replay` subcommand (replay moves to `trade-analyzer`)
+
+### Why
+
+Replay's single home is now the `trade-analyzer` CLI (in the
+`trading-tax-tracker` repo) — that's the downstream R2-recording consumer, so
+replay sits next to the bundle/timeline tooling and gained an `--from-r2` fetch
+there (its v42). `trade-control` shipped a `replay` subcommand in v33 as the
+first landing spot; keeping a second copy here just risks the two drifting.
+This removes the duplicate. `trade-control` keeps what it *uniquely* owns: the
+worker that **writes** tick-bundles, and the `TickBundle` / `evaluate_plan` /
+`simulate_fill` library types that `trade-analyzer` consumes as path-deps.
+
+### What changed
+
+- **Removed `trade-control replay`** — deleted `cli/src/replay.rs`, its
+  `mod replay;` + `pub use replay::{…}` re-export from `cli/src/lib.rs`, and the
+  `Replay(ReplayArgs)` command variant + `Cmd::Replay` dispatch arm in
+  `cli/src/bin/trade_control.rs`.
+- **Dropped the `trade-control-engine` dependency from the `cli` crate** — it
+  was pulled in only for `simulate_fill`/`evaluate_plan` in the replay path.
+  The `engine` crate itself is unchanged; `trade-analyzer` depends on it
+  directly.
+
+### Breaking
+
+- `trade-control replay` no longer exists. Use `trade-analyzer replay` (same
+  bundle format; adds `--from-r2 <key>`).
+
+### Config
+
+- None.
+
+### Tests
+
+- No behaviour code changed; the migrated replay tests live in `trade-analyzer`.
+  Workspace tests / clippy `-D warnings` / fmt / wasm worker build remain green.
+
+### Follow-up
+
+- The candle-cache → ReplayBroker historical walk and multi-tick replay land in
+  `trade-analyzer`, not here.
+
 ## v36 — 2026-06-18 — Detector window reaches back to the earliest trendline anchor
 
 ### Why
