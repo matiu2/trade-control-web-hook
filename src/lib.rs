@@ -14,6 +14,7 @@ mod allow_entry_gate;
 mod candle_gate;
 mod cron;
 mod diag;
+mod market_blackout;
 mod market_info;
 mod retry_gate;
 mod spread_blackout;
@@ -39,7 +40,7 @@ use trade_control_core::broker::{Broker, EntryError, EntryRequest};
 use trade_control_core::incoming::{self, IncomingDisposition, parse_and_verify};
 use trade_control_core::intent::{
     Action, BrokerKind, Intent, MW_CANCEL_VETO_NAME, MwAnchors, MwUpdate, REVERSAL_VETO_NAME,
-    ResolveError, Resolved, Shell, VetoLevel, effective_mw_params, plan_mw_update,
+    ResolveError, Resolved, Shell, VetoLevel, effective_mw_params, is_inside_any, plan_mw_update,
 };
 use trade_control_core::rules::{self, RuleError};
 use trade_control_core::sig;
@@ -1492,6 +1493,52 @@ pub(crate) async fn run_enter<B: Broker>(
             }
         }
     };
+
+    // Market-hours entry blackout (System 1, the reject gate): reject a
+    // brand-new entry that fires inside this instrument's daily close→open
+    // gap, so a resting stop order is never left to trigger on the reopen
+    // liquidity gap (the incident this feature fixes). The per-instrument
+    // UTC no-entry windows are derived once a day by the 06:00 UTC cron
+    // (`src/cron/blackout_hours.rs`) from the broker's session hours and
+    // stored in KV. This is a pure KV read + a minute-of-day comparison —
+    // no broker round-trip — so it sits ahead of the (broker-touching)
+    // spread-blackout gate below.
+    //
+    // REJECT, NOT a delay (same discipline as spread-blackout): no KV
+    // write, no re-fire scheduled. The next signal bar re-triggers and
+    // re-runs this check — once the market has reopened the same entry
+    // passes. Returning `ActionResult::Rejected` is a `Skip` in
+    // `seen_decision` (no `mark_seen`), so this reject never poisons the
+    // intent id; the in-hours refire is allowed through. See CLAUDE.md
+    // "Replay protection scope". Do NOT add any KV write on this path.
+    //
+    // FAIL OPEN: a KV read hiccup, or an instrument with no derived
+    // windows (24h / unparseable / not-yet-refreshed), must never block a
+    // legitimate entry — `get_blackout_windows` returns an empty Vec in
+    // those cases and `is_inside_any` is then always `false`.
+    match store.get_blackout_windows(&resolved.instrument).await {
+        Err(err) => {
+            rlog_err!(
+                "market-blackout: windows read failed for {} (id={}): {err} — failing open (allowing entry)",
+                resolved.instrument,
+                verified.intent.id
+            );
+        }
+        Ok(windows) => {
+            let now_min = market_blackout::now_utc_minute_of_day(now);
+            if is_inside_any(now_min, &windows) {
+                rlog!(
+                    "entry rejected: market-blackout instrument={} now_utc_min={now_min} windows={windows:?} (id={})",
+                    resolved.instrument,
+                    verified.intent.id
+                );
+                return ActionResult::Rejected {
+                    response: Response::error("entry blocked: market-hours blackout", 423),
+                    outcome: "rejected: market-blackout".into(),
+                };
+            }
+        }
+    }
 
     // System 1 of the spread blackout: reject a brand-new entry that
     // fires during the post-NY-close liquidity trough when the live
@@ -3823,6 +3870,7 @@ mod dispatcher_outcome_tests {
             "rejected: price-fetch-failed",
             "rejected: expiry-bars-out-of-range",
             "rejected: expiry-bars-script-parse",
+            "rejected: market-blackout",
         ];
         // Use Failed as the carrier — the decision rule treats
         // Failed and Rejected identically (both Skip), and Failed is

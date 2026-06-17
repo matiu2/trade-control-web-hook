@@ -38,11 +38,19 @@ reject gate covers both. Plan: `~/.home-claude/plans/market-hours-entry-blackout
       (26h TTL). Per-instrument failures log + continue. Wired into `src/cron.rs`.
       Tests: 10 deriver tests incl. real WS30 two-gap-merge + Brisbane→UTC +
       fail-open paths. WASM + native build green.
-- [ ] **Commit 4 — worker reject gate in `run_enter`.** Mirror `spread_blackout`;
-      read `get_blackout_windows(instrument)`, `is_inside_any(now_utc_min, &ws)`
-      → 423 `market-blackout`, no KV write / no seen poison. Covers webhook AND
-      engine (engine dispatches through `run_enter`). MemStateStore handler tests
-      (uses the new `test-support` feature from main).
+- [x] **Commit 4 — worker reject gate in `run_enter`.** New `src/market_blackout.rs`
+      holds the pure `now_utc_minute_of_day(now)` helper (5 unit tests); the gate in
+      `run_enter` reads `get_blackout_windows(&resolved.instrument)`, and if
+      `is_inside_any(now_utc_min, &windows)` returns `ActionResult::Rejected` →
+      423 `market-blackout`. NO KV write / no seen poison (Rejected → Skip in
+      `seen_decision`; `"rejected: market-blackout"` added to the
+      `every_rejection_outcome_classifies_as_skip` pin). Fail-open on KV read
+      error and on empty windows (24h / unparseable / not-yet-refreshed). Sits
+      ahead of the (broker-touching) spread-blackout gate since it's KV-only.
+      Covers webhook AND engine (both dispatch through `run_enter`). Note: a
+      `run_enter`-level handler test isn't feasible off-wasm (`KvStateStore` /
+      `worker::Response` need wasm-bindgen) — coverage is the pure helper +
+      `is_inside_any`/`windows_from_session` in core + the seen-decision pin.
 - [ ] **Commit 5 — cron sweep close action.** Persist `blackout_close` onto the
       `EntryAttempt`; `market_blackout_due` predicate branch before SL-breach;
       `CancelResting` cancels resting order, `CancelAndClose` also

@@ -1298,6 +1298,61 @@ This wraps `wrangler secret put TN_ACCOUNT_MY_TN_DEMO` and writes the
 metadata entry in KV. After that, intents with `account: my-tn-demo`
 route through that account; the worker handles session lifecycle.
 
+### Market-hours entry blackout
+
+A separate, simpler cousin of the spread-blackout above. It fixes a real
+incident: an entry candle closed right at a US-index rolling-future's daily
+close, the worker placed a **resting stop order** after the candle closed,
+the order sat through the whole closed session, and triggered on the next
+open's gap — getting stopped out on a move that never traded while the
+market was open. The fix has two halves:
+
+1. **A reject gate** (this commit) — block a *new* entry that fires inside
+   the instrument's daily close→open gap, so no fresh resting order is
+   placed into a market that's about to close.
+2. **A cron sweep** (a later commit) — act on a still-pending resting order
+   per the operator's chosen `blackout_close` policy.
+
+The per-instrument no-entry windows are **UTC minute-of-day ranges** derived
+once a day by a 06:00 UTC cron (`src/cron/blackout_hours.rs`) from the
+broker's session hours and stored in KV under `blackout-hours:<instrument>`.
+One window is emitted **per close→open gap** (a market can have several in a
+day, e.g. a maintenance gap plus the overnight gap), buffered `[close −3h …
+open +1h]` and merged where they overlap. Brisbane→UTC is fixed `−600 min`
+arithmetic (Brisbane is UTC+10, no DST); the DST correctness is inherited
+from the broker feed's London→Brisbane conversion, so the worker links no
+timezone tables. This is **distinct** from the spread-blackout's
+reduced-liquidity "spread hour" — that's handled by the feature above; this
+one only covers genuine close→open gaps.
+
+#### Reject gate — block new entries inside the window
+
+When an `enter` resolves, the worker reads the instrument's stored windows
+and compares `now`'s UTC minute-of-day against them. If `now` falls inside
+any window it rejects:
+
+- **Outcome:** `rejected: market-blackout`, **HTTP 423 Locked** (same family
+  as pause / cooldown / spread-blackout — the intent is valid, the condition
+  is transient, a later fire can succeed).
+- **Cheap, KV-only.** It's a single KV read plus a minute comparison — no
+  broker round-trip — so it sits **ahead** of the (broker-touching)
+  spread-blackout gate.
+- **Reject, NOT delay.** Nothing is persisted and no re-fire is queued. The
+  next signal bar re-triggers the alert and re-runs the check — once the
+  market has reopened the same entry passes.
+- **Does NOT consume the intent id.** Like every `Rejected`, this is a `Skip`
+  in the replay-dedup path (no `mark_seen`), so the in-hours refire is
+  allowed through (see "Replay protection scope" in `CLAUDE.md`).
+- **Fail-open.** A KV read error, or an instrument with no derived windows
+  (24-hour markets, unparseable session text, or windows not yet refreshed),
+  yields an empty window set and the gate is a no-op — a transient hiccup
+  must never block a legitimate trade.
+
+Both the webhook and the server-side trade-plan engine dispatch entries
+through `run_enter`, so this one gate covers both paths. The buffer defaults
+(3h before close, 1h after open) live in `Buffers::default()`
+(`core/src/intent/blackout/derive.rs`).
+
 ### Local TN store vs server-side account list
 
 Two account namespaces exist:
