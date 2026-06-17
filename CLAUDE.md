@@ -251,6 +251,18 @@ registered in the parent's `.gitmodules`. So:
 - Updating: commit + push *inside* this repo first, then in the parent
   `git add trade-control-web-hook && git commit && git push` to advance
   the pointer.
+- **Always advance the parent pointer after merging to `main` here.** A
+  merge to this repo's `main` is not "done" until the parent gitlink is
+  bumped and pushed — otherwise the parent still points at the old commit
+  and a fresh `trading-libraries` checkout gets stale code. So the tail of
+  every merge-to-main is:
+  ```sh
+  cd /home/matiu/projects/trading-libraries
+  git add trade-control-web-hook && \
+    git commit -m "bump trade-control-web-hook: <what merged>" && git push
+  ```
+  Do this immediately, same as the commit+push+tag-by-default rule — don't
+  wait for the user to ask.
 - The parent's `CLAUDE.md` (long architectural doc) lists this repo
   under "regular directories" — that note is outdated; treat it as a
   submodule.
