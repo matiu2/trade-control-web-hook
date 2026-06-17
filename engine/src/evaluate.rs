@@ -661,6 +661,7 @@ mod tests {
             granularity: Granularity::H1,
             pip_size: 0.0001,
             rules,
+            shadow: false,
         }
     }
 

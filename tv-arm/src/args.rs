@@ -79,6 +79,16 @@ pub struct Args {
     #[arg(long)]
     pub register_plan: bool,
 
+    /// Register the plan in **observe-only (shadow) mode**: the server-side
+    /// engine evaluates it and advances its state exactly as a live plan, but
+    /// never dispatches its fires to the broker — each would-be fire is logged
+    /// instead. This is the safe way to run the engine alongside the live TV
+    /// alerts on demo (Stage F gate): both see the same candles, only the TV
+    /// alert places real orders, so engine-vs-alert can be diffed without
+    /// double-firing. Only meaningful with `--register-plan`. Default: live.
+    #[arg(long)]
+    pub shadow: bool,
+
     /// Opt in to multi-shot entries: if the broker rejects the order
     /// (e.g. spread too wide), the worker will retry on subsequent
     /// enter-alert firings up to this many times. Default (flag

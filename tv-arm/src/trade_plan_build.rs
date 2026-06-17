@@ -64,6 +64,15 @@ pub fn resolution_to_granularity(resolution: &str) -> Option<Granularity> {
 /// - `granularity` is the chart timeframe (via [`resolution_to_granularity`]).
 /// - `is_mw` switches the `05-enter` rule between the H&S pattern trigger and
 ///   the M/W per-bar heartbeat, mirroring `build_alert_spec`.
+/// - `shadow` registers the plan observe-only: the engine evaluates and
+///   advances it but never dispatches its fires to the broker (see
+///   [`TradePlan::shadow`](trade_control_core::trade_plan::TradePlan::shadow)).
+///   The safe way to diff the engine against the live TV alerts on demo.
+// Eight parameters: each is a distinct chart-derived primitive (id, instrument,
+// alerts, direction, roles, granularity, is_mw, shadow) threaded once from the
+// single pipeline call site. Grouping them into a struct would just move the
+// same fields elsewhere without clarifying anything.
+#[allow(clippy::too_many_arguments)]
 pub fn build_trade_plan(
     trade_id: &str,
     instrument: &str,
@@ -72,6 +81,7 @@ pub fn build_trade_plan(
     roles: &Roles,
     granularity: Granularity,
     is_mw: bool,
+    shadow: bool,
 ) -> TradePlan {
     let rules = alerts
         .iter()
@@ -85,6 +95,7 @@ pub fn build_trade_plan(
         granularity,
         pip_size: pip_size_of(alerts),
         rules,
+        shadow,
     }
 }
 
@@ -497,8 +508,10 @@ mod tests {
             &roles,
             Granularity::H1,
             false,
+            false,
         );
 
+        assert!(!plan.shadow, "default build is live, not shadow");
         assert_eq!(plan.trade_id, "eurusd-hs-1");
         assert_eq!(plan.granularity, Granularity::H1);
         assert_eq!(plan.direction, Direction::Short);
@@ -595,6 +608,7 @@ mod tests {
             &roles,
             Granularity::H1,
             true,
+            false,
         );
         let by_id = |id: &str| plan.rules.iter().find(|r| r.rule_id == id).unwrap();
 
@@ -639,7 +653,26 @@ mod tests {
             &Roles::default(),
             Granularity::H1,
             false,
+            false,
         );
         assert!(plan.rules.is_empty());
+    }
+
+    /// `shadow=true` is carried through onto the built plan, so a
+    /// `--register-plan --shadow` arm produces an observe-only plan.
+    #[test]
+    fn shadow_flag_carried_onto_plan() {
+        let alerts = vec![alert("05-enter", Action::Enter)];
+        let plan = build_trade_plan(
+            "t",
+            "EUR_USD",
+            &alerts,
+            ConvDirection::Short,
+            &Roles::default(),
+            Granularity::H1,
+            true,
+            true,
+        );
+        assert!(plan.shadow, "shadow=true must reach the built plan");
     }
 }

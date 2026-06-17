@@ -598,6 +598,7 @@ mod tests {
                 fire_mode: FireMode::Once,
                 intent: rule_intent,
             }],
+            shadow: false,
         }
     }
 

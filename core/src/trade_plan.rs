@@ -69,6 +69,20 @@ pub struct TradePlan {
     /// The conditions to evaluate. Order is informational only — the engine
     /// evaluates every not-yet-latched rule each tick.
     pub rules: Vec<ConditionRule>,
+    /// Observe-only mode. When `true`, the engine evaluates the plan and
+    /// advances its [`PlanState`](crate::plan_state::PlanState) exactly as a
+    /// live plan, but **does not dispatch** fired intents to the broker — each
+    /// fire is logged as a `SHADOW would-fire` line instead. This is the safe
+    /// way to run the engine alongside the live TradingView alerts on demo (the
+    /// Stage F gate): both observe the same candles, but only the TV alert
+    /// places real orders, so the two can be diffed without double-firing.
+    ///
+    /// Signed as part of the plan (it rides the whole-body HMAC), so a plan's
+    /// shadow/live status can only be set at arm time, not flipped in flight.
+    /// `#[serde(default)]` so plans registered before this field existed
+    /// deserialize as **live** (`false`).
+    #[serde(default)]
+    pub shadow: bool,
 }
 
 /// One condition + the intent it fires. The engine evaluates [`trigger`] each
@@ -280,5 +294,29 @@ mod tests {
         };
         let back: Trigger = serde_yaml::from_str(&serde_yaml::to_string(&t).unwrap()).unwrap();
         assert_eq!(back, t);
+    }
+
+    /// The `shadow` flag survives a JSON round-trip when set.
+    #[test]
+    fn shadow_flag_round_trips() {
+        let json = r#"{"trade_id":"t-1","instrument":"EUR_USD","direction":"short",
+            "granularity":"h1","pip_size":0.0001,"rules":[],"shadow":true}"#;
+        let plan: TradePlan = serde_json::from_str(json).unwrap();
+        assert!(plan.shadow);
+        let back: TradePlan = serde_json::from_str(&serde_json::to_string(&plan).unwrap()).unwrap();
+        assert!(back.shadow, "shadow flag should survive a round-trip");
+    }
+
+    /// A plan registered before the `shadow` field existed (no `shadow` key in
+    /// the wire body) must deserialize as **live** — `#[serde(default)]` → false.
+    #[test]
+    fn missing_shadow_defaults_to_live() {
+        let json = r#"{"trade_id":"t-1","instrument":"EUR_USD","direction":"short",
+            "granularity":"h1","pip_size":0.0001,"rules":[]}"#;
+        let plan: TradePlan = serde_json::from_str(json).unwrap();
+        assert!(
+            !plan.shadow,
+            "absent shadow key must default to live (false)"
+        );
     }
 }

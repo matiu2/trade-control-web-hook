@@ -192,6 +192,7 @@ pub fn run(args: Args) -> Result<i32> {
             &state.resolution,
             &key,
             now,
+            args.shadow,
         )?;
     }
 
@@ -1281,6 +1282,7 @@ fn register_trade_plan(
     resolution: &str,
     key: &[u8; KEY_LEN],
     now: DateTime<Utc>,
+    shadow: bool,
 ) -> Result<()> {
     use cli::TradePattern;
     let is_mw = matches!(built_trade.spec.pattern, TradePattern::M | TradePattern::W);
@@ -1298,6 +1300,7 @@ fn register_trade_plan(
         roles,
         granularity,
         is_mw,
+        shadow,
     );
     let rule_count = plan.rules.len();
     // Mint a fresh register intent carrying the plan, sign it, POST it.
@@ -1309,6 +1312,7 @@ fn register_trade_plan(
         instrument = %built_trade.instrument,
         granularity = ?granularity,
         rules = rule_count,
+        shadow = shadow,
         "registering server-side trade plan",
     );
     post_register_blocking(body).wrap_err("register trade plan with worker")?;

@@ -19,6 +19,17 @@
 //! [`seed_plan_state`], persists it, and dispatches nothing. The *next* tick
 //! evaluates only genuinely-new candles.
 //!
+//! # Shadow (observe-only) plans
+//!
+//! A plan registered with [`shadow`](trade_control_core::trade_plan::TradePlan::shadow)
+//! `= true` is evaluated and its [`PlanState`] advanced **identically** to a
+//! live plan — same candles, same FSM, same watermark — but its fired intents
+//! are **never dispatched**: each is logged as a `SHADOW would-fire` line
+//! instead (see [`log_shadow_fire`]). This is the safe way to run the engine
+//! beside the live TradingView alerts on demo (the Stage F gate): both observe
+//! the same bars, but only the TV alert places real orders, so the engine's
+//! decisions can be diffed against the alert without any double-firing.
+//!
 //! # Fail-soft per plan
 //!
 //! Like the sweep, a single plan's failure (broker fetch, KV write, dispatch)
@@ -152,10 +163,35 @@ async fn tick_one(
         return Err(format!("put_plan_state: {err}"));
     }
 
+    // Shadow plans observe only: the state above advanced exactly as a live
+    // plan would, but we never touch the broker or the seen-id index — each
+    // would-be fire is logged so it can be diffed against the live TV alert.
+    if plan.shadow {
+        for fired in &eval.fired {
+            log_shadow_fire(&plan.trade_id, fired);
+        }
+        return Ok(());
+    }
+
     for fired in &eval.fired {
         dispatch_fired(env, store, &broker, fired, now).await;
     }
     Ok(())
+}
+
+/// Log a fired intent that a shadow plan suppressed. Mirrors the structured
+/// fields of [`dispatch_fired`]'s `cron engine fired` line (minus the broker
+/// outcome, which never happened) so a log scrape can diff `SHADOW would-fire`
+/// against the live TV alert's actual placement on the same candle.
+fn log_shadow_fire(trade_id: &str, fired: &trade_control_engine::FiredIntent) {
+    rlog!(
+        "cron engine SHADOW would-fire: trade_id={} rule={} action={:?} id={} candle_time={} (observe-only, no broker)",
+        trade_id,
+        fired.rule_id,
+        fired.intent.action,
+        fired.intent.id,
+        fired.candle.time,
+    );
 }
 
 /// First-tick seed: fetch a back-window, seed the state without firing, persist.

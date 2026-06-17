@@ -1,5 +1,56 @@
 # Changelog
 
+## v31 — 2026-06-17 — Engine shadow mode (observe-only plans for the safe parallel run)
+
+### Why
+
+The server-side engine dispatches a registered plan's fired intents through the
+*same* `run_enter` / `run_close` / veto handlers the webhook uses. So a live
+(non-shadow) registered plan would place **real broker orders in parallel with
+the live TradingView alerts** — double-firing every setup. But the Stage F
+promotion gate is to *diff* the engine's decisions against the live alerts on
+demo, not to trade the setup twice. There was no safe way to run the two side
+by side; shadow mode is it.
+
+### What changed
+
+- New signed field **`TradePlan.shadow: bool`** (`core/src/trade_plan.rs`,
+  `#[serde(default)]` → live for plans registered before the field existed).
+  It rides the existing whole-body HMAC, so a plan's shadow/live status is
+  fixed at arm time and can't be flipped in flight.
+- The cron engine (`src/cron/engine.rs`) honours it: a shadow plan is evaluated
+  and its `PlanState` advanced **identically** to a live plan (same candles,
+  same FSM, same watermark), but each fired intent is logged as a
+  `cron engine SHADOW would-fire:` line instead of being dispatched — no broker
+  order, no seen-id mark.
+- `tv-arm` gains **`--shadow`** (`tv-arm/src/args.rs`), threaded through
+  `register_trade_plan` → `build_trade_plan` so `--register-plan --shadow`
+  registers an observe-only plan. The arm-time `info!` log now reports
+  `shadow=…`.
+
+### Breaking
+
+- `tv_arm::trade_plan_build::build_trade_plan` gains a trailing `shadow: bool`
+  parameter. Internal to this repo; the only caller is the tv-arm pipeline.
+
+### Config
+
+- New CLI flag `tv-arm --shadow` (default off → live). Only meaningful with
+  `--register-plan`.
+
+### Tests
+
+- `core`: `shadow_flag_round_trips`, `missing_shadow_defaults_to_live`.
+- `tv-arm`: `shadow_flag_carried_onto_plan`, plus the existing builder tests
+  assert the default build is live.
+
+### Follow-up
+
+- Run a demo setup with `--register-plan --shadow` beside the live TV alerts
+  and diff the `SHADOW would-fire` log lines against the alerts' actual
+  placements — the empirical Stage F gate. This also produces the recorded-fire
+  dataset the H&S historical-replay parity follow-up needs.
+
 ## v30 — 2026-06-17 — H&S Pine candle detector ported to Rust (server-side `PinePattern`, Stage E)
 
 ### Why

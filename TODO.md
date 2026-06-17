@@ -282,6 +282,33 @@ recorded Pine fires (esp. the ADIDAS bug-10B case, where the closed-bar
 confirm intentionally diverges). Needs the recorded-Pine-fire dataset
 assembled first.
 
+### Stage E.5 — engine shadow mode (DONE — all green)
+
+Prereq for the Stage F gate: the engine dispatches through the *same*
+`run_enter`/`run_close` handlers as the webhook, so a live registered plan
+would place **real orders in parallel with the live TV alerts** — double-firing
+every setup. Shadow mode lets the engine run beside the alerts observe-only, so
+its decisions can be diffed without trading twice.
+
+- [x] `core/src/trade_plan.rs` — new signed `TradePlan.shadow: bool`
+      (`#[serde(default)]` → live for pre-existing plans). Round-trip + default
+      tests.
+- [x] `src/cron/engine.rs` — `tick_one` evaluates + advances `PlanState`
+      identically for a shadow plan, but logs each fire as
+      `cron engine SHADOW would-fire:` (`log_shadow_fire`) instead of
+      dispatching — no broker, no seen-id mark.
+- [x] `tv-arm` — `--shadow` flag (`args.rs`) threaded through
+      `register_trade_plan` → `build_trade_plan`; arm-time log reports `shadow=`.
+      Builder test asserts the flag carries onto the plan.
+- [x] core 502 / engine 28 / worker 200 green; clippy + fmt + wasm32 clean.
+      README + CHANGELOG (v31) updated.
+
+**Next:** run a demo setup with `--register-plan --shadow` beside the live TV
+alerts; scrape the `SHADOW would-fire` lines from CF Real-time Logs and diff
+against the alerts' actual placements. That parallel run is the empirical
+Stage F gate and also produces the recorded-fire dataset the H&S
+historical-replay parity follow-up needs.
+
 ### Stage F — retire the webhook (PENDING)
 ### Stage G — Durable Object websocket (only if demo proves a need) (PENDING)
 

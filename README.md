@@ -188,9 +188,12 @@ The day-to-day loop, end to end:
      `--register-plan`), fetches the broker candles closed since each
      plan's watermark, runs the per-trade FSM evaluator, and dispatches
      any fired intents through the *same* `run_enter` / `run_close` /
-     veto handlers the webhook uses. It runs **in parallel** with the TV
-     alerts (no behaviour change to existing trades) until proven on
-     demo; the `*/15` cadence stays for now. A plan's first tick *seeds*
+     veto handlers the webhook uses — unless the plan is registered with
+     `--shadow`, in which case it evaluates and advances state but only
+     *logs* its would-be fires (the safe way to run beside the live TV
+     alerts; a live plan would double-fire — see `--register-plan`). It
+     runs **in parallel** with the TV alerts until proven on demo; the
+     `*/15` cadence stays for now. A plan's first tick *seeds*
      its watermark without firing, so conditions already true at register
      don't back-fire. Both strategy families are now evaluated
      server-side: **M/W** fires the enter heartbeat every closed bar
@@ -1553,7 +1556,8 @@ cargo run -p tv-arm -- \
   --require-golden \                  # require Pine golden-candle signal on entry
   --require-confirmation \            # require a confirmed signal candle on entry (independent of golden)
   --create-alerts \                   # POST to TradingView; omit to only write the signed bundle to disk
-  --register-plan                     # experimental: also register one signed TradePlan with the server-side engine
+  --register-plan \                   # experimental: also register one signed TradePlan with the server-side engine
+  --shadow                            # register observe-only: engine evaluates + logs, but never places orders (safe parallel run)
 ```
 
 Run `tv-arm --help` for the full flag surface — it has diverged from the
@@ -1588,7 +1592,24 @@ the `*/15` tick, **in parallel** with the TV alerts, and evaluates both M/W
 (per-bar enter heartbeat) and H&S (the Rust port of the
 `candle-signals-v2.pine` detector) entries plus the trendline / level / time
 triggers and vetos. The TradingView alert path still runs alongside it until
-the engine is proven on demo (Stage F retires the alerts). The plan builder
+the engine is proven on demo (Stage F retires the alerts).
+
+> **Run it in shadow mode for the parallel period.** A live (non-shadow) plan
+> dispatches its fired intents through the *same* `run_enter` / `run_close`
+> handlers the webhook uses — so a registered live plan would place **real
+> broker orders in parallel with the TV alerts**, double-firing every setup.
+> The Stage F gate is to *diff* the engine's decisions against the live alerts,
+> not to trade twice. Register with **`--shadow`**: the engine evaluates the
+> plan and advances its `PlanState` identically to a live plan, but logs each
+> would-be fire as a `cron engine SHADOW would-fire:` line instead of touching
+> the broker (no order, no seen-id mark). Scrape those lines from the
+> Cloudflare Real-time Logs and compare them to what the TV alert actually
+> placed on the same candle. The shadow/live choice is baked into the signed
+> plan at arm time, so it can't be flipped in flight — re-arm to promote a
+> proven setup to live. (Field: `TradePlan.shadow`, `#[serde(default)]` → live
+> for plans registered before the flag existed.)
+
+The plan builder
 is `tv-arm/src/trade_plan_build.rs` (the inverse of `alert_spec.rs`); the
 `TradePlan` / `Trigger` model lives in `core/src/trade_plan.rs`; per-trade
 engine state is `core/src/plan_state.rs`; the FSM evaluator is
