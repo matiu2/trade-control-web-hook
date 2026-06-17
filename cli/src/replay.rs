@@ -22,8 +22,9 @@ use std::path::{Path, PathBuf};
 
 use clap::Parser;
 use color_eyre::eyre::{Context, Result, eyre};
+use trade_control_core::intent::{Action, Shell};
 use trade_control_core::tick_bundle::TickBundle;
-use trade_control_engine::evaluate_plan;
+use trade_control_engine::{evaluate_plan, simulate_fill};
 
 /// Args for the `replay` subcommand.
 #[derive(Parser)]
@@ -31,6 +32,13 @@ pub struct ReplayArgs {
     /// Path to a recorded tick-bundle JSON file (a `ticks/.../<...>.json`
     /// object, fetched from R2 or a local fixture).
     pub bundle: PathBuf,
+
+    /// Also simulate each fired enter's fill/exit against the bundle's recorded
+    /// candle path (the pure broker-simulator). Reports filled / stopped /
+    /// took-profit / never-filled per fired enter — price-path only, not the
+    /// worker's sizing or gate dispatch.
+    #[arg(long)]
+    pub simulate: bool,
 }
 
 /// Load a tick-bundle from a JSON file.
@@ -121,6 +129,9 @@ pub fn run_replay(args: ReplayArgs) -> Result<()> {
             println!("    [{}] {} → {}", o.seq, o.rule_id, o.outcome);
         }
     }
+    if args.simulate {
+        print_simulation(&bundle);
+    }
     if report.matched {
         println!("MATCH — the pure evaluation is unchanged.");
         Ok(())
@@ -128,6 +139,39 @@ pub fn run_replay(args: ReplayArgs) -> Result<()> {
         Err(eyre!(
             "MISMATCH — the replay diverged from the recorded tick"
         ))
+    }
+}
+
+/// Simulate each recorded fired **enter** against the bundle's candle path and
+/// print the fill/exit outcome. Non-enter fires (vetos, preps, closes) carry no
+/// order, so they're skipped. Candles within a single tick-bundle are a short
+/// window, so an enter often shows `filled (still open)` or `never filled` —
+/// the multi-tick fill story emerges from replaying a trade's whole `ticks/`
+/// prefix in sequence (a later convenience).
+fn print_simulation(bundle: &TickBundle) {
+    let enters: Vec<_> = bundle
+        .eval
+        .fired
+        .iter()
+        .filter(|f| f.intent.action == Action::Enter)
+        .collect();
+    if enters.is_empty() {
+        println!("  simulate: no fired enters in this tick");
+        return;
+    }
+    println!("  simulate (price-path fills over this tick's candles):");
+    for fired in enters {
+        let shell = match &fired.signal {
+            Some(sig) => Shell::from_candle_and_signal(&fired.candle, sig),
+            None => Shell::from_candle(&fired.candle),
+        };
+        let outcome = simulate_fill(
+            &fired.intent,
+            &shell,
+            bundle.plan.pip_size,
+            &bundle.detector_window,
+        );
+        println!("    {} → {:?}", fired.rule_id, outcome);
     }
 }
 

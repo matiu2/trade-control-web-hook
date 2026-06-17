@@ -969,13 +969,28 @@ Each bundle carries the pure replay tuple `evaluate_plan` consumed — the
 `plan`, the prior `PlanState`, the `new_candles` + detector back-window, and the
 tick `now`/`expires_at` — plus the golden `PlanEval` output (`fired` /
 `new_state` / `done`), the per-fire dispatch outcomes, and the plan-state
-`KvTickTransition` (before/after/success/error). Replaying a bundle re-runs the
-same `evaluate_plan` offline and diffs the result — a recorded tick becomes a
-deterministic regression test. Same fire-and-forget `wait_until` + fail-soft
-contract as request recording; same `TRADE_CONTROL_R2` binding. Both shadow
-(observe-only) and live ticks are recorded; a live tick's `dispatch_outcomes`
-carry each fire's broker result, while a shadow tick's is empty (it dispatches
-nothing).
+`KvTickTransition` (before/after/success/error). Same fire-and-forget
+`wait_until` + fail-soft contract as request recording; same `TRADE_CONTROL_R2`
+binding. Both shadow (observe-only) and live ticks are recorded; a live tick's
+`dispatch_outcomes` carry each fire's broker result, while a shadow tick's is
+empty (it dispatches nothing).
+
+**Replaying a bundle.** The native CLI replays one offline:
+
+```sh
+trade-control replay <bundle.json>              # diff the pure evaluation
+trade-control replay --simulate <bundle.json>   # + simulate each enter's fill/exit
+```
+
+`replay` re-runs the *same* `evaluate_plan` on the recorded inputs and diffs the
+fresh `fired` / `new_state` / `done` against the recorded `eval` — a recorded
+tick becomes a deterministic regression test (non-zero exit on any mismatch, so
+it gates in CI). `--simulate` additionally resolves each fired enter's
+entry/SL/TP (via the pure resolver) and walks the bundle's candle path through a
+dumb broker-simulator, reporting filled / stopped-out / took-profit /
+never-filled. The pure-evaluation diff validates the *decision* logic; the
+simulator the *price-path* — neither runs the worker's broker-dispatch glue
+(sizing, seen-id, gates), which is a later step.
 
 ## Brokers
 

@@ -42,11 +42,17 @@ No deploy to staging/prod. Each step its own green commit (test + clippy + fmt +
 - [x] Gate: workspace tests green (cli 239); clippy -D warnings clean; fmt
 - note: vNN tag + CHANGELOG deferred to after step (f) — a–f is one release (next is v33)
 
-## (f) broker-simulator for fill replay
-- [ ] implements Broker trait; candles from recorded new_candles, not refetched
-- [ ] replay also diffs dispatch_outcomes
-- [ ] Gate: test + clippy + fmt → commit
+## (f) broker-simulator for fill replay — DONE (commit pending)
+- [x] engine/src/simulator.rs: pure simulate_fill (resolves via core, fills from recorded candles)
+      SimOutcome = NeverFilled / FilledOpen / StoppedOut / TookProfit / Unresolved
+- [x] `replay --simulate` resolves each fired enter + walks candle path; prints outcome
+- [x] 3 unit tests (TP/SL/never/open + ambiguous→pessimistic-stop) + binary smoke (fill→TP)
+- [SCOPED OUT] full Broker-trait impl + dispatch_outcomes replay through run_enter/run_close:
+      blocked by worker::Response panicking off-wasm (handlers are pub(crate) in the cdylib).
+      Documented as Follow-up in CHANGELOG v33. User-approved: build simulator, defer dispatch replay.
+- [x] Gate: workspace tests green (engine 31); clippy -D warnings clean; fmt; wasm + worker-build OK
 
-## Cross-cutting
-- [ ] CHANGELOG + vNN tag per crate when (a)/(b), (c), (e) green
-- [ ] README event-format note: tick-bundles under ticks/ prefix (sibling to req/)
+## Cross-cutting — DONE
+- [x] CHANGELOG v33 + README replay/--simulate + ticks/ prefix notes
+- [ ] vNN tag v33 (apply on final commit)
+- [ ] update memory `bundle_replay_harness_state` → engine-era harness landed on feat/engine-tick-replay

@@ -1,5 +1,68 @@
 # Changelog
 
+## v33 — 2026-06-17 — Engine tick-bundles: record cron ticks to R2 + native replay
+
+### Why
+
+After the rearchitecture the cron engine — not an inbound TradingView alert — is
+where every trading decision happens (it loads each registered `TradePlan`,
+pulls fresh candles, runs the pure `evaluate_plan`, dispatches the fired
+intents). But the tick recorded **nothing**, so there was no way to replay a
+real engine decision offline. This collapses the bug-fix loop from a week on
+demo to a second in CI: fix a bug, replay the tick that showed it, watch the
+outcome change.
+
+### What changed
+
+- **`TickBundle`** (`core/src/tick_bundle.rs`) — a self-contained,
+  serde-round-trippable record of one `(tick, plan)`: the full `evaluate_plan`
+  input tuple (`plan`, prior `PlanState`, `new_candles`, detector window,
+  `now`/`expires_at`) + golden `PlanEval` output + per-fire `DispatchOutcome`s +
+  the plan-state `KvTickTransition` (before/after/success/error).
+- **Recording** — the cron tick now writes a bundle per evaluated plan to R2
+  under a new **`ticks/<date>/<tick_ts>-<trade_id>.json`** prefix (sibling to
+  `req/`, same `TRADE_CONTROL_R2` bucket), fire-and-forget via `ctx.wait_until`,
+  fail-soft on every axis (`src/tick_recording.rs`). Both shadow and live ticks.
+- **`trade-control replay <bundle.json>`** — re-runs the same `evaluate_plan` and
+  diffs `fired`/`new_state`/`done` against the recorded `eval`; non-zero exit on
+  mismatch (CI gate). `--simulate` additionally resolves each fired enter and
+  walks the candle path through a dumb broker-simulator
+  (`engine/src/simulator.rs`), reporting filled / stopped-out / took-profit /
+  never-filled.
+
+### Breaking
+
+- `FiredIntent` / `PlanEval` definitions moved from `trade-control-engine` to
+  `trade_control_core::plan_eval` (re-exported from `engine`, so `evaluate_plan`'s
+  signature is unchanged). `Candle`, `LatchedSignal`, `FiredIntent`, `PlanEval`
+  gained `Serialize`/`Deserialize`.
+- `run_engine_tick` / `tick_one` now take the cron `ScheduleContext` (was dropped
+  as `_ctx`).
+
+### Config
+
+- New R2 prefix `ticks/`; no new bindings (reuses `TRADE_CONTROL_R2`).
+- `trade-control-core` gains a `test-support` feature exposing `MemStateStore`
+  (pulls `serde_json` + `chrono/clock`); off by default, never in the wasm build.
+
+### Tests
+
+- `TickBundle` JSON round-trip + `r2_key` layout (core).
+- `replay`: faithful bundle → MATCH, tampered → MISMATCH (cli).
+- Broker-simulator fill/exit paths: TP, SL, never-filled, filled-open, ambiguous
+  → pessimistic-stop (engine).
+
+### Follow-up
+
+- Replaying the recorded `dispatch_outcomes` through the real `run_enter` /
+  `run_close` handlers needs the deferred `worker::Response` → `{status,message}`
+  decouple (those handlers live in the worker cdylib and panic off-wasm). The
+  pure-evaluation diff + price-path simulation are the phase-1 workhorse.
+- Wiring the downstream `trading-tax-tracker` to read `ticks/` as a sibling to
+  its `req/`-based `bundle` command.
+- Multi-tick replay (glob a trade's whole `ticks/` prefix in sequence) for the
+  full fill story across ticks.
+
 ## v32 — 2026-06-17 — `trade-control plan list` / `plan show` (inspect registered engine plans)
 
 ### Why
