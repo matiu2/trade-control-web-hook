@@ -54,5 +54,7 @@ No deploy to staging/prod. Each step its own green commit (test + clippy + fmt +
 
 ## Cross-cutting — DONE
 - [x] CHANGELOG v33 + README replay/--simulate + ticks/ prefix notes
-- [ ] vNN tag v33 (apply on final commit)
-- [ ] update memory `bundle_replay_harness_state` → engine-era harness landed on feat/engine-tick-replay
+- [x] tag v33 applied + pushed
+- [x] memory: new `engine_tick_replay_landed` + held memory cross-linked + MEMORY.md index updated
+
+## ALL STEPS (a)–(f) DONE. Branch feat/engine-tick-replay @ v33, pushed. NOT merged to main, no deploy.
