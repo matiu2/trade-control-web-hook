@@ -34,11 +34,13 @@ No deploy to staging/prod. Each step its own green commit (test + clippy + fmt +
 - [x] README softened: both shadow + live ticks recorded
 - [x] Gate: workspace tests green; clippy -D warnings clean; fmt; worker-build --release OK
 
-## (e) native replay CLI
-- [ ] cli/src/replay.rs: `trade-control replay <path-or-r2-key>`
-- [ ] re-run evaluate_plan, diff fired/new_state/done, non-zero exit on mismatch
-- [ ] cli deps: trade-control-core test-support, trade-control-engine, serde_json
-- [ ] Gate: test + clippy + fmt → commit
+## (e) native replay CLI — DONE (commit pending)
+- [x] cli/src/replay.rs: `trade-control replay <bundle.json>`
+- [x] re-run evaluate_plan, diff fired/new_state/done (serde-JSON eq), non-zero exit on mismatch
+- [x] cli dep: trade-control-engine added (test-support NOT needed — pure replay; that's for step f)
+- [x] 2 unit tests (faithful→MATCH, tampered→MISMATCH) + manual binary smoke (MATCH exit 0, MISMATCH exit 1)
+- [x] Gate: workspace tests green (cli 239); clippy -D warnings clean; fmt
+- note: vNN tag + CHANGELOG deferred to after step (f) — a–f is one release (next is v33)
 
 ## (f) broker-simulator for fill replay
 - [ ] implements Broker trait; candles from recorded new_candles, not refetched

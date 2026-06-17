@@ -21,6 +21,7 @@ use chrono::Utc;
 use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use clap_complete::{Shell, generate};
 use color_eyre::eyre::{Context, Result, eyre};
+use trade_control_cli::ReplayArgs;
 use trade_control_cli::{
     AdoptBody, CalendarBarsArgs, KEY_LEN, TradePattern, add_account, adopt_trade,
     build_clear_prep_intent, build_clear_veto_intent, build_market_info_intent,
@@ -30,7 +31,7 @@ use trade_control_cli::{
     generate_key_hex, list_accounts, load_cache, load_news_spec_from_file,
     load_pause_spec_from_file, load_spec_from_file, pick_pattern_interactive,
     pick_template_interactive, prompt_save_as_template, put_secret, record_account_use,
-    record_prep_use, record_veto_use, require_local_tn_account, run_calendar_bars,
+    record_prep_use, record_veto_use, require_local_tn_account, run_calendar_bars, run_replay,
     secret_binding_for, test_account, validate_instrument, wrap_signed, wrap_signed_template,
     write_news, write_pause, write_trade,
 };
@@ -151,6 +152,11 @@ enum Cmd {
     /// progressed.
     #[command(subcommand)]
     Plan(PlanCmd),
+    /// Replay a recorded engine tick-bundle through the pure evaluator and diff
+    /// the result against what was recorded. Reads a `ticks/.../<...>.json`
+    /// object (R2 fixture); re-runs `evaluate_plan` and reports MATCH or
+    /// MISMATCH (non-zero exit on mismatch, so it gates in CI).
+    Replay(ReplayArgs),
     /// Print a shell completion script to stdout. Install with e.g.
     /// `trade-control completions zsh > ~/.zfunc/_trade-control`.
     Completions {
@@ -725,6 +731,7 @@ fn main() -> Result<()> {
         }
         Cmd::Instruments(sub) => run_instruments(sub)?,
         Cmd::Plan(sub) => run_plan(sub)?,
+        Cmd::Replay(args) => run_replay(args)?,
         Cmd::Completions { shell } => run_completions(shell),
     }
     Ok(())

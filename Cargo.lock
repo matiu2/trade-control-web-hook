@@ -3564,6 +3564,7 @@ dependencies = [
  "trade-calendar-maker",
  "trade-control-conventions",
  "trade-control-core",
+ "trade-control-engine",
  "tradenation-api 0.3.0",
  "tradenation-instrument-cache",
 ]

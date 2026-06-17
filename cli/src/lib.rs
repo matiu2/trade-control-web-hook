@@ -13,6 +13,7 @@ mod interactive;
 mod news_pattern;
 mod pause_pattern;
 mod prompts;
+mod replay;
 mod script_validator;
 mod templates;
 mod trade_patterns;
@@ -49,6 +50,7 @@ pub use pause_pattern::{
     BuiltPause, BuiltPauseAlert, PauseSpec, build_pause_from_spec,
     load_spec_from_file as load_pause_spec_from_file, write_pause,
 };
+pub use replay::{ReplayArgs, ReplayReport, replay_bundle, run_replay};
 pub use script_validator::{ScriptError, validate as validate_intent_scripts};
 pub use templates::{discover_templates, pick_template_interactive, templates_root};
 pub use trade_control_core::intent::{BrokerKind, PriceAnchor};
