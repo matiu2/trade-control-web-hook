@@ -322,6 +322,29 @@ Visibility for the parallel-run period: see what the engine is evaluating.
       README + CHANGELOG (v32). Also folded in the stale market-info
       `cli/src/lib.rs` fmt diff.
 
+### Stage E.7 — trendline crosses in bar-index space, not wall-clock (DONE — all green)
+
+Bug: `line_price_at` interpolated a neckline's level by **wall-clock seconds**
+between the two anchors, so the line kept sloping through nights, weekends and
+exchange closures. TradingView's x-axis is an **ordinal bar index** — closed
+bars (market shut) aren't plotted, so a trendline advances one step *per traded
+bar*, not per elapsed minute. For any gapped instrument (everything but 24/5 FX,
+and even FX has the weekend gap) the engine resolved the break-and-close / retest
+level at the wrong price. Decisions (user): bake per-bar geometry at **arm
+time**; treat the **broker candle feed as the source of truth** for which bars
+exist (no market-hours table, no DST math — gaps are already absent from the
+feed). Stays entirely off the other LLM's market-hours / KV-window worktree.
+
+- [x] BX1 — `core`: signed `bar_seconds: i64` on `Trigger::TrendlineCross`
+      (`#[serde(default)]` back-compat); `tv-arm` bakes `granularity.seconds()`.
+- [x] BX2 — `engine`: `line_price_at` interpolates in bar-index counted from the
+      broker window (`detector_window`, gaps absent) via new `bar_index_at`;
+      `bar_seconds` is the fallback divisor only when an anchor predates the
+      window. Table tests: a session gap (23 h between bar 1 and 2) does NOT
+      slide the line; reworked extend_forward test onto a real bar window.
+- [x] BX3 — verified (workspace green / clippy / fmt / wasm32), README trendline
+      gotcha note, CHANGELOG v34, validated on live ALPHABET feed before coding.
+
 ### Stage F — retire the webhook (PENDING)
 ### Stage G — Durable Object websocket (only if demo proves a need) (PENDING)
 

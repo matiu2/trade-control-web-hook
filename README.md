@@ -1698,6 +1698,20 @@ where those preps don't apply.
   crosses the neckline *after* the drawn anchor segment never fires. The
   drawing-level `extendRight` property does *not* propagate to the alert
   payload; we override unconditionally for trendline tools.
+- **The engine interpolates trendlines in bar-index space, not
+  wall-clock.** TradingView's x-axis is *ordinal*: closed sessions (nights,
+  weekends, holidays) aren't plotted, so a neckline advances one step **per
+  traded bar**, not per elapsed second. The server-side engine matches this
+  — it counts the actual bars present in the broker candle feed between the
+  two anchors (the feed elides closed sessions, confirmed on ALPHABET: an
+  18 h overnight gap and a 66 h weekend gap each collapse to a single bar
+  step). `tv-arm` bakes the chart's bar duration onto each `TrendlineCross`
+  as a signed `bar_seconds`, used only as a fallback divisor when an anchor
+  predates the engine's fetched candle window. A naive wall-clock
+  interpolation would slide the break-and-close / retest level badly wrong
+  on any gapped instrument (everything but 24/5 FX — and even FX gaps at the
+  weekend). No market-hours table is needed: the candle feed *is* the
+  ordinal axis.
 - **Chart-side `_alertId` binding is cosmetic.** The "link icon" on a
   drawing comes from a separate client-side binding that TV's GUI sets
   via `LineDataSource.setAlert()`. Programmatic creates can't easily

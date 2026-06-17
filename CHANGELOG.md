@@ -1,5 +1,64 @@
 # Changelog
 
+## v34 — 2026-06-18 — Trendline crosses evaluated in bar-index space, not wall-clock
+
+### Why
+
+The engine interpolated a neckline's price between its two anchors by **elapsed
+wall-clock seconds**, so the line kept sloping through nights, weekends and
+exchange closures. TradingView's x-axis is *ordinal* — closed sessions aren't
+plotted, so a trendline advances one step **per traded bar**, not per second.
+For any gapped instrument (everything but 24/5 FX, and even FX gaps at the
+weekend) the engine resolved the `03-prep-break-and-close` / `04-prep-retest`
+level at the wrong price. Confirmed on live TradeNation data: ALPHABET's hourly
+feed shows only the ~7 cash-session bars per day, eliding the 18 h overnight gap
+and the 66 h weekend gap to single bar steps — exactly what TV draws and exactly
+what wall-clock interpolation got wrong.
+
+### What changed
+
+- **`engine` — bar-index interpolation.** `line_price_at` now measures a
+  candle's position along the line as a fraction of *bars* between the anchors,
+  counting the bars actually present in the broker feed (`detector_window`;
+  gaps are absent). New `bar_index_at` resolves an epoch → (fractional) bar
+  index: exact bar match, interpolation across a one-bar data hole, or
+  `bar_seconds`-based extrapolation when an anchor sits outside the fetched
+  window. `eval_trigger` (+ `fire_rule` / `stamp_retest` / the spine
+  evaluators) gains a `window: &[Candle]` param, ignored by every non-trendline
+  trigger.
+- **`core` — signed `bar_seconds`.** `Trigger::TrendlineCross` gains
+  `bar_seconds: i64` (`#[serde(default)]` → `0` = "pure bar-count, no fallback"
+  on plans signed before this field). It rides the existing whole-body HMAC, so
+  it can't be tampered.
+- **`tv-arm` — bake it.** `trendline_trigger` stamps `granularity.seconds()`
+  onto each trendline (threaded through `build_trade_plan` → `build_rule` →
+  `trigger_for`).
+
+### Breaking
+
+- `eval_trigger` signature gains a trailing `window: &[Candle]` (engine-internal;
+  no external callers).
+- `Trigger::TrendlineCross` gains a `bar_seconds` field (additive, defaulted).
+
+### Tests
+
+- `engine`: `trendline_gap_uses_bar_index_not_wall_clock` (the bug — a 23 h gap
+  between bar 1 and bar 2 must NOT slide the line; the level at bar 1 is the
+  bar-index half-way, not the wall-clock ~4 %), `trendline_interpolates_level_at_bar_index`,
+  reworked `trendline_respects_extend_forward_false` onto a real bar window.
+- `core`: `trendline_missing_bar_seconds_defaults_to_zero`.
+- `tv-arm`: existing H&S plan test now asserts `bar_seconds: 3600` baked from
+  the H1 chart.
+- Full workspace green; clippy + fmt + wasm32 clean.
+
+### Follow-up
+
+- The `bar_seconds` fallback only triggers when an anchor predates the engine's
+  fetched candle window; in practice `detector_window` reaches back far enough
+  that the exact-bar-count path is used. If a long-lookback neckline ever needs
+  the engine to fetch deeper history, that's a candle-fetch widening, not a
+  geometry change.
+
 ## v33 — 2026-06-17 — Engine tick-bundles: record cron ticks to R2 + native replay
 
 ### Why

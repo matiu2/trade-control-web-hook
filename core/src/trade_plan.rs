@@ -142,6 +142,21 @@ pub enum Trigger {
         /// analogue of the TV `extend_forward` payload flag — see the README's
         /// trendline note). Almost always `true` for a neckline.
         extend_forward: bool,
+        /// Nominal duration of one bar in seconds (the chart granularity baked
+        /// at arm time, e.g. 3600 for H1). The engine interpolates the line's
+        /// level in **bar-index** space — not wall-clock — so that a trendline
+        /// advances one step *per traded bar* and not per elapsed second
+        /// (TradingView's x-axis is ordinal; closed sessions aren't plotted, so
+        /// nights/weekends collapse to a single bar step). The engine prefers to
+        /// count the *actual* bars present in the broker feed between the anchors
+        /// (gaps are absent from the feed — confirmed on ALPHABET: a US stock's
+        /// 18h overnight and 66h weekend gaps each collapse to one bar). This
+        /// `bar_seconds` is the **fallback divisor** used only when an anchor
+        /// predates the fetched candle window, where no bar-count is available.
+        /// `#[serde(default)]` → `0` on plans signed before this field existed,
+        /// which the engine treats as "no fallback; pure bar-count only".
+        #[serde(default)]
+        bar_seconds: i64,
         dir: CrossDir,
         bar: BarEvent,
     },
@@ -289,11 +304,30 @@ mod tests {
                 price: 1.11,
             },
             extend_forward: true,
+            bar_seconds: 3600,
             dir: CrossDir::Down,
             bar: BarEvent::OnClose,
         };
         let back: Trigger = serde_yaml::from_str(&serde_yaml::to_string(&t).unwrap()).unwrap();
         assert_eq!(back, t);
+    }
+
+    /// A trendline signed before `bar_seconds` existed deserializes with `0`
+    /// (the "pure bar-count, no fallback" sentinel) rather than failing.
+    #[test]
+    fn trendline_missing_bar_seconds_defaults_to_zero() {
+        let yaml = r#"type: trendline_cross
+a: {at_epoch: 100, price: 1.0}
+b: {at_epoch: 200, price: 1.5}
+extend_forward: true
+dir: down
+bar: on_close
+"#;
+        let t: Trigger = serde_yaml::from_str(yaml).unwrap();
+        let Trigger::TrendlineCross { bar_seconds, .. } = t else {
+            panic!("expected a trendline cross, got {t:?}");
+        };
+        assert_eq!(bar_seconds, 0, "missing bar_seconds should default to 0");
     }
 
     /// The `shadow` flag survives a JSON round-trip when set.

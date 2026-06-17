@@ -85,7 +85,7 @@ pub fn build_trade_plan(
 ) -> TradePlan {
     let rules = alerts
         .iter()
-        .filter_map(|alert| build_rule(alert, direction, roles, is_mw))
+        .filter_map(|alert| build_rule(alert, direction, roles, granularity, is_mw))
         .collect();
 
     TradePlan {
@@ -107,10 +107,11 @@ fn build_rule(
     alert: &BuiltAlert,
     direction: ConvDirection,
     roles: &Roles,
+    granularity: Granularity,
     is_mw: bool,
 ) -> Option<ConditionRule> {
     let basename = AlertBasename::parse(&alert.basename)?;
-    let trigger = trigger_for(&basename, direction, roles, is_mw)?;
+    let trigger = trigger_for(&basename, direction, roles, granularity, is_mw)?;
     let fire_mode = fire_mode_for(&trigger);
     Some(ConditionRule {
         rule_id: alert.basename.clone(),
@@ -127,6 +128,7 @@ fn trigger_for(
     basename: &AlertBasename,
     direction: ConvDirection,
     roles: &Roles,
+    granularity: Granularity,
     is_mw: bool,
 ) -> Option<Trigger> {
     match basename {
@@ -153,12 +155,14 @@ fn trigger_for(
             roles.break_and_close.as_ref(),
             close_dir(direction),
             BarEvent::OnClose,
+            granularity,
         ),
         // Retest: opposite cross of the neckline trendline, intrabar.
         AlertBasename::PrepRetest => trendline_trigger(
             roles.retest.as_ref(),
             retest_dir(direction),
             BarEvent::Intrabar,
+            granularity,
         ),
         // Enter: H&S binds to the direction's candle pattern; M/W to the
         // per-bar geometry heartbeat.
@@ -260,7 +264,12 @@ fn time_trigger(drawing: Option<&Drawing>) -> Option<Trigger> {
 /// A trendline cross trigger from a two-anchor drawing. Necklines are
 /// extended forward so a cross past the right anchor still fires (the engine
 /// analogue of the TV `extend_forward` flag — see the README trendline note).
-fn trendline_trigger(drawing: Option<&Drawing>, dir: CrossDir, bar: BarEvent) -> Option<Trigger> {
+fn trendline_trigger(
+    drawing: Option<&Drawing>,
+    dir: CrossDir,
+    bar: BarEvent,
+    granularity: Granularity,
+) -> Option<Trigger> {
     let d = drawing?;
     let a = d.points.first()?;
     let b = d.points.get(1)?;
@@ -274,6 +283,10 @@ fn trendline_trigger(drawing: Option<&Drawing>, dir: CrossDir, bar: BarEvent) ->
             price: b.price,
         },
         extend_forward: true,
+        // The engine interpolates the line in bar-index space; this is the
+        // nominal bar duration it falls back to when an anchor predates the
+        // fetched candle window (see `Trigger::TrendlineCross::bar_seconds`).
+        bar_seconds: granularity.seconds(),
         dir,
         bar,
     })
@@ -530,12 +543,16 @@ mod tests {
             } if (level - 1.2000).abs() < 1e-9
         ));
         // Break-and-close: short closes DOWN through the neckline, OnClose.
+        // `bar_seconds` is baked from the H1 chart granularity (3600s) so the
+        // engine can fall back to a bar-spacing divisor if an anchor predates
+        // its fetched candle window.
         assert!(matches!(
             by_id("03-prep-break-and-close").trigger,
             Trigger::TrendlineCross {
                 dir: CrossDir::Down,
                 bar: BarEvent::OnClose,
                 extend_forward: true,
+                bar_seconds: 3600,
                 ..
             }
         ));
