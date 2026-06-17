@@ -11,7 +11,7 @@ use std::future::Future;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::intent::{Action, Direction, NoEntryWindow};
+use crate::intent::{Action, BlackoutCloseAction, Direction, NoEntryWindow};
 use crate::plan_state::PlanState;
 use crate::trade_plan::TradePlan;
 
@@ -193,6 +193,23 @@ pub struct EntryAttempt {
     /// open question in `src/cron/blackout_apply.rs`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pip_size: Option<f64>,
+    /// What the market-hours blackout sweep should do with this still-pending
+    /// order if it's caught resting inside the instrument's close→open gap.
+    /// Snapshotted from `Intent.blackout_close` at placement so the cron —
+    /// which has no intent in hand — can act on the operator's per-trade
+    /// choice. Defaults to [`BlackoutCloseAction::CancelResting`] (the
+    /// incident fix: cancel the unfilled order, never touch a filled
+    /// position); rows written before this field existed deserialize to the
+    /// same default via `#[serde(default)]`.
+    #[serde(default, skip_serializing_if = "is_default_blackout_close")]
+    pub blackout_close: BlackoutCloseAction,
+}
+
+/// Skip-serializing predicate for [`EntryAttempt::blackout_close`] — mirrors
+/// the same predicate on `Intent::blackout_close` so a default row stays
+/// byte-identical to pre-field rows in KV.
+fn is_default_blackout_close(a: &BlackoutCloseAction) -> bool {
+    matches!(a, BlackoutCloseAction::CancelResting)
 }
 
 impl HasExpiry for EntryAttempt {
@@ -2801,6 +2818,7 @@ mod tests {
             stop_loss_price: None,
             cancel_at: None,
             pip_size: None,
+            blackout_close: BlackoutCloseAction::default(),
         }
     }
 
@@ -2932,6 +2950,8 @@ mod tests {
             stop_loss_price: Some(1.0500),
             cancel_at: Some(now + chrono::Duration::hours(3)),
             pip_size: None,
+            // Non-default so the round-trip proves the field survives the wire.
+            blackout_close: BlackoutCloseAction::CancelAndClose,
         };
         let yaml = serde_yaml::to_string(&a).unwrap();
         let parsed: EntryAttempt = serde_yaml::from_str(&yaml).unwrap();
@@ -2962,6 +2982,10 @@ mod tests {
         // they must decode as `None` so the sweep skips the bar-expiry
         // check and the row still ages out via TTL.
         assert!(attempt.cancel_at.is_none());
+        // Rows written before the market-hours blackout landed lack
+        // `blackout_close`; they must decode to the safe default
+        // (CancelResting — cancel a resting order, never close a position).
+        assert_eq!(attempt.blackout_close, BlackoutCloseAction::CancelResting);
         assert_eq!(attempt.broker_order_id, "ord-1");
     }
 
@@ -2982,9 +3006,13 @@ mod tests {
             stop_loss_price: None,
             cancel_at: None,
             pip_size: None,
+            blackout_close: BlackoutCloseAction::default(),
         };
         let yaml = serde_yaml::to_string(&a).unwrap();
         assert!(!yaml.contains("broker_trade_id"));
+        // The default close policy is skip-serialized so a default row
+        // stays byte-identical to pre-field rows in KV.
+        assert!(!yaml.contains("blackout_close"));
         let parsed: EntryAttempt = serde_yaml::from_str(&yaml).unwrap();
         assert_eq!(parsed.broker_trade_id, None);
     }

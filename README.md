@@ -1307,11 +1307,12 @@ the order sat through the whole closed session, and triggered on the next
 open's gap — getting stopped out on a move that never traded while the
 market was open. The fix has two halves:
 
-1. **A reject gate** (this commit) — block a *new* entry that fires inside
-   the instrument's daily close→open gap, so no fresh resting order is
-   placed into a market that's about to close.
-2. **A cron sweep** (a later commit) — act on a still-pending resting order
-   per the operator's chosen `blackout_close` policy.
+1. **A reject gate** — block a *new* entry that fires inside the
+   instrument's daily close→open gap, so no fresh resting order is placed
+   into a market that's about to close.
+2. **A cron sweep** — act on a still-pending resting order that's *already*
+   resting when the gap opens, per the operator's chosen `blackout_close`
+   policy.
 
 The per-instrument no-entry windows are **UTC minute-of-day ranges** derived
 once a day by a 06:00 UTC cron (`src/cron/blackout_hours.rs`) from the
@@ -1352,6 +1353,33 @@ Both the webhook and the server-side trade-plan engine dispatch entries
 through `run_enter`, so this one gate covers both paths. The buffer defaults
 (3h before close, 1h after open) live in `Buffers::default()`
 (`core/src/intent/blackout/derive.rs`).
+
+#### Cron sweep — pull a resting order caught in the gap
+
+The reject gate only stops *new* entries. An order placed just before the
+gap opened can still be resting when the close arrives — exactly the
+incident. The `*/15` cron sweep (`src/cron/sweep.rs`) handles it: for each
+tracked `EntryAttempt` it now checks the instrument's stored windows
+**before** the SL-breach branch (across a closed session the last-traded
+price is stale, so the closed market itself must be the trigger, not a
+stale-price SL check). If the order is resting inside a window it acts on
+the row's `blackout_close` policy, snapshotted from the intent at placement:
+
+- **`CancelResting`** (default, the incident fix) — cancel the unfilled
+  resting order only. It **never** closes a position: if the order already
+  filled, the cancel is a broker no-op and the filled position is left
+  untouched (its SL is the only thing that should close it — see the
+  `veto_close_only_when_thesis_invalidated` rule in `CLAUDE.md`).
+- **`CancelAndClose`** — also market-close any open position on the
+  instrument. Opt-in only; the operator chose it at arm time because a
+  partly-formed setup carried through a closed session isn't worth the
+  reopen-gap risk.
+
+The cancel logs with reason `market-blackout` (greppable apart from
+`expired` / `bar-expiry` / `sl-breached`), then the row is deleted so the
+next sweep doesn't re-process it. A KV read error fails open (empty windows
+⇒ not due), matching the reject gate. Pre-field `EntryAttempt` rows decode
+to the safe `CancelResting` default.
 
 ### Local TN store vs server-side account list
 

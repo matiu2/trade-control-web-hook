@@ -350,6 +350,9 @@ pub async fn record_placement<S: StateStore>(
         // source it for a cron-found open position (it has no intent in
         // hand). `None` ⇒ the cron skips the widen and logs.
         pip_size: intent.pip_size,
+        // Snapshot the operator's market-hours-blackout close policy so the
+        // sweep can act on a resting order without the intent in hand.
+        blackout_close: intent.blackout_close,
     };
     if let Err(err) = store.record_entry_attempt(attempt).await {
         rlog_err!("KV record_entry_attempt: {err}");

@@ -51,11 +51,17 @@ reject gate covers both. Plan: `~/.home-claude/plans/market-hours-entry-blackout
       `run_enter`-level handler test isn't feasible off-wasm (`KvStateStore` /
       `worker::Response` need wasm-bindgen) — coverage is the pure helper +
       `is_inside_any`/`windows_from_session` in core + the seen-decision pin.
-- [ ] **Commit 5 — cron sweep close action.** Persist `blackout_close` onto the
-      `EntryAttempt`; `market_blackout_due` predicate branch before SL-breach;
-      `CancelResting` cancels resting order, `CancelAndClose` also
-      `close_positions`. (Broker trait already has `close_positions` /
-      `cancel_pending_for_instrument` — no addition needed.)
+- [x] **Commit 5 — cron sweep close action.** `EntryAttempt.blackout_close`
+      added (skip-default serde, decodes to `CancelResting` on pre-field rows);
+      `record_placement` snapshots it from `intent.blackout_close`. Pure
+      `market_blackout_due(windows, now)` predicate (4 unit tests) gates a new
+      branch in `sweep_one` placed BEFORE the SL-breach branch (stale closed-
+      session price must not decide). `market_blackout_act` → `blackout_cancel_close`:
+      always `cancel_order` (reason `market-blackout`), and only on
+      `CancelAndClose` also `close_positions` — `CancelResting` NEVER closes a
+      position (the `veto_close_only_when_thesis_invalidated` guard). Fail-open
+      on KV read error. README "Cron sweep" subsection added. Broker trait
+      needed no addition (had `close_positions`/`cancel_pending_for_instrument`).
 - [ ] **Commit 6 — CLI + tv-arm + README.** `--blackout-close {cancel|close}`;
       `build_trade_plan` carries the policy onto enter rules; README section.
 
