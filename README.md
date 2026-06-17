@@ -225,9 +225,22 @@ known at sign time. The schema fingerprint catches added / dropped /
 renamed top-level fields even though their values aren't signed. See
 `core::sig` for the exact canonical form.
 
-SL/TP rules reference the plaintext shell prices by anchor
-(`close`/`high`/`low`) with a pip offset, so the CLI never needs to
-know the live price — TradingView fills it in at fire time.
+SL/TP rules reference the plaintext shell prices by anchor with a pip
+offset, so the CLI never needs to know the live price — TradingView
+fills it in at fire time. Valid anchors:
+
+- `close` / `high` / `low` — the triggering candle's own values.
+- `recent_high` / `recent_low` — the indicator's `sl_lookback` window
+  (bars *strictly before* the signal bar). An SL anchor that doesn't
+  depend on the signal candle's own wick.
+- `signal_high` / `signal_low` — the *latched pattern extreme* (e.g. an
+  H&S head / right-shoulder). Unlike `high`/`low`, these are stable
+  across a confirmation re-fire, so an H&S/IHS enter resolves to the
+  same entry/SL geometry on the break-candle fire and the confirmed
+  re-fire. This is the default SL/entry anchor for the H&S/IHS builders.
+
+`recent_*` and `signal_*` fall back to the candle's own `high`/`low`
+when an older Pine indicator didn't ship the field.
 
 Why no encryption? The intent isn't secret — only its authenticity
 matters. Cleartext lets the operator inspect what TradingView actually

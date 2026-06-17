@@ -151,20 +151,27 @@ struct PatternGeometry {
 impl PatternGeometry {
     fn for_pattern(p: TradePattern) -> Self {
         match p {
+            // Entry/SL anchor to the *latched* signal extremes, not the
+            // triggering candle's own wick, so a confirmation re-fire resolves
+            // to the same geometry as the break-candle fire (bug #10 finding A).
+            // For a short H&S: entry below the break at signal_low, SL above
+            // the pattern at signal_high.
             TradePattern::Hs => Self {
                 direction: Direction::Short,
-                entry_anchor: PriceAnchor::Low,
+                entry_anchor: PriceAnchor::SignalLow,
                 entry_offset_default: 1.0,
-                sl_anchor: PriceAnchor::High,
+                sl_anchor: PriceAnchor::SignalHigh,
                 sl_offset_default: 1.0,
                 invalidation_veto_name: "too-high",
                 pcl_exhausted_veto_name: "too-low",
             },
+            // Inverse H&S long: mirror of the above — entry above the break at
+            // signal_high, SL below the pattern at signal_low.
             TradePattern::Ihs => Self {
                 direction: Direction::Long,
-                entry_anchor: PriceAnchor::High,
+                entry_anchor: PriceAnchor::SignalHigh,
                 entry_offset_default: 1.0,
-                sl_anchor: PriceAnchor::Low,
+                sl_anchor: PriceAnchor::SignalLow,
                 sl_offset_default: 1.0,
                 invalidation_veto_name: "too-low",
                 pcl_exhausted_veto_name: "too-high",
@@ -303,12 +310,12 @@ pub struct TradeSpec {
     #[serde(default)]
     pub sl_offset_pips: Option<f64>,
     /// Override the pattern's default SL anchor. Omit to use the pattern
-    /// default (`High` for H&S, `Low` for iH&S — the signal bar's own
-    /// extreme). Set to `recent_high` / `recent_low` to anchor against
-    /// Pine's `recent_high` / `recent_low` shell fields, which span the
-    /// indicator's `sl_lookback` window of bars *strictly preceding* the
-    /// signal bar. Useful when the signal candle is unusually small and
-    /// a tight wick-based SL would be hit by ordinary noise.
+    /// default (`signal_high` for H&S, `signal_low` for iH&S — the latched
+    /// pattern extreme, stable across a confirmation re-fire). Set to
+    /// `recent_high` / `recent_low` to anchor against Pine's `recent_high` /
+    /// `recent_low` shell fields instead, which span the indicator's
+    /// `sl_lookback` window of bars *strictly preceding* the signal bar, or
+    /// `high` / `low` to anchor to the triggering candle's own wick.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sl_anchor: Option<PriceAnchor>,
     /// Take-profit absolute price. The worker treats this verbatim and
@@ -600,9 +607,11 @@ pub fn build_trade_from_spec(mut spec: TradeSpec, now: DateTime<Utc>) -> Result<
             (geometry.direction, override_anchor),
             (
                 Direction::Short,
-                PriceAnchor::High | PriceAnchor::RecentHigh
-            ) | (Direction::Long, PriceAnchor::Low | PriceAnchor::RecentLow)
-                | (_, PriceAnchor::Close)
+                PriceAnchor::High | PriceAnchor::RecentHigh | PriceAnchor::SignalHigh
+            ) | (
+                Direction::Long,
+                PriceAnchor::Low | PriceAnchor::RecentLow | PriceAnchor::SignalLow
+            ) | (_, PriceAnchor::Close)
         );
         if !ok {
             return Err(eyre!(
@@ -1241,6 +1250,8 @@ fn anchor_label(anchor: PriceAnchor) -> &'static str {
         PriceAnchor::Low => "low",
         PriceAnchor::RecentHigh => "recent_high",
         PriceAnchor::RecentLow => "recent_low",
+        PriceAnchor::SignalHigh => "signal_high",
+        PriceAnchor::SignalLow => "signal_low",
     }
 }
 
@@ -1978,20 +1989,22 @@ mod tests {
             false,
         );
         assert_eq!(alert.intent.direction, Some(Direction::Short));
-        // Entry: low + 1 pip.
+        // Entry: signal_low + 1 pip — the latched pattern level, stable across
+        // a confirmation re-fire (bug #10 finding A), not the candle wick.
         match &alert.intent.entry {
             Some(EntrySpec::Stop {
                 from, offset_pips, ..
             }) => {
-                assert_eq!(*from, PriceAnchor::Low);
+                assert_eq!(*from, PriceAnchor::SignalLow);
                 assert!((offset_pips - 1.0).abs() < 1e-9);
             }
             other => panic!("expected Stop entry, got {other:?}"),
         }
-        // SL: high + 1 pip — matches short.yaml's tight stop.
+        // SL: signal_high + 1 pip — the pattern high, not the triggering
+        // candle's own high.
         match &alert.intent.stop_loss {
             Some(PriceRef::Anchored { from, offset_pips }) => {
-                assert_eq!(*from, PriceAnchor::High);
+                assert_eq!(*from, PriceAnchor::SignalHigh);
                 assert!((offset_pips - 1.0).abs() < 1e-9);
             }
             other => panic!("expected Anchored SL, got {other:?}"),
@@ -2051,18 +2064,21 @@ mod tests {
             false,
         );
         assert_eq!(alert.intent.direction, Some(Direction::Long));
+        // Entry: signal_high + 1 pip (mirror of the H&S short — pattern level,
+        // not the candle wick; bug #10 finding A).
         match &alert.intent.entry {
             Some(EntrySpec::Stop {
                 from, offset_pips, ..
             }) => {
-                assert_eq!(*from, PriceAnchor::High);
+                assert_eq!(*from, PriceAnchor::SignalHigh);
                 assert!((offset_pips - 1.0).abs() < 1e-9);
             }
             other => panic!("expected Stop entry, got {other:?}"),
         }
+        // SL: signal_low + 1 pip — the pattern low.
         match &alert.intent.stop_loss {
             Some(PriceRef::Anchored { from, offset_pips }) => {
-                assert_eq!(*from, PriceAnchor::Low);
+                assert_eq!(*from, PriceAnchor::SignalLow);
                 assert!((offset_pips - 1.0).abs() < 1e-9);
             }
             other => panic!("expected Anchored SL, got {other:?}"),
@@ -3153,8 +3169,8 @@ tp_price: 1.05
 
     #[test]
     fn sl_anchor_override_lands_on_enter_intent() {
-        // Override the H&S default (PriceAnchor::High → signal bar high)
-        // with RecentHigh — the SL price ref on the enter intent must
+        // Override the H&S default (PriceAnchor::SignalHigh → latched pattern
+        // high) with RecentHigh — the SL price ref on the enter intent must
         // pick up the override.
         let now = ts("2026-05-20T00:00:00Z");
         let mut spec = sample_spec(TradePattern::Hs, ts("2026-05-25T00:00:00Z"));

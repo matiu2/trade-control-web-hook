@@ -1384,6 +1384,18 @@ pub enum Direction {
 /// carry them (older Pine indicator), they fall back to the signal
 /// bar's `high` / `low` so behaviour degrades gracefully rather than
 /// producing a panic. Pine v2 from 2026-05-26 onwards ships them.
+///
+/// `SignalHigh` / `SignalLow` reference Pine's `signal_high` / `signal_low`
+/// — the *latched pattern extreme* (the H&S head / right-shoulder region),
+/// frozen when the pattern formed. Unlike `High`/`Low` (the triggering
+/// candle's own wick), these are **stable across a confirmation re-fire**:
+/// the break-candle fire and the later `signal_confirmed: 1` fire carry the
+/// same `signal_high`/`signal_low`, so an H&S enter anchored to them resolves
+/// to identical entry/SL geometry both times. (Contrast `RecentHigh`, which
+/// is the pre-signal lookback window, not the pattern extreme.) This anchor
+/// is what fixes bug #10 finding A — see the H&S/IHS geometry in
+/// `cli/src/trade_patterns.rs`. Same graceful `unwrap_or(high/low)` fallback
+/// as the recent_* anchors for shells that predate the fields.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PriceAnchor {
@@ -1392,6 +1404,8 @@ pub enum PriceAnchor {
     Low,
     RecentHigh,
     RecentLow,
+    SignalHigh,
+    SignalLow,
 }
 
 /// Reference to a price. Either anchored to the plaintext shell with a pip
@@ -1542,6 +1556,10 @@ impl Shell {
             // tighter SL, which is the conservative direction to err in).
             PriceAnchor::RecentHigh => self.recent_high.unwrap_or(self.high),
             PriceAnchor::RecentLow => self.recent_low.unwrap_or(self.low),
+            // Latched pattern extreme — stable across a confirm re-fire.
+            // Falls back to the candle wick if Pine didn't ship signal_*.
+            PriceAnchor::SignalHigh => self.signal_high.unwrap_or(self.high),
+            PriceAnchor::SignalLow => self.signal_low.unwrap_or(self.low),
         }
     }
 
@@ -1616,6 +1634,36 @@ mod tests {
         s.recent_low = Some(1.0950);
         assert_eq!(s.anchor_price(PriceAnchor::RecentHigh), 1.1050);
         assert_eq!(s.anchor_price(PriceAnchor::RecentLow), 1.0950);
+    }
+
+    #[test]
+    fn anchor_price_signal_uses_shell_field_when_present() {
+        // The latched pattern extreme, distinct from the candle wick.
+        let mut s = shell();
+        s.signal_high = Some(1.1075);
+        s.signal_low = Some(1.0925);
+        assert_eq!(s.anchor_price(PriceAnchor::SignalHigh), 1.1075);
+        assert_eq!(s.anchor_price(PriceAnchor::SignalLow), 1.0925);
+    }
+
+    #[test]
+    fn anchor_price_signal_falls_back_to_bar_extreme_when_missing() {
+        // Pre-2026-05 shells didn't carry signal_*. Fall back to the
+        // candle's own high/low rather than panic — same graceful
+        // degradation as the recent_* anchors.
+        let s = shell();
+        assert!(s.signal_high.is_none());
+        assert!(s.signal_low.is_none());
+        assert_eq!(s.anchor_price(PriceAnchor::SignalHigh), s.high);
+        assert_eq!(s.anchor_price(PriceAnchor::SignalLow), s.low);
+    }
+
+    #[test]
+    fn price_anchor_signal_round_trips_through_yaml() {
+        let from: PriceAnchor = serde_yaml::from_str("signal_high").unwrap();
+        assert_eq!(from, PriceAnchor::SignalHigh);
+        let out = serde_yaml::to_string(&PriceAnchor::SignalLow).unwrap();
+        assert!(out.contains("signal_low"), "got: {out}");
     }
 
     #[test]
