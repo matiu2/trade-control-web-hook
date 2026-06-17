@@ -28,9 +28,11 @@ No deploy to staging/prod. Each step its own green commit (test + clippy + fmt +
 - [x] README: "Engine tick-bundles (ticks/ prefix)" subsection
 - [x] Gate: workspace tests green; clippy --all-targets -D warnings clean; fmt; worker-build --release OK
 
-## (d) extend to live ticks
-- [ ] drop shadow gate; populate dispatch_outcomes from each dispatch_fired result
-- [ ] Gate: workspace test + clippy + fmt + wasm → commit
+## (d) extend to live ticks — DONE (commit pending)
+- [x] dispatch_fired returns its outcome string; tick_one collects DispatchOutcome per fire (seq-ordered)
+- [x] live + put-failed paths now also build + record a TickBundle (not just shadow)
+- [x] README softened: both shadow + live ticks recorded
+- [x] Gate: workspace tests green; clippy -D warnings clean; fmt; worker-build --release OK
 
 ## (e) native replay CLI
 - [ ] cli/src/replay.rs: `trade-control replay <path-or-r2-key>`

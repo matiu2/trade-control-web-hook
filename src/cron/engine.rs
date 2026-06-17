@@ -54,7 +54,9 @@ use trade_control_core::incoming::Verified;
 use trade_control_core::intent::{Action, Shell, VetoLevel};
 use trade_control_core::plan_state::PlanState;
 use trade_control_core::state::{StateStore, StoredPlan};
-use trade_control_core::tick_bundle::{KvTickTransition, TICK_BUNDLE_SCHEMA_VERSION, TickBundle};
+use trade_control_core::tick_bundle::{
+    DispatchOutcome, KvTickTransition, TICK_BUNDLE_SCHEMA_VERSION, TickBundle,
+};
 use trade_control_engine::{PlanEval, evaluate_plan, seed_plan_state};
 use worker::{Env, ScheduleContext};
 
@@ -179,12 +181,47 @@ async fn tick_one(
     }
 
     if put_failed {
+        // Record the failed transition before bailing, so a replay sees the
+        // "wanted to advance, couldn't" rather than a silent gap. No dispatch
+        // happened, so `dispatch_outcomes` is empty.
+        let bundle = build_tick_bundle(
+            stored,
+            &prior,
+            &fresh,
+            &detector_window,
+            eval,
+            now,
+            expires_at,
+            Vec::new(),
+            kv.clone(),
+        );
+        record_tick_to_r2(env, ctx, bundle);
         return Err(format!("put_plan_state: {}", kv.error.unwrap_or_default()));
     }
 
-    for fired in &eval.fired {
-        dispatch_fired(env, store, &broker, fired, now).await;
+    let mut dispatch_outcomes = Vec::with_capacity(eval.fired.len());
+    for (seq, fired) in eval.fired.iter().enumerate() {
+        let outcome = dispatch_fired(env, store, &broker, fired, now).await;
+        dispatch_outcomes.push(DispatchOutcome {
+            rule_id: fired.rule_id.clone(),
+            intent_id: fired.intent.id.clone(),
+            outcome,
+            seq: seq as u32,
+        });
     }
+
+    let bundle = build_tick_bundle(
+        stored,
+        &prior,
+        &fresh,
+        &detector_window,
+        eval,
+        now,
+        expires_at,
+        dispatch_outcomes,
+        kv,
+    );
+    record_tick_to_r2(env, ctx, bundle);
     Ok(())
 }
 
@@ -259,7 +296,7 @@ fn build_tick_bundle(
     eval: PlanEval,
     now: DateTime<Utc>,
     expires_at: DateTime<Utc>,
-    dispatch_outcomes: Vec<trade_control_core::tick_bundle::DispatchOutcome>,
+    dispatch_outcomes: Vec<DispatchOutcome>,
     kv: KvTickTransition,
 ) -> TickBundle {
     let plan = &stored.plan;
@@ -398,6 +435,8 @@ async fn detector_window_for(
 
 /// Dispatch one fired intent through the same handlers the webhook uses, then
 /// record the outcome on the seen-by-id index exactly as the HTTP path does.
+/// Returns the dispatch outcome string (`ActionResult::describe()`) so the tick
+/// can fold it into the recorded [`TickBundle`].
 ///
 /// The plan was verified at register, so the [`Verified`] is synthesised
 /// directly: the [`Shell`] from the triggering candle (OHLC + time; `open`
@@ -408,7 +447,7 @@ async fn dispatch_fired(
     broker: &BrokerHandle,
     fired: &trade_control_engine::FiredIntent,
     now: DateTime<Utc>,
-) {
+) -> String {
     // An H&S `PinePattern` fire carries the latched signal geometry; fold it onto
     // the shell so the enter resolves entry/SL/TP against the *pattern* extremes
     // (signal_high/low, recent_*, golden, signal_confirmed) exactly as the TV
@@ -426,14 +465,15 @@ async fn dispatch_fired(
         BrokerHandle::Oanda(b) => dispatch_action(b, store, &verified, env, now).await,
         BrokerHandle::TradeNation(b) => dispatch_action(b, store, &verified, env, now).await,
     };
+    let outcome = result.describe();
     rlog!(
-        "cron engine fired: rule={} action={:?} id={} outcome={}",
+        "cron engine fired: rule={} action={:?} id={} outcome={outcome}",
         fired.rule_id,
         verified.intent.action,
         verified.intent.id,
-        result.describe(),
     );
     crate::record_dispatcher_outcome(store, &verified, now, &result).await;
+    outcome
 }
 
 /// Engine-side action dispatch. Mirrors the webhook's `run_action` but for the

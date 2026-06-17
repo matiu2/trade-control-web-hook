@@ -972,9 +972,10 @@ tick `now`/`expires_at` — plus the golden `PlanEval` output (`fired` /
 `KvTickTransition` (before/after/success/error). Replaying a bundle re-runs the
 same `evaluate_plan` offline and diffs the result — a recorded tick becomes a
 deterministic regression test. Same fire-and-forget `wait_until` + fail-soft
-contract as request recording; same `TRADE_CONTROL_R2` binding. Recording is
-**shadow-ticks-only** initially (observe-only plans, no broker), widening to live
-ticks once proven.
+contract as request recording; same `TRADE_CONTROL_R2` binding. Both shadow
+(observe-only) and live ticks are recorded; a live tick's `dispatch_outcomes`
+carry each fire's broker result, while a shadow tick's is empty (it dispatches
+nothing).
 
 ## Brokers
 
