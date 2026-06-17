@@ -23,15 +23,15 @@ use clap_complete::{Shell, generate};
 use color_eyre::eyre::{Context, Result, eyre};
 use trade_control_cli::{
     AdoptBody, CalendarBarsArgs, KEY_LEN, TradePattern, add_account, adopt_trade,
-    build_clear_prep_intent, build_clear_veto_intent, build_news_from_spec, build_pause_from_spec,
-    build_prep_intent, build_status_intent, build_trade_from_spec, build_trade_interactive,
-    build_unlock_intent, build_veto_intent, delete_account, delete_secret, fill_missing_fields,
-    generate_key_hex, list_accounts, load_cache, load_news_spec_from_file,
-    load_pause_spec_from_file, load_spec_from_file, pick_pattern_interactive,
-    pick_template_interactive, prompt_save_as_template, put_secret, record_account_use,
-    record_prep_use, record_veto_use, require_local_tn_account, run_calendar_bars,
-    secret_binding_for, test_account, validate_instrument, wrap_signed, wrap_signed_template,
-    write_news, write_pause, write_trade,
+    build_clear_prep_intent, build_clear_veto_intent, build_market_info_intent,
+    build_news_from_spec, build_pause_from_spec, build_prep_intent, build_status_intent,
+    build_trade_from_spec, build_trade_interactive, build_unlock_intent, build_veto_intent,
+    delete_account, delete_secret, fill_missing_fields, generate_key_hex, list_accounts,
+    load_cache, load_news_spec_from_file, load_pause_spec_from_file, load_spec_from_file,
+    pick_pattern_interactive, pick_template_interactive, prompt_save_as_template, put_secret,
+    record_account_use, record_prep_use, record_veto_use, require_local_tn_account,
+    run_calendar_bars, secret_binding_for, test_account, validate_instrument, wrap_signed,
+    wrap_signed_template, write_news, write_pause, write_trade,
 };
 use trade_control_core::account::{
     AccountKind, AccountMetadata, Credentials, TradeNationCreds, TradeNationKind,
@@ -70,6 +70,12 @@ enum Cmd {
     Sign(SignArgs),
     /// Query the deployed worker's cooldown / recent-seen state.
     Status(EndpointArgs),
+    /// Show TradeNation trading hours + market details for one instrument.
+    /// Queries the worker, which resolves the instrument against the broker
+    /// and returns its session hours (Brisbane + London), spread, margin,
+    /// guaranteed-stop terms and expiry. TradeNation-only.
+    #[command(alias = "hours")]
+    MarketInfo(MarketInfoCmdArgs),
     /// Clear the cooldown for one instrument on the deployed worker.
     Unlock(UnlockCmdArgs),
     /// Record a named prep step for an instrument with a TTL.
@@ -404,6 +410,20 @@ struct EndpointArgs {
 }
 
 #[derive(Parser)]
+struct MarketInfoCmdArgs {
+    /// Instrument to look up, e.g. "Wall Street 30", US30, or EUR_USD.
+    /// Resolved to the canonical TradeNation MarketName via the catalog
+    /// (unless --force), then the worker resolves it against the broker.
+    instrument: String,
+    /// Skip catalog validation and send the instrument string verbatim
+    /// (use when the catalog can't resolve a name the broker still knows).
+    #[arg(long)]
+    force: bool,
+    #[command(flatten)]
+    common: EndpointArgs,
+}
+
+#[derive(Parser)]
 struct UnlockCmdArgs {
     /// Instrument to unlock, e.g. EUR_USD.
     instrument: String,
@@ -648,6 +668,7 @@ fn main() -> Result<()> {
         }
         Cmd::Sign(args) => run_sign(args)?,
         Cmd::Status(args) => run_status(args)?,
+        Cmd::MarketInfo(args) => run_market_info(args)?,
         Cmd::Unlock(args) => run_unlock(args)?,
         Cmd::Prep(args) => run_prep(args)?,
         Cmd::Veto(args) => run_veto(args)?,
@@ -1069,6 +1090,72 @@ fn run_status(args: EndpointArgs) -> Result<()> {
         print!("{footer}");
     }
     Ok(())
+}
+
+fn run_market_info(args: MarketInfoCmdArgs) -> Result<()> {
+    let key = load_key(&args.common.key_file)?;
+    // Market-info is TradeNation-only, so always canonicalize against the
+    // TN catalog (unless --force) — lets the operator type US30 / EUR_USD
+    // and have it resolved to the broker's MarketName before sending.
+    let instrument =
+        canonicalize_instrument_or_force(BrokerKindArg::TradeNation, &args.instrument, args.force)?;
+    let now = Utc::now();
+    let suffix = fresh_suffix()?;
+    let intent = build_market_info_intent(&instrument, now, &suffix);
+    let body = wrap_control(&intent, &key, now)?;
+    let response = post_control(&args.common.endpoint, &body)?;
+    // The worker returns the MarketInfo serialised as YAML. Pretty-print
+    // it Brisbane-first; if it can't be parsed (unexpected shape / error
+    // body), fall back to the raw pass-through so nothing is hidden.
+    match serde_yaml::from_str::<tradenation_api::MarketInfo>(&response) {
+        Ok(info) => print!("{}", format_market_info(&info)),
+        Err(_) => {
+            print!("{response}");
+            if !response.ends_with('\n') {
+                println!();
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Format a [`MarketInfo`](tradenation_api::MarketInfo) for the operator,
+/// **Brisbane time first** (their zone) with London alongside for clarity.
+///
+/// Trading hours come from the broker in London local; each parsed range
+/// carries both. When the broker returned non-range text (e.g.
+/// `"24 Hours"`), `ranges` is empty and we print `raw_london` verbatim.
+fn format_market_info(info: &tradenation_api::MarketInfo) -> String {
+    let mut out = format!("{}\n", info.name);
+    out.push_str("\ntrading hours (Brisbane / London):\n");
+    if info.trade_session.ranges.is_empty() {
+        // Non-range text like "24 Hours" — show the broker's raw string.
+        out.push_str(&format!("  {}\n", info.trade_session.raw_london));
+    } else {
+        for r in &info.trade_session.ranges {
+            out.push_str(&format!(
+                "  {} - {}   (London {} - {})\n",
+                r.open_brisbane, r.close_brisbane, r.open_london, r.close_london,
+            ));
+        }
+    }
+    out.push_str(&format!("\nspread:            {}\n", info.spread));
+    out.push_str(&format!("margin:            {}\n", info.margin));
+    out.push_str(&format!("stop orders:       {}\n", info.allow_stop_orders));
+    out.push_str(&format!(
+        "guaranteed stop:   {} (distance {}, charge {})\n",
+        info.allow_guaranteed_stop, info.gsl_distance, info.gsl_charge,
+    ));
+    out.push_str(&format!("min/max stake:     {}\n", info.min_max_stake));
+    out.push_str(&format!(
+        "contract:          {} (rolling: {})\n",
+        info.contract_month, info.is_rolling_market,
+    ));
+    out.push_str(&format!(
+        "expiry:            {} (London {})\n",
+        info.expiry_date_brisbane, info.expiry_date_london,
+    ));
+    out
 }
 
 /// Build a `# instruments:` footer that annotates each unique instrument
@@ -1627,6 +1714,61 @@ mod tests {
         assert_eq!(shell_from_path("/usr/bin/zsh").unwrap(), Shell::Zsh);
         assert_eq!(shell_from_path("/bin/bash").unwrap(), Shell::Bash);
         assert_eq!(shell_from_path("fish").unwrap(), Shell::Fish);
+    }
+
+    /// A MarketInfo fixture, deserialised the same way the CLI deserialises
+    /// the worker's response — so this also exercises the wire→struct path.
+    fn market_info_fixture(ranges_yaml: &str, raw_london: &str) -> tradenation_api::MarketInfo {
+        let yaml = format!(
+            "name: Wall Street 30
+trade_session:
+  raw_london: \"{raw_london}\"
+  ranges:
+{ranges_yaml}
+spread: \"4\"
+spread_type: S
+margin: 0.5%
+bet_per: \"1\"
+min_max_stake: USD,0.1,1000000
+allow_stop_orders: \"Yes\"
+allow_guaranteed_stop: \"Yes\"
+gsl_charge: \"3\"
+gsl_distance: 2%
+contract_month: Rolling
+last_trading: N/A
+basis_expiry: rollover
+expiry_date_london: \"-\"
+expiry_date_brisbane: \"-\"
+is_rolling_market: true
+reset_time: 10:00 PM
+"
+        );
+        serde_yaml::from_str(&yaml).expect("fixture deserialises")
+    }
+
+    #[test]
+    fn format_market_info_is_brisbane_first_with_london_alongside() {
+        let info = market_info_fixture(
+            "    - open_london: \"23:00\"\n      close_london: \"21:00\"\n      \
+             open_brisbane: \"09:00 (+1d)\"\n      close_brisbane: \"07:00 (+1d)\"",
+            "23:00 - 21:00",
+        );
+        let out = format_market_info(&info);
+        // Brisbane leads the range line; London is shown alongside.
+        assert!(out.contains("09:00 (+1d) - 07:00 (+1d)   (London 23:00 - 21:00)"));
+        assert!(out.contains("trading hours (Brisbane / London):"));
+        assert!(out.contains("Wall Street 30"));
+    }
+
+    #[test]
+    fn format_market_info_falls_back_to_raw_when_no_ranges() {
+        // Broker returned non-range text like "24 Hours" — ranges empty.
+        let info = market_info_fixture("    []", "24 Hours");
+        let out = format_market_info(&info);
+        assert!(out.contains("  24 Hours\n"));
+        // No fabricated range line (those carry " - " between two clock
+        // times alongside a "(London … - …)" suffix).
+        assert!(!out.contains("(London 0"));
     }
 
     #[test]

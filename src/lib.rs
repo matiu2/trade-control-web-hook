@@ -14,6 +14,7 @@ mod allow_entry_gate;
 mod candle_gate;
 mod cron;
 mod diag;
+mod market_info;
 mod retry_gate;
 mod spread_blackout;
 mod state;
@@ -245,6 +246,15 @@ pub async fn main(mut req: Request, env: Env, ctx: Context) -> Result<Response> 
             Action::NewsEnd => break 'intent handle_news_end(&store, &verified, now).await,
             Action::Register => break 'intent handle_register(&store, &verified, now).await,
             _ => {}
+        }
+
+        // `market-info` is a read-only query that needs a live TradeNation
+        // broker (its `market_info` call is not on the generic `Broker`
+        // trait), so it acquires the broker here and returns its own
+        // Response directly — it is not an `ActionResult` and so skips
+        // `run_action` / `record_dispatcher_outcome`.
+        if verified.intent.action == Action::MarketInfo {
+            break 'intent market_info::handle_market_info(&env, &store, &verified, now).await;
         }
 
         // Broker dispatch.
@@ -534,7 +544,11 @@ async fn run_action<B: Broker>(
         | Action::Resume
         | Action::NewsStart
         | Action::NewsEnd
-        | Action::Register => {
+        | Action::Register
+        // MarketInfo needs the concrete TradeNation broker (its `market_info`
+        // is not on the generic `Broker` trait), so it's dispatched in the
+        // broker-acquire section before this generic function — never here.
+        | Action::MarketInfo => {
             // Handled before broker dispatch; never reached here.
             unreachable!("non-broker actions handled before broker dispatch")
         }
@@ -1906,7 +1920,7 @@ async fn handle_status(
 /// Best-effort wrapper around `mark_seen`. Used by the dedicated control
 /// handlers (status / unlock / prep / veto / clear-*) so each one ends
 /// with one line instead of an `if let Err` repeated everywhere.
-async fn record_seen<S: StateStore>(
+pub(crate) async fn record_seen<S: StateStore>(
     store: &S,
     verified: &incoming::Verified,
     now: chrono::DateTime<chrono::Utc>,

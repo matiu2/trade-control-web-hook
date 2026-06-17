@@ -77,7 +77,9 @@ pub fn required_for_action(action: Action) -> &'static [&'static str] {
         Action::ClearPrep => &["step"],
         Action::ClearVeto => &["name", "trade_id"],
         // `instrument` is already in `ALWAYS_REQUIRED`; nothing extra needed.
-        Action::Status | Action::Unlock => &[],
+        // `market-info` queries the broker for that instrument's session
+        // hours / spread / margin — instrument is the only input.
+        Action::Status | Action::Unlock | Action::MarketInfo => &[],
         // pause/resume require `trade_id` + `blackout_id`, but those
         // aren't in `ALWAYS_REQUIRED` and the CLI's interactive
         // questionnaire doesn't know how to mint them — they're only

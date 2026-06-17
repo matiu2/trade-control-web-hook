@@ -57,6 +57,14 @@ Trading:
   expected range) and you want to be sure no entry fires while you sleep.
 - `status` — read-only snapshot of active cooldowns, recent seen ids, preps, and
   vetos. Curl-friendly debugging.
+- `market-info` — read-only query: return TradeNation's per-instrument market
+  details for the intent's `instrument` (trading session hours in Brisbane +
+  London, spread, margin, guaranteed-stop terms, expiry). Unlike the other
+  control actions this needs a live TradeNation broker (its `market_info` call
+  isn't on the generic `Broker` trait), so it dispatches through the broker path;
+  it still records `seen` and is fully idempotent. **TradeNation only** — a
+  non-TN intent is rejected `400`. These hours feed the upcoming market-hours
+  entry blackout.
 - `unlock` — clear the cooldown for one instrument. Recovery for an
   `invalidate` you didn't mean to send.
 
@@ -743,6 +751,15 @@ export TRADE_CONTROL_ENDPOINT=https://trade-control.<account>.workers.dev
 ./target/release/trade-control unlock EUR_USD \
   --key-file ~/.config/trade-control/key.hex
 
+# TradeNation trading hours + market details for one instrument. Accepts a
+# canonical name (US30, EUR_USD) or the TN MarketName ("Wall Street 30");
+# the CLI resolves it via the catalog (use --force to skip), the worker
+# resolves it against the broker. `hours` is an alias. TradeNation only.
+./target/release/trade-control market-info "Wall Street 30" \
+  --key-file ~/.config/trade-control/key.hex
+./target/release/trade-control hours US30 \
+  --key-file ~/.config/trade-control/key.hex
+
 # Set / clear preps and vetos directly. (TradingView normally fires these,
 # but the CLI is the manual escape hatch — e.g. when a prep went stale and
 # should be dropped before TTL.)
@@ -831,6 +848,31 @@ omitted entirely when the snapshot has no instrument fields.
 unlocked: EUR_USD
 was_cooled_down: true
 ```
+
+`market-info` pretty-prints the broker's market details, **Brisbane time
+first** (the operator's zone) with London alongside:
+
+```
+Wall Street 30
+
+trading hours (Brisbane / London):
+  09:00 (+1d) - 07:00 (+1d)   (London 23:00 - 21:00)
+
+spread:            4
+margin:            0.5%
+stop orders:       Yes
+guaranteed stop:   Yes (distance 2%, charge 3)
+min/max stake:     USD,0.1,1000000
+contract:          Rolling (rolling: true)
+expiry:            - (London -)
+```
+
+Trading hours come from the broker in **London local**; the Brisbane
+(UTC+10) equivalents are shown first. A `(+1d)` suffix on a Brisbane time
+means it falls on the next calendar day. When the broker returns
+non-range text (e.g. `24 Hours`), that raw string is printed verbatim
+instead of a parsed range. The worker itself returns the raw `MarketInfo`
+as YAML (machine-friendly); the Brisbane-first layout is the CLI's doing.
 
 All control subcommands use the same replay-protection mechanism as the
 trade actions — re-running the same `unlock` (or `clear-prep`, etc.)
