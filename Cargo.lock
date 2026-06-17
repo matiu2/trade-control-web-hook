@@ -259,8 +259,8 @@ dependencies = [
 
 [[package]]
 name = "broker-tradenation"
-version = "0.9.0"
-source = "git+https://github.com/matiu2/tradenation-api.git?tag=broker-tradenation-v0.9.0#92ea2b660f1332ee1588f6afba6e8d26ee6d49d8"
+version = "0.10.0"
+source = "git+https://github.com/matiu2/tradenation-api.git?tag=broker-tradenation-v0.10.0#f7126db999b8d40ecd280633ca2094cad16068a9"
 dependencies = [
  "color-eyre",
  "reqwest 0.12.23",
@@ -268,7 +268,7 @@ dependencies = [
  "serde_json",
  "thiserror",
  "tracing",
- "tradenation-api 0.2.0 (git+https://github.com/matiu2/tradenation-api.git?tag=broker-tradenation-v0.9.0)",
+ "tradenation-api 0.3.0",
 ]
 
 [[package]]
@@ -3564,7 +3564,7 @@ dependencies = [
  "trade-calendar-maker",
  "trade-control-conventions",
  "trade-control-core",
- "tradenation-api 0.2.0 (git+https://github.com/matiu2/tradenation-api.git?tag=broker-tradenation-v0.8.0)",
+ "tradenation-api 0.3.0",
  "tradenation-instrument-cache",
 ]
 
@@ -3611,7 +3611,7 @@ dependencies = [
  "serde_yaml",
  "tracing",
  "trade-control-core",
- "tradenation-api 0.2.0 (git+https://github.com/matiu2/tradenation-api.git?tag=broker-tradenation-v0.9.0)",
+ "tradenation-api 0.3.0",
  "worker",
 ]
 
@@ -3641,8 +3641,8 @@ dependencies = [
 
 [[package]]
 name = "tradenation-api"
-version = "0.2.0"
-source = "git+https://github.com/matiu2/tradenation-api.git?tag=broker-tradenation-v0.9.0#92ea2b660f1332ee1588f6afba6e8d26ee6d49d8"
+version = "0.3.0"
+source = "git+https://github.com/matiu2/tradenation-api.git?tag=broker-tradenation-v0.10.0#f7126db999b8d40ecd280633ca2094cad16068a9"
 dependencies = [
  "aes-gcm",
  "candle-model",
@@ -3667,7 +3667,7 @@ dependencies = [
 [[package]]
 name = "tradenation-instrument-cache"
 version = "0.2.0"
-source = "git+https://github.com/matiu2/tradenation-api.git?tag=broker-tradenation-v0.8.0#fee5e59d137d73c6a2be172af15ace8181811fcb"
+source = "git+https://github.com/matiu2/tradenation-api.git?tag=broker-tradenation-v0.10.0#f7126db999b8d40ecd280633ca2094cad16068a9"
 dependencies = [
  "chrono",
  "dirs",
@@ -3676,7 +3676,7 @@ dependencies = [
  "serde_json",
  "thiserror",
  "tracing",
- "tradenation-api 0.2.0 (git+https://github.com/matiu2/tradenation-api.git?tag=broker-tradenation-v0.8.0)",
+ "tradenation-api 0.3.0",
 ]
 
 [[package]]
@@ -3727,7 +3727,7 @@ dependencies = [
  "trade-control-cli",
  "trade-control-conventions",
  "trade-control-core",
- "tradenation-api 0.2.0 (git+https://github.com/matiu2/tradenation-api.git?tag=broker-tradenation-v0.8.0)",
+ "tradenation-api 0.2.0",
  "trading-view",
 ]
 
