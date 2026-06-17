@@ -1682,6 +1682,32 @@ engine state is `core/src/plan_state.rs`; the FSM evaluator is
 `engine/src/evaluate.rs`; the candle-pattern detector port is
 `core/src/signals.rs`.
 
+#### Re-arming an existing setup (`--update`)
+
+`tv-arm` mints a **fresh random `trade_id` every run**, so the engine treats
+each re-arm as a brand-new plan — and the *old* plan keeps ticking in KV until
+its TTL lapses. When you move annotations on the chart and re-run, pass
+`--update` (only meaningful alongside `--register-plan`) so the prior plan is
+deleted from the engine first:
+
+```sh
+# Auto-resolve by instrument: deletes the one existing plan on this instrument,
+# then registers the fresh one. Hard-errors if more than one plan is registered
+# for the instrument (re-run with the explicit id from `plan list`).
+tv-arm-staging --register-plan --update ...
+
+# Explicit: delete exactly this prior trade_id, then register fresh.
+tv-arm-staging --register-plan --update hs-eurusd-a3f9c1d2 ...
+```
+
+`--update` reconciles **only the server-side engine plan** (it POSTs
+`plan-list` to find the target, then a signed `plan-delete` that clears the
+plan's `plan:` + `plan-state:` KV — see `plan delete` below). It does **not**
+touch TradingView alerts; keep deleting/recreating those by hand (or via
+`--create-alerts`) as before. A bare `--update` with no plan registered for the
+instrument is a logged no-op. The resolution logic is the pure
+`resolve_update_target` (`tv-arm/src/pipeline.rs`), unit-tested.
+
 #### Inspecting / managing registered plans (`trade-control plan list` / `show` / `delete`)
 
 Three subcommands let you see and manage what the engine is evaluating —

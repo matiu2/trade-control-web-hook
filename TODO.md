@@ -437,6 +437,23 @@ bundles as the intent source for the plan (no YAML re-parse).
       (renumbered — main took v35/v36 while this branch was open).
 - [x] clippy + fmt + tests green per crate; one commit per layer, pushed.
 
+### Stage E.11 — `tv-arm --update`: re-arm an existing engine plan (DONE — all green)
+
+Operator re-arm flow (move annotations, re-run) had no engine-side equivalent:
+tv-arm mints a fresh random trade_id each run, so the old registered plan kept
+ticking in KV until TTL. `plan delete` already landed on main (clears `plan:` +
+`plan-state:`); `--update` drives it from the arm path.
+
+- [x] `--update [trade-id]` flag (args.rs, `num_args=0..=1`, only with
+      `--register-plan`). Bare → auto-resolve by instrument (one → delete; none
+      → no-op; many → hard error w/ candidate ids); `<id>` → delete that.
+- [x] `resolve_update_target` pure helper (pipeline.rs) + 5 unit tests.
+- [x] `update_existing_plan`: POST `plan-list`, resolve, POST signed
+      `plan-delete`; `post_intent_blocking` (returns body) added to register_post,
+      `post_register_blocking` wraps it. Leaves TV alerts untouched.
+- [x] README ("Re-arming an existing setup") + CHANGELOG v38. tv-arm 158 green;
+      clippy + fmt.
+
 ### Stage F — retire the webhook (PENDING)
 ### Stage G — Durable Object websocket (only if demo proves a need) (PENDING)
 

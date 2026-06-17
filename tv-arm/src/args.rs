@@ -79,6 +79,24 @@ pub struct Args {
     #[arg(long)]
     pub register_plan: bool,
 
+    /// Re-arm an existing setup: before registering the fresh plan, delete the
+    /// prior registered plan for this instrument from the server-side engine
+    /// (clears its `plan:` + `plan-state:` KV so the new plan starts clean and
+    /// the old one stops ticking). Use after moving annotations on the chart
+    /// and re-running. Only meaningful with `--register-plan`.
+    ///
+    /// - **`--update`** (no value): auto-resolves the target by instrument —
+    ///   if exactly one plan is registered for this instrument it's deleted; if
+    ///   none, it's a no-op; if more than one, it's a hard error (pass the id).
+    /// - **`--update <trade-id>`**: deletes exactly that plan, no matter how
+    ///   many are registered. The trade_id comes from `trade-control plan list`.
+    ///
+    /// Leaves TradingView alerts untouched — this reconciles only the engine
+    /// plan. (tv-arm mints a fresh random trade_id each run, so without
+    /// `--update` a re-arm leaves the old plan ticking until its TTL.)
+    #[arg(long, num_args = 0..=1, default_missing_value = "")]
+    pub update: Option<String>,
+
     /// Register the plan in **observe-only (shadow) mode**: the server-side
     /// engine evaluates it and advances its state exactly as a live plan, but
     /// never dispatches its fires to the broker — each would-be fire is logged

@@ -1,5 +1,41 @@
 # Changelog
 
+## v38 — 2026-06-18 — `tv-arm --update`: re-arm an existing engine plan
+
+### Why
+
+`tv-arm` mints a fresh random `trade_id` every run, so re-arming a setup (move
+the annotations, re-run) registers a *new* plan while the old one keeps ticking
+in KV until its TTL. The operator's manual flow ("delete the TV alerts, re-run")
+had no engine-side equivalent — stale plans accumulated.
+
+### What changed
+
+- **`tv-arm` — `--update [trade-id]` flag** (only with `--register-plan`).
+  Before registering the fresh plan it deletes the prior one from the engine:
+  - bare `--update` auto-resolves by instrument — POSTs `plan-list`, and if
+    exactly one plan is registered for this instrument deletes it; none → no-op;
+    more than one → hard error naming the candidates (re-run with an explicit
+    id).
+  - `--update <trade-id>` deletes exactly that plan.
+  Reuses the `plan-delete` action (clears `plan:` + `plan-state:`). Leaves
+  TradingView alerts untouched — engine-only reconciliation.
+- **`tv-arm` — `post_intent_blocking`** returns the worker's response body (so
+  the `--update` flow can read the `plan-list` YAML); `post_register_blocking`
+  is now a thin wrapper over it.
+
+### Tests
+
+- `tv-arm`: `resolve_update_target` — explicit id verbatim; auto single-match;
+  auto no-match no-op; auto multi-match hard error (names candidates); bare
+  `--update` (`""`/whitespace) treated as auto. tv-arm 158 green; clippy + fmt.
+
+### Follow-up
+
+- The actual POSTs (`plan-list` / `plan-delete`) are network-bound and aren't
+  unit-tested in `update_existing_plan`; the pure `resolve_update_target` is.
+  End-to-end is exercised on the staging worker during re-arm.
+
 ## v37 — 2026-06-18 — Calendar / news bars folded into the registered plan
 
 ### Why

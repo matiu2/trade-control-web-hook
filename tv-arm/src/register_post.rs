@@ -40,14 +40,25 @@ const POST_TIMEOUT: Duration = Duration::from_secs(20);
 /// operator can see *why* the engine rejected the plan (bad trade_id match,
 /// signature, etc.).
 pub fn post_register_blocking(signed_body: String) -> Result<()> {
-    let runtime =
-        tokio::runtime::Runtime::new().wrap_err("starting tokio runtime for register POST")?;
-    runtime.block_on(post_register(signed_body))
+    post_intent_blocking(signed_body).map(|_| ())
 }
 
-/// Async POST of the signed body. Factored out so it can be exercised against a
-/// local mock in tests without the runtime bridge.
-async fn post_register(signed_body: String) -> Result<()> {
+/// POST any already-signed intent body to the worker and return the worker's
+/// 2xx response body. Same destination + runtime bridge as
+/// [`post_register_blocking`], but surfaces the response text — used by the
+/// `--update` flow to read the `plan-list` YAML (a register POST discards it).
+/// A non-2xx status or transport failure is an `Err` carrying the worker's
+/// message.
+pub fn post_intent_blocking(signed_body: String) -> Result<String> {
+    let runtime =
+        tokio::runtime::Runtime::new().wrap_err("starting tokio runtime for worker POST")?;
+    runtime.block_on(post_intent(signed_body))
+}
+
+/// Async POST of the signed body, returning the worker's response text on 2xx.
+/// Factored out so it can be exercised against a local mock in tests without
+/// the runtime bridge.
+async fn post_intent(signed_body: String) -> Result<String> {
     let client = reqwest::Client::builder()
         .timeout(POST_TIMEOUT)
         .build()
@@ -58,14 +69,14 @@ async fn post_register(signed_body: String) -> Result<()> {
         .body(signed_body)
         .send()
         .await
-        .wrap_err_with(|| format!("POST register to {BAKED_WEBHOOK}"))?;
+        .wrap_err_with(|| format!("POST to {BAKED_WEBHOOK}"))?;
     let status = resp.status();
     let body = resp.text().await.unwrap_or_default();
     if status.is_success() {
-        return Ok(());
+        return Ok(body);
     }
     Err(eyre!(
-        "worker rejected register: HTTP {} — {}",
+        "worker rejected request: HTTP {} — {}",
         status.as_u16(),
         body.trim()
     ))
