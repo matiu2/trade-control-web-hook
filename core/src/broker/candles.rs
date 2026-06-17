@@ -21,7 +21,7 @@ use chrono::{DateTime, Utc};
 /// TradeNation report), so a freshly-closed H1 bar opened at 14:00 carries
 /// `time = 14:00` even though it closed at 15:00. The engine's watermark is
 /// compared against this `time`.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Candle {
     pub time: DateTime<Utc>,
     pub o: f64,

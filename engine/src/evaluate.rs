@@ -51,7 +51,8 @@
 use chrono::{DateTime, Utc};
 
 use trade_control_core::broker::Candle;
-use trade_control_core::intent::{Action, Direction, Intent, SignalKind};
+use trade_control_core::intent::{Action, Direction, SignalKind};
+use trade_control_core::plan_eval::{FiredIntent, PlanEval};
 use trade_control_core::plan_state::{Phase, PlanState};
 use trade_control_core::signals::{DetectorConfig, LatchedSignal, latched_signal_at};
 use trade_control_core::trade_plan::{
@@ -64,42 +65,6 @@ use trade_control_core::trade_plan::{
 /// needn't depend on the tv-arm-side `conventions` basename enum.
 const ROLE_BREAK_AND_CLOSE: &str = "prep-break-and-close";
 const ROLE_RETEST: &str = "prep-retest";
-
-/// One intent the evaluator decided to fire this run, tagged with the candle
-/// that triggered it. The wrapper synthesises a `Shell` from `candle` and
-/// dispatches `intent` through the same handlers the webhook uses.
-#[derive(Debug, Clone)]
-pub struct FiredIntent {
-    /// The `rule_id` that fired — for logging / attribution.
-    pub rule_id: String,
-    /// The exact intent the TV alert would have POSTed, cloned from the rule.
-    pub intent: Intent,
-    /// The candle on which the trigger fired (its close/high/low/open/time
-    /// become the dispatched `Shell`).
-    pub candle: Candle,
-    /// The latched candle-pattern signal, set only when a `PinePattern` (H&S
-    /// enter) rule fired. The wrapper folds its geometry
-    /// (`signal_high`/`signal_low`/`golden`/`signal_confirmed`/`recent_*`/…)
-    /// onto the dispatched `Shell` so the H&S enter resolves its entry/SL/TP
-    /// against the *pattern* extremes — exactly as the TV alert's `{{plot(...)}}`
-    /// substitutions did. `None` for every non-Pine trigger (M/W, vetos, preps),
-    /// which carry no pattern geometry.
-    pub signal: Option<LatchedSignal>,
-}
-
-/// The result of one [`evaluate_plan`] run.
-#[derive(Debug, Clone)]
-pub struct PlanEval {
-    /// Intents to dispatch, in candle order.
-    pub fired: Vec<FiredIntent>,
-    /// The advanced state to persist. The watermark has moved to the last
-    /// candle processed (or is unchanged when `new_candles` is empty).
-    pub new_state: PlanState,
-    /// True once the plan has reached [`Phase::Done`] — the wrapper clears the
-    /// plan + state. (M/W plans never reach this via the spine; they end by TTL
-    /// or a veto.)
-    pub done: bool,
-}
 
 /// The starting spine phase for a plan, derived from which rules it carries.
 /// A plan with a break-and-close prep starts gated behind it; everything else
@@ -576,7 +541,7 @@ mod tests {
     use std::collections::BTreeMap;
 
     use trade_control_core::broker::Granularity;
-    use trade_control_core::intent::{BrokerKind, Direction};
+    use trade_control_core::intent::{BrokerKind, Direction, Intent};
     use trade_control_core::trade_plan::FireMode;
     use trade_control_core::tunable::Tunable;
 

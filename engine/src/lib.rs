@@ -48,6 +48,7 @@
 // without each reaching into `trade_control_core` independently.
 pub use trade_control_core::broker::{Broker, Candle, CandleError, Granularity};
 pub use trade_control_core::intent::{self, Action, Intent};
+pub use trade_control_core::plan_eval::{FiredIntent, PlanEval};
 pub use trade_control_core::plan_state::{Phase, PlanState};
 pub use trade_control_core::signals::{DetectorConfig, LatchedSignal};
 pub use trade_control_core::state::{StateError, StateStore, StoredPlan};
@@ -56,9 +57,7 @@ pub use trade_control_core::trade_plan::{
 };
 
 mod evaluate;
-pub use evaluate::{
-    FiredIntent, PlanEval, eval_trigger, evaluate_plan, initial_phase, seed_plan_state,
-};
+pub use evaluate::{eval_trigger, evaluate_plan, initial_phase, seed_plan_state};
 
 #[cfg(test)]
 mod tests {
