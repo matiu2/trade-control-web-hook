@@ -379,6 +379,54 @@ trendline anchor is in-window (then the bar-index count is exact).
       warning surface stays as belt-and-braces for a pathological out-of-reach
       anchor.
 
+### Stage E.10 — fold calendar/news bars into the registered plan (IN PROGRESS)
+
+Bug (operator, 2026-06-18): `tv-arm --register-plan` produced a server-side
+`TradePlan` with **no** pause/resume/news-start/news-end rules, while
+`--create-alerts` correctly created those calendar bars as TV alerts. Root
+cause: `register_trade_plan` runs at pipeline step 5b — *before* the
+pause/news/calendar bundles are built (steps 6–8) — and `build_trade_plan`
+only walks `built_trade.alerts` (veto/prep/enter/close). The auxiliary bundles
+never reach the plan. Two more gaps compound it: the engine has no evaluation
+path for control rules, and the cron dispatcher rejects their actions.
+
+Decisions (locked with user): suppress control fires in `--shadow` (consistent
+with shadow = never touch live KV); reuse the in-memory `BuiltPause`/`BuiltNews`
+bundles as the intent source for the plan (no YAML re-parse).
+
+#### Commit 1 — engine: evaluate non-terminal control rules (DONE — all green)
+- [x] `is_control_rule()` in `engine/src/evaluate.rs` (Pause/Resume/NewsStart/
+      NewsEnd actions). `is_guard` unchanged.
+- [x] `evaluate_controls`: always-armed, **non-terminal** pass in
+      `evaluate_plan` (runs before guards), firing control rules on their
+      `TimeReached` trigger: push intent + latch via `state.fired`, no
+      `Phase::Done`.
+- [x] 3 tests: pause fires at its epoch without ending the spine (enter
+      heartbeat still fires same bar); pause+resume fire on own bars + don't
+      refire; two news windows all four fire. engine 35 green; clippy; fmt.
+
+#### Commit 2 — worker cron dispatch (DONE — all green)
+- [x] Routed Pause/Resume/NewsStart/NewsEnd in `dispatch_action`
+      (`src/cron/engine.rs`) to the existing `handle_pause`/`handle_resume`/
+      `handle_news_start`/`handle_news_end` via `control_result`.
+- [x] Confirmed `tick_one`'s shadow path suppresses these (returns before
+      dispatch) — no extra work (decision #1).
+- [x] No native unit test: `dispatch_action` is async + wasm-bound — verified by
+      worker compiling + the demo parallel run (Stage F gate).
+
+#### Commit 3 — tv-arm: fold bundles into the registered plan (DONE — all green)
+- [x] `cli::run_calendar_bars` returns `Vec<BuiltCalendarBundle>`; bin ignores it.
+- [x] `register_trade_plan` moved to after the bundles are built (step 8b).
+- [x] `append_control_rules` (`trade_plan_build.rs`) → one `TimeReached`
+      `ConditionRule` per bundle alert (`WindowAlert` trait unifies pause/news
+      alerts), anchored to start/end edge. Dropped the dead `roles.*_pairs.first()`
+      arms in `trigger_for`.
+- [x] Test: chart pause + news + calendar event → 8 control rules. tv-arm 153.
+
+#### Throughout (DONE)
+- [x] README + CHANGELOG (renumber to v37 on this branch — main took v35/v36).
+- [x] clippy + fmt + tests green per crate; one commit per layer.
+
 ### Stage F — retire the webhook (PENDING)
 ### Stage G — Durable Object websocket (only if demo proves a need) (PENDING)
 
