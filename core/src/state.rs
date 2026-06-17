@@ -1134,10 +1134,11 @@ pub async fn clear_named_vetos<S: StateStore>(
     Ok(cleared)
 }
 
-/// Simple in-memory [`StateStore`] used by core unit tests and by the
-/// worker crate's tests. Not exposed publicly outside `cfg(test)` to
-/// avoid leaking it into release builds.
-#[cfg(test)]
+/// Simple in-memory [`StateStore`] used by core unit tests and, under the
+/// `test-support` feature, by the native replay CLI to drive the engine offline.
+/// Gated so it never leaks into the wasm worker release build (which enables
+/// neither `test` nor `test-support`).
+#[cfg(any(test, feature = "test-support"))]
 mod memstore {
     use super::*;
     use std::cell::RefCell;
@@ -1820,6 +1821,12 @@ mod memstore {
         }
     }
 }
+
+/// Re-export the in-memory store under the same gate as its module, so consumers
+/// name it as `trade_control_core::state::MemStateStore` (core's own tests still
+/// reach it via `memstore::MemStateStore`).
+#[cfg(any(test, feature = "test-support"))]
+pub use memstore::MemStateStore;
 
 #[cfg(test)]
 mod tests {

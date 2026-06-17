@@ -12,10 +12,12 @@ No deploy to staging/prod. Each step its own green commit (test + clippy + fmt +
 - [x] serde round-trip unit test (JSON fixture → parse → reserialize → compare serde_json::Value)
 - [x] Gate: core 504 + engine 28 tests green; clippy clean; fmt; full workspace builds
 
-## (b) MemStateStore behind test-support feature
-- [ ] `mod memstore` #[cfg(test)] → #[cfg(any(test, feature = "test-support"))]
-- [ ] `test-support = []` in core/Cargo.toml [features]; `pub use memstore::MemStateStore` gated
-- [ ] Gate: cargo test -p trade-control-core --features test-support → commit
+## (b) MemStateStore behind test-support feature — DONE (commit pending)
+- [x] `mod memstore` #[cfg(test)] → #[cfg(any(test, feature = "test-support"))]
+- [x] `test-support = ["dep:serde_json", "chrono/clock"]` (MemStateStore needs both off-test);
+      serde_json added as optional dep; `pub use memstore::MemStateStore` gated
+- [x] Verified: default tests + --features test-support tests both 504 green; clippy clean both;
+      non-test lib build with feature compiles MemStateStore; wasm core build does NOT pull test-support
 
 ## (c) record_tick_to_r2 + ScheduleContext threading — SHADOW ticks only
 - [ ] src/cron.rs: `_ctx` → `ctx`; pass `&ctx` to run_engine_tick
