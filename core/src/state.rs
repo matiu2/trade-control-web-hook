@@ -11,7 +11,7 @@ use std::future::Future;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::intent::{Action, Direction};
+use crate::intent::{Action, Direction, NoEntryWindow};
 use crate::plan_state::PlanState;
 use crate::trade_plan::TradePlan;
 
@@ -329,6 +329,39 @@ pub struct SpreadBlackoutWindow {
 }
 
 impl HasExpiry for SpreadBlackoutWindow {
+    fn expires_at(&self) -> DateTime<Utc> {
+        self.expires_at
+    }
+}
+
+/// One stored **market-hours entry blackout** window for a single instrument.
+///
+/// Per-instrument key `blackout-hours:{instrument}`, written daily by the
+/// market-hours cron (which resolves the broker's current-season session into
+/// a UTC [`NoEntryWindow`]) and read by the `run_enter` reject gate + the cron
+/// sweep. Trading hours are an *instrument* property — the same across every
+/// account — so unlike vetos/cooldowns this key carries **no account scope**.
+///
+/// The `window` is the pure, comparison-ready type; `updated_at` records when
+/// the cron last refreshed it (audit / staleness), and `expires_at` ages an
+/// orphaned row out if the cron stops running. The whole feature is
+/// **fail-open**: an absent or TTL-expired row means *no blackout*, so the TTL
+/// (~26h, longer than a day) tolerates a single missed cron tick without ever
+/// blocking entries on stale data.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BlackoutHoursEntry {
+    /// Instrument this window applies to (the broker market name).
+    #[serde(skip_serializing_if = "String::is_empty", default)]
+    pub instrument: String,
+    /// The resolved UTC blackout window for this instrument.
+    pub window: NoEntryWindow,
+    /// When the daily cron last refreshed this row.
+    pub updated_at: DateTime<Utc>,
+    /// Safety TTL — ages out an orphaned row if the cron stops refreshing.
+    pub expires_at: DateTime<Utc>,
+}
+
+impl HasExpiry for BlackoutHoursEntry {
     fn expires_at(&self) -> DateTime<Utc> {
         self.expires_at
     }
@@ -809,6 +842,26 @@ pub trait StateStore {
     fn get_spread_blackout_window(
         &self,
     ) -> impl Future<Output = Result<Option<SpreadBlackoutWindow>, StateError>>;
+
+    /// Write (or overwrite) the **market-hours entry blackout** window for
+    /// `instrument`. Called once per instrument per day by the market-hours
+    /// cron with a ~26h `ttl_seconds` so a single missed tick can't strand a
+    /// stale window. `now` stamps `updated_at`; `expires_at` is `now + ttl`.
+    fn set_blackout_window(
+        &self,
+        instrument: &str,
+        window: NoEntryWindow,
+        now: DateTime<Utc>,
+        ttl_seconds: u64,
+    ) -> impl Future<Output = Result<(), StateError>>;
+
+    /// Read the market-hours blackout window for `instrument`. `None` when
+    /// none is set (key absent or TTL-expired) — the **fail-open** case the
+    /// reject gate and sweep treat as "no blackout".
+    fn get_blackout_window(
+        &self,
+        instrument: &str,
+    ) -> impl Future<Output = Result<Option<NoEntryWindow>, StateError>>;
 
     /// Create-or-update a per-trade blackout record. Sub-plans 4/5 call
     /// this with `applied = true` and populated payloads.
@@ -1623,6 +1676,38 @@ mod memstore {
             match self.get_live("spread-blackout:window", Utc::now()) {
                 Some(text) => serde_json::from_str(&text)
                     .map(Some)
+                    .map_err(|e| StateError::Backend(e.to_string())),
+                None => Ok(None),
+            }
+        }
+
+        async fn set_blackout_window(
+            &self,
+            instrument: &str,
+            window: NoEntryWindow,
+            now: DateTime<Utc>,
+            ttl_seconds: u64,
+        ) -> Result<(), StateError> {
+            let ttl = ttl_seconds.max(MIN_TTL_SECONDS);
+            let entry = BlackoutHoursEntry {
+                instrument: instrument.to_string(),
+                window,
+                updated_at: now,
+                expires_at: now + chrono::Duration::seconds(ttl as i64),
+            };
+            let body =
+                serde_json::to_string(&entry).map_err(|e| StateError::Backend(e.to_string()))?;
+            self.put(format!("blackout-hours:{instrument}"), body, ttl, now);
+            Ok(())
+        }
+
+        async fn get_blackout_window(
+            &self,
+            instrument: &str,
+        ) -> Result<Option<NoEntryWindow>, StateError> {
+            match self.get_live(&format!("blackout-hours:{instrument}"), Utc::now()) {
+                Some(text) => serde_json::from_str::<BlackoutHoursEntry>(&text)
+                    .map(|e| Some(e.window))
                     .map_err(|e| StateError::Backend(e.to_string())),
                 None => Ok(None),
             }
@@ -3050,6 +3135,78 @@ mod tests {
         let json = serde_json::to_string(&entry).unwrap();
         let parsed: SpreadBlackoutWindow = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed, entry);
+    }
+
+    #[test]
+    fn blackout_hours_entry_round_trips() {
+        let entry = BlackoutHoursEntry {
+            instrument: "US 500".into(),
+            window: NoEntryWindow::new(18 * 60, 2 * 60),
+            updated_at: ts("2026-06-18T06:00:00Z"),
+            expires_at: ts("2026-06-19T08:00:00Z"),
+        };
+        let json = serde_json::to_string(&entry).unwrap();
+        let parsed: BlackoutHoursEntry = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, entry);
+        assert_eq!(parsed.window.open_min, 18 * 60);
+        assert_eq!(parsed.window.close_min, 2 * 60);
+    }
+
+    #[test]
+    fn memstore_blackout_window_round_trips_per_instrument() {
+        use super::memstore::MemStateStore;
+        let store = MemStateStore::new();
+        let now = Utc::now();
+
+        // Absent before any write — the fail-open case (no blackout).
+        assert_eq!(
+            pollster::block_on(store.get_blackout_window("US 500")).unwrap(),
+            None
+        );
+
+        let us500 = NoEntryWindow::new(18 * 60, 2 * 60);
+        let gold = NoEntryWindow::new(21 * 60, 23 * 60);
+        pollster::block_on(store.set_blackout_window("US 500", us500, now, 26 * 3600)).unwrap();
+        pollster::block_on(store.set_blackout_window("Spot Gold", gold, now, 26 * 3600)).unwrap();
+
+        // Each instrument reads back its own window — keys don't collide.
+        assert_eq!(
+            pollster::block_on(store.get_blackout_window("US 500")).unwrap(),
+            Some(us500)
+        );
+        assert_eq!(
+            pollster::block_on(store.get_blackout_window("Spot Gold")).unwrap(),
+            Some(gold)
+        );
+        // An instrument never written stays fail-open.
+        assert_eq!(
+            pollster::block_on(store.get_blackout_window("EUR/USD")).unwrap(),
+            None
+        );
+
+        // Overwrite replaces the window for that instrument.
+        let revised = NoEntryWindow::new(19 * 60, 60);
+        pollster::block_on(store.set_blackout_window("US 500", revised, now, 26 * 3600)).unwrap();
+        assert_eq!(
+            pollster::block_on(store.get_blackout_window("US 500")).unwrap(),
+            Some(revised)
+        );
+    }
+
+    #[test]
+    fn memstore_blackout_window_expires_fail_open() {
+        use super::memstore::MemStateStore;
+        let store = MemStateStore::new();
+        // Stamp the window two days in the past with a 26h TTL → already
+        // expired → reads back None (no blackout), the fail-open guarantee.
+        let stale = Utc::now() - chrono::Duration::days(2);
+        let w = NoEntryWindow::new(18 * 60, 2 * 60);
+        pollster::block_on(store.set_blackout_window("US 500", w, stale, 26 * 3600)).unwrap();
+        assert_eq!(
+            pollster::block_on(store.get_blackout_window("US 500")).unwrap(),
+            None,
+            "an expired window must read as no-blackout (fail-open)"
+        );
     }
 
     #[test]

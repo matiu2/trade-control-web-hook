@@ -3500,6 +3500,21 @@ mod dispatcher_outcome_tests {
         ) -> Result<Option<trade_control_core::state::SpreadBlackoutWindow>, StateError> {
             Ok(None)
         }
+        async fn set_blackout_window(
+            &self,
+            _instrument: &str,
+            _window: trade_control_core::intent::NoEntryWindow,
+            _now: DateTime<Utc>,
+            _ttl_seconds: u64,
+        ) -> Result<(), StateError> {
+            Ok(())
+        }
+        async fn get_blackout_window(
+            &self,
+            _instrument: &str,
+        ) -> Result<Option<trade_control_core::intent::NoEntryWindow>, StateError> {
+            Ok(None)
+        }
         async fn upsert_spread_blackout_record(
             &self,
             _record: &trade_control_core::state::SpreadBlackoutRecord,

@@ -16,8 +16,13 @@ reject gate covers both. Plan: `~/.home-claude/plans/market-hours-entry-blackout
       (midnight-wrap + degenerate exhaustive tests). `Intent.blackout_close`
       signed field (`#[serde(default)]` = CancelResting) + signed round-trip /
       tamper tests through `parse_and_verify`. 514 core tests green.
-- [ ] **Commit 2 — KV window storage.** `get/set_blackout_window` on the state
-      trait + KV impl + mem-store double; ~26h TTL, fail-open.
+- [x] **Commit 2 — KV window storage.** `get/set_blackout_window(instrument, …)`
+      on the `StateStore` trait + `KvStateStore` impl (per-instrument key
+      `blackout-hours:{instrument}`, no account scope) + `MemStateStore` double +
+      both worker test fakes. New `BlackoutHoursEntry` storage wrapper in
+      `core/src/state.rs`. ~26h TTL, fail-open (absent/expired → no blackout).
+      Tests: core serde round-trip, mem-store per-instrument isolation +
+      overwrite + expiry-fail-open; worker decode + key-format. WASM build green.
 - [ ] **Commit 3 — daily cron derivation.** `src/cron/blackout_hours.rs`:
       `refresh_market_hours` (distinct instruments from entry attempts +
       registered plans; `market_info` → UTC window via pure `window_from_session`
