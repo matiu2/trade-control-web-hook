@@ -572,10 +572,29 @@ async fn dispatch_action<B: Broker>(
             }
         }
         Action::Prep => control_result(crate::handle_prep(store, verified, now).await, "prepped"),
+        // Calendar/news control rules: a plan folds in pause/resume (blackout
+        // window) and news-start/news-end (news window) as TimeReached rules.
+        // They set KV state only (no broker), exactly as the matching TV alert
+        // message would have. Route to the same handlers the webhook uses.
+        Action::Pause => {
+            control_result(crate::handle_pause(store, verified, now).await, "pause-set")
+        }
+        Action::Resume => control_result(
+            crate::handle_resume(store, verified, now).await,
+            "pause-cleared",
+        ),
+        Action::NewsStart => control_result(
+            crate::handle_news_start(store, verified, now).await,
+            "news-window-open",
+        ),
+        Action::NewsEnd => control_result(
+            crate::handle_news_end(store, verified, now).await,
+            "news-window-closed",
+        ),
         other => {
-            // Status / Unlock / Clear* / Pause / Resume / News* / Register /
-            // PrepExpire are operator/control actions a plan never embeds as a
-            // fired rule. Treat as a no-op rejection so it's visible but inert.
+            // Status / Unlock / Clear* / Register / PrepExpire / MarketInfo /
+            // Plan* are operator/control actions a plan never embeds as a fired
+            // rule. Treat as a no-op rejection so it's visible but inert.
             ActionResult::Rejected {
                 response: worker::Response::error("engine: unsupported fired action", 400),
                 outcome: format!("rejected: unsupported-action {other:?}"),

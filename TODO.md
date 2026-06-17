@@ -408,11 +408,16 @@ bundles as the intent source for the plan (no YAML re-parse).
 #### Commit 2 — worker cron dispatch (DONE — all green)
 - [x] Routed Pause/Resume/NewsStart/NewsEnd in `dispatch_action`
       (`src/cron/engine.rs`) to the existing `handle_pause`/`handle_resume`/
-      `handle_news_start`/`handle_news_end` via `control_result`.
-- [x] Confirmed `tick_one`'s shadow path suppresses these (returns before
-      dispatch) — no extra work (decision #1).
-- [x] No native unit test: `dispatch_action` is async + wasm-bound — verified by
-      worker compiling + the demo parallel run (Stage F gate).
+      `handle_news_start`/`handle_news_end` via `control_result`; replaced the
+      `other =>` unsupported-action arm (now only Status/Unlock/Clear*/Register/
+      PrepExpire/MarketInfo/Plan*).
+- [x] Confirmed `tick_one`'s shadow path (`log_shadow_fire` loop, returns before
+      dispatch) already suppresses these in shadow — no extra work (decision #1).
+- [x] No native unit test: `dispatch_action` is async + wasm-bound (`Env` /
+      `worker::Response`), same constraint the C3/C4 parity note records —
+      verified by worker compiling (native 200 tests + wasm32 clippy) and the
+      demo parallel run (Stage F gate). The pure fire/latch logic is the
+      Commit-1 native test.
 
 #### Commit 3 — tv-arm: fold bundles into the registered plan (DONE — all green)
 - [x] `cli::run_calendar_bars` returns `Vec<BuiltCalendarBundle>`; bin ignores it.
