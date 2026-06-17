@@ -1,5 +1,54 @@
 # Changelog
 
+## v29 — 2026-06-17 — H&S/IHS enter anchors entry+SL to signal_high/signal_low (bug #10 finding A)
+
+### Why
+
+An H&S `enter` fires twice — once on the break candle (`signal_confirmed: 0`)
+and once on the confirmed re-fire (`signal_confirmed: 1`). A confirmed re-fire
+is meant to be the *same trade* — same pattern-invalidation stop — just
+confirmed a candle later. Instead it silently became a *different,
+tighter-stopped* trade: the worker anchored both entry and SL to the
+**triggering candle's own high/low**, so the narrower confirmed candle handed a
+tighter, drifted stop. Surfaced by `hs-adidas-b70c1d31` (ADIDAS short,
+2026-06-16): designed entry 174.0 / SL 175.62 (stop 1.62) became entry 173.30 /
+SL 174.30 (stop 1.00) ≈ the confirmed candle's own low/high — even though
+`signal_high 175.61` / `signal_low 173.99` were identical on both fires. The
+re-substituted trade would have stopped out near-instantly had it filled, and
+it corrupts attribution (recorder's SL ≠ broker's SL).
+
+### What changed (behaviour)
+
+- New `PriceAnchor::SignalHigh` / `PriceAnchor::SignalLow` variants resolve to
+  the shell's latched `signal_high` / `signal_low` (with the same graceful
+  `unwrap_or(high/low)` fallback as the `recent_*` anchors).
+- The H&S / IHS enter builders now anchor entry **and** SL to those signal
+  extremes instead of the candle wick: H&S short = entry `signal_low`, SL
+  `signal_high`; IHS long = entry `signal_high`, SL `signal_low`. The
+  break-candle fire and the confirmed re-fire now resolve to identical
+  geometry.
+- `sl_anchor` override now also accepts `signal_high` (short) / `signal_low`
+  (long).
+
+### Breaking
+
+None. Additive enum variant — existing intents using `from: high`/`low`/etc.
+still resolve exactly as before.
+
+### Tests
+
+- `core`: `anchor_price` unit tests for `SignalHigh`/`SignalLow` (present +
+  fallback + YAML round-trip); a resolution regression
+  (`hs_short_signal_anchored_enter_resolves_identically_across_refires`) using
+  the real adidas numbers, asserting entry+SL are identical across the
+  break-candle and confirmed-candle shells.
+- `cli`: H&S/IHS builder geometry tests updated to assert the signal anchors.
+
+### Follow-up
+
+Finding B of bug #10 (Pine emitted `signal_confirmed: 1` one candle too early)
+is a separate Pine-source fix, not in this change.
+
 ## v28 — 2026-06-16 — expired/too-early intents return 200 declined, not 400 (bug #9)
 
 ### Why

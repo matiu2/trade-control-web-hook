@@ -661,6 +661,74 @@ mod tests {
         assert!((r.take_profit - 1.1110).abs() < 1e-9);
     }
 
+    /// Regression for bug #10 finding A (`hs-adidas-b70c1d31`): an H&S short
+    /// `enter` whose entry/SL anchor to `signal_low`/`signal_high` must resolve
+    /// to *identical* geometry on the break-candle fire and the later confirmed
+    /// re-fire — because the pattern levels (`signal_high`/`signal_low`) are the
+    /// same on both, even though each candle's own `high`/`low` wick differs.
+    ///
+    /// The incident: with the old `Low`/`High` anchors the confirmed (narrower)
+    /// candle handed a tighter, drifted stop (entry 173.30 / SL 174.30) instead
+    /// of the designed pattern stop. Anchoring to the latched signal extremes
+    /// removes that drift.
+    #[test]
+    fn hs_short_signal_anchored_enter_resolves_identically_across_refires() {
+        use crate::intent::ResolvedEntry;
+
+        // The latched H&S pattern levels — identical on both fires.
+        let signal_high = 175.61;
+        let signal_low = 173.99;
+        let pip = 0.01; // ADS.DE quotes in 0.01 increments.
+
+        // Short H&S enter: stop-entry below the break at signal_low + 1 pip,
+        // SL above the pattern at signal_high + 1 pip, absolute designed TP.
+        let mut intent = long_market_intent();
+        intent.direction = Some(Direction::Short);
+        intent.entry = Some(EntrySpec::Stop {
+            from: PriceAnchor::SignalLow,
+            offset_pips: 1.0,
+            on_too_close: None,
+        });
+        intent.stop_loss = Some(PriceRef::Anchored {
+            from: PriceAnchor::SignalHigh,
+            offset_pips: 1.0,
+        });
+        intent.take_profit = Some(TakeProfit::Anchored(PriceRef::Absolute {
+            absolute: 171.07402,
+        }));
+
+        // Two shells that share the signal levels but carry different candle
+        // wicks — the break candle (wide) vs the confirmed candle (narrow).
+        let mut break_candle = shell();
+        break_candle.close = 174.50;
+        break_candle.high = 175.61;
+        break_candle.low = 173.99;
+        break_candle.signal_high = Some(signal_high);
+        break_candle.signal_low = Some(signal_low);
+
+        let mut confirmed_candle = shell();
+        confirmed_candle.close = 174.50;
+        confirmed_candle.high = 174.29; // the narrow re-fire wick from the incident
+        confirmed_candle.low = 173.29;
+        confirmed_candle.signal_high = Some(signal_high);
+        confirmed_candle.signal_low = Some(signal_low);
+
+        let r1 = Resolved::from_intent(&intent, &break_candle, pip).unwrap();
+        let r2 = Resolved::from_intent(&intent, &confirmed_candle, pip).unwrap();
+
+        // Stop-loss is the pattern high + 1 pip on BOTH fires — no drift.
+        assert!((r1.stop_loss - (signal_high + pip)).abs() < 1e-9);
+        assert!((r1.stop_loss - r2.stop_loss).abs() < 1e-9);
+
+        // Entry trigger is the pattern low + 1 pip on BOTH fires — no drift.
+        let trigger = |r: &Resolved| match r.entry {
+            ResolvedEntry::Stop { trigger_price } => trigger_price,
+            _ => panic!("expected stop entry"),
+        };
+        assert!((trigger(&r1) - (signal_low + pip)).abs() < 1e-9);
+        assert!((trigger(&r1) - trigger(&r2)).abs() < 1e-9);
+    }
+
     #[test]
     fn stop_entry_carries_resolved_on_too_close_market() {
         use crate::intent::{OnTooClose, OnTooCloseAction};
