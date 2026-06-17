@@ -191,7 +191,28 @@ M/W ships first; `PinePattern` (H&S entry) is stubbed until Stage E.
       (register now persists). Green: core (473) + worker (195) tests; clippy;
       fmt; `cargo check --target wasm32` (worker).
 
-##### C2 — pure `evaluate_plan` for M/W (engine crate) (PENDING)
+##### C2 — pure `evaluate_plan` for M/W (engine crate) (DONE — all green)
+- [x] `engine/src/evaluate.rs`: `evaluate_plan(plan, prior, new_candles, now,
+      expires_at) -> PlanEval {fired, new_state, done}`. Per candle: guards →
+      spine. `initial_phase` derives the spine from rule_ids (b&c present ⇒
+      AwaitBreakAndClose else AwaitEntry). `eval_trigger` handles
+      Horizontal/PriceValue (Intrabar straddle + close-side; OnClose cross vs
+      persisted `last_close`, seed bar no-fire), Trendline (interpolate level at
+      candle time, respect `extend_forward`), `TimeReached`, `MwEveryBar`
+      heartbeat; `PinePattern` STUB (H&S inert until Stage E). Break-and-close
+      fires once → stamps `break_close_at` → advances → dies. Retest stamped
+      every AwaitEntry bar into `retest_seen_at` (persisted, cross-tick durable);
+      entry gated on retest∈(break_close_at, entry]. M/W enter (EveryBar) never
+      latches; Once enter ⇒ Done. Veto guards terminal, latched in `fired`,
+      `armed_in` permissive (trade-expiry any phase, rest AwaitEntry+).
+- [x] `cargo add chrono` (clock) + `serde_json` (dev) to engine. Re-exports
+      `evaluate_plan`/`eval_trigger`/`initial_phase`/`FiredIntent`/`PlanEval`.
+- [x] 21 native tests: cross modes (on-close vs prior, seed no-fire, intrabar
+      straddle+side, either), trendline interp + extend_forward, time/mw/pine,
+      spine derivation, b&c advances+dies, entry blocked-until-retest then Done,
+      retest persists across ticks, trade-expiry guard, latched-guard no-refire,
+      last_close cross-tick, watermark monotonic, BTreeMap determinism. Green:
+      engine (21) tests; clippy; fmt; wasm32 check.
 ##### C3 — `run_engine_tick` wrapper + Shell synthesis + dispatch (PENDING)
 ##### C4 — cron wiring + webhook-vs-engine parity test (PENDING)
 ### Stage E — port H&S Pine candle detector to Rust (PENDING)

@@ -52,6 +52,9 @@ pub use trade_control_core::trade_plan::{
     BarEvent, ConditionRule, CrossDir, FireMode, LinePoint, TradePlan, Trigger,
 };
 
+mod evaluate;
+pub use evaluate::{FiredIntent, PlanEval, eval_trigger, evaluate_plan, initial_phase};
+
 #[cfg(test)]
 mod tests {
     use super::*;
