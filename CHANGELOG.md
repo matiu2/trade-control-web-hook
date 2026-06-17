@@ -1,5 +1,66 @@
 # Changelog
 
+## v38 — 2026-06-18 — Trim no-op engine ticks from the R2 `ticks/` recording
+
+### Why
+
+The cron engine recorded a full `TickBundle` on **every** tick that saw a new
+closed bar — even when that tick changed nothing (no intent fired, no phase
+transition, plan not done, KV write OK). Those "no-op" bundles aren't compact:
+each re-stores the whole `plan: TradePlan`, both the `prior` and `new` `PlanState`s,
+*and* the wide `detector_window` slice. Over a long-running pattern with a quiet
+entry phase (e.g. an H&S waiting for break-and-close), that's one fat,
+near-duplicate object per bar carrying no information. This stops recording them
+while keeping a lightweight trace so a silent gap in the `ticks/` stream is never
+mistaken for "the cron stopped".
+
+### What changed
+
+- **New pure predicate `PlanEval::is_noteworthy(&prior)`** (`core/src/plan_eval.rs`):
+  a tick is noteworthy if it `fired` anything, finished the plan (`done`), or the
+  FSM's *meaningful* state advanced vs the prior.
+- **New helper `PlanState::advanced_vs(&prior)`** (`core/src/plan_state.rs`):
+  compares only the FSM-meaningful fields — `phase`, `fired`, `break_close_at`,
+  `retest_seen_at`, `mw`. It deliberately **ignores** `watermark`, `expires_at`,
+  and `last_close`, all of which churn on essentially every tick (a whole-struct
+  `!=` would make nothing a no-op).
+- **Live + shadow record sites gated** (`src/cron/engine.rs`): both now call
+  `record_tick_to_r2` only when `eval.is_noteworthy(&prior)`; otherwise they emit
+  a single heartbeat `rlog!` and skip the write. The **put-failed** site is
+  unchanged — a failed transition (`success:false`) is always recorded.
+
+### Behaviour (visible)
+
+- **Recording volume drops**: no-op ticks no longer produce R2 objects. The
+  `ticks/` prefix now holds only ticks where something fired / finished /
+  advanced, plus failed-KV-transition bundles. Each no-op leaves a heartbeat log
+  line (visible in Cloudflare Real-time Logs) instead.
+- **No change** to what a noteworthy bundle contains, to dispatch, or to state
+  persistence — KV is written every tick as before; only the *recording* is
+  trimmed. Replay is unaffected: each recorded bundle is self-contained
+  (carries its own `prior_state`), and the next noteworthy bundle reloads the
+  up-to-date `last_close` from KV.
+
+### Config
+
+- None.
+
+### Tests
+
+- `core`: `advanced_vs` unit tests — identical state, watermark-only,
+  expires_at-only, and `last_close`-only changes are all **not** advances;
+  phase / fire-latch / break_close / retest stamps **are**.
+- `engine`: `is_noteworthy` against real `evaluate_plan` output — fired,
+  finished, and phase-advance are noteworthy; the **critical**
+  `not_noteworthy_on_watermark_only_advance` proves a new-bar-but-nothing-moved
+  tick is a no-op (and that a full-struct compare *would* wrongly call it
+  changed).
+
+### Follow-up
+
+- The `tick_bundle_noop_trim_idea` memory is now implemented; the heartbeat-log
+  half of that idea ships here too.
+
 ## v37 — 2026-06-18 — Retire the `trade-control replay` subcommand (replay moves to `trade-analyzer`)
 
 ### Why

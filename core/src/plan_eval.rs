@@ -69,3 +69,28 @@ pub struct PlanEval {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub warnings: Vec<String>,
 }
+
+impl PlanEval {
+    /// Is this tick worth recording a full [`TickBundle`](crate::tick_bundle)
+    /// for?
+    ///
+    /// A tick is **noteworthy** if it fired anything, finished the plan, or
+    /// advanced the FSM's *meaningful* state versus `prior`. A **no-op** tick —
+    /// a new closed bar arrived, but nothing fired, the plan isn't done, and the
+    /// FSM didn't actually move — carries no information worth a fat bundle (the
+    /// bundle re-stores the whole plan, both states, and the wide detector
+    /// window), so the wrapper trims it to a heartbeat log instead.
+    ///
+    /// **The watermark/TTL gotcha.** `new_state` is *not* compared as a whole:
+    /// every tick advances `watermark` to the new candle's time, refreshes
+    /// `expires_at` to a fresh TTL stamp, and (for an `OnClose` cross rule)
+    /// records `last_close` — so a full-struct `!=` would be true on *every*
+    /// tick and nothing would ever be a no-op. We compare only the
+    /// FSM-meaningful fields (phase, fire latches, break-and-close / retest
+    /// stamps, the reserved `mw` slot) via [`PlanState::advanced_vs`], which
+    /// ignores `watermark`, `expires_at`, and `last_close` (see that method for
+    /// why `last_close` is bookkeeping, not a meaningful advance).
+    pub fn is_noteworthy(&self, prior: &PlanState) -> bool {
+        !self.fired.is_empty() || self.done || self.new_state.advanced_vs(prior)
+    }
+}
