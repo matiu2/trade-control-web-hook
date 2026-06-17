@@ -18,6 +18,7 @@ mod market_info;
 mod retry_gate;
 mod spread_blackout;
 mod state;
+mod tick_recording;
 #[cfg(target_arch = "wasm32")]
 mod tn_login;
 mod tn_login_helpers;

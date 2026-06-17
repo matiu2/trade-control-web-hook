@@ -38,7 +38,7 @@ use worker::{Env, ScheduleContext, ScheduledEvent, event};
 /// each self-gates on `now` (see module docs). Using `chrono::Timelike`
 /// for the minute gate on the NY-close-edge job.
 #[event(scheduled)]
-pub async fn scheduled(_event: ScheduledEvent, env: Env, _ctx: ScheduleContext) {
+pub async fn scheduled(_event: ScheduledEvent, env: Env, ctx: ScheduleContext) {
     use chrono::Timelike;
     crate::tracing_console::ConsoleSubscriber::install();
     let now = chrono::Utc::now();
@@ -52,7 +52,7 @@ pub async fn scheduled(_event: ScheduledEvent, env: Env, _ctx: ScheduleContext) 
     // fresh broker candles and dispatch fired intents. Runs in parallel with
     // the webhook (no self-gate); the `*/15` schedule stays — the `*/1`–`*/5`
     // bump is Stage F, once the engine is proven on demo.
-    engine::run_engine_tick(&env, now).await;
+    engine::run_engine_tick(&env, &ctx, now).await;
 
     // NY-close-edge job — fire exactly once per close hour, on the :00
     // tick. `apply_if_ny_close_edge` re-checks `is_ny_close_edge` itself,

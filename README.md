@@ -953,6 +953,29 @@ trade. If the binding is absent the worker logs one
 (`wrangler r2 bucket create …`), and the deploy API token to hold
 *Workers R2 Storage: Edit*. See the deploy notes for the exact steps.
 
+### Engine tick-bundles (`ticks/` prefix)
+
+The cron engine (`src/cron/engine.rs`) — not an inbound HTTP alert — is where
+every trading decision now happens once a trade runs as a registered
+`TradePlan`. So each engine **tick** records a self-contained, replayable
+**tick-bundle** to the *same* R2 bucket under a **distinct `ticks/` prefix**, so
+the `req/`-reader never trips on it:
+
+**Object layout:** `ticks/<YYYY-MM-DD>/<tick_ts>-<trade_id>.json`. One object per
+`(tick, plan)` that evaluated; a single trade's whole life globs under its
+`trade_id`.
+
+Each bundle carries the pure replay tuple `evaluate_plan` consumed — the
+`plan`, the prior `PlanState`, the `new_candles` + detector back-window, and the
+tick `now`/`expires_at` — plus the golden `PlanEval` output (`fired` /
+`new_state` / `done`), the per-fire dispatch outcomes, and the plan-state
+`KvTickTransition` (before/after/success/error). Replaying a bundle re-runs the
+same `evaluate_plan` offline and diffs the result — a recorded tick becomes a
+deterministic regression test. Same fire-and-forget `wait_until` + fail-soft
+contract as request recording; same `TRADE_CONTROL_R2` binding. Recording is
+**shadow-ticks-only** initially (observe-only plans, no broker), widening to live
+ticks once proven.
+
 ## Brokers
 
 The intent YAML carries an optional `broker:` field, one of `oanda`

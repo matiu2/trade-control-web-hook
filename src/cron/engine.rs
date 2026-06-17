@@ -52,13 +52,16 @@ use chrono::{DateTime, Utc};
 use trade_control_core::broker::{Broker, Candle, CandleError, Granularity, filter_new_candles};
 use trade_control_core::incoming::Verified;
 use trade_control_core::intent::{Action, Shell, VetoLevel};
+use trade_control_core::plan_state::PlanState;
 use trade_control_core::state::{StateStore, StoredPlan};
-use trade_control_engine::{evaluate_plan, seed_plan_state};
-use worker::Env;
+use trade_control_core::tick_bundle::{KvTickTransition, TICK_BUNDLE_SCHEMA_VERSION, TickBundle};
+use trade_control_engine::{PlanEval, evaluate_plan, seed_plan_state};
+use worker::{Env, ScheduleContext};
 
 use crate::ActionResult;
 use crate::cron::sweep::{BrokerHandle, acquire_broker_for_account, open_store};
 use crate::state::KvStateStore;
+use crate::tick_recording::record_tick_to_r2;
 
 /// How many bars of history to fetch when seeding a fresh plan. Enough to give
 /// each `OnClose` rule a prior close to compare against on the next tick, with
@@ -68,7 +71,7 @@ const SEED_BARS: i64 = 10;
 /// Walk every registered trade plan, evaluate it against fresh candles, and
 /// dispatch fired intents. `now` is threaded in (not `Utc::now()`) so the tick
 /// stays a pure function of `(env, now)`.
-pub async fn run_engine_tick(env: &Env, now: DateTime<Utc>) {
+pub async fn run_engine_tick(env: &Env, ctx: &ScheduleContext, now: DateTime<Utc>) {
     let store = match open_store(env) {
         Some(s) => s,
         None => return,
@@ -85,7 +88,7 @@ pub async fn run_engine_tick(env: &Env, now: DateTime<Utc>) {
     rlog!("cron engine: {} registered plans", plans.len());
 
     for stored in plans {
-        if let Err(err) = tick_one(env, &store, &stored, now).await {
+        if let Err(err) = tick_one(env, ctx, &store, &stored, now).await {
             rlog_err!(
                 "cron engine[{}/{}]: {err}",
                 stored.account.as_deref().unwrap_or("<global>"),
@@ -100,6 +103,7 @@ pub async fn run_engine_tick(env: &Env, now: DateTime<Utc>) {
 /// up as a skip for this tick.
 async fn tick_one(
     env: &Env,
+    ctx: &ScheduleContext,
     store: &KvStateStore,
     stored: &StoredPlan,
     now: DateTime<Utc>,
@@ -144,6 +148,62 @@ async fn tick_one(
 
     // Persist the advanced state (or clear it + the plan when the spine is
     // done) before dispatching, so a dispatch failure can't replay a fired bar.
+    // Capture the transition (before/after/success/error) for the tick-bundle.
+    let kv = persist_plan_state(store, plan, account, &eval, expires_at, now, &prior).await;
+    // A hard put failure is still a skip for this tick — but the bundle records
+    // the failed transition first, so a replay can see "wanted to advance,
+    // couldn't" rather than a silent gap.
+    let put_failed = !kv.success && !eval.done;
+
+    // Shadow plans observe only: the state above advanced exactly as a live
+    // plan would, but we never touch the broker or the seen-id index — each
+    // would-be fire is logged so it can be diffed against the live TV alert.
+    // Shadow ticks touch no broker, so they're the safest to record first.
+    if plan.shadow {
+        for fired in &eval.fired {
+            log_shadow_fire(&plan.trade_id, fired);
+        }
+        let bundle = build_tick_bundle(
+            stored,
+            &prior,
+            &fresh,
+            &detector_window,
+            eval,
+            now,
+            expires_at,
+            Vec::new(),
+            kv,
+        );
+        record_tick_to_r2(env, ctx, bundle);
+        return Ok(());
+    }
+
+    if put_failed {
+        return Err(format!("put_plan_state: {}", kv.error.unwrap_or_default()));
+    }
+
+    for fired in &eval.fired {
+        dispatch_fired(env, store, &broker, fired, now).await;
+    }
+    Ok(())
+}
+
+/// Persist the tick's advanced state and report the KV transition for the
+/// tick-bundle. On `done` the plan-state row *and* the plan row are cleared
+/// (the spine is finished); otherwise the new state is written with a fresh TTL.
+/// `success`/`error` capture whether the authoritative write landed — a failed
+/// clear is logged but doesn't fail the tick (the TTL still ages the row out),
+/// while a failed `put` is surfaced so the caller can skip dispatch.
+async fn persist_plan_state(
+    store: &KvStateStore,
+    plan: &trade_control_core::trade_plan::TradePlan,
+    account: Option<&str>,
+    eval: &PlanEval,
+    expires_at: DateTime<Utc>,
+    now: DateTime<Utc>,
+    prior: &PlanState,
+) -> KvTickTransition {
+    let key = plan_state_key(account, &plan.trade_id);
     if eval.done {
         if let Err(err) = store.clear_plan_state(account, &plan.trade_id).await {
             rlog_err!("cron engine: clear_plan_state({}): {err}", plan.trade_id);
@@ -151,7 +211,16 @@ async fn tick_one(
         if let Err(err) = store.clear_trade_plan(account, &plan.trade_id).await {
             rlog_err!("cron engine: clear_trade_plan({}): {err}", plan.trade_id);
         }
-    } else if let Err(err) = store
+        return KvTickTransition {
+            key,
+            before: Some(prior.clone()),
+            after: None,
+            cleared_plan: true,
+            success: true,
+            error: None,
+        };
+    }
+    match store
         .put_plan_state(
             account,
             &plan.trade_id,
@@ -160,23 +229,66 @@ async fn tick_one(
         )
         .await
     {
-        return Err(format!("put_plan_state: {err}"));
+        Ok(()) => KvTickTransition {
+            key,
+            before: Some(prior.clone()),
+            after: Some(eval.new_state.clone()),
+            cleared_plan: false,
+            success: true,
+            error: None,
+        },
+        Err(err) => KvTickTransition {
+            key,
+            before: Some(prior.clone()),
+            after: Some(eval.new_state.clone()),
+            cleared_plan: false,
+            success: false,
+            error: Some(err.to_string()),
+        },
     }
+}
 
-    // Shadow plans observe only: the state above advanced exactly as a live
-    // plan would, but we never touch the broker or the seen-id index — each
-    // would-be fire is logged so it can be diffed against the live TV alert.
-    if plan.shadow {
-        for fired in &eval.fired {
-            log_shadow_fire(&plan.trade_id, fired);
-        }
-        return Ok(());
+/// Assemble the [`TickBundle`] for this tick. `dispatch_outcomes` is empty for a
+/// shadow tick (which dispatches nothing); live ticks populate it.
+#[allow(clippy::too_many_arguments)]
+fn build_tick_bundle(
+    stored: &StoredPlan,
+    prior: &PlanState,
+    fresh: &[Candle],
+    detector_window: &[Candle],
+    eval: PlanEval,
+    now: DateTime<Utc>,
+    expires_at: DateTime<Utc>,
+    dispatch_outcomes: Vec<trade_control_core::tick_bundle::DispatchOutcome>,
+    kv: KvTickTransition,
+) -> TickBundle {
+    let plan = &stored.plan;
+    TickBundle {
+        schema_version: TICK_BUNDLE_SCHEMA_VERSION,
+        tick_ts: now,
+        correlation_id: plan.trade_id.clone(),
+        account: stored.account.clone(),
+        request_id: format!("{}@{}", plan.trade_id, now.to_rfc3339()),
+        plan: plan.clone(),
+        prior_state: prior.clone(),
+        new_candles: fresh.to_vec(),
+        detector_window: detector_window.to_vec(),
+        now,
+        expires_at,
+        shadow: plan.shadow,
+        eval,
+        dispatch_outcomes,
+        kv,
     }
+}
 
-    for fired in &eval.fired {
-        dispatch_fired(env, store, &broker, fired, now).await;
-    }
-    Ok(())
+/// Reconstruct the plan-state KV key for the bundle's `KvTickTransition`. Mirrors
+/// `KvStateStore::plan_state_key` (which is private) using the public
+/// [`account_scope`](trade_control_core::state::account_scope); a recording label
+/// only, so the small duplication is fine.
+fn plan_state_key(account: Option<&str>, trade_id: &str) -> String {
+    let scope = trade_control_core::state::account_scope(account);
+    format!("plan-state:{scope}:{trade_id}")
 }
 
 /// Log a fired intent that a shadow plan suppressed. Mirrors the structured

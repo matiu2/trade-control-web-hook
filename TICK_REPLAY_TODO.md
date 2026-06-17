@@ -19,13 +19,14 @@ No deploy to staging/prod. Each step its own green commit (test + clippy + fmt +
 - [x] Verified: default tests + --features test-support tests both 504 green; clippy clean both;
       non-test lib build with feature compiles MemStateStore; wasm core build does NOT pull test-support
 
-## (c) record_tick_to_r2 + ScheduleContext threading — SHADOW ticks only
-- [ ] src/cron.rs: `_ctx` → `ctx`; pass `&ctx` to run_engine_tick
-- [ ] thread `ctx: &ScheduleContext` → run_engine_tick → tick_one
-- [ ] new src/tick_recording.rs: record_tick_to_r2 (mirror record_to_r2, fail-soft, wasm-cfg)
-- [ ] assemble TickBundle in tick_one; gate emission on `plan.shadow`
-- [ ] R2 key: ticks/<date>/<tick_ts>-<trade_id>.json
-- [ ] Gate: workspace test + clippy -D warnings + fmt + wasm build → commit
+## (c) record_tick_to_r2 + ScheduleContext threading — SHADOW ticks only — DONE (commit pending)
+- [x] src/cron.rs: `_ctx` → `ctx`; pass `&ctx` to run_engine_tick
+- [x] thread `ctx: &ScheduleContext` → run_engine_tick → tick_one
+- [x] new src/tick_recording.rs: record_tick_to_r2 (mirror record_to_r2, fail-soft, wasm-cfg + native stub)
+- [x] tick_one: persist_plan_state captures KvTickTransition; build_tick_bundle helper; emit gated on `plan.shadow`
+- [x] R2 key: ticks/<date>/<tick_ts>-<trade_id>.json (TickBundle::r2_key)
+- [x] README: "Engine tick-bundles (ticks/ prefix)" subsection
+- [x] Gate: workspace tests green; clippy --all-targets -D warnings clean; fmt; worker-build --release OK
 
 ## (d) extend to live ticks
 - [ ] drop shadow gate; populate dispatch_outcomes from each dispatch_fired result
