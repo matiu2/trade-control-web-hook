@@ -174,6 +174,14 @@ async fn tick_one(
         for fired in &eval.fired {
             log_shadow_fire(&plan.trade_id, fired);
         }
+        // A shadow no-op is as information-free as a live one (it still never
+        // touches the broker), so it's trimmed identically — the diff against
+        // the live TV alert only cares about ticks where something fired or the
+        // FSM moved, and those are exactly the noteworthy ones.
+        if !eval.is_noteworthy(&prior) {
+            log_noop_tick(plan, &eval, now);
+            return Ok(());
+        }
         let bundle = build_tick_bundle(
             stored,
             &prior,
@@ -217,6 +225,18 @@ async fn tick_one(
             outcome,
             seq: seq as u32,
         });
+    }
+
+    // Trim no-op ticks: a new bar arrived but nothing fired, no phase/state
+    // advance, plan not done, KV write succeeded. The fat bundle (whole plan +
+    // both states + wide detector window) carries no information for such a
+    // tick, so emit a lightweight heartbeat instead and skip the R2 write. A
+    // noteworthy tick (something fired / finished / advanced) still records in
+    // full. (A no-op has an empty `fired`, so `dispatch_outcomes` is empty here
+    // too — nothing was dispatched.)
+    if !eval.is_noteworthy(&prior) {
+        log_noop_tick(plan, &eval, now);
+        return Ok(());
     }
 
     let bundle = build_tick_bundle(
@@ -349,6 +369,27 @@ fn log_shadow_fire(trade_id: &str, fired: &trade_control_engine::FiredIntent) {
         fired.intent.action,
         fired.intent.id,
         fired.candle.time,
+    );
+}
+
+/// Emit the lightweight heartbeat for a trimmed no-op tick.
+///
+/// A no-op tick saw a new closed bar but nothing fired and the FSM didn't
+/// advance, so its fat [`TickBundle`] is skipped (see [`PlanEval::is_noteworthy`]).
+/// This single line keeps the tick traceable in Cloudflare logs, so a silent
+/// gap in the `ticks/` R2 stream is never mistaken for "the cron stopped
+/// running". `new_state.watermark` is the new bar's open-time the tick processed.
+fn log_noop_tick(
+    plan: &trade_control_core::trade_plan::TradePlan,
+    eval: &PlanEval,
+    now: DateTime<Utc>,
+) {
+    rlog!(
+        "cron engine: plan {} tick {} no-op (new bar {:?}, nothing fired/advanced, phase {:?}) — not recorded",
+        plan.trade_id,
+        now,
+        eval.new_state.watermark,
+        eval.new_state.phase,
     );
 }
 

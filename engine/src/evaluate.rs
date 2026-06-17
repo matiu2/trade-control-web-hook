@@ -1730,4 +1730,104 @@ mod tests {
             "entry blocked: no retest up-cross stamped"
         );
     }
+
+    // ===== PlanEval::is_noteworthy — the no-op-tick trim predicate =====
+    //
+    // These exercise the predicate against real `evaluate_plan` output so the
+    // watermark-only no-op (the critical case) is proven on the state the
+    // evaluator actually produces, not a hand-built one.
+
+    #[test]
+    fn noteworthy_when_an_intent_fired() {
+        // M/W heartbeat fires an enter every bar → always noteworthy.
+        let p = plan(vec![rule(
+            "05-enter",
+            Trigger::MwEveryBar,
+            FireMode::EveryBar,
+            Action::Enter,
+        )]);
+        let prior = seed_at(Phase::AwaitEntry, "2026-06-16T11:00:00Z");
+        let c = candle("2026-06-16T12:00:00Z", 1.0, 1.0, 1.0, 1.0);
+        let eval = run(&p, &prior, &[c]);
+        assert!(!eval.fired.is_empty());
+        assert!(eval.is_noteworthy(&prior), "a fired intent is noteworthy");
+    }
+
+    #[test]
+    fn noteworthy_when_plan_finished() {
+        // A trade-expiry guard fires and finishes the plan → noteworthy.
+        let expiry = ts("2026-06-16T15:00:00Z").timestamp();
+        let p = plan(vec![rule(
+            "02-veto-trade-expiry",
+            Trigger::TimeReached { at_epoch: expiry },
+            FireMode::Once,
+            Action::Veto,
+        )]);
+        let prior = seed_at(Phase::AwaitEntry, "2026-06-16T13:00:00Z");
+        let c = candle("2026-06-16T16:00:00Z", 1.0, 1.0, 1.0, 1.0);
+        let eval = run(&p, &prior, &[c]);
+        assert!(eval.done);
+        assert!(eval.is_noteworthy(&prior), "a finished plan is noteworthy");
+    }
+
+    #[test]
+    fn noteworthy_when_phase_advanced() {
+        // Break-and-close fires: phase AwaitBreakAndClose → AwaitEntry. Even
+        // though an intent also fired here, the phase advance alone is what makes
+        // a transition-only tick noteworthy.
+        let p = hs_plan();
+        let mut prior = seed_at(Phase::AwaitBreakAndClose, "2026-06-16T09:00:00Z");
+        prior
+            .last_close
+            .insert("03-prep-break-and-close".into(), 1.2050);
+        let c = candle("2026-06-16T10:00:00Z", 1.205, 1.205, 1.195, 1.1950);
+        let eval = run(&p, &prior, &[c]);
+        assert_eq!(eval.new_state.phase, Phase::AwaitEntry);
+        assert!(eval.new_state.advanced_vs(&prior), "phase moved");
+        assert!(eval.is_noteworthy(&prior));
+    }
+
+    #[test]
+    fn not_noteworthy_on_watermark_only_advance() {
+        // THE CRITICAL CASE. An H&S plan sitting in AwaitBreakAndClose; a new bar
+        // arrives that does NOT cross the neckline → nothing fires, no phase
+        // change, plan not done. The only things that moved are the watermark
+        // (to the new bar) and `last_close` (the OnClose rule's bookkeeping) —
+        // neither is a meaningful advance, so the tick is a no-op and must NOT be
+        // recorded.
+        let p = hs_plan();
+        let mut prior = seed_at(Phase::AwaitBreakAndClose, "2026-06-16T09:00:00Z");
+        // Prior close ABOVE the 1.2000 neckline; the new bar also stays above and
+        // closes above → no down-cross, nothing fires.
+        prior
+            .last_close
+            .insert("03-prep-break-and-close".into(), 1.2100);
+        let c = candle("2026-06-16T10:00:00Z", 1.21, 1.215, 1.205, 1.2090);
+        let eval = run(&p, &prior, &[c]);
+
+        assert!(eval.fired.is_empty(), "nothing fired");
+        assert!(!eval.done, "plan not done");
+        assert_eq!(
+            eval.new_state.phase,
+            Phase::AwaitBreakAndClose,
+            "phase unchanged"
+        );
+        // The watermark DID advance (proving the bar was processed)…
+        assert_eq!(
+            eval.new_state.watermark,
+            Some(ts("2026-06-16T10:00:00Z")),
+            "watermark advanced to the new bar"
+        );
+        // …yet the tick is a no-op: a full-struct compare would be true here
+        // (watermark + expires_at + last_close all moved), but is_noteworthy
+        // must return false.
+        assert_ne!(
+            eval.new_state, prior,
+            "full-struct compare IS different (watermark/expires_at/last_close moved)"
+        );
+        assert!(
+            !eval.is_noteworthy(&prior),
+            "a watermark-only advance must be a no-op — else the trim does nothing"
+        );
+    }
 }

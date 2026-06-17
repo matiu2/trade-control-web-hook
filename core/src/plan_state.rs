@@ -97,6 +97,38 @@ pub struct PlanState {
 }
 
 impl PlanState {
+    /// Did the FSM's **meaningful** state advance versus `prior`?
+    ///
+    /// Three fields move on (essentially) every tick and must be ignored, or a
+    /// whole-struct `!=` would be true every tick and nothing would ever be a
+    /// no-op:
+    ///
+    /// - [`watermark`](Self::watermark) — always advances to the new candle's
+    ///   open-time.
+    /// - [`expires_at`](Self::expires_at) — refreshed to a fresh TTL stamp each
+    ///   tick.
+    /// - [`last_close`](Self::last_close) — an `OnClose` cross rule records the
+    ///   bar's close *every* bar so the next bar's cross can be detected against
+    ///   it. During an H&S plan's quiet "waiting for break-and-close" phase this
+    ///   churns on every bar with nothing else changing — the very ticks the
+    ///   trim targets. It's authoritative cross-detection memory persisted to KV
+    ///   regardless of recording, and each recorded bundle is self-contained
+    ///   (it carries its own `prior_state`), so trimming a `last_close`-only
+    ///   tick is safe for replay: the next *noteworthy* bundle loads the
+    ///   up-to-date `last_close` from KV.
+    ///
+    /// So this compares only the fields a tick advancing them genuinely means
+    /// "something happened": the spine `phase`, the `fired` latches, the
+    /// `break_close_at` / `retest_seen_at` lookback stamps, and the reserved
+    /// `mw` slot.
+    pub fn advanced_vs(&self, prior: &PlanState) -> bool {
+        self.phase != prior.phase
+            || self.fired != prior.fired
+            || self.break_close_at != prior.break_close_at
+            || self.retest_seen_at != prior.retest_seen_at
+            || self.mw != prior.mw
+    }
+
     /// A fresh, never-ticked state for `phase`. The first engine tick seeds the
     /// watermark + `last_close` from the back-window and persists this with
     /// `fired` empty, so nothing fires retroactively.
@@ -176,5 +208,87 @@ mod tests {
         let json = serde_json::to_string(&s).unwrap();
         let back: PlanState = serde_json::from_str(&json).unwrap();
         assert_eq!(back, s);
+    }
+
+    // ===== advanced_vs: meaningful-state comparison (the trim predicate) =====
+
+    /// A prior state at `AwaitEntry` with a watermark + one tracked close, for
+    /// the advance tests to mutate.
+    fn prior_state() -> PlanState {
+        let mut s = PlanState::seed(Phase::AwaitEntry, ts("2026-06-20T00:00:00Z"));
+        s.watermark = Some(ts("2026-06-16T11:00:00Z"));
+        s.last_close
+            .insert("03-prep-break-and-close".into(), 1.2000);
+        s
+    }
+
+    #[test]
+    fn advanced_vs_identical_meaningful_state_is_no_advance() {
+        let prior = prior_state();
+        let same = prior.clone();
+        assert!(!same.advanced_vs(&prior));
+    }
+
+    #[test]
+    fn advanced_vs_ignores_watermark_only_change() {
+        // The critical case: a new bar advanced the watermark but nothing else
+        // moved → NOT an advance, so the tick is a no-op.
+        let prior = prior_state();
+        let mut next = prior.clone();
+        next.watermark = Some(ts("2026-06-16T12:00:00Z"));
+        assert!(
+            !next.advanced_vs(&prior),
+            "a watermark-only advance is bookkeeping, not a meaningful advance"
+        );
+    }
+
+    #[test]
+    fn advanced_vs_ignores_expires_at_refresh() {
+        // Every tick refreshes the TTL stamp — that alone is not an advance.
+        let prior = prior_state();
+        let mut next = prior.clone();
+        next.expires_at = ts("2026-06-21T00:00:00Z");
+        assert!(!next.advanced_vs(&prior));
+    }
+
+    #[test]
+    fn advanced_vs_ignores_last_close_churn() {
+        // An OnClose rule records the bar's close every bar; that churn during a
+        // quiet phase is bookkeeping the next noteworthy bundle reloads from KV.
+        let prior = prior_state();
+        let mut next = prior.clone();
+        next.last_close
+            .insert("03-prep-break-and-close".into(), 1.2050);
+        assert!(
+            !next.advanced_vs(&prior),
+            "a last_close-only change is cross-detection memory, not an advance"
+        );
+    }
+
+    #[test]
+    fn advanced_vs_detects_phase_advance() {
+        let prior = prior_state();
+        let mut next = prior.clone();
+        next.phase = Phase::Done;
+        assert!(next.advanced_vs(&prior));
+    }
+
+    #[test]
+    fn advanced_vs_detects_fire_latch() {
+        let prior = prior_state();
+        let mut next = prior.clone();
+        next.fired.insert("01-veto-too-high".into());
+        assert!(next.advanced_vs(&prior));
+    }
+
+    #[test]
+    fn advanced_vs_detects_break_close_and_retest_stamps() {
+        let prior = prior_state();
+        let mut bc = prior.clone();
+        bc.break_close_at = Some(ts("2026-06-16T12:00:00Z"));
+        assert!(bc.advanced_vs(&prior), "break_close_at stamp is an advance");
+        let mut rt = prior.clone();
+        rt.retest_seen_at = Some(ts("2026-06-16T12:00:00Z"));
+        assert!(rt.advanced_vs(&prior), "retest_seen_at stamp is an advance");
     }
 }

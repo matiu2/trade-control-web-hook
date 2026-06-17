@@ -967,8 +967,8 @@ every trading decision now happens once a trade runs as a registered
 the `req/`-reader never trips on it:
 
 **Object layout:** `ticks/<YYYY-MM-DD>/<tick_ts>-<trade_id>.json`. One object per
-`(tick, plan)` that evaluated; a single trade's whole life globs under its
-`trade_id`.
+**noteworthy** `(tick, plan)` that evaluated; a single trade's whole life globs
+under its `trade_id`.
 
 Each bundle carries the pure replay tuple `evaluate_plan` consumed — the
 `plan`, the prior `PlanState`, the `new_candles` + detector back-window, and the
@@ -979,6 +979,20 @@ tick `now`/`expires_at` — plus the golden `PlanEval` output (`fired` /
 binding. Both shadow (observe-only) and live ticks are recorded; a live tick's
 `dispatch_outcomes` carry each fire's broker result, while a shadow tick's is
 empty (it dispatches nothing).
+
+**No-op ticks are trimmed.** A tick that saw a new closed bar but where nothing
+fired, no phase/state advanced, and the plan isn't done (a "no-op" — common
+during an H&S plan's quiet wait for break-and-close) is **not** recorded: its
+fat bundle would re-store the whole plan, both states, and the wide detector
+window for zero new information. The engine instead emits a single heartbeat log
+line (`cron engine: plan <id> tick <now> no-op (…) — not recorded`) so the tick
+is still traceable and a gap in the `ticks/` stream is never mistaken for a
+stalled cron. The decision is the pure `PlanEval::is_noteworthy(&prior)` (a tick
+is noteworthy if it fired, finished, or advanced the FSM's meaningful state —
+ignoring the always-moving `watermark` / `expires_at` / `last_close`). KV state
+is still persisted every tick regardless; only the *recording* is trimmed.
+A **failed** plan-state transition is always recorded (it carries `success:false`
+a replay needs).
 
 **Replaying a bundle.** Replay lives in the **`trade-analyzer`** CLI (in the
 `trading-tax-tracker` repo), *not* in `trade-control` — that's the downstream
