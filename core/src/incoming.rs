@@ -367,6 +367,51 @@ mod tests {
         ));
     }
 
+    /// Build a signed `market-info` query. A read-only TradeNation query
+    /// keyed on `instrument` (a TN MarketName); no entry geometry.
+    fn build_signed_market_info(instrument: &str) -> String {
+        let body_without_sig = [
+            "close: 0",
+            "high: 0",
+            "low: 0",
+            "time: \"2026-05-13T12:00:00Z\"",
+            "v: 1",
+            "action: market-info",
+            &format!("instrument: {instrument}"),
+            "id: market-info-wallst-abc",
+            "not_after: \"2026-05-13T12:05:00Z\"",
+            "broker: tradenation",
+            "",
+        ]
+        .join("\n");
+        let pairs = signed_pairs_from_text(&body_without_sig).unwrap();
+        let sig = crate::sig::sign(&KEY, &pairs).unwrap();
+        format!("{body_without_sig}sig: \"{sig}\"\n")
+    }
+
+    #[test]
+    fn signed_path_market_info_round_trips() {
+        let yaml = build_signed_market_info("Wall Street 30");
+        let now: DateTime<Utc> = "2026-05-13T12:01:00Z".parse().unwrap();
+        let v = parse_and_verify(&yaml, &KEY, now).unwrap();
+        assert_eq!(v.intent.action, crate::intent::Action::MarketInfo);
+        assert_eq!(v.intent.instrument, "Wall Street 30");
+        assert_eq!(v.intent.broker, crate::intent::BrokerKind::TradeNation);
+    }
+
+    #[test]
+    fn signed_path_market_info_instrument_tamper_rejected() {
+        // The instrument selects which market is queried — flipping it
+        // after signing must fail verification.
+        let yaml = build_signed_market_info("Wall Street 30")
+            .replace("instrument: Wall Street 30", "instrument: Spot Gold");
+        let now: DateTime<Utc> = "2026-05-13T12:01:00Z".parse().unwrap();
+        assert!(matches!(
+            parse_and_verify(&yaml, &KEY, now),
+            Err(IncomingError::Sig(SigError::Mismatch))
+        ));
+    }
+
     /// Build a signed `enter` carrying a baked top-level `pip_size`.
     fn build_signed_enter_with_pip(pip_size: &str) -> String {
         let body_without_sig = [

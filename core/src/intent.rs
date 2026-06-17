@@ -1366,6 +1366,15 @@ pub enum Action {
     /// control-style action — no broker call at register time; idempotent
     /// (re-registering the same plan refreshes its row). See the engine crate.
     Register,
+    /// Read-only query: return TradeNation's per-instrument market info
+    /// (trading session hours, spread, margin, guaranteed-stop terms,
+    /// expiry) for [`Intent::instrument`]. Unlike [`Action::Status`] this
+    /// needs a live TradeNation broker (it calls `broker.market_info`), so
+    /// it dispatches through the broker path rather than the KV-only
+    /// control block. No state mutation, no broker order. TradeNation only
+    /// — there is no OANDA equivalent yet. The hours feed the upcoming
+    /// market-hours entry blackout.
+    MarketInfo,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]

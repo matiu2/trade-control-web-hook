@@ -573,7 +573,11 @@ async fn run_action<B: Broker>(
         | Action::Resume
         | Action::NewsStart
         | Action::NewsEnd
-        | Action::Register => {
+        | Action::Register
+        // MarketInfo needs the concrete TradeNation broker (its `market_info`
+        // is not on the generic `Broker` trait), so it's dispatched in the
+        // broker-acquire section before this generic function — never here.
+        | Action::MarketInfo => {
             // Handled before broker dispatch; never reached here.
             unreachable!("non-broker actions handled before broker dispatch")
         }

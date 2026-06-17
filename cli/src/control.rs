@@ -87,6 +87,22 @@ pub fn build_unlock_intent(instrument: &str, now: DateTime<Utc>, suffix: &str) -
     control_skeleton(Action::Unlock, instrument, id, now)
 }
 
+/// Build a `market-info` query `Intent` for a single instrument. The
+/// worker resolves `instrument` (a TradeNation MarketName, e.g.
+/// `"Wall Street 30"`) against the broker and returns its session hours /
+/// spread / margin. TradeNation-only — the skeleton defaults `broker` to
+/// OANDA, so we override it here; the worker rejects a non-TN market-info.
+pub fn build_market_info_intent(instrument: &str, now: DateTime<Utc>, suffix: &str) -> Intent {
+    let id = format!(
+        "market-info-{instrument}-{}-{suffix}",
+        now.format("%Y-%m-%dT%H%M%S")
+    );
+    Intent {
+        broker: BrokerKind::TradeNation,
+        ..control_skeleton(Action::MarketInfo, instrument, id, now)
+    }
+}
+
 /// Build a `prep` Intent for a single (instrument, step) pair with a TTL.
 ///
 /// `clears` is the list of other prep steps to drop before recording
