@@ -344,6 +344,7 @@ mod tests {
             mw: Some(mw),
             pip_size: Some(mw.pip_size),
             trade_plan: None,
+            blackout_close: crate::intent::BlackoutCloseAction::default(),
         }
     }
 

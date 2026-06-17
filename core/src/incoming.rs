@@ -459,6 +459,75 @@ mod tests {
         ));
     }
 
+    /// Build a signed `enter` carrying an explicit `blackout_close` policy
+    /// (the market-hours entry blackout field). A scalar enum on its own
+    /// top-level line, so it's covered by the whole-body HMAC like any other
+    /// signed field.
+    fn build_signed_enter_with_blackout(close_action: &str) -> String {
+        let body_without_sig = [
+            "close: 152.000",
+            "high: 152.050",
+            "low: 151.950",
+            "time: \"2026-05-13T12:00:00Z\"",
+            "v: 1",
+            "action: enter",
+            "instrument: USD_JPY",
+            "id: hs-usdjpy-blk",
+            "trade_id: usdjpy-hs-1",
+            "not_after: \"2026-05-13T20:00:00Z\"",
+            "direction: long",
+            "entry: {\"type\":\"stop\",\"from\":\"high\",\"offset_pips\":1.0}",
+            "stop_loss: {\"from\":\"low\",\"offset_pips\":-1.0}",
+            "take_profit: {\"absolute\":153.0}",
+            &format!("blackout_close: {close_action}"),
+            "",
+        ]
+        .join("\n");
+        let pairs = signed_pairs_from_text(&body_without_sig).unwrap();
+        let sig = crate::sig::sign(&KEY, &pairs).unwrap();
+        format!("{body_without_sig}sig: \"{sig}\"\n")
+    }
+
+    #[test]
+    fn signed_path_blackout_close_round_trips() {
+        let yaml = build_signed_enter_with_blackout("cancel_and_close");
+        let now: DateTime<Utc> = "2026-05-13T12:01:00Z".parse().unwrap();
+        let v = parse_and_verify(&yaml, &KEY, now).unwrap();
+        assert_eq!(
+            v.intent.blackout_close,
+            crate::intent::BlackoutCloseAction::CancelAndClose
+        );
+    }
+
+    #[test]
+    fn signed_path_blackout_close_defaults_when_absent() {
+        // An enter with no `blackout_close:` line deserializes to the safe
+        // incident-fix default (`CancelResting`) — wire-compatible with intents
+        // minted before the field existed.
+        let yaml = build_signed_enter_with_pip("0.0001");
+        let now: DateTime<Utc> = "2026-05-13T12:01:00Z".parse().unwrap();
+        let v = parse_and_verify(&yaml, &KEY, now).unwrap();
+        assert_eq!(
+            v.intent.blackout_close,
+            crate::intent::BlackoutCloseAction::CancelResting
+        );
+    }
+
+    #[test]
+    fn signed_path_blackout_close_tamper_rejected() {
+        // The close policy is signed — flipping CancelResting → CancelAndClose
+        // after signing (to force a position close across the gap) must fail.
+        let yaml = build_signed_enter_with_blackout("cancel_resting").replace(
+            "blackout_close: cancel_resting",
+            "blackout_close: cancel_and_close",
+        );
+        let now: DateTime<Utc> = "2026-05-13T12:01:00Z".parse().unwrap();
+        assert!(matches!(
+            parse_and_verify(&yaml, &KEY, now),
+            Err(IncomingError::Sig(SigError::Mismatch))
+        ));
+    }
+
     /// Build a signed `register` carrying a flow-style `trade_plan`. The plan
     /// rides as single-line JSON (valid flow YAML) exactly as the CLI's
     /// `render_value` emits any nested field, so the whole plan sits on the

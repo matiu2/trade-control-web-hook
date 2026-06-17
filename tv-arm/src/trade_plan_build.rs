@@ -435,6 +435,7 @@ mod tests {
             mw: None,
             pip_size,
             trade_plan: None,
+            blackout_close: trade_control_core::intent::BlackoutCloseAction::default(),
         }
     }
 

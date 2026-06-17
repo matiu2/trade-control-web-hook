@@ -5,11 +5,13 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+mod blackout;
 mod expiry;
 mod mw_resolution;
 mod mw_state;
 mod resolution;
 
+pub use blackout::{BlackoutCloseAction, MINUTES_PER_DAY, NoEntryWindow, is_inside_window};
 pub use expiry::{ExpiryError, MAX_EXPIRY_BARS, resolve_cancel_at};
 pub use mw_state::{MwAnchors, MwUpdate, effective_mw_params, plan_mw_update};
 #[cfg(feature = "cli")]
@@ -776,6 +778,26 @@ pub struct Intent {
     /// pre-feature intents.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trade_plan: Option<crate::trade_plan::TradePlan>,
+    /// Market-hours entry blackout policy: what to do with this trade's
+    /// **resting order** when the daily blackout window opens (see
+    /// [`BlackoutCloseAction`]). The single field both the webhook enter path
+    /// and the engine's fired enter carry, so one reject gate + sweep branch
+    /// honours it regardless of which path placed the order.
+    ///
+    /// Defaults to [`BlackoutCloseAction::CancelResting`] — cancel the unfilled
+    /// order, leave any filled position alone (the incident fix). Signed as
+    /// part of the whole-body HMAC; `#[serde(default)]` + a skip predicate keep
+    /// the wire form byte-identical to pre-feature intents when it's the
+    /// default. Meaningful on `Action::Enter`; ignored on other actions.
+    #[serde(default, skip_serializing_if = "is_default_blackout_close")]
+    pub blackout_close: BlackoutCloseAction,
+}
+
+/// Skip-serializing predicate for [`Intent::blackout_close`]. Returns true on
+/// the default `CancelResting` so the wire form stays byte-identical to intents
+/// minted before the field existed.
+fn is_default_blackout_close(a: &BlackoutCloseAction) -> bool {
+    matches!(a, BlackoutCloseAction::CancelResting)
 }
 
 /// Skip-serializing predicate for [`Intent::max_retries`]. Returns true

@@ -1,5 +1,39 @@
 # TODO
 
+## ACTIVE — market-hours entry blackout (branch: worktree-market-hours-entry-blackout)
+
+Fixes the incident where a resting stop order on a US-index rolling future sat
+through the closed session and triggered on the close→open gap. A daily cron
+resolves a per-instrument UTC blackout window into KV (DST-correct from the
+broker `market_info` feed); the worker rejects new entries inside the window and
+the sweep acts on the resting order per a signed `BlackoutCloseAction`. Both the
+webhook enter path and the engine's fired enter converge on `run_enter`, so one
+reject gate covers both. Plan: `~/.home-claude/plans/market-hours-entry-blackout.md`.
+
+- [x] **Commit 1 — pure window + policy types in `core`.** `NoEntryWindow`
+      (UTC minute-of-day open/close + `wraps_midnight`), `BlackoutCloseAction
+      { CancelResting (default), CancelAndClose }`, `is_inside_window`
+      (midnight-wrap + degenerate exhaustive tests). `Intent.blackout_close`
+      signed field (`#[serde(default)]` = CancelResting) + signed round-trip /
+      tamper tests through `parse_and_verify`. 514 core tests green.
+- [ ] **Commit 2 — KV window storage.** `get/set_blackout_window` on the state
+      trait + KV impl + mem-store double; ~26h TTL, fail-open.
+- [ ] **Commit 3 — daily cron derivation.** `src/cron/blackout_hours.rs`:
+      `refresh_market_hours` (distinct instruments from entry attempts +
+      registered plans; `market_info` → UTC window via pure `window_from_session`
+      with −3h/+1h buffers). Wired into `src/cron.rs`, hour-gated.
+- [ ] **Commit 4 — worker reject gate in `run_enter`.** Mirror `spread_blackout`;
+      423 `market-blackout`, no KV write / no seen poison. Covers webhook AND
+      engine (engine dispatches through `run_enter`). MemStateStore handler tests
+      (uses the new `test-support` feature from main).
+- [ ] **Commit 5 — cron sweep close action.** Persist `blackout_close` onto the
+      `EntryAttempt`; `market_blackout_due` predicate branch before SL-breach;
+      `CancelResting` cancels resting order, `CancelAndClose` also
+      `close_positions`. (Broker trait already has `close_positions` /
+      `cancel_pending_for_instrument` — no addition needed.)
+- [ ] **Commit 6 — CLI + tv-arm + README.** `--blackout-close {cancel|close}`;
+      `build_trade_plan` carries the policy onto enter rules; README section.
+
 ## ACTIVE — server-side trade-plan engine (replace paid TradingView alerts)
 
 Big multi-stage shift: `tv-arm` keeps drawing/annotating the chart but, instead

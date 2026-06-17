@@ -274,6 +274,7 @@ fn build_pause_intent(
         mw: None,
         pip_size: None,
         trade_plan: None,
+        blackout_close: trade_control_core::intent::BlackoutCloseAction::default(),
     }
 }
 
