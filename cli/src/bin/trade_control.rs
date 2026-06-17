@@ -25,10 +25,10 @@ use trade_control_cli::ReplayArgs;
 use trade_control_cli::{
     AdoptBody, CalendarBarsArgs, KEY_LEN, TradePattern, add_account, adopt_trade,
     build_clear_prep_intent, build_clear_veto_intent, build_market_info_intent,
-    build_news_from_spec, build_pause_from_spec, build_plan_list_intent, build_plan_show_intent,
-    build_prep_intent, build_status_intent, build_trade_from_spec, build_trade_interactive,
-    build_unlock_intent, build_veto_intent, delete_account, delete_secret, fill_missing_fields,
-    generate_key_hex, list_accounts, load_cache, load_news_spec_from_file,
+    build_news_from_spec, build_pause_from_spec, build_plan_delete_intent, build_plan_list_intent,
+    build_plan_show_intent, build_prep_intent, build_status_intent, build_trade_from_spec,
+    build_trade_interactive, build_unlock_intent, build_veto_intent, delete_account, delete_secret,
+    fill_missing_fields, generate_key_hex, list_accounts, load_cache, load_news_spec_from_file,
     load_pause_spec_from_file, load_spec_from_file, pick_pattern_interactive,
     pick_template_interactive, prompt_save_as_template, put_secret, record_account_use,
     record_prep_use, record_veto_use, require_local_tn_account, run_calendar_bars, run_replay,
@@ -145,11 +145,12 @@ enum Cmd {
     /// cleanly through string mapping and don't need a catalog.
     #[command(subcommand)]
     Instruments(InstrumentsCmd),
-    /// Inspect the server-side engine's registered `TradePlan`s. Read-only
-    /// queries against the deployed worker (`plan list`, `plan show <id>`).
-    /// Useful during the engine's parallel-run period to confirm a plan
-    /// registered, whether it's in shadow mode, and how far its FSM has
-    /// progressed.
+    /// Inspect / manage the server-side engine's registered `TradePlan`s.
+    /// `plan list` and `plan show <id>` are read-only queries; `plan delete
+    /// <id>` drops a plan (the inverse of register) so a setup can be
+    /// re-armed after editing the chart. Useful during the engine's
+    /// parallel-run period to confirm a plan registered, whether it's in
+    /// shadow mode, and how far its FSM has progressed.
     #[command(subcommand)]
     Plan(PlanCmd),
     /// Replay a recorded engine tick-bundle through the pure evaluator and diff
@@ -173,6 +174,12 @@ enum PlanCmd {
     /// Dump one plan in full — every rule plus its persisted engine state.
     /// The worker scans all account scopes for the `trade_id`.
     Show(PlanShowArgs),
+    /// Delete a registered plan and its engine state — the inverse of
+    /// register. The worker scans all account scopes and drops the matching
+    /// `plan:` + `plan-state:` rows. Idempotent (deleting a missing plan is a
+    /// no-op). Use to re-arm a setup after editing its chart: `plan delete
+    /// <id>` then re-run `tv-arm`.
+    Delete(PlanDeleteArgs),
 }
 
 #[derive(Parser)]
@@ -191,6 +198,14 @@ struct PlanShowArgs {
     /// Print the worker's raw YAML response instead of the pretty view.
     #[arg(long)]
     yaml: bool,
+    #[command(flatten)]
+    common: EndpointArgs,
+}
+
+#[derive(Parser)]
+struct PlanDeleteArgs {
+    /// The plan's `trade_id` (e.g. `eurusd-hs-7`).
+    trade_id: String,
     #[command(flatten)]
     common: EndpointArgs,
 }
@@ -1142,6 +1157,7 @@ fn run_plan(sub: PlanCmd) -> Result<()> {
     match sub {
         PlanCmd::List(args) => run_plan_list(args),
         PlanCmd::Show(args) => run_plan_show(args),
+        PlanCmd::Delete(args) => run_plan_delete(args),
     }
 }
 
@@ -1186,6 +1202,21 @@ fn run_plan_show(args: PlanShowArgs) -> Result<()> {
         return Ok(());
     }
     print!("{}", format_plan_show(&args.trade_id, &response));
+    Ok(())
+}
+
+/// `plan delete <trade_id>` — drop a registered plan and its engine state.
+/// The inverse of `register`. Idempotent: the worker returns `ok` whether or
+/// not a plan existed under that id, so re-running is safe. Prints the
+/// worker's response verbatim.
+fn run_plan_delete(args: PlanDeleteArgs) -> Result<()> {
+    let key = load_key(&args.common.key_file)?;
+    let now = Utc::now();
+    let suffix = fresh_suffix()?;
+    let intent = build_plan_delete_intent(&args.trade_id, now, &suffix);
+    let body = wrap_control(&intent, &key, now)?;
+    let response = post_control(&args.common.endpoint, &body)?;
+    print_raw(&response);
     Ok(())
 }
 

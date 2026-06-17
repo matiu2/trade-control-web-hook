@@ -72,6 +72,11 @@ Trading:
 - `plan-show` — read-only: dump one plan in full (every rule + its persisted
   `PlanState`). Target named by the intent's `trade_id`; the worker scans all
   account scopes. Drives `trade-control plan show <trade_id>`. KV-only.
+- `plan-delete` — drop a registered plan and its `PlanState` — the inverse of
+  `register`. Target named by the intent's `trade_id`; the worker scans all
+  account scopes and deletes the matching `plan:` + `plan-state:` rows. Drives
+  `trade-control plan delete <trade_id>`. KV-only, idempotent (deleting a
+  missing plan is a no-op). Use to re-arm a setup after editing its chart.
 - `unlock` — clear the cooldown for one instrument. Recovery for an
   `invalidate` you didn't mean to send.
 
@@ -1662,17 +1667,18 @@ engine state is `core/src/plan_state.rs`; the FSM evaluator is
 `engine/src/evaluate.rs`; the candle-pattern detector port is
 `core/src/signals.rs`.
 
-#### Inspecting registered plans (`trade-control plan list` / `show`)
+#### Inspecting / managing registered plans (`trade-control plan list` / `show` / `delete`)
 
-Two read-only queries let you see what the engine is evaluating — useful
-during the parallel-run period to confirm a plan registered, whether it's in
-shadow mode, and how far its FSM has progressed:
+Three subcommands let you see and manage what the engine is evaluating —
+useful during the parallel-run period to confirm a plan registered, whether
+it's in shadow mode, and how far its FSM has progressed:
 
 ```sh
-trade-control-dev plan list              # compact table of every plan + state
-trade-control-dev plan list --yaml       # raw worker YAML (one entry per plan)
-trade-control-dev plan show eurusd-hs-7  # full dump of one plan + its state
+trade-control-dev plan list                # compact table of every plan + state
+trade-control-dev plan list --yaml         # raw worker YAML (one entry per plan)
+trade-control-dev plan show eurusd-hs-7    # full dump of one plan + its state
 trade-control-dev plan show eurusd-hs-7 --yaml
+trade-control-dev plan delete eurusd-hs-7  # drop a plan so the setup can be re-armed
 ```
 
 `plan list` shows `TRADE_ID`, `ACCOUNT`, `INSTRUMENT`, `SHADOW`, `PHASE`,
@@ -1681,9 +1687,19 @@ trade-control-dev plan show eurusd-hs-7 --yaml
 state row, so a freshly-registered plan lists with empty state until the next
 `*/15` tick. `plan show <trade_id>` scans every account scope for that id and
 dumps the whole `TradePlan` (every rule + embedded intent) plus the persisted
-`PlanState`. Both are KV-only control actions (`plan-list` / `plan-show`),
-signed like `status`, hitting the baked endpoint with no extra flag. A `plan
-show` for an unknown id exits non-zero with `no registered plan with trade_id …`.
+`PlanState`. `plan list` / `plan show` are read-only KV-only control actions
+(`plan-list` / `plan-show`), signed like `status`, hitting the baked endpoint
+with no extra flag. A `plan show` for an unknown id exits non-zero with `no
+registered plan with trade_id …`.
+
+`plan delete <trade_id>` is the inverse of `register`: it scans every account
+scope and drops the matching `plan:` and `plan-state:` rows, so the engine
+stops evaluating that plan. It's KV-only and **idempotent** — deleting a plan
+that doesn't exist returns `ok` (reported as a no-op), so re-running is safe.
+The intended workflow: `tv-arm` registers a plan and draws its news/blackout
+lines on the chart; if you tweak or remove some of those lines, run `plan
+delete <trade_id>` to wipe the stale server plan, then re-run `tv-arm` to
+register the corrected one.
 
 Skipped preps are pre-fired directly to the worker so the entry's
 `requires_preps:` gate is still satisfied — useful when joining a setup
