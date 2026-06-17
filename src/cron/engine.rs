@@ -123,7 +123,13 @@ async fn tick_one(
         return Ok(());
     }
 
-    let eval = evaluate_plan(plan, &prior, &fresh, now, expires_at);
+    // The H&S `PinePattern` entry is stateful and needs lookback the
+    // watermark-bounded `fresh` slice doesn't carry. When the plan has one,
+    // fetch a wider back-window ending at `now` for the detector; otherwise the
+    // window is unused and `fresh` stands in.
+    let detector_window = detector_window_for(&broker, plan, &fresh, now).await?;
+
+    let eval = evaluate_plan(plan, &prior, &fresh, &detector_window, now, expires_at);
 
     // Persist the advanced state (or clear it + the plan when the spine is
     // done) before dispatching, so a dispatch failure can't replay a fired bar.
@@ -198,6 +204,50 @@ async fn fetch_candles(
     }
 }
 
+/// Build the detector back-window for a plan's `PinePattern` entry. For a plan
+/// with no Pine entry rule (M/W, pure-trendline H&S preps) the window is unused,
+/// so we skip the extra fetch and return `fresh.to_vec()` — every new candle is
+/// still present (the only contract the evaluator needs).
+///
+/// When a Pine entry is present, the detector needs `min_lookback_bars` of
+/// history behind the earliest fresh candle to recompute the latch (pattern
+/// depth + confirm window + SL lookback). We fetch from there to `now` and merge
+/// so the window is ascending and contains the fresh candles.
+async fn detector_window_for(
+    broker: &BrokerHandle,
+    plan: &trade_control_core::trade_plan::TradePlan,
+    fresh: &[Candle],
+    now: DateTime<Utc>,
+) -> Result<Vec<Candle>, String> {
+    use trade_control_core::signals::{DetectorConfig, min_lookback_bars};
+    use trade_control_core::trade_plan::Trigger;
+
+    let has_pine = plan.rules.iter().any(|r| {
+        r.intent.action == Action::Enter && matches!(r.trigger, Trigger::PinePattern { .. })
+    });
+    if !has_pine {
+        return Ok(fresh.to_vec());
+    }
+
+    let cfg = DetectorConfig::pine_defaults(plan.granularity);
+    let lookback = min_lookback_bars(&cfg) as i64;
+    let earliest = fresh.iter().map(|c| c.time).min().unwrap_or(now);
+    let since = earliest - chrono::Duration::seconds(plan.granularity.seconds() * lookback);
+    let window = fetch_candles(broker, &plan.instrument, plan.granularity, since, now).await?;
+
+    // Merge fetched history with `fresh` and dedup by open-time so every new
+    // candle is present even if the history fetch's closed-bar cutoff dropped the
+    // most recent one. Ascending by time.
+    let mut merged = window;
+    for c in fresh {
+        if !merged.iter().any(|w| w.time == c.time) {
+            merged.push(*c);
+        }
+    }
+    merged.sort_by_key(|c| c.time);
+    Ok(merged)
+}
+
 /// Dispatch one fired intent through the same handlers the webhook uses, then
 /// record the outcome on the seen-by-id index exactly as the HTTP path does.
 ///
@@ -211,8 +261,17 @@ async fn dispatch_fired(
     fired: &trade_control_engine::FiredIntent,
     now: DateTime<Utc>,
 ) {
+    // An H&S `PinePattern` fire carries the latched signal geometry; fold it onto
+    // the shell so the enter resolves entry/SL/TP against the *pattern* extremes
+    // (signal_high/low, recent_*, golden, signal_confirmed) exactly as the TV
+    // alert's `{{plot(...)}}` substitutions did. Every other fire (M/W, vetos,
+    // preps) carries no signal and gets the plain candle shell.
+    let shell = match &fired.signal {
+        Some(sig) => Shell::from_candle_and_signal(&fired.candle, sig),
+        None => Shell::from_candle(&fired.candle),
+    };
     let verified = Verified {
-        shell: Shell::from_candle(&fired.candle),
+        shell,
         intent: fired.intent.clone(),
     };
     let result = match broker {
