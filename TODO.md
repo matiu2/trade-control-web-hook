@@ -364,6 +364,21 @@ it returns warnings the wrapper logs.
       note, CHANGELOG v35. Follow-up: widen `detector_window_for` so anchors are
       always in-window (retires the fallback) — deferred until logs show it.
 
+### Stage E.9 — widen detector window to the earliest trendline anchor (DONE — all green)
+
+The real fix behind E.8's observability: stop the `bar_seconds` fallback from
+firing at all on a normally-armed plan by fetching enough history that every
+trendline anchor is in-window (then the bar-index count is exact).
+
+- [x] RF1 — worker: `detector_window_for` fetches back to the earliest `since`
+      any consumer needs — the Pine `min_lookback_bars` **and** the earliest
+      `TrendlineCross` anchor (minus one bar slack). Pure helpers
+      `pine_lookback_since` / `trendline_anchor_since` (+ free
+      `earliest_trendline_anchor_epoch(triggers)`), three unit tests. Pure-M/W
+      plans keep the `fresh`-only fast path. README + CHANGELOG v36. The v35
+      warning surface stays as belt-and-braces for a pathological out-of-reach
+      anchor.
+
 ### Stage F — retire the webhook (PENDING)
 ### Stage G — Durable Object websocket (only if demo proves a need) (PENDING)
 

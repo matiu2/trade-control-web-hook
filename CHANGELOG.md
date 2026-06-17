@@ -1,5 +1,49 @@
 # Changelog
 
+## v36 — 2026-06-18 — Detector window reaches back to the earliest trendline anchor
+
+### Why
+
+The v34/v35 `bar_seconds` fallback fired whenever a trendline anchor fell
+outside the engine's fetched candle window — and for a non-Pine plan (pure
+M/W or trendline-only H&S preps) the window was just the watermark-bounded
+`fresh` slice, so **any** anchor older than the last cron gap was out-of-window
+and resolved by the wall-clock divisor. v35 made that path observable; this
+removes the cause. The real fix is to fetch enough history that anchors are
+always in-window, making the bar-index count exact and the fallback dead code
+for a normally-armed plan.
+
+### What changed
+
+- **worker — widen `detector_window_for`.** The window start is now the
+  earliest `since` any consumer needs, fetched once: the existing
+  `PinePattern` lookback (`min_lookback_bars` behind the freshest candle) **and**
+  the earliest `TrendlineCross` anchor across all the plan's rules (minus one
+  bar of slack so the anchor's own bar is in-window). Split into two pure
+  helpers — `pine_lookback_since` and `trendline_anchor_since` (the latter over
+  a free `earliest_trendline_anchor_epoch(triggers)` so it unit-tests without
+  building `Intent`s). A plan with neither a Pine entry nor a trendline (a pure
+  M/W heartbeat) keeps the no-extra-fetch `fresh`-only fast path.
+
+### Breaking
+
+- None. Behaviour change only: trendline plans now fetch a wider back-window
+  (one extra broker candle call covering history to the earliest anchor),
+  removing the out-of-window fallback for normally-armed plans. The v35 warning
+  surface stays as the belt-and-braces signal for a pathological anchor.
+
+### Tests
+
+- `earliest_trendline_anchor_epoch`: min across multiple trendline rules;
+  `None` for a no-trendline plan; reversed (b < a) endpoints pick the true min.
+
+### Follow-up
+
+- The `bar_seconds` field + fallback divisor are now exercised only by a
+  pathological anchor older than the fetch reaches. Could be retired entirely if
+  the warning never appears on a live plan over a meaningful window — left in as
+  a safety net for now.
+
 ## v35 — 2026-06-18 — Trendline `bar_seconds` fallback is now observable, not silent
 
 ### Why

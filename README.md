@@ -1711,14 +1711,17 @@ where those preps don't apply.
   interpolation would slide the break-and-close / retest level badly wrong
   on any gapped instrument (everything but 24/5 FX — and even FX gaps at the
   weekend). No market-hours table is needed: the candle feed *is* the
-  ordinal axis. The `bar_seconds` fallback is now **observable**: when an
-  anchor falls outside the fetched window, the engine attaches a warning to
-  its `PlanEval` and the cron wrapper `rlog!`s it (`cron engine: plan <id>
-  trendline …`) — a soft note when `bar_seconds` extrapolates across a gap,
-  a hard one when a pre-`bar_seconds` plan (`bar_seconds = 0`) makes the
-  trendline silently un-evaluable. The proper fix if you see these is to
-  widen the candle fetch so anchors land in-window, not to trust the
-  extrapolation.
+  ordinal axis. The engine **fetches its detector window back to the earliest
+  trendline anchor** (`detector_window_for`), so every anchor lands in-window
+  and the bar-index count is exact — the `bar_seconds` fallback is dead code
+  for a normally-armed plan. It survives only as a belt-and-braces path for a
+  pathological anchor older than the fetch could reach, and *that* path is
+  **observable**: the engine attaches a warning to its `PlanEval` and the cron
+  wrapper `rlog!`s it (`cron engine: plan <id> trendline …`) — a soft note when
+  `bar_seconds` extrapolates across a gap, a hard one when a pre-`bar_seconds`
+  plan (`bar_seconds = 0`) makes the trendline silently un-evaluable. If you
+  ever see one, the anchor predates the fetch window — widen it, don't trust
+  the extrapolation.
 - **Chart-side `_alertId` binding is cosmetic.** The "link icon" on a
   drawing comes from a separate client-side binding that TV's GUI sets
   via `LineDataSource.setAlert()`. Programmatic creates can't easily
