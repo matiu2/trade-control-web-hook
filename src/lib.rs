@@ -245,6 +245,8 @@ pub async fn main(mut req: Request, env: Env, ctx: Context) -> Result<Response> 
             Action::NewsStart => break 'intent handle_news_start(&store, &verified, now).await,
             Action::NewsEnd => break 'intent handle_news_end(&store, &verified, now).await,
             Action::Register => break 'intent handle_register(&store, &verified, now).await,
+            Action::PlanList => break 'intent handle_plan_list(&store, &verified, now).await,
+            Action::PlanShow => break 'intent handle_plan_show(&store, &verified, now).await,
             _ => {}
         }
 
@@ -545,6 +547,8 @@ async fn run_action<B: Broker>(
         | Action::NewsStart
         | Action::NewsEnd
         | Action::Register
+        | Action::PlanList
+        | Action::PlanShow
         // MarketInfo needs the concrete TradeNation broker (its `market_info`
         // is not on the generic `Broker` trait), so it's dispatched in the
         // broker-acquire section before this generic function — never here.
@@ -2646,6 +2650,179 @@ async fn handle_register(
     );
     record_seen(store, verified, now, &outcome).await;
     Response::ok("ok")
+}
+
+/// A compact, operator-facing view of one registered plan + its current engine
+/// state. Used by [`handle_plan_list`] — small enough to list many plans
+/// without burying the reader in each rule's embedded intent (use `plan show`
+/// for the full dump). Serialised to YAML for the `trade-control plan list`
+/// response.
+#[derive(Serialize)]
+struct PlanSummary {
+    trade_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    account: Option<String>,
+    instrument: String,
+    granularity: trade_control_core::broker::Granularity,
+    /// Observe-only? The thing an operator most wants to confirm during the
+    /// engine's parallel-run period.
+    shadow: bool,
+    rules: usize,
+    /// `PlanState`-derived fields. `None`/empty until the plan's first cron
+    /// tick has seeded its state (a registered-but-not-yet-ticked plan has no
+    /// state row).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    phase: Option<trade_control_core::plan_state::Phase>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    watermark: Option<chrono::DateTime<chrono::Utc>>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    fired: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    retest_seen_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// The full `plan show` payload: the whole registered plan plus its engine
+/// state, both serialised verbatim so the operator can inspect every rule and
+/// the exact persisted state.
+#[derive(Serialize)]
+struct PlanDetail {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    account: Option<String>,
+    plan: trade_control_core::trade_plan::TradePlan,
+    /// `None` until the first cron tick seeds the plan's state row.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    state: Option<trade_control_core::plan_state::PlanState>,
+}
+
+/// Handle the `plan-list` action: enumerate every registered plan across all
+/// account scopes, pair each with its current `PlanState`, and return a compact
+/// YAML summary. Read-only, KV-only, idempotent (marks seen on completion like
+/// every other control action).
+async fn handle_plan_list(
+    store: &KvStateStore,
+    verified: &incoming::Verified,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<Response> {
+    let plans = match store.list_all_trade_plans().await {
+        Ok(v) => v,
+        Err(err) => {
+            rlog_err!("plan-list: list_all_trade_plans: {err}");
+            return Response::error("state error", 500);
+        }
+    };
+
+    let mut summaries = Vec::with_capacity(plans.len());
+    for stored in &plans {
+        let state = store
+            .get_plan_state(stored.account.as_deref(), &stored.plan.trade_id)
+            .await
+            .unwrap_or(None);
+        summaries.push(plan_summary(stored, state));
+    }
+    // Stable ordering so a re-list is byte-comparable: account, then trade_id.
+    summaries.sort_by(|a, b| {
+        a.account
+            .cmp(&b.account)
+            .then_with(|| a.trade_id.cmp(&b.trade_id))
+    });
+
+    let body = match serde_yaml::to_string(&summaries) {
+        Ok(s) => s,
+        Err(err) => {
+            rlog_err!("plan-list serialise: {err}");
+            return Response::error("internal error", 500);
+        }
+    };
+    record_seen(
+        store,
+        verified,
+        now,
+        &format!("plan-list: {} plans", summaries.len()),
+    )
+    .await;
+    Response::ok(body)
+}
+
+/// Build the compact summary for one stored plan + its (optional) state.
+fn plan_summary(
+    stored: &trade_control_core::state::StoredPlan,
+    state: Option<trade_control_core::plan_state::PlanState>,
+) -> PlanSummary {
+    let plan = &stored.plan;
+    PlanSummary {
+        trade_id: plan.trade_id.clone(),
+        account: stored.account.clone(),
+        instrument: plan.instrument.clone(),
+        granularity: plan.granularity,
+        shadow: plan.shadow,
+        rules: plan.rules.len(),
+        phase: state.as_ref().map(|s| s.phase),
+        watermark: state.as_ref().and_then(|s| s.watermark),
+        fired: state
+            .as_ref()
+            .map(|s| s.fired.iter().cloned().collect())
+            .unwrap_or_default(),
+        retest_seen_at: state.as_ref().and_then(|s| s.retest_seen_at),
+    }
+}
+
+/// Handle the `plan-show` action: dump one plan in full. The target is named by
+/// `intent.trade_id`; we scan every account scope and return the match(es) —
+/// trade_ids are unique in practice, but if two scopes share one we return both
+/// so nothing is hidden. Returns 404 when no plan matches.
+async fn handle_plan_show(
+    store: &KvStateStore,
+    verified: &incoming::Verified,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<Response> {
+    let Some(target) = verified.intent.trade_id.as_deref() else {
+        return Response::error("plan-show requires a `trade_id`", 400);
+    };
+
+    let plans = match store.list_all_trade_plans().await {
+        Ok(v) => v,
+        Err(err) => {
+            rlog_err!("plan-show: list_all_trade_plans: {err}");
+            return Response::error("state error", 500);
+        }
+    };
+
+    let mut details = Vec::new();
+    for stored in &plans {
+        if stored.plan.trade_id != target {
+            continue;
+        }
+        let state = store
+            .get_plan_state(stored.account.as_deref(), &stored.plan.trade_id)
+            .await
+            .unwrap_or(None);
+        details.push(PlanDetail {
+            account: stored.account.clone(),
+            plan: stored.plan.clone(),
+            state,
+        });
+    }
+
+    if details.is_empty() {
+        record_seen(
+            store,
+            verified,
+            now,
+            &format!("plan-show: {target} not found"),
+        )
+        .await;
+        return Response::error(format!("no registered plan with trade_id {target}"), 404);
+    }
+
+    let body = match serde_yaml::to_string(&details) {
+        Ok(s) => s,
+        Err(err) => {
+            rlog_err!("plan-show serialise: {err}");
+            return Response::error("internal error", 500);
+        }
+    };
+    record_seen(store, verified, now, &format!("plan-show: {target}")).await;
+    Response::ok(body)
 }
 
 /// Resolve an [`OandaBroker`] for the request.

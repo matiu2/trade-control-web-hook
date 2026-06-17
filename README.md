@@ -65,6 +65,13 @@ Trading:
   it still records `seen` and is fully idempotent. **TradeNation only** — a
   non-TN intent is rejected `400`. These hours feed the upcoming market-hours
   entry blackout.
+- `plan-list` — read-only: list every registered server-side `TradePlan` the
+  engine is evaluating, each with a compact summary of its current `PlanState`
+  (phase, watermark, fired rules, shadow flag). Drives `trade-control plan
+  list`. KV-only, idempotent.
+- `plan-show` — read-only: dump one plan in full (every rule + its persisted
+  `PlanState`). Target named by the intent's `trade_id`; the worker scans all
+  account scopes. Drives `trade-control plan show <trade_id>`. KV-only.
 - `unlock` — clear the cooldown for one instrument. Recovery for an
   `invalidate` you didn't mean to send.
 
@@ -1615,6 +1622,29 @@ is `tv-arm/src/trade_plan_build.rs` (the inverse of `alert_spec.rs`); the
 engine state is `core/src/plan_state.rs`; the FSM evaluator is
 `engine/src/evaluate.rs`; the candle-pattern detector port is
 `core/src/signals.rs`.
+
+#### Inspecting registered plans (`trade-control plan list` / `show`)
+
+Two read-only queries let you see what the engine is evaluating — useful
+during the parallel-run period to confirm a plan registered, whether it's in
+shadow mode, and how far its FSM has progressed:
+
+```sh
+trade-control-dev plan list              # compact table of every plan + state
+trade-control-dev plan list --yaml       # raw worker YAML (one entry per plan)
+trade-control-dev plan show eurusd-hs-7  # full dump of one plan + its state
+trade-control-dev plan show eurusd-hs-7 --yaml
+```
+
+`plan list` shows `TRADE_ID`, `ACCOUNT`, `INSTRUMENT`, `SHADOW`, `PHASE`,
+`RULES`, and `FIRED` (the rule_ids that have latched). The state columns
+(`PHASE`, `FIRED`, …) are blank until a plan's first cron tick seeds its
+state row, so a freshly-registered plan lists with empty state until the next
+`*/15` tick. `plan show <trade_id>` scans every account scope for that id and
+dumps the whole `TradePlan` (every rule + embedded intent) plus the persisted
+`PlanState`. Both are KV-only control actions (`plan-list` / `plan-show`),
+signed like `status`, hitting the baked endpoint with no extra flag. A `plan
+show` for an unknown id exits non-zero with `no registered plan with trade_id …`.
 
 Skipped preps are pre-fired directly to the worker so the entry's
 `requires_preps:` gate is still satisfied — useful when joining a setup

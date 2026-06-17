@@ -1375,6 +1375,21 @@ pub enum Action {
     /// — there is no OANDA equivalent yet. The hours feed the upcoming
     /// market-hours entry blackout.
     MarketInfo,
+    /// Read-only query: list every registered server-side
+    /// [`TradePlan`](crate::trade_plan::TradePlan) the engine is evaluating,
+    /// each with a compact summary of its current
+    /// [`PlanState`](crate::plan_state::PlanState) (phase, watermark, fired
+    /// rules, shadow flag). Like [`Action::Status`] this is KV-only (no broker)
+    /// and `instrument` is an ignored placeholder. Drives `trade-control plan
+    /// list`. Recorded as seen on every completion (idempotent control op).
+    PlanList,
+    /// Read-only query: dump one registered plan in full — the entire
+    /// [`TradePlan`](crate::trade_plan::TradePlan) plus its
+    /// [`PlanState`](crate::plan_state::PlanState). The target is named by
+    /// [`Intent::trade_id`] (not `instrument`, which is an ignored placeholder);
+    /// the worker scans every account scope and returns the match(es). KV-only,
+    /// idempotent. Drives `trade-control plan show <trade_id>`.
+    PlanShow,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]

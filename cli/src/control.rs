@@ -129,6 +129,26 @@ pub fn build_market_info_intent(instrument: &str, now: DateTime<Utc>, suffix: &s
     }
 }
 
+/// Build a `plan-list` query `Intent`. Read-only; lists every registered
+/// server-side plan. Like `status`, `instrument` is an ignored placeholder.
+pub fn build_plan_list_intent(now: DateTime<Utc>, suffix: &str) -> Intent {
+    let id = format!("plan-list-{}-{suffix}", now.format("%Y-%m-%dT%H%M%S"));
+    control_skeleton(Action::PlanList, STATUS_INSTRUMENT, id, now)
+}
+
+/// Build a `plan-show` query `Intent` for one `trade_id`. The worker scans
+/// every account scope for a plan with that id. `instrument` is an ignored
+/// placeholder; the target rides on `trade_id`.
+pub fn build_plan_show_intent(trade_id: &str, now: DateTime<Utc>, suffix: &str) -> Intent {
+    let id = format!(
+        "plan-show-{trade_id}-{}-{suffix}",
+        now.format("%Y-%m-%dT%H%M%S")
+    );
+    let mut intent = control_skeleton(Action::PlanShow, STATUS_INSTRUMENT, id, now);
+    intent.trade_id = Some(trade_id.to_string());
+    intent
+}
+
 /// Build a `prep` Intent for a single (instrument, step) pair with a TTL.
 ///
 /// `clears` is the list of other prep steps to drop before recording

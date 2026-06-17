@@ -309,6 +309,19 @@ against the alerts' actual placements. That parallel run is the empirical
 Stage F gate and also produces the recorded-fire dataset the H&S
 historical-replay parity follow-up needs.
 
+### Stage E.6 — plan inspection CLI (DONE — all green)
+
+Visibility for the parallel-run period: see what the engine is evaluating.
+
+- [x] Two read-only actions `plan-list` / `plan-show` (core `Action`; worker
+      `handle_plan_list` / `handle_plan_show` reuse `list_all_trade_plans` +
+      `get_plan_state`). KV-only, idempotent, signed like `status`.
+- [x] CLI `trade-control plan list` (aligned table) + `plan show <trade_id>`
+      (full dump), each `--yaml` for raw worker output.
+- [x] Pure-formatting tests; full workspace green; clippy + fmt + wasm32 clean.
+      README + CHANGELOG (v32). Also folded in the stale market-info
+      `cli/src/lib.rs` fmt diff.
+
 ### Stage F — retire the webhook (PENDING)
 ### Stage G — Durable Object websocket (only if demo proves a need) (PENDING)
 

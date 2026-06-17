@@ -24,14 +24,15 @@ use color_eyre::eyre::{Context, Result, eyre};
 use trade_control_cli::{
     AdoptBody, CalendarBarsArgs, KEY_LEN, TradePattern, add_account, adopt_trade,
     build_clear_prep_intent, build_clear_veto_intent, build_market_info_intent,
-    build_news_from_spec, build_pause_from_spec, build_prep_intent, build_status_intent,
-    build_trade_from_spec, build_trade_interactive, build_unlock_intent, build_veto_intent,
-    delete_account, delete_secret, fill_missing_fields, generate_key_hex, list_accounts,
-    load_cache, load_news_spec_from_file, load_pause_spec_from_file, load_spec_from_file,
-    pick_pattern_interactive, pick_template_interactive, prompt_save_as_template, put_secret,
-    record_account_use, record_prep_use, record_veto_use, require_local_tn_account,
-    run_calendar_bars, secret_binding_for, test_account, validate_instrument, wrap_signed,
-    wrap_signed_template, write_news, write_pause, write_trade,
+    build_news_from_spec, build_pause_from_spec, build_plan_list_intent, build_plan_show_intent,
+    build_prep_intent, build_status_intent, build_trade_from_spec, build_trade_interactive,
+    build_unlock_intent, build_veto_intent, delete_account, delete_secret, fill_missing_fields,
+    generate_key_hex, list_accounts, load_cache, load_news_spec_from_file,
+    load_pause_spec_from_file, load_spec_from_file, pick_pattern_interactive,
+    pick_template_interactive, prompt_save_as_template, put_secret, record_account_use,
+    record_prep_use, record_veto_use, require_local_tn_account, run_calendar_bars,
+    secret_binding_for, test_account, validate_instrument, wrap_signed, wrap_signed_template,
+    write_news, write_pause, write_trade,
 };
 use trade_control_core::account::{
     AccountKind, AccountMetadata, Credentials, TradeNationCreds, TradeNationKind,
@@ -143,12 +144,49 @@ enum Cmd {
     /// cleanly through string mapping and don't need a catalog.
     #[command(subcommand)]
     Instruments(InstrumentsCmd),
+    /// Inspect the server-side engine's registered `TradePlan`s. Read-only
+    /// queries against the deployed worker (`plan list`, `plan show <id>`).
+    /// Useful during the engine's parallel-run period to confirm a plan
+    /// registered, whether it's in shadow mode, and how far its FSM has
+    /// progressed.
+    #[command(subcommand)]
+    Plan(PlanCmd),
     /// Print a shell completion script to stdout. Install with e.g.
     /// `trade-control completions zsh > ~/.zfunc/_trade-control`.
     Completions {
         /// Target shell.
         shell: Shell,
     },
+}
+
+#[derive(Subcommand)]
+enum PlanCmd {
+    /// List every registered plan with a compact summary of its current
+    /// engine state (phase, watermark, fired rules, shadow flag).
+    List(PlanListArgs),
+    /// Dump one plan in full — every rule plus its persisted engine state.
+    /// The worker scans all account scopes for the `trade_id`.
+    Show(PlanShowArgs),
+}
+
+#[derive(Parser)]
+struct PlanListArgs {
+    /// Print the worker's raw YAML response instead of the table.
+    #[arg(long)]
+    yaml: bool,
+    #[command(flatten)]
+    common: EndpointArgs,
+}
+
+#[derive(Parser)]
+struct PlanShowArgs {
+    /// The plan's `trade_id` (e.g. `eurusd-hs-7`).
+    trade_id: String,
+    /// Print the worker's raw YAML response instead of the pretty view.
+    #[arg(long)]
+    yaml: bool,
+    #[command(flatten)]
+    common: EndpointArgs,
 }
 
 #[derive(Subcommand)]
@@ -686,6 +724,7 @@ fn main() -> Result<()> {
             run_calendar_bars(args, key, Utc::now())?;
         }
         Cmd::Instruments(sub) => run_instruments(sub)?,
+        Cmd::Plan(sub) => run_plan(sub)?,
         Cmd::Completions { shell } => run_completions(shell),
     }
     Ok(())
@@ -1090,6 +1129,177 @@ fn run_status(args: EndpointArgs) -> Result<()> {
         print!("{footer}");
     }
     Ok(())
+}
+
+fn run_plan(sub: PlanCmd) -> Result<()> {
+    match sub {
+        PlanCmd::List(args) => run_plan_list(args),
+        PlanCmd::Show(args) => run_plan_show(args),
+    }
+}
+
+/// `plan list` — query the worker for every registered plan. Pretty table by
+/// default; `--yaml` passes the worker's raw YAML through verbatim.
+fn run_plan_list(args: PlanListArgs) -> Result<()> {
+    let key = load_key(&args.common.key_file)?;
+    let now = Utc::now();
+    let suffix = fresh_suffix()?;
+    let intent = build_plan_list_intent(now, &suffix);
+    let body = wrap_control(&intent, &key, now)?;
+    let response = post_control(&args.common.endpoint, &body)?;
+    if args.yaml {
+        print_raw(&response);
+        return Ok(());
+    }
+    match serde_yaml::from_str::<Vec<serde_yaml::Value>>(&response) {
+        Ok(plans) => print!("{}", format_plan_list(&plans)),
+        // Unexpected shape / error body — don't hide it.
+        Err(_) => print_raw(&response),
+    }
+    Ok(())
+}
+
+/// `plan show <trade_id>` — full dump of one plan + its engine state. Pretty
+/// key-value view by default; `--yaml` for the raw worker YAML.
+fn run_plan_show(args: PlanShowArgs) -> Result<()> {
+    let key = load_key(&args.common.key_file)?;
+    let now = Utc::now();
+    let suffix = fresh_suffix()?;
+    let intent = build_plan_show_intent(&args.trade_id, now, &suffix);
+    let body = wrap_control(&intent, &key, now)?;
+    // A miss is a 404; `post_control` turns any non-2xx into an `Err` carrying
+    // the worker's body ("no registered plan with trade_id …"), so `?` surfaces
+    // it as a clean error rather than printing an empty table.
+    let response = post_control(&args.common.endpoint, &body)?;
+    // `plan show` is already a full dump; the pretty view just adds a header
+    // per match. The raw YAML *is* the useful content, so default and --yaml
+    // differ only in that header.
+    if args.yaml {
+        print_raw(&response);
+        return Ok(());
+    }
+    print!("{}", format_plan_show(&args.trade_id, &response));
+    Ok(())
+}
+
+/// Print a worker response verbatim, ensuring a trailing newline.
+fn print_raw(response: &str) {
+    print!("{response}");
+    if !response.ends_with('\n') {
+        println!();
+    }
+}
+
+/// Render the `plan list` summaries as an aligned table. Each summary is a
+/// generic YAML map (we don't link the CLI to the worker's `PlanSummary`
+/// struct); missing fields render as `-`.
+fn format_plan_list(plans: &[serde_yaml::Value]) -> String {
+    if plans.is_empty() {
+        return "no registered plans\n".to_string();
+    }
+    let field = |p: &serde_yaml::Value, k: &str| -> String {
+        match p.get(k) {
+            Some(serde_yaml::Value::Sequence(s)) => s
+                .iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect::<Vec<_>>()
+                .join(","),
+            Some(v) => yaml_scalar(v),
+            None => "-".to_string(),
+        }
+    };
+    let rows: Vec<[String; 7]> = plans
+        .iter()
+        .map(|p| {
+            [
+                field(p, "trade_id"),
+                field(p, "account"),
+                field(p, "instrument"),
+                field(p, "shadow"),
+                field(p, "phase"),
+                field(p, "rules"),
+                field(p, "fired"),
+            ]
+        })
+        .collect();
+    let headers = [
+        "TRADE_ID",
+        "ACCOUNT",
+        "INSTRUMENT",
+        "SHADOW",
+        "PHASE",
+        "RULES",
+        "FIRED",
+    ];
+    render_table(&headers, &rows)
+}
+
+/// One scalar YAML value as a plain string (no quotes), `-` for null.
+fn yaml_scalar(v: &serde_yaml::Value) -> String {
+    match v {
+        serde_yaml::Value::Null => "-".to_string(),
+        serde_yaml::Value::Bool(b) => b.to_string(),
+        serde_yaml::Value::Number(n) => n.to_string(),
+        serde_yaml::Value::String(s) => s.clone(),
+        other => serde_yaml::to_string(other)
+            .unwrap_or_default()
+            .trim()
+            .to_string(),
+    }
+}
+
+/// Render a fixed-column table with each column widened to its longest cell.
+fn render_table<const N: usize>(headers: &[&str; N], rows: &[[String; N]]) -> String {
+    let mut widths = headers.map(str::len);
+    for row in rows {
+        for (i, cell) in row.iter().enumerate() {
+            widths[i] = widths[i].max(cell.len());
+        }
+    }
+    let line = |cells: &[String; N]| -> String {
+        cells
+            .iter()
+            .enumerate()
+            .map(|(i, c)| format!("{c:<width$}", width = widths[i]))
+            .collect::<Vec<_>>()
+            .join("  ")
+            .trim_end()
+            .to_string()
+    };
+    let header_row: [String; N] = std::array::from_fn(|i| headers[i].to_string());
+    let mut out = format!("{}\n", line(&header_row));
+    for row in rows {
+        out.push_str(&format!("{}\n", line(row)));
+    }
+    out
+}
+
+/// Format the `plan show` response: a short header per matched plan, then the
+/// worker's YAML for that match. The worker returns a YAML sequence (one entry
+/// per account scope that has the trade_id); we just label and pass through.
+fn format_plan_show(trade_id: &str, response: &str) -> String {
+    match serde_yaml::from_str::<Vec<serde_yaml::Value>>(response) {
+        Ok(matches) if !matches.is_empty() => {
+            let mut out = format!(
+                "plan {trade_id} — {} match{}\n\n",
+                matches.len(),
+                if matches.len() == 1 { "" } else { "es" },
+            );
+            for m in &matches {
+                out.push_str(&serde_yaml::to_string(m).unwrap_or_default());
+                out.push('\n');
+            }
+            out
+        }
+        // Empty sequence, a 404 error body, or an unexpected shape: pass through.
+        _ => {
+            let mut out = response.to_string();
+            if !out.ends_with('\n') {
+                out.push('\n');
+            }
+            out
+        }
+    }
 }
 
 fn run_market_info(args: MarketInfoCmdArgs) -> Result<()> {
@@ -1887,5 +2097,67 @@ reset_time: 10:00 PM
 #   - XAUUSD.F (no TN catalog match)
 ";
         assert_eq!(footer, expected);
+    }
+
+    #[test]
+    fn plan_list_table_aligns_and_fills_missing() {
+        // Two plans: one fully populated + shadow, one registered-but-not-yet-
+        // ticked (no state → no phase, empty fired). A null account renders `-`.
+        let yaml = "\
+- trade_id: eurusd-hs-7
+  account: reversals
+  instrument: EUR_USD
+  shadow: true
+  rules: 6
+  phase: await_entry
+  fired: [03-prep-break-and-close, 04-prep-retest]
+- trade_id: usdjpy-mw-3
+  instrument: USD_JPY
+  shadow: false
+  rules: 4
+";
+        let plans: Vec<serde_yaml::Value> = serde_yaml::from_str(yaml).unwrap();
+        let table = format_plan_list(&plans);
+        let lines: Vec<&str> = table.lines().collect();
+        assert!(lines[0].starts_with("TRADE_ID"), "header: {}", lines[0]);
+        // Fully-populated row.
+        assert!(lines[1].contains("eurusd-hs-7"));
+        assert!(lines[1].contains("reversals"));
+        assert!(lines[1].contains("true"));
+        assert!(lines[1].contains("await_entry"));
+        assert!(lines[1].contains("03-prep-break-and-close,04-prep-retest"));
+        // Not-yet-ticked row: missing account/phase/fired render as `-`.
+        assert!(lines[2].contains("usdjpy-mw-3"));
+        assert!(lines[2].contains("USD_JPY"));
+        // The ACCOUNT and PHASE columns are `-` for this row.
+        assert!(
+            lines[2].contains('-'),
+            "expected `-` placeholder: {}",
+            lines[2]
+        );
+    }
+
+    #[test]
+    fn plan_list_empty_is_friendly() {
+        assert_eq!(format_plan_list(&[]), "no registered plans\n");
+    }
+
+    #[test]
+    fn plan_show_labels_each_match() {
+        let yaml = "\
+- account: reversals
+  plan:
+    trade_id: eurusd-hs-7
+    instrument: EUR_USD
+  state:
+    phase: await_entry
+";
+        let out = format_plan_show("eurusd-hs-7", yaml);
+        assert!(
+            out.starts_with("plan eurusd-hs-7 — 1 match\n"),
+            "got: {out}"
+        );
+        assert!(out.contains("trade_id: eurusd-hs-7"));
+        assert!(out.contains("phase: await_entry"));
     }
 }

@@ -94,6 +94,10 @@ pub fn required_for_action(action: Action) -> &'static [&'static str] {
         // `tv-arm` from the chart geometry — never hand-built through the
         // interactive questionnaire, so nothing extra is prompted here.
         Action::Register => &[],
+        // plan-list / plan-show are read-only engine queries minted by the
+        // dedicated `trade-control plan` subcommand (plan-show names its
+        // target via `trade_id`), never through the interactive questionnaire.
+        Action::PlanList | Action::PlanShow => &[],
     }
 }
 

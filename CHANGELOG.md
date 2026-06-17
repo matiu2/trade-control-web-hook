@@ -1,5 +1,43 @@
 # Changelog
 
+## v32 — 2026-06-17 — `trade-control plan list` / `plan show` (inspect registered engine plans)
+
+### Why
+
+There was no way to see what the server-side engine is evaluating. During the
+engine's parallel-run period (shadow mode, v31) the operator needs to confirm a
+plan actually registered, whether it's in shadow or live mode, and how far its
+FSM has progressed — without grepping Cloudflare logs.
+
+### What changed
+
+- Two new read-only control actions: **`plan-list`** (every registered plan +
+  a compact summary of its `PlanState`) and **`plan-show`** (one plan dumped in
+  full — every rule + its persisted state, target named by `trade_id`, scanned
+  across all account scopes). KV-only, idempotent, signed like `status`.
+- Worker handlers `handle_plan_list` / `handle_plan_show` (`src/lib.rs`) reuse
+  the existing `list_all_trade_plans` + `get_plan_state` store methods. New
+  `PlanSummary` / `PlanDetail` view structs.
+- CLI **`trade-control plan list`** (aligned table) and **`trade-control plan
+  show <trade_id>`** (per-match header + YAML), each with **`--yaml`** for the
+  raw worker response. Builders `build_plan_list_intent` /
+  `build_plan_show_intent` (`cli/src/control.rs`).
+
+### Config
+
+- New CLI subcommand group `trade-control plan {list,show}`. No new secrets.
+
+### Tests
+
+- CLI: `plan_list_table_aligns_and_fills_missing`, `plan_list_empty_is_friendly`,
+  `plan_show_labels_each_match` (pure formatting). Core/worker exhaustiveness +
+  build covers the new `Action` variants.
+
+### Note
+
+- Also folded in the pending `cli/src/lib.rs` rustfmt diff left over from the
+  market-info merge (the re-export block this change already edits).
+
 ## v31 — 2026-06-17 — Engine shadow mode (observe-only plans for the safe parallel run)
 
 ### Why
