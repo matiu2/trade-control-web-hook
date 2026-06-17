@@ -27,6 +27,7 @@ mod blackout_restore;
 mod blackout_watch;
 mod blackout_widen;
 mod constants;
+mod engine;
 pub(crate) mod session_meta;
 mod session_refresh;
 mod sweep;
@@ -46,6 +47,12 @@ pub async fn scheduled(_event: ScheduledEvent, env: Env, _ctx: ScheduleContext) 
     session_refresh::refresh_stale_sessions(&env, now, constants::STALE_AFTER).await;
     sweep::sweep_pending_orders(&env, now).await;
     blackout_watch::watch_recovery(&env, now).await;
+
+    // Server-side trade-plan engine — evaluate every registered plan against
+    // fresh broker candles and dispatch fired intents. Runs in parallel with
+    // the webhook (no self-gate); the `*/15` schedule stays — the `*/1`–`*/5`
+    // bump is Stage F, once the engine is proven on demo.
+    engine::run_engine_tick(&env, now).await;
 
     // NY-close-edge job — fire exactly once per close hour, on the :00
     // tick. `apply_if_ny_close_edge` re-checks `is_ny_close_edge` itself,

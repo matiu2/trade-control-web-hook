@@ -522,46 +522,7 @@ async fn run_action<B: Broker>(
     match verified.intent.action {
         Action::Enter => run_enter(broker, store, verified, env, now, Some(raw_body)).await,
         Action::Close => run_close(broker, store, verified, now).await,
-        Action::Invalidate => {
-            let hours = match resolve_phase1_u32(
-                "cooldown_hours",
-                verified.intent.cooldown_hours.as_ref(),
-                &verified.shell,
-                12,
-            ) {
-                Ok(n) => n,
-                Err(outcome) => {
-                    return ActionResult::Rejected {
-                        response: Response::error("cooldown_hours script error", 412),
-                        outcome,
-                    };
-                }
-            };
-            let account = verified.intent.account.as_deref();
-            if let Err(err) = store
-                .set_cooldown(account, &verified.intent.instrument, hours, now)
-                .await
-            {
-                rlog_err!("KV set_cooldown: {err}");
-                return ActionResult::Rejected {
-                    response: Response::error("state error", 500),
-                    outcome: "rejected: state-error".into(),
-                };
-            }
-            let cancelled = broker
-                .cancel_pending_for_instrument(&verified.intent.instrument)
-                .await;
-            rlog!(
-                "invalidate instrument={} account={} cooldown={}h cancelled={} pending",
-                verified.intent.instrument,
-                account.unwrap_or("<global>"),
-                hours,
-                cancelled
-            );
-            ActionResult::Ok(format!(
-                "invalidated: cooldown {hours}h, cancelled {cancelled}"
-            ))
-        }
+        Action::Invalidate => run_invalidate(broker, store, verified, now).await,
         Action::Veto => run_veto_with_broker(broker, store, verified, now).await,
         Action::Status
         | Action::Unlock
@@ -578,6 +539,56 @@ async fn run_action<B: Broker>(
             unreachable!("non-broker actions handled before broker dispatch")
         }
     }
+}
+
+/// Dispatch an `Invalidate` intent: set an instrument cooldown and cancel any
+/// pending orders for it. Extracted from [`run_action`] so the cron engine can
+/// dispatch a fired invalidation veto through the identical path. `pub(crate)`
+/// for that reuse.
+pub(crate) async fn run_invalidate<B: Broker>(
+    broker: &B,
+    store: &KvStateStore,
+    verified: &incoming::Verified,
+    now: chrono::DateTime<chrono::Utc>,
+) -> ActionResult {
+    let hours = match resolve_phase1_u32(
+        "cooldown_hours",
+        verified.intent.cooldown_hours.as_ref(),
+        &verified.shell,
+        12,
+    ) {
+        Ok(n) => n,
+        Err(outcome) => {
+            return ActionResult::Rejected {
+                response: Response::error("cooldown_hours script error", 412),
+                outcome,
+            };
+        }
+    };
+    let account = verified.intent.account.as_deref();
+    if let Err(err) = store
+        .set_cooldown(account, &verified.intent.instrument, hours, now)
+        .await
+    {
+        rlog_err!("KV set_cooldown: {err}");
+        return ActionResult::Rejected {
+            response: Response::error("state error", 500),
+            outcome: "rejected: state-error".into(),
+        };
+    }
+    let cancelled = broker
+        .cancel_pending_for_instrument(&verified.intent.instrument)
+        .await;
+    rlog!(
+        "invalidate instrument={} account={} cooldown={}h cancelled={} pending",
+        verified.intent.instrument,
+        account.unwrap_or("<global>"),
+        hours,
+        cancelled
+    );
+    ActionResult::Ok(format!(
+        "invalidated: cooldown {hours}h, cancelled {cancelled}"
+    ))
 }
 
 /// Dispatch a `Close` intent. The close reaches the broker only when

@@ -172,8 +172,21 @@ The day-to-day loop, end to end:
 5. **The scheduled `cron` triggers** (declared in `wrangler.toml`,
    dispatched on `event.cron()` in `src/cron.rs`):
    - `*/15 * * * *` — sweeps pending stop-entry orders for SL-breach /
-     bar-expiry independently of any TV alert, **and** runs the
-     spread-recovery watcher (see below).
+     bar-expiry independently of any TV alert, runs the
+     spread-recovery watcher (see below), **and** runs the
+     server-side trade-plan engine (`run_engine_tick`, see below).
+   - **Server-side engine** (experimental, dev only) — on each `*/15`
+     tick the engine enumerates every registered `TradePlan` (see
+     `--register-plan`), fetches the broker candles closed since each
+     plan's watermark, runs the per-trade FSM evaluator, and dispatches
+     any fired intents through the *same* `run_enter` / `run_close` /
+     veto handlers the webhook uses. It runs **in parallel** with the TV
+     alerts (no behaviour change to existing trades) until proven on
+     demo; the `*/15` cadence stays for now. A plan's first tick *seeds*
+     its watermark without firing, so conditions already true at register
+     don't back-fire. M/W ships first (the enter heartbeat fires every
+     closed bar); H&S `PinePattern` entries are inert until the Pine
+     detector is ported to Rust.
    - `5 21 * * *` **and** `5 22 * * *` — the daily **NY-close-edge**
      check for the spread-blackout feature. CF crons are UTC-only and
      can't carry a timezone, so both candidate minutes fire (21:05 UTC

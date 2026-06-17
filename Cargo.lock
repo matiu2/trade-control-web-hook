@@ -3613,6 +3613,7 @@ dependencies = [
  "serde_yaml",
  "tracing",
  "trade-control-core",
+ "trade-control-engine",
  "tradenation-api 0.2.0 (git+https://github.com/matiu2/tradenation-api.git?tag=broker-tradenation-v0.9.0)",
  "worker",
 ]

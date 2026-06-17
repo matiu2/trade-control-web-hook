@@ -53,7 +53,9 @@ pub use trade_control_core::trade_plan::{
 };
 
 mod evaluate;
-pub use evaluate::{FiredIntent, PlanEval, eval_trigger, evaluate_plan, initial_phase};
+pub use evaluate::{
+    FiredIntent, PlanEval, eval_trigger, evaluate_plan, initial_phase, seed_plan_state,
+};
 
 #[cfg(test)]
 mod tests {

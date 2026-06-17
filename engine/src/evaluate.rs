@@ -103,6 +103,36 @@ pub fn initial_phase(plan: &TradePlan) -> Phase {
     }
 }
 
+/// Seed a fresh plan's state from a back-window of recent candles **without
+/// firing anything**.
+///
+/// The first engine tick for a plan must not retroactively fire conditions that
+/// were already true when the plan was registered (a fresh TV alert doesn't
+/// back-fire on history either — decision #3 in the plan). So instead of feeding
+/// the back-window through [`evaluate_plan`], the wrapper calls this: it sets
+/// the watermark to the newest candle's open-time and records each `OnClose`
+/// rule's `last_close` from that candle, so the *next* tick can detect a cross
+/// against it. `fired` stays empty; the phase is [`initial_phase`].
+///
+/// `candles` need not be sorted; the newest by `time` wins. An empty slice
+/// yields an unwatermarked seed (the next tick will itself seed once candles
+/// arrive).
+pub fn seed_plan_state(
+    plan: &TradePlan,
+    candles: &[Candle],
+    expires_at: DateTime<Utc>,
+) -> PlanState {
+    let mut state = PlanState::seed(initial_phase(plan), expires_at);
+    let Some(newest) = candles.iter().max_by_key(|c| c.time) else {
+        return state;
+    };
+    state.watermark = Some(newest.time);
+    for rule in &plan.rules {
+        record_last_close(&rule.rule_id, &rule.trigger, newest, &mut state);
+    }
+    state
+}
+
 /// Evaluate a plan against the candles that have closed since its watermark.
 ///
 /// `prior` is the persisted state (the caller seeds a fresh one on the first
@@ -1048,5 +1078,76 @@ mod tests {
         let j2 = serde_json::to_string(&st).unwrap();
         assert_eq!(j1, j2);
         assert!(j1.find("\"a\"").unwrap() < j1.find("\"z\"").unwrap());
+    }
+
+    // ===== seed_plan_state =====
+
+    #[test]
+    fn seed_sets_watermark_to_newest_and_fires_nothing() {
+        let p = plan(vec![rule(
+            "05-enter",
+            Trigger::MwEveryBar,
+            FireMode::EveryBar,
+            Action::Enter,
+        )]);
+        // Out-of-order back-window: newest is 13:00.
+        let candles = [
+            candle("2026-06-16T13:00:00Z", 1.0, 1.0, 1.0, 1.0),
+            candle("2026-06-16T11:00:00Z", 1.0, 1.0, 1.0, 1.0),
+            candle("2026-06-16T12:00:00Z", 1.0, 1.0, 1.0, 1.0),
+        ];
+        let st = seed_plan_state(&p, &candles, ts("2026-06-30T00:00:00Z"));
+        assert_eq!(st.watermark, Some(ts("2026-06-16T13:00:00Z")));
+        // MwEveryBar would fire on every candle if evaluated — seeding must not.
+        assert!(st.fired.is_empty());
+        assert_eq!(st.phase, Phase::AwaitEntry);
+    }
+
+    #[test]
+    fn seed_records_last_close_for_on_close_rule_from_newest_candle() {
+        let p = plan(vec![rule(
+            "03-prep-break-and-close",
+            Trigger::TrendlineCross {
+                a: LinePoint {
+                    at_epoch: ts("2026-06-16T10:00:00Z").timestamp(),
+                    price: 1.2000,
+                },
+                b: LinePoint {
+                    at_epoch: ts("2026-06-16T20:00:00Z").timestamp(),
+                    price: 1.2000,
+                },
+                extend_forward: true,
+                dir: CrossDir::Down,
+                bar: BarEvent::OnClose,
+            },
+            FireMode::Once,
+            Action::Prep,
+        )]);
+        let candles = [
+            candle("2026-06-16T11:00:00Z", 1.2, 1.2, 1.2, 1.2050),
+            candle("2026-06-16T12:00:00Z", 1.2, 1.2, 1.2, 1.2030),
+        ];
+        let st = seed_plan_state(&p, &candles, ts("2026-06-30T00:00:00Z"));
+        // last_close holds the newest candle's close (1.2030), so the next
+        // tick's first candle is compared against it — not back-fired here.
+        assert_eq!(
+            st.last_close.get("03-prep-break-and-close").copied(),
+            Some(1.2030)
+        );
+        // A break-and-close plan seeds into AwaitBreakAndClose.
+        assert_eq!(st.phase, Phase::AwaitBreakAndClose);
+    }
+
+    #[test]
+    fn seed_empty_window_is_unwatermarked() {
+        let p = plan(vec![rule(
+            "05-enter",
+            Trigger::MwEveryBar,
+            FireMode::EveryBar,
+            Action::Enter,
+        )]);
+        let st = seed_plan_state(&p, &[], ts("2026-06-30T00:00:00Z"));
+        assert!(st.watermark.is_none());
+        assert!(st.last_close.is_empty());
     }
 }

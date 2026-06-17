@@ -1,0 +1,357 @@
+//! Server-side trade-plan engine tick — the cron-driven evaluator that
+//! replaces TradingView's paid alerts.
+//!
+//! Where [`sweep`](super::sweep) walks pending broker orders, this walks every
+//! registered [`TradePlan`]. For each plan it loads the persisted
+//! [`PlanState`], fetches the candles that have closed since the watermark,
+//! runs the pure [`evaluate_plan`] FSM, persists the advanced state, and
+//! dispatches each fired intent through the *same* handlers the webhook uses
+//! (`run_enter` / `run_close` / the veto + prep handlers). The plan was already
+//! HMAC-verified at register time, so the engine synthesises a [`Verified`]
+//! directly from the triggering candle — no re-verification.
+//!
+//! # Seed-without-firing
+//!
+//! A plan's very first tick must **not** retroactively fire conditions that
+//! were already true when it was registered (a fresh TV alert doesn't back-fire
+//! on history either). So when there's no prior state, the engine fetches a
+//! short back-window, seeds the watermark + `last_close` via
+//! [`seed_plan_state`], persists it, and dispatches nothing. The *next* tick
+//! evaluates only genuinely-new candles.
+//!
+//! # Fail-soft per plan
+//!
+//! Like the sweep, a single plan's failure (broker fetch, KV write, dispatch)
+//! is logged and skipped — one stale plan must never jam the whole tick.
+//!
+//! # Where the tests live
+//!
+//! The decision logic is pure and tested where it lives: the FSM
+//! ([`evaluate_plan`]) and the seed-without-firing rule ([`seed_plan_state`])
+//! have native table tests in the `trade-control-engine` crate; [`Shell::from_candle`]
+//! is tested in `core`. This module's own functions are thin wasm-bound glue
+//! (`worker::Env`, the concrete [`BrokerHandle`], and `worker::Response`, which
+//! panics off-wasm at construction — see `every_rejection_outcome_classifies_as_skip`
+//! in `lib.rs` for the same constraint), so only the pure helpers
+//! (`seed_since`, `plan_ttl`, `plan_state_expires_at`) are unit-tested here.
+//! End-to-end behaviour is exercised on the demo deploy, run in parallel with
+//! the live TV alerts (Stage F gate).
+
+use chrono::{DateTime, Utc};
+use trade_control_core::broker::{Broker, Candle, CandleError, Granularity, filter_new_candles};
+use trade_control_core::incoming::Verified;
+use trade_control_core::intent::{Action, Shell, VetoLevel};
+use trade_control_core::state::{StateStore, StoredPlan};
+use trade_control_engine::{evaluate_plan, seed_plan_state};
+use worker::Env;
+
+use crate::ActionResult;
+use crate::cron::sweep::{BrokerHandle, acquire_broker_for_account, open_store};
+use crate::state::KvStateStore;
+
+/// How many bars of history to fetch when seeding a fresh plan. Enough to give
+/// each `OnClose` rule a prior close to compare against on the next tick, with
+/// slack for a cron gap; small so the seed fetch stays cheap.
+const SEED_BARS: i64 = 10;
+
+/// Walk every registered trade plan, evaluate it against fresh candles, and
+/// dispatch fired intents. `now` is threaded in (not `Utc::now()`) so the tick
+/// stays a pure function of `(env, now)`.
+pub async fn run_engine_tick(env: &Env, now: DateTime<Utc>) {
+    let store = match open_store(env) {
+        Some(s) => s,
+        None => return,
+    };
+
+    let plans = match store.list_all_trade_plans().await {
+        Ok(v) => v,
+        Err(err) => {
+            rlog_err!("cron engine: list_all_trade_plans: {err}");
+            return;
+        }
+    };
+
+    rlog!("cron engine: {} registered plans", plans.len());
+
+    for stored in plans {
+        if let Err(err) = tick_one(env, &store, &stored, now).await {
+            rlog_err!(
+                "cron engine[{}/{}]: {err}",
+                stored.account.as_deref().unwrap_or("<global>"),
+                stored.plan.trade_id,
+            );
+        }
+    }
+}
+
+/// Evaluate and dispatch one plan. Returns an error string so the caller can
+/// log it with plan context. Never panics; transient broker/KV failures bubble
+/// up as a skip for this tick.
+async fn tick_one(
+    env: &Env,
+    store: &KvStateStore,
+    stored: &StoredPlan,
+    now: DateTime<Utc>,
+) -> Result<(), String> {
+    let plan = &stored.plan;
+    let account = stored.account.as_deref();
+    let expires_at = plan_state_expires_at(now);
+
+    // Load prior state, or seed-without-firing on the first tick.
+    let prior = store
+        .get_plan_state(account, &plan.trade_id)
+        .await
+        .map_err(|err| format!("get_plan_state: {err}"))?;
+
+    let broker = acquire_broker_for_account(env, account)
+        .await
+        .ok_or("broker acquisition failed")?;
+
+    let Some(prior) = prior else {
+        return seed_first_tick(store, &broker, plan, account, expires_at, now).await;
+    };
+
+    // Fetch candles closed since the watermark. A plan with no watermark (an
+    // earlier seed that found an empty window) re-seeds from the back-window.
+    let since = match prior.watermark {
+        Some(w) => w,
+        None => return seed_first_tick(store, &broker, plan, account, expires_at, now).await,
+    };
+    let candles = fetch_candles(&broker, &plan.instrument, plan.granularity, since, now).await?;
+    let fresh = filter_new_candles(candles, since);
+    if fresh.is_empty() {
+        return Ok(());
+    }
+
+    let eval = evaluate_plan(plan, &prior, &fresh, now, expires_at);
+
+    // Persist the advanced state (or clear it + the plan when the spine is
+    // done) before dispatching, so a dispatch failure can't replay a fired bar.
+    if eval.done {
+        if let Err(err) = store.clear_plan_state(account, &plan.trade_id).await {
+            rlog_err!("cron engine: clear_plan_state({}): {err}", plan.trade_id);
+        }
+        if let Err(err) = store.clear_trade_plan(account, &plan.trade_id).await {
+            rlog_err!("cron engine: clear_trade_plan({}): {err}", plan.trade_id);
+        }
+    } else if let Err(err) = store
+        .put_plan_state(
+            account,
+            &plan.trade_id,
+            &eval.new_state,
+            plan_ttl(expires_at, now),
+        )
+        .await
+    {
+        return Err(format!("put_plan_state: {err}"));
+    }
+
+    for fired in &eval.fired {
+        dispatch_fired(env, store, &broker, fired, now).await;
+    }
+    Ok(())
+}
+
+/// First-tick seed: fetch a back-window, seed the state without firing, persist.
+async fn seed_first_tick(
+    store: &KvStateStore,
+    broker: &BrokerHandle,
+    plan: &trade_control_core::trade_plan::TradePlan,
+    account: Option<&str>,
+    expires_at: DateTime<Utc>,
+    now: DateTime<Utc>,
+) -> Result<(), String> {
+    let since = seed_since(plan.granularity, now);
+    let candles = fetch_candles(broker, &plan.instrument, plan.granularity, since, now).await?;
+    let state = seed_plan_state(plan, &candles, expires_at);
+    store
+        .put_plan_state(account, &plan.trade_id, &state, plan_ttl(expires_at, now))
+        .await
+        .map_err(|err| format!("put_plan_state (seed): {err}"))?;
+    rlog!(
+        "cron engine seed: trade_id={} instrument={} watermark={:?} ({} back-window candles)",
+        plan.trade_id,
+        plan.instrument,
+        state.watermark,
+        candles.len(),
+    );
+    Ok(())
+}
+
+/// Fetch candles through whichever broker the plan's account uses.
+async fn fetch_candles(
+    broker: &BrokerHandle,
+    instrument: &str,
+    granularity: Granularity,
+    since: DateTime<Utc>,
+    now: DateTime<Utc>,
+) -> Result<Vec<Candle>, String> {
+    let result = match broker {
+        BrokerHandle::Oanda(b) => b.get_candles(instrument, granularity, since, now).await,
+        BrokerHandle::TradeNation(b) => b.get_candles(instrument, granularity, since, now).await,
+    };
+    match result {
+        Ok(c) => Ok(c),
+        // A degenerate window is a no-op, not a failure — the next tick widens.
+        Err(CandleError::BadRange) => Ok(Vec::new()),
+        Err(CandleError::Transient) => Err("candle fetch failed (transient)".into()),
+    }
+}
+
+/// Dispatch one fired intent through the same handlers the webhook uses, then
+/// record the outcome on the seen-by-id index exactly as the HTTP path does.
+///
+/// The plan was verified at register, so the [`Verified`] is synthesised
+/// directly: the [`Shell`] from the triggering candle (OHLC + time; `open`
+/// populated so M/W body logic works), the intent cloned verbatim.
+async fn dispatch_fired(
+    env: &Env,
+    store: &KvStateStore,
+    broker: &BrokerHandle,
+    fired: &trade_control_engine::FiredIntent,
+    now: DateTime<Utc>,
+) {
+    let verified = Verified {
+        shell: Shell::from_candle(&fired.candle),
+        intent: fired.intent.clone(),
+    };
+    let result = match broker {
+        BrokerHandle::Oanda(b) => dispatch_action(b, store, &verified, env, now).await,
+        BrokerHandle::TradeNation(b) => dispatch_action(b, store, &verified, env, now).await,
+    };
+    rlog!(
+        "cron engine fired: rule={} action={:?} id={} outcome={}",
+        fired.rule_id,
+        verified.intent.action,
+        verified.intent.id,
+        result.describe(),
+    );
+    crate::record_dispatcher_outcome(store, &verified, now, &result).await;
+}
+
+/// Engine-side action dispatch. Mirrors the webhook's `run_action` but for the
+/// actions an engine-fired intent can carry, and with `raw_body: None` (there
+/// is no signed wire body — the plan rode one signed envelope at register, and
+/// each fired intent is reconstructed, not re-received). Control actions (prep,
+/// stop-next-entry veto) are wrapped into an [`ActionResult`] so every fired
+/// intent records uniformly.
+async fn dispatch_action<B: Broker>(
+    broker: &B,
+    store: &KvStateStore,
+    verified: &Verified,
+    env: &Env,
+    now: DateTime<Utc>,
+) -> ActionResult {
+    match verified.intent.action {
+        Action::Enter => crate::run_enter(broker, store, verified, env, now, None).await,
+        Action::Close => crate::run_close(broker, store, verified, now).await,
+        Action::Invalidate => crate::run_invalidate(broker, store, verified, now).await,
+        Action::Veto => {
+            // A stop-next-entry veto sets KV only (no broker); higher levels
+            // cancel/close via the broker. Matches the webhook's split.
+            if matches!(
+                verified.intent.level.unwrap_or_default(),
+                VetoLevel::StopNextEntry
+            ) {
+                control_result(crate::handle_veto(store, verified, now).await, "vetoed")
+            } else {
+                crate::run_veto_with_broker(broker, store, verified, now).await
+            }
+        }
+        Action::Prep => control_result(crate::handle_prep(store, verified, now).await, "prepped"),
+        other => {
+            // Status / Unlock / Clear* / Pause / Resume / News* / Register /
+            // PrepExpire are operator/control actions a plan never embeds as a
+            // fired rule. Treat as a no-op rejection so it's visible but inert.
+            ActionResult::Rejected {
+                response: worker::Response::error("engine: unsupported fired action", 400),
+                outcome: format!("rejected: unsupported-action {other:?}"),
+            }
+        }
+    }
+}
+
+/// Fold a control-action handler's `Result<Response>` into an [`ActionResult`]
+/// so engine dispatch records uniformly. A `2xx` is `Ok`; anything else (or a
+/// transport error) is `Rejected` — control handlers never reach the broker, so
+/// `Failed` (a broker error) is not a possible outcome here.
+fn control_result(resp: worker::Result<worker::Response>, ok_outcome: &str) -> ActionResult {
+    match resp {
+        Ok(r) if (200..300).contains(&r.status_code()) => ActionResult::Ok(ok_outcome.to_string()),
+        Ok(r) => {
+            let code = r.status_code();
+            ActionResult::Rejected {
+                response: Ok(r),
+                outcome: format!("rejected: control-status-{code}"),
+            }
+        }
+        Err(err) => ActionResult::Rejected {
+            response: worker::Response::error("engine control dispatch error", 500),
+            outcome: format!("rejected: control-error {err}"),
+        },
+    }
+}
+
+/// The `expires_at` stamp on a plan's state row. Plans don't carry their own
+/// expiry — the carrier enter intent's `not_after` set the *plan's* register
+/// TTL, which is the real GC. The state row just needs to outlive a few ticks,
+/// so a generous day past `now` is enough; whichever of the plan row or its
+/// state row ages out first, the engine stops ticking it.
+fn plan_state_expires_at(now: DateTime<Utc>) -> DateTime<Utc> {
+    now + chrono::Duration::days(1)
+}
+
+/// Seconds of KV TTL for a plan-state row, from its `expires_at`. Floored at
+/// 60s (Cloudflare KV's minimum TTL) so a near-expiry row still persists.
+fn plan_ttl(expires_at: DateTime<Utc>, now: DateTime<Utc>) -> u64 {
+    (expires_at - now).num_seconds().max(60) as u64
+}
+
+/// The seed back-window start: [`SEED_BARS`] bars of the plan's granularity
+/// before `now`. Pure so the window math is unit-testable without a broker.
+fn seed_since(granularity: Granularity, now: DateTime<Utc>) -> DateTime<Utc> {
+    now - chrono::Duration::seconds(granularity.seconds() * SEED_BARS)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ts(s: &str) -> DateTime<Utc> {
+        s.parse().unwrap()
+    }
+
+    #[test]
+    fn seed_since_walks_back_n_bars_of_granularity() {
+        let now = ts("2026-06-17T20:00:00Z");
+        // 10 H1 bars back = 10 hours.
+        assert_eq!(seed_since(Granularity::H1, now), ts("2026-06-17T10:00:00Z"));
+        // 10 M15 bars back = 150 minutes.
+        assert_eq!(
+            seed_since(Granularity::M15, now),
+            ts("2026-06-17T17:30:00Z")
+        );
+    }
+
+    #[test]
+    fn plan_ttl_is_seconds_to_expiry() {
+        let now = ts("2026-06-17T20:00:00Z");
+        let expires = ts("2026-06-17T21:00:00Z");
+        assert_eq!(plan_ttl(expires, now), 3600);
+    }
+
+    #[test]
+    fn plan_ttl_floors_at_sixty_seconds() {
+        let now = ts("2026-06-17T20:00:00Z");
+        // Already-past expiry would yield a negative/zero TTL — floor to 60s so
+        // the KV write is still accepted and the row survives a tick.
+        let expires = ts("2026-06-17T19:59:59Z");
+        assert_eq!(plan_ttl(expires, now), 60);
+    }
+
+    #[test]
+    fn plan_state_expires_at_is_a_day_out() {
+        let now = ts("2026-06-17T20:00:00Z");
+        assert_eq!(plan_state_expires_at(now), ts("2026-06-18T20:00:00Z"));
+    }
+}

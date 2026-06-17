@@ -1518,6 +1518,43 @@ impl OnTooClose {
 }
 
 impl Shell {
+    /// Synthesize a control-grade shell from one broker [`Candle`](crate::broker::Candle).
+    ///
+    /// The server-side engine has no TradingView alert to source a `Shell`
+    /// from — it polls candles and fires the registered intents itself. This
+    /// builds the minimal shell those intents need: OHLC + time. `open` is
+    /// populated (the candle carries it), so M/W body-extreme logic
+    /// ([`body_high`](Self::body_high) / [`body_low`](Self::body_low)) works.
+    /// Every Pine-latched field (`signal_*`, `recent_*`, `golden`, `atr`,
+    /// `next_candle_timestamp_*`) is `None`: the engine doesn't run the Pine
+    /// indicator, so those are genuinely unavailable here. H&S entries that
+    /// depend on `signal_*` are gated out of the engine until Stage E ports
+    /// the detector; M/W reads only OHLC, so it's fully served.
+    pub fn from_candle(candle: &crate::broker::Candle) -> Self {
+        Self {
+            close: candle.c,
+            high: candle.h,
+            low: candle.l,
+            open: Some(candle.o),
+            time: candle.time,
+            signal_high: None,
+            signal_low: None,
+            signal_range: None,
+            signal_start_time: None,
+            signal_kind: None,
+            golden: None,
+            atr: None,
+            signal_confirmed: None,
+            recent_high: None,
+            recent_low: None,
+            next_candle_timestamp_1: None,
+            next_candle_timestamp_2: None,
+            next_candle_timestamp_3: None,
+            next_candle_timestamp_4: None,
+            next_candle_timestamp_5: None,
+        }
+    }
+
     /// Body top — `max(open, close)` — or `None` if this shell didn't
     /// carry `open` (control shells, or a chart still on the pre-`open`
     /// Pine). M/W dynamic geometry uses bodies, not wicks, so a lone rogue
@@ -1624,6 +1661,32 @@ mod tests {
         let s = shell();
         assert_eq!(s.body_high(), None);
         assert_eq!(s.body_low(), None);
+    }
+
+    #[test]
+    fn from_candle_populates_ohlc_and_open_but_no_pine_fields() {
+        let candle = crate::broker::Candle {
+            time: "2026-06-17T12:00:00Z".parse().unwrap(),
+            o: 1.0990,
+            h: 1.1020,
+            l: 1.0980,
+            c: 1.1000,
+        };
+        let s = Shell::from_candle(&candle);
+        assert_eq!(s.close, 1.1000);
+        assert_eq!(s.high, 1.1020);
+        assert_eq!(s.low, 1.0980);
+        assert_eq!(s.open, Some(1.0990));
+        assert_eq!(s.time, candle.time);
+        // open is present, so body extremes are computable (M/W relies on this).
+        assert_eq!(s.body_high(), Some(1.1000));
+        assert_eq!(s.body_low(), Some(1.0990));
+        // Every Pine-latched field is absent — the engine doesn't run the indicator.
+        assert_eq!(s.signal_kind, None);
+        assert_eq!(s.golden, None);
+        assert_eq!(s.atr, None);
+        assert_eq!(s.recent_high, None);
+        assert_eq!(s.next_candle_timestamp_1, None);
     }
 
     #[test]

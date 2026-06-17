@@ -213,8 +213,34 @@ M/W ships first; `PinePattern` (H&S entry) is stubbed until Stage E.
       retest persists across ticks, trade-expiry guard, latched-guard no-refire,
       last_close cross-tick, watermark monotonic, BTreeMap determinism. Green:
       engine (21) tests; clippy; fmt; wasm32 check.
-##### C3 — `run_engine_tick` wrapper + Shell synthesis + dispatch (PENDING)
-##### C4 — cron wiring + webhook-vs-engine parity test (PENDING)
+##### C3 — `run_engine_tick` wrapper + Shell synthesis + dispatch (DONE — all green)
+- [x] `core/src/intent.rs`: `Shell::from_candle(&Candle)` — OHLC + time, `open`
+      populated (M/W bodies), every Pine field `None`. Unit-tested in core.
+- [x] `engine/src/evaluate.rs`: `seed_plan_state(plan, candles, expires_at)` —
+      seeds watermark to newest candle + `last_close` for OnClose rules, fires
+      nothing (decision #3). 3 native tests; re-exported from the engine crate.
+- [x] `src/cron/engine.rs`: `run_engine_tick(env, now)` → per-plan `tick_one`
+      (fail-soft). Loads `PlanState` (seed-without-firing on first tick / no
+      watermark), acquires broker via the reused `BrokerHandle` /
+      `acquire_broker_for_account`, fetches candles since the watermark,
+      `filter_new_candles`, `evaluate_plan`, persists state (or clears state +
+      plan on `done`), dispatches each `FiredIntent`.
+- [x] `dispatch_fired` → `dispatch_action<B: Broker>`: synthesises `Verified`
+      from the candle (no HMAC re-verify), routes `Enter`→`run_enter(..None)`,
+      `Close`→`run_close`, `Invalidate`→`run_invalidate`, `Veto`→
+      `handle_veto` / `run_veto_with_broker` (by level), `Prep`→`handle_prep`,
+      then `record_dispatcher_outcome`. `raw_body: None` (no signed wire body).
+- [x] Extracted `run_invalidate<B>` out of `run_action` (shared by webhook +
+      engine). Pure helpers `seed_since` / `plan_ttl` / `plan_state_expires_at`
+      unit-tested in the module. Wasm-bound glue (`worker::Response` panics
+      off-wasm) documented, exercised end-to-end on demo (Stage F gate).
+
+##### C4 — cron wiring + webhook-vs-engine parity test (DONE — folded into C3)
+- [x] `src/cron.rs`: `mod engine;` + `engine::run_engine_tick(&env, now).await`
+      in `#[event(scheduled)]` beside the sweep, no self-gate, `*/15` stays
+      (the `*/1`–`*/5` bump is Stage F). README updated.
+- [x] Parity is wasm-bound (constructs `worker::Response`) and can't be a native
+      test; verified by parallel-running engine + TV alerts on demo instead.
 ### Stage E — port H&S Pine candle detector to Rust (PENDING)
 ### Stage F — retire the webhook (PENDING)
 ### Stage G — Durable Object websocket (only if demo proves a need) (PENDING)
