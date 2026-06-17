@@ -36,7 +36,7 @@ use crate::post_outcome::{Outcome, classify as classify_outcome};
 use crate::register_post::post_register_blocking;
 use crate::roles::{Roles, classify};
 use crate::timeframe::infer_calendar_timeframe;
-use crate::trade_plan_build::{build_trade_plan, resolution_to_granularity};
+use crate::trade_plan_build::{append_control_rules, build_trade_plan, resolution_to_granularity};
 use trading_view::drawings::Drawing;
 use trading_view::mcp::TvMcp;
 
@@ -179,23 +179,6 @@ pub fn run(args: Args) -> Result<i32> {
         "trade bundle written"
     );
 
-    // 5b. (Experimental, --register-plan) Fold the whole trade into ONE signed
-    //     TradePlan and register it with the worker's server-side engine. This
-    //     runs *alongside* the TV alert path (old + new in parallel until the
-    //     engine is proven on demo — Stage F retires the alerts). A failed
-    //     register is a hard error, but the signed bundle is already on disk.
-    if args.register_plan {
-        register_trade_plan(
-            &built_trade,
-            direction,
-            &roles,
-            &state.resolution,
-            &key,
-            now,
-            args.shadow,
-        )?;
-    }
-
     // 6. Pause bundles per blackout pair.
     let pause_bundles = build_pause_bundles(
         &roles,
@@ -224,8 +207,8 @@ pub fn run(args: Args) -> Result<i32> {
     //    or if --skip-calendar-bars was passed). When auto-draw ran,
     //    the operator now has blackout-/news-pairs on the chart, so
     //    we skip the cli's calendar-bars step to avoid double-arming.
-    let calendar_bundles = if should_auto_draw || args.skip_calendar_bars {
-        Vec::new()
+    let (calendar_bundles, built_calendar) = if should_auto_draw || args.skip_calendar_bars {
+        (Vec::new(), Vec::new())
     } else {
         discover_or_fetch_calendar_bundles(
             &args,
@@ -239,6 +222,30 @@ pub fn run(args: Args) -> Result<i32> {
             now,
         )?
     };
+
+    // 8b. (Experimental, --register-plan) Fold the whole trade — main alerts
+    //     PLUS the pause/news/calendar control bars built above — into ONE
+    //     signed TradePlan and register it with the worker's server-side engine.
+    //     Runs *after* the bundles so the registered plan carries the same
+    //     calendar/news bars the --create-alerts path POSTs to TradingView (the
+    //     two ran out of step before this; see Stage E.8). Runs *alongside* the
+    //     TV alert path (old + new in parallel until the engine is proven on
+    //     demo — Stage F retires the alerts). A failed register is a hard error,
+    //     but the signed bundle is already on disk.
+    if args.register_plan {
+        register_trade_plan(
+            &built_trade,
+            direction,
+            &roles,
+            &state.resolution,
+            &pause_bundles,
+            &news_bundles,
+            &built_calendar,
+            &key,
+            now,
+            args.shadow,
+        )?;
+    }
 
     // 9. Bail out before POSTing if --create-alerts wasn't set.
     if !args.create_alerts {
@@ -1217,6 +1224,11 @@ fn draw_pair_lines(
 }
 
 /// Run the calendar-bars CLI and discover the resulting bundles.
+///
+/// Returns both the on-disk [`CalendarBundle`]s (driving the TradingView alert
+/// payloads) and the in-memory [`cli::BuiltCalendarBundle`]s (carrying the
+/// signed pause/news intents + window times, so `--register-plan` can fold the
+/// same control actions into the `TradePlan` without re-parsing the YAML).
 #[allow(clippy::too_many_arguments)]
 fn discover_or_fetch_calendar_bundles(
     args: &Args,
@@ -1228,15 +1240,15 @@ fn discover_or_fetch_calendar_bundles(
     out_dir: &Path,
     key: &[u8; KEY_LEN],
     now: DateTime<Utc>,
-) -> Result<Vec<CalendarBundle>> {
+) -> Result<(Vec<CalendarBundle>, Vec<cli::BuiltCalendarBundle>)> {
     if args.skip_calendar_bars {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), Vec::new()));
     }
     let timeframe = match infer_calendar_timeframe(&state.resolution) {
         Some(t) => t,
         None => {
             info!(resolution = %state.resolution, "below 15m — skipping calendar-bars");
-            return Ok(Vec::new());
+            return Ok((Vec::new(), Vec::new()));
         }
     };
     let cli_broker = match broker {
@@ -1254,13 +1266,16 @@ fn discover_or_fetch_calendar_bundles(
         output_dir: Some(out_dir.join("calendar-bars").join(trade_id)),
         dry_run: false,
     };
-    if let Err(e) = cli::run_calendar_bars(cb_args, *key, now) {
-        warn!(error = ?e, "calendar-bars failed; continuing without it");
-        return Ok(Vec::new());
-    }
+    let built = match cli::run_calendar_bars(cb_args, *key, now) {
+        Ok(b) => b,
+        Err(e) => {
+            warn!(error = ?e, "calendar-bars failed; continuing without it");
+            return Ok((Vec::new(), Vec::new()));
+        }
+    };
     let bundles = discover_calendar_bundles(out_dir, trade_id)?;
     info!(count = bundles.len(), "calendar bundles discovered");
-    Ok(bundles)
+    Ok((bundles, built))
 }
 
 /// Fold the built trade into one signed `register` `TradePlan` and POST it to
@@ -1268,18 +1283,26 @@ fn discover_or_fetch_calendar_bundles(
 ///
 /// The plan re-expresses every alert's condition as an engine [`Trigger`] (via
 /// [`build_trade_plan`], the inverse of `alert_spec`) and carries each alert's
-/// embedded intent verbatim. It's signed with the same key + whole-body HMAC as
-/// the control intents (the plan rides `trade_plan` as single-line flow JSON,
-/// so it's fully signed) and POSTed directly to the baked webhook.
+/// embedded intent verbatim. The pause/news/calendar **control bars** built
+/// upstream are folded in too — one `TimeReached` rule per bundle alert (see
+/// [`append_control_rules`]) — so the registered plan opens/closes the same
+/// blackout + news windows the `--create-alerts` path POSTs as TV alerts. It's
+/// signed with the same key + whole-body HMAC as the control intents (the plan
+/// rides `trade_plan` as single-line flow JSON, so it's fully signed) and
+/// POSTed directly to the baked webhook.
 ///
 /// Hard-errors on an unsupported chart resolution or a worker rejection — but
 /// the signed alert bundle is already on disk by the time this runs, so the
 /// trade isn't lost on a register failure.
+#[allow(clippy::too_many_arguments)]
 fn register_trade_plan(
     built_trade: &cli::BuiltTrade,
     direction: Direction,
     roles: &Roles,
     resolution: &str,
+    pause_bundles: &[PauseBundle],
+    news_bundles: &[NewsBundle],
+    built_calendar: &[cli::BuiltCalendarBundle],
     key: &[u8; KEY_LEN],
     now: DateTime<Utc>,
     shadow: bool,
@@ -1292,7 +1315,7 @@ fn register_trade_plan(
              cannot register a server-side plan (supported: 1/5/15/60/240/D)"
         )
     })?;
-    let plan = build_trade_plan(
+    let mut plan = build_trade_plan(
         &built_trade.trade_id,
         &built_trade.instrument,
         &built_trade.alerts,
@@ -1302,6 +1325,11 @@ fn register_trade_plan(
         is_mw,
         shadow,
     );
+    // Unwrap the tv-arm bundle wrappers to the cli `BuiltPause`/`BuiltNews` the
+    // appender reads (each carries the signed intents + window times).
+    let pauses: Vec<&cli::BuiltPause> = pause_bundles.iter().map(|b| &b.built).collect();
+    let newses: Vec<&cli::BuiltNews> = news_bundles.iter().map(|b| &b.built).collect();
+    append_control_rules(&mut plan, &pauses, &newses, built_calendar);
     let rule_count = plan.rules.len();
     // Mint a fresh register intent carrying the plan, sign it, POST it.
     let suffix = register_suffix(now);

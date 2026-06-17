@@ -1,5 +1,70 @@
 # Changelog
 
+## v37 — 2026-06-18 — Calendar / news bars folded into the registered plan
+
+### Why
+
+`tv-arm --register-plan` produced a server-side `TradePlan` with **no**
+pause/resume/news-start/news-end rules, while `--create-alerts` correctly
+created those calendar bars as TV alerts. So a registered plan silently dropped
+every blackout / news window — the engine never paused entries around a CPI
+print, never opened the news-window gate. Root cause: `register_trade_plan` ran
+at pipeline step 5b, *before* the pause/news/calendar bundles were built (steps
+6–8), and `build_trade_plan` only walked `built_trade.alerts` (veto/prep/enter/
+close). Two further gaps compounded it: the engine had no evaluation path for
+control rules, and the cron dispatcher rejected their actions.
+
+### What changed
+
+- **`engine` — non-terminal control rules.** New `evaluate_controls` pass in
+  `evaluate_plan` (runs before the guards) fires Pause/Resume/NewsStart/NewsEnd
+  rules on their `TimeReached` trigger, dispatches the carried intent, and
+  latches — but, unlike a guard, never sets `Phase::Done`, so the trade's spine
+  keeps running. Armed in every phase (a window can open before break-and-close).
+  New `is_control_rule` helper.
+- **`worker` cron — dispatch the control fires.** `dispatch_action`
+  (`src/cron/engine.rs`) routes the four control actions to the same
+  `handle_pause` / `handle_resume` / `handle_news_start` / `handle_news_end` the
+  webhook uses (KV-only, no broker), replacing the previous
+  `unsupported-action` rejection. Shadow plans still log-only (the `tick_one`
+  shadow path returns before dispatch).
+- **`tv-arm` — fold the bundles in.** `register_trade_plan` moved to *after* the
+  pause/news/calendar bundles are built, and new `append_control_rules`
+  (`trade_plan_build.rs`) appends one `TimeReached` `ConditionRule` per bundle
+  alert — carrying that alert's signed intent verbatim, anchored to the window's
+  start/end edge. Covers the operator's chart-drawn pairs (`BuiltPause`/
+  `BuiltNews`) and the auto-fetched forex-factory events. The dead
+  `roles.*_pairs.first()` arms in `trigger_for` are removed (they only ever saw
+  one pair, and these basenames never appear in `built_trade.alerts`).
+- **`cli` — surface the built bundles.** `run_calendar_bars` now returns
+  `Vec<BuiltCalendarBundle>` (the in-memory `BuiltPause`/`BuiltNews` it already
+  builds), so the register path reuses them rather than re-parsing the signed
+  YAML.
+
+### Breaking
+
+- `cli::run_calendar_bars` returns `Result<Vec<BuiltCalendarBundle>>` (was
+  `Result<()>`). The standalone `calendar-bars` bin ignores it.
+- `tv-arm::register_trade_plan` gains pause/news/calendar bundle params
+  (internal).
+
+### Tests
+
+- `engine`: pause fires at its epoch without ending the spine (enter heartbeat
+  still fires the same bar); pause+resume fire on their own bars and don't
+  refire; two news windows → all four fires.
+- `tv-arm`: `append_control_rules` over one chart pause + one news + one
+  calendar event yields 8 control rules with the right actions and window-edge
+  epochs.
+- Full workspace green (engine 35, worker 200, cli 239+13, tv-arm 153); clippy
+  native + wasm32 + fmt clean.
+
+### Follow-up
+
+- The engine-side control dispatch is wasm-bound (`Env` / `worker::Response`),
+  so it has no native unit test — verified by the worker compiling and the demo
+  parallel run (the Stage F gate), same as the rest of the cron dispatch path.
+
 ## v36 — 2026-06-18 — Detector window reaches back to the earliest trendline anchor
 
 ### Why
@@ -93,7 +158,6 @@ exactly the kind of thing that costs a debugging session later.
   `detector_window_for` so anchors are always in-window — which would make the
   `bar_seconds` fallback (and these warnings) dead code. Deferred until the logs
   show it actually happening on a live plan.
-
 ## v34 — 2026-06-18 — Trendline crosses evaluated in bar-index space, not wall-clock
 
 ### Why

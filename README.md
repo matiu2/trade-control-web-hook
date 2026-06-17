@@ -1660,6 +1660,21 @@ the engine is proven on demo (Stage F retires the alerts).
 > proven setup to live. (Field: `TradePlan.shadow`, `#[serde(default)]` → live
 > for plans registered before the flag existed.)
 
+**Calendar / news bars are folded into the plan too.** A registered plan
+carries not just the trade's own conditions but the **pause/resume** (blackout)
+and **news-start/news-end** (news-window) control bars — both the operator's
+chart-drawn pairs and the auto-fetched forex-factory events (the same bars the
+`--create-alerts` path POSTs as TV alerts). Each becomes a `TimeReached` rule
+carrying the matching `pause` / `resume` / `news-start` / `news-end` intent and
+firing at the window edge; the engine fires them **non-terminally** (they set
+the blackout / news-window KV state without ending the trade's spine) and the
+cron dispatches them through the same handlers the webhook uses. In `--shadow`
+they're logged, not applied, like every other fire. (Before this, a
+`--register-plan` produced a plan with *no* calendar bars — the register POST
+ran before the bundles were built; fixed in Stage E.10 / v37.) The folding lives
+in `append_control_rules` (`tv-arm/src/trade_plan_build.rs`); the non-terminal
+evaluation is `evaluate_controls` (`engine/src/evaluate.rs`).
+
 The plan builder
 is `tv-arm/src/trade_plan_build.rs` (the inverse of `alert_spec.rs`); the
 `TradePlan` / `Trigger` model lives in `core/src/trade_plan.rs`; per-trade

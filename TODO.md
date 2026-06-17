@@ -379,7 +379,7 @@ trendline anchor is in-window (then the bar-index count is exact).
       warning surface stays as belt-and-braces for a pathological out-of-reach
       anchor.
 
-### Stage E.10 — fold calendar/news bars into the registered plan (IN PROGRESS)
+### Stage E.10 — fold calendar/news bars into the registered plan (DONE — all green)
 
 Bug (operator, 2026-06-18): `tv-arm --register-plan` produced a server-side
 `TradePlan` with **no** pause/resume/news-start/news-end rules, while
@@ -420,17 +420,22 @@ bundles as the intent source for the plan (no YAML re-parse).
       Commit-1 native test.
 
 #### Commit 3 — tv-arm: fold bundles into the registered plan (DONE — all green)
-- [x] `cli::run_calendar_bars` returns `Vec<BuiltCalendarBundle>`; bin ignores it.
-- [x] `register_trade_plan` moved to after the bundles are built (step 8b).
+- [x] `cli::run_calendar_bars` returns `Vec<BuiltCalendarBundle>` (in-memory
+      `BuiltPause`/`BuiltNews`); standalone bin ignores it.
+- [x] `register_trade_plan` moved to after the bundles are built (step 8b,
+      before the `--create-alerts` gate); takes pause/news/calendar bundles.
 - [x] `append_control_rules` (`trade_plan_build.rs`) → one `TimeReached`
-      `ConditionRule` per bundle alert (`WindowAlert` trait unifies pause/news
-      alerts), anchored to start/end edge. Dropped the dead `roles.*_pairs.first()`
-      arms in `trigger_for`.
-- [x] Test: chart pause + news + calendar event → 8 control rules. tv-arm 153.
+      `ConditionRule` per bundle alert (`WindowAlert` trait unifies
+      `BuiltPauseAlert`/`BuiltNewsAlert`), carrying the embedded `Intent`,
+      anchored to start/end edge. Dropped the dead `roles.*_pairs.first()` arms
+      in `trigger_for`.
+- [x] Test: chart pause + news + calendar event → 8 control rules, right
+      actions + window-edge epochs. tv-arm 153 green.
 
 #### Throughout (DONE)
-- [x] README + CHANGELOG (renumber to v37 on this branch — main took v35/v36).
-- [x] clippy + fmt + tests green per crate; one commit per layer.
+- [x] README ("Calendar / news bars folded into the plan too") + CHANGELOG v37
+      (renumbered — main took v35/v36 while this branch was open).
+- [x] clippy + fmt + tests green per crate; one commit per layer, pushed.
 
 ### Stage F — retire the webhook (PENDING)
 ### Stage G — Durable Object websocket (only if demo proves a need) (PENDING)
