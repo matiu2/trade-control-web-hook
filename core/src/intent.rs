@@ -1814,8 +1814,11 @@ mod tests {
         assert_eq!(s.recent_high, Some(1.2500));
         assert_eq!(s.recent_low, Some(1.0500));
         assert_eq!(s.atr, Some(0.05));
-        // SignalHigh/SignalLow anchors now resolve to the pattern extremes.
-        assert_eq!(s.anchor_price(PriceAnchor::Low), 1.1000);
+        // The bug-010 SignalHigh/SignalLow anchors now resolve to the *pattern*
+        // extremes (not the triggering candle's own wick), so a server-side H&S
+        // fire anchors entry/SL identically to the TV-driven one.
+        assert_eq!(s.anchor_price(PriceAnchor::SignalHigh), 1.3000);
+        assert_eq!(s.anchor_price(PriceAnchor::SignalLow), 1.1000);
     }
 
     #[test]

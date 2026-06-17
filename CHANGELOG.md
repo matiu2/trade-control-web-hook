@@ -1,5 +1,62 @@
 # Changelog
 
+## v30 — 2026-06-17 — H&S Pine candle detector ported to Rust (server-side `PinePattern`, Stage E)
+
+### Why
+
+The H&S `05-enter` was the last condition still evaluated on TradingView's
+servers: it fired on the paid "Long/Short Pattern" alertconditions of the
+`candle-signals-v2.pine` detector. To evaluate H&S entries in the server-side
+engine (and drop the runtime TV dependency for H&S, like M/W already has), the
+detector is ported to Rust.
+
+### What changed
+
+- New `core/src/signals/` module — a faithful port of `candle-signals-v2.pine`:
+  per-candle metrics, Wilder ATR with the timeframe-dependent length, the five
+  pattern detectors (pinbar / tweezer / double-tweezer / regular- &
+  floating-engulfer) with the Pine priority order and signal geometry, and the
+  pending→valid→invalid state machine (confirmation latch, opposing-signal
+  invalidation with golden-protect, recent_high/low lookback). The public seam
+  is `latched_signal_at(window, as_of, cfg) -> LatchedSignal`.
+- The engine's `evaluate_plan` gains a `detector_window`; `Trigger::PinePattern`
+  is now evaluated (was a Stage-D stub) over that window, gated by direction +
+  optional pattern kind. A fired H&S enter carries the latched signal geometry
+  onto its shell via the new `Shell::from_candle_and_signal`, so it resolves
+  entry/SL/TP against the *pattern* extremes (the bug-010 `SignalHigh`/
+  `SignalLow` anchors) exactly as the TV alert's `{{plot(...)}}` substitutions
+  did.
+- `src/cron/engine.rs` fetches a wider detector back-window for Pine plans.
+
+### Behaviour
+
+The engine now evaluates **both** M/W and H&S server-side, in parallel with the
+TV alerts (no change to existing trades), on the `*/15` tick — until proven on
+demo (Stage F retires the alerts).
+
+### Intentional divergence (bug #10B)
+
+The port confirms a signal only on a **fully-closed** pushing bar (the engine
+never sees an unclosed bar), fixing the Pine one-bar-early confirm timing (the
+ADIDAS 5:30-vs-5:45 case). The historical-replay parity check will show this
+diff against recorded Pine fires.
+
+### Tests
+
+- `core/src/signals/` — metrics, ATR, each detector, the state machine
+  (confirm / breach-unconfirm / late-push / recent-extremes).
+- `engine/src/evaluate.rs` — Pine entry fires with geometry, wrong-direction
+  block, kind filter, retest gate.
+- `core/src/intent.rs` — `from_candle_and_signal` folds geometry; the
+  `SignalHigh`/`SignalLow` anchors resolve to the pattern extremes.
+- core 498 / engine 28 / worker 199 green; clippy + fmt + wasm32 clean.
+
+### Follow-up
+
+Historical-replay parity: replay candle history through the Rust detector and
+diff fires + geometry against recorded Pine fires. Needs the recorded-fire
+dataset assembled first.
+
 ## v29 — 2026-06-17 — H&S/IHS enter anchors entry+SL to signal_high/signal_low (bug #10 finding A)
 
 ### Why
