@@ -1088,9 +1088,12 @@ impl Intent {
         // looks vetos up by the entry's own trade_id — an untagged entry
         // could never match a (correctly tagged) veto. See the 2026-06-11
         // cross-trade veto-bleed fix.
+        // `PlanDelete` joins the trade-id-required set for a different reason:
+        // `trade_id` *names the plan to drop*. Without it there is nothing to
+        // delete, so reject the malformed control message before dispatch.
         if matches!(
             self.action,
-            Action::Enter | Action::Veto | Action::ClearVeto
+            Action::Enter | Action::Veto | Action::ClearVeto | Action::PlanDelete
         ) && self.trade_id.is_none()
         {
             return Err(IntentValidationError::MissingTradeId);
@@ -1415,6 +1418,17 @@ pub enum Action {
     /// the worker scans every account scope and returns the match(es). KV-only,
     /// idempotent. Drives `trade-control plan show <trade_id>`.
     PlanShow,
+    /// Delete a registered server-side
+    /// [`TradePlan`](crate::trade_plan::TradePlan) and its
+    /// [`PlanState`](crate::plan_state::PlanState) — the inverse of
+    /// [`Action::Register`]. The target is named by [`Intent::trade_id`]
+    /// (`instrument` is an ignored placeholder); the worker scans every
+    /// account scope and drops the matching `plan:` + `plan-state:` rows.
+    /// KV-only (no broker), idempotent — deleting a plan that doesn't exist
+    /// is a no-op, not an error. Lets the operator re-arm a setup after
+    /// editing the chart: `plan delete <id>` then re-run `tv-arm`. Drives
+    /// `trade-control plan delete <trade_id>`.
+    PlanDelete,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
@@ -3142,6 +3156,36 @@ mod tests {
             intent.validate(),
             Err(IntentValidationError::MissingTradeId)
         );
+    }
+
+    #[test]
+    fn validate_rejects_plan_delete_without_trade_id() {
+        let yaml = "
+            v: 1
+            id: plan-delete-no-tid
+            not_after: \"2026-05-13T20:00:00Z\"
+            action: plan-delete
+            instrument: ALL
+        ";
+        let intent: Intent = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(
+            intent.validate(),
+            Err(IntentValidationError::MissingTradeId)
+        );
+    }
+
+    #[test]
+    fn validate_accepts_plan_delete_with_trade_id() {
+        let yaml = "
+            v: 1
+            id: plan-delete-ok
+            trade_id: eurusd-hs-1
+            not_after: \"2026-05-13T20:00:00Z\"
+            action: plan-delete
+            instrument: ALL
+        ";
+        let intent: Intent = serde_yaml::from_str(yaml).unwrap();
+        intent.validate().unwrap();
     }
 
     #[test]

@@ -150,6 +150,20 @@ pub fn build_plan_show_intent(trade_id: &str, now: DateTime<Utc>, suffix: &str) 
     intent
 }
 
+/// Build a `plan-delete` `Intent` for one `trade_id` — the inverse of
+/// `register`. The worker scans every account scope and drops the matching
+/// plan + plan-state rows. `instrument` is an ignored placeholder; the target
+/// rides on `trade_id`.
+pub fn build_plan_delete_intent(trade_id: &str, now: DateTime<Utc>, suffix: &str) -> Intent {
+    let id = format!(
+        "plan-delete-{trade_id}-{}-{suffix}",
+        now.format("%Y-%m-%dT%H%M%S")
+    );
+    let mut intent = control_skeleton(Action::PlanDelete, STATUS_INSTRUMENT, id, now);
+    intent.trade_id = Some(trade_id.to_string());
+    intent
+}
+
 /// Build a `prep` Intent for a single (instrument, step) pair with a TTL.
 ///
 /// `clears` is the list of other prep steps to drop before recording

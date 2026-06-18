@@ -21,10 +21,10 @@
 //! `Ok(None)` semantics `build_alert_spec` uses), so a trade missing, say, a
 //! retest trendline simply yields a plan without that rule.
 
-use trade_control_cli::BuiltAlert;
+use trade_control_cli::{BuiltAlert, BuiltCalendarBundle, BuiltNews, BuiltPause};
 use trade_control_conventions::{AlertBasename, Direction as ConvDirection};
 use trade_control_core::broker::Granularity;
-use trade_control_core::intent::Direction;
+use trade_control_core::intent::{Direction, Intent};
 use trade_control_core::trade_plan::{
     BarEvent, ConditionRule, CrossDir, FireMode, LinePoint, TradePlan, Trigger,
 };
@@ -85,7 +85,7 @@ pub fn build_trade_plan(
 ) -> TradePlan {
     let rules = alerts
         .iter()
-        .filter_map(|alert| build_rule(alert, direction, roles, is_mw))
+        .filter_map(|alert| build_rule(alert, direction, roles, granularity, is_mw))
         .collect();
 
     TradePlan {
@@ -99,6 +99,100 @@ pub fn build_trade_plan(
     }
 }
 
+/// Append the pause/news/calendar **control bars** to a built plan as
+/// `TimeReached` rules — one per bundle alert, carrying that alert's embedded
+/// intent verbatim and firing at the bundle's window edge (start for
+/// pause-start / news-start, end for pause-resume / news-end).
+///
+/// This is what makes `--register-plan` open/close the same blackout + news
+/// windows the `--create-alerts` path POSTs as TradingView alerts. The chart-
+/// drawn pairs arrive as [`BuiltPause`]/[`BuiltNews`] bundles; the auto-fetched
+/// forex-factory events arrive as [`BuiltCalendarBundle`]s (each holding one
+/// pause + one news). All three feed the same per-alert conversion.
+///
+/// `build_trade_plan`'s `trigger_for` deliberately does **not** handle these
+/// basenames anymore: it only ever saw `roles.*_pairs.first()` (one pair) and
+/// the control alerts were never in `built_trade.alerts` to begin with — so the
+/// rules came from here, where every window (and every calendar event) is
+/// represented.
+pub fn append_control_rules(
+    plan: &mut TradePlan,
+    pause_bundles: &[&BuiltPause],
+    news_bundles: &[&BuiltNews],
+    calendar_bundles: &[BuiltCalendarBundle],
+) {
+    for b in pause_bundles {
+        push_window_rules(plan, &b.alerts, b.start_time, b.end_time);
+    }
+    for b in news_bundles {
+        push_window_rules(plan, &b.alerts, b.start_time, b.end_time);
+    }
+    for cb in calendar_bundles {
+        push_window_rules(
+            plan,
+            &cb.pause.alerts,
+            cb.pause.start_time,
+            cb.pause.end_time,
+        );
+        push_window_rules(plan, &cb.news.alerts, cb.news.start_time, cb.news.end_time);
+    }
+}
+
+/// Turn one window's built alerts into `TimeReached` rules on the plan. Each
+/// alert exposes a `basename` + the signed `intent`; the basename selects which
+/// window edge (`start`/`end`) the rule's epoch anchors to. An unrecognised
+/// basename is skipped (it isn't a window-edge control alert).
+fn push_window_rules<A: WindowAlert>(
+    plan: &mut TradePlan,
+    alerts: &[A],
+    start: chrono::DateTime<chrono::Utc>,
+    end: chrono::DateTime<chrono::Utc>,
+) {
+    for alert in alerts {
+        let Some(basename) = AlertBasename::parse(alert.basename()) else {
+            continue;
+        };
+        let at_epoch = match basename {
+            AlertBasename::PauseStart(_) | AlertBasename::NewsStart(_) => start.timestamp(),
+            AlertBasename::PauseResume(_) | AlertBasename::NewsEnd(_) => end.timestamp(),
+            _ => continue,
+        };
+        plan.rules.push(ConditionRule {
+            rule_id: alert.basename().to_string(),
+            trigger: Trigger::TimeReached { at_epoch },
+            fire_mode: FireMode::Once,
+            intent: alert.intent().clone(),
+        });
+    }
+}
+
+/// A built window alert (pause/news): a basename + the signed intent. Lets
+/// [`push_window_rules`] treat [`BuiltPauseAlert`](trade_control_cli::BuiltPauseAlert)
+/// and [`BuiltNewsAlert`](trade_control_cli::BuiltNewsAlert) uniformly — they
+/// have identical shape but are distinct types.
+trait WindowAlert {
+    fn basename(&self) -> &str;
+    fn intent(&self) -> &Intent;
+}
+
+impl WindowAlert for trade_control_cli::BuiltPauseAlert {
+    fn basename(&self) -> &str {
+        &self.basename
+    }
+    fn intent(&self) -> &Intent {
+        &self.intent
+    }
+}
+
+impl WindowAlert for trade_control_cli::BuiltNewsAlert {
+    fn basename(&self) -> &str {
+        &self.basename
+    }
+    fn intent(&self) -> &Intent {
+        &self.intent
+    }
+}
+
 /// One [`BuiltAlert`] → one [`ConditionRule`], or `None` when the role the
 /// trigger needs isn't on the chart. The embedded intent is cloned verbatim
 /// from the built alert — it is the exact action the TV alert would have
@@ -107,10 +201,11 @@ fn build_rule(
     alert: &BuiltAlert,
     direction: ConvDirection,
     roles: &Roles,
+    granularity: Granularity,
     is_mw: bool,
 ) -> Option<ConditionRule> {
     let basename = AlertBasename::parse(&alert.basename)?;
-    let trigger = trigger_for(&basename, direction, roles, is_mw)?;
+    let trigger = trigger_for(&basename, direction, roles, granularity, is_mw)?;
     let fire_mode = fire_mode_for(&trigger);
     Some(ConditionRule {
         rule_id: alert.basename.clone(),
@@ -127,14 +222,15 @@ fn trigger_for(
     basename: &AlertBasename,
     direction: ConvDirection,
     roles: &Roles,
+    granularity: Granularity,
     is_mw: bool,
 ) -> Option<Trigger> {
     match basename {
         AlertBasename::VetoTooHigh | AlertBasename::VetoTooLow => {
             invalidation_or_pcl_trigger(basename, direction, roles)
         }
-        // Trade-expiry / prep-expiry / pause / news are vertical-line time
-        // triggers. The veto fires when wall-clock reaches the line.
+        // Trade-expiry / prep-expiry are vertical-line time triggers. The veto
+        // fires when wall-clock reaches the line.
         AlertBasename::VetoTradeExpiry => time_trigger(roles.trade_expiry.as_ref()),
         AlertBasename::PrepExpire(step) => time_trigger(
             roles
@@ -143,22 +239,29 @@ fn trigger_for(
                 .find(|(s, _)| s == step)
                 .map(|(_, d)| d),
         ),
-        AlertBasename::PauseStart(_) => time_trigger(roles.blackout_pairs.first().map(|(s, _)| s)),
-        AlertBasename::PauseResume(_) => time_trigger(roles.blackout_pairs.first().map(|(_, e)| e)),
-        AlertBasename::NewsStart(_) => time_trigger(roles.news_pairs.first().map(|(s, _)| s)),
-        AlertBasename::NewsEnd(_) => time_trigger(roles.news_pairs.first().map(|(_, e)| e)),
+        // Pause / news are control bars: they're folded into the plan from the
+        // built pause/news/calendar bundles by [`append_control_rules`], not
+        // from `built_trade.alerts` (these basenames never appear there), so
+        // they are not handled here. A `built_trade` alert with one of these
+        // basenames (there is none) would be skipped.
+        AlertBasename::PauseStart(_)
+        | AlertBasename::PauseResume(_)
+        | AlertBasename::NewsStart(_)
+        | AlertBasename::NewsEnd(_) => None,
         // Break-and-close: neckline trendline, closes through it. Short closes
         // down, long closes up — same as the TV `CrossDown`/`CrossUp`.
         AlertBasename::PrepBreakAndClose => trendline_trigger(
             roles.break_and_close.as_ref(),
             close_dir(direction),
             BarEvent::OnClose,
+            granularity,
         ),
         // Retest: opposite cross of the neckline trendline, intrabar.
         AlertBasename::PrepRetest => trendline_trigger(
             roles.retest.as_ref(),
             retest_dir(direction),
             BarEvent::Intrabar,
+            granularity,
         ),
         // Enter: H&S binds to the direction's candle pattern; M/W to the
         // per-bar geometry heartbeat.
@@ -260,7 +363,12 @@ fn time_trigger(drawing: Option<&Drawing>) -> Option<Trigger> {
 /// A trendline cross trigger from a two-anchor drawing. Necklines are
 /// extended forward so a cross past the right anchor still fires (the engine
 /// analogue of the TV `extend_forward` flag — see the README trendline note).
-fn trendline_trigger(drawing: Option<&Drawing>, dir: CrossDir, bar: BarEvent) -> Option<Trigger> {
+fn trendline_trigger(
+    drawing: Option<&Drawing>,
+    dir: CrossDir,
+    bar: BarEvent,
+    granularity: Granularity,
+) -> Option<Trigger> {
     let d = drawing?;
     let a = d.points.first()?;
     let b = d.points.get(1)?;
@@ -274,6 +382,10 @@ fn trendline_trigger(drawing: Option<&Drawing>, dir: CrossDir, bar: BarEvent) ->
             price: b.price,
         },
         extend_forward: true,
+        // The engine interpolates the line in bar-index space; this is the
+        // nominal bar duration it falls back to when an anchor predates the
+        // fetched candle window (see `Trigger::TrendlineCross::bar_seconds`).
+        bar_seconds: granularity.seconds(),
         dir,
         bar,
     })
@@ -531,12 +643,16 @@ mod tests {
             } if (level - 1.2000).abs() < 1e-9
         ));
         // Break-and-close: short closes DOWN through the neckline, OnClose.
+        // `bar_seconds` is baked from the H1 chart granularity (3600s) so the
+        // engine can fall back to a bar-spacing divisor if an anchor predates
+        // its fetched candle window.
         assert!(matches!(
             by_id("03-prep-break-and-close").trigger,
             Trigger::TrendlineCross {
                 dir: CrossDir::Down,
                 bar: BarEvent::OnClose,
                 extend_forward: true,
+                bar_seconds: 3600,
                 ..
             }
         ));
@@ -675,5 +791,120 @@ mod tests {
             true,
         );
         assert!(plan.shadow, "shadow=true must reach the built plan");
+    }
+
+    // ===== append_control_rules =====
+
+    use trade_control_cli::{
+        BuiltCalendarBundle, NewsSpec, PauseSpec, build_news_from_spec, build_pause_from_spec,
+    };
+    use trade_control_core::intent::{Action as CoreAction, BrokerKind};
+
+    fn pause_spec(trade_id: &str, start: &str, end: &str) -> PauseSpec {
+        PauseSpec {
+            trade_id: trade_id.into(),
+            blackout_id: None,
+            instrument: "EUR_USD".into(),
+            account: "demo".into(),
+            broker: BrokerKind::Oanda,
+            start_time: ts(start),
+            end_time: ts(end),
+            reason: None,
+        }
+    }
+
+    fn news_spec(trade_id: &str, start: &str, end: &str) -> NewsSpec {
+        NewsSpec {
+            trade_id: trade_id.into(),
+            news_id: None,
+            instrument: "EUR_USD".into(),
+            account: "demo".into(),
+            broker: BrokerKind::Oanda,
+            start_time: ts(start),
+            end_time: ts(end),
+            reason: None,
+        }
+    }
+
+    /// A plan with one chart-drawn pause pair, one news pair, and a calendar
+    /// event (its own pause + news) gains a `TimeReached` rule per window edge,
+    /// each carrying the matching control action at the right epoch.
+    #[test]
+    fn control_rules_appended_from_pause_news_and_calendar_bundles() {
+        let now = ts("2026-06-15T00:00:00Z");
+        let pause = build_pause_from_spec(
+            pause_spec("t", "2026-06-16T10:00:00Z", "2026-06-16T11:00:00Z"),
+            now,
+        )
+        .unwrap();
+        let news = build_news_from_spec(
+            news_spec("t", "2026-06-16T12:00:00Z", "2026-06-16T13:00:00Z"),
+            now,
+        )
+        .unwrap();
+        // Calendar event: a separate pause + news window.
+        let cal = BuiltCalendarBundle {
+            event_slug: "usd-cpi-1".into(),
+            pause: build_pause_from_spec(
+                pause_spec("t", "2026-06-17T14:00:00Z", "2026-06-17T14:30:00Z"),
+                now,
+            )
+            .unwrap(),
+            news: build_news_from_spec(
+                news_spec("t", "2026-06-17T14:30:00Z", "2026-06-17T15:00:00Z"),
+                now,
+            )
+            .unwrap(),
+        };
+
+        let mut plan = build_trade_plan(
+            "t",
+            "EUR_USD",
+            &[alert("05-enter", Action::Enter)],
+            ConvDirection::Short,
+            &Roles::default(),
+            Granularity::H1,
+            false,
+            false,
+        );
+        assert_eq!(plan.rules.len(), 1, "just the enter before appending");
+
+        append_control_rules(&mut plan, &[&pause], &[&news], &[cal]);
+
+        // 1 enter + (pause-start, pause-resume) + (news-start, news-end)
+        // + calendar (pause start/resume + news start/end) = 1 + 2 + 2 + 4 = 9.
+        assert_eq!(plan.rules.len(), 9);
+
+        let by_action = |a: CoreAction| {
+            plan.rules
+                .iter()
+                .filter(|r| r.intent.action == a)
+                .collect::<Vec<_>>()
+        };
+        // Two pause windows (chart + calendar) → two Pause + two Resume.
+        assert_eq!(by_action(CoreAction::Pause).len(), 2);
+        assert_eq!(by_action(CoreAction::Resume).len(), 2);
+        // Two news windows → two NewsStart + two NewsEnd.
+        assert_eq!(by_action(CoreAction::NewsStart).len(), 2);
+        assert_eq!(by_action(CoreAction::NewsEnd).len(), 2);
+
+        // The chart pause anchors its start/end epochs to the window edges.
+        let pause_start = by_action(CoreAction::Pause)
+            .into_iter()
+            .find(|r| {
+                matches!(r.trigger, Trigger::TimeReached { at_epoch }
+                    if at_epoch == ts("2026-06-16T10:00:00Z").timestamp())
+            })
+            .expect("chart pause-start at its start epoch");
+        assert_eq!(pause_start.fire_mode, FireMode::Once);
+
+        // The calendar news-end anchors to the calendar window's end.
+        assert!(
+            by_action(CoreAction::NewsEnd).iter().any(|r| {
+                matches!(r.trigger, Trigger::TimeReached { at_epoch }
+                    if at_epoch == ts("2026-06-17T15:00:00Z").timestamp())
+            }),
+            "calendar news-end at the calendar window end"
+        );
     }
 }

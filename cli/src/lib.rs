@@ -13,7 +13,6 @@ mod interactive;
 mod news_pattern;
 mod pause_pattern;
 mod prompts;
-mod replay;
 mod script_validator;
 mod templates;
 mod trade_patterns;
@@ -23,14 +22,16 @@ pub use admin_client::{
 };
 pub use admin_secret::{delete_secret, put_secret, secret_binding_for};
 pub use calendar_bars::{
-    CalendarBarPlan, CalendarBarRow, CalendarBarsArgs, CalendarBrokerArg, PlanInputs, TimeframeArg,
-    dedupe_and_filter_events, fetch_events_for_range, fetch_week_events, parse_instrument,
-    plan_calendar_bars, plan_calendar_bars_within, print_summary_table, run_calendar_bars,
+    BuiltCalendarBundle, CalendarBarPlan, CalendarBarRow, CalendarBarsArgs, CalendarBrokerArg,
+    PlanInputs, TimeframeArg, dedupe_and_filter_events, fetch_events_for_range, fetch_week_events,
+    parse_instrument, plan_calendar_bars, plan_calendar_bars_within, print_summary_table,
+    run_calendar_bars,
 };
 pub use control::{
     build_clear_prep_intent, build_clear_veto_intent, build_market_info_intent,
-    build_plan_list_intent, build_plan_show_intent, build_prep_intent, build_register_intent,
-    build_status_intent, build_unlock_intent, build_veto_intent, wrap_signed, wrap_signed_template,
+    build_plan_delete_intent, build_plan_list_intent, build_plan_show_intent, build_prep_intent,
+    build_register_intent, build_status_intent, build_unlock_intent, build_veto_intent,
+    wrap_signed, wrap_signed_template,
 };
 /// Re-export forex-factory's event + impact types so downstream
 /// consumers (tv-news, future strategy binaries) don't have to pin the
@@ -50,7 +51,6 @@ pub use pause_pattern::{
     BuiltPause, BuiltPauseAlert, PauseSpec, build_pause_from_spec,
     load_spec_from_file as load_pause_spec_from_file, write_pause,
 };
-pub use replay::{ReplayArgs, ReplayReport, replay_bundle, run_replay};
 pub use script_validator::{ScriptError, validate as validate_intent_scripts};
 pub use templates::{discover_templates, pick_template_interactive, templates_root};
 pub use trade_control_core::intent::{BrokerKind, PriceAnchor};

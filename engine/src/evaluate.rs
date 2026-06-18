@@ -141,9 +141,16 @@ pub fn evaluate_plan(
     let detector_cfg = DetectorConfig::pine_defaults(plan.granularity);
 
     for candle in new_candles {
-        // Always-armed guards first: a terminal veto can end the plan on any
+        // Always-armed control rules first: pause/resume/news-start/news-end
+        // are wall-clock `TimeReached` fires that set KV state (blackout / news
+        // window) without touching the trade's spine. Non-terminal — they fire,
+        // latch, and the machine carries on. A window can land in any phase, so
+        // these are evaluated every bar regardless of `state.phase`.
+        evaluate_controls(plan, &mut state, candle, detector_window, &mut fired);
+
+        // Always-armed guards next: a terminal veto can end the plan on any
         // bar, regardless of spine phase.
-        evaluate_guards(plan, &mut state, candle, &mut fired);
+        evaluate_guards(plan, &mut state, candle, detector_window, &mut fired);
         if state.phase == Phase::Done {
             state.watermark = Some(candle.time);
             break;
@@ -152,12 +159,12 @@ pub fn evaluate_plan(
         // Sequential spine.
         match state.phase {
             Phase::AwaitBreakAndClose => {
-                evaluate_break_and_close(plan, &mut state, candle, &mut fired);
+                evaluate_break_and_close(plan, &mut state, candle, detector_window, &mut fired);
             }
             Phase::AwaitEntry => {
                 // Stamp the retest lookback before testing entry, so a retest
                 // and entry that land on the same bar are both seen.
-                stamp_retest(plan, &mut state, candle);
+                stamp_retest(plan, &mut state, candle, detector_window);
                 evaluate_entry(
                     plan,
                     &mut state,
@@ -177,10 +184,125 @@ pub fn evaluate_plan(
     }
 
     let done = state.phase == Phase::Done;
+    let warnings = trendline_anchor_warnings(plan, detector_window);
     PlanEval {
         fired,
         new_state: state,
         done,
+        warnings,
+    }
+}
+
+/// How a trendline anchor resolved against the candle window — the diagnostic
+/// the warning surface reports.
+enum AnchorResolution {
+    /// The anchor matched a real bar or fell inside the window's span — the
+    /// bar-index is exact (or one-hole interpolated). No warning.
+    InWindow,
+    /// The anchor fell outside the window's span and its bar-index was
+    /// *estimated* from `bar_seconds`. The estimate reintroduces wall-clock
+    /// spacing across any closed session in the un-fetched span, so it can slide
+    /// the line — a soft warning.
+    Extrapolated,
+    /// The anchor fell outside the window's span and `bar_seconds == 0` (a plan
+    /// signed before the field existed), so the bar-index can't be estimated at
+    /// all and the trendline silently can't fire this tick — a hard warning.
+    Unresolvable,
+}
+
+/// Classify a single anchor against the window using the same bar-index logic
+/// [`bar_index_at`] applies, but reporting *how* it resolved rather than the
+/// index itself.
+fn classify_anchor(epoch: i64, window: &[Candle], bar_seconds: i64) -> AnchorResolution {
+    if window.is_empty() {
+        // No window at all → the wrapper would never have called us with a
+        // trendline plan, but be total: treat as unresolvable.
+        return AnchorResolution::Unresolvable;
+    }
+    let first = window[0].time.timestamp();
+    let last = window[window.len() - 1].time.timestamp();
+    if epoch >= first && epoch <= last {
+        return AnchorResolution::InWindow;
+    }
+    if bar_seconds <= 0 {
+        AnchorResolution::Unresolvable
+    } else {
+        AnchorResolution::Extrapolated
+    }
+}
+
+/// Detect every [`Trigger::TrendlineCross`] whose anchor falls outside the
+/// fetched `window`, so the wrapper can log that the line's level was estimated
+/// (or couldn't be resolved). This is the **observability half** of the
+/// bar-index fix: in-window anchors are exact, but an out-of-window anchor falls
+/// back to the `bar_seconds` divisor — which re-introduces wall-clock spacing
+/// across any gap in the un-fetched span (the very assumption the bar-index work
+/// removed), or, on a pre-`bar_seconds` plan, makes the trendline silently
+/// un-evaluable. Both are rare in practice (a normal H&S/M/W `detector_window`
+/// straddles its anchors) but must not be silent when they do happen.
+///
+/// Pure and window-derived, so it recomputes deterministically on replay and is
+/// deliberately *not* part of the replay diff.
+fn trendline_anchor_warnings(plan: &TradePlan, window: &[Candle]) -> Vec<String> {
+    let mut warnings = Vec::new();
+    for rule in &plan.rules {
+        let Trigger::TrendlineCross {
+            a, b, bar_seconds, ..
+        } = &rule.trigger
+        else {
+            continue;
+        };
+        for (label, anchor) in [("a", a), ("b", b)] {
+            match classify_anchor(anchor.at_epoch, window, *bar_seconds) {
+                AnchorResolution::InWindow => {}
+                AnchorResolution::Extrapolated => warnings.push(format!(
+                    "trendline {rule_id}: anchor {label} (epoch {epoch}) is outside the \
+                     {n}-bar window; its bar-index was estimated from bar_seconds={bar_seconds} \
+                     (wall-clock spacing across any gap in the un-fetched span). Widen the \
+                     candle fetch so anchors are in-window.",
+                    rule_id = rule.rule_id,
+                    epoch = anchor.at_epoch,
+                    n = window.len(),
+                    bar_seconds = bar_seconds,
+                )),
+                AnchorResolution::Unresolvable => warnings.push(format!(
+                    "trendline {rule_id}: anchor {label} (epoch {epoch}) is outside the \
+                     {n}-bar window and bar_seconds=0 (plan signed before the field existed), \
+                     so this trendline cannot be evaluated this tick (silently won't fire). \
+                     Re-arm the plan to bake bar_seconds, or widen the candle fetch.",
+                    rule_id = rule.rule_id,
+                    epoch = anchor.at_epoch,
+                    n = window.len(),
+                )),
+            }
+        }
+    }
+    warnings
+}
+
+/// Evaluate every control rule (pause / resume / news-start / news-end)
+/// against this candle. Each is a `TimeReached` rule whose intent sets KV
+/// state (a blackout or news window) — **non-terminal**: it fires, latches in
+/// `state.fired` (`FireMode::Once`), and the plan continues. Distinct from a
+/// guard (which ends the spine) and from the prep spine. Armed in every phase
+/// so a window that opens before break-and-close still fires.
+fn evaluate_controls(
+    plan: &TradePlan,
+    state: &mut PlanState,
+    candle: &Candle,
+    window: &[Candle],
+    fired: &mut Vec<FiredIntent>,
+) {
+    for rule in &plan.rules {
+        if !is_control_rule(rule) || state.fired.contains(&rule.rule_id) {
+            continue;
+        }
+        if fire_rule(rule, state, candle, window) {
+            push_fire(rule, candle, fired);
+            state.fired.insert(rule.rule_id.clone());
+            // No phase change: a pause/resume/news fire is state-only and never
+            // ends the setup.
+        }
     }
 }
 
@@ -191,6 +313,7 @@ fn evaluate_guards(
     plan: &TradePlan,
     state: &mut PlanState,
     candle: &Candle,
+    window: &[Candle],
     fired: &mut Vec<FiredIntent>,
 ) {
     for rule in &plan.rules {
@@ -200,7 +323,7 @@ fn evaluate_guards(
         if !armed_in(&rule.rule_id, state.phase) {
             continue;
         }
-        if fire_rule(rule, state, candle) {
+        if fire_rule(rule, state, candle, window) {
             push_fire(rule, candle, fired);
             state.fired.insert(rule.rule_id.clone());
             // Every veto guard is terminal for the plan's spine: the dispatched
@@ -217,6 +340,7 @@ fn evaluate_break_and_close(
     plan: &TradePlan,
     state: &mut PlanState,
     candle: &Candle,
+    window: &[Candle],
     fired: &mut Vec<FiredIntent>,
 ) {
     let Some(rule) = plan.rules.iter().find(|r| is_break_and_close(r)) else {
@@ -225,7 +349,7 @@ fn evaluate_break_and_close(
         state.phase = Phase::AwaitEntry;
         return;
     };
-    if fire_rule(rule, state, candle) {
+    if fire_rule(rule, state, candle, window) {
         state.fired.insert(rule.rule_id.clone());
         state.break_close_at = Some(candle.time);
         // The break-and-close prep itself is recorded server-side by dispatching
@@ -264,7 +388,7 @@ fn evaluate_entry(
         // Every other entry trigger (the M/W heartbeat) is a plain per-candle
         // predicate with no pattern geometry.
         _ => {
-            if !fire_rule(rule, state, candle) {
+            if !fire_rule(rule, state, candle, detector_window) {
                 return;
             }
             None
@@ -318,7 +442,7 @@ fn eval_pine_entry(
 /// Stamp `retest_seen_at` if this candle satisfies the retest trendline
 /// geometry and falls after the break-and-close. No-op if there's no retest
 /// rule or no break-and-close has fired yet.
-fn stamp_retest(plan: &TradePlan, state: &mut PlanState, candle: &Candle) {
+fn stamp_retest(plan: &TradePlan, state: &mut PlanState, candle: &Candle, window: &[Candle]) {
     let Some(break_at) = state.break_close_at else {
         return;
     };
@@ -332,6 +456,7 @@ fn stamp_retest(plan: &TradePlan, state: &mut PlanState, candle: &Candle) {
         &rule.trigger,
         candle,
         state.last_close.get(&rule.rule_id).copied(),
+        window,
     ) {
         state.retest_seen_at = Some(candle.time);
     }
@@ -352,9 +477,14 @@ fn retest_satisfied(state: &PlanState, entry_time: DateTime<Utc>) -> bool {
 /// `last_close` memory) and return whether it fired this bar. Latched rules
 /// don't re-fire (the caller checks `state.fired` for guards; this also guards
 /// the entry/break-and-close paths via `record_last_close`).
-fn fire_rule(rule: &ConditionRule, state: &mut PlanState, candle: &Candle) -> bool {
+fn fire_rule(
+    rule: &ConditionRule,
+    state: &mut PlanState,
+    candle: &Candle,
+    window: &[Candle],
+) -> bool {
     let prev_close = state.last_close.get(&rule.rule_id).copied();
-    let hit = eval_trigger(&rule.trigger, candle, prev_close);
+    let hit = eval_trigger(&rule.trigger, candle, prev_close, window);
     record_last_close(&rule.rule_id, &rule.trigger, candle, state);
     hit
 }
@@ -389,8 +519,16 @@ fn trigger_uses_close(trigger: &Trigger) -> bool {
 
 /// Pure trigger evaluation against a single candle. `prev_close` is the rule's
 /// last processed close (for `OnClose` crosses); `None` on the seed bar, which
-/// never fires an `OnClose` cross.
-pub fn eval_trigger(trigger: &Trigger, candle: &Candle, prev_close: Option<f64>) -> bool {
+/// never fires an `OnClose` cross. `window` is the ascending bar series used to
+/// resolve a `TrendlineCross`'s level in bar-index space (ignored by every
+/// other trigger); pass the plan's `detector_window` (or `new_candles` when no
+/// trendline rule is present).
+pub fn eval_trigger(
+    trigger: &Trigger,
+    candle: &Candle,
+    prev_close: Option<f64>,
+    window: &[Candle],
+) -> bool {
     match trigger {
         Trigger::HorizontalCross { level, dir, bar }
         | Trigger::PriceValueCross { level, dir, bar } => {
@@ -400,10 +538,12 @@ pub fn eval_trigger(trigger: &Trigger, candle: &Candle, prev_close: Option<f64>)
             a,
             b,
             extend_forward,
+            bar_seconds,
             dir,
             bar,
         } => {
-            let Some(level) = line_price_at(a, b, candle.time, *extend_forward) else {
+            let Some(level) = line_price_at(a, b, candle, *extend_forward, *bar_seconds, window)
+            else {
                 return false;
             };
             level_crossed(level, *dir, *bar, candle, prev_close)
@@ -461,25 +601,90 @@ fn level_crossed(
     }
 }
 
-/// Interpolate a trendline's price at `t`. Returns `None` if `t` is past the
-/// second anchor and the line isn't extended forward. A degenerate vertical
-/// line (equal epochs) is treated as a horizontal at the first anchor's price.
+/// Interpolate a trendline's price at candle `t`, in **bar-index** space.
+///
+/// TradingView's x-axis is ordinal: closed sessions aren't plotted, so a
+/// trendline advances one step *per traded bar*, not per elapsed second. We
+/// replicate that by measuring `t`'s position along the line as a fraction of
+/// *bars* between the two anchors, not seconds — counting the bars that
+/// actually exist in `window` (the broker feed; gaps are absent). Confirmed on
+/// real ALPHABET data: an 18h overnight gap and a 66h weekend gap each collapse
+/// to a single bar step, exactly as TV draws them.
+///
+/// Returns `None` when `t` is past the second anchor and the line isn't
+/// extended forward. A degenerate line (anchors at the same bar) is treated as
+/// a horizontal at the first anchor's price.
+///
+/// `bar_seconds` is the fallback bar spacing used to estimate a bar-index when
+/// an anchor predates `window` (so its bar can't be counted directly); `0`
+/// means "no fallback" and such an out-of-window anchor yields `None`.
 fn line_price_at(
     a: &LinePoint,
     b: &LinePoint,
-    t: DateTime<Utc>,
+    t: &Candle,
     extend_forward: bool,
+    bar_seconds: i64,
+    window: &[Candle],
 ) -> Option<f64> {
-    let t = t.timestamp();
-    if t > b.at_epoch && !extend_forward {
+    let ia = bar_index_at(a.at_epoch, window, bar_seconds)?;
+    let ib = bar_index_at(b.at_epoch, window, bar_seconds)?;
+    let it = bar_index_at(t.time.timestamp(), window, bar_seconds)?;
+    if it > ib && !extend_forward {
         return None;
     }
-    let span = b.at_epoch - a.at_epoch;
-    if span == 0 {
+    let span = ib - ia;
+    if span == 0.0 {
         return Some(a.price);
     }
-    let frac = (t - a.at_epoch) as f64 / span as f64;
+    let frac = (it - ia) / span;
     Some(a.price + (b.price - a.price) * frac)
+}
+
+/// Resolve an epoch to a (possibly fractional) **bar index** within `window`.
+///
+/// - An epoch matching a bar in `window` returns that bar's ordinal position.
+/// - An epoch *inside* the window's span but between two bars (a brief data
+///   hole) is interpolated between the surrounding bars' indices by time, so a
+///   single missing bar doesn't throw the count off.
+/// - An epoch *after* the last bar is extrapolated forward by `bar_seconds`
+///   from the last bar (e.g. an anchor on a bar not yet fetched, or a candle
+///   the wrapper feeds that the detector window hasn't caught up to).
+/// - An epoch *before* the first bar can only be estimated via `bar_seconds`
+///   from the first bar; with `bar_seconds == 0` (pre-field plans) this returns
+///   `None`, collapsing the trendline to "can't evaluate this tick".
+fn bar_index_at(epoch: i64, window: &[Candle], bar_seconds: i64) -> Option<f64> {
+    if window.is_empty() {
+        return None;
+    }
+    // Exact bar match — the common case (anchors and candles are real bars).
+    if let Some(i) = window.iter().position(|c| c.time.timestamp() == epoch) {
+        return Some(i as f64);
+    }
+    let first = window[0].time.timestamp();
+    let last = window[window.len() - 1].time.timestamp();
+    if epoch < first {
+        // Before the window: estimate backwards by nominal bar spacing.
+        if bar_seconds <= 0 {
+            return None;
+        }
+        return Some(-((first - epoch) as f64 / bar_seconds as f64));
+    }
+    if epoch > last {
+        // After the window: estimate forward by nominal bar spacing.
+        if bar_seconds <= 0 {
+            return None;
+        }
+        let last_idx = (window.len() - 1) as f64;
+        return Some(last_idx + (epoch - last) as f64 / bar_seconds as f64);
+    }
+    // Inside the span but between bars (a data hole): interpolate by time
+    // between the bracketing bars' indices.
+    let hi = window.iter().position(|c| c.time.timestamp() > epoch)?;
+    let lo = hi - 1;
+    let lo_t = window[lo].time.timestamp();
+    let hi_t = window[hi].time.timestamp();
+    let frac = (epoch - lo_t) as f64 / (hi_t - lo_t) as f64;
+    Some(lo as f64 + frac)
 }
 
 /// Push a fired rule's intent onto the result, cloning the intent verbatim. No
@@ -511,6 +716,17 @@ fn is_guard(rule: &ConditionRule) -> bool {
     matches!(
         rule.intent.action,
         Action::Veto | Action::Invalidate | Action::Close
+    )
+}
+
+/// A control rule sets the worker's blackout / news-window KV state on a
+/// wall-clock `TimeReached` fire (pause/resume open and close a blackout;
+/// news-start/news-end open and close a news window). Always-armed but
+/// non-terminal — it never ends the trade's spine, unlike a guard.
+fn is_control_rule(rule: &ConditionRule) -> bool {
+    matches!(
+        rule.intent.action,
+        Action::Pause | Action::Resume | Action::NewsStart | Action::NewsEnd
     )
 }
 
@@ -557,6 +773,13 @@ mod tests {
             l,
             c,
         }
+    }
+
+    /// `eval_trigger` with an empty bar window — for level/time/mw triggers that
+    /// don't read it. Trendline tests call `eval_trigger` directly with a real
+    /// window (bar-index interpolation needs it).
+    fn et(trigger: &Trigger, candle: &Candle, prev_close: Option<f64>) -> bool {
+        eval_trigger(trigger, candle, prev_close, &[])
     }
 
     /// A minimal intent carrying just the action the evaluator reads; the rest
@@ -669,13 +892,13 @@ mod tests {
             bar: BarEvent::OnClose,
         };
         // prior close below, this close at/above → fires.
-        assert!(eval_trigger(
+        assert!(et(
             &t,
             &candle("2026-06-16T12:00:00Z", 1.1, 1.21, 1.1, 1.2005),
             Some(1.1990)
         ));
         // prior close already above → no cross.
-        assert!(!eval_trigger(
+        assert!(!et(
             &t,
             &candle("2026-06-16T12:00:00Z", 1.21, 1.22, 1.2, 1.2105),
             Some(1.2010)
@@ -690,7 +913,7 @@ mod tests {
             bar: BarEvent::OnClose,
         };
         // No prior close (seed) → never fires even if this close is above.
-        assert!(!eval_trigger(
+        assert!(!et(
             &t,
             &candle("2026-06-16T12:00:00Z", 1.1, 1.3, 1.1, 1.2500),
             None
@@ -705,19 +928,19 @@ mod tests {
             bar: BarEvent::Intrabar,
         };
         // Range straddles, close above → up fires.
-        assert!(eval_trigger(
+        assert!(et(
             &t,
             &candle("2026-06-16T12:00:00Z", 1.19, 1.21, 1.19, 1.2050),
             None
         ));
         // Range straddles but close below the level → up does NOT fire.
-        assert!(!eval_trigger(
+        assert!(!et(
             &t,
             &candle("2026-06-16T12:00:00Z", 1.21, 1.21, 1.19, 1.1950),
             None
         ));
         // Range doesn't reach the level → no fire.
-        assert!(!eval_trigger(
+        assert!(!et(
             &t,
             &candle("2026-06-16T12:00:00Z", 1.18, 1.195, 1.18, 1.19),
             None
@@ -731,12 +954,12 @@ mod tests {
             dir: CrossDir::Either,
             bar: BarEvent::Intrabar,
         };
-        assert!(eval_trigger(
+        assert!(et(
             &t,
             &candle("2026-06-16T12:00:00Z", 1.19, 1.21, 1.19, 1.205),
             None
         ));
-        assert!(eval_trigger(
+        assert!(et(
             &t,
             &candle("2026-06-16T12:00:00Z", 1.21, 1.21, 1.19, 1.195),
             None
@@ -745,53 +968,120 @@ mod tests {
 
     // ===== eval_trigger: trendline =====
 
+    /// Build a window of `n` consecutive bars at `step` seconds apart starting
+    /// at `start`, all flat at price `p` (range ±0.5 so we control straddles via
+    /// the candle under test). Bar `i` sits at epoch `start + i*step`.
+    fn flat_window(start: i64, step: i64, n: usize, p: f64) -> Vec<Candle> {
+        (0..n)
+            .map(|i| Candle {
+                time: DateTime::from_timestamp(start + i as i64 * step, 0).unwrap(),
+                o: p,
+                h: p,
+                l: p,
+                c: p,
+            })
+            .collect()
+    }
+
     #[test]
-    fn trendline_interpolates_level_at_candle_time() {
-        // Line from (0, 1.0) to (100, 2.0): at t=50 the level is 1.5.
-        let a = LinePoint {
-            at_epoch: 0,
-            price: 1.0,
-        };
-        let b = LinePoint {
-            at_epoch: 100,
-            price: 2.0,
-        };
+    fn trendline_interpolates_level_at_bar_index() {
+        // Line anchored on bar 0 (epoch 0, price 1.0) and bar 2 (epoch 200,
+        // price 2.0). The MIDDLE bar (index 1, epoch 100) is half-way → 1.5.
+        // Interpolation is by bar index, which here equals time since bars are
+        // evenly spaced; the gap tests below prove the index (not time) path.
+        let win = flat_window(0, 100, 3, 1.0);
         let t = Trigger::TrendlineCross {
-            a,
-            b,
+            a: LinePoint {
+                at_epoch: 0,
+                price: 1.0,
+            },
+            b: LinePoint {
+                at_epoch: 200,
+                price: 2.0,
+            },
             extend_forward: true,
+            bar_seconds: 100,
             dir: CrossDir::Up,
             bar: BarEvent::Intrabar,
         };
-        // candle.time = epoch 50 → level 1.5; range straddles, close above.
+        // bar 1: level 1.5; range straddles, close above → fires.
         let c = Candle {
-            time: DateTime::from_timestamp(50, 0).unwrap(),
+            time: DateTime::from_timestamp(100, 0).unwrap(),
             o: 1.4,
             h: 1.6,
             l: 1.4,
             c: 1.55,
         };
-        assert!(eval_trigger(&t, &c, None));
+        assert!(eval_trigger(&t, &c, None, &win));
+    }
+
+    /// The core of the bug: a session gap must NOT slide the line. Bars are
+    /// adjacent in index even though wall-clock between them is huge.
+    #[test]
+    fn trendline_gap_uses_bar_index_not_wall_clock() {
+        // Three bars: 13:00, 14:00 (1h apart) then a HUGE jump to next day's
+        // 13:00 — like ALPHABET's overnight gap (the real feed elides the closed
+        // session). Indices 0,1,2; the line is anchored bar 0 → bar 2.
+        let day1 = ts("2026-06-16T13:00:00Z").timestamp();
+        let day1b = ts("2026-06-16T14:00:00Z").timestamp();
+        let day2 = ts("2026-06-17T13:00:00Z").timestamp(); // +23h, but bar 2
+        let win = vec![
+            candle("2026-06-16T13:00:00Z", 1.0, 1.0, 1.0, 1.0),
+            candle("2026-06-16T14:00:00Z", 1.0, 1.0, 1.0, 1.0),
+            candle("2026-06-17T13:00:00Z", 1.0, 1.0, 1.0, 1.0),
+        ];
+        // Line from bar 0 (1.00) to bar 2 (2.00). At bar 1 (index 1 of 0..2) the
+        // level is the half-way 1.50 — NOT what wall-clock would give (bar 1 is
+        // only 1h into a 23h span → wall-clock ~1.04).
+        let t = Trigger::TrendlineCross {
+            a: LinePoint {
+                at_epoch: day1,
+                price: 1.0,
+            },
+            b: LinePoint {
+                at_epoch: day2,
+                price: 2.0,
+            },
+            extend_forward: true,
+            bar_seconds: 3600,
+            dir: CrossDir::Up,
+            bar: BarEvent::Intrabar,
+        };
+        // At bar 1, the bar-index level is 1.50. A candle straddling 1.50 fires;
+        // one straddling only ~1.04 (the wall-clock level) does NOT.
+        let at_index_level = candle("2026-06-16T14:00:00Z", 1.45, 1.55, 1.45, 1.52);
+        assert!(
+            eval_trigger(&t, &at_index_level, None, &win),
+            "bar-index level at bar 1 is 1.50 → straddle fires"
+        );
+        let at_wallclock_level = candle("2026-06-16T14:00:00Z", 1.0, 1.08, 1.0, 1.05);
+        assert!(
+            !eval_trigger(&t, &at_wallclock_level, None, &win),
+            "the old wall-clock level (~1.04) must NOT be where the line sits"
+        );
+        let _ = day1b;
     }
 
     #[test]
     fn trendline_respects_extend_forward_false() {
-        let a = LinePoint {
-            at_epoch: 0,
-            price: 1.0,
-        };
-        let b = LinePoint {
-            at_epoch: 100,
-            price: 1.0,
-        };
+        // Bars 0..=2; line anchored bar 0 → bar 1. Bar 2 is past the second
+        // anchor.
+        let win = flat_window(0, 100, 3, 1.0);
         let mk = |extend| Trigger::TrendlineCross {
-            a,
-            b,
+            a: LinePoint {
+                at_epoch: 0,
+                price: 1.0,
+            },
+            b: LinePoint {
+                at_epoch: 100,
+                price: 1.0,
+            },
             extend_forward: extend,
+            bar_seconds: 100,
             dir: CrossDir::Either,
             bar: BarEvent::Intrabar,
         };
-        // candle past the second anchor (epoch 200) at the line's level.
+        // candle = bar 2 (epoch 200), past the second anchor (bar 1), at level.
         let c = Candle {
             time: DateTime::from_timestamp(200, 0).unwrap(),
             o: 0.9,
@@ -800,13 +1090,140 @@ mod tests {
             c: 1.0,
         };
         assert!(
-            !eval_trigger(&mk(false), &c, None),
+            !eval_trigger(&mk(false), &c, None, &win),
             "no eval past anchor when not extended"
         );
         assert!(
-            eval_trigger(&mk(true), &c, None),
+            eval_trigger(&mk(true), &c, None, &win),
             "extended → still evaluates"
         );
+    }
+
+    // ===== trendline out-of-window anchor warnings (bar_seconds hardening) =====
+
+    /// A trendline rule whose anchors are at `a_epoch` / `b_epoch`, carrying the
+    /// given `bar_seconds`. Geometry is irrelevant to the warning surface.
+    fn trendline_rule(a_epoch: i64, b_epoch: i64, bar_seconds: i64) -> ConditionRule {
+        rule(
+            "03-prep-break-and-close",
+            Trigger::TrendlineCross {
+                a: LinePoint {
+                    at_epoch: a_epoch,
+                    price: 1.0,
+                },
+                b: LinePoint {
+                    at_epoch: b_epoch,
+                    price: 1.0,
+                },
+                extend_forward: true,
+                bar_seconds,
+                dir: CrossDir::Down,
+                bar: BarEvent::OnClose,
+            },
+            FireMode::Once,
+            Action::Prep,
+        )
+    }
+
+    #[test]
+    fn in_window_anchors_produce_no_warning() {
+        // Window spans epochs 0..200; both anchors inside it → silent.
+        let win = flat_window(0, 100, 3, 1.0);
+        let p = plan(vec![trendline_rule(0, 200, 100)]);
+        assert!(trendline_anchor_warnings(&p, &win).is_empty());
+    }
+
+    #[test]
+    fn out_of_window_anchor_warns_about_bar_seconds_extrapolation() {
+        // Window spans epochs 0..200; anchor `a` predates it (epoch -1000), so it
+        // can only be estimated from bar_seconds → a soft "extrapolated" warning.
+        let win = flat_window(0, 100, 3, 1.0);
+        let p = plan(vec![trendline_rule(-1000, 200, 100)]);
+        let w = trendline_anchor_warnings(&p, &win);
+        assert_eq!(w.len(), 1, "exactly one out-of-window anchor");
+        assert!(w[0].contains("anchor a"), "names the offending anchor");
+        assert!(
+            w[0].contains("bar_seconds=100"),
+            "reports the divisor used: {}",
+            w[0]
+        );
+        assert!(
+            w[0].contains("Widen the candle fetch"),
+            "points at the real fix: {}",
+            w[0]
+        );
+    }
+
+    #[test]
+    fn out_of_window_anchor_with_zero_bar_seconds_warns_unresolvable() {
+        // Pre-bar_seconds plan (bar_seconds=0): an out-of-window anchor can't be
+        // estimated at all → the trendline silently won't fire. The hard warning
+        // documents that exact failure mode.
+        let win = flat_window(0, 100, 3, 1.0);
+        let p = plan(vec![trendline_rule(-1000, 200, 0)]);
+        let w = trendline_anchor_warnings(&p, &win);
+        assert_eq!(w.len(), 1);
+        assert!(
+            w[0].contains("bar_seconds=0") || w[0].contains("bar_seconds=0 ("),
+            "names the zero divisor: {}",
+            w[0]
+        );
+        assert!(
+            w[0].contains("cannot be evaluated") && w[0].contains("won't fire"),
+            "documents the silent-non-fire: {}",
+            w[0]
+        );
+    }
+
+    #[test]
+    fn both_anchors_out_of_window_warns_twice() {
+        // Window spans 0..200; both anchors outside (one before, one after).
+        let win = flat_window(0, 100, 3, 1.0);
+        let p = plan(vec![trendline_rule(-500, 99_999, 100)]);
+        let w = trendline_anchor_warnings(&p, &win);
+        assert_eq!(w.len(), 2, "both anchors flagged");
+        assert!(w.iter().any(|s| s.contains("anchor a")));
+        assert!(w.iter().any(|s| s.contains("anchor b")));
+    }
+
+    #[test]
+    fn non_trendline_plan_never_warns() {
+        // An M/W plan (no trendline rule) produces no trendline warnings, even
+        // with an empty window.
+        let p = plan(vec![rule(
+            "05-enter",
+            Trigger::MwEveryBar,
+            FireMode::EveryBar,
+            Action::Enter,
+        )]);
+        assert!(trendline_anchor_warnings(&p, &[]).is_empty());
+    }
+
+    #[test]
+    fn evaluate_plan_surfaces_the_warning_on_planeval() {
+        // End-to-end: a plan whose neckline anchor predates the fed window
+        // surfaces the warning on PlanEval.warnings (what the wrapper logs).
+        // Window: three H1 bars; anchor `a` is a day earlier (out of window).
+        let win = vec![
+            candle("2026-06-16T13:00:00Z", 1.0, 1.0, 1.0, 1.0),
+            candle("2026-06-16T14:00:00Z", 1.0, 1.0, 1.0, 1.0),
+            candle("2026-06-16T15:00:00Z", 1.0, 1.0, 1.0, 1.0),
+        ];
+        let a_epoch = ts("2026-06-15T13:00:00Z").timestamp(); // out of window
+        let b_epoch = ts("2026-06-16T15:00:00Z").timestamp(); // in window
+        let p = plan(vec![
+            trendline_rule(a_epoch, b_epoch, 3600),
+            rule(
+                "05-enter",
+                Trigger::MwEveryBar,
+                FireMode::EveryBar,
+                Action::Enter,
+            ),
+        ]);
+        let prior = seed_at(Phase::AwaitBreakAndClose, "2026-06-16T12:00:00Z");
+        let eval = run_window(&p, &prior, &win, &win);
+        assert_eq!(eval.warnings.len(), 1, "the out-of-window anchor warns");
+        assert!(eval.warnings[0].contains("anchor a"));
     }
 
     // ===== eval_trigger: time + mw + pine =====
@@ -815,17 +1232,17 @@ mod tests {
     fn time_reached_fires_at_or_past_epoch() {
         let at = ts("2026-06-16T15:00:00Z").timestamp();
         let t = Trigger::TimeReached { at_epoch: at };
-        assert!(!eval_trigger(
+        assert!(!et(
             &t,
             &candle("2026-06-16T14:00:00Z", 1.0, 1.0, 1.0, 1.0),
             None
         ));
-        assert!(eval_trigger(
+        assert!(et(
             &t,
             &candle("2026-06-16T15:00:00Z", 1.0, 1.0, 1.0, 1.0),
             None
         ));
-        assert!(eval_trigger(
+        assert!(et(
             &t,
             &candle("2026-06-16T16:00:00Z", 1.0, 1.0, 1.0, 1.0),
             None
@@ -835,8 +1252,8 @@ mod tests {
     #[test]
     fn mw_every_bar_always_fires_and_pine_never_fires() {
         let c = candle("2026-06-16T12:00:00Z", 1.0, 1.0, 1.0, 1.0);
-        assert!(eval_trigger(&Trigger::MwEveryBar, &c, None));
-        assert!(!eval_trigger(
+        assert!(et(&Trigger::MwEveryBar, &c, None));
+        assert!(!et(
             &Trigger::PinePattern {
                 pattern: None,
                 dir: Direction::Short
@@ -871,6 +1288,7 @@ mod tests {
                 price: 1.2,
             },
             extend_forward: true,
+            bar_seconds: 100,
             dir: CrossDir::Down,
             bar: BarEvent::OnClose,
         };
@@ -946,6 +1364,7 @@ mod tests {
                 price: 1.2000,
             },
             extend_forward: true,
+            bar_seconds: 3600,
             dir,
             bar,
         };
@@ -1073,6 +1492,137 @@ mod tests {
     }
 
     #[test]
+    fn pause_control_fires_at_its_epoch_without_ending_the_spine() {
+        // A pause window opening mid-trade: its TimeReached fires, dispatches
+        // the Pause intent, but the plan keeps running (non-terminal) and the
+        // enter heartbeat still fires the same bar.
+        let pause_at = ts("2026-06-16T15:00:00Z").timestamp();
+        let p = plan(vec![
+            rule(
+                "05-enter",
+                Trigger::MwEveryBar,
+                FireMode::EveryBar,
+                Action::Enter,
+            ),
+            rule(
+                "pause-start-news1",
+                Trigger::TimeReached { at_epoch: pause_at },
+                FireMode::Once,
+                Action::Pause,
+            ),
+        ]);
+        let prior = seed_at(Phase::AwaitEntry, "2026-06-16T13:00:00Z");
+        let c = candle("2026-06-16T16:00:00Z", 1.0, 1.0, 1.0, 1.0);
+        let eval = run(&p, &prior, &[c]);
+        assert!(!eval.done, "a pause fire must not end the plan");
+        let ids: Vec<&str> = eval.fired.iter().map(|f| f.rule_id.as_str()).collect();
+        assert!(ids.contains(&"pause-start-news1"), "pause must fire");
+        assert!(ids.contains(&"05-enter"), "enter heartbeat still fires");
+    }
+
+    #[test]
+    fn pause_and_resume_fire_on_their_own_bars_and_dont_refire() {
+        // Resume comes a bar after pause. Each fires once on the first bar at or
+        // past its epoch; a re-tick of a later bar doesn't refire either.
+        let pause_at = ts("2026-06-16T15:00:00Z").timestamp();
+        let resume_at = ts("2026-06-16T16:00:00Z").timestamp();
+        let p = plan(vec![
+            rule(
+                "pause-start-news1",
+                Trigger::TimeReached { at_epoch: pause_at },
+                FireMode::Once,
+                Action::Pause,
+            ),
+            rule(
+                "pause-resume-news1",
+                Trigger::TimeReached {
+                    at_epoch: resume_at,
+                },
+                FireMode::Once,
+                Action::Resume,
+            ),
+        ]);
+        let prior = seed_at(Phase::AwaitEntry, "2026-06-16T13:00:00Z");
+        // Bar 1 (15:00): only pause fires.
+        let c1 = candle("2026-06-16T15:00:00Z", 1.0, 1.0, 1.0, 1.0);
+        let e1 = run(&p, &prior, &[c1]);
+        let ids1: Vec<&str> = e1.fired.iter().map(|f| f.rule_id.as_str()).collect();
+        assert_eq!(ids1, vec!["pause-start-news1"]);
+        // Bar 2 (16:00): only resume fires (pause already latched).
+        let c2 = candle("2026-06-16T16:00:00Z", 1.0, 1.0, 1.0, 1.0);
+        let e2 = run(&p, &e1.new_state, &[c2]);
+        let ids2: Vec<&str> = e2.fired.iter().map(|f| f.rule_id.as_str()).collect();
+        assert_eq!(ids2, vec!["pause-resume-news1"]);
+        // Bar 3: neither refires.
+        let c3 = candle("2026-06-16T17:00:00Z", 1.0, 1.0, 1.0, 1.0);
+        let e3 = run(&p, &e2.new_state, &[c3]);
+        assert!(e3.fired.is_empty(), "latched controls must not refire");
+    }
+
+    #[test]
+    fn multiple_news_windows_each_fire() {
+        // Two separate calendar events → two news-start + two news-end rules.
+        // Walking past all four epochs in one tick batch fires all four.
+        let p = plan(vec![
+            rule(
+                "news-start-evt1",
+                Trigger::TimeReached {
+                    at_epoch: ts("2026-06-16T10:00:00Z").timestamp(),
+                },
+                FireMode::Once,
+                Action::NewsStart,
+            ),
+            rule(
+                "news-end-evt1",
+                Trigger::TimeReached {
+                    at_epoch: ts("2026-06-16T11:00:00Z").timestamp(),
+                },
+                FireMode::Once,
+                Action::NewsEnd,
+            ),
+            rule(
+                "news-start-evt2",
+                Trigger::TimeReached {
+                    at_epoch: ts("2026-06-16T14:00:00Z").timestamp(),
+                },
+                FireMode::Once,
+                Action::NewsStart,
+            ),
+            rule(
+                "news-end-evt2",
+                Trigger::TimeReached {
+                    at_epoch: ts("2026-06-16T15:00:00Z").timestamp(),
+                },
+                FireMode::Once,
+                Action::NewsEnd,
+            ),
+        ]);
+        let prior = seed_at(Phase::AwaitEntry, "2026-06-16T09:00:00Z");
+        let candles: Vec<Candle> = [
+            "2026-06-16T10:00:00Z",
+            "2026-06-16T11:00:00Z",
+            "2026-06-16T14:00:00Z",
+            "2026-06-16T15:00:00Z",
+        ]
+        .iter()
+        .map(|t| candle(t, 1.0, 1.0, 1.0, 1.0))
+        .collect();
+        let eval = run(&p, &prior, &candles);
+        assert!(!eval.done);
+        let mut ids: Vec<&str> = eval.fired.iter().map(|f| f.rule_id.as_str()).collect();
+        ids.sort_unstable();
+        assert_eq!(
+            ids,
+            vec![
+                "news-end-evt1",
+                "news-end-evt2",
+                "news-start-evt1",
+                "news-start-evt2"
+            ]
+        );
+    }
+
+    #[test]
     fn rerun_same_candles_does_not_refire_a_latched_guard() {
         // Idempotency: a guard that already latched in state.fired doesn't fire
         // again on a re-tick of the same kind of bar.
@@ -1188,6 +1738,7 @@ mod tests {
                     price: 1.2000,
                 },
                 extend_forward: true,
+                bar_seconds: 3600,
                 dir: CrossDir::Down,
                 bar: BarEvent::OnClose,
             },
@@ -1327,6 +1878,7 @@ mod tests {
                 price: 1.25,
             },
             extend_forward: true,
+            bar_seconds: 3600,
             dir: CrossDir::Up,
             bar: BarEvent::Intrabar,
         };
@@ -1352,6 +1904,106 @@ mod tests {
         assert!(
             eval.fired.is_empty(),
             "entry blocked: no retest up-cross stamped"
+        );
+    }
+
+    // ===== PlanEval::is_noteworthy — the no-op-tick trim predicate =====
+    //
+    // These exercise the predicate against real `evaluate_plan` output so the
+    // watermark-only no-op (the critical case) is proven on the state the
+    // evaluator actually produces, not a hand-built one.
+
+    #[test]
+    fn noteworthy_when_an_intent_fired() {
+        // M/W heartbeat fires an enter every bar → always noteworthy.
+        let p = plan(vec![rule(
+            "05-enter",
+            Trigger::MwEveryBar,
+            FireMode::EveryBar,
+            Action::Enter,
+        )]);
+        let prior = seed_at(Phase::AwaitEntry, "2026-06-16T11:00:00Z");
+        let c = candle("2026-06-16T12:00:00Z", 1.0, 1.0, 1.0, 1.0);
+        let eval = run(&p, &prior, &[c]);
+        assert!(!eval.fired.is_empty());
+        assert!(eval.is_noteworthy(&prior), "a fired intent is noteworthy");
+    }
+
+    #[test]
+    fn noteworthy_when_plan_finished() {
+        // A trade-expiry guard fires and finishes the plan → noteworthy.
+        let expiry = ts("2026-06-16T15:00:00Z").timestamp();
+        let p = plan(vec![rule(
+            "02-veto-trade-expiry",
+            Trigger::TimeReached { at_epoch: expiry },
+            FireMode::Once,
+            Action::Veto,
+        )]);
+        let prior = seed_at(Phase::AwaitEntry, "2026-06-16T13:00:00Z");
+        let c = candle("2026-06-16T16:00:00Z", 1.0, 1.0, 1.0, 1.0);
+        let eval = run(&p, &prior, &[c]);
+        assert!(eval.done);
+        assert!(eval.is_noteworthy(&prior), "a finished plan is noteworthy");
+    }
+
+    #[test]
+    fn noteworthy_when_phase_advanced() {
+        // Break-and-close fires: phase AwaitBreakAndClose → AwaitEntry. Even
+        // though an intent also fired here, the phase advance alone is what makes
+        // a transition-only tick noteworthy.
+        let p = hs_plan();
+        let mut prior = seed_at(Phase::AwaitBreakAndClose, "2026-06-16T09:00:00Z");
+        prior
+            .last_close
+            .insert("03-prep-break-and-close".into(), 1.2050);
+        let c = candle("2026-06-16T10:00:00Z", 1.205, 1.205, 1.195, 1.1950);
+        let eval = run(&p, &prior, &[c]);
+        assert_eq!(eval.new_state.phase, Phase::AwaitEntry);
+        assert!(eval.new_state.advanced_vs(&prior), "phase moved");
+        assert!(eval.is_noteworthy(&prior));
+    }
+
+    #[test]
+    fn not_noteworthy_on_watermark_only_advance() {
+        // THE CRITICAL CASE. An H&S plan sitting in AwaitBreakAndClose; a new bar
+        // arrives that does NOT cross the neckline → nothing fires, no phase
+        // change, plan not done. The only things that moved are the watermark
+        // (to the new bar) and `last_close` (the OnClose rule's bookkeeping) —
+        // neither is a meaningful advance, so the tick is a no-op and must NOT be
+        // recorded.
+        let p = hs_plan();
+        let mut prior = seed_at(Phase::AwaitBreakAndClose, "2026-06-16T09:00:00Z");
+        // Prior close ABOVE the 1.2000 neckline; the new bar also stays above and
+        // closes above → no down-cross, nothing fires.
+        prior
+            .last_close
+            .insert("03-prep-break-and-close".into(), 1.2100);
+        let c = candle("2026-06-16T10:00:00Z", 1.21, 1.215, 1.205, 1.2090);
+        let eval = run(&p, &prior, &[c]);
+
+        assert!(eval.fired.is_empty(), "nothing fired");
+        assert!(!eval.done, "plan not done");
+        assert_eq!(
+            eval.new_state.phase,
+            Phase::AwaitBreakAndClose,
+            "phase unchanged"
+        );
+        // The watermark DID advance (proving the bar was processed)…
+        assert_eq!(
+            eval.new_state.watermark,
+            Some(ts("2026-06-16T10:00:00Z")),
+            "watermark advanced to the new bar"
+        );
+        // …yet the tick is a no-op: a full-struct compare would be true here
+        // (watermark + expires_at + last_close all moved), but is_noteworthy
+        // must return false.
+        assert_ne!(
+            eval.new_state, prior,
+            "full-struct compare IS different (watermark/expires_at/last_close moved)"
+        );
+        assert!(
+            !eval.is_noteworthy(&prior),
+            "a watermark-only advance must be a no-op — else the trim does nothing"
         );
     }
 }

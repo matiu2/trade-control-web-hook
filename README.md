@@ -72,6 +72,11 @@ Trading:
 - `plan-show` — read-only: dump one plan in full (every rule + its persisted
   `PlanState`). Target named by the intent's `trade_id`; the worker scans all
   account scopes. Drives `trade-control plan show <trade_id>`. KV-only.
+- `plan-delete` — drop a registered plan and its `PlanState` — the inverse of
+  `register`. Target named by the intent's `trade_id`; the worker scans all
+  account scopes and deletes the matching `plan:` + `plan-state:` rows. Drives
+  `trade-control plan delete <trade_id>`. KV-only, idempotent (deleting a
+  missing plan is a no-op). Use to re-arm a setup after editing its chart.
 - `unlock` — clear the cooldown for one instrument. Recovery for an
   `invalidate` you didn't mean to send.
 
@@ -970,8 +975,8 @@ every trading decision now happens once a trade runs as a registered
 the `req/`-reader never trips on it:
 
 **Object layout:** `ticks/<YYYY-MM-DD>/<tick_ts>-<trade_id>.json`. One object per
-`(tick, plan)` that evaluated; a single trade's whole life globs under its
-`trade_id`.
+**noteworthy** `(tick, plan)` that evaluated; a single trade's whole life globs
+under its `trade_id`.
 
 Each bundle carries the pure replay tuple `evaluate_plan` consumed — the
 `plan`, the prior `PlanState`, the `new_candles` + detector back-window, and the
@@ -983,11 +988,30 @@ binding. Both shadow (observe-only) and live ticks are recorded; a live tick's
 `dispatch_outcomes` carry each fire's broker result, while a shadow tick's is
 empty (it dispatches nothing).
 
-**Replaying a bundle.** The native CLI replays one offline:
+**No-op ticks are trimmed.** A tick that saw a new closed bar but where nothing
+fired, no phase/state advanced, and the plan isn't done (a "no-op" — common
+during an H&S plan's quiet wait for break-and-close) is **not** recorded: its
+fat bundle would re-store the whole plan, both states, and the wide detector
+window for zero new information. The engine instead emits a single heartbeat log
+line (`cron engine: plan <id> tick <now> no-op (…) — not recorded`) so the tick
+is still traceable and a gap in the `ticks/` stream is never mistaken for a
+stalled cron. The decision is the pure `PlanEval::is_noteworthy(&prior)` (a tick
+is noteworthy if it fired, finished, or advanced the FSM's meaningful state —
+ignoring the always-moving `watermark` / `expires_at` / `last_close`). KV state
+is still persisted every tick regardless; only the *recording* is trimmed.
+A **failed** plan-state transition is always recorded (it carries `success:false`
+a replay needs).
+
+**Replaying a bundle.** Replay lives in the **`trade-analyzer`** CLI (in the
+`trading-tax-tracker` repo), *not* in `trade-control` — that's the downstream
+R2-recording consumer, and keeping replay there gives it a single home next to
+the bundle/timeline tooling. It replays one bundle offline, either from a local
+file or fetched straight from R2 by object key:
 
 ```sh
-trade-control replay <bundle.json>              # diff the pure evaluation
-trade-control replay --simulate <bundle.json>   # + simulate each enter's fill/exit
+trade-analyzer replay <bundle.json>                       # local file
+trade-analyzer replay --from-r2 ticks/<date>/<...>.json   # fetch from R2
+trade-analyzer replay --simulate <bundle.json>            # + simulate each enter's fill/exit
 ```
 
 `replay` re-runs the *same* `evaluate_plan` on the recorded inputs and diffs the
@@ -1747,6 +1771,21 @@ the engine is proven on demo (Stage F retires the alerts).
 > proven setup to live. (Field: `TradePlan.shadow`, `#[serde(default)]` → live
 > for plans registered before the flag existed.)
 
+**Calendar / news bars are folded into the plan too.** A registered plan
+carries not just the trade's own conditions but the **pause/resume** (blackout)
+and **news-start/news-end** (news-window) control bars — both the operator's
+chart-drawn pairs and the auto-fetched forex-factory events (the same bars the
+`--create-alerts` path POSTs as TV alerts). Each becomes a `TimeReached` rule
+carrying the matching `pause` / `resume` / `news-start` / `news-end` intent and
+firing at the window edge; the engine fires them **non-terminally** (they set
+the blackout / news-window KV state without ending the trade's spine) and the
+cron dispatches them through the same handlers the webhook uses. In `--shadow`
+they're logged, not applied, like every other fire. (Before this, a
+`--register-plan` produced a plan with *no* calendar bars — the register POST
+ran before the bundles were built; fixed in Stage E.10 / v37.) The folding lives
+in `append_control_rules` (`tv-arm/src/trade_plan_build.rs`); the non-terminal
+evaluation is `evaluate_controls` (`engine/src/evaluate.rs`).
+
 The plan builder
 is `tv-arm/src/trade_plan_build.rs` (the inverse of `alert_spec.rs`); the
 `TradePlan` / `Trigger` model lives in `core/src/trade_plan.rs`; per-trade
@@ -1754,17 +1793,44 @@ engine state is `core/src/plan_state.rs`; the FSM evaluator is
 `engine/src/evaluate.rs`; the candle-pattern detector port is
 `core/src/signals.rs`.
 
-#### Inspecting registered plans (`trade-control plan list` / `show`)
+#### Re-arming an existing setup (`--update`)
 
-Two read-only queries let you see what the engine is evaluating — useful
-during the parallel-run period to confirm a plan registered, whether it's in
-shadow mode, and how far its FSM has progressed:
+`tv-arm` mints a **fresh random `trade_id` every run**, so the engine treats
+each re-arm as a brand-new plan — and the *old* plan keeps ticking in KV until
+its TTL lapses. When you move annotations on the chart and re-run, pass
+`--update` (only meaningful alongside `--register-plan`) so the prior plan is
+deleted from the engine first:
 
 ```sh
-trade-control-dev plan list              # compact table of every plan + state
-trade-control-dev plan list --yaml       # raw worker YAML (one entry per plan)
-trade-control-dev plan show eurusd-hs-7  # full dump of one plan + its state
+# Auto-resolve by instrument: deletes the one existing plan on this instrument,
+# then registers the fresh one. Hard-errors if more than one plan is registered
+# for the instrument (re-run with the explicit id from `plan list`).
+tv-arm-staging --register-plan --update ...
+
+# Explicit: delete exactly this prior trade_id, then register fresh.
+tv-arm-staging --register-plan --update hs-eurusd-a3f9c1d2 ...
+```
+
+`--update` reconciles **only the server-side engine plan** (it POSTs
+`plan-list` to find the target, then a signed `plan-delete` that clears the
+plan's `plan:` + `plan-state:` KV — see `plan delete` below). It does **not**
+touch TradingView alerts; keep deleting/recreating those by hand (or via
+`--create-alerts`) as before. A bare `--update` with no plan registered for the
+instrument is a logged no-op. The resolution logic is the pure
+`resolve_update_target` (`tv-arm/src/pipeline.rs`), unit-tested.
+
+#### Inspecting / managing registered plans (`trade-control plan list` / `show` / `delete`)
+
+Three subcommands let you see and manage what the engine is evaluating —
+useful during the parallel-run period to confirm a plan registered, whether
+it's in shadow mode, and how far its FSM has progressed:
+
+```sh
+trade-control-dev plan list                # compact table of every plan + state
+trade-control-dev plan list --yaml         # raw worker YAML (one entry per plan)
+trade-control-dev plan show eurusd-hs-7    # full dump of one plan + its state
 trade-control-dev plan show eurusd-hs-7 --yaml
+trade-control-dev plan delete eurusd-hs-7  # drop a plan so the setup can be re-armed
 ```
 
 `plan list` shows `TRADE_ID`, `ACCOUNT`, `INSTRUMENT`, `SHADOW`, `PHASE`,
@@ -1773,9 +1839,19 @@ trade-control-dev plan show eurusd-hs-7 --yaml
 state row, so a freshly-registered plan lists with empty state until the next
 `*/15` tick. `plan show <trade_id>` scans every account scope for that id and
 dumps the whole `TradePlan` (every rule + embedded intent) plus the persisted
-`PlanState`. Both are KV-only control actions (`plan-list` / `plan-show`),
-signed like `status`, hitting the baked endpoint with no extra flag. A `plan
-show` for an unknown id exits non-zero with `no registered plan with trade_id …`.
+`PlanState`. `plan list` / `plan show` are read-only KV-only control actions
+(`plan-list` / `plan-show`), signed like `status`, hitting the baked endpoint
+with no extra flag. A `plan show` for an unknown id exits non-zero with `no
+registered plan with trade_id …`.
+
+`plan delete <trade_id>` is the inverse of `register`: it scans every account
+scope and drops the matching `plan:` and `plan-state:` rows, so the engine
+stops evaluating that plan. It's KV-only and **idempotent** — deleting a plan
+that doesn't exist returns `ok` (reported as a no-op), so re-running is safe.
+The intended workflow: `tv-arm` registers a plan and draws its news/blackout
+lines on the chart; if you tweak or remove some of those lines, run `plan
+delete <trade_id>` to wipe the stale server plan, then re-run `tv-arm` to
+register the corrected one.
 
 Skipped preps are pre-fired directly to the worker so the entry's
 `requires_preps:` gate is still satisfied — useful when joining a setup
@@ -1790,6 +1866,30 @@ where those preps don't apply.
   crosses the neckline *after* the drawn anchor segment never fires. The
   drawing-level `extendRight` property does *not* propagate to the alert
   payload; we override unconditionally for trendline tools.
+- **The engine interpolates trendlines in bar-index space, not
+  wall-clock.** TradingView's x-axis is *ordinal*: closed sessions (nights,
+  weekends, holidays) aren't plotted, so a neckline advances one step **per
+  traded bar**, not per elapsed second. The server-side engine matches this
+  — it counts the actual bars present in the broker candle feed between the
+  two anchors (the feed elides closed sessions, confirmed on ALPHABET: an
+  18 h overnight gap and a 66 h weekend gap each collapse to a single bar
+  step). `tv-arm` bakes the chart's bar duration onto each `TrendlineCross`
+  as a signed `bar_seconds`, used only as a fallback divisor when an anchor
+  predates the engine's fetched candle window. A naive wall-clock
+  interpolation would slide the break-and-close / retest level badly wrong
+  on any gapped instrument (everything but 24/5 FX — and even FX gaps at the
+  weekend). No market-hours table is needed: the candle feed *is* the
+  ordinal axis. The engine **fetches its detector window back to the earliest
+  trendline anchor** (`detector_window_for`), so every anchor lands in-window
+  and the bar-index count is exact — the `bar_seconds` fallback is dead code
+  for a normally-armed plan. It survives only as a belt-and-braces path for a
+  pathological anchor older than the fetch could reach, and *that* path is
+  **observable**: the engine attaches a warning to its `PlanEval` and the cron
+  wrapper `rlog!`s it (`cron engine: plan <id> trendline …`) — a soft note when
+  `bar_seconds` extrapolates across a gap, a hard one when a pre-`bar_seconds`
+  plan (`bar_seconds = 0`) makes the trendline silently un-evaluable. If you
+  ever see one, the anchor predates the fetch window — widen it, don't trust
+  the extrapolation.
 - **Chart-side `_alertId` binding is cosmetic.** The "link icon" on a
   drawing comes from a separate client-side binding that TV's GUI sets
   via `LineDataSource.setAlert()`. Programmatic creates can't easily

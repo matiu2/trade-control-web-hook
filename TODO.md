@@ -397,6 +397,138 @@ Visibility for the parallel-run period: see what the engine is evaluating.
       README + CHANGELOG (v32). Also folded in the stale market-info
       `cli/src/lib.rs` fmt diff.
 
+### Stage E.7 — trendline crosses in bar-index space, not wall-clock (DONE — all green)
+
+Bug: `line_price_at` interpolated a neckline's level by **wall-clock seconds**
+between the two anchors, so the line kept sloping through nights, weekends and
+exchange closures. TradingView's x-axis is an **ordinal bar index** — closed
+bars (market shut) aren't plotted, so a trendline advances one step *per traded
+bar*, not per elapsed minute. For any gapped instrument (everything but 24/5 FX,
+and even FX has the weekend gap) the engine resolved the break-and-close / retest
+level at the wrong price. Decisions (user): bake per-bar geometry at **arm
+time**; treat the **broker candle feed as the source of truth** for which bars
+exist (no market-hours table, no DST math — gaps are already absent from the
+feed). Stays entirely off the other LLM's market-hours / KV-window worktree.
+
+- [x] BX1 — `core`: signed `bar_seconds: i64` on `Trigger::TrendlineCross`
+      (`#[serde(default)]` back-compat); `tv-arm` bakes `granularity.seconds()`.
+- [x] BX2 — `engine`: `line_price_at` interpolates in bar-index counted from the
+      broker window (`detector_window`, gaps absent) via new `bar_index_at`;
+      `bar_seconds` is the fallback divisor only when an anchor predates the
+      window. Table tests: a session gap (23 h between bar 1 and 2) does NOT
+      slide the line; reworked extend_forward test onto a real bar window.
+- [x] BX3 — verified (workspace green / clippy / fmt / wasm32), README trendline
+      gotcha note, CHANGELOG v34, validated on live ALPHABET feed before coding.
+
+### Stage E.8 — make the `bar_seconds` fallback observable (DONE — all green)
+
+The v34 `bar_seconds` divisor is a correct-but-silent fallback for an anchor
+outside the fetched window: it re-introduces wall-clock spacing across any gap
+in the un-fetched span, and on a pre-`bar_seconds` plan (`bar_seconds = 0`) it
+makes the trendline silently un-evaluable. Hardening = surface it, don't change
+the geometry. The pure evaluator can't log (no `rlog!` in the `engine` crate), so
+it returns warnings the wrapper logs.
+
+- [x] BH1 — `engine`: pure `trendline_anchor_warnings(plan, window)` classifies
+      each anchor (in-window / extrapolated / unresolvable); `evaluate_plan`
+      attaches them to new `PlanEval.warnings` (`core`, `#[serde(default)]`).
+      Six tests incl. end-to-end surfacing + the `bar_seconds = 0` non-fire case.
+- [x] BH2 — worker: `run_engine_tick` `rlog!`s each warning so the degraded path
+      is visible in CF logs; logged for live + shadow plans, before dispatch.
+- [x] BH3 — verified (workspace green / clippy / fmt / wasm32), README fallback
+      note, CHANGELOG v35. Follow-up: widen `detector_window_for` so anchors are
+      always in-window (retires the fallback) — deferred until logs show it.
+
+### Stage E.9 — widen detector window to the earliest trendline anchor (DONE — all green)
+
+The real fix behind E.8's observability: stop the `bar_seconds` fallback from
+firing at all on a normally-armed plan by fetching enough history that every
+trendline anchor is in-window (then the bar-index count is exact).
+
+- [x] RF1 — worker: `detector_window_for` fetches back to the earliest `since`
+      any consumer needs — the Pine `min_lookback_bars` **and** the earliest
+      `TrendlineCross` anchor (minus one bar slack). Pure helpers
+      `pine_lookback_since` / `trendline_anchor_since` (+ free
+      `earliest_trendline_anchor_epoch(triggers)`), three unit tests. Pure-M/W
+      plans keep the `fresh`-only fast path. README + CHANGELOG v36. The v35
+      warning surface stays as belt-and-braces for a pathological out-of-reach
+      anchor.
+
+### Stage E.10 — fold calendar/news bars into the registered plan (DONE — all green)
+
+Bug (operator, 2026-06-18): `tv-arm --register-plan` produced a server-side
+`TradePlan` with **no** pause/resume/news-start/news-end rules, while
+`--create-alerts` correctly created those calendar bars as TV alerts. Root
+cause: `register_trade_plan` runs at pipeline step 5b — *before* the
+pause/news/calendar bundles are built (steps 6–8) — and `build_trade_plan`
+only walks `built_trade.alerts` (veto/prep/enter/close). The auxiliary bundles
+never reach the plan. Two more gaps compound it: the engine has no evaluation
+path for control rules, and the cron dispatcher rejects their actions.
+
+Decisions (locked with user): suppress control fires in `--shadow` (consistent
+with shadow = never touch live KV); reuse the in-memory `BuiltPause`/`BuiltNews`
+bundles as the intent source for the plan (no YAML re-parse).
+
+#### Commit 1 — engine: evaluate non-terminal control rules (DONE — all green)
+- [x] `is_control_rule()` in `engine/src/evaluate.rs` (Pause/Resume/NewsStart/
+      NewsEnd actions). `is_guard` unchanged.
+- [x] `evaluate_controls`: always-armed, **non-terminal** pass in
+      `evaluate_plan` (runs before guards), firing control rules on their
+      `TimeReached` trigger: push intent + latch via `state.fired`, no
+      `Phase::Done`.
+- [x] 3 tests: pause fires at its epoch without ending the spine (enter
+      heartbeat still fires same bar); pause+resume fire on own bars + don't
+      refire; two news windows all four fire. engine 35 green; clippy; fmt.
+
+#### Commit 2 — worker cron dispatch (DONE — all green)
+- [x] Routed Pause/Resume/NewsStart/NewsEnd in `dispatch_action`
+      (`src/cron/engine.rs`) to the existing `handle_pause`/`handle_resume`/
+      `handle_news_start`/`handle_news_end` via `control_result`; replaced the
+      `other =>` unsupported-action arm (now only Status/Unlock/Clear*/Register/
+      PrepExpire/MarketInfo/Plan*).
+- [x] Confirmed `tick_one`'s shadow path (`log_shadow_fire` loop, returns before
+      dispatch) already suppresses these in shadow — no extra work (decision #1).
+- [x] No native unit test: `dispatch_action` is async + wasm-bound (`Env` /
+      `worker::Response`), same constraint the C3/C4 parity note records —
+      verified by worker compiling (native 200 tests + wasm32 clippy) and the
+      demo parallel run (Stage F gate). The pure fire/latch logic is the
+      Commit-1 native test.
+
+#### Commit 3 — tv-arm: fold bundles into the registered plan (DONE — all green)
+- [x] `cli::run_calendar_bars` returns `Vec<BuiltCalendarBundle>` (in-memory
+      `BuiltPause`/`BuiltNews`); standalone bin ignores it.
+- [x] `register_trade_plan` moved to after the bundles are built (step 8b,
+      before the `--create-alerts` gate); takes pause/news/calendar bundles.
+- [x] `append_control_rules` (`trade_plan_build.rs`) → one `TimeReached`
+      `ConditionRule` per bundle alert (`WindowAlert` trait unifies
+      `BuiltPauseAlert`/`BuiltNewsAlert`), carrying the embedded `Intent`,
+      anchored to start/end edge. Dropped the dead `roles.*_pairs.first()` arms
+      in `trigger_for`.
+- [x] Test: chart pause + news + calendar event → 8 control rules, right
+      actions + window-edge epochs. tv-arm 153 green.
+
+#### Throughout (DONE)
+- [x] README ("Calendar / news bars folded into the plan too") + CHANGELOG v37
+      (renumbered — main took v35/v36 while this branch was open).
+- [x] clippy + fmt + tests green per crate; one commit per layer, pushed.
+
+### Stage E.11 — `tv-arm --update`: re-arm an existing engine plan (DONE — all green)
+
+Operator re-arm flow (move annotations, re-run) had no engine-side equivalent:
+tv-arm mints a fresh random trade_id each run, so the old registered plan kept
+ticking in KV until TTL. `plan delete` already landed on main (clears `plan:` +
+`plan-state:`); `--update` drives it from the arm path.
+
+- [x] `--update [trade-id]` flag (args.rs, `num_args=0..=1`, only with
+      `--register-plan`). Bare → auto-resolve by instrument (one → delete; none
+      → no-op; many → hard error w/ candidate ids); `<id>` → delete that.
+- [x] `resolve_update_target` pure helper (pipeline.rs) + 5 unit tests.
+- [x] `update_existing_plan`: POST `plan-list`, resolve, POST signed
+      `plan-delete`; `post_intent_blocking` (returns body) added to register_post,
+      `post_register_blocking` wraps it. Leaves TV alerts untouched.
+- [x] README ("Re-arming an existing setup") + CHANGELOG v38. tv-arm 158 green;
+      clippy + fmt.
+
 ### Stage F — retire the webhook (PENDING)
 ### Stage G — Durable Object websocket (only if demo proves a need) (PENDING)
 
@@ -1725,3 +1857,24 @@ When this lands, the CLI gains a third subcommand `list-setups` — show all set
 `oanda-client` with a `BidAskDataSource: Send` regression — pre-existing,
 not introduced by anything in this repo. Needs an upstream fix in
 oanda-client before `wrangler deploy` will work again.
+
+---
+
+## TASK — `trade-control plan delete <plan-id>`
+
+Use case: re-plan a trade. `tv-arm` registers a server `TradePlan`; operator
+tweaks/deletes news lines in TradingView, then wants to wipe the server plan
+and re-arm. `plan delete` is the inverse of `register` — drops both the
+`plan:` row and its `plan-state:` row across every account scope (mirrors
+`plan show`'s all-scope scan). Idempotent: deleting a missing plan is a no-op.
+
+- [x] `core/src/intent.rs` — add `Action::PlanDelete` (kebab → `plan-delete`) + doc.
+- [x] `core/src/intent.rs` — `validate()` requires `trade_id` for `PlanDelete`; test.
+- [x] `cli/src/control.rs` — `build_plan_delete_intent(trade_id, now, suffix)`.
+- [x] `cli/src/lib.rs` — re-export it.
+- [x] `cli/src/bin/trade_control.rs` — `PlanCmd::Delete(PlanDeleteArgs)` + `run_plan_delete`.
+- [x] `cli/src/prompts.rs` — `PlanDelete` arm in `required_for_action`.
+- [x] `src/lib.rs` — dispatch + KV-only unreachable arm + `handle_plan_delete` (all-scope).
+- [x] README — document `plan delete`.
+- [x] workspace `cargo test` / clippy / fmt all green (incl. wasm `check`/`clippy`).
+- [ ] commit + push.

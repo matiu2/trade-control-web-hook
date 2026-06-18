@@ -148,6 +148,15 @@ async fn tick_one(
 
     let eval = evaluate_plan(plan, &prior, &fresh, &detector_window, now, expires_at);
 
+    // Surface any trendline out-of-window anchor diagnostics the pure evaluator
+    // can't log itself. An out-of-window anchor falls back to the `bar_seconds`
+    // divisor (wall-clock spacing across any gap in the un-fetched span) or, on
+    // a pre-`bar_seconds` plan, silently can't fire — both rare, neither should
+    // be invisible. Logged here (not in the engine crate, which has no rlog!).
+    for w in &eval.warnings {
+        rlog!("cron engine: plan {} {}", plan.trade_id, w);
+    }
+
     // Persist the advanced state (or clear it + the plan when the spine is
     // done) before dispatching, so a dispatch failure can't replay a fired bar.
     // Capture the transition (before/after/success/error) for the tick-bundle.
@@ -164,6 +173,14 @@ async fn tick_one(
     if plan.shadow {
         for fired in &eval.fired {
             log_shadow_fire(&plan.trade_id, fired);
+        }
+        // A shadow no-op is as information-free as a live one (it still never
+        // touches the broker), so it's trimmed identically — the diff against
+        // the live TV alert only cares about ticks where something fired or the
+        // FSM moved, and those are exactly the noteworthy ones.
+        if !eval.is_noteworthy(&prior) {
+            log_noop_tick(plan, &eval, now);
+            return Ok(());
         }
         let bundle = build_tick_bundle(
             stored,
@@ -208,6 +225,18 @@ async fn tick_one(
             outcome,
             seq: seq as u32,
         });
+    }
+
+    // Trim no-op ticks: a new bar arrived but nothing fired, no phase/state
+    // advance, plan not done, KV write succeeded. The fat bundle (whole plan +
+    // both states + wide detector window) carries no information for such a
+    // tick, so emit a lightweight heartbeat instead and skip the R2 write. A
+    // noteworthy tick (something fired / finished / advanced) still records in
+    // full. (A no-op has an empty `fired`, so `dispatch_outcomes` is empty here
+    // too — nothing was dispatched.)
+    if !eval.is_noteworthy(&prior) {
+        log_noop_tick(plan, &eval, now);
+        return Ok(());
     }
 
     let bundle = build_tick_bundle(
@@ -343,6 +372,27 @@ fn log_shadow_fire(trade_id: &str, fired: &trade_control_engine::FiredIntent) {
     );
 }
 
+/// Emit the lightweight heartbeat for a trimmed no-op tick.
+///
+/// A no-op tick saw a new closed bar but nothing fired and the FSM didn't
+/// advance, so its fat [`TickBundle`] is skipped (see [`PlanEval::is_noteworthy`]).
+/// This single line keeps the tick traceable in Cloudflare logs, so a silent
+/// gap in the `ticks/` R2 stream is never mistaken for "the cron stopped
+/// running". `new_state.watermark` is the new bar's open-time the tick processed.
+fn log_noop_tick(
+    plan: &trade_control_core::trade_plan::TradePlan,
+    eval: &PlanEval,
+    now: DateTime<Utc>,
+) {
+    rlog!(
+        "cron engine: plan {} tick {} no-op (new bar {:?}, nothing fired/advanced, phase {:?}) — not recorded",
+        plan.trade_id,
+        now,
+        eval.new_state.watermark,
+        eval.new_state.phase,
+    );
+}
+
 /// First-tick seed: fetch a back-window, seed the state without firing, persist.
 async fn seed_first_tick(
     store: &KvStateStore,
@@ -389,35 +439,43 @@ async fn fetch_candles(
     }
 }
 
-/// Build the detector back-window for a plan's `PinePattern` entry. For a plan
-/// with no Pine entry rule (M/W, pure-trendline H&S preps) the window is unused,
-/// so we skip the extra fetch and return `fresh.to_vec()` — every new candle is
-/// still present (the only contract the evaluator needs).
+/// Build the detector back-window for a plan.
 ///
-/// When a Pine entry is present, the detector needs `min_lookback_bars` of
-/// history behind the earliest fresh candle to recompute the latch (pattern
-/// depth + confirm window + SL lookback). We fetch from there to `now` and merge
-/// so the window is ascending and contains the fresh candles.
+/// The window must reach back far enough to cover **both** consumers that need
+/// history beyond the watermark-bounded `fresh` slice:
+///
+/// 1. A `PinePattern` entry (H&S) — the detector needs `min_lookback_bars` of
+///    history behind the earliest fresh candle to recompute the latch (pattern
+///    depth + confirm window + SL lookback).
+/// 2. A `TrendlineCross` (break-and-close / retest necklines) — the engine
+///    resolves the line's level in **bar-index** space by counting bars between
+///    its two anchors. If an anchor predates the window, that count falls back
+///    to the `bar_seconds` wall-clock divisor (which mis-counts across gaps) or,
+///    on a pre-`bar_seconds` plan, can't resolve at all. Fetching back to the
+///    **earliest anchor** keeps every anchor in-window, so the fallback never
+///    fires for a normally-armed plan.
+///
+/// We take the earliest `since` either consumer asks for and fetch once. A plan
+/// with neither (a pure M/W heartbeat) keeps the `fresh`-only fast path — no
+/// extra fetch, every new candle already present (the only contract the
+/// evaluator needs).
 async fn detector_window_for(
     broker: &BrokerHandle,
     plan: &trade_control_core::trade_plan::TradePlan,
     fresh: &[Candle],
     now: DateTime<Utc>,
 ) -> Result<Vec<Candle>, String> {
-    use trade_control_core::signals::{DetectorConfig, min_lookback_bars};
-    use trade_control_core::trade_plan::Trigger;
+    let earliest_fresh = fresh.iter().map(|c| c.time).min().unwrap_or(now);
+    let pine_since = pine_lookback_since(plan, earliest_fresh);
+    let anchor_since = trendline_anchor_since(plan);
 
-    let has_pine = plan.rules.iter().any(|r| {
-        r.intent.action == Action::Enter && matches!(r.trigger, Trigger::PinePattern { .. })
-    });
-    if !has_pine {
+    // The window start is the earliest any consumer needs. `None` from both ⇒
+    // no history fetch required; `fresh` already satisfies the evaluator.
+    let since = [pine_since, anchor_since].into_iter().flatten().min();
+    let Some(since) = since else {
         return Ok(fresh.to_vec());
-    }
+    };
 
-    let cfg = DetectorConfig::pine_defaults(plan.granularity);
-    let lookback = min_lookback_bars(&cfg) as i64;
-    let earliest = fresh.iter().map(|c| c.time).min().unwrap_or(now);
-    let since = earliest - chrono::Duration::seconds(plan.granularity.seconds() * lookback);
     let window = fetch_candles(broker, &plan.instrument, plan.granularity, since, now).await?;
 
     // Merge fetched history with `fresh` and dedup by open-time so every new
@@ -431,6 +489,55 @@ async fn detector_window_for(
     }
     merged.sort_by_key(|c| c.time);
     Ok(merged)
+}
+
+/// The fetch start a `PinePattern` entry needs: `min_lookback_bars` of history
+/// behind the earliest fresh candle. `None` when the plan has no Pine entry.
+fn pine_lookback_since(
+    plan: &trade_control_core::trade_plan::TradePlan,
+    earliest_fresh: DateTime<Utc>,
+) -> Option<DateTime<Utc>> {
+    use trade_control_core::signals::{DetectorConfig, min_lookback_bars};
+    use trade_control_core::trade_plan::Trigger;
+
+    let has_pine = plan.rules.iter().any(|r| {
+        r.intent.action == Action::Enter && matches!(r.trigger, Trigger::PinePattern { .. })
+    });
+    if !has_pine {
+        return None;
+    }
+    let cfg = DetectorConfig::pine_defaults(plan.granularity);
+    let lookback = min_lookback_bars(&cfg) as i64;
+    Some(earliest_fresh - chrono::Duration::seconds(plan.granularity.seconds() * lookback))
+}
+
+/// The fetch start the plan's trendlines need: the earliest anchor epoch across
+/// every `TrendlineCross` rule, minus one bar of slack so the anchor's own bar
+/// is comfortably inside the fetched window (the exact-match path in
+/// `bar_index_at` wants the anchor bar present). `None` when the plan has no
+/// trendline rule.
+fn trendline_anchor_since(
+    plan: &trade_control_core::trade_plan::TradePlan,
+) -> Option<DateTime<Utc>> {
+    let earliest_anchor = earliest_trendline_anchor_epoch(plan.rules.iter().map(|r| &r.trigger))?;
+    // One bar of slack before the anchor.
+    let slack = plan.granularity.seconds();
+    DateTime::from_timestamp(earliest_anchor - slack, 0)
+}
+
+/// The earliest anchor epoch across every `TrendlineCross` trigger in the
+/// sequence, or `None` if there are no trendline triggers. Pulled out as a free
+/// function over triggers so it can be unit-tested without building `Intent`s.
+fn earliest_trendline_anchor_epoch<'a>(
+    triggers: impl Iterator<Item = &'a trade_control_core::trade_plan::Trigger>,
+) -> Option<i64> {
+    use trade_control_core::trade_plan::Trigger;
+    triggers
+        .filter_map(|t| match t {
+            Trigger::TrendlineCross { a, b, .. } => Some(a.at_epoch.min(b.at_epoch)),
+            _ => None,
+        })
+        .min()
 }
 
 /// Dispatch one fired intent through the same handlers the webhook uses, then
@@ -506,10 +613,29 @@ async fn dispatch_action<B: Broker>(
             }
         }
         Action::Prep => control_result(crate::handle_prep(store, verified, now).await, "prepped"),
+        // Calendar/news control rules: a plan folds in pause/resume (blackout
+        // window) and news-start/news-end (news window) as TimeReached rules.
+        // They set KV state only (no broker), exactly as the matching TV alert
+        // message would have. Route to the same handlers the webhook uses.
+        Action::Pause => {
+            control_result(crate::handle_pause(store, verified, now).await, "pause-set")
+        }
+        Action::Resume => control_result(
+            crate::handle_resume(store, verified, now).await,
+            "pause-cleared",
+        ),
+        Action::NewsStart => control_result(
+            crate::handle_news_start(store, verified, now).await,
+            "news-window-open",
+        ),
+        Action::NewsEnd => control_result(
+            crate::handle_news_end(store, verified, now).await,
+            "news-window-closed",
+        ),
         other => {
-            // Status / Unlock / Clear* / Pause / Resume / News* / Register /
-            // PrepExpire are operator/control actions a plan never embeds as a
-            // fired rule. Treat as a no-op rejection so it's visible but inert.
+            // Status / Unlock / Clear* / Register / PrepExpire / MarketInfo /
+            // Plan* are operator/control actions a plan never embeds as a fired
+            // rule. Treat as a no-op rejection so it's visible but inert.
             ActionResult::Rejected {
                 response: worker::Response::error("engine: unsupported fired action", 400),
                 outcome: format!("rejected: unsupported-action {other:?}"),
@@ -600,5 +726,53 @@ mod tests {
     fn plan_state_expires_at_is_a_day_out() {
         let now = ts("2026-06-17T20:00:00Z");
         assert_eq!(plan_state_expires_at(now), ts("2026-06-18T20:00:00Z"));
+    }
+
+    // ===== detector_window widening for trendline anchors =====
+
+    use trade_control_core::trade_plan::{BarEvent, CrossDir, LinePoint, Trigger};
+
+    fn trendline(a_epoch: i64, b_epoch: i64) -> Trigger {
+        Trigger::TrendlineCross {
+            a: LinePoint {
+                at_epoch: a_epoch,
+                price: 1.0,
+            },
+            b: LinePoint {
+                at_epoch: b_epoch,
+                price: 1.0,
+            },
+            extend_forward: true,
+            bar_seconds: 3600,
+            dir: CrossDir::Down,
+            bar: BarEvent::OnClose,
+        }
+    }
+
+    #[test]
+    fn earliest_anchor_is_min_across_all_trendline_rules() {
+        // Two trendlines; the break-and-close anchor `a` (epoch 100) is the
+        // earliest of all four anchors → that's what the window must reach.
+        let triggers = [
+            trendline(100, 500),
+            trendline(300, 900),
+            Trigger::MwEveryBar, // ignored
+        ];
+        assert_eq!(earliest_trendline_anchor_epoch(triggers.iter()), Some(100));
+    }
+
+    #[test]
+    fn earliest_anchor_is_none_without_a_trendline() {
+        // Pure M/W (+ a time veto) has no trendline → no anchor-driven fetch.
+        let triggers = [Trigger::MwEveryBar, Trigger::TimeReached { at_epoch: 999 }];
+        assert_eq!(earliest_trendline_anchor_epoch(triggers.iter()), None);
+    }
+
+    #[test]
+    fn earliest_anchor_handles_reversed_endpoints() {
+        // `b` earlier than `a` (anchors aren't required to be time-ordered) — the
+        // min of the pair is still picked.
+        let triggers = [trendline(800, 200)];
+        assert_eq!(earliest_trendline_anchor_epoch(triggers.iter()), Some(200));
     }
 }
