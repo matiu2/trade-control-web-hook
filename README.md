@@ -481,7 +481,10 @@ in two places against the same fixed constant
 
 - **At fire time (worker)** — every `enter` samples the live spread
   (`get_quote`) and rejects with **HTTP 422 / `rejected:
-  sl-below-10x-spread`** if `sl_distance < 10 × spread`. Like the other
+  sl-below-10x-spread`** if `sl_distance < 10 × spread`. The response body
+  names the offending distances in pips, e.g. `entry blocked: SL <= 10x
+  spread: SL distance 8.0 pips; spread = 1.0 pips` (pips are
+  `distance / pip_size` using the intent's baked `pip_size`). Like the other
   entry gates this is a non-poisoning reject (the id can refire once the
   spread tightens), and it **fails open** on a quote-fetch error so a
   transient broker hiccup never strands a real entry.
