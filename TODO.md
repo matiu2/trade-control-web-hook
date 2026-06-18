@@ -1,5 +1,49 @@
 # TODO
 
+## ACTIVE — `on_too_close: limit` recovery (branch: feat/on-too-close-limit)
+
+Step 4 of `BUG-entry-too-close-to-market.md`. Today `OnTooCloseAction::Limit`
+degrades to `Skip {reason: "too-close-limit-unimplemented"}`. Implement it: a
+`#19-10` rejection on a stop whose fallback is `limit` re-places **one** limit
+order at the original trigger price, and lets it rest until the alert-window /
+`expiry_bars` cron sweep cancels it.
+
+### Findings (settled before coding)
+- **No broker-native GTD needed.** TradeNation order placement is hardcoded
+  GoodTillCancel upstream (`orderTypeID: 2`, `tradenation-api/src/orders.rs`) —
+  can't set per-order expiry there without an unverified upstream API change.
+  Not necessary: the recovered limit is recorded as a normal `EntryAttempt` via
+  the existing `Ok`-arm `record_placement(.., cancel_at)`, so `src/cron/sweep.rs`
+  cancels it on `attempt_expired` (`not_after`) or `bar_expiry_due` (`cancel_at`).
+  **The sweep IS the TTL** — limit reuses the alert window automatically.
+- **Both brokers already place `ResolvedEntry::Limit`** (OANDA limit order, TN
+  `place_limit_order_named`). No broker change — the fallback just builds a
+  `ResolvedEntry::Limit` request, same as `market` builds `ResolvedEntry::Market`.
+- **One attempt, not a loop** — identical rule to `market`. Place once; broker
+  reject → return original `EntryTooCloseToMarket` (seen-id un-poisoned).
+- **Geometry guard.** A long limit must sit at/below current price (short:
+  at/above) or it's a `#19-9`. In a genuine `#19-10` the price overran the stop
+  trigger so the original trigger IS the correct side — but validate in the pure
+  planner and `Skip {reason: "too-close-limit-wrong-side"}` if not.
+- **No slippage cap for limit** — a limit can't fill worse than its price, so
+  `max_slippage_pips` stays `market`-only. R is preserved exactly.
+
+### Steps
+- [x] 1. `src/too_close.rs`: added `TooClosePlan::Limit { trigger_price }`;
+      `OnTooCloseAction::Limit` routes through a geometry guard → Limit or Skip
+      (`too-close-limit-wrong-side` / `too-close-price-unavailable`). 6 new tests.
+- [x] 2. `src/lib.rs` `place_entry_too_close_fallback`: `Limit` arm builds an
+      `EntryRequest` with `ResolvedEntry::Limit`, places once, surfaces the
+      original error on failure. Doc comment updated.
+- [x] 3. README (`on_too_close` `limit` now implemented) + CHANGELOG v42.
+- [x] 4. core 547 / worker 219 green; clippy native+wasm clean; fmt; workspace
+      check clean. Commit + push next.
+
+DONE — green. Dev worktree, NOT deployed. Parent-pointer bump is a merge-to-main
+step (this is a feature branch).
+
+---
+
 ## ACTIVE — archive terminal plans (branch: feat/archive-terminal-plans)
 
 Vetoed/completed plans get deleted on the terminal cron tick

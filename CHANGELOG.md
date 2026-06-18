@@ -1,5 +1,65 @@
 # Changelog
 
+## v42 — 2026-06-19 — `on_too_close: limit` recovery (Step 4 of the too-close fallback)
+
+### Why
+
+The `on_too_close` stop-entry fallback (v17) shipped `skip` and `market` but
+left `action: limit` as a stub that degraded to `skip` with the reason
+`too-close-limit-unimplemented`. `limit` is the R-preserving recovery: when a
+stop trigger has been overtaken by price (`#19-10`), instead of chasing the
+move at market (`market`, which accepts a worse fill within a slippage bound),
+rest a **limit at the original trigger** and wait for a pullback. A limit can't
+fill worse than its price, so the planned R is preserved exactly — at the cost
+of possibly never filling.
+
+### What changed
+
+- **`action: limit` is now implemented.** On a `#19-10` rejection of a stop
+  whose fallback is `limit`, the worker re-places a **single** limit order
+  resting at the original stop trigger (`src/too_close.rs` `TooClosePlan::Limit`
+  + the new arm in `place_entry_too_close_fallback`, `src/lib.rs`). No fresh
+  sizing — the entry reference is unchanged, so the original stop-distance /
+  1%-equity math is reused.
+- **Geometry guard.** A limit must rest on the correct side of the market
+  (long: trigger at/below current price; short: at/above) or it would be a
+  `#19-9` ("limit on the wrong side"). In a genuine `#19-10` the price has
+  overrun the trigger so this holds; a degenerate / non-overrun case is skipped
+  with `too-close-limit-wrong-side` rather than firing a doomed order.
+- **No broker-native GTD needed.** TradeNation order placement is hardcoded
+  GoodTillCancel upstream, but the recovered limit is recorded as an ordinary
+  `EntryAttempt` (the existing success-path `record_placement`), so the cron
+  sweep (`src/cron/sweep.rs`) cancels it on `attempt_expired` (`not_after`) or
+  `bar_expiry_due` (`cancel_at`). The limit inherits the alert window's lifetime
+  for free.
+- **One attempt, not a loop** — identical to `market`. A broker reject returns
+  the original `EntryError::EntryTooCloseToMarket`, so the seen-id is never
+  poisoned and the next signal bar can retry.
+
+### Breaking
+
+None. `OnTooCloseAction::Limit` already existed and parsed; only its runtime
+behaviour changed (was: skip; now: limit re-place). The `TooClosePlan` enum
+gained a `Limit` variant (exhaustive matches in this crate updated).
+
+### Config
+
+No wire-format change. `on_too_close: { action: limit }` was already accepted;
+`max_slippage_pips` is not required or used for `limit`.
+
+### Tests
+
+`src/too_close.rs`: long/short correct-side → `Limit`, long/short wrong-side →
+`Skip { too-close-limit-wrong-side }`, exact-trigger equality rests, non-finite
+price skips (replaced the old `limit_action_skips_until_implemented` test).
+Worker suite green.
+
+### Follow-up
+
+None outstanding for the too-close fallback — all of
+`BUG-entry-too-close-to-market.md`'s suggested steps (1 plumb, 2 wire format,
+3 market, 4 limit) are now shipped.
+
 ## v41 — 2026-06-19 — archive terminal plans for post-mortem (`plan list --include-all`)
 
 ### Why
