@@ -1634,14 +1634,27 @@ pub(crate) async fn run_enter<B: Broker>(
             let sl_distance = (entry_reference_price(&resolved.entry) - resolved.stop_loss).abs();
             if trade_control_core::intent::sl_spread_floor_violation(sl_distance, spread_price) {
                 let min_sl = trade_control_core::intent::SL_MIN_SPREAD_MULTIPLE * spread_price;
+                // Render the distances in pips for the operator-facing message.
+                // `pip_size` is the baked intent value (or the secret/default
+                // fallback); guard against a non-positive divisor so a bad pip
+                // never produces a NaN/inf in the reject body.
+                let (sl_pips, spread_pips) = if pip_size > 0.0 {
+                    (sl_distance / pip_size, spread_price / pip_size)
+                } else {
+                    (sl_distance, spread_price)
+                };
+                let message = format!(
+                    "entry blocked: SL <= {mult:.0}x spread: SL distance {sl_pips:.1} pips; spread = {spread_pips:.1} pips",
+                    mult = trade_control_core::intent::SL_MIN_SPREAD_MULTIPLE,
+                );
                 rlog!(
-                    "entry rejected: sl-below-10x-spread instrument={} sl_distance={sl_distance} < {min_sl} (spread={spread_price}, {}x) (id={})",
+                    "entry rejected: sl-below-10x-spread instrument={} sl_distance={sl_distance} < {min_sl} (spread={spread_price}, {}x; {sl_pips:.1} pips vs {spread_pips:.1} pips) (id={})",
                     resolved.instrument,
                     trade_control_core::intent::SL_MIN_SPREAD_MULTIPLE,
                     verified.intent.id
                 );
                 return ActionResult::Rejected {
-                    response: Response::error("entry blocked: SL too close to spread", 422),
+                    response: Response::error(&message, 422),
                     outcome: "rejected: sl-below-10x-spread".into(),
                 };
             }
