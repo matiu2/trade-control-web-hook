@@ -636,6 +636,7 @@ mod tests {
             pip_size: None,
             trade_plan: None,
             blackout_close: crate::intent::BlackoutCloseAction::default(),
+            include_archived: false,
         }
     }
 

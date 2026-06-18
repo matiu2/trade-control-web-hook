@@ -13,10 +13,11 @@ use trade_control_core::intent::Action;
 use trade_control_core::intent::NoEntryWindow;
 use trade_control_core::plan_state::PlanState;
 use trade_control_core::state::{
-    BlackoutHoursEntry, CooldownEntry, EntryAttempt, MIN_TTL_SECONDS, MwState, NewsEntry,
-    PREP_BLOCK_INDEX_CAP, PREP_INDEX_CAP, PauseEntry, PrepBlockEntry, PrepEntry, SEEN_INDEX_CAP,
-    SeenEntry, Snapshot, SpreadBlackoutRecord, SpreadBlackoutWindow, StateError, StateStore,
-    StoredPlan, VETO_INDEX_CAP, VetoEntry, account_from_scope, account_scope, prune_expired,
+    ArchivedPlan, BlackoutHoursEntry, CooldownEntry, EntryAttempt, MIN_TTL_SECONDS, MwState,
+    NewsEntry, PREP_BLOCK_INDEX_CAP, PREP_INDEX_CAP, PauseEntry, PrepBlockEntry, PrepEntry,
+    SEEN_INDEX_CAP, SeenEntry, Snapshot, SpreadBlackoutRecord, SpreadBlackoutWindow, StateError,
+    StateStore, StoredPlan, VETO_INDEX_CAP, VetoEntry, account_from_scope, account_scope,
+    prune_expired,
 };
 use trade_control_core::trade_plan::TradePlan;
 use worker::kv::KvStore;
@@ -148,6 +149,15 @@ impl KvStateStore {
     fn plan_state_key(account: Option<&str>, trade_id: &str) -> String {
         let scope = account_scope(account);
         format!("plan-state:{scope}:{trade_id}")
+    }
+
+    /// Key for an archived (terminated) plan retained for post-mortem analysis:
+    /// `archived-plan:{scope}:{trade_id}`. Written with no TTL by `archive_plan`
+    /// on the terminal cron tick; enumerated by `list_all_archived_plans` and
+    /// dropped by `plan delete`.
+    fn archived_plan_key(account: Option<&str>, trade_id: &str) -> String {
+        let scope = account_scope(account);
+        format!("archived-plan:{scope}:{trade_id}")
     }
 
     /// Per-order key holding the raw signed alert body that placed a broker
@@ -1561,6 +1571,95 @@ impl StateStore for KvStateStore {
         trade_id: &str,
     ) -> Result<(), StateError> {
         let key = Self::plan_state_key(account, trade_id);
+        self.store
+            .delete(&key)
+            .await
+            .map_err(|e| StateError::Backend(format!("delete {key}: {e:?}")))?;
+        Ok(())
+    }
+
+    async fn archive_plan(
+        &self,
+        account: Option<&str>,
+        plan: &TradePlan,
+        final_state: &PlanState,
+        archived_at: DateTime<Utc>,
+    ) -> Result<(), StateError> {
+        let key = Self::archived_plan_key(account, &plan.trade_id);
+        let archived = ArchivedPlan {
+            account: None, // recovered from the key on read; `#[serde(skip)]`
+            plan: plan.clone(),
+            final_state: final_state.clone(),
+            archived_at,
+        };
+        let body = serde_json::to_string(&archived)
+            .map_err(|e| StateError::Backend(format!("encode archived plan: {e}")))?;
+        // No `expiration_ttl`: archived plans persist until `plan delete`.
+        self.store
+            .put(&key, body)
+            .map_err(|e| StateError::Backend(format!("put {key} builder: {e:?}")))?
+            .execute()
+            .await
+            .map_err(|e| StateError::Backend(format!("put {key} execute: {e:?}")))?;
+        Ok(())
+    }
+
+    async fn list_all_archived_plans(&self) -> Result<Vec<ArchivedPlan>, StateError> {
+        // Mirror `list_all_trade_plans`: page the `archived-plan:` prefix,
+        // keeping keys so the account scope can be recovered.
+        let prefix = "archived-plan:";
+        let mut keys: Vec<String> = Vec::new();
+        let mut cursor: Option<String> = None;
+        loop {
+            let mut builder = self.store.list().prefix(prefix.to_string());
+            if let Some(c) = cursor.take() {
+                builder = builder.cursor(c);
+            }
+            let resp = builder
+                .execute()
+                .await
+                .map_err(|e| StateError::Backend(format!("list archived plan: {e:?}")))?;
+            keys.extend(resp.keys.into_iter().map(|k| k.name));
+            if resp.list_complete {
+                break;
+            }
+            match resp.cursor {
+                Some(c) => cursor = Some(c),
+                None => break,
+            }
+        }
+
+        let mut plans: Vec<ArchivedPlan> = Vec::with_capacity(keys.len());
+        for key in keys {
+            // `archived-plan:{scope}:{trade_id}` — scope is between the first
+            // and second colon (after stripping the prefix).
+            let Some(rest) = key.strip_prefix("archived-plan:") else {
+                continue;
+            };
+            let Some((scope, _trade_id)) = rest.split_once(':') else {
+                continue;
+            };
+            let raw = self
+                .store
+                .get(&key)
+                .text()
+                .await
+                .map_err(|e| StateError::Backend(format!("get {key}: {e:?}")))?;
+            let Some(text) = raw else { continue };
+            let mut archived: ArchivedPlan = serde_json::from_str(&text)
+                .map_err(|e| StateError::Backend(format!("decode {key}: {e}")))?;
+            archived.account = account_from_scope(scope);
+            plans.push(archived);
+        }
+        Ok(plans)
+    }
+
+    async fn clear_archived_plan(
+        &self,
+        account: Option<&str>,
+        trade_id: &str,
+    ) -> Result<(), StateError> {
+        let key = Self::archived_plan_key(account, trade_id);
         self.store
             .delete(&key)
             .await

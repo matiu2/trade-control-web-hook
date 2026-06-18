@@ -178,6 +178,13 @@ enum PlanCmd {
 
 #[derive(Parser)]
 struct PlanListArgs {
+    /// Also list terminated plans (vetoed / completed). By default only live
+    /// plans the engine is still ticking are shown; terminated plans are
+    /// archived to a separate keyspace on the terminal cron tick and surfaced
+    /// only with this flag. Use it to analyze a setup after it vetoed, then
+    /// `plan delete <id>` to drop the archive.
+    #[arg(long, visible_alias = "include-archived")]
+    include_all: bool,
     /// Print the worker's raw YAML response instead of the table.
     #[arg(long)]
     yaml: bool,
@@ -1160,7 +1167,7 @@ fn run_plan_list(args: PlanListArgs) -> Result<()> {
     let key = load_key(&args.common.key_file)?;
     let now = Utc::now();
     let suffix = fresh_suffix()?;
-    let intent = build_plan_list_intent(now, &suffix);
+    let intent = build_plan_list_intent(now, &suffix, args.include_all);
     let body = wrap_control(&intent, &key, now)?;
     let response = post_control(&args.common.endpoint, &body)?;
     if args.yaml {
@@ -1239,7 +1246,10 @@ fn format_plan_list(plans: &[serde_yaml::Value]) -> String {
             None => "-".to_string(),
         }
     };
-    let rows: Vec<[String; 7]> = plans
+    // `ARCHIVED` is the terminated-plan marker: the worker stamps `archived_at`
+    // only on rows it read from the archive keyspace, so a live plan renders `-`
+    // there. Surfaced by `plan list --include-all`.
+    let rows: Vec<[String; 8]> = plans
         .iter()
         .map(|p| {
             [
@@ -1250,6 +1260,7 @@ fn format_plan_list(plans: &[serde_yaml::Value]) -> String {
                 field(p, "phase"),
                 field(p, "rules"),
                 field(p, "fired"),
+                field(p, "archived_at"),
             ]
         })
         .collect();
@@ -1261,6 +1272,7 @@ fn format_plan_list(plans: &[serde_yaml::Value]) -> String {
         "PHASE",
         "RULES",
         "FIRED",
+        "ARCHIVED",
     ];
     render_table(&headers, &rows)
 }

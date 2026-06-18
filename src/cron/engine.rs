@@ -271,6 +271,17 @@ async fn persist_plan_state(
 ) -> KvTickTransition {
     let key = plan_state_key(account, &plan.trade_id);
     if eval.done {
+        // Snapshot the finished plan + its terminal state to the archive
+        // keyspace BEFORE dropping the live rows, so `plan list --include-all`
+        // can still surface a vetoed/completed setup for analysis. A failed
+        // archive is logged but must not fail the tick — the clears below still
+        // proceed (the engine has finished with this plan regardless).
+        if let Err(err) = store
+            .archive_plan(account, plan, &eval.new_state, now)
+            .await
+        {
+            rlog_err!("cron engine: archive_plan({}): {err}", plan.trade_id);
+        }
         if let Err(err) = store.clear_plan_state(account, &plan.trade_id).await {
             rlog_err!("cron engine: clear_plan_state({}): {err}", plan.trade_id);
         }

@@ -69,6 +69,7 @@ fn control_skeleton(action: Action, instrument: &str, id: String, now: DateTime<
         pip_size: None,
         trade_plan: None,
         blackout_close: trade_control_core::intent::BlackoutCloseAction::default(),
+        include_archived: false,
     }
 }
 
@@ -132,9 +133,14 @@ pub fn build_market_info_intent(instrument: &str, now: DateTime<Utc>, suffix: &s
 
 /// Build a `plan-list` query `Intent`. Read-only; lists every registered
 /// server-side plan. Like `status`, `instrument` is an ignored placeholder.
-pub fn build_plan_list_intent(now: DateTime<Utc>, suffix: &str) -> Intent {
+/// `include_archived` (the `--include-all` flag) also enumerates terminated
+/// (vetoed/completed) plans retained in the archive keyspace.
+pub fn build_plan_list_intent(now: DateTime<Utc>, suffix: &str, include_archived: bool) -> Intent {
     let id = format!("plan-list-{}-{suffix}", now.format("%Y-%m-%dT%H%M%S"));
-    control_skeleton(Action::PlanList, STATUS_INSTRUMENT, id, now)
+    Intent {
+        include_archived,
+        ..control_skeleton(Action::PlanList, STATUS_INSTRUMENT, id, now)
+    }
 }
 
 /// Build a `plan-show` query `Intent` for one `trade_id`. The worker scans

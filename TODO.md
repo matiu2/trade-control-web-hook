@@ -1,5 +1,28 @@
 # TODO
 
+## ACTIVE — archive terminal plans (branch: feat/archive-terminal-plans)
+
+Vetoed/completed plans get deleted on the terminal cron tick
+(`src/cron/engine.rs:273-279`), so `plan list` (scans `plan:` prefix) shows
+nothing afterward — can't analyze a setup post-veto. Archive them instead to an
+`archived-plan:` keyspace (NO TTL), add `plan list --include-all`, and make
+`plan delete` clear both keyspaces.
+
+- [x] 1. core: `ArchivedPlan` struct + 3 `StateStore` methods (`archive_plan`,
+       `list_all_archived_plans`, `clear_archived_plan`); in-memory test impl.
+- [x] 2. worker KV impl: `archived_plan_key`; archive `put` has NO TTL.
+- [x] 3. engine: `persist_plan_state` done-branch archives BEFORE clearing live;
+       failed archive logs, doesn't fail tick.
+- [x] 4. intent + CLI: `Intent.include_archived: bool` (signed top-level);
+       `build_plan_list_intent(..., include_archived)`; `--include-all` flag.
+- [x] 5. worker `handle_plan_list`: merge archived with `archived_at`.
+- [x] 6. worker `handle_plan_delete`: also clear archived; scan archived list.
+- [x] 7. CLI table: ARCHIVED column.
+- [x] 8. README + CHANGELOG (v41) + test (round-trip/list/clear); clippy + fmt.
+
+DONE — green. No TTL ⇒ accumulate until `plan delete` (documented). Dev
+worktree; NOT deployed to staging. Advance parent pointer after merge to main.
+
 ## ACTIVE — SL distance ≥ 10× bid-ask spread (branch: feat/sl-min-10x-spread)
 
 Hard limit: an entry's SL distance must be at least 10× the live bid-ask spread.
