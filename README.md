@@ -1679,12 +1679,53 @@ the engine is proven on demo (Stage F retires the alerts).
 > proven setup to live. (Field: `TradePlan.shadow`, `#[serde(default)]` → live
 > for plans registered before the flag existed.)
 
+**Calendar / news bars are folded into the plan too.** A registered plan
+carries not just the trade's own conditions but the **pause/resume** (blackout)
+and **news-start/news-end** (news-window) control bars — both the operator's
+chart-drawn pairs and the auto-fetched forex-factory events (the same bars the
+`--create-alerts` path POSTs as TV alerts). Each becomes a `TimeReached` rule
+carrying the matching `pause` / `resume` / `news-start` / `news-end` intent and
+firing at the window edge; the engine fires them **non-terminally** (they set
+the blackout / news-window KV state without ending the trade's spine) and the
+cron dispatches them through the same handlers the webhook uses. In `--shadow`
+they're logged, not applied, like every other fire. (Before this, a
+`--register-plan` produced a plan with *no* calendar bars — the register POST
+ran before the bundles were built; fixed in Stage E.10 / v37.) The folding lives
+in `append_control_rules` (`tv-arm/src/trade_plan_build.rs`); the non-terminal
+evaluation is `evaluate_controls` (`engine/src/evaluate.rs`).
+
 The plan builder
 is `tv-arm/src/trade_plan_build.rs` (the inverse of `alert_spec.rs`); the
 `TradePlan` / `Trigger` model lives in `core/src/trade_plan.rs`; per-trade
 engine state is `core/src/plan_state.rs`; the FSM evaluator is
 `engine/src/evaluate.rs`; the candle-pattern detector port is
 `core/src/signals.rs`.
+
+#### Re-arming an existing setup (`--update`)
+
+`tv-arm` mints a **fresh random `trade_id` every run**, so the engine treats
+each re-arm as a brand-new plan — and the *old* plan keeps ticking in KV until
+its TTL lapses. When you move annotations on the chart and re-run, pass
+`--update` (only meaningful alongside `--register-plan`) so the prior plan is
+deleted from the engine first:
+
+```sh
+# Auto-resolve by instrument: deletes the one existing plan on this instrument,
+# then registers the fresh one. Hard-errors if more than one plan is registered
+# for the instrument (re-run with the explicit id from `plan list`).
+tv-arm-staging --register-plan --update ...
+
+# Explicit: delete exactly this prior trade_id, then register fresh.
+tv-arm-staging --register-plan --update hs-eurusd-a3f9c1d2 ...
+```
+
+`--update` reconciles **only the server-side engine plan** (it POSTs
+`plan-list` to find the target, then a signed `plan-delete` that clears the
+plan's `plan:` + `plan-state:` KV — see `plan delete` below). It does **not**
+touch TradingView alerts; keep deleting/recreating those by hand (or via
+`--create-alerts`) as before. A bare `--update` with no plan registered for the
+instrument is a logged no-op. The resolution logic is the pure
+`resolve_update_target` (`tv-arm/src/pipeline.rs`), unit-tested.
 
 #### Inspecting / managing registered plans (`trade-control plan list` / `show` / `delete`)
 

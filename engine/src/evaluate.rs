@@ -141,7 +141,14 @@ pub fn evaluate_plan(
     let detector_cfg = DetectorConfig::pine_defaults(plan.granularity);
 
     for candle in new_candles {
-        // Always-armed guards first: a terminal veto can end the plan on any
+        // Always-armed control rules first: pause/resume/news-start/news-end
+        // are wall-clock `TimeReached` fires that set KV state (blackout / news
+        // window) without touching the trade's spine. Non-terminal — they fire,
+        // latch, and the machine carries on. A window can land in any phase, so
+        // these are evaluated every bar regardless of `state.phase`.
+        evaluate_controls(plan, &mut state, candle, detector_window, &mut fired);
+
+        // Always-armed guards next: a terminal veto can end the plan on any
         // bar, regardless of spine phase.
         evaluate_guards(plan, &mut state, candle, detector_window, &mut fired);
         if state.phase == Phase::Done {
@@ -271,6 +278,32 @@ fn trendline_anchor_warnings(plan: &TradePlan, window: &[Candle]) -> Vec<String>
         }
     }
     warnings
+}
+
+/// Evaluate every control rule (pause / resume / news-start / news-end)
+/// against this candle. Each is a `TimeReached` rule whose intent sets KV
+/// state (a blackout or news window) — **non-terminal**: it fires, latches in
+/// `state.fired` (`FireMode::Once`), and the plan continues. Distinct from a
+/// guard (which ends the spine) and from the prep spine. Armed in every phase
+/// so a window that opens before break-and-close still fires.
+fn evaluate_controls(
+    plan: &TradePlan,
+    state: &mut PlanState,
+    candle: &Candle,
+    window: &[Candle],
+    fired: &mut Vec<FiredIntent>,
+) {
+    for rule in &plan.rules {
+        if !is_control_rule(rule) || state.fired.contains(&rule.rule_id) {
+            continue;
+        }
+        if fire_rule(rule, state, candle, window) {
+            push_fire(rule, candle, fired);
+            state.fired.insert(rule.rule_id.clone());
+            // No phase change: a pause/resume/news fire is state-only and never
+            // ends the setup.
+        }
+    }
 }
 
 /// Evaluate every veto guard rule against this candle. A guard that fires
@@ -683,6 +716,17 @@ fn is_guard(rule: &ConditionRule) -> bool {
     matches!(
         rule.intent.action,
         Action::Veto | Action::Invalidate | Action::Close
+    )
+}
+
+/// A control rule sets the worker's blackout / news-window KV state on a
+/// wall-clock `TimeReached` fire (pause/resume open and close a blackout;
+/// news-start/news-end open and close a news window). Always-armed but
+/// non-terminal — it never ends the trade's spine, unlike a guard.
+fn is_control_rule(rule: &ConditionRule) -> bool {
+    matches!(
+        rule.intent.action,
+        Action::Pause | Action::Resume | Action::NewsStart | Action::NewsEnd
     )
 }
 
@@ -1444,6 +1488,137 @@ mod tests {
         assert!(eval.done);
         assert_eq!(eval.fired.len(), 1);
         assert_eq!(eval.fired[0].rule_id, "02-veto-trade-expiry");
+    }
+
+    #[test]
+    fn pause_control_fires_at_its_epoch_without_ending_the_spine() {
+        // A pause window opening mid-trade: its TimeReached fires, dispatches
+        // the Pause intent, but the plan keeps running (non-terminal) and the
+        // enter heartbeat still fires the same bar.
+        let pause_at = ts("2026-06-16T15:00:00Z").timestamp();
+        let p = plan(vec![
+            rule(
+                "05-enter",
+                Trigger::MwEveryBar,
+                FireMode::EveryBar,
+                Action::Enter,
+            ),
+            rule(
+                "pause-start-news1",
+                Trigger::TimeReached { at_epoch: pause_at },
+                FireMode::Once,
+                Action::Pause,
+            ),
+        ]);
+        let prior = seed_at(Phase::AwaitEntry, "2026-06-16T13:00:00Z");
+        let c = candle("2026-06-16T16:00:00Z", 1.0, 1.0, 1.0, 1.0);
+        let eval = run(&p, &prior, &[c]);
+        assert!(!eval.done, "a pause fire must not end the plan");
+        let ids: Vec<&str> = eval.fired.iter().map(|f| f.rule_id.as_str()).collect();
+        assert!(ids.contains(&"pause-start-news1"), "pause must fire");
+        assert!(ids.contains(&"05-enter"), "enter heartbeat still fires");
+    }
+
+    #[test]
+    fn pause_and_resume_fire_on_their_own_bars_and_dont_refire() {
+        // Resume comes a bar after pause. Each fires once on the first bar at or
+        // past its epoch; a re-tick of a later bar doesn't refire either.
+        let pause_at = ts("2026-06-16T15:00:00Z").timestamp();
+        let resume_at = ts("2026-06-16T16:00:00Z").timestamp();
+        let p = plan(vec![
+            rule(
+                "pause-start-news1",
+                Trigger::TimeReached { at_epoch: pause_at },
+                FireMode::Once,
+                Action::Pause,
+            ),
+            rule(
+                "pause-resume-news1",
+                Trigger::TimeReached {
+                    at_epoch: resume_at,
+                },
+                FireMode::Once,
+                Action::Resume,
+            ),
+        ]);
+        let prior = seed_at(Phase::AwaitEntry, "2026-06-16T13:00:00Z");
+        // Bar 1 (15:00): only pause fires.
+        let c1 = candle("2026-06-16T15:00:00Z", 1.0, 1.0, 1.0, 1.0);
+        let e1 = run(&p, &prior, &[c1]);
+        let ids1: Vec<&str> = e1.fired.iter().map(|f| f.rule_id.as_str()).collect();
+        assert_eq!(ids1, vec!["pause-start-news1"]);
+        // Bar 2 (16:00): only resume fires (pause already latched).
+        let c2 = candle("2026-06-16T16:00:00Z", 1.0, 1.0, 1.0, 1.0);
+        let e2 = run(&p, &e1.new_state, &[c2]);
+        let ids2: Vec<&str> = e2.fired.iter().map(|f| f.rule_id.as_str()).collect();
+        assert_eq!(ids2, vec!["pause-resume-news1"]);
+        // Bar 3: neither refires.
+        let c3 = candle("2026-06-16T17:00:00Z", 1.0, 1.0, 1.0, 1.0);
+        let e3 = run(&p, &e2.new_state, &[c3]);
+        assert!(e3.fired.is_empty(), "latched controls must not refire");
+    }
+
+    #[test]
+    fn multiple_news_windows_each_fire() {
+        // Two separate calendar events → two news-start + two news-end rules.
+        // Walking past all four epochs in one tick batch fires all four.
+        let p = plan(vec![
+            rule(
+                "news-start-evt1",
+                Trigger::TimeReached {
+                    at_epoch: ts("2026-06-16T10:00:00Z").timestamp(),
+                },
+                FireMode::Once,
+                Action::NewsStart,
+            ),
+            rule(
+                "news-end-evt1",
+                Trigger::TimeReached {
+                    at_epoch: ts("2026-06-16T11:00:00Z").timestamp(),
+                },
+                FireMode::Once,
+                Action::NewsEnd,
+            ),
+            rule(
+                "news-start-evt2",
+                Trigger::TimeReached {
+                    at_epoch: ts("2026-06-16T14:00:00Z").timestamp(),
+                },
+                FireMode::Once,
+                Action::NewsStart,
+            ),
+            rule(
+                "news-end-evt2",
+                Trigger::TimeReached {
+                    at_epoch: ts("2026-06-16T15:00:00Z").timestamp(),
+                },
+                FireMode::Once,
+                Action::NewsEnd,
+            ),
+        ]);
+        let prior = seed_at(Phase::AwaitEntry, "2026-06-16T09:00:00Z");
+        let candles: Vec<Candle> = [
+            "2026-06-16T10:00:00Z",
+            "2026-06-16T11:00:00Z",
+            "2026-06-16T14:00:00Z",
+            "2026-06-16T15:00:00Z",
+        ]
+        .iter()
+        .map(|t| candle(t, 1.0, 1.0, 1.0, 1.0))
+        .collect();
+        let eval = run(&p, &prior, &candles);
+        assert!(!eval.done);
+        let mut ids: Vec<&str> = eval.fired.iter().map(|f| f.rule_id.as_str()).collect();
+        ids.sort_unstable();
+        assert_eq!(
+            ids,
+            vec![
+                "news-end-evt1",
+                "news-end-evt2",
+                "news-start-evt1",
+                "news-start-evt2"
+            ]
+        );
     }
 
     #[test]

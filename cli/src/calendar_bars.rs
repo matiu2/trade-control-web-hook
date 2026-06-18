@@ -32,8 +32,8 @@ use trade_control_core::intent::BrokerKind;
 use trade_control_core::sig::KEY_LEN;
 
 use crate::forex_factory_cache::get_week_events_cached;
-use crate::news_pattern::{NewsSpec, build_news_from_spec, write_news};
-use crate::pause_pattern::{PauseSpec, build_pause_from_spec, write_pause};
+use crate::news_pattern::{BuiltNews, NewsSpec, build_news_from_spec, write_news};
+use crate::pause_pattern::{BuiltPause, PauseSpec, build_pause_from_spec, write_pause};
 
 /// One calendar-derived row: original event metadata, plus the two
 /// specs that the I/O layer will hand to `build_pause_from_spec` and
@@ -56,6 +56,19 @@ pub struct CalendarBarRow {
 #[derive(Debug, Clone)]
 pub struct CalendarBarPlan {
     pub rows: Vec<CalendarBarRow>,
+}
+
+/// One event's in-memory built pause + news bundles, returned from
+/// [`run_calendar_bars`] alongside the on-disk signed YAMLs. The disk
+/// bundles drive the TradingView alert path (re-discovered via
+/// `discover_calendar_bundles`); these in-memory ones let the server-side
+/// `--register-plan` path fold the same pause/resume/news-start/news-end
+/// intents into the `TradePlan` without re-parsing the signed YAML.
+#[derive(Debug)]
+pub struct BuiltCalendarBundle {
+    pub event_slug: String,
+    pub pause: BuiltPause,
+    pub news: BuiltNews,
 }
 
 /// Inputs the planner needs that aren't on the calendar event itself.
@@ -543,7 +556,7 @@ pub fn run_calendar_bars(
     args: CalendarBarsArgs,
     key: [u8; KEY_LEN],
     now: DateTime<Utc>,
-) -> Result<()> {
+) -> Result<Vec<BuiltCalendarBundle>> {
     let instrument = parse_instrument(&args.instrument, args.broker.into())?;
     let timeframe: Timeframe = args.timeframe.into();
     let inputs = PlanInputs {
@@ -566,10 +579,10 @@ pub fn run_calendar_bars(
 
     if args.dry_run {
         println!("(dry-run — no files written)");
-        return Ok(());
+        return Ok(Vec::new());
     }
     if plan.rows.is_empty() {
-        return Ok(());
+        return Ok(Vec::new());
     }
 
     let out_root = args
@@ -578,6 +591,7 @@ pub fn run_calendar_bars(
         .unwrap_or_else(|| PathBuf::from("calendar-bars").join(&args.trade_id));
     println!("output: {}", out_root.display());
 
+    let mut built = Vec::with_capacity(plan.rows.len());
     for row in &plan.rows {
         let event_dir = out_root.join(&row.event_slug);
         let built_pause = build_pause_from_spec(row.pause_spec.clone(), now)
@@ -592,8 +606,13 @@ pub fn run_calendar_bars(
             written_pause.display(),
             written_news.display(),
         );
+        built.push(BuiltCalendarBundle {
+            event_slug: row.event_slug.clone(),
+            pause: built_pause,
+            news: built_news,
+        });
     }
-    Ok(())
+    Ok(built)
 }
 
 #[cfg(test)]
