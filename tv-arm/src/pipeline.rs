@@ -590,6 +590,11 @@ fn resolve_mw_trade_with_spread(
         return Err(ResolveError::Reject(msg));
     }
 
+    // The SL-vs-spread floor (hard limit) is enforced at build time in the
+    // shared `cli::build_mw_pattern` chokepoint that this resolve feeds into,
+    // and again at fire time in the worker against the live spread. Not
+    // duplicated here — see `cli/src/trade_patterns.rs::build_mw_pattern`.
+
     let expiry = read_trade_expiry(roles)?;
     let pattern = match direction {
         Direction::Short => cli::TradePattern::M,

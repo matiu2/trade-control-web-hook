@@ -1604,6 +1604,50 @@ pub(crate) async fn run_enter<B: Broker>(
         },
     }
 
+    // SL-vs-spread floor (hard limit, every entry): the stop-loss distance must
+    // be at least `SL_MIN_SPREAD_MULTIPLE`× the live bid-ask spread, so a stop
+    // is a real market level and not dominated by the cost of crossing the book.
+    // Pure decision in `trade_control_core::intent::sl_spread_floor_violation`;
+    // this is the live-quote wrapper. Mirrored at arm/build time (tv-arm,
+    // trade-control) so a bad setup is caught before signing — this is the
+    // real-time backstop.
+    //
+    // Unlike spread-blackout this samples the quote on EVERY entry (no window
+    // guard), since the floor always applies. It is the only other broker
+    // round-trip on the entry path; keep it right beside spread-blackout.
+    //
+    // FAIL OPEN on a quote error: a transient broker quote hiccup must not
+    // strand a legitimate entry (same discipline as spread-blackout). REJECT is
+    // a `Skip` in `seen_decision` (no `mark_seen`), so it never poisons the
+    // intent id — the next signal bar refires and re-checks. Do NOT add a KV
+    // write on this path.
+    match broker.get_quote(&resolved.instrument).await {
+        Err(err) => {
+            rlog_err!(
+                "sl-spread-floor: get_quote failed for {} (id={}): {err:?} — failing open (allowing entry)",
+                resolved.instrument,
+                verified.intent.id
+            );
+        }
+        Ok(quote) => {
+            let spread_price = quote.spread();
+            let sl_distance = (entry_reference_price(&resolved.entry) - resolved.stop_loss).abs();
+            if trade_control_core::intent::sl_spread_floor_violation(sl_distance, spread_price) {
+                let min_sl = trade_control_core::intent::SL_MIN_SPREAD_MULTIPLE * spread_price;
+                rlog!(
+                    "entry rejected: sl-below-10x-spread instrument={} sl_distance={sl_distance} < {min_sl} (spread={spread_price}, {}x) (id={})",
+                    resolved.instrument,
+                    trade_control_core::intent::SL_MIN_SPREAD_MULTIPLE,
+                    verified.intent.id
+                );
+                return ActionResult::Rejected {
+                    response: Response::error("entry blocked: SL too close to spread", 422),
+                    outcome: "rejected: sl-below-10x-spread".into(),
+                };
+            }
+        }
+    }
+
     let entry_request = EntryRequest {
         instrument: &resolved.instrument,
         direction: resolved.direction,

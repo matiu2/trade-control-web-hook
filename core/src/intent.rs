@@ -10,16 +10,19 @@ mod expiry;
 mod mw_resolution;
 mod mw_state;
 mod resolution;
+mod sl_spread_floor;
 
 pub use blackout::{
     BlackoutCloseAction, Buffers, MINUTES_PER_DAY, NoEntryWindow, is_inside_any, is_inside_window,
     windows_from_session,
 };
 pub use expiry::{ExpiryError, MAX_EXPIRY_BARS, resolve_cancel_at};
+pub use mw_resolution::mw_static_prices;
 pub use mw_state::{MwAnchors, MwUpdate, effective_mw_params, plan_mw_update};
 #[cfg(feature = "cli")]
 pub use resolution::MIN_R_FLOOR;
 pub use resolution::{ResolveError, Resolved, ResolvedEntry, ResolvedOnTooClose, RiskBudget};
+pub use sl_spread_floor::{SL_MIN_SPREAD_MULTIPLE, sl_spread_floor_violation};
 
 /// Plaintext outer YAML — the part TradingView substitutes `{{...}}` into.
 /// The intent fields sit alongside these at the top level of the signed

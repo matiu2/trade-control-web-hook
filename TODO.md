@@ -1,6 +1,47 @@
 # TODO
 
-## ACTIVE — market-hours entry blackout (branch: worktree-market-hours-entry-blackout)
+## ACTIVE — SL distance ≥ 10× bid-ask spread (branch: feat/sl-min-10x-spread)
+
+Hard limit: an entry's SL distance must be at least 10× the live bid-ask spread.
+Checked at entry (worker, real-time hard gate) AND at arm/build time (tv-arm /
+trade-control, so a bad setup is caught before it's signed).
+
+### Findings
+- **RR ≥ 1 already enforced universally** — `core/src/intent/resolution.rs`
+  `MIN_R_FLOOR = 1.0`, defaulted + checked in `Resolved::from_intent`
+  (`MinRBelowFloor` / `BelowMinR`). User: leave at 1.0. No code change.
+- **SL ≥ 10× spread is new.** Needs a live spread.
+  - Worker only fetches a quote in the spread-blackout gate (`src/lib.rs:1576`,
+    behind an open-window guard) — need a quote on every entry.
+  - tv-arm already reads live spread (`tv-arm/src/spread.rs::read_spread_pips`,
+    bakes `spread_pips` for M/W).
+
+### Decisions (user)
+- 10× = fixed server-side constant (cannot be weakened per-intent).
+- Worker quote-fetch failure ⇒ **fail open** (mirror spread-blackout; reject =
+  Skip, no seen-id poison).
+
+### Plan
+- [x] 1. Core pure helper + const in `core/src/intent/sl_spread_floor.rs`
+      (`SL_MIN_SPREAD_MULTIPLE = 10.0`, `sl_spread_floor_violation`, price units;
+      degenerate spread ⇒ false). 5 unit tests green.
+- [x] 2. Worker gate in `run_enter` (`src/lib.rs`): `get_quote` per entry,
+      `sl_distance` from `resolved`, reject 422 `sl-below-10x-spread`, fail-open
+      on Err. Own block beside spread-blackout (separate quote — clearer than
+      sharing across two independently-fail-open gates).
+- [x] 3+4. Build-time check in the SHARED chokepoint
+      `cli/src/trade_patterns.rs::build_mw_pattern` (covers BOTH tv-arm — which
+      routes through it — AND hand-crafted `build-trade --from-file` specs).
+      M/W only; H&S has no build-time SL (worker is its backstop). Extracted
+      `mw_static_prices` in core as the shared price-math source of truth (also
+      used by `from_mw_intent`). tv-arm duplicate dropped. 2 CLI tests green.
+- [x] 5. README updated (SL-vs-spread floor block). clippy + fmt clean across
+      workspace. Tests: core 544, cli 241, tv-arm 159, worker 214 — all green.
+- [ ] Memory note; commit/push; advance parent pointer.
+
+---
+
+## DONE/OLD — market-hours entry blackout (branch: worktree-market-hours-entry-blackout)
 
 Fixes the incident where a resting stop order on a US-index rolling future sat
 through the closed session and triggered on the close→open gap. A daily cron

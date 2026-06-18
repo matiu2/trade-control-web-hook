@@ -421,6 +421,27 @@ would otherwise fill straight into the take-profit. This is the same
 gate that protects the absolute-price flow when the trigger candle
 moves past one of your fixed levels.
 
+**SL-vs-spread floor (hard limit):** an entry's stop-loss distance must
+be at least **10× the live bid-ask spread**, so a stop is a genuine
+market level and not dominated by the cost of crossing the book. Enforced
+in two places against the same fixed constant
+(`trade_control_core::intent::SL_MIN_SPREAD_MULTIPLE`):
+
+- **At fire time (worker)** — every `enter` samples the live spread
+  (`get_quote`) and rejects with **HTTP 422 / `rejected:
+  sl-below-10x-spread`** if `sl_distance < 10 × spread`. Like the other
+  entry gates this is a non-poisoning reject (the id can refire once the
+  spread tightens), and it **fails open** on a quote-fetch error so a
+  transient broker hiccup never strands a real entry.
+- **At build/arm time (M/W only)** — `trade-control build-trade` and
+  `tv-arm` reject a too-tight M/W setup before it's ever signed, using the
+  arm-time spread baked into the path geometry. H&S has no build-time SL
+  (it anchors to the fire-time signal extreme), so H&S relies on the
+  worker gate alone.
+
+The multiple is a server-side constant — it cannot be weakened
+per-intent, the same discipline as the `min_r` ≥ 1.0 reward:risk floor.
+
 `id` is the **replay-protection key** — the worker remembers each id it
 **successfully fulfilled** until just past `not_after`. Gate rejections
 (missing prep, active veto, `allow_entry` script returning false,
