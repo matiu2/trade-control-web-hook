@@ -121,6 +121,38 @@ const MID_CROSS_FRAC: f64 = 0.5;
 /// in `tv-arm`'s `mw_geometry`.
 const CANCEL_EXT_FRAC: f64 = 1.3;
 
+/// The mid-correct `(entry, stop_loss, take_profit)` for an M/W setup from its
+/// [`MwParams`] anchors. Pure price math — no shell / live data — so it's the
+/// single source of truth shared by [`Resolved::from_mw_intent`] (fire time,
+/// effective anchors) and tv-arm's arm-time SL-vs-spread floor check (baked
+/// anchors). See the module-level doc block for the `±½ spread` derivation.
+pub fn mw_static_prices(direction: Direction, mw: &MwParams) -> (f64, f64, f64) {
+    let pip = mw.pip_size;
+    let spread = mw.spread_pips * pip;
+    let half_spread = spread / 2.0;
+    let half_pip = 0.5 * pip;
+    let one_pip = pip;
+    let neckline = mw.neckline;
+    let peak = mw.first_point;
+
+    match direction {
+        // W (long): break *up* through the neckline, fill at ask.
+        Direction::Long => {
+            let entry = neckline + half_spread + half_pip;
+            let sl = peak + half_spread - (spread + one_pip);
+            let tp = entry + (entry - sl);
+            (entry, sl, tp)
+        }
+        // M (short): break *down* through the neckline, fill at bid.
+        Direction::Short => {
+            let entry = neckline - half_spread - half_pip;
+            let sl = peak - half_spread + (spread + one_pip);
+            let tp = entry - (sl - entry);
+            (entry, sl, tp)
+        }
+    }
+}
+
 impl Resolved {
     /// Resolve an M/W `enter` intent against an explicit [`MwParams`].
     ///
@@ -144,29 +176,9 @@ impl Resolved {
             .ok_or(ResolveError::MissingField("direction"))?;
 
         let pip = mw.pip_size;
-        let spread = mw.spread_pips * pip;
-        let half_spread = spread / 2.0;
-        let half_pip = 0.5 * pip;
-        let one_pip = pip;
         let neckline = mw.neckline;
         let peak = mw.first_point;
-
-        let (entry, stop_loss, take_profit) = match direction {
-            // W (long): break *up* through the neckline, fill at ask.
-            Direction::Long => {
-                let entry = neckline + half_spread + half_pip;
-                let sl = peak + half_spread - (spread + one_pip);
-                let tp = entry + (entry - sl);
-                (entry, sl, tp)
-            }
-            // M (short): break *down* through the neckline, fill at bid.
-            Direction::Short => {
-                let entry = neckline - half_spread - half_pip;
-                let sl = peak - half_spread + (spread + one_pip);
-                let tp = entry - (sl - entry);
-                (entry, sl, tp)
-            }
-        };
+        let (entry, stop_loss, take_profit) = mw_static_prices(direction, mw);
 
         // Right-tower confirmation *window*. Before arming the breakout stop
         // we require the price to have rallied (M) / dropped (W) back *into*

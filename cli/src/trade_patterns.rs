@@ -1011,6 +1011,29 @@ fn build_mw_pattern(spec: TradeSpec, now: DateTime<Utc>) -> Result<BuiltTrade> {
         }
     };
 
+    // Build-time SL-vs-spread floor (hard limit; the worker re-checks at fire
+    // time against the live spread). The M/W entry/SL are pure functions of the
+    // baked anchors + arm-time spread, so we can reject a too-tight stop before
+    // signing — covers both tv-arm (which routes through here) and hand-crafted
+    // `build-trade --from-file` specs. Same constant + decision as the worker:
+    // `sl_spread_floor_violation`. (H&S has no build-time SL — it anchors to the
+    // fire-time signal extreme — so H&S relies on the worker gate alone.)
+    {
+        let params = mw.to_params();
+        let spread_price = params.spread_pips * params.pip_size;
+        let (entry, sl, _tp) = trade_control_core::intent::mw_static_prices(direction, &params);
+        let sl_distance = (entry - sl).abs();
+        if trade_control_core::intent::sl_spread_floor_violation(sl_distance, spread_price) {
+            let min_sl = trade_control_core::intent::SL_MIN_SPREAD_MULTIPLE * spread_price;
+            return Err(eyre!(
+                "M/W stop-loss is too close to the spread: SL distance {sl_distance} < required \
+                 {min_sl} ({}× the {spread_price} spread). Tighten the spread (arm in a better \
+                 session) or widen the pattern.",
+                trade_control_core::intent::SL_MIN_SPREAD_MULTIPLE
+            ));
+        }
+    }
+
     let trade_id = mint_trade_id(spec.pattern, &spec.instrument)?;
     let entry_deadline = derive_entry_deadline(now, spec.trade_expiry, spec.entry_deadline_pct);
     let veto_expiry = spec.trade_expiry + DEFAULT_POST_EXPIRY_GRACE;
@@ -2484,6 +2507,33 @@ mod tests {
                 "{pattern:?}"
             );
         }
+    }
+
+    #[test]
+    fn build_mw_rejects_sl_too_close_to_spread() {
+        // sample_mw geometry has SL distance ≈ 0.0080 + ~1.5×spread. A 20-pip
+        // spread (0.0020) makes the 10× floor 0.020, above the ~0.011 SL
+        // distance → reject at build time before any signing.
+        let now = ts("2026-05-20T00:00:00Z");
+        let mut spec = mw_spec(TradePattern::M, ts("2026-05-25T00:00:00Z"));
+        spec.mw = Some(MwSpec {
+            spread_pips: 20.0,
+            ..sample_mw()
+        });
+        let err = build_trade_from_spec(spec, now).unwrap_err();
+        assert!(
+            err.to_string().contains("too close to the spread"),
+            "got {err}"
+        );
+    }
+
+    #[test]
+    fn build_mw_allows_normal_sl_vs_spread() {
+        // sample_mw's default 1-pip spread → SL distance is ~80× the spread,
+        // comfortably above the 10× floor → builds fine.
+        let now = ts("2026-05-20T00:00:00Z");
+        let spec = mw_spec(TradePattern::M, ts("2026-05-25T00:00:00Z"));
+        assert!(build_trade_from_spec(spec, now).is_ok());
     }
 
     #[test]
