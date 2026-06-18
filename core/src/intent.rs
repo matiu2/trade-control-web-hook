@@ -797,6 +797,13 @@ pub struct Intent {
     /// default. Meaningful on `Action::Enter`; ignored on other actions.
     #[serde(default, skip_serializing_if = "is_default_blackout_close")]
     pub blackout_close: BlackoutCloseAction,
+    /// `plan list --include-all` flag: when true, the worker also enumerates the
+    /// archived (terminated) plans alongside the live ones. Meaningful only on
+    /// [`Action::PlanList`]; ignored elsewhere. Signed as part of the whole-body
+    /// HMAC; `#[serde(default)]` + skip-if-false keep the wire form
+    /// byte-identical to pre-feature `plan-list` intents.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub include_archived: bool,
 }
 
 /// Skip-serializing predicate for [`Intent::blackout_close`]. Returns true on

@@ -2773,6 +2773,12 @@ struct PlanSummary {
     fired: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     retest_seen_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// Set only for an archived (terminated) plan — the time the engine archived
+    /// it on its terminal cron tick. Absent on a live plan, which doubles as the
+    /// CLI's "is this row terminated?" marker (`ARCHIVED` column). Surfaced only
+    /// by `plan list --include-all`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    archived_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 /// The full `plan show` payload: the whole registered plan plus its engine
@@ -2813,7 +2819,22 @@ async fn handle_plan_list(
             .unwrap_or(None);
         summaries.push(plan_summary(stored, state));
     }
+
+    // `--include-all`: also fold in the archived (terminated) plans so a vetoed
+    // or completed setup can be analyzed after the engine dropped its live rows.
+    if verified.intent.include_archived {
+        match store.list_all_archived_plans().await {
+            Ok(archived) => summaries.extend(archived.iter().map(archived_plan_summary)),
+            Err(err) => {
+                rlog_err!("plan-list: list_all_archived_plans: {err}");
+                return Response::error("state error", 500);
+            }
+        }
+    }
+
     // Stable ordering so a re-list is byte-comparable: account, then trade_id.
+    // (A live and an archived plan never share a trade_id — the live row is
+    // deleted in the same terminal tick that writes the archive.)
     summaries.sort_by(|a, b| {
         a.account
             .cmp(&b.account)
@@ -2857,6 +2878,29 @@ fn plan_summary(
             .map(|s| s.fired.iter().cloned().collect())
             .unwrap_or_default(),
         retest_seen_at: state.as_ref().and_then(|s| s.retest_seen_at),
+        archived_at: None, // live plan — see `archived_plan_summary`
+    }
+}
+
+/// Build the compact summary for one archived (terminated) plan. The terminal
+/// `final_state` is always present (unlike a live plan, which may not have
+/// ticked yet), so `phase`/`fired` are taken from it directly. `archived_at`
+/// being `Some` is what flags the row as terminated to the CLI.
+fn archived_plan_summary(archived: &trade_control_core::state::ArchivedPlan) -> PlanSummary {
+    let plan = &archived.plan;
+    let state = &archived.final_state;
+    PlanSummary {
+        trade_id: plan.trade_id.clone(),
+        account: archived.account.clone(),
+        instrument: plan.instrument.clone(),
+        granularity: plan.granularity,
+        shadow: plan.shadow,
+        rules: plan.rules.len(),
+        phase: Some(state.phase),
+        watermark: state.watermark,
+        fired: state.fired.iter().cloned().collect(),
+        retest_seen_at: state.retest_seen_at,
+        archived_at: Some(archived.archived_at),
     }
 }
 
@@ -2923,9 +2967,13 @@ async fn handle_plan_show(
 /// state — the inverse of `register`. The target is named by
 /// `intent.trade_id`; we scan every account scope (as `plan-show` does) and
 /// delete each matching `plan:` + `plan-state:` row, so the operator can
-/// re-arm a setup after editing its chart. Idempotent and KV-only: a delete
-/// of a non-existent plan returns `ok` (count 0), never an error — re-running
-/// `plan delete` is always safe.
+/// re-arm a setup after editing its chart. We **also** clear any matching
+/// archived (terminated) plan, so a vetoed/completed plan surfaced by
+/// `plan list --include-all` can be dropped after analysis — and so an id that
+/// only exists in the archive (the common case: the live rows were already
+/// deleted on the terminal tick) is still deletable. Idempotent and KV-only: a
+/// delete of a non-existent plan returns `ok` (count 0), never an error —
+/// re-running `plan delete` is always safe.
 async fn handle_plan_delete(
     store: &KvStateStore,
     verified: &incoming::Verified,
@@ -2963,6 +3011,33 @@ async fn handle_plan_delete(
         deleted += 1;
         rlog!(
             "plan-delete: trade_id={target} account={} deleted",
+            account.unwrap_or("<global>")
+        );
+    }
+
+    // Also clear any archived copy. A terminated plan usually exists ONLY here
+    // (its live rows were deleted on the terminal tick), so this is the path
+    // that actually removes it; it counts toward `deleted` so the operator sees
+    // a non-zero count.
+    let archived = match store.list_all_archived_plans().await {
+        Ok(v) => v,
+        Err(err) => {
+            rlog_err!("plan-delete: list_all_archived_plans: {err}");
+            return Response::error("state error", 500);
+        }
+    };
+    for stored in &archived {
+        if stored.plan.trade_id != target {
+            continue;
+        }
+        let account = stored.account.as_deref();
+        if let Err(err) = store.clear_archived_plan(account, target).await {
+            rlog_err!("plan-delete: clear_archived_plan({target}): {err}");
+            return Response::error("state error", 500);
+        }
+        deleted += 1;
+        rlog!(
+            "plan-delete: trade_id={target} account={} archived-cleared",
             account.unwrap_or("<global>")
         );
     }
@@ -3761,6 +3836,27 @@ mod dispatcher_outcome_tests {
         ) -> Result<(), StateError> {
             Ok(())
         }
+        async fn archive_plan(
+            &self,
+            _account: Option<&str>,
+            _plan: &trade_control_core::trade_plan::TradePlan,
+            _final_state: &trade_control_core::plan_state::PlanState,
+            _archived_at: DateTime<Utc>,
+        ) -> Result<(), StateError> {
+            Ok(())
+        }
+        async fn list_all_archived_plans(
+            &self,
+        ) -> Result<Vec<trade_control_core::state::ArchivedPlan>, StateError> {
+            Ok(vec![])
+        }
+        async fn clear_archived_plan(
+            &self,
+            _account: Option<&str>,
+            _trade_id: &str,
+        ) -> Result<(), StateError> {
+            Ok(())
+        }
     }
 
     fn now() -> DateTime<Utc> {
@@ -3840,6 +3936,7 @@ mod dispatcher_outcome_tests {
                 pip_size: None,
                 trade_plan: None,
                 blackout_close: trade_control_core::intent::BlackoutCloseAction::default(),
+                include_archived: false,
             },
         }
     }

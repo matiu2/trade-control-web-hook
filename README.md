@@ -65,18 +65,22 @@ Trading:
   it still records `seen` and is fully idempotent. **TradeNation only** — a
   non-TN intent is rejected `400`. These hours feed the upcoming market-hours
   entry blackout.
-- `plan-list` — read-only: list every registered server-side `TradePlan` the
-  engine is evaluating, each with a compact summary of its current `PlanState`
-  (phase, watermark, fired rules, shadow flag). Drives `trade-control plan
-  list`. KV-only, idempotent.
+- `plan-list` — read-only: list the registered server-side `TradePlan`s, each
+  with a compact summary of its current `PlanState` (phase, watermark, fired
+  rules, shadow flag). Lists live plans by default; the intent's
+  `include_archived` flag (CLI `--include-all`) also lists terminated
+  (vetoed/completed) plans retained in the archive keyspace. Drives
+  `trade-control plan list`. KV-only, idempotent.
 - `plan-show` — read-only: dump one plan in full (every rule + its persisted
   `PlanState`). Target named by the intent's `trade_id`; the worker scans all
   account scopes. Drives `trade-control plan show <trade_id>`. KV-only.
 - `plan-delete` — drop a registered plan and its `PlanState` — the inverse of
   `register`. Target named by the intent's `trade_id`; the worker scans all
-  account scopes and deletes the matching `plan:` + `plan-state:` rows. Drives
-  `trade-control plan delete <trade_id>`. KV-only, idempotent (deleting a
-  missing plan is a no-op). Use to re-arm a setup after editing its chart.
+  account scopes and deletes the matching `plan:` + `plan-state:` rows **and**
+  any matching `archived-plan:` row (so a terminated plan can be cleared after
+  analysis). Drives `trade-control plan delete <trade_id>`. KV-only, idempotent
+  (deleting a missing plan is a no-op). Use to re-arm a setup after editing its
+  chart, or to clear an archived plan once analyzed.
 - `unlock` — clear the cooldown for one instrument. Recovery for an
   `invalidate` you didn't mean to send.
 
@@ -1895,32 +1899,49 @@ useful during the parallel-run period to confirm a plan registered, whether
 it's in shadow mode, and how far its FSM has progressed:
 
 ```sh
-trade-control-dev plan list                # compact table of every plan + state
+trade-control-dev plan list                # compact table of every LIVE plan + state
+trade-control-dev plan list --include-all  # also list terminated (vetoed/completed) plans
 trade-control-dev plan list --yaml         # raw worker YAML (one entry per plan)
 trade-control-dev plan show eurusd-hs-7    # full dump of one plan + its state
 trade-control-dev plan show eurusd-hs-7 --yaml
-trade-control-dev plan delete eurusd-hs-7  # drop a plan so the setup can be re-armed
+trade-control-dev plan delete eurusd-hs-7  # drop a plan (live and/or archived)
 ```
 
 `plan list` shows `TRADE_ID`, `ACCOUNT`, `INSTRUMENT`, `SHADOW`, `PHASE`,
-`RULES`, and `FIRED` (the rule_ids that have latched). The state columns
-(`PHASE`, `FIRED`, …) are blank until a plan's first cron tick seeds its
-state row, so a freshly-registered plan lists with empty state until the next
-`*/15` tick. `plan show <trade_id>` scans every account scope for that id and
-dumps the whole `TradePlan` (every rule + embedded intent) plus the persisted
-`PlanState`. `plan list` / `plan show` are read-only KV-only control actions
-(`plan-list` / `plan-show`), signed like `status`, hitting the baked endpoint
-with no extra flag. A `plan show` for an unknown id exits non-zero with `no
-registered plan with trade_id …`.
+`RULES`, `FIRED` (the rule_ids that have latched), and `ARCHIVED` (the archive
+timestamp, blank for live plans). The state columns (`PHASE`, `FIRED`, …) are
+blank until a plan's first cron tick seeds its state row, so a freshly-registered
+plan lists with empty state until the next `*/15` tick. `plan show <trade_id>`
+scans every account scope for that id and dumps the whole `TradePlan` (every rule
++ embedded intent) plus the persisted `PlanState`. `plan list` / `plan show` are
+read-only KV-only control actions (`plan-list` / `plan-show`), signed like
+`status`, hitting the baked endpoint with no extra flag. A `plan show` for an
+unknown id exits non-zero with `no registered plan with trade_id …`.
+
+**Archived (terminated) plans.** When a plan reaches a terminal phase — a veto
+fired, or the single-shot entry was dispatched — the engine deletes its live
+`plan:` / `plan-state:` rows on that cron tick so it stops ticking. Before
+deleting, it **archives** the plan (plan body + terminal `PlanState`) to an
+`archived-plan:{scope}:{trade_id}` KV key, so a vetoed/completed setup can still
+be analyzed afterward. Plain `plan list` shows only the live plans (what the
+engine is still evaluating); `plan list --include-all` (alias
+`--include-archived`) also lists the archived ones, marked by their `ARCHIVED`
+timestamp. Use `plan show` / the R2 tick-bundles for the per-tick detail of why
+a plan terminated. **Archived plans have no TTL** — they accumulate until you
+delete them explicitly, so clean up with `plan delete` once you're done
+analyzing.
 
 `plan delete <trade_id>` is the inverse of `register`: it scans every account
-scope and drops the matching `plan:` and `plan-state:` rows, so the engine
-stops evaluating that plan. It's KV-only and **idempotent** — deleting a plan
-that doesn't exist returns `ok` (reported as a no-op), so re-running is safe.
-The intended workflow: `tv-arm` registers a plan and draws its news/blackout
-lines on the chart; if you tweak or remove some of those lines, run `plan
-delete <trade_id>` to wipe the stale server plan, then re-run `tv-arm` to
-register the corrected one.
+scope and drops the matching `plan:` and `plan-state:` rows **and** any matching
+`archived-plan:` row, so the engine stops evaluating a live plan and a terminated
+plan is cleared from the archive. (A terminated plan usually exists only in the
+archive, so this is what actually removes it.) It's KV-only and **idempotent** —
+deleting a plan that doesn't exist returns `ok` (reported as a no-op), so
+re-running is safe. The intended workflows: (1) `tv-arm` registers a plan and
+draws its news/blackout lines; if you tweak or remove some, run `plan delete
+<trade_id>` to wipe the stale server plan, then re-run `tv-arm` to register the
+corrected one; (2) after a plan vetoed and you've analyzed it via `plan list
+--include-all`, `plan delete <trade_id>` clears the archive.
 
 Skipped preps are pre-fired directly to the worker so the entry's
 `requires_preps:` gate is still satisfied — useful when joining a setup

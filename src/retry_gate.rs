@@ -922,6 +922,27 @@ mod tests {
         ) -> Result<(), StateError> {
             Ok(())
         }
+        async fn archive_plan(
+            &self,
+            _account: Option<&str>,
+            _plan: &trade_control_core::trade_plan::TradePlan,
+            _final_state: &trade_control_core::plan_state::PlanState,
+            _archived_at: DateTime<Utc>,
+        ) -> Result<(), StateError> {
+            Ok(())
+        }
+        async fn list_all_archived_plans(
+            &self,
+        ) -> Result<Vec<trade_control_core::state::ArchivedPlan>, StateError> {
+            Ok(vec![])
+        }
+        async fn clear_archived_plan(
+            &self,
+            _account: Option<&str>,
+            _trade_id: &str,
+        ) -> Result<(), StateError> {
+            Ok(())
+        }
     }
 
     fn ts(s: &str) -> DateTime<Utc> {
@@ -984,6 +1005,7 @@ mod tests {
             pip_size: None,
             trade_plan: None,
             blackout_close: trade_control_core::intent::BlackoutCloseAction::default(),
+            include_archived: false,
         }
     }
 

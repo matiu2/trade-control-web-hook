@@ -1008,6 +1008,38 @@ pub trait StateStore {
         account: Option<&str>,
         trade_id: &str,
     ) -> impl Future<Output = Result<(), StateError>>;
+
+    // ----- Server-side engine: archived (terminated) plans -----
+
+    /// Snapshot a finished plan into the archive keyspace so it survives the
+    /// terminal cron tick's `clear_trade_plan` / `clear_plan_state`. Called from
+    /// the engine's `done` branch *before* the live rows are dropped, so
+    /// `plan list --include-all` can still surface a vetoed/completed plan for
+    /// post-mortem. Keyed `archived-plan:{scope}:{trade_id}`. Unlike the live
+    /// `plan:` row this is written with **no TTL** — archived plans accumulate
+    /// until an operator runs `plan delete`. `final_state` is the terminal
+    /// [`PlanState`] (its `phase`/`fired` record *why* the plan ended).
+    fn archive_plan(
+        &self,
+        account: Option<&str>,
+        plan: &TradePlan,
+        final_state: &PlanState,
+        archived_at: DateTime<Utc>,
+    ) -> impl Future<Output = Result<(), StateError>>;
+
+    /// Enumerate every archived plan across all account scopes (mirrors
+    /// [`Self::list_all_trade_plans`]). Read by `plan list --include-all`.
+    fn list_all_archived_plans(
+        &self,
+    ) -> impl Future<Output = Result<Vec<ArchivedPlan>, StateError>>;
+
+    /// Delete an archived plan. Best-effort (no-op if already gone). Called by
+    /// `plan delete` so a terminated plan can be cleared after analysis.
+    fn clear_archived_plan(
+        &self,
+        account: Option<&str>,
+        trade_id: &str,
+    ) -> impl Future<Output = Result<(), StateError>>;
 }
 
 /// A registered plan paired with the account scope it was stored under, as
@@ -1021,6 +1053,29 @@ pub struct StoredPlan {
     /// (parsed back from the key's `{scope}` segment).
     pub account: Option<String>,
     pub plan: TradePlan,
+}
+
+/// A terminated plan retained for post-mortem analysis, as written by
+/// [`StateStore::archive_plan`] and returned by
+/// [`StateStore::list_all_archived_plans`]. The body is JSON-serialised under
+/// `archived-plan:{scope}:{trade_id}`; the account is recovered from the key
+/// scope (like [`StoredPlan`]), so it is **not** part of the serialised body.
+///
+/// No `PartialEq` — `TradePlan` carries an `Intent`, which isn't `PartialEq`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ArchivedPlan {
+    /// `None` for a globally-scoped plan; `Some(name)` for an account-scoped one
+    /// (parsed back from the key scope on read — `#[serde(skip)]` so it never
+    /// rides in the stored body, the single source of truth being the key).
+    #[serde(skip)]
+    pub account: Option<String>,
+    /// The plan as registered.
+    pub plan: TradePlan,
+    /// The terminal engine state — its `phase`/`fired` say *why* the plan ended
+    /// (a fired veto rule vs. a dispatched entry).
+    pub final_state: PlanState,
+    /// When the engine archived it (the terminal cron tick's `now`).
+    pub archived_at: DateTime<Utc>,
 }
 
 /// Maximum number of recent seen ids retained in the index. Tuning knob;
@@ -1103,6 +1158,12 @@ impl std::error::Error for StateError {}
 
 /// Cloudflare KV's minimum TTL is 60 seconds; clamp anything smaller.
 pub const MIN_TTL_SECONDS: u64 = 60;
+
+/// "No expiry" sentinel for the in-memory test store, which (unlike real KV)
+/// keys every row on a TTL stamp. Archived plans are written to real KV with no
+/// `expiration_ttl` at all; the test store emulates "never" with a far-future
+/// stamp (~100 years). Not used by the production KV impl.
+pub const NO_TTL_SECONDS: u64 = 100 * 365 * 24 * 3600;
 
 /// Compute the effective TTL (in seconds) for a veto record.
 ///
@@ -1923,6 +1984,62 @@ mod memstore {
             trade_id: &str,
         ) -> Result<(), StateError> {
             self.delete(&format!("plan-state:{}:{trade_id}", account_scope(account)));
+            Ok(())
+        }
+
+        async fn archive_plan(
+            &self,
+            account: Option<&str>,
+            plan: &TradePlan,
+            final_state: &PlanState,
+            archived_at: DateTime<Utc>,
+        ) -> Result<(), StateError> {
+            let key = format!("archived-plan:{}:{}", account_scope(account), plan.trade_id);
+            let archived = ArchivedPlan {
+                account: None, // recovered from the key on read; skipped in the body
+                plan: plan.clone(),
+                final_state: final_state.clone(),
+                archived_at,
+            };
+            let body = serde_json::to_string(&archived)
+                .map_err(|e| StateError::Backend(format!("encode archived plan: {e}")))?;
+            // No TTL: archived plans persist until `plan delete`. The in-memory
+            // store keys on expiry, so use a far-future stamp as "never".
+            self.put(key, body, NO_TTL_SECONDS, Utc::now());
+            Ok(())
+        }
+
+        async fn list_all_archived_plans(&self) -> Result<Vec<ArchivedPlan>, StateError> {
+            let now = Utc::now();
+            let inner = self.inner.borrow();
+            let mut out = Vec::new();
+            for (key, (val, exp)) in inner.iter() {
+                let Some(rest) = key.strip_prefix("archived-plan:") else {
+                    continue;
+                };
+                if *exp <= now {
+                    continue;
+                }
+                let Some((scope, _trade_id)) = rest.split_once(':') else {
+                    continue;
+                };
+                let mut archived: ArchivedPlan = serde_json::from_str(val)
+                    .map_err(|e| StateError::Backend(format!("decode archived plan: {e}")))?;
+                archived.account = account_from_scope(scope);
+                out.push(archived);
+            }
+            Ok(out)
+        }
+
+        async fn clear_archived_plan(
+            &self,
+            account: Option<&str>,
+            trade_id: &str,
+        ) -> Result<(), StateError> {
+            self.delete(&format!(
+                "archived-plan:{}:{trade_id}",
+                account_scope(account)
+            ));
             Ok(())
         }
     }
@@ -3370,5 +3487,46 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[test]
+    fn memstore_archived_plan_round_trips_lists_and_clears() {
+        use super::memstore::MemStateStore;
+        use crate::plan_state::{Phase, PlanState};
+        let store = MemStateStore::new();
+
+        // Terminal state: a veto fired and latched, phase advanced to Done.
+        let mut term = PlanState::seed(Phase::Done, ts("2026-06-20T00:00:00Z"));
+        term.fired.insert("01-veto-too-high".into());
+        let when = ts("2026-06-19T09:00:00Z");
+
+        pollster::block_on(store.archive_plan(None, &sample_plan("hs-global"), &term, when))
+            .unwrap();
+        pollster::block_on(store.archive_plan(
+            Some("reversals"),
+            &sample_plan("hs-scoped"),
+            &term,
+            when,
+        ))
+        .unwrap();
+
+        let mut all = pollster::block_on(store.list_all_archived_plans()).unwrap();
+        all.sort_by(|a, b| a.plan.trade_id.cmp(&b.plan.trade_id));
+        assert_eq!(all.len(), 2);
+
+        let global = all.iter().find(|a| a.plan.trade_id == "hs-global").unwrap();
+        assert_eq!(global.account, None);
+        let scoped = all.iter().find(|a| a.plan.trade_id == "hs-scoped").unwrap();
+        // Account is recovered from the key scope, not the (skipped) body.
+        assert_eq!(scoped.account.as_deref(), Some("reversals"));
+        assert_eq!(scoped.final_state.phase, Phase::Done);
+        assert!(scoped.final_state.fired.contains("01-veto-too-high"));
+        assert_eq!(scoped.archived_at, when);
+
+        // delete clears one scope, leaves the other.
+        pollster::block_on(store.clear_archived_plan(Some("reversals"), "hs-scoped")).unwrap();
+        let remaining = pollster::block_on(store.list_all_archived_plans()).unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].plan.trade_id, "hs-global");
     }
 }

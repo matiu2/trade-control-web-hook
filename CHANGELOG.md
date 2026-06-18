@@ -1,5 +1,53 @@
 # Changelog
 
+## v41 — 2026-06-19 — archive terminal plans for post-mortem (`plan list --include-all`)
+
+### Why
+
+When a registered plan reached a terminal phase (a veto fired, or the
+single-shot entry was dispatched) the cron engine deleted both its `plan:` and
+`plan-state:` KV rows on that tick (`src/cron/engine.rs` `persist_plan_state`).
+`plan list` scans the `plan:` prefix, so a vetoed/completed plan vanished — there
+was no way to list it afterward to analyze why it terminated.
+
+### What changed
+
+- **Archive instead of plain delete.** On the terminal cron tick the engine now
+  snapshots the finished plan (plan body + terminal `PlanState`) to a new
+  `archived-plan:{scope}:{trade_id}` KV key *before* clearing the live rows. A
+  failed archive is logged but doesn't fail the tick.
+- **`plan list --include-all`** (alias `--include-archived`) also lists archived
+  plans; plain `plan list` still shows only live plans. New `ARCHIVED` column
+  carries the archive timestamp (blank for live plans).
+- **`plan delete <trade_id>`** now also clears any matching `archived-plan:` row
+  — so a terminated plan (which usually exists *only* in the archive) is
+  deletable after analysis. Still idempotent.
+- **No TTL on archived plans** — they persist until `plan delete`. Documented as
+  a manual-cleanup keyspace.
+
+### Breaking
+
+- `cli::build_plan_list_intent` gained a third `include_archived: bool` argument.
+- `StateStore` gained three methods: `archive_plan`, `list_all_archived_plans`,
+  `clear_archived_plan` (implemented for the KV store and the in-memory test
+  store).
+
+### Config
+
+- New signed top-level `Intent.include_archived: bool` (default false, elided
+  when false → wire form byte-identical for existing `plan-list` intents).
+
+### Tests
+
+- `memstore_archived_plan_round_trips_lists_and_clears` — archive round-trip,
+  scope recovery from the key, terminal-state capture, list, and scoped clear.
+
+### Follow-up
+
+- The `trading-tax-tracker` R2 consumer reads the `req/`/`ticks/` prefixes, not
+  KV — it has no view of archived plans. If post-mortem tooling wants the
+  archive, expose it via a read path there.
+
 ## v40 — 2026-06-18 — `tv-arm --update`: re-arm an existing engine plan
 
 ### Why

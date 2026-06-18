@@ -1474,8 +1474,10 @@ fn update_existing_plan(
     key: &[u8; KEY_LEN],
     now: DateTime<Utc>,
 ) -> Result<()> {
-    // Query the registered plans so an auto-resolve can count them per instrument.
-    let list_intent = cli::build_plan_list_intent(now, &register_suffix(now));
+    // Query the registered plans so an auto-resolve can count them per
+    // instrument. Live plans only (`include_archived: false`) — a terminated
+    // plan in the archive must not count against the per-instrument tally.
+    let list_intent = cli::build_plan_list_intent(now, &register_suffix(now), false);
     let list_body = cli::wrap_signed(&list_intent, key, now).wrap_err("sign plan-list intent")?;
     let yaml = post_intent_blocking(list_body).wrap_err("query plan-list for --update")?;
     let plans: Vec<PlanListEntry> =
