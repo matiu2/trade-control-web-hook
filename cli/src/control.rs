@@ -304,6 +304,40 @@ pub fn wrap_signed_template_drawing(intent: &Intent, key: &[u8; KEY_LEN]) -> Res
     build_signed_body(intent, key, &shell_for_tv_template_drawing())
 }
 
+/// Build a signed body for an enter intent **POSTed directly to the
+/// worker** (no TradingView in the loop) — the position-tool direct
+/// entry. There are no `{{plot(…)}}` placeholders to substitute, so the
+/// shell carries a concrete `reference_price` as `close`/`high`/`low`
+/// and `now` as `time`.
+///
+/// `reference_price` must be the entry price the operator drew: the
+/// worker's resolver range-checks `stop_loss < close < take_profit`
+/// (long) / `take_profit < close < stop_loss` (short) and derives the
+/// R-multiple from it, so a placeholder zero would be rejected as
+/// `EntryOutsideRange`. The actual broker fill for a `Market` entry is
+/// at live price; this reference is the operator's drawn entry, which is
+/// the right basis for the geometry/R checks.
+pub fn wrap_signed_direct_enter(
+    intent: &Intent,
+    key: &[u8; KEY_LEN],
+    reference_price: f64,
+    now: DateTime<Utc>,
+) -> Result<String> {
+    build_signed_body(intent, key, &shell_for_direct_enter(reference_price, now))
+}
+
+/// Self-contained shell for a directly-POSTed enter: the drawn entry
+/// price stamped on `close`/`high`/`low`, and `now` on `time`.
+fn shell_for_direct_enter(reference_price: f64, now: DateTime<Utc>) -> Vec<(&'static str, String)> {
+    let price = format!("{reference_price}");
+    vec![
+        ("close", price.clone()),
+        ("high", price.clone()),
+        ("low", price),
+        ("time", format!("\"{}\"", now.to_rfc3339())),
+    ]
+}
+
 fn build_signed_body(
     intent: &Intent,
     key: &[u8; KEY_LEN],

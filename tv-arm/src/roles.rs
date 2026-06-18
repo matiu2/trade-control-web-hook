@@ -40,6 +40,35 @@ mod kind {
     /// text property, so it's detected purely by geometry (3 anchors,
     /// all inside the visible range) — see [`super::classify`].
     pub const PATH: &str = "path";
+    /// TradingView short-position tool. Entry is `points[0].price`;
+    /// `stopLevel`/`profitLevel` (tick distances) come from properties.
+    /// Detected purely by kind — the tool has no label.
+    pub const SHORT_POSITION: &str = "short_position";
+    /// TradingView long-position tool. Same shape as `SHORT_POSITION`.
+    pub const LONG_POSITION: &str = "long_position";
+}
+
+/// Direction a position-tool drawing represents, read straight from the
+/// drawing kind (`short_position` / `long_position`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PositionDirection {
+    /// `long_position` — SL sits below entry, TP above.
+    Long,
+    /// `short_position` — SL sits above entry, TP below.
+    Short,
+}
+
+/// A long/short position tool the operator drew on the chart. The
+/// drawing carries an entry anchor (`points[0].price`) and tick-distance
+/// `stopLevel`/`profitLevel` in its properties; the conversion to
+/// absolute SL/TP prices lives in [`super::position_trade`].
+#[derive(Debug, Clone)]
+pub struct PositionDrawing {
+    /// Long or short, from the drawing kind.
+    pub direction: PositionDirection,
+    /// The raw drawing — entry is `points[0].price`, levels are in
+    /// `properties.stop_level` / `properties.profit_level`.
+    pub drawing: Drawing,
 }
 
 /// Everything `classify()` extracts from the chart, grouped by role.
@@ -80,6 +109,10 @@ pub struct Roles {
     /// point), C (neckline)]` in draw order. Latest-wins when several
     /// qualify. `None` for a plain H&S chart.
     pub mw_path: Option<Drawing>,
+    /// A long/short **position** tool — the direct-entry path. Detected
+    /// by kind alone (the tool has no label). Latest-wins when several
+    /// are drawn. `None` unless the operator drew a position tool.
+    pub position: Option<PositionDrawing>,
 }
 
 /// Anything that can hand us a `Drawing` by ID. The production impl is
@@ -125,6 +158,8 @@ pub fn classify<F: DrawingFetcher>(
     // Candidate M/W paths: 3-anchor `path` drawings inside the visible
     // range. Latest-wins resolved after the loop.
     let mut mw_paths: Vec<Drawing> = Vec::new();
+    // Candidate position tools (long/short). Latest-wins after the loop.
+    let mut positions: Vec<PositionDrawing> = Vec::new();
 
     for stub in stubs {
         let d = fetcher.get_drawing(&stub.id)?;
@@ -191,6 +226,21 @@ pub fn classify<F: DrawingFetcher>(
                 mw_paths.push(d);
                 Some("mw_path")
             }
+            // Position tools have no label; direction is the kind. We
+            // require an entry anchor and both tick levels so a
+            // half-drawn tool is ignored rather than guessed at.
+            kind::SHORT_POSITION | kind::LONG_POSITION if is_position(&d) => {
+                let direction = if kind == kind::SHORT_POSITION {
+                    PositionDirection::Short
+                } else {
+                    PositionDirection::Long
+                };
+                positions.push(PositionDrawing {
+                    direction,
+                    drawing: d,
+                });
+                Some("position")
+            }
             _ => None,
         };
         match role {
@@ -220,8 +270,33 @@ pub fn classify<F: DrawingFetcher>(
     roles.sr_levels = sr_levels;
     roles.prep_expiries = latest_prep_expiry_per_step(prep_expiry_lines);
     roles.mw_path = latest_only(mw_paths, "mw_path");
+    roles.position = latest_position(positions);
 
     Ok(roles)
+}
+
+/// A position tool qualifies only when it has an entry anchor and both
+/// tick levels — a half-drawn tool (no stop or no target) is ignored so
+/// the pipeline never arms an entry missing a leg.
+fn is_position(d: &Drawing) -> bool {
+    !d.points.is_empty() && d.properties.stop_level.is_some() && d.properties.profit_level.is_some()
+}
+
+/// Latest-wins for position tools (the `PositionDrawing` wrapper means
+/// `latest_only` can't be reused directly). Newest anchor time wins; a
+/// note is logged when the operator left more than one on the chart.
+fn latest_position(mut cands: Vec<PositionDrawing>) -> Option<PositionDrawing> {
+    if cands.is_empty() {
+        return None;
+    }
+    if cands.len() > 1 {
+        info!(
+            count = cands.len(),
+            "multiple position tools on chart; picking the latest"
+        );
+    }
+    cands.sort_by_key(|p| p.drawing.latest_time());
+    cands.pop()
 }
 
 /// A `path` drawing qualifies as the M/W marker iff it has exactly 3
@@ -329,6 +404,25 @@ mod tests {
                 .collect(),
             properties: Properties {
                 text: Some(label.to_string()),
+                ..Default::default()
+            },
+        }
+    }
+
+    /// A position-tool drawing: single entry anchor + tick levels, no
+    /// label (matches what tv-mcp emits for long/short position tools).
+    fn position(id: &str, entry: f64, t: i64, stop_level: f64, profit_level: f64) -> Drawing {
+        Drawing {
+            id: id.to_string(),
+            points: vec![Point {
+                time: t,
+                price: entry,
+            }],
+            properties: Properties {
+                text: None,
+                stop_level: Some(stop_level),
+                profit_level: Some(profit_level),
+                qty: Some(0.01),
             },
         }
     }
@@ -657,5 +751,69 @@ mod tests {
         ]);
         let roles = classify(&mcp, &stubs, (50, 800)).expect("ok");
         assert_eq!(roles.mw_path.unwrap().id, "new");
+    }
+
+    #[test]
+    fn short_position_classifies_with_direction() {
+        let (stubs, mcp) = fixture(vec![(
+            stub("sp", "short_position"),
+            position("sp", 23475.0, 1773738000, 3000.0, 7007.0),
+        )]);
+        let roles = classify(&mcp, &stubs, ANY_RANGE).expect("ok");
+        let pos = roles.position.expect("position present");
+        assert_eq!(pos.direction, PositionDirection::Short);
+        assert_eq!(pos.drawing.points[0].price, 23475.0);
+        assert_eq!(pos.drawing.properties.stop_level, Some(3000.0));
+        assert_eq!(pos.drawing.properties.profit_level, Some(7007.0));
+    }
+
+    #[test]
+    fn long_position_classifies_with_direction() {
+        let (stubs, mcp) = fixture(vec![(
+            stub("lp", "long_position"),
+            position("lp", 24195.3, 1778702400, 801.0, 2223.0),
+        )]);
+        let roles = classify(&mcp, &stubs, ANY_RANGE).expect("ok");
+        assert_eq!(roles.position.unwrap().direction, PositionDirection::Long);
+    }
+
+    #[test]
+    fn half_drawn_position_without_levels_is_ignored() {
+        // A position tool missing its profit level isn't a complete
+        // setup — ignore it rather than arm a TP-less entry.
+        let half = Drawing {
+            id: "h".into(),
+            points: vec![Point {
+                time: 100,
+                price: 100.0,
+            }],
+            properties: Properties {
+                text: None,
+                stop_level: Some(50.0),
+                profit_level: None,
+                qty: None,
+            },
+        };
+        let (stubs, mcp) = fixture(vec![(stub("h", "short_position"), half)]);
+        let roles = classify(&mcp, &stubs, ANY_RANGE).expect("ok");
+        assert!(roles.position.is_none());
+    }
+
+    #[test]
+    fn duplicate_positions_keep_latest() {
+        let (stubs, mcp) = fixture(vec![
+            (
+                stub("old", "short_position"),
+                position("old", 100.0, 100, 30.0, 70.0),
+            ),
+            (
+                stub("new", "long_position"),
+                position("new", 200.0, 900, 40.0, 80.0),
+            ),
+        ]);
+        let roles = classify(&mcp, &stubs, ANY_RANGE).expect("ok");
+        let pos = roles.position.unwrap();
+        assert_eq!(pos.drawing.id, "new");
+        assert_eq!(pos.direction, PositionDirection::Long);
     }
 }

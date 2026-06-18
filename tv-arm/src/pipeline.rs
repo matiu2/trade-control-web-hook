@@ -28,10 +28,13 @@ use trade_control_core::sig::KEY_LEN;
 
 use crate::alert_spec::{AlertPayload, CalendarWindow, DispatchContext, build_alert_spec};
 use crate::args::Args;
+use crate::args::PositionEntry;
 use crate::create_alerts::create_alerts;
 use crate::geometry::tp_price_from_fib;
+use crate::instrument_resolution::ResolvedInstrument;
 use crate::manifest::{CalendarBundle, discover_calendar_bundles};
 use crate::mw_geometry;
+use crate::position_trade::{core_direction, resolve_levels};
 use crate::post_outcome::{Outcome, classify as classify_outcome};
 use crate::register_post::{post_intent_blocking, post_register_blocking};
 use crate::roles::{Roles, classify};
@@ -115,6 +118,31 @@ pub fn run(args: Args) -> Result<i32> {
         }
     }
 
+    let key = read_key()?;
+    let account = resolve_account(&args, broker);
+    let out_dir = arm_out_dir(&raw_sym)?;
+    let now = Utc::now();
+
+    // 2c. Position-tool direct entry. When one of --market-entry /
+    //     --stop-entry / --limit-entry is set, ignore the pattern
+    //     machinery entirely: read the drawn long/short position tool,
+    //     convert its tick-distance SL/TP to absolute prices, and POST a
+    //     signed enter straight to the worker (placed on receipt). This
+    //     short-circuits the whole pattern flow below.
+    if let Some(mode) = args.position_entry_mode() {
+        return run_position_entry(
+            &args,
+            mode,
+            broker,
+            &roles,
+            &resolved,
+            &instrument,
+            &account,
+            &key,
+            now,
+        );
+    }
+
     // 3. Validate required drawings + resolve direction + build the
     //    trade spec. M/W (a path drawing is present) and H&S diverge
     //    completely here: M/W has no invalidation / TP-fib / prep
@@ -122,10 +150,6 @@ pub fn run(args: Args) -> Result<i32> {
     //    and the worker computes entry/SL/TP from baked params. The
     //    `?`-returning resolver hard-errors on a bad setup; a clean
     //    operator-facing rejection returns Ok(1).
-    let key = read_key()?;
-    let account = resolve_account(&args, broker);
-    let out_dir = arm_out_dir(&raw_sym)?;
-    let now = Utc::now();
     let resolved_spec = if roles.mw_path.is_some() {
         // Pip size for the baked MwSpec comes from the canonical
         // instrument-lookup catalog (`asset.pip_size`), overridable via
@@ -725,6 +749,9 @@ fn build_mw_trade_spec(
         // the M/W build path. Set to the neckline as a harmless,
         // non-zero placeholder so any accidental serialization is sane.
         tp_price: round5(anchors.neckline),
+        // M/W anchors SL via the worker-computed geometry, not an
+        // absolute drawn stop.
+        sl_price: None,
         entry_deadline_pct: 80,
         allow_entry: args.entry_filter_script.clone(),
         // M/W entry is always a stop order at the worker-computed level;
@@ -930,6 +957,8 @@ fn build_trade_spec(
         sl_offset_pips: None,
         sl_anchor: None,
         tp_price: round5(tp),
+        // H&S anchors SL to the pattern extreme, not an absolute price.
+        sl_price: None,
         entry_deadline_pct: 80,
         allow_entry: args.entry_filter_script.clone(),
         entry_mode: if args.entry_market {
@@ -1100,6 +1129,103 @@ fn build_news_bundles(
     }
     info!(count = bundles.len(), "news bundles built");
     Ok(bundles)
+}
+
+/// Position-tool direct entry. Read the drawn long/short position tool,
+/// convert its tick-distance SL/TP to absolute prices via the catalog
+/// `tick_size`, build + sign a naked enter, and POST it straight to the
+/// worker (placed on receipt). Returns the process exit code: `1` for a
+/// clean operator-facing rejection (no position drawn, stop/limit not
+/// supported yet), propagated `Err` for a real failure.
+#[allow(clippy::too_many_arguments)]
+fn run_position_entry(
+    args: &Args,
+    mode: PositionEntry,
+    broker: Broker,
+    roles: &Roles,
+    resolved: &ResolvedInstrument,
+    instrument: &str,
+    account: &str,
+    key: &[u8; KEY_LEN],
+    now: DateTime<Utc>,
+) -> Result<i32> {
+    let Some(pos) = roles.position.as_ref() else {
+        eprintln!(
+            "ERROR: --{}-entry was set but no long/short position tool is drawn on the chart.",
+            match mode {
+                PositionEntry::Market => "market",
+                PositionEntry::Stop => "stop",
+                PositionEntry::Limit => "limit",
+            }
+        );
+        return Ok(1);
+    };
+
+    // Tick-distance SL/TP → absolute prices. tick_size is the catalog
+    // value (NOT pip_size — see position_trade docs).
+    let levels = resolve_levels(pos, resolved.asset.tick_size)?;
+
+    // Expiry: a drawn trade-expiry line wins; otherwise now + flag hours.
+    let trade_expiry = match read_trade_expiry(roles) {
+        Ok(t) => t,
+        Err(_) => now + chrono::Duration::hours(i64::from(args.expiry_hours)),
+    };
+
+    let kind = match mode {
+        PositionEntry::Market => cli::PositionEntryKind::Market,
+        PositionEntry::Stop => cli::PositionEntryKind::Stop,
+        PositionEntry::Limit => cli::PositionEntryKind::Limit,
+    };
+    let direction = core_direction(pos.direction);
+
+    info!(
+        instrument,
+        direction = ?direction,
+        mode = ?mode,
+        entry = levels.entry,
+        stop_loss = levels.stop_loss,
+        take_profit = levels.take_profit,
+        tick_size = resolved.asset.tick_size,
+        trade_expiry = %trade_expiry.to_rfc3339(),
+        "position-tool direct entry"
+    );
+
+    let spec = cli::PositionEnterSpec {
+        instrument: instrument.to_string(),
+        account: account.to_string(),
+        broker: broker_to_kind(broker),
+        direction,
+        kind,
+        entry_price: levels.entry,
+        stop_loss: levels.stop_loss,
+        take_profit: levels.take_profit,
+        trade_expiry,
+        risk_amount: args.risk_amount,
+        pip_size: args.pip_size.or(Some(resolved.asset.pip_size)),
+        dry_run: args.broker_dry_run,
+    };
+
+    let (trade_id, signed_body) = match cli::build_position_enter(&spec, key, now) {
+        Ok(v) => v,
+        // Stop/Limit currently unsupported on the wire — clean rejection.
+        Err(e) => {
+            eprintln!("ERROR: {e}");
+            return Ok(1);
+        }
+    };
+
+    // Persist the signed body for audit (same place pattern bundles land).
+    let out_dir = arm_out_dir(instrument)?;
+    let body_path = out_dir.join(format!("{trade_id}-enter.yaml"));
+    fs::write(&body_path, &signed_body)
+        .with_context(|| format!("writing {}", body_path.display()))?;
+
+    // The whole point of the position path: POST straight to the worker,
+    // which places the order on receipt.
+    let resp = post_intent_blocking(signed_body).wrap_err("POST position enter to worker")?;
+    info!(trade_id = %trade_id, worker_response = %resp.trim(), "position enter POSTed");
+    println!("entered: trade_id={trade_id} — {}", resp.trim());
+    Ok(0)
 }
 
 /// Parse the trade-expiry timestamp from the classified drawings.
@@ -1583,7 +1709,10 @@ mod tests {
                 time: unix,
                 price: 1.0,
             }],
-            properties: Properties { text: None },
+            properties: Properties {
+                text: None,
+                ..Default::default()
+            },
         }
     }
 
@@ -1686,7 +1815,10 @@ mod tests {
                     price: p,
                 })
                 .collect(),
-            properties: Properties { text: None },
+            properties: Properties {
+                text: None,
+                ..Default::default()
+            },
         }
     }
 
@@ -1852,7 +1984,10 @@ mod tests {
                         price: 1.12,
                     },
                 ],
-                properties: Properties { text: None },
+                properties: Properties {
+                    text: None,
+                    ..Default::default()
+                },
             }),
             trade_expiry: Some(vline("exp", now().timestamp() + 86_400)),
             ..Default::default()

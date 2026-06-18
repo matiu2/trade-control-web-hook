@@ -157,6 +157,42 @@ emit a **different, smaller** bundle — no prep chain, single-shot:
 There is **no `06-close-on-reversal`** for M/W — the take-profit is a
 hard 1R, so there's no opposing-reversal close to arm.
 
+### Position-tool direct entry (`--market-entry` / `--stop-entry` / `--limit-entry`)
+
+For a manual trade you've already framed with a TradingView **position
+tool** (the long/short risk-reward rectangle), `tv-arm` can skip the
+whole pattern machinery and place the trade straight from the drawing.
+
+- Draw a `long_position` / `short_position` tool on the chart: drag the
+  entry, stop, and target to where you want them. (Optionally draw a
+  `trade-expiry` vertical line; otherwise `--expiry-hours` applies,
+  default 48h.)
+- Run `tv-arm-dev --market-entry` (or `--stop-entry` / `--limit-entry`).
+  Exactly one of the three may be set.
+
+`tv-arm` reads the tool's entry anchor (`points[0].price`) and its
+`stopLevel` / `profitLevel` — which TradingView stores as **tick
+distances**, not absolute prices — and converts them to absolute SL/TP
+via the catalog **`tick_size`** (from `instrument-lookup`, *not*
+`pip_size`; for FX the tick is 10× finer than a pip). Direction comes
+from the tool kind (short ⇒ stop above entry, target below).
+
+Unlike the pattern bundles, this path does **not** post a TradingView
+alert. It builds one signed `enter` intent (direction + `EntrySpec`,
+absolute `stop_loss` / `take_profit` as `PriceRef::Absolute`, the drawn
+entry as the signed shell reference price, the trade-expiry as
+`not_after`) and **POSTs it directly to the worker**, which places the
+order on receipt. No preps, no pattern vetos — it's a naked manual entry,
+still subject to the worker's replay / cooldown / market-hours /
+spread-blackout gates. `--risk-amount`, `--broker-dry-run`, and
+`--pip-size` apply as usual.
+
+**Status:** `--market-entry` is fully wired (market order, filled
+immediately). `--stop-entry` / `--limit-entry` are accepted but rejected
+at build time for now — a resting stop/limit needs an **absolute** entry
+*trigger* price on the wire, which `EntrySpec::Stop`/`Limit` can't yet
+express (they carry a geometry anchor). That's the next increment.
+
 ## General workflow
 
 The day-to-day loop, end to end:
