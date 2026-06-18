@@ -28,6 +28,7 @@ mod instrument_resolution;
 mod manifest;
 mod mw_geometry;
 mod pipeline;
+mod position_trade;
 mod post_outcome;
 mod register_post;
 mod roles;

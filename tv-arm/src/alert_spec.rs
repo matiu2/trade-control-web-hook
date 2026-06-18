@@ -519,6 +519,7 @@ mod tests {
                 .collect(),
             properties: Properties {
                 text: Some(label.to_string()),
+                ..Default::default()
             },
         }
     }
@@ -536,6 +537,7 @@ mod tests {
             sr_levels: vec![],
             prep_expiries: vec![],
             mw_path: None,
+            position: None,
         }
     }
 

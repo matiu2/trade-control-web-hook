@@ -33,7 +33,9 @@ use trade_control_core::intent::{
 };
 use trade_control_core::sig::KEY_LEN;
 
-use crate::control::{wrap_signed_template, wrap_signed_template_drawing};
+use crate::control::{
+    wrap_signed_direct_enter, wrap_signed_template, wrap_signed_template_drawing,
+};
 use crate::expiry;
 use crate::instruments::validate_instrument;
 
@@ -321,6 +323,15 @@ pub struct TradeSpec {
     /// Take-profit absolute price. The worker treats this verbatim and
     /// does not consult the shell.
     pub tp_price: f64,
+    /// Optional **absolute** stop-loss price. When set, the enter intent
+    /// carries `PriceRef::Absolute` for the SL instead of anchoring to
+    /// geometry + `sl_offset_pips` — used by the position-tool direct
+    /// entry, where the operator drew the stop at a fixed price rather
+    /// than relative to a pattern extreme. When `None` (the default,
+    /// every pattern path), SL stays geometry-anchored and the yaml is
+    /// byte-identical to pre-feature output.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sl_price: Option<f64>,
     /// Entry window end as a percentage of (trade_expiry − now). Default
     /// 80 — leaves a tail of trade_expiry to chase a late retest only if
     /// the operator extends the window.
@@ -796,6 +807,8 @@ fn build_pattern(
         entry_offset_pips: Some(entry_offset_pips),
         sl_offset_pips: Some(sl_offset_pips),
         tp_price,
+        // Interactive/questionnaire path always anchors SL to geometry.
+        sl_price: None,
         entry_deadline_pct,
         allow_entry: None,
         entry_mode: EntryMode::default(),
@@ -908,6 +921,7 @@ fn assemble_trade(
         entry_offset_pips,
         sl_offset_pips,
         spec.tp_price,
+        spec.sl_price,
         spec.risk_pct,
         spec.risk_amount,
         spec.dry_run,
@@ -1642,6 +1656,7 @@ fn build_enter_alert(
     entry_offset_pips: f64,
     sl_offset_pips: f64,
     tp_price: f64,
+    sl_price: Option<f64>,
     risk_pct: f64,
     risk_amount: Option<f64>,
     dry_run: bool,
@@ -1676,6 +1691,9 @@ fn build_enter_alert(
         EntryMode::Stop => EntrySpec::Stop {
             from: geometry.entry_anchor,
             offset_pips: entry_offset_pips,
+            // Pattern entries resolve against the live shell, not an
+            // absolute level — `at` is for the position-tool path only.
+            at: None,
             // No `on_too_close` opt-in from the H&S builder yet — bare
             // setups keep today's skip behaviour. A future CLI flag can
             // populate this (see the on_too_close follow-up).
@@ -1683,9 +1701,16 @@ fn build_enter_alert(
         },
         EntryMode::Market => EntrySpec::Market,
     });
-    intent.stop_loss = Some(PriceRef::Anchored {
-        from: geometry.sl_anchor,
-        offset_pips: sl_offset_pips,
+    // SL is normally anchored to the pattern extreme + offset. The
+    // position-tool direct entry instead supplies an absolute stop the
+    // operator drew, so when `sl_price` is set we emit `Absolute` and
+    // ignore the geometry anchor / offset entirely.
+    intent.stop_loss = Some(match sl_price {
+        Some(absolute) => PriceRef::Absolute { absolute },
+        None => PriceRef::Anchored {
+            from: geometry.sl_anchor,
+            offset_pips: sl_offset_pips,
+        },
     });
     // TP is an absolute price the operator typed in — the worker uses
     // it verbatim and ignores the shell.
@@ -1736,6 +1761,146 @@ fn build_enter_alert(
         purpose: "enter: stop-entry gated by both preps + both vetos".into(),
         intent,
     }
+}
+
+/// Order type for a position-tool direct entry. Mirrors the tv-arm flag
+/// trio (`--market-entry` / `--stop-entry` / `--limit-entry`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PositionEntryKind {
+    /// Market order, filled by the worker on receipt at broker price.
+    Market,
+    /// Pending stop order resting at the drawn entry price.
+    Stop,
+    /// Pending limit order resting at the drawn entry price.
+    Limit,
+}
+
+/// Everything needed to build a position-tool direct-entry intent. The
+/// SL/TP are absolute prices the operator drew (see `tv-arm`'s
+/// `position_trade::resolve_levels`); `entry_price` is the drawn entry
+/// anchor, used both as the order's resting price (Stop/Limit) and the
+/// signed shell's reference `close` for the worker's geometry/R checks.
+#[derive(Debug, Clone)]
+pub struct PositionEnterSpec {
+    pub instrument: String,
+    pub account: String,
+    pub broker: BrokerKind,
+    pub direction: Direction,
+    pub kind: PositionEntryKind,
+    /// Drawn entry price (absolute).
+    pub entry_price: f64,
+    /// Absolute stop-loss price.
+    pub stop_loss: f64,
+    /// Absolute take-profit price.
+    pub take_profit: f64,
+    /// Trade-expiry deadline — the enter's `not_after`.
+    pub trade_expiry: DateTime<Utc>,
+    /// Risk per trade as a home-currency amount; when `None`, uses 1% pct.
+    pub risk_amount: Option<f64>,
+    /// Pip size baked onto the intent (from instrument-lookup).
+    pub pip_size: Option<f64>,
+    /// When true, the worker logs the order but doesn't push to broker.
+    pub dry_run: bool,
+}
+
+/// Build and sign a position-tool direct-entry body, ready to POST
+/// straight to the worker (no TradingView). Returns `(trade_id, signed_body)`.
+///
+/// The entry carries absolute SL/TP (`PriceRef::Absolute`), the chosen
+/// order type, the drawn `trade_expiry` as `not_after`, and no preps /
+/// pattern vetos — it's a naked manual entry. It's signed with a
+/// self-contained shell whose reference `close` is the drawn entry price
+/// (`wrap_signed_direct_enter`), so the worker's
+/// `stop_loss < close < take_profit` range check and R-multiple are
+/// evaluated against the operator's drawn geometry.
+///
+/// All three order types are supported. `Market` fills on receipt;
+/// `Stop` / `Limit` rest at the drawn entry price, expressed as the
+/// absolute `EntrySpec::{Stop,Limit}::at` trigger (the worker uses it
+/// verbatim — no shell anchor). A long stop must sit above the drawn
+/// entry's reference and a long limit below it (and vice-versa for short);
+/// the worker's geometry check rejects a wrong-side trigger.
+pub fn build_position_enter(
+    spec: &PositionEnterSpec,
+    key: &[u8; KEY_LEN],
+    now: DateTime<Utc>,
+) -> Result<(String, String)> {
+    // Stop/Limit rest at the operator's drawn entry price — expressed as
+    // the absolute `at` trigger so the worker uses it verbatim (the shell
+    // anchor + offset path is for the pattern builders). `from`/`offset_pips`
+    // are inert when `at` is set but must still parse, so give them a sane
+    // anchor. Market needs no trigger.
+    let entry = match spec.kind {
+        PositionEntryKind::Market => EntrySpec::Market,
+        PositionEntryKind::Stop => EntrySpec::Stop {
+            from: PriceAnchor::Close,
+            offset_pips: 0.0,
+            at: Some(spec.entry_price),
+            on_too_close: None,
+        },
+        PositionEntryKind::Limit => EntrySpec::Limit {
+            from: PriceAnchor::Close,
+            offset_pips: 0.0,
+            at: Some(spec.entry_price),
+        },
+    };
+
+    // trade_id minting reuses the pattern slug machinery; a position
+    // entry isn't an H&S/M/W pattern, so tag it `pos`.
+    let trade_id = mint_position_trade_id(&spec.instrument)?;
+    let id = format!("{trade_id}-enter");
+    let mut intent = skeleton(
+        Action::Enter,
+        &spec.instrument,
+        id,
+        spec.trade_expiry,
+        spec.broker,
+        &spec.account,
+        &trade_id,
+    );
+    intent.direction = Some(spec.direction);
+    intent.pip_size = spec.pip_size;
+    intent.entry = Some(entry);
+    intent.stop_loss = Some(PriceRef::Absolute {
+        absolute: spec.stop_loss,
+    });
+    intent.take_profit = Some(TakeProfit::Anchored(PriceRef::Absolute {
+        absolute: spec.take_profit,
+    }));
+    match spec.risk_amount {
+        Some(amount) => {
+            intent.risk_amount = Some(trade_control_core::tunable::Tunable::Static(amount))
+        }
+        None => intent.risk_pct = trade_control_core::tunable::Tunable::Static(1.0),
+    }
+    if spec.dry_run {
+        intent.dry_run = Some(true);
+    }
+    // Naked manual entry: no preps, no pattern vetos. The enter's own
+    // `not_after` (= trade_expiry) bounds its validity.
+    intent
+        .validate()
+        .map_err(|e| eyre!("invalid position enter intent: {e}"))?;
+    let body = wrap_signed_direct_enter(&intent, key, spec.entry_price, now)
+        .map_err(|e| eyre!("sign position enter: {e}"))?;
+    Ok((trade_id, body))
+}
+
+/// Mint a `pos-<instrument>-<rand>` trade_id for a position-tool entry.
+fn mint_position_trade_id(instrument: &str) -> Result<String> {
+    let mut bytes = [0u8; 4];
+    getrandom::fill(&mut bytes).map_err(|e| eyre!("getrandom: {e}"))?;
+    let suffix = hex::encode(bytes);
+    let mut instr = String::new();
+    for c in instrument.to_lowercase().chars() {
+        if c.is_ascii_alphanumeric() {
+            instr.push(c);
+        } else if !instr.ends_with('-') {
+            instr.push('-');
+        }
+    }
+    let instr = instr.trim_matches('-');
+    Ok(format!("pos-{instr}-{suffix}"))
 }
 
 /// Build the consolidated `06-close-on-reversal` alert: an
@@ -1952,6 +2117,7 @@ mod tests {
                 1.0,
                 1.0,
                 1.0800,
+                None,
                 1.0,
                 None,
                 false,
@@ -1996,6 +2162,7 @@ mod tests {
                 entry_offset_pips: Some(1.0),
                 sl_offset_pips: Some(1.0),
                 tp_price: 1.0500,
+                sl_price: None,
                 entry_deadline_pct: DEFAULT_ENTRY_DEADLINE_PCT,
                 allow_entry: None,
                 entry_mode: EntryMode::Stop,
@@ -2028,6 +2195,7 @@ mod tests {
             1.0,
             1.0,
             1.0500,
+            None,
             1.0,
             None,
             false,
@@ -2104,6 +2272,7 @@ mod tests {
             1.0,
             1.0,
             1.1500,
+            None,
             1.0,
             None,
             false,
@@ -2157,6 +2326,108 @@ mod tests {
     }
 
     #[test]
+    fn absolute_sl_price_overrides_anchored_sl() {
+        // The position-tool direct entry supplies an absolute stop the
+        // operator drew. When `sl_price` is Some, the enter intent must
+        // carry `PriceRef::Absolute` and ignore the geometry anchor —
+        // TP stays absolute as always.
+        let geometry = PatternGeometry::for_pattern(TradePattern::Hs);
+        let deadline = ts("2026-05-24T00:00:00Z");
+        let alert = build_enter_alert(
+            "EUR_USD",
+            "pos-eur-usd-abs1",
+            &geometry,
+            deadline,
+            1.0,
+            1.0,
+            1.0500,
+            Some(1.0850),
+            1.0,
+            None,
+            false,
+            0,
+            None,
+            None,
+            EntryMode::Market,
+            false,
+            false,
+            &[],
+            None,
+            BlackoutCloseAction::default(),
+            &BrokerKind::Oanda,
+            "demo",
+            false,
+        );
+        match &alert.intent.stop_loss {
+            Some(PriceRef::Absolute { absolute }) => {
+                assert!((absolute - 1.0850).abs() < 1e-9, "{absolute}");
+            }
+            other => panic!("expected Absolute SL, got {other:?}"),
+        }
+        // Market entry sanity — position-tool market path.
+        assert!(matches!(alert.intent.entry, Some(EntrySpec::Market)));
+        match &alert.intent.take_profit {
+            Some(TakeProfit::Anchored(PriceRef::Absolute { absolute })) => {
+                assert!((absolute - 1.0500).abs() < 1e-9);
+            }
+            other => panic!("expected absolute TP, got {other:?}"),
+        }
+    }
+
+    fn position_spec(kind: PositionEntryKind) -> PositionEnterSpec {
+        PositionEnterSpec {
+            instrument: "EUR_USD".into(),
+            account: "demo".into(),
+            broker: BrokerKind::Oanda,
+            direction: Direction::Long,
+            kind,
+            entry_price: 1.1000,
+            stop_loss: 1.0900,
+            take_profit: 1.1200,
+            trade_expiry: ts("2026-05-25T00:00:00Z"),
+            risk_amount: None,
+            pip_size: Some(0.0001),
+            dry_run: false,
+        }
+    }
+
+    #[test]
+    fn position_market_enter_builds_market_entry() {
+        let key = [9u8; KEY_LEN];
+        let now = ts("2026-05-24T00:00:00Z");
+        let (trade_id, body) =
+            build_position_enter(&position_spec(PositionEntryKind::Market), &key, now)
+                .expect("build market");
+        assert!(trade_id.starts_with("pos-"), "{trade_id}");
+        assert!(body.contains(r#""type":"market""#), "{body}");
+        // Market carries no `at` trigger.
+        assert!(!body.contains(r#""at":"#), "{body}");
+    }
+
+    #[test]
+    fn position_stop_enter_bakes_absolute_trigger() {
+        // Phase 2: --stop-entry rests at the drawn entry as an absolute
+        // `at` trigger (long, so a stop above — but the wrong-side guard is
+        // skipped for `at`, see the core resolver test).
+        let key = [9u8; KEY_LEN];
+        let now = ts("2026-05-24T00:00:00Z");
+        let (_, body) = build_position_enter(&position_spec(PositionEntryKind::Stop), &key, now)
+            .expect("build stop");
+        assert!(body.contains(r#""type":"stop""#), "{body}");
+        assert!(body.contains(r#""at":1.1"#), "{body}");
+    }
+
+    #[test]
+    fn position_limit_enter_bakes_absolute_trigger() {
+        let key = [9u8; KEY_LEN];
+        let now = ts("2026-05-24T00:00:00Z");
+        let (_, body) = build_position_enter(&position_spec(PositionEntryKind::Limit), &key, now)
+            .expect("build limit");
+        assert!(body.contains(r#""type":"limit""#), "{body}");
+        assert!(body.contains(r#""at":1.1"#), "{body}");
+    }
+
+    #[test]
     fn ihs_invalidation_alert_uses_too_low_name() {
         // The veto name is geometry-driven — a misconfig here would
         // mean the long enter's `vetos: [too-low]` gate never fires
@@ -2201,6 +2472,7 @@ mod tests {
             entry_offset_pips: None,
             sl_offset_pips: None,
             tp_price: 1.0500,
+            sl_price: None,
             entry_deadline_pct: 80,
             allow_entry: None,
             entry_mode: EntryMode::Stop,

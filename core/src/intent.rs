@@ -1526,6 +1526,13 @@ pub enum EntrySpec {
         from: PriceAnchor,
         #[serde(default)]
         offset_pips: f64,
+        /// Absolute trigger price set at encode time. When `Some`, it
+        /// overrides `from`/`offset_pips` and the worker uses it verbatim
+        /// (the operator drew the exact level — e.g. a position tool's
+        /// entry anchor). When `None`, today's behaviour: trigger =
+        /// `anchor_price(from) + offset_pips × pip_size`. Signed.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        at: Option<f64>,
         /// Optional fallback for when the broker rejects the resting
         /// stop because the trigger has already been overtaken by price
         /// (TradeNation `#19-10` "entry too close to / wrong side of
@@ -1542,6 +1549,10 @@ pub enum EntrySpec {
         from: PriceAnchor,
         #[serde(default)]
         offset_pips: f64,
+        /// Absolute trigger price set at encode time — same semantics as
+        /// [`EntrySpec::Stop::at`]. When `Some`, overrides `from`/`offset_pips`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        at: Option<f64>,
     },
 }
 
@@ -2130,10 +2141,12 @@ mod tests {
             Some(EntrySpec::Stop {
                 from,
                 offset_pips,
+                at,
                 on_too_close,
             }) => {
                 assert_eq!(from, PriceAnchor::High);
                 assert!((offset_pips - 2.0).abs() < 1e-9);
+                assert_eq!(at, None);
                 assert!(on_too_close.is_none());
             }
             _ => panic!("expected stop entry"),
@@ -2148,10 +2161,12 @@ mod tests {
         let spec = EntrySpec::Stop {
             from: PriceAnchor::High,
             offset_pips: 1.0,
+            at: None,
             on_too_close: None,
         };
         let yaml = serde_yaml::to_string(&spec).unwrap();
         assert!(!yaml.contains("on_too_close"), "yaml was: {yaml}");
+        assert!(!yaml.contains("at:"), "yaml was: {yaml}");
     }
 
     #[test]
@@ -2178,6 +2193,7 @@ mod tests {
         let spec = EntrySpec::Stop {
             from: PriceAnchor::High,
             offset_pips: 1.0,
+            at: None,
             on_too_close: Some(OnTooClose {
                 action: OnTooCloseAction::Market,
                 max_slippage_pips: Some(8.0),
@@ -2233,9 +2249,14 @@ mod tests {
         ";
         let intent: Intent = serde_yaml::from_str(yaml).unwrap();
         match intent.entry {
-            Some(EntrySpec::Limit { from, offset_pips }) => {
+            Some(EntrySpec::Limit {
+                from,
+                offset_pips,
+                at,
+            }) => {
                 assert_eq!(from, PriceAnchor::Low);
                 assert!((offset_pips - -5.0).abs() < 1e-9);
+                assert_eq!(at, None);
             }
             _ => panic!("expected limit entry"),
         }

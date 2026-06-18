@@ -57,9 +57,28 @@ impl BlackoutClose {
     }
 }
 
+/// Which order type a position-tool direct entry should place. Only one
+/// of `--market-entry` / `--stop-entry` / `--limit-entry` may be given;
+/// they're mutually exclusive (the `position_entry` clap group enforces
+/// it). Set by [`Args::position_entry_mode`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PositionEntry {
+    /// Enter at market immediately (worker fills at broker bid/ask).
+    Market,
+    /// Rest a stop order at the drawing's entry price.
+    Stop,
+    /// Rest a limit order at the drawing's entry price.
+    Limit,
+}
+
 /// Arm a reversal setup from the active TradingView chart.
 #[derive(Debug, Parser)]
 #[command(version = env!("GIT_VERSION"), about, long_about = None)]
+#[command(group(
+    clap::ArgGroup::new("position_entry")
+        .args(["market_entry", "stop_entry", "limit_entry"])
+        .multiple(false)
+))]
 pub struct Args {
     /// Broker to target. Defaults to the chart's exchange (also
     /// `TRADE_CONTROL_BROKER` env).
@@ -157,9 +176,30 @@ pub struct Args {
 
     /// Use a market order for entry instead of the default pending
     /// stop-entry at the geometry anchor. SL still anchors to
-    /// geometry.
+    /// geometry. (Pattern path — H&S / M/W.)
     #[arg(long)]
     pub entry_market: bool,
+
+    /// **Position-tool direct entry.** Read the long/short *position*
+    /// tool drawn on the chart and place a **market** order immediately
+    /// (worker fills at broker price on receipt), with the drawing's
+    /// entry / SL / TP. Mutually exclusive with `--stop-entry` /
+    /// `--limit-entry`. No pattern, preps, or geometry needed — just the
+    /// drawn position + a trade-expiry.
+    #[arg(long)]
+    pub market_entry: bool,
+
+    /// **Position-tool direct entry.** Rest a **stop** order at the
+    /// drawn position's entry price. Mutually exclusive with
+    /// `--market-entry` / `--limit-entry`.
+    #[arg(long)]
+    pub stop_entry: bool,
+
+    /// **Position-tool direct entry.** Rest a **limit** order at the
+    /// drawn position's entry price. Mutually exclusive with
+    /// `--market-entry` / `--stop-entry`.
+    #[arg(long)]
+    pub limit_entry: bool,
 
     /// Anchor SL to Pine's `recent_high` (shorts) / `recent_low`
     /// (longs) instead of the signal bar's own wick. Requires the v2
@@ -236,6 +276,14 @@ pub struct Args {
     #[arg(long)]
     pub pip_size: Option<f64>,
 
+    /// (Position-tool entry only) Trade-expiry window in hours from now,
+    /// used when the chart carries no `trade-expiry` vertical line. The
+    /// emitted enter self-cancels (if still resting) / the setup expires
+    /// at `now + this`. Ignored when a `trade-expiry` line is present
+    /// (the line wins). Default 48h.
+    #[arg(long, default_value_t = 48)]
+    pub expiry_hours: u32,
+
     /// Print a zsh completion script to stdout and exit.
     #[arg(long)]
     pub print_completions: bool,
@@ -244,6 +292,20 @@ pub struct Args {
     /// `~/Downloads/tradingview-mcp-jackson` path.
     #[arg(long)]
     pub tv_mcp_root: Option<PathBuf>,
+}
+
+impl Args {
+    /// The selected position-tool entry mode, or `None` when none of the
+    /// three flags is set (the normal pattern-arming path). The clap
+    /// group guarantees at most one is set.
+    pub fn position_entry_mode(&self) -> Option<PositionEntry> {
+        match (self.market_entry, self.stop_entry, self.limit_entry) {
+            (true, _, _) => Some(PositionEntry::Market),
+            (_, true, _) => Some(PositionEntry::Stop),
+            (_, _, true) => Some(PositionEntry::Limit),
+            _ => None,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -317,6 +379,26 @@ mod tests {
                 .expect("parse mw flags");
         assert!(args.allow_50_pct_m_trades);
         assert_eq!(args.pip_size, Some(0.01));
+    }
+
+    #[test]
+    fn position_entry_flags_resolve() {
+        let args = Args::try_parse_from(["tv-arm"]).expect("parse");
+        assert_eq!(args.position_entry_mode(), None);
+        assert_eq!(args.expiry_hours, 48);
+
+        let m = Args::try_parse_from(["tv-arm", "--market-entry"]).expect("parse");
+        assert_eq!(m.position_entry_mode(), Some(PositionEntry::Market));
+        let s = Args::try_parse_from(["tv-arm", "--stop-entry"]).expect("parse");
+        assert_eq!(s.position_entry_mode(), Some(PositionEntry::Stop));
+        let l = Args::try_parse_from(["tv-arm", "--limit-entry"]).expect("parse");
+        assert_eq!(l.position_entry_mode(), Some(PositionEntry::Limit));
+    }
+
+    #[test]
+    fn position_entry_flags_are_mutually_exclusive() {
+        let res = Args::try_parse_from(["tv-arm", "--market-entry", "--stop-entry"]);
+        assert!(res.is_err(), "expected parse error, got {res:?}");
     }
 
     #[test]

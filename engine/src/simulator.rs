@@ -170,6 +170,7 @@ mod tests {
         i.entry = Some(EntrySpec::Stop {
             from: PriceAnchor::Close,
             offset_pips: 0.0,
+            at: None,
             on_too_close: None,
         });
         i.stop_loss = Some(PriceRef::Absolute { absolute: 1.1000 });
@@ -264,6 +265,7 @@ mod tests {
         intent.entry = Some(EntrySpec::Stop {
             from: PriceAnchor::Close,
             offset_pips: 10.0,
+            at: None,
             on_too_close: None,
         });
         let shell = trigger_shell();
@@ -327,6 +329,7 @@ mod tests {
         intent.entry = Some(EntrySpec::Stop {
             from: PriceAnchor::Close,
             offset_pips: 10.0,
+            at: None,
             on_too_close: None,
         });
         let shell = trigger_shell();
