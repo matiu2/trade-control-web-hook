@@ -441,9 +441,21 @@ entry:
   market fill reference (a worse fill changes the stop distance and
   therefore the 1%-equity position size). It does **not** consume a
   multi-shot `max_retries` slot — it's the same intended entry.
-- `action: limit` — **not yet implemented**; currently treated the same
-  as `skip` (the entry stays retryable). Reserved for a follow-up that
-  re-places the level as a pullback limit with geometry validation.
+- `action: limit` — re-place the level as a **limit order** resting at
+  the original stop trigger, waiting for price to pull back to the
+  intended entry. This preserves the planned R exactly (a limit can't
+  fill worse than its price) at the cost of possibly never filling. No
+  `max_slippage_pips` is needed or used. A geometry guard applies: the
+  limit must rest on the correct side of the market (long: trigger
+  at/below current price; short: at/above) — in a genuine `#19-10` the
+  price has overrun the trigger so this holds, but a degenerate case
+  that would create a `#19-9` ("limit on the wrong side") is skipped and
+  logged (`too-close-limit-wrong-side`). Like `market`, it's a **single**
+  synchronous attempt and does not consume a multi-shot `max_retries`
+  slot. The resting limit is recorded as a normal pending order, so the
+  alert-window / `expiry_bars` cron sweep cancels it if it never fills —
+  it inherits the same lifetime as any other resting order (no
+  broker-native good-til-date is required).
 
 The distinct rejection is observable in the logs as
 `entry-failed: too-close-to-market` (vs the generic

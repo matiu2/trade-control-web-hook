@@ -1894,9 +1894,17 @@ async fn maybe_update_mw_state<B: Broker>(
 /// and therefore the 1%-equity position size, so the broker re-runs
 /// sizing from the market reference rather than the stop-trigger math.
 ///
+/// For `action: limit` it instead re-places a **limit** order resting at
+/// the original trigger (after a geometry guard — a limit on the wrong
+/// side would be a `#19-9`), preserving the planned R and waiting for a
+/// pullback. No fresh sizing: the entry reference is unchanged. The
+/// resting limit is recorded as a normal `EntryAttempt` by the caller, so
+/// the cron sweep cancels it when the alert window / `expiry_bars` lapses
+/// — no broker-native GTD required.
+///
 /// Returns the original [`EntryError::EntryTooCloseToMarket`] (so the
 /// caller surfaces the distinct outcome) when the fallback is absent,
-/// out of threshold, `skip`, `limit` (unimplemented), or the re-place
+/// out of threshold, `skip`, a wrong-side `limit`, or the re-place
 /// itself fails / the price read fails. One attempt only.
 async fn place_entry_too_close_fallback<B: Broker>(
     broker: &B,
@@ -1973,6 +1981,44 @@ async fn place_entry_too_close_fallback<B: Broker>(
                     // recovery was attempted and failed, and the seen-id
                     // stays un-poisoned for the next bar.
                     rlog_err!("too-close fallback: market re-place failed: {err} (id={intent_id})");
+                    Err(EntryError::EntryTooCloseToMarket)
+                }
+            }
+        }
+        too_close::TooClosePlan::Limit { trigger_price } => {
+            rlog!(
+                "too-close fallback: re-placing as LIMIT at original trigger (id={intent_id} trigger={trigger_price} price={current_price})"
+            );
+            // The entry reference is unchanged (the limit rests at the
+            // original trigger), so the stop distance — and therefore the
+            // 1%-equity sizing — is identical to the original plan. Reuse
+            // the resolved stop/take-profit/risk verbatim; the broker
+            // sizes from the limit trigger just as it would have from the
+            // stop trigger.
+            let limit_request = EntryRequest {
+                instrument: &resolved.instrument,
+                direction: resolved.direction,
+                entry: ResolvedEntry::Limit { trigger_price },
+                stop_loss: resolved.stop_loss,
+                take_profit: resolved.take_profit,
+                risk: resolved.risk,
+                dry_run: resolved.dry_run,
+            };
+            match broker
+                .place_entry(max_risk_pct, max_open_positions, &limit_request)
+                .await
+            {
+                Ok(order_id) => {
+                    rlog!(
+                        "too-close fallback: limit re-place succeeded (id={intent_id} order={order_id})"
+                    );
+                    Ok(order_id)
+                }
+                Err(err) => {
+                    // One attempt only. Surface the original too-close
+                    // identity so the seen-id stays un-poisoned and the
+                    // next bar can retry.
+                    rlog_err!("too-close fallback: limit re-place failed: {err} (id={intent_id})");
                     Err(EntryError::EntryTooCloseToMarket)
                 }
             }

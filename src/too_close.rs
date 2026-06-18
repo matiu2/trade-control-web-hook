@@ -16,9 +16,10 @@
 //!   failure must stay `ActionResult::Failed` (a Skip in `seen_decision`)
 //!   so the seen-id is never poisoned and the next bar can retry.
 //! - [`market_replace_plan`] decides whether a `#19-10` rejection should
-//!   be recovered by re-placing as a market order, and at what
-//!   reference price, given the `on_too_close` config and the current
-//!   market price (Step 3 — the slippage-guarded recovery path).
+//!   be recovered, and how — re-place as a market order (Step 3, the
+//!   slippage-guarded chase), as a limit order resting at the original
+//!   trigger (Step 4, R-preserving), or skip — given the `on_too_close`
+//!   config and the current market price.
 //!
 //! Both are KV-free and broker-free; the actual broker re-place and KV
 //! bookkeeping live in `run_enter` (`src/lib.rs`).
@@ -46,6 +47,17 @@ pub enum TooClosePlan {
     /// position size, so the original stop-trigger math must not be
     /// reused.
     Market { reference_price: f64 },
+    /// Re-place as a **limit** order resting at `trigger_price` (the
+    /// original stop trigger). The break already happened, so a limit at
+    /// the original level waits for a pullback to the intended entry —
+    /// preserving the planned R exactly (a limit can't fill worse than
+    /// its price), at the cost of possibly never filling. No fresh
+    /// sizing is needed: the entry reference is unchanged, so the caller
+    /// reuses the original stop-distance math. The resting limit is
+    /// recorded as a normal `EntryAttempt`, so the cron sweep cancels it
+    /// when the alert window / `expiry_bars` lapses — no broker-native
+    /// GTD required.
+    Limit { trigger_price: f64 },
     /// Don't recover — keep the failure terminal (`Failed` → 502, no
     /// seen-id poison, next bar retries). `reason` is a short
     /// telemetry-friendly suffix for the log / outcome string.
@@ -60,8 +72,14 @@ pub enum TooClosePlan {
 ///
 /// Rules:
 /// - No fallback, or `skip` → [`TooClosePlan::Skip`] (today's behaviour).
-/// - `limit` → Skip for now (Step 4, not yet implemented) so the entry
-///   stays retryable rather than silently dropped.
+/// - `limit` → re-place a limit at the original trigger, **only if** the
+///   limit would rest on the correct side of the market (long: trigger
+///   at/below current; short: at/above). In a genuine `#19-10` the price
+///   has overrun the stop trigger so the original trigger IS the correct
+///   side — but a degenerate / non-overrun case (trigger still on the
+///   wrong side) would create a `#19-9`, so guard it and Skip with
+///   `too-close-limit-wrong-side`. No slippage bound applies — a limit
+///   can't fill worse than its price, so R is preserved.
 /// - `market` with no slippage bound (validation should have caught it)
 ///   → Skip — never chase an unbounded fill.
 /// - `market` with a bound → re-place **only if** the current price is
@@ -86,9 +104,33 @@ pub fn market_replace_plan(
         OnTooCloseAction::Skip => TooClosePlan::Skip {
             reason: "too-close-skip",
         },
-        OnTooCloseAction::Limit => TooClosePlan::Skip {
-            reason: "too-close-limit-unimplemented",
-        },
+        OnTooCloseAction::Limit => {
+            if !current_price.is_finite() || !trigger_price.is_finite() {
+                return TooClosePlan::Skip {
+                    reason: "too-close-price-unavailable",
+                };
+            }
+            // A long limit must rest at/below the market, a short limit
+            // at/above — otherwise it's a `#19-9` ("limit on the wrong
+            // side"), the sibling of the `#19-10` we're recovering from.
+            // For a genuine too-close the price overran the trigger
+            // (long: current >= trigger; short: current <= trigger), so
+            // the original trigger is the correct side and fills on a
+            // pullback. The `>=` / `<=` allow the equality (price exactly
+            // at the trigger) — the broker treats that as a marketable
+            // limit, which is acceptable.
+            let correct_side = match direction {
+                Direction::Long => current_price >= trigger_price,
+                Direction::Short => current_price <= trigger_price,
+            };
+            if correct_side {
+                TooClosePlan::Limit { trigger_price }
+            } else {
+                TooClosePlan::Skip {
+                    reason: "too-close-limit-wrong-side",
+                }
+            }
+        }
         OnTooCloseAction::Market => {
             let Some(max_slip) = otc.max_slippage_price else {
                 return TooClosePlan::Skip {
@@ -171,11 +213,73 @@ mod tests {
     }
 
     #[test]
-    fn limit_action_skips_until_implemented() {
+    fn limit_long_correct_side_rests_at_trigger() {
+        // Genuine #19-10: long trigger 1.1000 overrun, price now 1.1005
+        // (above). A limit at 1.1000 is below market → correct side,
+        // rests for a pullback. No slippage bound needed; R preserved.
         let cfg = otc(OnTooCloseAction::Limit, None);
         let plan = market_replace_plan(Some(&cfg), Direction::Long, 1.1000, 1.1005);
+        match plan {
+            TooClosePlan::Limit { trigger_price } => {
+                assert!((trigger_price - 1.1000).abs() < 1e-12);
+            }
+            other => panic!("expected Limit, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn limit_short_correct_side_rests_at_trigger() {
+        // Short trigger 1.1000 overrun, price now 1.0994 (below). A
+        // limit at 1.1000 is above market → correct side for a short.
+        let cfg = otc(OnTooCloseAction::Limit, None);
+        let plan = market_replace_plan(Some(&cfg), Direction::Short, 1.1000, 1.0994);
+        assert!(matches!(plan, TooClosePlan::Limit { .. }));
+    }
+
+    #[test]
+    fn limit_long_wrong_side_skips() {
+        // Not a genuine overrun: long trigger 1.1000, price 1.0995 (still
+        // *below* the trigger). A long limit at 1.1000 would sit above
+        // market → #19-9. Guard skips instead of placing a doomed order.
+        let cfg = otc(OnTooCloseAction::Limit, None);
+        let plan = market_replace_plan(Some(&cfg), Direction::Long, 1.1000, 1.0995);
         assert!(
-            matches!(plan, TooClosePlan::Skip { reason } if reason == "too-close-limit-unimplemented")
+            matches!(plan, TooClosePlan::Skip { reason } if reason == "too-close-limit-wrong-side")
+        );
+    }
+
+    #[test]
+    fn limit_short_wrong_side_skips() {
+        // Short trigger 1.1000, price 1.1005 (above) → a short limit at
+        // 1.1000 would sit below market → #19-9. Skip.
+        let cfg = otc(OnTooCloseAction::Limit, None);
+        let plan = market_replace_plan(Some(&cfg), Direction::Short, 1.1000, 1.1005);
+        assert!(
+            matches!(plan, TooClosePlan::Skip { reason } if reason == "too-close-limit-wrong-side")
+        );
+    }
+
+    #[test]
+    fn limit_at_exact_trigger_rests() {
+        // Equality (price exactly at the trigger) is allowed for both
+        // directions — a marketable limit, acceptable.
+        let cfg = otc(OnTooCloseAction::Limit, None);
+        assert!(matches!(
+            market_replace_plan(Some(&cfg), Direction::Long, 1.1000, 1.1000),
+            TooClosePlan::Limit { .. }
+        ));
+        assert!(matches!(
+            market_replace_plan(Some(&cfg), Direction::Short, 1.1000, 1.1000),
+            TooClosePlan::Limit { .. }
+        ));
+    }
+
+    #[test]
+    fn limit_non_finite_price_skips() {
+        let cfg = otc(OnTooCloseAction::Limit, None);
+        let plan = market_replace_plan(Some(&cfg), Direction::Long, 1.1000, f64::NAN);
+        assert!(
+            matches!(plan, TooClosePlan::Skip { reason } if reason == "too-close-price-unavailable")
         );
     }
 
