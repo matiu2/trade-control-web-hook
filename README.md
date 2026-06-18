@@ -187,11 +187,23 @@ still subject to the worker's replay / cooldown / market-hours /
 spread-blackout gates. `--risk-amount`, `--broker-dry-run`, and
 `--pip-size` apply as usual.
 
-**Status:** `--market-entry` is fully wired (market order, filled
-immediately). `--stop-entry` / `--limit-entry` are accepted but rejected
-at build time for now — a resting stop/limit needs an **absolute** entry
-*trigger* price on the wire, which `EntrySpec::Stop`/`Limit` can't yet
-express (they carry a geometry anchor). That's the next increment.
+**Order types:**
+
+- `--market-entry` — market order, filled by the worker on receipt at
+  broker price.
+- `--stop-entry` — pending **stop** order resting at the drawn entry
+  price (breakout: it triggers when price trades *through* the level).
+- `--limit-entry` — pending **limit** order resting at the drawn entry
+  price (pullback: it fills when price comes *back* to the level).
+
+The resting price is baked onto the wire as an absolute trigger
+(`EntrySpec::{Stop,Limit}::at`) — the operator drew the exact level, so
+the worker uses it verbatim rather than re-deriving it from a shell
+anchor. The usual "wrong-side" geometry guard (which would reject a long
+stop at/below the reference price) is **skipped** for an `at` trigger,
+because the signed shell carries that same drawn level as its reference;
+the broker, not the worker, arbitrates whether a resting order is
+wrong-side and rejects it if so.
 
 ## General workflow
 

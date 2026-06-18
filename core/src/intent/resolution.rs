@@ -239,19 +239,32 @@ impl Resolved {
             EntrySpec::Stop {
                 from,
                 offset_pips,
+                at,
                 on_too_close: otc,
             } => {
-                let trigger = shell.anchor_price(*from) + offset_pips * pip_size;
+                // `at` (absolute, set at encode time) wins over the
+                // shell-anchored geometry, exactly like `PriceRef::Absolute`.
+                let trigger = match at {
+                    Some(absolute) => *absolute,
+                    None => shell.anchor_price(*from) + offset_pips * pip_size,
+                };
                 // Stop sits on the *far* side of current price for the direction:
-                // long stops above close, short stops below.
-                match direction {
-                    Direction::Long if trigger <= shell.close => {
-                        return Err(ResolveError::InvalidGeometry);
+                // long stops above close, short stops below. Skip this guard
+                // when `at` is set: an absolute trigger comes from an operator
+                // who drew the exact level (position tool), and the signed
+                // shell carries that same level as `close` — there is no live
+                // price to compare against, so the broker, not us, decides if
+                // it's wrong-side.
+                if at.is_none() {
+                    match direction {
+                        Direction::Long if trigger <= shell.close => {
+                            return Err(ResolveError::InvalidGeometry);
+                        }
+                        Direction::Short if trigger >= shell.close => {
+                            return Err(ResolveError::InvalidGeometry);
+                        }
+                        _ => {}
                     }
-                    Direction::Short if trigger >= shell.close => {
-                        return Err(ResolveError::InvalidGeometry);
-                    }
-                    _ => {}
                 }
                 on_too_close = otc.map(|o| resolve_on_too_close(o, pip_size));
                 (
@@ -261,20 +274,31 @@ impl Resolved {
                     trigger,
                 )
             }
-            EntrySpec::Limit { from, offset_pips } => {
-                let trigger = shell.anchor_price(*from) + offset_pips * pip_size;
+            EntrySpec::Limit {
+                from,
+                offset_pips,
+                at,
+            } => {
+                let trigger = match at {
+                    Some(absolute) => *absolute,
+                    None => shell.anchor_price(*from) + offset_pips * pip_size,
+                };
                 // Limit sits on the *near* side of current price for the direction:
                 // long limits below close, short limits above. If it's the wrong
                 // side, OANDA would fill instantly (turning the limit into a
-                // market order at a worse price) — reject as a typo.
-                match direction {
-                    Direction::Long if trigger >= shell.close => {
-                        return Err(ResolveError::InvalidGeometry);
+                // market order at a worse price) — reject as a typo. Skipped for
+                // an absolute `at` (see the Stop arm: operator-drawn level, shell
+                // close == trigger, broker arbitrates wrong-side).
+                if at.is_none() {
+                    match direction {
+                        Direction::Long if trigger >= shell.close => {
+                            return Err(ResolveError::InvalidGeometry);
+                        }
+                        Direction::Short if trigger <= shell.close => {
+                            return Err(ResolveError::InvalidGeometry);
+                        }
+                        _ => {}
                     }
-                    Direction::Short if trigger <= shell.close => {
-                        return Err(ResolveError::InvalidGeometry);
-                    }
-                    _ => {}
                 }
                 (
                     ResolvedEntry::Limit {
@@ -649,6 +673,7 @@ mod tests {
         intent.entry = Some(EntrySpec::Stop {
             from: PriceAnchor::High,
             offset_pips: 2.0,
+            at: None,
             on_too_close: None,
         });
         let r = Resolved::from_intent(&intent, &shell(), 0.0001).unwrap();
@@ -660,6 +685,59 @@ mod tests {
         // R is computed from the trigger, not the close.
         // SL = 1.0978; trigger = 1.1022; R = 0.0044; TP = 1.1022 + 2*0.0044 = 1.1110
         assert!((r.take_profit - 1.1110).abs() < 1e-9);
+    }
+
+    /// A stop-entry with an absolute `at` ignores the shell anchor and uses
+    /// the baked trigger verbatim — the position-tool direct-entry path. The
+    /// signed shell carries the *same* level on `close` (the position tool
+    /// only knows its drawn entry), so the wrong-side guard must be skipped:
+    /// `trigger == close` would otherwise be `InvalidGeometry` for a long stop.
+    #[test]
+    fn stop_entry_absolute_at_overrides_anchor_and_skips_wrongside_guard() {
+        let mut intent = long_market_intent();
+        intent.entry = Some(EntrySpec::Stop {
+            // `from`/`offset_pips` are inert when `at` is set.
+            from: PriceAnchor::High,
+            offset_pips: 2.0,
+            at: Some(1.1000),
+            on_too_close: None,
+        });
+        // Absolute SL/TP so the geometry is self-contained. Direct-entry
+        // shell stamps close = trigger = 1.1000.
+        intent.stop_loss = Some(PriceRef::Absolute { absolute: 1.0900 });
+        intent.take_profit = Some(TakeProfit::Anchored(PriceRef::Absolute {
+            absolute: 1.1200,
+        }));
+        let r = Resolved::from_intent(&intent, &shell(), 0.0001).unwrap();
+        match r.entry {
+            ResolvedEntry::Stop { trigger_price } => {
+                assert!((trigger_price - 1.1000).abs() < 1e-9, "{trigger_price}")
+            }
+            _ => panic!("expected stop entry"),
+        }
+    }
+
+    /// A limit-entry with an absolute `at` likewise uses the baked trigger
+    /// and skips the wrong-side guard (trigger == close).
+    #[test]
+    fn limit_entry_absolute_at_overrides_anchor_and_skips_wrongside_guard() {
+        let mut intent = long_market_intent();
+        intent.entry = Some(EntrySpec::Limit {
+            from: PriceAnchor::Low,
+            offset_pips: 5.0,
+            at: Some(1.1000),
+        });
+        intent.stop_loss = Some(PriceRef::Absolute { absolute: 1.0900 });
+        intent.take_profit = Some(TakeProfit::Anchored(PriceRef::Absolute {
+            absolute: 1.1100,
+        }));
+        let r = Resolved::from_intent(&intent, &shell(), 0.0001).unwrap();
+        match r.entry {
+            ResolvedEntry::Limit { trigger_price } => {
+                assert!((trigger_price - 1.1000).abs() < 1e-9, "{trigger_price}")
+            }
+            _ => panic!("expected limit entry"),
+        }
     }
 
     /// Regression for bug #10 finding A (`hs-adidas-b70c1d31`): an H&S short
@@ -688,6 +766,7 @@ mod tests {
         intent.entry = Some(EntrySpec::Stop {
             from: PriceAnchor::SignalLow,
             offset_pips: 1.0,
+            at: None,
             on_too_close: None,
         });
         intent.stop_loss = Some(PriceRef::Anchored {
@@ -737,6 +816,7 @@ mod tests {
         intent.entry = Some(EntrySpec::Stop {
             from: PriceAnchor::High,
             offset_pips: 2.0,
+            at: None,
             on_too_close: Some(OnTooClose {
                 action: OnTooCloseAction::Market,
                 max_slippage_pips: Some(8.0),
@@ -764,6 +844,7 @@ mod tests {
         intent.entry = Some(EntrySpec::Stop {
             from: PriceAnchor::High,
             offset_pips: 2.0,
+            at: None,
             on_too_close: Some(OnTooClose {
                 action: OnTooCloseAction::Skip,
                 max_slippage_pips: None,
@@ -782,6 +863,7 @@ mod tests {
         intent.entry = Some(EntrySpec::Limit {
             from: PriceAnchor::Low,
             offset_pips: 5.0,
+            at: None,
         });
         let r = Resolved::from_intent(&intent, &shell(), 0.0001).unwrap();
         match r.entry {
@@ -800,6 +882,7 @@ mod tests {
         intent.entry = Some(EntrySpec::Limit {
             from: PriceAnchor::High,
             offset_pips: -10.0,
+            at: None,
         });
         assert!(matches!(
             Resolved::from_intent(&intent, &shell(), 0.0001),
@@ -819,6 +902,7 @@ mod tests {
         intent.entry = Some(EntrySpec::Limit {
             from: PriceAnchor::High,
             offset_pips: -5.0,
+            at: None,
         });
         let r = Resolved::from_intent(&intent, &shell(), 0.0001).unwrap();
         match r.entry {
@@ -837,6 +921,7 @@ mod tests {
         intent.entry = Some(EntrySpec::Stop {
             from: PriceAnchor::Low,
             offset_pips: 10.0,
+            at: None,
             on_too_close: None,
         });
         assert!(matches!(

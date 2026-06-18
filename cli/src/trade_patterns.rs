@@ -1668,6 +1668,9 @@ fn build_enter_alert(
         EntryMode::Stop => EntrySpec::Stop {
             from: geometry.entry_anchor,
             offset_pips: entry_offset_pips,
+            // Pattern entries resolve against the live shell, not an
+            // absolute level — `at` is for the position-tool path only.
+            at: None,
             // No `on_too_close` opt-in from the H&S builder yet — bare
             // setups keep today's skip behaviour. A future CLI flag can
             // populate this (see the on_too_close follow-up).
@@ -1788,24 +1791,35 @@ pub struct PositionEnterSpec {
 /// `stop_loss < close < take_profit` range check and R-multiple are
 /// evaluated against the operator's drawn geometry.
 ///
-/// **Phase 1 supports `Market` only.** `Stop` / `Limit` need an absolute
-/// entry *trigger* price, which the wire `EntrySpec::Stop`/`Limit` can't
-/// yet express (they carry a geometry `PriceAnchor`, not an absolute) —
-/// those return an error until that core change lands.
+/// All three order types are supported. `Market` fills on receipt;
+/// `Stop` / `Limit` rest at the drawn entry price, expressed as the
+/// absolute `EntrySpec::{Stop,Limit}::at` trigger (the worker uses it
+/// verbatim — no shell anchor). A long stop must sit above the drawn
+/// entry's reference and a long limit below it (and vice-versa for short);
+/// the worker's geometry check rejects a wrong-side trigger.
 pub fn build_position_enter(
     spec: &PositionEnterSpec,
     key: &[u8; KEY_LEN],
     now: DateTime<Utc>,
 ) -> Result<(String, String)> {
+    // Stop/Limit rest at the operator's drawn entry price — expressed as
+    // the absolute `at` trigger so the worker uses it verbatim (the shell
+    // anchor + offset path is for the pattern builders). `from`/`offset_pips`
+    // are inert when `at` is set but must still parse, so give them a sane
+    // anchor. Market needs no trigger.
     let entry = match spec.kind {
         PositionEntryKind::Market => EntrySpec::Market,
-        PositionEntryKind::Stop | PositionEntryKind::Limit => {
-            return Err(eyre!(
-                "stop/limit position entries are not supported yet — they need an absolute \
-                 entry-trigger price on the wire (EntrySpec::Stop/Limit currently carry a \
-                 geometry anchor). Use --market-entry for now."
-            ));
-        }
+        PositionEntryKind::Stop => EntrySpec::Stop {
+            from: PriceAnchor::Close,
+            offset_pips: 0.0,
+            at: Some(spec.entry_price),
+            on_too_close: None,
+        },
+        PositionEntryKind::Limit => EntrySpec::Limit {
+            from: PriceAnchor::Close,
+            offset_pips: 0.0,
+            at: Some(spec.entry_price),
+        },
     };
 
     // trade_id minting reuses the pattern slug machinery; a position
@@ -2335,6 +2349,59 @@ mod tests {
             }
             other => panic!("expected absolute TP, got {other:?}"),
         }
+    }
+
+    fn position_spec(kind: PositionEntryKind) -> PositionEnterSpec {
+        PositionEnterSpec {
+            instrument: "EUR_USD".into(),
+            account: "demo".into(),
+            broker: BrokerKind::Oanda,
+            direction: Direction::Long,
+            kind,
+            entry_price: 1.1000,
+            stop_loss: 1.0900,
+            take_profit: 1.1200,
+            trade_expiry: ts("2026-05-25T00:00:00Z"),
+            risk_amount: None,
+            pip_size: Some(0.0001),
+            dry_run: false,
+        }
+    }
+
+    #[test]
+    fn position_market_enter_builds_market_entry() {
+        let key = [9u8; KEY_LEN];
+        let now = ts("2026-05-24T00:00:00Z");
+        let (trade_id, body) =
+            build_position_enter(&position_spec(PositionEntryKind::Market), &key, now)
+                .expect("build market");
+        assert!(trade_id.starts_with("pos-"), "{trade_id}");
+        assert!(body.contains(r#""type":"market""#), "{body}");
+        // Market carries no `at` trigger.
+        assert!(!body.contains(r#""at":"#), "{body}");
+    }
+
+    #[test]
+    fn position_stop_enter_bakes_absolute_trigger() {
+        // Phase 2: --stop-entry rests at the drawn entry as an absolute
+        // `at` trigger (long, so a stop above — but the wrong-side guard is
+        // skipped for `at`, see the core resolver test).
+        let key = [9u8; KEY_LEN];
+        let now = ts("2026-05-24T00:00:00Z");
+        let (_, body) = build_position_enter(&position_spec(PositionEntryKind::Stop), &key, now)
+            .expect("build stop");
+        assert!(body.contains(r#""type":"stop""#), "{body}");
+        assert!(body.contains(r#""at":1.1"#), "{body}");
+    }
+
+    #[test]
+    fn position_limit_enter_bakes_absolute_trigger() {
+        let key = [9u8; KEY_LEN];
+        let now = ts("2026-05-24T00:00:00Z");
+        let (_, body) = build_position_enter(&position_spec(PositionEntryKind::Limit), &key, now)
+            .expect("build limit");
+        assert!(body.contains(r#""type":"limit""#), "{body}");
+        assert!(body.contains(r#""at":1.1"#), "{body}");
     }
 
     #[test]

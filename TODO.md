@@ -71,17 +71,41 @@ and derives the R-multiple from it — so the direct-POST shell must carry
 the **drawn entry price** as `close`, not a placeholder zero (which would
 be rejected `EntryOutsideRange`). `wrap_signed_direct_enter` does this.
 
-## Phase 2 — `--stop-entry` / `--limit-entry` (core + worker)
+## Phase 2 — `--stop-entry` / `--limit-entry` (core only; worker unchanged)
 
-- [ ] `core/src/intent.rs`: let `EntrySpec::Stop`/`Limit` express an absolute
-      trigger price (make `from` a `PriceRef`, or add `at: Option<f64>`).
-      Update `Intent::validate`.
-- [ ] `core/src/intent/resolution.rs`: resolve absolute entry trigger.
-- [ ] `cli`: add `EntryMode::Limit`; plumb absolute entry price.
-- [ ] `tv-arm`: wire `--stop-entry`/`--limit-entry` to the absolute entry price
-      from the drawing's `points[0].price`.
-- [ ] Worker + resolution tests.
-- [ ] Deploy to dev (`./deploy-dev.sh` on `main`), verify against live chart.
+- [x] `core/src/intent.rs`: added `at: Option<f64>` to **both**
+      `EntrySpec::Stop` and `EntrySpec::Limit` (additive, non-breaking;
+      `#[serde(default, skip_serializing_if = "Option::is_none")]`). `Some`
+      = absolute trigger set at encode time, overrides `from`/`offset_pips`;
+      `None` = today's shell-anchored behaviour. No `validate` change needed.
+- [x] `core/src/intent/resolution.rs`: Stop/Limit resolve `at` verbatim when
+      set. **Wrong-side geometry guard skipped when `at` is set** — the
+      position tool only knows its drawn entry, so the direct-POST shell
+      carries that same level as `close`; `trigger == close` would otherwise
+      be `InvalidGeometry`. The broker arbitrates wrong-side instead. Two
+      new resolver tests.
+- [x] `cli`: `build_position_enter` now builds `EntrySpec::{Stop,Limit}`
+      with `at: Some(entry_price)` (was: errored). Three new cli tests
+      (market/stop/limit body shape).
+- [x] `tv-arm`: already passed the chosen kind through — Stop/Limit now
+      flow end-to-end (only the stale "unsupported" comment was removed).
+- [x] Engine simulator test constructors updated for the new field.
+- [x] Full workspace tests / clippy / fmt green.
+- [x] README: documented all three order types + the `at`-trigger /
+      skipped-guard behaviour.
+
+**KEY DESIGN NOTE:** chose **`at: Option<f64>`** over making `from` a
+`PriceRef`. The latter would have broken the wire form of every existing
+Stop/Limit (`from: high` no longer parses), and these are signed bodies.
+`at` is additive: existing intents serialise/deserialise unchanged, and
+`at` is itself a signed field (it's inside the single-line flow `entry:`
+value, which the HMAC covers).
+
+### Phase 2 follow-ups (not done)
+
+- [ ] Deploy to dev (`./deploy-dev.sh` on `main` after merge), verify a
+      `--stop-entry` / `--limit-entry` against a live chart + demo broker.
+      (Dry-run → demo order → live, per the dry-run-first protocol.)
 
 ## Open questions / notes
 

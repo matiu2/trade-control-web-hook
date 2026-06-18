@@ -1207,7 +1207,7 @@ fn run_position_entry(
 
     let (trade_id, signed_body) = match cli::build_position_enter(&spec, key, now) {
         Ok(v) => v,
-        // Stop/Limit currently unsupported on the wire — clean rejection.
+        // Build/validation failure (bad geometry, sign error) — clean rejection.
         Err(e) => {
             eprintln!("ERROR: {e}");
             return Ok(1);
