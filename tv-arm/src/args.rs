@@ -148,6 +148,14 @@ pub struct Args {
     #[arg(long)]
     pub shadow: bool,
 
+    /// Also write the built `TradePlan` as pretty JSON to this path, in
+    /// addition to registering it with the worker. Lets the offline
+    /// `replay-candles` harness load the exact plan the engine received and
+    /// replay a candle window through it. Only meaningful with
+    /// `--register-plan` (the only path that builds a plan).
+    #[arg(long)]
+    pub plan_out: Option<PathBuf>,
+
     /// Opt in to multi-shot entries: if the broker rejects the order
     /// (e.g. spread too wide), the worker will retry on subsequent
     /// enter-alert firings up to this many times. Default (flag

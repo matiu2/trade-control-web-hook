@@ -683,6 +683,55 @@ mod tests {
         assert_eq!(enter.fire_mode, FireMode::Once);
     }
 
+    /// A built plan survives the exact JSON round-trip that `--plan-out` writes
+    /// and the offline `replay-candles` harness reads back. Guards the contract
+    /// between tv-arm dumping the plan and the harness deserialising it: every
+    /// rule, trigger, and embedded intent must reappear unchanged.
+    #[test]
+    fn built_plan_round_trips_through_plan_out_json() {
+        let alerts = vec![
+            alert("01-veto-too-high", Action::Veto),
+            alert("03-prep-break-and-close", Action::Prep),
+            alert("04-prep-retest", Action::Prep),
+            alert("02-veto-trade-expiry", Action::Invalidate),
+            alert("05-enter", Action::Enter),
+        ];
+        let roles = Roles {
+            invalidation: Some(horz(1.2000)),
+            break_and_close: Some(trend((10, 1.1900), (20, 1.1850))),
+            retest: Some(trend((10, 1.1900), (20, 1.1850))),
+            trade_expiry: Some(vert(99_000)),
+            ..Roles::default()
+        };
+        let plan = build_trade_plan(
+            "eurusd-roundtrip-1",
+            "EUR_USD",
+            &alerts,
+            ConvDirection::Short,
+            &roles,
+            Granularity::H1,
+            false,
+            false,
+        );
+
+        // This is exactly what `register_trade_plan` writes for `--plan-out`.
+        let json = serde_json::to_string_pretty(&plan).expect("serialise plan");
+        let back: TradePlan = serde_json::from_str(&json).expect("deserialise plan");
+
+        assert_eq!(back.trade_id, plan.trade_id);
+        assert_eq!(back.instrument, plan.instrument);
+        assert_eq!(back.granularity, plan.granularity);
+        assert_eq!(back.direction, plan.direction);
+        assert_eq!(back.pip_size, plan.pip_size);
+        assert_eq!(back.shadow, plan.shadow);
+        assert_eq!(back.rules.len(), plan.rules.len());
+        for (a, b) in plan.rules.iter().zip(back.rules.iter()) {
+            assert_eq!(a.rule_id, b.rule_id);
+            assert_eq!(a.fire_mode, b.fire_mode);
+            assert_eq!(a.intent.action, b.intent.action);
+        }
+    }
+
     /// An M/W enter folds to the per-bar heartbeat (EveryBar), and its
     /// path-anchor vetos become price-value triggers; abort is the only
     /// OnClose one.
