@@ -1,5 +1,86 @@
 # Changelog
 
+## v44 — 2026-06-20 — multi-shot retry gate: never stack a duplicate on a still-open position (Bug #11)
+
+### Why
+
+A multi-shot `enter` (`max_retries > 0`) re-fired while its **first
+position was still open** and the worker placed a **second live
+position** on the same `trade_id`/instrument/side — the account briefly
+carried double exposure and took two stop-outs where the design allows
+one (incident `hs-eur-cad-b6b708cc`, EUR/CAD, 2026-06-18, demo). The
+retry gate is meant to reject a re-entry while a prior attempt is open;
+it didn't.
+
+Root cause, confirmed from the 18-Jun worker logs: the gate **did** run
+and **did** find the prior attempt, but its per-attempt broker lookup
+mis-resolved the still-open TradeNation position to `AttemptState::Unknown`.
+On a bracketed TN entry the entry order executes and a **fresh** SL child
+order is attached with a new id, so the live `Position.order_id` no longer
+equals the originating entry order id we stored on the `EntryAttempt`.
+`compute_attempt_state` matched only on that entry order id, missed the
+position, and fell through to `Unknown` — which the gate bucketed with
+the *closed* states and skipped past, proceeding to place the duplicate.
+(`lookup_attempt_state` success is silent, which is why no lookup line
+appears in the logs and an earlier read mistook this for "the gate never
+checked".) The "1 → 0 tracked-attempts oscillation" in the cron logs was
+a red herring: two workers (dev + staging) sweeping their own KV into one
+log stream.
+
+### What changed (three layers, defense in depth)
+
+- **`Unknown` now fails safe → reject (412).** A prior attempt the
+  broker can't confirm as open/pending/closed is treated as "might still
+  be open" and blocks the re-entry, instead of being treated as done.
+  New outcome string `rejected: prior-attempt-unknown`
+  (`src/retry_gate.rs`).
+- **`compute_attempt_state` correlates an open position on EITHER the
+  stored entry `order_id` OR the snapshotted `position_id`** — so a
+  still-open position whose live (bracket) order id has drifted is still
+  recognised as `OpenPosition` once its PositionID has been snapshotted
+  (`src/tradenation_adapter.rs`).
+- **Independent open-positions backstop before placement.** When there
+  is at least one tracked prior attempt, the gate lists the broker's live
+  open positions for the instrument and rejects (412) if any correlates
+  to a prior attempt by `order_id` or `position_id` — immune to the
+  per-attempt-lookup taxonomy and to bracket order-id drift. New outcome
+  string `rejected: trade-already-open (backstop)`. A transient failure
+  reading the positions list fails safe (503) rather than risking a
+  duplicate (`src/retry_gate.rs::open_position_backstop`).
+
+### Behaviour
+
+- A multi-shot `enter` re-fire while a same-`trade_id` position is open
+  is now rejected (412), no second order placed.
+- A re-fire **after** the prior attempt has provably closed/cancelled
+  still re-enters (Bug #1 behaviour preserved — `ClosedWin` /
+  `ClosedLossOrBreakeven` / `Cancelled` still fall through).
+- The single-shot path (`max_retries: Static(0)`, the default) is
+  untouched — the gate is skipped entirely, no new KV/broker calls.
+
+### Breaking
+
+None. New reject outcome strings only.
+
+### Tests
+
+- gate: `Unknown` prior attempt rejects (`prior-attempt-unknown`).
+- gate backstop: rejects a live position matching a prior attempt by
+  `position_id` even when the order id has drifted; ignores an unrelated
+  same-instrument position; fails safe (503) on a transient positions
+  read.
+- adapter: `compute_attempt_state` resolves `OpenPosition` via a
+  snapshotted `position_id` when the live `order_id` no longer matches.
+- regression: collapsed states still proceed; single-shot baseline makes
+  no new calls.
+
+### Follow-up
+
+- The closed-position `RefID`-vs-`PositionID` limitation on TradeNation
+  (a stopped-out TN trade still resolves to `Cancelled`, Bug #1) is
+  unchanged and out of scope here — the `Unknown` fail-safe and the
+  backstop both guard the **open** path, which is what this incident hit.
+
 ## v42 — 2026-06-19 — `on_too_close: limit` recovery (Step 4 of the too-close fallback)
 
 ### Why

@@ -1,28 +1,22 @@
-# Fix: confirmation fires early instead of waiting full window
+# TODO — fix Bug #11: re-entry while prior position still open — DONE
 
-## Bug
+Root cause (confirmed from 18-Jun staging logs): a still-open TN position
+resolved to `Unknown` because TN's bracket fill drifts the live order id
+away from the stored entry order id; the gate treated `Unknown` as "done"
+and stacked a duplicate. The `1→0` sweep oscillation was a red herring
+(dev + staging both logging into one file).
 
-Desired: signal candle closes (bar 0), wait `confirm_bars` (=2) more bar closes,
-and ONLY at the end of the window check whether price broke through the
-extreme during the window. If it broke at any point in the window → confirm.
+Fix shipped (three layers, all done):
 
-Actual (both Pine v2.5 and Rust port): the moment a bar within the window
-breaks the extreme it confirms EARLY (`bars_elapsed <= confirm_bars && pushed`).
+- [x] (1) `Unknown` → fail-safe reject (412) in `retry_gate::evaluate`
+      (`rejected: prior-attempt-unknown`).
+- [x] (3) `compute_attempt_state` step 2 also matches `Position.position_id`.
+- [x] (2) Independent open-positions backstop before placement
+      (`rejected: trade-already-open (backstop)`; transient → 503 fail-safe).
 
-Semantics chosen by user: "at end of window if ever broke" — latch the break,
-but only transition to VALID / fire the alert when `bars_elapsed == confirm_bars`.
-
-## Plan
-
-- [x] Pine `candle-signals-v2.pine`: per-direction break-latch + confirm only at
-      `bars_elapsed == confirm_bars`. Bump to v2.6, update header docs.
-- [x] Rust `core/src/signals/state_machine.rs`: add `broke` flag to `Tracked`,
-      transition to Valid only at window end, keep invalidation rules.
-- [x] Update / add Rust tests:
-      - confirm does NOT fire early (bar 1 break, as_of=1 -> not confirmed/not fires)
-      - confirm DOES fire at window end (as_of=2 -> confirmed/fires)
-      - transient break in window still confirms at window end
-      - no break in window -> invalid at window end (existing test adjusted)
-- [x] cargo test, clippy, fmt green
-- [x] Update README + pine parity memory if behaviour-visible
-- [x] Commit + push both; advance parent pointer
+- [x] cargo test green (224 passed)
+- [x] cargo clippy clean
+- [x] cargo fmt
+- [x] CHANGELOG v44 entry (README: gate semantics are internal; no operator
+      surface to change beyond the new reject strings, captured in CHANGELOG)
+- [ ] commit + push; tag v44; advance parent pointer
