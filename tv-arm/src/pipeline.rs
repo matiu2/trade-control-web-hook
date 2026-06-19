@@ -274,6 +274,7 @@ pub fn run(args: Args) -> Result<i32> {
             &key,
             now,
             args.shadow,
+            args.plan_out.as_deref(),
         )?;
     }
 
@@ -1524,6 +1525,7 @@ fn register_trade_plan(
     key: &[u8; KEY_LEN],
     now: DateTime<Utc>,
     shadow: bool,
+    plan_out: Option<&Path>,
 ) -> Result<()> {
     use cli::TradePattern;
     let is_mw = matches!(built_trade.spec.pattern, TradePattern::M | TradePattern::W);
@@ -1549,6 +1551,13 @@ fn register_trade_plan(
     let newses: Vec<&cli::BuiltNews> = news_bundles.iter().map(|b| &b.built).collect();
     append_control_rules(&mut plan, &pauses, &newses, built_calendar);
     let rule_count = plan.rules.len();
+    // Dump the fully-built plan (control rules folded in) for offline replay,
+    // before `build_register_intent` moves it into the register intent.
+    if let Some(path) = plan_out {
+        let json = serde_json::to_string_pretty(&plan).wrap_err("serialise trade plan")?;
+        fs::write(path, json).wrap_err_with(|| format!("write plan to {}", path.display()))?;
+        info!(path = %path.display(), "wrote trade plan JSON");
+    }
     // Mint a fresh register intent carrying the plan, sign it, POST it.
     let suffix = register_suffix(now);
     let intent = cli::build_register_intent(plan, now, &suffix);
