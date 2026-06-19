@@ -21,8 +21,12 @@ indicator("Candle Signals", shorttitle="Candle Signals", overlay=true, max_label
 //   golden       — 1.0 if signal_range >= ATR at signal time, else 0.0.
 //   atr          — ATR value at signal time.
 //   signal_confirmed — 1.0 once a confirming push has validated the
-//     latched signal within `confirm_bars`, 0.0 otherwise. Resets to
-//     0.0 every time a fresh signal overwrites the latch.
+//     latched signal. As of v2.6 confirmation resolves only at the END of
+//     the `confirm_bars` window: a push through the extreme anywhere inside
+//     the window is latched, and the signal validates (confirmed=1.0) when
+//     the window closes iff such a push occurred — it no longer fires the
+//     instant a bar breaks the extreme. Resets to 0.0 every time a fresh
+//     signal overwrites the latch.
 //   recent_high, recent_low — extreme of the `sl_lookback` bars
 //     preceding the signal, a robust SL anchor.
 //
@@ -50,6 +54,19 @@ indicator("Candle Signals", shorttitle="Candle Signals", overlay=true, max_label
 //   keeps working (those bars just can't drive body-based logic). Requires a
 //   manual republish to start sending `open`.
 //
+// v2.6: confirmation now resolves only at the END of the `confirm_bars`
+//   window. Previously a pending signal validated (and the Long/Short
+//   Pattern alert fired with signal_confirmed=1) the instant any bar within
+//   the window pushed through its extreme — so a confirmed entry could fire
+//   on the very next bar instead of after the full wait. The state machine
+//   now latches an in-window push and only transitions PENDING→VALID when
+//   bars_elapsed == confirm_bars: valid iff a push occurred at any point in
+//   the window, invalid otherwise. Invalidation rules (opposite-extreme
+//   breach, in-window opposer) are unchanged and still take effect
+//   immediately. Requires a manual republish of the study after pulling
+//   this version. The Rust worker port (core/src/signals/state_machine.rs)
+//   carries the identical change — keep the two in sync.
+//
 // Single alert per direction; the worker-side Rhai engine reads the
 // shell vars to decide whether to act (golden filter, kind filter,
 // confirmation requirement, candle-size override, etc.).
@@ -60,9 +77,13 @@ indicator("Candle Signals", shorttitle="Candle Signals", overlay=true, max_label
 // 1. Every detected signal starts in the pending state when it prints.
 // 2. If price trades above the high of a bearish signal, it becomes invalid.
 // 3. If price trades below the low of a bullish signal, it becomes invalid.
-// 4. A bullish pending signal becomes valid when price pushes above its high within `confirm_bars`.
-// 5. A bearish pending signal becomes valid when price pushes below its low within `confirm_bars`.
-// 6. Any pending signal that neither validates nor invalidates within `confirm_bars` becomes invalid.
+// 4. A bullish pending signal becomes valid at the END of the `confirm_bars`
+//    window iff price pushed above its high at any point within the window
+//    (the push is latched on its bar; validation is deferred to window end).
+// 5. A bearish pending signal becomes valid at the END of the `confirm_bars`
+//    window iff price pushed below its low at any point within the window.
+// 6. Any pending signal with no in-window push becomes invalid at the end of
+//    the `confirm_bars` window.
 // 7. An opposing-direction signal printing inside the `confirm_bars` window
 //    invalidates the original (this can flip a previously-VALID signal back
 //    to INVALID — confirmation only counts if no opposer printed in-window).
@@ -315,6 +336,11 @@ var int[] bullish_states = array.new_int()
 var int[] bullish_bars = array.new_int()
 var label[] bullish_labels = array.new<label>()
 var bool[] bullish_golden = array.new_bool()
+// `broke` latches whether price has pushed through the signal's extreme at any
+// point *within* the confirm window. The signal only validates at the END of
+// the window (bars_elapsed == confirm_bars) iff broke is true — confirmation
+// must wait the full window rather than firing the instant a bar breaks through.
+var bool[] bullish_broke = array.new_bool()
 
 var float[] bearish_highs = array.new_float()
 var float[] bearish_lows = array.new_float()
@@ -322,6 +348,7 @@ var int[] bearish_states = array.new_int()
 var int[] bearish_bars = array.new_int()
 var label[] bearish_labels = array.new<label>()
 var bool[] bearish_golden = array.new_bool()
+var bool[] bearish_broke = array.new_bool()
 
 // Persistent signal metadata for webhook embedding. These latch when a new
 // signal prints (bullish or bearish) and retain their last value across all
@@ -357,15 +384,22 @@ while bullish_index >= 0
     float sig_low = array.get(bullish_lows, idx)
     label sig_label = array.get(bullish_labels, idx)
     bool is_golden = array.get(bullish_golden, idx)
+    bool broke = array.get(bullish_broke, idx)
 
     int new_state = state
     int bars_elapsed = bar_index - signal_bar
 
+    // Latch a confirming push anywhere inside the window, but only RESOLVE at
+    // the window end (bars_elapsed == confirm_bars): valid iff a push happened,
+    // invalid otherwise. Resolving early (the instant a bar broke the high) was
+    // the v2.5 bug — confirmation fired before the operator's "wait N closes"
+    // window had elapsed.
     if state == STATE_PENDING
         if bars_elapsed <= confirm_bars and high > sig_high
-            new_state := STATE_VALID
-        else if bars_elapsed > confirm_bars
-            new_state := STATE_INVALID
+            broke := true
+            array.set(bullish_broke, idx, true)
+        if bars_elapsed >= confirm_bars
+            new_state := broke ? STATE_VALID : STATE_INVALID
 
     if low < sig_low
         new_state := STATE_INVALID
@@ -409,15 +443,18 @@ while bearish_index >= 0
     float sig_low = array.get(bearish_lows, idx)
     label sig_label = array.get(bearish_labels, idx)
     bool is_golden = array.get(bearish_golden, idx)
+    bool broke = array.get(bearish_broke, idx)
 
     int new_state = state
     int bars_elapsed = bar_index - signal_bar
 
+    // Latch + window-end resolve, mirroring the bullish branch (see above).
     if state == STATE_PENDING
         if bars_elapsed <= confirm_bars and low < sig_low
-            new_state := STATE_VALID
-        else if bars_elapsed > confirm_bars
-            new_state := STATE_INVALID
+            broke := true
+            array.set(bearish_broke, idx, true)
+        if bars_elapsed >= confirm_bars
+            new_state := broke ? STATE_VALID : STATE_INVALID
 
     if high > sig_high
         new_state := STATE_INVALID
@@ -465,6 +502,7 @@ if bullish_signal
     array.push(bullish_states, STATE_PENDING)
     array.push(bullish_bars, bar_index)
     array.push(bullish_golden, bull_sig_golden)
+    array.push(bullish_broke, false)
     label lbl = f_create_label(bar_index, bull_sig_low, true, bull_sig_golden)
     f_apply_label_style(lbl, true, STATE_PENDING, bull_sig_golden)
     array.push(bullish_labels, lbl)
@@ -485,6 +523,7 @@ if bearish_signal
     array.push(bearish_states, STATE_PENDING)
     array.push(bearish_bars, bar_index)
     array.push(bearish_golden, bear_sig_golden)
+    array.push(bearish_broke, false)
     label lbl = f_create_label(bar_index, bear_sig_high, false, bear_sig_golden)
     f_apply_label_style(lbl, false, STATE_PENDING, bear_sig_golden)
     array.push(bearish_labels, lbl)
@@ -538,6 +577,7 @@ while array.size(bullish_states) > max_signals
     array.shift(bullish_states)
     array.shift(bullish_bars)
     array.shift(bullish_golden)
+    array.shift(bullish_broke)
     label old_lbl = array.shift(bullish_labels)
     if not na(old_lbl)
         label.delete(old_lbl)
@@ -548,6 +588,7 @@ while array.size(bearish_states) > max_signals
     array.shift(bearish_states)
     array.shift(bearish_bars)
     array.shift(bearish_golden)
+    array.shift(bearish_broke)
     label old_lbl = array.shift(bearish_labels)
     if not na(old_lbl)
         label.delete(old_lbl)
