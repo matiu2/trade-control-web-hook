@@ -18,12 +18,20 @@
 //! (`fires`). The engine fires the `PinePattern` enter exactly when `fires` is
 //! true and the latched direction matches the plan.
 //!
-//! # Confirmation timing — fixes Pine bug #10B
+//! # Confirmation timing — fixes Pine bug #10B and the early-confirm bug
 //!
 //! Pine can latch `signal_confirmed = 1` off a bar that hasn't closed (the
 //! ADIDAS 5:30-vs-5:45 case). The engine only sees **closed** candles, so a
 //! confirming push here is always a closed bar — the port confirms only on
-//! closed pushing bars within `confirm_bars`, which is the correct behaviour.
+//! closed pushing bars within `confirm_bars`.
+//!
+//! As of the v2.6 fix, confirmation also resolves **only at the end of the
+//! window**: a push through the extreme anywhere inside `confirm_bars` is
+//! latched (`Tracked::broke`) and the signal transitions PENDING→VALID when
+//! `bars_elapsed == confirm_bars` iff such a push occurred — it no longer
+//! validates the instant a bar breaks through. This matches the operator's
+//! "wait the full window, then confirm if it ever broke" semantics and the
+//! Pine `candle-signals-v2.pine` change; keep the two in sync.
 //!
 //! # Opposing-signal invalidation (golden-protect)
 //!
@@ -101,6 +109,11 @@ struct Tracked {
     signal_bar: usize,
     state: SigState,
     golden: bool,
+    /// True once price pushed through the extreme at any point *within* the
+    /// confirm window. Latched on the breaking bar but only consulted at the
+    /// window end (`bars_elapsed == confirm_bars`) — confirmation must wait for
+    /// the full window to close, then validate iff a break happened.
+    broke: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -176,6 +189,7 @@ pub fn latched_signal_at(
                 signal_bar: bar,
                 state: SigState::Pending,
                 golden,
+                broke: false,
             });
             latch = Some(Latch {
                 direction: d.direction,
@@ -255,18 +269,26 @@ fn update_tracked(
         let bars_elapsed = bar.saturating_sub(t.signal_bar);
         let mut new_state = t.state;
 
-        // Pending → Valid on a confirming push through the extreme within the
-        // window; → Invalid once the window elapses without one. (Closed-bar
-        // only — fixes bug #10B.)
+        // Pending signals latch a confirming push (closed-bar only — fixes bug
+        // #10B) but only RESOLVE at the end of the window: confirmation must
+        // wait the full `confirm_bars`, then validate iff a push happened at any
+        // point inside the window. Resolving early (the moment a bar broke the
+        // extreme) was the v2.5 bug — it fired the confirmation before the
+        // operator's "wait 2 bar closes" window had elapsed.
         if t.state == SigState::Pending {
             let pushed = match t.direction {
                 Direction::Long => c.h > t.high,
                 Direction::Short => c.l < t.low,
             };
             if bars_elapsed <= cfg.confirm_bars && pushed {
-                new_state = SigState::Valid;
-            } else if bars_elapsed > cfg.confirm_bars {
-                new_state = SigState::Invalid;
+                t.broke = true;
+            }
+            if bars_elapsed >= cfg.confirm_bars {
+                new_state = if t.broke {
+                    SigState::Valid
+                } else {
+                    SigState::Invalid
+                };
             }
         }
 
@@ -390,11 +412,50 @@ mod tests {
     #[test]
     fn confirms_on_closed_push_within_window() {
         let candles = bullish_pinbar_window();
-        // As of bar 2 the push above 1.20 validates the latched pinbar.
+        // The push above 1.20 lands on bar 2, which is the window-end bar
+        // (signal_bar = 1, confirm_bars = 2 → window ends at bar_index 3? no:
+        // bar 2 → bars_elapsed = 1). Confirmation must therefore wait one more
+        // bar; see early-vs-late tests below for the precise timing.
+        // As of bar 2 (mid-window) it has NOT yet confirmed.
+        let l2 = latched_signal_at(&candles, 2, &cfg()).expect("latched");
+        assert!(
+            !l2.signal_confirmed,
+            "mid-window push doesn't confirm early"
+        );
+    }
+
+    /// Window-end-only confirmation: a push that happens *early* in the window
+    /// (bar 2, bars_elapsed = 1) must NOT confirm until the window actually
+    /// elapses (bar 3, bars_elapsed = 2). This is the v2.5 bug fix — the old
+    /// code fired the confirmation the instant a bar broke the extreme.
+    fn early_break_then_hold() -> Vec<Candle> {
+        let mut c = bullish_pinbar_window();
+        // bar 2 already pushes above 1.20 (early break, bars_elapsed = 1).
+        // bar 3: a balanced doji that stays inside the range (no further push
+        // above 1.20, no breach of the low 1.00, and prints no new signal) —
+        // the latched break should still carry confirmation to window end.
+        c.push(k("2026-06-16T12:00:00Z", 1.18, 1.185, 1.175, 1.18));
+        c
+    }
+
+    #[test]
+    fn no_confirm_before_window_end() {
+        let candles = early_break_then_hold();
+        // As of bar 2 the break has happened but the window (2 bars) is not yet
+        // closed — confirmation must wait, and the alert must not fire.
         let l = latched_signal_at(&candles, 2, &cfg()).expect("latched");
-        assert!(l.signal_confirmed, "validated by the pushing bar");
-        // The alert fires on the just-valid bar too.
-        assert!(l.fires);
+        assert!(!l.signal_confirmed, "must wait the full window");
+        assert!(!l.fires, "no early just-valid alert fire");
+    }
+
+    #[test]
+    fn confirms_at_window_end_after_early_break() {
+        let candles = early_break_then_hold();
+        // As of bar 3 (bars_elapsed = 2 = confirm_bars) the window has closed
+        // and the in-window break carries confirmation.
+        let l = latched_signal_at(&candles, 3, &cfg()).expect("latched");
+        assert!(l.signal_confirmed, "in-window break confirms at window end");
+        assert!(l.fires, "alert fires on the window-end just-valid bar");
     }
 
     #[test]

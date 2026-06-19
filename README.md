@@ -271,8 +271,13 @@ The day-to-day loop, end to end:
      the *pattern* extremes exactly as the TV alert's `{{plot(...)}}`
      substitutions did. The port confirms only on **fully-closed** pushing
      bars (the engine never sees an unclosed bar), which fixes the Pine
-     one-bar-early confirm timing (bug #10B). Validation against recorded
-     Pine fires by historical replay is a tracked follow-up.
+     one-bar-early confirm timing (bug #10B). Confirmation also resolves
+     **only at the end of the `confirm_bars` window** (v2.6): a push through
+     the signal's extreme anywhere inside the window is latched, and the
+     signal validates when the window closes iff such a push occurred — it no
+     longer fires the instant a bar breaks through. Both `candle-signals-v2.pine`
+     and the Rust port carry this fix in lock-step. Validation against
+     recorded Pine fires by historical replay is a tracked follow-up.
    - `5 21 * * *` **and** `5 22 * * *` — the daily **NY-close-edge**
      check for the spread-blackout feature. CF crons are UTC-only and
      can't carry a timezone, so both candidate minutes fire (21:05 UTC
