@@ -31,7 +31,8 @@ use std::fs;
 use std::path::PathBuf;
 
 use chrono::{DateTime, Duration, NaiveDateTime, TimeZone, Utc};
-use clap::Parser;
+use clap::{CommandFactory, Parser};
+use clap_complete::{Shell, generate};
 use color_eyre::eyre::{Context, Result, eyre};
 use tracing_error::ErrorLayer;
 use tracing_subscriber::prelude::*;
@@ -78,11 +79,25 @@ struct Args {
     /// Override the candle-cache disk cache directory.
     #[arg(long)]
     cache_dir: Option<PathBuf>,
+
+    /// Print the zsh completion script to stdout and exit. Source it into your
+    /// fpath (or `source <(replay-candles --print-completions)`).
+    #[arg(long)]
+    print_completions: bool,
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     color_eyre::install()?;
+
+    // Handle completions before clap's required-arg validation: `--plan` and
+    // `--start` are required, so a plain `Args::parse()` would reject a bare
+    // `--print-completions`. Detect it on the raw argv first, emit, and exit.
+    if std::env::args().any(|a| a == "--print-completions") {
+        print_completions();
+        return Ok(());
+    }
+
     init_tracing();
 
     let args = Args::parse();
@@ -155,6 +170,24 @@ fn parse_utc(s: &str) -> Result<DateTime<Utc>> {
     Err(eyre!(
         "{s:?} is not a valid UTC datetime (expected YYYY-MM-DDTHH:MM[:SS])"
     ))
+}
+
+/// Emit the clap-generated zsh completion script. Binds the completion to the
+/// invoked binary name (argv[0] stem) so a renamed-on-install copy emits
+/// completions for its own name, falling back to the clap command name. Mirrors
+/// the `tv-arm --print-completions` pattern.
+fn print_completions() {
+    let mut cmd = Args::command();
+    let name = std::env::args()
+        .next()
+        .and_then(|a| {
+            std::path::Path::new(&a)
+                .file_name()
+                .and_then(|s| s.to_str())
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| cmd.get_name().to_string());
+    generate(Shell::Zsh, &mut cmd, name, &mut std::io::stdout());
 }
 
 fn init_tracing() {
