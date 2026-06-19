@@ -1,5 +1,31 @@
 # Changelog
 
+## v45 — 2026-06-20 — `replay-candles --print-completions`
+
+### Why
+
+`replay-candles` (v43) shipped without the zsh completion flag the other
+operator tools (`tv-arm`, `trade-control`) carry, so TAB-completing its flags
+needed hand-written compdef.
+
+### What changed
+
+- **`replay-candles --print-completions`** emits the clap-generated zsh
+  completion script (bound to the invoked binary name so a renamed-on-install
+  copy completes for its own name), mirroring `tv-arm --print-completions`.
+  Because `--plan`/`--start` are required, the flag is detected on the raw argv
+  before `Args::parse()` so a bare `--print-completions` doesn't trip clap's
+  required-arg validation.
+
+### Breaking / Config
+
+- None. New flag only; `clap_complete` was already a `cli/` dependency.
+
+### Tests
+
+- Verified standalone (no required args), exit 0, `#compdef replay-candles`,
+  and that required-arg enforcement is unaffected on a normal run.
+
 ## v44 — 2026-06-20 — multi-shot retry gate: never stack a duplicate on a still-open position (Bug #11)
 
 ### Why
