@@ -187,6 +187,27 @@ pub async fn evaluate<B: Broker, S: StateStore>(
         }
     };
 
+    // Belt-and-braces open-position backstop (Bug #11). Independent of
+    // the per-attempt `lookup_attempt_state` walk below: ask the broker
+    // for the live open positions on this instrument and reject if any
+    // of them belongs to a prior attempt of this trade — matched on the
+    // stored entry order id OR the snapshotted PositionID. This is the
+    // last line of defence against stacking a duplicate: it survives the
+    // exact failure that caused the incident (a bracket fill drifting the
+    // live order id so the per-attempt lookup mis-resolved to `Unknown`),
+    // and it doesn't depend on the attempt-state taxonomy at all.
+    //
+    // Only worth a broker round-trip when there's at least one prior
+    // attempt to correlate against — a live position carries no trade_id,
+    // so with zero tracked attempts we have nothing to key on and must
+    // not block unrelated positions on the same instrument.
+    if !attempts.is_empty()
+        && let Some(outcome) =
+            open_position_backstop(broker, account, &intent.instrument, &attempts).await
+    {
+        return outcome;
+    }
+
     // Walk newest-first. The plan's collapse rule: stop at the first
     // attempt whose state blocks a placement, otherwise (open, raced
     // cancel) bubble it back as a 412; on a pending we cancel and
@@ -270,12 +291,34 @@ pub async fn evaluate<B: Broker, S: StateStore>(
             }
             Ok(AttemptState::ClosedWin { .. })
             | Ok(AttemptState::ClosedLossOrBreakeven { .. })
-            | Ok(AttemptState::Cancelled)
-            | Ok(AttemptState::Unknown) => {
-                // Collapsed state — this attempt is done. Look at
-                // the next-older attempt; if none remain, fall
+            | Ok(AttemptState::Cancelled) => {
+                // Collapsed state — this attempt is provably done. Look
+                // at the next-older attempt; if none remain, fall
                 // through to the cap check.
                 continue;
+            }
+            Ok(AttemptState::Unknown) => {
+                // The broker couldn't confirm this prior attempt as
+                // open / pending / closed. We must NOT treat that as
+                // "done" — that fail-OPEN is exactly the Bug #11 hole:
+                // a still-open TN position whose live (bracket) order id
+                // had drifted away from the stored entry order id
+                // resolved to `Unknown`, and the gate stacked a
+                // duplicate entry on top of it. Fail SAFE — an
+                // unresolvable prior attempt blocks the re-entry. The
+                // independent open-positions backstop below is the belt
+                // to this braces.
+                rlog!(
+                    "retry: prior attempt #{} unresolvable (Unknown) — rejecting to avoid \
+                     stacking a duplicate (trade_id={trade_id} order_id={})",
+                    attempt.attempt_no,
+                    attempt.broker_order_id,
+                );
+                return RetryGateOutcome::Rejected {
+                    status: 412,
+                    message: "prior attempt state unknown",
+                    outcome: "rejected: prior-attempt-unknown".into(),
+                };
             }
             Err(LookupError::Transient) => {
                 return RetryGateOutcome::Rejected {
@@ -298,6 +341,74 @@ pub async fn evaluate<B: Broker, S: StateStore>(
     RetryGateOutcome::Proceed {
         next_attempt_no: attempts.len() as u32 + 1,
     }
+}
+
+/// Independent open-position backstop for the retry gate (Bug #11).
+///
+/// Lists the broker's live open positions for `instrument` and returns
+/// a `Rejected` outcome if any of them correlates to one of this trade's
+/// prior `attempts` — matched on the stored entry `broker_order_id` OR
+/// the snapshotted `broker_trade_id` (PositionID). Returns `None` when
+/// no live position belongs to this trade (placement may proceed past
+/// this check).
+///
+/// This is deliberately decoupled from `lookup_attempt_state`: the
+/// incident showed that per-attempt lookup can mis-resolve a still-open
+/// position to `Unknown` when the live order id has drifted. Querying
+/// the open-positions list and matching it back to *our* attempts is
+/// immune to that — a position we placed is a position we placed,
+/// whatever its current child-order id.
+///
+/// A broker transient is treated fail-SAFE here: if we can't read the
+/// open positions we can't prove the prior entry has closed, so we
+/// reject (503) rather than risk a duplicate. (The per-attempt walk
+/// already fails 503 on transient; this keeps the same posture.)
+async fn open_position_backstop<B: Broker>(
+    broker: &B,
+    account: Option<&str>,
+    instrument: &str,
+    attempts: &[EntryAttempt],
+) -> Option<RetryGateOutcome> {
+    let positions = match broker.list_open_positions(account.unwrap_or("")).await {
+        Ok(p) => p,
+        Err(LookupError::Transient) => {
+            rlog_err!(
+                "retry: open-position backstop could not list positions (transient) — \
+                 rejecting fail-safe to avoid a possible duplicate (instrument={instrument})"
+            );
+            return Some(RetryGateOutcome::Rejected {
+                status: 503,
+                message: "broker transient",
+                outcome: "rejected: broker-transient".into(),
+            });
+        }
+    };
+
+    let inst_key = instrument.to_lowercase();
+    for pos in positions
+        .iter()
+        .filter(|p| p.instrument.to_lowercase() == inst_key)
+    {
+        let matched = attempts.iter().find(|a| {
+            a.broker_order_id == pos.order_id
+                || a.broker_trade_id.as_deref() == Some(pos.position_id.as_str())
+        });
+        if let Some(a) = matched {
+            rlog!(
+                "retry: open-position backstop matched a live position to prior attempt #{} \
+                 (instrument={instrument} order_id={} position_id={}) — rejecting duplicate",
+                a.attempt_no,
+                pos.order_id,
+                pos.position_id,
+            );
+            return Some(RetryGateOutcome::Rejected {
+                status: 412,
+                message: "trade already open",
+                outcome: "rejected: trade-already-open (backstop)".into(),
+            });
+        }
+    }
+    None
 }
 
 /// Record the placed attempt on the seen-by-fire index and the
@@ -399,9 +510,23 @@ mod tests {
         lookup_calls: RefCell<Vec<(String, String, Option<String>)>>,
         cancel_calls: RefCell<Vec<(String, String)>>,
         place_calls: RefCell<u32>,
+        /// Open positions the backstop's `list_open_positions` returns.
+        /// Default empty → the backstop is a no-op (most tests). Set a
+        /// position to exercise the Bug #11 backstop reject.
+        open_positions: RefCell<Vec<OpenPosition>>,
+        /// When true, `list_open_positions` returns a transient error so
+        /// the backstop's fail-safe 503 path can be tested.
+        open_positions_transient: RefCell<bool>,
+        open_positions_calls: RefCell<u32>,
     }
 
     impl MockBroker {
+        fn push_open_position(&self, p: OpenPosition) {
+            self.open_positions.borrow_mut().push(p);
+        }
+        fn set_open_positions_transient(&self) {
+            *self.open_positions_transient.borrow_mut() = true;
+        }
         fn push_lookup(&self, s: AttemptState) {
             self.lookups.borrow_mut().push(LookupScript::Ok(s));
         }
@@ -475,7 +600,11 @@ mod tests {
             &self,
             _account_id: &str,
         ) -> Result<Vec<OpenPosition>, LookupError> {
-            unimplemented!("MockBroker: list_open_positions unused by retry-gate tests")
+            *self.open_positions_calls.borrow_mut() += 1;
+            if *self.open_positions_transient.borrow() {
+                return Err(LookupError::Transient);
+            }
+            Ok(self.open_positions.borrow().clone())
         }
         async fn amend_stop(
             &self,
@@ -949,6 +1078,22 @@ mod tests {
         s.parse().unwrap()
     }
 
+    /// Build an `OpenPosition` for the backstop tests. Instrument
+    /// defaults to the fixture intent's `EUR_USD` so it matches the
+    /// instrument filter; `order_id` / `position_id` are the two
+    /// correlation keys the backstop matches against prior attempts.
+    fn open_pos(order_id: &str, position_id: &str) -> OpenPosition {
+        OpenPosition {
+            instrument: "EUR_USD".into(),
+            direction: Direction::Long,
+            stop_loss: None,
+            take_profit: None,
+            position_id: position_id.into(),
+            order_id: order_id.into(),
+            stake: 1.0,
+        }
+    }
+
     /// Build an Intent with `max_retries: Static(n)`. Pass `0` for the
     /// default single-shot behaviour, matching the post-flatten wire
     /// semantics (`Static(0)` is the elided default).
@@ -1251,17 +1396,18 @@ mod tests {
         assert_eq!(*store.set_btid_calls.borrow(), 1);
     }
 
-    /// Every collapsed state (ClosedWin / ClosedLossOrBE / Cancelled
-    /// / Unknown) lets the gate fall through to placement of the next
+    /// Every *provably-collapsed* state (ClosedWin / ClosedLossOrBE /
+    /// Cancelled) lets the gate fall through to placement of the next
     /// attempt. ClosedWin no longer gates — min-1R filtering downstream
-    /// is what stops re-entering a winner.
+    /// is what stops re-entering a winner. `Unknown` is deliberately NOT
+    /// in this set any more — it now fails safe (see
+    /// `unknown_prior_attempt_rejects_failsafe`).
     #[test]
     fn collapsed_states_let_next_attempt_through() {
         for state in [
             AttemptState::ClosedWin { realized_pl: 10.0 },
             AttemptState::ClosedLossOrBreakeven { realized_pl: -5.0 },
             AttemptState::Cancelled,
-            AttemptState::Unknown,
         ] {
             let broker = MockBroker::default();
             let store = CountingStore::default();
@@ -1287,6 +1433,127 @@ mod tests {
                 "collapsed state {state:?} should NOT trigger a cancel"
             );
         }
+    }
+
+    /// Bug #11 — a prior attempt whose broker state resolves to
+    /// `Unknown` must FAIL SAFE: the gate rejects (412) rather than
+    /// proceeding. This is the per-attempt-walk half of the fix; the
+    /// real incident was a still-open TN position mis-resolving to
+    /// `Unknown` and the old gate stacking a duplicate on top of it.
+    #[test]
+    fn unknown_prior_attempt_rejects_failsafe() {
+        let broker = MockBroker::default();
+        let store = CountingStore::default();
+        let intent = intent_with_retries(3);
+        run(record_placement(
+            &store,
+            &intent,
+            ts("2026-05-25T13:00:00Z"),
+            intent.not_after,
+            ts("2026-05-25T13:00:01Z"),
+            1,
+            "order-1",
+            Direction::Long,
+            1.05,
+            None,
+        ));
+        broker.push_lookup(AttemptState::Unknown);
+
+        let out = run(evaluate(&broker, &store, &intent, &fixture_shell()));
+        assert_rejected(out, 412, "prior-attempt-unknown");
+        // No cancel and no placement on the fail-safe path.
+        assert!(broker.cancel_calls.borrow().is_empty());
+    }
+
+    /// Bug #11 backstop — even when the per-attempt lookup would let the
+    /// fire through (e.g. it mis-resolves the still-open position to a
+    /// non-open state), the independent open-positions backstop catches
+    /// a live position that correlates to a prior attempt. Here the
+    /// backstop matches on the snapshotted PositionID (the order id has
+    /// drifted, exactly the incident's bracket-reassignment case).
+    #[test]
+    fn open_position_backstop_rejects_on_position_id_match() {
+        let broker = MockBroker::default();
+        let store = CountingStore::default();
+        let intent = intent_with_retries(3);
+        run(record_placement(
+            &store,
+            &intent,
+            ts("2026-05-25T13:00:00Z"),
+            intent.not_after,
+            ts("2026-05-25T13:00:01Z"),
+            1,
+            "26815011",
+            Direction::Long,
+            1.05,
+            None,
+        ));
+        // Snapshot the PositionID onto the attempt (as a prior lookup
+        // would have), then present a live position whose live order id
+        // has drifted but whose PositionID still matches.
+        run(store.set_entry_attempt_broker_trade_id(Some("acct-a"), "trade-xyz", 1, "27205376"))
+            .ok();
+        broker.push_open_position(open_pos(/*drifted order id*/ "26815021", "27205376"));
+
+        let out = run(evaluate(&broker, &store, &intent, &fixture_shell()));
+        assert_rejected(out, 412, "trade-already-open (backstop)");
+        // Backstop short-circuits before the per-attempt lookup walk.
+        assert!(broker.lookup_calls.borrow().is_empty());
+    }
+
+    /// Bug #11 backstop — a live position on the SAME instrument that
+    /// does NOT correlate to any prior attempt (different order id and
+    /// position id) must NOT block the fire. Proves the backstop is
+    /// scoped to *our* attempts, not "any position on the instrument".
+    #[test]
+    fn open_position_backstop_ignores_unrelated_position() {
+        let broker = MockBroker::default();
+        let store = CountingStore::default();
+        let intent = intent_with_retries(3);
+        run(record_placement(
+            &store,
+            &intent,
+            ts("2026-05-25T13:00:00Z"),
+            intent.not_after,
+            ts("2026-05-25T13:00:01Z"),
+            1,
+            "order-1",
+            Direction::Long,
+            1.05,
+            None,
+        ));
+        // Unrelated live position (someone else's), same instrument.
+        broker.push_open_position(open_pos("999999", "888888"));
+        // The prior attempt itself resolves closed, so the walk proceeds.
+        broker.push_lookup(AttemptState::Cancelled);
+
+        let out = run(evaluate(&broker, &store, &intent, &fixture_shell()));
+        assert_proceed(out, 2);
+    }
+
+    /// Bug #11 backstop fail-safe — if the open-positions list can't be
+    /// read (transient), reject (503) rather than risk a duplicate.
+    #[test]
+    fn open_position_backstop_transient_rejects_503() {
+        let broker = MockBroker::default();
+        let store = CountingStore::default();
+        let intent = intent_with_retries(3);
+        run(record_placement(
+            &store,
+            &intent,
+            ts("2026-05-25T13:00:00Z"),
+            intent.not_after,
+            ts("2026-05-25T13:00:01Z"),
+            1,
+            "order-1",
+            Direction::Long,
+            1.05,
+            None,
+        ));
+        broker.set_open_positions_transient();
+
+        let out = run(evaluate(&broker, &store, &intent, &fixture_shell()));
+        assert_rejected(out, 503, "broker-transient");
     }
 
     /// Three attempts on record → fourth fire rejected with 429.

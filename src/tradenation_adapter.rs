@@ -525,14 +525,33 @@ fn compute_attempt_state(
         return AttemptState::Pending;
     }
 
-    // 2. Open position whose ORIGINATING order id matches. TN
-    //    populates `Position.order_id` as the originating OrderID and
-    //    `Position.position_id` as the distinct PositionID — we match
-    //    on the former, return the latter as broker_trade_id.
+    // 2. Open position belonging to this attempt. TN populates
+    //    `Position.order_id` as the originating OrderID and
+    //    `Position.position_id` as the distinct PositionID.
+    //
+    //    We match on EITHER:
+    //      - `Position.order_id == broker_order_id` (the originating
+    //        entry order id we placed), OR
+    //      - `Position.position_id == broker_trade_id` (the PositionID
+    //        snapshotted onto the attempt on a prior lookup).
+    //
+    //    The second correlation is load-bearing: on a bracketed entry,
+    //    TN executes the entry order and then attaches a *fresh* SL
+    //    child order with a NEW id, and the live `Position.order_id`
+    //    can report that child id rather than the original entry id we
+    //    stored. Matching only on the entry order id then misses the
+    //    still-open position and falls through to `Unknown`, which is
+    //    exactly the Bug #11 duplicate-entry hole. See
+    //    `bug-011-reentry-while-position-open.md`. We still return the
+    //    PositionID as broker_trade_id so the row gets snapshotted for
+    //    subsequent lookups.
     let open_match = positions
         .iter()
         .filter(|p| p.market_name.to_lowercase() == inst_key)
-        .find(|p| p.order_id.to_string() == broker_order_id);
+        .find(|p| {
+            p.order_id.to_string() == broker_order_id
+                || broker_trade_id.is_some_and(|btid| p.position_id.to_string() == btid)
+        });
     if let Some(p) = open_match {
         return AttemptState::OpenPosition {
             broker_trade_id: p.position_id.to_string(),
@@ -664,6 +683,36 @@ mod attempt_state_tests {
         // (which would be the wrong correlation key).
         let s_wrong = compute_attempt_state("EUR/USD", "9999", None, &[], &positions, None);
         assert_eq!(s_wrong, AttemptState::Unknown);
+    }
+
+    #[test]
+    fn open_position_matches_on_position_id_when_order_id_drifted() {
+        // Bug #11 regression: a bracketed TN entry executes and the live
+        // position can report the SL *child* order id (here 26815021),
+        // NOT the original entry order id we placed and stored
+        // (26815011). Looking up by the stored entry order id alone
+        // would miss → Unknown → duplicate entry. But once we've
+        // snapshotted the PositionID as broker_trade_id, matching on it
+        // must still resolve the position as Open.
+        let positions = vec![position(
+            /*PositionID*/ 27205376, /*live OrderID (SL child)*/ 26815021, "EUR/CAD",
+        )];
+        // Stored entry order id 26815011 no longer matches any
+        // Position.order_id, but the snapshotted PositionID does.
+        let s = compute_attempt_state(
+            "EUR/CAD",
+            "26815011",
+            Some("27205376"),
+            &[],
+            &positions,
+            None,
+        );
+        assert_eq!(
+            s,
+            AttemptState::OpenPosition {
+                broker_trade_id: "27205376".into()
+            }
+        );
     }
 
     #[test]
