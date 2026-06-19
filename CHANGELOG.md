@@ -1,5 +1,69 @@
 # Changelog
 
+## v43 — 2026-06-20 — `replay-candles`: offline candle replay through the engine
+
+### Why
+
+We had no way to take a registered `TradePlan` and ask "what would the engine
+have fired over this window, and would those entries have won or lost?" without
+standing up a live cron trigger. The tax-tracker's `replay` only diffs recorded
+`TickBundle`s; nothing pulled fresh candles for a plan + time range.
+
+The obvious shape — "POST candles into local `wrangler dev` with a mock broker"
+— doesn't fit: the worker has no candle-ingest endpoint (the cron engine *pulls*
+candles each tick), and the order-dispatch path can't run off-wasm (`run_enter`
+builds a `worker::Response` that panics at construction). But the decision core
+(`evaluate_plan`) is pure and native-callable, and `simulate_fill` is the
+broker-free fill model. So the harness drives the pure core natively.
+
+### What changed
+
+- **New native bin `replay-candles`** (in the `cli/` workspace member):
+  load a `TradePlan` JSON, resolve the instrument per-source via
+  `instrument-lookup`, pull the candle window via `candle-cache`
+  (TradeNation — matches the live engine — or OANDA, disk-cached), convert
+  `candle_model::CandleData` → engine `Candle` (mid, UTC, drop volume), then
+  seed-without-firing and feed closed bars through `evaluate_plan` one tick at a
+  time exactly as `run_engine_tick` does. Each fired enter is run through the
+  pure `simulate_fill` over the forward candles to report the fill/SL/TP
+  outcome. No `wrangler dev`, no HTTP, no live orders.
+- **`tv-arm --plan-out <path>`** writes the fully-built `TradePlan` (control
+  rules folded in) as pretty JSON before the register intent consumes it, so the
+  harness can load the exact plan the engine received. Only meaningful with
+  `--register-plan`.
+
+### Breaking
+
+- None. `register_trade_plan` gains a `plan_out: Option<&Path>` parameter
+  (internal to `tv-arm`).
+
+### Config
+
+- New `tv-arm` flag `--plan-out <path>`.
+- New `replay-candles` env: `TN_ACCOUNT_TYPE` (`demo` default / `live`) with
+  `TN_USERNAME`+`TN_PASSWORD` for live; `OANDA_TOKEN`+`OANDA_ACCOUNT_ID` for
+  `--source oanda`.
+
+### Build
+
+- `candle-cache` / `oanda-client` / `candle-model` / `trade-control-engine` are
+  added to `cli/` only. The worker cdylib does not depend on `cli`, so the wasm
+  build is unaffected (candle-cache absent from the worker dep tree; wasm cdylib
+  still builds).
+
+### Tests
+
+- New unit tests: granularity parse/bridge, instrument resolution, candle
+  conversion+timezone, seed/loop wiring, datetime parsing, and a `tv-arm` plan
+  JSON round-trip. End-to-end verified against the TradeNation demo feed.
+
+### Follow-up
+
+- A hand-authored firing-rule fixture to exercise the report's TP/SL counters
+  end-to-end (the firing path is currently covered via the engine's own
+  `evaluate_plan`/`simulate_fill` tests).
+- Multi-granularity / HTF detector windows; a `--source both` divergence mode.
+
 ## v42 — 2026-06-19 — `on_too_close: limit` recovery (Step 4 of the too-close fallback)
 
 ### Why
