@@ -2,7 +2,7 @@
 # Deploy the DEV environment.
 #
 #   worker : trade-control-web-hook           (branch: main)
-#   CLIs   : trade-control-dev, tv-arm-dev, tv-news-dev
+#   CLIs   : trade-control-dev, tv-arm-dev, tv-news-dev, replay-candles-dev
 #
 # NOTE (promotion plan): next week `web-hook` becomes PROD and a fresh
 # `web-hook-dev` worker is cut for dev. When that happens, change ENV_WEBHOOK

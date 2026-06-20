@@ -8,6 +8,7 @@
 use trade_control_core::intent::{Action, Shell};
 use trade_control_engine::{SimOutcome, TradePlan, simulate_fill};
 
+use super::brisbane::bne;
 use super::replay::{Fire, Replay};
 
 /// Render the full replay report as a string.
@@ -58,7 +59,10 @@ fn render_fire(
     let candle = &fire.fired.candle;
     let mut line = format!(
         "\n• {} {:?} @ {}  close={}\n",
-        fire.fired.rule_id, intent.action, candle.time, candle.c
+        fire.fired.rule_id,
+        intent.action,
+        bne(candle.time),
+        candle.c
     );
 
     if !simulate {
@@ -93,14 +97,19 @@ fn describe_outcome(outcome: &SimOutcome) -> String {
         SimOutcome::FilledOpen {
             fill_at,
             entry_price,
-        } => format!("fill: FILLED @ {entry_price} ({fill_at}) — still open at window end"),
+        } => format!(
+            "fill: FILLED @ {entry_price} ({}) — still open at window end",
+            bne(*fill_at)
+        ),
         SimOutcome::StoppedOut {
             fill_at,
             entry_price,
             exit_at,
             exit_price,
         } => format!(
-            "fill: STOPPED OUT — in @ {entry_price} ({fill_at}) → SL {exit_price} ({exit_at})"
+            "fill: STOPPED OUT — in @ {entry_price} ({}) → SL {exit_price} ({})",
+            bne(*fill_at),
+            bne(*exit_at)
         ),
         SimOutcome::TookProfit {
             fill_at,
@@ -108,7 +117,9 @@ fn describe_outcome(outcome: &SimOutcome) -> String {
             exit_at,
             exit_price,
         } => format!(
-            "fill: TOOK PROFIT — in @ {entry_price} ({fill_at}) → TP {exit_price} ({exit_at})"
+            "fill: TOOK PROFIT — in @ {entry_price} ({}) → TP {exit_price} ({})",
+            bne(*fill_at),
+            bne(*exit_at)
         ),
         SimOutcome::Unresolved(reason) => format!("fill: UNRESOLVED — {reason}"),
     }
