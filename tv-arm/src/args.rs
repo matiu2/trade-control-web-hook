@@ -148,11 +148,13 @@ pub struct Args {
     #[arg(long)]
     pub shadow: bool,
 
-    /// Also write the built `TradePlan` as pretty JSON to this path, in
-    /// addition to registering it with the worker. Lets the offline
-    /// `replay-candles` harness load the exact plan the engine received and
-    /// replay a candle window through it. Only meaningful with
-    /// `--register-plan` (the only path that builds a plan).
+    /// Write the built `TradePlan` as pretty JSON to this path. Lets the offline
+    /// `replay-candles` harness load the exact plan the engine would receive and
+    /// replay a candle window through it.
+    ///
+    /// Builds the plan on its own — you do **not** need `--register-plan`. Used
+    /// alone, it writes the JSON and stops (no worker POST). Combined with
+    /// `--register-plan`, it also registers the plan with the worker.
     #[arg(long)]
     pub plan_out: Option<PathBuf>,
 

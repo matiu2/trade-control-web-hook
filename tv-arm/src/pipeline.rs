@@ -256,11 +256,17 @@ pub fn run(args: Args) -> Result<i32> {
     //     TV alert path (old + new in parallel until the engine is proven on
     //     demo — Stage F retires the alerts). A failed register is a hard error,
     //     but the signed bundle is already on disk.
-    if args.register_plan {
+    // `--plan-out` alone builds the plan and writes the JSON without touching
+    // the worker; `--register-plan` additionally POSTs it. Run the block for
+    // either so `--plan-out` is no longer a silent no-op on its own.
+    if args.register_plan || args.plan_out.is_some() {
         // 8a. (--update) Re-arm: delete the prior plan for this instrument before
         //     registering the fresh one, so the old plan stops ticking and the
         //     new one starts with clean engine state. No-op when --update absent.
-        if let Some(update_target) = args.update.as_deref() {
+        //     Only meaningful when actually registering.
+        if args.register_plan
+            && let Some(update_target) = args.update.as_deref()
+        {
             update_existing_plan(update_target, &built_trade.instrument, &key, now)?;
         }
         register_trade_plan(
@@ -275,6 +281,7 @@ pub fn run(args: Args) -> Result<i32> {
             now,
             args.shadow,
             args.plan_out.as_deref(),
+            args.register_plan,
         )?;
     }
 
@@ -1497,8 +1504,12 @@ fn update_existing_plan(
     Ok(())
 }
 
-/// Fold the built trade into one signed `register` `TradePlan` and POST it to
-/// the worker's server-side engine.
+/// Fold the built trade into one signed `register` `TradePlan` and (when
+/// `register` is true) POST it to the worker's server-side engine.
+///
+/// When `register` is false (`--plan-out` without `--register-plan`) the plan is
+/// still built and, if `plan_out` is set, written to disk — but no worker POST
+/// happens. This is the offline "just give me the JSON for replay" path.
 ///
 /// The plan re-expresses every alert's condition as an engine [`Trigger`] (via
 /// [`build_trade_plan`], the inverse of `alert_spec`) and carries each alert's
@@ -1526,6 +1537,7 @@ fn register_trade_plan(
     now: DateTime<Utc>,
     shadow: bool,
     plan_out: Option<&Path>,
+    register: bool,
 ) -> Result<()> {
     use cli::TradePattern;
     let is_mw = matches!(built_trade.spec.pattern, TradePattern::M | TradePattern::W);
@@ -1557,6 +1569,15 @@ fn register_trade_plan(
         let json = serde_json::to_string_pretty(&plan).wrap_err("serialise trade plan")?;
         fs::write(path, json).wrap_err_with(|| format!("write plan to {}", path.display()))?;
         info!(path = %path.display(), "wrote trade plan JSON");
+    }
+    // Offline path: `--plan-out` without `--register-plan` stops here — the JSON
+    // is on disk, but we never POST the plan to the worker.
+    if !register {
+        info!(
+            trade_id = %built_trade.trade_id,
+            "plan built (--plan-out only); not registering with worker"
+        );
+        return Ok(());
     }
     // Mint a fresh register intent carrying the plan, sign it, POST it.
     let suffix = register_suffix(now);

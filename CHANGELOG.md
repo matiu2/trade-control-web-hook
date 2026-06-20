@@ -1,5 +1,46 @@
 # Changelog
 
+## v48 — 2026-06-20 — tv-arm: `--plan-out` builds the plan on its own
+
+### Why
+
+`tv-arm --plan-out plan.json` silently wrote nothing unless `--register-plan`
+was *also* passed. The plan-build + JSON-dump lived entirely inside
+`register_trade_plan`, which only ran under the `if args.register_plan` guard.
+So the documented replay workflow (v47 TODO: "`tv-arm --plan-out plan.json`
+builds the plan", then `replay-candles --plan plan.json`) didn't actually work
+standalone — the operator got a clean exit and an empty `out_dir`, no file, no
+warning.
+
+### What changed
+
+- The plan-build block now runs when **either** `--register-plan` **or**
+  `--plan-out` is set. Used alone, `--plan-out` builds the `TradePlan` (control
+  rules folded in), writes the pretty JSON, and stops — **no worker POST**.
+  Combined with `--register-plan` it additionally registers the plan, exactly as
+  before.
+- `--update` re-arm (plan delete) still only fires under `--register-plan` —
+  there's nothing to reconcile on the offline path.
+
+### Breaking
+
+- None. `register_trade_plan` gains a `register: bool` parameter that gates the
+  worker POST; the offline path returns early after the optional disk write.
+
+### Config
+
+- No new flags. `--plan-out`'s doc comment no longer claims it's "only
+  meaningful with `--register-plan`".
+
+### Tests
+
+- Existing `built_plan_round_trips_through_plan_out_json` covers the JSON shape;
+  all 171 tv-arm tests pass. (The guard split is control-flow only.)
+
+### Follow-up
+
+- None.
+
 ## v47 — 2026-06-20 — replay-candles: pull the replay window straight from TradingView
 
 ### Why
