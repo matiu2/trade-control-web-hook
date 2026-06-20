@@ -3630,6 +3630,7 @@ dependencies = [
  "trade-control-engine",
  "tradenation-api 0.3.0",
  "tradenation-instrument-cache",
+ "trading-view",
 ]
 
 [[package]]

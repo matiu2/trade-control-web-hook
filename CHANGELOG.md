@@ -1,5 +1,61 @@
 # Changelog
 
+## v47 — 2026-06-20 — replay-candles: pull the replay window straight from TradingView
+
+### Why
+
+The `replay-candles` workflow (v43/v45) required the operator to hand-type
+`--instrument`, `--granularity`, `--start`, and `--end`. But the operator is
+already *looking at exactly that window* in TradingView replay mode: they
+rewind, arm the plan with `tv-arm`, then scrub the chart forward to the end of
+the trade. At that point the chart's visible region **is** the window to replay,
+and the chart symbol + resolution **are** the instrument + granularity.
+Re-typing them is error-prone busywork.
+
+### What changed
+
+- `replay-candles` now reads the instrument, granularity, and start/end window
+  off the **current TradingView chart** when those flags are omitted, via the
+  same `trading-view` MCP wrapper `tv-arm` uses (`TvMcp::get_state` →
+  symbol + resolution, `TvMcp::get_range().visible_range.to_utc()` →
+  start/end).
+- All four flags remain **optional overrides** — any flag that is passed wins
+  over the chart value. With all of instrument/granularity/start/end explicit,
+  no MCP call is made at all.
+- New `--tv-mcp-root` flag (mirrors `tv-arm`) to point at a non-default tv-mcp
+  checkout.
+- The chart resolution → granularity map (`"60"` → `1h`, `"D"` → `1d`, …)
+  mirrors `tv-arm`'s `resolution_to_granularity`; an unsupported resolution
+  (sub-minute, weekly) errors with a clear "set `--granularity` explicitly"
+  message rather than guessing.
+
+### Breaking
+
+- `--granularity` and `--start` are no longer required / no longer defaulted to
+  `1h`. Omitting them now pulls from TradingView instead of erroring (`--start`)
+  or silently assuming `1h` (`--granularity`). Existing invocations that passed
+  both explicitly are unaffected.
+
+### Config
+
+None.
+
+### Tests
+
+`cli/src/bin/replay_candles/tv.rs` unit tests: exchange-prefix stripping
+(`OANDA:EURUSD` → `EURUSD`), TV-resolution → friendly-granularity mapping,
+unsupported-resolution rejection, and a round-trip asserting every friendly
+string this module emits parses back through the CLI's own granularity parser.
+The live MCP path is not unit-tested (it shells out to node). Full workspace
+suite green; wasm worker build stays ring-free (no `trading-view`/`candle-cache`
+in the cdylib tree).
+
+### Follow-up
+
+- Could also derive the candle `--source` from the chart exchange
+  (`OANDA:` → oanda, `TRADENATION:` → tradenation) instead of defaulting to
+  TradeNation; deferred until there's a concrete need.
+
 ## v46 — 2026-06-20 — multi-shot retry gate: never stack a duplicate on a still-open position (Bug #11)
 
 ### Why
