@@ -27,6 +27,7 @@
 //! Any flag that *is* passed overrides the corresponding chart value.
 
 mod replay_candles {
+    pub mod brisbane;
     pub mod candles;
     pub mod granularity;
     pub mod instrument;
@@ -49,7 +50,7 @@ use tracing_subscriber::{EnvFilter, fmt};
 
 use replay_candles::source::CandleSource;
 use replay_candles::tv::TvDefaults;
-use replay_candles::{candles, granularity, instrument, replay, report, tv};
+use replay_candles::{brisbane, candles, granularity, instrument, replay, report, tv};
 use trade_control_engine::TradePlan;
 use trading_view::mcp::TvMcp;
 
@@ -72,7 +73,9 @@ struct Args {
     #[arg(long)]
     granularity: Option<String>,
 
-    /// Candle source. TradeNation matches the live engine; OANDA is disk-cached.
+    /// Which broker candle-cache pulls from. Both sources always go through
+    /// candle-cache (filling the on-disk cache either way); this only selects
+    /// the broker. TradeNation matches the live engine.
     #[arg(long, value_enum, default_value_t = CandleSource::TradeNation)]
     source: CandleSource,
 
@@ -151,9 +154,9 @@ async fn main() -> Result<()> {
         instrument = %symbol,
         granularity = %window.granularity,
         source = ?args.source,
-        %start,
-        %end,
-        "pulling candles"
+        start = %brisbane::bne(start),
+        end = %brisbane::bne(end),
+        "pulling candles (times in Brisbane, UTC+10)"
     );
     let candles = candles::pull(args.source, &symbol, gran, start, end, args.cache_dir).await?;
     if candles.is_empty() {

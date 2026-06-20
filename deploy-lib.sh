@@ -13,8 +13,8 @@
 #      against deploying staging code to the dev worker, or vice versa).
 #   2. `wrangler deploy` the worker (wrangler.toml on the branch already
 #      points at the right worker name / KV / R2).
-#   3. Build the three CLIs with TRADE_CONTROL_WEBHOOK set so each binary
-#      bakes this environment's URL as its compiled-in default endpoint
+#   3. Build the CLIs with TRADE_CONTROL_WEBHOOK set so each webhook-talking
+#      binary bakes this environment's URL as its compiled-in default endpoint
 #      (build.rs → BAKED_WEBHOOK; see cli/build.rs and tv-arm/build.rs).
 #   4. Copy the freshly-built binaries into ~/.cargo/bin under their
 #      suffixed names (trade-control-staging, tv-arm-staging, …). The
@@ -22,7 +22,7 @@
 #      an environment from the shell.
 #
 # This is a Cargo *workspace* (root Cargo.toml lists cli/tv-arm/tv-news as
-# members), so one `cargo build --release` produces all three into the
+# members), so one `cargo build --release` produces every binary into the
 # shared ./target/release/.
 
 set -euo pipefail
@@ -36,8 +36,14 @@ CARGO_BIN="${CARGO_HOME:-$HOME/.cargo}/bin"
 # binary is `trade-control`). CLI_BINARIES are the built artifact names in
 # ./target/release/ — each gets the env suffix appended on install
 # (e.g. trade-control -> trade-control-staging).
+#
+# `replay-candles` is a second binary of the `trade-control-cli` package, so it
+# builds with that `-p` already; it has no baked webhook (it talks to
+# TradingView + the broker via candle-cache, not the worker), so the suffixed
+# copy is purely a convenience name — but installing per-env keeps it alongside
+# the other dev/staging tools.
 CLI_PACKAGES=(trade-control-cli tv-arm tv-news)
-CLI_BINARIES=(trade-control tv-arm tv-news)
+CLI_BINARIES=(trade-control tv-arm tv-news replay-candles)
 
 # deploy_env <env-name> <required-branch> <webhook-url> <suffix> <pine-name>
 #

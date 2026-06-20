@@ -1,5 +1,53 @@
 # Changelog
 
+## v49 — 2026-06-20 — replay-candles: Brisbane-time output + clearer --source help + dev deploy
+
+### Why
+
+The replay report printed every candle/fill/exit timestamp in **UTC**, but the
+operator (and the broker, and the TradingView chart they armed from) all work in
+**Brisbane time**. Cross-referencing a fire against the chart meant doing +10h
+arithmetic in your head. Separately, `--source`'s help implied it might bypass
+the cache — it never did; **both** sources always go through candle-cache.
+
+### What changed
+
+- **All report timestamps now render in Brisbane time (UTC+10)** with an
+  explicit `+10:00` suffix — candle fire times, fill/SL/TP times, and the
+  "pulling candles" log line. Brisbane has no DST, so the offset is fixed
+  year-round. New `replay_candles/brisbane.rs` (`bne()`); the candle *data* and
+  the engine still compute in UTC internally — this is display-only.
+- **`--source` help clarified.** Both `tradenation` and `oanda` always pull
+  through candle-cache (filling the on-disk cache and cutting future broker
+  calls); `--source` only selects the broker, never whether the cache is used.
+  No behaviour change — wording only.
+- **`replay-candles` now installs via `./deploy-dev.sh`** (and staging) as
+  `replay-candles-<env>`. It's a second binary of the `trade-control-cli`
+  package, so it already built with the others; added to `CLI_BINARIES` so the
+  suffixed copy lands in `~/.cargo/bin`. It has no baked webhook (it talks to
+  TradingView + the broker, not the worker), so the per-env copy is just a
+  naming convenience.
+
+### Breaking
+
+None. Output format of timestamps changed (UTC → Brisbane), but no flags or
+APIs changed.
+
+### Config
+
+None.
+
+### Tests
+
+`brisbane.rs`: UTC→Brisbane render (`11:00Z` → `21:00 +10:00`) and a
+date-rollover case (`20:00Z` → next-day `06:00 +10:00`). Full bin suite (17)
+and workspace green; wasm worker build stays ring-free.
+
+### Follow-up
+
+- Still could auto-derive `--source` from the TV chart exchange
+  (`OANDA:`/`TRADENATION:`); deferred (carried from v47).
+
 ## v48 — 2026-06-20 — tv-arm: `--plan-out` builds the plan on its own
 
 ### Why
