@@ -13,10 +13,18 @@
 //! at construction), so this drives the *pure* engine core natively and uses the
 //! fill simulator as the faithful, broker-free stand-in for execution.
 //!
+//! With explicit flags:
+//!
 //! ```text
 //! replay-candles --plan plan.json --instrument eur/cad --granularity 1h \
 //!   --source tradenation --start 2026-06-18T11:00
 //! ```
+//!
+//! Or, with no window flags, the instrument + granularity + start/end are
+//! read straight off the current TradingView chart (the replay-mode visible
+//! region) via the same MCP wrapper `tv-arm` uses — so the operator scrubs the
+//! chart to the trade's end and just runs `replay-candles --plan plan.json`.
+//! Any flag that *is* passed overrides the corresponding chart value.
 
 mod replay_candles {
     pub mod candles;
@@ -25,6 +33,7 @@ mod replay_candles {
     pub mod replay;
     pub mod report;
     pub mod source;
+    pub mod tv;
 }
 
 use std::fs;
@@ -39,8 +48,10 @@ use tracing_subscriber::prelude::*;
 use tracing_subscriber::{EnvFilter, fmt};
 
 use replay_candles::source::CandleSource;
-use replay_candles::{candles, granularity, instrument, replay, report};
+use replay_candles::tv::TvDefaults;
+use replay_candles::{candles, granularity, instrument, replay, report, tv};
 use trade_control_engine::TradePlan;
+use trading_view::mcp::TvMcp;
 
 #[derive(Parser)]
 #[command(name = "replay-candles")]
@@ -50,27 +61,36 @@ struct Args {
     #[arg(long)]
     plan: PathBuf,
 
-    /// Instrument to pull candles for (e.g. `eur/cad`). Defaults to the plan's
-    /// instrument. Resolved per-source via instrument-lookup.
+    /// Instrument to pull candles for (e.g. `eur/cad`). Overrides the chart's
+    /// symbol; falls back to the TradingView chart, then the plan's instrument.
+    /// Resolved per-source via instrument-lookup.
     #[arg(long)]
     instrument: Option<String>,
 
-    /// Candle granularity (`1m`/`5m`/`15m`/`1h`/`4h`/`1d`). Must match the
-    /// plan's granularity.
-    #[arg(long, default_value = "1h")]
-    granularity: String,
+    /// Candle granularity (`1m`/`5m`/`15m`/`1h`/`4h`/`1d`). Overrides the
+    /// chart's resolution. Must match the plan's granularity.
+    #[arg(long)]
+    granularity: Option<String>,
 
     /// Candle source. TradeNation matches the live engine; OANDA is disk-cached.
     #[arg(long, value_enum, default_value_t = CandleSource::TradeNation)]
     source: CandleSource,
 
     /// Window start, UTC (e.g. `2026-06-18T11:00` or `2026-06-18T11:00:00`).
+    /// Overrides the chart's visible-region start. Omit to read it from the
+    /// TradingView chart.
     #[arg(long)]
-    start: String,
+    start: Option<String>,
 
-    /// Window end, UTC. Omit to replay up to now.
+    /// Window end, UTC. Overrides the chart's visible-region end. Omit to read
+    /// it from the TradingView chart.
     #[arg(long)]
     end: Option<String>,
+
+    /// Override the tv-mcp module root used to read the chart when window flags
+    /// are omitted. Defaults to the hard-coded `~/Downloads/tradingview-mcp-jackson`.
+    #[arg(long)]
+    tv_mcp_root: Option<PathBuf>,
 
     /// Run the fill simulator on each fired enter (default on).
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
@@ -90,8 +110,8 @@ struct Args {
 async fn main() -> Result<()> {
     color_eyre::install()?;
 
-    // Handle completions before clap's required-arg validation: `--plan` and
-    // `--start` are required, so a plain `Args::parse()` would reject a bare
+    // Handle completions before clap's required-arg validation: `--plan` is
+    // required, so a plain `Args::parse()` would reject a bare
     // `--print-completions`. Detect it on the raw argv first, emit, and exit.
     if std::env::args().any(|a| a == "--print-completions") {
         print_completions();
@@ -102,7 +122,9 @@ async fn main() -> Result<()> {
 
     let args = Args::parse();
     let plan = load_plan(&args.plan)?;
-    let gran = granularity::parse(&args.granularity)?;
+
+    let window = resolve_window(&args)?;
+    let gran = granularity::parse(&window.granularity)?;
 
     // The plan's granularity drives the engine's detector config and the candle
     // feed; a mismatch would replay the wrong bars, so refuse it.
@@ -110,27 +132,24 @@ async fn main() -> Result<()> {
         return Err(eyre!(
             "granularity {} does not match the plan's granularity {} — \
              pass --granularity {}",
-            args.granularity,
+            window.granularity,
             granularity::engine_label(plan.granularity),
             granularity::engine_label(plan.granularity),
         ));
     }
 
-    let raw_instrument = args.instrument.as_deref().unwrap_or(&plan.instrument);
+    let raw_instrument = window.instrument.as_deref().unwrap_or(&plan.instrument);
     let symbol = instrument::resolve_for(raw_instrument, args.source)?;
 
-    let start = parse_utc(&args.start).wrap_err("parse --start")?;
-    let end = match &args.end {
-        Some(e) => parse_utc(e).wrap_err("parse --end")?,
-        None => Utc::now(),
-    };
+    let start = window.start;
+    let end = window.end;
     if end <= start {
-        return Err(eyre!("--end ({end}) must be after --start ({start})"));
+        return Err(eyre!("end ({end}) must be after start ({start})"));
     }
 
     tracing::info!(
         instrument = %symbol,
-        granularity = %args.granularity,
+        granularity = %window.granularity,
         source = ?args.source,
         %start,
         %end,
@@ -140,7 +159,7 @@ async fn main() -> Result<()> {
     if candles.is_empty() {
         return Err(eyre!(
             "no candles returned for {symbol} {} in [{start}, {end}]",
-            args.granularity
+            window.granularity
         ));
     }
     tracing::info!(count = candles.len(), "pulled candles");
@@ -151,6 +170,73 @@ async fn main() -> Result<()> {
 
     print!("{}", report::render(&plan, &replay, args.simulate));
     Ok(())
+}
+
+/// The fully-resolved replay window: instrument (or `None` to fall back to the
+/// plan), the friendly granularity string, and the UTC start/end. Built from
+/// CLI flags, with any omitted field pulled from the live TradingView chart.
+struct ResolvedWindow {
+    instrument: Option<String>,
+    granularity: String,
+    start: DateTime<Utc>,
+    end: DateTime<Utc>,
+}
+
+/// Resolve the replay window from flags, consulting TradingView only when a
+/// window field is missing. Explicit flags always win; the chart fills the
+/// gaps. Instrument falls back to `None` here (the caller then uses the plan's
+/// instrument) — the chart symbol is only consulted when TV is needed for some
+/// *other* field anyway, so a bare `--plan` with all-explicit window still
+/// honours the plan instrument without an MCP call.
+fn resolve_window(args: &Args) -> Result<ResolvedWindow> {
+    let need_tv = args.instrument.is_none()
+        || args.granularity.is_none()
+        || args.start.is_none()
+        || args.end.is_none();
+
+    let tv = if need_tv {
+        let mcp = match &args.tv_mcp_root {
+            Some(root) => TvMcp::new(root.clone()),
+            None => TvMcp::default(),
+        };
+        tracing::info!(
+            root = %mcp.root().display(),
+            "reading replay window from TradingView chart"
+        );
+        Some(tv::pull_defaults(&mcp)?)
+    } else {
+        None
+    };
+
+    let instrument = args
+        .instrument
+        .clone()
+        .or_else(|| tv.as_ref().map(|d: &TvDefaults| d.instrument.clone()));
+
+    let granularity = match (&args.granularity, &tv) {
+        (Some(g), _) => g.clone(),
+        (None, Some(d)) => d.granularity.clone(),
+        (None, None) => unreachable!("need_tv is true when --granularity is absent"),
+    };
+
+    let start = match (&args.start, &tv) {
+        (Some(s), _) => parse_utc(s).wrap_err("parse --start")?,
+        (None, Some(d)) => d.start,
+        (None, None) => unreachable!("need_tv is true when --start is absent"),
+    };
+
+    let end = match (&args.end, &tv) {
+        (Some(e), _) => parse_utc(e).wrap_err("parse --end")?,
+        (None, Some(d)) => d.end,
+        (None, None) => unreachable!("need_tv is true when --end is absent"),
+    };
+
+    Ok(ResolvedWindow {
+        instrument,
+        granularity,
+        start,
+        end,
+    })
 }
 
 fn load_plan(path: &PathBuf) -> Result<TradePlan> {
