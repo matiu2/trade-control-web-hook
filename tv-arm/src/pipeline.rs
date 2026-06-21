@@ -770,7 +770,7 @@ fn build_mw_trade_spec(
         // M/W entry is always a stop order at the worker-computed level;
         // --entry-market is an H&S flag and is ignored here.
         entry_mode: cli::EntryMode::Stop,
-        needs_golden: args.require_golden,
+        needs_golden: !args.skip_golden,
         needs_confirmed: args.require_confirmation,
         // No close-on-reversal for M/W (TP is a hard 1R), so news/SR
         // close coverage is not wired.
@@ -963,7 +963,7 @@ fn build_trade_spec(
         risk_pct: args.risk_pct.unwrap_or(1.0),
         risk_amount: args.risk_amount,
         dry_run: args.broker_dry_run,
-        max_retries: args.max_retries.unwrap_or(0),
+        max_retries: args.max_retries.unwrap_or(5),
         expiry_bars: args.expiry_bars,
         skip_preps,
         entry_offset_pips: None,
@@ -979,7 +979,7 @@ fn build_trade_spec(
         } else {
             cli::EntryMode::Stop
         },
-        needs_golden: args.require_golden,
+        needs_golden: !args.skip_golden,
         needs_confirmed: args.require_confirmation,
         close_on_news: !roles.news_pairs.is_empty(),
         sr_reversal_ranges: build_sr_ranges(roles, args.reversal_band_pct),

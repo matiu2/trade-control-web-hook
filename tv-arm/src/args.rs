@@ -160,9 +160,9 @@ pub struct Args {
 
     /// Opt in to multi-shot entries: if the broker rejects the order
     /// (e.g. spread too wide), the worker will retry on subsequent
-    /// enter-alert firings up to this many times. Default (flag
-    /// absent) keeps today's single-shot behaviour. Bounded by
-    /// `trade_expiry`.
+    /// enter-alert firings up to this many times. Defaults to 5 when
+    /// the flag is absent. Pass `--max-retries 0` for single-shot.
+    /// Bounded by `trade_expiry`.
     #[arg(long)]
     pub max_retries: Option<u32>,
 
@@ -233,15 +233,17 @@ pub struct Args {
     #[arg(long)]
     pub skip_retest: bool,
 
-    /// Require a golden signal candle on entry. Sets
-    /// `needs_golden: true` on the trade spec.
+    /// Drop the golden-signal-candle requirement on entry. By default
+    /// a golden signal candle is required (`needs_golden: true` on the
+    /// trade spec); pass this to clear it.
     #[arg(long)]
-    pub require_golden: bool,
+    pub skip_golden: bool,
 
     /// Require a confirmed signal candle on entry. Sets
-    /// `needs_confirmed: true` on the enter intent. Symmetric with
-    /// `--require-golden` and independent of it — pass both for a
-    /// stricter "golden AND confirmed" entry gate.
+    /// `needs_confirmed: true` on the enter intent. Independent of the
+    /// golden gate (which is on by default; clear it with
+    /// `--skip-golden`) — leave golden on and pass this for a stricter
+    /// "golden AND confirmed" entry gate.
     #[arg(long)]
     pub require_confirmation: bool,
 
@@ -369,11 +371,14 @@ mod tests {
     }
 
     #[test]
-    fn require_golden_and_confirmation_compose() {
-        // Independent gates — both flags accepted together.
-        let args = Args::try_parse_from(["tv-arm", "--require-golden", "--require-confirmation"])
+    fn golden_default_on_skip_clears_it() {
+        // Golden is required by default; --skip-golden clears it.
+        let args = Args::try_parse_from(["tv-arm"]).expect("parse");
+        assert!(!args.skip_golden);
+
+        let args = Args::try_parse_from(["tv-arm", "--skip-golden", "--require-confirmation"])
             .expect("parse");
-        assert!(args.require_golden);
+        assert!(args.skip_golden);
         assert!(args.require_confirmation);
     }
 

@@ -1807,7 +1807,8 @@ cargo run -p tv-arm -- \
   --veto-on-reversal \                # experimental: a reversal off a band before entry also vetoes the upcoming trade (default off)
   --skip-break-and-close \            # for stocks (no after-hours retests)
   --skip-retest \                     # implies --skip-break-and-close; for late entries
-  --require-golden \                  # require Pine golden-candle signal on entry
+  --skip-golden \                     # drop the Pine golden-candle requirement (golden is required by default)
+  --max-retries 5 \                   # multi-shot re-entry cap (default 5; pass 0 for single-shot)
   --require-confirmation \            # require a confirmed signal candle on entry (independent of golden)
   --blackout-close close \            # market-hours blackout: also flatten an open position if caught in the close→open gap (default: cancel = cancel the resting order only)
   --create-alerts \                   # POST to TradingView; omit to only write the signed bundle to disk
