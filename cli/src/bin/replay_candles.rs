@@ -41,6 +41,7 @@ mod replay_candles {
     pub mod granularity;
     pub mod instrument;
     pub mod replay;
+    pub mod replay_broker;
     pub mod report;
     pub mod source;
     pub mod tv;
@@ -218,12 +219,22 @@ async fn main() -> Result<()> {
         "pulled candles"
     );
 
+    // Half-spread in price units = pips × the plan's pip size. The replay's
+    // multi-shot prior-attempt resolution and the report's fill sim both use it.
+    let half_spread = args.half_spread_pips * plan.pip_size;
+
     // Keep the state TTL past the window so nothing expires mid-replay.
     let expires_at = end + Duration::days(365);
-    let replay = replay::run(&plan, &candles, gran.engine(), start, expires_at);
+    let replay = replay::run(
+        &plan,
+        &candles,
+        gran.engine(),
+        start,
+        expires_at,
+        half_spread,
+    )
+    .await;
 
-    // Half-spread in price units = pips × the plan's pip size.
-    let half_spread = args.half_spread_pips * plan.pip_size;
     print!(
         "{}",
         report::render(&plan, &replay, args.simulate, half_spread)

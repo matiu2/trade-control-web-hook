@@ -8,10 +8,16 @@
 //! fill.
 
 use chrono::{DateTime, Duration, Utc};
+use trade_control_core::intent::{Action, Shell};
+use trade_control_core::retry_gate::{self, RetryGateOutcome};
+use trade_control_core::state::MemStateStore;
+use trade_control_core::tunable::Tunable;
 use trade_control_engine::Candle as EngineCandle;
 use trade_control_engine::{
     FiredIntent, Granularity, PlanState, TradePlan, evaluate_plan, seed_plan_state,
 };
+
+use super::replay_broker::ReplayBroker;
 
 /// One fired intent plus the forward candle path needed to simulate its fill.
 pub struct Fire {
@@ -51,12 +57,13 @@ const SEED_BARS: usize = 10;
 /// retired by a stale veto-level touch that happened earlier (which would
 /// otherwise end the plan before the entry it exists to protect). The warm-up
 /// bars are pulled by the caller (`--warmup-bars`).
-pub fn run(
+pub async fn run(
     plan: &TradePlan,
     candles: &[EngineCandle],
     granularity: Granularity,
     live_start: DateTime<Utc>,
     expires_at: DateTime<Utc>,
+    half_spread: f64,
 ) -> Replay {
     if candles.is_empty() {
         return Replay {
@@ -84,6 +91,17 @@ pub fn run(
     let mut warnings: Vec<String> = Vec::new();
     let mut done = false;
 
+    // Multi-shot plumbing: the SAME async retry gate the worker runs, backed by
+    // an offline `ReplayBroker` (resolves a prior attempt's state by simulating
+    // it against the candle window up to the asking bar) and an in-memory store.
+    // The engine fix (multi-shot enter stays AwaitEntry) lets the loop reach the
+    // re-entry bars; the gate decides whether each enter fire actually places
+    // (Proceed) or is blocked (a prior attempt still open / the cap reached) —
+    // exactly as the live worker would. Single-shot enters never enter this gate
+    // (the engine retires them after one fire).
+    let replay_broker = ReplayBroker::new(candles.to_vec(), plan.pip_size, half_spread);
+    let store = MemStateStore::default();
+
     // The detector window grows with each tick: Pine / trendline triggers need
     // the full back-window of closed candles, not just the single new bar.
     for i in seed_end..candles.len() {
@@ -105,6 +123,15 @@ pub fn run(
         }
 
         for fired in eval.fired {
+            // An enter fire on a multi-shot plan must clear the retry gate before
+            // it counts as a placement; any other fire (veto/prep, or a
+            // single-shot enter) records straight through.
+            if fired.intent.action == Action::Enter && is_multi_shot(&fired.intent.max_retries) {
+                match gate_enter(&replay_broker, &store, &fired, now, plan.pip_size).await {
+                    Some(()) => {}    // Proceed — record the placement.
+                    None => continue, // Rejected (open / cap) — no placement.
+                }
+            }
             // The fill simulator walks candles at/after the firing bar.
             let forward = candles[i..].to_vec();
             fires.push(Fire { fired, forward });
@@ -121,6 +148,69 @@ pub fn run(
         final_state: state,
         done,
         warnings,
+    }
+}
+
+/// Is this enter opted into multi-shot (any non-default `max_retries`)? Mirrors
+/// the worker's gate-entry check in `run_enter`.
+fn is_multi_shot(max_retries: &Tunable<u32>) -> bool {
+    !matches!(max_retries, Tunable::Static(0))
+}
+
+/// Run one multi-shot enter fire through the shared retry gate, backed by the
+/// offline broker. On `Proceed`, register the placement with the broker (so a
+/// later re-entry's gate sees this attempt) and the store, and return `Some(())`
+/// to record the fire. On any `Rejected` (a prior attempt still open, the cap
+/// reached, …) return `None` so the loop skips it — no placement happened.
+async fn gate_enter(
+    broker: &ReplayBroker,
+    store: &MemStateStore,
+    fired: &FiredIntent,
+    now: DateTime<Utc>,
+    pip_size: f64,
+) -> Option<()> {
+    let intent = &fired.intent;
+    // Reconstruct the firing shell exactly as the worker's dispatch would, so the
+    // gate's `max_retries` script (if any) resolves against the same anchors.
+    let shell = match &fired.signal {
+        Some(sig) => Shell::from_candle_and_signal(&fired.candle, sig),
+        None => Shell::from_candle(&fired.candle),
+    };
+
+    // Point the broker's prior-attempt resolution at this bar (time-accurate).
+    broker.set_as_of(fired.candle.time);
+
+    match retry_gate::evaluate(broker, store, intent, &shell).await {
+        RetryGateOutcome::Proceed { next_attempt_no } => {
+            let order_id = format!("{}-{next_attempt_no}", intent.id);
+            // Register with the broker so the next re-entry's gate can resolve
+            // this attempt's state from the candles.
+            broker.record_attempt(order_id.clone(), intent.clone(), shell.clone());
+            // Persist the EntryAttempt + retry-fire-seen mark via the SAME
+            // `record_placement` the worker uses, so the cap counts correctly.
+            let resolved_sl =
+                trade_control_core::intent::Resolved::from_intent(intent, &shell, pip_size)
+                    .ok()
+                    .map(|r| r.stop_loss)
+                    .unwrap_or(0.0);
+            retry_gate::record_placement(
+                store,
+                intent,
+                shell.time,
+                intent.not_after,
+                now,
+                next_attempt_no,
+                &order_id,
+                intent
+                    .direction
+                    .unwrap_or(trade_control_core::intent::Direction::Long),
+                resolved_sl,
+                None,
+            )
+            .await;
+            Some(())
+        }
+        RetryGateOutcome::Rejected { .. } => None,
     }
 }
 
@@ -150,8 +240,8 @@ mod tests {
     // A plan with no rules never fires and never finishes; it just advances the
     // watermark across the window. Confirms the seed/loop wiring is sound
     // without needing geometry.
-    #[test]
-    fn empty_rule_plan_fires_nothing_and_advances() {
+    #[tokio::test]
+    async fn empty_rule_plan_fires_nothing_and_advances() {
         let plan = TradePlan {
             trade_id: "t-empty".into(),
             instrument: "EUR_CAD".into(),
@@ -166,7 +256,7 @@ mod tests {
             .collect();
         let expires = Utc.timestamp_opt(99 * 3600, 0).unwrap();
 
-        let replay = run(&plan, &candles, Granularity::H1, all_live(), expires);
+        let replay = run(&plan, &candles, Granularity::H1, all_live(), expires, 0.0).await;
 
         assert!(replay.fires.is_empty(), "no rules → no fires");
         assert!(!replay.done);
@@ -176,8 +266,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn empty_candles_seed_only() {
+    #[tokio::test]
+    async fn empty_candles_seed_only() {
         let plan = TradePlan {
             trade_id: "t".into(),
             instrument: "EUR_CAD".into(),
@@ -187,7 +277,7 @@ mod tests {
             rules: Vec::new(),
             shadow: false,
         };
-        let replay = run(&plan, &[], Granularity::H1, all_live(), all_live());
+        let replay = run(&plan, &[], Granularity::H1, all_live(), all_live(), 0.0).await;
         assert!(replay.fires.is_empty());
     }
 
@@ -197,8 +287,8 @@ mod tests {
     /// opening at-or-after the expiry — one bar past it — for the plan to
     /// finish. This is the NZD/CHF boundary case: pulling only up to the expiry
     /// left the last bar opening one bar *short*, so expiry never fired.
-    #[test]
-    fn trade_expiry_fires_when_a_bar_opens_at_expiry() {
+    #[tokio::test]
+    async fn trade_expiry_fires_when_a_bar_opens_at_expiry() {
         let expiry = 15 * 3600;
         let candles: Vec<Candle> = (0..=15).map(|i| candle(i * 3600, 1.30)).collect();
         // The last bar opens at exactly `expiry` → `candle.time >= expiry`.
@@ -209,7 +299,9 @@ mod tests {
             Granularity::H1,
             all_live(),
             expires(),
-        );
+            0.0,
+        )
+        .await;
         assert!(
             replay.done,
             "a bar opening at the expiry should finish the plan"
@@ -221,8 +313,8 @@ mod tests {
     /// The converse: when the window stops one bar *short* of the expiry (last
     /// bar opens before it), nothing fires — which is exactly why the window
     /// resolver extends the pull end past the plan's trade-expiry.
-    #[test]
-    fn trade_expiry_does_not_fire_a_bar_short() {
+    #[tokio::test]
+    async fn trade_expiry_does_not_fire_a_bar_short() {
         let expiry = 15 * 3600;
         let candles: Vec<Candle> = (0..15).map(|i| candle(i * 3600, 1.30)).collect();
         assert!(candles.last().unwrap().time.timestamp() < expiry);
@@ -232,7 +324,9 @@ mod tests {
             Granularity::H1,
             all_live(),
             expires(),
-        );
+            0.0,
+        )
+        .await;
         assert!(!replay.done);
         assert!(replay.fires.is_empty());
     }
@@ -282,8 +376,8 @@ mod tests {
     /// prefix** (before `live_start`) must NOT fire — those bars seed silently.
     /// A breach in the **live** window fires. Proves the live boundary, not the
     /// geometry, gates the veto.
-    #[test]
-    fn warmup_prefix_does_not_fire_a_veto_touched_before_live_start() {
+    #[tokio::test]
+    async fn warmup_prefix_does_not_fire_a_veto_touched_before_live_start() {
         let level = 1.30;
         // 40 bars below the level, except two close-confirmed up-crosses:
         // bar 5 (warm-up) and bar 25 (live, well past the SEED_BARS floor).
@@ -301,7 +395,9 @@ mod tests {
             Granularity::H1,
             live_at,
             expires(),
-        );
+            0.0,
+        )
+        .await;
         assert_eq!(
             r.fires.len(),
             1,
