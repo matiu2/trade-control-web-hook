@@ -1,6 +1,6 @@
 # Changelog
 
-## v51 — 2026-06-22 — Bug #12: continuous at-entry too-low/too-high enforcement
+## v52 — 2026-06-22 — Bug #12: continuous at-entry too-low/too-high enforcement
 
 ### Why
 
@@ -55,7 +55,7 @@ plans armed after deploy carry it; in-flight plans keep the cross-guard until
 they expire/re-arm. Dev only (`./deploy-dev.sh`); do not redeploy staging
 mid-week.
 
-## v50 — 2026-06-22 — M/W: optional drawn right shoulder (4-point path) arms immediately
+## v51 — 2026-06-22 — M/W: optional drawn right shoulder (4-point path) arms immediately
 
 ### Why
 
@@ -98,6 +98,40 @@ the 1.3 break.
   shoulder, wrong-side stop still declines, drawn shoulder seeds `MwState`.
 - tv-arm: `validate_right_shoulder` (valid / 1.3-break / wrong-side, M+W),
   `highest_shoulder`, 4-anchor classification + pipeline accept/reject.
+
+## v50 — 2026-06-22 — `plan show` finds archived (terminated) plans
+
+### Why
+
+`plan list --include-archived` would list a terminated plan, but
+`plan show <trade_id>` for that same id returned **404 — no registered plan**.
+A terminated plan usually exists *only* in the archive keyspace (its live
+`plan:` / `plan-state:` rows are dropped on the terminal tick), and
+`handle_plan_show` only scanned the **live** plans (`list_all_trade_plans`),
+never the archive — so the one path the operator would use to inspect a
+finished plan couldn't find it. (`plan delete` already scanned both.)
+
+### What changed
+
+- **`plan show` now scans live *and* archived plans.** A new pure,
+  `StateStore`-generic helper `collect_plan_details(store, target)` gathers
+  matches from the live rows first, then the archive; `handle_plan_show` 404s
+  only when both are empty.
+- **An archived match carries an `archived_at` field** in the dump (mirrors
+  `PlanSummary::archived_at`), so the operator can tell at a glance whether
+  `plan show` surfaced a live or a finished plan. Live matches omit it.
+
+### Breaking
+
+None. Live `plan show` output is unchanged (no `archived_at` field emitted);
+the field appears only for archived matches.
+
+### Tests
+
+New `plan_show_tests` module (uses core's `MemStateStore` via the
+`test-support` feature, added as a dev-dependency): an archived-only plan is
+found and flagged with `archived_at`; a live plan is still found and *not*
+flagged; an unknown id yields no details (→ 404 at the caller).
 
 ## v49 — 2026-06-20 — replay-candles: Brisbane-time output + clearer --source help + dev deploy
 

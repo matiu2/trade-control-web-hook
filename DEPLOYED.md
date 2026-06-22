@@ -23,9 +23,14 @@ message wire format changes.
 
 | branch | environment | worker name | deploy rule |
 |---|---|---|---|
-| `main` | dev (today's existing worker) | `trade-control-web-hook` | deploy freely |
+| `main` | dev | `trade-control-web-hook-dev` | deploy freely |
 | `staging` | staging (demo account) | `trade-control-web-hook-staging` | deploy freely; must run **1 week unchanged + profitable** to promote |
 | `prod` | prod (live account, later) | `trade-control-web-hook-prod` | only promoted-from-staging code |
+
+**Every environment carries a suffix** (`-dev` / `-staging` / `-prod`). The
+old no-suffix worker `trade-control-web-hook` + R2 `trade-control-recording`
+are deprecated — left running only until last week's demo trades are
+journaled, then deleted. The dev R2 bucket is now `trade-control-recording-dev`.
 
 Each branch carries its own `wrangler.toml` (own worker name, KV
 namespace, R2 bucket) so a plain `wrangler deploy` on a branch targets

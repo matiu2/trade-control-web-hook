@@ -1,9 +1,15 @@
 //! End-to-end orchestration: read TV chart → classify drawings →
-//! build trade + pause + news + calendar bundles → create alerts.
+//! build trade + pause + news + calendar bundles → register the
+//! signed `TradePlan` with the worker's server-side engine.
 //!
 //! Port of `tv_arm_hs.py::main()` (lines ~1548–2006). The library
 //! calls into `trade-control-cli` directly rather than shelling out
 //! to the binary (faster startup + structured errors).
+//!
+//! The legacy path (POST a signed alert bundle to TradingView via
+//! tv-mcp, let TV fire the alerts at the webhook) has been retired:
+//! the server-side cron engine is the sole producer now, so arming is
+//! `--register-plan` (one signed plan the `*/15` cron evaluates).
 //!
 //! Two-pass flow for blackout/news/calendar bars:
 //!
@@ -21,21 +27,17 @@ use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, TimeZone, Utc};
 use color_eyre::eyre::{Context, Result, eyre};
-use tracing::{error, info, warn};
+use tracing::{info, warn};
 use trade_control_cli as cli;
 use trade_control_conventions::{Broker, Direction, split_symbol};
 use trade_control_core::sig::KEY_LEN;
 
-use crate::alert_spec::{AlertPayload, CalendarWindow, DispatchContext, build_alert_spec};
 use crate::args::Args;
 use crate::args::PositionEntry;
-use crate::create_alerts::create_alerts;
 use crate::geometry::{horizontal_price, pcl_exhausted_price_from_fib, tp_price_from_fib};
 use crate::instrument_resolution::ResolvedInstrument;
-use crate::manifest::{CalendarBundle, discover_calendar_bundles};
 use crate::mw_geometry;
 use crate::position_trade::{core_direction, resolve_levels};
-use crate::post_outcome::{Outcome, classify as classify_outcome};
 use crate::register_post::{post_intent_blocking, post_register_blocking};
 use crate::roles::{Roles, classify};
 use crate::timeframe::infer_calendar_timeframe;
@@ -231,8 +233,8 @@ pub fn run(args: Args) -> Result<i32> {
     //    or if --skip-calendar-bars was passed). When auto-draw ran,
     //    the operator now has blackout-/news-pairs on the chart, so
     //    we skip the cli's calendar-bars step to avoid double-arming.
-    let (calendar_bundles, built_calendar) = if should_auto_draw || args.skip_calendar_bars {
-        (Vec::new(), Vec::new())
+    let built_calendar = if should_auto_draw || args.skip_calendar_bars {
+        Vec::new()
     } else {
         discover_or_fetch_calendar_bundles(
             &args,
@@ -247,15 +249,12 @@ pub fn run(args: Args) -> Result<i32> {
         )?
     };
 
-    // 8b. (Experimental, --register-plan) Fold the whole trade — main alerts
-    //     PLUS the pause/news/calendar control bars built above — into ONE
-    //     signed TradePlan and register it with the worker's server-side engine.
-    //     Runs *after* the bundles so the registered plan carries the same
-    //     calendar/news bars the --create-alerts path POSTs to TradingView (the
-    //     two ran out of step before this; see Stage E.8). Runs *alongside* the
-    //     TV alert path (old + new in parallel until the engine is proven on
-    //     demo — Stage F retires the alerts). A failed register is a hard error,
-    //     but the signed bundle is already on disk.
+    // 8b. (--register-plan) Fold the whole trade — main alert conditions PLUS
+    //     the pause/news/calendar control bars built above — into ONE signed
+    //     TradePlan and register it with the worker's server-side engine. This
+    //     is now the *only* way a trade is armed (the legacy TV-alert POST path
+    //     was retired once the engine became the sole producer). A failed
+    //     register is a hard error, but the signed bundle is already on disk.
     // `--plan-out` alone builds the plan and writes the JSON without touching
     // the worker; `--register-plan` additionally POSTs it. Run the block for
     // either so `--plan-out` is no longer a silent no-op on its own.
@@ -285,68 +284,11 @@ pub fn run(args: Args) -> Result<i32> {
         )?;
     }
 
-    // 9. Bail out before POSTing if --create-alerts wasn't set.
-    if !args.create_alerts {
-        info!("--create-alerts not set; signed bundle on disk, no TV POSTs");
-        return Ok(0);
-    }
-
-    // 10. Build payloads + POST.
-    let payloads = build_all_payloads(
-        &built_trade,
-        &out_dir,
-        direction,
-        &roles,
-        &pause_bundles,
-        &news_bundles,
-        &calendar_bundles,
-        &trade_id,
-    )?;
-    if payloads.is_empty() {
-        info!("no payloads to POST");
-        return Ok(0);
-    }
-    let results = create_alerts(&payloads, mcp.root()).wrap_err("create alerts via tv-mcp")?;
-    let mut failures = 0usize;
-    for r in &results {
-        let outcome = classify_outcome(r);
-        let body_head = r
-            .body
-            .as_deref()
-            .unwrap_or("")
-            .chars()
-            .take(400)
-            .collect::<String>();
-        match &outcome {
-            Outcome::Ok => {
-                info!(name = ?r.name, status = ?r.status, body = %body_head, "alert POSTed");
-            }
-            Outcome::TvError { errmsg, err_code } => {
-                failures += 1;
-                error!(
-                    name = ?r.name,
-                    status = ?r.status,
-                    errmsg = errmsg.as_deref().unwrap_or(""),
-                    err_code = err_code.as_deref().unwrap_or(""),
-                    body = %body_head,
-                    debug = ?r.debug,
-                    "alert REJECTED by TradingView",
-                );
-            }
-            Outcome::TransportError(err) => {
-                failures += 1;
-                error!(name = ?r.name, error = %err, "alert FAILED before POST");
-            }
-            Outcome::NoSignal => {
-                failures += 1;
-                warn!(name = ?r.name, "alert returned with no status or error");
-            }
-        }
-    }
-    if failures > 0 {
-        error!(failures, total = results.len(), "some alerts did not arm");
-        return Ok(1);
-    }
+    // The TradingView-alert creation path (build payloads → POST via tv-mcp) was
+    // retired once the server-side cron engine became the sole producer. Arming a
+    // trade is now: build + sign the bundle to disk (above) and register it as a
+    // `TradePlan` with the worker (step 8b, gated on `--register-plan`).
+    info!(trade_id = %trade_id, "signed bundle on disk; arm via --register-plan");
     Ok(0)
 }
 
@@ -1464,10 +1406,9 @@ fn draw_pair_lines(
 
 /// Run the calendar-bars CLI and discover the resulting bundles.
 ///
-/// Returns both the on-disk [`CalendarBundle`]s (driving the TradingView alert
-/// payloads) and the in-memory [`cli::BuiltCalendarBundle`]s (carrying the
-/// signed pause/news intents + window times, so `--register-plan` can fold the
-/// same control actions into the `TradePlan` without re-parsing the YAML).
+/// Returns the in-memory [`cli::BuiltCalendarBundle`]s (carrying the signed
+/// pause/news intents + window times, so `--register-plan` can fold the same
+/// control actions into the `TradePlan` without re-parsing the YAML).
 #[allow(clippy::too_many_arguments)]
 fn discover_or_fetch_calendar_bundles(
     args: &Args,
@@ -1479,15 +1420,15 @@ fn discover_or_fetch_calendar_bundles(
     out_dir: &Path,
     key: &[u8; KEY_LEN],
     now: DateTime<Utc>,
-) -> Result<(Vec<CalendarBundle>, Vec<cli::BuiltCalendarBundle>)> {
+) -> Result<Vec<cli::BuiltCalendarBundle>> {
     if args.skip_calendar_bars {
-        return Ok((Vec::new(), Vec::new()));
+        return Ok(Vec::new());
     }
     let timeframe = match infer_calendar_timeframe(&state.resolution) {
         Some(t) => t,
         None => {
             info!(resolution = %state.resolution, "below 15m — skipping calendar-bars");
-            return Ok((Vec::new(), Vec::new()));
+            return Ok(Vec::new());
         }
     };
     let cli_broker = match broker {
@@ -1509,12 +1450,11 @@ fn discover_or_fetch_calendar_bundles(
         Ok(b) => b,
         Err(e) => {
             warn!(error = ?e, "calendar-bars failed; continuing without it");
-            return Ok((Vec::new(), Vec::new()));
+            return Ok(Vec::new());
         }
     };
-    let bundles = discover_calendar_bundles(out_dir, trade_id)?;
-    info!(count = bundles.len(), "calendar bundles discovered");
-    Ok((bundles, built))
+    info!(count = built.len(), "calendar bundles built");
+    Ok(built)
 }
 
 /// One registered plan as seen in the `plan-list` response — only the two
@@ -1608,7 +1548,7 @@ fn update_existing_plan(
 /// embedded intent verbatim. The pause/news/calendar **control bars** built
 /// upstream are folded in too — one `TimeReached` rule per bundle alert (see
 /// [`append_control_rules`]) — so the registered plan opens/closes the same
-/// blackout + news windows the `--create-alerts` path POSTs as TV alerts. It's
+/// blackout + news windows the legacy TV-alert path used to POST. It's
 /// signed with the same key + whole-body HMAC as the control intents (the plan
 /// rides `trade_plan` as single-line flow JSON, so it's fully signed) and
 /// POSTed directly to the baked webhook.
@@ -1693,109 +1633,6 @@ fn register_trade_plan(
 /// Derived from the sub-second clock — no rand dependency.
 fn register_suffix(now: DateTime<Utc>) -> String {
     format!("{:06}", now.timestamp_subsec_micros() % 1_000_000)
-}
-
-/// Walk every alert in every bundle and build the payload list.
-#[allow(clippy::too_many_arguments)]
-fn build_all_payloads(
-    built_trade: &cli::BuiltTrade,
-    out_dir: &Path,
-    direction: Direction,
-    roles: &Roles,
-    pause_bundles: &[PauseBundle],
-    news_bundles: &[NewsBundle],
-    calendar_bundles: &[CalendarBundle],
-    trade_id: &str,
-) -> Result<Vec<AlertPayload>> {
-    use cli::TradePattern;
-    // M/W enters bind to the per-bar "Every Bar Close" alertcondition
-    // instead of the direction's pattern plot. The flag only affects the
-    // `05-enter` payload; the auxiliary pause/news/calendar bundles never
-    // carry an enter, so threading the same value through them is a no-op.
-    let is_mw = matches!(built_trade.spec.pattern, TradePattern::M | TradePattern::W);
-    let mut payloads = Vec::new();
-    // 1. Main trade alerts.
-    for alert in &built_trade.alerts {
-        let file = format!("{}.yaml", alert.basename);
-        let ctx = DispatchContext::default();
-        if let Some(mut p) = build_alert_spec(&file, direction, roles, &ctx, is_mw)? {
-            stamp_payload(&mut p, trade_id, &file, out_dir)?;
-            payloads.push(p);
-        }
-    }
-
-    // 2. Pause bundles.
-    for bundle in pause_bundles {
-        let ctx = DispatchContext {
-            blackout_pair: Some((&bundle.start, &bundle.end)),
-            ..Default::default()
-        };
-        for alert in &bundle.built.alerts {
-            let file = format!("{}.yaml", alert.basename);
-            if let Some(mut p) = build_alert_spec(&file, direction, roles, &ctx, is_mw)? {
-                stamp_payload(&mut p, trade_id, &file, &bundle.out_dir)?;
-                payloads.push(p);
-            }
-        }
-    }
-    // 3. News bundles.
-    for bundle in news_bundles {
-        let ctx = DispatchContext {
-            news_pair: Some((&bundle.start, &bundle.end)),
-            ..Default::default()
-        };
-        for alert in &bundle.built.alerts {
-            let file = format!("{}.yaml", alert.basename);
-            if let Some(mut p) = build_alert_spec(&file, direction, roles, &ctx, is_mw)? {
-                stamp_payload(&mut p, trade_id, &file, &bundle.out_dir)?;
-                payloads.push(p);
-            }
-        }
-    }
-    // 4. Calendar bundles.
-    for bundle in calendar_bundles {
-        let ctx = DispatchContext {
-            calendar_window: Some(CalendarWindow {
-                start_iso: bundle.start_iso.clone(),
-                end_iso: bundle.end_iso.clone(),
-            }),
-            ..Default::default()
-        };
-        for entry in &bundle.manifest.alerts {
-            if let Some(mut p) = build_alert_spec(&entry.file, direction, roles, &ctx, is_mw)? {
-                stamp_payload(&mut p, trade_id, &entry.file, &bundle.bundle_dir)?;
-                payloads.push(p);
-            }
-        }
-    }
-    Ok(payloads)
-}
-
-/// Stamp the orchestrator-owned fields onto a dispatched payload:
-///
-/// - `tv_name` → `<trade_id>-<role_slug>` so all alerts sort together
-///   in TV's alert list (empty `trade_id` is a no-op).
-/// - `name` → the manifest filename; the JS template echoes it back
-///   in each result so the operator can attribute failures.
-/// - `message` → the full text of the signed YAML on disk, which TV
-///   posts to the webhook when the alert fires. An empty `message`
-///   makes TV reject `create_alert` with `invalid_request`.
-fn stamp_payload(
-    payload: &mut AlertPayload,
-    trade_id: &str,
-    file: &str,
-    out_dir: &Path,
-) -> Result<()> {
-    if !trade_id.is_empty() {
-        let tv_name = payload.tv_name_mut();
-        *tv_name = format!("{trade_id}-{tv_name}");
-    }
-    *payload.name_mut() = file.to_string();
-    let signed_path = out_dir.join(file);
-    let body = fs::read_to_string(&signed_path)
-        .with_context(|| format!("read signed alert body {}", signed_path.display()))?;
-    *payload.message_mut() = body;
-    Ok(())
 }
 
 fn utc_iso(unix: i64) -> Result<String> {

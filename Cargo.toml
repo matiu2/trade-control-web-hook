@@ -27,6 +27,7 @@ trade-control-engine = { version = "0.1.0", path = "engine" }
 
 [dev-dependencies]
 pollster = "0.4.0"
+trade-control-core = { path = "core", features = ["test-support"] }
 
 # `tradenation-api` is consumed as a git dep; its `ohlcv` module exposes
 # `candle_model::Granularity` / `CandleData` from a candle-model vendored

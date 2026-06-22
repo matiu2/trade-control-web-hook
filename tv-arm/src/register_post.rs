@@ -1,30 +1,26 @@
 //! POST a signed `register` intent (carrying the whole [`TradePlan`]) to the
 //! worker.
 //!
-//! This is tv-arm's first *direct* HTTP path to the worker. Until now the only
-//! way tv-arm reached the worker was indirectly — TradingView delivered the
-//! signed alert `message` when an alert fired. The server-side engine inverts
-//! that: tv-arm folds the whole trade into one [`TradePlan`] and registers it
-//! up front, so the worker can evaluate the conditions itself on its cron tick.
+//! This is tv-arm's direct HTTP path to the worker, and the only way a trade is
+//! armed: tv-arm folds the whole trade into one [`TradePlan`] and registers it
+//! up front, so the worker's cron engine can evaluate the conditions itself on
+//! its tick. (The retired legacy path reached the worker only indirectly —
+//! TradingView delivered the signed alert `message` when an alert fired.)
 //!
-//! The destination is the same baked-at-build-time webhook the TV alerts POST
-//! to (`BAKED_WEBHOOK`, see [`crate::create_alerts`]), so a
-//! `tv-arm-staging` binary registers against the staging worker with no env
-//! var or flag — endpoint parity with the alert path is automatic.
+//! The destination is the baked-at-build-time webhook (`BAKED_WEBHOOK`), so a
+//! `tv-arm-staging` binary registers against the staging worker with no env var
+//! or flag.
 //!
-//! **Old + new run in parallel** (Stage F retires the alert path): a register
-//! POST is *additive* to `create_alerts`, never a replacement. It is also
-//! best-effort from the operator's point of view — a failed register is logged
-//! and returned as an error to `run`, but the signed alert bundle is already on
-//! disk and (if `--create-alerts`) armed on TV, so the trade is not lost.
+//! A failed register is logged and returned as an error to `run`, but the signed
+//! bundle is already on disk by then, so the trade isn't lost.
 
 use std::time::Duration;
 
 use color_eyre::eyre::{Result, WrapErr, eyre};
 
 /// The worker endpoint, baked in at build time by `build.rs` from
-/// `TRADE_CONTROL_WEBHOOK` — the same source as the TV alert `web_hook`. Each
-/// per-environment binary embeds its own worker URL.
+/// `TRADE_CONTROL_WEBHOOK`. Each per-environment binary embeds its own worker
+/// URL (see the per-env deploy scripts).
 const BAKED_WEBHOOK: &str = env!("BAKED_WEBHOOK");
 
 /// Timeout for the register POST. Generous — the worker only validates +

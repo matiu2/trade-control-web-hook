@@ -45,7 +45,7 @@ use trade_control_core::intent::{
 use trade_control_core::rules::{self, RuleError};
 use trade_control_core::sig;
 use trade_control_core::state::{
-    StateStore, clear_named_preps, clear_named_vetos, veto_ttl_seconds,
+    StateError, StateStore, clear_named_preps, clear_named_vetos, veto_ttl_seconds,
 };
 use trade_control_core::tunable::Tunable;
 
@@ -2881,6 +2881,12 @@ struct PlanDetail {
     /// `None` until the first cron tick seeds the plan's state row.
     #[serde(skip_serializing_if = "Option::is_none")]
     state: Option<trade_control_core::plan_state::PlanState>,
+    /// `Some` when this match came from the archive (a terminated plan), `None`
+    /// for a live registered plan. Mirrors [`PlanSummary::archived_at`] so the
+    /// operator can tell at a glance whether `plan show` surfaced a live or a
+    /// finished plan.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    archived_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 /// Handle the `plan-list` action: enumerate every registered plan across all
@@ -2993,10 +2999,60 @@ fn archived_plan_summary(archived: &trade_control_core::state::ArchivedPlan) -> 
     }
 }
 
+/// Gather the full `plan show` detail(s) for one `trade_id` from **both** the
+/// live plan rows and the archive. trade_ids are unique in practice, but if two
+/// scopes share one we return every match so nothing is hidden. A terminated
+/// plan usually exists *only* in the archive (its live rows were dropped on the
+/// terminal tick), so scanning the archive is what makes a finished plan
+/// (the kind `plan list --include-archived` surfaces) inspectable at all.
+///
+/// Pure and [`StateStore`]-generic so it's unit-testable off-wasm with a
+/// `MemStateStore`; `worker::Response` construction stays in the caller.
+async fn collect_plan_details<S: StateStore>(
+    store: &S,
+    target: &str,
+) -> Result<Vec<PlanDetail>, StateError> {
+    let mut details = Vec::new();
+
+    // Live registered plans: pair each match with its current engine state
+    // (which may be `None` if the plan hasn't ticked yet).
+    for stored in store.list_all_trade_plans().await? {
+        if stored.plan.trade_id != target {
+            continue;
+        }
+        let state = store
+            .get_plan_state(stored.account.as_deref(), &stored.plan.trade_id)
+            .await
+            .unwrap_or(None);
+        details.push(PlanDetail {
+            account: stored.account,
+            plan: stored.plan,
+            state,
+            archived_at: None,
+        });
+    }
+
+    // Archived (terminated) plans: the terminal `final_state` is always present,
+    // and `archived_at` flags the match as a finished plan to the operator.
+    for archived in store.list_all_archived_plans().await? {
+        if archived.plan.trade_id != target {
+            continue;
+        }
+        details.push(PlanDetail {
+            account: archived.account,
+            plan: archived.plan,
+            state: Some(archived.final_state),
+            archived_at: Some(archived.archived_at),
+        });
+    }
+
+    Ok(details)
+}
+
 /// Handle the `plan-show` action: dump one plan in full. The target is named by
-/// `intent.trade_id`; we scan every account scope and return the match(es) —
-/// trade_ids are unique in practice, but if two scopes share one we return both
-/// so nothing is hidden. Returns 404 when no plan matches.
+/// `intent.trade_id`; we scan every account scope — **live and archived** — and
+/// return the match(es) so a finished plan surfaced by `plan list
+/// --include-archived` is still inspectable. Returns 404 when no plan matches.
 async fn handle_plan_show(
     store: &KvStateStore,
     verified: &incoming::Verified,
@@ -3006,29 +3062,13 @@ async fn handle_plan_show(
         return Response::error("plan-show requires a `trade_id`", 400);
     };
 
-    let plans = match store.list_all_trade_plans().await {
+    let details = match collect_plan_details(store, target).await {
         Ok(v) => v,
         Err(err) => {
-            rlog_err!("plan-show: list_all_trade_plans: {err}");
+            rlog_err!("plan-show: collect_plan_details: {err}");
             return Response::error("state error", 500);
         }
     };
-
-    let mut details = Vec::new();
-    for stored in &plans {
-        if stored.plan.trade_id != target {
-            continue;
-        }
-        let state = store
-            .get_plan_state(stored.account.as_deref(), &stored.plan.trade_id)
-            .await
-            .unwrap_or(None);
-        details.push(PlanDetail {
-            account: stored.account.clone(),
-            plan: stored.plan.clone(),
-            state,
-        });
-    }
 
     if details.is_empty() {
         record_seen(
@@ -4274,5 +4314,89 @@ mod dispatcher_outcome_tests {
                 "{action:?} must not be treated as a multi-shot enter",
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod plan_show_tests {
+    //! Pins [`collect_plan_details`]: `plan show` must find a plan whether it
+    //! is a live registered plan **or** an archived (terminated) one. The bug
+    //! that motivated this: a finished plan surfaced by `plan list
+    //! --include-archived` 404'd on `plan show`, because the handler only
+    //! scanned live plans.
+    use super::*;
+    use chrono::{TimeZone, Utc};
+    use trade_control_core::plan_state::{Phase, PlanState};
+    use trade_control_core::state::{MemStateStore, StateStore};
+    use trade_control_core::trade_plan::TradePlan;
+
+    /// Minimal valid plan — empty rule set is fine, `collect_plan_details`
+    /// matches on `trade_id` only.
+    fn sample_plan(trade_id: &str) -> TradePlan {
+        let json = format!(
+            r#"{{"trade_id":"{trade_id}","instrument":"NZD_CHF","direction":"short",
+                "granularity":"d1","pip_size":0.0001,"rules":[]}}"#
+        );
+        serde_json::from_str(&json).expect("sample plan json")
+    }
+
+    /// The regression: a plan that exists ONLY in the archive (its live rows
+    /// were dropped on the terminal tick) is still found by `plan show`.
+    #[test]
+    fn archived_only_plan_is_found() {
+        let store = MemStateStore::new();
+        let archived_at = Utc.with_ymd_and_hms(2026, 6, 18, 22, 45, 21).unwrap();
+        let final_state = PlanState::seed(Phase::Done, archived_at);
+        pollster::block_on(store.archive_plan(
+            None,
+            &sample_plan("hs-nzd-chf-d12eb831"),
+            &final_state,
+            archived_at,
+        ))
+        .expect("archive");
+
+        let details = pollster::block_on(collect_plan_details(&store, "hs-nzd-chf-d12eb831"))
+            .expect("collect");
+        assert_eq!(details.len(), 1, "the archived plan must surface");
+        let d = &details[0];
+        assert_eq!(d.plan.trade_id, "hs-nzd-chf-d12eb831");
+        assert_eq!(
+            d.archived_at,
+            Some(archived_at),
+            "archived match must carry archived_at so the operator can tell"
+        );
+        assert!(
+            d.state.is_some(),
+            "archived plan carries its terminal state"
+        );
+    }
+
+    /// No regression: a live registered plan is still found, and is NOT flagged
+    /// as archived.
+    #[test]
+    fn live_plan_is_found_and_not_flagged_archived() {
+        let store = MemStateStore::new();
+        pollster::block_on(store.put_trade_plan(None, &sample_plan("hs-live-1"), 3600))
+            .expect("put");
+
+        let details =
+            pollster::block_on(collect_plan_details(&store, "hs-live-1")).expect("collect");
+        assert_eq!(details.len(), 1);
+        assert_eq!(details[0].plan.trade_id, "hs-live-1");
+        assert_eq!(
+            details[0].archived_at, None,
+            "a live plan must not be flagged archived"
+        );
+    }
+
+    /// An unknown id matches nothing in either store — the caller turns this
+    /// empty vec into a 404.
+    #[test]
+    fn unknown_id_yields_no_details() {
+        let store = MemStateStore::new();
+        pollster::block_on(store.put_trade_plan(None, &sample_plan("hs-live-1"), 3600))
+            .expect("put");
+        let details = pollster::block_on(collect_plan_details(&store, "nope")).expect("collect");
+        assert!(details.is_empty());
     }
 }

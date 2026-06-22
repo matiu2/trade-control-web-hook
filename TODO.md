@@ -1,38 +1,27 @@
-# TODO — replay-candles: pull window from TradingView when flags absent — DONE (v47)
+# Fix: `plan show` 404s on archived plans — DONE
 
-Goal: `replay-candles` should derive instrument + granularity + start + end
-straight from the **current TradingView chart state** (replay-mode visible
-window) when those CLI flags are omitted. Flags remain optional overrides.
+Branch: `fix/plan-show-archived` (worktree). Target env: **dev** (`main`).
 
-Workflow this enables:
-1. TV replay mode → rewind back in time.
-2. `tv-arm --plan-out plan.json` builds the plan.
-3. Scrub TV forward to the end of the trade.
-4. `replay-candles --plan plan.json` reads the chart's current visible window
-   (instrument + granularity + start/end) and replays exactly that span.
+## Bug
+`trade-control-dev plan list --include-archived` lists an archived (terminated)
+plan, but `plan show <trade_id>` returned 404 for it. `handle_plan_show` only
+scanned live plans via `list_all_trade_plans`; it never consulted the archive
+(unlike `handle_plan_delete`, which scans both).
 
-## Building blocks (verified in `trading-view` crate)
-- `TvMcp::get_state() -> ChartState { symbol: "OANDA:EURUSD", resolution: "60" }`
-  → instrument + granularity in one call.
-- `TvMcp::get_range() -> ChartRange { visible_range: UnixRange { from, to } }`,
-  `UnixRange::to_utc() -> (DateTime<Utc>, DateTime<Utc>)` → window start/end.
-- TV resolution codes → granularity: `"1"|"5"|"15"|"60"|"240"|"D"` (mirrors
-  tv-arm's `resolution_to_granularity`).
-- `--tv-mcp-root` flag mirrors tv-arm.
+## Done
+- [x] Added `archived_at: Option<DateTime<Utc>>` to `PlanDetail` (mirrors
+      `PlanSummary`); only emitted for archived matches.
+- [x] Factored pure, `StateStore`-generic helper `collect_plan_details(store,
+      target)` scanning live then archived plans. `worker::Response` stays in
+      `handle_plan_show`.
+- [x] `handle_plan_show` calls the helper; 404 only when both empty.
+- [x] Unit tests (`plan_show_tests`, using core `MemStateStore` via new
+      `test-support` dev-dependency): archived-only found + flagged, live found
+      + not flagged, unknown id empty.
+- [x] README `plan-show` bullet updated; CHANGELOG v50 added.
+- [x] cargo test (227 ok) / clippy (native + wasm) / fmt all green.
 
-## Tasks
-- [x] add `trading-view` path-dep to `cli/`
-- [x] new module `replay_candles/tv.rs`:
-      - `resolution_to_friendly(&str) -> Option<&'static str>` (TV code → "1h" etc.)
-      - strip `EXCHANGE:` prefix off `ChartState.symbol` → bare TV symbol
-      - `pull_defaults(&TvMcp) -> TvDefaults { instrument, granularity, start, end }`
-      - unit tests: resolution map; strip exchange prefix (live MCP not tested)
-- [x] `replay_candles.rs`:
-      - make `--start` optional; add `--tv-mcp-root` flag
-      - when instrument/granularity/start/end absent → fetch from TV (lazy: only
-        call MCP if at least one is missing)
-      - keep flags as overrides; granularity-vs-plan mismatch check still applies
-- [x] gate: cargo test / clippy -D warnings / fmt in trade-control-web-hook
-- [x] wasm ring-free: `cargo tree -p trade-control-web-hook | grep -i ring` empty,
-      no candle-cache/trading-view in worker cdylib tree
-- [x] CHANGELOG.md v47 entry; merge to main; tag v47
+## Remaining
+- [ ] Commit + push + tag v50 + advance parent gitlink.
+- [ ] Deploy to dev (`./deploy-dev.sh`) so the live `-dev` worker picks it up,
+      then re-verify `plan show hs-nzd-chf-d12eb831` against it.
