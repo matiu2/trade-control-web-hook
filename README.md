@@ -1844,6 +1844,7 @@ cargo run -p tv-arm -- \
   --risk-pct 0.5 \                    # % of NAV (or --risk-amount <home-ccy>)
   --reversal-band-pct 0.1 \           # half-width % around support/resistance lines (default 0.1)
   --veto-on-reversal \                # experimental: a reversal off a band before entry also vetoes the upcoming trade (default off)
+  --quasimodo \                       # alias: --skip-break-and-close --skip-retest --require-confirmation (drop both H&S preps, gate on a confirmed candle)
   --skip-break-and-close \            # for stocks (no after-hours retests)
   --skip-retest \                     # implies --skip-break-and-close; for late entries
   --skip-golden \                     # drop the Pine golden-candle requirement (golden is required by default)
