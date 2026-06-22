@@ -156,25 +156,36 @@ impl PatternGeometry {
             // Entry/SL anchor to the *latched* signal extremes, not the
             // triggering candle's own wick, so a confirmation re-fire resolves
             // to the same geometry as the break-candle fire (bug #10 finding A).
-            // For a short H&S: entry below the break at signal_low, SL above
-            // the pattern at signal_high.
+            //
+            // The offset is applied raw at resolution (`anchor + offset_pips *
+            // pip`, no direction flip), so each offset's **sign** must push the
+            // level *away from the pattern in the breakout direction*: a
+            // `signal_low` anchor takes a negative offset (1 pip below the low),
+            // a `signal_high` anchor a positive one (1 pip above the high).
+            // A flat `+1.0` on every anchor was wrong for the two low anchors —
+            // it placed them 1 pip *above* the low (HS entered too high → tight
+            // SL → stop-out; a bar closing on its low resolved `InvalidGeometry`).
+            //
+            // For a short H&S: sell-stop entry 1 pip *below* the break at
+            // signal_low, SL 1 pip *above* the pattern at signal_high.
             TradePattern::Hs => Self {
                 direction: Direction::Short,
                 entry_anchor: PriceAnchor::SignalLow,
-                entry_offset_default: 1.0,
+                entry_offset_default: -1.0,
                 sl_anchor: PriceAnchor::SignalHigh,
                 sl_offset_default: 1.0,
                 invalidation_veto_name: "too-high",
                 pcl_exhausted_veto_name: "too-low",
             },
-            // Inverse H&S long: mirror of the above — entry above the break at
-            // signal_high, SL below the pattern at signal_low.
+            // Inverse H&S long: mirror of the above — buy-stop entry 1 pip
+            // *above* the break at signal_high, SL 1 pip *below* the pattern at
+            // signal_low.
             TradePattern::Ihs => Self {
                 direction: Direction::Long,
                 entry_anchor: PriceAnchor::SignalHigh,
                 entry_offset_default: 1.0,
                 sl_anchor: PriceAnchor::SignalLow,
-                sl_offset_default: 1.0,
+                sl_offset_default: -1.0,
                 invalidation_veto_name: "too-low",
                 pcl_exhausted_veto_name: "too-high",
             },
@@ -2259,8 +2270,8 @@ mod tests {
             "hs-eur-usd-zzzz",
             &geometry,
             deadline,
-            1.0,
-            1.0,
+            -1.0, // entry: 1 pip below signal_low (short break)
+            1.0,  // SL: 1 pip above signal_high
             1.0500,
             None,
             1.0,
@@ -2281,19 +2292,20 @@ mod tests {
             &[],
         );
         assert_eq!(alert.intent.direction, Some(Direction::Short));
-        // Entry: signal_low + 1 pip — the latched pattern level, stable across
-        // a confirmation re-fire (bug #10 finding A), not the candle wick.
+        // Entry: signal_low − 1 pip — a sell-stop 1 pip *below* the break (the
+        // offset pushes away from the pattern), at the latched pattern level
+        // (bug #10 finding A), not the candle wick.
         match &alert.intent.entry {
             Some(EntrySpec::Stop {
                 from, offset_pips, ..
             }) => {
                 assert_eq!(*from, PriceAnchor::SignalLow);
-                assert!((offset_pips - 1.0).abs() < 1e-9);
+                assert!((offset_pips - (-1.0)).abs() < 1e-9);
             }
             other => panic!("expected Stop entry, got {other:?}"),
         }
-        // SL: signal_high + 1 pip — the pattern high, not the triggering
-        // candle's own high.
+        // SL: signal_high + 1 pip — 1 pip *above* the pattern high, not the
+        // triggering candle's own high.
         match &alert.intent.stop_loss {
             Some(PriceRef::Anchored { from, offset_pips }) => {
                 assert_eq!(*from, PriceAnchor::SignalHigh);
@@ -2385,8 +2397,8 @@ mod tests {
             "ihs-eur-usd-yyyy",
             &geometry,
             deadline,
-            1.0,
-            1.0,
+            1.0,  // entry: 1 pip above signal_high (long break)
+            -1.0, // SL: 1 pip below signal_low
             1.1500,
             None,
             1.0,
@@ -2407,8 +2419,9 @@ mod tests {
             &[],
         );
         assert_eq!(alert.intent.direction, Some(Direction::Long));
-        // Entry: signal_high + 1 pip (mirror of the H&S short — pattern level,
-        // not the candle wick; bug #10 finding A).
+        // Entry: signal_high + 1 pip — a buy-stop 1 pip *above* the break
+        // (mirror of the H&S short — pattern level, not the candle wick; bug
+        // #10 finding A).
         match &alert.intent.entry {
             Some(EntrySpec::Stop {
                 from, offset_pips, ..
@@ -2418,11 +2431,11 @@ mod tests {
             }
             other => panic!("expected Stop entry, got {other:?}"),
         }
-        // SL: signal_low + 1 pip — the pattern low.
+        // SL: signal_low − 1 pip — 1 pip *below* the pattern low.
         match &alert.intent.stop_loss {
             Some(PriceRef::Anchored { from, offset_pips }) => {
                 assert_eq!(*from, PriceAnchor::SignalLow);
-                assert!((offset_pips - 1.0).abs() < 1e-9);
+                assert!((offset_pips - (-1.0)).abs() < 1e-9);
             }
             other => panic!("expected Anchored SL, got {other:?}"),
         }
@@ -3054,14 +3067,14 @@ mod tests {
     #[test]
     fn build_trade_from_spec_applies_pattern_default_offsets() {
         // Omitting entry/sl offsets must fall back to the pattern's
-        // geometry defaults (1 pip from short.yaml / long.yaml).
+        // geometry defaults (HS short entry: 1 pip *below* signal_low).
         let now = ts("2026-05-20T00:00:00Z");
         let spec = sample_spec(TradePattern::Hs, ts("2026-05-25T00:00:00Z"));
         let trade = build_trade_from_spec(spec, now, BuildStrictness::Strict).unwrap();
         let enter = trade.alerts.last().unwrap();
         match &enter.intent.entry {
             Some(EntrySpec::Stop { offset_pips, .. }) => {
-                assert!((offset_pips - 1.0).abs() < 1e-9);
+                assert!((offset_pips - (-1.0)).abs() < 1e-9);
             }
             other => panic!("expected Stop entry, got {other:?}"),
         }
