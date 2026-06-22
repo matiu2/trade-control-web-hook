@@ -73,7 +73,9 @@ Trading:
   `trade-control plan list`. KV-only, idempotent.
 - `plan-show` — read-only: dump one plan in full (every rule + its persisted
   `PlanState`). Target named by the intent's `trade_id`; the worker scans all
-  account scopes. Drives `trade-control plan show <trade_id>`. KV-only.
+  account scopes — **live and archived** — so a terminated plan surfaced by
+  `plan list --include-all` is still inspectable (an archived match carries an
+  `archived_at` field). Drives `trade-control plan show <trade_id>`. KV-only.
 - `plan-delete` — drop a registered plan and its `PlanState` — the inverse of
   `register`. Target named by the intent's `trade_id`; the worker scans all
   account scopes and deletes the matching `plan:` + `plan-state:` rows **and**
