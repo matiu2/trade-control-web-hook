@@ -5,11 +5,102 @@
 //! gets the plain candle shell), so `simulate_fill` resolves entry/SL/TP against
 //! the same levels the live dispatch would have.
 
+use chrono::{DateTime, Utc};
 use trade_control_core::intent::{Action, Direction, Resolved, ResolvedEntry, Shell};
 use trade_control_engine::{SimOutcome, TradePlan, simulate_fill};
 
 use super::brisbane::bne;
 use super::replay::{Fire, Replay};
+
+/// How a filled position ended, for annotation purposes. `--annotate`
+/// draws only the three *filled* outcomes; the rest of the report still
+/// prints every fire (including never-filled / declined ones).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FillKind {
+    /// Filled and still open at the window's end.
+    Open,
+    /// Filled then hit stop-loss.
+    StoppedOut,
+    /// Filled then hit take-profit.
+    TookProfit,
+}
+
+/// The resolved bracket plus simulated fill for one *filled* enter fire —
+/// everything `--annotate` needs to draw the position. Computed by
+/// [`resolve_fire`] so the report line and the annotator agree on the
+/// same levels (the same resolution the report's order line uses).
+#[derive(Debug, Clone)]
+pub struct FireResult {
+    pub direction: Direction,
+    /// Open-time of the bar the entry actually filled on (UTC).
+    pub fill_at: DateTime<Utc>,
+    /// Right-edge time anchor for the drawn box: the exit bar for a closed
+    /// trade, or the last replayed bar for one still open at window end.
+    pub until: DateTime<Utc>,
+    /// The placed entry level the fill happened at.
+    pub entry_price: f64,
+    pub stop_loss: f64,
+    pub take_profit: f64,
+    pub kind: FillKind,
+}
+
+/// Resolve the bracket + simulate the fill for one fire, returning a
+/// [`FireResult`] **only** when it's an enter that actually filled
+/// (`Open` / `StoppedOut` / `TookProfit`). Non-enters, unresolved
+/// brackets, declined entries, and never-filled pending orders yield
+/// `None` — they have no position to annotate.
+///
+/// The shell reconstruction mirrors the worker's dispatch (an H&S Pine
+/// fire folds its latched signal onto the shell), so the levels match
+/// what the live worker would have placed — and the report's `order:`
+/// line, which resolves the same way.
+pub fn resolve_fire(plan: &TradePlan, fire: &Fire) -> Option<FireResult> {
+    let intent = &fire.fired.intent;
+    if intent.action != Action::Enter {
+        return None;
+    }
+    let candle = &fire.fired.candle;
+    let shell = match &fire.fired.signal {
+        Some(sig) => Shell::from_candle_and_signal(candle, sig),
+        None => Shell::from_candle(candle),
+    };
+    let resolved = Resolved::from_intent(intent, &shell, plan.pip_size).ok()?;
+    // For an open trade the box runs to the last replayed bar; closed trades
+    // override this with their exit bar below.
+    let window_end = fire.forward.last().map(|c| c.time)?;
+    let (fill_at, until, entry_price, kind) =
+        match simulate_fill(intent, &shell, plan.pip_size, &fire.forward) {
+            SimOutcome::FilledOpen {
+                fill_at,
+                entry_price,
+            } => (fill_at, window_end, entry_price, FillKind::Open),
+            SimOutcome::StoppedOut {
+                fill_at,
+                entry_price,
+                exit_at,
+                ..
+            } => (fill_at, exit_at, entry_price, FillKind::StoppedOut),
+            SimOutcome::TookProfit {
+                fill_at,
+                entry_price,
+                exit_at,
+                ..
+            } => (fill_at, exit_at, entry_price, FillKind::TookProfit),
+            // No position to annotate.
+            SimOutcome::NeverFilled | SimOutcome::Unresolved(_) | SimOutcome::Declined { .. } => {
+                return None;
+            }
+        };
+    Some(FireResult {
+        direction: resolved.direction,
+        fill_at,
+        until,
+        entry_price,
+        stop_loss: resolved.stop_loss,
+        take_profit: resolved.take_profit,
+        kind,
+    })
+}
 
 /// Render the full replay report as a string.
 pub fn render(plan: &TradePlan, replay: &Replay, simulate: bool) -> String {
@@ -66,6 +157,13 @@ fn render_fire(
     );
 
     if !simulate {
+        return line;
+    }
+    if intent.action == Action::Prep {
+        // A prep carries no bracket of its own — preview the plan's *enter*
+        // bracket resolved against this prep bar, so the journal shows the
+        // SL/TP the eventual order would carry even when it never fills.
+        line.push_str(&prep_would_enter_line(plan, fire));
         return line;
     }
     if intent.action != Action::Enter {
@@ -128,6 +226,44 @@ fn describe_order(resolved: &Resolved, pip_size: f64) -> String {
         fmt_price(resolved.stop_loss, pip_size),
         fmt_price(resolved.take_profit, pip_size)
     )
+}
+
+/// The `would-enter:` preview line for a prep fire: resolve the plan's
+/// *enter* bracket against the prep bar's shell and show its direction /
+/// entry / SL / TP. A prep gates the entry but carries no bracket itself,
+/// so this previews what order the setup is building toward — useful for
+/// journaling even when the enter never fires or fills.
+///
+/// Falls back to a short note when the plan has no enter rule or the
+/// enter can't resolve at this bar (e.g. a PinePattern enter that needs a
+/// latched signal the prep bar doesn't yet have).
+fn prep_would_enter_line(plan: &TradePlan, fire: &Fire) -> String {
+    let Some(enter) = plan_enter_intent(plan) else {
+        return "    (prep — plan has no enter rule to preview)\n".to_string();
+    };
+    let candle = &fire.fired.candle;
+    let shell = match &fire.fired.signal {
+        Some(sig) => Shell::from_candle_and_signal(candle, sig),
+        None => Shell::from_candle(candle),
+    };
+    match Resolved::from_intent(enter, &shell, plan.pip_size) {
+        Ok(resolved) => format!(
+            "    would-enter: {}\n",
+            describe_order(&resolved, plan.pip_size)
+                .strip_prefix("order: ")
+                .unwrap_or("?")
+        ),
+        Err(_) => "    (prep — enter bracket not resolvable at this bar yet)\n".to_string(),
+    }
+}
+
+/// The first enter intent in the plan, if any. The bundle has exactly one
+/// enter rule (`05-enter`); the rest are vetos/preps.
+fn plan_enter_intent(plan: &TradePlan) -> Option<&trade_control_core::intent::Intent> {
+    plan.rules
+        .iter()
+        .map(|r| &r.intent)
+        .find(|i| i.action == Action::Enter)
 }
 
 /// Format a price at the instrument's display precision: one decimal place

@@ -135,6 +135,44 @@ impl TvMcp {
             text,
         ])
     }
+
+    /// Draw a filled rectangle spanning the two corners in `rect`, tinted
+    /// its `color` (a `#rrggbb` string used for both border and fill) at
+    /// its `transparency` (0 = opaque, 100 = invisible) and labelled with
+    /// its `text`. Returns the new drawing's entity-id.
+    ///
+    /// This is the primitive `replay-candles --annotate` draws positions
+    /// with: TradingView's native position tool can't be created through
+    /// tv-mcp (`createMultipointShape` silently no-ops for it), but the
+    /// rectangle lands cleanly, so a position is two rectangles
+    /// (entry→TP green, entry→SL red).
+    pub fn draw_rectangle(&self, rect: &Rect<'_>) -> Result<DrawShapeResult> {
+        let overrides = rectangle_overrides(rect.color, rect.transparency);
+        self.call_json(&[
+            "draw",
+            "shape",
+            "-t",
+            "rectangle",
+            "--time",
+            &rect.time1.to_string(),
+            "-p",
+            &rect.price1.to_string(),
+            "--time2",
+            &rect.time2.to_string(),
+            "--price2",
+            &rect.price2.to_string(),
+            "--overrides",
+            &overrides,
+            "--text",
+            rect.text,
+        ])
+    }
+
+    /// `draw remove <id>` — delete one drawing by entity-id. Used to
+    /// clear prior `--annotate` rectangles before redrawing.
+    pub fn remove_drawing(&self, entity_id: &str) -> Result<RemoveDrawingResult> {
+        self.call_json(&["draw", "remove", entity_id])
+    }
 }
 
 /// Result of `tv-mcp draw shape`. The CLI returns `{success, shape,
@@ -154,6 +192,52 @@ pub struct DrawShapeResult {
     /// Error message when `success: false`.
     #[serde(default)]
     pub error: Option<String>,
+}
+
+/// A rectangle to draw: two opposite corners `(time1, price1)` →
+/// `(time2, price2)` (UNIX seconds / absolute prices), a `#rrggbb`
+/// `color` for border + fill, a fill `transparency` (0 opaque … 100
+/// invisible), and `text` label. Bundles [`TvMcp::draw_rectangle`]'s
+/// inputs so the call site reads as one shape, not eight positionals.
+#[derive(Debug, Clone, Copy)]
+pub struct Rect<'a> {
+    /// First corner time (UNIX seconds).
+    pub time1: i64,
+    /// First corner price (absolute).
+    pub price1: f64,
+    /// Opposite corner time (UNIX seconds).
+    pub time2: i64,
+    /// Opposite corner price (absolute).
+    pub price2: f64,
+    /// `#rrggbb` tint for both border and fill.
+    pub color: &'a str,
+    /// Fill transparency: 0 opaque … 100 invisible.
+    pub transparency: u8,
+    /// Label text written on the drawing (carries the `replay:` tag).
+    pub text: &'a str,
+}
+
+/// Build the `--overrides` JSON for a rectangle: tint both the border
+/// (`color`) and fill (`backgroundColor`) the same hue, at the given
+/// fill `transparency` (0 opaque … 100 invisible). Kept separate so the
+/// JSON shape is unit-testable without shelling out to Node.
+fn rectangle_overrides(color: &str, transparency: u8) -> String {
+    format!("{{\"color\":{color:?},\"backgroundColor\":{color:?},\"transparency\":{transparency}}}")
+}
+
+/// Result of `tv-mcp draw remove`. The CLI returns
+/// `{success, entity_id, removed, remaining_shapes}` — `removed` is the
+/// load-bearing field (whether the shape is actually gone).
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct RemoveDrawingResult {
+    /// Whether the CLI call itself succeeded.
+    pub success: bool,
+    /// Whether the shape is actually gone from the chart.
+    #[serde(default)]
+    pub removed: bool,
+    /// Count of drawings still on the chart afterwards.
+    #[serde(default)]
+    pub remaining_shapes: Option<usize>,
 }
 
 impl Default for TvMcp {
@@ -176,6 +260,29 @@ mod tests {
     fn default_root_matches_python() {
         let mcp = TvMcp::default();
         assert_eq!(mcp.root(), Path::new(DEFAULT_TV_MCP_ROOT));
+    }
+
+    #[test]
+    fn rectangle_overrides_tints_border_and_fill_same_color() {
+        let o = rectangle_overrides("#26a69a", 80);
+        assert_eq!(
+            o,
+            r##"{"color":"#26a69a","backgroundColor":"#26a69a","transparency":80}"##
+        );
+        // Must be valid JSON the Node side can `JSON.parse`.
+        let parsed: serde_json::Value = serde_json::from_str(&o).expect("valid json");
+        assert_eq!(parsed["color"], "#26a69a");
+        assert_eq!(parsed["transparency"], 80);
+    }
+
+    #[test]
+    fn parses_remove_drawing_result() {
+        // Trimmed from a real `draw remove` response.
+        let json = r#"{"success":true,"entity_id":"VI61Fw","removed":true,"remaining_shapes":55}"#;
+        let r: RemoveDrawingResult = serde_json::from_str(json).expect("parse");
+        assert!(r.success);
+        assert!(r.removed);
+        assert_eq!(r.remaining_shapes, Some(55));
     }
 
     #[test]

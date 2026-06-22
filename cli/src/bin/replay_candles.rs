@@ -36,6 +36,7 @@
 //! corresponding resolved value.
 
 mod replay_candles {
+    pub mod annotate;
     pub mod brisbane;
     pub mod candles;
     pub mod granularity;
@@ -60,7 +61,7 @@ use tracing_subscriber::{EnvFilter, fmt};
 
 use replay_candles::source::CandleSource;
 use replay_candles::tv::TvDefaults;
-use replay_candles::{brisbane, candles, granularity, instrument, replay, report, tv};
+use replay_candles::{annotate, brisbane, candles, granularity, instrument, replay, report, tv};
 use trade_control_engine::{TradePlan, Trigger};
 use trading_view::mcp::TvMcp;
 
@@ -110,6 +111,15 @@ struct Args {
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     simulate: bool,
 
+    /// After replaying, draw each *filled* position onto the live TradingView
+    /// chart (two rectangles per trade: entry→TP green, entry→SL red), spanning
+    /// the fill bar to the exit. Prior `--annotate` drawings are cleared first;
+    /// your hand-drawn necklines/fibs are left alone. Implies `--simulate`
+    /// (annotation needs the simulated fill). Uses the same tv-mcp chart as
+    /// window resolution (`--tv-mcp-root`).
+    #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
+    annotate: bool,
+
     /// Number of extra candles pulled *before* the window start as a silent
     /// warm-up prefix. These bars seed the detector (so ATR is warm and the
     /// candle patterns have context) and prime the FSM, but fire nothing — the
@@ -145,6 +155,15 @@ async fn main() -> Result<()> {
     init_tracing();
 
     let args = Args::parse();
+
+    // Annotation draws each *filled* position, which needs the simulated fill —
+    // so `--annotate` forces simulation on even if the operator passed
+    // `--simulate false`.
+    let simulate = args.simulate || args.annotate;
+    if args.annotate && !args.simulate {
+        tracing::info!("--annotate implies --simulate; running the fill simulator");
+    }
+
     let plan = load_plan(&args.plan)?;
 
     // Granularity comes from the plan; `--granularity` only overrides, and an
@@ -216,7 +235,17 @@ async fn main() -> Result<()> {
     let expires_at = end + Duration::days(365);
     let replay = replay::run(&plan, &candles, gran.engine(), start, expires_at).await;
 
-    print!("{}", report::render(&plan, &replay, args.simulate));
+    print!("{}", report::render(&plan, &replay, simulate));
+
+    if args.annotate {
+        let mcp = match &args.tv_mcp_root {
+            Some(root) => TvMcp::new(root.clone()),
+            None => TvMcp::default(),
+        };
+        tracing::info!(root = %mcp.root().display(), "annotating filled positions on the chart");
+        let drawn = annotate::annotate(&mcp, &plan, &replay)?;
+        println!("annotated {drawn} filled position(s) on the chart");
+    }
     Ok(())
 }
 
@@ -492,6 +521,7 @@ mod tests {
             end: None,
             tv_mcp_root: None,
             simulate: true,
+            annotate: false,
             warmup_bars: 200,
             cache_dir: None,
             print_completions: false,
