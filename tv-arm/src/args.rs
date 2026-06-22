@@ -100,23 +100,18 @@ pub struct Args {
     #[arg(long, group = "risk")]
     pub risk_amount: Option<f64>,
 
-    /// Post the alerts to TradingView. Without this, the bundle is
-    /// built and signed to disk but no alerts are POSTed.
-    #[arg(long)]
-    pub create_alerts: bool,
-
     /// Set `dry_run` on the enter intent so the worker logs the order
     /// but does not send it to the broker. Useful for first-time live
-    /// runs of a new sizing path. Compatible with `--create-alerts`.
+    /// runs of a new sizing path.
     #[arg(long)]
     pub broker_dry_run: bool,
 
-    /// Also register the trade as ONE signed `TradePlan` with the worker's
-    /// server-side engine (POSTed directly to the baked webhook), in addition
-    /// to creating the TradingView alerts. Experimental / dev-only: old (TV
-    /// alerts) and new (engine) paths run in parallel until the engine is
-    /// proven on demo. Independent of `--create-alerts` — you can register a
-    /// plan without arming TV alerts, or vice versa.
+    /// Register the trade as ONE signed `TradePlan` with the worker's
+    /// server-side engine (POSTed directly to the baked webhook). This is
+    /// how a trade is armed: the `*/15` cron then evaluates the plan against
+    /// fresh candles and dispatches its fires. (The legacy path — POST a
+    /// signed alert bundle to TradingView and let TV fire the alerts — has
+    /// been retired.)
     #[arg(long)]
     pub register_plan: bool,
 
@@ -141,10 +136,8 @@ pub struct Args {
     /// Register the plan in **observe-only (shadow) mode**: the server-side
     /// engine evaluates it and advances its state exactly as a live plan, but
     /// never dispatches its fires to the broker — each would-be fire is logged
-    /// instead. This is the safe way to run the engine alongside the live TV
-    /// alerts on demo (Stage F gate): both see the same candles, only the TV
-    /// alert places real orders, so engine-vs-alert can be diffed without
-    /// double-firing. Only meaningful with `--register-plan`. Default: live.
+    /// instead. The safe way to watch a new plan's decisions on demo without
+    /// placing real orders. Only meaningful with `--register-plan`. Default: live.
     #[arg(long)]
     pub shadow: bool,
 
@@ -328,7 +321,6 @@ mod tests {
     #[test]
     fn defaults_are_sensible() {
         let args = Args::try_parse_from(["tv-arm"]).expect("parse ok");
-        assert!(!args.create_alerts);
         assert!(!args.broker_dry_run);
         assert!(!args.skip_calendar_bars);
         assert_eq!(args.reversal_band_pct, 0.1);
