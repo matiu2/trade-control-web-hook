@@ -1,18 +1,19 @@
 #!/usr/bin/env bash
 # Deploy the DEV environment.
 #
-#   worker : trade-control-web-hook           (branch: main)
+#   worker : trade-control-web-hook-dev       (branch: main)
 #   CLIs   : trade-control-dev, tv-arm-dev, tv-news-dev, replay-candles-dev
 #
-# NOTE (promotion plan): next week `web-hook` becomes PROD and a fresh
-# `web-hook-dev` worker is cut for dev. When that happens, change ENV_WEBHOOK
-# below to the new dev URL — that's the only edit this script needs.
+# Every environment now carries a suffix. The old no-suffix worker
+# `trade-control-web-hook` is deprecated (kept running only until last week's
+# trades are journaled, then deleted) — this script targets the suffixed
+# `-dev` worker.
 
 set -euo pipefail
 
 ENV_NAME="dev"
 ENV_BRANCH="main"
-ENV_WEBHOOK="https://trade-control-web-hook.msherborne.workers.dev"
+ENV_WEBHOOK="https://trade-control-web-hook-dev.msherborne.workers.dev"
 ENV_SUFFIX="dev"
 # Pine study title tv-arm-dev arms against. Dev runs the newer Pine (v25,
 # which sends `open` for M/W body-extreme logic). The chart study MUST be

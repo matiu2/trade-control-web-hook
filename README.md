@@ -1675,12 +1675,17 @@ There are three environments, one per git branch, each an isolated worker
 environment. See `DEPLOYED.md` for the full branch → environment model and
 the staging → prod promotion rule.
 
+**Every environment carries a suffix** (`-dev` / `-staging` / `-prod`). The
+old no-suffix worker `trade-control-web-hook` + its R2 bucket
+`trade-control-recording` are deprecated — kept running only until last
+week's demo trades are journaled, then deleted. Do not deploy to them.
+
 Use the per-environment deploy script — **never** call `wrangler deploy`
 directly for a real deploy, because the scripts also rebuild and install
 the matching CLIs:
 
 ```sh
-git checkout main    && ./deploy-dev.sh       # dev     -> trade-control-web-hook
+git checkout main    && ./deploy-dev.sh       # dev     -> trade-control-web-hook-dev
 git checkout staging && ./deploy-staging.sh   # staging -> trade-control-web-hook-staging
 # ./deploy-live.sh is added at the first prod promotion.
 ```
@@ -1697,13 +1702,12 @@ Each script:
 4. Installs the binaries into `~/.cargo/bin` under **suffixed names** —
    `trade-control-staging`, `tv-arm-staging`, `tv-news-staging` (and the
    `-dev` set). So you pick an environment by which command you run; no env
-   var to set. The webhook the armed TradingView alerts POST to is baked
-   into `tv-arm-<env>` too — there is no longer a hard-coded URL in the JS
-   template.
+   var to set. The worker URL each `tv-arm-<env>` registers its `TradePlan`
+   against is baked in the same way.
 
 `deploy-lib.sh` holds the shared logic; the per-env wrappers hold only the
-branch + URL (one place each), so next week's "`web-hook` becomes prod, cut
-a fresh `web-hook-dev`" remap is a one-line edit per script.
+branch + URL (one place each), so standing up a new environment (e.g. the
+upcoming `-prod`) is a one-script change.
 
 > The legacy top-level `deploy.sh` is deprecated and now just points at the
 > per-env scripts.
@@ -1711,9 +1715,9 @@ a fresh `web-hook-dev`" remap is a one-line edit per script.
 ### Per-environment Pine versions
 
 The Pine source (`pine-scripts/candle-signals-v2.pine`) carries **no
-webhook URL** — the URL is baked into `tv-arm-<env>` and substituted into
-the alert at create time. So one Pine source serves every environment; what
-differs per environment is **which Pine *version*** a chart runs.
+webhook URL**. One Pine source serves every environment; what differs per
+environment is **which Pine *version*** a chart runs, so each `tv-arm-<env>`
+reads the study version that matches its worker's server-side detector.
 
 To pin a Pine version per environment, run **two studies on the chart with
 distinct base titles** — e.g. `Candle Signals v24` and `Candle Signals

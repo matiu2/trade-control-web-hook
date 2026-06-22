@@ -26,38 +26,34 @@ Future `prod` branch → `-prod` suffix; no-suffix retired entirely later.
 
 ## THIS SESSION
 
-### 1. tv-arm: remove TV-alert creation  — [in progress]
-- [ ] Delete the `--create-alerts` flag (`args.rs`) + its test assertions.
-- [ ] Remove pipeline steps 9-10 (the `!create_alerts` bail + payload POST loop),
-      `build_all_payloads`, `stamp_payload`, and the `alert_spec`/`create_alerts`/
-      `post_outcome` imports (`pipeline.rs`).
-- [ ] Delete modules `create_alerts.rs`, `alert_spec.rs`, `post_outcome.rs` +
-      their `mod` decls in `main.rs`.
-- [ ] Delete `assets/tv_mcp_template.js` (only used by `create_alerts.rs`).
-- [ ] Fix doc comments in `register_post.rs` / `trade_plan_build.rs` that imply
-      alerts still exist (keep accurate "ported from alert_spec" provenance notes;
-      reword "additive to create_alerts" / "the --create-alerts path POSTs").
-- [ ] Check `manifest.rs::discover_calendar_bundles` — still needed by the engine
-      register path (reads bundle dirs)? If only the dead payload loop used it,
-      remove; otherwise keep.
-- [ ] `cargo build -p tv-arm`, `cargo clippy -p tv-arm`, `cargo fmt`, tests green.
+### 1. tv-arm: remove TV-alert creation  — [DONE]
+- [x] Delete the `--create-alerts` flag (`args.rs`) + its test assertions.
+- [x] Remove pipeline steps 9-10 + `build_all_payloads` + `stamp_payload` +
+      the dead imports (`pipeline.rs`).
+- [x] Delete modules `create_alerts.rs`, `alert_spec.rs`, `post_outcome.rs`,
+      `manifest.rs` (all only fed the dead payload loop) + their `mod` decls.
+- [x] Delete `assets/tv_mcp_template.js`.
+- [x] Fix doc comments in `register_post.rs` / `pipeline.rs` / `args.rs` that
+      framed alerts as live or the engine as "additive/parallel".
+- [x] `discover_or_fetch_calendar_bundles` now returns only the in-memory
+      `BuiltCalendarBundle`s the engine register path needs.
+- [x] build + clippy + fmt clean; 126 tv-arm tests pass; workspace builds.
+- [x] README updated. Committed: `aee7651`.
 
-### 2. Repoint `main` to suffixed `-dev` worker + new R2  — [pending]
-- [ ] `wrangler.toml`: `name = "trade-control-web-hook-dev"`,
-      R2 `bucket_name = "trade-control-recording-dev"`. Leave KV id as-is
-      (current dev KV is fine to keep; state is fresh anyway, but DO NOT point at
-      staging/prod KV).
-- [ ] `deploy-dev.sh`: `ENV_WEBHOOK = https://trade-control-web-hook-dev.msherborne.workers.dev`.
-      Suffix already `dev` — CLIs stay `*-dev`.
-- [ ] Create the new R2 bucket: `wrangler r2 bucket create trade-control-recording-dev`
-      (operator/Claude with R2 Edit token). Update the wrangler.toml comment.
-- [ ] Update env table in this repo's `CLAUDE.md` and README env section to the
+### 2. Repoint `main` to suffixed `-dev` worker + new R2  — [DONE]
+- [x] `wrangler.toml`: `name = "trade-control-web-hook-dev"`,
+      R2 `bucket_name = "trade-control-recording-dev"`. KV id kept (same dev env,
+      just renamed; preserves in-flight plan state).
+- [x] `deploy-dev.sh`: `ENV_WEBHOOK = https://trade-control-web-hook-dev.msherborne.workers.dev`;
+      stale "web-hook becomes prod" header replaced.
+- [x] Created the R2 bucket `trade-control-recording-dev` (empty, safe; no impact
+      on the running no-suffix worker).
+- [x] Updated env tables: `CLAUDE.md`, `README.md`, `DEPLOYED.md` to the
       "everything suffixed; no-suffix deprecated" model.
-- [ ] Do NOT deploy from here — operator deploys after the remaining dev bugs are
-      fixed. (Deploy script is branch-guarded to `main`; deploy happens from the
-      real `main` checkout after merge.)
+- [ ] **Operator action:** deploy from real `main` (`./deploy-dev.sh`) AFTER the
+      remaining dev bugs are fixed. Not deployed from this worktree.
 
-### 3. This plan file  — [in progress]
+### 3. This plan file  — [DONE]
 
 ---
 
