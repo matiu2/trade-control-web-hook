@@ -5,10 +5,11 @@
 //! gets the plain candle shell), so `simulate_fill` resolves entry/SL/TP against
 //! the same levels the live dispatch would have.
 
-use trade_control_core::intent::{Action, Shell};
-use trade_control_engine::{SimOutcome, TradePlan, simulate_fill};
+use trade_control_core::intent::Action;
+use trade_control_engine::{SimOutcome, TradePlan};
 
 use super::brisbane::bne;
+use super::fixture::fill_for;
 use super::replay::{Fire, Replay};
 
 /// Render the full replay report as a string.
@@ -68,18 +69,15 @@ fn render_fire(
     if !simulate {
         return line;
     }
-    if intent.action != Action::Enter {
-        line.push_str("    (non-enter fire — no fill simulated)\n");
+    // `fill_for` simulates only enters (with the dispatch shell reconstructed the
+    // same way the worker would) — the single source the snapshot also uses.
+    // A non-enter fire returns `None` here and shows the no-fill note.
+    let Some(outcome) = fill_for(plan, fire, simulate) else {
+        if intent.action != Action::Enter {
+            line.push_str("    (non-enter fire — no fill simulated)\n");
+        }
         return line;
-    }
-
-    // Reconstruct the shell exactly as the worker's dispatch would, so the
-    // simulator resolves the same entry/SL/TP levels.
-    let shell = match &fire.fired.signal {
-        Some(sig) => Shell::from_candle_and_signal(candle, sig),
-        None => Shell::from_candle(candle),
     };
-    let outcome = simulate_fill(intent, &shell, plan.pip_size, &fire.forward);
     line.push_str(&format!("    {}\n", describe_outcome(&outcome)));
     match outcome {
         SimOutcome::TookProfit { .. } => *wins += 1,

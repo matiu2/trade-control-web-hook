@@ -1,0 +1,7 @@
+{
+  "instrument": "GBP/AUD",
+  "granularity": "h1",
+  "source": "tradenation",
+  "start": "2026-06-19T00:00:00Z",
+  "end": "2026-06-19T15:00:00Z"
+}

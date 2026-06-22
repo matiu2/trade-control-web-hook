@@ -1,0 +1,26 @@
+{
+  "trade_id": "seed-gbpaud-expiry",
+  "instrument": "GBP_AUD",
+  "direction": "short",
+  "granularity": "h1",
+  "pip_size": 0.0001,
+  "rules": [
+    {
+      "rule_id": "02-veto-trade-expiry",
+      "trigger": {
+        "type": "time_reached",
+        "at_epoch": 1781881200
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "seed-expiry-intent",
+        "not_after": "2099-01-01T00:00:00Z",
+        "action": "veto",
+        "instrument": "GBP_AUD",
+        "broker": "oanda"
+      }
+    }
+  ],
+  "shadow": false
+}

@@ -1135,6 +1135,56 @@ never-filled. The pure-evaluation diff validates the *decision* logic; the
 simulator the *price-path* — neither runs the worker's broker-dispatch glue
 (sizing, seen-id, gates), which is a later step.
 
+### Candle replay (`replay-candles`) + golden fixtures
+
+`replay-candles` (`cli/src/bin/replay_candles.rs`) is the *other* offline
+replay: instead of re-running one recorded engine tick, it drives a whole
+`TradePlan` over a historical candle **window**, one closed bar at a time —
+exactly as the live cron would — and simulates each fired enter's fill. It pulls
+the candles from the broker (via candle-cache) and needs no `wrangler dev`, no
+HTTP, no live orders. With no window flags it self-resolves the window from the
+plan + the live TradingView chart (see the module header); fully-flagged, it
+needs no MCP:
+
+```sh
+replay-candles --plan plan.json --instrument gbp/aud \
+  --granularity 1h --start 2026-06-19T00:00 --end 2026-06-19T15:00
+```
+
+**Freezing a known-good run as a regression fixture.** When a replay is
+producing the verdict you want, add `--save <name>` to freeze that run into
+`replay-fixtures/<name>/` — four JSON files: the `plan`, the **exact candle
+window** (`candles.json`, so the fixture is offline forever — broker history can
+change, the disk cache can be wiped, the fixture still runs identically), the
+resolved `meta` (instrument / granularity / source / window), and the golden
+`expected.json` outcome (each fire's decision + simulated fill, the terminal
+phase, warnings):
+
+```sh
+replay-candles --plan plan.json --instrument gbp/aud \
+  --start 2026-06-19T00:00 --end 2026-06-19T15:00 --save gbpaud-expiry-2026-06-19
+```
+
+**Re-running a fixture offline.** `--test-mode --fixture <name>` loads the
+frozen plan + candles + meta and replays them with **no network, no env vars,
+no TradingView** — the candles come from `candles.json`, the granularity/window
+from `meta.json`. Add `--check` to diff the fresh outcome against
+`expected.json` and exit non-zero on any mismatch (the gate proof):
+
+```sh
+replay-candles --test-mode --fixture gbpaud-expiry-2026-06-19 --check
+```
+
+**The regression suite.** A `#[test]` (`all_fixtures_match_expected`) globs
+`replay-fixtures/*/` and re-runs every saved fixture through the pure engine on
+`cargo test` — so every deploy's test gate re-verifies all known-good scenarios.
+A later engine change (a cross-mode tweak, a resolver edit, a veto-gate fix) that
+silently moves a verified verdict fails here. The expected snapshot is
+**structured JSON of outcomes**, not the human report text, so cosmetic report
+changes don't churn fixtures; after an *intentional* outcome change, re-save the
+fixture. The snapshot freezes today's mid-only fill semantics on purpose — a
+change to the simulator's fill model will (correctly) flag.
+
 ## Brokers
 
 The intent YAML carries an optional `broker:` field, one of `oanda`

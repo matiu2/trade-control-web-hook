@@ -1,0 +1,13 @@
+{
+  "fires": [
+    {
+      "rule_id": "02-veto-trade-expiry",
+      "action": "veto",
+      "candle_time": "2026-06-19T15:00:00Z",
+      "candle_close": 1.8862
+    }
+  ],
+  "done": true,
+  "final_phase": "done",
+  "warnings": []
+}
