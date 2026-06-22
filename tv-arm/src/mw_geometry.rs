@@ -158,6 +158,77 @@ pub fn overshoot_level(first_point: f64, neckline: f64) -> f64 {
     neckline - 0.8 * (first_point - neckline)
 }
 
+/// The shoulder the arming math keys off when a right shoulder is drawn:
+/// the **taller** of the two (further from the neckline). For an M (short)
+/// `first_point > neckline`, so that's `max`; for a W (long) it's `min`.
+/// With no right shoulder this is just the left shoulder.
+pub fn highest_shoulder(first_point: f64, neckline: f64, right_shoulder: Option<f64>) -> f64 {
+    match right_shoulder {
+        Some(rs) if first_point > neckline => first_point.max(rs),
+        Some(rs) => first_point.min(rs),
+        None => first_point,
+    }
+}
+
+/// Validate the **drawn right shoulder** of a 4-point M/W path.
+///
+/// Two-shoulder validity (the operator's rule): the *taller* of the two
+/// shoulders must sit **below the 1.3 extension** measured from the neckline
+/// to the **shorter** shoulder — i.e. the two towers are aligned within 30%
+/// of the shorter one. The right shoulder must also lie on the same side of
+/// the neckline as the left (above for an M, below for a W).
+///
+/// ```text
+///   shorter = the shoulder nearer the neckline
+///   taller  = the shoulder further from the neckline
+///   ceiling = neckline + 1.3 × (shorter − neckline)
+///   valid  ⇔ right shoulder on the correct side  AND  taller is inside the ceiling
+/// ```
+///
+/// Hard-errors with the levels so a fat-fingered 4th anchor is obvious in
+/// the operator's terminal. Both shoulders and the neckline are MID prices.
+pub fn validate_right_shoulder(first_point: f64, neckline: f64, right_shoulder: f64) -> Result<()> {
+    let left_above = first_point > neckline;
+    let rs_above = right_shoulder > neckline;
+    if left_above != rs_above {
+        return Err(eyre!(
+            "M/W right shoulder is on the wrong side of the neckline.\n  \
+             left shoulder (B) = {first_point}\n  neckline (C)      = {neckline}\n  \
+             right shoulder (D) = {right_shoulder}\n  the right shoulder must be \
+             {} the neckline, like the left shoulder.",
+            if left_above { "above" } else { "below" }
+        ));
+    }
+    // The shorter shoulder is the one nearer the neckline; the taller is
+    // further. `left_above` picks min/max consistently for M and W.
+    let (shorter, taller) = if left_above {
+        (
+            first_point.min(right_shoulder),
+            first_point.max(right_shoulder),
+        )
+    } else {
+        (
+            first_point.max(right_shoulder),
+            first_point.min(right_shoulder),
+        )
+    };
+    let ceiling = neckline + 1.3 * (shorter - neckline);
+    let inside = if left_above {
+        taller < ceiling
+    } else {
+        taller > ceiling
+    };
+    if !inside {
+        return Err(eyre!(
+            "M/W right shoulder breaks the 1.3 alignment rule: the taller shoulder \
+             must stay within the 1.3 extension of the shorter shoulder.\n  \
+             neckline (C)   = {neckline}\n  shorter shoulder = {shorter}\n  \
+             taller shoulder = {taller}\n  1.3 ceiling      = {ceiling}"
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -333,5 +404,61 @@ mod tests {
         // Equal legs is not "longer" — reject.
         let err = check_mw_structure(1.1000, 1.1200, 1.1000);
         assert!(err.is_err());
+    }
+
+    // ---- validate_right_shoulder (4-point path) ----
+    //
+    // M worked: neckline C = 1.1120, left shoulder B = 1.1200.
+
+    #[test]
+    fn right_shoulder_valid_when_within_1_3_of_shorter() {
+        // Right shoulder 1.1180 (< B). Shorter = 1.1180, ceiling =
+        // 1.1120 + 1.3×(1.1180 − 1.1120) = 1.1198. Taller B = 1.1200 ≥ 1.1198
+        // → just over. Use a right shoulder of 1.1190 instead: shorter B?
+        // No — keep it clean: left 1.1200, right 1.1190 → shorter 1.1190,
+        // ceiling 1.1120 + 1.3×0.0070 = 1.1211; taller 1.1200 < 1.1211 → ok.
+        validate_right_shoulder(1.1200, 1.1120, 1.1190).expect("aligned shoulders");
+    }
+
+    #[test]
+    fn right_shoulder_rejected_when_taller_breaks_1_3() {
+        // Left 1.1200, right 1.1260 (taller). Shorter = 1.1200, ceiling =
+        // 1.1120 + 1.3×0.0080 = 1.1224. Taller 1.1260 ≥ 1.1224 → reject.
+        let err = validate_right_shoulder(1.1200, 1.1120, 1.1260).unwrap_err();
+        assert!(format!("{err}").contains("1.3 alignment"), "{err}");
+    }
+
+    #[test]
+    fn right_shoulder_rejected_on_wrong_side() {
+        // M: shoulders sit above the neckline. A right shoulder below it
+        // (1.1100 < 1.1120) is on the wrong side → reject.
+        let err = validate_right_shoulder(1.1200, 1.1120, 1.1100).unwrap_err();
+        assert!(format!("{err}").contains("wrong side"), "{err}");
+    }
+
+    #[test]
+    fn right_shoulder_w_mirror_valid() {
+        // W: neckline 1.1080, left trough 1.1000 (below). Right trough 1.1010
+        // → shorter 1.1010, ceiling 1.1080 + 1.3×(1.1010 − 1.1080) = 1.0989;
+        // taller 1.1000 > 1.0989 → valid.
+        validate_right_shoulder(1.1000, 1.1080, 1.1010).expect("aligned W troughs");
+    }
+
+    #[test]
+    fn right_shoulder_w_mirror_rejected_when_too_deep() {
+        // W: left trough 1.1000, right trough 1.0900 (deeper/taller).
+        // Shorter 1.1000, ceiling 1.1080 + 1.3×(1.1000 − 1.1080) = 1.0976;
+        // taller 1.0900 < 1.0976 → breaks the rule (taller must stay > ceiling).
+        let err = validate_right_shoulder(1.1000, 1.1080, 1.0900).unwrap_err();
+        assert!(format!("{err}").contains("1.3 alignment"), "{err}");
+    }
+
+    #[test]
+    fn highest_shoulder_picks_taller_or_left() {
+        // M: higher of the two; W: lower of the two; None: the left shoulder.
+        assert!((highest_shoulder(1.1200, 1.1120, Some(1.1230)) - 1.1230).abs() < 1e-9);
+        assert!((highest_shoulder(1.1200, 1.1120, Some(1.1180)) - 1.1200).abs() < 1e-9);
+        assert!((highest_shoulder(1.1000, 1.1080, Some(1.0980)) - 1.0980).abs() < 1e-9);
+        assert!((highest_shoulder(1.1200, 1.1120, None) - 1.1200).abs() < 1e-9);
     }
 }

@@ -1841,6 +1841,7 @@ async fn maybe_update_mw_state<B: Broker>(
         runup_start: mw.runup_start,
         left_shoulder: mw.first_point,
         baked_neckline: mw.neckline,
+        drawn_right_shoulder: mw.right_shoulder,
     };
 
     match plan_mw_update(anchors, prior, &verified.shell, now, expires_at) {

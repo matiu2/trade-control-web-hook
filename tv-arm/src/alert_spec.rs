@@ -20,7 +20,7 @@ use trade_control_conventions::{
 };
 
 use crate::geometry::pcl_exhausted_price_from_fib;
-use crate::mw_geometry::{abort_level, cancel_level, overshoot_level};
+use crate::mw_geometry::{abort_level, cancel_level, highest_shoulder, overshoot_level};
 
 /// Pine study title this binary arms against, baked per environment by
 /// `build.rs` (`TRADE_CONTROL_PINE_NAME` → `BAKED_PINE_NAME`). Defaults to
@@ -432,17 +432,18 @@ enum MwVeto {
 /// C, the abort level needs C alone.
 fn mw_price_veto(roles: &Roles, which: MwVeto, tv_name: String) -> Option<AlertPayload> {
     let path = roles.mw_path.as_ref()?;
-    // A path classified into `mw_path` always has exactly 3 anchors
-    // (`is_mw_path` enforces it), but guard the indices defensively.
+    // A path classified into `mw_path` has 3 or 4 anchors (`is_mw_path`
+    // enforces it), but guard the indices defensively.
     let first_point = path.points.get(1)?.price;
     let neckline = path.points.get(2)?.price;
+    // 4-point path: anchor cancel / overshoot to the higher of the two
+    // shoulders (the abort = neckline close is shoulder-independent).
+    let right_shoulder = path.points.get(3).map(|p| p.price);
+    let shoulder = highest_shoulder(first_point, neckline, right_shoulder);
     let (value, frequency) = match which {
-        MwVeto::Cancel => (cancel_level(first_point, neckline), Frequency::OnFirstFire),
+        MwVeto::Cancel => (cancel_level(shoulder, neckline), Frequency::OnFirstFire),
         MwVeto::Abort => (abort_level(neckline), Frequency::OnBarClose),
-        MwVeto::Overshoot => (
-            overshoot_level(first_point, neckline),
-            Frequency::OnFirstFire,
-        ),
+        MwVeto::Overshoot => (overshoot_level(shoulder, neckline), Frequency::OnFirstFire),
     };
     Some(AlertPayload::PriceValue {
         value,

@@ -90,6 +90,13 @@ pub struct MwAnchors {
     /// `C` — baked neckline (the seed; a revised neckline lives in
     /// [`MwState`]).
     pub baked_neckline: f64,
+    /// `D` — the **drawn** right shoulder of a 4-point path, if any. On the
+    /// first update (no prior [`MwState`]) it seeds the recorded right
+    /// shoulder, so the SL anchor uses the higher of the two shoulders from
+    /// the very first bar instead of waiting for the worker to rediscover it.
+    /// Live updates may still raise it (capped at the 1.3 extension). `None`
+    /// for a classic 3-point path.
+    pub drawn_right_shoulder: Option<f64>,
 }
 
 /// Decide this bar's M/W geometry update.
@@ -112,6 +119,7 @@ pub fn plan_mw_update(
         runup_start,
         left_shoulder,
         baked_neckline,
+        drawn_right_shoulder,
     } = anchors;
 
     // No bodies → can't evolve; ride baked geometry this bar.
@@ -120,7 +128,12 @@ pub fn plan_mw_update(
     };
 
     let neckline = prior.map(|p| p.neckline).unwrap_or(baked_neckline);
-    let right_shoulder = prior.and_then(|p| p.right_shoulder);
+    // Seed the recorded right shoulder from a prior state if we have one,
+    // else from the drawn 4-point anchor (so the SL anchor uses the higher
+    // shoulder from the first bar). Live updates below may still raise it.
+    let right_shoulder = prior
+        .and_then(|p| p.right_shoulder)
+        .or(drawn_right_shoulder);
 
     // 60% validity floor on the runup→shoulder (A→B) leg.
     let floor = runup_start + VALIDITY_FLOOR_FRAC * (left_shoulder - runup_start);
@@ -269,13 +282,50 @@ mod tests {
     const M_C: f64 = 1.1120;
 
     fn plan_m(prior: Option<MwState>, shell: &Shell) -> MwUpdate {
+        plan_m_with_drawn(prior, shell, None)
+    }
+
+    fn plan_m_with_drawn(
+        prior: Option<MwState>,
+        shell: &Shell,
+        drawn_right_shoulder: Option<f64>,
+    ) -> MwUpdate {
         let anchors = MwAnchors {
             direction: Direction::Short,
             runup_start: M_A,
             left_shoulder: M_B,
             baked_neckline: M_C,
+            drawn_right_shoulder,
         };
         plan_mw_update(anchors, prior, shell, now(), exp())
+    }
+
+    #[test]
+    fn drawn_right_shoulder_seeds_state_on_first_bar() {
+        // 4-point path: a right shoulder drawn at 1.1190 (< cancel 1.1224)
+        // seeds the recorded shoulder on the first update, even though this
+        // quiet bar's body high (1.1160) is lower than the drawn shoulder.
+        let s = shell_oc(1.1160, 1.1150); // body_high 1.1160, body_low 1.1150
+        match plan_m_with_drawn(None, &s, Some(1.1190)) {
+            MwUpdate::Proceed { state, .. } => {
+                assert_eq!(state.right_shoulder, Some(1.1190));
+            }
+            other => panic!("expected Proceed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn live_body_high_raises_drawn_right_shoulder() {
+        // A drawn shoulder at 1.1190, but this bar's body high 1.1200 is
+        // higher (and < cancel 1.1224) → the recorded shoulder rises to 1.1200.
+        let s = shell_oc(1.1200, 1.1160);
+        match plan_m_with_drawn(None, &s, Some(1.1190)) {
+            MwUpdate::Proceed { state, changed } => {
+                assert!(changed);
+                assert_eq!(state.right_shoulder, Some(1.1200));
+            }
+            other => panic!("expected Proceed, got {other:?}"),
+        }
     }
 
     #[test]
@@ -389,6 +439,7 @@ mod tests {
             runup_start: W_A,
             left_shoulder: W_B,
             baked_neckline: W_C,
+            drawn_right_shoulder: None,
         };
         plan_mw_update(anchors, prior, shell, now(), exp())
     }
@@ -421,6 +472,7 @@ mod tests {
             neckline: M_C,
             first_point: M_B,
             runup_start: M_A,
+            right_shoulder: None,
             spread_pips: 0.8,
             pip_size: 0.0001,
         }
@@ -477,6 +529,7 @@ mod tests {
             neckline: W_C,
             first_point: W_B,
             runup_start: W_A,
+            right_shoulder: None,
             spread_pips: 0.8,
             pip_size: 0.0001,
         };

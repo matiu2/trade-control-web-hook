@@ -2014,23 +2014,32 @@ where those preps don't apply.
 ### M/W (double-top / double-bottom) setups
 
 M/W reversals use a completely different drawing input from H&S: **one
-PATH (polyline) tool with exactly 3 anchors**, plus a `trade-expiry`
+PATH (polyline) tool with 3 or 4 anchors**, plus a `trade-expiry`
 vertical. No invalidation line, no neckline/retest trendlines, no fib.
 
-The 3 path anchors, **in draw order**:
+The path anchors, **in draw order**:
 
 1. **A — runup start** (audit/log only).
 2. **B — first peak (M) / first trough (W)** — the SL anchor base.
 3. **C — neckline retracement** — the entry/abort anchor.
+4. **D — right shoulder** (*optional 4th anchor*) — the second peak/trough.
+   Draw it to **arm the setup immediately** (see "4-point paths" below);
+   omit it for the classic 3-anchor path where the worker discovers the
+   right tower live.
 
 Direction is inferred from the A→B leg geometry (A above B → W/long; A
 below B → M/short) — the **path tool has no text label**, so detection
-is geometry-only, and only a path whose 3 anchors all sit inside the
+is geometry-only, and only a path whose anchors all sit inside the
 visible chart range is picked up. `tv-arm` gates the setup at arm time:
 
 - **Neckline-retracement depth.** Retrace as a % of the runup must be
   `< 40%`. `--allow-50-pct-m-trades` raises the ceiling to `<= 50%` for
   a marginal setup; `> 50%` is always rejected.
+- **Right-shoulder alignment (4-point only).** When `D` is drawn, the
+  taller of the two shoulders must stay **below the 1.3 extension** of the
+  *shorter* shoulder (measured neckline→shorter), and `D` must sit on the
+  same side of the neckline as `B`. A drawing that breaks either rule is
+  **rejected at arm** with the offending levels printed.
 - **Live broker spread.** The mid→bid/ask correction the worker applies
   needs the spread captured at arm time, so `tv-arm` **reads it live**
   from the broker (OANDA `/pricing`; TradeNation's chart bid/ask
@@ -2084,6 +2093,17 @@ leg, all MID-price:
    no-op), but the wire status lets timeline/verdict tooling tell a routine
    decline apart from a real geometry bug. (Internally: the three arming
    gates return `ResolveError::NotArmedYet`.)
+
+**4-point paths arm immediately.** Both live confirmations above exist only
+because a 3-anchor path doesn't yet know the right tower — it discovers it
+bar by bar. When the operator draws the **4th anchor (D — right shoulder)**
+the second tower is *declared* (and validated at arm time), so both gates
+are satisfied by construction and **skipped**: the setup is armed on the
+first fire. Only the **1.3-extension ceiling** and the **stop-on-correct-side**
+placement check still apply, and the cancel/mid levels are measured off the
+**higher** of the two shoulders. The worker still re-measures every bar — a
+higher shoulder reshapes the geometry (below) and the 1.3 ceiling still
+aborts — matching "price may run higher but stay inside the 1.3 system".
 
 **Worker-side dynamic geometry (KV-backed).** The book reads the *higher
 shoulder* and the *deepest neckline* off a finished chart; we arm with only

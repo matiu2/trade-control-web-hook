@@ -463,6 +463,11 @@ pub struct MwSpec {
     /// `A` — the runup start. Audit / log only; fed the arm-time
     /// neckline-% gate, not the worker's entry geometry.
     pub runup_start: f64,
+    /// `D` — the optional drawn right shoulder (4-point path). When set the
+    /// worker arms immediately. `#[serde(default)]` keeps a 3-point spec
+    /// yaml byte-identical.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub right_shoulder: Option<f64>,
     /// Broker spread in pips, read at arm time. `>= 0`.
     pub spread_pips: f64,
     /// Instrument pip size at arm time (e.g. `0.0001`). `> 0`.
@@ -476,6 +481,7 @@ impl MwSpec {
             neckline: self.neckline,
             first_point: self.first_point,
             runup_start: self.runup_start,
+            right_shoulder: self.right_shoulder,
             spread_pips: self.spread_pips,
             pip_size: self.pip_size,
         }
@@ -2746,6 +2752,7 @@ mod tests {
             neckline: 1.1120,
             first_point: 1.1200,
             runup_start: 1.1000,
+            right_shoulder: None,
             spread_pips: 1.0,
             pip_size: 0.0001,
         }

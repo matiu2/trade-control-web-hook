@@ -1,5 +1,49 @@
 # Changelog
 
+## v50 — 2026-06-22 — M/W: optional drawn right shoulder (4-point path) arms immediately
+
+### Why
+
+A 3-anchor M/W path (runup-start, left shoulder, neckline) leaves the right
+tower unknown at arm time, so the worker has to *discover* it live — waiting
+for a right-tower-reach confirmation and then a 50% "middle of the M"
+downward cross before it arms. When the operator can already *see* the right
+shoulder on the chart, that wait is needless latency: the pattern is valid the
+moment both towers exist. The operator wanted to draw the right shoulder and
+have the trade arm straight away, re-measuring each bar and aborting only on
+the 1.3 break.
+
+### What changed
+
+- **Optional 4th path anchor `D` = right shoulder.** `tv-arm` now accepts a
+  3- *or* 4-anchor M/W PATH. A 4th anchor is read as the right shoulder and
+  baked onto the enter intent (`MwParams.right_shoulder: Option<f64>`).
+- **4-point paths arm immediately.** With a right shoulder present the worker
+  skips the live right-tower-reach and 50%-mid-cross gates (`from_mw_intent`);
+  only the 1.3-extension ceiling and the stop-on-correct-side placement check
+  remain. 3-anchor behaviour is unchanged.
+- **Highest-shoulder geometry.** The SL anchor, the 1.3 cancel ceiling, and the
+  `mw-cancel` / `mw-overshoot` veto levels are measured off the **higher** of
+  the two shoulders when `D` is drawn (M: max; W: min). The worker still
+  re-measures every bar — a higher shoulder reshapes the geometry via `MwState`
+  and the 1.3 ceiling still aborts.
+- **Arm-time validity.** `tv-arm` rejects a 4-point drawing whose right
+  shoulder is on the wrong side of the neckline, or whose taller shoulder
+  breaches the 1.3 extension of the *shorter* shoulder.
+
+### Config
+
+- New signed field `MwParams.right_shoulder` (and CLI `MwSpec.right_shoulder`),
+  both `#[serde(default, skip_serializing_if = "Option::is_none")]` — a
+  3-anchor signed intent / spec yaml stays byte-identical.
+
+### Tests
+
+- core: 4-point arms-without-mid-cross (M+W), 1.3 ceiling tracks the higher
+  shoulder, wrong-side stop still declines, drawn shoulder seeds `MwState`.
+- tv-arm: `validate_right_shoulder` (valid / 1.3-break / wrong-side, M+W),
+  `highest_shoulder`, 4-anchor classification + pipeline accept/reject.
+
 ## v49 — 2026-06-20 — replay-candles: Brisbane-time output + clearer --source help + dev deploy
 
 ### Why

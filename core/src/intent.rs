@@ -309,6 +309,20 @@ pub struct MwParams {
     /// `A` — the runup start. Audit / log only; the worker doesn't use
     /// it for entry geometry (it fed the arm-time neckline-% gate).
     pub runup_start: f64,
+    /// `D` — the **right shoulder**, when the operator drew a 4-point M/W
+    /// path (the optional 4th anchor). MID price, on the same side of the
+    /// neckline as `first_point` (above for an M, below for a W).
+    ///
+    /// When set, the second tower is already drawn, so the setup is
+    /// **armed immediately** — the worker skips the live right-tower-reach
+    /// and 50%-mid-cross gates (a 3-point path has to discover the right
+    /// tower bar by bar; a 4-point path declares it). The arming math then
+    /// keys the SL anchor / mid references off the **higher** of the two
+    /// shoulders. `None` for a classic 3-point path (unchanged behaviour).
+    /// `#[serde(default)]` keeps every in-flight 3-point signed intent
+    /// byte-identical.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub right_shoulder: Option<f64>,
     /// Broker spread in pips, read at arm time. The worker has no live
     /// spread at entry, so this baked value drives the mid→bid/ask
     /// correction on every level. `>= 0`.
@@ -1256,6 +1270,20 @@ impl Intent {
             let pip_ok = mw.pip_size.is_finite() && mw.pip_size > 0.0;
             if !(anchors_finite && spread_ok && pip_ok) {
                 return Err(IntentValidationError::MwFieldInvalid);
+            }
+            // 4-point path: the right shoulder must be finite and sit on
+            // the same side of the neckline as the left shoulder (above for
+            // an M where first_point > neckline, below for a W). The richer
+            // "within 1.3 of the shortest shoulder" validity is a *drawing*
+            // gate enforced at arm time in tv-arm; here we only guard the
+            // wire contract so a NaN / wrong-side baked value can't reach
+            // the resolver.
+            if let Some(rs) = mw.right_shoulder {
+                let left_above = mw.first_point > mw.neckline;
+                let rs_above = rs > mw.neckline;
+                if !rs.is_finite() || rs_above != left_above {
+                    return Err(IntentValidationError::MwFieldInvalid);
+                }
             }
         }
         // Top-level baked pip: if present it scales every offset_pips into

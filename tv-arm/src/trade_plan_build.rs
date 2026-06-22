@@ -30,7 +30,7 @@ use trade_control_core::trade_plan::{
 };
 
 use crate::geometry::pcl_exhausted_price_from_fib;
-use crate::mw_geometry::{abort_level, cancel_level, overshoot_level};
+use crate::mw_geometry::{abort_level, cancel_level, highest_shoulder, overshoot_level};
 use crate::roles::Roles;
 use trading_view::drawings::Drawing;
 
@@ -337,12 +337,18 @@ fn mw_price_trigger(roles: &Roles, which: MwVeto) -> Option<Trigger> {
     let path = roles.mw_path.as_ref()?;
     let first_point = path.points.get(1)?.price;
     let neckline = path.points.get(2)?.price;
+    // 4-point path: anchor the cancel / overshoot levels to the **higher** of
+    // the two drawn shoulders, so a drawn right shoulder above the left widens
+    // the 1.3 cancel ceiling and pushes the overshoot level out to match the
+    // real geometry. The abort (neckline close) is shoulder-independent.
+    let right_shoulder = path.points.get(3).map(|p| p.price);
+    let shoulder = highest_shoulder(first_point, neckline, right_shoulder);
     let (level, bar) = match which {
-        MwVeto::Cancel => (cancel_level(first_point, neckline), BarEvent::Intrabar),
+        MwVeto::Cancel => (cancel_level(shoulder, neckline), BarEvent::Intrabar),
         // Abort is the only M/W veto that's a candle *close* back through the
         // neckline → OnClose.
         MwVeto::Abort => (abort_level(neckline), BarEvent::OnClose),
-        MwVeto::Overshoot => (overshoot_level(first_point, neckline), BarEvent::Intrabar),
+        MwVeto::Overshoot => (overshoot_level(shoulder, neckline), BarEvent::Intrabar),
     };
     Some(Trigger::PriceValueCross {
         level,

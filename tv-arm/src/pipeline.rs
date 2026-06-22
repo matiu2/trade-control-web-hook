@@ -572,10 +572,10 @@ fn check_mw_required(roles: &Roles) -> std::result::Result<(), ResolveError> {
         .mw_path
         .as_ref()
         .ok_or_else(|| eyre!("resolve_mw_trade called without an mw_path"))?;
-    if path.points.len() != 3 {
+    if !matches!(path.points.len(), 3 | 4) {
         return Err(ResolveError::Reject(format!(
-            "M/W path must have exactly 3 anchors [A runup-start, B first-point, C neckline]; \
-             found {}",
+            "M/W path must have 3 anchors [A runup-start, B first-point, C neckline] or 4 \
+             [+ D right-shoulder]; found {}",
             path.points.len()
         )));
     }
@@ -609,6 +609,8 @@ fn resolve_mw_trade_with_spread(
     let runup_start = path.points[0].price;
     let first_point = path.points[1].price;
     let neckline = path.points[2].price;
+    // Optional 4th anchor: the drawn right shoulder (arms immediately).
+    let right_shoulder = path.points.get(3).map(|p| p.price);
 
     let direction = mw_geometry::mw_direction_from_anchors(runup_start, first_point)
         .ok_or_else(|| ResolveError::Reject(mw_flat_first_leg_msg(runup_start, first_point)))?;
@@ -620,6 +622,15 @@ fn resolve_mw_trade_with_spread(
     let pct = mw_geometry::neckline_retrace_pct(runup_start, first_point, neckline);
     if let Err(msg) = gate_neckline_pct(pct, args.allow_50_pct_m_trades) {
         return Err(ResolveError::Reject(msg));
+    }
+    // 4-point path: reject a drawing whose right shoulder is on the wrong
+    // side of the neckline or breaks the 1.3 alignment of the shorter
+    // shoulder. Drawing-level validity, so it fails arm here rather than
+    // silently baking a bad geometry.
+    if let Some(rs) = right_shoulder
+        && let Err(e) = mw_geometry::validate_right_shoulder(first_point, neckline, rs)
+    {
+        return Err(ResolveError::Reject(format!("{e}\n")));
     }
 
     // The SL-vs-spread floor (hard limit) is enforced at build time in the
@@ -636,6 +647,7 @@ fn resolve_mw_trade_with_spread(
         direction = direction.as_str(),
         pattern = ?pattern,
         runup_start, first_point, neckline,
+        right_shoulder = ?right_shoulder,
         retrace_pct = %format!("{:.1}%", pct * 100.0),
         spread_pips,
         pip_size,
@@ -652,6 +664,7 @@ fn resolve_mw_trade_with_spread(
             runup_start,
             first_point,
             neckline,
+            right_shoulder,
             spread_pips,
             pip_size,
         },
@@ -690,6 +703,8 @@ struct MwSpecAnchors {
     runup_start: f64,
     first_point: f64,
     neckline: f64,
+    /// `D` — the optional drawn right shoulder (4-point path).
+    right_shoulder: Option<f64>,
     spread_pips: f64,
     pip_size: f64,
 }
@@ -783,6 +798,7 @@ fn build_mw_trade_spec(
             neckline: anchors.neckline,
             first_point: anchors.first_point,
             runup_start: anchors.runup_start,
+            right_shoulder: anchors.right_shoulder,
             spread_pips: anchors.spread_pips,
             pip_size: anchors.pip_size,
         }),
@@ -1842,6 +1858,14 @@ mod tests {
     // ===== M / W trade-spec resolution ==================================
 
     fn path(id: &str, prices: [f64; 3]) -> Drawing {
+        path_n(id, &prices)
+    }
+
+    fn path4(id: &str, prices: [f64; 4]) -> Drawing {
+        path_n(id, &prices)
+    }
+
+    fn path_n(id: &str, prices: &[f64]) -> Drawing {
         Drawing {
             id: id.to_string(),
             points: prices
@@ -1916,6 +1940,44 @@ mod tests {
         assert!((mw.pip_size - 0.0001).abs() < 1e-12);
         // ...and is mirrored onto the top-level spec field.
         assert_eq!(spec.pip_size, Some(0.0001));
+    }
+
+    #[test]
+    fn resolve_mw_4point_bakes_right_shoulder() {
+        // 4-point M: A=1.1000, B=1.1200, C=1.1120, D=1.1190 (valid: inside
+        // the 1.3 ceiling of the shorter shoulder, same side as B).
+        let roles = mw_roles(path4("p", [1.1000, 1.1200, 1.1120, 1.1190]));
+        let args = mw_args(&["--allow-50-pct-m-trades"]);
+        let (dir, spec) = resolve(&args, &roles, "EUR_USD", Broker::TradeNation, 0.0001)
+            .expect("valid 4-point M resolves");
+        assert_eq!(dir, Direction::Short);
+        let mw = spec.mw.expect("mw baked");
+        assert_eq!(mw.right_shoulder, Some(1.1190));
+    }
+
+    #[test]
+    fn resolve_mw_4point_rejects_misaligned_right_shoulder() {
+        // D=1.1300 breaks the 1.3 alignment (taller shoulder past the
+        // ceiling of the shorter) → the drawing is rejected at arm.
+        let roles = mw_roles(path4("p", [1.1000, 1.1200, 1.1120, 1.1300]));
+        let args = mw_args(&["--allow-50-pct-m-trades"]);
+        match resolve(&args, &roles, "EUR_USD", Broker::TradeNation, 0.0001) {
+            Err(ResolveError::Reject(msg)) => {
+                assert!(msg.contains("1.3 alignment"), "msg = {msg}")
+            }
+            other => panic!("expected Reject, got {:?}", other.map(|_| ())),
+        }
+    }
+
+    #[test]
+    fn resolve_mw_4point_rejects_wrong_side_right_shoulder() {
+        // D=1.1100 sits below the neckline (wrong side for an M) → rejected.
+        let roles = mw_roles(path4("p", [1.1000, 1.1200, 1.1120, 1.1100]));
+        let args = mw_args(&["--allow-50-pct-m-trades"]);
+        match resolve(&args, &roles, "EUR_USD", Broker::TradeNation, 0.0001) {
+            Err(ResolveError::Reject(msg)) => assert!(msg.contains("wrong side"), "msg = {msg}"),
+            other => panic!("expected Reject, got {:?}", other.map(|_| ())),
+        }
     }
 
     #[test]
@@ -2031,10 +2093,24 @@ mod tests {
         };
         match check_mw_required(&roles) {
             Err(ResolveError::Reject(msg)) => {
-                assert!(msg.contains("exactly 3 anchors"), "msg = {msg}")
+                assert!(
+                    msg.contains("3 anchors") && msg.contains("found 2"),
+                    "msg = {msg}"
+                )
             }
             other => panic!("expected Reject, got {:?}", other.map(|_| ())),
         }
+    }
+
+    #[test]
+    fn check_mw_required_accepts_four_anchor_path() {
+        // A 4-anchor path (right shoulder drawn) passes the count guard.
+        let roles = Roles {
+            mw_path: Some(path4("p", [1.1000, 1.1200, 1.1120, 1.1190])),
+            trade_expiry: Some(vline("exp", now().timestamp() + 86_400)),
+            ..Default::default()
+        };
+        assert!(check_mw_required(&roles).is_ok());
     }
 
     #[test]

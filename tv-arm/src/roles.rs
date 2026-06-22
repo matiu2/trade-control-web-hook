@@ -37,7 +37,7 @@ mod kind {
     pub const VERTICAL_LINE: &str = "vertical_line";
     pub const FIB_RETRACEMENT: &str = "fib_retracement";
     /// The polyline / path tool used to mark an M/W reversal. It has no
-    /// text property, so it's detected purely by geometry (3 anchors,
+    /// text property, so it's detected purely by geometry (3 or 4 anchors,
     /// all inside the visible range) — see [`super::classify`].
     pub const PATH: &str = "path";
     /// TradingView short-position tool. Entry is `points[0].price`;
@@ -103,10 +103,11 @@ pub struct Roles {
     /// to the drawing. Multiple lines for the same step keep only the
     /// latest (older ones are stale leftovers).
     pub prep_expiries: Vec<(String, Drawing)>,
-    /// The M/W reversal path: a 3-anchor `path` drawing wholly inside
-    /// the visible range. The path tool has no label, so detection is
-    /// geometry-only — anchors are `[A (runup start), B (first
-    /// point), C (neckline)]` in draw order. Latest-wins when several
+    /// The M/W reversal path: a 3- or 4-anchor `path` drawing wholly
+    /// inside the visible range. The path tool has no label, so detection
+    /// is geometry-only — anchors are `[A (runup start), B (first point),
+    /// C (neckline)]` in draw order, with an optional 4th `D (right
+    /// shoulder)` that arms the setup immediately. Latest-wins when several
     /// qualify. `None` for a plain H&S chart.
     pub mw_path: Option<Drawing>,
     /// A long/short **position** tool — the direct-entry path. Detected
@@ -299,13 +300,15 @@ fn latest_position(mut cands: Vec<PositionDrawing>) -> Option<PositionDrawing> {
     cands.pop()
 }
 
-/// A `path` drawing qualifies as the M/W marker iff it has exactly 3
+/// A `path` drawing qualifies as the M/W marker iff it has **3 or 4**
 /// anchors and every anchor's time falls inside the visible range
-/// `[from, to]` (inclusive). Off-screen paths are stale leftovers; a
-/// path with 2 or 4+ anchors is a fat-fingered shape and is ignored
-/// rather than guessed at.
+/// `[from, to]` (inclusive). Three anchors is the classic
+/// `[A runup-start, B left-shoulder, C neckline]`; a 4th anchor is the
+/// optional `D right-shoulder` (arms immediately). Off-screen paths are
+/// stale leftovers; a path with 2 or 5+ anchors is a fat-fingered shape
+/// and is ignored rather than guessed at.
 fn is_mw_path(d: &Drawing, (from, to): (i64, i64)) -> bool {
-    d.points.len() == 3 && d.points.iter().all(|p| p.time >= from && p.time <= to)
+    matches!(d.points.len(), 3 | 4) && d.points.iter().all(|p| p.time >= from && p.time <= to)
 }
 
 /// Collapse the per-step prep-expiry candidates to one drawing each —
@@ -722,13 +725,37 @@ mod tests {
     }
 
     #[test]
-    fn four_anchor_path_is_ignored() {
+    fn four_anchor_path_is_the_right_shoulder_form() {
+        // A 4-anchor path is the 4-point M/W form (D = right shoulder);
+        // it classifies as an mw_path with all four points preserved.
         let (stubs, mcp) = fixture(vec![(
             stub("p", "path"),
             drawing(
                 "p",
                 "",
                 vec![(100, 1.1), (200, 1.12), (300, 1.11), (400, 1.13)],
+            ),
+        )]);
+        let roles = classify(&mcp, &stubs, ANY_RANGE).expect("ok");
+        let path = roles.mw_path.expect("4-anchor path is a valid mw_path");
+        assert_eq!(path.points.len(), 4);
+    }
+
+    #[test]
+    fn five_anchor_path_is_ignored() {
+        // 5+ anchors is a fat-fingered shape → ignored.
+        let (stubs, mcp) = fixture(vec![(
+            stub("p", "path"),
+            drawing(
+                "p",
+                "",
+                vec![
+                    (100, 1.1),
+                    (200, 1.12),
+                    (300, 1.11),
+                    (400, 1.13),
+                    (500, 1.1),
+                ],
             ),
         )]);
         let roles = classify(&mcp, &stubs, ANY_RANGE).expect("ok");
