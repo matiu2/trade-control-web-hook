@@ -213,6 +213,42 @@ Key facts a refactorer must preserve:
   `reversal_veto_plan()` helper (KV-free, unit-tested); the KV write
   is a thin wrapper.
 
+### `too-high` is close-confirmed now; `too-low` still fires on a wick
+
+The two at-level invalidation vetos a H&S enter carries are **not**
+symmetric in cross semantics, and that asymmetry is intentional — don't
+"fix" one to match the other.
+
+For a **short** trade (mirror for long):
+
+- **`too-high` = invalidation** (the drawing-bound horizontal at the
+  shoulder cap). Built as `HorizontalCross { dir: Up, bar: Intrabar }`
+  in `tv-arm/src/trade_plan_build.rs::invalidation_or_pcl_trigger`. The
+  engine's intrabar `Up` cross requires the bar to **close** on the up
+  side: `straddles && candle.c >= level` (`engine/src/evaluate.rs`
+  `level_crossed`). **Previous behaviour was any wick above the level
+  (a touch); it is now a close above.** A bar whose high pokes above
+  `too-high` but closes back below does **not** fire. (Seen on
+  NZD/CHF 2026-06-19: the 10:45 Brisbane bar `H=0.46359 C=0.46351`
+  vs level `0.46354` — wick above, close below → no fire, by design.)
+
+- **`too-low` = pcl-exhausted** (the computed fib level, ~80% of the way
+  to TP). Built as `PriceValueCross { dir: Either, bar: Intrabar }`.
+  Intrabar `Either` fires on **any straddle** regardless of where the
+  close sits — so a wick down to the 80%-completion level **still
+  aborts** the trade. This is **unchanged** from the original behaviour
+  and must stay that way: if a short ran 80% to TP without us, a wick
+  alone is reason enough to abort.
+
+Why the asymmetry is right: an invalidation wick that immediately
+retreats is debatably *not* an invalidation (close-confirm filters the
+fakeout), whereas a pcl-exhaustion wick means the move you wanted
+already happened without you — abort on the touch. If you ever
+unify these, unify toward the operator's intent per-level, not toward
+one cross mode for both. (These levels are also baked onto the enter as
+continuous `entry_level_vetos` — see Bug #12 / `[[bug12_at_entry_level_vetos]]`
+— which is `is_past`-inclusive and independent of this cross-guard.)
+
 ### tv_arm_hs.py: server-side trendline-cross eval is anchor-bounded
 
 Burned a lot of time on this. When you POST a `create_alert` with
