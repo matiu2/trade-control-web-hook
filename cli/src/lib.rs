@@ -56,9 +56,9 @@ pub use templates::{discover_templates, pick_template_interactive, templates_roo
 pub use trade_control_core::intent::{BrokerKind, PriceAnchor};
 pub use trade_control_core::sig::KEY_LEN;
 pub use trade_patterns::{
-    BuiltAlert, BuiltTrade, EntryMode, MwSpec, PositionEnterSpec, PositionEntryKind, TradePattern,
-    TradeSpec, build_position_enter, build_trade_from_spec, build_trade_interactive,
-    load_spec_from_file, pick_pattern_interactive, write_trade,
+    BuildStrictness, BuiltAlert, BuiltTrade, EntryMode, MwSpec, PositionEnterSpec,
+    PositionEntryKind, TradePattern, TradeSpec, build_position_enter, build_trade_from_spec,
+    build_trade_interactive, load_spec_from_file, pick_pattern_interactive, write_trade,
 };
 
 /// Generate a fresh 32-byte signing key as 64 hex chars, using the OS RNG.

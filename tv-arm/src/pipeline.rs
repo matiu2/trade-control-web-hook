@@ -195,7 +195,18 @@ pub fn run(args: Args) -> Result<i32> {
         blackout_pairs = roles.blackout_pairs.len(),
         "trade spec built",
     );
-    let built_trade = cli::build_trade_from_spec(trade_spec, now).wrap_err("build trade bundle")?;
+    // `--plan-out` without `--register-plan` is an offline build (no worker
+    // POST) — typically replaying / inspecting a historical setup, where an
+    // already-elapsed trade_expiry (or in-window news) is expected. Relax the
+    // time-sensitive checks to warnings so the JSON still gets written; any
+    // path that actually arms the worker (`--register-plan`) stays strict.
+    let strictness = if args.register_plan {
+        cli::BuildStrictness::Strict
+    } else {
+        cli::BuildStrictness::Lenient
+    };
+    let built_trade =
+        cli::build_trade_from_spec(trade_spec, now, strictness).wrap_err("build trade bundle")?;
     let trade_id = built_trade.trade_id.clone();
     cli::write_trade(&built_trade, &key, &out_dir).wrap_err("write trade bundle")?;
     info!(

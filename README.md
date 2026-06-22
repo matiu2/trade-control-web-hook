@@ -1881,6 +1881,17 @@ registers against the staging worker with no extra flag. The chart timeframe
 must map to an engine granularity (`1`/`5`/`15`/`60`/`240`/`D`), else the
 register is rejected.
 
+> **`--plan-out` is the offline sibling.** `tv-arm --plan-out <file>` *without*
+> `--register-plan` builds the plan and writes its JSON to disk but never POSTs
+> to the worker — used to replay / inspect a historical setup. Because such a
+> setup is usually already in the past, the build relaxes its time-sensitive
+> checks (`trade_expiry` already elapsed, an in-window news event) from hard
+> errors to **warnings** in this offline mode, so the JSON still gets written.
+> Any path that actually arms the worker (`--register-plan`, and the
+> `build-trade --from-file` signing path) stays strict and rejects an expired
+> `trade_expiry`. The strictness toggle is `BuildStrictness` in
+> `cli/src/trade_patterns.rs`.
+
 The worker validates the registered plan and **persists** it to KV (key
 `plan:{scope}:{trade_id}`, TTL = the trade window plus grace) for the
 server-side engine to enumerate each cron tick. The engine that *evaluates*

@@ -22,7 +22,7 @@ use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use clap_complete::{Shell, generate};
 use color_eyre::eyre::{Context, Result, eyre};
 use trade_control_cli::{
-    AdoptBody, CalendarBarsArgs, KEY_LEN, TradePattern, add_account, adopt_trade,
+    AdoptBody, BuildStrictness, CalendarBarsArgs, KEY_LEN, TradePattern, add_account, adopt_trade,
     build_clear_prep_intent, build_clear_veto_intent, build_market_info_intent,
     build_news_from_spec, build_pause_from_spec, build_plan_delete_intent, build_plan_list_intent,
     build_plan_show_intent, build_prep_intent, build_status_intent, build_trade_from_spec,
@@ -759,7 +759,9 @@ fn run_build_trade(args: BuildTradeArgs) -> Result<()> {
         Some(path) => {
             let spec = load_spec_from_file(&path)?;
             check_account_known(&spec.account)?;
-            build_trade_from_spec(spec, now)?
+            // `build-trade` signs a bundle bound for the live worker, so the
+            // strict checks (trade_expiry in the future, etc.) stay on.
+            build_trade_from_spec(spec, now, BuildStrictness::Strict)?
         }
         None => {
             let pattern = match args.pattern {

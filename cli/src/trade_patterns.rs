@@ -549,10 +549,37 @@ pub fn build_trade_interactive(pattern: TradePattern, now: DateTime<Utc>) -> Res
     }
 }
 
+/// How strictly to validate a [`TradeSpec`] that's about to be built.
+///
+/// The on-disk signing path (`build-trade --from-file`, `tv-arm
+/// --register-plan`) feeds the live worker, so a stale `trade_expiry`
+/// would arm a plan that can never enter — that's a hard error. The
+/// offline `tv-arm --plan-out` path (no worker POST) is used for
+/// replay / inspection of historical setups, where an expired window
+/// or an in-window news event is expected; there we only warn so the
+/// JSON still gets written.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BuildStrictness {
+    /// Bound for the live worker — expired / news-overlapping setups are
+    /// rejected.
+    Strict,
+    /// Offline `--plan-out` only — those conditions warn instead of erroring.
+    Lenient,
+}
+
 /// Build a trade from a pre-filled [`TradeSpec`] with no prompts. Used by
 /// the `--from-file` flag on `build-trade`. Validates the spec against
 /// the same rules the prompts would enforce, then assembles the alerts.
-pub fn build_trade_from_spec(mut spec: TradeSpec, now: DateTime<Utc>) -> Result<BuiltTrade> {
+///
+/// `strictness` controls whether time-sensitive checks (`trade_expiry` in
+/// the past, news in the window) are hard errors ([`BuildStrictness::Strict`],
+/// the live path) or warnings ([`BuildStrictness::Lenient`], offline
+/// `--plan-out`).
+pub fn build_trade_from_spec(
+    mut spec: TradeSpec,
+    now: DateTime<Utc>,
+    strictness: BuildStrictness,
+) -> Result<BuiltTrade> {
     let is_mw = matches!(spec.pattern, TradePattern::M | TradePattern::W);
     // `mw` and the pattern must agree: M/W require the baked path
     // geometry, H&S/IH&S must not carry it. Catch a hand-edited spec
@@ -593,7 +620,19 @@ pub fn build_trade_from_spec(mut spec: TradeSpec, now: DateTime<Utc>) -> Result<
         return Err(eyre!("account is required"));
     }
     if spec.trade_expiry <= now {
-        return Err(eyre!("trade_expiry must be in the future"));
+        match strictness {
+            BuildStrictness::Strict => {
+                return Err(eyre!("trade_expiry must be in the future"));
+            }
+            BuildStrictness::Lenient => {
+                tracing::warn!(
+                    trade_expiry = %spec.trade_expiry.to_rfc3339(),
+                    now = %now.to_rfc3339(),
+                    "trade_expiry is in the past — allowed because this is an offline \
+                     --plan-out build (would be rejected on the live worker path)",
+                );
+            }
+        }
     }
     if !spec.tp_price.is_finite() {
         return Err(eyre!("tp_price must be a finite number"));
@@ -2567,7 +2606,7 @@ mod tests {
     fn build_trade_from_spec_emits_six_alerts_for_hs() {
         let now = ts("2026-05-20T00:00:00Z");
         let spec = sample_spec(TradePattern::Hs, ts("2026-05-25T00:00:00Z"));
-        let trade = build_trade_from_spec(spec, now).unwrap();
+        let trade = build_trade_from_spec(spec, now, BuildStrictness::Strict).unwrap();
         // 6 alerts: invalidation (too-high), pcl-exhausted (too-low),
         // trade-expiry, break-and-close, retest, enter.
         assert_eq!(trade.alerts.len(), 6);
@@ -2586,7 +2625,7 @@ mod tests {
         let now = ts("2026-05-20T00:00:00Z");
         let mut spec = sample_spec(TradePattern::Hs, ts("2026-05-25T00:00:00Z"));
         spec.close_on_news = true;
-        let trade = build_trade_from_spec(spec, now).unwrap();
+        let trade = build_trade_from_spec(spec, now, BuildStrictness::Strict).unwrap();
         assert_eq!(trade.alerts.len(), 7);
         assert_eq!(trade.alerts[6].basename, "06-close-on-reversal");
         let close = &trade.alerts[6].intent;
@@ -2612,7 +2651,7 @@ mod tests {
         let now = ts("2026-05-20T00:00:00Z");
         let mut spec = sample_spec(TradePattern::Hs, ts("2026-05-25T00:00:00Z"));
         spec.sr_reversal_ranges = vec![[1.0950, 1.0970], [1.1000, 1.1020]];
-        let trade = build_trade_from_spec(spec, now).unwrap();
+        let trade = build_trade_from_spec(spec, now, BuildStrictness::Strict).unwrap();
         assert_eq!(trade.alerts.len(), 7);
         assert_eq!(trade.alerts[6].basename, "06-close-on-reversal");
         let close = &trade.alerts[6].intent;
@@ -2637,7 +2676,7 @@ mod tests {
         let mut spec = sample_spec(TradePattern::Hs, ts("2026-05-25T00:00:00Z"));
         spec.close_on_news = true;
         spec.sr_reversal_ranges = vec![[1.0950, 1.0970]];
-        let trade = build_trade_from_spec(spec, now).unwrap();
+        let trade = build_trade_from_spec(spec, now, BuildStrictness::Strict).unwrap();
         assert_eq!(trade.alerts.len(), 7);
         assert_eq!(trade.alerts[6].basename, "06-close-on-reversal");
         let close = &trade.alerts[6].intent;
@@ -2667,7 +2706,7 @@ mod tests {
         let mut spec = sample_spec(TradePattern::Hs, ts("2026-05-25T00:00:00Z"));
         spec.close_on_news = true;
         spec.needs_confirmed_close = true;
-        let trade = build_trade_from_spec(spec, now).unwrap();
+        let trade = build_trade_from_spec(spec, now, BuildStrictness::Strict).unwrap();
         let close = &trade.alerts[6].intent;
         assert!(close.needs_confirmed);
         assert!(!close.needs_golden);
@@ -2682,7 +2721,7 @@ mod tests {
         let now = ts("2026-05-20T00:00:00Z");
         let mut spec = sample_spec(TradePattern::Hs, ts("2026-05-25T00:00:00Z"));
         spec.sr_reversal_ranges = vec![[1.0950, 1.0970]];
-        let trade = build_trade_from_spec(spec, now).unwrap();
+        let trade = build_trade_from_spec(spec, now, BuildStrictness::Strict).unwrap();
         let close = &trade.alerts[6].intent;
         assert!(!close.veto_on_reversal);
         // The enter (05-enter) must NOT list `reversal` when the flag is off.
@@ -2698,7 +2737,7 @@ mod tests {
         let mut spec = sample_spec(TradePattern::Hs, ts("2026-05-25T00:00:00Z"));
         spec.sr_reversal_ranges = vec![[1.0950, 1.0970]];
         spec.veto_on_reversal = true;
-        let trade = build_trade_from_spec(spec, now).unwrap();
+        let trade = build_trade_from_spec(spec, now, BuildStrictness::Strict).unwrap();
         let close = &trade.alerts[6].intent;
         assert!(close.veto_on_reversal);
         // The paired half: the enter MUST list `reversal` in its vetos, or
@@ -2725,7 +2764,7 @@ mod tests {
         let mut spec = sample_spec(TradePattern::Hs, ts("2026-05-25T00:00:00Z"));
         spec.close_on_news = true;
         spec.veto_on_reversal = true;
-        let trade = build_trade_from_spec(spec, now).unwrap();
+        let trade = build_trade_from_spec(spec, now, BuildStrictness::Strict).unwrap();
         let close = &trade.alerts[6].intent;
         assert!(!close.veto_on_reversal);
         let enter = &trade.alerts[5].intent;
@@ -2739,7 +2778,7 @@ mod tests {
     fn build_trade_from_spec_emits_six_alerts_for_ihs() {
         let now = ts("2026-05-20T00:00:00Z");
         let spec = sample_spec(TradePattern::Ihs, ts("2026-05-25T00:00:00Z"));
-        let trade = build_trade_from_spec(spec, now).unwrap();
+        let trade = build_trade_from_spec(spec, now, BuildStrictness::Strict).unwrap();
         // IH&S flips the veto direction: invalidation = too-low,
         // pcl-exhausted = too-high.
         assert_eq!(trade.alerts[0].basename, "01-veto-too-low");
@@ -2758,7 +2797,7 @@ mod tests {
         // BUG-too-low-closes-positions.md (demo trade 046).
         let now = ts("2026-05-20T00:00:00Z");
         let spec = sample_spec(TradePattern::Hs, ts("2026-05-25T00:00:00Z"));
-        let trade = build_trade_from_spec(spec, now).unwrap();
+        let trade = build_trade_from_spec(spec, now, BuildStrictness::Strict).unwrap();
         let invalidation = &trade.alerts[0];
         let pcl_exhausted = &trade.alerts[1];
         assert_eq!(invalidation.intent.name.as_deref(), Some("too-high"));
@@ -2782,7 +2821,7 @@ mod tests {
         let now = ts("2026-05-20T00:00:00Z");
         for pattern in [TradePattern::Hs, TradePattern::Ihs] {
             let spec = sample_spec(pattern, ts("2026-05-25T00:00:00Z"));
-            let trade = build_trade_from_spec(spec, now).unwrap();
+            let trade = build_trade_from_spec(spec, now, BuildStrictness::Strict).unwrap();
             assert_eq!(
                 trade.alerts[0].intent.level,
                 Some(VetoLevel::ClosePositions),
@@ -2803,7 +2842,7 @@ mod tests {
         // by `tv-arm`, not hand-edited.
         let now = ts("2026-05-20T00:00:00Z");
         let spec = sample_spec(TradePattern::M, ts("2026-05-25T00:00:00Z"));
-        let err = build_trade_from_spec(spec, now).unwrap_err();
+        let err = build_trade_from_spec(spec, now, BuildStrictness::Strict).unwrap_err();
         assert!(err.to_string().contains("requires `mw`"), "got {err}");
     }
 
@@ -2814,7 +2853,7 @@ mod tests {
         let now = ts("2026-05-20T00:00:00Z");
         let mut spec = sample_spec(TradePattern::Hs, ts("2026-05-25T00:00:00Z"));
         spec.mw = Some(sample_mw());
-        let err = build_trade_from_spec(spec, now).unwrap_err();
+        let err = build_trade_from_spec(spec, now, BuildStrictness::Strict).unwrap_err();
         assert!(err.to_string().contains("must not carry `mw`"), "got {err}");
     }
 
@@ -2845,7 +2884,7 @@ mod tests {
         let now = ts("2026-05-20T00:00:00Z");
         for pattern in [TradePattern::M, TradePattern::W] {
             let spec = mw_spec(pattern, ts("2026-05-25T00:00:00Z"));
-            let trade = build_trade_from_spec(spec, now).unwrap();
+            let trade = build_trade_from_spec(spec, now, BuildStrictness::Strict).unwrap();
             assert_eq!(trade.alerts.len(), 5, "{pattern:?}");
             let basenames: Vec<&str> = trade.alerts.iter().map(|a| a.basename.as_str()).collect();
             assert_eq!(
@@ -2873,7 +2912,7 @@ mod tests {
             spread_pips: 20.0,
             ..sample_mw()
         });
-        let err = build_trade_from_spec(spec, now).unwrap_err();
+        let err = build_trade_from_spec(spec, now, BuildStrictness::Strict).unwrap_err();
         assert!(
             err.to_string().contains("too close to the spread"),
             "got {err}"
@@ -2886,7 +2925,7 @@ mod tests {
         // comfortably above the 10× floor → builds fine.
         let now = ts("2026-05-20T00:00:00Z");
         let spec = mw_spec(TradePattern::M, ts("2026-05-25T00:00:00Z"));
-        assert!(build_trade_from_spec(spec, now).is_ok());
+        assert!(build_trade_from_spec(spec, now, BuildStrictness::Strict).is_ok());
     }
 
     #[test]
@@ -2898,7 +2937,7 @@ mod tests {
         // invalidation).
         let now = ts("2026-05-20T00:00:00Z");
         let spec = mw_spec(TradePattern::M, ts("2026-05-25T00:00:00Z"));
-        let trade = build_trade_from_spec(spec, now).unwrap();
+        let trade = build_trade_from_spec(spec, now, BuildStrictness::Strict).unwrap();
         assert_eq!(trade.alerts[0].intent.name.as_deref(), Some("mw-cancel"));
         assert_eq!(trade.alerts[0].intent.level, Some(VetoLevel::CancelPending));
         assert_eq!(trade.alerts[1].intent.name.as_deref(), Some("mw-abort"));
@@ -2914,7 +2953,7 @@ mod tests {
         // pattern; vetos are the three M/W ones; no preps; single-shot.
         let now = ts("2026-05-20T00:00:00Z");
         let spec = mw_spec(TradePattern::M, ts("2026-05-25T00:00:00Z"));
-        let trade = build_trade_from_spec(spec, now).unwrap();
+        let trade = build_trade_from_spec(spec, now, BuildStrictness::Strict).unwrap();
         let enter = &trade.alerts[4].intent;
         assert_eq!(enter.action, Action::Enter);
         assert_eq!(enter.direction, Some(Direction::Short));
@@ -2953,7 +2992,7 @@ mod tests {
         // M in the bundle.
         let now = ts("2026-05-20T00:00:00Z");
         let spec = mw_spec(TradePattern::W, ts("2026-05-25T00:00:00Z"));
-        let trade = build_trade_from_spec(spec, now).unwrap();
+        let trade = build_trade_from_spec(spec, now, BuildStrictness::Strict).unwrap();
         assert_eq!(trade.alerts[4].intent.direction, Some(Direction::Long));
     }
 
@@ -2965,7 +3004,7 @@ mod tests {
         let now = ts("2026-05-20T00:00:00Z");
         let mut spec = sample_spec(TradePattern::Hs, ts("2026-05-25T00:00:00Z"));
         spec.pip_size = Some(0.01); // JPY-scale
-        let trade = build_trade_from_spec(spec, now).unwrap();
+        let trade = build_trade_from_spec(spec, now, BuildStrictness::Strict).unwrap();
         let enter = &trade.alerts[5].intent;
         assert_eq!(enter.action, Action::Enter);
         assert_eq!(enter.pip_size, Some(0.01));
@@ -2979,7 +3018,7 @@ mod tests {
         let now = ts("2026-05-20T00:00:00Z");
         let spec = sample_spec(TradePattern::Hs, ts("2026-05-25T00:00:00Z"));
         assert_eq!(spec.pip_size, None);
-        let trade = build_trade_from_spec(spec, now).unwrap();
+        let trade = build_trade_from_spec(spec, now, BuildStrictness::Strict).unwrap();
         assert_eq!(trade.alerts[5].intent.pip_size, None);
     }
 
@@ -2987,8 +3026,18 @@ mod tests {
     fn build_trade_from_spec_rejects_past_trade_expiry() {
         let now = ts("2026-05-20T00:00:00Z");
         let spec = sample_spec(TradePattern::Hs, ts("2026-05-19T00:00:00Z"));
-        let err = build_trade_from_spec(spec, now).unwrap_err();
+        let err = build_trade_from_spec(spec, now, BuildStrictness::Strict).unwrap_err();
         assert!(err.to_string().contains("future"), "got {err}");
+    }
+
+    #[test]
+    fn build_trade_from_spec_lenient_allows_past_trade_expiry() {
+        // The offline `--plan-out` path (replaying a historical setup) must
+        // still build even when trade_expiry has already elapsed — it only
+        // warns, so the JSON gets written.
+        let now = ts("2026-05-20T00:00:00Z");
+        let spec = sample_spec(TradePattern::Hs, ts("2026-05-19T00:00:00Z"));
+        assert!(build_trade_from_spec(spec, now, BuildStrictness::Lenient).is_ok());
     }
 
     #[test]
@@ -2996,10 +3045,10 @@ mod tests {
         let now = ts("2026-05-20T00:00:00Z");
         let mut spec = sample_spec(TradePattern::Hs, ts("2026-05-25T00:00:00Z"));
         spec.entry_deadline_pct = 0;
-        assert!(build_trade_from_spec(spec, now).is_err());
+        assert!(build_trade_from_spec(spec, now, BuildStrictness::Strict).is_err());
         let mut spec2 = sample_spec(TradePattern::Hs, ts("2026-05-25T00:00:00Z"));
         spec2.entry_deadline_pct = 101;
-        assert!(build_trade_from_spec(spec2, now).is_err());
+        assert!(build_trade_from_spec(spec2, now, BuildStrictness::Strict).is_err());
     }
 
     #[test]
@@ -3008,7 +3057,7 @@ mod tests {
         // geometry defaults (1 pip from short.yaml / long.yaml).
         let now = ts("2026-05-20T00:00:00Z");
         let spec = sample_spec(TradePattern::Hs, ts("2026-05-25T00:00:00Z"));
-        let trade = build_trade_from_spec(spec, now).unwrap();
+        let trade = build_trade_from_spec(spec, now, BuildStrictness::Strict).unwrap();
         let enter = trade.alerts.last().unwrap();
         match &enter.intent.entry {
             Some(EntrySpec::Stop { offset_pips, .. }) => {
@@ -3075,7 +3124,7 @@ tp_price: 1.05
         let now = ts("2026-05-20T00:00:00Z");
         let mut spec = sample_spec(TradePattern::Hs, ts("2026-05-25T00:00:00Z"));
         spec.risk_amount = Some(5.0);
-        let trade = build_trade_from_spec(spec, now).unwrap();
+        let trade = build_trade_from_spec(spec, now, BuildStrictness::Strict).unwrap();
         let enter = trade.alerts.last().unwrap();
         match &enter.intent.risk_amount {
             Some(trade_control_core::tunable::Tunable::Static(a)) => {
@@ -3101,7 +3150,7 @@ tp_price: 1.05
         let now = ts("2026-05-20T00:00:00Z");
         let mut spec = sample_spec(TradePattern::Hs, ts("2026-05-25T00:00:00Z"));
         spec.dry_run = true;
-        let trade = build_trade_from_spec(spec, now).unwrap();
+        let trade = build_trade_from_spec(spec, now, BuildStrictness::Strict).unwrap();
         let enter = trade.alerts.last().unwrap();
         assert_eq!(enter.intent.dry_run, Some(true));
         // Spot-check a non-enter alert: dry_run must be None.
@@ -3117,7 +3166,7 @@ tp_price: 1.05
         let now = ts("2026-05-20T00:00:00Z");
         let mut spec = sample_spec(TradePattern::Hs, ts("2026-05-25T00:00:00Z"));
         spec.blackout_close = BlackoutCloseAction::CancelAndClose;
-        let trade = build_trade_from_spec(spec, now).unwrap();
+        let trade = build_trade_from_spec(spec, now, BuildStrictness::Strict).unwrap();
         let enter = trade.alerts.last().unwrap();
         assert_eq!(
             enter.intent.blackout_close,
@@ -3137,7 +3186,7 @@ tp_price: 1.05
         // The default spec mints an enter at the safe incident-fix default.
         let now = ts("2026-05-20T00:00:00Z");
         let spec = sample_spec(TradePattern::Hs, ts("2026-05-25T00:00:00Z"));
-        let trade = build_trade_from_spec(spec, now).unwrap();
+        let trade = build_trade_from_spec(spec, now, BuildStrictness::Strict).unwrap();
         let enter = trade.alerts.last().unwrap();
         assert_eq!(
             enter.intent.blackout_close,
@@ -3152,7 +3201,7 @@ tp_price: 1.05
         let now = ts("2026-05-20T00:00:00Z");
         let mut spec = sample_spec(TradePattern::Hs, ts("2026-05-25T00:00:00Z"));
         spec.prep_expiries = vec!["break-and-close".into()];
-        let trade = build_trade_from_spec(spec, now).unwrap();
+        let trade = build_trade_from_spec(spec, now, BuildStrictness::Strict).unwrap();
         let pe = trade
             .alerts
             .iter()
@@ -3172,7 +3221,7 @@ tp_price: 1.05
         let now = ts("2026-05-20T00:00:00Z");
         let mut spec = sample_spec(TradePattern::Hs, ts("2026-05-25T00:00:00Z"));
         spec.prep_expiries = vec!["nonsense".into()];
-        assert!(build_trade_from_spec(spec, now).is_err());
+        assert!(build_trade_from_spec(spec, now, BuildStrictness::Strict).is_err());
     }
 
     #[test]
@@ -3182,7 +3231,7 @@ tp_price: 1.05
         let mut spec = sample_spec(TradePattern::Hs, ts("2026-05-25T00:00:00Z"));
         spec.skip_preps = vec!["retest".into()];
         spec.prep_expiries = vec!["retest".into()];
-        assert!(build_trade_from_spec(spec, now).is_err());
+        assert!(build_trade_from_spec(spec, now, BuildStrictness::Strict).is_err());
     }
 
     #[test]
@@ -3193,7 +3242,7 @@ tp_price: 1.05
         let now = ts("2026-05-20T00:00:00Z");
         let mut spec = sample_spec(TradePattern::Hs, ts("2026-05-25T00:00:00Z"));
         spec.needs_golden = true;
-        let trade = build_trade_from_spec(spec, now).unwrap();
+        let trade = build_trade_from_spec(spec, now, BuildStrictness::Strict).unwrap();
         let enter = trade.alerts.last().unwrap();
         assert!(enter.intent.needs_golden);
         enter.intent.validate().unwrap();
@@ -3213,7 +3262,7 @@ tp_price: 1.05
         let now = ts("2026-05-20T00:00:00Z");
         let mut spec = sample_spec(TradePattern::Hs, ts("2026-05-25T00:00:00Z"));
         spec.needs_confirmed = true;
-        let trade = build_trade_from_spec(spec, now).unwrap();
+        let trade = build_trade_from_spec(spec, now, BuildStrictness::Strict).unwrap();
         let enter = trade.alerts.last().unwrap();
         assert!(enter.intent.needs_confirmed);
         // needs_golden is independent — not set unless asked for.
@@ -3236,7 +3285,7 @@ tp_price: 1.05
         let mut spec = sample_spec(TradePattern::Hs, ts("2026-05-25T00:00:00Z"));
         spec.needs_golden = true;
         spec.needs_confirmed = true;
-        let trade = build_trade_from_spec(spec, now).unwrap();
+        let trade = build_trade_from_spec(spec, now, BuildStrictness::Strict).unwrap();
         let enter = trade.alerts.last().unwrap();
         assert!(enter.intent.needs_golden);
         assert!(enter.intent.needs_confirmed);
@@ -3253,7 +3302,7 @@ tp_price: 1.05
         let now = ts("2026-05-20T00:00:00Z");
         let mut spec = sample_spec(TradePattern::Hs, ts("2026-05-25T00:00:00Z"));
         spec.max_retries = 3;
-        let trade = build_trade_from_spec(spec, now).unwrap();
+        let trade = build_trade_from_spec(spec, now, BuildStrictness::Strict).unwrap();
         let enter = trade.alerts.last().unwrap();
         match &enter.intent.max_retries {
             trade_control_core::tunable::Tunable::Static(n) => assert_eq!(*n, 3),
@@ -3280,7 +3329,7 @@ tp_price: 1.05
         let now = ts("2026-05-20T00:00:00Z");
         let mut spec = sample_spec(TradePattern::Hs, ts("2026-05-25T00:00:00Z"));
         spec.expiry_bars = Some(3);
-        let trade = build_trade_from_spec(spec, now).unwrap();
+        let trade = build_trade_from_spec(spec, now, BuildStrictness::Strict).unwrap();
         let enter = trade.alerts.last().unwrap();
         match &enter.intent.expiry_bars {
             Some(trade_control_core::tunable::Tunable::Static(n)) => assert_eq!(*n, 3),
@@ -3302,7 +3351,7 @@ tp_price: 1.05
         // carries no expiry_bars, so the order rests until trade_expiry.
         let now = ts("2026-05-20T00:00:00Z");
         let spec = sample_spec(TradePattern::Hs, ts("2026-05-25T00:00:00Z"));
-        let trade = build_trade_from_spec(spec, now).unwrap();
+        let trade = build_trade_from_spec(spec, now, BuildStrictness::Strict).unwrap();
         let enter = trade.alerts.last().unwrap();
         assert!(enter.intent.expiry_bars.is_none());
     }
@@ -3313,7 +3362,7 @@ tp_price: 1.05
         // critical for wire compat with all pre-existing spec yamls.
         let now = ts("2026-05-20T00:00:00Z");
         let spec = sample_spec(TradePattern::Hs, ts("2026-05-25T00:00:00Z"));
-        let trade = build_trade_from_spec(spec, now).unwrap();
+        let trade = build_trade_from_spec(spec, now, BuildStrictness::Strict).unwrap();
         let enter = trade.alerts.last().unwrap();
         assert!(
             matches!(&enter.intent.entry, Some(EntrySpec::Stop { .. })),
@@ -3330,7 +3379,7 @@ tp_price: 1.05
         let now = ts("2026-05-20T00:00:00Z");
         let mut spec = sample_spec(TradePattern::Hs, ts("2026-05-25T00:00:00Z"));
         spec.entry_mode = EntryMode::Market;
-        let trade = build_trade_from_spec(spec, now).unwrap();
+        let trade = build_trade_from_spec(spec, now, BuildStrictness::Strict).unwrap();
         let enter = trade.alerts.last().unwrap();
         assert!(
             matches!(&enter.intent.entry, Some(EntrySpec::Market)),
@@ -3368,7 +3417,7 @@ entry_mode: market
         let now = ts("2026-05-20T00:00:00Z");
         let mut spec = sample_spec(TradePattern::Hs, ts("2026-05-25T00:00:00Z"));
         spec.allow_entry = Some("signal_confirmed".into());
-        let trade = build_trade_from_spec(spec, now).unwrap();
+        let trade = build_trade_from_spec(spec, now, BuildStrictness::Strict).unwrap();
         let enter = trade.alerts.last().unwrap();
         match &enter.intent.allow_entry {
             Some(trade_control_core::tunable::Tunable::Script(s)) => {
@@ -3398,7 +3447,7 @@ entry_mode: market
         let now = ts("2026-06-02T00:00:00Z");
         let mut spec = sample_spec(TradePattern::Hs, ts("2026-06-09T00:00:00Z"));
         spec.allow_entry = Some("signal_confirmed".into());
-        let trade = build_trade_from_spec(spec, now).unwrap();
+        let trade = build_trade_from_spec(spec, now, BuildStrictness::Strict).unwrap();
         let enter = trade.alerts.last().unwrap();
         assert_eq!(enter.basename, "05-enter");
         let key = [9u8; KEY_LEN];
@@ -3444,7 +3493,7 @@ entry_mode: market
         let now = ts("2026-06-02T00:00:00Z");
         let mut spec = sample_spec(TradePattern::Hs, ts("2026-06-09T00:00:00Z"));
         spec.expiry_bars = Some(3);
-        let trade = build_trade_from_spec(spec, now).unwrap();
+        let trade = build_trade_from_spec(spec, now, BuildStrictness::Strict).unwrap();
         let enter = trade.alerts.last().unwrap();
         assert_eq!(enter.basename, "05-enter");
         let key = [9u8; KEY_LEN];
@@ -3496,7 +3545,7 @@ entry_mode: market
         // on an indicator that ships the menu plots.
         let now = ts("2026-06-02T00:00:00Z");
         let spec = sample_spec(TradePattern::Hs, ts("2026-06-09T00:00:00Z"));
-        let trade = build_trade_from_spec(spec, now).unwrap();
+        let trade = build_trade_from_spec(spec, now, BuildStrictness::Strict).unwrap();
         let enter = trade.alerts.last().unwrap();
         let key = [9u8; KEY_LEN];
         let signed = wrap_signed_template(&enter.intent, &key).unwrap();
@@ -3514,7 +3563,7 @@ entry_mode: market
         let now = ts("2026-05-20T00:00:00Z");
         let mut spec = sample_spec(TradePattern::Hs, ts("2026-05-25T00:00:00Z"));
         spec.allow_entry = Some("if foo {{{ bad".into());
-        let err = build_trade_from_spec(spec, now).unwrap_err();
+        let err = build_trade_from_spec(spec, now, BuildStrictness::Strict).unwrap_err();
         assert!(err.to_string().contains("allow_entry"), "got {err}");
     }
 
@@ -3553,7 +3602,7 @@ tp_price: 1.05
         let spec: TradeSpec = serde_yaml::from_str(yaml).unwrap();
         assert_eq!(spec.max_retries, 0);
         let now = ts("2026-05-20T00:00:00Z");
-        let trade = build_trade_from_spec(spec, now).unwrap();
+        let trade = build_trade_from_spec(spec, now, BuildStrictness::Strict).unwrap();
         let enter = trade.alerts.last().unwrap();
         assert!(matches!(
             enter.intent.max_retries,
@@ -3566,10 +3615,10 @@ tp_price: 1.05
         let now = ts("2026-05-20T00:00:00Z");
         let mut spec = sample_spec(TradePattern::Hs, ts("2026-05-25T00:00:00Z"));
         spec.risk_amount = Some(0.0);
-        assert!(build_trade_from_spec(spec, now).is_err());
+        assert!(build_trade_from_spec(spec, now, BuildStrictness::Strict).is_err());
         let mut spec2 = sample_spec(TradePattern::Hs, ts("2026-05-25T00:00:00Z"));
         spec2.risk_amount = Some(-1.0);
-        assert!(build_trade_from_spec(spec2, now).is_err());
+        assert!(build_trade_from_spec(spec2, now, BuildStrictness::Strict).is_err());
     }
 
     #[test]
@@ -3580,7 +3629,7 @@ tp_price: 1.05
         let now = ts("2026-05-20T00:00:00Z");
         let mut spec = sample_spec(TradePattern::Hs, ts("2026-05-25T00:00:00Z"));
         spec.skip_preps = vec!["break-and-close".into()];
-        let trade = build_trade_from_spec(spec, now).unwrap();
+        let trade = build_trade_from_spec(spec, now, BuildStrictness::Strict).unwrap();
         let basenames: Vec<&str> = trade.alerts.iter().map(|a| a.basename.as_str()).collect();
         assert!(!basenames.contains(&"03-prep-break-and-close"));
         assert!(basenames.contains(&"04-prep-retest"));
@@ -3596,7 +3645,7 @@ tp_price: 1.05
         let now = ts("2026-05-20T00:00:00Z");
         let mut spec = sample_spec(TradePattern::Hs, ts("2026-05-25T00:00:00Z"));
         spec.skip_preps = vec!["break-and-close".into(), "retest".into()];
-        let trade = build_trade_from_spec(spec, now).unwrap();
+        let trade = build_trade_from_spec(spec, now, BuildStrictness::Strict).unwrap();
         let basenames: Vec<&str> = trade.alerts.iter().map(|a| a.basename.as_str()).collect();
         assert!(!basenames.contains(&"03-prep-break-and-close"));
         assert!(!basenames.contains(&"04-prep-retest"));
@@ -3612,7 +3661,7 @@ tp_price: 1.05
         let now = ts("2026-05-20T00:00:00Z");
         let mut spec = sample_spec(TradePattern::Hs, ts("2026-05-25T00:00:00Z"));
         spec.skip_preps = vec!["bogus".into()];
-        let err = build_trade_from_spec(spec, now).unwrap_err();
+        let err = build_trade_from_spec(spec, now, BuildStrictness::Strict).unwrap_err();
         assert!(err.to_string().contains("bogus"), "got {err}");
     }
 
@@ -3649,7 +3698,7 @@ tp_price: 1.05
         let now = ts("2026-05-20T00:00:00Z");
         let mut spec = sample_spec(TradePattern::Hs, ts("2026-05-25T00:00:00Z"));
         spec.sl_anchor = Some(PriceAnchor::RecentHigh);
-        let trade = build_trade_from_spec(spec, now).unwrap();
+        let trade = build_trade_from_spec(spec, now, BuildStrictness::Strict).unwrap();
         let enter = trade.alerts.last().unwrap();
         match &enter.intent.stop_loss {
             Some(PriceRef::Anchored { from, .. }) => assert_eq!(*from, PriceAnchor::RecentHigh),
@@ -3664,7 +3713,7 @@ tp_price: 1.05
         let now = ts("2026-05-20T00:00:00Z");
         let mut spec = sample_spec(TradePattern::Hs, ts("2026-05-25T00:00:00Z"));
         spec.sl_anchor = Some(PriceAnchor::RecentLow);
-        let err = build_trade_from_spec(spec, now).unwrap_err();
+        let err = build_trade_from_spec(spec, now, BuildStrictness::Strict).unwrap_err();
         assert!(err.to_string().contains("short"), "got {err}");
     }
 
@@ -3673,7 +3722,7 @@ tp_price: 1.05
         let now = ts("2026-05-20T00:00:00Z");
         let mut spec = sample_spec(TradePattern::Ihs, ts("2026-05-25T00:00:00Z"));
         spec.sl_anchor = Some(PriceAnchor::RecentLow);
-        let trade = build_trade_from_spec(spec, now).unwrap();
+        let trade = build_trade_from_spec(spec, now, BuildStrictness::Strict).unwrap();
         let enter = trade.alerts.last().unwrap();
         match &enter.intent.stop_loss {
             Some(PriceRef::Anchored { from, .. }) => assert_eq!(*from, PriceAnchor::RecentLow),
@@ -3690,7 +3739,7 @@ tp_price: 1.05
         // (#05) is bound to a Pine study and may carry plot placeholders.
         let now = ts("2026-05-20T00:00:00Z");
         let spec = sample_spec(TradePattern::Hs, ts("2026-05-25T00:00:00Z"));
-        let trade = build_trade_from_spec(spec, now).unwrap();
+        let trade = build_trade_from_spec(spec, now, BuildStrictness::Strict).unwrap();
         let key = [9u8; KEY_LEN];
         for alert in &trade.alerts {
             let is_pine_bound = alert.basename == "05-enter";
