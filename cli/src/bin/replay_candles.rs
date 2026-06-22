@@ -20,11 +20,20 @@
 //!   --source tradenation --start 2026-06-18T11:00
 //! ```
 //!
-//! Or, with no window flags, the instrument + granularity + start/end are
-//! read straight off the current TradingView chart (the replay-mode visible
-//! region) via the same MCP wrapper `tv-arm` uses — so the operator scrubs the
-//! chart to the trade's end and just runs `replay-candles --plan plan.json`.
-//! Any flag that *is* passed overrides the corresponding chart value.
+//! Or, with no window flags, the window resolves itself from the plan + the
+//! live TradingView chart, for the natural replay workflow:
+//!
+//!   - **granularity** comes from the **plan** (`plan.granularity`).
+//!   - **start** is the chart's **last shown candle** (`bars_range.to`) — in TV
+//!     replay mode that's the replay cursor, so the operator just rewinds the
+//!     chart to the start of the trade.
+//!   - **end** is the plan's **trade-expiry** rule (`TimeReached.at_epoch`),
+//!     falling back to the chart's visible-region end if the plan has none.
+//!   - **instrument** falls back chart-symbol → plan.
+//!
+//! So the operator rewinds TradingView to the trade start and just runs
+//! `replay-candles --plan plan.json`. Any flag that *is* passed overrides the
+//! corresponding resolved value.
 
 mod replay_candles {
     pub mod brisbane;
@@ -51,7 +60,7 @@ use tracing_subscriber::{EnvFilter, fmt};
 use replay_candles::source::CandleSource;
 use replay_candles::tv::TvDefaults;
 use replay_candles::{brisbane, candles, granularity, instrument, replay, report, tv};
-use trade_control_engine::TradePlan;
+use trade_control_engine::{TradePlan, Trigger};
 use trading_view::mcp::TvMcp;
 
 #[derive(Parser)]
@@ -68,8 +77,9 @@ struct Args {
     #[arg(long)]
     instrument: Option<String>,
 
-    /// Candle granularity (`1m`/`5m`/`15m`/`1h`/`4h`/`1d`). Overrides the
-    /// chart's resolution. Must match the plan's granularity.
+    /// Candle granularity (`1m`/`5m`/`15m`/`1h`/`4h`/`1d`). Defaults to the
+    /// plan's granularity; pass this only to override it (the override must
+    /// still match the plan's granularity).
     #[arg(long)]
     granularity: Option<String>,
 
@@ -80,13 +90,13 @@ struct Args {
     source: CandleSource,
 
     /// Window start, UTC (e.g. `2026-06-18T11:00` or `2026-06-18T11:00:00`).
-    /// Overrides the chart's visible-region start. Omit to read it from the
-    /// TradingView chart.
+    /// Overrides the chart's last-shown-candle (replay cursor). Omit to read it
+    /// from the TradingView chart.
     #[arg(long)]
     start: Option<String>,
 
-    /// Window end, UTC. Overrides the chart's visible-region end. Omit to read
-    /// it from the TradingView chart.
+    /// Window end, UTC. Overrides the plan's trade-expiry. Omit to use the
+    /// plan's trade-expiry (or, if it has none, the chart's visible-region end).
     #[arg(long)]
     end: Option<String>,
 
@@ -126,20 +136,13 @@ async fn main() -> Result<()> {
     let args = Args::parse();
     let plan = load_plan(&args.plan)?;
 
-    let window = resolve_window(&args)?;
-    let gran = granularity::parse(&window.granularity)?;
+    // Granularity comes from the plan; `--granularity` only overrides, and an
+    // override must still match the plan (a mismatch would replay the wrong
+    // bars). `gran_label` is the friendly form for logging / errors.
+    let gran = resolve_granularity(&args, &plan)?;
+    let gran_label = granularity::engine_label(plan.granularity);
 
-    // The plan's granularity drives the engine's detector config and the candle
-    // feed; a mismatch would replay the wrong bars, so refuse it.
-    if gran.engine() != plan.granularity {
-        return Err(eyre!(
-            "granularity {} does not match the plan's granularity {} — \
-             pass --granularity {}",
-            window.granularity,
-            granularity::engine_label(plan.granularity),
-            granularity::engine_label(plan.granularity),
-        ));
-    }
+    let window = resolve_window(&args, &plan)?;
 
     let raw_instrument = window.instrument.as_deref().unwrap_or(&plan.instrument);
     let symbol = instrument::resolve_for(raw_instrument, args.source)?;
@@ -152,7 +155,7 @@ async fn main() -> Result<()> {
 
     tracing::info!(
         instrument = %symbol,
-        granularity = %window.granularity,
+        granularity = %gran_label,
         source = ?args.source,
         start = %brisbane::bne(start),
         end = %brisbane::bne(end),
@@ -161,8 +164,7 @@ async fn main() -> Result<()> {
     let candles = candles::pull(args.source, &symbol, gran, start, end, args.cache_dir).await?;
     if candles.is_empty() {
         return Err(eyre!(
-            "no candles returned for {symbol} {} in [{start}, {end}]",
-            window.granularity
+            "no candles returned for {symbol} {gran_label} in [{start}, {end}]"
         ));
     }
     tracing::info!(count = candles.len(), "pulled candles");
@@ -176,26 +178,52 @@ async fn main() -> Result<()> {
 }
 
 /// The fully-resolved replay window: instrument (or `None` to fall back to the
-/// plan), the friendly granularity string, and the UTC start/end. Built from
-/// CLI flags, with any omitted field pulled from the live TradingView chart.
+/// plan) and the UTC start/end. Granularity is resolved separately (from the
+/// plan, see [`resolve_granularity`]).
 struct ResolvedWindow {
     instrument: Option<String>,
-    granularity: String,
     start: DateTime<Utc>,
     end: DateTime<Utc>,
 }
 
-/// Resolve the replay window from flags, consulting TradingView only when a
-/// window field is missing. Explicit flags always win; the chart fills the
-/// gaps. Instrument falls back to `None` here (the caller then uses the plan's
-/// instrument) — the chart symbol is only consulted when TV is needed for some
-/// *other* field anyway, so a bare `--plan` with all-explicit window still
-/// honours the plan instrument without an MCP call.
-fn resolve_window(args: &Args) -> Result<ResolvedWindow> {
-    let need_tv = args.instrument.is_none()
-        || args.granularity.is_none()
-        || args.start.is_none()
-        || args.end.is_none();
+/// Resolve the granularity. Defaults to the plan's granularity; `--granularity`
+/// only overrides, and the override must still match the plan (a mismatch would
+/// replay the wrong bars through a detector configured for a different bar
+/// size, so we refuse it).
+fn resolve_granularity(args: &Args, plan: &TradePlan) -> Result<granularity::ReplayGranularity> {
+    let plan_label = granularity::engine_label(plan.granularity);
+    let Some(raw) = &args.granularity else {
+        // No override: take the plan's granularity straight.
+        return granularity::parse(plan_label);
+    };
+    let gran = granularity::parse(raw)?;
+    if gran.engine() != plan.granularity {
+        return Err(eyre!(
+            "granularity {raw} does not match the plan's granularity {plan_label} — \
+             drop --granularity to use the plan's, or pass --granularity {plan_label}"
+        ));
+    }
+    Ok(gran)
+}
+
+/// Resolve the replay window from flags, the plan, and TradingView. Precedence,
+/// per field:
+///
+///   - **start** — `--start` flag → chart's last shown candle (replay cursor).
+///   - **end** — `--end` flag → plan's trade-expiry → chart visible-region end.
+///   - **instrument** — `--instrument` flag → chart symbol → (caller) plan.
+///
+/// TradingView is consulted only when something it provides is actually needed:
+/// the start cursor, the symbol, or the end-fallback (and the end-fallback is
+/// only reached when the plan has no trade-expiry rule). So a fully-flagged
+/// window, or one whose end comes from the plan, needs no MCP call.
+fn resolve_window(args: &Args, plan: &TradePlan) -> Result<ResolvedWindow> {
+    let plan_expiry = trade_expiry_epoch(plan).and_then(|at| Utc.timestamp_opt(at, 0).single());
+
+    // The chart is needed for the start cursor, the symbol, or (only when the
+    // plan has no expiry and no --end) the end fallback.
+    let need_end_from_chart = args.end.is_none() && plan_expiry.is_none();
+    let need_tv = args.start.is_none() || args.instrument.is_none() || need_end_from_chart;
 
     let tv = if need_tv {
         let mcp = match &args.tv_mcp_root {
@@ -204,7 +232,7 @@ fn resolve_window(args: &Args) -> Result<ResolvedWindow> {
         };
         tracing::info!(
             root = %mcp.root().display(),
-            "reading replay window from TradingView chart"
+            "reading replay defaults from TradingView chart"
         );
         Some(tv::pull_defaults(&mcp)?)
     } else {
@@ -216,29 +244,42 @@ fn resolve_window(args: &Args) -> Result<ResolvedWindow> {
         .clone()
         .or_else(|| tv.as_ref().map(|d: &TvDefaults| d.instrument.clone()));
 
-    let granularity = match (&args.granularity, &tv) {
-        (Some(g), _) => g.clone(),
-        (None, Some(d)) => d.granularity.clone(),
-        (None, None) => unreachable!("need_tv is true when --granularity is absent"),
-    };
-
     let start = match (&args.start, &tv) {
         (Some(s), _) => parse_utc(s).wrap_err("parse --start")?,
         (None, Some(d)) => d.start,
         (None, None) => unreachable!("need_tv is true when --start is absent"),
     };
 
-    let end = match (&args.end, &tv) {
-        (Some(e), _) => parse_utc(e).wrap_err("parse --end")?,
-        (None, Some(d)) => d.end,
-        (None, None) => unreachable!("need_tv is true when --end is absent"),
+    let end = match (&args.end, plan_expiry, &tv) {
+        (Some(e), _, _) => parse_utc(e).wrap_err("parse --end")?,
+        (None, Some(expiry), _) => expiry,
+        (None, None, Some(d)) => d.fallback_end,
+        (None, None, None) => {
+            unreachable!("need_end_from_chart is true when --end and plan expiry are both absent")
+        }
     };
 
     Ok(ResolvedWindow {
         instrument,
-        granularity,
         start,
         end,
+    })
+}
+
+/// Pull the plan's trade-expiry as a Unix epoch (seconds, UTC), if it has one.
+/// The expiry is a [`Trigger::TimeReached`] rule whose `rule_id` contains
+/// `trade-expiry` (e.g. `02-veto-trade-expiry`) — the same id the engine keys
+/// on. Returns `None` for a plan with no such rule (the caller then falls back
+/// to the chart's visible-region end).
+fn trade_expiry_epoch(plan: &TradePlan) -> Option<i64> {
+    plan.rules.iter().find_map(|rule| {
+        if !rule.rule_id.contains("trade-expiry") {
+            return None;
+        }
+        match rule.trigger {
+            Trigger::TimeReached { at_epoch } => Some(at_epoch),
+            _ => None,
+        }
     })
 }
 
@@ -291,6 +332,7 @@ fn init_tracing() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use trade_control_engine::Granularity;
 
     #[test]
     fn parses_minute_and_second_precision() {
@@ -303,5 +345,112 @@ mod tests {
     #[test]
     fn rejects_garbage_datetime() {
         assert!(parse_utc("yesterday").is_err());
+    }
+
+    /// Build a minimal `TradePlan` from JSON, with the given rules spliced in.
+    /// Plans are loaded from JSON in the real flow, so exercising serde here
+    /// also confirms the rule shapes the resolver reads match the wire form.
+    fn plan_with_rules(granularity: &str, rules_json: &str) -> TradePlan {
+        let json = format!(
+            r#"{{
+                "trade_id": "test-1",
+                "instrument": "EUR_USD",
+                "direction": "long",
+                "granularity": "{granularity}",
+                "pip_size": 0.0001,
+                "rules": {rules_json}
+            }}"#
+        );
+        serde_json::from_str(&json).expect("parse test plan")
+    }
+
+    /// A single rule JSON with the given id + a `TimeReached` trigger. The
+    /// intent is the minimal set of non-defaulted `Intent` fields.
+    fn time_rule(rule_id: &str, at_epoch: i64) -> String {
+        format!(
+            r#"{{
+                "rule_id": "{rule_id}",
+                "trigger": {{ "type": "time_reached", "at_epoch": {at_epoch} }},
+                "fire_mode": "once",
+                "intent": {{
+                    "v": 1,
+                    "id": "{rule_id}-intent",
+                    "not_after": "2027-01-01T00:00:00Z",
+                    "action": "veto",
+                    "instrument": "EUR_USD"
+                }}
+            }}"#
+        )
+    }
+
+    #[test]
+    fn extracts_trade_expiry_epoch() {
+        let expiry = Utc
+            .with_ymd_and_hms(2026, 6, 16, 15, 0, 0)
+            .unwrap()
+            .timestamp();
+        let rules = format!("[{}]", time_rule("02-veto-trade-expiry", expiry));
+        let plan = plan_with_rules("h1", &rules);
+        assert_eq!(trade_expiry_epoch(&plan), Some(expiry));
+    }
+
+    #[test]
+    fn ignores_non_expiry_time_rules() {
+        // A plan with a time rule that isn't the trade-expiry (a pause window)
+        // has no recoverable expiry.
+        let rules = format!("[{}]", time_rule("pause-start-news1", 1_780_000_000));
+        let plan = plan_with_rules("h1", &rules);
+        assert_eq!(trade_expiry_epoch(&plan), None);
+    }
+
+    #[test]
+    fn no_rules_means_no_expiry() {
+        let plan = plan_with_rules("h1", "[]");
+        assert_eq!(trade_expiry_epoch(&plan), None);
+    }
+
+    #[test]
+    fn granularity_defaults_to_plan() {
+        let plan = plan_with_rules("h1", "[]");
+        let args = base_args();
+        let gran = resolve_granularity(&args, &plan).unwrap();
+        assert_eq!(gran.engine(), Granularity::H1);
+    }
+
+    #[test]
+    fn granularity_override_matching_plan_is_accepted() {
+        let plan = plan_with_rules("h1", "[]");
+        let mut args = base_args();
+        args.granularity = Some("1h".into());
+        assert_eq!(
+            resolve_granularity(&args, &plan).unwrap().engine(),
+            Granularity::H1
+        );
+    }
+
+    #[test]
+    fn granularity_override_mismatching_plan_is_rejected() {
+        let plan = plan_with_rules("h1", "[]");
+        let mut args = base_args();
+        args.granularity = Some("5m".into());
+        let err = resolve_granularity(&args, &plan).unwrap_err().to_string();
+        assert!(err.contains("does not match"), "got: {err}");
+    }
+
+    /// `Args` with only `--plan` set; the rest at their defaults. Lets the
+    /// resolver tests flip individual flags.
+    fn base_args() -> Args {
+        Args {
+            plan: PathBuf::from("unused.json"),
+            instrument: None,
+            granularity: None,
+            source: CandleSource::TradeNation,
+            start: None,
+            end: None,
+            tv_mcp_root: None,
+            simulate: true,
+            cache_dir: None,
+            print_completions: false,
+        }
     }
 }
