@@ -13,6 +13,7 @@ pub mod intent;
 pub mod ny_clock;
 pub mod plan_eval;
 pub mod plan_state;
+pub mod retry_gate;
 pub mod rules;
 pub mod sig;
 pub mod signals;

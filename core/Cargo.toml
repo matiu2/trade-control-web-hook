@@ -16,6 +16,7 @@ subtle = "2.6.1"
 # non-test consumers via `test-support` (in `cfg(test)` the dev-dependency
 # below covers it). Kept off the default/wasm build.
 serde_json = { version = "1.0.149", optional = true }
+tracing = "0.1.44"
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 rhai = { version = "1.25.0", default-features = false, features = ["std", "wasm-bindgen", "serde"] }

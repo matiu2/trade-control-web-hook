@@ -16,7 +16,6 @@ mod cron;
 mod diag;
 mod market_blackout;
 mod market_info;
-mod retry_gate;
 mod spread_blackout;
 mod state;
 mod tick_recording;
@@ -1192,9 +1191,18 @@ pub(crate) async fn run_enter<B: Broker>(
         verified.intent.max_retries,
         trade_control_core::tunable::Tunable::Static(0)
     ) {
-        match retry_gate::evaluate(broker, store, &verified.intent, &verified.shell).await {
-            retry_gate::RetryGateOutcome::Proceed { next_attempt_no } => Some(next_attempt_no),
-            retry_gate::RetryGateOutcome::Rejected {
+        match trade_control_core::retry_gate::evaluate(
+            broker,
+            store,
+            &verified.intent,
+            &verified.shell,
+        )
+        .await
+        {
+            trade_control_core::retry_gate::RetryGateOutcome::Proceed { next_attempt_no } => {
+                Some(next_attempt_no)
+            }
+            trade_control_core::retry_gate::RetryGateOutcome::Rejected {
                 status,
                 message,
                 outcome,
@@ -1771,7 +1779,7 @@ pub(crate) async fn run_enter<B: Broker>(
             } else {
                 rlog!("entry placed id={} order={}", verified.intent.id, order_id);
                 if let Some(attempt_no) = retry_attempt_no {
-                    retry_gate::record_placement(
+                    trade_control_core::retry_gate::record_placement(
                         store,
                         &verified.intent,
                         verified.shell.time,
