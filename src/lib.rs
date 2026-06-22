@@ -1619,13 +1619,28 @@ pub(crate) async fn run_enter<B: Broker>(
                 let spread_pips = quote.spread() / pip_size;
                 let threshold = spread_blackout::elevated_threshold_pips(&resolved.instrument);
                 if spread_blackout::spread_blackout_decision(true, spread_pips, threshold) {
+                    // Name the instrument's baked normal/spike so the
+                    // operator can judge whether the block is right. Baked
+                    // figures come from the spread-sampler baseline; absent
+                    // for an uncatalogued instrument (then we only have the
+                    // flat threshold to show).
+                    let normal = match spread_blackout::baked_baseline(&resolved.instrument) {
+                        Some((low, high, median)) => format!(
+                            "{} normal spread ~{median:.1}p (seen {low:.1}–{high:.1}p)",
+                            resolved.instrument
+                        ),
+                        None => format!("{} (no baseline)", resolved.instrument),
+                    };
+                    let message = format!(
+                        "entry blocked: spread blackout — {normal}, current spread {spread_pips:.1}p > {threshold:.1}p; preventing entry for safety"
+                    );
                     rlog!(
                         "entry rejected: spread-blackout instrument={} spread={spread_pips:.1}p > {threshold:.1}p (id={})",
                         resolved.instrument,
                         verified.intent.id
                     );
                     return ActionResult::Rejected {
-                        response: Response::error("entry blocked: spread blackout", 423),
+                        response: Response::error(&message, 423),
                         outcome: "rejected: spread-blackout".into(),
                     };
                 }

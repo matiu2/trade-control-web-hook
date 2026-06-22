@@ -1195,11 +1195,12 @@ orders* during the window and re-drives them after.
 >    re-runs the real HMAC verify on the stored signed body (no fabricated
 >    auth) — confirm a cancelled order actually re-places (or correctly
 >    drops) on demo.
-> 3. **Thresholds are provisional placeholders**, not calibrated:
->    `SPREAD_BLACKOUT_ELEVATED_PIPS` (8p, System 1 reject),
->    `SPREAD_BLACKOUT_RECOVERED_PIPS` (4p, System 2/3 restore), and the
->    `clamp_widen` floor/ceiling (22p / 40p). Tune against observed
->    EUR/NZD / AUD/NZD trough spreads during the demo week.
+> 3. **Some thresholds are still provisional**: System 1's elevated cutoff
+>    is now per-instrument and baked from sampled spreads (see below), but
+>    `SPREAD_BLACKOUT_RECOVERED_PIPS` (4p, System 2/3 restore) and the
+>    `clamp_widen` floor/ceiling (22p / 40p) are still flat placeholders.
+>    Tune against observed trough spreads during the demo week, and re-bake
+>    the per-instrument table as the sample window lengthens.
 >
 > See the **Demo-validation checklist** in `TODO.md` for the step-by-step.
 
@@ -1232,15 +1233,31 @@ instrument and, if it exceeds the elevated cutoff (in pips), rejects:
 - **Window closed = zero cost.** When the marker is absent the worker
   falls through without any broker round-trip (no `get_quote` call).
 
-The elevated cutoff is a **provisional single constant**
-(`SPREAD_BLACKOUT_ELEVATED_PIPS`, 8 pips). It and the recovery cutoff
-(`SPREAD_BLACKOUT_RECOVERED_PIPS`, 4 pips) now live **together** in
-`src/spread_blackout.rs` so the hysteresis pair (`recovered < elevated`,
-so the window doesn't flap) is tuned in one place. The whole feature works
-in **pips** consistently — the cron side converts the broker's absolute
-`ask − bid` to pips via the `pip_size` baked onto each per-trade record at
-apply time. Both cutoffs are provisional — calibrate on demo before
-relying on them.
+The elevated cutoff is now **per-instrument, baked at compile time** from
+real sampled spreads (it was a flat 8-pip constant, which mis-fired badly
+for non-FX: Copper's *normal* spread is ~150 pips, so the flat 8 blocked
+every legitimate Copper entry during the window). `build.rs` reads the
+committed YAML samples from the **`spread-sampler-cron`** submodule and
+emits a per-instrument table (`(name, low, high, median)` in pips, keyed by
+the broker-canonical TradeNation name — the same `resolved.instrument` the
+gate passes). `elevated_threshold_pips(instrument)` returns
+`max(observed_high, median × SPREAD_NORMAL_MULTIPLE)` (3× normal) so it
+blocks clearly above anything seen, yet never blocks a spread within 3× of
+normal even for an instrument that hasn't spiked in the sample window. An
+instrument absent from the baseline (a fresh asset, or one with no pip
+size) falls back to the flat `SPREAD_BLACKOUT_ELEVATED_PIPS` (8 pips). The
+reject message names the instrument's baked normal/seen-range and the
+current spread. The recovery cutoff (`SPREAD_BLACKOUT_RECOVERED_PIPS`,
+4 pips) is still a flat constant and lives beside the elevated logic in
+`src/spread_blackout.rs`. The whole feature works in **pips**
+consistently.
+
+> **Re-bake cadence:** the table is only as good as the committed samples.
+> Re-running `git pull` in the submodule (the hourly cron commits new
+> sweeps) and rebuilding picks up fresh data — `cargo:rerun-if-changed` on
+> the samples dir forces a rebuild when they grow. Early bakes (a few days
+> of data) are conservative on purpose; tighten as the sample window
+> lengthens.
 
 #### System 2 — widen open stops during the window, restore after
 
