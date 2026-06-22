@@ -1,5 +1,53 @@
 # Changelog
 
+## v54 — 2026-06-22 — replay-candles: window from the replay cursor + the plan, not the visible region
+
+### Why
+
+The TradingView-defaults workflow (v47) read the *whole visible region* as the
+replay window and the granularity off the chart resolution. In practice the
+operator's natural move is to put TradingView in **replay mode at the start of
+the trade** and run `replay-candles` — at which point the chart only renders
+bars up to the replay cursor, so the *last shown candle* is the trade start, not
+some scrubbed-to right edge. And the granularity is already pinned by the signed
+plan, so reading it off the chart was a redundant source of mismatch errors.
+
+### What changed
+
+- **start = the chart's last shown candle** (`bars_range.to`, the replay
+  cursor) instead of `visible_range.from`. `--start` still overrides.
+- **end = the plan's trade-expiry** — the `TimeReached.at_epoch` of the rule
+  whose `rule_id` contains `trade-expiry` (e.g. `02-veto-trade-expiry`, the same
+  id the engine keys on). Falls back to the chart's visible-region end
+  (`visible_range.to`) when the plan has no such rule. `--end` still overrides.
+- **granularity comes from the plan** (`plan.granularity`), no longer read from
+  the chart resolution. `--granularity` is now an *override only*, and an
+  override must still match the plan's granularity (else it's refused).
+- TradingView is consulted only when something it provides is actually needed
+  (the start cursor, the symbol, or the end-fallback when the plan has no
+  expiry). A run whose end comes from the plan and whose start/instrument are
+  flagged makes no MCP call.
+
+### Breaking
+
+None to the wire format. CLI behaviour change: a bare
+`replay-candles --plan plan.json` now replays `[last-shown-candle,
+plan-trade-expiry]` instead of `[visible.from, visible.to]`, and `--granularity`
+no longer *supplies* the granularity (it only overrides). `--start`/`--end`
+override as before.
+
+### Tests
+
+`trade-control-cli` (native): `trade_expiry_epoch` extraction (found / ignores
+non-expiry time rules / none); `resolve_granularity` (defaults to plan / accepts
+a matching override / rejects a mismatching override). `tv.rs` drops the
+now-unused `resolution_to_friendly` and its tests.
+
+### Follow-up
+
+Rebuild + reinstall the `-dev` / `-staging` CLIs via the deploy scripts so the
+installed `replay-candles-<env>` picks up the new defaults.
+
 ## v53 — 2026-06-22 — Bug #13: a resolve-failed cron-engine enter no longer retires the plan
 
 ### Why
