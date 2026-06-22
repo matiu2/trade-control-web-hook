@@ -1,5 +1,71 @@
 # Changelog
 
+## v53 — 2026-06-22 — Bug #13: a resolve-failed cron-engine enter no longer retires the plan
+
+### Why
+
+A cron-engine H&S plan (`hs-nzd-chf-d12eb831`, NZD/CHF m15, 19-Jun 2026)
+fired its single-shot `05-enter` on a tiny pinbar, the resolver produced a
+degenerate zeros bracket (`trigger 0.0`, `sl 0`, R 0.0), and the worker
+correctly rejected it `resolve-failed` — **but the FSM had already
+transitioned `AwaitEntry → Done` on the same tick**, purely because the
+once-enter *trigger* fired. The pure evaluator decides phase transitions at
+fire-time and never sees the dispatch outcome; the state is persisted before
+dispatch. So a doomed enter retired the whole plan, and its three veto rules
+(`too-high`/`too-low`/`trade-expiry`, valid ~11h longer) stopped being
+evaluated. No loss here (the plan held no position), but on a plan that *had*
+opened a position an abandoned `close-positions` veto would be a missed
+protective exit.
+
+Linked Finding B: `run_enter` resolves **before** the `needs_golden` candle
+gate, so a false-golden tiny pinbar (`signal_high ≈ signal_low`) fails resolve
+first — which is why the log showed `resolve-failed` rather than
+`needs-golden`. The engine FSM also didn't pre-gate `needs_golden`, so a
+non-golden bar could fire the detector.
+
+### What changed
+
+- **Engine FSM pre-flight (`engine/src/evaluate.rs`).** A `PinePattern`
+  (single-shot) enter is now pre-flighted before it fires/latches/retires the
+  spine, via the new pure `pine_entry_dispatchable`:
+  1. the candle-quality gate (`needs_golden`/`needs_confirmed` vs the latched
+     signal flags — `None`/`false` both reject), and
+  2. bracket resolution (`Resolved::from_intent` on the signal-folded shell).
+  If either fails it's a **decline-this-bar** (stay `AwaitEntry`), not a
+  `Done`. Both checks are pure and recompute identically on replay; the worker
+  still re-runs its own gates + resolution on dispatch (this is a pre-flight,
+  not a replacement — it never sees account caps / cooldown / retry /
+  `allow_entry`).
+- **Scope is `PinePattern`-only.** The M/W heartbeat enter is untouched — its
+  resolution and by-design `NotArmedYet` decline are owned by
+  `run_enter → maybe_update_mw_state`, so pre-resolving it in the FSM would
+  wrongly suppress the heartbeat.
+
+### Breaking
+
+None. Pure-FSM behaviour change only; no wire-format, KV, or signed-field
+change.
+
+### Tests
+
+`engine` crate (native): a resolvable Pine enter still fires + `Done`
+(unchanged); an unresolvable bracket fires the detector but does **not**
+retire the plan (phase stays `AwaitEntry`, enter doesn't latch); a
+`close-positions` veto crossed *after* a resolve-failed enter still fires
+(acceptance criterion 3); a `needs_golden` enter declines on a non-golden bar;
+the M/W heartbeat is not pre-flighted; plus a direct unit test of
+`pine_entry_dispatchable`. The four pre-existing Pine fixtures were given
+real signal-anchored geometry (a bare no-geometry enter would now decline at
+resolve).
+
+### Follow-up
+
+Finding B1 vs B2 (was the surfacing pinbar truly non-golden upstream, or did
+Pine stamp a false `golden:1`?) is decided by the `ticks/` R2 object, not by
+this change. This fix makes either case safe — a non-golden *or* unresolvable
+bar now declines without retiring the plan — but if B2 holds, the Pine source
+still wants the Bug #10-family fix separately.
+
 ## v52 — 2026-06-22 — Bug #12: continuous at-entry too-low/too-high enforcement
 
 ### Why

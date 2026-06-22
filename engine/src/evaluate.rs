@@ -47,6 +47,16 @@
 //! `signal_confirmed`/`recent_*`/…) on the [`FiredIntent`], so the dispatched
 //! enter resolves against the *pattern* extremes exactly as the TV alert's
 //! `{{plot(...)}}` substitutions did.
+//!
+//! Before a Pine entry latches + retires the spine it is **pre-flighted**
+//! ([`pine_entry_dispatchable`]): the candle-quality gate
+//! (`needs_golden`/`needs_confirmed`) and bracket resolution
+//! ([`trade_control_core::intent::Resolved::from_intent`]) must both pass —
+//! both pure here. A bar that fires the detector but can't pass these is a
+//! *decline this bar* (stay `AwaitEntry`), not a terminal `Done`. Without this,
+//! a `resolve-failed` enter (e.g. a false-golden tiny pinbar resolving to a
+//! degenerate bracket) tore the plan down and abandoned its still-valid vetos
+//! — bug #13.
 
 use chrono::{DateTime, Utc};
 
@@ -395,6 +405,27 @@ fn evaluate_entry(
         }
     };
 
+    // Pre-flight a `PinePattern` enter before firing (bug #13). The detector
+    // firing is necessary but not sufficient: the candle-quality gate
+    // (`needs_golden`/`needs_confirmed`) and bracket resolution still have to
+    // pass, and both are **pure** here (the latched signal carries the flags;
+    // `Resolved::from_intent` needs only intent + shell + pip_size). If either
+    // fails, this is a *decline this bar*, not a terminal event — return without
+    // firing so the plan stays in `AwaitEntry`, its vetos keep ticking, and a
+    // later bar can re-form a valid pattern. (A false-golden tiny pinbar with
+    // `signal_high ≈ signal_low` resolves to a degenerate zeros bracket; the old
+    // code fired + went `Done` regardless, abandoning the live vetos.)
+    //
+    // Scope is deliberately `PinePattern` only: the M/W heartbeat's resolution
+    // (and its by-design `NotArmedYet` decline) is owned by the worker's
+    // `run_enter → maybe_update_mw_state`, so pre-resolving it here would
+    // wrongly suppress the heartbeat. `signal.is_some()` ⇔ a Pine fire.
+    if let Some(sig) = &signal
+        && !pine_entry_dispatchable(&rule.intent, candle, sig, plan.pip_size)
+    {
+        return;
+    }
+
     // Retest gate: if the plan carries a retest rule, a retest must have been
     // seen in (break_close_at, this candle]. The stamp is persisted, so a
     // retest that closed in an earlier tick still counts.
@@ -437,6 +468,48 @@ fn eval_pine_entry(
         return None;
     }
     Some(sig)
+}
+
+/// Is a fired `PinePattern` enter actually dispatchable on this bar — i.e. would
+/// the worker's `run_enter` accept it rather than decline it? Returns `false`
+/// for the two **pure, recomputable-here** rejections that the FSM must treat as
+/// "decline this bar, stay armed" (not as a terminal fire):
+///
+/// 1. The candle-quality gate: `needs_golden` / `needs_confirmed` on the intent
+///    vs the latched signal's flags. Mirrors `candle_gate::evaluate` in the
+///    worker (which keys off the same flags, folded onto the shell). Checking
+///    it here stops a non-golden bar from firing + retiring the plan when the
+///    operator demanded golden.
+/// 2. Bracket resolution: `Resolved::from_intent` on the signal-folded shell. A
+///    degenerate signal (e.g. a false-golden tiny pinbar with
+///    `signal_high ≈ signal_low`) resolves to an inconsistent / zeros bracket
+///    and the worker rejects it `resolve-failed`. Pre-checking it here keeps a
+///    `resolve-failed` bar from tearing the plan (and its live vetos) down.
+///
+/// Pure: the shell, the gate flags, and `from_intent` are all deterministic
+/// functions of the inputs, so this recomputes identically on replay. The
+/// worker still re-runs its own gates + resolution on dispatch — this is a
+/// *pre-flight*, not a replacement (it never sees the account caps, cooldown,
+/// retry, or `allow_entry` script the worker also applies).
+fn pine_entry_dispatchable(
+    intent: &trade_control_core::intent::Intent,
+    candle: &Candle,
+    sig: &LatchedSignal,
+    pip_size: f64,
+) -> bool {
+    // Candle-quality gate — `None`/`false` both fail (conservative reject),
+    // matching `candle_gate::evaluate`.
+    if intent.needs_golden && !sig.golden {
+        return false;
+    }
+    if intent.needs_confirmed && !sig.signal_confirmed {
+        return false;
+    }
+    // Bracket resolution against the same signal-folded shell the worker
+    // dispatches. An `Err` (degenerate geometry, below-min-R, out-of-range, …)
+    // is a decline-this-bar, not a fire.
+    let shell = trade_control_core::intent::Shell::from_candle_and_signal(candle, sig);
+    trade_control_core::intent::Resolved::from_intent(intent, &shell, pip_size).is_ok()
 }
 
 /// Stamp `retest_seen_at` if this candle satisfies the retest trendline
@@ -841,6 +914,42 @@ mod tests {
             trigger,
             fire_mode,
             intent: intent(action),
+        }
+    }
+
+    /// A complete short H&S `PinePattern` enter rule with signal-anchored
+    /// geometry that **resolves** against the `bearish_pinbar_window`
+    /// (signal_high 1.30 / signal_low 1.10): stop-entry at signal_low + 1 pip,
+    /// SL at signal_high + 1 pip, absolute TP below for ≥ 1R. Mirrors the real
+    /// incident's enter shape so the bug #13 pre-flight (gate + resolve) has
+    /// something real to act on. `needs_golden` toggles the candle-quality gate.
+    fn pine_enter_rule(
+        pattern: Option<SignalKind>,
+        dir: Direction,
+        needs_golden: bool,
+    ) -> ConditionRule {
+        use trade_control_core::intent::{EntrySpec, PriceAnchor, PriceRef, TakeProfit};
+        let mut intent = intent(Action::Enter);
+        intent.direction = Some(dir);
+        intent.entry = Some(EntrySpec::Stop {
+            from: PriceAnchor::SignalLow,
+            offset_pips: 1.0,
+            at: None,
+            on_too_close: None,
+        });
+        intent.stop_loss = Some(PriceRef::Anchored {
+            from: PriceAnchor::SignalHigh,
+            offset_pips: 1.0,
+        });
+        // Absolute TP below the entry for a short, ≥ 1R from the ~0.20 SL
+        // distance (entry ≈ 1.10, SL ≈ 1.30): 0.90 gives R ≈ 1.0.
+        intent.take_profit = Some(TakeProfit::Anchored(PriceRef::Absolute { absolute: 0.90 }));
+        intent.needs_golden = needs_golden;
+        ConditionRule {
+            rule_id: "05-enter".into(),
+            trigger: Trigger::PinePattern { pattern, dir },
+            fire_mode: FireMode::Once,
+            intent,
         }
     }
 
@@ -1798,15 +1907,9 @@ mod tests {
     #[test]
     fn pine_short_entry_fires_with_signal_geometry() {
         // H&S short: PinePattern{dir: Short} single-shot enter, in AwaitEntry.
-        let p = plan(vec![rule(
-            "05-enter",
-            Trigger::PinePattern {
-                pattern: None,
-                dir: Direction::Short,
-            },
-            FireMode::Once,
-            Action::Enter,
-        )]);
+        // Carries real signal-anchored geometry so the bug #13 resolve pre-flight
+        // passes (a bare no-geometry enter would now decline at resolve).
+        let p = plan(vec![pine_enter_rule(None, Direction::Short, false)]);
         let window = bearish_pinbar_window();
         let prior = seed_at(Phase::AwaitEntry, "2026-06-16T10:00:00Z");
         // Only the last (pinbar) candle is new this tick; the whole window is the
@@ -1832,15 +1935,7 @@ mod tests {
     fn pine_entry_does_not_fire_for_opposite_direction_plan() {
         // Same bearish-pinbar window, but the plan is a LONG H&S — the latched
         // signal is Short, so the entry must not fire.
-        let p = plan(vec![rule(
-            "05-enter",
-            Trigger::PinePattern {
-                pattern: None,
-                dir: Direction::Long,
-            },
-            FireMode::Once,
-            Action::Enter,
-        )]);
+        let p = plan(vec![pine_enter_rule(None, Direction::Long, false)]);
         let window = bearish_pinbar_window();
         let prior = seed_at(Phase::AwaitEntry, "2026-06-16T10:00:00Z");
         let eval = run_window(&p, &prior, &window[3..], &window);
@@ -1851,14 +1946,10 @@ mod tests {
     #[test]
     fn pine_entry_kind_filter_blocks_mismatched_pattern() {
         // The window prints a pinbar; a plan demanding a Tweezer must not fire.
-        let p = plan(vec![rule(
-            "05-enter",
-            Trigger::PinePattern {
-                pattern: Some(SignalKind::Tweezer),
-                dir: Direction::Short,
-            },
-            FireMode::Once,
-            Action::Enter,
+        let p = plan(vec![pine_enter_rule(
+            Some(SignalKind::Tweezer),
+            Direction::Short,
+            false,
         )]);
         let window = bearish_pinbar_window();
         let prior = seed_at(Phase::AwaitEntry, "2026-06-16T10:00:00Z");
@@ -1886,15 +1977,7 @@ mod tests {
         };
         let p = plan(vec![
             rule("04-prep-retest", neckline_up, FireMode::Once, Action::Prep),
-            rule(
-                "05-enter",
-                Trigger::PinePattern {
-                    pattern: None,
-                    dir: Direction::Short,
-                },
-                FireMode::Once,
-                Action::Enter,
-            ),
+            pine_enter_rule(None, Direction::Short, false),
         ]);
         let window = bearish_pinbar_window();
         // break_close set, but the pinbar bar (high 1.30) DOES straddle 1.25 with
@@ -1907,6 +1990,154 @@ mod tests {
             eval.fired.is_empty(),
             "entry blocked: no retest up-cross stamped"
         );
+    }
+
+    // ===== Bug #13: a resolve-failed / gate-failed Pine enter must not retire =====
+
+    /// A short Pine enter whose bracket **cannot resolve** on the firing bar: the
+    /// absolute TP sits *above* the entry (wrong side for a short →
+    /// `EntryOutsideRange`). The detector still fires the pinbar, but the worker
+    /// would reject it `resolve-failed`. The same `pine_enter_rule` geometry,
+    /// only the TP flipped to the wrong side.
+    fn pine_enter_rule_unresolvable_tp() -> ConditionRule {
+        use trade_control_core::intent::{PriceRef, TakeProfit};
+        let mut r = pine_enter_rule(None, Direction::Short, false);
+        // TP above the ~1.10 entry is invalid for a short — out of the SL..TP
+        // range, so resolution fails.
+        r.intent.take_profit = Some(TakeProfit::Anchored(PriceRef::Absolute { absolute: 1.50 }));
+        r
+    }
+
+    #[test]
+    fn pine_enter_resolve_failed_does_not_retire_plan() {
+        // THE bug #13 regression. The pinbar fires the detector, but the bracket
+        // can't resolve → the plan must NOT go Done: nothing fires, phase stays
+        // AwaitEntry, so the vetos keep ticking and a later bar can re-form a
+        // valid pattern.
+        let p = plan(vec![pine_enter_rule_unresolvable_tp()]);
+        let window = bearish_pinbar_window();
+        let prior = seed_at(Phase::AwaitEntry, "2026-06-16T10:00:00Z");
+        let eval = run_window(&p, &prior, &window[3..], &window);
+        assert!(eval.fired.is_empty(), "an unresolvable enter must not fire");
+        assert!(
+            !eval.done,
+            "a resolve-failed enter must not retire the plan"
+        );
+        assert_eq!(
+            eval.new_state.phase,
+            Phase::AwaitEntry,
+            "phase stays AwaitEntry, not Done"
+        );
+        assert!(
+            !eval.new_state.fired.contains("05-enter"),
+            "the enter rule does not latch on a resolve-failure"
+        );
+    }
+
+    #[test]
+    fn veto_still_fires_after_a_resolve_failed_pine_enter() {
+        // Acceptance criterion 3: a close-positions veto crossed *after* a
+        // resolve-failed enter still fires — the plan wasn't abandoned. Tick 1's
+        // pinbar can't resolve (stays AwaitEntry); tick 2 crosses the veto level
+        // and the guard fires + finishes the plan.
+        let veto = rule(
+            "01-veto-too-high",
+            Trigger::HorizontalCross {
+                level: 1.40,
+                dir: CrossDir::Up,
+                bar: BarEvent::Intrabar,
+            },
+            FireMode::Once,
+            Action::Veto,
+        );
+        let p = plan(vec![pine_enter_rule_unresolvable_tp(), veto]);
+        let window = bearish_pinbar_window();
+        let prior = seed_at(Phase::AwaitEntry, "2026-06-16T10:00:00Z");
+
+        // Tick 1: the pinbar fires the detector but the bracket can't resolve →
+        // no fire, plan still alive.
+        let eval1 = run_window(&p, &prior, &window[3..], &window);
+        assert!(
+            eval1.fired.is_empty(),
+            "resolve-failed enter: nothing fires"
+        );
+        assert!(!eval1.done, "plan survives the resolve-failed enter");
+
+        // Tick 2: a later bar crosses the veto level (high 1.41 > 1.40) → the
+        // guard fires and finishes the plan. Had the plan gone Done in tick 1,
+        // this veto would have been silently abandoned.
+        let later = candle("2026-06-16T12:00:00Z", 1.30, 1.41, 1.30, 1.405);
+        let eval2 = run_window(&p, &eval1.new_state, &[later], &[later]);
+        let ids: Vec<&str> = eval2.fired.iter().map(|f| f.rule_id.as_str()).collect();
+        assert!(
+            ids.contains(&"01-veto-too-high"),
+            "the veto fires after a resolve-failed enter, got {ids:?}"
+        );
+        assert!(eval2.done, "the terminal veto finishes the plan");
+    }
+
+    #[test]
+    fn pine_enter_needs_golden_declines_on_non_golden_bar() {
+        // Finding B1: a `needs_golden` Pine enter must not fire on a bar whose
+        // latched signal isn't golden — and, like resolve-failure, the decline is
+        // non-terminal (stay AwaitEntry), not a Done. The short back-window here
+        // has no ATR, so the pinbar's latch is non-golden.
+        let p = plan(vec![pine_enter_rule(None, Direction::Short, true)]);
+        let window = bearish_pinbar_window();
+        let prior = seed_at(Phase::AwaitEntry, "2026-06-16T10:00:00Z");
+        let eval = run_window(&p, &prior, &window[3..], &window);
+        assert!(
+            eval.fired.is_empty(),
+            "needs_golden blocks a non-golden pinbar"
+        );
+        assert!(
+            !eval.done,
+            "a needs_golden decline must not retire the plan"
+        );
+        assert_eq!(eval.new_state.phase, Phase::AwaitEntry);
+    }
+
+    #[test]
+    fn pine_entry_dispatchable_unit() {
+        // Pin the pure helper directly. Golden gate, confirmed gate, and resolve
+        // each gate the fire; a resolvable, gate-passing intent is dispatchable.
+        let window = bearish_pinbar_window();
+        let last = window[3];
+        let sig = latched_signal_at(&window, 3, &DetectorConfig::pine_defaults(Granularity::H1))
+            .expect("the window prints a latched signal on the pinbar");
+
+        // Resolvable, no gates → dispatchable.
+        let ok = pine_enter_rule(None, Direction::Short, false).intent;
+        assert!(pine_entry_dispatchable(&ok, &last, &sig, 0.0001));
+
+        // needs_golden on a non-golden latch → not dispatchable.
+        let mut golden = ok.clone();
+        golden.needs_golden = true;
+        assert!(!sig.golden, "fixture precondition: latch is non-golden");
+        assert!(!pine_entry_dispatchable(&golden, &last, &sig, 0.0001));
+
+        // Unresolvable bracket → not dispatchable.
+        let bad = pine_enter_rule_unresolvable_tp().intent;
+        assert!(!pine_entry_dispatchable(&bad, &last, &sig, 0.0001));
+    }
+
+    #[test]
+    fn mw_heartbeat_enter_is_not_preflighted() {
+        // The bug #13 pre-flight is PinePattern-only. An M/W heartbeat enter (no
+        // signal) must still fire every bar even though its bare intent carries
+        // no resolvable geometry — the worker's run_enter owns M/W resolution and
+        // its by-design NotArmedYet decline.
+        let p = plan(vec![rule(
+            "05-enter",
+            Trigger::MwEveryBar,
+            FireMode::EveryBar,
+            Action::Enter,
+        )]);
+        let prior = seed_at(Phase::AwaitEntry, "2026-06-16T11:00:00Z");
+        let c = candle("2026-06-16T12:00:00Z", 1.0, 1.0, 1.0, 1.0);
+        let eval = run(&p, &prior, &[c]);
+        assert_eq!(eval.fired.len(), 1, "M/W heartbeat still fires every bar");
+        assert_eq!(eval.fired[0].rule_id, "05-enter");
     }
 
     // ===== PlanEval::is_noteworthy — the no-op-tick trim predicate =====

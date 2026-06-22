@@ -2128,6 +2128,18 @@ leg, all MID-price:
    decline apart from a real geometry bug. (Internally: the three arming
    gates return `ResolveError::NotArmedYet`.)
 
+   **The cron-engine H&S `PinePattern` entry declines the same way.** A bar
+   that fires the candle detector but whose enter can't pass the
+   `needs_golden`/`needs_confirmed` gate or can't resolve to a valid bracket
+   (e.g. a false-golden tiny pinbar with `signal_high ≈ signal_low` →
+   degenerate geometry) is **declined this bar** — the plan stays in
+   `AwaitEntry`, its veto rules keep being evaluated, and a later bar can
+   re-form a valid pattern. It does **not** retire the plan. (Before this —
+   bug #13 — a single-shot enter that fired the detector retired the spine to
+   `Done` *regardless* of the dispatch outcome, silently abandoning the
+   still-valid `close-positions` vetos. The pre-flight is the pure
+   `pine_entry_dispatchable` in `engine/src/evaluate.rs`.)
+
 **4-point paths arm immediately.** Both live confirmations above exist only
 because a 3-anchor path doesn't yet know the right tower — it discovers it
 bar by bar. When the operator draws the **4th anchor (D — right shoulder)**
