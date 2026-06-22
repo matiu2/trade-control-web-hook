@@ -153,25 +153,35 @@ async fn main() -> Result<()> {
         return Err(eyre!("end ({end}) must be after start ({start})"));
     }
 
+    // The engine evaluates a `TimeReached` (trade-expiry) against each candle's
+    // *open* time, so a trade-expiry at `end` only fires once a bar *opens* at
+    // or after `end` — one bar past it. Pull that extra bar so the expiry
+    // actually fires (without it the window stops one bar short and the plan
+    // never retires). Harmless when there's no expiry: the engine stops at the
+    // first `done`, and trailing candles are ignored.
+    let pull_end = end + Duration::seconds(gran.engine().seconds());
+
     tracing::info!(
         instrument = %symbol,
         granularity = %gran_label,
         source = ?args.source,
         start = %brisbane::bne(start),
         end = %brisbane::bne(end),
+        pull_end = %brisbane::bne(pull_end),
         "pulling candles (times in Brisbane, UTC+10)"
     );
-    let candles = candles::pull(args.source, &symbol, gran, start, end, args.cache_dir).await?;
+    let candles =
+        candles::pull(args.source, &symbol, gran, start, pull_end, args.cache_dir).await?;
     if candles.is_empty() {
         return Err(eyre!(
-            "no candles returned for {symbol} {gran_label} in [{start}, {end}]"
+            "no candles returned for {symbol} {gran_label} in [{start}, {pull_end}]"
         ));
     }
     tracing::info!(count = candles.len(), "pulled candles");
 
     // Keep the state TTL past the window so nothing expires mid-replay.
     let expires_at = end + Duration::days(365);
-    let replay = replay::run(&plan, &candles, expires_at);
+    let replay = replay::run(&plan, &candles, gran.engine(), expires_at);
 
     print!("{}", report::render(&plan, &replay, args.simulate));
     Ok(())

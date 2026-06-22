@@ -7,9 +7,11 @@
 //! together with the candles that followed it, so the caller can simulate the
 //! fill.
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Duration, Utc};
 use trade_control_engine::Candle as EngineCandle;
-use trade_control_engine::{FiredIntent, PlanState, TradePlan, evaluate_plan, seed_plan_state};
+use trade_control_engine::{
+    FiredIntent, Granularity, PlanState, TradePlan, evaluate_plan, seed_plan_state,
+};
 
 /// One fired intent plus the forward candle path needed to simulate its fill.
 pub struct Fire {
@@ -33,10 +35,16 @@ pub struct Replay {
 /// rules to have a `last_close` reference before the first live tick.
 const SEED_BARS: usize = 10;
 
-/// Replay `plan` over `candles` (ascending, the pulled window). `expires_at`
-/// stamps the state TTL on each tick (kept past the window so nothing expires
-/// mid-replay).
-pub fn run(plan: &TradePlan, candles: &[EngineCandle], expires_at: DateTime<Utc>) -> Replay {
+/// Replay `plan` over `candles` (ascending, the pulled window). `granularity`
+/// is the bar size, used to derive each tick's `now` (a closed bar's close time
+/// = its open time + one bar). `expires_at` stamps the state TTL on each tick
+/// (kept past the window so nothing expires mid-replay).
+pub fn run(
+    plan: &TradePlan,
+    candles: &[EngineCandle],
+    granularity: Granularity,
+    expires_at: DateTime<Utc>,
+) -> Replay {
     if candles.is_empty() {
         return Replay {
             fires: Vec::new(),
@@ -45,6 +53,8 @@ pub fn run(plan: &TradePlan, candles: &[EngineCandle], expires_at: DateTime<Utc>
             warnings: Vec::new(),
         };
     }
+
+    let bar = Duration::seconds(granularity.seconds());
 
     let seed_end = SEED_BARS.min(candles.len());
     let mut state = seed_plan_state(plan, &candles[..seed_end], expires_at);
@@ -58,7 +68,11 @@ pub fn run(plan: &TradePlan, candles: &[EngineCandle], expires_at: DateTime<Utc>
     for i in seed_end..candles.len() {
         let new = &candles[i..=i];
         let detector_window = &candles[..=i];
-        let now = candles[i].time;
+        // Candle timestamps are bar *open* times; the live cron tick that first
+        // observes this closed bar fires at (or after) its *close*. Use the
+        // close time as `now` so wall-clock-derived state (TTLs, logging) lines
+        // up with the live worker, which ticks on wall-clock, not bar-open.
+        let now = candles[i].time + bar;
 
         let eval = evaluate_plan(plan, &state, new, detector_window, now, expires_at);
         state = eval.new_state;
@@ -124,7 +138,7 @@ mod tests {
             .collect();
         let expires = Utc.timestamp_opt(99 * 3600, 0).unwrap();
 
-        let replay = run(&plan, &candles, expires);
+        let replay = run(&plan, &candles, Granularity::H1, expires);
 
         assert!(replay.fires.is_empty(), "no rules → no fires");
         assert!(!replay.done);
@@ -145,7 +159,76 @@ mod tests {
             rules: Vec::new(),
             shadow: false,
         };
-        let replay = run(&plan, &[], Utc.timestamp_opt(0, 0).unwrap());
+        let replay = run(
+            &plan,
+            &[],
+            Granularity::H1,
+            Utc.timestamp_opt(0, 0).unwrap(),
+        );
         assert!(replay.fires.is_empty());
+    }
+
+    /// A trade-expiry `TimeReached` fires on the first candle whose *open* time
+    /// is at-or-past the expiry epoch (the engine evaluates `TimeReached`
+    /// against `candle.time`, the bar open). So the window must include a candle
+    /// opening at-or-after the expiry — one bar past it — for the plan to
+    /// finish. This is the NZD/CHF boundary case: pulling only up to the expiry
+    /// left the last bar opening one bar *short*, so expiry never fired.
+    #[test]
+    fn trade_expiry_fires_when_a_bar_opens_at_expiry() {
+        let expiry = 15 * 3600;
+        let candles: Vec<Candle> = (0..=15).map(|i| candle(i * 3600, 1.30)).collect();
+        // The last bar opens at exactly `expiry` → `candle.time >= expiry`.
+        assert_eq!(candles.last().unwrap().time.timestamp(), expiry);
+        let replay = run(&expiry_plan(expiry), &candles, Granularity::H1, expires());
+        assert!(
+            replay.done,
+            "a bar opening at the expiry should finish the plan"
+        );
+        assert_eq!(replay.fires.len(), 1);
+        assert_eq!(replay.fires[0].fired.rule_id, "02-veto-trade-expiry");
+    }
+
+    /// The converse: when the window stops one bar *short* of the expiry (last
+    /// bar opens before it), nothing fires — which is exactly why the window
+    /// resolver extends the pull end past the plan's trade-expiry.
+    #[test]
+    fn trade_expiry_does_not_fire_a_bar_short() {
+        let expiry = 15 * 3600;
+        let candles: Vec<Candle> = (0..15).map(|i| candle(i * 3600, 1.30)).collect();
+        assert!(candles.last().unwrap().time.timestamp() < expiry);
+        let replay = run(&expiry_plan(expiry), &candles, Granularity::H1, expires());
+        assert!(!replay.done);
+        assert!(replay.fires.is_empty());
+    }
+
+    fn expires() -> DateTime<Utc> {
+        Utc.timestamp_opt(99 * 3600, 0).unwrap()
+    }
+
+    /// A plan carrying a single `02-veto-trade-expiry` `TimeReached` rule.
+    fn expiry_plan(at_epoch: i64) -> TradePlan {
+        serde_json::from_str(&format!(
+            r#"{{
+                "trade_id": "t-expiry",
+                "instrument": "EUR_USD",
+                "direction": "short",
+                "granularity": "h1",
+                "pip_size": 0.0001,
+                "rules": [{{
+                    "rule_id": "02-veto-trade-expiry",
+                    "trigger": {{ "type": "time_reached", "at_epoch": {at_epoch} }},
+                    "fire_mode": "once",
+                    "intent": {{
+                        "v": 1,
+                        "id": "expiry-intent",
+                        "not_after": "2099-01-01T00:00:00Z",
+                        "action": "veto",
+                        "instrument": "EUR_USD"
+                    }}
+                }}]
+            }}"#
+        ))
+        .expect("parse plan")
     }
 }

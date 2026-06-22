@@ -1,5 +1,48 @@
 # Changelog
 
+## v55 — 2026-06-22 — replay-candles: pull one bar past the trade-expiry so it actually fires
+
+### Why
+
+After v54, a bare `replay-candles --plan plan.json` resolved its window end to
+the plan's trade-expiry — but the replay then reported `0 fires` / `Done: false`
+even on a plan whose trade-expiry clearly should have retired it (NZD/CHF M15,
+expiry 19:30 BNE). The engine evaluates a `TimeReached` (trade-expiry) trigger
+against each candle's **open** time (`candle.time >= at_epoch`, `evaluate.rs`).
+With the window ending *exactly at* the expiry, the last bar *opened* one bar
+short of it (e.g. opens 19:15, expiry 19:30), so no candle ever satisfied the
+predicate and the expiry never fired.
+
+### What changed
+
+- **Pull one granularity bar past the window end** (`pull_end = end + 1 bar`) so
+  a candle that *opens at* the trade-expiry is fetched and evaluated. The
+  displayed/`expires_at` `end` is unchanged; only the candle-pull range extends.
+  Harmless when there's no expiry — the engine stops at the first `done` and
+  ignores trailing candles. The extra bar is logged as `pull_end`.
+- **Replay `now` is the bar's close time** (`candle.time + granularity`) instead
+  of its open time, so wall-clock-derived state (TTLs, logging) matches the live
+  worker, which ticks on wall-clock rather than bar-open. (Note: this does *not*
+  affect `TimeReached`, which the engine keys off `candle.time` directly — the
+  window-extension above is what fixes the expiry firing.)
+
+### Breaking
+
+None. CLI behaviour fix only; no wire-format / KV / signed-field change.
+
+### Tests
+
+`trade-control-cli` (native): a trade-expiry whose epoch a bar opens at fires +
+finishes the plan; the converse (window a bar short → no fire) confirms the
+need for the extension. Existing replay tests updated for the new `run`
+signature (now takes the granularity).
+
+### Verified
+
+Re-ran the NZD/CHF M15 plan (`hs-nzd-chf-9457e0d7`): now reports
+`02-veto-trade-expiry Veto @ 19:30` / `Done: true` / `1 fire`, where before it
+was `0 fires` / `Done: false`.
+
 ## v54 — 2026-06-22 — replay-candles: window from the replay cursor + the plan, not the visible region
 
 ### Why
