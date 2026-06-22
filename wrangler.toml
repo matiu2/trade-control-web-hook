@@ -3,7 +3,12 @@
 # and R2 bucket, separate from staging/prod. The staging branch carries a
 # staging-pointed wrangler.toml; promotion to prod uses a prod-pointed one.
 # See DEPLOYED.md for the branch -> environment model.
-name = "trade-control-web-hook"
+#
+# Naming: every environment now carries a suffix (`-dev` / `-staging` /
+# `-prod`). The old no-suffix worker `trade-control-web-hook` + its R2 bucket
+# `trade-control-recording` are DEPRECATED — left running only while last
+# week's trades are journaled, then deleted. Do not deploy to them.
+name = "trade-control-web-hook-dev"
 main = "build/worker/shim.mjs"
 compatibility_date = "2026-03-13"
 workers_dev = true
@@ -17,6 +22,8 @@ enabled = true
 [vars]
 
 # DEV KV namespace — distinct from staging/prod so state never collides.
+# Kept across the worker rename (same dev env, new name) so in-flight engine
+# plan state survives. Do NOT point this at the staging/prod KV.
 [[kv_namespaces]]
 binding = "TRADE_CONTROL_KV"
 id = "e4f27179248e451daf8cf68a98c47e5b"
@@ -25,11 +32,14 @@ id = "e4f27179248e451daf8cf68a98c47e5b"
 # logs). The worker writes one JSON object per intent request here; if this
 # binding is absent the worker logs one line and skips recording (fail-soft
 # — trading is unaffected). Create with:
-#   wrangler r2 bucket create trade-control-recording
+#   wrangler r2 bucket create trade-control-recording-dev
 # The deploying API token needs "Workers R2 Storage: Edit".
+# NOTE: this is a fresh bucket for the suffixed dev env. The old no-suffix
+# `trade-control-recording` bucket is deprecated (kept until last week's
+# trades are journaled, then deleted).
 [[r2_buckets]]
 binding = "TRADE_CONTROL_R2"
-bucket_name = "trade-control-recording"
+bucket_name = "trade-control-recording-dev"
 
 # Scheduled (cron) trigger. Fires the `scheduled` event in `src/cron.rs`.
 # A SINGLE */15 trigger drives every job; each self-gates on `now`:

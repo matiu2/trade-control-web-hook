@@ -1675,12 +1675,17 @@ There are three environments, one per git branch, each an isolated worker
 environment. See `DEPLOYED.md` for the full branch → environment model and
 the staging → prod promotion rule.
 
+**Every environment carries a suffix** (`-dev` / `-staging` / `-prod`). The
+old no-suffix worker `trade-control-web-hook` + its R2 bucket
+`trade-control-recording` are deprecated — kept running only until last
+week's demo trades are journaled, then deleted. Do not deploy to them.
+
 Use the per-environment deploy script — **never** call `wrangler deploy`
 directly for a real deploy, because the scripts also rebuild and install
 the matching CLIs:
 
 ```sh
-git checkout main    && ./deploy-dev.sh       # dev     -> trade-control-web-hook
+git checkout main    && ./deploy-dev.sh       # dev     -> trade-control-web-hook-dev
 git checkout staging && ./deploy-staging.sh   # staging -> trade-control-web-hook-staging
 # ./deploy-live.sh is added at the first prod promotion.
 ```
@@ -1697,13 +1702,12 @@ Each script:
 4. Installs the binaries into `~/.cargo/bin` under **suffixed names** —
    `trade-control-staging`, `tv-arm-staging`, `tv-news-staging` (and the
    `-dev` set). So you pick an environment by which command you run; no env
-   var to set. The webhook the armed TradingView alerts POST to is baked
-   into `tv-arm-<env>` too — there is no longer a hard-coded URL in the JS
-   template.
+   var to set. The worker URL each `tv-arm-<env>` registers its `TradePlan`
+   against is baked in the same way.
 
 `deploy-lib.sh` holds the shared logic; the per-env wrappers hold only the
-branch + URL (one place each), so next week's "`web-hook` becomes prod, cut
-a fresh `web-hook-dev`" remap is a one-line edit per script.
+branch + URL (one place each), so standing up a new environment (e.g. the
+upcoming `-prod`) is a one-script change.
 
 > The legacy top-level `deploy.sh` is deprecated and now just points at the
 > per-env scripts.
@@ -1711,9 +1715,9 @@ a fresh `web-hook-dev`" remap is a one-line edit per script.
 ### Per-environment Pine versions
 
 The Pine source (`pine-scripts/candle-signals-v2.pine`) carries **no
-webhook URL** — the URL is baked into `tv-arm-<env>` and substituted into
-the alert at create time. So one Pine source serves every environment; what
-differs per environment is **which Pine *version*** a chart runs.
+webhook URL**. One Pine source serves every environment; what differs per
+environment is **which Pine *version*** a chart runs, so each `tv-arm-<env>`
+reads the study version that matches its worker's server-side detector.
 
 To pin a Pine version per environment, run **two studies on the chart with
 distinct base titles** — e.g. `Candle Signals v24` and `Candle Signals
@@ -1811,65 +1815,62 @@ cargo run -p tv-arm -- \
   --max-retries 5 \                   # multi-shot re-entry cap (default 5; pass 0 for single-shot)
   --require-confirmation \            # require a confirmed signal candle on entry (independent of golden)
   --blackout-close close \            # market-hours blackout: also flatten an open position if caught in the close→open gap (default: cancel = cancel the resting order only)
-  --create-alerts \                   # POST to TradingView; omit to only write the signed bundle to disk
-  --register-plan \                   # experimental: also register one signed TradePlan with the server-side engine
-  --shadow                            # register observe-only: engine evaluates + logs, but never places orders (safe parallel run)
+  --register-plan \                   # arm the trade: register one signed TradePlan with the server-side engine
+  --shadow                            # register observe-only: engine evaluates + logs, but never places orders (safe dry watch)
 ```
 
 Run `tv-arm --help` for the full flag surface — it has diverged from the
 deprecated Python script.
 
-### Server-side engine registration (`--register-plan`, experimental)
+### Server-side engine registration (`--register-plan`)
 
-The long-term direction is to drop the dependency on paid TradingView alerts
-by evaluating every trigger **server-side** in the worker. `--register-plan`
-is the first step on the arming side: instead of (only) creating one TV alert
-per condition, `tv-arm` folds the **whole trade** — every condition each alert
-would have encoded, re-expressed as an engine `Trigger` — into one signed
-`TradePlan` and POSTs it directly to the worker (action `register`). The plan
-rides the same whole-body HMAC as every other intent (it's carried in the
-intent's `trade_plan` field), so it can't be tampered.
+Trades are armed **server-side**: the worker evaluates every trigger itself on
+its cron tick — there are no paid TradingView alerts. `--register-plan` folds
+the **whole trade** — every condition (re-expressed as an engine `Trigger`),
+plus the embedded enter/close/veto/prep intents — into one signed `TradePlan`
+and POSTs it directly to the worker (action `register`). The plan rides the
+same whole-body HMAC as every other intent (carried in the intent's
+`trade_plan` field), so it can't be tampered.
 
-It's **additive and opt-in**: the TV alert path (`--create-alerts`) is
-unaffected and stays the default. Old (TV alerts) and new (engine) run in
-parallel until the engine is proven on demo; only then does the alert path
-retire. A failed register is a hard error, but the signed alert bundle is
-already on disk by the time the POST happens, so the trade is never lost. The
-plan's destination is the same baked-at-build-time webhook the TV alerts use,
-so `tv-arm-staging --register-plan` registers against the staging worker with
-no extra flag. The chart timeframe must map to an engine granularity
-(`1`/`5`/`15`/`60`/`240`/`D`), else the register is rejected.
+> **The legacy TradingView-alert path has been retired.** `tv-arm` used to also
+> POST a signed 5-alert bundle to TradingView via tv-mcp and let TV fire each
+> alert at the webhook (`--create-alerts`). That whole path — the flag, the
+> tv-mcp template, the `alert_spec` / `create_alerts` / `post_outcome` modules —
+> is gone. The signed bundle is still written to disk as a build artifact, but
+> arming is now solely `--register-plan`.
+
+A failed register is a hard error, but the signed bundle is already on disk by
+the time the POST happens, so the trade is never lost. The plan's destination
+is the baked-at-build-time webhook, so `tv-arm-staging --register-plan`
+registers against the staging worker with no extra flag. The chart timeframe
+must map to an engine granularity (`1`/`5`/`15`/`60`/`240`/`D`), else the
+register is rejected.
 
 The worker validates the registered plan and **persists** it to KV (key
-`plan:{scope}:{trade_id}`, TTL = the alert window plus grace) for the
+`plan:{scope}:{trade_id}`, TTL = the trade window plus grace) for the
 server-side engine to enumerate each cron tick. The engine that *evaluates*
-those plans — a state machine per trade — now ships (Stage D/E): it runs on
-the `*/15` tick, **in parallel** with the TV alerts, and evaluates both M/W
-(per-bar enter heartbeat) and H&S (the Rust port of the
+those plans — a state machine per trade — runs on the `*/15` tick and evaluates
+both M/W (per-bar enter heartbeat) and H&S (the Rust port of the
 `candle-signals-v2.pine` detector) entries plus the trendline / level / time
-triggers and vetos. The TradingView alert path still runs alongside it until
-the engine is proven on demo (Stage F retires the alerts).
+triggers and vetos.
 
-> **Run it in shadow mode for the parallel period.** A live (non-shadow) plan
-> dispatches its fired intents through the *same* `run_enter` / `run_close`
-> handlers the webhook uses — so a registered live plan would place **real
-> broker orders in parallel with the TV alerts**, double-firing every setup.
-> The Stage F gate is to *diff* the engine's decisions against the live alerts,
-> not to trade twice. Register with **`--shadow`**: the engine evaluates the
-> plan and advances its `PlanState` identically to a live plan, but logs each
-> would-be fire as a `cron engine SHADOW would-fire:` line instead of touching
-> the broker (no order, no seen-id mark). Scrape those lines from the
-> Cloudflare Real-time Logs and compare them to what the TV alert actually
-> placed on the same candle. The shadow/live choice is baked into the signed
-> plan at arm time, so it can't be flipped in flight — re-arm to promote a
-> proven setup to live. (Field: `TradePlan.shadow`, `#[serde(default)]` → live
-> for plans registered before the flag existed.)
+> **Shadow mode for watching a new plan.** A live (non-shadow) plan dispatches
+> its fired intents through the *same* `run_enter` / `run_close` handlers the
+> webhook uses — it places **real broker orders**. To watch a new or changed
+> plan's decisions without trading, register with **`--shadow`**: the engine
+> evaluates the plan and advances its `PlanState` identically to a live plan,
+> but logs each would-be fire as a `cron engine SHADOW would-fire:` line instead
+> of touching the broker (no order, no seen-id mark). Scrape those lines from
+> the Cloudflare Real-time Logs to confirm the plan does what you expect. The
+> shadow/live choice is baked into the signed plan at arm time, so it can't be
+> flipped in flight — re-arm to promote a proven setup to live. (Field:
+> `TradePlan.shadow`, `#[serde(default)]` → live for plans registered before the
+> flag existed.)
 
 **Calendar / news bars are folded into the plan too.** A registered plan
 carries not just the trade's own conditions but the **pause/resume** (blackout)
 and **news-start/news-end** (news-window) control bars — both the operator's
-chart-drawn pairs and the auto-fetched forex-factory events (the same bars the
-`--create-alerts` path POSTs as TV alerts). Each becomes a `TimeReached` rule
+chart-drawn pairs and the auto-fetched forex-factory events. Each becomes a `TimeReached` rule
 carrying the matching `pause` / `resume` / `news-start` / `news-end` intent and
 firing at the window edge; the engine fires them **non-terminally** (they set
 the blackout / news-window KV state without ending the trade's spine) and the
@@ -1905,13 +1906,11 @@ tv-arm-staging --register-plan --update ...
 tv-arm-staging --register-plan --update hs-eurusd-a3f9c1d2 ...
 ```
 
-`--update` reconciles **only the server-side engine plan** (it POSTs
-`plan-list` to find the target, then a signed `plan-delete` that clears the
-plan's `plan:` + `plan-state:` KV — see `plan delete` below). It does **not**
-touch TradingView alerts; keep deleting/recreating those by hand (or via
-`--create-alerts`) as before. A bare `--update` with no plan registered for the
-instrument is a logged no-op. The resolution logic is the pure
-`resolve_update_target` (`tv-arm/src/pipeline.rs`), unit-tested.
+`--update` reconciles the server-side engine plan: it POSTs `plan-list` to find
+the target, then a signed `plan-delete` that clears the plan's `plan:` +
+`plan-state:` KV (see `plan delete` below). A bare `--update` with no plan
+registered for the instrument is a logged no-op. The resolution logic is the
+pure `resolve_update_target` (`tv-arm/src/pipeline.rs`), unit-tested.
 
 #### Inspecting / managing registered plans (`trade-control plan list` / `show` / `delete`)
 
@@ -2125,7 +2124,7 @@ in `maybe_update_mw_state` (`src/lib.rs`). Baked params are the seed.
 cargo run -p tv-arm -- \
   --broker oanda \
   --allow-50-pct-m-trades \           # opt in to a 40–50% neckline retrace
-  --create-alerts
+  --register-plan
 # (draw the 3-anchor path + a trade-expiry vertical on the chart first)
 ```
 

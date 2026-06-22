@@ -24,9 +24,14 @@ deploying anything.
 
 | branch | environment | worker | CLIs | who uses it |
 |---|---|---|---|---|
-| `main` | **dev** | `trade-control-web-hook` | `*-dev` | coding / development |
+| `main` | **dev** | `trade-control-web-hook-dev` | `*-dev` | coding / development |
 | `staging` | **staging (demo)** | `trade-control-web-hook-staging` | `*-staging` | the week's live demo trading |
 | `prod` | **prod (real money)** | `trade-control-web-hook-prod` | `*-prod` | **not stood up yet** — first promotion target |
+
+**Every environment now carries a suffix** (`-dev` / `-staging` / `-prod`).
+The old **no-suffix** worker `trade-control-web-hook` + its R2 bucket
+`trade-control-recording` are **deprecated**: left running only while last
+week's demo trades are journaled, then deleted. Don't deploy to them.
 
 Current working split (2026-06): **trading runs on `staging`** (demo
 account, real-time), **coding happens on `main`**. So treat the `staging`
@@ -74,12 +79,13 @@ binary `trade-control`).
 `prod` doesn't exist yet. The plan: when `staging` has run a full week
 unchanged + profitable, it gets merged into a new `prod` branch with a
 prod-pointed `wrangler.toml`, and a fresh `staging` is cut from `main`.
-**Known wrinkle for whoever sets up prod:** the current intent is that
-`trade-control-web-hook` (today's dev worker) *becomes prod*, and a new
-`trade-control-web-hook-dev` worker is cut for dev. When that happens,
-`deploy-dev.sh`'s `ENV_WEBHOOK` changes to the new dev URL and
-`deploy-live.sh` points at `trade-control-web-hook`. Keep each branch's
-`wrangler.toml` divergent and pointed at its own worker.
+Under the **everything-suffixed** model, prod is its own worker
+`trade-control-web-hook-prod` (R2 `trade-control-recording-prod`) — a clean
+new env, *not* a rename of an existing worker. `deploy-live.sh` (added at
+that point) points at `-prod`; `main`/`-dev` and `staging`/`-staging` keep
+their own workers. The legacy no-suffix worker is retired separately (after
+the journaling window) and is **not** repurposed as prod. Keep each branch's
+`wrangler.toml` divergent and pointed at its own suffixed worker.
 
 ## Things the README doesn't shout
 
