@@ -116,6 +116,45 @@ What "retry" is **not**:
   multi-shot needs distinct intent ids per fire (which `build-trade`
   mints for multi-shot setups, not for single-shot).
 
+### A multi-shot enter must NOT retire the cron-engine plan
+
+In the cron-engine model a `FireMode::Once` enter set `Phase::Done`
+the moment it fired, and the cron archives + clears any `Done` plan
+(`src/cron/engine.rs`, `persist_plan_state`). For a *single-shot*
+enter that's correct. For a **multi-shot** enter (`max_retries > 0`)
+it silently broke re-entry: the plan that would fire attempt #2 was
+gone after the first fire, so place → fill → close → re-enter never
+got a second bar. The live worker would enter once and never
+re-enter even though the operator opted into multi-shot. Caught by
+the replay on NZD/CHF 2026-06-19 (07:30 short → SL, expected 13:00
+re-entry never fired).
+
+Fix (commit `83333fa`, `engine/src/evaluate.rs::evaluate_entry`): a
+`Once` enter only transitions to `Phase::Done` when it is *also*
+single-shot (`max_retries == Tunable::Static(0)`). Anything else —
+including a script-resolved cap — is treated as multi-shot, fires
+this bar, and **stays in `Phase::AwaitEntry`**: the plan survives,
+its vetos keep ticking, and the next golden signal bar fires the
+enter again. The placement cap is **not** the engine's job — it's
+the worker's retry gate. The plan still retires the normal way (a
+terminal `close-positions` veto, `trade-expiry`, or the enter's
+`not_after` window closing). New test
+`multi_shot_pine_enter_fires_but_stays_await_entry`; single-shot
+behaviour is byte-identical (all prior tests use `Static(0)`).
+
+The retry gate itself **moved to `core`** (commit `940c948`):
+`trade_control_core::retry_gate` (was `src/retry_gate.rs`, worker
+bin, wasm-only). It was already generic over `<B: Broker, S:
+StateStore>`; the only worker coupling was the `rlog!` / `rlog_err!`
+recording-buffer macros, now plain `tracing::info!` / `error!`
+(wasm-safe). Both consumers now call
+`trade_control_core::retry_gate::evaluate` with their own `Broker` —
+the worker its real TradeNation/OANDA broker, the offline replay a
+fake broker that approximates a prior attempt's state by simulating
+it against the candle window. One async gate, swappable broker, no
+decision duplication. (Stale `src/retry_gate.rs` paths in the prose
+above and a comment at `src/lib.rs:1186` predate this move.)
+
 ### Replay protection scope
 
 The intent-id seen index (`is_seen` / `mark_seen`) covers two

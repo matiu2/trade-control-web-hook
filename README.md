@@ -1847,7 +1847,7 @@ cargo run -p tv-arm -- \
   --skip-break-and-close \            # for stocks (no after-hours retests)
   --skip-retest \                     # implies --skip-break-and-close; for late entries
   --skip-golden \                     # drop the Pine golden-candle requirement (golden is required by default)
-  --max-retries 5 \                   # multi-shot re-entry cap (default 5; pass 0 for single-shot)
+  --max-retries 5 \                   # multi-shot re-entry cap (default 5; pass 0 for single-shot). >0 keeps the engine plan in AwaitEntry across re-entries (see below)
   --require-confirmation \            # require a confirmed signal candle on entry (independent of golden)
   --blackout-close close \            # market-hours blackout: also flatten an open position if caught in the close→open gap (default: cancel = cancel the resting order only)
   --register-plan \                   # arm the trade: register one signed TradePlan with the server-side engine
@@ -2150,6 +2150,30 @@ leg, all MID-price:
    `Done` *regardless* of the dispatch outcome, silently abandoning the
    still-valid `close-positions` vetos. The pre-flight is the pure
    `pine_entry_dispatchable` in `engine/src/evaluate.rs`.)
+
+   **A *multi-shot* enter (`max_retries > 0`) also keeps the plan alive — even
+   after a *successful* fire.** A `FireMode::Once` enter normally sets
+   `Phase::Done` the moment it fires, and the cron then archives + clears any
+   `Done` plan (`src/cron/engine.rs`, `persist_plan_state`). For a single-shot
+   enter that is correct. But a multi-shot enter *is* the
+   place → fill → close (typically at SL) → re-enter-on-the-next-signal-bar
+   mechanism, so retiring its plan on the first fire would archive the very plan
+   that fires re-entry #2 — leaving the worker to enter once and never re-enter,
+   even though the operator opted into multi-shot. So a multi-shot enter fires
+   this bar but **stays in `AwaitEntry`**: the plan survives, its vetos keep
+   ticking, and the next golden signal bar fires it again. The *placement cap* is
+   not the engine's job — it is the worker's `retry_gate` (which the offline
+   replay now also runs), so the engine just keeps emitting fires up to whatever
+   `max_retries` resolves to. The plan still retires the normal way — a terminal
+   `close-positions` veto, `trade-expiry`, or the enter's `not_after` window
+   closing. (`engine/src/evaluate.rs` treats any `max_retries` other than the
+   static default `Static(0)` as multi-shot, mirroring the worker's gate-entry
+   check; commit `83333fa`. Verified on NZD/CHF 2026-06-19: the 07:30 golden
+   short fired, stopped out, and should have re-entered on the 13:00 golden short
+   pinbar — but the plan had archived at 07:30, so no re-entry fired.) The
+   `retry_gate` itself now lives in `core` (`trade_control_core::retry_gate`,
+   commit `940c948`), shared by the worker and the replay so both run the
+   identical async cap/collapse logic against their own broker.
 
 **4-point paths arm immediately.** Both live confirmations above exist only
 because a 3-anchor path doesn't yet know the right tower — it discovers it

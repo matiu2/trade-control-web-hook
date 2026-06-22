@@ -61,12 +61,12 @@
 //! behaviour predates the gate and is verified by an explicit
 //! regression test in the worker suite.
 
+use crate::broker::{AttemptState, Broker, LookupError};
+use crate::intent::{Intent, Shell};
+use crate::rules::{self, RuleError};
+use crate::state::{EntryAttempt, StateStore};
+use crate::tunable::Tunable;
 use chrono::{DateTime, Utc};
-use trade_control_core::broker::{AttemptState, Broker, LookupError};
-use trade_control_core::intent::{Intent, Shell};
-use trade_control_core::rules::{self, RuleError};
-use trade_control_core::state::{EntryAttempt, StateStore};
-use trade_control_core::tunable::Tunable;
 
 /// Outcome of the retry gate. `Proceed` falls through into the rest of
 /// `run_enter`; `Rejected` carries an HTTP status code, a body message,
@@ -157,7 +157,9 @@ pub async fn evaluate<B: Broker, S: StateStore>(
         .await
     {
         Ok(true) => {
-            rlog!("retry: same-bar re-fire dedup'd (trade_id={trade_id} shell_time={shell_time})");
+            tracing::info!(
+                "retry: same-bar re-fire dedup'd (trade_id={trade_id} shell_time={shell_time})"
+            );
             return RetryGateOutcome::Rejected {
                 status: 409,
                 message: "replay (retry-fire)",
@@ -166,7 +168,7 @@ pub async fn evaluate<B: Broker, S: StateStore>(
         }
         Ok(false) => {}
         Err(err) => {
-            rlog_err!("KV is_retry_fire_seen: {err}");
+            tracing::error!("KV is_retry_fire_seen: {err}");
             return RetryGateOutcome::Rejected {
                 status: 500,
                 message: "state error",
@@ -178,7 +180,7 @@ pub async fn evaluate<B: Broker, S: StateStore>(
     let attempts = match store.list_entry_attempts(account, trade_id).await {
         Ok(a) => a,
         Err(err) => {
-            rlog_err!("KV list_entry_attempts: {err}");
+            tracing::error!("KV list_entry_attempts: {err}");
             return RetryGateOutcome::Rejected {
                 status: 500,
                 message: "state error",
@@ -248,7 +250,7 @@ pub async fn evaluate<B: Broker, S: StateStore>(
                                         )
                                         .await
                                 {
-                                    rlog_err!(
+                                    tracing::error!(
                                         "KV set_entry_attempt_broker_trade_id (raced): {err}"
                                     );
                                 }
@@ -281,7 +283,7 @@ pub async fn evaluate<B: Broker, S: StateStore>(
                         )
                         .await
                 {
-                    rlog_err!("KV set_entry_attempt_broker_trade_id: {err}");
+                    tracing::error!("KV set_entry_attempt_broker_trade_id: {err}");
                 }
                 return RetryGateOutcome::Rejected {
                     status: 412,
@@ -308,7 +310,7 @@ pub async fn evaluate<B: Broker, S: StateStore>(
                 // unresolvable prior attempt blocks the re-entry. The
                 // independent open-positions backstop below is the belt
                 // to this braces.
-                rlog!(
+                tracing::info!(
                     "retry: prior attempt #{} unresolvable (Unknown) — rejecting to avoid \
                      stacking a duplicate (trade_id={trade_id} order_id={})",
                     attempt.attempt_no,
@@ -372,7 +374,7 @@ async fn open_position_backstop<B: Broker>(
     let positions = match broker.list_open_positions(account.unwrap_or("")).await {
         Ok(p) => p,
         Err(LookupError::Transient) => {
-            rlog_err!(
+            tracing::error!(
                 "retry: open-position backstop could not list positions (transient) — \
                  rejecting fail-safe to avoid a possible duplicate (instrument={instrument})"
             );
@@ -394,7 +396,7 @@ async fn open_position_backstop<B: Broker>(
                 || a.broker_trade_id.as_deref() == Some(pos.position_id.as_str())
         });
         if let Some(a) = matched {
-            rlog!(
+            tracing::info!(
                 "retry: open-position backstop matched a live position to prior attempt #{} \
                  (instrument={instrument} order_id={} position_id={}) — rejecting duplicate",
                 a.attempt_no,
@@ -430,7 +432,7 @@ pub async fn record_placement<S: StateStore>(
     now: DateTime<Utc>,
     attempt_no: u32,
     broker_order_id: &str,
-    direction: trade_control_core::intent::Direction,
+    direction: crate::intent::Direction,
     stop_loss_price: f64,
     cancel_at: Option<DateTime<Utc>>,
 ) {
@@ -438,7 +440,7 @@ pub async fn record_placement<S: StateStore>(
         return;
     };
     let account = intent.account.as_deref();
-    let ttl_seconds = trade_control_core::incoming::replay_ttl_seconds(not_after, now);
+    let ttl_seconds = crate::incoming::replay_ttl_seconds(not_after, now);
     // `replay_ttl_seconds` already adds a 1h grace tail; reuse it
     // for both the EntryAttempt's expires_at and the retry-fire
     // dedup key so a multi-bar setup's last attempt's row outlives
@@ -466,29 +468,29 @@ pub async fn record_placement<S: StateStore>(
         blackout_close: intent.blackout_close,
     };
     if let Err(err) = store.record_entry_attempt(attempt).await {
-        rlog_err!("KV record_entry_attempt: {err}");
+        tracing::error!("KV record_entry_attempt: {err}");
     }
     if let Err(err) = store
         .mark_retry_fire_seen(account, trade_id, shell_time, ttl_seconds)
         .await
     {
-        rlog_err!("KV mark_retry_fire_seen: {err}");
+        tracing::error!("KV mark_retry_fire_seen: {err}");
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::cell::RefCell;
-    use std::collections::HashMap;
-    use trade_control_core::broker::{
+    use crate::broker::{
         AmendError, AttemptState, Broker, CancelError, Candle, CandleError, EntryError,
         EntryRequest, Granularity, LookupError, OpenPosition, PendingOrder, Quote,
     };
-    use trade_control_core::intent::{
+    use crate::intent::{
         Action, BrokerKind, Direction, EntrySpec, Intent, PriceAnchor, PriceRef, TakeProfit,
     };
-    use trade_control_core::state::{EntryAttempt, Snapshot, StateError, StateStore};
+    use crate::state::{EntryAttempt, Snapshot, StateError, StateStore};
+    use std::cell::RefCell;
+    use std::collections::HashMap;
 
     /// One scripted broker response per call. Tests push these onto a
     /// queue and the mock pops them in order, panicking if a call
@@ -808,7 +810,7 @@ mod tests {
         async fn list_pauses_for_trade(
             &self,
             _trade_id: &str,
-        ) -> Result<Vec<trade_control_core::state::PauseEntry>, StateError> {
+        ) -> Result<Vec<crate::state::PauseEntry>, StateError> {
             // The retry-gate tests never set a pause; an empty list keeps
             // the existing gate semantics unchanged.
             Ok(Vec::new())
@@ -833,7 +835,7 @@ mod tests {
         async fn list_news_windows_for_trade(
             &self,
             _trade_id: &str,
-        ) -> Result<Vec<trade_control_core::state::NewsEntry>, StateError> {
+        ) -> Result<Vec<crate::state::NewsEntry>, StateError> {
             Ok(Vec::new())
         }
         async fn clear_news_window(
@@ -936,13 +938,13 @@ mod tests {
         }
         async fn get_spread_blackout_window(
             &self,
-        ) -> Result<Option<trade_control_core::state::SpreadBlackoutWindow>, StateError> {
+        ) -> Result<Option<crate::state::SpreadBlackoutWindow>, StateError> {
             Ok(None)
         }
         async fn set_blackout_windows(
             &self,
             _instrument: &str,
-            _windows: &[trade_control_core::intent::NoEntryWindow],
+            _windows: &[crate::intent::NoEntryWindow],
             _now: DateTime<Utc>,
             _ttl_seconds: u64,
         ) -> Result<(), StateError> {
@@ -951,12 +953,12 @@ mod tests {
         async fn get_blackout_windows(
             &self,
             _instrument: &str,
-        ) -> Result<Vec<trade_control_core::intent::NoEntryWindow>, StateError> {
+        ) -> Result<Vec<crate::intent::NoEntryWindow>, StateError> {
             Ok(Vec::new())
         }
         async fn upsert_spread_blackout_record(
             &self,
-            _record: &trade_control_core::state::SpreadBlackoutRecord,
+            _record: &crate::state::SpreadBlackoutRecord,
             _ttl_seconds: u64,
         ) -> Result<(), StateError> {
             Ok(())
@@ -964,12 +966,12 @@ mod tests {
         async fn get_spread_blackout_record(
             &self,
             _trade_id: &str,
-        ) -> Result<Option<trade_control_core::state::SpreadBlackoutRecord>, StateError> {
+        ) -> Result<Option<crate::state::SpreadBlackoutRecord>, StateError> {
             Ok(None)
         }
         async fn list_all_spread_blackout_records(
             &self,
-        ) -> Result<Vec<trade_control_core::state::SpreadBlackoutRecord>, StateError> {
+        ) -> Result<Vec<crate::state::SpreadBlackoutRecord>, StateError> {
             Ok(Vec::new())
         }
         async fn clear_spread_blackout_record(&self, _trade_id: &str) -> Result<(), StateError> {
@@ -979,14 +981,14 @@ mod tests {
             &self,
             _account: Option<&str>,
             _trade_id: &str,
-        ) -> Result<Option<trade_control_core::state::MwState>, StateError> {
+        ) -> Result<Option<crate::state::MwState>, StateError> {
             Ok(None)
         }
         async fn upsert_mw_state(
             &self,
             _account: Option<&str>,
             _trade_id: &str,
-            _state: &trade_control_core::state::MwState,
+            _state: &crate::state::MwState,
             _ttl_seconds: u64,
         ) -> Result<(), StateError> {
             Ok(())
@@ -1004,7 +1006,7 @@ mod tests {
         async fn put_trade_plan(
             &self,
             _account: Option<&str>,
-            _plan: &trade_control_core::trade_plan::TradePlan,
+            _plan: &crate::trade_plan::TradePlan,
             _ttl_seconds: u64,
         ) -> Result<(), StateError> {
             Ok(())
@@ -1013,12 +1015,10 @@ mod tests {
             &self,
             _account: Option<&str>,
             _trade_id: &str,
-        ) -> Result<Option<trade_control_core::trade_plan::TradePlan>, StateError> {
+        ) -> Result<Option<crate::trade_plan::TradePlan>, StateError> {
             Ok(None)
         }
-        async fn list_all_trade_plans(
-            &self,
-        ) -> Result<Vec<trade_control_core::state::StoredPlan>, StateError> {
+        async fn list_all_trade_plans(&self) -> Result<Vec<crate::state::StoredPlan>, StateError> {
             Ok(Vec::new())
         }
         async fn clear_trade_plan(
@@ -1032,14 +1032,14 @@ mod tests {
             &self,
             _account: Option<&str>,
             _trade_id: &str,
-        ) -> Result<Option<trade_control_core::plan_state::PlanState>, StateError> {
+        ) -> Result<Option<crate::plan_state::PlanState>, StateError> {
             Ok(None)
         }
         async fn put_plan_state(
             &self,
             _account: Option<&str>,
             _trade_id: &str,
-            _state: &trade_control_core::plan_state::PlanState,
+            _state: &crate::plan_state::PlanState,
             _ttl_seconds: u64,
         ) -> Result<(), StateError> {
             Ok(())
@@ -1054,15 +1054,15 @@ mod tests {
         async fn archive_plan(
             &self,
             _account: Option<&str>,
-            _plan: &trade_control_core::trade_plan::TradePlan,
-            _final_state: &trade_control_core::plan_state::PlanState,
+            _plan: &crate::trade_plan::TradePlan,
+            _final_state: &crate::plan_state::PlanState,
             _archived_at: DateTime<Utc>,
         ) -> Result<(), StateError> {
             Ok(())
         }
         async fn list_all_archived_plans(
             &self,
-        ) -> Result<Vec<trade_control_core::state::ArchivedPlan>, StateError> {
+        ) -> Result<Vec<crate::state::ArchivedPlan>, StateError> {
             Ok(vec![])
         }
         async fn clear_archived_plan(
@@ -1117,7 +1117,7 @@ mod tests {
                 from: PriceAnchor::Close,
                 offset_r: 2.0,
             }),
-            risk_pct: trade_control_core::tunable::Tunable::Static(0.5),
+            risk_pct: crate::tunable::Tunable::Static(0.5),
             risk_amount: None,
             size_units: None,
             dry_run: None,
@@ -1127,7 +1127,7 @@ mod tests {
             account: Some("acct-a".into()),
             step: None,
             name: None,
-            ttl_hours: trade_control_core::tunable::Tunable::Static(0),
+            ttl_hours: crate::tunable::Tunable::Static(0),
             level: None,
             requires_preps: Vec::new(),
             vetos: Vec::new(),
@@ -1150,7 +1150,7 @@ mod tests {
             mw: None,
             pip_size: None,
             trade_plan: None,
-            blackout_close: trade_control_core::intent::BlackoutCloseAction::default(),
+            blackout_close: crate::intent::BlackoutCloseAction::default(),
             include_archived: false,
         }
     }
@@ -1614,6 +1614,234 @@ mod tests {
     }
 
     // ---- max_retries as Tunable ----
+
+    /// Exact placement-cap boundary (cap 3). With two prior attempts on
+    /// record (both collapsed → walked past), the Nth placement — here the
+    /// 3rd — must PROCEED with `next_attempt_no = 3`; it's only the
+    /// (N+1)th fire that trips the cap. The existing `retry_cap_yields_429`
+    /// proves the reject side; this pins the inclusive boundary so an
+    /// off-by-one in `attempts.len() >= max_retries` can't pass.
+    #[test]
+    fn retry_cap_boundary_nth_placement_proceeds() {
+        let broker = MockBroker::default();
+        let store = CountingStore::default();
+        let intent = intent_with_retries(3);
+        // Two collapsed attempts on record → the 3rd placement is allowed.
+        for n in 1..=2 {
+            run(record_placement(
+                &store,
+                &intent,
+                ts(&format!("2026-05-25T13:0{n}:00Z")),
+                intent.not_after,
+                ts(&format!("2026-05-25T13:0{n}:01Z")),
+                n,
+                &format!("order-{n}"),
+                Direction::Long,
+                1.05,
+                None,
+            ));
+            broker.push_lookup(AttemptState::Cancelled);
+        }
+
+        let out = run(evaluate(&broker, &store, &intent, &fixture_shell()));
+        assert_proceed(out, 3);
+        // Walked both collapsed attempts; cancelled neither.
+        assert_eq!(broker.lookup_calls.borrow().len(), 2);
+        assert!(broker.cancel_calls.borrow().is_empty());
+    }
+
+    /// `max_retries: Static(1)` is the minimal multi-shot config (a single
+    /// placement, but routed through the gate because it isn't `Static(0)`).
+    /// First fire proceeds with attempt 1; a second fire after that
+    /// placement closes trips the cap at 429 — the cap is 1, not 0 and not
+    /// 2.
+    #[test]
+    fn multishot_static_one_caps_after_single_placement() {
+        let broker = MockBroker::default();
+        let store = CountingStore::default();
+        let intent = intent_with_retries(1);
+
+        // First fire — nothing on record → Proceed{1}.
+        let out = run(evaluate(&broker, &store, &intent, &fixture_shell()));
+        assert_proceed(out, 1);
+
+        // Record the placement, then fire again on a fresh bar.
+        run(record_placement(
+            &store,
+            &intent,
+            ts("2026-05-25T13:00:00Z"),
+            intent.not_after,
+            ts("2026-05-25T13:00:01Z"),
+            1,
+            "order-1",
+            Direction::Long,
+            1.05,
+            None,
+        ));
+        // The one prior attempt collapsed (closed at SL) → walked past, then
+        // the cap (1) is hit.
+        broker.push_lookup(AttemptState::ClosedLossOrBreakeven { realized_pl: -5.0 });
+
+        let out = run(evaluate(&broker, &store, &intent, &fixture_shell()));
+        assert_rejected(out, 429, "retry-cap (1)");
+    }
+
+    /// Backstop correlation on the stored entry `order_id` (the other half
+    /// of the OR in `open_position_backstop` — `position_id` is covered by
+    /// `open_position_backstop_rejects_on_position_id_match`). Here the
+    /// live position's `order_id` matches the attempt's stored
+    /// `broker_order_id` while the `position_id` is something we never
+    /// snapshotted.
+    #[test]
+    fn open_position_backstop_rejects_on_order_id_match() {
+        let broker = MockBroker::default();
+        let store = CountingStore::default();
+        let intent = intent_with_retries(3);
+        run(record_placement(
+            &store,
+            &intent,
+            ts("2026-05-25T13:00:00Z"),
+            intent.not_after,
+            ts("2026-05-25T13:00:01Z"),
+            1,
+            "26815011",
+            Direction::Long,
+            1.05,
+            None,
+        ));
+        // Live position whose order_id matches our stored entry order id;
+        // position_id is unrelated (and we never snapshotted one).
+        broker.push_open_position(open_pos("26815011", "unrelated-position"));
+
+        let out = run(evaluate(&broker, &store, &intent, &fixture_shell()));
+        assert_rejected(out, 412, "trade-already-open (backstop)");
+        // Backstop short-circuits before the per-attempt lookup walk.
+        assert!(broker.lookup_calls.borrow().is_empty());
+    }
+
+    /// Full multi-shot lifecycle (cap 3): a first attempt is open → 412;
+    /// it then closes at SL and a fresh bar re-enters → Proceed{2}; a third
+    /// placement is recorded and the fourth fire exhausts the cap → 429.
+    /// Exercises the open→close→re-enter→exhaust path the plan calls out as
+    /// a "mix" the individual tests don't string together.
+    #[test]
+    fn open_then_closed_reentry_proceeds_then_exhausts() {
+        let broker = MockBroker::default();
+        let store = CountingStore::default();
+        let intent = intent_with_retries(3);
+
+        // Attempt 1 placed and still open → re-fire is blocked (412).
+        run(record_placement(
+            &store,
+            &intent,
+            ts("2026-05-25T13:00:00Z"),
+            intent.not_after,
+            ts("2026-05-25T13:00:01Z"),
+            1,
+            "order-1",
+            Direction::Long,
+            1.05,
+            None,
+        ));
+        broker.push_lookup(AttemptState::OpenPosition {
+            broker_trade_id: "btid-1".into(),
+        });
+        let out = run(evaluate(&broker, &store, &intent, &fixture_shell()));
+        assert_rejected(out, 412, "trade-already-open");
+
+        // Attempt 1 has now closed at SL → a fresh bar re-enters as #2.
+        broker.push_lookup(AttemptState::ClosedLossOrBreakeven { realized_pl: -4.0 });
+        let out = run(evaluate(&broker, &store, &intent, &fixture_shell()));
+        assert_proceed(out, 2);
+
+        // Record #2 and #3 (both later closed), then the 4th fire caps.
+        run(record_placement(
+            &store,
+            &intent,
+            ts("2026-05-25T13:02:00Z"),
+            intent.not_after,
+            ts("2026-05-25T13:02:01Z"),
+            2,
+            "order-2",
+            Direction::Long,
+            1.05,
+            None,
+        ));
+        run(record_placement(
+            &store,
+            &intent,
+            ts("2026-05-25T13:03:00Z"),
+            intent.not_after,
+            ts("2026-05-25T13:03:01Z"),
+            3,
+            "order-3",
+            Direction::Long,
+            1.05,
+            None,
+        ));
+        broker.push_lookup(AttemptState::Cancelled); // #3 (newest-first)
+        broker.push_lookup(AttemptState::Cancelled); // #2
+        broker.push_lookup(AttemptState::Cancelled); // #1
+        let out = run(evaluate(&broker, &store, &intent, &fixture_shell()));
+        assert_rejected(out, 429, "retry-cap (3)");
+    }
+
+    /// Each `Rejected` carries a sensible human-facing `message` — the
+    /// shared `assert_rejected` helper ignores that field, so pin a few
+    /// distinct rejections' messages directly. The worker surfaces this
+    /// string to the operator, so a refactor mustn't silently blank it.
+    #[test]
+    fn rejected_outcomes_carry_messages() {
+        // Cap-reached carries "retry cap reached".
+        let broker = MockBroker::default();
+        let store = CountingStore::default();
+        let intent = intent_with_retries(1);
+        run(record_placement(
+            &store,
+            &intent,
+            ts("2026-05-25T13:00:00Z"),
+            intent.not_after,
+            ts("2026-05-25T13:00:01Z"),
+            1,
+            "order-1",
+            Direction::Long,
+            1.05,
+            None,
+        ));
+        broker.push_lookup(AttemptState::Cancelled);
+        match run(evaluate(&broker, &store, &intent, &fixture_shell())) {
+            RetryGateOutcome::Rejected { message, .. } => {
+                assert_eq!(message, "retry cap reached")
+            }
+            RetryGateOutcome::Proceed { .. } => panic!("expected cap reject"),
+        }
+
+        // Open-position reject carries "trade already open".
+        let broker = MockBroker::default();
+        let store = CountingStore::default();
+        let intent = intent_with_retries(3);
+        run(record_placement(
+            &store,
+            &intent,
+            ts("2026-05-25T13:00:00Z"),
+            intent.not_after,
+            ts("2026-05-25T13:00:01Z"),
+            1,
+            "order-1",
+            Direction::Long,
+            1.05,
+            None,
+        ));
+        broker.push_lookup(AttemptState::OpenPosition {
+            broker_trade_id: "btid-9".into(),
+        });
+        match run(evaluate(&broker, &store, &intent, &fixture_shell())) {
+            RetryGateOutcome::Rejected { message, .. } => {
+                assert_eq!(message, "trade already open")
+            }
+            RetryGateOutcome::Proceed { .. } => panic!("expected open reject"),
+        }
+    }
 
     #[test]
     fn max_retries_static_path_unchanged() {
