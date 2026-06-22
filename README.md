@@ -2172,7 +2172,7 @@ leg, all MID-price:
    short fired, stopped out, and should have re-entered on the 13:00 golden short
    pinbar — but the plan had archived at 07:30, so no re-entry fired.) The
    `retry_gate` itself now lives in `core` (`trade_control_core::retry_gate`,
-   commit `940c948`), shared by the worker and the replay so both run the
+   commit `edef1ea`), shared by the worker and the replay so both run the
    identical async cap/collapse logic against their own broker.
 
 **4-point paths arm immediately.** Both live confirmations above exist only

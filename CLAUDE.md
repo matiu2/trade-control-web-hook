@@ -142,7 +142,7 @@ terminal `close-positions` veto, `trade-expiry`, or the enter's
 `multi_shot_pine_enter_fires_but_stays_await_entry`; single-shot
 behaviour is byte-identical (all prior tests use `Static(0)`).
 
-The retry gate itself **moved to `core`** (commit `940c948`):
+The retry gate itself **moved to `core`** (commit `edef1ea`):
 `trade_control_core::retry_gate` (was `src/retry_gate.rs`, worker
 bin, wasm-only). It was already generic over `<B: Broker, S:
 StateStore>`; the only worker coupling was the `rlog!` / `rlog_err!`
