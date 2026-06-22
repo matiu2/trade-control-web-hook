@@ -1,5 +1,60 @@
 # Changelog
 
+## v51 — 2026-06-22 — Bug #12: continuous at-entry too-low/too-high enforcement
+
+### Why
+
+A live `too-low` veto failed to block a confirmed H&S entry (NZD/CAD,
+−110.53 GBP, 10–11 Jun 2026). Root cause is a semantic gap from the engine
+migration: the legacy TradingView `too-low`/`too-high` alert *wrote a
+persistent KV veto* that a later confirmed enter found and rejected. The
+engine re-modelled those as one-shot cross-event guard rules — the KV veto is
+only written when price *crosses* the level on a closed candle. A gap past the
+level, a level already breached when the plan armed, or a cross during a
+disarmed phase writes **no** veto, so the enter confirmed and the order was
+placed. `too-low` is really a *continuous* predicate ("is the entry already
+past the pcl-exhausted level?"), not a one-shot cross.
+
+### What changed
+
+- **`Intent.entry_level_vetos: Vec<EntryLevelVeto>`** (new core type
+  `EntryLevelVeto { name, level, past: VetoSide{Below,Above} }`). Baked onto
+  the H&S/IH&S enter at arm time: `too-low` = pcl-exhausted (from the fib),
+  `too-high` = invalidation (the right-shoulder horizontal), with sides
+  derived from direction.
+- **Worker gate (`run_enter`).** After resolving and before `allow_entry`, the
+  worker rejects the entry when the resolved entry/trigger price is already
+  past any baked level — `rejected: veto-active (<name>)`, HTTP 412, no order
+  placed — independent of any cross-event guard. Byte-identical outcome string
+  to the legacy KV veto path (a seen-id `Skip`, so the id isn't poisoned).
+- **Engine cross-guard left as-is** (lowest risk): the new at-entry check is an
+  *additional*, authoritative safety net, not a replacement.
+- **Simulator** (`engine::simulator`): new `SimOutcome::Declined { name }`;
+  `simulate_fill` short-circuits to it when the entry is past a level, so
+  tick-replay reproduces the worker's gate (loss → no-fill).
+
+### Config
+
+- New signed field `Intent.entry_level_vetos` and `TradeSpec.entry_level_vetos`,
+  both `#[serde(default, skip_serializing_if = "Vec::is_empty")]` — old signed
+  intents / stored plans / spec yaml deserialise and round-trip unchanged.
+
+### Tests
+
+- core: `EntryLevelVeto::is_past` truth table (inclusive at the level) + JSON
+  round-trip; `ResolvedEntry::reference_price`.
+- tv-arm: `hs_entry_level_vetos` sides + skip-missing for short & long.
+- cli: `build_enter_alert` carries the levels onto the enter intent.
+- engine: tick-replay flips the −110.53 loss path to a clean no-fill when the
+  pcl level is breached (and still fills when the entry is short of it).
+
+### Rollout
+
+Deploy only — no re-arm migration. The level is baked at arm time, so only
+plans armed after deploy carry it; in-flight plans keep the cross-guard until
+they expire/re-arm. Dev only (`./deploy-dev.sh`); do not redeploy staging
+mid-week.
+
 ## v50 — 2026-06-22 — M/W: optional drawn right shoulder (4-point path) arms immediately
 
 ### Why

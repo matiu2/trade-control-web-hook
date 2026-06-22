@@ -786,6 +786,7 @@ mod tests {
     /// is copied verbatim into fired results.
     fn intent(action: Action) -> Intent {
         Intent {
+            entry_level_vetos: Vec::new(),
             v: 1,
             id: "x".into(),
             not_before: None,

@@ -25,6 +25,7 @@ const STATUS_INSTRUMENT: &str = "ALL";
 /// Specific builders override only what they care about.
 fn control_skeleton(action: Action, instrument: &str, id: String, now: DateTime<Utc>) -> Intent {
     Intent {
+        entry_level_vetos: Vec::new(),
         v: 1,
         id,
         not_before: None,

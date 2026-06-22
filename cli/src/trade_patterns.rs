@@ -441,6 +441,16 @@ pub struct TradeSpec {
     /// at the default.
     #[serde(default, skip_serializing_if = "is_default_blackout_close")]
     pub blackout_close: BlackoutCloseAction,
+    /// Continuous at-entry level vetos (Bug #12) baked onto the `05-enter`
+    /// intent. For H&S these are the pcl-exhausted (`too-low`) and
+    /// invalidation (`too-high`) price levels, computed at arm time from the
+    /// fib + invalidation drawings; `build_enter_alert` copies them onto the
+    /// enter intent so the worker rejects an entry already past the level
+    /// even when no cross-event guard fired. Empty for M/W and for
+    /// pre-feature specs. `#[serde(default)]` keeps spec yaml byte-identical
+    /// when unset.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub entry_level_vetos: Vec<trade_control_core::intent::EntryLevelVeto>,
 }
 
 /// Skip-serializing predicate for [`TradeSpec::blackout_close`] — keeps a
@@ -825,6 +835,7 @@ fn build_pattern(
         // never close a position). The `--blackout-close` flag lives on the
         // `--from-file` / scripted path.
         blackout_close: BlackoutCloseAction::default(),
+        entry_level_vetos: Vec::new(),
     };
     assemble_trade(spec, geometry, entry_offset_pips, sl_offset_pips, now)
 }
@@ -946,6 +957,7 @@ fn assemble_trade(
         // reversal-close that writes it actually exists for this setup —
         // i.e. the flag is armed AND there are sr bands to reverse off.
         spec.veto_on_reversal && !spec.sr_reversal_ranges.is_empty(),
+        &spec.entry_level_vetos,
     ));
     if spec.close_on_news || !spec.sr_reversal_ranges.is_empty() {
         alerts.push(build_close_on_reversal_alert(
@@ -1415,6 +1427,7 @@ fn skeleton(
     trade_id: &str,
 ) -> Intent {
     Intent {
+        entry_level_vetos: Vec::new(),
         v: 1,
         id,
         not_before: None,
@@ -1679,6 +1692,7 @@ fn build_enter_alert(
     broker: &BrokerKind,
     account: &str,
     check_reversal_veto: bool,
+    entry_level_vetos: &[trade_control_core::intent::EntryLevelVeto],
 ) -> BuiltAlert {
     let id = format!("{trade_id}-enter");
     let mut intent = skeleton(
@@ -1763,6 +1777,11 @@ fn build_enter_alert(
             .vetos
             .push(trade_control_core::intent::REVERSAL_VETO_NAME.into());
     }
+    // Continuous at-entry level vetos (Bug #12): pcl-exhausted / invalidation
+    // levels the worker re-checks against the resolved entry price, so an
+    // entry already past the level is rejected even when no cross-event guard
+    // fired. Carried only on the enter intent.
+    intent.entry_level_vetos = entry_level_vetos.to_vec();
     BuiltAlert {
         basename: AlertBasename::Enter.as_str().into_owned(),
         purpose: "enter: stop-entry gated by both preps + both vetos".into(),
@@ -2140,6 +2159,7 @@ mod tests {
                 &BrokerKind::Oanda,
                 "demo",
                 false,
+                &[],
             ),
         ];
         let trade = BuiltTrade {
@@ -2177,6 +2197,7 @@ mod tests {
                 mw: None,
                 pip_size: None,
                 blackout_close: BlackoutCloseAction::default(),
+                entry_level_vetos: Vec::new(),
             },
         };
         let manifest = render_manifest(&trade);
@@ -2218,6 +2239,7 @@ mod tests {
             &BrokerKind::Oanda,
             "demo",
             false,
+            &[],
         );
         assert_eq!(alert.intent.direction, Some(Direction::Short));
         // Entry: signal_low + 1 pip — the latched pattern level, stable across
@@ -2265,6 +2287,54 @@ mod tests {
     }
 
     #[test]
+    fn enter_carries_entry_level_vetos_onto_the_intent() {
+        // Bug #12: the continuous at-entry level vetos handed to
+        // build_enter_alert land verbatim on the enter intent (and nowhere
+        // else). Empty by default (the existing tests above pass `&[]`).
+        use trade_control_core::intent::{EntryLevelVeto, VetoSide};
+        let geometry = PatternGeometry::for_pattern(TradePattern::Hs);
+        let levels = vec![
+            EntryLevelVeto {
+                name: "too-low".into(),
+                level: 1.0700,
+                past: VetoSide::Below,
+            },
+            EntryLevelVeto {
+                name: "too-high".into(),
+                level: 1.0950,
+                past: VetoSide::Above,
+            },
+        ];
+        let alert = build_enter_alert(
+            "EUR_USD",
+            "hs-eur-usd-elv",
+            &geometry,
+            ts("2026-05-24T00:00:00Z"),
+            1.0,
+            1.0,
+            1.0500,
+            None,
+            1.0,
+            None,
+            false,
+            0,
+            None,
+            None,
+            EntryMode::Stop,
+            false,
+            false,
+            &[],
+            None,
+            BlackoutCloseAction::default(),
+            &BrokerKind::Oanda,
+            "demo",
+            false,
+            &levels,
+        );
+        assert_eq!(alert.intent.entry_level_vetos, levels);
+    }
+
+    #[test]
     fn ihs_enter_matches_long_template_geometry() {
         // IH&S mirrors `long.yaml`: stop-entry at high+1, SL at low+1,
         // vetoed by `too-low` (not `too-high`). Direction flips to
@@ -2295,6 +2365,7 @@ mod tests {
             &BrokerKind::Oanda,
             "demo",
             false,
+            &[],
         );
         assert_eq!(alert.intent.direction, Some(Direction::Long));
         // Entry: signal_high + 1 pip (mirror of the H&S short — pattern level,
@@ -2364,6 +2435,7 @@ mod tests {
             &BrokerKind::Oanda,
             "demo",
             false,
+            &[],
         );
         match &alert.intent.stop_loss {
             Some(PriceRef::Absolute { absolute }) => {
@@ -2487,6 +2559,7 @@ mod tests {
             mw: None,
             pip_size: None,
             blackout_close: BlackoutCloseAction::default(),
+            entry_level_vetos: Vec::new(),
         }
     }
 

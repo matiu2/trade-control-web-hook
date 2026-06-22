@@ -343,6 +343,7 @@ mod tests {
 
     fn mw_intent(direction: Direction, mw: MwParams) -> Intent {
         Intent {
+            entry_level_vetos: Vec::new(),
             v: 1,
             id: "mw-test".into(),
             not_before: None,

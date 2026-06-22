@@ -6,6 +6,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 mod blackout;
+mod entry_level_veto;
 mod expiry;
 mod mw_resolution;
 mod mw_state;
@@ -16,6 +17,7 @@ pub use blackout::{
     BlackoutCloseAction, Buffers, MINUTES_PER_DAY, NoEntryWindow, is_inside_any, is_inside_window,
     windows_from_session,
 };
+pub use entry_level_veto::{EntryLevelVeto, VetoSide};
 pub use expiry::{ExpiryError, MAX_EXPIRY_BARS, resolve_cancel_at};
 pub use mw_resolution::mw_static_prices;
 pub use mw_state::{MwAnchors, MwUpdate, effective_mw_params, plan_mw_update};
@@ -489,6 +491,17 @@ pub struct Intent {
     /// veto gate.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub vetos: Vec<String>,
+    /// Continuous **at-entry level vetos** (Bug #12). Each names a veto, a
+    /// price level, and which side counts as "past". `run_enter` rejects the
+    /// entry when the resolved entry/trigger price is already past the level
+    /// — independent of whether any cross-event guard fired or wrote a KV
+    /// veto. Restores the legacy behaviour where a persistent `too-low` /
+    /// `too-high` KV veto blocked a confirmed enter. `#[serde(default)]`
+    /// keeps every in-flight signed intent / stored plan deserialising
+    /// unchanged. The `vetos` name-list above is left untouched and still
+    /// gates any externally/guard-set KV veto.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub entry_level_vetos: Vec<EntryLevelVeto>,
     /// Names to clear *before* setting the new prep/veto. Used to model
     /// ordered prep sequences where landing an earlier step must
     /// invalidate any stale later step.

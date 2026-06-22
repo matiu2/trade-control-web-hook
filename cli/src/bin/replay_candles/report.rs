@@ -122,5 +122,8 @@ fn describe_outcome(outcome: &SimOutcome) -> String {
             bne(*exit_at)
         ),
         SimOutcome::Unresolved(reason) => format!("fill: UNRESOLVED — {reason}"),
+        SimOutcome::Declined { name } => {
+            format!("fill: DECLINED — entry past the {name} level (no order placed)")
+        }
     }
 }

@@ -213,6 +213,7 @@ fn build_news_intent(
     not_after: DateTime<Utc>,
 ) -> Intent {
     Intent {
+        entry_level_vetos: Vec::new(),
         v: 1,
         id,
         not_before: None,

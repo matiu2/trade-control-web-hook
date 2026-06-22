@@ -1403,6 +1403,35 @@ pub(crate) async fn run_enter<B: Broker>(
         }
     };
 
+    // Entry-level veto gate — Bug #12. The pcl-exhausted / invalidation level
+    // is a *continuous* predicate: reject when the resolved entry price is
+    // already past it, regardless of whether the engine's cross-event guard
+    // fired or wrote a KV veto. The legacy persistent KV veto gave this
+    // continuous semantics for free; the engine's one-shot Intrabar guard can
+    // miss a gap / pre-armed breach and let the entry through (the NZD/CAD
+    // −110.53 GBP incident). Sits after `resolved` (needs the entry price) and
+    // before `allow_entry` (a regression-critical veto must not be defeatable
+    // by an operator script). The `rejected: veto-active (<name>)` outcome is
+    // byte-identical to the legacy KV veto path and is a seen-id `Skip`.
+    let entry_ref_price = resolved.entry.reference_price();
+    if let Some(elv) = verified
+        .intent
+        .entry_level_vetos
+        .iter()
+        .find(|elv| elv.is_past(entry_ref_price))
+    {
+        rlog!(
+            "entry rejected: entry-level veto {} active (entry={entry_ref_price} past level={}) (id={})",
+            elv.name,
+            elv.level,
+            verified.intent.id
+        );
+        return ActionResult::Rejected {
+            response: Response::error("veto active", 412),
+            outcome: format!("rejected: veto-active ({})", elv.name),
+        };
+    }
+
     // allow_entry gate — operator's Tunable<bool> script sees the full
     // shell + resolved geometry. Sits after Resolved::from_intent
     // (Phase 2 bindings need it) and ahead of the broker call (cheap
@@ -3952,6 +3981,7 @@ mod dispatcher_outcome_tests {
                 next_candle_timestamp_5: None,
             },
             intent: Intent {
+                entry_level_vetos: Vec::new(),
                 v: 1,
                 id: id.into(),
                 not_before: None,

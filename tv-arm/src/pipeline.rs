@@ -30,7 +30,7 @@ use crate::alert_spec::{AlertPayload, CalendarWindow, DispatchContext, build_ale
 use crate::args::Args;
 use crate::args::PositionEntry;
 use crate::create_alerts::create_alerts;
-use crate::geometry::tp_price_from_fib;
+use crate::geometry::{horizontal_price, pcl_exhausted_price_from_fib, tp_price_from_fib};
 use crate::instrument_resolution::ResolvedInstrument;
 use crate::manifest::{CalendarBundle, discover_calendar_bundles};
 use crate::mw_geometry;
@@ -518,11 +518,24 @@ fn resolve_hs_trade(
         .as_ref()
         .ok_or_else(|| eyre!("missing tp_fib (already checked by check_required)"))?;
     let tp = tp_price_from_fib(&tp_fib.prices(), direction);
+    // Continuous at-entry level vetos (Bug #12): the pcl-exhausted (`too-low`)
+    // and invalidation (`too-high`) levels, baked onto the enter so the worker
+    // rejects an entry already past either — independent of the cross-guard.
+    let entry_level_vetos = hs_entry_level_vetos(roles, direction);
     let expiry = read_trade_expiry(roles)?;
     // --pip-size overrides the canonical catalog value when set.
     let pip_size = args.pip_size.unwrap_or(catalog_pip);
     let spec = build_trade_spec(
-        args, instrument, account, broker, direction, expiry, tp, roles, pip_size,
+        args,
+        instrument,
+        account,
+        broker,
+        direction,
+        expiry,
+        tp,
+        roles,
+        pip_size,
+        entry_level_vetos,
     );
     Ok((direction, spec))
 }
@@ -806,6 +819,9 @@ fn build_mw_trade_spec(
         // also does this); keeps the worker's sizing tail on the baked pip.
         pip_size: Some(anchors.pip_size),
         blackout_close: args.blackout_close.into_core(),
+        // M/W has no fib / invalidation drawing — its abort/cancel/overshoot
+        // vetos cover the level guards, so no continuous entry-level vetos.
+        entry_level_vetos: Vec::new(),
     }
 }
 
@@ -957,6 +973,7 @@ fn build_trade_spec(
     tp: f64,
     roles: &Roles,
     pip_size: f64,
+    entry_level_vetos: Vec<trade_control_core::intent::EntryLevelVeto>,
 ) -> cli::TradeSpec {
     use cli::TradePattern;
     let pattern = match direction {
@@ -1011,6 +1028,7 @@ fn build_trade_spec(
         // the entry/SL offset_pips with the right pip, not its forex default.
         pip_size: Some(pip_size),
         blackout_close: args.blackout_close.into_core(),
+        entry_level_vetos,
     };
     if args.sl_from_recent {
         spec.sl_anchor = Some(match direction {
@@ -1019,6 +1037,64 @@ fn build_trade_spec(
         });
     }
     spec
+}
+
+/// The continuous at-entry level vetos for an H&S/IH&S setup (Bug #12).
+///
+/// Two levels, mirroring the `intent.vetos` name-list the enter already
+/// carries:
+/// - **pcl-exhausted** — `midpoint + 0.8 × (TP − midpoint)` from the fib;
+///   the move is mostly done, a late entry's R:R no longer justifies opening.
+///   For a short the entry is "past" when **at or below** it (`Below`); a long
+///   mirrors (`Above`). Named `too-low` (short) / `too-high` (long).
+/// - **invalidation** — the operator's horizontal at the right shoulder; the
+///   thesis is dead once price runs back past it. For a short "past" is **at
+///   or above** (`Above`); a long mirrors (`Below`). Named `too-high` (short)
+///   / `too-low` (long).
+///
+/// A level that comes back `NaN` (drawing absent or malformed) is skipped so a
+/// missing fib / invalidation can't bake a poison level. Direction picks both
+/// the name and the side.
+fn hs_entry_level_vetos(
+    roles: &Roles,
+    direction: Direction,
+) -> Vec<trade_control_core::intent::EntryLevelVeto> {
+    use trade_control_core::intent::{EntryLevelVeto, VetoSide};
+    let mut out = Vec::new();
+
+    // pcl-exhausted (the "ran most of the way to TP" gate).
+    if let Some(fib) = roles.tp_fib.as_ref() {
+        let level = pcl_exhausted_price_from_fib(&fib.prices(), direction);
+        if level.is_finite() {
+            let (name, past) = match direction {
+                Direction::Short => ("too-low", VetoSide::Below),
+                Direction::Long => ("too-high", VetoSide::Above),
+            };
+            out.push(EntryLevelVeto {
+                name: name.into(),
+                level,
+                past,
+            });
+        }
+    }
+
+    // invalidation (the right-shoulder horizontal; thesis dead past it).
+    if let Some(inv) = roles.invalidation.as_ref() {
+        let level = horizontal_price(&inv.prices());
+        if level.is_finite() {
+            let (name, past) = match direction {
+                Direction::Short => ("too-high", VetoSide::Above),
+                Direction::Long => ("too-low", VetoSide::Below),
+            };
+            out.push(EntryLevelVeto {
+                name: name.into(),
+                level,
+                past,
+            });
+        }
+    }
+
+    out
 }
 
 fn broker_to_kind(b: Broker) -> cli::BrokerKind {
@@ -1996,6 +2072,7 @@ mod tests {
             150.0,
             &Roles::default(),
             0.01,
+            Vec::new(),
         );
         assert_eq!(spec.pattern, cli::TradePattern::Hs);
         assert!(spec.mw.is_none());
@@ -2019,8 +2096,59 @@ mod tests {
             1.05,
             &Roles::default(),
             pip_size,
+            Vec::new(),
         );
         assert_eq!(spec.pip_size, Some(0.25));
+    }
+
+    #[test]
+    fn hs_entry_level_vetos_short_sides_and_skips_missing() {
+        // Bug #12: a short H&S with a fib (head 1.1000 → neckline 1.0900) and
+        // an invalidation horizontal at 1.1050 bakes two level vetos:
+        //   too-low  = pcl-exhausted, side Below  (entry past it = too far down)
+        //   too-high = invalidation,  side Above  (entry above the shoulder)
+        use trade_control_core::intent::VetoSide;
+        let mut roles = Roles {
+            // fib: head → neckline (2 prices).
+            tp_fib: Some(path_n("fib", &[1.1000, 1.0900])),
+            // invalidation horizontal (1 price).
+            invalidation: Some(path_n("inv", &[1.1050])),
+            ..Default::default()
+        };
+        let vetos = hs_entry_level_vetos(&roles, Direction::Short);
+        let by = |n: &str| vetos.iter().find(|v| v.name == n).expect("present");
+        // pcl: midpoint 1.0950, tp = 2×1.0900 − 1.1000 = 1.0800,
+        //   level = 1.0950 + 0.8×(1.0800 − 1.0950) = 1.0830.
+        let low = by("too-low");
+        assert_eq!(low.past, VetoSide::Below);
+        assert!((low.level - 1.0830).abs() < 1e-9, "{}", low.level);
+        let high = by("too-high");
+        assert_eq!(high.past, VetoSide::Above);
+        assert!((high.level - 1.1050).abs() < 1e-9);
+
+        // Missing fib → only the invalidation veto is baked (NaN is skipped).
+        roles.tp_fib = None;
+        let vetos = hs_entry_level_vetos(&roles, Direction::Short);
+        assert_eq!(vetos.len(), 1);
+        assert_eq!(vetos[0].name, "too-high");
+    }
+
+    #[test]
+    fn hs_entry_level_vetos_long_mirrors() {
+        // IH&S long: sides flip. pcl named too-high/Above, invalidation
+        // too-low/Below.
+        use trade_control_core::intent::VetoSide;
+        let roles = Roles {
+            tp_fib: Some(path_n("fib", &[1.0900, 1.1000])), // head below neckline (long)
+            invalidation: Some(path_n("inv", &[1.0850])),
+            ..Default::default()
+        };
+        let vetos = hs_entry_level_vetos(&roles, Direction::Long);
+        let pcl = vetos.iter().find(|v| v.name == "too-high").expect("pcl");
+        assert_eq!(pcl.past, VetoSide::Above);
+        let inv = vetos.iter().find(|v| v.name == "too-low").expect("inv");
+        assert_eq!(inv.past, VetoSide::Below);
+        assert!((inv.level - 1.0850).abs() < 1e-9);
     }
 
     #[test]

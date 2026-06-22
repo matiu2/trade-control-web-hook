@@ -196,6 +196,7 @@ mod tests {
 
     fn intent_with_allow_entry(gate: Option<Tunable<bool>>) -> Intent {
         Intent {
+            entry_level_vetos: Vec::new(),
             v: 1,
             id: "msg-1".into(),
             not_before: None,

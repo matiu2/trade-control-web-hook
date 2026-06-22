@@ -546,6 +546,22 @@ below, then entry candle." Each event is its own TradingView alert; the
 worker stores short-lived named flags per-instrument and the `enter`
 intent declares which flags must be set (and which must not).
 
+### Continuous at-entry level vetos (`too-low` / `too-high`)
+
+Beyond the named-flag vetos above, an H&S/IH&S enter also carries
+**level-bearing** entry vetos baked at arm time — the pcl-exhausted
+(`too-low`) and invalidation (`too-high`) prices. The worker re-checks the
+**resolved entry price** against these on every fire and rejects
+(`rejected: veto-active (<name>)`, HTTP 412, no order placed) when the entry
+is already past the level — **independent of whether any cross-event guard
+fired**. This is a *continuous* predicate ("is the entry already too far into
+the move?"), not a one-shot cross: it catches a price that **gapped past** the
+level or was **already past** it when the plan armed, which the engine's
+one-shot cross guard would miss. It restores the legacy behaviour where a
+persistent KV `too-low`/`too-high` veto blocked a confirmed enter (Bug #12,
+the NZD/CAD −110.53 GBP incident). The named-flag `vetos` list is unchanged
+and still gates any externally/guard-set KV veto.
+
 A `prep` intent records that a named step happened, with a TTL:
 
 ```yaml

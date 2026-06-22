@@ -52,6 +52,12 @@ pub enum SimOutcome {
     /// The intent couldn't be resolved to concrete levels (not an enter, M/W
     /// not armed, invalid geometry, …). Carries the resolver's reason.
     Unresolved(String),
+    /// The worker's at-entry level veto (Bug #12) would have rejected the
+    /// entry: the resolved entry price is already past a baked
+    /// `entry_level_veto` (pcl-exhausted / invalidation). No order placed.
+    /// Carries the veto name (`too-low` / `too-high`). `simulate_fill`
+    /// short-circuits here before any fill, mirroring `run_enter`'s gate.
+    Declined { name: String },
 }
 
 /// Simulate one fired enter `intent` (with its triggering `candle` folded into a
@@ -71,6 +77,21 @@ pub fn simulate_fill(
         Ok(r) => r,
         Err(err) => return SimOutcome::Unresolved(err.to_string()),
     };
+
+    // At-entry level veto (Bug #12) — the worker's `run_enter` rejects an
+    // entry already past a baked pcl-exhausted / invalidation level before any
+    // placement, independent of the cross-event guard. `simulate_fill` doesn't
+    // run `run_enter`, so mirror that gate here: a past level → no fill.
+    let entry_ref_price = resolved.entry.reference_price();
+    if let Some(elv) = intent
+        .entry_level_vetos
+        .iter()
+        .find(|elv| elv.is_past(entry_ref_price))
+    {
+        return SimOutcome::Declined {
+            name: elv.name.clone(),
+        };
+    }
 
     // Phase 1 — find the fill. A market entry is filled at the trigger candle's
     // close (the shell's candle); a stop/limit fills on the first forward candle
@@ -182,6 +203,7 @@ mod tests {
 
     fn base_enter() -> Intent {
         Intent {
+            entry_level_vetos: Vec::new(),
             v: 1,
             id: "sim-test".into(),
             not_before: None,
@@ -321,6 +343,60 @@ mod tests {
         assert!(matches!(
             simulate_fill(&intent, &shell, 0.0001, &still_open),
             SimOutcome::FilledOpen { .. }
+        ));
+    }
+
+    #[test]
+    fn entry_level_veto_flips_loss_to_no_fill() {
+        // Bug #12 regression — the −110.53 GBP path. Same candles, same
+        // resolved entry: with NO entry-level veto the order fills and runs to
+        // its stop (a loss); with a breached pcl-exhausted level baked on, the
+        // simulator declines before filling (£0), exactly as the worker's
+        // `run_enter` gate would.
+        use trade_control_core::intent::{EntryLevelVeto, VetoSide};
+        let mut intent = long_stop_intent();
+        intent.entry = Some(EntrySpec::Stop {
+            from: PriceAnchor::Close,
+            offset_pips: 10.0, // trigger 1.1050
+            at: None,
+            on_too_close: None,
+        });
+        let shell = trigger_shell();
+        // Fills @1.1050, then a candle reaches SL 1.1000 → StoppedOut.
+        let sl_path = [
+            candle("2026-06-17T11:00:00Z", 1.1042, 1.1055, 1.1041, 1.1052),
+            candle("2026-06-17T12:00:00Z", 1.1050, 1.1051, 1.0995, 1.1000),
+        ];
+
+        // Baseline: no veto → the loss path.
+        assert!(matches!(
+            simulate_fill(&intent, &shell, 0.0001, &sl_path),
+            SimOutcome::StoppedOut { .. }
+        ));
+
+        // With a pcl-exhausted level the entry (1.1050) is already past
+        // (`Above` 1.1040 for a long) → declined, no fill.
+        intent.entry_level_vetos = vec![EntryLevelVeto {
+            name: "too-high".into(),
+            level: 1.1040,
+            past: VetoSide::Above,
+        }];
+        assert_eq!(
+            simulate_fill(&intent, &shell, 0.0001, &sl_path),
+            SimOutcome::Declined {
+                name: "too-high".into()
+            }
+        );
+
+        // An entry short of the level still fills (don't-over-decline control).
+        intent.entry_level_vetos = vec![EntryLevelVeto {
+            name: "too-high".into(),
+            level: 1.1060, // entry 1.1050 < 1.1060 → not past
+            past: VetoSide::Above,
+        }];
+        assert!(matches!(
+            simulate_fill(&intent, &shell, 0.0001, &sl_path),
+            SimOutcome::StoppedOut { .. }
         ));
     }
 

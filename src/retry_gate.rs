@@ -1103,6 +1103,7 @@ mod tests {
 
     fn intent_with_max_retries_tunable(max_retries: Tunable<u32>) -> Intent {
         Intent {
+            entry_level_vetos: Vec::new(),
             v: 1,
             id: "msg-1".into(),
             not_before: None,

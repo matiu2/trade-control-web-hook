@@ -21,6 +21,19 @@ pub enum ResolvedEntry {
     Limit { trigger_price: f64 },
 }
 
+impl ResolvedEntry {
+    /// The price the entry-level gates / risk math key off: the trigger for a
+    /// Stop / Limit pending order, or the reference (close) for a Market fill.
+    pub fn reference_price(&self) -> f64 {
+        match self {
+            ResolvedEntry::Market { reference_price } => *reference_price,
+            ResolvedEntry::Stop { trigger_price } | ResolvedEntry::Limit { trigger_price } => {
+                *trigger_price
+            }
+        }
+    }
+}
+
 /// How units are determined for this trade. Resolved from the
 /// intent's `risk_pct` / `risk_amount` / `size_units` fields
 /// (exactly one of them is required).
@@ -586,6 +599,7 @@ mod tests {
 
     fn long_market_intent() -> Intent {
         Intent {
+            entry_level_vetos: Vec::new(),
             v: 1,
             id: "t1".into(),
             not_before: None,
