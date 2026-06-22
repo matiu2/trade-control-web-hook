@@ -440,6 +440,11 @@ pub async fn handle_adopt(req: &mut Request, env: &Env) -> Result<Response> {
         // adopted trades need widen coverage, plumb a `pip_size` onto the
         // adopt payload.
         pip_size: None,
+        // Adopt-trade has no intent in hand, so use the safe default
+        // (cancel a resting order, never close a position). An adopted
+        // trade is already filled, so the sweep's close branch never
+        // applies to it anyway.
+        blackout_close: trade_control_core::intent::BlackoutCloseAction::default(),
     };
 
     if let Err(err) = state.record_entry_attempt(attempt.clone()).await {

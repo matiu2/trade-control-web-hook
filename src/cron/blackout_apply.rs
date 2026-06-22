@@ -386,6 +386,7 @@ mod tests {
             stop_loss_price: Some(1.8000),
             cancel_at: None,
             pip_size,
+            blackout_close: trade_control_core::intent::BlackoutCloseAction::default(),
         }
     }
 

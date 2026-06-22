@@ -5,12 +5,14 @@
 //! reads `OANDA_API_KEY`, `OANDA_ACCOUNT_ID`, and the optional `OANDA_LIVE`
 //! secret from the Worker `Env`.
 
+mod candles;
 mod fx;
 mod oanda;
 mod risk;
 
 pub use oanda::OANDA_ACCOUNT_ID;
 
+use chrono::{DateTime, Utc};
 use oanda::{
     amend_stop as amend_stop_impl, cancel_order as cancel_order_impl,
     cancel_pending_for_instrument, close_positions, get_quote as get_quote_impl,
@@ -20,8 +22,8 @@ use oanda::{
 };
 use oanda_client::OandaClient;
 use trade_control_core::broker::{
-    AmendError, AttemptState, Broker, CancelError, EntryError, EntryRequest, LookupError,
-    OpenPosition, PendingOrder, Quote,
+    AmendError, AttemptState, Broker, CancelError, Candle, CandleError, EntryError, EntryRequest,
+    Granularity, LookupError, OpenPosition, PendingOrder, Quote,
 };
 use worker::{Env, console_error};
 
@@ -119,6 +121,16 @@ impl Broker for OandaBroker {
         _account_id: &str,
     ) -> Result<Vec<PendingOrder>, LookupError> {
         list_pending_orders_impl(&self.client, &self.account_id).await
+    }
+
+    async fn get_candles(
+        &self,
+        instrument: &str,
+        granularity: Granularity,
+        since: DateTime<Utc>,
+        now: DateTime<Utc>,
+    ) -> Result<Vec<Candle>, CandleError> {
+        candles::get_candles(&self.client, instrument, granularity, since, now).await
     }
 }
 

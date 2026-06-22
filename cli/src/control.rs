@@ -25,6 +25,7 @@ const STATUS_INSTRUMENT: &str = "ALL";
 /// Specific builders override only what they care about.
 fn control_skeleton(action: Action, instrument: &str, id: String, now: DateTime<Utc>) -> Intent {
     Intent {
+        entry_level_vetos: Vec::new(),
         v: 1,
         id,
         not_before: None,
@@ -67,6 +68,9 @@ fn control_skeleton(action: Action, instrument: &str, id: String, now: DateTime<
         reason: None,
         mw: None,
         pip_size: None,
+        trade_plan: None,
+        blackout_close: trade_control_core::intent::BlackoutCloseAction::default(),
+        include_archived: false,
     }
 }
 
@@ -84,6 +88,87 @@ pub fn build_unlock_intent(instrument: &str, now: DateTime<Utc>, suffix: &str) -
         now.format("%Y-%m-%dT%H%M%S")
     );
     control_skeleton(Action::Unlock, instrument, id, now)
+}
+
+/// Build a `register` Intent carrying a server-side [`TradePlan`].
+///
+/// The worker's `handle_register` requires the plan to be present and, if
+/// the carrier intent has a `trade_id`, that it match the plan's — so we set
+/// both `trade_id` and `instrument` from the plan. The id is unique per call
+/// (timestamp + suffix) so a re-arm of the same trade isn't rejected by the
+/// seen-id replay check. The plan rides the whole-body HMAC via `trade_plan`
+/// (rendered as single-line flow JSON by `build_signed_body`).
+pub fn build_register_intent(
+    plan: trade_control_core::trade_plan::TradePlan,
+    now: DateTime<Utc>,
+    suffix: &str,
+) -> Intent {
+    let id = format!(
+        "register-{}-{}-{suffix}",
+        plan.trade_id,
+        now.format("%Y-%m-%dT%H%M%S")
+    );
+    let instrument = plan.instrument.clone();
+    let trade_id = plan.trade_id.clone();
+    let mut intent = control_skeleton(Action::Register, &instrument, id, now);
+    intent.trade_id = Some(trade_id);
+    intent.trade_plan = Some(plan);
+    intent
+}
+
+/// Build a `market-info` query `Intent` for a single instrument. The
+/// worker resolves `instrument` (a TradeNation MarketName, e.g.
+/// `"Wall Street 30"`) against the broker and returns its session hours /
+/// spread / margin. TradeNation-only — the skeleton defaults `broker` to
+/// OANDA, so we override it here; the worker rejects a non-TN market-info.
+pub fn build_market_info_intent(instrument: &str, now: DateTime<Utc>, suffix: &str) -> Intent {
+    let id = format!(
+        "market-info-{instrument}-{}-{suffix}",
+        now.format("%Y-%m-%dT%H%M%S")
+    );
+    Intent {
+        broker: BrokerKind::TradeNation,
+        ..control_skeleton(Action::MarketInfo, instrument, id, now)
+    }
+}
+
+/// Build a `plan-list` query `Intent`. Read-only; lists every registered
+/// server-side plan. Like `status`, `instrument` is an ignored placeholder.
+/// `include_archived` (the `--include-all` flag) also enumerates terminated
+/// (vetoed/completed) plans retained in the archive keyspace.
+pub fn build_plan_list_intent(now: DateTime<Utc>, suffix: &str, include_archived: bool) -> Intent {
+    let id = format!("plan-list-{}-{suffix}", now.format("%Y-%m-%dT%H%M%S"));
+    Intent {
+        include_archived,
+        ..control_skeleton(Action::PlanList, STATUS_INSTRUMENT, id, now)
+    }
+}
+
+/// Build a `plan-show` query `Intent` for one `trade_id`. The worker scans
+/// every account scope for a plan with that id. `instrument` is an ignored
+/// placeholder; the target rides on `trade_id`.
+pub fn build_plan_show_intent(trade_id: &str, now: DateTime<Utc>, suffix: &str) -> Intent {
+    let id = format!(
+        "plan-show-{trade_id}-{}-{suffix}",
+        now.format("%Y-%m-%dT%H%M%S")
+    );
+    let mut intent = control_skeleton(Action::PlanShow, STATUS_INSTRUMENT, id, now);
+    intent.trade_id = Some(trade_id.to_string());
+    intent
+}
+
+/// Build a `plan-delete` `Intent` for one `trade_id` — the inverse of
+/// `register`. The worker scans every account scope and drops the matching
+/// plan + plan-state rows. `instrument` is an ignored placeholder; the target
+/// rides on `trade_id`.
+pub fn build_plan_delete_intent(trade_id: &str, now: DateTime<Utc>, suffix: &str) -> Intent {
+    let id = format!(
+        "plan-delete-{trade_id}-{}-{suffix}",
+        now.format("%Y-%m-%dT%H%M%S")
+    );
+    let mut intent = control_skeleton(Action::PlanDelete, STATUS_INSTRUMENT, id, now);
+    intent.trade_id = Some(trade_id.to_string());
+    intent
 }
 
 /// Build a `prep` Intent for a single (instrument, step) pair with a TTL.
@@ -224,6 +309,40 @@ pub fn wrap_signed_template(intent: &Intent, key: &[u8; KEY_LEN]) -> Result<Stri
 /// optional `Shell` fields stay `None`.
 pub fn wrap_signed_template_drawing(intent: &Intent, key: &[u8; KEY_LEN]) -> Result<String> {
     build_signed_body(intent, key, &shell_for_tv_template_drawing())
+}
+
+/// Build a signed body for an enter intent **POSTed directly to the
+/// worker** (no TradingView in the loop) — the position-tool direct
+/// entry. There are no `{{plot(…)}}` placeholders to substitute, so the
+/// shell carries a concrete `reference_price` as `close`/`high`/`low`
+/// and `now` as `time`.
+///
+/// `reference_price` must be the entry price the operator drew: the
+/// worker's resolver range-checks `stop_loss < close < take_profit`
+/// (long) / `take_profit < close < stop_loss` (short) and derives the
+/// R-multiple from it, so a placeholder zero would be rejected as
+/// `EntryOutsideRange`. The actual broker fill for a `Market` entry is
+/// at live price; this reference is the operator's drawn entry, which is
+/// the right basis for the geometry/R checks.
+pub fn wrap_signed_direct_enter(
+    intent: &Intent,
+    key: &[u8; KEY_LEN],
+    reference_price: f64,
+    now: DateTime<Utc>,
+) -> Result<String> {
+    build_signed_body(intent, key, &shell_for_direct_enter(reference_price, now))
+}
+
+/// Self-contained shell for a directly-POSTed enter: the drawn entry
+/// price stamped on `close`/`high`/`low`, and `now` on `time`.
+fn shell_for_direct_enter(reference_price: f64, now: DateTime<Utc>) -> Vec<(&'static str, String)> {
+    let price = format!("{reference_price}");
+    vec![
+        ("close", price.clone()),
+        ("high", price.clone()),
+        ("low", price),
+        ("time", format!("\"{}\"", now.to_rfc3339())),
+    ]
 }
 
 fn build_signed_body(
@@ -530,5 +649,86 @@ mod tests {
         assert!(body.contains("time:"), "body was:\n{body}");
         assert!(!body.contains("{{close}}"), "body was:\n{body}");
         assert!(body.contains("sig: \"v1-sig."), "body was:\n{body}");
+    }
+
+    /// A minimal one-rule plan for register signing tests.
+    fn sample_plan() -> trade_control_core::trade_plan::TradePlan {
+        use trade_control_core::broker::Granularity;
+        use trade_control_core::trade_plan::{
+            BarEvent, ConditionRule, CrossDir, FireMode, TradePlan, Trigger,
+        };
+        let rule_intent = control_skeleton(Action::Veto, "EUR_USD", "veto-1".into(), t());
+        TradePlan {
+            trade_id: "eurusd-hs-7".into(),
+            instrument: "EUR_USD".into(),
+            direction: trade_control_core::intent::Direction::Short,
+            granularity: Granularity::H1,
+            pip_size: 0.0001,
+            rules: vec![ConditionRule {
+                rule_id: "01-veto-too-high".into(),
+                trigger: Trigger::HorizontalCross {
+                    level: 1.2000,
+                    dir: CrossDir::Up,
+                    bar: BarEvent::Intrabar,
+                },
+                fire_mode: FireMode::Once,
+                intent: rule_intent,
+            }],
+            shadow: false,
+        }
+    }
+
+    #[test]
+    fn register_intent_binds_trade_id_and_carries_plan() {
+        let intent = build_register_intent(sample_plan(), t(), "cd34");
+        assert_eq!(intent.action, Action::Register);
+        // The carrier's trade_id / instrument must match the plan so the
+        // worker's handle_register cross-check passes.
+        assert_eq!(intent.trade_id.as_deref(), Some("eurusd-hs-7"));
+        assert_eq!(intent.instrument, "EUR_USD");
+        let plan = intent.trade_plan.as_ref().expect("plan present");
+        assert_eq!(plan.rules.len(), 1);
+    }
+
+    /// The whole plan must ride the signature: a signed register body
+    /// round-trips through the worker's `parse_and_verify`, reconstructing
+    /// the nested `trade_plan` intact — proving the single-line flow-JSON
+    /// rendering is both signed and re-parseable.
+    #[test]
+    fn signed_register_body_round_trips_through_verify() {
+        let key = [7u8; KEY_LEN];
+        let intent = build_register_intent(sample_plan(), t(), "cd34");
+        let body = wrap_signed(&intent, &key, t()).unwrap();
+        // The plan is a single top-level line (flow JSON), not block YAML.
+        assert!(body.contains("trade_plan: {"), "body was:\n{body}");
+        let verified = trade_control_core::incoming::parse_and_verify(&body, &key, t())
+            .expect("register body should verify");
+        assert_eq!(verified.intent.action, Action::Register);
+        let plan = verified
+            .intent
+            .trade_plan
+            .as_ref()
+            .expect("plan survived verify");
+        assert_eq!(plan.trade_id, "eurusd-hs-7");
+        assert_eq!(plan.rules.len(), 1);
+        assert_eq!(plan.rules[0].rule_id, "01-veto-too-high");
+    }
+
+    /// Tampering with the plan after signing must fail verification — the
+    /// plan is inside the HMAC, not appended unsigned.
+    #[test]
+    fn tampered_register_plan_is_rejected() {
+        let key = [7u8; KEY_LEN];
+        let intent = build_register_intent(sample_plan(), t(), "cd34");
+        let body = wrap_signed(&intent, &key, t()).unwrap();
+        // Flip a digit in the plan's baked level (1.2 → 9.2) without re-signing.
+        let tampered = body.replace("\"level\":1.2", "\"level\":9.2");
+        assert_ne!(tampered, body, "tamper substitution must have matched");
+        let err = trade_control_core::incoming::parse_and_verify(&tampered, &key, t())
+            .expect_err("tampered plan must be rejected");
+        assert!(
+            matches!(err, trade_control_core::incoming::IncomingError::Sig(_)),
+            "expected a signature error, got {err:?}"
+        );
     }
 }

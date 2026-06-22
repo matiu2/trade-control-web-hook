@@ -24,9 +24,14 @@ deploying anything.
 
 | branch | environment | worker | CLIs | who uses it |
 |---|---|---|---|---|
-| `main` | **dev** | `trade-control-web-hook` | `*-dev` | coding / development |
+| `main` | **dev** | `trade-control-web-hook-dev` | `*-dev` | coding / development |
 | `staging` | **staging (demo)** | `trade-control-web-hook-staging` | `*-staging` | the week's live demo trading |
 | `prod` | **prod (real money)** | `trade-control-web-hook-prod` | `*-prod` | **not stood up yet** — first promotion target |
+
+**Every environment now carries a suffix** (`-dev` / `-staging` / `-prod`).
+The old **no-suffix** worker `trade-control-web-hook` + its R2 bucket
+`trade-control-recording` are **deprecated**: left running only while last
+week's demo trades are journaled, then deleted. Don't deploy to them.
 
 Current working split (2026-06): **trading runs on `staging`** (demo
 account, real-time), **coding happens on `main`**. So treat the `staging`
@@ -74,12 +79,13 @@ binary `trade-control`).
 `prod` doesn't exist yet. The plan: when `staging` has run a full week
 unchanged + profitable, it gets merged into a new `prod` branch with a
 prod-pointed `wrangler.toml`, and a fresh `staging` is cut from `main`.
-**Known wrinkle for whoever sets up prod:** the current intent is that
-`trade-control-web-hook` (today's dev worker) *becomes prod*, and a new
-`trade-control-web-hook-dev` worker is cut for dev. When that happens,
-`deploy-dev.sh`'s `ENV_WEBHOOK` changes to the new dev URL and
-`deploy-live.sh` points at `trade-control-web-hook`. Keep each branch's
-`wrangler.toml` divergent and pointed at its own worker.
+Under the **everything-suffixed** model, prod is its own worker
+`trade-control-web-hook-prod` (R2 `trade-control-recording-prod`) — a clean
+new env, *not* a rename of an existing worker. `deploy-live.sh` (added at
+that point) points at `-prod`; `main`/`-dev` and `staging`/`-staging` keep
+their own workers. The legacy no-suffix worker is retired separately (after
+the journaling window) and is **not** repurposed as prod. Keep each branch's
+`wrangler.toml` divergent and pointed at its own suffixed worker.
 
 ## Things the README doesn't shout
 
@@ -109,6 +115,45 @@ What "retry" is **not**:
   entry. Top-level intent-id dedup still applies on `Ok` outcomes —
   multi-shot needs distinct intent ids per fire (which `build-trade`
   mints for multi-shot setups, not for single-shot).
+
+### A multi-shot enter must NOT retire the cron-engine plan
+
+In the cron-engine model a `FireMode::Once` enter set `Phase::Done`
+the moment it fired, and the cron archives + clears any `Done` plan
+(`src/cron/engine.rs`, `persist_plan_state`). For a *single-shot*
+enter that's correct. For a **multi-shot** enter (`max_retries > 0`)
+it silently broke re-entry: the plan that would fire attempt #2 was
+gone after the first fire, so place → fill → close → re-enter never
+got a second bar. The live worker would enter once and never
+re-enter even though the operator opted into multi-shot. Caught by
+the replay on NZD/CHF 2026-06-19 (07:30 short → SL, expected 13:00
+re-entry never fired).
+
+Fix (commit `83333fa`, `engine/src/evaluate.rs::evaluate_entry`): a
+`Once` enter only transitions to `Phase::Done` when it is *also*
+single-shot (`max_retries == Tunable::Static(0)`). Anything else —
+including a script-resolved cap — is treated as multi-shot, fires
+this bar, and **stays in `Phase::AwaitEntry`**: the plan survives,
+its vetos keep ticking, and the next golden signal bar fires the
+enter again. The placement cap is **not** the engine's job — it's
+the worker's retry gate. The plan still retires the normal way (a
+terminal `close-positions` veto, `trade-expiry`, or the enter's
+`not_after` window closing). New test
+`multi_shot_pine_enter_fires_but_stays_await_entry`; single-shot
+behaviour is byte-identical (all prior tests use `Static(0)`).
+
+The retry gate itself **moved to `core`** (commit `edef1ea`):
+`trade_control_core::retry_gate` (was `src/retry_gate.rs`, worker
+bin, wasm-only). It was already generic over `<B: Broker, S:
+StateStore>`; the only worker coupling was the `rlog!` / `rlog_err!`
+recording-buffer macros, now plain `tracing::info!` / `error!`
+(wasm-safe). Both consumers now call
+`trade_control_core::retry_gate::evaluate` with their own `Broker` —
+the worker its real TradeNation/OANDA broker, the offline replay a
+fake broker that approximates a prior attempt's state by simulating
+it against the candle window. One async gate, swappable broker, no
+decision duplication. (Stale `src/retry_gate.rs` paths in the prose
+above and a comment at `src/lib.rs:1186` predate this move.)
 
 ### Replay protection scope
 
@@ -207,6 +252,42 @@ Key facts a refactorer must preserve:
   `reversal_veto_plan()` helper (KV-free, unit-tested); the KV write
   is a thin wrapper.
 
+### `too-high` is close-confirmed now; `too-low` still fires on a wick
+
+The two at-level invalidation vetos a H&S enter carries are **not**
+symmetric in cross semantics, and that asymmetry is intentional — don't
+"fix" one to match the other.
+
+For a **short** trade (mirror for long):
+
+- **`too-high` = invalidation** (the drawing-bound horizontal at the
+  shoulder cap). Built as `HorizontalCross { dir: Up, bar: Intrabar }`
+  in `tv-arm/src/trade_plan_build.rs::invalidation_or_pcl_trigger`. The
+  engine's intrabar `Up` cross requires the bar to **close** on the up
+  side: `straddles && candle.c >= level` (`engine/src/evaluate.rs`
+  `level_crossed`). **Previous behaviour was any wick above the level
+  (a touch); it is now a close above.** A bar whose high pokes above
+  `too-high` but closes back below does **not** fire. (Seen on
+  NZD/CHF 2026-06-19: the 10:45 Brisbane bar `H=0.46359 C=0.46351`
+  vs level `0.46354` — wick above, close below → no fire, by design.)
+
+- **`too-low` = pcl-exhausted** (the computed fib level, ~80% of the way
+  to TP). Built as `PriceValueCross { dir: Either, bar: Intrabar }`.
+  Intrabar `Either` fires on **any straddle** regardless of where the
+  close sits — so a wick down to the 80%-completion level **still
+  aborts** the trade. This is **unchanged** from the original behaviour
+  and must stay that way: if a short ran 80% to TP without us, a wick
+  alone is reason enough to abort.
+
+Why the asymmetry is right: an invalidation wick that immediately
+retreats is debatably *not* an invalidation (close-confirm filters the
+fakeout), whereas a pcl-exhaustion wick means the move you wanted
+already happened without you — abort on the touch. If you ever
+unify these, unify toward the operator's intent per-level, not toward
+one cross mode for both. (These levels are also baked onto the enter as
+continuous `entry_level_vetos` — see Bug #12 / `[[bug12_at_entry_level_vetos]]`
+— which is `is_past`-inclusive and independent of this cross-guard.)
+
 ### tv_arm_hs.py: server-side trendline-cross eval is anchor-bounded
 
 Burned a lot of time on this. When you POST a `create_alert` with
@@ -251,6 +332,18 @@ registered in the parent's `.gitmodules`. So:
 - Updating: commit + push *inside* this repo first, then in the parent
   `git add trade-control-web-hook && git commit && git push` to advance
   the pointer.
+- **Always advance the parent pointer after merging to `main` here.** A
+  merge to this repo's `main` is not "done" until the parent gitlink is
+  bumped and pushed — otherwise the parent still points at the old commit
+  and a fresh `trading-libraries` checkout gets stale code. So the tail of
+  every merge-to-main is:
+  ```sh
+  cd /home/matiu/projects/trading-libraries
+  git add trade-control-web-hook && \
+    git commit -m "bump trade-control-web-hook: <what merged>" && git push
+  ```
+  Do this immediately, same as the commit+push+tag-by-default rule — don't
+  wait for the user to ask.
 - The parent's `CLAUDE.md` (long architectural doc) lists this repo
   under "regular directories" — that note is outdated; treat it as a
   submodule.

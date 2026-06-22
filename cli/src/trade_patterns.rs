@@ -28,12 +28,14 @@ use serde::{Deserialize, Serialize};
 
 use trade_control_conventions::AlertBasename;
 use trade_control_core::intent::{
-    Action, BrokerKind, Direction, EntrySpec, Intent, MW_CANCEL_VETO_NAME, MW_OVERSHOOT_VETO_NAME,
-    PriceAnchor, PriceRef, TakeProfit, VetoLevel,
+    Action, BlackoutCloseAction, BrokerKind, Direction, EntrySpec, Intent, MW_CANCEL_VETO_NAME,
+    MW_OVERSHOOT_VETO_NAME, PriceAnchor, PriceRef, TakeProfit, VetoLevel,
 };
 use trade_control_core::sig::KEY_LEN;
 
-use crate::control::{wrap_signed_template, wrap_signed_template_drawing};
+use crate::control::{
+    wrap_signed_direct_enter, wrap_signed_template, wrap_signed_template_drawing,
+};
 use crate::expiry;
 use crate::instruments::validate_instrument;
 
@@ -151,21 +153,39 @@ struct PatternGeometry {
 impl PatternGeometry {
     fn for_pattern(p: TradePattern) -> Self {
         match p {
+            // Entry/SL anchor to the *latched* signal extremes, not the
+            // triggering candle's own wick, so a confirmation re-fire resolves
+            // to the same geometry as the break-candle fire (bug #10 finding A).
+            //
+            // The offset is applied raw at resolution (`anchor + offset_pips *
+            // pip`, no direction flip), so each offset's **sign** must push the
+            // level *away from the pattern in the breakout direction*: a
+            // `signal_low` anchor takes a negative offset (1 pip below the low),
+            // a `signal_high` anchor a positive one (1 pip above the high).
+            // A flat `+1.0` on every anchor was wrong for the two low anchors —
+            // it placed them 1 pip *above* the low (HS entered too high → tight
+            // SL → stop-out; a bar closing on its low resolved `InvalidGeometry`).
+            //
+            // For a short H&S: sell-stop entry 1 pip *below* the break at
+            // signal_low, SL 1 pip *above* the pattern at signal_high.
             TradePattern::Hs => Self {
                 direction: Direction::Short,
-                entry_anchor: PriceAnchor::Low,
-                entry_offset_default: 1.0,
-                sl_anchor: PriceAnchor::High,
+                entry_anchor: PriceAnchor::SignalLow,
+                entry_offset_default: -1.0,
+                sl_anchor: PriceAnchor::SignalHigh,
                 sl_offset_default: 1.0,
                 invalidation_veto_name: "too-high",
                 pcl_exhausted_veto_name: "too-low",
             },
+            // Inverse H&S long: mirror of the above — buy-stop entry 1 pip
+            // *above* the break at signal_high, SL 1 pip *below* the pattern at
+            // signal_low.
             TradePattern::Ihs => Self {
                 direction: Direction::Long,
-                entry_anchor: PriceAnchor::High,
+                entry_anchor: PriceAnchor::SignalHigh,
                 entry_offset_default: 1.0,
-                sl_anchor: PriceAnchor::Low,
-                sl_offset_default: 1.0,
+                sl_anchor: PriceAnchor::SignalLow,
+                sl_offset_default: -1.0,
                 invalidation_veto_name: "too-low",
                 pcl_exhausted_veto_name: "too-high",
             },
@@ -303,17 +323,26 @@ pub struct TradeSpec {
     #[serde(default)]
     pub sl_offset_pips: Option<f64>,
     /// Override the pattern's default SL anchor. Omit to use the pattern
-    /// default (`High` for H&S, `Low` for iH&S — the signal bar's own
-    /// extreme). Set to `recent_high` / `recent_low` to anchor against
-    /// Pine's `recent_high` / `recent_low` shell fields, which span the
-    /// indicator's `sl_lookback` window of bars *strictly preceding* the
-    /// signal bar. Useful when the signal candle is unusually small and
-    /// a tight wick-based SL would be hit by ordinary noise.
+    /// default (`signal_high` for H&S, `signal_low` for iH&S — the latched
+    /// pattern extreme, stable across a confirmation re-fire). Set to
+    /// `recent_high` / `recent_low` to anchor against Pine's `recent_high` /
+    /// `recent_low` shell fields instead, which span the indicator's
+    /// `sl_lookback` window of bars *strictly preceding* the signal bar, or
+    /// `high` / `low` to anchor to the triggering candle's own wick.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sl_anchor: Option<PriceAnchor>,
     /// Take-profit absolute price. The worker treats this verbatim and
     /// does not consult the shell.
     pub tp_price: f64,
+    /// Optional **absolute** stop-loss price. When set, the enter intent
+    /// carries `PriceRef::Absolute` for the SL instead of anchoring to
+    /// geometry + `sl_offset_pips` — used by the position-tool direct
+    /// entry, where the operator drew the stop at a fixed price rather
+    /// than relative to a pattern extreme. When `None` (the default,
+    /// every pattern path), SL stays geometry-anchored and the yaml is
+    /// byte-identical to pre-feature output.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sl_price: Option<f64>,
     /// Entry window end as a percentage of (trade_expiry − now). Default
     /// 80 — leaves a tail of trade_expiry to chase a late retest only if
     /// the operator extends the window.
@@ -413,6 +442,32 @@ pub struct TradeSpec {
     /// default (pre-feature behaviour).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pip_size: Option<f64>,
+    /// What the market-hours blackout sweep should do with this trade's
+    /// still-pending resting order if it's caught inside the instrument's
+    /// daily close→open gap. Lands on the `05-enter` intent's
+    /// `blackout_close`. Default [`BlackoutCloseAction::CancelResting`]
+    /// (the incident fix: cancel the unfilled order, never close a filled
+    /// position); set `cancel-and-close` to also flatten an open position
+    /// on the instrument. Byte-identical to pre-feature spec yaml when left
+    /// at the default.
+    #[serde(default, skip_serializing_if = "is_default_blackout_close")]
+    pub blackout_close: BlackoutCloseAction,
+    /// Continuous at-entry level vetos (Bug #12) baked onto the `05-enter`
+    /// intent. For H&S these are the pcl-exhausted (`too-low`) and
+    /// invalidation (`too-high`) price levels, computed at arm time from the
+    /// fib + invalidation drawings; `build_enter_alert` copies them onto the
+    /// enter intent so the worker rejects an entry already past the level
+    /// even when no cross-event guard fired. Empty for M/W and for
+    /// pre-feature specs. `#[serde(default)]` keeps spec yaml byte-identical
+    /// when unset.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub entry_level_vetos: Vec<trade_control_core::intent::EntryLevelVeto>,
+}
+
+/// Skip-serializing predicate for [`TradeSpec::blackout_close`] — keeps a
+/// default spec yaml byte-identical to pre-feature specs.
+fn is_default_blackout_close(a: &BlackoutCloseAction) -> bool {
+    matches!(a, BlackoutCloseAction::CancelResting)
 }
 
 /// CLI-side mirror of [`trade_control_core::intent::MwParams`]. Kept as a
@@ -429,6 +484,11 @@ pub struct MwSpec {
     /// `A` — the runup start. Audit / log only; fed the arm-time
     /// neckline-% gate, not the worker's entry geometry.
     pub runup_start: f64,
+    /// `D` — the optional drawn right shoulder (4-point path). When set the
+    /// worker arms immediately. `#[serde(default)]` keeps a 3-point spec
+    /// yaml byte-identical.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub right_shoulder: Option<f64>,
     /// Broker spread in pips, read at arm time. `>= 0`.
     pub spread_pips: f64,
     /// Instrument pip size at arm time (e.g. `0.0001`). `> 0`.
@@ -442,6 +502,7 @@ impl MwSpec {
             neckline: self.neckline,
             first_point: self.first_point,
             runup_start: self.runup_start,
+            right_shoulder: self.right_shoulder,
             spread_pips: self.spread_pips,
             pip_size: self.pip_size,
         }
@@ -499,10 +560,37 @@ pub fn build_trade_interactive(pattern: TradePattern, now: DateTime<Utc>) -> Res
     }
 }
 
+/// How strictly to validate a [`TradeSpec`] that's about to be built.
+///
+/// The on-disk signing path (`build-trade --from-file`, `tv-arm
+/// --register-plan`) feeds the live worker, so a stale `trade_expiry`
+/// would arm a plan that can never enter — that's a hard error. The
+/// offline `tv-arm --plan-out` path (no worker POST) is used for
+/// replay / inspection of historical setups, where an expired window
+/// or an in-window news event is expected; there we only warn so the
+/// JSON still gets written.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BuildStrictness {
+    /// Bound for the live worker — expired / news-overlapping setups are
+    /// rejected.
+    Strict,
+    /// Offline `--plan-out` only — those conditions warn instead of erroring.
+    Lenient,
+}
+
 /// Build a trade from a pre-filled [`TradeSpec`] with no prompts. Used by
 /// the `--from-file` flag on `build-trade`. Validates the spec against
 /// the same rules the prompts would enforce, then assembles the alerts.
-pub fn build_trade_from_spec(mut spec: TradeSpec, now: DateTime<Utc>) -> Result<BuiltTrade> {
+///
+/// `strictness` controls whether time-sensitive checks (`trade_expiry` in
+/// the past, news in the window) are hard errors ([`BuildStrictness::Strict`],
+/// the live path) or warnings ([`BuildStrictness::Lenient`], offline
+/// `--plan-out`).
+pub fn build_trade_from_spec(
+    mut spec: TradeSpec,
+    now: DateTime<Utc>,
+    strictness: BuildStrictness,
+) -> Result<BuiltTrade> {
     let is_mw = matches!(spec.pattern, TradePattern::M | TradePattern::W);
     // `mw` and the pattern must agree: M/W require the baked path
     // geometry, H&S/IH&S must not carry it. Catch a hand-edited spec
@@ -543,7 +631,19 @@ pub fn build_trade_from_spec(mut spec: TradeSpec, now: DateTime<Utc>) -> Result<
         return Err(eyre!("account is required"));
     }
     if spec.trade_expiry <= now {
-        return Err(eyre!("trade_expiry must be in the future"));
+        match strictness {
+            BuildStrictness::Strict => {
+                return Err(eyre!("trade_expiry must be in the future"));
+            }
+            BuildStrictness::Lenient => {
+                tracing::warn!(
+                    trade_expiry = %spec.trade_expiry.to_rfc3339(),
+                    now = %now.to_rfc3339(),
+                    "trade_expiry is in the past — allowed because this is an offline \
+                     --plan-out build (would be rejected on the live worker path)",
+                );
+            }
+        }
     }
     if !spec.tp_price.is_finite() {
         return Err(eyre!("tp_price must be a finite number"));
@@ -600,9 +700,11 @@ pub fn build_trade_from_spec(mut spec: TradeSpec, now: DateTime<Utc>) -> Result<
             (geometry.direction, override_anchor),
             (
                 Direction::Short,
-                PriceAnchor::High | PriceAnchor::RecentHigh
-            ) | (Direction::Long, PriceAnchor::Low | PriceAnchor::RecentLow)
-                | (_, PriceAnchor::Close)
+                PriceAnchor::High | PriceAnchor::RecentHigh | PriceAnchor::SignalHigh
+            ) | (
+                Direction::Long,
+                PriceAnchor::Low | PriceAnchor::RecentLow | PriceAnchor::SignalLow
+            ) | (_, PriceAnchor::Close)
         );
         if !ok {
             return Err(eyre!(
@@ -771,12 +873,19 @@ fn build_pattern(
         entry_offset_pips: Some(entry_offset_pips),
         sl_offset_pips: Some(sl_offset_pips),
         tp_price,
+        // Interactive/questionnaire path always anchors SL to geometry.
+        sl_price: None,
         entry_deadline_pct,
         allow_entry: None,
         entry_mode: EntryMode::default(),
         sl_anchor: None,
         mw: None,
         pip_size: None,
+        // Interactive path keeps the safe default (cancel a resting order,
+        // never close a position). The `--blackout-close` flag lives on the
+        // `--from-file` / scripted path.
+        blackout_close: BlackoutCloseAction::default(),
+        entry_level_vetos: Vec::new(),
     };
     assemble_trade(spec, geometry, entry_offset_pips, sl_offset_pips, now)
 }
@@ -879,6 +988,7 @@ fn assemble_trade(
         entry_offset_pips,
         sl_offset_pips,
         spec.tp_price,
+        spec.sl_price,
         spec.risk_pct,
         spec.risk_amount,
         spec.dry_run,
@@ -890,12 +1000,14 @@ fn assemble_trade(
         spec.needs_confirmed,
         &spec.skip_preps,
         spec.pip_size,
+        spec.blackout_close,
         &spec.broker,
         &spec.account,
         // The enter must check the `reversal` veto only when a
         // reversal-close that writes it actually exists for this setup —
         // i.e. the flag is armed AND there are sr bands to reverse off.
         spec.veto_on_reversal && !spec.sr_reversal_ranges.is_empty(),
+        &spec.entry_level_vetos,
     ));
     if spec.close_on_news || !spec.sr_reversal_ranges.is_empty() {
         alerts.push(build_close_on_reversal_alert(
@@ -981,6 +1093,29 @@ fn build_mw_pattern(spec: TradeSpec, now: DateTime<Utc>) -> Result<BuiltTrade> {
         }
     };
 
+    // Build-time SL-vs-spread floor (hard limit; the worker re-checks at fire
+    // time against the live spread). The M/W entry/SL are pure functions of the
+    // baked anchors + arm-time spread, so we can reject a too-tight stop before
+    // signing — covers both tv-arm (which routes through here) and hand-crafted
+    // `build-trade --from-file` specs. Same constant + decision as the worker:
+    // `sl_spread_floor_violation`. (H&S has no build-time SL — it anchors to the
+    // fire-time signal extreme — so H&S relies on the worker gate alone.)
+    {
+        let params = mw.to_params();
+        let spread_price = params.spread_pips * params.pip_size;
+        let (entry, sl, _tp) = trade_control_core::intent::mw_static_prices(direction, &params);
+        let sl_distance = (entry - sl).abs();
+        if trade_control_core::intent::sl_spread_floor_violation(sl_distance, spread_price) {
+            let min_sl = trade_control_core::intent::SL_MIN_SPREAD_MULTIPLE * spread_price;
+            return Err(eyre!(
+                "M/W stop-loss is too close to the spread: SL distance {sl_distance} < required \
+                 {min_sl} ({}× the {spread_price} spread). Tighten the spread (arm in a better \
+                 session) or widen the pattern.",
+                trade_control_core::intent::SL_MIN_SPREAD_MULTIPLE
+            ));
+        }
+    }
+
     let trade_id = mint_trade_id(spec.pattern, &spec.instrument)?;
     let entry_deadline = derive_entry_deadline(now, spec.trade_expiry, spec.entry_deadline_pct);
     let veto_expiry = spec.trade_expiry + DEFAULT_POST_EXPIRY_GRACE;
@@ -1031,6 +1166,7 @@ fn build_mw_pattern(spec: TradeSpec, now: DateTime<Utc>) -> Result<BuiltTrade> {
             spec.allow_entry.as_deref(),
             spec.needs_golden,
             spec.needs_confirmed,
+            spec.blackout_close,
             &spec.broker,
             &spec.account,
         ),
@@ -1183,6 +1319,7 @@ fn build_mw_enter_alert(
     allow_entry: Option<&str>,
     needs_golden: bool,
     needs_confirmed: bool,
+    blackout_close: BlackoutCloseAction,
     broker: &BrokerKind,
     account: &str,
 ) -> BuiltAlert {
@@ -1217,6 +1354,8 @@ fn build_mw_enter_alert(
     intent.allow_entry = allow_entry.map(trade_control_core::tunable::Tunable::from_script);
     intent.needs_golden = needs_golden;
     intent.needs_confirmed = needs_confirmed;
+    // Market-hours blackout close policy — see build_enter_alert.
+    intent.blackout_close = blackout_close;
     intent.requires_preps = Vec::new();
     intent.vetos = vec![
         MW_CANCEL_VETO_NAME.into(),
@@ -1241,6 +1380,8 @@ fn anchor_label(anchor: PriceAnchor) -> &'static str {
         PriceAnchor::Low => "low",
         PriceAnchor::RecentHigh => "recent_high",
         PriceAnchor::RecentLow => "recent_low",
+        PriceAnchor::SignalHigh => "signal_high",
+        PriceAnchor::SignalLow => "signal_low",
     }
 }
 
@@ -1336,6 +1477,7 @@ fn skeleton(
     trade_id: &str,
 ) -> Intent {
     Intent {
+        entry_level_vetos: Vec::new(),
         v: 1,
         id,
         not_before: None,
@@ -1378,6 +1520,9 @@ fn skeleton(
         reason: None,
         mw: None,
         pip_size: None,
+        trade_plan: None,
+        blackout_close: trade_control_core::intent::BlackoutCloseAction::default(),
+        include_archived: false,
     }
 }
 
@@ -1581,6 +1726,7 @@ fn build_enter_alert(
     entry_offset_pips: f64,
     sl_offset_pips: f64,
     tp_price: f64,
+    sl_price: Option<f64>,
     risk_pct: f64,
     risk_amount: Option<f64>,
     dry_run: bool,
@@ -1592,9 +1738,11 @@ fn build_enter_alert(
     needs_confirmed: bool,
     skip_preps: &[String],
     pip_size: Option<f64>,
+    blackout_close: BlackoutCloseAction,
     broker: &BrokerKind,
     account: &str,
     check_reversal_veto: bool,
+    entry_level_vetos: &[trade_control_core::intent::EntryLevelVeto],
 ) -> BuiltAlert {
     let id = format!("{trade_id}-enter");
     let mut intent = skeleton(
@@ -1614,6 +1762,9 @@ fn build_enter_alert(
         EntryMode::Stop => EntrySpec::Stop {
             from: geometry.entry_anchor,
             offset_pips: entry_offset_pips,
+            // Pattern entries resolve against the live shell, not an
+            // absolute level — `at` is for the position-tool path only.
+            at: None,
             // No `on_too_close` opt-in from the H&S builder yet — bare
             // setups keep today's skip behaviour. A future CLI flag can
             // populate this (see the on_too_close follow-up).
@@ -1621,9 +1772,16 @@ fn build_enter_alert(
         },
         EntryMode::Market => EntrySpec::Market,
     });
-    intent.stop_loss = Some(PriceRef::Anchored {
-        from: geometry.sl_anchor,
-        offset_pips: sl_offset_pips,
+    // SL is normally anchored to the pattern extreme + offset. The
+    // position-tool direct entry instead supplies an absolute stop the
+    // operator drew, so when `sl_price` is set we emit `Absolute` and
+    // ignore the geometry anchor / offset entirely.
+    intent.stop_loss = Some(match sl_price {
+        Some(absolute) => PriceRef::Absolute { absolute },
+        None => PriceRef::Anchored {
+            from: geometry.sl_anchor,
+            offset_pips: sl_offset_pips,
+        },
     });
     // TP is an absolute price the operator typed in — the worker uses
     // it verbatim and ignores the shell.
@@ -1648,6 +1806,9 @@ fn build_enter_alert(
     intent.allow_entry = allow_entry.map(trade_control_core::tunable::Tunable::from_script);
     intent.needs_golden = needs_golden;
     intent.needs_confirmed = needs_confirmed;
+    // Market-hours blackout close policy — what the sweep does with this
+    // order if it's caught resting in the close→open gap.
+    intent.blackout_close = blackout_close;
     intent.requires_preps = ["break-and-close", "retest"]
         .into_iter()
         .filter(|step| !skip_preps.iter().any(|s| s == step))
@@ -1666,11 +1827,156 @@ fn build_enter_alert(
             .vetos
             .push(trade_control_core::intent::REVERSAL_VETO_NAME.into());
     }
+    // Continuous at-entry level vetos (Bug #12): pcl-exhausted / invalidation
+    // levels the worker re-checks against the resolved entry price, so an
+    // entry already past the level is rejected even when no cross-event guard
+    // fired. Carried only on the enter intent.
+    intent.entry_level_vetos = entry_level_vetos.to_vec();
     BuiltAlert {
         basename: AlertBasename::Enter.as_str().into_owned(),
         purpose: "enter: stop-entry gated by both preps + both vetos".into(),
         intent,
     }
+}
+
+/// Order type for a position-tool direct entry. Mirrors the tv-arm flag
+/// trio (`--market-entry` / `--stop-entry` / `--limit-entry`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PositionEntryKind {
+    /// Market order, filled by the worker on receipt at broker price.
+    Market,
+    /// Pending stop order resting at the drawn entry price.
+    Stop,
+    /// Pending limit order resting at the drawn entry price.
+    Limit,
+}
+
+/// Everything needed to build a position-tool direct-entry intent. The
+/// SL/TP are absolute prices the operator drew (see `tv-arm`'s
+/// `position_trade::resolve_levels`); `entry_price` is the drawn entry
+/// anchor, used both as the order's resting price (Stop/Limit) and the
+/// signed shell's reference `close` for the worker's geometry/R checks.
+#[derive(Debug, Clone)]
+pub struct PositionEnterSpec {
+    pub instrument: String,
+    pub account: String,
+    pub broker: BrokerKind,
+    pub direction: Direction,
+    pub kind: PositionEntryKind,
+    /// Drawn entry price (absolute).
+    pub entry_price: f64,
+    /// Absolute stop-loss price.
+    pub stop_loss: f64,
+    /// Absolute take-profit price.
+    pub take_profit: f64,
+    /// Trade-expiry deadline — the enter's `not_after`.
+    pub trade_expiry: DateTime<Utc>,
+    /// Risk per trade as a home-currency amount; when `None`, uses 1% pct.
+    pub risk_amount: Option<f64>,
+    /// Pip size baked onto the intent (from instrument-lookup).
+    pub pip_size: Option<f64>,
+    /// When true, the worker logs the order but doesn't push to broker.
+    pub dry_run: bool,
+}
+
+/// Build and sign a position-tool direct-entry body, ready to POST
+/// straight to the worker (no TradingView). Returns `(trade_id, signed_body)`.
+///
+/// The entry carries absolute SL/TP (`PriceRef::Absolute`), the chosen
+/// order type, the drawn `trade_expiry` as `not_after`, and no preps /
+/// pattern vetos — it's a naked manual entry. It's signed with a
+/// self-contained shell whose reference `close` is the drawn entry price
+/// (`wrap_signed_direct_enter`), so the worker's
+/// `stop_loss < close < take_profit` range check and R-multiple are
+/// evaluated against the operator's drawn geometry.
+///
+/// All three order types are supported. `Market` fills on receipt;
+/// `Stop` / `Limit` rest at the drawn entry price, expressed as the
+/// absolute `EntrySpec::{Stop,Limit}::at` trigger (the worker uses it
+/// verbatim — no shell anchor). A long stop must sit above the drawn
+/// entry's reference and a long limit below it (and vice-versa for short);
+/// the worker's geometry check rejects a wrong-side trigger.
+pub fn build_position_enter(
+    spec: &PositionEnterSpec,
+    key: &[u8; KEY_LEN],
+    now: DateTime<Utc>,
+) -> Result<(String, String)> {
+    // Stop/Limit rest at the operator's drawn entry price — expressed as
+    // the absolute `at` trigger so the worker uses it verbatim (the shell
+    // anchor + offset path is for the pattern builders). `from`/`offset_pips`
+    // are inert when `at` is set but must still parse, so give them a sane
+    // anchor. Market needs no trigger.
+    let entry = match spec.kind {
+        PositionEntryKind::Market => EntrySpec::Market,
+        PositionEntryKind::Stop => EntrySpec::Stop {
+            from: PriceAnchor::Close,
+            offset_pips: 0.0,
+            at: Some(spec.entry_price),
+            on_too_close: None,
+        },
+        PositionEntryKind::Limit => EntrySpec::Limit {
+            from: PriceAnchor::Close,
+            offset_pips: 0.0,
+            at: Some(spec.entry_price),
+        },
+    };
+
+    // trade_id minting reuses the pattern slug machinery; a position
+    // entry isn't an H&S/M/W pattern, so tag it `pos`.
+    let trade_id = mint_position_trade_id(&spec.instrument)?;
+    let id = format!("{trade_id}-enter");
+    let mut intent = skeleton(
+        Action::Enter,
+        &spec.instrument,
+        id,
+        spec.trade_expiry,
+        spec.broker,
+        &spec.account,
+        &trade_id,
+    );
+    intent.direction = Some(spec.direction);
+    intent.pip_size = spec.pip_size;
+    intent.entry = Some(entry);
+    intent.stop_loss = Some(PriceRef::Absolute {
+        absolute: spec.stop_loss,
+    });
+    intent.take_profit = Some(TakeProfit::Anchored(PriceRef::Absolute {
+        absolute: spec.take_profit,
+    }));
+    match spec.risk_amount {
+        Some(amount) => {
+            intent.risk_amount = Some(trade_control_core::tunable::Tunable::Static(amount))
+        }
+        None => intent.risk_pct = trade_control_core::tunable::Tunable::Static(1.0),
+    }
+    if spec.dry_run {
+        intent.dry_run = Some(true);
+    }
+    // Naked manual entry: no preps, no pattern vetos. The enter's own
+    // `not_after` (= trade_expiry) bounds its validity.
+    intent
+        .validate()
+        .map_err(|e| eyre!("invalid position enter intent: {e}"))?;
+    let body = wrap_signed_direct_enter(&intent, key, spec.entry_price, now)
+        .map_err(|e| eyre!("sign position enter: {e}"))?;
+    Ok((trade_id, body))
+}
+
+/// Mint a `pos-<instrument>-<rand>` trade_id for a position-tool entry.
+fn mint_position_trade_id(instrument: &str) -> Result<String> {
+    let mut bytes = [0u8; 4];
+    getrandom::fill(&mut bytes).map_err(|e| eyre!("getrandom: {e}"))?;
+    let suffix = hex::encode(bytes);
+    let mut instr = String::new();
+    for c in instrument.to_lowercase().chars() {
+        if c.is_ascii_alphanumeric() {
+            instr.push(c);
+        } else if !instr.ends_with('-') {
+            instr.push('-');
+        }
+    }
+    let instr = instr.trim_matches('-');
+    Ok(format!("pos-{instr}-{suffix}"))
 }
 
 /// Build the consolidated `06-close-on-reversal` alert: an
@@ -1887,6 +2193,7 @@ mod tests {
                 1.0,
                 1.0,
                 1.0800,
+                None,
                 1.0,
                 None,
                 false,
@@ -1898,9 +2205,11 @@ mod tests {
                 false,
                 &[],
                 None,
+                BlackoutCloseAction::default(),
                 &BrokerKind::Oanda,
                 "demo",
                 false,
+                &[],
             ),
         ];
         let trade = BuiltTrade {
@@ -1930,12 +2239,15 @@ mod tests {
                 entry_offset_pips: Some(1.0),
                 sl_offset_pips: Some(1.0),
                 tp_price: 1.0500,
+                sl_price: None,
                 entry_deadline_pct: DEFAULT_ENTRY_DEADLINE_PCT,
                 allow_entry: None,
                 entry_mode: EntryMode::Stop,
                 sl_anchor: None,
                 mw: None,
                 pip_size: None,
+                blackout_close: BlackoutCloseAction::default(),
+                entry_level_vetos: Vec::new(),
             },
         };
         let manifest = render_manifest(&trade);
@@ -1958,9 +2270,10 @@ mod tests {
             "hs-eur-usd-zzzz",
             &geometry,
             deadline,
-            1.0,
-            1.0,
+            -1.0, // entry: 1 pip below signal_low (short break)
+            1.0,  // SL: 1 pip above signal_high
             1.0500,
+            None,
             1.0,
             None,
             false,
@@ -1972,25 +2285,30 @@ mod tests {
             false,
             &[],
             None,
+            BlackoutCloseAction::default(),
             &BrokerKind::Oanda,
             "demo",
             false,
+            &[],
         );
         assert_eq!(alert.intent.direction, Some(Direction::Short));
-        // Entry: low + 1 pip.
+        // Entry: signal_low − 1 pip — a sell-stop 1 pip *below* the break (the
+        // offset pushes away from the pattern), at the latched pattern level
+        // (bug #10 finding A), not the candle wick.
         match &alert.intent.entry {
             Some(EntrySpec::Stop {
                 from, offset_pips, ..
             }) => {
-                assert_eq!(*from, PriceAnchor::Low);
-                assert!((offset_pips - 1.0).abs() < 1e-9);
+                assert_eq!(*from, PriceAnchor::SignalLow);
+                assert!((offset_pips - (-1.0)).abs() < 1e-9);
             }
             other => panic!("expected Stop entry, got {other:?}"),
         }
-        // SL: high + 1 pip — matches short.yaml's tight stop.
+        // SL: signal_high + 1 pip — 1 pip *above* the pattern high, not the
+        // triggering candle's own high.
         match &alert.intent.stop_loss {
             Some(PriceRef::Anchored { from, offset_pips }) => {
-                assert_eq!(*from, PriceAnchor::High);
+                assert_eq!(*from, PriceAnchor::SignalHigh);
                 assert!((offset_pips - 1.0).abs() < 1e-9);
             }
             other => panic!("expected Anchored SL, got {other:?}"),
@@ -2020,20 +2338,33 @@ mod tests {
     }
 
     #[test]
-    fn ihs_enter_matches_long_template_geometry() {
-        // IH&S mirrors `long.yaml`: stop-entry at high+1, SL at low+1,
-        // vetoed by `too-low` (not `too-high`). Direction flips to
-        // Long.
-        let geometry = PatternGeometry::for_pattern(TradePattern::Ihs);
-        let deadline = ts("2026-05-24T00:00:00Z");
+    fn enter_carries_entry_level_vetos_onto_the_intent() {
+        // Bug #12: the continuous at-entry level vetos handed to
+        // build_enter_alert land verbatim on the enter intent (and nowhere
+        // else). Empty by default (the existing tests above pass `&[]`).
+        use trade_control_core::intent::{EntryLevelVeto, VetoSide};
+        let geometry = PatternGeometry::for_pattern(TradePattern::Hs);
+        let levels = vec![
+            EntryLevelVeto {
+                name: "too-low".into(),
+                level: 1.0700,
+                past: VetoSide::Below,
+            },
+            EntryLevelVeto {
+                name: "too-high".into(),
+                level: 1.0950,
+                past: VetoSide::Above,
+            },
+        ];
         let alert = build_enter_alert(
             "EUR_USD",
-            "ihs-eur-usd-yyyy",
+            "hs-eur-usd-elv",
             &geometry,
-            deadline,
+            ts("2026-05-24T00:00:00Z"),
             1.0,
             1.0,
-            1.1500,
+            1.0500,
+            None,
             1.0,
             None,
             false,
@@ -2045,24 +2376,66 @@ mod tests {
             false,
             &[],
             None,
+            BlackoutCloseAction::default(),
             &BrokerKind::Oanda,
             "demo",
             false,
+            &levels,
+        );
+        assert_eq!(alert.intent.entry_level_vetos, levels);
+    }
+
+    #[test]
+    fn ihs_enter_matches_long_template_geometry() {
+        // IH&S mirrors `long.yaml`: stop-entry at high+1, SL at low+1,
+        // vetoed by `too-low` (not `too-high`). Direction flips to
+        // Long.
+        let geometry = PatternGeometry::for_pattern(TradePattern::Ihs);
+        let deadline = ts("2026-05-24T00:00:00Z");
+        let alert = build_enter_alert(
+            "EUR_USD",
+            "ihs-eur-usd-yyyy",
+            &geometry,
+            deadline,
+            1.0,  // entry: 1 pip above signal_high (long break)
+            -1.0, // SL: 1 pip below signal_low
+            1.1500,
+            None,
+            1.0,
+            None,
+            false,
+            0,
+            None,
+            None,
+            EntryMode::Stop,
+            false,
+            false,
+            &[],
+            None,
+            BlackoutCloseAction::default(),
+            &BrokerKind::Oanda,
+            "demo",
+            false,
+            &[],
         );
         assert_eq!(alert.intent.direction, Some(Direction::Long));
+        // Entry: signal_high + 1 pip — a buy-stop 1 pip *above* the break
+        // (mirror of the H&S short — pattern level, not the candle wick; bug
+        // #10 finding A).
         match &alert.intent.entry {
             Some(EntrySpec::Stop {
                 from, offset_pips, ..
             }) => {
-                assert_eq!(*from, PriceAnchor::High);
+                assert_eq!(*from, PriceAnchor::SignalHigh);
                 assert!((offset_pips - 1.0).abs() < 1e-9);
             }
             other => panic!("expected Stop entry, got {other:?}"),
         }
+        // SL: signal_low − 1 pip — 1 pip *below* the pattern low.
         match &alert.intent.stop_loss {
             Some(PriceRef::Anchored { from, offset_pips }) => {
-                assert_eq!(*from, PriceAnchor::Low);
-                assert!((offset_pips - 1.0).abs() < 1e-9);
+                assert_eq!(*from, PriceAnchor::SignalLow);
+                assert!((offset_pips - (-1.0)).abs() < 1e-9);
             }
             other => panic!("expected Anchored SL, got {other:?}"),
         }
@@ -2080,6 +2453,109 @@ mod tests {
                 "trade-expiry".to_string()
             ]
         );
+    }
+
+    #[test]
+    fn absolute_sl_price_overrides_anchored_sl() {
+        // The position-tool direct entry supplies an absolute stop the
+        // operator drew. When `sl_price` is Some, the enter intent must
+        // carry `PriceRef::Absolute` and ignore the geometry anchor —
+        // TP stays absolute as always.
+        let geometry = PatternGeometry::for_pattern(TradePattern::Hs);
+        let deadline = ts("2026-05-24T00:00:00Z");
+        let alert = build_enter_alert(
+            "EUR_USD",
+            "pos-eur-usd-abs1",
+            &geometry,
+            deadline,
+            1.0,
+            1.0,
+            1.0500,
+            Some(1.0850),
+            1.0,
+            None,
+            false,
+            0,
+            None,
+            None,
+            EntryMode::Market,
+            false,
+            false,
+            &[],
+            None,
+            BlackoutCloseAction::default(),
+            &BrokerKind::Oanda,
+            "demo",
+            false,
+            &[],
+        );
+        match &alert.intent.stop_loss {
+            Some(PriceRef::Absolute { absolute }) => {
+                assert!((absolute - 1.0850).abs() < 1e-9, "{absolute}");
+            }
+            other => panic!("expected Absolute SL, got {other:?}"),
+        }
+        // Market entry sanity — position-tool market path.
+        assert!(matches!(alert.intent.entry, Some(EntrySpec::Market)));
+        match &alert.intent.take_profit {
+            Some(TakeProfit::Anchored(PriceRef::Absolute { absolute })) => {
+                assert!((absolute - 1.0500).abs() < 1e-9);
+            }
+            other => panic!("expected absolute TP, got {other:?}"),
+        }
+    }
+
+    fn position_spec(kind: PositionEntryKind) -> PositionEnterSpec {
+        PositionEnterSpec {
+            instrument: "EUR_USD".into(),
+            account: "demo".into(),
+            broker: BrokerKind::Oanda,
+            direction: Direction::Long,
+            kind,
+            entry_price: 1.1000,
+            stop_loss: 1.0900,
+            take_profit: 1.1200,
+            trade_expiry: ts("2026-05-25T00:00:00Z"),
+            risk_amount: None,
+            pip_size: Some(0.0001),
+            dry_run: false,
+        }
+    }
+
+    #[test]
+    fn position_market_enter_builds_market_entry() {
+        let key = [9u8; KEY_LEN];
+        let now = ts("2026-05-24T00:00:00Z");
+        let (trade_id, body) =
+            build_position_enter(&position_spec(PositionEntryKind::Market), &key, now)
+                .expect("build market");
+        assert!(trade_id.starts_with("pos-"), "{trade_id}");
+        assert!(body.contains(r#""type":"market""#), "{body}");
+        // Market carries no `at` trigger.
+        assert!(!body.contains(r#""at":"#), "{body}");
+    }
+
+    #[test]
+    fn position_stop_enter_bakes_absolute_trigger() {
+        // Phase 2: --stop-entry rests at the drawn entry as an absolute
+        // `at` trigger (long, so a stop above — but the wrong-side guard is
+        // skipped for `at`, see the core resolver test).
+        let key = [9u8; KEY_LEN];
+        let now = ts("2026-05-24T00:00:00Z");
+        let (_, body) = build_position_enter(&position_spec(PositionEntryKind::Stop), &key, now)
+            .expect("build stop");
+        assert!(body.contains(r#""type":"stop""#), "{body}");
+        assert!(body.contains(r#""at":1.1"#), "{body}");
+    }
+
+    #[test]
+    fn position_limit_enter_bakes_absolute_trigger() {
+        let key = [9u8; KEY_LEN];
+        let now = ts("2026-05-24T00:00:00Z");
+        let (_, body) = build_position_enter(&position_spec(PositionEntryKind::Limit), &key, now)
+            .expect("build limit");
+        assert!(body.contains(r#""type":"limit""#), "{body}");
+        assert!(body.contains(r#""at":1.1"#), "{body}");
     }
 
     #[test]
@@ -2127,12 +2603,15 @@ mod tests {
             entry_offset_pips: None,
             sl_offset_pips: None,
             tp_price: 1.0500,
+            sl_price: None,
             entry_deadline_pct: 80,
             allow_entry: None,
             entry_mode: EntryMode::Stop,
             sl_anchor: None,
             mw: None,
             pip_size: None,
+            blackout_close: BlackoutCloseAction::default(),
+            entry_level_vetos: Vec::new(),
         }
     }
 
@@ -2140,7 +2619,7 @@ mod tests {
     fn build_trade_from_spec_emits_six_alerts_for_hs() {
         let now = ts("2026-05-20T00:00:00Z");
         let spec = sample_spec(TradePattern::Hs, ts("2026-05-25T00:00:00Z"));
-        let trade = build_trade_from_spec(spec, now).unwrap();
+        let trade = build_trade_from_spec(spec, now, BuildStrictness::Strict).unwrap();
         // 6 alerts: invalidation (too-high), pcl-exhausted (too-low),
         // trade-expiry, break-and-close, retest, enter.
         assert_eq!(trade.alerts.len(), 6);
@@ -2159,7 +2638,7 @@ mod tests {
         let now = ts("2026-05-20T00:00:00Z");
         let mut spec = sample_spec(TradePattern::Hs, ts("2026-05-25T00:00:00Z"));
         spec.close_on_news = true;
-        let trade = build_trade_from_spec(spec, now).unwrap();
+        let trade = build_trade_from_spec(spec, now, BuildStrictness::Strict).unwrap();
         assert_eq!(trade.alerts.len(), 7);
         assert_eq!(trade.alerts[6].basename, "06-close-on-reversal");
         let close = &trade.alerts[6].intent;
@@ -2185,7 +2664,7 @@ mod tests {
         let now = ts("2026-05-20T00:00:00Z");
         let mut spec = sample_spec(TradePattern::Hs, ts("2026-05-25T00:00:00Z"));
         spec.sr_reversal_ranges = vec![[1.0950, 1.0970], [1.1000, 1.1020]];
-        let trade = build_trade_from_spec(spec, now).unwrap();
+        let trade = build_trade_from_spec(spec, now, BuildStrictness::Strict).unwrap();
         assert_eq!(trade.alerts.len(), 7);
         assert_eq!(trade.alerts[6].basename, "06-close-on-reversal");
         let close = &trade.alerts[6].intent;
@@ -2210,7 +2689,7 @@ mod tests {
         let mut spec = sample_spec(TradePattern::Hs, ts("2026-05-25T00:00:00Z"));
         spec.close_on_news = true;
         spec.sr_reversal_ranges = vec![[1.0950, 1.0970]];
-        let trade = build_trade_from_spec(spec, now).unwrap();
+        let trade = build_trade_from_spec(spec, now, BuildStrictness::Strict).unwrap();
         assert_eq!(trade.alerts.len(), 7);
         assert_eq!(trade.alerts[6].basename, "06-close-on-reversal");
         let close = &trade.alerts[6].intent;
@@ -2240,7 +2719,7 @@ mod tests {
         let mut spec = sample_spec(TradePattern::Hs, ts("2026-05-25T00:00:00Z"));
         spec.close_on_news = true;
         spec.needs_confirmed_close = true;
-        let trade = build_trade_from_spec(spec, now).unwrap();
+        let trade = build_trade_from_spec(spec, now, BuildStrictness::Strict).unwrap();
         let close = &trade.alerts[6].intent;
         assert!(close.needs_confirmed);
         assert!(!close.needs_golden);
@@ -2255,7 +2734,7 @@ mod tests {
         let now = ts("2026-05-20T00:00:00Z");
         let mut spec = sample_spec(TradePattern::Hs, ts("2026-05-25T00:00:00Z"));
         spec.sr_reversal_ranges = vec![[1.0950, 1.0970]];
-        let trade = build_trade_from_spec(spec, now).unwrap();
+        let trade = build_trade_from_spec(spec, now, BuildStrictness::Strict).unwrap();
         let close = &trade.alerts[6].intent;
         assert!(!close.veto_on_reversal);
         // The enter (05-enter) must NOT list `reversal` when the flag is off.
@@ -2271,7 +2750,7 @@ mod tests {
         let mut spec = sample_spec(TradePattern::Hs, ts("2026-05-25T00:00:00Z"));
         spec.sr_reversal_ranges = vec![[1.0950, 1.0970]];
         spec.veto_on_reversal = true;
-        let trade = build_trade_from_spec(spec, now).unwrap();
+        let trade = build_trade_from_spec(spec, now, BuildStrictness::Strict).unwrap();
         let close = &trade.alerts[6].intent;
         assert!(close.veto_on_reversal);
         // The paired half: the enter MUST list `reversal` in its vetos, or
@@ -2298,7 +2777,7 @@ mod tests {
         let mut spec = sample_spec(TradePattern::Hs, ts("2026-05-25T00:00:00Z"));
         spec.close_on_news = true;
         spec.veto_on_reversal = true;
-        let trade = build_trade_from_spec(spec, now).unwrap();
+        let trade = build_trade_from_spec(spec, now, BuildStrictness::Strict).unwrap();
         let close = &trade.alerts[6].intent;
         assert!(!close.veto_on_reversal);
         let enter = &trade.alerts[5].intent;
@@ -2312,7 +2791,7 @@ mod tests {
     fn build_trade_from_spec_emits_six_alerts_for_ihs() {
         let now = ts("2026-05-20T00:00:00Z");
         let spec = sample_spec(TradePattern::Ihs, ts("2026-05-25T00:00:00Z"));
-        let trade = build_trade_from_spec(spec, now).unwrap();
+        let trade = build_trade_from_spec(spec, now, BuildStrictness::Strict).unwrap();
         // IH&S flips the veto direction: invalidation = too-low,
         // pcl-exhausted = too-high.
         assert_eq!(trade.alerts[0].basename, "01-veto-too-low");
@@ -2331,7 +2810,7 @@ mod tests {
         // BUG-too-low-closes-positions.md (demo trade 046).
         let now = ts("2026-05-20T00:00:00Z");
         let spec = sample_spec(TradePattern::Hs, ts("2026-05-25T00:00:00Z"));
-        let trade = build_trade_from_spec(spec, now).unwrap();
+        let trade = build_trade_from_spec(spec, now, BuildStrictness::Strict).unwrap();
         let invalidation = &trade.alerts[0];
         let pcl_exhausted = &trade.alerts[1];
         assert_eq!(invalidation.intent.name.as_deref(), Some("too-high"));
@@ -2355,7 +2834,7 @@ mod tests {
         let now = ts("2026-05-20T00:00:00Z");
         for pattern in [TradePattern::Hs, TradePattern::Ihs] {
             let spec = sample_spec(pattern, ts("2026-05-25T00:00:00Z"));
-            let trade = build_trade_from_spec(spec, now).unwrap();
+            let trade = build_trade_from_spec(spec, now, BuildStrictness::Strict).unwrap();
             assert_eq!(
                 trade.alerts[0].intent.level,
                 Some(VetoLevel::ClosePositions),
@@ -2376,7 +2855,7 @@ mod tests {
         // by `tv-arm`, not hand-edited.
         let now = ts("2026-05-20T00:00:00Z");
         let spec = sample_spec(TradePattern::M, ts("2026-05-25T00:00:00Z"));
-        let err = build_trade_from_spec(spec, now).unwrap_err();
+        let err = build_trade_from_spec(spec, now, BuildStrictness::Strict).unwrap_err();
         assert!(err.to_string().contains("requires `mw`"), "got {err}");
     }
 
@@ -2387,7 +2866,7 @@ mod tests {
         let now = ts("2026-05-20T00:00:00Z");
         let mut spec = sample_spec(TradePattern::Hs, ts("2026-05-25T00:00:00Z"));
         spec.mw = Some(sample_mw());
-        let err = build_trade_from_spec(spec, now).unwrap_err();
+        let err = build_trade_from_spec(spec, now, BuildStrictness::Strict).unwrap_err();
         assert!(err.to_string().contains("must not carry `mw`"), "got {err}");
     }
 
@@ -2398,6 +2877,7 @@ mod tests {
             neckline: 1.1120,
             first_point: 1.1200,
             runup_start: 1.1000,
+            right_shoulder: None,
             spread_pips: 1.0,
             pip_size: 0.0001,
         }
@@ -2417,7 +2897,7 @@ mod tests {
         let now = ts("2026-05-20T00:00:00Z");
         for pattern in [TradePattern::M, TradePattern::W] {
             let spec = mw_spec(pattern, ts("2026-05-25T00:00:00Z"));
-            let trade = build_trade_from_spec(spec, now).unwrap();
+            let trade = build_trade_from_spec(spec, now, BuildStrictness::Strict).unwrap();
             assert_eq!(trade.alerts.len(), 5, "{pattern:?}");
             let basenames: Vec<&str> = trade.alerts.iter().map(|a| a.basename.as_str()).collect();
             assert_eq!(
@@ -2435,6 +2915,33 @@ mod tests {
     }
 
     #[test]
+    fn build_mw_rejects_sl_too_close_to_spread() {
+        // sample_mw geometry has SL distance ≈ 0.0080 + ~1.5×spread. A 20-pip
+        // spread (0.0020) makes the 10× floor 0.020, above the ~0.011 SL
+        // distance → reject at build time before any signing.
+        let now = ts("2026-05-20T00:00:00Z");
+        let mut spec = mw_spec(TradePattern::M, ts("2026-05-25T00:00:00Z"));
+        spec.mw = Some(MwSpec {
+            spread_pips: 20.0,
+            ..sample_mw()
+        });
+        let err = build_trade_from_spec(spec, now, BuildStrictness::Strict).unwrap_err();
+        assert!(
+            err.to_string().contains("too close to the spread"),
+            "got {err}"
+        );
+    }
+
+    #[test]
+    fn build_mw_allows_normal_sl_vs_spread() {
+        // sample_mw's default 1-pip spread → SL distance is ~80× the spread,
+        // comfortably above the 10× floor → builds fine.
+        let now = ts("2026-05-20T00:00:00Z");
+        let spec = mw_spec(TradePattern::M, ts("2026-05-25T00:00:00Z"));
+        assert!(build_trade_from_spec(spec, now, BuildStrictness::Strict).is_ok());
+    }
+
+    #[test]
     fn build_mw_cancel_abort_overshoot_are_cancel_pending() {
         // All three price-level M/W vetos are CancelPending — never
         // ClosePositions. The abort especially: once filled the trade
@@ -2443,7 +2950,7 @@ mod tests {
         // invalidation).
         let now = ts("2026-05-20T00:00:00Z");
         let spec = mw_spec(TradePattern::M, ts("2026-05-25T00:00:00Z"));
-        let trade = build_trade_from_spec(spec, now).unwrap();
+        let trade = build_trade_from_spec(spec, now, BuildStrictness::Strict).unwrap();
         assert_eq!(trade.alerts[0].intent.name.as_deref(), Some("mw-cancel"));
         assert_eq!(trade.alerts[0].intent.level, Some(VetoLevel::CancelPending));
         assert_eq!(trade.alerts[1].intent.name.as_deref(), Some("mw-abort"));
@@ -2459,7 +2966,7 @@ mod tests {
         // pattern; vetos are the three M/W ones; no preps; single-shot.
         let now = ts("2026-05-20T00:00:00Z");
         let spec = mw_spec(TradePattern::M, ts("2026-05-25T00:00:00Z"));
-        let trade = build_trade_from_spec(spec, now).unwrap();
+        let trade = build_trade_from_spec(spec, now, BuildStrictness::Strict).unwrap();
         let enter = &trade.alerts[4].intent;
         assert_eq!(enter.action, Action::Enter);
         assert_eq!(enter.direction, Some(Direction::Short));
@@ -2498,7 +3005,7 @@ mod tests {
         // M in the bundle.
         let now = ts("2026-05-20T00:00:00Z");
         let spec = mw_spec(TradePattern::W, ts("2026-05-25T00:00:00Z"));
-        let trade = build_trade_from_spec(spec, now).unwrap();
+        let trade = build_trade_from_spec(spec, now, BuildStrictness::Strict).unwrap();
         assert_eq!(trade.alerts[4].intent.direction, Some(Direction::Long));
     }
 
@@ -2510,7 +3017,7 @@ mod tests {
         let now = ts("2026-05-20T00:00:00Z");
         let mut spec = sample_spec(TradePattern::Hs, ts("2026-05-25T00:00:00Z"));
         spec.pip_size = Some(0.01); // JPY-scale
-        let trade = build_trade_from_spec(spec, now).unwrap();
+        let trade = build_trade_from_spec(spec, now, BuildStrictness::Strict).unwrap();
         let enter = &trade.alerts[5].intent;
         assert_eq!(enter.action, Action::Enter);
         assert_eq!(enter.pip_size, Some(0.01));
@@ -2524,7 +3031,7 @@ mod tests {
         let now = ts("2026-05-20T00:00:00Z");
         let spec = sample_spec(TradePattern::Hs, ts("2026-05-25T00:00:00Z"));
         assert_eq!(spec.pip_size, None);
-        let trade = build_trade_from_spec(spec, now).unwrap();
+        let trade = build_trade_from_spec(spec, now, BuildStrictness::Strict).unwrap();
         assert_eq!(trade.alerts[5].intent.pip_size, None);
     }
 
@@ -2532,8 +3039,18 @@ mod tests {
     fn build_trade_from_spec_rejects_past_trade_expiry() {
         let now = ts("2026-05-20T00:00:00Z");
         let spec = sample_spec(TradePattern::Hs, ts("2026-05-19T00:00:00Z"));
-        let err = build_trade_from_spec(spec, now).unwrap_err();
+        let err = build_trade_from_spec(spec, now, BuildStrictness::Strict).unwrap_err();
         assert!(err.to_string().contains("future"), "got {err}");
+    }
+
+    #[test]
+    fn build_trade_from_spec_lenient_allows_past_trade_expiry() {
+        // The offline `--plan-out` path (replaying a historical setup) must
+        // still build even when trade_expiry has already elapsed — it only
+        // warns, so the JSON gets written.
+        let now = ts("2026-05-20T00:00:00Z");
+        let spec = sample_spec(TradePattern::Hs, ts("2026-05-19T00:00:00Z"));
+        assert!(build_trade_from_spec(spec, now, BuildStrictness::Lenient).is_ok());
     }
 
     #[test]
@@ -2541,23 +3058,23 @@ mod tests {
         let now = ts("2026-05-20T00:00:00Z");
         let mut spec = sample_spec(TradePattern::Hs, ts("2026-05-25T00:00:00Z"));
         spec.entry_deadline_pct = 0;
-        assert!(build_trade_from_spec(spec, now).is_err());
+        assert!(build_trade_from_spec(spec, now, BuildStrictness::Strict).is_err());
         let mut spec2 = sample_spec(TradePattern::Hs, ts("2026-05-25T00:00:00Z"));
         spec2.entry_deadline_pct = 101;
-        assert!(build_trade_from_spec(spec2, now).is_err());
+        assert!(build_trade_from_spec(spec2, now, BuildStrictness::Strict).is_err());
     }
 
     #[test]
     fn build_trade_from_spec_applies_pattern_default_offsets() {
         // Omitting entry/sl offsets must fall back to the pattern's
-        // geometry defaults (1 pip from short.yaml / long.yaml).
+        // geometry defaults (HS short entry: 1 pip *below* signal_low).
         let now = ts("2026-05-20T00:00:00Z");
         let spec = sample_spec(TradePattern::Hs, ts("2026-05-25T00:00:00Z"));
-        let trade = build_trade_from_spec(spec, now).unwrap();
+        let trade = build_trade_from_spec(spec, now, BuildStrictness::Strict).unwrap();
         let enter = trade.alerts.last().unwrap();
         match &enter.intent.entry {
             Some(EntrySpec::Stop { offset_pips, .. }) => {
-                assert!((offset_pips - 1.0).abs() < 1e-9);
+                assert!((offset_pips - (-1.0)).abs() < 1e-9);
             }
             other => panic!("expected Stop entry, got {other:?}"),
         }
@@ -2620,7 +3137,7 @@ tp_price: 1.05
         let now = ts("2026-05-20T00:00:00Z");
         let mut spec = sample_spec(TradePattern::Hs, ts("2026-05-25T00:00:00Z"));
         spec.risk_amount = Some(5.0);
-        let trade = build_trade_from_spec(spec, now).unwrap();
+        let trade = build_trade_from_spec(spec, now, BuildStrictness::Strict).unwrap();
         let enter = trade.alerts.last().unwrap();
         match &enter.intent.risk_amount {
             Some(trade_control_core::tunable::Tunable::Static(a)) => {
@@ -2646,12 +3163,48 @@ tp_price: 1.05
         let now = ts("2026-05-20T00:00:00Z");
         let mut spec = sample_spec(TradePattern::Hs, ts("2026-05-25T00:00:00Z"));
         spec.dry_run = true;
-        let trade = build_trade_from_spec(spec, now).unwrap();
+        let trade = build_trade_from_spec(spec, now, BuildStrictness::Strict).unwrap();
         let enter = trade.alerts.last().unwrap();
         assert_eq!(enter.intent.dry_run, Some(true));
         // Spot-check a non-enter alert: dry_run must be None.
         let veto = &trade.alerts[0];
         assert_eq!(veto.intent.dry_run, None);
+    }
+
+    #[test]
+    fn build_trade_from_spec_threads_blackout_close_onto_enter_intent() {
+        // A non-default close policy on the spec must land on the enter
+        // intent (the worker reads it there) and leave the non-enter alerts
+        // at the wire default.
+        let now = ts("2026-05-20T00:00:00Z");
+        let mut spec = sample_spec(TradePattern::Hs, ts("2026-05-25T00:00:00Z"));
+        spec.blackout_close = BlackoutCloseAction::CancelAndClose;
+        let trade = build_trade_from_spec(spec, now, BuildStrictness::Strict).unwrap();
+        let enter = trade.alerts.last().unwrap();
+        assert_eq!(
+            enter.intent.blackout_close,
+            BlackoutCloseAction::CancelAndClose
+        );
+        enter.intent.validate().unwrap();
+        // A veto alert keeps the default — the policy is enter-only.
+        let veto = &trade.alerts[0];
+        assert_eq!(
+            veto.intent.blackout_close,
+            BlackoutCloseAction::CancelResting
+        );
+    }
+
+    #[test]
+    fn build_trade_from_spec_default_blackout_close_is_cancel_resting() {
+        // The default spec mints an enter at the safe incident-fix default.
+        let now = ts("2026-05-20T00:00:00Z");
+        let spec = sample_spec(TradePattern::Hs, ts("2026-05-25T00:00:00Z"));
+        let trade = build_trade_from_spec(spec, now, BuildStrictness::Strict).unwrap();
+        let enter = trade.alerts.last().unwrap();
+        assert_eq!(
+            enter.intent.blackout_close,
+            BlackoutCloseAction::CancelResting
+        );
     }
 
     #[test]
@@ -2661,7 +3214,7 @@ tp_price: 1.05
         let now = ts("2026-05-20T00:00:00Z");
         let mut spec = sample_spec(TradePattern::Hs, ts("2026-05-25T00:00:00Z"));
         spec.prep_expiries = vec!["break-and-close".into()];
-        let trade = build_trade_from_spec(spec, now).unwrap();
+        let trade = build_trade_from_spec(spec, now, BuildStrictness::Strict).unwrap();
         let pe = trade
             .alerts
             .iter()
@@ -2681,7 +3234,7 @@ tp_price: 1.05
         let now = ts("2026-05-20T00:00:00Z");
         let mut spec = sample_spec(TradePattern::Hs, ts("2026-05-25T00:00:00Z"));
         spec.prep_expiries = vec!["nonsense".into()];
-        assert!(build_trade_from_spec(spec, now).is_err());
+        assert!(build_trade_from_spec(spec, now, BuildStrictness::Strict).is_err());
     }
 
     #[test]
@@ -2691,7 +3244,7 @@ tp_price: 1.05
         let mut spec = sample_spec(TradePattern::Hs, ts("2026-05-25T00:00:00Z"));
         spec.skip_preps = vec!["retest".into()];
         spec.prep_expiries = vec!["retest".into()];
-        assert!(build_trade_from_spec(spec, now).is_err());
+        assert!(build_trade_from_spec(spec, now, BuildStrictness::Strict).is_err());
     }
 
     #[test]
@@ -2702,7 +3255,7 @@ tp_price: 1.05
         let now = ts("2026-05-20T00:00:00Z");
         let mut spec = sample_spec(TradePattern::Hs, ts("2026-05-25T00:00:00Z"));
         spec.needs_golden = true;
-        let trade = build_trade_from_spec(spec, now).unwrap();
+        let trade = build_trade_from_spec(spec, now, BuildStrictness::Strict).unwrap();
         let enter = trade.alerts.last().unwrap();
         assert!(enter.intent.needs_golden);
         enter.intent.validate().unwrap();
@@ -2722,7 +3275,7 @@ tp_price: 1.05
         let now = ts("2026-05-20T00:00:00Z");
         let mut spec = sample_spec(TradePattern::Hs, ts("2026-05-25T00:00:00Z"));
         spec.needs_confirmed = true;
-        let trade = build_trade_from_spec(spec, now).unwrap();
+        let trade = build_trade_from_spec(spec, now, BuildStrictness::Strict).unwrap();
         let enter = trade.alerts.last().unwrap();
         assert!(enter.intent.needs_confirmed);
         // needs_golden is independent — not set unless asked for.
@@ -2745,7 +3298,7 @@ tp_price: 1.05
         let mut spec = sample_spec(TradePattern::Hs, ts("2026-05-25T00:00:00Z"));
         spec.needs_golden = true;
         spec.needs_confirmed = true;
-        let trade = build_trade_from_spec(spec, now).unwrap();
+        let trade = build_trade_from_spec(spec, now, BuildStrictness::Strict).unwrap();
         let enter = trade.alerts.last().unwrap();
         assert!(enter.intent.needs_golden);
         assert!(enter.intent.needs_confirmed);
@@ -2762,7 +3315,7 @@ tp_price: 1.05
         let now = ts("2026-05-20T00:00:00Z");
         let mut spec = sample_spec(TradePattern::Hs, ts("2026-05-25T00:00:00Z"));
         spec.max_retries = 3;
-        let trade = build_trade_from_spec(spec, now).unwrap();
+        let trade = build_trade_from_spec(spec, now, BuildStrictness::Strict).unwrap();
         let enter = trade.alerts.last().unwrap();
         match &enter.intent.max_retries {
             trade_control_core::tunable::Tunable::Static(n) => assert_eq!(*n, 3),
@@ -2789,7 +3342,7 @@ tp_price: 1.05
         let now = ts("2026-05-20T00:00:00Z");
         let mut spec = sample_spec(TradePattern::Hs, ts("2026-05-25T00:00:00Z"));
         spec.expiry_bars = Some(3);
-        let trade = build_trade_from_spec(spec, now).unwrap();
+        let trade = build_trade_from_spec(spec, now, BuildStrictness::Strict).unwrap();
         let enter = trade.alerts.last().unwrap();
         match &enter.intent.expiry_bars {
             Some(trade_control_core::tunable::Tunable::Static(n)) => assert_eq!(*n, 3),
@@ -2811,7 +3364,7 @@ tp_price: 1.05
         // carries no expiry_bars, so the order rests until trade_expiry.
         let now = ts("2026-05-20T00:00:00Z");
         let spec = sample_spec(TradePattern::Hs, ts("2026-05-25T00:00:00Z"));
-        let trade = build_trade_from_spec(spec, now).unwrap();
+        let trade = build_trade_from_spec(spec, now, BuildStrictness::Strict).unwrap();
         let enter = trade.alerts.last().unwrap();
         assert!(enter.intent.expiry_bars.is_none());
     }
@@ -2822,7 +3375,7 @@ tp_price: 1.05
         // critical for wire compat with all pre-existing spec yamls.
         let now = ts("2026-05-20T00:00:00Z");
         let spec = sample_spec(TradePattern::Hs, ts("2026-05-25T00:00:00Z"));
-        let trade = build_trade_from_spec(spec, now).unwrap();
+        let trade = build_trade_from_spec(spec, now, BuildStrictness::Strict).unwrap();
         let enter = trade.alerts.last().unwrap();
         assert!(
             matches!(&enter.intent.entry, Some(EntrySpec::Stop { .. })),
@@ -2839,7 +3392,7 @@ tp_price: 1.05
         let now = ts("2026-05-20T00:00:00Z");
         let mut spec = sample_spec(TradePattern::Hs, ts("2026-05-25T00:00:00Z"));
         spec.entry_mode = EntryMode::Market;
-        let trade = build_trade_from_spec(spec, now).unwrap();
+        let trade = build_trade_from_spec(spec, now, BuildStrictness::Strict).unwrap();
         let enter = trade.alerts.last().unwrap();
         assert!(
             matches!(&enter.intent.entry, Some(EntrySpec::Market)),
@@ -2877,7 +3430,7 @@ entry_mode: market
         let now = ts("2026-05-20T00:00:00Z");
         let mut spec = sample_spec(TradePattern::Hs, ts("2026-05-25T00:00:00Z"));
         spec.allow_entry = Some("signal_confirmed".into());
-        let trade = build_trade_from_spec(spec, now).unwrap();
+        let trade = build_trade_from_spec(spec, now, BuildStrictness::Strict).unwrap();
         let enter = trade.alerts.last().unwrap();
         match &enter.intent.allow_entry {
             Some(trade_control_core::tunable::Tunable::Script(s)) => {
@@ -2907,7 +3460,7 @@ entry_mode: market
         let now = ts("2026-06-02T00:00:00Z");
         let mut spec = sample_spec(TradePattern::Hs, ts("2026-06-09T00:00:00Z"));
         spec.allow_entry = Some("signal_confirmed".into());
-        let trade = build_trade_from_spec(spec, now).unwrap();
+        let trade = build_trade_from_spec(spec, now, BuildStrictness::Strict).unwrap();
         let enter = trade.alerts.last().unwrap();
         assert_eq!(enter.basename, "05-enter");
         let key = [9u8; KEY_LEN];
@@ -2953,7 +3506,7 @@ entry_mode: market
         let now = ts("2026-06-02T00:00:00Z");
         let mut spec = sample_spec(TradePattern::Hs, ts("2026-06-09T00:00:00Z"));
         spec.expiry_bars = Some(3);
-        let trade = build_trade_from_spec(spec, now).unwrap();
+        let trade = build_trade_from_spec(spec, now, BuildStrictness::Strict).unwrap();
         let enter = trade.alerts.last().unwrap();
         assert_eq!(enter.basename, "05-enter");
         let key = [9u8; KEY_LEN];
@@ -3005,7 +3558,7 @@ entry_mode: market
         // on an indicator that ships the menu plots.
         let now = ts("2026-06-02T00:00:00Z");
         let spec = sample_spec(TradePattern::Hs, ts("2026-06-09T00:00:00Z"));
-        let trade = build_trade_from_spec(spec, now).unwrap();
+        let trade = build_trade_from_spec(spec, now, BuildStrictness::Strict).unwrap();
         let enter = trade.alerts.last().unwrap();
         let key = [9u8; KEY_LEN];
         let signed = wrap_signed_template(&enter.intent, &key).unwrap();
@@ -3023,7 +3576,7 @@ entry_mode: market
         let now = ts("2026-05-20T00:00:00Z");
         let mut spec = sample_spec(TradePattern::Hs, ts("2026-05-25T00:00:00Z"));
         spec.allow_entry = Some("if foo {{{ bad".into());
-        let err = build_trade_from_spec(spec, now).unwrap_err();
+        let err = build_trade_from_spec(spec, now, BuildStrictness::Strict).unwrap_err();
         assert!(err.to_string().contains("allow_entry"), "got {err}");
     }
 
@@ -3062,7 +3615,7 @@ tp_price: 1.05
         let spec: TradeSpec = serde_yaml::from_str(yaml).unwrap();
         assert_eq!(spec.max_retries, 0);
         let now = ts("2026-05-20T00:00:00Z");
-        let trade = build_trade_from_spec(spec, now).unwrap();
+        let trade = build_trade_from_spec(spec, now, BuildStrictness::Strict).unwrap();
         let enter = trade.alerts.last().unwrap();
         assert!(matches!(
             enter.intent.max_retries,
@@ -3075,10 +3628,10 @@ tp_price: 1.05
         let now = ts("2026-05-20T00:00:00Z");
         let mut spec = sample_spec(TradePattern::Hs, ts("2026-05-25T00:00:00Z"));
         spec.risk_amount = Some(0.0);
-        assert!(build_trade_from_spec(spec, now).is_err());
+        assert!(build_trade_from_spec(spec, now, BuildStrictness::Strict).is_err());
         let mut spec2 = sample_spec(TradePattern::Hs, ts("2026-05-25T00:00:00Z"));
         spec2.risk_amount = Some(-1.0);
-        assert!(build_trade_from_spec(spec2, now).is_err());
+        assert!(build_trade_from_spec(spec2, now, BuildStrictness::Strict).is_err());
     }
 
     #[test]
@@ -3089,7 +3642,7 @@ tp_price: 1.05
         let now = ts("2026-05-20T00:00:00Z");
         let mut spec = sample_spec(TradePattern::Hs, ts("2026-05-25T00:00:00Z"));
         spec.skip_preps = vec!["break-and-close".into()];
-        let trade = build_trade_from_spec(spec, now).unwrap();
+        let trade = build_trade_from_spec(spec, now, BuildStrictness::Strict).unwrap();
         let basenames: Vec<&str> = trade.alerts.iter().map(|a| a.basename.as_str()).collect();
         assert!(!basenames.contains(&"03-prep-break-and-close"));
         assert!(basenames.contains(&"04-prep-retest"));
@@ -3105,7 +3658,7 @@ tp_price: 1.05
         let now = ts("2026-05-20T00:00:00Z");
         let mut spec = sample_spec(TradePattern::Hs, ts("2026-05-25T00:00:00Z"));
         spec.skip_preps = vec!["break-and-close".into(), "retest".into()];
-        let trade = build_trade_from_spec(spec, now).unwrap();
+        let trade = build_trade_from_spec(spec, now, BuildStrictness::Strict).unwrap();
         let basenames: Vec<&str> = trade.alerts.iter().map(|a| a.basename.as_str()).collect();
         assert!(!basenames.contains(&"03-prep-break-and-close"));
         assert!(!basenames.contains(&"04-prep-retest"));
@@ -3121,7 +3674,7 @@ tp_price: 1.05
         let now = ts("2026-05-20T00:00:00Z");
         let mut spec = sample_spec(TradePattern::Hs, ts("2026-05-25T00:00:00Z"));
         spec.skip_preps = vec!["bogus".into()];
-        let err = build_trade_from_spec(spec, now).unwrap_err();
+        let err = build_trade_from_spec(spec, now, BuildStrictness::Strict).unwrap_err();
         assert!(err.to_string().contains("bogus"), "got {err}");
     }
 
@@ -3152,13 +3705,13 @@ tp_price: 1.05
 
     #[test]
     fn sl_anchor_override_lands_on_enter_intent() {
-        // Override the H&S default (PriceAnchor::High → signal bar high)
-        // with RecentHigh — the SL price ref on the enter intent must
+        // Override the H&S default (PriceAnchor::SignalHigh → latched pattern
+        // high) with RecentHigh — the SL price ref on the enter intent must
         // pick up the override.
         let now = ts("2026-05-20T00:00:00Z");
         let mut spec = sample_spec(TradePattern::Hs, ts("2026-05-25T00:00:00Z"));
         spec.sl_anchor = Some(PriceAnchor::RecentHigh);
-        let trade = build_trade_from_spec(spec, now).unwrap();
+        let trade = build_trade_from_spec(spec, now, BuildStrictness::Strict).unwrap();
         let enter = trade.alerts.last().unwrap();
         match &enter.intent.stop_loss {
             Some(PriceRef::Anchored { from, .. }) => assert_eq!(*from, PriceAnchor::RecentHigh),
@@ -3173,7 +3726,7 @@ tp_price: 1.05
         let now = ts("2026-05-20T00:00:00Z");
         let mut spec = sample_spec(TradePattern::Hs, ts("2026-05-25T00:00:00Z"));
         spec.sl_anchor = Some(PriceAnchor::RecentLow);
-        let err = build_trade_from_spec(spec, now).unwrap_err();
+        let err = build_trade_from_spec(spec, now, BuildStrictness::Strict).unwrap_err();
         assert!(err.to_string().contains("short"), "got {err}");
     }
 
@@ -3182,7 +3735,7 @@ tp_price: 1.05
         let now = ts("2026-05-20T00:00:00Z");
         let mut spec = sample_spec(TradePattern::Ihs, ts("2026-05-25T00:00:00Z"));
         spec.sl_anchor = Some(PriceAnchor::RecentLow);
-        let trade = build_trade_from_spec(spec, now).unwrap();
+        let trade = build_trade_from_spec(spec, now, BuildStrictness::Strict).unwrap();
         let enter = trade.alerts.last().unwrap();
         match &enter.intent.stop_loss {
             Some(PriceRef::Anchored { from, .. }) => assert_eq!(*from, PriceAnchor::RecentLow),
@@ -3199,7 +3752,7 @@ tp_price: 1.05
         // (#05) is bound to a Pine study and may carry plot placeholders.
         let now = ts("2026-05-20T00:00:00Z");
         let spec = sample_spec(TradePattern::Hs, ts("2026-05-25T00:00:00Z"));
-        let trade = build_trade_from_spec(spec, now).unwrap();
+        let trade = build_trade_from_spec(spec, now, BuildStrictness::Strict).unwrap();
         let key = [9u8; KEY_LEN];
         for alert in &trade.alerts {
             let is_pine_bound = alert.basename == "05-enter";

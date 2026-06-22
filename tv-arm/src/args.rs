@@ -35,9 +35,50 @@ impl BrokerArg {
     }
 }
 
+/// Market-hours blackout close policy. Crate-local so the value-enum can be
+/// used in the `clap` derive; maps to
+/// [`trade_control_core::intent::BlackoutCloseAction`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+#[clap(rename_all = "lowercase")]
+pub enum BlackoutClose {
+    /// Cancel the unfilled resting order only; never close a position. Default.
+    Cancel,
+    /// Cancel the resting order **and** market-close an open position.
+    Close,
+}
+
+impl BlackoutClose {
+    /// Translate to the signed wire enum.
+    pub fn into_core(self) -> trade_control_core::intent::BlackoutCloseAction {
+        match self {
+            Self::Cancel => trade_control_core::intent::BlackoutCloseAction::CancelResting,
+            Self::Close => trade_control_core::intent::BlackoutCloseAction::CancelAndClose,
+        }
+    }
+}
+
+/// Which order type a position-tool direct entry should place. Only one
+/// of `--market-entry` / `--stop-entry` / `--limit-entry` may be given;
+/// they're mutually exclusive (the `position_entry` clap group enforces
+/// it). Set by [`Args::position_entry_mode`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PositionEntry {
+    /// Enter at market immediately (worker fills at broker bid/ask).
+    Market,
+    /// Rest a stop order at the drawing's entry price.
+    Stop,
+    /// Rest a limit order at the drawing's entry price.
+    Limit,
+}
+
 /// Arm a reversal setup from the active TradingView chart.
 #[derive(Debug, Parser)]
 #[command(version = env!("GIT_VERSION"), about, long_about = None)]
+#[command(group(
+    clap::ArgGroup::new("position_entry")
+        .args(["market_entry", "stop_entry", "limit_entry"])
+        .multiple(false)
+))]
 pub struct Args {
     /// Broker to target. Defaults to the chart's exchange (also
     /// `TRADE_CONTROL_BROKER` env).
@@ -59,22 +100,62 @@ pub struct Args {
     #[arg(long, group = "risk")]
     pub risk_amount: Option<f64>,
 
-    /// Post the alerts to TradingView. Without this, the bundle is
-    /// built and signed to disk but no alerts are POSTed.
-    #[arg(long)]
-    pub create_alerts: bool,
-
     /// Set `dry_run` on the enter intent so the worker logs the order
     /// but does not send it to the broker. Useful for first-time live
-    /// runs of a new sizing path. Compatible with `--create-alerts`.
+    /// runs of a new sizing path.
     #[arg(long)]
     pub broker_dry_run: bool,
 
+    /// Register the trade as ONE signed `TradePlan` with the worker's
+    /// server-side engine (POSTed directly to the baked webhook). This is
+    /// how a trade is armed: the `*/15` cron then evaluates the plan against
+    /// fresh candles and dispatches its fires. (The legacy path — POST a
+    /// signed alert bundle to TradingView and let TV fire the alerts — has
+    /// been retired.)
+    #[arg(long)]
+    pub register_plan: bool,
+
+    /// Re-arm an existing setup: before registering the fresh plan, delete the
+    /// prior registered plan for this instrument from the server-side engine
+    /// (clears its `plan:` + `plan-state:` KV so the new plan starts clean and
+    /// the old one stops ticking). Use after moving annotations on the chart
+    /// and re-running. Only meaningful with `--register-plan`.
+    ///
+    /// - **`--update`** (no value): auto-resolves the target by instrument —
+    ///   if exactly one plan is registered for this instrument it's deleted; if
+    ///   none, it's a no-op; if more than one, it's a hard error (pass the id).
+    /// - **`--update <trade-id>`**: deletes exactly that plan, no matter how
+    ///   many are registered. The trade_id comes from `trade-control plan list`.
+    ///
+    /// Leaves TradingView alerts untouched — this reconciles only the engine
+    /// plan. (tv-arm mints a fresh random trade_id each run, so without
+    /// `--update` a re-arm leaves the old plan ticking until its TTL.)
+    #[arg(long, num_args = 0..=1, default_missing_value = "")]
+    pub update: Option<String>,
+
+    /// Register the plan in **observe-only (shadow) mode**: the server-side
+    /// engine evaluates it and advances its state exactly as a live plan, but
+    /// never dispatches its fires to the broker — each would-be fire is logged
+    /// instead. The safe way to watch a new plan's decisions on demo without
+    /// placing real orders. Only meaningful with `--register-plan`. Default: live.
+    #[arg(long)]
+    pub shadow: bool,
+
+    /// Write the built `TradePlan` as pretty JSON to this path. Lets the offline
+    /// `replay-candles` harness load the exact plan the engine would receive and
+    /// replay a candle window through it.
+    ///
+    /// Builds the plan on its own — you do **not** need `--register-plan`. Used
+    /// alone, it writes the JSON and stops (no worker POST). Combined with
+    /// `--register-plan`, it also registers the plan with the worker.
+    #[arg(long)]
+    pub plan_out: Option<PathBuf>,
+
     /// Opt in to multi-shot entries: if the broker rejects the order
     /// (e.g. spread too wide), the worker will retry on subsequent
-    /// enter-alert firings up to this many times. Default (flag
-    /// absent) keeps today's single-shot behaviour. Bounded by
-    /// `trade_expiry`.
+    /// enter-alert firings up to this many times. Defaults to 5 when
+    /// the flag is absent. Pass `--max-retries 0` for single-shot.
+    /// Bounded by `trade_expiry`.
     #[arg(long)]
     pub max_retries: Option<u32>,
 
@@ -87,11 +168,41 @@ pub struct Args {
     #[arg(long)]
     pub expiry_bars: Option<u32>,
 
+    /// What the market-hours blackout sweep should do with this trade's
+    /// resting entry order if it's caught inside the instrument's daily
+    /// close→open gap. `cancel` (default) cancels the unfilled order and
+    /// never touches a filled position; `close` also market-closes any open
+    /// position on the instrument. Lands on the enter intent's
+    /// `blackout_close`.
+    #[arg(long, value_enum, default_value_t = BlackoutClose::Cancel)]
+    pub blackout_close: BlackoutClose,
+
     /// Use a market order for entry instead of the default pending
     /// stop-entry at the geometry anchor. SL still anchors to
-    /// geometry.
+    /// geometry. (Pattern path — H&S / M/W.)
     #[arg(long)]
     pub entry_market: bool,
+
+    /// **Position-tool direct entry.** Read the long/short *position*
+    /// tool drawn on the chart and place a **market** order immediately
+    /// (worker fills at broker price on receipt), with the drawing's
+    /// entry / SL / TP. Mutually exclusive with `--stop-entry` /
+    /// `--limit-entry`. No pattern, preps, or geometry needed — just the
+    /// drawn position + a trade-expiry.
+    #[arg(long)]
+    pub market_entry: bool,
+
+    /// **Position-tool direct entry.** Rest a **stop** order at the
+    /// drawn position's entry price. Mutually exclusive with
+    /// `--market-entry` / `--limit-entry`.
+    #[arg(long)]
+    pub stop_entry: bool,
+
+    /// **Position-tool direct entry.** Rest a **limit** order at the
+    /// drawn position's entry price. Mutually exclusive with
+    /// `--market-entry` / `--stop-entry`.
+    #[arg(long)]
+    pub limit_entry: bool,
 
     /// Anchor SL to Pine's `recent_high` (shorts) / `recent_low`
     /// (longs) instead of the signal bar's own wick. Requires the v2
@@ -115,15 +226,17 @@ pub struct Args {
     #[arg(long)]
     pub skip_retest: bool,
 
-    /// Require a golden signal candle on entry. Sets
-    /// `needs_golden: true` on the trade spec.
+    /// Drop the golden-signal-candle requirement on entry. By default
+    /// a golden signal candle is required (`needs_golden: true` on the
+    /// trade spec); pass this to clear it.
     #[arg(long)]
-    pub require_golden: bool,
+    pub skip_golden: bool,
 
     /// Require a confirmed signal candle on entry. Sets
-    /// `needs_confirmed: true` on the enter intent. Symmetric with
-    /// `--require-golden` and independent of it — pass both for a
-    /// stricter "golden AND confirmed" entry gate.
+    /// `needs_confirmed: true` on the enter intent. Independent of the
+    /// golden gate (which is on by default; clear it with
+    /// `--skip-golden`) — leave golden on and pass this for a stricter
+    /// "golden AND confirmed" entry gate.
     #[arg(long)]
     pub require_confirmation: bool,
 
@@ -168,6 +281,14 @@ pub struct Args {
     #[arg(long)]
     pub pip_size: Option<f64>,
 
+    /// (Position-tool entry only) Trade-expiry window in hours from now,
+    /// used when the chart carries no `trade-expiry` vertical line. The
+    /// emitted enter self-cancels (if still resting) / the setup expires
+    /// at `now + this`. Ignored when a `trade-expiry` line is present
+    /// (the line wins). Default 48h.
+    #[arg(long, default_value_t = 48)]
+    pub expiry_hours: u32,
+
     /// Print a zsh completion script to stdout and exit.
     #[arg(long)]
     pub print_completions: bool,
@@ -178,6 +299,20 @@ pub struct Args {
     pub tv_mcp_root: Option<PathBuf>,
 }
 
+impl Args {
+    /// The selected position-tool entry mode, or `None` when none of the
+    /// three flags is set (the normal pattern-arming path). The clap
+    /// group guarantees at most one is set.
+    pub fn position_entry_mode(&self) -> Option<PositionEntry> {
+        match (self.market_entry, self.stop_entry, self.limit_entry) {
+            (true, _, _) => Some(PositionEntry::Market),
+            (_, true, _) => Some(PositionEntry::Stop),
+            (_, _, true) => Some(PositionEntry::Limit),
+            _ => None,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -186,10 +321,29 @@ mod tests {
     #[test]
     fn defaults_are_sensible() {
         let args = Args::try_parse_from(["tv-arm"]).expect("parse ok");
-        assert!(!args.create_alerts);
         assert!(!args.broker_dry_run);
         assert!(!args.skip_calendar_bars);
         assert_eq!(args.reversal_band_pct, 0.1);
+    }
+
+    #[test]
+    fn blackout_close_defaults_to_cancel_and_parses() {
+        use trade_control_core::intent::BlackoutCloseAction;
+        // Default (flag absent) is the safe incident-fix policy.
+        let args = Args::try_parse_from(["tv-arm"]).expect("parse");
+        assert_eq!(args.blackout_close, BlackoutClose::Cancel);
+        assert_eq!(
+            args.blackout_close.into_core(),
+            BlackoutCloseAction::CancelResting
+        );
+        // `--blackout-close close` opts into also flattening an open position.
+        let args =
+            Args::try_parse_from(["tv-arm", "--blackout-close", "close"]).expect("parse close");
+        assert_eq!(args.blackout_close, BlackoutClose::Close);
+        assert_eq!(
+            args.blackout_close.into_core(),
+            BlackoutCloseAction::CancelAndClose
+        );
     }
 
     #[test]
@@ -209,11 +363,14 @@ mod tests {
     }
 
     #[test]
-    fn require_golden_and_confirmation_compose() {
-        // Independent gates — both flags accepted together.
-        let args = Args::try_parse_from(["tv-arm", "--require-golden", "--require-confirmation"])
+    fn golden_default_on_skip_clears_it() {
+        // Golden is required by default; --skip-golden clears it.
+        let args = Args::try_parse_from(["tv-arm"]).expect("parse");
+        assert!(!args.skip_golden);
+
+        let args = Args::try_parse_from(["tv-arm", "--skip-golden", "--require-confirmation"])
             .expect("parse");
-        assert!(args.require_golden);
+        assert!(args.skip_golden);
         assert!(args.require_confirmation);
     }
 
@@ -229,6 +386,26 @@ mod tests {
                 .expect("parse mw flags");
         assert!(args.allow_50_pct_m_trades);
         assert_eq!(args.pip_size, Some(0.01));
+    }
+
+    #[test]
+    fn position_entry_flags_resolve() {
+        let args = Args::try_parse_from(["tv-arm"]).expect("parse");
+        assert_eq!(args.position_entry_mode(), None);
+        assert_eq!(args.expiry_hours, 48);
+
+        let m = Args::try_parse_from(["tv-arm", "--market-entry"]).expect("parse");
+        assert_eq!(m.position_entry_mode(), Some(PositionEntry::Market));
+        let s = Args::try_parse_from(["tv-arm", "--stop-entry"]).expect("parse");
+        assert_eq!(s.position_entry_mode(), Some(PositionEntry::Stop));
+        let l = Args::try_parse_from(["tv-arm", "--limit-entry"]).expect("parse");
+        assert_eq!(l.position_entry_mode(), Some(PositionEntry::Limit));
+    }
+
+    #[test]
+    fn position_entry_flags_are_mutually_exclusive() {
+        let res = Args::try_parse_from(["tv-arm", "--market-entry", "--stop-entry"]);
+        assert!(res.is_err(), "expected parse error, got {res:?}");
     }
 
     #[test]

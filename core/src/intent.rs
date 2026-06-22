@@ -5,16 +5,26 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+mod blackout;
+mod entry_level_veto;
 mod expiry;
 mod mw_resolution;
 mod mw_state;
 mod resolution;
+mod sl_spread_floor;
 
+pub use blackout::{
+    BlackoutCloseAction, Buffers, MINUTES_PER_DAY, NoEntryWindow, is_inside_any, is_inside_window,
+    windows_from_session,
+};
+pub use entry_level_veto::{EntryLevelVeto, VetoSide};
 pub use expiry::{ExpiryError, MAX_EXPIRY_BARS, resolve_cancel_at};
+pub use mw_resolution::mw_static_prices;
 pub use mw_state::{MwAnchors, MwUpdate, effective_mw_params, plan_mw_update};
 #[cfg(feature = "cli")]
 pub use resolution::MIN_R_FLOOR;
-pub use resolution::{Resolved, ResolvedEntry, ResolvedOnTooClose, RiskBudget};
+pub use resolution::{ResolveError, Resolved, ResolvedEntry, ResolvedOnTooClose, RiskBudget};
+pub use sl_spread_floor::{SL_MIN_SPREAD_MULTIPLE, sl_spread_floor_violation};
 
 /// Plaintext outer YAML — the part TradingView substitutes `{{...}}` into.
 /// The intent fields sit alongside these at the top level of the signed
@@ -301,6 +311,20 @@ pub struct MwParams {
     /// `A` — the runup start. Audit / log only; the worker doesn't use
     /// it for entry geometry (it fed the arm-time neckline-% gate).
     pub runup_start: f64,
+    /// `D` — the **right shoulder**, when the operator drew a 4-point M/W
+    /// path (the optional 4th anchor). MID price, on the same side of the
+    /// neckline as `first_point` (above for an M, below for a W).
+    ///
+    /// When set, the second tower is already drawn, so the setup is
+    /// **armed immediately** — the worker skips the live right-tower-reach
+    /// and 50%-mid-cross gates (a 3-point path has to discover the right
+    /// tower bar by bar; a 4-point path declares it). The arming math then
+    /// keys the SL anchor / mid references off the **higher** of the two
+    /// shoulders. `None` for a classic 3-point path (unchanged behaviour).
+    /// `#[serde(default)]` keeps every in-flight 3-point signed intent
+    /// byte-identical.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub right_shoulder: Option<f64>,
     /// Broker spread in pips, read at arm time. The worker has no live
     /// spread at entry, so this baked value drives the mid→bid/ask
     /// correction on every level. `>= 0`.
@@ -467,6 +491,17 @@ pub struct Intent {
     /// veto gate.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub vetos: Vec<String>,
+    /// Continuous **at-entry level vetos** (Bug #12). Each names a veto, a
+    /// price level, and which side counts as "past". `run_enter` rejects the
+    /// entry when the resolved entry/trigger price is already past the level
+    /// — independent of whether any cross-event guard fired or wrote a KV
+    /// veto. Restores the legacy behaviour where a persistent `too-low` /
+    /// `too-high` KV veto blocked a confirmed enter. `#[serde(default)]`
+    /// keeps every in-flight signed intent / stored plan deserialising
+    /// unchanged. The `vetos` name-list above is left untouched and still
+    /// gates any externally/guard-set KV veto.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub entry_level_vetos: Vec<EntryLevelVeto>,
     /// Names to clear *before* setting the new prep/veto. Used to model
     /// ordered prep sequences where landing an earlier step must
     /// invalidate any stale later step.
@@ -765,6 +800,44 @@ pub struct Intent {
     /// `tv-arm` sets both to the same number.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pip_size: Option<f64>,
+    /// Server-side [`TradePlan`](crate::trade_plan::TradePlan) — present only
+    /// on an [`Action::Register`] intent, absent on every other action. The
+    /// engine reads this, persists the plan, and from then on evaluates the
+    /// plan's conditions itself on each cron tick (replacing the per-condition
+    /// TradingView alerts). Signed as part of the whole-body HMAC like every
+    /// other field, so the plan can't be tampered in flight.
+    ///
+    /// Default-absent = a non-register intent; byte-identical wire form to
+    /// pre-feature intents.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trade_plan: Option<crate::trade_plan::TradePlan>,
+    /// Market-hours entry blackout policy: what to do with this trade's
+    /// **resting order** when the daily blackout window opens (see
+    /// [`BlackoutCloseAction`]). The single field both the webhook enter path
+    /// and the engine's fired enter carry, so one reject gate + sweep branch
+    /// honours it regardless of which path placed the order.
+    ///
+    /// Defaults to [`BlackoutCloseAction::CancelResting`] — cancel the unfilled
+    /// order, leave any filled position alone (the incident fix). Signed as
+    /// part of the whole-body HMAC; `#[serde(default)]` + a skip predicate keep
+    /// the wire form byte-identical to pre-feature intents when it's the
+    /// default. Meaningful on `Action::Enter`; ignored on other actions.
+    #[serde(default, skip_serializing_if = "is_default_blackout_close")]
+    pub blackout_close: BlackoutCloseAction,
+    /// `plan list --include-all` flag: when true, the worker also enumerates the
+    /// archived (terminated) plans alongside the live ones. Meaningful only on
+    /// [`Action::PlanList`]; ignored elsewhere. Signed as part of the whole-body
+    /// HMAC; `#[serde(default)]` + skip-if-false keep the wire form
+    /// byte-identical to pre-feature `plan-list` intents.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub include_archived: bool,
+}
+
+/// Skip-serializing predicate for [`Intent::blackout_close`]. Returns true on
+/// the default `CancelResting` so the wire form stays byte-identical to intents
+/// minted before the field existed.
+fn is_default_blackout_close(a: &BlackoutCloseAction) -> bool {
+    matches!(a, BlackoutCloseAction::CancelResting)
 }
 
 /// Skip-serializing predicate for [`Intent::max_retries`]. Returns true
@@ -1052,9 +1125,12 @@ impl Intent {
         // looks vetos up by the entry's own trade_id — an untagged entry
         // could never match a (correctly tagged) veto. See the 2026-06-11
         // cross-trade veto-bleed fix.
+        // `PlanDelete` joins the trade-id-required set for a different reason:
+        // `trade_id` *names the plan to drop*. Without it there is nothing to
+        // delete, so reject the malformed control message before dispatch.
         if matches!(
             self.action,
-            Action::Enter | Action::Veto | Action::ClearVeto
+            Action::Enter | Action::Veto | Action::ClearVeto | Action::PlanDelete
         ) && self.trade_id.is_none()
         {
             return Err(IntentValidationError::MissingTradeId);
@@ -1208,6 +1284,20 @@ impl Intent {
             if !(anchors_finite && spread_ok && pip_ok) {
                 return Err(IntentValidationError::MwFieldInvalid);
             }
+            // 4-point path: the right shoulder must be finite and sit on
+            // the same side of the neckline as the left shoulder (above for
+            // an M where first_point > neckline, below for a W). The richer
+            // "within 1.3 of the shortest shoulder" validity is a *drawing*
+            // gate enforced at arm time in tv-arm; here we only guard the
+            // wire contract so a NaN / wrong-side baked value can't reach
+            // the resolver.
+            if let Some(rs) = mw.right_shoulder {
+                let left_above = mw.first_point > mw.neckline;
+                let rs_above = rs > mw.neckline;
+                if !rs.is_finite() || rs_above != left_above {
+                    return Err(IntentValidationError::MwFieldInvalid);
+                }
+            }
         }
         // Top-level baked pip: if present it scales every offset_pips into
         // a price, so a zero/negative/NaN value would silently zero or
@@ -1348,6 +1438,48 @@ pub enum Action {
     NewsStart,
     /// Clear the matching `news:<trade_id>:<news_id>` entry.
     NewsEnd,
+    /// Register a server-side [`TradePlan`](crate::trade_plan::TradePlan) with
+    /// the engine. The plan rides in [`Intent::trade_plan`]; the engine then
+    /// evaluates its conditions on each cron tick and dispatches the embedded
+    /// intents itself, replacing the per-condition TradingView alerts. A
+    /// control-style action — no broker call at register time; idempotent
+    /// (re-registering the same plan refreshes its row). See the engine crate.
+    Register,
+    /// Read-only query: return TradeNation's per-instrument market info
+    /// (trading session hours, spread, margin, guaranteed-stop terms,
+    /// expiry) for [`Intent::instrument`]. Unlike [`Action::Status`] this
+    /// needs a live TradeNation broker (it calls `broker.market_info`), so
+    /// it dispatches through the broker path rather than the KV-only
+    /// control block. No state mutation, no broker order. TradeNation only
+    /// — there is no OANDA equivalent yet. The hours feed the upcoming
+    /// market-hours entry blackout.
+    MarketInfo,
+    /// Read-only query: list every registered server-side
+    /// [`TradePlan`](crate::trade_plan::TradePlan) the engine is evaluating,
+    /// each with a compact summary of its current
+    /// [`PlanState`](crate::plan_state::PlanState) (phase, watermark, fired
+    /// rules, shadow flag). Like [`Action::Status`] this is KV-only (no broker)
+    /// and `instrument` is an ignored placeholder. Drives `trade-control plan
+    /// list`. Recorded as seen on every completion (idempotent control op).
+    PlanList,
+    /// Read-only query: dump one registered plan in full — the entire
+    /// [`TradePlan`](crate::trade_plan::TradePlan) plus its
+    /// [`PlanState`](crate::plan_state::PlanState). The target is named by
+    /// [`Intent::trade_id`] (not `instrument`, which is an ignored placeholder);
+    /// the worker scans every account scope and returns the match(es). KV-only,
+    /// idempotent. Drives `trade-control plan show <trade_id>`.
+    PlanShow,
+    /// Delete a registered server-side
+    /// [`TradePlan`](crate::trade_plan::TradePlan) and its
+    /// [`PlanState`](crate::plan_state::PlanState) — the inverse of
+    /// [`Action::Register`]. The target is named by [`Intent::trade_id`]
+    /// (`instrument` is an ignored placeholder); the worker scans every
+    /// account scope and drops the matching `plan:` + `plan-state:` rows.
+    /// KV-only (no broker), idempotent — deleting a plan that doesn't exist
+    /// is a no-op, not an error. Lets the operator re-arm a setup after
+    /// editing the chart: `plan delete <id>` then re-run `tv-arm`. Drives
+    /// `trade-control plan delete <trade_id>`.
+    PlanDelete,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
@@ -1366,6 +1498,18 @@ pub enum Direction {
 /// carry them (older Pine indicator), they fall back to the signal
 /// bar's `high` / `low` so behaviour degrades gracefully rather than
 /// producing a panic. Pine v2 from 2026-05-26 onwards ships them.
+///
+/// `SignalHigh` / `SignalLow` reference Pine's `signal_high` / `signal_low`
+/// — the *latched pattern extreme* (the H&S head / right-shoulder region),
+/// frozen when the pattern formed. Unlike `High`/`Low` (the triggering
+/// candle's own wick), these are **stable across a confirmation re-fire**:
+/// the break-candle fire and the later `signal_confirmed: 1` fire carry the
+/// same `signal_high`/`signal_low`, so an H&S enter anchored to them resolves
+/// to identical entry/SL geometry both times. (Contrast `RecentHigh`, which
+/// is the pre-signal lookback window, not the pattern extreme.) This anchor
+/// is what fixes bug #10 finding A — see the H&S/IHS geometry in
+/// `cli/src/trade_patterns.rs`. Same graceful `unwrap_or(high/low)` fallback
+/// as the recent_* anchors for shells that predate the fields.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PriceAnchor {
@@ -1374,6 +1518,8 @@ pub enum PriceAnchor {
     Low,
     RecentHigh,
     RecentLow,
+    SignalHigh,
+    SignalLow,
 }
 
 /// Reference to a price. Either anchored to the plaintext shell with a pip
@@ -1428,6 +1574,13 @@ pub enum EntrySpec {
         from: PriceAnchor,
         #[serde(default)]
         offset_pips: f64,
+        /// Absolute trigger price set at encode time. When `Some`, it
+        /// overrides `from`/`offset_pips` and the worker uses it verbatim
+        /// (the operator drew the exact level — e.g. a position tool's
+        /// entry anchor). When `None`, today's behaviour: trigger =
+        /// `anchor_price(from) + offset_pips × pip_size`. Signed.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        at: Option<f64>,
         /// Optional fallback for when the broker rejects the resting
         /// stop because the trigger has already been overtaken by price
         /// (TradeNation `#19-10` "entry too close to / wrong side of
@@ -1444,6 +1597,10 @@ pub enum EntrySpec {
         from: PriceAnchor,
         #[serde(default)]
         offset_pips: f64,
+        /// Absolute trigger price set at encode time — same semantics as
+        /// [`EntrySpec::Stop::at`]. When `Some`, overrides `from`/`offset_pips`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        at: Option<f64>,
     },
 }
 
@@ -1500,6 +1657,75 @@ impl OnTooClose {
 }
 
 impl Shell {
+    /// Synthesize a control-grade shell from one broker [`Candle`](crate::broker::Candle).
+    ///
+    /// The server-side engine has no TradingView alert to source a `Shell`
+    /// from — it polls candles and fires the registered intents itself. This
+    /// builds the minimal shell those intents need: OHLC + time. `open` is
+    /// populated (the candle carries it), so M/W body-extreme logic
+    /// ([`body_high`](Self::body_high) / [`body_low`](Self::body_low)) works.
+    /// Every Pine-latched field (`signal_*`, `recent_*`, `golden`, `atr`,
+    /// `next_candle_timestamp_*`) is `None`: a plain candle carries no pattern
+    /// geometry. This is the right shell for M/W (reads only OHLC), vetos, and
+    /// preps. An **H&S enter** instead uses [`Self::from_candle_and_signal`],
+    /// which folds the latched signal geometry the Pine-detector port computed
+    /// onto these fields.
+    pub fn from_candle(candle: &crate::broker::Candle) -> Self {
+        Self {
+            close: candle.c,
+            high: candle.h,
+            low: candle.l,
+            open: Some(candle.o),
+            time: candle.time,
+            signal_high: None,
+            signal_low: None,
+            signal_range: None,
+            signal_start_time: None,
+            signal_kind: None,
+            golden: None,
+            atr: None,
+            signal_confirmed: None,
+            recent_high: None,
+            recent_low: None,
+            next_candle_timestamp_1: None,
+            next_candle_timestamp_2: None,
+            next_candle_timestamp_3: None,
+            next_candle_timestamp_4: None,
+            next_candle_timestamp_5: None,
+        }
+    }
+
+    /// Synthesize an **H&S enter** shell from the triggering candle plus the
+    /// latched candle-pattern signal the engine's Pine-detector port computed.
+    ///
+    /// Starts from [`Self::from_candle`] (OHLC + time + `open`) and folds the
+    /// signal geometry onto the `signal_*` / `recent_*` / `golden` / `atr` /
+    /// `signal_confirmed` fields — the same values the TV alert's
+    /// `{{plot("signal_high")}}` substitutions carried. The H&S enter resolves
+    /// its entry/SL/TP against these (`PriceAnchor::SignalHigh` etc.), so a
+    /// server-side fire resolves to identical geometry as the TV-driven one.
+    ///
+    /// `next_candle_timestamp_*` stays `None`: the engine derives a pending
+    /// order's `cancel_at` from `expiry_bars` against the live tick clock, not
+    /// from a Pine-projected bar-close menu.
+    pub fn from_candle_and_signal(
+        candle: &crate::broker::Candle,
+        sig: &crate::signals::LatchedSignal,
+    ) -> Self {
+        let mut shell = Self::from_candle(candle);
+        shell.signal_high = Some(sig.signal_high);
+        shell.signal_low = Some(sig.signal_low);
+        shell.signal_range = Some(sig.signal_range);
+        shell.signal_start_time = Some(sig.signal_start_time);
+        shell.signal_kind = Some(sig.kind);
+        shell.golden = Some(sig.golden);
+        shell.signal_confirmed = Some(sig.signal_confirmed);
+        shell.atr = sig.atr;
+        shell.recent_high = sig.recent_high;
+        shell.recent_low = sig.recent_low;
+        shell
+    }
+
     /// Body top — `max(open, close)` — or `None` if this shell didn't
     /// carry `open` (control shells, or a chart still on the pre-`open`
     /// Pine). M/W dynamic geometry uses bodies, not wicks, so a lone rogue
@@ -1524,6 +1750,10 @@ impl Shell {
             // tighter SL, which is the conservative direction to err in).
             PriceAnchor::RecentHigh => self.recent_high.unwrap_or(self.high),
             PriceAnchor::RecentLow => self.recent_low.unwrap_or(self.low),
+            // Latched pattern extreme — stable across a confirm re-fire.
+            // Falls back to the candle wick if Pine didn't ship signal_*.
+            PriceAnchor::SignalHigh => self.signal_high.unwrap_or(self.high),
+            PriceAnchor::SignalLow => self.signal_low.unwrap_or(self.low),
         }
     }
 
@@ -1601,11 +1831,110 @@ mod tests {
     }
 
     #[test]
+    fn anchor_price_signal_uses_shell_field_when_present() {
+        // The latched pattern extreme, distinct from the candle wick.
+        let mut s = shell();
+        s.signal_high = Some(1.1075);
+        s.signal_low = Some(1.0925);
+        assert_eq!(s.anchor_price(PriceAnchor::SignalHigh), 1.1075);
+        assert_eq!(s.anchor_price(PriceAnchor::SignalLow), 1.0925);
+    }
+
+    #[test]
+    fn anchor_price_signal_falls_back_to_bar_extreme_when_missing() {
+        // Pre-2026-05 shells didn't carry signal_*. Fall back to the
+        // candle's own high/low rather than panic — same graceful
+        // degradation as the recent_* anchors.
+        let s = shell();
+        assert!(s.signal_high.is_none());
+        assert!(s.signal_low.is_none());
+        assert_eq!(s.anchor_price(PriceAnchor::SignalHigh), s.high);
+        assert_eq!(s.anchor_price(PriceAnchor::SignalLow), s.low);
+    }
+
+    #[test]
+    fn price_anchor_signal_round_trips_through_yaml() {
+        let from: PriceAnchor = serde_yaml::from_str("signal_high").unwrap();
+        assert_eq!(from, PriceAnchor::SignalHigh);
+        let out = serde_yaml::to_string(&PriceAnchor::SignalLow).unwrap();
+        assert!(out.contains("signal_low"), "got: {out}");
+    }
+
+    #[test]
     fn body_extremes_none_without_open() {
         // The default shell() has open: None.
         let s = shell();
         assert_eq!(s.body_high(), None);
         assert_eq!(s.body_low(), None);
+    }
+
+    #[test]
+    fn from_candle_populates_ohlc_and_open_but_no_pine_fields() {
+        let candle = crate::broker::Candle {
+            time: "2026-06-17T12:00:00Z".parse().unwrap(),
+            o: 1.0990,
+            h: 1.1020,
+            l: 1.0980,
+            c: 1.1000,
+        };
+        let s = Shell::from_candle(&candle);
+        assert_eq!(s.close, 1.1000);
+        assert_eq!(s.high, 1.1020);
+        assert_eq!(s.low, 1.0980);
+        assert_eq!(s.open, Some(1.0990));
+        assert_eq!(s.time, candle.time);
+        // open is present, so body extremes are computable (M/W relies on this).
+        assert_eq!(s.body_high(), Some(1.1000));
+        assert_eq!(s.body_low(), Some(1.0990));
+        // Every Pine-latched field is absent — the engine doesn't run the indicator.
+        assert_eq!(s.signal_kind, None);
+        assert_eq!(s.golden, None);
+        assert_eq!(s.atr, None);
+        assert_eq!(s.recent_high, None);
+        assert_eq!(s.next_candle_timestamp_1, None);
+    }
+
+    #[test]
+    fn from_candle_and_signal_folds_pattern_geometry() {
+        let candle = crate::broker::Candle {
+            time: "2026-06-17T12:00:00Z".parse().unwrap(),
+            o: 1.1200,
+            h: 1.3000,
+            l: 1.1000,
+            c: 1.1150,
+        };
+        let sig = crate::signals::LatchedSignal {
+            direction: Direction::Short,
+            kind: SignalKind::Pinbar,
+            signal_high: 1.3000,
+            signal_low: 1.1000,
+            signal_range: 0.2000,
+            signal_start_time: candle.time,
+            golden: true,
+            signal_confirmed: true,
+            atr: Some(0.05),
+            recent_high: Some(1.2500),
+            recent_low: Some(1.0500),
+            fires: true,
+        };
+        let s = Shell::from_candle_and_signal(&candle, &sig);
+        // OHLC still from the candle.
+        assert_eq!(s.close, 1.1150);
+        assert_eq!(s.open, Some(1.1200));
+        // Pattern geometry folded on — the H&S enter anchors entry/SL to these.
+        assert_eq!(s.signal_high, Some(1.3000));
+        assert_eq!(s.signal_low, Some(1.1000));
+        assert_eq!(s.signal_kind, Some(SignalKind::Pinbar));
+        assert_eq!(s.golden, Some(true));
+        assert_eq!(s.signal_confirmed, Some(true));
+        assert_eq!(s.recent_high, Some(1.2500));
+        assert_eq!(s.recent_low, Some(1.0500));
+        assert_eq!(s.atr, Some(0.05));
+        // The bug-010 SignalHigh/SignalLow anchors now resolve to the *pattern*
+        // extremes (not the triggering candle's own wick), so a server-side H&S
+        // fire anchors entry/SL identically to the TV-driven one.
+        assert_eq!(s.anchor_price(PriceAnchor::SignalHigh), 1.3000);
+        assert_eq!(s.anchor_price(PriceAnchor::SignalLow), 1.1000);
     }
 
     #[test]
@@ -1860,10 +2189,12 @@ mod tests {
             Some(EntrySpec::Stop {
                 from,
                 offset_pips,
+                at,
                 on_too_close,
             }) => {
                 assert_eq!(from, PriceAnchor::High);
                 assert!((offset_pips - 2.0).abs() < 1e-9);
+                assert_eq!(at, None);
                 assert!(on_too_close.is_none());
             }
             _ => panic!("expected stop entry"),
@@ -1878,10 +2209,12 @@ mod tests {
         let spec = EntrySpec::Stop {
             from: PriceAnchor::High,
             offset_pips: 1.0,
+            at: None,
             on_too_close: None,
         };
         let yaml = serde_yaml::to_string(&spec).unwrap();
         assert!(!yaml.contains("on_too_close"), "yaml was: {yaml}");
+        assert!(!yaml.contains("at:"), "yaml was: {yaml}");
     }
 
     #[test]
@@ -1908,6 +2241,7 @@ mod tests {
         let spec = EntrySpec::Stop {
             from: PriceAnchor::High,
             offset_pips: 1.0,
+            at: None,
             on_too_close: Some(OnTooClose {
                 action: OnTooCloseAction::Market,
                 max_slippage_pips: Some(8.0),
@@ -1963,9 +2297,14 @@ mod tests {
         ";
         let intent: Intent = serde_yaml::from_str(yaml).unwrap();
         match intent.entry {
-            Some(EntrySpec::Limit { from, offset_pips }) => {
+            Some(EntrySpec::Limit {
+                from,
+                offset_pips,
+                at,
+            }) => {
                 assert_eq!(from, PriceAnchor::Low);
                 assert!((offset_pips - -5.0).abs() < 1e-9);
+                assert_eq!(at, None);
             }
             _ => panic!("expected limit entry"),
         }
@@ -2889,6 +3228,36 @@ mod tests {
             intent.validate(),
             Err(IntentValidationError::MissingTradeId)
         );
+    }
+
+    #[test]
+    fn validate_rejects_plan_delete_without_trade_id() {
+        let yaml = "
+            v: 1
+            id: plan-delete-no-tid
+            not_after: \"2026-05-13T20:00:00Z\"
+            action: plan-delete
+            instrument: ALL
+        ";
+        let intent: Intent = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(
+            intent.validate(),
+            Err(IntentValidationError::MissingTradeId)
+        );
+    }
+
+    #[test]
+    fn validate_accepts_plan_delete_with_trade_id() {
+        let yaml = "
+            v: 1
+            id: plan-delete-ok
+            trade_id: eurusd-hs-1
+            not_after: \"2026-05-13T20:00:00Z\"
+            action: plan-delete
+            instrument: ALL
+        ";
+        let intent: Intent = serde_yaml::from_str(yaml).unwrap();
+        intent.validate().unwrap();
     }
 
     #[test]

@@ -3,3 +3,4 @@ target/
 .dev.vars
 scripts/__pycache__/
 scripts/tmp.json
+candle_cache

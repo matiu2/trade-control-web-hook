@@ -77,7 +77,9 @@ pub fn required_for_action(action: Action) -> &'static [&'static str] {
         Action::ClearPrep => &["step"],
         Action::ClearVeto => &["name", "trade_id"],
         // `instrument` is already in `ALWAYS_REQUIRED`; nothing extra needed.
-        Action::Status | Action::Unlock => &[],
+        // `market-info` queries the broker for that instrument's session
+        // hours / spread / margin — instrument is the only input.
+        Action::Status | Action::Unlock | Action::MarketInfo => &[],
         // pause/resume require `trade_id` + `blackout_id`, but those
         // aren't in `ALWAYS_REQUIRED` and the CLI's interactive
         // questionnaire doesn't know how to mint them — they're only
@@ -88,6 +90,15 @@ pub fn required_for_action(action: Action) -> &'static [&'static str] {
         // news-start / news-end are produced by `trade-control
         // build-news` from a NewsSpec — same shape as pause/resume.
         Action::NewsStart | Action::NewsEnd => &[],
+        // register carries a whole `TradePlan` in `trade_plan`, minted by
+        // `tv-arm` from the chart geometry — never hand-built through the
+        // interactive questionnaire, so nothing extra is prompted here.
+        Action::Register => &[],
+        // plan-list / plan-show / plan-delete are engine ops minted by the
+        // dedicated `trade-control plan` subcommand (plan-show / plan-delete
+        // name their target via `trade_id`), never through the interactive
+        // questionnaire.
+        Action::PlanList | Action::PlanShow | Action::PlanDelete => &[],
     }
 }
 

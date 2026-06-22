@@ -22,13 +22,16 @@ pub use admin_client::{
 };
 pub use admin_secret::{delete_secret, put_secret, secret_binding_for};
 pub use calendar_bars::{
-    CalendarBarPlan, CalendarBarRow, CalendarBarsArgs, CalendarBrokerArg, PlanInputs, TimeframeArg,
-    dedupe_and_filter_events, fetch_events_for_range, fetch_week_events, parse_instrument,
-    plan_calendar_bars, plan_calendar_bars_within, print_summary_table, run_calendar_bars,
+    BuiltCalendarBundle, CalendarBarPlan, CalendarBarRow, CalendarBarsArgs, CalendarBrokerArg,
+    PlanInputs, TimeframeArg, dedupe_and_filter_events, fetch_events_for_range, fetch_week_events,
+    parse_instrument, plan_calendar_bars, plan_calendar_bars_within, print_summary_table,
+    run_calendar_bars,
 };
 pub use control::{
-    build_clear_prep_intent, build_clear_veto_intent, build_prep_intent, build_status_intent,
-    build_unlock_intent, build_veto_intent, wrap_signed, wrap_signed_template,
+    build_clear_prep_intent, build_clear_veto_intent, build_market_info_intent,
+    build_plan_delete_intent, build_plan_list_intent, build_plan_show_intent, build_prep_intent,
+    build_register_intent, build_status_intent, build_unlock_intent, build_veto_intent,
+    wrap_signed, wrap_signed_direct_enter, wrap_signed_template,
 };
 /// Re-export forex-factory's event + impact types so downstream
 /// consumers (tv-news, future strategy binaries) don't have to pin the
@@ -53,7 +56,8 @@ pub use templates::{discover_templates, pick_template_interactive, templates_roo
 pub use trade_control_core::intent::{BrokerKind, PriceAnchor};
 pub use trade_control_core::sig::KEY_LEN;
 pub use trade_patterns::{
-    BuiltAlert, BuiltTrade, EntryMode, MwSpec, TradePattern, TradeSpec, build_trade_from_spec,
+    BuildStrictness, BuiltAlert, BuiltTrade, EntryMode, MwSpec, PositionEnterSpec,
+    PositionEntryKind, TradePattern, TradeSpec, build_position_enter, build_trade_from_spec,
     build_trade_interactive, load_spec_from_file, pick_pattern_interactive, write_trade,
 };
 

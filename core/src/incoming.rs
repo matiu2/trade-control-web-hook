@@ -41,6 +41,45 @@ pub enum IncomingError {
     InvalidIntent(IntentValidationError),
 }
 
+/// How the worker should report an [`IncomingError`] on the wire.
+///
+/// Splits the benign time-window declines (a well-formed, correctly-signed
+/// intent that simply fired outside its `[not_before, not_after]` window —
+/// the expected end-of-life outcome for any scheduled alert) from the
+/// genuinely bad / forged requests. The worker maps the former to an HTTP
+/// 200 `declined:` outcome and the latter to a 400 `rejected`, so timeline /
+/// verdict tooling can tell a routine stale fire apart from a real bad-body
+/// defect. See bug #9 — same status-code convention as M/W's
+/// `declined: mw-not-armed` (bug #7), here at the parse/verify gate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IncomingDisposition {
+    /// 200 — fired after `not_after`. Outcome `declined: intent-expired`.
+    DeclinedExpired,
+    /// 200 — fired before `not_before`. Outcome `declined: intent-too-early`.
+    DeclinedTooEarly,
+    /// 400 — a genuinely malformed/forged request. `StaleShellTime` lands
+    /// here too: a >24h-old plaintext `time` smells of replay, not a benign
+    /// late fire.
+    Rejected,
+}
+
+impl IncomingError {
+    /// Classify this error for the worker's wire response. Pure (no KV / no
+    /// clock), so it is unit-testable off-wasm.
+    pub fn disposition(&self) -> IncomingDisposition {
+        match self {
+            Self::Expired => IncomingDisposition::DeclinedExpired,
+            Self::TooEarly => IncomingDisposition::DeclinedTooEarly,
+            Self::BadYaml(_)
+            | Self::Sig(_)
+            | Self::BadIntentYaml(_)
+            | Self::UnsupportedVersion(_)
+            | Self::StaleShellTime
+            | Self::InvalidIntent(_) => IncomingDisposition::Rejected,
+        }
+    }
+}
+
 impl core::fmt::Display for IncomingError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
@@ -328,6 +367,51 @@ mod tests {
         ));
     }
 
+    /// Build a signed `market-info` query. A read-only TradeNation query
+    /// keyed on `instrument` (a TN MarketName); no entry geometry.
+    fn build_signed_market_info(instrument: &str) -> String {
+        let body_without_sig = [
+            "close: 0",
+            "high: 0",
+            "low: 0",
+            "time: \"2026-05-13T12:00:00Z\"",
+            "v: 1",
+            "action: market-info",
+            &format!("instrument: {instrument}"),
+            "id: market-info-wallst-abc",
+            "not_after: \"2026-05-13T12:05:00Z\"",
+            "broker: tradenation",
+            "",
+        ]
+        .join("\n");
+        let pairs = signed_pairs_from_text(&body_without_sig).unwrap();
+        let sig = crate::sig::sign(&KEY, &pairs).unwrap();
+        format!("{body_without_sig}sig: \"{sig}\"\n")
+    }
+
+    #[test]
+    fn signed_path_market_info_round_trips() {
+        let yaml = build_signed_market_info("Wall Street 30");
+        let now: DateTime<Utc> = "2026-05-13T12:01:00Z".parse().unwrap();
+        let v = parse_and_verify(&yaml, &KEY, now).unwrap();
+        assert_eq!(v.intent.action, crate::intent::Action::MarketInfo);
+        assert_eq!(v.intent.instrument, "Wall Street 30");
+        assert_eq!(v.intent.broker, crate::intent::BrokerKind::TradeNation);
+    }
+
+    #[test]
+    fn signed_path_market_info_instrument_tamper_rejected() {
+        // The instrument selects which market is queried — flipping it
+        // after signing must fail verification.
+        let yaml = build_signed_market_info("Wall Street 30")
+            .replace("instrument: Wall Street 30", "instrument: Spot Gold");
+        let now: DateTime<Utc> = "2026-05-13T12:01:00Z".parse().unwrap();
+        assert!(matches!(
+            parse_and_verify(&yaml, &KEY, now),
+            Err(IncomingError::Sig(SigError::Mismatch))
+        ));
+    }
+
     /// Build a signed `enter` carrying a baked top-level `pip_size`.
     fn build_signed_enter_with_pip(pip_size: &str) -> String {
         let body_without_sig = [
@@ -368,6 +452,130 @@ mod tests {
         // mis-size the trade) must fail verification.
         let yaml =
             build_signed_enter_with_pip("0.01").replace("pip_size: 0.01", "pip_size: 0.0001");
+        let now: DateTime<Utc> = "2026-05-13T12:01:00Z".parse().unwrap();
+        assert!(matches!(
+            parse_and_verify(&yaml, &KEY, now),
+            Err(IncomingError::Sig(SigError::Mismatch))
+        ));
+    }
+
+    /// Build a signed `enter` carrying an explicit `blackout_close` policy
+    /// (the market-hours entry blackout field). A scalar enum on its own
+    /// top-level line, so it's covered by the whole-body HMAC like any other
+    /// signed field.
+    fn build_signed_enter_with_blackout(close_action: &str) -> String {
+        let body_without_sig = [
+            "close: 152.000",
+            "high: 152.050",
+            "low: 151.950",
+            "time: \"2026-05-13T12:00:00Z\"",
+            "v: 1",
+            "action: enter",
+            "instrument: USD_JPY",
+            "id: hs-usdjpy-blk",
+            "trade_id: usdjpy-hs-1",
+            "not_after: \"2026-05-13T20:00:00Z\"",
+            "direction: long",
+            "entry: {\"type\":\"stop\",\"from\":\"high\",\"offset_pips\":1.0}",
+            "stop_loss: {\"from\":\"low\",\"offset_pips\":-1.0}",
+            "take_profit: {\"absolute\":153.0}",
+            &format!("blackout_close: {close_action}"),
+            "",
+        ]
+        .join("\n");
+        let pairs = signed_pairs_from_text(&body_without_sig).unwrap();
+        let sig = crate::sig::sign(&KEY, &pairs).unwrap();
+        format!("{body_without_sig}sig: \"{sig}\"\n")
+    }
+
+    #[test]
+    fn signed_path_blackout_close_round_trips() {
+        let yaml = build_signed_enter_with_blackout("cancel_and_close");
+        let now: DateTime<Utc> = "2026-05-13T12:01:00Z".parse().unwrap();
+        let v = parse_and_verify(&yaml, &KEY, now).unwrap();
+        assert_eq!(
+            v.intent.blackout_close,
+            crate::intent::BlackoutCloseAction::CancelAndClose
+        );
+    }
+
+    #[test]
+    fn signed_path_blackout_close_defaults_when_absent() {
+        // An enter with no `blackout_close:` line deserializes to the safe
+        // incident-fix default (`CancelResting`) — wire-compatible with intents
+        // minted before the field existed.
+        let yaml = build_signed_enter_with_pip("0.0001");
+        let now: DateTime<Utc> = "2026-05-13T12:01:00Z".parse().unwrap();
+        let v = parse_and_verify(&yaml, &KEY, now).unwrap();
+        assert_eq!(
+            v.intent.blackout_close,
+            crate::intent::BlackoutCloseAction::CancelResting
+        );
+    }
+
+    #[test]
+    fn signed_path_blackout_close_tamper_rejected() {
+        // The close policy is signed — flipping CancelResting → CancelAndClose
+        // after signing (to force a position close across the gap) must fail.
+        let yaml = build_signed_enter_with_blackout("cancel_resting").replace(
+            "blackout_close: cancel_resting",
+            "blackout_close: cancel_and_close",
+        );
+        let now: DateTime<Utc> = "2026-05-13T12:01:00Z".parse().unwrap();
+        assert!(matches!(
+            parse_and_verify(&yaml, &KEY, now),
+            Err(IncomingError::Sig(SigError::Mismatch))
+        ));
+    }
+
+    /// Build a signed `register` carrying a flow-style `trade_plan`. The plan
+    /// rides as single-line JSON (valid flow YAML) exactly as the CLI's
+    /// `render_value` emits any nested field, so the whole plan sits on the
+    /// `trade_plan:` line and is covered by the whole-body HMAC.
+    fn build_signed_register(plan_json: &str) -> String {
+        let body_without_sig = [
+            "close: 0",
+            "high: 0",
+            "low: 0",
+            "time: \"2026-05-13T12:00:00Z\"",
+            "v: 1",
+            "action: register",
+            "instrument: EUR_USD",
+            "id: register-abc",
+            "trade_id: eurusd-hs-1",
+            "not_after: \"2026-05-13T20:00:00Z\"",
+            &format!("trade_plan: {plan_json}"),
+            "",
+        ]
+        .join("\n");
+        let pairs = signed_pairs_from_text(&body_without_sig).unwrap();
+        let sig = crate::sig::sign(&KEY, &pairs).unwrap();
+        format!("{body_without_sig}sig: \"{sig}\"\n")
+    }
+
+    /// A minimal flow-style plan: zero rules is enough to prove the field
+    /// signs, verifies, and deserialises back into a `TradePlan`. Rule
+    /// evaluation is Stage D.
+    const MINIMAL_PLAN_JSON: &str = r#"{"trade_id":"eurusd-hs-1","instrument":"EUR_USD","direction":"long","granularity":"h1","pip_size":0.0001,"rules":[]}"#;
+
+    #[test]
+    fn signed_path_register_trade_plan_round_trips() {
+        let yaml = build_signed_register(MINIMAL_PLAN_JSON);
+        let now: DateTime<Utc> = "2026-05-13T12:01:00Z".parse().unwrap();
+        let v = parse_and_verify(&yaml, &KEY, now).unwrap();
+        assert_eq!(v.intent.action, crate::intent::Action::Register);
+        let plan = v.intent.trade_plan.expect("trade_plan present");
+        assert_eq!(plan.trade_id, "eurusd-hs-1");
+        assert_eq!(plan.instrument, "EUR_USD");
+        assert!(plan.rules.is_empty());
+    }
+
+    #[test]
+    fn signed_path_register_trade_plan_tamper_rejected() {
+        // The plan is signed as part of the whole body — editing the
+        // single-line plan value after signing must fail verification.
+        let yaml = build_signed_register(MINIMAL_PLAN_JSON)
+            .replace(r#""pip_size":0.0001"#, r#""pip_size":0.01"#);
         let now: DateTime<Utc> = "2026-05-13T12:01:00Z".parse().unwrap();
         assert!(matches!(
             parse_and_verify(&yaml, &KEY, now),
@@ -881,6 +1089,46 @@ mod tests {
         let now: DateTime<Utc> = "2026-05-13T12:01:00Z".parse().unwrap();
         let v = parse_and_verify(&yaml, &KEY, now).unwrap();
         assert_eq!(v.intent.trade_id.as_deref(), Some("eurusd-short-01jb2x"));
+    }
+
+    #[test]
+    fn disposition_splits_time_window_from_bad_request() {
+        use crate::intent::IntentValidationError;
+
+        // Benign time-window declines → 200 declined.
+        assert_eq!(
+            IncomingError::Expired.disposition(),
+            IncomingDisposition::DeclinedExpired
+        );
+        assert_eq!(
+            IncomingError::TooEarly.disposition(),
+            IncomingDisposition::DeclinedTooEarly
+        );
+
+        // Genuinely bad / forged → 400 rejected.
+        for err in [
+            IncomingError::BadYaml("x".into()),
+            IncomingError::Sig(SigError::Mismatch),
+            IncomingError::BadIntentYaml("x".into()),
+            IncomingError::UnsupportedVersion(99),
+            IncomingError::InvalidIntent(IntentValidationError::InvalidTradeId),
+        ] {
+            assert_eq!(
+                err.disposition(),
+                IncomingDisposition::Rejected,
+                "{err:?} should be a 400 rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn disposition_stale_shell_time_is_rejected_not_benign() {
+        // A >24h-old plaintext `time` smells of replay/forgery — it must not
+        // be reclassified as a benign decline alongside Expired/TooEarly.
+        assert_eq!(
+            IncomingError::StaleShellTime.disposition(),
+            IncomingDisposition::Rejected
+        );
     }
 
     #[test]

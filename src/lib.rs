@@ -14,9 +14,11 @@ mod allow_entry_gate;
 mod candle_gate;
 mod cron;
 mod diag;
-mod retry_gate;
+mod market_blackout;
+mod market_info;
 mod spread_blackout;
 mod state;
+mod tick_recording;
 #[cfg(target_arch = "wasm32")]
 mod tn_login;
 mod tn_login_helpers;
@@ -34,15 +36,15 @@ use broker_oanda::login_with_account_id as oanda_login_with;
 use broker_oanda::{OandaBroker, login as oanda_login};
 use serde::Serialize;
 use trade_control_core::broker::{Broker, EntryError, EntryRequest};
-use trade_control_core::incoming::{self, parse_and_verify};
+use trade_control_core::incoming::{self, IncomingDisposition, parse_and_verify};
 use trade_control_core::intent::{
     Action, BrokerKind, Intent, MW_CANCEL_VETO_NAME, MwAnchors, MwUpdate, REVERSAL_VETO_NAME,
-    Resolved, Shell, VetoLevel, effective_mw_params, plan_mw_update,
+    ResolveError, Resolved, Shell, VetoLevel, effective_mw_params, is_inside_any, plan_mw_update,
 };
 use trade_control_core::rules::{self, RuleError};
 use trade_control_core::sig;
 use trade_control_core::state::{
-    StateStore, clear_named_preps, clear_named_vetos, veto_ttl_seconds,
+    StateError, StateStore, clear_named_preps, clear_named_vetos, veto_ttl_seconds,
 };
 use trade_control_core::tunable::Tunable;
 
@@ -148,14 +150,43 @@ pub async fn main(mut req: Request, env: Env, ctx: Context) -> Result<Response> 
         let now = Utc::now();
         let verified = match parse_and_verify(&yaml, &key, now) {
             Ok(v) => v,
-            Err(err) => {
-                rlog_err!(
-                    "incoming rejected: {err} | body_len={} body_excerpt={:?}",
-                    yaml.len(),
-                    body_excerpt(&yaml)
-                );
-                break 'intent Response::error("rejected", 400);
-            }
+            // A benign time-window decline (`Expired` / `TooEarly`) is a
+            // well-formed, correctly-signed intent that simply fired outside
+            // its `[not_before, not_after]` window — the *expected*
+            // end-of-life outcome for any scheduled alert that keeps firing
+            // past its intent's lifetime. Report it as a 200 with a distinct
+            // `declined:` outcome so the timeline/verdict downstream can tell
+            // it apart from a genuinely malformed/forged request (which stays
+            // a 400 `rejected`). `StaleShellTime` is *not* folded in here — a
+            // >24h-old plaintext `time` smells of replay. Same status-code
+            // convention as bug #7's `declined: mw-not-armed`, here at the
+            // parse/verify gate. Bug #9.
+            Err(err) => match err.disposition() {
+                IncomingDisposition::DeclinedExpired => {
+                    rlog!(
+                        "incoming declined: {err} | body_len={} body_excerpt={:?}",
+                        yaml.len(),
+                        body_excerpt(&yaml)
+                    );
+                    break 'intent Response::ok("declined: intent-expired");
+                }
+                IncomingDisposition::DeclinedTooEarly => {
+                    rlog!(
+                        "incoming declined: {err} | body_len={} body_excerpt={:?}",
+                        yaml.len(),
+                        body_excerpt(&yaml)
+                    );
+                    break 'intent Response::ok("declined: intent-too-early");
+                }
+                IncomingDisposition::Rejected => {
+                    rlog_err!(
+                        "incoming rejected: {err} | body_len={} body_excerpt={:?}",
+                        yaml.len(),
+                        body_excerpt(&yaml)
+                    );
+                    break 'intent Response::error("rejected", 400);
+                }
+            },
         };
 
         let store = match env.kv(KV_NAMESPACE) {
@@ -214,7 +245,20 @@ pub async fn main(mut req: Request, env: Env, ctx: Context) -> Result<Response> 
             Action::Resume => break 'intent handle_resume(&store, &verified, now).await,
             Action::NewsStart => break 'intent handle_news_start(&store, &verified, now).await,
             Action::NewsEnd => break 'intent handle_news_end(&store, &verified, now).await,
+            Action::Register => break 'intent handle_register(&store, &verified, now).await,
+            Action::PlanList => break 'intent handle_plan_list(&store, &verified, now).await,
+            Action::PlanShow => break 'intent handle_plan_show(&store, &verified, now).await,
+            Action::PlanDelete => break 'intent handle_plan_delete(&store, &verified, now).await,
             _ => {}
+        }
+
+        // `market-info` is a read-only query that needs a live TradeNation
+        // broker (its `market_info` call is not on the generic `Broker`
+        // trait), so it acquires the broker here and returns its own
+        // Response directly — it is not an `ActionResult` and so skips
+        // `run_action` / `record_dispatcher_outcome`.
+        if verified.intent.action == Action::MarketInfo {
+            break 'intent market_info::handle_market_info(&env, &store, &verified, now).await;
         }
 
         // Broker dispatch.
@@ -492,46 +536,7 @@ async fn run_action<B: Broker>(
     match verified.intent.action {
         Action::Enter => run_enter(broker, store, verified, env, now, Some(raw_body)).await,
         Action::Close => run_close(broker, store, verified, now).await,
-        Action::Invalidate => {
-            let hours = match resolve_phase1_u32(
-                "cooldown_hours",
-                verified.intent.cooldown_hours.as_ref(),
-                &verified.shell,
-                12,
-            ) {
-                Ok(n) => n,
-                Err(outcome) => {
-                    return ActionResult::Rejected {
-                        response: Response::error("cooldown_hours script error", 412),
-                        outcome,
-                    };
-                }
-            };
-            let account = verified.intent.account.as_deref();
-            if let Err(err) = store
-                .set_cooldown(account, &verified.intent.instrument, hours, now)
-                .await
-            {
-                rlog_err!("KV set_cooldown: {err}");
-                return ActionResult::Rejected {
-                    response: Response::error("state error", 500),
-                    outcome: "rejected: state-error".into(),
-                };
-            }
-            let cancelled = broker
-                .cancel_pending_for_instrument(&verified.intent.instrument)
-                .await;
-            rlog!(
-                "invalidate instrument={} account={} cooldown={}h cancelled={} pending",
-                verified.intent.instrument,
-                account.unwrap_or("<global>"),
-                hours,
-                cancelled
-            );
-            ActionResult::Ok(format!(
-                "invalidated: cooldown {hours}h, cancelled {cancelled}"
-            ))
-        }
+        Action::Invalidate => run_invalidate(broker, store, verified, now).await,
         Action::Veto => run_veto_with_broker(broker, store, verified, now).await,
         Action::Status
         | Action::Unlock
@@ -542,11 +547,69 @@ async fn run_action<B: Broker>(
         | Action::Pause
         | Action::Resume
         | Action::NewsStart
-        | Action::NewsEnd => {
+        | Action::NewsEnd
+        | Action::Register
+        | Action::PlanList
+        | Action::PlanShow
+        | Action::PlanDelete
+        // MarketInfo needs the concrete TradeNation broker (its `market_info`
+        // is not on the generic `Broker` trait), so it's dispatched in the
+        // broker-acquire section before this generic function — never here.
+        | Action::MarketInfo => {
             // Handled before broker dispatch; never reached here.
             unreachable!("non-broker actions handled before broker dispatch")
         }
     }
+}
+
+/// Dispatch an `Invalidate` intent: set an instrument cooldown and cancel any
+/// pending orders for it. Extracted from [`run_action`] so the cron engine can
+/// dispatch a fired invalidation veto through the identical path. `pub(crate)`
+/// for that reuse.
+pub(crate) async fn run_invalidate<B: Broker>(
+    broker: &B,
+    store: &KvStateStore,
+    verified: &incoming::Verified,
+    now: chrono::DateTime<chrono::Utc>,
+) -> ActionResult {
+    let hours = match resolve_phase1_u32(
+        "cooldown_hours",
+        verified.intent.cooldown_hours.as_ref(),
+        &verified.shell,
+        12,
+    ) {
+        Ok(n) => n,
+        Err(outcome) => {
+            return ActionResult::Rejected {
+                response: Response::error("cooldown_hours script error", 412),
+                outcome,
+            };
+        }
+    };
+    let account = verified.intent.account.as_deref();
+    if let Err(err) = store
+        .set_cooldown(account, &verified.intent.instrument, hours, now)
+        .await
+    {
+        rlog_err!("KV set_cooldown: {err}");
+        return ActionResult::Rejected {
+            response: Response::error("state error", 500),
+            outcome: "rejected: state-error".into(),
+        };
+    }
+    let cancelled = broker
+        .cancel_pending_for_instrument(&verified.intent.instrument)
+        .await;
+    rlog!(
+        "invalidate instrument={} account={} cooldown={}h cancelled={} pending",
+        verified.intent.instrument,
+        account.unwrap_or("<global>"),
+        hours,
+        cancelled
+    );
+    ActionResult::Ok(format!(
+        "invalidated: cooldown {hours}h, cancelled {cancelled}"
+    ))
 }
 
 /// Dispatch a `Close` intent. The close reaches the broker only when
@@ -1128,9 +1191,18 @@ pub(crate) async fn run_enter<B: Broker>(
         verified.intent.max_retries,
         trade_control_core::tunable::Tunable::Static(0)
     ) {
-        match retry_gate::evaluate(broker, store, &verified.intent, &verified.shell).await {
-            retry_gate::RetryGateOutcome::Proceed { next_attempt_no } => Some(next_attempt_no),
-            retry_gate::RetryGateOutcome::Rejected {
+        match trade_control_core::retry_gate::evaluate(
+            broker,
+            store,
+            &verified.intent,
+            &verified.shell,
+        )
+        .await
+        {
+            trade_control_core::retry_gate::RetryGateOutcome::Proceed { next_attempt_no } => {
+                Some(next_attempt_no)
+            }
+            trade_control_core::retry_gate::RetryGateOutcome::Rejected {
                 status,
                 message,
                 outcome,
@@ -1312,6 +1384,24 @@ pub(crate) async fn run_enter<B: Broker>(
     };
     let resolved = match resolve_result {
         Ok(r) => r,
+        // An M/W bar that hasn't completed its real-time arming sequence is
+        // a *benign, expected* decline ("stay armed for the next bar"), not a
+        // bad request. Report it as a 200 with a distinct `declined:` outcome
+        // so the timeline/verdict downstream can tell routine M/W declines
+        // apart from a genuinely malformed enter. It is still a seen-id
+        // `Skip` (Rejected), so the setup stays armed. See bug #7.
+        Err(ResolveError::NotArmedYet) => {
+            rlog!(
+                "resolve: M/W not armed yet — declining this bar (id={})",
+                verified.intent.id
+            );
+            return ActionResult::Rejected {
+                response: Response::ok("declined: mw-not-armed"),
+                outcome: "declined: mw-not-armed".into(),
+            };
+        }
+        // Genuinely malformed enter (wrong-side SL/limit/stop, entry outside
+        // SL..TP, sub-1R, missing field, bad script): a real 400 bad request.
         Err(err) => {
             rlog_err!("resolve: {err}");
             return ActionResult::Rejected {
@@ -1320,6 +1410,35 @@ pub(crate) async fn run_enter<B: Broker>(
             };
         }
     };
+
+    // Entry-level veto gate — Bug #12. The pcl-exhausted / invalidation level
+    // is a *continuous* predicate: reject when the resolved entry price is
+    // already past it, regardless of whether the engine's cross-event guard
+    // fired or wrote a KV veto. The legacy persistent KV veto gave this
+    // continuous semantics for free; the engine's one-shot Intrabar guard can
+    // miss a gap / pre-armed breach and let the entry through (the NZD/CAD
+    // −110.53 GBP incident). Sits after `resolved` (needs the entry price) and
+    // before `allow_entry` (a regression-critical veto must not be defeatable
+    // by an operator script). The `rejected: veto-active (<name>)` outcome is
+    // byte-identical to the legacy KV veto path and is a seen-id `Skip`.
+    let entry_ref_price = resolved.entry.reference_price();
+    if let Some(elv) = verified
+        .intent
+        .entry_level_vetos
+        .iter()
+        .find(|elv| elv.is_past(entry_ref_price))
+    {
+        rlog!(
+            "entry rejected: entry-level veto {} active (entry={entry_ref_price} past level={}) (id={})",
+            elv.name,
+            elv.level,
+            verified.intent.id
+        );
+        return ActionResult::Rejected {
+            response: Response::error("veto active", 412),
+            outcome: format!("rejected: veto-active ({})", elv.name),
+        };
+    }
 
     // allow_entry gate — operator's Tunable<bool> script sees the full
     // shell + resolved geometry. Sits after Resolved::from_intent
@@ -1414,6 +1533,52 @@ pub(crate) async fn run_enter<B: Broker>(
         }
     };
 
+    // Market-hours entry blackout (System 1, the reject gate): reject a
+    // brand-new entry that fires inside this instrument's daily close→open
+    // gap, so a resting stop order is never left to trigger on the reopen
+    // liquidity gap (the incident this feature fixes). The per-instrument
+    // UTC no-entry windows are derived once a day by the 06:00 UTC cron
+    // (`src/cron/blackout_hours.rs`) from the broker's session hours and
+    // stored in KV. This is a pure KV read + a minute-of-day comparison —
+    // no broker round-trip — so it sits ahead of the (broker-touching)
+    // spread-blackout gate below.
+    //
+    // REJECT, NOT a delay (same discipline as spread-blackout): no KV
+    // write, no re-fire scheduled. The next signal bar re-triggers and
+    // re-runs this check — once the market has reopened the same entry
+    // passes. Returning `ActionResult::Rejected` is a `Skip` in
+    // `seen_decision` (no `mark_seen`), so this reject never poisons the
+    // intent id; the in-hours refire is allowed through. See CLAUDE.md
+    // "Replay protection scope". Do NOT add any KV write on this path.
+    //
+    // FAIL OPEN: a KV read hiccup, or an instrument with no derived
+    // windows (24h / unparseable / not-yet-refreshed), must never block a
+    // legitimate entry — `get_blackout_windows` returns an empty Vec in
+    // those cases and `is_inside_any` is then always `false`.
+    match store.get_blackout_windows(&resolved.instrument).await {
+        Err(err) => {
+            rlog_err!(
+                "market-blackout: windows read failed for {} (id={}): {err} — failing open (allowing entry)",
+                resolved.instrument,
+                verified.intent.id
+            );
+        }
+        Ok(windows) => {
+            let now_min = market_blackout::now_utc_minute_of_day(now);
+            if is_inside_any(now_min, &windows) {
+                rlog!(
+                    "entry rejected: market-blackout instrument={} now_utc_min={now_min} windows={windows:?} (id={})",
+                    resolved.instrument,
+                    verified.intent.id
+                );
+                return ActionResult::Rejected {
+                    response: Response::error("entry blocked: market-hours blackout", 423),
+                    outcome: "rejected: market-blackout".into(),
+                };
+            }
+        }
+    }
+
     // System 1 of the spread blackout: reject a brand-new entry that
     // fires during the post-NY-close liquidity trough when the live
     // spread on THIS instrument is elevated. Runs here — after every
@@ -1462,18 +1627,90 @@ pub(crate) async fn run_enter<B: Broker>(
                 let spread_pips = quote.spread() / pip_size;
                 let threshold = spread_blackout::elevated_threshold_pips(&resolved.instrument);
                 if spread_blackout::spread_blackout_decision(true, spread_pips, threshold) {
+                    // Name the instrument's baked normal/spike so the
+                    // operator can judge whether the block is right. Baked
+                    // figures come from the spread-sampler baseline; absent
+                    // for an uncatalogued instrument (then we only have the
+                    // flat threshold to show).
+                    let normal = match spread_blackout::baked_baseline(&resolved.instrument) {
+                        Some((low, high, median)) => format!(
+                            "{} normal spread ~{median:.1}p (seen {low:.1}–{high:.1}p)",
+                            resolved.instrument
+                        ),
+                        None => format!("{} (no baseline)", resolved.instrument),
+                    };
+                    let message = format!(
+                        "entry blocked: spread blackout — {normal}, current spread {spread_pips:.1}p > {threshold:.1}p; preventing entry for safety"
+                    );
                     rlog!(
                         "entry rejected: spread-blackout instrument={} spread={spread_pips:.1}p > {threshold:.1}p (id={})",
                         resolved.instrument,
                         verified.intent.id
                     );
                     return ActionResult::Rejected {
-                        response: Response::error("entry blocked: spread blackout", 423),
+                        response: Response::error(&message, 423),
                         outcome: "rejected: spread-blackout".into(),
                     };
                 }
             }
         },
+    }
+
+    // SL-vs-spread floor (hard limit, every entry): the stop-loss distance must
+    // be at least `SL_MIN_SPREAD_MULTIPLE`× the live bid-ask spread, so a stop
+    // is a real market level and not dominated by the cost of crossing the book.
+    // Pure decision in `trade_control_core::intent::sl_spread_floor_violation`;
+    // this is the live-quote wrapper. Mirrored at arm/build time (tv-arm,
+    // trade-control) so a bad setup is caught before signing — this is the
+    // real-time backstop.
+    //
+    // Unlike spread-blackout this samples the quote on EVERY entry (no window
+    // guard), since the floor always applies. It is the only other broker
+    // round-trip on the entry path; keep it right beside spread-blackout.
+    //
+    // FAIL OPEN on a quote error: a transient broker quote hiccup must not
+    // strand a legitimate entry (same discipline as spread-blackout). REJECT is
+    // a `Skip` in `seen_decision` (no `mark_seen`), so it never poisons the
+    // intent id — the next signal bar refires and re-checks. Do NOT add a KV
+    // write on this path.
+    match broker.get_quote(&resolved.instrument).await {
+        Err(err) => {
+            rlog_err!(
+                "sl-spread-floor: get_quote failed for {} (id={}): {err:?} — failing open (allowing entry)",
+                resolved.instrument,
+                verified.intent.id
+            );
+        }
+        Ok(quote) => {
+            let spread_price = quote.spread();
+            let sl_distance = (entry_reference_price(&resolved.entry) - resolved.stop_loss).abs();
+            if trade_control_core::intent::sl_spread_floor_violation(sl_distance, spread_price) {
+                let min_sl = trade_control_core::intent::SL_MIN_SPREAD_MULTIPLE * spread_price;
+                // Render the distances in pips for the operator-facing message.
+                // `pip_size` is the baked intent value (or the secret/default
+                // fallback); guard against a non-positive divisor so a bad pip
+                // never produces a NaN/inf in the reject body.
+                let (sl_pips, spread_pips) = if pip_size > 0.0 {
+                    (sl_distance / pip_size, spread_price / pip_size)
+                } else {
+                    (sl_distance, spread_price)
+                };
+                let message = format!(
+                    "entry blocked: SL <= {mult:.0}x spread: SL distance {sl_pips:.1} pips; spread = {spread_pips:.1} pips",
+                    mult = trade_control_core::intent::SL_MIN_SPREAD_MULTIPLE,
+                );
+                rlog!(
+                    "entry rejected: sl-below-10x-spread instrument={} sl_distance={sl_distance} < {min_sl} (spread={spread_price}, {}x; {sl_pips:.1} pips vs {spread_pips:.1} pips) (id={})",
+                    resolved.instrument,
+                    trade_control_core::intent::SL_MIN_SPREAD_MULTIPLE,
+                    verified.intent.id
+                );
+                return ActionResult::Rejected {
+                    response: Response::error(&message, 422),
+                    outcome: "rejected: sl-below-10x-spread".into(),
+                };
+            }
+        }
     }
 
     let entry_request = EntryRequest {
@@ -1542,7 +1779,7 @@ pub(crate) async fn run_enter<B: Broker>(
             } else {
                 rlog!("entry placed id={} order={}", verified.intent.id, order_id);
                 if let Some(attempt_no) = retry_attempt_no {
-                    retry_gate::record_placement(
+                    trade_control_core::retry_gate::record_placement(
                         store,
                         &verified.intent,
                         verified.shell.time,
@@ -1656,6 +1893,7 @@ async fn maybe_update_mw_state<B: Broker>(
         runup_start: mw.runup_start,
         left_shoulder: mw.first_point,
         baked_neckline: mw.neckline,
+        drawn_right_shoulder: mw.right_shoulder,
     };
 
     match plan_mw_update(anchors, prior, &verified.shell, now, expires_at) {
@@ -1722,9 +1960,17 @@ async fn maybe_update_mw_state<B: Broker>(
 /// and therefore the 1%-equity position size, so the broker re-runs
 /// sizing from the market reference rather than the stop-trigger math.
 ///
+/// For `action: limit` it instead re-places a **limit** order resting at
+/// the original trigger (after a geometry guard — a limit on the wrong
+/// side would be a `#19-9`), preserving the planned R and waiting for a
+/// pullback. No fresh sizing: the entry reference is unchanged. The
+/// resting limit is recorded as a normal `EntryAttempt` by the caller, so
+/// the cron sweep cancels it when the alert window / `expiry_bars` lapses
+/// — no broker-native GTD required.
+///
 /// Returns the original [`EntryError::EntryTooCloseToMarket`] (so the
 /// caller surfaces the distinct outcome) when the fallback is absent,
-/// out of threshold, `skip`, `limit` (unimplemented), or the re-place
+/// out of threshold, `skip`, a wrong-side `limit`, or the re-place
 /// itself fails / the price read fails. One attempt only.
 async fn place_entry_too_close_fallback<B: Broker>(
     broker: &B,
@@ -1805,6 +2051,44 @@ async fn place_entry_too_close_fallback<B: Broker>(
                 }
             }
         }
+        too_close::TooClosePlan::Limit { trigger_price } => {
+            rlog!(
+                "too-close fallback: re-placing as LIMIT at original trigger (id={intent_id} trigger={trigger_price} price={current_price})"
+            );
+            // The entry reference is unchanged (the limit rests at the
+            // original trigger), so the stop distance — and therefore the
+            // 1%-equity sizing — is identical to the original plan. Reuse
+            // the resolved stop/take-profit/risk verbatim; the broker
+            // sizes from the limit trigger just as it would have from the
+            // stop trigger.
+            let limit_request = EntryRequest {
+                instrument: &resolved.instrument,
+                direction: resolved.direction,
+                entry: ResolvedEntry::Limit { trigger_price },
+                stop_loss: resolved.stop_loss,
+                take_profit: resolved.take_profit,
+                risk: resolved.risk,
+                dry_run: resolved.dry_run,
+            };
+            match broker
+                .place_entry(max_risk_pct, max_open_positions, &limit_request)
+                .await
+            {
+                Ok(order_id) => {
+                    rlog!(
+                        "too-close fallback: limit re-place succeeded (id={intent_id} order={order_id})"
+                    );
+                    Ok(order_id)
+                }
+                Err(err) => {
+                    // One attempt only. Surface the original too-close
+                    // identity so the seen-id stays un-poisoned and the
+                    // next bar can retry.
+                    rlog_err!("too-close fallback: limit re-place failed: {err} (id={intent_id})");
+                    Err(EntryError::EntryTooCloseToMarket)
+                }
+            }
+        }
     }
 }
 
@@ -1846,7 +2130,7 @@ async fn handle_status(
 /// Best-effort wrapper around `mark_seen`. Used by the dedicated control
 /// handlers (status / unlock / prep / veto / clear-*) so each one ends
 /// with one line instead of an `if let Err` repeated everywhere.
-async fn record_seen<S: StateStore>(
+pub(crate) async fn record_seen<S: StateStore>(
     store: &S,
     verified: &incoming::Verified,
     now: chrono::DateTime<chrono::Utc>,
@@ -2515,6 +2799,408 @@ async fn handle_news_end(
     };
     record_seen(store, verified, now, &outcome).await;
     Response::ok("ok")
+}
+
+/// Handle the `register` action: accept a server-side
+/// [`TradePlan`](trade_control_core::trade_plan::TradePlan) for the engine to
+/// evaluate on each cron tick. A control action — no broker work; idempotent
+/// (re-registering refreshes the row), so it marks-seen on every completion
+/// like the other control handlers.
+///
+/// **Stage C scope:** this validates the intent actually carries a plan and
+/// that the plan's `trade_id` matches the intent's, then acknowledges it. The
+/// KV persistence of the plan + its per-rule `PlanState` is Stage D — until
+/// then a register is a logged no-op so the wire path and the dispatch routing
+/// can be exercised end-to-end without the engine's storage schema. The
+/// `not-yet-persisted` outcome string makes that explicit in `status`.
+async fn handle_register(
+    store: &KvStateStore,
+    verified: &incoming::Verified,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<Response> {
+    let Some(plan) = verified.intent.trade_plan.as_ref() else {
+        return Response::error("register requires a `trade_plan`", 400);
+    };
+    // The plan and its carrier intent must agree on which trade they describe,
+    // otherwise the engine couldn't key the plan's state to the intent's id.
+    if let Some(intent_trade_id) = verified.intent.trade_id.as_deref()
+        && intent_trade_id != plan.trade_id
+    {
+        return Response::error(
+            "register: intent trade_id does not match plan trade_id",
+            400,
+        );
+    }
+    // Persist the plan for the cron engine to evaluate. TTL mirrors the
+    // replay window: the plan must outlive its alert window plus grace and die
+    // with it (an expired-window plan stops being enumerated by the engine).
+    let account = verified.intent.account.as_deref();
+    let ttl = incoming::replay_ttl_seconds(verified.intent.not_after, now);
+    if let Err(err) = store.put_trade_plan(account, plan, ttl).await {
+        rlog_err!(
+            "register: put_trade_plan failed (trade_id={}): {err}",
+            plan.trade_id
+        );
+        return Response::error("state error", 500);
+    }
+    rlog!(
+        "register: trade_id={} instrument={} rules={} persisted (ttl={ttl}s)",
+        plan.trade_id,
+        plan.instrument,
+        plan.rules.len()
+    );
+    let outcome = format!(
+        "registered: {} ({} rules, persisted)",
+        plan.trade_id,
+        plan.rules.len()
+    );
+    record_seen(store, verified, now, &outcome).await;
+    Response::ok("ok")
+}
+
+/// A compact, operator-facing view of one registered plan + its current engine
+/// state. Used by [`handle_plan_list`] — small enough to list many plans
+/// without burying the reader in each rule's embedded intent (use `plan show`
+/// for the full dump). Serialised to YAML for the `trade-control plan list`
+/// response.
+#[derive(Serialize)]
+struct PlanSummary {
+    trade_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    account: Option<String>,
+    instrument: String,
+    granularity: trade_control_core::broker::Granularity,
+    /// Observe-only? The thing an operator most wants to confirm during the
+    /// engine's parallel-run period.
+    shadow: bool,
+    rules: usize,
+    /// `PlanState`-derived fields. `None`/empty until the plan's first cron
+    /// tick has seeded its state (a registered-but-not-yet-ticked plan has no
+    /// state row).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    phase: Option<trade_control_core::plan_state::Phase>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    watermark: Option<chrono::DateTime<chrono::Utc>>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    fired: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    retest_seen_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// Set only for an archived (terminated) plan — the time the engine archived
+    /// it on its terminal cron tick. Absent on a live plan, which doubles as the
+    /// CLI's "is this row terminated?" marker (`ARCHIVED` column). Surfaced only
+    /// by `plan list --include-all`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    archived_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// The full `plan show` payload: the whole registered plan plus its engine
+/// state, both serialised verbatim so the operator can inspect every rule and
+/// the exact persisted state.
+#[derive(Serialize)]
+struct PlanDetail {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    account: Option<String>,
+    plan: trade_control_core::trade_plan::TradePlan,
+    /// `None` until the first cron tick seeds the plan's state row.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    state: Option<trade_control_core::plan_state::PlanState>,
+    /// `Some` when this match came from the archive (a terminated plan), `None`
+    /// for a live registered plan. Mirrors [`PlanSummary::archived_at`] so the
+    /// operator can tell at a glance whether `plan show` surfaced a live or a
+    /// finished plan.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    archived_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// Handle the `plan-list` action: enumerate every registered plan across all
+/// account scopes, pair each with its current `PlanState`, and return a compact
+/// YAML summary. Read-only, KV-only, idempotent (marks seen on completion like
+/// every other control action).
+async fn handle_plan_list(
+    store: &KvStateStore,
+    verified: &incoming::Verified,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<Response> {
+    let plans = match store.list_all_trade_plans().await {
+        Ok(v) => v,
+        Err(err) => {
+            rlog_err!("plan-list: list_all_trade_plans: {err}");
+            return Response::error("state error", 500);
+        }
+    };
+
+    let mut summaries = Vec::with_capacity(plans.len());
+    for stored in &plans {
+        let state = store
+            .get_plan_state(stored.account.as_deref(), &stored.plan.trade_id)
+            .await
+            .unwrap_or(None);
+        summaries.push(plan_summary(stored, state));
+    }
+
+    // `--include-all`: also fold in the archived (terminated) plans so a vetoed
+    // or completed setup can be analyzed after the engine dropped its live rows.
+    if verified.intent.include_archived {
+        match store.list_all_archived_plans().await {
+            Ok(archived) => summaries.extend(archived.iter().map(archived_plan_summary)),
+            Err(err) => {
+                rlog_err!("plan-list: list_all_archived_plans: {err}");
+                return Response::error("state error", 500);
+            }
+        }
+    }
+
+    // Stable ordering so a re-list is byte-comparable: account, then trade_id.
+    // (A live and an archived plan never share a trade_id — the live row is
+    // deleted in the same terminal tick that writes the archive.)
+    summaries.sort_by(|a, b| {
+        a.account
+            .cmp(&b.account)
+            .then_with(|| a.trade_id.cmp(&b.trade_id))
+    });
+
+    let body = match serde_yaml::to_string(&summaries) {
+        Ok(s) => s,
+        Err(err) => {
+            rlog_err!("plan-list serialise: {err}");
+            return Response::error("internal error", 500);
+        }
+    };
+    record_seen(
+        store,
+        verified,
+        now,
+        &format!("plan-list: {} plans", summaries.len()),
+    )
+    .await;
+    Response::ok(body)
+}
+
+/// Build the compact summary for one stored plan + its (optional) state.
+fn plan_summary(
+    stored: &trade_control_core::state::StoredPlan,
+    state: Option<trade_control_core::plan_state::PlanState>,
+) -> PlanSummary {
+    let plan = &stored.plan;
+    PlanSummary {
+        trade_id: plan.trade_id.clone(),
+        account: stored.account.clone(),
+        instrument: plan.instrument.clone(),
+        granularity: plan.granularity,
+        shadow: plan.shadow,
+        rules: plan.rules.len(),
+        phase: state.as_ref().map(|s| s.phase),
+        watermark: state.as_ref().and_then(|s| s.watermark),
+        fired: state
+            .as_ref()
+            .map(|s| s.fired.iter().cloned().collect())
+            .unwrap_or_default(),
+        retest_seen_at: state.as_ref().and_then(|s| s.retest_seen_at),
+        archived_at: None, // live plan — see `archived_plan_summary`
+    }
+}
+
+/// Build the compact summary for one archived (terminated) plan. The terminal
+/// `final_state` is always present (unlike a live plan, which may not have
+/// ticked yet), so `phase`/`fired` are taken from it directly. `archived_at`
+/// being `Some` is what flags the row as terminated to the CLI.
+fn archived_plan_summary(archived: &trade_control_core::state::ArchivedPlan) -> PlanSummary {
+    let plan = &archived.plan;
+    let state = &archived.final_state;
+    PlanSummary {
+        trade_id: plan.trade_id.clone(),
+        account: archived.account.clone(),
+        instrument: plan.instrument.clone(),
+        granularity: plan.granularity,
+        shadow: plan.shadow,
+        rules: plan.rules.len(),
+        phase: Some(state.phase),
+        watermark: state.watermark,
+        fired: state.fired.iter().cloned().collect(),
+        retest_seen_at: state.retest_seen_at,
+        archived_at: Some(archived.archived_at),
+    }
+}
+
+/// Gather the full `plan show` detail(s) for one `trade_id` from **both** the
+/// live plan rows and the archive. trade_ids are unique in practice, but if two
+/// scopes share one we return every match so nothing is hidden. A terminated
+/// plan usually exists *only* in the archive (its live rows were dropped on the
+/// terminal tick), so scanning the archive is what makes a finished plan
+/// (the kind `plan list --include-archived` surfaces) inspectable at all.
+///
+/// Pure and [`StateStore`]-generic so it's unit-testable off-wasm with a
+/// `MemStateStore`; `worker::Response` construction stays in the caller.
+async fn collect_plan_details<S: StateStore>(
+    store: &S,
+    target: &str,
+) -> Result<Vec<PlanDetail>, StateError> {
+    let mut details = Vec::new();
+
+    // Live registered plans: pair each match with its current engine state
+    // (which may be `None` if the plan hasn't ticked yet).
+    for stored in store.list_all_trade_plans().await? {
+        if stored.plan.trade_id != target {
+            continue;
+        }
+        let state = store
+            .get_plan_state(stored.account.as_deref(), &stored.plan.trade_id)
+            .await
+            .unwrap_or(None);
+        details.push(PlanDetail {
+            account: stored.account,
+            plan: stored.plan,
+            state,
+            archived_at: None,
+        });
+    }
+
+    // Archived (terminated) plans: the terminal `final_state` is always present,
+    // and `archived_at` flags the match as a finished plan to the operator.
+    for archived in store.list_all_archived_plans().await? {
+        if archived.plan.trade_id != target {
+            continue;
+        }
+        details.push(PlanDetail {
+            account: archived.account,
+            plan: archived.plan,
+            state: Some(archived.final_state),
+            archived_at: Some(archived.archived_at),
+        });
+    }
+
+    Ok(details)
+}
+
+/// Handle the `plan-show` action: dump one plan in full. The target is named by
+/// `intent.trade_id`; we scan every account scope — **live and archived** — and
+/// return the match(es) so a finished plan surfaced by `plan list
+/// --include-archived` is still inspectable. Returns 404 when no plan matches.
+async fn handle_plan_show(
+    store: &KvStateStore,
+    verified: &incoming::Verified,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<Response> {
+    let Some(target) = verified.intent.trade_id.as_deref() else {
+        return Response::error("plan-show requires a `trade_id`", 400);
+    };
+
+    let details = match collect_plan_details(store, target).await {
+        Ok(v) => v,
+        Err(err) => {
+            rlog_err!("plan-show: collect_plan_details: {err}");
+            return Response::error("state error", 500);
+        }
+    };
+
+    if details.is_empty() {
+        record_seen(
+            store,
+            verified,
+            now,
+            &format!("plan-show: {target} not found"),
+        )
+        .await;
+        return Response::error(format!("no registered plan with trade_id {target}"), 404);
+    }
+
+    let body = match serde_yaml::to_string(&details) {
+        Ok(s) => s,
+        Err(err) => {
+            rlog_err!("plan-show serialise: {err}");
+            return Response::error("internal error", 500);
+        }
+    };
+    record_seen(store, verified, now, &format!("plan-show: {target}")).await;
+    Response::ok(body)
+}
+
+/// Handle the `plan-delete` action: drop a registered plan and its engine
+/// state — the inverse of `register`. The target is named by
+/// `intent.trade_id`; we scan every account scope (as `plan-show` does) and
+/// delete each matching `plan:` + `plan-state:` row, so the operator can
+/// re-arm a setup after editing its chart. We **also** clear any matching
+/// archived (terminated) plan, so a vetoed/completed plan surfaced by
+/// `plan list --include-all` can be dropped after analysis — and so an id that
+/// only exists in the archive (the common case: the live rows were already
+/// deleted on the terminal tick) is still deletable. Idempotent and KV-only: a
+/// delete of a non-existent plan returns `ok` (count 0), never an error —
+/// re-running `plan delete` is always safe.
+async fn handle_plan_delete(
+    store: &KvStateStore,
+    verified: &incoming::Verified,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<Response> {
+    let Some(target) = verified.intent.trade_id.as_deref() else {
+        return Response::error("plan-delete requires a `trade_id`", 400);
+    };
+
+    let plans = match store.list_all_trade_plans().await {
+        Ok(v) => v,
+        Err(err) => {
+            rlog_err!("plan-delete: list_all_trade_plans: {err}");
+            return Response::error("state error", 500);
+        }
+    };
+
+    // Drop every scope that holds this trade_id. trade_ids are unique in
+    // practice, but if two scopes share one we clear both — nothing is left
+    // dangling. Each plan carries its own state row, so clear both per match.
+    let mut deleted = 0usize;
+    for stored in &plans {
+        if stored.plan.trade_id != target {
+            continue;
+        }
+        let account = stored.account.as_deref();
+        if let Err(err) = store.clear_trade_plan(account, target).await {
+            rlog_err!("plan-delete: clear_trade_plan({target}): {err}");
+            return Response::error("state error", 500);
+        }
+        if let Err(err) = store.clear_plan_state(account, target).await {
+            rlog_err!("plan-delete: clear_plan_state({target}): {err}");
+            return Response::error("state error", 500);
+        }
+        deleted += 1;
+        rlog!(
+            "plan-delete: trade_id={target} account={} deleted",
+            account.unwrap_or("<global>")
+        );
+    }
+
+    // Also clear any archived copy. A terminated plan usually exists ONLY here
+    // (its live rows were deleted on the terminal tick), so this is the path
+    // that actually removes it; it counts toward `deleted` so the operator sees
+    // a non-zero count.
+    let archived = match store.list_all_archived_plans().await {
+        Ok(v) => v,
+        Err(err) => {
+            rlog_err!("plan-delete: list_all_archived_plans: {err}");
+            return Response::error("state error", 500);
+        }
+    };
+    for stored in &archived {
+        if stored.plan.trade_id != target {
+            continue;
+        }
+        let account = stored.account.as_deref();
+        if let Err(err) = store.clear_archived_plan(account, target).await {
+            rlog_err!("plan-delete: clear_archived_plan({target}): {err}");
+            return Response::error("state error", 500);
+        }
+        deleted += 1;
+        rlog!(
+            "plan-delete: trade_id={target} account={} archived-cleared",
+            account.unwrap_or("<global>")
+        );
+    }
+
+    let outcome = if deleted == 0 {
+        format!("plan-deleted: {target} (noop)")
+    } else {
+        format!("plan-deleted: {target} ({deleted})")
+    };
+    record_seen(store, verified, now, &outcome).await;
+    Response::ok(outcome)
 }
 
 /// Resolve an [`OandaBroker`] for the request.
@@ -3191,6 +3877,21 @@ mod dispatcher_outcome_tests {
         ) -> Result<Option<trade_control_core::state::SpreadBlackoutWindow>, StateError> {
             Ok(None)
         }
+        async fn set_blackout_windows(
+            &self,
+            _instrument: &str,
+            _windows: &[trade_control_core::intent::NoEntryWindow],
+            _now: DateTime<Utc>,
+            _ttl_seconds: u64,
+        ) -> Result<(), StateError> {
+            Ok(())
+        }
+        async fn get_blackout_windows(
+            &self,
+            _instrument: &str,
+        ) -> Result<Vec<trade_control_core::intent::NoEntryWindow>, StateError> {
+            Ok(Vec::new())
+        }
         async fn upsert_spread_blackout_record(
             &self,
             _record: &trade_control_core::state::SpreadBlackoutRecord,
@@ -3235,6 +3936,79 @@ mod dispatcher_outcome_tests {
         ) -> Result<(), StateError> {
             Ok(())
         }
+
+        // Engine plan/state methods — unused by these tests; minimal stubs.
+        async fn put_trade_plan(
+            &self,
+            _account: Option<&str>,
+            _plan: &trade_control_core::trade_plan::TradePlan,
+            _ttl_seconds: u64,
+        ) -> Result<(), StateError> {
+            Ok(())
+        }
+        async fn get_trade_plan(
+            &self,
+            _account: Option<&str>,
+            _trade_id: &str,
+        ) -> Result<Option<trade_control_core::trade_plan::TradePlan>, StateError> {
+            Ok(None)
+        }
+        async fn list_all_trade_plans(
+            &self,
+        ) -> Result<Vec<trade_control_core::state::StoredPlan>, StateError> {
+            Ok(Vec::new())
+        }
+        async fn clear_trade_plan(
+            &self,
+            _account: Option<&str>,
+            _trade_id: &str,
+        ) -> Result<(), StateError> {
+            Ok(())
+        }
+        async fn get_plan_state(
+            &self,
+            _account: Option<&str>,
+            _trade_id: &str,
+        ) -> Result<Option<trade_control_core::plan_state::PlanState>, StateError> {
+            Ok(None)
+        }
+        async fn put_plan_state(
+            &self,
+            _account: Option<&str>,
+            _trade_id: &str,
+            _state: &trade_control_core::plan_state::PlanState,
+            _ttl_seconds: u64,
+        ) -> Result<(), StateError> {
+            Ok(())
+        }
+        async fn clear_plan_state(
+            &self,
+            _account: Option<&str>,
+            _trade_id: &str,
+        ) -> Result<(), StateError> {
+            Ok(())
+        }
+        async fn archive_plan(
+            &self,
+            _account: Option<&str>,
+            _plan: &trade_control_core::trade_plan::TradePlan,
+            _final_state: &trade_control_core::plan_state::PlanState,
+            _archived_at: DateTime<Utc>,
+        ) -> Result<(), StateError> {
+            Ok(())
+        }
+        async fn list_all_archived_plans(
+            &self,
+        ) -> Result<Vec<trade_control_core::state::ArchivedPlan>, StateError> {
+            Ok(vec![])
+        }
+        async fn clear_archived_plan(
+            &self,
+            _account: Option<&str>,
+            _trade_id: &str,
+        ) -> Result<(), StateError> {
+            Ok(())
+        }
     }
 
     fn now() -> DateTime<Utc> {
@@ -3270,6 +4044,7 @@ mod dispatcher_outcome_tests {
                 next_candle_timestamp_5: None,
             },
             intent: Intent {
+                entry_level_vetos: Vec::new(),
                 v: 1,
                 id: id.into(),
                 not_before: None,
@@ -3312,6 +4087,9 @@ mod dispatcher_outcome_tests {
                 reason: None,
                 mw: None,
                 pip_size: None,
+                trade_plan: None,
+                blackout_close: trade_control_core::intent::BlackoutCloseAction::default(),
+                include_archived: false,
             },
         }
     }
@@ -3445,6 +4223,7 @@ mod dispatcher_outcome_tests {
             "rejected: price-fetch-failed",
             "rejected: expiry-bars-out-of-range",
             "rejected: expiry-bars-script-parse",
+            "rejected: market-blackout",
         ];
         // Use Failed as the carrier — the decision rule treats
         // Failed and Rejected identically (both Skip), and Failed is
@@ -3558,5 +4337,89 @@ mod dispatcher_outcome_tests {
                 "{action:?} must not be treated as a multi-shot enter",
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod plan_show_tests {
+    //! Pins [`collect_plan_details`]: `plan show` must find a plan whether it
+    //! is a live registered plan **or** an archived (terminated) one. The bug
+    //! that motivated this: a finished plan surfaced by `plan list
+    //! --include-archived` 404'd on `plan show`, because the handler only
+    //! scanned live plans.
+    use super::*;
+    use chrono::{TimeZone, Utc};
+    use trade_control_core::plan_state::{Phase, PlanState};
+    use trade_control_core::state::{MemStateStore, StateStore};
+    use trade_control_core::trade_plan::TradePlan;
+
+    /// Minimal valid plan — empty rule set is fine, `collect_plan_details`
+    /// matches on `trade_id` only.
+    fn sample_plan(trade_id: &str) -> TradePlan {
+        let json = format!(
+            r#"{{"trade_id":"{trade_id}","instrument":"NZD_CHF","direction":"short",
+                "granularity":"d1","pip_size":0.0001,"rules":[]}}"#
+        );
+        serde_json::from_str(&json).expect("sample plan json")
+    }
+
+    /// The regression: a plan that exists ONLY in the archive (its live rows
+    /// were dropped on the terminal tick) is still found by `plan show`.
+    #[test]
+    fn archived_only_plan_is_found() {
+        let store = MemStateStore::new();
+        let archived_at = Utc.with_ymd_and_hms(2026, 6, 18, 22, 45, 21).unwrap();
+        let final_state = PlanState::seed(Phase::Done, archived_at);
+        pollster::block_on(store.archive_plan(
+            None,
+            &sample_plan("hs-nzd-chf-d12eb831"),
+            &final_state,
+            archived_at,
+        ))
+        .expect("archive");
+
+        let details = pollster::block_on(collect_plan_details(&store, "hs-nzd-chf-d12eb831"))
+            .expect("collect");
+        assert_eq!(details.len(), 1, "the archived plan must surface");
+        let d = &details[0];
+        assert_eq!(d.plan.trade_id, "hs-nzd-chf-d12eb831");
+        assert_eq!(
+            d.archived_at,
+            Some(archived_at),
+            "archived match must carry archived_at so the operator can tell"
+        );
+        assert!(
+            d.state.is_some(),
+            "archived plan carries its terminal state"
+        );
+    }
+
+    /// No regression: a live registered plan is still found, and is NOT flagged
+    /// as archived.
+    #[test]
+    fn live_plan_is_found_and_not_flagged_archived() {
+        let store = MemStateStore::new();
+        pollster::block_on(store.put_trade_plan(None, &sample_plan("hs-live-1"), 3600))
+            .expect("put");
+
+        let details =
+            pollster::block_on(collect_plan_details(&store, "hs-live-1")).expect("collect");
+        assert_eq!(details.len(), 1);
+        assert_eq!(details[0].plan.trade_id, "hs-live-1");
+        assert_eq!(
+            details[0].archived_at, None,
+            "a live plan must not be flagged archived"
+        );
+    }
+
+    /// An unknown id matches nothing in either store — the caller turns this
+    /// empty vec into a 404.
+    #[test]
+    fn unknown_id_yields_no_details() {
+        let store = MemStateStore::new();
+        pollster::block_on(store.put_trade_plan(None, &sample_plan("hs-live-1"), 3600))
+            .expect("put");
+        let details = pollster::block_on(collect_plan_details(&store, "nope")).expect("collect");
+        assert!(details.is_empty());
     }
 }

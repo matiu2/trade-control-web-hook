@@ -57,6 +57,32 @@ Trading:
   expected range) and you want to be sure no entry fires while you sleep.
 - `status` — read-only snapshot of active cooldowns, recent seen ids, preps, and
   vetos. Curl-friendly debugging.
+- `market-info` — read-only query: return TradeNation's per-instrument market
+  details for the intent's `instrument` (trading session hours in Brisbane +
+  London, spread, margin, guaranteed-stop terms, expiry). Unlike the other
+  control actions this needs a live TradeNation broker (its `market_info` call
+  isn't on the generic `Broker` trait), so it dispatches through the broker path;
+  it still records `seen` and is fully idempotent. **TradeNation only** — a
+  non-TN intent is rejected `400`. These hours feed the upcoming market-hours
+  entry blackout.
+- `plan-list` — read-only: list the registered server-side `TradePlan`s, each
+  with a compact summary of its current `PlanState` (phase, watermark, fired
+  rules, shadow flag). Lists live plans by default; the intent's
+  `include_archived` flag (CLI `--include-all`) also lists terminated
+  (vetoed/completed) plans retained in the archive keyspace. Drives
+  `trade-control plan list`. KV-only, idempotent.
+- `plan-show` — read-only: dump one plan in full (every rule + its persisted
+  `PlanState`). Target named by the intent's `trade_id`; the worker scans all
+  account scopes — **live and archived** — so a terminated plan surfaced by
+  `plan list --include-all` is still inspectable (an archived match carries an
+  `archived_at` field). Drives `trade-control plan show <trade_id>`. KV-only.
+- `plan-delete` — drop a registered plan and its `PlanState` — the inverse of
+  `register`. Target named by the intent's `trade_id`; the worker scans all
+  account scopes and deletes the matching `plan:` + `plan-state:` rows **and**
+  any matching `archived-plan:` row (so a terminated plan can be cleared after
+  analysis). Drives `trade-control plan delete <trade_id>`. KV-only, idempotent
+  (deleting a missing plan is a no-op). Use to re-arm a setup after editing its
+  chart, or to clear an archived plan once analyzed.
 - `unlock` — clear the cooldown for one instrument. Recovery for an
   `invalidate` you didn't mean to send.
 
@@ -137,6 +163,54 @@ emit a **different, smaller** bundle — no prep chain, single-shot:
 There is **no `06-close-on-reversal`** for M/W — the take-profit is a
 hard 1R, so there's no opposing-reversal close to arm.
 
+### Position-tool direct entry (`--market-entry` / `--stop-entry` / `--limit-entry`)
+
+For a manual trade you've already framed with a TradingView **position
+tool** (the long/short risk-reward rectangle), `tv-arm` can skip the
+whole pattern machinery and place the trade straight from the drawing.
+
+- Draw a `long_position` / `short_position` tool on the chart: drag the
+  entry, stop, and target to where you want them. (Optionally draw a
+  `trade-expiry` vertical line; otherwise `--expiry-hours` applies,
+  default 48h.)
+- Run `tv-arm-dev --market-entry` (or `--stop-entry` / `--limit-entry`).
+  Exactly one of the three may be set.
+
+`tv-arm` reads the tool's entry anchor (`points[0].price`) and its
+`stopLevel` / `profitLevel` — which TradingView stores as **tick
+distances**, not absolute prices — and converts them to absolute SL/TP
+via the catalog **`tick_size`** (from `instrument-lookup`, *not*
+`pip_size`; for FX the tick is 10× finer than a pip). Direction comes
+from the tool kind (short ⇒ stop above entry, target below).
+
+Unlike the pattern bundles, this path does **not** post a TradingView
+alert. It builds one signed `enter` intent (direction + `EntrySpec`,
+absolute `stop_loss` / `take_profit` as `PriceRef::Absolute`, the drawn
+entry as the signed shell reference price, the trade-expiry as
+`not_after`) and **POSTs it directly to the worker**, which places the
+order on receipt. No preps, no pattern vetos — it's a naked manual entry,
+still subject to the worker's replay / cooldown / market-hours /
+spread-blackout gates. `--risk-amount`, `--broker-dry-run`, and
+`--pip-size` apply as usual.
+
+**Order types:**
+
+- `--market-entry` — market order, filled by the worker on receipt at
+  broker price.
+- `--stop-entry` — pending **stop** order resting at the drawn entry
+  price (breakout: it triggers when price trades *through* the level).
+- `--limit-entry` — pending **limit** order resting at the drawn entry
+  price (pullback: it fills when price comes *back* to the level).
+
+The resting price is baked onto the wire as an absolute trigger
+(`EntrySpec::{Stop,Limit}::at`) — the operator drew the exact level, so
+the worker uses it verbatim rather than re-deriving it from a shell
+anchor. The usual "wrong-side" geometry guard (which would reject a long
+stop at/below the reference price) is **skipped** for an `at` trigger,
+because the signed shell carries that same drawn level as its reference;
+the broker, not the worker, arbitrates whether a resting order is
+wrong-side and rejects it if so.
+
 ## General workflow
 
 The day-to-day loop, end to end:
@@ -172,8 +246,40 @@ The day-to-day loop, end to end:
 5. **The scheduled `cron` triggers** (declared in `wrangler.toml`,
    dispatched on `event.cron()` in `src/cron.rs`):
    - `*/15 * * * *` — sweeps pending stop-entry orders for SL-breach /
-     bar-expiry independently of any TV alert, **and** runs the
-     spread-recovery watcher (see below).
+     bar-expiry independently of any TV alert, runs the
+     spread-recovery watcher (see below), **and** runs the
+     server-side trade-plan engine (`run_engine_tick`, see below).
+   - **Server-side engine** (experimental, dev only) — on each `*/15`
+     tick the engine enumerates every registered `TradePlan` (see
+     `--register-plan`), fetches the broker candles closed since each
+     plan's watermark, runs the per-trade FSM evaluator, and dispatches
+     any fired intents through the *same* `run_enter` / `run_close` /
+     veto handlers the webhook uses — unless the plan is registered with
+     `--shadow`, in which case it evaluates and advances state but only
+     *logs* its would-be fires (the safe way to run beside the live TV
+     alerts; a live plan would double-fire — see `--register-plan`). It
+     runs **in parallel** with the TV alerts until proven on demo; the
+     `*/15` cadence stays for now. A plan's first tick *seeds*
+     its watermark without firing, so conditions already true at register
+     don't back-fire. Both strategy families are now evaluated
+     server-side: **M/W** fires the enter heartbeat every closed bar
+     (`run_enter` owns the live neckline geometry), and **H&S** fires its
+     `PinePattern` enter from the Rust port of the `candle-signals-v2.pine`
+     detector (pinbar / tweezer / double-tweezer / regular- &
+     floating-engulfer, plus the pending→valid→invalid confirmation state
+     machine). A fired H&S enter carries the latched signal geometry
+     (`signal_high` / `signal_low` / `golden` / `signal_confirmed` /
+     `recent_*` / `atr`) onto its shell, so it resolves entry/SL/TP against
+     the *pattern* extremes exactly as the TV alert's `{{plot(...)}}`
+     substitutions did. The port confirms only on **fully-closed** pushing
+     bars (the engine never sees an unclosed bar), which fixes the Pine
+     one-bar-early confirm timing (bug #10B). Confirmation also resolves
+     **only at the end of the `confirm_bars` window** (v2.6): a push through
+     the signal's extreme anywhere inside the window is latched, and the
+     signal validates when the window closes iff such a push occurred — it no
+     longer fires the instant a bar breaks through. Both `candle-signals-v2.pine`
+     and the Rust port carry this fix in lock-step. Validation against
+     recorded Pine fires by historical replay is a tracked follow-up.
    - `5 21 * * *` **and** `5 22 * * *` — the daily **NY-close-edge**
      check for the spread-blackout feature. CF crons are UTC-only and
      can't carry a timezone, so both candidate minutes fire (21:05 UTC
@@ -225,9 +331,22 @@ known at sign time. The schema fingerprint catches added / dropped /
 renamed top-level fields even though their values aren't signed. See
 `core::sig` for the exact canonical form.
 
-SL/TP rules reference the plaintext shell prices by anchor
-(`close`/`high`/`low`) with a pip offset, so the CLI never needs to
-know the live price — TradingView fills it in at fire time.
+SL/TP rules reference the plaintext shell prices by anchor with a pip
+offset, so the CLI never needs to know the live price — TradingView
+fills it in at fire time. Valid anchors:
+
+- `close` / `high` / `low` — the triggering candle's own values.
+- `recent_high` / `recent_low` — the indicator's `sl_lookback` window
+  (bars *strictly before* the signal bar). An SL anchor that doesn't
+  depend on the signal candle's own wick.
+- `signal_high` / `signal_low` — the *latched pattern extreme* (e.g. an
+  H&S head / right-shoulder). Unlike `high`/`low`, these are stable
+  across a confirmation re-fire, so an H&S/IHS enter resolves to the
+  same entry/SL geometry on the break-candle fire and the confirmed
+  re-fire. This is the default SL/entry anchor for the H&S/IHS builders.
+
+`recent_*` and `signal_*` fall back to the candle's own `high`/`low`
+when an older Pine indicator didn't ship the field.
 
 Why no encryption? The intent isn't secret — only its authenticity
 matters. Cleartext lets the operator inspect what TradingView actually
@@ -262,6 +381,14 @@ expiry_bars: 3                         # optional, 1..=5. Cancel a resting
                                        # within N bars. See "Bar-based order
                                        # expiry" below. Omit to rest until
                                        # not_after.
+blackout_close: cancel_resting         # optional. What the market-hours
+                                       # blackout sweep does with a still-
+                                       # resting order caught in the daily
+                                       # close→open gap. cancel_resting
+                                       # (default) cancels the unfilled order
+                                       # only; cancel_and_close also flattens
+                                       # an open position. See "Market-hours
+                                       # entry blackout" below.
 cooldown_hours: 12                     # only used by "invalidate"
 ```
 
@@ -321,9 +448,21 @@ entry:
   market fill reference (a worse fill changes the stop distance and
   therefore the 1%-equity position size). It does **not** consume a
   multi-shot `max_retries` slot — it's the same intended entry.
-- `action: limit` — **not yet implemented**; currently treated the same
-  as `skip` (the entry stays retryable). Reserved for a follow-up that
-  re-places the level as a pullback limit with geometry validation.
+- `action: limit` — re-place the level as a **limit order** resting at
+  the original stop trigger, waiting for price to pull back to the
+  intended entry. This preserves the planned R exactly (a limit can't
+  fill worse than its price) at the cost of possibly never filling. No
+  `max_slippage_pips` is needed or used. A geometry guard applies: the
+  limit must rest on the correct side of the market (long: trigger
+  at/below current price; short: at/above) — in a genuine `#19-10` the
+  price has overrun the trigger so this holds, but a degenerate case
+  that would create a `#19-9` ("limit on the wrong side") is skipped and
+  logged (`too-close-limit-wrong-side`). Like `market`, it's a **single**
+  synchronous attempt and does not consume a multi-shot `max_retries`
+  slot. The resting limit is recorded as a normal pending order, so the
+  alert-window / `expiry_bars` cron sweep cancels it if it never fills —
+  it inherits the same lifetime as any other resting order (no
+  broker-native good-til-date is required).
 
 The distinct rejection is observable in the logs as
 `entry-failed: too-close-to-market` (vs the generic
@@ -353,6 +492,30 @@ would otherwise fill straight into the take-profit. This is the same
 gate that protects the absolute-price flow when the trigger candle
 moves past one of your fixed levels.
 
+**SL-vs-spread floor (hard limit):** an entry's stop-loss distance must
+be at least **10× the live bid-ask spread**, so a stop is a genuine
+market level and not dominated by the cost of crossing the book. Enforced
+in two places against the same fixed constant
+(`trade_control_core::intent::SL_MIN_SPREAD_MULTIPLE`):
+
+- **At fire time (worker)** — every `enter` samples the live spread
+  (`get_quote`) and rejects with **HTTP 422 / `rejected:
+  sl-below-10x-spread`** if `sl_distance < 10 × spread`. The response body
+  names the offending distances in pips, e.g. `entry blocked: SL <= 10x
+  spread: SL distance 8.0 pips; spread = 1.0 pips` (pips are
+  `distance / pip_size` using the intent's baked `pip_size`). Like the other
+  entry gates this is a non-poisoning reject (the id can refire once the
+  spread tightens), and it **fails open** on a quote-fetch error so a
+  transient broker hiccup never strands a real entry.
+- **At build/arm time (M/W only)** — `trade-control build-trade` and
+  `tv-arm` reject a too-tight M/W setup before it's ever signed, using the
+  arm-time spread baked into the path geometry. H&S has no build-time SL
+  (it anchors to the fire-time signal extreme), so H&S relies on the
+  worker gate alone.
+
+The multiple is a server-side constant — it cannot be weakened
+per-intent, the same discipline as the `min_r` ≥ 1.0 reward:risk floor.
+
 `id` is the **replay-protection key** — the worker remembers each id it
 **successfully fulfilled** until just past `not_after`. Gate rejections
 (missing prep, active veto, `allow_entry` script returning false,
@@ -363,6 +526,20 @@ clear-*, unlock) all consume the id, so byte-identical replays of those
 return 409 instead of executing twice. Use a unique id per intended
 trade.
 
+**Firing outside the time window is a benign decline, not an error.** A
+well-formed, correctly-signed intent that arrives after its `not_after`
+(expired) or before its `not_before` (too early) is the *expected*
+end-of-life outcome for any scheduled alert that keeps firing past its
+intent's lifetime. The worker reports it as **HTTP 200** with
+`outcome: declined: intent-expired` (or `declined: intent-too-early`) —
+distinct from the **400 `rejected`** it returns for a genuinely malformed
+or forged request (bad YAML, bad HMAC sig, unsupported version, malformed
+`trade_id`). A `time` plaintext stamp more than 24h from now stays a 400
+`rejected` (it smells of replay), not a benign decline. The split lets
+timeline/verdict tooling tell a routine stale fire apart from a real
+bad-body defect — the same status-code convention as M/W's
+`declined: mw-not-armed`, here at the parse/verify gate.
+
 ## Conditional entries (preps + vetos)
 
 Some setups want to fire `enter` only after a sequence of prior events.
@@ -370,6 +547,22 @@ The classic example is "break-and-close below the trend line, retest from
 below, then entry candle." Each event is its own TradingView alert; the
 worker stores short-lived named flags per-instrument and the `enter`
 intent declares which flags must be set (and which must not).
+
+### Continuous at-entry level vetos (`too-low` / `too-high`)
+
+Beyond the named-flag vetos above, an H&S/IH&S enter also carries
+**level-bearing** entry vetos baked at arm time — the pcl-exhausted
+(`too-low`) and invalidation (`too-high`) prices. The worker re-checks the
+**resolved entry price** against these on every fire and rejects
+(`rejected: veto-active (<name>)`, HTTP 412, no order placed) when the entry
+is already past the level — **independent of whether any cross-event guard
+fired**. This is a *continuous* predicate ("is the entry already too far into
+the move?"), not a one-shot cross: it catches a price that **gapped past** the
+level or was **already past** it when the plan armed, which the engine's
+one-shot cross guard would miss. It restores the legacy behaviour where a
+persistent KV `too-low`/`too-high` veto blocked a confirmed enter (Bug #12,
+the NZD/CAD −110.53 GBP incident). The named-flag `vetos` list is unchanged
+and still gates any externally/guard-set KV veto.
 
 A `prep` intent records that a named step happened, with a TTL:
 
@@ -703,6 +896,15 @@ export TRADE_CONTROL_ENDPOINT=https://trade-control.<account>.workers.dev
 ./target/release/trade-control unlock EUR_USD \
   --key-file ~/.config/trade-control/key.hex
 
+# TradeNation trading hours + market details for one instrument. Accepts a
+# canonical name (US30, EUR_USD) or the TN MarketName ("Wall Street 30");
+# the CLI resolves it via the catalog (use --force to skip), the worker
+# resolves it against the broker. `hours` is an alias. TradeNation only.
+./target/release/trade-control market-info "Wall Street 30" \
+  --key-file ~/.config/trade-control/key.hex
+./target/release/trade-control hours US30 \
+  --key-file ~/.config/trade-control/key.hex
+
 # Set / clear preps and vetos directly. (TradingView normally fires these,
 # but the CLI is the manual escape hatch — e.g. when a prep went stale and
 # should be dropped before TTL.)
@@ -792,6 +994,31 @@ unlocked: EUR_USD
 was_cooled_down: true
 ```
 
+`market-info` pretty-prints the broker's market details, **Brisbane time
+first** (the operator's zone) with London alongside:
+
+```
+Wall Street 30
+
+trading hours (Brisbane / London):
+  09:00 (+1d) - 07:00 (+1d)   (London 23:00 - 21:00)
+
+spread:            4
+margin:            0.5%
+stop orders:       Yes
+guaranteed stop:   Yes (distance 2%, charge 3)
+min/max stake:     USD,0.1,1000000
+contract:          Rolling (rolling: true)
+expiry:            - (London -)
+```
+
+Trading hours come from the broker in **London local**; the Brisbane
+(UTC+10) equivalents are shown first. A `(+1d)` suffix on a Brisbane time
+means it falls on the next calendar day. When the broker returns
+non-range text (e.g. `24 Hours`), that raw string is printed verbatim
+instead of a parsed range. The worker itself returns the raw `MarketInfo`
+as YAML (machine-friendly); the Brisbane-first layout is the CLI's doing.
+
 All control subcommands use the same replay-protection mechanism as the
 trade actions — re-running the same `unlock` (or `clear-prep`, etc.)
 within its window won't double-fire.
@@ -849,6 +1076,64 @@ trade. If the binding is absent the worker logs one
 `wrangler.toml` (`[[r2_buckets]]`), the bucket created
 (`wrangler r2 bucket create …`), and the deploy API token to hold
 *Workers R2 Storage: Edit*. See the deploy notes for the exact steps.
+
+### Engine tick-bundles (`ticks/` prefix)
+
+The cron engine (`src/cron/engine.rs`) — not an inbound HTTP alert — is where
+every trading decision now happens once a trade runs as a registered
+`TradePlan`. So each engine **tick** records a self-contained, replayable
+**tick-bundle** to the *same* R2 bucket under a **distinct `ticks/` prefix**, so
+the `req/`-reader never trips on it:
+
+**Object layout:** `ticks/<YYYY-MM-DD>/<tick_ts>-<trade_id>.json`. One object per
+**noteworthy** `(tick, plan)` that evaluated; a single trade's whole life globs
+under its `trade_id`.
+
+Each bundle carries the pure replay tuple `evaluate_plan` consumed — the
+`plan`, the prior `PlanState`, the `new_candles` + detector back-window, and the
+tick `now`/`expires_at` — plus the golden `PlanEval` output (`fired` /
+`new_state` / `done`), the per-fire dispatch outcomes, and the plan-state
+`KvTickTransition` (before/after/success/error). Same fire-and-forget
+`wait_until` + fail-soft contract as request recording; same `TRADE_CONTROL_R2`
+binding. Both shadow (observe-only) and live ticks are recorded; a live tick's
+`dispatch_outcomes` carry each fire's broker result, while a shadow tick's is
+empty (it dispatches nothing).
+
+**No-op ticks are trimmed.** A tick that saw a new closed bar but where nothing
+fired, no phase/state advanced, and the plan isn't done (a "no-op" — common
+during an H&S plan's quiet wait for break-and-close) is **not** recorded: its
+fat bundle would re-store the whole plan, both states, and the wide detector
+window for zero new information. The engine instead emits a single heartbeat log
+line (`cron engine: plan <id> tick <now> no-op (…) — not recorded`) so the tick
+is still traceable and a gap in the `ticks/` stream is never mistaken for a
+stalled cron. The decision is the pure `PlanEval::is_noteworthy(&prior)` (a tick
+is noteworthy if it fired, finished, or advanced the FSM's meaningful state —
+ignoring the always-moving `watermark` / `expires_at` / `last_close`). KV state
+is still persisted every tick regardless; only the *recording* is trimmed.
+A **failed** plan-state transition is always recorded (it carries `success:false`
+a replay needs).
+
+**Replaying a bundle.** Replay lives in the **`trade-analyzer`** CLI (in the
+`trading-tax-tracker` repo), *not* in `trade-control` — that's the downstream
+R2-recording consumer, and keeping replay there gives it a single home next to
+the bundle/timeline tooling. It replays one bundle offline, either from a local
+file or fetched straight from R2 by object key:
+
+```sh
+trade-analyzer replay <bundle.json>                       # local file
+trade-analyzer replay --from-r2 ticks/<date>/<...>.json   # fetch from R2
+trade-analyzer replay --simulate <bundle.json>            # + simulate each enter's fill/exit
+```
+
+`replay` re-runs the *same* `evaluate_plan` on the recorded inputs and diffs the
+fresh `fired` / `new_state` / `done` against the recorded `eval` — a recorded
+tick becomes a deterministic regression test (non-zero exit on any mismatch, so
+it gates in CI). `--simulate` additionally resolves each fired enter's
+entry/SL/TP (via the pure resolver) and walks the bundle's candle path through a
+dumb broker-simulator, reporting filled / stopped-out / took-profit /
+never-filled. The pure-evaluation diff validates the *decision* logic; the
+simulator the *price-path* — neither runs the worker's broker-dispatch glue
+(sizing, seen-id, gates), which is a later step.
 
 ## Brokers
 
@@ -910,11 +1195,12 @@ orders* during the window and re-drives them after.
 >    re-runs the real HMAC verify on the stored signed body (no fabricated
 >    auth) — confirm a cancelled order actually re-places (or correctly
 >    drops) on demo.
-> 3. **Thresholds are provisional placeholders**, not calibrated:
->    `SPREAD_BLACKOUT_ELEVATED_PIPS` (8p, System 1 reject),
->    `SPREAD_BLACKOUT_RECOVERED_PIPS` (4p, System 2/3 restore), and the
->    `clamp_widen` floor/ceiling (22p / 40p). Tune against observed
->    EUR/NZD / AUD/NZD trough spreads during the demo week.
+> 3. **Some thresholds are still provisional**: System 1's elevated cutoff
+>    is now per-instrument and baked from sampled spreads (see below), but
+>    `SPREAD_BLACKOUT_RECOVERED_PIPS` (4p, System 2/3 restore) and the
+>    `clamp_widen` floor/ceiling (22p / 40p) are still flat placeholders.
+>    Tune against observed trough spreads during the demo week, and re-bake
+>    the per-instrument table as the sample window lengthens.
 >
 > See the **Demo-validation checklist** in `TODO.md` for the step-by-step.
 
@@ -947,15 +1233,31 @@ instrument and, if it exceeds the elevated cutoff (in pips), rejects:
 - **Window closed = zero cost.** When the marker is absent the worker
   falls through without any broker round-trip (no `get_quote` call).
 
-The elevated cutoff is a **provisional single constant**
-(`SPREAD_BLACKOUT_ELEVATED_PIPS`, 8 pips). It and the recovery cutoff
-(`SPREAD_BLACKOUT_RECOVERED_PIPS`, 4 pips) now live **together** in
-`src/spread_blackout.rs` so the hysteresis pair (`recovered < elevated`,
-so the window doesn't flap) is tuned in one place. The whole feature works
-in **pips** consistently — the cron side converts the broker's absolute
-`ask − bid` to pips via the `pip_size` baked onto each per-trade record at
-apply time. Both cutoffs are provisional — calibrate on demo before
-relying on them.
+The elevated cutoff is now **per-instrument, baked at compile time** from
+real sampled spreads (it was a flat 8-pip constant, which mis-fired badly
+for non-FX: Copper's *normal* spread is ~150 pips, so the flat 8 blocked
+every legitimate Copper entry during the window). `build.rs` reads the
+committed YAML samples from the **`spread-sampler-cron`** submodule and
+emits a per-instrument table (`(name, low, high, median)` in pips, keyed by
+the broker-canonical TradeNation name — the same `resolved.instrument` the
+gate passes). `elevated_threshold_pips(instrument)` returns
+`max(observed_high, median × SPREAD_NORMAL_MULTIPLE)` (3× normal) so it
+blocks clearly above anything seen, yet never blocks a spread within 3× of
+normal even for an instrument that hasn't spiked in the sample window. An
+instrument absent from the baseline (a fresh asset, or one with no pip
+size) falls back to the flat `SPREAD_BLACKOUT_ELEVATED_PIPS` (8 pips). The
+reject message names the instrument's baked normal/seen-range and the
+current spread. The recovery cutoff (`SPREAD_BLACKOUT_RECOVERED_PIPS`,
+4 pips) is still a flat constant and lives beside the elevated logic in
+`src/spread_blackout.rs`. The whole feature works in **pips**
+consistently.
+
+> **Re-bake cadence:** the table is only as good as the committed samples.
+> Re-running `git pull` in the submodule (the hourly cron commits new
+> sweeps) and rebuilding picks up fresh data — `cargo:rerun-if-changed` on
+> the samples dir forces a rebuild when they grow. Early bakes (a few days
+> of data) are conservative on purpose; tighten as the sample window
+> lengthens.
 
 #### System 2 — widen open stops during the window, restore after
 
@@ -1156,6 +1458,89 @@ This wraps `wrangler secret put TN_ACCOUNT_MY_TN_DEMO` and writes the
 metadata entry in KV. After that, intents with `account: my-tn-demo`
 route through that account; the worker handles session lifecycle.
 
+### Market-hours entry blackout
+
+A separate, simpler cousin of the spread-blackout above. It fixes a real
+incident: an entry candle closed right at a US-index rolling-future's daily
+close, the worker placed a **resting stop order** after the candle closed,
+the order sat through the whole closed session, and triggered on the next
+open's gap — getting stopped out on a move that never traded while the
+market was open. The fix has two halves:
+
+1. **A reject gate** — block a *new* entry that fires inside the
+   instrument's daily close→open gap, so no fresh resting order is placed
+   into a market that's about to close.
+2. **A cron sweep** — act on a still-pending resting order that's *already*
+   resting when the gap opens, per the operator's chosen `blackout_close`
+   policy.
+
+The per-instrument no-entry windows are **UTC minute-of-day ranges** derived
+once a day by a 06:00 UTC cron (`src/cron/blackout_hours.rs`) from the
+broker's session hours and stored in KV under `blackout-hours:<instrument>`.
+One window is emitted **per close→open gap** (a market can have several in a
+day, e.g. a maintenance gap plus the overnight gap), buffered `[close −3h …
+open +1h]` and merged where they overlap. Brisbane→UTC is fixed `−600 min`
+arithmetic (Brisbane is UTC+10, no DST); the DST correctness is inherited
+from the broker feed's London→Brisbane conversion, so the worker links no
+timezone tables. This is **distinct** from the spread-blackout's
+reduced-liquidity "spread hour" — that's handled by the feature above; this
+one only covers genuine close→open gaps.
+
+#### Reject gate — block new entries inside the window
+
+When an `enter` resolves, the worker reads the instrument's stored windows
+and compares `now`'s UTC minute-of-day against them. If `now` falls inside
+any window it rejects:
+
+- **Outcome:** `rejected: market-blackout`, **HTTP 423 Locked** (same family
+  as pause / cooldown / spread-blackout — the intent is valid, the condition
+  is transient, a later fire can succeed).
+- **Cheap, KV-only.** It's a single KV read plus a minute comparison — no
+  broker round-trip — so it sits **ahead** of the (broker-touching)
+  spread-blackout gate.
+- **Reject, NOT delay.** Nothing is persisted and no re-fire is queued. The
+  next signal bar re-triggers the alert and re-runs the check — once the
+  market has reopened the same entry passes.
+- **Does NOT consume the intent id.** Like every `Rejected`, this is a `Skip`
+  in the replay-dedup path (no `mark_seen`), so the in-hours refire is
+  allowed through (see "Replay protection scope" in `CLAUDE.md`).
+- **Fail-open.** A KV read error, or an instrument with no derived windows
+  (24-hour markets, unparseable session text, or windows not yet refreshed),
+  yields an empty window set and the gate is a no-op — a transient hiccup
+  must never block a legitimate trade.
+
+Both the webhook and the server-side trade-plan engine dispatch entries
+through `run_enter`, so this one gate covers both paths. The buffer defaults
+(3h before close, 1h after open) live in `Buffers::default()`
+(`core/src/intent/blackout/derive.rs`).
+
+#### Cron sweep — pull a resting order caught in the gap
+
+The reject gate only stops *new* entries. An order placed just before the
+gap opened can still be resting when the close arrives — exactly the
+incident. The `*/15` cron sweep (`src/cron/sweep.rs`) handles it: for each
+tracked `EntryAttempt` it now checks the instrument's stored windows
+**before** the SL-breach branch (across a closed session the last-traded
+price is stale, so the closed market itself must be the trigger, not a
+stale-price SL check). If the order is resting inside a window it acts on
+the row's `blackout_close` policy, snapshotted from the intent at placement:
+
+- **`CancelResting`** (default, the incident fix) — cancel the unfilled
+  resting order only. It **never** closes a position: if the order already
+  filled, the cancel is a broker no-op and the filled position is left
+  untouched (its SL is the only thing that should close it — see the
+  `veto_close_only_when_thesis_invalidated` rule in `CLAUDE.md`).
+- **`CancelAndClose`** — also market-close any open position on the
+  instrument. Opt-in only; the operator chose it at arm time because a
+  partly-formed setup carried through a closed session isn't worth the
+  reopen-gap risk.
+
+The cancel logs with reason `market-blackout` (greppable apart from
+`expired` / `bar-expiry` / `sl-breached`), then the row is deleted so the
+next sweep doesn't re-process it. A KV read error fails open (empty windows
+⇒ not due), matching the reject gate. Pre-field `EntryAttempt` rows decode
+to the safe `CancelResting` default.
+
 ### Local TN store vs server-side account list
 
 Two account namespaces exist:
@@ -1325,12 +1710,17 @@ There are three environments, one per git branch, each an isolated worker
 environment. See `DEPLOYED.md` for the full branch → environment model and
 the staging → prod promotion rule.
 
+**Every environment carries a suffix** (`-dev` / `-staging` / `-prod`). The
+old no-suffix worker `trade-control-web-hook` + its R2 bucket
+`trade-control-recording` are deprecated — kept running only until last
+week's demo trades are journaled, then deleted. Do not deploy to them.
+
 Use the per-environment deploy script — **never** call `wrangler deploy`
 directly for a real deploy, because the scripts also rebuild and install
 the matching CLIs:
 
 ```sh
-git checkout main    && ./deploy-dev.sh       # dev     -> trade-control-web-hook
+git checkout main    && ./deploy-dev.sh       # dev     -> trade-control-web-hook-dev
 git checkout staging && ./deploy-staging.sh   # staging -> trade-control-web-hook-staging
 # ./deploy-live.sh is added at the first prod promotion.
 ```
@@ -1347,13 +1737,12 @@ Each script:
 4. Installs the binaries into `~/.cargo/bin` under **suffixed names** —
    `trade-control-staging`, `tv-arm-staging`, `tv-news-staging` (and the
    `-dev` set). So you pick an environment by which command you run; no env
-   var to set. The webhook the armed TradingView alerts POST to is baked
-   into `tv-arm-<env>` too — there is no longer a hard-coded URL in the JS
-   template.
+   var to set. The worker URL each `tv-arm-<env>` registers its `TradePlan`
+   against is baked in the same way.
 
 `deploy-lib.sh` holds the shared logic; the per-env wrappers hold only the
-branch + URL (one place each), so next week's "`web-hook` becomes prod, cut
-a fresh `web-hook-dev`" remap is a one-line edit per script.
+branch + URL (one place each), so standing up a new environment (e.g. the
+upcoming `-prod`) is a one-script change.
 
 > The legacy top-level `deploy.sh` is deprecated and now just points at the
 > per-env scripts.
@@ -1361,9 +1750,9 @@ a fresh `web-hook-dev`" remap is a one-line edit per script.
 ### Per-environment Pine versions
 
 The Pine source (`pine-scripts/candle-signals-v2.pine`) carries **no
-webhook URL** — the URL is baked into `tv-arm-<env>` and substituted into
-the alert at create time. So one Pine source serves every environment; what
-differs per environment is **which Pine *version*** a chart runs.
+webhook URL**. One Pine source serves every environment; what differs per
+environment is **which Pine *version*** a chart runs, so each `tv-arm-<env>`
+reads the study version that matches its worker's server-side detector.
 
 To pin a Pine version per environment, run **two studies on the chart with
 distinct base titles** — e.g. `Candle Signals v24` and `Candle Signals
@@ -1457,13 +1846,168 @@ cargo run -p tv-arm -- \
   --veto-on-reversal \                # experimental: a reversal off a band before entry also vetoes the upcoming trade (default off)
   --skip-break-and-close \            # for stocks (no after-hours retests)
   --skip-retest \                     # implies --skip-break-and-close; for late entries
-  --require-golden \                  # require Pine golden-candle signal on entry
+  --skip-golden \                     # drop the Pine golden-candle requirement (golden is required by default)
+  --max-retries 5 \                   # multi-shot re-entry cap (default 5; pass 0 for single-shot). >0 keeps the engine plan in AwaitEntry across re-entries (see below)
   --require-confirmation \            # require a confirmed signal candle on entry (independent of golden)
-  --create-alerts                     # POST to TradingView; omit to only write the signed bundle to disk
+  --blackout-close close \            # market-hours blackout: also flatten an open position if caught in the close→open gap (default: cancel = cancel the resting order only)
+  --register-plan \                   # arm the trade: register one signed TradePlan with the server-side engine
+  --shadow                            # register observe-only: engine evaluates + logs, but never places orders (safe dry watch)
 ```
 
 Run `tv-arm --help` for the full flag surface — it has diverged from the
 deprecated Python script.
+
+### Server-side engine registration (`--register-plan`)
+
+Trades are armed **server-side**: the worker evaluates every trigger itself on
+its cron tick — there are no paid TradingView alerts. `--register-plan` folds
+the **whole trade** — every condition (re-expressed as an engine `Trigger`),
+plus the embedded enter/close/veto/prep intents — into one signed `TradePlan`
+and POSTs it directly to the worker (action `register`). The plan rides the
+same whole-body HMAC as every other intent (carried in the intent's
+`trade_plan` field), so it can't be tampered.
+
+> **The legacy TradingView-alert path has been retired.** `tv-arm` used to also
+> POST a signed 5-alert bundle to TradingView via tv-mcp and let TV fire each
+> alert at the webhook (`--create-alerts`). That whole path — the flag, the
+> tv-mcp template, the `alert_spec` / `create_alerts` / `post_outcome` modules —
+> is gone. The signed bundle is still written to disk as a build artifact, but
+> arming is now solely `--register-plan`.
+
+A failed register is a hard error, but the signed bundle is already on disk by
+the time the POST happens, so the trade is never lost. The plan's destination
+is the baked-at-build-time webhook, so `tv-arm-staging --register-plan`
+registers against the staging worker with no extra flag. The chart timeframe
+must map to an engine granularity (`1`/`5`/`15`/`60`/`240`/`D`), else the
+register is rejected.
+
+> **`--plan-out` is the offline sibling.** `tv-arm --plan-out <file>` *without*
+> `--register-plan` builds the plan and writes its JSON to disk but never POSTs
+> to the worker — used to replay / inspect a historical setup. Because such a
+> setup is usually already in the past, the build relaxes its time-sensitive
+> checks (`trade_expiry` already elapsed, an in-window news event) from hard
+> errors to **warnings** in this offline mode, so the JSON still gets written.
+> Any path that actually arms the worker (`--register-plan`, and the
+> `build-trade --from-file` signing path) stays strict and rejects an expired
+> `trade_expiry`. The strictness toggle is `BuildStrictness` in
+> `cli/src/trade_patterns.rs`.
+
+The worker validates the registered plan and **persists** it to KV (key
+`plan:{scope}:{trade_id}`, TTL = the trade window plus grace) for the
+server-side engine to enumerate each cron tick. The engine that *evaluates*
+those plans — a state machine per trade — runs on the `*/15` tick and evaluates
+both M/W (per-bar enter heartbeat) and H&S (the Rust port of the
+`candle-signals-v2.pine` detector) entries plus the trendline / level / time
+triggers and vetos.
+
+> **Shadow mode for watching a new plan.** A live (non-shadow) plan dispatches
+> its fired intents through the *same* `run_enter` / `run_close` handlers the
+> webhook uses — it places **real broker orders**. To watch a new or changed
+> plan's decisions without trading, register with **`--shadow`**: the engine
+> evaluates the plan and advances its `PlanState` identically to a live plan,
+> but logs each would-be fire as a `cron engine SHADOW would-fire:` line instead
+> of touching the broker (no order, no seen-id mark). Scrape those lines from
+> the Cloudflare Real-time Logs to confirm the plan does what you expect. The
+> shadow/live choice is baked into the signed plan at arm time, so it can't be
+> flipped in flight — re-arm to promote a proven setup to live. (Field:
+> `TradePlan.shadow`, `#[serde(default)]` → live for plans registered before the
+> flag existed.)
+
+**Calendar / news bars are folded into the plan too.** A registered plan
+carries not just the trade's own conditions but the **pause/resume** (blackout)
+and **news-start/news-end** (news-window) control bars — both the operator's
+chart-drawn pairs and the auto-fetched forex-factory events. Each becomes a `TimeReached` rule
+carrying the matching `pause` / `resume` / `news-start` / `news-end` intent and
+firing at the window edge; the engine fires them **non-terminally** (they set
+the blackout / news-window KV state without ending the trade's spine) and the
+cron dispatches them through the same handlers the webhook uses. In `--shadow`
+they're logged, not applied, like every other fire. (Before this, a
+`--register-plan` produced a plan with *no* calendar bars — the register POST
+ran before the bundles were built; fixed in Stage E.10 / v37.) The folding lives
+in `append_control_rules` (`tv-arm/src/trade_plan_build.rs`); the non-terminal
+evaluation is `evaluate_controls` (`engine/src/evaluate.rs`).
+
+The plan builder
+is `tv-arm/src/trade_plan_build.rs` (the inverse of `alert_spec.rs`); the
+`TradePlan` / `Trigger` model lives in `core/src/trade_plan.rs`; per-trade
+engine state is `core/src/plan_state.rs`; the FSM evaluator is
+`engine/src/evaluate.rs`; the candle-pattern detector port is
+`core/src/signals.rs`.
+
+#### Re-arming an existing setup (`--update`)
+
+`tv-arm` mints a **fresh random `trade_id` every run**, so the engine treats
+each re-arm as a brand-new plan — and the *old* plan keeps ticking in KV until
+its TTL lapses. When you move annotations on the chart and re-run, pass
+`--update` (only meaningful alongside `--register-plan`) so the prior plan is
+deleted from the engine first:
+
+```sh
+# Auto-resolve by instrument: deletes the one existing plan on this instrument,
+# then registers the fresh one. Hard-errors if more than one plan is registered
+# for the instrument (re-run with the explicit id from `plan list`).
+tv-arm-staging --register-plan --update ...
+
+# Explicit: delete exactly this prior trade_id, then register fresh.
+tv-arm-staging --register-plan --update hs-eurusd-a3f9c1d2 ...
+```
+
+`--update` reconciles the server-side engine plan: it POSTs `plan-list` to find
+the target, then a signed `plan-delete` that clears the plan's `plan:` +
+`plan-state:` KV (see `plan delete` below). A bare `--update` with no plan
+registered for the instrument is a logged no-op. The resolution logic is the
+pure `resolve_update_target` (`tv-arm/src/pipeline.rs`), unit-tested.
+
+#### Inspecting / managing registered plans (`trade-control plan list` / `show` / `delete`)
+
+Three subcommands let you see and manage what the engine is evaluating —
+useful during the parallel-run period to confirm a plan registered, whether
+it's in shadow mode, and how far its FSM has progressed:
+
+```sh
+trade-control-dev plan list                # compact table of every LIVE plan + state
+trade-control-dev plan list --include-all  # also list terminated (vetoed/completed) plans
+trade-control-dev plan list --yaml         # raw worker YAML (one entry per plan)
+trade-control-dev plan show eurusd-hs-7    # full dump of one plan + its state
+trade-control-dev plan show eurusd-hs-7 --yaml
+trade-control-dev plan delete eurusd-hs-7  # drop a plan (live and/or archived)
+```
+
+`plan list` shows `TRADE_ID`, `ACCOUNT`, `INSTRUMENT`, `SHADOW`, `PHASE`,
+`RULES`, `FIRED` (the rule_ids that have latched), and `ARCHIVED` (the archive
+timestamp, blank for live plans). The state columns (`PHASE`, `FIRED`, …) are
+blank until a plan's first cron tick seeds its state row, so a freshly-registered
+plan lists with empty state until the next `*/15` tick. `plan show <trade_id>`
+scans every account scope for that id and dumps the whole `TradePlan` (every rule
++ embedded intent) plus the persisted `PlanState`. `plan list` / `plan show` are
+read-only KV-only control actions (`plan-list` / `plan-show`), signed like
+`status`, hitting the baked endpoint with no extra flag. A `plan show` for an
+unknown id exits non-zero with `no registered plan with trade_id …`.
+
+**Archived (terminated) plans.** When a plan reaches a terminal phase — a veto
+fired, or the single-shot entry was dispatched — the engine deletes its live
+`plan:` / `plan-state:` rows on that cron tick so it stops ticking. Before
+deleting, it **archives** the plan (plan body + terminal `PlanState`) to an
+`archived-plan:{scope}:{trade_id}` KV key, so a vetoed/completed setup can still
+be analyzed afterward. Plain `plan list` shows only the live plans (what the
+engine is still evaluating); `plan list --include-all` (alias
+`--include-archived`) also lists the archived ones, marked by their `ARCHIVED`
+timestamp. Use `plan show` / the R2 tick-bundles for the per-tick detail of why
+a plan terminated. **Archived plans have no TTL** — they accumulate until you
+delete them explicitly, so clean up with `plan delete` once you're done
+analyzing.
+
+`plan delete <trade_id>` is the inverse of `register`: it scans every account
+scope and drops the matching `plan:` and `plan-state:` rows **and** any matching
+`archived-plan:` row, so the engine stops evaluating a live plan and a terminated
+plan is cleared from the archive. (A terminated plan usually exists only in the
+archive, so this is what actually removes it.) It's KV-only and **idempotent** —
+deleting a plan that doesn't exist returns `ok` (reported as a no-op), so
+re-running is safe. The intended workflows: (1) `tv-arm` registers a plan and
+draws its news/blackout lines; if you tweak or remove some, run `plan delete
+<trade_id>` to wipe the stale server plan, then re-run `tv-arm` to register the
+corrected one; (2) after a plan vetoed and you've analyzed it via `plan list
+--include-all`, `plan delete <trade_id>` clears the archive.
 
 Skipped preps are pre-fired directly to the worker so the entry's
 `requires_preps:` gate is still satisfied — useful when joining a setup
@@ -1478,6 +2022,30 @@ where those preps don't apply.
   crosses the neckline *after* the drawn anchor segment never fires. The
   drawing-level `extendRight` property does *not* propagate to the alert
   payload; we override unconditionally for trendline tools.
+- **The engine interpolates trendlines in bar-index space, not
+  wall-clock.** TradingView's x-axis is *ordinal*: closed sessions (nights,
+  weekends, holidays) aren't plotted, so a neckline advances one step **per
+  traded bar**, not per elapsed second. The server-side engine matches this
+  — it counts the actual bars present in the broker candle feed between the
+  two anchors (the feed elides closed sessions, confirmed on ALPHABET: an
+  18 h overnight gap and a 66 h weekend gap each collapse to a single bar
+  step). `tv-arm` bakes the chart's bar duration onto each `TrendlineCross`
+  as a signed `bar_seconds`, used only as a fallback divisor when an anchor
+  predates the engine's fetched candle window. A naive wall-clock
+  interpolation would slide the break-and-close / retest level badly wrong
+  on any gapped instrument (everything but 24/5 FX — and even FX gaps at the
+  weekend). No market-hours table is needed: the candle feed *is* the
+  ordinal axis. The engine **fetches its detector window back to the earliest
+  trendline anchor** (`detector_window_for`), so every anchor lands in-window
+  and the bar-index count is exact — the `bar_seconds` fallback is dead code
+  for a normally-armed plan. It survives only as a belt-and-braces path for a
+  pathological anchor older than the fetch could reach, and *that* path is
+  **observable**: the engine attaches a warning to its `PlanEval` and the cron
+  wrapper `rlog!`s it (`cron engine: plan <id> trendline …`) — a soft note when
+  `bar_seconds` extrapolates across a gap, a hard one when a pre-`bar_seconds`
+  plan (`bar_seconds = 0`) makes the trendline silently un-evaluable. If you
+  ever see one, the anchor predates the fetch window — widen it, don't trust
+  the extrapolation.
 - **Chart-side `_alertId` binding is cosmetic.** The "link icon" on a
   drawing comes from a separate client-side binding that TV's GUI sets
   via `LineDataSource.setAlert()`. Programmatic creates can't easily
@@ -1491,23 +2059,32 @@ where those preps don't apply.
 ### M/W (double-top / double-bottom) setups
 
 M/W reversals use a completely different drawing input from H&S: **one
-PATH (polyline) tool with exactly 3 anchors**, plus a `trade-expiry`
+PATH (polyline) tool with 3 or 4 anchors**, plus a `trade-expiry`
 vertical. No invalidation line, no neckline/retest trendlines, no fib.
 
-The 3 path anchors, **in draw order**:
+The path anchors, **in draw order**:
 
 1. **A — runup start** (audit/log only).
 2. **B — first peak (M) / first trough (W)** — the SL anchor base.
 3. **C — neckline retracement** — the entry/abort anchor.
+4. **D — right shoulder** (*optional 4th anchor*) — the second peak/trough.
+   Draw it to **arm the setup immediately** (see "4-point paths" below);
+   omit it for the classic 3-anchor path where the worker discovers the
+   right tower live.
 
 Direction is inferred from the A→B leg geometry (A above B → W/long; A
 below B → M/short) — the **path tool has no text label**, so detection
-is geometry-only, and only a path whose 3 anchors all sit inside the
+is geometry-only, and only a path whose anchors all sit inside the
 visible chart range is picked up. `tv-arm` gates the setup at arm time:
 
 - **Neckline-retracement depth.** Retrace as a % of the runup must be
   `< 40%`. `--allow-50-pct-m-trades` raises the ceiling to `<= 50%` for
   a marginal setup; `> 50%` is always rejected.
+- **Right-shoulder alignment (4-point only).** When `D` is drawn, the
+  taller of the two shoulders must stay **below the 1.3 extension** of the
+  *shorter* shoulder (measured neckline→shorter), and `D` must sit on the
+  same side of the neckline as `B`. A drawing that breaks either rule is
+  **rejected at arm** with the offending levels printed.
 - **Live broker spread.** The mid→bid/ask correction the worker applies
   needs the spread captured at arm time, so `tv-arm` **reads it live**
   from the broker (OANDA `/pricing`; TradeNation's chart bid/ask
@@ -1550,6 +2127,65 @@ leg, all MID-price:
    worker constants (`RIGHT_TOWER_MIN_FRAC` / `CANCEL_EXT_FRAC` /
    `MID_CROSS_FRAC` in `core/src/intent/mw_resolution.rs`).
 
+   **A not-armed-yet bar is a benign decline, not an error.** Declining a
+   bar here (right tower unconfirmed, middle not crossed, or breakout stop
+   on the wrong side of the close) is the *expected* outcome on most M/W
+   enter fires. The worker reports it as **HTTP 200** with
+   `outcome: declined: mw-not-armed` — distinct from the **400
+   `rejected: resolve-failed`** it returns for a genuinely malformed enter
+   (wrong-side SL, entry outside SL..TP, sub-1R, missing field, bad
+   script). Either way the setup stays armed (the decline is a seen-id
+   no-op), but the wire status lets timeline/verdict tooling tell a routine
+   decline apart from a real geometry bug. (Internally: the three arming
+   gates return `ResolveError::NotArmedYet`.)
+
+   **The cron-engine H&S `PinePattern` entry declines the same way.** A bar
+   that fires the candle detector but whose enter can't pass the
+   `needs_golden`/`needs_confirmed` gate or can't resolve to a valid bracket
+   (e.g. a false-golden tiny pinbar with `signal_high ≈ signal_low` →
+   degenerate geometry) is **declined this bar** — the plan stays in
+   `AwaitEntry`, its veto rules keep being evaluated, and a later bar can
+   re-form a valid pattern. It does **not** retire the plan. (Before this —
+   bug #13 — a single-shot enter that fired the detector retired the spine to
+   `Done` *regardless* of the dispatch outcome, silently abandoning the
+   still-valid `close-positions` vetos. The pre-flight is the pure
+   `pine_entry_dispatchable` in `engine/src/evaluate.rs`.)
+
+   **A *multi-shot* enter (`max_retries > 0`) also keeps the plan alive — even
+   after a *successful* fire.** A `FireMode::Once` enter normally sets
+   `Phase::Done` the moment it fires, and the cron then archives + clears any
+   `Done` plan (`src/cron/engine.rs`, `persist_plan_state`). For a single-shot
+   enter that is correct. But a multi-shot enter *is* the
+   place → fill → close (typically at SL) → re-enter-on-the-next-signal-bar
+   mechanism, so retiring its plan on the first fire would archive the very plan
+   that fires re-entry #2 — leaving the worker to enter once and never re-enter,
+   even though the operator opted into multi-shot. So a multi-shot enter fires
+   this bar but **stays in `AwaitEntry`**: the plan survives, its vetos keep
+   ticking, and the next golden signal bar fires it again. The *placement cap* is
+   not the engine's job — it is the worker's `retry_gate` (which the offline
+   replay now also runs), so the engine just keeps emitting fires up to whatever
+   `max_retries` resolves to. The plan still retires the normal way — a terminal
+   `close-positions` veto, `trade-expiry`, or the enter's `not_after` window
+   closing. (`engine/src/evaluate.rs` treats any `max_retries` other than the
+   static default `Static(0)` as multi-shot, mirroring the worker's gate-entry
+   check; commit `83333fa`. Verified on NZD/CHF 2026-06-19: the 07:30 golden
+   short fired, stopped out, and should have re-entered on the 13:00 golden short
+   pinbar — but the plan had archived at 07:30, so no re-entry fired.) The
+   `retry_gate` itself now lives in `core` (`trade_control_core::retry_gate`,
+   commit `edef1ea`), shared by the worker and the replay so both run the
+   identical async cap/collapse logic against their own broker.
+
+**4-point paths arm immediately.** Both live confirmations above exist only
+because a 3-anchor path doesn't yet know the right tower — it discovers it
+bar by bar. When the operator draws the **4th anchor (D — right shoulder)**
+the second tower is *declared* (and validated at arm time), so both gates
+are satisfied by construction and **skipped**: the setup is armed on the
+first fire. Only the **1.3-extension ceiling** and the **stop-on-correct-side**
+placement check still apply, and the cancel/mid levels are measured off the
+**higher** of the two shoulders. The worker still re-measures every bar — a
+higher shoulder reshapes the geometry (below) and the 1.3 ceiling still
+aborts — matching "price may run higher but stay inside the 1.3 system".
+
 **Worker-side dynamic geometry (KV-backed).** The book reads the *higher
 shoulder* and the *deepest neckline* off a finished chart; we arm with only
 the left shoulder + neckline known, so the worker recovers them bar by bar
@@ -1590,7 +2226,7 @@ in `maybe_update_mw_state` (`src/lib.rs`). Baked params are the seed.
 cargo run -p tv-arm -- \
   --broker oanda \
   --allow-50-pct-m-trades \           # opt in to a 40–50% neckline retrace
-  --create-alerts
+  --register-plan
 # (draw the 3-anchor path + a trade-expiry vertical on the chart first)
 ```
 

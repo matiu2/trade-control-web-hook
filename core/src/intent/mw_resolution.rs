@@ -84,16 +84,33 @@
 //! through the middle do we arm the breakout stop. A bar that fails the
 //! cross is declined and the setup stays armed for the next bar.
 //!
+//! ## 4-point paths arm immediately
+//!
+//! Both gates above exist only because a 3-point path doesn't yet know the
+//! right tower — it has to discover it live. When the operator draws a
+//! **4-point** path the right shoulder (`MwParams::right_shoulder`) is baked
+//! at arm time, so the second tower is already known *and* validated (tv-arm
+//! rejects a drawing whose right shoulder breaches the 1.3 extension of the
+//! shortest shoulder). With a right shoulder present both live gates are
+//! satisfied by construction and skipped: the setup is **armed immediately**
+//! and re-measured each bar (a higher shoulder reshapes the geometry through
+//! [`MwState`][crate::state::MwState]). Only the 1.3-extension ceiling and the
+//! stop-on-correct-side placement check still apply. The cancel ceiling and
+//! the 50% mid level are measured off the **higher** of the two shoulders.
+//!
 //! ## "Stay armed" semantics
 //!
 //! The enter alert fires every bar close. A bar that fails the
 //! confirmation window above, or whose close has *not* yet broken the
 //! neckline (so the breakout stop would sit on the wrong side of the
 //! current price), is declined here with
-//! [`ResolveError::InvalidGeometry`]. Post the 2026-06 seen-id fix a
-//! non-`Ok` resolve does **not** mark the intent id seen, so the next
-//! bar's fire is allowed through — i.e. the setup stays armed until a
-//! bar actually breaks out (or a cancel / abort / expiry veto ends it).
+//! [`ResolveError::NotArmedYet`] — a benign "decline this bar" outcome
+//! distinct from the genuine bad-request [`ResolveError::InvalidGeometry`]
+//! (operator typo: SL on the wrong side). The worker maps `NotArmedYet`
+//! to a 2xx decline, not a 400. Post the 2026-06 seen-id fix a non-`Ok`
+//! resolve does **not** mark the intent id seen, so the next bar's fire
+//! is allowed through — i.e. the setup stays armed until a bar actually
+//! breaks out (or a cancel / abort / expiry veto ends it).
 
 use super::resolution::{ResolveError, Resolved, ResolvedEntry};
 use super::{Direction, Intent, MwParams, Shell};
@@ -118,6 +135,38 @@ const MID_CROSS_FRAC: f64 = 0.5;
 /// in `tv-arm`'s `mw_geometry`.
 const CANCEL_EXT_FRAC: f64 = 1.3;
 
+/// The mid-correct `(entry, stop_loss, take_profit)` for an M/W setup from its
+/// [`MwParams`] anchors. Pure price math — no shell / live data — so it's the
+/// single source of truth shared by [`Resolved::from_mw_intent`] (fire time,
+/// effective anchors) and tv-arm's arm-time SL-vs-spread floor check (baked
+/// anchors). See the module-level doc block for the `±½ spread` derivation.
+pub fn mw_static_prices(direction: Direction, mw: &MwParams) -> (f64, f64, f64) {
+    let pip = mw.pip_size;
+    let spread = mw.spread_pips * pip;
+    let half_spread = spread / 2.0;
+    let half_pip = 0.5 * pip;
+    let one_pip = pip;
+    let neckline = mw.neckline;
+    let peak = mw.first_point;
+
+    match direction {
+        // W (long): break *up* through the neckline, fill at ask.
+        Direction::Long => {
+            let entry = neckline + half_spread + half_pip;
+            let sl = peak + half_spread - (spread + one_pip);
+            let tp = entry + (entry - sl);
+            (entry, sl, tp)
+        }
+        // M (short): break *down* through the neckline, fill at bid.
+        Direction::Short => {
+            let entry = neckline - half_spread - half_pip;
+            let sl = peak - half_spread + (spread + one_pip);
+            let tp = entry - (sl - entry);
+            (entry, sl, tp)
+        }
+    }
+}
+
 impl Resolved {
     /// Resolve an M/W `enter` intent against an explicit [`MwParams`].
     ///
@@ -141,87 +190,83 @@ impl Resolved {
             .ok_or(ResolveError::MissingField("direction"))?;
 
         let pip = mw.pip_size;
-        let spread = mw.spread_pips * pip;
-        let half_spread = spread / 2.0;
-        let half_pip = 0.5 * pip;
-        let one_pip = pip;
         let neckline = mw.neckline;
         let peak = mw.first_point;
+        let (entry, stop_loss, take_profit) = mw_static_prices(direction, mw);
 
-        let (entry, stop_loss, take_profit) = match direction {
-            // W (long): break *up* through the neckline, fill at ask.
-            Direction::Long => {
-                let entry = neckline + half_spread + half_pip;
-                let sl = peak + half_spread - (spread + one_pip);
-                let tp = entry + (entry - sl);
-                (entry, sl, tp)
-            }
-            // M (short): break *down* through the neckline, fill at bid.
-            Direction::Short => {
-                let entry = neckline - half_spread - half_pip;
-                let sl = peak - half_spread + (spread + one_pip);
-                let tp = entry - (sl - entry);
-                (entry, sl, tp)
-            }
+        // The shoulder the arming math keys off: the **higher** of the two
+        // (the lower for a W) when a right shoulder is known, else just the
+        // left shoulder. For a 4-point path the right shoulder is baked at
+        // arm time; for a 3-point path the worker discovers it bar by bar and
+        // folds it into `peak` via `effective_mw_params`, so `peak` already
+        // *is* the higher shoulder here. Either way, the 1.3 cancel ceiling
+        // and the 50% mid level are measured off this highest shoulder.
+        let highest_shoulder = match (mw.right_shoulder, direction) {
+            (Some(rs), Direction::Short) => peak.max(rs),
+            (Some(rs), Direction::Long) => peak.min(rs),
+            (None, _) => peak,
         };
+        let cancel = neckline + CANCEL_EXT_FRAC * (highest_shoulder - neckline);
 
-        // Right-tower confirmation *window*. Before arming the breakout stop
-        // we require the price to have rallied (M) / dropped (W) back *into*
-        // the pattern — far enough to count as a real right tower (within 30%
-        // of the left-shoulder high), but not so far that it blew past the
-        // pattern entirely.
-        //
-        // The window is expressed as fractions of the neckline→first-point
-        // (C→B) leg:
-        //
-        //   lower = neckline + 0.7 × (first_point − neckline)   (within 30% of B)
-        //   upper = neckline + 1.3 × (first_point − neckline)   (cancel level)
-        //
-        // For an M (short) B > C, so the window sits *above* the neckline and
-        // we test the bar's `high`. For a W (long) B < C, the window sits
-        // *below* the neckline and we test the bar's `low`. B, C and high/low
-        // are all MID prices — no spread correction on this gate.
-        //
-        // - Below `lower`: the right tower isn't tall enough yet → decline,
-        //   stay armed for the next bar.
-        // - At/above `upper`: price reached the 1.3 extension — the pattern is
-        //   invalidated (this is the same level the `mw-cancel` veto guards).
-        //   Decline as a safety net in case that veto hasn't fired yet.
-        // A bar inside [lower, upper) is a confirmed right tower → proceed to
-        // the middle-of-the-M cross check below (see module docs).
-        let right_tower = neckline + RIGHT_TOWER_MIN_FRAC * (peak - neckline);
-        let cancel = neckline + CANCEL_EXT_FRAC * (peak - neckline);
-        let right_tower_confirmed = match direction {
-            // M: right tower is above the neckline. The high must reach the
-            // right-tower level but stay below the 1.3 cancel extension.
-            Direction::Short => shell.high >= right_tower && shell.high < cancel,
-            // W: mirror — right trough below the neckline. The low must drop
-            // to the right-tower level but stay above the cancel extension.
-            Direction::Long => shell.low <= right_tower && shell.low > cancel,
+        // The 1.3-extension ceiling, checked on *every* path. A bar whose
+        // extreme has already reached the 1.3 extension has invalidated the
+        // pattern (the same level the `mw-cancel` veto guards) — decline as a
+        // safety net in case that veto hasn't fired yet. M tests the high
+        // (the cancel sits above the neckline); W tests the low (below).
+        let past_cancel = match direction {
+            Direction::Short => shell.high >= cancel,
+            Direction::Long => shell.low <= cancel,
         };
-        if !right_tower_confirmed {
-            return Err(ResolveError::InvalidGeometry);
+        if past_cancel {
+            return Err(ResolveError::NotArmedYet);
         }
 
-        // "Middle of the M" downward-cross trigger. A confirmed right tower
-        // says the shape is valid; the arming trigger is the bar that rolls
-        // back *off* it through the 50% level of the C→B leg:
+        // Live arming gates — **only when no right shoulder was drawn**.
         //
-        //   mid50 = neckline + 0.5 × (first_point − neckline)
-        //   M (short): high ≥ mid50 AND close < mid50   (crossed down through it)
-        //   W (long):  low  ≤ mid50 AND close > mid50   (crossed up through it)
+        // A 3-point path arms in real time with only the left shoulder and
+        // neckline known, so before placing the breakout stop it must first
+        // *discover* a real right tower (rally/drop back within 30% of the
+        // left shoulder — the top 30% of the C→B leg) and then watch price
+        // roll back *off* it down through the 50% "middle of the M". These
+        // two gates are the live stand-ins for the validity the book reads
+        // off a finished chart (see the module docs).
         //
-        // The high/low condition proves the bar traded on the far side of the
-        // middle (so it's a genuine crossing, not a bar already wholly past
-        // it); the close condition proves it ended up back on the breakout
-        // side. A bar that hasn't crossed is declined → stay armed.
-        let mid50 = neckline + MID_CROSS_FRAC * (peak - neckline);
-        let crossed_middle = match direction {
-            Direction::Short => shell.high >= mid50 && shell.close < mid50,
-            Direction::Long => shell.low <= mid50 && shell.close > mid50,
-        };
-        if !crossed_middle {
-            return Err(ResolveError::InvalidGeometry);
+        // A 4-point path *declares* the right shoulder, so both are already
+        // satisfied by construction: the second tower exists (it's drawn) and
+        // is valid (tv-arm rejected the drawing otherwise). We arm
+        // immediately, then re-measure every bar — a higher shoulder reshapes
+        // the geometry via `MwState`, and the 1.3 ceiling above still aborts.
+        if mw.right_shoulder.is_none() {
+            let right_tower = neckline + RIGHT_TOWER_MIN_FRAC * (peak - neckline);
+            let right_tower_confirmed = match direction {
+                // M: right tower above the neckline; the high must reach it.
+                Direction::Short => shell.high >= right_tower,
+                // W: mirror — right trough below the neckline; the low reaches it.
+                Direction::Long => shell.low <= right_tower,
+            };
+            if !right_tower_confirmed {
+                return Err(ResolveError::NotArmedYet);
+            }
+
+            // "Middle of the M" downward-cross trigger. The arming bar is the
+            // one that rolls back off the right tower through the 50% level of
+            // the C→B leg:
+            //
+            //   mid50 = neckline + 0.5 × (first_point − neckline)
+            //   M (short): high ≥ mid50 AND close < mid50   (crossed down)
+            //   W (long):  low  ≤ mid50 AND close > mid50   (crossed up)
+            //
+            // The high/low proves the bar traded on the far side of the middle
+            // (a genuine crossing, not a bar already wholly past it); the close
+            // proves it ended back on the breakout side. No cross → stay armed.
+            let mid50 = neckline + MID_CROSS_FRAC * (peak - neckline);
+            let crossed_middle = match direction {
+                Direction::Short => shell.high >= mid50 && shell.close < mid50,
+                Direction::Long => shell.low <= mid50 && shell.close > mid50,
+            };
+            if !crossed_middle {
+                return Err(ResolveError::NotArmedYet);
+            }
         }
 
         // The entry is a breakout *stop*: it must sit on the far side of
@@ -233,7 +278,7 @@ impl Resolved {
             Direction::Short => entry < shell.close,
         };
         if !stop_on_correct_side {
-            return Err(ResolveError::InvalidGeometry);
+            return Err(ResolveError::NotArmedYet);
         }
 
         // Shared tail: SL..TP range check, geometry snapshot, min_r, and
@@ -298,6 +343,7 @@ mod tests {
 
     fn mw_intent(direction: Direction, mw: MwParams) -> Intent {
         Intent {
+            entry_level_vetos: Vec::new(),
             v: 1,
             id: "mw-test".into(),
             not_before: None,
@@ -340,6 +386,9 @@ mod tests {
             reason: None,
             mw: Some(mw),
             pip_size: Some(mw.pip_size),
+            trade_plan: None,
+            blackout_close: crate::intent::BlackoutCloseAction::default(),
+            include_archived: false,
         }
     }
 
@@ -355,6 +404,7 @@ mod tests {
             neckline: 1.1120,
             first_point: 1.1200,
             runup_start: 1.1000,
+            right_shoulder: None,
             spread_pips: 0.8,
             pip_size: 0.0001,
         }
@@ -370,6 +420,7 @@ mod tests {
             neckline: 1.1080,
             first_point: 1.1000,
             runup_start: 1.1200,
+            right_shoulder: None,
             spread_pips: 0.8,
             pip_size: 0.0001,
         }
@@ -439,12 +490,12 @@ mod tests {
     #[test]
     fn short_stop_on_wrong_side_is_declined() {
         // Close already below the entry (price gapped through) → the stop
-        // can't be placed below the close → InvalidGeometry (stay armed).
+        // can't be placed below the close → NotArmedYet (stay armed).
         let intent = mw_intent(Direction::Short, m_params());
         // high passes the window; close 1.1100 is below entry → stop-side fail.
         let err =
             Resolved::from_mw_intent(&intent, &shell_hlc(1.1200, 1.1100, 1.1100), &m_params());
-        assert!(matches!(err, Err(ResolveError::InvalidGeometry)), "{err:?}");
+        assert!(matches!(err, Err(ResolveError::NotArmedYet)), "{err:?}");
     }
 
     #[test]
@@ -453,7 +504,7 @@ mod tests {
         // low passes the window; close 1.1090 is above entry → stop-side fail.
         let err =
             Resolved::from_mw_intent(&intent, &shell_hlc(1.1090, 1.1000, 1.1090), &w_params());
-        assert!(matches!(err, Err(ResolveError::InvalidGeometry)), "{err:?}");
+        assert!(matches!(err, Err(ResolveError::NotArmedYet)), "{err:?}");
     }
 
     // ---- Second-peak confirmation window (the 0.7 / 1.3 gate) ----
@@ -469,6 +520,7 @@ mod tests {
             neckline: 0.98339,
             first_point: 0.98509,
             runup_start: 0.97856,
+            right_shoulder: None,
             spread_pips: 1.7,
             pip_size: 0.0001,
         }
@@ -481,7 +533,7 @@ mod tests {
         let intent = mw_intent(Direction::Short, audcad_m());
         let err =
             Resolved::from_mw_intent(&intent, &shell_hlc(0.98430, 0.98300, 0.98400), &audcad_m());
-        assert!(matches!(err, Err(ResolveError::InvalidGeometry)), "{err:?}");
+        assert!(matches!(err, Err(ResolveError::NotArmedYet)), "{err:?}");
     }
 
     #[test]
@@ -501,7 +553,7 @@ mod tests {
         let intent = mw_intent(Direction::Short, audcad_m());
         let err =
             Resolved::from_mw_intent(&intent, &shell_hlc(0.98560, 0.98300, 0.98400), &audcad_m());
-        assert!(matches!(err, Err(ResolveError::InvalidGeometry)), "{err:?}");
+        assert!(matches!(err, Err(ResolveError::NotArmedYet)), "{err:?}");
     }
 
     #[test]
@@ -512,7 +564,7 @@ mod tests {
         let intent = mw_intent(Direction::Long, w_params());
         let err =
             Resolved::from_mw_intent(&intent, &shell_hlc(1.1080, 1.1030, 1.1080), &w_params());
-        assert!(matches!(err, Err(ResolveError::InvalidGeometry)), "{err:?}");
+        assert!(matches!(err, Err(ResolveError::NotArmedYet)), "{err:?}");
     }
 
     #[test]
@@ -521,7 +573,7 @@ mod tests {
         let intent = mw_intent(Direction::Long, w_params());
         let err =
             Resolved::from_mw_intent(&intent, &shell_hlc(1.1080, 1.0976, 1.1080), &w_params());
-        assert!(matches!(err, Err(ResolveError::InvalidGeometry)), "{err:?}");
+        assert!(matches!(err, Err(ResolveError::NotArmedYet)), "{err:?}");
     }
 
     // ---- "Middle of the M" downward-cross trigger ----
@@ -539,7 +591,7 @@ mod tests {
         let intent = mw_intent(Direction::Short, audcad_m());
         let err =
             Resolved::from_mw_intent(&intent, &shell_hlc(0.98470, 0.98300, 0.98450), &audcad_m());
-        assert!(matches!(err, Err(ResolveError::InvalidGeometry)), "{err:?}");
+        assert!(matches!(err, Err(ResolveError::NotArmedYet)), "{err:?}");
     }
 
     #[test]
@@ -559,7 +611,7 @@ mod tests {
         let intent = mw_intent(Direction::Short, audcad_m());
         let err =
             Resolved::from_mw_intent(&intent, &shell_hlc(0.98470, 0.98300, 0.98424), &audcad_m());
-        assert!(matches!(err, Err(ResolveError::InvalidGeometry)), "{err:?}");
+        assert!(matches!(err, Err(ResolveError::NotArmedYet)), "{err:?}");
     }
 
     // W mirror: w_params neckline 1.1080, peak 1.1000.
@@ -573,7 +625,7 @@ mod tests {
         let intent = mw_intent(Direction::Long, w_params());
         let err =
             Resolved::from_mw_intent(&intent, &shell_hlc(1.1080, 1.1020, 1.1030), &w_params());
-        assert!(matches!(err, Err(ResolveError::InvalidGeometry)), "{err:?}");
+        assert!(matches!(err, Err(ResolveError::NotArmedYet)), "{err:?}");
     }
 
     #[test]
@@ -584,6 +636,112 @@ mod tests {
         let intent = mw_intent(Direction::Long, w_params());
         let r = Resolved::from_mw_intent(&intent, &shell_hlc(1.1080, 1.1020, 1.1080), &w_params())
             .expect("right trough + upward cross arms");
+        assert!(matches!(r.entry, ResolvedEntry::Stop { .. }));
+    }
+
+    // ---- Bug #7: arming-gate declines are NotArmedYet, not InvalidGeometry ----
+
+    #[test]
+    fn all_three_arming_gates_return_not_armed_yet() {
+        // The three "decline this bar, stay armed" gates must surface
+        // `NotArmedYet` (a benign 2xx decline at the worker), never
+        // `InvalidGeometry` (a 400 bad-request). See bug-007.
+        let intent = mw_intent(Direction::Short, audcad_m());
+        // (1) right tower not confirmed: high 0.98430 < right_tower 0.98458.
+        let g1 =
+            Resolved::from_mw_intent(&intent, &shell_hlc(0.98430, 0.98300, 0.98400), &audcad_m());
+        assert!(matches!(g1, Err(ResolveError::NotArmedYet)), "gate1 {g1:?}");
+        // (2) right tower confirmed but middle not crossed: close 0.98450 ≥ mid50.
+        let g2 =
+            Resolved::from_mw_intent(&intent, &shell_hlc(0.98470, 0.98300, 0.98450), &audcad_m());
+        assert!(matches!(g2, Err(ResolveError::NotArmedYet)), "gate2 {g2:?}");
+        // (3) tower + cross OK but breakout stop on the wrong side of close.
+        // entry ≈ 0.98326; a close below it fails the stop-side check.
+        let g3 =
+            Resolved::from_mw_intent(&intent, &shell_hlc(0.98470, 0.98300, 0.98320), &audcad_m());
+        assert!(matches!(g3, Err(ResolveError::NotArmedYet)), "gate3 {g3:?}");
+    }
+
+    // ---- 4-point paths (drawn right shoulder) arm immediately ----
+    //
+    // A drawn right shoulder skips the live right-tower-reach and 50%
+    // mid-cross gates: the second tower is declared, so the only remaining
+    // gates are the 1.3-extension ceiling and the stop-on-correct-side check.
+
+    /// `m_params` with a drawn right shoulder at `rs`.
+    fn m_params_4pt(rs: f64) -> MwParams {
+        MwParams {
+            right_shoulder: Some(rs),
+            ..m_params()
+        }
+    }
+
+    #[test]
+    fn m_4point_arms_without_mid_cross() {
+        // Right shoulder drawn at 1.1180 (below the left peak 1.1200, so the
+        // higher shoulder stays the left). A bar that has NOT crossed the
+        // middle of the M — high 1.1130, close 1.1125 — would be declined on a
+        // 3-point path (no mid-cross), but a 4-point path arms immediately. For
+        // a short the breakout stop (entry 1.11191) must sit *below* the close,
+        // so close 1.1125 > entry → stop-side satisfied.
+        let mw = m_params_4pt(1.1180);
+        let intent = mw_intent(Direction::Short, mw);
+        let r = Resolved::from_mw_intent(&intent, &shell_hlc(1.1130, 1.1122, 1.1125), &mw)
+            .expect("4-point M arms immediately, no mid-cross required");
+        assert!(matches!(r.entry, ResolvedEntry::Stop { .. }));
+    }
+
+    #[test]
+    fn m_4point_declined_when_high_past_cancel_of_highest_shoulder() {
+        // Right shoulder drawn ABOVE the left (1.1230 > 1.1200) → highest
+        // shoulder = 1.1230, cancel = neckline + 1.3×(1.1230 − 1.1120)
+        //   = 1.1120 + 1.3×0.0110 = 1.1263. A high reaching 1.1263 has hit the
+        // 1.3 extension → declined even on a 4-point path.
+        let mw = m_params_4pt(1.1230);
+        let intent = mw_intent(Direction::Short, mw);
+        let err = Resolved::from_mw_intent(&intent, &shell_hlc(1.1263, 1.1100, 1.1118), &mw);
+        assert!(matches!(err, Err(ResolveError::NotArmedYet)), "{err:?}");
+    }
+
+    #[test]
+    fn m_4point_cancel_extends_with_higher_right_shoulder() {
+        // The same high (1.1240) that would breach the left-shoulder cancel
+        // (1.1224) is still inside the cancel of the higher right shoulder
+        // 1.1230 (cancel 1.1263) → arms. Proves the ceiling tracks the
+        // highest shoulder, not the left.
+        let mw = m_params_4pt(1.1230);
+        let intent = mw_intent(Direction::Short, mw);
+        // close 1.1125 > entry 1.11191 → short stop sits below the close.
+        let r = Resolved::from_mw_intent(&intent, &shell_hlc(1.1240, 1.1122, 1.1125), &mw)
+            .expect("high inside the higher shoulder's 1.3 ceiling arms");
+        assert!(matches!(r.entry, ResolvedEntry::Stop { .. }));
+    }
+
+    #[test]
+    fn m_4point_still_declined_on_wrong_side_stop() {
+        // Even armed-immediately, the breakout stop must sit below the close
+        // for a short. close 1.1100 < entry 1.11191 fails (price gapped
+        // through) → NotArmedYet.
+        let mw = m_params_4pt(1.1180);
+        let intent = mw_intent(Direction::Short, mw);
+        let err = Resolved::from_mw_intent(&intent, &shell_hlc(1.1130, 1.1090, 1.1100), &mw);
+        assert!(matches!(err, Err(ResolveError::NotArmedYet)), "{err:?}");
+    }
+
+    #[test]
+    fn w_4point_arms_without_mid_cross() {
+        // W mirror: neckline 1.1080, left trough 1.1000, right trough drawn at
+        // 1.1010 (above the left, so the left stays the lower shoulder). A bar
+        // with low 1.1030 (no mid-cross) arms immediately. For a long the
+        // breakout stop (entry 1.10809) must sit *above* the close, so close
+        // 1.1078 < entry → stop-side satisfied.
+        let mw = MwParams {
+            right_shoulder: Some(1.1010),
+            ..w_params()
+        };
+        let intent = mw_intent(Direction::Long, mw);
+        let r = Resolved::from_mw_intent(&intent, &shell_hlc(1.1078, 1.1030, 1.1078), &mw)
+            .expect("4-point W arms immediately, no mid-cross required");
         assert!(matches!(r.entry, ResolvedEntry::Stop { .. }));
     }
 }

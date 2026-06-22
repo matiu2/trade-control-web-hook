@@ -28,12 +28,31 @@ pub struct Point {
 
 /// Optional drawing properties tv-mcp returns. The `text` field is
 /// what the operator writes on the drawing to assign it a role.
+///
+/// The `stop_level`/`profit_level` fields are emitted by the
+/// long/short **position** tools (tv-mcp kind `long_position` /
+/// `short_position`). They are *tick* distances from the entry anchor
+/// (`points[0].price`), **not** absolute prices — the absolute SL/TP
+/// are `entry ± level × tick_size` (see `tv-arm`'s position resolver).
+/// They are `Option` because every other drawing kind omits them.
 #[derive(Debug, Clone, Default, Deserialize, PartialEq)]
 pub struct Properties {
     /// Free-form text the operator typed on the drawing (used as the
     /// role label). Trimmed and lower-cased by the classifier.
     #[serde(default)]
     pub text: Option<String>,
+    /// Stop-loss distance from entry, in instrument *ticks*. Set only
+    /// on position tools.
+    #[serde(default, rename = "stopLevel")]
+    pub stop_level: Option<f64>,
+    /// Take-profit distance from entry, in instrument *ticks*. Set only
+    /// on position tools.
+    #[serde(default, rename = "profitLevel")]
+    pub profit_level: Option<f64>,
+    /// Position size the operator dialled in on the tool. Carried for
+    /// visibility/logging; sizing is decided by the worker, not this.
+    #[serde(default)]
+    pub qty: Option<f64>,
 }
 
 /// A drawing stub from `draw list`. Carries just enough info to
@@ -252,6 +271,44 @@ mod tests {
         assert_eq!(d.points.len(), 1);
         assert_eq!(d.prices(), vec![1.234]);
         assert_eq!(d.label(), "too-high");
+    }
+
+    #[test]
+    fn parses_short_position_levels() {
+        // Trimmed from a real `draw get` on a DE40 short_position tool.
+        // entry = points[0].price; stopLevel/profitLevel are TICK
+        // distances, not absolute prices.
+        let json = r##"{
+            "entity_id": "R5zDSP",
+            "points": [
+                {"price": 23475, "time": 1773738000},
+                {"price": 23475, "time": 1774227600}
+            ],
+            "properties": {
+                "linecolor": "#808080",
+                "stopLevel": 3000,
+                "profitLevel": 7007,
+                "qty": 0.0103,
+                "accountSize": 10000
+            },
+            "name": "short_position"
+        }"##;
+        let d: Drawing = serde_json::from_str(json).expect("parse");
+        assert_eq!(d.points[0].price, 23475.0);
+        assert_eq!(d.properties.stop_level, Some(3000.0));
+        assert_eq!(d.properties.profit_level, Some(7007.0));
+        assert_eq!(d.properties.qty, Some(0.0103));
+        // Position tools carry no role text.
+        assert_eq!(d.label(), "");
+    }
+
+    #[test]
+    fn non_position_drawing_has_no_levels() {
+        let json =
+            r#"{"id":"x","points":[{"time":1,"price":1.0}],"properties":{"text":"neckline"}}"#;
+        let d: Drawing = serde_json::from_str(json).unwrap();
+        assert_eq!(d.properties.stop_level, None);
+        assert_eq!(d.properties.profit_level, None);
     }
 
     #[test]

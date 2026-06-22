@@ -1,5 +1,1424 @@
 # Changelog
 
+## v55 — 2026-06-22 — replay-candles: pull one bar past the trade-expiry so it actually fires
+
+### Why
+
+After v54, a bare `replay-candles --plan plan.json` resolved its window end to
+the plan's trade-expiry — but the replay then reported `0 fires` / `Done: false`
+even on a plan whose trade-expiry clearly should have retired it (NZD/CHF M15,
+expiry 19:30 BNE). The engine evaluates a `TimeReached` (trade-expiry) trigger
+against each candle's **open** time (`candle.time >= at_epoch`, `evaluate.rs`).
+With the window ending *exactly at* the expiry, the last bar *opened* one bar
+short of it (e.g. opens 19:15, expiry 19:30), so no candle ever satisfied the
+predicate and the expiry never fired.
+
+### What changed
+
+- **Pull one granularity bar past the window end** (`pull_end = end + 1 bar`) so
+  a candle that *opens at* the trade-expiry is fetched and evaluated. The
+  displayed/`expires_at` `end` is unchanged; only the candle-pull range extends.
+  Harmless when there's no expiry — the engine stops at the first `done` and
+  ignores trailing candles. The extra bar is logged as `pull_end`.
+- **Replay `now` is the bar's close time** (`candle.time + granularity`) instead
+  of its open time, so wall-clock-derived state (TTLs, logging) matches the live
+  worker, which ticks on wall-clock rather than bar-open. (Note: this does *not*
+  affect `TimeReached`, which the engine keys off `candle.time` directly — the
+  window-extension above is what fixes the expiry firing.)
+
+### Breaking
+
+None. CLI behaviour fix only; no wire-format / KV / signed-field change.
+
+### Tests
+
+`trade-control-cli` (native): a trade-expiry whose epoch a bar opens at fires +
+finishes the plan; the converse (window a bar short → no fire) confirms the
+need for the extension. Existing replay tests updated for the new `run`
+signature (now takes the granularity).
+
+### Verified
+
+Re-ran the NZD/CHF M15 plan (`hs-nzd-chf-9457e0d7`): now reports
+`02-veto-trade-expiry Veto @ 19:30` / `Done: true` / `1 fire`, where before it
+was `0 fires` / `Done: false`.
+
+## v54 — 2026-06-22 — replay-candles: window from the replay cursor + the plan, not the visible region
+
+### Why
+
+The TradingView-defaults workflow (v47) read the *whole visible region* as the
+replay window and the granularity off the chart resolution. In practice the
+operator's natural move is to put TradingView in **replay mode at the start of
+the trade** and run `replay-candles` — at which point the chart only renders
+bars up to the replay cursor, so the *last shown candle* is the trade start, not
+some scrubbed-to right edge. And the granularity is already pinned by the signed
+plan, so reading it off the chart was a redundant source of mismatch errors.
+
+### What changed
+
+- **start = the chart's last shown candle** (`bars_range.to`, the replay
+  cursor) instead of `visible_range.from`. `--start` still overrides.
+- **end = the plan's trade-expiry** — the `TimeReached.at_epoch` of the rule
+  whose `rule_id` contains `trade-expiry` (e.g. `02-veto-trade-expiry`, the same
+  id the engine keys on). Falls back to the chart's visible-region end
+  (`visible_range.to`) when the plan has no such rule. `--end` still overrides.
+- **granularity comes from the plan** (`plan.granularity`), no longer read from
+  the chart resolution. `--granularity` is now an *override only*, and an
+  override must still match the plan's granularity (else it's refused).
+- TradingView is consulted only when something it provides is actually needed
+  (the start cursor, the symbol, or the end-fallback when the plan has no
+  expiry). A run whose end comes from the plan and whose start/instrument are
+  flagged makes no MCP call.
+
+### Breaking
+
+None to the wire format. CLI behaviour change: a bare
+`replay-candles --plan plan.json` now replays `[last-shown-candle,
+plan-trade-expiry]` instead of `[visible.from, visible.to]`, and `--granularity`
+no longer *supplies* the granularity (it only overrides). `--start`/`--end`
+override as before.
+
+### Tests
+
+`trade-control-cli` (native): `trade_expiry_epoch` extraction (found / ignores
+non-expiry time rules / none); `resolve_granularity` (defaults to plan / accepts
+a matching override / rejects a mismatching override). `tv.rs` drops the
+now-unused `resolution_to_friendly` and its tests.
+
+### Follow-up
+
+Rebuild + reinstall the `-dev` / `-staging` CLIs via the deploy scripts so the
+installed `replay-candles-<env>` picks up the new defaults.
+
+## v53 — 2026-06-22 — Bug #13: a resolve-failed cron-engine enter no longer retires the plan
+
+### Why
+
+A cron-engine H&S plan (`hs-nzd-chf-d12eb831`, NZD/CHF m15, 19-Jun 2026)
+fired its single-shot `05-enter` on a tiny pinbar, the resolver produced a
+degenerate zeros bracket (`trigger 0.0`, `sl 0`, R 0.0), and the worker
+correctly rejected it `resolve-failed` — **but the FSM had already
+transitioned `AwaitEntry → Done` on the same tick**, purely because the
+once-enter *trigger* fired. The pure evaluator decides phase transitions at
+fire-time and never sees the dispatch outcome; the state is persisted before
+dispatch. So a doomed enter retired the whole plan, and its three veto rules
+(`too-high`/`too-low`/`trade-expiry`, valid ~11h longer) stopped being
+evaluated. No loss here (the plan held no position), but on a plan that *had*
+opened a position an abandoned `close-positions` veto would be a missed
+protective exit.
+
+Linked Finding B: `run_enter` resolves **before** the `needs_golden` candle
+gate, so a false-golden tiny pinbar (`signal_high ≈ signal_low`) fails resolve
+first — which is why the log showed `resolve-failed` rather than
+`needs-golden`. The engine FSM also didn't pre-gate `needs_golden`, so a
+non-golden bar could fire the detector.
+
+### What changed
+
+- **Engine FSM pre-flight (`engine/src/evaluate.rs`).** A `PinePattern`
+  (single-shot) enter is now pre-flighted before it fires/latches/retires the
+  spine, via the new pure `pine_entry_dispatchable`:
+  1. the candle-quality gate (`needs_golden`/`needs_confirmed` vs the latched
+     signal flags — `None`/`false` both reject), and
+  2. bracket resolution (`Resolved::from_intent` on the signal-folded shell).
+  If either fails it's a **decline-this-bar** (stay `AwaitEntry`), not a
+  `Done`. Both checks are pure and recompute identically on replay; the worker
+  still re-runs its own gates + resolution on dispatch (this is a pre-flight,
+  not a replacement — it never sees account caps / cooldown / retry /
+  `allow_entry`).
+- **Scope is `PinePattern`-only.** The M/W heartbeat enter is untouched — its
+  resolution and by-design `NotArmedYet` decline are owned by
+  `run_enter → maybe_update_mw_state`, so pre-resolving it in the FSM would
+  wrongly suppress the heartbeat.
+
+### Breaking
+
+None. Pure-FSM behaviour change only; no wire-format, KV, or signed-field
+change.
+
+### Tests
+
+`engine` crate (native): a resolvable Pine enter still fires + `Done`
+(unchanged); an unresolvable bracket fires the detector but does **not**
+retire the plan (phase stays `AwaitEntry`, enter doesn't latch); a
+`close-positions` veto crossed *after* a resolve-failed enter still fires
+(acceptance criterion 3); a `needs_golden` enter declines on a non-golden bar;
+the M/W heartbeat is not pre-flighted; plus a direct unit test of
+`pine_entry_dispatchable`. The four pre-existing Pine fixtures were given
+real signal-anchored geometry (a bare no-geometry enter would now decline at
+resolve).
+
+### Follow-up
+
+Finding B1 vs B2 (was the surfacing pinbar truly non-golden upstream, or did
+Pine stamp a false `golden:1`?) is decided by the `ticks/` R2 object, not by
+this change. This fix makes either case safe — a non-golden *or* unresolvable
+bar now declines without retiring the plan — but if B2 holds, the Pine source
+still wants the Bug #10-family fix separately.
+
+## v52 — 2026-06-22 — Bug #12: continuous at-entry too-low/too-high enforcement
+
+### Why
+
+A live `too-low` veto failed to block a confirmed H&S entry (NZD/CAD,
+−110.53 GBP, 10–11 Jun 2026). Root cause is a semantic gap from the engine
+migration: the legacy TradingView `too-low`/`too-high` alert *wrote a
+persistent KV veto* that a later confirmed enter found and rejected. The
+engine re-modelled those as one-shot cross-event guard rules — the KV veto is
+only written when price *crosses* the level on a closed candle. A gap past the
+level, a level already breached when the plan armed, or a cross during a
+disarmed phase writes **no** veto, so the enter confirmed and the order was
+placed. `too-low` is really a *continuous* predicate ("is the entry already
+past the pcl-exhausted level?"), not a one-shot cross.
+
+### What changed
+
+- **`Intent.entry_level_vetos: Vec<EntryLevelVeto>`** (new core type
+  `EntryLevelVeto { name, level, past: VetoSide{Below,Above} }`). Baked onto
+  the H&S/IH&S enter at arm time: `too-low` = pcl-exhausted (from the fib),
+  `too-high` = invalidation (the right-shoulder horizontal), with sides
+  derived from direction.
+- **Worker gate (`run_enter`).** After resolving and before `allow_entry`, the
+  worker rejects the entry when the resolved entry/trigger price is already
+  past any baked level — `rejected: veto-active (<name>)`, HTTP 412, no order
+  placed — independent of any cross-event guard. Byte-identical outcome string
+  to the legacy KV veto path (a seen-id `Skip`, so the id isn't poisoned).
+- **Engine cross-guard left as-is** (lowest risk): the new at-entry check is an
+  *additional*, authoritative safety net, not a replacement.
+- **Simulator** (`engine::simulator`): new `SimOutcome::Declined { name }`;
+  `simulate_fill` short-circuits to it when the entry is past a level, so
+  tick-replay reproduces the worker's gate (loss → no-fill).
+
+### Config
+
+- New signed field `Intent.entry_level_vetos` and `TradeSpec.entry_level_vetos`,
+  both `#[serde(default, skip_serializing_if = "Vec::is_empty")]` — old signed
+  intents / stored plans / spec yaml deserialise and round-trip unchanged.
+
+### Tests
+
+- core: `EntryLevelVeto::is_past` truth table (inclusive at the level) + JSON
+  round-trip; `ResolvedEntry::reference_price`.
+- tv-arm: `hs_entry_level_vetos` sides + skip-missing for short & long.
+- cli: `build_enter_alert` carries the levels onto the enter intent.
+- engine: tick-replay flips the −110.53 loss path to a clean no-fill when the
+  pcl level is breached (and still fills when the entry is short of it).
+
+### Rollout
+
+Deploy only — no re-arm migration. The level is baked at arm time, so only
+plans armed after deploy carry it; in-flight plans keep the cross-guard until
+they expire/re-arm. Dev only (`./deploy-dev.sh`); do not redeploy staging
+mid-week.
+
+## v51 — 2026-06-22 — M/W: optional drawn right shoulder (4-point path) arms immediately
+
+### Why
+
+A 3-anchor M/W path (runup-start, left shoulder, neckline) leaves the right
+tower unknown at arm time, so the worker has to *discover* it live — waiting
+for a right-tower-reach confirmation and then a 50% "middle of the M"
+downward cross before it arms. When the operator can already *see* the right
+shoulder on the chart, that wait is needless latency: the pattern is valid the
+moment both towers exist. The operator wanted to draw the right shoulder and
+have the trade arm straight away, re-measuring each bar and aborting only on
+the 1.3 break.
+
+### What changed
+
+- **Optional 4th path anchor `D` = right shoulder.** `tv-arm` now accepts a
+  3- *or* 4-anchor M/W PATH. A 4th anchor is read as the right shoulder and
+  baked onto the enter intent (`MwParams.right_shoulder: Option<f64>`).
+- **4-point paths arm immediately.** With a right shoulder present the worker
+  skips the live right-tower-reach and 50%-mid-cross gates (`from_mw_intent`);
+  only the 1.3-extension ceiling and the stop-on-correct-side placement check
+  remain. 3-anchor behaviour is unchanged.
+- **Highest-shoulder geometry.** The SL anchor, the 1.3 cancel ceiling, and the
+  `mw-cancel` / `mw-overshoot` veto levels are measured off the **higher** of
+  the two shoulders when `D` is drawn (M: max; W: min). The worker still
+  re-measures every bar — a higher shoulder reshapes the geometry via `MwState`
+  and the 1.3 ceiling still aborts.
+- **Arm-time validity.** `tv-arm` rejects a 4-point drawing whose right
+  shoulder is on the wrong side of the neckline, or whose taller shoulder
+  breaches the 1.3 extension of the *shorter* shoulder.
+
+### Config
+
+- New signed field `MwParams.right_shoulder` (and CLI `MwSpec.right_shoulder`),
+  both `#[serde(default, skip_serializing_if = "Option::is_none")]` — a
+  3-anchor signed intent / spec yaml stays byte-identical.
+
+### Tests
+
+- core: 4-point arms-without-mid-cross (M+W), 1.3 ceiling tracks the higher
+  shoulder, wrong-side stop still declines, drawn shoulder seeds `MwState`.
+- tv-arm: `validate_right_shoulder` (valid / 1.3-break / wrong-side, M+W),
+  `highest_shoulder`, 4-anchor classification + pipeline accept/reject.
+
+## v50 — 2026-06-22 — `plan show` finds archived (terminated) plans
+
+### Why
+
+`plan list --include-archived` would list a terminated plan, but
+`plan show <trade_id>` for that same id returned **404 — no registered plan**.
+A terminated plan usually exists *only* in the archive keyspace (its live
+`plan:` / `plan-state:` rows are dropped on the terminal tick), and
+`handle_plan_show` only scanned the **live** plans (`list_all_trade_plans`),
+never the archive — so the one path the operator would use to inspect a
+finished plan couldn't find it. (`plan delete` already scanned both.)
+
+### What changed
+
+- **`plan show` now scans live *and* archived plans.** A new pure,
+  `StateStore`-generic helper `collect_plan_details(store, target)` gathers
+  matches from the live rows first, then the archive; `handle_plan_show` 404s
+  only when both are empty.
+- **An archived match carries an `archived_at` field** in the dump (mirrors
+  `PlanSummary::archived_at`), so the operator can tell at a glance whether
+  `plan show` surfaced a live or a finished plan. Live matches omit it.
+
+### Breaking
+
+None. Live `plan show` output is unchanged (no `archived_at` field emitted);
+the field appears only for archived matches.
+
+### Tests
+
+New `plan_show_tests` module (uses core's `MemStateStore` via the
+`test-support` feature, added as a dev-dependency): an archived-only plan is
+found and flagged with `archived_at`; a live plan is still found and *not*
+flagged; an unknown id yields no details (→ 404 at the caller).
+
+## v49 — 2026-06-20 — replay-candles: Brisbane-time output + clearer --source help + dev deploy
+
+### Why
+
+The replay report printed every candle/fill/exit timestamp in **UTC**, but the
+operator (and the broker, and the TradingView chart they armed from) all work in
+**Brisbane time**. Cross-referencing a fire against the chart meant doing +10h
+arithmetic in your head. Separately, `--source`'s help implied it might bypass
+the cache — it never did; **both** sources always go through candle-cache.
+
+### What changed
+
+- **All report timestamps now render in Brisbane time (UTC+10)** with an
+  explicit `+10:00` suffix — candle fire times, fill/SL/TP times, and the
+  "pulling candles" log line. Brisbane has no DST, so the offset is fixed
+  year-round. New `replay_candles/brisbane.rs` (`bne()`); the candle *data* and
+  the engine still compute in UTC internally — this is display-only.
+- **`--source` help clarified.** Both `tradenation` and `oanda` always pull
+  through candle-cache (filling the on-disk cache and cutting future broker
+  calls); `--source` only selects the broker, never whether the cache is used.
+  No behaviour change — wording only.
+- **`replay-candles` now installs via `./deploy-dev.sh`** (and staging) as
+  `replay-candles-<env>`. It's a second binary of the `trade-control-cli`
+  package, so it already built with the others; added to `CLI_BINARIES` so the
+  suffixed copy lands in `~/.cargo/bin`. It has no baked webhook (it talks to
+  TradingView + the broker, not the worker), so the per-env copy is just a
+  naming convenience.
+
+### Breaking
+
+None. Output format of timestamps changed (UTC → Brisbane), but no flags or
+APIs changed.
+
+### Config
+
+None.
+
+### Tests
+
+`brisbane.rs`: UTC→Brisbane render (`11:00Z` → `21:00 +10:00`) and a
+date-rollover case (`20:00Z` → next-day `06:00 +10:00`). Full bin suite (17)
+and workspace green; wasm worker build stays ring-free.
+
+### Follow-up
+
+- Still could auto-derive `--source` from the TV chart exchange
+  (`OANDA:`/`TRADENATION:`); deferred (carried from v47).
+
+## v48 — 2026-06-20 — tv-arm: `--plan-out` builds the plan on its own
+
+### Why
+
+`tv-arm --plan-out plan.json` silently wrote nothing unless `--register-plan`
+was *also* passed. The plan-build + JSON-dump lived entirely inside
+`register_trade_plan`, which only ran under the `if args.register_plan` guard.
+So the documented replay workflow (v47 TODO: "`tv-arm --plan-out plan.json`
+builds the plan", then `replay-candles --plan plan.json`) didn't actually work
+standalone — the operator got a clean exit and an empty `out_dir`, no file, no
+warning.
+
+### What changed
+
+- The plan-build block now runs when **either** `--register-plan` **or**
+  `--plan-out` is set. Used alone, `--plan-out` builds the `TradePlan` (control
+  rules folded in), writes the pretty JSON, and stops — **no worker POST**.
+  Combined with `--register-plan` it additionally registers the plan, exactly as
+  before.
+- `--update` re-arm (plan delete) still only fires under `--register-plan` —
+  there's nothing to reconcile on the offline path.
+
+### Breaking
+
+- None. `register_trade_plan` gains a `register: bool` parameter that gates the
+  worker POST; the offline path returns early after the optional disk write.
+
+### Config
+
+- No new flags. `--plan-out`'s doc comment no longer claims it's "only
+  meaningful with `--register-plan`".
+
+### Tests
+
+- Existing `built_plan_round_trips_through_plan_out_json` covers the JSON shape;
+  all 171 tv-arm tests pass. (The guard split is control-flow only.)
+
+### Follow-up
+
+- None.
+
+## v47 — 2026-06-20 — replay-candles: pull the replay window straight from TradingView
+
+### Why
+
+The `replay-candles` workflow (v43/v45) required the operator to hand-type
+`--instrument`, `--granularity`, `--start`, and `--end`. But the operator is
+already *looking at exactly that window* in TradingView replay mode: they
+rewind, arm the plan with `tv-arm`, then scrub the chart forward to the end of
+the trade. At that point the chart's visible region **is** the window to replay,
+and the chart symbol + resolution **are** the instrument + granularity.
+Re-typing them is error-prone busywork.
+
+### What changed
+
+- `replay-candles` now reads the instrument, granularity, and start/end window
+  off the **current TradingView chart** when those flags are omitted, via the
+  same `trading-view` MCP wrapper `tv-arm` uses (`TvMcp::get_state` →
+  symbol + resolution, `TvMcp::get_range().visible_range.to_utc()` →
+  start/end).
+- All four flags remain **optional overrides** — any flag that is passed wins
+  over the chart value. With all of instrument/granularity/start/end explicit,
+  no MCP call is made at all.
+- New `--tv-mcp-root` flag (mirrors `tv-arm`) to point at a non-default tv-mcp
+  checkout.
+- The chart resolution → granularity map (`"60"` → `1h`, `"D"` → `1d`, …)
+  mirrors `tv-arm`'s `resolution_to_granularity`; an unsupported resolution
+  (sub-minute, weekly) errors with a clear "set `--granularity` explicitly"
+  message rather than guessing.
+
+### Breaking
+
+- `--granularity` and `--start` are no longer required / no longer defaulted to
+  `1h`. Omitting them now pulls from TradingView instead of erroring (`--start`)
+  or silently assuming `1h` (`--granularity`). Existing invocations that passed
+  both explicitly are unaffected.
+
+### Config
+
+None.
+
+### Tests
+
+`cli/src/bin/replay_candles/tv.rs` unit tests: exchange-prefix stripping
+(`OANDA:EURUSD` → `EURUSD`), TV-resolution → friendly-granularity mapping,
+unsupported-resolution rejection, and a round-trip asserting every friendly
+string this module emits parses back through the CLI's own granularity parser.
+The live MCP path is not unit-tested (it shells out to node). Full workspace
+suite green; wasm worker build stays ring-free (no `trading-view`/`candle-cache`
+in the cdylib tree).
+
+### Follow-up
+
+- Could also derive the candle `--source` from the chart exchange
+  (`OANDA:` → oanda, `TRADENATION:` → tradenation) instead of defaulting to
+  TradeNation; deferred until there's a concrete need.
+
+## v46 — 2026-06-20 — multi-shot retry gate: never stack a duplicate on a still-open position (Bug #11)
+
+### Why
+
+A multi-shot `enter` (`max_retries > 0`) re-fired while its **first
+position was still open** and the worker placed a **second live
+position** on the same `trade_id`/instrument/side — the account briefly
+carried double exposure and took two stop-outs where the design allows
+one (incident `hs-eur-cad-b6b708cc`, EUR/CAD, 2026-06-18, demo). The
+retry gate is meant to reject a re-entry while a prior attempt is open;
+it didn't.
+
+Root cause, confirmed from the 18-Jun worker logs: the gate **did** run
+and **did** find the prior attempt, but its per-attempt broker lookup
+mis-resolved the still-open TradeNation position to `AttemptState::Unknown`.
+On a bracketed TN entry the entry order executes and a **fresh** SL child
+order is attached with a new id, so the live `Position.order_id` no longer
+equals the originating entry order id we stored on the `EntryAttempt`.
+`compute_attempt_state` matched only on that entry order id, missed the
+position, and fell through to `Unknown` — which the gate bucketed with
+the *closed* states and skipped past, proceeding to place the duplicate.
+(`lookup_attempt_state` success is silent, which is why no lookup line
+appears in the logs and an earlier read mistook this for "the gate never
+checked".) The "1 → 0 tracked-attempts oscillation" in the cron logs was
+a red herring: two workers (dev + staging) sweeping their own KV into one
+log stream.
+
+### What changed (three layers, defense in depth)
+
+- **`Unknown` now fails safe → reject (412).** A prior attempt the
+  broker can't confirm as open/pending/closed is treated as "might still
+  be open" and blocks the re-entry, instead of being treated as done.
+  New outcome string `rejected: prior-attempt-unknown`
+  (`src/retry_gate.rs`).
+- **`compute_attempt_state` correlates an open position on EITHER the
+  stored entry `order_id` OR the snapshotted `position_id`** — so a
+  still-open position whose live (bracket) order id has drifted is still
+  recognised as `OpenPosition` once its PositionID has been snapshotted
+  (`src/tradenation_adapter.rs`).
+- **Independent open-positions backstop before placement.** When there
+  is at least one tracked prior attempt, the gate lists the broker's live
+  open positions for the instrument and rejects (412) if any correlates
+  to a prior attempt by `order_id` or `position_id` — immune to the
+  per-attempt-lookup taxonomy and to bracket order-id drift. New outcome
+  string `rejected: trade-already-open (backstop)`. A transient failure
+  reading the positions list fails safe (503) rather than risking a
+  duplicate (`src/retry_gate.rs::open_position_backstop`).
+
+### Behaviour
+
+- A multi-shot `enter` re-fire while a same-`trade_id` position is open
+  is now rejected (412), no second order placed.
+- A re-fire **after** the prior attempt has provably closed/cancelled
+  still re-enters (Bug #1 behaviour preserved — `ClosedWin` /
+  `ClosedLossOrBreakeven` / `Cancelled` still fall through).
+- The single-shot path (`max_retries: Static(0)`, the default) is
+  untouched — the gate is skipped entirely, no new KV/broker calls.
+
+### Breaking
+
+None. New reject outcome strings only.
+
+### Tests
+
+- gate: `Unknown` prior attempt rejects (`prior-attempt-unknown`).
+- gate backstop: rejects a live position matching a prior attempt by
+  `position_id` even when the order id has drifted; ignores an unrelated
+  same-instrument position; fails safe (503) on a transient positions
+  read.
+- adapter: `compute_attempt_state` resolves `OpenPosition` via a
+  snapshotted `position_id` when the live `order_id` no longer matches.
+- regression: collapsed states still proceed; single-shot baseline makes
+  no new calls.
+
+### Follow-up
+
+- The closed-position `RefID`-vs-`PositionID` limitation on TradeNation
+  (a stopped-out TN trade still resolves to `Cancelled`, Bug #1) is
+  unchanged and out of scope here — the `Unknown` fail-safe and the
+  backstop both guard the **open** path, which is what this incident hit.
+## v45 — 2026-06-20 — `replay-candles --print-completions`
+
+### Why
+
+`replay-candles` (v43) shipped without the zsh completion flag the other
+operator tools (`tv-arm`, `trade-control`) carry, so TAB-completing its flags
+needed hand-written compdef.
+
+### What changed
+
+- **`replay-candles --print-completions`** emits the clap-generated zsh
+  completion script (bound to the invoked binary name so a renamed-on-install
+  copy completes for its own name), mirroring `tv-arm --print-completions`.
+  Because `--plan`/`--start` are required, the flag is detected on the raw argv
+  before `Args::parse()` so a bare `--print-completions` doesn't trip clap's
+  required-arg validation.
+
+### Breaking / Config
+
+- None. New flag only; `clap_complete` was already a `cli/` dependency.
+
+### Tests
+
+- Verified standalone (no required args), exit 0, `#compdef replay-candles`,
+  and that required-arg enforcement is unaffected on a normal run.
+
+## v43 — 2026-06-20 — `replay-candles`: offline candle replay through the engine
+
+### Why
+
+We had no way to take a registered `TradePlan` and ask "what would the engine
+have fired over this window, and would those entries have won or lost?" without
+standing up a live cron trigger. The tax-tracker's `replay` only diffs recorded
+`TickBundle`s; nothing pulled fresh candles for a plan + time range.
+
+The obvious shape — "POST candles into local `wrangler dev` with a mock broker"
+— doesn't fit: the worker has no candle-ingest endpoint (the cron engine *pulls*
+candles each tick), and the order-dispatch path can't run off-wasm (`run_enter`
+builds a `worker::Response` that panics at construction). But the decision core
+(`evaluate_plan`) is pure and native-callable, and `simulate_fill` is the
+broker-free fill model. So the harness drives the pure core natively.
+
+### What changed
+
+- **New native bin `replay-candles`** (in the `cli/` workspace member):
+  load a `TradePlan` JSON, resolve the instrument per-source via
+  `instrument-lookup`, pull the candle window via `candle-cache`
+  (TradeNation — matches the live engine — or OANDA, disk-cached), convert
+  `candle_model::CandleData` → engine `Candle` (mid, UTC, drop volume), then
+  seed-without-firing and feed closed bars through `evaluate_plan` one tick at a
+  time exactly as `run_engine_tick` does. Each fired enter is run through the
+  pure `simulate_fill` over the forward candles to report the fill/SL/TP
+  outcome. No `wrangler dev`, no HTTP, no live orders.
+- **`tv-arm --plan-out <path>`** writes the fully-built `TradePlan` (control
+  rules folded in) as pretty JSON before the register intent consumes it, so the
+  harness can load the exact plan the engine received. Only meaningful with
+  `--register-plan`.
+
+### Breaking
+
+- None. `register_trade_plan` gains a `plan_out: Option<&Path>` parameter
+  (internal to `tv-arm`).
+
+### Config
+
+- New `tv-arm` flag `--plan-out <path>`.
+- New `replay-candles` env: `TN_ACCOUNT_TYPE` (`demo` default / `live`) with
+  `TN_USERNAME`+`TN_PASSWORD` for live; `OANDA_TOKEN`+`OANDA_ACCOUNT_ID` for
+  `--source oanda`.
+
+### Build
+
+- `candle-cache` / `oanda-client` / `candle-model` / `trade-control-engine` are
+  added to `cli/` only. The worker cdylib does not depend on `cli`, so the wasm
+  build is unaffected (candle-cache absent from the worker dep tree; wasm cdylib
+  still builds).
+
+### Tests
+
+- New unit tests: granularity parse/bridge, instrument resolution, candle
+  conversion+timezone, seed/loop wiring, datetime parsing, and a `tv-arm` plan
+  JSON round-trip. End-to-end verified against the TradeNation demo feed.
+
+### Follow-up
+
+- A hand-authored firing-rule fixture to exercise the report's TP/SL counters
+  end-to-end (the firing path is currently covered via the engine's own
+  `evaluate_plan`/`simulate_fill` tests).
+- Multi-granularity / HTF detector windows; a `--source both` divergence mode.
+
+## v42 — 2026-06-19 — `on_too_close: limit` recovery (Step 4 of the too-close fallback)
+
+### Why
+
+The `on_too_close` stop-entry fallback (v17) shipped `skip` and `market` but
+left `action: limit` as a stub that degraded to `skip` with the reason
+`too-close-limit-unimplemented`. `limit` is the R-preserving recovery: when a
+stop trigger has been overtaken by price (`#19-10`), instead of chasing the
+move at market (`market`, which accepts a worse fill within a slippage bound),
+rest a **limit at the original trigger** and wait for a pullback. A limit can't
+fill worse than its price, so the planned R is preserved exactly — at the cost
+of possibly never filling.
+
+### What changed
+
+- **`action: limit` is now implemented.** On a `#19-10` rejection of a stop
+  whose fallback is `limit`, the worker re-places a **single** limit order
+  resting at the original stop trigger (`src/too_close.rs` `TooClosePlan::Limit`
+  + the new arm in `place_entry_too_close_fallback`, `src/lib.rs`). No fresh
+  sizing — the entry reference is unchanged, so the original stop-distance /
+  1%-equity math is reused.
+- **Geometry guard.** A limit must rest on the correct side of the market
+  (long: trigger at/below current price; short: at/above) or it would be a
+  `#19-9` ("limit on the wrong side"). In a genuine `#19-10` the price has
+  overrun the trigger so this holds; a degenerate / non-overrun case is skipped
+  with `too-close-limit-wrong-side` rather than firing a doomed order.
+- **No broker-native GTD needed.** TradeNation order placement is hardcoded
+  GoodTillCancel upstream, but the recovered limit is recorded as an ordinary
+  `EntryAttempt` (the existing success-path `record_placement`), so the cron
+  sweep (`src/cron/sweep.rs`) cancels it on `attempt_expired` (`not_after`) or
+  `bar_expiry_due` (`cancel_at`). The limit inherits the alert window's lifetime
+  for free.
+- **One attempt, not a loop** — identical to `market`. A broker reject returns
+  the original `EntryError::EntryTooCloseToMarket`, so the seen-id is never
+  poisoned and the next signal bar can retry.
+
+### Breaking
+
+None. `OnTooCloseAction::Limit` already existed and parsed; only its runtime
+behaviour changed (was: skip; now: limit re-place). The `TooClosePlan` enum
+gained a `Limit` variant (exhaustive matches in this crate updated).
+
+### Config
+
+No wire-format change. `on_too_close: { action: limit }` was already accepted;
+`max_slippage_pips` is not required or used for `limit`.
+
+### Tests
+
+`src/too_close.rs`: long/short correct-side → `Limit`, long/short wrong-side →
+`Skip { too-close-limit-wrong-side }`, exact-trigger equality rests, non-finite
+price skips (replaced the old `limit_action_skips_until_implemented` test).
+Worker suite green.
+
+### Follow-up
+
+None outstanding for the too-close fallback — all of
+`BUG-entry-too-close-to-market.md`'s suggested steps (1 plumb, 2 wire format,
+3 market, 4 limit) are now shipped.
+
+## v41 — 2026-06-19 — archive terminal plans for post-mortem (`plan list --include-all`)
+
+### Why
+
+When a registered plan reached a terminal phase (a veto fired, or the
+single-shot entry was dispatched) the cron engine deleted both its `plan:` and
+`plan-state:` KV rows on that tick (`src/cron/engine.rs` `persist_plan_state`).
+`plan list` scans the `plan:` prefix, so a vetoed/completed plan vanished — there
+was no way to list it afterward to analyze why it terminated.
+
+### What changed
+
+- **Archive instead of plain delete.** On the terminal cron tick the engine now
+  snapshots the finished plan (plan body + terminal `PlanState`) to a new
+  `archived-plan:{scope}:{trade_id}` KV key *before* clearing the live rows. A
+  failed archive is logged but doesn't fail the tick.
+- **`plan list --include-all`** (alias `--include-archived`) also lists archived
+  plans; plain `plan list` still shows only live plans. New `ARCHIVED` column
+  carries the archive timestamp (blank for live plans).
+- **`plan delete <trade_id>`** now also clears any matching `archived-plan:` row
+  — so a terminated plan (which usually exists *only* in the archive) is
+  deletable after analysis. Still idempotent.
+- **No TTL on archived plans** — they persist until `plan delete`. Documented as
+  a manual-cleanup keyspace.
+
+### Breaking
+
+- `cli::build_plan_list_intent` gained a third `include_archived: bool` argument.
+- `StateStore` gained three methods: `archive_plan`, `list_all_archived_plans`,
+  `clear_archived_plan` (implemented for the KV store and the in-memory test
+  store).
+
+### Config
+
+- New signed top-level `Intent.include_archived: bool` (default false, elided
+  when false → wire form byte-identical for existing `plan-list` intents).
+
+### Tests
+
+- `memstore_archived_plan_round_trips_lists_and_clears` — archive round-trip,
+  scope recovery from the key, terminal-state capture, list, and scoped clear.
+
+### Follow-up
+
+- The `trading-tax-tracker` R2 consumer reads the `req/`/`ticks/` prefixes, not
+  KV — it has no view of archived plans. If post-mortem tooling wants the
+  archive, expose it via a read path there.
+
+## v40 — 2026-06-18 — `tv-arm --update`: re-arm an existing engine plan
+
+### Why
+
+`tv-arm` mints a fresh random `trade_id` every run, so re-arming a setup (move
+the annotations, re-run) registers a *new* plan while the old one keeps ticking
+in KV until its TTL. The operator's manual flow ("delete the TV alerts, re-run")
+had no engine-side equivalent — stale plans accumulated.
+
+### What changed
+
+- **`tv-arm` — `--update [trade-id]` flag** (only with `--register-plan`).
+  Before registering the fresh plan it deletes the prior one from the engine:
+  - bare `--update` auto-resolves by instrument — POSTs `plan-list`, and if
+    exactly one plan is registered for this instrument deletes it; none → no-op;
+    more than one → hard error naming the candidates (re-run with an explicit
+    id).
+  - `--update <trade-id>` deletes exactly that plan.
+  Reuses the `plan-delete` action (clears `plan:` + `plan-state:`). Leaves
+  TradingView alerts untouched — engine-only reconciliation.
+- **`tv-arm` — `post_intent_blocking`** returns the worker's response body (so
+  the `--update` flow can read the `plan-list` YAML); `post_register_blocking`
+  is now a thin wrapper over it.
+
+### Tests
+
+- `tv-arm`: `resolve_update_target` — explicit id verbatim; auto single-match;
+  auto no-match no-op; auto multi-match hard error (names candidates); bare
+  `--update` (`""`/whitespace) treated as auto. tv-arm 158 green; clippy + fmt.
+
+### Follow-up
+
+- The actual POSTs (`plan-list` / `plan-delete`) are network-bound and aren't
+  unit-tested in `update_existing_plan`; the pure `resolve_update_target` is.
+  End-to-end is exercised on the staging worker during re-arm.
+
+## v39 — 2026-06-18 — Calendar / news bars folded into the registered plan
+
+### Why
+
+`tv-arm --register-plan` produced a server-side `TradePlan` with **no**
+pause/resume/news-start/news-end rules, while `--create-alerts` correctly
+created those calendar bars as TV alerts. So a registered plan silently dropped
+every blackout / news window — the engine never paused entries around a CPI
+print, never opened the news-window gate. Root cause: `register_trade_plan` ran
+at pipeline step 5b, *before* the pause/news/calendar bundles were built (steps
+6–8), and `build_trade_plan` only walked `built_trade.alerts` (veto/prep/enter/
+close). Two further gaps compounded it: the engine had no evaluation path for
+control rules, and the cron dispatcher rejected their actions.
+
+### What changed
+
+- **`engine` — non-terminal control rules.** New `evaluate_controls` pass in
+  `evaluate_plan` (runs before the guards) fires Pause/Resume/NewsStart/NewsEnd
+  rules on their `TimeReached` trigger, dispatches the carried intent, and
+  latches — but, unlike a guard, never sets `Phase::Done`, so the trade's spine
+  keeps running. Armed in every phase (a window can open before break-and-close).
+  New `is_control_rule` helper.
+- **`worker` cron — dispatch the control fires.** `dispatch_action`
+  (`src/cron/engine.rs`) routes the four control actions to the same
+  `handle_pause` / `handle_resume` / `handle_news_start` / `handle_news_end` the
+  webhook uses (KV-only, no broker), replacing the previous
+  `unsupported-action` rejection. Shadow plans still log-only (the `tick_one`
+  shadow path returns before dispatch).
+- **`tv-arm` — fold the bundles in.** `register_trade_plan` moved to *after* the
+  pause/news/calendar bundles are built, and new `append_control_rules`
+  (`trade_plan_build.rs`) appends one `TimeReached` `ConditionRule` per bundle
+  alert — carrying that alert's signed intent verbatim, anchored to the window's
+  start/end edge. Covers the operator's chart-drawn pairs (`BuiltPause`/
+  `BuiltNews`) and the auto-fetched forex-factory events. The dead
+  `roles.*_pairs.first()` arms in `trigger_for` are removed (they only ever saw
+  one pair, and these basenames never appear in `built_trade.alerts`).
+- **`cli` — surface the built bundles.** `run_calendar_bars` now returns
+  `Vec<BuiltCalendarBundle>` (the in-memory `BuiltPause`/`BuiltNews` it already
+  builds), so the register path reuses them rather than re-parsing the signed
+  YAML.
+
+### Breaking
+
+- `cli::run_calendar_bars` returns `Result<Vec<BuiltCalendarBundle>>` (was
+  `Result<()>`). The standalone `calendar-bars` bin ignores it.
+- `tv-arm::register_trade_plan` gains pause/news/calendar bundle params
+  (internal).
+
+### Tests
+
+- `engine`: pause fires at its epoch without ending the spine (enter heartbeat
+  still fires the same bar); pause+resume fire on their own bars and don't
+  refire; two news windows → all four fires.
+- `tv-arm`: `append_control_rules` over one chart pause + one news + one
+  calendar event yields 8 control rules with the right actions and window-edge
+  epochs.
+- Full workspace green (engine 35, worker 200, cli 239+13, tv-arm 153); clippy
+  native + wasm32 + fmt clean.
+
+### Follow-up
+
+- The engine-side control dispatch is wasm-bound (`Env` / `worker::Response`),
+  so it has no native unit test — verified by the worker compiling and the demo
+  parallel run (the Stage F gate), same as the rest of the cron dispatch path.
+
+## v38 — 2026-06-18 — Trim no-op engine ticks from the R2 `ticks/` recording
+
+### Why
+
+The cron engine recorded a full `TickBundle` on **every** tick that saw a new
+closed bar — even when that tick changed nothing (no intent fired, no phase
+transition, plan not done, KV write OK). Those "no-op" bundles aren't compact:
+each re-stores the whole `plan: TradePlan`, both the `prior` and `new` `PlanState`s,
+*and* the wide `detector_window` slice. Over a long-running pattern with a quiet
+entry phase (e.g. an H&S waiting for break-and-close), that's one fat,
+near-duplicate object per bar carrying no information. This stops recording them
+while keeping a lightweight trace so a silent gap in the `ticks/` stream is never
+mistaken for "the cron stopped".
+
+### What changed
+
+- **New pure predicate `PlanEval::is_noteworthy(&prior)`** (`core/src/plan_eval.rs`):
+  a tick is noteworthy if it `fired` anything, finished the plan (`done`), or the
+  FSM's *meaningful* state advanced vs the prior.
+- **New helper `PlanState::advanced_vs(&prior)`** (`core/src/plan_state.rs`):
+  compares only the FSM-meaningful fields — `phase`, `fired`, `break_close_at`,
+  `retest_seen_at`, `mw`. It deliberately **ignores** `watermark`, `expires_at`,
+  and `last_close`, all of which churn on essentially every tick (a whole-struct
+  `!=` would make nothing a no-op).
+- **Live + shadow record sites gated** (`src/cron/engine.rs`): both now call
+  `record_tick_to_r2` only when `eval.is_noteworthy(&prior)`; otherwise they emit
+  a single heartbeat `rlog!` and skip the write. The **put-failed** site is
+  unchanged — a failed transition (`success:false`) is always recorded.
+
+### Behaviour (visible)
+
+- **Recording volume drops**: no-op ticks no longer produce R2 objects. The
+  `ticks/` prefix now holds only ticks where something fired / finished /
+  advanced, plus failed-KV-transition bundles. Each no-op leaves a heartbeat log
+  line (visible in Cloudflare Real-time Logs) instead.
+- **No change** to what a noteworthy bundle contains, to dispatch, or to state
+  persistence — KV is written every tick as before; only the *recording* is
+  trimmed. Replay is unaffected: each recorded bundle is self-contained
+  (carries its own `prior_state`), and the next noteworthy bundle reloads the
+  up-to-date `last_close` from KV.
+
+### Config
+
+- None.
+
+### Tests
+
+- `core`: `advanced_vs` unit tests — identical state, watermark-only,
+  expires_at-only, and `last_close`-only changes are all **not** advances;
+  phase / fire-latch / break_close / retest stamps **are**.
+- `engine`: `is_noteworthy` against real `evaluate_plan` output — fired,
+  finished, and phase-advance are noteworthy; the **critical**
+  `not_noteworthy_on_watermark_only_advance` proves a new-bar-but-nothing-moved
+  tick is a no-op (and that a full-struct compare *would* wrongly call it
+  changed).
+
+### Follow-up
+
+- The `tick_bundle_noop_trim_idea` memory is now implemented; the heartbeat-log
+  half of that idea ships here too.
+
+## v37 — 2026-06-18 — Retire the `trade-control replay` subcommand (replay moves to `trade-analyzer`)
+
+### Why
+
+Replay's single home is now the `trade-analyzer` CLI (in the
+`trading-tax-tracker` repo) — that's the downstream R2-recording consumer, so
+replay sits next to the bundle/timeline tooling and gained an `--from-r2` fetch
+there (its v42). `trade-control` shipped a `replay` subcommand in v33 as the
+first landing spot; keeping a second copy here just risks the two drifting.
+This removes the duplicate. `trade-control` keeps what it *uniquely* owns: the
+worker that **writes** tick-bundles, and the `TickBundle` / `evaluate_plan` /
+`simulate_fill` library types that `trade-analyzer` consumes as path-deps.
+
+### What changed
+
+- **Removed `trade-control replay`** — deleted `cli/src/replay.rs`, its
+  `mod replay;` + `pub use replay::{…}` re-export from `cli/src/lib.rs`, and the
+  `Replay(ReplayArgs)` command variant + `Cmd::Replay` dispatch arm in
+  `cli/src/bin/trade_control.rs`.
+- **Dropped the `trade-control-engine` dependency from the `cli` crate** — it
+  was pulled in only for `simulate_fill`/`evaluate_plan` in the replay path.
+  The `engine` crate itself is unchanged; `trade-analyzer` depends on it
+  directly.
+
+### Breaking
+
+- `trade-control replay` no longer exists. Use `trade-analyzer replay` (same
+  bundle format; adds `--from-r2 <key>`).
+
+### Config
+
+- None.
+
+### Tests
+
+- No behaviour code changed; the migrated replay tests live in `trade-analyzer`.
+  Workspace tests / clippy `-D warnings` / fmt / wasm worker build remain green.
+
+### Follow-up
+
+- The candle-cache → ReplayBroker historical walk and multi-tick replay land in
+  `trade-analyzer`, not here.
+
+## v36 — 2026-06-18 — Detector window reaches back to the earliest trendline anchor
+
+### Why
+
+The v34/v35 `bar_seconds` fallback fired whenever a trendline anchor fell
+outside the engine's fetched candle window — and for a non-Pine plan (pure
+M/W or trendline-only H&S preps) the window was just the watermark-bounded
+`fresh` slice, so **any** anchor older than the last cron gap was out-of-window
+and resolved by the wall-clock divisor. v35 made that path observable; this
+removes the cause. The real fix is to fetch enough history that anchors are
+always in-window, making the bar-index count exact and the fallback dead code
+for a normally-armed plan.
+
+### What changed
+
+- **worker — widen `detector_window_for`.** The window start is now the
+  earliest `since` any consumer needs, fetched once: the existing
+  `PinePattern` lookback (`min_lookback_bars` behind the freshest candle) **and**
+  the earliest `TrendlineCross` anchor across all the plan's rules (minus one
+  bar of slack so the anchor's own bar is in-window). Split into two pure
+  helpers — `pine_lookback_since` and `trendline_anchor_since` (the latter over
+  a free `earliest_trendline_anchor_epoch(triggers)` so it unit-tests without
+  building `Intent`s). A plan with neither a Pine entry nor a trendline (a pure
+  M/W heartbeat) keeps the no-extra-fetch `fresh`-only fast path.
+
+### Breaking
+
+- None. Behaviour change only: trendline plans now fetch a wider back-window
+  (one extra broker candle call covering history to the earliest anchor),
+  removing the out-of-window fallback for normally-armed plans. The v35 warning
+  surface stays as the belt-and-braces signal for a pathological anchor.
+
+### Tests
+
+- `earliest_trendline_anchor_epoch`: min across multiple trendline rules;
+  `None` for a no-trendline plan; reversed (b < a) endpoints pick the true min.
+
+### Follow-up
+
+- The `bar_seconds` field + fallback divisor are now exercised only by a
+  pathological anchor older than the fetch reaches. Could be retired entirely if
+  the warning never appears on a live plan over a meaningful window — left in as
+  a safety net for now.
+
+## v35 — 2026-06-18 — Trendline `bar_seconds` fallback is now observable, not silent
+
+### Why
+
+v34 made trendline crosses interpolate in bar-index space, with a `bar_seconds`
+wall-clock divisor *only* as a fallback for an anchor that falls outside the
+fetched candle window. That fallback was correct but **silent**, and it has two
+sharp edges worth surfacing: (1) it re-introduces wall-clock spacing across any
+closed session in the *un-fetched* span (the exact assumption the bar-index work
+removed), and (2) on a plan signed before the `bar_seconds` field existed
+(`bar_seconds = 0`) an out-of-window anchor makes the trendline silently
+**un-evaluable** — it just never fires, with no trace. Both are rare (a normal
+H&S/M/W `detector_window` straddles its anchors) but a silent degraded path is
+exactly the kind of thing that costs a debugging session later.
+
+### What changed
+
+- **`engine` — pure warning surface.** New `trendline_anchor_warnings(plan,
+  window)` classifies each `TrendlineCross` anchor against the window
+  (in-window / extrapolated / unresolvable) and returns human-readable
+  diagnostics. `evaluate_plan` attaches them to the new `PlanEval.warnings`
+  field. Pure and window-derived, so it recomputes deterministically on replay.
+- **`core` — `PlanEval.warnings: Vec<String>`.** `#[serde(default,
+  skip_serializing_if = "Vec::is_empty")]` — old tick bundles still deserialise,
+  and a clean tick adds nothing to the recorded JSON.
+- **worker — log them.** `run_engine_tick` (`src/cron/engine.rs`) `rlog!`s each
+  warning (`cron engine: plan <id> trendline …`) so the degraded path shows up
+  in Cloudflare Real-time Logs instead of being invisible. Logged for both live
+  and shadow plans, before dispatch.
+
+### Breaking
+
+- None. `PlanEval` gains a defaulted field; the replay diff still compares only
+  `fired` / `new_state` / `done` (warnings recompute from the same recorded
+  inputs, so they are deliberately *not* diffed).
+
+### Tests
+
+- `engine`: in-window anchors warn-free; an out-of-window anchor warns about the
+  `bar_seconds` extrapolation; `bar_seconds = 0` warns "unresolvable / won't
+  fire"; both-anchors-out warns twice; a non-trendline (M/W) plan never warns;
+  end-to-end `evaluate_plan` surfaces the warning on `PlanEval.warnings`.
+
+### Follow-up
+
+- The real fix for a warning in the logs is to **widen the candle fetch** in
+  `detector_window_for` so anchors are always in-window — which would make the
+  `bar_seconds` fallback (and these warnings) dead code. Deferred until the logs
+  show it actually happening on a live plan.
+## v34 — 2026-06-18 — Trendline crosses evaluated in bar-index space, not wall-clock
+
+### Why
+
+The engine interpolated a neckline's price between its two anchors by **elapsed
+wall-clock seconds**, so the line kept sloping through nights, weekends and
+exchange closures. TradingView's x-axis is *ordinal* — closed sessions aren't
+plotted, so a trendline advances one step **per traded bar**, not per second.
+For any gapped instrument (everything but 24/5 FX, and even FX gaps at the
+weekend) the engine resolved the `03-prep-break-and-close` / `04-prep-retest`
+level at the wrong price. Confirmed on live TradeNation data: ALPHABET's hourly
+feed shows only the ~7 cash-session bars per day, eliding the 18 h overnight gap
+and the 66 h weekend gap to single bar steps — exactly what TV draws and exactly
+what wall-clock interpolation got wrong.
+
+### What changed
+
+- **`engine` — bar-index interpolation.** `line_price_at` now measures a
+  candle's position along the line as a fraction of *bars* between the anchors,
+  counting the bars actually present in the broker feed (`detector_window`;
+  gaps are absent). New `bar_index_at` resolves an epoch → (fractional) bar
+  index: exact bar match, interpolation across a one-bar data hole, or
+  `bar_seconds`-based extrapolation when an anchor sits outside the fetched
+  window. `eval_trigger` (+ `fire_rule` / `stamp_retest` / the spine
+  evaluators) gains a `window: &[Candle]` param, ignored by every non-trendline
+  trigger.
+- **`core` — signed `bar_seconds`.** `Trigger::TrendlineCross` gains
+  `bar_seconds: i64` (`#[serde(default)]` → `0` = "pure bar-count, no fallback"
+  on plans signed before this field). It rides the existing whole-body HMAC, so
+  it can't be tampered.
+- **`tv-arm` — bake it.** `trendline_trigger` stamps `granularity.seconds()`
+  onto each trendline (threaded through `build_trade_plan` → `build_rule` →
+  `trigger_for`).
+
+### Breaking
+
+- `eval_trigger` signature gains a trailing `window: &[Candle]` (engine-internal;
+  no external callers).
+- `Trigger::TrendlineCross` gains a `bar_seconds` field (additive, defaulted).
+
+### Tests
+
+- `engine`: `trendline_gap_uses_bar_index_not_wall_clock` (the bug — a 23 h gap
+  between bar 1 and bar 2 must NOT slide the line; the level at bar 1 is the
+  bar-index half-way, not the wall-clock ~4 %), `trendline_interpolates_level_at_bar_index`,
+  reworked `trendline_respects_extend_forward_false` onto a real bar window.
+- `core`: `trendline_missing_bar_seconds_defaults_to_zero`.
+- `tv-arm`: existing H&S plan test now asserts `bar_seconds: 3600` baked from
+  the H1 chart.
+- Full workspace green; clippy + fmt + wasm32 clean.
+
+### Follow-up
+
+- The `bar_seconds` fallback only triggers when an anchor predates the engine's
+  fetched candle window; in practice `detector_window` reaches back far enough
+  that the exact-bar-count path is used. If a long-lookback neckline ever needs
+  the engine to fetch deeper history, that's a candle-fetch widening, not a
+  geometry change.
+
+## v33 — 2026-06-17 — Engine tick-bundles: record cron ticks to R2 + native replay
+
+### Why
+
+After the rearchitecture the cron engine — not an inbound TradingView alert — is
+where every trading decision happens (it loads each registered `TradePlan`,
+pulls fresh candles, runs the pure `evaluate_plan`, dispatches the fired
+intents). But the tick recorded **nothing**, so there was no way to replay a
+real engine decision offline. This collapses the bug-fix loop from a week on
+demo to a second in CI: fix a bug, replay the tick that showed it, watch the
+outcome change.
+
+### What changed
+
+- **`TickBundle`** (`core/src/tick_bundle.rs`) — a self-contained,
+  serde-round-trippable record of one `(tick, plan)`: the full `evaluate_plan`
+  input tuple (`plan`, prior `PlanState`, `new_candles`, detector window,
+  `now`/`expires_at`) + golden `PlanEval` output + per-fire `DispatchOutcome`s +
+  the plan-state `KvTickTransition` (before/after/success/error).
+- **Recording** — the cron tick now writes a bundle per evaluated plan to R2
+  under a new **`ticks/<date>/<tick_ts>-<trade_id>.json`** prefix (sibling to
+  `req/`, same `TRADE_CONTROL_R2` bucket), fire-and-forget via `ctx.wait_until`,
+  fail-soft on every axis (`src/tick_recording.rs`). Both shadow and live ticks.
+- **`trade-control replay <bundle.json>`** — re-runs the same `evaluate_plan` and
+  diffs `fired`/`new_state`/`done` against the recorded `eval`; non-zero exit on
+  mismatch (CI gate). `--simulate` additionally resolves each fired enter and
+  walks the candle path through a dumb broker-simulator
+  (`engine/src/simulator.rs`), reporting filled / stopped-out / took-profit /
+  never-filled.
+
+### Breaking
+
+- `FiredIntent` / `PlanEval` definitions moved from `trade-control-engine` to
+  `trade_control_core::plan_eval` (re-exported from `engine`, so `evaluate_plan`'s
+  signature is unchanged). `Candle`, `LatchedSignal`, `FiredIntent`, `PlanEval`
+  gained `Serialize`/`Deserialize`.
+- `run_engine_tick` / `tick_one` now take the cron `ScheduleContext` (was dropped
+  as `_ctx`).
+
+### Config
+
+- New R2 prefix `ticks/`; no new bindings (reuses `TRADE_CONTROL_R2`).
+- `trade-control-core` gains a `test-support` feature exposing `MemStateStore`
+  (pulls `serde_json` + `chrono/clock`); off by default, never in the wasm build.
+
+### Tests
+
+- `TickBundle` JSON round-trip + `r2_key` layout (core).
+- `replay`: faithful bundle → MATCH, tampered → MISMATCH (cli).
+- Broker-simulator fill/exit paths: TP, SL, never-filled, filled-open, ambiguous
+  → pessimistic-stop (engine).
+
+### Follow-up
+
+- Replaying the recorded `dispatch_outcomes` through the real `run_enter` /
+  `run_close` handlers needs the deferred `worker::Response` → `{status,message}`
+  decouple (those handlers live in the worker cdylib and panic off-wasm). The
+  pure-evaluation diff + price-path simulation are the phase-1 workhorse.
+- Wiring the downstream `trading-tax-tracker` to read `ticks/` as a sibling to
+  its `req/`-based `bundle` command.
+- Multi-tick replay (glob a trade's whole `ticks/` prefix in sequence) for the
+  full fill story across ticks.
+
+## v32 — 2026-06-17 — `trade-control plan list` / `plan show` (inspect registered engine plans)
+
+### Why
+
+There was no way to see what the server-side engine is evaluating. During the
+engine's parallel-run period (shadow mode, v31) the operator needs to confirm a
+plan actually registered, whether it's in shadow or live mode, and how far its
+FSM has progressed — without grepping Cloudflare logs.
+
+### What changed
+
+- Two new read-only control actions: **`plan-list`** (every registered plan +
+  a compact summary of its `PlanState`) and **`plan-show`** (one plan dumped in
+  full — every rule + its persisted state, target named by `trade_id`, scanned
+  across all account scopes). KV-only, idempotent, signed like `status`.
+- Worker handlers `handle_plan_list` / `handle_plan_show` (`src/lib.rs`) reuse
+  the existing `list_all_trade_plans` + `get_plan_state` store methods. New
+  `PlanSummary` / `PlanDetail` view structs.
+- CLI **`trade-control plan list`** (aligned table) and **`trade-control plan
+  show <trade_id>`** (per-match header + YAML), each with **`--yaml`** for the
+  raw worker response. Builders `build_plan_list_intent` /
+  `build_plan_show_intent` (`cli/src/control.rs`).
+
+### Config
+
+- New CLI subcommand group `trade-control plan {list,show}`. No new secrets.
+
+### Tests
+
+- CLI: `plan_list_table_aligns_and_fills_missing`, `plan_list_empty_is_friendly`,
+  `plan_show_labels_each_match` (pure formatting). Core/worker exhaustiveness +
+  build covers the new `Action` variants.
+
+### Note
+
+- Also folded in the pending `cli/src/lib.rs` rustfmt diff left over from the
+  market-info merge (the re-export block this change already edits).
+
+## v31 — 2026-06-17 — Engine shadow mode (observe-only plans for the safe parallel run)
+
+### Why
+
+The server-side engine dispatches a registered plan's fired intents through the
+*same* `run_enter` / `run_close` / veto handlers the webhook uses. So a live
+(non-shadow) registered plan would place **real broker orders in parallel with
+the live TradingView alerts** — double-firing every setup. But the Stage F
+promotion gate is to *diff* the engine's decisions against the live alerts on
+demo, not to trade the setup twice. There was no safe way to run the two side
+by side; shadow mode is it.
+
+### What changed
+
+- New signed field **`TradePlan.shadow: bool`** (`core/src/trade_plan.rs`,
+  `#[serde(default)]` → live for plans registered before the field existed).
+  It rides the existing whole-body HMAC, so a plan's shadow/live status is
+  fixed at arm time and can't be flipped in flight.
+- The cron engine (`src/cron/engine.rs`) honours it: a shadow plan is evaluated
+  and its `PlanState` advanced **identically** to a live plan (same candles,
+  same FSM, same watermark), but each fired intent is logged as a
+  `cron engine SHADOW would-fire:` line instead of being dispatched — no broker
+  order, no seen-id mark.
+- `tv-arm` gains **`--shadow`** (`tv-arm/src/args.rs`), threaded through
+  `register_trade_plan` → `build_trade_plan` so `--register-plan --shadow`
+  registers an observe-only plan. The arm-time `info!` log now reports
+  `shadow=…`.
+
+### Breaking
+
+- `tv_arm::trade_plan_build::build_trade_plan` gains a trailing `shadow: bool`
+  parameter. Internal to this repo; the only caller is the tv-arm pipeline.
+
+### Config
+
+- New CLI flag `tv-arm --shadow` (default off → live). Only meaningful with
+  `--register-plan`.
+
+### Tests
+
+- `core`: `shadow_flag_round_trips`, `missing_shadow_defaults_to_live`.
+- `tv-arm`: `shadow_flag_carried_onto_plan`, plus the existing builder tests
+  assert the default build is live.
+
+### Follow-up
+
+- Run a demo setup with `--register-plan --shadow` beside the live TV alerts
+  and diff the `SHADOW would-fire` log lines against the alerts' actual
+  placements — the empirical Stage F gate. This also produces the recorded-fire
+  dataset the H&S historical-replay parity follow-up needs.
+
+## v30 — 2026-06-17 — H&S Pine candle detector ported to Rust (server-side `PinePattern`, Stage E)
+
+### Why
+
+The H&S `05-enter` was the last condition still evaluated on TradingView's
+servers: it fired on the paid "Long/Short Pattern" alertconditions of the
+`candle-signals-v2.pine` detector. To evaluate H&S entries in the server-side
+engine (and drop the runtime TV dependency for H&S, like M/W already has), the
+detector is ported to Rust.
+
+### What changed
+
+- New `core/src/signals/` module — a faithful port of `candle-signals-v2.pine`:
+  per-candle metrics, Wilder ATR with the timeframe-dependent length, the five
+  pattern detectors (pinbar / tweezer / double-tweezer / regular- &
+  floating-engulfer) with the Pine priority order and signal geometry, and the
+  pending→valid→invalid state machine (confirmation latch, opposing-signal
+  invalidation with golden-protect, recent_high/low lookback). The public seam
+  is `latched_signal_at(window, as_of, cfg) -> LatchedSignal`.
+- The engine's `evaluate_plan` gains a `detector_window`; `Trigger::PinePattern`
+  is now evaluated (was a Stage-D stub) over that window, gated by direction +
+  optional pattern kind. A fired H&S enter carries the latched signal geometry
+  onto its shell via the new `Shell::from_candle_and_signal`, so it resolves
+  entry/SL/TP against the *pattern* extremes (the bug-010 `SignalHigh`/
+  `SignalLow` anchors) exactly as the TV alert's `{{plot(...)}}` substitutions
+  did.
+- `src/cron/engine.rs` fetches a wider detector back-window for Pine plans.
+
+### Behaviour
+
+The engine now evaluates **both** M/W and H&S server-side, in parallel with the
+TV alerts (no change to existing trades), on the `*/15` tick — until proven on
+demo (Stage F retires the alerts).
+
+### Intentional divergence (bug #10B)
+
+The port confirms a signal only on a **fully-closed** pushing bar (the engine
+never sees an unclosed bar), fixing the Pine one-bar-early confirm timing (the
+ADIDAS 5:30-vs-5:45 case). The historical-replay parity check will show this
+diff against recorded Pine fires.
+
+### Tests
+
+- `core/src/signals/` — metrics, ATR, each detector, the state machine
+  (confirm / breach-unconfirm / late-push / recent-extremes).
+- `engine/src/evaluate.rs` — Pine entry fires with geometry, wrong-direction
+  block, kind filter, retest gate.
+- `core/src/intent.rs` — `from_candle_and_signal` folds geometry; the
+  `SignalHigh`/`SignalLow` anchors resolve to the pattern extremes.
+- core 498 / engine 28 / worker 199 green; clippy + fmt + wasm32 clean.
+
+### Follow-up
+
+Historical-replay parity: replay candle history through the Rust detector and
+diff fires + geometry against recorded Pine fires. Needs the recorded-fire
+dataset assembled first.
+
+## v29 — 2026-06-17 — H&S/IHS enter anchors entry+SL to signal_high/signal_low (bug #10 finding A)
+
+### Why
+
+An H&S `enter` fires twice — once on the break candle (`signal_confirmed: 0`)
+and once on the confirmed re-fire (`signal_confirmed: 1`). A confirmed re-fire
+is meant to be the *same trade* — same pattern-invalidation stop — just
+confirmed a candle later. Instead it silently became a *different,
+tighter-stopped* trade: the worker anchored both entry and SL to the
+**triggering candle's own high/low**, so the narrower confirmed candle handed a
+tighter, drifted stop. Surfaced by `hs-adidas-b70c1d31` (ADIDAS short,
+2026-06-16): designed entry 174.0 / SL 175.62 (stop 1.62) became entry 173.30 /
+SL 174.30 (stop 1.00) ≈ the confirmed candle's own low/high — even though
+`signal_high 175.61` / `signal_low 173.99` were identical on both fires. The
+re-substituted trade would have stopped out near-instantly had it filled, and
+it corrupts attribution (recorder's SL ≠ broker's SL).
+
+### What changed (behaviour)
+
+- New `PriceAnchor::SignalHigh` / `PriceAnchor::SignalLow` variants resolve to
+  the shell's latched `signal_high` / `signal_low` (with the same graceful
+  `unwrap_or(high/low)` fallback as the `recent_*` anchors).
+- The H&S / IHS enter builders now anchor entry **and** SL to those signal
+  extremes instead of the candle wick: H&S short = entry `signal_low`, SL
+  `signal_high`; IHS long = entry `signal_high`, SL `signal_low`. The
+  break-candle fire and the confirmed re-fire now resolve to identical
+  geometry.
+- `sl_anchor` override now also accepts `signal_high` (short) / `signal_low`
+  (long).
+
+### Breaking
+
+None. Additive enum variant — existing intents using `from: high`/`low`/etc.
+still resolve exactly as before.
+
+### Tests
+
+- `core`: `anchor_price` unit tests for `SignalHigh`/`SignalLow` (present +
+  fallback + YAML round-trip); a resolution regression
+  (`hs_short_signal_anchored_enter_resolves_identically_across_refires`) using
+  the real adidas numbers, asserting entry+SL are identical across the
+  break-candle and confirmed-candle shells.
+- `cli`: H&S/IHS builder geometry tests updated to assert the signal anchors.
+
+### Follow-up
+
+Finding B of bug #10 (Pine emitted `signal_confirmed: 1` one candle too early)
+is a separate Pine-source fix, not in this change.
+
+## v28 — 2026-06-16 — expired/too-early intents return 200 declined, not 400 (bug #9)
+
+### Why
+
+A well-formed, correctly-signed intent that arrives after its `not_after`
+(expired) or before its `not_before` (too early) is the *expected*
+end-of-life outcome for any scheduled TradingView alert that keeps firing
+past its intent's lifetime. The worker mapped **all seven** `IncomingError`
+variants to a single `400 "rejected"`, so a routine stale fire read as an
+HTTP 400 bad request — indistinguishable from a genuinely malformed/forged
+request (bad YAML, bad HMAC sig, unsupported version, malformed `trade_id`).
+This polluted the `trading-tax-tracker` timeline/verdict and masked real
+bad-body / forgery defects in the 4xx noise. Surfaced by `m-aud-usd-007dfa5e`
+on 2026-06-16. Same status-code-conflation defect as bug #7 (v27), here at
+the `parse_and_verify` gate rather than the `resolve` gate.
+
+### What changed (behaviour)
+
+- **New `IncomingError::disposition()`** → `IncomingDisposition`
+  (`DeclinedExpired` / `DeclinedTooEarly` / `Rejected`), a pure
+  (KV-free, clock-free) classifier. `Expired`/`TooEarly` are benign 200
+  declines; **every** other variant — including `StaleShellTime` (a >24h-old
+  plaintext `time` smells of replay) — stays a 400 reject.
+- The `parse_and_verify` match site in `src/lib.rs` now matches on
+  `err.disposition()`: `Expired` → `200 "declined: intent-expired"`,
+  `TooEarly` → `200 "declined: intent-too-early"` (logged at info via
+  `rlog!`), all others → unchanged `400 "rejected"` (`rlog_err!`).
+
+### Breaking
+
+None. New public `IncomingDisposition` enum + `IncomingError::disposition()`
+method; existing variants and `Display` unchanged.
+
+### Tests
+
+- `disposition_splits_time_window_from_bad_request` — `Expired`/`TooEarly`
+  classify as their declined dispositions; the five bad-request variants
+  classify as `Rejected`.
+- `disposition_stale_shell_time_is_rejected_not_benign` — `StaleShellTime`
+  is explicitly **not** folded in with the benign declines.
+
+### Follow-up
+
+Not yet deployed to staging — bakes on `main` first per the
+develop-on-main / let-it-bake-on-staging split.
+
+## v27 — 2026-06-15 — M/W not-armed-yet declines are 200, not 400 (bug #7)
+
+### Why
+
+Every M/W `enter` bar that isn't yet a valid arming bar was declined with
+`ResolveError::InvalidGeometry`, and the worker mapped **all** resolve errors
+to a single `400 rejected: resolve-failed`. So a routine "decline this bar,
+stay armed for the next" — the *most common* M/W enter outcome — read as an
+HTTP 400 bad request, indistinguishable from a genuinely malformed enter
+(wrong-side SL, entry outside SL..TP, sub-1R, bad script). This polluted the
+`trading-tax-tracker` timeline/verdict and masked real geometry bugs in the
+noise of routine declines. Surfaced by `m-japan-225-ccabdfb7` on 2026-06-15.
+
+### What changed (behaviour)
+
+- **New `ResolveError::NotArmedYet`** variant. The three M/W arming gates in
+  `from_mw_intent` (right-tower confirmation, middle-of-the-M cross, breakout
+  stop on the correct side of the close) now return `NotArmedYet` instead of
+  `InvalidGeometry`.
+- **Worker maps it to a benign `200 declined: mw-not-armed`** (distinct
+  `outcome` string), while genuinely malformed enters keep `400
+  rejected: resolve-failed`. The decline is still a seen-id no-op, so the
+  setup stays armed for the next bar exactly as before — only the wire status
+  and outcome string change.
+
+### Breaking
+
+None. `InvalidGeometry` retains its bad-request meaning for the standard
+(non-M/W) wrong-side SL/limit/stop cases. No wire-format or signed-field
+change.
+
+### Tests
+
+- `core`: the nine M/W gate-decline tests now assert `NotArmedYet`; added
+  `all_three_arming_gates_return_not_armed_yet` pinning all three gates to the
+  new variant (bug #7).
+- The standard-path wrong-side tests still assert `InvalidGeometry`,
+  preserving the distinction at the `lib.rs` match site.
+
+### Follow-up
+
+Pairs with bug #8 (`trading-tax-tracker` timeline drops the `mw-abort`
+veto-set event) — the timeline side consumes this 200/400 split to stop
+labelling routine declines as bad requests.
+
 ## v26 — 2026-06-15 — M/W overshoot veto (180% of top→neckline)
 
 ### Why

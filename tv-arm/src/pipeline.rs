@@ -1,9 +1,15 @@
 //! End-to-end orchestration: read TV chart → classify drawings →
-//! build trade + pause + news + calendar bundles → create alerts.
+//! build trade + pause + news + calendar bundles → register the
+//! signed `TradePlan` with the worker's server-side engine.
 //!
 //! Port of `tv_arm_hs.py::main()` (lines ~1548–2006). The library
 //! calls into `trade-control-cli` directly rather than shelling out
 //! to the binary (faster startup + structured errors).
+//!
+//! The legacy path (POST a signed alert bundle to TradingView via
+//! tv-mcp, let TV fire the alerts at the webhook) has been retired:
+//! the server-side cron engine is the sole producer now, so arming is
+//! `--register-plan` (one signed plan the `*/15` cron evaluates).
 //!
 //! Two-pass flow for blackout/news/calendar bars:
 //!
@@ -21,20 +27,21 @@ use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, TimeZone, Utc};
 use color_eyre::eyre::{Context, Result, eyre};
-use tracing::{error, info, warn};
+use tracing::{info, warn};
 use trade_control_cli as cli;
 use trade_control_conventions::{Broker, Direction, split_symbol};
 use trade_control_core::sig::KEY_LEN;
 
-use crate::alert_spec::{AlertPayload, CalendarWindow, DispatchContext, build_alert_spec};
 use crate::args::Args;
-use crate::create_alerts::create_alerts;
-use crate::geometry::tp_price_from_fib;
-use crate::manifest::{CalendarBundle, discover_calendar_bundles};
+use crate::args::PositionEntry;
+use crate::geometry::{horizontal_price, pcl_exhausted_price_from_fib, tp_price_from_fib};
+use crate::instrument_resolution::ResolvedInstrument;
 use crate::mw_geometry;
-use crate::post_outcome::{Outcome, classify as classify_outcome};
+use crate::position_trade::{core_direction, resolve_levels};
+use crate::register_post::{post_intent_blocking, post_register_blocking};
 use crate::roles::{Roles, classify};
 use crate::timeframe::infer_calendar_timeframe;
+use crate::trade_plan_build::{append_control_rules, build_trade_plan, resolution_to_granularity};
 use trading_view::drawings::Drawing;
 use trading_view::mcp::TvMcp;
 
@@ -113,6 +120,31 @@ pub fn run(args: Args) -> Result<i32> {
         }
     }
 
+    let key = read_key()?;
+    let account = resolve_account(&args, broker);
+    let out_dir = arm_out_dir(&raw_sym)?;
+    let now = Utc::now();
+
+    // 2c. Position-tool direct entry. When one of --market-entry /
+    //     --stop-entry / --limit-entry is set, ignore the pattern
+    //     machinery entirely: read the drawn long/short position tool,
+    //     convert its tick-distance SL/TP to absolute prices, and POST a
+    //     signed enter straight to the worker (placed on receipt). This
+    //     short-circuits the whole pattern flow below.
+    if let Some(mode) = args.position_entry_mode() {
+        return run_position_entry(
+            &args,
+            mode,
+            broker,
+            &roles,
+            &resolved,
+            &instrument,
+            &account,
+            &key,
+            now,
+        );
+    }
+
     // 3. Validate required drawings + resolve direction + build the
     //    trade spec. M/W (a path drawing is present) and H&S diverge
     //    completely here: M/W has no invalidation / TP-fib / prep
@@ -120,10 +152,6 @@ pub fn run(args: Args) -> Result<i32> {
     //    and the worker computes entry/SL/TP from baked params. The
     //    `?`-returning resolver hard-errors on a bad setup; a clean
     //    operator-facing rejection returns Ok(1).
-    let key = read_key()?;
-    let account = resolve_account(&args, broker);
-    let out_dir = arm_out_dir(&raw_sym)?;
-    let now = Utc::now();
     let resolved_spec = if roles.mw_path.is_some() {
         // Pip size for the baked MwSpec comes from the canonical
         // instrument-lookup catalog (`asset.pip_size`), overridable via
@@ -167,7 +195,18 @@ pub fn run(args: Args) -> Result<i32> {
         blackout_pairs = roles.blackout_pairs.len(),
         "trade spec built",
     );
-    let built_trade = cli::build_trade_from_spec(trade_spec, now).wrap_err("build trade bundle")?;
+    // `--plan-out` without `--register-plan` is an offline build (no worker
+    // POST) — typically replaying / inspecting a historical setup, where an
+    // already-elapsed trade_expiry (or in-window news) is expected. Relax the
+    // time-sensitive checks to warnings so the JSON still gets written; any
+    // path that actually arms the worker (`--register-plan`) stays strict.
+    let strictness = if args.register_plan {
+        cli::BuildStrictness::Strict
+    } else {
+        cli::BuildStrictness::Lenient
+    };
+    let built_trade =
+        cli::build_trade_from_spec(trade_spec, now, strictness).wrap_err("build trade bundle")?;
     let trade_id = built_trade.trade_id.clone();
     cli::write_trade(&built_trade, &key, &out_dir).wrap_err("write trade bundle")?;
     info!(
@@ -205,7 +244,7 @@ pub fn run(args: Args) -> Result<i32> {
     //    or if --skip-calendar-bars was passed). When auto-draw ran,
     //    the operator now has blackout-/news-pairs on the chart, so
     //    we skip the cli's calendar-bars step to avoid double-arming.
-    let calendar_bundles = if should_auto_draw || args.skip_calendar_bars {
+    let built_calendar = if should_auto_draw || args.skip_calendar_bars {
         Vec::new()
     } else {
         discover_or_fetch_calendar_bundles(
@@ -221,68 +260,46 @@ pub fn run(args: Args) -> Result<i32> {
         )?
     };
 
-    // 9. Bail out before POSTing if --create-alerts wasn't set.
-    if !args.create_alerts {
-        info!("--create-alerts not set; signed bundle on disk, no TV POSTs");
-        return Ok(0);
+    // 8b. (--register-plan) Fold the whole trade — main alert conditions PLUS
+    //     the pause/news/calendar control bars built above — into ONE signed
+    //     TradePlan and register it with the worker's server-side engine. This
+    //     is now the *only* way a trade is armed (the legacy TV-alert POST path
+    //     was retired once the engine became the sole producer). A failed
+    //     register is a hard error, but the signed bundle is already on disk.
+    // `--plan-out` alone builds the plan and writes the JSON without touching
+    // the worker; `--register-plan` additionally POSTs it. Run the block for
+    // either so `--plan-out` is no longer a silent no-op on its own.
+    if args.register_plan || args.plan_out.is_some() {
+        // 8a. (--update) Re-arm: delete the prior plan for this instrument before
+        //     registering the fresh one, so the old plan stops ticking and the
+        //     new one starts with clean engine state. No-op when --update absent.
+        //     Only meaningful when actually registering.
+        if args.register_plan
+            && let Some(update_target) = args.update.as_deref()
+        {
+            update_existing_plan(update_target, &built_trade.instrument, &key, now)?;
+        }
+        register_trade_plan(
+            &built_trade,
+            direction,
+            &roles,
+            &state.resolution,
+            &pause_bundles,
+            &news_bundles,
+            &built_calendar,
+            &key,
+            now,
+            args.shadow,
+            args.plan_out.as_deref(),
+            args.register_plan,
+        )?;
     }
 
-    // 10. Build payloads + POST.
-    let payloads = build_all_payloads(
-        &built_trade,
-        &out_dir,
-        direction,
-        &roles,
-        &pause_bundles,
-        &news_bundles,
-        &calendar_bundles,
-        &trade_id,
-    )?;
-    if payloads.is_empty() {
-        info!("no payloads to POST");
-        return Ok(0);
-    }
-    let results = create_alerts(&payloads, mcp.root()).wrap_err("create alerts via tv-mcp")?;
-    let mut failures = 0usize;
-    for r in &results {
-        let outcome = classify_outcome(r);
-        let body_head = r
-            .body
-            .as_deref()
-            .unwrap_or("")
-            .chars()
-            .take(400)
-            .collect::<String>();
-        match &outcome {
-            Outcome::Ok => {
-                info!(name = ?r.name, status = ?r.status, body = %body_head, "alert POSTed");
-            }
-            Outcome::TvError { errmsg, err_code } => {
-                failures += 1;
-                error!(
-                    name = ?r.name,
-                    status = ?r.status,
-                    errmsg = errmsg.as_deref().unwrap_or(""),
-                    err_code = err_code.as_deref().unwrap_or(""),
-                    body = %body_head,
-                    debug = ?r.debug,
-                    "alert REJECTED by TradingView",
-                );
-            }
-            Outcome::TransportError(err) => {
-                failures += 1;
-                error!(name = ?r.name, error = %err, "alert FAILED before POST");
-            }
-            Outcome::NoSignal => {
-                failures += 1;
-                warn!(name = ?r.name, "alert returned with no status or error");
-            }
-        }
-    }
-    if failures > 0 {
-        error!(failures, total = results.len(), "some alerts did not arm");
-        return Ok(1);
-    }
+    // The TradingView-alert creation path (build payloads → POST via tv-mcp) was
+    // retired once the server-side cron engine became the sole producer. Arming a
+    // trade is now: build + sign the bundle to disk (above) and register it as a
+    // `TradePlan` with the worker (step 8b, gated on `--register-plan`).
+    info!(trade_id = %trade_id, "signed bundle on disk; arm via --register-plan");
     Ok(0)
 }
 
@@ -454,11 +471,24 @@ fn resolve_hs_trade(
         .as_ref()
         .ok_or_else(|| eyre!("missing tp_fib (already checked by check_required)"))?;
     let tp = tp_price_from_fib(&tp_fib.prices(), direction);
+    // Continuous at-entry level vetos (Bug #12): the pcl-exhausted (`too-low`)
+    // and invalidation (`too-high`) levels, baked onto the enter so the worker
+    // rejects an entry already past either — independent of the cross-guard.
+    let entry_level_vetos = hs_entry_level_vetos(roles, direction);
     let expiry = read_trade_expiry(roles)?;
     // --pip-size overrides the canonical catalog value when set.
     let pip_size = args.pip_size.unwrap_or(catalog_pip);
     let spec = build_trade_spec(
-        args, instrument, account, broker, direction, expiry, tp, roles, pip_size,
+        args,
+        instrument,
+        account,
+        broker,
+        direction,
+        expiry,
+        tp,
+        roles,
+        pip_size,
+        entry_level_vetos,
     );
     Ok((direction, spec))
 }
@@ -508,10 +538,10 @@ fn check_mw_required(roles: &Roles) -> std::result::Result<(), ResolveError> {
         .mw_path
         .as_ref()
         .ok_or_else(|| eyre!("resolve_mw_trade called without an mw_path"))?;
-    if path.points.len() != 3 {
+    if !matches!(path.points.len(), 3 | 4) {
         return Err(ResolveError::Reject(format!(
-            "M/W path must have exactly 3 anchors [A runup-start, B first-point, C neckline]; \
-             found {}",
+            "M/W path must have 3 anchors [A runup-start, B first-point, C neckline] or 4 \
+             [+ D right-shoulder]; found {}",
             path.points.len()
         )));
     }
@@ -545,6 +575,8 @@ fn resolve_mw_trade_with_spread(
     let runup_start = path.points[0].price;
     let first_point = path.points[1].price;
     let neckline = path.points[2].price;
+    // Optional 4th anchor: the drawn right shoulder (arms immediately).
+    let right_shoulder = path.points.get(3).map(|p| p.price);
 
     let direction = mw_geometry::mw_direction_from_anchors(runup_start, first_point)
         .ok_or_else(|| ResolveError::Reject(mw_flat_first_leg_msg(runup_start, first_point)))?;
@@ -557,6 +589,20 @@ fn resolve_mw_trade_with_spread(
     if let Err(msg) = gate_neckline_pct(pct, args.allow_50_pct_m_trades) {
         return Err(ResolveError::Reject(msg));
     }
+    // 4-point path: reject a drawing whose right shoulder is on the wrong
+    // side of the neckline or breaks the 1.3 alignment of the shorter
+    // shoulder. Drawing-level validity, so it fails arm here rather than
+    // silently baking a bad geometry.
+    if let Some(rs) = right_shoulder
+        && let Err(e) = mw_geometry::validate_right_shoulder(first_point, neckline, rs)
+    {
+        return Err(ResolveError::Reject(format!("{e}\n")));
+    }
+
+    // The SL-vs-spread floor (hard limit) is enforced at build time in the
+    // shared `cli::build_mw_pattern` chokepoint that this resolve feeds into,
+    // and again at fire time in the worker against the live spread. Not
+    // duplicated here — see `cli/src/trade_patterns.rs::build_mw_pattern`.
 
     let expiry = read_trade_expiry(roles)?;
     let pattern = match direction {
@@ -567,6 +613,7 @@ fn resolve_mw_trade_with_spread(
         direction = direction.as_str(),
         pattern = ?pattern,
         runup_start, first_point, neckline,
+        right_shoulder = ?right_shoulder,
         retrace_pct = %format!("{:.1}%", pct * 100.0),
         spread_pips,
         pip_size,
@@ -583,6 +630,7 @@ fn resolve_mw_trade_with_spread(
             runup_start,
             first_point,
             neckline,
+            right_shoulder,
             spread_pips,
             pip_size,
         },
@@ -621,6 +669,8 @@ struct MwSpecAnchors {
     runup_start: f64,
     first_point: f64,
     neckline: f64,
+    /// `D` — the optional drawn right shoulder (4-point path).
+    right_shoulder: Option<f64>,
     spread_pips: f64,
     pip_size: f64,
 }
@@ -693,12 +743,15 @@ fn build_mw_trade_spec(
         // the M/W build path. Set to the neckline as a harmless,
         // non-zero placeholder so any accidental serialization is sane.
         tp_price: round5(anchors.neckline),
+        // M/W anchors SL via the worker-computed geometry, not an
+        // absolute drawn stop.
+        sl_price: None,
         entry_deadline_pct: 80,
         allow_entry: args.entry_filter_script.clone(),
         // M/W entry is always a stop order at the worker-computed level;
         // --entry-market is an H&S flag and is ignored here.
         entry_mode: cli::EntryMode::Stop,
-        needs_golden: args.require_golden,
+        needs_golden: !args.skip_golden,
         needs_confirmed: args.require_confirmation,
         // No close-on-reversal for M/W (TP is a hard 1R), so news/SR
         // close coverage is not wired.
@@ -711,12 +764,17 @@ fn build_mw_trade_spec(
             neckline: anchors.neckline,
             first_point: anchors.first_point,
             runup_start: anchors.runup_start,
+            right_shoulder: anchors.right_shoulder,
             spread_pips: anchors.spread_pips,
             pip_size: anchors.pip_size,
         }),
         // Mirror the M/W pip onto the top-level field (the cli M/W builder
         // also does this); keeps the worker's sizing tail on the baked pip.
         pip_size: Some(anchors.pip_size),
+        blackout_close: args.blackout_close.into_core(),
+        // M/W has no fib / invalidation drawing — its abort/cancel/overshoot
+        // vetos cover the level guards, so no continuous entry-level vetos.
+        entry_level_vetos: Vec::new(),
     }
 }
 
@@ -868,6 +926,7 @@ fn build_trade_spec(
     tp: f64,
     roles: &Roles,
     pip_size: f64,
+    entry_level_vetos: Vec<trade_control_core::intent::EntryLevelVeto>,
 ) -> cli::TradeSpec {
     use cli::TradePattern;
     let pattern = match direction {
@@ -890,13 +949,15 @@ fn build_trade_spec(
         risk_pct: args.risk_pct.unwrap_or(1.0),
         risk_amount: args.risk_amount,
         dry_run: args.broker_dry_run,
-        max_retries: args.max_retries.unwrap_or(0),
+        max_retries: args.max_retries.unwrap_or(5),
         expiry_bars: args.expiry_bars,
         skip_preps,
         entry_offset_pips: None,
         sl_offset_pips: None,
         sl_anchor: None,
         tp_price: round5(tp),
+        // H&S anchors SL to the pattern extreme, not an absolute price.
+        sl_price: None,
         entry_deadline_pct: 80,
         allow_entry: args.entry_filter_script.clone(),
         entry_mode: if args.entry_market {
@@ -904,7 +965,7 @@ fn build_trade_spec(
         } else {
             cli::EntryMode::Stop
         },
-        needs_golden: args.require_golden,
+        needs_golden: !args.skip_golden,
         needs_confirmed: args.require_confirmation,
         close_on_news: !roles.news_pairs.is_empty(),
         sr_reversal_ranges: build_sr_ranges(roles, args.reversal_band_pct),
@@ -919,6 +980,8 @@ fn build_trade_spec(
         // Baked from instrument-lookup (or --pip-size) so the worker scales
         // the entry/SL offset_pips with the right pip, not its forex default.
         pip_size: Some(pip_size),
+        blackout_close: args.blackout_close.into_core(),
+        entry_level_vetos,
     };
     if args.sl_from_recent {
         spec.sl_anchor = Some(match direction {
@@ -927,6 +990,64 @@ fn build_trade_spec(
         });
     }
     spec
+}
+
+/// The continuous at-entry level vetos for an H&S/IH&S setup (Bug #12).
+///
+/// Two levels, mirroring the `intent.vetos` name-list the enter already
+/// carries:
+/// - **pcl-exhausted** — `midpoint + 0.8 × (TP − midpoint)` from the fib;
+///   the move is mostly done, a late entry's R:R no longer justifies opening.
+///   For a short the entry is "past" when **at or below** it (`Below`); a long
+///   mirrors (`Above`). Named `too-low` (short) / `too-high` (long).
+/// - **invalidation** — the operator's horizontal at the right shoulder; the
+///   thesis is dead once price runs back past it. For a short "past" is **at
+///   or above** (`Above`); a long mirrors (`Below`). Named `too-high` (short)
+///   / `too-low` (long).
+///
+/// A level that comes back `NaN` (drawing absent or malformed) is skipped so a
+/// missing fib / invalidation can't bake a poison level. Direction picks both
+/// the name and the side.
+fn hs_entry_level_vetos(
+    roles: &Roles,
+    direction: Direction,
+) -> Vec<trade_control_core::intent::EntryLevelVeto> {
+    use trade_control_core::intent::{EntryLevelVeto, VetoSide};
+    let mut out = Vec::new();
+
+    // pcl-exhausted (the "ran most of the way to TP" gate).
+    if let Some(fib) = roles.tp_fib.as_ref() {
+        let level = pcl_exhausted_price_from_fib(&fib.prices(), direction);
+        if level.is_finite() {
+            let (name, past) = match direction {
+                Direction::Short => ("too-low", VetoSide::Below),
+                Direction::Long => ("too-high", VetoSide::Above),
+            };
+            out.push(EntryLevelVeto {
+                name: name.into(),
+                level,
+                past,
+            });
+        }
+    }
+
+    // invalidation (the right-shoulder horizontal; thesis dead past it).
+    if let Some(inv) = roles.invalidation.as_ref() {
+        let level = horizontal_price(&inv.prices());
+        if level.is_finite() {
+            let (name, past) = match direction {
+                Direction::Short => ("too-high", VetoSide::Above),
+                Direction::Long => ("too-low", VetoSide::Below),
+            };
+            out.push(EntryLevelVeto {
+                name: name.into(),
+                level,
+                past,
+            });
+        }
+    }
+
+    out
 }
 
 fn broker_to_kind(b: Broker) -> cli::BrokerKind {
@@ -1068,6 +1189,103 @@ fn build_news_bundles(
     Ok(bundles)
 }
 
+/// Position-tool direct entry. Read the drawn long/short position tool,
+/// convert its tick-distance SL/TP to absolute prices via the catalog
+/// `tick_size`, build + sign a naked enter, and POST it straight to the
+/// worker (placed on receipt). Returns the process exit code: `1` for a
+/// clean operator-facing rejection (no position drawn, stop/limit not
+/// supported yet), propagated `Err` for a real failure.
+#[allow(clippy::too_many_arguments)]
+fn run_position_entry(
+    args: &Args,
+    mode: PositionEntry,
+    broker: Broker,
+    roles: &Roles,
+    resolved: &ResolvedInstrument,
+    instrument: &str,
+    account: &str,
+    key: &[u8; KEY_LEN],
+    now: DateTime<Utc>,
+) -> Result<i32> {
+    let Some(pos) = roles.position.as_ref() else {
+        eprintln!(
+            "ERROR: --{}-entry was set but no long/short position tool is drawn on the chart.",
+            match mode {
+                PositionEntry::Market => "market",
+                PositionEntry::Stop => "stop",
+                PositionEntry::Limit => "limit",
+            }
+        );
+        return Ok(1);
+    };
+
+    // Tick-distance SL/TP → absolute prices. tick_size is the catalog
+    // value (NOT pip_size — see position_trade docs).
+    let levels = resolve_levels(pos, resolved.asset.tick_size)?;
+
+    // Expiry: a drawn trade-expiry line wins; otherwise now + flag hours.
+    let trade_expiry = match read_trade_expiry(roles) {
+        Ok(t) => t,
+        Err(_) => now + chrono::Duration::hours(i64::from(args.expiry_hours)),
+    };
+
+    let kind = match mode {
+        PositionEntry::Market => cli::PositionEntryKind::Market,
+        PositionEntry::Stop => cli::PositionEntryKind::Stop,
+        PositionEntry::Limit => cli::PositionEntryKind::Limit,
+    };
+    let direction = core_direction(pos.direction);
+
+    info!(
+        instrument,
+        direction = ?direction,
+        mode = ?mode,
+        entry = levels.entry,
+        stop_loss = levels.stop_loss,
+        take_profit = levels.take_profit,
+        tick_size = resolved.asset.tick_size,
+        trade_expiry = %trade_expiry.to_rfc3339(),
+        "position-tool direct entry"
+    );
+
+    let spec = cli::PositionEnterSpec {
+        instrument: instrument.to_string(),
+        account: account.to_string(),
+        broker: broker_to_kind(broker),
+        direction,
+        kind,
+        entry_price: levels.entry,
+        stop_loss: levels.stop_loss,
+        take_profit: levels.take_profit,
+        trade_expiry,
+        risk_amount: args.risk_amount,
+        pip_size: args.pip_size.or(Some(resolved.asset.pip_size)),
+        dry_run: args.broker_dry_run,
+    };
+
+    let (trade_id, signed_body) = match cli::build_position_enter(&spec, key, now) {
+        Ok(v) => v,
+        // Build/validation failure (bad geometry, sign error) — clean rejection.
+        Err(e) => {
+            eprintln!("ERROR: {e}");
+            return Ok(1);
+        }
+    };
+
+    // Persist the signed body for audit (same place pattern bundles land).
+    let out_dir = arm_out_dir(instrument)?;
+    let body_path = out_dir.join(format!("{trade_id}-enter.yaml"));
+    fs::write(&body_path, &signed_body)
+        .with_context(|| format!("writing {}", body_path.display()))?;
+
+    // The whole point of the position path: POST straight to the worker,
+    // which places the order on receipt.
+    let resp = post_intent_blocking(signed_body).wrap_err("POST position enter to worker")?;
+    info!(trade_id = %trade_id, worker_response = %resp.trim(), "position enter POSTed");
+    println!("entered: trade_id={trade_id} — {}", resp.trim());
+    Ok(0)
+}
+
 /// Parse the trade-expiry timestamp from the classified drawings.
 /// Used both as the hard expiry for the trade bundle and (when known
 /// pre-auto-draw) as the lookahead horizon for calendar bars so the
@@ -1198,6 +1416,10 @@ fn draw_pair_lines(
 }
 
 /// Run the calendar-bars CLI and discover the resulting bundles.
+///
+/// Returns the in-memory [`cli::BuiltCalendarBundle`]s (carrying the signed
+/// pause/news intents + window times, so `--register-plan` can fold the same
+/// control actions into the `TradePlan` without re-parsing the YAML).
 #[allow(clippy::too_many_arguments)]
 fn discover_or_fetch_calendar_bundles(
     args: &Args,
@@ -1209,7 +1431,7 @@ fn discover_or_fetch_calendar_bundles(
     out_dir: &Path,
     key: &[u8; KEY_LEN],
     now: DateTime<Utc>,
-) -> Result<Vec<CalendarBundle>> {
+) -> Result<Vec<cli::BuiltCalendarBundle>> {
     if args.skip_calendar_bars {
         return Ok(Vec::new());
     }
@@ -1235,116 +1457,193 @@ fn discover_or_fetch_calendar_bundles(
         output_dir: Some(out_dir.join("calendar-bars").join(trade_id)),
         dry_run: false,
     };
-    if let Err(e) = cli::run_calendar_bars(cb_args, *key, now) {
-        warn!(error = ?e, "calendar-bars failed; continuing without it");
-        return Ok(Vec::new());
-    }
-    let bundles = discover_calendar_bundles(out_dir, trade_id)?;
-    info!(count = bundles.len(), "calendar bundles discovered");
-    Ok(bundles)
+    let built = match cli::run_calendar_bars(cb_args, *key, now) {
+        Ok(b) => b,
+        Err(e) => {
+            warn!(error = ?e, "calendar-bars failed; continuing without it");
+            return Ok(Vec::new());
+        }
+    };
+    info!(count = built.len(), "calendar bundles built");
+    Ok(built)
 }
 
-/// Walk every alert in every bundle and build the payload list.
+/// One registered plan as seen in the `plan-list` response — only the two
+/// fields `--update` needs to resolve a target. Other fields are ignored.
+#[derive(serde::Deserialize)]
+struct PlanListEntry {
+    trade_id: String,
+    instrument: String,
+}
+
+/// Decide which trade_id `--update` should delete.
+///
+/// - An explicit, non-empty `target` is used verbatim (delete exactly that).
+/// - An empty `target` (bare `--update`) auto-resolves by instrument: exactly
+///   one registered plan on `instrument` → delete it; none → `Ok(None)`
+///   (nothing to clear, proceed); more than one → a hard error naming the
+///   candidates so the operator re-runs with an explicit id.
+///
+/// Pure (takes the parsed plan list), so the resolution rules are unit-tested
+/// without the worker.
+fn resolve_update_target(
+    target: &str,
+    instrument: &str,
+    plans: &[PlanListEntry],
+) -> Result<Option<String>> {
+    let target = target.trim();
+    if !target.is_empty() {
+        return Ok(Some(target.to_string()));
+    }
+    let matches: Vec<&str> = plans
+        .iter()
+        .filter(|p| p.instrument == instrument)
+        .map(|p| p.trade_id.as_str())
+        .collect();
+    match matches.as_slice() {
+        [] => Ok(None),
+        [only] => Ok(Some((*only).to_string())),
+        many => Err(eyre!(
+            "--update: {} plans registered for {instrument} ({}); \
+             pass the trade_id explicitly: --update <trade-id>",
+            many.len(),
+            many.join(", "),
+        )),
+    }
+}
+
+/// Re-arm support for `--register-plan`: resolve the prior plan for this
+/// instrument (or the explicit `--update <id>`) and delete it from the engine
+/// before the fresh register. Queries `plan-list`, applies
+/// [`resolve_update_target`], then POSTs a signed `plan-delete` (which clears
+/// both the `plan:` and `plan-state:` KV rows). A no-target resolution is a
+/// logged no-op. Hard-errors on an ambiguous auto-resolve or a worker rejection
+/// — better to stop than to leave a stale plan ticking beside the new one.
+fn update_existing_plan(
+    target: &str,
+    instrument: &str,
+    key: &[u8; KEY_LEN],
+    now: DateTime<Utc>,
+) -> Result<()> {
+    // Query the registered plans so an auto-resolve can count them per
+    // instrument. Live plans only (`include_archived: false`) — a terminated
+    // plan in the archive must not count against the per-instrument tally.
+    let list_intent = cli::build_plan_list_intent(now, &register_suffix(now), false);
+    let list_body = cli::wrap_signed(&list_intent, key, now).wrap_err("sign plan-list intent")?;
+    let yaml = post_intent_blocking(list_body).wrap_err("query plan-list for --update")?;
+    let plans: Vec<PlanListEntry> =
+        serde_yaml::from_str(&yaml).wrap_err("parse plan-list response")?;
+
+    let Some(trade_id) = resolve_update_target(target, instrument, &plans)? else {
+        info!(instrument = %instrument, "--update: no existing plan for this instrument; nothing to delete");
+        return Ok(());
+    };
+
+    let del_intent = cli::build_plan_delete_intent(&trade_id, now, &register_suffix(now));
+    let del_body = cli::wrap_signed(&del_intent, key, now).wrap_err("sign plan-delete intent")?;
+    info!(trade_id = %trade_id, instrument = %instrument, "--update: deleting prior registered plan");
+    post_intent_blocking(del_body).wrap_err("delete prior plan for --update")?;
+    info!(trade_id = %trade_id, "--update: prior plan deleted");
+    Ok(())
+}
+
+/// Fold the built trade into one signed `register` `TradePlan` and (when
+/// `register` is true) POST it to the worker's server-side engine.
+///
+/// When `register` is false (`--plan-out` without `--register-plan`) the plan is
+/// still built and, if `plan_out` is set, written to disk — but no worker POST
+/// happens. This is the offline "just give me the JSON for replay" path.
+///
+/// The plan re-expresses every alert's condition as an engine [`Trigger`] (via
+/// [`build_trade_plan`], the inverse of `alert_spec`) and carries each alert's
+/// embedded intent verbatim. The pause/news/calendar **control bars** built
+/// upstream are folded in too — one `TimeReached` rule per bundle alert (see
+/// [`append_control_rules`]) — so the registered plan opens/closes the same
+/// blackout + news windows the legacy TV-alert path used to POST. It's
+/// signed with the same key + whole-body HMAC as the control intents (the plan
+/// rides `trade_plan` as single-line flow JSON, so it's fully signed) and
+/// POSTed directly to the baked webhook.
+///
+/// Hard-errors on an unsupported chart resolution or a worker rejection — but
+/// the signed alert bundle is already on disk by the time this runs, so the
+/// trade isn't lost on a register failure.
 #[allow(clippy::too_many_arguments)]
-fn build_all_payloads(
+fn register_trade_plan(
     built_trade: &cli::BuiltTrade,
-    out_dir: &Path,
     direction: Direction,
     roles: &Roles,
+    resolution: &str,
     pause_bundles: &[PauseBundle],
     news_bundles: &[NewsBundle],
-    calendar_bundles: &[CalendarBundle],
-    trade_id: &str,
-) -> Result<Vec<AlertPayload>> {
+    built_calendar: &[cli::BuiltCalendarBundle],
+    key: &[u8; KEY_LEN],
+    now: DateTime<Utc>,
+    shadow: bool,
+    plan_out: Option<&Path>,
+    register: bool,
+) -> Result<()> {
     use cli::TradePattern;
-    // M/W enters bind to the per-bar "Every Bar Close" alertcondition
-    // instead of the direction's pattern plot. The flag only affects the
-    // `05-enter` payload; the auxiliary pause/news/calendar bundles never
-    // carry an enter, so threading the same value through them is a no-op.
     let is_mw = matches!(built_trade.spec.pattern, TradePattern::M | TradePattern::W);
-    let mut payloads = Vec::new();
-    // 1. Main trade alerts.
-    for alert in &built_trade.alerts {
-        let file = format!("{}.yaml", alert.basename);
-        let ctx = DispatchContext::default();
-        if let Some(mut p) = build_alert_spec(&file, direction, roles, &ctx, is_mw)? {
-            stamp_payload(&mut p, trade_id, &file, out_dir)?;
-            payloads.push(p);
-        }
+    let granularity = resolution_to_granularity(resolution).ok_or_else(|| {
+        eyre!(
+            "chart resolution {resolution:?} has no engine granularity; \
+             cannot register a server-side plan (supported: 1/5/15/60/240/D)"
+        )
+    })?;
+    let mut plan = build_trade_plan(
+        &built_trade.trade_id,
+        &built_trade.instrument,
+        &built_trade.alerts,
+        direction,
+        roles,
+        granularity,
+        is_mw,
+        shadow,
+    );
+    // Unwrap the tv-arm bundle wrappers to the cli `BuiltPause`/`BuiltNews` the
+    // appender reads (each carries the signed intents + window times).
+    let pauses: Vec<&cli::BuiltPause> = pause_bundles.iter().map(|b| &b.built).collect();
+    let newses: Vec<&cli::BuiltNews> = news_bundles.iter().map(|b| &b.built).collect();
+    append_control_rules(&mut plan, &pauses, &newses, built_calendar);
+    let rule_count = plan.rules.len();
+    // Dump the fully-built plan (control rules folded in) for offline replay,
+    // before `build_register_intent` moves it into the register intent.
+    if let Some(path) = plan_out {
+        let json = serde_json::to_string_pretty(&plan).wrap_err("serialise trade plan")?;
+        fs::write(path, json).wrap_err_with(|| format!("write plan to {}", path.display()))?;
+        info!(path = %path.display(), "wrote trade plan JSON");
     }
-
-    // 2. Pause bundles.
-    for bundle in pause_bundles {
-        let ctx = DispatchContext {
-            blackout_pair: Some((&bundle.start, &bundle.end)),
-            ..Default::default()
-        };
-        for alert in &bundle.built.alerts {
-            let file = format!("{}.yaml", alert.basename);
-            if let Some(mut p) = build_alert_spec(&file, direction, roles, &ctx, is_mw)? {
-                stamp_payload(&mut p, trade_id, &file, &bundle.out_dir)?;
-                payloads.push(p);
-            }
-        }
+    // Offline path: `--plan-out` without `--register-plan` stops here — the JSON
+    // is on disk, but we never POST the plan to the worker.
+    if !register {
+        info!(
+            trade_id = %built_trade.trade_id,
+            "plan built (--plan-out only); not registering with worker"
+        );
+        return Ok(());
     }
-    // 3. News bundles.
-    for bundle in news_bundles {
-        let ctx = DispatchContext {
-            news_pair: Some((&bundle.start, &bundle.end)),
-            ..Default::default()
-        };
-        for alert in &bundle.built.alerts {
-            let file = format!("{}.yaml", alert.basename);
-            if let Some(mut p) = build_alert_spec(&file, direction, roles, &ctx, is_mw)? {
-                stamp_payload(&mut p, trade_id, &file, &bundle.out_dir)?;
-                payloads.push(p);
-            }
-        }
-    }
-    // 4. Calendar bundles.
-    for bundle in calendar_bundles {
-        let ctx = DispatchContext {
-            calendar_window: Some(CalendarWindow {
-                start_iso: bundle.start_iso.clone(),
-                end_iso: bundle.end_iso.clone(),
-            }),
-            ..Default::default()
-        };
-        for entry in &bundle.manifest.alerts {
-            if let Some(mut p) = build_alert_spec(&entry.file, direction, roles, &ctx, is_mw)? {
-                stamp_payload(&mut p, trade_id, &entry.file, &bundle.bundle_dir)?;
-                payloads.push(p);
-            }
-        }
-    }
-    Ok(payloads)
+    // Mint a fresh register intent carrying the plan, sign it, POST it.
+    let suffix = register_suffix(now);
+    let intent = cli::build_register_intent(plan, now, &suffix);
+    let body = cli::wrap_signed(&intent, key, now).wrap_err("sign register intent")?;
+    info!(
+        trade_id = %built_trade.trade_id,
+        instrument = %built_trade.instrument,
+        granularity = ?granularity,
+        rules = rule_count,
+        shadow = shadow,
+        "registering server-side trade plan",
+    );
+    post_register_blocking(body).wrap_err("register trade plan with worker")?;
+    info!(trade_id = %built_trade.trade_id, "trade plan registered");
+    Ok(())
 }
 
-/// Stamp the orchestrator-owned fields onto a dispatched payload:
-///
-/// - `tv_name` → `<trade_id>-<role_slug>` so all alerts sort together
-///   in TV's alert list (empty `trade_id` is a no-op).
-/// - `name` → the manifest filename; the JS template echoes it back
-///   in each result so the operator can attribute failures.
-/// - `message` → the full text of the signed YAML on disk, which TV
-///   posts to the webhook when the alert fires. An empty `message`
-///   makes TV reject `create_alert` with `invalid_request`.
-fn stamp_payload(
-    payload: &mut AlertPayload,
-    trade_id: &str,
-    file: &str,
-    out_dir: &Path,
-) -> Result<()> {
-    if !trade_id.is_empty() {
-        let tv_name = payload.tv_name_mut();
-        *tv_name = format!("{trade_id}-{tv_name}");
-    }
-    *payload.name_mut() = file.to_string();
-    let signed_path = out_dir.join(file);
-    let body = fs::read_to_string(&signed_path)
-        .with_context(|| format!("read signed alert body {}", signed_path.display()))?;
-    *payload.message_mut() = body;
-    Ok(())
+/// A short per-call tag for the register intent id so two arms of the same
+/// trade_id in the same second don't collide on the worker's seen-id check.
+/// Derived from the sub-second clock — no rand dependency.
+fn register_suffix(now: DateTime<Utc>) -> String {
+    format!("{:06}", now.timestamp_subsec_micros() % 1_000_000)
 }
 
 fn utc_iso(unix: i64) -> Result<String> {
@@ -1387,7 +1686,10 @@ mod tests {
                 time: unix,
                 price: 1.0,
             }],
-            properties: Properties { text: None },
+            properties: Properties {
+                text: None,
+                ..Default::default()
+            },
         }
     }
 
@@ -1480,6 +1782,14 @@ mod tests {
     // ===== M / W trade-spec resolution ==================================
 
     fn path(id: &str, prices: [f64; 3]) -> Drawing {
+        path_n(id, &prices)
+    }
+
+    fn path4(id: &str, prices: [f64; 4]) -> Drawing {
+        path_n(id, &prices)
+    }
+
+    fn path_n(id: &str, prices: &[f64]) -> Drawing {
         Drawing {
             id: id.to_string(),
             points: prices
@@ -1490,7 +1800,10 @@ mod tests {
                     price: p,
                 })
                 .collect(),
-            properties: Properties { text: None },
+            properties: Properties {
+                text: None,
+                ..Default::default()
+            },
         }
     }
 
@@ -1554,6 +1867,44 @@ mod tests {
     }
 
     #[test]
+    fn resolve_mw_4point_bakes_right_shoulder() {
+        // 4-point M: A=1.1000, B=1.1200, C=1.1120, D=1.1190 (valid: inside
+        // the 1.3 ceiling of the shorter shoulder, same side as B).
+        let roles = mw_roles(path4("p", [1.1000, 1.1200, 1.1120, 1.1190]));
+        let args = mw_args(&["--allow-50-pct-m-trades"]);
+        let (dir, spec) = resolve(&args, &roles, "EUR_USD", Broker::TradeNation, 0.0001)
+            .expect("valid 4-point M resolves");
+        assert_eq!(dir, Direction::Short);
+        let mw = spec.mw.expect("mw baked");
+        assert_eq!(mw.right_shoulder, Some(1.1190));
+    }
+
+    #[test]
+    fn resolve_mw_4point_rejects_misaligned_right_shoulder() {
+        // D=1.1300 breaks the 1.3 alignment (taller shoulder past the
+        // ceiling of the shorter) → the drawing is rejected at arm.
+        let roles = mw_roles(path4("p", [1.1000, 1.1200, 1.1120, 1.1300]));
+        let args = mw_args(&["--allow-50-pct-m-trades"]);
+        match resolve(&args, &roles, "EUR_USD", Broker::TradeNation, 0.0001) {
+            Err(ResolveError::Reject(msg)) => {
+                assert!(msg.contains("1.3 alignment"), "msg = {msg}")
+            }
+            other => panic!("expected Reject, got {:?}", other.map(|_| ())),
+        }
+    }
+
+    #[test]
+    fn resolve_mw_4point_rejects_wrong_side_right_shoulder() {
+        // D=1.1100 sits below the neckline (wrong side for an M) → rejected.
+        let roles = mw_roles(path4("p", [1.1000, 1.1200, 1.1120, 1.1100]));
+        let args = mw_args(&["--allow-50-pct-m-trades"]);
+        match resolve(&args, &roles, "EUR_USD", Broker::TradeNation, 0.0001) {
+            Err(ResolveError::Reject(msg)) => assert!(msg.contains("wrong side"), "msg = {msg}"),
+            other => panic!("expected Reject, got {:?}", other.map(|_| ())),
+        }
+    }
+
+    #[test]
     fn build_trade_spec_bakes_catalog_pip_for_hs() {
         // The H&S spec carries the pip passed to build_trade_spec on its
         // top-level field (the worker scales offset_pips with it). A
@@ -1569,6 +1920,7 @@ mod tests {
             150.0,
             &Roles::default(),
             0.01,
+            Vec::new(),
         );
         assert_eq!(spec.pattern, cli::TradePattern::Hs);
         assert!(spec.mw.is_none());
@@ -1592,8 +1944,59 @@ mod tests {
             1.05,
             &Roles::default(),
             pip_size,
+            Vec::new(),
         );
         assert_eq!(spec.pip_size, Some(0.25));
+    }
+
+    #[test]
+    fn hs_entry_level_vetos_short_sides_and_skips_missing() {
+        // Bug #12: a short H&S with a fib (head 1.1000 → neckline 1.0900) and
+        // an invalidation horizontal at 1.1050 bakes two level vetos:
+        //   too-low  = pcl-exhausted, side Below  (entry past it = too far down)
+        //   too-high = invalidation,  side Above  (entry above the shoulder)
+        use trade_control_core::intent::VetoSide;
+        let mut roles = Roles {
+            // fib: head → neckline (2 prices).
+            tp_fib: Some(path_n("fib", &[1.1000, 1.0900])),
+            // invalidation horizontal (1 price).
+            invalidation: Some(path_n("inv", &[1.1050])),
+            ..Default::default()
+        };
+        let vetos = hs_entry_level_vetos(&roles, Direction::Short);
+        let by = |n: &str| vetos.iter().find(|v| v.name == n).expect("present");
+        // pcl: midpoint 1.0950, tp = 2×1.0900 − 1.1000 = 1.0800,
+        //   level = 1.0950 + 0.8×(1.0800 − 1.0950) = 1.0830.
+        let low = by("too-low");
+        assert_eq!(low.past, VetoSide::Below);
+        assert!((low.level - 1.0830).abs() < 1e-9, "{}", low.level);
+        let high = by("too-high");
+        assert_eq!(high.past, VetoSide::Above);
+        assert!((high.level - 1.1050).abs() < 1e-9);
+
+        // Missing fib → only the invalidation veto is baked (NaN is skipped).
+        roles.tp_fib = None;
+        let vetos = hs_entry_level_vetos(&roles, Direction::Short);
+        assert_eq!(vetos.len(), 1);
+        assert_eq!(vetos[0].name, "too-high");
+    }
+
+    #[test]
+    fn hs_entry_level_vetos_long_mirrors() {
+        // IH&S long: sides flip. pcl named too-high/Above, invalidation
+        // too-low/Below.
+        use trade_control_core::intent::VetoSide;
+        let roles = Roles {
+            tp_fib: Some(path_n("fib", &[1.0900, 1.1000])), // head below neckline (long)
+            invalidation: Some(path_n("inv", &[1.0850])),
+            ..Default::default()
+        };
+        let vetos = hs_entry_level_vetos(&roles, Direction::Long);
+        let pcl = vetos.iter().find(|v| v.name == "too-high").expect("pcl");
+        assert_eq!(pcl.past, VetoSide::Above);
+        let inv = vetos.iter().find(|v| v.name == "too-low").expect("inv");
+        assert_eq!(inv.past, VetoSide::Below);
+        assert!((inv.level - 1.0850).abs() < 1e-9);
     }
 
     #[test]
@@ -1656,17 +2059,34 @@ mod tests {
                         price: 1.12,
                     },
                 ],
-                properties: Properties { text: None },
+                properties: Properties {
+                    text: None,
+                    ..Default::default()
+                },
             }),
             trade_expiry: Some(vline("exp", now().timestamp() + 86_400)),
             ..Default::default()
         };
         match check_mw_required(&roles) {
             Err(ResolveError::Reject(msg)) => {
-                assert!(msg.contains("exactly 3 anchors"), "msg = {msg}")
+                assert!(
+                    msg.contains("3 anchors") && msg.contains("found 2"),
+                    "msg = {msg}"
+                )
             }
             other => panic!("expected Reject, got {:?}", other.map(|_| ())),
         }
+    }
+
+    #[test]
+    fn check_mw_required_accepts_four_anchor_path() {
+        // A 4-anchor path (right shoulder drawn) passes the count guard.
+        let roles = Roles {
+            mw_path: Some(path4("p", [1.1000, 1.1200, 1.1120, 1.1190])),
+            trade_expiry: Some(vline("exp", now().timestamp() + 86_400)),
+            ..Default::default()
+        };
+        assert!(check_mw_required(&roles).is_ok());
     }
 
     #[test]
@@ -1691,5 +2111,63 @@ mod tests {
             Err(ResolveError::Reject(msg)) => assert!(msg.contains("runup leg"), "msg = {msg}"),
             other => panic!("expected Reject, got {:?}", other.map(|_| ())),
         }
+    }
+
+    // ===== --update target resolution =====
+
+    fn plan_entry(trade_id: &str, instrument: &str) -> PlanListEntry {
+        PlanListEntry {
+            trade_id: trade_id.into(),
+            instrument: instrument.into(),
+        }
+    }
+
+    #[test]
+    fn update_explicit_target_used_verbatim() {
+        // An explicit id is deleted regardless of how many plans exist.
+        let plans = [
+            plan_entry("hs-eurusd-aaaa", "EUR_USD"),
+            plan_entry("hs-eurusd-bbbb", "EUR_USD"),
+        ];
+        let got = resolve_update_target("hs-eurusd-bbbb", "EUR_USD", &plans).unwrap();
+        assert_eq!(got.as_deref(), Some("hs-eurusd-bbbb"));
+    }
+
+    #[test]
+    fn update_auto_resolves_single_plan_for_instrument() {
+        let plans = [
+            plan_entry("hs-eurusd-aaaa", "EUR_USD"),
+            plan_entry("hs-gbpusd-cccc", "GBP_USD"),
+        ];
+        let got = resolve_update_target("", "EUR_USD", &plans).unwrap();
+        assert_eq!(got.as_deref(), Some("hs-eurusd-aaaa"));
+    }
+
+    #[test]
+    fn update_auto_no_plan_for_instrument_is_noop() {
+        let plans = [plan_entry("hs-gbpusd-cccc", "GBP_USD")];
+        let got = resolve_update_target("", "EUR_USD", &plans).unwrap();
+        assert!(got.is_none(), "no plan on instrument → nothing to delete");
+    }
+
+    #[test]
+    fn update_auto_multiple_plans_is_hard_error() {
+        let plans = [
+            plan_entry("hs-eurusd-aaaa", "EUR_USD"),
+            plan_entry("mw-eurusd-bbbb", "EUR_USD"),
+        ];
+        let err = resolve_update_target("", "EUR_USD", &plans).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("2 plans"), "msg = {msg}");
+        assert!(msg.contains("hs-eurusd-aaaa"), "names candidates: {msg}");
+        assert!(msg.contains("mw-eurusd-bbbb"), "names candidates: {msg}");
+    }
+
+    #[test]
+    fn update_whitespace_target_is_treated_as_auto() {
+        // clap's default_missing_value for a bare `--update` is "" → auto.
+        let plans = [plan_entry("hs-eurusd-aaaa", "EUR_USD")];
+        let got = resolve_update_target("  ", "EUR_USD", &plans).unwrap();
+        assert_eq!(got.as_deref(), Some("hs-eurusd-aaaa"));
     }
 }

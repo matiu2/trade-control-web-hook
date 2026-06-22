@@ -4,10 +4,12 @@
 //! forex-factory calendar.
 //!
 //! Port of `scripts/tv_arm_hs.py`. The chart-reading + classification
-//! and alert-spec dispatch live here; the signing layer is delegated
-//! to the `trade-control-cli` crate as a library.
+//! live here; the signing layer is delegated to the `trade-control-cli`
+//! crate as a library, and arming registers the signed `TradePlan` with
+//! the worker's server-side engine (the legacy TradingView-alert POST
+//! path has been retired).
 
-// Some library-style helpers (`horizontal_price`, `Manifest::trade_id`,
+// Some library-style helpers (`horizontal_price`,
 // `DrawShapeResult.shape`/`.entity_id`, etc.) aren't consumed by the
 // current pipeline but are public API for downstream tools; suppress
 // the dead-code warnings rather than dropping useful surface.
@@ -19,19 +21,18 @@ use clap::{CommandFactory, Parser};
 use clap_complete::{Shell, generate};
 use color_eyre::eyre::Result;
 
-mod alert_spec;
 mod args;
-mod create_alerts;
 mod geometry;
 mod instrument_recovery;
 mod instrument_resolution;
-mod manifest;
 mod mw_geometry;
 mod pipeline;
-mod post_outcome;
+mod position_trade;
+mod register_post;
 mod roles;
 mod spread;
 mod timeframe;
+mod trade_plan_build;
 
 use crate::args::Args;
 

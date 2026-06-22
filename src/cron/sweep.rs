@@ -14,7 +14,9 @@
 
 use chrono::{DateTime, Utc};
 use trade_control_core::broker::Broker;
-use trade_control_core::intent::{BrokerKind, Direction};
+use trade_control_core::intent::{
+    BlackoutCloseAction, BrokerKind, Direction, NoEntryWindow, is_inside_any,
+};
 use trade_control_core::state::{EntryAttempt, StateStore};
 use worker::Env;
 
@@ -70,6 +72,17 @@ pub fn bar_expiry_due(cancel_at: Option<DateTime<Utc>>, now: DateTime<Utc>) -> b
     cancel_at.is_some_and(|c| c < now)
 }
 
+/// Pure market-hours-blackout predicate: true iff `now` falls inside any of
+/// the instrument's derived no-entry windows. Tiny and pure (delegates to
+/// the core [`is_inside_any`]) so the sweep ordering can be asserted without
+/// a broker/env. Empty `windows` (24h markets / unparseable session text /
+/// not-yet-refreshed) ⇒ `false` — the sweep leaves the order alone, matching
+/// the reject gate's fail-open.
+pub fn market_blackout_due(windows: &[NoEntryWindow], now: DateTime<Utc>) -> bool {
+    let now_min = crate::market_blackout::now_utc_minute_of_day(now);
+    is_inside_any(now_min, windows)
+}
+
 /// Per-attempt sweep. Splits the three reasons to act (expired, SL
 /// breached, otherwise leave alone) and returns an error string so
 /// the caller can log with row context.
@@ -87,6 +100,25 @@ async fn sweep_one(
         // (no current-price fetch needed) but with a distinct reason so
         // it's greppable apart from the alert-window `expired` case.
         cancel_and_delete(env, store, attempt, "bar-expiry").await
+    } else if market_blackout_due(
+        &store
+            .get_blackout_windows(&attempt.instrument)
+            .await
+            .unwrap_or_default(),
+        now,
+    ) {
+        // Market-hours blackout: this order is still resting as the
+        // instrument's daily close→open gap opens. Leaving it to rest is
+        // exactly the incident — it would trigger on the reopen gap. Pull
+        // it now, per the operator's `blackout_close` policy. Runs BEFORE
+        // the SL-breach branch: across a closed session the last-traded
+        // price is stale, so we must not let a stale-price SL check (or its
+        // absence) decide; the closed market itself is the trigger.
+        //
+        // A KV read error fails open (`unwrap_or_default` ⇒ empty ⇒ not
+        // due), matching the reject gate — a transient hiccup must not pull
+        // a legitimate resting order.
+        market_blackout_act(env, store, attempt).await
     } else if let Some(sl) = attempt.stop_loss_price {
         // Only acquire a broker when there's a chance we'll need to
         // call `get_current_price` — i.e. the row carries an SL.
@@ -151,6 +183,59 @@ async fn cancel_and_delete(
     }
     delete_row(store, attempt).await;
     Ok(())
+}
+
+/// Act on a resting order caught inside the market-hours blackout window,
+/// per the row's `blackout_close` policy:
+///
+/// * [`BlackoutCloseAction::CancelResting`] (default, the incident fix) —
+///   cancel the unfilled resting order only. NEVER closes a position: if the
+///   order already filled, the cancel is a no-op on the broker and the filled
+///   position is left untouched (its SL is the only thing that should ever
+///   close it — see the `[[veto_close_only_when_thesis_invalidated]]` rule).
+/// * [`BlackoutCloseAction::CancelAndClose`] — also market-close any open
+///   position on the instrument. Opt-in only; the operator chose this at arm
+///   time because a partly-formed setup carried through a closed session is
+///   not worth the reopen-gap risk.
+///
+/// Either way the row is deleted afterwards so the next sweep doesn't
+/// re-process it. The cancel reason string is distinct (`market-blackout`)
+/// so it's greppable in CF logs apart from `expired` / `bar-expiry` /
+/// `sl-breached`.
+async fn market_blackout_act(
+    env: &Env,
+    store: &KvStateStore,
+    attempt: &EntryAttempt,
+) -> Result<(), String> {
+    match acquire_broker_for_attempt(env, attempt).await {
+        Some(BrokerHandle::Oanda(b)) => blackout_cancel_close(&b, attempt).await,
+        Some(BrokerHandle::TradeNation(b)) => blackout_cancel_close(&b, attempt).await,
+        None => return Err("broker acquisition failed".into()),
+    }
+    delete_row(store, attempt).await;
+    Ok(())
+}
+
+/// Generic-over-broker body for [`market_blackout_act`]. Always cancels the
+/// resting order; additionally closes positions only on `CancelAndClose`.
+async fn blackout_cancel_close<B: Broker>(broker: &B, attempt: &EntryAttempt) {
+    // Always cancel the resting order first.
+    cancel_with_broker(broker, attempt, "market-blackout", f64::NAN).await;
+
+    // CancelAndClose additionally flattens any open position on the
+    // instrument. CancelResting (the default) stops here — it must never
+    // close a position.
+    if matches!(attempt.blackout_close, BlackoutCloseAction::CancelAndClose) {
+        let closed = broker.close_positions(&attempt.instrument).await;
+        rlog!(
+            "cron sweep market-blackout close: account={} trade_id={} attempt_no={} \
+             instrument={} closed_any={closed}",
+            attempt.account.as_deref().unwrap_or("<global>"),
+            attempt.trade_id,
+            attempt.attempt_no,
+            attempt.instrument,
+        );
+    }
 }
 
 /// Wrap `Broker::cancel_order` with a single log line so per-row
@@ -328,5 +413,54 @@ mod tests {
         // sweep must fall through to the SL/expires_at paths untouched.
         let now = ts("2026-05-13T15:00:00Z");
         assert!(!bar_expiry_due(None, now));
+    }
+
+    #[test]
+    fn market_blackout_not_due_when_no_windows() {
+        // 24h markets / unparseable session text / not-yet-refreshed all
+        // surface as an empty window set — the sweep must leave the order
+        // alone (fail-open), matching the reject gate.
+        let now = ts("2026-05-13T15:00:00Z");
+        assert!(!market_blackout_due(&[], now));
+    }
+
+    #[test]
+    fn market_blackout_due_when_now_inside_window() {
+        // Window 14:00–16:00 UTC (840..960 minutes-of-day); 15:00 is inside.
+        let windows = [NoEntryWindow {
+            open_min: 14 * 60,
+            close_min: 16 * 60,
+        }];
+        let now = ts("2026-05-13T15:00:00Z");
+        assert!(market_blackout_due(&windows, now));
+    }
+
+    #[test]
+    fn market_blackout_not_due_when_now_outside_window() {
+        // 15:00 UTC is outside an 18:00–20:00 window.
+        let windows = [NoEntryWindow {
+            open_min: 18 * 60,
+            close_min: 20 * 60,
+        }];
+        let now = ts("2026-05-13T15:00:00Z");
+        assert!(!market_blackout_due(&windows, now));
+    }
+
+    #[test]
+    fn market_blackout_due_matches_any_of_several_windows() {
+        // Several daily gaps (e.g. a maintenance gap + the overnight gap):
+        // due iff inside ANY one of them. 15:00 hits the second.
+        let windows = [
+            NoEntryWindow {
+                open_min: 2 * 60,
+                close_min: 3 * 60,
+            },
+            NoEntryWindow {
+                open_min: 14 * 60,
+                close_min: 16 * 60,
+            },
+        ];
+        let now = ts("2026-05-13T15:00:00Z");
+        assert!(market_blackout_due(&windows, now));
     }
 }

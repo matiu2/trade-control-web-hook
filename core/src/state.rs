@@ -11,7 +11,9 @@ use std::future::Future;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::intent::{Action, Direction};
+use crate::intent::{Action, BlackoutCloseAction, Direction, NoEntryWindow};
+use crate::plan_state::PlanState;
+use crate::trade_plan::TradePlan;
 
 /// One active cooldown row in a [`Snapshot`]. `set_at` records when the
 /// cooldown was put in place so the operator can see how long ago it
@@ -191,6 +193,23 @@ pub struct EntryAttempt {
     /// open question in `src/cron/blackout_apply.rs`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pip_size: Option<f64>,
+    /// What the market-hours blackout sweep should do with this still-pending
+    /// order if it's caught resting inside the instrument's close→open gap.
+    /// Snapshotted from `Intent.blackout_close` at placement so the cron —
+    /// which has no intent in hand — can act on the operator's per-trade
+    /// choice. Defaults to [`BlackoutCloseAction::CancelResting`] (the
+    /// incident fix: cancel the unfilled order, never touch a filled
+    /// position); rows written before this field existed deserialize to the
+    /// same default via `#[serde(default)]`.
+    #[serde(default, skip_serializing_if = "is_default_blackout_close")]
+    pub blackout_close: BlackoutCloseAction,
+}
+
+/// Skip-serializing predicate for [`EntryAttempt::blackout_close`] — mirrors
+/// the same predicate on `Intent::blackout_close` so a default row stays
+/// byte-identical to pre-field rows in KV.
+fn is_default_blackout_close(a: &BlackoutCloseAction) -> bool {
+    matches!(a, BlackoutCloseAction::CancelResting)
 }
 
 impl HasExpiry for EntryAttempt {
@@ -332,6 +351,42 @@ impl HasExpiry for SpreadBlackoutWindow {
     }
 }
 
+/// The stored **market-hours entry blackout** windows for a single instrument.
+///
+/// Per-instrument key `blackout-hours:{instrument}`, written daily by the
+/// market-hours cron (which resolves the broker's current-season session into a
+/// set of UTC [`NoEntryWindow`]s — one per close→open gap) and read by the
+/// `run_enter` reject gate + the cron sweep. Trading hours are an *instrument*
+/// property — the same across every account — so unlike vetos/cooldowns this
+/// key carries **no account scope**.
+///
+/// `windows` is the pure, comparison-ready set (a market can have several daily
+/// gaps); `updated_at` records when the cron last refreshed it (audit /
+/// staleness), and `expires_at` ages an orphaned row out if the cron stops
+/// running. The whole feature is **fail-open**: an absent or TTL-expired row,
+/// or an empty `windows`, means *no blackout*, so the TTL (~26h, longer than a
+/// day) tolerates a single missed cron tick without ever blocking entries on
+/// stale data.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BlackoutHoursEntry {
+    /// Instrument these windows apply to (the broker market name).
+    #[serde(skip_serializing_if = "String::is_empty", default)]
+    pub instrument: String,
+    /// The resolved UTC blackout windows for this instrument — one per
+    /// close→open gap, already merged. Empty means no blackout (fail-open).
+    pub windows: Vec<NoEntryWindow>,
+    /// When the daily cron last refreshed this row.
+    pub updated_at: DateTime<Utc>,
+    /// Safety TTL — ages out an orphaned row if the cron stops refreshing.
+    pub expires_at: DateTime<Utc>,
+}
+
+impl HasExpiry for BlackoutHoursEntry {
+    fn expires_at(&self) -> DateTime<Utc> {
+        self.expires_at
+    }
+}
+
 /// Per-trade-id blackout record. Written when a trade's stops/orders
 /// were actually touched. Sub-plan 4 (System 2) populates `applied = true`,
 /// `pip_size`, and `original_stops` (the widened stops' originals to restore
@@ -415,6 +470,18 @@ pub const ACCOUNT_SCOPE_GLOBAL: &str = "_";
 /// unchanged. Centralised so the encoding lives in one place.
 pub fn account_scope(account: Option<&str>) -> &str {
     account.unwrap_or(ACCOUNT_SCOPE_GLOBAL)
+}
+
+/// Inverse of [`account_scope`]: turn a key's `{scope}` segment back into an
+/// optional account name. The global sentinel maps to `None`; any other
+/// segment is an account name. Used when enumerating plans (whose account is
+/// encoded only in the key) — see [`StateStore::list_all_trade_plans`].
+pub fn account_from_scope(scope: &str) -> Option<String> {
+    if scope == ACCOUNT_SCOPE_GLOBAL {
+        None
+    } else {
+        Some(scope.to_string())
+    }
 }
 
 /// Read-only snapshot of the state store for the `status` action.
@@ -796,6 +863,27 @@ pub trait StateStore {
         &self,
     ) -> impl Future<Output = Result<Option<SpreadBlackoutWindow>, StateError>>;
 
+    /// Write (or overwrite) the **market-hours entry blackout** windows for
+    /// `instrument` (one per close→open gap, already merged). Called once per
+    /// instrument per day by the market-hours cron with a ~26h `ttl_seconds` so
+    /// a single missed tick can't strand a stale window. `now` stamps
+    /// `updated_at`; `expires_at` is `now + ttl`.
+    fn set_blackout_windows(
+        &self,
+        instrument: &str,
+        windows: &[NoEntryWindow],
+        now: DateTime<Utc>,
+        ttl_seconds: u64,
+    ) -> impl Future<Output = Result<(), StateError>>;
+
+    /// Read the market-hours blackout windows for `instrument`. An empty `Vec`
+    /// (key absent, TTL-expired, or no gaps stored) is the **fail-open** case
+    /// the reject gate and sweep treat as "no blackout".
+    fn get_blackout_windows(
+        &self,
+        instrument: &str,
+    ) -> impl Future<Output = Result<Vec<NoEntryWindow>, StateError>>;
+
     /// Create-or-update a per-trade blackout record. Sub-plans 4/5 call
     /// this with `applied = true` and populated payloads.
     fn upsert_spread_blackout_record(
@@ -856,6 +944,138 @@ pub trait StateStore {
         account: Option<&str>,
         trade_id: &str,
     ) -> impl Future<Output = Result<(), StateError>>;
+
+    // ----- Server-side engine: registered plans + per-trade FSM state -----
+
+    /// Persist a registered [`TradePlan`] for the cron engine to evaluate.
+    /// Keyed `plan:{scope}:{trade_id}`; `account` is the carrier intent's
+    /// account (the plan struct itself has no account field). Overwrites a
+    /// prior registration of the same `(account, trade_id)` and refreshes TTL.
+    fn put_trade_plan(
+        &self,
+        account: Option<&str>,
+        plan: &TradePlan,
+        ttl_seconds: u64,
+    ) -> impl Future<Output = Result<(), StateError>>;
+
+    /// Read one registered plan by `(account, trade_id)`, or `None` if absent /
+    /// expired. Account-scoped only (no global-first): a plan key always
+    /// carries the registering intent's scope.
+    fn get_trade_plan(
+        &self,
+        account: Option<&str>,
+        trade_id: &str,
+    ) -> impl Future<Output = Result<Option<TradePlan>, StateError>>;
+
+    /// Enumerate every active registered plan, each paired with the account it
+    /// was registered under (parsed back from the key scope). The engine's
+    /// per-tick entry point — mirrors [`Self::list_all_entry_attempts`].
+    fn list_all_trade_plans(&self) -> impl Future<Output = Result<Vec<StoredPlan>, StateError>>;
+
+    /// Delete a registered plan. Best-effort (no-op if already gone). Called
+    /// when the plan reaches a terminal phase so a finished setup stops ticking.
+    fn clear_trade_plan(
+        &self,
+        account: Option<&str>,
+        trade_id: &str,
+    ) -> impl Future<Output = Result<(), StateError>>;
+
+    /// Read the engine's evolving [`PlanState`] for `(account, trade_id)`, or
+    /// `None` if the plan has never ticked (the engine seeds it). Keyed
+    /// `plan-state:{scope}:{trade_id}`, account-scoped (the carrier scope is
+    /// always known from the plan).
+    fn get_plan_state(
+        &self,
+        account: Option<&str>,
+        trade_id: &str,
+    ) -> impl Future<Output = Result<Option<PlanState>, StateError>>;
+
+    /// Create-or-update the engine's [`PlanState`] for `(account, trade_id)`.
+    /// Overwrites the prior row + refreshes TTL. Written every tick that the
+    /// watermark advances (re-set keeps an active plan's state from ageing out).
+    fn put_plan_state(
+        &self,
+        account: Option<&str>,
+        trade_id: &str,
+        state: &PlanState,
+        ttl_seconds: u64,
+    ) -> impl Future<Output = Result<(), StateError>>;
+
+    /// Delete the engine's [`PlanState`] row. Best-effort. Called alongside
+    /// [`Self::clear_trade_plan`] when a plan finishes.
+    fn clear_plan_state(
+        &self,
+        account: Option<&str>,
+        trade_id: &str,
+    ) -> impl Future<Output = Result<(), StateError>>;
+
+    // ----- Server-side engine: archived (terminated) plans -----
+
+    /// Snapshot a finished plan into the archive keyspace so it survives the
+    /// terminal cron tick's `clear_trade_plan` / `clear_plan_state`. Called from
+    /// the engine's `done` branch *before* the live rows are dropped, so
+    /// `plan list --include-all` can still surface a vetoed/completed plan for
+    /// post-mortem. Keyed `archived-plan:{scope}:{trade_id}`. Unlike the live
+    /// `plan:` row this is written with **no TTL** — archived plans accumulate
+    /// until an operator runs `plan delete`. `final_state` is the terminal
+    /// [`PlanState`] (its `phase`/`fired` record *why* the plan ended).
+    fn archive_plan(
+        &self,
+        account: Option<&str>,
+        plan: &TradePlan,
+        final_state: &PlanState,
+        archived_at: DateTime<Utc>,
+    ) -> impl Future<Output = Result<(), StateError>>;
+
+    /// Enumerate every archived plan across all account scopes (mirrors
+    /// [`Self::list_all_trade_plans`]). Read by `plan list --include-all`.
+    fn list_all_archived_plans(
+        &self,
+    ) -> impl Future<Output = Result<Vec<ArchivedPlan>, StateError>>;
+
+    /// Delete an archived plan. Best-effort (no-op if already gone). Called by
+    /// `plan delete` so a terminated plan can be cleared after analysis.
+    fn clear_archived_plan(
+        &self,
+        account: Option<&str>,
+        trade_id: &str,
+    ) -> impl Future<Output = Result<(), StateError>>;
+}
+
+/// A registered plan paired with the account scope it was stored under, as
+/// returned by [`StateStore::list_all_trade_plans`]. The cron engine needs the
+/// account to acquire the right broker and to key the plan's [`PlanState`].
+///
+/// No `PartialEq` — `TradePlan` carries an `Intent`, which isn't `PartialEq`.
+#[derive(Debug, Clone)]
+pub struct StoredPlan {
+    /// `None` for a globally-scoped plan; `Some(name)` for an account-scoped one
+    /// (parsed back from the key's `{scope}` segment).
+    pub account: Option<String>,
+    pub plan: TradePlan,
+}
+
+/// A terminated plan retained for post-mortem analysis, as written by
+/// [`StateStore::archive_plan`] and returned by
+/// [`StateStore::list_all_archived_plans`]. The body is JSON-serialised under
+/// `archived-plan:{scope}:{trade_id}`; the account is recovered from the key
+/// scope (like [`StoredPlan`]), so it is **not** part of the serialised body.
+///
+/// No `PartialEq` — `TradePlan` carries an `Intent`, which isn't `PartialEq`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ArchivedPlan {
+    /// `None` for a globally-scoped plan; `Some(name)` for an account-scoped one
+    /// (parsed back from the key scope on read — `#[serde(skip)]` so it never
+    /// rides in the stored body, the single source of truth being the key).
+    #[serde(skip)]
+    pub account: Option<String>,
+    /// The plan as registered.
+    pub plan: TradePlan,
+    /// The terminal engine state — its `phase`/`fired` say *why* the plan ended
+    /// (a fired veto rule vs. a dispatched entry).
+    pub final_state: PlanState,
+    /// When the engine archived it (the terminal cron tick's `now`).
+    pub archived_at: DateTime<Utc>,
 }
 
 /// Maximum number of recent seen ids retained in the index. Tuning knob;
@@ -938,6 +1158,12 @@ impl std::error::Error for StateError {}
 
 /// Cloudflare KV's minimum TTL is 60 seconds; clamp anything smaller.
 pub const MIN_TTL_SECONDS: u64 = 60;
+
+/// "No expiry" sentinel for the in-memory test store, which (unlike real KV)
+/// keys every row on a TTL stamp. Archived plans are written to real KV with no
+/// `expiration_ttl` at all; the test store emulates "never" with a far-future
+/// stamp (~100 years). Not used by the production KV impl.
+pub const NO_TTL_SECONDS: u64 = 100 * 365 * 24 * 3600;
 
 /// Compute the effective TTL (in seconds) for a veto record.
 ///
@@ -1043,10 +1269,11 @@ pub async fn clear_named_vetos<S: StateStore>(
     Ok(cleared)
 }
 
-/// Simple in-memory [`StateStore`] used by core unit tests and by the
-/// worker crate's tests. Not exposed publicly outside `cfg(test)` to
-/// avoid leaking it into release builds.
-#[cfg(test)]
+/// Simple in-memory [`StateStore`] used by core unit tests and, under the
+/// `test-support` feature, by the native replay CLI to drive the engine offline.
+/// Gated so it never leaks into the wasm worker release build (which enables
+/// neither `test` nor `test-support`).
+#[cfg(any(test, feature = "test-support"))]
 mod memstore {
     use super::*;
     use std::cell::RefCell;
@@ -1536,6 +1763,38 @@ mod memstore {
             }
         }
 
+        async fn set_blackout_windows(
+            &self,
+            instrument: &str,
+            windows: &[NoEntryWindow],
+            now: DateTime<Utc>,
+            ttl_seconds: u64,
+        ) -> Result<(), StateError> {
+            let ttl = ttl_seconds.max(MIN_TTL_SECONDS);
+            let entry = BlackoutHoursEntry {
+                instrument: instrument.to_string(),
+                windows: windows.to_vec(),
+                updated_at: now,
+                expires_at: now + chrono::Duration::seconds(ttl as i64),
+            };
+            let body =
+                serde_json::to_string(&entry).map_err(|e| StateError::Backend(e.to_string()))?;
+            self.put(format!("blackout-hours:{instrument}"), body, ttl, now);
+            Ok(())
+        }
+
+        async fn get_blackout_windows(
+            &self,
+            instrument: &str,
+        ) -> Result<Vec<NoEntryWindow>, StateError> {
+            match self.get_live(&format!("blackout-hours:{instrument}"), Utc::now()) {
+                Some(text) => serde_json::from_str::<BlackoutHoursEntry>(&text)
+                    .map(|e| e.windows)
+                    .map_err(|e| StateError::Backend(e.to_string())),
+                None => Ok(Vec::new()),
+            }
+        }
+
         async fn upsert_spread_blackout_record(
             &self,
             record: &SpreadBlackoutRecord,
@@ -1627,8 +1886,170 @@ mod memstore {
             self.delete(&format!("mw-state:{}:{trade_id}", account_scope(account)));
             Ok(())
         }
+
+        async fn put_trade_plan(
+            &self,
+            account: Option<&str>,
+            plan: &TradePlan,
+            ttl_seconds: u64,
+        ) -> Result<(), StateError> {
+            let key = format!("plan:{}:{}", account_scope(account), plan.trade_id);
+            let body = serde_json::to_string(plan)
+                .map_err(|e| StateError::Backend(format!("encode plan: {e}")))?;
+            self.put(key, body, ttl_seconds.max(MIN_TTL_SECONDS), Utc::now());
+            Ok(())
+        }
+
+        async fn get_trade_plan(
+            &self,
+            account: Option<&str>,
+            trade_id: &str,
+        ) -> Result<Option<TradePlan>, StateError> {
+            let key = format!("plan:{}:{trade_id}", account_scope(account));
+            match self.get_live(&key, Utc::now()) {
+                Some(text) => serde_json::from_str(&text)
+                    .map(Some)
+                    .map_err(|e| StateError::Backend(format!("decode plan: {e}"))),
+                None => Ok(None),
+            }
+        }
+
+        async fn list_all_trade_plans(&self) -> Result<Vec<StoredPlan>, StateError> {
+            let now = Utc::now();
+            let inner = self.inner.borrow();
+            let mut out = Vec::new();
+            for (key, (val, exp)) in inner.iter() {
+                // Key form: `plan:{scope}:{trade_id}`. The scope is the second
+                // colon-segment; trade_id may itself contain `:` (rare), so
+                // splitn(3) keeps the remainder intact.
+                let Some(rest) = key.strip_prefix("plan:") else {
+                    continue;
+                };
+                if *exp <= now {
+                    continue;
+                }
+                let Some((scope, _trade_id)) = rest.split_once(':') else {
+                    continue;
+                };
+                let plan: TradePlan = serde_json::from_str(val)
+                    .map_err(|e| StateError::Backend(format!("decode plan: {e}")))?;
+                out.push(StoredPlan {
+                    account: account_from_scope(scope),
+                    plan,
+                });
+            }
+            Ok(out)
+        }
+
+        async fn clear_trade_plan(
+            &self,
+            account: Option<&str>,
+            trade_id: &str,
+        ) -> Result<(), StateError> {
+            self.delete(&format!("plan:{}:{trade_id}", account_scope(account)));
+            Ok(())
+        }
+
+        async fn get_plan_state(
+            &self,
+            account: Option<&str>,
+            trade_id: &str,
+        ) -> Result<Option<PlanState>, StateError> {
+            let key = format!("plan-state:{}:{trade_id}", account_scope(account));
+            match self.get_live(&key, Utc::now()) {
+                Some(text) => serde_json::from_str(&text)
+                    .map(Some)
+                    .map_err(|e| StateError::Backend(format!("decode plan-state: {e}"))),
+                None => Ok(None),
+            }
+        }
+
+        async fn put_plan_state(
+            &self,
+            account: Option<&str>,
+            trade_id: &str,
+            state: &PlanState,
+            ttl_seconds: u64,
+        ) -> Result<(), StateError> {
+            let key = format!("plan-state:{}:{trade_id}", account_scope(account));
+            let body = serde_json::to_string(state)
+                .map_err(|e| StateError::Backend(format!("encode plan-state: {e}")))?;
+            self.put(key, body, ttl_seconds.max(MIN_TTL_SECONDS), Utc::now());
+            Ok(())
+        }
+
+        async fn clear_plan_state(
+            &self,
+            account: Option<&str>,
+            trade_id: &str,
+        ) -> Result<(), StateError> {
+            self.delete(&format!("plan-state:{}:{trade_id}", account_scope(account)));
+            Ok(())
+        }
+
+        async fn archive_plan(
+            &self,
+            account: Option<&str>,
+            plan: &TradePlan,
+            final_state: &PlanState,
+            archived_at: DateTime<Utc>,
+        ) -> Result<(), StateError> {
+            let key = format!("archived-plan:{}:{}", account_scope(account), plan.trade_id);
+            let archived = ArchivedPlan {
+                account: None, // recovered from the key on read; skipped in the body
+                plan: plan.clone(),
+                final_state: final_state.clone(),
+                archived_at,
+            };
+            let body = serde_json::to_string(&archived)
+                .map_err(|e| StateError::Backend(format!("encode archived plan: {e}")))?;
+            // No TTL: archived plans persist until `plan delete`. The in-memory
+            // store keys on expiry, so use a far-future stamp as "never".
+            self.put(key, body, NO_TTL_SECONDS, Utc::now());
+            Ok(())
+        }
+
+        async fn list_all_archived_plans(&self) -> Result<Vec<ArchivedPlan>, StateError> {
+            let now = Utc::now();
+            let inner = self.inner.borrow();
+            let mut out = Vec::new();
+            for (key, (val, exp)) in inner.iter() {
+                let Some(rest) = key.strip_prefix("archived-plan:") else {
+                    continue;
+                };
+                if *exp <= now {
+                    continue;
+                }
+                let Some((scope, _trade_id)) = rest.split_once(':') else {
+                    continue;
+                };
+                let mut archived: ArchivedPlan = serde_json::from_str(val)
+                    .map_err(|e| StateError::Backend(format!("decode archived plan: {e}")))?;
+                archived.account = account_from_scope(scope);
+                out.push(archived);
+            }
+            Ok(out)
+        }
+
+        async fn clear_archived_plan(
+            &self,
+            account: Option<&str>,
+            trade_id: &str,
+        ) -> Result<(), StateError> {
+            self.delete(&format!(
+                "archived-plan:{}:{trade_id}",
+                account_scope(account)
+            ));
+            Ok(())
+        }
     }
 }
+
+/// Re-export the in-memory store under the same gate as its module, so consumers
+/// name it as `trade_control_core::state::MemStateStore` (core's own tests still
+/// reach it via `memstore::MemStateStore`).
+#[cfg(any(test, feature = "test-support"))]
+pub use memstore::MemStateStore;
 
 #[cfg(test)]
 mod tests {
@@ -2514,6 +2935,7 @@ mod tests {
             stop_loss_price: None,
             cancel_at: None,
             pip_size: None,
+            blackout_close: BlackoutCloseAction::default(),
         }
     }
 
@@ -2645,6 +3067,8 @@ mod tests {
             stop_loss_price: Some(1.0500),
             cancel_at: Some(now + chrono::Duration::hours(3)),
             pip_size: None,
+            // Non-default so the round-trip proves the field survives the wire.
+            blackout_close: BlackoutCloseAction::CancelAndClose,
         };
         let yaml = serde_yaml::to_string(&a).unwrap();
         let parsed: EntryAttempt = serde_yaml::from_str(&yaml).unwrap();
@@ -2675,6 +3099,10 @@ mod tests {
         // they must decode as `None` so the sweep skips the bar-expiry
         // check and the row still ages out via TTL.
         assert!(attempt.cancel_at.is_none());
+        // Rows written before the market-hours blackout landed lack
+        // `blackout_close`; they must decode to the safe default
+        // (CancelResting — cancel a resting order, never close a position).
+        assert_eq!(attempt.blackout_close, BlackoutCloseAction::CancelResting);
         assert_eq!(attempt.broker_order_id, "ord-1");
     }
 
@@ -2695,9 +3123,13 @@ mod tests {
             stop_loss_price: None,
             cancel_at: None,
             pip_size: None,
+            blackout_close: BlackoutCloseAction::default(),
         };
         let yaml = serde_yaml::to_string(&a).unwrap();
         assert!(!yaml.contains("broker_trade_id"));
+        // The default close policy is skip-serialized so a default row
+        // stays byte-identical to pre-field rows in KV.
+        assert!(!yaml.contains("blackout_close"));
         let parsed: EntryAttempt = serde_yaml::from_str(&yaml).unwrap();
         assert_eq!(parsed.broker_trade_id, None);
     }
@@ -2855,6 +3287,88 @@ mod tests {
     }
 
     #[test]
+    fn blackout_hours_entry_round_trips() {
+        let entry = BlackoutHoursEntry {
+            instrument: "US 500".into(),
+            windows: vec![
+                NoEntryWindow::new(18 * 60, 2 * 60),
+                NoEntryWindow::new(9 * 60, 10 * 60),
+            ],
+            updated_at: ts("2026-06-18T06:00:00Z"),
+            expires_at: ts("2026-06-19T08:00:00Z"),
+        };
+        let json = serde_json::to_string(&entry).unwrap();
+        let parsed: BlackoutHoursEntry = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, entry);
+        assert_eq!(parsed.windows.len(), 2);
+        assert_eq!(parsed.windows[0].open_min, 18 * 60);
+        assert_eq!(parsed.windows[0].close_min, 2 * 60);
+    }
+
+    #[test]
+    fn memstore_blackout_windows_round_trip_per_instrument() {
+        use super::memstore::MemStateStore;
+        let store = MemStateStore::new();
+        let now = Utc::now();
+
+        // Absent before any write — the fail-open case (no blackout).
+        assert!(
+            pollster::block_on(store.get_blackout_windows("US 500"))
+                .unwrap()
+                .is_empty()
+        );
+
+        let us500 = [NoEntryWindow::new(18 * 60, 2 * 60)];
+        let gold = [
+            NoEntryWindow::new(21 * 60, 23 * 60),
+            NoEntryWindow::new(3 * 60, 4 * 60),
+        ];
+        pollster::block_on(store.set_blackout_windows("US 500", &us500, now, 26 * 3600)).unwrap();
+        pollster::block_on(store.set_blackout_windows("Spot Gold", &gold, now, 26 * 3600)).unwrap();
+
+        // Each instrument reads back its own windows — keys don't collide.
+        assert_eq!(
+            pollster::block_on(store.get_blackout_windows("US 500")).unwrap(),
+            us500.to_vec()
+        );
+        assert_eq!(
+            pollster::block_on(store.get_blackout_windows("Spot Gold")).unwrap(),
+            gold.to_vec()
+        );
+        // An instrument never written stays fail-open.
+        assert!(
+            pollster::block_on(store.get_blackout_windows("EUR/USD"))
+                .unwrap()
+                .is_empty()
+        );
+
+        // Overwrite replaces the windows for that instrument.
+        let revised = [NoEntryWindow::new(19 * 60, 60)];
+        pollster::block_on(store.set_blackout_windows("US 500", &revised, now, 26 * 3600)).unwrap();
+        assert_eq!(
+            pollster::block_on(store.get_blackout_windows("US 500")).unwrap(),
+            revised.to_vec()
+        );
+    }
+
+    #[test]
+    fn memstore_blackout_windows_expire_fail_open() {
+        use super::memstore::MemStateStore;
+        let store = MemStateStore::new();
+        // Stamp two days in the past with a 26h TTL → already expired → reads
+        // back empty (no blackout), the fail-open guarantee.
+        let stale = Utc::now() - chrono::Duration::days(2);
+        let w = [NoEntryWindow::new(18 * 60, 2 * 60)];
+        pollster::block_on(store.set_blackout_windows("US 500", &w, stale, 26 * 3600)).unwrap();
+        assert!(
+            pollster::block_on(store.get_blackout_windows("US 500"))
+                .unwrap()
+                .is_empty(),
+            "an expired window must read as no-blackout (fail-open)"
+        );
+    }
+
+    #[test]
     fn spread_blackout_record_round_trips_with_reserved_fields() {
         let record = SpreadBlackoutRecord {
             trade_id: "hs-eur-nzd-c1e0f25b".into(),
@@ -2898,5 +3412,121 @@ mod tests {
         assert_eq!(parsed.pip_size, 0.0, "old rows decode pip_size to 0.0");
         assert!(parsed.original_stops.is_empty());
         assert!(parsed.cancelled_orders.is_empty());
+    }
+
+    /// A minimal rules-empty plan, built off JSON so the test doesn't have to
+    /// hand-construct a full `Intent` (rules carry one each).
+    fn sample_plan(trade_id: &str) -> TradePlan {
+        let json = format!(
+            r#"{{"trade_id":"{trade_id}","instrument":"EUR_USD","direction":"short",
+                "granularity":"h1","pip_size":0.0001,"rules":[]}}"#
+        );
+        serde_json::from_str(&json).unwrap()
+    }
+
+    #[test]
+    fn memstore_trade_plan_round_trips_and_lists_with_account() {
+        use super::memstore::MemStateStore;
+        let store = MemStateStore::new();
+        // Global + account-scoped plans coexist; list recovers both scopes.
+        pollster::block_on(store.put_trade_plan(None, &sample_plan("hs-global"), 3600)).unwrap();
+        pollster::block_on(store.put_trade_plan(
+            Some("reversals"),
+            &sample_plan("hs-scoped"),
+            3600,
+        ))
+        .unwrap();
+
+        let got = pollster::block_on(store.get_trade_plan(Some("reversals"), "hs-scoped"))
+            .unwrap()
+            .expect("scoped plan present");
+        assert_eq!(got.trade_id, "hs-scoped");
+        assert_eq!(got.instrument, "EUR_USD");
+        // Account-scoped get is NOT global-first: a global plan does not satisfy
+        // a scoped query (the engine always knows the carrier scope).
+        assert!(
+            pollster::block_on(store.get_trade_plan(Some("reversals"), "hs-global"))
+                .unwrap()
+                .is_none()
+        );
+
+        let mut all = pollster::block_on(store.list_all_trade_plans()).unwrap();
+        all.sort_by(|a, b| a.plan.trade_id.cmp(&b.plan.trade_id));
+        assert_eq!(all.len(), 2);
+        let global = all.iter().find(|s| s.plan.trade_id == "hs-global").unwrap();
+        assert_eq!(global.account, None);
+        let scoped = all.iter().find(|s| s.plan.trade_id == "hs-scoped").unwrap();
+        assert_eq!(scoped.account.as_deref(), Some("reversals"));
+
+        pollster::block_on(store.clear_trade_plan(Some("reversals"), "hs-scoped")).unwrap();
+        assert!(
+            pollster::block_on(store.get_trade_plan(Some("reversals"), "hs-scoped"))
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn memstore_plan_state_round_trips() {
+        use super::memstore::MemStateStore;
+        use crate::plan_state::{Phase, PlanState};
+        let store = MemStateStore::new();
+        let mut st = PlanState::seed(Phase::AwaitBreakAndClose, ts("2026-06-20T00:00:00Z"));
+        st.watermark = Some(ts("2026-06-16T12:00:00Z"));
+        st.last_close.insert("01-veto-too-high".into(), 1.2345);
+
+        pollster::block_on(store.put_plan_state(Some("reversals"), "hs-1", &st, 3600)).unwrap();
+        let got = pollster::block_on(store.get_plan_state(Some("reversals"), "hs-1"))
+            .unwrap()
+            .expect("plan-state present");
+        assert_eq!(got, st);
+
+        pollster::block_on(store.clear_plan_state(Some("reversals"), "hs-1")).unwrap();
+        assert!(
+            pollster::block_on(store.get_plan_state(Some("reversals"), "hs-1"))
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn memstore_archived_plan_round_trips_lists_and_clears() {
+        use super::memstore::MemStateStore;
+        use crate::plan_state::{Phase, PlanState};
+        let store = MemStateStore::new();
+
+        // Terminal state: a veto fired and latched, phase advanced to Done.
+        let mut term = PlanState::seed(Phase::Done, ts("2026-06-20T00:00:00Z"));
+        term.fired.insert("01-veto-too-high".into());
+        let when = ts("2026-06-19T09:00:00Z");
+
+        pollster::block_on(store.archive_plan(None, &sample_plan("hs-global"), &term, when))
+            .unwrap();
+        pollster::block_on(store.archive_plan(
+            Some("reversals"),
+            &sample_plan("hs-scoped"),
+            &term,
+            when,
+        ))
+        .unwrap();
+
+        let mut all = pollster::block_on(store.list_all_archived_plans()).unwrap();
+        all.sort_by(|a, b| a.plan.trade_id.cmp(&b.plan.trade_id));
+        assert_eq!(all.len(), 2);
+
+        let global = all.iter().find(|a| a.plan.trade_id == "hs-global").unwrap();
+        assert_eq!(global.account, None);
+        let scoped = all.iter().find(|a| a.plan.trade_id == "hs-scoped").unwrap();
+        // Account is recovered from the key scope, not the (skipped) body.
+        assert_eq!(scoped.account.as_deref(), Some("reversals"));
+        assert_eq!(scoped.final_state.phase, Phase::Done);
+        assert!(scoped.final_state.fired.contains("01-veto-too-high"));
+        assert_eq!(scoped.archived_at, when);
+
+        // delete clears one scope, leaves the other.
+        pollster::block_on(store.clear_archived_plan(Some("reversals"), "hs-scoped")).unwrap();
+        let remaining = pollster::block_on(store.list_all_archived_plans()).unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].plan.trade_id, "hs-global");
     }
 }

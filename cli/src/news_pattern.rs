@@ -213,6 +213,7 @@ fn build_news_intent(
     not_after: DateTime<Utc>,
 ) -> Intent {
     Intent {
+        entry_level_vetos: Vec::new(),
         v: 1,
         id,
         not_before: None,
@@ -255,6 +256,9 @@ fn build_news_intent(
         reason: spec.reason.clone(),
         mw: None,
         pip_size: None,
+        trade_plan: None,
+        blackout_close: trade_control_core::intent::BlackoutCloseAction::default(),
+        include_archived: false,
     }
 }
 

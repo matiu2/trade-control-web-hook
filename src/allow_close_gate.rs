@@ -118,6 +118,7 @@ mod tests {
         allow_close: Option<Tunable<bool>>,
     ) -> Intent {
         Intent {
+            entry_level_vetos: Vec::new(),
             v: 1,
             id: "msg-1".into(),
             not_before: None,
@@ -160,6 +161,9 @@ mod tests {
             reason: None,
             mw: None,
             pip_size: None,
+            trade_plan: None,
+            blackout_close: trade_control_core::intent::BlackoutCloseAction::default(),
+            include_archived: false,
         }
     }
 
