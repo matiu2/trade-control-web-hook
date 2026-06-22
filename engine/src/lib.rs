@@ -46,7 +46,7 @@
 // Re-export the shared surface the engine builds on, so downstream stages (and
 // the worker's cron wiring) can name everything through `trade_control_engine`
 // without each reaching into `trade_control_core` independently.
-pub use trade_control_core::broker::{Broker, Candle, CandleError, Granularity};
+pub use trade_control_core::broker::{BidAskCandle, Broker, Candle, CandleError, Granularity};
 pub use trade_control_core::intent::{self, Action, Intent};
 pub use trade_control_core::plan_eval::{FiredIntent, PlanEval};
 pub use trade_control_core::plan_state::{Phase, PlanState};

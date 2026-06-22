@@ -21,7 +21,7 @@
 //! `dispatch_outcomes` through the real handlers needs the `Response` decouple
 //! and is a separate, later task.
 
-use trade_control_core::broker::Candle;
+use trade_control_core::broker::BidAskCandle;
 use trade_control_core::intent::{Direction, Intent, Resolved, ResolvedEntry, Shell};
 
 /// What the simulator decided happened to one fired enter over the candle path.
@@ -65,28 +65,28 @@ pub enum SimOutcome {
 /// `new_candles`/`detector_window`). `pip_size` is the plan's pip size, needed to
 /// resolve pip-offset entry/SL levels.
 ///
-/// `half_spread` (price units, ≥ 0) models the bid/ask: ask = mid + half_spread,
-/// bid = mid − half_spread. You **buy at the ask, sell at the bid**, so the side
-/// that fills each leg depends on direction:
+/// The candles carry **real per-bar bid/ask books** ([`BidAskCandle`]), so the
+/// fill reproduces the broker's actual spread (which widens at session opens and
+/// around news) instead of a flat synthetic half-spread. You **buy at the ask,
+/// sell at the bid**, so the book each leg touches depends on direction:
 ///
-/// - **Short** (sell to open, buy to close): entry fills when the **bid** drops
-///   to the trigger; SL/TP close when the **ask** reaches them.
-/// - **Long** (buy to open, sell to close): mirror — entry on the **ask**, exits
-///   on the **bid**.
+/// - **Short** (sell to open, buy to close): entry fills when the **bid** range
+///   reaches the trigger; SL/TP close when the **ask** range reaches them.
+/// - **Long** (buy to open, sell to close): mirror — entry on the **ask** range,
+///   exits on the **bid** range.
 ///
-/// The candles are MID (what the engine and the live worker both evaluate on —
-/// the worker resolves SL/TP at mid and the *broker* applies bid/ask). We
-/// reproduce the broker side here by shifting each level by `half_spread` before
-/// the mid-range touch test, so a short's SL triggers a half-spread earlier
-/// (ask-side), matching reality. Pass `half_spread = 0.0` for the old
-/// exact-level mid behaviour. Recorded fill/exit prices are the broker-adjusted
-/// (bid/ask) prices, not the mid level.
+/// The engine still *resolves* and evaluates on MID (the worker places every
+/// level at mid); only the **fill test** here uses the relevant book side, which
+/// is where the real spread lives. Recorded fill/exit prices are the placed
+/// level (the resting order's price), not the book extreme that touched it.
+///
+/// When the data source only serves mid (bid == ask == mid per bar), this
+/// degrades cleanly to exact-level mid fills.
 pub fn simulate_fill(
     intent: &Intent,
     shell: &Shell,
     pip_size: f64,
-    half_spread: f64,
-    candles: &[Candle],
+    candles: &[BidAskCandle],
 ) -> SimOutcome {
     let resolved = match Resolved::from_intent(intent, shell, pip_size) {
         Ok(r) => r,
@@ -109,20 +109,18 @@ pub fn simulate_fill(
         };
     }
 
-    // The order levels (entry trigger, SL, TP) are placed at MID by the worker;
-    // the broker fills each on the relevant book side (ask for a buy, bid for a
-    // sell). We have mid candles, so for each leg we test the mid range against
-    // the *mid value at which that book side touches the placed level* — the
-    // level shifted by `half_spread` per [`trigger_mid`] — and record the placed
-    // level itself as the fill price (that's the price the resting order gives).
-
-    // Phase 1 — find the fill. A short entry sells (fills on the bid); a long
-    // entry buys (fills on the ask). A market entry crosses the spread at once.
+    // Phase 1 — find the fill. A short entry sells (fills on the bid book); a
+    // long entry buys (fills on the ask book). A market entry crosses the spread
+    // at once. The recorded fill price is the placed level (the resting order's
+    // price), not the book extreme.
+    let entry_book = book_for(Leg::Entry, dir);
     let (fill_at, entry_price, rest) = match resolved.entry {
         ResolvedEntry::Market { reference_price } => (shell.time, reference_price, candles),
         ResolvedEntry::Stop { trigger_price } | ResolvedEntry::Limit { trigger_price } => {
-            let test = trigger_mid(Leg::Entry, dir, trigger_price, half_spread);
-            match candles.iter().position(|c| candle_crosses(c, test)) {
+            match candles
+                .iter()
+                .position(|c| book_crosses(c, entry_book, trigger_price))
+            {
                 Some(i) => (candles[i].time, trigger_price, &candles[i + 1..]),
                 None => return SimOutcome::NeverFilled,
             }
@@ -131,15 +129,14 @@ pub fn simulate_fill(
 
     // Phase 2 — after the fill, the first candle that touches SL or TP closes
     // the position. The close is the *opposite* book side from entry (short buys
-    // back at the ask, long sells at the bid). If both are touched in the same
+    // back on the ask, long sells on the bid). If both are touched in the same
     // candle we can't tell the intrabar order from a closed bar, so we
     // conservatively call it the stop (the worse outcome) — matches the
     // simulator doc's "exact-level, pessimistic on ambiguity" stance.
-    let sl_test = trigger_mid(Leg::Exit, dir, resolved.stop_loss, half_spread);
-    let tp_test = trigger_mid(Leg::Exit, dir, resolved.take_profit, half_spread);
+    let exit_book = book_for(Leg::Exit, dir);
     for c in rest {
-        let hit_sl = candle_crosses(c, sl_test);
-        let hit_tp = candle_crosses(c, tp_test);
+        let hit_sl = book_crosses(c, exit_book, resolved.stop_loss);
+        let hit_tp = book_crosses(c, exit_book, resolved.take_profit);
         match (hit_sl, hit_tp) {
             (true, _) => {
                 return SimOutcome::StoppedOut {
@@ -167,11 +164,13 @@ pub fn simulate_fill(
     }
 }
 
-/// Whether a candle's high–low range spans `level` (an exact-level touch). The
-/// fill model is direction-agnostic: a long stop above and a short stop below are
-/// both "the candle's range reached the level".
-fn candle_crosses(c: &Candle, level: f64) -> bool {
-    c.l <= level && level <= c.h
+/// Which broker book a price level is tested against.
+#[derive(Clone, Copy, PartialEq)]
+enum Book {
+    /// A sell fills here (short entry, long exit).
+    Bid,
+    /// A buy fills here (long entry, short exit).
+    Ask,
 }
 
 /// Which leg of the trade a level belongs to — entry (open) vs SL/TP (close).
@@ -181,42 +180,32 @@ enum Leg {
     Exit,
 }
 
-/// The **mid** value at which the relevant book side touches a level placed at
-/// mid `level`, given the `half_spread` (ask = mid + h, bid = mid − h). The
-/// worker places every level at mid; the broker fills the leg on the book side
-/// that the trade uses, so the mid has to travel an extra (or shorter)
-/// half-spread to get that side onto the level:
-///
-/// - **Short**: entry sells on the **bid** (bid ≤ level ⟺ mid ≤ level + h);
-///   SL/TP buy back on the **ask** (ask ≥/≤ level ⟺ mid ≥/≤ level − h).
-/// - **Long**: entry buys on the **ask** (mid ≥ level − h); SL/TP sell on the
-///   **bid** (mid level + h).
-///
-/// The recorded fill price stays the placed `level` (the price the resting order
-/// gives); only the *trigger* shifts. `half_spread = 0` ⇒ the level unchanged.
-fn trigger_mid(leg: Leg, dir: Direction, level: f64, half_spread: f64) -> f64 {
-    // Sign: does the book side this leg fills on sit *above* mid (ask, +) or
-    // *below* mid (bid, −)? A buy uses the ask, a sell uses the bid. Entry side
-    // is the trade direction; exit side is its opposite.
-    let buys = match (leg, dir) {
-        (Leg::Entry, Direction::Long) => true,   // buy to open
-        (Leg::Entry, Direction::Short) => false, // sell to open
-        (Leg::Exit, Direction::Long) => false,   // sell to close
-        (Leg::Exit, Direction::Short) => true,   // buy to close
-    };
-    // If the fill side is the ask (buys), it sits +h above mid, so mid must be h
-    // *lower* to put the ask on the level: test against level − h. If the bid
-    // (sells), test against level + h.
-    if buys {
-        level - half_spread
-    } else {
-        level + half_spread
+/// The broker book the given leg fills on: a buy uses the ask, a sell uses the
+/// bid. Entry side is the trade direction; exit side is its opposite (you close
+/// by trading the other way).
+fn book_for(leg: Leg, dir: Direction) -> Book {
+    match (leg, dir) {
+        (Leg::Entry, Direction::Long) => Book::Ask, // buy to open
+        (Leg::Entry, Direction::Short) => Book::Bid, // sell to open
+        (Leg::Exit, Direction::Long) => Book::Bid,  // sell to close
+        (Leg::Exit, Direction::Short) => Book::Ask, // buy to close
     }
 }
 
-/// Direction is unused by [`candle_crosses`] but kept in the public surface so a
-/// future bid/ask-aware fill (long fills on ask, exits on bid) can branch on it
-/// without an API change.
+/// Whether the candle's chosen book range spans `level` (an exact-level touch).
+/// Direction-agnostic on the level itself: a long stop above and a short stop
+/// below are both "this book's high–low range reached the level". The *book*
+/// (bid vs ask) is what carries the real per-bar spread.
+fn book_crosses(c: &BidAskCandle, book: Book, level: f64) -> bool {
+    let (lo, hi) = match book {
+        Book::Bid => (c.bid_l, c.bid_h),
+        Book::Ask => (c.ask_l, c.ask_h),
+    };
+    lo <= level && level <= hi
+}
+
+/// The resolved trade direction — a small public helper so callers can label a
+/// fill's side without re-resolving the intent.
 pub fn direction_of(resolved: &Resolved) -> Direction {
     resolved.direction
 }
@@ -234,13 +223,47 @@ mod tests {
         s.parse().unwrap()
     }
 
-    fn candle(time: &str, o: f64, h: f64, l: f64, c: f64) -> Candle {
-        Candle {
+    /// A bar with **bid == ask == mid** (zero spread) — the data-source-serves-
+    /// mid-only case. Lets the level-logic tests read as plain OHLC while
+    /// exercising the bid/ask code paths through the degenerate (zero-spread)
+    /// branch.
+    fn candle(time: &str, o: f64, h: f64, l: f64, c: f64) -> BidAskCandle {
+        BidAskCandle {
             time: ts(time),
             o,
             h,
             l,
             c,
+            bid_o: o,
+            bid_h: h,
+            bid_l: l,
+            bid_c: c,
+            ask_o: o,
+            ask_h: h,
+            ask_l: l,
+            ask_c: c,
+        }
+    }
+
+    /// A bar with explicit bid/ask books (mid is their midpoint, unused by the
+    /// fill test). For the spread-specific tests: `bid_*` is the sell book,
+    /// `ask_*` the buy book.
+    #[allow(clippy::too_many_arguments)]
+    fn ba_candle(time: &str, bid_h: f64, bid_l: f64, ask_h: f64, ask_l: f64) -> BidAskCandle {
+        BidAskCandle {
+            time: ts(time),
+            o: (bid_l + ask_h) / 2.0,
+            h: (bid_h + ask_h) / 2.0,
+            l: (bid_l + ask_l) / 2.0,
+            c: (bid_l + ask_h) / 2.0,
+            bid_o: bid_l,
+            bid_h,
+            bid_l,
+            bid_c: bid_l,
+            ask_o: ask_h,
+            ask_h,
+            ask_l,
+            ask_c: ask_h,
         }
     }
 
@@ -317,13 +340,7 @@ mod tests {
     /// The shell the fire carried: a trigger candle closing at 1.1040 (below the
     /// 1.1050 stop, so the stop is valid — long stop sits above close).
     fn trigger_shell() -> Shell {
-        Shell::from_candle(&candle(
-            "2026-06-17T10:00:00Z",
-            1.1035,
-            1.1045,
-            1.1030,
-            1.1040,
-        ))
+        Shell::from_candle(&candle("2026-06-17T10:00:00Z", 1.1035, 1.1045, 1.1030, 1.1040).mid())
     }
 
     #[test]
@@ -336,7 +353,7 @@ mod tests {
         // path where the fill candle reaches the resolved trigger.
         // Resolver: trigger = anchor(Close)=1.1040; long-stop-<=close errors.
         // So this intent resolves with InvalidGeometry — assert that path first.
-        let outcome = simulate_fill(&intent, &shell, 0.0001, 0.0, &[]);
+        let outcome = simulate_fill(&intent, &shell, 0.0001, &[]);
         assert!(
             matches!(outcome, SimOutcome::Unresolved(_)),
             "0-offset long stop on close is invalid geometry: {outcome:?}"
@@ -360,7 +377,7 @@ mod tests {
             candle("2026-06-17T11:00:00Z", 1.1042, 1.1055, 1.1041, 1.1052), // fills @1.1050
             candle("2026-06-17T12:00:00Z", 1.1052, 1.1160, 1.1050, 1.1155), // hits TP 1.1150
         ];
-        match simulate_fill(&intent, &shell, 0.0001, 0.0, &tp_path) {
+        match simulate_fill(&intent, &shell, 0.0001, &tp_path) {
             SimOutcome::TookProfit {
                 entry_price,
                 exit_price,
@@ -377,7 +394,7 @@ mod tests {
             candle("2026-06-17T11:00:00Z", 1.1042, 1.1055, 1.1041, 1.1052), // fills
             candle("2026-06-17T12:00:00Z", 1.1050, 1.1051, 1.0995, 1.1000), // hits SL 1.1000
         ];
-        match simulate_fill(&intent, &shell, 0.0001, 0.0, &sl_path) {
+        match simulate_fill(&intent, &shell, 0.0001, &sl_path) {
             SimOutcome::StoppedOut { exit_price, .. } => {
                 assert!((exit_price - 1.1000).abs() < 1e-9);
             }
@@ -393,7 +410,7 @@ mod tests {
             1.1043,
         )];
         assert_eq!(
-            simulate_fill(&intent, &shell, 0.0001, 0.0, &no_fill),
+            simulate_fill(&intent, &shell, 0.0001, &no_fill),
             SimOutcome::NeverFilled
         );
 
@@ -403,7 +420,7 @@ mod tests {
             candle("2026-06-17T12:00:00Z", 1.1052, 1.1060, 1.1048, 1.1055), // neither
         ];
         assert!(matches!(
-            simulate_fill(&intent, &shell, 0.0001, 0.0, &still_open),
+            simulate_fill(&intent, &shell, 0.0001, &still_open),
             SimOutcome::FilledOpen { .. }
         ));
     }
@@ -432,7 +449,7 @@ mod tests {
 
         // Baseline: no veto → the loss path.
         assert!(matches!(
-            simulate_fill(&intent, &shell, 0.0001, 0.0, &sl_path),
+            simulate_fill(&intent, &shell, 0.0001, &sl_path),
             SimOutcome::StoppedOut { .. }
         ));
 
@@ -444,7 +461,7 @@ mod tests {
             past: VetoSide::Above,
         }];
         assert_eq!(
-            simulate_fill(&intent, &shell, 0.0001, 0.0, &sl_path),
+            simulate_fill(&intent, &shell, 0.0001, &sl_path),
             SimOutcome::Declined {
                 name: "too-high".into()
             }
@@ -457,7 +474,7 @@ mod tests {
             past: VetoSide::Above,
         }];
         assert!(matches!(
-            simulate_fill(&intent, &shell, 0.0001, 0.0, &sl_path),
+            simulate_fill(&intent, &shell, 0.0001, &sl_path),
             SimOutcome::StoppedOut { .. }
         ));
     }
@@ -478,16 +495,17 @@ mod tests {
             candle("2026-06-17T12:00:00Z", 1.1050, 1.1160, 1.0995, 1.1100), // spans SL & TP
         ];
         assert!(matches!(
-            simulate_fill(&intent, &shell, 0.0001, 0.0, &both),
+            simulate_fill(&intent, &shell, 0.0001, &both),
             SimOutcome::StoppedOut { .. }
         ));
     }
 
     /// A short stop-entry: absolute trigger 1.1000 (below the shell close so the
-    /// sell-stop is validly placed), SL 1.1030 (above), TP 1.0950 (below). Closes
-    /// by *buying* → the SL fills on the ASK, so the mid only has to rise to
-    /// `SL − half_spread`. A candle whose high reaches 1.1029 (mid) misses the SL
-    /// at half_spread=0 but hits it at half_spread=1 pip (ask = 1.1030).
+    /// sell-stop is validly placed), SL 1.1030 (above), TP 1.0950 (below). Entry
+    /// fills on the **bid** book (a sell); the SL closes by *buying*, so it fills
+    /// on the **ask** book. The spread-specific test exploits that asymmetry: a
+    /// bar whose *mid* high misses the SL but whose *ask* high reaches it stops
+    /// out, because the broker closes the short on the ask.
     fn short_stop_intent() -> Intent {
         let mut i = base_enter();
         i.direction = Some(Direction::Short);
@@ -507,35 +525,34 @@ mod tests {
     }
 
     #[test]
-    fn short_sl_triggers_a_half_spread_early_on_the_ask() {
+    fn short_sl_triggers_on_the_ask_book() {
         let intent = short_stop_intent();
-        let shell = Shell::from_candle(&candle(
-            "2026-06-17T10:00:00Z",
-            1.1010,
-            1.1012,
-            1.0998,
-            1.1005,
-        ));
-        // Fill bar: short fills on the BID. At half_spread=1pip the bid = mid−1pip,
-        // so the mid must reach 1.1001 for the bid to touch the 1.1000 trigger.
-        // Then a bar whose high is 1.1029 (mid) — 1 pip *short* of the 1.1030 SL.
-        let path = [
-            candle("2026-06-17T10:15:00Z", 1.1002, 1.1003, 1.0999, 1.1001), // bid touches 1.1000
-            candle("2026-06-17T10:30:00Z", 1.1010, 1.1029, 1.1008, 1.1020), // high 1.1029 (mid)
-        ];
-
-        // half_spread = 0: SL is exact 1.1030; high 1.1029 misses → still open.
-        assert!(
-            matches!(
-                simulate_fill(&intent, &shell, 0.0001, 0.0, &path),
-                SimOutcome::FilledOpen { .. }
-            ),
-            "at mid the 1.1029 high misses the 1.1030 SL"
+        let shell = Shell::from_candle(
+            &candle("2026-06-17T10:00:00Z", 1.1010, 1.1012, 1.0998, 1.1005).mid(),
         );
 
-        // half_spread = 1 pip: SL fills on the ask, so it triggers when mid ≥
-        // 1.1030 − 0.0001 = 1.1029 — the high reaches it → stopped out.
-        match simulate_fill(&intent, &shell, 0.0001, 0.0001, &path) {
+        // Fill bar: the short fills on the BID — bid range must reach the 1.1000
+        // trigger. Then the SL bar's MID high (1.1029) is a pip short of the
+        // 1.1030 SL, but its ASK high (1.1031) reaches it. Since a short closes by
+        // buying on the ask, the SL fires — a stop the mid-only view would miss.
+        let sl_bar = ba_candle(
+            "2026-06-17T10:30:00Z",
+            1.1027, // bid_h (mid-ish high; would miss SL on the bid book)
+            1.1008, // bid_l
+            1.1031, // ask_h — reaches the 1.1030 SL
+            1.1012, // ask_l
+        );
+        let fill_bar = ba_candle(
+            "2026-06-17T10:15:00Z",
+            1.1000, // bid_h reaches the 1.1000 sell-stop trigger
+            1.0996, // bid_l
+            1.1004, // ask_h
+            1.1000, // ask_l
+        );
+        let path = [fill_bar, sl_bar];
+
+        // The ask high (1.1031) reaches the 1.1030 SL → stopped out on the ask.
+        match simulate_fill(&intent, &shell, 0.0001, &path) {
             SimOutcome::StoppedOut {
                 exit_price,
                 entry_price,
@@ -548,5 +565,17 @@ mod tests {
             }
             other => panic!("expected ask-side stop-out, got {other:?}"),
         }
+
+        // Control: if the SL bar's ASK high stops a pip *short* of the SL
+        // (ask_h 1.1029 < 1.1030), the short stays open — the mid/bid reaching
+        // 1.1029 must NOT trigger a close that only the ask can make.
+        let near_miss = ba_candle("2026-06-17T10:30:00Z", 1.1027, 1.1008, 1.1029, 1.1012);
+        assert!(
+            matches!(
+                simulate_fill(&intent, &shell, 0.0001, &[fill_bar, near_miss]),
+                SimOutcome::FilledOpen { .. }
+            ),
+            "ask high 1.1029 misses the 1.1030 SL → still open"
+        );
     }
 }

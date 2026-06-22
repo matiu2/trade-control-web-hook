@@ -120,13 +120,6 @@ struct Args {
     #[arg(long, default_value_t = 200)]
     warmup_bars: usize,
 
-    /// Half-spread in pips applied to the fill simulator to model bid/ask. The
-    /// candles are mid; the broker fills the entry on the bid (short) / ask
-    /// (long) and the SL/TP on the opposite side, each a half-spread off mid.
-    /// Default 1.0 (a 2-pip spread). Pass 0 for exact-level mid fills.
-    #[arg(long, default_value_t = 1.0)]
-    half_spread_pips: f64,
-
     /// Override the candle-cache disk cache directory.
     #[arg(long)]
     cache_dir: Option<PathBuf>,
@@ -219,26 +212,11 @@ async fn main() -> Result<()> {
         "pulled candles"
     );
 
-    // Half-spread in price units = pips × the plan's pip size. The replay's
-    // multi-shot prior-attempt resolution and the report's fill sim both use it.
-    let half_spread = args.half_spread_pips * plan.pip_size;
-
     // Keep the state TTL past the window so nothing expires mid-replay.
     let expires_at = end + Duration::days(365);
-    let replay = replay::run(
-        &plan,
-        &candles,
-        gran.engine(),
-        start,
-        expires_at,
-        half_spread,
-    )
-    .await;
+    let replay = replay::run(&plan, &candles, gran.engine(), start, expires_at).await;
 
-    print!(
-        "{}",
-        report::render(&plan, &replay, args.simulate, half_spread)
-    );
+    print!("{}", report::render(&plan, &replay, args.simulate));
     Ok(())
 }
 
@@ -515,7 +493,6 @@ mod tests {
             tv_mcp_root: None,
             simulate: true,
             warmup_bars: 200,
-            half_spread_pips: 1.0,
             cache_dir: None,
             print_completions: false,
         }

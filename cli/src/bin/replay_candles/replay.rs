@@ -12,9 +12,9 @@ use trade_control_core::intent::{Action, Shell};
 use trade_control_core::retry_gate::{self, RetryGateOutcome};
 use trade_control_core::state::MemStateStore;
 use trade_control_core::tunable::Tunable;
-use trade_control_engine::Candle as EngineCandle;
+use trade_control_engine::BidAskCandle as EngineCandle;
 use trade_control_engine::{
-    FiredIntent, Granularity, PlanState, TradePlan, evaluate_plan, seed_plan_state,
+    Candle, FiredIntent, Granularity, PlanState, TradePlan, evaluate_plan, seed_plan_state,
 };
 
 use super::replay_broker::ReplayBroker;
@@ -22,7 +22,8 @@ use super::replay_broker::ReplayBroker;
 /// One fired intent plus the forward candle path needed to simulate its fill.
 pub struct Fire {
     pub fired: FiredIntent,
-    /// Candles at or after the firing bar (ascending) — the simulator's input.
+    /// Bid/ask candles at or after the firing bar (ascending) — the fill
+    /// simulator's input (it fills each leg on the relevant book side).
     pub forward: Vec<EngineCandle>,
 }
 
@@ -63,12 +64,18 @@ pub async fn run(
     granularity: Granularity,
     live_start: DateTime<Utc>,
     expires_at: DateTime<Utc>,
-    half_spread: f64,
 ) -> Replay {
+    // The engine evaluates on MID (matching the live worker, whose
+    // `Broker::get_candles` is contractually mid); the bid/ask books are only
+    // consulted by the fill simulator. Build the mid view once and feed it to
+    // `evaluate_plan` / `seed_plan_state`; keep the bid/ask `candles` for the
+    // broker + each fire's forward path.
+    let mid: Vec<Candle> = candles.iter().map(|c| c.mid()).collect();
+
     if candles.is_empty() {
         return Replay {
             fires: Vec::new(),
-            final_state: seed_plan_state(plan, candles, expires_at),
+            final_state: seed_plan_state(plan, &mid, expires_at),
             done: false,
             warnings: Vec::new(),
         };
@@ -85,7 +92,7 @@ pub async fn run(
     let seed_end = warmup_end
         .max(SEED_BARS.min(candles.len()))
         .min(last_live_floor);
-    let mut state = seed_plan_state(plan, &candles[..seed_end], expires_at);
+    let mut state = seed_plan_state(plan, &mid[..seed_end], expires_at);
 
     let mut fires = Vec::new();
     let mut warnings: Vec<String> = Vec::new();
@@ -99,14 +106,15 @@ pub async fn run(
     // (Proceed) or is blocked (a prior attempt still open / the cap reached) —
     // exactly as the live worker would. Single-shot enters never enter this gate
     // (the engine retires them after one fire).
-    let replay_broker = ReplayBroker::new(candles.to_vec(), plan.pip_size, half_spread);
+    let replay_broker = ReplayBroker::new(candles.to_vec(), plan.pip_size);
     let store = MemStateStore::default();
 
     // The detector window grows with each tick: Pine / trendline triggers need
     // the full back-window of closed candles, not just the single new bar.
     for i in seed_end..candles.len() {
-        let new = &candles[i..=i];
-        let detector_window = &candles[..=i];
+        // The engine sees MID; the fill simulator's forward path stays bid/ask.
+        let new = &mid[i..=i];
+        let detector_window = &mid[..=i];
         // Candle timestamps are bar *open* times; the live cron tick that first
         // observes this closed bar fires at (or after) its *close*. Use the
         // close time as `now` so wall-clock-derived state (TTLs, logging) lines
@@ -218,15 +226,25 @@ async fn gate_enter(
 mod tests {
     use super::*;
     use chrono::TimeZone;
-    use trade_control_engine::Candle;
 
-    fn candle(epoch: i64, c: f64) -> Candle {
-        Candle {
+    /// A bid==ask==mid bar (zero spread): the engine sees the mid OHLC, the fill
+    /// simulator's books equal it, so these wiring tests need no spread.
+    fn candle(epoch: i64, c: f64) -> EngineCandle {
+        let (o, h, l) = (c, c + 0.5, c - 0.5);
+        EngineCandle {
             time: Utc.timestamp_opt(epoch, 0).unwrap(),
-            o: c,
-            h: c + 0.5,
-            l: c - 0.5,
+            o,
+            h,
+            l,
             c,
+            bid_o: o,
+            bid_h: h,
+            bid_l: l,
+            bid_c: c,
+            ask_o: o,
+            ask_h: h,
+            ask_l: l,
+            ask_c: c,
         }
     }
 
@@ -251,12 +269,12 @@ mod tests {
             rules: Vec::new(),
             shadow: false,
         };
-        let candles: Vec<Candle> = (0..20)
+        let candles: Vec<EngineCandle> = (0..20)
             .map(|i| candle(i * 3600, 1.30 + i as f64 * 0.001))
             .collect();
         let expires = Utc.timestamp_opt(99 * 3600, 0).unwrap();
 
-        let replay = run(&plan, &candles, Granularity::H1, all_live(), expires, 0.0).await;
+        let replay = run(&plan, &candles, Granularity::H1, all_live(), expires).await;
 
         assert!(replay.fires.is_empty(), "no rules → no fires");
         assert!(!replay.done);
@@ -277,7 +295,7 @@ mod tests {
             rules: Vec::new(),
             shadow: false,
         };
-        let replay = run(&plan, &[], Granularity::H1, all_live(), all_live(), 0.0).await;
+        let replay = run(&plan, &[], Granularity::H1, all_live(), all_live()).await;
         assert!(replay.fires.is_empty());
     }
 
@@ -290,7 +308,7 @@ mod tests {
     #[tokio::test]
     async fn trade_expiry_fires_when_a_bar_opens_at_expiry() {
         let expiry = 15 * 3600;
-        let candles: Vec<Candle> = (0..=15).map(|i| candle(i * 3600, 1.30)).collect();
+        let candles: Vec<EngineCandle> = (0..=15).map(|i| candle(i * 3600, 1.30)).collect();
         // The last bar opens at exactly `expiry` → `candle.time >= expiry`.
         assert_eq!(candles.last().unwrap().time.timestamp(), expiry);
         let replay = run(
@@ -299,7 +317,6 @@ mod tests {
             Granularity::H1,
             all_live(),
             expires(),
-            0.0,
         )
         .await;
         assert!(
@@ -316,7 +333,7 @@ mod tests {
     #[tokio::test]
     async fn trade_expiry_does_not_fire_a_bar_short() {
         let expiry = 15 * 3600;
-        let candles: Vec<Candle> = (0..15).map(|i| candle(i * 3600, 1.30)).collect();
+        let candles: Vec<EngineCandle> = (0..15).map(|i| candle(i * 3600, 1.30)).collect();
         assert!(candles.last().unwrap().time.timestamp() < expiry);
         let replay = run(
             &expiry_plan(expiry),
@@ -324,7 +341,6 @@ mod tests {
             Granularity::H1,
             all_live(),
             expires(),
-            0.0,
         )
         .await;
         assert!(!replay.done);
@@ -362,13 +378,22 @@ mod tests {
     }
 
     /// A candle with explicit OHLC (so we can place a wick across a level).
-    fn ohlc(epoch: i64, o: f64, h: f64, l: f64, c: f64) -> Candle {
-        Candle {
+    /// A bid==ask==mid bar with explicit OHLC (zero spread).
+    fn ohlc(epoch: i64, o: f64, h: f64, l: f64, c: f64) -> EngineCandle {
+        EngineCandle {
             time: Utc.timestamp_opt(epoch, 0).unwrap(),
             o,
             h,
             l,
             c,
+            bid_o: o,
+            bid_h: h,
+            bid_l: l,
+            bid_c: c,
+            ask_o: o,
+            ask_h: h,
+            ask_l: l,
+            ask_c: c,
         }
     }
 
@@ -381,7 +406,7 @@ mod tests {
         let level = 1.30;
         // 40 bars below the level, except two close-confirmed up-crosses:
         // bar 5 (warm-up) and bar 25 (live, well past the SEED_BARS floor).
-        let mut candles: Vec<Candle> = (0..40)
+        let mut candles: Vec<EngineCandle> = (0..40)
             .map(|i| ohlc(i * 3600, 1.20, 1.21, 1.19, 1.205))
             .collect();
         candles[5] = ohlc(5 * 3600, 1.29, 1.31, 1.28, 1.305); // warm-up breach
@@ -395,7 +420,6 @@ mod tests {
             Granularity::H1,
             live_at,
             expires(),
-            0.0,
         )
         .await;
         assert_eq!(

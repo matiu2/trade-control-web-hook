@@ -16,8 +16,8 @@ use std::cell::RefCell;
 
 use chrono::{DateTime, Utc};
 use trade_control_core::broker::{
-    AmendError, AttemptState, Broker, CancelError, Candle, CandleError, EntryError, EntryRequest,
-    Granularity, LookupError, OpenPosition, PendingOrder, Quote,
+    AmendError, AttemptState, BidAskCandle, Broker, CancelError, Candle, CandleError, EntryError,
+    EntryRequest, Granularity, LookupError, OpenPosition, PendingOrder, Quote,
 };
 use trade_control_core::intent::{Intent, Shell};
 use trade_control_engine::{SimOutcome, simulate_fill};
@@ -38,11 +38,11 @@ struct PlacedAttempt {
 
 /// Offline broker that resolves prior-attempt state from the candle window.
 pub struct ReplayBroker {
-    /// The full pulled candle window (warm-up + live), ascending. Each lookup
-    /// re-simulates an attempt against the prefix up to the asking bar.
-    candles: Vec<Candle>,
+    /// The full pulled bid/ask candle window (warm-up + live), ascending. Each
+    /// lookup re-simulates an attempt against the prefix up to the asking bar,
+    /// filling each leg on the real book side.
+    candles: Vec<BidAskCandle>,
     pip_size: f64,
-    half_spread: f64,
     /// The bar the gate is currently asking about — its open time. Set by the
     /// replay loop before each `evaluate`, so `lookup_attempt_state` bounds its
     /// simulation at this bar (time-accurate prior-state resolution).
@@ -51,12 +51,11 @@ pub struct ReplayBroker {
 }
 
 impl ReplayBroker {
-    pub fn new(candles: Vec<Candle>, pip_size: f64, half_spread: f64) -> Self {
+    pub fn new(candles: Vec<BidAskCandle>, pip_size: f64) -> Self {
         let last = candles.last().map(|c| c.time).unwrap_or_else(Utc::now);
         Self {
             candles,
             pip_size,
-            half_spread,
             as_of: RefCell::new(last),
             placed: RefCell::new(Vec::new()),
         }
@@ -82,7 +81,7 @@ impl ReplayBroker {
 
     /// Candles up to and including the `as_of` bar — the slice a prior attempt
     /// is simulated against. Bounding here is what makes re-entry time-accurate.
-    fn window_to_as_of(&self) -> Vec<Candle> {
+    fn window_to_as_of(&self) -> Vec<BidAskCandle> {
         let as_of = *self.as_of.borrow();
         self.candles
             .iter()
@@ -101,17 +100,11 @@ impl ReplayBroker {
         let window = self.window_to_as_of();
         // Forward path = candles from the firing bar onward (simulate_fill walks
         // these to find the fill, then the SL/TP touch).
-        let forward: Vec<Candle> = window
+        let forward: Vec<BidAskCandle> = window
             .into_iter()
             .filter(|c| c.time >= attempt.shell.time)
             .collect();
-        match simulate_fill(
-            &attempt.intent,
-            &attempt.shell,
-            self.pip_size,
-            self.half_spread,
-            &forward,
-        ) {
+        match simulate_fill(&attempt.intent, &attempt.shell, self.pip_size, &forward) {
             SimOutcome::StoppedOut { .. } => {
                 AttemptState::ClosedLossOrBreakeven { realized_pl: -1.0 }
             }
@@ -248,13 +241,24 @@ mod tests {
     use super::*;
     use chrono::TimeZone;
 
-    fn candle(epoch: i64, c: f64) -> Candle {
-        Candle {
+    /// A bid==ask==mid bar (zero spread) — the books equal the mid OHLC, so the
+    /// fill tests read as plain prices while still exercising the bid/ask path.
+    fn candle(epoch: i64, c: f64) -> BidAskCandle {
+        let (o, h, l) = (c, c + 0.001, c - 0.001);
+        BidAskCandle {
             time: Utc.timestamp_opt(epoch, 0).unwrap(),
-            o: c,
-            h: c + 0.001,
-            l: c - 0.001,
+            o,
+            h,
+            l,
             c,
+            bid_o: o,
+            bid_h: h,
+            bid_l: l,
+            bid_c: c,
+            ask_o: o,
+            ask_h: h,
+            ask_l: l,
+            ask_c: c,
         }
     }
 
@@ -283,7 +287,7 @@ mod tests {
 
     #[tokio::test]
     async fn unknown_order_id_resolves_unknown() {
-        let b = ReplayBroker::new(vec![candle(0, 1.10)], 0.0001, 0.0);
+        let b = ReplayBroker::new(vec![candle(0, 1.10)], 0.0001);
         let st = b
             .lookup_attempt_state("EUR/USD", "nope", None)
             .await
@@ -296,8 +300,8 @@ mod tests {
         // Candles that would fill + stop the short (so absent the cancel it'd be
         // ClosedLossOrBreakeven); the cancel must override to Cancelled.
         let candles = vec![candle(0, 1.1000), candle(3600, 1.1025)];
-        let b = ReplayBroker::new(candles, 0.0001, 0.0);
-        let shell = Shell::from_candle(&candle(0, 1.1000));
+        let b = ReplayBroker::new(candles, 0.0001);
+        let shell = Shell::from_candle(&candle(0, 1.1000).mid());
         b.record_attempt("o1".into(), short_enter_intent(), shell);
         b.cancel_order("", "o1").await.unwrap();
         let st = b.lookup_attempt_state("EUR/USD", "o1", None).await.unwrap();
@@ -311,8 +315,8 @@ mod tests {
         // SL bar → ClosedLossOrBreakeven. Time-accurate prior-state resolution.
         let sl_bar = candle(3600, 1.1021);
         let candles = vec![candle(0, 1.1000), sl_bar];
-        let b = ReplayBroker::new(candles, 0.0001, 0.0);
-        let shell = Shell::from_candle(&candle(0, 1.1000));
+        let b = ReplayBroker::new(candles, 0.0001);
+        let shell = Shell::from_candle(&candle(0, 1.1000).mid());
         b.record_attempt("o1".into(), short_enter_intent(), shell);
 
         b.set_as_of(Utc.timestamp_opt(0, 0).unwrap());

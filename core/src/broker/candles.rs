@@ -30,6 +30,51 @@ pub struct Candle {
     pub c: f64,
 }
 
+/// One closed OHLC candle carrying **both** mid and the broker's bid/ask
+/// books, UTC-stamped. The engine never sees this — it runs on [`Candle`]
+/// (mid). It exists for the **fill simulator**, which must reproduce the
+/// broker's real spread: a buy fills on the ask, a sell on the bid, and the
+/// spread varies bar to bar (wide at session opens / news). The synthetic
+/// `mid ± half_spread` shift the simulator used before is replaced by these
+/// real per-bar books.
+///
+/// `time` is the **open** time, same convention as [`Candle`]. `.mid()` drops
+/// the books and returns the plain mid candle so a mid-only consumer (the
+/// engine, the detector) can reuse a bid/ask series without a separate pull.
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct BidAskCandle {
+    pub time: DateTime<Utc>,
+    // Mid OHLC (what the engine evaluates on).
+    pub o: f64,
+    pub h: f64,
+    pub l: f64,
+    pub c: f64,
+    // Bid book (a sell fills here).
+    pub bid_o: f64,
+    pub bid_h: f64,
+    pub bid_l: f64,
+    pub bid_c: f64,
+    // Ask book (a buy fills here).
+    pub ask_o: f64,
+    pub ask_h: f64,
+    pub ask_l: f64,
+    pub ask_c: f64,
+}
+
+impl BidAskCandle {
+    /// The mid-only view of this candle — for mid consumers (engine, detector)
+    /// that share a bid/ask series.
+    pub fn mid(&self) -> Candle {
+        Candle {
+            time: self.time,
+            o: self.o,
+            h: self.h,
+            l: self.l,
+            c: self.c,
+        }
+    }
+}
+
 /// The candle timeframes the engine fetches. Deliberately a small closed set —
 /// only the granularities trades are actually armed on — so every broker can
 /// map it without an "unsupported" runtime branch leaking into the engine.
