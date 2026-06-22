@@ -30,19 +30,32 @@ pub struct Replay {
     pub warnings: Vec<String>,
 }
 
-/// Number of leading candles used to seed the FSM without firing. A small
-/// fixed back-window matching the worker's `SEED_BARS`, enough for `OnClose`
-/// rules to have a `last_close` reference before the first live tick.
+/// Minimum number of leading candles used to seed the FSM without firing. A
+/// small fixed back-window matching the worker's `SEED_BARS`, enough for
+/// `OnClose` rules to have a `last_close` reference before the first live tick.
+/// The actual seed span is usually larger — every warm-up bar before
+/// `live_start` seeds silently (see [`run`]).
 const SEED_BARS: usize = 10;
 
 /// Replay `plan` over `candles` (ascending, the pulled window). `granularity`
 /// is the bar size, used to derive each tick's `now` (a closed bar's close time
 /// = its open time + one bar). `expires_at` stamps the state TTL on each tick
 /// (kept past the window so nothing expires mid-replay).
+///
+/// `live_start` is the boundary between the **warm-up prefix** and the **live
+/// window**: every candle whose open-time is `< live_start` only seeds the
+/// detector / FSM state (warms ATR, gives patterns context, primes `last_close`)
+/// and **fires nothing**. The plan goes live — vetos, preps, and the enter can
+/// fire — on the first candle at or after `live_start`. This mirrors live
+/// behaviour, where the plan is armed when the pattern forms and so cannot be
+/// retired by a stale veto-level touch that happened earlier (which would
+/// otherwise end the plan before the entry it exists to protect). The warm-up
+/// bars are pulled by the caller (`--warmup-bars`).
 pub fn run(
     plan: &TradePlan,
     candles: &[EngineCandle],
     granularity: Granularity,
+    live_start: DateTime<Utc>,
     expires_at: DateTime<Utc>,
 ) -> Replay {
     if candles.is_empty() {
@@ -56,7 +69,15 @@ pub fn run(
 
     let bar = Duration::seconds(granularity.seconds());
 
-    let seed_end = SEED_BARS.min(candles.len());
+    // Seed every bar before `live_start` (the warm-up prefix), so the detector
+    // and `last_close` are warm but nothing fires. Floor at `SEED_BARS` (so a
+    // window starting exactly at `live_start` still gets a minimal seed) and cap
+    // at `len - 1` so at least one live bar remains to evaluate.
+    let warmup_end = candles.partition_point(|c| c.time < live_start);
+    let last_live_floor = candles.len() - 1; // candles is non-empty here
+    let seed_end = warmup_end
+        .max(SEED_BARS.min(candles.len()))
+        .min(last_live_floor);
     let mut state = seed_plan_state(plan, &candles[..seed_end], expires_at);
 
     let mut fires = Vec::new();
@@ -119,6 +140,13 @@ mod tests {
         }
     }
 
+    /// A `live_start` before any candle — the whole window is live (no silent
+    /// warm-up prefix), matching the pre-warm-up `run` behaviour these tests
+    /// were written against.
+    fn all_live() -> DateTime<Utc> {
+        Utc.timestamp_opt(0, 0).unwrap()
+    }
+
     // A plan with no rules never fires and never finishes; it just advances the
     // watermark across the window. Confirms the seed/loop wiring is sound
     // without needing geometry.
@@ -138,7 +166,7 @@ mod tests {
             .collect();
         let expires = Utc.timestamp_opt(99 * 3600, 0).unwrap();
 
-        let replay = run(&plan, &candles, Granularity::H1, expires);
+        let replay = run(&plan, &candles, Granularity::H1, all_live(), expires);
 
         assert!(replay.fires.is_empty(), "no rules → no fires");
         assert!(!replay.done);
@@ -159,12 +187,7 @@ mod tests {
             rules: Vec::new(),
             shadow: false,
         };
-        let replay = run(
-            &plan,
-            &[],
-            Granularity::H1,
-            Utc.timestamp_opt(0, 0).unwrap(),
-        );
+        let replay = run(&plan, &[], Granularity::H1, all_live(), all_live());
         assert!(replay.fires.is_empty());
     }
 
@@ -180,7 +203,13 @@ mod tests {
         let candles: Vec<Candle> = (0..=15).map(|i| candle(i * 3600, 1.30)).collect();
         // The last bar opens at exactly `expiry` → `candle.time >= expiry`.
         assert_eq!(candles.last().unwrap().time.timestamp(), expiry);
-        let replay = run(&expiry_plan(expiry), &candles, Granularity::H1, expires());
+        let replay = run(
+            &expiry_plan(expiry),
+            &candles,
+            Granularity::H1,
+            all_live(),
+            expires(),
+        );
         assert!(
             replay.done,
             "a bar opening at the expiry should finish the plan"
@@ -197,13 +226,94 @@ mod tests {
         let expiry = 15 * 3600;
         let candles: Vec<Candle> = (0..15).map(|i| candle(i * 3600, 1.30)).collect();
         assert!(candles.last().unwrap().time.timestamp() < expiry);
-        let replay = run(&expiry_plan(expiry), &candles, Granularity::H1, expires());
+        let replay = run(
+            &expiry_plan(expiry),
+            &candles,
+            Granularity::H1,
+            all_live(),
+            expires(),
+        );
         assert!(!replay.done);
         assert!(replay.fires.is_empty());
     }
 
     fn expires() -> DateTime<Utc> {
         Utc.timestamp_opt(99 * 3600, 0).unwrap()
+    }
+
+    /// A plan with a single intrabar `too-high` veto at `level` (crosses up).
+    fn too_high_plan(level: f64) -> TradePlan {
+        serde_json::from_str(&format!(
+            r#"{{
+                "trade_id": "t-th",
+                "instrument": "EUR_USD",
+                "direction": "short",
+                "granularity": "h1",
+                "pip_size": 0.0001,
+                "rules": [{{
+                    "rule_id": "01-veto-too-high",
+                    "trigger": {{ "type": "horizontal_cross", "level": {level}, "dir": "up", "bar": "intrabar" }},
+                    "fire_mode": "once",
+                    "intent": {{
+                        "v": 1,
+                        "id": "th-intent",
+                        "not_after": "2099-01-01T00:00:00Z",
+                        "action": "veto",
+                        "instrument": "EUR_USD"
+                    }}
+                }}]
+            }}"#
+        ))
+        .expect("parse plan")
+    }
+
+    /// A candle with explicit OHLC (so we can place a wick across a level).
+    fn ohlc(epoch: i64, o: f64, h: f64, l: f64, c: f64) -> Candle {
+        Candle {
+            time: Utc.timestamp_opt(epoch, 0).unwrap(),
+            o,
+            h,
+            l,
+            c,
+        }
+    }
+
+    /// The core warm-up guarantee: a veto level breached only in the **warm-up
+    /// prefix** (before `live_start`) must NOT fire — those bars seed silently.
+    /// A breach in the **live** window fires. Proves the live boundary, not the
+    /// geometry, gates the veto.
+    #[test]
+    fn warmup_prefix_does_not_fire_a_veto_touched_before_live_start() {
+        let level = 1.30;
+        // 40 bars below the level, except two close-confirmed up-crosses:
+        // bar 5 (warm-up) and bar 25 (live, well past the SEED_BARS floor).
+        let mut candles: Vec<Candle> = (0..40)
+            .map(|i| ohlc(i * 3600, 1.20, 1.21, 1.19, 1.205))
+            .collect();
+        candles[5] = ohlc(5 * 3600, 1.29, 1.31, 1.28, 1.305); // warm-up breach
+        candles[25] = ohlc(25 * 3600, 1.29, 1.31, 1.28, 1.305); // live breach
+
+        // live_start at bar 20 → bar 5 is warm-up (silent), bar 25 is live.
+        let live_at = Utc.timestamp_opt(20 * 3600, 0).unwrap();
+        let r = run(
+            &too_high_plan(level),
+            &candles,
+            Granularity::H1,
+            live_at,
+            expires(),
+        );
+        assert_eq!(
+            r.fires.len(),
+            1,
+            "only the live breach (bar 25) should fire"
+        );
+        assert_eq!(r.fires[0].fired.rule_id, "01-veto-too-high");
+        // The fire is the live one, not the warm-up one: its candle is bar 25.
+        assert_eq!(
+            r.fires[0].forward.first().map(|c| c.time),
+            Some(candles[25].time),
+            "the fire must be the live breach at bar 25, not the warm-up breach at bar 5"
+        );
     }
 
     /// A plan carrying a single `02-veto-trade-expiry` `TimeReached` rule.

@@ -109,6 +109,16 @@ struct Args {
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     simulate: bool,
 
+    /// Number of extra candles pulled *before* the window start as a silent
+    /// warm-up prefix. These bars seed the detector (so ATR is warm and the
+    /// candle patterns have context) and prime the FSM, but fire nothing — the
+    /// plan only goes live at the window start. Without this, a `needs_golden`
+    /// enter can never fire (ATR never warms) and a stale veto-level touch in
+    /// the warm-up span would wrongly retire the plan. 200 covers the 96-bar
+    /// 15m ATR plus pattern lookback; raise it for very long-lookback configs.
+    #[arg(long, default_value_t = 200)]
+    warmup_bars: usize,
+
     /// Override the candle-cache disk cache directory.
     #[arg(long)]
     cache_dir: Option<PathBuf>,
@@ -161,27 +171,49 @@ async fn main() -> Result<()> {
     // first `done`, and trailing candles are ignored.
     let pull_end = end + Duration::seconds(gran.engine().seconds());
 
+    // Pull a silent warm-up prefix before `start`: these bars seed the detector
+    // (warm ATR, pattern context) and the FSM but fire nothing — the plan goes
+    // live at `start` (see `replay::run`'s `live_start`). The cache pull is
+    // time-windowed, so size the prefix by time = warmup_bars × bar.
+    let bar_secs = gran.engine().seconds();
+    let pull_from = start - Duration::seconds(bar_secs * args.warmup_bars as i64);
+
     tracing::info!(
         instrument = %symbol,
         granularity = %gran_label,
         source = ?args.source,
+        warmup_from = %brisbane::bne(pull_from),
         start = %brisbane::bne(start),
         end = %brisbane::bne(end),
         pull_end = %brisbane::bne(pull_end),
+        warmup_bars = args.warmup_bars,
         "pulling candles (times in Brisbane, UTC+10)"
     );
-    let candles =
-        candles::pull(args.source, &symbol, gran, start, pull_end, args.cache_dir).await?;
+    let candles = candles::pull(
+        args.source,
+        &symbol,
+        gran,
+        pull_from,
+        pull_end,
+        args.cache_dir,
+    )
+    .await?;
     if candles.is_empty() {
         return Err(eyre!(
-            "no candles returned for {symbol} {gran_label} in [{start}, {pull_end}]"
+            "no candles returned for {symbol} {gran_label} in [{pull_from}, {pull_end}]"
         ));
     }
-    tracing::info!(count = candles.len(), "pulled candles");
+    let warmup_count = candles.iter().filter(|c| c.time < start).count();
+    tracing::info!(
+        count = candles.len(),
+        warmup = warmup_count,
+        live = candles.len() - warmup_count,
+        "pulled candles"
+    );
 
     // Keep the state TTL past the window so nothing expires mid-replay.
     let expires_at = end + Duration::days(365);
-    let replay = replay::run(&plan, &candles, gran.engine(), expires_at);
+    let replay = replay::run(&plan, &candles, gran.engine(), start, expires_at);
 
     print!("{}", report::render(&plan, &replay, args.simulate));
     Ok(())
@@ -459,6 +491,7 @@ mod tests {
             end: None,
             tv_mcp_root: None,
             simulate: true,
+            warmup_bars: 200,
             cache_dir: None,
             print_completions: false,
         }
