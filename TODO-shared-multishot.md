@@ -14,7 +14,34 @@ trade should **re-enter at the 13:00 golden short pinbar** — but replay shows 
 fire + Done. The 13:00 bar IS golden (`fires=true` in the latch dump); the plan
 just retired instead of re-arming.
 
-## Design (settled)
+## REVISED design (settled 2026-06-22, user's async-broker model)
+
+Do NOT extract a pure decision fn. Instead share the **whole async gate** and
+swap only the broker (the user's insight: re-entry must really ask the broker if
+the prior position closed; in replay the "broker" approximates that from candles).
+
+- **Step 1 — DONE (commit 940c948):** `retry_gate` moved `src/` → `core/` (it was
+  already generic over `<B: Broker, S: StateStore>`; only `rlog!` macros blocked
+  it → now `tracing`). Worker calls `core::retry_gate::evaluate(real_broker, kv)`;
+  18 gate + 211 worker tests green; wasm compiles.
+- **Step 2 — replay fake broker + multi-shot loop (THIS step):**
+  - `ReplayBroker` impls `Broker`. Only the retry-gate methods do real work:
+    - `lookup_attempt_state(order_id)`: find the synthetic `EntryAttempt`,
+      `simulate_fill` it against candles **up to the asking bar** (user choice:
+      time-accurate), map `SimOutcome` → `AttemptState`:
+      `StoppedOut`→`ClosedLossOrBreakeven`, `TookProfit`→`ClosedWin`,
+      `FilledOpen`→`OpenPosition{trade_id}`, `NeverFilled`→`Pending`/`Cancelled`.
+    - `list_open_positions`: synthetic positions for attempts still open by now.
+    - `cancel_order`: mark the synthetic attempt cancelled.
+    - everything else (`place_entry`, `amend_stop`, `get_candles`, …): unreachable
+      stub / no-op (replay never places real orders).
+  - `MemStateStore` (already in core, `test-support`) is the ledger.
+  - Replay loop: on an enter fire, don't `break` on `Done`. Call
+    `retry_gate::evaluate(replay_broker, mem_store, intent, shell)`; on `Proceed`
+    `simulate_fill` the entry, `record_placement` a synthetic attempt, re-arm to
+    `AwaitEntry`, keep scanning. Stop on gate reject (cap/open) or window end.
+
+## Original (superseded) design
 Extract the **pure decision** of `retry_gate::evaluate` into `core` so the worker
 and the replay call the SAME collapse/cap logic. I/O stays per-consumer.
 

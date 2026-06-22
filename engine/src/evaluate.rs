@@ -435,11 +435,32 @@ fn evaluate_entry(
     push_fire_signal(rule, candle, signal, fired);
     // A heartbeat (EveryBar) enter does not latch or finish the spine — the
     // worker's run_enter owns the actual placement/dedup, and M/W rides its TTL
-    // / a veto to end. A single-shot (Once) enter ends the spine.
+    // / a veto to end.
+    //
+    // A single-shot (`Once`) enter normally ends the spine on its first fire.
+    // **But a multi-shot enter (`max_retries > 0`) must NOT** — it is the place
+    // → fill → close → re-enter-on-the-next-signal-bar mechanism, and if the
+    // engine retired the plan here the cron would archive it (engine.rs) and no
+    // later bar could ever fire the re-entry. So a multi-shot enter fires this
+    // bar and stays in `AwaitEntry`: the plan survives, its vetos keep ticking,
+    // and the next golden signal bar fires again. The *placement cap* is the
+    // worker's `retry_gate` (which the replay also runs); the engine just keeps
+    // emitting fires. The plan still retires the normal way — a terminal veto /
+    // trade-expiry, or the enter's `not_after` window closing.
+    //
+    // `max_retries` is `Tunable<u32>`; treat anything other than the static
+    // default `Static(0)` as multi-shot, mirroring the worker's gate-entry
+    // check (`src/lib.rs` `run_enter`). A script-based cap (rare) is therefore
+    // multi-shot here too — the worker resolves the actual number at placement.
+    let multi_shot = !matches!(
+        rule.intent.max_retries,
+        trade_control_core::tunable::Tunable::Static(0)
+    );
     if matches!(
         rule.fire_mode,
         trade_control_core::trade_plan::FireMode::Once
-    ) {
+    ) && !multi_shot
+    {
         state.fired.insert(rule.rule_id.clone());
         state.phase = Phase::Done;
     }
@@ -1929,6 +1950,35 @@ mod tests {
         assert!((sig.signal_low - 1.10).abs() < 1e-12);
         // single-shot enter ends the spine.
         assert!(eval.done);
+    }
+
+    #[test]
+    fn multi_shot_pine_enter_fires_but_stays_await_entry() {
+        // Same fire as the single-shot case, but the enter opts into multi-shot
+        // (`max_retries > 0`). It must fire AND keep the plan in `AwaitEntry` so
+        // a later signal bar can re-enter — if it went `Done`, the cron would
+        // archive the plan and no re-entry could ever fire (the NZD/CHF bug).
+        let mut rule = pine_enter_rule(None, Direction::Short, false);
+        rule.intent.max_retries = trade_control_core::tunable::Tunable::Static(5);
+        let p = plan(vec![rule]);
+        let window = bearish_pinbar_window();
+        let prior = seed_at(Phase::AwaitEntry, "2026-06-16T10:00:00Z");
+        let eval = run_window(&p, &prior, &window[3..], &window);
+        assert_eq!(eval.fired.len(), 1, "the pinbar still fires the enter");
+        assert_eq!(eval.fired[0].rule_id, "05-enter");
+        assert!(
+            !eval.done,
+            "a multi-shot enter must NOT retire the plan on its first fire"
+        );
+        assert_eq!(
+            eval.new_state.phase,
+            Phase::AwaitEntry,
+            "the plan stays armed for the next re-entry signal"
+        );
+        assert!(
+            !eval.new_state.fired.contains("05-enter"),
+            "a multi-shot enter must not latch in `fired` (it re-fires on new bars)"
+        );
     }
 
     #[test]
