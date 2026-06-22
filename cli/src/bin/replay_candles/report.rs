@@ -12,9 +12,11 @@ use trade_control_engine::{SimOutcome, TradePlan, simulate_fill};
 use super::brisbane::bne;
 use super::replay::{Fire, Replay};
 
-/// How a filled position ended, for annotation purposes. `--annotate`
-/// draws only the three *filled* outcomes; the rest of the report still
-/// prints every fire (including never-filled / declined ones).
+/// How a position resolved, for annotation purposes. The first three are
+/// *taken* (filled) outcomes; the last two are *not-taken* — an order that
+/// the price path never filled, or an entry the worker declined to place.
+/// `--annotate` always draws the taken outcomes; `--annotate-unfilled` adds
+/// the not-taken ones (drawn at the fire bar, muted, since there is no fill).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FillKind {
     /// Filled and still open at the window's end.
@@ -23,6 +25,19 @@ pub enum FillKind {
     StoppedOut,
     /// Filled then hit take-profit.
     TookProfit,
+    /// A pending order that never triggered within the window. Not taken.
+    NeverFilled,
+    /// An entry the worker declined to place (entry past a gate level). Not taken.
+    Declined,
+}
+
+impl FillKind {
+    /// Was this position actually taken (an order filled)? `false` for the
+    /// not-taken kinds (`NeverFilled` / `Declined`), which only have an
+    /// *intended* bracket, anchored at the fire bar.
+    pub fn is_taken(self) -> bool {
+        matches!(self, Self::Open | Self::StoppedOut | Self::TookProfit)
+    }
 }
 
 /// The resolved bracket plus simulated fill for one *filled* enter fire —
@@ -48,13 +63,25 @@ pub struct FireResult {
 /// [`FireResult`] **only** when it's an enter that actually filled
 /// (`Open` / `StoppedOut` / `TookProfit`). Non-enters, unresolved
 /// brackets, declined entries, and never-filled pending orders yield
-/// `None` — they have no position to annotate.
+/// `None` — they have no *taken* position to annotate.
 ///
 /// The shell reconstruction mirrors the worker's dispatch (an H&S Pine
 /// fire folds its latched signal onto the shell), so the levels match
 /// what the live worker would have placed — and the report's `order:`
 /// line, which resolves the same way.
 pub fn resolve_fire(plan: &TradePlan, fire: &Fire) -> Option<FireResult> {
+    resolve_fire_any(plan, fire).filter(|r| r.kind.is_taken())
+}
+
+/// Like [`resolve_fire`], but also returns the *not-taken* enters —
+/// pending orders that never filled (`NeverFilled`) and entries the worker
+/// declined (`Declined`). These have no fill bar, so the box is anchored at
+/// the **fire bar** (where the order would have been placed) and runs to the
+/// window end; `entry_price` is the intended placed level, not a fill.
+///
+/// Still `None` for non-enters and for enters whose bracket can't resolve
+/// (an `Unresolved` outcome — nothing meaningful to draw).
+pub fn resolve_fire_any(plan: &TradePlan, fire: &Fire) -> Option<FireResult> {
     let intent = &fire.fired.intent;
     if intent.action != Action::Enter {
         return None;
@@ -65,9 +92,13 @@ pub fn resolve_fire(plan: &TradePlan, fire: &Fire) -> Option<FireResult> {
         None => Shell::from_candle(candle),
     };
     let resolved = Resolved::from_intent(intent, &shell, plan.pip_size).ok()?;
-    // For an open trade the box runs to the last replayed bar; closed trades
-    // override this with their exit bar below.
+    // For an open / not-taken trade the box runs to the last replayed bar;
+    // closed trades override this with their exit bar below.
     let window_end = fire.forward.last().map(|c| c.time)?;
+    // The fire bar is the not-taken anchor: an order that never filled (or was
+    // declined) was still "placed" at this bar, so draw the intended bracket
+    // there.
+    let fire_at = candle.time;
     let (fill_at, until, entry_price, kind) =
         match simulate_fill(intent, &shell, plan.pip_size, &fire.forward) {
             SimOutcome::FilledOpen {
@@ -86,10 +117,22 @@ pub fn resolve_fire(plan: &TradePlan, fire: &Fire) -> Option<FireResult> {
                 exit_at,
                 ..
             } => (fill_at, exit_at, entry_price, FillKind::TookProfit),
-            // No position to annotate.
-            SimOutcome::NeverFilled | SimOutcome::Unresolved(_) | SimOutcome::Declined { .. } => {
-                return None;
-            }
+            // Not taken: anchor the intended bracket at the fire bar, running
+            // to the window end. The placed level (`resolved`) is the entry.
+            SimOutcome::NeverFilled => (
+                fire_at,
+                window_end,
+                resolved.entry.reference_price(),
+                FillKind::NeverFilled,
+            ),
+            SimOutcome::Declined { .. } => (
+                fire_at,
+                window_end,
+                resolved.entry.reference_price(),
+                FillKind::Declined,
+            ),
+            // Nothing meaningful to draw.
+            SimOutcome::Unresolved(_) => return None,
         };
     Some(FireResult {
         direction: resolved.direction,
@@ -338,6 +381,15 @@ mod tests {
             dry_run: false,
             on_too_close: None,
         }
+    }
+
+    #[test]
+    fn taken_kinds_are_filled_not_taken_kinds_are_not() {
+        assert!(FillKind::Open.is_taken());
+        assert!(FillKind::StoppedOut.is_taken());
+        assert!(FillKind::TookProfit.is_taken());
+        assert!(!FillKind::NeverFilled.is_taken());
+        assert!(!FillKind::Declined.is_taken());
     }
 
     #[test]

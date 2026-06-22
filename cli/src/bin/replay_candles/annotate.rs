@@ -36,24 +36,40 @@ const TAG_PREFIX: &str = "replay:";
 const TP_COLOR: &str = "#26a69a";
 /// Stop-loss box colour (TradingView's default short-red).
 const SL_COLOR: &str = "#ef5350";
-/// Fill transparency for the boxes (0 opaque … 100 invisible). Light tint
-/// so the candles underneath stay readable.
+/// Muted box colour for a *not-taken* trade (never filled / declined) — grey,
+/// so the operator can tell at a glance it never went on. Both legs share it.
+const UNFILLED_COLOR: &str = "#787b86";
+/// Fill transparency for taken-position boxes (0 opaque … 100 invisible).
+/// Light tint so the candles underneath stay readable.
 const BOX_TRANSPARENCY: u8 = 80;
+/// Fainter still for a not-taken trade — it's only the *intended* bracket, so
+/// it should sit visually behind the taken positions.
+const UNFILLED_TRANSPARENCY: u8 = 90;
 
-/// Clear prior replay annotations, then draw the filled positions from
-/// `replay` onto the chart `mcp` points at. Returns the number of
-/// positions drawn (each is two rectangles).
-pub fn annotate(mcp: &TvMcp, plan: &TradePlan, replay: &Replay) -> Result<usize> {
+/// Clear prior replay annotations, then draw the replayed positions from
+/// `replay` onto the chart `mcp` points at. Returns the number of positions
+/// drawn (each is two rectangles). With `include_unfilled`, the not-taken
+/// enters (never-filled pending orders, declined entries) are drawn too — as
+/// muted boxes anchored at the fire bar — otherwise only the taken ones.
+pub fn annotate(
+    mcp: &TvMcp,
+    plan: &TradePlan,
+    replay: &Replay,
+    include_unfilled: bool,
+) -> Result<usize> {
     let cleared = clear_prior(mcp)?;
     if cleared > 0 {
         tracing::info!(cleared, "removed prior replay annotations");
     }
 
-    let positions: Vec<FireResult> = replay
-        .fires
-        .iter()
-        .filter_map(|f| report::resolve_fire(plan, f))
-        .collect();
+    let resolve = |f: &_| {
+        if include_unfilled {
+            report::resolve_fire_any(plan, f)
+        } else {
+            report::resolve_fire(plan, f)
+        }
+    };
+    let positions: Vec<FireResult> = replay.fires.iter().filter_map(resolve).collect();
 
     for pos in &positions {
         draw_position(mcp, plan, pos)?;
@@ -87,21 +103,25 @@ fn clear_prior(mcp: &TvMcp) -> Result<usize> {
     Ok(removed)
 }
 
-/// Draw one position as a green entry→TP box and a red entry→SL box,
-/// spanning the fill bar to the exit (or window end). Both rectangles
-/// carry the same `replay:` tag so the next run clears them.
+/// Draw one position as an entry→TP box and an entry→SL box, spanning the
+/// fill bar to the exit (or window end). A *taken* trade gets the green/red
+/// zones; a *not-taken* one (never-filled / declined) gets two muted grey
+/// boxes at the fire bar, since it never went on. Both rectangles carry the
+/// same `replay:` tag so the next run clears them.
 fn draw_position(mcp: &TvMcp, plan: &TradePlan, pos: &FireResult) -> Result<()> {
     let from = pos.fill_at.timestamp();
     let to = pos.until.timestamp();
     let tag = annotation_tag(plan, pos);
+    let taken = pos.kind.is_taken();
+    let (tp_color, sl_color, transparency) = box_style(taken);
 
     mcp.draw_rectangle(&Rect {
         time1: from,
         price1: pos.entry_price,
         time2: to,
         price2: pos.take_profit,
-        color: TP_COLOR,
-        transparency: BOX_TRANSPARENCY,
+        color: tp_color,
+        transparency,
         text: &tag,
     })?;
     mcp.draw_rectangle(&Rect {
@@ -109,17 +129,34 @@ fn draw_position(mcp: &TvMcp, plan: &TradePlan, pos: &FireResult) -> Result<()> 
         price1: pos.entry_price,
         time2: to,
         price2: pos.stop_loss,
-        color: SL_COLOR,
-        transparency: BOX_TRANSPARENCY,
+        color: sl_color,
+        transparency,
         text: &tag,
     })?;
+    let shape = if taken {
+        "entry→TP green, entry→SL red"
+    } else {
+        "intended bracket, muted (not taken)"
+    };
     tracing::info!(
         tag = %tag,
         direction = ?pos.direction,
         from = %bne(pos.fill_at),
-        "drew position (entry→TP green, entry→SL red)"
+        "drew position ({shape})"
     );
     Ok(())
+}
+
+/// The (TP-box colour, SL-box colour, transparency) for a position. A *taken*
+/// trade gets the green TP / red SL zones at the normal tint; a *not-taken*
+/// one gets two muted grey boxes, fainter still, so it reads as "intended,
+/// never went on".
+fn box_style(taken: bool) -> (&'static str, &'static str, u8) {
+    if taken {
+        (TP_COLOR, SL_COLOR, BOX_TRANSPARENCY)
+    } else {
+        (UNFILLED_COLOR, UNFILLED_COLOR, UNFILLED_TRANSPARENCY)
+    }
 }
 
 /// Short outcome label baked into the annotation tag so the operator can
@@ -129,6 +166,8 @@ fn outcome_label(kind: FillKind) -> &'static str {
         FillKind::Open => "open",
         FillKind::StoppedOut => "SL",
         FillKind::TookProfit => "TP",
+        FillKind::NeverFilled => "no-fill",
+        FillKind::Declined => "declined",
     }
 }
 
@@ -192,9 +231,23 @@ mod tests {
     }
 
     #[test]
-    fn outcome_label_covers_every_filled_kind() {
+    fn taken_positions_are_green_red_not_taken_are_muted() {
+        let (tp, sl, t) = box_style(true);
+        assert_eq!((tp, sl), (TP_COLOR, SL_COLOR), "taken = green TP / red SL");
+        assert_eq!(t, BOX_TRANSPARENCY);
+
+        let (tp, sl, t) = box_style(false);
+        assert_eq!(tp, UNFILLED_COLOR, "not-taken TP muted");
+        assert_eq!(sl, UNFILLED_COLOR, "not-taken SL muted");
+        assert!(t > BOX_TRANSPARENCY, "not-taken is fainter than taken");
+    }
+
+    #[test]
+    fn outcome_label_covers_every_kind() {
         assert_eq!(outcome_label(FillKind::Open), "open");
         assert_eq!(outcome_label(FillKind::StoppedOut), "SL");
         assert_eq!(outcome_label(FillKind::TookProfit), "TP");
+        assert_eq!(outcome_label(FillKind::NeverFilled), "no-fill");
+        assert_eq!(outcome_label(FillKind::Declined), "declined");
     }
 }

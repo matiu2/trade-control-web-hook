@@ -120,6 +120,13 @@ struct Args {
     #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
     annotate: bool,
 
+    /// Also annotate *not-taken* trades — pending orders that never filled and
+    /// entries the worker declined — as muted grey boxes at the fire bar. Only
+    /// meaningful with `--annotate` (and implies it). Off by default, so a
+    /// plain `--annotate` shows just the taken positions.
+    #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
+    annotate_unfilled: bool,
+
     /// Number of extra candles pulled *before* the window start as a silent
     /// warm-up prefix. These bars seed the detector (so ATR is warm and the
     /// candle patterns have context) and prime the FSM, but fire nothing — the
@@ -156,12 +163,15 @@ async fn main() -> Result<()> {
 
     let args = Args::parse();
 
-    // Annotation draws each *filled* position, which needs the simulated fill —
-    // so `--annotate` forces simulation on even if the operator passed
+    // `--annotate-unfilled` is a superset of `--annotate` (it adds the
+    // not-taken trades), so it implies annotation is on.
+    let annotate = args.annotate || args.annotate_unfilled;
+    // Annotation draws each position, which needs the simulated fill — so
+    // annotating forces simulation on even if the operator passed
     // `--simulate false`.
-    let simulate = args.simulate || args.annotate;
-    if args.annotate && !args.simulate {
-        tracing::info!("--annotate implies --simulate; running the fill simulator");
+    let simulate = args.simulate || annotate;
+    if annotate && !args.simulate {
+        tracing::info!("annotation implies --simulate; running the fill simulator");
     }
 
     let plan = load_plan(&args.plan)?;
@@ -237,14 +247,19 @@ async fn main() -> Result<()> {
 
     print!("{}", report::render(&plan, &replay, simulate));
 
-    if args.annotate {
+    if annotate {
         let mcp = match &args.tv_mcp_root {
             Some(root) => TvMcp::new(root.clone()),
             None => TvMcp::default(),
         };
-        tracing::info!(root = %mcp.root().display(), "annotating filled positions on the chart");
-        let drawn = annotate::annotate(&mcp, &plan, &replay)?;
-        println!("annotated {drawn} filled position(s) on the chart");
+        let scope = if args.annotate_unfilled {
+            "positions (incl. not-taken)"
+        } else {
+            "filled positions"
+        };
+        tracing::info!(root = %mcp.root().display(), "annotating {scope} on the chart");
+        let drawn = annotate::annotate(&mcp, &plan, &replay, args.annotate_unfilled)?;
+        println!("annotated {drawn} position(s) on the chart");
     }
     Ok(())
 }
@@ -522,6 +537,7 @@ mod tests {
             tv_mcp_root: None,
             simulate: true,
             annotate: false,
+            annotate_unfilled: false,
             warmup_bars: 200,
             cache_dir: None,
             print_completions: false,
