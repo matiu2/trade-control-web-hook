@@ -12,7 +12,7 @@ use super::brisbane::bne;
 use super::replay::{Fire, Replay};
 
 /// Render the full replay report as a string.
-pub fn render(plan: &TradePlan, replay: &Replay, simulate: bool) -> String {
+pub fn render(plan: &TradePlan, replay: &Replay, simulate: bool, half_spread: f64) -> String {
     let mut out = String::new();
     out.push_str(&format!(
         "Plan {} ({}, {:?}) — {} fire(s) over the window\n",
@@ -25,7 +25,14 @@ pub fn render(plan: &TradePlan, replay: &Replay, simulate: bool) -> String {
     let mut wins = 0usize;
     let mut losses = 0usize;
     for fire in &replay.fires {
-        out.push_str(&render_fire(plan, fire, simulate, &mut wins, &mut losses));
+        out.push_str(&render_fire(
+            plan,
+            fire,
+            simulate,
+            half_spread,
+            &mut wins,
+            &mut losses,
+        ));
     }
 
     if !replay.warnings.is_empty() {
@@ -52,6 +59,7 @@ fn render_fire(
     plan: &TradePlan,
     fire: &Fire,
     simulate: bool,
+    half_spread: f64,
     wins: &mut usize,
     losses: &mut usize,
 ) -> String {
@@ -79,7 +87,7 @@ fn render_fire(
         Some(sig) => Shell::from_candle_and_signal(candle, sig),
         None => Shell::from_candle(candle),
     };
-    let outcome = simulate_fill(intent, &shell, plan.pip_size, &fire.forward);
+    let outcome = simulate_fill(intent, &shell, plan.pip_size, half_spread, &fire.forward);
     line.push_str(&format!("    {}\n", describe_outcome(&outcome)));
     match outcome {
         SimOutcome::TookProfit { .. } => *wins += 1,
