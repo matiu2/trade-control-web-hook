@@ -1012,11 +1012,6 @@ pub enum IntentValidationError {
     /// a zero/negative/NaN value would silently zero or invert the trade
     /// geometry.
     PipSizeInvalid,
-    /// `entry: { type: stop, recover_entry: { action: market } }` was
-    /// missing the required `max_slippage_pips` guard rail. Without it a
-    /// runaway breakout could be chased into an arbitrarily worse fill,
-    /// so `market` requires the bound.
-    RecoverEntryMissingSlippage,
     /// `enter` / `veto` / `clear-veto` reached validation without a
     /// `trade_id`. The veto KV key is
     /// `veto:<account>:<trade_id>:<instrument>:<name>` — without a
@@ -1095,9 +1090,6 @@ impl core::fmt::Display for IntentValidationError {
                 "mw params invalid: anchor prices must be finite, spread_pips >= 0, pip_size > 0",
             ),
             Self::PipSizeInvalid => f.write_str("pip_size must be finite and > 0"),
-            Self::RecoverEntryMissingSlippage => {
-                f.write_str("entry recover_entry: action market requires max_slippage_pips")
-            }
             Self::MissingTradeId => {
                 f.write_str("trade_id is required on action: enter | veto | clear-veto")
             }
@@ -1308,18 +1300,11 @@ impl Intent {
         {
             return Err(IntentValidationError::PipSizeInvalid);
         }
-        // recover_entry (stop-entry recovery): a `market` recovery must
-        // carry its `max_slippage_pips` guard rail. Catch the malformed
-        // form here so a missing bound fails before dispatch rather than
-        // silently degrading to `skip` at the worker.
-        if let Some(EntrySpec::Stop {
-            recover_entry: Some(rec),
-            ..
-        }) = &self.entry
-            && rec.is_missing_required_slippage()
-        {
-            return Err(IntentValidationError::RecoverEntryMissingSlippage);
-        }
+        // recover_entry: a `market` recovery no longer requires an explicit
+        // `max_slippage_pips` — the resolver derives the bound from the
+        // SL→entry distance when it's omitted (see
+        // `resolution::resolve_recover_entry` and the wrong-side Stop arm),
+        // so there is no malformed form to reject here.
         Ok(())
     }
 }
@@ -1649,17 +1634,6 @@ pub enum RecoverEntryAction {
     /// fail (502, no seen-id poison, broker-time) so the next signal bar
     /// can retry. Identical to omitting `recover_entry` entirely.
     Skip,
-}
-
-impl RecoverEntry {
-    /// True iff this recovery is missing its required guard rail: a
-    /// `market` action without `max_slippage_pips`. Used by
-    /// [`Intent::validate`] and the CLI builder so a malformed recovery
-    /// fails before it reaches the worker (where the missing guard
-    /// would silently degrade to `skip`).
-    pub fn is_missing_required_slippage(&self) -> bool {
-        matches!(self.action, RecoverEntryAction::Market) && self.max_slippage_pips.is_none()
-    }
 }
 
 impl Shell {
@@ -2239,7 +2213,6 @@ mod tests {
             } => {
                 assert_eq!(rec.action, RecoverEntryAction::Market);
                 assert!((rec.max_slippage_pips.unwrap() - 8.0).abs() < 1e-9);
-                assert!(!rec.is_missing_required_slippage());
             }
             other => panic!("expected stop with recover_entry, got {other:?}"),
         }
@@ -2294,20 +2267,19 @@ mod tests {
     fn recover_entry_skip_and_limit_parse() {
         let skip: RecoverEntry = serde_yaml::from_str("{ action: skip }").unwrap();
         assert_eq!(skip.action, RecoverEntryAction::Skip);
-        assert!(!skip.is_missing_required_slippage());
 
         let limit: RecoverEntry = serde_yaml::from_str("{ action: limit }").unwrap();
         assert_eq!(limit.action, RecoverEntryAction::Limit);
-        assert!(!limit.is_missing_required_slippage());
     }
 
     #[test]
-    fn recover_entry_market_without_slippage_flagged() {
-        // `market` without `max_slippage_pips` parses (serde-wise) but
-        // is_missing_required_slippage() flags it for validation.
+    fn recover_entry_market_without_slippage_parses() {
+        // `market` without `max_slippage_pips` is valid: the resolver
+        // derives the SL→entry slippage bound, so no explicit value is
+        // required (was previously flagged as a validation error).
         let rec: RecoverEntry = serde_yaml::from_str("{ action: market }").unwrap();
         assert_eq!(rec.action, RecoverEntryAction::Market);
-        assert!(rec.is_missing_required_slippage());
+        assert!(rec.max_slippage_pips.is_none());
     }
 
     #[test]
@@ -3306,7 +3278,10 @@ mod tests {
     }
 
     #[test]
-    fn validate_rejects_recover_entry_market_without_slippage() {
+    fn validate_accepts_recover_entry_market_without_slippage() {
+        // The resolver derives the slippage bound from the SL→entry
+        // distance, so an explicit `max_slippage_pips` is no longer
+        // required for a `market` recovery (was previously rejected).
         let yaml = "
             v: 1
             id: enter-1
@@ -3320,10 +3295,7 @@ mod tests {
             take_profit: { from: close, offset_r: 2.0 }
         ";
         let intent: Intent = serde_yaml::from_str(yaml).unwrap();
-        assert_eq!(
-            intent.validate(),
-            Err(IntentValidationError::RecoverEntryMissingSlippage)
-        );
+        intent.validate().unwrap();
     }
 
     #[test]
