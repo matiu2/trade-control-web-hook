@@ -28,8 +28,25 @@ const OANDA_API_KEY: &str = "OANDA_API_KEY";
 pub const OANDA_ACCOUNT_ID: &str = "OANDA_ACCOUNT_ID";
 const OANDA_LIVE: &str = "OANDA_LIVE";
 
-/// Log in to oanda - if it can't it'll log the error and give you nothing
+/// Parse the worker-global `OANDA_LIVE` secret into a live/practice flag.
+/// Absent / non-`true` → practice. Pure so the parsing is unit-testable
+/// without a Worker `Env`.
+pub(super) fn live_flag_from_secret(raw: Option<String>) -> bool {
+    raw.map(|s| s.to_lowercase() == "true").unwrap_or(false)
+}
+
+/// Log in to oanda using the worker-global `OANDA_LIVE` secret to pick
+/// practice vs live. Used by the legacy global path (`account: None`).
+/// If it can't, it'll log the error and give you nothing.
 pub async fn login(env: &Env) -> Option<OandaClient> {
+    let live = live_flag_from_secret(super::get_secret(OANDA_LIVE, env));
+    login_with_live(env, live).await
+}
+
+/// Like [`login`] but the caller supplies the live/practice flag
+/// directly — e.g. derived from a named account's `kind` so each account
+/// hits its own OANDA environment regardless of the global `OANDA_LIVE`.
+pub async fn login_with_live(env: &Env, live: bool) -> Option<OandaClient> {
     let api_key = match super::get_secret(OANDA_API_KEY, env) {
         Some(s) => s,
         None => {
@@ -37,9 +54,6 @@ pub async fn login(env: &Env) -> Option<OandaClient> {
             return None;
         }
     };
-    let live = super::get_secret(OANDA_LIVE, env)
-        .and_then(|s| (s.to_lowercase() == "true").then_some(true))
-        .unwrap_or(false);
     Some(if live {
         OandaClient::new_live(api_key)
     } else {
@@ -849,5 +863,29 @@ mod mapping_tests {
     fn unparseable_trigger_is_skipped() {
         let p = pending("p-4", OrderType::Stop, "100", "");
         assert_eq!(oanda_order_to_pending(&p), None);
+    }
+}
+
+#[cfg(test)]
+mod live_flag_tests {
+    use super::live_flag_from_secret;
+
+    #[test]
+    fn absent_secret_is_practice() {
+        assert!(!live_flag_from_secret(None));
+    }
+
+    #[test]
+    fn true_is_live_case_insensitive() {
+        assert!(live_flag_from_secret(Some("true".into())));
+        assert!(live_flag_from_secret(Some("TRUE".into())));
+        assert!(live_flag_from_secret(Some("True".into())));
+    }
+
+    #[test]
+    fn anything_else_is_practice() {
+        assert!(!live_flag_from_secret(Some("false".into())));
+        assert!(!live_flag_from_secret(Some("1".into())));
+        assert!(!live_flag_from_secret(Some(String::new())));
     }
 }
