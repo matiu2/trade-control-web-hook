@@ -950,12 +950,18 @@ pub trait StateStore {
     /// Persist a registered [`TradePlan`] for the cron engine to evaluate.
     /// Keyed `plan:{scope}:{trade_id}`; `account` is the carrier intent's
     /// account (the plan struct itself has no account field). Overwrites a
-    /// prior registration of the same `(account, trade_id)` and refreshes TTL.
+    /// prior registration of the same `(account, trade_id)`.
+    ///
+    /// Written with **no expiration** — a registered plan never times out. It
+    /// retires only via the engine's archive path (`archive_plan` +
+    /// `clear_trade_plan`) when the plan reaches a terminal state (close,
+    /// trade-expiry veto, or its window closing). A TTL here would race that
+    /// path and silently drop a still-live plan (the 5-min `CONTROL_TTL` bug,
+    /// 2026-06-23).
     fn put_trade_plan(
         &self,
         account: Option<&str>,
         plan: &TradePlan,
-        ttl_seconds: u64,
     ) -> impl Future<Output = Result<(), StateError>>;
 
     /// Read one registered plan by `(account, trade_id)`, or `None` if absent /
@@ -1300,6 +1306,13 @@ mod memstore {
             let inner = self.inner.borrow();
             let (val, exp) = inner.get(key)?;
             if *exp > now { Some(val.clone()) } else { None }
+        }
+
+        /// Test-only: the stored expiry stamp for a key, to assert TTL behaviour
+        /// (e.g. that a registered plan was written with no short TTL).
+        #[cfg(test)]
+        pub(super) fn expiry_of(&self, key: &str) -> Option<DateTime<Utc>> {
+            self.inner.borrow().get(key).map(|(_, exp)| *exp)
         }
 
         fn put(&self, key: String, value: String, ttl_seconds: u64, now: DateTime<Utc>) {
@@ -1891,12 +1904,13 @@ mod memstore {
             &self,
             account: Option<&str>,
             plan: &TradePlan,
-            ttl_seconds: u64,
         ) -> Result<(), StateError> {
             let key = format!("plan:{}:{}", account_scope(account), plan.trade_id);
             let body = serde_json::to_string(plan)
                 .map_err(|e| StateError::Backend(format!("encode plan: {e}")))?;
-            self.put(key, body, ttl_seconds.max(MIN_TTL_SECONDS), Utc::now());
+            // No TTL: registered plans never time out (mirrors `archive_plan`).
+            // The in-memory store keys on expiry, so use a far-future stamp.
+            self.put(key, body, NO_TTL_SECONDS, Utc::now());
             Ok(())
         }
 
@@ -3429,13 +3443,9 @@ mod tests {
         use super::memstore::MemStateStore;
         let store = MemStateStore::new();
         // Global + account-scoped plans coexist; list recovers both scopes.
-        pollster::block_on(store.put_trade_plan(None, &sample_plan("hs-global"), 3600)).unwrap();
-        pollster::block_on(store.put_trade_plan(
-            Some("reversals"),
-            &sample_plan("hs-scoped"),
-            3600,
-        ))
-        .unwrap();
+        pollster::block_on(store.put_trade_plan(None, &sample_plan("hs-global"))).unwrap();
+        pollster::block_on(store.put_trade_plan(Some("reversals"), &sample_plan("hs-scoped")))
+            .unwrap();
 
         let got = pollster::block_on(store.get_trade_plan(Some("reversals"), "hs-scoped"))
             .unwrap()
@@ -3464,6 +3474,60 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    // A registered plan must NOT carry a short TTL. The 2026-06-23 bug gave it
+    // the carrier intent's 5-min `CONTROL_TTL`, so it evaporated from KV ~1h
+    // after arming. The MemStore keys on expiry; `put_trade_plan` now stores it
+    // with the same far-future `NO_TTL_SECONDS` stamp `archive_plan` uses, so a
+    // `get` well past any control-TTL window still finds it.
+    #[test]
+    fn memstore_registered_plan_does_not_expire() {
+        use super::memstore::MemStateStore;
+        let store = MemStateStore::new();
+        pollster::block_on(store.put_trade_plan(None, &sample_plan("hs-no-ttl"))).unwrap();
+
+        // The entry's expiry must be far in the future (≈ NO_TTL_SECONDS out),
+        // not minutes — proving no control-TTL leaked in.
+        let exp = store.expiry_of("plan:_:hs-no-ttl").expect("plan stored");
+        assert!(
+            exp > Utc::now() + chrono::Duration::days(365),
+            "registered plan expiry must be far-future, got {exp}"
+        );
+    }
+
+    // The engine retires a plan by archiving it then clearing the live key
+    // (`persist_plan_state` on a `done` eval). Since the live key has no TTL,
+    // `clear_trade_plan` is the ONLY thing that removes it — confirm it does,
+    // and that the archived copy survives for `plan list --include-all`.
+    #[test]
+    fn memstore_clear_trade_plan_removes_live_but_keeps_archive() {
+        use super::memstore::MemStateStore;
+        use crate::plan_state::{Phase, PlanState};
+        let store = MemStateStore::new();
+        let plan = sample_plan("hs-archive-me");
+        let final_state = PlanState::seed(Phase::Done, ts("2026-06-20T00:00:00Z"));
+
+        pollster::block_on(store.put_trade_plan(None, &plan)).unwrap();
+        pollster::block_on(store.archive_plan(
+            None,
+            &plan,
+            &final_state,
+            ts("2026-06-20T01:00:00Z"),
+        ))
+        .unwrap();
+        pollster::block_on(store.clear_trade_plan(None, "hs-archive-me")).unwrap();
+
+        // Live key gone…
+        assert!(
+            pollster::block_on(store.get_trade_plan(None, "hs-archive-me"))
+                .unwrap()
+                .is_none()
+        );
+        // …archived copy retained.
+        let archived = pollster::block_on(store.list_all_archived_plans()).unwrap();
+        assert_eq!(archived.len(), 1);
+        assert_eq!(archived[0].plan.trade_id, "hs-archive-me");
     }
 
     #[test]

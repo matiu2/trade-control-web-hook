@@ -31,32 +31,35 @@ mod baseline {
     include!(concat!(env!("OUT_DIR"), "/spread_baseline.rs"));
 }
 
-/// How far above an instrument's *median* (resting) spread we still allow
-/// before calling it "elevated", when the observed *high* is too close to
-/// the median to be a useful ceiling. With only a few days of samples a
-/// quiet instrument may never have spiked, so its observed `high` ≈ its
-/// normal — using that directly would re-introduce the very over-blocking
-/// we're fixing. So the threshold is `max(high, median × this)`: never
-/// below a clear multiple of normal, even if we haven't yet recorded a
-/// spike. 3× normal is comfortably above resting jitter and below a real
-/// liquidity-trough blowout.
-pub const SPREAD_NORMAL_MULTIPLE: f64 = 3.0;
+/// The reject line, as a multiple of an instrument's *normal* (median)
+/// spread. The 2026-06-23 spread-hour data showed the post-NY-close
+/// blowout is an **FX** phenomenon — FX crosses spike 10–20× their normal
+/// (AUD/USD 0.4p → 6p, EUR/GBP 0.5p → 10p), while commodities/indices
+/// (Copper, Gold) stay flat. So a per-instrument multiple of normal is the
+/// right shape: 5× sits clearly above resting jitter and busy-news
+/// widening, yet well below a real spread-hour spike (which is ≥10×), so it
+/// catches the blowout. For a flat-spread instrument like Copper (normal
+/// ~150p) the line is ~750p — never a false block.
+///
+/// Chosen over "observed max" because with a short sample window a quiet
+/// instrument's max can equal its normal, which would re-introduce the
+/// over-blocking this whole change fixed.
+pub const SPREAD_REJECT_MULTIPLE: f64 = 5.0;
 
 /// "Elevated" spread cutoff in pips for System 1's reject, per instrument.
 ///
 /// Looks the instrument up in the baked baseline (keyed by the
 /// broker-canonical TradeNation name — the same `resolved.instrument` the
 /// gate passes). When found, the threshold is
-/// `max(observed_high, median × SPREAD_NORMAL_MULTIPLE)` — block clearly
-/// above anything we've seen, but never block a spread within 3× of
-/// normal even for an instrument that hasn't spiked in our sample window.
+/// `median × SPREAD_REJECT_MULTIPLE` (5× the instrument's own normal
+/// spread) — see [`SPREAD_REJECT_MULTIPLE`].
 ///
 /// Falls back to the flat [`SPREAD_BLACKOUT_ELEVATED_PIPS`] for any
 /// instrument not in the baseline (a fresh asset, or one whose samples
 /// lacked a pip size). Re-baked whenever the committed samples grow.
 pub fn elevated_threshold_pips(instrument: &str) -> f64 {
     match baked_baseline(instrument) {
-        Some((_low, high, median)) => high.max(median * SPREAD_NORMAL_MULTIPLE),
+        Some((_low, _high, median)) => median * SPREAD_REJECT_MULTIPLE,
         None => SPREAD_BLACKOUT_ELEVATED_PIPS,
     }
 }
@@ -163,15 +166,15 @@ mod tests {
     }
 
     #[test]
-    fn baked_threshold_is_never_below_three_times_normal() {
-        // For every baked instrument the threshold must be at least 3x its
-        // median — guarding the over-block fix even for instruments that
-        // never spiked in the sample window.
+    fn baked_threshold_is_five_times_normal() {
+        // For every baked instrument the threshold is exactly 5x its
+        // median normal spread — high enough to pass resting/busy-news
+        // widening, low enough to reject a ≥10x spread-hour blowout.
         for (name, _low, _high, median, _n) in baseline::SPREAD_BASELINE {
             let t = elevated_threshold_pips(name);
             assert!(
-                t >= median * SPREAD_NORMAL_MULTIPLE - 1e-9,
-                "{name}: threshold {t} < 3x median {median}",
+                (t - median * SPREAD_REJECT_MULTIPLE).abs() < 1e-9,
+                "{name}: threshold {t} != 5x median {median}",
             );
         }
     }

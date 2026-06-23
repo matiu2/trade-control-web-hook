@@ -217,6 +217,14 @@ pub struct Args {
     #[arg(long)]
     pub entry_filter_script: Option<String>,
 
+    /// **Quasimodo setup.** Convenience alias that expands to
+    /// `--skip-break-and-close --skip-retest --require-confirmation`:
+    /// drop both H&S preps and gate the entry on a confirmed signal
+    /// candle instead. Combines with the underlying flags (it only
+    /// *adds* — passing one of them as well is harmless).
+    #[arg(long)]
+    pub quasimodo: bool,
+
     /// Drop the break-and-close prep from the bundle (no alert
     /// emitted and the entry no longer requires it).
     #[arg(long)]
@@ -300,6 +308,20 @@ pub struct Args {
 }
 
 impl Args {
+    /// Expand convenience aliases into the concrete flags the pipeline
+    /// reads. `--quasimodo` is shorthand for `--skip-break-and-close
+    /// --skip-retest --require-confirmation`; it only ORs the targets on
+    /// (never clears them), so combining it with the underlying flags is
+    /// harmless. Call once after `parse`, before the pipeline runs.
+    pub fn apply_aliases(mut self) -> Self {
+        if self.quasimodo {
+            self.skip_break_and_close = true;
+            self.skip_retest = true;
+            self.require_confirmation = true;
+        }
+        self
+    }
+
     /// The selected position-tool entry mode, or `None` when none of the
     /// three flags is set (the normal pattern-arming path). The clap
     /// group guarantees at most one is set.
@@ -360,6 +382,34 @@ mod tests {
         assert!(!args.require_confirmation);
         let args = Args::try_parse_from(["tv-arm", "--require-confirmation"]).expect("parse");
         assert!(args.require_confirmation);
+    }
+
+    #[test]
+    fn quasimodo_expands_to_the_three_flags() {
+        // Bare --quasimodo is off until apply_aliases runs.
+        let parsed = Args::try_parse_from(["tv-arm", "--quasimodo"]).expect("parse");
+        assert!(parsed.quasimodo);
+        assert!(!parsed.skip_break_and_close);
+        assert!(!parsed.skip_retest);
+        assert!(!parsed.require_confirmation);
+
+        // After expansion all three concrete flags are on.
+        let args = parsed.apply_aliases();
+        assert!(args.skip_break_and_close);
+        assert!(args.skip_retest);
+        assert!(args.require_confirmation);
+    }
+
+    #[test]
+    fn apply_aliases_is_a_noop_without_quasimodo() {
+        let args = Args::try_parse_from(["tv-arm", "--skip-retest"])
+            .expect("parse")
+            .apply_aliases();
+        assert!(!args.quasimodo);
+        // Only the explicitly-passed flag is set; the others stay off.
+        assert!(args.skip_retest);
+        assert!(!args.skip_break_and_close);
+        assert!(!args.require_confirmation);
     }
 
     #[test]

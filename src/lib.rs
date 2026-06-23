@@ -2831,12 +2831,13 @@ async fn handle_register(
             400,
         );
     }
-    // Persist the plan for the cron engine to evaluate. TTL mirrors the
-    // replay window: the plan must outlive its alert window plus grace and die
-    // with it (an expired-window plan stops being enumerated by the engine).
+    // Persist the plan for the cron engine to evaluate. No TTL: a registered
+    // plan never times out (the carrier intent's `not_after` is a control TTL,
+    // unrelated to the plan's lifetime). It retires only via the engine's
+    // archive path when the plan reaches a terminal state. See the 5-min
+    // `CONTROL_TTL` register bug (2026-06-23).
     let account = verified.intent.account.as_deref();
-    let ttl = incoming::replay_ttl_seconds(verified.intent.not_after, now);
-    if let Err(err) = store.put_trade_plan(account, plan, ttl).await {
+    if let Err(err) = store.put_trade_plan(account, plan).await {
         rlog_err!(
             "register: put_trade_plan failed (trade_id={}): {err}",
             plan.trade_id
@@ -2844,7 +2845,7 @@ async fn handle_register(
         return Response::error("state error", 500);
     }
     rlog!(
-        "register: trade_id={} instrument={} rules={} persisted (ttl={ttl}s)",
+        "register: trade_id={} instrument={} rules={} persisted (no expiry)",
         plan.trade_id,
         plan.instrument,
         plan.rules.len()
@@ -3942,7 +3943,6 @@ mod dispatcher_outcome_tests {
             &self,
             _account: Option<&str>,
             _plan: &trade_control_core::trade_plan::TradePlan,
-            _ttl_seconds: u64,
         ) -> Result<(), StateError> {
             Ok(())
         }
@@ -4399,8 +4399,7 @@ mod plan_show_tests {
     #[test]
     fn live_plan_is_found_and_not_flagged_archived() {
         let store = MemStateStore::new();
-        pollster::block_on(store.put_trade_plan(None, &sample_plan("hs-live-1"), 3600))
-            .expect("put");
+        pollster::block_on(store.put_trade_plan(None, &sample_plan("hs-live-1"))).expect("put");
 
         let details =
             pollster::block_on(collect_plan_details(&store, "hs-live-1")).expect("collect");
@@ -4417,8 +4416,7 @@ mod plan_show_tests {
     #[test]
     fn unknown_id_yields_no_details() {
         let store = MemStateStore::new();
-        pollster::block_on(store.put_trade_plan(None, &sample_plan("hs-live-1"), 3600))
-            .expect("put");
+        pollster::block_on(store.put_trade_plan(None, &sample_plan("hs-live-1"))).expect("put");
         let details = pollster::block_on(collect_plan_details(&store, "nope")).expect("collect");
         assert!(details.is_empty());
     }

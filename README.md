@@ -67,10 +67,13 @@ Trading:
   entry blackout.
 - `plan-list` — read-only: list the registered server-side `TradePlan`s, each
   with a compact summary of its current `PlanState` (phase, watermark, fired
-  rules, shadow flag). Lists live plans by default; the intent's
-  `include_archived` flag (CLI `--include-all`) also lists terminated
-  (vetoed/completed) plans retained in the archive keyspace. Drives
-  `trade-control plan list`. KV-only, idempotent.
+  rules, shadow flag). The `ACCOUNT` column reflects the plan's KV scope
+  (`plan:{account}:{trade_id}`); `tv-arm` registers each plan under its
+  resolved `--account` so the plan shares the scope of its own vetos/preps. A
+  plan armed without an account (legacy / global `_` scope) shows `-`. Lists
+  live plans by default; the intent's `include_archived` flag (CLI
+  `--include-all`) also lists terminated (vetoed/completed) plans retained in
+  the archive keyspace. Drives `trade-control plan list`. KV-only, idempotent.
 - `plan-show` — read-only: dump one plan in full (every rule + its persisted
   `PlanState`). Target named by the intent's `trade_id`; the worker scans all
   account scopes — **live and archived** — so a terminated plan surfaced by
@@ -1241,10 +1244,15 @@ committed YAML samples from the **`spread-sampler-cron`** submodule and
 emits a per-instrument table (`(name, low, high, median)` in pips, keyed by
 the broker-canonical TradeNation name — the same `resolved.instrument` the
 gate passes). `elevated_threshold_pips(instrument)` returns
-`max(observed_high, median × SPREAD_NORMAL_MULTIPLE)` (3× normal) so it
-blocks clearly above anything seen, yet never blocks a spread within 3× of
-normal even for an instrument that hasn't spiked in the sample window. An
-instrument absent from the baseline (a fresh asset, or one with no pip
+`median × SPREAD_REJECT_MULTIPLE` (**5× the instrument's own normal
+spread**). The 2026-06-23 spread-hour data showed the post-NY-close blowout
+is an **FX** phenomenon — FX crosses spike 10–20× their normal (AUD/USD
+0.4p→6p, EUR/GBP 0.5p→10p) while commodities/indices (Copper, Gold) stay
+flat — so a multiple of each instrument's *normal* is the right shape: 5×
+sits above resting/busy-news jitter yet well below a ≥10× spread-hour
+spike, so it rejects the blowout (AUD/USD line = 2p) without ever
+false-blocking a flat-spread instrument (Copper normal ~150p → line 750p).
+An instrument absent from the baseline (a fresh asset, or one with no pip
 size) falls back to the flat `SPREAD_BLACKOUT_ELEVATED_PIPS` (8 pips). The
 reject message names the instrument's baked normal/seen-range and the
 current spread. The recovery cutoff (`SPREAD_BLACKOUT_RECOVERED_PIPS`,
@@ -1844,6 +1852,7 @@ cargo run -p tv-arm -- \
   --risk-pct 0.5 \                    # % of NAV (or --risk-amount <home-ccy>)
   --reversal-band-pct 0.1 \           # half-width % around support/resistance lines (default 0.1)
   --veto-on-reversal \                # experimental: a reversal off a band before entry also vetoes the upcoming trade (default off)
+  --quasimodo \                       # alias: --skip-break-and-close --skip-retest --require-confirmation (drop both H&S preps, gate on a confirmed candle)
   --skip-break-and-close \            # for stocks (no after-hours retests)
   --skip-retest \                     # implies --skip-break-and-close; for late entries
   --skip-golden \                     # drop the Pine golden-candle requirement (golden is required by default)
@@ -1893,8 +1902,13 @@ register is rejected.
 > `cli/src/trade_patterns.rs`.
 
 The worker validates the registered plan and **persists** it to KV (key
-`plan:{scope}:{trade_id}`, TTL = the trade window plus grace) for the
-server-side engine to enumerate each cron tick. The engine that *evaluates*
+`plan:{scope}:{trade_id}`, **no TTL** — like an archived plan) for the
+server-side engine to enumerate each cron tick. A registered plan never times
+out; it is removed only when the engine retires it (archive + clear on a
+terminal state: close, trade-expiry veto, or its window closing). The carrier
+`register` intent's `not_after` is a short control TTL and is **not** the
+plan's lifetime — anchoring KV expiry to it dropped live plans ~1h after arming
+(the 2026-06-23 bug). The engine that *evaluates*
 those plans — a state machine per trade — runs on the `*/15` tick and evaluates
 both M/W (per-bar enter heartbeat) and H&S (the Rust port of the
 `candle-signals-v2.pine` detector) entries plus the trendline / level / time
