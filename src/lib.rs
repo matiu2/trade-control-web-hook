@@ -16,13 +16,13 @@ mod cron;
 mod diag;
 mod market_blackout;
 mod market_info;
+mod recover_entry;
 mod spread_blackout;
 mod state;
 mod tick_recording;
 #[cfg(target_arch = "wasm32")]
 mod tn_login;
 mod tn_login_helpers;
-mod too_close;
 mod tracing_console;
 mod tradenation_adapter;
 
@@ -1121,7 +1121,7 @@ mod reversal_veto_tests {
 }
 
 /// Run an `enter` intent end-to-end (gates → sizing → broker placement →
-/// `on_too_close` fallback).
+/// `recover_entry` fallback).
 ///
 /// `raw_body` is the **exact signed YAML bytes** this intent arrived as, when
 /// known. On a successful real placement we persist it under an
@@ -1748,8 +1748,8 @@ pub(crate) async fn run_enter<B: Broker>(
     );
 
     // First placement. On `EntryTooCloseToMarket` (TN `#19-10`), the
-    // stop trigger was overtaken by price; the optional `on_too_close`
-    // fallback may recover with a *single* synchronous market re-place
+    // stop trigger was overtaken by price; the optional `recover_entry`
+    // policy may recover with a *single* synchronous market re-place
     // (never a loop — a too-close means price is moving). The re-place
     // is the SAME intended entry, so it shares `retry_attempt_no` and
     // does not consume an extra multi-shot slot.
@@ -1819,7 +1819,7 @@ pub(crate) async fn run_enter<B: Broker>(
             // a too-close / broker failure must never poison the seen-id
             // so the next signal bar can retry. The too-close case gets
             // a distinct outcome string for log-grep observability.
-            let outcome = too_close::outcome_for_entry_error(&err);
+            let outcome = recover_entry::outcome_for_entry_error(&err);
             rlog_err!("entry failed: {err} ({outcome})");
             ActionResult::Failed(outcome)
         }
@@ -1953,8 +1953,8 @@ async fn maybe_update_mw_state<B: Broker>(
 
 /// Single synchronous market re-place for a stop-entry rejected with
 /// `#19-10` ("entry too close to / wrong side of market"). Reads the
-/// current market price, applies the `on_too_close` slippage guard
-/// (pure [`too_close::market_replace_plan`]), and on a within-threshold
+/// current market price, applies the `recover_entry` slippage guard
+/// (pure [`recover_entry::recover_entry_plan`]), and on a within-threshold
 /// `market` action re-places as a **market order** sized against the
 /// actual fill reference — a worse market fill changes the stop distance
 /// and therefore the 1%-equity position size, so the broker re-runs
@@ -2001,19 +2001,19 @@ async fn place_entry_too_close_fallback<B: Broker>(
         }
     };
 
-    match too_close::market_replace_plan(
-        resolved.on_too_close.as_ref(),
+    match recover_entry::recover_entry_plan(
+        resolved.recover_entry.as_ref(),
         resolved.direction,
         trigger_price,
         current_price,
     ) {
-        too_close::TooClosePlan::Skip { reason } => {
+        recover_entry::RecoverEntryPlan::Skip { reason } => {
             rlog!(
                 "too-close fallback: not recovering (id={intent_id} reason={reason} trigger={trigger_price} price={current_price})"
             );
             Err(EntryError::EntryTooCloseToMarket)
         }
-        too_close::TooClosePlan::Market { reference_price } => {
+        recover_entry::RecoverEntryPlan::Market { reference_price } => {
             rlog!(
                 "too-close fallback: re-placing as MARKET (id={intent_id} trigger={trigger_price} price={reference_price})"
             );
@@ -2051,7 +2051,7 @@ async fn place_entry_too_close_fallback<B: Broker>(
                 }
             }
         }
-        too_close::TooClosePlan::Limit { trigger_price } => {
+        recover_entry::RecoverEntryPlan::Limit { trigger_price } => {
             rlog!(
                 "too-close fallback: re-placing as LIMIT at original trigger (id={intent_id} trigger={trigger_price} price={current_price})"
             );
@@ -4129,7 +4129,7 @@ mod dispatcher_outcome_tests {
     /// A too-close (`#19-10`) entry failure must classify as Skip so it
     /// never poisons the seen-id — the recovery contract is "let the
     /// next bar retry". Uses the exact string the worker emits via
-    /// `too_close::outcome_for_entry_error`.
+    /// `recover_entry::outcome_for_entry_error`.
     #[test]
     fn too_close_outcome_classifies_as_skip() {
         let result = ActionResult::Failed("entry-failed: too-close-to-market".into());

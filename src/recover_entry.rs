@@ -1,31 +1,31 @@
-//! Stop-entry "too close to market" fallback (`on_too_close`).
+//! Broker-side stop-entry recovery (`recover_entry`, `#19-10` path).
 //!
 //! When a stop-entry's resting placement is rejected because the trigger
 //! has already been overtaken by price (TradeNation `#19-10` — see
 //! [`trade_control_core::broker::EntryError::EntryTooCloseToMarket`]),
 //! the worker can optionally recover instead of dropping the entry. The
 //! desired behaviour travels in the signed intent
-//! ([`trade_control_core::intent::OnTooClose`]) and resolves to
-//! [`trade_control_core::intent::ResolvedOnTooClose`].
+//! ([`trade_control_core::intent::RecoverEntry`]) and resolves to
+//! [`trade_control_core::intent::ResolvedRecoverEntry`].
 //!
 //! This module holds the **pure** decision logic so it can be unit
 //! tested off-wasm without a broker or KV store:
 //!
 //! - [`outcome_for_entry_error`] renders the distinct outcome string
-//!   the dispatcher records (Step 1 — observability). A too-close
+//!   the dispatcher records (Step 1 — observability). A `#19-10`
 //!   failure must stay `ActionResult::Failed` (a Skip in `seen_decision`)
 //!   so the seen-id is never poisoned and the next bar can retry.
-//! - [`market_replace_plan`] decides whether a `#19-10` rejection should
-//!   be recovered, and how — re-place as a market order (Step 3, the
+//! - [`recover_entry_plan`] decides whether a `#19-10` rejection should
+//!   be recovered, and how — re-place as a market order (the
 //!   slippage-guarded chase), as a limit order resting at the original
-//!   trigger (Step 4, R-preserving), or skip — given the `on_too_close`
-//!   config and the current market price.
+//!   trigger (R-preserving), or skip — given the `recover_entry` config
+//!   and the current market price.
 //!
 //! Both are KV-free and broker-free; the actual broker re-place and KV
 //! bookkeeping live in `run_enter` (`src/lib.rs`).
 
 use trade_control_core::broker::EntryError;
-use trade_control_core::intent::{Direction, OnTooCloseAction, ResolvedOnTooClose};
+use trade_control_core::intent::{Direction, RecoverEntryAction, ResolvedRecoverEntry};
 
 /// Distinct outcome string for an entry-placement failure. The
 /// too-close case gets its own label so a `#19-10` rejection is a
@@ -40,7 +40,7 @@ pub fn outcome_for_entry_error(err: &EntryError) -> String {
 
 /// The recovery decision for a `#19-10` rejection.
 #[derive(Debug, Clone, PartialEq)]
-pub enum TooClosePlan {
+pub enum RecoverEntryPlan {
     /// Re-place as a market order at `reference_price` (the current
     /// market price). The caller re-runs sizing against this reference
     /// — a worse fill changes the stop distance and therefore the
@@ -66,48 +66,49 @@ pub enum TooClosePlan {
 
 /// Decide how to handle a too-close rejection.
 ///
-/// `on_too_close` is the resolved fallback carried on the trade (`None`
+/// `recover_entry` is the resolved recovery carried on the trade (`None`
 /// when the operator didn't opt in). `trigger_price` is the original
 /// stop trigger; `current_price` is a fresh read of the market.
 ///
 /// Rules:
-/// - No fallback, or `skip` → [`TooClosePlan::Skip`] (today's behaviour).
+/// - No fallback, or `skip` → [`RecoverEntryPlan::Skip`] (today's behaviour).
 /// - `limit` → re-place a limit at the original trigger, **only if** the
 ///   limit would rest on the correct side of the market (long: trigger
 ///   at/below current; short: at/above). In a genuine `#19-10` the price
 ///   has overrun the stop trigger so the original trigger IS the correct
 ///   side — but a degenerate / non-overrun case (trigger still on the
 ///   wrong side) would create a `#19-9`, so guard it and Skip with
-///   `too-close-limit-wrong-side`. No slippage bound applies — a limit
-///   can't fill worse than its price, so R is preserved.
-/// - `market` with no slippage bound (validation should have caught it)
-///   → Skip — never chase an unbounded fill.
+///   `recover-entry-limit-wrong-side`. No slippage bound applies — a
+///   limit can't fill worse than its price, so R is preserved.
+/// - `market` with no slippage bound (the resolver derives one when the
+///   intent omits it, so this is only the defensive path) → Skip — never
+///   chase an unbounded fill.
 /// - `market` with a bound → re-place **only if** the current price is
 ///   within `max_slippage_price` of the trigger on the breakout side
 ///   (long: price ran *up* past the trigger; short: *down*). Out of
-///   threshold → Skip with `too-close-slippage`.
+///   threshold → Skip with `recover-entry-slippage`.
 ///
 /// A non-finite current price is treated as out-of-threshold (Skip).
-pub fn market_replace_plan(
-    on_too_close: Option<&ResolvedOnTooClose>,
+pub fn recover_entry_plan(
+    recover_entry: Option<&ResolvedRecoverEntry>,
     direction: Direction,
     trigger_price: f64,
     current_price: f64,
-) -> TooClosePlan {
-    let Some(otc) = on_too_close else {
-        return TooClosePlan::Skip {
-            reason: "too-close-no-fallback",
+) -> RecoverEntryPlan {
+    let Some(rec) = recover_entry else {
+        return RecoverEntryPlan::Skip {
+            reason: "recover-entry-none",
         };
     };
 
-    match otc.action {
-        OnTooCloseAction::Skip => TooClosePlan::Skip {
-            reason: "too-close-skip",
+    match rec.action {
+        RecoverEntryAction::Skip => RecoverEntryPlan::Skip {
+            reason: "recover-entry-skip",
         },
-        OnTooCloseAction::Limit => {
+        RecoverEntryAction::Limit => {
             if !current_price.is_finite() || !trigger_price.is_finite() {
-                return TooClosePlan::Skip {
-                    reason: "too-close-price-unavailable",
+                return RecoverEntryPlan::Skip {
+                    reason: "recover-entry-price-unavailable",
                 };
             }
             // A long limit must rest at/below the market, a short limit
@@ -124,22 +125,22 @@ pub fn market_replace_plan(
                 Direction::Short => current_price <= trigger_price,
             };
             if correct_side {
-                TooClosePlan::Limit { trigger_price }
+                RecoverEntryPlan::Limit { trigger_price }
             } else {
-                TooClosePlan::Skip {
-                    reason: "too-close-limit-wrong-side",
+                RecoverEntryPlan::Skip {
+                    reason: "recover-entry-limit-wrong-side",
                 }
             }
         }
-        OnTooCloseAction::Market => {
-            let Some(max_slip) = otc.max_slippage_price else {
-                return TooClosePlan::Skip {
-                    reason: "too-close-market-no-slippage-bound",
+        RecoverEntryAction::Market => {
+            let Some(max_slip) = rec.max_slippage_price else {
+                return RecoverEntryPlan::Skip {
+                    reason: "recover-entry-market-no-slippage-bound",
                 };
             };
             if !current_price.is_finite() || !trigger_price.is_finite() {
-                return TooClosePlan::Skip {
-                    reason: "too-close-price-unavailable",
+                return RecoverEntryPlan::Skip {
+                    reason: "recover-entry-price-unavailable",
                 };
             }
             // The slippage is the distance the breakout has run *past*
@@ -156,12 +157,12 @@ pub fn market_replace_plan(
                 Direction::Short => trigger_price - current_price,
             };
             if slippage <= max_slip {
-                TooClosePlan::Market {
+                RecoverEntryPlan::Market {
                     reference_price: current_price,
                 }
             } else {
-                TooClosePlan::Skip {
-                    reason: "too-close-slippage",
+                RecoverEntryPlan::Skip {
+                    reason: "recover-entry-slippage",
                 }
             }
         }
@@ -172,8 +173,11 @@ pub fn market_replace_plan(
 mod tests {
     use super::*;
 
-    fn otc(action: OnTooCloseAction, max_slippage_price: Option<f64>) -> ResolvedOnTooClose {
-        ResolvedOnTooClose {
+    fn rec_cfg(
+        action: RecoverEntryAction,
+        max_slippage_price: Option<f64>,
+    ) -> ResolvedRecoverEntry {
+        ResolvedRecoverEntry {
             action,
             max_slippage_price,
         }
@@ -196,20 +200,22 @@ mod tests {
 
     #[test]
     fn no_fallback_skips() {
-        let plan = market_replace_plan(None, Direction::Long, 1.1000, 1.1005);
+        let plan = recover_entry_plan(None, Direction::Long, 1.1000, 1.1005);
         assert_eq!(
             plan,
-            TooClosePlan::Skip {
-                reason: "too-close-no-fallback"
+            RecoverEntryPlan::Skip {
+                reason: "recover-entry-none"
             }
         );
     }
 
     #[test]
     fn skip_action_skips() {
-        let cfg = otc(OnTooCloseAction::Skip, None);
-        let plan = market_replace_plan(Some(&cfg), Direction::Long, 1.1000, 1.1005);
-        assert!(matches!(plan, TooClosePlan::Skip { reason } if reason == "too-close-skip"));
+        let cfg = rec_cfg(RecoverEntryAction::Skip, None);
+        let plan = recover_entry_plan(Some(&cfg), Direction::Long, 1.1000, 1.1005);
+        assert!(
+            matches!(plan, RecoverEntryPlan::Skip { reason } if reason == "recover-entry-skip")
+        );
     }
 
     #[test]
@@ -217,10 +223,10 @@ mod tests {
         // Genuine #19-10: long trigger 1.1000 overrun, price now 1.1005
         // (above). A limit at 1.1000 is below market → correct side,
         // rests for a pullback. No slippage bound needed; R preserved.
-        let cfg = otc(OnTooCloseAction::Limit, None);
-        let plan = market_replace_plan(Some(&cfg), Direction::Long, 1.1000, 1.1005);
+        let cfg = rec_cfg(RecoverEntryAction::Limit, None);
+        let plan = recover_entry_plan(Some(&cfg), Direction::Long, 1.1000, 1.1005);
         match plan {
-            TooClosePlan::Limit { trigger_price } => {
+            RecoverEntryPlan::Limit { trigger_price } => {
                 assert!((trigger_price - 1.1000).abs() < 1e-12);
             }
             other => panic!("expected Limit, got {other:?}"),
@@ -231,9 +237,9 @@ mod tests {
     fn limit_short_correct_side_rests_at_trigger() {
         // Short trigger 1.1000 overrun, price now 1.0994 (below). A
         // limit at 1.1000 is above market → correct side for a short.
-        let cfg = otc(OnTooCloseAction::Limit, None);
-        let plan = market_replace_plan(Some(&cfg), Direction::Short, 1.1000, 1.0994);
-        assert!(matches!(plan, TooClosePlan::Limit { .. }));
+        let cfg = rec_cfg(RecoverEntryAction::Limit, None);
+        let plan = recover_entry_plan(Some(&cfg), Direction::Short, 1.1000, 1.0994);
+        assert!(matches!(plan, RecoverEntryPlan::Limit { .. }));
     }
 
     #[test]
@@ -241,10 +247,10 @@ mod tests {
         // Not a genuine overrun: long trigger 1.1000, price 1.0995 (still
         // *below* the trigger). A long limit at 1.1000 would sit above
         // market → #19-9. Guard skips instead of placing a doomed order.
-        let cfg = otc(OnTooCloseAction::Limit, None);
-        let plan = market_replace_plan(Some(&cfg), Direction::Long, 1.1000, 1.0995);
+        let cfg = rec_cfg(RecoverEntryAction::Limit, None);
+        let plan = recover_entry_plan(Some(&cfg), Direction::Long, 1.1000, 1.0995);
         assert!(
-            matches!(plan, TooClosePlan::Skip { reason } if reason == "too-close-limit-wrong-side")
+            matches!(plan, RecoverEntryPlan::Skip { reason } if reason == "recover-entry-limit-wrong-side")
         );
     }
 
@@ -252,10 +258,10 @@ mod tests {
     fn limit_short_wrong_side_skips() {
         // Short trigger 1.1000, price 1.1005 (above) → a short limit at
         // 1.1000 would sit below market → #19-9. Skip.
-        let cfg = otc(OnTooCloseAction::Limit, None);
-        let plan = market_replace_plan(Some(&cfg), Direction::Short, 1.1000, 1.1005);
+        let cfg = rec_cfg(RecoverEntryAction::Limit, None);
+        let plan = recover_entry_plan(Some(&cfg), Direction::Short, 1.1000, 1.1005);
         assert!(
-            matches!(plan, TooClosePlan::Skip { reason } if reason == "too-close-limit-wrong-side")
+            matches!(plan, RecoverEntryPlan::Skip { reason } if reason == "recover-entry-limit-wrong-side")
         );
     }
 
@@ -263,23 +269,23 @@ mod tests {
     fn limit_at_exact_trigger_rests() {
         // Equality (price exactly at the trigger) is allowed for both
         // directions — a marketable limit, acceptable.
-        let cfg = otc(OnTooCloseAction::Limit, None);
+        let cfg = rec_cfg(RecoverEntryAction::Limit, None);
         assert!(matches!(
-            market_replace_plan(Some(&cfg), Direction::Long, 1.1000, 1.1000),
-            TooClosePlan::Limit { .. }
+            recover_entry_plan(Some(&cfg), Direction::Long, 1.1000, 1.1000),
+            RecoverEntryPlan::Limit { .. }
         ));
         assert!(matches!(
-            market_replace_plan(Some(&cfg), Direction::Short, 1.1000, 1.1000),
-            TooClosePlan::Limit { .. }
+            recover_entry_plan(Some(&cfg), Direction::Short, 1.1000, 1.1000),
+            RecoverEntryPlan::Limit { .. }
         ));
     }
 
     #[test]
     fn limit_non_finite_price_skips() {
-        let cfg = otc(OnTooCloseAction::Limit, None);
-        let plan = market_replace_plan(Some(&cfg), Direction::Long, 1.1000, f64::NAN);
+        let cfg = rec_cfg(RecoverEntryAction::Limit, None);
+        let plan = recover_entry_plan(Some(&cfg), Direction::Long, 1.1000, f64::NAN);
         assert!(
-            matches!(plan, TooClosePlan::Skip { reason } if reason == "too-close-price-unavailable")
+            matches!(plan, RecoverEntryPlan::Skip { reason } if reason == "recover-entry-price-unavailable")
         );
     }
 
@@ -287,10 +293,10 @@ mod tests {
     fn market_within_threshold_replaces_at_current_price() {
         // Long: trigger 1.1000, price ran to 1.1005 = 5 pips slip;
         // bound is 8 pips (0.0008). Within → replace at 1.1005.
-        let cfg = otc(OnTooCloseAction::Market, Some(0.0008));
-        let plan = market_replace_plan(Some(&cfg), Direction::Long, 1.1000, 1.1005);
+        let cfg = rec_cfg(RecoverEntryAction::Market, Some(0.0008));
+        let plan = recover_entry_plan(Some(&cfg), Direction::Long, 1.1000, 1.1005);
         match plan {
-            TooClosePlan::Market { reference_price } => {
+            RecoverEntryPlan::Market { reference_price } => {
                 assert!((reference_price - 1.1005).abs() < 1e-12);
             }
             other => panic!("expected Market, got {other:?}"),
@@ -301,9 +307,11 @@ mod tests {
     fn market_out_of_threshold_skips() {
         // Long: 65 pips of slip against an 8-pip bound — the GBP/NZD
         // chase the guard exists to prevent.
-        let cfg = otc(OnTooCloseAction::Market, Some(0.0008));
-        let plan = market_replace_plan(Some(&cfg), Direction::Long, 1.1000, 1.1065);
-        assert!(matches!(plan, TooClosePlan::Skip { reason } if reason == "too-close-slippage"));
+        let cfg = rec_cfg(RecoverEntryAction::Market, Some(0.0008));
+        let plan = recover_entry_plan(Some(&cfg), Direction::Long, 1.1000, 1.1065);
+        assert!(
+            matches!(plan, RecoverEntryPlan::Skip { reason } if reason == "recover-entry-slippage")
+        );
     }
 
     #[test]
@@ -311,40 +319,42 @@ mod tests {
         // Short: trigger 1.1000, price ran *down* to 1.0994 = 6 pips
         // slip; bound 8 pips → within. (An upside move would be
         // negative slip — also within.)
-        let cfg = otc(OnTooCloseAction::Market, Some(0.0008));
-        let plan = market_replace_plan(Some(&cfg), Direction::Short, 1.1000, 1.0994);
-        assert!(matches!(plan, TooClosePlan::Market { .. }));
+        let cfg = rec_cfg(RecoverEntryAction::Market, Some(0.0008));
+        let plan = recover_entry_plan(Some(&cfg), Direction::Short, 1.1000, 1.0994);
+        assert!(matches!(plan, RecoverEntryPlan::Market { .. }));
 
         // 12 pips down → out of threshold.
-        let plan = market_replace_plan(Some(&cfg), Direction::Short, 1.1000, 1.0988);
-        assert!(matches!(plan, TooClosePlan::Skip { reason } if reason == "too-close-slippage"));
+        let plan = recover_entry_plan(Some(&cfg), Direction::Short, 1.1000, 1.0988);
+        assert!(
+            matches!(plan, RecoverEntryPlan::Skip { reason } if reason == "recover-entry-slippage")
+        );
     }
 
     #[test]
     fn market_at_exact_threshold_replaces() {
         // Boundary: exactly 8 pips slip with an 8-pip bound → allowed.
-        let cfg = otc(OnTooCloseAction::Market, Some(0.0008));
-        let plan = market_replace_plan(Some(&cfg), Direction::Long, 1.1000, 1.1008);
-        assert!(matches!(plan, TooClosePlan::Market { .. }));
+        let cfg = rec_cfg(RecoverEntryAction::Market, Some(0.0008));
+        let plan = recover_entry_plan(Some(&cfg), Direction::Long, 1.1000, 1.1008);
+        assert!(matches!(plan, RecoverEntryPlan::Market { .. }));
     }
 
     #[test]
     fn market_without_bound_skips_defensively() {
         // Validation should reject this upstream, but if a malformed
         // intent slips through the worker must not chase unbounded.
-        let cfg = otc(OnTooCloseAction::Market, None);
-        let plan = market_replace_plan(Some(&cfg), Direction::Long, 1.1000, 1.1005);
+        let cfg = rec_cfg(RecoverEntryAction::Market, None);
+        let plan = recover_entry_plan(Some(&cfg), Direction::Long, 1.1000, 1.1005);
         assert!(
-            matches!(plan, TooClosePlan::Skip { reason } if reason == "too-close-market-no-slippage-bound")
+            matches!(plan, RecoverEntryPlan::Skip { reason } if reason == "recover-entry-market-no-slippage-bound")
         );
     }
 
     #[test]
     fn market_non_finite_price_skips() {
-        let cfg = otc(OnTooCloseAction::Market, Some(0.0008));
-        let plan = market_replace_plan(Some(&cfg), Direction::Long, 1.1000, f64::NAN);
+        let cfg = rec_cfg(RecoverEntryAction::Market, Some(0.0008));
+        let plan = recover_entry_plan(Some(&cfg), Direction::Long, 1.1000, f64::NAN);
         assert!(
-            matches!(plan, TooClosePlan::Skip { reason } if reason == "too-close-price-unavailable")
+            matches!(plan, RecoverEntryPlan::Skip { reason } if reason == "recover-entry-price-unavailable")
         );
     }
 }

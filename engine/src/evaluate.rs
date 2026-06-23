@@ -634,7 +634,10 @@ fn log_rejected_entry_spec(
         None => ("none", None),
     };
 
-    let stop_loss = intent.stop_loss.as_ref().map(|sl| sl.resolve(shell, pip_size));
+    let stop_loss = intent
+        .stop_loss
+        .as_ref()
+        .map(|sl| sl.resolve(shell, pip_size));
 
     // Take-profit — RMultiple needs the entry+SL to resolve, so only report the
     // simple absolute / anchored case precisely; RMultiple is logged as a label.
@@ -657,21 +660,21 @@ fn log_rejected_entry_spec(
         shell_low = shell.low,
         signal_high = ?shell.signal_high,
         signal_low = ?shell.signal_low,
-        on_too_close = ?entry_on_too_close(&intent.entry),
+        recover_entry = ?entry_recover_entry(&intent.entry),
         "pine-enter: NOT dispatchable — resolve failed; resolved entry spec follows"
     );
 }
 
-/// Short label for the entry's `on_too_close` opt-in (for the rejection log).
-fn entry_on_too_close(
+/// Short label for the entry's `recover_entry` opt-in (for the rejection log).
+fn entry_recover_entry(
     entry: &Option<trade_control_core::intent::EntrySpec>,
-) -> Option<trade_control_core::intent::OnTooCloseAction> {
+) -> Option<trade_control_core::intent::RecoverEntryAction> {
     use trade_control_core::intent::EntrySpec;
     match entry {
         Some(EntrySpec::Stop {
-            on_too_close: Some(otc),
+            recover_entry: Some(rec),
             ..
-        }) => Some(otc.action),
+        }) => Some(rec.action),
         _ => None,
     }
 }
@@ -1099,7 +1102,7 @@ mod tests {
             from: PriceAnchor::SignalLow,
             offset_pips: 1.0,
             at: None,
-            on_too_close: None,
+            recover_entry: None,
         });
         intent.stop_loss = Some(PriceRef::Anchored {
             from: PriceAnchor::SignalHigh,

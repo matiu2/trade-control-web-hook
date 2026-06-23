@@ -379,7 +379,7 @@ mod tests {
             take_profit: tp,
             risk: RiskBudget::Percent(1.0),
             dry_run: false,
-            on_too_close: None,
+            recover_entry: None,
         }
     }
 

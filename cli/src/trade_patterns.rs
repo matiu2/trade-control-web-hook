@@ -1765,10 +1765,10 @@ fn build_enter_alert(
             // Pattern entries resolve against the live shell, not an
             // absolute level — `at` is for the position-tool path only.
             at: None,
-            // No `on_too_close` opt-in from the H&S builder yet — bare
+            // No `recover_entry` opt-in from the H&S builder yet — bare
             // setups keep today's skip behaviour. A future CLI flag can
-            // populate this (see the on_too_close follow-up).
-            on_too_close: None,
+            // populate this (see the recover_entry follow-up).
+            recover_entry: None,
         },
         EntryMode::Market => EntrySpec::Market,
     });
@@ -1912,7 +1912,7 @@ pub fn build_position_enter(
             from: PriceAnchor::Close,
             offset_pips: 0.0,
             at: Some(spec.entry_price),
-            on_too_close: None,
+            recover_entry: None,
         },
         PositionEntryKind::Limit => EntrySpec::Limit {
             from: PriceAnchor::Close,
