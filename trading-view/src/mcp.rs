@@ -221,8 +221,14 @@ pub struct Rect<'a> {
 /// (`color`) and fill (`backgroundColor`) the same hue, at the given
 /// fill `transparency` (0 opaque … 100 invisible). Kept separate so the
 /// JSON shape is unit-testable without shelling out to Node.
+///
+/// `extendLeft`/`extendRight` are pinned `false` so the box stays a
+/// finite fill-bar→exit-bar zone — TradingView's rectangle tool defaults
+/// these on, which would stretch every annotation across the whole chart.
 fn rectangle_overrides(color: &str, transparency: u8) -> String {
-    format!("{{\"color\":{color:?},\"backgroundColor\":{color:?},\"transparency\":{transparency}}}")
+    format!(
+        "{{\"color\":{color:?},\"backgroundColor\":{color:?},\"transparency\":{transparency},\"extendLeft\":false,\"extendRight\":false}}"
+    )
 }
 
 /// Result of `tv-mcp draw remove`. The CLI returns
@@ -267,12 +273,15 @@ mod tests {
         let o = rectangle_overrides("#26a69a", 80);
         assert_eq!(
             o,
-            r##"{"color":"#26a69a","backgroundColor":"#26a69a","transparency":80}"##
+            r##"{"color":"#26a69a","backgroundColor":"#26a69a","transparency":80,"extendLeft":false,"extendRight":false}"##
         );
         // Must be valid JSON the Node side can `JSON.parse`.
         let parsed: serde_json::Value = serde_json::from_str(&o).expect("valid json");
         assert_eq!(parsed["color"], "#26a69a");
         assert_eq!(parsed["transparency"], 80);
+        // The box must stay finite — no chart-spanning extension.
+        assert_eq!(parsed["extendLeft"], false);
+        assert_eq!(parsed["extendRight"], false);
     }
 
     #[test]
