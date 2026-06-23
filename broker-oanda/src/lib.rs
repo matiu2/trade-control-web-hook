@@ -3,7 +3,10 @@
 //! Wraps `oanda-client` behind a small `OandaBroker` value that holds the
 //! authenticated client and the account id. The free `login(env)` helper
 //! reads `OANDA_API_KEY`, `OANDA_ACCOUNT_ID`, and the optional `OANDA_LIVE`
-//! secret from the Worker `Env`.
+//! secret from the Worker `Env` (the legacy global path). For named
+//! accounts the caller supplies practice-vs-live explicitly via
+//! [`login_with_account_id`], derived from the account's `kind`, so
+//! `OANDA_LIVE` is bypassed and each account hits its own environment.
 
 mod candles;
 mod fx;
@@ -148,14 +151,22 @@ pub async fn login(env: &Env) -> Option<OandaBroker> {
             return None;
         }
     };
-    login_with_account_id(env, account_id).await
+    // Global path keeps reading the worker-wide `OANDA_LIVE` secret.
+    let client = login_client(env).await?;
+    Some(OandaBroker { client, account_id })
 }
 
-/// Like [`login`] but uses an explicitly-supplied `account_id` (e.g.
-/// from per-account metadata) instead of reading `OANDA_ACCOUNT_ID`.
-/// The API token is still the shared worker-wide `OANDA_API_KEY`.
-pub async fn login_with_account_id(env: &Env, account_id: String) -> Option<OandaBroker> {
-    let client = login_client(env).await?;
+/// Like [`login`] but uses an explicitly-supplied `account_id` (e.g. from
+/// per-account metadata) and an explicit `live` flag (e.g. derived from
+/// the account's `kind`) so each account hits its own OANDA environment
+/// regardless of the worker-global `OANDA_LIVE` secret. The API token is
+/// still the shared worker-wide `OANDA_API_KEY`.
+pub async fn login_with_account_id(
+    env: &Env,
+    account_id: String,
+    live: bool,
+) -> Option<OandaBroker> {
+    let client = oanda::login_with_live(env, live).await?;
     Some(OandaBroker { client, account_id })
 }
 

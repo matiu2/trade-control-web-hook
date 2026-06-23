@@ -1032,8 +1032,8 @@ within its window won't double-fire.
 |---|---|---|
 | `SIGNING_KEY` | yes | 64-hex-char HMAC-SHA256 key. Used to sign / verify the body and (re-used) to gate `GET /diag/*`. |
 | `OANDA_API_KEY` | for OANDA | OANDA v20 token. |
-| `OANDA_ACCOUNT_ID` | for OANDA | OANDA account id. |
-| `OANDA_LIVE` | no | `true` for live trading; defaults to practice. |
+| `OANDA_ACCOUNT_ID` | for OANDA | OANDA account id, for the legacy global path (intents with no `account:`). Named accounts carry their id on metadata instead. |
+| `OANDA_LIVE` | no | Practice vs live for the **legacy global path only** (`account: None`). `true` → live, anything else / absent → practice. **Named accounts ignore this** — each account's practice-vs-live host is derived from its own `kind` (`demo` → practice, `live` → live), so one worker can run a demo and a live OANDA account side by side. |
 | `TN_ACCOUNT_<NAME>` | for TradeNation | Per-account credentials blob (JSON-serialised `Credentials::TradeNation`). `<NAME>` is the operator-friendly account name uppercased with `-` → `_`. Managed via `trade-control account add` — set this secret per account, the worker logs in on demand and caches the session in KV. See "TradeNation session" below. |
 | `MAX_RISK_PCT_PER_TRADE` | no | Hard cap on requested `risk_pct`. Default `1.0`. |
 | `MAX_OPEN_POSITIONS` | no | Max concurrent open positions. Default `3`. |
