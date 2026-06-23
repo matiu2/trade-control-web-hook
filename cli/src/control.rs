@@ -98,8 +98,15 @@ pub fn build_unlock_intent(instrument: &str, now: DateTime<Utc>, suffix: &str) -
 /// (timestamp + suffix) so a re-arm of the same trade isn't rejected by the
 /// seen-id replay check. The plan rides the whole-body HMAC via `trade_plan`
 /// (rendered as single-line flow JSON by `build_signed_body`).
+///
+/// `account` is the operator-facing account name that scopes the plan in KV
+/// (`plan:{account}:{trade_id}`). It must match the account used for the
+/// trade's vetos/preps so the engine's scoped lookups line up — otherwise the
+/// plan lands in the global `_` scope and `plan list` shows `-` under ACCOUNT.
+/// `None` keeps the legacy global scope for callers with no account context.
 pub fn build_register_intent(
     plan: trade_control_core::trade_plan::TradePlan,
+    account: Option<&str>,
     now: DateTime<Utc>,
     suffix: &str,
 ) -> Intent {
@@ -112,6 +119,7 @@ pub fn build_register_intent(
     let trade_id = plan.trade_id.clone();
     let mut intent = control_skeleton(Action::Register, &instrument, id, now);
     intent.trade_id = Some(trade_id);
+    intent.account = account.map(str::to_owned);
     intent.trade_plan = Some(plan);
     intent
 }
@@ -680,12 +688,15 @@ mod tests {
 
     #[test]
     fn register_intent_binds_trade_id_and_carries_plan() {
-        let intent = build_register_intent(sample_plan(), t(), "cd34");
+        let intent = build_register_intent(sample_plan(), Some("reversals"), t(), "cd34");
         assert_eq!(intent.action, Action::Register);
         // The carrier's trade_id / instrument must match the plan so the
         // worker's handle_register cross-check passes.
         assert_eq!(intent.trade_id.as_deref(), Some("eurusd-hs-7"));
         assert_eq!(intent.instrument, "EUR_USD");
+        // The account scopes the plan's KV row (`plan:{account}:{trade_id}`) so
+        // `plan list` shows it under ACCOUNT instead of `-`.
+        assert_eq!(intent.account.as_deref(), Some("reversals"));
         let plan = intent.trade_plan.as_ref().expect("plan present");
         assert_eq!(plan.rules.len(), 1);
     }
@@ -697,7 +708,7 @@ mod tests {
     #[test]
     fn signed_register_body_round_trips_through_verify() {
         let key = [7u8; KEY_LEN];
-        let intent = build_register_intent(sample_plan(), t(), "cd34");
+        let intent = build_register_intent(sample_plan(), None, t(), "cd34");
         let body = wrap_signed(&intent, &key, t()).unwrap();
         // The plan is a single top-level line (flow JSON), not block YAML.
         assert!(body.contains("trade_plan: {"), "body was:\n{body}");
@@ -719,7 +730,7 @@ mod tests {
     #[test]
     fn tampered_register_plan_is_rejected() {
         let key = [7u8; KEY_LEN];
-        let intent = build_register_intent(sample_plan(), t(), "cd34");
+        let intent = build_register_intent(sample_plan(), None, t(), "cd34");
         let body = wrap_signed(&intent, &key, t()).unwrap();
         // Flip a digit in the plan's baked level (1.2 → 9.2) without re-signing.
         let tampered = body.replace("\"level\":1.2", "\"level\":9.2");
