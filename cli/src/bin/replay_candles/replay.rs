@@ -121,6 +121,16 @@ pub async fn run(
         // up with the live worker, which ticks on wall-clock, not bar-open.
         let now = candles[i].time + bar;
 
+        tracing::debug!(
+            bar = %candles[i].time,
+            phase = ?state.phase,
+            o = mid[i].o,
+            h = mid[i].h,
+            l = mid[i].l,
+            c = mid[i].c,
+            "tick: evaluating live bar"
+        );
+
         let eval = evaluate_plan(plan, &state, new, detector_window, now, expires_at);
         state = eval.new_state;
 
@@ -131,6 +141,12 @@ pub async fn run(
         }
 
         for fired in eval.fired {
+            tracing::debug!(
+                bar = %candles[i].time,
+                rule = %fired.rule_id,
+                action = ?fired.intent.action,
+                "tick: rule fired"
+            );
             // An enter fire on a multi-shot plan must clear the retry gate before
             // it counts as a placement; any other fire (veto/prep, or a
             // single-shot enter) records straight through.

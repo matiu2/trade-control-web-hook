@@ -1,5 +1,91 @@
 # Changelog
 
+## v57 — 2026-06-24 — Recover wrong-side stop entries (rename `on_too_close` → `recover_entry`)
+
+### Why
+
+An H&S / iH&S short enters on a stop at `signal_low − 1pip`. When price
+breaks **down through that trigger during the 2-bar signal-confirmation
+wait**, the stop is "wrong-side" by the time the signal confirms
+(`trigger ≥ close` for a short). The resolver returned `InvalidGeometry`,
+the engine treated that as "decline this bar", and the trade was
+**silently dropped** — even when the thesis was right and price ran to TP.
+Proven on Euro Stocks 50 (2026-06-23): trigger 6306.2, confirm-bar close
+6302.3, SL 6329.0, TP 6210.65 → a confirmed setup abandoned, ~3.4R left on
+the table. The recovery machinery already existed for the broker `#19-10`
+case, but never fired at resolve time and was misleadingly named.
+
+### What changed
+
+- **Resolver recovers a wrong-side stop instead of dropping it** — *when
+  opted in*. `recover_entry: { action: market }` re-keys to a market entry
+  at the current close; `{ action: limit }` rests a limit at the original
+  trigger (correct-side re-checked) for the pullback, preserving R. `skip`
+  / absent keep today's drop (zero blast radius for un-opted stops). The
+  recovered entry flows through the same resolver tail, so the **≥1R floor**
+  and the **in-range** check re-run against the new reference; the worker's
+  **SL≥10×spread** floor still applies.
+- **Derived slippage default.** A `market` recovery no longer *requires*
+  `max_slippage_pips`; when omitted the resolver derives the bound from the
+  SL→entry distance (`|stop_loss − trigger|`). Explicit pips still win.
+- **tv-arm `--recover-entry market|limit|abort`** (H&S / iH&S only;
+  `abort → skip`). When omitted the default is keyed off
+  `--require-confirmation`: a confirmation-required setup (whose lag is what
+  strands the stop) defaults to **`limit`**; otherwise **drop**. M/W is out
+  of scope (no `EntrySpec`).
+
+### Breaking
+
+- **Concept rename `on_too_close` → `recover_entry`** across the wire and
+  the codebase: struct `OnTooClose` → `RecoverEntry`, enum
+  `OnTooCloseAction` → `RecoverEntryAction` (variants `Market`/`Limit`/`Skip`
+  unchanged), `ResolvedOnTooClose` → `ResolvedRecoverEntry`,
+  `Resolved::on_too_close`/`EntrySpec::Stop::on_too_close` →
+  `recover_entry`, `IntentValidationError::OnTooCloseMissingSlippage`
+  removed, `src/too_close.rs` → `src/recover_entry.rs`
+  (`market_replace_plan`/`TooClosePlan` → `recover_entry_plan`/
+  `RecoverEntryPlan`). `EntryError::EntryTooCloseToMarket` (the broker
+  `#19-10` condition) is **unchanged**.
+- **Wire back-compat:** `#[serde(alias = "on_too_close")]` on the renamed
+  `EntrySpec::Stop::recover_entry` field, so in-flight signed KV plans
+  still parse. Action values (`market`/`limit`/`skip`) are unchanged.
+
+### Config
+
+- `entry.recover_entry: { action: market|limit|skip, max_slippage_pips?: f64 }`
+  on a `stop` entry (was `on_too_close`). `max_slippage_pips` is now optional
+  for `market`. CLI: `tv-arm --recover-entry market|limit|abort`.
+
+### Telemetry (breaking for log greps)
+
+- Recovery skip-reason strings `too-close-*` → `recover-entry-*` (e.g.
+  `too-close-limit-wrong-side` → `recover-entry-limit-wrong-side`,
+  `too-close-no-fallback` → `recover-entry-none`). The engine
+  rejected-entry-spec tracing field `on_too_close=` → `recover_entry=`. The
+  broker-failure outcome string `entry-failed: too-close-to-market` is
+  **unchanged** (it names the broker condition).
+
+### Tests
+
+- Core: 8 new resolver tests (bare/skip drop; market@close + derived/
+  explicit slippage; limit@trigger; below-min-R refused; past-TP
+  out-of-range; the exact Euro fixture → Limit@6306.2 SL 6329.0 TP 6210.65);
+  serde alias round-trip; validation now *accepts* a bound-less market. CLI:
+  threading (Skip→no field, Limit→Some+validates, Market entry ignores it).
+  tv-arm: flag mapping + Option default. core 593 / engine 53 / worker 211 /
+  cli 249 / tv-arm 142 — all green.
+- **Replay proof** (`/tmp/euro.json`): bare → resolve-failed → drops →
+  `too-low` veto; `recover_entry:{action:limit}` → "dispatchable — will
+  fire enter", SHORT limit @ 6306.2 → TOOK PROFIT (TP:1 SL:0);
+  `{action:market}` → SHORT market @ 6302.3 → TOOK PROFIT.
+
+### Follow-up
+
+- The broker-`#19-10` `place_entry_too_close_fallback` (`src/lib.rs`) still
+  re-places via `broker.place_entry` directly, bypassing the SL≥10×spread
+  and R-floor worker gates. Documented, not fixed here.
+- Not deployed — landed + verified on `main`/dev via replay only.
+
 ## v56 — 2026-06-23 — OANDA practice-vs-live is per-account (not a global secret)
 
 ### Why

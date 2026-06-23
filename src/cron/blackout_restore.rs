@@ -12,12 +12,12 @@
 //!    during a long blackout) is **dropped with a log, never placed**.
 //! 2. **Cheap fill-side pre-check** via the pure
 //!    [`blackout_recreate::restore_plan`] using a fresh quote: a placeable stop
-//!    or limit re-drives; an overrun stop with `on_too_close=skip` is dropped
+//!    or limit re-drives; an overrun stop with `recover_entry=skip` is dropped
 //!    without a broker round-trip; a stale limit is dropped (limits are
 //!    themselves a fallback).
 //! 3. **Re-drive through [`crate::run_enter`]** — NOT `place_entry` directly —
 //!    so sizing at the actual fill reference, the prep/veto/cooldown/allow_entry
-//!    gates, AND the Sub-plan-0 `on_too_close` fallback all apply for free.
+//!    gates, AND the Sub-plan-0 `recover_entry` fallback all apply for free.
 //!
 //! ## Seen-id / retry-gate interaction (load-bearing — see CLAUDE.md
 //! "Replay protection scope")
@@ -122,7 +122,7 @@ async fn restore_one_order(
     let quote = get_quote(&broker, &resolved.instrument)
         .await
         .map_err(|e| format!("quote: {e:?}"))?;
-    let on_too_close = resolved.on_too_close.as_ref().map(|o| o.action);
+    let recover_entry = resolved.recover_entry.as_ref().map(|o| o.action);
 
     let plan = restore_plan(
         &resolved.entry,
@@ -131,12 +131,12 @@ async fn restore_one_order(
         resolved.take_profit,
         quote.bid,
         quote.ask,
-        on_too_close,
+        recover_entry,
     );
     match plan {
         RestorePlan::DropStopOverrunSkip => {
             rlog!(
-                "blackout restore[{tid}]: stop overrun, on_too_close=skip, dropped order {} \
+                "blackout restore[{tid}]: stop overrun, recover_entry=skip, dropped order {} \
                  (bid={} ask={})",
                 cancelled.order_id,
                 quote.bid,
@@ -172,9 +172,9 @@ async fn restore_one_order(
     //    mark_seen (the original id is already seen; the cron is off the HTTP
     //    is_seen path entirely) and we pass the signed body so a successfully
     //    re-placed order re-stores its own order:{order_id} row (it can be
-    //    blackout-cancelled again later). The on_too_close fallback fires
+    //    blackout-cancelled again later). The recover_entry policy fires
     //    naturally on the broker's #19-10 if the trigger was overrun beyond the
-    //    band but on_too_close != skip.
+    //    band but recover_entry != skip.
     let result = redrive(
         &broker,
         store,

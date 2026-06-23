@@ -137,7 +137,7 @@ pub enum EntryError {
     /// resting below price / sell-stop above, or the limit analogue).
     /// On TradeNation this is `#19-10` / `#19-9` (`d.Status == -19`).
     /// Distinct from [`Self::OrderRejected`] so the worker's
-    /// `on_too_close` fallback can recover (re-place as market / limit,
+    /// `recover_entry` fallback can recover (re-place as market / limit,
     /// or skip) instead of dropping the entry. The stop-loss distance is
     /// **not** the cause.
     EntryTooCloseToMarket,
