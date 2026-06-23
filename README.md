@@ -368,7 +368,7 @@ instrument: EUR_USD
 direction: long                        # long | short
 entry: { type: market }                # or { type: stop, from: high, offset_pips: 2 }
                                        # or { type: limit, from: low,  offset_pips: 5 }
-                                       # stop entries may add on_too_close: see below
+                                       # stop entries may add recover_entry: see below
 stop_loss:   { from: low,  offset_pips: -2 }    # anchored — or { absolute: 1.86236 }
 take_profit: { from: close, offset_r: 2.0 }    # 2R — or { absolute: 1.86899 }
                                        #         or { from: high, offset_pips: 50 }
@@ -423,55 +423,76 @@ rejects the trade if the geometry is wrong (e.g. a long limit priced above
 the current candle close), so a typo can't turn a limit into an instant
 market fill at a worse price.
 
-**Stop-entry "too close to market" fallback (`on_too_close`):** when a
-stop-entry's trigger has already been overtaken by price by the time the
-order tries to rest, the broker rejects it as "entry too close to / on
-the wrong side of the market" (TradeNation `#19-10`). By default that
-placement fails (HTTP 502) without poisoning the intent id, so the next
-signal bar can retry. A `stop` entry can opt into a recovery instead:
+**Wrong-side stop-entry recovery (`recover_entry`):** a stop entry can be
+unplaceable because its trigger has already been overtaken by price. This
+happens at **two** points:
+
+1. **At resolve time** — the breakout ran *during* the
+   signal-confirmation wait, so by the bar the signal confirms the stop
+   is on the wrong side for its direction (a short stop now sits at/above
+   the close, a long stop at/below). Previously the resolver returned
+   "geometry inconsistent with direction" and the entry was **silently
+   dropped**, even when the thesis was right and price ran to TP.
+2. **At the broker** — the order tries to rest and TradeNation rejects it
+   as "entry too close to / on the wrong side of the market" (`#19-10`).
+   By default the placement fails (HTTP 502) without poisoning the intent
+   id, so the next signal bar can retry.
+
+A `stop` entry can opt into a recovery for **both** cases:
 
 ```yaml
 entry:
   type: stop
-  from: high
-  offset_pips: 1.0
-  on_too_close:               # optional; default = skip (today's behaviour)
-    action: market            # market | limit | skip
-    max_slippage_pips: 8.0    # required for action: market — guard rail
+  from: signal_low
+  offset_pips: -1.0
+  recover_entry:              # optional; default = skip (today's drop)
+    action: limit             # market | limit | skip
+    max_slippage_pips: 8.0    # optional for market; derived if omitted
 ```
 
-- `action: skip` (default, also when `on_too_close` is omitted) — fail
-  the placement, don't poison the id, let the next bar try.
-- `action: market` — re-place as a **market order**, but only if the
-  current price is within `max_slippage_pips` of the original stop
-  trigger; otherwise fall back to skip and log why. The guard rail is
-  **required** (rejected at validate time if missing) so a runaway
-  breakout can't be chased into a much worse fill. The re-place is a
-  **single** synchronous attempt and is re-sized against the actual
-  market fill reference (a worse fill changes the stop distance and
-  therefore the 1%-equity position size). It does **not** consume a
-  multi-shot `max_retries` slot — it's the same intended entry.
-- `action: limit` — re-place the level as a **limit order** resting at
-  the original stop trigger, waiting for price to pull back to the
-  intended entry. This preserves the planned R exactly (a limit can't
-  fill worse than its price) at the cost of possibly never filling. No
-  `max_slippage_pips` is needed or used. A geometry guard applies: the
-  limit must rest on the correct side of the market (long: trigger
-  at/below current price; short: at/above) — in a genuine `#19-10` the
-  price has overrun the trigger so this holds, but a degenerate case
-  that would create a `#19-9` ("limit on the wrong side") is skipped and
-  logged (`too-close-limit-wrong-side`). Like `market`, it's a **single**
-  synchronous attempt and does not consume a multi-shot `max_retries`
-  slot. The resting limit is recorded as a normal pending order, so the
-  alert-window / `expiry_bars` cron sweep cancels it if it never fills —
-  it inherits the same lifetime as any other resting order (no
-  broker-native good-til-date is required).
+- `action: skip` (default, also when `recover_entry` is omitted) — drop
+  the entry (resolve-time) / fail the placement without poisoning the id
+  (broker-time), letting the next bar try.
+- `action: market` — enter the confirmed breakout at **market**. At
+  resolve time the reference becomes the current candle close; at the
+  broker the live market price. The chase is bounded by
+  `max_slippage_pips`, or — when omitted — by the **derived SL→entry
+  distance** (`|stop_loss − trigger|`), so a runaway breakout can't be
+  chased into a much worse fill without the operator supplying a number.
+  The recovered entry is re-sized against the actual fill reference.
+- `action: limit` — rest a **limit order** at the original stop trigger
+  and wait for price to pull back to the intended entry. This preserves
+  the planned R exactly (a limit can't fill worse than its price) at the
+  cost of possibly never filling. A geometry guard applies: the limit
+  must rest on the correct side (long: trigger at/below the close; short:
+  at/above) — a degenerate case that would create a `#19-9` is dropped.
+  The resting limit is a normal pending order, so the alert-window /
+  `expiry_bars` cron sweep cancels it if it never fills.
 
-The distinct rejection is observable in the logs as
-`entry-failed: too-close-to-market` (vs the generic
-`entry-failed: broker rejected the order`). Only TradeNation has a
-confirmed `#19-10` today; the OANDA path maps its broker rejections to
-the generic case and does not trigger this fallback.
+**Both recoveries are still gated.** The recovered entry runs through the
+same resolver tail as any entry, so the **≥1R floor** (`min_r`) and the
+**in-range** check (entry strictly between SL and TP) re-run against the
+new reference — a recovery that's too far toward TP (low R) or already
+past a level is refused. The worker's **SL≥10×spread** floor also still
+applies. The broker re-place is a **single** synchronous attempt and does
+**not** consume a multi-shot `max_retries` slot — it's the same intended
+entry.
+
+The broker rejection is observable as `entry-failed: too-close-to-market`
+(vs the generic `entry-failed: broker rejected the order`). The recovery
+skip reasons are logged as `recover-entry-<reason>` (e.g.
+`recover-entry-limit-wrong-side`, `recover-entry-slippage`). Only
+TradeNation has a confirmed `#19-10` today; the OANDA path maps its broker
+rejections to the generic case (the resolve-time recovery is
+broker-agnostic).
+
+**Arming via `tv-arm` (H&S / iH&S):** pass `--recover-entry
+market|limit|abort` to bake the policy onto the `05-enter` intent
+(`abort` → `skip`). When the flag is **omitted**, the default is keyed off
+`--require-confirmation`: a confirmation-required setup (whose
+confirmation lag is exactly what strands the stop) defaults to **`limit`**;
+otherwise the default is **drop** (`skip`). M/W is out of scope — it has
+no stop `EntrySpec` and is unaffected.
 
 **Bar-based order expiry (`expiry_bars`):** a resting stop/limit order
 that never fills otherwise sits until `not_after`. Set `expiry_bars: N`
@@ -1194,7 +1215,7 @@ orders* during the window and re-drives them after.
 >    cron logs an `INTENT amend_stop …` line before every amend precisely so
 >    a dry-run/demo can confirm without risk.
 > 2. **cancel + re-drive of a resting order works** (System 3), including the
->    `on_too_close` fallback when the level has been overrun. Re-drive
+>    `recover_entry` recovery when the level has been overrun. Re-drive
 >    re-runs the real HMAC verify on the stored signed body (no fabricated
 >    auth) — confirm a cancelled order actually re-places (or correctly
 >    drops) on demo.
@@ -1338,22 +1359,22 @@ stores the order's whole **signed alert body** so the recovery watcher can
   HMAC verify the HTTP path does) and calls the **same entry path**
   (`run_enter`) the original alert took — so sizing at the live fill
   reference, the prep/veto/cooldown/allow_entry gates, **and** the
-  `on_too_close` stop fallback all apply, with no duplicated place logic.
+  `recover_entry` stop recovery all apply, with no duplicated place logic.
 - **Fill-side recreate geometry (the sign-bug-prone seam).** Before
   re-driving, a pure predicate checks whether the order is still worth
   placing, using **fill-side** bid/ask (a long buys at `ask`, a short sells
   at `bid` — spread counts *against* re-entering a deep order):
   - **Stop still placeable** (fill-side hasn't blown past trigger beyond the
     SL band) → re-drive as a stop.
-  - **Stop overrun** (the move is gone) → route to the order's `on_too_close`
+  - **Stop overrun** (the move is gone) → route to the order's `recover_entry`
     fallback (market / limit / skip) via the broker's own `#19-10` rejection.
-    If `on_too_close` is `skip` (the default), it's dropped without a
+    If `recover_entry` is `skip` (the default), it's dropped without a
     pointless broker round-trip and the next signal bar can retry.
   - **Limit still on the pullback side** (fill-side strictly between entry
     and TP) → re-drive as a limit.
   - **Limit stale** (wrong side / past TP) → **dropped**, leaving the trade
     "looking for entry". A limit is itself a fallback, so a stale one is fine
-    to drop; it is **never** routed to the stop `on_too_close` path.
+    to drop; it is **never** routed to the stop `recover_entry` path.
 - **Crash-safe ordering.** The `CancelledOrder` (signed body + order id) is
   stored on the per-trade record **before** the broker `cancel_order`, so a
   crash between them can't lose a wanted entry — the worst case is a
@@ -1380,7 +1401,7 @@ stores the order's whole **signed alert body** so the recovery watcher can
 > force Cron 1, confirm it's cancelled at the broker and stored in KV
 > (`trade-control status` shows the `cancelled_orders` entry); then force
 > recovery and confirm it's re-placed (price still on the entry side),
-> routed to `on_too_close` (price overran), or dropped (stale limit). **Do
+> routed to `recover_entry` (price overran), or dropped (stale limit). **Do
 > not enable live until demo-confirmed.** See `TODO.md`.
 
 This release lands the **state machine + cron skeleton** plus Systems 1, 2,
@@ -1857,7 +1878,8 @@ cargo run -p tv-arm -- \
   --skip-retest \                     # implies --skip-break-and-close; for late entries
   --skip-golden \                     # drop the Pine golden-candle requirement (golden is required by default)
   --max-retries 5 \                   # multi-shot re-entry cap (default 5; pass 0 for single-shot). >0 keeps the engine plan in AwaitEntry across re-entries (see below)
-  --require-confirmation \            # require a confirmed signal candle on entry (independent of golden)
+  --require-confirmation \            # require a confirmed signal candle on entry (independent of golden). Also flips the recover-entry default to `limit` (see below)
+  --recover-entry limit \             # H&S/iH&S: how to recover a stop entry gone wrong-side during confirmation — market | limit | abort. Omit to default off --require-confirmation (limit) else drop
   --blackout-close close \            # market-hours blackout: also flatten an open position if caught in the close→open gap (default: cancel = cancel the resting order only)
   --register-plan \                   # arm the trade: register one signed TradePlan with the server-side engine
   --shadow                            # register observe-only: engine evaluates + logs, but never places orders (safe dry watch)
