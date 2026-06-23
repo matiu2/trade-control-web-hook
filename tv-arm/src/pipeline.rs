@@ -288,6 +288,7 @@ pub fn run(args: Args) -> Result<i32> {
             &news_bundles,
             &built_calendar,
             &key,
+            &account,
             now,
             args.shadow,
             args.plan_out.as_deref(),
@@ -1577,6 +1578,7 @@ fn register_trade_plan(
     news_bundles: &[NewsBundle],
     built_calendar: &[cli::BuiltCalendarBundle],
     key: &[u8; KEY_LEN],
+    account: &str,
     now: DateTime<Utc>,
     shadow: bool,
     plan_out: Option<&Path>,
@@ -1624,7 +1626,7 @@ fn register_trade_plan(
     }
     // Mint a fresh register intent carrying the plan, sign it, POST it.
     let suffix = register_suffix(now);
-    let intent = cli::build_register_intent(plan, now, &suffix);
+    let intent = cli::build_register_intent(plan, Some(account), now, &suffix);
     let body = cli::wrap_signed(&intent, key, now).wrap_err("sign register intent")?;
     info!(
         trade_id = %built_trade.trade_id,

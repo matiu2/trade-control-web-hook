@@ -67,10 +67,13 @@ Trading:
   entry blackout.
 - `plan-list` — read-only: list the registered server-side `TradePlan`s, each
   with a compact summary of its current `PlanState` (phase, watermark, fired
-  rules, shadow flag). Lists live plans by default; the intent's
-  `include_archived` flag (CLI `--include-all`) also lists terminated
-  (vetoed/completed) plans retained in the archive keyspace. Drives
-  `trade-control plan list`. KV-only, idempotent.
+  rules, shadow flag). The `ACCOUNT` column reflects the plan's KV scope
+  (`plan:{account}:{trade_id}`); `tv-arm` registers each plan under its
+  resolved `--account` so the plan shares the scope of its own vetos/preps. A
+  plan armed without an account (legacy / global `_` scope) shows `-`. Lists
+  live plans by default; the intent's `include_archived` flag (CLI
+  `--include-all`) also lists terminated (vetoed/completed) plans retained in
+  the archive keyspace. Drives `trade-control plan list`. KV-only, idempotent.
 - `plan-show` — read-only: dump one plan in full (every rule + its persisted
   `PlanState`). Target named by the intent's `trade_id`; the worker scans all
   account scopes — **live and archived** — so a terminated plan surfaced by
