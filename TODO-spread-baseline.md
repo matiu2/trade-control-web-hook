@@ -11,23 +11,34 @@ demo; re-bake tomorrow with more live data.
   against `elevated_threshold_pips(&resolved.instrument)`.
 - `resolved.instrument` is the **broker-canonical (TradeNation MarketName)**
   symbol — same key as the samples. Threshold unit is **pips**.
-- Per instrument, bake the **observed max `spread_pips`** as the threshold
-  (reject only when current exceeds the instrument's own observed ceiling).
+- Per instrument, threshold = **`median × 5`** (5× the instrument's own
+  normal spread). Chosen 2026-06-23 after spread-hour data showed the
+  blowout is FX-only (FX spikes 10–20× normal; Copper/Gold stay flat), so a
+  multiple of normal — not the observed max — is the right shape.
 - Instruments without a baked value fall back to the flat `8.0`.
 
 ## Steps
 
-- [ ] build.rs in the worker crate: read `../spread-sampler-cron/samples/*.yaml`,
-      compute per-instrument max `spread_pips` (skip files with no
-      `spread_pips`), emit `OUT_DIR/spread_baseline.rs` as a `match` fn.
-      `cargo:rerun-if-changed` on the samples dir.
-- [ ] `spread_blackout.rs`: `elevated_threshold_pips(instrument)` consults
-      the generated table, falls back to `SPREAD_BLACKOUT_ELEVATED_PIPS`.
-- [ ] Update the reject message to name the baked normal/high vs current.
-- [ ] Tests: generated-table lookup hits a known instrument (Copper,
-      EUR/USD), misses fall back to 8.0.
-- [ ] cargo build (wasm target check), test, clippy, fmt.
-- [ ] README: note the baked-threshold source + the re-bake cadence.
-- [ ] Commit + push (worker repo), bump parent pointer.
-- [ ] Deploy to **staging** (demo) — the user wants to go live on demo ASAP.
+- [x] build.rs in the worker crate: read `../spread-sampler-cron/samples/*.yaml`,
+      compute per-instrument low/high/median `spread_pips` (skip files with no
+      `spread_pips`), emit `OUT_DIR/spread_baseline.rs` as a sorted slice.
+      `cargo:rerun-if-changed` on the samples dir. Fail-soft → empty table.
+- [x] `spread_blackout.rs`: `elevated_threshold_pips(instrument)` consults
+      the generated table (`median × SPREAD_REJECT_MULTIPLE` = 5×), falls
+      back to `SPREAD_BLACKOUT_ELEVATED_PIPS`. `baked_baseline()` exposed
+      for the reject message.
+- [x] Update the reject message to name the baked normal/seen-range vs current.
+- [x] Tests: table sorted + self-consistent, threshold == 5×median, unknown
+      falls back to 8.0.
+- [x] cargo build (wasm target check ✓), test ✓, clippy ✓, fmt ✓.
+- [x] README: baked-threshold source + re-bake cadence + FX-only finding.
+- [x] Commit + push (worker `main`: e5f5ae3 baked table, fdee846 = 5×),
+      parent pointer bumped.
+- [x] **Deployed to staging (demo)** — landed via another session's
+      main→staging merge + `deploy-staging.sh` (2026-06-24). The 5× spread
+      threshold is live on the demo worker; spread files identical on
+      main/staging.
+- [ ] **Re-bake periodically** as samples accumulate. Copper confirmed FLAT
+      (~150, no spread-hour) — TradeNation "fixed spreads" change ~twice a
+      day, not a liquidity spike. FX is where the spread-hour action is.
 ```
