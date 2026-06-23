@@ -478,14 +478,59 @@ fn eval_pine_entry(
     pattern: Option<SignalKind>,
     dir: Direction,
 ) -> Option<LatchedSignal> {
-    let idx = detector_window.iter().position(|c| c.time == candle.time)?;
-    let sig = latched_signal_at(detector_window, idx, cfg)?;
-    if !sig.fires || sig.direction != dir {
+    let Some(idx) = detector_window.iter().position(|c| c.time == candle.time) else {
+        tracing::debug!(
+            bar = %candle.time,
+            "pine-enter: candle not found in detector window (no signal)"
+        );
+        return None;
+    };
+    let Some(sig) = latched_signal_at(detector_window, idx, cfg) else {
+        tracing::debug!(
+            bar = %candle.time,
+            window_len = detector_window.len(),
+            "pine-enter: no latched signal yet (detector warming / no pattern printed)"
+        );
+        return None;
+    };
+    // Log the full latched state every bar so a replay with RUST_LOG=debug shows
+    // *why* a bar does or doesn't fire the enter: the detector verdict, the
+    // latched geometry, and the quality flags the dispatchable gate reads.
+    tracing::debug!(
+        bar = %candle.time,
+        fires = sig.fires,
+        latched_dir = ?sig.direction,
+        want_dir = ?dir,
+        kind = ?sig.kind,
+        want_kind = ?pattern,
+        golden = sig.golden,
+        confirmed = sig.signal_confirmed,
+        signal_high = sig.signal_high,
+        signal_low = sig.signal_low,
+        "pine-enter: latched signal at this bar"
+    );
+    if !sig.fires {
+        tracing::debug!(bar = %candle.time, "pine-enter: alert does not fire on this bar");
+        return None;
+    }
+    if sig.direction != dir {
+        tracing::debug!(
+            bar = %candle.time,
+            latched_dir = ?sig.direction,
+            want_dir = ?dir,
+            "pine-enter: latched direction != plan direction — decline"
+        );
         return None;
     }
     if let Some(want) = pattern
         && sig.kind != want
     {
+        tracing::debug!(
+            bar = %candle.time,
+            kind = ?sig.kind,
+            want_kind = ?want,
+            "pine-enter: latched kind != required pattern — decline"
+        );
         return None;
     }
     Some(sig)
@@ -521,16 +566,114 @@ fn pine_entry_dispatchable(
     // Candle-quality gate — `None`/`false` both fail (conservative reject),
     // matching `candle_gate::evaluate`.
     if intent.needs_golden && !sig.golden {
+        tracing::debug!(
+            bar = %candle.time,
+            "pine-enter: NOT dispatchable — needs_golden but signal is not golden"
+        );
         return false;
     }
     if intent.needs_confirmed && !sig.signal_confirmed {
+        tracing::debug!(
+            bar = %candle.time,
+            "pine-enter: NOT dispatchable — needs_confirmed but signal is not confirmed"
+        );
         return false;
     }
     // Bracket resolution against the same signal-folded shell the worker
     // dispatches. An `Err` (degenerate geometry, below-min-R, out-of-range, …)
     // is a decline-this-bar, not a fire.
     let shell = trade_control_core::intent::Shell::from_candle_and_signal(candle, sig);
-    trade_control_core::intent::Resolved::from_intent(intent, &shell, pip_size).is_ok()
+    match trade_control_core::intent::Resolved::from_intent(intent, &shell, pip_size) {
+        Ok(_) => {
+            tracing::debug!(bar = %candle.time, "pine-enter: dispatchable — will fire enter");
+            true
+        }
+        Err(e) => {
+            log_rejected_entry_spec(&e, intent, &shell, pip_size);
+            false
+        }
+    }
+}
+
+/// Dump the **fully-resolved** entry spec of a rejected enter so a
+/// `RUST_LOG=...=debug` replay shows exactly what geometry was being compared
+/// against what — instead of just the opaque `resolve-failed` string. The
+/// trigger / SL / TP are recomputed the same way the resolver does
+/// (`anchor_price + offset × pip_size`, `PriceRef::resolve`, the `TakeProfit`
+/// variants), and the shell's reference prices (`close`/`signal_high`/
+/// `signal_low`) are logged alongside so the wrong-side check
+/// (`short stop trigger >= close`) is auditable at a glance.
+fn log_rejected_entry_spec(
+    err: &trade_control_core::intent::ResolveError,
+    intent: &trade_control_core::intent::Intent,
+    shell: &trade_control_core::intent::Shell,
+    pip_size: f64,
+) {
+    use trade_control_core::intent::{EntrySpec, PriceRef, TakeProfit};
+
+    // Entry trigger / kind — mirror `Resolved::from_intent`'s match arms.
+    let (entry_kind, entry_trigger) = match &intent.entry {
+        Some(EntrySpec::Market) => ("market", Some(shell.close)),
+        Some(EntrySpec::Stop {
+            from,
+            offset_pips,
+            at,
+            ..
+        }) => (
+            "stop",
+            Some(at.unwrap_or_else(|| shell.anchor_price(*from) + offset_pips * pip_size)),
+        ),
+        Some(EntrySpec::Limit {
+            from,
+            offset_pips,
+            at,
+        }) => (
+            "limit",
+            Some(at.unwrap_or_else(|| shell.anchor_price(*from) + offset_pips * pip_size)),
+        ),
+        None => ("none", None),
+    };
+
+    let stop_loss = intent.stop_loss.as_ref().map(|sl| sl.resolve(shell, pip_size));
+
+    // Take-profit — RMultiple needs the entry+SL to resolve, so only report the
+    // simple absolute / anchored case precisely; RMultiple is logged as a label.
+    let take_profit = match &intent.take_profit {
+        Some(TakeProfit::Anchored(PriceRef::Absolute { absolute })) => Some(*absolute),
+        Some(TakeProfit::Anchored(r)) => Some(r.resolve(shell, pip_size)),
+        _ => None,
+    };
+
+    tracing::debug!(
+        bar = %shell.time,
+        error = %err,
+        direction = ?intent.direction,
+        entry_kind,
+        entry_trigger,
+        stop_loss,
+        take_profit,
+        shell_close = shell.close,
+        shell_high = shell.high,
+        shell_low = shell.low,
+        signal_high = ?shell.signal_high,
+        signal_low = ?shell.signal_low,
+        on_too_close = ?entry_on_too_close(&intent.entry),
+        "pine-enter: NOT dispatchable — resolve failed; resolved entry spec follows"
+    );
+}
+
+/// Short label for the entry's `on_too_close` opt-in (for the rejection log).
+fn entry_on_too_close(
+    entry: &Option<trade_control_core::intent::EntrySpec>,
+) -> Option<trade_control_core::intent::OnTooCloseAction> {
+    use trade_control_core::intent::EntrySpec;
+    match entry {
+        Some(EntrySpec::Stop {
+            on_too_close: Some(otc),
+            ..
+        }) => Some(otc.action),
+        _ => None,
+    }
 }
 
 /// Stamp `retest_seen_at` if this candle satisfies the retest trendline
