@@ -1,5 +1,44 @@
 # Changelog
 
+## v56 — 2026-06-23 — OANDA practice-vs-live is per-account (not a global secret)
+
+### Why
+
+The worker picked the OANDA host (practice `api-fxpractice` vs live
+`api-fxtrade`) from one worker-global `OANDA_LIVE` secret, read inside
+`broker-oanda`'s login regardless of which named account was trading. That
+makes it impossible to run a demo and a live OANDA account in the same worker,
+and it silently couples a named demo account's host to a global flag the
+operator may have set for something else.
+
+### What changed
+
+- **Named OANDA accounts derive practice-vs-live from their own `kind`.**
+  `acquire_oanda_broker_for_account` now passes `meta.kind.is_live()` down:
+  `demo` → practice host, `live` → live host. The global `OANDA_LIVE` secret is
+  bypassed entirely for the named-account path.
+- `broker_oanda::login_with_account_id(env, account_id, live)` gained the
+  explicit `live` flag; `oanda::login_with_live(env, live)` is the new
+  host-from-flag constructor. The pure `live_flag_from_secret` helper isolates
+  the `OANDA_LIVE` string parsing.
+- **Legacy global path unchanged:** `login(env)` (intents with no `account:`)
+  still reads `OANDA_LIVE`.
+
+### Breaking
+
+- `broker_oanda::login_with_account_id` now takes a third `live: bool` argument.
+
+### Tests
+
+- `live_flag_tests` in `broker-oanda/src/oanda.rs` cover the `OANDA_LIVE` parse
+  (absent → practice, case-insensitive `true` → live, everything else →
+  practice). Existing `AccountKind::is_live` tests cover the per-account flag.
+
+### Follow-up
+
+- None. The legacy `OANDA_LIVE` secret can stay for the global path; named
+  accounts no longer consult it.
+
 ## v55 — 2026-06-22 — replay-candles: pull one bar past the trade-expiry so it actually fires
 
 ### Why

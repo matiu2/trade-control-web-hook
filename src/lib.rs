@@ -3256,8 +3256,12 @@ async fn acquire_oanda_broker_for_account(env: &Env, name: &str) -> Option<Oanda
         );
         return None;
     }
+    // Practice vs live is per-account, derived from the account's `kind`
+    // — not the worker-global `OANDA_LIVE` secret. A demo account always
+    // hits the practice host, a live account the live host, in one worker.
+    let live = meta.kind.is_live();
     match meta.oanda_account_id {
-        Some(id) => oanda_login_with(env, id).await,
+        Some(id) => oanda_login_with(env, id, live).await,
         None => {
             rlog_err!(
                 "oanda[{name}]: metadata has no `oanda_account_id` — re-run `trade-control account add` \
