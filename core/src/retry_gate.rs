@@ -1007,7 +1007,6 @@ mod tests {
             &self,
             _account: Option<&str>,
             _plan: &crate::trade_plan::TradePlan,
-            _ttl_seconds: u64,
         ) -> Result<(), StateError> {
             Ok(())
         }

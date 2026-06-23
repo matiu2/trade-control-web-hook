@@ -1902,8 +1902,13 @@ register is rejected.
 > `cli/src/trade_patterns.rs`.
 
 The worker validates the registered plan and **persists** it to KV (key
-`plan:{scope}:{trade_id}`, TTL = the trade window plus grace) for the
-server-side engine to enumerate each cron tick. The engine that *evaluates*
+`plan:{scope}:{trade_id}`, **no TTL** — like an archived plan) for the
+server-side engine to enumerate each cron tick. A registered plan never times
+out; it is removed only when the engine retires it (archive + clear on a
+terminal state: close, trade-expiry veto, or its window closing). The carrier
+`register` intent's `not_after` is a short control TTL and is **not** the
+plan's lifetime — anchoring KV expiry to it dropped live plans ~1h after arming
+(the 2026-06-23 bug). The engine that *evaluates*
 those plans — a state machine per trade — runs on the `*/15` tick and evaluates
 both M/W (per-bar enter heartbeat) and H&S (the Rust port of the
 `candle-signals-v2.pine` detector) entries plus the trendline / level / time

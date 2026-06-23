@@ -1425,16 +1425,15 @@ impl StateStore for KvStateStore {
         &self,
         account: Option<&str>,
         plan: &TradePlan,
-        ttl_seconds: u64,
     ) -> Result<(), StateError> {
         let key = Self::trade_plan_key(account, &plan.trade_id);
-        let ttl = ttl_seconds.max(MIN_TTL_SECONDS);
         let body = serde_json::to_string(plan)
             .map_err(|e| StateError::Backend(format!("encode plan: {e}")))?;
+        // No `.expiration_ttl(...)`: the live plan key persists indefinitely and
+        // is removed only by `clear_trade_plan` on the engine's archive path.
         self.store
             .put(&key, body)
             .map_err(|e| StateError::Backend(format!("put {key} builder: {e:?}")))?
-            .expiration_ttl(ttl)
             .execute()
             .await
             .map_err(|e| StateError::Backend(format!("put {key} execute: {e:?}")))?;

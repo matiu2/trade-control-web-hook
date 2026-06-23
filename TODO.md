@@ -1,38 +1,33 @@
-# TODO — replay-candles smarter defaults from TV replay cursor + plan
+# Fix: registered plans must not time out — archive on close instead — DONE
 
-Branch: `feat/replay-cursor-from-plan` (worktree). Target env: **dev** (`main`).
+## Root cause
+`build_register_intent` (cli/src/control.rs) builds on `control_skeleton`, which
+sets `not_after = now + CONTROL_TTL(5min)` and never overrides it for register.
+Worker `handle_register` derived the live `plan:` KV TTL from
+`(not_after - now) + 1h grace` → every registered plan expired from KV ~65min
+after arming (proven via R2 dump 2026-06-23: every register `ttl≈3897s`).
 
-Operator workflow: start TV in **replay mode at the start of the trade**, then
-just run `replay-candles-dev --plan plan.json`. The chart's last shown candle is
-the replay cursor (= trade start); the plan carries the trade-expiry (= end) and
-the granularity. So none of `--start`/`--end`/`--granularity` need to be typed.
+## Decision
+Plans never expire by TTL. They retire only via the engine's archive path
+(`persist_plan_state` → `archive_plan` + `clear_trade_plan`) on a `done` eval
+(terminal close / trade-expiry veto / window-close). That path already exists.
 
-## Changes
+## Done
+- [x] `put_trade_plan`: drop `ttl_seconds`; write live `plan:` key with NO expiry.
+  - [x] core/src/state.rs trait signature (+ doc explaining why)
+  - [x] src/state/kv.rs impl — omit `.expiration_ttl(...)` (mirrors `archive_plan`)
+  - [x] core/src/state.rs MemStateStore impl — store via `NO_TTL_SECONDS` idiom
+  - [x] fixed 3 other impls/stubs (retry_gate fake, lib.rs SeenSpyStore) + callers
+- [x] `handle_register` (src/lib.rs): dropped `replay_ttl_seconds`; rlog now
+      "persisted (no expiry)".
+- [x] Tests:
+  - [x] `memstore_registered_plan_does_not_expire` — expiry is far-future, not minutes
+  - [x] `memstore_clear_trade_plan_removes_live_but_keeps_archive` — archive path intact
+  - [x] added test-only `MemStateStore::expiry_of` accessor
+- [x] cargo test green: core 584, cli 247+34+13, tv-arm 141, tv-news 76,
+      engine 53, worker 211. clippy clean, fmt clean, wasm32 check clean.
+- [x] README updated (the `plan:` key persistence note).
 
-- [x] **start = last shown candle** (`bars_range.to`, the replay cursor), not
-      `visible_range.from`.
-- [x] **end = plan's trade-expiry** (`Trigger::TimeReached.at_epoch` on the rule
-      whose `rule_id` contains `trade-expiry`); fall back to chart
-      `visible_range.to` when the plan has no such rule.
-- [x] **granularity from the plan** (`plan.granularity`), not the chart. CLI
-      `--granularity` flag still overrides. Dropped chart-resolution reading from
-      the `need_tv`/`resolve_window` path.
-- [x] instrument unchanged: `--instrument` flag → chart symbol → plan.
-
-## Touch points
-
-- `cli/src/bin/replay_candles/tv.rs` — `TvDefaults`/`pull_defaults`: drop
-  granularity (move to plan), switch start to `bars_range.to`, end to
-  `visible_range.to` (fallback only).
-- `cli/src/bin/replay_candles.rs` — `resolve_window`: granularity from plan;
-  end from plan trade-expiry with chart fallback; recompute `need_tv`.
-- helper to extract trade-expiry epoch from a `TradePlan`.
-
-## Done when
-
-- [x] new unit tests for trade-expiry extraction + granularity resolution
-- [x] `cargo test -p trade-control-cli` green (13 + 20 bin tests)
-- [x] `cargo clippy` clean, `cargo fmt` run
-- [x] CHANGELOG v54 added (replay-candles not in README; documented in CHANGELOG)
-- [ ] commit + push + advance parent gitlink
-- [ ] rebuild + reinstall via deploy scripts so `replay-candles-<env>` updates
+## Follow-up (not in this change)
+- `CONTROL_TTL` 5-min default is still correct for real control actions; left as-is.
+- After merge: re-arm the staging setups against the fixed `tv-arm-staging`.
