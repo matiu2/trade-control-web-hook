@@ -1244,10 +1244,15 @@ committed YAML samples from the **`spread-sampler-cron`** submodule and
 emits a per-instrument table (`(name, low, high, median)` in pips, keyed by
 the broker-canonical TradeNation name — the same `resolved.instrument` the
 gate passes). `elevated_threshold_pips(instrument)` returns
-`max(observed_high, median × SPREAD_NORMAL_MULTIPLE)` (3× normal) so it
-blocks clearly above anything seen, yet never blocks a spread within 3× of
-normal even for an instrument that hasn't spiked in the sample window. An
-instrument absent from the baseline (a fresh asset, or one with no pip
+`median × SPREAD_REJECT_MULTIPLE` (**5× the instrument's own normal
+spread**). The 2026-06-23 spread-hour data showed the post-NY-close blowout
+is an **FX** phenomenon — FX crosses spike 10–20× their normal (AUD/USD
+0.4p→6p, EUR/GBP 0.5p→10p) while commodities/indices (Copper, Gold) stay
+flat — so a multiple of each instrument's *normal* is the right shape: 5×
+sits above resting/busy-news jitter yet well below a ≥10× spread-hour
+spike, so it rejects the blowout (AUD/USD line = 2p) without ever
+false-blocking a flat-spread instrument (Copper normal ~150p → line 750p).
+An instrument absent from the baseline (a fresh asset, or one with no pip
 size) falls back to the flat `SPREAD_BLACKOUT_ELEVATED_PIPS` (8 pips). The
 reject message names the instrument's baked normal/seen-range and the
 current spread. The recovery cutoff (`SPREAD_BLACKOUT_RECOVERED_PIPS`,
