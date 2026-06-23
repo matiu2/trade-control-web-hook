@@ -3,7 +3,7 @@
 
 use chrono::{DateTime, Utc};
 
-use super::{Action, Direction, EntrySpec, Intent, OnTooCloseAction, Shell, TakeProfit};
+use super::{Action, Direction, EntrySpec, Intent, RecoverEntryAction, Shell, TakeProfit};
 use crate::rules::{self, RhaiScope, RuleError};
 use crate::tunable::Tunable;
 
@@ -53,16 +53,16 @@ pub enum RiskBudget {
     Units(f64),
 }
 
-/// Resolved form of [`super::OnTooClose`] — the stop-entry fallback
+/// Resolved form of [`super::RecoverEntry`] — the stop-entry recovery
 /// carried alongside the [`Resolved`] trade so the worker's `run_enter`
 /// can recover from a `#19-10` rejection without re-reading the intent
 /// or pip size. Threaded *next to* [`ResolvedEntry`] rather than inside
 /// `ResolvedEntry::Stop` so the ~10 existing match sites (and the
 /// upstream broker adapters, which don't carry it) stay untouched.
 #[derive(Debug, Clone, Copy)]
-pub struct ResolvedOnTooClose {
+pub struct ResolvedRecoverEntry {
     /// The recovery action the operator opted into.
-    pub action: OnTooCloseAction,
+    pub action: RecoverEntryAction,
     /// Guard rail for `market` recovery in **price units** (already
     /// `max_slippage_pips × pip_size`). The worker re-places as a market
     /// order only if the current price is within this distance of the
@@ -91,12 +91,12 @@ pub struct Resolved {
     /// order — the inputs / calculations / output get logged instead.
     /// Defaults to false. See `Intent::dry_run`.
     pub dry_run: bool,
-    /// Stop-entry "too close to market" fallback, resolved from
-    /// `EntrySpec::Stop::on_too_close`. `None` for market / limit entries
-    /// and for stop entries that didn't opt in (today's behaviour: a
-    /// `#19-10` rejection fails the placement and the next bar retries).
-    /// See [`ResolvedOnTooClose`].
-    pub on_too_close: Option<ResolvedOnTooClose>,
+    /// Stop-entry recovery, resolved from `EntrySpec::Stop::recover_entry`.
+    /// `None` for market / limit entries and for stop entries that didn't
+    /// opt in (today's behaviour: a wrong-side stop is dropped at resolve
+    /// time, or a `#19-10` rejection fails the placement and the next bar
+    /// retries). See [`ResolvedRecoverEntry`].
+    pub recover_entry: Option<ResolvedRecoverEntry>,
 }
 
 /// Hard server-side floor on `min_r`. Overrides below this are rejected
@@ -237,10 +237,10 @@ impl Resolved {
 
         let stop_loss = sl_ref.resolve(shell, pip_size);
 
-        // Only stop entries carry a too-close fallback; market / limit
-        // leave it `None`. Resolved here (pips → price units) so the
-        // worker never needs pip_size again.
-        let mut on_too_close: Option<ResolvedOnTooClose> = None;
+        // Only stop entries carry a recovery; market / limit leave it
+        // `None`. Resolved here (pips → price units) so the worker never
+        // needs pip_size again.
+        let mut recover_entry: Option<ResolvedRecoverEntry> = None;
 
         let (entry, reference_price) = match entry_spec {
             EntrySpec::Market => (
@@ -253,7 +253,7 @@ impl Resolved {
                 from,
                 offset_pips,
                 at,
-                on_too_close: otc,
+                recover_entry: rec,
             } => {
                 // `at` (absolute, set at encode time) wins over the
                 // shell-anchored geometry, exactly like `PriceRef::Absolute`.
@@ -261,31 +261,85 @@ impl Resolved {
                     Some(absolute) => *absolute,
                     None => shell.anchor_price(*from) + offset_pips * pip_size,
                 };
-                // Stop sits on the *far* side of current price for the direction:
-                // long stops above close, short stops below. Skip this guard
-                // when `at` is set: an absolute trigger comes from an operator
-                // who drew the exact level (position tool), and the signed
-                // shell carries that same level as `close` — there is no live
-                // price to compare against, so the broker, not us, decides if
-                // it's wrong-side.
-                if at.is_none() {
-                    match direction {
-                        Direction::Long if trigger <= shell.close => {
-                            return Err(ResolveError::InvalidGeometry);
+                // A stop must sit on the *far* side of current price for its
+                // direction: long stops above close, short stops below. When
+                // the trigger has already been overtaken (long `trigger <=
+                // close`, short `trigger >= close`) the stop is "wrong-side"
+                // — this happens when the breakout ran during the
+                // signal-confirmation wait. Recover instead of dropping when
+                // the intent opted in (see `recover_entry`); otherwise return
+                // `InvalidGeometry` exactly as before (zero blast radius for
+                // un-opted stops). Skipped entirely for an absolute `at`: an
+                // operator-drawn level carries no live price to compare
+                // against, so the broker arbitrates wrong-side.
+                let wrong_side = at.is_none()
+                    && match direction {
+                        Direction::Long => trigger <= shell.close,
+                        Direction::Short => trigger >= shell.close,
+                    };
+                if wrong_side {
+                    // Recover only when the operator opted into market/limit.
+                    // `None` / `Skip` preserve today's drop. The recovered
+                    // entry still flows through `finish_with_sizing`, which
+                    // re-runs the ≥1R floor and the in-range check off the new
+                    // `reference_price` — so a recovery that's too far toward
+                    // TP (low R) or already past a level is still refused.
+                    match rec.map(|o| o.action) {
+                        Some(super::RecoverEntryAction::Market) => {
+                            // Enter the confirmed breakout at market. The
+                            // slippage bound is the explicit pips when set,
+                            // else the derived SL→entry distance (handled by
+                            // `resolve_recover_entry`).
+                            recover_entry =
+                                rec.map(|o| resolve_recover_entry(o, pip_size, stop_loss, trigger));
+                            (
+                                ResolvedEntry::Market {
+                                    reference_price: shell.close,
+                                },
+                                shell.close,
+                            )
                         }
-                        Direction::Short if trigger >= shell.close => {
-                            return Err(ResolveError::InvalidGeometry);
+                        Some(super::RecoverEntryAction::Limit) => {
+                            // Rest a limit at the original trigger — waits for
+                            // the pullback, preserving the planned R exactly.
+                            // Re-check it would rest on the correct side vs the
+                            // current close (long limit at/below, short
+                            // at/above); a degenerate non-overrun case would be
+                            // a wrong-side limit, so drop it.
+                            let limit_ok = match direction {
+                                Direction::Long => trigger <= shell.close,
+                                Direction::Short => trigger >= shell.close,
+                            };
+                            if !limit_ok {
+                                return Err(ResolveError::InvalidGeometry);
+                            }
+                            recover_entry = Some(ResolvedRecoverEntry {
+                                action: super::RecoverEntryAction::Limit,
+                                max_slippage_price: None,
+                            });
+                            (
+                                ResolvedEntry::Limit {
+                                    trigger_price: trigger,
+                                },
+                                trigger,
+                            )
                         }
-                        _ => {}
+                        // No opt-in or explicit Skip → today's drop.
+                        _ => return Err(ResolveError::InvalidGeometry),
                     }
+                } else {
+                    // Correct-side stop: resolve the recovery for the worker's
+                    // broker `#19-10` path (it fires only if the broker still
+                    // rejects the resting stop), with derived-slippage support.
+                    recover_entry =
+                        rec.map(|o| resolve_recover_entry(o, pip_size, stop_loss, trigger));
+                    (
+                        ResolvedEntry::Stop {
+                            trigger_price: trigger,
+                        },
+                        trigger,
+                    )
                 }
-                on_too_close = otc.map(|o| resolve_on_too_close(o, pip_size));
-                (
-                    ResolvedEntry::Stop {
-                        trigger_price: trigger,
-                    },
-                    trigger,
-                )
             }
             EntrySpec::Limit {
                 from,
@@ -340,7 +394,7 @@ impl Resolved {
             reference_price,
             stop_loss,
             take_profit,
-            on_too_close,
+            recover_entry,
         )
     }
 
@@ -360,7 +414,7 @@ impl Resolved {
         reference_price: f64,
         stop_loss: f64,
         take_profit: f64,
-        on_too_close: Option<ResolvedOnTooClose>,
+        recover_entry: Option<ResolvedRecoverEntry>,
     ) -> Result<Self, ResolveError> {
         // Sizing-mode selection. `risk_pct` is always present (default
         // `Static(1.0)`), so it's the fallback. `risk_amount` and
@@ -415,7 +469,7 @@ impl Resolved {
             // is resolved. Scripts never see `risk`.
             risk: RiskBudget::Percent(0.0),
             dry_run: intent.dry_run.unwrap_or(false),
-            on_too_close,
+            recover_entry,
         };
 
         // Server-enforced floor: an `min_r` override cannot weaken the
@@ -533,16 +587,28 @@ fn resolve_f64_tunable(
     })
 }
 
-/// Resolve the wire [`super::OnTooClose`] into the price-unit
-/// [`ResolvedOnTooClose`]. The slippage guard is converted from pips to
+/// Resolve the wire [`super::RecoverEntry`] into the price-unit
+/// [`ResolvedRecoverEntry`]. The slippage guard is converted from pips to
 /// price units here so the worker compares against the trigger directly.
-/// A `market` action with no `max_slippage_pips` (which validation
-/// rejects upstream) resolves to a `None` bound — the worker treats that
-/// as "skip" defensively rather than chasing an unbounded fill.
-fn resolve_on_too_close(otc: super::OnTooClose, pip_size: f64) -> ResolvedOnTooClose {
-    ResolvedOnTooClose {
-        action: otc.action,
-        max_slippage_price: otc.max_slippage_pips.map(|pips| pips.abs() * pip_size),
+/// A `market` action with no explicit `max_slippage_pips` falls back to
+/// the **derived** SL→entry distance (`|stop_loss − trigger|`, already in
+/// price units) so the broker `#19-10` recovery path is bounded without
+/// the operator having to supply a number. `limit` / `skip` carry no
+/// bound.
+fn resolve_recover_entry(
+    rec: super::RecoverEntry,
+    pip_size: f64,
+    stop_loss: f64,
+    trigger: f64,
+) -> ResolvedRecoverEntry {
+    let max_slippage_price = match (rec.action, rec.max_slippage_pips) {
+        (_, Some(pips)) => Some(pips.abs() * pip_size),
+        (super::RecoverEntryAction::Market, None) => Some((stop_loss - trigger).abs()),
+        _ => None,
+    };
+    ResolvedRecoverEntry {
+        action: rec.action,
+        max_slippage_price,
     }
 }
 
@@ -689,7 +755,7 @@ mod tests {
             from: PriceAnchor::High,
             offset_pips: 2.0,
             at: None,
-            on_too_close: None,
+            recover_entry: None,
         });
         let r = Resolved::from_intent(&intent, &shell(), 0.0001).unwrap();
         // trigger = 1.1020 + 2*0.0001 = 1.1022
@@ -715,7 +781,7 @@ mod tests {
             from: PriceAnchor::High,
             offset_pips: 2.0,
             at: Some(1.1000),
-            on_too_close: None,
+            recover_entry: None,
         });
         // Absolute SL/TP so the geometry is self-contained. Direct-entry
         // shell stamps close = trigger = 1.1000.
@@ -782,7 +848,7 @@ mod tests {
             from: PriceAnchor::SignalLow,
             offset_pips: 1.0,
             at: None,
-            on_too_close: None,
+            recover_entry: None,
         });
         intent.stop_loss = Some(PriceRef::Anchored {
             from: PriceAnchor::SignalHigh,
@@ -825,50 +891,240 @@ mod tests {
     }
 
     #[test]
-    fn stop_entry_carries_resolved_on_too_close_market() {
-        use crate::intent::{OnTooClose, OnTooCloseAction};
+    fn stop_entry_carries_resolved_recover_entry_market() {
+        use crate::intent::{RecoverEntry, RecoverEntryAction};
         let mut intent = long_market_intent();
         intent.entry = Some(EntrySpec::Stop {
             from: PriceAnchor::High,
             offset_pips: 2.0,
             at: None,
-            on_too_close: Some(OnTooClose {
-                action: OnTooCloseAction::Market,
+            recover_entry: Some(RecoverEntry {
+                action: RecoverEntryAction::Market,
                 max_slippage_pips: Some(8.0),
             }),
         });
         let r = Resolved::from_intent(&intent, &shell(), 0.0001).unwrap();
-        let otc = r.on_too_close.expect("fallback carried onto Resolved");
-        assert_eq!(otc.action, OnTooCloseAction::Market);
+        let rec = r.recover_entry.expect("recovery carried onto Resolved");
+        assert_eq!(rec.action, RecoverEntryAction::Market);
         // 8 pips * 0.0001 pip_size = 0.0008 in price units.
-        assert!((otc.max_slippage_price.unwrap() - 0.0008).abs() < 1e-12);
+        assert!((rec.max_slippage_price.unwrap() - 0.0008).abs() < 1e-12);
     }
 
     #[test]
-    fn market_entry_has_no_on_too_close() {
-        // The fallback is a stop-entry concept; a market entry never
-        // carries it even if some future caller sets it.
+    fn market_entry_has_no_recover_entry() {
+        // Recovery is a stop-entry concept; a market entry never carries
+        // it even if some future caller sets it.
         let r = Resolved::from_intent(&long_market_intent(), &shell(), 0.0001).unwrap();
-        assert!(r.on_too_close.is_none());
+        assert!(r.recover_entry.is_none());
     }
 
     #[test]
     fn stop_entry_skip_resolves_with_no_slippage_bound() {
-        use crate::intent::{OnTooClose, OnTooCloseAction};
+        use crate::intent::{RecoverEntry, RecoverEntryAction};
         let mut intent = long_market_intent();
         intent.entry = Some(EntrySpec::Stop {
             from: PriceAnchor::High,
             offset_pips: 2.0,
             at: None,
-            on_too_close: Some(OnTooClose {
-                action: OnTooCloseAction::Skip,
+            recover_entry: Some(RecoverEntry {
+                action: RecoverEntryAction::Skip,
                 max_slippage_pips: None,
             }),
         });
         let r = Resolved::from_intent(&intent, &shell(), 0.0001).unwrap();
-        let otc = r.on_too_close.unwrap();
-        assert_eq!(otc.action, OnTooCloseAction::Skip);
-        assert!(otc.max_slippage_price.is_none());
+        let rec = r.recover_entry.unwrap();
+        assert_eq!(rec.action, RecoverEntryAction::Skip);
+        assert!(rec.max_slippage_price.is_none());
+    }
+
+    // ---- Wrong-side stop recovery (Commit 3) -----------------------------
+
+    use crate::intent::{RecoverEntry, RecoverEntryAction};
+
+    /// A short stop whose trigger has been overtaken by price (trigger >=
+    /// close → wrong-side), with the given recovery policy. Mirrors the
+    /// H&S short shape: SL above, TP below, stop-entry below.
+    fn wrong_side_short_stop(rec: Option<RecoverEntry>) -> Intent {
+        let mut intent = long_market_intent();
+        intent.direction = Some(Direction::Short);
+        // Stop trigger 1.1010 sits ABOVE the 1.1000 close → wrong-side for
+        // a short (price already broke below the intended entry).
+        intent.entry = Some(EntrySpec::Stop {
+            from: PriceAnchor::Close,
+            offset_pips: 10.0,
+            at: None,
+            recover_entry: rec,
+        });
+        intent.stop_loss = Some(PriceRef::Anchored {
+            from: PriceAnchor::Close,
+            offset_pips: 40.0, // SL = 1.1040, above the trigger
+        });
+        intent.take_profit = Some(TakeProfit::Anchored(PriceRef::Anchored {
+            from: PriceAnchor::Close,
+            offset_pips: -90.0, // TP = 1.0910, well below
+        }));
+        intent
+    }
+
+    #[test]
+    fn wrong_side_short_stop_bare_still_drops() {
+        // No recover_entry → today's behaviour: InvalidGeometry (drop).
+        let r = Resolved::from_intent(&wrong_side_short_stop(None), &shell(), 0.0001);
+        assert!(matches!(r, Err(ResolveError::InvalidGeometry)));
+    }
+
+    #[test]
+    fn wrong_side_short_stop_skip_drops() {
+        let rec = Some(RecoverEntry {
+            action: RecoverEntryAction::Skip,
+            max_slippage_pips: None,
+        });
+        let r = Resolved::from_intent(&wrong_side_short_stop(rec), &shell(), 0.0001);
+        assert!(matches!(r, Err(ResolveError::InvalidGeometry)));
+    }
+
+    #[test]
+    fn wrong_side_short_stop_market_recovers_at_close_with_derived_slippage() {
+        let rec = Some(RecoverEntry {
+            action: RecoverEntryAction::Market,
+            max_slippage_pips: None, // → derived bound
+        });
+        let r = Resolved::from_intent(&wrong_side_short_stop(rec), &shell(), 0.0001).unwrap();
+        // Re-keyed to a market entry at the current close.
+        match r.entry {
+            ResolvedEntry::Market { reference_price } => {
+                assert!((reference_price - 1.1000).abs() < 1e-9);
+            }
+            other => panic!("expected Market recovery, got {other:?}"),
+        }
+        let recd = r.recover_entry.expect("recovery carried");
+        assert_eq!(recd.action, RecoverEntryAction::Market);
+        // Derived slippage = |SL - trigger| = |1.1040 - 1.1010| = 0.0030.
+        assert!((recd.max_slippage_price.unwrap() - 0.0030).abs() < 1e-9);
+    }
+
+    #[test]
+    fn wrong_side_short_stop_market_explicit_slippage_wins() {
+        let rec = Some(RecoverEntry {
+            action: RecoverEntryAction::Market,
+            max_slippage_pips: Some(12.0),
+        });
+        let r = Resolved::from_intent(&wrong_side_short_stop(rec), &shell(), 0.0001).unwrap();
+        let recd = r.recover_entry.unwrap();
+        // Explicit 12 pips * 0.0001 = 0.0012 (overrides the derived 0.0030).
+        assert!((recd.max_slippage_price.unwrap() - 0.0012).abs() < 1e-9);
+    }
+
+    #[test]
+    fn wrong_side_short_stop_limit_rests_at_trigger() {
+        let rec = Some(RecoverEntry {
+            action: RecoverEntryAction::Limit,
+            max_slippage_pips: None,
+        });
+        let r = Resolved::from_intent(&wrong_side_short_stop(rec), &shell(), 0.0001).unwrap();
+        match r.entry {
+            ResolvedEntry::Limit { trigger_price } => {
+                assert!((trigger_price - 1.1010).abs() < 1e-9);
+            }
+            other => panic!("expected Limit recovery, got {other:?}"),
+        }
+        let recd = r.recover_entry.unwrap();
+        assert_eq!(recd.action, RecoverEntryAction::Limit);
+        assert!(recd.max_slippage_price.is_none());
+    }
+
+    #[test]
+    fn wrong_side_recovery_below_min_r_is_refused() {
+        // Trigger 1.1010 wrong-side; recover at market@close 1.1000. Put TP
+        // just below the close so R = (SL-entry)/(entry-TP) collapses below
+        // 1.0 → finish_with_sizing's MIN_R_FLOOR rejects it.
+        let mut intent = wrong_side_short_stop(Some(RecoverEntry {
+            action: RecoverEntryAction::Market,
+            max_slippage_pips: None,
+        }));
+        // SL = 1.1040 (30 pips above entry), TP = 1.0990 (10 pips below
+        // entry) → R = 30/10... that's > 1. Flip: tiny SL, far TP would be
+        // > 1R. For < 1R we need risk > reward: SL far, TP near.
+        intent.stop_loss = Some(PriceRef::Anchored {
+            from: PriceAnchor::Close,
+            offset_pips: 50.0, // SL 1.1050, risk = 50 pips from entry
+        });
+        intent.take_profit = Some(TakeProfit::Anchored(PriceRef::Anchored {
+            from: PriceAnchor::Close,
+            offset_pips: -20.0, // TP 1.0980, reward = 20 pips → R = 0.4
+        }));
+        let r = Resolved::from_intent(&intent, &shell(), 0.0001);
+        assert!(
+            matches!(r, Err(ResolveError::BelowMinR { .. })),
+            "got {r:?}"
+        );
+    }
+
+    #[test]
+    fn wrong_side_recovery_past_tp_is_out_of_range() {
+        // Recover at market@close, but put TP ABOVE the close so the entry
+        // is no longer between SL and TP for a short → EntryOutsideRange.
+        let mut intent = wrong_side_short_stop(Some(RecoverEntry {
+            action: RecoverEntryAction::Market,
+            max_slippage_pips: None,
+        }));
+        intent.take_profit = Some(TakeProfit::Anchored(PriceRef::Anchored {
+            from: PriceAnchor::Close,
+            offset_pips: 10.0, // TP 1.1010 — above the 1.1000 close
+        }));
+        let r = Resolved::from_intent(&intent, &shell(), 0.0001);
+        assert!(
+            matches!(r, Err(ResolveError::EntryOutsideRange { .. })),
+            "got {r:?}"
+        );
+    }
+
+    #[test]
+    fn euro_wrong_side_short_limit_recovers() {
+        // The real Euro Stocks 50 case (2026-06-23), pip_size 1.0:
+        // signal_low 6307.2 → stop trigger 6306.2; by the confirm bar the
+        // close had fallen to 6302.3 (trigger now wrong-side). SL 6329.0,
+        // TP 6210.65. A `limit` recovery rests at 6306.2 for the pullback.
+        let mut intent = long_market_intent();
+        intent.direction = Some(Direction::Short);
+        // Use the offset form (not absolute `at`) so the resolver's
+        // wrong-side guard actually fires: trigger = close + 3.9 = 6306.2,
+        // which sits above the 6302.3 close → wrong-side for a short.
+        intent.entry = Some(EntrySpec::Stop {
+            from: PriceAnchor::Close,
+            offset_pips: 3.9,
+            at: None,
+            recover_entry: Some(RecoverEntry {
+                action: RecoverEntryAction::Limit,
+                max_slippage_pips: None,
+            }),
+        });
+        intent.stop_loss = Some(PriceRef::Anchored {
+            from: PriceAnchor::Close,
+            offset_pips: 26.7, // SL = 6302.3 + 26.7 = 6329.0
+        });
+        intent.take_profit = Some(TakeProfit::Anchored(PriceRef::Anchored {
+            from: PriceAnchor::Close,
+            offset_pips: -91.65, // TP = 6302.3 - 91.65 = 6210.65
+        }));
+        let euro_shell = Shell {
+            close: 6302.3,
+            high: 6303.0,
+            low: 6301.2,
+            ..shell()
+        };
+        let r = Resolved::from_intent(&intent, &euro_shell, 1.0).unwrap();
+        match r.entry {
+            ResolvedEntry::Limit { trigger_price } => {
+                assert!(
+                    (trigger_price - 6306.2).abs() < 1e-6,
+                    "trigger {trigger_price}"
+                );
+            }
+            other => panic!("expected Limit recovery, got {other:?}"),
+        }
+        assert!((r.stop_loss - 6329.0).abs() < 1e-6);
+        assert!((r.take_profit - 6210.65).abs() < 1e-2);
     }
 
     #[test]
@@ -937,7 +1193,7 @@ mod tests {
             from: PriceAnchor::Low,
             offset_pips: 10.0,
             at: None,
-            on_too_close: None,
+            recover_entry: None,
         });
         assert!(matches!(
             Resolved::from_intent(&intent, &shell(), 0.0001),

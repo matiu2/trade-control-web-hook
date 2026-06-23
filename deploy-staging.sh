@@ -13,11 +13,11 @@ ENV_NAME="staging"
 ENV_BRANCH="staging"
 ENV_WEBHOOK="https://trade-control-web-hook-staging.msherborne.workers.dev"
 ENV_SUFFIX="staging"
-# Pine study title tv-arm-staging arms against. Staging is pinned to the
-# previous Pine (v24) for the promotion-gate week — its chart study must be
-# renamed to exactly this base title. (This week's demo is mid-flight; only
-# rename the staging study when you're ready to cut a fresh staging.)
-ENV_PINE_NAME="Candle Signals v24"
+# Pine study title tv-arm-staging arms against. Its chart study must be
+# renamed to exactly this base title. Cut fresh from main on 2026-06-23
+# (the prior staging week was unusable), so staging now tracks the current
+# Pine v25 in lockstep with dev.
+ENV_PINE_NAME="Candle Signals v25"
 
 source "$(dirname "$0")/deploy-lib.sh"
 deploy_env "$ENV_NAME" "$ENV_BRANCH" "$ENV_WEBHOOK" "$ENV_SUFFIX" "$ENV_PINE_NAME"

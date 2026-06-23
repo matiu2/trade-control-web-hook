@@ -277,7 +277,7 @@ mod tests {
             from: PriceAnchor::Close,
             offset_pips: 0.0,
             at: None,
-            on_too_close: None,
+            recover_entry: None,
         });
         i.stop_loss = Some(PriceRef::Absolute { absolute: 1.1000 });
         i.take_profit = Some(TakeProfit::Anchored(PriceRef::Absolute {
@@ -368,7 +368,7 @@ mod tests {
             from: PriceAnchor::Close,
             offset_pips: 10.0,
             at: None,
-            on_too_close: None,
+            recover_entry: None,
         });
         let shell = trigger_shell();
 
@@ -438,7 +438,7 @@ mod tests {
             from: PriceAnchor::Close,
             offset_pips: 10.0, // trigger 1.1050
             at: None,
-            on_too_close: None,
+            recover_entry: None,
         });
         let shell = trigger_shell();
         // Fills @1.1050, then a candle reaches SL 1.1000 → StoppedOut.
@@ -486,7 +486,7 @@ mod tests {
             from: PriceAnchor::Close,
             offset_pips: 10.0,
             at: None,
-            on_too_close: None,
+            recover_entry: None,
         });
         let shell = trigger_shell();
         // One candle fills AND spans both SL and TP → pessimistic: StoppedOut.
@@ -515,7 +515,7 @@ mod tests {
             from: PriceAnchor::Close,
             offset_pips: 0.0,
             at: Some(1.1000),
-            on_too_close: None,
+            recover_entry: None,
         });
         i.stop_loss = Some(PriceRef::Absolute { absolute: 1.1030 });
         i.take_profit = Some(TakeProfit::Anchored(PriceRef::Absolute {

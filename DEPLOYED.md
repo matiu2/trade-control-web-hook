@@ -62,10 +62,10 @@ from `main` carrying the week's accumulated changes.
 
 | part | version | deployed (Brisbane) | notes |
 |---|---|---|---|
-| pine | `v2.4` (study title `Candle Signals v24`) | — | pinned to the pre-`open` version for the promotion-gate week. `tv-arm-staging` bakes this study title. Don't rename the staging study mid-week. |
-| tv-arm | `0.1.0` | — | will install as `tv-arm-staging` (staging URL + `Candle Signals v24` baked) on next staging deploy |
-| trade-control | `0.2.0` | — | |
-| backend | `v23` | 2026-06-15 | first recording-enabled build; R2 recording verified live. **Not yet on v24/v25** (frozen this week). |
+| pine | `v2.4` (study title `Candle Signals v24`) | — | pinned to the pre-`open` version; chart **unchanged** this deploy. v25 worker degrades gracefully when `open` is absent (rides baked geometry). `tv-arm-staging` bakes this study title. |
+| tv-arm | `0.1.0` | 2026-06-15 | installed as `tv-arm-staging` (staging URL + `Candle Signals v24` baked) |
+| trade-control | `0.2.0` | 2026-06-15 | installed as `trade-control-staging` (staging URL baked) |
+| backend | `v25` | 2026-06-15 | M/W real-time arming (v24) + dynamic geometry / `open` (v25). Version `ed4f04ff`. **Promotion-gate week restarts from this deploy.** |
 | contract | `v3` | — | unchanged by v23 (recording is observe-only) |
 
 ### prod

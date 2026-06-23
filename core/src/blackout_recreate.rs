@@ -24,7 +24,7 @@
 //! pips convert via the intent's baked `pip_size` *before* reaching here (these
 //! fns take raw price distances, never pips).
 
-use crate::intent::{Direction, OnTooCloseAction, ResolvedEntry};
+use crate::intent::{Direction, RecoverEntryAction, ResolvedEntry};
 
 /// What the recovery watcher should do with one cancelled resting order, given
 /// fresh fill-side bid/ask. The pure decision — no KV, no broker — so the
@@ -32,17 +32,17 @@ use crate::intent::{Direction, OnTooCloseAction, ResolvedEntry};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RestorePlan {
     /// Re-drive the entry through `run_enter` — the order is still placeable as
-    /// a stop/limit, OR it's an overrun stop whose `on_too_close` is NOT skip
+    /// a stop/limit, OR it's an overrun stop whose `recover_entry` is NOT skip
     /// (so the broker → Sub-plan-0 fallback should get a chance to recover it
     /// as market/limit). One code path; the broker is the authority.
     Redrive,
     /// Stop overrun (fill-side blew past trigger beyond the SL band) AND the
-    /// stored intent's `on_too_close` is `skip` (or absent). Short-circuit:
+    /// stored intent's `recover_entry` is `skip` (or absent). Short-circuit:
     /// drop without a guaranteed-to-fail broker round-trip.
     DropStopOverrunSkip,
     /// Limit on the wrong side / past TP. Drop it and leave the trade looking
     /// for entry — limits are themselves a fallback, so a stale one is fine to
-    /// drop. NEVER routed to the stop `on_too_close` fallback.
+    /// drop. NEVER routed to the stop `recover_entry` fallback.
     DropStaleLimit,
     /// A resting "market" order shouldn't exist (market entries fill
     /// immediately, never rest). Drop + log; nothing to restore.
@@ -51,7 +51,7 @@ pub enum RestorePlan {
 
 /// Decide the restore action for one cancelled order. Pure: takes the resolved
 /// geometry + a fresh fill-side quote + whether the stored intent's
-/// `on_too_close` is `skip`, and returns a [`RestorePlan`].
+/// `recover_entry` is `skip`, and returns a [`RestorePlan`].
 ///
 /// `sl_distance` for a stop is `|trigger − stop_loss|`; for a limit `tp` is the
 /// take-profit and `entry` the trigger. The watcher computes these off the
@@ -63,14 +63,14 @@ pub fn restore_plan(
     take_profit: f64,
     bid: f64,
     ask: f64,
-    on_too_close: Option<OnTooCloseAction>,
+    recover_entry: Option<RecoverEntryAction>,
 ) -> RestorePlan {
     match entry {
         ResolvedEntry::Stop { trigger_price } => {
             let sl_distance = (trigger_price - stop_loss).abs();
             if recreate_stop(direction, *trigger_price, sl_distance, bid, ask) {
                 RestorePlan::Redrive
-            } else if matches!(on_too_close, None | Some(OnTooCloseAction::Skip)) {
+            } else if matches!(recover_entry, None | Some(RecoverEntryAction::Skip)) {
                 // Overrun + skip ⇒ no point re-driving (guaranteed to fail then
                 // skip); short-circuit. A non-skip fallback re-drives so the
                 // broker → Sub-plan-0 path can recover it.
@@ -97,7 +97,7 @@ pub fn restore_plan(
 /// available.
 ///
 /// Returns `false` → DO NOT recreate as a stop → the caller routes to the
-/// Sub-plan-0 `on_too_close` fallback (market / limit / skip) encoded on the
+/// Sub-plan-0 `recover_entry` fallback (market / limit / skip) encoded on the
 /// stored intent. A long buy-stop wants price to break *up* through `trigger`;
 /// once `ask` has run all the way to `trigger + sl_distance` the entire planned
 /// SL distance is already consumed by the time we'd fill — the edge is gone.
@@ -125,7 +125,7 @@ pub fn recreate_stop(
 ///
 /// Returns `false` → DROP the limit and leave the trade "looking for entry"
 /// (limits are themselves a fallback option, so dropping a stale one is fine —
-/// it is NEVER routed to the `on_too_close` stop fallback).
+/// it is NEVER routed to the `recover_entry` stop fallback).
 ///
 /// Directional ordering is load-bearing: a long limit has `tp > entry`, a short
 /// limit `tp < entry`. The `&&` predicates encode that ordering, so an
@@ -180,7 +180,7 @@ mod tests {
             1.8049,
             1.8050
         ));
-        // ask well past band top → overrun → route to on_too_close.
+        // ask well past band top → overrun → route to recover_entry.
         assert!(!recreate_stop(
             Direction::Long,
             1.8000,
@@ -192,7 +192,7 @@ mod tests {
 
     #[test]
     fn long_stop_just_overrun_returns_false() {
-        // One tick past the band edge → false (the on_too_close path).
+        // One tick past the band edge → false (the recover_entry path).
         assert!(!recreate_stop(
             Direction::Long,
             1.8000,
@@ -235,7 +235,7 @@ mod tests {
             1.7950,
             1.7952
         ));
-        // bid below band bottom → overrun → on_too_close.
+        // bid below band bottom → overrun → recover_entry.
         assert!(!recreate_stop(
             Direction::Short,
             1.8000,
@@ -405,7 +405,7 @@ mod tests {
 
     // ----- restore_plan (the branch-decision seam) -----
 
-    use crate::intent::{OnTooCloseAction, ResolvedEntry};
+    use crate::intent::{RecoverEntryAction, ResolvedEntry};
 
     #[test]
     fn restore_plan_placeable_stop_redrives() {
@@ -426,7 +426,7 @@ mod tests {
 
     #[test]
     fn restore_plan_overrun_stop_with_skip_short_circuits() {
-        // Long stop overrun (ask past band top) + on_too_close skip/None →
+        // Long stop overrun (ask past band top) + recover_entry skip/None →
         // drop without a place call.
         let plan = restore_plan(
             &ResolvedEntry::Stop {
@@ -437,7 +437,7 @@ mod tests {
             1.8200,
             1.8090,
             1.8092, // past band top 1.8050
-            Some(OnTooCloseAction::Skip),
+            Some(RecoverEntryAction::Skip),
         );
         assert_eq!(plan, RestorePlan::DropStopOverrunSkip);
         // None behaves like skip.
@@ -457,7 +457,7 @@ mod tests {
 
     #[test]
     fn restore_plan_overrun_stop_with_market_fallback_redrives() {
-        // Overrun, but on_too_close=market → re-drive so the broker →
+        // Overrun, but recover_entry=market → re-drive so the broker →
         // Sub-plan-0 fallback can convert it to a market entry.
         let plan = restore_plan(
             &ResolvedEntry::Stop {
@@ -468,7 +468,7 @@ mod tests {
             1.8200,
             1.8090,
             1.8092,
-            Some(OnTooCloseAction::Market),
+            Some(RecoverEntryAction::Market),
         );
         assert_eq!(plan, RestorePlan::Redrive);
     }
@@ -492,7 +492,7 @@ mod tests {
 
     #[test]
     fn restore_plan_stale_limit_drops() {
-        // Long limit, ask below entry → stale, drop (never to on_too_close).
+        // Long limit, ask below entry → stale, drop (never to recover_entry).
         let plan = restore_plan(
             &ResolvedEntry::Limit {
                 trigger_price: 1.8000,
@@ -502,9 +502,9 @@ mod tests {
             1.8100,
             1.7989,
             1.7990,
-            // Even if a stray on_too_close were present, a limit is never
+            // Even if a stray recover_entry were present, a limit is never
             // routed to the stop fallback.
-            Some(OnTooCloseAction::Market),
+            Some(RecoverEntryAction::Market),
         );
         assert_eq!(plan, RestorePlan::DropStaleLimit);
     }
