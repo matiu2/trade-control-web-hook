@@ -29,7 +29,8 @@ use serde::{Deserialize, Serialize};
 use trade_control_conventions::AlertBasename;
 use trade_control_core::intent::{
     Action, BlackoutCloseAction, BrokerKind, Direction, EntrySpec, Intent, MW_CANCEL_VETO_NAME,
-    MW_OVERSHOOT_VETO_NAME, PriceAnchor, PriceRef, TakeProfit, VetoLevel,
+    MW_OVERSHOOT_VETO_NAME, PriceAnchor, PriceRef, RecoverEntry, RecoverEntryAction, TakeProfit,
+    VetoLevel,
 };
 use trade_control_core::sig::KEY_LEN;
 
@@ -462,12 +463,28 @@ pub struct TradeSpec {
     /// when unset.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub entry_level_vetos: Vec<trade_control_core::intent::EntryLevelVeto>,
+    /// How to recover an H&S / iH&S stop entry that goes wrong-side at
+    /// resolve time (price broke the trigger during the
+    /// signal-confirmation wait). Lands on the `05-enter` intent's
+    /// `EntrySpec::Stop::recover_entry` (only for `EntryMode::Stop`).
+    /// `Skip` (default) emits no `recover_entry` field → today's drop
+    /// behaviour; `Market`/`Limit` opt in. M/W never reaches this builder.
+    /// `#[serde(default)]` keeps spec yaml byte-identical when unset.
+    #[serde(default, skip_serializing_if = "is_default_recover_entry")]
+    pub recover_entry: RecoverEntryAction,
 }
 
 /// Skip-serializing predicate for [`TradeSpec::blackout_close`] — keeps a
 /// default spec yaml byte-identical to pre-feature specs.
 fn is_default_blackout_close(a: &BlackoutCloseAction) -> bool {
     matches!(a, BlackoutCloseAction::CancelResting)
+}
+
+/// Skip-serializing predicate for [`TradeSpec::recover_entry`] — `Skip`
+/// is the default (emit no `recover_entry`), keeping spec yaml
+/// byte-identical to pre-feature specs.
+fn is_default_recover_entry(a: &RecoverEntryAction) -> bool {
+    matches!(a, RecoverEntryAction::Skip)
 }
 
 /// CLI-side mirror of [`trade_control_core::intent::MwParams`]. Kept as a
@@ -886,6 +903,9 @@ fn build_pattern(
         // `--from-file` / scripted path.
         blackout_close: BlackoutCloseAction::default(),
         entry_level_vetos: Vec::new(),
+        // Interactive path keeps today's drop-on-wrong-side behaviour. The
+        // `--recover-entry` opt-in lives on the scripted / tv-arm path.
+        recover_entry: RecoverEntryAction::Skip,
     };
     assemble_trade(spec, geometry, entry_offset_pips, sl_offset_pips, now)
 }
@@ -1008,6 +1028,7 @@ fn assemble_trade(
         // i.e. the flag is armed AND there are sr bands to reverse off.
         spec.veto_on_reversal && !spec.sr_reversal_ranges.is_empty(),
         &spec.entry_level_vetos,
+        spec.recover_entry,
     ));
     if spec.close_on_news || !spec.sr_reversal_ranges.is_empty() {
         alerts.push(build_close_on_reversal_alert(
@@ -1743,6 +1764,7 @@ fn build_enter_alert(
     account: &str,
     check_reversal_veto: bool,
     entry_level_vetos: &[trade_control_core::intent::EntryLevelVeto],
+    recover_entry: RecoverEntryAction,
 ) -> BuiltAlert {
     let id = format!("{trade_id}-enter");
     let mut intent = skeleton(
@@ -1765,10 +1787,16 @@ fn build_enter_alert(
             // Pattern entries resolve against the live shell, not an
             // absolute level — `at` is for the position-tool path only.
             at: None,
-            // No `recover_entry` opt-in from the H&S builder yet — bare
-            // setups keep today's skip behaviour. A future CLI flag can
-            // populate this (see the recover_entry follow-up).
-            recover_entry: None,
+            // Wrong-side recovery: `Skip` emits no field (today's drop);
+            // `Market`/`Limit` opt in. The slippage bound is derived by the
+            // resolver from the SL→entry distance, so none is set here.
+            recover_entry: match recover_entry {
+                RecoverEntryAction::Skip => None,
+                action => Some(RecoverEntry {
+                    action,
+                    max_slippage_pips: None,
+                }),
+            },
         },
         EntryMode::Market => EntrySpec::Market,
     });
@@ -2210,6 +2238,7 @@ mod tests {
                 "demo",
                 false,
                 &[],
+                RecoverEntryAction::Skip,
             ),
         ];
         let trade = BuiltTrade {
@@ -2248,6 +2277,7 @@ mod tests {
                 pip_size: None,
                 blackout_close: BlackoutCloseAction::default(),
                 entry_level_vetos: Vec::new(),
+                recover_entry: RecoverEntryAction::Skip,
             },
         };
         let manifest = render_manifest(&trade);
@@ -2290,6 +2320,7 @@ mod tests {
             "demo",
             false,
             &[],
+            RecoverEntryAction::Skip,
         );
         assert_eq!(alert.intent.direction, Some(Direction::Short));
         // Entry: signal_low − 1 pip — a sell-stop 1 pip *below* the break (the
@@ -2381,6 +2412,7 @@ mod tests {
             "demo",
             false,
             &levels,
+            RecoverEntryAction::Skip,
         );
         assert_eq!(alert.intent.entry_level_vetos, levels);
     }
@@ -2417,6 +2449,7 @@ mod tests {
             "demo",
             false,
             &[],
+            RecoverEntryAction::Skip,
         );
         assert_eq!(alert.intent.direction, Some(Direction::Long));
         // Entry: signal_high + 1 pip — a buy-stop 1 pip *above* the break
@@ -2488,6 +2521,7 @@ mod tests {
             "demo",
             false,
             &[],
+            RecoverEntryAction::Skip,
         );
         match &alert.intent.stop_loss {
             Some(PriceRef::Absolute { absolute }) => {
@@ -2612,7 +2646,57 @@ mod tests {
             pip_size: None,
             blackout_close: BlackoutCloseAction::default(),
             entry_level_vetos: Vec::new(),
+            recover_entry: RecoverEntryAction::Skip,
         }
+    }
+
+    #[test]
+    fn build_trade_from_spec_threads_recover_entry_onto_enter_intent() {
+        // A market/limit recovery on the spec must land on the enter
+        // intent's stop entry; `Skip` emits no field (today's drop).
+        let now = ts("2026-05-20T00:00:00Z");
+
+        // Skip (default) → bare stop, no recover_entry.
+        let spec = sample_spec(TradePattern::Hs, ts("2026-05-25T00:00:00Z"));
+        let trade = build_trade_from_spec(spec, now, BuildStrictness::Strict).unwrap();
+        let enter = trade.alerts.last().unwrap();
+        match enter.intent.entry.as_ref().unwrap() {
+            EntrySpec::Stop { recover_entry, .. } => assert!(recover_entry.is_none()),
+            other => panic!("expected stop entry, got {other:?}"),
+        }
+
+        // Limit → opts in, no explicit slippage (resolver derives it).
+        let mut spec = sample_spec(TradePattern::Hs, ts("2026-05-25T00:00:00Z"));
+        spec.recover_entry = RecoverEntryAction::Limit;
+        let trade = build_trade_from_spec(spec, now, BuildStrictness::Strict).unwrap();
+        let enter = trade.alerts.last().unwrap();
+        match enter.intent.entry.as_ref().unwrap() {
+            EntrySpec::Stop {
+                recover_entry: Some(rec),
+                ..
+            } => {
+                assert_eq!(rec.action, RecoverEntryAction::Limit);
+                assert!(rec.max_slippage_pips.is_none());
+            }
+            other => panic!("expected stop with recovery, got {other:?}"),
+        }
+        enter.intent.validate().unwrap();
+    }
+
+    #[test]
+    fn build_trade_from_spec_market_entry_ignores_recover_entry() {
+        // A market entry has no EntrySpec::Stop, so recover_entry is moot
+        // — the enter must still be a plain Market entry.
+        let now = ts("2026-05-20T00:00:00Z");
+        let mut spec = sample_spec(TradePattern::Hs, ts("2026-05-25T00:00:00Z"));
+        spec.entry_mode = EntryMode::Market;
+        spec.recover_entry = RecoverEntryAction::Market;
+        let trade = build_trade_from_spec(spec, now, BuildStrictness::Strict).unwrap();
+        let enter = trade.alerts.last().unwrap();
+        assert!(matches!(
+            enter.intent.entry.as_ref().unwrap(),
+            EntrySpec::Market
+        ));
     }
 
     #[test]

@@ -57,6 +57,36 @@ impl BlackoutClose {
     }
 }
 
+/// What to do when an H&S / iH&S stop entry goes wrong-side at resolve
+/// time (the breakout ran during the signal-confirmation wait). Crate-local
+/// so the value-enum works in the `clap` derive; maps to
+/// [`trade_control_core::intent::RecoverEntryAction`]. The CLI vocabulary
+/// (`market | limit | abort`) maps `abort → Skip` (the wire variant).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+#[clap(rename_all = "lowercase")]
+pub enum RecoverEntry {
+    /// Enter the confirmed breakout at market (bounded by the SL→entry
+    /// distance).
+    Market,
+    /// Rest a limit at the original trigger and wait for the pullback —
+    /// preserves the planned R exactly.
+    Limit,
+    /// Drop the entry (today's behaviour for an un-opted stop).
+    Abort,
+}
+
+impl RecoverEntry {
+    /// Translate to the signed wire action (`abort → Skip`).
+    pub fn into_core(self) -> trade_control_core::intent::RecoverEntryAction {
+        use trade_control_core::intent::RecoverEntryAction as Core;
+        match self {
+            Self::Market => Core::Market,
+            Self::Limit => Core::Limit,
+            Self::Abort => Core::Skip,
+        }
+    }
+}
+
 /// Which order type a position-tool direct entry should place. Only one
 /// of `--market-entry` / `--stop-entry` / `--limit-entry` may be given;
 /// they're mutually exclusive (the `position_entry` clap group enforces
@@ -248,6 +278,19 @@ pub struct Args {
     #[arg(long)]
     pub require_confirmation: bool,
 
+    /// How to recover an H&S / iH&S stop entry that has gone wrong-side by
+    /// the time the signal confirms (price broke through the trigger during
+    /// the confirmation wait). `market` enters the breakout at market;
+    /// `limit` rests at the original trigger for the pullback (preserves R);
+    /// `abort` drops it. When omitted the default is keyed off
+    /// `--require-confirmation`: a confirmation-required setup (which
+    /// introduces the very lag that strands the stop) defaults to `limit`;
+    /// otherwise the default is to drop (today's behaviour). H&S / iH&S
+    /// only — M/W is unaffected. The ≥1R and SL≥10×spread floors still gate
+    /// the recovered entry.
+    #[arg(long, value_enum)]
+    pub recover_entry: Option<RecoverEntry>,
+
     /// Skip the automatic calendar-bars step. By default, after
     /// build-trade `tv-arm` fetches this week's forex-factory events
     /// for the chart's currency pair and arms one pause-pair + one
@@ -382,6 +425,25 @@ mod tests {
         assert!(!args.require_confirmation);
         let args = Args::try_parse_from(["tv-arm", "--require-confirmation"]).expect("parse");
         assert!(args.require_confirmation);
+    }
+
+    #[test]
+    fn recover_entry_is_optional_and_maps_to_core() {
+        use trade_control_core::intent::RecoverEntryAction as Core;
+        // Absent → None (the caller derives the default from
+        // `--require-confirmation`).
+        let args = Args::try_parse_from(["tv-arm"]).expect("parse");
+        assert_eq!(args.recover_entry, None);
+        // Each value parses and maps to the wire action (abort → Skip).
+        for (flag, want) in [
+            ("market", Core::Market),
+            ("limit", Core::Limit),
+            ("abort", Core::Skip),
+        ] {
+            let args =
+                Args::try_parse_from(["tv-arm", "--recover-entry", flag]).expect("parse recover");
+            assert_eq!(args.recover_entry.unwrap().into_core(), want, "flag {flag}");
+        }
     }
 
     #[test]

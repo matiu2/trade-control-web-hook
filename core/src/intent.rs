@@ -1618,7 +1618,7 @@ pub struct RecoverEntry {
 }
 
 /// The recovery action for [`RecoverEntry`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum RecoverEntryAction {
     /// Re-place as a market order, bounded by
@@ -1632,7 +1632,9 @@ pub enum RecoverEntryAction {
     Limit,
     /// Do nothing — drop the entry (resolve-time) or let the placement
     /// fail (502, no seen-id poison, broker-time) so the next signal bar
-    /// can retry. Identical to omitting `recover_entry` entirely.
+    /// can retry. Identical to omitting `recover_entry` entirely. The
+    /// default (a bare stop neither recovers nor needs a slippage bound).
+    #[default]
     Skip,
 }
 

@@ -776,6 +776,9 @@ fn build_mw_trade_spec(
         // M/W has no fib / invalidation drawing — its abort/cancel/overshoot
         // vetos cover the level guards, so no continuous entry-level vetos.
         entry_level_vetos: Vec::new(),
+        // M/W is out of scope for wrong-side stop recovery (it has no
+        // EntrySpec — resolves via intent.mw). Keep today's behaviour.
+        recover_entry: trade_control_core::intent::RecoverEntryAction::Skip,
     }
 }
 
@@ -983,6 +986,17 @@ fn build_trade_spec(
         pip_size: Some(pip_size),
         blackout_close: args.blackout_close.into_core(),
         entry_level_vetos,
+        // Wrong-side stop recovery (H&S / iH&S). Explicit `--recover-entry`
+        // wins; otherwise a confirmation-required setup defaults to `limit`
+        // (the confirmation lag is what strands the stop), and everything
+        // else keeps today's drop (`skip`).
+        recover_entry: args.recover_entry.map(|r| r.into_core()).unwrap_or(
+            if args.require_confirmation {
+                trade_control_core::intent::RecoverEntryAction::Limit
+            } else {
+                trade_control_core::intent::RecoverEntryAction::Skip
+            },
+        ),
     };
     if args.sl_from_recent {
         spec.sl_anchor = Some(match direction {
