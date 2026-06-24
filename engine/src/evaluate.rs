@@ -76,11 +76,46 @@ use trade_control_core::trade_plan::{
 const ROLE_BREAK_AND_CLOSE: &str = "prep-break-and-close";
 const ROLE_RETEST: &str = "prep-retest";
 
+/// The prep-step name an enter intent lists in `requires_preps` for the retest
+/// gate. Distinct from `ROLE_RETEST` (which matches the *rule_id* of the prep
+/// rule) — `requires_preps` carries the bare step name the CLI emits. Used to
+/// decide per-enter (not plan-global) whether the retest gate applies, so a
+/// strategy-v2 QM enter (empty `requires_preps`) is free of it while the stop
+/// enter still respects it.
+const PREP_STEP_RETEST: &str = "retest";
+
+/// Count the `Action::Enter` rules in a plan. Single-enter plans (the H&S
+/// stop entry or the M/W heartbeat) have one; a strategy-v2 plan has two (the
+/// stop entry plus the Quasimodo limit). The engine evaluates *every* enter
+/// rule each bar (see [`evaluate_entry`]); the count drives the phase choice.
+fn enter_rule_count(plan: &TradePlan) -> usize {
+    plan.rules
+        .iter()
+        .filter(|r| r.intent.action == Action::Enter)
+        .count()
+}
+
+/// Whether a plan carries more than one enter rule (strategy-v2: stop + QM).
+fn is_multi_enter(plan: &TradePlan) -> bool {
+    enter_rule_count(plan) > 1
+}
+
 /// The starting spine phase for a plan, derived from which rules it carries.
 /// A plan with a break-and-close prep starts gated behind it; everything else
 /// (notably M/W, whose enter is a per-bar heartbeat with no preps) starts
 /// watching for entry directly.
+///
+/// **Multi-enter (strategy-v2) exception:** a plan with two enters (a stop
+/// entry that needs break-and-close, plus a Quasimodo limit that needs *no*
+/// preps) must let the QM enter be evaluable from bar 1 — so it starts in
+/// `AwaitEntry` even though a break-and-close rule exists. The stop entry's
+/// break-and-close is still stamped (the `AwaitEntry` arm runs it for
+/// multi-enter plans) and still gates that enter via its `requires_preps`;
+/// the QM enter, carrying no preps, is free.
 pub fn initial_phase(plan: &TradePlan) -> Phase {
+    if is_multi_enter(plan) {
+        return Phase::AwaitEntry;
+    }
     if plan
         .rules
         .iter()
@@ -172,6 +207,15 @@ pub fn evaluate_plan(
                 evaluate_break_and_close(plan, &mut state, candle, detector_window, &mut fired);
             }
             Phase::AwaitEntry => {
+                // Multi-enter (strategy-v2) starts in AwaitEntry but still has a
+                // break-and-close prep that gates the stop entry. Run it here so
+                // `break_close_at` gets stamped (and the prep intent dispatched)
+                // exactly as it would in the AwaitBreakAndClose arm. The phase is
+                // already AwaitEntry, so the `phase = AwaitEntry` set inside is a
+                // no-op; the rule latches in `state.fired` so it stamps once.
+                if is_multi_enter(plan) {
+                    evaluate_break_and_close(plan, &mut state, candle, detector_window, &mut fired);
+                }
                 // Stamp the retest lookback before testing entry, so a retest
                 // and entry that land on the same bar are both seen.
                 stamp_retest(plan, &mut state, candle, detector_window);
@@ -369,10 +413,14 @@ fn evaluate_break_and_close(
     }
 }
 
-/// Evaluate the entry rule (the `Action::Enter` rule). For M/W this is the
-/// per-bar heartbeat (fires every closed bar); for H&S it's the `PinePattern`
-/// candle detector (recomputed from `detector_window`). The entry is gated by
-/// the retest lookback when a retest rule is present.
+/// Evaluate the plan's entry rule(s). A single-enter plan (H&S stop entry or
+/// M/W heartbeat) has one; a strategy-v2 plan has two (the stop entry plus the
+/// Quasimodo limit), and **both** are evaluated every bar — whichever fires
+/// first dispatches, and the worker's retry gate cancels the other's resting
+/// order (the two enters share a `trade_id`). The stop enter is ordered before
+/// the QM enter in `plan.rules`, so on a bar where both qualify the stop
+/// dispatches first (the QM is then deduped by the retry gate's same-bar
+/// guard) — the operator's "stop wins the tie" choice.
 fn evaluate_entry(
     plan: &TradePlan,
     state: &mut PlanState,
@@ -381,10 +429,55 @@ fn evaluate_entry(
     detector_cfg: &DetectorConfig,
     fired: &mut Vec<FiredIntent>,
 ) {
-    let Some(rule) = plan.rules.iter().find(|r| r.intent.action == Action::Enter) else {
-        return;
-    };
+    // Snapshot the enter rule_ids up front so we can borrow `plan` immutably in
+    // the loop while mutating `state`. Skip ones already latched (a fired
+    // single-shot enter must not re-fire).
+    let enter_rule_ids: Vec<String> = plan
+        .rules
+        .iter()
+        .filter(|r| r.intent.action == Action::Enter)
+        .map(|r| r.rule_id.clone())
+        .collect();
+    for rule_id in enter_rule_ids {
+        if state.fired.contains(&rule_id) {
+            continue;
+        }
+        let Some(rule) = plan.rules.iter().find(|r| r.rule_id == rule_id) else {
+            continue;
+        };
+        evaluate_one_entry(
+            plan,
+            state,
+            rule,
+            candle,
+            detector_window,
+            detector_cfg,
+            fired,
+        );
+        // A terminal single-shot enter ends the spine — stop evaluating the
+        // rest (there is at most one such enter, and the plan is now Done).
+        if state.phase == Phase::Done {
+            return;
+        }
+    }
+}
 
+/// Evaluate a single enter `rule`. Factored out of [`evaluate_entry`] so a
+/// strategy-v2 plan can run it once per enter rule. The body is the historical
+/// single-enter logic, with the retest gate keyed on **this rule's**
+/// `requires_preps` rather than the plan-global presence of a retest rule (so
+/// the QM enter, which lists no preps, is not blocked by the stop enter's
+/// retest rule).
+#[allow(clippy::too_many_arguments)]
+fn evaluate_one_entry(
+    plan: &TradePlan,
+    state: &mut PlanState,
+    rule: &ConditionRule,
+    candle: &Candle,
+    detector_window: &[Candle],
+    detector_cfg: &DetectorConfig,
+    fired: &mut Vec<FiredIntent>,
+) {
     // A `PinePattern` enter is decided by the stateful candle detector over the
     // back-window, not by a per-candle level cross. It also produces the latched
     // signal geometry that rides onto the dispatched shell.
@@ -426,10 +519,29 @@ fn evaluate_entry(
         return;
     }
 
-    // Retest gate: if the plan carries a retest rule, a retest must have been
-    // seen in (break_close_at, this candle]. The stamp is persisted, so a
-    // retest that closed in an earlier tick still counts.
-    if plan.rules.iter().any(is_retest) && !retest_satisfied(state, candle.time) {
+    // Retest gate: a retest must have been seen in (break_close_at, this
+    // candle] before this enter may fire.
+    //
+    // Which enters are gated:
+    // - **Multi-enter (strategy-v2):** key strictly on *this enter's*
+    //   `requires_preps` — the stop enter lists `retest` and is gated; the QM
+    //   enter lists no preps and is free. This is what lets the two enters
+    //   diverge within one plan.
+    // - **Single-enter:** preserve the historical plan-global rule exactly —
+    //   "a retest rule exists ⇒ gate the (lone) enter". The engine's synthetic
+    //   test intents don't populate `requires_preps`, and production single
+    //   enters always do, so the plan-global check is the byte-identical
+    //   baseline here. (The two agree in production; only the multi-enter case
+    //   needs the per-rule split.)
+    let requires_retest = if is_multi_enter(plan) {
+        rule.intent
+            .requires_preps
+            .iter()
+            .any(|p| p == PREP_STEP_RETEST)
+    } else {
+        plan.rules.iter().any(is_retest)
+    };
+    if requires_retest && !retest_satisfied(state, candle.time) {
         return;
     }
     push_fire_signal(rule, candle, signal, fired);
@@ -1692,6 +1804,126 @@ mod tests {
         );
         assert_eq!(eval.fired.len(), 1);
         assert_eq!(eval.fired[0].rule_id, "03-prep-break-and-close");
+    }
+
+    // ===== strategy-v2: two enters in one plan =====
+
+    /// An enter rule with explicit `requires_preps` + `max_retries`, using the
+    /// `MwEveryBar` heartbeat trigger so firing is deterministic (no Pine
+    /// resolution). Mirrors the strategy-v2 enter shape: the stop enter lists
+    /// both preps, the QM enter lists none; both are multi-shot (max_retries=5)
+    /// so a fire keeps the plan alive (the worker retry gate is the real cap).
+    fn enter_rule(rule_id: &str, preps: &[&str], max_retries: u32) -> ConditionRule {
+        let mut intent = intent(Action::Enter);
+        intent.requires_preps = preps.iter().map(|s| s.to_string()).collect();
+        intent.max_retries = Tunable::Static(max_retries);
+        intent.direction = Some(Direction::Short);
+        ConditionRule {
+            rule_id: rule_id.into(),
+            trigger: Trigger::MwEveryBar,
+            fire_mode: FireMode::Once,
+            intent,
+        }
+    }
+
+    /// A strategy-v2 plan: break-and-close + retest preps, a stop enter gated by
+    /// both, and a QM enter gated by neither. The stop enter is listed first so
+    /// it wins a same-bar tie.
+    fn strategy_v2_plan() -> TradePlan {
+        let neckline = |dir, bar| Trigger::TrendlineCross {
+            a: LinePoint {
+                at_epoch: ts("2026-06-16T00:00:00Z").timestamp(),
+                price: 1.2000,
+            },
+            b: LinePoint {
+                at_epoch: ts("2026-06-16T20:00:00Z").timestamp(),
+                price: 1.2000,
+            },
+            extend_forward: true,
+            bar_seconds: 3600,
+            dir,
+            bar,
+        };
+        plan(vec![
+            rule(
+                "03-prep-break-and-close",
+                neckline(CrossDir::Down, BarEvent::OnClose),
+                FireMode::Once,
+                Action::Prep,
+            ),
+            rule(
+                "04-prep-retest",
+                neckline(CrossDir::Up, BarEvent::Intrabar),
+                FireMode::Once,
+                Action::Prep,
+            ),
+            // Stop enter first (wins the same-bar tie), gated by both preps.
+            enter_rule("05-enter", &["break-and-close", "retest"], 5),
+            // QM enter, gated by neither prep.
+            enter_rule("09-enter-qm", &[], 5),
+        ])
+    }
+
+    #[test]
+    fn multi_enter_plan_starts_in_await_entry() {
+        // Even though a break-and-close prep exists, a two-enter plan starts in
+        // AwaitEntry so the QM enter is evaluable from bar 1.
+        let p = strategy_v2_plan();
+        assert_eq!(initial_phase(&p), Phase::AwaitEntry);
+    }
+
+    #[test]
+    fn qm_enter_fires_before_break_and_close_while_stop_is_blocked() {
+        // Bar 1: no break-and-close, no retest. The QM enter (no preps) fires;
+        // the stop enter (needs both preps) does not. The plan survives (both
+        // enters are multi-shot).
+        let p = strategy_v2_plan();
+        let prior = seed_at(Phase::AwaitEntry, "2026-06-16T10:00:00Z");
+        // Price sits below the neckline and does not cross up — no b&c, no retest.
+        let c1 = candle("2026-06-16T11:00:00Z", 1.18, 1.185, 1.17, 1.182);
+        let eval = run(&p, &prior, &[c1]);
+        let fired: Vec<&str> = eval.fired.iter().map(|f| f.rule_id.as_str()).collect();
+        assert_eq!(fired, vec!["09-enter-qm"], "only the QM enter fires");
+        assert!(!eval.done, "plan stays alive (multi-shot enters)");
+        assert_eq!(eval.new_state.phase, Phase::AwaitEntry);
+    }
+
+    #[test]
+    fn stop_enter_fires_only_after_break_and_close_then_retest() {
+        // Drive the full stop-entry path on a strategy-v2 plan: the b&c stamps,
+        // a retest stamps, then the stop enter fires. The QM enter fires on
+        // every bar throughout (no preps), so we assert the stop appears only
+        // once the gate is satisfied.
+        let p = strategy_v2_plan();
+        let mut prior = seed_at(Phase::AwaitEntry, "2026-06-16T09:00:00Z");
+        prior
+            .last_close
+            .insert("03-prep-break-and-close".into(), 1.2050);
+
+        // Bar 1 (10:00): closes below the neckline → break-and-close stamps.
+        // No retest yet, so the stop enter is still blocked; QM fires.
+        let c1 = candle("2026-06-16T10:00:00Z", 1.205, 1.205, 1.195, 1.1950);
+        let eval1 = run(&p, &prior, &[c1]);
+        let f1: Vec<&str> = eval1.fired.iter().map(|f| f.rule_id.as_str()).collect();
+        assert!(f1.contains(&"03-prep-break-and-close"));
+        assert!(f1.contains(&"09-enter-qm"));
+        assert!(!f1.contains(&"05-enter"), "stop blocked: no retest yet");
+        assert_eq!(
+            eval1.new_state.break_close_at,
+            Some(ts("2026-06-16T10:00:00Z"))
+        );
+
+        // Bar 2 (11:00): straddles the neckline closing above → retest stamps,
+        // and the stop enter fires the same bar. QM fires too.
+        let c2 = candle("2026-06-16T11:00:00Z", 1.19, 1.205, 1.19, 1.2010);
+        let eval2 = run(&p, &eval1.new_state, &[c2]);
+        let f2: Vec<&str> = eval2.fired.iter().map(|f| f.rule_id.as_str()).collect();
+        assert!(f2.contains(&"05-enter"), "stop fires once retest seen");
+        assert!(f2.contains(&"09-enter-qm"));
+        // Stop is listed before QM, so on this shared bar it dispatches first.
+        assert_eq!(f2.first(), Some(&"05-enter"), "stop wins the same-bar tie");
+        assert!(!eval2.done, "multi-shot enters keep the plan alive");
+        assert_eq!(eval2.new_state.phase, Phase::AwaitEntry);
     }
 
     #[test]

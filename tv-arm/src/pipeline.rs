@@ -789,6 +789,8 @@ fn build_mw_trade_spec(
         // M/W is out of scope for wrong-side stop recovery (it has no
         // EntrySpec — resolves via intent.mw). Keep today's behaviour.
         recover_entry: trade_control_core::intent::RecoverEntryAction::Skip,
+        // strategy-v2 (dual stop + QM enter) is H&S-only.
+        strategy_v2: false,
     }
 }
 
@@ -963,7 +965,16 @@ fn build_trade_spec(
         risk_pct: args.risk_pct.unwrap_or(1.0),
         risk_amount: args.risk_amount,
         dry_run: args.broker_dry_run,
-        max_retries: args.max_retries.unwrap_or(5),
+        // strategy-v2 needs a non-zero max_retries on both enters: it's the
+        // multi_shot flag that keeps the engine plan alive after the first
+        // enter fires, so the worker retry gate can cancel the sibling's
+        // resting order. Floor to 1 (a `--max-retries 0` with `--strategy-v2`
+        // is rejected by validate_args, so this floor is just belt-and-braces).
+        max_retries: if args.strategy_v2 {
+            args.max_retries.unwrap_or(5).max(1)
+        } else {
+            args.max_retries.unwrap_or(5)
+        },
         expiry_bars: args.expiry_bars,
         skip_preps,
         entry_offset_pips: None,
@@ -1007,6 +1018,7 @@ fn build_trade_spec(
                 trade_control_core::intent::RecoverEntryAction::Skip
             },
         ),
+        strategy_v2: args.strategy_v2,
     };
     if args.sl_from_recent {
         spec.sl_anchor = Some(match direction {

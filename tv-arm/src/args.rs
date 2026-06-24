@@ -255,6 +255,25 @@ pub struct Args {
     #[arg(long)]
     pub quasimodo: bool,
 
+    /// **strategy-v2 (H&S only).** Arm a *second* entry — the Quasimodo
+    /// limit — alongside the normal break-and-close + retest stop entry, on
+    /// the same setup. The QM entry drops both preps, is gated only on a
+    /// confirmed signal candle, and rests as a limit order at the same signal
+    /// level the stop entry anchors to (filling on the pullback back to the
+    /// level rather than a break through it). Whichever fires first wins: the
+    /// worker cancels the other's resting order, and an already-open position
+    /// blocks the sibling. The stop entry wins a same-bar tie.
+    ///
+    /// This is NOT `--quasimodo` (which runs the QM setup *instead of* the
+    /// stop entry) — strategy-v2 runs both. Conflicts with `--quasimodo`,
+    /// `--entry-market`, `--skip-break-and-close`, and `--skip-retest`;
+    /// `--max-retries 0` is rejected at validation.
+    #[arg(
+        long,
+        conflicts_with_all = ["quasimodo", "entry_market", "skip_break_and_close", "skip_retest"]
+    )]
+    pub strategy_v2: bool,
+
     /// Drop the break-and-close prep from the bundle (no alert
     /// emitted and the entry no longer requires it).
     #[arg(long)]
@@ -365,6 +384,24 @@ impl Args {
         self
     }
 
+    /// Validate flag combinations clap can't express. Call after
+    /// `apply_aliases`, before the pipeline runs. Currently: `--strategy-v2`
+    /// needs a non-zero `max_retries` (it's the multi_shot flag that keeps the
+    /// engine plan alive so the worker can cancel the losing enter's resting
+    /// order). The mutual exclusions with `--quasimodo` / `--entry-market` /
+    /// `--skip-*` are enforced by clap's `conflicts_with_all` at parse time.
+    pub fn validate(&self) -> color_eyre::eyre::Result<()> {
+        if self.strategy_v2 && self.max_retries == Some(0) {
+            color_eyre::eyre::bail!(
+                "--strategy-v2 requires a non-zero --max-retries: both enters \
+                 must be multi-shot so the worker can cancel the sibling's \
+                 resting order when one fires (omit --max-retries to use the \
+                 default of 5)"
+            );
+        }
+        Ok(())
+    }
+
     /// The selected position-tool entry mode, or `None` when none of the
     /// three flags is set (the normal pattern-arming path). The clap
     /// group guarantees at most one is set.
@@ -460,6 +497,48 @@ mod tests {
         assert!(args.skip_break_and_close);
         assert!(args.skip_retest);
         assert!(args.require_confirmation);
+    }
+
+    #[test]
+    fn strategy_v2_parses_and_defaults_off() {
+        let args = Args::try_parse_from(["tv-arm"]).expect("parse");
+        assert!(!args.strategy_v2);
+        let args = Args::try_parse_from(["tv-arm", "--strategy-v2"]).expect("parse");
+        assert!(args.strategy_v2);
+        // Default max_retries (omitted) is valid under strategy-v2.
+        args.validate().expect("default max_retries validates");
+    }
+
+    #[test]
+    fn strategy_v2_conflicts_with_quasimodo_and_friends() {
+        for conflicting in [
+            "--quasimodo",
+            "--entry-market",
+            "--skip-break-and-close",
+            "--skip-retest",
+        ] {
+            let res = Args::try_parse_from(["tv-arm", "--strategy-v2", conflicting]);
+            assert!(
+                res.is_err(),
+                "--strategy-v2 must conflict with {conflicting}"
+            );
+        }
+    }
+
+    #[test]
+    fn strategy_v2_rejects_zero_max_retries() {
+        let args = Args::try_parse_from(["tv-arm", "--strategy-v2", "--max-retries", "0"])
+            .expect("parse")
+            .apply_aliases();
+        assert!(
+            args.validate().is_err(),
+            "--strategy-v2 with --max-retries 0 must be rejected"
+        );
+        // A positive value is fine.
+        let args = Args::try_parse_from(["tv-arm", "--strategy-v2", "--max-retries", "3"])
+            .expect("parse")
+            .apply_aliases();
+        args.validate().expect("positive max_retries validates");
     }
 
     #[test]
