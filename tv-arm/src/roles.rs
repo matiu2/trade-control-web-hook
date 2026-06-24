@@ -33,7 +33,7 @@ use trade_control_conventions::{
 
 use trading_view::drawings::{Drawing, DrawingStub};
 use trading_view::mcp::TvMcp;
-use trading_view::pair_lines::pair_vertical_lines;
+use trading_view::pair_lines::{TimedAnchor, pair_vertical_lines};
 
 /// Drawing kinds emitted by tv-mcp.
 mod kind {
@@ -279,6 +279,17 @@ pub fn classify<F: DrawingFetcher>(
     roles.tp_fib = pick_slot(tp_fibs, "tp_fib", slot_pref);
     roles.trade_expiry = pick_slot(trade_expiries, "trade_expiry", slot_pref);
 
+    // Pause/resume and news-start/news-end lines that sit outside the
+    // visible window are stale leftovers from a prior setup — a window
+    // that may already have closed. Pairing them would mint a blackout
+    // whose `end_time` is in the past, which `build_pause_from_spec`
+    // rejects ("refusing to arm a stale blackout"). Drop off-screen
+    // lines up front so only the on-screen window is armed.
+    let blackout_starts = in_visible_window(blackout_starts, "blackout_start", visible_range);
+    let blackout_ends = in_visible_window(blackout_ends, "blackout_end", visible_range);
+    let news_starts = in_visible_window(news_starts, "news_start", visible_range);
+    let news_ends = in_visible_window(news_ends, "news_end", visible_range);
+
     roles.blackout_pairs = pair_vertical_lines(blackout_starts, blackout_ends, "blackout")?;
     roles.news_pairs = pair_vertical_lines(news_starts, news_ends, "news")?;
     roles.sr_levels = sr_levels;
@@ -324,6 +335,32 @@ fn latest_position(mut cands: Vec<PositionDrawing>) -> Option<PositionDrawing> {
 /// and is ignored rather than guessed at.
 fn is_mw_path(d: &Drawing, (from, to): (i64, i64)) -> bool {
     matches!(d.points.len(), 3 | 4) && d.points.iter().all(|p| p.time >= from && p.time <= to)
+}
+
+/// Keep only the vertical-line drawings whose anchor sits inside the
+/// visible window `[from, to]` (inclusive). Off-screen pause / resume /
+/// news lines are stale leftovers from a prior, possibly already-closed
+/// window — arming them would mint a blackout with a past `end_time` that
+/// `build_pause_from_spec` rejects. Each dropped line is logged so an
+/// operator who scrolled a line off-screen can see why it was ignored.
+fn in_visible_window(cands: Vec<Drawing>, role: &str, (from, to): (i64, i64)) -> Vec<Drawing> {
+    cands
+        .into_iter()
+        .filter(|d| {
+            let t = d.anchor_time();
+            let kept = t >= from && t <= to;
+            if !kept {
+                debug!(
+                    role,
+                    anchor_time = t,
+                    window_from = from,
+                    window_to = to,
+                    "vertical line ignored — anchor outside visible window",
+                );
+            }
+            kept
+        })
+        .collect()
 }
 
 /// Collapse the per-step prep-expiry candidates to one drawing each —
@@ -604,6 +641,82 @@ mod tests {
 
         assert_eq!(roles.sr_levels.len(), 1);
         assert_eq!(roles.sr_levels[0].id, "sr");
+    }
+
+    #[test]
+    fn pause_and_news_lines_outside_visible_window_are_ignored() {
+        // Two pause/resume pairs and two news pairs: one of each sits
+        // inside the visible window [200, 500], the other is a stale
+        // leftover anchored before it. Only the in-window pair survives —
+        // off-screen lines would otherwise mint a blackout whose end_time
+        // is already in the past and `build_pause_from_spec` would reject.
+        let (stubs, mcp) = fixture(vec![
+            // Stale (off-screen) blackout pair — anchored well before the window.
+            (
+                stub("bs_old", "vertical_line"),
+                drawing("bs_old", "pause", vec![(10, 1.0)]),
+            ),
+            (
+                stub("be_old", "vertical_line"),
+                drawing("be_old", "resume", vec![(20, 1.0)]),
+            ),
+            // In-window blackout pair.
+            (
+                stub("bs", "vertical_line"),
+                drawing("bs", "blackout-start", vec![(300, 1.0)]),
+            ),
+            (
+                stub("be", "vertical_line"),
+                drawing("be", "blackout-end", vec![(350, 1.0)]),
+            ),
+            // Stale (off-screen) news pair.
+            (
+                stub("ns_old", "vertical_line"),
+                drawing("ns_old", "news-start", vec![(30, 1.0)]),
+            ),
+            (
+                stub("ne_old", "vertical_line"),
+                drawing("ne_old", "news-end", vec![(40, 1.0)]),
+            ),
+            // In-window news pair.
+            (
+                stub("ns", "vertical_line"),
+                drawing("ns", "news-start", vec![(400, 1.0)]),
+            ),
+            (
+                stub("ne", "vertical_line"),
+                drawing("ne", "news-end", vec![(450, 1.0)]),
+            ),
+        ]);
+
+        let roles = classify(&mcp, &stubs, (200, 500), SlotPref::LatestWins).expect("classify ok");
+
+        // Exactly the in-window pairs survive; the off-screen lines are dropped.
+        assert_eq!(roles.blackout_pairs.len(), 1);
+        assert_eq!(roles.blackout_pairs[0].0.id, "bs");
+        assert_eq!(roles.blackout_pairs[0].1.id, "be");
+
+        assert_eq!(roles.news_pairs.len(), 1);
+        assert_eq!(roles.news_pairs[0].0.id, "ns");
+        assert_eq!(roles.news_pairs[0].1.id, "ne");
+    }
+
+    #[test]
+    fn pause_line_on_window_boundary_is_kept() {
+        // Anchors exactly on the window edges [200, 500] are inclusive —
+        // a line drawn at the boundary is on-screen and must survive.
+        let (stubs, mcp) = fixture(vec![
+            (
+                stub("bs", "vertical_line"),
+                drawing("bs", "pause", vec![(200, 1.0)]),
+            ),
+            (
+                stub("be", "vertical_line"),
+                drawing("be", "resume", vec![(500, 1.0)]),
+            ),
+        ]);
+        let roles = classify(&mcp, &stubs, (200, 500), SlotPref::LatestWins).expect("classify ok");
+        assert_eq!(roles.blackout_pairs.len(), 1);
     }
 
     #[test]
