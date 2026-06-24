@@ -475,6 +475,18 @@ pub struct TradeSpec {
     /// `#[serde(default)]` keeps spec yaml byte-identical when unset.
     #[serde(default, skip_serializing_if = "is_default_recover_entry")]
     pub recover_entry: RecoverEntryAction,
+    /// **strategy-v2 (H&S only), default OFF.** Arm a *second* enter — the
+    /// Quasimodo limit — alongside the normal stop entry, on the same setup.
+    /// The QM enter carries no preps (break-and-close / retest skipped), is
+    /// gated only on a confirmed signal candle, and rests as a limit order at
+    /// the same signal level the stop entry anchors to. Whichever of the two
+    /// fires first wins: the worker's retry gate cancels the other's resting
+    /// order (both enters share this `trade_id` + a non-zero `max_retries`),
+    /// and an already-filled position blocks the sibling. The stop enter is
+    /// emitted first so it wins a same-bar tie. Off = byte-identical
+    /// single-enter spec yaml.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub strategy_v2: bool,
 }
 
 /// Skip-serializing predicate for [`TradeSpec::blackout_close`] — keeps a
@@ -909,6 +921,9 @@ fn build_pattern(
         // Interactive path keeps today's drop-on-wrong-side behaviour. The
         // `--recover-entry` opt-in lives on the scripted / tv-arm path.
         recover_entry: RecoverEntryAction::Skip,
+        // strategy-v2 (dual stop + QM enter) is a tv-arm opt-in, not an
+        // interactive-questionnaire option.
+        strategy_v2: false,
     };
     assemble_trade(spec, geometry, entry_offset_pips, sl_offset_pips, now)
 }
@@ -1033,6 +1048,46 @@ fn assemble_trade(
         &spec.entry_level_vetos,
         spec.recover_entry,
     ));
+    // strategy-v2: a second enter — the Quasimodo limit — armed alongside the
+    // stop entry on the same setup. No preps (both skipped), confirmed-candle
+    // gated, limit order at the signal level (EntryMode::Limit picks the
+    // 09-enter-qm basename and EntrySpec::Limit inside build_enter_alert). It
+    // shares this trade_id + max_retries so the worker retry gate treats the
+    // two enters as attempts of one trade and cancels the loser's resting
+    // order. Pushed *after* the stop enter so the stop wins a same-bar tie.
+    // The at-entry level vetos (too-high/too-low) still apply — they're
+    // invalidation levels independent of order type. No wrong-side recovery: a
+    // limit doesn't strand the way a stop does.
+    if spec.strategy_v2 {
+        let qm_skip_preps = vec!["break-and-close".to_string(), "retest".to_string()];
+        alerts.push(build_enter_alert(
+            &spec.instrument,
+            &trade_id,
+            &geometry,
+            entry_deadline,
+            entry_offset_pips,
+            sl_offset_pips,
+            spec.tp_price,
+            spec.sl_price,
+            spec.risk_pct,
+            spec.risk_amount,
+            spec.dry_run,
+            spec.max_retries,
+            spec.expiry_bars,
+            spec.allow_entry.as_deref(),
+            EntryMode::Limit,
+            spec.needs_golden,
+            true, // QM is always confirmed-candle gated
+            &qm_skip_preps,
+            spec.pip_size,
+            spec.blackout_close,
+            &spec.broker,
+            &spec.account,
+            spec.veto_on_reversal && !spec.sr_reversal_ranges.is_empty(),
+            &spec.entry_level_vetos,
+            RecoverEntryAction::Skip,
+        ));
+    }
     if spec.close_on_news || !spec.sr_reversal_ranges.is_empty() {
         alerts.push(build_close_on_reversal_alert(
             &spec.instrument,
@@ -2313,6 +2368,7 @@ mod tests {
                 blackout_close: BlackoutCloseAction::default(),
                 entry_level_vetos: Vec::new(),
                 recover_entry: RecoverEntryAction::Skip,
+                strategy_v2: false,
             },
         };
         let manifest = render_manifest(&trade);
@@ -2741,7 +2797,57 @@ mod tests {
             blackout_close: BlackoutCloseAction::default(),
             entry_level_vetos: Vec::new(),
             recover_entry: RecoverEntryAction::Skip,
+            strategy_v2: false,
         }
+    }
+
+    #[test]
+    fn build_trade_from_spec_strategy_v2_emits_two_enters_sharing_trade_id() {
+        // strategy-v2 arms a second enter (the QM limit) alongside the stop
+        // enter: 7 alerts = the usual 6 + 09-enter-qm, pushed right after
+        // 05-enter. The two enters share the trade_id (so the worker retry
+        // gate correlates them) and a non-zero max_retries (so the engine
+        // keeps the plan alive after the first fire). The QM enter is a Limit
+        // with no preps; the stop enter keeps both preps.
+        let now = ts("2026-05-20T00:00:00Z");
+        let mut spec = sample_spec(TradePattern::Hs, ts("2026-05-25T00:00:00Z"));
+        spec.strategy_v2 = true;
+        spec.max_retries = 5;
+        let trade = build_trade_from_spec(spec, now, BuildStrictness::Strict).unwrap();
+        assert_eq!(trade.alerts.len(), 7);
+        assert_eq!(trade.alerts[5].basename, "05-enter");
+        assert_eq!(trade.alerts[6].basename, "09-enter-qm");
+
+        let stop = &trade.alerts[5];
+        let qm = &trade.alerts[6];
+        // Same trade_id across both enters.
+        assert_eq!(stop.intent.trade_id, qm.intent.trade_id);
+        assert!(stop.intent.trade_id.is_some());
+        // Stop: Stop entry, both preps.
+        assert!(matches!(stop.intent.entry, Some(EntrySpec::Stop { .. })));
+        assert_eq!(
+            stop.intent.requires_preps,
+            vec!["break-and-close".to_string(), "retest".to_string()]
+        );
+        // QM: Limit entry, no preps, confirmed-gated, multi-shot.
+        match &qm.intent.entry {
+            Some(EntrySpec::Limit {
+                from,
+                offset_pips,
+                at,
+            }) => {
+                assert_eq!(*from, PriceAnchor::SignalLow);
+                assert!(offset_pips.abs() < 1e-9);
+                assert!(at.is_none());
+            }
+            other => panic!("expected Limit QM entry, got {other:?}"),
+        }
+        assert!(qm.intent.requires_preps.is_empty());
+        assert!(qm.intent.needs_confirmed);
+        assert!(matches!(
+            qm.intent.max_retries,
+            trade_control_core::tunable::Tunable::Static(5)
+        ));
     }
 
     #[test]

@@ -789,6 +789,8 @@ fn build_mw_trade_spec(
         // M/W is out of scope for wrong-side stop recovery (it has no
         // EntrySpec — resolves via intent.mw). Keep today's behaviour.
         recover_entry: trade_control_core::intent::RecoverEntryAction::Skip,
+        // strategy-v2 (dual stop + QM enter) is H&S-only.
+        strategy_v2: false,
     }
 }
 
@@ -1007,6 +1009,9 @@ fn build_trade_spec(
                 trade_control_core::intent::RecoverEntryAction::Skip
             },
         ),
+        // Wired to the `--strategy-v2` flag in the next commit; the field
+        // exists now so the workspace compiles against the new TradeSpec.
+        strategy_v2: false,
     };
     if args.sl_from_recent {
         spec.sl_anchor = Some(match direction {

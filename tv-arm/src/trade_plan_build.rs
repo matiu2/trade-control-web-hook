@@ -264,8 +264,11 @@ fn trigger_for(
             granularity,
         ),
         // Enter: H&S binds to the direction's candle pattern; M/W to the
-        // per-bar geometry heartbeat.
-        AlertBasename::Enter => Some(if is_mw {
+        // per-bar geometry heartbeat. The strategy-v2 Quasimodo enter
+        // (`EnterQm`) is H&S-only and decided by the *same* candle detector as
+        // `Enter` — the difference between the two is the intent (no preps,
+        // limit order), not the trigger. So it maps to the same PinePattern.
+        AlertBasename::Enter | AlertBasename::EnterQm => Some(if is_mw {
             Trigger::MwEveryBar
         } else {
             Trigger::PinePattern {
