@@ -7,9 +7,14 @@
 //! struct ready for the alert pipeline.
 //!
 //! When multiple drawings claim the same single-slot role
-//! (invalidation, neckline, retest, tp fib, trade-expiry), the
-//! *latest* one wins — older drawings are stale leftovers from
-//! prior setups. A note is logged at `info` so the operator can
+//! (invalidation, neckline, retest, tp fib, trade-expiry), the winner
+//! depends on the run mode ([`SlotPref`]): live arming
+//! (`--register-plan`) keeps the *latest* one — older drawings are
+//! stale leftovers — while an offline / replay build (`--plan-out`
+//! alone) prefers the drawing belonging to the on-screen window, so a
+//! chart rewound to a historical setup doesn't grab a recent,
+//! live-dated drawing (which would bake an anchor outside the replayed
+//! candle window). A note is logged at `info` so the operator can
 //! notice they've left clutter on the chart.
 //!
 //! Blackout and news vertical-line pairs are collected as multi-slot
@@ -133,15 +138,23 @@ impl DrawingFetcher for TvMcp {
 /// docs for the resolution rules.
 ///
 /// `visible_range` is the chart's currently-visible time window (unix
-/// seconds). It's only consulted for M/W path detection: a `path`
-/// drawing qualifies as the M/W marker only when **all** its anchors
-/// fall inside that window, so a stale path scrolled off-screen is
-/// ignored. Pass the window from [`trading_view::mcp::TvMcp::get_range`]
+/// seconds). It scopes M/W path detection (a `path` drawing qualifies as the
+/// M/W marker only when **all** its anchors fall inside that window) and, when
+/// `slot_pref` is [`SlotPref::WindowAware`], drives single-slot role selection
+/// too. Pass the window from [`trading_view::mcp::TvMcp::get_range`]
 /// (`visible_range`).
+///
+/// `slot_pref` chooses how single-slot roles (invalidation, neckline, retest,
+/// tp_fib, trade_expiry) resolve when several candidates are drawn:
+/// [`SlotPref::LatestWins`] for live arming (`--register-plan`) — newest wins —
+/// and [`SlotPref::WindowAware`] for an offline / replay build (`--plan-out`
+/// alone), which prefers the drawing belonging to the on-screen window so a
+/// rewound replay doesn't grab a recent, live-dated drawing.
 pub fn classify<F: DrawingFetcher>(
     fetcher: &F,
     stubs: &[DrawingStub],
     visible_range: (i64, i64),
+    slot_pref: SlotPref,
 ) -> Result<Roles> {
     let mut invalidations: Vec<(Drawing, String)> = Vec::new();
     let mut break_lines: Vec<Drawing> = Vec::new();
@@ -257,20 +270,22 @@ pub fn classify<F: DrawingFetcher>(
 
     let mut roles = Roles::default();
 
-    if let Some((d, lbl)) = latest_with_label(invalidations, "invalidation") {
+    if let Some((d, lbl)) = pick_slot_with_label(invalidations, "invalidation", slot_pref) {
         roles.invalidation = Some(d);
         roles.invalidation_label = Some(lbl);
     }
-    roles.break_and_close = latest_only(break_lines, "break_and_close");
-    roles.retest = latest_only(retest_lines, "retest");
-    roles.tp_fib = latest_only(tp_fibs, "tp_fib");
-    roles.trade_expiry = latest_only(trade_expiries, "trade_expiry");
+    roles.break_and_close = pick_slot(break_lines, "break_and_close", slot_pref);
+    roles.retest = pick_slot(retest_lines, "retest", slot_pref);
+    roles.tp_fib = pick_slot(tp_fibs, "tp_fib", slot_pref);
+    roles.trade_expiry = pick_slot(trade_expiries, "trade_expiry", slot_pref);
 
     roles.blackout_pairs = pair_vertical_lines(blackout_starts, blackout_ends, "blackout")?;
     roles.news_pairs = pair_vertical_lines(news_starts, news_ends, "news")?;
     roles.sr_levels = sr_levels;
     roles.prep_expiries = latest_prep_expiry_per_step(prep_expiry_lines);
-    roles.mw_path = latest_only(mw_paths, "mw_path");
+    // M/W paths are already in-window-filtered by `is_mw_path`, so latest-wins
+    // among qualifiers is correct in both modes.
+    roles.mw_path = pick_slot(mw_paths, "mw_path", SlotPref::LatestWins);
     roles.position = latest_position(positions);
 
     Ok(roles)
@@ -341,36 +356,111 @@ fn latest_prep_expiry_per_step(cands: Vec<(&'static str, Drawing)>) -> Vec<(Stri
     out
 }
 
-/// Pick the drawing with the latest anchor time, logging a note when
-/// duplicates were present.
-fn latest_only(mut cands: Vec<Drawing>, role: &str) -> Option<Drawing> {
-    if cands.is_empty() {
-        return None;
-    }
-    if cands.len() > 1 {
-        info!(
-            count = cands.len(),
-            role, "multiple drawings for role; picking the latest"
-        );
-    }
-    cands.sort_by_key(|d| d.latest_time());
-    cands.pop()
+/// How a single-slot role (invalidation, neckline, retest, tp_fib,
+/// trade_expiry) chooses among several candidate drawings.
+///
+/// The two modes mirror the two ways `tv-arm` is run (see [`classify`]):
+///
+/// - [`SlotPref::LatestWins`] — live arming (`--register-plan`). The
+///   operator just (re)drew the current setup, so the newest drawing is
+///   authoritative; an older one is a stale leftover. This is the
+///   long-standing behaviour.
+/// - [`SlotPref::WindowAware`] — offline / replay build (`--plan-out`
+///   without `--register-plan`). The chart is rewound to a historical
+///   setup but may *also* carry recent, live-dated drawings. Latest-wins
+///   would wrongly grab the recent drawing, baking an anchor *outside* the
+///   replayed candle window (so e.g. break-and-close never evaluates and no
+///   entry fires). Instead, prefer the drawing that belongs to the
+///   on-screen window — see [`pick_window_aware`].
+#[derive(Debug, Clone, Copy)]
+pub enum SlotPref {
+    /// Newest anchor time wins (live arming).
+    LatestWins,
+    /// Prefer the drawing belonging to the visible window `(from, to)`
+    /// (replay build).
+    WindowAware((i64, i64)),
 }
 
-/// Variant of `latest_only` for drawings that carry an associated
-/// label (currently just `invalidation`).
-fn latest_with_label(mut cands: Vec<(Drawing, String)>, role: &str) -> Option<(Drawing, String)> {
+/// Pick a single-slot drawing under `pref`, logging a note when duplicates
+/// were present. `LatestWins` keeps the newest; `WindowAware` defers to
+/// [`pick_window_aware`].
+fn pick_slot(mut cands: Vec<Drawing>, role: &str, pref: SlotPref) -> Option<Drawing> {
     if cands.is_empty() {
         return None;
     }
     if cands.len() > 1 {
         info!(
             count = cands.len(),
-            role, "multiple drawings for role; picking the latest"
+            role, "multiple drawings for role; picking by preference"
         );
     }
-    cands.sort_by_key(|(d, _)| d.latest_time());
-    cands.pop()
+    match pref {
+        SlotPref::LatestWins => {
+            cands.sort_by_key(|d| d.latest_time());
+            cands.pop()
+        }
+        SlotPref::WindowAware(view) => pick_window_aware(cands, role, view),
+    }
+}
+
+/// Window-aware single-slot pick for replay builds. In order of preference:
+///
+/// 1. A drawing whose anchors all sit **inside** the visible range
+///    `[from, to]` — among those, the latest wins.
+/// 2. Else the drawing anchored **before and closest** to the window start
+///    (largest `latest_time()` that is `<= from`) — a neckline drawn just
+///    left of the replay cursor still works.
+/// 3. Else plain latest-wins, so we never select *nothing* and silently
+///    regress a chart whose drawings are all to the right of the window.
+fn pick_window_aware(cands: Vec<Drawing>, role: &str, (from, to): (i64, i64)) -> Option<Drawing> {
+    let in_window = cands
+        .iter()
+        .filter(|d| !d.points.is_empty() && d.points.iter().all(|p| p.time >= from && p.time <= to))
+        .max_by_key(|d| d.latest_time())
+        .cloned();
+    if let Some(d) = in_window {
+        return Some(d);
+    }
+    debug!(
+        role,
+        "no in-window drawing; falling back to before-and-closest"
+    );
+    let before = cands
+        .iter()
+        .filter(|d| d.latest_time() <= from)
+        .max_by_key(|d| d.latest_time())
+        .cloned();
+    if let Some(d) = before {
+        return Some(d);
+    }
+    debug!(
+        role,
+        "no drawing at-or-before window start; falling back to latest"
+    );
+    cands.into_iter().max_by_key(|d| d.latest_time())
+}
+
+/// Variant of [`pick_slot`] for drawings that carry an associated label
+/// (currently just `invalidation`). Selects the drawing under `pref`, then
+/// returns it with its label.
+fn pick_slot_with_label(
+    cands: Vec<(Drawing, String)>,
+    role: &str,
+    pref: SlotPref,
+) -> Option<(Drawing, String)> {
+    if cands.is_empty() {
+        return None;
+    }
+    // Split labels off into a lookup, pick on the drawings alone (so the
+    // window-aware logic is shared), then re-attach the chosen label by id.
+    let labels: std::collections::HashMap<String, String> = cands
+        .iter()
+        .map(|(d, lbl)| (d.id.clone(), lbl.clone()))
+        .collect();
+    let drawings: Vec<Drawing> = cands.into_iter().map(|(d, _)| d).collect();
+    let chosen = pick_slot(drawings, role, pref)?;
+    let lbl = labels.get(&chosen.id).cloned().unwrap_or_default();
+    Some((chosen, lbl))
 }
 
 #[cfg(test)]
@@ -495,7 +585,7 @@ mod tests {
             ),
         ]);
 
-        let roles = classify(&mcp, &stubs, ANY_RANGE).expect("classify ok");
+        let roles = classify(&mcp, &stubs, ANY_RANGE, SlotPref::LatestWins).expect("classify ok");
 
         assert!(roles.invalidation.is_some());
         assert_eq!(roles.invalidation_label.as_deref(), Some("too-high"));
@@ -519,7 +609,7 @@ mod tests {
     #[test]
     fn empty_chart_yields_empty_roles() {
         let (stubs, mcp) = fixture(vec![]);
-        let roles = classify(&mcp, &stubs, ANY_RANGE).expect("classify ok");
+        let roles = classify(&mcp, &stubs, ANY_RANGE, SlotPref::LatestWins).expect("classify ok");
         assert!(roles.invalidation.is_none());
         assert!(roles.break_and_close.is_none());
         assert!(roles.blackout_pairs.is_empty());
@@ -540,7 +630,7 @@ mod tests {
                 drawing("new", "neckline", vec![(400, 1.0), (500, 1.0)]),
             ),
         ]);
-        let roles = classify(&mcp, &stubs, ANY_RANGE).expect("ok");
+        let roles = classify(&mcp, &stubs, ANY_RANGE, SlotPref::LatestWins).expect("ok");
         assert_eq!(roles.break_and_close.unwrap().id, "new");
     }
 
@@ -556,9 +646,125 @@ mod tests {
                 drawing("new", "too-high", vec![(500, 1.5)]),
             ),
         ]);
-        let roles = classify(&mcp, &stubs, ANY_RANGE).expect("ok");
+        let roles = classify(&mcp, &stubs, ANY_RANGE, SlotPref::LatestWins).expect("ok");
         assert_eq!(roles.invalidation.as_ref().unwrap().id, "new");
         assert_eq!(roles.invalidation_label.as_deref(), Some("too-high"));
+    }
+
+    #[test]
+    fn window_aware_prefers_in_window_neckline_over_newer_out_of_window() {
+        // The replay bug: an old in-window neckline (t=100..200) and a recent
+        // out-of-window one (t=900..1000). Latest-wins would grab the recent
+        // one (baking an anchor outside the replayed window); window-aware must
+        // pick the in-window neckline.
+        let (stubs, mcp) = fixture(vec![
+            (
+                stub("hist", "trend_line"),
+                drawing("hist", "neckline", vec![(100, 1.0), (200, 1.0)]),
+            ),
+            (
+                stub("recent", "trend_line"),
+                drawing("recent", "neckline", vec![(900, 1.5), (1000, 1.5)]),
+            ),
+        ]);
+        let view = (50, 300);
+        let roles = classify(&mcp, &stubs, view, SlotPref::WindowAware(view)).expect("ok");
+        assert_eq!(roles.break_and_close.unwrap().id, "hist");
+    }
+
+    #[test]
+    fn window_aware_falls_back_to_before_and_closest_when_none_in_window() {
+        // No neckline fully inside the window [500, 800]. Two sit entirely
+        // before it (t≤500): the one anchored closest to the window start
+        // (t=450) wins over the older one (t=200). A neckline to the right of
+        // the window (t=900+) is ignored.
+        let (stubs, mcp) = fixture(vec![
+            (
+                stub("far", "trend_line"),
+                drawing("far", "neckline", vec![(100, 1.0), (200, 1.0)]),
+            ),
+            (
+                stub("near", "trend_line"),
+                drawing("near", "neckline", vec![(400, 1.0), (450, 1.0)]),
+            ),
+            (
+                stub("future", "trend_line"),
+                drawing("future", "neckline", vec![(900, 1.0), (1000, 1.0)]),
+            ),
+        ]);
+        let view = (500, 800);
+        let roles = classify(&mcp, &stubs, view, SlotPref::WindowAware(view)).expect("ok");
+        assert_eq!(roles.break_and_close.unwrap().id, "near");
+    }
+
+    #[test]
+    fn window_aware_last_resort_is_latest_when_all_to_the_right() {
+        // Every neckline sits to the right of the window [0, 100] — none is
+        // in-window and none is at-or-before the start. Last-resort latest-wins
+        // so we never select nothing.
+        let (stubs, mcp) = fixture(vec![
+            (
+                stub("a", "trend_line"),
+                drawing("a", "neckline", vec![(200, 1.0), (300, 1.0)]),
+            ),
+            (
+                stub("b", "trend_line"),
+                drawing("b", "neckline", vec![(600, 1.0), (700, 1.0)]),
+            ),
+        ]);
+        let view = (0, 100);
+        let roles = classify(&mcp, &stubs, view, SlotPref::WindowAware(view)).expect("ok");
+        assert_eq!(roles.break_and_close.unwrap().id, "b");
+    }
+
+    #[test]
+    fn latest_wins_picks_newest_even_when_out_of_window() {
+        // Live arming (LatestWins): the recent out-of-window neckline is the
+        // authoritative one even though an in-window historical line exists.
+        let (stubs, mcp) = fixture(vec![
+            (
+                stub("hist", "trend_line"),
+                drawing("hist", "neckline", vec![(100, 1.0), (200, 1.0)]),
+            ),
+            (
+                stub("recent", "trend_line"),
+                drawing("recent", "neckline", vec![(900, 1.5), (1000, 1.5)]),
+            ),
+        ]);
+        let view = (50, 300);
+        let roles = classify(&mcp, &stubs, view, SlotPref::LatestWins).expect("ok");
+        assert_eq!(roles.break_and_close.unwrap().id, "recent");
+    }
+
+    #[test]
+    fn window_aware_also_applies_to_invalidation_and_trade_expiry() {
+        // The same in-window preference holds for the labelled invalidation
+        // role and the trade-expiry vertical line, not just trend lines.
+        let (stubs, mcp) = fixture(vec![
+            // Invalidation: in-window (t=150) vs recent (t=950).
+            (
+                stub("inv-hist", "horizontal_line"),
+                drawing("inv-hist", "too-high", vec![(150, 1.25)]),
+            ),
+            (
+                stub("inv-recent", "horizontal_line"),
+                drawing("inv-recent", "too-high", vec![(950, 1.30)]),
+            ),
+            // Trade-expiry: in-window (t=250) vs recent (t=990).
+            (
+                stub("exp-hist", "vertical_line"),
+                drawing("exp-hist", "trade-expiry", vec![(250, 1.0)]),
+            ),
+            (
+                stub("exp-recent", "vertical_line"),
+                drawing("exp-recent", "trade-expiry", vec![(990, 1.0)]),
+            ),
+        ]);
+        let view = (50, 300);
+        let roles = classify(&mcp, &stubs, view, SlotPref::WindowAware(view)).expect("ok");
+        assert_eq!(roles.invalidation.as_ref().unwrap().id, "inv-hist");
+        assert_eq!(roles.invalidation_label.as_deref(), Some("too-high"));
+        assert_eq!(roles.trade_expiry.as_ref().unwrap().id, "exp-hist");
     }
 
     #[test]
@@ -574,7 +780,7 @@ mod tests {
                 drawing("pe", "resume", vec![(350, 1.0)]),
             ),
         ]);
-        let roles = classify(&mcp, &stubs, ANY_RANGE).expect("ok");
+        let roles = classify(&mcp, &stubs, ANY_RANGE, SlotPref::LatestWins).expect("ok");
         assert_eq!(roles.blackout_pairs.len(), 1);
     }
 
@@ -586,7 +792,7 @@ mod tests {
             stub("a", "trend_line"),
             drawing("a", "scratchpad", vec![(50, 1.0), (100, 1.0)]),
         )]);
-        let roles = classify(&mcp, &stubs, ANY_RANGE).expect("ok");
+        let roles = classify(&mcp, &stubs, ANY_RANGE, SlotPref::LatestWins).expect("ok");
         assert!(roles.break_and_close.is_none());
         assert!(roles.retest.is_none());
     }
@@ -597,7 +803,7 @@ mod tests {
             stub("bs", "vertical_line"),
             drawing("bs", "blackout-start", vec![(300, 1.0)]),
         )]);
-        let err = classify(&mcp, &stubs, ANY_RANGE).unwrap_err();
+        let err = classify(&mcp, &stubs, ANY_RANGE, SlotPref::LatestWins).unwrap_err();
         assert!(format!("{err}").contains("blackout"));
     }
 
@@ -613,7 +819,7 @@ mod tests {
                 drawing("ne", "news-end", vec![(400, 1.0)]),
             ),
         ]);
-        let err = classify(&mcp, &stubs, ANY_RANGE).unwrap_err();
+        let err = classify(&mcp, &stubs, ANY_RANGE, SlotPref::LatestWins).unwrap_err();
         let msg = format!("{err}");
         assert!(msg.contains("news"), "msg = {msg}");
         assert!(msg.contains("reversed"), "msg = {msg}");
@@ -631,7 +837,7 @@ mod tests {
                 drawing("s2", "resistance", vec![(200, 1.20)]),
             ),
         ]);
-        let roles = classify(&mcp, &stubs, ANY_RANGE).expect("ok");
+        let roles = classify(&mcp, &stubs, ANY_RANGE, SlotPref::LatestWins).expect("ok");
         assert_eq!(roles.sr_levels.len(), 2);
     }
 
@@ -650,7 +856,7 @@ mod tests {
                 drawing("exp", "trade-expiry", vec![(900, 1.0)]),
             ),
         ]);
-        let roles = classify(&mcp, &stubs, ANY_RANGE).expect("ok");
+        let roles = classify(&mcp, &stubs, ANY_RANGE, SlotPref::LatestWins).expect("ok");
         assert_eq!(roles.prep_expiries.len(), 1);
         assert_eq!(roles.prep_expiries[0].0, "break-and-close");
         assert_eq!(roles.prep_expiries[0].1.id, "bnce");
@@ -669,7 +875,7 @@ mod tests {
                 drawing("new", "retest-expiry", vec![(500, 1.0)]),
             ),
         ]);
-        let roles = classify(&mcp, &stubs, ANY_RANGE).expect("ok");
+        let roles = classify(&mcp, &stubs, ANY_RANGE, SlotPref::LatestWins).expect("ok");
         assert_eq!(roles.prep_expiries.len(), 1);
         assert_eq!(roles.prep_expiries[0].0, "retest");
         assert_eq!(roles.prep_expiries[0].1.id, "new");
@@ -682,7 +888,7 @@ mod tests {
             stub("f", "fib_retracement"),
             drawing("f", "leftover note", vec![(50, 1.2), (200, 1.1)]),
         )]);
-        let roles = classify(&mcp, &stubs, ANY_RANGE).expect("ok");
+        let roles = classify(&mcp, &stubs, ANY_RANGE, SlotPref::LatestWins).expect("ok");
         assert!(roles.tp_fib.is_some());
     }
 
@@ -694,7 +900,7 @@ mod tests {
             stub("p", "path"),
             drawing("p", "", vec![(100, 1.10), (200, 1.12), (300, 1.112)]),
         )]);
-        let roles = classify(&mcp, &stubs, (50, 400)).expect("ok");
+        let roles = classify(&mcp, &stubs, (50, 400), SlotPref::LatestWins).expect("ok");
         assert_eq!(roles.mw_path.as_ref().unwrap().id, "p");
         // Anchors preserved in draw order = A, B, C.
         let pts = &roles.mw_path.unwrap().points;
@@ -710,7 +916,7 @@ mod tests {
             stub("p", "path"),
             drawing("p", "", vec![(100, 1.10), (200, 1.12), (900, 1.112)]),
         )]);
-        let roles = classify(&mcp, &stubs, (50, 400)).expect("ok");
+        let roles = classify(&mcp, &stubs, (50, 400), SlotPref::LatestWins).expect("ok");
         assert!(roles.mw_path.is_none());
     }
 
@@ -720,7 +926,7 @@ mod tests {
             stub("p", "path"),
             drawing("p", "", vec![(100, 1.10), (200, 1.12)]),
         )]);
-        let roles = classify(&mcp, &stubs, ANY_RANGE).expect("ok");
+        let roles = classify(&mcp, &stubs, ANY_RANGE, SlotPref::LatestWins).expect("ok");
         assert!(roles.mw_path.is_none());
     }
 
@@ -736,7 +942,7 @@ mod tests {
                 vec![(100, 1.1), (200, 1.12), (300, 1.11), (400, 1.13)],
             ),
         )]);
-        let roles = classify(&mcp, &stubs, ANY_RANGE).expect("ok");
+        let roles = classify(&mcp, &stubs, ANY_RANGE, SlotPref::LatestWins).expect("ok");
         let path = roles.mw_path.expect("4-anchor path is a valid mw_path");
         assert_eq!(path.points.len(), 4);
     }
@@ -758,7 +964,7 @@ mod tests {
                 ],
             ),
         )]);
-        let roles = classify(&mcp, &stubs, ANY_RANGE).expect("ok");
+        let roles = classify(&mcp, &stubs, ANY_RANGE, SlotPref::LatestWins).expect("ok");
         assert!(roles.mw_path.is_none());
     }
 
@@ -776,7 +982,7 @@ mod tests {
                 drawing("new", "", vec![(600, 1.1), (650, 1.12), (700, 1.112)]),
             ),
         ]);
-        let roles = classify(&mcp, &stubs, (50, 800)).expect("ok");
+        let roles = classify(&mcp, &stubs, (50, 800), SlotPref::LatestWins).expect("ok");
         assert_eq!(roles.mw_path.unwrap().id, "new");
     }
 
@@ -786,7 +992,7 @@ mod tests {
             stub("sp", "short_position"),
             position("sp", 23475.0, 1773738000, 3000.0, 7007.0),
         )]);
-        let roles = classify(&mcp, &stubs, ANY_RANGE).expect("ok");
+        let roles = classify(&mcp, &stubs, ANY_RANGE, SlotPref::LatestWins).expect("ok");
         let pos = roles.position.expect("position present");
         assert_eq!(pos.direction, PositionDirection::Short);
         assert_eq!(pos.drawing.points[0].price, 23475.0);
@@ -800,7 +1006,7 @@ mod tests {
             stub("lp", "long_position"),
             position("lp", 24195.3, 1778702400, 801.0, 2223.0),
         )]);
-        let roles = classify(&mcp, &stubs, ANY_RANGE).expect("ok");
+        let roles = classify(&mcp, &stubs, ANY_RANGE, SlotPref::LatestWins).expect("ok");
         assert_eq!(roles.position.unwrap().direction, PositionDirection::Long);
     }
 
@@ -822,7 +1028,7 @@ mod tests {
             },
         };
         let (stubs, mcp) = fixture(vec![(stub("h", "short_position"), half)]);
-        let roles = classify(&mcp, &stubs, ANY_RANGE).expect("ok");
+        let roles = classify(&mcp, &stubs, ANY_RANGE, SlotPref::LatestWins).expect("ok");
         assert!(roles.position.is_none());
     }
 
@@ -838,7 +1044,7 @@ mod tests {
                 position("new", 200.0, 900, 40.0, 80.0),
             ),
         ]);
-        let roles = classify(&mcp, &stubs, ANY_RANGE).expect("ok");
+        let roles = classify(&mcp, &stubs, ANY_RANGE, SlotPref::LatestWins).expect("ok");
         let pos = roles.position.unwrap();
         assert_eq!(pos.drawing.id, "new");
         assert_eq!(pos.direction, PositionDirection::Long);

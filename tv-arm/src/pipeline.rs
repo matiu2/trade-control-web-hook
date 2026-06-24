@@ -39,7 +39,7 @@ use crate::instrument_resolution::ResolvedInstrument;
 use crate::mw_geometry;
 use crate::position_trade::{core_direction, resolve_levels};
 use crate::register_post::{post_intent_blocking, post_register_blocking};
-use crate::roles::{Roles, classify};
+use crate::roles::{Roles, SlotPref, classify};
 use crate::timeframe::infer_calendar_timeframe;
 use crate::trade_plan_build::{append_control_rules, build_trade_plan, resolution_to_granularity};
 use trading_view::drawings::Drawing;
@@ -99,8 +99,18 @@ pub fn run(args: Args) -> Result<i32> {
         .wrap_err("read TV visible range")?
         .visible_range;
     let view = (visible.from, visible.to);
+    // Single-slot role selection follows the run mode (same signal as
+    // `BuildStrictness` below): live arming (`--register-plan`, king when both
+    // flags are set) trusts the newest drawing; an offline / replay build
+    // (`--plan-out` alone) prefers the drawing belonging to the on-screen
+    // window, so a rewound replay doesn't grab a recent, live-dated drawing.
+    let slot_pref = if args.register_plan {
+        SlotPref::LatestWins
+    } else {
+        SlotPref::WindowAware(view)
+    };
     let mut drawings = mcp.list_drawings().wrap_err("list TV drawings")?;
-    let mut roles = classify(&mcp, &drawings, view)?;
+    let mut roles = classify(&mcp, &drawings, view, slot_pref)?;
 
     let should_auto_draw =
         !args.skip_calendar_bars && roles.blackout_pairs.is_empty() && roles.news_pairs.is_empty();
@@ -116,7 +126,7 @@ pub fn run(args: Args) -> Result<i32> {
             warn!(error = ?e, "calendar auto-draw failed; continuing with chart as-is");
         } else {
             drawings = mcp.list_drawings().wrap_err("re-list TV drawings")?;
-            roles = classify(&mcp, &drawings, view)?;
+            roles = classify(&mcp, &drawings, view, slot_pref)?;
         }
     }
 
