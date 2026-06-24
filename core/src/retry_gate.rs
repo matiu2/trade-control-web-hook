@@ -1396,6 +1396,124 @@ mod tests {
         assert_eq!(*store.set_btid_calls.borrow(), 1);
     }
 
+    // ===== strategy-v2: the two enters cancel each other via the gate =====
+    //
+    // These prove the strategy-v2 design works through the *unchanged* retry
+    // gate: the stop enter and the Quasimodo enter share one trade_id, so a
+    // fire of the second enter sees the first's EntryAttempt row and applies
+    // the ordinary cross-reference rules. The gate is blind to *which* enter
+    // produced a row — that homogeneity is exactly what makes "first fire wins,
+    // cancel the sibling's resting order, block on an open position" fall out
+    // for free. The order ids are named for the two enters to make the
+    // scenario legible.
+
+    /// QM enter places first (resting limit), then the stop enter fires on a
+    /// later bar. The gate sees the QM order pending → cancels it → the stop
+    /// enter proceeds as attempt 2. "Open orders are cancelled to replace the
+    /// new order."
+    #[test]
+    fn strategy_v2_stop_fire_cancels_pending_qm_order() {
+        let broker = MockBroker::default();
+        let store = CountingStore::default();
+        let intent = intent_with_retries(5);
+
+        // Attempt 1: the QM limit was placed on an earlier bar.
+        run(record_placement(
+            &store,
+            &intent,
+            ts("2026-05-25T13:00:00Z"),
+            intent.not_after,
+            ts("2026-05-25T13:00:01Z"),
+            1,
+            "qm-order",
+            Direction::Long,
+            1.05,
+            None,
+        ));
+
+        broker.push_lookup(AttemptState::Pending);
+        broker.push_cancel_ok();
+
+        // The stop enter fires on a *later* bar (distinct shell.time, so the
+        // same-bar dedup doesn't fire).
+        let stop_shell = shell_at(ts("2026-05-25T14:00:00Z"));
+        let out = run(evaluate(&broker, &store, &intent, &stop_shell));
+        assert_proceed(out, 2);
+
+        let cancels = broker.cancel_calls.borrow();
+        assert_eq!(cancels.len(), 1);
+        assert_eq!(
+            cancels[0].1, "qm-order",
+            "the QM order is the one cancelled"
+        );
+    }
+
+    /// Symmetric: the stop enter places first, then the QM enter fires on a
+    /// later bar and cancels the resting stop order, proceeding as attempt 2.
+    #[test]
+    fn strategy_v2_qm_fire_cancels_pending_stop_order() {
+        let broker = MockBroker::default();
+        let store = CountingStore::default();
+        let intent = intent_with_retries(5);
+
+        run(record_placement(
+            &store,
+            &intent,
+            ts("2026-05-25T13:00:00Z"),
+            intent.not_after,
+            ts("2026-05-25T13:00:01Z"),
+            1,
+            "stop-order",
+            Direction::Long,
+            1.05,
+            None,
+        ));
+
+        broker.push_lookup(AttemptState::Pending);
+        broker.push_cancel_ok();
+
+        let qm_shell = shell_at(ts("2026-05-25T14:00:00Z"));
+        let out = run(evaluate(&broker, &store, &intent, &qm_shell));
+        assert_proceed(out, 2);
+
+        let cancels = broker.cancel_calls.borrow();
+        assert_eq!(cancels.len(), 1);
+        assert_eq!(cancels[0].1, "stop-order");
+    }
+
+    /// One enter has already *filled* (open position). The sibling enter
+    /// firing later is rejected 412 — we never stack a second entry on a live
+    /// one. "Open positions remain and cancel the new one."
+    #[test]
+    fn strategy_v2_open_position_blocks_sibling_enter() {
+        let broker = MockBroker::default();
+        let store = CountingStore::default();
+        let intent = intent_with_retries(5);
+
+        run(record_placement(
+            &store,
+            &intent,
+            ts("2026-05-25T13:00:00Z"),
+            intent.not_after,
+            ts("2026-05-25T13:00:01Z"),
+            1,
+            "qm-order",
+            Direction::Long,
+            1.05,
+            None,
+        ));
+
+        broker.push_lookup(AttemptState::OpenPosition {
+            broker_trade_id: "btid-99".into(),
+        });
+
+        let stop_shell = shell_at(ts("2026-05-25T14:00:00Z"));
+        let out = run(evaluate(&broker, &store, &intent, &stop_shell));
+        assert_rejected(out, 412, "trade-already-open");
+        // No cancel — we don't touch a filled position.
+        assert!(broker.cancel_calls.borrow().is_empty());
+    }
+
     /// Every *provably-collapsed* state (ClosedWin / ClosedLossOrBE /
     /// Cancelled) lets the gate fall through to placement of the next
     /// attempt. ClosedWin no longer gates — min-1R filtering downstream
