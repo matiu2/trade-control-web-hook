@@ -56,6 +56,15 @@ pub enum AlertBasename {
     PrepExpire(String),
     /// `05-enter` — Pine `Candle Signals` entry alert.
     Enter,
+    /// `09-enter-qm` — Quasimodo limit entry (strategy-v2). A second
+    /// enter armed alongside `05-enter` on the same setup: no preps
+    /// (break-and-close / retest skipped), gated only on a confirmed
+    /// signal candle, placed as a limit order resting at the signal
+    /// level. Same Pine `Candle Signals` detector as `05-enter`; the
+    /// difference is the intent (no preps, `EntrySpec::Limit`). The
+    /// first of the two enters to fire cancels the other's resting
+    /// order via the worker retry gate (shared `trade_id`).
+    EnterQm,
     /// `06-close-on-reversal` — Pine reversal close, gated on an
     /// active news window.
     CloseOnReversal,
@@ -86,6 +95,7 @@ impl AlertBasename {
             Self::PrepRetest => Cow::Borrowed("04-prep-retest"),
             Self::PrepExpire(step) => Cow::Owned(format!("08-prep-expire-{step}")),
             Self::Enter => Cow::Borrowed("05-enter"),
+            Self::EnterQm => Cow::Borrowed("09-enter-qm"),
             Self::CloseOnReversal => Cow::Borrowed("06-close-on-reversal"),
             Self::CloseOnSrReversal => Cow::Borrowed("07-close-on-sr-reversal"),
             Self::PauseStart(id) => Cow::Owned(format!("01-pause-{id}")),
@@ -112,6 +122,7 @@ impl AlertBasename {
             "03-prep-break-and-close" => Some(Self::PrepBreakAndClose),
             "04-prep-retest" => Some(Self::PrepRetest),
             "05-enter" => Some(Self::Enter),
+            "09-enter-qm" => Some(Self::EnterQm),
             "06-close-on-reversal" => Some(Self::CloseOnReversal),
             "07-close-on-sr-reversal" => Some(Self::CloseOnSrReversal),
             other => other
@@ -145,7 +156,7 @@ impl AlertBasename {
 mod tests {
     use super::*;
 
-    fn variants() -> [AlertBasename; 17] {
+    fn variants() -> [AlertBasename; 18] {
         [
             AlertBasename::VetoTooHigh,
             AlertBasename::VetoTooLow,
@@ -158,6 +169,7 @@ mod tests {
             AlertBasename::PrepExpire("break-and-close".into()),
             AlertBasename::PrepExpire("retest".into()),
             AlertBasename::Enter,
+            AlertBasename::EnterQm,
             AlertBasename::CloseOnReversal,
             AlertBasename::CloseOnSrReversal,
             AlertBasename::PauseStart("cal-foo-1780034400-pause".into()),
@@ -196,6 +208,7 @@ mod tests {
         );
         assert_eq!(AlertBasename::PrepRetest.as_str(), "04-prep-retest");
         assert_eq!(AlertBasename::Enter.as_str(), "05-enter");
+        assert_eq!(AlertBasename::EnterQm.as_str(), "09-enter-qm");
         assert_eq!(
             AlertBasename::CloseOnReversal.as_str(),
             "06-close-on-reversal"

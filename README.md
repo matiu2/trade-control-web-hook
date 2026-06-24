@@ -137,6 +137,7 @@ Basename ordering matters — `tv-arm` maps drawings to alerts by prefix.
 | `03-prep-break-and-close` | `prep` | Trendline crossing (neckline break) | Skippable for stocks / late entries with `--skip-break-and-close`. |
 | `04-prep-retest` | `prep` | Trendline crossing (retest from below) | Skippable with `--skip-retest`. |
 | `05-enter` | `enter` | Pine `Candle Signals` golden candle | The actual trade. Gated on the preps above + opposing-direction veto absent. |
+| `09-enter-qm` | `enter` | Pine `Candle Signals` (same detector as `05-enter`) | **`tv-arm --strategy-v2` only.** The Quasimodo limit entry, armed alongside `05-enter`: no preps, confirmed-candle gated, `EntrySpec::Limit` resting at the signal level. Shares the trade's `trade_id` + `max_retries` with `05-enter`; first of the two to fire cancels the other's resting order (worker retry gate). See "Dual entry — `--strategy-v2`" below. |
 | `06-close-on-reversal` | `close` | Pine `Candle Signals` opposing reversal | Emitted when news-pairs and/or `support`/`resistance` lines are drawn. Carries `inside_window: [news?, price?]` (OR-composed) and, when `price` is listed, `sr_bands: [[lo, hi], ...]`. Defaults `needs_golden: true` for the candle-quality gate. With `tv-arm --veto-on-reversal` (experimental) it also carries `veto_on_reversal: true`, so a reversal off a band before entry vetoes the upcoming trade — see the `close` action notes above. |
 | `08-prep-expire-<step>` | `prep-expire` | Vertical line crossing chart time | Emitted once per chart-drawn `<prep>-expiry` line (`break-and-close-expiry`, `retest-expiry`). When crossed, blocks any further `<step>` prep on the trade — so a setup whose prep lands too late never enters. Drawing-bound. `<step>` is the canonical prep name and may contain hyphens. |
 
@@ -1874,6 +1875,7 @@ cargo run -p tv-arm -- \
   --reversal-band-pct 0.1 \           # half-width % around support/resistance lines (default 0.1)
   --veto-on-reversal \                # experimental: a reversal off a band before entry also vetoes the upcoming trade (default off)
   --quasimodo \                       # alias: --skip-break-and-close --skip-retest --require-confirmation (drop both H&S preps, gate on a confirmed candle)
+  --strategy-v2 \                     # arm BOTH a stop entry AND a Quasimodo limit entry on one setup; first to fire cancels the other (see below). Conflicts with --quasimodo/--entry-market/--skip-*; needs --max-retries > 0
   --skip-break-and-close \            # for stocks (no after-hours retests)
   --skip-retest \                     # implies --skip-break-and-close; for late entries
   --skip-golden \                     # drop the Pine golden-candle requirement (golden is required by default)
@@ -1887,6 +1889,37 @@ cargo run -p tv-arm -- \
 
 Run `tv-arm --help` for the full flag surface — it has diverged from the
 deprecated Python script.
+
+### Dual entry — `--strategy-v2` (stop + Quasimodo)
+
+`--strategy-v2` (H&S / iH&S only) arms **two entries on the same setup at
+once**, competing for the same trade:
+
+1. **Stop entry** — the normal one: gated by the break-and-close + retest
+   preps and a confirmed signal candle, placed as a stop order that triggers
+   on a break *through* the signal level.
+2. **Quasimodo (QM) limit** — no preps at all, gated only on a confirmed
+   signal candle, placed as a **limit** order resting at the *same* signal
+   level. It fills on a pullback *back* to the level (the mirror of the stop's
+   break-through).
+
+This is **not** `--quasimodo`, which runs the QM setup *instead of* the stop
+entry. strategy-v2 runs both. The bundle gains a second enter alert,
+`09-enter-qm`, alongside `05-enter`; both share the trade's `trade_id`.
+
+**Whichever fires first wins.** The two enters share that `trade_id` and a
+non-zero `--max-retries`, so the worker's retry gate treats them as attempts
+of one trade: when the second enter fires, the gate finds the first's resting
+order and **cancels it** before placing the new one — but if the first has
+already *filled* (an open position), the second is **rejected** instead (we
+never stack two entries on one setup). The stop entry is emitted first, so on
+the rare bar where both qualify simultaneously the stop wins the tie and the
+QM fire is deduped.
+
+Because the cancel-the-sibling mechanism rides on multi-shot, `--strategy-v2`
+requires `--max-retries > 0` (it defaults to 5; `--max-retries 0` is
+rejected). It conflicts with `--quasimodo`, `--entry-market`,
+`--skip-break-and-close`, and `--skip-retest`.
 
 ### Server-side engine registration (`--register-plan`)
 
