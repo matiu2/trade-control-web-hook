@@ -99,6 +99,8 @@ fn main() -> Result<ExitCode> {
         return Ok(ExitCode::SUCCESS);
     }
 
-    let code = pipeline::run(parsed.apply_aliases())?;
+    let parsed = parsed.apply_aliases();
+    parsed.validate()?;
+    let code = pipeline::run(parsed)?;
     Ok(ExitCode::from(code as u8))
 }
