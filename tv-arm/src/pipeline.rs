@@ -138,6 +138,11 @@ pub fn run(args: Args) -> Result<i32> {
     let out_dir = arm_out_dir(&raw_sym)?;
     let now = Utc::now();
 
+    // Drop blackout/news windows that have already fully elapsed in
+    // wall-clock terms (common when arming off a chart of historical bars).
+    // See `drop_past_control_pairs` for the why.
+    drop_past_control_pairs(&mut roles, now);
+
     // 2c. Position-tool direct entry. When one of --market-entry /
     //     --stop-entry / --limit-entry is set, ignore the pattern
     //     machinery entirely: read the drawn long/short position tool,
@@ -1132,6 +1137,35 @@ struct NewsBundle {
     out_dir: PathBuf,
 }
 
+/// Drop blackout/news pairs whose window has already fully closed
+/// (`end_time <= now`). The visible-window filter in [`classify`] only
+/// removes lines that are *off-screen*; when the operator arms off a chart
+/// that is showing historical bars (an old H&S whose trade-expiry is in the
+/// past), the news/blackout vertical lines are genuinely on-screen yet their
+/// window has elapsed in wall-clock terms. A past window has nothing left to
+/// pause / close-on-news for, so arming it is meaningless — and feeding it to
+/// `build_pause_from_spec` would hard-fail with "refusing to arm a stale
+/// blackout". Drop it here, once, so the log line, `close_on_news`, and both
+/// bundle builders all see a consistent live-only view.
+fn drop_past_control_pairs(roles: &mut Roles, now: DateTime<Utc>) {
+    let now_unix = now.timestamp();
+    let is_past = |pair: &(Drawing, Drawing)| pair.1.anchor_time_seconds() <= now_unix;
+    for (kind, pairs) in [
+        ("blackout", &mut roles.blackout_pairs),
+        ("news", &mut roles.news_pairs),
+    ] {
+        let before = pairs.len();
+        pairs.retain(|p| !is_past(p));
+        let dropped = before - pairs.len();
+        if dropped > 0 {
+            info!(
+                kind,
+                dropped, "dropping control pair(s) whose window already closed (end_time <= now)"
+            );
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn build_pause_bundles(
     roles: &Roles,
@@ -1832,6 +1866,51 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(prep_expiry_steps(&roles), vec!["break-and-close", "retest"]);
+    }
+
+    // ===== past control-pair drop =======================================
+
+    #[test]
+    fn drop_past_control_pairs_removes_elapsed_windows() {
+        // One live pair (ends in the future) and one elapsed pair (ends
+        // before `now`) for each of blackout + news. Only the live pairs
+        // survive — an elapsed window has nothing left to act on, and feeding
+        // it to build_pause/news_from_spec would hard-fail as a "stale" arm.
+        let t = now().timestamp();
+        let live = (vline("ls", t + 1800), vline("le", t + 3600));
+        let past = (vline("ps", t - 7200), vline("pe", t - 3600));
+        let mut roles = Roles {
+            blackout_pairs: vec![past.clone(), live.clone()],
+            news_pairs: vec![past.clone(), live.clone()],
+            ..Default::default()
+        };
+
+        drop_past_control_pairs(&mut roles, now());
+
+        assert_eq!(roles.blackout_pairs.len(), 1);
+        assert_eq!(roles.blackout_pairs[0].1.id, "le");
+        assert_eq!(roles.news_pairs.len(), 1);
+        assert_eq!(roles.news_pairs[0].1.id, "le");
+    }
+
+    #[test]
+    fn drop_past_control_pairs_keeps_window_ending_exactly_now() {
+        // Boundary: a window whose end is in the future by one second is
+        // live; one ending exactly at `now` is treated as elapsed (the gate
+        // is `end <= now`), mirroring build_pause_from_spec's own check.
+        let t = now().timestamp();
+        let mut roles = Roles {
+            news_pairs: vec![
+                (vline("a_s", t - 60), vline("a_e", t)), // ends exactly now → past
+                (vline("b_s", t), vline("b_e", t + 1)),  // ends 1s out → live
+            ],
+            ..Default::default()
+        };
+
+        drop_past_control_pairs(&mut roles, now());
+
+        assert_eq!(roles.news_pairs.len(), 1);
+        assert_eq!(roles.news_pairs[0].1.id, "b_e");
     }
 
     // ===== M / W neckline-% gate ========================================
