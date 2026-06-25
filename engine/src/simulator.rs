@@ -136,9 +136,15 @@ pub fn simulate_fill(
                 .iter()
                 .position(|c| book_crosses(c, entry_book, trigger_price))
             {
-                // `i` indexes `after_fire`, so the fill bar is `candles[i + 1]`
-                // and the post-fill path is `candles[i + 2..]`.
-                Some(i) => (after_fire[i].time, trigger_price, &candles[i + 2..]),
+                // `i` indexes `after_fire`, so the fill bar is `candles[i + 1]`.
+                // The post-fill SL/TP search **includes** the fill bar itself
+                // (`candles[i + 1..]`): an order that fills mid-bar can be stopped
+                // out (or hit TP) later in that SAME bar — a real intrabar loss
+                // on a violent breakout bar. With only OHLC we can't order the
+                // fill vs the SL/TP touch within the bar, so Phase 2's pessimistic
+                // tie-break (SL wins on ambiguity) covers a fill bar that spans
+                // both.
+                Some(i) => (after_fire[i].time, trigger_price, &candles[i + 1..]),
                 None => return SimOutcome::NeverFilled,
             }
         }
@@ -657,5 +663,55 @@ mod tests {
             }
             other => panic!("expected TookProfit filled on the post-fire bar, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn fill_bar_can_stop_out_same_bar() {
+        // A pending order that fills mid-bar can be stopped out later in that
+        // SAME bar (a violent breakout: spikes through the entry, then reverses
+        // to the SL before the bar closes). The exit search must include the fill
+        // bar; with only OHLC the pessimistic tie-break calls a fill-bar that
+        // also spans the SL a stop-out.
+        let mut intent = long_stop_intent();
+        intent.entry = Some(EntrySpec::Stop {
+            from: PriceAnchor::Close,
+            offset_pips: 10.0, // trigger 1.1050; SL 1.1000, TP 1.1150
+            at: None,
+            recover_entry: None,
+        });
+        let shell = trigger_shell();
+
+        // Bar 1 (post-fire) fills @1.1050 AND its range reaches the SL 1.1000 in
+        // the same bar → StoppedOut, exit on this same bar.
+        let path = [
+            fire_bar(),
+            candle("2026-06-17T11:00:00Z", 1.1048, 1.1055, 1.0995, 1.1010), // fill + SL
+        ];
+        match simulate_fill(&intent, &shell, 0.0001, &path) {
+            SimOutcome::StoppedOut {
+                fill_at, exit_at, ..
+            } => {
+                assert_eq!(fill_at, ts("2026-06-17T11:00:00Z"));
+                assert_eq!(
+                    exit_at,
+                    ts("2026-06-17T11:00:00Z"),
+                    "the stop-out lands on the fill bar itself"
+                );
+            }
+            other => panic!("expected same-bar StoppedOut, got {other:?}"),
+        }
+
+        // Control: a fill bar that fills but does NOT reach SL/TP stays open.
+        let still_open = [
+            fire_bar(),
+            candle("2026-06-17T11:00:00Z", 1.1048, 1.1055, 1.1047, 1.1052), // fill only
+        ];
+        assert!(
+            matches!(
+                simulate_fill(&intent, &shell, 0.0001, &still_open),
+                SimOutcome::FilledOpen { .. }
+            ),
+            "a fill bar that doesn't reach SL/TP must stay open, not exit"
+        );
     }
 }
