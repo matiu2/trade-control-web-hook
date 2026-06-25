@@ -25,6 +25,17 @@ pub struct Fire {
     /// Bid/ask candles at or after the firing bar (ascending) — the fill
     /// simulator's input (it fills each leg on the relevant book side).
     pub forward: Vec<EngineCandle>,
+    /// The broker order id this enter placed under (`{intent.id}-{attempt_no}`),
+    /// for a gated multi-shot enter. `None` for non-enters and single-shot
+    /// enters (which never enter the gate). Used to correlate the gate's
+    /// cancel-and-replace decisions back to this fire.
+    pub order_id: Option<String>,
+    /// Set when a **later** enter superseded this fire's still-resting order
+    /// (the gate's cancel-and-replace path). A superseded order was cancelled
+    /// before it could fill, so the report must show it as cancelled — not its
+    /// standalone simulated fill. The faithful model: a new entry cancels any
+    /// resting sibling/prior order on the same setup.
+    pub superseded: bool,
 }
 
 /// The outcome of replaying a plan over a candle series.
@@ -150,15 +161,25 @@ pub async fn run(
             // An enter fire on a multi-shot plan must clear the retry gate before
             // it counts as a placement; any other fire (veto/prep, or a
             // single-shot enter) records straight through.
+            let mut order_id = None;
             if fired.intent.action == Action::Enter && is_multi_shot(&fired.intent.max_retries) {
                 match gate_enter(&replay_broker, &store, &fired, now, plan.pip_size).await {
-                    Some(()) => {}    // Proceed — record the placement.
-                    None => continue, // Rejected (open / cap) — no placement.
+                    Some(id) => order_id = Some(id), // Proceed — record the placement.
+                    None => continue,                // Rejected (open / cap) — no placement.
                 }
+                // The gate may have cancelled a prior resting order to replace it
+                // (cancel-and-replace). Stamp any superseded fire so the report
+                // shows it cancelled instead of its standalone simulated fill.
+                mark_superseded(&mut fires, &replay_broker);
             }
             // The fill simulator walks candles at/after the firing bar.
             let forward = candles[i..].to_vec();
-            fires.push(Fire { fired, forward });
+            fires.push(Fire {
+                fired,
+                forward,
+                order_id,
+                superseded: false,
+            });
         }
 
         if eval.done {
@@ -181,18 +202,35 @@ fn is_multi_shot(max_retries: &Tunable<u32>) -> bool {
     !matches!(max_retries, Tunable::Static(0))
 }
 
+/// Stamp `superseded = true` on any already-recorded enter `Fire` whose order
+/// the gate has now cancelled (cancel-and-replace). Called right after each
+/// gate `Proceed`: the gate cancels at most a prior resting order, and the
+/// matching fire is the one carrying that `order_id`. Idempotent — a fire
+/// already marked stays marked.
+fn mark_superseded(fires: &mut [Fire], broker: &ReplayBroker) {
+    let cancelled = broker.cancelled_order_ids();
+    for fire in fires.iter_mut() {
+        if let Some(id) = &fire.order_id
+            && cancelled.contains(id)
+        {
+            fire.superseded = true;
+        }
+    }
+}
+
 /// Run one multi-shot enter fire through the shared retry gate, backed by the
 /// offline broker. On `Proceed`, register the placement with the broker (so a
-/// later re-entry's gate sees this attempt) and the store, and return `Some(())`
-/// to record the fire. On any `Rejected` (a prior attempt still open, the cap
-/// reached, …) return `None` so the loop skips it — no placement happened.
+/// later re-entry's gate sees this attempt) and the store, and return the
+/// placed `order_id` to record on the fire. On any `Rejected` (a prior attempt
+/// still open, the cap reached, …) return `None` so the loop skips it — no
+/// placement happened.
 async fn gate_enter(
     broker: &ReplayBroker,
     store: &MemStateStore,
     fired: &FiredIntent,
     now: DateTime<Utc>,
     pip_size: f64,
-) -> Option<()> {
+) -> Option<String> {
     let intent = &fired.intent;
     // Reconstruct the firing shell exactly as the worker's dispatch would, so the
     // gate's `max_retries` script (if any) resolves against the same anchors.
@@ -232,7 +270,7 @@ async fn gate_enter(
                 None,
             )
             .await;
-            Some(())
+            Some(order_id)
         }
         RetryGateOutcome::Rejected { .. } => None,
     }
@@ -476,5 +514,149 @@ mod tests {
             }}"#
         ))
         .expect("parse plan")
+    }
+
+    /// A two-enter, multi-shot (strategy-v2-shaped) plan: a `stop` enter and a
+    /// `limit` enter sharing one `trade_id`, both `max_retries: 5`, both fired
+    /// by a level cross so the test needs no PinePattern geometry. Both are LONG
+    /// with the same absolute SL/TP; only the entry order type differs. This is
+    /// the cross-fire lifecycle the two bugs live in — a new entry must cancel a
+    /// resting sibling order, and must not stack on an open position.
+    fn two_enter_v2_plan() -> TradePlan {
+        serde_json::from_str(
+            r#"{
+                "trade_id": "v2",
+                "instrument": "EUR_USD",
+                "direction": "long",
+                "granularity": "h1",
+                "pip_size": 0.0001,
+                "rules": [
+                    {
+                        "rule_id": "05-enter",
+                        "trigger": { "type": "horizontal_cross", "level": 1.1050, "dir": "up", "bar": "on_close" },
+                        "fire_mode": "once",
+                        "intent": {
+                            "v": 1,
+                            "id": "v2-stop",
+                            "not_after": "2099-01-01T00:00:00Z",
+                            "action": "enter",
+                            "instrument": "EUR_USD",
+                            "direction": "long",
+                            "entry": { "type": "stop", "from": "close", "offset_pips": 0.0, "at": 1.1100 },
+                            "stop_loss": { "absolute": 1.1000 },
+                            "take_profit": { "absolute": 1.1300 },
+                            "broker": "tradenation",
+                            "trade_id": "v2",
+                            "max_retries": 5
+                        }
+                    },
+                    {
+                        "rule_id": "09-enter-qm",
+                        "trigger": { "type": "horizontal_cross", "level": 1.1060, "dir": "up", "bar": "on_close" },
+                        "fire_mode": "once",
+                        "intent": {
+                            "v": 1,
+                            "id": "v2-limit",
+                            "not_after": "2099-01-01T00:00:00Z",
+                            "action": "enter",
+                            "instrument": "EUR_USD",
+                            "direction": "long",
+                            "entry": { "type": "limit", "from": "close", "offset_pips": 0.0, "at": 1.1100 },
+                            "stop_loss": { "absolute": 1.1000 },
+                            "take_profit": { "absolute": 1.1300 },
+                            "broker": "tradenation",
+                            "trade_id": "v2",
+                            "max_retries": 5
+                        }
+                    }
+                ]
+            }"#,
+        )
+        .expect("parse v2 plan")
+    }
+
+    /// Bug 1 (cancel resting order) + Bug 2 (don't stack on an open position):
+    /// when a second enter fires while the first's order is still **resting**,
+    /// the gate must cancel-and-replace it (the first fire is `superseded`), and
+    /// the still-resting order must not go on to fill as a second position.
+    ///
+    /// Geometry (all LONG stop/limit @ 1.1100, SL 1.1000, TP 1.1300):
+    /// - bar 0..9: warm-up/seed below every level.
+    /// - bar 10: crosses 1.1050 up → `05-enter` (stop) fires, order rests @1.1100.
+    /// - bar 11: crosses 1.1060 up → `09-enter-qm` (limit) fires while the stop
+    ///   still rests (neither has reached 1.1100 yet) → gate cancels the stop →
+    ///   the stop fire is `superseded`.
+    /// - bars 12+: price rises through 1.1100 (fills the limit) then to TP.
+    /// Exactly one taken position (the limit), no overlap.
+    #[tokio::test]
+    async fn a_new_enter_cancels_a_resting_sibling_order_no_overlap() {
+        // 10 seed bars at 1.1040 (below 1.1050), then the two crosses, then a run
+        // up to TP. Keep highs below 1.1100 until bar 12 so neither order fills
+        // before the cancel-and-replace happens.
+        let mut candles: Vec<EngineCandle> = (0..10).map(|i| candle(i * 3600, 1.1040)).collect();
+        // bar 10: OnClose cross of 1.1050 (prev close 1.1040 < 1.1050 ≤ close
+        // 1.1055, and 1.1055 < 1.1060 so the limit doesn't yet cross) →
+        // `05-enter` (stop) fires once; its order rests @1.1100.
+        candles.push(ohlc(10 * 3600, 1.1045, 1.1058, 1.1042, 1.1055));
+        // bar 11: OnClose cross of 1.1060 (prev close 1.1055 < 1.1060 ≤ close
+        // 1.1065) → `09-enter-qm` (limit) fires once, while the stop's order
+        // @1.1100 is still resting (high < 1.1100 throughout).
+        candles.push(ohlc(11 * 3600, 1.1056, 1.1068, 1.1050, 1.1065));
+        // bars 12..15: rise through 1.1100 (fills) up to TP 1.1300.
+        candles.push(ohlc(12 * 3600, 1.1060, 1.1120, 1.1055, 1.1110)); // fills @1.1100
+        candles.push(ohlc(13 * 3600, 1.1110, 1.1200, 1.1100, 1.1190));
+        candles.push(ohlc(14 * 3600, 1.1190, 1.1310, 1.1185, 1.1300)); // hits TP 1.1300
+        candles.push(ohlc(15 * 3600, 1.1300, 1.1320, 1.1290, 1.1305));
+
+        let r = run(
+            &two_enter_v2_plan(),
+            &candles,
+            Granularity::H1,
+            all_live(),
+            expires(),
+        )
+        .await;
+
+        let enters: Vec<&Fire> = r
+            .fires
+            .iter()
+            .filter(|f| f.fired.intent.action == Action::Enter)
+            .collect();
+        assert_eq!(enters.len(), 2, "both enters fire (stop then limit)");
+
+        let stop = enters
+            .iter()
+            .find(|f| f.fired.rule_id == "05-enter")
+            .expect("stop enter recorded");
+        let limit = enters
+            .iter()
+            .find(|f| f.fired.rule_id == "09-enter-qm")
+            .expect("limit enter recorded");
+
+        // Bug 1: the stop order was still resting when the limit fired, so the
+        // gate cancelled-and-replaced it.
+        assert!(
+            stop.superseded,
+            "the resting stop order must be superseded by the later limit enter"
+        );
+        // Bug 2: the limit is the live entry; it isn't itself superseded, and it
+        // fills + takes profit as the *only* open position.
+        assert!(
+            !limit.superseded,
+            "the replacing limit enter is the live one, not superseded"
+        );
+
+        // The report must reflect this: the superseded stop shows SUPERSEDED (no
+        // fabricated fill), and exactly one trade is tallied (the limit's TP) —
+        // not two overlapping positions.
+        let report = crate::report::render(&two_enter_v2_plan(), &r, true);
+        assert!(
+            report.contains("SUPERSEDED"),
+            "report must show the cancelled stop as SUPERSEDED:\n{report}"
+        );
+        assert!(
+            report.contains("TP: 1  SL: 0"),
+            "exactly one taken position (the limit's TP), no overlap:\n{report}"
+        );
     }
 }

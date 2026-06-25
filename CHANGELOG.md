@@ -1,5 +1,59 @@
 # Changelog
 
+## v58 — 2026-06-25 — Replay: cancel-and-replace a resting sibling order; no overlapping positions
+
+### Why
+
+A `--strategy-v2` replay (XLM/USD, two enters — `05-enter` stop +
+`09-enter-qm` limit, both `max_retries: 5`) reported **three overlapping
+positions** the live worker would never have taken:
+
+1. A new entry firing while a prior order was still **resting** did not
+   cancel that resting order — the replay let both rest and fill
+   (cancel-and-replace was missing). *(Bug 1)*
+2. With the resting order still alive, a later entry's position **stacked
+   on top of** the prior one — two open positions at once. *(Bug 2)*
+
+The worker was always correct here: the shared retry gate
+(`core::retry_gate::evaluate`) asks the **broker** whether a prior attempt
+is resting and, on `Pending`, cancels-and-replaces it; on an open position
+it blocks. This was a **replay-only** fidelity gap — the offline
+`ReplayBroker` mis-reported a still-resting order as `Cancelled` (a free
+slot) instead of `Pending`, so the gate never took its cancel path, and
+the report then re-simulated each enter fire in isolation with no
+cross-fire awareness.
+
+### What changed
+
+- **`ReplayBroker.resolve()`**: a not-yet-filled (still-resting) order now
+  resolves to `AttemptState::Pending`, exactly what the real broker reports
+  — so the shared gate cancels-and-replaces it for a sibling/re-entry.
+  (Declined/unresolved stay `Cancelled`; a genuinely cancelled attempt is
+  still caught by the `cancelled` flag.)
+- **Cross-fire propagation**: `run()` stamps `Fire.superseded` on any
+  recorded enter whose resting order the gate later cancelled (correlated by
+  `order_id`). The report shows it as `SUPERSEDED — resting order cancelled
+  by a later entry`, not a fabricated standalone fill; `--annotate` no longer
+  draws it as a taken position.
+
+### Breaking
+
+None (replay-only; `Fire` gains `order_id` / `superseded` fields).
+
+### Tests
+
+- New `a_new_enter_cancels_a_resting_sibling_order_no_overlap` (replay.rs):
+  two-enter multi-shot plan; the resting stop is superseded by the later
+  limit, report shows `SUPERSEDED` and tallies one TP / no overlap.
+- Updated `open_then_closed_as_the_asof_bar_advances` (replay_broker.rs):
+  as-of the fire bar, a resting order is now `Pending` (was `Cancelled`).
+
+### Follow-up
+
+The decision logic is unchanged and shared; this only aligns the replay's
+broker-state reporting + journaling with what the worker already does. See
+the `strategy-changes-in-both-replayer-and-worker` memory.
+
 ## v57 — 2026-06-24 — Recover wrong-side stop entries (rename `on_too_close` → `recover_entry`)
 
 ### Why

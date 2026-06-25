@@ -39,6 +39,7 @@ mod replay_candles {
     pub mod annotate;
     pub mod brisbane;
     pub mod candles;
+    pub mod fixture;
     pub mod granularity;
     pub mod instrument;
     pub mod replay;
@@ -59,19 +60,22 @@ use tracing_error::ErrorLayer;
 use tracing_subscriber::prelude::*;
 use tracing_subscriber::{EnvFilter, fmt};
 
+use replay_candles::fixture::{self, FixtureMeta, ReplayOutcome};
 use replay_candles::source::CandleSource;
 use replay_candles::tv::TvDefaults;
 use replay_candles::{annotate, brisbane, candles, granularity, instrument, replay, report, tv};
-use trade_control_engine::{TradePlan, Trigger};
+use trade_control_engine::{BidAskCandle as EngineCandle, Granularity, TradePlan, Trigger};
 use trading_view::mcp::TvMcp;
 
 #[derive(Parser)]
 #[command(name = "replay-candles")]
 #[command(about = "Replay a candle window through the engine's decision logic, offline")]
 struct Args {
-    /// Path to the TradePlan JSON written by `tv-arm --plan-out`.
+    /// Path to the TradePlan JSON written by `tv-arm --plan-out`. Required for a
+    /// live replay; omitted (and ignored) under `--test-mode`, where the plan
+    /// comes from the saved fixture.
     #[arg(long)]
-    plan: PathBuf,
+    plan: Option<PathBuf>,
 
     /// Instrument to pull candles for (e.g. `eur/cad`). Overrides the chart's
     /// symbol; falls back to the TradingView chart, then the plan's instrument.
@@ -145,6 +149,42 @@ struct Args {
     /// fpath (or `source <(replay-candles --print-completions)`).
     #[arg(long)]
     print_completions: bool,
+
+    /// After a live replay, freeze this run's inputs (plan + the pulled candle
+    /// window + resolved meta) and its outcome into `<fixtures-dir>/<NAME>/`, a
+    /// golden regression case the test suite re-runs offline. Run it once a
+    /// replay is producing the verdict you want.
+    #[arg(long, value_name = "NAME")]
+    save: Option<String>,
+
+    /// Replay a saved fixture **offline**: load plan + candles + meta from
+    /// `<fixtures-dir>/<--fixture>/` instead of pulling from the broker (no
+    /// network, no env vars, no TradingView). Requires `--fixture`.
+    #[arg(long, requires = "fixture")]
+    test_mode: bool,
+
+    /// Name of the fixture under `<fixtures-dir>/` to replay with `--test-mode`.
+    #[arg(long, value_name = "NAME")]
+    fixture: Option<String>,
+
+    /// Under `--test-mode`, also compare the replay's outcome against the
+    /// fixture's `expected.json` and exit non-zero on any mismatch (printing the
+    /// diff). The gate proof for a fixture.
+    #[arg(long)]
+    check: bool,
+
+    /// Directory holding the saved fixtures. Defaults to `replay-fixtures` at the
+    /// repo root (relative to the cli crate's manifest).
+    #[arg(long)]
+    fixtures_dir: Option<PathBuf>,
+}
+
+/// Default fixtures directory: `<repo-root>/replay-fixtures`, resolved from the
+/// cli crate's manifest dir (`.../cli`) so it's stable regardless of cwd.
+fn default_fixtures_dir() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("replay-fixtures")
 }
 
 #[tokio::main]
@@ -163,6 +203,12 @@ async fn main() -> Result<()> {
 
     let args = Args::parse();
 
+    // `--test-mode` is a fully-offline branch: no broker, no TradingView, no
+    // env vars — everything comes from the saved fixture.
+    if args.test_mode {
+        return run_test_mode(&args).await;
+    }
+
     // `--annotate-unfilled` is a superset of `--annotate` (it adds the
     // not-taken trades), so it implies annotation is on.
     let annotate = args.annotate || args.annotate_unfilled;
@@ -174,7 +220,11 @@ async fn main() -> Result<()> {
         tracing::info!("annotation implies --simulate; running the fill simulator");
     }
 
-    let plan = load_plan(&args.plan)?;
+    let plan_path = args
+        .plan
+        .clone()
+        .ok_or_else(|| eyre!("--plan is required (or use --test-mode --fixture <name>)"))?;
+    let plan = load_plan(&plan_path)?;
 
     // Granularity comes from the plan; `--granularity` only overrides, and an
     // override must still match the plan (a mismatch would replay the wrong
@@ -225,7 +275,7 @@ async fn main() -> Result<()> {
         gran,
         pull_from,
         pull_end,
-        args.cache_dir,
+        args.cache_dir.clone(),
     )
     .await?;
     if candles.is_empty() {
@@ -261,7 +311,88 @@ async fn main() -> Result<()> {
         let drawn = annotate::annotate(&mcp, &plan, &replay, args.annotate_unfilled)?;
         println!("annotated {drawn} position(s) on the chart");
     }
+
+    if let Some(name) = &args.save {
+        let meta = FixtureMeta {
+            instrument: symbol.clone(),
+            granularity: gran.engine(),
+            source: args.source,
+            start,
+            end,
+        };
+        let expected = ReplayOutcome::compute(&plan, &replay, simulate);
+        let dir = fixtures_dir(&args).join(name);
+        fixture::save(&dir, &plan, &candles, &meta, &expected)?;
+        tracing::info!(dir = %dir.display(), "saved fixture");
+    }
+
     Ok(())
+}
+
+/// The fixtures directory: `--fixtures-dir` if given, else the repo-root default.
+fn fixtures_dir(args: &Args) -> PathBuf {
+    args.fixtures_dir
+        .clone()
+        .unwrap_or_else(default_fixtures_dir)
+}
+
+/// Replay a saved fixture offline. Loads plan + candles + meta from the fixture
+/// dir, runs the pure engine over the frozen candles, prints the report, and —
+/// under `--check` — diffs the computed outcome against `expected.json`,
+/// returning an error (non-zero exit) on any mismatch.
+async fn run_test_mode(args: &Args) -> Result<()> {
+    let name = args
+        .fixture
+        .as_deref()
+        .ok_or_else(|| eyre!("--test-mode requires --fixture <name>"))?;
+    let dir = fixtures_dir(args).join(name);
+    tracing::info!(dir = %dir.display(), "replaying fixture offline");
+
+    let inputs = fixture::load(&dir)?;
+    let replay = run_frozen(
+        &inputs.plan,
+        &inputs.candles,
+        inputs.meta.granularity,
+        inputs.meta.start,
+    )
+    .await;
+
+    print!("{}", report::render(&inputs.plan, &replay, args.simulate));
+
+    if args.check {
+        let computed = ReplayOutcome::compute(&inputs.plan, &replay, args.simulate);
+        let expected = fixture::load_expected(&dir)?;
+        if computed != expected {
+            return Err(diff_error(&expected, &computed));
+        }
+        tracing::info!("fixture matches expected.json");
+    }
+    Ok(())
+}
+
+/// Run the pure engine over a frozen candle window. Mirrors the live path's
+/// `replay::run` call, with a far-future TTL so nothing expires mid-replay (the
+/// window's own end isn't needed — the candles are fixed). `live_start` is the
+/// saved window start: frozen candles include the warm-up prefix pulled before
+/// it, so the plan goes live at `live_start` exactly as it did at save time.
+async fn run_frozen(
+    plan: &TradePlan,
+    candles: &[EngineCandle],
+    gran: Granularity,
+    live_start: DateTime<Utc>,
+) -> replay::Replay {
+    let expires_at = candles.last().map(|c| c.time).unwrap_or_else(Utc::now) + Duration::days(365);
+    replay::run(plan, candles, gran, live_start, expires_at).await
+}
+
+/// Build a readable diff error when a fixture's computed outcome diverges from
+/// its `expected.json` — the two pretty-printed JSON blobs, side by side.
+fn diff_error(expected: &ReplayOutcome, got: &ReplayOutcome) -> color_eyre::eyre::Report {
+    let exp = serde_json::to_string_pretty(expected).unwrap_or_default();
+    let act = serde_json::to_string_pretty(got).unwrap_or_default();
+    eyre!(
+        "fixture outcome does not match expected.json\n--- expected ---\n{exp}\n--- got ---\n{act}"
+    )
 }
 
 /// The fully-resolved replay window: instrument (or `None` to fall back to the
@@ -528,7 +659,7 @@ mod tests {
     /// resolver tests flip individual flags.
     fn base_args() -> Args {
         Args {
-            plan: PathBuf::from("unused.json"),
+            plan: Some(PathBuf::from("unused.json")),
             instrument: None,
             granularity: None,
             source: CandleSource::TradeNation,
@@ -541,6 +672,11 @@ mod tests {
             warmup_bars: 200,
             cache_dir: None,
             print_completions: false,
+            save: None,
+            test_mode: false,
+            fixture: None,
+            check: false,
+            fixtures_dir: None,
         }
     }
 }
