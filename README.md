@@ -1996,6 +1996,18 @@ ran before the bundles were built; fixed in Stage E.10 / v37.) The folding lives
 in `append_control_rules` (`tv-arm/src/trade_plan_build.rs`); the non-terminal
 evaluation is `evaluate_controls` (`engine/src/evaluate.rs`).
 
+The auto-fetched events are windowed over the **chart's visible range**
+(`get_range().visible_range`), widened to the trade expiry when that sits past
+the visible right edge. This is what lets you re-arm an **old** trade scrolled
+back into view and still get the news bars it overlapped — events in the visible
+window are kept even though they're all in the past relative to `now`. (Before
+this, the calendar fetch was anchored to `now` and only looked forward, so an
+old trade silently got *zero* news bars; manually drawn `news-start`/`news-end`
+pairs were unaffected and always armed.) Both the auto-draw path
+(`auto_draw_calendar_lines`) and the supplemental fetch when you've hand-drawn
+some pairs (`discover_or_fetch_calendar_bundles` → `run_calendar_bars`) use the
+visible window via the shared `calendar_window` helper.
+
 The plan builder
 is `tv-arm/src/trade_plan_build.rs` (the inverse of `alert_spec.rs`); the
 `TradePlan` / `Trigger` model lives in `core/src/trade_plan.rs`; per-trade

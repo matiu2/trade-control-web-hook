@@ -115,14 +115,17 @@ pub fn run(args: Args) -> Result<i32> {
     let should_auto_draw =
         !args.skip_calendar_bars && roles.blackout_pairs.is_empty() && roles.news_pairs.is_empty();
     if should_auto_draw {
-        // Read the trade-expiry drawing before auto-draw so we can widen
-        // the calendar lookahead to cover the full trade lifetime, not
-        // just the next ~9h H1+ buffer window. If the expiry drawing is
-        // missing or unparseable, fall back to None — auto-draw will use
-        // its default buffer window, and check_required (step 3) will
-        // surface the missing drawing as a hard error shortly anyway.
+        // Auto-draw over the chart's visible range (`view`) so rewinding
+        // an OLD trade into view still draws the news bars it overlapped.
+        // The trade-expiry drawing only widens the horizon past the
+        // visible right edge (live multi-day trades zoomed in tight); if
+        // it's missing or unparseable we fall back to None — the visible
+        // edge then bounds the window, and check_required (step 3)
+        // surfaces the missing drawing as a hard error shortly anyway.
         let expiry_hint = read_trade_expiry(&roles).ok();
-        if let Err(e) = auto_draw_calendar_lines(&mcp, &state.resolution, &resolved, expiry_hint) {
+        if let Err(e) =
+            auto_draw_calendar_lines(&mcp, &state.resolution, &resolved, view, expiry_hint)
+        {
             warn!(error = ?e, "calendar auto-draw failed; continuing with chart as-is");
         } else {
             drawings = mcp.list_drawings().wrap_err("re-list TV drawings")?;
@@ -215,6 +218,9 @@ pub fn run(args: Args) -> Result<i32> {
     } else {
         cli::BuildStrictness::Lenient
     };
+    // Capture the expiry before `trade_spec` is consumed — it bounds the
+    // supplemental calendar window in step 8 (`calendar_window`).
+    let trade_expiry = trade_spec.trade_expiry;
     let built_trade =
         cli::build_trade_from_spec(trade_spec, now, strictness).wrap_err("build trade bundle")?;
     let trade_id = built_trade.trade_id.clone();
@@ -267,6 +273,8 @@ pub fn run(args: Args) -> Result<i32> {
             &out_dir,
             &key,
             now,
+            view,
+            trade_expiry,
         )?
     };
 
@@ -1343,38 +1351,72 @@ fn read_trade_expiry(roles: &Roles) -> Result<DateTime<Utc>> {
         .ok_or_else(|| eyre!("invalid trade_expiry timestamp {expiry_unix}"))
 }
 
-/// Auto-draw vertical lines on the chart from forex-factory events
-/// over the trade's lifetime. Used when the operator hasn't drawn any
-/// blackout/news pairs themselves.
+/// Resolve the calendar event window `[window_start, lookahead_end]` from
+/// the chart's visible range (`view = (from_unix, to_unix)`), widening the
+/// right edge to the trade expiry when that sits past the visible edge.
 ///
-/// When `expiry_hint` is `Some`, the lookahead horizon is the trade
-/// expiry (so multi-day H1+ trades pick up events past the default
-/// 9h buffer). When `None` (rare: expiry drawing missing), falls back
-/// to the default buffer-only window from `plan_calendar_bars`.
+/// The left edge (`window_start`) is the load-bearing fix for old trades:
+/// events before it are dropped, events after are kept regardless of `now`,
+/// so a trade rewound into view still draws the bars it overlapped. Returns
+/// `None` when the window is empty (`lookahead_end <= window_start`).
+fn calendar_window(
+    view: (i64, i64),
+    expiry_hint: Option<DateTime<Utc>>,
+) -> Result<Option<(DateTime<Utc>, DateTime<Utc>)>> {
+    let window_start = Utc
+        .timestamp_opt(view.0, 0)
+        .single()
+        .ok_or_else(|| eyre!("invalid visible-range start {}", view.0))?;
+    let visible_end = Utc
+        .timestamp_opt(view.1, 0)
+        .single()
+        .ok_or_else(|| eyre!("invalid visible-range end {}", view.1))?;
+    let lookahead_end = match expiry_hint {
+        Some(expiry) => expiry.max(visible_end),
+        None => visible_end,
+    };
+    if lookahead_end <= window_start {
+        return Ok(None);
+    }
+    Ok(Some((window_start, lookahead_end)))
+}
+
+/// Auto-draw vertical lines on the chart from forex-factory events
+/// over the window the operator is looking at. Used when the operator
+/// hasn't drawn any blackout/news pairs themselves.
+///
+/// The window is the chart's **visible range** (`view = (from, to)`),
+/// so it works for an OLD trade rewound into view — events the trade
+/// actually overlapped (all in the past relative to `now`) are still
+/// fetched and kept. The right edge is widened to the trade expiry when
+/// that is later than the visible edge, so a live multi-day H1+ trade
+/// zoomed in tight still picks up events out to expiry.
 fn auto_draw_calendar_lines(
     mcp: &TvMcp,
     resolution: &str,
     resolved: &crate::instrument_resolution::ResolvedInstrument,
+    view: (i64, i64),
     expiry_hint: Option<DateTime<Utc>>,
 ) -> Result<()> {
     let timeframe = infer_calendar_timeframe(resolution).ok_or_else(|| {
         eyre!("chart resolution {resolution:?} is below 15m; calendar bars skipped")
     })?;
-    let now = Utc::now();
+    let (window_start, lookahead_end) = match calendar_window(view, expiry_hint)? {
+        Some(w) => w,
+        None => {
+            info!("visible window is empty — nothing to auto-draw");
+            return Ok(());
+        }
+    };
     // Synthesise the tcm Instrument straight from the catalog Asset
     // so non-FX assets (SMI, gold, indices) get correct news-currency
     // exposure without the FX-only cli::parse_instrument path.
     let instrument_parsed =
         crate::instrument_resolution::synthesize_calendar_instrument(resolved.asset);
     let runtime = tokio::runtime::Runtime::new().context("starting tokio runtime")?;
-    let events = match expiry_hint {
-        Some(expiry) if expiry > now => runtime
-            .block_on(cli::fetch_events_for_range(now, expiry))
-            .wrap_err("fetch_events_for_range")?,
-        _ => runtime
-            .block_on(cli::fetch_week_events(now))
-            .wrap_err("fetch_week_events")?,
-    };
+    let events = runtime
+        .block_on(cli::fetch_events_for_range(window_start, lookahead_end))
+        .wrap_err("fetch_events_for_range")?;
     let inputs = cli::PlanInputs {
         // trade_id isn't used for the line geometry — empty string is fine.
         trade_id: String::new(),
@@ -1382,23 +1424,20 @@ fn auto_draw_calendar_lines(
         account: String::new(),
         broker: cli::BrokerKind::Oanda,
     };
-    let plan = match expiry_hint {
-        Some(expiry) if expiry > now => cli::plan_calendar_bars_within(
-            &events,
-            &instrument_parsed,
-            timeframe.into(),
-            now,
-            expiry,
-            &inputs,
-        )
-        .wrap_err("plan_calendar_bars_within")?,
-        _ => cli::plan_calendar_bars(&events, &instrument_parsed, timeframe.into(), now, &inputs)
-            .wrap_err("plan_calendar_bars")?,
-    };
+    let plan = cli::plan_calendar_bars_within(
+        &events,
+        &instrument_parsed,
+        timeframe.into(),
+        window_start,
+        lookahead_end,
+        &inputs,
+    )
+    .wrap_err("plan_calendar_bars_within")?;
     info!(
         events_fetched = events.len(),
         events_kept = plan.rows.len(),
-        horizon = ?expiry_hint.map(|e| e.to_rfc3339()),
+        window_start = %window_start.to_rfc3339(),
+        lookahead_end = %lookahead_end.to_rfc3339(),
         "calendar fetch + plan",
     );
     if plan.rows.is_empty() {
@@ -1468,6 +1507,8 @@ fn discover_or_fetch_calendar_bundles(
     out_dir: &Path,
     key: &[u8; KEY_LEN],
     now: DateTime<Utc>,
+    view: (i64, i64),
+    trade_expiry: DateTime<Utc>,
 ) -> Result<Vec<cli::BuiltCalendarBundle>> {
     if args.skip_calendar_bars {
         return Ok(Vec::new());
@@ -1494,7 +1535,12 @@ fn discover_or_fetch_calendar_bundles(
         output_dir: Some(out_dir.join("calendar-bars").join(trade_id)),
         dry_run: false,
     };
-    let built = match cli::run_calendar_bars(cb_args, *key, now) {
+    // Window the supplemental calendar over the visible chart range
+    // (widened to the trade expiry), so arming an OLD trade with manually
+    // drawn pairs still picks up the calendar events it overlapped instead
+    // of only this week's future events.
+    let window = calendar_window(view, Some(trade_expiry))?;
+    let built = match cli::run_calendar_bars(cb_args, *key, now, window) {
         Ok(b) => b,
         Err(e) => {
             warn!(error = ?e, "calendar-bars failed; continuing without it");

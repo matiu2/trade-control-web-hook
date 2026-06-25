@@ -743,7 +743,7 @@ fn main() -> Result<()> {
         Cmd::CalendarBars(args) => {
             let key = load_key(&args.key_file)?;
             check_account_known(&args.account)?;
-            run_calendar_bars(args, key, Utc::now())?;
+            run_calendar_bars(args, key, Utc::now(), None)?;
         }
         Cmd::Instruments(sub) => run_instruments(sub)?,
         Cmd::Plan(sub) => run_plan(sub)?,
