@@ -113,15 +113,32 @@ pub fn simulate_fill(
     // long entry buys (fills on the ask book). A market entry crosses the spread
     // at once. The recorded fill price is the placed level (the resting order's
     // price), not the book extreme.
+    //
+    // `candles[0]` is the **fire bar** — the bar the enter fired on. A pending
+    // order is only placed once that bar has *closed* (the engine decides the
+    // fire on the cron tick that processes the closed bar; under
+    // `needs_confirmed` the confirmation itself isn't known until this bar's
+    // close). So a Stop/Limit order cannot interact with the fire bar's own
+    // intrabar path — the earliest bar it can fill on is the **next** one. We
+    // therefore search for the fill from `candles[1..]`. A Market entry is the
+    // exception: it fills at the fire bar's close (the shell price), which is
+    // exactly when the order is placed.
     let entry_book = book_for(Leg::Entry, dir);
     let (fill_at, entry_price, rest) = match resolved.entry {
         ResolvedEntry::Market { reference_price } => (shell.time, reference_price, candles),
         ResolvedEntry::Stop { trigger_price } | ResolvedEntry::Limit { trigger_price } => {
-            match candles
+            // Skip the fire bar (index 0): the resting order isn't live until
+            // after it closes. `get(1..)` is empty when the fire bar is the only
+            // recorded candle, yielding `NeverFilled` — correct (no later bar to
+            // fill on yet).
+            let after_fire = candles.get(1..).unwrap_or(&[]);
+            match after_fire
                 .iter()
                 .position(|c| book_crosses(c, entry_book, trigger_price))
             {
-                Some(i) => (candles[i].time, trigger_price, &candles[i + 1..]),
+                // `i` indexes `after_fire`, so the fill bar is `candles[i + 1]`
+                // and the post-fill path is `candles[i + 2..]`.
+                Some(i) => (after_fire[i].time, trigger_price, &candles[i + 2..]),
                 None => return SimOutcome::NeverFilled,
             }
         }
@@ -343,6 +360,16 @@ mod tests {
         Shell::from_candle(&candle("2026-06-17T10:00:00Z", 1.1035, 1.1045, 1.1030, 1.1040).mid())
     }
 
+    /// The **fire bar** — `candles[0]` in production, the bar the enter fired on.
+    /// A pending order isn't live until this bar closes, so `simulate_fill` skips
+    /// it for the fill search. Tests prepend this so the path matches production's
+    /// `fire.forward` shape (fire bar first, then the post-fire path). Its range
+    /// (1.1041–1.1045) deliberately misses every per-test trigger/SL/TP so its
+    /// only role is to be skipped.
+    fn fire_bar() -> BidAskCandle {
+        candle("2026-06-17T10:30:00Z", 1.1042, 1.1045, 1.1041, 1.1043)
+    }
+
     #[test]
     fn stop_entry_fills_then_takes_profit() {
         let intent = long_stop_intent();
@@ -373,7 +400,10 @@ mod tests {
         let shell = trigger_shell();
 
         // Path A: a candle reaches 1.1050 (fills), a later one reaches 1.1150 (TP).
+        // Each path leads with the fire bar (skipped — order isn't live until it
+        // closes), so the first *fillable* bar is index 1.
         let tp_path = [
+            fire_bar(),
             candle("2026-06-17T11:00:00Z", 1.1042, 1.1055, 1.1041, 1.1052), // fills @1.1050
             candle("2026-06-17T12:00:00Z", 1.1052, 1.1160, 1.1050, 1.1155), // hits TP 1.1150
         ];
@@ -391,6 +421,7 @@ mod tests {
 
         // Path B: fills, then a candle reaches the SL 1.1000.
         let sl_path = [
+            fire_bar(),
             candle("2026-06-17T11:00:00Z", 1.1042, 1.1055, 1.1041, 1.1052), // fills
             candle("2026-06-17T12:00:00Z", 1.1050, 1.1051, 1.0995, 1.1000), // hits SL 1.1000
         ];
@@ -402,13 +433,10 @@ mod tests {
         }
 
         // Path C: never reaches the trigger → NeverFilled.
-        let no_fill = [candle(
-            "2026-06-17T11:00:00Z",
-            1.1041,
-            1.1045,
-            1.1038,
-            1.1043,
-        )];
+        let no_fill = [
+            fire_bar(),
+            candle("2026-06-17T11:00:00Z", 1.1041, 1.1045, 1.1038, 1.1043),
+        ];
         assert_eq!(
             simulate_fill(&intent, &shell, 0.0001, &no_fill),
             SimOutcome::NeverFilled
@@ -416,6 +444,7 @@ mod tests {
 
         // Path D: fills but neither level touched → FilledOpen.
         let still_open = [
+            fire_bar(),
             candle("2026-06-17T11:00:00Z", 1.1042, 1.1055, 1.1041, 1.1052), // fills
             candle("2026-06-17T12:00:00Z", 1.1052, 1.1060, 1.1048, 1.1055), // neither
         ];
@@ -441,8 +470,10 @@ mod tests {
             recover_entry: None,
         });
         let shell = trigger_shell();
-        // Fills @1.1050, then a candle reaches SL 1.1000 → StoppedOut.
+        // Fills @1.1050, then a candle reaches SL 1.1000 → StoppedOut. Lead with
+        // the fire bar (skipped) so the fill lands on the realistic index 1.
         let sl_path = [
+            fire_bar(),
             candle("2026-06-17T11:00:00Z", 1.1042, 1.1055, 1.1041, 1.1052),
             candle("2026-06-17T12:00:00Z", 1.1050, 1.1051, 1.0995, 1.1000),
         ];
@@ -491,6 +522,7 @@ mod tests {
         let shell = trigger_shell();
         // One candle fills AND spans both SL and TP → pessimistic: StoppedOut.
         let both = [
+            fire_bar(),
             candle("2026-06-17T11:00:00Z", 1.1042, 1.1055, 1.1041, 1.1052), // fills @1.1050
             candle("2026-06-17T12:00:00Z", 1.1050, 1.1160, 1.0995, 1.1100), // spans SL & TP
         ];
@@ -549,7 +581,7 @@ mod tests {
             1.1004, // ask_h
             1.1000, // ask_l
         );
-        let path = [fill_bar, sl_bar];
+        let path = [fire_bar(), fill_bar, sl_bar];
 
         // The ask high (1.1031) reaches the 1.1030 SL → stopped out on the ask.
         match simulate_fill(&intent, &shell, 0.0001, &path) {
@@ -569,13 +601,61 @@ mod tests {
         // Control: if the SL bar's ASK high stops a pip *short* of the SL
         // (ask_h 1.1029 < 1.1030), the short stays open — the mid/bid reaching
         // 1.1029 must NOT trigger a close that only the ask can make.
-        let near_miss = ba_candle("2026-06-17T10:30:00Z", 1.1027, 1.1008, 1.1029, 1.1012);
+        let near_miss = ba_candle("2026-06-17T10:45:00Z", 1.1027, 1.1008, 1.1029, 1.1012);
         assert!(
             matches!(
-                simulate_fill(&intent, &shell, 0.0001, &[fill_bar, near_miss]),
+                simulate_fill(&intent, &shell, 0.0001, &[fire_bar(), fill_bar, near_miss]),
                 SimOutcome::FilledOpen { .. }
             ),
             "ask high 1.1029 misses the 1.1030 SL → still open"
         );
+    }
+
+    #[test]
+    fn pending_entry_does_not_fill_on_the_fire_bar() {
+        // The off-by-one regression (CAD/JPY 21-May confirmed short): the enter
+        // fires on the confirming bar, but a resting Stop/Limit order isn't live
+        // until that bar *closes*. So even if the fire bar's own range crosses the
+        // trigger, the fill must wait for the NEXT bar. A live worker places the
+        // order on the cron tick after the bar closes — it cannot fill the bar
+        // whose close produced the confirmation.
+        let mut intent = long_stop_intent();
+        intent.entry = Some(EntrySpec::Stop {
+            from: PriceAnchor::Close,
+            offset_pips: 10.0, // trigger 1.1050
+            at: None,
+            recover_entry: None,
+        });
+        let shell = trigger_shell();
+
+        // Fire bar already trades through the 1.1050 trigger. The OLD code filled
+        // here (index 0); the fix skips it.
+        let fire_crosses = candle("2026-06-17T10:30:00Z", 1.1045, 1.1060, 1.1044, 1.1052);
+
+        // Case 1: ONLY the fire bar crosses; nothing after → NeverFilled (not a
+        // fill on the fire bar).
+        assert_eq!(
+            simulate_fill(&intent, &shell, 0.0001, &[fire_crosses]),
+            SimOutcome::NeverFilled,
+            "a trigger-crossing fire bar must not fill — order not live until it closes"
+        );
+
+        // Case 2: fire bar crosses AND a later bar also reaches the trigger → the
+        // fill is recorded on the LATER bar (11:00), never the fire bar (10:30).
+        let path = [
+            fire_crosses,
+            candle("2026-06-17T11:00:00Z", 1.1048, 1.1055, 1.1047, 1.1052), // fills here
+            candle("2026-06-17T12:00:00Z", 1.1052, 1.1160, 1.1050, 1.1155), // TP 1.1150
+        ];
+        match simulate_fill(&intent, &shell, 0.0001, &path) {
+            SimOutcome::TookProfit { fill_at, .. } => {
+                assert_eq!(
+                    fill_at,
+                    ts("2026-06-17T11:00:00Z"),
+                    "fill must be the post-fire bar, not the fire bar"
+                );
+            }
+            other => panic!("expected TookProfit filled on the post-fire bar, got {other:?}"),
+        }
     }
 }
