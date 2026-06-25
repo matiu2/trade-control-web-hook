@@ -132,11 +132,31 @@ pub fn simulate_fill(
             // recorded candle, yielding `NeverFilled` — correct (no later bar to
             // fill on yet).
             let after_fire = candles.get(1..).unwrap_or(&[]);
-            match after_fire
+            // Bar-expiry (`expiry_bars`): the worker cancels a still-resting order
+            // `N` bars after the fire bar (its `cancel_at = next_candle_timestamp_N`).
+            // Mirror that here by bounding the fill window to the first `N` bars
+            // after the fire bar — a cross on a later bar is an order the worker
+            // would already have cancelled, so it must not fill. A static
+            // `expiry_bars` is honoured; a script-resolved one (Rhai) is beyond
+            // this pure price-path sim, so it's treated as "no bar-expiry"
+            // (unbounded), same as `None`.
+            let expiry_bars = intent
+                .expiry_bars
+                .as_ref()
+                .and_then(|t| t.as_static())
+                .copied();
+            let fill_window: &[BidAskCandle] = match expiry_bars {
+                Some(n) => after_fire
+                    .get(..(n as usize).min(after_fire.len()))
+                    .unwrap_or(&[]),
+                None => after_fire,
+            };
+            match fill_window
                 .iter()
                 .position(|c| book_crosses(c, entry_book, trigger_price))
             {
-                // `i` indexes `after_fire`, so the fill bar is `candles[i + 1]`.
+                // `i` indexes `fill_window` (a prefix of `after_fire`), so the
+                // fill bar is `candles[i + 1]`.
                 // The post-fill SL/TP search **includes** the fill bar itself
                 // (`candles[i + 1..]`): an order that fills mid-bar can be stopped
                 // out (or hit TP) later in that SAME bar — a real intrabar loss
@@ -712,6 +732,51 @@ mod tests {
                 SimOutcome::FilledOpen { .. }
             ),
             "a fill bar that doesn't reach SL/TP must stay open, not exit"
+        );
+    }
+
+    #[test]
+    fn bar_expiry_cancels_a_late_fill() {
+        // `expiry_bars = 2`: the order is live only for the 2 bars after the fire
+        // bar. A trigger cross on the 3rd bar (or later) is an order the worker
+        // would already have cancelled → NeverFilled.
+        let mut intent = long_stop_intent();
+        intent.entry = Some(EntrySpec::Stop {
+            from: PriceAnchor::Close,
+            offset_pips: 10.0, // trigger 1.1050
+            at: None,
+            recover_entry: None,
+        });
+        intent.expiry_bars = Some(Tunable::Static(2));
+        let shell = trigger_shell();
+
+        let no_cross = |t: &str| candle(t, 1.1041, 1.1045, 1.1038, 1.1043);
+
+        // Cross only on bar 3 after the fire bar (index 3 of the path) → expired.
+        let late = [
+            fire_bar(),                                                     // bar 0 (fire)
+            no_cross("2026-06-17T11:00:00Z"),                               // bar 1 (live)
+            no_cross("2026-06-17T12:00:00Z"),                               // bar 2 (live, last)
+            candle("2026-06-17T13:00:00Z", 1.1048, 1.1055, 1.1047, 1.1052), // bar 3 — too late
+        ];
+        assert_eq!(
+            simulate_fill(&intent, &shell, 0.0001, &late),
+            SimOutcome::NeverFilled,
+            "a cross after expiry_bars must not fill — order already cancelled"
+        );
+
+        // Cross on bar 2 (the last live bar) → still fills.
+        let in_time = [
+            fire_bar(),
+            no_cross("2026-06-17T11:00:00Z"),
+            candle("2026-06-17T12:00:00Z", 1.1048, 1.1055, 1.1047, 1.1052), // bar 2 — fills
+        ];
+        assert!(
+            matches!(
+                simulate_fill(&intent, &shell, 0.0001, &in_time),
+                SimOutcome::FilledOpen { .. }
+            ),
+            "a cross on the last live bar still fills"
         );
     }
 }
