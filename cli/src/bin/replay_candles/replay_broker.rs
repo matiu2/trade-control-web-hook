@@ -310,27 +310,43 @@ mod tests {
 
     #[tokio::test]
     async fn open_then_closed_as_the_asof_bar_advances() {
-        // Short fills when the bid reaches 1.1000 (bar 0), then the SL at 1.1020
-        // is hit only on the later bar. So as-of bar 0 → OpenPosition; as-of the
-        // SL bar → ClosedLossOrBreakeven. Time-accurate prior-state resolution.
-        let sl_bar = candle(3600, 1.1021);
-        let candles = vec![candle(0, 1.1000), sl_bar];
+        // The attempt fires on bar 0 (its shell bar); a resting order isn't live
+        // until that bar closes, so the fill can only land on bar 1 onward (the
+        // fire-bar skip in `simulate_fill`). Here the bid reaches the 1.1000
+        // sell-stop on bar 1 (fill), then the SL at 1.1020 is hit on bar 2. So
+        // as-of bar 0 → not yet filled (Cancelled-as-free); as-of bar 1 →
+        // OpenPosition; as-of bar 2 → ClosedLossOrBreakeven.
+        let fire_bar = candle(0, 1.1010); // shell/fire bar — above the trigger, no fill
+        let fill_bar = candle(3600, 1.1000); // bid reaches the 1.1000 sell-stop
+        let sl_bar = candle(7200, 1.1021); // SL 1.1020 hit
+        let candles = vec![fire_bar, fill_bar, sl_bar];
         let b = ReplayBroker::new(candles, 0.0001);
-        let shell = Shell::from_candle(&candle(0, 1.1000).mid());
+        let shell = Shell::from_candle(&fire_bar.mid());
         b.record_attempt("o1".into(), short_enter_intent(), shell);
 
+        // As-of the fire bar: order placed but not live until it closes → no fill
+        // yet → the slot is free (Cancelled in this offline model).
         b.set_as_of(Utc.timestamp_opt(0, 0).unwrap());
+        let at_fire = b.lookup_attempt_state("EUR/USD", "o1", None).await.unwrap();
+        assert!(
+            matches!(at_fire, AttemptState::Cancelled),
+            "fire bar can't fill the resting order → free slot, got {at_fire:?}"
+        );
+
+        // As-of bar 1: filled, not yet stopped → open.
+        b.set_as_of(Utc.timestamp_opt(3600, 0).unwrap());
         let early = b.lookup_attempt_state("EUR/USD", "o1", None).await.unwrap();
         assert!(
             matches!(early, AttemptState::OpenPosition { .. }),
-            "filled but not yet stopped by bar 0 → open, got {early:?}"
+            "filled on bar 1, not yet stopped → open, got {early:?}"
         );
 
-        b.set_as_of(Utc.timestamp_opt(3600, 0).unwrap());
+        // As-of bar 2: SL hit → closed.
+        b.set_as_of(Utc.timestamp_opt(7200, 0).unwrap());
         let late = b.lookup_attempt_state("EUR/USD", "o1", None).await.unwrap();
         assert!(
             matches!(late, AttemptState::ClosedLossOrBreakeven { .. }),
-            "SL hit by the later bar → closed, got {late:?}"
+            "SL hit by bar 2 → closed, got {late:?}"
         );
     }
 }
