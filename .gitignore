@@ -3,4 +3,5 @@ target/
 .dev.vars
 scripts/__pycache__/
 scripts/tmp.json
-candle_cache
+# replay-candles disk cache (transient; candles are frozen into replay-fixtures/ instead)
+candle_cache/

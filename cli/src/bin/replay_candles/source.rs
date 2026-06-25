@@ -1,6 +1,7 @@
 //! Which broker candle-cache pulls (and caches) candles from.
 
 use clap::ValueEnum;
+use serde::{Deserialize, Serialize};
 
 /// Which broker candle-cache pulls (and caches) candles from. **Both** sources
 /// always go through candle-cache, so either choice fills the on-disk cache and
@@ -9,8 +10,9 @@ use clap::ValueEnum;
 /// that's the default: it reproduces what the engine actually saw. OANDA is
 /// offered because it needs no TradeNation session; its mid prices differ
 /// slightly from TradeNation's.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Serialize, Deserialize)]
 #[clap(rename_all = "lowercase")]
+#[serde(rename_all = "lowercase")]
 pub enum CandleSource {
     /// TradeNation candles via candle-cache (matches the live engine).
     TradeNation,
