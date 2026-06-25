@@ -86,6 +86,13 @@ pub fn resolve_fire_any(plan: &TradePlan, fire: &Fire) -> Option<FireResult> {
     if intent.action != Action::Enter {
         return None;
     }
+    // A superseded enter never went on (its resting order was cancelled by a
+    // later entry before it could fill), so there's no position to annotate —
+    // not even a not-taken intended bracket: the cancel-and-replace means the
+    // *replacing* entry is the one that carries the bracket forward.
+    if fire.superseded {
+        return None;
+    }
     let candle = &fire.fired.candle;
     let shell = match &fire.fired.signal {
         Some(sig) => Shell::from_candle_and_signal(candle, sig),
@@ -230,6 +237,14 @@ fn render_fire(
             describe_order(&resolved, plan.pip_size)
         )),
         Err(err) => line.push_str(&format!("    order: UNRESOLVED — {err:?}\n")),
+    }
+
+    // A superseded enter had its resting order cancelled by a later entry
+    // (cancel-and-replace) before it could fill, so its standalone simulated
+    // fill is fiction — report the cancellation instead and don't tally it.
+    if fire.superseded {
+        line.push_str("    fill: SUPERSEDED — resting order cancelled by a later entry (cancel-and-replace)\n");
+        return line;
     }
 
     let outcome = simulate_fill(intent, &shell, plan.pip_size, &fire.forward);

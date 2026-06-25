@@ -79,6 +79,19 @@ impl ReplayBroker {
         });
     }
 
+    /// The order ids the gate has cancelled so far (the cancel-and-replace
+    /// path — a later sibling/re-entry superseded a still-resting order). The
+    /// replay loop reads this after each gate call to stamp the superseded
+    /// `Fire` so the report shows it as cancelled, not a fabricated fill.
+    pub fn cancelled_order_ids(&self) -> Vec<String> {
+        self.placed
+            .borrow()
+            .iter()
+            .filter(|a| a.cancelled)
+            .map(|a| a.order_id.clone())
+            .collect()
+    }
+
     /// Candles up to and including the `as_of` bar — the slice a prior attempt
     /// is simulated against. Bounding here is what makes re-entry time-accurate.
     fn window_to_as_of(&self) -> Vec<BidAskCandle> {
@@ -112,13 +125,22 @@ impl ReplayBroker {
             SimOutcome::FilledOpen { .. } => AttemptState::OpenPosition {
                 broker_trade_id: format!("{}-pos", attempt.order_id),
             },
-            // Never filled by now, or declined/unresolved — the order isn't a
-            // live position. Treat as cancelled (the slot is free): a pending
-            // order that never filled by the asking bar isn't blocking a fresh
-            // signal-bar entry in this offline model.
-            SimOutcome::NeverFilled | SimOutcome::Declined { .. } | SimOutcome::Unresolved(_) => {
-                AttemptState::Cancelled
-            }
+            // Not filled by the asking bar = a still-**resting** order, exactly
+            // what the real broker reports as `Pending`. This is load-bearing
+            // for strategy-v2: a sibling enter (QM limit vs break-and-close stop)
+            // firing on a later bar must see the prior resting order as `Pending`
+            // so the gate **cancels and replaces** it (cancel-and-replace), and
+            // so a still-resting order can't go on to fill alongside the new one.
+            // Returning `Cancelled` here (the old behaviour) silently let both
+            // orders rest+fill → overlapping positions (Bug 1 + Bug 2). A
+            // genuinely cancelled order is caught above by `attempt.cancelled`.
+            // (`expiry_bars`-driven expiry is folded into `simulate_fill`'s fill
+            // window, so an expired order resolves to `NeverFilled`/`Pending`
+            // here too — these v2 plans don't set `expiry_bars`, and the gate's
+            // cap/window bound the re-entry count regardless.)
+            SimOutcome::NeverFilled => AttemptState::Pending,
+            // Declined / unresolved — no order ever went on; the slot is free.
+            SimOutcome::Declined { .. } | SimOutcome::Unresolved(_) => AttemptState::Cancelled,
         }
     }
 }
@@ -314,8 +336,8 @@ mod tests {
         // until that bar closes, so the fill can only land on bar 1 onward (the
         // fire-bar skip in `simulate_fill`). Here the bid reaches the 1.1000
         // sell-stop on bar 1 (fill), then the SL at 1.1020 is hit on bar 2. So
-        // as-of bar 0 → not yet filled (Cancelled-as-free); as-of bar 1 →
-        // OpenPosition; as-of bar 2 → ClosedLossOrBreakeven.
+        // as-of bar 0 → not filled yet, but the order is **resting** (Pending);
+        // as-of bar 1 → OpenPosition; as-of bar 2 → ClosedLossOrBreakeven.
         let fire_bar = candle(0, 1.1010); // shell/fire bar — above the trigger, no fill
         let fill_bar = candle(3600, 1.1000); // bid reaches the 1.1000 sell-stop
         let sl_bar = candle(7200, 1.1021); // SL 1.1020 hit
@@ -324,13 +346,14 @@ mod tests {
         let shell = Shell::from_candle(&fire_bar.mid());
         b.record_attempt("o1".into(), short_enter_intent(), shell);
 
-        // As-of the fire bar: order placed but not live until it closes → no fill
-        // yet → the slot is free (Cancelled in this offline model).
+        // As-of the fire bar: order placed but not yet filled (can't fill on its
+        // own fire bar). It's a live **resting** order → Pending, exactly what the
+        // real broker reports — so a sibling enter would cancel-and-replace it.
         b.set_as_of(Utc.timestamp_opt(0, 0).unwrap());
         let at_fire = b.lookup_attempt_state("EUR/USD", "o1", None).await.unwrap();
         assert!(
-            matches!(at_fire, AttemptState::Cancelled),
-            "fire bar can't fill the resting order → free slot, got {at_fire:?}"
+            matches!(at_fire, AttemptState::Pending),
+            "fire bar can't fill the resting order, but it's resting → Pending, got {at_fire:?}"
         );
 
         // As-of bar 1: filled, not yet stopped → open.
