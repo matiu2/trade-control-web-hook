@@ -101,19 +101,24 @@ pub fn plan_calendar_bars(
     plan_calendar_bars_within(events, instrument, timeframe, now, lookahead_end, inputs)
 }
 
-/// Plan calendar bars across an explicit horizon `[now, lookahead_end]`.
-/// Filters by impact (per `timeframe.min_blocking_impact()`) and the
-/// instrument's `is_affected_by(currency)` rule, then splits each kept
+/// Plan calendar bars across an explicit window `[window_start,
+/// lookahead_end]`. Filters by impact (per `timeframe.min_blocking_impact()`)
+/// and the instrument's `is_affected_by(currency)` rule, then splits each kept
 /// event into a pause-spec (`[event - buffer_before, event]`) and a
 /// news-spec (`[event, event + buffer_after]`).
 ///
-/// Pure — no I/O, no signing. Empty range (`lookahead_end <= now`)
+/// `window_start` is the lower bound: events at or before it are dropped.
+/// Live arming passes `now` (only future events matter). Replaying an *old*
+/// trade passes the chart's visible-range start, so events the trade actually
+/// overlapped — all in the past relative to `now` — are still kept.
+///
+/// Pure — no I/O, no signing. Empty range (`lookahead_end <= window_start`)
 /// returns an empty plan.
 pub fn plan_calendar_bars_within(
     events: &[EconomicEvent],
     instrument: &Instrument,
     timeframe: Timeframe,
-    now: DateTime<Utc>,
+    window_start: DateTime<Utc>,
     lookahead_end: DateTime<Utc>,
     inputs: &PlanInputs,
 ) -> Result<CalendarBarPlan> {
@@ -124,7 +129,7 @@ pub fn plan_calendar_bars_within(
     let mut rows: Vec<CalendarBarRow> = Vec::new();
     for ev in events {
         let event_utc = ev.datetime.with_timezone(&Utc);
-        if event_utc <= now {
+        if event_utc <= window_start {
             continue;
         }
         if event_utc > lookahead_end {
@@ -552,10 +557,17 @@ pub fn print_summary_table(plan: &CalendarBarPlan) {
 /// Sync entry point for the binary. Builds its own multi-thread tokio
 /// runtime for the single async fetch — keeps the rest of the CLI sync
 /// and avoids forcing every other subcommand into `#[tokio::main]`.
+///
+/// `window` overrides the event window. `None` is the standalone-CLI
+/// default: fetch the current week and plan the next buffer window from
+/// `now`. `Some((start, end))` (passed by tv-arm with the chart's
+/// visible range) fetches and plans `[start, end]`, so arming an OLD
+/// trade still picks up the calendar events it overlapped.
 pub fn run_calendar_bars(
     args: CalendarBarsArgs,
     key: [u8; KEY_LEN],
     now: DateTime<Utc>,
+    window: Option<(DateTime<Utc>, DateTime<Utc>)>,
 ) -> Result<Vec<BuiltCalendarBundle>> {
     let instrument = parse_instrument(&args.instrument, args.broker.into())?;
     let timeframe: Timeframe = args.timeframe.into();
@@ -567,13 +579,24 @@ pub fn run_calendar_bars(
     };
 
     let runtime = tokio::runtime::Runtime::new().context("starting tokio runtime")?;
-    let events = runtime.block_on(fetch_week_events(now))?;
-    let plan = plan_calendar_bars(&events, &instrument, timeframe, now, &inputs)?;
+    let (events_fetched, plan) = match window {
+        Some((start, end)) => {
+            let events = runtime.block_on(fetch_events_for_range(start, end))?;
+            let plan =
+                plan_calendar_bars_within(&events, &instrument, timeframe, start, end, &inputs)?;
+            (events.len(), plan)
+        }
+        None => {
+            let events = runtime.block_on(fetch_week_events(now))?;
+            let plan = plan_calendar_bars(&events, &instrument, timeframe, now, &inputs)?;
+            (events.len(), plan)
+        }
+    };
 
     println!("trade_id: {}", args.trade_id);
     println!("instrument: {}", args.instrument);
     println!("timeframe: {timeframe}");
-    println!("events_fetched: {}", events.len());
+    println!("events_fetched: {events_fetched}");
     println!("events_kept: {}", plan.rows.len());
     print_summary_table(&plan);
 
@@ -707,6 +730,35 @@ mod tests {
             "expiry-wide window must keep the Bailey event"
         );
         assert_eq!(plan_wide.rows[0].event_name, "BOE Gov Bailey Speaks");
+    }
+
+    #[test]
+    fn within_keeps_past_events_when_window_start_is_in_the_past() {
+        // Replaying an OLD trade: `now` is well after the trade's window, but
+        // `window_start`/`lookahead_end` come from the chart's visible range,
+        // which sits entirely in the past. Events inside that window — though
+        // all `<= now` — must still be kept, so the news bars get drawn.
+        let window_start = ts("2026-06-01T06:00:00Z");
+        let lookahead_end = ts("2026-06-03T11:00:00Z");
+        let events = vec![
+            // Before the visible window — dropped.
+            ev("Stale CPI", "EUR", Impact::High, "2026-05-30T08:00:00Z"),
+            // Inside the visible window, but in the past relative to "now".
+            ev("ECB Rate", "EUR", Impact::High, "2026-06-02T12:00:00Z"),
+            // After the visible window — dropped.
+            ev("Later NFP", "USD", Impact::High, "2026-06-04T13:30:00Z"),
+        ];
+        let plan = plan_calendar_bars_within(
+            &events,
+            &eur_usd(),
+            Timeframe::H1Plus,
+            window_start,
+            lookahead_end,
+            &inputs(),
+        )
+        .unwrap();
+        assert_eq!(plan.rows.len(), 1, "only the in-window past event is kept");
+        assert_eq!(plan.rows[0].event_name, "ECB Rate");
     }
 
     #[test]
