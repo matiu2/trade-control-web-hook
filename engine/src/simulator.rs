@@ -20,6 +20,31 @@
 //! rejections — only the price-path fill/exit. Replaying the recorded
 //! `dispatch_outcomes` through the real handlers needs the `Response` decouple
 //! and is a separate, later task.
+//!
+//! ## Known optimism vs a real broker (deliberate v1 simplifications)
+//!
+//! These make the sim report outcomes a *little* better than reality. They are
+//! intentional — modelling them needs live quotes / KV state the offline replay
+//! doesn't have — but a future debugger should know the replay is optimistic on:
+//!
+//! - **Gap fills priced at the resting level.** A bar that gaps *through* a stop
+//!   trigger / SL fills at the gapped book extreme on a real broker, not the
+//!   requested level. We record the placed level (`book_crosses` is a boolean
+//!   touch). Optimistic for stop entries and stop-loss exits.
+//! - **Market entry fills at mid.** `ResolvedEntry::Market` books the mid close,
+//!   not the spread-crossed price (buy the ask / sell the bid). Optimistic by the
+//!   half-spread.
+//! - **No KV-state or live-quote gates.** The worker's `run_enter` also applies
+//!   cooldown, KV vetos, prep ordering, account caps, the `allow_entry` script,
+//!   the seen-id replay check, the SL≥10×spread floor, spread-blackout,
+//!   market-hours blackout, and news windows. The replay applies none of these
+//!   (only the at-entry-level veto below), so it can report fires/fills the
+//!   worker would reject.
+//!
+//! What *is* modelled faithfully (don't "simplify" these away): the fire-bar skip
+//! (a pending order can't fill on the bar that fired it), same-bar fill-and-stop
+//! (the fill bar is in the exit search, pessimistic on SL/TP ties), per-bar
+//! bid/ask book selection, and bar-expiry (`expiry_bars` bounds the fill window).
 
 use trade_control_core::broker::BidAskCandle;
 use trade_control_core::intent::{Direction, Intent, Resolved, ResolvedEntry, Shell};
