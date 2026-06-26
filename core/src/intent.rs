@@ -1546,7 +1546,7 @@ fn default_close_anchor() -> PriceAnchor {
 }
 
 /// Entry order spec.
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum EntrySpec {
     /// Market order at current price (we use the plaintext `close` as the

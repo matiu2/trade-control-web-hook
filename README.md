@@ -137,7 +137,7 @@ Basename ordering matters — `tv-arm` maps drawings to alerts by prefix.
 | `03-prep-break-and-close` | `prep` | Trendline crossing (neckline break) | Skippable for stocks / late entries with `--skip-break-and-close`. |
 | `04-prep-retest` | `prep` | Trendline crossing (retest from below) | Skippable with `--skip-retest`. |
 | `05-enter` | `enter` | Pine `Candle Signals` golden candle | The actual trade. Gated on the preps above + opposing-direction veto absent. |
-| `09-enter-qm` | `enter` | Pine `Candle Signals` (same detector as `05-enter`) | **`tv-arm --strategy-v2` only.** The Quasimodo limit entry, armed alongside `05-enter`: no preps, confirmed-candle gated, `EntrySpec::Limit` resting at the signal level. Shares the trade's `trade_id` + `max_retries` with `05-enter`; first of the two to fire cancels the other's resting order (worker retry gate). See "Dual entry — `--strategy-v2`" below. |
+| `09-enter-qm` | `enter` | Pine `Candle Signals` (same detector as `05-enter`) | **`tv-arm --strategy-v2` only.** The Quasimodo entry, armed alongside `05-enter`: no preps, confirmed-candle gated. Its entry spec is **identical to standalone `--quasimodo`** — a stop at signal_low − 1 pip with a `recover_entry: limit` fallback (fills on the pullback when the level was overrun), *not* a bare limit. Shares the trade's `trade_id` + `max_retries` with `05-enter`; first of the two to fire cancels the other's resting order (worker retry gate). See "Dual entry — `--strategy-v2`" below. |
 | `06-close-on-reversal` | `close` | Pine `Candle Signals` opposing reversal | Emitted when news-pairs and/or `support`/`resistance` lines are drawn. Carries `inside_window: [news?, price?]` (OR-composed) and, when `price` is listed, `sr_bands: [[lo, hi], ...]`. Defaults `needs_golden: true` for the candle-quality gate. With `tv-arm --veto-on-reversal` (experimental) it also carries `veto_on_reversal: true`, so a reversal off a band before entry vetoes the upcoming trade — see the `close` action notes above. |
 | `08-prep-expire-<step>` | `prep-expire` | Vertical line crossing chart time | Emitted once per chart-drawn `<prep>-expiry` line (`break-and-close-expiry`, `retest-expiry`). When crossed, blocks any further `<step>` prep on the trade — so a setup whose prep lands too late never enters. Drawing-bound. `<step>` is the canonical prep name and may contain hyphens. |
 
@@ -1962,10 +1962,21 @@ once**, competing for the same trade:
 1. **Stop entry** — the normal one: gated by the break-and-close + retest
    preps and a confirmed signal candle, placed as a stop order that triggers
    on a break *through* the signal level.
-2. **Quasimodo (QM) limit** — no preps at all, gated only on a confirmed
-   signal candle, placed as a **limit** order resting at the *same* signal
-   level. It fills on a pullback *back* to the level (the mirror of the stop's
-   break-through).
+2. **Quasimodo (QM) entry** — no preps at all, gated only on a confirmed
+   signal candle. Its order spec is **identical to standalone `--quasimodo`**:
+   a stop at the signal level (signal_low − 1 pip for a short) carrying a
+   `recover_entry: limit` fallback. It fires as a resting stop on a normal
+   break, and when the signal candle has already overrun the level the engine
+   recovers it to a **limit** resting at the level — so it still fills on the
+   pullback *back* to the level, the mirror of the break-through.
+
+   > Earlier strategy-v2 builds armed this leg as a bare `EntrySpec::Limit` at
+   > the level with *no* recovery. For a short whose confirmation candle closed
+   > below the level, that limit is geometry-invalid (a sell-limit must rest
+   > above market), so the engine rejected it and — with no recovery — dropped
+   > the whole leg silently, forfeiting a winning entry (demo trade 031,
+   > CAD/JPY). The QM leg now shares standalone `--quasimodo`'s exact spec so
+   > the two can never diverge again.
 
 This is **not** `--quasimodo`, which runs the QM setup *instead of* the stop
 entry. strategy-v2 runs both. The bundle gains a second enter alert,
