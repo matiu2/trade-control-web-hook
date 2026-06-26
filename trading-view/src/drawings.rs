@@ -111,6 +111,32 @@ impl Drawing {
     pub fn prices(&self) -> Vec<f64> {
         self.points.iter().map(|p| p.price).collect()
     }
+
+    /// Earliest anchor time across all the drawing's points (the start
+    /// of its time-span). Mirror of [`Self::latest_time`]. Returns `0`
+    /// for a point-less drawing.
+    pub fn earliest_time(&self) -> i64 {
+        self.points.iter().map(|p| p.time).min().unwrap_or(0)
+    }
+
+    /// Does this drawing's time-span **intersect** the visible window
+    /// `[from, to]` (inclusive)?
+    ///
+    /// Intersection, not containment: a trend line with one anchor left
+    /// of `from` and one right of `to` spans the whole view and counts as
+    /// in-window. A single-anchor drawing (horizontal / vertical line)
+    /// has a zero-width span, so this reduces to "its anchor sits in
+    /// `[from, to]`". A drawing whose entire span is to the left of `from`
+    /// or to the right of `to` does **not** intersect.
+    ///
+    /// A point-less drawing (no anchors) is treated as not in any window.
+    pub fn intersects_window(&self, from: i64, to: i64) -> bool {
+        if self.points.is_empty() {
+            return false;
+        }
+        // Spans overlap iff each starts at or before the other ends.
+        self.earliest_time() <= to && self.latest_time() >= from
+    }
 }
 
 /// Vertical lines have a single anchor; `TimedAnchor` returns that
@@ -309,6 +335,56 @@ mod tests {
         let d: Drawing = serde_json::from_str(json).unwrap();
         assert_eq!(d.properties.stop_level, None);
         assert_eq!(d.properties.profit_level, None);
+    }
+
+    fn pts(times: &[i64]) -> Drawing {
+        Drawing {
+            id: "x".into(),
+            points: times
+                .iter()
+                .map(|&t| Point {
+                    time: t,
+                    price: 1.0,
+                })
+                .collect(),
+            properties: Properties::default(),
+        }
+    }
+
+    #[test]
+    fn intersects_window_single_anchor_inside() {
+        assert!(pts(&[150]).intersects_window(100, 200));
+        assert!(pts(&[100]).intersects_window(100, 200)); // on the from edge
+        assert!(pts(&[200]).intersects_window(100, 200)); // on the to edge
+    }
+
+    #[test]
+    fn intersects_window_single_anchor_outside() {
+        assert!(!pts(&[50]).intersects_window(100, 200)); // left of window
+        assert!(!pts(&[250]).intersects_window(100, 200)); // right of window
+    }
+
+    #[test]
+    fn intersects_window_span_crossing_or_overlapping() {
+        // Span fully inside.
+        assert!(pts(&[120, 180]).intersects_window(100, 200));
+        // Span straddles the whole view (one anchor each side).
+        assert!(pts(&[50, 300]).intersects_window(100, 200));
+        // Span overlaps the left edge only.
+        assert!(pts(&[50, 150]).intersects_window(100, 200));
+        // Span overlaps the right edge only.
+        assert!(pts(&[150, 300]).intersects_window(100, 200));
+    }
+
+    #[test]
+    fn intersects_window_span_fully_outside() {
+        assert!(!pts(&[10, 90]).intersects_window(100, 200)); // entirely left
+        assert!(!pts(&[210, 300]).intersects_window(100, 200)); // entirely right
+    }
+
+    #[test]
+    fn intersects_window_pointless_drawing_is_never_in_window() {
+        assert!(!pts(&[]).intersects_window(0, i64::MAX));
     }
 
     #[test]
