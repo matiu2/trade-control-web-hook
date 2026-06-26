@@ -22,9 +22,9 @@
 //! plan-state **re-seed** (`tick_one` → `seed_first_tick` → `seed_plan_state`
 //! when `get_plan_state` returns `None`) advances the watermark to the newest
 //! candle and **fires nothing**, so any cross already in the un-processed gap is
-//! skipped forever (the next fetch only asks for `> watermark`). The
+//! skipped forever (the next fetch only asks for newer-than-watermark). The
 //! wall-clock `trade-expiry` survives a re-seed (it re-becomes true at any tick
-//! >= its epoch); a price-cross veto does not. That matches the experimental
+//! at or after its epoch); a price-cross veto does not. That matches the experimental
 //! twin exactly: watermark jumped past the cross, only trade-expiry fired. A KV
 //! TTL lapse / read-miss / non-landing `put` on one account's state row — but
 //! not the other's, registered 2 min apart — is enough to diverge the twins.

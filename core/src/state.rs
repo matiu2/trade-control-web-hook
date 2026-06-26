@@ -2109,7 +2109,9 @@ mod memstore {
             trade_id: &str,
         ) -> Result<(), StateError> {
             let prefix = format!("control-event:{}:{trade_id}:", account_scope(account));
-            self.inner.borrow_mut().retain(|k, _| !k.starts_with(&prefix));
+            self.inner
+                .borrow_mut()
+                .retain(|k, _| !k.starts_with(&prefix));
             Ok(())
         }
 
@@ -3702,17 +3704,13 @@ mod tests {
         pollster::block_on(store.record_control_event(Some("reversals"), "hs-1", &b)).unwrap();
         pollster::block_on(store.record_control_event(Some("reversals"), "hs-1", &a)).unwrap();
 
-        let got =
-            pollster::block_on(store.list_control_events(Some("reversals"), "hs-1")).unwrap();
+        let got = pollster::block_on(store.list_control_events(Some("reversals"), "hs-1")).unwrap();
         assert_eq!(got, vec![a.clone(), b.clone()]);
 
         // The audit row is no-TTL (far-future expiry), so it outlives the live
         // control row it records.
         let exp = store
-            .expiry_of(&format!(
-                "control-event:reversals:hs-1:{}",
-                a.key_suffix()
-            ))
+            .expiry_of(&format!("control-event:reversals:hs-1:{}", a.key_suffix()))
             .expect("control-event stored");
         assert!(exp > Utc::now() + chrono::Duration::days(365));
 

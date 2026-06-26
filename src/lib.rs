@@ -16,6 +16,7 @@ mod cron;
 mod diag;
 mod market_blackout;
 mod market_info;
+mod r2_purge;
 mod recover_entry;
 mod spread_blackout;
 mod state;
@@ -249,6 +250,15 @@ pub async fn main(mut req: Request, env: Env, ctx: Context) -> Result<Response> 
             Action::PlanList => break 'intent handle_plan_list(&store, &verified, now).await,
             Action::PlanShow => break 'intent handle_plan_show(&store, &verified, now).await,
             Action::PlanDelete => break 'intent handle_plan_delete(&store, &verified, now).await,
+            // PlanPurge / PurgeOlderThan touch R2 (the `env`), so — like
+            // MarketInfo — they're dispatched here with `env` in scope rather
+            // than through the broker-less `run_action`.
+            Action::PlanPurge => {
+                break 'intent handle_plan_purge(&store, &env, &verified, now).await;
+            }
+            Action::PurgeOlderThan => {
+                break 'intent handle_purge_older_than(&env, &verified, now).await;
+            }
             _ => {}
         }
 
@@ -552,6 +562,8 @@ async fn run_action<B: Broker>(
         | Action::PlanList
         | Action::PlanShow
         | Action::PlanDelete
+        | Action::PlanPurge
+        | Action::PurgeOlderThan
         // MarketInfo needs the concrete TradeNation broker (its `market_info`
         // is not on the generic `Broker` trait), so it's dispatched in the
         // broker-acquire section before this generic function — never here.
@@ -1826,13 +1838,13 @@ pub(crate) async fn run_enter<B: Broker>(
                 // (no longer aged out with its EntryAttempt). Best-effort: a
                 // write failure only costs the blackout-restore ability for this
                 // one order, never the placement.
-                if let Some(body) = raw_body {
-                    if let Err(err) = store.put_order_body(&order_id, body).await {
-                        rlog_err!(
-                            "order-body store for blackout-restore failed (order={order_id}): {err} \
-                             — this order can't be blackout-cancelled+restored"
-                        );
-                    }
+                if let Some(body) = raw_body
+                    && let Err(err) = store.put_order_body(&order_id, body).await
+                {
+                    rlog_err!(
+                        "order-body store for blackout-restore failed (order={order_id}): {err} \
+                         — this order can't be blackout-cancelled+restored"
+                    );
                 }
                 ActionResult::Ok(format!("entered: order={order_id}"))
             }
@@ -2194,6 +2206,7 @@ pub(crate) async fn record_seen<S: StateStore>(
 /// Skipped when there's no `trade_id` to scope it to (the trail is per-trade;
 /// a `cooldown`/blackout set without a trade_id can't be journaled per trade).
 /// `request_id` links the event back to its R2 `req/` bundle when known.
+#[allow(clippy::too_many_arguments)]
 async fn record_control_event_for<S: StateStore>(
     store: &S,
     account: Option<&str>,
@@ -3331,6 +3344,141 @@ async fn handle_plan_delete(
     };
     record_seen(store, verified, now, &outcome).await;
     Response::ok(outcome)
+}
+
+/// Handle the `plan-purge` action: delete **every** trace of a journaled trade.
+///
+/// A superset of [`handle_plan_delete`]. Beyond the `plan:` / `plan-state:` /
+/// `archived-plan:` rows that delete drops, purge also clears the no-TTL
+/// per-trade lifecycle rows — `entry-attempt:` (and the `order-body:` rows their
+/// `broker_trade_id`/order ids point at), `control-event:` — plus the
+/// enumerable trade-scoped control rows (`pause:` / `news:`), and deletes the
+/// trade's R2 `ticks/` bundles. Idempotent: purging a trade with nothing left is
+/// a no-op `ok`, not an error.
+///
+/// `veto:` / `prep:` rows are intentionally **not** swept here: they keep their
+/// window TTL (expiry is their feature) and self-clear, and their lifecycle is
+/// already captured durably in the `control-event:` trail this purge drops. So
+/// purge removes the *audit + lifecycle* state, not the still-live control gates
+/// (which a purge of a finished trade has none of anyway).
+async fn handle_plan_purge(
+    store: &KvStateStore,
+    env: &Env,
+    verified: &incoming::Verified,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<Response> {
+    let Some(target) = verified.intent.trade_id.as_deref() else {
+        return Response::error("plan-purge requires a `trade_id`", 400);
+    };
+
+    // 1) Drop the plan / state / archived rows across every scope (same scan as
+    //    plan-delete). We re-list rather than call handle_plan_delete so we keep
+    //    the per-scope account for the lifecycle-row clears below.
+    let plans = store.list_all_trade_plans().await.unwrap_or_default();
+    let archived = store.list_all_archived_plans().await.unwrap_or_default();
+    let scopes: Vec<Option<String>> = plans
+        .iter()
+        .filter(|s| s.plan.trade_id == target)
+        .map(|s| s.account.clone())
+        .chain(
+            archived
+                .iter()
+                .filter(|s| s.plan.trade_id == target)
+                .map(|s| s.account.clone()),
+        )
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect();
+
+    // If no plan/archive names this trade, still attempt a global-scope sweep of
+    // the lifecycle rows (a trade can be purged after its plan rows already aged
+    // out / were deleted).
+    let scopes = if scopes.is_empty() {
+        vec![None]
+    } else {
+        scopes
+    };
+
+    let mut cleared = 0usize;
+    for scope in &scopes {
+        let account = scope.as_deref();
+        // entry-attempts → also drop each attempt's order-body, then the attempt.
+        if let Ok(attempts) = store.list_entry_attempts(account, target).await {
+            for a in &attempts {
+                if let Some(oid) = &a.broker_trade_id
+                    && store.delete_order_body(oid).await.is_ok()
+                {
+                    cleared += 1;
+                }
+                if store
+                    .delete_entry_attempt(account, target, a.attempt_no)
+                    .await
+                    .is_ok()
+                {
+                    cleared += 1;
+                }
+            }
+        }
+        // pauses + news windows (trade-scoped, enumerable).
+        if let Ok(pauses) = store.list_pauses_for_trade(target).await {
+            for p in &pauses {
+                if store.clear_pause(target, &p.blackout_id).await.is_ok() {
+                    cleared += 1;
+                }
+            }
+        }
+        if let Ok(windows) = store.list_news_windows_for_trade(target).await {
+            for w in &windows {
+                if store.clear_news_window(target, &w.news_id).await.is_ok() {
+                    cleared += 1;
+                }
+            }
+        }
+        // control-event audit trail.
+        if store.clear_control_events(account, target).await.is_ok() {
+            cleared += 1;
+        }
+        // plan / state / archived.
+        store.clear_trade_plan(account, target).await.ok();
+        store.clear_plan_state(account, target).await.ok();
+        store.clear_archived_plan(account, target).await.ok();
+    }
+
+    // 2) R2 tick bundles for this trade.
+    let r2_deleted = r2_purge::purge_trade_ticks(env, target)
+        .await
+        .unwrap_or_else(|err| {
+            rlog_err!("plan-purge: R2 ticks purge failed for {target}: {err}");
+            0
+        });
+
+    rlog!("plan-purge: trade_id={target} kv_cleared={cleared} r2_ticks_deleted={r2_deleted}");
+    let outcome = format!("plan-purged: {target} (kv={cleared} r2={r2_deleted})");
+    record_seen(store, verified, now, &outcome).await;
+    Response::ok(outcome)
+}
+
+/// Handle the `purge-older-than` action: bulk-delete R2 `req/` + `ticks/`
+/// bundles whose date partition is strictly older than the cutoff carried in
+/// `intent.not_before`. KV is untouched (per-trade KV rows are dropped by
+/// `plan purge`). Manual retention housekeeping for the no-TTL recording bucket.
+async fn handle_purge_older_than(
+    env: &Env,
+    verified: &incoming::Verified,
+    _now: chrono::DateTime<chrono::Utc>,
+) -> Result<Response> {
+    let Some(cutoff) = verified.intent.not_before else {
+        return Response::error("purge-older-than requires a cutoff in `not_before`", 400);
+    };
+    let deleted = match r2_purge::purge_older_than(env, cutoff).await {
+        Ok(n) => n,
+        Err(err) => {
+            rlog_err!("purge-older-than: {err}");
+            return Response::error("r2 purge error", 500);
+        }
+    };
+    rlog!("purge-older-than: cutoff={cutoff} r2_deleted={deleted}");
+    Response::ok(format!("purged-older-than: {cutoff} ({deleted})"))
 }
 
 /// Resolve an [`OandaBroker`] for the request.

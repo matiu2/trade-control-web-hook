@@ -1117,12 +1117,18 @@ impl Intent {
         // looks vetos up by the entry's own trade_id — an untagged entry
         // could never match a (correctly tagged) veto. See the 2026-06-11
         // cross-trade veto-bleed fix.
-        // `PlanDelete` joins the trade-id-required set for a different reason:
-        // `trade_id` *names the plan to drop*. Without it there is nothing to
-        // delete, so reject the malformed control message before dispatch.
+        // `PlanDelete` / `PlanPurge` join the trade-id-required set for a
+        // different reason: `trade_id` *names the plan/trade to drop*. Without
+        // it there is nothing to delete, so reject the malformed control message
+        // before dispatch. (`PurgeOlderThan` carries no trade_id — it's a bulk
+        // date sweep — so it is deliberately excluded.)
         if matches!(
             self.action,
-            Action::Enter | Action::Veto | Action::ClearVeto | Action::PlanDelete
+            Action::Enter
+                | Action::Veto
+                | Action::ClearVeto
+                | Action::PlanDelete
+                | Action::PlanPurge
         ) && self.trade_id.is_none()
         {
             return Err(IntentValidationError::MissingTradeId);
@@ -1465,6 +1471,22 @@ pub enum Action {
     /// editing the chart: `plan delete <id>` then re-run `tv-arm`. Drives
     /// `trade-control plan delete <trade_id>`.
     PlanDelete,
+    /// **Purge** every trace of a journaled trade — a superset of
+    /// [`Action::PlanDelete`]. Beyond the `plan:` / `plan-state:` /
+    /// `archived-plan:` rows that delete drops, purge also clears the no-TTL
+    /// per-trade lifecycle rows (`entry-attempt:`, `order-body:` recovered from
+    /// the attempts, `control-event:`) and the trade-scoped control rows
+    /// (`veto:` / `prep:` / `pause:` / `news:`), and deletes the trade's R2
+    /// `ticks/` bundles. Use after a trade has been journaled/logged and its
+    /// records are no longer needed. Target named by [`Intent::trade_id`];
+    /// KV+R2, idempotent. Drives `trade-control plan purge <trade_id>`.
+    PlanPurge,
+    /// Bulk retention sweep: delete R2 `req/` and `ticks/` bundles whose date
+    /// partition is strictly older than a cutoff. Manual housekeeping for the
+    /// (now no-TTL) recording bucket. The cutoff is carried in
+    /// [`Intent::not_before`] (reused as "purge older than this instant"); no
+    /// `trade_id`. Drives `trade-control purge --older-than <dur>`.
+    PurgeOlderThan,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
