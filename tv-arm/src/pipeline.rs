@@ -138,10 +138,13 @@ pub fn run(args: Args) -> Result<i32> {
     let out_dir = arm_out_dir(&raw_sym)?;
     let now = Utc::now();
 
-    // Drop blackout/news windows that have already fully elapsed in
-    // wall-clock terms (common when arming off a chart of historical bars).
-    // See `drop_past_control_pairs` for the why.
-    drop_past_control_pairs(&mut roles, now);
+    // Drop blackout/news windows that have already fully elapsed as of the
+    // arm's reference time. Live (`--register-plan`) prunes against wall-clock
+    // now; an offline replay (`--plan-out`) prunes against the chart's replay
+    // cursor so a blackout still upcoming relative to the cursor survives a
+    // historical replay. See `drop_past_control_pairs` / `pick_prune_as_of`.
+    let prune_as_of = pick_prune_as_of(&args, now, view);
+    drop_past_control_pairs(&mut roles, prune_as_of);
 
     // 2c. Position-tool direct entry. When one of --market-entry /
     //     --stop-entry / --limit-entry is set, ignore the pattern
@@ -1147,9 +1150,9 @@ struct NewsBundle {
 /// `build_pause_from_spec` would hard-fail with "refusing to arm a stale
 /// blackout". Drop it here, once, so the log line, `close_on_news`, and both
 /// bundle builders all see a consistent live-only view.
-fn drop_past_control_pairs(roles: &mut Roles, now: DateTime<Utc>) {
-    let now_unix = now.timestamp();
-    let is_past = |pair: &(Drawing, Drawing)| pair.1.anchor_time_seconds() <= now_unix;
+fn drop_past_control_pairs(roles: &mut Roles, as_of: AsOf) {
+    let as_of_unix = as_of.at.timestamp();
+    let is_past = |pair: &(Drawing, Drawing)| pair.1.anchor_time_seconds() <= as_of_unix;
     for (kind, pairs) in [
         ("blackout", &mut roles.blackout_pairs),
         ("news", &mut roles.news_pairs),
@@ -1160,9 +1163,61 @@ fn drop_past_control_pairs(roles: &mut Roles, now: DateTime<Utc>) {
         if dropped > 0 {
             info!(
                 kind,
-                dropped, "dropping control pair(s) whose window already closed (end_time <= now)"
+                dropped,
+                as_of = %as_of.at.to_rfc3339(),
+                source = as_of.source,
+                "dropping control pair(s) whose window already closed (end_time <= as_of)"
             );
         }
+    }
+}
+
+/// The "as-of" time control pairs are pruned against, plus where it came from
+/// (for the drop log line). In a live `--register-plan` arm this is wall-clock
+/// `now`; in an offline / replay `--plan-out` build it's the chart's replay
+/// cursor (visible range right edge), so blackouts still *upcoming* relative to
+/// the cursor survive a historical replay. See `BUG-tv-arm-stale-blackout-*`.
+#[derive(Clone, Copy)]
+struct AsOf {
+    at: DateTime<Utc>,
+    source: &'static str,
+}
+
+/// Pick the as-of time used to prune already-elapsed control pairs.
+///
+/// - `--register-plan` (live arm): always wall-clock `now`. A genuinely stale
+///   event must still be dropped when arming the live worker.
+/// - `--as-of <ts>` (offline override): the explicit cursor, for headless /
+///   cron replays with no readable chart range.
+/// - offline `--plan-out` (replay): the chart's replay cursor (`view.1`),
+///   clamped to `now` so a normal live `--plan-out` (cursor ≈ today) is
+///   unchanged and only a rewound replay (cursor in the past) shifts the yardstick.
+fn pick_prune_as_of(args: &Args, now: DateTime<Utc>, view: (i64, i64)) -> AsOf {
+    if args.register_plan {
+        return AsOf {
+            at: now,
+            source: "wallclock",
+        };
+    }
+    if let Some(raw) = args.as_of.as_deref() {
+        match DateTime::parse_from_rfc3339(raw) {
+            Ok(ts) => {
+                return AsOf {
+                    at: ts.with_timezone(&Utc),
+                    source: "as-of-flag",
+                };
+            }
+            Err(e) => warn!(
+                as_of = raw,
+                error = %e,
+                "--as-of is not valid RFC3339; falling back to the replay cursor"
+            ),
+        }
+    }
+    let cursor = DateTime::<Utc>::from_timestamp(view.1, 0).unwrap_or(now);
+    AsOf {
+        at: cursor.min(now),
+        source: "replay-cursor",
     }
 }
 
@@ -1815,6 +1870,13 @@ mod tests {
         "2026-06-08T00:00:00Z".parse().unwrap()
     }
 
+    fn wallclock(at: DateTime<Utc>) -> AsOf {
+        AsOf {
+            at,
+            source: "wallclock",
+        }
+    }
+
     #[test]
     fn prep_expiry_future_without_prep_errors() {
         // Cutoff in the future but no break-and-close trend line → error.
@@ -1885,7 +1947,7 @@ mod tests {
             ..Default::default()
         };
 
-        drop_past_control_pairs(&mut roles, now());
+        drop_past_control_pairs(&mut roles, wallclock(now()));
 
         assert_eq!(roles.blackout_pairs.len(), 1);
         assert_eq!(roles.blackout_pairs[0].1.id, "le");
@@ -1907,10 +1969,105 @@ mod tests {
             ..Default::default()
         };
 
-        drop_past_control_pairs(&mut roles, now());
+        drop_past_control_pairs(&mut roles, wallclock(now()));
 
         assert_eq!(roles.news_pairs.len(), 1);
         assert_eq!(roles.news_pairs[0].1.id, "b_e");
+    }
+
+    // ===== as-of selection for control-pair pruning =====================
+
+    /// Replay regression (the bug): a `--plan-out` build off a rewound chart
+    /// must prune against the visible right edge (replay cursor), so an event
+    /// AHEAD of the cursor — but BEFORE wall-clock today — is kept, not dropped.
+    #[test]
+    fn pick_prune_as_of_offline_uses_replay_cursor() {
+        let now = now(); // 2026-06-08
+        let cursor = "2026-05-28T21:00:00Z".parse::<DateTime<Utc>>().unwrap();
+        let view = (cursor.timestamp() - 4 * 86_400, cursor.timestamp());
+
+        let as_of = pick_prune_as_of(&mw_args(&["--plan-out", "/tmp/x.json"]), now, view);
+
+        assert_eq!(as_of.at, cursor);
+        assert_eq!(as_of.source, "replay-cursor");
+
+        // An event 12h after the cursor (still in the past vs `now`) survives.
+        let event_end = cursor.timestamp() + 12 * 3600;
+        let mut roles = Roles {
+            blackout_pairs: vec![(vline("s", event_end - 1800), vline("e", event_end))],
+            ..Default::default()
+        };
+        drop_past_control_pairs(&mut roles, as_of);
+        assert_eq!(
+            roles.blackout_pairs.len(),
+            1,
+            "upcoming-vs-cursor pair kept"
+        );
+    }
+
+    /// Live arm: `--register-plan` always prunes against wall-clock now, even
+    /// though the chart cursor (a tightly-zoomed live view) may sit in the past.
+    #[test]
+    fn pick_prune_as_of_register_plan_uses_wallclock() {
+        let now = now();
+        let cursor = "2026-05-28T21:00:00Z".parse::<DateTime<Utc>>().unwrap();
+        let view = (cursor.timestamp() - 86_400, cursor.timestamp());
+
+        let as_of = pick_prune_as_of(&mw_args(&["--register-plan"]), now, view);
+
+        assert_eq!(as_of.at, now);
+        assert_eq!(as_of.source, "wallclock");
+    }
+
+    /// A normal live `--plan-out` (cursor ≈ today) is unchanged: the cursor is
+    /// clamped to `now`, so we never treat a future cursor as the yardstick.
+    #[test]
+    fn pick_prune_as_of_offline_clamps_future_cursor_to_now() {
+        let now = now();
+        let view = (now.timestamp() - 86_400, now.timestamp() + 7200); // cursor 2h ahead
+
+        let as_of = pick_prune_as_of(&mw_args(&["--plan-out", "/tmp/x.json"]), now, view);
+
+        assert_eq!(as_of.at, now, "cursor clamped down to now");
+    }
+
+    /// `--as-of` overrides the cursor for headless replays with no chart range.
+    #[test]
+    fn pick_prune_as_of_explicit_flag_overrides_cursor() {
+        let now = now();
+        let view = (now.timestamp() - 86_400, now.timestamp());
+        let forced = "2026-05-28T21:00:00Z".parse::<DateTime<Utc>>().unwrap();
+
+        let as_of = pick_prune_as_of(
+            &mw_args(&[
+                "--plan-out",
+                "/tmp/x.json",
+                "--as-of",
+                "2026-05-28T21:00:00Z",
+            ]),
+            now,
+            view,
+        );
+
+        assert_eq!(as_of.at, forced);
+        assert_eq!(as_of.source, "as-of-flag");
+    }
+
+    /// A malformed `--as-of` falls back to the replay cursor rather than failing.
+    #[test]
+    fn pick_prune_as_of_bad_flag_falls_back_to_cursor() {
+        let now = now();
+        let cursor = "2026-05-28T21:00:00Z".parse::<DateTime<Utc>>().unwrap();
+        let view = (cursor.timestamp() - 86_400, cursor.timestamp());
+
+        let as_of = pick_prune_as_of(
+            &mw_args(&["--plan-out", "/tmp/x.json", "--as-of", "not-a-date"]),
+            now,
+            view,
+        );
+
+        assert_eq!(as_of.at, cursor);
+        assert_eq!(as_of.source, "replay-cursor");
     }
 
     // ===== M / W neckline-% gate ========================================
