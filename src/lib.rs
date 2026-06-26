@@ -1797,14 +1797,13 @@ pub(crate) async fn run_enter<B: Broker>(
                 // body keyed by the broker order id so the apply cron can
                 // recover THIS order's intent (it finds a broker pending order,
                 // never a signed intent) and re-drive it on recovery. Only when
-                // we have the signed bytes in hand; TTL tracks the alert window
-                // (`not_after` + grace) so a never-cancelled order's body ages
-                // out with its EntryAttempt. Best-effort: a write failure only
-                // costs the blackout-restore ability for this one order, never
-                // the placement.
+                // we have the signed bytes in hand. No TTL — the body is
+                // per-trade lifecycle state and is removed by `plan purge`
+                // (no longer aged out with its EntryAttempt). Best-effort: a
+                // write failure only costs the blackout-restore ability for this
+                // one order, never the placement.
                 if let Some(body) = raw_body {
-                    let ttl = incoming::replay_ttl_seconds(verified.intent.not_after, now);
-                    if let Err(err) = store.put_order_body(&order_id, body, ttl).await {
+                    if let Err(err) = store.put_order_body(&order_id, body).await {
                         rlog_err!(
                             "order-body store for blackout-restore failed (order={order_id}): {err} \
                              — this order can't be blackout-cancelled+restored"

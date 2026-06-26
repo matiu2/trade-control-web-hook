@@ -180,14 +180,15 @@ impl KvStateStore {
         &self,
         order_id: &str,
         signed_body: &str,
-        ttl_seconds: u64,
     ) -> Result<(), StateError> {
         let key = Self::order_body_key(order_id);
-        let ttl = ttl_seconds.max(MIN_TTL_SECONDS);
+        // No `.expiration_ttl(...)`: the order-body recovery cache is per-trade
+        // lifecycle state and now persists until `plan purge` (the order_id is
+        // recovered from the trade's entry-attempt rows). Previously TTL'd to
+        // the alert window so it aged out with its EntryAttempt.
         self.store
             .put(&key, signed_body)
             .map_err(|e| StateError::Backend(format!("put {key} builder: {e:?}")))?
-            .expiration_ttl(ttl)
             .execute()
             .await
             .map_err(|e| StateError::Backend(format!("put {key} execute: {e:?}")))?;
@@ -195,8 +196,8 @@ impl KvStateStore {
     }
 
     /// Read the raw signed alert body for `order_id`, or `None` if absent /
-    /// TTL-expired (the order's alert window closed before any blackout, so
-    /// it can't and shouldn't be restored).
+    /// purged (the order's alert window closed before any blackout, so it can't
+    /// and shouldn't be restored).
     pub async fn get_order_body(&self, order_id: &str) -> Result<Option<String>, StateError> {
         let key = Self::order_body_key(order_id);
         self.store
@@ -911,18 +912,18 @@ impl StateStore for KvStateStore {
             &attempt.trade_id,
             attempt.attempt_no,
         );
-        // TTL the row to `expires_at` so dead attempts age out of KV
-        // (and out of `list_entry_attempts`) without explicit cleanup.
-        let now = Utc::now();
-        let ttl = (attempt.expires_at - now)
-            .num_seconds()
-            .max(MIN_TTL_SECONDS as i64) as u64;
+        // No `.expiration_ttl(...)`: entry-attempt rows are per-trade lifecycle
+        // state and now persist until the trade is retired (`plan purge`), so a
+        // journaled post-mortem can still see every placement. The retry-gate
+        // cap (`attempts.len() >= max_retries`) is scoped to this `(account,
+        // trade_id)`, so a non-expiring attempt from a *finished* trade never
+        // affects a new trade's count. The `expires_at` field is retained on the
+        // row for adopt/display logic; it no longer drives the KV TTL.
         let body = serde_json::to_string(&attempt)
             .map_err(|e| StateError::Backend(format!("encode entry_attempt: {e}")))?;
         self.store
             .put(&key, body)
             .map_err(|e| StateError::Backend(format!("put entry_attempt builder: {e:?}")))?
-            .expiration_ttl(ttl)
             .execute()
             .await
             .map_err(|e| StateError::Backend(format!("put entry_attempt execute: {e:?}")))?;
@@ -1052,25 +1053,21 @@ impl StateStore for KvStateStore {
             .map_err(|e| StateError::Backend(format!("get {key}: {e:?}")))?;
         let Some(text) = raw else {
             return Err(StateError::Backend(format!(
-                "entry_attempt missing for {key} (expired or never recorded)"
+                "entry_attempt missing for {key} (never recorded or purged)"
             )));
         };
         let mut attempt: EntryAttempt = serde_json::from_str(&text)
             .map_err(|e| StateError::Backend(format!("decode {key}: {e}")))?;
         attempt.broker_trade_id = Some(broker_trade_id.to_string());
-        // Preserve the row's remaining lifetime: re-derive TTL from
-        // `expires_at` (clamped to KV's minimum) rather than letting
-        // the rewrite reset to "forever".
-        let now = Utc::now();
-        let ttl = (attempt.expires_at - now)
-            .num_seconds()
-            .max(MIN_TTL_SECONDS as i64) as u64;
+        // No `.expiration_ttl(...)`: matches `record_entry_attempt` — the
+        // attempt row is no-TTL and lives until `plan purge`. (Previously this
+        // re-derived the remaining TTL from `expires_at` to avoid resetting it
+        // on rewrite; with no TTL there's nothing to preserve.)
         let body = serde_json::to_string(&attempt)
             .map_err(|e| StateError::Backend(format!("encode {key}: {e}")))?;
         self.store
             .put(&key, body)
             .map_err(|e| StateError::Backend(format!("put {key} builder: {e:?}")))?
-            .expiration_ttl(ttl)
             .execute()
             .await
             .map_err(|e| StateError::Backend(format!("put {key} execute: {e:?}")))?;
