@@ -1295,11 +1295,34 @@ mod memstore {
     pub struct MemStateStore {
         inner: RefCell<Entries>,
         attempts: RefCell<AttemptMap>,
+        /// Optional injected "current time". `None` (the default) ⇒ TTL
+        /// expiry is judged against real wall-clock `Utc::now()`, matching
+        /// the live KV store. An **offline replay** sets this to each tick's
+        /// time via [`set_clock`] so a pause stamped during a historical
+        /// replay (e.g. 2026-05-29) isn't immediately judged "expired"
+        /// against today's wall-clock — the exact wall-clock-vs-cursor trap
+        /// that makes blackout state vanish in replay. Read via [`now`].
+        clock: RefCell<Option<DateTime<Utc>>>,
     }
 
     impl MemStateStore {
         pub fn new() -> Self {
             Self::default()
+        }
+
+        /// Pin the store's notion of "now" to `at` (offline replay). All TTL
+        /// expiry checks then use `at` instead of wall-clock `Utc::now()`.
+        /// Advance it once per replay tick before evaluating that tick.
+        pub fn set_clock(&self, at: DateTime<Utc>) {
+            *self.clock.borrow_mut() = Some(at);
+        }
+
+        /// The store's current time: the injected replay clock if set,
+        /// otherwise real wall-clock. Every internal expiry check routes
+        /// through here so a single setter makes the whole store
+        /// replay-time-aware.
+        fn now(&self) -> DateTime<Utc> {
+            self.clock.borrow().unwrap_or_else(Utc::now)
         }
 
         fn get_live(&self, key: &str, now: DateTime<Utc>) -> Option<String> {
@@ -1327,7 +1350,7 @@ mod memstore {
 
     impl StateStore for MemStateStore {
         async fn is_seen(&self, id: &str) -> Result<bool, StateError> {
-            Ok(self.get_live(&format!("seen:{id}"), Utc::now()).is_some())
+            Ok(self.get_live(&format!("seen:{id}"), self.now()).is_some())
         }
         async fn mark_seen(
             &self,
@@ -1350,7 +1373,7 @@ mod memstore {
             account: Option<&str>,
             instrument: &str,
         ) -> Result<bool, StateError> {
-            let now = Utc::now();
+            let now = self.now();
             // Global cooldowns pause every account; check both keys.
             let global = format!("cooldown:{ACCOUNT_SCOPE_GLOBAL}:{instrument}");
             if self.get_live(&global, now).is_some() {
@@ -1413,7 +1436,7 @@ mod memstore {
             instrument: &str,
             step: &str,
         ) -> Result<Option<DateTime<Utc>>, StateError> {
-            let now = Utc::now();
+            let now = self.now();
             // Global preps satisfy the gate on every account; check
             // global first, then scoped if present.
             let global = format!("prep:{ACCOUNT_SCOPE_GLOBAL}:{instrument}:{step}");
@@ -1441,7 +1464,7 @@ mod memstore {
             let scope = account_scope(account);
             let key = format!("prep:{scope}:{instrument}:{step}");
             let setter = self
-                .get_live(&key, Utc::now())
+                .get_live(&key, self.now())
                 .map(|raw| parse_prep_value(&raw).1.to_string());
             if self.delete(&key) {
                 Ok(Some(setter.unwrap_or_default()))
@@ -1462,7 +1485,7 @@ mod memstore {
                 format!("veto:{scope}:{trade_id}:{instrument}:{name}"),
                 "1".into(),
                 ttl_seconds.max(MIN_TTL_SECONDS),
-                Utc::now(),
+                self.now(),
             );
             Ok(())
         }
@@ -1473,7 +1496,7 @@ mod memstore {
             instrument: &str,
             name: &str,
         ) -> Result<bool, StateError> {
-            let now = Utc::now();
+            let now = self.now();
             // Global vetos cover every account; check both keys.
             let global = format!("veto:{ACCOUNT_SCOPE_GLOBAL}:{trade_id}:{instrument}:{name}");
             if self.get_live(&global, now).is_some() {
@@ -1520,7 +1543,7 @@ mod memstore {
             instrument: &str,
             step: &str,
         ) -> Result<bool, StateError> {
-            let now = Utc::now();
+            let now = self.now();
             // Global blocks cover every account; check both keys.
             let global = format!("prep-blocked:{ACCOUNT_SCOPE_GLOBAL}:{instrument}:{step}");
             if self.get_live(&global, now).is_some() {
@@ -1549,7 +1572,7 @@ mod memstore {
             // Tests that care about the snapshot shape use the real KV
             // impl; this is for trait-contract tests of the gate logic.
             Ok(Snapshot {
-                now: Utc::now(),
+                now: self.now(),
                 cooldowns: Vec::new(),
                 recent_seen: Vec::new(),
                 preps: Vec::new(),
@@ -1589,7 +1612,7 @@ mod memstore {
             trade_id: &str,
         ) -> Result<Vec<PauseEntry>, StateError> {
             let prefix = format!("pause:{trade_id}:");
-            let now = Utc::now();
+            let now = self.now();
             let inner = self.inner.borrow();
             let mut out = Vec::new();
             for (key, (val, exp)) in inner.iter() {
@@ -1635,7 +1658,7 @@ mod memstore {
             trade_id: &str,
         ) -> Result<Vec<NewsEntry>, StateError> {
             let prefix = format!("news:{trade_id}:");
-            let now = Utc::now();
+            let now = self.now();
             let inner = self.inner.borrow();
             let mut out = Vec::new();
             for (key, (val, exp)) in inner.iter() {
@@ -1728,7 +1751,7 @@ mod memstore {
         ) -> Result<bool, StateError> {
             let scope = account_scope(account);
             let key = format!("seen-retry:{scope}:{trade_id}:{}", shell_time.to_rfc3339());
-            Ok(self.get_live(&key, Utc::now()).is_some())
+            Ok(self.get_live(&key, self.now()).is_some())
         }
 
         async fn mark_retry_fire_seen(
@@ -1744,7 +1767,7 @@ mod memstore {
                 key,
                 "1".into(),
                 ttl_seconds.max(MIN_TTL_SECONDS),
-                Utc::now(),
+                self.now(),
             );
             Ok(())
         }
@@ -1768,7 +1791,7 @@ mod memstore {
         async fn get_spread_blackout_window(
             &self,
         ) -> Result<Option<SpreadBlackoutWindow>, StateError> {
-            match self.get_live("spread-blackout:window", Utc::now()) {
+            match self.get_live("spread-blackout:window", self.now()) {
                 Some(text) => serde_json::from_str(&text)
                     .map(Some)
                     .map_err(|e| StateError::Backend(e.to_string())),
@@ -1800,7 +1823,7 @@ mod memstore {
             &self,
             instrument: &str,
         ) -> Result<Vec<NoEntryWindow>, StateError> {
-            match self.get_live(&format!("blackout-hours:{instrument}"), Utc::now()) {
+            match self.get_live(&format!("blackout-hours:{instrument}"), self.now()) {
                 Some(text) => serde_json::from_str::<BlackoutHoursEntry>(&text)
                     .map(|e| e.windows)
                     .map_err(|e| StateError::Backend(e.to_string())),
@@ -1817,7 +1840,7 @@ mod memstore {
             let key = format!("spread-blackout:rec:{}", record.trade_id);
             let body =
                 serde_json::to_string(record).map_err(|e| StateError::Backend(e.to_string()))?;
-            self.put(key, body, ttl, Utc::now());
+            self.put(key, body, ttl, self.now());
             Ok(())
         }
 
@@ -1826,7 +1849,7 @@ mod memstore {
             trade_id: &str,
         ) -> Result<Option<SpreadBlackoutRecord>, StateError> {
             let key = format!("spread-blackout:rec:{trade_id}");
-            match self.get_live(&key, Utc::now()) {
+            match self.get_live(&key, self.now()) {
                 Some(text) => serde_json::from_str(&text)
                     .map(Some)
                     .map_err(|e| StateError::Backend(e.to_string())),
@@ -1837,7 +1860,7 @@ mod memstore {
         async fn list_all_spread_blackout_records(
             &self,
         ) -> Result<Vec<SpreadBlackoutRecord>, StateError> {
-            let now = Utc::now();
+            let now = self.now();
             let inner = self.inner.borrow();
             let mut out = Vec::new();
             for (key, (val, exp)) in inner.iter() {
@@ -1861,7 +1884,7 @@ mod memstore {
             account: Option<&str>,
             trade_id: &str,
         ) -> Result<Option<MwState>, StateError> {
-            let now = Utc::now();
+            let now = self.now();
             // Global-first: a global row satisfies an account-scoped query.
             let global = format!("mw-state:{}:{trade_id}", account_scope(None));
             let mut raw = self.get_live(&global, now);
@@ -1887,7 +1910,7 @@ mod memstore {
             let key = format!("mw-state:{}:{trade_id}", account_scope(account));
             let body = serde_json::to_string(state)
                 .map_err(|e| StateError::Backend(format!("encode mw-state: {e}")))?;
-            self.put(key, body, ttl_seconds.max(MIN_TTL_SECONDS), Utc::now());
+            self.put(key, body, ttl_seconds.max(MIN_TTL_SECONDS), self.now());
             Ok(())
         }
 
@@ -1910,7 +1933,7 @@ mod memstore {
                 .map_err(|e| StateError::Backend(format!("encode plan: {e}")))?;
             // No TTL: registered plans never time out (mirrors `archive_plan`).
             // The in-memory store keys on expiry, so use a far-future stamp.
-            self.put(key, body, NO_TTL_SECONDS, Utc::now());
+            self.put(key, body, NO_TTL_SECONDS, self.now());
             Ok(())
         }
 
@@ -1920,7 +1943,7 @@ mod memstore {
             trade_id: &str,
         ) -> Result<Option<TradePlan>, StateError> {
             let key = format!("plan:{}:{trade_id}", account_scope(account));
-            match self.get_live(&key, Utc::now()) {
+            match self.get_live(&key, self.now()) {
                 Some(text) => serde_json::from_str(&text)
                     .map(Some)
                     .map_err(|e| StateError::Backend(format!("decode plan: {e}"))),
@@ -1929,7 +1952,7 @@ mod memstore {
         }
 
         async fn list_all_trade_plans(&self) -> Result<Vec<StoredPlan>, StateError> {
-            let now = Utc::now();
+            let now = self.now();
             let inner = self.inner.borrow();
             let mut out = Vec::new();
             for (key, (val, exp)) in inner.iter() {
@@ -1970,7 +1993,7 @@ mod memstore {
             trade_id: &str,
         ) -> Result<Option<PlanState>, StateError> {
             let key = format!("plan-state:{}:{trade_id}", account_scope(account));
-            match self.get_live(&key, Utc::now()) {
+            match self.get_live(&key, self.now()) {
                 Some(text) => serde_json::from_str(&text)
                     .map(Some)
                     .map_err(|e| StateError::Backend(format!("decode plan-state: {e}"))),
@@ -1988,7 +2011,7 @@ mod memstore {
             let key = format!("plan-state:{}:{trade_id}", account_scope(account));
             let body = serde_json::to_string(state)
                 .map_err(|e| StateError::Backend(format!("encode plan-state: {e}")))?;
-            self.put(key, body, ttl_seconds.max(MIN_TTL_SECONDS), Utc::now());
+            self.put(key, body, ttl_seconds.max(MIN_TTL_SECONDS), self.now());
             Ok(())
         }
 
@@ -2019,12 +2042,12 @@ mod memstore {
                 .map_err(|e| StateError::Backend(format!("encode archived plan: {e}")))?;
             // No TTL: archived plans persist until `plan delete`. The in-memory
             // store keys on expiry, so use a far-future stamp as "never".
-            self.put(key, body, NO_TTL_SECONDS, Utc::now());
+            self.put(key, body, NO_TTL_SECONDS, self.now());
             Ok(())
         }
 
         async fn list_all_archived_plans(&self) -> Result<Vec<ArchivedPlan>, StateError> {
-            let now = Utc::now();
+            let now = self.now();
             let inner = self.inner.borrow();
             let mut out = Vec::new();
             for (key, (val, exp)) in inner.iter() {

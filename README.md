@@ -1210,6 +1210,21 @@ changes don't churn fixtures; after an *intentional* outcome change, re-save the
 fixture. The snapshot freezes today's mid-only fill semantics on purpose — a
 change to the simulator's fill model will (correctly) flag.
 
+**Replay enforces the news blackout (pause/resume), not just logs it.** A plan's
+`pause`/`resume` control rules fire on their `TimeReached` epochs; the replay
+applies them to its in-memory state store and **gates `05-enter` on them** —
+exactly as the live worker's `run_enter` blackout gate does. An enter that fires
+inside an active pause is a **hard skip** (NO FILL / 0R), shown in the report as
+`fill: SUPPRESSED — trade paused by news blackout [...] → NO FILL / 0R` and not
+tallied as a win. The decision lives once in `trade_control_core::pause_gate`
+(`apply_pause` / `apply_resume` / `entry_blocked`), shared by the worker and the
+replay so they can't drift. Because the replay runs over *historical* bars, its
+`MemStateStore` clock is pinned to each tick's time (`set_clock`) — otherwise a
+pause stamped at, say, 2026-05-29 would be judged expired against today's
+wall-clock and vanish (the same wall-clock-vs-cursor trap as the tv-arm prune).
+Without a blackout (or with `--skip-calendar-bars`) the same enter fills — that
+with/without pair is the A/B the journal needs to price what the news rule cost.
+
 **News / blackout pruning is replay-cursor-aware.** When `tv-arm` builds a plan
 it fetches the week's forex-factory events and adds one blackout pair + one news
 pair per event, then drops any pair whose window has already elapsed. The

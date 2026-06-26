@@ -11,6 +11,7 @@ pub mod broker;
 pub mod incoming;
 pub mod intent;
 pub mod ny_clock;
+pub mod pause_gate;
 pub mod plan_eval;
 pub mod plan_state;
 pub mod retry_gate;
