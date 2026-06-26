@@ -1210,6 +1210,23 @@ changes don't churn fixtures; after an *intentional* outcome change, re-save the
 fixture. The snapshot freezes today's mid-only fill semantics on purpose — a
 change to the simulator's fill model will (correctly) flag.
 
+**News / blackout pruning is replay-cursor-aware.** When `tv-arm` builds a plan
+it fetches the week's forex-factory events and adds one blackout pair + one news
+pair per event, then drops any pair whose window has already elapsed. The
+"as-of" time it prunes against depends on the run mode:
+
+- **`--register-plan` (live arm):** wall-clock now — a genuinely stale event is
+  still dropped before it reaches the live worker.
+- **`--plan-out` (offline / replay build):** the chart's **replay cursor** (the
+  visible range's right edge), clamped to now. So arming off a rewound chart
+  keeps a blackout that is still *upcoming relative to the cursor* even though
+  it's in the past relative to today — the replay can then reproduce a news
+  skip the live system actually made. (Before this fix the prune always used
+  wall-clock now, so every historical replay silently ran with blackouts
+  removed.) `--as-of <RFC3339>` forces an explicit cursor for headless / cron
+  replays where no live chart range is readable. The drop log line records the
+  `as_of=` it used and its `source` (`wallclock` / `replay-cursor` / `as-of-flag`).
+
 ## Brokers
 
 The intent YAML carries an optional `broker:` field, one of `oanda`
