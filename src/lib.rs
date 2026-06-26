@@ -3981,7 +3981,6 @@ mod dispatcher_outcome_tests {
             _account: Option<&str>,
             _trade_id: &str,
             _state: &trade_control_core::plan_state::PlanState,
-            _ttl_seconds: u64,
         ) -> Result<(), StateError> {
             Ok(())
         }

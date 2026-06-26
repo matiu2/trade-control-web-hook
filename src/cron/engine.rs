@@ -44,7 +44,7 @@
 //! (`worker::Env`, the concrete [`BrokerHandle`], and `worker::Response`, which
 //! panics off-wasm at construction — see `every_rejection_outcome_classifies_as_skip`
 //! in `lib.rs` for the same constraint), so only the pure helpers
-//! (`seed_since`, `plan_ttl`, `plan_state_expires_at`) are unit-tested here.
+//! (`seed_since`, `plan_state_expires_at`) are unit-tested here.
 //! End-to-end behaviour is exercised on the demo deploy, run in parallel with
 //! the live TV alerts (Stage F gate).
 
@@ -115,18 +115,29 @@ async fn tick_one(
     let expires_at = plan_state_expires_at(now);
 
     // Load prior state, or seed-without-firing on the first tick.
-    let prior = store
-        .get_plan_state(account, &plan.trade_id)
-        .await
-        .map_err(|err| format!("get_plan_state: {err}"))?;
+    //
+    // A `None` here is meant to be "this plan has never ticked" → seed. But a
+    // re-seed is dangerous: it jumps the watermark to the newest candle and
+    // fires nothing, so any price-cross veto in the skipped gap is lost forever
+    // (bug #15). The plan-state row is now no-TTL, so it can't age out
+    // mid-trade — the only remaining way a *live* plan reads `None` is a
+    // transient KV eventual-consistency read-miss. Guard against that by
+    // re-reading once before committing to a seed: a real first tick stays
+    // `None`, a read-miss resolves to the persisted state and we proceed
+    // normally instead of silently re-seeding past a cross.
+    let prior = match read_plan_state_settled(store, account, &plan.trade_id).await? {
+        Some(state) => state,
+        None => {
+            let broker = acquire_broker_for_account(env, account)
+                .await
+                .ok_or("broker acquisition failed")?;
+            return seed_first_tick(store, &broker, plan, account, expires_at, now).await;
+        }
+    };
 
     let broker = acquire_broker_for_account(env, account)
         .await
         .ok_or("broker acquisition failed")?;
-
-    let Some(prior) = prior else {
-        return seed_first_tick(store, &broker, plan, account, expires_at, now).await;
-    };
 
     // Fetch candles closed since the watermark. A plan with no watermark (an
     // earlier seed that found an empty window) re-seeds from the back-window.
@@ -160,7 +171,7 @@ async fn tick_one(
     // Persist the advanced state (or clear it + the plan when the spine is
     // done) before dispatching, so a dispatch failure can't replay a fired bar.
     // Capture the transition (before/after/success/error) for the tick-bundle.
-    let kv = persist_plan_state(store, plan, account, &eval, expires_at, now, &prior).await;
+    let kv = persist_plan_state(store, plan, account, &eval, now, &prior).await;
     // A hard put failure is still a skip for this tick — but the bundle records
     // the failed transition first, so a replay can see "wanted to advance,
     // couldn't" rather than a silent gap.
@@ -265,7 +276,6 @@ async fn persist_plan_state(
     plan: &trade_control_core::trade_plan::TradePlan,
     account: Option<&str>,
     eval: &PlanEval,
-    expires_at: DateTime<Utc>,
     now: DateTime<Utc>,
     prior: &PlanState,
 ) -> KvTickTransition {
@@ -298,12 +308,7 @@ async fn persist_plan_state(
         };
     }
     match store
-        .put_plan_state(
-            account,
-            &plan.trade_id,
-            &eval.new_state,
-            plan_ttl(expires_at, now),
-        )
+        .put_plan_state(account, &plan.trade_id, &eval.new_state)
         .await
     {
         Ok(()) => KvTickTransition {
@@ -404,6 +409,42 @@ fn log_noop_tick(
     );
 }
 
+/// Read a plan's persisted state, tolerating a transient KV read-miss before
+/// concluding the plan has never ticked.
+///
+/// The state row is no-TTL, so a live plan's row never ages out — but
+/// Cloudflare KV is eventually consistent, and a read immediately after a write
+/// on another edge can momentarily return `None`. Treating that `None` as
+/// "first tick" would re-seed and skip the cross (bug #15). So on a `None`, we
+/// re-read once: a genuine first tick stays `None`; a read-miss resolves to the
+/// real state on the retry. The cost is one extra KV GET on the rare miss.
+async fn read_plan_state_settled(
+    store: &KvStateStore,
+    account: Option<&str>,
+    trade_id: &str,
+) -> Result<Option<PlanState>, String> {
+    let first = store
+        .get_plan_state(account, trade_id)
+        .await
+        .map_err(|err| format!("get_plan_state: {err}"))?;
+    if first.is_some() {
+        return Ok(first);
+    }
+    // `None` — re-read once to rule out an eventual-consistency miss before
+    // committing to a (watermark-jumping) seed.
+    let settled = store
+        .get_plan_state(account, trade_id)
+        .await
+        .map_err(|err| format!("get_plan_state (re-read): {err}"))?;
+    if settled.is_some() {
+        rlog!(
+            "cron engine: plan-state for {trade_id} missed on first read, resolved on re-read \
+             (KV eventual consistency) — proceeding without a re-seed"
+        );
+    }
+    Ok(settled)
+}
+
 /// First-tick seed: fetch a back-window, seed the state without firing, persist.
 async fn seed_first_tick(
     store: &KvStateStore,
@@ -417,7 +458,7 @@ async fn seed_first_tick(
     let candles = fetch_candles(broker, &plan.instrument, plan.granularity, since, now).await?;
     let state = seed_plan_state(plan, &candles, expires_at);
     store
-        .put_plan_state(account, &plan.trade_id, &state, plan_ttl(expires_at, now))
+        .put_plan_state(account, &plan.trade_id, &state)
         .await
         .map_err(|err| format!("put_plan_state (seed): {err}"))?;
     rlog!(
@@ -685,12 +726,6 @@ fn plan_state_expires_at(now: DateTime<Utc>) -> DateTime<Utc> {
     now + chrono::Duration::days(1)
 }
 
-/// Seconds of KV TTL for a plan-state row, from its `expires_at`. Floored at
-/// 60s (Cloudflare KV's minimum TTL) so a near-expiry row still persists.
-fn plan_ttl(expires_at: DateTime<Utc>, now: DateTime<Utc>) -> u64 {
-    (expires_at - now).num_seconds().max(60) as u64
-}
-
 /// The seed back-window start: [`SEED_BARS`] bars of the plan's granularity
 /// before `now`. Pure so the window math is unit-testable without a broker.
 fn seed_since(granularity: Granularity, now: DateTime<Utc>) -> DateTime<Utc> {
@@ -715,22 +750,6 @@ mod tests {
             seed_since(Granularity::M15, now),
             ts("2026-06-17T17:30:00Z")
         );
-    }
-
-    #[test]
-    fn plan_ttl_is_seconds_to_expiry() {
-        let now = ts("2026-06-17T20:00:00Z");
-        let expires = ts("2026-06-17T21:00:00Z");
-        assert_eq!(plan_ttl(expires, now), 3600);
-    }
-
-    #[test]
-    fn plan_ttl_floors_at_sixty_seconds() {
-        let now = ts("2026-06-17T20:00:00Z");
-        // Already-past expiry would yield a negative/zero TTL — floor to 60s so
-        // the KV write is still accepted and the row survives a tick.
-        let expires = ts("2026-06-17T19:59:59Z");
-        assert_eq!(plan_ttl(expires, now), 60);
     }
 
     #[test]

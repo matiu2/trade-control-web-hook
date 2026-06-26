@@ -997,14 +997,21 @@ pub trait StateStore {
     ) -> impl Future<Output = Result<Option<PlanState>, StateError>>;
 
     /// Create-or-update the engine's [`PlanState`] for `(account, trade_id)`.
-    /// Overwrites the prior row + refreshes TTL. Written every tick that the
-    /// watermark advances (re-set keeps an active plan's state from ageing out).
+    /// Overwrites the prior row. Written every tick that the watermark advances.
+    ///
+    /// **No TTL** — like [`Self::put_trade_plan`] and [`Self::archive_plan`], the
+    /// state row persists until the plan is retired (`clear_plan_state` on the
+    /// engine's `done` branch or a `plan delete`/`plan purge`). It used to carry
+    /// a flat ~1-day TTL; when that aged out while the plan was still live, the
+    /// next tick read `None`, **re-seeded** (jumping the watermark to "now" and
+    /// firing nothing), and silently skipped any price-cross veto in the gap —
+    /// bug #15 (the unfixed half of the 2026-06-23 `plan:`-TTL fix). The live
+    /// `plan:` row already lives forever, so its state row must too.
     fn put_plan_state(
         &self,
         account: Option<&str>,
         trade_id: &str,
         state: &PlanState,
-        ttl_seconds: u64,
     ) -> impl Future<Output = Result<(), StateError>>;
 
     /// Delete the engine's [`PlanState`] row. Best-effort. Called alongside
@@ -2006,12 +2013,14 @@ mod memstore {
             account: Option<&str>,
             trade_id: &str,
             state: &PlanState,
-            ttl_seconds: u64,
         ) -> Result<(), StateError> {
             let key = format!("plan-state:{}:{trade_id}", account_scope(account));
             let body = serde_json::to_string(state)
                 .map_err(|e| StateError::Backend(format!("encode plan-state: {e}")))?;
-            self.put(key, body, ttl_seconds.max(MIN_TTL_SECONDS), self.now());
+            // No TTL (mirrors `put_trade_plan`/`archive_plan`): the state row
+            // lives as long as its plan. The in-memory store keys on expiry, so
+            // use a far-future stamp.
+            self.put(key, body, NO_TTL_SECONDS, self.now());
             Ok(())
         }
 
@@ -3562,11 +3571,22 @@ mod tests {
         st.watermark = Some(ts("2026-06-16T12:00:00Z"));
         st.last_close.insert("01-veto-too-high".into(), 1.2345);
 
-        pollster::block_on(store.put_plan_state(Some("reversals"), "hs-1", &st, 3600)).unwrap();
+        pollster::block_on(store.put_plan_state(Some("reversals"), "hs-1", &st)).unwrap();
         let got = pollster::block_on(store.get_plan_state(Some("reversals"), "hs-1"))
             .unwrap()
             .expect("plan-state present");
         assert_eq!(got, st);
+
+        // The state row carries no TTL (bug #15): its expiry must be far-future
+        // like the `plan:` row, not a flat ~1-day stamp that could age out
+        // mid-trade and trigger a watermark-skipping re-seed.
+        let exp = store
+            .expiry_of("plan-state:reversals:hs-1")
+            .expect("plan-state stored");
+        assert!(
+            exp > Utc::now() + chrono::Duration::days(365),
+            "plan-state expiry must be far-future, got {exp}"
+        );
 
         pollster::block_on(store.clear_plan_state(Some("reversals"), "hs-1")).unwrap();
         assert!(

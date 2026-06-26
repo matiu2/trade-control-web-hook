@@ -1548,16 +1548,17 @@ impl StateStore for KvStateStore {
         account: Option<&str>,
         trade_id: &str,
         state: &PlanState,
-        ttl_seconds: u64,
     ) -> Result<(), StateError> {
         let key = Self::plan_state_key(account, trade_id);
-        let ttl = ttl_seconds.max(MIN_TTL_SECONDS);
         let body = serde_json::to_string(state)
             .map_err(|e| StateError::Backend(format!("encode plan-state: {e}")))?;
+        // No `.expiration_ttl(...)`: the state row persists as long as its
+        // (no-TTL) `plan:` row, removed only by `clear_plan_state` on retire.
+        // A flat TTL here let the row age out mid-trade → re-seed → skipped
+        // price-cross veto (bug #15).
         self.store
             .put(&key, body)
             .map_err(|e| StateError::Backend(format!("put {key} builder: {e:?}")))?
-            .expiration_ttl(ttl)
             .execute()
             .await
             .map_err(|e| StateError::Backend(format!("put {key} execute: {e:?}")))?;
