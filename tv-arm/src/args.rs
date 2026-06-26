@@ -317,6 +317,18 @@ pub struct Args {
     #[arg(long)]
     pub skip_calendar_bars: bool,
 
+    /// Override the "as-of" time used to prune already-elapsed news /
+    /// blackout control pairs (RFC3339, e.g. `2026-05-28T21:00:00Z`).
+    ///
+    /// By default an offline `--plan-out` build prunes against the chart's
+    /// replay-cursor (the visible range's right edge) so a historical replay
+    /// keeps blackouts that are still *upcoming* relative to the cursor; a
+    /// live `--register-plan` build prunes against wall-clock now. This flag
+    /// forces an explicit cursor for headless / cron replays where no live
+    /// chart range is readable. Ignored on the `--register-plan` live path.
+    #[arg(long)]
+    pub as_of: Option<String>,
+
     /// Half-width of the price band around each chart-drawn
     /// `support` / `resistance` line, as a percent of the line's
     /// price. Default 0.1 (= ±0.1% of price). Ignored when no
