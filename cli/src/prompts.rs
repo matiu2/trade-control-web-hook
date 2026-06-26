@@ -94,11 +94,16 @@ pub fn required_for_action(action: Action) -> &'static [&'static str] {
         // `tv-arm` from the chart geometry — never hand-built through the
         // interactive questionnaire, so nothing extra is prompted here.
         Action::Register => &[],
-        // plan-list / plan-show / plan-delete are engine ops minted by the
-        // dedicated `trade-control plan` subcommand (plan-show / plan-delete
-        // name their target via `trade_id`), never through the interactive
-        // questionnaire.
-        Action::PlanList | Action::PlanShow | Action::PlanDelete => &[],
+        // plan-list / plan-show / plan-delete / plan-purge are engine ops
+        // minted by the dedicated `trade-control plan` subcommand (they name
+        // their target via `trade_id`); purge-older-than is the bulk R2 sweep
+        // from `trade-control purge` (cutoff in `not_before`). None go through
+        // the interactive questionnaire.
+        Action::PlanList
+        | Action::PlanShow
+        | Action::PlanDelete
+        | Action::PlanPurge
+        | Action::PurgeOlderThan => &[],
     }
 }
 

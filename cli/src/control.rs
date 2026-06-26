@@ -179,6 +179,37 @@ pub fn build_plan_delete_intent(trade_id: &str, now: DateTime<Utc>, suffix: &str
     intent
 }
 
+/// Build a `plan-purge` `Intent` for one `trade_id` — a superset of
+/// `plan-delete` that also drops the trade's per-trade lifecycle rows
+/// (entry-attempt / order-body / control-event), enumerable trade-scoped
+/// controls (pause / news), and its R2 `ticks/` bundles. Use after journaling.
+pub fn build_plan_purge_intent(trade_id: &str, now: DateTime<Utc>, suffix: &str) -> Intent {
+    let id = format!(
+        "plan-purge-{trade_id}-{}-{suffix}",
+        now.format("%Y-%m-%dT%H%M%S")
+    );
+    let mut intent = control_skeleton(Action::PlanPurge, STATUS_INSTRUMENT, id, now);
+    intent.trade_id = Some(trade_id.to_string());
+    intent
+}
+
+/// Build a `purge-older-than` `Intent`. The `cutoff` is carried in
+/// `not_before` (reused as "delete R2 bundles dated before this"); the worker
+/// sweeps both `req/` and `ticks/`. No `trade_id` — it's a bulk date sweep.
+pub fn build_purge_older_than_intent(
+    cutoff: DateTime<Utc>,
+    now: DateTime<Utc>,
+    suffix: &str,
+) -> Intent {
+    let id = format!(
+        "purge-older-than-{}-{suffix}",
+        now.format("%Y-%m-%dT%H%M%S")
+    );
+    let mut intent = control_skeleton(Action::PurgeOlderThan, STATUS_INSTRUMENT, id, now);
+    intent.not_before = Some(cutoff);
+    intent
+}
+
 /// Build a `prep` Intent for a single (instrument, step) pair with a TTL.
 ///
 /// `clears` is the list of other prep steps to drop before recording

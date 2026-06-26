@@ -16,6 +16,7 @@ mod cron;
 mod diag;
 mod market_blackout;
 mod market_info;
+mod r2_purge;
 mod recover_entry;
 mod spread_blackout;
 mod state;
@@ -249,6 +250,15 @@ pub async fn main(mut req: Request, env: Env, ctx: Context) -> Result<Response> 
             Action::PlanList => break 'intent handle_plan_list(&store, &verified, now).await,
             Action::PlanShow => break 'intent handle_plan_show(&store, &verified, now).await,
             Action::PlanDelete => break 'intent handle_plan_delete(&store, &verified, now).await,
+            // PlanPurge / PurgeOlderThan touch R2 (the `env`), so — like
+            // MarketInfo — they're dispatched here with `env` in scope rather
+            // than through the broker-less `run_action`.
+            Action::PlanPurge => {
+                break 'intent handle_plan_purge(&store, &env, &verified, now).await;
+            }
+            Action::PurgeOlderThan => {
+                break 'intent handle_purge_older_than(&env, &verified, now).await;
+            }
             _ => {}
         }
 
@@ -552,6 +562,8 @@ async fn run_action<B: Broker>(
         | Action::PlanList
         | Action::PlanShow
         | Action::PlanDelete
+        | Action::PlanPurge
+        | Action::PurgeOlderThan
         // MarketInfo needs the concrete TradeNation broker (its `market_info`
         // is not on the generic `Broker` trait), so it's dispatched in the
         // broker-acquire section before this generic function — never here.
@@ -597,6 +609,18 @@ pub(crate) async fn run_invalidate<B: Broker>(
             outcome: "rejected: state-error".into(),
         };
     }
+    record_control_event_for(
+        store,
+        account,
+        verified.intent.trade_id.as_deref(),
+        trade_control_core::control_event::ControlKind::Cooldown,
+        "",
+        &verified.intent.instrument,
+        (hours as u64).saturating_mul(3600),
+        now,
+        None,
+    )
+    .await;
     let cancelled = broker
         .cancel_pending_for_instrument(&verified.intent.instrument)
         .await;
@@ -867,6 +891,18 @@ async fn write_reversal_veto(
         rlog_err!("KV set_veto (reversal): {err}");
         return;
     }
+    record_control_event_for(
+        store,
+        plan.account,
+        Some(plan.trade_id),
+        trade_control_core::control_event::ControlKind::Veto,
+        REVERSAL_VETO_NAME,
+        plan.instrument,
+        plan.ttl_seconds,
+        now,
+        None,
+    )
+    .await;
     rlog!(
         "reversal veto set: instrument={} account={} trade_id={} name={REVERSAL_VETO_NAME} ttl={}s",
         plan.instrument,
@@ -1797,19 +1833,18 @@ pub(crate) async fn run_enter<B: Broker>(
                 // body keyed by the broker order id so the apply cron can
                 // recover THIS order's intent (it finds a broker pending order,
                 // never a signed intent) and re-drive it on recovery. Only when
-                // we have the signed bytes in hand; TTL tracks the alert window
-                // (`not_after` + grace) so a never-cancelled order's body ages
-                // out with its EntryAttempt. Best-effort: a write failure only
-                // costs the blackout-restore ability for this one order, never
-                // the placement.
-                if let Some(body) = raw_body {
-                    let ttl = incoming::replay_ttl_seconds(verified.intent.not_after, now);
-                    if let Err(err) = store.put_order_body(&order_id, body, ttl).await {
-                        rlog_err!(
-                            "order-body store for blackout-restore failed (order={order_id}): {err} \
-                             — this order can't be blackout-cancelled+restored"
-                        );
-                    }
+                // we have the signed bytes in hand. No TTL — the body is
+                // per-trade lifecycle state and is removed by `plan purge`
+                // (no longer aged out with its EntryAttempt). Best-effort: a
+                // write failure only costs the blackout-restore ability for this
+                // one order, never the placement.
+                if let Some(body) = raw_body
+                    && let Err(err) = store.put_order_body(&order_id, body).await
+                {
+                    rlog_err!(
+                        "order-body store for blackout-restore failed (order={order_id}): {err} \
+                         — this order can't be blackout-cancelled+restored"
+                    );
                 }
                 ActionResult::Ok(format!("entered: order={order_id}"))
             }
@@ -1933,6 +1968,18 @@ async fn maybe_update_mw_state<B: Broker>(
             {
                 rlog_err!("mw-state cancel: set_veto failed (trade_id={trade_id}): {err}");
             }
+            record_control_event_for(
+                store,
+                account,
+                Some(trade_id),
+                trade_control_core::control_event::ControlKind::Veto,
+                MW_CANCEL_VETO_NAME,
+                &intent.instrument,
+                ttl_seconds,
+                now,
+                None,
+            )
+            .await;
             // Clear the state row so a re-armed setup reusing the trade_id
             // starts clean. Best-effort.
             if let Err(err) = store.clear_mw_state(account, trade_id).await {
@@ -2152,6 +2199,41 @@ pub(crate) async fn record_seen<S: StateStore>(
     }
 }
 
+/// Append a [`ControlEvent`] audit row alongside a TTL'd control set.
+///
+/// Best-effort and **non-blocking**: a failure is logged and swallowed — the
+/// live control row was already set, and the audit trail must never gate it.
+/// Skipped when there's no `trade_id` to scope it to (the trail is per-trade;
+/// a `cooldown`/blackout set without a trade_id can't be journaled per trade).
+/// `request_id` links the event back to its R2 `req/` bundle when known.
+#[allow(clippy::too_many_arguments)]
+async fn record_control_event_for<S: StateStore>(
+    store: &S,
+    account: Option<&str>,
+    trade_id: Option<&str>,
+    kind: trade_control_core::control_event::ControlKind,
+    name: &str,
+    instrument: &str,
+    ttl_seconds: u64,
+    now: chrono::DateTime<chrono::Utc>,
+    request_id: Option<String>,
+) {
+    let Some(trade_id) = trade_id else {
+        return;
+    };
+    let event = trade_control_core::control_event::ControlEvent::new(
+        kind,
+        name,
+        instrument,
+        now,
+        ttl_seconds,
+        request_id,
+    );
+    if let Err(err) = store.record_control_event(account, trade_id, &event).await {
+        rlog_err!("KV record_control_event ({}/{name}): {err}", kind.tag());
+    }
+}
+
 /// Handle the `unlock` action: clear the cooldown for `verified.intent.instrument`.
 async fn handle_unlock(
     store: &KvStateStore,
@@ -2269,6 +2351,18 @@ async fn handle_prep(
         rlog_err!("KV set_prep: {err}");
         return Response::error("state error", 500);
     }
+    record_control_event_for(
+        store,
+        account,
+        verified.intent.trade_id.as_deref(),
+        trade_control_core::control_event::ControlKind::Prep,
+        step,
+        &verified.intent.instrument,
+        ttl_seconds,
+        now,
+        None,
+    )
+    .await;
     rlog!(
         "prep set: instrument={} account={} step={} ttl={}h cleared={:?}",
         verified.intent.instrument,
@@ -2414,6 +2508,18 @@ async fn handle_veto(
         rlog_err!("KV set_veto: {err}");
         return Response::error("state error", 500);
     }
+    record_control_event_for(
+        store,
+        account,
+        Some(trade_id),
+        trade_control_core::control_event::ControlKind::Veto,
+        name,
+        &verified.intent.instrument,
+        ttl_seconds,
+        now,
+        None,
+    )
+    .await;
     rlog!(
         "veto set: instrument={} account={} name={} ttl={}h cleared={:?}",
         verified.intent.instrument,
@@ -2524,6 +2630,18 @@ async fn run_veto_with_broker<B: Broker>(
             outcome: "rejected: state-error".into(),
         };
     }
+    record_control_event_for(
+        store,
+        account,
+        Some(trade_id),
+        trade_control_core::control_event::ControlKind::Veto,
+        name,
+        instrument,
+        ttl_seconds,
+        now,
+        None,
+    )
+    .await;
 
     let cancelled = broker.cancel_pending_for_instrument(instrument).await;
     let closed_ok = match level {
@@ -2690,6 +2808,18 @@ async fn handle_pause(
         rlog_err!("KV set_pause: {err}");
         return Response::error("state error", 500);
     }
+    record_control_event_for(
+        store,
+        verified.intent.account.as_deref(),
+        Some(trade_id),
+        trade_control_core::control_event::ControlKind::Pause,
+        blackout_id,
+        &verified.intent.instrument,
+        ttl_seconds,
+        now,
+        None,
+    )
+    .await;
     rlog!(
         "pause set: trade_id={trade_id} blackout_id={blackout_id} reason={:?}",
         reason
@@ -2759,6 +2889,18 @@ async fn handle_news_start(
         rlog_err!("KV set_news_window: {err}");
         return Response::error("state error", 500);
     }
+    record_control_event_for(
+        store,
+        verified.intent.account.as_deref(),
+        Some(trade_id),
+        trade_control_core::control_event::ControlKind::News,
+        news_id,
+        &verified.intent.instrument,
+        ttl_seconds,
+        now,
+        None,
+    )
+    .await;
     rlog!(
         "news-start: trade_id={trade_id} news_id={news_id} reason={:?}",
         reason
@@ -3202,6 +3344,141 @@ async fn handle_plan_delete(
     };
     record_seen(store, verified, now, &outcome).await;
     Response::ok(outcome)
+}
+
+/// Handle the `plan-purge` action: delete **every** trace of a journaled trade.
+///
+/// A superset of [`handle_plan_delete`]. Beyond the `plan:` / `plan-state:` /
+/// `archived-plan:` rows that delete drops, purge also clears the no-TTL
+/// per-trade lifecycle rows — `entry-attempt:` (and the `order-body:` rows their
+/// `broker_trade_id`/order ids point at), `control-event:` — plus the
+/// enumerable trade-scoped control rows (`pause:` / `news:`), and deletes the
+/// trade's R2 `ticks/` bundles. Idempotent: purging a trade with nothing left is
+/// a no-op `ok`, not an error.
+///
+/// `veto:` / `prep:` rows are intentionally **not** swept here: they keep their
+/// window TTL (expiry is their feature) and self-clear, and their lifecycle is
+/// already captured durably in the `control-event:` trail this purge drops. So
+/// purge removes the *audit + lifecycle* state, not the still-live control gates
+/// (which a purge of a finished trade has none of anyway).
+async fn handle_plan_purge(
+    store: &KvStateStore,
+    env: &Env,
+    verified: &incoming::Verified,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<Response> {
+    let Some(target) = verified.intent.trade_id.as_deref() else {
+        return Response::error("plan-purge requires a `trade_id`", 400);
+    };
+
+    // 1) Drop the plan / state / archived rows across every scope (same scan as
+    //    plan-delete). We re-list rather than call handle_plan_delete so we keep
+    //    the per-scope account for the lifecycle-row clears below.
+    let plans = store.list_all_trade_plans().await.unwrap_or_default();
+    let archived = store.list_all_archived_plans().await.unwrap_or_default();
+    let scopes: Vec<Option<String>> = plans
+        .iter()
+        .filter(|s| s.plan.trade_id == target)
+        .map(|s| s.account.clone())
+        .chain(
+            archived
+                .iter()
+                .filter(|s| s.plan.trade_id == target)
+                .map(|s| s.account.clone()),
+        )
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect();
+
+    // If no plan/archive names this trade, still attempt a global-scope sweep of
+    // the lifecycle rows (a trade can be purged after its plan rows already aged
+    // out / were deleted).
+    let scopes = if scopes.is_empty() {
+        vec![None]
+    } else {
+        scopes
+    };
+
+    let mut cleared = 0usize;
+    for scope in &scopes {
+        let account = scope.as_deref();
+        // entry-attempts → also drop each attempt's order-body, then the attempt.
+        if let Ok(attempts) = store.list_entry_attempts(account, target).await {
+            for a in &attempts {
+                if let Some(oid) = &a.broker_trade_id
+                    && store.delete_order_body(oid).await.is_ok()
+                {
+                    cleared += 1;
+                }
+                if store
+                    .delete_entry_attempt(account, target, a.attempt_no)
+                    .await
+                    .is_ok()
+                {
+                    cleared += 1;
+                }
+            }
+        }
+        // pauses + news windows (trade-scoped, enumerable).
+        if let Ok(pauses) = store.list_pauses_for_trade(target).await {
+            for p in &pauses {
+                if store.clear_pause(target, &p.blackout_id).await.is_ok() {
+                    cleared += 1;
+                }
+            }
+        }
+        if let Ok(windows) = store.list_news_windows_for_trade(target).await {
+            for w in &windows {
+                if store.clear_news_window(target, &w.news_id).await.is_ok() {
+                    cleared += 1;
+                }
+            }
+        }
+        // control-event audit trail.
+        if store.clear_control_events(account, target).await.is_ok() {
+            cleared += 1;
+        }
+        // plan / state / archived.
+        store.clear_trade_plan(account, target).await.ok();
+        store.clear_plan_state(account, target).await.ok();
+        store.clear_archived_plan(account, target).await.ok();
+    }
+
+    // 2) R2 tick bundles for this trade.
+    let r2_deleted = r2_purge::purge_trade_ticks(env, target)
+        .await
+        .unwrap_or_else(|err| {
+            rlog_err!("plan-purge: R2 ticks purge failed for {target}: {err}");
+            0
+        });
+
+    rlog!("plan-purge: trade_id={target} kv_cleared={cleared} r2_ticks_deleted={r2_deleted}");
+    let outcome = format!("plan-purged: {target} (kv={cleared} r2={r2_deleted})");
+    record_seen(store, verified, now, &outcome).await;
+    Response::ok(outcome)
+}
+
+/// Handle the `purge-older-than` action: bulk-delete R2 `req/` + `ticks/`
+/// bundles whose date partition is strictly older than the cutoff carried in
+/// `intent.not_before`. KV is untouched (per-trade KV rows are dropped by
+/// `plan purge`). Manual retention housekeeping for the no-TTL recording bucket.
+async fn handle_purge_older_than(
+    env: &Env,
+    verified: &incoming::Verified,
+    _now: chrono::DateTime<chrono::Utc>,
+) -> Result<Response> {
+    let Some(cutoff) = verified.intent.not_before else {
+        return Response::error("purge-older-than requires a cutoff in `not_before`", 400);
+    };
+    let deleted = match r2_purge::purge_older_than(env, cutoff).await {
+        Ok(n) => n,
+        Err(err) => {
+            rlog_err!("purge-older-than: {err}");
+            return Response::error("r2 purge error", 500);
+        }
+    };
+    rlog!("purge-older-than: cutoff={cutoff} r2_deleted={deleted}");
+    Response::ok(format!("purged-older-than: {cutoff} ({deleted})"))
 }
 
 /// Resolve an [`OandaBroker`] for the request.
@@ -3981,11 +4258,32 @@ mod dispatcher_outcome_tests {
             _account: Option<&str>,
             _trade_id: &str,
             _state: &trade_control_core::plan_state::PlanState,
-            _ttl_seconds: u64,
         ) -> Result<(), StateError> {
             Ok(())
         }
         async fn clear_plan_state(
+            &self,
+            _account: Option<&str>,
+            _trade_id: &str,
+        ) -> Result<(), StateError> {
+            Ok(())
+        }
+        async fn record_control_event(
+            &self,
+            _account: Option<&str>,
+            _trade_id: &str,
+            _event: &trade_control_core::control_event::ControlEvent,
+        ) -> Result<(), StateError> {
+            Ok(())
+        }
+        async fn list_control_events(
+            &self,
+            _account: Option<&str>,
+            _trade_id: &str,
+        ) -> Result<Vec<trade_control_core::control_event::ControlEvent>, StateError> {
+            Ok(Vec::new())
+        }
+        async fn clear_control_events(
             &self,
             _account: Option<&str>,
             _trade_id: &str,

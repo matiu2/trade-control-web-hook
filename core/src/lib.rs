@@ -8,6 +8,7 @@
 pub mod account;
 pub mod blackout_recreate;
 pub mod broker;
+pub mod control_event;
 pub mod incoming;
 pub mod intent;
 pub mod ny_clock;

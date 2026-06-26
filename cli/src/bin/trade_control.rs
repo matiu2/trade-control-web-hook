@@ -25,7 +25,8 @@ use trade_control_cli::{
     AdoptBody, BuildStrictness, CalendarBarsArgs, KEY_LEN, TradePattern, add_account, adopt_trade,
     build_clear_prep_intent, build_clear_veto_intent, build_market_info_intent,
     build_news_from_spec, build_pause_from_spec, build_plan_delete_intent, build_plan_list_intent,
-    build_plan_show_intent, build_prep_intent, build_status_intent, build_trade_from_spec,
+    build_plan_purge_intent, build_plan_show_intent, build_prep_intent,
+    build_purge_older_than_intent, build_status_intent, build_trade_from_spec,
     build_trade_interactive, build_unlock_intent, build_veto_intent, delete_account, delete_secret,
     fill_missing_fields, generate_key_hex, list_accounts, load_cache, load_news_spec_from_file,
     load_pause_spec_from_file, load_spec_from_file, pick_pattern_interactive,
@@ -152,6 +153,10 @@ enum Cmd {
     /// shadow mode, and how far its FSM has progressed.
     #[command(subcommand)]
     Plan(PlanCmd),
+    /// Bulk-delete R2 recording bundles (`req/` + `ticks/`) older than a
+    /// cutoff — manual retention housekeeping for the no-TTL recording bucket.
+    /// Per-trade KV rows are dropped by `plan purge`, not here.
+    Purge(PurgeArgs),
     /// Print a shell completion script to stdout. Install with e.g.
     /// `trade-control completions zsh > ~/.zfunc/_trade-control`.
     Completions {
@@ -174,6 +179,11 @@ enum PlanCmd {
     /// no-op). Use to re-arm a setup after editing its chart: `plan delete
     /// <id>` then re-run `tv-arm`.
     Delete(PlanDeleteArgs),
+    /// Purge **every** trace of a journaled trade — a superset of `delete`.
+    /// Also clears the no-TTL per-trade rows (entry-attempt / order-body /
+    /// control-event), enumerable trade-scoped controls (pause / news), and the
+    /// trade's R2 `ticks/` bundles. Use after the trade is journaled/logged.
+    Purge(PlanPurgeArgs),
 }
 
 #[derive(Parser)]
@@ -207,6 +217,25 @@ struct PlanShowArgs {
 struct PlanDeleteArgs {
     /// The plan's `trade_id` (e.g. `eurusd-hs-7`).
     trade_id: String,
+    #[command(flatten)]
+    common: EndpointArgs,
+}
+
+#[derive(Parser)]
+struct PlanPurgeArgs {
+    /// The trade's `trade_id` to purge (e.g. `eurusd-hs-7`).
+    trade_id: String,
+    #[command(flatten)]
+    common: EndpointArgs,
+}
+
+#[derive(Parser)]
+struct PurgeArgs {
+    /// Delete recording bundles older than this many **days** (e.g. `7` for a
+    /// week, `30` for a month). The cutoff is `now - <days>`; bundles whose date
+    /// partition is strictly before it are deleted.
+    #[arg(long = "older-than")]
+    older_than_days: u32,
     #[command(flatten)]
     common: EndpointArgs,
 }
@@ -747,6 +776,7 @@ fn main() -> Result<()> {
         }
         Cmd::Instruments(sub) => run_instruments(sub)?,
         Cmd::Plan(sub) => run_plan(sub)?,
+        Cmd::Purge(args) => run_purge(args)?,
         Cmd::Completions { shell } => run_completions(shell),
     }
     Ok(())
@@ -1160,6 +1190,7 @@ fn run_plan(sub: PlanCmd) -> Result<()> {
         PlanCmd::List(args) => run_plan_list(args),
         PlanCmd::Show(args) => run_plan_show(args),
         PlanCmd::Delete(args) => run_plan_delete(args),
+        PlanCmd::Purge(args) => run_plan_purge(args),
     }
 }
 
@@ -1216,6 +1247,33 @@ fn run_plan_delete(args: PlanDeleteArgs) -> Result<()> {
     let now = Utc::now();
     let suffix = fresh_suffix()?;
     let intent = build_plan_delete_intent(&args.trade_id, now, &suffix);
+    let body = wrap_control(&intent, &key, now)?;
+    let response = post_control(&args.common.endpoint, &body)?;
+    print_raw(&response);
+    Ok(())
+}
+
+/// `plan purge <trade_id>` — superset of delete: also clears per-trade
+/// lifecycle rows + the trade's R2 ticks. Prints the worker's response verbatim.
+fn run_plan_purge(args: PlanPurgeArgs) -> Result<()> {
+    let key = load_key(&args.common.key_file)?;
+    let now = Utc::now();
+    let suffix = fresh_suffix()?;
+    let intent = build_plan_purge_intent(&args.trade_id, now, &suffix);
+    let body = wrap_control(&intent, &key, now)?;
+    let response = post_control(&args.common.endpoint, &body)?;
+    print_raw(&response);
+    Ok(())
+}
+
+/// `purge --older-than <days>` — bulk R2 retention sweep. Computes the cutoff
+/// `now - days` client-side and signs it onto the intent's `not_before`.
+fn run_purge(args: PurgeArgs) -> Result<()> {
+    let key = load_key(&args.common.key_file)?;
+    let now = Utc::now();
+    let suffix = fresh_suffix()?;
+    let cutoff = now - chrono::Duration::days(args.older_than_days as i64);
+    let intent = build_purge_older_than_intent(cutoff, now, &suffix);
     let body = wrap_control(&intent, &key, now)?;
     let response = post_control(&args.common.endpoint, &body)?;
     print_raw(&response);

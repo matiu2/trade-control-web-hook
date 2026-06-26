@@ -1039,11 +1039,32 @@ mod tests {
             _account: Option<&str>,
             _trade_id: &str,
             _state: &crate::plan_state::PlanState,
-            _ttl_seconds: u64,
         ) -> Result<(), StateError> {
             Ok(())
         }
         async fn clear_plan_state(
+            &self,
+            _account: Option<&str>,
+            _trade_id: &str,
+        ) -> Result<(), StateError> {
+            Ok(())
+        }
+        async fn record_control_event(
+            &self,
+            _account: Option<&str>,
+            _trade_id: &str,
+            _event: &crate::control_event::ControlEvent,
+        ) -> Result<(), StateError> {
+            Ok(())
+        }
+        async fn list_control_events(
+            &self,
+            _account: Option<&str>,
+            _trade_id: &str,
+        ) -> Result<Vec<crate::control_event::ControlEvent>, StateError> {
+            Ok(Vec::new())
+        }
+        async fn clear_control_events(
             &self,
             _account: Option<&str>,
             _trade_id: &str,
