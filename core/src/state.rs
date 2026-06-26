@@ -11,6 +11,7 @@ use std::future::Future;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+use crate::control_event::ControlEvent;
 use crate::intent::{Action, BlackoutCloseAction, Direction, NoEntryWindow};
 use crate::plan_state::PlanState;
 use crate::trade_plan::TradePlan;
@@ -997,19 +998,59 @@ pub trait StateStore {
     ) -> impl Future<Output = Result<Option<PlanState>, StateError>>;
 
     /// Create-or-update the engine's [`PlanState`] for `(account, trade_id)`.
-    /// Overwrites the prior row + refreshes TTL. Written every tick that the
-    /// watermark advances (re-set keeps an active plan's state from ageing out).
+    /// Overwrites the prior row. Written every tick that the watermark advances.
+    ///
+    /// **No TTL** — like [`Self::put_trade_plan`] and [`Self::archive_plan`], the
+    /// state row persists until the plan is retired (`clear_plan_state` on the
+    /// engine's `done` branch or a `plan delete`/`plan purge`). It used to carry
+    /// a flat ~1-day TTL; when that aged out while the plan was still live, the
+    /// next tick read `None`, **re-seeded** (jumping the watermark to "now" and
+    /// firing nothing), and silently skipped any price-cross veto in the gap —
+    /// bug #15 (the unfixed half of the 2026-06-23 `plan:`-TTL fix). The live
+    /// `plan:` row already lives forever, so its state row must too.
     fn put_plan_state(
         &self,
         account: Option<&str>,
         trade_id: &str,
         state: &PlanState,
-        ttl_seconds: u64,
     ) -> impl Future<Output = Result<(), StateError>>;
 
     /// Delete the engine's [`PlanState`] row. Best-effort. Called alongside
     /// [`Self::clear_trade_plan`] when a plan finishes.
     fn clear_plan_state(
+        &self,
+        account: Option<&str>,
+        trade_id: &str,
+    ) -> impl Future<Output = Result<(), StateError>>;
+
+    // ----- Control-event audit trail -----
+
+    /// Append a durable, **no-TTL** [`ControlEvent`] recording that a
+    /// TTL-carrying control row (cooldown/veto/prep/pause/news/blackout) was
+    /// set. KV deletes the live control row passively when its TTL lapses, with
+    /// no trace; this row preserves the set→expire lifecycle for journaling /
+    /// debugging until `plan purge`. Keyed
+    /// `control-event:{scope}:{trade_id}:{event.key_suffix()}` — append-only
+    /// (a later set of the same control is a distinct event). Best-effort at the
+    /// call site: a write failure must never block the control set itself.
+    fn record_control_event(
+        &self,
+        account: Option<&str>,
+        trade_id: &str,
+        event: &ControlEvent,
+    ) -> impl Future<Output = Result<(), StateError>>;
+
+    /// List every [`ControlEvent`] recorded for `(account, trade_id)`, ascending
+    /// by `set_at`. Read by `plan show` / journaling.
+    fn list_control_events(
+        &self,
+        account: Option<&str>,
+        trade_id: &str,
+    ) -> impl Future<Output = Result<Vec<ControlEvent>, StateError>>;
+
+    /// Delete every control-event row for `(account, trade_id)`. Called by
+    /// `plan purge`. Best-effort.
+    fn clear_control_events(
         &self,
         account: Option<&str>,
         trade_id: &str,
@@ -2006,12 +2047,14 @@ mod memstore {
             account: Option<&str>,
             trade_id: &str,
             state: &PlanState,
-            ttl_seconds: u64,
         ) -> Result<(), StateError> {
             let key = format!("plan-state:{}:{trade_id}", account_scope(account));
             let body = serde_json::to_string(state)
                 .map_err(|e| StateError::Backend(format!("encode plan-state: {e}")))?;
-            self.put(key, body, ttl_seconds.max(MIN_TTL_SECONDS), self.now());
+            // No TTL (mirrors `put_trade_plan`/`archive_plan`): the state row
+            // lives as long as its plan. The in-memory store keys on expiry, so
+            // use a far-future stamp.
+            self.put(key, body, NO_TTL_SECONDS, self.now());
             Ok(())
         }
 
@@ -2021,6 +2064,54 @@ mod memstore {
             trade_id: &str,
         ) -> Result<(), StateError> {
             self.delete(&format!("plan-state:{}:{trade_id}", account_scope(account)));
+            Ok(())
+        }
+
+        async fn record_control_event(
+            &self,
+            account: Option<&str>,
+            trade_id: &str,
+            event: &ControlEvent,
+        ) -> Result<(), StateError> {
+            let key = format!(
+                "control-event:{}:{trade_id}:{}",
+                account_scope(account),
+                event.key_suffix()
+            );
+            let body = serde_json::to_string(event)
+                .map_err(|e| StateError::Backend(format!("encode control-event: {e}")))?;
+            // No TTL: the audit trail outlives the (TTL'd) live control row.
+            self.put(key, body, NO_TTL_SECONDS, self.now());
+            Ok(())
+        }
+
+        async fn list_control_events(
+            &self,
+            account: Option<&str>,
+            trade_id: &str,
+        ) -> Result<Vec<ControlEvent>, StateError> {
+            let prefix = format!("control-event:{}:{trade_id}:", account_scope(account));
+            let now = self.now();
+            let mut events: Vec<ControlEvent> = self
+                .inner
+                .borrow()
+                .iter()
+                .filter(|(k, (_, exp))| k.starts_with(&prefix) && *exp > now)
+                .filter_map(|(_, (v, _))| serde_json::from_str(v).ok())
+                .collect();
+            events.sort_by_key(|e: &ControlEvent| e.set_at);
+            Ok(events)
+        }
+
+        async fn clear_control_events(
+            &self,
+            account: Option<&str>,
+            trade_id: &str,
+        ) -> Result<(), StateError> {
+            let prefix = format!("control-event:{}:{trade_id}:", account_scope(account));
+            self.inner
+                .borrow_mut()
+                .retain(|k, _| !k.starts_with(&prefix));
             Ok(())
         }
 
@@ -3562,17 +3653,80 @@ mod tests {
         st.watermark = Some(ts("2026-06-16T12:00:00Z"));
         st.last_close.insert("01-veto-too-high".into(), 1.2345);
 
-        pollster::block_on(store.put_plan_state(Some("reversals"), "hs-1", &st, 3600)).unwrap();
+        pollster::block_on(store.put_plan_state(Some("reversals"), "hs-1", &st)).unwrap();
         let got = pollster::block_on(store.get_plan_state(Some("reversals"), "hs-1"))
             .unwrap()
             .expect("plan-state present");
         assert_eq!(got, st);
+
+        // The state row carries no TTL (bug #15): its expiry must be far-future
+        // like the `plan:` row, not a flat ~1-day stamp that could age out
+        // mid-trade and trigger a watermark-skipping re-seed.
+        let exp = store
+            .expiry_of("plan-state:reversals:hs-1")
+            .expect("plan-state stored");
+        assert!(
+            exp > Utc::now() + chrono::Duration::days(365),
+            "plan-state expiry must be far-future, got {exp}"
+        );
 
         pollster::block_on(store.clear_plan_state(Some("reversals"), "hs-1")).unwrap();
         assert!(
             pollster::block_on(store.get_plan_state(Some("reversals"), "hs-1"))
                 .unwrap()
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn memstore_control_events_append_list_and_clear() {
+        use super::memstore::MemStateStore;
+        use crate::control_event::{ControlEvent, ControlKind};
+        let store = MemStateStore::new();
+
+        let a = ControlEvent::new(
+            ControlKind::Veto,
+            "too-low",
+            "GBP/USD",
+            ts("2026-06-24T01:00:00Z"),
+            3600,
+            None,
+        );
+        let b = ControlEvent::new(
+            ControlKind::Cooldown,
+            "",
+            "GBP/USD",
+            ts("2026-06-24T02:00:00Z"),
+            8 * 3600,
+            Some("req-1".into()),
+        );
+        // Insert out of order; list must come back ascending by set_at.
+        pollster::block_on(store.record_control_event(Some("reversals"), "hs-1", &b)).unwrap();
+        pollster::block_on(store.record_control_event(Some("reversals"), "hs-1", &a)).unwrap();
+
+        let got = pollster::block_on(store.list_control_events(Some("reversals"), "hs-1")).unwrap();
+        assert_eq!(got, vec![a.clone(), b.clone()]);
+
+        // The audit row is no-TTL (far-future expiry), so it outlives the live
+        // control row it records.
+        let exp = store
+            .expiry_of(&format!("control-event:reversals:hs-1:{}", a.key_suffix()))
+            .expect("control-event stored");
+        assert!(exp > Utc::now() + chrono::Duration::days(365));
+
+        // Scoping: a different trade_id sees none of these.
+        assert!(
+            pollster::block_on(store.list_control_events(Some("reversals"), "other"))
+                .unwrap()
+                .is_empty()
+        );
+
+        // Clear drops all of this trade's events.
+        pollster::block_on(store.clear_control_events(Some("reversals"), "hs-1")).unwrap();
+        assert!(
+            pollster::block_on(store.list_control_events(Some("reversals"), "hs-1"))
+                .unwrap()
+                .is_empty()
         );
     }
 

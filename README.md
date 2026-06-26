@@ -5,9 +5,9 @@ TradeNation trades. The body is cleartext YAML with an HMAC-SHA256
 signature, so a leaked webhook URL can't be weaponised by anyone who
 doesn't also have the signing key.
 
-Thirteen actions are supported. The first five are the day-to-day trading
+Fifteen actions are supported. The first five are the day-to-day trading
 verbs; the rest are state management for multi-event setups and scheduled
-windows.
+windows, plus the journaling-cleanup purge commands.
 
 Trading:
 
@@ -86,6 +86,19 @@ Trading:
   analysis). Drives `trade-control plan delete <trade_id>`. KV-only, idempotent
   (deleting a missing plan is a no-op). Use to re-arm a setup after editing its
   chart, or to clear an archived plan once analyzed.
+- `plan-purge` — wipe **every** trace of one journaled trade. A superset of
+  `plan-delete`: it scans all account scopes and removes the per-trade KV rows
+  (`plan:` / `plan-state:` / `archived-plan:`, plus the trade's
+  `entry-attempt:` rows and each attempt's `order-body:`, the `control-event:`
+  audit trail, and any enumerable trade-scoped `pause:` / `news:` rows) **and**
+  the trade's R2 `ticks/` bundles. Window-TTL'd `veto:` / `prep:` rows are left
+  to self-clear (their lifecycle is already in the control-event trail). Target
+  named by the intent's `trade_id`. Drives `trade-control plan purge
+  <trade_id>`; idempotent.
+- `purge-older-than` — bulk R2 retention sweep. Deletes recorded bundles under
+  both the `req/` and `ticks/` prefixes whose date prefix is older than a cutoff
+  (carried as N days on the intent). KV is untouched. Drives `trade-control
+  purge --older-than <days>`.
 - `unlock` — clear the cooldown for one instrument. Recovery for an
   `invalidate` you didn't mean to send.
 
@@ -1102,6 +1115,11 @@ trade. If the binding is absent the worker logs one
 (`wrangler r2 bucket create …`), and the deploy API token to hold
 *Workers R2 Storage: Edit*. See the deploy notes for the exact steps.
 
+**Retention.** R2 bundles are **no-TTL** — they persist until a purge command
+removes them. Wipe one trade's `ticks/` with `plan purge <trade_id>`, or run a
+bulk date sweep over `req/` + `ticks/` with `purge --older-than <days>` (see the
+KV namespace "Row lifetimes" note and the CLI section).
+
 ### Engine tick-bundles (`ticks/` prefix)
 
 The cron engine (`src/cron/engine.rs`) — not an inbound HTTP alert — is where
@@ -1799,6 +1817,40 @@ Create the namespace once and paste its id into `wrangler.toml` under the
 wrangler kv:namespace create TRADE_CONTROL_KV
 ```
 
+### Row lifetimes: no-TTL per-trade rows vs TTL'd control rows
+
+KV rows fall into two classes with deliberately different lifetimes:
+
+| Class | Rows | Lifetime | Cleaned up by |
+|---|---|---|---|
+| **Per-trade lifecycle** | `plan:` · `plan-state:` · `archived-plan:` · `entry-attempt:` · `order-body:` · `control-event:` | **No TTL** — live as long as the trade matters | `plan purge <trade_id>` |
+| **Control / dedup** | `cooldown:` · `veto:` · `prep:` · `pause:` · `news:` · `spread-blackout:` · `blackout-hours:` · `seen:` · `retry-fire-seen:` | **Window-anchored TTL** — expiry *is* the intended behaviour | passive KV TTL |
+
+The split exists because a per-trade row must outlive its own window. The plan
+state row (`plan-state:`, the engine's per-trade watermark + FSM state) used to
+carry a flat ~1-day TTL; when it aged out while the plan was still live, the next
+cron tick read `None`, **re-seeded**, jumped the watermark to the newest candle,
+and silently skipped any price-cross veto in the gap (bug #15). Now every
+per-trade row is no-TTL and lives until you explicitly `plan purge` it — the
+plan and its state can't fall out of sync by expiry. For the TTL'd control rows,
+expiry is correct: a cooldown lapsing *is* the cooldown ending.
+
+**Control-event audit trail.** A TTL'd control row vanishes passively when its
+window lapses — KV writes no event and leaves no trace, so journaling a past
+trade could see (from the R2 `req/` archive) that a control was *set* but nothing
+recording that it *expired*. So every per-trade TTL'd control set (cooldown,
+veto, prep, pause, news) also writes a small no-TTL
+`control-event:{scope}:{trade_id}:{suffix}` row capturing
+kind/name/instrument/set_at/ttl_seconds/computed_expiry/request_id. That trail
+lets you reconstruct a control's set→expire lifecycle after the live row is gone.
+It's append-only, read back via `list_control_events`, and dropped by `plan
+purge`. (Global / instrument-only sets like `spread-blackout` / `blackout-hours`
+aren't per-trade, so they carry no trail.)
+
+R2 recording bundles (`req/` and `ticks/`) are likewise **no-TTL** now — they
+persist until a `plan purge <trade_id>` (per-trade `ticks/`) or a bulk `purge
+--older-than <days>` (date sweep over both prefixes) removes them.
+
 ### Index blobs are decode-tolerant
 
 State for the `status` view is kept in five JSON-array index blobs
@@ -2176,6 +2228,8 @@ trade-control-dev plan list --yaml         # raw worker YAML (one entry per plan
 trade-control-dev plan show eurusd-hs-7    # full dump of one plan + its state
 trade-control-dev plan show eurusd-hs-7 --yaml
 trade-control-dev plan delete eurusd-hs-7  # drop a plan (live and/or archived)
+trade-control-dev plan purge eurusd-hs-7   # wipe ALL KV + R2 traces of one trade
+trade-control-dev purge --older-than 90    # bulk R2 sweep: drop req/ + ticks/ older than 90d
 ```
 
 `plan list` shows `TRADE_ID`, `ACCOUNT`, `INSTRUMENT`, `SHADOW`, `PHASE`,
@@ -2213,6 +2267,22 @@ draws its news/blackout lines; if you tweak or remove some, run `plan delete
 <trade_id>` to wipe the stale server plan, then re-run `tv-arm` to register the
 corrected one; (2) after a plan vetoed and you've analyzed it via `plan list
 --include-all`, `plan delete <trade_id>` clears the archive.
+
+`plan purge <trade_id>` goes further than `plan delete`: it removes **every**
+per-trade trace once a trade is fully journaled. On top of the `plan:` /
+`plan-state:` / `archived-plan:` rows that `plan delete` drops, it also clears
+the trade's `entry-attempt:` rows (and each attempt's `order-body:`), its
+`control-event:` audit trail, any enumerable trade-scoped `pause:` / `news:`
+rows, and the trade's R2 `ticks/` bundles. Window-TTL'd `veto:` / `prep:` rows
+are intentionally left to self-clear. Use it after you've finished analyzing a
+trade and want it gone — the per-trade KV rows and R2 bundles are no longer
+TTL'd (see "Row lifetimes" under the KV namespace), so an explicit purge is the
+only thing that reclaims them.
+
+`purge --older-than <days>` is the bulk counterpart for the recording bucket: a
+retention sweep that deletes R2 objects under `req/` and `ticks/` whose date
+prefix is older than the cutoff. It never touches KV — use `plan purge` for
+per-trade KV cleanup.
 
 Skipped preps are pre-fired directly to the worker so the entry's
 `requires_preps:` gate is still satisfied — useful when joining a setup

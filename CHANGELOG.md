@@ -1,5 +1,117 @@
 # Changelog
 
+## v59 — 2026-06-27 — No-TTL per-trade rows + control-event trail + purge commands (bug #15)
+
+### Why
+
+The `plan-state:` KV row (the engine's per-trade watermark + FSM state) was
+written with a flat ~1-day TTL. When it aged out while the plan was still live,
+the next cron tick read `None`, **re-seeded** (`tick_one → seed_first_tick →
+seed_plan_state`), jumped the watermark to the newest candle, and fired nothing
+— silently skipping any **price-cross veto** in the gap (the wall-clock
+`trade-expiry` survives a re-seed; a price-cross veto does not). This was the
+unfixed half of the 2026-06-23 TTL fix (775092e), which de-TTL'd `plan:` /
+`archived-plan:` but left `plan-state:` on a flat TTL — so the state row
+outlived its plan by only ~1 day while the plan now lives forever. Reproduced on
+the GBP/USD inverse-H&S twins: `reversals` fired `01-veto-too-low` correctly;
+`experimental` re-seeded past the 15:00 cross and fired only
+`02-veto-trade-expiry` (**bug #15**).
+
+Fixing that pushed the whole per-trade-row model to no-TTL, which in turn needs
+explicit cleanup (TTL no longer reclaims the rows) and a way to review a TTL'd
+control's lifecycle after it passively vanishes — hence the control-event trail
+and the purge commands.
+
+### What changed
+
+Two classes of KV row now have deliberately different lifetimes:
+
+- **Per-trade lifecycle rows are no-TTL** — `plan:`, `plan-state:`,
+  `archived-plan:`, `entry-attempt:` (+ each attempt's `order-body:`), and the
+  new `control-event:`. They live until an explicit `plan purge`. This is what
+  fixes bug #15: the plan and its state row can no longer fall out of sync by
+  expiry.
+- **Control / dedup rows keep their window-anchored TTL** — `cooldown:`,
+  `veto:`, `prep:`, `pause:`, `news:`, `spread-blackout:`, `blackout-hours:`,
+  `seen:`, `retry-fire-seen:`. Expiry *is* their intended behaviour (a cooldown
+  lapsing is the cooldown ending).
+
+- **`put_plan_state` no longer TTLs** (drops `plan_ttl(now + 1 day)`), mirroring
+  `put_trade_plan` / `archive_plan`. `read_plan_state_settled` re-reads once on a
+  `None` before committing to a seed, so a transient KV eventual-consistency
+  read-miss can't trigger a watermark-jumping re-seed either; it logs loudly when
+  a re-seed/recovery happens.
+- **Entry-attempt + order-body rows are no-TTL too.**
+  `record_entry_attempt` / `set_entry_attempt_broker_trade_id` /
+  `put_order_body` drop their `.expiration_ttl`. The retry gate's cap
+  (`attempts.len() >= max_retries`) is scoped to one `(account, trade_id)`, so a
+  non-expiring attempt from a finished trade never affects a new trade's count.
+- **Durable control-event audit trail.** KV deletes a TTL'd control row passively
+  when its window lapses — no event, no trace. A new no-TTL
+  `control-event:{scope}:{trade_id}:{suffix}` row is written on **every** per-trade
+  TTL'd control set (cooldown / veto / prep / pause / news), capturing
+  kind/name/instrument/set_at/ttl_seconds/computed_expiry/request_id
+  (`computed_expiry = set_at + ttl`, the best available "and it lifted at…"). It
+  lets you reconstruct a control's set→expire lifecycle when journaling a past
+  trade. Append-only, read back via `list_control_events`, dropped by `plan
+  purge`. Global / instrument-only sets (spread-blackout, blackout-hours) aren't
+  per-trade and carry no trail.
+- **Purge commands.** `trade-control plan purge <trade_id>` is a superset of
+  `plan delete`: it deletes every per-trade KV row (plan / state / archived /
+  entry-attempt / order-body / control-event + enumerable trade-scoped pause /
+  news) **and** the trade's R2 `ticks/` bundles; window-TTL'd `veto:` / `prep:`
+  rows are left to self-clear (their lifecycle is in the control-event trail).
+  `trade-control purge --older-than <days>` is a bulk R2 retention sweep over
+  `req/` + `ticks/` by date prefix (KV untouched). New `src/r2_purge.rs`
+  (`purge_trade_ticks` / `purge_older_than`, fail-soft) with pure `key_date` /
+  `key_is_for_trade` helpers unit-tested (incl. the hs-1/hs-10 prefix-collision
+  case).
+- **R2 is now no-TTL** — recording bundles persist until a purge command removes
+  them.
+
+### Breaking
+
+- `StateStore` trait surface changes (all impls — KV, MemStore, retry-gate +
+  worker-test fakes — updated):
+  - **`put_plan_state` drops its `ttl_seconds` param** (now no-TTL). The
+    `plan_ttl` helper + its tests and the unused `expires_at` on
+    `persist_plan_state` are removed.
+  - **`put_order_body` drops its `ttl_seconds` param** (now no-TTL).
+  - New methods `record_control_event` / `list_control_events` /
+    `clear_control_events`.
+- New actions **`Action::PlanPurge`** (requires `trade_id`) and
+  **`Action::PurgeOlderThan`** (carries its day-count cutoff in `not_before`).
+- New `core::control_event::{ControlEvent, ControlKind}`.
+
+### Config
+
+None. No new secrets or `wrangler.toml` bindings — purge reuses the existing
+`TRADE_CONTROL_KV` + `TRADE_CONTROL_R2` bindings. (Operational note: with R2 and
+per-trade KV rows no longer TTL'd, growth is now bounded by running the purge
+commands rather than by TTL.)
+
+### Tests
+
+- `engine/tests/bug015_repro.rs` (3): the FSM fires `too-low` correctly against
+  the real TradeNation feed in every batching scenario (proving the engine was
+  never the bug), and a re-seed-after-cross reproduces the experimental twin's
+  exact `fired=[trade-expiry]` terminal state.
+- `memstore_plan_state_round_trips` now asserts the row's expiry is far-future
+  (no TTL).
+- `control_event` module (4) + `memstore_control_events_append_list_and_clear`
+  (ordering, no-TTL, trade scoping, clear).
+- `src/r2_purge.rs`: 8 tests incl. the hs-1/hs-10 prefix-collision case.
+- Full workspace green (core 605, engine 59+3 repro, worker 217 incl. 8
+  r2_purge, cli 253).
+
+### Follow-up
+
+The control-event trail covers per-trade TTL'd sets; global / instrument-only
+sets (spread-blackout, blackout-hours) still leave no trace when they lapse —
+add a trail for those only if a journaling need surfaces. The downstream
+`trade-analyzer` R2 consumer may want to read the `control-event:` data when
+reconstructing a trade's timeline.
+
 ## v58 — 2026-06-25 — Replay: cancel-and-replace a resting sibling order; no overlapping positions
 
 ### Why
