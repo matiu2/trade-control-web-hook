@@ -1217,15 +1217,21 @@ pair per event, then drops any pair whose window has already elapsed. The
 
 - **`--register-plan` (live arm):** wall-clock now — a genuinely stale event is
   still dropped before it reaches the live worker.
-- **`--plan-out` (offline / replay build):** the chart's **replay cursor** (the
-  visible range's right edge), clamped to now. So arming off a rewound chart
-  keeps a blackout that is still *upcoming relative to the cursor* even though
-  it's in the past relative to today — the replay can then reproduce a news
-  skip the live system actually made. (Before this fix the prune always used
-  wall-clock now, so every historical replay silently ran with blackouts
-  removed.) `--as-of <RFC3339>` forces an explicit cursor for headless / cron
-  replays where no live chart range is readable. The drop log line records the
-  `as_of=` it used and its `source` (`wallclock` / `replay-cursor` / `as-of-flag`).
+- **`--plan-out` (offline / replay build):** the chart's **replay cursor** —
+  `bars_range.to`, the last *loaded* bar, **not** the visible-window right edge
+  (on a rewound chart the visible window still extends past the last bar into
+  empty future space, so `visible_range.to` overshoots the cursor and would
+  prune events that are genuinely upcoming relative to it). Clamped to now. So
+  arming off a rewound chart keeps a blackout that is still *upcoming relative
+  to the cursor* even though it's in the past relative to today — the replay can
+  then reproduce a news skip the live system actually made. (Before this fix the
+  prune always used wall-clock now, so every historical replay silently ran with
+  blackouts removed.) `--as-of <RFC3339>` forces an explicit cursor for headless
+  / cron replays where no live chart range is readable. The drop log line records
+  the `as_of=` it used and its `source` (`wallclock` / `replay-cursor` /
+  `as-of-flag`). The **same as-of** flows into the pause/news/calendar-bars
+  builders so a pair that survives the prune isn't then rejected by their own
+  "refusing to arm a stale blackout" past-window guard.
 
 ## Brokers
 
