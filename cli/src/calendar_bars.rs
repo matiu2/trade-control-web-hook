@@ -554,6 +554,16 @@ pub fn print_summary_table(plan: &CalendarBarPlan) {
     }
 }
 
+/// Whether a calendar row's window has already elapsed as of `now`, so it has
+/// nothing left to arm and must be skipped rather than fed to
+/// `build_pause_from_spec` / `build_news_from_spec` (which reject a past window
+/// with a hard "stale blackout" error). A row needs BOTH its pause and news
+/// halves built, so it's stale if EITHER end is at-or-before `now` — a
+/// half-stale event straddling `now` is a degenerate edge not worth arming.
+fn row_is_stale(row: &CalendarBarRow, now: DateTime<Utc>) -> bool {
+    row.pause_spec.end_time <= now || row.news_spec.end_time <= now
+}
+
 /// Sync entry point for the binary. Builds its own multi-thread tokio
 /// runtime for the single async fetch — keeps the rest of the CLI sync
 /// and avoids forcing every other subcommand into `#[tokio::main]`.
@@ -616,6 +626,20 @@ pub fn run_calendar_bars(
 
     let mut built = Vec::with_capacity(plan.rows.len());
     for row in &plan.rows {
+        // Skip a row whose window has already elapsed (see `row_is_stale`).
+        // Common when the calendar window overlaps OLD bars on the chart (an
+        // event from a previous trade): there's nothing left to arm, and
+        // building it would hard-fail "refusing to arm a stale blackout",
+        // aborting the whole build and losing the still-live rows with it.
+        if row_is_stale(row, now) {
+            tracing::debug!(
+                event = %row.event_slug,
+                pause_end = %row.pause_spec.end_time.to_rfc3339(),
+                news_end = %row.news_spec.end_time.to_rfc3339(),
+                "skipping stale calendar event (window already closed)"
+            );
+            continue;
+        }
         let event_dir = out_root.join(&row.event_slug);
         let built_pause = build_pause_from_spec(row.pause_spec.clone(), now)
             .with_context(|| format!("building pause for {}", row.event_slug))?;
@@ -759,6 +783,43 @@ mod tests {
         .unwrap();
         assert_eq!(plan.rows.len(), 1, "only the in-window past event is kept");
         assert_eq!(plan.rows[0].event_name, "ECB Rate");
+    }
+
+    #[test]
+    fn row_is_stale_flags_elapsed_windows_so_the_build_skips_them() {
+        // The chokepoint for the "refusing to arm a stale blackout" abort: a
+        // calendar row whose window is in the past (an OLD trade's event that
+        // the visible-range window happened to span) must be detected as stale
+        // by `row_is_stale`, so `run_calendar_bars` skips it instead of letting
+        // `build_pause_from_spec` hard-fail and abort the whole build.
+        let window_start = ts("2026-06-01T06:00:00Z");
+        let lookahead_end = ts("2026-06-03T11:00:00Z");
+        let event_in_past = ev("ECB Rate", "EUR", Impact::High, "2026-06-02T12:00:00Z");
+        let plan = plan_calendar_bars_within(
+            &[event_in_past],
+            &eur_usd(),
+            Timeframe::H1Plus,
+            window_start,
+            lookahead_end,
+            &inputs(),
+        )
+        .unwrap();
+        let row = &plan.rows[0];
+
+        // Wall-clock "now" well after the event (the IRL present-time arm in the
+        // bug report) → stale, skipped.
+        let now_after = ts("2026-06-26T10:00:00Z");
+        assert!(
+            row_is_stale(row, now_after),
+            "an event whose window ended days ago must be stale"
+        );
+
+        // "Now" before the window → live, built.
+        let now_before = ts("2026-06-02T00:00:00Z");
+        assert!(
+            !row_is_stale(row, now_before),
+            "an event still ahead of `now` must be armable"
+        );
     }
 
     #[test]
