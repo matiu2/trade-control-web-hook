@@ -1910,6 +1910,20 @@ What you draw on the chart:
 | Vertical line pair | `blackout-start` / `blackout-end` (or `pause` / `resume` aliases) | Each pair emits a `build-pause` bundle. Blocks entries while active. **Only lines anchored inside the chart's visible window are armed** — off-screen lines are ignored as stale. **A pair whose window has already fully elapsed (`end_time ≤ now`) is dropped silently** rather than rejected, so arming off a historical chart no longer fails on a past blackout. |
 | Horizontal line | `support` or `resistance` | Each line adds an `[lo, hi]` band of ±`--reversal-band-pct` (default `0.1%`) to the `06-close-on-reversal` alert's `sr_bands` list, and adds `price` to its `inside_window`. Multiple lines union. |
 
+> **Single-slot roles are scoped to the visible window.** The invalidation,
+> break-and-close, retest and TP-fib roles each fill exactly one slot. Before
+> picking, `tv-arm` drops any candidate drawing whose time-span lies *entirely*
+> outside the chart's on-screen window — in **both** live-arming and replay
+> builds. This stops a stale off-screen drawing (e.g. a neckline left weeks
+> away on the timeline) from being armed against just because it's the newest.
+> Intersection (not containment) is used, so a line spanning the whole view or
+> poking past one edge still counts; the `trade-expiry` marker additionally
+> keeps a small forward margin past the right edge, where it's meant to sit.
+> If more than one drawing for a single-slot role survives the window filter,
+> the run-mode tiebreak still applies (live = newest) and a `warn` is logged so
+> you can clear the clutter. A per-role `dropped_out_of_window` count is logged
+> at `info`.
+
 When news pairs *and* `support`/`resistance` lines are both present, a
 single `06-close-on-reversal` alert is emitted with
 `inside_window: [news, price]` — the close fires on an opposing reversal

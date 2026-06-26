@@ -7,15 +7,24 @@
 //! struct ready for the alert pipeline.
 //!
 //! When multiple drawings claim the same single-slot role
-//! (invalidation, neckline, retest, tp fib, trade-expiry), the winner
-//! depends on the run mode ([`SlotPref`]): live arming
-//! (`--register-plan`) keeps the *latest* one — older drawings are
-//! stale leftovers — while an offline / replay build (`--plan-out`
-//! alone) prefers the drawing belonging to the on-screen window, so a
-//! chart rewound to a historical setup doesn't grab a recent,
-//! live-dated drawing (which would bake an anchor outside the replayed
-//! candle window). A note is logged at `info` so the operator can
-//! notice they've left clutter on the chart.
+//! (invalidation, neckline, retest, tp fib, trade-expiry), resolution is
+//! two steps. **First, the visible-window filter** drops any drawing whose
+//! time-span lies *entirely* outside the chart's on-screen window — in
+//! *both* run modes. This is the structural fix for the recurring "armed
+//! against the wrong pattern" bug: a stale off-screen drawing (e.g. a
+//! neckline drawn weeks after the setup) can no longer out-rank the in-view
+//! one just by being newer. Intersection (not containment) is used, so a
+//! line spanning the whole view or poking past one edge survives; the
+//! trade-expiry marker additionally keeps a small forward margin past the
+//! right edge, where it's *meant* to sit.
+//!
+//! **Second, among the survivors, the tiebreak** depends on the run mode
+//! ([`SlotPref`]): live arming (`--register-plan`) keeps the *latest* one —
+//! older drawings are stale leftovers — while an offline / replay build
+//! (`--plan-out` alone) prefers the drawing belonging to the on-screen
+//! window. Dropped counts are logged at `info`, and a genuinely ambiguous
+//! chart (more than one drawing left in-window for a single-slot role) is
+//! logged at `warn` so the operator can clean up the clutter.
 //!
 //! Blackout and news vertical-line pairs are collected as multi-slot
 //! lists and chronologically paired via
@@ -24,7 +33,7 @@
 //! arm half a window.
 
 use color_eyre::eyre::Result;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 use trade_control_conventions::{
     BLACKOUT_END_LABELS, BLACKOUT_START_LABELS, BREAK_LABELS, INVALIDATION_LABELS, NEWS_END_LABELS,
     NEWS_START_LABELS, RETEST_LABELS, SR_LEVEL_LABELS, TRADE_EXPIRY_LABELS, matches,
@@ -270,14 +279,16 @@ pub fn classify<F: DrawingFetcher>(
 
     let mut roles = Roles::default();
 
-    if let Some((d, lbl)) = pick_slot_with_label(invalidations, "invalidation", slot_pref) {
+    if let Some((d, lbl)) =
+        pick_slot_with_label(invalidations, "invalidation", visible_range, slot_pref)
+    {
         roles.invalidation = Some(d);
         roles.invalidation_label = Some(lbl);
     }
-    roles.break_and_close = pick_slot(break_lines, "break_and_close", slot_pref);
-    roles.retest = pick_slot(retest_lines, "retest", slot_pref);
-    roles.tp_fib = pick_slot(tp_fibs, "tp_fib", slot_pref);
-    roles.trade_expiry = pick_slot(trade_expiries, "trade_expiry", slot_pref);
+    roles.break_and_close = pick_slot(break_lines, "break_and_close", visible_range, slot_pref);
+    roles.retest = pick_slot(retest_lines, "retest", visible_range, slot_pref);
+    roles.tp_fib = pick_slot(tp_fibs, "tp_fib", visible_range, slot_pref);
+    roles.trade_expiry = pick_trade_expiry(trade_expiries, visible_range, slot_pref);
 
     // Pause/resume and news-start/news-end lines that sit outside the
     // visible window are stale leftovers from a prior setup — a window
@@ -295,8 +306,9 @@ pub fn classify<F: DrawingFetcher>(
     roles.sr_levels = sr_levels;
     roles.prep_expiries = latest_prep_expiry_per_step(prep_expiry_lines);
     // M/W paths are already in-window-filtered by `is_mw_path`, so latest-wins
-    // among qualifiers is correct in both modes.
-    roles.mw_path = pick_slot(mw_paths, "mw_path", SlotPref::LatestWins);
+    // among qualifiers is correct in both modes (the window filter inside
+    // `pick_slot` is a no-op for them).
+    roles.mw_path = pick_slot(mw_paths, "mw_path", visible_range, SlotPref::LatestWins);
     roles.position = latest_position(positions);
 
     Ok(roles)
@@ -394,21 +406,24 @@ fn latest_prep_expiry_per_step(cands: Vec<(&'static str, Drawing)>) -> Vec<(Stri
 }
 
 /// How a single-slot role (invalidation, neckline, retest, tp_fib,
-/// trade_expiry) chooses among several candidate drawings.
+/// trade_expiry) breaks ties **after** the visible-window filter (see
+/// [`pick_slot`]) has dropped off-screen drawings. The window filter runs in
+/// both modes; `SlotPref` only governs the choice among the in-window
+/// survivors.
 ///
 /// The two modes mirror the two ways `tv-arm` is run (see [`classify`]):
 ///
-/// - [`SlotPref::LatestWins`] — live arming (`--register-plan`). The
-///   operator just (re)drew the current setup, so the newest drawing is
+/// - [`SlotPref::LatestWins`] — live arming (`--register-plan`). Among the
+///   in-window drawings the operator just (re)drew, the newest is
 ///   authoritative; an older one is a stale leftover. This is the
-///   long-standing behaviour.
+///   long-standing behaviour (now scoped to the visible window first).
 /// - [`SlotPref::WindowAware`] — offline / replay build (`--plan-out`
-///   without `--register-plan`). The chart is rewound to a historical
-///   setup but may *also* carry recent, live-dated drawings. Latest-wins
-///   would wrongly grab the recent drawing, baking an anchor *outside* the
-///   replayed candle window (so e.g. break-and-close never evaluates and no
-///   entry fires). Instead, prefer the drawing that belongs to the
-///   on-screen window — see [`pick_window_aware`].
+///   without `--register-plan`). The chart is rewound to a historical setup;
+///   among the in-window survivors prefer the one fully inside the window,
+///   then the one anchored just before the window start — see
+///   [`pick_window_aware`]. (When the window filter leaves *nothing* — a
+///   chart rewound to the left of every drawing — `pick_slot` falls back to
+///   the full set so this before-and-closest logic still has candidates.)
 #[derive(Debug, Clone, Copy)]
 pub enum SlotPref {
     /// Newest anchor time wins (live arming).
@@ -418,19 +433,70 @@ pub enum SlotPref {
     WindowAware((i64, i64)),
 }
 
-/// Pick a single-slot drawing under `pref`, logging a note when duplicates
-/// were present. `LatestWins` keeps the newest; `WindowAware` defers to
-/// [`pick_window_aware`].
-fn pick_slot(mut cands: Vec<Drawing>, role: &str, pref: SlotPref) -> Option<Drawing> {
+/// Pick a single-slot drawing, window-filtering first then breaking ties
+/// under `pref`.
+///
+/// **Window filter first (both modes).** Drawings whose time-span lies
+/// *entirely* outside the visible window `[from, to]` are stale leftovers from
+/// another part of the timeline — they're dropped before any tiebreak so a
+/// recent off-screen drawing can never out-rank the in-view one. This is the
+/// fix for the recurring "armed against the wrong pattern" bug: the window
+/// applies to **live arming too**, not just replay. Intersection (not
+/// containment) keeps a line that spans the whole view or pokes past one edge.
+///
+/// After the filter:
+/// - ≥1 in-window candidate → tiebreak among those (`>1` logged at WARN as
+///   genuine on-screen ambiguity the operator should clean up).
+/// - none in-window → fall back to the full candidate set so we never select
+///   *nothing* (this preserves the replay before-and-closest behaviour for a
+///   chart rewound to the left of every drawing).
+///
+/// The per-mode tiebreak itself: `LatestWins` keeps the newest; `WindowAware`
+/// defers to [`pick_window_aware`].
+fn pick_slot(
+    cands: Vec<Drawing>,
+    role: &str,
+    (from, to): (i64, i64),
+    pref: SlotPref,
+) -> Option<Drawing> {
     if cands.is_empty() {
         return None;
     }
-    if cands.len() > 1 {
+    let total = cands.len();
+    let (in_window, out): (Vec<Drawing>, Vec<Drawing>) = cands
+        .into_iter()
+        .partition(|d| d.intersects_window(from, to));
+    if !out.is_empty() {
         info!(
-            count = cands.len(),
-            role, "multiple drawings for role; picking by preference"
+            role,
+            in_window = in_window.len(),
+            dropped_out_of_window = out.len(),
+            "filtered drawings to the visible window before role-matching"
         );
     }
+    // Fall back to the full set only when the window left nothing.
+    let (survivors, scoped_to_window) = if in_window.is_empty() {
+        debug!(
+            role,
+            total, "no in-window drawing; using full candidate set"
+        );
+        (out, false)
+    } else {
+        (in_window, true)
+    };
+    if scoped_to_window && survivors.len() > 1 {
+        warn!(
+            count = survivors.len(),
+            role, "multiple in-window drawings for role; picking by preference (ambiguous chart)"
+        );
+    }
+    finish_slot_pick(survivors, role, pref)
+}
+
+/// Run the per-mode tiebreak over `cands` (already window-filtered by
+/// [`pick_slot`]). Split out so the window filter and the tiebreak read as
+/// two distinct steps.
+fn finish_slot_pick(mut cands: Vec<Drawing>, role: &str, pref: SlotPref) -> Option<Drawing> {
     match pref {
         SlotPref::LatestWins => {
             cands.sort_by_key(|d| d.latest_time());
@@ -438,6 +504,67 @@ fn pick_slot(mut cands: Vec<Drawing>, role: &str, pref: SlotPref) -> Option<Draw
         }
         SlotPref::WindowAware(view) => pick_window_aware(cands, role, view),
     }
+}
+
+/// Pick the trade-expiry vertical line.
+///
+/// Unlike the other single-slot roles, the trade-expiry marker is *meant* to
+/// sit at or just past the visible window's right edge (it bounds a trade that
+/// may run days past what's on screen). So the generic [`pick_slot`] window
+/// filter — which drops anything entirely right of `to` — would throw away a
+/// perfectly valid expiry. Instead:
+///
+/// - **In-window** expiries (intersect `[from, to]`) qualify, as do ones
+///   **within a forward margin** of `to` (the margin is the window's own width,
+///   so it scales with timeframe; for `LatestWins`'s unbounded window every
+///   expiry qualifies).
+/// - Among the qualifiers, prefer the one **nearest the right edge** — the
+///   expiry the operator drew for *this* setup, not a stale one far to the
+///   right or an old one to the left.
+/// - If nothing qualifies, fall back to the full set under the mode tiebreak so
+///   we never silently drop the only expiry on the chart.
+fn pick_trade_expiry(
+    cands: Vec<Drawing>,
+    (from, to): (i64, i64),
+    pref: SlotPref,
+) -> Option<Drawing> {
+    const ROLE: &str = "trade_expiry";
+    if cands.is_empty() {
+        return None;
+    }
+    // Forward margin = window width (saturating), so it scales with timeframe.
+    let width = to.saturating_sub(from);
+    let margin_to = to.saturating_add(width);
+    let total = cands.len();
+    let (qualifying, out): (Vec<Drawing>, Vec<Drawing>) = cands.into_iter().partition(|d| {
+        d.intersects_window(from, to) || (d.earliest_time() > to && d.earliest_time() <= margin_to)
+    });
+    if !out.is_empty() {
+        info!(
+            role = ROLE,
+            in_window = qualifying.len(),
+            dropped_out_of_window = out.len(),
+            "filtered drawings to the visible window before role-matching"
+        );
+    }
+    let pool = if qualifying.is_empty() {
+        debug!(
+            role = ROLE,
+            total, "no in-window/near expiry; using full candidate set"
+        );
+        return finish_slot_pick(out, ROLE, pref);
+    } else {
+        qualifying
+    };
+    if pool.len() > 1 {
+        warn!(
+            count = pool.len(),
+            role = ROLE,
+            "multiple in-window trade-expiry lines; picking the one nearest the right edge"
+        );
+    }
+    // Nearest the right edge = largest anchor time (closest to / just past `to`).
+    pool.into_iter().max_by_key(|d| d.anchor_time())
 }
 
 /// Window-aware single-slot pick for replay builds. In order of preference:
@@ -483,19 +610,21 @@ fn pick_window_aware(cands: Vec<Drawing>, role: &str, (from, to): (i64, i64)) ->
 fn pick_slot_with_label(
     cands: Vec<(Drawing, String)>,
     role: &str,
+    window: (i64, i64),
     pref: SlotPref,
 ) -> Option<(Drawing, String)> {
     if cands.is_empty() {
         return None;
     }
     // Split labels off into a lookup, pick on the drawings alone (so the
-    // window-aware logic is shared), then re-attach the chosen label by id.
+    // window-filter + tiebreak logic is shared), then re-attach the chosen
+    // label by id.
     let labels: std::collections::HashMap<String, String> = cands
         .iter()
         .map(|(d, lbl)| (d.id.clone(), lbl.clone()))
         .collect();
     let drawings: Vec<Drawing> = cands.into_iter().map(|(d, _)| d).collect();
-    let chosen = pick_slot(drawings, role, pref)?;
+    let chosen = pick_slot(drawings, role, window, pref)?;
     let lbl = labels.get(&chosen.id).cloned().unwrap_or_default();
     Some((chosen, lbl))
 }
@@ -831,9 +960,12 @@ mod tests {
     }
 
     #[test]
-    fn latest_wins_picks_newest_even_when_out_of_window() {
-        // Live arming (LatestWins): the recent out-of-window neckline is the
-        // authoritative one even though an in-window historical line exists.
+    fn latest_wins_drops_out_of_window_drawing_even_when_newer() {
+        // THE BUG (CAD/JPY): live arming (LatestWins) was grabbing a recent
+        // off-screen neckline (t=900..1000) over the in-view one (t=100..200)
+        // purely because it was newer. With the visible-window filter applied
+        // in *both* modes, the out-of-window drawing is dropped before the
+        // tiebreak and the in-view neckline wins.
         let (stubs, mcp) = fixture(vec![
             (
                 stub("hist", "trend_line"),
@@ -846,7 +978,27 @@ mod tests {
         ]);
         let view = (50, 300);
         let roles = classify(&mcp, &stubs, view, SlotPref::LatestWins).expect("ok");
-        assert_eq!(roles.break_and_close.unwrap().id, "recent");
+        assert_eq!(roles.break_and_close.unwrap().id, "hist");
+    }
+
+    #[test]
+    fn latest_wins_picks_newest_among_in_window_drawings() {
+        // When several drawings are *all* in-window, LatestWins still keeps the
+        // newest — the window filter only removes off-screen clutter, it doesn't
+        // change the in-window tiebreak.
+        let (stubs, mcp) = fixture(vec![
+            (
+                stub("older", "trend_line"),
+                drawing("older", "neckline", vec![(100, 1.0), (150, 1.0)]),
+            ),
+            (
+                stub("newer", "trend_line"),
+                drawing("newer", "neckline", vec![(200, 1.5), (250, 1.5)]),
+            ),
+        ]);
+        let view = (50, 300);
+        let roles = classify(&mcp, &stubs, view, SlotPref::LatestWins).expect("ok");
+        assert_eq!(roles.break_and_close.unwrap().id, "newer");
     }
 
     #[test]
@@ -1143,6 +1295,132 @@ mod tests {
         let (stubs, mcp) = fixture(vec![(stub("h", "short_position"), half)]);
         let roles = classify(&mcp, &stubs, ANY_RANGE, SlotPref::LatestWins).expect("ok");
         assert!(roles.position.is_none());
+    }
+
+    #[test]
+    fn cadjpy_repro_in_window_neckline_wins_over_off_screen_pair() {
+        // Real session, CAD/JPY H1. Visible window May 15 → May 27.
+        //   visible_range = 1778810400 .. 1779843600
+        // Four trend lines on the chart; only `1kUSW4` (May 18 → May 20) sits
+        // inside the window. The June pair (`2Xfe1I`/`7rdwbe`) and the April
+        // line (`sh1OWn`) are off-screen leftovers. Live arming (LatestWins)
+        // used to grab the June pair because it was newest. The window filter
+        // now collapses break_and_close to the single in-view neckline.
+        let view = (1778810400, 1779843600);
+        // May 18 23:00 → May 20 19:00 UTC (inside the window).
+        let correct = (1779145200_i64, 1779303600_i64);
+        // April 13 → 14 (left of view).
+        let april = (1776038400_i64, 1776124800_i64);
+        // June 3 → 4 (right of view), drawn twice.
+        let june = (1780531200_i64, 1780617600_i64);
+        let (stubs, mcp) = fixture(vec![
+            (
+                stub("1kUSW4", "trend_line"),
+                drawing(
+                    "1kUSW4",
+                    "neckline",
+                    vec![(correct.0, 115.502), (correct.1, 115.46)],
+                ),
+            ),
+            (
+                stub("sh1OWn", "trend_line"),
+                drawing(
+                    "sh1OWn",
+                    "neckline",
+                    vec![(april.0, 110.0), (april.1, 110.0)],
+                ),
+            ),
+            (
+                stub("2Xfe1I", "trend_line"),
+                drawing("2Xfe1I", "neckline", vec![(june.0, 120.0), (june.1, 120.0)]),
+            ),
+            (
+                stub("7rdwbe", "trend_line"),
+                drawing("7rdwbe", "neckline", vec![(june.0, 121.0), (june.1, 121.0)]),
+            ),
+        ]);
+        let roles = classify(&mcp, &stubs, view, SlotPref::LatestWins).expect("ok");
+        let neck = roles.break_and_close.expect("break_and_close resolved");
+        assert_eq!(neck.id, "1kUSW4");
+        // Anchored at the May setup, not June/April.
+        assert_eq!(neck.earliest_time(), correct.0);
+        assert_eq!(neck.latest_time(), correct.1);
+    }
+
+    #[test]
+    fn trend_line_straddling_the_whole_view_is_kept() {
+        // One anchor left of `from`, one right of `to` — the line spans the
+        // entire visible window, so intersection keeps it even though neither
+        // anchor is inside. (Containment would have wrongly dropped it.)
+        let (stubs, mcp) = fixture(vec![(
+            stub("span", "trend_line"),
+            drawing("span", "neckline", vec![(50, 1.0), (500, 1.0)]),
+        )]);
+        let view = (100, 200);
+        let roles = classify(&mcp, &stubs, view, SlotPref::LatestWins).expect("ok");
+        assert_eq!(roles.break_and_close.unwrap().id, "span");
+    }
+
+    #[test]
+    fn single_partly_off_screen_drawing_is_kept_by_intersection() {
+        // Exactly one neckline, overlapping only the left edge of the window
+        // (t=50..150 vs view 100..300). Intersection keeps it; we must not
+        // regress to "nothing resolved" for a partly-off-screen sole drawing.
+        let (stubs, mcp) = fixture(vec![(
+            stub("edge", "trend_line"),
+            drawing("edge", "neckline", vec![(50, 1.0), (150, 1.0)]),
+        )]);
+        let view = (100, 300);
+        let roles = classify(&mcp, &stubs, view, SlotPref::LatestWins).expect("ok");
+        assert_eq!(roles.break_and_close.unwrap().id, "edge");
+    }
+
+    #[test]
+    fn trade_expiry_just_past_right_edge_is_kept_and_nearest_wins() {
+        // The expiry marker legitimately sits at/after the right edge. The
+        // generic window filter would drop it; `pick_trade_expiry` keeps any
+        // expiry within a forward margin of `to` and prefers the one nearest
+        // the right edge. Here view is [100, 300] (width 200, margin to 500):
+        //   - `inview`  at t=250 (inside)            -> qualifies
+        //   - `just`    at t=350 (just past `to`)    -> qualifies, nearest edge
+        //   - `wayfar`  at t=900 (beyond the margin) -> dropped
+        let (stubs, mcp) = fixture(vec![
+            (
+                stub("inview", "vertical_line"),
+                drawing("inview", "trade-expiry", vec![(250, 1.0)]),
+            ),
+            (
+                stub("just", "vertical_line"),
+                drawing("just", "trade-expiry", vec![(350, 1.0)]),
+            ),
+            (
+                stub("wayfar", "vertical_line"),
+                drawing("wayfar", "trade-expiry", vec![(900, 1.0)]),
+            ),
+        ]);
+        let view = (100, 300);
+        let roles = classify(&mcp, &stubs, view, SlotPref::LatestWins).expect("ok");
+        // Nearest the right edge among qualifiers (the just-past-`to` one).
+        assert_eq!(roles.trade_expiry.unwrap().id, "just");
+    }
+
+    #[test]
+    fn trade_expiry_off_screen_left_is_dropped() {
+        // A stale expiry well to the left of the window must not be chosen over
+        // the real one inside it.
+        let (stubs, mcp) = fixture(vec![
+            (
+                stub("stale", "vertical_line"),
+                drawing("stale", "trade-expiry", vec![(10, 1.0)]),
+            ),
+            (
+                stub("real", "vertical_line"),
+                drawing("real", "trade-expiry", vec![(250, 1.0)]),
+            ),
+        ]);
+        let view = (100, 300);
+        let roles = classify(&mcp, &stubs, view, SlotPref::LatestWins).expect("ok");
+        assert_eq!(roles.trade_expiry.unwrap().id, "real");
     }
 
     #[test]
