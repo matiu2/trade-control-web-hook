@@ -1047,17 +1047,27 @@ fn assemble_trade(
         spec.veto_on_reversal && !spec.sr_reversal_ranges.is_empty(),
         &spec.entry_level_vetos,
         spec.recover_entry,
+        false, // BCR leg → 05-enter
     ));
-    // strategy-v2: a second enter — the Quasimodo limit — armed alongside the
-    // stop entry on the same setup. No preps (both skipped), confirmed-candle
-    // gated, limit order at the signal level (EntryMode::Limit picks the
-    // 09-enter-qm basename and EntrySpec::Limit inside build_enter_alert). It
-    // shares this trade_id + max_retries so the worker retry gate treats the
-    // two enters as attempts of one trade and cancels the loser's resting
-    // order. Pushed *after* the stop enter so the stop wins a same-bar tie.
-    // The at-entry level vetos (too-high/too-low) still apply — they're
-    // invalidation levels independent of order type. No wrong-side recovery: a
-    // limit doesn't strand the way a stop does.
+    // strategy-v2: a second enter — the Quasimodo entry — armed alongside the
+    // BCR stop entry on the same setup. No preps (both skipped),
+    // confirmed-candle gated, `09-enter-qm` basename. It shares this trade_id +
+    // max_retries so the worker retry gate treats the two enters as attempts of
+    // one trade and cancels the loser's resting order. Pushed *after* the BCR
+    // enter so the BCR wins a same-bar tie. The at-entry level vetos
+    // (too-high/too-low) still apply — they're invalidation levels independent
+    // of order type.
+    //
+    // The QM leg's entry spec is built *identical* to standalone --quasimodo's
+    // 05-enter: `EntryMode::Stop` at signal_low − 1 pip (`entry_offset_pips`,
+    // the same value the BCR leg uses) with `RecoverEntryAction::Limit` as the
+    // wrong-side fallback. The earlier `EntryMode::Limit` / offset 0 form built
+    // a bare sell-limit resting *at* the level; for a short where price has
+    // already pushed below the level that limit is on the wrong side of market,
+    // the engine rejects it as geometry-inconsistent, and with no recover_entry
+    // the whole leg evaporated (demo trade 031, CAD/JPY). A resting stop below
+    // market is valid for a short and fills on the pullback, exactly as
+    // standalone --quasimodo does.
     if spec.strategy_v2 {
         let qm_skip_preps = vec!["break-and-close".to_string(), "retest".to_string()];
         alerts.push(build_enter_alert(
@@ -1075,7 +1085,7 @@ fn assemble_trade(
             spec.max_retries,
             spec.expiry_bars,
             spec.allow_entry.as_deref(),
-            EntryMode::Limit,
+            EntryMode::Stop, // identical order shape to standalone --quasimodo
             spec.needs_golden,
             true, // QM is always confirmed-candle gated
             &qm_skip_preps,
@@ -1085,7 +1095,8 @@ fn assemble_trade(
             &spec.account,
             spec.veto_on_reversal && !spec.sr_reversal_ranges.is_empty(),
             &spec.entry_level_vetos,
-            RecoverEntryAction::Skip,
+            RecoverEntryAction::Limit, // wrong-side fallback, like standalone QM
+            true,                      // QM leg → 09-enter-qm
         ));
     }
     if spec.close_on_news || !spec.sr_reversal_ranges.is_empty() {
@@ -1823,13 +1834,14 @@ fn build_enter_alert(
     check_reversal_veto: bool,
     entry_level_vetos: &[trade_control_core::intent::EntryLevelVeto],
     recover_entry: RecoverEntryAction,
+    qm: bool,
 ) -> BuiltAlert {
-    // The Quasimodo limit entry (strategy-v2) is the only `Limit`-mode
-    // pattern enter, so the order type unambiguously selects the basename:
-    // `Limit` → `09-enter-qm`, everything else → `05-enter`. Keeping this
-    // keyed off `entry_mode` avoids threading a basename arg through every
-    // (test and prod) call site.
-    let is_qm = matches!(entry_mode, EntryMode::Limit);
+    // The QM leg (strategy-v2's second enter) gets the `09-enter-qm`
+    // basename; every other pattern enter gets `05-enter`. This is keyed
+    // off the explicit `qm` flag, *not* the order type: the QM leg is now a
+    // `Stop` entry identical to standalone --quasimodo (see the call site),
+    // so `entry_mode` no longer distinguishes the two legs.
+    let is_qm = qm;
     let basename = if is_qm {
         AlertBasename::EnterQm
     } else {
@@ -2329,6 +2341,7 @@ mod tests {
                 false,
                 &[],
                 RecoverEntryAction::Skip,
+                false,
             ),
         ];
         let trade = BuiltTrade {
@@ -2412,6 +2425,7 @@ mod tests {
             false,
             &[],
             RecoverEntryAction::Skip,
+            false,
         );
         assert_eq!(alert.intent.direction, Some(Direction::Short));
         // Entry: signal_low − 1 pip — a sell-stop 1 pip *below* the break (the
@@ -2460,53 +2474,72 @@ mod tests {
     }
 
     #[test]
-    fn qm_limit_enter_is_limit_no_preps_at_signal_level() {
-        // strategy-v2 Quasimodo enter: EntryMode::Limit produces an
-        // EntrySpec::Limit resting at the *same* signal anchor the stop
-        // entry uses (SignalLow for a short), offset 0, no preps, the
-        // 09-enter-qm basename, and a -enter-qm id suffix. Same vetos /
-        // trade_id as the stop enter so the retry gate correlates them.
+    fn qm_enter_matches_standalone_quasimodo_entry_spec() {
+        // strategy-v2 Quasimodo enter (the `09-enter-qm` basename, selected
+        // by the `qm: true` flag): its entry spec must be *byte-identical* to
+        // the one standalone --quasimodo produces for 05-enter — a Stop at
+        // signal_low − 1 pip with a `recover_entry: Limit` fallback — NOT the
+        // old bare-Limit-at-the-level form. A bare sell-limit resting at the
+        // level is geometry-invalid for a short whose price has already pushed
+        // below it; the engine rejected it and, with no recover_entry, the
+        // whole leg evaporated (demo trade 031). The Stop form rests below
+        // market, valid for a short, and fills on the pullback. No preps,
+        // confirmed-candle gated, `-enter-qm` id suffix. Same vetos / trade_id
+        // as the BCR enter so the retry gate correlates them.
         let geometry = PatternGeometry::for_pattern(TradePattern::Hs);
         let deadline = ts("2026-05-24T00:00:00Z");
-        let alert = build_enter_alert(
-            "EUR_USD",
-            "hs-eur-usd-zzzz",
-            &geometry,
-            deadline,
-            -1.0,
-            1.0,
-            1.0500,
-            None,
-            1.0,
-            None,
-            false,
-            5, // multi-shot: keeps the plan alive so the sibling can cancel
-            None,
-            None,
-            EntryMode::Limit,
-            false,
-            true, // confirmed-candle gated
-            &["break-and-close".to_string(), "retest".to_string()],
-            None,
-            BlackoutCloseAction::default(),
-            &BrokerKind::Oanda,
-            "demo",
-            false,
-            &[],
-            RecoverEntryAction::Skip,
-        );
+        let build = |qm: bool, recover: RecoverEntryAction| {
+            build_enter_alert(
+                "EUR_USD",
+                "hs-eur-usd-zzzz",
+                &geometry,
+                deadline,
+                -1.0,
+                1.0,
+                1.0500,
+                None,
+                1.0,
+                None,
+                false,
+                5, // multi-shot: keeps the plan alive so the sibling can cancel
+                None,
+                None,
+                EntryMode::Stop,
+                false,
+                true, // confirmed-candle gated
+                &["break-and-close".to_string(), "retest".to_string()],
+                None,
+                BlackoutCloseAction::default(),
+                &BrokerKind::Oanda,
+                "demo",
+                false,
+                &[],
+                recover,
+                qm,
+            )
+        };
+        let alert = build(true, RecoverEntryAction::Limit);
         assert_eq!(alert.basename, "09-enter-qm");
         match &alert.intent.entry {
-            Some(EntrySpec::Limit {
+            Some(EntrySpec::Stop {
                 from,
                 offset_pips,
                 at,
+                recover_entry,
             }) => {
                 assert_eq!(*from, PriceAnchor::SignalLow);
-                assert!(offset_pips.abs() < 1e-9, "QM limit rests at the level");
+                assert!(
+                    (offset_pips - -1.0).abs() < 1e-9,
+                    "QM stop rests 1 pip below the level"
+                );
                 assert!(at.is_none());
+                assert_eq!(
+                    recover_entry.as_ref().map(|r| r.action),
+                    Some(RecoverEntryAction::Limit),
+                    "QM leg carries the wrong-side limit recovery"
+                );
             }
-            other => panic!("expected Limit entry, got {other:?}"),
+            other => panic!("expected Stop entry, got {other:?}"),
         }
         assert!(
             alert.intent.requires_preps.is_empty(),
@@ -2516,6 +2549,14 @@ mod tests {
         assert_eq!(alert.intent.trade_id.as_deref(), Some("hs-eur-usd-zzzz"));
         assert_eq!(alert.intent.id, "hs-eur-usd-zzzz-enter-qm");
         alert.intent.validate().unwrap();
+
+        // The QM leg and the standalone --quasimodo BCR enter (qm: false,
+        // same Stop+Limit-recover) must produce identical entry specs — only
+        // the basename/id differ. This is the regression guard the bug report
+        // asks for: the two can never drift apart again.
+        let standalone = build(false, RecoverEntryAction::Limit);
+        assert_eq!(standalone.basename, "05-enter");
+        assert_eq!(alert.intent.entry, standalone.intent.entry);
     }
 
     #[test]
@@ -2563,6 +2604,7 @@ mod tests {
             false,
             &levels,
             RecoverEntryAction::Skip,
+            false,
         );
         assert_eq!(alert.intent.entry_level_vetos, levels);
     }
@@ -2600,6 +2642,7 @@ mod tests {
             false,
             &[],
             RecoverEntryAction::Skip,
+            false,
         );
         assert_eq!(alert.intent.direction, Some(Direction::Long));
         // Entry: signal_high + 1 pip — a buy-stop 1 pip *above* the break
@@ -2672,6 +2715,7 @@ mod tests {
             false,
             &[],
             RecoverEntryAction::Skip,
+            false,
         );
         match &alert.intent.stop_loss {
             Some(PriceRef::Absolute { absolute }) => {
@@ -2803,16 +2847,22 @@ mod tests {
 
     #[test]
     fn build_trade_from_spec_strategy_v2_emits_two_enters_sharing_trade_id() {
-        // strategy-v2 arms a second enter (the QM limit) alongside the stop
+        // strategy-v2 arms a second enter (the QM leg) alongside the BCR stop
         // enter: 7 alerts = the usual 6 + 09-enter-qm, pushed right after
         // 05-enter. The two enters share the trade_id (so the worker retry
         // gate correlates them) and a non-zero max_retries (so the engine
-        // keeps the plan alive after the first fire). The QM enter is a Limit
-        // with no preps; the stop enter keeps both preps.
+        // keeps the plan alive after the first fire). The QM enter carries no
+        // preps; the BCR enter keeps both preps. Crucially, the QM leg's
+        // entry spec is now *identical* to the BCR enter's — a Stop at
+        // signal_low − 1 pip with `recover_entry: Limit` — not the old
+        // bare-Limit form that the engine rejected as wrong-side (trade 031).
         let now = ts("2026-05-20T00:00:00Z");
         let mut spec = sample_spec(TradePattern::Hs, ts("2026-05-25T00:00:00Z"));
         spec.strategy_v2 = true;
         spec.max_retries = 5;
+        // Standalone --quasimodo opts into the limit recovery; strategy-v2's
+        // BCR + QM legs must inherit the same so all three entry specs match.
+        spec.recover_entry = RecoverEntryAction::Limit;
         let trade = build_trade_from_spec(spec, now, BuildStrictness::Strict).unwrap();
         assert_eq!(trade.alerts.len(), 7);
         assert_eq!(trade.alerts[5].basename, "05-enter");
@@ -2823,25 +2873,36 @@ mod tests {
         // Same trade_id across both enters.
         assert_eq!(stop.intent.trade_id, qm.intent.trade_id);
         assert!(stop.intent.trade_id.is_some());
-        // Stop: Stop entry, both preps.
+        // BCR: Stop entry, both preps.
         assert!(matches!(stop.intent.entry, Some(EntrySpec::Stop { .. })));
         assert_eq!(
             stop.intent.requires_preps,
             vec!["break-and-close".to_string(), "retest".to_string()]
         );
-        // QM: Limit entry, no preps, confirmed-gated, multi-shot.
+        // QM: Stop entry at signal_low − 1 pip with limit recovery (identical
+        // order shape to standalone --quasimodo), no preps, confirmed-gated,
+        // multi-shot.
         match &qm.intent.entry {
-            Some(EntrySpec::Limit {
+            Some(EntrySpec::Stop {
                 from,
                 offset_pips,
                 at,
+                recover_entry,
             }) => {
                 assert_eq!(*from, PriceAnchor::SignalLow);
-                assert!(offset_pips.abs() < 1e-9);
+                assert!((offset_pips - -1.0).abs() < 1e-9);
                 assert!(at.is_none());
+                assert_eq!(
+                    recover_entry.as_ref().map(|r| r.action),
+                    Some(RecoverEntryAction::Limit)
+                );
             }
-            other => panic!("expected Limit QM entry, got {other:?}"),
+            other => panic!("expected Stop QM entry, got {other:?}"),
         }
+        // The two legs' entry specs are byte-identical — only basename/id
+        // differ. This is the regression guard against re-introducing the
+        // trade-031 drift.
+        assert_eq!(stop.intent.entry, qm.intent.entry);
         assert!(qm.intent.requires_preps.is_empty());
         assert!(qm.intent.needs_confirmed);
         assert!(matches!(

@@ -56,14 +56,18 @@ pub enum AlertBasename {
     PrepExpire(String),
     /// `05-enter` — Pine `Candle Signals` entry alert.
     Enter,
-    /// `09-enter-qm` — Quasimodo limit entry (strategy-v2). A second
-    /// enter armed alongside `05-enter` on the same setup: no preps
+    /// `09-enter-qm` — Quasimodo entry (strategy-v2). A second enter
+    /// armed alongside `05-enter` on the same setup: no preps
     /// (break-and-close / retest skipped), gated only on a confirmed
-    /// signal candle, placed as a limit order resting at the signal
-    /// level. Same Pine `Candle Signals` detector as `05-enter`; the
-    /// difference is the intent (no preps, `EntrySpec::Limit`). The
-    /// first of the two enters to fire cancels the other's resting
-    /// order via the worker retry gate (shared `trade_id`).
+    /// signal candle. Its entry spec is identical to standalone
+    /// `--quasimodo` — an `EntrySpec::Stop` at the signal level (− 1 pip)
+    /// with a `recover_entry: Limit` fallback, so it fills on the
+    /// pullback when the level was already overrun. (It used to be a bare
+    /// `EntrySpec::Limit`; that was geometry-invalid for an overrun short
+    /// and the leg was dropped — demo trade 031.) Same Pine `Candle
+    /// Signals` detector as `05-enter`; the difference is the intent (no
+    /// preps). The first of the two enters to fire cancels the other's
+    /// resting order via the worker retry gate (shared `trade_id`).
     EnterQm,
     /// `06-close-on-reversal` — Pine reversal close, gated on an
     /// active news window.
