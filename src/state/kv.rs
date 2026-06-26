@@ -12,6 +12,7 @@ use chrono::{DateTime, Utc};
 use trade_control_core::intent::Action;
 use trade_control_core::intent::NoEntryWindow;
 use trade_control_core::plan_state::PlanState;
+use trade_control_core::control_event::ControlEvent;
 use trade_control_core::state::{
     ArchivedPlan, BlackoutHoursEntry, CooldownEntry, EntryAttempt, MIN_TTL_SECONDS, MwState,
     NewsEntry, PREP_BLOCK_INDEX_CAP, PREP_INDEX_CAP, PauseEntry, PrepBlockEntry, PrepEntry,
@@ -160,6 +161,20 @@ impl KvStateStore {
         format!("archived-plan:{scope}:{trade_id}")
     }
 
+    /// Per-event key for the control-event audit trail:
+    /// `control-event:{scope}:{trade_id}:{suffix}`. No TTL; appended on each
+    /// TTL'd control set, listed by `list_control_events`, dropped by
+    /// `clear_control_events` (`plan purge`).
+    fn control_event_key(account: Option<&str>, trade_id: &str, suffix: &str) -> String {
+        let scope = account_scope(account);
+        format!("control-event:{scope}:{trade_id}:{suffix}")
+    }
+
+    fn control_event_prefix(account: Option<&str>, trade_id: &str) -> String {
+        let scope = account_scope(account);
+        format!("control-event:{scope}:{trade_id}:")
+    }
+
     /// Per-order key holding the raw signed alert body that placed a broker
     /// order, keyed by `broker_order_id`. Written on successful single-shot
     /// placement (`run_enter`) and read by the spread-blackout apply cron,
@@ -216,6 +231,34 @@ impl KvStateStore {
             .await
             .map_err(|e| StateError::Backend(format!("delete {key}: {e:?}")))?;
         Ok(())
+    }
+
+    /// List every KV key under `prefix`, paging through `kv.list` until
+    /// `list_complete`. Shared by the control-event + purge paths; mirrors the
+    /// pagination already inlined in `list_entry_attempts` /
+    /// `list_all_trade_plans`.
+    pub(crate) async fn list_keys(&self, prefix: &str) -> Result<Vec<String>, StateError> {
+        let mut keys: Vec<String> = Vec::new();
+        let mut cursor: Option<String> = None;
+        loop {
+            let mut builder = self.store.list().prefix(prefix.to_string());
+            if let Some(c) = cursor.take() {
+                builder = builder.cursor(c);
+            }
+            let resp = builder
+                .execute()
+                .await
+                .map_err(|e| StateError::Backend(format!("list {prefix}: {e:?}")))?;
+            keys.extend(resp.keys.into_iter().map(|k| k.name));
+            if resp.list_complete {
+                break;
+            }
+            match resp.cursor {
+                Some(c) => cursor = Some(c),
+                None => break,
+            }
+        }
+        Ok(keys)
     }
 
     /// Prefix used to list every news window for a single `trade_id`.
@@ -1572,6 +1615,66 @@ impl StateStore for KvStateStore {
             .delete(&key)
             .await
             .map_err(|e| StateError::Backend(format!("delete {key}: {e:?}")))?;
+        Ok(())
+    }
+
+    async fn record_control_event(
+        &self,
+        account: Option<&str>,
+        trade_id: &str,
+        event: &ControlEvent,
+    ) -> Result<(), StateError> {
+        let key = Self::control_event_key(account, trade_id, &event.key_suffix());
+        let body = serde_json::to_string(event)
+            .map_err(|e| StateError::Backend(format!("encode control-event: {e}")))?;
+        // No `.expiration_ttl(...)`: the audit row outlives the TTL'd control
+        // row it records, so a journaled post-mortem can see its set→expiry.
+        self.store
+            .put(&key, body)
+            .map_err(|e| StateError::Backend(format!("put {key} builder: {e:?}")))?
+            .execute()
+            .await
+            .map_err(|e| StateError::Backend(format!("put {key} execute: {e:?}")))?;
+        Ok(())
+    }
+
+    async fn list_control_events(
+        &self,
+        account: Option<&str>,
+        trade_id: &str,
+    ) -> Result<Vec<ControlEvent>, StateError> {
+        let prefix = Self::control_event_prefix(account, trade_id);
+        let keys = self.list_keys(&prefix).await?;
+        let mut events: Vec<ControlEvent> = Vec::with_capacity(keys.len());
+        for key in keys {
+            let raw = self
+                .store
+                .get(&key)
+                .text()
+                .await
+                .map_err(|e| StateError::Backend(format!("get {key}: {e:?}")))?;
+            let Some(text) = raw else { continue };
+            let event: ControlEvent = serde_json::from_str(&text)
+                .map_err(|e| StateError::Backend(format!("decode {key}: {e}")))?;
+            events.push(event);
+        }
+        events.sort_by_key(|e| e.set_at);
+        Ok(events)
+    }
+
+    async fn clear_control_events(
+        &self,
+        account: Option<&str>,
+        trade_id: &str,
+    ) -> Result<(), StateError> {
+        let prefix = Self::control_event_prefix(account, trade_id);
+        let keys = self.list_keys(&prefix).await?;
+        for key in keys {
+            self.store
+                .delete(&key)
+                .await
+                .map_err(|e| StateError::Backend(format!("delete {key}: {e:?}")))?;
+        }
         Ok(())
     }
 

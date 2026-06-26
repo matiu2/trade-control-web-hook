@@ -11,6 +11,7 @@ use std::future::Future;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+use crate::control_event::ControlEvent;
 use crate::intent::{Action, BlackoutCloseAction, Direction, NoEntryWindow};
 use crate::plan_state::PlanState;
 use crate::trade_plan::TradePlan;
@@ -1017,6 +1018,39 @@ pub trait StateStore {
     /// Delete the engine's [`PlanState`] row. Best-effort. Called alongside
     /// [`Self::clear_trade_plan`] when a plan finishes.
     fn clear_plan_state(
+        &self,
+        account: Option<&str>,
+        trade_id: &str,
+    ) -> impl Future<Output = Result<(), StateError>>;
+
+    // ----- Control-event audit trail -----
+
+    /// Append a durable, **no-TTL** [`ControlEvent`] recording that a
+    /// TTL-carrying control row (cooldown/veto/prep/pause/news/blackout) was
+    /// set. KV deletes the live control row passively when its TTL lapses, with
+    /// no trace; this row preserves the set→expire lifecycle for journaling /
+    /// debugging until `plan purge`. Keyed
+    /// `control-event:{scope}:{trade_id}:{event.key_suffix()}` — append-only
+    /// (a later set of the same control is a distinct event). Best-effort at the
+    /// call site: a write failure must never block the control set itself.
+    fn record_control_event(
+        &self,
+        account: Option<&str>,
+        trade_id: &str,
+        event: &ControlEvent,
+    ) -> impl Future<Output = Result<(), StateError>>;
+
+    /// List every [`ControlEvent`] recorded for `(account, trade_id)`, ascending
+    /// by `set_at`. Read by `plan show` / journaling.
+    fn list_control_events(
+        &self,
+        account: Option<&str>,
+        trade_id: &str,
+    ) -> impl Future<Output = Result<Vec<ControlEvent>, StateError>>;
+
+    /// Delete every control-event row for `(account, trade_id)`. Called by
+    /// `plan purge`. Best-effort.
+    fn clear_control_events(
         &self,
         account: Option<&str>,
         trade_id: &str,
@@ -2030,6 +2064,52 @@ mod memstore {
             trade_id: &str,
         ) -> Result<(), StateError> {
             self.delete(&format!("plan-state:{}:{trade_id}", account_scope(account)));
+            Ok(())
+        }
+
+        async fn record_control_event(
+            &self,
+            account: Option<&str>,
+            trade_id: &str,
+            event: &ControlEvent,
+        ) -> Result<(), StateError> {
+            let key = format!(
+                "control-event:{}:{trade_id}:{}",
+                account_scope(account),
+                event.key_suffix()
+            );
+            let body = serde_json::to_string(event)
+                .map_err(|e| StateError::Backend(format!("encode control-event: {e}")))?;
+            // No TTL: the audit trail outlives the (TTL'd) live control row.
+            self.put(key, body, NO_TTL_SECONDS, self.now());
+            Ok(())
+        }
+
+        async fn list_control_events(
+            &self,
+            account: Option<&str>,
+            trade_id: &str,
+        ) -> Result<Vec<ControlEvent>, StateError> {
+            let prefix = format!("control-event:{}:{trade_id}:", account_scope(account));
+            let now = self.now();
+            let mut events: Vec<ControlEvent> = self
+                .inner
+                .borrow()
+                .iter()
+                .filter(|(k, (_, exp))| k.starts_with(&prefix) && *exp > now)
+                .filter_map(|(_, (v, _))| serde_json::from_str(v).ok())
+                .collect();
+            events.sort_by_key(|e: &ControlEvent| e.set_at);
+            Ok(events)
+        }
+
+        async fn clear_control_events(
+            &self,
+            account: Option<&str>,
+            trade_id: &str,
+        ) -> Result<(), StateError> {
+            let prefix = format!("control-event:{}:{trade_id}:", account_scope(account));
+            self.inner.borrow_mut().retain(|k, _| !k.starts_with(&prefix));
             Ok(())
         }
 
@@ -3593,6 +3673,62 @@ mod tests {
             pollster::block_on(store.get_plan_state(Some("reversals"), "hs-1"))
                 .unwrap()
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn memstore_control_events_append_list_and_clear() {
+        use super::memstore::MemStateStore;
+        use crate::control_event::{ControlEvent, ControlKind};
+        let store = MemStateStore::new();
+
+        let a = ControlEvent::new(
+            ControlKind::Veto,
+            "too-low",
+            "GBP/USD",
+            ts("2026-06-24T01:00:00Z"),
+            3600,
+            None,
+        );
+        let b = ControlEvent::new(
+            ControlKind::Cooldown,
+            "",
+            "GBP/USD",
+            ts("2026-06-24T02:00:00Z"),
+            8 * 3600,
+            Some("req-1".into()),
+        );
+        // Insert out of order; list must come back ascending by set_at.
+        pollster::block_on(store.record_control_event(Some("reversals"), "hs-1", &b)).unwrap();
+        pollster::block_on(store.record_control_event(Some("reversals"), "hs-1", &a)).unwrap();
+
+        let got =
+            pollster::block_on(store.list_control_events(Some("reversals"), "hs-1")).unwrap();
+        assert_eq!(got, vec![a.clone(), b.clone()]);
+
+        // The audit row is no-TTL (far-future expiry), so it outlives the live
+        // control row it records.
+        let exp = store
+            .expiry_of(&format!(
+                "control-event:reversals:hs-1:{}",
+                a.key_suffix()
+            ))
+            .expect("control-event stored");
+        assert!(exp > Utc::now() + chrono::Duration::days(365));
+
+        // Scoping: a different trade_id sees none of these.
+        assert!(
+            pollster::block_on(store.list_control_events(Some("reversals"), "other"))
+                .unwrap()
+                .is_empty()
+        );
+
+        // Clear drops all of this trade's events.
+        pollster::block_on(store.clear_control_events(Some("reversals"), "hs-1")).unwrap();
+        assert!(
+            pollster::block_on(store.list_control_events(Some("reversals"), "hs-1"))
+                .unwrap()
+                .is_empty()
         );
     }
 

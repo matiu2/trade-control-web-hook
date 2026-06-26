@@ -597,6 +597,18 @@ pub(crate) async fn run_invalidate<B: Broker>(
             outcome: "rejected: state-error".into(),
         };
     }
+    record_control_event_for(
+        store,
+        account,
+        verified.intent.trade_id.as_deref(),
+        trade_control_core::control_event::ControlKind::Cooldown,
+        "",
+        &verified.intent.instrument,
+        (hours as u64).saturating_mul(3600),
+        now,
+        None,
+    )
+    .await;
     let cancelled = broker
         .cancel_pending_for_instrument(&verified.intent.instrument)
         .await;
@@ -867,6 +879,18 @@ async fn write_reversal_veto(
         rlog_err!("KV set_veto (reversal): {err}");
         return;
     }
+    record_control_event_for(
+        store,
+        plan.account,
+        Some(plan.trade_id),
+        trade_control_core::control_event::ControlKind::Veto,
+        REVERSAL_VETO_NAME,
+        plan.instrument,
+        plan.ttl_seconds,
+        now,
+        None,
+    )
+    .await;
     rlog!(
         "reversal veto set: instrument={} account={} trade_id={} name={REVERSAL_VETO_NAME} ttl={}s",
         plan.instrument,
@@ -1932,6 +1956,18 @@ async fn maybe_update_mw_state<B: Broker>(
             {
                 rlog_err!("mw-state cancel: set_veto failed (trade_id={trade_id}): {err}");
             }
+            record_control_event_for(
+                store,
+                account,
+                Some(trade_id),
+                trade_control_core::control_event::ControlKind::Veto,
+                MW_CANCEL_VETO_NAME,
+                &intent.instrument,
+                ttl_seconds,
+                now,
+                None,
+            )
+            .await;
             // Clear the state row so a re-armed setup reusing the trade_id
             // starts clean. Best-effort.
             if let Err(err) = store.clear_mw_state(account, trade_id).await {
@@ -2151,6 +2187,40 @@ pub(crate) async fn record_seen<S: StateStore>(
     }
 }
 
+/// Append a [`ControlEvent`] audit row alongside a TTL'd control set.
+///
+/// Best-effort and **non-blocking**: a failure is logged and swallowed — the
+/// live control row was already set, and the audit trail must never gate it.
+/// Skipped when there's no `trade_id` to scope it to (the trail is per-trade;
+/// a `cooldown`/blackout set without a trade_id can't be journaled per trade).
+/// `request_id` links the event back to its R2 `req/` bundle when known.
+async fn record_control_event_for<S: StateStore>(
+    store: &S,
+    account: Option<&str>,
+    trade_id: Option<&str>,
+    kind: trade_control_core::control_event::ControlKind,
+    name: &str,
+    instrument: &str,
+    ttl_seconds: u64,
+    now: chrono::DateTime<chrono::Utc>,
+    request_id: Option<String>,
+) {
+    let Some(trade_id) = trade_id else {
+        return;
+    };
+    let event = trade_control_core::control_event::ControlEvent::new(
+        kind,
+        name,
+        instrument,
+        now,
+        ttl_seconds,
+        request_id,
+    );
+    if let Err(err) = store.record_control_event(account, trade_id, &event).await {
+        rlog_err!("KV record_control_event ({}/{name}): {err}", kind.tag());
+    }
+}
+
 /// Handle the `unlock` action: clear the cooldown for `verified.intent.instrument`.
 async fn handle_unlock(
     store: &KvStateStore,
@@ -2268,6 +2338,18 @@ async fn handle_prep(
         rlog_err!("KV set_prep: {err}");
         return Response::error("state error", 500);
     }
+    record_control_event_for(
+        store,
+        account,
+        verified.intent.trade_id.as_deref(),
+        trade_control_core::control_event::ControlKind::Prep,
+        step,
+        &verified.intent.instrument,
+        ttl_seconds,
+        now,
+        None,
+    )
+    .await;
     rlog!(
         "prep set: instrument={} account={} step={} ttl={}h cleared={:?}",
         verified.intent.instrument,
@@ -2413,6 +2495,18 @@ async fn handle_veto(
         rlog_err!("KV set_veto: {err}");
         return Response::error("state error", 500);
     }
+    record_control_event_for(
+        store,
+        account,
+        Some(trade_id),
+        trade_control_core::control_event::ControlKind::Veto,
+        name,
+        &verified.intent.instrument,
+        ttl_seconds,
+        now,
+        None,
+    )
+    .await;
     rlog!(
         "veto set: instrument={} account={} name={} ttl={}h cleared={:?}",
         verified.intent.instrument,
@@ -2523,6 +2617,18 @@ async fn run_veto_with_broker<B: Broker>(
             outcome: "rejected: state-error".into(),
         };
     }
+    record_control_event_for(
+        store,
+        account,
+        Some(trade_id),
+        trade_control_core::control_event::ControlKind::Veto,
+        name,
+        instrument,
+        ttl_seconds,
+        now,
+        None,
+    )
+    .await;
 
     let cancelled = broker.cancel_pending_for_instrument(instrument).await;
     let closed_ok = match level {
@@ -2689,6 +2795,18 @@ async fn handle_pause(
         rlog_err!("KV set_pause: {err}");
         return Response::error("state error", 500);
     }
+    record_control_event_for(
+        store,
+        verified.intent.account.as_deref(),
+        Some(trade_id),
+        trade_control_core::control_event::ControlKind::Pause,
+        blackout_id,
+        &verified.intent.instrument,
+        ttl_seconds,
+        now,
+        None,
+    )
+    .await;
     rlog!(
         "pause set: trade_id={trade_id} blackout_id={blackout_id} reason={:?}",
         reason
@@ -2758,6 +2876,18 @@ async fn handle_news_start(
         rlog_err!("KV set_news_window: {err}");
         return Response::error("state error", 500);
     }
+    record_control_event_for(
+        store,
+        verified.intent.account.as_deref(),
+        Some(trade_id),
+        trade_control_core::control_event::ControlKind::News,
+        news_id,
+        &verified.intent.instrument,
+        ttl_seconds,
+        now,
+        None,
+    )
+    .await;
     rlog!(
         "news-start: trade_id={trade_id} news_id={news_id} reason={:?}",
         reason
@@ -3984,6 +4114,28 @@ mod dispatcher_outcome_tests {
             Ok(())
         }
         async fn clear_plan_state(
+            &self,
+            _account: Option<&str>,
+            _trade_id: &str,
+        ) -> Result<(), StateError> {
+            Ok(())
+        }
+        async fn record_control_event(
+            &self,
+            _account: Option<&str>,
+            _trade_id: &str,
+            _event: &trade_control_core::control_event::ControlEvent,
+        ) -> Result<(), StateError> {
+            Ok(())
+        }
+        async fn list_control_events(
+            &self,
+            _account: Option<&str>,
+            _trade_id: &str,
+        ) -> Result<Vec<trade_control_core::control_event::ControlEvent>, StateError> {
+            Ok(Vec::new())
+        }
+        async fn clear_control_events(
             &self,
             _account: Option<&str>,
             _trade_id: &str,

@@ -1049,6 +1049,28 @@ mod tests {
         ) -> Result<(), StateError> {
             Ok(())
         }
+        async fn record_control_event(
+            &self,
+            _account: Option<&str>,
+            _trade_id: &str,
+            _event: &crate::control_event::ControlEvent,
+        ) -> Result<(), StateError> {
+            Ok(())
+        }
+        async fn list_control_events(
+            &self,
+            _account: Option<&str>,
+            _trade_id: &str,
+        ) -> Result<Vec<crate::control_event::ControlEvent>, StateError> {
+            Ok(Vec::new())
+        }
+        async fn clear_control_events(
+            &self,
+            _account: Option<&str>,
+            _trade_id: &str,
+        ) -> Result<(), StateError> {
+            Ok(())
+        }
         async fn archive_plan(
             &self,
             _account: Option<&str>,
