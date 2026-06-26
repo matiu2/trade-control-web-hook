@@ -93,6 +93,11 @@ pub fn resolve_fire_any(plan: &TradePlan, fire: &Fire) -> Option<FireResult> {
     if fire.superseded {
         return None;
     }
+    // A suppressed enter (paused by a news blackout) never placed an order —
+    // no position to annotate, same as a superseded one.
+    if fire.suppressed_by.is_some() {
+        return None;
+    }
     let candle = &fire.fired.candle;
     let shell = match &fire.fired.signal {
         Some(sig) => Shell::from_candle_and_signal(candle, sig),
@@ -237,6 +242,17 @@ fn render_fire(
             describe_order(&resolved, plan.pip_size)
         )),
         Err(err) => line.push_str(&format!("    order: UNRESOLVED — {err:?}\n")),
+    }
+
+    // A suppressed enter landed inside an active news-blackout pause — the gate
+    // rejected it (the live worker 423s), so no order went on. Show the 0R skip
+    // legibly and don't tally it.
+    if let Some(blackouts) = &fire.suppressed_by {
+        line.push_str(&format!(
+            "    fill: SUPPRESSED — trade paused by news blackout [{}] → NO FILL / 0R\n",
+            blackouts.join(", ")
+        ));
+        return line;
     }
 
     // A superseded enter had its resting order cancelled by a later entry

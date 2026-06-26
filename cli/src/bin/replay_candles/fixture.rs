@@ -76,6 +76,12 @@ pub struct FireOutcome {
     /// The simulated fill, present only for an enter when simulation was on.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fill: Option<FillOutcome>,
+    /// Active news-blackout ids that suppressed this enter (paused at fire
+    /// time). Empty/omitted for any fire the blackout gate let through. A
+    /// suppressed enter has no `fill` — it's a 0R skip. Serialized so a fixture
+    /// freezes the with-blackout SKIP as a regression.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub suppressed_by: Vec<String>,
 }
 
 /// A flat, serializable mirror of [`SimOutcome`]. Mirroring it here (rather than
@@ -159,6 +165,11 @@ pub fn fill_for(plan: &TradePlan, fire: &Fire, simulate: bool) -> Option<SimOutc
     if !simulate || fire.fired.intent.action != Action::Enter {
         return None;
     }
+    // A suppressed enter (paused by a news blackout) never placed an order, so
+    // its standalone fill is fiction — no fill, exactly like a superseded one.
+    if fire.suppressed_by.is_some() {
+        return None;
+    }
     let candle = &fire.fired.candle;
     let shell = match &fire.fired.signal {
         Some(sig) => Shell::from_candle_and_signal(candle, sig),
@@ -185,6 +196,7 @@ impl ReplayOutcome {
                 candle_time: fire.fired.candle.time,
                 candle_close: fire.fired.candle.c,
                 fill: fill_for(plan, fire, simulate).map(|o| (&o).into()),
+                suppressed_by: fire.suppressed_by.clone().unwrap_or_default(),
             })
             .collect();
         ReplayOutcome {
@@ -359,6 +371,7 @@ mod tests {
                     exit_at: Utc.with_ymd_and_hms(2026, 6, 18, 18, 0, 0).unwrap(),
                     exit_price: 1.2400,
                 }),
+                suppressed_by: Vec::new(),
             }],
             done: true,
             final_phase: trade_control_engine::Phase::Done,

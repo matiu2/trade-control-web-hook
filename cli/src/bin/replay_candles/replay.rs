@@ -9,6 +9,7 @@
 
 use chrono::{DateTime, Duration, Utc};
 use trade_control_core::intent::{Action, Shell};
+use trade_control_core::pause_gate::{self, EntryGate};
 use trade_control_core::retry_gate::{self, RetryGateOutcome};
 use trade_control_core::state::MemStateStore;
 use trade_control_core::tunable::Tunable;
@@ -36,6 +37,12 @@ pub struct Fire {
     /// standalone simulated fill. The faithful model: a new entry cancels any
     /// resting sibling/prior order on the same setup.
     pub superseded: bool,
+    /// Set on an `enter` fire that landed inside an active news-blackout pause:
+    /// the blackout gate (`core::pause_gate::entry_blocked`) rejected it, so no
+    /// order went on — a hard skip matching the live worker, which 423s a paused
+    /// entry. Carries the active blackout ids for the report. `None` for any
+    /// fire the gate let through (or that never hit the gate).
+    pub suppressed_by: Option<Vec<String>>,
 }
 
 /// The outcome of replaying a plan over a candle series.
@@ -131,6 +138,10 @@ pub async fn run(
         // close time as `now` so wall-clock-derived state (TTLs, logging) lines
         // up with the live worker, which ticks on wall-clock, not bar-open.
         let now = candles[i].time + bar;
+        // Pin the store's clock to this tick so historically-dated pause TTLs
+        // aren't judged "expired" against real wall-clock — the same
+        // wall-clock-vs-cursor trap that drops blackout state in replay.
+        store.set_clock(now);
 
         tracing::debug!(
             bar = %candles[i].time,
@@ -158,11 +169,54 @@ pub async fn run(
                 action = ?fired.intent.action,
                 "tick: rule fired"
             );
+            // News-blackout control fires set/clear pause state in the SAME
+            // store the enter gate reads, via the SAME core helpers the worker
+            // uses (so the replay can't drift from live). A pause/resume isn't
+            // an enter — record it through as a non-fill fire afterwards.
+            match fired.intent.action {
+                Action::Pause => {
+                    if let Err(e) = pause_gate::apply_pause(&store, &fired.intent, now).await {
+                        tracing::error!(rule = %fired.rule_id, error = %e, "apply_pause failed");
+                    }
+                }
+                Action::Resume => {
+                    if let Err(e) = pause_gate::apply_resume(&store, &fired.intent).await {
+                        tracing::error!(rule = %fired.rule_id, error = %e, "apply_resume failed");
+                    }
+                }
+                _ => {}
+            }
+
+            // Blackout gate — an enter that lands inside an active pause is a
+            // hard skip (the live worker 423s it). Record the suppressed fire so
+            // the report shows the 0R skip legibly, but place no order / no fill.
+            let mut suppressed_by = None;
+            if fired.intent.action == Action::Enter {
+                match pause_gate::entry_blocked(&store, &fired.intent).await {
+                    Ok(EntryGate::Blocked { blackouts }) => {
+                        tracing::debug!(
+                            rule = %fired.rule_id,
+                            blackouts = ?blackouts,
+                            "tick: enter suppressed — trade paused (news blackout)"
+                        );
+                        suppressed_by = Some(blackouts);
+                    }
+                    Ok(EntryGate::Allowed) => {}
+                    Err(e) => {
+                        tracing::error!(rule = %fired.rule_id, error = %e, "entry_blocked check failed");
+                    }
+                }
+            }
+
             // An enter fire on a multi-shot plan must clear the retry gate before
             // it counts as a placement; any other fire (veto/prep, or a
-            // single-shot enter) records straight through.
+            // single-shot enter) records straight through. A suppressed enter
+            // skips the retry gate entirely — it never reaches placement.
             let mut order_id = None;
-            if fired.intent.action == Action::Enter && is_multi_shot(&fired.intent.max_retries) {
+            if suppressed_by.is_none()
+                && fired.intent.action == Action::Enter
+                && is_multi_shot(&fired.intent.max_retries)
+            {
                 match gate_enter(&replay_broker, &store, &fired, now, plan.pip_size).await {
                     Some(id) => order_id = Some(id), // Proceed — record the placement.
                     None => continue,                // Rejected (open / cap) — no placement.
@@ -179,6 +233,7 @@ pub async fn run(
                 forward,
                 order_id,
                 superseded: false,
+                suppressed_by,
             });
         }
 
@@ -403,6 +458,145 @@ mod tests {
 
     fn expires() -> DateTime<Utc> {
         Utc.timestamp_opt(99 * 3600, 0).unwrap()
+    }
+
+    /// A single-shot LONG stop-enter (crosses 1.1050 up, OnClose) wrapped in a
+    /// news-blackout `pause`/`resume` pair (TimeReached). `pause_epoch` /
+    /// `resume_epoch` bound the blackout window. The enter shares the trade_id
+    /// the pause/resume scope to, so the blackout gate can find it.
+    fn paused_enter_plan(pause_epoch: i64, resume_epoch: i64) -> TradePlan {
+        serde_json::from_str(&format!(
+            r#"{{
+                "trade_id": "t041",
+                "instrument": "CAD_CHF",
+                "direction": "long",
+                "granularity": "h1",
+                "pip_size": 0.0001,
+                "rules": [
+                    {{
+                        "rule_id": "01-pause-cad-gdp",
+                        "trigger": {{ "type": "time_reached", "at_epoch": {pause_epoch} }},
+                        "fire_mode": "once",
+                        "intent": {{
+                            "v": 1, "id": "pause-cad-gdp", "not_after": "2099-01-01T00:00:00Z",
+                            "action": "pause", "instrument": "CAD_CHF",
+                            "trade_id": "t041", "blackout_id": "cad-gdp", "reason": "CAD GDP"
+                        }}
+                    }},
+                    {{
+                        "rule_id": "02-resume-cad-gdp",
+                        "trigger": {{ "type": "time_reached", "at_epoch": {resume_epoch} }},
+                        "fire_mode": "once",
+                        "intent": {{
+                            "v": 1, "id": "resume-cad-gdp", "not_after": "2099-01-01T00:00:00Z",
+                            "action": "resume", "instrument": "CAD_CHF",
+                            "trade_id": "t041", "blackout_id": "cad-gdp"
+                        }}
+                    }},
+                    {{
+                        "rule_id": "05-enter",
+                        "trigger": {{ "type": "horizontal_cross", "level": 1.1050, "dir": "up", "bar": "on_close" }},
+                        "fire_mode": "once",
+                        "intent": {{
+                            "v": 1, "id": "t041-enter", "not_after": "2099-01-01T00:00:00Z",
+                            "action": "enter", "instrument": "CAD_CHF", "direction": "long",
+                            "entry": {{ "type": "stop", "from": "close", "offset_pips": 0.0, "at": 1.1100 }},
+                            "stop_loss": {{ "absolute": 1.1000 }},
+                            "take_profit": {{ "absolute": 1.1300 }},
+                            "broker": "tradenation", "trade_id": "t041", "max_retries": 0
+                        }}
+                    }}
+                ]
+            }}"#
+        ))
+        .expect("parse paused-enter plan")
+    }
+
+    /// Bug `BUG-replay-candles-pause-not-enforced`: an enter that fires inside an
+    /// active news-blackout pause must be SUPPRESSED (no fill, 0R) — matching the
+    /// live worker, which 423s a paused entry. Without the gate this enter would
+    /// fill at 1.1100 and take profit at 1.1300.
+    #[tokio::test]
+    async fn enter_inside_pause_window_is_suppressed_no_fill() {
+        // 10 seed bars below 1.1050, then bar 10 = pause epoch, bar 12 crosses
+        // 1.1050 up (enter fires), bars 13+ run through 1.1100 to TP 1.1300.
+        // Resume is far past the window so the pause is active at bar 12.
+        let mut candles: Vec<EngineCandle> = (0..10).map(|i| candle(i * 3600, 1.1040)).collect();
+        candles.push(candle(10 * 3600, 1.1040)); // bar 10: pause fires (epoch 10*3600)
+        candles.push(candle(11 * 3600, 1.1045)); // bar 11
+        candles.push(ohlc(12 * 3600, 1.1045, 1.1058, 1.1042, 1.1055)); // bar 12: OnClose cross
+        candles.push(ohlc(13 * 3600, 1.1060, 1.1120, 1.1055, 1.1110)); // would fill @1.1100
+        candles.push(ohlc(14 * 3600, 1.1110, 1.1310, 1.1185, 1.1300)); // would TP 1.1300
+
+        let pause_epoch = 10 * 3600;
+        let resume_epoch = 100 * 3600; // far past the window — pause stays active
+        let r = run(
+            &paused_enter_plan(pause_epoch, resume_epoch),
+            &candles,
+            Granularity::H1,
+            all_live(),
+            expires(),
+        )
+        .await;
+
+        let enter = r
+            .fires
+            .iter()
+            .find(|f| f.fired.rule_id == "05-enter")
+            .expect("enter fired");
+        assert_eq!(
+            enter.suppressed_by.as_deref(),
+            Some(&["cad-gdp(CAD GDP)".to_string()][..]),
+            "the enter must be suppressed by the active cad-gdp blackout"
+        );
+
+        // And the report must show the skip, not a fabricated fill.
+        let report = crate::report::render(&paused_enter_plan(pause_epoch, resume_epoch), &r, true);
+        assert!(
+            report.contains("SUPPRESSED") && report.contains("NO FILL"),
+            "report must show the paused enter as a 0R skip:\n{report}"
+        );
+        assert!(
+            report.contains("TP: 0  SL: 0"),
+            "a suppressed enter is not tallied as a win:\n{report}"
+        );
+    }
+
+    /// The converse: the SAME enter with NO pause window fills and takes profit.
+    /// This is the A/B the journal needs — with-blackout (0R) vs without (+R).
+    #[tokio::test]
+    async fn enter_without_pause_fills_and_takes_profit() {
+        let mut candles: Vec<EngineCandle> = (0..10).map(|i| candle(i * 3600, 1.1040)).collect();
+        candles.push(candle(10 * 3600, 1.1040));
+        candles.push(candle(11 * 3600, 1.1045));
+        candles.push(ohlc(12 * 3600, 1.1045, 1.1058, 1.1042, 1.1055));
+        candles.push(ohlc(13 * 3600, 1.1060, 1.1120, 1.1055, 1.1110));
+        candles.push(ohlc(14 * 3600, 1.1110, 1.1310, 1.1185, 1.1300));
+
+        // Pause + resume both BEFORE the enter bar → no active blackout at bar 12.
+        let r = run(
+            &paused_enter_plan(3600, 2 * 3600),
+            &candles,
+            Granularity::H1,
+            all_live(),
+            expires(),
+        )
+        .await;
+
+        let enter = r
+            .fires
+            .iter()
+            .find(|f| f.fired.rule_id == "05-enter")
+            .expect("enter fired");
+        assert!(
+            enter.suppressed_by.is_none(),
+            "no active pause at the enter bar → not suppressed"
+        );
+        let report = crate::report::render(&paused_enter_plan(3600, 2 * 3600), &r, true);
+        assert!(
+            report.contains("TP: 1"),
+            "without an active blackout the enter fills and takes profit:\n{report}"
+        );
     }
 
     /// A plan with a single intrabar `too-high` veto at `level` (crosses up).
