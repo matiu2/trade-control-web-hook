@@ -1248,6 +1248,17 @@ pair per event, then drops any pair whose window has already elapsed. The
   builders so a pair that survives the prune isn't then rejected by their own
   "refusing to arm a stale blackout" past-window guard.
 
+**Zero-length blackout/news pairs are dropped, not fatal.** When `tv-arm`
+auto-draws calendar lines and reads them back, TradingView snaps each vertical
+line to its bar's timestamp — so two distinct planned times that fall in the same
+bar (e.g. one event's `resume` and the next event's `pause` 8h apart on an H1+
+chart) come back on the *same* timestamp. The readback pairing
+(`trading-view/src/pair_lines.rs`) zips sorted starts to sorted ends and now
+**drops any pair whose start and end snapped to the same time** — a zero-length
+window arms nothing — instead of hard-erroring `blackout pair is reversed` and
+aborting the whole arm. A genuinely reversed pair (`start > end`, drawn out of
+order) is still a hard error.
+
 ## Brokers
 
 The intent YAML carries an optional `broker:` field, one of `oanda`
