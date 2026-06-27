@@ -62,11 +62,12 @@ pub fn annotate(
         tracing::info!(cleared, "removed prior replay annotations");
     }
 
+    let closes = report::collect_close_fires(replay);
     let resolve = |f: &_| {
         if include_unfilled {
-            report::resolve_fire_any(plan, f)
+            report::resolve_fire_any(plan, f, &closes)
         } else {
-            report::resolve_fire(plan, f)
+            report::resolve_fire(plan, f, &closes)
         }
     };
     let positions: Vec<FireResult> = replay.fires.iter().filter_map(resolve).collect();
@@ -166,6 +167,7 @@ fn outcome_label(kind: FillKind) -> &'static str {
         FillKind::Open => "open",
         FillKind::StoppedOut => "SL",
         FillKind::TookProfit => "TP",
+        FillKind::ClosedOnReversal => "reversal",
         FillKind::NeverFilled => "no-fill",
         FillKind::Declined => "declined",
     }

@@ -853,4 +853,111 @@ mod tests {
             "exactly one taken position (the limit's TP), no overlap:\n{report}"
         );
     }
+
+    /// A SHORT plan with a `06-close-on-reversal` PinePattern{Long} guard: the
+    /// short fills, then a bullish reversal candle prints inside the SR band
+    /// **before** SL/TP — the position must close on that reversal bar, not run
+    /// to window-end. This is the trade-075 Wheat bug: the engine now fires the
+    /// close (a PinePattern guard), and the replay flattens the open short there.
+    fn short_with_close_on_reversal_plan() -> TradePlan {
+        // Short stop entry at 1.180 (absolute), SL 1.300 (above), TP 0.950
+        // (below) — a wide bracket so neither is touched before the reversal.
+        // The enter fires on an OnClose down-cross of 1.190; the close-on-
+        // reversal is a Long PinePattern gated on price ∈ [1.15, 1.20].
+        serde_json::from_str(
+            r#"{
+                "trade_id": "wheat-rev",
+                "instrument": "WHEAT_USD",
+                "direction": "short",
+                "granularity": "h1",
+                "pip_size": 0.001,
+                "rules": [
+                    {
+                        "rule_id": "05-enter",
+                        "trigger": { "type": "horizontal_cross", "level": 1.190, "dir": "down", "bar": "on_close" },
+                        "fire_mode": "once",
+                        "intent": {
+                            "v": 1, "id": "wheat-rev-enter", "not_after": "2099-01-01T00:00:00Z",
+                            "action": "enter", "instrument": "WHEAT_USD", "direction": "short",
+                            "entry": { "type": "stop", "from": "close", "offset_pips": 0.0, "at": 1.180 },
+                            "stop_loss": { "absolute": 1.300 },
+                            "take_profit": { "absolute": 0.950 },
+                            "broker": "oanda", "trade_id": "wheat-rev", "max_retries": 5
+                        }
+                    },
+                    {
+                        "rule_id": "06-close-on-reversal",
+                        "trigger": { "type": "pine_pattern", "dir": "long" },
+                        "fire_mode": "once",
+                        "intent": {
+                            "v": 1, "id": "wheat-rev-close", "not_after": "2099-01-01T00:00:00Z",
+                            "action": "close", "instrument": "WHEAT_USD",
+                            "inside_window": ["price"], "sr_bands": [[1.150, 1.200]],
+                            "broker": "oanda", "trade_id": "wheat-rev"
+                        }
+                    }
+                ]
+            }"#,
+        )
+        .expect("parse short-with-close plan")
+    }
+
+    #[tokio::test]
+    async fn open_short_closes_on_a_reversal_candle_in_the_band() {
+        // 10 clean warm-up bars above the entry (the `run` seed floor is 10 bars
+        // when live_start precedes the window), then the live action: the OnClose
+        // down-cross fires the short, the next bar fills it at 1.180, then a
+        // bullish pinbar reversal (close 1.18, inside [1.15, 1.20]) prints — the
+        // short must CLOSE there. Warm-up bars are flat (no stray signal).
+        let mut candles: Vec<EngineCandle> = (0..11)
+            .map(|i| ohlc(i * 3600, 1.20, 1.205, 1.195, 1.20))
+            .collect();
+        // bar 11: OnClose down-cross of 1.190 (prev 1.20 > 1.190 ≥ close 1.185)
+        // → `05-enter` (short stop @1.180) fires; order rests.
+        candles.push(ohlc(11 * 3600, 1.195, 1.196, 1.184, 1.185));
+        // bar 12: dips to 1.180 → fills the short stop @1.180. Stays above TP.
+        candles.push(ohlc(12 * 3600, 1.185, 1.186, 1.179, 1.182));
+        // bar 13: a clean prior bar for the pinbar breakout (no signal shape):
+        // a small down bar that does NOT undercut to set up a long pinbar itself.
+        candles.push(ohlc(13 * 3600, 1.182, 1.185, 1.175, 1.178));
+        // bar 14: BULLISH pinbar. range 1.00..1.20 = 0.20; body 1.16..1.18 (top
+        // quartile: top_25 = 1.20 - 0.05 = 1.15 → body_bottom 1.16 ≥ 1.15);
+        // lower wick = 1.16 - 1.00 = 0.16 ≥ 0.10; low 1.00 < prior low 1.175;
+        // close 1.18 > open 1.16 → bullish. close 1.18 ∈ [1.15, 1.20]. low 1.00
+        // stays above TP 0.95, high 1.20 below SL 1.30 → neither bracket hit.
+        candles.push(ohlc(14 * 3600, 1.16, 1.20, 1.00, 1.18));
+        // bar 15+: drift, so without the close the short would just stay open.
+        candles.push(ohlc(15 * 3600, 1.18, 1.19, 1.17, 1.18));
+
+        let plan = short_with_close_on_reversal_plan();
+        let r = run(&plan, &candles, Granularity::H1, all_live(), expires()).await;
+
+        // Both fired: the short enter, then the close guard on the reversal.
+        assert!(
+            r.fires.iter().any(|f| f.fired.rule_id == "05-enter"),
+            "the short enter must fire and fill"
+        );
+        assert!(
+            r.fires
+                .iter()
+                .any(|f| f.fired.rule_id == "06-close-on-reversal"),
+            "the engine must fire the close-on-reversal guard"
+        );
+        assert!(r.done, "a terminal close retires the plan");
+
+        // The replay report shows the short CLOSED ON REVERSAL, not held open.
+        let report = crate::report::render(&plan, &r, true);
+        assert!(
+            report.contains("CLOSED ON REVERSAL"),
+            "the open short must close on the reversal candle:\n{report}"
+        );
+        assert!(
+            report.contains("REV: 1"),
+            "the reversal close is tallied:\n{report}"
+        );
+        assert!(
+            !report.contains("still open at window end"),
+            "the short must not be reported as still open:\n{report}"
+        );
+    }
 }

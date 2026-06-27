@@ -1,32 +1,52 @@
-# TODO — tv-arm: filter drawings to visible window before role-matching
+# TODO — fix `06-close-on-reversal` never evaluated (engine + replay)
 
-## Problem
-`tv-arm` role-matching reads ALL drawings on the chart (entire history), not
-just those in the visible window. In **live arming** (`SlotPref::LatestWins`)
-the window is ignored entirely — a stale off-screen drawing with a newer anchor
-time wins the single-slot tiebreak over the correct in-view drawing. Recurs
-constantly; hand-fixed by deleting stale drawings. Structural fix: drop
-drawings that lie entirely outside the visible window (intersection, not
-containment) BEFORE the tiebreak, in BOTH run modes.
+Bug: `BUG-replay-close-on-reversal-not-evaluated.md`. A `06-close-on-reversal`
+rule (`Trigger::PinePattern`, `action: close`, `dir` = opposite of trade) never
+fires — neither in the worker nor in replay — because `eval_trigger` returns
+`false` for every `PinePattern` trigger (only `evaluate_entry`'s `eval_pine_entry`
+ever runs pine detection). So an open position is over-held to SL/TP/window-end.
 
-Concrete repro: CAD/JPY H1, visible May 15→27 (1778810400..1779843600). Correct
-neckline `1kUSW4` (May 18→20) lost to June `2Xfe1I`/`7rdwbe` pair under
-LatestWins. Only `1kUSW4` is in-window; window-filtering collapses every role
-to one unambiguous drawing.
+This is a SHARED-engine gap (see strategy_changes_in_both_replayer_and_worker):
+fixing the engine fixes the worker dispatch AND the replay fire.
 
 ## Plan
-- [x] Read roles.rs / drawings.rs / pipeline.rs — understand current modes
-- [x] Add `Drawing::intersects_window(from, to)` (intersection, not
-      containment) + `earliest_time()` helper, unit-tested in drawings.rs.
-- [x] `pick_slot` window-filters to in-window first (BOTH prefs, real visible
-      range threaded independent of SlotPref), logs `in_window=N
-      dropped_out_of_window=M`, WARNs on >1 in-window, falls back to full set
-      only when nothing is in-window. SlotPref now governs only the tiebreak.
-- [x] `pick_trade_expiry`: intersection OR within forward margin (= window
-      width) of `to`; prefers expiry nearest the right edge.
-- [x] Tests: CAD/JPY repro, intersection edge cases (whole-view span, single
-      partly-off-screen kept), expiry forward margin + off-screen-left dropped,
-      both modes, in-window newest tiebreak. 35 roles tests, all green.
-- [x] cargo test (211 workspace), clippy -D warnings, fmt — all clean.
-- [x] README: documented single-slot visible-window scoping.
-- [ ] Commit + push main; deploy dev + staging; advance parent pointer.
+
+- [x] **Engine — fire a `PinePattern` guard via the detector.** In
+      `evaluate_guards`, when a guard rule's trigger is `PinePattern`, route it
+      through `eval_pine_entry` (same detector as the enter), gated by direction.
+      On a detector fire, also require the reversal candle's price to sit inside
+      one of the intent's `sr_bands` (when `inside_window` lists `price`) — the
+      pure half of the worker's `run_close` contextual gate, so the engine only
+      fires a real reversal-close. News-window gate stays the worker's job (KV).
+      Push the intent **with the latched signal shell** (so `run_close` sees
+      golden/confirmed) and set `Phase::Done`.
+  - [x] Add a pure `price_in_any_band(price, bands)` helper to the engine
+        (mirrors `src/lib.rs::price_band_hit`; worker copy stays — it reads a
+        live broker price, not a candle).
+  - [x] Tests: a short plan + a long reversal candle in an SR band fires the
+        close guard; the same candle OUTSIDE every band does not; a long
+        reversal with no band requirement still fires; same-direction ignored.
+
+- [x] **Replay — exit the open position on a close fire.** The fill simulator
+      (`report.rs`) walks each enter's forward path independently and ignored
+      close fires. A `close` fire that lands after an enter's fill and before its
+      SL/TP now flattens the position at the close bar's close price.
+  - [x] Post-pass `apply_reversal_close` threads close fires into the per-enter
+        fill resolution (report + annotate share `resolve_fire`, now `+closes`).
+  - [x] Surface it: `fill: CLOSED ON REVERSAL — in @ … → exit … (<bar>)`,
+        tallied under `REV:` distinct from TP/SL; annotate label `reversal`.
+  - [x] Test: end-to-end `run`→`render` (multi-shot short fills, bullish reversal
+        in band closes it) + `apply_reversal_close` unit matrix.
+
+- [x] cargo clippy (-D warnings) + fmt + full workspace test green
+      (core 605, engine 67, worker 217, trading_view 34, tv-arm 165, tv-news 76,
+      cli replay 48).
+- [x] README (engine close-on-reversal note + Candle replay note) + CHANGELOG.
+- [ ] Commit + push branch. Tag/advance parent + deploy: defer to user —
+      staging is mid-bake (v60 marker), so DON'T disturb it; this is a
+      main/dev-targeted fix.
+
+## Verification
+
+Re-replay trade 075 Wheat: leg 3 closes on 06-25 23:00 ≈ 5.860 (+~0.16R), not
+held to window-end. `pine-close` evaluations > 0 in the debug log.
