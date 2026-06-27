@@ -43,6 +43,17 @@ helper in `core` so the two consumers can't drift (same pattern as
        `build_enter_alert` + `build_mw_enter_alert` bake `Intent.breakeven`.
        tv-arm `--no-breakeven` / `--breakeven-pct` flags. 3 CLI tests. Both H&S
        (incl. QM leg) and M/W. Workspace green, clippy+fmt clean.
-- [ ] 6. README + CHANGELOG + tag; advance parent submodule pointer.
+- [x] 6. README ("Break-even stop management" section + spec field + tv-arm
+       flags) + CHANGELOG (v61 unreleased). Replay report shows
+       `BREAK-EVEN (SL→BE)` on a BE exit.
+
+## Deferred (do NOT do now)
+
+- **Tag + deploy** — `staging` is mid-bake on v60 (the week-long promotion
+  gate). Land on `main` (dev) only; tag v61 + deploy when the bake window
+  allows. (Same posture as the parallel close-on-reversal fix.)
+- **Demo-confirm** `amend_stop` on an open TN position (shared precondition
+  with the spread-blackout widen) before trusting the live move.
+- **Advance parent submodule pointer** after merge to this repo's `main`.
 
 A change isn't done until: tests pass, clippy clean, fmt run.

@@ -371,11 +371,21 @@ fn describe_outcome(outcome: &SimOutcome) -> String {
             entry_price,
             exit_at,
             exit_price,
-        } => format!(
-            "fill: STOPPED OUT — in @ {entry_price} ({}) → SL {exit_price} ({})",
-            bne(*fill_at),
-            bne(*exit_at)
-        ),
+        } => {
+            // When the stop landed at the entry price, break-even management
+            // (BUG-replay-no-breakeven-stop-at-50pct) moved it there after a
+            // candle closed past 50%-to-TP — a 0R scratch, not a −1R loss.
+            let label = if (exit_price - entry_price).abs() < 1e-9 {
+                "BREAK-EVEN (SL→BE) — in @"
+            } else {
+                "STOPPED OUT — in @"
+            };
+            format!(
+                "fill: {label} {entry_price} ({}) → SL {exit_price} ({})",
+                bne(*fill_at),
+                bne(*exit_at)
+            )
+        }
         SimOutcome::TookProfit {
             fill_at,
             entry_price,
