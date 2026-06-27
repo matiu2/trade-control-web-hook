@@ -1,5 +1,22 @@
 # Changelog
 
+## v60 — 2026-06-27 — Staging bake marker (no code change)
+
+Marker release pinning the staging promotion candidate for its week-long bake
+starting Monday 2026-06-29. **No code change since v59** — this tag exists so
+the exact commit that runs unchanged on `staging` for the week (the promotion
+gate) is unambiguously identified before a `prod` promotion.
+
+- Code is byte-identical to v59 (the bug #15 no-TTL + control-event + purge ship).
+- Secrets backfilled onto the suffixed `-dev` / `-staging` workers this session
+  (post-2026-06-22 env rename): `ADMIN_KEY`, regenerated `OANDA_API_KEY`,
+  `OANDA_ACCOUNT_ID`, `OANDA_ACCOUNT_OANDA_REVERSALS_DEMO`, and the two
+  TradeNation demo creds (`TN_ACCOUNT_EXPERIMENTAL` / `TN_ACCOUNT_REVERSALS`).
+  Cloudflare Worker secrets do not expire — this was a one-time backfill, not a
+  recurring thing. No repo change (secret-store ops only).
+- **Promotion plan:** if `staging` runs unchanged + profitable for the week, it
+  merges into a fresh `prod` branch (worker `trade-control-web-hook-prod`).
+
 ## v59 — 2026-06-27 — No-TTL per-trade rows + control-event trail + purge commands (bug #15)
 
 ### Why
