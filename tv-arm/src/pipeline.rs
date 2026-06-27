@@ -815,6 +815,15 @@ fn build_mw_trade_spec(
         recover_entry: trade_control_core::intent::RecoverEntryAction::Skip,
         // strategy-v2 (dual stop + QM enter) is H&S-only.
         strategy_v2: false,
+        // Break-even on at 50% by default; `--no-breakeven` opts out,
+        // `--breakeven-pct` overrides. M/W honours it exactly like H&S — the
+        // worker resolves the M/W geometry at fill, so the cron's snapshot has
+        // a concrete entry/TP for the 50% level.
+        breakeven_pct: if args.no_breakeven {
+            None
+        } else {
+            Some(args.breakeven_pct.unwrap_or(0.5))
+        },
     }
 }
 
@@ -1043,6 +1052,13 @@ fn build_trade_spec(
             },
         ),
         strategy_v2: args.strategy_v2,
+        // Break-even on at 50% by default; `--no-breakeven` opts out,
+        // `--breakeven-pct` overrides the threshold.
+        breakeven_pct: if args.no_breakeven {
+            None
+        } else {
+            Some(args.breakeven_pct.unwrap_or(0.5))
+        },
     };
     if args.sl_from_recent {
         spec.sl_anchor = Some(match direction {

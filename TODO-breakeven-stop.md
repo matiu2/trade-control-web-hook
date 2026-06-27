@@ -33,11 +33,16 @@ helper in `core` so the two consumers can't drift (same pattern as
        that CLOSES past the 50% level moves `active_stop` to entry for
        subsequent bars. 2 tests (trade-075 leg-2: −1R→0R; wick does not arm).
        Core+engine suites green (677). clippy+fmt clean.
-- [ ] 4. live worker: cron step that, for open positions of a trade whose enter
-       carried `breakeven`, arms once a closed candle passes 50% and calls
-       `amend_stop(entry)`. (Re-use the blackout_watch open-position pattern.)
-- [ ] 5. tv-arm / build-trade: bake `breakeven` onto the `05-enter` intent
-       (default on at 50%? confirm gate). README.
+- [x] 4. live worker: `src/cron/breakeven_watch.rs` — every-tick cron that
+       joins open positions to their EntryAttempt's BreakevenSnapshot, fetches
+       closed candles, and amend_stop(entry) once a close passes 50%. Pure
+       decision in core (`decide_move` / `more_progressed`). Plumbing:
+       BreakevenSnapshot on EntryAttempt, record_placement + run_enter params,
+       granularity threaded from the engine. Full workspace green.
+- [x] 5. tv-arm / build-trade: `TradeSpec.breakeven_pct` (default Some(0.5));
+       `build_enter_alert` + `build_mw_enter_alert` bake `Intent.breakeven`.
+       tv-arm `--no-breakeven` / `--breakeven-pct` flags. 3 CLI tests. Both H&S
+       (incl. QM leg) and M/W. Workspace green, clippy+fmt clean.
 - [ ] 6. README + CHANGELOG + tag; advance parent submodule pointer.
 
 A change isn't done until: tests pass, clippy clean, fmt run.

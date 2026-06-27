@@ -487,6 +487,32 @@ pub struct TradeSpec {
     /// single-enter spec yaml.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub strategy_v2: bool,
+    /// Break-even stop management (BUG-replay-no-breakeven-stop-at-50pct).
+    /// **Default ON at 50%.** Bakes a [`Breakeven`] rule onto the `05-enter`
+    /// intent (H&S, M/W, and the strategy-v2 QM enter) so the live worker's
+    /// position cron moves the stop-loss to break-even (the entry price) once a
+    /// candle closes past this fraction of the entry→TP distance.
+    ///
+    /// `Some(f)` arms at fraction `f` (0.5 = halfway); the default function
+    /// supplies `Some(0.5)`. Set `breakeven_pct: null` in the spec yaml to
+    /// **disable** break-even for this trade. Out-of-`(0,1)` values are clamped
+    /// to 0.5 by the worker/replay (`Breakeven::sane`).
+    #[serde(default = "default_breakeven_pct")]
+    pub breakeven_pct: Option<f64>,
+}
+
+/// Default for [`TradeSpec::breakeven_pct`]: break-even is **on at 50%** unless
+/// the operator explicitly sets `breakeven_pct: null`. The standing lesson
+/// ("once profit reaches 50%, set SL to break-even") is the default, not an
+/// opt-in.
+fn default_breakeven_pct() -> Option<f64> {
+    Some(trade_control_core::intent::DEFAULT_BREAKEVEN_THRESHOLD)
+}
+
+/// Build the [`Breakeven`] rule for an enter from a spec's `breakeven_pct`:
+/// `Some(f)` → armed at `f`; `None` → no break-even (operator opted out).
+fn breakeven_from_pct(breakeven_pct: Option<f64>) -> Option<trade_control_core::intent::Breakeven> {
+    breakeven_pct.map(|threshold| trade_control_core::intent::Breakeven { threshold })
 }
 
 /// Skip-serializing predicate for [`TradeSpec::blackout_close`] — keeps a
@@ -924,6 +950,8 @@ fn build_pattern(
         // strategy-v2 (dual stop + QM enter) is a tv-arm opt-in, not an
         // interactive-questionnaire option.
         strategy_v2: false,
+        // Break-even on at 50% by default (the standing lesson).
+        breakeven_pct: default_breakeven_pct(),
     };
     assemble_trade(spec, geometry, entry_offset_pips, sl_offset_pips, now)
 }
@@ -1048,6 +1076,7 @@ fn assemble_trade(
         &spec.entry_level_vetos,
         spec.recover_entry,
         false, // BCR leg → 05-enter
+        breakeven_from_pct(spec.breakeven_pct),
     ));
     // strategy-v2: a second enter — the Quasimodo entry — armed alongside the
     // BCR stop entry on the same setup. No preps (both skipped),
@@ -1097,6 +1126,7 @@ fn assemble_trade(
             &spec.entry_level_vetos,
             RecoverEntryAction::Limit, // wrong-side fallback, like standalone QM
             true,                      // QM leg → 09-enter-qm
+            breakeven_from_pct(spec.breakeven_pct),
         ));
     }
     if spec.close_on_news || !spec.sr_reversal_ranges.is_empty() {
@@ -1259,6 +1289,7 @@ fn build_mw_pattern(spec: TradeSpec, now: DateTime<Utc>) -> Result<BuiltTrade> {
             spec.blackout_close,
             &spec.broker,
             &spec.account,
+            breakeven_from_pct(spec.breakeven_pct),
         ),
     ];
 
@@ -1412,6 +1443,7 @@ fn build_mw_enter_alert(
     blackout_close: BlackoutCloseAction,
     broker: &BrokerKind,
     account: &str,
+    breakeven: Option<trade_control_core::intent::Breakeven>,
 ) -> BuiltAlert {
     let id = format!("{trade_id}-enter");
     let mut intent = skeleton(
@@ -1453,6 +1485,9 @@ fn build_mw_enter_alert(
         MW_OVERSHOOT_VETO_NAME.into(),
         "trade-expiry".into(),
     ];
+    // Break-even — same as H&S; the worker resolves the M/W geometry at fill,
+    // so the cron's snapshot has a concrete entry/TP to compute the 50% level.
+    intent.breakeven = breakeven;
     BuiltAlert {
         basename: AlertBasename::Enter.as_str().into_owned(),
         purpose: "enter: M/W per-bar stop entry (worker-computed geometry; vetoed by \
@@ -1836,6 +1871,7 @@ fn build_enter_alert(
     entry_level_vetos: &[trade_control_core::intent::EntryLevelVeto],
     recover_entry: RecoverEntryAction,
     qm: bool,
+    breakeven: Option<trade_control_core::intent::Breakeven>,
 ) -> BuiltAlert {
     // The QM leg (strategy-v2's second enter) gets the `09-enter-qm`
     // basename; every other pattern enter gets `05-enter`. This is keyed
@@ -1958,6 +1994,10 @@ fn build_enter_alert(
     // entry already past the level is rejected even when no cross-event guard
     // fired. Carried only on the enter intent.
     intent.entry_level_vetos = entry_level_vetos.to_vec();
+    // Break-even stop management — the live worker's position cron moves the SL
+    // to break-even once a candle closes past this fraction of entry→TP. Default
+    // on at 50% (see `TradeSpec::breakeven_pct`).
+    intent.breakeven = breakeven;
     let purpose = if is_qm {
         "enter: quasimodo limit at signal level, confirmed-candle gated, no preps"
     } else {
@@ -2343,6 +2383,7 @@ mod tests {
                 &[],
                 RecoverEntryAction::Skip,
                 false,
+                None,
             ),
         ];
         let trade = BuiltTrade {
@@ -2383,6 +2424,7 @@ mod tests {
                 entry_level_vetos: Vec::new(),
                 recover_entry: RecoverEntryAction::Skip,
                 strategy_v2: false,
+                breakeven_pct: default_breakeven_pct(),
             },
         };
         let manifest = render_manifest(&trade);
@@ -2427,6 +2469,7 @@ mod tests {
             &[],
             RecoverEntryAction::Skip,
             false,
+            None,
         );
         assert_eq!(alert.intent.direction, Some(Direction::Short));
         // Entry: signal_low − 1 pip — a sell-stop 1 pip *below* the break (the
@@ -2517,6 +2560,7 @@ mod tests {
                 &[],
                 recover,
                 qm,
+                None,
             )
         };
         let alert = build(true, RecoverEntryAction::Limit);
@@ -2606,6 +2650,7 @@ mod tests {
             &levels,
             RecoverEntryAction::Skip,
             false,
+            None,
         );
         assert_eq!(alert.intent.entry_level_vetos, levels);
     }
@@ -2644,6 +2689,7 @@ mod tests {
             &[],
             RecoverEntryAction::Skip,
             false,
+            None,
         );
         assert_eq!(alert.intent.direction, Some(Direction::Long));
         // Entry: signal_high + 1 pip — a buy-stop 1 pip *above* the break
@@ -2717,6 +2763,7 @@ mod tests {
             &[],
             RecoverEntryAction::Skip,
             false,
+            None,
         );
         match &alert.intent.stop_loss {
             Some(PriceRef::Absolute { absolute }) => {
@@ -2843,6 +2890,7 @@ mod tests {
             entry_level_vetos: Vec::new(),
             recover_entry: RecoverEntryAction::Skip,
             strategy_v2: false,
+            breakeven_pct: default_breakeven_pct(),
         }
     }
 
@@ -3713,6 +3761,56 @@ tp_price: 1.05
         let trade = build_trade_from_spec(spec, now, BuildStrictness::Strict).unwrap();
         let enter = trade.alerts.last().unwrap();
         assert!(enter.intent.expiry_bars.is_none());
+    }
+
+    #[test]
+    fn build_trade_from_spec_bakes_breakeven_on_enter_by_default() {
+        // BUG-replay-no-breakeven-stop-at-50pct: the `05-enter` carries a
+        // break-even rule (default 50%) so the worker's position cron can move
+        // the stop to break-even. Non-enter alerts must NOT carry it.
+        let now = ts("2026-05-20T00:00:00Z");
+        let spec = sample_spec(TradePattern::Hs, ts("2026-05-25T00:00:00Z"));
+        let trade = build_trade_from_spec(spec, now, BuildStrictness::Strict).unwrap();
+        let enter = trade.alerts.last().unwrap();
+        match &enter.intent.breakeven {
+            Some(be) => assert!((be.threshold - 0.5).abs() < 1e-9, "default BE = 50%"),
+            None => panic!("enter must carry a default break-even rule"),
+        }
+        for alert in trade.alerts.iter().take(trade.alerts.len() - 1) {
+            assert!(
+                alert.intent.breakeven.is_none(),
+                "non-enter alert {} must not carry breakeven",
+                alert.basename
+            );
+        }
+    }
+
+    #[test]
+    fn build_trade_from_spec_breakeven_pct_none_disables_it() {
+        // `breakeven_pct: None` in the spec opts out — the enter carries no
+        // break-even rule and the stop stays static for the life of the trade.
+        let now = ts("2026-05-20T00:00:00Z");
+        let mut spec = sample_spec(TradePattern::Hs, ts("2026-05-25T00:00:00Z"));
+        spec.breakeven_pct = None;
+        let trade = build_trade_from_spec(spec, now, BuildStrictness::Strict).unwrap();
+        let enter = trade.alerts.last().unwrap();
+        assert!(
+            enter.intent.breakeven.is_none(),
+            "breakeven_pct: None must disable the rule on the enter"
+        );
+    }
+
+    #[test]
+    fn build_trade_from_spec_custom_breakeven_pct_is_carried() {
+        let now = ts("2026-05-20T00:00:00Z");
+        let mut spec = sample_spec(TradePattern::Hs, ts("2026-05-25T00:00:00Z"));
+        spec.breakeven_pct = Some(0.7);
+        let trade = build_trade_from_spec(spec, now, BuildStrictness::Strict).unwrap();
+        let enter = trade.alerts.last().unwrap();
+        match &enter.intent.breakeven {
+            Some(be) => assert!((be.threshold - 0.7).abs() < 1e-9),
+            None => panic!("custom breakeven_pct must be carried"),
+        }
     }
 
     #[test]
