@@ -137,6 +137,7 @@ fn base_intent(action: Action, id: &str) -> Intent {
         pip_size: Some(0.0001),
         trade_plan: None,
         blackout_close: trade_control_core::intent::BlackoutCloseAction::default(),
+        breakeven: None,
         include_archived: false,
     }
 }

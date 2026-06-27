@@ -411,6 +411,7 @@ mod tests {
             risk: RiskBudget::Percent(1.0),
             dry_run: false,
             recover_entry: None,
+            breakeven: None,
         }
     }
 

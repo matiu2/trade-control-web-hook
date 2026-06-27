@@ -1171,6 +1171,7 @@ mod tests {
             pip_size: None,
             trade_plan: None,
             blackout_close: crate::intent::BlackoutCloseAction::default(),
+            breakeven: None,
             include_archived: false,
         }
     }

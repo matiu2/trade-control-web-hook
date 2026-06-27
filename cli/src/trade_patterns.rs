@@ -1612,6 +1612,7 @@ fn skeleton(
         pip_size: None,
         trade_plan: None,
         blackout_close: trade_control_core::intent::BlackoutCloseAction::default(),
+        breakeven: None,
         include_archived: false,
     }
 }
