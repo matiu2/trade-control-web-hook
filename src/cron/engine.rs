@@ -229,7 +229,7 @@ async fn tick_one(
 
     let mut dispatch_outcomes = Vec::with_capacity(eval.fired.len());
     for (seq, fired) in eval.fired.iter().enumerate() {
-        let outcome = dispatch_fired(env, store, &broker, fired, now).await;
+        let outcome = dispatch_fired(env, store, &broker, fired, plan.granularity, now).await;
         dispatch_outcomes.push(DispatchOutcome {
             rule_id: fired.rule_id.clone(),
             intent_id: fired.intent.id.clone(),
@@ -605,6 +605,7 @@ async fn dispatch_fired(
     store: &KvStateStore,
     broker: &BrokerHandle,
     fired: &trade_control_engine::FiredIntent,
+    granularity: Granularity,
     now: DateTime<Utc>,
 ) -> String {
     // An H&S `PinePattern` fire carries the latched signal geometry; fold it onto
@@ -621,8 +622,10 @@ async fn dispatch_fired(
         intent: fired.intent.clone(),
     };
     let result = match broker {
-        BrokerHandle::Oanda(b) => dispatch_action(b, store, &verified, env, now).await,
-        BrokerHandle::TradeNation(b) => dispatch_action(b, store, &verified, env, now).await,
+        BrokerHandle::Oanda(b) => dispatch_action(b, store, &verified, env, granularity, now).await,
+        BrokerHandle::TradeNation(b) => {
+            dispatch_action(b, store, &verified, env, granularity, now).await
+        }
     };
     let outcome = result.describe();
     rlog!(
@@ -646,10 +649,13 @@ async fn dispatch_action<B: Broker>(
     store: &KvStateStore,
     verified: &Verified,
     env: &Env,
+    granularity: Granularity,
     now: DateTime<Utc>,
 ) -> ActionResult {
     match verified.intent.action {
-        Action::Enter => crate::run_enter(broker, store, verified, env, now, None).await,
+        Action::Enter => {
+            crate::run_enter(broker, store, verified, env, now, None, Some(granularity)).await
+        }
         Action::Close => crate::run_close(broker, store, verified, now).await,
         Action::Invalidate => crate::run_invalidate(broker, store, verified, now).await,
         Action::Veto => {

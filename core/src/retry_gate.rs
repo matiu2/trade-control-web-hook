@@ -435,6 +435,7 @@ pub async fn record_placement<S: StateStore>(
     direction: crate::intent::Direction,
     stop_loss_price: f64,
     cancel_at: Option<DateTime<Utc>>,
+    breakeven: Option<crate::state::BreakevenSnapshot>,
 ) {
     let Some(trade_id) = intent.trade_id.as_deref() else {
         return;
@@ -466,6 +467,9 @@ pub async fn record_placement<S: StateStore>(
         // Snapshot the operator's market-hours-blackout close policy so the
         // sweep can act on a resting order without the intent in hand.
         blackout_close: intent.blackout_close,
+        // Snapshot the break-even geometry so the position cron can move the
+        // stop to BE without the intent/plan in hand (BUG-replay-no-breakeven).
+        breakeven,
     };
     if let Err(err) = store.record_entry_attempt(attempt).await {
         tracing::error!("KV record_entry_attempt: {err}");
@@ -1309,6 +1313,7 @@ mod tests {
             Direction::Long,
             1.05,
             None,
+            None,
         ));
 
         // 2nd fire on the same shell bar — 409.
@@ -1336,6 +1341,7 @@ mod tests {
             "order-1",
             Direction::Long,
             1.05,
+            None,
             None,
         ));
 
@@ -1368,6 +1374,7 @@ mod tests {
             "order-1",
             Direction::Long,
             1.05,
+            None,
             None,
         ));
 
@@ -1406,6 +1413,7 @@ mod tests {
             "order-1",
             Direction::Long,
             1.05,
+            None,
             None,
         ));
 
@@ -1451,6 +1459,7 @@ mod tests {
             Direction::Long,
             1.05,
             None,
+            None,
         ));
 
         broker.push_lookup(AttemptState::Pending);
@@ -1489,6 +1498,7 @@ mod tests {
             Direction::Long,
             1.05,
             None,
+            None,
         ));
 
         broker.push_lookup(AttemptState::Pending);
@@ -1522,6 +1532,7 @@ mod tests {
             "qm-order",
             Direction::Long,
             1.05,
+            None,
             None,
         ));
 
@@ -1563,6 +1574,7 @@ mod tests {
                 Direction::Long,
                 1.05,
                 None,
+                None,
             ));
             broker.push_lookup(state.clone());
 
@@ -1596,6 +1608,7 @@ mod tests {
             Direction::Long,
             1.05,
             None,
+            None,
         ));
         broker.push_lookup(AttemptState::Unknown);
 
@@ -1626,6 +1639,7 @@ mod tests {
             "26815011",
             Direction::Long,
             1.05,
+            None,
             None,
         ));
         // Snapshot the PositionID onto the attempt (as a prior lookup
@@ -1661,6 +1675,7 @@ mod tests {
             Direction::Long,
             1.05,
             None,
+            None,
         ));
         // Unrelated live position (someone else's), same instrument.
         broker.push_open_position(open_pos("999999", "888888"));
@@ -1689,6 +1704,7 @@ mod tests {
             Direction::Long,
             1.05,
             None,
+            None,
         ));
         broker.set_open_positions_transient();
 
@@ -1713,6 +1729,7 @@ mod tests {
                 &format!("order-{n}"),
                 Direction::Long,
                 1.05,
+                None,
                 None,
             ));
             // All three are collapsed so we walk past them.
@@ -1741,6 +1758,7 @@ mod tests {
             "order-1",
             Direction::Long,
             1.05,
+            None,
             None,
         ));
         broker.push_lookup_err();
@@ -1777,6 +1795,7 @@ mod tests {
                 &format!("order-{n}"),
                 Direction::Long,
                 1.05,
+                None,
                 None,
             ));
             broker.push_lookup(AttemptState::Cancelled);
@@ -1816,6 +1835,7 @@ mod tests {
             Direction::Long,
             1.05,
             None,
+            None,
         ));
         // The one prior attempt collapsed (closed at SL) → walked past, then
         // the cap (1) is hit.
@@ -1846,6 +1866,7 @@ mod tests {
             "26815011",
             Direction::Long,
             1.05,
+            None,
             None,
         ));
         // Live position whose order_id matches our stored entry order id;
@@ -1881,6 +1902,7 @@ mod tests {
             Direction::Long,
             1.05,
             None,
+            None,
         ));
         broker.push_lookup(AttemptState::OpenPosition {
             broker_trade_id: "btid-1".into(),
@@ -1905,6 +1927,7 @@ mod tests {
             Direction::Long,
             1.05,
             None,
+            None,
         ));
         run(record_placement(
             &store,
@@ -1916,6 +1939,7 @@ mod tests {
             "order-3",
             Direction::Long,
             1.05,
+            None,
             None,
         ));
         broker.push_lookup(AttemptState::Cancelled); // #3 (newest-first)
@@ -1946,6 +1970,7 @@ mod tests {
             Direction::Long,
             1.05,
             None,
+            None,
         ));
         broker.push_lookup(AttemptState::Cancelled);
         match run(evaluate(&broker, &store, &intent, &fixture_shell())) {
@@ -1969,6 +1994,7 @@ mod tests {
             "order-1",
             Direction::Long,
             1.05,
+            None,
             None,
         ));
         broker.push_lookup(AttemptState::OpenPosition {

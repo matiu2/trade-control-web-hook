@@ -11,8 +11,9 @@ use std::future::Future;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+use crate::broker::Granularity;
 use crate::control_event::ControlEvent;
-use crate::intent::{Action, BlackoutCloseAction, Direction, NoEntryWindow};
+use crate::intent::{Action, BlackoutCloseAction, Breakeven, Direction, NoEntryWindow};
 use crate::plan_state::PlanState;
 use crate::trade_plan::TradePlan;
 
@@ -137,6 +138,27 @@ pub struct PrepBlockEntry {
 /// On OANDA `broker_trade_id` happens to equal `broker_order_id`; on
 /// TradeNation the trade id is the distinct PositionID. Don't assume
 /// identity in callers — always correlate via the stored field.
+/// Break-even geometry snapshotted onto an [`EntryAttempt`] at placement so the
+/// position cron can move the stop to break-even without an intent in hand —
+/// the same "snapshot at placement" pattern as [`EntryAttempt::stop_loss_price`]
+/// / [`EntryAttempt::pip_size`]. The cron joins a found [`OpenPosition`] back to
+/// its attempt, reads this, fetches the closed candles since fill at
+/// [`Self::granularity`], and calls
+/// [`Breakeven::decide_move`](crate::intent::Breakeven::decide_move).
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct BreakevenSnapshot {
+    /// The break-even rule (threshold). See [`Breakeven`].
+    pub rule: Breakeven,
+    /// Resolved entry/reference price at placement — the break-even target stop
+    /// (a 0R scratch) and the lower bound of the 50%-to-TP window.
+    pub entry_price: f64,
+    /// Resolved take-profit at placement — the upper bound of the window.
+    pub take_profit: f64,
+    /// The trade's timeframe, so the cron fetches the right closed candles to
+    /// test "did a candle CLOSE past 50%".
+    pub granularity: Granularity,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct EntryAttempt {
     pub trade_id: String,
@@ -204,6 +226,13 @@ pub struct EntryAttempt {
     /// same default via `#[serde(default)]`.
     #[serde(default, skip_serializing_if = "is_default_blackout_close")]
     pub blackout_close: BlackoutCloseAction,
+    /// Break-even stop-management geometry, snapshotted from the resolved enter
+    /// at placement (BUG-replay-no-breakeven-stop-at-50pct). `None` = the enter
+    /// carried no `breakeven`, so the position cron leaves the stop alone (rows
+    /// written before this field, and trades that opted out, deserialize to
+    /// `None` via `#[serde(default)]`). See [`BreakevenSnapshot`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub breakeven: Option<BreakevenSnapshot>,
 }
 
 /// Skip-serializing predicate for [`EntryAttempt::blackout_close`] — mirrors
@@ -3064,6 +3093,7 @@ mod tests {
             cancel_at: None,
             pip_size: None,
             blackout_close: BlackoutCloseAction::default(),
+            breakeven: None,
         }
     }
 
@@ -3197,6 +3227,7 @@ mod tests {
             pip_size: None,
             // Non-default so the round-trip proves the field survives the wire.
             blackout_close: BlackoutCloseAction::CancelAndClose,
+            breakeven: None,
         };
         let yaml = serde_yaml::to_string(&a).unwrap();
         let parsed: EntryAttempt = serde_yaml::from_str(&yaml).unwrap();
@@ -3252,6 +3283,7 @@ mod tests {
             cancel_at: None,
             pip_size: None,
             blackout_close: BlackoutCloseAction::default(),
+            breakeven: None,
         };
         let yaml = serde_yaml::to_string(&a).unwrap();
         assert!(!yaml.contains("broker_trade_id"));

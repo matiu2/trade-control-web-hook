@@ -100,6 +100,61 @@ impl Breakeven {
     pub fn target_stop(&self, entry: f64) -> f64 {
         entry
     }
+
+    /// The live worker's per-tick decision: given the trade geometry and the
+    /// **highest-progress closed candle** observed since the fill, return the
+    /// stop the worker should amend to — or `None` to leave the stop where it
+    /// is.
+    ///
+    /// The worker has no per-position event loop; the position cron wakes every
+    /// tick, reads the open position's `current_stop`, and feeds the close of
+    /// the most-progressed *closed* candle since fill (the one nearest TP) as
+    /// `best_close`. We return `Some(entry)` once that close has armed BE and
+    /// the stop isn't already at break-even. Idempotent: amending to the same
+    /// entry price every tick is harmless, but we suppress the redundant broker
+    /// call by returning `None` when `current_stop` is already at (or beyond, in
+    /// the trade's favour) the entry — which also makes the move strictly
+    /// one-way (we never widen a stop the operator/another system tightened
+    /// past entry).
+    ///
+    /// `best_close` is the close of the closed candle that ran *furthest toward
+    /// TP*; passing the latest close instead would miss a BE arm that happened
+    /// on an earlier bar which has since retraced (BE is latched — once any
+    /// close armed it, the stop should be at entry). The caller computes the
+    /// furthest-toward-TP close with [`Breakeven::more_progressed`].
+    pub fn decide_move(
+        &self,
+        direction: Direction,
+        entry: f64,
+        take_profit: f64,
+        current_stop: f64,
+        best_close: f64,
+    ) -> Option<f64> {
+        let level = self.arms_at(entry, take_profit);
+        if !self.close_arms(direction, level, best_close) {
+            return None;
+        }
+        let target = self.target_stop(entry);
+        // Already at/beyond break-even (in the trade's favour) → nothing to do.
+        // Long: a stop >= entry is at/past BE; short: a stop <= entry is.
+        let already_at_be = match direction {
+            Direction::Long => current_stop >= target,
+            Direction::Short => current_stop <= target,
+        };
+        if already_at_be { None } else { Some(target) }
+    }
+
+    /// Pick the close that has run *furthest toward TP* between two candidates,
+    /// for the given direction. The worker folds every closed candle since fill
+    /// through this to get the `best_close` for [`Breakeven::decide_move`], so a
+    /// BE arm on a bar that has since retraced is not missed (BE is latched).
+    /// Long: the higher close is more progressed; short: the lower close.
+    pub fn more_progressed(direction: Direction, a: f64, b: f64) -> f64 {
+        match direction {
+            Direction::Long => a.max(b),
+            Direction::Short => a.min(b),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -185,6 +240,57 @@ mod tests {
                 "threshold {bad} should clamp to 0.5"
             );
         }
+    }
+
+    #[test]
+    fn decide_move_arms_to_entry_for_a_short() {
+        // Short: entry 1.1000, TP 1.0900 → BE level 1.0950, original SL 1.1040.
+        let be = Breakeven::at_half();
+        let (dir, entry, tp, sl) = (Direction::Short, 1.1000, 1.0900, 1.1040);
+        // Best close hasn't reached the level → no move.
+        assert_eq!(be.decide_move(dir, entry, tp, sl, 1.0960), None);
+        // Best close past the level → move SL to entry.
+        assert_eq!(be.decide_move(dir, entry, tp, sl, 1.0940), Some(1.1000));
+    }
+
+    #[test]
+    fn decide_move_arms_to_entry_for_a_long() {
+        // Long: entry 1.1000, TP 1.1100 → BE level 1.1050, original SL 1.0960.
+        let be = Breakeven::at_half();
+        let (dir, entry, tp, sl) = (Direction::Long, 1.1000, 1.1100, 1.0960);
+        assert_eq!(be.decide_move(dir, entry, tp, sl, 1.1040), None);
+        assert_eq!(be.decide_move(dir, entry, tp, sl, 1.1060), Some(1.1000));
+    }
+
+    #[test]
+    fn decide_move_is_idempotent_once_at_breakeven() {
+        // Already at BE (or tightened past it in the trade's favour) → no
+        // redundant amend, and never widens back.
+        let be = Breakeven::at_half();
+        // Short whose stop is already at entry → None even though armed.
+        assert_eq!(
+            be.decide_move(Direction::Short, 1.1000, 1.0900, 1.1000, 1.0940),
+            None
+        );
+        // Short whose stop is tightened BELOW entry (further in our favour) →
+        // still None (one-way; never widen back to entry).
+        assert_eq!(
+            be.decide_move(Direction::Short, 1.1000, 1.0900, 1.0980, 1.0940),
+            None
+        );
+        // Long mirror: stop already at/above entry → None.
+        assert_eq!(
+            be.decide_move(Direction::Long, 1.1000, 1.1100, 1.1000, 1.1060),
+            None
+        );
+    }
+
+    #[test]
+    fn more_progressed_picks_toward_tp() {
+        // Long: higher close is more progressed.
+        assert!((Breakeven::more_progressed(Direction::Long, 1.10, 1.12) - 1.12).abs() < 1e-9);
+        // Short: lower close is more progressed.
+        assert!((Breakeven::more_progressed(Direction::Short, 1.10, 1.08) - 1.08).abs() < 1e-9);
     }
 
     #[test]
