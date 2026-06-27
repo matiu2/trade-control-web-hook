@@ -195,7 +195,14 @@ pub fn evaluate_plan(
 
         // Always-armed guards next: a terminal veto can end the plan on any
         // bar, regardless of spine phase.
-        evaluate_guards(plan, &mut state, candle, detector_window, &mut fired);
+        evaluate_guards(
+            plan,
+            &mut state,
+            candle,
+            detector_window,
+            &detector_cfg,
+            &mut fired,
+        );
         if state.phase == Phase::Done {
             state.watermark = Some(candle.time);
             break;
@@ -363,11 +370,25 @@ fn evaluate_controls(
 /// Evaluate every veto guard rule against this candle. A guard that fires
 /// pushes its intent and, being terminal, ends the plan. Guards are
 /// `FireMode::Once` so they latch in `state.fired`.
+///
+/// Two kinds of guard trigger:
+/// - **Level / time guards** (`HorizontalCross` / `PriceValueCross` /
+///   `TrendlineCross` / `TimeReached`) — a pure per-candle predicate via
+///   [`fire_rule`]; no pattern geometry.
+/// - **`PinePattern` guards** — the consolidated `06-close-on-reversal` close,
+///   which fires when a confirming reversal candle of the *opposite* direction
+///   prints. This is the SAME stateful candle detector the entry path uses
+///   ([`eval_pine_entry`]), not a level cross — `eval_trigger` deliberately
+///   returns `false` for `PinePattern`, so a guard carrying one is routed to
+///   [`eval_pine_guard`] here instead. The latched signal rides onto the fired
+///   intent's shell so the worker's `run_close` sees the candle-quality flags
+///   (`golden` / `confirmed`) the gate reads.
 fn evaluate_guards(
     plan: &TradePlan,
     state: &mut PlanState,
     candle: &Candle,
     window: &[Candle],
+    detector_cfg: &DetectorConfig,
     fired: &mut Vec<FiredIntent>,
 ) {
     for rule in &plan.rules {
@@ -377,14 +398,29 @@ fn evaluate_guards(
         if !armed_in(&rule.rule_id, state.phase) {
             continue;
         }
-        if fire_rule(rule, state, candle, window) {
-            push_fire(rule, candle, fired);
-            state.fired.insert(rule.rule_id.clone());
-            // Every veto guard is terminal for the plan's spine: the dispatched
-            // intent (cancel / close / invalidate) is the end of this setup.
-            state.phase = Phase::Done;
-            return;
-        }
+        // A `PinePattern` guard (the close-on-reversal close) is decided by the
+        // candle detector over the back-window, not a level cross. Every other
+        // guard trigger is the plain per-candle predicate.
+        let signal = match &rule.trigger {
+            Trigger::PinePattern { pattern, dir } => {
+                match eval_pine_guard(&rule.intent, candle, window, detector_cfg, *pattern, *dir) {
+                    Some(sig) => Some(sig),
+                    None => continue,
+                }
+            }
+            _ => {
+                if !fire_rule(rule, state, candle, window) {
+                    continue;
+                }
+                None
+            }
+        };
+        push_fire_signal(rule, candle, signal, fired);
+        state.fired.insert(rule.rule_id.clone());
+        // Every veto guard is terminal for the plan's spine: the dispatched
+        // intent (cancel / close / invalidate) is the end of this setup.
+        state.phase = Phase::Done;
+        return;
     }
 }
 
@@ -646,6 +682,84 @@ fn eval_pine_entry(
         return None;
     }
     Some(sig)
+}
+
+/// Decide a `PinePattern` **guard** (the consolidated `06-close-on-reversal`
+/// close) on this candle. Like [`eval_pine_entry`], it recomputes the latched
+/// candle signal over `detector_window` at this bar and fires iff the alert
+/// fires, the latched direction matches the rule's `dir` (the *opposite* of the
+/// trade — a long reversal closes a short), and (when set) the kind matches.
+///
+/// On top of the detector match it applies the **pure half** of the worker's
+/// `run_close` contextual gate: when the intent's `inside_window` lists `price`,
+/// the reversal candle's close must sit inside one of the intent's `sr_bands`.
+/// This is what makes the engine fire a *real* reversal-close (price back at the
+/// SR band) rather than any opposite-direction pattern anywhere on the chart —
+/// matching live, where `run_close` rejects a close whose broker price is out of
+/// every band. The **news-window** half of the gate is KV state the worker owns
+/// at dispatch, so it stays there; the engine only resolves the recomputable
+/// price gate. (When the worker dispatches this fire it re-runs the full gate
+/// against the live broker price, so a fire the price gate let through here can
+/// still be declined there — the engine is permissive-but-aligned, never
+/// stricter than live.)
+///
+/// Returns the latched signal to ride onto the shell, or `None` to not fire.
+fn eval_pine_guard(
+    intent: &trade_control_core::intent::Intent,
+    candle: &Candle,
+    detector_window: &[Candle],
+    cfg: &DetectorConfig,
+    pattern: Option<SignalKind>,
+    dir: Direction,
+) -> Option<LatchedSignal> {
+    // The detector match is shared with the entry path (direction / kind /
+    // fires), so a close and an enter can't drift on what "a reversal printed"
+    // means. `eval_pine_entry` logs under the `pine-enter` tag; the extra
+    // band gate below logs under `pine-close`.
+    let sig = eval_pine_entry(candle, detector_window, cfg, pattern, dir)?;
+
+    // Price-band gate (the pure half of `run_close`'s contextual window). Only
+    // applied when the intent opted into the price window; a news-only
+    // reversal-close has no recomputable price gate here and fires on the
+    // detector match alone (the worker's news-window KV gate decides it).
+    let wants_price = intent
+        .inside_window
+        .contains(&trade_control_core::intent::EventWindow::Price);
+    if wants_price {
+        // The reversal candle's close is the pure proxy for the broker's
+        // current price the worker checks. Bands come from the signed intent.
+        if price_in_any_band(candle.c, &intent.sr_bands).is_none() {
+            tracing::debug!(
+                bar = %candle.time,
+                close = candle.c,
+                bands = ?intent.sr_bands,
+                "pine-close: reversal candle outside every SR band — decline"
+            );
+            return None;
+        }
+        tracing::debug!(
+            bar = %candle.time,
+            close = candle.c,
+            "pine-close: reversal candle inside an SR band — close fires"
+        );
+    } else {
+        tracing::debug!(
+            bar = %candle.time,
+            "pine-close: reversal detector fired (no price-band gate) — close fires"
+        );
+    }
+    Some(sig)
+}
+
+/// The first `[lo, hi]` band that contains `price` (inclusive of both
+/// endpoints), or `None`. Mirrors the worker's `src/lib.rs::price_band_hit` —
+/// the worker keeps its own copy because it tests a *live broker* price, while
+/// this engine copy tests a *candle* price for the pure close-on-reversal gate.
+fn price_in_any_band(price: f64, bands: &[[f64; 2]]) -> Option<[f64; 2]> {
+    bands
+        .iter()
+        .copied()
+        .find(|[lo, hi]| price >= *lo && price <= *hi)
 }
 
 /// Is a fired `PinePattern` enter actually dispatchable on this bar — i.e. would
@@ -2547,6 +2661,137 @@ mod tests {
         // Unresolvable bracket → not dispatchable.
         let bad = pine_enter_rule_unresolvable_tp().intent;
         assert!(!pine_entry_dispatchable(&bad, &last, &sig, 0.0001));
+    }
+
+    // ===== close-on-reversal (PinePattern guard) =====
+
+    /// A back-window ending in a **bullish** pinbar on the last bar: a small body
+    /// in the top quartile, a long lower wick (≥ 50% range), and a low below the
+    /// prior bar's low (the bullish breakout). The earlier bars are flat context
+    /// so no other signal prints. Mirrors `bearish_pinbar_window` but the
+    /// opposite direction — a long reversal candle, the shape that closes an open
+    /// short via `06-close-on-reversal`. The pinbar's close is 1.18.
+    fn bullish_pinbar_window() -> Vec<Candle> {
+        vec![
+            candle("2026-06-16T08:00:00Z", 1.10, 1.11, 1.09, 1.10),
+            candle("2026-06-16T09:00:00Z", 1.10, 1.11, 1.09, 1.10),
+            // prior bar — its low 1.09 is the level the pinbar must undercut.
+            candle("2026-06-16T10:00:00Z", 1.10, 1.11, 1.09, 1.105),
+            // bullish pinbar: range 1.00..1.20 = 0.20. body 1.16..1.18 (top
+            // quartile: top_25 = 1.20 - 0.05 = 1.15 → body_bottom 1.16 ≥ 1.15).
+            // lower wick = body_bottom - low = 1.16 - 1.00 = 0.16 ≥ 0.10. low 1.00
+            // < prior low 1.09. close 1.18 > open 1.16 → bullish.
+            candle("2026-06-16T11:00:00Z", 1.16, 1.20, 1.00, 1.18),
+        ]
+    }
+
+    /// A `06-close-on-reversal` guard rule: a `PinePattern` close bound to `dir`
+    /// (the *opposite* of the trade). When `band` is `Some`, the intent opts into
+    /// the price contextual window (`inside_window: [price]`, `sr_bands: [band]`)
+    /// so the engine's pure price gate applies; `None` leaves it news-only-shaped
+    /// (no recomputable price gate → fires on the detector match alone).
+    fn close_on_reversal_rule(dir: Direction, band: Option<[f64; 2]>) -> ConditionRule {
+        let mut intent = intent(Action::Close);
+        if let Some(b) = band {
+            intent.inside_window = vec![trade_control_core::intent::EventWindow::Price];
+            intent.sr_bands = vec![b];
+        }
+        ConditionRule {
+            rule_id: "06-close-on-reversal".into(),
+            trigger: Trigger::PinePattern { pattern: None, dir },
+            fire_mode: FireMode::Once,
+            intent,
+        }
+    }
+
+    #[test]
+    fn close_on_reversal_fires_on_a_long_reversal_in_the_band() {
+        // THE bug: a SHORT trade's `06-close-on-reversal` is a PinePattern{Long}
+        // close. A bullish reversal candle whose close (1.18) sits inside the SR
+        // band must fire the close and retire the plan — the engine fires it for
+        // both the worker (dispatch run_close) and the replay (exit the position).
+        let p = plan(vec![close_on_reversal_rule(
+            Direction::Long,
+            Some([1.15, 1.20]),
+        )]);
+        let window = bullish_pinbar_window();
+        let prior = seed_at(Phase::AwaitEntry, "2026-06-16T10:00:00Z");
+        let eval = run_window(&p, &prior, &window[3..], &window);
+        assert_eq!(eval.fired.len(), 1, "the bullish reversal fires the close");
+        let f = &eval.fired[0];
+        assert_eq!(f.rule_id, "06-close-on-reversal");
+        assert_eq!(f.intent.action, Action::Close);
+        let sig = f
+            .signal
+            .expect("a PinePattern close carries latched geometry");
+        assert_eq!(sig.direction, Direction::Long);
+        assert!(eval.done, "a terminal close retires the plan");
+    }
+
+    #[test]
+    fn close_on_reversal_declines_when_close_outside_every_band() {
+        // Same bullish reversal candle, but the SR band sits well above the
+        // pinbar's close (1.18) — the pure price gate must decline, so the close
+        // does NOT fire and the plan stays alive (matching the live worker, whose
+        // run_close rejects an out-of-band price). The detector still matched;
+        // only the contextual price gate blocks it.
+        let p = plan(vec![close_on_reversal_rule(
+            Direction::Long,
+            Some([1.30, 1.40]),
+        )]);
+        let window = bullish_pinbar_window();
+        let prior = seed_at(Phase::AwaitEntry, "2026-06-16T10:00:00Z");
+        let eval = run_window(&p, &prior, &window[3..], &window);
+        assert!(
+            eval.fired.is_empty(),
+            "a reversal outside every band must not fire the close"
+        );
+        assert!(!eval.done, "an out-of-band close must not retire the plan");
+        assert_eq!(eval.new_state.phase, Phase::AwaitEntry);
+    }
+
+    #[test]
+    fn close_on_reversal_without_price_window_fires_on_detector_alone() {
+        // A news-only-shaped close (no `price` in inside_window, no sr_bands) has
+        // no recomputable price gate here, so the detector match alone fires it
+        // (the worker's news-window KV gate is what gates it at dispatch).
+        let p = plan(vec![close_on_reversal_rule(Direction::Long, None)]);
+        let window = bullish_pinbar_window();
+        let prior = seed_at(Phase::AwaitEntry, "2026-06-16T10:00:00Z");
+        let eval = run_window(&p, &prior, &window[3..], &window);
+        assert_eq!(eval.fired.len(), 1, "no price gate → detector match fires");
+        assert_eq!(eval.fired[0].rule_id, "06-close-on-reversal");
+        assert!(eval.done);
+    }
+
+    #[test]
+    fn close_on_reversal_ignores_same_direction_pattern() {
+        // A SHORT trade's close binds to the LONG reversal. A *bearish* (short)
+        // reversal candle is the trade's own direction — it must NOT fire the
+        // close (that's an enter signal, not an exit). Guards the direction match.
+        let p = plan(vec![close_on_reversal_rule(
+            Direction::Long,
+            Some([1.00, 1.20]),
+        )]);
+        let window = bearish_pinbar_window(); // prints a SHORT signal
+        let prior = seed_at(Phase::AwaitEntry, "2026-06-16T10:00:00Z");
+        let eval = run_window(&p, &prior, &window[3..], &window);
+        assert!(
+            eval.fired.is_empty(),
+            "a short reversal can't fire the long-bound close"
+        );
+        assert!(!eval.done);
+    }
+
+    #[test]
+    fn price_in_any_band_inclusive_endpoints() {
+        let bands = [[1.10, 1.20], [1.30, 1.40]];
+        assert_eq!(price_in_any_band(1.15, &bands), Some([1.10, 1.20]));
+        assert_eq!(price_in_any_band(1.10, &bands), Some([1.10, 1.20])); // lo edge
+        assert_eq!(price_in_any_band(1.40, &bands), Some([1.30, 1.40])); // hi edge
+        assert_eq!(price_in_any_band(1.35, &bands), Some([1.30, 1.40]));
+        assert_eq!(price_in_any_band(1.25, &bands), None); // between bands
+        assert_eq!(price_in_any_band(1.15, &[]), None); // no bands
     }
 
     #[test]
