@@ -1,5 +1,61 @@
 # Changelog
 
+## Unreleased — 2026-06-28 — Engine fires `06-close-on-reversal`; replay honours it
+
+**Why.** A `06-close-on-reversal` rule (a `PinePattern` close bound to the
+*opposite* direction, gated on price ∈ `sr_bands`) **never fired** in the
+cron-engine era — neither in the live worker nor in the offline `replay-candles`
+simulator. Root cause: `engine::evaluate::eval_trigger` returns `false` for
+every `PinePattern` trigger, and Pine detection was wired only into the *entry*
+path (`eval_pine_entry`), never the guard path. So a guard carrying a
+`PinePattern` (the close) was inert. A trade that should have exited on a
+confirming reversal candle over-held to SL / TP / window-end. (The close *was*
+honoured in the now-retired TV-alert era, where TradingView's Pine study fired
+the alert and the worker only gated it; the engine port never replaced that
+trigger half.) Caught replaying demo trade 075 (Wheat H1 H&S short, leg 3):
+`88 pine-enter` evaluations, `0 pine-close`.
+
+**What changed.**
+
+- **Engine (shared — fixes worker dispatch *and* replay):** a `PinePattern`
+  guard is now routed through the candle detector (`eval_pine_guard`, sharing
+  `eval_pine_entry`'s direction/kind/fires match) instead of `eval_trigger`. On
+  a detector match it applies the **pure** half of `run_close`'s contextual gate
+  — when the intent lists `inside_window: price`, the reversal candle's close
+  must sit inside one of `sr_bands` (new pure helper `price_in_any_band`, mirror
+  of the worker's `price_band_hit`). A news-only close has no recomputable price
+  gate here and fires on the detector match alone (the worker's news-window KV
+  gate decides it at dispatch). On fire it pushes the intent **with the latched
+  signal** onto the shell (so `run_close` sees `golden`/`confirmed`) and retires
+  the plan (`Phase::Done`), like any terminal guard.
+- **Replay (`replay-candles`):** the pure per-enter `simulate_fill` knows only
+  the bracket, so a reversal-close fire is applied as a post-pass
+  (`report::apply_reversal_close`): an open position is flattened on the earliest
+  reversal-close that lands while it's open, before its SL/TP. New
+  `FillKind::ClosedOnReversal`; the report prints `fill: CLOSED ON REVERSAL — in
+  @ <entry> → exit <price> (<bar>)` and tallies `REV:` distinctly from `TP:` /
+  `SL:`; `--annotate` draws it (outcome label `reversal`).
+
+**Behaviour change (live).** When `staging` (or any env) is next deployed, the
+worker will begin auto-closing positions on `06-close-on-reversal` fires — the
+intended behaviour, previously dormant. No effect until a deploy; coding stays
+on `main`/dev.
+
+**Breaking.** `report::resolve_fire` / `resolve_fire_any` now take an extra
+`closes: &[CloseFire]` argument (replay-internal; not a wire/serde change).
+
+**Tests.** Engine: a long reversal in the band fires the close; outside every
+band declines (plan stays alive); news-only fires on the detector alone;
+same-direction reversal is ignored; `price_in_any_band` endpoints. Replay:
+`apply_reversal_close` unit matrix (before-fill ignored, after-SL moot,
+before-SL pre-empts, earliest-wins, never-filled untouched) + an end-to-end
+`run`→`render` test (a multi-shot short fills, a bullish reversal in the band
+prints, the short reports `CLOSED ON REVERSAL` / `REV: 1`, not "still open").
+
+**Follow-up.** The replay flattens at the reversal **bar close** (the worker
+flattens at market on that tick — a faithful proxy with only OHLC). A
+spread-aware exit price would need the bid/ask book the worker actually trades.
+
 ## v60 — 2026-06-27 — Staging bake marker (no code change)
 
 Marker release pinning the staging promotion candidate for its week-long bake

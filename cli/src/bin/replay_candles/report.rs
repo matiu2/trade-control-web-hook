@@ -4,6 +4,19 @@
 //! (an H&S Pine fire folds its latched signal onto the shell; everything else
 //! gets the plain candle shell), so `simulate_fill` resolves entry/SL/TP against
 //! the same levels the live dispatch would have.
+//!
+//! ## Reversal-close post-pass
+//!
+//! `simulate_fill` is pure and per-enter: it knows only the bracket (entry / SL
+//! / TP) and the forward candle path. The `06-close-on-reversal` close is a
+//! *separate* fire (a `PinePattern` guard the engine now fires when a confirming
+//! opposite-direction reversal candle prints inside the SR band). So the report
+//! runs a small post-pass — [`apply_reversal_close`] — that flattens an open
+//! position on the earliest reversal-close fire that lands while it's open,
+//! before its SL/TP. The engine decides *whether* the reversal fires (shared
+//! with the worker); this layer only *applies* it to the simulated position,
+//! since the worker's real `run_close` (which the offline replay doesn't run)
+//! is what flattens the broker position live.
 
 use chrono::{DateTime, Utc};
 use trade_control_core::intent::{Action, Direction, Resolved, ResolvedEntry, Shell};
@@ -11,6 +24,108 @@ use trade_control_engine::{SimOutcome, TradePlan, simulate_fill};
 
 use super::brisbane::bne;
 use super::replay::{Fire, Replay};
+
+/// A fired `06-close-on-reversal` close, reduced to what the fill resolution
+/// needs: the bar it fired on and the price the position flattens at. The
+/// worker's `run_close` flattens at market when the reversal candle prints, so
+/// the bar's **close** is the faithful exit-price proxy (the engine fires the
+/// close on that bar's close, and the worker dispatches it that tick).
+#[derive(Debug, Clone, Copy)]
+pub struct CloseFire {
+    pub at: DateTime<Utc>,
+    pub price: f64,
+}
+
+/// Every `Action::Close` fire in the replay, in fire order, reduced to
+/// [`CloseFire`]s. The fill resolution consults these to exit an open position
+/// on a reversal candle — the engine now fires the close (a `PinePattern`
+/// guard), but the pure per-enter `simulate_fill` only knows SL/TP, so the
+/// replay must apply the close itself.
+pub fn collect_close_fires(replay: &Replay) -> Vec<CloseFire> {
+    replay
+        .fires
+        .iter()
+        .filter(|f| f.fired.intent.action == Action::Close)
+        .map(|f| CloseFire {
+            at: f.fired.candle.time,
+            price: f.fired.candle.c,
+        })
+        .collect()
+}
+
+/// Apply any reversal-close to a per-enter [`SimOutcome`]. A close fire flattens
+/// the position when its bar lands **after the fill** and **at-or-before** the
+/// outcome's own exit — i.e. the reversal printed while the trade was still
+/// open. The earliest such close wins (a position only closes once).
+///
+/// - `FilledOpen` (no SL/TP touched) → closed on the first post-fill reversal.
+/// - `StoppedOut` / `TookProfit` → only overridden if a reversal fires *strictly
+///   before* that exit bar; a close on/after the SL/TP bar is moot (the position
+///   was already flat). Ties go to the SL/TP (the simulator's pessimistic
+///   stance, and the close can't pre-empt an exit that already happened).
+/// - `NeverFilled` / `Declined` / `Unresolved` → untouched (no open position).
+///
+/// Returns the (possibly overridden) outcome; on override it's the new
+/// [`ReplayOutcome::ClosedOnReversal`] carrying the close bar + price.
+fn apply_reversal_close(outcome: SimOutcome, closes: &[CloseFire]) -> ReplayOutcome {
+    let (fill_at, entry_price, exit_limit) = match &outcome {
+        SimOutcome::FilledOpen {
+            fill_at,
+            entry_price,
+        } => (*fill_at, *entry_price, None),
+        SimOutcome::StoppedOut {
+            fill_at,
+            entry_price,
+            exit_at,
+            ..
+        }
+        | SimOutcome::TookProfit {
+            fill_at,
+            entry_price,
+            exit_at,
+            ..
+        } => (*fill_at, *entry_price, Some(*exit_at)),
+        // No open position to close.
+        SimOutcome::NeverFilled | SimOutcome::Declined { .. } | SimOutcome::Unresolved(_) => {
+            return ReplayOutcome::Sim(outcome);
+        }
+    };
+
+    let reversal = closes
+        .iter()
+        .filter(|c| c.at > fill_at)
+        .filter(|c| match exit_limit {
+            // Only a reversal strictly before the SL/TP bar pre-empts it.
+            Some(exit_at) => c.at < exit_at,
+            None => true,
+        })
+        .min_by_key(|c| c.at);
+
+    match reversal {
+        Some(c) => ReplayOutcome::ClosedOnReversal {
+            fill_at,
+            entry_price,
+            exit_at: c.at,
+            exit_price: c.price,
+        },
+        None => ReplayOutcome::Sim(outcome),
+    }
+}
+
+/// A per-enter fill outcome after the replay's reversal-close post-pass: either
+/// the pure simulator's verdict ([`SimOutcome`]) or a reversal close that
+/// flattened the position before its SL/TP/window-end.
+#[derive(Debug, Clone)]
+enum ReplayOutcome {
+    Sim(SimOutcome),
+    /// The position was flattened by a `06-close-on-reversal` fire while open.
+    ClosedOnReversal {
+        fill_at: DateTime<Utc>,
+        entry_price: f64,
+        exit_at: DateTime<Utc>,
+        exit_price: f64,
+    },
+}
 
 /// How a position resolved, for annotation purposes. The first three are
 /// *taken* (filled) outcomes; the last two are *not-taken* — an order that
@@ -25,6 +140,9 @@ pub enum FillKind {
     StoppedOut,
     /// Filled then hit take-profit.
     TookProfit,
+    /// Filled, then flattened by a `06-close-on-reversal` fire (a confirming
+    /// opposite-direction reversal candle inside the SR band) before SL/TP.
+    ClosedOnReversal,
     /// A pending order that never triggered within the window. Not taken.
     NeverFilled,
     /// An entry the worker declined to place (entry past a gate level). Not taken.
@@ -36,7 +154,10 @@ impl FillKind {
     /// not-taken kinds (`NeverFilled` / `Declined`), which only have an
     /// *intended* bracket, anchored at the fire bar.
     pub fn is_taken(self) -> bool {
-        matches!(self, Self::Open | Self::StoppedOut | Self::TookProfit)
+        matches!(
+            self,
+            Self::Open | Self::StoppedOut | Self::TookProfit | Self::ClosedOnReversal
+        )
     }
 }
 
@@ -69,8 +190,8 @@ pub struct FireResult {
 /// fire folds its latched signal onto the shell), so the levels match
 /// what the live worker would have placed — and the report's `order:`
 /// line, which resolves the same way.
-pub fn resolve_fire(plan: &TradePlan, fire: &Fire) -> Option<FireResult> {
-    resolve_fire_any(plan, fire).filter(|r| r.kind.is_taken())
+pub fn resolve_fire(plan: &TradePlan, fire: &Fire, closes: &[CloseFire]) -> Option<FireResult> {
+    resolve_fire_any(plan, fire, closes).filter(|r| r.kind.is_taken())
 }
 
 /// Like [`resolve_fire`], but also returns the *not-taken* enters —
@@ -81,7 +202,7 @@ pub fn resolve_fire(plan: &TradePlan, fire: &Fire) -> Option<FireResult> {
 ///
 /// Still `None` for non-enters and for enters whose bracket can't resolve
 /// (an `Unresolved` outcome — nothing meaningful to draw).
-pub fn resolve_fire_any(plan: &TradePlan, fire: &Fire) -> Option<FireResult> {
+pub fn resolve_fire_any(plan: &TradePlan, fire: &Fire, closes: &[CloseFire]) -> Option<FireResult> {
     let intent = &fire.fired.intent;
     if intent.action != Action::Enter {
         return None;
@@ -111,8 +232,15 @@ pub fn resolve_fire_any(plan: &TradePlan, fire: &Fire) -> Option<FireResult> {
     // declined) was still "placed" at this bar, so draw the intended bracket
     // there.
     let fire_at = candle.time;
-    let (fill_at, until, entry_price, kind) =
-        match simulate_fill(intent, &shell, plan.pip_size, &fire.forward) {
+    let raw = simulate_fill(intent, &shell, plan.pip_size, &fire.forward);
+    let (fill_at, until, entry_price, kind) = match apply_reversal_close(raw, closes) {
+        ReplayOutcome::ClosedOnReversal {
+            fill_at,
+            exit_at,
+            entry_price,
+            ..
+        } => (fill_at, exit_at, entry_price, FillKind::ClosedOnReversal),
+        ReplayOutcome::Sim(sim) => match sim {
             SimOutcome::FilledOpen {
                 fill_at,
                 entry_price,
@@ -145,7 +273,8 @@ pub fn resolve_fire_any(plan: &TradePlan, fire: &Fire) -> Option<FireResult> {
             ),
             // Nothing meaningful to draw.
             SimOutcome::Unresolved(_) => return None,
-        };
+        },
+    };
     Some(FireResult {
         direction: resolved.direction,
         fill_at,
@@ -168,10 +297,20 @@ pub fn render(plan: &TradePlan, replay: &Replay, simulate: bool) -> String {
         replay.fires.len()
     ));
 
+    let closes = collect_close_fires(replay);
     let mut wins = 0usize;
     let mut losses = 0usize;
+    let mut reversal_closes = 0usize;
     for fire in &replay.fires {
-        out.push_str(&render_fire(plan, fire, simulate, &mut wins, &mut losses));
+        out.push_str(&render_fire(
+            plan,
+            fire,
+            simulate,
+            &closes,
+            &mut wins,
+            &mut losses,
+            &mut reversal_closes,
+        ));
     }
 
     if !replay.warnings.is_empty() {
@@ -189,17 +328,23 @@ pub fn render(plan: &TradePlan, replay: &Replay, simulate: bool) -> String {
     ));
     if simulate {
         out.push_str(&format!("  |  TP: {wins}  SL: {losses}"));
+        if reversal_closes > 0 {
+            out.push_str(&format!("  REV: {reversal_closes}"));
+        }
     }
     out.push('\n');
     out
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render_fire(
     plan: &TradePlan,
     fire: &Fire,
     simulate: bool,
+    closes: &[CloseFire],
     wins: &mut usize,
     losses: &mut usize,
+    reversal_closes: &mut usize,
 ) -> String {
     let intent = &fire.fired.intent;
     let candle = &fire.fired.candle;
@@ -219,6 +364,17 @@ fn render_fire(
         // bracket resolved against this prep bar, so the journal shows the
         // SL/TP the eventual order would carry even when it never fills.
         line.push_str(&prep_would_enter_line(plan, fire));
+        return line;
+    }
+    if intent.action == Action::Close {
+        // A close fire has no fill of its own — it flattens whatever enter is
+        // open. Surface it so the reversal exit is legible next to the enter it
+        // closes (which renders its own `CLOSED ON REVERSAL` fill line).
+        line.push_str(&format!(
+            "    close-on-reversal: reversal candle @ {} (close {}) — flattens the open position\n",
+            bne(candle.time),
+            candle.c
+        ));
         return line;
     }
     if intent.action != Action::Enter {
@@ -263,12 +419,28 @@ fn render_fire(
         return line;
     }
 
-    let outcome = simulate_fill(intent, &shell, plan.pip_size, &fire.forward);
-    line.push_str(&format!("    {}\n", describe_outcome(&outcome)));
-    match outcome {
-        SimOutcome::TookProfit { .. } => *wins += 1,
-        SimOutcome::StoppedOut { .. } => *losses += 1,
-        _ => {}
+    let raw = simulate_fill(intent, &shell, plan.pip_size, &fire.forward);
+    match apply_reversal_close(raw, closes) {
+        ReplayOutcome::ClosedOnReversal {
+            entry_price,
+            exit_at,
+            exit_price,
+            ..
+        } => {
+            line.push_str(&format!(
+                "    fill: CLOSED ON REVERSAL — in @ {entry_price} → exit {exit_price} ({})\n",
+                bne(exit_at)
+            ));
+            *reversal_closes += 1;
+        }
+        ReplayOutcome::Sim(outcome) => {
+            line.push_str(&format!("    {}\n", describe_outcome(&outcome)));
+            match outcome {
+                SimOutcome::TookProfit { .. } => *wins += 1,
+                SimOutcome::StoppedOut { .. } => *losses += 1,
+                _ => {}
+            }
+        }
     }
     line
 }
@@ -419,8 +591,107 @@ mod tests {
         assert!(FillKind::Open.is_taken());
         assert!(FillKind::StoppedOut.is_taken());
         assert!(FillKind::TookProfit.is_taken());
+        assert!(FillKind::ClosedOnReversal.is_taken());
         assert!(!FillKind::NeverFilled.is_taken());
         assert!(!FillKind::Declined.is_taken());
+    }
+
+    fn at(secs: i64) -> DateTime<Utc> {
+        Utc.timestamp_opt(secs, 0).unwrap()
+    }
+
+    fn cf(secs: i64, price: f64) -> CloseFire {
+        CloseFire {
+            at: at(secs),
+            price,
+        }
+    }
+
+    #[test]
+    fn reversal_close_flattens_an_open_position() {
+        // FilledOpen + a reversal after the fill → ClosedOnReversal at that bar.
+        let open = SimOutcome::FilledOpen {
+            fill_at: at(100),
+            entry_price: 5.871,
+        };
+        match apply_reversal_close(open, &[cf(300, 5.860)]) {
+            ReplayOutcome::ClosedOnReversal {
+                fill_at,
+                entry_price,
+                exit_at,
+                exit_price,
+            } => {
+                assert_eq!(fill_at, at(100));
+                assert!((entry_price - 5.871).abs() < 1e-9);
+                assert_eq!(exit_at, at(300));
+                assert!((exit_price - 5.860).abs() < 1e-9);
+            }
+            other => panic!("expected ClosedOnReversal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn reversal_before_the_fill_is_ignored() {
+        // A close fire BEFORE the fill belongs to no open position → untouched.
+        let open = SimOutcome::FilledOpen {
+            fill_at: at(200),
+            entry_price: 5.871,
+        };
+        assert!(matches!(
+            apply_reversal_close(open, &[cf(100, 5.860)]),
+            ReplayOutcome::Sim(SimOutcome::FilledOpen { .. })
+        ));
+    }
+
+    #[test]
+    fn reversal_after_sl_does_not_override_the_stop() {
+        // The position already stopped out at bar 250; a reversal at 300 is moot.
+        let stopped = SimOutcome::StoppedOut {
+            fill_at: at(100),
+            entry_price: 5.871,
+            exit_at: at(250),
+            exit_price: 5.90,
+        };
+        assert!(matches!(
+            apply_reversal_close(stopped, &[cf(300, 5.86)]),
+            ReplayOutcome::Sim(SimOutcome::StoppedOut { .. })
+        ));
+    }
+
+    #[test]
+    fn reversal_before_sl_pre_empts_the_stop() {
+        // A reversal that fires strictly before the SL bar closes the position
+        // first — the trade exited on the reversal, never reaching its stop.
+        let stopped = SimOutcome::StoppedOut {
+            fill_at: at(100),
+            entry_price: 5.871,
+            exit_at: at(400),
+            exit_price: 5.90,
+        };
+        match apply_reversal_close(stopped, &[cf(300, 5.86)]) {
+            ReplayOutcome::ClosedOnReversal { exit_at, .. } => assert_eq!(exit_at, at(300)),
+            other => panic!("expected ClosedOnReversal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn earliest_reversal_wins() {
+        let open = SimOutcome::FilledOpen {
+            fill_at: at(100),
+            entry_price: 5.871,
+        };
+        match apply_reversal_close(open, &[cf(400, 5.85), cf(250, 5.86)]) {
+            ReplayOutcome::ClosedOnReversal { exit_at, .. } => assert_eq!(exit_at, at(250)),
+            other => panic!("expected the earliest reversal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn never_filled_is_untouched_by_a_reversal() {
+        assert!(matches!(
+            apply_reversal_close(SimOutcome::NeverFilled, &[cf(300, 5.86)]),
+            ReplayOutcome::Sim(SimOutcome::NeverFilled)
+        ));
     }
 
     #[test]

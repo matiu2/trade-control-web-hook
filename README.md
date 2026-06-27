@@ -297,6 +297,17 @@ The day-to-day loop, end to end:
      longer fires the instant a bar breaks through. Both `candle-signals-v2.pine`
      and the Rust port carry this fix in lock-step. Validation against
      recorded Pine fires by historical replay is a tracked follow-up.
+     The **`06-close-on-reversal`** close is the *exit* side of the same
+     detector: it's a `PinePattern` guard bound to the *opposite* direction
+     (a long reversal candle closes an open short, and vice-versa). When that
+     reversal prints **and** its close sits inside one of the intent's
+     `sr_bands` (the pure half of `run_close`'s contextual window — the
+     news-window half stays a dispatch-time KV check), the engine fires the
+     close, which flattens the position and retires the plan. Before this it
+     was inert in the cron-engine era (the engine never ran Pine detection for
+     guards, only for the enter), so a trade that should have exited on a
+     reversal candle over-held to SL/TP/window-end; the offline `replay-candles`
+     simulator now honours the close fire too (see *Candle replay* below).
    - `5 21 * * *` **and** `5 22 * * *` — the daily **NY-close-edge**
      check for the spread-blackout feature. CF crons are UTC-only and
      can't carry a timezone, so both candidate minutes fire (21:05 UTC
@@ -1193,6 +1204,16 @@ needs no MCP:
 replay-candles --plan plan.json --instrument gbp/aud \
   --granularity 1h --start 2026-06-19T00:00 --end 2026-06-19T15:00
 ```
+
+The fill simulator is pure and per-enter (entry / SL / TP only), so a
+**`06-close-on-reversal`** fire — a separate guard the engine fires when an
+opposing reversal candle prints in an `sr_bands` band — is applied as a
+post-pass: an open position is flattened on the earliest reversal-close that
+lands while it's open, before its SL/TP. The report prints `fill: CLOSED ON
+REVERSAL — in @ <entry> → exit <price> (<bar>)` for that enter and tallies it
+under `REV:` (distinct from `TP:` / `SL:`). This matches the live worker, whose
+`run_close` flattens the broker position on the same fire; before the fix the
+close was inert and the position over-held to SL/TP/window-end.
 
 **Freezing a known-good run as a regression fixture.** When a replay is
 producing the verdict you want, add `--save <name>` to freeze that run into
