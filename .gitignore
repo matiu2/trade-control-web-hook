@@ -5,3 +5,22 @@ scripts/__pycache__/
 scripts/tmp.json
 # replay-candles disk cache (transient; candles are frozen into replay-fixtures/ instead)
 candle_cache/
+
+# Local scratch: ad-hoc alert payloads, log dumps, instrument snapshots, and
+# the trade-calendar-maker symlink — accidentally committed in the v61 merge,
+# untracked again here. These are working-tree scratch, not repo content.
+*.log
+*.log.json
+logs.json
+7-days.log.json
+wrangler.log
+tradenation-instruments.json
+nzd-chf-replay.txt
+dell
+/gbp-aud.yaml
+/japan-test.yaml
+/retest.yaml
+/tmp.yaml
+.claude/trade-calendar-maker
+TODO-bug015-ttl-and-purge.md
+TODO-track-D-candle-cache-wasm-kv.md

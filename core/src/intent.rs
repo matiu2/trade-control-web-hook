@@ -20,6 +20,9 @@ pub use blackout::{
 };
 pub use breakeven::{Breakeven, DEFAULT_BREAKEVEN_THRESHOLD};
 pub use entry_level_veto::{EntryLevelVeto, VetoSide};
+// `OffsetError` / `resolve_offset` are defined in this file (below) but
+// re-stated here in the doc-facing surface; no re-export needed since they're
+// already `pub` at module root.
 pub use expiry::{ExpiryError, MAX_EXPIRY_BARS, resolve_cancel_at};
 pub use mw_resolution::mw_static_prices;
 pub use mw_state::{MwAnchors, MwUpdate, effective_mw_params, plan_mw_update};
@@ -936,7 +939,9 @@ pub fn is_valid_trade_id(s: &str) -> bool {
 }
 
 /// Error returned by [`Intent::validate`].
-#[derive(Debug, PartialEq, Eq)]
+// `Eq` is intentionally omitted: the `OffsetSpecInvalid(OffsetError)` variant
+// carries an `f64` (the offending atr-pct), which is `PartialEq` but not `Eq`.
+#[derive(Debug, PartialEq)]
 pub enum IntentValidationError {
     /// `trade_id` failed [`is_valid_trade_id`].
     InvalidTradeId,
@@ -1030,6 +1035,13 @@ pub enum IntentValidationError {
     /// a zero/negative/NaN value would silently zero or invert the trade
     /// geometry.
     PipSizeInvalid,
+    /// An anchored offset (entry / SL / TP) set both `offset_pips` and
+    /// `offset_atr_pct`, or set `offset_atr_pct` to a negative / non-finite
+    /// value, or paired `offset_atr_pct` with a directionless `close` anchor.
+    /// The resolver would reject these too, but catching them at validate time
+    /// gives the operator a fast parse-time error before encryption. See
+    /// [`OffsetError`].
+    OffsetSpecInvalid(OffsetError),
     /// `enter` / `veto` / `clear-veto` reached validation without a
     /// `trade_id`. The veto KV key is
     /// `veto:<account>:<trade_id>:<instrument>:<name>` — without a
@@ -1108,6 +1120,7 @@ impl core::fmt::Display for IntentValidationError {
                 "mw params invalid: anchor prices must be finite, spread_pips >= 0, pip_size > 0",
             ),
             Self::PipSizeInvalid => f.write_str("pip_size must be finite and > 0"),
+            Self::OffsetSpecInvalid(e) => write!(f, "invalid anchored offset: {e}"),
             Self::MissingTradeId => {
                 f.write_str("trade_id is required on action: enter | veto | clear-veto")
             }
@@ -1329,8 +1342,82 @@ impl Intent {
         // SL→entry distance when it's omitted (see
         // `resolution::resolve_recover_entry` and the wrong-side Stop arm),
         // so there is no malformed form to reject here.
+
+        // Anchored-offset static validity (entry / SL / TP). The resolver also
+        // rejects these, but validating at parse time fails fast before
+        // encryption. Only the *static* OffsetError cases are checkable here —
+        // `AtrUnavailable` depends on a live shell and is deferred to resolve.
+        for (pips, atr_pct, anchor) in self.anchored_offsets() {
+            if let Err(e) = check_offset_static(pips, atr_pct, anchor) {
+                return Err(IntentValidationError::OffsetSpecInvalid(e));
+            }
+        }
         Ok(())
     }
+
+    /// The `(offset_pips, offset_atr_pct, anchor)` triple of every anchored
+    /// offset this intent carries — the entry trigger (Stop/Limit), the
+    /// stop-loss, and an anchored take-profit. `Absolute`/`Market`/`RMultiple`
+    /// forms carry no offset and are skipped. Used by [`Self::validate`] to
+    /// statically check the ATR-pct / pips constraints.
+    fn anchored_offsets(&self) -> Vec<(f64, Option<f64>, PriceAnchor)> {
+        let mut out = Vec::new();
+        match &self.entry {
+            Some(EntrySpec::Stop {
+                from,
+                offset_pips,
+                offset_atr_pct,
+                ..
+            })
+            | Some(EntrySpec::Limit {
+                from,
+                offset_pips,
+                offset_atr_pct,
+                ..
+            }) => out.push((*offset_pips, *offset_atr_pct, *from)),
+            _ => {}
+        }
+        if let Some(PriceRef::Anchored {
+            from,
+            offset_pips,
+            offset_atr_pct,
+        }) = &self.stop_loss
+        {
+            out.push((*offset_pips, *offset_atr_pct, *from));
+        }
+        if let Some(TakeProfit::Anchored(PriceRef::Anchored {
+            from,
+            offset_pips,
+            offset_atr_pct,
+        })) = &self.take_profit
+        {
+            out.push((*offset_pips, *offset_atr_pct, *from));
+        }
+        out
+    }
+}
+
+/// Static (shell-free) validity of an anchored offset — the subset of
+/// [`resolve_offset`]'s checks that don't need a live shell: mutual exclusion,
+/// non-negative + finite `offset_atr_pct`, and a directional anchor for the ATR
+/// form. The runtime `AtrUnavailable` case is deferred to resolve time.
+fn check_offset_static(
+    offset_pips: f64,
+    offset_atr_pct: Option<f64>,
+    anchor: PriceAnchor,
+) -> Result<(), OffsetError> {
+    if let Some(pct) = offset_atr_pct {
+        if offset_pips != 0.0 {
+            return Err(OffsetError::BothOffsetsSet);
+        }
+        if !pct.is_finite() || pct < 0.0 {
+            return Err(OffsetError::NegativeAtrPct(pct));
+        }
+        if anchor.buffer_sign().is_none() {
+            return Err(OffsetError::AtrPctOnCloseAnchor);
+        }
+    }
+    Ok(())
 }
 
 /// Contextual-window type for the consolidated close-on-reversal gate
@@ -1547,6 +1634,31 @@ pub enum PriceAnchor {
     SignalLow,
 }
 
+impl PriceAnchor {
+    /// The sign an **unsigned** ATR-buffer magnitude takes when applied to this
+    /// anchor, so the level is always pushed *away* from the candle (never into
+    /// it): `+1.0` for the `*High` anchors (push up, above the high), `-1.0` for
+    /// the `*Low` anchors (push down, below the low).
+    ///
+    /// `Close` is directionless — there's no "away" from a midpoint — so it
+    /// returns `None`. Resolution rejects an `offset_atr_pct` paired with a
+    /// `Close` anchor for that reason (the legacy signed `offset_pips` carried
+    /// its own direction, so it had no such restriction).
+    ///
+    /// This replaces `offset_pips`' sign-in-the-value quirk: with `offset_pips`
+    /// the operator had to write `-1.0` on a low anchor and `+1.0` on a high
+    /// anchor by hand (and a flat sign was a real bug — see the geometry table
+    /// in `cli/src/trade_patterns.rs`). Deriving the sign from the anchor here
+    /// makes that class of mistake unrepresentable.
+    pub fn buffer_sign(self) -> Option<f64> {
+        match self {
+            PriceAnchor::High | PriceAnchor::RecentHigh | PriceAnchor::SignalHigh => Some(1.0),
+            PriceAnchor::Low | PriceAnchor::RecentLow | PriceAnchor::SignalLow => Some(-1.0),
+            PriceAnchor::Close => None,
+        }
+    }
+}
+
 /// Reference to a price. Either anchored to the plaintext shell with a pip
 /// offset (TradingView fills in the anchor at fire time) or a fixed absolute
 /// price set at encode time (the worker uses it verbatim, ignoring the shell).
@@ -1555,14 +1667,28 @@ pub enum PriceAnchor {
 pub enum PriceRef {
     /// `{ absolute: 1.86236 }` — fixed price; shell ignored.
     Absolute { absolute: f64 },
-    /// `{ from: low, offset_pips: -2 }` — anchor + signed pip offset.
+    /// `{ from: signal_high, offset_atr_pct: 0.5 }` — anchor + an offset that
+    /// is either a fraction of ATR (preferred) or a signed pip count (legacy).
     Anchored {
         from: PriceAnchor,
-        /// Offset in pips. Sign matters: -2 means "low - 2 pips" regardless
-        /// of direction. The "pip" here is the instrument's pip size; the
-        /// caller supplies that.
+        /// **Deprecated** — prefer `offset_atr_pct`. Offset in pips. Sign
+        /// matters: -2 means "low - 2 pips" regardless of direction. The
+        /// "pip" here is the instrument's pip size; the caller supplies that.
+        /// Still honoured for in-flight / hand-written plans; mutually
+        /// exclusive with `offset_atr_pct` (both-set is rejected at resolve).
         #[serde(default)]
         offset_pips: f64,
+        /// Buffer as a **percent of ATR** (e.g. `0.5` = 0.5% of the latched
+        /// ATR), resolved at fill time against `shell.atr`. **Unsigned
+        /// magnitude** — the direction is taken from `from` (`*High` pushes up,
+        /// `*Low` pushes down, away from the candle), so a `Close` anchor is
+        /// rejected. Volatility-scaled: a noisy instrument gets a proportionally
+        /// wider buffer than a quiet one from the same percent. When `shell.atr`
+        /// is absent (ATR warmup / short feed) resolution rejects the entry
+        /// (`ResolveError::AtrUnavailable`) rather than guessing. Absent =
+        /// fall back to `offset_pips` (byte-identical wire for old intents).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        offset_atr_pct: Option<f64>,
     },
 }
 
@@ -1597,13 +1723,22 @@ pub enum EntrySpec {
     /// Long stop sits *above* current price; short stop sits *below*.
     Stop {
         from: PriceAnchor,
+        /// **Deprecated** — prefer `offset_atr_pct`. Signed pip offset; still
+        /// honoured for old/hand-written plans. Mutually exclusive with
+        /// `offset_atr_pct`.
         #[serde(default)]
         offset_pips: f64,
+        /// Buffer as a percent of ATR (unsigned magnitude; direction from
+        /// `from`). See [`PriceRef::Anchored::offset_atr_pct`]. Mutually
+        /// exclusive with `offset_pips`; rejected on a `Close` anchor; rejects
+        /// the entry when `shell.atr` is absent.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        offset_atr_pct: Option<f64>,
         /// Absolute trigger price set at encode time. When `Some`, it
-        /// overrides `from`/`offset_pips` and the worker uses it verbatim
-        /// (the operator drew the exact level — e.g. a position tool's
-        /// entry anchor). When `None`, today's behaviour: trigger =
-        /// `anchor_price(from) + offset_pips × pip_size`. Signed.
+        /// overrides `from`/`offset_pips`/`offset_atr_pct` and the worker uses
+        /// it verbatim (the operator drew the exact level — e.g. a position
+        /// tool's entry anchor). When `None`, today's behaviour: trigger =
+        /// `anchor_price(from) + buffer`. Signed.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         at: Option<f64>,
         /// Optional recovery for when a stop entry can't be placed as a
@@ -1627,10 +1762,20 @@ pub enum EntrySpec {
     /// Long limit sits *below* current price; short limit sits *above*.
     Limit {
         from: PriceAnchor,
+        /// **Deprecated** — prefer `offset_atr_pct`. Signed pip offset; still
+        /// honoured for old/hand-written plans. Mutually exclusive with
+        /// `offset_atr_pct`.
         #[serde(default)]
         offset_pips: f64,
+        /// Buffer as a percent of ATR (unsigned magnitude; direction from
+        /// `from`). See [`PriceRef::Anchored::offset_atr_pct`]. Mutually
+        /// exclusive with `offset_pips`; rejected on a `Close` anchor; rejects
+        /// the entry when `shell.atr` is absent.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        offset_atr_pct: Option<f64>,
         /// Absolute trigger price set at encode time — same semantics as
-        /// [`EntrySpec::Stop::at`]. When `Some`, overrides `from`/`offset_pips`.
+        /// [`EntrySpec::Stop::at`]. When `Some`, overrides
+        /// `from`/`offset_pips`/`offset_atr_pct`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         at: Option<f64>,
     },
@@ -1795,13 +1940,102 @@ impl Shell {
     }
 }
 
-impl PriceRef {
-    pub fn resolve(&self, shell: &Shell, pip_size: f64) -> f64 {
+/// Why an anchored offset (entry / SL / TP) couldn't be turned into a price.
+/// All three are *config / availability* failures, not arithmetic ones — the
+/// resolver returns them so the caller declines the bar (engine: stay armed,
+/// retry next tick) rather than placing a trade with a wrong buffer. Surfaced
+/// up through [`ResolveError`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum OffsetError {
+    /// Both `offset_pips` and `offset_atr_pct` were set on the same ref. They
+    /// are mutually exclusive (one buffer, one unit) — pick one.
+    BothOffsetsSet,
+    /// `offset_atr_pct` was paired with a directionless `Close` anchor. The
+    /// ATR buffer takes its direction from the anchor (`*High` up / `*Low`
+    /// down), and `Close` has no "away" side, so the combination is rejected.
+    AtrPctOnCloseAnchor,
+    /// `offset_atr_pct` was negative. It's an unsigned magnitude — the
+    /// direction comes from the anchor — so a negative would push the level
+    /// *into* the candle, which is never intended.
+    NegativeAtrPct(f64),
+    /// `offset_atr_pct` was set but the shell carries no ATR. Happens only in
+    /// the ATR warmup region (fewer closed candles than `atr_length_for`) or on
+    /// a short / failed broker feed — where a golden enter can't validly fire
+    /// anyway. Reject this bar; the next tick recomputes ATR and retries.
+    AtrUnavailable,
+}
+
+impl core::fmt::Display for OffsetError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
-            PriceRef::Absolute { absolute } => *absolute,
-            PriceRef::Anchored { from, offset_pips } => {
-                shell.anchor_price(*from) + offset_pips * pip_size
+            Self::BothOffsetsSet => {
+                f.write_str("offset_pips and offset_atr_pct are mutually exclusive")
             }
+            Self::AtrPctOnCloseAnchor => {
+                f.write_str("offset_atr_pct needs a directional anchor, not `close`")
+            }
+            Self::NegativeAtrPct(v) => {
+                write!(f, "offset_atr_pct must be non-negative, got {v}")
+            }
+            Self::AtrUnavailable => {
+                f.write_str("offset_atr_pct set but ATR is unavailable (warmup / short feed)")
+            }
+        }
+    }
+}
+
+/// Resolve an anchored offset into a **signed price delta** to add to the
+/// anchor. Exactly one of the two offset forms is honoured:
+///
+/// - `offset_atr_pct: Some(p)` → buffer = `sign(from) × (p / 100) × shell.atr`,
+///   where `sign(from)` is [`PriceAnchor::buffer_sign`] (`*High` → +, `*Low` →
+///   −). Unsigned `p`; the anchor carries the direction. Errors if `from` is
+///   `Close` ([`OffsetError::AtrPctOnCloseAnchor`]), `p` is negative
+///   ([`OffsetError::NegativeAtrPct`]), or `shell.atr` is `None`
+///   ([`OffsetError::AtrUnavailable`]).
+/// - else `offset_pips` (the **deprecated** path) → `offset_pips × pip_size`,
+///   sign carried in the value, exactly as before.
+///
+/// Both set is [`OffsetError::BothOffsetsSet`]. Both absent → `0.0` (a bare
+/// anchor). Shared by [`PriceRef::resolve`] and the [`EntrySpec`] stop/limit
+/// arms so the two can't drift.
+pub fn resolve_offset(
+    from: PriceAnchor,
+    offset_pips: f64,
+    offset_atr_pct: Option<f64>,
+    shell: &Shell,
+    pip_size: f64,
+) -> Result<f64, OffsetError> {
+    match offset_atr_pct {
+        Some(pct) => {
+            if offset_pips != 0.0 {
+                return Err(OffsetError::BothOffsetsSet);
+            }
+            if pct < 0.0 {
+                return Err(OffsetError::NegativeAtrPct(pct));
+            }
+            let sign = from.buffer_sign().ok_or(OffsetError::AtrPctOnCloseAnchor)?;
+            let atr = shell.atr.ok_or(OffsetError::AtrUnavailable)?;
+            Ok(sign * (pct / 100.0) * atr)
+        }
+        None => Ok(offset_pips * pip_size),
+    }
+}
+
+impl PriceRef {
+    /// Resolve to a concrete price. `Absolute` ignores the shell; `Anchored`
+    /// resolves its offset via [`resolve_offset`] (ATR-pct preferred,
+    /// `offset_pips` legacy fallback) — fallible because the ATR path can
+    /// reject (see [`OffsetError`]).
+    pub fn resolve(&self, shell: &Shell, pip_size: f64) -> Result<f64, OffsetError> {
+        match self {
+            PriceRef::Absolute { absolute } => Ok(*absolute),
+            PriceRef::Anchored {
+                from,
+                offset_pips,
+                offset_atr_pct,
+            } => Ok(shell.anchor_price(*from)
+                + resolve_offset(*from, *offset_pips, *offset_atr_pct, shell, pip_size)?),
         }
     }
 }
@@ -2005,9 +2239,10 @@ mod tests {
         let sl = PriceRef::Anchored {
             from: PriceAnchor::Low,
             offset_pips: -2.0,
+            offset_atr_pct: None,
         };
         // 1.0980 + (-2 * 0.0001) = 1.0978
-        assert!((sl.resolve(&s, 0.0001) - 1.0978).abs() < 1e-9);
+        assert!((sl.resolve(&s, 0.0001).unwrap() - 1.0978).abs() < 1e-9);
     }
 
     #[test]
@@ -2211,6 +2446,7 @@ mod tests {
             Some(EntrySpec::Stop {
                 from,
                 offset_pips,
+                offset_atr_pct: _,
                 at,
                 recover_entry,
             }) => {
@@ -2231,6 +2467,7 @@ mod tests {
         let spec = EntrySpec::Stop {
             from: PriceAnchor::High,
             offset_pips: 1.0,
+            offset_atr_pct: None,
             at: None,
             recover_entry: None,
         };
@@ -2262,6 +2499,7 @@ mod tests {
         let spec = EntrySpec::Stop {
             from: PriceAnchor::High,
             offset_pips: 1.0,
+            offset_atr_pct: None,
             at: None,
             recover_entry: Some(RecoverEntry {
                 action: RecoverEntryAction::Market,
@@ -2343,6 +2581,7 @@ mod tests {
             Some(EntrySpec::Limit {
                 from,
                 offset_pips,
+                offset_atr_pct: _,
                 at,
             }) => {
                 assert_eq!(from, PriceAnchor::Low);
@@ -2660,6 +2899,94 @@ mod tests {
         let intent: Intent = serde_yaml::from_str(yaml).unwrap();
         assert_eq!(intent.trade_id.as_deref(), Some("eurusd-short-01jb2x"));
         intent.validate().unwrap();
+    }
+
+    /// An `offset_atr_pct` enter with directional anchors validates fine.
+    #[test]
+    fn validate_accepts_atr_pct_offset() {
+        let yaml = "
+            v: 1
+            id: t-atr-ok
+            not_after: \"2026-05-13T20:00:00Z\"
+            action: enter
+            instrument: EUR_USD
+            direction: short
+            trade_id: eurusd-short-atr
+            entry: { type: stop, from: signal_low, offset_atr_pct: 0.5 }
+            stop_loss: { from: signal_high, offset_atr_pct: 0.5 }
+            take_profit: { from: signal_low, offset_pips: -50 }
+        ";
+        let intent: Intent = serde_yaml::from_str(yaml).unwrap();
+        intent.validate().unwrap();
+    }
+
+    #[test]
+    fn validate_rejects_both_offset_forms() {
+        let yaml = "
+            v: 1
+            id: t-atr-both
+            not_after: \"2026-05-13T20:00:00Z\"
+            action: enter
+            instrument: EUR_USD
+            direction: short
+            trade_id: eurusd-short-atr
+            entry: { type: stop, from: signal_low, offset_pips: 1, offset_atr_pct: 0.5 }
+            stop_loss: { from: signal_high, offset_pips: 1 }
+            take_profit: { from: signal_low, offset_pips: -50 }
+        ";
+        let intent: Intent = serde_yaml::from_str(yaml).unwrap();
+        assert!(matches!(
+            intent.validate(),
+            Err(IntentValidationError::OffsetSpecInvalid(
+                OffsetError::BothOffsetsSet
+            ))
+        ));
+    }
+
+    #[test]
+    fn validate_rejects_negative_atr_pct() {
+        let yaml = "
+            v: 1
+            id: t-atr-neg
+            not_after: \"2026-05-13T20:00:00Z\"
+            action: enter
+            instrument: EUR_USD
+            direction: short
+            trade_id: eurusd-short-atr
+            entry: { type: stop, from: signal_low, offset_atr_pct: -0.5 }
+            stop_loss: { from: signal_high, offset_pips: 1 }
+            take_profit: { from: signal_low, offset_pips: -50 }
+        ";
+        let intent: Intent = serde_yaml::from_str(yaml).unwrap();
+        assert!(matches!(
+            intent.validate(),
+            Err(IntentValidationError::OffsetSpecInvalid(
+                OffsetError::NegativeAtrPct(_)
+            ))
+        ));
+    }
+
+    #[test]
+    fn validate_rejects_atr_pct_on_close_anchor() {
+        let yaml = "
+            v: 1
+            id: t-atr-close
+            not_after: \"2026-05-13T20:00:00Z\"
+            action: enter
+            instrument: EUR_USD
+            direction: short
+            trade_id: eurusd-short-atr
+            entry: { type: stop, from: close, offset_atr_pct: 0.5 }
+            stop_loss: { from: signal_high, offset_pips: 1 }
+            take_profit: { from: signal_low, offset_pips: -50 }
+        ";
+        let intent: Intent = serde_yaml::from_str(yaml).unwrap();
+        assert!(matches!(
+            intent.validate(),
+            Err(IntentValidationError::OffsetSpecInvalid(
+                OffsetError::AtrPctOnCloseAnchor
+            ))
+        ));
     }
 
     #[test]

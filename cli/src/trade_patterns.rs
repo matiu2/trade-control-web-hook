@@ -120,6 +120,54 @@ impl TradePattern {
 ///   entry = high + 1 pip, SL = low + 1 pip (the template uses `+1`
 ///   not `-1` — a tight SL that sits inside the candle by 1 pip, so a
 ///   wick to the low takes you out), invalidation veto = `too-low`.
+/// Default entry/SL buffer for a new H&S/iH&S enter, as a **percent of ATR**
+/// (0.5% of the latched ATR). Replaces the old hardcoded ±1-pip buffer so the
+/// buffer scales with instrument volatility (the trade-075 Wheat finding). A
+/// single tunable to begin; entry-vs-SL can be split later if needed. The
+/// operator overrides per-trade via the spec's `*_offset_atr_pct` (or opts back
+/// into the deprecated pips form via `*_offset_pips`).
+pub const DEFAULT_BUFFER_ATR_PCT: f64 = 0.5;
+
+/// Which buffer form a pattern enter's entry / SL offset uses. The buffer
+/// always pushes the level *away* from the candle; direction comes from the
+/// geometry anchor (`*High` up, `*Low` down) at resolve time, so both forms
+/// carry an unsigned-by-intent magnitude (pips stays signed for back-compat;
+/// the geometry table supplies the sign for the legacy default).
+#[derive(Debug, Clone, Copy)]
+enum OffsetSpec {
+    /// **Deprecated** — a signed pip offset (legacy / explicit operator
+    /// override). Resolves to `EntrySpec`/`PriceRef` `offset_pips`.
+    Pips(f64),
+    /// Buffer as a percent of ATR (resolves to `offset_atr_pct`).
+    AtrPct(f64),
+}
+
+impl OffsetSpec {
+    /// Lower into the `(offset_pips, offset_atr_pct)` pair an
+    /// `EntrySpec`/`PriceRef` carries. The two forms are mutually exclusive
+    /// on the wire: pips sets `offset_atr_pct: None`; an ATR-pct buffer sets
+    /// `offset_pips: 0.0` and the percent.
+    fn as_fields(self) -> (f64, Option<f64>) {
+        match self {
+            OffsetSpec::Pips(p) => (p, None),
+            OffsetSpec::AtrPct(pct) => (0.0, Some(pct)),
+        }
+    }
+}
+
+/// Pick the offset form for an entry or SL from the spec's two optional
+/// override fields. Precedence: an explicit `offset_pips` (the deprecated but
+/// still-honoured form) wins; else an explicit `offset_atr_pct`; else the
+/// system default of [`DEFAULT_BUFFER_ATR_PCT`]. Both set is rejected upstream
+/// at validation — here pips-wins is just a defensive tiebreak.
+fn resolve_offset_spec(offset_pips: Option<f64>, offset_atr_pct: Option<f64>) -> OffsetSpec {
+    match (offset_pips, offset_atr_pct) {
+        (Some(p), _) => OffsetSpec::Pips(p),
+        (None, Some(pct)) => OffsetSpec::AtrPct(pct),
+        (None, None) => OffsetSpec::AtrPct(DEFAULT_BUFFER_ATR_PCT),
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 struct PatternGeometry {
     direction: Direction,
@@ -318,14 +366,28 @@ pub struct TradeSpec {
     /// out its preps). Unknown names are rejected.
     #[serde(default)]
     pub skip_preps: Vec<String>,
-    /// Entry stop-trigger offset in pips from the geometry anchor.
-    /// Omit to use the pattern's default (1 pip).
+    /// **Deprecated** — prefer `entry_offset_atr_pct`. Entry stop-trigger
+    /// offset in pips from the geometry anchor. When set, opts this enter back
+    /// into the legacy pip buffer; mutually exclusive with
+    /// `entry_offset_atr_pct`. Omit both to use the ATR-pct default
+    /// ([`DEFAULT_BUFFER_ATR_PCT`]).
     #[serde(default)]
     pub entry_offset_pips: Option<f64>,
-    /// Stop-loss offset in pips from the geometry anchor. Same default
-    /// behaviour as `entry_offset_pips`.
+    /// **Deprecated** — prefer `sl_offset_atr_pct`. Stop-loss offset in pips
+    /// from the geometry anchor. Same deprecation/default behaviour as
+    /// `entry_offset_pips`.
     #[serde(default)]
     pub sl_offset_pips: Option<f64>,
+    /// Entry stop-trigger buffer as a **percent of ATR** (e.g. `0.5` = 0.5% of
+    /// the latched ATR), resolved at fill time. Omit (with `entry_offset_pips`
+    /// also omitted) to use [`DEFAULT_BUFFER_ATR_PCT`]. Mutually exclusive with
+    /// `entry_offset_pips`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entry_offset_atr_pct: Option<f64>,
+    /// Stop-loss buffer as a percent of ATR. Same behaviour as
+    /// `entry_offset_atr_pct`; mutually exclusive with `sl_offset_pips`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sl_offset_atr_pct: Option<f64>,
     /// Override the pattern's default SL anchor. Omit to use the pattern
     /// default (`signal_high` for H&S, `signal_low` for iH&S — the latched
     /// pattern extreme, stable across a confirmation re-fire). Set to
@@ -776,11 +838,9 @@ pub fn build_trade_from_spec(
         }
         geometry.sl_anchor = override_anchor;
     }
-    let entry_offset_pips = spec
-        .entry_offset_pips
-        .unwrap_or(geometry.entry_offset_default);
-    let sl_offset_pips = spec.sl_offset_pips.unwrap_or(geometry.sl_offset_default);
-    assemble_trade(spec, geometry, entry_offset_pips, sl_offset_pips, now)
+    let entry_offset = resolve_offset_spec(spec.entry_offset_pips, spec.entry_offset_atr_pct);
+    let sl_offset = resolve_offset_spec(spec.sl_offset_pips, spec.sl_offset_atr_pct);
+    assemble_trade(spec, geometry, entry_offset, sl_offset, now)
 }
 
 /// Preps the H&S / IH&S pipeline can emit. Used to validate
@@ -930,6 +990,9 @@ fn build_pattern(
         skip_preps: Vec::new(),
         entry_offset_pips: Some(entry_offset_pips),
         sl_offset_pips: Some(sl_offset_pips),
+        // Interactive path is pip-based — the ATR-pct overrides stay unset.
+        entry_offset_atr_pct: None,
+        sl_offset_atr_pct: None,
         tp_price,
         // Interactive/questionnaire path always anchors SL to geometry.
         sl_price: None,
@@ -953,7 +1016,15 @@ fn build_pattern(
         // Break-even on at 50% by default (the standing lesson).
         breakeven_pct: default_breakeven_pct(),
     };
-    assemble_trade(spec, geometry, entry_offset_pips, sl_offset_pips, now)
+    // The interactive prompt is explicitly pip-based, so thread the prompted
+    // values through as the pips form (not the ATR-pct default).
+    assemble_trade(
+        spec,
+        geometry,
+        OffsetSpec::Pips(entry_offset_pips),
+        OffsetSpec::Pips(sl_offset_pips),
+        now,
+    )
 }
 
 /// Common alert-assembly path shared by the interactive and
@@ -962,8 +1033,8 @@ fn build_pattern(
 fn assemble_trade(
     spec: TradeSpec,
     geometry: PatternGeometry,
-    entry_offset_pips: f64,
-    sl_offset_pips: f64,
+    entry_offset: OffsetSpec,
+    sl_offset: OffsetSpec,
     now: DateTime<Utc>,
 ) -> Result<BuiltTrade> {
     let trade_id = mint_trade_id(spec.pattern, &spec.instrument)?;
@@ -1051,8 +1122,8 @@ fn assemble_trade(
         &trade_id,
         &geometry,
         entry_deadline,
-        entry_offset_pips,
-        sl_offset_pips,
+        entry_offset,
+        sl_offset,
         spec.tp_price,
         spec.sl_price,
         spec.risk_pct,
@@ -1104,8 +1175,8 @@ fn assemble_trade(
             &trade_id,
             &geometry,
             entry_deadline,
-            entry_offset_pips,
-            sl_offset_pips,
+            entry_offset,
+            sl_offset,
             spec.tp_price,
             spec.sl_price,
             spec.risk_pct,
@@ -1849,8 +1920,8 @@ fn build_enter_alert(
     trade_id: &str,
     geometry: &PatternGeometry,
     entry_deadline: DateTime<Utc>,
-    entry_offset_pips: f64,
-    sl_offset_pips: f64,
+    entry_offset: OffsetSpec,
+    sl_offset: OffsetSpec,
     tp_price: f64,
     sl_price: Option<f64>,
     risk_pct: f64,
@@ -1902,10 +1973,14 @@ fn build_enter_alert(
     // Baked pip scales the entry/SL offset_pips at the worker; absent =
     // worker falls back to its secret/default.
     intent.pip_size = pip_size;
+    let (entry_offset_pips, entry_offset_atr_pct) = entry_offset.as_fields();
     intent.entry = Some(match entry_mode {
         EntryMode::Stop => EntrySpec::Stop {
             from: geometry.entry_anchor,
+            // OffsetSpec lowers to exactly one of the two forms: a pips buffer
+            // (atr_pct None) or an ATR-pct buffer (pips 0.0, atr_pct Some).
             offset_pips: entry_offset_pips,
+            offset_atr_pct: entry_offset_atr_pct,
             // Pattern entries resolve against the live shell, not an
             // absolute level — `at` is for the position-tool path only.
             at: None,
@@ -1928,9 +2003,14 @@ fn build_enter_alert(
         // exactly at the level so the side is unambiguous (a Stop-style
         // offset could land the limit on the wrong side). `at: None` — like
         // the stop, it resolves against the live confirmed-signal shell.
+        // Intentionally unbuffered: the QM limit rests *exactly* at the
+        // signal anchor (offset 0, no ATR-pct buffer) so the side is
+        // unambiguous. It deliberately does NOT take the entry ATR buffer
+        // (`entry_offset` is ignored on this arm).
         EntryMode::Limit => EntrySpec::Limit {
             from: geometry.entry_anchor,
             offset_pips: 0.0,
+            offset_atr_pct: None,
             at: None,
         },
     });
@@ -1938,11 +2018,13 @@ fn build_enter_alert(
     // position-tool direct entry instead supplies an absolute stop the
     // operator drew, so when `sl_price` is set we emit `Absolute` and
     // ignore the geometry anchor / offset entirely.
+    let (sl_offset_pips, sl_offset_atr_pct) = sl_offset.as_fields();
     intent.stop_loss = Some(match sl_price {
         Some(absolute) => PriceRef::Absolute { absolute },
         None => PriceRef::Anchored {
             from: geometry.sl_anchor,
             offset_pips: sl_offset_pips,
+            offset_atr_pct: sl_offset_atr_pct,
         },
     });
     // TP is an absolute price the operator typed in — the worker uses
@@ -2082,12 +2164,14 @@ pub fn build_position_enter(
         PositionEntryKind::Stop => EntrySpec::Stop {
             from: PriceAnchor::Close,
             offset_pips: 0.0,
+            offset_atr_pct: None,
             at: Some(spec.entry_price),
             recover_entry: None,
         },
         PositionEntryKind::Limit => EntrySpec::Limit {
             from: PriceAnchor::Close,
             offset_pips: 0.0,
+            offset_atr_pct: None,
             at: Some(spec.entry_price),
         },
     };
@@ -2361,8 +2445,8 @@ mod tests {
                 "hs-eur-usd-abcd",
                 &geometry,
                 trade_expiry,
-                1.0,
-                1.0,
+                OffsetSpec::Pips(1.0),
+                OffsetSpec::Pips(1.0),
                 1.0800,
                 None,
                 1.0,
@@ -2412,6 +2496,8 @@ mod tests {
                 skip_preps: Vec::new(),
                 entry_offset_pips: Some(1.0),
                 sl_offset_pips: Some(1.0),
+                entry_offset_atr_pct: None,
+                sl_offset_atr_pct: None,
                 tp_price: 1.0500,
                 sl_price: None,
                 entry_deadline_pct: DEFAULT_ENTRY_DEADLINE_PCT,
@@ -2447,8 +2533,8 @@ mod tests {
             "hs-eur-usd-zzzz",
             &geometry,
             deadline,
-            -1.0, // entry: 1 pip below signal_low (short break)
-            1.0,  // SL: 1 pip above signal_high
+            OffsetSpec::Pips(-1.0), // entry: 1 pip below signal_low (short break)
+            OffsetSpec::Pips(1.0),  // SL: 1 pip above signal_high
             1.0500,
             None,
             1.0,
@@ -2487,7 +2573,11 @@ mod tests {
         // SL: signal_high + 1 pip — 1 pip *above* the pattern high, not the
         // triggering candle's own high.
         match &alert.intent.stop_loss {
-            Some(PriceRef::Anchored { from, offset_pips }) => {
+            Some(PriceRef::Anchored {
+                from,
+                offset_pips,
+                offset_atr_pct: _,
+            }) => {
                 assert_eq!(*from, PriceAnchor::SignalHigh);
                 assert!((offset_pips - 1.0).abs() < 1e-9);
             }
@@ -2538,8 +2628,8 @@ mod tests {
                 "hs-eur-usd-zzzz",
                 &geometry,
                 deadline,
-                -1.0,
-                1.0,
+                OffsetSpec::Pips(-1.0),
+                OffsetSpec::Pips(1.0),
                 1.0500,
                 None,
                 1.0,
@@ -2569,6 +2659,7 @@ mod tests {
             Some(EntrySpec::Stop {
                 from,
                 offset_pips,
+                offset_atr_pct: _,
                 at,
                 recover_entry,
             }) => {
@@ -2628,8 +2719,8 @@ mod tests {
             "hs-eur-usd-elv",
             &geometry,
             ts("2026-05-24T00:00:00Z"),
-            1.0,
-            1.0,
+            OffsetSpec::Pips(1.0),
+            OffsetSpec::Pips(1.0),
             1.0500,
             None,
             1.0,
@@ -2667,8 +2758,8 @@ mod tests {
             "ihs-eur-usd-yyyy",
             &geometry,
             deadline,
-            1.0,  // entry: 1 pip above signal_high (long break)
-            -1.0, // SL: 1 pip below signal_low
+            OffsetSpec::Pips(1.0), // entry: 1 pip above signal_high (long break)
+            OffsetSpec::Pips(-1.0), // SL: 1 pip below signal_low
             1.1500,
             None,
             1.0,
@@ -2706,7 +2797,11 @@ mod tests {
         }
         // SL: signal_low − 1 pip — 1 pip *below* the pattern low.
         match &alert.intent.stop_loss {
-            Some(PriceRef::Anchored { from, offset_pips }) => {
+            Some(PriceRef::Anchored {
+                from,
+                offset_pips,
+                offset_atr_pct: _,
+            }) => {
                 assert_eq!(*from, PriceAnchor::SignalLow);
                 assert!((offset_pips - (-1.0)).abs() < 1e-9);
             }
@@ -2741,8 +2836,8 @@ mod tests {
             "pos-eur-usd-abs1",
             &geometry,
             deadline,
-            1.0,
-            1.0,
+            OffsetSpec::Pips(1.0),
+            OffsetSpec::Pips(1.0),
             1.0500,
             Some(1.0850),
             1.0,
@@ -2878,6 +2973,8 @@ mod tests {
             skip_preps: Vec::new(),
             entry_offset_pips: None,
             sl_offset_pips: None,
+            entry_offset_atr_pct: None,
+            sl_offset_atr_pct: None,
             tp_price: 1.0500,
             sl_price: None,
             entry_deadline_pct: 80,
@@ -2928,18 +3025,21 @@ mod tests {
             stop.intent.requires_preps,
             vec!["break-and-close".to_string(), "retest".to_string()]
         );
-        // QM: Stop entry at signal_low − 1 pip with limit recovery (identical
-        // order shape to standalone --quasimodo), no preps, confirmed-gated,
-        // multi-shot.
+        // QM: Stop entry at signal_low − ATR-pct buffer with limit recovery
+        // (identical order shape to standalone --quasimodo), no preps,
+        // confirmed-gated, multi-shot. The buffer defaults to the ATR-pct form
+        // now (DEFAULT_BUFFER_ATR_PCT), not the old ±1 pip.
         match &qm.intent.entry {
             Some(EntrySpec::Stop {
                 from,
                 offset_pips,
+                offset_atr_pct,
                 at,
                 recover_entry,
             }) => {
                 assert_eq!(*from, PriceAnchor::SignalLow);
-                assert!((offset_pips - -1.0).abs() < 1e-9);
+                assert_eq!(*offset_pips, 0.0);
+                assert_eq!(*offset_atr_pct, Some(DEFAULT_BUFFER_ATR_PCT));
                 assert!(at.is_none());
                 assert_eq!(
                     recover_entry.as_ref().map(|r| r.action),
@@ -3459,18 +3559,37 @@ mod tests {
     }
 
     #[test]
-    fn build_trade_from_spec_applies_pattern_default_offsets() {
-        // Omitting entry/sl offsets must fall back to the pattern's
-        // geometry defaults (HS short entry: 1 pip *below* signal_low).
+    fn build_trade_from_spec_applies_atr_pct_default_offset() {
+        // Omitting entry/sl offsets now defaults to the ATR-pct buffer
+        // (DEFAULT_BUFFER_ATR_PCT), not the old hardcoded ±1 pip. The buffer
+        // direction comes from the geometry anchor (HS short entry anchors to
+        // signal_low and pushes down), so the magnitude here is unsigned.
         let now = ts("2026-05-20T00:00:00Z");
         let spec = sample_spec(TradePattern::Hs, ts("2026-05-25T00:00:00Z"));
         let trade = build_trade_from_spec(spec, now, BuildStrictness::Strict).unwrap();
         let enter = trade.alerts.last().unwrap();
         match &enter.intent.entry {
-            Some(EntrySpec::Stop { offset_pips, .. }) => {
-                assert!((offset_pips - (-1.0)).abs() < 1e-9);
+            Some(EntrySpec::Stop {
+                offset_pips,
+                offset_atr_pct,
+                ..
+            }) => {
+                assert_eq!(*offset_pips, 0.0, "pips form not used on the ATR default");
+                assert_eq!(*offset_atr_pct, Some(DEFAULT_BUFFER_ATR_PCT));
             }
             other => panic!("expected Stop entry, got {other:?}"),
+        }
+        // SL likewise defaults to the ATR-pct buffer.
+        match &enter.intent.stop_loss {
+            Some(trade_control_core::intent::PriceRef::Anchored {
+                offset_pips,
+                offset_atr_pct,
+                ..
+            }) => {
+                assert_eq!(*offset_pips, 0.0);
+                assert_eq!(*offset_atr_pct, Some(DEFAULT_BUFFER_ATR_PCT));
+            }
+            other => panic!("expected anchored SL, got {other:?}"),
         }
     }
 

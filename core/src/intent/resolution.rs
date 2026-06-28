@@ -159,6 +159,19 @@ pub enum ResolveError {
     /// A `Tunable<f64>` field resolved to a non-positive / non-finite
     /// value (e.g. a `risk_pct` script that returned `0.0`).
     InvalidTunableValue { field: &'static str, value: f64 },
+    /// An anchored offset (entry / SL / TP) couldn't be turned into a price —
+    /// e.g. `offset_atr_pct` set with the shell carrying no ATR (warmup), both
+    /// offset forms set, a `Close` anchor, or a negative percent. See
+    /// [`OffsetError`](super::OffsetError). The engine's `pine_entry_dispatchable`
+    /// treats this (like every `from_intent` `Err`) as decline-this-bar-stay-armed,
+    /// so a warmup `AtrUnavailable` simply retries on the next tick.
+    Offset(super::OffsetError),
+}
+
+impl From<super::OffsetError> for ResolveError {
+    fn from(e: super::OffsetError) -> Self {
+        ResolveError::Offset(e)
+    }
 }
 
 impl core::fmt::Display for ResolveError {
@@ -203,6 +216,7 @@ impl core::fmt::Display for ResolveError {
             Self::InvalidTunableValue { field, value } => {
                 write!(f, "{field} must be positive and finite, got {value}")
             }
+            Self::Offset(e) => write!(f, "offset resolution failed: {e}"),
         }
     }
 }
@@ -242,7 +256,7 @@ impl Resolved {
             .as_ref()
             .ok_or(ResolveError::MissingField("take_profit"))?;
 
-        let stop_loss = sl_ref.resolve(shell, pip_size);
+        let stop_loss = sl_ref.resolve(shell, pip_size)?;
 
         // Only stop entries carry a recovery; market / limit leave it
         // `None`. Resolved here (pips → price units) so the worker never
@@ -259,6 +273,7 @@ impl Resolved {
             EntrySpec::Stop {
                 from,
                 offset_pips,
+                offset_atr_pct,
                 at,
                 recover_entry: rec,
             } => {
@@ -266,7 +281,16 @@ impl Resolved {
                 // shell-anchored geometry, exactly like `PriceRef::Absolute`.
                 let trigger = match at {
                     Some(absolute) => *absolute,
-                    None => shell.anchor_price(*from) + offset_pips * pip_size,
+                    None => {
+                        shell.anchor_price(*from)
+                            + super::resolve_offset(
+                                *from,
+                                *offset_pips,
+                                *offset_atr_pct,
+                                shell,
+                                pip_size,
+                            )?
+                    }
                 };
                 // A stop must sit on the *far* side of current price for its
                 // direction: long stops above close, short stops below. When
@@ -351,11 +375,21 @@ impl Resolved {
             EntrySpec::Limit {
                 from,
                 offset_pips,
+                offset_atr_pct,
                 at,
             } => {
                 let trigger = match at {
                     Some(absolute) => *absolute,
-                    None => shell.anchor_price(*from) + offset_pips * pip_size,
+                    None => {
+                        shell.anchor_price(*from)
+                            + super::resolve_offset(
+                                *from,
+                                *offset_pips,
+                                *offset_atr_pct,
+                                shell,
+                                pip_size,
+                            )?
+                    }
                 };
                 // Limit sits on the *near* side of current price for the direction:
                 // long limits below close, short limits above. If it's the wrong
@@ -390,7 +424,7 @@ impl Resolved {
             direction,
             reference_price,
             stop_loss,
-        );
+        )?;
 
         Self::finish_with_sizing(
             intent,
@@ -627,16 +661,16 @@ fn resolve_tp(
     direction: Direction,
     entry: f64,
     stop_loss: f64,
-) -> f64 {
+) -> Result<f64, ResolveError> {
     match spec {
-        TakeProfit::Anchored(price_ref) => price_ref.resolve(shell, pip_size),
+        TakeProfit::Anchored(price_ref) => Ok(price_ref.resolve(shell, pip_size)?),
         TakeProfit::RMultiple { from: _, offset_r } => {
             // R is the stop-loss distance in price units, always positive.
             let r = (entry - stop_loss).abs();
-            match direction {
+            Ok(match direction {
                 Direction::Long => entry + offset_r * r,
                 Direction::Short => entry - offset_r * r,
-            }
+            })
         }
     }
 }
@@ -685,6 +719,7 @@ mod tests {
             stop_loss: Some(PriceRef::Anchored {
                 from: PriceAnchor::Low,
                 offset_pips: -2.0,
+                offset_atr_pct: None,
             }),
             take_profit: Some(TakeProfit::RMultiple {
                 from: PriceAnchor::Close,
@@ -745,10 +780,12 @@ mod tests {
         intent.stop_loss = Some(PriceRef::Anchored {
             from: PriceAnchor::High,
             offset_pips: 2.0,
+            offset_atr_pct: None,
         });
         intent.take_profit = Some(TakeProfit::Anchored(PriceRef::Anchored {
             from: PriceAnchor::Low,
             offset_pips: -10.0,
+            offset_atr_pct: None,
         }));
         let r = Resolved::from_intent(&intent, &shell(), 0.0001).unwrap();
         // SL = 1.1020 + 2*0.0001 = 1.1022
@@ -763,6 +800,7 @@ mod tests {
         intent.entry = Some(EntrySpec::Stop {
             from: PriceAnchor::High,
             offset_pips: 2.0,
+            offset_atr_pct: None,
             at: None,
             recover_entry: None,
         });
@@ -789,6 +827,7 @@ mod tests {
             // `from`/`offset_pips` are inert when `at` is set.
             from: PriceAnchor::High,
             offset_pips: 2.0,
+            offset_atr_pct: None,
             at: Some(1.1000),
             recover_entry: None,
         });
@@ -815,6 +854,7 @@ mod tests {
         intent.entry = Some(EntrySpec::Limit {
             from: PriceAnchor::Low,
             offset_pips: 5.0,
+            offset_atr_pct: None,
             at: Some(1.1000),
         });
         intent.stop_loss = Some(PriceRef::Absolute { absolute: 1.0900 });
@@ -856,12 +896,14 @@ mod tests {
         intent.entry = Some(EntrySpec::Stop {
             from: PriceAnchor::SignalLow,
             offset_pips: 1.0,
+            offset_atr_pct: None,
             at: None,
             recover_entry: None,
         });
         intent.stop_loss = Some(PriceRef::Anchored {
             from: PriceAnchor::SignalHigh,
             offset_pips: 1.0,
+            offset_atr_pct: None,
         });
         intent.take_profit = Some(TakeProfit::Anchored(PriceRef::Absolute {
             absolute: 171.07402,
@@ -906,6 +948,7 @@ mod tests {
         intent.entry = Some(EntrySpec::Stop {
             from: PriceAnchor::High,
             offset_pips: 2.0,
+            offset_atr_pct: None,
             at: None,
             recover_entry: Some(RecoverEntry {
                 action: RecoverEntryAction::Market,
@@ -934,6 +977,7 @@ mod tests {
         intent.entry = Some(EntrySpec::Stop {
             from: PriceAnchor::High,
             offset_pips: 2.0,
+            offset_atr_pct: None,
             at: None,
             recover_entry: Some(RecoverEntry {
                 action: RecoverEntryAction::Skip,
@@ -961,16 +1005,19 @@ mod tests {
         intent.entry = Some(EntrySpec::Stop {
             from: PriceAnchor::Close,
             offset_pips: 10.0,
+            offset_atr_pct: None,
             at: None,
             recover_entry: rec,
         });
         intent.stop_loss = Some(PriceRef::Anchored {
             from: PriceAnchor::Close,
             offset_pips: 40.0, // SL = 1.1040, above the trigger
+            offset_atr_pct: None,
         });
         intent.take_profit = Some(TakeProfit::Anchored(PriceRef::Anchored {
             from: PriceAnchor::Close,
             offset_pips: -90.0, // TP = 1.0910, well below
+            offset_atr_pct: None,
         }));
         intent
     }
@@ -1057,10 +1104,12 @@ mod tests {
         intent.stop_loss = Some(PriceRef::Anchored {
             from: PriceAnchor::Close,
             offset_pips: 50.0, // SL 1.1050, risk = 50 pips from entry
+            offset_atr_pct: None,
         });
         intent.take_profit = Some(TakeProfit::Anchored(PriceRef::Anchored {
             from: PriceAnchor::Close,
             offset_pips: -20.0, // TP 1.0980, reward = 20 pips → R = 0.4
+            offset_atr_pct: None,
         }));
         let r = Resolved::from_intent(&intent, &shell(), 0.0001);
         assert!(
@@ -1080,6 +1129,7 @@ mod tests {
         intent.take_profit = Some(TakeProfit::Anchored(PriceRef::Anchored {
             from: PriceAnchor::Close,
             offset_pips: 10.0, // TP 1.1010 — above the 1.1000 close
+            offset_atr_pct: None,
         }));
         let r = Resolved::from_intent(&intent, &shell(), 0.0001);
         assert!(
@@ -1102,6 +1152,7 @@ mod tests {
         intent.entry = Some(EntrySpec::Stop {
             from: PriceAnchor::Close,
             offset_pips: 3.9,
+            offset_atr_pct: None,
             at: None,
             recover_entry: Some(RecoverEntry {
                 action: RecoverEntryAction::Limit,
@@ -1111,10 +1162,12 @@ mod tests {
         intent.stop_loss = Some(PriceRef::Anchored {
             from: PriceAnchor::Close,
             offset_pips: 26.7, // SL = 6302.3 + 26.7 = 6329.0
+            offset_atr_pct: None,
         });
         intent.take_profit = Some(TakeProfit::Anchored(PriceRef::Anchored {
             from: PriceAnchor::Close,
             offset_pips: -91.65, // TP = 6302.3 - 91.65 = 6210.65
+            offset_atr_pct: None,
         }));
         let euro_shell = Shell {
             close: 6302.3,
@@ -1143,6 +1196,7 @@ mod tests {
         intent.entry = Some(EntrySpec::Limit {
             from: PriceAnchor::Low,
             offset_pips: 5.0,
+            offset_atr_pct: None,
             at: None,
         });
         let r = Resolved::from_intent(&intent, &shell(), 0.0001).unwrap();
@@ -1162,6 +1216,7 @@ mod tests {
         intent.entry = Some(EntrySpec::Limit {
             from: PriceAnchor::High,
             offset_pips: -10.0,
+            offset_atr_pct: None,
             at: None,
         });
         assert!(matches!(
@@ -1177,11 +1232,13 @@ mod tests {
         intent.stop_loss = Some(PriceRef::Anchored {
             from: PriceAnchor::High,
             offset_pips: 10.0,
+            offset_atr_pct: None,
         });
         // Short limit at 1.1015 — above the 1.1000 close.
         intent.entry = Some(EntrySpec::Limit {
             from: PriceAnchor::High,
             offset_pips: -5.0,
+            offset_atr_pct: None,
             at: None,
         });
         let r = Resolved::from_intent(&intent, &shell(), 0.0001).unwrap();
@@ -1201,6 +1258,7 @@ mod tests {
         intent.entry = Some(EntrySpec::Stop {
             from: PriceAnchor::Low,
             offset_pips: 10.0,
+            offset_atr_pct: None,
             at: None,
             recover_entry: None,
         });
@@ -1216,6 +1274,7 @@ mod tests {
         intent.stop_loss = Some(PriceRef::Anchored {
             from: PriceAnchor::High,
             offset_pips: 2.0,
+            offset_atr_pct: None,
         });
         assert!(matches!(
             Resolved::from_intent(&intent, &shell(), 0.0001),
@@ -1438,6 +1497,7 @@ mod tests {
         intent.take_profit = Some(TakeProfit::Anchored(PriceRef::Anchored {
             from: PriceAnchor::Close,
             offset_pips: 1.0,
+            offset_atr_pct: None,
         }));
         match Resolved::from_intent(&intent, &shell(), 0.0001) {
             Err(ResolveError::BelowMinR { actual, min }) => {
@@ -1506,11 +1566,13 @@ mod tests {
         intent.stop_loss = Some(PriceRef::Anchored {
             from: PriceAnchor::High,
             offset_pips: 10.0,
+            offset_atr_pct: None,
         });
         // Anchored TP 1 pip below entry — way under 1R for a 30-pip SL.
         intent.take_profit = Some(TakeProfit::Anchored(PriceRef::Anchored {
             from: PriceAnchor::Close,
             offset_pips: -1.0,
+            offset_atr_pct: None,
         }));
         assert!(matches!(
             Resolved::from_intent(&intent, &shell(), 0.0001),
@@ -2038,5 +2100,156 @@ min_r: !script "if direction == \"long\" { 1.5 } else { 1.0 }"
 "#;
         let intent: Intent = serde_yaml::from_str(yaml).unwrap();
         assert!(matches!(intent.min_r, Some(Tunable::Script(_))));
+    }
+
+    // ---- ATR-based offset buffer (offset_atr_pct) ------------------------
+
+    use crate::intent::OffsetError;
+
+    /// A short H&S-style stop-entry: entry below the pattern at `signal_low`,
+    /// SL above at `signal_high`, both buffered by `pct`% of ATR. The shell
+    /// carries the latched pattern extremes + ATR.
+    fn atr_short_intent(pct: f64) -> Intent {
+        let mut intent = long_market_intent();
+        intent.direction = Some(Direction::Short);
+        intent.entry = Some(EntrySpec::Stop {
+            from: PriceAnchor::SignalLow,
+            offset_pips: 0.0,
+            offset_atr_pct: Some(pct),
+            at: None,
+            recover_entry: None,
+        });
+        intent.stop_loss = Some(PriceRef::Anchored {
+            from: PriceAnchor::SignalHigh,
+            offset_pips: 0.0,
+            offset_atr_pct: Some(pct),
+        });
+        intent.take_profit = Some(TakeProfit::Anchored(PriceRef::Absolute {
+            absolute: 1.0700,
+        }));
+        intent
+    }
+
+    /// A shell with the H&S pattern levels + a latched ATR. close sits between
+    /// the entry trigger and SL so the short geometry is in-range.
+    fn atr_short_shell(atr: f64) -> Shell {
+        let mut s = shell();
+        s.close = 1.0950; // between trigger (below signal_low) and SL (above signal_high)
+        s.signal_high = Some(1.1000);
+        s.signal_low = Some(1.0900);
+        s.atr = Some(atr);
+        s
+    }
+
+    #[test]
+    fn atr_pct_buffer_pushes_levels_away_from_candle() {
+        // atr = 0.0040, pct = 0.5 → buffer = 0.5/100 * 0.0040 = 0.00002.
+        // Entry anchor signal_low (1.0900) pushes DOWN: 1.0900 - 0.00002.
+        // SL anchor signal_high (1.1000) pushes UP:   1.1000 + 0.00002.
+        let r = Resolved::from_intent(&atr_short_intent(0.5), &atr_short_shell(0.0040), 0.0001)
+            .unwrap();
+        let buffer = 0.5 / 100.0 * 0.0040;
+        match r.entry {
+            ResolvedEntry::Stop { trigger_price } => {
+                assert!(
+                    (trigger_price - (1.0900 - buffer)).abs() < 1e-12,
+                    "{trigger_price}"
+                );
+            }
+            other => panic!("expected stop entry, got {other:?}"),
+        }
+        assert!(
+            (r.stop_loss - (1.1000 + buffer)).abs() < 1e-12,
+            "{}",
+            r.stop_loss
+        );
+    }
+
+    #[test]
+    fn atr_pct_scales_with_volatility() {
+        // Same pct, different ATR → proportionally wider buffer. A 4x ATR
+        // gives a 4x buffer (the whole point of the feature).
+        let tight = Resolved::from_intent(&atr_short_intent(0.5), &atr_short_shell(0.0010), 0.0001)
+            .unwrap();
+        let wide = Resolved::from_intent(&atr_short_intent(0.5), &atr_short_shell(0.0040), 0.0001)
+            .unwrap();
+        let tight_dist = (1.0900 - tight.entry.reference_price()).abs();
+        let wide_dist = (1.0900 - wide.entry.reference_price()).abs();
+        assert!(
+            (wide_dist / tight_dist - 4.0).abs() < 1e-9,
+            "{wide_dist} vs {tight_dist}"
+        );
+    }
+
+    #[test]
+    fn atr_pct_with_no_atr_rejects() {
+        // Warmup / short-feed: shell carries no ATR. Fail-closed.
+        let mut s = atr_short_shell(0.0040);
+        s.atr = None;
+        let r = Resolved::from_intent(&atr_short_intent(0.5), &s, 0.0001);
+        assert!(
+            matches!(r, Err(ResolveError::Offset(OffsetError::AtrUnavailable))),
+            "got {r:?}"
+        );
+    }
+
+    #[test]
+    fn atr_pct_and_offset_pips_both_set_rejects() {
+        let mut intent = atr_short_intent(0.5);
+        // Re-set the SL with BOTH offsets populated.
+        intent.stop_loss = Some(PriceRef::Anchored {
+            from: PriceAnchor::SignalHigh,
+            offset_pips: 1.0,
+            offset_atr_pct: Some(0.5),
+        });
+        let r = Resolved::from_intent(&intent, &atr_short_shell(0.0040), 0.0001);
+        assert!(
+            matches!(r, Err(ResolveError::Offset(OffsetError::BothOffsetsSet))),
+            "got {r:?}"
+        );
+    }
+
+    #[test]
+    fn atr_pct_on_close_anchor_rejects() {
+        let mut intent = atr_short_intent(0.5);
+        intent.stop_loss = Some(PriceRef::Anchored {
+            from: PriceAnchor::Close, // directionless
+            offset_pips: 0.0,
+            offset_atr_pct: Some(0.5),
+        });
+        let r = Resolved::from_intent(&intent, &atr_short_shell(0.0040), 0.0001);
+        assert!(
+            matches!(
+                r,
+                Err(ResolveError::Offset(OffsetError::AtrPctOnCloseAnchor))
+            ),
+            "got {r:?}"
+        );
+    }
+
+    #[test]
+    fn negative_atr_pct_rejects() {
+        let r = Resolved::from_intent(&atr_short_intent(-0.5), &atr_short_shell(0.0040), 0.0001);
+        assert!(
+            matches!(r, Err(ResolveError::Offset(OffsetError::NegativeAtrPct(_)))),
+            "got {r:?}"
+        );
+    }
+
+    #[test]
+    fn offset_pips_path_unchanged_when_no_atr_pct() {
+        // The deprecated offset_pips path still resolves exactly as before
+        // when offset_atr_pct is absent — even if the shell carries an ATR.
+        let mut intent = long_market_intent();
+        intent.stop_loss = Some(PriceRef::Anchored {
+            from: PriceAnchor::Low,
+            offset_pips: -2.0,
+            offset_atr_pct: None,
+        });
+        let mut s = shell();
+        s.atr = Some(0.0040); // present but must be ignored on the pips path
+        let r = Resolved::from_intent(&intent, &s, 0.0001).unwrap();
+        // 1.0980 - 2*0.0001 = 1.0978, unchanged.
+        assert!((r.stop_loss - 1.0978).abs() < 1e-9, "{}", r.stop_loss);
     }
 }

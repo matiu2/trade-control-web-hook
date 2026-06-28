@@ -150,7 +150,7 @@ Basename ordering matters — `tv-arm` maps drawings to alerts by prefix.
 | `03-prep-break-and-close` | `prep` | Trendline crossing (neckline break) | Skippable for stocks / late entries with `--skip-break-and-close`. |
 | `04-prep-retest` | `prep` | Trendline crossing (retest from below) | Skippable with `--skip-retest`. |
 | `05-enter` | `enter` | Pine `Candle Signals` golden candle | The actual trade. Gated on the preps above + opposing-direction veto absent. |
-| `09-enter-qm` | `enter` | Pine `Candle Signals` (same detector as `05-enter`) | **`tv-arm --strategy-v2` only.** The Quasimodo entry, armed alongside `05-enter`: no preps, confirmed-candle gated. Its entry spec is **identical to standalone `--quasimodo`** — a stop at signal_low − 1 pip with a `recover_entry: limit` fallback (fills on the pullback when the level was overrun), *not* a bare limit. Shares the trade's `trade_id` + `max_retries` with `05-enter`; first of the two to fire cancels the other's resting order (worker retry gate). See "Dual entry — `--strategy-v2`" below. |
+| `09-enter-qm` | `enter` | Pine `Candle Signals` (same detector as `05-enter`) | **`tv-arm --strategy-v2` only.** The Quasimodo entry, armed alongside `05-enter`: no preps, confirmed-candle gated. Its entry spec is **identical to standalone `--quasimodo`** — a stop at signal_low − the ATR buffer (`offset_atr_pct: 0.5`; see "ATR buffer") with a `recover_entry: limit` fallback (fills on the pullback when the level was overrun), *not* a bare limit. Shares the trade's `trade_id` + `max_retries` with `05-enter`; first of the two to fire cancels the other's resting order (worker retry gate). See "Dual entry — `--strategy-v2`" below. |
 | `06-close-on-reversal` | `close` | Pine `Candle Signals` opposing reversal | Emitted when news-pairs and/or `support`/`resistance` lines are drawn. Carries `inside_window: [news?, price?]` (OR-composed) and, when `price` is listed, `sr_bands: [[lo, hi], ...]`. Defaults `needs_golden: true` for the candle-quality gate. With `tv-arm --veto-on-reversal` (experimental) it also carries `veto_on_reversal: true`, so a reversal off a band before entry vetoes the upcoming trade — see the `close` action notes above. |
 | `08-prep-expire-<step>` | `prep-expire` | Vertical line crossing chart time | Emitted once per chart-drawn `<prep>-expiry` line (`break-and-close-expiry`, `retest-expiry`). When crossed, blocks any further `<step>` prep on the trade — so a setup whose prep lands too late never enters. Drawing-bound. `<step>` is the canonical prep name and may contain hyphens. |
 
@@ -391,10 +391,13 @@ not_after:  "2026-05-14T02:00:00Z"    # hard expiry, required
 action: enter                          # enter | close | invalidate
 instrument: EUR_USD
 direction: long                        # long | short
-entry: { type: market }                # or { type: stop, from: high, offset_pips: 2 }
-                                       # or { type: limit, from: low,  offset_pips: 5 }
+entry: { type: stop, from: signal_high, offset_atr_pct: 0.5 }
+                                       # or { type: market }
+                                       # or { type: limit, from: low, offset_atr_pct: 0.5 }
+                                       # offset_atr_pct = % of ATR (preferred, volatility-scaled);
+                                       # offset_pips still works (deprecated). See "ATR buffer" below.
                                        # stop entries may add recover_entry: see below
-stop_loss:   { from: low,  offset_pips: -2 }    # anchored — or { absolute: 1.86236 }
+stop_loss:   { from: signal_low, offset_atr_pct: 0.5 }   # anchored — or { absolute: 1.86236 }
 take_profit: { from: close, offset_r: 2.0 }    # 2R — or { absolute: 1.86899 }
                                        #         or { from: high, offset_pips: 50 }
 risk_pct: 0.5                          # % of NAV; capped server-side
@@ -430,6 +433,33 @@ breakeven: { threshold: 0.5 }          # optional. Move the SL to break-even
 `take_profit` can also be `{ from: high, offset_pips: 50 }` for a fixed
 anchored TP. `offset_pips` is in instrument pip units, scaled by the
 instrument's pip size to a price.
+
+**ATR-based buffer (`offset_atr_pct`) — preferred over `offset_pips`.**
+Every anchored offset (entry trigger, `stop_loss`, anchored `take_profit`)
+accepts `offset_atr_pct` instead of `offset_pips`. The buffer then resolves
+**at fill time** as `(offset_atr_pct / 100) × ATR`, where ATR is the Wilder
+ATR the signal detector already latches for the firing bar (per-timeframe
+length — 24 on H1, 96 on M15, …). So a quiet pair gets a tight buffer and a
+noisy instrument (Wheat, an index) gets a proportionally wider one from the
+*same* setting — no per-instrument hand-tuning. New H&S / iH&S enters armed
+through `tv-arm` / `build-trade` default to **`offset_atr_pct: 0.5`** (0.5% of
+ATR) on both entry and SL, replacing the old hardcoded ±1 pip.
+
+- `offset_atr_pct` is an **unsigned magnitude** — the direction comes from the
+  anchor (`*high` anchors push the level up, `*low` anchors push it down, away
+  from the candle). (Contrast `offset_pips`, which carried its own sign.) A
+  `close` anchor has no "away" side, so `offset_atr_pct` on `close` is rejected.
+- `offset_pips` and `offset_atr_pct` are **mutually exclusive** on one offset;
+  setting both is rejected at parse time and at resolve.
+- **Fail-closed on warmup.** If an `offset_atr_pct` offset resolves on a bar
+  with no ATR yet (the warmup region, fewer closed candles than the ATR length,
+  or a short broker feed), the enter is **declined this bar** rather than placed
+  with a zero buffer — the plan stays armed and the next bar (with a warm ATR)
+  retries. A golden enter can't validly fire in warmup anyway.
+- **`offset_pips` is deprecated** but still honoured for in-flight / hand-armed
+  plans and for an explicit pip buffer (set it to opt back in). The same buffer
+  resolution lives in `trade_control_core`, so the live worker and the offline
+  replay resolve it identically.
 
 **Pip size precedence.** The worker resolves the pip size from, in order:
 
