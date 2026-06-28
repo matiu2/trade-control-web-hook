@@ -729,19 +729,25 @@ fn log_rejected_entry_spec(
         Some(EntrySpec::Stop {
             from,
             offset_pips,
+            offset_atr_pct,
             at,
             ..
         }) => (
             "stop",
-            Some(at.unwrap_or_else(|| shell.anchor_price(*from) + offset_pips * pip_size)),
+            Some(at.unwrap_or_else(|| {
+                log_anchor(*from, *offset_pips, *offset_atr_pct, shell, pip_size)
+            })),
         ),
         Some(EntrySpec::Limit {
             from,
             offset_pips,
+            offset_atr_pct,
             at,
         }) => (
             "limit",
-            Some(at.unwrap_or_else(|| shell.anchor_price(*from) + offset_pips * pip_size)),
+            Some(at.unwrap_or_else(|| {
+                log_anchor(*from, *offset_pips, *offset_atr_pct, shell, pip_size)
+            })),
         ),
         None => ("none", None),
     };
@@ -749,13 +755,13 @@ fn log_rejected_entry_spec(
     let stop_loss = intent
         .stop_loss
         .as_ref()
-        .map(|sl| sl.resolve(shell, pip_size));
+        .map(|sl| sl.resolve(shell, pip_size).unwrap_or(f64::NAN));
 
     // Take-profit — RMultiple needs the entry+SL to resolve, so only report the
     // simple absolute / anchored case precisely; RMultiple is logged as a label.
     let take_profit = match &intent.take_profit {
         Some(TakeProfit::Anchored(PriceRef::Absolute { absolute })) => Some(*absolute),
-        Some(TakeProfit::Anchored(r)) => Some(r.resolve(shell, pip_size)),
+        Some(TakeProfit::Anchored(r)) => Some(r.resolve(shell, pip_size).unwrap_or(f64::NAN)),
         _ => None,
     };
 
@@ -775,6 +781,30 @@ fn log_rejected_entry_spec(
         recover_entry = ?entry_recover_entry(&intent.entry),
         "pine-enter: NOT dispatchable — resolve failed; resolved entry spec follows"
     );
+}
+
+/// Resolve `anchor + offset` for the rejection log, mirroring the resolver's
+/// own `anchor_price + resolve_offset` so the logged trigger reflects the real
+/// (ATR-pct or pips) buffer. When the offset can't resolve — which is often the
+/// very reason we're logging (ATR unavailable in warmup) — fall back to `NaN`
+/// so the log line still emits rather than the logger itself failing.
+fn log_anchor(
+    from: trade_control_core::intent::PriceAnchor,
+    offset_pips: f64,
+    offset_atr_pct: Option<f64>,
+    shell: &trade_control_core::intent::Shell,
+    pip_size: f64,
+) -> f64 {
+    match trade_control_core::intent::resolve_offset(
+        from,
+        offset_pips,
+        offset_atr_pct,
+        shell,
+        pip_size,
+    ) {
+        Ok(delta) => shell.anchor_price(from) + delta,
+        Err(_) => f64::NAN,
+    }
 }
 
 /// Short label for the entry's `recover_entry` opt-in (for the rejection log).
@@ -1213,12 +1243,14 @@ mod tests {
         intent.entry = Some(EntrySpec::Stop {
             from: PriceAnchor::SignalLow,
             offset_pips: 1.0,
+            offset_atr_pct: None,
             at: None,
             recover_entry: None,
         });
         intent.stop_loss = Some(PriceRef::Anchored {
             from: PriceAnchor::SignalHigh,
             offset_pips: 1.0,
+            offset_atr_pct: None,
         });
         // Absolute TP below the entry for a short, ≥ 1R from the ~0.20 SL
         // distance (entry ≈ 1.10, SL ≈ 1.30): 0.90 gives R ≈ 1.0.

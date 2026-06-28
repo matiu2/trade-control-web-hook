@@ -1869,6 +1869,9 @@ fn build_enter_alert(
         EntryMode::Stop => EntrySpec::Stop {
             from: geometry.entry_anchor,
             offset_pips: entry_offset_pips,
+            // Commit 3 wires the ATR-pct default here; Commit 1 keeps the pips
+            // path byte-identical (None = use offset_pips).
+            offset_atr_pct: None,
             // Pattern entries resolve against the live shell, not an
             // absolute level — `at` is for the position-tool path only.
             at: None,
@@ -1894,6 +1897,7 @@ fn build_enter_alert(
         EntryMode::Limit => EntrySpec::Limit {
             from: geometry.entry_anchor,
             offset_pips: 0.0,
+            offset_atr_pct: None,
             at: None,
         },
     });
@@ -1906,6 +1910,7 @@ fn build_enter_alert(
         None => PriceRef::Anchored {
             from: geometry.sl_anchor,
             offset_pips: sl_offset_pips,
+            offset_atr_pct: None,
         },
     });
     // TP is an absolute price the operator typed in — the worker uses
@@ -2041,12 +2046,14 @@ pub fn build_position_enter(
         PositionEntryKind::Stop => EntrySpec::Stop {
             from: PriceAnchor::Close,
             offset_pips: 0.0,
+            offset_atr_pct: None,
             at: Some(spec.entry_price),
             recover_entry: None,
         },
         PositionEntryKind::Limit => EntrySpec::Limit {
             from: PriceAnchor::Close,
             offset_pips: 0.0,
+            offset_atr_pct: None,
             at: Some(spec.entry_price),
         },
     };
@@ -2443,7 +2450,11 @@ mod tests {
         // SL: signal_high + 1 pip — 1 pip *above* the pattern high, not the
         // triggering candle's own high.
         match &alert.intent.stop_loss {
-            Some(PriceRef::Anchored { from, offset_pips }) => {
+            Some(PriceRef::Anchored {
+                from,
+                offset_pips,
+                offset_atr_pct: _,
+            }) => {
                 assert_eq!(*from, PriceAnchor::SignalHigh);
                 assert!((offset_pips - 1.0).abs() < 1e-9);
             }
@@ -2524,6 +2535,7 @@ mod tests {
             Some(EntrySpec::Stop {
                 from,
                 offset_pips,
+                offset_atr_pct: _,
                 at,
                 recover_entry,
             }) => {
@@ -2659,7 +2671,11 @@ mod tests {
         }
         // SL: signal_low − 1 pip — 1 pip *below* the pattern low.
         match &alert.intent.stop_loss {
-            Some(PriceRef::Anchored { from, offset_pips }) => {
+            Some(PriceRef::Anchored {
+                from,
+                offset_pips,
+                offset_atr_pct: _,
+            }) => {
                 assert_eq!(*from, PriceAnchor::SignalLow);
                 assert!((offset_pips - (-1.0)).abs() < 1e-9);
             }
@@ -2886,6 +2902,7 @@ mod tests {
             Some(EntrySpec::Stop {
                 from,
                 offset_pips,
+                offset_atr_pct: _,
                 at,
                 recover_entry,
             }) => {

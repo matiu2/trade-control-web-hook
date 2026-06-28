@@ -344,6 +344,7 @@ mod tests {
         i.entry = Some(EntrySpec::Stop {
             from: PriceAnchor::Close,
             offset_pips: 0.0,
+            offset_atr_pct: None,
             at: None,
             recover_entry: None,
         });
@@ -445,6 +446,7 @@ mod tests {
         intent.entry = Some(EntrySpec::Stop {
             from: PriceAnchor::Close,
             offset_pips: 10.0,
+            offset_atr_pct: None,
             at: None,
             recover_entry: None,
         });
@@ -517,6 +519,7 @@ mod tests {
         intent.entry = Some(EntrySpec::Stop {
             from: PriceAnchor::Close,
             offset_pips: 10.0, // trigger 1.1050
+            offset_atr_pct: None,
             at: None,
             recover_entry: None,
         });
@@ -567,6 +570,7 @@ mod tests {
         intent.entry = Some(EntrySpec::Stop {
             from: PriceAnchor::Close,
             offset_pips: 10.0,
+            offset_atr_pct: None,
             at: None,
             recover_entry: None,
         });
@@ -597,6 +601,7 @@ mod tests {
         i.entry = Some(EntrySpec::Stop {
             from: PriceAnchor::Close,
             offset_pips: 0.0,
+            offset_atr_pct: None,
             at: Some(1.1000),
             recover_entry: None,
         });
@@ -674,6 +679,7 @@ mod tests {
         intent.entry = Some(EntrySpec::Stop {
             from: PriceAnchor::Close,
             offset_pips: 10.0, // trigger 1.1050
+            offset_atr_pct: None,
             at: None,
             recover_entry: None,
         });
@@ -721,6 +727,7 @@ mod tests {
         intent.entry = Some(EntrySpec::Stop {
             from: PriceAnchor::Close,
             offset_pips: 10.0, // trigger 1.1050; SL 1.1000, TP 1.1150
+            offset_atr_pct: None,
             at: None,
             recover_entry: None,
         });
@@ -769,6 +776,7 @@ mod tests {
         intent.entry = Some(EntrySpec::Stop {
             from: PriceAnchor::Close,
             offset_pips: 10.0, // trigger 1.1050
+            offset_atr_pct: None,
             at: None,
             recover_entry: None,
         });

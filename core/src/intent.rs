@@ -18,6 +18,9 @@ pub use blackout::{
     windows_from_session,
 };
 pub use entry_level_veto::{EntryLevelVeto, VetoSide};
+// `OffsetError` / `resolve_offset` are defined in this file (below) but
+// re-stated here in the doc-facing surface; no re-export needed since they're
+// already `pub` at module root.
 pub use expiry::{ExpiryError, MAX_EXPIRY_BARS, resolve_cancel_at};
 pub use mw_resolution::mw_static_prices;
 pub use mw_state::{MwAnchors, MwUpdate, effective_mw_params, plan_mw_update};
@@ -1529,6 +1532,31 @@ pub enum PriceAnchor {
     SignalLow,
 }
 
+impl PriceAnchor {
+    /// The sign an **unsigned** ATR-buffer magnitude takes when applied to this
+    /// anchor, so the level is always pushed *away* from the candle (never into
+    /// it): `+1.0` for the `*High` anchors (push up, above the high), `-1.0` for
+    /// the `*Low` anchors (push down, below the low).
+    ///
+    /// `Close` is directionless — there's no "away" from a midpoint — so it
+    /// returns `None`. Resolution rejects an `offset_atr_pct` paired with a
+    /// `Close` anchor for that reason (the legacy signed `offset_pips` carried
+    /// its own direction, so it had no such restriction).
+    ///
+    /// This replaces `offset_pips`' sign-in-the-value quirk: with `offset_pips`
+    /// the operator had to write `-1.0` on a low anchor and `+1.0` on a high
+    /// anchor by hand (and a flat sign was a real bug — see the geometry table
+    /// in `cli/src/trade_patterns.rs`). Deriving the sign from the anchor here
+    /// makes that class of mistake unrepresentable.
+    pub fn buffer_sign(self) -> Option<f64> {
+        match self {
+            PriceAnchor::High | PriceAnchor::RecentHigh | PriceAnchor::SignalHigh => Some(1.0),
+            PriceAnchor::Low | PriceAnchor::RecentLow | PriceAnchor::SignalLow => Some(-1.0),
+            PriceAnchor::Close => None,
+        }
+    }
+}
+
 /// Reference to a price. Either anchored to the plaintext shell with a pip
 /// offset (TradingView fills in the anchor at fire time) or a fixed absolute
 /// price set at encode time (the worker uses it verbatim, ignoring the shell).
@@ -1537,14 +1565,28 @@ pub enum PriceAnchor {
 pub enum PriceRef {
     /// `{ absolute: 1.86236 }` — fixed price; shell ignored.
     Absolute { absolute: f64 },
-    /// `{ from: low, offset_pips: -2 }` — anchor + signed pip offset.
+    /// `{ from: signal_high, offset_atr_pct: 0.5 }` — anchor + an offset that
+    /// is either a fraction of ATR (preferred) or a signed pip count (legacy).
     Anchored {
         from: PriceAnchor,
-        /// Offset in pips. Sign matters: -2 means "low - 2 pips" regardless
-        /// of direction. The "pip" here is the instrument's pip size; the
-        /// caller supplies that.
+        /// **Deprecated** — prefer `offset_atr_pct`. Offset in pips. Sign
+        /// matters: -2 means "low - 2 pips" regardless of direction. The
+        /// "pip" here is the instrument's pip size; the caller supplies that.
+        /// Still honoured for in-flight / hand-written plans; mutually
+        /// exclusive with `offset_atr_pct` (both-set is rejected at resolve).
         #[serde(default)]
         offset_pips: f64,
+        /// Buffer as a **percent of ATR** (e.g. `0.5` = 0.5% of the latched
+        /// ATR), resolved at fill time against `shell.atr`. **Unsigned
+        /// magnitude** — the direction is taken from `from` (`*High` pushes up,
+        /// `*Low` pushes down, away from the candle), so a `Close` anchor is
+        /// rejected. Volatility-scaled: a noisy instrument gets a proportionally
+        /// wider buffer than a quiet one from the same percent. When `shell.atr`
+        /// is absent (ATR warmup / short feed) resolution rejects the entry
+        /// (`ResolveError::AtrUnavailable`) rather than guessing. Absent =
+        /// fall back to `offset_pips` (byte-identical wire for old intents).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        offset_atr_pct: Option<f64>,
     },
 }
 
@@ -1579,13 +1621,22 @@ pub enum EntrySpec {
     /// Long stop sits *above* current price; short stop sits *below*.
     Stop {
         from: PriceAnchor,
+        /// **Deprecated** — prefer `offset_atr_pct`. Signed pip offset; still
+        /// honoured for old/hand-written plans. Mutually exclusive with
+        /// `offset_atr_pct`.
         #[serde(default)]
         offset_pips: f64,
+        /// Buffer as a percent of ATR (unsigned magnitude; direction from
+        /// `from`). See [`PriceRef::Anchored::offset_atr_pct`]. Mutually
+        /// exclusive with `offset_pips`; rejected on a `Close` anchor; rejects
+        /// the entry when `shell.atr` is absent.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        offset_atr_pct: Option<f64>,
         /// Absolute trigger price set at encode time. When `Some`, it
-        /// overrides `from`/`offset_pips` and the worker uses it verbatim
-        /// (the operator drew the exact level — e.g. a position tool's
-        /// entry anchor). When `None`, today's behaviour: trigger =
-        /// `anchor_price(from) + offset_pips × pip_size`. Signed.
+        /// overrides `from`/`offset_pips`/`offset_atr_pct` and the worker uses
+        /// it verbatim (the operator drew the exact level — e.g. a position
+        /// tool's entry anchor). When `None`, today's behaviour: trigger =
+        /// `anchor_price(from) + buffer`. Signed.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         at: Option<f64>,
         /// Optional recovery for when a stop entry can't be placed as a
@@ -1609,10 +1660,20 @@ pub enum EntrySpec {
     /// Long limit sits *below* current price; short limit sits *above*.
     Limit {
         from: PriceAnchor,
+        /// **Deprecated** — prefer `offset_atr_pct`. Signed pip offset; still
+        /// honoured for old/hand-written plans. Mutually exclusive with
+        /// `offset_atr_pct`.
         #[serde(default)]
         offset_pips: f64,
+        /// Buffer as a percent of ATR (unsigned magnitude; direction from
+        /// `from`). See [`PriceRef::Anchored::offset_atr_pct`]. Mutually
+        /// exclusive with `offset_pips`; rejected on a `Close` anchor; rejects
+        /// the entry when `shell.atr` is absent.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        offset_atr_pct: Option<f64>,
         /// Absolute trigger price set at encode time — same semantics as
-        /// [`EntrySpec::Stop::at`]. When `Some`, overrides `from`/`offset_pips`.
+        /// [`EntrySpec::Stop::at`]. When `Some`, overrides
+        /// `from`/`offset_pips`/`offset_atr_pct`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         at: Option<f64>,
     },
@@ -1777,13 +1838,102 @@ impl Shell {
     }
 }
 
-impl PriceRef {
-    pub fn resolve(&self, shell: &Shell, pip_size: f64) -> f64 {
+/// Why an anchored offset (entry / SL / TP) couldn't be turned into a price.
+/// All three are *config / availability* failures, not arithmetic ones — the
+/// resolver returns them so the caller declines the bar (engine: stay armed,
+/// retry next tick) rather than placing a trade with a wrong buffer. Surfaced
+/// up through [`ResolveError`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum OffsetError {
+    /// Both `offset_pips` and `offset_atr_pct` were set on the same ref. They
+    /// are mutually exclusive (one buffer, one unit) — pick one.
+    BothOffsetsSet,
+    /// `offset_atr_pct` was paired with a directionless `Close` anchor. The
+    /// ATR buffer takes its direction from the anchor (`*High` up / `*Low`
+    /// down), and `Close` has no "away" side, so the combination is rejected.
+    AtrPctOnCloseAnchor,
+    /// `offset_atr_pct` was negative. It's an unsigned magnitude — the
+    /// direction comes from the anchor — so a negative would push the level
+    /// *into* the candle, which is never intended.
+    NegativeAtrPct(f64),
+    /// `offset_atr_pct` was set but the shell carries no ATR. Happens only in
+    /// the ATR warmup region (fewer closed candles than `atr_length_for`) or on
+    /// a short / failed broker feed — where a golden enter can't validly fire
+    /// anyway. Reject this bar; the next tick recomputes ATR and retries.
+    AtrUnavailable,
+}
+
+impl core::fmt::Display for OffsetError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
-            PriceRef::Absolute { absolute } => *absolute,
-            PriceRef::Anchored { from, offset_pips } => {
-                shell.anchor_price(*from) + offset_pips * pip_size
+            Self::BothOffsetsSet => {
+                f.write_str("offset_pips and offset_atr_pct are mutually exclusive")
             }
+            Self::AtrPctOnCloseAnchor => {
+                f.write_str("offset_atr_pct needs a directional anchor, not `close`")
+            }
+            Self::NegativeAtrPct(v) => {
+                write!(f, "offset_atr_pct must be non-negative, got {v}")
+            }
+            Self::AtrUnavailable => {
+                f.write_str("offset_atr_pct set but ATR is unavailable (warmup / short feed)")
+            }
+        }
+    }
+}
+
+/// Resolve an anchored offset into a **signed price delta** to add to the
+/// anchor. Exactly one of the two offset forms is honoured:
+///
+/// - `offset_atr_pct: Some(p)` → buffer = `sign(from) × (p / 100) × shell.atr`,
+///   where `sign(from)` is [`PriceAnchor::buffer_sign`] (`*High` → +, `*Low` →
+///   −). Unsigned `p`; the anchor carries the direction. Errors if `from` is
+///   `Close` ([`OffsetError::AtrPctOnCloseAnchor`]), `p` is negative
+///   ([`OffsetError::NegativeAtrPct`]), or `shell.atr` is `None`
+///   ([`OffsetError::AtrUnavailable`]).
+/// - else `offset_pips` (the **deprecated** path) → `offset_pips × pip_size`,
+///   sign carried in the value, exactly as before.
+///
+/// Both set is [`OffsetError::BothOffsetsSet`]. Both absent → `0.0` (a bare
+/// anchor). Shared by [`PriceRef::resolve`] and the [`EntrySpec`] stop/limit
+/// arms so the two can't drift.
+pub fn resolve_offset(
+    from: PriceAnchor,
+    offset_pips: f64,
+    offset_atr_pct: Option<f64>,
+    shell: &Shell,
+    pip_size: f64,
+) -> Result<f64, OffsetError> {
+    match offset_atr_pct {
+        Some(pct) => {
+            if offset_pips != 0.0 {
+                return Err(OffsetError::BothOffsetsSet);
+            }
+            if pct < 0.0 {
+                return Err(OffsetError::NegativeAtrPct(pct));
+            }
+            let sign = from.buffer_sign().ok_or(OffsetError::AtrPctOnCloseAnchor)?;
+            let atr = shell.atr.ok_or(OffsetError::AtrUnavailable)?;
+            Ok(sign * (pct / 100.0) * atr)
+        }
+        None => Ok(offset_pips * pip_size),
+    }
+}
+
+impl PriceRef {
+    /// Resolve to a concrete price. `Absolute` ignores the shell; `Anchored`
+    /// resolves its offset via [`resolve_offset`] (ATR-pct preferred,
+    /// `offset_pips` legacy fallback) — fallible because the ATR path can
+    /// reject (see [`OffsetError`]).
+    pub fn resolve(&self, shell: &Shell, pip_size: f64) -> Result<f64, OffsetError> {
+        match self {
+            PriceRef::Absolute { absolute } => Ok(*absolute),
+            PriceRef::Anchored {
+                from,
+                offset_pips,
+                offset_atr_pct,
+            } => Ok(shell.anchor_price(*from)
+                + resolve_offset(*from, *offset_pips, *offset_atr_pct, shell, pip_size)?),
         }
     }
 }
@@ -1987,9 +2137,10 @@ mod tests {
         let sl = PriceRef::Anchored {
             from: PriceAnchor::Low,
             offset_pips: -2.0,
+            offset_atr_pct: None,
         };
         // 1.0980 + (-2 * 0.0001) = 1.0978
-        assert!((sl.resolve(&s, 0.0001) - 1.0978).abs() < 1e-9);
+        assert!((sl.resolve(&s, 0.0001).unwrap() - 1.0978).abs() < 1e-9);
     }
 
     #[test]
@@ -2193,6 +2344,7 @@ mod tests {
             Some(EntrySpec::Stop {
                 from,
                 offset_pips,
+                offset_atr_pct: _,
                 at,
                 recover_entry,
             }) => {
@@ -2213,6 +2365,7 @@ mod tests {
         let spec = EntrySpec::Stop {
             from: PriceAnchor::High,
             offset_pips: 1.0,
+            offset_atr_pct: None,
             at: None,
             recover_entry: None,
         };
@@ -2244,6 +2397,7 @@ mod tests {
         let spec = EntrySpec::Stop {
             from: PriceAnchor::High,
             offset_pips: 1.0,
+            offset_atr_pct: None,
             at: None,
             recover_entry: Some(RecoverEntry {
                 action: RecoverEntryAction::Market,
@@ -2325,6 +2479,7 @@ mod tests {
             Some(EntrySpec::Limit {
                 from,
                 offset_pips,
+                offset_atr_pct: _,
                 at,
             }) => {
                 assert_eq!(from, PriceAnchor::Low);
