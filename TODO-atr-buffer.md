@@ -90,10 +90,19 @@ Report: `the-trading-academy/books/demo-journal/FEATURE-atr-based-entry-sl-buffe
       to the worker (broke 9 tests; reverted). Pattern builders + worker carry
       the offset validation.
 
-### Commit 5 — docs
-- [ ] README: new `offset_atr_pct` field, deprecation of `offset_pips`,
-      new H&S default, fail-closed-on-warmup note.
-- [ ] CHANGELOG vNN. Tag + push + advance parent pointer.
+### Commit 5 — docs ✅ DONE
+- [x] README: `offset_atr_pct` in the enter-intent example + a dedicated
+      "ATR-based buffer" subsection (unsigned/direction-from-anchor, XOR with
+      pips, fail-closed-on-warmup, deprecation of `offset_pips`, new H&S
+      default). Updated the 09-enter-qm row.
+- [x] CHANGELOG v61 entry (Why/What/Behaviour/Breaking/Config/Tests/Follow-up).
+
+### Remaining (user-gated) — NOT done by me
+- [ ] Tag `v61` on the merge commit + push (the workflow tags at merge-to-main;
+      the user controls the merge of this feature branch).
+- [ ] Advance the parent `trading-libraries` submodule pointer after merge.
+- [ ] Deploy is DEFERRED — staging is mid-bake (v60 promotion gate); this is a
+      `main`/dev change. Do NOT redeploy staging.
 
 ## Hazards
 - Must land in BOTH replay + worker — both go through core
