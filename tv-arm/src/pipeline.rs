@@ -2292,6 +2292,85 @@ mod tests {
     }
 
     #[test]
+    fn skip_golden_clears_needs_golden_on_hs_spec() {
+        // BUG-replay-golden-gate-not-enforced (arm half): `--skip-golden`
+        // must flip `needs_golden` to false on the emitted H&S spec (which
+        // threads onto every enter intent — BCR stop, QM limit, v2 sibling).
+        // Default (no flag) keeps it on.
+        let default = build_trade_spec(
+            &mw_args(&[]),
+            "EUR_USD",
+            "ms-oanda-1",
+            Broker::Oanda,
+            Direction::Long,
+            now() + chrono::Duration::days(1),
+            1.05,
+            &Roles::default(),
+            0.0001,
+            Vec::new(),
+        );
+        assert!(
+            default.needs_golden,
+            "golden is on by default (every trade, always)"
+        );
+
+        let skipped = build_trade_spec(
+            &mw_args(&["--skip-golden"]),
+            "EUR_USD",
+            "ms-oanda-1",
+            Broker::Oanda,
+            Direction::Long,
+            now() + chrono::Duration::days(1),
+            1.05,
+            &Roles::default(),
+            0.0001,
+            Vec::new(),
+        );
+        assert!(
+            !skipped.needs_golden,
+            "--skip-golden must clear needs_golden on the spec"
+        );
+    }
+
+    #[test]
+    fn skip_golden_clears_needs_golden_on_mw_spec() {
+        // Same guard on the M/W spec builder — `--skip-golden` clears it,
+        // default keeps it on.
+        let anchors = || MwSpecAnchors {
+            runup_start: 1.0500,
+            first_point: 1.1000,
+            neckline: 1.0800,
+            right_shoulder: None,
+            spread_pips: 1.0,
+            pip_size: 0.0001,
+        };
+        let default = build_mw_trade_spec(
+            &mw_args(&[]),
+            "EUR_USD",
+            "ms-oanda-1",
+            Broker::Oanda,
+            cli::TradePattern::W,
+            now() + chrono::Duration::days(1),
+            anchors(),
+        );
+        assert!(default.needs_golden, "golden on by default for M/W too");
+
+        let skipped = build_mw_trade_spec(
+            &mw_args(&["--skip-golden"]),
+            "EUR_USD",
+            "ms-oanda-1",
+            Broker::Oanda,
+            cli::TradePattern::W,
+            now() + chrono::Duration::days(1),
+            anchors(),
+        );
+        assert!(
+            !skipped.needs_golden,
+            "--skip-golden must clear needs_golden on the M/W spec"
+        );
+    }
+
+    #[test]
     fn resolve_hs_pip_size_flag_overrides_catalog() {
         // --pip-size beats the catalog value on the H&S path too (the
         // override is applied in resolve_hs_trade before build_trade_spec).
