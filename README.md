@@ -1413,12 +1413,12 @@ line on the bar whose spread tripped the widen:
 It's computed by the pure `widened_stop_at` helper (engine), which consults the
 shared `trade_control_core::blackout_widen` math the live worker uses, so the
 widened level can't drift between worker and replay. It does **not** change
-`SimOutcome`. **Approximation:** the worker's exact spread-blackout *trigger*
-threshold (`baseline × 5`) lives in the worker-only spread-blackout baseline that
-the engine can't link, so the replay uses the System-2 widen floor
-(`WIDEN_FLOOR_PIPS`, 22 pips) as the detection proxy — a bar whose spread reaches
-the widen floor while the position is open. This becomes exact once the
-spread-blackout baseline moves to `core` (replay-parity audit item 1).
+`SimOutcome`. The detection trigger is **exact**: the replay uses the
+instrument's real spread-blackout threshold (`baseline × 5`) via
+`trade_control_core::spread_blackout::elevated_threshold_pips` — the same number
+the System-1 entry-reject uses — now that the baked baseline lives in shared
+`core` and the engine links it. (It was a flat `WIDEN_FLOOR_PIPS` proxy until
+replay-parity audit item 1 promoted the baseline to `core`.)
 
 **Blocked close (`close: BLOCKED` line).** A `06-close-on-reversal` carries the
 worker's `allow_close` gate (shared `trade_control_core::allow_close_gate`). When

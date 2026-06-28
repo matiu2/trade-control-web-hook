@@ -568,22 +568,16 @@ pub struct SpreadWiden {
 /// the **exit price** — without this, a replay would stop the position out at
 /// the original (tighter) level and diverge from the live worker.
 ///
-/// **Approximation (the threshold).** The worker's *trigger* for entering the
-/// spread-blackout window is `spread > baked-baseline × 5`, and that baked
-/// baseline lives in the worker-only `src/spread_blackout.rs` (build.rs
-/// constants), which the engine can't link. So the replay can't reconstruct the
-/// exact per-instrument threshold. Instead the caller passes a
-/// `widen_trigger_pips` floor and we treat the first post-fill bar whose
+/// **The trigger.** The caller passes `widen_trigger_pips` — the instrument's
+/// spread-blackout threshold (`baked-baseline × 5`) via
+/// [`trade_control_core::spread_blackout::elevated_threshold_pips`], the *same*
+/// number the System-1 entry-reject uses. Now that the baked baseline lives in
+/// shared `core` the engine links it directly, so this is the **exact**
+/// per-instrument threshold the live worker's `blackout_apply` widens against —
+/// no longer the flat `WIDEN_FLOOR_PIPS` proxy. The first post-fill bar whose
 /// **spread** (`ask_c − bid_c`, in pips) meets or exceeds it — *while the stop
-/// hasn't yet been hit* — as the widen bar. The default the replay supplies is
-/// [`trade_control_core::blackout_widen::WIDEN_FLOOR_PIPS`] (22), i.e. a spread
-/// already as wide as the empirical EUR/NZD blowout the widen exists for. This
-/// is a deliberate over-detect-safe approximation; see the
-/// `[[strategy_changes_in_both_replayer_and_worker]]` rule and the TODO below.
-///
-/// TODO(replay-parity-item-1): once `spread_blackout`'s baked baseline moves to
-/// `core` (audit item 1), pass the real `baseline × 5` per-instrument threshold
-/// here instead of the `WIDEN_FLOOR_PIPS` proxy, and the detection becomes exact.
+/// hasn't yet been hit* — is the widen bar. The amount it widens by is still
+/// floored/clamped 22–40 pips via [`trade_control_core::blackout_widen::clamp_widen`].
 ///
 /// Pure and side-effect-free. Returns `None` when the enter has no fill, exits
 /// before any qualifying spread bar, or no bar's spread reaches the trigger.

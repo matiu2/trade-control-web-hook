@@ -19,8 +19,8 @@
 //! is what flattens the broker position live.
 
 use chrono::{DateTime, Utc};
-use trade_control_core::blackout_widen::WIDEN_FLOOR_PIPS;
 use trade_control_core::intent::{Action, Direction, Resolved, ResolvedEntry, Shell};
+use trade_control_core::spread_blackout::elevated_threshold_pips;
 use trade_control_engine::{
     GateBlock, SimOutcome, SweepReason, TradePlan, breakeven_armed_at, entry_gate_block,
     simulate_fill, sweep_reason, widened_stop_at,
@@ -531,15 +531,14 @@ fn render_fire(
     // trigger moves the broker SL *away* from price (live cron
     // `blackout_apply`). A widened stop changes the exit price, so surface it —
     // otherwise a wider-than-bracket stop-out below looks wrong. The trigger is
-    // the `WIDEN_FLOOR_PIPS` proxy (the exact per-instrument threshold needs the
-    // worker-only spread-blackout baseline; see `widened_stop_at`'s TODO).
-    if let Some(widen) = widened_stop_at(
-        intent,
-        &shell,
-        plan.pip_size,
-        &fire.forward,
-        WIDEN_FLOOR_PIPS,
-    ) {
+    // the instrument's *real* spread-blackout threshold (`baseline × 5`), now
+    // that the baked baseline lives in shared `core` and the engine links it —
+    // the same `elevated_threshold_pips` the System-1 entry-reject uses, so the
+    // two stay exact and in lockstep with the live worker.
+    let widen_trigger = elevated_threshold_pips(&intent.instrument);
+    if let Some(widen) =
+        widened_stop_at(intent, &shell, plan.pip_size, &fire.forward, widen_trigger)
+    {
         line.push_str(&format!(
             "    exit: SL widened to {} (spread blackout System 2) @ {} (from {})\n",
             fmt_price(widen.widened_stop, plan.pip_size),
