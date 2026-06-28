@@ -207,8 +207,13 @@ struct PlanShowArgs {
     /// The plan's `trade_id` (e.g. `eurusd-hs-7`).
     trade_id: String,
     /// Print the worker's raw YAML response instead of the pretty view.
-    #[arg(long)]
+    #[arg(long, conflicts_with = "json")]
     yaml: bool,
+    /// Print the matched plan(s) as pretty JSON — the same data as `--yaml`
+    /// (each match's full `PlanDetail`: account, plan, state, archived_at),
+    /// just JSON-encoded. Handy for piping into `jq`.
+    #[arg(long, conflicts_with = "yaml")]
+    json: bool,
     #[command(flatten)]
     common: EndpointArgs,
 }
@@ -1234,6 +1239,10 @@ fn run_plan_show(args: PlanShowArgs) -> Result<()> {
         print_raw(&response);
         return Ok(());
     }
+    if args.json {
+        print!("{}", format_plan_show_json(&response)?);
+        return Ok(());
+    }
     print!("{}", format_plan_show(&args.trade_id, &response));
     Ok(())
 }
@@ -1403,6 +1412,24 @@ fn format_plan_show(trade_id: &str, response: &str) -> String {
             out
         }
     }
+}
+
+/// Render the `plan show` response as pretty JSON. The worker emits a YAML
+/// sequence of `PlanDetail` maps; we round-trip it through `serde_yaml::Value`
+/// into `serde_json` so the output carries the *same data* as `--yaml`, just
+/// JSON-encoded. Decoupled from the worker structs (like `format_plan_list`),
+/// so a new plan field needs no CLI change.
+///
+/// A 404 / error body is not a YAML sequence; `?` surfaces the parse error,
+/// but in practice `post_control` already turned a non-2xx into an `Err`
+/// before we get here, so this only runs on a real match.
+fn format_plan_show_json(response: &str) -> Result<String> {
+    let value: serde_yaml::Value =
+        serde_yaml::from_str(response).map_err(|e| eyre!("plan-show: parse worker YAML: {e}"))?;
+    let mut out = serde_json::to_string_pretty(&value)
+        .map_err(|e| eyre!("plan-show: serialise JSON: {e}"))?;
+    out.push('\n');
+    Ok(out)
 }
 
 fn run_market_info(args: MarketInfoCmdArgs) -> Result<()> {
@@ -2262,5 +2289,27 @@ reset_time: 10:00 PM
         );
         assert!(out.contains("trade_id: eurusd-hs-7"));
         assert!(out.contains("phase: await_entry"));
+    }
+
+    #[test]
+    fn plan_show_json_round_trips_yaml_to_json() {
+        let yaml = "\
+- account: reversals
+  plan:
+    trade_id: eurusd-hs-7
+    instrument: EUR_USD
+  state:
+    phase: await_entry
+";
+        let out = format_plan_show_json(yaml).expect("valid yaml");
+        // Parse the JSON back so we assert on structure, not formatting.
+        let v: serde_json::Value = serde_json::from_str(&out).expect("valid json");
+        let arr = v.as_array().expect("top-level array");
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["account"], "reversals");
+        assert_eq!(arr[0]["plan"]["trade_id"], "eurusd-hs-7");
+        assert_eq!(arr[0]["plan"]["instrument"], "EUR_USD");
+        assert_eq!(arr[0]["state"]["phase"], "await_entry");
+        assert!(out.ends_with('\n'));
     }
 }
