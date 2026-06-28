@@ -4,26 +4,34 @@
 //! `spread-sampler-cron` submodule and emits a generated Rust table of
 //! per-instrument spread statistics (in **pips**, keyed by TradeNation
 //! MarketName — the same `resolved.instrument` the worker's spread-blackout
-//! gate compares against). The gate (`src/spread_blackout.rs`) consults the
+//! gate compares against). The gate (`spread_blackout.rs`) consults the
 //! table to pick a per-instrument threshold instead of the flat 8-pip
 //! constant that mis-fired for non-FX instruments (Copper's *normal* spread
 //! is ~150 pips, so the flat 8 blocked every legitimate entry).
+//!
+//! This generation lives in **`core`** (not the worker crate) so the offline
+//! replay — which links `core` but not the worker `cdylib` — bakes the same
+//! table and applies the same spread-blackout reject as the live worker
+//! (`[[strategy_changes_in_both_replayer_and_worker]]`).
 //!
 //! Runs on the HOST, not wasm — host-native serde_yaml is fine here.
 //!
 //! Fail-soft by design: if the samples dir is missing (a fresh checkout
 //! that hasn't pulled the submodule) or a file is unparseable, we emit an
 //! empty table and the gate falls back to the flat constant for every
-//! instrument. A missing baseline must never break the worker build.
+//! instrument. A missing baseline must never break the build.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
-/// Where the committed samples live, relative to this crate root. The
-/// submodule sits beside the worker repo in the trading-libraries tree.
-const SAMPLES_DIR: &str = "../spread-sampler-cron/samples";
+/// Where the committed samples live, relative to this crate root. `core` sits
+/// one directory below the worker repo root, and the `spread-sampler-cron`
+/// submodule sits beside the repo in the trading-libraries tree — so from
+/// `core/` the samples are two levels up (`../../`), one more than the root
+/// `build.rs` (`../`).
+const SAMPLES_DIR: &str = "../../spread-sampler-cron/samples";
 
 /// One sampled quote — mirrors `spread_sampler_cron::sample::Sample`, but
 /// we only deserialise the fields the baseline needs. `spread_pips` is

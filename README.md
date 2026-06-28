@@ -1424,6 +1424,24 @@ wall-clock and vanish (the same wall-clock-vs-cursor trap as the tv-arm prune).
 Without a blackout (or with `--skip-calendar-bars`) the same enter fills — that
 with/without pair is the A/B the journal needs to price what the news rule cost.
 
+**Replay enforces the spread-blackout reject (System 1), not just the fill.**
+The live worker rejects a new entry that fires during the post-NY-close
+liquidity trough when the instrument's spread is elevated (see *Spread-blackout
+window* above). The replay now mirrors it: `simulate_fill` computes the **fire
+bar**'s spread from the recorded bid/ask book (`(ask_c − bid_c) / pip_size`) and
+calls the *same* `trade_control_core::spread_blackout` decision + per-instrument
+threshold the worker uses. On a reject it returns the new
+`SimOutcome::SpreadBlackout { spread_pips, threshold_pips }`, shown in the report
+as `spread: REJECTED — spread 30.0p > 8.0p threshold inside the NY-close-edge
+window (no order placed; live worker 423s)` and not tallied as a win. A
+mid-only feed (`bid == ask`) has zero spread → never blacks out (we don't
+fabricate a spread the data doesn't carry). **Modelling note:** the live gate
+only samples when the KV `spread-blackout:window` marker is set (the daily cron
+writes it at the NY-close edge); the replay has no KV, so it approximates the
+marker with `core::ny_clock::is_ny_close_edge(fire_bar.time)` — exactly the
+close-edge hour, where the live window can persist a little longer until the
+recovery watcher clears it.
+
 **News / blackout pruning is replay-cursor-aware.** When `tv-arm` builds a plan
 it fetches the week's forex-factory events and adds one blackout pair + one news
 pair per event, then drops any pair whose window has already elapsed. The
@@ -1559,7 +1577,7 @@ instrument and, if it exceeds the elevated cutoff (in pips), rejects:
 The elevated cutoff is now **per-instrument, baked at compile time** from
 real sampled spreads (it was a flat 8-pip constant, which mis-fired badly
 for non-FX: Copper's *normal* spread is ~150 pips, so the flat 8 blocked
-every legitimate Copper entry during the window). `build.rs` reads the
+every legitimate Copper entry during the window). `core/build.rs` reads the
 committed YAML samples from the **`spread-sampler-cron`** submodule and
 emits a per-instrument table (`(name, low, high, median)` in pips, keyed by
 the broker-canonical TradeNation name — the same `resolved.instrument` the
@@ -1576,9 +1594,20 @@ An instrument absent from the baseline (a fresh asset, or one with no pip
 size) falls back to the flat `SPREAD_BLACKOUT_ELEVATED_PIPS` (8 pips). The
 reject message names the instrument's baked normal/seen-range and the
 current spread. The recovery cutoff (`SPREAD_BLACKOUT_RECOVERED_PIPS`,
-4 pips) is still a flat constant and lives beside the elevated logic in
-`src/spread_blackout.rs`. The whole feature works in **pips**
-consistently.
+4 pips) is still a flat constant and lives beside the elevated logic. The
+whole feature works in **pips** consistently.
+
+The **pure decision, the per-instrument threshold lookup, the baked
+baseline, and the `build.rs` that bakes it now live in
+`trade_control_core::spread_blackout`** (not the worker crate), so the
+offline candle replay — which links `core` but not the worker `cdylib` —
+applies the *same* reject the live worker does
+(`[[strategy_changes_in_both_replayer_and_worker]]`). The worker keeps only
+the I/O wrapper around the pure decision: the KV `spread-blackout:window`
+read + the live `get_quote` sample (`run_enter`) and the recovery watcher
+(`src/cron/blackout_watch.rs`), reaching the shared items through the thin
+`src/spread_blackout.rs` re-export shim. See *Candle replay* below for how
+the replay reconstructs the spread from the recorded bid/ask book.
 
 > **Re-bake cadence:** the table is only as good as the committed samples.
 > Re-running `git pull` in the submodule (the hourly cron commits new

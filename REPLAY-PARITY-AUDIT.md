@@ -42,7 +42,7 @@ decide that is **still worker-only**, ranked by replay value.
 | `allow_entry` Rhai script | `src/allow_entry_gate.rs` (pure `evaluate`, 415 ln) | **yes** (pure, takes intent+shell+resolved) | yes (Rhai compiles off-wasm) | **MOVE** | **high** — a script `false`/golden-unmet/confirmed-unmet would reject the entry; replay fills it anyway |
 | candle-quality (`needs_golden`/`needs_confirmed`) | `src/candle_gate.rs` (pure `evaluate`, 211 ln) | **yes** | yes (latched signal carries flags) | **MOVE** | **high** — but note `evaluate_plan`'s `pine_entry_dispatchable` already pre-flights golden/confirmed for Pine enters; gap is M/W + non-pine |
 | market-hours blackout | `src/market_blackout.rs` (pure minute-of-day, 65 ln) + KV windows | **yes** (pure predicate) | yes IF the no-entry windows are resolvable offline (they're daily-cron-written to KV from broker session hours) | **MOVE** (predicate) + need a window source | **high** — a re-entry in a closed session is rejected live, filled in replay |
-| spread blackout | `src/spread_blackout.rs` (pure decision + baked baseline, 181 ln) | **yes** | **yes** — `ask_c − bid_c` per candle IS the spread; threshold is the build.rs baseline × 5 | **MOVE** | **high** — the one you asked for; fully reconstructable from candle bid/ask |
+| spread blackout | `core::spread_blackout` (pure decision + baked baseline; `core/build.rs` bakes it) | **yes** | **yes** — `ask_c − bid_c` per candle IS the spread; threshold is the build.rs baseline × 5 | **shared** ✅ (`simulate_fill` applies; `is_ny_close_edge` window stand-in) | — |
 | SL ≥ 10×spread floor | `core::intent::sl_spread_floor` | yes | yes (spread from candle) | **shared** ✅ | — |
 | RR ≥ 1 floor (`MIN_R_FLOOR`) | `core` resolution | yes | yes | **shared** ✅ | — |
 | `recover_entry` (#19-10) | `src/recover_entry.rs` (pure `recover_entry_plan`, 360 ln) | **yes** (pure plan fn) | partly — needs the broker "too close" error, which the sim approximates | **MOVE** (plan) | medium — changes a rejected stop-entry into a recovered one |
@@ -72,7 +72,11 @@ decide that is **still worker-only**, ranked by replay value.
 
 ## Priority order (highest replay-fidelity gain first)
 
-1. **spread_blackout → core** (asked for; fully replayable from candle bid/ask).
+1. ~~**spread_blackout → core**~~ ✅ **DONE** — pure decision + baked baseline +
+   `build.rs` moved to `core::spread_blackout`; `simulate_fill` applies it from
+   the fire-bar bid/ask with `is_ny_close_edge` as the window stand-in; new
+   `SimOutcome::SpreadBlackout` + report line. Worker call site byte-identical
+   (re-export shim).
 2. **order sweep breach predicate → core** + report line (explains NEVER FILLED).
 3. **market-hours blackout predicate → core** + an offline window source.
 4. **allow_entry / candle_gate → core** (Rhai compiles off-wasm; big fidelity win

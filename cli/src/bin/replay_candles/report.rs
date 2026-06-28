@@ -63,7 +63,8 @@ pub fn collect_close_fires(replay: &Replay) -> Vec<CloseFire> {
 ///   before* that exit bar; a close on/after the SL/TP bar is moot (the position
 ///   was already flat). Ties go to the SL/TP (the simulator's pessimistic
 ///   stance, and the close can't pre-empt an exit that already happened).
-/// - `NeverFilled` / `Declined` / `Unresolved` → untouched (no open position).
+/// - `NeverFilled` / `Declined` / `SpreadBlackout` / `Unresolved` → untouched
+///   (no open position).
 ///
 /// Returns the (possibly overridden) outcome; on override it's the new
 /// [`ReplayOutcome::ClosedOnReversal`] carrying the close bar + price.
@@ -86,7 +87,10 @@ fn apply_reversal_close(outcome: SimOutcome, closes: &[CloseFire]) -> ReplayOutc
             ..
         } => (*fill_at, *entry_price, Some(*exit_at)),
         // No open position to close.
-        SimOutcome::NeverFilled | SimOutcome::Declined { .. } | SimOutcome::Unresolved(_) => {
+        SimOutcome::NeverFilled
+        | SimOutcome::Declined { .. }
+        | SimOutcome::SpreadBlackout { .. }
+        | SimOutcome::Unresolved(_) => {
             return ReplayOutcome::Sim(outcome);
         }
     };
@@ -147,12 +151,15 @@ pub enum FillKind {
     NeverFilled,
     /// An entry the worker declined to place (entry past a gate level). Not taken.
     Declined,
+    /// An entry the worker's spread-blackout gate would have rejected (fire-bar
+    /// spread above threshold inside the NY-close-edge window). Not taken.
+    SpreadBlackout,
 }
 
 impl FillKind {
     /// Was this position actually taken (an order filled)? `false` for the
-    /// not-taken kinds (`NeverFilled` / `Declined`), which only have an
-    /// *intended* bracket, anchored at the fire bar.
+    /// not-taken kinds (`NeverFilled` / `Declined` / `SpreadBlackout`), which
+    /// only have an *intended* bracket, anchored at the fire bar.
     pub fn is_taken(self) -> bool {
         matches!(
             self,
@@ -270,6 +277,12 @@ pub fn resolve_fire_any(plan: &TradePlan, fire: &Fire, closes: &[CloseFire]) -> 
                 window_end,
                 resolved.entry.reference_price(),
                 FillKind::Declined,
+            ),
+            SimOutcome::SpreadBlackout { .. } => (
+                fire_at,
+                window_end,
+                resolved.entry.reference_price(),
+                FillKind::SpreadBlackout,
             ),
             // Nothing meaningful to draw.
             SimOutcome::Unresolved(_) => return None,
@@ -613,6 +626,12 @@ fn describe_outcome(outcome: &SimOutcome) -> String {
         SimOutcome::Declined { name } => {
             format!("fill: DECLINED — entry past the {name} level (no order placed)")
         }
+        SimOutcome::SpreadBlackout {
+            spread_pips,
+            threshold_pips,
+        } => format!(
+            "spread: REJECTED — spread {spread_pips:.1}p > {threshold_pips:.1}p threshold inside the NY-close-edge window (no order placed; live worker 423s)"
+        ),
     }
 }
 
