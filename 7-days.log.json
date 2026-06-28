@@ -1,0 +1,3549 @@
+[
+  {
+    "source": {
+      "message": "cron session_refresh: 1 TN accounts to consider"
+    },
+    "dataset": "cloudflare-workers",
+    "timestamp": "2026-06-01T02:15:42.629Z",
+    "$workers": {
+      "truncated": false,
+      "event": {
+        "cron": "*/15 * * * *",
+        "scheduledTime": 1780280142000
+      },
+      "scriptName": "trade-control-web-hook",
+      "outcome": "ok",
+      "eventType": "cron",
+      "scriptVersion": {
+        "id": "27bc37ae-48a5-495b-ae0b-e86cac82e9d3"
+      },
+      "executionModel": "stateless",
+      "requestId": "P0ZY6ZOKJAU7QLL5"
+    },
+    "$metadata": {
+      "id": "01KT0FEATHF54436F678QEM398",
+      "requestId": "P0ZY6ZOKJAU7QLL5",
+      "trigger": "*/15 * * * *",
+      "service": "trade-control-web-hook",
+      "message": "cron session_refresh: 1 TN accounts to consider",
+      "account": "4a1a3fca7735ec4b76a4f276821fb795",
+      "type": "cf-worker",
+      "fingerprint": "83bd0c6ddf8a4b5fe22d6b1f5dccfe4d",
+      "origin": "cron",
+      "messageTemplate": "cron session_refresh: 1 TN accounts to consider"
+    }
+  },
+  {
+    "source": {
+      "message": "DEBUG tradenation_api::ohlcv: Fetching candles: https://charts.finsatechnology.com/data/minute/61397/ask?l=1"
+    },
+    "dataset": "cloudflare-workers",
+    "timestamp": "2026-06-01T02:00:44.953Z",
+    "$workers": {
+      "truncated": false,
+      "event": {
+        "cron": "*/15 * * * *",
+        "scheduledTime": 1780279242000
+      },
+      "scriptName": "trade-control-web-hook",
+      "outcome": "ok",
+      "eventType": "cron",
+      "scriptVersion": {
+        "id": "27bc37ae-48a5-495b-ae0b-e86cac82e9d3"
+      },
+      "executionModel": "stateless",
+      "requestId": "Q3B5L8FTV6OBT3VE"
+    },
+    "$metadata": {
+      "id": "01KT0EJY4SSW5HHQT4HYZ62QF9",
+      "requestId": "Q3B5L8FTV6OBT3VE",
+      "trigger": "*/15 * * * *",
+      "service": "trade-control-web-hook",
+      "message": "DEBUG tradenation_api::ohlcv: Fetching candles: https://charts.finsatechnology.com/data/minute/61397/ask?l=1",
+      "account": "4a1a3fca7735ec4b76a4f276821fb795",
+      "type": "cf-worker",
+      "fingerprint": "83bd0c6ddf8a4b5fe22d6b1f5dccfe4d",
+      "origin": "cron",
+      "messageTemplate": "DEBUG tradenation_api::ohlcv: Fetching candles: https://charts.finsatechnology.com/data/minute/61397/<*>"
+    }
+  },
+  {
+    "source": {
+      "message": "tn[reversals]: using cached session"
+    },
+    "dataset": "cloudflare-workers",
+    "timestamp": "2026-06-01T02:00:44.077Z",
+    "$workers": {
+      "truncated": false,
+      "event": {
+        "cron": "*/15 * * * *",
+        "scheduledTime": 1780279242000
+      },
+      "scriptName": "trade-control-web-hook",
+      "outcome": "ok",
+      "eventType": "cron",
+      "scriptVersion": {
+        "id": "27bc37ae-48a5-495b-ae0b-e86cac82e9d3"
+      },
+      "executionModel": "stateless",
+      "requestId": "Q3B5L8FTV6OBT3VE"
+    },
+    "$metadata": {
+      "id": "01KT0EJX9DTADWVCJ0PJ2242F7",
+      "requestId": "Q3B5L8FTV6OBT3VE",
+      "trigger": "*/15 * * * *",
+      "service": "trade-control-web-hook",
+      "message": "tn[reversals]: using cached session",
+      "account": "4a1a3fca7735ec4b76a4f276821fb795",
+      "type": "cf-worker",
+      "fingerprint": "83bd0c6ddf8a4b5fe22d6b1f5dccfe4d",
+      "origin": "cron",
+      "messageTemplate": "tn[reversals]: using cached session"
+    }
+  },
+  {
+    "source": {
+      "message": "DEBUG tradenation_api::ohlcv: Fetching candles: https://charts.finsatechnology.com/data/minute/61397/bid?l=1"
+    },
+    "dataset": "cloudflare-workers",
+    "timestamp": "2026-06-01T01:00:44.292Z",
+    "$workers": {
+      "truncated": false,
+      "event": {
+        "cron": "*/15 * * * *",
+        "scheduledTime": 1780275642000
+      },
+      "scriptName": "trade-control-web-hook",
+      "outcome": "ok",
+      "eventType": "cron",
+      "scriptVersion": {
+        "id": "27bc37ae-48a5-495b-ae0b-e86cac82e9d3"
+      },
+      "executionModel": "stateless",
+      "requestId": "00M8XXV1S0M4JGGC"
+    },
+    "$metadata": {
+      "id": "01KT0B52333HPZ7447RJBBPWRP",
+      "requestId": "00M8XXV1S0M4JGGC",
+      "trigger": "*/15 * * * *",
+      "service": "trade-control-web-hook",
+      "message": "DEBUG tradenation_api::ohlcv: Fetching candles: https://charts.finsatechnology.com/data/minute/61397/bid?l=1",
+      "account": "4a1a3fca7735ec4b76a4f276821fb795",
+      "type": "cf-worker",
+      "fingerprint": "83bd0c6ddf8a4b5fe22d6b1f5dccfe4d",
+      "origin": "cron",
+      "messageTemplate": "DEBUG tradenation_api::ohlcv: Fetching candles: https://charts.finsatechnology.com/data/minute/61397/bid?l=1"
+    }
+  },
+  {
+    "source": {
+      "message": "tn[reversals]: using cached session"
+    },
+    "dataset": "cloudflare-workers",
+    "timestamp": "2026-06-01T01:00:43.959Z",
+    "$workers": {
+      "truncated": false,
+      "event": {
+        "cron": "*/15 * * * *",
+        "scheduledTime": 1780275642000
+      },
+      "scriptName": "trade-control-web-hook",
+      "outcome": "ok",
+      "eventType": "cron",
+      "scriptVersion": {
+        "id": "27bc37ae-48a5-495b-ae0b-e86cac82e9d3"
+      },
+      "executionModel": "stateless",
+      "requestId": "00M8XXV1S0M4JGGC"
+    },
+    "$metadata": {
+      "id": "01KT0B52333HPZ7447RJBBPWRN",
+      "requestId": "00M8XXV1S0M4JGGC",
+      "trigger": "*/15 * * * *",
+      "service": "trade-control-web-hook",
+      "message": "tn[reversals]: using cached session",
+      "account": "4a1a3fca7735ec4b76a4f276821fb795",
+      "type": "cf-worker",
+      "fingerprint": "83bd0c6ddf8a4b5fe22d6b1f5dccfe4d",
+      "origin": "cron",
+      "messageTemplate": "tn[reversals]: using cached session"
+    }
+  },
+  {
+    "source": {
+      "message": "cron session_refresh: 1 TN accounts to consider"
+    },
+    "dataset": "cloudflare-workers",
+    "timestamp": "2026-06-01T01:00:42.851Z",
+    "$workers": {
+      "truncated": false,
+      "event": {
+        "cron": "*/15 * * * *",
+        "scheduledTime": 1780275642000
+      },
+      "scriptName": "trade-control-web-hook",
+      "outcome": "ok",
+      "eventType": "cron",
+      "scriptVersion": {
+        "id": "27bc37ae-48a5-495b-ae0b-e86cac82e9d3"
+      },
+      "executionModel": "stateless",
+      "requestId": "00M8XXV1S0M4JGGC"
+    },
+    "$metadata": {
+      "id": "01KT0B52333HPZ7447RJBBPWRH",
+      "requestId": "00M8XXV1S0M4JGGC",
+      "trigger": "*/15 * * * *",
+      "service": "trade-control-web-hook",
+      "message": "cron session_refresh: 1 TN accounts to consider",
+      "account": "4a1a3fca7735ec4b76a4f276821fb795",
+      "type": "cf-worker",
+      "fingerprint": "83bd0c6ddf8a4b5fe22d6b1f5dccfe4d",
+      "origin": "cron",
+      "messageTemplate": "cron session_refresh: 1 TN accounts to consider"
+    }
+  },
+  {
+    "source": {
+      "message": "DEBUG tradenation_api::ohlcv: Fetching candles: https://charts.finsatechnology.com/data/minute/61397/bid?l=1"
+    },
+    "dataset": "cloudflare-workers",
+    "timestamp": "2026-06-01T00:45:43.786Z",
+    "$workers": {
+      "truncated": false,
+      "event": {
+        "cron": "*/15 * * * *",
+        "scheduledTime": 1780274742000
+      },
+      "scriptName": "trade-control-web-hook",
+      "outcome": "ok",
+      "eventType": "cron",
+      "scriptVersion": {
+        "id": "27bc37ae-48a5-495b-ae0b-e86cac82e9d3"
+      },
+      "executionModel": "stateless",
+      "requestId": "SNFBI9IITJNGT9AC"
+    },
+    "$metadata": {
+      "id": "01KT0A9JFAJ34P4P6YH46B4FCE",
+      "requestId": "SNFBI9IITJNGT9AC",
+      "trigger": "*/15 * * * *",
+      "service": "trade-control-web-hook",
+      "message": "DEBUG tradenation_api::ohlcv: Fetching candles: https://charts.finsatechnology.com/data/minute/61397/bid?l=1",
+      "account": "4a1a3fca7735ec4b76a4f276821fb795",
+      "type": "cf-worker",
+      "fingerprint": "83bd0c6ddf8a4b5fe22d6b1f5dccfe4d",
+      "origin": "cron",
+      "messageTemplate": "DEBUG tradenation_api::ohlcv: Fetching candles: https://charts.finsatechnology.com/data/minute/61397/bid?l=1"
+    }
+  },
+  {
+    "source": {
+      "message": "tn[reversals]: using cached session"
+    },
+    "dataset": "cloudflare-workers",
+    "timestamp": "2026-06-01T00:45:43.694Z",
+    "$workers": {
+      "truncated": false,
+      "event": {
+        "cron": "*/15 * * * *",
+        "scheduledTime": 1780274742000
+      },
+      "scriptName": "trade-control-web-hook",
+      "outcome": "ok",
+      "eventType": "cron",
+      "scriptVersion": {
+        "id": "27bc37ae-48a5-495b-ae0b-e86cac82e9d3"
+      },
+      "executionModel": "stateless",
+      "requestId": "SNFBI9IITJNGT9AC"
+    },
+    "$metadata": {
+      "id": "01KT0A9JCEDCE4KXGHEDDH3CP1",
+      "requestId": "SNFBI9IITJNGT9AC",
+      "trigger": "*/15 * * * *",
+      "service": "trade-control-web-hook",
+      "message": "tn[reversals]: using cached session",
+      "account": "4a1a3fca7735ec4b76a4f276821fb795",
+      "type": "cf-worker",
+      "fingerprint": "83bd0c6ddf8a4b5fe22d6b1f5dccfe4d",
+      "origin": "cron",
+      "messageTemplate": "tn[reversals]: using cached session"
+    }
+  },
+  {
+    "source": {
+      "message": "cron sweep: 1 tracked attempts"
+    },
+    "dataset": "cloudflare-workers",
+    "timestamp": "2026-06-01T00:30:43.529Z",
+    "$workers": {
+      "truncated": false,
+      "event": {
+        "cron": "*/15 * * * *",
+        "scheduledTime": 1780273842000
+      },
+      "scriptName": "trade-control-web-hook",
+      "outcome": "ok",
+      "eventType": "cron",
+      "scriptVersion": {
+        "id": "27bc37ae-48a5-495b-ae0b-e86cac82e9d3"
+      },
+      "executionModel": "stateless",
+      "requestId": "8DYU8HUY1L6HD34J"
+    },
+    "$metadata": {
+      "id": "01KT09E3YZ4JJ42P70DH7VX7FJ",
+      "requestId": "8DYU8HUY1L6HD34J",
+      "trigger": "*/15 * * * *",
+      "service": "trade-control-web-hook",
+      "message": "cron sweep: 1 tracked attempts",
+      "account": "4a1a3fca7735ec4b76a4f276821fb795",
+      "type": "cf-worker",
+      "fingerprint": "83bd0c6ddf8a4b5fe22d6b1f5dccfe4d",
+      "origin": "cron",
+      "messageTemplate": "cron sweep: 1 tracked attempts"
+    }
+  },
+  {
+    "source": {
+      "message": "cron session_refresh[reversals]: refreshed"
+    },
+    "dataset": "cloudflare-workers",
+    "timestamp": "2026-06-01T00:30:43.339Z",
+    "$workers": {
+      "truncated": false,
+      "event": {
+        "cron": "*/15 * * * *",
+        "scheduledTime": 1780273842000
+      },
+      "scriptName": "trade-control-web-hook",
+      "outcome": "ok",
+      "eventType": "cron",
+      "scriptVersion": {
+        "id": "27bc37ae-48a5-495b-ae0b-e86cac82e9d3"
+      },
+      "executionModel": "stateless",
+      "requestId": "8DYU8HUY1L6HD34J"
+    },
+    "$metadata": {
+      "id": "01KT09E3YZ4JJ42P70DH7VX7FH",
+      "requestId": "8DYU8HUY1L6HD34J",
+      "trigger": "*/15 * * * *",
+      "service": "trade-control-web-hook",
+      "message": "cron session_refresh[reversals]: refreshed",
+      "account": "4a1a3fca7735ec4b76a4f276821fb795",
+      "type": "cf-worker",
+      "fingerprint": "83bd0c6ddf8a4b5fe22d6b1f5dccfe4d",
+      "origin": "cron",
+      "messageTemplate": "cron session_refresh[reversals]: refreshed"
+    }
+  },
+  {
+    "source": {
+      "message": "DEBUG tradenation_api::ohlcv: Fetching candles: https://charts.finsatechnology.com/data/minute/61397/ask?l=1"
+    },
+    "dataset": "cloudflare-workers",
+    "timestamp": "2026-05-31T23:45:44.419Z",
+    "$workers": {
+      "truncated": false,
+      "event": {
+        "cron": "*/15 * * * *",
+        "scheduledTime": 1780271142000
+      },
+      "scriptName": "trade-control-web-hook",
+      "outcome": "ok",
+      "eventType": "cron",
+      "scriptVersion": {
+        "id": "27bc37ae-48a5-495b-ae0b-e86cac82e9d3"
+      },
+      "executionModel": "stateless",
+      "requestId": "ML64WS09CLUIPL90"
+    },
+    "$metadata": {
+      "id": "01KT06VQF3C3Z3NXM1S60VAB9Y",
+      "requestId": "ML64WS09CLUIPL90",
+      "trigger": "*/15 * * * *",
+      "service": "trade-control-web-hook",
+      "message": "DEBUG tradenation_api::ohlcv: Fetching candles: https://charts.finsatechnology.com/data/minute/61397/ask?l=1",
+      "account": "4a1a3fca7735ec4b76a4f276821fb795",
+      "type": "cf-worker",
+      "fingerprint": "83bd0c6ddf8a4b5fe22d6b1f5dccfe4d",
+      "origin": "cron",
+      "messageTemplate": "DEBUG tradenation_api::ohlcv: Fetching candles: https://charts.finsatechnology.com/data/minute/61397/<*>"
+    }
+  },
+  {
+    "source": {
+      "message": "cron session_refresh[reversals]: refreshed"
+    },
+    "dataset": "cloudflare-workers",
+    "timestamp": "2026-05-31T23:45:43.304Z",
+    "$workers": {
+      "truncated": false,
+      "event": {
+        "cron": "*/15 * * * *",
+        "scheduledTime": 1780271142000
+      },
+      "scriptName": "trade-control-web-hook",
+      "outcome": "ok",
+      "eventType": "cron",
+      "scriptVersion": {
+        "id": "27bc37ae-48a5-495b-ae0b-e86cac82e9d3"
+      },
+      "executionModel": "stateless",
+      "requestId": "ML64WS09CLUIPL90"
+    },
+    "$metadata": {
+      "id": "01KT06VPC8GYFW6Q10E953T59N",
+      "requestId": "ML64WS09CLUIPL90",
+      "trigger": "*/15 * * * *",
+      "service": "trade-control-web-hook",
+      "message": "cron session_refresh[reversals]: refreshed",
+      "account": "4a1a3fca7735ec4b76a4f276821fb795",
+      "type": "cf-worker",
+      "fingerprint": "83bd0c6ddf8a4b5fe22d6b1f5dccfe4d",
+      "origin": "cron",
+      "messageTemplate": "cron session_refresh[reversals]: refreshed"
+    }
+  },
+  {
+    "source": {
+      "level": "info",
+      "message": "POST https://trade-control-web-hook.msherborne.workers.dev/"
+    },
+    "dataset": "cloudflare-workers",
+    "timestamp": "2026-05-31T23:45:09.308Z",
+    "$workers": {
+      "event": {
+        "request": {
+          "cf": {
+            "isEUCountry": false,
+            "tlsClientAuth": {
+              "certRFC9440TooLarge": false,
+              "certChainRFC9440TooLarge": false,
+              "certPresented": "0",
+              "certVerified": "NONE",
+              "certRevoked": "0",
+              "certIssuerDN": "",
+              "certSubjectDN": "",
+              "certIssuerDNRFC2253": "",
+              "certSubjectDNRFC2253": "",
+              "certIssuerDNLegacy": "",
+              "certSubjectDNLegacy": "",
+              "certSerial": "",
+              "certIssuerSerial": "",
+              "certSKI": "",
+              "certIssuerSKI": "",
+              "certFingerprintSHA1": "",
+              "certFingerprintSHA256": "",
+              "certNotBefore": "",
+              "certNotAfter": "",
+              "certRFC9440": "",
+              "certChainRFC9440": ""
+            },
+            "httpProtocol": "HTTP/1.1",
+            "clientAcceptEncoding": "gzip",
+            "requestPriority": "",
+            "colo": "PDX",
+            "asOrganization": "Amazon Technologies Inc.",
+            "country": "US",
+            "city": "Boardman",
+            "continent": "NA",
+            "region": "Oregon",
+            "regionCode": "OR",
+            "timezone": "America/Los_Angeles",
+            "longitude": "-119.70058",
+            "latitude": "45.83986",
+            "postalCode": "97818",
+            "metroCode": "810",
+            "tlsVersion": "TLSv1.3",
+            "tlsCipher": "AEAD-AES128-GCM-SHA256",
+            "tlsClientRandom": "lj4L6BH/UM3+qRYh4qC7pEGLOtV1JyaFVHfPwLfMZWc=",
+            "tlsClientCiphersSha1": "QrF6UadKW3vtNOqdNqbd4frxxxE=",
+            "tlsClientExtensionsSha1": "VmypJ9I6O+wlbe1dI9qycuZ4Ywg=",
+            "tlsClientExtensionsSha1Le": "i+zMiC3iuMzkwC9CUcQV4FcnRkg=",
+            "tlsExportedAuthenticator": {
+              "clientHandshake": "0d32c20602b42fbb9d9c751432b2dc34bb97d732663601e4ff755bfc2611edb1",
+              "serverHandshake": "430f9c52cf048fbe29d0c53779afc203273037c6df8b73a0898e767b4c051129",
+              "clientFinished": "903537a6987682acd3f0861aebccbac3bbc022b696b772c4cc7739dec0175786",
+              "serverFinished": "700103f214a076395b9edf4af82ff225dc9812b9393039080aac745563cb0a87"
+            },
+            "tlsClientHelloLength": "1524",
+            "verifiedBotCategory": "",
+            "edgeRequestKeepAliveStatus": 1,
+            "clientTcpRtt": 5,
+            "clientQuicRtt": 0,
+            "asn": 16509,
+            "edgeL4": {
+              "deliveryRate": 826956
+            }
+          },
+          "url": "https://trade-control-web-hook.msherborne.workers.dev/",
+          "method": "POST",
+          "headers": {
+            "accept-encoding": "gzip, br",
+            "cf-connecting-ip": "52.32.178.7",
+            "cf-ipcountry": "US",
+            "cf-ray": "a049d9c11bb7efac",
+            "cf-visitor": "{\"scheme\":\"https\"}",
+            "connection": "Keep-Alive",
+            "content-length": "355",
+            "content-type": "text/plain; charset=utf-8",
+            "host": "trade-control-web-hook.msherborne.workers.dev",
+            "user-agent": "Go-http-client/1.1",
+            "x-forwarded-proto": "https",
+            "x-real-ip": "52.32.178.7"
+          },
+          "path": "/"
+        },
+        "rayId": "a049d9c11bb7efac",
+        "response": {
+          "status": 409
+        }
+      },
+      "truncated": false,
+      "scriptName": "trade-control-web-hook",
+      "outcome": "ok",
+      "eventType": "fetch",
+      "executionModel": "stateless",
+      "scriptVersion": {
+        "id": "27bc37ae-48a5-495b-ae0b-e86cac82e9d3"
+      },
+      "requestId": "a049d9c11bb7efac",
+      "cpuTimeMs": 25,
+      "wallTimeMs": 160
+    },
+    "$metadata": {
+      "id": "01KT06TN5WYMHP57HJHFKDPXN5",
+      "requestId": "a049d9c11bb7efac",
+      "trigger": "POST /",
+      "service": "trade-control-web-hook",
+      "level": "info",
+      "message": "POST https://trade-control-web-hook.msherborne.workers.dev/",
+      "account": "4a1a3fca7735ec4b76a4f276821fb795",
+      "type": "cf-worker-event",
+      "fingerprint": "83bd0c6ddf8a4b5fe22d6b1f5dccfe4d",
+      "origin": "fetch",
+      "messageTemplate": "POST https://trade-control-web-hook.msherborne.workers.dev/"
+    }
+  },
+  {
+    "source": {
+      "message": "DEBUG tradenation_api::ohlcv: Fetching candles: https://charts.finsatechnology.com/data/minute/61397/ask?l=1"
+    },
+    "dataset": "cloudflare-workers",
+    "timestamp": "2026-05-31T23:15:44.031Z",
+    "$workers": {
+      "truncated": false,
+      "event": {
+        "cron": "*/15 * * * *",
+        "scheduledTime": 1780269342000
+      },
+      "scriptName": "trade-control-web-hook",
+      "outcome": "ok",
+      "eventType": "cron",
+      "scriptVersion": {
+        "id": "27bc37ae-48a5-495b-ae0b-e86cac82e9d3"
+      },
+      "executionModel": "stateless",
+      "requestId": "LGZ16GJ2QCM5N63D"
+    },
+    "$metadata": {
+      "id": "01KT054S8Z52T17EWT97BMZCDJ",
+      "requestId": "LGZ16GJ2QCM5N63D",
+      "trigger": "*/15 * * * *",
+      "service": "trade-control-web-hook",
+      "message": "DEBUG tradenation_api::ohlcv: Fetching candles: https://charts.finsatechnology.com/data/minute/61397/ask?l=1",
+      "account": "4a1a3fca7735ec4b76a4f276821fb795",
+      "type": "cf-worker",
+      "fingerprint": "83bd0c6ddf8a4b5fe22d6b1f5dccfe4d",
+      "origin": "cron",
+      "messageTemplate": "DEBUG tradenation_api::ohlcv: Fetching candles: https://charts.finsatechnology.com/data/minute/61397/<*>"
+    }
+  },
+  {
+    "source": {
+      "message": "cron sweep: 1 tracked attempts"
+    },
+    "dataset": "cloudflare-workers",
+    "timestamp": "2026-05-31T23:00:45.404Z",
+    "$workers": {
+      "truncated": false,
+      "event": {
+        "cron": "*/15 * * * *",
+        "scheduledTime": 1780268442000
+      },
+      "scriptName": "trade-control-web-hook",
+      "outcome": "ok",
+      "eventType": "cron",
+      "scriptVersion": {
+        "id": "27bc37ae-48a5-495b-ae0b-e86cac82e9d3"
+      },
+      "executionModel": "stateless",
+      "requestId": "YXOWV1QI9HJWM3R9"
+    },
+    "$metadata": {
+      "id": "01KT049BPWCV5XSD7NH1380DRQ",
+      "requestId": "YXOWV1QI9HJWM3R9",
+      "trigger": "*/15 * * * *",
+      "service": "trade-control-web-hook",
+      "message": "cron sweep: 1 tracked attempts",
+      "account": "4a1a3fca7735ec4b76a4f276821fb795",
+      "type": "cf-worker",
+      "fingerprint": "83bd0c6ddf8a4b5fe22d6b1f5dccfe4d",
+      "origin": "cron",
+      "messageTemplate": "cron sweep: 1 tracked attempts"
+    }
+  },
+  {
+    "source": {
+      "message": "tn[reversals]: using cached session"
+    },
+    "dataset": "cloudflare-workers",
+    "timestamp": "2026-05-31T23:00:45.229Z",
+    "$workers": {
+      "truncated": false,
+      "event": {
+        "cron": "*/15 * * * *",
+        "scheduledTime": 1780268442000
+      },
+      "scriptName": "trade-control-web-hook",
+      "outcome": "ok",
+      "eventType": "cron",
+      "scriptVersion": {
+        "id": "27bc37ae-48a5-495b-ae0b-e86cac82e9d3"
+      },
+      "executionModel": "stateless",
+      "requestId": "YXOWV1QI9HJWM3R9"
+    },
+    "$metadata": {
+      "id": "01KT049BNHY1E011ZF21Z3JAKB",
+      "requestId": "YXOWV1QI9HJWM3R9",
+      "trigger": "*/15 * * * *",
+      "service": "trade-control-web-hook",
+      "message": "tn[reversals]: using cached session",
+      "account": "4a1a3fca7735ec4b76a4f276821fb795",
+      "type": "cf-worker",
+      "fingerprint": "83bd0c6ddf8a4b5fe22d6b1f5dccfe4d",
+      "origin": "cron",
+      "messageTemplate": "tn[reversals]: using cached session"
+    }
+  },
+  {
+    "source": {
+      "message": "cron session_refresh[reversals]: refreshed"
+    },
+    "dataset": "cloudflare-workers",
+    "timestamp": "2026-05-31T22:30:43.855Z",
+    "$workers": {
+      "truncated": false,
+      "event": {
+        "cron": "*/15 * * * *",
+        "scheduledTime": 1780266642000
+      },
+      "scriptName": "trade-control-web-hook",
+      "outcome": "ok",
+      "eventType": "cron",
+      "scriptVersion": {
+        "id": "27bc37ae-48a5-495b-ae0b-e86cac82e9d3"
+      },
+      "executionModel": "stateless",
+      "requestId": "HWJ01YWKW3TFUMKM"
+    },
+    "$metadata": {
+      "id": "01KT02JD89ANS88C5GHKA49WFC",
+      "requestId": "HWJ01YWKW3TFUMKM",
+      "trigger": "*/15 * * * *",
+      "service": "trade-control-web-hook",
+      "message": "cron session_refresh[reversals]: refreshed",
+      "account": "4a1a3fca7735ec4b76a4f276821fb795",
+      "type": "cf-worker",
+      "fingerprint": "83bd0c6ddf8a4b5fe22d6b1f5dccfe4d",
+      "origin": "cron",
+      "messageTemplate": "cron session_refresh[reversals]: refreshed"
+    }
+  },
+  {
+    "source": {
+      "level": "info",
+      "message": "*/15 * * * * "
+    },
+    "dataset": "cloudflare-workers",
+    "timestamp": "2026-05-31T21:45:42.546Z",
+    "$workers": {
+      "truncated": false,
+      "event": {
+        "cron": "*/15 * * * *",
+        "scheduledTime": 1780263942000
+      },
+      "scriptName": "trade-control-web-hook",
+      "outcome": "ok",
+      "eventType": "cron",
+      "scriptVersion": {
+        "id": "27bc37ae-48a5-495b-ae0b-e86cac82e9d3"
+      },
+      "executionModel": "stateless",
+      "requestId": "8H9S8N3K2VYCGUXF",
+      "wallTimeMs": 1994,
+      "cpuTimeMs": 9
+    },
+    "$metadata": {
+      "id": "01KSZZZYCJB79JZVVS2AJ0G70G",
+      "requestId": "8H9S8N3K2VYCGUXF",
+      "trigger": "*/15 * * * *",
+      "service": "trade-control-web-hook",
+      "level": "info",
+      "message": "*/15 * * * * ",
+      "account": "4a1a3fca7735ec4b76a4f276821fb795",
+      "type": "cf-worker-event",
+      "fingerprint": "83bd0c6ddf8a4b5fe22d6b1f5dccfe4d",
+      "origin": "cron",
+      "messageTemplate": "*/15 * * * *"
+    }
+  },
+  {
+    "source": {
+      "message": "tn[reversals]: using cached session"
+    },
+    "dataset": "cloudflare-workers",
+    "timestamp": "2026-05-31T21:15:43.356Z",
+    "$workers": {
+      "truncated": false,
+      "event": {
+        "cron": "*/15 * * * *",
+        "scheduledTime": 1780262142000
+      },
+      "scriptName": "trade-control-web-hook",
+      "outcome": "ok",
+      "eventType": "cron",
+      "scriptVersion": {
+        "id": "27bc37ae-48a5-495b-ae0b-e86cac82e9d3"
+      },
+      "executionModel": "stateless",
+      "requestId": "C8CB1YEBIR4Q2AAT"
+    },
+    "$metadata": {
+      "id": "01KSZY91BWKZSC8G763PPG2RZH",
+      "requestId": "C8CB1YEBIR4Q2AAT",
+      "trigger": "*/15 * * * *",
+      "service": "trade-control-web-hook",
+      "message": "tn[reversals]: using cached session",
+      "account": "4a1a3fca7735ec4b76a4f276821fb795",
+      "type": "cf-worker",
+      "fingerprint": "83bd0c6ddf8a4b5fe22d6b1f5dccfe4d",
+      "origin": "cron",
+      "messageTemplate": "tn[reversals]: using cached session"
+    }
+  },
+  {
+    "source": {
+      "message": "cron session_refresh: 1 TN accounts to consider"
+    },
+    "dataset": "cloudflare-workers",
+    "timestamp": "2026-05-31T21:00:45.342Z",
+    "$workers": {
+      "truncated": false,
+      "event": {
+        "cron": "*/15 * * * *",
+        "scheduledTime": 1780261242000
+      },
+      "scriptName": "trade-control-web-hook",
+      "outcome": "ok",
+      "eventType": "cron",
+      "scriptVersion": {
+        "id": "27bc37ae-48a5-495b-ae0b-e86cac82e9d3"
+      },
+      "executionModel": "stateless",
+      "requestId": "RW6NL5EL0CUVHRC1"
+    },
+    "$metadata": {
+      "id": "01KSZXDMYY5TFMTBBBVCXY4VPX",
+      "requestId": "RW6NL5EL0CUVHRC1",
+      "trigger": "*/15 * * * *",
+      "service": "trade-control-web-hook",
+      "message": "cron session_refresh: 1 TN accounts to consider",
+      "account": "4a1a3fca7735ec4b76a4f276821fb795",
+      "type": "cf-worker",
+      "fingerprint": "83bd0c6ddf8a4b5fe22d6b1f5dccfe4d",
+      "origin": "cron",
+      "messageTemplate": "cron session_refresh: 1 TN accounts to consider"
+    }
+  },
+  {
+    "source": {
+      "level": "info",
+      "message": "*/15 * * * * "
+    },
+    "dataset": "cloudflare-workers",
+    "timestamp": "2026-05-31T21:00:45.256Z",
+    "$workers": {
+      "truncated": false,
+      "event": {
+        "cron": "*/15 * * * *",
+        "scheduledTime": 1780261242000
+      },
+      "scriptName": "trade-control-web-hook",
+      "outcome": "ok",
+      "eventType": "cron",
+      "scriptVersion": {
+        "id": "27bc37ae-48a5-495b-ae0b-e86cac82e9d3"
+      },
+      "executionModel": "stateless",
+      "requestId": "RW6NL5EL0CUVHRC1",
+      "wallTimeMs": 2278,
+      "cpuTimeMs": 11
+    },
+    "$metadata": {
+      "id": "01KSZXDMYY5TFMTBBBVCXY4VPW",
+      "requestId": "RW6NL5EL0CUVHRC1",
+      "trigger": "*/15 * * * *",
+      "service": "trade-control-web-hook",
+      "level": "info",
+      "message": "*/15 * * * * ",
+      "account": "4a1a3fca7735ec4b76a4f276821fb795",
+      "type": "cf-worker-event",
+      "fingerprint": "83bd0c6ddf8a4b5fe22d6b1f5dccfe4d",
+      "origin": "cron",
+      "messageTemplate": "*/15 * * * *"
+    }
+  },
+  {
+    "source": {
+      "message": "cron session_refresh[reversals]: refreshed"
+    },
+    "dataset": "cloudflare-workers",
+    "timestamp": "2026-05-31T20:45:43.415Z",
+    "$workers": {
+      "truncated": false,
+      "event": {
+        "cron": "*/15 * * * *",
+        "scheduledTime": 1780260342000
+      },
+      "scriptName": "trade-control-web-hook",
+      "outcome": "ok",
+      "eventType": "cron",
+      "scriptVersion": {
+        "id": "27bc37ae-48a5-495b-ae0b-e86cac82e9d3"
+      },
+      "executionModel": "stateless",
+      "requestId": "FGXFIPQRZBV8CO08"
+    },
+    "$metadata": {
+      "id": "01KSZWJ3KQWYY4ABCC6B938DCT",
+      "requestId": "FGXFIPQRZBV8CO08",
+      "trigger": "*/15 * * * *",
+      "service": "trade-control-web-hook",
+      "message": "cron session_refresh[reversals]: refreshed",
+      "account": "4a1a3fca7735ec4b76a4f276821fb795",
+      "type": "cf-worker",
+      "fingerprint": "83bd0c6ddf8a4b5fe22d6b1f5dccfe4d",
+      "origin": "cron",
+      "messageTemplate": "cron session_refresh[reversals]: refreshed"
+    }
+  },
+  {
+    "source": {
+      "level": "info",
+      "message": "*/15 * * * * "
+    },
+    "dataset": "cloudflare-workers",
+    "timestamp": "2026-05-31T20:30:43.747Z",
+    "$workers": {
+      "truncated": false,
+      "event": {
+        "cron": "*/15 * * * *",
+        "scheduledTime": 1780259442000
+      },
+      "scriptName": "trade-control-web-hook",
+      "outcome": "ok",
+      "eventType": "cron",
+      "scriptVersion": {
+        "id": "27bc37ae-48a5-495b-ae0b-e86cac82e9d3"
+      },
+      "executionModel": "stateless",
+      "requestId": "BRHF6VRDY0T7A7LY",
+      "wallTimeMs": 2287,
+      "cpuTimeMs": 9
+    },
+    "$metadata": {
+      "id": "01KSZVPPHZH9F1FNM53FBDZ7KG",
+      "requestId": "BRHF6VRDY0T7A7LY",
+      "trigger": "*/15 * * * *",
+      "service": "trade-control-web-hook",
+      "level": "info",
+      "message": "*/15 * * * * ",
+      "account": "4a1a3fca7735ec4b76a4f276821fb795",
+      "type": "cf-worker-event",
+      "fingerprint": "83bd0c6ddf8a4b5fe22d6b1f5dccfe4d",
+      "origin": "cron",
+      "messageTemplate": "*/15 * * * *"
+    }
+  },
+  {
+    "source": {
+      "message": "cron session_refresh: 1 TN accounts to consider"
+    },
+    "dataset": "cloudflare-workers",
+    "timestamp": "2026-05-31T20:15:42.639Z",
+    "$workers": {
+      "truncated": false,
+      "event": {
+        "cron": "*/15 * * * *",
+        "scheduledTime": 1780258542000
+      },
+      "scriptName": "trade-control-web-hook",
+      "outcome": "ok",
+      "eventType": "cron",
+      "scriptVersion": {
+        "id": "27bc37ae-48a5-495b-ae0b-e86cac82e9d3"
+      },
+      "executionModel": "stateless",
+      "requestId": "8X3OG6B32G8KPR2H"
+    },
+    "$metadata": {
+      "id": "01KSZTV51FQVQX50VFXDQE4VHZ",
+      "requestId": "8X3OG6B32G8KPR2H",
+      "trigger": "*/15 * * * *",
+      "service": "trade-control-web-hook",
+      "message": "cron session_refresh: 1 TN accounts to consider",
+      "account": "4a1a3fca7735ec4b76a4f276821fb795",
+      "type": "cf-worker",
+      "fingerprint": "83bd0c6ddf8a4b5fe22d6b1f5dccfe4d",
+      "origin": "cron",
+      "messageTemplate": "cron session_refresh: 1 TN accounts to consider"
+    }
+  },
+  {
+    "source": {
+      "message": "DEBUG tradenation_api::ohlcv: Fetching candles: https://charts.finsatechnology.com/data/minute/61397/bid?l=1"
+    },
+    "dataset": "cloudflare-workers",
+    "timestamp": "2026-05-31T20:00:46.477Z",
+    "$workers": {
+      "truncated": false,
+      "event": {
+        "cron": "*/15 * * * *",
+        "scheduledTime": 1780257642000
+      },
+      "scriptName": "trade-control-web-hook",
+      "outcome": "ok",
+      "eventType": "cron",
+      "scriptVersion": {
+        "id": "27bc37ae-48a5-495b-ae0b-e86cac82e9d3"
+      },
+      "executionModel": "stateless",
+      "requestId": "E06NNF3LL1SLBLNV"
+    },
+    "$metadata": {
+      "id": "01KSZSZSWDYAC1YEKF0GSJ8ZC6",
+      "requestId": "E06NNF3LL1SLBLNV",
+      "trigger": "*/15 * * * *",
+      "service": "trade-control-web-hook",
+      "message": "DEBUG tradenation_api::ohlcv: Fetching candles: https://charts.finsatechnology.com/data/minute/61397/bid?l=1",
+      "account": "4a1a3fca7735ec4b76a4f276821fb795",
+      "type": "cf-worker",
+      "fingerprint": "83bd0c6ddf8a4b5fe22d6b1f5dccfe4d",
+      "origin": "cron",
+      "messageTemplate": "DEBUG tradenation_api::ohlcv: Fetching candles: https://charts.finsatechnology.com/data/minute/61397/bid?l=1"
+    }
+  },
+  {
+    "source": {
+      "level": "info",
+      "message": "*/15 * * * * "
+    },
+    "dataset": "cloudflare-workers",
+    "timestamp": "2026-05-31T20:00:45.168Z",
+    "$workers": {
+      "truncated": false,
+      "event": {
+        "cron": "*/15 * * * *",
+        "scheduledTime": 1780257642000
+      },
+      "scriptName": "trade-control-web-hook",
+      "outcome": "ok",
+      "eventType": "cron",
+      "scriptVersion": {
+        "id": "27bc37ae-48a5-495b-ae0b-e86cac82e9d3"
+      },
+      "executionModel": "stateless",
+      "requestId": "E06NNF3LL1SLBLNV",
+      "wallTimeMs": 2042,
+      "cpuTimeMs": 11
+    },
+    "$metadata": {
+      "id": "01KSZSZSHXZG1RWXRHGFJNRVR0",
+      "requestId": "E06NNF3LL1SLBLNV",
+      "trigger": "*/15 * * * *",
+      "service": "trade-control-web-hook",
+      "level": "info",
+      "message": "*/15 * * * * ",
+      "account": "4a1a3fca7735ec4b76a4f276821fb795",
+      "type": "cf-worker-event",
+      "fingerprint": "83bd0c6ddf8a4b5fe22d6b1f5dccfe4d",
+      "origin": "cron",
+      "messageTemplate": "*/15 * * * *"
+    }
+  },
+  {
+    "source": {
+      "message": "tn[reversals]: using cached session"
+    },
+    "dataset": "cloudflare-workers",
+    "timestamp": "2026-05-31T19:45:43.949Z",
+    "$workers": {
+      "truncated": false,
+      "event": {
+        "cron": "*/15 * * * *",
+        "scheduledTime": 1780256742000
+      },
+      "scriptName": "trade-control-web-hook",
+      "outcome": "ok",
+      "eventType": "cron",
+      "scriptVersion": {
+        "id": "27bc37ae-48a5-495b-ae0b-e86cac82e9d3"
+      },
+      "executionModel": "stateless",
+      "requestId": "2VDCGZD0HEFJV9BC"
+    },
+    "$metadata": {
+      "id": "01KSZS48GDQG4ZJAS5ZGF0JHY0",
+      "requestId": "2VDCGZD0HEFJV9BC",
+      "trigger": "*/15 * * * *",
+      "service": "trade-control-web-hook",
+      "message": "tn[reversals]: using cached session",
+      "account": "4a1a3fca7735ec4b76a4f276821fb795",
+      "type": "cf-worker",
+      "fingerprint": "83bd0c6ddf8a4b5fe22d6b1f5dccfe4d",
+      "origin": "cron",
+      "messageTemplate": "tn[reversals]: using cached session"
+    }
+  },
+  {
+    "source": {
+      "level": "info",
+      "message": "*/15 * * * * "
+    },
+    "dataset": "cloudflare-workers",
+    "timestamp": "2026-05-31T18:30:43.161Z",
+    "$workers": {
+      "truncated": false,
+      "event": {
+        "cron": "*/15 * * * *",
+        "scheduledTime": 1780252242000
+      },
+      "scriptName": "trade-control-web-hook",
+      "outcome": "ok",
+      "eventType": "cron",
+      "scriptVersion": {
+        "id": "27bc37ae-48a5-495b-ae0b-e86cac82e9d3"
+      },
+      "executionModel": "stateless",
+      "requestId": "9GP62WPCMANNKW37",
+      "wallTimeMs": 1794,
+      "cpuTimeMs": 10
+    },
+    "$metadata": {
+      "id": "01KSZMTYSRM2EKAV7J848S4MSP",
+      "requestId": "9GP62WPCMANNKW37",
+      "trigger": "*/15 * * * *",
+      "service": "trade-control-web-hook",
+      "level": "info",
+      "message": "*/15 * * * * ",
+      "account": "4a1a3fca7735ec4b76a4f276821fb795",
+      "type": "cf-worker-event",
+      "fingerprint": "83bd0c6ddf8a4b5fe22d6b1f5dccfe4d",
+      "origin": "cron",
+      "messageTemplate": "*/15 * * * *"
+    }
+  },
+  {
+    "source": {
+      "message": "DEBUG tradenation_api::ohlcv: Fetching candles: https://charts.finsatechnology.com/data/minute/61397/ask?l=1"
+    },
+    "dataset": "cloudflare-workers",
+    "timestamp": "2026-05-31T18:00:46.933Z",
+    "$workers": {
+      "truncated": false,
+      "event": {
+        "cron": "*/15 * * * *",
+        "scheduledTime": 1780250442000
+      },
+      "scriptName": "trade-control-web-hook",
+      "outcome": "ok",
+      "eventType": "cron",
+      "scriptVersion": {
+        "id": "27bc37ae-48a5-495b-ae0b-e86cac82e9d3"
+      },
+      "executionModel": "stateless",
+      "requestId": "ALPVJFIWQYASEWUB"
+    },
+    "$metadata": {
+      "id": "01KSZK432NW2C04Q3P2DEVPET2",
+      "requestId": "ALPVJFIWQYASEWUB",
+      "trigger": "*/15 * * * *",
+      "service": "trade-control-web-hook",
+      "message": "DEBUG tradenation_api::ohlcv: Fetching candles: https://charts.finsatechnology.com/data/minute/61397/ask?l=1",
+      "account": "4a1a3fca7735ec4b76a4f276821fb795",
+      "type": "cf-worker",
+      "fingerprint": "83bd0c6ddf8a4b5fe22d6b1f5dccfe4d",
+      "origin": "cron",
+      "messageTemplate": "DEBUG tradenation_api::ohlcv: Fetching candles: https://charts.finsatechnology.com/data/minute/61397/<*>"
+    }
+  },
+  {
+    "source": {
+      "message": "cron session_refresh[reversals]: refreshed"
+    },
+    "dataset": "cloudflare-workers",
+    "timestamp": "2026-05-31T18:00:45.694Z",
+    "$workers": {
+      "truncated": false,
+      "event": {
+        "cron": "*/15 * * * *",
+        "scheduledTime": 1780250442000
+      },
+      "scriptName": "trade-control-web-hook",
+      "outcome": "ok",
+      "eventType": "cron",
+      "scriptVersion": {
+        "id": "27bc37ae-48a5-495b-ae0b-e86cac82e9d3"
+      },
+      "executionModel": "stateless",
+      "requestId": "ALPVJFIWQYASEWUB"
+    },
+    "$metadata": {
+      "id": "01KSZK427T45AHGBFV8V2EFNBK",
+      "requestId": "ALPVJFIWQYASEWUB",
+      "trigger": "*/15 * * * *",
+      "service": "trade-control-web-hook",
+      "message": "cron session_refresh[reversals]: refreshed",
+      "account": "4a1a3fca7735ec4b76a4f276821fb795",
+      "type": "cf-worker",
+      "fingerprint": "83bd0c6ddf8a4b5fe22d6b1f5dccfe4d",
+      "origin": "cron",
+      "messageTemplate": "cron session_refresh[reversals]: refreshed"
+    }
+  },
+  {
+    "source": {
+      "level": "info",
+      "message": "*/15 * * * * "
+    },
+    "dataset": "cloudflare-workers",
+    "timestamp": "2026-05-31T17:45:42.548Z",
+    "$workers": {
+      "truncated": false,
+      "event": {
+        "cron": "*/15 * * * *",
+        "scheduledTime": 1780249542000
+      },
+      "scriptName": "trade-control-web-hook",
+      "outcome": "ok",
+      "eventType": "cron",
+      "scriptVersion": {
+        "id": "27bc37ae-48a5-495b-ae0b-e86cac82e9d3"
+      },
+      "executionModel": "stateless",
+      "requestId": "SKDKOOG7M6VJT3SH",
+      "wallTimeMs": 2588,
+      "cpuTimeMs": 10
+    },
+    "$metadata": {
+      "id": "01KSZJ8FWM123GWQZR0XAWERE9",
+      "requestId": "SKDKOOG7M6VJT3SH",
+      "trigger": "*/15 * * * *",
+      "service": "trade-control-web-hook",
+      "level": "info",
+      "message": "*/15 * * * * ",
+      "account": "4a1a3fca7735ec4b76a4f276821fb795",
+      "type": "cf-worker-event",
+      "fingerprint": "83bd0c6ddf8a4b5fe22d6b1f5dccfe4d",
+      "origin": "cron",
+      "messageTemplate": "*/15 * * * *"
+    }
+  },
+  {
+    "source": {
+      "message": "DEBUG tradenation_api::ohlcv: Fetching candles: https://charts.finsatechnology.com/data/minute/61397/bid?l=1"
+    },
+    "dataset": "cloudflare-workers",
+    "timestamp": "2026-05-31T16:45:44.297Z",
+    "$workers": {
+      "truncated": false,
+      "event": {
+        "cron": "*/15 * * * *",
+        "scheduledTime": 1780245942000
+      },
+      "scriptName": "trade-control-web-hook",
+      "outcome": "ok",
+      "eventType": "cron",
+      "scriptVersion": {
+        "id": "27bc37ae-48a5-495b-ae0b-e86cac82e9d3"
+      },
+      "executionModel": "stateless",
+      "requestId": "6ZA699CX1P5E9ONR"
+    },
+    "$metadata": {
+      "id": "01KSZETNZ96P1ZZY1XBQANNNNV",
+      "requestId": "6ZA699CX1P5E9ONR",
+      "trigger": "*/15 * * * *",
+      "service": "trade-control-web-hook",
+      "message": "DEBUG tradenation_api::ohlcv: Fetching candles: https://charts.finsatechnology.com/data/minute/61397/bid?l=1",
+      "account": "4a1a3fca7735ec4b76a4f276821fb795",
+      "type": "cf-worker",
+      "fingerprint": "83bd0c6ddf8a4b5fe22d6b1f5dccfe4d",
+      "origin": "cron",
+      "messageTemplate": "DEBUG tradenation_api::ohlcv: Fetching candles: https://charts.finsatechnology.com/data/minute/61397/bid?l=1"
+    }
+  },
+  {
+    "source": {
+      "message": "tn[reversals]: using cached session"
+    },
+    "dataset": "cloudflare-workers",
+    "timestamp": "2026-05-31T16:45:43.961Z",
+    "$workers": {
+      "truncated": false,
+      "event": {
+        "cron": "*/15 * * * *",
+        "scheduledTime": 1780245942000
+      },
+      "scriptName": "trade-control-web-hook",
+      "outcome": "ok",
+      "eventType": "cron",
+      "scriptVersion": {
+        "id": "27bc37ae-48a5-495b-ae0b-e86cac82e9d3"
+      },
+      "executionModel": "stateless",
+      "requestId": "6ZA699CX1P5E9ONR"
+    },
+    "$metadata": {
+      "id": "01KSZETNYDA5MHYCW5D5CEQMBN",
+      "requestId": "6ZA699CX1P5E9ONR",
+      "trigger": "*/15 * * * *",
+      "service": "trade-control-web-hook",
+      "message": "tn[reversals]: using cached session",
+      "account": "4a1a3fca7735ec4b76a4f276821fb795",
+      "type": "cf-worker",
+      "fingerprint": "83bd0c6ddf8a4b5fe22d6b1f5dccfe4d",
+      "origin": "cron",
+      "messageTemplate": "tn[reversals]: using cached session"
+    }
+  },
+  {
+    "source": {
+      "message": "cron session_refresh[reversals]: refreshed"
+    },
+    "dataset": "cloudflare-workers",
+    "timestamp": "2026-05-31T16:30:44.277Z",
+    "$workers": {
+      "truncated": false,
+      "event": {
+        "cron": "*/15 * * * *",
+        "scheduledTime": 1780245042000
+      },
+      "scriptName": "trade-control-web-hook",
+      "outcome": "ok",
+      "eventType": "cron",
+      "scriptVersion": {
+        "id": "27bc37ae-48a5-495b-ae0b-e86cac82e9d3"
+      },
+      "executionModel": "stateless",
+      "requestId": "EFG4KSO1J4BXWZTO"
+    },
+    "$metadata": {
+      "id": "01KSZDZ7VMZB5BJ2Y2XDJGAWXX",
+      "requestId": "EFG4KSO1J4BXWZTO",
+      "trigger": "*/15 * * * *",
+      "service": "trade-control-web-hook",
+      "message": "cron session_refresh[reversals]: refreshed",
+      "account": "4a1a3fca7735ec4b76a4f276821fb795",
+      "type": "cf-worker",
+      "fingerprint": "83bd0c6ddf8a4b5fe22d6b1f5dccfe4d",
+      "origin": "cron",
+      "messageTemplate": "cron session_refresh[reversals]: refreshed"
+    }
+  },
+  {
+    "source": {
+      "message": "DEBUG tradenation_api::ohlcv: Fetching candles: https://charts.finsatechnology.com/data/minute/61397/ask?l=1"
+    },
+    "dataset": "cloudflare-workers",
+    "timestamp": "2026-05-31T16:15:44.622Z",
+    "$workers": {
+      "truncated": false,
+      "event": {
+        "cron": "*/15 * * * *",
+        "scheduledTime": 1780244142000
+      },
+      "scriptName": "trade-control-web-hook",
+      "outcome": "ok",
+      "eventType": "cron",
+      "scriptVersion": {
+        "id": "27bc37ae-48a5-495b-ae0b-e86cac82e9d3"
+      },
+      "executionModel": "stateless",
+      "requestId": "368R7YD6RIAIRS79"
+    },
+    "$metadata": {
+      "id": "01KSZD3RFEH20H5NBKS7MBGR91",
+      "requestId": "368R7YD6RIAIRS79",
+      "trigger": "*/15 * * * *",
+      "service": "trade-control-web-hook",
+      "message": "DEBUG tradenation_api::ohlcv: Fetching candles: https://charts.finsatechnology.com/data/minute/61397/ask?l=1",
+      "account": "4a1a3fca7735ec4b76a4f276821fb795",
+      "type": "cf-worker",
+      "fingerprint": "83bd0c6ddf8a4b5fe22d6b1f5dccfe4d",
+      "origin": "cron",
+      "messageTemplate": "DEBUG tradenation_api::ohlcv: Fetching candles: https://charts.finsatechnology.com/data/minute/61397/<*>"
+    }
+  },
+  {
+    "source": {
+      "message": "DEBUG tradenation_api::ohlcv: Fetching candles: https://charts.finsatechnology.com/data/minute/61397/bid?l=1"
+    },
+    "dataset": "cloudflare-workers",
+    "timestamp": "2026-05-31T16:15:43.838Z",
+    "$workers": {
+      "truncated": false,
+      "event": {
+        "cron": "*/15 * * * *",
+        "scheduledTime": 1780244142000
+      },
+      "scriptName": "trade-control-web-hook",
+      "outcome": "ok",
+      "eventType": "cron",
+      "scriptVersion": {
+        "id": "27bc37ae-48a5-495b-ae0b-e86cac82e9d3"
+      },
+      "executionModel": "stateless",
+      "requestId": "368R7YD6RIAIRS79"
+    },
+    "$metadata": {
+      "id": "01KSZD3QPYTH2ZV9GK85C2T29J",
+      "requestId": "368R7YD6RIAIRS79",
+      "trigger": "*/15 * * * *",
+      "service": "trade-control-web-hook",
+      "message": "DEBUG tradenation_api::ohlcv: Fetching candles: https://charts.finsatechnology.com/data/minute/61397/bid?l=1",
+      "account": "4a1a3fca7735ec4b76a4f276821fb795",
+      "type": "cf-worker",
+      "fingerprint": "83bd0c6ddf8a4b5fe22d6b1f5dccfe4d",
+      "origin": "cron",
+      "messageTemplate": "DEBUG tradenation_api::ohlcv: Fetching candles: https://charts.finsatechnology.com/data/minute/61397/bid?l=1"
+    }
+  },
+  {
+    "source": {
+      "message": "tn[reversals]: using cached session"
+    },
+    "dataset": "cloudflare-workers",
+    "timestamp": "2026-05-31T16:15:43.214Z",
+    "$workers": {
+      "truncated": false,
+      "event": {
+        "cron": "*/15 * * * *",
+        "scheduledTime": 1780244142000
+      },
+      "scriptName": "trade-control-web-hook",
+      "outcome": "ok",
+      "eventType": "cron",
+      "scriptVersion": {
+        "id": "27bc37ae-48a5-495b-ae0b-e86cac82e9d3"
+      },
+      "executionModel": "stateless",
+      "requestId": "368R7YD6RIAIRS79"
+    },
+    "$metadata": {
+      "id": "01KSZD3Q3E4PYY4D23FZJX61EY",
+      "requestId": "368R7YD6RIAIRS79",
+      "trigger": "*/15 * * * *",
+      "service": "trade-control-web-hook",
+      "message": "tn[reversals]: using cached session",
+      "account": "4a1a3fca7735ec4b76a4f276821fb795",
+      "type": "cf-worker",
+      "fingerprint": "83bd0c6ddf8a4b5fe22d6b1f5dccfe4d",
+      "origin": "cron",
+      "messageTemplate": "tn[reversals]: using cached session"
+    }
+  },
+  {
+    "source": {
+      "message": "cron sweep: 1 tracked attempts"
+    },
+    "dataset": "cloudflare-workers",
+    "timestamp": "2026-05-31T15:30:44.432Z",
+    "$workers": {
+      "truncated": false,
+      "event": {
+        "cron": "*/15 * * * *",
+        "scheduledTime": 1780241442000
+      },
+      "scriptName": "trade-control-web-hook",
+      "outcome": "ok",
+      "eventType": "cron",
+      "scriptVersion": {
+        "id": "27bc37ae-48a5-495b-ae0b-e86cac82e9d3"
+      },
+      "executionModel": "stateless",
+      "requestId": "HHS7IP9FZOTGOYUQ"
+    },
+    "$metadata": {
+      "id": "01KSZAHBT2JYJYBRW8T00XN7P5",
+      "requestId": "HHS7IP9FZOTGOYUQ",
+      "trigger": "*/15 * * * *",
+      "service": "trade-control-web-hook",
+      "message": "cron sweep: 1 tracked attempts",
+      "account": "4a1a3fca7735ec4b76a4f276821fb795",
+      "type": "cf-worker",
+      "fingerprint": "83bd0c6ddf8a4b5fe22d6b1f5dccfe4d",
+      "origin": "cron",
+      "messageTemplate": "cron sweep: 1 tracked attempts"
+    }
+  },
+  {
+    "source": {
+      "message": "cron sweep: 1 tracked attempts"
+    },
+    "dataset": "cloudflare-workers",
+    "timestamp": "2026-05-31T14:45:43.620Z",
+    "$workers": {
+      "truncated": false,
+      "event": {
+        "cron": "*/15 * * * *",
+        "scheduledTime": 1780238742000
+      },
+      "scriptName": "trade-control-web-hook",
+      "outcome": "ok",
+      "eventType": "cron",
+      "scriptVersion": {
+        "id": "27bc37ae-48a5-495b-ae0b-e86cac82e9d3"
+      },
+      "executionModel": "stateless",
+      "requestId": "ANQ25L0JNBGP3Y58"
+    },
+    "$metadata": {
+      "id": "01KSZ7YY24NP3CGEPN5V7KK80B",
+      "requestId": "ANQ25L0JNBGP3Y58",
+      "trigger": "*/15 * * * *",
+      "service": "trade-control-web-hook",
+      "message": "cron sweep: 1 tracked attempts",
+      "account": "4a1a3fca7735ec4b76a4f276821fb795",
+      "type": "cf-worker",
+      "fingerprint": "83bd0c6ddf8a4b5fe22d6b1f5dccfe4d",
+      "origin": "cron",
+      "messageTemplate": "cron sweep: 1 tracked attempts"
+    }
+  },
+  {
+    "source": {
+      "message": "tn[reversals]: using cached session"
+    },
+    "dataset": "cloudflare-workers",
+    "timestamp": "2026-05-31T14:45:43.448Z",
+    "$workers": {
+      "truncated": false,
+      "event": {
+        "cron": "*/15 * * * *",
+        "scheduledTime": 1780238742000
+      },
+      "scriptName": "trade-control-web-hook",
+      "outcome": "ok",
+      "eventType": "cron",
+      "scriptVersion": {
+        "id": "27bc37ae-48a5-495b-ae0b-e86cac82e9d3"
+      },
+      "executionModel": "stateless",
+      "requestId": "ANQ25L0JNBGP3Y58"
+    },
+    "$metadata": {
+      "id": "01KSZ7YXWRAEBFSYKVTRQQCTBD",
+      "requestId": "ANQ25L0JNBGP3Y58",
+      "trigger": "*/15 * * * *",
+      "service": "trade-control-web-hook",
+      "message": "tn[reversals]: using cached session",
+      "account": "4a1a3fca7735ec4b76a4f276821fb795",
+      "type": "cf-worker",
+      "fingerprint": "83bd0c6ddf8a4b5fe22d6b1f5dccfe4d",
+      "origin": "cron",
+      "messageTemplate": "tn[reversals]: using cached session"
+    }
+  },
+  {
+    "source": {
+      "message": "DEBUG tradenation_api::ohlcv: Fetching candles: https://charts.finsatechnology.com/data/minute/61397/bid?l=1"
+    },
+    "dataset": "cloudflare-workers",
+    "timestamp": "2026-05-31T14:30:44.582Z",
+    "$workers": {
+      "truncated": false,
+      "event": {
+        "cron": "*/15 * * * *",
+        "scheduledTime": 1780237842000
+      },
+      "scriptName": "trade-control-web-hook",
+      "outcome": "ok",
+      "eventType": "cron",
+      "scriptVersion": {
+        "id": "27bc37ae-48a5-495b-ae0b-e86cac82e9d3"
+      },
+      "executionModel": "stateless",
+      "requestId": "ZQ95CGT1MWPIIE6Y"
+    },
+    "$metadata": {
+      "id": "01KSZ73G36RX3G8F4ZNTGA4E03",
+      "requestId": "ZQ95CGT1MWPIIE6Y",
+      "trigger": "*/15 * * * *",
+      "service": "trade-control-web-hook",
+      "message": "DEBUG tradenation_api::ohlcv: Fetching candles: https://charts.finsatechnology.com/data/minute/61397/bid?l=1",
+      "account": "4a1a3fca7735ec4b76a4f276821fb795",
+      "type": "cf-worker",
+      "fingerprint": "83bd0c6ddf8a4b5fe22d6b1f5dccfe4d",
+      "origin": "cron",
+      "messageTemplate": "DEBUG tradenation_api::ohlcv: Fetching candles: https://charts.finsatechnology.com/data/minute/61397/bid?l=1"
+    }
+  },
+  {
+    "source": {
+      "message": "cron sweep: 1 tracked attempts"
+    },
+    "dataset": "cloudflare-workers",
+    "timestamp": "2026-05-31T14:30:44.142Z",
+    "$workers": {
+      "truncated": false,
+      "event": {
+        "cron": "*/15 * * * *",
+        "scheduledTime": 1780237842000
+      },
+      "scriptName": "trade-control-web-hook",
+      "outcome": "ok",
+      "eventType": "cron",
+      "scriptVersion": {
+        "id": "27bc37ae-48a5-495b-ae0b-e86cac82e9d3"
+      },
+      "executionModel": "stateless",
+      "requestId": "ZQ95CGT1MWPIIE6Y"
+    },
+    "$metadata": {
+      "id": "01KSZ73FZRRSFEPD47Y6CERY5K",
+      "requestId": "ZQ95CGT1MWPIIE6Y",
+      "trigger": "*/15 * * * *",
+      "service": "trade-control-web-hook",
+      "message": "cron sweep: 1 tracked attempts",
+      "account": "4a1a3fca7735ec4b76a4f276821fb795",
+      "type": "cf-worker",
+      "fingerprint": "83bd0c6ddf8a4b5fe22d6b1f5dccfe4d",
+      "origin": "cron",
+      "messageTemplate": "cron sweep: 1 tracked attempts"
+    }
+  },
+  {
+    "source": {
+      "message": "tn[reversals]: using cached session"
+    },
+    "dataset": "cloudflare-workers",
+    "timestamp": "2026-05-31T14:30:43.948Z",
+    "$workers": {
+      "truncated": false,
+      "event": {
+        "cron": "*/15 * * * *",
+        "scheduledTime": 1780237842000
+      },
+      "scriptName": "trade-control-web-hook",
+      "outcome": "ok",
+      "eventType": "cron",
+      "scriptVersion": {
+        "id": "27bc37ae-48a5-495b-ae0b-e86cac82e9d3"
+      },
+      "executionModel": "stateless",
+      "requestId": "ZQ95CGT1MWPIIE6Y"
+    },
+    "$metadata": {
+      "id": "01KSZ73FZRRSFEPD47Y6CERY5H",
+      "requestId": "ZQ95CGT1MWPIIE6Y",
+      "trigger": "*/15 * * * *",
+      "service": "trade-control-web-hook",
+      "message": "tn[reversals]: using cached session",
+      "account": "4a1a3fca7735ec4b76a4f276821fb795",
+      "type": "cf-worker",
+      "fingerprint": "83bd0c6ddf8a4b5fe22d6b1f5dccfe4d",
+      "origin": "cron",
+      "messageTemplate": "tn[reversals]: using cached session"
+    }
+  },
+  {
+    "source": {
+      "message": "tn[reversals]: using cached session"
+    },
+    "dataset": "cloudflare-workers",
+    "timestamp": "2026-05-31T14:15:43.384Z",
+    "$workers": {
+      "truncated": false,
+      "event": {
+        "cron": "*/15 * * * *",
+        "scheduledTime": 1780236942000
+      },
+      "scriptName": "trade-control-web-hook",
+      "outcome": "ok",
+      "eventType": "cron",
+      "scriptVersion": {
+        "id": "27bc37ae-48a5-495b-ae0b-e86cac82e9d3"
+      },
+      "executionModel": "stateless",
+      "requestId": "JDXKTODXHDDXAUGT"
+    },
+    "$metadata": {
+      "id": "01KSZ6811NPT6Z26TQT054K748",
+      "requestId": "JDXKTODXHDDXAUGT",
+      "trigger": "*/15 * * * *",
+      "service": "trade-control-web-hook",
+      "message": "tn[reversals]: using cached session",
+      "account": "4a1a3fca7735ec4b76a4f276821fb795",
+      "type": "cf-worker",
+      "fingerprint": "83bd0c6ddf8a4b5fe22d6b1f5dccfe4d",
+      "origin": "cron",
+      "messageTemplate": "tn[reversals]: using cached session"
+    }
+  },
+  {
+    "source": {
+      "message": "DEBUG tradenation_api::ohlcv: Fetching candles: https://charts.finsatechnology.com/data/minute/61397/ask?l=1"
+    },
+    "dataset": "cloudflare-workers",
+    "timestamp": "2026-05-31T14:00:47.708Z",
+    "$workers": {
+      "truncated": false,
+      "event": {
+        "cron": "*/15 * * * *",
+        "scheduledTime": 1780236042000
+      },
+      "scriptName": "trade-control-web-hook",
+      "outcome": "ok",
+      "eventType": "cron",
+      "scriptVersion": {
+        "id": "27bc37ae-48a5-495b-ae0b-e86cac82e9d3"
+      },
+      "executionModel": "stateless",
+      "requestId": "EN3FTPTHGMFOXSEB"
+    },
+    "$metadata": {
+      "id": "01KSZ5CNAWEQS8FXW9FF9R1XSB",
+      "requestId": "EN3FTPTHGMFOXSEB",
+      "trigger": "*/15 * * * *",
+      "service": "trade-control-web-hook",
+      "message": "DEBUG tradenation_api::ohlcv: Fetching candles: https://charts.finsatechnology.com/data/minute/61397/ask?l=1",
+      "account": "4a1a3fca7735ec4b76a4f276821fb795",
+      "type": "cf-worker",
+      "fingerprint": "83bd0c6ddf8a4b5fe22d6b1f5dccfe4d",
+      "origin": "cron",
+      "messageTemplate": "DEBUG tradenation_api::ohlcv: Fetching candles: https://charts.finsatechnology.com/data/minute/61397/<*>"
+    }
+  },
+  {
+    "source": {
+      "message": "tn[reversals]: using cached session"
+    },
+    "dataset": "cloudflare-workers",
+    "timestamp": "2026-05-31T14:00:46.470Z",
+    "$workers": {
+      "truncated": false,
+      "event": {
+        "cron": "*/15 * * * *",
+        "scheduledTime": 1780236042000
+      },
+      "scriptName": "trade-control-web-hook",
+      "outcome": "ok",
+      "eventType": "cron",
+      "scriptVersion": {
+        "id": "27bc37ae-48a5-495b-ae0b-e86cac82e9d3"
+      },
+      "executionModel": "stateless",
+      "requestId": "EN3FTPTHGMFOXSEB"
+    },
+    "$metadata": {
+      "id": "01KSZ5CM46MH42B6SV5NW20SBQ",
+      "requestId": "EN3FTPTHGMFOXSEB",
+      "trigger": "*/15 * * * *",
+      "service": "trade-control-web-hook",
+      "message": "tn[reversals]: using cached session",
+      "account": "4a1a3fca7735ec4b76a4f276821fb795",
+      "type": "cf-worker",
+      "fingerprint": "83bd0c6ddf8a4b5fe22d6b1f5dccfe4d",
+      "origin": "cron",
+      "messageTemplate": "tn[reversals]: using cached session"
+    }
+  },
+  {
+    "source": {
+      "message": "cron sweep: 1 tracked attempts"
+    },
+    "dataset": "cloudflare-workers",
+    "timestamp": "2026-05-31T13:45:43.418Z",
+    "$workers": {
+      "truncated": false,
+      "event": {
+        "cron": "*/15 * * * *",
+        "scheduledTime": 1780235142000
+      },
+      "scriptName": "trade-control-web-hook",
+      "outcome": "ok",
+      "eventType": "cron",
+      "scriptVersion": {
+        "id": "27bc37ae-48a5-495b-ae0b-e86cac82e9d3"
+      },
+      "executionModel": "stateless",
+      "requestId": "VNP4O03AIGSGDJF6"
+    },
+    "$metadata": {
+      "id": "01KSZ4H3C6PCSHPZC0C8YNNT1H",
+      "requestId": "VNP4O03AIGSGDJF6",
+      "trigger": "*/15 * * * *",
+      "service": "trade-control-web-hook",
+      "message": "cron sweep: 1 tracked attempts",
+      "account": "4a1a3fca7735ec4b76a4f276821fb795",
+      "type": "cf-worker",
+      "fingerprint": "83bd0c6ddf8a4b5fe22d6b1f5dccfe4d",
+      "origin": "cron",
+      "messageTemplate": "cron sweep: 1 tracked attempts"
+    }
+  },
+  {
+    "source": {
+      "message": "tn[reversals]: using cached session"
+    },
+    "dataset": "cloudflare-workers",
+    "timestamp": "2026-05-31T13:00:45.052Z",
+    "$workers": {
+      "truncated": false,
+      "event": {
+        "cron": "*/15 * * * *",
+        "scheduledTime": 1780232442000
+      },
+      "scriptName": "trade-control-web-hook",
+      "outcome": "ok",
+      "eventType": "cron",
+      "scriptVersion": {
+        "id": "27bc37ae-48a5-495b-ae0b-e86cac82e9d3"
+      },
+      "executionModel": "stateless",
+      "requestId": "HRWXVME6CIZHWOM4"
+    },
+    "$metadata": {
+      "id": "01KSZ1YQ3W3GN7TE9J6K3RH8H0",
+      "requestId": "HRWXVME6CIZHWOM4",
+      "trigger": "*/15 * * * *",
+      "service": "trade-control-web-hook",
+      "message": "tn[reversals]: using cached session",
+      "account": "4a1a3fca7735ec4b76a4f276821fb795",
+      "type": "cf-worker",
+      "fingerprint": "83bd0c6ddf8a4b5fe22d6b1f5dccfe4d",
+      "origin": "cron",
+      "messageTemplate": "tn[reversals]: using cached session"
+    }
+  },
+  {
+    "source": {
+      "message": "cron session_refresh[reversals]: refreshed"
+    },
+    "dataset": "cloudflare-workers",
+    "timestamp": "2026-05-31T12:45:43.230Z",
+    "$workers": {
+      "truncated": false,
+      "event": {
+        "cron": "*/15 * * * *",
+        "scheduledTime": 1780231542000
+      },
+      "scriptName": "trade-control-web-hook",
+      "outcome": "ok",
+      "eventType": "cron",
+      "scriptVersion": {
+        "id": "27bc37ae-48a5-495b-ae0b-e86cac82e9d3"
+      },
+      "executionModel": "stateless",
+      "requestId": "DKW33L3BJYMW58AY"
+    },
+    "$metadata": {
+      "id": "01KSZ136DYAXR3QS8T993FTBBB",
+      "requestId": "DKW33L3BJYMW58AY",
+      "trigger": "*/15 * * * *",
+      "service": "trade-control-web-hook",
+      "message": "cron session_refresh[reversals]: refreshed",
+      "account": "4a1a3fca7735ec4b76a4f276821fb795",
+      "type": "cf-worker",
+      "fingerprint": "83bd0c6ddf8a4b5fe22d6b1f5dccfe4d",
+      "origin": "cron",
+      "messageTemplate": "cron session_refresh[reversals]: refreshed"
+    }
+  },
+  {
+    "source": {
+      "message": "cron session_refresh: 1 TN accounts to consider"
+    },
+    "dataset": "cloudflare-workers",
+    "timestamp": "2026-05-31T12:45:42.626Z",
+    "$workers": {
+      "truncated": false,
+      "event": {
+        "cron": "*/15 * * * *",
+        "scheduledTime": 1780231542000
+      },
+      "scriptName": "trade-control-web-hook",
+      "outcome": "ok",
+      "eventType": "cron",
+      "scriptVersion": {
+        "id": "27bc37ae-48a5-495b-ae0b-e86cac82e9d3"
+      },
+      "executionModel": "stateless",
+      "requestId": "DKW33L3BJYMW58AY"
+    },
+    "$metadata": {
+      "id": "01KSZ135V2F6P2T86P38X93WT9",
+      "requestId": "DKW33L3BJYMW58AY",
+      "trigger": "*/15 * * * *",
+      "service": "trade-control-web-hook",
+      "message": "cron session_refresh: 1 TN accounts to consider",
+      "account": "4a1a3fca7735ec4b76a4f276821fb795",
+      "type": "cf-worker",
+      "fingerprint": "83bd0c6ddf8a4b5fe22d6b1f5dccfe4d",
+      "origin": "cron",
+      "messageTemplate": "cron session_refresh: 1 TN accounts to consider"
+    }
+  },
+  {
+    "source": {
+      "message": "tn[reversals]: using cached session"
+    },
+    "dataset": "cloudflare-workers",
+    "timestamp": "2026-05-31T12:00:46.970Z",
+    "$workers": {
+      "truncated": false,
+      "event": {
+        "cron": "*/15 * * * *",
+        "scheduledTime": 1780228842000
+      },
+      "scriptName": "trade-control-web-hook",
+      "outcome": "ok",
+      "eventType": "cron",
+      "scriptVersion": {
+        "id": "27bc37ae-48a5-495b-ae0b-e86cac82e9d3"
+      },
+      "executionModel": "stateless",
+      "requestId": "BAM5RDZ9HYZPKEX4"
+    },
+    "$metadata": {
+      "id": "01KSYYGXBTGNSRJ3QD3CSR5JFN",
+      "requestId": "BAM5RDZ9HYZPKEX4",
+      "trigger": "*/15 * * * *",
+      "service": "trade-control-web-hook",
+      "message": "tn[reversals]: using cached session",
+      "account": "4a1a3fca7735ec4b76a4f276821fb795",
+      "type": "cf-worker",
+      "fingerprint": "83bd0c6ddf8a4b5fe22d6b1f5dccfe4d",
+      "origin": "cron",
+      "messageTemplate": "tn[reversals]: using cached session"
+    }
+  },
+  {
+    "source": {
+      "level": "info",
+      "message": "*/15 * * * * "
+    },
+    "dataset": "cloudflare-workers",
+    "timestamp": "2026-05-31T11:45:42.550Z",
+    "$workers": {
+      "truncated": false,
+      "event": {
+        "cron": "*/15 * * * *",
+        "scheduledTime": 1780227942000
+      },
+      "scriptName": "trade-control-web-hook",
+      "outcome": "ok",
+      "eventType": "cron",
+      "scriptVersion": {
+        "id": "27bc37ae-48a5-495b-ae0b-e86cac82e9d3"
+      },
+      "executionModel": "stateless",
+      "requestId": "SRNMFK407K85F871",
+      "wallTimeMs": 2632,
+      "cpuTimeMs": 35
+    },
+    "$metadata": {
+      "id": "01KSYXNBPHN0WZPBZTBQM9Q2G5",
+      "requestId": "SRNMFK407K85F871",
+      "trigger": "*/15 * * * *",
+      "service": "trade-control-web-hook",
+      "level": "info",
+      "message": "*/15 * * * * ",
+      "account": "4a1a3fca7735ec4b76a4f276821fb795",
+      "type": "cf-worker-event",
+      "fingerprint": "83bd0c6ddf8a4b5fe22d6b1f5dccfe4d",
+      "origin": "cron",
+      "messageTemplate": "*/15 * * * *"
+    }
+  },
+  {
+    "source": {
+      "message": "DEBUG tradenation_api::ohlcv: Fetching candles: https://charts.finsatechnology.com/data/minute/61397/ask?l=1"
+    },
+    "dataset": "cloudflare-workers",
+    "timestamp": "2026-05-31T11:30:12.521Z",
+    "$workers": {
+      "truncated": false,
+      "event": {
+        "cron": "*/15 * * * *",
+        "scheduledTime": 1780227009000
+      },
+      "scriptName": "trade-control-web-hook",
+      "outcome": "ok",
+      "eventType": "cron",
+      "scriptVersion": {
+        "id": "27bc37ae-48a5-495b-ae0b-e86cac82e9d3"
+      },
+      "executionModel": "stateless",
+      "requestId": "8FTP30ZGK39ALALZ"
+    },
+    "$metadata": {
+      "id": "01KSYWRXX9NS75SY6W8AW8SB2R",
+      "requestId": "8FTP30ZGK39ALALZ",
+      "trigger": "*/15 * * * *",
+      "service": "trade-control-web-hook",
+      "message": "DEBUG tradenation_api::ohlcv: Fetching candles: https://charts.finsatechnology.com/data/minute/61397/ask?l=1",
+      "account": "4a1a3fca7735ec4b76a4f276821fb795",
+      "type": "cf-worker",
+      "fingerprint": "83bd0c6ddf8a4b5fe22d6b1f5dccfe4d",
+      "origin": "cron",
+      "messageTemplate": "DEBUG tradenation_api::ohlcv: Fetching candles: https://charts.finsatechnology.com/data/minute/61397/<*>"
+    }
+  },
+  {
+    "source": {
+      "message": "tn[reversals]: using cached session"
+    },
+    "dataset": "cloudflare-workers",
+    "timestamp": "2026-05-31T11:30:11.577Z",
+    "$workers": {
+      "truncated": false,
+      "event": {
+        "cron": "*/15 * * * *",
+        "scheduledTime": 1780227009000
+      },
+      "scriptName": "trade-control-web-hook",
+      "outcome": "ok",
+      "eventType": "cron",
+      "scriptVersion": {
+        "id": "27bc37ae-48a5-495b-ae0b-e86cac82e9d3"
+      },
+      "executionModel": "stateless",
+      "requestId": "8FTP30ZGK39ALALZ"
+    },
+    "$metadata": {
+      "id": "01KSYWRWZSZ4PEQ6AJHMCS97DC",
+      "requestId": "8FTP30ZGK39ALALZ",
+      "trigger": "*/15 * * * *",
+      "service": "trade-control-web-hook",
+      "message": "tn[reversals]: using cached session",
+      "account": "4a1a3fca7735ec4b76a4f276821fb795",
+      "type": "cf-worker",
+      "fingerprint": "83bd0c6ddf8a4b5fe22d6b1f5dccfe4d",
+      "origin": "cron",
+      "messageTemplate": "tn[reversals]: using cached session"
+    }
+  },
+  {
+    "source": {
+      "message": "DEBUG tradenation_api::ohlcv: Fetching candles: https://charts.finsatechnology.com/data/minute/61397/ask?l=1"
+    },
+    "dataset": "cloudflare-workers",
+    "timestamp": "2026-05-31T11:15:12.453Z",
+    "$workers": {
+      "truncated": false,
+      "event": {
+        "cron": "*/15 * * * *",
+        "scheduledTime": 1780226109000
+      },
+      "scriptName": "trade-control-web-hook",
+      "outcome": "ok",
+      "eventType": "cron",
+      "scriptVersion": {
+        "id": "27bc37ae-48a5-495b-ae0b-e86cac82e9d3"
+      },
+      "executionModel": "stateless",
+      "requestId": "WED0KQZNZ26RUSA2"
+    },
+    "$metadata": {
+      "id": "01KSYVXEY5K0FX417AVVWKJ8WN",
+      "requestId": "WED0KQZNZ26RUSA2",
+      "trigger": "*/15 * * * *",
+      "service": "trade-control-web-hook",
+      "message": "DEBUG tradenation_api::ohlcv: Fetching candles: https://charts.finsatechnology.com/data/minute/61397/ask?l=1",
+      "account": "4a1a3fca7735ec4b76a4f276821fb795",
+      "type": "cf-worker",
+      "fingerprint": "83bd0c6ddf8a4b5fe22d6b1f5dccfe4d",
+      "origin": "cron",
+      "messageTemplate": "DEBUG tradenation_api::ohlcv: Fetching candles: https://charts.finsatechnology.com/data/minute/61397/<*>"
+    }
+  },
+  {
+    "source": {
+      "message": "cron session_refresh[reversals]: refreshed"
+    },
+    "dataset": "cloudflare-workers",
+    "timestamp": "2026-05-31T11:15:10.484Z",
+    "$workers": {
+      "truncated": false,
+      "event": {
+        "cron": "*/15 * * * *",
+        "scheduledTime": 1780226109000
+      },
+      "scriptName": "trade-control-web-hook",
+      "outcome": "ok",
+      "eventType": "cron",
+      "scriptVersion": {
+        "id": "27bc37ae-48a5-495b-ae0b-e86cac82e9d3"
+      },
+      "executionModel": "stateless",
+      "requestId": "WED0KQZNZ26RUSA2"
+    },
+    "$metadata": {
+      "id": "01KSYVXD0MESH79CY5TY2YBGWT",
+      "requestId": "WED0KQZNZ26RUSA2",
+      "trigger": "*/15 * * * *",
+      "service": "trade-control-web-hook",
+      "message": "cron session_refresh[reversals]: refreshed",
+      "account": "4a1a3fca7735ec4b76a4f276821fb795",
+      "type": "cf-worker",
+      "fingerprint": "83bd0c6ddf8a4b5fe22d6b1f5dccfe4d",
+      "origin": "cron",
+      "messageTemplate": "cron session_refresh[reversals]: refreshed"
+    }
+  },
+  {
+    "source": {
+      "message": "DEBUG tradenation_api::ohlcv: Fetching candles: https://charts.finsatechnology.com/data/minute/61397/ask?l=1"
+    },
+    "dataset": "cloudflare-workers",
+    "timestamp": "2026-05-31T10:45:12.420Z",
+    "$workers": {
+      "truncated": false,
+      "event": {
+        "cron": "*/15 * * * *",
+        "scheduledTime": 1780224309000
+      },
+      "scriptName": "trade-control-web-hook",
+      "outcome": "ok",
+      "eventType": "cron",
+      "scriptVersion": {
+        "id": "27bc37ae-48a5-495b-ae0b-e86cac82e9d3"
+      },
+      "executionModel": "stateless",
+      "requestId": "RUIQAZH2G9HJFAWA"
+    },
+    "$metadata": {
+      "id": "01KSYT6H34J80ZVAVFWCDK2EFA",
+      "requestId": "RUIQAZH2G9HJFAWA",
+      "trigger": "*/15 * * * *",
+      "service": "trade-control-web-hook",
+      "message": "DEBUG tradenation_api::ohlcv: Fetching candles: https://charts.finsatechnology.com/data/minute/61397/ask?l=1",
+      "account": "4a1a3fca7735ec4b76a4f276821fb795",
+      "type": "cf-worker",
+      "fingerprint": "83bd0c6ddf8a4b5fe22d6b1f5dccfe4d",
+      "origin": "cron",
+      "messageTemplate": "DEBUG tradenation_api::ohlcv: Fetching candles: https://charts.finsatechnology.com/data/minute/61397/<*>"
+    }
+  },
+  {
+    "source": {
+      "message": "tn[reversals]: using cached session"
+    },
+    "dataset": "cloudflare-workers",
+    "timestamp": "2026-05-31T10:45:11.105Z",
+    "$workers": {
+      "truncated": false,
+      "event": {
+        "cron": "*/15 * * * *",
+        "scheduledTime": 1780224309000
+      },
+      "scriptName": "trade-control-web-hook",
+      "outcome": "ok",
+      "eventType": "cron",
+      "scriptVersion": {
+        "id": "27bc37ae-48a5-495b-ae0b-e86cac82e9d3"
+      },
+      "executionModel": "stateless",
+      "requestId": "RUIQAZH2G9HJFAWA"
+    },
+    "$metadata": {
+      "id": "01KSYT6FT12QWQ8DV8XE28T36K",
+      "requestId": "RUIQAZH2G9HJFAWA",
+      "trigger": "*/15 * * * *",
+      "service": "trade-control-web-hook",
+      "message": "tn[reversals]: using cached session",
+      "account": "4a1a3fca7735ec4b76a4f276821fb795",
+      "type": "cf-worker",
+      "fingerprint": "83bd0c6ddf8a4b5fe22d6b1f5dccfe4d",
+      "origin": "cron",
+      "messageTemplate": "tn[reversals]: using cached session"
+    }
+  },
+  {
+    "source": {
+      "message": "cron session_refresh[reversals]: refreshed"
+    },
+    "dataset": "cloudflare-workers",
+    "timestamp": "2026-05-31T10:15:10.513Z",
+    "$workers": {
+      "truncated": false,
+      "event": {
+        "cron": "*/15 * * * *",
+        "scheduledTime": 1780222509000
+      },
+      "scriptName": "trade-control-web-hook",
+      "outcome": "ok",
+      "eventType": "cron",
+      "scriptVersion": {
+        "id": "27bc37ae-48a5-495b-ae0b-e86cac82e9d3"
+      },
+      "executionModel": "stateless",
+      "requestId": "M0KF0ITDOXCIFHRJ"
+    },
+    "$metadata": {
+      "id": "01KSYRFHDHYYT34GQ6X586S7Q6",
+      "requestId": "M0KF0ITDOXCIFHRJ",
+      "trigger": "*/15 * * * *",
+      "service": "trade-control-web-hook",
+      "message": "cron session_refresh[reversals]: refreshed",
+      "account": "4a1a3fca7735ec4b76a4f276821fb795",
+      "type": "cf-worker",
+      "fingerprint": "83bd0c6ddf8a4b5fe22d6b1f5dccfe4d",
+      "origin": "cron",
+      "messageTemplate": "cron session_refresh[reversals]: refreshed"
+    }
+  },
+  {
+    "source": {
+      "message": "tn[reversals]: using cached session"
+    },
+    "dataset": "cloudflare-workers",
+    "timestamp": "2026-05-31T09:30:11.233Z",
+    "$workers": {
+      "truncated": false,
+      "event": {
+        "cron": "*/15 * * * *",
+        "scheduledTime": 1780219809000
+      },
+      "scriptName": "trade-control-web-hook",
+      "outcome": "ok",
+      "eventType": "cron",
+      "scriptVersion": {
+        "id": "27bc37ae-48a5-495b-ae0b-e86cac82e9d3"
+      },
+      "executionModel": "stateless",
+      "requestId": "5Q6T59L9ZL8BM398"
+    },
+    "$metadata": {
+      "id": "01KSYNX5D1ZFHJW1QDF9BWC8GY",
+      "requestId": "5Q6T59L9ZL8BM398",
+      "trigger": "*/15 * * * *",
+      "service": "trade-control-web-hook",
+      "message": "tn[reversals]: using cached session",
+      "account": "4a1a3fca7735ec4b76a4f276821fb795",
+      "type": "cf-worker",
+      "fingerprint": "83bd0c6ddf8a4b5fe22d6b1f5dccfe4d",
+      "origin": "cron",
+      "messageTemplate": "tn[reversals]: using cached session"
+    }
+  },
+  {
+    "source": {
+      "message": "DEBUG tradenation_api::ohlcv: Fetching candles: https://charts.finsatechnology.com/data/minute/61397/ask?l=1"
+    },
+    "dataset": "cloudflare-workers",
+    "timestamp": "2026-05-31T08:45:11.998Z",
+    "$workers": {
+      "truncated": false,
+      "event": {
+        "cron": "*/15 * * * *",
+        "scheduledTime": 1780217109000
+      },
+      "scriptName": "trade-control-web-hook",
+      "outcome": "ok",
+      "eventType": "cron",
+      "scriptVersion": {
+        "id": "27bc37ae-48a5-495b-ae0b-e86cac82e9d3"
+      },
+      "executionModel": "stateless",
+      "requestId": "T99FRI806W8UD5MN"
+    },
+    "$metadata": {
+      "id": "01KSYKASDYR67CJM7B5W32AGHN",
+      "requestId": "T99FRI806W8UD5MN",
+      "trigger": "*/15 * * * *",
+      "service": "trade-control-web-hook",
+      "message": "DEBUG tradenation_api::ohlcv: Fetching candles: https://charts.finsatechnology.com/data/minute/61397/ask?l=1",
+      "account": "4a1a3fca7735ec4b76a4f276821fb795",
+      "type": "cf-worker",
+      "fingerprint": "83bd0c6ddf8a4b5fe22d6b1f5dccfe4d",
+      "origin": "cron",
+      "messageTemplate": "DEBUG tradenation_api::ohlcv: Fetching candles: https://charts.finsatechnology.com/data/minute/61397/<*>"
+    }
+  },
+  {
+    "source": {
+      "message": "DEBUG tradenation_api::ohlcv: Fetching candles: https://charts.finsatechnology.com/data/minute/61397/bid?l=1"
+    },
+    "dataset": "cloudflare-workers",
+    "timestamp": "2026-05-31T08:15:11.472Z",
+    "$workers": {
+      "truncated": false,
+      "event": {
+        "cron": "*/15 * * * *",
+        "scheduledTime": 1780215309000
+      },
+      "scriptName": "trade-control-web-hook",
+      "outcome": "ok",
+      "eventType": "cron",
+      "scriptVersion": {
+        "id": "27bc37ae-48a5-495b-ae0b-e86cac82e9d3"
+      },
+      "executionModel": "stateless",
+      "requestId": "8UDPBSVUJSDVA0AP"
+    },
+    "$metadata": {
+      "id": "01KSYHKV3GCJR25NWFK4BRAQRT",
+      "requestId": "8UDPBSVUJSDVA0AP",
+      "trigger": "*/15 * * * *",
+      "service": "trade-control-web-hook",
+      "message": "DEBUG tradenation_api::ohlcv: Fetching candles: https://charts.finsatechnology.com/data/minute/61397/bid?l=1",
+      "account": "4a1a3fca7735ec4b76a4f276821fb795",
+      "type": "cf-worker",
+      "fingerprint": "83bd0c6ddf8a4b5fe22d6b1f5dccfe4d",
+      "origin": "cron",
+      "messageTemplate": "DEBUG tradenation_api::ohlcv: Fetching candles: https://charts.finsatechnology.com/data/minute/61397/bid?l=1"
+    }
+  },
+  {
+    "source": {
+      "level": "info",
+      "message": "*/15 * * * * "
+    },
+    "dataset": "cloudflare-workers",
+    "timestamp": "2026-05-31T08:15:09.319Z",
+    "$workers": {
+      "truncated": false,
+      "event": {
+        "cron": "*/15 * * * *",
+        "scheduledTime": 1780215309000
+      },
+      "scriptName": "trade-control-web-hook",
+      "outcome": "ok",
+      "eventType": "cron",
+      "scriptVersion": {
+        "id": "27bc37ae-48a5-495b-ae0b-e86cac82e9d3"
+      },
+      "executionModel": "stateless",
+      "requestId": "8UDPBSVUJSDVA0AP",
+      "wallTimeMs": 3680,
+      "cpuTimeMs": 8
+    },
+    "$metadata": {
+      "id": "01KSYHKS07Z88456HJCB1QXGVA",
+      "requestId": "8UDPBSVUJSDVA0AP",
+      "trigger": "*/15 * * * *",
+      "service": "trade-control-web-hook",
+      "level": "info",
+      "message": "*/15 * * * * ",
+      "account": "4a1a3fca7735ec4b76a4f276821fb795",
+      "type": "cf-worker-event",
+      "fingerprint": "83bd0c6ddf8a4b5fe22d6b1f5dccfe4d",
+      "origin": "cron",
+      "messageTemplate": "*/15 * * * *"
+    }
+  },
+  {
+    "source": {
+      "level": "info",
+      "message": "*/15 * * * * "
+    },
+    "dataset": "cloudflare-workers",
+    "timestamp": "2026-05-31T07:30:09.320Z",
+    "$workers": {
+      "truncated": false,
+      "event": {
+        "cron": "*/15 * * * *",
+        "scheduledTime": 1780212609000
+      },
+      "scriptName": "trade-control-web-hook",
+      "outcome": "ok",
+      "eventType": "cron",
+      "scriptVersion": {
+        "id": "27bc37ae-48a5-495b-ae0b-e86cac82e9d3"
+      },
+      "executionModel": "stateless",
+      "requestId": "CJ0302BHWE8QG8JR",
+      "wallTimeMs": 3156,
+      "cpuTimeMs": 7
+    },
+    "$metadata": {
+      "id": "01KSYF1C98KRQ00GVSAQ88KD9A",
+      "requestId": "CJ0302BHWE8QG8JR",
+      "trigger": "*/15 * * * *",
+      "service": "trade-control-web-hook",
+      "level": "info",
+      "message": "*/15 * * * * ",
+      "account": "4a1a3fca7735ec4b76a4f276821fb795",
+      "type": "cf-worker-event",
+      "fingerprint": "83bd0c6ddf8a4b5fe22d6b1f5dccfe4d",
+      "origin": "cron",
+      "messageTemplate": "*/15 * * * *"
+    }
+  },
+  {
+    "source": {
+      "message": "cron sweep: 1 tracked attempts"
+    },
+    "dataset": "cloudflare-workers",
+    "timestamp": "2026-05-31T07:15:11.028Z",
+    "$workers": {
+      "truncated": false,
+      "event": {
+        "cron": "*/15 * * * *",
+        "scheduledTime": 1780211709000
+      },
+      "scriptName": "trade-control-web-hook",
+      "outcome": "ok",
+      "eventType": "cron",
+      "scriptVersion": {
+        "id": "27bc37ae-48a5-495b-ae0b-e86cac82e9d3"
+      },
+      "executionModel": "stateless",
+      "requestId": "H7TW6VWWRVCPOHLH"
+    },
+    "$metadata": {
+      "id": "01KSYE5Z1MRV9QBCK2XTY6YHA1",
+      "requestId": "H7TW6VWWRVCPOHLH",
+      "trigger": "*/15 * * * *",
+      "service": "trade-control-web-hook",
+      "message": "cron sweep: 1 tracked attempts",
+      "account": "4a1a3fca7735ec4b76a4f276821fb795",
+      "type": "cf-worker",
+      "fingerprint": "83bd0c6ddf8a4b5fe22d6b1f5dccfe4d",
+      "origin": "cron",
+      "messageTemplate": "cron sweep: 1 tracked attempts"
+    }
+  },
+  {
+    "source": {
+      "message": "cron session_refresh: 1 TN accounts to consider"
+    },
+    "dataset": "cloudflare-workers",
+    "timestamp": "2026-05-31T06:30:09.516Z",
+    "$workers": {
+      "truncated": false,
+      "event": {
+        "cron": "*/15 * * * *",
+        "scheduledTime": 1780209009000
+      },
+      "scriptName": "trade-control-web-hook",
+      "outcome": "ok",
+      "eventType": "cron",
+      "scriptVersion": {
+        "id": "27bc37ae-48a5-495b-ae0b-e86cac82e9d3"
+      },
+      "executionModel": "stateless",
+      "requestId": "ZHKHC4OI4AEQ6ENE"
+    },
+    "$metadata": {
+      "id": "01KSYBKGVCZTQ1AW5K813PJ9HN",
+      "requestId": "ZHKHC4OI4AEQ6ENE",
+      "trigger": "*/15 * * * *",
+      "service": "trade-control-web-hook",
+      "message": "cron session_refresh: 1 TN accounts to consider",
+      "account": "4a1a3fca7735ec4b76a4f276821fb795",
+      "type": "cf-worker",
+      "fingerprint": "83bd0c6ddf8a4b5fe22d6b1f5dccfe4d",
+      "origin": "cron",
+      "messageTemplate": "cron session_refresh: 1 TN accounts to consider"
+    }
+  },
+  {
+    "source": {
+      "level": "info",
+      "message": "*/15 * * * * "
+    },
+    "dataset": "cloudflare-workers",
+    "timestamp": "2026-05-31T06:30:09.319Z",
+    "$workers": {
+      "truncated": false,
+      "event": {
+        "cron": "*/15 * * * *",
+        "scheduledTime": 1780209009000
+      },
+      "scriptName": "trade-control-web-hook",
+      "outcome": "ok",
+      "eventType": "cron",
+      "scriptVersion": {
+        "id": "27bc37ae-48a5-495b-ae0b-e86cac82e9d3"
+      },
+      "executionModel": "stateless",
+      "requestId": "ZHKHC4OI4AEQ6ENE",
+      "wallTimeMs": 3493,
+      "cpuTimeMs": 8
+    },
+    "$metadata": {
+      "id": "01KSYBKGN7GB0BB3JQ065CWRKM",
+      "requestId": "ZHKHC4OI4AEQ6ENE",
+      "trigger": "*/15 * * * *",
+      "service": "trade-control-web-hook",
+      "level": "info",
+      "message": "*/15 * * * * ",
+      "account": "4a1a3fca7735ec4b76a4f276821fb795",
+      "type": "cf-worker-event",
+      "fingerprint": "83bd0c6ddf8a4b5fe22d6b1f5dccfe4d",
+      "origin": "cron",
+      "messageTemplate": "*/15 * * * *"
+    }
+  },
+  {
+    "source": {
+      "message": "DEBUG tradenation_api::ohlcv: Fetching candles: https://charts.finsatechnology.com/data/minute/61397/ask?l=1"
+    },
+    "dataset": "cloudflare-workers",
+    "timestamp": "2026-05-31T06:15:12.021Z",
+    "$workers": {
+      "truncated": false,
+      "event": {
+        "cron": "*/15 * * * *",
+        "scheduledTime": 1780208109000
+      },
+      "scriptName": "trade-control-web-hook",
+      "outcome": "ok",
+      "eventType": "cron",
+      "scriptVersion": {
+        "id": "27bc37ae-48a5-495b-ae0b-e86cac82e9d3"
+      },
+      "executionModel": "stateless",
+      "requestId": "PXJMDKDRTE6REQQK"
+    },
+    "$metadata": {
+      "id": "01KSYAR4CNP7W3C6ZJMMRQAQJ0",
+      "requestId": "PXJMDKDRTE6REQQK",
+      "trigger": "*/15 * * * *",
+      "service": "trade-control-web-hook",
+      "message": "DEBUG tradenation_api::ohlcv: Fetching candles: https://charts.finsatechnology.com/data/minute/61397/ask?l=1",
+      "account": "4a1a3fca7735ec4b76a4f276821fb795",
+      "type": "cf-worker",
+      "fingerprint": "83bd0c6ddf8a4b5fe22d6b1f5dccfe4d",
+      "origin": "cron",
+      "messageTemplate": "DEBUG tradenation_api::ohlcv: Fetching candles: https://charts.finsatechnology.com/data/minute/61397/<*>"
+    }
+  },
+  {
+    "source": {
+      "level": "info",
+      "message": "*/15 * * * * "
+    },
+    "dataset": "cloudflare-workers",
+    "timestamp": "2026-05-31T05:45:09.318Z",
+    "$workers": {
+      "truncated": false,
+      "event": {
+        "cron": "*/15 * * * *",
+        "scheduledTime": 1780206309000
+      },
+      "scriptName": "trade-control-web-hook",
+      "outcome": "ok",
+      "eventType": "cron",
+      "scriptVersion": {
+        "id": "27bc37ae-48a5-495b-ae0b-e86cac82e9d3"
+      },
+      "executionModel": "stateless",
+      "requestId": "E6SMH9K3YS3JSYXW",
+      "wallTimeMs": 3260,
+      "cpuTimeMs": 6
+    },
+    "$metadata": {
+      "id": "01KSY913Y67F3S563X8JJ9VC41",
+      "requestId": "E6SMH9K3YS3JSYXW",
+      "trigger": "*/15 * * * *",
+      "service": "trade-control-web-hook",
+      "level": "info",
+      "message": "*/15 * * * * ",
+      "account": "4a1a3fca7735ec4b76a4f276821fb795",
+      "type": "cf-worker-event",
+      "fingerprint": "83bd0c6ddf8a4b5fe22d6b1f5dccfe4d",
+      "origin": "cron",
+      "messageTemplate": "*/15 * * * *"
+    }
+  },
+  {
+    "source": {
+      "message": "tn[reversals]: using cached session"
+    },
+    "dataset": "cloudflare-workers",
+    "timestamp": "2026-05-31T05:30:10.382Z",
+    "$workers": {
+      "truncated": false,
+      "event": {
+        "cron": "*/15 * * * *",
+        "scheduledTime": 1780205409000
+      },
+      "scriptName": "trade-control-web-hook",
+      "outcome": "ok",
+      "eventType": "cron",
+      "scriptVersion": {
+        "id": "27bc37ae-48a5-495b-ae0b-e86cac82e9d3"
+      },
+      "executionModel": "stateless",
+      "requestId": "93ITP7OYX528XP11"
+    },
+    "$metadata": {
+      "id": "01KSY85P2EPSJ14THTB699FXKG",
+      "requestId": "93ITP7OYX528XP11",
+      "trigger": "*/15 * * * *",
+      "service": "trade-control-web-hook",
+      "message": "tn[reversals]: using cached session",
+      "account": "4a1a3fca7735ec4b76a4f276821fb795",
+      "type": "cf-worker",
+      "fingerprint": "83bd0c6ddf8a4b5fe22d6b1f5dccfe4d",
+      "origin": "cron",
+      "messageTemplate": "tn[reversals]: using cached session"
+    }
+  },
+  {
+    "source": {
+      "message": "DEBUG tradenation_api::ohlcv: Fetching candles: https://charts.finsatechnology.com/data/minute/61397/ask?l=1"
+    },
+    "dataset": "cloudflare-workers",
+    "timestamp": "2026-05-31T05:15:11.934Z",
+    "$workers": {
+      "truncated": false,
+      "event": {
+        "cron": "*/15 * * * *",
+        "scheduledTime": 1780204509000
+      },
+      "scriptName": "trade-control-web-hook",
+      "outcome": "ok",
+      "eventType": "cron",
+      "scriptVersion": {
+        "id": "27bc37ae-48a5-495b-ae0b-e86cac82e9d3"
+      },
+      "executionModel": "stateless",
+      "requestId": "29Z3UZZZO9F0MZVV"
+    },
+    "$metadata": {
+      "id": "01KSY7A8NY63HM99HPM746NACR",
+      "requestId": "29Z3UZZZO9F0MZVV",
+      "trigger": "*/15 * * * *",
+      "service": "trade-control-web-hook",
+      "message": "DEBUG tradenation_api::ohlcv: Fetching candles: https://charts.finsatechnology.com/data/minute/61397/ask?l=1",
+      "account": "4a1a3fca7735ec4b76a4f276821fb795",
+      "type": "cf-worker",
+      "fingerprint": "83bd0c6ddf8a4b5fe22d6b1f5dccfe4d",
+      "origin": "cron",
+      "messageTemplate": "DEBUG tradenation_api::ohlcv: Fetching candles: https://charts.finsatechnology.com/data/minute/61397/<*>"
+    }
+  },
+  {
+    "source": {
+      "message": "DEBUG tradenation_api::ohlcv: Fetching candles: https://charts.finsatechnology.com/data/minute/61397/bid?l=1"
+    },
+    "dataset": "cloudflare-workers",
+    "timestamp": "2026-05-31T04:30:11.328Z",
+    "$workers": {
+      "truncated": false,
+      "event": {
+        "cron": "*/15 * * * *",
+        "scheduledTime": 1780201809000
+      },
+      "scriptName": "trade-control-web-hook",
+      "outcome": "ok",
+      "eventType": "cron",
+      "scriptVersion": {
+        "id": "27bc37ae-48a5-495b-ae0b-e86cac82e9d3"
+      },
+      "executionModel": "stateless",
+      "requestId": "94EZHWAYLJ05612W"
+    },
+    "$metadata": {
+      "id": "01KSY4QVC0988DRV6MZ09V1TJW",
+      "requestId": "94EZHWAYLJ05612W",
+      "trigger": "*/15 * * * *",
+      "service": "trade-control-web-hook",
+      "message": "DEBUG tradenation_api::ohlcv: Fetching candles: https://charts.finsatechnology.com/data/minute/61397/bid?l=1",
+      "account": "4a1a3fca7735ec4b76a4f276821fb795",
+      "type": "cf-worker",
+      "fingerprint": "83bd0c6ddf8a4b5fe22d6b1f5dccfe4d",
+      "origin": "cron",
+      "messageTemplate": "DEBUG tradenation_api::ohlcv: Fetching candles: https://charts.finsatechnology.com/data/minute/61397/bid?l=1"
+    }
+  },
+  {
+    "source": {
+      "message": "cron session_refresh[reversals]: refreshed"
+    },
+    "dataset": "cloudflare-workers",
+    "timestamp": "2026-05-31T04:30:10.637Z",
+    "$workers": {
+      "truncated": false,
+      "event": {
+        "cron": "*/15 * * * *",
+        "scheduledTime": 1780201809000
+      },
+      "scriptName": "trade-control-web-hook",
+      "outcome": "ok",
+      "eventType": "cron",
+      "scriptVersion": {
+        "id": "27bc37ae-48a5-495b-ae0b-e86cac82e9d3"
+      },
+      "executionModel": "stateless",
+      "requestId": "94EZHWAYLJ05612W"
+    },
+    "$metadata": {
+      "id": "01KSY4QTPDSS7SYHGSB8PWAMND",
+      "requestId": "94EZHWAYLJ05612W",
+      "trigger": "*/15 * * * *",
+      "service": "trade-control-web-hook",
+      "message": "cron session_refresh[reversals]: refreshed",
+      "account": "4a1a3fca7735ec4b76a4f276821fb795",
+      "type": "cf-worker",
+      "fingerprint": "83bd0c6ddf8a4b5fe22d6b1f5dccfe4d",
+      "origin": "cron",
+      "messageTemplate": "cron session_refresh[reversals]: refreshed"
+    }
+  },
+  {
+    "source": {
+      "level": "info",
+      "message": "*/15 * * * * "
+    },
+    "dataset": "cloudflare-workers",
+    "timestamp": "2026-05-31T04:15:09.318Z",
+    "$workers": {
+      "truncated": false,
+      "event": {
+        "cron": "*/15 * * * *",
+        "scheduledTime": 1780200909000
+      },
+      "scriptName": "trade-control-web-hook",
+      "outcome": "ok",
+      "eventType": "cron",
+      "scriptVersion": {
+        "id": "27bc37ae-48a5-495b-ae0b-e86cac82e9d3"
+      },
+      "executionModel": "stateless",
+      "requestId": "ZBKLNK974YCZ1I9V",
+      "wallTimeMs": 4321,
+      "cpuTimeMs": 6
+    },
+    "$metadata": {
+      "id": "01KSY3WAG6W3DKV372G1P7KP09",
+      "requestId": "ZBKLNK974YCZ1I9V",
+      "trigger": "*/15 * * * *",
+      "service": "trade-control-web-hook",
+      "level": "info",
+      "message": "*/15 * * * * ",
+      "account": "4a1a3fca7735ec4b76a4f276821fb795",
+      "type": "cf-worker-event",
+      "fingerprint": "83bd0c6ddf8a4b5fe22d6b1f5dccfe4d",
+      "origin": "cron",
+      "messageTemplate": "*/15 * * * *"
+    }
+  },
+  {
+    "source": {
+      "message": "tn[reversals]: using cached session"
+    },
+    "dataset": "cloudflare-workers",
+    "timestamp": "2026-05-31T03:45:11.473Z",
+    "$workers": {
+      "truncated": false,
+      "event": {
+        "cron": "*/15 * * * *",
+        "scheduledTime": 1780199109000
+      },
+      "scriptName": "trade-control-web-hook",
+      "outcome": "ok",
+      "eventType": "cron",
+      "scriptVersion": {
+        "id": "27bc37ae-48a5-495b-ae0b-e86cac82e9d3"
+      },
+      "executionModel": "stateless",
+      "requestId": "N587YQPO92K49HOQ"
+    },
+    "$metadata": {
+      "id": "01KSY25ESHS2AM37CAXZCSXWJ2",
+      "requestId": "N587YQPO92K49HOQ",
+      "trigger": "*/15 * * * *",
+      "service": "trade-control-web-hook",
+      "message": "tn[reversals]: using cached session",
+      "account": "4a1a3fca7735ec4b76a4f276821fb795",
+      "type": "cf-worker",
+      "fingerprint": "83bd0c6ddf8a4b5fe22d6b1f5dccfe4d",
+      "origin": "cron",
+      "messageTemplate": "tn[reversals]: using cached session"
+    }
+  },
+  {
+    "source": {
+      "message": "cron sweep: 1 tracked attempts"
+    },
+    "dataset": "cloudflare-workers",
+    "timestamp": "2026-05-31T03:45:10.988Z",
+    "$workers": {
+      "truncated": false,
+      "event": {
+        "cron": "*/15 * * * *",
+        "scheduledTime": 1780199109000
+      },
+      "scriptName": "trade-control-web-hook",
+      "outcome": "ok",
+      "eventType": "cron",
+      "scriptVersion": {
+        "id": "27bc37ae-48a5-495b-ae0b-e86cac82e9d3"
+      },
+      "executionModel": "stateless",
+      "requestId": "N587YQPO92K49HOQ"
+    },
+    "$metadata": {
+      "id": "01KSY25EACYNVRCJ2C6EAXKRPV",
+      "requestId": "N587YQPO92K49HOQ",
+      "trigger": "*/15 * * * *",
+      "service": "trade-control-web-hook",
+      "message": "cron sweep: 1 tracked attempts",
+      "account": "4a1a3fca7735ec4b76a4f276821fb795",
+      "type": "cf-worker",
+      "fingerprint": "83bd0c6ddf8a4b5fe22d6b1f5dccfe4d",
+      "origin": "cron",
+      "messageTemplate": "cron sweep: 1 tracked attempts"
+    }
+  },
+  {
+    "source": {
+      "message": "cron session_refresh: 1 TN accounts to consider"
+    },
+    "dataset": "cloudflare-workers",
+    "timestamp": "2026-05-31T03:45:09.511Z",
+    "$workers": {
+      "truncated": false,
+      "event": {
+        "cron": "*/15 * * * *",
+        "scheduledTime": 1780199109000
+      },
+      "scriptName": "trade-control-web-hook",
+      "outcome": "ok",
+      "eventType": "cron",
+      "scriptVersion": {
+        "id": "27bc37ae-48a5-495b-ae0b-e86cac82e9d3"
+      },
+      "executionModel": "stateless",
+      "requestId": "N587YQPO92K49HOQ"
+    },
+    "$metadata": {
+      "id": "01KSY25CW7DVRZ65G5KZE4JE61",
+      "requestId": "N587YQPO92K49HOQ",
+      "trigger": "*/15 * * * *",
+      "service": "trade-control-web-hook",
+      "message": "cron session_refresh: 1 TN accounts to consider",
+      "account": "4a1a3fca7735ec4b76a4f276821fb795",
+      "type": "cf-worker",
+      "fingerprint": "83bd0c6ddf8a4b5fe22d6b1f5dccfe4d",
+      "origin": "cron",
+      "messageTemplate": "cron session_refresh: 1 TN accounts to consider"
+    }
+  },
+  {
+    "source": {
+      "message": "cron session_refresh: 1 TN accounts to consider"
+    },
+    "dataset": "cloudflare-workers",
+    "timestamp": "2026-05-31T03:15:09.516Z",
+    "$workers": {
+      "truncated": false,
+      "event": {
+        "cron": "*/15 * * * *",
+        "scheduledTime": 1780197309000
+      },
+      "scriptName": "trade-control-web-hook",
+      "outcome": "ok",
+      "eventType": "cron",
+      "scriptVersion": {
+        "id": "27bc37ae-48a5-495b-ae0b-e86cac82e9d3"
+      },
+      "executionModel": "stateless",
+      "requestId": "AA83GGI3KDUC1VAG"
+    },
+    "$metadata": {
+      "id": "01KSY0EF2CMVH2EXW0XQ7FQVMA",
+      "requestId": "AA83GGI3KDUC1VAG",
+      "trigger": "*/15 * * * *",
+      "service": "trade-control-web-hook",
+      "message": "cron session_refresh: 1 TN accounts to consider",
+      "account": "4a1a3fca7735ec4b76a4f276821fb795",
+      "type": "cf-worker",
+      "fingerprint": "83bd0c6ddf8a4b5fe22d6b1f5dccfe4d",
+      "origin": "cron",
+      "messageTemplate": "cron session_refresh: 1 TN accounts to consider"
+    }
+  },
+  {
+    "source": {
+      "level": "info",
+      "message": "*/15 * * * * "
+    },
+    "dataset": "cloudflare-workers",
+    "timestamp": "2026-05-31T03:00:09.320Z",
+    "$workers": {
+      "truncated": false,
+      "event": {
+        "cron": "*/15 * * * *",
+        "scheduledTime": 1780196409000
+      },
+      "scriptName": "trade-control-web-hook",
+      "outcome": "ok",
+      "eventType": "cron",
+      "scriptVersion": {
+        "id": "27bc37ae-48a5-495b-ae0b-e86cac82e9d3"
+      },
+      "executionModel": "stateless",
+      "requestId": "ZHKVS69EJVQNDZWY",
+      "wallTimeMs": 2787,
+      "cpuTimeMs": 6
+    },
+    "$metadata": {
+      "id": "01KSXZJZZ8EYWWT19H3CJR2Q32",
+      "requestId": "ZHKVS69EJVQNDZWY",
+      "trigger": "*/15 * * * *",
+      "service": "trade-control-web-hook",
+      "level": "info",
+      "message": "*/15 * * * * ",
+      "account": "4a1a3fca7735ec4b76a4f276821fb795",
+      "type": "cf-worker-event",
+      "fingerprint": "83bd0c6ddf8a4b5fe22d6b1f5dccfe4d",
+      "origin": "cron",
+      "messageTemplate": "*/15 * * * *"
+    }
+  },
+  {
+    "source": {
+      "message": "tn[reversals]: using cached session"
+    },
+    "dataset": "cloudflare-workers",
+    "timestamp": "2026-05-31T02:00:11.334Z",
+    "$workers": {
+      "truncated": false,
+      "event": {
+        "cron": "*/15 * * * *",
+        "scheduledTime": 1780192809000
+      },
+      "scriptName": "trade-control-web-hook",
+      "outcome": "ok",
+      "eventType": "cron",
+      "scriptVersion": {
+        "id": "27bc37ae-48a5-495b-ae0b-e86cac82e9d3"
+      },
+      "executionModel": "stateless",
+      "requestId": "9ZEKUW11ON25EQ0O"
+    },
+    "$metadata": {
+      "id": "01KSXW56A6K2WKYT5X1V2W5JQT",
+      "requestId": "9ZEKUW11ON25EQ0O",
+      "trigger": "*/15 * * * *",
+      "service": "trade-control-web-hook",
+      "message": "tn[reversals]: using cached session",
+      "account": "4a1a3fca7735ec4b76a4f276821fb795",
+      "type": "cf-worker",
+      "fingerprint": "83bd0c6ddf8a4b5fe22d6b1f5dccfe4d",
+      "origin": "cron",
+      "messageTemplate": "tn[reversals]: using cached session"
+    }
+  },
+  {
+    "source": {
+      "level": "info",
+      "message": "*/15 * * * * "
+    },
+    "dataset": "cloudflare-workers",
+    "timestamp": "2026-05-31T02:00:09.320Z",
+    "$workers": {
+      "truncated": false,
+      "event": {
+        "cron": "*/15 * * * *",
+        "scheduledTime": 1780192809000
+      },
+      "scriptName": "trade-control-web-hook",
+      "outcome": "ok",
+      "eventType": "cron",
+      "scriptVersion": {
+        "id": "27bc37ae-48a5-495b-ae0b-e86cac82e9d3"
+      },
+      "executionModel": "stateless",
+      "requestId": "9ZEKUW11ON25EQ0O",
+      "wallTimeMs": 5176,
+      "cpuTimeMs": 8
+    },
+    "$metadata": {
+      "id": "01KSXW54B8E39CCZKDMSDAN91J",
+      "requestId": "9ZEKUW11ON25EQ0O",
+      "trigger": "*/15 * * * *",
+      "service": "trade-control-web-hook",
+      "level": "info",
+      "message": "*/15 * * * * ",
+      "account": "4a1a3fca7735ec4b76a4f276821fb795",
+      "type": "cf-worker-event",
+      "fingerprint": "83bd0c6ddf8a4b5fe22d6b1f5dccfe4d",
+      "origin": "cron",
+      "messageTemplate": "*/15 * * * *"
+    }
+  },
+  {
+    "source": {
+      "message": "DEBUG tradenation_api::ohlcv: Fetching candles: https://charts.finsatechnology.com/data/minute/61397/bid?l=1"
+    },
+    "dataset": "cloudflare-workers",
+    "timestamp": "2026-05-31T00:30:11.101Z",
+    "$workers": {
+      "truncated": false,
+      "event": {
+        "cron": "*/15 * * * *",
+        "scheduledTime": 1780187409000
+      },
+      "scriptName": "trade-control-web-hook",
+      "outcome": "ok",
+      "eventType": "cron",
+      "scriptVersion": {
+        "id": "27bc37ae-48a5-495b-ae0b-e86cac82e9d3"
+      },
+      "executionModel": "stateless",
+      "requestId": "TZCADZBB5AFOEQGO"
+    },
+    "$metadata": {
+      "id": "01KSXQ0CMXMTWH18FG5W1KY9FN",
+      "requestId": "TZCADZBB5AFOEQGO",
+      "trigger": "*/15 * * * *",
+      "service": "trade-control-web-hook",
+      "message": "DEBUG tradenation_api::ohlcv: Fetching candles: https://charts.finsatechnology.com/data/minute/61397/bid?l=1",
+      "account": "4a1a3fca7735ec4b76a4f276821fb795",
+      "type": "cf-worker",
+      "fingerprint": "83bd0c6ddf8a4b5fe22d6b1f5dccfe4d",
+      "origin": "cron",
+      "messageTemplate": "DEBUG tradenation_api::ohlcv: Fetching candles: https://charts.finsatechnology.com/data/minute/61397/bid?l=1"
+    }
+  },
+  {
+    "source": {
+      "message": "tn[reversals]: using cached session"
+    },
+    "dataset": "cloudflare-workers",
+    "timestamp": "2026-05-31T00:30:10.976Z",
+    "$workers": {
+      "truncated": false,
+      "event": {
+        "cron": "*/15 * * * *",
+        "scheduledTime": 1780187409000
+      },
+      "scriptName": "trade-control-web-hook",
+      "outcome": "ok",
+      "eventType": "cron",
+      "scriptVersion": {
+        "id": "27bc37ae-48a5-495b-ae0b-e86cac82e9d3"
+      },
+      "executionModel": "stateless",
+      "requestId": "TZCADZBB5AFOEQGO"
+    },
+    "$metadata": {
+      "id": "01KSXQ0CH0VD8VWHSRF75023V7",
+      "requestId": "TZCADZBB5AFOEQGO",
+      "trigger": "*/15 * * * *",
+      "service": "trade-control-web-hook",
+      "message": "tn[reversals]: using cached session",
+      "account": "4a1a3fca7735ec4b76a4f276821fb795",
+      "type": "cf-worker",
+      "fingerprint": "83bd0c6ddf8a4b5fe22d6b1f5dccfe4d",
+      "origin": "cron",
+      "messageTemplate": "tn[reversals]: using cached session"
+    }
+  },
+  {
+    "source": {
+      "level": "info",
+      "message": "*/15 * * * * "
+    },
+    "dataset": "cloudflare-workers",
+    "timestamp": "2026-05-31T00:30:09.319Z",
+    "$workers": {
+      "truncated": false,
+      "event": {
+        "cron": "*/15 * * * *",
+        "scheduledTime": 1780187409000
+      },
+      "scriptName": "trade-control-web-hook",
+      "outcome": "ok",
+      "eventType": "cron",
+      "scriptVersion": {
+        "id": "27bc37ae-48a5-495b-ae0b-e86cac82e9d3"
+      },
+      "executionModel": "stateless",
+      "requestId": "TZCADZBB5AFOEQGO",
+      "wallTimeMs": 2976,
+      "cpuTimeMs": 6
+    },
+    "$metadata": {
+      "id": "01KSXQ0AX732N1PREVZ2GR2R5B",
+      "requestId": "TZCADZBB5AFOEQGO",
+      "trigger": "*/15 * * * *",
+      "service": "trade-control-web-hook",
+      "level": "info",
+      "message": "*/15 * * * * ",
+      "account": "4a1a3fca7735ec4b76a4f276821fb795",
+      "type": "cf-worker-event",
+      "fingerprint": "83bd0c6ddf8a4b5fe22d6b1f5dccfe4d",
+      "origin": "cron",
+      "messageTemplate": "*/15 * * * *"
+    }
+  },
+  {
+    "source": {
+      "message": "DEBUG tradenation_api::ohlcv: Fetching candles: https://charts.finsatechnology.com/data/minute/61397/bid?l=1"
+    },
+    "dataset": "cloudflare-workers",
+    "timestamp": "2026-05-31T00:15:11.600Z",
+    "$workers": {
+      "truncated": false,
+      "event": {
+        "cron": "*/15 * * * *",
+        "scheduledTime": 1780186509000
+      },
+      "scriptName": "trade-control-web-hook",
+      "outcome": "ok",
+      "eventType": "cron",
+      "scriptVersion": {
+        "id": "27bc37ae-48a5-495b-ae0b-e86cac82e9d3"
+      },
+      "executionModel": "stateless",
+      "requestId": "KNQMIVS7XDFKAUNJ"
+    },
+    "$metadata": {
+      "id": "01KSXP4Y7GE60Q0HMVTPYXNNYD",
+      "requestId": "KNQMIVS7XDFKAUNJ",
+      "trigger": "*/15 * * * *",
+      "service": "trade-control-web-hook",
+      "message": "DEBUG tradenation_api::ohlcv: Fetching candles: https://charts.finsatechnology.com/data/minute/61397/bid?l=1",
+      "account": "4a1a3fca7735ec4b76a4f276821fb795",
+      "type": "cf-worker",
+      "fingerprint": "83bd0c6ddf8a4b5fe22d6b1f5dccfe4d",
+      "origin": "cron",
+      "messageTemplate": "DEBUG tradenation_api::ohlcv: Fetching candles: https://charts.finsatechnology.com/data/minute/61397/bid?l=1"
+    }
+  },
+  {
+    "source": {
+      "message": "DEBUG tradenation_api::ohlcv: Fetching candles: https://charts.finsatechnology.com/data/minute/61397/bid?l=1"
+    },
+    "dataset": "cloudflare-workers",
+    "timestamp": "2026-05-31T00:00:11.437Z",
+    "$workers": {
+      "truncated": false,
+      "event": {
+        "cron": "*/15 * * * *",
+        "scheduledTime": 1780185609000
+      },
+      "scriptName": "trade-control-web-hook",
+      "outcome": "ok",
+      "eventType": "cron",
+      "scriptVersion": {
+        "id": "27bc37ae-48a5-495b-ae0b-e86cac82e9d3"
+      },
+      "executionModel": "stateless",
+      "requestId": "X07ROEL6Z6S5VRUN"
+    },
+    "$metadata": {
+      "id": "01KSXN9F5D076NDKCQZQ4GNVMC",
+      "requestId": "X07ROEL6Z6S5VRUN",
+      "trigger": "*/15 * * * *",
+      "service": "trade-control-web-hook",
+      "message": "DEBUG tradenation_api::ohlcv: Fetching candles: https://charts.finsatechnology.com/data/minute/61397/bid?l=1",
+      "account": "4a1a3fca7735ec4b76a4f276821fb795",
+      "type": "cf-worker",
+      "fingerprint": "83bd0c6ddf8a4b5fe22d6b1f5dccfe4d",
+      "origin": "cron",
+      "messageTemplate": "DEBUG tradenation_api::ohlcv: Fetching candles: https://charts.finsatechnology.com/data/minute/61397/bid?l=1"
+    }
+  },
+  {
+    "source": {
+      "message": "cron session_refresh[reversals]: refreshed"
+    },
+    "dataset": "cloudflare-workers",
+    "timestamp": "2026-05-31T00:00:10.440Z",
+    "$workers": {
+      "truncated": false,
+      "event": {
+        "cron": "*/15 * * * *",
+        "scheduledTime": 1780185609000
+      },
+      "scriptName": "trade-control-web-hook",
+      "outcome": "ok",
+      "eventType": "cron",
+      "scriptVersion": {
+        "id": "27bc37ae-48a5-495b-ae0b-e86cac82e9d3"
+      },
+      "executionModel": "stateless",
+      "requestId": "X07ROEL6Z6S5VRUN"
+    },
+    "$metadata": {
+      "id": "01KSXN9E689YWHXWEGR0V8S6P0",
+      "requestId": "X07ROEL6Z6S5VRUN",
+      "trigger": "*/15 * * * *",
+      "service": "trade-control-web-hook",
+      "message": "cron session_refresh[reversals]: refreshed",
+      "account": "4a1a3fca7735ec4b76a4f276821fb795",
+      "type": "cf-worker",
+      "fingerprint": "83bd0c6ddf8a4b5fe22d6b1f5dccfe4d",
+      "origin": "cron",
+      "messageTemplate": "cron session_refresh[reversals]: refreshed"
+    }
+  },
+  {
+    "source": {
+      "message": "cron session_refresh: 1 TN accounts to consider"
+    },
+    "dataset": "cloudflare-workers",
+    "timestamp": "2026-05-31T00:00:09.516Z",
+    "$workers": {
+      "truncated": false,
+      "event": {
+        "cron": "*/15 * * * *",
+        "scheduledTime": 1780185609000
+      },
+      "scriptName": "trade-control-web-hook",
+      "outcome": "ok",
+      "eventType": "cron",
+      "scriptVersion": {
+        "id": "27bc37ae-48a5-495b-ae0b-e86cac82e9d3"
+      },
+      "executionModel": "stateless",
+      "requestId": "X07ROEL6Z6S5VRUN"
+    },
+    "$metadata": {
+      "id": "01KSXN9D9CYSA3RG6GNE38BHZ6",
+      "requestId": "X07ROEL6Z6S5VRUN",
+      "trigger": "*/15 * * * *",
+      "service": "trade-control-web-hook",
+      "message": "cron session_refresh: 1 TN accounts to consider",
+      "account": "4a1a3fca7735ec4b76a4f276821fb795",
+      "type": "cf-worker",
+      "fingerprint": "83bd0c6ddf8a4b5fe22d6b1f5dccfe4d",
+      "origin": "cron",
+      "messageTemplate": "cron session_refresh: 1 TN accounts to consider"
+    }
+  },
+  {
+    "source": {
+      "message": "cron session_refresh: 1 TN accounts to consider"
+    },
+    "dataset": "cloudflare-workers",
+    "timestamp": "2026-05-30T23:45:09.503Z",
+    "$workers": {
+      "truncated": false,
+      "event": {
+        "cron": "*/15 * * * *",
+        "scheduledTime": 1780184709000
+      },
+      "scriptName": "trade-control-web-hook",
+      "outcome": "ok",
+      "eventType": "cron",
+      "scriptVersion": {
+        "id": "27bc37ae-48a5-495b-ae0b-e86cac82e9d3"
+      },
+      "executionModel": "stateless",
+      "requestId": "N8P9HEF7F0BUYHKF"
+    },
+    "$metadata": {
+      "id": "01KSXMDYBZABE1BDQGS3GQBNBF",
+      "requestId": "N8P9HEF7F0BUYHKF",
+      "trigger": "*/15 * * * *",
+      "service": "trade-control-web-hook",
+      "message": "cron session_refresh: 1 TN accounts to consider",
+      "account": "4a1a3fca7735ec4b76a4f276821fb795",
+      "type": "cf-worker",
+      "fingerprint": "83bd0c6ddf8a4b5fe22d6b1f5dccfe4d",
+      "origin": "cron",
+      "messageTemplate": "cron session_refresh: 1 TN accounts to consider"
+    }
+  },
+  {
+    "source": {
+      "message": "tn[reversals]: using cached session"
+    },
+    "dataset": "cloudflare-workers",
+    "timestamp": "2026-05-30T23:30:10.915Z",
+    "$workers": {
+      "truncated": false,
+      "event": {
+        "cron": "*/15 * * * *",
+        "scheduledTime": 1780183809000
+      },
+      "scriptName": "trade-control-web-hook",
+      "outcome": "ok",
+      "eventType": "cron",
+      "scriptVersion": {
+        "id": "27bc37ae-48a5-495b-ae0b-e86cac82e9d3"
+      },
+      "executionModel": "stateless",
+      "requestId": "JH84211VU3ARM45Y"
+    },
+    "$metadata": {
+      "id": "01KSXKJGV36AMMHW084XS2YW4Q",
+      "requestId": "JH84211VU3ARM45Y",
+      "trigger": "*/15 * * * *",
+      "service": "trade-control-web-hook",
+      "message": "tn[reversals]: using cached session",
+      "account": "4a1a3fca7735ec4b76a4f276821fb795",
+      "type": "cf-worker",
+      "fingerprint": "83bd0c6ddf8a4b5fe22d6b1f5dccfe4d",
+      "origin": "cron",
+      "messageTemplate": "tn[reversals]: using cached session"
+    }
+  },
+  {
+    "source": {
+      "message": "DEBUG tradenation_api::ohlcv: Fetching candles: https://charts.finsatechnology.com/data/minute/61397/bid?l=1"
+    },
+    "dataset": "cloudflare-workers",
+    "timestamp": "2026-05-30T23:15:11.347Z",
+    "$workers": {
+      "truncated": false,
+      "event": {
+        "cron": "*/15 * * * *",
+        "scheduledTime": 1780182909000
+      },
+      "scriptName": "trade-control-web-hook",
+      "outcome": "ok",
+      "eventType": "cron",
+      "scriptVersion": {
+        "id": "27bc37ae-48a5-495b-ae0b-e86cac82e9d3"
+      },
+      "executionModel": "stateless",
+      "requestId": "W1XGHXCCQKVNODPH"
+    },
+    "$metadata": {
+      "id": "01KSXJQ2BKCSXJA2QCVE7M5FK2",
+      "requestId": "W1XGHXCCQKVNODPH",
+      "trigger": "*/15 * * * *",
+      "service": "trade-control-web-hook",
+      "message": "DEBUG tradenation_api::ohlcv: Fetching candles: https://charts.finsatechnology.com/data/minute/61397/bid?l=1",
+      "account": "4a1a3fca7735ec4b76a4f276821fb795",
+      "type": "cf-worker",
+      "fingerprint": "83bd0c6ddf8a4b5fe22d6b1f5dccfe4d",
+      "origin": "cron",
+      "messageTemplate": "DEBUG tradenation_api::ohlcv: Fetching candles: https://charts.finsatechnology.com/data/minute/61397/bid?l=1"
+    }
+  },
+  {
+    "source": {
+      "message": "cron sweep: 1 tracked attempts"
+    },
+    "dataset": "cloudflare-workers",
+    "timestamp": "2026-05-30T22:45:10.890Z",
+    "$workers": {
+      "truncated": false,
+      "event": {
+        "cron": "*/15 * * * *",
+        "scheduledTime": 1780181109000
+      },
+      "scriptName": "trade-control-web-hook",
+      "outcome": "ok",
+      "eventType": "cron",
+      "scriptVersion": {
+        "id": "27bc37ae-48a5-495b-ae0b-e86cac82e9d3"
+      },
+      "executionModel": "stateless",
+      "requestId": "9AK2P2NBPHHSPM9Y"
+    },
+    "$metadata": {
+      "id": "01KSXH043A2F81TQHQ4X8EH8VV",
+      "requestId": "9AK2P2NBPHHSPM9Y",
+      "trigger": "*/15 * * * *",
+      "service": "trade-control-web-hook",
+      "message": "cron sweep: 1 tracked attempts",
+      "account": "4a1a3fca7735ec4b76a4f276821fb795",
+      "type": "cf-worker",
+      "fingerprint": "83bd0c6ddf8a4b5fe22d6b1f5dccfe4d",
+      "origin": "cron",
+      "messageTemplate": "cron sweep: 1 tracked attempts"
+    }
+  },
+  {
+    "source": {
+      "message": "cron sweep: 1 tracked attempts"
+    },
+    "dataset": "cloudflare-workers",
+    "timestamp": "2026-05-30T22:30:10.821Z",
+    "$workers": {
+      "truncated": false,
+      "event": {
+        "cron": "*/15 * * * *",
+        "scheduledTime": 1780180209000
+      },
+      "scriptName": "trade-control-web-hook",
+      "outcome": "ok",
+      "eventType": "cron",
+      "scriptVersion": {
+        "id": "27bc37ae-48a5-495b-ae0b-e86cac82e9d3"
+      },
+      "executionModel": "stateless",
+      "requestId": "Z0OIZ2WMMMNEKCN4"
+    },
+    "$metadata": {
+      "id": "01KSXG4N454CG5GJXM9XNK5C58",
+      "requestId": "Z0OIZ2WMMMNEKCN4",
+      "trigger": "*/15 * * * *",
+      "service": "trade-control-web-hook",
+      "message": "cron sweep: 1 tracked attempts",
+      "account": "4a1a3fca7735ec4b76a4f276821fb795",
+      "type": "cf-worker",
+      "fingerprint": "83bd0c6ddf8a4b5fe22d6b1f5dccfe4d",
+      "origin": "cron",
+      "messageTemplate": "cron sweep: 1 tracked attempts"
+    }
+  },
+  {
+    "source": {
+      "message": "cron session_refresh[reversals]: refreshed"
+    },
+    "dataset": "cloudflare-workers",
+    "timestamp": "2026-05-30T22:30:10.410Z",
+    "$workers": {
+      "truncated": false,
+      "event": {
+        "cron": "*/15 * * * *",
+        "scheduledTime": 1780180209000
+      },
+      "scriptName": "trade-control-web-hook",
+      "outcome": "ok",
+      "eventType": "cron",
+      "scriptVersion": {
+        "id": "27bc37ae-48a5-495b-ae0b-e86cac82e9d3"
+      },
+      "executionModel": "stateless",
+      "requestId": "Z0OIZ2WMMMNEKCN4"
+    },
+    "$metadata": {
+      "id": "01KSXG4MQA70Z1KTCMHVKSABZZ",
+      "requestId": "Z0OIZ2WMMMNEKCN4",
+      "trigger": "*/15 * * * *",
+      "service": "trade-control-web-hook",
+      "message": "cron session_refresh[reversals]: refreshed",
+      "account": "4a1a3fca7735ec4b76a4f276821fb795",
+      "type": "cf-worker",
+      "fingerprint": "83bd0c6ddf8a4b5fe22d6b1f5dccfe4d",
+      "origin": "cron",
+      "messageTemplate": "cron session_refresh[reversals]: refreshed"
+    }
+  },
+  {
+    "source": {
+      "message": "tn[reversals]: using cached session"
+    },
+    "dataset": "cloudflare-workers",
+    "timestamp": "2026-05-30T21:45:10.921Z",
+    "$workers": {
+      "truncated": false,
+      "event": {
+        "cron": "*/15 * * * *",
+        "scheduledTime": 1780177509000
+      },
+      "scriptName": "trade-control-web-hook",
+      "outcome": "ok",
+      "eventType": "cron",
+      "scriptVersion": {
+        "id": "27bc37ae-48a5-495b-ae0b-e86cac82e9d3"
+      },
+      "executionModel": "stateless",
+      "requestId": "U0THGCLLJPPYSLAU"
+    },
+    "$metadata": {
+      "id": "01KSXDJ8G9H3B92C774XXG04XX",
+      "requestId": "U0THGCLLJPPYSLAU",
+      "trigger": "*/15 * * * *",
+      "service": "trade-control-web-hook",
+      "message": "tn[reversals]: using cached session",
+      "account": "4a1a3fca7735ec4b76a4f276821fb795",
+      "type": "cf-worker",
+      "fingerprint": "83bd0c6ddf8a4b5fe22d6b1f5dccfe4d",
+      "origin": "cron",
+      "messageTemplate": "tn[reversals]: using cached session"
+    }
+  },
+  {
+    "source": {
+      "message": "cron session_refresh: 1 TN accounts to consider"
+    },
+    "dataset": "cloudflare-workers",
+    "timestamp": "2026-05-30T21:45:09.514Z",
+    "$workers": {
+      "truncated": false,
+      "event": {
+        "cron": "*/15 * * * *",
+        "scheduledTime": 1780177509000
+      },
+      "scriptName": "trade-control-web-hook",
+      "outcome": "ok",
+      "eventType": "cron",
+      "scriptVersion": {
+        "id": "27bc37ae-48a5-495b-ae0b-e86cac82e9d3"
+      },
+      "executionModel": "stateless",
+      "requestId": "U0THGCLLJPPYSLAU"
+    },
+    "$metadata": {
+      "id": "01KSXDJ74A364PEW340GX9G7XF",
+      "requestId": "U0THGCLLJPPYSLAU",
+      "trigger": "*/15 * * * *",
+      "service": "trade-control-web-hook",
+      "message": "cron session_refresh: 1 TN accounts to consider",
+      "account": "4a1a3fca7735ec4b76a4f276821fb795",
+      "type": "cf-worker",
+      "fingerprint": "83bd0c6ddf8a4b5fe22d6b1f5dccfe4d",
+      "origin": "cron",
+      "messageTemplate": "cron session_refresh: 1 TN accounts to consider"
+    }
+  },
+  {
+    "source": {
+      "message": "DEBUG tradenation_api::ohlcv: Fetching candles: https://charts.finsatechnology.com/data/minute/61397/bid?l=1"
+    },
+    "dataset": "cloudflare-workers",
+    "timestamp": "2026-05-30T21:15:11.389Z",
+    "$workers": {
+      "truncated": false,
+      "event": {
+        "cron": "*/15 * * * *",
+        "scheduledTime": 1780175709000
+      },
+      "scriptName": "trade-control-web-hook",
+      "outcome": "ok",
+      "eventType": "cron",
+      "scriptVersion": {
+        "id": "27bc37ae-48a5-495b-ae0b-e86cac82e9d3"
+      },
+      "executionModel": "stateless",
+      "requestId": "JAAB36OLNTUL064Y"
+    },
+    "$metadata": {
+      "id": "01KSXBVB4XWRXX4QT11VD09ADX",
+      "requestId": "JAAB36OLNTUL064Y",
+      "trigger": "*/15 * * * *",
+      "service": "trade-control-web-hook",
+      "message": "DEBUG tradenation_api::ohlcv: Fetching candles: https://charts.finsatechnology.com/data/minute/61397/bid?l=1",
+      "account": "4a1a3fca7735ec4b76a4f276821fb795",
+      "type": "cf-worker",
+      "fingerprint": "83bd0c6ddf8a4b5fe22d6b1f5dccfe4d",
+      "origin": "cron",
+      "messageTemplate": "DEBUG tradenation_api::ohlcv: Fetching candles: https://charts.finsatechnology.com/data/minute/61397/bid?l=1"
+    }
+  },
+  {
+    "source": {
+      "message": "tn[reversals]: using cached session"
+    },
+    "dataset": "cloudflare-workers",
+    "timestamp": "2026-05-30T21:15:11.264Z",
+    "$workers": {
+      "truncated": false,
+      "event": {
+        "cron": "*/15 * * * *",
+        "scheduledTime": 1780175709000
+      },
+      "scriptName": "trade-control-web-hook",
+      "outcome": "ok",
+      "eventType": "cron",
+      "scriptVersion": {
+        "id": "27bc37ae-48a5-495b-ae0b-e86cac82e9d3"
+      },
+      "executionModel": "stateless",
+      "requestId": "JAAB36OLNTUL064Y"
+    },
+    "$metadata": {
+      "id": "01KSXBVB107FPR3VPH5JM24QRS",
+      "requestId": "JAAB36OLNTUL064Y",
+      "trigger": "*/15 * * * *",
+      "service": "trade-control-web-hook",
+      "message": "tn[reversals]: using cached session",
+      "account": "4a1a3fca7735ec4b76a4f276821fb795",
+      "type": "cf-worker",
+      "fingerprint": "83bd0c6ddf8a4b5fe22d6b1f5dccfe4d",
+      "origin": "cron",
+      "messageTemplate": "tn[reversals]: using cached session"
+    }
+  },
+  {
+    "source": {
+      "message": "tn[reversals]: using cached session"
+    },
+    "dataset": "cloudflare-workers",
+    "timestamp": "2026-05-30T20:15:11.181Z",
+    "$workers": {
+      "truncated": false,
+      "event": {
+        "cron": "*/15 * * * *",
+        "scheduledTime": 1780172109000
+      },
+      "scriptName": "trade-control-web-hook",
+      "outcome": "ok",
+      "eventType": "cron",
+      "scriptVersion": {
+        "id": "27bc37ae-48a5-495b-ae0b-e86cac82e9d3"
+      },
+      "executionModel": "stateless",
+      "requestId": "W5N73QAR0YX3QFA4"
+    },
+    "$metadata": {
+      "id": "01KSX8DFADE06T1NEKKHZYWY2E",
+      "requestId": "W5N73QAR0YX3QFA4",
+      "trigger": "*/15 * * * *",
+      "service": "trade-control-web-hook",
+      "message": "tn[reversals]: using cached session",
+      "account": "4a1a3fca7735ec4b76a4f276821fb795",
+      "type": "cf-worker",
+      "fingerprint": "83bd0c6ddf8a4b5fe22d6b1f5dccfe4d",
+      "origin": "cron",
+      "messageTemplate": "tn[reversals]: using cached session"
+    }
+  },
+  {
+    "source": {
+      "message": "tn[reversals]: using cached session"
+    },
+    "dataset": "cloudflare-workers",
+    "timestamp": "2026-05-30T20:00:11.110Z",
+    "$workers": {
+      "truncated": false,
+      "event": {
+        "cron": "*/15 * * * *",
+        "scheduledTime": 1780171209000
+      },
+      "scriptName": "trade-control-web-hook",
+      "outcome": "ok",
+      "eventType": "cron",
+      "scriptVersion": {
+        "id": "27bc37ae-48a5-495b-ae0b-e86cac82e9d3"
+      },
+      "executionModel": "stateless",
+      "requestId": "BJTU9752UCGZ5K9D"
+    },
+    "$metadata": {
+      "id": "01KSX7J0B6JVTJF5AH8MFG96W0",
+      "requestId": "BJTU9752UCGZ5K9D",
+      "trigger": "*/15 * * * *",
+      "service": "trade-control-web-hook",
+      "message": "tn[reversals]: using cached session",
+      "account": "4a1a3fca7735ec4b76a4f276821fb795",
+      "type": "cf-worker",
+      "fingerprint": "83bd0c6ddf8a4b5fe22d6b1f5dccfe4d",
+      "origin": "cron",
+      "messageTemplate": "tn[reversals]: using cached session"
+    }
+  }
+]

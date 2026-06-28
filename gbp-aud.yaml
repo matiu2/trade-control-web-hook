@@ -1,0 +1,23 @@
+v: 1
+action: enter
+instrument: GBPAUD
+id: GBPAUD-2026-05-18-eea1
+not_after: 2026-05-19T10:48:58.758386730+00:00
+broker: tradenation
+direction: short
+entry:
+  type: stop
+  from: low
+  offset_pips: 1.0
+stop_loss:
+  from: high
+  offset_pips: 1.0
+take_profit:
+  absolute: 1.86276
+risk_pct: 1.0
+requires_preps:
+- break-and-close
+- retest
+vetos:
+- above-shoulder
+- trade-expired

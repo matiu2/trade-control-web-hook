@@ -1,0 +1,27 @@
+close: {{close}}
+high: {{high}}
+low: {{low}}
+time: "{{time}}"
+signal_high: {{plot("signal_high")}}
+signal_low: {{plot("signal_low")}}
+signal_range: {{plot("signal_range")}}
+signal_start_time: {{plot("signal_start_time")}}
+signal_kind: {{plot("signal_kind")}}
+golden: {{plot("signal_golden")}}
+atr: {{plot("signal_atr")}}
+signal_confirmed: {{plot("signal_confirmed")}}
+recent_high: {{plot("recent_high")}}
+recent_low: {{plot("recent_low")}}
+v: 1
+id: ihs-gbp-nzd-951d28fa-close-on-reversal
+not_after: "2026-06-05T12:00:00Z"
+action: close
+instrument: GBP/NZD
+broker: tradenation
+account: reversals
+trade_id: ihs-gbp-nzd-951d28fa
+inside_window: [news, price]
+sr_bands:
+  - [2.26213, 2.26665]
+reason: news-window or S/R reversal
+sig: "v1-sig.YZK8U2LUAQWuEl9R5k38CpfIupuygoywuQKUfDMDdZc="

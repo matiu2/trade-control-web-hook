@@ -1,0 +1,8 @@
+v: 1
+action: prep
+instrument: USDZAR
+id: USDZAR-2026-05-18-2fbb
+not_after: 2026-05-20T13:31:44.901900553+00:00
+step: retest
+ttl_hours: 12
+clears: []

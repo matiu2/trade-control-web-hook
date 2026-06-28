@@ -107,6 +107,51 @@ week-long promotion gate). Demo-confirm `amend_stop` on an open TN position
 before trusting the live move (shared precondition with the blackout widen).
 The operator's stance ("the SL is handled by the broker") means BE only needs
 to arm once and set the broker-native stop.
+## v61 — 2026-06-28 — ATR-based entry/SL buffer (`offset_atr_pct`)
+
+**Why.** The entry and stop-loss were offset from the signal candle by a
+hardcoded ±1 pip, which doesn't scale with instrument volatility — a buffer
+that's safe on EUR/USD is nothing on a noisy instrument like Wheat (demo trade
+075). The buffer should be a function of recent volatility so a quiet pair gets
+a tight buffer and a noisy one a proportionally wider one, with no per-instrument
+hand-tuning.
+
+**What changed.** Every anchored offset (entry trigger, `stop_loss`, anchored
+`take_profit`) now accepts **`offset_atr_pct`** — a buffer as a percent of ATR,
+resolved at fill time as `(offset_atr_pct / 100) × shell.atr`. The ATR is the
+Wilder ATR the signal detector already latches per bar (per-timeframe length),
+recomputed each tick from the candle window the engine holds — no new ATR
+plumbing, no broker pull. New H&S / iH&S enters (CLI `build-trade` + `tv-arm`)
+default to `offset_atr_pct: 0.5` on entry and SL, replacing the ±1-pip default.
+`offset_atr_pct` is an unsigned magnitude (direction comes from the anchor).
+Resolution is shared in `trade_control_core`, so the live worker and the offline
+replay can't drift. The engine simulator honours it automatically (same pure
+`Resolved::from_intent`).
+
+**Behaviour.** Fail-closed: an `offset_atr_pct` offset on a bar with no ATR
+(warmup / short feed) declines that bar (the plan stays armed and retries next
+tick) rather than placing a zero-buffer trade. `offset_atr_pct` and
+`offset_pips` are mutually exclusive; `offset_atr_pct` on a `close` anchor is
+rejected; a negative `offset_atr_pct` is rejected.
+
+**Breaking.** `PriceRef::resolve` / `resolve_tp` are now fallible
+(`Result<_, OffsetError>`). `IntentValidationError` drops its `Eq` derive (the
+new `OffsetSpecInvalid(OffsetError)` variant carries an f64). `TradeSpec` gains
+`entry_offset_atr_pct` / `sl_offset_atr_pct` override fields.
+
+**Config.** New enter-intent offset field `offset_atr_pct` on
+`PriceRef::Anchored` / `EntrySpec::{Stop,Limit}` (serde-default, skip-if-none →
+old wire byte-identical). `offset_pips` is **deprecated** but still honoured for
+in-flight / hand-armed plans and explicit pip buffers. CLI interactive prompts
+now offer ATR-pct (default) or pips for directional anchors.
+
+**Tests.** New core resolution tests (buffer pushes away / scales with vol /
+no-ATR rejects / both-set rejects / close-anchor rejects / negative rejects /
+pips path unchanged); 4 parse-time `validate` tests; 2 engine simulator parity
+tests (buffered fill + no-ATR Unresolved). Full workspace green.
+
+**Follow-up.** None required — M/W uses its own baked-price geometry and is
+untouched; `entry_level_vetos` bake absolute prices and are unaffected.
 
 ## v60 — 2026-06-27 — Staging bake marker (no code change)
 

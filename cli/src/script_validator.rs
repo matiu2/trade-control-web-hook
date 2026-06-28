@@ -209,6 +209,7 @@ mod tests {
             stop_loss: Some(PriceRef::Anchored {
                 from: PriceAnchor::Low,
                 offset_pips: -2.0,
+                offset_atr_pct: None,
             }),
             take_profit: Some(TakeProfit::Anchored(PriceRef::Absolute {
                 absolute: 1.1044,
