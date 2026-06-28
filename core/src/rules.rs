@@ -689,6 +689,7 @@ mod tests {
             risk: crate::intent::RiskBudget::Percent(0.5),
             dry_run: false,
             recover_entry: None,
+            breakeven: None,
         }
     }
 
@@ -777,6 +778,7 @@ mod tests {
             risk: crate::intent::RiskBudget::Percent(0.5),
             dry_run: false,
             recover_entry: None,
+            breakeven: None,
         };
         bind_shell_anchors(&mut scope, &shell_full());
         bind_intent_derived(&mut scope, &r, 0.0001);

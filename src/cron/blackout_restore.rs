@@ -216,10 +216,10 @@ async fn redrive(
 ) -> crate::ActionResult {
     match broker {
         BrokerHandle::Oanda(b) => {
-            crate::run_enter(b, store, verified, env, now, Some(raw_body)).await
+            crate::run_enter(b, store, verified, env, now, Some(raw_body), None).await
         }
         BrokerHandle::TradeNation(b) => {
-            crate::run_enter(b, store, verified, env, now, Some(raw_body)).await
+            crate::run_enter(b, store, verified, env, now, Some(raw_body), None).await
         }
     }
 }

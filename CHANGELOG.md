@@ -56,6 +56,58 @@ prints, the short reports `CLOSED ON REVERSAL` / `REV: 1`, not "still open").
 flattens at market on that tick — a faithful proxy with only OHLC). A
 spread-aware exit price would need the bid/ask book the worker actually trades.
 
+## Unreleased — 2026-06-28 — Break-even stop at 50%-to-TP
+
+**Why.** There was no stop-management rule of any kind: after entry the SL
+stayed at its original level for the life of the position, so a leg that ran
+≥50% to TP and then reversed took a full −1R instead of a 0R scratch (demo
+trade 075 Wheat H&S short, leg 2 — `BUG-replay-no-breakeven-stop-at-50pct`).
+The standing lesson ("once profit reaches 50%, set SL to break-even") was not
+encoded in the engine.
+
+**What changed.** A break-even rule, baked as signed data on the enter intent
+and applied identically by both consumers (replay + live worker) via a pure
+core helper so they can't drift:
+
+- **core** `intent::Breakeven { threshold }` — pure helpers: `arms_at(entry,tp)`
+  (directional 50%-to-TP level), `close_arms` (inclusive **close-past** test —
+  a wick does not arm), `target_stop` (= entry, a 0R scratch), `decide_move`
+  (the worker's per-tick decision; idempotent & one-way), `more_progressed`.
+  Degenerate thresholds clamp to 0.5.
+- **replay** `engine::simulate_fill` — the exit walk tracks a latched
+  `active_stop`; once a candle CLOSES past the 50% level the stop moves to
+  entry for subsequent bars. Report shows `BREAK-EVEN (SL→BE)` when the stop
+  landed at entry.
+- **live worker** `src/cron/breakeven_watch.rs` — new every-tick cron: joins
+  open positions to their `EntryAttempt`'s `BreakevenSnapshot`, fetches closed
+  candles at the trade granularity, and `amend_stop(entry)` once a close passes
+  50%. Shares `blackout_apply`'s demo-confirm precondition on
+  `AmendCloseOrder`-on-open-position (every intended amend logged first).
+- **arm** `05-enter` carries the rule **by default at 50%** (H&S, the
+  strategy-v2 QM leg, and M/W). tv-arm `--no-breakeven` opts out;
+  `--breakeven-pct <f>` overrides. Spec field `breakeven_pct` (`null` disables).
+
+**Breaking.** `Intent.breakeven: Option<Breakeven>` and `Resolved.breakeven`
+added (serde default-absent — in-flight intents/plans unchanged).
+`EntryAttempt.breakeven: Option<BreakevenSnapshot>` added (serde default-absent).
+`retry_gate::record_placement` gains a `breakeven` param; `run_enter` gains an
+`enter_granularity` param (engine passes the plan granularity; webhook +
+blackout-restore pass `None`).
+
+**Config.** `TradeSpec.breakeven_pct` (default `Some(0.5)`; `null` disables).
+tv-arm `--no-breakeven` / `--breakeven-pct`.
+
+**Tests.** Core (`Breakeven` helpers incl. trade-075 leg-2 geometry +
+`decide_move`/`more_progressed`), engine (`simulate_fill` −1R→0R; wick does not
+arm), CLI (default 50% baked on the enter only; `null` disables; custom carried),
+worker cron (join). Full workspace green; clippy + fmt clean.
+
+**Follow-up.** Tag + deploy **deferred** — `staging` is mid-bake on v60 (the
+week-long promotion gate). Demo-confirm `amend_stop` on an open TN position
+before trusting the live move (shared precondition with the blackout widen).
+The operator's stance ("the SL is handled by the broker") means BE only needs
+to arm once and set the broker-native stop.
+
 ## v60 — 2026-06-27 — Staging bake marker (no code change)
 
 Marker release pinning the staging promotion candidate for its week-long bake

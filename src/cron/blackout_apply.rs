@@ -387,6 +387,7 @@ mod tests {
             cancel_at: None,
             pip_size,
             blackout_close: trade_control_core::intent::BlackoutCloseAction::default(),
+            breakeven: None,
         }
     }
 

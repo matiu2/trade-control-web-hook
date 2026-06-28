@@ -544,7 +544,7 @@ async fn run_action<B: Broker>(
     raw_body: &str,
 ) -> ActionResult {
     match verified.intent.action {
-        Action::Enter => run_enter(broker, store, verified, env, now, Some(raw_body)).await,
+        Action::Enter => run_enter(broker, store, verified, env, now, Some(raw_body), None).await,
         Action::Close => run_close(broker, store, verified, now).await,
         Action::Invalidate => run_invalidate(broker, store, verified, now).await,
         Action::Veto => run_veto_with_broker(broker, store, verified, now).await,
@@ -1174,6 +1174,14 @@ pub(crate) async fn run_enter<B: Broker>(
     env: &Env,
     now: chrono::DateTime<chrono::Utc>,
     raw_body: Option<&str>,
+    // The trade's timeframe, when this enter was dispatched from a registered
+    // plan (the engine path passes `Some(plan.granularity)`). The break-even
+    // position cron needs it to fetch the right closed candles. The webhook and
+    // blackout-restore re-drive paths have no plan timeframe in hand and pass
+    // `None` — those enters simply don't get cron-managed break-even (the
+    // signed enter still carries its `breakeven` rule; only the cron snapshot
+    // is skipped without a granularity to fetch on).
+    enter_granularity: Option<trade_control_core::broker::Granularity>,
 ) -> ActionResult {
     // Blackout gate — if any pause for this trade_id is active, reject
     // before doing any other work. Pauses are intentionally cheap to
@@ -1815,6 +1823,22 @@ pub(crate) async fn run_enter<B: Broker>(
             } else {
                 rlog!("entry placed id={} order={}", verified.intent.id, order_id);
                 if let Some(attempt_no) = retry_attempt_no {
+                    // Break-even snapshot: only when the enter carried a
+                    // `breakeven` rule AND we know the trade's timeframe (engine
+                    // path). The cron joins the open position back to this row,
+                    // fetches closed candles at `granularity`, and moves the SL
+                    // to entry once a candle closes past 50%-to-TP.
+                    let breakeven_snapshot = match (resolved.breakeven, enter_granularity) {
+                        (Some(rule), Some(granularity)) => {
+                            Some(trade_control_core::state::BreakevenSnapshot {
+                                rule,
+                                entry_price: resolved.entry.reference_price(),
+                                take_profit: resolved.take_profit,
+                                granularity,
+                            })
+                        }
+                        _ => None,
+                    };
                     trade_control_core::retry_gate::record_placement(
                         store,
                         &verified.intent,
@@ -1826,6 +1850,7 @@ pub(crate) async fn run_enter<B: Broker>(
                         resolved.direction,
                         resolved.stop_loss,
                         cancel_at,
+                        breakeven_snapshot,
                     )
                     .await;
                 }
@@ -4391,6 +4416,7 @@ mod dispatcher_outcome_tests {
                 pip_size: None,
                 trade_plan: None,
                 blackout_close: trade_control_core::intent::BlackoutCloseAction::default(),
+                breakeven: None,
                 include_archived: false,
             },
         }

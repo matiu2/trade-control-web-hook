@@ -30,6 +30,7 @@ mod blackout_hours;
 mod blackout_restore;
 mod blackout_watch;
 mod blackout_widen;
+mod breakeven_watch;
 mod constants;
 mod engine;
 pub(crate) mod session_meta;
@@ -51,6 +52,9 @@ pub async fn scheduled(_event: ScheduledEvent, env: Env, ctx: ScheduleContext) {
     session_refresh::refresh_stale_sessions(&env, now, constants::STALE_AFTER).await;
     sweep::sweep_pending_orders(&env, now).await;
     blackout_watch::watch_recovery(&env, now).await;
+    // Break-even stop management — move open positions' stops to entry once a
+    // candle closes past 50%-to-TP (BUG-replay-no-breakeven-stop-at-50pct).
+    breakeven_watch::watch(&env, now).await;
 
     // Server-side trade-plan engine — evaluate every registered plan against
     // fresh broker candles and dispatch fired intents. Runs in parallel with

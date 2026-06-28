@@ -201,9 +201,22 @@ pub fn simulate_fill(
     // candle we can't tell the intrabar order from a closed bar, so we
     // conservatively call it the stop (the worse outcome) — matches the
     // simulator doc's "exact-level, pessimistic on ambiguity" stance.
+    //
+    // Break-even management (BUG-replay-no-breakeven-stop-at-50pct): if the
+    // enter carries `breakeven`, the active stop starts at the resolved SL and
+    // moves to the entry price once a candle *closes* past the 50%-to-TP level.
+    // Latched / one-way. The operator's same-bar rule: BE arms on a close, so
+    // the moved stop is live from the **next** bar — on the arming bar the
+    // original (or already-moved) stop still applies, mirroring the broker's
+    // resting stop. We therefore test the exit against `active_stop` first, then
+    // arm BE from this candle's close for subsequent bars.
     let exit_book = book_for(Leg::Exit, dir);
+    let be_arms_at = resolved
+        .breakeven
+        .map(|be| be.arms_at(entry_price, resolved.take_profit));
+    let mut active_stop = resolved.stop_loss;
     for c in rest {
-        let hit_sl = book_crosses(c, exit_book, resolved.stop_loss);
+        let hit_sl = book_crosses(c, exit_book, active_stop);
         let hit_tp = book_crosses(c, exit_book, resolved.take_profit);
         match (hit_sl, hit_tp) {
             (true, _) => {
@@ -211,7 +224,7 @@ pub fn simulate_fill(
                     fill_at,
                     entry_price,
                     exit_at: c.time,
-                    exit_price: resolved.stop_loss,
+                    exit_price: active_stop,
                 };
             }
             (false, true) => {
@@ -223,6 +236,15 @@ pub fn simulate_fill(
                 };
             }
             (false, false) => {}
+        }
+        // Arm break-even for the next bar onward when this candle CLOSES past
+        // the 50% level. Latched: once moved to entry it never reverts (a long's
+        // entry >= original SL, a short's entry <= it, so `active_stop` only
+        // tightens).
+        if let (Some(be), Some(level)) = (resolved.breakeven, be_arms_at)
+            && be.close_arms(dir, level, c.c)
+        {
+            active_stop = be.target_stop(entry_price);
         }
     }
 
@@ -401,6 +423,7 @@ mod tests {
             pip_size: None,
             trade_plan: None,
             blackout_close: trade_control_core::intent::BlackoutCloseAction::default(),
+            breakeven: None,
             include_archived: false,
         }
     }
@@ -559,6 +582,111 @@ mod tests {
             simulate_fill(&intent, &shell, 0.0001, &sl_path),
             SimOutcome::StoppedOut { .. }
         ));
+    }
+
+    /// Override a short stop-entry intent's entry trigger / SL / TP to absolute
+    /// levels, so a BE test controls the exact 50%-to-TP geometry.
+    fn i_set_levels(intent: &mut Intent, entry: f64, sl: f64, tp: f64) {
+        intent.entry = Some(EntrySpec::Stop {
+            from: PriceAnchor::Close,
+            offset_pips: 0.0,
+            at: Some(entry),
+            recover_entry: None,
+        });
+        intent.stop_loss = Some(PriceRef::Absolute { absolute: sl });
+        intent.take_profit = Some(TakeProfit::Anchored(PriceRef::Absolute { absolute: tp }));
+    }
+
+    #[test]
+    fn breakeven_scratches_a_leg_that_runs_50pct_then_reverses() {
+        // Trade-075 Wheat leg-2 shape (BUG-replay-no-breakeven-stop-at-50pct),
+        // simplified to round levels but the same geometry: a SHORT that runs
+        // past the 50%-to-TP mark on a close, then bounces back to the original
+        // SL. Without BE → StoppedOut at the original SL (−1R). With BE → the
+        // stop is moved to entry once a candle closes past 50%, so the bounce
+        // closes it at break-even (entry), a 0R scratch.
+        use trade_control_core::intent::Breakeven;
+
+        // Short stop-entry at 1.1000, original SL 1.1040 (above), TP 1.0900
+        // (below). 50%-to-TP level = 1.1000 + 0.5×(1.0900 − 1.1000) = 1.0950.
+        let mut intent = short_stop_intent();
+        i_set_levels(&mut intent, 1.1000, 1.1040, 1.0900);
+        let shell = Shell::from_candle(
+            &candle("2026-06-17T10:00:00Z", 1.1010, 1.1012, 1.0998, 1.1005).mid(),
+        );
+
+        // Path: fire bar (skipped) → fill bar reaches the 1.1000 sell-stop on
+        // the bid → a candle that CLOSES at 1.0940 (past the 1.0950 BE level,
+        // arming BE) → a candle that bounces back up to the 1.1040 ORIGINAL SL.
+        let fill_bar = candle("2026-06-17T11:00:00Z", 1.1005, 1.1005, 1.0995, 1.1000);
+        let runs_past_50 = candle("2026-06-17T12:00:00Z", 1.0990, 1.0992, 1.0935, 1.0940); // closes past 1.0950
+        let bounce_to_orig_sl = candle("2026-06-17T13:00:00Z", 1.0945, 1.1041, 1.0944, 1.1000);
+        let path = [fire_bar(), fill_bar, runs_past_50, bounce_to_orig_sl];
+
+        // Baseline: NO breakeven → the bounce hits the original 1.1040 SL.
+        intent.breakeven = None;
+        match simulate_fill(&intent, &shell, 0.0001, &path) {
+            SimOutcome::StoppedOut { exit_price, .. } => {
+                assert!(
+                    (exit_price - 1.1040).abs() < 1e-9,
+                    "no-BE: stopped at the original SL 1.1040, got {exit_price}"
+                );
+            }
+            other => panic!("no-BE: expected StoppedOut at original SL, got {other:?}"),
+        }
+
+        // With BE at 50%: the 1.0940 close arms BE (SL → entry 1.1000); the
+        // bounce bar (which spans 1.0944..1.1041) now hits the MOVED stop at the
+        // entry price 1.1000 first → break-even scratch, not −1R.
+        intent.breakeven = Some(Breakeven::at_half());
+        match simulate_fill(&intent, &shell, 0.0001, &path) {
+            SimOutcome::StoppedOut {
+                exit_price,
+                entry_price,
+                ..
+            } => {
+                assert!(
+                    (exit_price - 1.1000).abs() < 1e-9,
+                    "BE: stop moved to entry 1.1000, got {exit_price}"
+                );
+                assert!(
+                    (exit_price - entry_price).abs() < 1e-9,
+                    "BE: exit == entry → 0R scratch"
+                );
+            }
+            other => panic!("BE: expected break-even stop-out at entry, got {other:?}"),
+        }
+    }
+
+    /// A candle that only WICKS past the 50% level (but closes back short of it)
+    /// must NOT arm break-even — the arming basis is the close, not the wick.
+    #[test]
+    fn breakeven_does_not_arm_on_a_wick() {
+        use trade_control_core::intent::Breakeven;
+        let mut intent = short_stop_intent();
+        i_set_levels(&mut intent, 1.1000, 1.1040, 1.0900); // BE level 1.0950
+        intent.breakeven = Some(Breakeven::at_half());
+        let shell = Shell::from_candle(
+            &candle("2026-06-17T10:00:00Z", 1.1010, 1.1012, 1.0998, 1.1005).mid(),
+        );
+
+        // Fill, then a candle whose LOW (1.0935) wicks past the 1.0950 BE level
+        // but whose CLOSE (1.0960) stays short of it → BE must NOT arm. The
+        // later bounce to the original SL 1.1040 then takes the full −1R.
+        let fill_bar = candle("2026-06-17T11:00:00Z", 1.1005, 1.1005, 1.0995, 1.1000);
+        let wick_only = candle("2026-06-17T12:00:00Z", 1.0990, 1.0992, 1.0935, 1.0960); // close 1.0960 > level
+        let bounce = candle("2026-06-17T13:00:00Z", 1.0965, 1.1041, 1.0960, 1.1000);
+        let path = [fire_bar(), fill_bar, wick_only, bounce];
+
+        match simulate_fill(&intent, &shell, 0.0001, &path) {
+            SimOutcome::StoppedOut { exit_price, .. } => {
+                assert!(
+                    (exit_price - 1.1040).abs() < 1e-9,
+                    "a wick must not arm BE; stop stays at original 1.1040, got {exit_price}"
+                );
+            }
+            other => panic!("expected StoppedOut at original SL (no BE arm), got {other:?}"),
+        }
     }
 
     #[test]

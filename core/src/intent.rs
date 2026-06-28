@@ -6,6 +6,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 mod blackout;
+mod breakeven;
 mod entry_level_veto;
 mod expiry;
 mod mw_resolution;
@@ -17,6 +18,7 @@ pub use blackout::{
     BlackoutCloseAction, Buffers, MINUTES_PER_DAY, NoEntryWindow, is_inside_any, is_inside_window,
     windows_from_session,
 };
+pub use breakeven::{Breakeven, DEFAULT_BREAKEVEN_THRESHOLD};
 pub use entry_level_veto::{EntryLevelVeto, VetoSide};
 pub use expiry::{ExpiryError, MAX_EXPIRY_BARS, resolve_cancel_at};
 pub use mw_resolution::mw_static_prices;
@@ -502,6 +504,22 @@ pub struct Intent {
     /// gates any externally/guard-set KV veto.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub entry_level_vetos: Vec<EntryLevelVeto>,
+    /// Break-even stop management (BUG-replay-no-breakeven-stop-at-50pct).
+    /// When present on an `enter`, the stop-loss is moved to break-even (the
+    /// entry price) once a candle **closes** past [`Breakeven::arms_at`] — by
+    /// default 50% of the entry→TP distance. Latched / one-way: it arms once
+    /// and the moved stop never reverts. Both consumers honour it identically
+    /// — the offline replay (`simulate_fill`) and the live worker's open-
+    /// position cron (`amend_stop`) — via the pure helpers on [`Breakeven`], so
+    /// they can't drift (same pattern as [`Self::entry_level_vetos`]).
+    ///
+    /// `#[serde(default)]` keeps every in-flight signed intent / stored plan
+    /// deserialising unchanged; default-absent = no break-even move (today's
+    /// static-SL behaviour). Signed as part of the whole-body HMAC, so a baked
+    /// threshold can't be tampered. Meaningful on `Action::Enter`; ignored on
+    /// other actions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub breakeven: Option<Breakeven>,
     /// Names to clear *before* setting the new prep/veto. Used to model
     /// ordered prep sequences where landing an earlier step must
     /// invalidate any stale later step.

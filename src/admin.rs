@@ -445,6 +445,9 @@ pub async fn handle_adopt(req: &mut Request, env: &Env) -> Result<Response> {
         // trade is already filled, so the sweep's close branch never
         // applies to it anyway.
         blackout_close: trade_control_core::intent::BlackoutCloseAction::default(),
+        // Adopt-trade has no resolved enter geometry, so no cron-managed
+        // break-even — the operator adopted an already-filled position.
+        breakeven: None,
     };
 
     if let Err(err) = state.record_entry_attempt(attempt.clone()).await {
