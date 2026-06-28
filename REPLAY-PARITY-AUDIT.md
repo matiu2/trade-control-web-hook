@@ -81,14 +81,19 @@ decide that is **still worker-only**, ranked by replay value.
    `bar_expiry_due` / `market_blackout_due` moved to `core::sweep_gate`; pure
    `engine::sweep_reason` reconstructs the cancel reason for a `NeverFilled` and
    the report names it (SL-breach / bar-expiry / alert-window-expiry / blackout).
-3. **market-hours blackout** — ⏳ **seam done, source pending.** The predicate
-   (`market_blackout_due`) and the `engine::sweep_reason` blackout branch are
-   wired and source-agnostic; the report renders the label. The **offline window
-   source** isn't connected: live windows come from TradeNation `market_info`
-   (daily cron → KV); the replay needs the same hours from a forthcoming shared
-   market-hours source. `replay-candles` currently passes empty windows + WARN
-   (`market_hours::resolve_blackout_windows`, `TODO(replay-parity-item-3)`), so
-   behaviour is unchanged until the source lands — then it's a one-function swap.
+3. ~~**market-hours blackout**~~ ✅ **DONE** — the predicate
+   (`market_blackout_due`) and the `engine::sweep_reason` blackout branch were
+   already wired and source-agnostic; the report renders the label. The
+   **offline window source** is now connected:
+   `market_hours::resolve_blackout_windows` calls the **same** TradeNation
+   `market_info` the live `blackout_hours` cron uses (`resolve_market` +
+   `get_market_info`) and feeds the Brisbane session ranges through the identical
+   shared deriver (`core::windows_from_session`) — so the replay reconstructs the
+   exact UTC windows the worker would. OANDA stays empty (the worker's cron skips
+   OANDA — venue hours coming soon). Fail-soft: any login/resolve/broker miss
+   logs a WARN and yields no windows. `--test-mode` (fixture replay) stays fully
+   offline (passes `&[]`). Smoke-tested live on GBP/AUD → one window
+   `[1199..1325]` (the 20:00→22:00 UTC FX maintenance gap, buffered).
 4. ~~**allow_entry / candle_gate → core**~~ ✅ **DONE** — both gates in
    `core::allow_entry_gate` / `candle_gate`; `engine::entry_gate_block` applies
    them in the replay with a `BLOCKED` report line.

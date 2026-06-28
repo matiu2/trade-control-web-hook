@@ -5,6 +5,6 @@ edition = "2024"
 
 [dependencies]
 chrono = { version = "0.4.45", default-features = false, features = ["alloc"] }
-oanda-client = { version = "0.1.4", path = "../../oanda-client", default-features = false, features = ["wasm_js"] }
+oanda-client = { version = "0.2.0", path = "../../oanda-client", default-features = false, features = ["wasm_js"] }
 trade-control-core = { version = "0.1.0", path = "../core" }
 worker = "0.8"
