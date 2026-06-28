@@ -48,6 +48,7 @@
 
 use trade_control_core::broker::BidAskCandle;
 use trade_control_core::intent::{Direction, Intent, Resolved, ResolvedEntry, Shell};
+use trade_control_core::sweep_gate::{SweepReason, bar_expiry_due, breach_detected};
 
 /// What the simulator decided happened to one fired enter over the candle path.
 #[derive(Debug, Clone, PartialEq)]
@@ -320,6 +321,89 @@ pub fn breakeven_armed_at(
             return Some(c.time);
         }
     }
+    None
+}
+
+/// Why the live cron sweep would have cancelled a `NeverFilled` resting order,
+/// and the bar timestamp at which it would have acted — the replay stand-in for
+/// the worker's [`sweep_pending_orders`](../../../src/cron/sweep.rs).
+///
+/// `simulate_fill` reports `NeverFilled` for *any* order that never triggered —
+/// but the live worker doesn't passively wait: every cron tick it walks each
+/// resting `EntryAttempt` and **cancels** it once its alert window expired, its
+/// bar-based `cancel_at` passed, it sits inside a market-hours blackout, or
+/// current price overtook its stop-loss. A replay that can't tell an order the
+/// worker would have *swept* from one that merely never triggered diverges
+/// silently from production. This walks the post-fire candle path and returns
+/// the first sweep the worker would have made.
+///
+/// Mirrors the worker's `sweep_one` branch priority at each bar: **expired**
+/// (alert window) → **bar-expiry** (`cancel_at`) → *blackout* → **SL-breach**.
+/// It reuses the shared `core::sweep_gate` predicates so worker and replay can't
+/// drift, and derives `cancel_at` via the same `core::resolve_cancel_at` the
+/// worker uses (off the Pine-shipped forward bar-close menu on the shell).
+///
+/// Returns `None` when no sweep condition is reached within the candle path, or
+/// when the order would never rest (a Market entry / an unresolved intent — the
+/// caller's `NeverFilled` is then not a swept order). The **blackout** case is
+/// deliberately not reconstructed: the per-instrument no-entry windows are
+/// daily-cron-written to KV and the offline replay doesn't have them — so a
+/// blackout-driven sweep returns `None` here rather than a faked `Blackout`.
+/// TODO: surface market-hours blackout once an offline window source lands —
+/// REPLAY-PARITY-AUDIT item 3.
+///
+/// Pure and side-effect-free; the report calls it independently of
+/// [`simulate_fill`] so the `SimOutcome` enum (and every saved fixture) stays
+/// untouched — the same pattern [`breakeven_armed_at`] uses.
+pub fn sweep_reason(
+    intent: &Intent,
+    shell: &Shell,
+    pip_size: f64,
+    candles: &[BidAskCandle],
+) -> Option<(SweepReason, chrono::DateTime<chrono::Utc>)> {
+    let resolved = Resolved::from_intent(intent, shell, pip_size).ok()?;
+
+    // A Market entry fills at once (it never rests), so a `NeverFilled` Market is
+    // not a swept order — there's nothing for the sweep to cancel.
+    let sl = match resolved.entry {
+        ResolvedEntry::Stop { .. } | ResolvedEntry::Limit { .. } => resolved.stop_loss,
+        ResolvedEntry::Market { .. } => return None,
+    };
+    let dir = resolved.direction;
+
+    // Derive the bar-based `cancel_at` exactly as the worker's `run_enter` does:
+    // off the Pine-shipped forward bar-close menu on the shell, capped at the
+    // alert window. A non-static / out-of-range / absent `expiry_bars` yields no
+    // bar-expiry (matching the worker, which only sets `cancel_at` when it
+    // resolves cleanly).
+    let cancel_at = intent
+        .expiry_bars
+        .as_ref()
+        .and_then(|t| t.as_static())
+        .copied()
+        .and_then(|bars| {
+            trade_control_core::intent::resolve_cancel_at(bars, shell, intent.not_after).ok()
+        });
+
+    // The order rests from the bar *after* the fire bar (a pending order isn't
+    // live until the fire bar closes — same skip `find_fill` applies). Walk those
+    // live bars chronologically; the first that trips a sweep branch wins.
+    for c in candles.get(1..).unwrap_or(&[]) {
+        if intent.not_after < c.time {
+            return Some((SweepReason::Expired, c.time));
+        }
+        if bar_expiry_due(cancel_at, c.time) {
+            return Some((SweepReason::BarExpiry, c.time));
+        }
+        // SL-breach uses the bar's mid close as the "current price" the live
+        // sweep would read from `get_current_price` (a mid quote). Intrabar
+        // wick noise is intentionally ignored: the sweep samples a point price
+        // per tick, not the bar range.
+        if breach_detected(dir, c.c, sl) {
+            return Some((SweepReason::SlBreached, c.time));
+        }
+    }
+
     None
 }
 
@@ -1154,5 +1238,141 @@ mod tests {
             ),
             "a cross on the last live bar still fills"
         );
+    }
+
+    // --- sweep_reason -------------------------------------------------------
+
+    /// A never-triggered LONG stop-entry whose price falls past its SL while the
+    /// order is still resting → the live cron sweep would cancel it for an
+    /// SL-breach. `sweep_reason` reports that, at the breaching bar.
+    #[test]
+    fn sweep_reason_reports_sl_breach() {
+        let mut intent = long_stop_intent();
+        intent.entry = Some(EntrySpec::Stop {
+            from: PriceAnchor::Close,
+            offset_pips: 10.0, // trigger 1.1050; SL 1.1000
+            offset_atr_pct: None,
+            at: None,
+            recover_entry: None,
+        });
+        let shell = trigger_shell();
+
+        // Fire bar (skipped), then two bars that never reach the 1.1050 trigger;
+        // the second CLOSES at 1.0995 — below the 1.1000 SL → breach.
+        let path = [
+            fire_bar(),
+            candle("2026-06-17T11:00:00Z", 1.1041, 1.1045, 1.1038, 1.1040), // rests, no breach
+            candle("2026-06-17T12:00:00Z", 1.1010, 1.1012, 1.0990, 1.0995), // close past SL
+        ];
+        // Sanity: this path is NeverFilled (trigger never reached).
+        assert_eq!(
+            simulate_fill(&intent, &shell, 0.0001, &path),
+            SimOutcome::NeverFilled
+        );
+        assert_eq!(
+            sweep_reason(&intent, &shell, 0.0001, &path),
+            Some((SweepReason::SlBreached, ts("2026-06-17T12:00:00Z")))
+        );
+    }
+
+    /// A never-triggered stop-entry whose bar-based `cancel_at` (off the shell's
+    /// Pine forward-bar-close menu) passes → swept for bar-expiry.
+    #[test]
+    fn sweep_reason_reports_bar_expiry() {
+        let mut intent = long_stop_intent();
+        intent.entry = Some(EntrySpec::Stop {
+            from: PriceAnchor::Close,
+            offset_pips: 10.0, // trigger 1.1050
+            offset_atr_pct: None,
+            at: None,
+            recover_entry: None,
+        });
+        intent.expiry_bars = Some(Tunable::Static(1));
+        // cancel_at resolves off slot-1 of the shell's forward menu.
+        let mut shell = trigger_shell();
+        shell.next_candle_timestamp_1 = Some(ts("2026-06-17T11:30:00Z"));
+
+        // Bars never reach the trigger and never breach the SL — only bar-expiry
+        // can fire. The 12:00 bar is past the 11:30 cancel_at.
+        let path = [
+            fire_bar(),
+            candle("2026-06-17T11:00:00Z", 1.1041, 1.1045, 1.1038, 1.1043), // before cancel_at
+            candle("2026-06-17T12:00:00Z", 1.1041, 1.1045, 1.1038, 1.1043), // past cancel_at
+        ];
+        assert_eq!(
+            simulate_fill(&intent, &shell, 0.0001, &path),
+            SimOutcome::NeverFilled
+        );
+        assert_eq!(
+            sweep_reason(&intent, &shell, 0.0001, &path),
+            Some((SweepReason::BarExpiry, ts("2026-06-17T12:00:00Z")))
+        );
+    }
+
+    /// A never-triggered stop-entry whose alert window (`not_after`) closes
+    /// during the candle path → swept as alert-window expired. Expiry takes
+    /// priority over a same-bar SL-breach (worker `sweep_one` branch order).
+    #[test]
+    fn sweep_reason_reports_alert_window_expiry_first() {
+        let mut intent = long_stop_intent();
+        intent.entry = Some(EntrySpec::Stop {
+            from: PriceAnchor::Close,
+            offset_pips: 10.0, // trigger 1.1050; SL 1.1000
+            offset_atr_pct: None,
+            at: None,
+            recover_entry: None,
+        });
+        intent.not_after = ts("2026-06-17T11:30:00Z");
+        let shell = trigger_shell();
+
+        // The 12:00 bar is past not_after AND closes past the SL — expiry wins.
+        let path = [
+            fire_bar(),
+            candle("2026-06-17T11:00:00Z", 1.1041, 1.1045, 1.1038, 1.1043), // within window
+            candle("2026-06-17T12:00:00Z", 1.1010, 1.1012, 1.0990, 1.0995), // past window + SL
+        ];
+        assert_eq!(
+            sweep_reason(&intent, &shell, 0.0001, &path),
+            Some((SweepReason::Expired, ts("2026-06-17T12:00:00Z")))
+        );
+    }
+
+    /// No sweep condition reached within the path → `None`. A resting order that
+    /// simply never triggered (and never breached / expired) is not swept.
+    #[test]
+    fn sweep_reason_is_none_when_nothing_sweeps() {
+        let mut intent = long_stop_intent();
+        intent.entry = Some(EntrySpec::Stop {
+            from: PriceAnchor::Close,
+            offset_pips: 10.0, // trigger 1.1050; SL 1.1000
+            offset_atr_pct: None,
+            at: None,
+            recover_entry: None,
+        });
+        // No bar-expiry, generous alert window.
+        intent.expiry_bars = None;
+        let shell = trigger_shell();
+
+        // Bars stay between SL and trigger — never fill, never breach, in-window.
+        let path = [
+            fire_bar(),
+            candle("2026-06-17T11:00:00Z", 1.1041, 1.1045, 1.1038, 1.1043),
+            candle("2026-06-17T12:00:00Z", 1.1041, 1.1045, 1.1038, 1.1043),
+        ];
+        assert_eq!(
+            simulate_fill(&intent, &shell, 0.0001, &path),
+            SimOutcome::NeverFilled
+        );
+        assert_eq!(sweep_reason(&intent, &shell, 0.0001, &path), None);
+    }
+
+    /// A Market entry never rests, so a (degenerate) Market `NeverFilled` is not
+    /// a swept order → `None`.
+    #[test]
+    fn sweep_reason_is_none_for_market_entry() {
+        let mut intent = long_stop_intent();
+        intent.entry = Some(EntrySpec::Market);
+        let shell = trigger_shell();
+        assert_eq!(sweep_reason(&intent, &shell, 0.0001, &[fire_bar()]), None);
     }
 }

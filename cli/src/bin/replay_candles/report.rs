@@ -20,7 +20,9 @@
 
 use chrono::{DateTime, Utc};
 use trade_control_core::intent::{Action, Direction, Resolved, ResolvedEntry, Shell};
-use trade_control_engine::{SimOutcome, TradePlan, breakeven_armed_at, simulate_fill};
+use trade_control_engine::{
+    SimOutcome, SweepReason, TradePlan, breakeven_armed_at, simulate_fill, sweep_reason,
+};
 
 use super::brisbane::bne;
 use super::replay::{Fire, Replay};
@@ -475,7 +477,19 @@ fn render_fire(
             *reversal_closes += 1;
         }
         ReplayOutcome::Sim(outcome) => {
-            line.push_str(&format!("    {}\n", describe_outcome(&outcome)));
+            // A `NeverFilled` order isn't necessarily one that passively never
+            // triggered — the live cron sweep actively cancels a still-resting
+            // order once its window expires, its bar-expiry passes, or price
+            // overtakes its SL. Surface *why* the worker would have swept it so
+            // the replay distinguishes a swept order from an untriggered one.
+            let detail = match &outcome {
+                SimOutcome::NeverFilled => {
+                    let swept = sweep_reason(intent, &shell, plan.pip_size, &fire.forward);
+                    describe_never_filled(swept)
+                }
+                other => describe_outcome(other),
+            };
+            line.push_str(&format!("    {detail}\n"));
             match outcome {
                 SimOutcome::TookProfit { .. } => *wins += 1,
                 SimOutcome::StoppedOut { .. } => *losses += 1,
@@ -565,6 +579,30 @@ fn fmt_price(price: f64, pip_size: f64) -> String {
         5
     };
     format!("{price:.decimals$}")
+}
+
+/// The `NEVER FILLED` line, annotated with the sweep reason when the live cron
+/// would have actively cancelled the resting order (vs it simply never
+/// triggering). `swept` is `sweep_reason`'s verdict: `None` keeps the plain
+/// wording (untriggered / or a blackout sweep the offline replay can't see).
+fn describe_never_filled(swept: Option<(SweepReason, DateTime<Utc>)>) -> String {
+    match swept {
+        Some((SweepReason::SlBreached, at)) => format!(
+            "fill: NEVER FILLED — swept: SL breached @ {} (live cron cancels the resting order here)",
+            bne(at)
+        ),
+        Some((SweepReason::BarExpiry, at)) => {
+            format!("fill: NEVER FILLED — swept: bar-expiry @ {}", bne(at))
+        }
+        Some((SweepReason::Expired, at)) => {
+            format!("fill: NEVER FILLED — alert-window expired @ {}", bne(at))
+        }
+        // Blackout isn't reconstructable offline (no-entry windows live in KV),
+        // so `sweep_reason` returns None for it — fall through to plain wording.
+        Some((SweepReason::Blackout, _)) | None => {
+            "fill: NEVER FILLED (pending order untriggered in window)".to_string()
+        }
+    }
 }
 
 fn describe_outcome(outcome: &SimOutcome) -> String {

@@ -20,6 +20,7 @@ pub mod rules;
 pub mod sig;
 pub mod signals;
 pub mod state;
+pub mod sweep_gate;
 pub mod tick_bundle;
 pub mod trade_plan;
 pub mod tunable;
