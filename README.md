@@ -1388,6 +1388,7 @@ names the sweep reason when there is one:
     fill: NEVER FILLED — swept: SL breached @ 2026-06-19 12:00:00 +10:00 (live cron cancels the resting order here)
     fill: NEVER FILLED — swept: bar-expiry @ 2026-06-19 13:00:00 +10:00
     fill: NEVER FILLED — alert-window expired @ 2026-06-19 14:00:00 +10:00
+    fill: NEVER FILLED — swept: market-hours blackout @ 2026-06-19 21:00:00 +10:00 (live cron cancels the resting order as the session closes)
 ```
 
 When no sweep condition is reached it keeps the original wording, `fill: NEVER
@@ -1396,9 +1397,19 @@ FILLED (pending order untriggered in window)`. The decision is the pure
 predicates (`breach_detected` / `bar_expiry_due` / `market_blackout_due`) the
 live worker's sweep uses — so worker and replay can't drift. Like
 `breakeven_armed_at` it does **not** change `SimOutcome`, so saved fixtures are
-untouched. (The market-hours **blackout** sweep is not reconstructed offline —
-the per-instrument no-entry windows live in KV — so a blackout-driven cancel
-still shows the plain wording; surfacing it is REPLAY-PARITY-AUDIT item 3.)
+untouched.
+
+The **market-hours blackout** branch is wired (`sweep_reason` takes the
+instrument's no-entry windows and matches the live worker's `market_blackout_due`),
+but the offline **window source** isn't connected yet: live, the windows are
+written to KV daily by the `blackout_hours` cron from TradeNation `market_info`;
+the replay needs the *same* TradeNation hours (TradingView's charted-exchange
+hours would diverge), supplied by a forthcoming shared market-hours source. Until
+that lands, `replay-candles` logs a `WARN` and passes empty windows — so a
+blackout-driven cancel shows the plain "untriggered" wording, exactly as before.
+Wiring the source in is a one-function change (`market_hours::resolve_blackout_windows`);
+see `TODO(replay-parity-item-3)`. OANDA-sourced replays stay empty either way —
+the worker's `blackout_hours` cron skips OANDA (no `market_info` equivalent).
 
 **Spread-widen (`exit: SL widened` line).** System 2 of the spread-blackout
 defence widens the broker stop *away* from price when the live spread blows out

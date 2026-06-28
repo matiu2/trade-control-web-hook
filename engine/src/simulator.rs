@@ -49,7 +49,9 @@
 use trade_control_core::allow_entry_gate::{self, AllowEntryOutcome};
 use trade_control_core::broker::BidAskCandle;
 use trade_control_core::intent::{Direction, Intent, Resolved, ResolvedEntry, Shell};
-use trade_control_core::sweep_gate::{SweepReason, bar_expiry_due, breach_detected};
+use trade_control_core::sweep_gate::{
+    SweepReason, bar_expiry_due, breach_detected, market_blackout_due,
+};
 
 /// What the simulator decided happened to one fired enter over the candle path.
 #[derive(Debug, Clone, PartialEq)]
@@ -419,19 +421,25 @@ pub fn breakeven_armed_at(
 /// the first sweep the worker would have made.
 ///
 /// Mirrors the worker's `sweep_one` branch priority at each bar: **expired**
-/// (alert window) → **bar-expiry** (`cancel_at`) → *blackout* → **SL-breach**.
-/// It reuses the shared `core::sweep_gate` predicates so worker and replay can't
-/// drift, and derives `cancel_at` via the same `core::resolve_cancel_at` the
-/// worker uses (off the Pine-shipped forward bar-close menu on the shell).
+/// (alert window) → **bar-expiry** (`cancel_at`) → **blackout** (market-hours)
+/// → **SL-breach**. It reuses the shared `core::sweep_gate` predicates so worker
+/// and replay can't drift, and derives `cancel_at` via the same
+/// `core::resolve_cancel_at` the worker uses (off the Pine-shipped forward
+/// bar-close menu on the shell).
+///
+/// `blackout_windows` are the instrument's market-hours no-entry windows. Live
+/// they're written to KV daily by the `blackout_hours` cron from TradeNation
+/// `market_info`; the offline replay fetches the *same* `market_info` at startup
+/// and resolves them through the *same* `core::windows_from_session` deriver, so
+/// a blackout-driven sweep here matches the live worker's. Pass an **empty**
+/// slice when no windows are available (TradeNation unreachable, an OANDA-sourced
+/// replay, a 24h market, or an unparseable session) — the blackout branch then
+/// never fires, exactly the worker's fail-open, and the order falls through to
+/// the SL-breach check / plain "never triggered" verdict.
 ///
 /// Returns `None` when no sweep condition is reached within the candle path, or
 /// when the order would never rest (a Market entry / an unresolved intent — the
-/// caller's `NeverFilled` is then not a swept order). The **blackout** case is
-/// deliberately not reconstructed: the per-instrument no-entry windows are
-/// daily-cron-written to KV and the offline replay doesn't have them — so a
-/// blackout-driven sweep returns `None` here rather than a faked `Blackout`.
-/// TODO: surface market-hours blackout once an offline window source lands —
-/// REPLAY-PARITY-AUDIT item 3.
+/// caller's `NeverFilled` is then not a swept order).
 ///
 /// Pure and side-effect-free; the report calls it independently of
 /// [`simulate_fill`] so the `SimOutcome` enum (and every saved fixture) stays
@@ -441,6 +449,7 @@ pub fn sweep_reason(
     shell: &Shell,
     pip_size: f64,
     candles: &[BidAskCandle],
+    blackout_windows: &[trade_control_core::intent::NoEntryWindow],
 ) -> Option<(SweepReason, chrono::DateTime<chrono::Utc>)> {
     let resolved = Resolved::from_intent(intent, shell, pip_size).ok()?;
 
@@ -475,6 +484,15 @@ pub fn sweep_reason(
         }
         if bar_expiry_due(cancel_at, c.time) {
             return Some((SweepReason::BarExpiry, c.time));
+        }
+        // Market-hours blackout: the resting order is caught inside the
+        // instrument's daily close→open gap. Runs BEFORE SL-breach to match the
+        // worker's `sweep_one` ordering — across a closed session a price-based
+        // check would read a stale quote, so the closed market itself is the
+        // trigger. Empty `blackout_windows` ⇒ `market_blackout_due` is false ⇒
+        // fail-open (no fabricated blackout), same as the worker's reject gate.
+        if market_blackout_due(blackout_windows, c.time) {
+            return Some((SweepReason::Blackout, c.time));
         }
         // SL-breach uses the bar's mid close as the "current price" the live
         // sweep would read from `get_current_price` (a mid quote). Intrabar
@@ -1682,7 +1700,7 @@ mod tests {
             SimOutcome::NeverFilled
         );
         assert_eq!(
-            sweep_reason(&intent, &shell, 0.0001, &path),
+            sweep_reason(&intent, &shell, 0.0001, &path, &[]),
             Some((SweepReason::SlBreached, ts("2026-06-17T12:00:00Z")))
         );
     }
@@ -1716,7 +1734,7 @@ mod tests {
             SimOutcome::NeverFilled
         );
         assert_eq!(
-            sweep_reason(&intent, &shell, 0.0001, &path),
+            sweep_reason(&intent, &shell, 0.0001, &path, &[]),
             Some((SweepReason::BarExpiry, ts("2026-06-17T12:00:00Z")))
         );
     }
@@ -1744,7 +1762,7 @@ mod tests {
             candle("2026-06-17T12:00:00Z", 1.1010, 1.1012, 1.0990, 1.0995), // past window + SL
         ];
         assert_eq!(
-            sweep_reason(&intent, &shell, 0.0001, &path),
+            sweep_reason(&intent, &shell, 0.0001, &path, &[]),
             Some((SweepReason::Expired, ts("2026-06-17T12:00:00Z")))
         );
     }
@@ -1775,7 +1793,7 @@ mod tests {
             simulate_fill(&intent, &shell, 0.0001, &path),
             SimOutcome::NeverFilled
         );
-        assert_eq!(sweep_reason(&intent, &shell, 0.0001, &path), None);
+        assert_eq!(sweep_reason(&intent, &shell, 0.0001, &path, &[]), None);
     }
 
     /// A Market entry never rests, so a (degenerate) Market `NeverFilled` is not
@@ -1785,7 +1803,49 @@ mod tests {
         let mut intent = long_stop_intent();
         intent.entry = Some(EntrySpec::Market);
         let shell = trigger_shell();
-        assert_eq!(sweep_reason(&intent, &shell, 0.0001, &[fire_bar()]), None);
+        assert_eq!(
+            sweep_reason(&intent, &shell, 0.0001, &[fire_bar()], &[]),
+            None
+        );
+    }
+
+    /// A never-triggered stop-entry whose resting bars fall inside a market-hours
+    /// blackout window → swept as `Blackout`. Blackout takes priority over a
+    /// same-bar SL-breach (worker `sweep_one` branch order: blackout before the
+    /// stale-price SL check). An empty window slice never fires this branch.
+    #[test]
+    fn sweep_reason_reports_market_blackout() {
+        use trade_control_core::intent::NoEntryWindow;
+
+        let mut intent = long_stop_intent();
+        intent.entry = Some(EntrySpec::Stop {
+            from: PriceAnchor::Close,
+            offset_pips: 10.0, // trigger 1.1050; SL 1.1000
+            offset_atr_pct: None,
+            at: None,
+            recover_entry: None,
+        });
+        intent.expiry_bars = None;
+        let shell = trigger_shell();
+
+        // The 12:00Z bar both closes past the SL AND sits inside the blackout
+        // window (UTC minute 720 = 12:00). Blackout must win over SL-breach.
+        let path = [
+            fire_bar(),
+            candle("2026-06-17T11:00:00Z", 1.1041, 1.1045, 1.1038, 1.1043), // in-window, no breach
+            candle("2026-06-17T12:00:00Z", 1.1010, 1.1012, 1.0990, 1.0995), // blackout + past SL
+        ];
+        // 11:55–12:05 UTC blackout (minutes 715..=725) catches the 12:00 bar.
+        let windows = [NoEntryWindow::new(715, 725)];
+        assert_eq!(
+            sweep_reason(&intent, &shell, 0.0001, &path, &windows),
+            Some((SweepReason::Blackout, ts("2026-06-17T12:00:00Z")))
+        );
+        // Same path with no windows → falls through to SL-breach (not blackout).
+        assert_eq!(
+            sweep_reason(&intent, &shell, 0.0001, &path, &[]),
+            Some((SweepReason::SlBreached, ts("2026-06-17T12:00:00Z")))
+        );
     }
 
     /// A resolvable market enter so the gate-block tests exercise the gate, not

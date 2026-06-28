@@ -19,7 +19,9 @@
 //! is what flattens the broker position live.
 
 use chrono::{DateTime, Utc};
-use trade_control_core::intent::{Action, Direction, Resolved, ResolvedEntry, Shell};
+use trade_control_core::intent::{
+    Action, Direction, NoEntryWindow, Resolved, ResolvedEntry, Shell,
+};
 use trade_control_core::spread_blackout::elevated_threshold_pips;
 use trade_control_engine::{
     GateBlock, SimOutcome, SweepReason, TradePlan, breakeven_armed_at, entry_gate_block,
@@ -331,7 +333,13 @@ pub fn resolve_fire_any(plan: &TradePlan, fire: &Fire, closes: &[CloseFire]) -> 
 /// break-and-close / retest stamps, fires) is printed first — the events the
 /// per-fire report below can't show (notably the retest, which never fires an
 /// intent).
-pub fn render(plan: &TradePlan, replay: &Replay, simulate: bool, verbose: bool) -> String {
+pub fn render(
+    plan: &TradePlan,
+    replay: &Replay,
+    simulate: bool,
+    verbose: bool,
+    blackout_windows: &[NoEntryWindow],
+) -> String {
     let mut out = String::new();
     out.push_str(&format!(
         "Plan {} ({}, {:?}) — {} fire(s) over the window\n",
@@ -355,6 +363,7 @@ pub fn render(plan: &TradePlan, replay: &Replay, simulate: bool, verbose: bool) 
             fire,
             simulate,
             &closes,
+            blackout_windows,
             &mut wins,
             &mut losses,
             &mut reversal_closes,
@@ -411,6 +420,7 @@ fn render_fire(
     fire: &Fire,
     simulate: bool,
     closes: &[CloseFire],
+    blackout_windows: &[NoEntryWindow],
     wins: &mut usize,
     losses: &mut usize,
     reversal_closes: &mut usize,
@@ -569,7 +579,13 @@ fn render_fire(
             // the replay distinguishes a swept order from an untriggered one.
             let detail = match &outcome {
                 SimOutcome::NeverFilled => {
-                    let swept = sweep_reason(intent, &shell, plan.pip_size, &fire.forward);
+                    let swept = sweep_reason(
+                        intent,
+                        &shell,
+                        plan.pip_size,
+                        &fire.forward,
+                        blackout_windows,
+                    );
                     describe_never_filled(swept)
                 }
                 other => describe_outcome(other),
@@ -669,7 +685,8 @@ fn fmt_price(price: f64, pip_size: f64) -> String {
 /// The `NEVER FILLED` line, annotated with the sweep reason when the live cron
 /// would have actively cancelled the resting order (vs it simply never
 /// triggering). `swept` is `sweep_reason`'s verdict: `None` keeps the plain
-/// wording (untriggered / or a blackout sweep the offline replay can't see).
+/// wording (the order simply never triggered, or no market-hours window source
+/// was available so the blackout branch couldn't fire).
 fn describe_never_filled(swept: Option<(SweepReason, DateTime<Utc>)>) -> String {
     match swept {
         Some((SweepReason::SlBreached, at)) => format!(
@@ -682,11 +699,11 @@ fn describe_never_filled(swept: Option<(SweepReason, DateTime<Utc>)>) -> String 
         Some((SweepReason::Expired, at)) => {
             format!("fill: NEVER FILLED — alert-window expired @ {}", bne(at))
         }
-        // Blackout isn't reconstructable offline (no-entry windows live in KV),
-        // so `sweep_reason` returns None for it — fall through to plain wording.
-        Some((SweepReason::Blackout, _)) | None => {
-            "fill: NEVER FILLED (pending order untriggered in window)".to_string()
-        }
+        Some((SweepReason::Blackout, at)) => format!(
+            "fill: NEVER FILLED — swept: market-hours blackout @ {} (live cron cancels the resting order as the session closes)",
+            bne(at)
+        ),
+        None => "fill: NEVER FILLED (pending order untriggered in window)".to_string(),
     }
 }
 

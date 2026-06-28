@@ -77,14 +77,28 @@ decide that is **still worker-only**, ranked by replay value.
    the fire-bar bid/ask with `is_ny_close_edge` as the window stand-in; new
    `SimOutcome::SpreadBlackout` + report line. Worker call site byte-identical
    (re-export shim).
-2. **order sweep breach predicate → core** + report line (explains NEVER FILLED).
-3. **market-hours blackout predicate → core** + an offline window source.
-4. **allow_entry / candle_gate → core** (Rhai compiles off-wasm; big fidelity win
-   for script-gated setups).
-5. **allow_close → core**, **spread widen → core**, **recover_entry → core**.
+2. ~~**order sweep breach predicate → core**~~ ✅ **DONE** — `breach_detected` /
+   `bar_expiry_due` / `market_blackout_due` moved to `core::sweep_gate`; pure
+   `engine::sweep_reason` reconstructs the cancel reason for a `NeverFilled` and
+   the report names it (SL-breach / bar-expiry / alert-window-expiry / blackout).
+3. **market-hours blackout** — ⏳ **seam done, source pending.** The predicate
+   (`market_blackout_due`) and the `engine::sweep_reason` blackout branch are
+   wired and source-agnostic; the report renders the label. The **offline window
+   source** isn't connected: live windows come from TradeNation `market_info`
+   (daily cron → KV); the replay needs the same hours from a forthcoming shared
+   market-hours source. `replay-candles` currently passes empty windows + WARN
+   (`market_hours::resolve_blackout_windows`, `TODO(replay-parity-item-3)`), so
+   behaviour is unchanged until the source lands — then it's a one-function swap.
+4. ~~**allow_entry / candle_gate → core**~~ ✅ **DONE** — both gates in
+   `core::allow_entry_gate` / `candle_gate`; `engine::entry_gate_block` applies
+   them in the replay with a `BLOCKED` report line.
+5. ~~**allow_close → core**, **spread widen → core**, **recover_entry → core**~~
+   ✅ **DONE** — in `core::allow_close_gate` / `blackout_widen` / `recover_entry`;
+   replay wires `allow_close` (blocked close keeps position open) and System-2
+   widen (now using the exact `baseline × 5` threshold). `recover_entry` moved to
+   core (replay wiring deferred — needs a simulated broker rejection).
 
-Each is independently shippable. Items 1–3 were the user's pick; 4–5 are the
-longer tail. Every move follows the same shape: relocate the pure fn (+ its
+Every move follows the same shape: relocate the pure fn (+ its
 tests) to `core`, re-export from the worker so `src/lib.rs` is unchanged at the
 call site, then wire the replay (`simulate_fill` / report) to call the now-shared
 fn — so worker and replay can't drift.

@@ -42,6 +42,7 @@ mod replay_candles {
     pub mod fixture;
     pub mod granularity;
     pub mod instrument;
+    pub mod market_hours;
     pub mod replay;
     pub mod replay_broker;
     pub mod report;
@@ -64,7 +65,9 @@ use tracing_subscriber::{EnvFilter, fmt};
 use replay_candles::fixture::{self, FixtureMeta, ReplayOutcome};
 use replay_candles::source::CandleSource;
 use replay_candles::tv::TvDefaults;
-use replay_candles::{annotate, brisbane, candles, granularity, instrument, replay, report, tv};
+use replay_candles::{
+    annotate, brisbane, candles, granularity, instrument, market_hours, replay, report, tv,
+};
 use trade_control_engine::{BidAskCandle as EngineCandle, Granularity, TradePlan, Trigger};
 use trading_view::mcp::TvMcp;
 
@@ -304,7 +307,15 @@ async fn main() -> Result<()> {
     let expires_at = end + Duration::days(365);
     let replay = replay::run(&plan, &candles, gran.engine(), start, expires_at).await;
 
-    print!("{}", report::render(&plan, &replay, simulate, args.verbose));
+    // Market-hours no-entry windows (for the blackout sweep reason). Source
+    // pending — currently empty + WARN; see `market_hours`. Fail-soft.
+    let blackout_windows =
+        market_hours::resolve_blackout_windows(args.source, raw_instrument).await;
+
+    print!(
+        "{}",
+        report::render(&plan, &replay, simulate, args.verbose, &blackout_windows)
+    );
 
     if annotate {
         let mcp = match &args.tv_mcp_root {
@@ -366,9 +377,12 @@ async fn run_test_mode(args: &Args) -> Result<()> {
     )
     .await;
 
+    // A saved-fixture replay has no live instrument to resolve hours for, so the
+    // blackout sweep reason isn't reconstructed here (empty windows). Fixtures
+    // froze their verdict before this feature, so this keeps them byte-stable.
     print!(
         "{}",
-        report::render(&inputs.plan, &replay, args.simulate, args.verbose)
+        report::render(&inputs.plan, &replay, args.simulate, args.verbose, &[])
     );
 
     if args.check {
