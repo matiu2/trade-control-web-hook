@@ -1920,10 +1920,11 @@ dependencies = [
 
 [[package]]
 name = "oanda-client"
-version = "0.1.4"
+version = "0.2.0"
 dependencies = [
  "candle-model",
  "chrono",
+ "chrono-tz",
  "clap",
  "color-eyre",
  "getrandom 0.4.2",

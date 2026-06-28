@@ -1399,17 +1399,21 @@ live worker's sweep uses — so worker and replay can't drift. Like
 `breakeven_armed_at` it does **not** change `SimOutcome`, so saved fixtures are
 untouched.
 
-The **market-hours blackout** branch is wired (`sweep_reason` takes the
-instrument's no-entry windows and matches the live worker's `market_blackout_due`),
-but the offline **window source** isn't connected yet: live, the windows are
-written to KV daily by the `blackout_hours` cron from TradeNation `market_info`;
-the replay needs the *same* TradeNation hours (TradingView's charted-exchange
-hours would diverge), supplied by a forthcoming shared market-hours source. Until
-that lands, `replay-candles` logs a `WARN` and passes empty windows — so a
-blackout-driven cancel shows the plain "untriggered" wording, exactly as before.
-Wiring the source in is a one-function change (`market_hours::resolve_blackout_windows`);
-see `TODO(replay-parity-item-3)`. OANDA-sourced replays stay empty either way —
-the worker's `blackout_hours` cron skips OANDA (no `market_info` equivalent).
+The **market-hours blackout** branch is fully wired: `sweep_reason` takes the
+instrument's no-entry windows and matches the live worker's `market_blackout_due`,
+and the offline **window source** is connected. `replay-candles` resolves the
+windows from the *same* TradeNation `market_info` the live `blackout_hours` cron
+uses (`resolve_market` + `get_market_info`) and feeds the Brisbane session ranges
+through the identical shared deriver (`core::windows_from_session`) — so the
+replay reconstructs the exact UTC windows the worker would have written to KV.
+TradingView's charted-exchange hours would diverge from the broker's CFD session,
+so they are deliberately *not* used. It's **fail-soft**: any login / resolve /
+broker miss logs a `WARN` and passes empty windows (the order then shows the plain
+"untriggered" wording rather than a fabricated blackout). `--test-mode` fixture
+replays stay fully offline (no market-hours network call). OANDA-sourced replays
+stay empty — the worker's `blackout_hours` cron skips OANDA (no `market_info`
+equivalent); OANDA venue hours are coming soon. See
+`cli/src/bin/replay_candles/market_hours.rs`.
 
 **Spread-widen (`exit: SL widened` line).** System 2 of the spread-blackout
 defence widens the broker stop *away* from price when the live spread blows out

@@ -307,8 +307,10 @@ async fn main() -> Result<()> {
     let expires_at = end + Duration::days(365);
     let replay = replay::run(&plan, &candles, gran.engine(), start, expires_at).await;
 
-    // Market-hours no-entry windows (for the blackout sweep reason). Source
-    // pending — currently empty + WARN; see `market_hours`. Fail-soft.
+    // Market-hours no-entry windows (for the blackout sweep reason). Resolved
+    // from the same TradeNation `market_info` source the live worker's
+    // `blackout_hours` cron uses; OANDA stays empty (coming soon). Fail-soft —
+    // any miss logs a WARN and yields no windows. See `market_hours`.
     let blackout_windows =
         market_hours::resolve_blackout_windows(args.source, raw_instrument).await;
 
