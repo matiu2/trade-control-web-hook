@@ -57,17 +57,24 @@ Report: `the-trading-academy/books/demo-journal/FEATURE-atr-based-entry-sl-buffe
 - [x] Whole workspace builds + ALL tests pass (612 core / 59 engine / 217
       worker / 165 tv-arm …, 0 failed). clippy clean, fmt done.
 
-### Commit 2 — engine/simulator parity
-- [ ] Confirm simulator entry-level re-resolution honors the ATR buffer
-      identically (it calls core resolution → should be automatic). Add a
-      replay/simulator test pinning an ATR-buffered enter resolves the same
-      in evaluate + simulate.
+### Commit 2 — engine/simulator parity ✅ DONE
+- [x] Simulator `simulate_fill` resolves via the same pure
+      `Resolved::from_intent` → ATR buffer honoured automatically. Added 2
+      tests: `atr_buffered_short_stop_fills_at_buffered_trigger` (fills at the
+      ATR-buffered level) + `atr_buffered_enter_with_no_atr_is_unresolved`
+      (fail-closed parity). engine_log_anchor logger updated for the new field.
 
-### Commit 3 — tv-arm / cli trade_patterns: H&S default to ATR 0.5%
-- [ ] `DEFAULT_BUFFER_ATR_PCT = 0.5` const.
-- [ ] H&S/iH&S enter bakes `offset_atr_pct: ±0.5` on entry + SL; stop emitting
-      `offset_pips` for those. Sign per existing geometry table.
-- [ ] Tests for the built enter intent.
+### Commit 3 — tv-arm / cli trade_patterns: H&S default to ATR 0.5% ✅ DONE
+- [x] `DEFAULT_BUFFER_ATR_PCT = 0.5` const + `OffsetSpec` enum +
+      `resolve_offset_spec` (pips-explicit > atr-pct-explicit > ATR default).
+      `OffsetSpec::as_fields()` maps to (offset_pips, offset_atr_pct).
+- [x] H&S/iH&S enter (shared `build_enter_alert`, used by CLI + tv-arm) now
+      defaults to `offset_atr_pct: 0.5` on entry + SL (direction from anchor,
+      unsigned). QM limit stays intentionally unbuffered (0.0/None).
+- [x] New spec fields `entry_offset_atr_pct` / `sl_offset_atr_pct` (operator
+      override). tv-arm's two TradeSpec literals updated → H&S inherits default.
+- [x] Updated 2 tests that asserted the old ±1-pip default to assert the new
+      ATR-pct default. Full workspace green, clippy clean, fmt.
 
 ### Commit 4 — CLI interactive + anchored TP
 - [ ] `interactive.rs` prompts: choose ATR-pct (default) or pips for

@@ -667,6 +667,90 @@ mod tests {
         );
     }
 
+    /// Replay/worker parity: `simulate_fill` resolves the entry via the same
+    /// pure `Resolved::from_intent` the worker uses, so an **ATR-pct-buffered**
+    /// enter resolves to the identical trigger on both paths. Here a short
+    /// stop-entry anchored to `signal_low` with `offset_atr_pct` fills at the
+    /// ATR-buffered level, proving the simulator honours the new buffer (no
+    /// replay-vs-worker drift — the whole reason resolution lives in core).
+    #[test]
+    fn atr_buffered_short_stop_fills_at_buffered_trigger() {
+        let atr = 0.0040;
+        let pct = 0.5;
+        // signal_low 1.1000; buffer = 0.5/100 * 0.0040 = 0.00002; short entry
+        // anchors to signal_low and pushes DOWN → trigger 1.1000 - 0.00002.
+        let buffered_trigger = 1.1000 - (pct / 100.0) * atr;
+
+        let mut intent = short_stop_intent();
+        intent.entry = Some(EntrySpec::Stop {
+            from: PriceAnchor::SignalLow,
+            offset_pips: 0.0,
+            offset_atr_pct: Some(pct),
+            at: None,
+            recover_entry: None,
+        });
+        // Keep SL/TP absolute so the geometry is self-contained around the
+        // buffered trigger (SL above, TP below — short).
+        intent.stop_loss = Some(PriceRef::Absolute { absolute: 1.1030 });
+        intent.take_profit = Some(TakeProfit::Anchored(PriceRef::Absolute {
+            absolute: 1.0950,
+        }));
+
+        // Shell carries the latched pattern low + ATR; close sits between the
+        // trigger and SL so the short stop is correct-side (trigger < close).
+        let mut shell = Shell::from_candle(
+            &candle("2026-06-17T10:00:00Z", 1.1015, 1.1018, 1.1010, 1.1012).mid(),
+        );
+        shell.signal_low = Some(1.1000);
+        shell.signal_high = Some(1.1030);
+        shell.atr = Some(atr);
+
+        // A bar whose bid reaches the buffered sell-stop trigger fills the short.
+        let fill_bar = ba_candle(
+            "2026-06-17T10:15:00Z",
+            buffered_trigger, // bid_h reaches the buffered trigger
+            buffered_trigger - 0.0010,
+            buffered_trigger + 0.0004,
+            buffered_trigger,
+        );
+        match simulate_fill(&intent, &shell, 0.0001, &[fire_bar(), fill_bar]) {
+            SimOutcome::FilledOpen { entry_price, .. } => {
+                assert!(
+                    (entry_price - buffered_trigger).abs() < 1e-9,
+                    "filled at {entry_price}, expected ATR-buffered {buffered_trigger}"
+                );
+            }
+            other => panic!("expected fill at the ATR-buffered trigger, got {other:?}"),
+        }
+    }
+
+    /// The fail-closed half: an ATR-pct enter whose shell carries **no ATR**
+    /// (warmup) is `Unresolved` in the simulator too — same reject the worker
+    /// gives — rather than silently filling at a zero-buffer level.
+    #[test]
+    fn atr_buffered_enter_with_no_atr_is_unresolved() {
+        let mut intent = short_stop_intent();
+        intent.entry = Some(EntrySpec::Stop {
+            from: PriceAnchor::SignalLow,
+            offset_pips: 0.0,
+            offset_atr_pct: Some(0.5),
+            at: None,
+            recover_entry: None,
+        });
+        let mut shell = Shell::from_candle(
+            &candle("2026-06-17T10:00:00Z", 1.1015, 1.1018, 1.1010, 1.1012).mid(),
+        );
+        shell.signal_low = Some(1.1000);
+        shell.atr = None; // warmup / short feed
+        assert!(
+            matches!(
+                simulate_fill(&intent, &shell, 0.0001, &[fire_bar()]),
+                SimOutcome::Unresolved(_)
+            ),
+            "no-ATR ATR-pct enter must be Unresolved, not a zero-buffer fill"
+        );
+    }
+
     #[test]
     fn pending_entry_does_not_fill_on_the_fire_bar() {
         // The off-by-one regression (CAD/JPY 21-May confirmed short): the enter

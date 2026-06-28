@@ -773,6 +773,11 @@ fn build_mw_trade_spec(
         skip_preps: Vec::new(),
         entry_offset_pips: None,
         sl_offset_pips: None,
+        // Both offset forms None → the shared builder applies the ATR-pct
+        // default (DEFAULT_BUFFER_ATR_PCT). Unused on the M/W path (worker
+        // computes geometry); the H&S enter inherits the volatility-scaled buffer.
+        entry_offset_atr_pct: None,
+        sl_offset_atr_pct: None,
         sl_anchor: None,
         // Worker computes the real TP (hard 1R); this field is unused on
         // the M/W build path. Set to the neckline as a harmless,
@@ -1003,6 +1008,11 @@ fn build_trade_spec(
         skip_preps,
         entry_offset_pips: None,
         sl_offset_pips: None,
+        // Both offset forms None → the shared builder applies the ATR-pct
+        // default (DEFAULT_BUFFER_ATR_PCT). Unused on the M/W path (worker
+        // computes geometry); the H&S enter inherits the volatility-scaled buffer.
+        entry_offset_atr_pct: None,
+        sl_offset_atr_pct: None,
         sl_anchor: None,
         tp_price: round5(tp),
         // H&S anchors SL to the pattern extreme, not an absolute price.
