@@ -183,6 +183,11 @@ pub enum FillKind {
     /// An entry the worker's spread-blackout gate would have rejected (fire-bar
     /// spread above threshold inside the NY-close-edge window). Not taken.
     SpreadBlackout,
+    /// An entry the worker's pre-broker gate would have rejected — the
+    /// `allow_entry` script returned false/errored, or the candle-quality
+    /// requirement (`needs_golden` / `needs_confirmed`) the signal-folded shell
+    /// didn't meet. Not taken (the live worker 412s before placing the order).
+    GateBlocked,
 }
 
 impl FillKind {
@@ -268,6 +273,45 @@ pub fn resolve_fire_any(plan: &TradePlan, fire: &Fire, closes: &[CloseFire]) -> 
     // declined) was still "placed" at this bar, so draw the intended bracket
     // there.
     let fire_at = candle.time;
+
+    // Pre-broker entry gate (BUG-replay-golden-gate-not-enforced): the worker's
+    // `run_enter` rejects an enter whose `allow_entry` script fails or whose
+    // `needs_golden` / `needs_confirmed` candle-quality requirement the
+    // (signal-folded) shell doesn't meet — before any order is placed. The
+    // shared `core` gate is the same one the live worker runs. `render_fire`
+    // already consults it; this *annotation/R* path (the `--annotate` boxes and
+    // the four-way entry-style net-R chart) must too, or it draws + tallies an
+    // R for a fill the live worker would never have placed (golden grep == 0).
+    // A blocked enter is not-taken — anchor the intended bracket at the fire bar.
+    if let Some(block) = entry_gate_block(intent, &shell, plan.pip_size) {
+        tracing::debug!(
+            bar = %candle.time,
+            golden = ?shell.golden,
+            needs_golden = intent.needs_golden,
+            ?block,
+            "golden: blocked @ {} — entry gate rejects (annotation path, not taken)",
+            candle.time
+        );
+        return Some(FireResult {
+            direction: resolved.direction,
+            fill_at: fire_at,
+            until: window_end,
+            entry_price: resolved.entry.reference_price(),
+            stop_loss: resolved.stop_loss,
+            take_profit: resolved.take_profit,
+            kind: FillKind::GateBlocked,
+        });
+    }
+    if intent.needs_golden || intent.needs_confirmed {
+        tracing::debug!(
+            bar = %candle.time,
+            golden = ?shell.golden,
+            confirmed = ?shell.signal_confirmed,
+            "golden: ok @ {} — candle-quality gate passes (annotation path)",
+            candle.time
+        );
+    }
+
     let raw = simulate_fill(intent, &shell, plan.pip_size, &fire.forward);
     let (fill_at, until, entry_price, kind) = match apply_reversal_close(raw, closes) {
         ReplayOutcome::ClosedOnReversal {
@@ -831,6 +875,122 @@ mod tests {
         assert!(FillKind::ClosedOnReversal.is_taken());
         assert!(!FillKind::NeverFilled.is_taken());
         assert!(!FillKind::Declined.is_taken());
+        assert!(!FillKind::SpreadBlackout.is_taken());
+        // BUG-replay-golden-gate-not-enforced: a gate-blocked enter is not
+        // taken, so it contributes 0R to the entry-style net-R comparison.
+        assert!(!FillKind::GateBlocked.is_taken());
+    }
+
+    /// A bid==ask==mid bar (zero spread) for the annotation-path tests.
+    fn ba(epoch: i64, c: f64) -> trade_control_engine::BidAskCandle {
+        let (o, h, l) = (c, c + 0.01, c - 0.01);
+        trade_control_engine::BidAskCandle {
+            time: at(epoch),
+            o,
+            h,
+            l,
+            c,
+            bid_o: o,
+            bid_h: h,
+            bid_l: l,
+            bid_c: c,
+            ask_o: o,
+            ask_h: h,
+            ask_l: l,
+            ask_c: c,
+        }
+    }
+
+    /// A long stop enter that would fill on the forward path — `needs_golden`
+    /// toggled by the caller. Built from YAML so the giant `Intent` literal
+    /// stays out of the test.
+    fn golden_stop_enter(needs_golden: bool) -> trade_control_core::intent::Intent {
+        let yaml = format!(
+            "
+            v: 1
+            id: golden-test
+            trade_id: golden-test
+            not_after: \"2026-06-30T00:00:00Z\"
+            action: enter
+            instrument: EUR_USD
+            direction: long
+            entry: {{ type: stop, from: high, at: 1.1000 }}
+            stop_loss: {{ absolute: 1.0950 }}
+            take_profit: {{ absolute: 1.1100 }}
+            risk_pct: 1.0
+            needs_golden: {needs_golden}
+        "
+        );
+        serde_yaml::from_str(&yaml).expect("parse golden enter intent")
+    }
+
+    fn enter_fire(intent: trade_control_core::intent::Intent, fire_secs: i64) -> Fire {
+        Fire {
+            fired: trade_control_engine::FiredIntent {
+                rule_id: "05-enter".into(),
+                intent,
+                candle: ba(fire_secs, 1.0980).mid(),
+                // A stop/limit enter has no latched Pine signal — exactly the
+                // case that strips `golden` off the reconstructed shell.
+                signal: None,
+            },
+            // Forward path rises through the 1.1000 stop trigger, then on to the
+            // 1.1100 TP — so *without* the gate this enter would fill + take
+            // profit (a +R the chart would tally).
+            forward: vec![
+                ba(fire_secs, 1.0980),
+                ba(fire_secs + 3600, 1.1010),
+                ba(fire_secs + 7200, 1.1110),
+            ],
+            order_id: None,
+            superseded: false,
+            suppressed_by: None,
+        }
+    }
+
+    fn plan_for(pip_size: f64) -> TradePlan {
+        TradePlan {
+            trade_id: "golden-test".into(),
+            instrument: "EUR_USD".into(),
+            direction: Direction::Long,
+            granularity: trade_control_engine::Granularity::H1,
+            pip_size,
+            rules: Vec::new(),
+            shadow: false,
+        }
+    }
+
+    #[test]
+    fn annotation_path_blocks_a_non_golden_fill_when_needs_golden() {
+        // The core of BUG-replay-golden-gate-not-enforced: a `needs_golden`
+        // enter whose shell carries no `golden` flag (a stop/limit enter, so
+        // `signal: None`) must NOT fill on the annotation / net-R path — the
+        // live worker 412s it before placing the order. Pre-fix this returned
+        // a TookProfit (+R); post-fix it's GateBlocked (not taken, 0R).
+        let fire = enter_fire(golden_stop_enter(true), 1_781_244_000);
+        let result = resolve_fire_any(&plan_for(0.0001), &fire, &[]).expect("an enter result");
+        assert_eq!(
+            result.kind,
+            FillKind::GateBlocked,
+            "needs_golden enter with golden:None must be gate-blocked, not filled"
+        );
+        assert!(!result.kind.is_taken());
+        // And resolve_fire (taken-only) drops it entirely.
+        assert!(resolve_fire(&plan_for(0.0001), &fire, &[]).is_none());
+    }
+
+    #[test]
+    fn annotation_path_fills_normally_without_needs_golden() {
+        // Same enter + path but golden not required → the gate is a noop and the
+        // forward path fills to TP, proving the block above is the gate, not the
+        // price path.
+        let fire = enter_fire(golden_stop_enter(false), 1_781_244_000);
+        let result = resolve_fire_any(&plan_for(0.0001), &fire, &[]).expect("an enter result");
+        assert!(
+            result.kind.is_taken(),
+            "without needs_golden the forward path fills the order (got {:?})",
+            result.kind
+        );
     }
 
     fn at(secs: i64) -> DateTime<Utc> {
