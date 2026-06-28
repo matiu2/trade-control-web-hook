@@ -1319,7 +1319,7 @@ Bar-by-bar engine trace (--verbose):
     phase AwaitBreakAndClose→AwaitEntry
     ✓ break-and-close stamped (spine → AwaitEntry)
     → fired 03-prep-break-and-close
-  bar 2026-06-23 16:00:00 +10:00 phase=AwaitEntry
+  bar 2026-06-23 17:00:00 +10:00 phase=AwaitEntry
     ✓ retest stamped (entry gate now satisfied)
   bar 2026-06-23 18:00:00 +10:00 phase=AwaitEntry
     → fired 05-enter
@@ -1327,6 +1327,29 @@ Bar-by-bar engine trace (--verbose):
 
 It's a pure diff of the `PlanState` before/after each tick — no engine change,
 no extra evaluation — so it's always safe to add to any replay.
+
+**Break-even arming (`be:` line).** Break-even is *not* a fill-time decision —
+in production the live cron (`breakeven_watch`) sends `amend_stop(entry)` to the
+broker on the first 15-min tick that observes a candle closing past the
+threshold (50%-to-TP by default). So a trade reported as `BREAK-EVEN (SL→BE)`
+looks like it stopped at entry for no visible reason. The per-enter section now
+shows a `be:` line — printed whenever break-even arms during a trade's life (any
+outcome) — naming the **bar whose close armed it**, i.e. when the live worker
+would have amended the broker SL:
+
+```text
+• 05-enter Enter @ 2026-06-23 23:00:00 +10:00  close=5.924
+    order: SHORT stop @ 5.9168  SL 5.9562  TP 5.7657
+    be: SL→break-even @ 2026-06-24 12:00:00 +10:00 (a candle closed past 50%-to-TP; live cron amends the broker SL here)
+    fill: BREAK-EVEN (SL→BE) — in @ 5.9168 → SL 5.9168
+```
+
+This is computed by the pure `breakeven_armed_at` helper (engine), which shares
+its fill-finding and arming predicate (`Breakeven::close_arms`) with
+`simulate_fill`, so the reported arming bar can't drift from the simulated
+break-even outcome. It does **not** change `SimOutcome` (so saved fixtures are
+untouched). The live worker's break-even path is unchanged — this is replay
+reporting only.
 
 **Freezing a known-good run as a regression fixture.** When a replay is
 producing the verdict you want, add `--save <name>` to freeze that run into

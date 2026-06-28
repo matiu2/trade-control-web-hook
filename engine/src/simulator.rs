@@ -134,66 +134,11 @@ pub fn simulate_fill(
         };
     }
 
-    // Phase 1 — find the fill. A short entry sells (fills on the bid book); a
-    // long entry buys (fills on the ask book). A market entry crosses the spread
-    // at once. The recorded fill price is the placed level (the resting order's
-    // price), not the book extreme.
-    //
-    // `candles[0]` is the **fire bar** — the bar the enter fired on. A pending
-    // order is only placed once that bar has *closed* (the engine decides the
-    // fire on the cron tick that processes the closed bar; under
-    // `needs_confirmed` the confirmation itself isn't known until this bar's
-    // close). So a Stop/Limit order cannot interact with the fire bar's own
-    // intrabar path — the earliest bar it can fill on is the **next** one. We
-    // therefore search for the fill from `candles[1..]`. A Market entry is the
-    // exception: it fills at the fire bar's close (the shell price), which is
-    // exactly when the order is placed.
-    let entry_book = book_for(Leg::Entry, dir);
-    let (fill_at, entry_price, rest) = match resolved.entry {
-        ResolvedEntry::Market { reference_price } => (shell.time, reference_price, candles),
-        ResolvedEntry::Stop { trigger_price } | ResolvedEntry::Limit { trigger_price } => {
-            // Skip the fire bar (index 0): the resting order isn't live until
-            // after it closes. `get(1..)` is empty when the fire bar is the only
-            // recorded candle, yielding `NeverFilled` — correct (no later bar to
-            // fill on yet).
-            let after_fire = candles.get(1..).unwrap_or(&[]);
-            // Bar-expiry (`expiry_bars`): the worker cancels a still-resting order
-            // `N` bars after the fire bar (its `cancel_at = next_candle_timestamp_N`).
-            // Mirror that here by bounding the fill window to the first `N` bars
-            // after the fire bar — a cross on a later bar is an order the worker
-            // would already have cancelled, so it must not fill. A static
-            // `expiry_bars` is honoured; a script-resolved one (Rhai) is beyond
-            // this pure price-path sim, so it's treated as "no bar-expiry"
-            // (unbounded), same as `None`.
-            let expiry_bars = intent
-                .expiry_bars
-                .as_ref()
-                .and_then(|t| t.as_static())
-                .copied();
-            let fill_window: &[BidAskCandle] = match expiry_bars {
-                Some(n) => after_fire
-                    .get(..(n as usize).min(after_fire.len()))
-                    .unwrap_or(&[]),
-                None => after_fire,
-            };
-            match fill_window
-                .iter()
-                .position(|c| book_crosses(c, entry_book, trigger_price))
-            {
-                // `i` indexes `fill_window` (a prefix of `after_fire`), so the
-                // fill bar is `candles[i + 1]`.
-                // The post-fill SL/TP search **includes** the fill bar itself
-                // (`candles[i + 1..]`): an order that fills mid-bar can be stopped
-                // out (or hit TP) later in that SAME bar — a real intrabar loss
-                // on a violent breakout bar. With only OHLC we can't order the
-                // fill vs the SL/TP touch within the bar, so Phase 2's pessimistic
-                // tie-break (SL wins on ambiguity) covers a fill bar that spans
-                // both.
-                Some(i) => (after_fire[i].time, trigger_price, &candles[i + 1..]),
-                None => return SimOutcome::NeverFilled,
-            }
-        }
+    // Phase 1 — find the fill (shared with `breakeven_armed_at`).
+    let Some(fill) = find_fill(&resolved, intent, shell, dir, candles) else {
+        return SimOutcome::NeverFilled;
     };
+    let (fill_at, entry_price, rest) = (fill.fill_at, fill.entry_price, fill.rest);
 
     // Phase 2 — after the fill, the first candle that touches SL or TP closes
     // the position. The close is the *opposite* book side from entry (short buys
@@ -252,6 +197,130 @@ pub fn simulate_fill(
         fill_at,
         entry_price,
     }
+}
+
+/// A located fill: when/where the entry order filled, and the candle slice from
+/// the fill bar onward (the post-fill SL/TP/break-even search window). Shared by
+/// [`simulate_fill`] and [`breakeven_armed_at`] so the two can't disagree on
+/// *which* bar the order filled on.
+struct Fill<'a> {
+    fill_at: chrono::DateTime<chrono::Utc>,
+    entry_price: f64,
+    rest: &'a [BidAskCandle],
+}
+
+/// Phase 1 of the fill: find where the entry order filled. A short entry sells
+/// (fills on the bid book); a long entry buys (fills on the ask book). A market
+/// entry crosses the spread at once. The recorded fill price is the placed level
+/// (the resting order's price), not the book extreme.
+///
+/// `candles[0]` is the **fire bar** — the bar the enter fired on. A pending
+/// order is only placed once that bar has *closed* (the engine decides the fire
+/// on the cron tick that processes the closed bar; under `needs_confirmed` the
+/// confirmation itself isn't known until this bar's close). So a Stop/Limit order
+/// cannot interact with the fire bar's own intrabar path — the earliest bar it
+/// can fill on is the **next** one, so we search from `candles[1..]`. A Market
+/// entry is the exception: it fills at the fire bar's close (the shell price).
+///
+/// Returns `None` when the pending order never fills within the window (the
+/// caller maps that to `NeverFilled`).
+fn find_fill<'a>(
+    resolved: &Resolved,
+    intent: &Intent,
+    shell: &Shell,
+    dir: Direction,
+    candles: &'a [BidAskCandle],
+) -> Option<Fill<'a>> {
+    let entry_book = book_for(Leg::Entry, dir);
+    match resolved.entry {
+        ResolvedEntry::Market { reference_price } => Some(Fill {
+            fill_at: shell.time,
+            entry_price: reference_price,
+            rest: candles,
+        }),
+        ResolvedEntry::Stop { trigger_price } | ResolvedEntry::Limit { trigger_price } => {
+            // Skip the fire bar (index 0): the resting order isn't live until
+            // after it closes. `get(1..)` is empty when the fire bar is the only
+            // recorded candle, yielding `None` (no later bar to fill on yet).
+            let after_fire = candles.get(1..).unwrap_or(&[]);
+            // Bar-expiry (`expiry_bars`): the worker cancels a still-resting order
+            // `N` bars after the fire bar (its `cancel_at = next_candle_timestamp_N`).
+            // Mirror that here by bounding the fill window to the first `N` bars
+            // after the fire bar — a cross on a later bar is an order the worker
+            // would already have cancelled, so it must not fill. A static
+            // `expiry_bars` is honoured; a script-resolved one (Rhai) is beyond
+            // this pure price-path sim, so it's treated as "no bar-expiry"
+            // (unbounded), same as `None`.
+            let expiry_bars = intent
+                .expiry_bars
+                .as_ref()
+                .and_then(|t| t.as_static())
+                .copied();
+            let fill_window: &[BidAskCandle] = match expiry_bars {
+                Some(n) => after_fire
+                    .get(..(n as usize).min(after_fire.len()))
+                    .unwrap_or(&[]),
+                None => after_fire,
+            };
+            let i = fill_window
+                .iter()
+                .position(|c| book_crosses(c, entry_book, trigger_price))?;
+            // `i` indexes `fill_window` (a prefix of `after_fire`), so the fill
+            // bar is `candles[i + 1]`. The post-fill search **includes** the fill
+            // bar itself (`candles[i + 1..]`): an order that fills mid-bar can be
+            // stopped out (or hit TP) later in that SAME bar.
+            Some(Fill {
+                fill_at: after_fire[i].time,
+                entry_price: trigger_price,
+                rest: &candles[i + 1..],
+            })
+        }
+    }
+}
+
+/// The bar on which break-even **would arm** for this enter — i.e. the first
+/// post-fill candle whose *close* runs past the `breakeven` threshold (50%-to-TP
+/// by default), at or before the position's exit. `None` when the enter carries
+/// no `breakeven`, never fills, or exits (SL/TP) before any candle arms it.
+///
+/// This is the **replay stand-in for the live cron amend**: in production
+/// [`crate::breakeven_watch`] doesn't move the stop at fill-time — it runs every
+/// 15-min cron tick and sends `amend_stop(entry)` to the broker on the first tick
+/// that observes a closed candle past the threshold. The bar returned here is
+/// exactly that candle, so a replay can show "this is when the worker would have
+/// amended the broker SL to break-even." It shares the same arming predicate
+/// ([`Breakeven::close_arms`]) and fill-finding ([`find_fill`]) as the fill
+/// simulator, so the reported bar can't drift from the simulated outcome.
+///
+/// Pure and side-effect-free; the report calls it independently of
+/// [`simulate_fill`] so the `SimOutcome` enum (and every saved fixture) is
+/// untouched.
+pub fn breakeven_armed_at(
+    intent: &Intent,
+    shell: &Shell,
+    pip_size: f64,
+    candles: &[BidAskCandle],
+) -> Option<chrono::DateTime<chrono::Utc>> {
+    let be = intent.breakeven?;
+    let resolved = Resolved::from_intent(intent, shell, pip_size).ok()?;
+    let dir = resolved.direction;
+    let fill = find_fill(&resolved, intent, shell, dir, candles)?;
+
+    let exit_book = book_for(Leg::Exit, dir);
+    let level = be.arms_at(fill.entry_price, resolved.take_profit);
+    // Walk the post-fill path exactly as Phase 2 does: an exit (SL/TP) before any
+    // arming close means break-even never armed during the position's life.
+    for c in fill.rest {
+        if book_crosses(c, exit_book, resolved.stop_loss)
+            || book_crosses(c, exit_book, resolved.take_profit)
+        {
+            return None;
+        }
+        if be.close_arms(dir, level, c.c) {
+            return Some(c.time);
+        }
+    }
+    None
 }
 
 /// Which broker book a price level is tested against.
@@ -660,6 +729,67 @@ mod tests {
             }
             other => panic!("BE: expected break-even stop-out at entry, got {other:?}"),
         }
+    }
+
+    /// `breakeven_armed_at` reports the **bar whose close arms break-even** —
+    /// the replay stand-in for the live cron amend. Same trade-075 leg-2 geometry
+    /// as `breakeven_scratches_a_leg_that_runs_50pct_then_reverses`: the
+    /// `runs_past_50` bar (close 1.0940 past the 1.0950 BE level) is the arming
+    /// bar, and it must match the bar that the fill sim moves the stop on.
+    #[test]
+    fn breakeven_armed_at_reports_the_arming_bar() {
+        use trade_control_core::intent::Breakeven;
+        let mut intent = short_stop_intent();
+        i_set_levels(&mut intent, 1.1000, 1.1040, 1.0900); // BE level 1.0950
+        intent.breakeven = Some(Breakeven::at_half());
+        let shell = Shell::from_candle(
+            &candle("2026-06-17T10:00:00Z", 1.1010, 1.1012, 1.0998, 1.1005).mid(),
+        );
+        let fill_bar = candle("2026-06-17T11:00:00Z", 1.1005, 1.1005, 1.0995, 1.1000);
+        let runs_past_50 = candle("2026-06-17T12:00:00Z", 1.0990, 1.0992, 1.0935, 1.0940);
+        let bounce_to_orig_sl = candle("2026-06-17T13:00:00Z", 1.0945, 1.1041, 1.0944, 1.1000);
+        let path = [fire_bar(), fill_bar, runs_past_50, bounce_to_orig_sl];
+
+        let armed = breakeven_armed_at(&intent, &shell, 0.0001, &path);
+        assert_eq!(
+            armed,
+            Some(runs_past_50.time),
+            "BE arms on the bar whose close (1.0940) runs past the 1.0950 level"
+        );
+    }
+
+    /// No `breakeven` rule → never armed (the field is `None`).
+    #[test]
+    fn breakeven_armed_at_is_none_without_a_rule() {
+        let mut intent = short_stop_intent();
+        i_set_levels(&mut intent, 1.1000, 1.1040, 1.0900);
+        intent.breakeven = None;
+        let shell = Shell::from_candle(
+            &candle("2026-06-17T10:00:00Z", 1.1010, 1.1012, 1.0998, 1.1005).mid(),
+        );
+        let fill_bar = candle("2026-06-17T11:00:00Z", 1.1005, 1.1005, 1.0995, 1.1000);
+        let runs_past_50 = candle("2026-06-17T12:00:00Z", 1.0990, 1.0992, 1.0935, 1.0940);
+        let path = [fire_bar(), fill_bar, runs_past_50];
+        assert_eq!(breakeven_armed_at(&intent, &shell, 0.0001, &path), None);
+    }
+
+    /// A position stopped out at the original SL **before** any candle arms BE
+    /// reports `None` — break-even never armed during its life.
+    #[test]
+    fn breakeven_armed_at_is_none_when_stopped_before_arming() {
+        use trade_control_core::intent::Breakeven;
+        let mut intent = short_stop_intent();
+        i_set_levels(&mut intent, 1.1000, 1.1040, 1.0900); // BE level 1.0950
+        intent.breakeven = Some(Breakeven::at_half());
+        let shell = Shell::from_candle(
+            &candle("2026-06-17T10:00:00Z", 1.1010, 1.1012, 1.0998, 1.1005).mid(),
+        );
+        // Fill, then a bar that hits the original 1.1040 SL before ever closing
+        // past the 1.0950 BE level → BE never arms.
+        let fill_bar = candle("2026-06-17T11:00:00Z", 1.1005, 1.1005, 1.0995, 1.1000);
+        let straight_to_sl = candle("2026-06-17T12:00:00Z", 1.1005, 1.1041, 1.1000, 1.1030);
+        let path = [fire_bar(), fill_bar, straight_to_sl];
+        assert_eq!(breakeven_armed_at(&intent, &shell, 0.0001, &path), None);
     }
 
     /// A candle that only WICKS past the 50% level (but closes back short of it)

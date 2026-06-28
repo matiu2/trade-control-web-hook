@@ -20,7 +20,7 @@
 
 use chrono::{DateTime, Utc};
 use trade_control_core::intent::{Action, Direction, Resolved, ResolvedEntry, Shell};
-use trade_control_engine::{SimOutcome, TradePlan, simulate_fill};
+use trade_control_engine::{SimOutcome, TradePlan, breakeven_armed_at, simulate_fill};
 
 use super::brisbane::bne;
 use super::replay::{Fire, Replay};
@@ -446,6 +446,18 @@ fn render_fire(
     if fire.superseded {
         line.push_str("    fill: SUPERSEDED — resting order cancelled by a later entry (cancel-and-replace)\n");
         return line;
+    }
+
+    // Break-even arming: the bar whose close runs past the threshold
+    // (50%-to-TP by default). In production the live cron (`breakeven_watch`)
+    // sends `amend_stop(entry)` to the broker on the tick that observes this
+    // candle; surface it so the journal shows *when* the SL moved to break-even
+    // (otherwise a BREAK-EVEN stop-out below looks like it came from nowhere).
+    if let Some(armed_at) = breakeven_armed_at(intent, &shell, plan.pip_size, &fire.forward) {
+        line.push_str(&format!(
+            "    be: SL→break-even @ {} (a candle closed past 50%-to-TP; live cron amends the broker SL here)\n",
+            bne(armed_at)
+        ));
     }
 
     let raw = simulate_fill(intent, &shell, plan.pip_size, &fire.forward);
