@@ -1351,6 +1351,41 @@ break-even outcome. It does **not** change `SimOutcome` (so saved fixtures are
 untouched). The live worker's break-even path is unchanged — this is replay
 reporting only.
 
+**Spread-widen (`exit: SL widened` line).** System 2 of the spread-blackout
+defence widens the broker stop *away* from price when the live spread blows out
+(the live cron `blackout_apply`). A widened stop changes the exit price, so the
+per-enter section prints an `exit: SL widened to <px> (spread blackout System 2)`
+line on the bar whose spread tripped the widen:
+
+```text
+    exit: SL widened to 1.09195 (spread blackout System 2) @ 2026-06-17 22:00:00 +10:00 (from 1.0950)
+```
+
+It's computed by the pure `widened_stop_at` helper (engine), which consults the
+shared `trade_control_core::blackout_widen` math the live worker uses, so the
+widened level can't drift between worker and replay. It does **not** change
+`SimOutcome`. **Approximation:** the worker's exact spread-blackout *trigger*
+threshold (`baseline × 5`) lives in the worker-only spread-blackout baseline that
+the engine can't link, so the replay uses the System-2 widen floor
+(`WIDEN_FLOOR_PIPS`, 22 pips) as the detection proxy — a bar whose spread reaches
+the widen floor while the position is open. This becomes exact once the
+spread-blackout baseline moves to `core` (replay-parity audit item 1).
+
+**Blocked close (`close: BLOCKED` line).** A `06-close-on-reversal` carries the
+worker's `allow_close` gate (shared `trade_control_core::allow_close_gate`). When
+that gate blocks (the script returns `false`, errors, or an unmet
+`needs_golden` / `needs_confirmed`), the live worker leaves the position **open**
+— so the replay must too. A blocked close is dropped from the reversal-close
+post-pass (it does not flatten the simulated enter) and renders its own line:
+
+```text
+    close: BLOCKED by allow_close gate (position stays open) @ 2026-06-24 12:00:00 +10:00 (close 5.91)
+```
+
+A close whose gate passes still prints the usual `close-on-reversal: …` line and
+flattens the open position. This keeps the replay's exit decision aligned with
+the live worker's `run_close`.
+
 **Freezing a known-good run as a regression fixture.** When a replay is
 producing the verdict you want, add `--save <name>` to freeze that run into
 `replay-fixtures/<name>/` — four JSON files: the `plan`, the **exact candle

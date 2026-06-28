@@ -323,6 +323,92 @@ pub fn breakeven_armed_at(
     None
 }
 
+/// A System-2 spread-widen the replay reconstructs from the candle path: the
+/// bar whose spread tripped the widen, and the new (widened) stop level.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SpreadWiden {
+    /// Open-time of the bar whose spread crossed the widen trigger.
+    pub at: chrono::DateTime<chrono::Utc>,
+    /// The original (resolved) stop level, before widening.
+    pub original_stop: f64,
+    /// The stop after widening away from price (the shared
+    /// [`trade_control_core::blackout_widen::widened_stop`] result).
+    pub widened_stop: f64,
+}
+
+/// Reconstruct a System-2 spread-blackout stop widen from the candle path, if
+/// one would apply while this enter's position is open.
+///
+/// In production the live cron (`src/cron/blackout_apply.rs`) samples
+/// `ask − bid`, and when it's inside the spread-blackout window it widens the
+/// broker stop *away* from price by the live spread (floored/clamped 22–40 pips
+/// via [`trade_control_core::blackout_widen::clamp_widen`] /
+/// [`trade_control_core::blackout_widen::widened_stop`]). A widened stop changes
+/// the **exit price** — without this, a replay would stop the position out at
+/// the original (tighter) level and diverge from the live worker.
+///
+/// **Approximation (the threshold).** The worker's *trigger* for entering the
+/// spread-blackout window is `spread > baked-baseline × 5`, and that baked
+/// baseline lives in the worker-only `src/spread_blackout.rs` (build.rs
+/// constants), which the engine can't link. So the replay can't reconstruct the
+/// exact per-instrument threshold. Instead the caller passes a
+/// `widen_trigger_pips` floor and we treat the first post-fill bar whose
+/// **spread** (`ask_c − bid_c`, in pips) meets or exceeds it — *while the stop
+/// hasn't yet been hit* — as the widen bar. The default the replay supplies is
+/// [`trade_control_core::blackout_widen::WIDEN_FLOOR_PIPS`] (22), i.e. a spread
+/// already as wide as the empirical EUR/NZD blowout the widen exists for. This
+/// is a deliberate over-detect-safe approximation; see the
+/// `[[strategy_changes_in_both_replayer_and_worker]]` rule and the TODO below.
+///
+/// TODO(replay-parity-item-1): once `spread_blackout`'s baked baseline moves to
+/// `core` (audit item 1), pass the real `baseline × 5` per-instrument threshold
+/// here instead of the `WIDEN_FLOOR_PIPS` proxy, and the detection becomes exact.
+///
+/// Pure and side-effect-free. Returns `None` when the enter has no fill, exits
+/// before any qualifying spread bar, or no bar's spread reaches the trigger.
+pub fn widened_stop_at(
+    intent: &Intent,
+    shell: &Shell,
+    pip_size: f64,
+    candles: &[BidAskCandle],
+    widen_trigger_pips: f64,
+) -> Option<SpreadWiden> {
+    if !pip_size.is_finite() || pip_size <= 0.0 {
+        return None;
+    }
+    let resolved = Resolved::from_intent(intent, shell, pip_size).ok()?;
+    let dir = resolved.direction;
+    let fill = find_fill(&resolved, intent, shell, dir, candles)?;
+    let exit_book = book_for(Leg::Exit, dir);
+    let original_stop = resolved.stop_loss;
+
+    for c in fill.rest {
+        // The original stop is still the live one until a widen fires, so an
+        // exit (SL/TP) before any qualifying spread bar means no widen applied.
+        if book_crosses(c, exit_book, original_stop)
+            || book_crosses(c, exit_book, resolved.take_profit)
+        {
+            return None;
+        }
+        let spread_pips = (c.ask_c - c.bid_c) / pip_size;
+        if spread_pips.is_finite() && spread_pips >= widen_trigger_pips {
+            let widen_pips = trade_control_core::blackout_widen::clamp_widen(spread_pips);
+            let widened = trade_control_core::blackout_widen::widened_stop(
+                dir,
+                original_stop,
+                widen_pips,
+                pip_size,
+            );
+            return Some(SpreadWiden {
+                at: c.time,
+                original_stop,
+                widened_stop: widened,
+            });
+        }
+    }
+    None
+}
+
 /// Which broker book a price level is tested against.
 #[derive(Clone, Copy, PartialEq)]
 enum Book {
@@ -821,6 +907,79 @@ mod tests {
             }
             other => panic!("expected StoppedOut at original SL (no BE arm), got {other:?}"),
         }
+    }
+
+    /// A long position whose post-fill path includes a wide-spread bar reports
+    /// the widen: the bar's time, the original SL, and a stop moved DOWN (away
+    /// from price for a long) by the clamped live spread.
+    #[test]
+    fn widened_stop_at_reports_the_widen_bar_for_a_long() {
+        use trade_control_core::blackout_widen::{WIDEN_FLOOR_PIPS, widened_stop};
+        let mut intent = long_stop_intent();
+        i_set_levels(&mut intent, 1.1000, 1.0950, 1.1100);
+        let shell = trigger_shell();
+        // Fire bar (skipped), then a zero-spread bar whose ASK reaches the 1.1000
+        // long trigger → fill. Then a wide-spread bar (ask_c − bid_c = 1.10315 −
+        // 1.10010 = 0.00305 = 30.5 pips, within the 22–40 clamp) that does NOT hit
+        // SL/TP → widen.
+        let fill_bar = candle("2026-06-17T11:00:00Z", 1.1000, 1.1001, 1.0999, 1.1000);
+        let wide = ba_candle("2026-06-17T12:00:00Z", 1.10015, 1.10010, 1.10315, 1.10310);
+        let spread_pips = (wide.ask_c - wide.bid_c) / 0.0001; // 30.5
+        let path = [fire_bar(), fill_bar, wide];
+
+        let widen = widened_stop_at(&intent, &shell, 0.0001, &path, WIDEN_FLOOR_PIPS)
+            .expect("a 30.5-pip spread bar must trip the widen");
+        assert_eq!(widen.at, wide.time);
+        assert!((widen.original_stop - 1.0950).abs() < 1e-9);
+        // 30.5 pips is within the 22–40 clamp, so widen by the live spread; long
+        // moves DOWN.
+        let expected = widened_stop(Direction::Long, 1.0950, spread_pips, 0.0001);
+        assert!(
+            (widen.widened_stop - expected).abs() < 1e-9,
+            "expected {expected}, got {}",
+            widen.widened_stop
+        );
+        assert!(
+            widen.widened_stop < 1.0950,
+            "a long widen moves the SL DOWN"
+        );
+    }
+
+    /// No bar's spread reaches the trigger → no widen.
+    #[test]
+    fn widened_stop_at_is_none_when_spread_stays_tight() {
+        use trade_control_core::blackout_widen::WIDEN_FLOOR_PIPS;
+        let mut intent = long_stop_intent();
+        i_set_levels(&mut intent, 1.1000, 1.0950, 1.1100);
+        let shell = trigger_shell();
+        let fill_bar = candle("2026-06-17T11:00:00Z", 1.1000, 1.1001, 1.0999, 1.1000);
+        // 2-pip spread bar — well under the 22-pip floor.
+        let tight = ba_candle("2026-06-17T12:00:00Z", 1.10010, 1.10005, 1.10030, 1.10025);
+        let path = [fire_bar(), fill_bar, tight];
+        assert_eq!(
+            widened_stop_at(&intent, &shell, 0.0001, &path, WIDEN_FLOOR_PIPS),
+            None
+        );
+    }
+
+    /// A position stopped out before any wide-spread bar reports no widen — the
+    /// original stop was still the live one when the position closed.
+    #[test]
+    fn widened_stop_at_is_none_when_stopped_before_widen() {
+        use trade_control_core::blackout_widen::WIDEN_FLOOR_PIPS;
+        let mut intent = long_stop_intent();
+        i_set_levels(&mut intent, 1.1000, 1.0950, 1.1100);
+        let shell = trigger_shell();
+        let fill_bar = candle("2026-06-17T11:00:00Z", 1.1000, 1.1001, 1.0999, 1.1000);
+        // Hits the 1.0950 SL on the bid book (long exits on bid) before any
+        // wide-spread bar.
+        let to_sl = candle("2026-06-17T12:00:00Z", 1.0990, 1.0991, 1.0949, 1.0951);
+        let wide = ba_candle("2026-06-17T13:00:00Z", 1.10015, 1.10010, 1.10315, 1.10310);
+        let path = [fire_bar(), fill_bar, to_sl, wide];
+        assert_eq!(
+            widened_stop_at(&intent, &shell, 0.0001, &path, WIDEN_FLOOR_PIPS),
+            None
+        );
     }
 
     #[test]
