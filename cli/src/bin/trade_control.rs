@@ -173,6 +173,11 @@ enum PlanCmd {
     /// Dump one plan in full — every rule plus its persisted engine state.
     /// The worker scans all account scopes for the `trade_id`.
     Show(PlanShowArgs),
+    /// Export one plan exactly as it was imported — the bare `TradePlan` body,
+    /// encoded the same single-line flow JSON `register` puts on the wire. The
+    /// inverse of arming: re-registerable as-is. (Unlike `show`, which wraps the
+    /// plan with engine state; this is *just* the plan.)
+    Export(PlanExportArgs),
     /// Delete a registered plan and its engine state — the inverse of
     /// register. The worker scans all account scopes and drops the matching
     /// `plan:` + `plan-state:` rows. Idempotent (deleting a missing plan is a
@@ -207,8 +212,21 @@ struct PlanShowArgs {
     /// The plan's `trade_id` (e.g. `eurusd-hs-7`).
     trade_id: String,
     /// Print the worker's raw YAML response instead of the pretty view.
-    #[arg(long)]
+    #[arg(long, conflicts_with = "json")]
     yaml: bool,
+    /// Print the matched plan(s) as pretty JSON — the same data as `--yaml`
+    /// (each match's full `PlanDetail`: account, plan, state, archived_at),
+    /// just JSON-encoded. Handy for piping into `jq`.
+    #[arg(long, conflicts_with = "yaml")]
+    json: bool,
+    #[command(flatten)]
+    common: EndpointArgs,
+}
+
+#[derive(Parser)]
+struct PlanExportArgs {
+    /// The plan's `trade_id` (e.g. `eurusd-hs-7`).
+    trade_id: String,
     #[command(flatten)]
     common: EndpointArgs,
 }
@@ -1189,6 +1207,7 @@ fn run_plan(sub: PlanCmd) -> Result<()> {
     match sub {
         PlanCmd::List(args) => run_plan_list(args),
         PlanCmd::Show(args) => run_plan_show(args),
+        PlanCmd::Export(args) => run_plan_export(args),
         PlanCmd::Delete(args) => run_plan_delete(args),
         PlanCmd::Purge(args) => run_plan_purge(args),
     }
@@ -1234,8 +1253,59 @@ fn run_plan_show(args: PlanShowArgs) -> Result<()> {
         print_raw(&response);
         return Ok(());
     }
+    if args.json {
+        print!("{}", format_plan_show_json(&response)?);
+        return Ok(());
+    }
     print!("{}", format_plan_show(&args.trade_id, &response));
     Ok(())
+}
+
+/// `plan export <trade_id>` — emit the bare `TradePlan` body exactly as it was
+/// imported, one match per line in the same single-line flow JSON `register`
+/// puts on the wire. Re-registerable as-is. Goes through the same read-only
+/// `plan-show` query as `plan show`, then strips the `PlanDetail` wrapper down
+/// to its `.plan` field.
+fn run_plan_export(args: PlanExportArgs) -> Result<()> {
+    let key = load_key(&args.common.key_file)?;
+    let now = Utc::now();
+    let suffix = fresh_suffix()?;
+    let intent = build_plan_show_intent(&args.trade_id, now, &suffix);
+    let body = wrap_control(&intent, &key, now)?;
+    // A miss is a 404; `post_control` surfaces the worker's body as an `Err`.
+    let response = post_control(&args.common.endpoint, &body)?;
+    print!("{}", format_plan_export(&response)?);
+    Ok(())
+}
+
+/// Strip the `plan show` response (a YAML sequence of `PlanDetail`) down to each
+/// match's bare `plan` field, emitted as single-line flow JSON — byte-identical
+/// to how `control.rs` encodes a `TradePlan` for `register` (the nested-value
+/// branch of `render_value` is the same `serde_json::to_string`). One line per
+/// match (trade_ids are unique in practice, so usually one). The output is
+/// re-registerable as-is.
+///
+/// "Exactly as imported" has one serde-canonical caveat: a `#[serde(default)]`
+/// field omitted on the original import (e.g. `shadow`) reappears here at its
+/// default value, because the worker stores the parsed `TradePlan`, not the raw
+/// wire bytes. The plan is semantically identical and round-trips cleanly.
+fn format_plan_export(response: &str) -> Result<String> {
+    let matches: Vec<serde_yaml::Value> =
+        serde_yaml::from_str(response).map_err(|e| eyre!("plan-export: parse worker YAML: {e}"))?;
+    if matches.is_empty() {
+        return Err(eyre!("plan-export: worker returned no plan"));
+    }
+    let mut out = String::new();
+    for m in &matches {
+        let plan = m
+            .get("plan")
+            .ok_or_else(|| eyre!("plan-export: match has no `plan` field"))?;
+        let line =
+            serde_json::to_string(plan).map_err(|e| eyre!("plan-export: serialise plan: {e}"))?;
+        out.push_str(&line);
+        out.push('\n');
+    }
+    Ok(out)
 }
 
 /// `plan delete <trade_id>` — drop a registered plan and its engine state.
@@ -1403,6 +1473,24 @@ fn format_plan_show(trade_id: &str, response: &str) -> String {
             out
         }
     }
+}
+
+/// Render the `plan show` response as pretty JSON. The worker emits a YAML
+/// sequence of `PlanDetail` maps; we round-trip it through `serde_yaml::Value`
+/// into `serde_json` so the output carries the *same data* as `--yaml`, just
+/// JSON-encoded. Decoupled from the worker structs (like `format_plan_list`),
+/// so a new plan field needs no CLI change.
+///
+/// A 404 / error body is not a YAML sequence; `?` surfaces the parse error,
+/// but in practice `post_control` already turned a non-2xx into an `Err`
+/// before we get here, so this only runs on a real match.
+fn format_plan_show_json(response: &str) -> Result<String> {
+    let value: serde_yaml::Value =
+        serde_yaml::from_str(response).map_err(|e| eyre!("plan-show: parse worker YAML: {e}"))?;
+    let mut out = serde_json::to_string_pretty(&value)
+        .map_err(|e| eyre!("plan-show: serialise JSON: {e}"))?;
+    out.push('\n');
+    Ok(out)
 }
 
 fn run_market_info(args: MarketInfoCmdArgs) -> Result<()> {
@@ -2262,5 +2350,56 @@ reset_time: 10:00 PM
         );
         assert!(out.contains("trade_id: eurusd-hs-7"));
         assert!(out.contains("phase: await_entry"));
+    }
+
+    #[test]
+    fn plan_show_json_round_trips_yaml_to_json() {
+        let yaml = "\
+- account: reversals
+  plan:
+    trade_id: eurusd-hs-7
+    instrument: EUR_USD
+  state:
+    phase: await_entry
+";
+        let out = format_plan_show_json(yaml).expect("valid yaml");
+        // Parse the JSON back so we assert on structure, not formatting.
+        let v: serde_json::Value = serde_json::from_str(&out).expect("valid json");
+        let arr = v.as_array().expect("top-level array");
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["account"], "reversals");
+        assert_eq!(arr[0]["plan"]["trade_id"], "eurusd-hs-7");
+        assert_eq!(arr[0]["plan"]["instrument"], "EUR_USD");
+        assert_eq!(arr[0]["state"]["phase"], "await_entry");
+        assert!(out.ends_with('\n'));
+    }
+
+    #[test]
+    fn plan_export_strips_wrapper_to_bare_plan_one_line() {
+        let yaml = "\
+- account: reversals
+  plan:
+    trade_id: eurusd-hs-7
+    instrument: EUR_USD
+    rules: []
+  state:
+    phase: await_entry
+";
+        let out = format_plan_export(yaml).expect("valid yaml");
+        // One match → one line, no trailing blank line beyond the single \n.
+        assert_eq!(out.lines().count(), 1);
+        // The wrapper (account / state) is gone; only the plan remains.
+        assert!(!out.contains("account"), "wrapper leaked: {out}");
+        assert!(!out.contains("phase"), "state leaked: {out}");
+        // It's single-line flow JSON that parses back to the bare plan.
+        let plan: serde_json::Value = serde_json::from_str(out.trim()).expect("valid json");
+        assert_eq!(plan["trade_id"], "eurusd-hs-7");
+        assert_eq!(plan["instrument"], "EUR_USD");
+        assert!(plan["rules"].is_array());
+    }
+
+    #[test]
+    fn plan_export_empty_response_errors() {
+        assert!(format_plan_export("[]").is_err());
     }
 }

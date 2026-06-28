@@ -2540,6 +2540,8 @@ trade-control-dev plan list --include-all  # also list terminated (vetoed/comple
 trade-control-dev plan list --yaml         # raw worker YAML (one entry per plan)
 trade-control-dev plan show eurusd-hs-7    # full dump of one plan + its state
 trade-control-dev plan show eurusd-hs-7 --yaml
+trade-control-dev plan show eurusd-hs-7 --json   # same data as --yaml, JSON-encoded (pipe to jq)
+trade-control-dev plan export eurusd-hs-7  # bare TradePlan, exactly as imported (re-registerable)
 trade-control-dev plan delete eurusd-hs-7  # drop a plan (live and/or archived)
 trade-control-dev plan purge eurusd-hs-7   # wipe ALL KV + R2 traces of one trade
 trade-control-dev purge --older-than 90    # bulk R2 sweep: drop req/ + ticks/ older than 90d
@@ -2553,8 +2555,18 @@ plan lists with empty state until the next `*/15` tick. `plan show <trade_id>`
 scans every account scope for that id and dumps the whole `TradePlan` (every rule
 + embedded intent) plus the persisted `PlanState`. `plan list` / `plan show` are
 read-only KV-only control actions (`plan-list` / `plan-show`), signed like
-`status`, hitting the baked endpoint with no extra flag. A `plan show` for an
-unknown id exits non-zero with `no registered plan with trade_id …`.
+`status`, hitting the baked endpoint with no extra flag. `plan show --yaml`
+prints the raw worker YAML; `plan show --json` prints the *same data* as pretty
+JSON (each match's full `PlanDetail`) — handy for piping into `jq`. A `plan show`
+for an unknown id exits non-zero with `no registered plan with trade_id …`.
+
+`plan export <trade_id>` is the re-registerable cousin of `show`: it strips the
+`PlanDetail` wrapper (account / state / archived_at) down to the bare
+`TradePlan`, emitted as the same single-line flow JSON `register` puts on the
+wire — so the output round-trips straight back through an arm. (One serde caveat:
+a `#[serde(default)]` field omitted on the original import — e.g. `shadow` —
+reappears at its default, since the worker stores the parsed plan, not the raw
+bytes; semantically identical.)
 
 **Archived (terminated) plans.** When a plan reaches a terminal phase — a veto
 fired, or the single-shot entry was dispatched — the engine deletes its live
