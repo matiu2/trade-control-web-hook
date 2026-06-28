@@ -477,6 +477,30 @@ for JPY pairs or indices; the correct pip is baked in. The baked `pip_size`
 is also bound as a variable in gate scripts (`allow_entry`, `min_r`,
 `risk_pct`, …) alongside `entry_price`, `r_multiple`, etc.
 
+**How a catalog change reaches each binary.** The `instrument-lookup`
+catalog (`instrument-lookup/src/catalog.toml`) is `include_str!`-compiled
+into the `instrument-lookup` library, which the **CLIs** (`tv-arm`,
+`tv-news`, `trade-control`) link directly. So:
+
+- **The worker never links `instrument-lookup`** — it isn't wasm-clean
+  (its default `import` feature pulls in `reqwest` blocking) and was
+  deliberately kept catalog-free. **Recompiling/redeploying the worker
+  does *not* teach it a catalog change.** The worker only sees catalog
+  facts (`pip_size`, …) that `tv-arm` baked onto each *signed intent* at
+  **arm time**. To make a catalog edit affect a live setup you re-**arm**
+  it (re-run `tv-arm` with the new catalog) — you do not redeploy the
+  worker.
+- **The CLIs do pick up a catalog edit on rebuild.** Change
+  `catalog.toml`, rebuild/reinstall the CLIs (`./deploy-*.sh` does this as
+  part of a deploy), and they resolve against the new baseline.
+- **Caveat — the CLIs also merge a runtime overlay.** On every invocation
+  they merge `~/.config/instrument-lookup/mappings.toml` over the baked
+  baseline (same `id` replaces, new `id` appends). So a baked CLI is *not*
+  fully self-contained: an overlay there can override the compiled-in
+  catalog with no recompile. To add/override a single asset for an
+  operator, editing that overlay is the no-rebuild path; editing
+  `catalog.toml` is the everyone-gets-it, requires-rebuild path.
+
 **Stop vs limit entries:** a `stop` order fills when price moves *through*
 the level (breakout: long stops sit *above* current price, short stops
 *below*). A `limit` fills when price comes *back* to the level (pullback:
@@ -1297,6 +1321,131 @@ under `REV:` (distinct from `TP:` / `SL:`). This matches the live worker, whose
 `run_close` flattens the broker position on the same fire; before the fix the
 close was inert and the position over-held to SL/TP/window-end.
 
+**Seeing the engine's silent state changes (`--verbose` / `--all-events`).**
+The normal report lists only *fires* — intents the engine emits. But the engine
+also advances state per bar that fires nothing: the spine phase
+(`AwaitBreakAndClose → AwaitEntry → Done`), the break-and-close stamp, and —
+most confusingly — the **retest stamp**. Retest is *not* an emitted prep; it's a
+retroactive `retest_seen_at` lookback that the entry gate reads. So a plan whose
+`requires_preps` lists `retest` will never show a "retest" fire, which reads like
+the step was skipped when it wasn't. `--verbose` (alias `--all-events`) prints a
+bar-by-bar trace of these state moves *before* the fire report, showing exactly
+which bar stamped the retest and when the spine advanced (quiet bars are
+omitted):
+
+```sh
+replay-candles --plan plan.json --verbose
+```
+
+```text
+Bar-by-bar engine trace (--verbose):
+  bar 2026-06-23 15:00:00 +10:00 phase=AwaitEntry
+    phase AwaitBreakAndClose→AwaitEntry
+    ✓ break-and-close stamped (spine → AwaitEntry)
+    → fired 03-prep-break-and-close
+  bar 2026-06-23 17:00:00 +10:00 phase=AwaitEntry
+    ✓ retest stamped (entry gate now satisfied)
+  bar 2026-06-23 18:00:00 +10:00 phase=AwaitEntry
+    → fired 05-enter
+```
+
+It's a pure diff of the `PlanState` before/after each tick — no engine change,
+no extra evaluation — so it's always safe to add to any replay.
+
+**Break-even arming (`be:` line).** Break-even is *not* a fill-time decision —
+in production the live cron (`breakeven_watch`) sends `amend_stop(entry)` to the
+broker on the first 15-min tick that observes a candle closing past the
+threshold (50%-to-TP by default). So a trade reported as `BREAK-EVEN (SL→BE)`
+looks like it stopped at entry for no visible reason. The per-enter section now
+shows a `be:` line — printed whenever break-even arms during a trade's life (any
+outcome) — naming the **bar whose close armed it**, i.e. when the live worker
+would have amended the broker SL:
+
+```text
+• 05-enter Enter @ 2026-06-23 23:00:00 +10:00  close=5.924
+    order: SHORT stop @ 5.9168  SL 5.9562  TP 5.7657
+    be: SL→break-even @ 2026-06-24 12:00:00 +10:00 (a candle closed past 50%-to-TP; live cron amends the broker SL here)
+    fill: BREAK-EVEN (SL→BE) — in @ 5.9168 → SL 5.9168
+```
+
+This is computed by the pure `breakeven_armed_at` helper (engine), which shares
+its fill-finding and arming predicate (`Breakeven::close_arms`) with
+`simulate_fill`, so the reported arming bar can't drift from the simulated
+break-even outcome. It does **not** change `SimOutcome` (so saved fixtures are
+untouched). The live worker's break-even path is unchanged — this is replay
+reporting only.
+
+**Why an order "NEVER FILLED" — the sweep reason.** A resting stop/limit order
+that never triggers isn't necessarily one the live worker passively let sit:
+every 15-min cron tick the worker's order **sweep** (`src/cron/sweep.rs`)
+cancels a still-pending order once its alert window expired, its bar-based
+`cancel_at` (`expiry_bars`) passed, it sits inside a market-hours blackout, or
+current price overtook its stop-loss. So a plain "never filled" hides whether
+the worker would have *actively swept* the order. The `NEVER FILLED` line now
+names the sweep reason when there is one:
+
+```text
+    fill: NEVER FILLED — swept: SL breached @ 2026-06-19 12:00:00 +10:00 (live cron cancels the resting order here)
+    fill: NEVER FILLED — swept: bar-expiry @ 2026-06-19 13:00:00 +10:00
+    fill: NEVER FILLED — alert-window expired @ 2026-06-19 14:00:00 +10:00
+    fill: NEVER FILLED — swept: market-hours blackout @ 2026-06-19 21:00:00 +10:00 (live cron cancels the resting order as the session closes)
+```
+
+When no sweep condition is reached it keeps the original wording, `fill: NEVER
+FILLED (pending order untriggered in window)`. The decision is the pure
+`sweep_reason` helper (engine), which reuses the shared `core::sweep_gate`
+predicates (`breach_detected` / `bar_expiry_due` / `market_blackout_due`) the
+live worker's sweep uses — so worker and replay can't drift. Like
+`breakeven_armed_at` it does **not** change `SimOutcome`, so saved fixtures are
+untouched.
+
+The **market-hours blackout** branch is wired (`sweep_reason` takes the
+instrument's no-entry windows and matches the live worker's `market_blackout_due`),
+but the offline **window source** isn't connected yet: live, the windows are
+written to KV daily by the `blackout_hours` cron from TradeNation `market_info`;
+the replay needs the *same* TradeNation hours (TradingView's charted-exchange
+hours would diverge), supplied by a forthcoming shared market-hours source. Until
+that lands, `replay-candles` logs a `WARN` and passes empty windows — so a
+blackout-driven cancel shows the plain "untriggered" wording, exactly as before.
+Wiring the source in is a one-function change (`market_hours::resolve_blackout_windows`);
+see `TODO(replay-parity-item-3)`. OANDA-sourced replays stay empty either way —
+the worker's `blackout_hours` cron skips OANDA (no `market_info` equivalent).
+
+**Spread-widen (`exit: SL widened` line).** System 2 of the spread-blackout
+defence widens the broker stop *away* from price when the live spread blows out
+(the live cron `blackout_apply`). A widened stop changes the exit price, so the
+per-enter section prints an `exit: SL widened to <px> (spread blackout System 2)`
+line on the bar whose spread tripped the widen:
+
+```text
+    exit: SL widened to 1.09195 (spread blackout System 2) @ 2026-06-17 22:00:00 +10:00 (from 1.0950)
+```
+
+It's computed by the pure `widened_stop_at` helper (engine), which consults the
+shared `trade_control_core::blackout_widen` math the live worker uses, so the
+widened level can't drift between worker and replay. It does **not** change
+`SimOutcome`. The detection trigger is **exact**: the replay uses the
+instrument's real spread-blackout threshold (`baseline × 5`) via
+`trade_control_core::spread_blackout::elevated_threshold_pips` — the same number
+the System-1 entry-reject uses — now that the baked baseline lives in shared
+`core` and the engine links it. (It was a flat `WIDEN_FLOOR_PIPS` proxy until
+replay-parity audit item 1 promoted the baseline to `core`.)
+
+**Blocked close (`close: BLOCKED` line).** A `06-close-on-reversal` carries the
+worker's `allow_close` gate (shared `trade_control_core::allow_close_gate`). When
+that gate blocks (the script returns `false`, errors, or an unmet
+`needs_golden` / `needs_confirmed`), the live worker leaves the position **open**
+— so the replay must too. A blocked close is dropped from the reversal-close
+post-pass (it does not flatten the simulated enter) and renders its own line:
+
+```text
+    close: BLOCKED by allow_close gate (position stays open) @ 2026-06-24 12:00:00 +10:00 (close 5.91)
+```
+
+A close whose gate passes still prints the usual `close-on-reversal: …` line and
+flattens the open position. This keeps the replay's exit decision aligned with
+the live worker's `run_close`.
+
 **Freezing a known-good run as a regression fixture.** When a replay is
 producing the verdict you want, add `--save <name>` to freeze that run into
 `replay-fixtures/<name>/` — four JSON files: the `plan`, the **exact candle
@@ -1345,6 +1494,50 @@ pause stamped at, say, 2026-05-29 would be judged expired against today's
 wall-clock and vanish (the same wall-clock-vs-cursor trap as the tv-arm prune).
 Without a blackout (or with `--skip-calendar-bars`) the same enter fills — that
 with/without pair is the A/B the journal needs to price what the news rule cost.
+
+**Replay enforces the spread-blackout reject (System 1), not just the fill.**
+The live worker rejects a new entry that fires during the post-NY-close
+liquidity trough when the instrument's spread is elevated (see *Spread-blackout
+window* above). The replay now mirrors it: `simulate_fill` computes the **fire
+bar**'s spread from the recorded bid/ask book (`(ask_c − bid_c) / pip_size`) and
+calls the *same* `trade_control_core::spread_blackout` decision + per-instrument
+threshold the worker uses. On a reject it returns the new
+`SimOutcome::SpreadBlackout { spread_pips, threshold_pips }`, shown in the report
+as `spread: REJECTED — spread 30.0p > 8.0p threshold inside the NY-close-edge
+window (no order placed; live worker 423s)` and not tallied as a win. A
+mid-only feed (`bid == ask`) has zero spread → never blacks out (we don't
+fabricate a spread the data doesn't carry). **Modelling note:** the live gate
+only samples when the KV `spread-blackout:window` marker is set (the daily cron
+writes it at the NY-close edge); the replay has no KV, so it approximates the
+marker with `core::ny_clock::is_ny_close_edge(fire_bar.time)` — exactly the
+close-edge hour, where the live window can persist a little longer until the
+recovery watcher clears it.
+
+**Replay applies the pre-broker entry gate (`allow_entry` + candle-quality).**
+The live worker's `run_enter` rejects an entry — before any order reaches the
+broker — when the intent's `allow_entry` Rhai script returns `false` (or fails
+to parse/eval), or when a `needs_golden` / `needs_confirmed` candle-quality
+requirement isn't met by the (signal-folded) shell. `simulate_fill` only knows
+the price path, so without this it would *fill* an order the worker would have
+*rejected*. Both gates now live in the shared `trade_control_core::allow_entry_gate`
+(Rhai compiles off-wasm), and the replay applies them via the pure
+`entry_gate_block` helper (engine) — so worker and replay can't drift. A blocked
+enter is a **hard skip** (NO FILL / 0R, not tallied), shown in the per-enter
+section as one of:
+
+```text
+    fill: BLOCKED by allow_entry script (returned false) → NO FILL / 0R
+    fill: BLOCKED by allow_entry script (parse error: <msg>) → NO FILL / 0R
+    fill: BLOCKED — golden candle required, not present → NO FILL / 0R
+    fill: BLOCKED — confirmed signal required, not present → NO FILL / 0R
+```
+
+Like the `be:` line this is replay reporting only — it does **not** change
+`SimOutcome` (saved fixtures are untouched), and the live worker's gate path is
+unchanged. (For Pine enters the engine's `pine_entry_dispatchable` already
+pre-flights golden/confirmed at evaluate time so the plan stays armed rather than
+firing; this gate is the broader catch — the `allow_entry` script for every
+enter, plus the candle-quality gate for M/W and non-pine fires.)
 
 **News / blackout pruning is replay-cursor-aware.** When `tv-arm` builds a plan
 it fetches the week's forex-factory events and adds one blackout pair + one news
@@ -1481,7 +1674,7 @@ instrument and, if it exceeds the elevated cutoff (in pips), rejects:
 The elevated cutoff is now **per-instrument, baked at compile time** from
 real sampled spreads (it was a flat 8-pip constant, which mis-fired badly
 for non-FX: Copper's *normal* spread is ~150 pips, so the flat 8 blocked
-every legitimate Copper entry during the window). `build.rs` reads the
+every legitimate Copper entry during the window). `core/build.rs` reads the
 committed YAML samples from the **`spread-sampler-cron`** submodule and
 emits a per-instrument table (`(name, low, high, median)` in pips, keyed by
 the broker-canonical TradeNation name — the same `resolved.instrument` the
@@ -1498,9 +1691,20 @@ An instrument absent from the baseline (a fresh asset, or one with no pip
 size) falls back to the flat `SPREAD_BLACKOUT_ELEVATED_PIPS` (8 pips). The
 reject message names the instrument's baked normal/seen-range and the
 current spread. The recovery cutoff (`SPREAD_BLACKOUT_RECOVERED_PIPS`,
-4 pips) is still a flat constant and lives beside the elevated logic in
-`src/spread_blackout.rs`. The whole feature works in **pips**
-consistently.
+4 pips) is still a flat constant and lives beside the elevated logic. The
+whole feature works in **pips** consistently.
+
+The **pure decision, the per-instrument threshold lookup, the baked
+baseline, and the `build.rs` that bakes it now live in
+`trade_control_core::spread_blackout`** (not the worker crate), so the
+offline candle replay — which links `core` but not the worker `cdylib` —
+applies the *same* reject the live worker does
+(`[[strategy_changes_in_both_replayer_and_worker]]`). The worker keeps only
+the I/O wrapper around the pure decision: the KV `spread-blackout:window`
+read + the live `get_quote` sample (`run_enter`) and the recovery watcher
+(`src/cron/blackout_watch.rs`), reaching the shared items through the thin
+`src/spread_blackout.rs` re-export shim. See *Candle replay* below for how
+the replay reconstructs the spread from the recorded bid/ask book.
 
 > **Re-bake cadence:** the table is only as good as the committed samples.
 > Re-running `git pull` in the submodule (the hourly cron commits new

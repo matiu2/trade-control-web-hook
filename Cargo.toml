@@ -29,12 +29,10 @@ trade-control-engine = { version = "0.1.0", path = "engine" }
 pollster = "0.4.0"
 trade-control-core = { path = "core", features = ["test-support"] }
 
-# build.rs runs on the HOST (not wasm), so these host-native crates are
-# fine here — they bake the per-instrument spread thresholds from the
-# spread-sampler-cron submodule's YAML at compile time. See build.rs.
-[build-dependencies]
-serde = { version = "1", features = ["derive"] }
-serde_yaml = "0.9"
+# The spread-baseline bake (per-instrument thresholds from the
+# spread-sampler-cron YAML) moved to `core/build.rs` so the offline replay
+# (which links `core`, not this worker `cdylib`) shares it. No worker-side
+# build.rs / build-dependencies remain — see `src/spread_blackout.rs`.
 
 # `tradenation-api` is consumed as a git dep; its `ohlcv` module exposes
 # `candle_model::Granularity` / `CandleData` from a candle-model vendored

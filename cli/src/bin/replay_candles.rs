@@ -42,11 +42,13 @@ mod replay_candles {
     pub mod fixture;
     pub mod granularity;
     pub mod instrument;
+    pub mod market_hours;
     pub mod replay;
     pub mod replay_broker;
     pub mod report;
     pub mod source;
     pub mod tv;
+    pub mod verbose;
 }
 
 use std::fs;
@@ -63,7 +65,9 @@ use tracing_subscriber::{EnvFilter, fmt};
 use replay_candles::fixture::{self, FixtureMeta, ReplayOutcome};
 use replay_candles::source::CandleSource;
 use replay_candles::tv::TvDefaults;
-use replay_candles::{annotate, brisbane, candles, granularity, instrument, replay, report, tv};
+use replay_candles::{
+    annotate, brisbane, candles, granularity, instrument, market_hours, replay, report, tv,
+};
 use trade_control_engine::{BidAskCandle as EngineCandle, Granularity, TradePlan, Trigger};
 use trading_view::mcp::TvMcp;
 
@@ -114,6 +118,14 @@ struct Args {
     /// Run the fill simulator on each fired enter (default on).
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     simulate: bool,
+
+    /// Print a bar-by-bar trace of the engine's silent state changes before the
+    /// fire report: phase transitions, the break-and-close stamp, and the
+    /// **retest stamp** (which never fires an intent, so it's invisible in the
+    /// normal report). Quiet bars are omitted. For debugging "why did/didn't the
+    /// entry fire" — it shows exactly which bar armed the retest gate.
+    #[arg(long, visible_alias = "all-events", default_value_t = false)]
+    verbose: bool,
 
     /// After replaying, draw each *filled* position onto the live TradingView
     /// chart (two rectangles per trade: entry→TP green, entry→SL red), spanning
@@ -295,7 +307,15 @@ async fn main() -> Result<()> {
     let expires_at = end + Duration::days(365);
     let replay = replay::run(&plan, &candles, gran.engine(), start, expires_at).await;
 
-    print!("{}", report::render(&plan, &replay, simulate));
+    // Market-hours no-entry windows (for the blackout sweep reason). Source
+    // pending — currently empty + WARN; see `market_hours`. Fail-soft.
+    let blackout_windows =
+        market_hours::resolve_blackout_windows(args.source, raw_instrument).await;
+
+    print!(
+        "{}",
+        report::render(&plan, &replay, simulate, args.verbose, &blackout_windows)
+    );
 
     if annotate {
         let mcp = match &args.tv_mcp_root {
@@ -357,7 +377,13 @@ async fn run_test_mode(args: &Args) -> Result<()> {
     )
     .await;
 
-    print!("{}", report::render(&inputs.plan, &replay, args.simulate));
+    // A saved-fixture replay has no live instrument to resolve hours for, so the
+    // blackout sweep reason isn't reconstructed here (empty windows). Fixtures
+    // froze their verdict before this feature, so this keeps them byte-stable.
+    print!(
+        "{}",
+        report::render(&inputs.plan, &replay, args.simulate, args.verbose, &[])
+    );
 
     if args.check {
         let computed = ReplayOutcome::compute(&inputs.plan, &replay, args.simulate);
@@ -667,6 +693,7 @@ mod tests {
             end: None,
             tv_mcp_root: None,
             simulate: true,
+            verbose: false,
             annotate: false,
             annotate_unfilled: false,
             warmup_bars: 200,

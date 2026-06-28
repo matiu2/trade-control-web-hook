@@ -11,7 +11,6 @@ mod admin;
 mod adopt;
 mod allow_close_gate;
 mod allow_entry_gate;
-mod candle_gate;
 mod cron;
 mod diag;
 mod market_blackout;

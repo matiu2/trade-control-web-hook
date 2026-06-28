@@ -46,8 +46,12 @@
 //! (the fill bar is in the exit search, pessimistic on SL/TP ties), per-bar
 //! bid/ask book selection, and bar-expiry (`expiry_bars` bounds the fill window).
 
+use trade_control_core::allow_entry_gate::{self, AllowEntryOutcome};
 use trade_control_core::broker::BidAskCandle;
 use trade_control_core::intent::{Direction, Intent, Resolved, ResolvedEntry, Shell};
+use trade_control_core::sweep_gate::{
+    SweepReason, bar_expiry_due, breach_detected, market_blackout_due,
+};
 
 /// What the simulator decided happened to one fired enter over the candle path.
 #[derive(Debug, Clone, PartialEq)]
@@ -83,6 +87,25 @@ pub enum SimOutcome {
     /// Carries the veto name (`too-low` / `too-high`). `simulate_fill`
     /// short-circuits here before any fill, mirroring `run_enter`'s gate.
     Declined { name: String },
+    /// The worker's spread-blackout gate (System 1) would have rejected the
+    /// entry: the **fire bar**'s `ask − bid` spread (in pips) exceeds the
+    /// instrument's elevated threshold while the NY-close-edge blackout
+    /// window is open. No order placed — the live worker 423s here.
+    /// `simulate_fill` short-circuits before any fill, mirroring `run_enter`.
+    ///
+    /// **Modelling note (the offline `window_open` stand-in):** the live
+    /// gate only samples the spread when the KV `spread-blackout:window`
+    /// marker is set, which the daily cron writes at the NY-close edge
+    /// (`src/cron/blackout_apply.rs`). The replay has no KV, so it
+    /// approximates the marker with
+    /// [`trade_control_core::ny_clock::is_ny_close_edge`] on the fire bar's
+    /// open time. This is an *approximation*: the real window can persist
+    /// past the close hour until the recovery watcher clears it, whereas the
+    /// offline stand-in is exactly the close-edge hour. See [`simulate_fill`].
+    SpreadBlackout {
+        spread_pips: f64,
+        threshold_pips: f64,
+    },
 }
 
 /// Simulate one fired enter `intent` (with its triggering `candle` folded into a
@@ -134,66 +157,28 @@ pub fn simulate_fill(
         };
     }
 
-    // Phase 1 — find the fill. A short entry sells (fills on the bid book); a
-    // long entry buys (fills on the ask book). A market entry crosses the spread
-    // at once. The recorded fill price is the placed level (the resting order's
-    // price), not the book extreme.
+    // Spread-blackout (System 1) — the worker's `run_enter` rejects a
+    // brand-new entry that fires during the post-NY-close liquidity trough
+    // when the live spread on the instrument is elevated. `simulate_fill`
+    // doesn't run `run_enter`, so mirror that gate here from the recorded
+    // book: the fire bar's `ask_c − bid_c` IS the spread the worker would
+    // have sampled. The decision + per-instrument threshold are shared with
+    // the worker (`core::spread_blackout`) so the two can't drift.
     //
-    // `candles[0]` is the **fire bar** — the bar the enter fired on. A pending
-    // order is only placed once that bar has *closed* (the engine decides the
-    // fire on the cron tick that processes the closed bar; under
-    // `needs_confirmed` the confirmation itself isn't known until this bar's
-    // close). So a Stop/Limit order cannot interact with the fire bar's own
-    // intrabar path — the earliest bar it can fill on is the **next** one. We
-    // therefore search for the fill from `candles[1..]`. A Market entry is the
-    // exception: it fills at the fire bar's close (the shell price), which is
-    // exactly when the order is placed.
-    let entry_book = book_for(Leg::Entry, dir);
-    let (fill_at, entry_price, rest) = match resolved.entry {
-        ResolvedEntry::Market { reference_price } => (shell.time, reference_price, candles),
-        ResolvedEntry::Stop { trigger_price } | ResolvedEntry::Limit { trigger_price } => {
-            // Skip the fire bar (index 0): the resting order isn't live until
-            // after it closes. `get(1..)` is empty when the fire bar is the only
-            // recorded candle, yielding `NeverFilled` — correct (no later bar to
-            // fill on yet).
-            let after_fire = candles.get(1..).unwrap_or(&[]);
-            // Bar-expiry (`expiry_bars`): the worker cancels a still-resting order
-            // `N` bars after the fire bar (its `cancel_at = next_candle_timestamp_N`).
-            // Mirror that here by bounding the fill window to the first `N` bars
-            // after the fire bar — a cross on a later bar is an order the worker
-            // would already have cancelled, so it must not fill. A static
-            // `expiry_bars` is honoured; a script-resolved one (Rhai) is beyond
-            // this pure price-path sim, so it's treated as "no bar-expiry"
-            // (unbounded), same as `None`.
-            let expiry_bars = intent
-                .expiry_bars
-                .as_ref()
-                .and_then(|t| t.as_static())
-                .copied();
-            let fill_window: &[BidAskCandle] = match expiry_bars {
-                Some(n) => after_fire
-                    .get(..(n as usize).min(after_fire.len()))
-                    .unwrap_or(&[]),
-                None => after_fire,
-            };
-            match fill_window
-                .iter()
-                .position(|c| book_crosses(c, entry_book, trigger_price))
-            {
-                // `i` indexes `fill_window` (a prefix of `after_fire`), so the
-                // fill bar is `candles[i + 1]`.
-                // The post-fill SL/TP search **includes** the fill bar itself
-                // (`candles[i + 1..]`): an order that fills mid-bar can be stopped
-                // out (or hit TP) later in that SAME bar — a real intrabar loss
-                // on a violent breakout bar. With only OHLC we can't order the
-                // fill vs the SL/TP touch within the bar, so Phase 2's pessimistic
-                // tie-break (SL wins on ambiguity) covers a fill bar that spans
-                // both.
-                Some(i) => (after_fire[i].time, trigger_price, &candles[i + 1..]),
-                None => return SimOutcome::NeverFilled,
-            }
-        }
+    // `window_open` stand-in: the live gate only samples when the KV
+    // `spread-blackout:window` marker is set (written by the daily cron at
+    // the NY-close edge). Offline there is no KV, so we approximate it with
+    // `is_ny_close_edge` on the fire bar's open time — see the `SpreadBlackout`
+    // variant doc for why this is an approximation, not an exact mirror.
+    if let Some(reject) = spread_blackout_reject(intent, shell, pip_size, candles) {
+        return reject;
+    }
+
+    // Phase 1 — find the fill (shared with `breakeven_armed_at`).
+    let Some(fill) = find_fill(&resolved, intent, shell, dir, candles) else {
+        return SimOutcome::NeverFilled;
     };
+    let (fill_at, entry_price, rest) = (fill.fill_at, fill.entry_price, fill.rest);
 
     // Phase 2 — after the fill, the first candle that touches SL or TP closes
     // the position. The close is the *opposite* book side from entry (short buys
@@ -252,6 +237,409 @@ pub fn simulate_fill(
         fill_at,
         entry_price,
     }
+}
+
+/// The replay's spread-blackout gate: `Some(SimOutcome::SpreadBlackout { .. })`
+/// when the worker's System-1 gate would reject this enter, `None` otherwise.
+///
+/// The fire bar is `candles[0]` (the bar the enter fired on — the same bar the
+/// `shell` was folded from). Its `ask_c − bid_c` over `pip_size` is the spread
+/// the live worker would have sampled from a broker quote. A mid-only feed has
+/// `bid_c == ask_c` → zero spread → never blacks out (correct: we don't fabricate
+/// a spread the data doesn't carry). `window_open` is the NY-close-edge stand-in
+/// keyed on the fire bar's open time. Decision + threshold come from
+/// `core::spread_blackout`, shared with the worker.
+fn spread_blackout_reject(
+    intent: &Intent,
+    shell: &Shell,
+    pip_size: f64,
+    candles: &[BidAskCandle],
+) -> Option<SimOutcome> {
+    if pip_size <= 0.0 {
+        return None;
+    }
+    // The fire bar carries the spread the worker would have quoted. Prefer the
+    // recorded `candles[0]` (the literal fire bar); fall back to the shell's
+    // own time for the window check if the path is empty.
+    let fire = candles.first()?;
+    let spread_pips = (fire.ask_c - fire.bid_c) / pip_size;
+    // Defensive: an exactly-mid bar (bid == ask) yields zero, a malformed book
+    // (ask < bid) a negative, and a NaN book a non-finite — none is a blackout.
+    // Only a finite positive spread can be sampled.
+    if !spread_pips.is_finite() || spread_pips <= 0.0 {
+        return None;
+    }
+    let window_open = trade_control_core::ny_clock::is_ny_close_edge(shell.time);
+    let threshold_pips =
+        trade_control_core::spread_blackout::elevated_threshold_pips(&intent.instrument);
+    trade_control_core::spread_blackout::spread_blackout_decision(
+        window_open,
+        spread_pips,
+        threshold_pips,
+    )
+    .then_some(SimOutcome::SpreadBlackout {
+        spread_pips,
+        threshold_pips,
+    })
+}
+
+/// A located fill: when/where the entry order filled, and the candle slice from
+/// the fill bar onward (the post-fill SL/TP/break-even search window). Shared by
+/// [`simulate_fill`] and [`breakeven_armed_at`] so the two can't disagree on
+/// *which* bar the order filled on.
+struct Fill<'a> {
+    fill_at: chrono::DateTime<chrono::Utc>,
+    entry_price: f64,
+    rest: &'a [BidAskCandle],
+}
+
+/// Phase 1 of the fill: find where the entry order filled. A short entry sells
+/// (fills on the bid book); a long entry buys (fills on the ask book). A market
+/// entry crosses the spread at once. The recorded fill price is the placed level
+/// (the resting order's price), not the book extreme.
+///
+/// `candles[0]` is the **fire bar** — the bar the enter fired on. A pending
+/// order is only placed once that bar has *closed* (the engine decides the fire
+/// on the cron tick that processes the closed bar; under `needs_confirmed` the
+/// confirmation itself isn't known until this bar's close). So a Stop/Limit order
+/// cannot interact with the fire bar's own intrabar path — the earliest bar it
+/// can fill on is the **next** one, so we search from `candles[1..]`. A Market
+/// entry is the exception: it fills at the fire bar's close (the shell price).
+///
+/// Returns `None` when the pending order never fills within the window (the
+/// caller maps that to `NeverFilled`).
+fn find_fill<'a>(
+    resolved: &Resolved,
+    intent: &Intent,
+    shell: &Shell,
+    dir: Direction,
+    candles: &'a [BidAskCandle],
+) -> Option<Fill<'a>> {
+    let entry_book = book_for(Leg::Entry, dir);
+    match resolved.entry {
+        ResolvedEntry::Market { reference_price } => Some(Fill {
+            fill_at: shell.time,
+            entry_price: reference_price,
+            rest: candles,
+        }),
+        ResolvedEntry::Stop { trigger_price } | ResolvedEntry::Limit { trigger_price } => {
+            // Skip the fire bar (index 0): the resting order isn't live until
+            // after it closes. `get(1..)` is empty when the fire bar is the only
+            // recorded candle, yielding `None` (no later bar to fill on yet).
+            let after_fire = candles.get(1..).unwrap_or(&[]);
+            // Bar-expiry (`expiry_bars`): the worker cancels a still-resting order
+            // `N` bars after the fire bar (its `cancel_at = next_candle_timestamp_N`).
+            // Mirror that here by bounding the fill window to the first `N` bars
+            // after the fire bar — a cross on a later bar is an order the worker
+            // would already have cancelled, so it must not fill. A static
+            // `expiry_bars` is honoured; a script-resolved one (Rhai) is beyond
+            // this pure price-path sim, so it's treated as "no bar-expiry"
+            // (unbounded), same as `None`.
+            let expiry_bars = intent
+                .expiry_bars
+                .as_ref()
+                .and_then(|t| t.as_static())
+                .copied();
+            let fill_window: &[BidAskCandle] = match expiry_bars {
+                Some(n) => after_fire
+                    .get(..(n as usize).min(after_fire.len()))
+                    .unwrap_or(&[]),
+                None => after_fire,
+            };
+            let i = fill_window
+                .iter()
+                .position(|c| book_crosses(c, entry_book, trigger_price))?;
+            // `i` indexes `fill_window` (a prefix of `after_fire`), so the fill
+            // bar is `candles[i + 1]`. The post-fill search **includes** the fill
+            // bar itself (`candles[i + 1..]`): an order that fills mid-bar can be
+            // stopped out (or hit TP) later in that SAME bar.
+            Some(Fill {
+                fill_at: after_fire[i].time,
+                entry_price: trigger_price,
+                rest: &candles[i + 1..],
+            })
+        }
+    }
+}
+
+/// The bar on which break-even **would arm** for this enter — i.e. the first
+/// post-fill candle whose *close* runs past the `breakeven` threshold (50%-to-TP
+/// by default), at or before the position's exit. `None` when the enter carries
+/// no `breakeven`, never fills, or exits (SL/TP) before any candle arms it.
+///
+/// This is the **replay stand-in for the live cron amend**: in production
+/// [`crate::breakeven_watch`] doesn't move the stop at fill-time — it runs every
+/// 15-min cron tick and sends `amend_stop(entry)` to the broker on the first tick
+/// that observes a closed candle past the threshold. The bar returned here is
+/// exactly that candle, so a replay can show "this is when the worker would have
+/// amended the broker SL to break-even." It shares the same arming predicate
+/// ([`Breakeven::close_arms`]) and fill-finding ([`find_fill`]) as the fill
+/// simulator, so the reported bar can't drift from the simulated outcome.
+///
+/// Pure and side-effect-free; the report calls it independently of
+/// [`simulate_fill`] so the `SimOutcome` enum (and every saved fixture) is
+/// untouched.
+pub fn breakeven_armed_at(
+    intent: &Intent,
+    shell: &Shell,
+    pip_size: f64,
+    candles: &[BidAskCandle],
+) -> Option<chrono::DateTime<chrono::Utc>> {
+    let be = intent.breakeven?;
+    let resolved = Resolved::from_intent(intent, shell, pip_size).ok()?;
+    let dir = resolved.direction;
+    let fill = find_fill(&resolved, intent, shell, dir, candles)?;
+
+    let exit_book = book_for(Leg::Exit, dir);
+    let level = be.arms_at(fill.entry_price, resolved.take_profit);
+    // Walk the post-fill path exactly as Phase 2 does: an exit (SL/TP) before any
+    // arming close means break-even never armed during the position's life.
+    for c in fill.rest {
+        if book_crosses(c, exit_book, resolved.stop_loss)
+            || book_crosses(c, exit_book, resolved.take_profit)
+        {
+            return None;
+        }
+        if be.close_arms(dir, level, c.c) {
+            return Some(c.time);
+        }
+    }
+    None
+}
+
+/// Why the live cron sweep would have cancelled a `NeverFilled` resting order,
+/// and the bar timestamp at which it would have acted — the replay stand-in for
+/// the worker's [`sweep_pending_orders`](../../../src/cron/sweep.rs).
+///
+/// `simulate_fill` reports `NeverFilled` for *any* order that never triggered —
+/// but the live worker doesn't passively wait: every cron tick it walks each
+/// resting `EntryAttempt` and **cancels** it once its alert window expired, its
+/// bar-based `cancel_at` passed, it sits inside a market-hours blackout, or
+/// current price overtook its stop-loss. A replay that can't tell an order the
+/// worker would have *swept* from one that merely never triggered diverges
+/// silently from production. This walks the post-fire candle path and returns
+/// the first sweep the worker would have made.
+///
+/// Mirrors the worker's `sweep_one` branch priority at each bar: **expired**
+/// (alert window) → **bar-expiry** (`cancel_at`) → **blackout** (market-hours)
+/// → **SL-breach**. It reuses the shared `core::sweep_gate` predicates so worker
+/// and replay can't drift, and derives `cancel_at` via the same
+/// `core::resolve_cancel_at` the worker uses (off the Pine-shipped forward
+/// bar-close menu on the shell).
+///
+/// `blackout_windows` are the instrument's market-hours no-entry windows. Live
+/// they're written to KV daily by the `blackout_hours` cron from TradeNation
+/// `market_info`; the offline replay fetches the *same* `market_info` at startup
+/// and resolves them through the *same* `core::windows_from_session` deriver, so
+/// a blackout-driven sweep here matches the live worker's. Pass an **empty**
+/// slice when no windows are available (TradeNation unreachable, an OANDA-sourced
+/// replay, a 24h market, or an unparseable session) — the blackout branch then
+/// never fires, exactly the worker's fail-open, and the order falls through to
+/// the SL-breach check / plain "never triggered" verdict.
+///
+/// Returns `None` when no sweep condition is reached within the candle path, or
+/// when the order would never rest (a Market entry / an unresolved intent — the
+/// caller's `NeverFilled` is then not a swept order).
+///
+/// Pure and side-effect-free; the report calls it independently of
+/// [`simulate_fill`] so the `SimOutcome` enum (and every saved fixture) stays
+/// untouched — the same pattern [`breakeven_armed_at`] uses.
+pub fn sweep_reason(
+    intent: &Intent,
+    shell: &Shell,
+    pip_size: f64,
+    candles: &[BidAskCandle],
+    blackout_windows: &[trade_control_core::intent::NoEntryWindow],
+) -> Option<(SweepReason, chrono::DateTime<chrono::Utc>)> {
+    let resolved = Resolved::from_intent(intent, shell, pip_size).ok()?;
+
+    // A Market entry fills at once (it never rests), so a `NeverFilled` Market is
+    // not a swept order — there's nothing for the sweep to cancel.
+    let sl = match resolved.entry {
+        ResolvedEntry::Stop { .. } | ResolvedEntry::Limit { .. } => resolved.stop_loss,
+        ResolvedEntry::Market { .. } => return None,
+    };
+    let dir = resolved.direction;
+
+    // Derive the bar-based `cancel_at` exactly as the worker's `run_enter` does:
+    // off the Pine-shipped forward bar-close menu on the shell, capped at the
+    // alert window. A non-static / out-of-range / absent `expiry_bars` yields no
+    // bar-expiry (matching the worker, which only sets `cancel_at` when it
+    // resolves cleanly).
+    let cancel_at = intent
+        .expiry_bars
+        .as_ref()
+        .and_then(|t| t.as_static())
+        .copied()
+        .and_then(|bars| {
+            trade_control_core::intent::resolve_cancel_at(bars, shell, intent.not_after).ok()
+        });
+
+    // The order rests from the bar *after* the fire bar (a pending order isn't
+    // live until the fire bar closes — same skip `find_fill` applies). Walk those
+    // live bars chronologically; the first that trips a sweep branch wins.
+    for c in candles.get(1..).unwrap_or(&[]) {
+        if intent.not_after < c.time {
+            return Some((SweepReason::Expired, c.time));
+        }
+        if bar_expiry_due(cancel_at, c.time) {
+            return Some((SweepReason::BarExpiry, c.time));
+        }
+        // Market-hours blackout: the resting order is caught inside the
+        // instrument's daily close→open gap. Runs BEFORE SL-breach to match the
+        // worker's `sweep_one` ordering — across a closed session a price-based
+        // check would read a stale quote, so the closed market itself is the
+        // trigger. Empty `blackout_windows` ⇒ `market_blackout_due` is false ⇒
+        // fail-open (no fabricated blackout), same as the worker's reject gate.
+        if market_blackout_due(blackout_windows, c.time) {
+            return Some((SweepReason::Blackout, c.time));
+        }
+        // SL-breach uses the bar's mid close as the "current price" the live
+        // sweep would read from `get_current_price` (a mid quote). Intrabar
+        // wick noise is intentionally ignored: the sweep samples a point price
+        // per tick, not the bar range.
+        if breach_detected(dir, c.c, sl) {
+            return Some((SweepReason::SlBreached, c.time));
+        }
+    }
+
+    None
+}
+
+/// Why the worker's pre-broker entry gate would have **rejected** this enter,
+/// so the offline replay can report a block instead of silently filling an
+/// order the live worker never would have placed.
+///
+/// These mirror the worker's `run_enter` `allow_entry_gate::evaluate` outcomes
+/// (the `allow_entry` Rhai script + the AND-composed candle-quality gate). The
+/// `Declined` (at-entry-level veto) and `Unresolved` rejections already live in
+/// [`SimOutcome`]; this covers the two that didn't, without touching that enum.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GateBlock {
+    /// The `allow_entry` Rhai script evaluated to `false`. The live worker 412s.
+    AllowEntryFalse,
+    /// The `allow_entry` script failed to parse / eval / returned the wrong
+    /// type. The live worker 412s with the kind in its rejection log.
+    AllowEntryScriptError {
+        /// `parse` / `eval` / `wrong-type`.
+        kind: &'static str,
+        /// The script error's display string.
+        message: String,
+    },
+    /// `needs_golden` was set on the enter but the (signal-folded) shell did not
+    /// carry `golden: Some(true)`. The live worker 412s "needs-golden".
+    NeedsGoldenUnmet,
+    /// `needs_confirmed` was set but the shell did not carry
+    /// `signal_confirmed: Some(true)`. The live worker 412s "needs-confirmed".
+    NeedsConfirmedUnmet,
+}
+
+/// Would the worker's pre-broker entry gate have **rejected** this fired enter?
+///
+/// `simulate_fill` reproduces only the price-path fill; the worker's `run_enter`
+/// also runs the `allow_entry` script + candle-quality gate before any
+/// placement. Both now live in the shared [`allow_entry_gate`] (in `core`), so
+/// the replay can apply them identically — this is that call.
+///
+/// Standalone and pure (it resolves the bracket itself, like
+/// [`breakeven_armed_at`]), so it leaves [`SimOutcome`] and `simulate_fill`'s
+/// fill behaviour untouched: the report calls it first and, on `Some`, prints a
+/// gate-block line instead of the simulated fill.
+///
+/// Returns `None` when the gate would let the entry through, the intent can't be
+/// resolved (an `Unresolved`/`Declined` `simulate_fill` already reports that),
+/// or the action isn't an enter.
+pub fn entry_gate_block(intent: &Intent, shell: &Shell, pip_size: f64) -> Option<GateBlock> {
+    let resolved = Resolved::from_intent(intent, shell, pip_size).ok()?;
+    match allow_entry_gate::evaluate(intent, shell, &resolved, pip_size) {
+        AllowEntryOutcome::Proceed => None,
+        AllowEntryOutcome::Blocked => Some(GateBlock::AllowEntryFalse),
+        AllowEntryOutcome::NeedsGoldenUnmet => Some(GateBlock::NeedsGoldenUnmet),
+        AllowEntryOutcome::NeedsConfirmedUnmet => Some(GateBlock::NeedsConfirmedUnmet),
+        AllowEntryOutcome::ScriptError { kind, message } => {
+            Some(GateBlock::AllowEntryScriptError { kind, message })
+        }
+    }
+}
+
+/// A System-2 spread-widen the replay reconstructs from the candle path: the
+/// bar whose spread tripped the widen, and the new (widened) stop level.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SpreadWiden {
+    /// Open-time of the bar whose spread crossed the widen trigger.
+    pub at: chrono::DateTime<chrono::Utc>,
+    /// The original (resolved) stop level, before widening.
+    pub original_stop: f64,
+    /// The stop after widening away from price (the shared
+    /// [`trade_control_core::blackout_widen::widened_stop`] result).
+    pub widened_stop: f64,
+}
+
+/// Reconstruct a System-2 spread-blackout stop widen from the candle path, if
+/// one would apply while this enter's position is open.
+///
+/// In production the live cron (`src/cron/blackout_apply.rs`) samples
+/// `ask − bid`, and when it's inside the spread-blackout window it widens the
+/// broker stop *away* from price by the live spread (floored/clamped 22–40 pips
+/// via [`trade_control_core::blackout_widen::clamp_widen`] /
+/// [`trade_control_core::blackout_widen::widened_stop`]). A widened stop changes
+/// the **exit price** — without this, a replay would stop the position out at
+/// the original (tighter) level and diverge from the live worker.
+///
+/// **The trigger.** The caller passes `widen_trigger_pips` — the instrument's
+/// spread-blackout threshold (`baked-baseline × 5`) via
+/// [`trade_control_core::spread_blackout::elevated_threshold_pips`], the *same*
+/// number the System-1 entry-reject uses. Now that the baked baseline lives in
+/// shared `core` the engine links it directly, so this is the **exact**
+/// per-instrument threshold the live worker's `blackout_apply` widens against —
+/// no longer the flat `WIDEN_FLOOR_PIPS` proxy. The first post-fill bar whose
+/// **spread** (`ask_c − bid_c`, in pips) meets or exceeds it — *while the stop
+/// hasn't yet been hit* — is the widen bar. The amount it widens by is still
+/// floored/clamped 22–40 pips via [`trade_control_core::blackout_widen::clamp_widen`].
+///
+/// Pure and side-effect-free. Returns `None` when the enter has no fill, exits
+/// before any qualifying spread bar, or no bar's spread reaches the trigger.
+pub fn widened_stop_at(
+    intent: &Intent,
+    shell: &Shell,
+    pip_size: f64,
+    candles: &[BidAskCandle],
+    widen_trigger_pips: f64,
+) -> Option<SpreadWiden> {
+    if !pip_size.is_finite() || pip_size <= 0.0 {
+        return None;
+    }
+    let resolved = Resolved::from_intent(intent, shell, pip_size).ok()?;
+    let dir = resolved.direction;
+    let fill = find_fill(&resolved, intent, shell, dir, candles)?;
+    let exit_book = book_for(Leg::Exit, dir);
+    let original_stop = resolved.stop_loss;
+
+    for c in fill.rest {
+        // The original stop is still the live one until a widen fires, so an
+        // exit (SL/TP) before any qualifying spread bar means no widen applied.
+        if book_crosses(c, exit_book, original_stop)
+            || book_crosses(c, exit_book, resolved.take_profit)
+        {
+            return None;
+        }
+        let spread_pips = (c.ask_c - c.bid_c) / pip_size;
+        if spread_pips.is_finite() && spread_pips >= widen_trigger_pips {
+            let widen_pips = trade_control_core::blackout_widen::clamp_widen(spread_pips);
+            let widened = trade_control_core::blackout_widen::widened_stop(
+                dir,
+                original_stop,
+                widen_pips,
+                pip_size,
+            );
+            return Some(SpreadWiden {
+                at: c.time,
+                original_stop,
+                widened_stop: widened,
+            });
+        }
+    }
+    None
 }
 
 /// Which broker book a price level is tested against.
@@ -587,6 +975,128 @@ mod tests {
         ));
     }
 
+    /// An NY-close-edge UTC instant — 21:00 UTC on an EDT day (12-Mar-2026,
+    /// past the 2nd Sunday of March). `is_ny_close_edge` is true here, so the
+    /// offline blackout window stand-in is "open". Used to fire enters inside
+    /// the trough.
+    const EDGE_TS: &str = "2026-03-12T21:00:00Z";
+    /// A non-edge UTC instant — 10:00 UTC, mid-London-session, window closed.
+    const NON_EDGE_TS: &str = "2026-03-12T10:00:00Z";
+
+    /// A fire bar with an explicit `ask_c − bid_c` spread, in PRICE units, at
+    /// `time`. Only the close books carry the spread (the worker samples a quote
+    /// close ≈ the bar close); the rest are filled in arbitrarily but
+    /// consistently so the bar is well-formed and never crosses any per-test
+    /// level.
+    fn spread_fire_bar(time: &str, mid: f64, spread_price: f64) -> BidAskCandle {
+        let half = spread_price / 2.0;
+        BidAskCandle {
+            time: ts(time),
+            o: mid,
+            h: mid + 0.0001,
+            l: mid - 0.0001,
+            c: mid,
+            bid_o: mid - half,
+            bid_h: mid - half + 0.0001,
+            bid_l: mid - half - 0.0001,
+            bid_c: mid - half,
+            ask_o: mid + half,
+            ask_h: mid + half + 0.0001,
+            ask_l: mid + half - 0.0001,
+            ask_c: mid + half,
+        }
+    }
+
+    /// A resolvable long stop-entry (trigger 10 pips above the 1.1040 close, so
+    /// the geometry is valid and resolution doesn't short-circuit before the
+    /// spread gate). The spread tests vary only the fire bar's book + time.
+    fn resolvable_long_stop() -> Intent {
+        let mut i = long_stop_intent();
+        i.entry = Some(EntrySpec::Stop {
+            from: PriceAnchor::Close,
+            offset_pips: 10.0, // trigger 1.1050 > close 1.1040 → valid long stop
+            offset_atr_pct: None,
+            at: None,
+            recover_entry: None,
+        });
+        i
+    }
+
+    #[test]
+    fn elevated_spread_inside_ny_close_edge_is_blacked_out() {
+        // EUR_USD isn't in the baked baseline (keyed by the TN name "EUR/USD"),
+        // so the flat 8-pip fallback applies. A fire bar with a 30-pip spread
+        // (0.0030 at pip 0.0001) inside the NY-close-edge window → the worker's
+        // System-1 gate would 423, and the replay now mirrors it.
+        let intent = resolvable_long_stop();
+        // Shell time IS the fire bar time — both at the close edge.
+        let shell = Shell::from_candle(&spread_fire_bar(EDGE_TS, 1.1040, 0.0030).mid());
+        let path = [spread_fire_bar(EDGE_TS, 1.1040, 0.0030)];
+
+        match simulate_fill(&intent, &shell, 0.0001, &path) {
+            SimOutcome::SpreadBlackout {
+                spread_pips,
+                threshold_pips,
+            } => {
+                assert!(
+                    (spread_pips - 30.0).abs() < 1e-6,
+                    "30p spread, got {spread_pips}"
+                );
+                assert!(
+                    (threshold_pips - 8.0).abs() < 1e-9,
+                    "flat 8p fallback threshold, got {threshold_pips}"
+                );
+            }
+            other => panic!("expected SpreadBlackout, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn normal_spread_inside_window_fills() {
+        // Control: same NY-close-edge window, but a tight 2-pip spread is below
+        // the 8-pip threshold → not blacked out. The order then resolves and
+        // (with no fill bar after the fire bar) reports NeverFilled — i.e. the
+        // blackout gate let it through.
+        let intent = resolvable_long_stop();
+        let shell = Shell::from_candle(&spread_fire_bar(EDGE_TS, 1.1040, 0.0002).mid());
+        let path = [spread_fire_bar(EDGE_TS, 1.1040, 0.0002)];
+        assert_eq!(
+            simulate_fill(&intent, &shell, 0.0001, &path),
+            SimOutcome::NeverFilled,
+            "a tight spread inside the window must pass the blackout gate"
+        );
+    }
+
+    #[test]
+    fn elevated_spread_outside_window_fills() {
+        // Control: the SAME wide 30-pip spread, but the fire bar is NOT at the
+        // NY-close edge → window closed → no blackout (the worker wouldn't even
+        // sample). Falls through to the normal path (NeverFilled here).
+        let intent = resolvable_long_stop();
+        let shell = Shell::from_candle(&spread_fire_bar(NON_EDGE_TS, 1.1040, 0.0030).mid());
+        let path = [spread_fire_bar(NON_EDGE_TS, 1.1040, 0.0030)];
+        assert_eq!(
+            simulate_fill(&intent, &shell, 0.0001, &path),
+            SimOutcome::NeverFilled,
+            "a wide spread outside the close-edge window must not black out"
+        );
+    }
+
+    #[test]
+    fn mid_only_feed_never_blacks_out() {
+        // A mid-only data source has bid == ask == mid → zero spread. Even a
+        // fire bar at the close edge must never black out (we don't fabricate a
+        // spread the data doesn't carry).
+        let intent = resolvable_long_stop();
+        let shell = Shell::from_candle(&candle(EDGE_TS, 1.1040, 1.1041, 1.1039, 1.1040).mid());
+        let path = [candle(EDGE_TS, 1.1040, 1.1041, 1.1039, 1.1040)];
+        assert_eq!(
+            simulate_fill(&intent, &shell, 0.0001, &path),
+            SimOutcome::NeverFilled,
+            "zero-spread mid-only bar must never black out"
+        );
+    }
+
     /// Override a short stop-entry intent's entry trigger / SL / TP to absolute
     /// levels, so a BE test controls the exact 50%-to-TP geometry.
     fn i_set_levels(intent: &mut Intent, entry: f64, sl: f64, tp: f64) {
@@ -662,6 +1172,67 @@ mod tests {
         }
     }
 
+    /// `breakeven_armed_at` reports the **bar whose close arms break-even** —
+    /// the replay stand-in for the live cron amend. Same trade-075 leg-2 geometry
+    /// as `breakeven_scratches_a_leg_that_runs_50pct_then_reverses`: the
+    /// `runs_past_50` bar (close 1.0940 past the 1.0950 BE level) is the arming
+    /// bar, and it must match the bar that the fill sim moves the stop on.
+    #[test]
+    fn breakeven_armed_at_reports_the_arming_bar() {
+        use trade_control_core::intent::Breakeven;
+        let mut intent = short_stop_intent();
+        i_set_levels(&mut intent, 1.1000, 1.1040, 1.0900); // BE level 1.0950
+        intent.breakeven = Some(Breakeven::at_half());
+        let shell = Shell::from_candle(
+            &candle("2026-06-17T10:00:00Z", 1.1010, 1.1012, 1.0998, 1.1005).mid(),
+        );
+        let fill_bar = candle("2026-06-17T11:00:00Z", 1.1005, 1.1005, 1.0995, 1.1000);
+        let runs_past_50 = candle("2026-06-17T12:00:00Z", 1.0990, 1.0992, 1.0935, 1.0940);
+        let bounce_to_orig_sl = candle("2026-06-17T13:00:00Z", 1.0945, 1.1041, 1.0944, 1.1000);
+        let path = [fire_bar(), fill_bar, runs_past_50, bounce_to_orig_sl];
+
+        let armed = breakeven_armed_at(&intent, &shell, 0.0001, &path);
+        assert_eq!(
+            armed,
+            Some(runs_past_50.time),
+            "BE arms on the bar whose close (1.0940) runs past the 1.0950 level"
+        );
+    }
+
+    /// No `breakeven` rule → never armed (the field is `None`).
+    #[test]
+    fn breakeven_armed_at_is_none_without_a_rule() {
+        let mut intent = short_stop_intent();
+        i_set_levels(&mut intent, 1.1000, 1.1040, 1.0900);
+        intent.breakeven = None;
+        let shell = Shell::from_candle(
+            &candle("2026-06-17T10:00:00Z", 1.1010, 1.1012, 1.0998, 1.1005).mid(),
+        );
+        let fill_bar = candle("2026-06-17T11:00:00Z", 1.1005, 1.1005, 1.0995, 1.1000);
+        let runs_past_50 = candle("2026-06-17T12:00:00Z", 1.0990, 1.0992, 1.0935, 1.0940);
+        let path = [fire_bar(), fill_bar, runs_past_50];
+        assert_eq!(breakeven_armed_at(&intent, &shell, 0.0001, &path), None);
+    }
+
+    /// A position stopped out at the original SL **before** any candle arms BE
+    /// reports `None` — break-even never armed during its life.
+    #[test]
+    fn breakeven_armed_at_is_none_when_stopped_before_arming() {
+        use trade_control_core::intent::Breakeven;
+        let mut intent = short_stop_intent();
+        i_set_levels(&mut intent, 1.1000, 1.1040, 1.0900); // BE level 1.0950
+        intent.breakeven = Some(Breakeven::at_half());
+        let shell = Shell::from_candle(
+            &candle("2026-06-17T10:00:00Z", 1.1010, 1.1012, 1.0998, 1.1005).mid(),
+        );
+        // Fill, then a bar that hits the original 1.1040 SL before ever closing
+        // past the 1.0950 BE level → BE never arms.
+        let fill_bar = candle("2026-06-17T11:00:00Z", 1.1005, 1.1005, 1.0995, 1.1000);
+        let straight_to_sl = candle("2026-06-17T12:00:00Z", 1.1005, 1.1041, 1.1000, 1.1030);
+        let path = [fire_bar(), fill_bar, straight_to_sl];
+        assert_eq!(breakeven_armed_at(&intent, &shell, 0.0001, &path), None);
+    }
+
     /// A candle that only WICKS past the 50% level (but closes back short of it)
     /// must NOT arm break-even — the arming basis is the close, not the wick.
     #[test]
@@ -691,6 +1262,79 @@ mod tests {
             }
             other => panic!("expected StoppedOut at original SL (no BE arm), got {other:?}"),
         }
+    }
+
+    /// A long position whose post-fill path includes a wide-spread bar reports
+    /// the widen: the bar's time, the original SL, and a stop moved DOWN (away
+    /// from price for a long) by the clamped live spread.
+    #[test]
+    fn widened_stop_at_reports_the_widen_bar_for_a_long() {
+        use trade_control_core::blackout_widen::{WIDEN_FLOOR_PIPS, widened_stop};
+        let mut intent = long_stop_intent();
+        i_set_levels(&mut intent, 1.1000, 1.0950, 1.1100);
+        let shell = trigger_shell();
+        // Fire bar (skipped), then a zero-spread bar whose ASK reaches the 1.1000
+        // long trigger → fill. Then a wide-spread bar (ask_c − bid_c = 1.10315 −
+        // 1.10010 = 0.00305 = 30.5 pips, within the 22–40 clamp) that does NOT hit
+        // SL/TP → widen.
+        let fill_bar = candle("2026-06-17T11:00:00Z", 1.1000, 1.1001, 1.0999, 1.1000);
+        let wide = ba_candle("2026-06-17T12:00:00Z", 1.10015, 1.10010, 1.10315, 1.10310);
+        let spread_pips = (wide.ask_c - wide.bid_c) / 0.0001; // 30.5
+        let path = [fire_bar(), fill_bar, wide];
+
+        let widen = widened_stop_at(&intent, &shell, 0.0001, &path, WIDEN_FLOOR_PIPS)
+            .expect("a 30.5-pip spread bar must trip the widen");
+        assert_eq!(widen.at, wide.time);
+        assert!((widen.original_stop - 1.0950).abs() < 1e-9);
+        // 30.5 pips is within the 22–40 clamp, so widen by the live spread; long
+        // moves DOWN.
+        let expected = widened_stop(Direction::Long, 1.0950, spread_pips, 0.0001);
+        assert!(
+            (widen.widened_stop - expected).abs() < 1e-9,
+            "expected {expected}, got {}",
+            widen.widened_stop
+        );
+        assert!(
+            widen.widened_stop < 1.0950,
+            "a long widen moves the SL DOWN"
+        );
+    }
+
+    /// No bar's spread reaches the trigger → no widen.
+    #[test]
+    fn widened_stop_at_is_none_when_spread_stays_tight() {
+        use trade_control_core::blackout_widen::WIDEN_FLOOR_PIPS;
+        let mut intent = long_stop_intent();
+        i_set_levels(&mut intent, 1.1000, 1.0950, 1.1100);
+        let shell = trigger_shell();
+        let fill_bar = candle("2026-06-17T11:00:00Z", 1.1000, 1.1001, 1.0999, 1.1000);
+        // 2-pip spread bar — well under the 22-pip floor.
+        let tight = ba_candle("2026-06-17T12:00:00Z", 1.10010, 1.10005, 1.10030, 1.10025);
+        let path = [fire_bar(), fill_bar, tight];
+        assert_eq!(
+            widened_stop_at(&intent, &shell, 0.0001, &path, WIDEN_FLOOR_PIPS),
+            None
+        );
+    }
+
+    /// A position stopped out before any wide-spread bar reports no widen — the
+    /// original stop was still the live one when the position closed.
+    #[test]
+    fn widened_stop_at_is_none_when_stopped_before_widen() {
+        use trade_control_core::blackout_widen::WIDEN_FLOOR_PIPS;
+        let mut intent = long_stop_intent();
+        i_set_levels(&mut intent, 1.1000, 1.0950, 1.1100);
+        let shell = trigger_shell();
+        let fill_bar = candle("2026-06-17T11:00:00Z", 1.1000, 1.1001, 1.0999, 1.1000);
+        // Hits the 1.0950 SL on the bid book (long exits on bid) before any
+        // wide-spread bar.
+        let to_sl = candle("2026-06-17T12:00:00Z", 1.0990, 1.0991, 1.0949, 1.0951);
+        let wide = ba_candle("2026-06-17T13:00:00Z", 1.10015, 1.10010, 1.10315, 1.10310);
+        let path = [fire_bar(), fill_bar, to_sl, wide];
+        assert_eq!(
+            widened_stop_at(&intent, &shell, 0.0001, &path, WIDEN_FLOOR_PIPS),
+            None
+        );
     }
 
     #[test]
@@ -1024,5 +1668,243 @@ mod tests {
             ),
             "a cross on the last live bar still fills"
         );
+    }
+
+    // --- sweep_reason -------------------------------------------------------
+
+    /// A never-triggered LONG stop-entry whose price falls past its SL while the
+    /// order is still resting → the live cron sweep would cancel it for an
+    /// SL-breach. `sweep_reason` reports that, at the breaching bar.
+    #[test]
+    fn sweep_reason_reports_sl_breach() {
+        let mut intent = long_stop_intent();
+        intent.entry = Some(EntrySpec::Stop {
+            from: PriceAnchor::Close,
+            offset_pips: 10.0, // trigger 1.1050; SL 1.1000
+            offset_atr_pct: None,
+            at: None,
+            recover_entry: None,
+        });
+        let shell = trigger_shell();
+
+        // Fire bar (skipped), then two bars that never reach the 1.1050 trigger;
+        // the second CLOSES at 1.0995 — below the 1.1000 SL → breach.
+        let path = [
+            fire_bar(),
+            candle("2026-06-17T11:00:00Z", 1.1041, 1.1045, 1.1038, 1.1040), // rests, no breach
+            candle("2026-06-17T12:00:00Z", 1.1010, 1.1012, 1.0990, 1.0995), // close past SL
+        ];
+        // Sanity: this path is NeverFilled (trigger never reached).
+        assert_eq!(
+            simulate_fill(&intent, &shell, 0.0001, &path),
+            SimOutcome::NeverFilled
+        );
+        assert_eq!(
+            sweep_reason(&intent, &shell, 0.0001, &path, &[]),
+            Some((SweepReason::SlBreached, ts("2026-06-17T12:00:00Z")))
+        );
+    }
+
+    /// A never-triggered stop-entry whose bar-based `cancel_at` (off the shell's
+    /// Pine forward-bar-close menu) passes → swept for bar-expiry.
+    #[test]
+    fn sweep_reason_reports_bar_expiry() {
+        let mut intent = long_stop_intent();
+        intent.entry = Some(EntrySpec::Stop {
+            from: PriceAnchor::Close,
+            offset_pips: 10.0, // trigger 1.1050
+            offset_atr_pct: None,
+            at: None,
+            recover_entry: None,
+        });
+        intent.expiry_bars = Some(Tunable::Static(1));
+        // cancel_at resolves off slot-1 of the shell's forward menu.
+        let mut shell = trigger_shell();
+        shell.next_candle_timestamp_1 = Some(ts("2026-06-17T11:30:00Z"));
+
+        // Bars never reach the trigger and never breach the SL — only bar-expiry
+        // can fire. The 12:00 bar is past the 11:30 cancel_at.
+        let path = [
+            fire_bar(),
+            candle("2026-06-17T11:00:00Z", 1.1041, 1.1045, 1.1038, 1.1043), // before cancel_at
+            candle("2026-06-17T12:00:00Z", 1.1041, 1.1045, 1.1038, 1.1043), // past cancel_at
+        ];
+        assert_eq!(
+            simulate_fill(&intent, &shell, 0.0001, &path),
+            SimOutcome::NeverFilled
+        );
+        assert_eq!(
+            sweep_reason(&intent, &shell, 0.0001, &path, &[]),
+            Some((SweepReason::BarExpiry, ts("2026-06-17T12:00:00Z")))
+        );
+    }
+
+    /// A never-triggered stop-entry whose alert window (`not_after`) closes
+    /// during the candle path → swept as alert-window expired. Expiry takes
+    /// priority over a same-bar SL-breach (worker `sweep_one` branch order).
+    #[test]
+    fn sweep_reason_reports_alert_window_expiry_first() {
+        let mut intent = long_stop_intent();
+        intent.entry = Some(EntrySpec::Stop {
+            from: PriceAnchor::Close,
+            offset_pips: 10.0, // trigger 1.1050; SL 1.1000
+            offset_atr_pct: None,
+            at: None,
+            recover_entry: None,
+        });
+        intent.not_after = ts("2026-06-17T11:30:00Z");
+        let shell = trigger_shell();
+
+        // The 12:00 bar is past not_after AND closes past the SL — expiry wins.
+        let path = [
+            fire_bar(),
+            candle("2026-06-17T11:00:00Z", 1.1041, 1.1045, 1.1038, 1.1043), // within window
+            candle("2026-06-17T12:00:00Z", 1.1010, 1.1012, 1.0990, 1.0995), // past window + SL
+        ];
+        assert_eq!(
+            sweep_reason(&intent, &shell, 0.0001, &path, &[]),
+            Some((SweepReason::Expired, ts("2026-06-17T12:00:00Z")))
+        );
+    }
+
+    /// No sweep condition reached within the path → `None`. A resting order that
+    /// simply never triggered (and never breached / expired) is not swept.
+    #[test]
+    fn sweep_reason_is_none_when_nothing_sweeps() {
+        let mut intent = long_stop_intent();
+        intent.entry = Some(EntrySpec::Stop {
+            from: PriceAnchor::Close,
+            offset_pips: 10.0, // trigger 1.1050; SL 1.1000
+            offset_atr_pct: None,
+            at: None,
+            recover_entry: None,
+        });
+        // No bar-expiry, generous alert window.
+        intent.expiry_bars = None;
+        let shell = trigger_shell();
+
+        // Bars stay between SL and trigger — never fill, never breach, in-window.
+        let path = [
+            fire_bar(),
+            candle("2026-06-17T11:00:00Z", 1.1041, 1.1045, 1.1038, 1.1043),
+            candle("2026-06-17T12:00:00Z", 1.1041, 1.1045, 1.1038, 1.1043),
+        ];
+        assert_eq!(
+            simulate_fill(&intent, &shell, 0.0001, &path),
+            SimOutcome::NeverFilled
+        );
+        assert_eq!(sweep_reason(&intent, &shell, 0.0001, &path, &[]), None);
+    }
+
+    /// A Market entry never rests, so a (degenerate) Market `NeverFilled` is not
+    /// a swept order → `None`.
+    #[test]
+    fn sweep_reason_is_none_for_market_entry() {
+        let mut intent = long_stop_intent();
+        intent.entry = Some(EntrySpec::Market);
+        let shell = trigger_shell();
+        assert_eq!(
+            sweep_reason(&intent, &shell, 0.0001, &[fire_bar()], &[]),
+            None
+        );
+    }
+
+    /// A never-triggered stop-entry whose resting bars fall inside a market-hours
+    /// blackout window → swept as `Blackout`. Blackout takes priority over a
+    /// same-bar SL-breach (worker `sweep_one` branch order: blackout before the
+    /// stale-price SL check). An empty window slice never fires this branch.
+    #[test]
+    fn sweep_reason_reports_market_blackout() {
+        use trade_control_core::intent::NoEntryWindow;
+
+        let mut intent = long_stop_intent();
+        intent.entry = Some(EntrySpec::Stop {
+            from: PriceAnchor::Close,
+            offset_pips: 10.0, // trigger 1.1050; SL 1.1000
+            offset_atr_pct: None,
+            at: None,
+            recover_entry: None,
+        });
+        intent.expiry_bars = None;
+        let shell = trigger_shell();
+
+        // The 12:00Z bar both closes past the SL AND sits inside the blackout
+        // window (UTC minute 720 = 12:00). Blackout must win over SL-breach.
+        let path = [
+            fire_bar(),
+            candle("2026-06-17T11:00:00Z", 1.1041, 1.1045, 1.1038, 1.1043), // in-window, no breach
+            candle("2026-06-17T12:00:00Z", 1.1010, 1.1012, 1.0990, 1.0995), // blackout + past SL
+        ];
+        // 11:55–12:05 UTC blackout (minutes 715..=725) catches the 12:00 bar.
+        let windows = [NoEntryWindow::new(715, 725)];
+        assert_eq!(
+            sweep_reason(&intent, &shell, 0.0001, &path, &windows),
+            Some((SweepReason::Blackout, ts("2026-06-17T12:00:00Z")))
+        );
+        // Same path with no windows → falls through to SL-breach (not blackout).
+        assert_eq!(
+            sweep_reason(&intent, &shell, 0.0001, &path, &[]),
+            Some((SweepReason::SlBreached, ts("2026-06-17T12:00:00Z")))
+        );
+    }
+
+    /// A resolvable market enter so the gate-block tests exercise the gate, not
+    /// the resolver (an `Unresolved` short-circuits before `allow_entry_gate`).
+    fn market_enter() -> Intent {
+        let mut i = base_enter();
+        i.direction = Some(Direction::Long);
+        i.entry = Some(EntrySpec::Market);
+        i.stop_loss = Some(PriceRef::Absolute { absolute: 1.1000 });
+        i.take_profit = Some(TakeProfit::Anchored(PriceRef::Absolute {
+            absolute: 1.1150,
+        }));
+        i
+    }
+
+    #[test]
+    fn entry_gate_block_none_when_gate_passes() {
+        // No allow_entry script, no candle-quality requirement → the worker
+        // would place the order, so the replay must not block it.
+        let intent = market_enter();
+        let shell = trigger_shell();
+        assert_eq!(entry_gate_block(&intent, &shell, 0.0001), None);
+    }
+
+    #[test]
+    fn entry_gate_block_allow_entry_false() {
+        // The worker's `run_enter` 412s a static-false `allow_entry`; the replay
+        // must surface that block instead of filling the order.
+        let mut intent = market_enter();
+        intent.allow_entry = Some(Tunable::Static(false));
+        let shell = trigger_shell();
+        assert_eq!(
+            entry_gate_block(&intent, &shell, 0.0001),
+            Some(GateBlock::AllowEntryFalse)
+        );
+    }
+
+    #[test]
+    fn entry_gate_block_needs_golden_unmet() {
+        // `needs_golden` set but the shell carries `golden: None` (the realistic
+        // non-golden case) → the worker rejects "needs-golden"; replay mirrors it.
+        let mut intent = market_enter();
+        intent.needs_golden = true;
+        let shell = trigger_shell();
+        assert_eq!(shell.golden, None);
+        assert_eq!(
+            entry_gate_block(&intent, &shell, 0.0001),
+            Some(GateBlock::NeedsGoldenUnmet)
+        );
+    }
+
+    #[test]
+    fn entry_gate_block_script_error_surfaces_kind() {
+        let mut intent = market_enter();
+        intent.allow_entry = Some(Tunable::from_script("if if if"));
+        let shell = trigger_shell();
+        match entry_gate_block(&intent, &shell, 0.0001) {
+            Some(GateBlock::AllowEntryScriptError { kind, .. }) => assert_eq!(kind, "parse"),
+            other => panic!("expected AllowEntryScriptError(parse), got {other:?}"),
+        }
     }
 }

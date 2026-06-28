@@ -19,8 +19,14 @@
 //! is what flattens the broker position live.
 
 use chrono::{DateTime, Utc};
-use trade_control_core::intent::{Action, Direction, Resolved, ResolvedEntry, Shell};
-use trade_control_engine::{SimOutcome, TradePlan, simulate_fill};
+use trade_control_core::intent::{
+    Action, Direction, NoEntryWindow, Resolved, ResolvedEntry, Shell,
+};
+use trade_control_core::spread_blackout::elevated_threshold_pips;
+use trade_control_engine::{
+    GateBlock, SimOutcome, SweepReason, TradePlan, breakeven_armed_at, entry_gate_block,
+    simulate_fill, sweep_reason, widened_stop_at,
+};
 
 use super::brisbane::bne;
 use super::replay::{Fire, Replay};
@@ -36,16 +42,39 @@ pub struct CloseFire {
     pub price: f64,
 }
 
-/// Every `Action::Close` fire in the replay, in fire order, reduced to
-/// [`CloseFire`]s. The fill resolution consults these to exit an open position
-/// on a reversal candle — the engine now fires the close (a `PinePattern`
-/// guard), but the pure per-enter `simulate_fill` only knows SL/TP, so the
-/// replay must apply the close itself.
+/// Whether the worker's `allow_close` gate would let this close flatten the
+/// position. The live worker runs the shared
+/// [`trade_control_core::allow_close_gate::evaluate`] on every `run_close`; a
+/// non-`Proceed` outcome (`allow_close` false, a script error, or an unmet
+/// `needs_golden` / `needs_confirmed`) is a 412 that leaves the position OPEN.
+/// Without this the replay would close it and diverge from the live worker.
+fn close_gate_passes(fire: &Fire) -> bool {
+    let intent = &fire.fired.intent;
+    let candle = &fire.fired.candle;
+    let shell = match &fire.fired.signal {
+        Some(sig) => Shell::from_candle_and_signal(candle, sig),
+        None => Shell::from_candle(candle),
+    };
+    matches!(
+        trade_control_core::allow_close_gate::evaluate(intent, &shell),
+        trade_control_core::allow_close_gate::AllowCloseOutcome::Proceed
+    )
+}
+
+/// Every `Action::Close` fire in the replay **whose `allow_close` gate passes**,
+/// in fire order, reduced to [`CloseFire`]s. The fill resolution consults these
+/// to exit an open position on a reversal candle — the engine now fires the
+/// close (a `PinePattern` guard), but the pure per-enter `simulate_fill` only
+/// knows SL/TP, so the replay must apply the close itself. A close the
+/// `allow_close` gate would block is dropped here so the position stays open
+/// (matching the live worker); the blocked close still renders its own
+/// `BLOCKED` line via [`render_fire`].
 pub fn collect_close_fires(replay: &Replay) -> Vec<CloseFire> {
     replay
         .fires
         .iter()
         .filter(|f| f.fired.intent.action == Action::Close)
+        .filter(|f| close_gate_passes(f))
         .map(|f| CloseFire {
             at: f.fired.candle.time,
             price: f.fired.candle.c,
@@ -63,7 +92,8 @@ pub fn collect_close_fires(replay: &Replay) -> Vec<CloseFire> {
 ///   before* that exit bar; a close on/after the SL/TP bar is moot (the position
 ///   was already flat). Ties go to the SL/TP (the simulator's pessimistic
 ///   stance, and the close can't pre-empt an exit that already happened).
-/// - `NeverFilled` / `Declined` / `Unresolved` → untouched (no open position).
+/// - `NeverFilled` / `Declined` / `SpreadBlackout` / `Unresolved` → untouched
+///   (no open position).
 ///
 /// Returns the (possibly overridden) outcome; on override it's the new
 /// [`ReplayOutcome::ClosedOnReversal`] carrying the close bar + price.
@@ -86,7 +116,10 @@ fn apply_reversal_close(outcome: SimOutcome, closes: &[CloseFire]) -> ReplayOutc
             ..
         } => (*fill_at, *entry_price, Some(*exit_at)),
         // No open position to close.
-        SimOutcome::NeverFilled | SimOutcome::Declined { .. } | SimOutcome::Unresolved(_) => {
+        SimOutcome::NeverFilled
+        | SimOutcome::Declined { .. }
+        | SimOutcome::SpreadBlackout { .. }
+        | SimOutcome::Unresolved(_) => {
             return ReplayOutcome::Sim(outcome);
         }
     };
@@ -147,12 +180,15 @@ pub enum FillKind {
     NeverFilled,
     /// An entry the worker declined to place (entry past a gate level). Not taken.
     Declined,
+    /// An entry the worker's spread-blackout gate would have rejected (fire-bar
+    /// spread above threshold inside the NY-close-edge window). Not taken.
+    SpreadBlackout,
 }
 
 impl FillKind {
     /// Was this position actually taken (an order filled)? `false` for the
-    /// not-taken kinds (`NeverFilled` / `Declined`), which only have an
-    /// *intended* bracket, anchored at the fire bar.
+    /// not-taken kinds (`NeverFilled` / `Declined` / `SpreadBlackout`), which
+    /// only have an *intended* bracket, anchored at the fire bar.
     pub fn is_taken(self) -> bool {
         matches!(
             self,
@@ -271,6 +307,12 @@ pub fn resolve_fire_any(plan: &TradePlan, fire: &Fire, closes: &[CloseFire]) -> 
                 resolved.entry.reference_price(),
                 FillKind::Declined,
             ),
+            SimOutcome::SpreadBlackout { .. } => (
+                fire_at,
+                window_end,
+                resolved.entry.reference_price(),
+                FillKind::SpreadBlackout,
+            ),
             // Nothing meaningful to draw.
             SimOutcome::Unresolved(_) => return None,
         },
@@ -286,8 +328,18 @@ pub fn resolve_fire_any(plan: &TradePlan, fire: &Fire, closes: &[CloseFire]) -> 
     })
 }
 
-/// Render the full replay report as a string.
-pub fn render(plan: &TradePlan, replay: &Replay, simulate: bool) -> String {
+/// Render the full replay report as a string. When `verbose` is set, a
+/// bar-by-bar trace of the engine's silent state changes (phase moves, the
+/// break-and-close / retest stamps, fires) is printed first — the events the
+/// per-fire report below can't show (notably the retest, which never fires an
+/// intent).
+pub fn render(
+    plan: &TradePlan,
+    replay: &Replay,
+    simulate: bool,
+    verbose: bool,
+    blackout_windows: &[NoEntryWindow],
+) -> String {
     let mut out = String::new();
     out.push_str(&format!(
         "Plan {} ({}, {:?}) — {} fire(s) over the window\n",
@@ -296,6 +348,10 @@ pub fn render(plan: &TradePlan, replay: &Replay, simulate: bool) -> String {
         plan.granularity,
         replay.fires.len()
     ));
+
+    if verbose {
+        out.push_str(&render_trace(replay));
+    }
 
     let closes = collect_close_fires(replay);
     let mut wins = 0usize;
@@ -307,6 +363,7 @@ pub fn render(plan: &TradePlan, replay: &Replay, simulate: bool) -> String {
             fire,
             simulate,
             &closes,
+            blackout_windows,
             &mut wins,
             &mut losses,
             &mut reversal_closes,
@@ -336,12 +393,34 @@ pub fn render(plan: &TradePlan, replay: &Replay, simulate: bool) -> String {
     out
 }
 
+/// Render the `--verbose` bar-by-bar trace: every live bar on which the engine
+/// did something (a phase move, a break-and-close / retest stamp, or a fire),
+/// in order. Quiet bars are omitted. Returns a short note when no bar was
+/// noteworthy (e.g. a window that only ever seeded), so `--verbose` is never
+/// silently empty.
+fn render_trace(replay: &Replay) -> String {
+    let mut out = String::from("\nBar-by-bar engine trace (--verbose):\n");
+    let mut any = false;
+    for trace in &replay.traces {
+        let block = trace.render();
+        if !block.is_empty() {
+            out.push_str(&block);
+            any = true;
+        }
+    }
+    if !any {
+        out.push_str("  (no phase moves, stamps, or fires — every live bar seeded silently)\n");
+    }
+    out
+}
+
 #[allow(clippy::too_many_arguments)]
 fn render_fire(
     plan: &TradePlan,
     fire: &Fire,
     simulate: bool,
     closes: &[CloseFire],
+    blackout_windows: &[NoEntryWindow],
     wins: &mut usize,
     losses: &mut usize,
     reversal_closes: &mut usize,
@@ -368,13 +447,25 @@ fn render_fire(
     }
     if intent.action == Action::Close {
         // A close fire has no fill of its own — it flattens whatever enter is
-        // open. Surface it so the reversal exit is legible next to the enter it
-        // closes (which renders its own `CLOSED ON REVERSAL` fill line).
-        line.push_str(&format!(
-            "    close-on-reversal: reversal candle @ {} (close {}) — flattens the open position\n",
-            bne(candle.time),
-            candle.c
-        ));
+        // open. The worker's `allow_close` gate (shared core) can block it: a
+        // blocked close keeps the position OPEN, so it must NOT flatten the
+        // simulated enter (it's already excluded from `collect_close_fires`).
+        // Surface either case so the reversal exit is legible next to the enter
+        // it closes (which renders its own `CLOSED ON REVERSAL` fill line when
+        // the gate passes).
+        if close_gate_passes(fire) {
+            line.push_str(&format!(
+                "    close-on-reversal: reversal candle @ {} (close {}) — flattens the open position\n",
+                bne(candle.time),
+                candle.c
+            ));
+        } else {
+            line.push_str(&format!(
+                "    close: BLOCKED by allow_close gate (position stays open) @ {} (close {})\n",
+                bne(candle.time),
+                candle.c
+            ));
+        }
         return line;
     }
     if intent.action != Action::Enter {
@@ -419,6 +510,53 @@ fn render_fire(
         return line;
     }
 
+    // Pre-broker entry gate: the worker's `run_enter` rejects an enter whose
+    // `allow_entry` script returns false/errors, or whose `needs_golden` /
+    // `needs_confirmed` candle-quality requirement the (signal-folded) shell
+    // doesn't meet — before any order is placed. `simulate_fill` only knows the
+    // price path, so without this it would FILL an order the live worker would
+    // have REJECTED. Both gates now live in shared `core` (applied identically
+    // live and here), so surface the block and don't simulate a fill or tally it.
+    if let Some(block) = entry_gate_block(intent, &shell, plan.pip_size) {
+        line.push_str(&format!(
+            "    fill: {} → NO FILL / 0R\n",
+            describe_gate_block(&block)
+        ));
+        return line;
+    }
+
+    // Break-even arming: the bar whose close runs past the threshold
+    // (50%-to-TP by default). In production the live cron (`breakeven_watch`)
+    // sends `amend_stop(entry)` to the broker on the tick that observes this
+    // candle; surface it so the journal shows *when* the SL moved to break-even
+    // (otherwise a BREAK-EVEN stop-out below looks like it came from nowhere).
+    if let Some(armed_at) = breakeven_armed_at(intent, &shell, plan.pip_size, &fire.forward) {
+        line.push_str(&format!(
+            "    be: SL→break-even @ {} (a candle closed past 50%-to-TP; live cron amends the broker SL here)\n",
+            bne(armed_at)
+        ));
+    }
+
+    // Spread-widen (System 2): a post-fill bar whose spread reaches the widen
+    // trigger moves the broker SL *away* from price (live cron
+    // `blackout_apply`). A widened stop changes the exit price, so surface it —
+    // otherwise a wider-than-bracket stop-out below looks wrong. The trigger is
+    // the instrument's *real* spread-blackout threshold (`baseline × 5`), now
+    // that the baked baseline lives in shared `core` and the engine links it —
+    // the same `elevated_threshold_pips` the System-1 entry-reject uses, so the
+    // two stay exact and in lockstep with the live worker.
+    let widen_trigger = elevated_threshold_pips(&intent.instrument);
+    if let Some(widen) =
+        widened_stop_at(intent, &shell, plan.pip_size, &fire.forward, widen_trigger)
+    {
+        line.push_str(&format!(
+            "    exit: SL widened to {} (spread blackout System 2) @ {} (from {})\n",
+            fmt_price(widen.widened_stop, plan.pip_size),
+            bne(widen.at),
+            fmt_price(widen.original_stop, plan.pip_size)
+        ));
+    }
+
     let raw = simulate_fill(intent, &shell, plan.pip_size, &fire.forward);
     match apply_reversal_close(raw, closes) {
         ReplayOutcome::ClosedOnReversal {
@@ -434,7 +572,25 @@ fn render_fire(
             *reversal_closes += 1;
         }
         ReplayOutcome::Sim(outcome) => {
-            line.push_str(&format!("    {}\n", describe_outcome(&outcome)));
+            // A `NeverFilled` order isn't necessarily one that passively never
+            // triggered — the live cron sweep actively cancels a still-resting
+            // order once its window expires, its bar-expiry passes, or price
+            // overtakes its SL. Surface *why* the worker would have swept it so
+            // the replay distinguishes a swept order from an untriggered one.
+            let detail = match &outcome {
+                SimOutcome::NeverFilled => {
+                    let swept = sweep_reason(
+                        intent,
+                        &shell,
+                        plan.pip_size,
+                        &fire.forward,
+                        blackout_windows,
+                    );
+                    describe_never_filled(swept)
+                }
+                other => describe_outcome(other),
+            };
+            line.push_str(&format!("    {detail}\n"));
             match outcome {
                 SimOutcome::TookProfit { .. } => *wins += 1,
                 SimOutcome::StoppedOut { .. } => *losses += 1,
@@ -526,6 +682,31 @@ fn fmt_price(price: f64, pip_size: f64) -> String {
     format!("{price:.decimals$}")
 }
 
+/// The `NEVER FILLED` line, annotated with the sweep reason when the live cron
+/// would have actively cancelled the resting order (vs it simply never
+/// triggering). `swept` is `sweep_reason`'s verdict: `None` keeps the plain
+/// wording (the order simply never triggered, or no market-hours window source
+/// was available so the blackout branch couldn't fire).
+fn describe_never_filled(swept: Option<(SweepReason, DateTime<Utc>)>) -> String {
+    match swept {
+        Some((SweepReason::SlBreached, at)) => format!(
+            "fill: NEVER FILLED — swept: SL breached @ {} (live cron cancels the resting order here)",
+            bne(at)
+        ),
+        Some((SweepReason::BarExpiry, at)) => {
+            format!("fill: NEVER FILLED — swept: bar-expiry @ {}", bne(at))
+        }
+        Some((SweepReason::Expired, at)) => {
+            format!("fill: NEVER FILLED — alert-window expired @ {}", bne(at))
+        }
+        Some((SweepReason::Blackout, at)) => format!(
+            "fill: NEVER FILLED — swept: market-hours blackout @ {} (live cron cancels the resting order as the session closes)",
+            bne(at)
+        ),
+        None => "fill: NEVER FILLED (pending order untriggered in window)".to_string(),
+    }
+}
+
 fn describe_outcome(outcome: &SimOutcome) -> String {
     match outcome {
         SimOutcome::NeverFilled => {
@@ -572,6 +753,26 @@ fn describe_outcome(outcome: &SimOutcome) -> String {
         SimOutcome::Declined { name } => {
             format!("fill: DECLINED — entry past the {name} level (no order placed)")
         }
+        SimOutcome::SpreadBlackout {
+            spread_pips,
+            threshold_pips,
+        } => format!(
+            "spread: REJECTED — spread {spread_pips:.1}p > {threshold_pips:.1}p threshold inside the NY-close-edge window (no order placed; live worker 423s)"
+        ),
+    }
+}
+
+/// Human-readable line for a pre-broker entry-gate rejection (the worker's
+/// `allow_entry` script + candle-quality gate, now applied in replay via the
+/// shared core gate). The caller prefixes `fill: ` and suffixes the `0R` tally.
+fn describe_gate_block(block: &GateBlock) -> String {
+    match block {
+        GateBlock::AllowEntryFalse => "BLOCKED by allow_entry script (returned false)".into(),
+        GateBlock::AllowEntryScriptError { kind, message } => {
+            format!("BLOCKED by allow_entry script ({kind} error: {message})")
+        }
+        GateBlock::NeedsGoldenUnmet => "BLOCKED — golden candle required, not present".into(),
+        GateBlock::NeedsConfirmedUnmet => "BLOCKED — confirmed signal required, not present".into(),
     }
 }
 
@@ -595,6 +796,31 @@ mod tests {
             recover_entry: None,
             breakeven: None,
         }
+    }
+
+    #[test]
+    fn gate_block_renders_each_reason() {
+        // The exact strings the replay journal prints when the worker's
+        // pre-broker entry gate would have rejected the fill.
+        assert_eq!(
+            describe_gate_block(&GateBlock::AllowEntryFalse),
+            "BLOCKED by allow_entry script (returned false)"
+        );
+        assert_eq!(
+            describe_gate_block(&GateBlock::NeedsGoldenUnmet),
+            "BLOCKED — golden candle required, not present"
+        );
+        assert_eq!(
+            describe_gate_block(&GateBlock::NeedsConfirmedUnmet),
+            "BLOCKED — confirmed signal required, not present"
+        );
+        assert_eq!(
+            describe_gate_block(&GateBlock::AllowEntryScriptError {
+                kind: "parse",
+                message: "boom".into(),
+            }),
+            "BLOCKED by allow_entry script (parse error: boom)"
+        );
     }
 
     #[test]

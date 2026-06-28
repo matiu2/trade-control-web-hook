@@ -6,13 +6,17 @@
 //! before any Rhai engine spin-up); both reject when the relevant shell
 //! field is anything other than `Some(true)`.
 //!
-//! Reused by [`crate::allow_entry_gate`] (Enter path) and
-//! [`crate::allow_close_gate`] (Close path on the consolidated reversal
-//! template). AND-composed with the action's script gate — both this
-//! check and `allow_entry` / `allow_close` must pass for the dispatch
-//! to reach the broker.
+//! Reused by [`crate::allow_entry_gate`] (Enter path) and the worker's
+//! `allow_close_gate` (Close path on the consolidated reversal template).
+//! AND-composed with the action's script gate — both this check and
+//! `allow_entry` / `allow_close` must pass for the dispatch to reach the
+//! broker.
+//!
+//! Lives in `core` so **both** the live worker and the offline replay
+//! (`engine::simulator`) apply the same candle-quality gate; the worker
+//! re-exports it so its call sites are unchanged.
 
-use trade_control_core::intent::{Intent, Shell};
+use crate::intent::{Intent, Shell};
 
 /// Outcome of the candle-quality gate. Maps onto a 412 rejection at the
 /// dispatch layer; the variant tells the rejection-outcome string which
@@ -46,11 +50,11 @@ pub fn evaluate(intent: &Intent, shell: &Shell) -> CandleGateOutcome {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::{DateTime, Utc};
-    use trade_control_core::intent::{
+    use crate::intent::{
         Action, BrokerKind, Direction, EntrySpec, PriceAnchor, PriceRef, TakeProfit,
     };
-    use trade_control_core::tunable::Tunable;
+    use crate::tunable::Tunable;
+    use chrono::{DateTime, Utc};
 
     fn ts(s: &str) -> DateTime<Utc> {
         s.parse().unwrap()
@@ -134,7 +138,7 @@ mod tests {
             mw: None,
             pip_size: None,
             trade_plan: None,
-            blackout_close: trade_control_core::intent::BlackoutCloseAction::default(),
+            blackout_close: crate::intent::BlackoutCloseAction::default(),
             breakeven: None,
             include_archived: false,
         }

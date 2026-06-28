@@ -60,7 +60,11 @@ mod evaluate;
 pub use evaluate::{eval_trigger, evaluate_plan, initial_phase, seed_plan_state};
 
 mod simulator;
-pub use simulator::{SimOutcome, direction_of, simulate_fill};
+pub use simulator::{
+    GateBlock, SimOutcome, SpreadWiden, breakeven_armed_at, direction_of, entry_gate_block,
+    simulate_fill, sweep_reason, widened_stop_at,
+};
+pub use trade_control_core::sweep_gate::SweepReason;
 
 #[cfg(test)]
 mod tests {

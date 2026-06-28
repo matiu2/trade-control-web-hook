@@ -14,11 +14,14 @@
 
 use chrono::{DateTime, Utc};
 use trade_control_core::broker::Broker;
-use trade_control_core::intent::{
-    BlackoutCloseAction, BrokerKind, Direction, NoEntryWindow, is_inside_any,
-};
+use trade_control_core::intent::{BlackoutCloseAction, BrokerKind};
 use trade_control_core::state::{EntryAttempt, StateStore};
 use worker::Env;
+
+// The pure sweep predicates now live in `core` so the offline replay can share
+// them (the `[[strategy_changes_in_both_replayer_and_worker]]` rule). Imported
+// here so every call site in this file stays byte-unchanged.
+use trade_control_core::sweep_gate::{bar_expiry_due, breach_detected, market_blackout_due};
 
 use crate::state::KvStateStore;
 
@@ -54,33 +57,6 @@ pub async fn sweep_pending_orders(env: &Env, now: DateTime<Utc>) {
             );
         }
     }
-}
-
-/// Pure breach predicate. Long is breached when current ≤ SL; short
-/// when current ≥ SL. Kept tiny and pure so it's trivially testable.
-pub fn breach_detected(direction: Direction, current_price: f64, stop_loss: f64) -> bool {
-    match direction {
-        Direction::Long => current_price <= stop_loss,
-        Direction::Short => current_price >= stop_loss,
-    }
-}
-
-/// Pure bar-expiry predicate: true iff the row carries a `cancel_at`
-/// that has passed. Mirrors [`breach_detected`] — tiny and pure so the
-/// sweep ordering can be asserted without a broker/env.
-pub fn bar_expiry_due(cancel_at: Option<DateTime<Utc>>, now: DateTime<Utc>) -> bool {
-    cancel_at.is_some_and(|c| c < now)
-}
-
-/// Pure market-hours-blackout predicate: true iff `now` falls inside any of
-/// the instrument's derived no-entry windows. Tiny and pure (delegates to
-/// the core [`is_inside_any`]) so the sweep ordering can be asserted without
-/// a broker/env. Empty `windows` (24h markets / unparseable session text /
-/// not-yet-refreshed) ⇒ `false` — the sweep leaves the order alone, matching
-/// the reject gate's fail-open.
-pub fn market_blackout_due(windows: &[NoEntryWindow], now: DateTime<Utc>) -> bool {
-    let now_min = crate::market_blackout::now_utc_minute_of_day(now);
-    is_inside_any(now_min, windows)
 }
 
 /// Per-attempt sweep. Splits the three reasons to act (expired, SL
@@ -373,94 +349,6 @@ async fn resolve_broker_kind(env: &Env, account: Option<&str>) -> Option<BrokerK
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn long_breach_when_price_at_or_below_sl() {
-        assert!(breach_detected(Direction::Long, 1.0500, 1.0500));
-        assert!(breach_detected(Direction::Long, 1.0499, 1.0500));
-        assert!(!breach_detected(Direction::Long, 1.0501, 1.0500));
-    }
-
-    #[test]
-    fn short_breach_when_price_at_or_above_sl() {
-        assert!(breach_detected(Direction::Short, 1.0500, 1.0500));
-        assert!(breach_detected(Direction::Short, 1.0501, 1.0500));
-        assert!(!breach_detected(Direction::Short, 1.0499, 1.0500));
-    }
-
-    fn ts(s: &str) -> DateTime<Utc> {
-        s.parse().unwrap()
-    }
-
-    #[test]
-    fn bar_expiry_due_when_cancel_at_passed() {
-        let now = ts("2026-05-13T15:00:00Z");
-        assert!(bar_expiry_due(Some(ts("2026-05-13T14:59:59Z")), now));
-    }
-
-    #[test]
-    fn bar_expiry_not_due_when_cancel_at_future() {
-        let now = ts("2026-05-13T15:00:00Z");
-        assert!(!bar_expiry_due(Some(ts("2026-05-13T15:00:01Z")), now));
-    }
-
-    #[test]
-    fn bar_expiry_not_due_when_unset() {
-        // Legacy rows / orders without a bar-expiry carry None — the
-        // sweep must fall through to the SL/expires_at paths untouched.
-        let now = ts("2026-05-13T15:00:00Z");
-        assert!(!bar_expiry_due(None, now));
-    }
-
-    #[test]
-    fn market_blackout_not_due_when_no_windows() {
-        // 24h markets / unparseable session text / not-yet-refreshed all
-        // surface as an empty window set — the sweep must leave the order
-        // alone (fail-open), matching the reject gate.
-        let now = ts("2026-05-13T15:00:00Z");
-        assert!(!market_blackout_due(&[], now));
-    }
-
-    #[test]
-    fn market_blackout_due_when_now_inside_window() {
-        // Window 14:00–16:00 UTC (840..960 minutes-of-day); 15:00 is inside.
-        let windows = [NoEntryWindow {
-            open_min: 14 * 60,
-            close_min: 16 * 60,
-        }];
-        let now = ts("2026-05-13T15:00:00Z");
-        assert!(market_blackout_due(&windows, now));
-    }
-
-    #[test]
-    fn market_blackout_not_due_when_now_outside_window() {
-        // 15:00 UTC is outside an 18:00–20:00 window.
-        let windows = [NoEntryWindow {
-            open_min: 18 * 60,
-            close_min: 20 * 60,
-        }];
-        let now = ts("2026-05-13T15:00:00Z");
-        assert!(!market_blackout_due(&windows, now));
-    }
-
-    #[test]
-    fn market_blackout_due_matches_any_of_several_windows() {
-        // Several daily gaps (e.g. a maintenance gap + the overnight gap):
-        // due iff inside ANY one of them. 15:00 hits the second.
-        let windows = [
-            NoEntryWindow {
-                open_min: 2 * 60,
-                close_min: 3 * 60,
-            },
-            NoEntryWindow {
-                open_min: 14 * 60,
-                close_min: 16 * 60,
-            },
-        ];
-        let now = ts("2026-05-13T15:00:00Z");
-        assert!(market_blackout_due(&windows, now));
-    }
-}
+// The pure predicate unit tests (`breach_detected`, `bar_expiry_due`,
+// `market_blackout_due`, `now_utc_minute_of_day`) moved with the predicates to
+// `trade_control_core::sweep_gate` — see its `#[cfg(test)] mod tests`.
