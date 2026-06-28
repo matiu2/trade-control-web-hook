@@ -47,6 +47,7 @@ mod replay_candles {
     pub mod report;
     pub mod source;
     pub mod tv;
+    pub mod verbose;
 }
 
 use std::fs;
@@ -114,6 +115,14 @@ struct Args {
     /// Run the fill simulator on each fired enter (default on).
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     simulate: bool,
+
+    /// Print a bar-by-bar trace of the engine's silent state changes before the
+    /// fire report: phase transitions, the break-and-close stamp, and the
+    /// **retest stamp** (which never fires an intent, so it's invisible in the
+    /// normal report). Quiet bars are omitted. For debugging "why did/didn't the
+    /// entry fire" — it shows exactly which bar armed the retest gate.
+    #[arg(long, visible_alias = "all-events", default_value_t = false)]
+    verbose: bool,
 
     /// After replaying, draw each *filled* position onto the live TradingView
     /// chart (two rectangles per trade: entry→TP green, entry→SL red), spanning
@@ -295,7 +304,7 @@ async fn main() -> Result<()> {
     let expires_at = end + Duration::days(365);
     let replay = replay::run(&plan, &candles, gran.engine(), start, expires_at).await;
 
-    print!("{}", report::render(&plan, &replay, simulate));
+    print!("{}", report::render(&plan, &replay, simulate, args.verbose));
 
     if annotate {
         let mcp = match &args.tv_mcp_root {
@@ -357,7 +366,10 @@ async fn run_test_mode(args: &Args) -> Result<()> {
     )
     .await;
 
-    print!("{}", report::render(&inputs.plan, &replay, args.simulate));
+    print!(
+        "{}",
+        report::render(&inputs.plan, &replay, args.simulate, args.verbose)
+    );
 
     if args.check {
         let computed = ReplayOutcome::compute(&inputs.plan, &replay, args.simulate);
@@ -667,6 +679,7 @@ mod tests {
             end: None,
             tv_mcp_root: None,
             simulate: true,
+            verbose: false,
             annotate: false,
             annotate_unfilled: false,
             warmup_bars: 200,

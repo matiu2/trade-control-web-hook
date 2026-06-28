@@ -19,6 +19,7 @@ use trade_control_engine::{
 };
 
 use super::replay_broker::ReplayBroker;
+use super::verbose::BarTrace;
 
 /// One fired intent plus the forward candle path needed to simulate its fill.
 pub struct Fire {
@@ -53,6 +54,11 @@ pub struct Replay {
     pub done: bool,
     /// Distinct warnings surfaced by the evaluator (deduped, in first-seen order).
     pub warnings: Vec<String>,
+    /// Per-live-bar state-delta trace for `--verbose`: what the engine changed
+    /// each tick (phase, the break-and-close / retest stamps, fired rules) — the
+    /// silent state moves the fire report can't show. One entry per evaluated
+    /// live bar, in order; quiet bars are kept here and skipped at render time.
+    pub traces: Vec<BarTrace>,
 }
 
 /// Minimum number of leading candles used to seed the FSM without firing. A
@@ -96,6 +102,7 @@ pub async fn run(
             final_state: seed_plan_state(plan, &mid, expires_at),
             done: false,
             warnings: Vec::new(),
+            traces: Vec::new(),
         };
     }
 
@@ -114,6 +121,7 @@ pub async fn run(
 
     let mut fires = Vec::new();
     let mut warnings: Vec<String> = Vec::new();
+    let mut traces: Vec<BarTrace> = Vec::new();
     let mut done = false;
 
     // Multi-shot plumbing: the SAME async retry gate the worker runs, backed by
@@ -153,8 +161,22 @@ pub async fn run(
             "tick: evaluating live bar"
         );
 
+        // Snapshot the pre-tick state so `--verbose` can report exactly what the
+        // engine changed this bar — phase moves and the break-and-close / retest
+        // stamps are silent in the fire report (retest never even fires an
+        // intent). A cheap clone; the diff is a pure `PlanState` comparison.
+        let before = state.clone();
+
         let eval = evaluate_plan(plan, &state, new, detector_window, now, expires_at);
         state = eval.new_state;
+
+        let fired_rules: Vec<String> = eval.fired.iter().map(|f| f.rule_id.clone()).collect();
+        traces.push(BarTrace::diff(
+            candles[i].time,
+            &before,
+            &state,
+            fired_rules,
+        ));
 
         for warning in eval.warnings {
             if !warnings.contains(&warning) {
@@ -248,6 +270,7 @@ pub async fn run(
         final_state: state,
         done,
         warnings,
+        traces,
     }
 }
 
@@ -554,7 +577,12 @@ mod tests {
         );
 
         // And the report must show the skip, not a fabricated fill.
-        let report = crate::report::render(&paused_enter_plan(pause_epoch, resume_epoch), &r, true);
+        let report = crate::report::render(
+            &paused_enter_plan(pause_epoch, resume_epoch),
+            &r,
+            true,
+            false,
+        );
         assert!(
             report.contains("SUPPRESSED") && report.contains("NO FILL"),
             "report must show the paused enter as a 0R skip:\n{report}"
@@ -595,7 +623,7 @@ mod tests {
             enter.suppressed_by.is_none(),
             "no active pause at the enter bar → not suppressed"
         );
-        let report = crate::report::render(&paused_enter_plan(3600, 2 * 3600), &r, true);
+        let report = crate::report::render(&paused_enter_plan(3600, 2 * 3600), &r, true, false);
         assert!(
             report.contains("TP: 1"),
             "without an active blackout the enter fills and takes profit:\n{report}"
@@ -846,7 +874,7 @@ mod tests {
         // The report must reflect this: the superseded stop shows SUPERSEDED (no
         // fabricated fill), and exactly one trade is tallied (the limit's TP) —
         // not two overlapping positions.
-        let report = crate::report::render(&two_enter_v2_plan(), &r, true);
+        let report = crate::report::render(&two_enter_v2_plan(), &r, true, false);
         assert!(
             report.contains("SUPERSEDED"),
             "report must show the cancelled stop as SUPERSEDED:\n{report}"
@@ -949,7 +977,7 @@ mod tests {
         assert!(r.done, "a terminal close retires the plan");
 
         // The replay report shows the short CLOSED ON REVERSAL, not held open.
-        let report = crate::report::render(&plan, &r, true);
+        let report = crate::report::render(&plan, &r, true, false);
         assert!(
             report.contains("CLOSED ON REVERSAL"),
             "the open short must close on the reversal candle:\n{report}"

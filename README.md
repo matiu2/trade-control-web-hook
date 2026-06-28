@@ -1297,6 +1297,37 @@ under `REV:` (distinct from `TP:` / `SL:`). This matches the live worker, whose
 `run_close` flattens the broker position on the same fire; before the fix the
 close was inert and the position over-held to SL/TP/window-end.
 
+**Seeing the engine's silent state changes (`--verbose` / `--all-events`).**
+The normal report lists only *fires* — intents the engine emits. But the engine
+also advances state per bar that fires nothing: the spine phase
+(`AwaitBreakAndClose → AwaitEntry → Done`), the break-and-close stamp, and —
+most confusingly — the **retest stamp**. Retest is *not* an emitted prep; it's a
+retroactive `retest_seen_at` lookback that the entry gate reads. So a plan whose
+`requires_preps` lists `retest` will never show a "retest" fire, which reads like
+the step was skipped when it wasn't. `--verbose` (alias `--all-events`) prints a
+bar-by-bar trace of these state moves *before* the fire report, showing exactly
+which bar stamped the retest and when the spine advanced (quiet bars are
+omitted):
+
+```sh
+replay-candles --plan plan.json --verbose
+```
+
+```text
+Bar-by-bar engine trace (--verbose):
+  bar 2026-06-23 15:00:00 +10:00 phase=AwaitEntry
+    phase AwaitBreakAndClose→AwaitEntry
+    ✓ break-and-close stamped (spine → AwaitEntry)
+    → fired 03-prep-break-and-close
+  bar 2026-06-23 16:00:00 +10:00 phase=AwaitEntry
+    ✓ retest stamped (entry gate now satisfied)
+  bar 2026-06-23 18:00:00 +10:00 phase=AwaitEntry
+    → fired 05-enter
+```
+
+It's a pure diff of the `PlanState` before/after each tick — no engine change,
+no extra evaluation — so it's always safe to add to any replay.
+
 **Freezing a known-good run as a regression fixture.** When a replay is
 producing the verdict you want, add `--save <name>` to freeze that run into
 `replay-fixtures/<name>/` — four JSON files: the `plan`, the **exact candle

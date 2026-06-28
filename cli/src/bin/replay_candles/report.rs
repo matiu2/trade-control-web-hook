@@ -286,8 +286,12 @@ pub fn resolve_fire_any(plan: &TradePlan, fire: &Fire, closes: &[CloseFire]) -> 
     })
 }
 
-/// Render the full replay report as a string.
-pub fn render(plan: &TradePlan, replay: &Replay, simulate: bool) -> String {
+/// Render the full replay report as a string. When `verbose` is set, a
+/// bar-by-bar trace of the engine's silent state changes (phase moves, the
+/// break-and-close / retest stamps, fires) is printed first — the events the
+/// per-fire report below can't show (notably the retest, which never fires an
+/// intent).
+pub fn render(plan: &TradePlan, replay: &Replay, simulate: bool, verbose: bool) -> String {
     let mut out = String::new();
     out.push_str(&format!(
         "Plan {} ({}, {:?}) — {} fire(s) over the window\n",
@@ -296,6 +300,10 @@ pub fn render(plan: &TradePlan, replay: &Replay, simulate: bool) -> String {
         plan.granularity,
         replay.fires.len()
     ));
+
+    if verbose {
+        out.push_str(&render_trace(replay));
+    }
 
     let closes = collect_close_fires(replay);
     let mut wins = 0usize;
@@ -333,6 +341,27 @@ pub fn render(plan: &TradePlan, replay: &Replay, simulate: bool) -> String {
         }
     }
     out.push('\n');
+    out
+}
+
+/// Render the `--verbose` bar-by-bar trace: every live bar on which the engine
+/// did something (a phase move, a break-and-close / retest stamp, or a fire),
+/// in order. Quiet bars are omitted. Returns a short note when no bar was
+/// noteworthy (e.g. a window that only ever seeded), so `--verbose` is never
+/// silently empty.
+fn render_trace(replay: &Replay) -> String {
+    let mut out = String::from("\nBar-by-bar engine trace (--verbose):\n");
+    let mut any = false;
+    for trace in &replay.traces {
+        let block = trace.render();
+        if !block.is_empty() {
+            out.push_str(&block);
+            any = true;
+        }
+    }
+    if !any {
+        out.push_str("  (no phase moves, stamps, or fires — every live bar seeded silently)\n");
+    }
     out
 }
 
