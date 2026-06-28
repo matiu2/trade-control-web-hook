@@ -19,10 +19,11 @@
 //! is what flattens the broker position live.
 
 use chrono::{DateTime, Utc};
+use trade_control_core::blackout_widen::WIDEN_FLOOR_PIPS;
 use trade_control_core::intent::{Action, Direction, Resolved, ResolvedEntry, Shell};
 use trade_control_engine::{
     GateBlock, SimOutcome, SweepReason, TradePlan, breakeven_armed_at, entry_gate_block,
-    simulate_fill, sweep_reason,
+    simulate_fill, sweep_reason, widened_stop_at,
 };
 
 use super::brisbane::bne;
@@ -39,16 +40,39 @@ pub struct CloseFire {
     pub price: f64,
 }
 
-/// Every `Action::Close` fire in the replay, in fire order, reduced to
-/// [`CloseFire`]s. The fill resolution consults these to exit an open position
-/// on a reversal candle — the engine now fires the close (a `PinePattern`
-/// guard), but the pure per-enter `simulate_fill` only knows SL/TP, so the
-/// replay must apply the close itself.
+/// Whether the worker's `allow_close` gate would let this close flatten the
+/// position. The live worker runs the shared
+/// [`trade_control_core::allow_close_gate::evaluate`] on every `run_close`; a
+/// non-`Proceed` outcome (`allow_close` false, a script error, or an unmet
+/// `needs_golden` / `needs_confirmed`) is a 412 that leaves the position OPEN.
+/// Without this the replay would close it and diverge from the live worker.
+fn close_gate_passes(fire: &Fire) -> bool {
+    let intent = &fire.fired.intent;
+    let candle = &fire.fired.candle;
+    let shell = match &fire.fired.signal {
+        Some(sig) => Shell::from_candle_and_signal(candle, sig),
+        None => Shell::from_candle(candle),
+    };
+    matches!(
+        trade_control_core::allow_close_gate::evaluate(intent, &shell),
+        trade_control_core::allow_close_gate::AllowCloseOutcome::Proceed
+    )
+}
+
+/// Every `Action::Close` fire in the replay **whose `allow_close` gate passes**,
+/// in fire order, reduced to [`CloseFire`]s. The fill resolution consults these
+/// to exit an open position on a reversal candle — the engine now fires the
+/// close (a `PinePattern` guard), but the pure per-enter `simulate_fill` only
+/// knows SL/TP, so the replay must apply the close itself. A close the
+/// `allow_close` gate would block is dropped here so the position stays open
+/// (matching the live worker); the blocked close still renders its own
+/// `BLOCKED` line via [`render_fire`].
 pub fn collect_close_fires(replay: &Replay) -> Vec<CloseFire> {
     replay
         .fires
         .iter()
         .filter(|f| f.fired.intent.action == Action::Close)
+        .filter(|f| close_gate_passes(f))
         .map(|f| CloseFire {
             at: f.fired.candle.time,
             price: f.fired.candle.c,
@@ -413,13 +437,25 @@ fn render_fire(
     }
     if intent.action == Action::Close {
         // A close fire has no fill of its own — it flattens whatever enter is
-        // open. Surface it so the reversal exit is legible next to the enter it
-        // closes (which renders its own `CLOSED ON REVERSAL` fill line).
-        line.push_str(&format!(
-            "    close-on-reversal: reversal candle @ {} (close {}) — flattens the open position\n",
-            bne(candle.time),
-            candle.c
-        ));
+        // open. The worker's `allow_close` gate (shared core) can block it: a
+        // blocked close keeps the position OPEN, so it must NOT flatten the
+        // simulated enter (it's already excluded from `collect_close_fires`).
+        // Surface either case so the reversal exit is legible next to the enter
+        // it closes (which renders its own `CLOSED ON REVERSAL` fill line when
+        // the gate passes).
+        if close_gate_passes(fire) {
+            line.push_str(&format!(
+                "    close-on-reversal: reversal candle @ {} (close {}) — flattens the open position\n",
+                bne(candle.time),
+                candle.c
+            ));
+        } else {
+            line.push_str(&format!(
+                "    close: BLOCKED by allow_close gate (position stays open) @ {} (close {})\n",
+                bne(candle.time),
+                candle.c
+            ));
+        }
         return line;
     }
     if intent.action != Action::Enter {
@@ -488,6 +524,27 @@ fn render_fire(
         line.push_str(&format!(
             "    be: SL→break-even @ {} (a candle closed past 50%-to-TP; live cron amends the broker SL here)\n",
             bne(armed_at)
+        ));
+    }
+
+    // Spread-widen (System 2): a post-fill bar whose spread reaches the widen
+    // trigger moves the broker SL *away* from price (live cron
+    // `blackout_apply`). A widened stop changes the exit price, so surface it —
+    // otherwise a wider-than-bracket stop-out below looks wrong. The trigger is
+    // the `WIDEN_FLOOR_PIPS` proxy (the exact per-instrument threshold needs the
+    // worker-only spread-blackout baseline; see `widened_stop_at`'s TODO).
+    if let Some(widen) = widened_stop_at(
+        intent,
+        &shell,
+        plan.pip_size,
+        &fire.forward,
+        WIDEN_FLOOR_PIPS,
+    ) {
+        line.push_str(&format!(
+            "    exit: SL widened to {} (spread blackout System 2) @ {} (from {})\n",
+            fmt_price(widen.widened_stop, plan.pip_size),
+            bne(widen.at),
+            fmt_price(widen.original_stop, plan.pip_size)
         ));
     }
 
