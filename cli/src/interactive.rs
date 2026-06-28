@@ -101,6 +101,13 @@ pub fn fill_missing_fields(template: &mut Value, non_interactive: bool) -> Resul
     // Final validation: deserialize fully into `Intent` to surface any
     // structural mistakes (bad enum variants, wrong value types) before we
     // encrypt and the worker rejects it.
+    //
+    // NB: we deliberately don't run the full `Intent::validate()` here — the
+    // interactive driver fills templates for every action incrementally and
+    // some intermediate/manual shapes legitimately defer structural checks
+    // (e.g. trade_id) to the worker. The offset-spec mistakes the ATR buffer
+    // can introduce are caught by `validate()` in the pattern builders and by
+    // the resolver/worker; the manual path relies on those.
     let intent: Intent = serde_yaml::from_value(template.clone())
         .map_err(|e| eyre!("template doesn't parse as a valid Intent: {e}"))?;
 
@@ -692,9 +699,8 @@ fn prompt_entry(theme: &ColorfulTheme) -> Result<Value> {
     );
     if kinds[idx] != "market" {
         let anchor = prompt_anchor(theme, "entry trigger anchor")?;
-        let offset = prompt_float(theme, "entry offset_pips (signed)", Some(0.0))?;
-        map.insert(Value::String("from".into()), anchor);
-        map.insert(Value::String("offset_pips".into()), offset);
+        map.insert(Value::String("from".into()), anchor.clone());
+        prompt_offset(theme, "entry", &anchor, &mut map)?;
     }
     Ok(Value::Mapping(map))
 }
@@ -712,9 +718,8 @@ fn prompt_price_ref(theme: &ColorfulTheme, name: &str) -> Result<Value> {
     let mut map = serde_yaml::Mapping::new();
     if idx == 0 {
         let anchor = prompt_anchor(theme, &format!("{name} anchor"))?;
-        let offset = prompt_float(theme, &format!("{name} offset_pips (signed)"), Some(0.0))?;
-        map.insert(Value::String("from".into()), anchor);
-        map.insert(Value::String("offset_pips".into()), offset);
+        map.insert(Value::String("from".into()), anchor.clone());
+        prompt_offset(theme, name, &anchor, &mut map)?;
     } else {
         let price = prompt_float(theme, &format!("{name} absolute price"), None)?;
         map.insert(Value::String("absolute".into()), price);
@@ -743,9 +748,8 @@ fn prompt_take_profit(theme: &ColorfulTheme) -> Result<Value> {
         }
         1 => {
             let anchor = prompt_anchor(theme, "take_profit anchor")?;
-            let offset = prompt_float(theme, "take_profit offset_pips (signed)", Some(0.0))?;
-            map.insert(Value::String("from".into()), anchor);
-            map.insert(Value::String("offset_pips".into()), offset);
+            map.insert(Value::String("from".into()), anchor.clone());
+            prompt_offset(theme, "take_profit", &anchor, &mut map)?;
         }
         _ => {
             let price = prompt_float(theme, "take_profit absolute price", None)?;
@@ -753,6 +757,50 @@ fn prompt_take_profit(theme: &ColorfulTheme) -> Result<Value> {
         }
     }
     Ok(Value::Mapping(map))
+}
+
+/// Prompt for an anchored offset's buffer form and insert the right key into
+/// `map`. Offers the **ATR-pct** buffer (the preferred, volatility-scaled form)
+/// by default, with the deprecated signed-pips form as the alternative. ATR-pct
+/// needs a directional anchor (the buffer's direction comes from the anchor), so
+/// when `anchor` is `close` only the pips form is offered — picking ATR-pct on a
+/// `close` anchor would be rejected at resolve time. `anchor` is the already-
+/// chosen anchor string (`"close"` / `"high"` / `"low"`).
+fn prompt_offset(
+    theme: &ColorfulTheme,
+    name: &str,
+    anchor: &Value,
+    map: &mut serde_yaml::Mapping,
+) -> Result<()> {
+    let is_close = matches!(anchor, Value::String(s) if s == "close");
+    // A `close` anchor can't take the ATR buffer — go straight to pips.
+    if is_close {
+        let offset = prompt_float(theme, &format!("{name} offset_pips (signed)"), Some(0.0))?;
+        map.insert(Value::String("offset_pips".into()), offset);
+        return Ok(());
+    }
+    let forms = [
+        "ATR-pct buffer (percent of ATR — preferred)",
+        "pips (signed, deprecated)",
+    ];
+    let idx = Select::with_theme(theme)
+        .with_prompt(format!("{name} buffer form"))
+        .items(forms)
+        .default(0)
+        .interact()?;
+    if idx == 0 {
+        // Unsigned magnitude — direction comes from the anchor.
+        let pct = prompt_float(
+            theme,
+            &format!("{name} offset_atr_pct (e.g. 0.5)"),
+            Some(0.5),
+        )?;
+        map.insert(Value::String("offset_atr_pct".into()), pct);
+    } else {
+        let offset = prompt_float(theme, &format!("{name} offset_pips (signed)"), Some(0.0))?;
+        map.insert(Value::String("offset_pips".into()), offset);
+    }
+    Ok(())
 }
 
 fn prompt_anchor(theme: &ColorfulTheme, prompt: &str) -> Result<Value> {

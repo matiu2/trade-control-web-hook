@@ -76,10 +76,19 @@ Report: `the-trading-academy/books/demo-journal/FEATURE-atr-based-entry-sl-buffe
 - [x] Updated 2 tests that asserted the old ±1-pip default to assert the new
       ATR-pct default. Full workspace green, clippy clean, fmt.
 
-### Commit 4 — CLI interactive + anchored TP
-- [ ] `interactive.rs` prompts: choose ATR-pct (default) or pips for
-      entry/SL/TP; emit the chosen field.
-- [ ] script_validator: validate XOR + pct range (>0, sane upper bound).
+### Commit 4 — CLI interactive + validation ✅ DONE
+- [x] `interactive.rs`: new `prompt_offset` helper — offers ATR-pct (default)
+      or pips for entry/SL/TP anchored offsets. A `close` anchor only offers
+      pips (ATR-pct needs a directional anchor). Wired into all 3 anchored
+      prompt arms.
+- [x] core `Intent::validate`: `anchored_offsets()` + `check_offset_static`
+      reject both-set / negative / close-anchored `offset_atr_pct` at parse
+      time (`OffsetSpecInvalid(OffsetError)`). Runs in pattern builders +
+      worker. 4 new validate tests.
+- [x] Did NOT add blanket `validate()` to the interactive driver — it fills
+      templates incrementally for every action and some shapes defer checks
+      to the worker (broke 9 tests; reverted). Pattern builders + worker carry
+      the offset validation.
 
 ### Commit 5 — docs
 - [ ] README: new `offset_atr_pct` field, deprecation of `offset_pips`,

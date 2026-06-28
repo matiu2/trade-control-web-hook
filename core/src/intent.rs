@@ -921,7 +921,9 @@ pub fn is_valid_trade_id(s: &str) -> bool {
 }
 
 /// Error returned by [`Intent::validate`].
-#[derive(Debug, PartialEq, Eq)]
+// `Eq` is intentionally omitted: the `OffsetSpecInvalid(OffsetError)` variant
+// carries an `f64` (the offending atr-pct), which is `PartialEq` but not `Eq`.
+#[derive(Debug, PartialEq)]
 pub enum IntentValidationError {
     /// `trade_id` failed [`is_valid_trade_id`].
     InvalidTradeId,
@@ -1015,6 +1017,13 @@ pub enum IntentValidationError {
     /// a zero/negative/NaN value would silently zero or invert the trade
     /// geometry.
     PipSizeInvalid,
+    /// An anchored offset (entry / SL / TP) set both `offset_pips` and
+    /// `offset_atr_pct`, or set `offset_atr_pct` to a negative / non-finite
+    /// value, or paired `offset_atr_pct` with a directionless `close` anchor.
+    /// The resolver would reject these too, but catching them at validate time
+    /// gives the operator a fast parse-time error before encryption. See
+    /// [`OffsetError`].
+    OffsetSpecInvalid(OffsetError),
     /// `enter` / `veto` / `clear-veto` reached validation without a
     /// `trade_id`. The veto KV key is
     /// `veto:<account>:<trade_id>:<instrument>:<name>` — without a
@@ -1093,6 +1102,7 @@ impl core::fmt::Display for IntentValidationError {
                 "mw params invalid: anchor prices must be finite, spread_pips >= 0, pip_size > 0",
             ),
             Self::PipSizeInvalid => f.write_str("pip_size must be finite and > 0"),
+            Self::OffsetSpecInvalid(e) => write!(f, "invalid anchored offset: {e}"),
             Self::MissingTradeId => {
                 f.write_str("trade_id is required on action: enter | veto | clear-veto")
             }
@@ -1314,8 +1324,82 @@ impl Intent {
         // SL→entry distance when it's omitted (see
         // `resolution::resolve_recover_entry` and the wrong-side Stop arm),
         // so there is no malformed form to reject here.
+
+        // Anchored-offset static validity (entry / SL / TP). The resolver also
+        // rejects these, but validating at parse time fails fast before
+        // encryption. Only the *static* OffsetError cases are checkable here —
+        // `AtrUnavailable` depends on a live shell and is deferred to resolve.
+        for (pips, atr_pct, anchor) in self.anchored_offsets() {
+            if let Err(e) = check_offset_static(pips, atr_pct, anchor) {
+                return Err(IntentValidationError::OffsetSpecInvalid(e));
+            }
+        }
         Ok(())
     }
+
+    /// The `(offset_pips, offset_atr_pct, anchor)` triple of every anchored
+    /// offset this intent carries — the entry trigger (Stop/Limit), the
+    /// stop-loss, and an anchored take-profit. `Absolute`/`Market`/`RMultiple`
+    /// forms carry no offset and are skipped. Used by [`Self::validate`] to
+    /// statically check the ATR-pct / pips constraints.
+    fn anchored_offsets(&self) -> Vec<(f64, Option<f64>, PriceAnchor)> {
+        let mut out = Vec::new();
+        match &self.entry {
+            Some(EntrySpec::Stop {
+                from,
+                offset_pips,
+                offset_atr_pct,
+                ..
+            })
+            | Some(EntrySpec::Limit {
+                from,
+                offset_pips,
+                offset_atr_pct,
+                ..
+            }) => out.push((*offset_pips, *offset_atr_pct, *from)),
+            _ => {}
+        }
+        if let Some(PriceRef::Anchored {
+            from,
+            offset_pips,
+            offset_atr_pct,
+        }) = &self.stop_loss
+        {
+            out.push((*offset_pips, *offset_atr_pct, *from));
+        }
+        if let Some(TakeProfit::Anchored(PriceRef::Anchored {
+            from,
+            offset_pips,
+            offset_atr_pct,
+        })) = &self.take_profit
+        {
+            out.push((*offset_pips, *offset_atr_pct, *from));
+        }
+        out
+    }
+}
+
+/// Static (shell-free) validity of an anchored offset — the subset of
+/// [`resolve_offset`]'s checks that don't need a live shell: mutual exclusion,
+/// non-negative + finite `offset_atr_pct`, and a directional anchor for the ATR
+/// form. The runtime `AtrUnavailable` case is deferred to resolve time.
+fn check_offset_static(
+    offset_pips: f64,
+    offset_atr_pct: Option<f64>,
+    anchor: PriceAnchor,
+) -> Result<(), OffsetError> {
+    if let Some(pct) = offset_atr_pct {
+        if offset_pips != 0.0 {
+            return Err(OffsetError::BothOffsetsSet);
+        }
+        if !pct.is_finite() || pct < 0.0 {
+            return Err(OffsetError::NegativeAtrPct(pct));
+        }
+        if anchor.buffer_sign().is_none() {
+            return Err(OffsetError::AtrPctOnCloseAnchor);
+        }
+    }
+    Ok(())
 }
 
 /// Contextual-window type for the consolidated close-on-reversal gate
@@ -2797,6 +2881,94 @@ mod tests {
         let intent: Intent = serde_yaml::from_str(yaml).unwrap();
         assert_eq!(intent.trade_id.as_deref(), Some("eurusd-short-01jb2x"));
         intent.validate().unwrap();
+    }
+
+    /// An `offset_atr_pct` enter with directional anchors validates fine.
+    #[test]
+    fn validate_accepts_atr_pct_offset() {
+        let yaml = "
+            v: 1
+            id: t-atr-ok
+            not_after: \"2026-05-13T20:00:00Z\"
+            action: enter
+            instrument: EUR_USD
+            direction: short
+            trade_id: eurusd-short-atr
+            entry: { type: stop, from: signal_low, offset_atr_pct: 0.5 }
+            stop_loss: { from: signal_high, offset_atr_pct: 0.5 }
+            take_profit: { from: signal_low, offset_pips: -50 }
+        ";
+        let intent: Intent = serde_yaml::from_str(yaml).unwrap();
+        intent.validate().unwrap();
+    }
+
+    #[test]
+    fn validate_rejects_both_offset_forms() {
+        let yaml = "
+            v: 1
+            id: t-atr-both
+            not_after: \"2026-05-13T20:00:00Z\"
+            action: enter
+            instrument: EUR_USD
+            direction: short
+            trade_id: eurusd-short-atr
+            entry: { type: stop, from: signal_low, offset_pips: 1, offset_atr_pct: 0.5 }
+            stop_loss: { from: signal_high, offset_pips: 1 }
+            take_profit: { from: signal_low, offset_pips: -50 }
+        ";
+        let intent: Intent = serde_yaml::from_str(yaml).unwrap();
+        assert!(matches!(
+            intent.validate(),
+            Err(IntentValidationError::OffsetSpecInvalid(
+                OffsetError::BothOffsetsSet
+            ))
+        ));
+    }
+
+    #[test]
+    fn validate_rejects_negative_atr_pct() {
+        let yaml = "
+            v: 1
+            id: t-atr-neg
+            not_after: \"2026-05-13T20:00:00Z\"
+            action: enter
+            instrument: EUR_USD
+            direction: short
+            trade_id: eurusd-short-atr
+            entry: { type: stop, from: signal_low, offset_atr_pct: -0.5 }
+            stop_loss: { from: signal_high, offset_pips: 1 }
+            take_profit: { from: signal_low, offset_pips: -50 }
+        ";
+        let intent: Intent = serde_yaml::from_str(yaml).unwrap();
+        assert!(matches!(
+            intent.validate(),
+            Err(IntentValidationError::OffsetSpecInvalid(
+                OffsetError::NegativeAtrPct(_)
+            ))
+        ));
+    }
+
+    #[test]
+    fn validate_rejects_atr_pct_on_close_anchor() {
+        let yaml = "
+            v: 1
+            id: t-atr-close
+            not_after: \"2026-05-13T20:00:00Z\"
+            action: enter
+            instrument: EUR_USD
+            direction: short
+            trade_id: eurusd-short-atr
+            entry: { type: stop, from: close, offset_atr_pct: 0.5 }
+            stop_loss: { from: signal_high, offset_pips: 1 }
+            take_profit: { from: signal_low, offset_pips: -50 }
+        ";
+        let intent: Intent = serde_yaml::from_str(yaml).unwrap();
+        assert!(matches!(
+            intent.validate(),
+            Err(IntentValidationError::OffsetSpecInvalid(
+                OffsetError::AtrPctOnCloseAnchor
+            ))
+        ));
     }
 
     #[test]
