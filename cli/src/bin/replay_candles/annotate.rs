@@ -171,6 +171,7 @@ fn outcome_label(kind: FillKind) -> &'static str {
         FillKind::NeverFilled => "no-fill",
         FillKind::Declined => "declined",
         FillKind::SpreadBlackout => "spread",
+        FillKind::GateBlocked => "gate-blocked",
     }
 }
 
