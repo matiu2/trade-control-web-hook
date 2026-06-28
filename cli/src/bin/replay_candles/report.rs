@@ -21,7 +21,8 @@
 use chrono::{DateTime, Utc};
 use trade_control_core::intent::{Action, Direction, Resolved, ResolvedEntry, Shell};
 use trade_control_engine::{
-    SimOutcome, SweepReason, TradePlan, breakeven_armed_at, simulate_fill, sweep_reason,
+    GateBlock, SimOutcome, SweepReason, TradePlan, breakeven_armed_at, entry_gate_block,
+    simulate_fill, sweep_reason,
 };
 
 use super::brisbane::bne;
@@ -463,6 +464,21 @@ fn render_fire(
         return line;
     }
 
+    // Pre-broker entry gate: the worker's `run_enter` rejects an enter whose
+    // `allow_entry` script returns false/errors, or whose `needs_golden` /
+    // `needs_confirmed` candle-quality requirement the (signal-folded) shell
+    // doesn't meet — before any order is placed. `simulate_fill` only knows the
+    // price path, so without this it would FILL an order the live worker would
+    // have REJECTED. Both gates now live in shared `core` (applied identically
+    // live and here), so surface the block and don't simulate a fill or tally it.
+    if let Some(block) = entry_gate_block(intent, &shell, plan.pip_size) {
+        line.push_str(&format!(
+            "    fill: {} → NO FILL / 0R\n",
+            describe_gate_block(&block)
+        ));
+        return line;
+    }
+
     // Break-even arming: the bar whose close runs past the threshold
     // (50%-to-TP by default). In production the live cron (`breakeven_watch`)
     // sends `amend_stop(entry)` to the broker on the tick that observes this
@@ -673,6 +689,20 @@ fn describe_outcome(outcome: &SimOutcome) -> String {
     }
 }
 
+/// Human-readable line for a pre-broker entry-gate rejection (the worker's
+/// `allow_entry` script + candle-quality gate, now applied in replay via the
+/// shared core gate). The caller prefixes `fill: ` and suffixes the `0R` tally.
+fn describe_gate_block(block: &GateBlock) -> String {
+    match block {
+        GateBlock::AllowEntryFalse => "BLOCKED by allow_entry script (returned false)".into(),
+        GateBlock::AllowEntryScriptError { kind, message } => {
+            format!("BLOCKED by allow_entry script ({kind} error: {message})")
+        }
+        GateBlock::NeedsGoldenUnmet => "BLOCKED — golden candle required, not present".into(),
+        GateBlock::NeedsConfirmedUnmet => "BLOCKED — confirmed signal required, not present".into(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -693,6 +723,31 @@ mod tests {
             recover_entry: None,
             breakeven: None,
         }
+    }
+
+    #[test]
+    fn gate_block_renders_each_reason() {
+        // The exact strings the replay journal prints when the worker's
+        // pre-broker entry gate would have rejected the fill.
+        assert_eq!(
+            describe_gate_block(&GateBlock::AllowEntryFalse),
+            "BLOCKED by allow_entry script (returned false)"
+        );
+        assert_eq!(
+            describe_gate_block(&GateBlock::NeedsGoldenUnmet),
+            "BLOCKED — golden candle required, not present"
+        );
+        assert_eq!(
+            describe_gate_block(&GateBlock::NeedsConfirmedUnmet),
+            "BLOCKED — confirmed signal required, not present"
+        );
+        assert_eq!(
+            describe_gate_block(&GateBlock::AllowEntryScriptError {
+                kind: "parse",
+                message: "boom".into(),
+            }),
+            "BLOCKED by allow_entry script (parse error: boom)"
+        );
     }
 
     #[test]

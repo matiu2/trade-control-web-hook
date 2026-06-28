@@ -1467,6 +1467,32 @@ marker with `core::ny_clock::is_ny_close_edge(fire_bar.time)` — exactly the
 close-edge hour, where the live window can persist a little longer until the
 recovery watcher clears it.
 
+**Replay applies the pre-broker entry gate (`allow_entry` + candle-quality).**
+The live worker's `run_enter` rejects an entry — before any order reaches the
+broker — when the intent's `allow_entry` Rhai script returns `false` (or fails
+to parse/eval), or when a `needs_golden` / `needs_confirmed` candle-quality
+requirement isn't met by the (signal-folded) shell. `simulate_fill` only knows
+the price path, so without this it would *fill* an order the worker would have
+*rejected*. Both gates now live in the shared `trade_control_core::allow_entry_gate`
+(Rhai compiles off-wasm), and the replay applies them via the pure
+`entry_gate_block` helper (engine) — so worker and replay can't drift. A blocked
+enter is a **hard skip** (NO FILL / 0R, not tallied), shown in the per-enter
+section as one of:
+
+```text
+    fill: BLOCKED by allow_entry script (returned false) → NO FILL / 0R
+    fill: BLOCKED by allow_entry script (parse error: <msg>) → NO FILL / 0R
+    fill: BLOCKED — golden candle required, not present → NO FILL / 0R
+    fill: BLOCKED — confirmed signal required, not present → NO FILL / 0R
+```
+
+Like the `be:` line this is replay reporting only — it does **not** change
+`SimOutcome` (saved fixtures are untouched), and the live worker's gate path is
+unchanged. (For Pine enters the engine's `pine_entry_dispatchable` already
+pre-flights golden/confirmed at evaluate time so the plan stays armed rather than
+firing; this gate is the broader catch — the `allow_entry` script for every
+enter, plus the candle-quality gate for M/W and non-pine fires.)
+
 **News / blackout pruning is replay-cursor-aware.** When `tv-arm` builds a plan
 it fetches the week's forex-factory events and adds one blackout pair + one news
 pair per event, then drops any pair whose window has already elapsed. The

@@ -46,6 +46,7 @@
 //! (the fill bar is in the exit search, pessimistic on SL/TP ties), per-bar
 //! bid/ask book selection, and bar-expiry (`expiry_bars` bounds the fill window).
 
+use trade_control_core::allow_entry_gate::{self, AllowEntryOutcome};
 use trade_control_core::broker::BidAskCandle;
 use trade_control_core::intent::{Direction, Intent, Resolved, ResolvedEntry, Shell};
 use trade_control_core::sweep_gate::{SweepReason, bar_expiry_due, breach_detected};
@@ -485,6 +486,62 @@ pub fn sweep_reason(
     }
 
     None
+}
+
+/// Why the worker's pre-broker entry gate would have **rejected** this enter,
+/// so the offline replay can report a block instead of silently filling an
+/// order the live worker never would have placed.
+///
+/// These mirror the worker's `run_enter` `allow_entry_gate::evaluate` outcomes
+/// (the `allow_entry` Rhai script + the AND-composed candle-quality gate). The
+/// `Declined` (at-entry-level veto) and `Unresolved` rejections already live in
+/// [`SimOutcome`]; this covers the two that didn't, without touching that enum.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GateBlock {
+    /// The `allow_entry` Rhai script evaluated to `false`. The live worker 412s.
+    AllowEntryFalse,
+    /// The `allow_entry` script failed to parse / eval / returned the wrong
+    /// type. The live worker 412s with the kind in its rejection log.
+    AllowEntryScriptError {
+        /// `parse` / `eval` / `wrong-type`.
+        kind: &'static str,
+        /// The script error's display string.
+        message: String,
+    },
+    /// `needs_golden` was set on the enter but the (signal-folded) shell did not
+    /// carry `golden: Some(true)`. The live worker 412s "needs-golden".
+    NeedsGoldenUnmet,
+    /// `needs_confirmed` was set but the shell did not carry
+    /// `signal_confirmed: Some(true)`. The live worker 412s "needs-confirmed".
+    NeedsConfirmedUnmet,
+}
+
+/// Would the worker's pre-broker entry gate have **rejected** this fired enter?
+///
+/// `simulate_fill` reproduces only the price-path fill; the worker's `run_enter`
+/// also runs the `allow_entry` script + candle-quality gate before any
+/// placement. Both now live in the shared [`allow_entry_gate`] (in `core`), so
+/// the replay can apply them identically — this is that call.
+///
+/// Standalone and pure (it resolves the bracket itself, like
+/// [`breakeven_armed_at`]), so it leaves [`SimOutcome`] and `simulate_fill`'s
+/// fill behaviour untouched: the report calls it first and, on `Some`, prints a
+/// gate-block line instead of the simulated fill.
+///
+/// Returns `None` when the gate would let the entry through, the intent can't be
+/// resolved (an `Unresolved`/`Declined` `simulate_fill` already reports that),
+/// or the action isn't an enter.
+pub fn entry_gate_block(intent: &Intent, shell: &Shell, pip_size: f64) -> Option<GateBlock> {
+    let resolved = Resolved::from_intent(intent, shell, pip_size).ok()?;
+    match allow_entry_gate::evaluate(intent, shell, &resolved, pip_size) {
+        AllowEntryOutcome::Proceed => None,
+        AllowEntryOutcome::Blocked => Some(GateBlock::AllowEntryFalse),
+        AllowEntryOutcome::NeedsGoldenUnmet => Some(GateBlock::NeedsGoldenUnmet),
+        AllowEntryOutcome::NeedsConfirmedUnmet => Some(GateBlock::NeedsConfirmedUnmet),
+        AllowEntryOutcome::ScriptError { kind, message } => {
+            Some(GateBlock::AllowEntryScriptError { kind, message })
+        }
+    }
 }
 
 /// Which broker book a price level is tested against.
@@ -1576,5 +1633,65 @@ mod tests {
         intent.entry = Some(EntrySpec::Market);
         let shell = trigger_shell();
         assert_eq!(sweep_reason(&intent, &shell, 0.0001, &[fire_bar()]), None);
+    }
+
+    /// A resolvable market enter so the gate-block tests exercise the gate, not
+    /// the resolver (an `Unresolved` short-circuits before `allow_entry_gate`).
+    fn market_enter() -> Intent {
+        let mut i = base_enter();
+        i.direction = Some(Direction::Long);
+        i.entry = Some(EntrySpec::Market);
+        i.stop_loss = Some(PriceRef::Absolute { absolute: 1.1000 });
+        i.take_profit = Some(TakeProfit::Anchored(PriceRef::Absolute {
+            absolute: 1.1150,
+        }));
+        i
+    }
+
+    #[test]
+    fn entry_gate_block_none_when_gate_passes() {
+        // No allow_entry script, no candle-quality requirement → the worker
+        // would place the order, so the replay must not block it.
+        let intent = market_enter();
+        let shell = trigger_shell();
+        assert_eq!(entry_gate_block(&intent, &shell, 0.0001), None);
+    }
+
+    #[test]
+    fn entry_gate_block_allow_entry_false() {
+        // The worker's `run_enter` 412s a static-false `allow_entry`; the replay
+        // must surface that block instead of filling the order.
+        let mut intent = market_enter();
+        intent.allow_entry = Some(Tunable::Static(false));
+        let shell = trigger_shell();
+        assert_eq!(
+            entry_gate_block(&intent, &shell, 0.0001),
+            Some(GateBlock::AllowEntryFalse)
+        );
+    }
+
+    #[test]
+    fn entry_gate_block_needs_golden_unmet() {
+        // `needs_golden` set but the shell carries `golden: None` (the realistic
+        // non-golden case) → the worker rejects "needs-golden"; replay mirrors it.
+        let mut intent = market_enter();
+        intent.needs_golden = true;
+        let shell = trigger_shell();
+        assert_eq!(shell.golden, None);
+        assert_eq!(
+            entry_gate_block(&intent, &shell, 0.0001),
+            Some(GateBlock::NeedsGoldenUnmet)
+        );
+    }
+
+    #[test]
+    fn entry_gate_block_script_error_surfaces_kind() {
+        let mut intent = market_enter();
+        intent.allow_entry = Some(Tunable::from_script("if if if"));
+        let shell = trigger_shell();
+        match entry_gate_block(&intent, &shell, 0.0001) {
+            Some(GateBlock::AllowEntryScriptError { kind, .. }) => assert_eq!(kind, "parse"),
+            other => panic!("expected AllowEntryScriptError(parse), got {other:?}"),
+        }
     }
 }
