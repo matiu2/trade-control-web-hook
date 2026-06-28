@@ -139,8 +139,11 @@ impl ReplayBroker {
             // here too — these v2 plans don't set `expiry_bars`, and the gate's
             // cap/window bound the re-entry count regardless.)
             SimOutcome::NeverFilled => AttemptState::Pending,
-            // Declined / unresolved — no order ever went on; the slot is free.
-            SimOutcome::Declined { .. } | SimOutcome::Unresolved(_) => AttemptState::Cancelled,
+            // Declined / spread-blackout / unresolved — no order ever went on;
+            // the slot is free.
+            SimOutcome::Declined { .. }
+            | SimOutcome::SpreadBlackout { .. }
+            | SimOutcome::Unresolved(_) => AttemptState::Cancelled,
         }
     }
 }

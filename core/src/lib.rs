@@ -19,6 +19,7 @@ pub mod retry_gate;
 pub mod rules;
 pub mod sig;
 pub mod signals;
+pub mod spread_blackout;
 pub mod state;
 pub mod tick_bundle;
 pub mod trade_plan;

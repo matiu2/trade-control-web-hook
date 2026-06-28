@@ -1,5 +1,71 @@
 # Changelog
 
+## Unreleased — 2026-06-28 — Spread-blackout moved to `core`; replay applies it
+
+**Why.** The spread-blackout entry reject (System 1) lived in
+`src/spread_blackout.rs` — inside the worker crate, a `cdylib` the
+`engine`/`cli` crates cannot depend on. So the offline candle replay
+(`replay-candles` → `engine::simulate_fill`) could not apply it and **silently
+filled entries the live worker would reject** (a 423), making the replay an
+unfaithful production dry-run. The replay candles carry real per-bar bid/ask
+books, so the fire-bar spread is in the data — the reject is fully
+reconstructable offline. This is item 1 of `REPLAY-PARITY-AUDIT.md` and follows
+the established `pause_gate` / `retry_gate` / `Breakeven` shape: pure decision in
+`core`, thin I/O wrapper in the worker
+(`[[strategy_changes_in_both_replayer_and_worker]]`).
+
+**What changed.**
+
+- **`core::spread_blackout` (new, shared):** the pure `spread_blackout_decision`,
+  `elevated_threshold_pips`, `baked_baseline`, the `SPREAD_REJECT_MULTIPLE` /
+  `SPREAD_BLACKOUT_ELEVATED_PIPS` / `SPREAD_BLACKOUT_RECOVERED_PIPS` constants,
+  and the baked-baseline module moved here verbatim (with their unit tests). The
+  compile-time baseline bake moved with them: **`core/build.rs`** reads the
+  `spread-sampler-cron` YAML samples (path adjusted to `../../` for core's depth)
+  and emits the per-instrument table; a missing samples dir still bakes an empty
+  table (flat-8 fallback), unchanged.
+- **Worker (byte-identical behaviour):** the old `src/spread_blackout.rs` is now a
+  thin re-export shim over `trade_control_core::spread_blackout`. Every
+  `crate::spread_blackout::*` call site (`run_enter`, `blackout_watch`,
+  `blackout_cancel`) is unchanged. The now-dead root `build.rs` and its
+  `[build-dependencies]` were removed (the bake lives in `core` now).
+- **Replay (`engine::simulate_fill`):** after resolving the entry and the
+  at-entry level veto, the simulator computes the **fire bar**'s spread
+  (`(ask_c − bid_c) / pip_size`) and calls the shared
+  `core::spread_blackout::spread_blackout_decision`. The `window_open` input is
+  modelled offline by `core::ny_clock::is_ny_close_edge(fire_bar.time)` (the live
+  KV window marker has no offline equivalent — documented as an approximation). A
+  reject returns the new `SimOutcome::SpreadBlackout { spread_pips,
+  threshold_pips }`, mirrored to `FillOutcome::SpreadBlackout` (fixture), a
+  `FillKind::SpreadBlackout` (report/annotate, a not-taken kind), and a report
+  line: `spread: REJECTED — spread 30.0p > 8.0p threshold inside the
+  NY-close-edge window (no order placed; live worker 423s)`. A mid-only feed
+  (`bid == ask`) has zero spread → never blacks out.
+
+**Breaking.** New `SimOutcome::SpreadBlackout` and `FillOutcome::SpreadBlackout`
+variants (matched exhaustively across `report.rs` / `fixture.rs` /
+`replay_broker.rs` / `annotate.rs`). No signed-wire or KV change. Worker
+behaviour identical — this is a refactor + replay-fidelity addition, **not** a
+worker behaviour change, so no redeploy is required.
+
+**Config.** None. Thresholds, the baked baseline, and the re-bake cadence are
+unchanged (the table is byte-identical — same samples, same extraction, now run
+from `core/build.rs`).
+
+**Tests.** Pure-decision unit tests moved to `core` (11 incl. the baked-baseline
+self-consistency + 5×-median checks over the 1240-sample table). New
+`simulate_fill` tests: elevated spread inside the NY-close-edge window →
+`SpreadBlackout`; tight spread inside the window → fills (passes the gate); wide
+spread *outside* the window → fills; mid-only zero-spread bar → never blacks out.
+`fixture.rs` round-trip extended to the new variant. Existing
+`all_fixtures_match_expected` regression still passes (no fixture churn — no saved
+fixture exercises the new path).
+
+**Follow-up.** The `is_ny_close_edge` window stand-in is exactly the close-edge
+hour, whereas the live KV window can persist a little longer until the recovery
+watcher clears it — a small known optimism. Items 2–3 of the parity audit (order
+sweep breach predicate, market-hours blackout) are the next moves.
+
 ## Unreleased — 2026-06-28 — Engine fires `06-close-on-reversal`; replay honours it
 
 **Why.** A `06-close-on-reversal` rule (a `PinePattern` close bound to the
