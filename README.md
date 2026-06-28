@@ -477,6 +477,30 @@ for JPY pairs or indices; the correct pip is baked in. The baked `pip_size`
 is also bound as a variable in gate scripts (`allow_entry`, `min_r`,
 `risk_pct`, …) alongside `entry_price`, `r_multiple`, etc.
 
+**How a catalog change reaches each binary.** The `instrument-lookup`
+catalog (`instrument-lookup/src/catalog.toml`) is `include_str!`-compiled
+into the `instrument-lookup` library, which the **CLIs** (`tv-arm`,
+`tv-news`, `trade-control`) link directly. So:
+
+- **The worker never links `instrument-lookup`** — it isn't wasm-clean
+  (its default `import` feature pulls in `reqwest` blocking) and was
+  deliberately kept catalog-free. **Recompiling/redeploying the worker
+  does *not* teach it a catalog change.** The worker only sees catalog
+  facts (`pip_size`, …) that `tv-arm` baked onto each *signed intent* at
+  **arm time**. To make a catalog edit affect a live setup you re-**arm**
+  it (re-run `tv-arm` with the new catalog) — you do not redeploy the
+  worker.
+- **The CLIs do pick up a catalog edit on rebuild.** Change
+  `catalog.toml`, rebuild/reinstall the CLIs (`./deploy-*.sh` does this as
+  part of a deploy), and they resolve against the new baseline.
+- **Caveat — the CLIs also merge a runtime overlay.** On every invocation
+  they merge `~/.config/instrument-lookup/mappings.toml` over the baked
+  baseline (same `id` replaces, new `id` appends). So a baked CLI is *not*
+  fully self-contained: an overlay there can override the compiled-in
+  catalog with no recompile. To add/override a single asset for an
+  operator, editing that overlay is the no-rebuild path; editing
+  `catalog.toml` is the everyone-gets-it, requires-rebuild path.
+
 **Stop vs limit entries:** a `stop` order fills when price moves *through*
 the level (breakout: long stops sit *above* current price, short stops
 *below*). A `limit` fills when price comes *back* to the level (pullback:
