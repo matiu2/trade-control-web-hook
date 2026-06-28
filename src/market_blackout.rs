@@ -17,49 +17,10 @@
 //! (no `mark_seen`), so this reject never poisons the intent id. See
 //! CLAUDE.md "Replay protection scope".
 
-use chrono::{DateTime, Timelike, Utc};
-
-/// Minutes-of-day [0, 1440) for `now` in **UTC** — the coordinate the stored
-/// [`trade_control_core::intent::NoEntryWindow`]s use. The deriver converts
-/// the broker's Brisbane session hours to this same UTC minute-of-day axis,
-/// so the gate compares like-for-like.
-pub fn now_utc_minute_of_day(now: DateTime<Utc>) -> u32 {
-    now.hour() * 60 + now.minute()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use chrono::TimeZone;
-
-    fn at(hour: u32, minute: u32) -> DateTime<Utc> {
-        Utc.with_ymd_and_hms(2026, 6, 18, hour, minute, 0).unwrap()
-    }
-
-    #[test]
-    fn midnight_is_zero() {
-        assert_eq!(now_utc_minute_of_day(at(0, 0)), 0);
-    }
-
-    #[test]
-    fn one_minute_past_midnight() {
-        assert_eq!(now_utc_minute_of_day(at(0, 1)), 1);
-    }
-
-    #[test]
-    fn noon_is_seven_twenty() {
-        assert_eq!(now_utc_minute_of_day(at(12, 0)), 720);
-    }
-
-    #[test]
-    fn last_minute_of_day() {
-        // 23:59 = 1439, strictly inside [0, 1440).
-        assert_eq!(now_utc_minute_of_day(at(23, 59)), 1439);
-    }
-
-    #[test]
-    fn seconds_are_ignored() {
-        let with_secs = Utc.with_ymd_and_hms(2026, 6, 18, 9, 30, 45).unwrap();
-        assert_eq!(now_utc_minute_of_day(with_secs), 9 * 60 + 30);
-    }
-}
+// `now_utc_minute_of_day` moved to `trade_control_core::sweep_gate` so the
+// offline replay (which can't depend on this worker `cdylib`) shares one
+// definition with the worker — the `[[strategy_changes_in_both_replayer_and_worker]]`
+// rule. Re-exported here so the `run_enter` gate call site
+// (`market_blackout::now_utc_minute_of_day`) stays byte-unchanged. The
+// predicate's unit tests live alongside it in `core::sweep_gate`.
+pub use trade_control_core::sweep_gate::now_utc_minute_of_day;

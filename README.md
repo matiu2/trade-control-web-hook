@@ -1375,6 +1375,31 @@ break-even outcome. It does **not** change `SimOutcome` (so saved fixtures are
 untouched). The live worker's break-even path is unchanged — this is replay
 reporting only.
 
+**Why an order "NEVER FILLED" — the sweep reason.** A resting stop/limit order
+that never triggers isn't necessarily one the live worker passively let sit:
+every 15-min cron tick the worker's order **sweep** (`src/cron/sweep.rs`)
+cancels a still-pending order once its alert window expired, its bar-based
+`cancel_at` (`expiry_bars`) passed, it sits inside a market-hours blackout, or
+current price overtook its stop-loss. So a plain "never filled" hides whether
+the worker would have *actively swept* the order. The `NEVER FILLED` line now
+names the sweep reason when there is one:
+
+```text
+    fill: NEVER FILLED — swept: SL breached @ 2026-06-19 12:00:00 +10:00 (live cron cancels the resting order here)
+    fill: NEVER FILLED — swept: bar-expiry @ 2026-06-19 13:00:00 +10:00
+    fill: NEVER FILLED — alert-window expired @ 2026-06-19 14:00:00 +10:00
+```
+
+When no sweep condition is reached it keeps the original wording, `fill: NEVER
+FILLED (pending order untriggered in window)`. The decision is the pure
+`sweep_reason` helper (engine), which reuses the shared `core::sweep_gate`
+predicates (`breach_detected` / `bar_expiry_due` / `market_blackout_due`) the
+live worker's sweep uses — so worker and replay can't drift. Like
+`breakeven_armed_at` it does **not** change `SimOutcome`, so saved fixtures are
+untouched. (The market-hours **blackout** sweep is not reconstructed offline —
+the per-instrument no-entry windows live in KV — so a blackout-driven cancel
+still shows the plain wording; surfacing it is REPLAY-PARITY-AUDIT item 3.)
+
 **Freezing a known-good run as a regression fixture.** When a replay is
 producing the verdict you want, add `--save <name>` to freeze that run into
 `replay-fixtures/<name>/` — four JSON files: the `plan`, the **exact candle
