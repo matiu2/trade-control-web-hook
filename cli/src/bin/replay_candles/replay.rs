@@ -323,6 +323,9 @@ async fn gate_enter(
                     .unwrap_or(trade_control_core::intent::Direction::Long),
                 resolved_sl,
                 None,
+                // The replay drives break-even directly in `simulate_fill` (it
+                // walks the candle path), so it doesn't need the cron snapshot.
+                None,
             )
             .await;
             Some(order_id)

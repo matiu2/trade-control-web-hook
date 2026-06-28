@@ -139,6 +139,7 @@ mod tests {
             risk: RiskBudget::Percent(0.5),
             dry_run: false,
             recover_entry: None,
+            breakeven: None,
         }
     }
 
@@ -195,6 +196,7 @@ mod tests {
             pip_size: None,
             trade_plan: None,
             blackout_close: trade_control_core::intent::BlackoutCloseAction::default(),
+            breakeven: None,
             include_archived: false,
         }
     }

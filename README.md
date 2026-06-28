@@ -418,6 +418,13 @@ blackout_close: cancel_resting         # optional. What the market-hours
                                        # an open position. See "Market-hours
                                        # entry blackout" below.
 cooldown_hours: 12                     # only used by "invalidate"
+breakeven: { threshold: 0.5 }          # optional. Move the SL to break-even
+                                       # (the entry price) once a candle CLOSES
+                                       # past this fraction of entry→TP. Latched
+                                       # / one-way. Default ON at 0.5 when armed
+                                       # via build-trade / tv-arm; omit to keep
+                                       # the static SL. See "Break-even stop
+                                       # management" below.
 ```
 
 `take_profit` can also be `{ from: high, offset_pips: 50 }` for a fixed
@@ -738,6 +745,51 @@ increasing in list order, or if any opted-in veto is active. Preps are
 
 `requires_preps` and `vetos` are template-only fields; the CLI does not
 prompt for them. Author one template per setup.
+
+## Break-even stop management
+
+Once a candle **closes** past 50% of the way from entry to take-profit (in the
+trade direction), the worker moves the stop-loss to **break-even** — the entry
+price exactly — so a leg that ran most of the way to TP and then reverses
+scratches at **0R** instead of taking a full **−1R**. This encodes the standing
+lesson: *once profit reaches 50%, set SL to break-even.*
+
+- **Default ON at 50%** for every pattern enter armed via `tv-arm` /
+  `build-trade` (H&S, the strategy-v2 Quasimodo leg, and M/W).
+- **Latched / one-way.** It arms once; the stop is moved to entry and never
+  reverts. The broker's resting stop handles everything else.
+- **Arming basis is the candle CLOSE**, not an intrabar wick — a fakeout spike
+  to the midpoint that closes back does **not** arm it.
+
+### How it works
+
+The rule is baked as a signed `breakeven: { threshold: <f> }` field on the
+`05-enter` intent (covered by the whole-body HMAC, so it can't be tampered).
+Two consumers honour it identically, sharing one pure helper in
+`trade_control_core::intent::Breakeven` so they can't drift:
+
+- **Live worker** — a cron step (`breakeven_watch`) runs every 15-min tick. For
+  each open position whose enter carried `breakeven`, it fetches the closed
+  candles since the fill at the trade's timeframe and, once one has closed past
+  the 50% level, calls `amend_stop(entry)` (a broker-native SL move). Idempotent
+  — re-running is a no-op once the stop is at break-even.
+- **Offline replay** (`replay-candles`) — `simulate_fill` walks the candle path
+  and moves its tracked stop to entry on the same close-past-50% rule; the
+  report shows `BREAK-EVEN (SL→BE)` when a position closed at the moved stop.
+
+### How to set it
+
+- **tv-arm:** on by default. `--no-breakeven` opts out; `--breakeven-pct <f>`
+  overrides the threshold (e.g. `--breakeven-pct 0.7`).
+- **`build-trade` trade spec:** `breakeven_pct: 0.5` (the default). Set
+  `breakeven_pct: null` to disable for that trade, or a custom fraction to
+  change the threshold. Values outside `(0, 1)` are clamped to 0.5.
+
+> **Demo-confirm before trusting live.** Like the spread-blackout stop widen,
+> the break-even move uses `amend_stop` on an **open** position; TradeNation's
+> `AmendCloseOrder`-on-open-position path is demo-unverified. Every intended
+> amend is logged prominently first so a demo run can read it back (SL moved to
+> entry, TP unchanged) before this is trusted on a live account.
 
 ## Using `expiry_bars`
 
@@ -2062,6 +2114,8 @@ cargo run -p tv-arm -- \
   --veto-on-reversal \                # experimental: a reversal off a band before entry also vetoes the upcoming trade (default off)
   --quasimodo \                       # alias: --skip-break-and-close --skip-retest --require-confirmation (drop both H&S preps, gate on a confirmed candle)
   --strategy-v2 \                     # arm BOTH a stop entry AND a Quasimodo limit entry on one setup; first to fire cancels the other (see below). Conflicts with --quasimodo/--entry-market/--skip-*; needs --max-retries > 0
+  --no-breakeven \                    # disable break-even stop management (default ON at 50%; see "Break-even stop management")
+  --breakeven-pct 0.7 \               # override the break-even arm threshold as a fraction of entry→TP (default 0.5)
   --skip-break-and-close \            # for stocks (no after-hours retests)
   --skip-retest \                     # implies --skip-break-and-close; for late entries
   --skip-golden \                     # drop the Pine golden-candle requirement (golden is required by default)

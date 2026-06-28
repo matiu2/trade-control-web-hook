@@ -274,6 +274,20 @@ pub struct Args {
     )]
     pub strategy_v2: bool,
 
+    /// Disable break-even stop management for this trade. By default the
+    /// `05-enter` carries a break-even rule (50% of entry→TP) so the live
+    /// worker moves the stop to break-even once a candle closes past the
+    /// midpoint (BUG-replay-no-breakeven-stop-at-50pct). Pass this to opt out
+    /// (the stop stays at its original level for the life of the position).
+    #[arg(long)]
+    pub no_breakeven: bool,
+
+    /// Override the break-even arm threshold as a fraction of entry→TP
+    /// (default 0.5 = 50%). Ignored when `--no-breakeven` is set. Values
+    /// outside `(0, 1)` are clamped to 0.5 by the worker/replay.
+    #[arg(long)]
+    pub breakeven_pct: Option<f64>,
+
     /// Drop the break-and-close prep from the bundle (no alert
     /// emitted and the entry no longer requires it).
     #[arg(long)]

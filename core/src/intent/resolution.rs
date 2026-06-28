@@ -97,6 +97,13 @@ pub struct Resolved {
     /// time, or a `#19-10` rejection fails the placement and the next bar
     /// retries). See [`ResolvedRecoverEntry`].
     pub recover_entry: Option<ResolvedRecoverEntry>,
+    /// Break-even stop management, copied verbatim from
+    /// [`Intent::breakeven`](super::Intent::breakeven). `None` = no BE move
+    /// (today's static-SL behaviour). The replay (`simulate_fill`) and the live
+    /// worker's position cron read this to decide when to move the stop to the
+    /// entry price — see [`super::Breakeven`]. Carried on the resolved trade so
+    /// both consumers share one source of truth and can't drift.
+    pub breakeven: Option<super::Breakeven>,
 }
 
 /// Hard server-side floor on `min_r`. Overrides below this are rejected
@@ -470,6 +477,7 @@ impl Resolved {
             risk: RiskBudget::Percent(0.0),
             dry_run: intent.dry_run.unwrap_or(false),
             recover_entry,
+            breakeven: intent.breakeven,
         };
 
         // Server-enforced floor: an `min_r` override cannot weaken the
@@ -716,6 +724,7 @@ mod tests {
             pip_size: None,
             trade_plan: None,
             blackout_close: crate::intent::BlackoutCloseAction::default(),
+            breakeven: None,
             include_archived: false,
         }
     }
