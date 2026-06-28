@@ -2332,6 +2332,117 @@ mod tests {
         );
     }
 
+    /// End-to-end arm: build the HS spec the real `--plan-out` path builds,
+    /// then run it through the SAME `cli::build_trade_from_spec` +
+    /// `build_trade_plan` the pipeline uses, and inspect every emitted
+    /// `rules[*].intent.needs_golden` in the serialized plan JSON. This is the
+    /// path the spec-only test missed — the bug (if any) shows here.
+    fn emitted_plan_with(extra: &[&str]) -> trade_control_core::trade_plan::TradePlan {
+        let args = mw_args(extra);
+        let spec = build_trade_spec(
+            &args,
+            "EUR_USD",
+            "ms-oanda-1",
+            Broker::Oanda,
+            Direction::Short,
+            now() + chrono::Duration::days(1),
+            1.05,
+            &Roles::default(),
+            0.0001,
+            Vec::new(),
+        );
+        let built = cli::build_trade_from_spec(spec, now(), cli::BuildStrictness::Lenient)
+            .expect("build trade bundle");
+        build_trade_plan(
+            &built.trade_id,
+            &built.instrument,
+            &built.alerts,
+            trade_control_conventions::Direction::Short,
+            &Roles::default(),
+            trade_control_core::broker::Granularity::H1,
+            false,
+            false,
+        )
+    }
+
+    #[test]
+    fn skip_golden_clears_needs_golden_on_every_emitted_enter() {
+        // BUG-replay-golden-gate-not-enforced (arm half), asserted against the
+        // EMITTED PLAN JSON, not just the spec builder. `--skip-golden` with the
+        // raw style (`--skip-break-and-close --skip-retest`) must yield
+        // `needs_golden: false` on every ENTER rule (05-enter BCR stop, and
+        // 09-enter-qm if strategy-v2). The 06-close-on-reversal guard keeps its
+        // own `needs_golden: true` — that's the CLOSE gate, not the entry gate,
+        // and `--skip-golden` does not touch it.
+        let plan = emitted_plan_with(&["--skip-break-and-close", "--skip-retest", "--skip-golden"]);
+        let json = serde_json::to_string_pretty(&plan).unwrap();
+
+        // Only ENTER rules are governed by --skip-golden. The
+        // 06-close-on-reversal guard legitimately keeps needs_golden: true —
+        // that's the CLOSE gate, which --skip-golden does not touch. (This is
+        // why a raw-style plan's `rules[4]` still shows true: it's the close
+        // guard, not the stop enter.)
+        let mut saw_enter = false;
+        for rule in &plan.rules {
+            if rule.intent.action == trade_control_core::intent::Action::Enter {
+                saw_enter = true;
+                assert!(
+                    !rule.intent.needs_golden,
+                    "emitted ENTER rule {} still carries needs_golden: true \
+                     despite --skip-golden\nplan JSON:\n{json}",
+                    rule.rule_id
+                );
+            }
+        }
+        assert!(saw_enter, "expected at least one ENTER rule in the plan");
+    }
+
+    #[test]
+    fn default_keeps_needs_golden_on_every_emitted_enter() {
+        // Mirror image: with no flag, every emitted ENTER rule carries
+        // needs_golden: true (golden is on every trade, always).
+        let plan = emitted_plan_with(&["--skip-break-and-close", "--skip-retest"]);
+        let mut saw_enter = false;
+        for rule in &plan.rules {
+            if rule.intent.action == trade_control_core::intent::Action::Enter {
+                saw_enter = true;
+                assert!(
+                    rule.intent.needs_golden,
+                    "emitted ENTER rule {} should default to needs_golden: true",
+                    rule.rule_id
+                );
+            }
+        }
+        assert!(saw_enter, "expected at least one ENTER rule in the plan");
+    }
+
+    #[test]
+    fn skip_golden_clears_needs_golden_on_strategy_v2_siblings() {
+        // strategy-v2 emits TWO enters (BCR stop + QM limit) — both must honour
+        // --skip-golden in the emitted plan.
+        // --strategy-v2 conflicts with the explicit --skip-* flags (it owns the
+        // prep-skip internally), so pass it alone with --skip-golden.
+        let plan = emitted_plan_with(&["--skip-golden", "--strategy-v2"]);
+        let json = serde_json::to_string_pretty(&plan).unwrap();
+        let enters: Vec<_> = plan
+            .rules
+            .iter()
+            .filter(|r| r.intent.action == trade_control_core::intent::Action::Enter)
+            .collect();
+        assert!(
+            enters.len() >= 2,
+            "strategy-v2 should emit at least two enters, got {}\n{json}",
+            enters.len()
+        );
+        for rule in enters {
+            assert!(
+                !rule.intent.needs_golden,
+                "strategy-v2 ENTER rule {} still carries needs_golden: true despite --skip-golden",
+                rule.rule_id
+            );
+        }
+    }
+
     #[test]
     fn skip_golden_clears_needs_golden_on_mw_spec() {
         // Same guard on the M/W spec builder — `--skip-golden` clears it,
