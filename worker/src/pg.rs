@@ -70,6 +70,13 @@ impl PgStateStore {
         Self { pool }
     }
 
+    /// Borrow the underlying connection pool. The native runtime hands this to
+    /// sibling stores (e.g. [`crate::PgMetadataStore`]) so they share one pool
+    /// rather than opening a second.
+    pub fn pool(&self) -> &PgPool {
+        &self.pool
+    }
+
     /// Apply the bundled migrations. Idempotent — sqlx tracks applied versions
     /// in `_sqlx_migrations`.
     pub async fn migrate(&self) -> Result<(), StateError> {

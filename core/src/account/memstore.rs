@@ -203,4 +203,14 @@ mod tests {
         let err = pollster::block_on(resolver.resolve("nope")).unwrap_err();
         assert!(matches!(err, CredentialsError::NotFound(name) if name == "nope"));
     }
+
+    /// Run the cross-backend metadata conformance harness against the
+    /// reference in-memory store. The native `PgMetadataStore` runs the *same*
+    /// `run_all` in `worker/tests/` — keeping the two from drifting.
+    #[test]
+    fn metadata_conformance_against_memstore() {
+        use crate::account::metadata_conformance;
+        let store = MemMetadataStore::new();
+        pollster::block_on(metadata_conformance::run_all(&store, "mem"));
+    }
 }

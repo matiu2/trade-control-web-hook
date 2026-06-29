@@ -43,6 +43,13 @@ mod memstore;
 mod metadata;
 mod store;
 
+/// Cross-backend conformance harness for [`MetadataStore`] — one set of
+/// assertions run against both `MemMetadataStore` (the reference) and the
+/// native `PgMetadataStore`, so the two can't drift. Mirrors the `StateStore`
+/// conformance harness in [`crate::state::conformance`]. Test-only.
+#[cfg(any(test, feature = "test-support"))]
+pub mod metadata_conformance;
+
 pub use caps::AccountCaps;
 pub use creds::{
     Credentials, CredentialsError, CredentialsResolver, OandaCreds, TradeNationCreds,
