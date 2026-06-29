@@ -4,9 +4,10 @@
 //! # One long-lived interval per job — NOT a sleep-per-iteration loop
 //!
 //! This scheduler is **a small, fixed number of long-lived
-//! [`tokio::time::interval`] timers** (one per cron job — currently just the
-//! engine tick), each re-arming itself via `.tick().await`. It is emphatically
-//! **not** a per-plan / per-request timer fan-out.
+//! [`tokio::time::interval`] timers** (one per cron job — currently the engine
+//! tick, the break-even watcher, and the daily market-hours blackout refresh),
+//! each re-arming itself via `.tick().await`. It is emphatically **not** a
+//! per-plan / per-request timer fan-out.
 //!
 //! That distinction is load-bearing. tokio's timer driver guards its wheel with
 //! a single mutex; under a flood of short-lived `Sleep` timers being created and
@@ -49,21 +50,34 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use trade_control_cron::run_engine_tick;
+use trade_control_cron::{breakeven_watch, refresh_market_hours_if_due, run_engine_tick};
 
 use crate::SchedulerConfig;
 use crate::http::AppState;
 use crate::native_cron::NativeCronEnv;
 
 /// Start the scheduler on a dedicated current-thread + [`LocalSet`] background
-/// thread. Returns immediately; the thread runs the engine-tick interval for the
+/// thread. Returns immediately; the thread runs every cron-job interval for the
 /// process lifetime.
 ///
 /// `state` is the shared [`AppState`] (Postgres pool + secrets), `intervals`
-/// supplies the engine-tick period via [`SchedulerConfig::engine_interval`].
+/// supplies each job's period: the engine tick
+/// ([`SchedulerConfig::engine_interval`]), the break-even watcher (the frequent
+/// [`SchedulerConfig::upkeep_interval`]), and the daily market-hours blackout
+/// refresh (the self-gating [`SchedulerConfig::daily_tick_interval`]).
+///
+/// The three loops are joined on one [`LocalSet`], so they share the single
+/// current-thread runtime — a slow tick on one job yields cooperatively to the
+/// others rather than blocking them. (Two more cron jobs — the spread-blackout
+/// NY-close apply and its recovery watcher — are *not* wired here: they still
+/// live in the wasm worker because they need an HMAC signing-key seam the
+/// [`CronEnv`](trade_control_cron::CronEnv) trait doesn't expose; see the cron
+/// crate's `lib.rs` note.)
 pub fn run_scheduler(state: Arc<AppState>, intervals: SchedulerConfig) {
     let cron = NativeCronEnv::new(state.clone());
     let engine_period = intervals.engine_interval();
+    let breakeven_period = intervals.upkeep_interval();
+    let blackout_hours_period = intervals.daily_tick_interval();
 
     std::thread::Builder::new()
         .name("tc-scheduler".to_string())
@@ -80,11 +94,28 @@ pub fn run_scheduler(state: Arc<AppState>, intervals: SchedulerConfig) {
             };
             let local = tokio::task::LocalSet::new();
             local.block_on(&rt, async move {
-                engine_tick_loop(state, cron, engine_period).await;
+                // All cron loops run forever on the one current-thread runtime;
+                // `join!` drives them concurrently and never returns.
+                tokio::join!(
+                    engine_tick_loop(state.clone(), cron.clone(), engine_period),
+                    breakeven_loop(state.clone(), cron.clone(), breakeven_period),
+                    blackout_hours_loop(state, cron, blackout_hours_period),
+                );
             });
         })
         .map(|_| ())
         .unwrap_or_else(|e| tracing::error!("failed to spawn scheduler thread: {e}"));
+}
+
+/// Build a re-arming [`tokio::time::interval`] with the catch-up-suppressing
+/// [`MissedTickBehavior::Skip`](tokio::time::MissedTickBehavior::Skip). Shared by
+/// every cron loop so they all get the same single-timer, no-burst semantics
+/// (see the module docs for why this matters).
+fn skip_interval(period: Duration) -> tokio::time::Interval {
+    let mut interval = tokio::time::interval(period);
+    // A slow tick must not queue catch-up ticks — re-align to the next boundary.
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    interval
 }
 
 /// The engine-tick job: one long-lived re-arming [`tokio::time::interval`] that
@@ -92,9 +123,7 @@ pub fn run_scheduler(state: Arc<AppState>, intervals: SchedulerConfig) {
 /// a single interval (not a sleep-per-iteration loop) and why missed ticks are
 /// skipped rather than caught up.
 async fn engine_tick_loop(state: Arc<AppState>, cron: NativeCronEnv, period: Duration) {
-    let mut interval = tokio::time::interval(period);
-    // A slow tick must not queue catch-up ticks — re-align to the next boundary.
-    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut interval = skip_interval(period);
 
     tracing::info!("scheduler: engine tick every {}s", period.as_secs());
 
@@ -106,5 +135,41 @@ async fn engine_tick_loop(state: Arc<AppState>, cron: NativeCronEnv, period: Dur
         // would still take down only this scheduler thread, never the HTTP
         // receiver (separate thread + runtime).
         run_engine_tick(&state.store, &cron, now).await;
+    }
+}
+
+/// The break-even-watch job: every `period` (the frequent upkeep cadence) move
+/// each eligible open position's stop to break-even once a candle has closed past
+/// 50%-to-TP. Fail-soft per position (logs + skips), single re-arming interval.
+async fn breakeven_loop(state: Arc<AppState>, cron: NativeCronEnv, period: Duration) {
+    let mut interval = skip_interval(period);
+
+    tracing::info!("scheduler: breakeven watch every {}s", period.as_secs());
+
+    loop {
+        interval.tick().await;
+        let now = chrono::Utc::now();
+        breakeven_watch(&state.store, &cron, now).await;
+    }
+}
+
+/// The daily market-hours blackout refresh: ticks at the daily cadence and
+/// **self-gates on the 06:00 UTC hour** inside
+/// [`refresh_market_hours_if_due`] — most ticks no-op. The interval is just the
+/// wake cadence (mirroring the wasm worker's `now.minute() < 15` wake), so a tick
+/// faster than once an hour costs nothing but the hour check. Fail-open per
+/// instrument; single re-arming interval.
+async fn blackout_hours_loop(state: Arc<AppState>, cron: NativeCronEnv, period: Duration) {
+    let mut interval = skip_interval(period);
+
+    tracing::info!(
+        "scheduler: market-hours blackout refresh wake every {}s (self-gates on 06:00 UTC)",
+        period.as_secs()
+    );
+
+    loop {
+        interval.tick().await;
+        let now = chrono::Utc::now();
+        refresh_market_hours_if_due(&state.store, &cron, now).await;
     }
 }

@@ -4219,11 +4219,13 @@ name = "trade-control-cron"
 version = "0.1.0"
 dependencies = [
  "broker-oanda",
+ "broker-tradenation",
  "broker-tradenation-adapter",
  "chrono",
  "tracing",
  "trade-control-core",
  "trade-control-engine",
+ "tradenation-api 0.3.0",
 ]
 
 [[package]]

@@ -35,13 +35,20 @@
 //! position via TradeNation's `AmendCloseOrder` is demo-unverified. Every
 //! intended amend is logged prominently first so a demo run can read it back
 //! (SL moved to entry, TP unchanged) before this is trusted live.
+//!
+//! # Runtime-agnostic via the [`CronEnv`] seam
+//!
+//! Moved into `trade-control-cron` so both the wasm Cloudflare worker and the
+//! native VM scheduler run the *same* break-even logic. The `&Env`-hidden broker
+//! acquisition now travels through the [`CronEnv`] seam; the caller opens the
+//! [`StateStore`] and passes it in, exactly as the engine tick does.
 
 use chrono::{DateTime, Duration, Utc};
 use trade_control_core::broker::{AmendError, Broker, Candle, Granularity, OpenPosition};
 use trade_control_core::state::{BreakevenSnapshot, EntryAttempt, StateStore};
-use worker::Env;
 
-use super::sweep::{BrokerHandle, acquire_broker_for_account, open_store};
+use crate::broker_handle::BrokerHandle;
+use crate::seam::CronEnv;
 
 /// How far back to look for closed candles when deciding a break-even arm. The
 /// arm is latched and idempotent, so we only need to catch a candle that closed
@@ -52,14 +59,15 @@ const BREAKEVEN_LOOKBACK_BARS: i64 = 500;
 /// Walk every open position and move its stop to break-even when a candle has
 /// closed past 50%-to-TP. Per-row errors are logged and skipped — one bad row
 /// must never abort the loop (same discipline as the order sweep / blackout).
-pub async fn watch(env: &Env, now: DateTime<Utc>) {
-    let Some(store) = open_store(env) else {
-        return;
-    };
+pub async fn watch<S, C>(store: &S, cron: &C, now: DateTime<Utc>)
+where
+    S: StateStore,
+    C: CronEnv,
+{
     let attempts = match store.list_all_entry_attempts().await {
         Ok(v) => v,
         Err(err) => {
-            rlog_err!("breakeven watch: list_all_entry_attempts: {err}");
+            tracing::error!("breakeven watch: list_all_entry_attempts: {err}");
             return;
         }
     };
@@ -75,26 +83,26 @@ pub async fn watch(env: &Env, now: DateTime<Utc>) {
             accounts.push(a.account.clone());
         }
     }
-    rlog!(
+    tracing::info!(
         "breakeven watch: {} attempt(s), {} BE account(s)",
         attempts.len(),
         accounts.len(),
     );
     for account in accounts {
-        watch_account(env, &attempts, account.as_deref(), now).await;
+        watch_account(cron, &attempts, account.as_deref(), now).await;
     }
 }
 
 /// Move-to-BE every eligible open position on one account. Logs + skips per
 /// position.
-async fn watch_account(
-    env: &Env,
+async fn watch_account<C: CronEnv>(
+    cron: &C,
     attempts: &[EntryAttempt],
     account: Option<&str>,
     now: DateTime<Utc>,
 ) {
-    let Some(broker) = acquire_broker_for_account(env, account).await else {
-        rlog_err!(
+    let Some(broker) = cron.acquire_broker(account).await else {
+        tracing::error!(
             "breakeven watch[{}]: broker acquisition failed; skipping account",
             account.unwrap_or("<global>"),
         );
@@ -104,7 +112,7 @@ async fn watch_account(
     let positions = match list_positions(&broker, account_id).await {
         Ok(p) => p,
         Err(err) => {
-            rlog_err!(
+            tracing::error!(
                 "breakeven watch[{}]: list_open_positions: {err}",
                 account.unwrap_or("<global>"),
             );
@@ -163,7 +171,7 @@ async fn watch_one(
     // PRECONDITION-guarded amend: log the intent prominently so a demo run can
     // confirm `AmendCloseOrder`-on-open-position moved the SL (and left TP)
     // before this is trusted live.
-    rlog!(
+    tracing::info!(
         "breakeven watch[{}]: INTENT amend_stop trade={trade_id} id={} instrument={} dir={:?} \
          current_sl={current_stop} -> BE={new_stop} (entry={}, tp={}, best_close={best_close}) \
          (DEMO-CONFIRM AmendCloseOrder-on-open-position before trusting live)",
@@ -175,18 +183,18 @@ async fn watch_one(
         snap.take_profit,
     );
     match amend(broker, account.unwrap_or(""), &position.order_id, new_stop).await {
-        Ok(()) => rlog!(
+        Ok(()) => tracing::info!(
             "breakeven watch[{}]: amend_stop ok trade={trade_id} id={} -> {new_stop} (break-even)",
             account.unwrap_or("<global>"),
             position.order_id,
         ),
-        Err(AmendError::NotFound) => rlog!(
+        Err(AmendError::NotFound) => tracing::info!(
             "breakeven watch[{}]: amend_stop id={} not found (position closed?) trade={trade_id} — \
              benign",
             account.unwrap_or("<global>"),
             position.order_id,
         ),
-        Err(err) => rlog_err!(
+        Err(err) => tracing::error!(
             "breakeven watch[{}]: amend_stop trade={trade_id} id={} -> {new_stop} FAILED ({err}); \
              will retry next tick",
             account.unwrap_or("<global>"),
@@ -234,7 +242,7 @@ async fn fetch_candles(
     match res {
         Ok(c) => Some(c),
         Err(err) => {
-            rlog_err!("breakeven watch: get_candles({instrument}): {err}");
+            tracing::error!("breakeven watch: get_candles({instrument}): {err}");
             None
         }
     }

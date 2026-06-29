@@ -26,11 +26,9 @@
 
 mod blackout_apply;
 mod blackout_cancel;
-mod blackout_hours;
 mod blackout_restore;
 mod blackout_watch;
 mod blackout_widen;
-mod breakeven_watch;
 mod constants;
 mod seam;
 pub(crate) mod session_meta;
@@ -52,37 +50,39 @@ pub async fn scheduled(_event: ScheduledEvent, env: Env, ctx: ScheduleContext) {
     session_refresh::refresh_stale_sessions(&env, now, constants::STALE_AFTER).await;
     sweep::sweep_pending_orders(&env, now).await;
     blackout_watch::watch_recovery(&env, now).await;
-    // Break-even stop management — move open positions' stops to entry once a
-    // candle closes past 50%-to-TP (BUG-replay-no-breakeven-stop-at-50pct).
-    breakeven_watch::watch(&env, now).await;
 
-    // Server-side trade-plan engine — evaluate every registered plan against
-    // fresh broker candles and dispatch fired intents. Runs in parallel with
-    // the webhook (no self-gate); the `*/15` schedule stays — the `*/1`–`*/5`
-    // bump is Stage F, once the engine is proven on demo.
-    //
-    // The engine is generic over its store + backend seam (`CronEnv`) so the
-    // same code runs on the native runtime (Task #5). It now lives in the shared
-    // `trade-control-cron` crate; here we open the KV store and wrap `&Env`/`&ctx`
-    // in `EnvCronEnv` (our local `CronEnv` impl), then hand both to the shared
-    // tick, which threads them through the seam, never touching `Env` directly.
+    // Open the KV store + our `CronEnv` impl once and reuse them for every cron
+    // job that now lives in the shared `trade-control-cron` crate: the break-even
+    // watcher, the engine tick, and the daily market-hours blackout refresh. Each
+    // is generic over its store + backend seam (`CronEnv`) so the *same* code runs
+    // on the native runtime (Task #5); here we wrap `&Env`/`&ctx` in `EnvCronEnv`
+    // and hand both in, never touching `Env` inside the shared logic.
     if let Some(store) = sweep::open_store(&env) {
         let cron_env = seam::EnvCronEnv {
             env: &env,
             ctx: &ctx,
         };
-        trade_control_cron::run_engine_tick(&store, &cron_env, now).await;
-    }
 
-    // NY-close-edge job — fire exactly once per close hour, on the :00
-    // tick. `apply_if_ny_close_edge` re-checks `is_ny_close_edge` itself,
-    // so the minute gate is purely to avoid running it on all four ticks
-    // of the close hour.
-    if now.minute() < 15 {
-        blackout_apply::apply_if_ny_close_edge(&env, now).await;
-        // Daily market-hours blackout refresh — self-gates on its own hour
-        // (06:00 UTC). Resolves each traded instrument's current-season
-        // session into UTC no-entry windows and writes them to KV.
-        blackout_hours::refresh_if_due(&env, now).await;
+        // Break-even stop management — move open positions' stops to entry once a
+        // candle closes past 50%-to-TP (BUG-replay-no-breakeven-stop-at-50pct).
+        trade_control_cron::breakeven_watch(&store, &cron_env, now).await;
+
+        // Server-side trade-plan engine — evaluate every registered plan against
+        // fresh broker candles and dispatch fired intents. Runs in parallel with
+        // the webhook (no self-gate); the `*/15` schedule stays — the `*/1`–`*/5`
+        // bump is Stage F, once the engine is proven on demo.
+        trade_control_cron::run_engine_tick(&store, &cron_env, now).await;
+
+        // NY-close-edge job — fire exactly once per close hour, on the :00
+        // tick. `apply_if_ny_close_edge` re-checks `is_ny_close_edge` itself,
+        // so the minute gate is purely to avoid running it on all four ticks
+        // of the close hour.
+        if now.minute() < 15 {
+            blackout_apply::apply_if_ny_close_edge(&env, now).await;
+            // Daily market-hours blackout refresh — self-gates on its own hour
+            // (06:00 UTC). Resolves each traded instrument's current-season
+            // session into UTC no-entry windows and writes them to KV.
+            trade_control_cron::refresh_market_hours_if_due(&store, &cron_env, now).await;
+        }
     }
 }

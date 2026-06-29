@@ -30,16 +30,24 @@
 //! error, or a resolve miss writes **no** windows for that instrument — never a
 //! blackout invented from missing data. The ~26h TTL on each row means one
 //! skipped daily run can't strand a stale window either.
+//!
+//! # Runtime-agnostic via the [`CronEnv`] seam
+//!
+//! Moved into `trade-control-cron` so both the wasm Cloudflare worker and the
+//! native VM scheduler run the *same* refresh. The `&Env`-hidden broker
+//! acquisition now travels through the [`CronEnv`] seam; the caller opens the
+//! [`StateStore`] and passes it in. The `now.minute() < 15` once-per-hour gate
+//! is the caller's job (it already wraps the NY-close apply in the same gate);
+//! this fn only self-gates on the hour.
 
 use std::collections::BTreeSet;
 
 use chrono::{DateTime, Timelike, Utc};
 use trade_control_core::intent::{Buffers, NoEntryWindow, windows_from_session};
 use trade_control_core::state::StateStore;
-use worker::Env;
 
-use super::sweep::{BrokerHandle, acquire_broker_for_account, open_store};
-use crate::state::KvStateStore;
+use crate::broker_handle::BrokerHandle;
+use crate::seam::CronEnv;
 
 /// UTC hour at which the daily refresh runs (once per day). 06:00 UTC is a
 /// quiet, fixed point well away from the NY-close-edge spread-blackout job
@@ -52,43 +60,48 @@ const REFRESH_HOUR_UTC: u32 = 6;
 const WINDOW_TTL_SECONDS: u64 = 26 * 60 * 60;
 
 /// Run the daily refresh iff `now` is the refresh hour's first tick. Mirrors
-/// the NY-close-edge gating in [`super::blackout_apply`]: the caller's
-/// `now.minute() < 15` check plus this hour check make it fire exactly once on
-/// the :00 tick of [`REFRESH_HOUR_UTC`]. Safe to double-fire (idempotent
-/// overwrite), the gate just avoids redundant broker calls.
-pub async fn refresh_if_due(env: &Env, now: DateTime<Utc>) {
+/// the NY-close-edge gating in `blackout_apply`: the caller's `now.minute() < 15`
+/// check plus this hour check make it fire exactly once on the :00 tick of
+/// [`REFRESH_HOUR_UTC`]. Safe to double-fire (idempotent overwrite), the gate
+/// just avoids redundant broker calls.
+pub async fn refresh_if_due<S, C>(store: &S, cron: &C, now: DateTime<Utc>)
+where
+    S: StateStore,
+    C: CronEnv,
+{
     if now.hour() != REFRESH_HOUR_UTC {
         return;
     }
-    let Some(store) = open_store(env) else {
-        return;
-    };
-    refresh_market_hours(env, &store, now).await;
+    refresh_market_hours(store, cron, now).await;
 }
 
 /// Enumerate the distinct `(account, instrument)` pairs we trade, resolve each
 /// TradeNation instrument's session into UTC blackout windows, and write them.
 /// Per-instrument failures log and continue — one bad market never blocks the
 /// rest (the same per-row discipline the order sweep uses).
-async fn refresh_market_hours(env: &Env, store: &KvStateStore, now: DateTime<Utc>) {
+async fn refresh_market_hours<S, C>(store: &S, cron: &C, now: DateTime<Utc>)
+where
+    S: StateStore,
+    C: CronEnv,
+{
     let pairs = match distinct_pairs(store).await {
         Ok(p) => p,
         Err(err) => {
-            rlog_err!("blackout-hours: enumerate instruments: {err}");
+            tracing::error!("blackout-hours: enumerate instruments: {err}");
             return;
         }
     };
-    rlog!("blackout-hours: refreshing {} instrument(s)", pairs.len());
+    tracing::info!("blackout-hours: refreshing {} instrument(s)", pairs.len());
 
     for (account, instrument) in pairs {
-        refresh_one(env, store, account.as_deref(), &instrument, now).await;
+        refresh_one(store, cron, account.as_deref(), &instrument, now).await;
     }
 }
 
 /// Distinct `(account, instrument)` pairs across live entry attempts and
 /// registered trade plans. A `BTreeSet` dedups and gives stable ordering.
-async fn distinct_pairs(
-    store: &KvStateStore,
+async fn distinct_pairs<S: StateStore>(
+    store: &S,
 ) -> Result<BTreeSet<(Option<String>, String)>, trade_control_core::state::StateError> {
     let mut pairs = BTreeSet::new();
     for a in store.list_all_entry_attempts().await? {
@@ -103,21 +116,24 @@ async fn distinct_pairs(
 /// Resolve one instrument's session into windows and store them. TradeNation
 /// only — an OANDA-scoped instrument is skipped (no `market_info` equivalent).
 /// Any error path writes nothing for this instrument (fail-open).
-async fn refresh_one(
-    env: &Env,
-    store: &KvStateStore,
+async fn refresh_one<S, C>(
+    store: &S,
+    cron: &C,
     account: Option<&str>,
     instrument: &str,
     now: DateTime<Utc>,
-) {
-    let broker = match acquire_broker_for_account(env, account).await {
+) where
+    S: StateStore,
+    C: CronEnv,
+{
+    let broker = match cron.acquire_broker(account).await {
         Some(BrokerHandle::TradeNation(b)) => b,
         Some(BrokerHandle::Oanda(_)) => {
-            rlog!("blackout-hours: {instrument} is OANDA-scoped; skipped (TN-only)");
+            tracing::info!("blackout-hours: {instrument} is OANDA-scoped; skipped (TN-only)");
             return;
         }
         None => {
-            rlog_err!("blackout-hours: no broker for account={account:?} ({instrument})");
+            tracing::error!("blackout-hours: no broker for account={account:?} ({instrument})");
             return;
         }
     };
@@ -131,11 +147,11 @@ async fn refresh_one(
         .set_blackout_windows(instrument, &windows, now, WINDOW_TTL_SECONDS)
         .await
     {
-        Ok(()) => rlog!(
+        Ok(()) => tracing::info!(
             "blackout-hours: {instrument} → {} window(s) {windows:?}",
             windows.len()
         ),
-        Err(err) => rlog_err!("blackout-hours: write {instrument}: {err}"),
+        Err(err) => tracing::error!("blackout-hours: write {instrument}: {err}"),
     }
 }
 
@@ -143,7 +159,7 @@ async fn refresh_one(
 /// windows. Returns `None` (fail-open, logged) on any resolve / broker /
 /// derivation miss. An empty `Vec` (24h market, no gaps) is a valid `Some`.
 async fn resolve_windows(
-    broker: &crate::tradenation_adapter::TradeNationAdapter,
+    broker: &broker_tradenation_adapter::TradeNationAdapter,
     instrument: &str,
 ) -> Option<Vec<NoEntryWindow>> {
     let market =
@@ -152,7 +168,7 @@ async fn resolve_windows(
         {
             Ok(m) => m,
             Err(err) => {
-                rlog_err!("blackout-hours resolve_market({instrument}): {err:?}");
+                tracing::error!("blackout-hours resolve_market({instrument}): {err:?}");
                 return None;
             }
         };
@@ -160,7 +176,7 @@ async fn resolve_windows(
     let info = match broker.0.market_info(market.market_id).await {
         Ok(i) => i,
         Err(err) => {
-            rlog_err!("blackout-hours market_info({instrument}): {err:?}");
+            tracing::error!("blackout-hours market_info({instrument}): {err:?}");
             return None;
         }
     };

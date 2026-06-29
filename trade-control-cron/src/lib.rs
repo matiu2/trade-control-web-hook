@@ -12,9 +12,15 @@
 //! tick recording) are hidden behind the [`CronEnv`] seam, whose concrete impls
 //! live with their runtimes — never here.
 //!
-//! Only the engine tick has moved so far; the sweep / blackout / session /
-//! breakeven cron jobs follow later through this same crate.
+//! The engine tick, the break-even watcher, and the daily market-hours blackout
+//! refresh have moved here so far. The order sweep / spread-blackout
+//! apply+recovery / session cron jobs follow later through this same crate (two
+//! of them, `blackout_apply` and the spread-recovery watcher, also need an HMAC
+//! signing-key seam the [`CronEnv`] trait doesn't yet expose — see their
+//! still-in-worker counterparts).
 
+mod blackout_hours;
+mod breakeven_watch;
 mod broker_handle;
 mod engine;
 mod seam;
@@ -22,3 +28,6 @@ mod seam;
 pub use broker_handle::BrokerHandle;
 pub use engine::run_engine_tick;
 pub use seam::CronEnv;
+
+pub use blackout_hours::refresh_if_due as refresh_market_hours_if_due;
+pub use breakeven_watch::watch as breakeven_watch;
