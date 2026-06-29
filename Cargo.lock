@@ -4158,6 +4158,9 @@ dependencies = [
 name = "trade-control-worker"
 version = "0.1.0"
 dependencies = [
+ "broker-oanda",
+ "broker-tradenation",
+ "broker-tradenation-adapter",
  "chrono",
  "color-eyre",
  "serde",
@@ -4167,6 +4170,7 @@ dependencies = [
  "toml",
  "tracing",
  "trade-control-core",
+ "tradenation-api 0.3.0",
 ]
 
 [[package]]

@@ -4,6 +4,9 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+broker-oanda = { version = "0.1.0", path = "../broker-oanda" }
+broker-tradenation = { git = "https://github.com/matiu2/tradenation-api.git", tag = "broker-tradenation-v0.10.0", version = "0.10.0" }
+broker-tradenation-adapter = { version = "0.1.0", path = "../broker-tradenation-adapter" }
 chrono = { version = "0.4.45", features = ["serde"] }
 color-eyre = "0.6.5"
 serde = { version = "1.0.228", features = ["derive"] }
@@ -12,6 +15,7 @@ sqlx = { version = "0.9.0", default-features = false, features = ["postgres", "r
 toml = "1.1.2"
 tracing = "0.1.44"
 trade-control-core = { version = "0.1.0", path = "../core" }
+tradenation-api = { git = "https://github.com/matiu2/tradenation-api.git", tag = "broker-tradenation-v0.10.0", version = "0.3.0" }
 
 [dev-dependencies]
 tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros"] }

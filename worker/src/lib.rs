@@ -3,11 +3,13 @@
 //! (`PgStateStore`); Phase 1 adds the account metadata store, runtime config,
 //! the axum HTTP receiver, and the tokio scheduler. See `MIGRATION-VM-POSTGRES.md`.
 
+mod broker_factory;
 mod config;
 mod pg;
 mod pg_accounts;
 mod secrets;
 
+pub use broker_factory::{BrokerError, acquire_oanda, acquire_tn};
 pub use config::{Config, ConfigError, DatabaseConfig, HttpConfig, SchedulerConfig};
 pub use pg::PgStateStore;
 pub use pg_accounts::PgMetadataStore;
