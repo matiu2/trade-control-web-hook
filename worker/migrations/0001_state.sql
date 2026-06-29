@@ -13,6 +13,13 @@
 --    fixed string and `Some(name)` is the account name. We store `account text`
 --    NULL = global, non-null = that account. Global-first lookups become
 --    `WHERE account IS NULL OR account = $1`.
+--    A NULL global row must be storable, so account-scoped tables CANNOT put
+--    `account` in a PRIMARY KEY (PK columns are implicitly NOT NULL, which would
+--    reject every global row). Instead they enforce their natural-key uniqueness
+--    — global row included — with a UNIQUE INDEX over `COALESCE(account,'')`.
+--    The `_impl` upserts are DELETE-then-INSERT (NULL can't drive ON CONFLICT)
+--    so they never relied on a PK constraint name; the unique index is purely a
+--    correctness backstop.
 --  * Structured bodies (TradePlan, PlanState, MwState, SpreadBlackoutRecord,
 --    EntryAttempt, ControlEvent, NoEntryWindow[]) are stored as `jsonb` of the
 --    exact serde shape the KV store serialised — same wire format, so parity is
@@ -36,9 +43,10 @@ CREATE TABLE IF NOT EXISTS cooldown (
   account     text,                       -- NULL = global
   instrument  text        NOT NULL,
   set_at      timestamptz,
-  expires_at  timestamptz NOT NULL,
-  PRIMARY KEY (account, instrument)
+  expires_at  timestamptz NOT NULL
 );
+CREATE UNIQUE INDEX IF NOT EXISTS cooldown_key
+  ON cooldown (COALESCE(account, ''), instrument);
 CREATE INDEX IF NOT EXISTS cooldown_expiry ON cooldown (expires_at);
 
 -- prep flags — was prep:<scope>:<instrument>:<step>
@@ -48,9 +56,10 @@ CREATE TABLE IF NOT EXISTS prep (
   step        text        NOT NULL,
   set_at      timestamptz NOT NULL,       -- the prep's `now`, used for ordering gate
   setter_id   text        NOT NULL DEFAULT '',
-  expires_at  timestamptz NOT NULL,
-  PRIMARY KEY (account, instrument, step)
+  expires_at  timestamptz NOT NULL
 );
+CREATE UNIQUE INDEX IF NOT EXISTS prep_key
+  ON prep (COALESCE(account, ''), instrument, step);
 CREATE INDEX IF NOT EXISTS prep_expiry ON prep (expires_at);
 
 -- vetos — was veto:<scope>:<trade_id>:<instrument>:<name>
@@ -59,9 +68,10 @@ CREATE TABLE IF NOT EXISTS veto (
   trade_id    text        NOT NULL,
   instrument  text        NOT NULL,
   name        text        NOT NULL,
-  expires_at  timestamptz NOT NULL,
-  PRIMARY KEY (account, trade_id, instrument, name)
+  expires_at  timestamptz NOT NULL
 );
+CREATE UNIQUE INDEX IF NOT EXISTS veto_key
+  ON veto (COALESCE(account, ''), trade_id, instrument, name);
 CREATE INDEX IF NOT EXISTS veto_expiry ON veto (expires_at);
 
 -- prep blocks — was prep-blocked:<scope>:<instrument>:<step>
@@ -70,9 +80,10 @@ CREATE TABLE IF NOT EXISTS prep_block (
   instrument  text        NOT NULL,
   step        text        NOT NULL,
   set_at      timestamptz NOT NULL,
-  expires_at  timestamptz NOT NULL,
-  PRIMARY KEY (account, instrument, step)
+  expires_at  timestamptz NOT NULL
 );
+CREATE UNIQUE INDEX IF NOT EXISTS prep_block_key
+  ON prep_block (COALESCE(account, ''), instrument, step);
 CREATE INDEX IF NOT EXISTS prep_block_expiry ON prep_block (expires_at);
 
 -- blackout pauses — was pause:<trade_id>:<blackout_id> (no account scope)
@@ -102,9 +113,10 @@ CREATE TABLE IF NOT EXISTS retry_fire (
   account     text,
   trade_id    text        NOT NULL,
   shell_time  timestamptz NOT NULL,
-  expires_at  timestamptz NOT NULL,
-  PRIMARY KEY (account, trade_id, shell_time)
+  expires_at  timestamptz NOT NULL
 );
+CREATE UNIQUE INDEX IF NOT EXISTS retry_fire_key
+  ON retry_fire (COALESCE(account, ''), trade_id, shell_time);
 CREATE INDEX IF NOT EXISTS retry_fire_expiry ON retry_fire (expires_at);
 
 -- global spread-blackout window marker (singleton) — was a single KV key
@@ -136,9 +148,10 @@ CREATE TABLE IF NOT EXISTS mw_state (
   account     text,                       -- NULL = global (global-first lookup)
   trade_id    text        NOT NULL,
   body        jsonb       NOT NULL,       -- MwState
-  expires_at  timestamptz NOT NULL,
-  PRIMARY KEY (account, trade_id)
+  expires_at  timestamptz NOT NULL
 );
+CREATE UNIQUE INDEX IF NOT EXISTS mw_state_key
+  ON mw_state (COALESCE(account, ''), trade_id);
 CREATE INDEX IF NOT EXISTS mw_state_expiry ON mw_state (expires_at);
 
 -- ───────────────────────── per-trade rows (NO TTL) ──────────────────────────
@@ -147,26 +160,29 @@ CREATE INDEX IF NOT EXISTS mw_state_expiry ON mw_state (expires_at);
 CREATE TABLE IF NOT EXISTS trade_plan (
   account     text,                       -- NULL = global
   trade_id    text        NOT NULL,
-  body        jsonb       NOT NULL,       -- TradePlan
-  PRIMARY KEY (account, trade_id)
+  body        jsonb       NOT NULL        -- TradePlan
 );
+CREATE UNIQUE INDEX IF NOT EXISTS trade_plan_key
+  ON trade_plan (COALESCE(account, ''), trade_id);
 
 -- engine FSM state — was plan-state:<scope>:<trade_id>, no expiry (Bug #15)
 CREATE TABLE IF NOT EXISTS plan_state (
   account     text,
   trade_id    text        NOT NULL,
-  body        jsonb       NOT NULL,       -- PlanState
-  PRIMARY KEY (account, trade_id)
+  body        jsonb       NOT NULL        -- PlanState
 );
+CREATE UNIQUE INDEX IF NOT EXISTS plan_state_key
+  ON plan_state (COALESCE(account, ''), trade_id);
 
 -- placed entry attempts (multi-shot retry gate) — was entry-attempt:<scope>:<trade_id>:<attempt_no>
 CREATE TABLE IF NOT EXISTS entry_attempt (
   account         text,
   trade_id        text        NOT NULL,
   attempt_no      integer     NOT NULL,
-  body            jsonb       NOT NULL,   -- EntryAttempt (incl. broker_trade_id, set lazily)
-  PRIMARY KEY (account, trade_id, attempt_no)
+  body            jsonb       NOT NULL    -- EntryAttempt (incl. broker_trade_id, set lazily)
 );
+CREATE UNIQUE INDEX IF NOT EXISTS entry_attempt_key
+  ON entry_attempt (COALESCE(account, ''), trade_id, attempt_no);
 
 -- durable control-event audit trail — was control-event:<scope>:<trade_id>:<suffix>, no TTL
 CREATE TABLE IF NOT EXISTS control_event (
@@ -175,15 +191,17 @@ CREATE TABLE IF NOT EXISTS control_event (
   key_suffix  text        NOT NULL,       -- event.key_suffix(); append-only per (trade,suffix)
   seq         bigserial   NOT NULL,       -- append order within a trade
   body        jsonb       NOT NULL,       -- ControlEvent
-  set_at      timestamptz NOT NULL,       -- ordering for list_control_events (ascending)
-  PRIMARY KEY (account, trade_id, key_suffix, seq)
+  set_at      timestamptz NOT NULL        -- ordering for list_control_events (ascending)
 );
+CREATE UNIQUE INDEX IF NOT EXISTS control_event_key
+  ON control_event (COALESCE(account, ''), trade_id, key_suffix, seq);
 CREATE INDEX IF NOT EXISTS control_event_order ON control_event (account, trade_id, set_at);
 
 -- archived (terminated) plans — was archived-plan:<scope>:<trade_id>, no TTL
 CREATE TABLE IF NOT EXISTS archived_plan (
   account     text,
   trade_id    text        NOT NULL,
-  body        jsonb       NOT NULL,       -- ArchivedPlan (plan + final_state + archived_at)
-  PRIMARY KEY (account, trade_id)
+  body        jsonb       NOT NULL        -- ArchivedPlan (plan + final_state + archived_at)
 );
+CREATE UNIQUE INDEX IF NOT EXISTS archived_plan_key
+  ON archived_plan (COALESCE(account, ''), trade_id);

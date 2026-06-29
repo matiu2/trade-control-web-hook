@@ -2208,12 +2208,30 @@ mod memstore {
 #[cfg(any(test, feature = "test-support"))]
 pub use memstore::MemStateStore;
 
+/// Cross-backend conformance harness (Mem vs Pg). Gated behind the same
+/// `test-support` feature as `MemStateStore` so the worker crate (a non-test
+/// consumer driving `PgStateStore`) can reach it. See the module docs.
+#[cfg(any(test, feature = "test-support"))]
+pub mod conformance;
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn ts(s: &str) -> DateTime<Utc> {
         s.parse().unwrap()
+    }
+
+    /// The cross-backend conformance harness, run against the in-memory
+    /// reference store. The identical harness runs against `PgStateStore` in
+    /// the `trade-control-worker` crate — if this passes but that fails (or
+    /// vice versa), the two `StateStore` backends have drifted. This is the
+    /// Mem half of the KV→Postgres parity gate.
+    #[test]
+    fn conformance_against_memstore() {
+        use super::memstore::MemStateStore;
+        let store = MemStateStore::new();
+        pollster::block_on(conformance::run_all(&store, "mem"));
     }
 
     #[test]

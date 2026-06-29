@@ -23,8 +23,8 @@ use trade_control_core::control_event::ControlEvent;
 use trade_control_core::intent::{Action, NoEntryWindow};
 use trade_control_core::plan_state::PlanState;
 use trade_control_core::state::{
-    ArchivedPlan, EntryAttempt, MwState, NewsEntry, PauseEntry, SeenEntry, Snapshot,
-    SpreadBlackoutRecord, SpreadBlackoutWindow, StateError, StateStore, StoredPlan,
+    ArchivedPlan, EntryAttempt, MIN_TTL_SECONDS, MwState, NewsEntry, PauseEntry, SeenEntry,
+    Snapshot, SpreadBlackoutRecord, SpreadBlackoutWindow, StateError, StateStore, StoredPlan,
 };
 use trade_control_core::trade_plan::TradePlan;
 
@@ -33,6 +33,16 @@ use trade_control_core::trade_plan::TradePlan;
 /// the same (the KV store does likewise).
 fn backend(e: impl std::fmt::Display) -> StateError {
     StateError::Backend(e.to_string())
+}
+
+/// `expires_at` for a control row, applying the **same `MIN_TTL_SECONDS` floor
+/// the KV/`MemStateStore` path applies**. The control families clamp a tiny ttl
+/// up to 60s so a write can't evaporate within one cron tick; Pg must clamp
+/// identically or it diverges from the reference store (caught by the
+/// cross-backend conformance harness). `seen` and the no-TTL per-trade families
+/// deliberately do **not** clamp, so they don't call this.
+fn control_expires_at(now: DateTime<Utc>, ttl_seconds: u64) -> DateTime<Utc> {
+    now + chrono::Duration::seconds(ttl_seconds.max(MIN_TTL_SECONDS) as i64)
 }
 
 /// A [`StateStore`] backed by a Postgres connection pool. Cheap to clone
@@ -211,7 +221,10 @@ impl PgStateStore {
         hours: u32,
         now: DateTime<Utc>,
     ) -> Result<(), StateError> {
-        let expires_at = now + chrono::Duration::hours(hours as i64);
+        // Mem/KV stamps `(hours*3600).max(MIN_TTL_SECONDS)`; match it so an
+        // `hours = 0` cooldown floors to 60s on both backends instead of
+        // expiring instantly here.
+        let expires_at = control_expires_at(now, (hours as u64).saturating_mul(3600));
         // NULL account can't participate in a UNIQUE/ON CONFLICT key (NULLs are
         // distinct), so upsert via delete+insert within the (account,instrument)
         // scope. Matches KV's overwrite semantics.
@@ -271,7 +284,7 @@ impl PgStateStore {
         ttl_seconds: u64,
         setter_id: &str,
     ) -> Result<(), StateError> {
-        let expires_at = now + chrono::Duration::seconds(ttl_seconds as i64);
+        let expires_at = control_expires_at(now, ttl_seconds);
         sqlx::query(
             "DELETE FROM prep
              WHERE account IS NOT DISTINCT FROM $1 AND instrument = $2 AND step = $3",
@@ -357,7 +370,7 @@ impl PgStateStore {
         ttl_seconds: u64,
     ) -> Result<(), StateError> {
         // Presence is the signal; we still stamp expires_at for TTL.
-        let expires_at = Utc::now() + chrono::Duration::seconds(ttl_seconds as i64);
+        let expires_at = control_expires_at(Utc::now(), ttl_seconds);
         sqlx::query(
             "DELETE FROM veto
              WHERE account IS NOT DISTINCT FROM $1 AND trade_id = $2
@@ -444,7 +457,7 @@ impl PgStateStore {
         now: DateTime<Utc>,
         ttl_seconds: u64,
     ) -> Result<(), StateError> {
-        let expires_at = now + chrono::Duration::seconds(ttl_seconds as i64);
+        let expires_at = control_expires_at(now, ttl_seconds);
         sqlx::query(
             "DELETE FROM prep_block
              WHERE account IS NOT DISTINCT FROM $1 AND instrument = $2 AND step = $3",
@@ -523,7 +536,7 @@ impl PgStateStore {
         now: DateTime<Utc>,
         ttl_seconds: u64,
     ) -> Result<(), StateError> {
-        let expires_at = now + chrono::Duration::seconds(ttl_seconds as i64);
+        let expires_at = control_expires_at(now, ttl_seconds);
         sqlx::query(
             "INSERT INTO pause (trade_id, blackout_id, reason, set_at, expires_at)
              VALUES ($1, $2, $3, $4, $5)
@@ -606,7 +619,7 @@ impl PgStateStore {
         now: DateTime<Utc>,
         ttl_seconds: u64,
     ) -> Result<(), StateError> {
-        let expires_at = now + chrono::Duration::seconds(ttl_seconds as i64);
+        let expires_at = control_expires_at(now, ttl_seconds);
         sqlx::query(
             "INSERT INTO news_window (trade_id, news_id, reason, set_at, expires_at)
              VALUES ($1, $2, $3, $4, $5)
@@ -708,7 +721,7 @@ impl PgStateStore {
         shell_time: DateTime<Utc>,
         ttl_seconds: u64,
     ) -> Result<(), StateError> {
-        let expires_at = Utc::now() + chrono::Duration::seconds(ttl_seconds as i64);
+        let expires_at = control_expires_at(Utc::now(), ttl_seconds);
         sqlx::query(
             "DELETE FROM retry_fire
              WHERE account IS NOT DISTINCT FROM $1 AND trade_id = $2 AND shell_time = $3",
@@ -757,9 +770,14 @@ impl PgStateStore {
     async fn record_entry_attempt_impl(&self, attempt: EntryAttempt) -> Result<(), StateError> {
         let body = to_jsonb(&attempt)?;
         sqlx::query(
+            // ON CONFLICT must name the index's *expression* (COALESCE(account,''))
+            // — a global (NULL-account) row is keyed on '' in the unique index, and
+            // a bare `(account, …)` inference no longer matches any constraint since
+            // `account` left the PRIMARY KEY (it had to, so NULL globals are storable).
             "INSERT INTO entry_attempt (account, trade_id, attempt_no, body)
              VALUES ($1, $2, $3, $4)
-             ON CONFLICT (account, trade_id, attempt_no) DO UPDATE SET body = EXCLUDED.body",
+             ON CONFLICT (COALESCE(account, ''), trade_id, attempt_no)
+               DO UPDATE SET body = EXCLUDED.body",
         )
         .bind(attempt.account.as_deref())
         .bind(&attempt.trade_id)
@@ -851,7 +869,7 @@ impl PgStateStore {
         now: DateTime<Utc>,
         ttl_seconds: u64,
     ) -> Result<(), StateError> {
-        let expires_at = now + chrono::Duration::seconds(ttl_seconds as i64);
+        let expires_at = control_expires_at(now, ttl_seconds);
         let body = to_jsonb(&SpreadBlackoutWindow {
             opened_at: now,
             expires_at,
@@ -893,7 +911,7 @@ impl PgStateStore {
         now: DateTime<Utc>,
         ttl_seconds: u64,
     ) -> Result<(), StateError> {
-        let expires_at = now + chrono::Duration::seconds(ttl_seconds as i64);
+        let expires_at = control_expires_at(now, ttl_seconds);
         let body = to_jsonb(&windows.to_vec())?;
         sqlx::query(
             "INSERT INTO blackout_windows (instrument, windows, updated_at, expires_at)
@@ -938,7 +956,7 @@ impl PgStateStore {
         record: &SpreadBlackoutRecord,
         ttl_seconds: u64,
     ) -> Result<(), StateError> {
-        let expires_at = Utc::now() + chrono::Duration::seconds(ttl_seconds as i64);
+        let expires_at = control_expires_at(Utc::now(), ttl_seconds);
         let body = to_jsonb(record)?;
         sqlx::query(
             "INSERT INTO spread_blackout_record (trade_id, body, expires_at)
@@ -1021,7 +1039,7 @@ impl PgStateStore {
         state: &MwState,
         ttl_seconds: u64,
     ) -> Result<(), StateError> {
-        let expires_at = Utc::now() + chrono::Duration::seconds(ttl_seconds as i64);
+        let expires_at = control_expires_at(Utc::now(), ttl_seconds);
         let body = to_jsonb(state)?;
         sqlx::query("DELETE FROM mw_state WHERE account IS NOT DISTINCT FROM $1 AND trade_id = $2")
             .bind(account)
@@ -1279,9 +1297,10 @@ impl PgStateStore {
         };
         let body = to_jsonb(&archived)?;
         sqlx::query(
+            // Expression-index inference — see record_entry_attempt_impl.
             "INSERT INTO archived_plan (account, trade_id, body)
              VALUES ($1, $2, $3)
-             ON CONFLICT (account, trade_id) DO UPDATE SET body = EXCLUDED.body",
+             ON CONFLICT (COALESCE(account, ''), trade_id) DO UPDATE SET body = EXCLUDED.body",
         )
         .bind(account)
         .bind(&plan.trade_id)
