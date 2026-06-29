@@ -11,19 +11,26 @@ Worker entirely. axum HTTP receiver + per-task tokio scheduler, backed by
 `PgStateStore`, brokers built from the enc account store + env secrets.
 
 ### Build order (each step green before the next)
-- [ ] **Map the dispatch surface** (Explore agent on `src/lib.rs`): run_action
-      chain, every `worker::Response` site, broker factory, `open_store`,
-      secrets read off `Env`, recording sink. → seam map.
-- [ ] **Broker factory (native).** Replace `&worker::Env` secret-reads with a
-      native config: `broker-oanda::login(env)` + TN login currently take
-      `&worker::Env`. Build a `BrokerFactory` that constructs per-account
-      brokers from `~/.config/tradenation/accounts.enc` + env secrets
-      (`OANDA_API_KEY`, signing key, …). Non-wasm `tradenation-api` (CLI's dep).
-- [ ] **Config loader.** `config.toml` (bind addr/port, DB URL, intervals) +
-      env-secret resolver. `serde`/`toml`.
-- [ ] **axum receiver.** Lift `run_action` off `worker::Response` →
-      `IntoResponse`. Reuse `core` verify/parse/gates UNCHANGED. One POST route
-      for the webhook; bind `127.0.0.1:PORT` (reverse proxy terminates TLS).
+- [x] **Map the dispatch surface** (Explore agent) → seam map below.
+- [x] **Broker factory (native).** `worker/src/broker_factory.rs`:
+      `acquire_oanda(meta, secrets)` + `acquire_tn(meta)`. Plus the
+      `broker-tradenation-adapter` crate extraction + `OandaBroker::from_api_key`
+      + `PgMetadataStore` (account index). DONE (commits 86cb62a→0b19192).
+- [x] **Config loader.** `worker/src/config.rs` (TOML) + `secrets.rs` (env). DONE.
+- [ ] **Dispatch extraction → shared crate** (user DECIDED 2026-06-29).
+      Move `run_action` + `run_enter`/`run_close`/`run_invalidate`/
+      `run_veto_with_broker` + `handle_*` control handlers out of the root wasm
+      `src/lib.rs` into a shared crate (lean: a new `dispatch` crate, or `core`),
+      made generic over `<S: StateStore, B: Broker>` and returning a worker-FREE
+      `DispatchResult { status: u16, body: String, outcome: String }` (replacing
+      `ActionResult::Rejected { response: worker::Response }`). The wasm worker
+      maps `DispatchResult → worker::Response` at its edge; the native crate maps
+      it to axum `IntoResponse`. ONE dispatch, no drift. Stage it: enter path
+      first (run_enter + its gates), wasm worker green throughout, then
+      close/invalidate, then control handlers.
+- [ ] **axum receiver.** Once dispatch is worker-free + generic: one POST route,
+      verify/parse via `core`, call the shared `run_action::<PgStateStore, _>`,
+      map `DispatchResult` to `IntoResponse`. Bind `127.0.0.1:PORT` (proxy TLS).
       Graceful SIGTERM shutdown.
 - [ ] **Per-task scheduler.** Port `src/cron/*` one module at a time, each
       taking `&PgStateStore` + `&BrokerFactory` instead of `&Env`. Own tokio

@@ -695,7 +695,8 @@ async fn dispatch_action<B: Broker>(
             // Plan* are operator/control actions a plan never embeds as a fired
             // rule. Treat as a no-op rejection so it's visible but inert.
             ActionResult::Rejected {
-                response: worker::Response::error("engine: unsupported fired action", 400),
+                status: 400,
+                body: "engine: unsupported fired action".to_string(),
                 outcome: format!("rejected: unsupported-action {other:?}"),
             }
         }
@@ -712,12 +713,14 @@ fn control_result(resp: worker::Result<worker::Response>, ok_outcome: &str) -> A
         Ok(r) => {
             let code = r.status_code();
             ActionResult::Rejected {
-                response: Ok(r),
+                status: code,
+                body: format!("control dispatch returned status {code}"),
                 outcome: format!("rejected: control-status-{code}"),
             }
         }
         Err(err) => ActionResult::Rejected {
-            response: worker::Response::error("engine control dispatch error", 500),
+            status: 500,
+            body: "engine control dispatch error".to_string(),
             outcome: format!("rejected: control-error {err}"),
         },
     }

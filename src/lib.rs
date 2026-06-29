@@ -302,7 +302,7 @@ pub async fn main(mut req: Request, env: Env, ctx: Context) -> Result<Response> 
         match result {
             ActionResult::Ok(_) => Response::ok("ok"),
             ActionResult::Failed(_) => Response::error("action failed", 502),
-            ActionResult::Rejected { response, .. } => response,
+            ActionResult::Rejected { status, body, .. } => Response::error(body, status),
         }
     };
 
@@ -507,19 +507,22 @@ pub(crate) enum ActionResult {
     /// next fire is allowed to retry.
     Failed(String),
     /// Action was rejected before reaching the broker (gate, validation,
-    /// state error). The `response` is returned to the caller. **Not**
+    /// state error). The `status` + `body` are returned to the caller as
+    /// the HTTP rejection (built at the consumption edge). **Not**
     /// recorded against the seen id — gate rejections are transient
     /// (the condition might flip later in the alert window), so the
     /// next fire is allowed through.
     Rejected {
-        response: Result<Response>,
+        /// HTTP status for the rejection (e.g. 412, 500, 502).
+        status: u16,
+        /// Response body text (was the `Response::error` message).
+        body: String,
         outcome: String,
     },
 }
 
 impl ActionResult {
-    /// Short, `Response`-free description for logging (the `Rejected` variant
-    /// holds a `worker::Response`, which isn't `Debug`). Used by the
+    /// Short, `Response`-free description for logging. Used by the
     /// spread-blackout restore re-drive, which logs the outcome but does not
     /// route it through the HTTP dispatcher.
     pub(crate) fn describe(&self) -> String {
@@ -592,7 +595,8 @@ pub(crate) async fn run_invalidate<B: Broker>(
         Ok(n) => n,
         Err(outcome) => {
             return ActionResult::Rejected {
-                response: Response::error("cooldown_hours script error", 412),
+                status: 412,
+                body: "cooldown_hours script error".to_string(),
                 outcome,
             };
         }
@@ -604,7 +608,8 @@ pub(crate) async fn run_invalidate<B: Broker>(
     {
         rlog_err!("KV set_cooldown: {err}");
         return ActionResult::Rejected {
-            response: Response::error("state error", 500),
+            status: 500,
+            body: "state error".to_string(),
             outcome: "rejected: state-error".into(),
         };
     }
@@ -677,7 +682,8 @@ async fn run_close<B: Broker>(
     let news_outcome = if want_news {
         let Some(tid) = verified.intent.trade_id.as_deref() else {
             return ActionResult::Rejected {
-                response: Response::error("close with news-window gate requires `trade_id`", 400),
+                status: 400,
+                body: "close with news-window gate requires `trade_id`".to_string(),
                 outcome: "rejected: missing-trade-id".into(),
             };
         };
@@ -700,7 +706,8 @@ async fn run_close<B: Broker>(
             Err(err) => {
                 rlog_err!("KV list_news_windows_for_trade: {err}");
                 return ActionResult::Rejected {
-                    response: Response::error("state error", 500),
+                    status: 500,
+                    body: "state error".to_string(),
                     outcome: "rejected: state-error".into(),
                 };
             }
@@ -748,7 +755,8 @@ async fn run_close<B: Broker>(
                     verified.intent.instrument
                 );
                 return ActionResult::Rejected {
-                    response: Response::error("price-fetch failed", 500),
+                    status: 500,
+                    body: "price-fetch failed".to_string(),
                     outcome: "rejected: price-fetch-failed".into(),
                 };
             }
@@ -759,7 +767,8 @@ async fn run_close<B: Broker>(
     if let GateDecision::Reject { reason_code } = evaluate_close_gates(news_outcome, price_outcome)
     {
         return ActionResult::Rejected {
-            response: Response::error("close gates not satisfied", 423),
+            status: 423,
+            body: "close gates not satisfied".to_string(),
             outcome: format!("rejected: {reason_code}"),
         };
     }
@@ -774,7 +783,8 @@ async fn run_close<B: Broker>(
                 verified.intent.id
             );
             return ActionResult::Rejected {
-                response: Response::error("close blocked", 412),
+                status: 412,
+                body: "close blocked".to_string(),
                 outcome: "rejected: allow-close-false".into(),
             };
         }
@@ -784,7 +794,8 @@ async fn run_close<B: Broker>(
                 verified.intent.id
             );
             return ActionResult::Rejected {
-                response: Response::error("close blocked: needs-golden", 412),
+                status: 412,
+                body: "close blocked: needs-golden".to_string(),
                 outcome: "rejected: needs-golden".into(),
             };
         }
@@ -794,7 +805,8 @@ async fn run_close<B: Broker>(
                 verified.intent.id
             );
             return ActionResult::Rejected {
-                response: Response::error("close blocked: needs-confirmed", 412),
+                status: 412,
+                body: "close blocked: needs-confirmed".to_string(),
                 outcome: "rejected: needs-confirmed".into(),
             };
         }
@@ -804,7 +816,8 @@ async fn run_close<B: Broker>(
                 verified.intent.id
             );
             return ActionResult::Rejected {
-                response: Response::error("close blocked: script error", 412),
+                status: 412,
+                body: "close blocked: script error".to_string(),
                 outcome: format!("rejected: allow-close-{kind}"),
             };
         }
@@ -1203,7 +1216,8 @@ pub(crate) async fn run_enter<B: Broker>(
                     blackouts.join(", ")
                 );
                 return ActionResult::Rejected {
-                    response: Response::error("trade paused", 423),
+                    status: 423,
+                    body: "trade paused".to_string(),
                     outcome: format!("rejected: paused [{}]", blackouts.join(",")),
                 };
             }
@@ -1211,7 +1225,8 @@ pub(crate) async fn run_enter<B: Broker>(
             Err(err) => {
                 rlog_err!("KV list_pauses_for_trade: {err}");
                 return ActionResult::Rejected {
-                    response: Response::error("state error", 500),
+                    status: 500,
+                    body: "state error".to_string(),
                     outcome: "rejected: state-error".into(),
                 };
             }
@@ -1251,7 +1266,8 @@ pub(crate) async fn run_enter<B: Broker>(
                 outcome,
             } => {
                 return ActionResult::Rejected {
-                    response: Response::error(message, status),
+                    status,
+                    body: message.to_string(),
                     outcome,
                 };
             }
@@ -1277,7 +1293,8 @@ pub(crate) async fn run_enter<B: Broker>(
                 verified.intent.id
             );
             return ActionResult::Rejected {
-                response: Response::error("instrument cooled down", 423),
+                status: 423,
+                body: "instrument cooled down".to_string(),
                 outcome: "rejected: cooled-down".into(),
             };
         }
@@ -1285,7 +1302,8 @@ pub(crate) async fn run_enter<B: Broker>(
         Err(err) => {
             rlog_err!("KV is_cooled_down: {err}");
             return ActionResult::Rejected {
-                response: Response::error("state error", 500),
+                status: 500,
+                body: "state error".to_string(),
                 outcome: "rejected: state-error".into(),
             };
         }
@@ -1314,7 +1332,8 @@ pub(crate) async fn run_enter<B: Broker>(
                         verified.intent.id
                     );
                     return ActionResult::Rejected {
-                        response: Response::error("prep order violated", 412),
+                        status: 412,
+                        body: "prep order violated".to_string(),
                         outcome: format!("rejected: prep-order-violated ({step})"),
                     };
                 }
@@ -1327,14 +1346,16 @@ pub(crate) async fn run_enter<B: Broker>(
                     verified.intent.id
                 );
                 return ActionResult::Rejected {
-                    response: Response::error("missing prep", 412),
+                    status: 412,
+                    body: "missing prep".to_string(),
                     outcome: format!("rejected: missing-prep ({step})"),
                 };
             }
             Err(err) => {
                 rlog_err!("KV get_prep: {err}");
                 return ActionResult::Rejected {
-                    response: Response::error("state error", 500),
+                    status: 500,
+                    body: "state error".to_string(),
                     outcome: "rejected: state-error".into(),
                 };
             }
@@ -1355,7 +1376,8 @@ pub(crate) async fn run_enter<B: Broker>(
             verified.intent.id
         );
         return ActionResult::Rejected {
-            response: Response::error("enter requires trade_id", 400),
+            status: 400,
+            body: "enter requires trade_id".to_string(),
             outcome: "rejected: missing-trade-id".into(),
         };
     };
@@ -1376,7 +1398,8 @@ pub(crate) async fn run_enter<B: Broker>(
                     verified.intent.id
                 );
                 return ActionResult::Rejected {
-                    response: Response::error("veto active", 412),
+                    status: 412,
+                    body: "veto active".to_string(),
                     outcome: format!("rejected: veto-active ({veto})"),
                 };
             }
@@ -1384,7 +1407,8 @@ pub(crate) async fn run_enter<B: Broker>(
             Err(err) => {
                 rlog_err!("KV is_vetoed: {err}");
                 return ActionResult::Rejected {
-                    response: Response::error("state error", 500),
+                    status: 500,
+                    body: "state error".to_string(),
                     outcome: "rejected: state-error".into(),
                 };
             }
@@ -1439,7 +1463,8 @@ pub(crate) async fn run_enter<B: Broker>(
                 verified.intent.id
             );
             return ActionResult::Rejected {
-                response: Response::ok("declined: mw-not-armed"),
+                status: 200,
+                body: "declined: mw-not-armed".to_string(),
                 outcome: "declined: mw-not-armed".into(),
             };
         }
@@ -1448,7 +1473,8 @@ pub(crate) async fn run_enter<B: Broker>(
         Err(err) => {
             rlog_err!("resolve: {err}");
             return ActionResult::Rejected {
-                response: Response::error("rejected", 400),
+                status: 400,
+                body: "rejected".to_string(),
                 outcome: "rejected: resolve-failed".into(),
             };
         }
@@ -1478,7 +1504,8 @@ pub(crate) async fn run_enter<B: Broker>(
             verified.intent.id
         );
         return ActionResult::Rejected {
-            response: Response::error("veto active", 412),
+            status: 412,
+            body: "veto active".to_string(),
             outcome: format!("rejected: veto-active ({})", elv.name),
         };
     }
@@ -1496,7 +1523,8 @@ pub(crate) async fn run_enter<B: Broker>(
                 verified.intent.id
             );
             return ActionResult::Rejected {
-                response: Response::error("entry blocked", 412),
+                status: 412,
+                body: "entry blocked".to_string(),
                 outcome: "rejected: allow-entry-false".into(),
             };
         }
@@ -1506,7 +1534,8 @@ pub(crate) async fn run_enter<B: Broker>(
                 verified.intent.id
             );
             return ActionResult::Rejected {
-                response: Response::error("entry blocked: needs-golden", 412),
+                status: 412,
+                body: "entry blocked: needs-golden".to_string(),
                 outcome: "rejected: needs-golden".into(),
             };
         }
@@ -1516,7 +1545,8 @@ pub(crate) async fn run_enter<B: Broker>(
                 verified.intent.id
             );
             return ActionResult::Rejected {
-                response: Response::error("entry blocked: needs-confirmed", 412),
+                status: 412,
+                body: "entry blocked: needs-confirmed".to_string(),
                 outcome: "rejected: needs-confirmed".into(),
             };
         }
@@ -1526,7 +1556,8 @@ pub(crate) async fn run_enter<B: Broker>(
                 verified.intent.id
             );
             return ActionResult::Rejected {
-                response: Response::error("entry blocked: script error", 412),
+                status: 412,
+                body: "entry blocked: script error".to_string(),
                 outcome: format!("rejected: allow-entry-{kind}"),
             };
         }
@@ -1551,7 +1582,8 @@ pub(crate) async fn run_enter<B: Broker>(
                 Err(outcome) => {
                     rlog!("entry rejected: {outcome} (id={})", verified.intent.id);
                     return ActionResult::Rejected {
-                        response: Response::error("entry blocked: expiry-bars script", 412),
+                        status: 412,
+                        body: "entry blocked: expiry-bars script".to_string(),
                         outcome,
                     };
                 }
@@ -1568,7 +1600,8 @@ pub(crate) async fn run_enter<B: Broker>(
                         verified.intent.id
                     );
                     return ActionResult::Rejected {
-                        response: Response::error("entry blocked: expiry-bars out of range", 400),
+                        status: 400,
+                        body: "entry blocked: expiry-bars out of range".to_string(),
                         outcome: "rejected: expiry-bars-out-of-range".into(),
                     };
                 }
@@ -1615,7 +1648,8 @@ pub(crate) async fn run_enter<B: Broker>(
                     verified.intent.id
                 );
                 return ActionResult::Rejected {
-                    response: Response::error("entry blocked: market-hours blackout", 423),
+                    status: 423,
+                    body: "entry blocked: market-hours blackout".to_string(),
                     outcome: "rejected: market-blackout".into(),
                 };
             }
@@ -1691,7 +1725,8 @@ pub(crate) async fn run_enter<B: Broker>(
                         verified.intent.id
                     );
                     return ActionResult::Rejected {
-                        response: Response::error(&message, 423),
+                        status: 423,
+                        body: message,
                         outcome: "rejected: spread-blackout".into(),
                     };
                 }
@@ -1749,7 +1784,8 @@ pub(crate) async fn run_enter<B: Broker>(
                     verified.intent.id
                 );
                 return ActionResult::Rejected {
-                    response: Response::error(&message, 422),
+                    status: 422,
+                    body: message,
                     outcome: "rejected: sl-below-10x-spread".into(),
                 };
             }
@@ -2015,7 +2051,8 @@ async fn maybe_update_mw_state<B: Broker>(
                 account.unwrap_or("<global>")
             );
             MwStateOutcome::Cancelled(ActionResult::Rejected {
-                response: Response::error("mw pattern cancelled (validity floor breached)", 412),
+                status: 412,
+                body: "mw pattern cancelled (validity floor breached)".to_string(),
                 outcome: "rejected: mw-cancel (validity-floor)".into(),
             })
         }
@@ -2597,7 +2634,8 @@ async fn run_veto_with_broker<B: Broker>(
 ) -> ActionResult {
     let Some(name) = verified.intent.name.as_deref() else {
         return ActionResult::Rejected {
-            response: Response::error("veto requires `name`", 400),
+            status: 400,
+            body: "veto requires `name`".to_string(),
             outcome: "rejected: missing-name".into(),
         };
     };
@@ -2605,7 +2643,8 @@ async fn run_veto_with_broker<B: Broker>(
     // defence-in-depth (the veto key is scoped per-setup).
     let Some(trade_id) = verified.intent.trade_id.as_deref() else {
         return ActionResult::Rejected {
-            response: Response::error("veto requires trade_id", 400),
+            status: 400,
+            body: "veto requires trade_id".to_string(),
             outcome: "rejected: missing-trade-id".into(),
         };
     };
@@ -2618,7 +2657,8 @@ async fn run_veto_with_broker<B: Broker>(
         Ok(n) => n,
         Err(outcome) => {
             return ActionResult::Rejected {
-                response: Response::error("ttl_hours script error", 412),
+                status: 412,
+                body: "ttl_hours script error".to_string(),
                 outcome,
             };
         }
@@ -2650,7 +2690,8 @@ async fn run_veto_with_broker<B: Broker>(
     {
         rlog_err!("KV set_veto: {err}");
         return ActionResult::Rejected {
-            response: Response::error("state error", 500),
+            status: 500,
+            body: "state error".to_string(),
             outcome: "rejected: state-error".into(),
         };
     }
