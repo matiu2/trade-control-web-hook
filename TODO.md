@@ -1,52 +1,66 @@
-# TODO — fix `06-close-on-reversal` never evaluated (engine + replay)
+# TODO — Phase 0: PgStateStore + conformance harness
 
-Bug: `BUG-replay-close-on-reversal-not-evaluated.md`. A `06-close-on-reversal`
-rule (`Trigger::PinePattern`, `action: close`, `dir` = opposite of trade) never
-fires — neither in the worker nor in replay — because `eval_trigger` returns
-`false` for every `PinePattern` trigger (only `evaluate_entry`'s `eval_pine_entry`
-ever runs pine detection). So an open position is over-held to SL/TP/window-end.
+Branch: `feat/pg-state-store` (worktree, sibling of repo).
+DB: `postgresql://candle_cache:candle_cache@localhost:5432/trade_control_dev`
+Plan: see `MIGRATION-VM-POSTGRES.md`.
 
-This is a SHARED-engine gap (see strategy_changes_in_both_replayer_and_worker):
-fixing the engine fixes the worker dispatch AND the replay fire.
+## In progress
+- [x] **All 17 state families ported** into `worker/src/pg.rs` — zero `todo!()`,
+      builds clean, clippy clean, fmt clean. seen test green vs live DB.
+- [ ] **NEXT: Mem-vs-Pg conformance harness** — the real parity proof. Extract
+      MemStateStore tests into a generic `conformance<S: StateStore>(store)` and
+      run against both. (snapshot is Pg-only: Mem returns empties by design.)
+- [ ] Then: `sqlx prepare` (offline), per-family edge tests, commit batches.
 
-## Plan
+### Porting notes for the morning (things to double-check, NOT guessed-final)
+- `set_veto`/`mark_retry_fire_seen`/`upsert_*` stamp `expires_at` from
+  `Utc::now()` (trait gives no `now`), whereas KV used the worker clock. Fine for
+  live, but the offline replay sets a replay clock on MemStore — Pg can't honour
+  that yet. If replay ever drives Pg, add a clock injection. Flagged.
+- `control_event`: KV keyed on `key_suffix` alone (same suffix overwrote). Pg
+  appends with a `seq`. key_suffix embeds set_at epoch, so same-suffix = same
+  instant → observationally identical for the audit reader. Verify against the
+  `plan show` consumer before calling done.
+- Expiry sweep (periodic DELETE) not written yet — reads filter correctly so
+  it's correctness-safe; the DELETE job lands with the scheduler (Phase 1).
 
-- [x] **Engine — fire a `PinePattern` guard via the detector.** In
-      `evaluate_guards`, when a guard rule's trigger is `PinePattern`, route it
-      through `eval_pine_entry` (same detector as the enter), gated by direction.
-      On a detector fire, also require the reversal candle's price to sit inside
-      one of the intent's `sr_bands` (when `inside_window` lists `price`) — the
-      pure half of the worker's `run_close` contextual gate, so the engine only
-      fires a real reversal-close. News-window gate stays the worker's job (KV).
-      Push the intent **with the latched signal shell** (so `run_close` sees
-      golden/confirmed) and set `Phase::Done`.
-  - [x] Add a pure `price_in_any_band(price, bands)` helper to the engine
-        (mirrors `src/lib.rs::price_band_hit`; worker copy stays — it reads a
-        live broker price, not a candle).
-  - [x] Tests: a short plan + a long reversal candle in an SR band fires the
-        close guard; the same candle OUTSIDE every band does not; a long
-        reversal with no band requirement still fires; same-direction ignored.
+## Phase 0 checklist
+- [x] Fresh `worker` crate (`trade-control-worker`), workspace member, edition 2024
+- [x] sqlx added (`postgres,runtime-tokio,tls-rustls,chrono,macros,json,migrate`)
+- [x] Schema migration `worker/migrations/0001_state.sql` (17 typed tables) —
+      APPROVED, applied to dev DB
+- [x] `worker/src/pg.rs` — `PgStateStore` (connect/from_pool/migrate) + full
+      `impl StateStore` skeleton; **seen family ported & passing**
+- [x] First round-trip test green vs live dev DB (`tests/pg_seen.rs`) —
+      caught + fixed an INT4/i64 decode bug
+- [ ] Port the other 16 families (cooldown → prep → veto → … → archived_plan)
+- [ ] Extract existing MemStateStore `#[test]`s into a generic
+      `conformance<S: StateStore>(store)` harness
+- [ ] Run conformance against MemStateStore (must still pass — no behaviour change)
+- [ ] Run conformance against PgStateStore (parity gate)
+- [ ] `sqlx prepare` (offline mode) so other machines/CI build without a live DB
+- [ ] clippy + fmt
+- [ ] commit + push
 
-- [x] **Replay — exit the open position on a close fire.** The fill simulator
-      (`report.rs`) walks each enter's forward path independently and ignored
-      close fires. A `close` fire that lands after an enter's fill and before its
-      SL/TP now flattens the position at the close bar's close price.
-  - [x] Post-pass `apply_reversal_close` threads close fires into the per-enter
-        fill resolution (report + annotate share `resolve_fire`, now `+closes`).
-  - [x] Surface it: `fill: CLOSED ON REVERSAL — in @ … → exit … (<bar>)`,
-        tallied under `REV:` distinct from TP/SL; annotate label `reversal`.
-  - [x] Test: end-to-end `run`→`render` (multi-shot short fills, bullish reversal
-        in band closes it) + `apply_reversal_close` unit matrix.
+## Decisions locked
+- Crate: fresh `worker` (NOT in core — keeps core wasm-clean for in-tree CF). Port
+  old-worker pieces in as needed, not bulk.
+- Schema: 17 flat typed tables, no FKs (hierarchy conventional). account=NULL=global.
+- Expiry: lazy filter on read + periodic DELETE (sweep, folded into scheduler later).
+- DB: `postgresql://candle_cache:candle_cache@localhost:5432/trade_control_dev`
 
-- [x] cargo clippy (-D warnings) + fmt + full workspace test green
-      (core 605, engine 67, worker 217, trading_view 34, tv-arm 165, tv-news 76,
-      cli replay 48).
-- [x] README (engine close-on-reversal note + Candle replay note) + CHANGELOG.
-- [ ] Commit + push branch. Tag/advance parent + deploy: defer to user —
-      staging is mid-bake (v60 marker), so DON'T disturb it; this is a
-      main/dev-targeted fix.
+## State families (→ tables)
+seen · cooldown · prep · veto · prep_block · pause · news_window ·
+entry_attempt · retry_fire · spread_blackout_window(singleton) ·
+blackout_windows(per-instrument) · spread_blackout_record · mw_state ·
+trade_plan · plan_state · control_event · archived_plan
 
-## Verification
+## TTL rule (Bug #15 — must preserve)
+- **Per-trade rows** (trade_plan, plan_state, archived_plan, entry_attempt,
+  control_event): **NO expiry**.
+- **Control rows** (cooldown, veto, prep, prep_block, pause, news_window,
+  retry_fire, blackout windows/records): carry `expires_at`, filtered on read.
 
-Re-replay trade 075 Wheat: leg 3 closes on 06-25 23:00 ≈ 5.860 (+~0.16R), not
-held to window-end. `pine-close` evaluations > 0 in the debug log.
+## Open question for user before writing pg.rs
+- Sweep strategy for expired rows: lazy-filter-on-read only, or also a periodic
+  `DELETE WHERE expires_at <= now()` cleanup? (KV deletes passively on TTL.)
