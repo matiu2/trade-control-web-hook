@@ -13,12 +13,14 @@
 //! live with their runtimes — never here.
 //!
 //! The engine tick, the break-even watcher, the daily market-hours blackout
-//! refresh, and the **spread-blackout cluster** (NY-close apply + cancel +
-//! recovery watcher + restore) have moved here. The apply/cancel/restore jobs
-//! re-verify a *stored* signed body, so they use the [`CronEnv::signing_key`]
-//! seam — the same key the HTTP path verifies with. The order sweep / session
-//! refresh cron jobs still live in the wasm worker (they run on the raw `&Env`
-//! path and aren't ported yet).
+//! refresh, the **order sweep** (`sweep_pending_orders`), and the
+//! **spread-blackout cluster** (NY-close apply + cancel + recovery watcher +
+//! restore) have moved here. The apply/cancel/restore jobs re-verify a *stored*
+//! signed body, so they use the [`CronEnv::signing_key`] seam — the same key the
+//! HTTP path verifies with. Only `session_refresh` stays wasm-only: it pre-warms
+//! the KV session cache, an optimization the native runtime doesn't need (it
+//! re-logins on demand via the broker factory), so it has no native equivalent
+//! by design — a deliberate divergence, not a missing port.
 
 mod blackout_apply;
 mod blackout_cancel;
@@ -30,6 +32,7 @@ mod broker_handle;
 mod constants;
 mod engine;
 mod seam;
+mod sweep;
 
 pub use broker_handle::BrokerHandle;
 pub use engine::run_engine_tick;
@@ -41,3 +44,4 @@ pub use blackout_hours::refresh_if_due as refresh_market_hours_if_due;
 pub use blackout_restore::restore_cancelled_orders;
 pub use blackout_watch::watch_recovery;
 pub use breakeven_watch::watch as breakeven_watch;
+pub use sweep::sweep_pending_orders;

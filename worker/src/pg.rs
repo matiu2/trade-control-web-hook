@@ -85,6 +85,68 @@ impl PgStateStore {
             .await
             .map_err(backend)
     }
+
+    /// Garbage-collect physically-expired control rows — the native runtime's
+    /// stand-in for KV's automatic TTL eviction.
+    ///
+    /// The KV backend drops a row the moment its TTL passes; Postgres does not,
+    /// so every TTL-bearing table (`expires_at` column) accumulates
+    /// already-logically-expired rows. Every read on those tables already
+    /// filters `expires_at > now()`, so a row past `now()` is *invisible* to the
+    /// app — this is **pure physical cleanup**, never a correctness operation. It
+    /// only deletes rows already logically gone.
+    ///
+    /// Runs `DELETE FROM <table> WHERE expires_at < now()` for **every** table in
+    /// the migration that carries an `expires_at` column (enumerated below — keep
+    /// in sync with `migrations/0001_state.sql`). The no-TTL per-trade families
+    /// (`trade_plan`, `plan_state`, `entry_attempt`, `control_event`,
+    /// `archived_plan`) have no `expires_at` and are deliberately never touched.
+    ///
+    /// **Fail-soft per table**: a failure on one table is logged and the GC
+    /// continues to the rest; the call returns the **sum of rows deleted from the
+    /// tables that succeeded** rather than aborting. One wedged table must never
+    /// jam the housekeeping for every other table.
+    ///
+    /// Native-only — this lives on [`PgStateStore`] and is **not** on the
+    /// [`StateStore`] trait; the wasm KV store gets free TTL and needs no GC.
+    pub async fn gc_expired(&self) -> Result<u64, StateError> {
+        // Every table with an `expires_at` column in 0001_state.sql. Keep this
+        // list exhaustive — a missed table silently leaks expired rows forever.
+        const TTL_TABLES: &[&str] = &[
+            "seen",
+            "cooldown",
+            "prep",
+            "veto",
+            "prep_block",
+            "pause",
+            "news_window",
+            "retry_fire",
+            "spread_blackout_window",
+            "blackout_windows",
+            "spread_blackout_record",
+            "mw_state",
+        ];
+
+        let mut total: u64 = 0;
+        for table in TTL_TABLES {
+            // Table names are compile-time constants from `TTL_TABLES`, never
+            // user input, so the inline format is injection-safe — assert that to
+            // sqlx 0.9's `SqlSafeStr` guard, which rejects bare runtime strings.
+            let sql = format!("DELETE FROM {table} WHERE expires_at < now()");
+            match sqlx::query(sqlx::AssertSqlSafe(sql))
+                .execute(&self.pool)
+                .await
+            {
+                Ok(res) => total += res.rows_affected(),
+                Err(err) => {
+                    // Fail-soft per table: log and keep going so one wedged table
+                    // doesn't abort the whole GC.
+                    tracing::error!("gc_expired: DELETE on '{table}' failed (skipping): {err}");
+                }
+            }
+        }
+        Ok(total)
+    }
 }
 
 /// Serialise an [`Action`] to its kebab-case wire string (matches the KV store,

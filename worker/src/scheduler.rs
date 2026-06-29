@@ -6,9 +6,18 @@
 //! This scheduler is **a small, fixed number of long-lived
 //! [`tokio::time::interval`] timers** (one per cron job — currently the engine
 //! tick, the break-even watcher, the daily market-hours blackout refresh, the
-//! spread-recovery watcher, and the NY-close-edge spread-blackout apply), each
-//! re-arming itself via `.tick().await`. It is emphatically **not** a per-plan /
-//! per-request timer fan-out.
+//! spread-recovery watcher, the NY-close-edge spread-blackout apply, the order
+//! sweep, and the Postgres expired-row GC), each re-arming itself via
+//! `.tick().await`. It is emphatically **not** a per-plan / per-request timer
+//! fan-out.
+//!
+//! `session_refresh` has no loop here on purpose: it is a wasm-only KV
+//! session-cache pre-warm; the native runtime re-logins on demand via the broker
+//! factory, so it has no native scheduler job by design (a deliberate
+//! divergence, not a missing port). The expired-row GC
+//! ([`PgStateStore::gc_expired`](crate::PgStateStore::gc_expired)) is the inverse
+//! — a *native-only* job with no wasm equivalent, since KV evicts expired rows
+//! automatically.
 //!
 //! That distinction is load-bearing. tokio's timer driver guards its wheel with
 //! a single mutex; under a flood of short-lived `Sleep` timers being created and
@@ -53,7 +62,7 @@ use std::time::Duration;
 
 use trade_control_cron::{
     apply_if_ny_close_edge, breakeven_watch, refresh_market_hours_if_due, run_engine_tick,
-    watch_recovery,
+    sweep_pending_orders, watch_recovery,
 };
 
 use crate::SchedulerConfig;
@@ -66,9 +75,11 @@ use crate::native_cron::NativeCronEnv;
 ///
 /// `state` is the shared [`AppState`] (Postgres pool + secrets), `intervals`
 /// supplies each job's period: the engine tick
-/// ([`SchedulerConfig::engine_interval`]), the break-even watcher (the frequent
-/// [`SchedulerConfig::upkeep_interval`]), and the daily market-hours blackout
-/// refresh (the self-gating [`SchedulerConfig::daily_tick_interval`]).
+/// ([`SchedulerConfig::engine_interval`]), the break-even watcher + order sweep +
+/// spread-recovery watcher + NY-close apply (the frequent
+/// [`SchedulerConfig::upkeep_interval`]), the daily market-hours blackout refresh
+/// (the self-gating [`SchedulerConfig::daily_tick_interval`]), and the expired-row
+/// GC (the hourly [`SchedulerConfig::expiry_sweep_interval`]).
 ///
 /// All loops are joined on one [`LocalSet`], so they share the single
 /// current-thread runtime — a slow tick on one job yields cooperatively to the
@@ -76,7 +87,9 @@ use crate::native_cron::NativeCronEnv;
 /// recovery watcher are wired here too (they re-verify a stored signed body via
 /// the [`CronEnv::signing_key`](trade_control_cron::CronEnv::signing_key) seam);
 /// `blackout_restore` / `blackout_cancel` are *called by* the watcher/apply, not
-/// scheduled directly, so they get no interval of their own.
+/// scheduled directly, so they get no interval of their own. The expired-row GC
+/// is native-only (KV evicts expired rows for free) and so takes the
+/// [`PgStateStore`](crate::PgStateStore) directly, not the `CronEnv` seam.
 pub fn run_scheduler(state: Arc<AppState>, intervals: SchedulerConfig) {
     let cron = NativeCronEnv::new(state.clone());
     let engine_period = intervals.engine_interval();
@@ -87,6 +100,11 @@ pub fn run_scheduler(state: Arc<AppState>, intervals: SchedulerConfig) {
     // `is_ny_close_edge`, mirroring the wasm worker's `now.minute() < 15` wake.
     let blackout_watch_period = intervals.upkeep_interval();
     let blackout_apply_period = intervals.upkeep_interval();
+    // The order sweep runs at the frequent upkeep cadence (the wasm worker ran it
+    // on every 15-min cron tick). The expired-row GC is the native-only TTL
+    // housekeeping, hourly by default.
+    let sweep_period = intervals.upkeep_interval();
+    let expiry_gc_period = intervals.expiry_sweep_interval();
 
     std::thread::Builder::new()
         .name("tc-scheduler".to_string())
@@ -110,7 +128,9 @@ pub fn run_scheduler(state: Arc<AppState>, intervals: SchedulerConfig) {
                     breakeven_loop(state.clone(), cron.clone(), breakeven_period),
                     blackout_hours_loop(state.clone(), cron.clone(), blackout_hours_period),
                     blackout_watch_loop(state.clone(), cron.clone(), blackout_watch_period),
-                    blackout_apply_loop(state, cron, blackout_apply_period),
+                    blackout_apply_loop(state.clone(), cron.clone(), blackout_apply_period),
+                    sweep_loop(state.clone(), cron.clone(), sweep_period),
+                    expiry_gc_loop(state, expiry_gc_period),
                 );
             });
         })
@@ -224,5 +244,44 @@ async fn blackout_apply_loop(state: Arc<AppState>, cron: NativeCronEnv, period: 
         interval.tick().await;
         let now = chrono::Utc::now();
         apply_if_ny_close_edge(&state.store, &cron, now).await;
+    }
+}
+
+/// The order sweep: every `period` (the frequent upkeep cadence) walk every
+/// tracked pending `EntryAttempt` and cancel + delete any whose alert window
+/// expired, whose bar-expiry fired, that's caught in a market-hours blackout, or
+/// whose SL has been overtaken by current price. Fail-soft per attempt (logs +
+/// skips); single re-arming interval. Shared with the wasm worker via the
+/// `trade-control-cron` crate.
+async fn sweep_loop(state: Arc<AppState>, cron: NativeCronEnv, period: Duration) {
+    let mut interval = skip_interval(period);
+
+    tracing::info!("scheduler: order sweep every {}s", period.as_secs());
+
+    loop {
+        interval.tick().await;
+        let now = chrono::Utc::now();
+        sweep_pending_orders(&state.store, &cron, now).await;
+    }
+}
+
+/// The expired-row GC: every `period` (hourly by default) physically delete TTL
+/// rows past `expires_at` across every TTL table — the native stand-in for KV's
+/// automatic eviction. Native-only (the wasm KV store evicts for free), so it
+/// takes the [`PgStateStore`](crate::PgStateStore) directly rather than the
+/// `CronEnv` seam. Fail-soft: a failed GC pass is logged and the loop continues
+/// to the next tick (reads already filter expired rows, so a missed pass is
+/// harmless). Single re-arming interval.
+async fn expiry_gc_loop(state: Arc<AppState>, period: Duration) {
+    let mut interval = skip_interval(period);
+
+    tracing::info!("scheduler: expired-row GC every {}s", period.as_secs());
+
+    loop {
+        interval.tick().await;
+        match state.store.gc_expired().await {
+            Ok(deleted) => tracing::info!("scheduler: expired-row GC deleted {deleted} row(s)"),
+            Err(err) => tracing::error!("scheduler: expired-row GC failed: {err}"),
+        }
     }
 }

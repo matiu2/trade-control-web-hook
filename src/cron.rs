@@ -41,24 +41,31 @@ pub async fn scheduled(_event: ScheduledEvent, env: Env, ctx: ScheduleContext) {
     crate::tracing_console::ConsoleSubscriber::install();
     let now = chrono::Utc::now();
 
-    // Frequent upkeep — every 15-min tick. `session_refresh` + `sweep` are not
-    // yet ported to the shared cron crate (they run on the raw `&Env` path), so
-    // they stay here.
+    // Frequent upkeep — every 15-min tick. `session_refresh` is wasm-only (it
+    // pre-warms the KV session cache, an optimization the native runtime doesn't
+    // need — it re-logins on demand via the broker factory), so it stays here on
+    // the raw `&Env` path with no native equivalent by design.
     session_refresh::refresh_stale_sessions(&env, now, constants::STALE_AFTER).await;
-    sweep::sweep_pending_orders(&env, now).await;
 
     // Open the KV store + our `CronEnv` impl once and reuse them for every cron
-    // job that now lives in the shared `trade-control-cron` crate: the
-    // spread-recovery watcher, the break-even watcher, the engine tick, the
-    // NY-close-edge apply, and the daily market-hours blackout refresh. Each is
-    // generic over its store + backend seam (`CronEnv`) so the *same* code runs
-    // on the native runtime (Task #5); here we wrap `&Env`/`&ctx` in `EnvCronEnv`
-    // and hand both in, never touching `Env` inside the shared logic.
+    // job that now lives in the shared `trade-control-cron` crate: the order
+    // sweep, the spread-recovery watcher, the break-even watcher, the engine
+    // tick, the NY-close-edge apply, and the daily market-hours blackout refresh.
+    // Each is generic over its store + backend seam (`CronEnv`) so the *same*
+    // code runs on the native runtime (Task #5); here we wrap `&Env`/`&ctx` in
+    // `EnvCronEnv` and hand both in, never touching `Env` inside the shared logic.
     if let Some(store) = sweep::open_store(&env) {
         let cron_env = seam::EnvCronEnv {
             env: &env,
             ctx: &ctx,
         };
+
+        // Order sweep — cancel + delete each pending `EntryAttempt` whose alert
+        // window expired, whose bar-expiry fired, that's caught in a market-hours
+        // blackout, or whose SL has been overtaken. Runs after session_refresh,
+        // before the spread-recovery watcher (call order preserved across the
+        // port to the shared crate).
+        trade_control_cron::sweep_pending_orders(&store, &cron_env, now).await;
 
         // Spread-recovery watcher — clear each per-trade blackout record once the
         // spread has recovered (or the backstop fires), restoring widened stops +

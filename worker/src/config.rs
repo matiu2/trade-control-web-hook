@@ -98,9 +98,11 @@ pub struct SchedulerConfig {
     /// same as the CF worker. Default 900s.
     #[serde(default = "default_daily_tick_secs")]
     pub daily_tick_secs: u64,
-    /// Expired-row sweep — `DELETE FROM … WHERE expires_at <= now()`. Reads
-    /// already filter correctly, so this is housekeeping, not correctness.
-    /// Default 3600s.
+    /// Expired-row GC ([`PgStateStore::gc_expired`](crate::PgStateStore::gc_expired))
+    /// — `DELETE FROM … WHERE expires_at < now()` across every TTL table, the
+    /// native stand-in for KV's automatic TTL eviction. Reads already filter
+    /// `expires_at > now()`, so this is pure housekeeping, not correctness.
+    /// Native-only. Default 3600s (hourly).
     #[serde(default = "default_expiry_sweep_secs")]
     pub expiry_sweep_secs: u64,
 }
