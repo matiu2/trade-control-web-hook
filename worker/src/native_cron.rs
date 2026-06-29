@@ -107,14 +107,24 @@ impl CronEnv for NativeCronEnv {
     }
 
     fn record_tick(&self, bundle: TickBundle) {
-        // STUB (Task #6): the native runtime will insert the tick bundle into the
-        // `tick_bundles` Postgres table here. For now we drop it after a debug
-        // line so the recording wiring is visibly pending, not silently missing.
-        // TODO(Task #6): insert `bundle` into the `tick_bundles` table.
-        tracing::debug!(
-            "cron: would record tick bundle trade_id={} (native recording is Task #6, dropping)",
-            bundle.correlation_id
-        );
+        // The trait method is sync (it mirrors the wasm worker's
+        // `ctx.wait_until` fire-and-forget, which can't be awaited inline
+        // either), but the Postgres insert is async. The cron runs on the
+        // local-thread runtime's `LocalSet` (see `crate::scheduler`), so
+        // `spawn_local` is available: we move the owned `bundle` + an `Arc`
+        // clone of the state into a fire-and-forget task. This matches the
+        // wasm `wait_until` semantics — the insert races the next tick and
+        // never blocks it — and keeps recording fail-soft (a failed insert is
+        // logged + swallowed inside the task, never surfaced to the engine).
+        let state = self.state.clone();
+        tokio::task::spawn_local(async move {
+            if let Err(err) = crate::recording_pg::record_tick(state.store.pool(), &bundle).await {
+                tracing::error!(
+                    "recording: tick_bundles insert failed (trade_id={}): {err}",
+                    bundle.correlation_id
+                );
+            }
+        });
     }
 
     fn signing_key(&self) -> Option<Vec<u8>> {

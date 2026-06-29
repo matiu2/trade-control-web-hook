@@ -10,6 +10,7 @@ pub mod http;
 mod native_cron;
 mod pg;
 mod pg_accounts;
+pub mod recording_pg;
 mod scheduler;
 mod secrets;
 

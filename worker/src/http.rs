@@ -169,12 +169,13 @@ async fn webhook(State(dispatcher): State<Dispatcher>, body: String) -> Response
 
 /// Process one signed-alert request to a `(status, body)`. Mirrors the wasm
 /// worker's `'intent` loop. Runs on the local dispatcher thread (so the `!Send`
-/// broker futures are legal). The (stubbed) request recorder fires on every
-/// return path, the way the wasm worker records every `'intent` outcome to R2.
+/// broker futures are legal). The request recorder fires on every return path,
+/// the way the wasm worker records every `'intent` outcome to R2 — here it
+/// inserts a row into the Postgres `request_records` table instead.
 async fn dispatch_request(state: &AppState, body: &str) -> (StatusCode, String) {
     let now = Utc::now();
     let parts = dispatch_inner(state, body, now).await;
-    record_request_stub(body, parts.0);
+    record_request(state, body, now, &parts).await;
     parts
 }
 
@@ -401,17 +402,51 @@ fn action_to_parts(result: &ActionResult) -> (StatusCode, String) {
     }
 }
 
-/// Stub for the per-request recording sink. The real Postgres `request_records`
-/// insert is Task #6; for now we just log what it *would* record so the wiring
-/// site exists and is easy to find.
-fn record_request_stub(body: &str, status: StatusCode) {
-    // TODO(Task #6): insert a row into `request_records` (ts, request_id,
-    // method, path, headers, body, intent_id, trade_id, status, outcome, logs).
-    tracing::debug!(
-        "would record request status={} body_len={}",
-        status.as_u16(),
-        body.len()
-    );
+/// Build the [`RequestRecord`] for this request and insert it into the Postgres
+/// `request_records` table. Fail-soft: any insert error is logged and swallowed
+/// — recording must never fail a request.
+///
+/// Simplifications vs the wasm worker's R2 record (acceptable here; the
+/// *decisions* are what matter, and they're captured):
+/// * **headers / method / path** — the native receiver doesn't thread the axum
+///   request parts down to the dispatcher (the handler ships only the body over
+///   the channel). We record `method: "POST"`, `path: "/"` (the only route) and
+///   an empty header vector. `request_id` is still minted from the body alone
+///   (`&[]` headers), which is deterministic for a given body.
+/// * **logs** — native `tracing` isn't buffered per-request yet (the wasm
+///   worker's thread-local `LOG_BUFFER` is a Cloudflare single-thread-per-
+///   request artifact). We record `logs: vec![]`; per-request log capture is a
+///   follow-up.
+/// * **outcome** — the dispatch response body doubles as the short outcome
+///   string (e.g. `"ok"`, `"replay"`, `"rejected"`, `"declined: …"`), exactly
+///   the strings the `*_to_parts` mappers produce.
+async fn record_request(
+    state: &AppState,
+    body: &str,
+    now: chrono::DateTime<Utc>,
+    parts: &(StatusCode, String),
+) {
+    use trade_control_core::recording::{RequestRecord, ids_from_body, mint_request_id};
+
+    let (status, outcome) = parts;
+    let (intent_id, trade_id) = ids_from_body(body);
+    let record = RequestRecord {
+        ts: now.to_rfc3339(),
+        request_id: mint_request_id(body, &[]),
+        method: "POST".to_string(),
+        path: "/".to_string(),
+        headers: vec![],
+        body: body.to_string(),
+        intent_id,
+        trade_id,
+        status: status.as_u16(),
+        outcome: outcome.clone(),
+        logs: vec![],
+    };
+    if let Err(err) = crate::recording_pg::record_request(state.store.pool(), &record).await {
+        // Fail-soft: a recording failure must never break the request path.
+        tracing::error!("recording: request_records insert failed: {err}");
+    }
 }
 
 #[cfg(test)]
