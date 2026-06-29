@@ -30,22 +30,27 @@ Worker entirely. axum HTTP receiver + per-task tokio scheduler, backed by
       - [x] **(7) de-worker `ActionResult`** — `Rejected` carries
             `{status: u16, body: String, outcome}`; `worker::Response` built only
             at the single fetch-path consumption edge. Commit `957420b`.
-      - [ ] **(8a) StateStore axis** — the 22 dispatch fns `store: &KvStateStore`
-            → `store: &S` with a `<S: StateStore>` bound (broker first, store
-            second, à la `core::retry_gate::evaluate`). All `store` use is via the
-            trait (verified — no `KvStateStore::`-inherent calls). KvStateStore
-            still satisfies the bound at the wasm call sites; byte-identical.
-            IN PROGRESS (agent a0f343).
-      - [ ] **(8b) env axis → `DispatchConfig`** — `run_enter` is the ONLY
-            dispatch fn that reads `env` for config (4 reads: `secret_or_default`
-            ×2, `pip_size_for`, `load_account_caps`). Replace `env: &Env` there
-            with a pre-resolved `core::DispatchConfig { worker_max_risk_pct: f64,
-            worker_max_open_positions: u32, pip_size: f64, caps: AccountCaps }`,
-            built at the EDGE (wasm: from `Env`; native: from `Secrets` +
-            `PgMetadataStore`). The `r2_purge` env uses (plan-purge / older-than)
-            stay `env: &Env` for now — they're the *recording* backend (R2 →
-            Postgres `tick_bundles` is Task #6), NOT state, so they're handled
-            with the recording sink, not here.
+      - [x] **(8a) StateStore axis** — the 22 dispatch fns `store: &KvStateStore`
+            → `store: &S` with a `<S: StateStore>` bound. Commit `0f99518`.
+            Surfaced + fixed an order-body parity gap (put/get/delete_order_body
+            were inherent to KvStateStore, off the trait → PgStateStore missed
+            them). Now on the trait (no-op defaults for test stores), real Mem +
+            Pg impls, `order_bodies` table (migration 0004), and an `order_body`
+            conformance family guarding it on BOTH backends.
+      - [x] **(8b) env axis → `DispatchConfig`** — `run_enter` (+ `run_action`)
+            were the only dispatch fns reading `env` for config (4 reads:
+            `secret_or_default` ×2, `pip_size_for`, `load_account_caps`).
+            Replaced `env: &Env` with a pre-resolved
+            `core::dispatch_config::DispatchConfig { worker_max_risk_pct,
+            worker_max_open_positions, pip_size, caps }`, built at the EDGE by
+            `build_dispatch_config(env, verified)` (wasm) — the 3 call sites
+            (fetch handler, cron engine, blackout_restore) build it then pass
+            `&cfg`. The native runtime builds the same struct from `Secrets` +
+            `PgMetadataStore`. The `r2_purge` env uses (plan-purge / older-than)
+            stay `env: &Env` — they're the *recording* backend (R2 → Postgres
+            `tick_bundles` is Task #6), NOT state, handled with the recording
+            sink. Entry dispatch path is now fully `Env`-free + `StateStore`-
+            generic → ready to relocate to `core` (increment 9).
       - [ ] **(9) relocate** — move the now-generic, worker-free dispatch fns +
             `ActionResult`/`DispatchResult` + `DispatchConfig` into `core` (where
             `retry_gate`/`pause_gate`/the gates already live). wasm worker + native

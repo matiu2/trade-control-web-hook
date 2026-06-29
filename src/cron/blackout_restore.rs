@@ -214,12 +214,16 @@ async fn redrive(
     now: DateTime<Utc>,
     raw_body: &str,
 ) -> crate::ActionResult {
+    // Resolve the dispatch config at this edge (mirrors the webhook fetch
+    // path) so `run_enter` is `Env`-free. The re-driven enter is the SAME
+    // intended entry, so its caps/pip/risk resolve identically.
+    let cfg = crate::build_dispatch_config(env, verified).await;
     match broker {
         BrokerHandle::Oanda(b) => {
-            crate::run_enter(b, store, verified, env, now, Some(raw_body), None).await
+            crate::run_enter(b, store, verified, &cfg, now, Some(raw_body), None).await
         }
         BrokerHandle::TradeNation(b) => {
-            crate::run_enter(b, store, verified, env, now, Some(raw_body), None).await
+            crate::run_enter(b, store, verified, &cfg, now, Some(raw_body), None).await
         }
     }
 }

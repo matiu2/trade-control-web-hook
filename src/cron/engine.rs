@@ -654,7 +654,10 @@ async fn dispatch_action<B: Broker>(
 ) -> ActionResult {
     match verified.intent.action {
         Action::Enter => {
-            crate::run_enter(broker, store, verified, env, now, None, Some(granularity)).await
+            // Resolve the dispatch config at this edge (mirrors the webhook
+            // fetch path) so `run_enter` is `Env`-free.
+            let cfg = crate::build_dispatch_config(env, verified).await;
+            crate::run_enter(broker, store, verified, &cfg, now, None, Some(granularity)).await
         }
         Action::Close => crate::run_close(broker, store, verified, now).await,
         Action::Invalidate => crate::run_invalidate(broker, store, verified, now).await,

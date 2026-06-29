@@ -270,11 +270,17 @@ pub async fn main(mut req: Request, env: Env, ctx: Context) -> Result<Response> 
             break 'intent market_info::handle_market_info(&env, &store, &verified, now).await;
         }
 
+        // Resolve the dispatch config (risk caps, pip fallback, account caps)
+        // at this edge so `run_action`/`run_enter` are `Env`-free. Built once,
+        // shared by both broker arms (it's a function of the intent, not the
+        // broker).
+        let cfg = build_dispatch_config(&env, &verified).await;
+
         // Broker dispatch.
         let result = match verified.intent.broker {
             BrokerKind::Oanda => {
                 match acquire_oanda_broker(&env, verified.intent.account.as_deref()).await {
-                    Some(broker) => run_action(&broker, &store, &verified, &env, now, &yaml).await,
+                    Some(broker) => run_action(&broker, &store, &verified, &cfg, now, &yaml).await,
                     None => break 'intent Response::error("oanda login failed", 500),
                 }
             }
@@ -282,7 +288,7 @@ pub async fn main(mut req: Request, env: Env, ctx: Context) -> Result<Response> 
                 match acquire_tn_broker(&env, verified.intent.account.as_deref()).await {
                     Some(broker) => {
                         let adapter = TradeNationAdapter(broker);
-                        run_action(&adapter, &store, &verified, &env, now, &yaml).await
+                        run_action(&adapter, &store, &verified, &cfg, now, &yaml).await
                     }
                     None => {
                         break 'intent Response::error(
@@ -541,12 +547,12 @@ async fn run_action<B: Broker, S: StateStore>(
     broker: &B,
     store: &S,
     verified: &incoming::Verified,
-    env: &Env,
+    cfg: &trade_control_core::dispatch_config::DispatchConfig,
     now: chrono::DateTime<chrono::Utc>,
     raw_body: &str,
 ) -> ActionResult {
     match verified.intent.action {
-        Action::Enter => run_enter(broker, store, verified, env, now, Some(raw_body), None).await,
+        Action::Enter => run_enter(broker, store, verified, cfg, now, Some(raw_body), None).await,
         Action::Close => run_close(broker, store, verified, now).await,
         Action::Invalidate => run_invalidate(broker, store, verified, now).await,
         Action::Veto => run_veto_with_broker(broker, store, verified, now).await,
@@ -1183,7 +1189,7 @@ pub(crate) async fn run_enter<B: Broker, S: StateStore>(
     broker: &B,
     store: &S,
     verified: &incoming::Verified,
-    env: &Env,
+    cfg: &trade_control_core::dispatch_config::DispatchConfig,
     now: chrono::DateTime<chrono::Utc>,
     raw_body: Option<&str>,
     // The trade's timeframe, when this enter was dispatched from a registered
@@ -1415,17 +1421,15 @@ pub(crate) async fn run_enter<B: Broker, S: StateStore>(
         }
     }
 
-    let worker_max_risk_pct = secret_or_default(env, MAX_RISK_PCT_PER_TRADE_SECRET, 1.0);
-    let worker_max_open_positions = secret_or_default(env, MAX_OPEN_POSITIONS_SECRET, 3.0) as u32;
+    let worker_max_risk_pct = cfg.worker_max_risk_pct;
+    let worker_max_open_positions = cfg.worker_max_open_positions;
     // Pip size precedence: the value baked into the signed intent at arm
     // time (the authority — `tv-arm` reads it from `instrument-lookup`) wins;
-    // a missing field falls back to the per-instrument `PIP_SIZE_<instrument>`
-    // secret, then the forex default. The fallback keeps any pre-baked
-    // in-flight intent resolving during rollout. See `pip_size_for`.
-    let pip_size = verified
-        .intent
-        .pip_size
-        .unwrap_or_else(|| pip_size_for(env, &verified.intent.instrument));
+    // a missing field falls back to `cfg.pip_size`, which the edge resolved
+    // from the per-instrument `PIP_SIZE_<instrument>` secret then the forex
+    // default. The fallback keeps any pre-baked in-flight intent resolving
+    // during rollout. See `DispatchConfig` / `pip_size_for`.
+    let pip_size = verified.intent.pip_size.unwrap_or(cfg.pip_size);
 
     // M/W real-time geometry. For M/W enters carrying a `trade_id`, evolve
     // the live neckline / right-shoulder per bar (Phase B): a deeper body
@@ -1563,10 +1567,11 @@ pub(crate) async fn run_enter<B: Broker, S: StateStore>(
         }
     }
 
-    let caps = load_account_caps(env, verified.intent.account.as_deref()).await;
-    // Apply the per-account narrowing now that we have the caps: an
-    // account record can tighten the worker-wide ceiling but never
-    // relax it.
+    // Per-account caps were resolved at the edge into `cfg.caps` (the wasm
+    // worker from the KV account index, the native runtime from Postgres).
+    // Apply the per-account narrowing: an account record can tighten the
+    // worker-wide ceiling but never relax it.
+    let caps = cfg.caps;
     let max_risk_pct = caps.resolve_max_risk_pct(worker_max_risk_pct);
     let max_open_positions = caps.resolve_max_open_positions(worker_max_open_positions);
 
@@ -3948,6 +3953,30 @@ fn pip_size_for(env: &Env, instrument: &str) -> f64 {
     get_secret(&key, env)
         .and_then(|s| s.parse().ok())
         .unwrap_or(DEFAULT_PIP_SIZE)
+}
+
+/// Resolve the [`DispatchConfig`](trade_control_core::dispatch_config::DispatchConfig)
+/// for an enter, off the Cloudflare `Env`. This is the wasm worker's "edge"
+/// resolver — it reads the worker-wide risk caps, the per-instrument pip-size
+/// fallback, and the per-account caps (async, from the KV account index) up
+/// front so `run_enter` itself is `Env`-free. The native runtime has its own
+/// edge resolver built from `Secrets` + the Postgres account index.
+///
+/// `pip_size` here is only the *fallback* (the per-instrument secret →
+/// `DEFAULT_PIP_SIZE`); `run_enter` still prefers the intent's baked `pip_size`
+/// over it. Caps are looked up per the intent's `account` (default for an
+/// unnamed account).
+pub(crate) async fn build_dispatch_config(
+    env: &Env,
+    verified: &incoming::Verified,
+) -> trade_control_core::dispatch_config::DispatchConfig {
+    let caps = load_account_caps(env, verified.intent.account.as_deref()).await;
+    trade_control_core::dispatch_config::DispatchConfig {
+        worker_max_risk_pct: secret_or_default(env, MAX_RISK_PCT_PER_TRADE_SECRET, 1.0),
+        worker_max_open_positions: secret_or_default(env, MAX_OPEN_POSITIONS_SECRET, 3.0) as u32,
+        pip_size: pip_size_for(env, &verified.intent.instrument),
+        caps,
+    }
 }
 
 #[cfg(test)]
