@@ -27,7 +27,6 @@ trade-control-engine = { version = "0.1.0", path = "engine" }
 broker-tradenation-adapter = { version = "0.1.0", path = "broker-tradenation-adapter" }
 
 [dev-dependencies]
-pollster = "0.4.0"
 trade-control-core = { path = "core", features = ["test-support"] }
 
 # The spread-baseline bake (per-instrument thresholds from the

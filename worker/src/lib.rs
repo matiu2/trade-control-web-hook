@@ -5,12 +5,15 @@
 
 mod broker_factory;
 mod config;
+mod dispatch_config_native;
+pub mod http;
 mod pg;
 mod pg_accounts;
 mod secrets;
 
 pub use broker_factory::{BrokerError, acquire_oanda, acquire_tn};
 pub use config::{Config, ConfigError, DatabaseConfig, HttpConfig, SchedulerConfig};
+pub use dispatch_config_native::build_dispatch_config_native;
 pub use pg::PgStateStore;
 pub use pg_accounts::PgMetadataStore;
 pub use secrets::{

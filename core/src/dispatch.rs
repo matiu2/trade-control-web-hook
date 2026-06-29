@@ -21,6 +21,7 @@ mod control;
 mod control_result;
 mod enter;
 mod invalidate;
+mod seen;
 mod shared;
 mod veto;
 
@@ -31,5 +32,6 @@ pub use control::*;
 pub use control_result::*;
 pub use enter::*;
 pub use invalidate::*;
+pub use seen::*;
 pub use shared::*;
 pub use veto::*;
