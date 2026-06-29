@@ -6,12 +6,14 @@
 //!   2. loads non-secret [`Config`] from a TOML file,
 //!   3. loads [`Secrets`] from the environment,
 //!   4. connects + migrates Postgres,
-//!   5. builds the app state and serves `POST /` with graceful shutdown.
+//!   5. builds the app state, starts the cron scheduler, and serves `POST /`
+//!      with graceful shutdown.
 //!
 //! TLS is terminated by a reverse proxy; this binds plain HTTP on loopback.
 //!
-//! The tokio scheduler (engine tick / upkeep / daily / expiry-sweep) is a
-//! later task — this binary stands up the receiver only.
+//! The tokio scheduler currently runs the shared **engine tick** (the only cron
+//! job ported so far) on a long-lived interval; the remaining cron jobs (upkeep
+//! / daily / expiry-sweep) follow through the same `trade-control-cron` crate.
 
 use std::sync::Arc;
 
@@ -21,6 +23,7 @@ use trace_init::init_tracing;
 use trade_control_worker::{
     Config, PgMetadataStore, PgStateStore, Secrets,
     http::{AppState, Dispatcher, router},
+    run_scheduler,
 };
 
 /// Default config path when none is passed as the first CLI argument.
@@ -72,8 +75,17 @@ async fn main() -> Result<()> {
     // The broker dispatch returns `?Send` futures (single-threaded SDK clients),
     // so it runs on a dedicated current-thread + `LocalSet` thread owned by the
     // dispatcher; axum handlers stay `Send` and just ferry the body across.
-    let dispatcher = Dispatcher::spawn(state);
+    let dispatcher = Dispatcher::spawn(state.clone());
     let app = router(dispatcher);
+
+    // Start the cron scheduler on its own dedicated current-thread + `LocalSet`
+    // thread (the engine tick drives the `?Send` broker SDKs, same as the HTTP
+    // dispatcher). It runs the shared engine tick on a long-lived re-arming
+    // interval; on process shutdown the thread is torn down with the process
+    // (the engine persists plan state before dispatching, so an abandoned tick
+    // is safe — the next start re-evaluates from the persisted watermark). See
+    // `scheduler` for the tokio#6504 timer-design guardrails.
+    run_scheduler(state, config.scheduler.clone());
 
     let bind = format!("{}:{}", config.http.bind_addr, config.http.port);
     let listener = TcpListener::bind(&bind)

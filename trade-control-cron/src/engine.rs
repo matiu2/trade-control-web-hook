@@ -1,14 +1,14 @@
 //! Server-side trade-plan engine tick — the cron-driven evaluator that
 //! replaces TradingView's paid alerts.
 //!
-//! Where [`sweep`](super::sweep) walks pending broker orders, this walks every
-//! registered [`TradePlan`]. For each plan it loads the persisted
-//! [`PlanState`], fetches the candles that have closed since the watermark,
-//! runs the pure [`evaluate_plan`] FSM, persists the advanced state, and
-//! dispatches each fired intent through the *same* handlers the webhook uses
-//! (`run_enter` / `run_close` / the veto + prep handlers). The plan was already
-//! HMAC-verified at register time, so the engine synthesises a [`Verified`]
-//! directly from the triggering candle — no re-verification.
+//! Where the order sweep walks pending broker orders, this walks every
+//! registered [`TradePlan`](trade_control_core::trade_plan::TradePlan). For
+//! each plan it loads the persisted [`PlanState`], fetches the candles that have
+//! closed since the watermark, runs the pure [`evaluate_plan`] FSM, persists the
+//! advanced state, and dispatches each fired intent through the *same* handlers
+//! the webhook uses (`run_enter` / `run_close` / the veto + prep handlers). The
+//! plan was already HMAC-verified at register time, so the engine synthesises a
+//! [`Verified`] directly from the triggering candle — no re-verification.
 //!
 //! # Seed-without-firing
 //!
@@ -39,17 +39,20 @@
 //!
 //! The decision logic is pure and tested where it lives: the FSM
 //! ([`evaluate_plan`]) and the seed-without-firing rule ([`seed_plan_state`])
-//! have native table tests in the `trade-control-engine` crate; [`Shell::from_candle`]
-//! is tested in `core`. This module's own functions are thin wasm-bound glue
-//! (`worker::Env`, the concrete [`BrokerHandle`], and `worker::Response`, which
-//! panics off-wasm at construction — see `every_rejection_outcome_classifies_as_skip`
-//! in `lib.rs` for the same constraint), so only the pure helpers
-//! (`seed_since`, `plan_state_expires_at`) are unit-tested here.
-//! End-to-end behaviour is exercised on the demo deploy, run in parallel with
-//! the live TV alerts (Stage F gate).
+//! have native table tests in the `trade-control-engine` crate;
+//! [`Shell::from_candle`] is tested in `core`. This module's own functions are
+//! thin glue over the concrete [`BrokerHandle`] and the [`CronEnv`] seam, so
+//! only the pure helpers (`seed_since`, `plan_state_expires_at`, the trendline
+//! anchor math) are unit-tested here. End-to-end behaviour is exercised on the
+//! demo deploy, run in parallel with the live TV alerts (Stage F gate).
 
 use chrono::{DateTime, Utc};
 use trade_control_core::broker::{Broker, Candle, CandleError, Granularity, filter_new_candles};
+use trade_control_core::dispatch::{
+    ActionResult, handle_news_end, handle_news_start, handle_pause, handle_prep, handle_resume,
+    handle_veto, record_dispatcher_outcome, run_close, run_enter, run_invalidate,
+    run_veto_with_broker,
+};
 use trade_control_core::incoming::Verified;
 use trade_control_core::intent::{Action, Shell, VetoLevel};
 use trade_control_core::plan_state::PlanState;
@@ -59,9 +62,8 @@ use trade_control_core::tick_bundle::{
 };
 use trade_control_engine::{PlanEval, evaluate_plan, seed_plan_state};
 
-use crate::ActionResult;
-use crate::cron::seam::CronEnv;
-use crate::cron::sweep::BrokerHandle;
+use crate::broker_handle::BrokerHandle;
+use crate::seam::CronEnv;
 
 /// How many bars of history to fetch when seeding a fresh plan. Enough to give
 /// each `OnClose` rule a prior close to compare against on the next tick, with
@@ -79,16 +81,16 @@ where
     let plans = match store.list_all_trade_plans().await {
         Ok(v) => v,
         Err(err) => {
-            rlog_err!("cron engine: list_all_trade_plans: {err}");
+            tracing::error!("cron engine: list_all_trade_plans: {err}");
             return;
         }
     };
 
-    rlog!("cron engine: {} registered plans", plans.len());
+    tracing::info!("cron engine: {} registered plans", plans.len());
 
     for stored in plans {
         if let Err(err) = tick_one(store, cron, &stored, now).await {
-            rlog_err!(
+            tracing::error!(
                 "cron engine[{}/{}]: {err}",
                 stored.account.as_deref().unwrap_or("<global>"),
                 stored.plan.trade_id,
@@ -165,9 +167,9 @@ where
     // can't log itself. An out-of-window anchor falls back to the `bar_seconds`
     // divisor (wall-clock spacing across any gap in the un-fetched span) or, on
     // a pre-`bar_seconds` plan, silently can't fire — both rare, neither should
-    // be invisible. Logged here (not in the engine crate, which has no rlog!).
+    // be invisible. Logged here (not in the engine crate, which has no tracing).
     for w in &eval.warnings {
-        rlog!("cron engine: plan {} {}", plan.trade_id, w);
+        tracing::info!("cron engine: plan {} {}", plan.trade_id, w);
     }
 
     // Persist the advanced state (or clear it + the plan when the spine is
@@ -292,13 +294,13 @@ async fn persist_plan_state<S: StateStore>(
             .archive_plan(account, plan, &eval.new_state, now)
             .await
         {
-            rlog_err!("cron engine: archive_plan({}): {err}", plan.trade_id);
+            tracing::error!("cron engine: archive_plan({}): {err}", plan.trade_id);
         }
         if let Err(err) = store.clear_plan_state(account, &plan.trade_id).await {
-            rlog_err!("cron engine: clear_plan_state({}): {err}", plan.trade_id);
+            tracing::error!("cron engine: clear_plan_state({}): {err}", plan.trade_id);
         }
         if let Err(err) = store.clear_trade_plan(account, &plan.trade_id).await {
-            rlog_err!("cron engine: clear_trade_plan({}): {err}", plan.trade_id);
+            tracing::error!("cron engine: clear_trade_plan({}): {err}", plan.trade_id);
         }
         return KvTickTransition {
             key,
@@ -380,7 +382,7 @@ fn plan_state_key(account: Option<&str>, trade_id: &str) -> String {
 /// outcome, which never happened) so a log scrape can diff `SHADOW would-fire`
 /// against the live TV alert's actual placement on the same candle.
 fn log_shadow_fire(trade_id: &str, fired: &trade_control_engine::FiredIntent) {
-    rlog!(
+    tracing::info!(
         "cron engine SHADOW would-fire: trade_id={} rule={} action={:?} id={} candle_time={} (observe-only, no broker)",
         trade_id,
         fired.rule_id,
@@ -402,7 +404,7 @@ fn log_noop_tick(
     eval: &PlanEval,
     now: DateTime<Utc>,
 ) {
-    rlog!(
+    tracing::info!(
         "cron engine: plan {} tick {} no-op (new bar {:?}, nothing fired/advanced, phase {:?}) — not recorded",
         plan.trade_id,
         now,
@@ -439,7 +441,7 @@ async fn read_plan_state_settled<S: StateStore>(
         .await
         .map_err(|err| format!("get_plan_state (re-read): {err}"))?;
     if settled.is_some() {
-        rlog!(
+        tracing::info!(
             "cron engine: plan-state for {trade_id} missed on first read, resolved on re-read \
              (KV eventual consistency) — proceeding without a re-seed"
         );
@@ -463,7 +465,7 @@ async fn seed_first_tick<S: StateStore>(
         .put_plan_state(account, &plan.trade_id, &state)
         .await
         .map_err(|err| format!("put_plan_state (seed): {err}"))?;
-    rlog!(
+    tracing::info!(
         "cron engine seed: trade_id={} instrument={} watermark={:?} ({} back-window candles)",
         plan.trade_id,
         plan.instrument,
@@ -636,13 +638,13 @@ where
         }
     };
     let outcome = result.describe();
-    rlog!(
+    tracing::info!(
         "cron engine fired: rule={} action={:?} id={} outcome={outcome}",
         fired.rule_id,
         verified.intent.action,
         verified.intent.id,
     );
-    crate::record_dispatcher_outcome(store, &verified, now, &result).await;
+    record_dispatcher_outcome(store, &verified, now, &result).await;
     outcome
 }
 
@@ -670,10 +672,10 @@ where
             // Resolve the dispatch config at this edge (mirrors the webhook
             // fetch path) so `run_enter` is backend-free.
             let cfg = cron.dispatch_config(verified).await;
-            crate::run_enter(broker, store, verified, &cfg, now, None, Some(granularity)).await
+            run_enter(broker, store, verified, &cfg, now, None, Some(granularity)).await
         }
-        Action::Close => crate::run_close(broker, store, verified, now).await,
-        Action::Invalidate => crate::run_invalidate(broker, store, verified, now).await,
+        Action::Close => run_close(broker, store, verified, now).await,
+        Action::Invalidate => run_invalidate(broker, store, verified, now).await,
         Action::Veto => {
             // A stop-next-entry veto sets KV only (no broker); higher levels
             // cancel/close via the broker. Matches the webhook's split.
@@ -681,29 +683,26 @@ where
                 verified.intent.level.unwrap_or_default(),
                 VetoLevel::StopNextEntry
             ) {
-                control_result(crate::handle_veto(store, verified, now).await, "vetoed")
+                control_result(handle_veto(store, verified, now).await, "vetoed")
             } else {
-                crate::run_veto_with_broker(broker, store, verified, now).await
+                run_veto_with_broker(broker, store, verified, now).await
             }
         }
-        Action::Prep => control_result(crate::handle_prep(store, verified, now).await, "prepped"),
+        Action::Prep => control_result(handle_prep(store, verified, now).await, "prepped"),
         // Calendar/news control rules: a plan folds in pause/resume (blackout
         // window) and news-start/news-end (news window) as TimeReached rules.
         // They set KV state only (no broker), exactly as the matching TV alert
         // message would have. Route to the same handlers the webhook uses.
-        Action::Pause => {
-            control_result(crate::handle_pause(store, verified, now).await, "pause-set")
+        Action::Pause => control_result(handle_pause(store, verified, now).await, "pause-set"),
+        Action::Resume => {
+            control_result(handle_resume(store, verified, now).await, "pause-cleared")
         }
-        Action::Resume => control_result(
-            crate::handle_resume(store, verified, now).await,
-            "pause-cleared",
-        ),
         Action::NewsStart => control_result(
-            crate::handle_news_start(store, verified, now).await,
+            handle_news_start(store, verified, now).await,
             "news-window-open",
         ),
         Action::NewsEnd => control_result(
-            crate::handle_news_end(store, verified, now).await,
+            handle_news_end(store, verified, now).await,
             "news-window-closed",
         ),
         other => {
@@ -719,10 +718,10 @@ where
     }
 }
 
-/// Fold a control-action handler's [`ControlResult`] into an [`ActionResult`]
-/// so engine dispatch records uniformly. A `2xx` is `Ok`; anything else is
-/// `Rejected` — control handlers never reach the broker, so `Failed` (a broker
-/// error) is not a possible outcome here.
+/// Fold a control-action handler's [`ControlResult`](trade_control_core::dispatch::ControlResult)
+/// into an [`ActionResult`] so engine dispatch records uniformly. A `2xx` is
+/// `Ok`; anything else is `Rejected` — control handlers never reach the broker,
+/// so `Failed` (a broker error) is not a possible outcome here.
 fn control_result(
     res: trade_control_core::dispatch::ControlResult,
     ok_outcome: &str,

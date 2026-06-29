@@ -32,7 +32,6 @@ mod blackout_watch;
 mod blackout_widen;
 mod breakeven_watch;
 mod constants;
-mod engine;
 mod seam;
 pub(crate) mod session_meta;
 mod session_refresh;
@@ -63,15 +62,16 @@ pub async fn scheduled(_event: ScheduledEvent, env: Env, ctx: ScheduleContext) {
     // bump is Stage F, once the engine is proven on demo.
     //
     // The engine is generic over its store + backend seam (`CronEnv`) so the
-    // same code runs on the native runtime (Task #5). Here we open the KV store
-    // and wrap `&Env`/`&ctx` in `EnvCronEnv`; the engine threads them through
-    // the seam, never touching `Env` directly.
+    // same code runs on the native runtime (Task #5). It now lives in the shared
+    // `trade-control-cron` crate; here we open the KV store and wrap `&Env`/`&ctx`
+    // in `EnvCronEnv` (our local `CronEnv` impl), then hand both to the shared
+    // tick, which threads them through the seam, never touching `Env` directly.
     if let Some(store) = sweep::open_store(&env) {
         let cron_env = seam::EnvCronEnv {
             env: &env,
             ctx: &ctx,
         };
-        engine::run_engine_tick(&store, &cron_env, now).await;
+        trade_control_cron::run_engine_tick(&store, &cron_env, now).await;
     }
 
     // NY-close-edge job — fire exactly once per close hour, on the :00

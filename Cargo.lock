@@ -4215,6 +4215,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "trade-control-cron"
+version = "0.1.0"
+dependencies = [
+ "broker-oanda",
+ "broker-tradenation-adapter",
+ "chrono",
+ "tracing",
+ "trade-control-core",
+ "trade-control-engine",
+]
+
+[[package]]
 name = "trade-control-engine"
 version = "0.1.0"
 dependencies = [
@@ -4239,6 +4251,7 @@ dependencies = [
  "serde_yaml",
  "tracing",
  "trade-control-core",
+ "trade-control-cron",
  "trade-control-engine",
  "tradenation-api 0.3.0",
  "worker",
@@ -4264,6 +4277,7 @@ dependencies = [
  "tracing-error",
  "tracing-subscriber",
  "trade-control-core",
+ "trade-control-cron",
  "tradenation-api 0.3.0",
 ]
 

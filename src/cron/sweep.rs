@@ -276,14 +276,11 @@ pub(crate) fn open_store(env: &Env) -> Option<KvStateStore> {
     }
 }
 
-/// One enum so the dispatcher can return either broker type without
-/// boxing across the async boundary (which `impl Trait` precludes).
-/// Shared with the spread-recovery watcher, which calls `get_quote`
-/// through the same per-broker match.
-pub(crate) enum BrokerHandle {
-    Oanda(broker_oanda::OandaBroker),
-    TradeNation(crate::tradenation_adapter::TradeNationAdapter),
-}
+// `BrokerHandle` moved to the shared `trade-control-cron` crate (so the engine
+// tick is worker-free). Re-exported here under its old path because sweep's own
+// not-yet-moved code (the order sweep + spread-recovery watcher) still matches
+// on it.
+pub(crate) use trade_control_cron::BrokerHandle;
 
 /// Pick a broker for the attempt's account. Thin wrapper over
 /// [`acquire_broker_for_account`].
