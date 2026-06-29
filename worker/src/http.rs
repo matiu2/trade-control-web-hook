@@ -172,10 +172,15 @@ async fn webhook(State(dispatcher): State<Dispatcher>, body: String) -> Response
 /// broker futures are legal). The request recorder fires on every return path,
 /// the way the wasm worker records every `'intent` outcome to R2 — here it
 /// inserts a row into the Postgres `request_records` table instead.
-async fn dispatch_request(state: &AppState, body: &str) -> (StatusCode, String) {
+async fn dispatch_request(state: &Arc<AppState>, body: &str) -> (StatusCode, String) {
     let now = Utc::now();
     let parts = dispatch_inner(state, body, now).await;
-    record_request(state, body, now, &parts).await;
+    // Record off the response's critical path: the recorder is fire-and-forget
+    // (matches the tick recorder + the wasm worker's `wait_until`), so the
+    // response returns immediately and the next single-flight request isn't held
+    // behind this insert. The spawned task logs the response + whether the insert
+    // landed, so the trail stays visible.
+    record_request(state, body, now, &parts);
     parts
 }
 
@@ -420,8 +425,8 @@ fn action_to_parts(result: &ActionResult) -> (StatusCode, String) {
 /// * **outcome** — the dispatch response body doubles as the short outcome
 ///   string (e.g. `"ok"`, `"replay"`, `"rejected"`, `"declined: …"`), exactly
 ///   the strings the `*_to_parts` mappers produce.
-async fn record_request(
-    state: &AppState,
+fn record_request(
+    state: &Arc<AppState>,
     body: &str,
     now: chrono::DateTime<Utc>,
     parts: &(StatusCode, String),
@@ -443,10 +448,28 @@ async fn record_request(
         outcome: outcome.clone(),
         logs: vec![],
     };
-    if let Err(err) = crate::recording_pg::record_request(state.store.pool(), &record).await {
-        // Fail-soft: a recording failure must never break the request path.
-        tracing::error!("recording: request_records insert failed: {err}");
-    }
+
+    // Fire-and-forget on the dispatcher's `LocalSet` (the request path is `?Send`
+    // so we're already on a local-thread runtime — see `Dispatcher`). The task
+    // owns the record, so the response returns without waiting on the insert. It
+    // logs the response (status + outcome + request_id) on success and the error
+    // on failure, so every recorded request still leaves a trail. Recording can
+    // never break the request path — a failed insert is logged + swallowed here.
+    let state = state.clone();
+    tokio::task::spawn_local(async move {
+        let request_id = record.request_id.clone();
+        let status = record.status;
+        let outcome = record.outcome.clone();
+        match crate::recording_pg::record_request(state.store.pool(), &record).await {
+            Ok(()) => tracing::info!(
+                "recording: recorded request id={request_id} status={status} outcome={outcome:?}"
+            ),
+            Err(err) => tracing::error!(
+                "recording: request_records insert failed (id={request_id} status={status} \
+                 outcome={outcome:?}): {err}"
+            ),
+        }
+    });
 }
 
 #[cfg(test)]
