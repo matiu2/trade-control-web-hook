@@ -706,26 +706,23 @@ async fn dispatch_action<B: Broker>(
     }
 }
 
-/// Fold a control-action handler's `Result<Response>` into an [`ActionResult`]
-/// so engine dispatch records uniformly. A `2xx` is `Ok`; anything else (or a
-/// transport error) is `Rejected` — control handlers never reach the broker, so
-/// `Failed` (a broker error) is not a possible outcome here.
-fn control_result(resp: worker::Result<worker::Response>, ok_outcome: &str) -> ActionResult {
-    match resp {
-        Ok(r) if (200..300).contains(&r.status_code()) => ActionResult::Ok(ok_outcome.to_string()),
-        Ok(r) => {
-            let code = r.status_code();
-            ActionResult::Rejected {
-                status: code,
-                body: format!("control dispatch returned status {code}"),
-                outcome: format!("rejected: control-status-{code}"),
-            }
+/// Fold a control-action handler's [`ControlResult`] into an [`ActionResult`]
+/// so engine dispatch records uniformly. A `2xx` is `Ok`; anything else is
+/// `Rejected` — control handlers never reach the broker, so `Failed` (a broker
+/// error) is not a possible outcome here.
+fn control_result(
+    res: trade_control_core::dispatch::ControlResult,
+    ok_outcome: &str,
+) -> ActionResult {
+    if res.is_success() {
+        ActionResult::Ok(ok_outcome.to_string())
+    } else {
+        let code = res.status;
+        ActionResult::Rejected {
+            status: code,
+            body: format!("control dispatch returned status {code}"),
+            outcome: format!("rejected: control-status-{code}"),
         }
-        Err(err) => ActionResult::Rejected {
-            status: 500,
-            body: "engine control dispatch error".to_string(),
-            outcome: format!("rejected: control-error {err}"),
-        },
     }
 }
 

@@ -17,6 +17,7 @@
 mod action;
 mod action_result;
 mod close;
+mod control;
 mod control_result;
 mod enter;
 mod invalidate;
@@ -26,6 +27,7 @@ mod veto;
 pub use action::*;
 pub use action_result::*;
 pub use close::*;
+pub use control::*;
 pub use control_result::*;
 pub use enter::*;
 pub use invalidate::*;
