@@ -58,12 +58,10 @@ use trade_control_core::tick_bundle::{
     DispatchOutcome, KvTickTransition, TICK_BUNDLE_SCHEMA_VERSION, TickBundle,
 };
 use trade_control_engine::{PlanEval, evaluate_plan, seed_plan_state};
-use worker::{Env, ScheduleContext};
 
 use crate::ActionResult;
-use crate::cron::sweep::{BrokerHandle, acquire_broker_for_account, open_store};
-use crate::state::KvStateStore;
-use crate::tick_recording::record_tick_to_r2;
+use crate::cron::seam::CronEnv;
+use crate::cron::sweep::BrokerHandle;
 
 /// How many bars of history to fetch when seeding a fresh plan. Enough to give
 /// each `OnClose` rule a prior close to compare against on the next tick, with
@@ -73,12 +71,11 @@ const SEED_BARS: i64 = 10;
 /// Walk every registered trade plan, evaluate it against fresh candles, and
 /// dispatch fired intents. `now` is threaded in (not `Utc::now()`) so the tick
 /// stays a pure function of `(env, now)`.
-pub async fn run_engine_tick(env: &Env, ctx: &ScheduleContext, now: DateTime<Utc>) {
-    let store = match open_store(env) {
-        Some(s) => s,
-        None => return,
-    };
-
+pub async fn run_engine_tick<S, C>(store: &S, cron: &C, now: DateTime<Utc>)
+where
+    S: StateStore,
+    C: CronEnv,
+{
     let plans = match store.list_all_trade_plans().await {
         Ok(v) => v,
         Err(err) => {
@@ -90,7 +87,7 @@ pub async fn run_engine_tick(env: &Env, ctx: &ScheduleContext, now: DateTime<Utc
     rlog!("cron engine: {} registered plans", plans.len());
 
     for stored in plans {
-        if let Err(err) = tick_one(env, ctx, &store, &stored, now).await {
+        if let Err(err) = tick_one(store, cron, &stored, now).await {
             rlog_err!(
                 "cron engine[{}/{}]: {err}",
                 stored.account.as_deref().unwrap_or("<global>"),
@@ -103,13 +100,16 @@ pub async fn run_engine_tick(env: &Env, ctx: &ScheduleContext, now: DateTime<Utc
 /// Evaluate and dispatch one plan. Returns an error string so the caller can
 /// log it with plan context. Never panics; transient broker/KV failures bubble
 /// up as a skip for this tick.
-async fn tick_one(
-    env: &Env,
-    ctx: &ScheduleContext,
-    store: &KvStateStore,
+async fn tick_one<S, C>(
+    store: &S,
+    cron: &C,
     stored: &StoredPlan,
     now: DateTime<Utc>,
-) -> Result<(), String> {
+) -> Result<(), String>
+where
+    S: StateStore,
+    C: CronEnv,
+{
     let plan = &stored.plan;
     let account = stored.account.as_deref();
     let expires_at = plan_state_expires_at(now);
@@ -128,14 +128,16 @@ async fn tick_one(
     let prior = match read_plan_state_settled(store, account, &plan.trade_id).await? {
         Some(state) => state,
         None => {
-            let broker = acquire_broker_for_account(env, account)
+            let broker = cron
+                .acquire_broker(account)
                 .await
                 .ok_or("broker acquisition failed")?;
             return seed_first_tick(store, &broker, plan, account, expires_at, now).await;
         }
     };
 
-    let broker = acquire_broker_for_account(env, account)
+    let broker = cron
+        .acquire_broker(account)
         .await
         .ok_or("broker acquisition failed")?;
 
@@ -204,7 +206,7 @@ async fn tick_one(
             Vec::new(),
             kv,
         );
-        record_tick_to_r2(env, ctx, bundle);
+        cron.record_tick(bundle);
         return Ok(());
     }
 
@@ -223,13 +225,13 @@ async fn tick_one(
             Vec::new(),
             kv.clone(),
         );
-        record_tick_to_r2(env, ctx, bundle);
+        cron.record_tick(bundle);
         return Err(format!("put_plan_state: {}", kv.error.unwrap_or_default()));
     }
 
     let mut dispatch_outcomes = Vec::with_capacity(eval.fired.len());
     for (seq, fired) in eval.fired.iter().enumerate() {
-        let outcome = dispatch_fired(env, store, &broker, fired, plan.granularity, now).await;
+        let outcome = dispatch_fired(cron, store, &broker, fired, plan.granularity, now).await;
         dispatch_outcomes.push(DispatchOutcome {
             rule_id: fired.rule_id.clone(),
             intent_id: fired.intent.id.clone(),
@@ -261,7 +263,7 @@ async fn tick_one(
         dispatch_outcomes,
         kv,
     );
-    record_tick_to_r2(env, ctx, bundle);
+    cron.record_tick(bundle);
     Ok(())
 }
 
@@ -271,8 +273,8 @@ async fn tick_one(
 /// `success`/`error` capture whether the authoritative write landed — a failed
 /// clear is logged but doesn't fail the tick (the TTL still ages the row out),
 /// while a failed `put` is surfaced so the caller can skip dispatch.
-async fn persist_plan_state(
-    store: &KvStateStore,
+async fn persist_plan_state<S: StateStore>(
+    store: &S,
     plan: &trade_control_core::trade_plan::TradePlan,
     account: Option<&str>,
     eval: &PlanEval,
@@ -418,8 +420,8 @@ fn log_noop_tick(
 /// "first tick" would re-seed and skip the cross (bug #15). So on a `None`, we
 /// re-read once: a genuine first tick stays `None`; a read-miss resolves to the
 /// real state on the retry. The cost is one extra KV GET on the rare miss.
-async fn read_plan_state_settled(
-    store: &KvStateStore,
+async fn read_plan_state_settled<S: StateStore>(
+    store: &S,
     account: Option<&str>,
     trade_id: &str,
 ) -> Result<Option<PlanState>, String> {
@@ -446,8 +448,8 @@ async fn read_plan_state_settled(
 }
 
 /// First-tick seed: fetch a back-window, seed the state without firing, persist.
-async fn seed_first_tick(
-    store: &KvStateStore,
+async fn seed_first_tick<S: StateStore>(
+    store: &S,
     broker: &BrokerHandle,
     plan: &trade_control_core::trade_plan::TradePlan,
     account: Option<&str>,
@@ -600,14 +602,18 @@ fn earliest_trendline_anchor_epoch<'a>(
 /// The plan was verified at register, so the [`Verified`] is synthesised
 /// directly: the [`Shell`] from the triggering candle (OHLC + time; `open`
 /// populated so M/W body logic works), the intent cloned verbatim.
-async fn dispatch_fired(
-    env: &Env,
-    store: &KvStateStore,
+async fn dispatch_fired<S, C>(
+    cron: &C,
+    store: &S,
     broker: &BrokerHandle,
     fired: &trade_control_engine::FiredIntent,
     granularity: Granularity,
     now: DateTime<Utc>,
-) -> String {
+) -> String
+where
+    S: StateStore,
+    C: CronEnv,
+{
     // An H&S `PinePattern` fire carries the latched signal geometry; fold it onto
     // the shell so the enter resolves entry/SL/TP against the *pattern* extremes
     // (signal_high/low, recent_*, golden, signal_confirmed) exactly as the TV
@@ -622,9 +628,11 @@ async fn dispatch_fired(
         intent: fired.intent.clone(),
     };
     let result = match broker {
-        BrokerHandle::Oanda(b) => dispatch_action(b, store, &verified, env, granularity, now).await,
+        BrokerHandle::Oanda(b) => {
+            dispatch_action(b, store, &verified, cron, granularity, now).await
+        }
         BrokerHandle::TradeNation(b) => {
-            dispatch_action(b, store, &verified, env, granularity, now).await
+            dispatch_action(b, store, &verified, cron, granularity, now).await
         }
     };
     let outcome = result.describe();
@@ -644,19 +652,24 @@ async fn dispatch_fired(
 /// each fired intent is reconstructed, not re-received). Control actions (prep,
 /// stop-next-entry veto) are wrapped into an [`ActionResult`] so every fired
 /// intent records uniformly.
-async fn dispatch_action<B: Broker>(
+async fn dispatch_action<B, S, C>(
     broker: &B,
-    store: &KvStateStore,
+    store: &S,
     verified: &Verified,
-    env: &Env,
+    cron: &C,
     granularity: Granularity,
     now: DateTime<Utc>,
-) -> ActionResult {
+) -> ActionResult
+where
+    B: Broker,
+    S: StateStore,
+    C: CronEnv,
+{
     match verified.intent.action {
         Action::Enter => {
             // Resolve the dispatch config at this edge (mirrors the webhook
-            // fetch path) so `run_enter` is `Env`-free.
-            let cfg = crate::build_dispatch_config(env, verified).await;
+            // fetch path) so `run_enter` is backend-free.
+            let cfg = cron.dispatch_config(verified).await;
             crate::run_enter(broker, store, verified, &cfg, now, None, Some(granularity)).await
         }
         Action::Close => crate::run_close(broker, store, verified, now).await,
