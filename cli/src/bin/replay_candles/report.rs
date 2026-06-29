@@ -24,8 +24,8 @@ use trade_control_core::intent::{
 };
 use trade_control_core::spread_blackout::elevated_threshold_pips;
 use trade_control_engine::{
-    GateBlock, SimOutcome, SweepReason, TradePlan, breakeven_armed_at, entry_gate_block,
-    simulate_fill, sweep_reason, widened_stop_at,
+    SimOutcome, SweepReason, TradePlan, breakeven_armed_at, simulate_fill, sweep_reason,
+    widened_stop_at,
 };
 
 use super::brisbane::bne;
@@ -255,11 +255,6 @@ pub fn resolve_fire_any(plan: &TradePlan, fire: &Fire, closes: &[CloseFire]) -> 
     if fire.superseded {
         return None;
     }
-    // A suppressed enter (paused by a news blackout) never placed an order —
-    // no position to annotate, same as a superseded one.
-    if fire.suppressed_by.is_some() {
-        return None;
-    }
     let candle = &fire.fired.candle;
     let shell = match &fire.fired.signal {
         Some(sig) => Shell::from_candle_and_signal(candle, sig),
@@ -274,23 +269,17 @@ pub fn resolve_fire_any(plan: &TradePlan, fire: &Fire, closes: &[CloseFire]) -> 
     // there.
     let fire_at = candle.time;
 
-    // Pre-broker entry gate (BUG-replay-golden-gate-not-enforced): the worker's
-    // `run_enter` rejects an enter whose `allow_entry` script fails or whose
-    // `needs_golden` / `needs_confirmed` candle-quality requirement the
-    // (signal-folded) shell doesn't meet — before any order is placed. The
-    // shared `core` gate is the same one the live worker runs. `render_fire`
-    // already consults it; this *annotation/R* path (the `--annotate` boxes and
-    // the four-way entry-style net-R chart) must too, or it draws + tallies an
-    // R for a fill the live worker would never have placed (golden grep == 0).
-    // A blocked enter is not-taken — anchor the intended bracket at the fire bar.
-    if let Some(block) = entry_gate_block(intent, &shell, plan.pip_size) {
+    // The entry decision was made ONCE in the tick loop by the REAL `run_enter`
+    // (every gate: pause / retry / cooldown / prep / veto / entry-level-veto /
+    // allow_entry / blackouts / SL-floor). A `Rejected` enter is not-taken — the
+    // live worker 412/422/423s it before placing an order — so anchor the
+    // intended bracket at the fire bar as a `GateBlocked` and tally 0R. This
+    // path no longer re-derives any gate; the verdict comes off the fire.
+    if fire.rejected_reason().is_some() {
         tracing::debug!(
             bar = %candle.time,
-            golden = ?shell.golden,
-            needs_golden = intent.needs_golden,
-            ?block,
-            "golden: blocked @ {} — entry gate rejects (annotation path, not taken)",
-            candle.time
+            reason = ?fire.rejected_reason(),
+            "entry rejected by run_enter — annotation path, not taken (0R)"
         );
         return Some(FireResult {
             direction: resolved.direction,
@@ -301,15 +290,6 @@ pub fn resolve_fire_any(plan: &TradePlan, fire: &Fire, closes: &[CloseFire]) -> 
             take_profit: resolved.take_profit,
             kind: FillKind::GateBlocked,
         });
-    }
-    if intent.needs_golden || intent.needs_confirmed {
-        tracing::debug!(
-            bar = %candle.time,
-            golden = ?shell.golden,
-            confirmed = ?shell.signal_confirmed,
-            "golden: ok @ {} — candle-quality gate passes (annotation path)",
-            candle.time
-        );
     }
 
     let raw = simulate_fill(intent, &shell, plan.pip_size, &fire.forward);
@@ -535,37 +515,29 @@ fn render_fire(
         Err(err) => line.push_str(&format!("    order: UNRESOLVED — {err:?}\n")),
     }
 
-    // A suppressed enter landed inside an active news-blackout pause — the gate
-    // rejected it (the live worker 423s), so no order went on. Show the 0R skip
-    // legibly and don't tally it.
-    if let Some(blackouts) = &fire.suppressed_by {
-        line.push_str(&format!(
-            "    fill: SUPPRESSED — trade paused by news blackout [{}] → NO FILL / 0R\n",
-            blackouts.join(", ")
-        ));
-        return line;
-    }
-
     // A superseded enter had its resting order cancelled by a later entry
     // (cancel-and-replace) before it could fill, so its standalone simulated
     // fill is fiction — report the cancellation instead and don't tally it.
+    // (Checked before the rejection branch: a placed-then-superseded enter has a
+    // `Placed` outcome, not a rejection, so the gate verdict wouldn't catch it.)
     if fire.superseded {
         line.push_str("    fill: SUPERSEDED — resting order cancelled by a later entry (cancel-and-replace)\n");
         return line;
     }
 
-    // Pre-broker entry gate: the worker's `run_enter` rejects an enter whose
-    // `allow_entry` script returns false/errors, or whose `needs_golden` /
-    // `needs_confirmed` candle-quality requirement the (signal-folded) shell
-    // doesn't meet — before any order is placed. `simulate_fill` only knows the
-    // price path, so without this it would FILL an order the live worker would
-    // have REJECTED. Both gates now live in shared `core` (applied identically
-    // live and here), so surface the block and don't simulate a fill or tally it.
-    if let Some(block) = entry_gate_block(intent, &shell, plan.pip_size) {
-        line.push_str(&format!(
-            "    fill: {} → NO FILL / 0R\n",
-            describe_gate_block(&block)
-        ));
+    // The entry decision came from the REAL `run_enter` in the tick loop. A
+    // `Rejected` enter is a 0R skip — the live worker 412/422/423s it before
+    // placing an order — so surface the real dispatch reason and don't simulate
+    // a fill or tally it. A pause rejection keeps the legible "SUPPRESSED"
+    // wording; every other gate (cooldown / prep / veto / entry-level-veto /
+    // allow_entry / blackouts / SL-floor) prints its own reason verbatim.
+    if let Some(reason) = fire.rejected_reason() {
+        let detail = if reason.starts_with("rejected: paused") {
+            format!("fill: SUPPRESSED — trade paused by news blackout [{reason}] → NO FILL / 0R")
+        } else {
+            format!("fill: BLOCKED — {reason} → NO FILL / 0R")
+        };
+        line.push_str(&format!("    {detail}\n"));
         return line;
     }
 
@@ -806,22 +778,9 @@ fn describe_outcome(outcome: &SimOutcome) -> String {
     }
 }
 
-/// Human-readable line for a pre-broker entry-gate rejection (the worker's
-/// `allow_entry` script + candle-quality gate, now applied in replay via the
-/// shared core gate). The caller prefixes `fill: ` and suffixes the `0R` tally.
-fn describe_gate_block(block: &GateBlock) -> String {
-    match block {
-        GateBlock::AllowEntryFalse => "BLOCKED by allow_entry script (returned false)".into(),
-        GateBlock::AllowEntryScriptError { kind, message } => {
-            format!("BLOCKED by allow_entry script ({kind} error: {message})")
-        }
-        GateBlock::NeedsGoldenUnmet => "BLOCKED — golden candle required, not present".into(),
-        GateBlock::NeedsConfirmedUnmet => "BLOCKED — confirmed signal required, not present".into(),
-    }
-}
-
 #[cfg(test)]
 mod tests {
+    use super::super::replay::EnterGateOutcome;
     use super::*;
     use chrono::{TimeZone, Utc};
     use trade_control_core::intent::RiskBudget;
@@ -840,31 +799,6 @@ mod tests {
             recover_entry: None,
             breakeven: None,
         }
-    }
-
-    #[test]
-    fn gate_block_renders_each_reason() {
-        // The exact strings the replay journal prints when the worker's
-        // pre-broker entry gate would have rejected the fill.
-        assert_eq!(
-            describe_gate_block(&GateBlock::AllowEntryFalse),
-            "BLOCKED by allow_entry script (returned false)"
-        );
-        assert_eq!(
-            describe_gate_block(&GateBlock::NeedsGoldenUnmet),
-            "BLOCKED — golden candle required, not present"
-        );
-        assert_eq!(
-            describe_gate_block(&GateBlock::NeedsConfirmedUnmet),
-            "BLOCKED — confirmed signal required, not present"
-        );
-        assert_eq!(
-            describe_gate_block(&GateBlock::AllowEntryScriptError {
-                kind: "parse",
-                message: "boom".into(),
-            }),
-            "BLOCKED by allow_entry script (parse error: boom)"
-        );
     }
 
     #[test]
@@ -924,7 +858,11 @@ mod tests {
         serde_yaml::from_str(&yaml).expect("parse golden enter intent")
     }
 
-    fn enter_fire(intent: trade_control_core::intent::Intent, fire_secs: i64) -> Fire {
+    fn enter_fire(
+        intent: trade_control_core::intent::Intent,
+        fire_secs: i64,
+        gate_outcome: EnterGateOutcome,
+    ) -> Fire {
         Fire {
             fired: trade_control_engine::FiredIntent {
                 rule_id: "05-enter".into(),
@@ -935,16 +873,14 @@ mod tests {
                 signal: None,
             },
             // Forward path rises through the 1.1000 stop trigger, then on to the
-            // 1.1100 TP — so *without* the gate this enter would fill + take
-            // profit (a +R the chart would tally).
+            // 1.1100 TP — so a `Placed` enter would fill + take profit.
             forward: vec![
                 ba(fire_secs, 1.0980),
                 ba(fire_secs + 3600, 1.1010),
                 ba(fire_secs + 7200, 1.1110),
             ],
-            order_id: None,
+            gate_outcome,
             superseded: false,
-            suppressed_by: None,
         }
     }
 
@@ -961,18 +897,23 @@ mod tests {
     }
 
     #[test]
-    fn annotation_path_blocks_a_non_golden_fill_when_needs_golden() {
-        // The core of BUG-replay-golden-gate-not-enforced: a `needs_golden`
-        // enter whose shell carries no `golden` flag (a stop/limit enter, so
-        // `signal: None`) must NOT fill on the annotation / net-R path — the
-        // live worker 412s it before placing the order. Pre-fix this returned
-        // a TookProfit (+R); post-fix it's GateBlocked (not taken, 0R).
-        let fire = enter_fire(golden_stop_enter(true), 1_781_244_000);
+    fn annotation_path_blocks_a_rejected_enter() {
+        // The entry decision is made by `run_enter` in the tick loop; the report
+        // only maps its verdict. A `Rejected` enter (e.g. the live worker 412'd a
+        // `needs_golden` enter with golden:None) must render as GateBlocked — not
+        // taken, 0R — even though the forward path would otherwise fill to TP.
+        let fire = enter_fire(
+            golden_stop_enter(true),
+            1_781_244_000,
+            EnterGateOutcome::Rejected {
+                reason: "rejected: needs-golden".into(),
+            },
+        );
         let result = resolve_fire_any(&plan_for(0.0001), &fire, &[]).expect("an enter result");
         assert_eq!(
             result.kind,
             FillKind::GateBlocked,
-            "needs_golden enter with golden:None must be gate-blocked, not filled"
+            "a run_enter-rejected enter must be gate-blocked, not filled"
         );
         assert!(!result.kind.is_taken());
         // And resolve_fire (taken-only) drops it entirely.
@@ -980,15 +921,18 @@ mod tests {
     }
 
     #[test]
-    fn annotation_path_fills_normally_without_needs_golden() {
-        // Same enter + path but golden not required → the gate is a noop and the
-        // forward path fills to TP, proving the block above is the gate, not the
-        // price path.
-        let fire = enter_fire(golden_stop_enter(false), 1_781_244_000);
+    fn annotation_path_fills_a_placed_enter() {
+        // Same enter + path but `run_enter` placed it → the forward path fills to
+        // TP, proving the block above is the verdict, not the price path.
+        let fire = enter_fire(
+            golden_stop_enter(false),
+            1_781_244_000,
+            EnterGateOutcome::Placed { order_id: None },
+        );
         let result = resolve_fire_any(&plan_for(0.0001), &fire, &[]).expect("an enter result");
         assert!(
             result.kind.is_taken(),
-            "without needs_golden the forward path fills the order (got {:?})",
+            "a placed enter fills along the forward path (got {:?})",
             result.kind
         );
     }

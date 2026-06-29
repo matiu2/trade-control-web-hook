@@ -51,10 +51,41 @@ Worker entirely. axum HTTP receiver + per-task tokio scheduler, backed by
             `tick_bundles` is Task #6), NOT state, handled with the recording
             sink. Entry dispatch path is now fully `Env`-free + `StateStore`-
             generic → ready to relocate to `core` (increment 9).
-      - [ ] **(9) relocate** — move the now-generic, worker-free dispatch fns +
-            `ActionResult`/`DispatchResult` + `DispatchConfig` into `core` (where
-            `retry_gate`/`pause_gate`/the gates already live). wasm worker + native
-            both import from `core`. ONE dispatch, can't drift.
+      - [x] **(9-relocate) ActionResult dispatch → core::dispatch** (commit
+            4e8abcb) — the 5 ActionResult fns + ActionResult enum + helper
+            closure moved into `core/src/dispatch/` (action/enter/close/
+            invalidate/veto/action_result/control_result/shared). rlog!→tracing!.
+            wasm worker re-exports them (kept compiling — DEAD END, not polished).
+            4 dead re-export shims deleted. core 730 tests, all consumers build.
+      - [ ] **(9-replay) re-point replay at the REAL run_enter** (IN PROGRESS,
+            agent a3dbc0e) — USER PRIORITY: replay behaviour must match the engine
+            as closely as possible. The replay (cli/src/bin/replay_candles) already
+            has a MemStateStore+clock + ReplayBroker (full Broker impl) and calls
+            pause_gate/retry_gate piecemeal but MISSES cooldown/prep/veto/
+            entry-level-veto. Replace the hand-assembled gates with ONE
+            run_enter(&ReplayBroker, &store, &verified, &cfg, ...) call, carry the
+            ActionResult outcome on Fire (EnterGateOutcome), report reads it
+            instead of re-deriving via engine::entry_gate_block (DELETE that
+            mirror). Maximum fidelity, kills the drift class.
+      - [ ] **(9-control) de-worker + relocate the 17 control handlers** — convert
+            handle_status/prep/veto/pause/resume/register/plan_* from
+            `Result<Response>` → `core::dispatch::ControlResult{status,body}` (like
+            #7 did ActionResult: Response::ok(b)→ControlResult::ok(b),
+            Response::error(m,s)→ControlResult::error(m,s); the edge maps back via
+            is_success). Then relocate to core::dispatch. Worker + native map
+            ControlResult→their response at the edge. User chose "move EVERYTHING".
+            CATALOG (post-relocation line nums, ~63 Response sites total):
+              env-FREE (15, fully relocatable): handle_status(L474),
+              handle_unlock(523), handle_prep(557), handle_prep_expire(689),
+              handle_veto(735), handle_clear_prep(822), handle_clear_veto(870),
+              handle_pause(915), handle_resume(966), handle_news_start(998),
+              handle_news_end(1047), handle_register(1087), handle_plan_list(1191),
+              handle_plan_show(1351), handle_plan_delete(1401).
+              env-USING (2, convert return type but KEEP env + stay in worker until
+              Task #6 R2→PG): handle_plan_purge(1493, r2_purge), 
+              handle_purge_older_than(1594, r2_purge).
+            Edge consumers: the 17 `break 'intent handle_*` sites in main's fetch
+            loop wrap with a control→Response mapper.
 - [ ] **axum receiver.** Once dispatch is worker-free + generic: one POST route,
       verify/parse via `core`, call the shared `run_action::<PgStateStore, _>`,
       map `DispatchResult` to `IntoResponse`. Bind `127.0.0.1:PORT` (proxy TLS).

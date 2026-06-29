@@ -36,6 +36,18 @@ struct PlacedAttempt {
     cancelled: bool,
 }
 
+/// The geometry the replay loop arms before each `run_enter` so this broker's
+/// `place_entry` can mint a correlatable order id and record the attempt. The
+/// real dispatch (`run_enter`) calls `broker.place_entry` with only an
+/// `EntryRequest`, which lacks the intent + shell the offline prior-attempt
+/// resolver needs — so the loop hands them in out-of-band here.
+#[derive(Clone)]
+struct ArmedPlacement {
+    order_id: String,
+    intent: Intent,
+    shell: Shell,
+}
+
 /// Offline broker that resolves prior-attempt state from the candle window.
 pub struct ReplayBroker {
     /// The full pulled bid/ask candle window (warm-up + live), ascending. Each
@@ -48,6 +60,9 @@ pub struct ReplayBroker {
     /// simulation at this bar (time-accurate prior-state resolution).
     as_of: RefCell<DateTime<Utc>>,
     placed: RefCell<Vec<PlacedAttempt>>,
+    /// The placement the loop armed for the next `run_enter` (its intent, shell,
+    /// and the order id `place_entry` should return). Consumed by `place_entry`.
+    armed: RefCell<Option<ArmedPlacement>>,
 }
 
 impl ReplayBroker {
@@ -58,6 +73,7 @@ impl ReplayBroker {
             pip_size,
             as_of: RefCell::new(last),
             placed: RefCell::new(Vec::new()),
+            armed: RefCell::new(None),
         }
     }
 
@@ -67,10 +83,24 @@ impl ReplayBroker {
         *self.as_of.borrow_mut() = as_of;
     }
 
+    /// Arm the placement for the next `run_enter`: the order id `place_entry`
+    /// should return and the intent + shell needed to resolve this attempt's
+    /// later state. Call right before dispatching the enter; `place_entry`
+    /// consumes it. `order_id` must match what the gate stores on the
+    /// `EntryAttempt` (`run_enter` stamps `place_entry`'s return there), so the
+    /// minted id is the standard `{intent.id}-{attempt_no}` form.
+    pub fn arm_placement(&self, order_id: String, intent: Intent, shell: Shell) {
+        *self.armed.borrow_mut() = Some(ArmedPlacement {
+            order_id,
+            intent,
+            shell,
+        });
+    }
+
     /// Register a placed attempt so a later lookup can resolve it. `order_id`
     /// must match what the gate stored on the `EntryAttempt` (the replay uses
     /// the same id when it `record_placement`s).
-    pub fn record_attempt(&self, order_id: String, intent: Intent, shell: Shell) {
+    fn record_attempt(&self, order_id: String, intent: Intent, shell: Shell) {
         self.placed.borrow_mut().push(PlacedAttempt {
             order_id,
             intent,
@@ -155,9 +185,29 @@ impl Broker for ReplayBroker {
         _max_open_positions: u32,
         _req: &EntryRequest<'_>,
     ) -> Result<String, EntryError> {
-        // The replay places via simulate_fill in its own loop, not through the
-        // broker trait. The gate never calls this.
-        unreachable!("ReplayBroker: place_entry is driven by the replay loop, not the gate")
+        // The real dispatch (`run_enter`) calls this to "place" the order. The
+        // replay loop armed the geometry out-of-band (intent + shell + the order
+        // id to return) because `EntryRequest` lacks what the offline
+        // prior-attempt resolver needs. Record the attempt so a later
+        // `lookup_attempt_state` can resolve it, and hand back the armed id —
+        // which `run_enter` then stamps onto the `EntryAttempt` row, keeping the
+        // gate's correlation intact.
+        let armed = self.armed.borrow_mut().take();
+        match armed {
+            Some(a) => {
+                self.record_attempt(a.order_id.clone(), a.intent, a.shell);
+                Ok(a.order_id)
+            }
+            // No armed placement means the loop dispatched an enter without
+            // arming first — a wiring bug, not a broker condition. Fail the
+            // placement loudly rather than fabricate an id.
+            None => {
+                tracing::error!(
+                    "ReplayBroker::place_entry called with no armed placement — replay wiring bug"
+                );
+                Err(EntryError::OrderRejected)
+            }
+        }
     }
 
     async fn close_positions(&self, _instrument: &str) -> bool {
