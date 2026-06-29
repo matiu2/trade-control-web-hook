@@ -290,4 +290,52 @@ Two Arm instances: compute + Postgres, same region/AD, private VCN.
 - **Replay protection + retry gate** must behave identically — both already in
   `core`, just give them the PG store.
 - **Don't regress close-confirm into wick-trigger** when adding ticks (phase 2).
-```
+
+---
+
+## Phase 0 status — DONE & GREEN (2026-06-29)
+
+The Postgres `StateStore` layer is complete and proven:
+
+- `trade-control-worker` crate (`worker/`), workspace member, edition 2024.
+- `PgStateStore` — all **53** `StateStore` methods over Postgres
+  (`worker/src/pg.rs`), schema `worker/migrations/0001_state.sql` (17 typed
+  tables), applied to the dev DB.
+- **Cross-backend conformance harness** `core::state::conformance::run_all`
+  (gated `test-support`): one set of behavioural assertions, run against
+  **both** `MemStateStore` (in `core`) and `PgStateStore` (in `worker`).
+  **Green on both.** It caught four real parity bugs (NULL-account PK, TTL
+  clamp, µs/ns timestamp precision, `ON CONFLICT` on account) — all fixed.
+  See `TODO.md` for the full writeup.
+- `snapshot()` (Pg-only cross-family aggregation) tested.
+- Builds offline (runtime queries, no `query!` macro / no `.sqlx` cache).
+
+The StateStore seam is the hard part of the migration and it's done. What
+remains is the native *shell* around it (Phase 1).
+
+## Phase 1 — OPEN QUESTIONS for the user (do NOT guess these)
+
+Phase 1 (axum receiver + tokio scheduler) has design forks that need a
+decision before coding — flagged here rather than guessed:
+
+1. **HTTP server shape** — bind addr/port, TLS termination (nginx/caddy in
+   front, or rustls in-process?), graceful-shutdown signal handling. Behind a
+   reverse proxy on the Oracle box, or exposed directly?
+2. **Scheduler cadence** — CF cron fired the upkeep list on a fixed `*/N`.
+   Native can self-pace (a tokio interval). Keep the same N-minute tick, or
+   tighten now that we're not paying per-invocation? (Phase 2 websocket changes
+   this calculus again.)
+3. **Recording sink schema** — DECIDED it's a Postgres table, but the table
+   shape (one `recordings` table with a `kind` + jsonb, vs separate `req` /
+   `tick_bundle` tables) and whether the tax-tracker's S3 pull is replaced now
+   or bridged later.
+4. **`&dyn Broker` construction** — the scheduler needs a broker per account
+   from `~/.config/tradenation/accounts.enc`. Confirm the native binary owns
+   that store directly (it should — it's native already) and how secrets
+   (`OANDA_API_KEY` etc.) are sourced (env, file, or the same enc store).
+5. **Config file format** — env vars (12-factor) vs a TOML config the binary
+   reads. The CF model was all secrets; native can have a real config file.
+
+Recommendation when you're ready: do Phase 1 as its own branch off this one,
+porting `src/cron.rs`'s submodules one at a time, each taking `&PgStateStore`
++ `&dyn Broker`, with the replay harness as the decision-parity gate.
