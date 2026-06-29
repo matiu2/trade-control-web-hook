@@ -185,54 +185,6 @@ impl KvStateStore {
         format!("order:{order_id}")
     }
 
-    /// Persist the raw signed alert body for a placed order so the
-    /// spread-blackout apply cron can recover + re-drive it. `order_id` is
-    /// the broker order id [`crate::tradenation_adapter`] / OANDA returned.
-    /// Inherent (not on [`StateStore`]) because only the worker's entry path
-    /// and the blackout crons touch it — keeping it off the trait avoids
-    /// rippling into the in-memory test store + CLI.
-    pub async fn put_order_body(
-        &self,
-        order_id: &str,
-        signed_body: &str,
-    ) -> Result<(), StateError> {
-        let key = Self::order_body_key(order_id);
-        // No `.expiration_ttl(...)`: the order-body recovery cache is per-trade
-        // lifecycle state and now persists until `plan purge` (the order_id is
-        // recovered from the trade's entry-attempt rows). Previously TTL'd to
-        // the alert window so it aged out with its EntryAttempt.
-        self.store
-            .put(&key, signed_body)
-            .map_err(|e| StateError::Backend(format!("put {key} builder: {e:?}")))?
-            .execute()
-            .await
-            .map_err(|e| StateError::Backend(format!("put {key} execute: {e:?}")))?;
-        Ok(())
-    }
-
-    /// Read the raw signed alert body for `order_id`, or `None` if absent /
-    /// purged (the order's alert window closed before any blackout, so it can't
-    /// and shouldn't be restored).
-    pub async fn get_order_body(&self, order_id: &str) -> Result<Option<String>, StateError> {
-        let key = Self::order_body_key(order_id);
-        self.store
-            .get(&key)
-            .text()
-            .await
-            .map_err(|e| StateError::Backend(format!("get {key}: {e:?}")))
-    }
-
-    /// Best-effort delete of an order-body row once it has been re-driven on
-    /// recovery (or the order is otherwise gone). A no-op if already expired.
-    pub async fn delete_order_body(&self, order_id: &str) -> Result<(), StateError> {
-        let key = Self::order_body_key(order_id);
-        self.store
-            .delete(&key)
-            .await
-            .map_err(|e| StateError::Backend(format!("delete {key}: {e:?}")))?;
-        Ok(())
-    }
-
     /// List every KV key under `prefix`, paging through `kv.list` until
     /// `list_complete`. Shared by the control-event + purge paths; mirrors the
     /// pagination already inlined in `list_entry_attempts` /
@@ -391,6 +343,47 @@ async fn write_index<T: serde::Serialize>(
 }
 
 impl StateStore for KvStateStore {
+    /// Persist the raw signed alert body for a placed order so the
+    /// spread-blackout apply cron can recover + re-drive it. `order_id` is
+    /// the broker order id [`crate::tradenation_adapter`] / OANDA returned.
+    async fn put_order_body(&self, order_id: &str, signed_body: &str) -> Result<(), StateError> {
+        let key = Self::order_body_key(order_id);
+        // No `.expiration_ttl(...)`: the order-body recovery cache is per-trade
+        // lifecycle state and now persists until `plan purge` (the order_id is
+        // recovered from the trade's entry-attempt rows). Previously TTL'd to
+        // the alert window so it aged out with its EntryAttempt.
+        self.store
+            .put(&key, signed_body)
+            .map_err(|e| StateError::Backend(format!("put {key} builder: {e:?}")))?
+            .execute()
+            .await
+            .map_err(|e| StateError::Backend(format!("put {key} execute: {e:?}")))?;
+        Ok(())
+    }
+
+    /// Read the raw signed alert body for `order_id`, or `None` if absent /
+    /// purged (the order's alert window closed before any blackout, so it can't
+    /// and shouldn't be restored).
+    async fn get_order_body(&self, order_id: &str) -> Result<Option<String>, StateError> {
+        let key = Self::order_body_key(order_id);
+        self.store
+            .get(&key)
+            .text()
+            .await
+            .map_err(|e| StateError::Backend(format!("get {key}: {e:?}")))
+    }
+
+    /// Best-effort delete of an order-body row once it has been re-driven on
+    /// recovery (or the order is otherwise gone). A no-op if already expired.
+    async fn delete_order_body(&self, order_id: &str) -> Result<(), StateError> {
+        let key = Self::order_body_key(order_id);
+        self.store
+            .delete(&key)
+            .await
+            .map_err(|e| StateError::Backend(format!("delete {key}: {e:?}")))?;
+        Ok(())
+    }
+
     async fn is_seen(&self, id: &str) -> Result<bool, StateError> {
         let key = Self::seen_key(id);
         let result = self

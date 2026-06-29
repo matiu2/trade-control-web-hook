@@ -537,9 +537,9 @@ impl ActionResult {
 /// Dispatch `Enter` / `Close` / `Invalidate` / escalated `Veto` against an
 /// authenticated broker. Status / Unlock / Prep / `stop-next-entry` Veto /
 /// Clear-* are handled before this function and never reach it.
-async fn run_action<B: Broker>(
+async fn run_action<B: Broker, S: StateStore>(
     broker: &B,
-    store: &KvStateStore,
+    store: &S,
     verified: &incoming::Verified,
     env: &Env,
     now: chrono::DateTime<chrono::Utc>,
@@ -580,9 +580,9 @@ async fn run_action<B: Broker>(
 /// pending orders for it. Extracted from [`run_action`] so the cron engine can
 /// dispatch a fired invalidation veto through the identical path. `pub(crate)`
 /// for that reuse.
-pub(crate) async fn run_invalidate<B: Broker>(
+pub(crate) async fn run_invalidate<B: Broker, S: StateStore>(
     broker: &B,
-    store: &KvStateStore,
+    store: &S,
     verified: &incoming::Verified,
     now: chrono::DateTime<chrono::Utc>,
 ) -> ActionResult {
@@ -665,9 +665,9 @@ pub(crate) async fn run_invalidate<B: Broker>(
 /// Both contextual gates are evaluated even after one passes, so the
 /// log line records the full state and the outcome string can name
 /// every failed gate when none passes.
-async fn run_close<B: Broker>(
+async fn run_close<B: Broker, S: StateStore>(
     broker: &B,
-    store: &KvStateStore,
+    store: &S,
     verified: &incoming::Verified,
     now: chrono::DateTime<chrono::Utc>,
 ) -> ActionResult {
@@ -878,8 +878,8 @@ fn reversal_veto_plan<'a>(
 /// reversal-close. Best-effort: a KV failure or a missing `trade_id` is
 /// logged and swallowed — the close has already happened and the veto is
 /// an additive guard, not a precondition for it.
-async fn write_reversal_veto(
-    store: &KvStateStore,
+async fn write_reversal_veto<S: StateStore>(
+    store: &S,
     verified: &incoming::Verified,
     now: chrono::DateTime<chrono::Utc>,
 ) {
@@ -1179,9 +1179,9 @@ mod reversal_veto_tests {
 /// body is available (there is none today — both the HTTP path and the
 /// blackout re-drive supply it); a `None` simply skips the order-body write, so
 /// such an order can't be blackout-cancelled-and-restored.
-pub(crate) async fn run_enter<B: Broker>(
+pub(crate) async fn run_enter<B: Broker, S: StateStore>(
     broker: &B,
-    store: &KvStateStore,
+    store: &S,
     verified: &incoming::Verified,
     env: &Env,
     now: chrono::DateTime<chrono::Utc>,
@@ -2212,8 +2212,8 @@ fn entry_reference_price(entry: &trade_control_core::intent::ResolvedEntry) -> f
 }
 
 /// Handle the `status` action: dump cooldown + recent-seen indexes as YAML.
-async fn handle_status(
-    store: &KvStateStore,
+async fn handle_status<S: StateStore>(
+    store: &S,
     verified: &incoming::Verified,
     now: chrono::DateTime<chrono::Utc>,
 ) -> Result<Response> {
@@ -2296,8 +2296,8 @@ async fn record_control_event_for<S: StateStore>(
 }
 
 /// Handle the `unlock` action: clear the cooldown for `verified.intent.instrument`.
-async fn handle_unlock(
-    store: &KvStateStore,
+async fn handle_unlock<S: StateStore>(
+    store: &S,
     verified: &incoming::Verified,
     now: chrono::DateTime<chrono::Utc>,
 ) -> Result<Response> {
@@ -2330,8 +2330,8 @@ async fn handle_unlock(
 }
 
 /// Handle the `prep` action: record a named step for an instrument with a TTL.
-async fn handle_prep(
-    store: &KvStateStore,
+async fn handle_prep<S: StateStore>(
+    store: &S,
     verified: &incoming::Verified,
     now: chrono::DateTime<chrono::Utc>,
 ) -> Result<Response> {
@@ -2462,8 +2462,8 @@ fn format_prep_set_outcome(step: &str, ttl_hours: u32, cleared: &[String]) -> St
 ///
 /// Marks-seen on completion (idempotent control action, like `prep`):
 /// replaying the same `prep-expire` body just re-applies the same block.
-async fn handle_prep_expire(
-    store: &KvStateStore,
+async fn handle_prep_expire<S: StateStore>(
+    store: &S,
     verified: &incoming::Verified,
     now: chrono::DateTime<chrono::Utc>,
 ) -> Result<Response> {
@@ -2508,8 +2508,8 @@ async fn handle_prep_expire(
 
 /// Handle the `veto` action at level `stop-next-entry`: record a named
 /// veto for an instrument with a TTL. No broker call.
-async fn handle_veto(
-    store: &KvStateStore,
+async fn handle_veto<S: StateStore>(
+    store: &S,
     verified: &incoming::Verified,
     now: chrono::DateTime<chrono::Utc>,
 ) -> Result<Response> {
@@ -2626,9 +2626,9 @@ fn format_veto_set_outcome(
 /// `close-positions`: set the KV flag, then execute the broker-side
 /// effects appropriate to the level. Re-fires repeat the side effects
 /// (alerts can drop; reapplying is cheap and defensive).
-async fn run_veto_with_broker<B: Broker>(
+async fn run_veto_with_broker<B: Broker, S: StateStore>(
     broker: &B,
-    store: &KvStateStore,
+    store: &S,
     verified: &incoming::Verified,
     now: chrono::DateTime<chrono::Utc>,
 ) -> ActionResult {
@@ -2755,8 +2755,8 @@ async fn run_veto_with_broker<B: Broker>(
 }
 
 /// Handle the `clear-prep` action: drop a single prep flag.
-async fn handle_clear_prep(
-    store: &KvStateStore,
+async fn handle_clear_prep<S: StateStore>(
+    store: &S,
     verified: &incoming::Verified,
     now: chrono::DateTime<chrono::Utc>,
 ) -> Result<Response> {
@@ -2803,8 +2803,8 @@ async fn handle_clear_prep(
 }
 
 /// Handle the `clear-veto` action: drop a single veto flag.
-async fn handle_clear_veto(
-    store: &KvStateStore,
+async fn handle_clear_veto<S: StateStore>(
+    store: &S,
     verified: &incoming::Verified,
     now: chrono::DateTime<chrono::Utc>,
 ) -> Result<Response> {
@@ -2848,8 +2848,8 @@ async fn handle_clear_veto(
 /// grace tail) so an orphaned pause from a dropped `resume` eventually
 /// ages out instead of pinning the trade forever. The matching `resume`
 /// is the authoritative clear.
-async fn handle_pause(
-    store: &KvStateStore,
+async fn handle_pause<S: StateStore>(
+    store: &S,
     verified: &incoming::Verified,
     now: chrono::DateTime<chrono::Utc>,
 ) -> Result<Response> {
@@ -2899,8 +2899,8 @@ async fn handle_pause(
 
 /// Handle the `resume` action: clear a single `(trade_id, blackout_id)`
 /// pause. Sibling blackouts on the same trade survive.
-async fn handle_resume(
-    store: &KvStateStore,
+async fn handle_resume<S: StateStore>(
+    store: &S,
     verified: &incoming::Verified,
     now: chrono::DateTime<chrono::Utc>,
 ) -> Result<Response> {
@@ -2931,8 +2931,8 @@ async fn handle_resume(
 /// `(trade_id, news_id)`. No broker work. Mirrors `handle_pause` but
 /// writes to the news-window KV namespace, which only the gated
 /// `close` reads — entries are not blocked by news windows.
-async fn handle_news_start(
-    store: &KvStateStore,
+async fn handle_news_start<S: StateStore>(
+    store: &S,
     verified: &incoming::Verified,
     now: chrono::DateTime<chrono::Utc>,
 ) -> Result<Response> {
@@ -2980,8 +2980,8 @@ async fn handle_news_start(
 
 /// Handle the `news-end` action: close a single
 /// `(trade_id, news_id)` news window.
-async fn handle_news_end(
-    store: &KvStateStore,
+async fn handle_news_end<S: StateStore>(
+    store: &S,
     verified: &incoming::Verified,
     now: chrono::DateTime<chrono::Utc>,
 ) -> Result<Response> {
@@ -3020,8 +3020,8 @@ async fn handle_news_end(
 /// then a register is a logged no-op so the wire path and the dispatch routing
 /// can be exercised end-to-end without the engine's storage schema. The
 /// `not-yet-persisted` outcome string makes that explicit in `status`.
-async fn handle_register(
-    store: &KvStateStore,
+async fn handle_register<S: StateStore>(
+    store: &S,
     verified: &incoming::Verified,
     now: chrono::DateTime<chrono::Utc>,
 ) -> Result<Response> {
@@ -3124,8 +3124,8 @@ struct PlanDetail {
 /// account scopes, pair each with its current `PlanState`, and return a compact
 /// YAML summary. Read-only, KV-only, idempotent (marks seen on completion like
 /// every other control action).
-async fn handle_plan_list(
-    store: &KvStateStore,
+async fn handle_plan_list<S: StateStore>(
+    store: &S,
     verified: &incoming::Verified,
     now: chrono::DateTime<chrono::Utc>,
 ) -> Result<Response> {
@@ -3284,8 +3284,8 @@ async fn collect_plan_details<S: StateStore>(
 /// `intent.trade_id`; we scan every account scope — **live and archived** — and
 /// return the match(es) so a finished plan surfaced by `plan list
 /// --include-archived` is still inspectable. Returns 404 when no plan matches.
-async fn handle_plan_show(
-    store: &KvStateStore,
+async fn handle_plan_show<S: StateStore>(
+    store: &S,
     verified: &incoming::Verified,
     now: chrono::DateTime<chrono::Utc>,
 ) -> Result<Response> {
@@ -3334,8 +3334,8 @@ async fn handle_plan_show(
 /// deleted on the terminal tick) is still deletable. Idempotent and KV-only: a
 /// delete of a non-existent plan returns `ok` (count 0), never an error —
 /// re-running `plan delete` is always safe.
-async fn handle_plan_delete(
-    store: &KvStateStore,
+async fn handle_plan_delete<S: StateStore>(
+    store: &S,
     verified: &incoming::Verified,
     now: chrono::DateTime<chrono::Utc>,
 ) -> Result<Response> {
@@ -3426,8 +3426,8 @@ async fn handle_plan_delete(
 /// already captured durably in the `control-event:` trail this purge drops. So
 /// purge removes the *audit + lifecycle* state, not the still-live control gates
 /// (which a purge of a finished trade has none of anyway).
-async fn handle_plan_purge(
-    store: &KvStateStore,
+async fn handle_plan_purge<S: StateStore>(
+    store: &S,
     env: &Env,
     verified: &incoming::Verified,
     now: chrono::DateTime<chrono::Utc>,

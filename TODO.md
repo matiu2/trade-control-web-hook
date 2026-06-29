@@ -25,9 +25,31 @@ Worker entirely. axum HTTP receiver + per-task tokio scheduler, backed by
       `DispatchResult { status: u16, body: String, outcome: String }` (replacing
       `ActionResult::Rejected { response: worker::Response }`). The wasm worker
       maps `DispatchResult → worker::Response` at its edge; the native crate maps
-      it to axum `IntoResponse`. ONE dispatch, no drift. Stage it: enter path
-      first (run_enter + its gates), wasm worker green throughout, then
-      close/invalidate, then control handlers.
+      it to axum `IntoResponse`. ONE dispatch, no drift. Staged as 4 increments,
+      each keeping the wasm worker green:
+      - [x] **(7) de-worker `ActionResult`** — `Rejected` carries
+            `{status: u16, body: String, outcome}`; `worker::Response` built only
+            at the single fetch-path consumption edge. Commit `957420b`.
+      - [ ] **(8a) StateStore axis** — the 22 dispatch fns `store: &KvStateStore`
+            → `store: &S` with a `<S: StateStore>` bound (broker first, store
+            second, à la `core::retry_gate::evaluate`). All `store` use is via the
+            trait (verified — no `KvStateStore::`-inherent calls). KvStateStore
+            still satisfies the bound at the wasm call sites; byte-identical.
+            IN PROGRESS (agent a0f343).
+      - [ ] **(8b) env axis → `DispatchConfig`** — `run_enter` is the ONLY
+            dispatch fn that reads `env` for config (4 reads: `secret_or_default`
+            ×2, `pip_size_for`, `load_account_caps`). Replace `env: &Env` there
+            with a pre-resolved `core::DispatchConfig { worker_max_risk_pct: f64,
+            worker_max_open_positions: u32, pip_size: f64, caps: AccountCaps }`,
+            built at the EDGE (wasm: from `Env`; native: from `Secrets` +
+            `PgMetadataStore`). The `r2_purge` env uses (plan-purge / older-than)
+            stay `env: &Env` for now — they're the *recording* backend (R2 →
+            Postgres `tick_bundles` is Task #6), NOT state, so they're handled
+            with the recording sink, not here.
+      - [ ] **(9) relocate** — move the now-generic, worker-free dispatch fns +
+            `ActionResult`/`DispatchResult` + `DispatchConfig` into `core` (where
+            `retry_gate`/`pause_gate`/the gates already live). wasm worker + native
+            both import from `core`. ONE dispatch, can't drift.
 - [ ] **axum receiver.** Once dispatch is worker-free + generic: one POST route,
       verify/parse via `core`, call the shared `run_action::<PgStateStore, _>`,
       map `DispatchResult` to `IntoResponse`. Bind `127.0.0.1:PORT` (proxy TLS).

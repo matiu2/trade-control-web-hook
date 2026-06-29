@@ -83,6 +83,56 @@ pub async fn run_all(store: &impl StateStore, tag: &str) {
     plan_state(store, tag).await;
     control_events(store, tag).await;
     archived_plan(store, tag).await;
+    order_body(store, tag).await;
+}
+
+// ---------------------------------------------------------------------------
+// order_body
+// ---------------------------------------------------------------------------
+
+/// Order-body recovery cache: round-trips, overwrites in place, reads `None`
+/// when absent, and deletes. NO TTL (it persists until `plan purge`), so —
+/// unlike the control families — there is no expiry assertion. This family
+/// guards the parity gap the dispatch genericisation surfaced: the three
+/// methods were inherent to `KvStateStore` (off the trait) so Phase 0 never
+/// exercised them; the Postgres backend must back them with real storage, not
+/// the trait's no-op defaults.
+pub async fn order_body(store: &impl StateStore, tag: &str) {
+    let order_id = format!("{tag}-order-1");
+
+    assert!(
+        store.get_order_body(&order_id).await.unwrap().is_none(),
+        "absent order body reads None"
+    );
+
+    store
+        .put_order_body(&order_id, "signed-body-v1")
+        .await
+        .unwrap();
+    assert_eq!(
+        store.get_order_body(&order_id).await.unwrap().as_deref(),
+        Some("signed-body-v1"),
+        "stored order body round-trips"
+    );
+
+    // Overwrite in place (a re-placed order under the same id).
+    store
+        .put_order_body(&order_id, "signed-body-v2")
+        .await
+        .unwrap();
+    assert_eq!(
+        store.get_order_body(&order_id).await.unwrap().as_deref(),
+        Some("signed-body-v2"),
+        "re-put overwrites the prior body"
+    );
+
+    store.delete_order_body(&order_id).await.unwrap();
+    assert!(
+        store.get_order_body(&order_id).await.unwrap().is_none(),
+        "deleted order body reads None"
+    );
+    // Idempotent: deleting an absent body is a no-op.
+    store.delete_order_body(&order_id).await.unwrap();
 }
 
 // ---------------------------------------------------------------------------

@@ -1875,4 +1875,40 @@ impl StateStore for PgStateStore {
     ) -> Result<(), StateError> {
         self.clear_archived_plan_impl(account, trade_id).await
     }
+
+    // Order-body recovery cache (`order_bodies` table, NO TTL). Keyed by the
+    // broker order id only — globally unique, no account scope. Mirrors the KV
+    // `order:<id>` slots. See migration 0004 for why these must be real (not
+    // the trait's no-op defaults) on the native runtime.
+    async fn put_order_body(&self, order_id: &str, signed_body: &str) -> Result<(), StateError> {
+        sqlx::query(
+            "INSERT INTO order_bodies (order_id, signed_body) VALUES ($1, $2) \
+             ON CONFLICT (order_id) DO UPDATE SET signed_body = EXCLUDED.signed_body",
+        )
+        .bind(order_id)
+        .bind(signed_body)
+        .execute(&self.pool)
+        .await
+        .map_err(backend)?;
+        Ok(())
+    }
+
+    async fn get_order_body(&self, order_id: &str) -> Result<Option<String>, StateError> {
+        let row: Option<(String,)> =
+            sqlx::query_as("SELECT signed_body FROM order_bodies WHERE order_id = $1")
+                .bind(order_id)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(backend)?;
+        Ok(row.map(|(body,)| body))
+    }
+
+    async fn delete_order_body(&self, order_id: &str) -> Result<(), StateError> {
+        sqlx::query("DELETE FROM order_bodies WHERE order_id = $1")
+            .bind(order_id)
+            .execute(&self.pool)
+            .await
+            .map_err(backend)?;
+        Ok(())
+    }
 }

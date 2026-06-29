@@ -46,7 +46,7 @@ use chrono::{DateTime, Utc};
 use trade_control_core::blackout_recreate::{RestorePlan, restore_plan};
 use trade_control_core::incoming::{self, IncomingError};
 use trade_control_core::intent::Resolved;
-use trade_control_core::state::{CancelledOrder, SpreadBlackoutRecord};
+use trade_control_core::state::{CancelledOrder, SpreadBlackoutRecord, StateStore};
 use worker::Env;
 
 use super::sweep::{BrokerHandle, acquire_broker_for_account};
