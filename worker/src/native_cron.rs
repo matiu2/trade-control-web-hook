@@ -116,4 +116,12 @@ impl CronEnv for NativeCronEnv {
             bundle.correlation_id
         );
     }
+
+    fn signing_key(&self) -> Option<Vec<u8>> {
+        // Decoded once at boot and held on `AppState` (the same key the HTTP
+        // receiver verifies with). Always present here — `main` aborts if
+        // `SIGNING_KEY` is missing/invalid — but the seam is `Option` for the
+        // wasm side, so clone the bytes.
+        Some(self.state.signing_key.clone())
+    }
 }

@@ -13,7 +13,6 @@ mod cron;
 mod diag;
 mod market_info;
 mod r2_purge;
-mod spread_blackout;
 mod state;
 mod tick_recording;
 #[cfg(target_arch = "wasm32")]
@@ -30,13 +29,14 @@ use crate::tradenation_adapter::TradeNationAdapter;
 #[cfg(target_arch = "wasm32")]
 use broker_oanda::login_with_account_id as oanda_login_with;
 use broker_oanda::{OandaBroker, login as oanda_login};
-// Re-exported at the crate root so existing `crate::run_enter` /
-// `crate::ActionResult` call sites in `lib.rs` (the fetch path) and
-// `cron/blackout_restore.rs` resolve unchanged after the dispatch move to core.
-// (`run_close` / `run_invalidate` / `run_veto_with_broker` were only used by the
-// engine tick, which moved to `trade-control-cron` and imports them from core
-// directly, so they're no longer re-exported here.)
-pub(crate) use trade_control_core::dispatch::{ActionResult, ControlResult, run_action, run_enter};
+// Re-exported at the crate root so existing `crate::ActionResult` /
+// `crate::run_action` call sites in `lib.rs` (the fetch path) resolve unchanged
+// after the dispatch move to core. (`run_enter` was only reached directly by
+// `cron/blackout_restore.rs`, and `run_close` / `run_invalidate` /
+// `run_veto_with_broker` only by the engine tick — both moved to
+// `trade-control-cron` and import from core directly, so neither is re-exported
+// here any more.)
+pub(crate) use trade_control_core::dispatch::{ActionResult, ControlResult, run_action};
 // Replay-protection helpers now live in `core::dispatch::seen` so the wasm
 // worker and the native axum receiver share the same logic (and can't drift —
 // `[[strategy_changes_in_both_replayer_and_worker]]`). Re-exported at the crate

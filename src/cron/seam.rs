@@ -41,4 +41,8 @@ impl CronEnv for EnvCronEnv<'_> {
     fn record_tick(&self, bundle: TickBundle) {
         crate::tick_recording::record_tick_to_r2(self.env, self.ctx, bundle);
     }
+
+    fn signing_key(&self) -> Option<Vec<u8>> {
+        crate::signing_key(self.env)
+    }
 }

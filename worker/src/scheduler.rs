@@ -5,9 +5,10 @@
 //!
 //! This scheduler is **a small, fixed number of long-lived
 //! [`tokio::time::interval`] timers** (one per cron job — currently the engine
-//! tick, the break-even watcher, and the daily market-hours blackout refresh),
-//! each re-arming itself via `.tick().await`. It is emphatically **not** a
-//! per-plan / per-request timer fan-out.
+//! tick, the break-even watcher, the daily market-hours blackout refresh, the
+//! spread-recovery watcher, and the NY-close-edge spread-blackout apply), each
+//! re-arming itself via `.tick().await`. It is emphatically **not** a per-plan /
+//! per-request timer fan-out.
 //!
 //! That distinction is load-bearing. tokio's timer driver guards its wheel with
 //! a single mutex; under a flood of short-lived `Sleep` timers being created and
@@ -50,7 +51,10 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use trade_control_cron::{breakeven_watch, refresh_market_hours_if_due, run_engine_tick};
+use trade_control_cron::{
+    apply_if_ny_close_edge, breakeven_watch, refresh_market_hours_if_due, run_engine_tick,
+    watch_recovery,
+};
 
 use crate::SchedulerConfig;
 use crate::http::AppState;
@@ -66,18 +70,23 @@ use crate::native_cron::NativeCronEnv;
 /// [`SchedulerConfig::upkeep_interval`]), and the daily market-hours blackout
 /// refresh (the self-gating [`SchedulerConfig::daily_tick_interval`]).
 ///
-/// The three loops are joined on one [`LocalSet`], so they share the single
+/// All loops are joined on one [`LocalSet`], so they share the single
 /// current-thread runtime — a slow tick on one job yields cooperatively to the
-/// others rather than blocking them. (Two more cron jobs — the spread-blackout
-/// NY-close apply and its recovery watcher — are *not* wired here: they still
-/// live in the wasm worker because they need an HMAC signing-key seam the
-/// [`CronEnv`](trade_control_cron::CronEnv) trait doesn't expose; see the cron
-/// crate's `lib.rs` note.)
+/// others rather than blocking them. The spread-blackout NY-close apply and its
+/// recovery watcher are wired here too (they re-verify a stored signed body via
+/// the [`CronEnv::signing_key`](trade_control_cron::CronEnv::signing_key) seam);
+/// `blackout_restore` / `blackout_cancel` are *called by* the watcher/apply, not
+/// scheduled directly, so they get no interval of their own.
 pub fn run_scheduler(state: Arc<AppState>, intervals: SchedulerConfig) {
     let cron = NativeCronEnv::new(state.clone());
     let engine_period = intervals.engine_interval();
     let breakeven_period = intervals.upkeep_interval();
     let blackout_hours_period = intervals.daily_tick_interval();
+    // The spread-recovery watcher runs at the frequent upkeep cadence; the
+    // NY-close apply also ticks at upkeep cadence and self-gates internally on
+    // `is_ny_close_edge`, mirroring the wasm worker's `now.minute() < 15` wake.
+    let blackout_watch_period = intervals.upkeep_interval();
+    let blackout_apply_period = intervals.upkeep_interval();
 
     std::thread::Builder::new()
         .name("tc-scheduler".to_string())
@@ -99,7 +108,9 @@ pub fn run_scheduler(state: Arc<AppState>, intervals: SchedulerConfig) {
                 tokio::join!(
                     engine_tick_loop(state.clone(), cron.clone(), engine_period),
                     breakeven_loop(state.clone(), cron.clone(), breakeven_period),
-                    blackout_hours_loop(state, cron, blackout_hours_period),
+                    blackout_hours_loop(state.clone(), cron.clone(), blackout_hours_period),
+                    blackout_watch_loop(state.clone(), cron.clone(), blackout_watch_period),
+                    blackout_apply_loop(state, cron, blackout_apply_period),
                 );
             });
         })
@@ -171,5 +182,47 @@ async fn blackout_hours_loop(state: Arc<AppState>, cron: NativeCronEnv, period: 
         interval.tick().await;
         let now = chrono::Utc::now();
         refresh_market_hours_if_due(&state.store, &cron, now).await;
+    }
+}
+
+/// The spread-recovery watcher: every `period` (the frequent upkeep cadence)
+/// walk every per-trade spread-blackout record and clear it once the spread has
+/// recovered (or the backstop fires), restoring widened stops + re-driving
+/// cancelled resting orders before the clear. Fail-soft per record (logs +
+/// skips); single re-arming interval.
+async fn blackout_watch_loop(state: Arc<AppState>, cron: NativeCronEnv, period: Duration) {
+    let mut interval = skip_interval(period);
+
+    tracing::info!(
+        "scheduler: spread-recovery watch every {}s",
+        period.as_secs()
+    );
+
+    loop {
+        interval.tick().await;
+        let now = chrono::Utc::now();
+        watch_recovery(&state.store, &cron, now).await;
+    }
+}
+
+/// The NY-close-edge spread-blackout apply: ticks at the upkeep cadence and
+/// **self-gates on `is_ny_close_edge`** inside
+/// [`apply_if_ny_close_edge`] — most ticks no-op. The interval is just the wake
+/// cadence (mirroring the wasm worker's `now.minute() < 15` wake), so a tick
+/// faster than the close hour costs nothing but the edge check. When the edge
+/// hits it opens the blackout window, widens open stops, and cancels resting
+/// orders. Fail-soft per position/order; single re-arming interval.
+async fn blackout_apply_loop(state: Arc<AppState>, cron: NativeCronEnv, period: Duration) {
+    let mut interval = skip_interval(period);
+
+    tracing::info!(
+        "scheduler: NY-close-edge blackout apply wake every {}s (self-gates on the close edge)",
+        period.as_secs()
+    );
+
+    loop {
+        interval.tick().await;
+        let now = chrono::Utc::now();
+        apply_if_ny_close_edge(&state.store, &cron, now).await;
     }
 }

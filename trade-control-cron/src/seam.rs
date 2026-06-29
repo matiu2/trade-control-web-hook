@@ -67,4 +67,12 @@ pub trait CronEnv {
     /// fail-soft — recording must never break trading. wasm writes R2; native
     /// writes Postgres (Task #6).
     fn record_tick(&self, bundle: TickBundle);
+
+    /// The HMAC signing key (raw bytes, hex already decoded), or `None` if it
+    /// can't be resolved. The spread-blackout restore / cancel jobs re-verify a
+    /// *stored* signed body via `incoming::parse_and_verify` before re-driving
+    /// it, so they need the same key the HTTP path verifies with. wasm reads the
+    /// `SIGNING_KEY` secret off `Env`; native returns the key decoded once at
+    /// boot. `None` makes the caller skip the re-drive (it can't trust the body).
+    fn signing_key(&self) -> Option<Vec<u8>>;
 }

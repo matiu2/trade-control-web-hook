@@ -7,7 +7,7 @@
 //!    via [`incoming::parse_and_verify`] — the *only* constructor of a
 //!    `Verified`, and the reason the apply side stores the whole signed body
 //!    rather than a deserialised `Intent`. The signing key is the same secret
-//!    the HTTP path verifies with ([`crate::signing_key`]). A body that no
+//!    the HTTP path verifies with ([`CronEnv::signing_key`]). A body that no
 //!    longer verifies (`Expired` / `StaleShellTime` — the alert window closed
 //!    during a long blackout) is **dropped with a log, never placed**.
 //! 2. **Cheap fill-side pre-check** via the pure
@@ -15,8 +15,8 @@
 //!    or limit re-drives; an overrun stop with `recover_entry=skip` is dropped
 //!    without a broker round-trip; a stale limit is dropped (limits are
 //!    themselves a fallback).
-//! 3. **Re-drive through [`crate::run_enter`]** — NOT `place_entry` directly —
-//!    so sizing at the actual fill reference, the prep/veto/cooldown/allow_entry
+//! 3. **Re-drive through [`run_enter`]** — NOT `place_entry` directly — so
+//!    sizing at the actual fill reference, the prep/veto/cooldown/allow_entry
 //!    gates, AND the Sub-plan-0 `recover_entry` fallback all apply for free.
 //!
 //! ## Seen-id / retry-gate interaction (load-bearing — see CLAUDE.md
@@ -41,33 +41,44 @@
 //!   multi-shot order can burn a slot — acceptable until multi-shot resting
 //!   orders are demo-exercised. Single-shot (the motivating H&S/M-W case) is
 //!   unaffected.
+//!
+//! # Runtime-agnostic via the [`CronEnv`] seam
+//!
+//! Moved into `trade-control-cron` so both the wasm Cloudflare worker and the
+//! native VM scheduler share one re-drive. The `&Env`-hidden broker acquisition,
+//! dispatch-config resolution, and signing-key lookup all travel through the
+//! [`CronEnv`] seam; the caller opens the [`StateStore`] and passes it in.
 
 use chrono::{DateTime, Utc};
 use trade_control_core::blackout_recreate::{RestorePlan, restore_plan};
+use trade_control_core::dispatch::{ActionResult, run_enter};
 use trade_control_core::incoming::{self, IncomingError};
 use trade_control_core::intent::Resolved;
 use trade_control_core::state::{CancelledOrder, SpreadBlackoutRecord, StateStore};
-use worker::Env;
 
-use super::sweep::{BrokerHandle, acquire_broker_for_account};
-use crate::state::KvStateStore;
+use crate::broker_handle::BrokerHandle;
+use crate::constants::DEFAULT_PIP_SIZE;
+use crate::seam::CronEnv;
 
 /// Re-drive (or drop) every cancelled resting order on a record. Called by the
 /// recovery watcher at both clear points (recovery + backstop), BEFORE the
 /// record is cleared. Per-order errors are logged and skipped — one bad
 /// re-drive must never block the others or the clear.
-pub async fn restore_cancelled_orders(
-    env: &Env,
-    store: &KvStateStore,
+pub async fn restore_cancelled_orders<S, C>(
+    store: &S,
+    cron: &C,
     record: &SpreadBlackoutRecord,
     now: DateTime<Utc>,
-) {
+) where
+    S: StateStore,
+    C: CronEnv,
+{
     if record.cancelled_orders.is_empty() {
         return;
     }
     for cancelled in &record.cancelled_orders {
-        if let Err(err) = restore_one_order(env, store, record, cancelled, now).await {
-            rlog_err!(
+        if let Err(err) = restore_one_order(store, cron, record, cancelled, now).await {
+            tracing::error!(
                 "blackout restore[{}]: order {} re-drive error: {err}",
                 record.trade_id,
                 cancelled.order_id,
@@ -80,21 +91,25 @@ pub async fn restore_cancelled_orders(
 /// genuinely unexpected failures (broker/key acquisition); every *expected*
 /// drop path (expired body, stale limit, overrun-skip stop) returns `Ok(())`
 /// after logging, so the watcher treats them as handled.
-async fn restore_one_order(
-    env: &Env,
-    store: &KvStateStore,
+async fn restore_one_order<S, C>(
+    store: &S,
+    cron: &C,
     record: &SpreadBlackoutRecord,
     cancelled: &CancelledOrder,
     now: DateTime<Utc>,
-) -> Result<(), String> {
+) -> Result<(), String>
+where
+    S: StateStore,
+    C: CronEnv,
+{
     let tid = &record.trade_id;
 
     // 1. Reconstruct an authentic Verified from the stored signed body.
-    let key = crate::signing_key(env).ok_or("no signing key")?;
+    let key = cron.signing_key().ok_or("no signing key")?;
     let verified = match incoming::parse_and_verify(&cancelled.signed_intent, &key, now) {
         Ok(v) => v,
         Err(IncomingError::Expired) | Err(IncomingError::StaleShellTime) => {
-            rlog!(
+            tracing::info!(
                 "blackout restore[{tid}]: stored intent expired, dropped order {} \
                  (window closed during blackout)",
                 cancelled.order_id,
@@ -106,7 +121,8 @@ async fn restore_one_order(
     };
 
     // 2. Fill-side pre-check using the pure restore_plan + a fresh quote.
-    let broker = acquire_broker_for_account(env, record.account.as_deref())
+    let broker = cron
+        .acquire_broker(record.account.as_deref())
         .await
         .ok_or("broker acquisition failed")?;
     // pip_size: prefer the baked intent value, else the record's (apply-time)
@@ -116,7 +132,7 @@ async fn restore_one_order(
         .pip_size
         .filter(|p| *p > 0.0 && p.is_finite())
         .or(Some(record.pip_size).filter(|p| *p > 0.0 && p.is_finite()))
-        .unwrap_or(crate::DEFAULT_PIP_SIZE);
+        .unwrap_or(DEFAULT_PIP_SIZE);
     let resolved = Resolved::from_intent(&verified.intent, &verified.shell, pip)
         .map_err(|e| format!("resolve: {e}"))?;
     let quote = get_quote(&broker, &resolved.instrument)
@@ -135,7 +151,7 @@ async fn restore_one_order(
     );
     match plan {
         RestorePlan::DropStopOverrunSkip => {
-            rlog!(
+            tracing::info!(
                 "blackout restore[{tid}]: stop overrun, recover_entry=skip, dropped order {} \
                  (bid={} ask={})",
                 cancelled.order_id,
@@ -146,7 +162,7 @@ async fn restore_one_order(
             return Ok(());
         }
         RestorePlan::DropStaleLimit => {
-            rlog!(
+            tracing::info!(
                 "blackout restore[{tid}]: limit stale (bid/ask wrong side), dropped order {} \
                  — trade left looking for entry (bid={} ask={})",
                 cancelled.order_id,
@@ -157,7 +173,7 @@ async fn restore_one_order(
             return Ok(());
         }
         RestorePlan::DropUnexpectedMarket => {
-            rlog!(
+            tracing::info!(
                 "blackout restore[{tid}]: unexpected resting market order {}, dropped \
                  (market entries never rest)",
                 cancelled.order_id,
@@ -178,13 +194,13 @@ async fn restore_one_order(
     let result = redrive(
         &broker,
         store,
+        cron,
         &verified,
-        env,
         now,
         &cancelled.signed_intent,
     )
     .await;
-    rlog!(
+    tracing::info!(
         "blackout restore[{tid}]: re-drive order {} → {}",
         cancelled.order_id,
         result.describe(),
@@ -197,33 +213,37 @@ async fn restore_one_order(
 
 /// Best-effort delete of the stored order body once it's been handled (placed,
 /// dropped, or expired). Logged, never fatal — the TTL is the backstop.
-async fn cleanup_body(store: &KvStateStore, order_id: &str) {
+async fn cleanup_body<S: StateStore>(store: &S, order_id: &str) {
     if let Err(err) = store.delete_order_body(order_id).await {
-        rlog_err!("blackout restore: delete_order_body({order_id}) failed: {err}");
+        tracing::error!("blackout restore: delete_order_body({order_id}) failed: {err}");
     }
 }
 
 /// Re-drive via `run_enter` against the concrete inner broker. `BrokerHandle`
 /// type-erases the broker, so we match here to hand `run_enter` a single
 /// `impl Broker` (it's generic over `B: Broker`, which an enum can't satisfy).
-async fn redrive(
+async fn redrive<S, C>(
     broker: &BrokerHandle,
-    store: &KvStateStore,
+    store: &S,
+    cron: &C,
     verified: &incoming::Verified,
-    env: &Env,
     now: DateTime<Utc>,
     raw_body: &str,
-) -> crate::ActionResult {
+) -> ActionResult
+where
+    S: StateStore,
+    C: CronEnv,
+{
     // Resolve the dispatch config at this edge (mirrors the webhook fetch
-    // path) so `run_enter` is `Env`-free. The re-driven enter is the SAME
+    // path) so `run_enter` is backend-free. The re-driven enter is the SAME
     // intended entry, so its caps/pip/risk resolve identically.
-    let cfg = crate::build_dispatch_config(env, verified).await;
+    let cfg = cron.dispatch_config(verified).await;
     match broker {
         BrokerHandle::Oanda(b) => {
-            crate::run_enter(b, store, verified, &cfg, now, Some(raw_body), None).await
+            run_enter(b, store, verified, &cfg, now, Some(raw_body), None).await
         }
         BrokerHandle::TradeNation(b) => {
-            crate::run_enter(b, store, verified, &cfg, now, Some(raw_body), None).await
+            run_enter(b, store, verified, &cfg, now, Some(raw_body), None).await
         }
     }
 }
