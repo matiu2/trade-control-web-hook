@@ -313,29 +313,35 @@ The Postgres `StateStore` layer is complete and proven:
 The StateStore seam is the hard part of the migration and it's done. What
 remains is the native *shell* around it (Phase 1).
 
-## Phase 1 — OPEN QUESTIONS for the user (do NOT guess these)
+## Phase 1 — DECIDED (2026-06-29) + build plan
 
-Phase 1 (axum receiver + tokio scheduler) has design forks that need a
-decision before coding — flagged here rather than guessed:
+User-settled design forks (was "open questions"):
 
-1. **HTTP server shape** — bind addr/port, TLS termination (nginx/caddy in
-   front, or rustls in-process?), graceful-shutdown signal handling. Behind a
-   reverse proxy on the Oracle box, or exposed directly?
-2. **Scheduler cadence** — CF cron fired the upkeep list on a fixed `*/N`.
-   Native can self-pace (a tokio interval). Keep the same N-minute tick, or
-   tighten now that we're not paying per-invocation? (Phase 2 websocket changes
-   this calculus again.)
-3. **Recording sink schema** — DECIDED it's a Postgres table, but the table
-   shape (one `recordings` table with a `kind` + jsonb, vs separate `req` /
-   `tick_bundle` tables) and whether the tax-tracker's S3 pull is replaced now
-   or bridged later.
-4. **`&dyn Broker` construction** — the scheduler needs a broker per account
-   from `~/.config/tradenation/accounts.enc`. Confirm the native binary owns
-   that store directly (it should — it's native already) and how secrets
-   (`OANDA_API_KEY` etc.) are sourced (env, file, or the same enc store).
-5. **Config file format** — env vars (12-factor) vs a TOML config the binary
-   reads. The CF model was all secrets; native can have a real config file.
+1. **HTTP/TLS — reverse proxy in front.** nginx/caddy terminates TLS
+   (Let's Encrypt auto-renew); the worker binds `127.0.0.1:PORT` plain HTTP and
+   handles no certs. Keeps the binary simple; proxy config lives on the Oracle
+   box, not in-process. Graceful shutdown on SIGTERM (systemd-friendly).
+2. **Scheduler — per-task intervals.** Each upkeep task gets its own tokio
+   `interval` at its natural cadence (engine tick fast, session refresh slow,
+   daily blackout-hours once/day) rather than one fixed `*/N` list. More
+   moving parts but matches each task's real need; the replay harness still
+   gates decision-parity per task.
+3. **Recording sink — Postgres table** (shape TBD at implementation; lean to a
+   single `recordings(kind, body jsonb, …)` table so `req` + `tick_bundle`
+   share one sink). Tax-tracker's S3 pull is bridged later, not a blocker.
+4. **Broker construction — native binary owns the enc store.** Brokers built
+   per account from `~/.config/tradenation/accounts.enc` (already native).
+   Secrets (`OANDA_API_KEY`, webhook signing key) from **env vars**; non-secret
+   settings + DB URL from a **TOML config file**.
+5. **Config — TOML file + env secrets + enc account store** (decision #4's
+   second half). A real `config.toml` for bind addr/port, DB URL, intervals;
+   secrets stay in env; accounts in the enc store.
 
-Recommendation when you're ready: do Phase 1 as its own branch off this one,
-porting `src/cron.rs`'s submodules one at a time, each taking `&PgStateStore`
-+ `&dyn Broker`, with the replay harness as the decision-parity gate.
+**Build plan (own branch off `feat/pg-state-store`):**
+- axum receiver: lift `run_action` off `worker::Response` → `IntoResponse`;
+  reuse `core` signature-verify / parse / gates unchanged.
+- Per-task tokio scheduler: port `src/cron/*` submodules one at a time, each
+  taking `&PgStateStore` + `&dyn Broker` instead of `&Env`.
+- TOML config loader + env-secret resolver + enc-store broker factory.
+- Parity gate: run the existing replay/tick-bundle harness against the native
+  binary, diff decisions vs the CF worker on the same recorded inputs.
