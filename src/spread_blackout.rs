@@ -21,6 +21,5 @@
 // public surface — `SPREAD_REJECT_MULTIPLE`, `SPREAD_BLACKOUT_ELEVATED_PIPS`
 // — lives in `trade_control_core::spread_blackout`; reach for it there.
 pub use trade_control_core::spread_blackout::{
-    SPREAD_BLACKOUT_RECOVERED_PIPS, baked_baseline, elevated_threshold_pips,
-    spread_blackout_decision,
+    SPREAD_BLACKOUT_RECOVERED_PIPS, elevated_threshold_pips,
 };
