@@ -319,6 +319,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "broker-tradenation-adapter"
+version = "0.1.0"
+dependencies = [
+ "broker-tradenation",
+ "candle-model",
+ "chrono",
+ "tracing",
+ "trade-control-core",
+ "tradenation-api 0.3.0",
+]
+
+[[package]]
 name = "brotli"
 version = "8.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4127,6 +4139,7 @@ version = "0.2.0"
 dependencies = [
  "broker-oanda",
  "broker-tradenation",
+ "broker-tradenation-adapter",
  "candle-model",
  "chrono",
  "hex",
@@ -4151,6 +4164,7 @@ dependencies = [
  "serde_json",
  "sqlx",
  "tokio",
+ "toml",
  "tracing",
  "trade-control-core",
 ]

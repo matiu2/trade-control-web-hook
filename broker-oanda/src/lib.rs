@@ -37,6 +37,26 @@ pub struct OandaBroker {
     account_id: String,
 }
 
+impl OandaBroker {
+    /// Construct a broker directly from an API key + sub-account id, with no
+    /// Worker `Env` involved. This is the **native-runtime** entry point (the
+    /// VM + Postgres binary): it reads `OANDA_API_KEY` from the process
+    /// environment / config and the account id from the Postgres account index,
+    /// rather than from Worker secrets. `live` picks the OANDA host (live vs
+    /// practice), normally derived from the account's `kind`.
+    ///
+    /// The `login*(env)` helpers below stay the wasm-worker path; both build the
+    /// same `OandaBroker` value, so all `impl Broker` methods are shared.
+    pub fn from_api_key(api_key: String, account_id: String, live: bool) -> Self {
+        let client = if live {
+            OandaClient::new_live(api_key)
+        } else {
+            OandaClient::new(api_key)
+        };
+        Self { client, account_id }
+    }
+}
+
 impl Broker for OandaBroker {
     async fn place_entry(
         &self,
