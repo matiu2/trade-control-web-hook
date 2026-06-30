@@ -240,3 +240,40 @@ Plus a one-line **overall verdict**:
   `src/cron/blackout_apply.rs` (`widen_one` → `amend`).
 - This is **bug #2 of 3** from the demo-journal; it does not need the other two
   to be tested.
+
+---
+
+## RESULT — executed 2026-06-30 on the experimental demo
+
+Run via the real `TradeNationAdapter::amend_stop` (the production trait method),
+EUR/USD, tiny stake, on the experimental demo account.
+
+```
+Case A (with TP):   pos 27224658
+  before:  SL=1.135   TP=1.15   stake=0.01  dir=Buy
+  amend:   new_stop=1.1345   -> amend_stop returned: Ok
+  after:   SL=1.1345  TP=1.15  open=yes
+  verdict: PASS  (SL moved, TP preserved, still open same size)
+
+Case B (no TP):     pos 27224654
+  before:  SL=1.137    TP=None  stake=0.01  dir=Buy
+  amend:   new_stop=1.1365  -> amend_stop returned: Ok
+  after:   SL=1.1365   TP=None  open=yes   (no phantom TP at 0)
+  verdict: PASS
+```
+
+**Overall: PASS — but only after a fix.** The *first* run reproduced the
+failure this test existed to catch: the old adapter sent
+`existing_tp.unwrap_or(0.0)`, and TradeNation rejected the no-TP amend
+(`#5-9 "too close to market"`) — the SL silently failed to move. Isolation:
+
+- mode 3 + `limitOrderPrice = 0.0`  → **rejected** (SL unchanged)
+- mode 3 + a *valid* far TP        → **accepted** (proves SL distance was fine)
+- mode 2 ("Stop only") + `"0"`      → **accepted**, SL moves, TP stays absent
+
+The fix (upstream `tradenation-api` v0.11.0 + adapter): `amend_order` takes the
+TP as `Option<f64>`; `None` → orderModeID 2 stop-only. With that in place, both
+cases pass through the real adapter (above). The break-even cron and the
+spread-blackout widen are **cleared for live** on the amend path. The
+`UNVERIFIED` comments in `broker-tradenation-adapter/src/lib.rs` and the
+demo-confirm caveats in `CHANGELOG.md` are updated to "verified 2026-06-30".

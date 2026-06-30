@@ -1,5 +1,44 @@
 # Changelog
 
+## Unreleased — 2026-06-30 — amend_stop no-TP fix (demo-verified) + TN v0.11.0
+
+**Why.** `amend_stop` on a position with **no take-profit** silently failed.
+The adapter sent `existing_tp.unwrap_or(0.0)`, and TradeNation's
+`AmendCloseOrder` (orderModeID 3, "Both") read `0.0` as a real take-profit at
+price 0 — a closing order on the wrong side of the market — and rejected the
+whole amend (`#5-9 "too close to market"`). The stop never moved. This is the
+exact path the **break-even cron** (`breakeven_watch`) and the **spread-blackout
+widen** (`blackout_apply`) depend on, so it was the gate before either could go
+live (TEST-REPORT-amend-stop-on-open-position.md).
+
+**What changed.**
+- Upstream `tradenation-api` (tag **broker-tradenation-v0.11.0**):
+  `amend_order`'s `limit_order_price` is now `Option<f64>`. `Some(tp)` →
+  orderModeID 3 (both legs, unchanged). `None` → orderModeID 2 (Stop only) with
+  `limitOrderPrice: "0"`, which the platform accepts and leaves the TP absent.
+- `broker-tradenation-adapter::amend_stop` now passes
+  `target.existing_take_profit` (the `Option<f64>`) straight through instead of
+  collapsing `None` to `0.0`.
+- Bumped every `tradenation-api` / `broker-tradenation` /
+  `tradenation-instrument-cache` git-dep pin (root, cli, tv-arm, cron, worker,
+  adapter) to **broker-tradenation-v0.11.0** (one tag → no lockfile skew).
+
+**Verified on the experimental DEMO 2026-06-30** via the real
+`TradeNationAdapter::amend_stop` (not a re-implementation):
+- **With TP** — SL moved, TP preserved (Some→Some unchanged). PASS.
+- **No TP** — SL moved, TP stayed absent (None→None, no phantom 0). PASS.
+
+So the break-even stop and the blackout widen are now **clear for live** on the
+amend path. (Earlier, mode 3 + `0.0` was reproduced rejected; mode 2 + `"0"`
+isolated as the fix; a valid-TP control confirmed SL distance was never the
+cause.)
+
+**Breaking.** `tradenation_api::amend_order` /
+`TradeNationClient::amend_order` — `limit_order_price: f64` → `Option<f64>`.
+
+**Tests.** Upstream `amend_order_body` unit tests (mode-3 with-TP, mode-2
+no-TP). Worker workspace green; clippy + fmt clean.
+
 ## Unreleased — 2026-06-30 — strategy-v2 entry starvation + preps are life-of-trade (no TTL)
 
 **Why.** A plain iH&S where BCR enters and loses −1R came back as a spurious
@@ -229,10 +268,13 @@ arm), CLI (default 50% baked on the enter only; `null` disables; custom carried)
 worker cron (join). Full workspace green; clippy + fmt clean.
 
 **Follow-up.** Tag + deploy **deferred** — `staging` is mid-bake on v60 (the
-week-long promotion gate). Demo-confirm `amend_stop` on an open TN position
-before trusting the live move (shared precondition with the blackout widen).
-The operator's stance ("the SL is handled by the broker") means BE only needs
-to arm once and set the broker-native stop.
+week-long promotion gate). ~~Demo-confirm `amend_stop` on an open TN position
+before trusting the live move~~ — **DONE 2026-06-30** (see the amend_stop no-TP
+fix entry at the top): `amend_stop` is now demo-verified on the experimental
+account for both the with-TP and no-TP cases, after fixing a no-TP rejection
+bug this test surfaced. Shared precondition with the blackout widen is
+satisfied. The operator's stance ("the SL is handled by the broker") means BE
+only needs to arm once and set the broker-native stop.
 ## v61 — 2026-06-28 — ATR-based entry/SL buffer (`offset_atr_pct`)
 
 **Why.** The entry and stop-loss were offset from the signal candle by a
