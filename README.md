@@ -847,11 +847,15 @@ Two consumers honour it identically, sharing one pure helper in
   `breakeven_pct: null` to disable for that trade, or a custom fraction to
   change the threshold. Values outside `(0, 1)` are clamped to 0.5.
 
-> **Demo-confirm before trusting live.** Like the spread-blackout stop widen,
-> the break-even move uses `amend_stop` on an **open** position; TradeNation's
-> `AmendCloseOrder`-on-open-position path is demo-unverified. Every intended
-> amend is logged prominently first so a demo run can read it back (SL moved to
-> entry, TP unchanged) before this is trusted on a live account.
+> **Demo-verified 2026-06-30.** Like the spread-blackout stop widen, the
+> break-even move uses `amend_stop` on an **open** position via TradeNation's
+> `AmendCloseOrder`. This path is now **confirmed on the experimental demo**:
+> the with-TP amend moves the SL and preserves the TP, and the no-TP amend moves
+> the SL with no phantom TP (it surfaced and fixed a bug where a no-TP position
+> sent `limitOrderPrice 0.0` and the broker rejected the whole amend — fixed in
+> `tradenation-api` **v0.11.0** via an `orderModeID: 2` stop-only amend). Every
+> intended amend is still logged prominently first. Both the break-even cron and
+> the blackout widen are **cleared for live** on the amend path.
 
 ## Using `expiry_bars`
 
@@ -1610,9 +1614,10 @@ leaving TP / trigger / stake untouched), and `list_pending_orders`.
 **foundations for the spread-blackout feature and carry no operator-visible
 behaviour** — no worker action calls them yet. TradeNation implements all
 four; OANDA implements all four via its v20 trade/order/pricing endpoints.
-**Caveat (TradeNation `amend_stop`):** the upstream `AmendCloseOrder`
-endpoint is unverified against an *open position's* SL — a later sub-plan
-must demo-confirm it before any live stop-widening.
+**TradeNation `amend_stop` — demo-verified 2026-06-30:** the upstream
+`AmendCloseOrder` endpoint moves an *open position's* SL (with-TP preserves
+the TP; no-TP moves the SL via an `orderModeID: 2` stop-only amend, fixed in
+`tradenation-api` v0.11.0). Cleared for live stop-widening.
 
 ### Spread-blackout window
 
@@ -1767,15 +1772,14 @@ spread normalises (or a ~3h backstop fires).
   broker amend, so a crash between them can't strand a widened stop with no
   remembered original (the worst case is a restore that's a harmless no-op).
 
-> **PRECONDITION — demo-confirm `amend_stop` on an OPEN position first.**
-> TradeNation's `AmendCloseOrder` has zero existing callers and it is
-> **UNVERIFIED** whether it moves an *open position's* SL (vs only a resting
-> order's). System 2 depends on it. Before trusting the widen live: open a
-> demo position on `reversals` with a known SL, `amend_stop` it, read it
-> back, confirm the SL moved and the TP is unchanged. The apply cron logs an
-> `INTENT amend_stop …` line before every amend precisely so a dry-run/demo
-> can confirm the read-back. **Do not enable live widening until this is
-> demo-confirmed.** See `TODO.md`.
+> **PRECONDITION SATISFIED — `amend_stop` on an OPEN position demo-verified
+> 2026-06-30.** TradeNation's `AmendCloseOrder` does move an *open position's*
+> SL. Confirmed on the experimental demo for both the with-TP case (SL moves,
+> TP preserved) and the no-TP case (SL moves, no phantom TP) — the latter after
+> fixing a bug where a no-TP amend sent `limitOrderPrice 0.0` and was rejected
+> (`tradenation-api` v0.11.0, `orderModeID: 2` stop-only). System 2's widen is
+> **cleared for live**. The apply cron still logs an `INTENT amend_stop …` line
+> before every amend for read-back visibility.
 
 #### System 3 — cancel resting entry orders during the window, restore after
 
