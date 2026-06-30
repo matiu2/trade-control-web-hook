@@ -18,9 +18,12 @@
 //!   * **OANDA** uses the shared `OANDA_API_KEY` env token + the per-account
 //!     `oanda_account_id` recorded here (an id, not a secret).
 //!
-//! DB connection: read from the worker's `trade-control.toml` (`--config`,
-//! default `./trade-control.toml`) so it points at the same database as the
-//! worker, or overridden with `--database-url`.
+//! DB connection: `--database-url` / `DATABASE_URL` env win; otherwise the URL
+//! is read from a `trade-control.toml` — an explicit `--config <path>`, else
+//! `~/.config/trade-control/trade-control.toml` (the config home, searched
+//! first so the CLI works from any directory), else `./trade-control.toml`. The
+//! account *data* itself lives in Postgres (the `accounts` table), so it's
+//! globally accessible to anything pointed at the same database.
 //!
 //! ```text
 //! trade-control-accounts list
@@ -43,18 +46,72 @@ use trade_control_worker::{Config, PgMetadataStore, PgStateStore};
 #[command(name = "trade-control-accounts")]
 #[command(about = "Manage the native (Postgres) account index — metadata only, no credentials")]
 struct Cli {
-    /// Path to the worker's `trade-control.toml`, used only to read
-    /// `database.url`. Ignored when `--database-url` is given.
-    #[arg(long, default_value = "./trade-control.toml", global = true)]
-    config: String,
-
-    /// Postgres URL override (`postgresql://…`). Takes precedence over the URL
-    /// in `--config`, so the CLI can run without a config file present.
+    /// Path to the worker's `trade-control.toml` to read `database.url` from.
+    /// When omitted, the CLI resolves the DB URL via (in order): `--database-url`,
+    /// the `DATABASE_URL` env var, `./trade-control.toml`, then
+    /// `~/.config/trade-control/trade-control.toml`. Ignored when
+    /// `--database-url` is given.
     #[arg(long, global = true)]
+    config: Option<String>,
+
+    /// Postgres URL override (`postgresql://…`). Highest precedence — lets the
+    /// CLI run with no config file present.
+    #[arg(long, env = "DATABASE_URL", global = true)]
     database_url: Option<String>,
 
     #[command(subcommand)]
     command: Command,
+}
+
+/// Resolve the Postgres URL with a forgiving precedence chain so the CLI is
+/// usable from any directory:
+///
+/// 1. `--database-url` / `DATABASE_URL` env (clap already merged these).
+/// 2. an explicit `--config <path>` (a missing file here IS an error — the
+///    operator named it).
+/// 3. `./trade-control.toml` if it exists (the worker's working-dir convention).
+/// 4. `~/.config/trade-control/trade-control.toml` if it exists.
+///
+/// If none resolve, the error lists every option so the fix is obvious.
+fn resolve_db_url(cli: &Cli) -> Result<String> {
+    if let Some(url) = &cli.database_url {
+        return Ok(url.clone());
+    }
+    if let Some(path) = &cli.config {
+        return load_config_url(path)
+            .wrap_err_with(|| format!("loading database.url from --config {path}"));
+    }
+    for candidate in default_config_paths() {
+        if std::path::Path::new(&candidate).is_file() {
+            return load_config_url(&candidate)
+                .wrap_err_with(|| format!("loading database.url from {candidate}"));
+        }
+    }
+    Err(eyre!(
+        "no database URL: pass --database-url, set DATABASE_URL, or create a \
+         trade-control.toml (looked in ./ and ~/.config/trade-control/) — or \
+         point --config at one"
+    ))
+}
+
+/// Read just `database.url` out of a config TOML.
+fn load_config_url(path: &str) -> Result<String> {
+    Ok(Config::load(path).map_err(|e| eyre!("{e}"))?.database.url)
+}
+
+/// The default config locations searched when neither `--database-url` nor
+/// `--config` is given. The user config dir (`~/.config/trade-control/`, the
+/// established home for `key.hex` / `admin-key.hex` / templates) is searched
+/// **first** so the CLI works from any directory and isn't shadowed by a stray
+/// `./trade-control.toml`; the working-dir file (the worker's own convention)
+/// is the fallback.
+fn default_config_paths() -> Vec<String> {
+    let mut paths = Vec::new();
+    if let Ok(home) = std::env::var("HOME") {
+        paths.push(format!("{home}/.config/trade-control/trade-control.toml"));
+    }
+    paths.push("./trade-control.toml".to_string());
+    paths
 }
 
 #[derive(Subcommand)]
@@ -132,20 +189,7 @@ async fn main() -> Result<()> {
     color_eyre::install()?;
     let cli = Cli::parse();
 
-    // Resolve the DB URL: explicit flag wins, else read it from the worker's
-    // config so the CLI points at the same database the worker uses.
-    let db_url = match cli.database_url {
-        Some(url) => url,
-        None => Config::load(&cli.config)
-            .wrap_err_with(|| {
-                format!(
-                    "loading database.url from {} (pass --database-url to skip the config file)",
-                    cli.config
-                )
-            })?
-            .database
-            .url,
-    };
+    let db_url = resolve_db_url(&cli)?;
 
     let store = PgStateStore::connect(&db_url)
         .await
