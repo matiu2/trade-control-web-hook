@@ -1090,7 +1090,6 @@ fn assemble_trade(
             spec.trade_expiry,
             &spec.broker,
             &spec.account,
-            now,
         ));
     }
     if !skip_retest {
@@ -1100,7 +1099,6 @@ fn assemble_trade(
             spec.trade_expiry,
             &spec.broker,
             &spec.account,
-            now,
         ));
     }
     // One prep-expire alert per chart-drawn `<prep>-expiry` line. When
@@ -1823,7 +1821,6 @@ fn build_break_and_close_alert(
     trade_expiry: DateTime<Utc>,
     broker: &BrokerKind,
     account: &str,
-    now: DateTime<Utc>,
 ) -> BuiltAlert {
     let id = format!("{trade_id}-break-and-close");
     let mut intent = skeleton(
@@ -1836,8 +1833,10 @@ fn build_break_and_close_alert(
         trade_id,
     );
     intent.step = Some("break-and-close".into());
-    intent.ttl_hours =
-        trade_control_core::tunable::Tunable::Static(ttl_hours_until(now, trade_expiry));
+    // No TTL: the prep is a milestone (the close broke the neckline) that
+    // lives for the life of the trade and only has to happen once. See
+    // PREP_NO_EXPIRY_HOURS.
+    intent.ttl_hours = trade_control_core::tunable::Tunable::Static(PREP_NO_EXPIRY_HOURS);
     // Landing a fresh break-and-close invalidates any stale retest
     // from a prior, abandoned setup on the same instrument.
     intent.clears = vec!["retest".into()];
@@ -1854,7 +1853,6 @@ fn build_retest_alert(
     trade_expiry: DateTime<Utc>,
     broker: &BrokerKind,
     account: &str,
-    now: DateTime<Utc>,
 ) -> BuiltAlert {
     let id = format!("{trade_id}-retest");
     let mut intent = skeleton(
@@ -1867,8 +1865,9 @@ fn build_retest_alert(
         trade_id,
     );
     intent.step = Some("retest".into());
-    intent.ttl_hours =
-        trade_control_core::tunable::Tunable::Static(ttl_hours_until(now, trade_expiry));
+    // No TTL: the retest prep (price returned to the neckline) lives for the
+    // life of the trade and only has to happen once. See PREP_NO_EXPIRY_HOURS.
+    intent.ttl_hours = trade_control_core::tunable::Tunable::Static(PREP_NO_EXPIRY_HOURS);
     BuiltAlert {
         basename: AlertBasename::PrepRetest.as_str().into_owned(),
         purpose: "prep: retest (price returns to neckline; gates entry)".into(),
@@ -2313,6 +2312,30 @@ fn build_close_on_reversal_alert(
         intent,
     }
 }
+
+/// "No expiry" TTL (in hours) for the structural trade preps
+/// (`break-and-close`, `retest`). A prep is a *milestone the trade has
+/// passed* — "the close broke the neckline", "price retested it" — not a
+/// time-boxed permission. It must live for the **life of the trade** and
+/// only has to happen **once**; the trade is retired by its own
+/// `trade-expiry` veto (which clears the plan and its preps), never by a
+/// prep ageing out from under a still-open setup.
+///
+/// Previously these preps took `ttl_hours_until(now, trade_expiry)` — a
+/// wall-clock-relative TTL. Live (future `trade_expiry`) that spanned the
+/// whole setup, so it was fine. But it broke **offline replay**: a
+/// `--plan-out` plan is armed against a *historical* window whose
+/// `trade_expiry` is already in the past relative to wall-clock `now`, so
+/// the TTL collapsed to the 1h floor and the break-and-close prep aged out
+/// ~1h after stamping — long before the entry bar (13h later on GBP/JPY
+/// trade 071), making `run_enter`'s prep gate reject every preps-gated
+/// enter with `missing-prep`. Anchoring the prep to the *trade's life*
+/// rather than a wall-clock TTL fixes replay and is identical live.
+///
+/// Expressed in hours so it flows through the existing `ttl_hours` →
+/// `ttl_seconds` → `set_prep` pipeline; ~100 years, mirroring
+/// `trade_control_core::state::NO_TTL_SECONDS`.
+const PREP_NO_EXPIRY_HOURS: u32 = 100 * 365 * 24;
 
 /// Hours between `now` and `until`, rounded up to the next hour and
 /// clamped to at least 1. The worker veto TTL also adds the alert's

@@ -225,7 +225,7 @@ pub fn evaluate_plan(
                 }
                 // Stamp the retest lookback before testing entry, so a retest
                 // and entry that land on the same bar are both seen.
-                stamp_retest(plan, &mut state, candle, detector_window);
+                stamp_retest(plan, &mut state, candle, detector_window, &mut fired);
                 evaluate_entry(
                     plan,
                     &mut state,
@@ -439,6 +439,17 @@ fn evaluate_break_and_close(
         state.phase = Phase::AwaitEntry;
         return;
     };
+    // The break-and-close prep is `FireMode::Once`: it stamps the lookback start
+    // exactly once and then "dies". In a single-enter plan the phase advances off
+    // `AwaitBreakAndClose` and this function is never re-entered, so the latch was
+    // implicit. But a **multi-enter (strategy-v2)** plan stays in `AwaitEntry` and
+    // re-runs this every bar — so a later neckline re-cross would re-fire and walk
+    // `break_close_at` forward, pushing an already-seen retest *before* the new
+    // break window and starving the stop enter forever (replay trade 071). Honour
+    // the latch explicitly: once fired, never re-stamp.
+    if state.fired.contains(&rule.rule_id) {
+        return;
+    }
     if fire_rule(rule, state, candle, window) {
         state.fired.insert(rule.rule_id.clone());
         state.break_close_at = Some(candle.time);
@@ -938,7 +949,13 @@ fn entry_recover_entry(
 /// Stamp `retest_seen_at` if this candle satisfies the retest trendline
 /// geometry and falls after the break-and-close. No-op if there's no retest
 /// rule or no break-and-close has fired yet.
-fn stamp_retest(plan: &TradePlan, state: &mut PlanState, candle: &Candle, window: &[Candle]) {
+fn stamp_retest(
+    plan: &TradePlan,
+    state: &mut PlanState,
+    candle: &Candle,
+    window: &[Candle],
+    fired: &mut Vec<FiredIntent>,
+) {
     let Some(break_at) = state.break_close_at else {
         return;
     };
@@ -948,13 +965,28 @@ fn stamp_retest(plan: &TradePlan, state: &mut PlanState, candle: &Candle, window
     let Some(rule) = plan.rules.iter().find(|r| is_retest(r)) else {
         return;
     };
-    if eval_trigger(
-        &rule.trigger,
-        candle,
-        state.last_close.get(&rule.rule_id).copied(),
-        window,
-    ) {
+    // Only stamp once: the retest is a milestone the trade passes a single
+    // time. Without this latch a later re-cross would re-stamp `retest_seen_at`
+    // and re-emit the prep fire every bar (the break-and-close analogue of the
+    // strategy-v2 starvation bug).
+    if state.retest_seen_at.is_none()
+        && eval_trigger(
+            &rule.trigger,
+            candle,
+            state.last_close.get(&rule.rule_id).copied(),
+            window,
+        )
+    {
         state.retest_seen_at = Some(candle.time);
+        // Emit the retest prep fire so it seeds the store the enter's prep gate
+        // reads — exactly as the TV `04-prep-retest` alert did, and exactly as
+        // `evaluate_break_and_close` emits the break-and-close prep. The engine
+        // satisfies the retest internally via `retest_satisfied(state, …)`, but
+        // `run_enter`'s prep gate is store-backed, so the prep must be dispatched
+        // (worker + replay route `Action::Prep` → `handle_prep` → `set_prep`).
+        // Without this, the engine validated the retest but `run_enter` rejected
+        // the enter with `missing-prep (retest)`.
+        push_fire(rule, candle, fired);
     }
     // The retest's `last_close` is tracked so an OnClose retest works across
     // ticks; record it regardless of whether it fired.
@@ -2060,17 +2092,99 @@ mod tests {
             Some(ts("2026-06-16T10:00:00Z"))
         );
 
-        // Bar 2 (11:00): straddles the neckline closing above → retest stamps,
-        // and the stop enter fires the same bar. QM fires too.
+        // Bar 2 (11:00): straddles the neckline closing above → retest stamps
+        // (and emits the retest prep fire so the store is seeded before the
+        // enter's prep gate), and the stop enter fires the same bar. QM fires too.
         let c2 = candle("2026-06-16T11:00:00Z", 1.19, 1.205, 1.19, 1.2010);
         let eval2 = run(&p, &eval1.new_state, &[c2]);
         let f2: Vec<&str> = eval2.fired.iter().map(|f| f.rule_id.as_str()).collect();
+        assert!(
+            f2.contains(&"04-prep-retest"),
+            "retest prep fires to seed store"
+        );
         assert!(f2.contains(&"05-enter"), "stop fires once retest seen");
         assert!(f2.contains(&"09-enter-qm"));
-        // Stop is listed before QM, so on this shared bar it dispatches first.
-        assert_eq!(f2.first(), Some(&"05-enter"), "stop wins the same-bar tie");
+        // The retest prep is dispatched before either enter (stamp_retest runs
+        // before evaluate_entry), so set_prep(retest) precedes run_enter.
+        assert_eq!(
+            f2.first(),
+            Some(&"04-prep-retest"),
+            "retest prep seeds the store ahead of the enters"
+        );
+        // Among the enters, the stop is listed before QM, so it dispatches first.
+        let enters: Vec<&str> = f2
+            .iter()
+            .copied()
+            .filter(|id| id.contains("enter"))
+            .collect();
+        assert_eq!(
+            enters,
+            vec!["05-enter", "09-enter-qm"],
+            "stop wins the same-bar tie over QM"
+        );
         assert!(!eval2.done, "multi-shot enters keep the plan alive");
         assert_eq!(eval2.new_state.phase, Phase::AwaitEntry);
+    }
+
+    #[test]
+    fn break_and_close_does_not_restamp_after_latching_under_multi_enter() {
+        // Regression for the strategy-v2 entry-starvation bug (replay trade 071,
+        // GBP/JPY iH&S): a multi-shot plan stays in AwaitEntry, so the break-and-
+        // close arm runs every bar. Without a latch guard it re-fired and walked
+        // `break_close_at` forward on every later neckline re-cross — pushing the
+        // retest *before* the new break window, so `retest_satisfied` flipped to
+        // false and the stop enter was starved forever (re-prepping in place).
+        //
+        // The break-and-close prep is `FireMode::Once`: once it stamps, a later
+        // re-cross must NOT re-stamp `break_close_at`, and the stop enter must
+        // still fire on a bar after the (single) retest.
+        let p = strategy_v2_plan();
+        let mut prior = seed_at(Phase::AwaitEntry, "2026-06-16T09:00:00Z");
+        prior
+            .last_close
+            .insert("03-prep-break-and-close".into(), 1.2050);
+
+        // Bar 1 (10:00): closes below the neckline → break-and-close stamps @10:00.
+        let c1 = candle("2026-06-16T10:00:00Z", 1.205, 1.205, 1.195, 1.1950);
+        let eval1 = run(&p, &prior, &[c1]);
+        assert_eq!(
+            eval1.new_state.break_close_at,
+            Some(ts("2026-06-16T10:00:00Z"))
+        );
+
+        // Bar 2 (11:00): straddles up through the neckline → retest stamps @11:00.
+        let c2 = candle("2026-06-16T11:00:00Z", 1.19, 1.205, 1.19, 1.2010);
+        let eval2 = run(&p, &eval1.new_state, &[c2]);
+        assert_eq!(
+            eval2.new_state.retest_seen_at,
+            Some(ts("2026-06-16T11:00:00Z"))
+        );
+
+        // Bar 3 (12:00): closes BACK below the neckline — a fresh down-cross. The
+        // latched break-and-close must NOT re-stamp; `break_close_at` stays @10:00
+        // and the retest (@11:00) remains inside (break, entry].
+        let c3 = candle("2026-06-16T12:00:00Z", 1.201, 1.205, 1.195, 1.1950);
+        let eval3 = run(&p, &eval2.new_state, &[c3]);
+        assert_eq!(
+            eval3.new_state.break_close_at,
+            Some(ts("2026-06-16T10:00:00Z")),
+            "break-and-close must not re-stamp after latching (it is FireMode::Once)"
+        );
+        let f3: Vec<&str> = eval3.fired.iter().map(|f| f.rule_id.as_str()).collect();
+        assert!(
+            !f3.contains(&"03-prep-break-and-close"),
+            "latched break-and-close must not re-fire on a later re-cross"
+        );
+
+        // Bar 4 (13:00): the stop enter must fire — retest (@11:00) is still valid
+        // against the un-walked break (@10:00). Before the fix this was starved.
+        let c4 = candle("2026-06-16T13:00:00Z", 1.196, 1.198, 1.19, 1.1960);
+        let eval4 = run(&p, &eval3.new_state, &[c4]);
+        let f4: Vec<&str> = eval4.fired.iter().map(|f| f.rule_id.as_str()).collect();
+        assert!(
+            f4.contains(&"05-enter"),
+            "stop enter must fire: retest stays valid against the latched break"
+        );
     }
 
     #[test]
@@ -2087,11 +2201,18 @@ mod tests {
         assert!(eval1.new_state.retest_seen_at.is_none());
 
         // Bar at 12:00: range straddles the neckline with close above → retest
-        // up-cross stamps, and the entry heartbeat fires the same bar → Done.
+        // up-cross stamps (emitting the retest prep fire so it seeds the store),
+        // and the entry heartbeat fires the same bar → Done. Two fires, retest
+        // before enter (stamp_retest runs before evaluate_entry), so the worker
+        // dispatches set_prep(retest) ahead of run_enter's prep gate.
         let c_retest = candle("2026-06-16T12:00:00Z", 1.19, 1.205, 1.19, 1.2010);
         let eval2 = run(&p, &eval1.new_state, &[c_retest]);
-        assert_eq!(eval2.fired.len(), 1, "entry fires once retest seen");
-        assert_eq!(eval2.fired[0].rule_id, "05-enter");
+        let f2: Vec<&str> = eval2.fired.iter().map(|f| f.rule_id.as_str()).collect();
+        assert_eq!(
+            f2,
+            vec!["04-prep-retest", "05-enter"],
+            "retest prep seeds the store before the enter, both on the retest bar"
+        );
         assert!(eval2.done);
         assert_eq!(eval2.new_state.phase, Phase::Done);
     }

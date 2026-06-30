@@ -26,14 +26,14 @@ use trade_control_cli::{
     build_clear_prep_intent, build_clear_veto_intent, build_market_info_intent,
     build_news_from_spec, build_pause_from_spec, build_plan_delete_intent, build_plan_list_intent,
     build_plan_purge_intent, build_plan_show_intent, build_prep_intent,
-    build_purge_older_than_intent, build_status_intent, build_trade_from_spec,
-    build_trade_interactive, build_unlock_intent, build_veto_intent, delete_account, delete_secret,
-    fill_missing_fields, generate_key_hex, list_accounts, load_cache, load_news_spec_from_file,
-    load_pause_spec_from_file, load_spec_from_file, pick_pattern_interactive,
-    pick_template_interactive, prompt_save_as_template, put_secret, record_account_use,
-    record_prep_use, record_veto_use, require_local_tn_account, run_calendar_bars,
-    secret_binding_for, test_account, validate_instrument, wrap_signed, wrap_signed_template,
-    write_news, write_pause, write_trade,
+    build_purge_older_than_intent, build_register_intent, build_status_intent,
+    build_trade_from_spec, build_trade_interactive, build_unlock_intent, build_veto_intent,
+    delete_account, delete_secret, fill_missing_fields, generate_key_hex, list_accounts,
+    load_cache, load_news_spec_from_file, load_pause_spec_from_file, load_spec_from_file,
+    pick_pattern_interactive, pick_template_interactive, prompt_save_as_template, put_secret,
+    record_account_use, record_prep_use, record_veto_use, require_local_tn_account,
+    run_calendar_bars, secret_binding_for, test_account, validate_instrument, wrap_signed,
+    wrap_signed_template, write_news, write_pause, write_trade,
 };
 use trade_control_core::account::{
     AccountKind, AccountMetadata, Credentials, TradeNationCreds, TradeNationKind,
@@ -178,6 +178,16 @@ enum PlanCmd {
     /// inverse of arming: re-registerable as-is. (Unlike `show`, which wraps the
     /// plan with engine state; this is *just* the plan.)
     Export(PlanExportArgs),
+    /// Register a bare `TradePlan` JSON file with the worker's engine — the
+    /// programmatic counterpart of `tv-arm --register-plan`, but POSTable to
+    /// **any** `--endpoint` (so a `tv-arm --plan-out plan.json` build can be
+    /// armed against a local/native worker, not only the baked webhook). The
+    /// plan rides one signed `register` carrier intent (whole-body HMAC); the
+    /// `--account-id` scopes it (`plan:{account}:{trade_id}`) and must match the
+    /// account the trade's vetos/preps use. Re-registering the same `trade_id`
+    /// mints a fresh carrier id, so the seen-id replay check won't reject it;
+    /// `plan delete <id>` first if you want the old engine state cleared.
+    Register(PlanRegisterArgs),
     /// Delete a registered plan and its engine state — the inverse of
     /// register. The worker scans all account scopes and drops the matching
     /// `plan:` + `plan-state:` rows. Idempotent (deleting a missing plan is a
@@ -227,6 +237,20 @@ struct PlanShowArgs {
 struct PlanExportArgs {
     /// The plan's `trade_id` (e.g. `eurusd-hs-7`).
     trade_id: String,
+    #[command(flatten)]
+    common: EndpointArgs,
+}
+
+#[derive(Parser)]
+struct PlanRegisterArgs {
+    /// Path to a bare `TradePlan` JSON file (e.g. the output of
+    /// `tv-arm --plan-out plan.json`).
+    plan_file: PathBuf,
+    /// Operator account name that scopes the plan (`plan:{account}:{trade_id}`).
+    /// Must match the account the trade's vetos/preps use. Omit to keep the
+    /// legacy global `_` scope (then `plan list` shows `-` under ACCOUNT).
+    #[arg(long)]
+    account_id: Option<String>,
     #[command(flatten)]
     common: EndpointArgs,
 }
@@ -1208,6 +1232,7 @@ fn run_plan(sub: PlanCmd) -> Result<()> {
         PlanCmd::List(args) => run_plan_list(args),
         PlanCmd::Show(args) => run_plan_show(args),
         PlanCmd::Export(args) => run_plan_export(args),
+        PlanCmd::Register(args) => run_plan_register(args),
         PlanCmd::Delete(args) => run_plan_delete(args),
         PlanCmd::Purge(args) => run_plan_purge(args),
     }
@@ -1306,6 +1331,32 @@ fn format_plan_export(response: &str) -> Result<String> {
         out.push('\n');
     }
     Ok(out)
+}
+
+/// `plan register <plan.json>` — POST a bare `TradePlan` JSON to any
+/// `--endpoint` as one signed `register` carrier. The programmatic counterpart
+/// of `tv-arm --register-plan`, but endpoint-overridable (the arming pipeline
+/// only POSTs to the compiled-in `BAKED_WEBHOOK`), so a `tv-arm --plan-out`
+/// build can be armed against a local/native worker. Prints the worker's
+/// response verbatim.
+fn run_plan_register(args: PlanRegisterArgs) -> Result<()> {
+    let key = load_key(&args.common.key_file)?;
+    let now = Utc::now();
+    let suffix = fresh_suffix()?;
+
+    // Read + parse the bare TradePlan. A malformed/empty file is a clear
+    // operator error (wrong path, or a `plan show` dump rather than the bare
+    // `plan export` / `--plan-out` body), so surface the parse error directly.
+    let text = std::fs::read_to_string(&args.plan_file)
+        .map_err(|e| eyre!("read plan file {}: {e}", args.plan_file.display()))?;
+    let plan: trade_control_core::trade_plan::TradePlan = serde_json::from_str(&text)
+        .map_err(|e| eyre!("parse TradePlan from {}: {e}", args.plan_file.display()))?;
+
+    let intent = build_register_intent(plan, args.account_id.as_deref(), now, &suffix);
+    let body = wrap_control(&intent, &key, now)?;
+    let response = post_control(&args.common.endpoint, &body)?;
+    print_raw(&response);
+    Ok(())
 }
 
 /// `plan delete <trade_id>` — drop a registered plan and its engine state.

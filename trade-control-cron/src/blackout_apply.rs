@@ -1,8 +1,8 @@
-//! Cron 1 — NY-close-edge handler. Fires from the daily candidate crons
-//! (`5 21 * * *` / `5 22 * * *`). When `is_ny_close_edge(now)`, opens the
-//! global spread-blackout window marker, then — **System 2** — widens every
-//! open position's stop-loss away from price so the post-NY-close spread
-//! blowout can't clip it, remembering each original stop on a per-trade
+//! Cron 1 — NY-close-edge handler. Fired from the 15-min cron arm gated by the
+//! caller on `is_ny_close_edge`. When `is_ny_close_edge(now)`, opens the global
+//! spread-blackout window marker, then — **System 2** — widens every open
+//! position's stop-loss away from price so the post-NY-close spread blowout
+//! can't clip it, remembering each original stop on a per-trade
 //! `SpreadBlackoutRecord` for the recovery watcher to restore.
 //!
 //! Per-row discipline (same as the order sweep): one position's
@@ -15,49 +15,57 @@
 //! read it back, confirm SL moved + TP unchanged) before this is trusted live.
 //! See TODO.md + CHANGELOG. The code is structured so every intended amend is
 //! logged prominently first, so a dry-run/demo can confirm the read-back.
+//!
+//! # Runtime-agnostic via the [`CronEnv`] seam
+//!
+//! Moved into `trade-control-cron` so both the wasm Cloudflare worker and the
+//! native VM scheduler run the *same* NY-close apply. The `&Env`-hidden broker
+//! acquisition travels through the [`CronEnv`] seam; the caller opens the
+//! [`StateStore`] and passes it in. The fn self-gates on `is_ny_close_edge` —
+//! the caller's once-per-hour `now.minute() < 15` guard (wasm) or upkeep tick
+//! (native) only avoids redundant broker calls.
 
 use std::collections::HashMap;
 
 use chrono::{DateTime, Duration, Utc};
+use trade_control_core::blackout_widen::{clamp_widen, widened_stop};
 use trade_control_core::broker::{AmendError, Broker, OpenPosition};
 use trade_control_core::ny_clock::is_ny_close_edge;
 use trade_control_core::state::{EntryAttempt, RememberedStop, SpreadBlackoutRecord, StateStore};
-use worker::Env;
 
-use super::blackout_widen::{clamp_widen, widened_stop};
-use super::constants::BLACKOUT_BACKSTOP_SECONDS;
-use super::sweep::{BrokerHandle, acquire_broker_for_account, open_store};
-use crate::state::KvStateStore;
+use crate::broker_handle::BrokerHandle;
+use crate::constants::BLACKOUT_BACKSTOP_SECONDS;
+use crate::seam::CronEnv;
 
 /// Open the global spread-blackout window marker iff `now` is the
-/// NY-close edge, then widen open stops (System 2). The two daily crons
-/// fire at both DST candidate hours (21:05 EDT, 22:05 EST);
-/// `is_ny_close_edge` decides which one is the real edge this season and
-/// no-ops the other.
-pub async fn apply_if_ny_close_edge(env: &Env, now: DateTime<Utc>) {
+/// NY-close edge, then widen open stops (System 2). The caller fires this on
+/// every candidate tick; `is_ny_close_edge` decides which is the real edge this
+/// season and no-ops the rest.
+pub async fn apply_if_ny_close_edge<S, C>(store: &S, cron: &C, now: DateTime<Utc>)
+where
+    S: StateStore,
+    C: CronEnv,
+{
     if !is_ny_close_edge(now) {
-        rlog!("blackout: cron fired but not NY-close edge ({now}); no-op");
+        tracing::info!("blackout: cron fired but not NY-close edge ({now}); no-op");
         return;
     }
-    let Some(store) = open_store(env) else {
-        return;
-    };
     // The window TTL keys off the same backstop the recovery watcher
     // uses, so the marker and the per-record backstop can never drift.
     let ttl = BLACKOUT_BACKSTOP_SECONDS;
     match store.set_spread_blackout_window(now, ttl).await {
-        Ok(()) => rlog!("blackout: window opened at {now} (ttl {ttl}s)"),
-        Err(err) => rlog_err!("blackout: failed to open window: {err}"),
+        Ok(()) => tracing::info!("blackout: window opened at {now} (ttl {ttl}s)"),
+        Err(err) => tracing::error!("blackout: failed to open window: {err}"),
     }
 
     // System 2 — widen open stops away from price.
-    widen_open_stops(env, &store, now).await;
+    widen_open_stops(store, cron, now).await;
     // System 3 — cancel resting entry orders on elevated-spread instruments
     // and store their signed intent for the recovery watcher to re-drive.
     // Runs on the SAME affected-account set as the widen; the two share one
     // `SpreadBlackoutRecord` per trade (widened stops in `original_stops`,
     // cancelled orders in `cancelled_orders`) and the watcher restores both.
-    super::blackout_cancel::cancel_resting_orders(env, now).await;
+    crate::cancel_resting_orders(store, cron, now).await;
 }
 
 /// List open positions per affected account, join each to its originating
@@ -69,11 +77,15 @@ pub async fn apply_if_ny_close_edge(env: &Env, now: DateTime<Utc>) {
 /// confirmed broker today is TN `reversals`; if more accounts land this still
 /// covers them. A position with no `EntryAttempt` at all can't be pip-resolved
 /// and is skipped — see the join open question.)
-async fn widen_open_stops(env: &Env, store: &KvStateStore, now: DateTime<Utc>) {
+async fn widen_open_stops<S, C>(store: &S, cron: &C, now: DateTime<Utc>)
+where
+    S: StateStore,
+    C: CronEnv,
+{
     let attempts = match store.list_all_entry_attempts().await {
         Ok(v) => v,
         Err(err) => {
-            rlog_err!("blackout widen: list_all_entry_attempts: {err}");
+            tracing::error!("blackout widen: list_all_entry_attempts: {err}");
             return;
         }
     };
@@ -84,26 +96,29 @@ async fn widen_open_stops(env: &Env, store: &KvStateStore, now: DateTime<Utc>) {
             accounts.push(a.account.clone());
         }
     }
-    rlog!(
+    tracing::info!(
         "blackout widen: {} attempt(s), {} affected account(s)",
         attempts.len(),
         accounts.len(),
     );
     for account in accounts {
-        widen_account(env, store, &attempts, account.as_deref(), now).await;
+        widen_account(store, cron, &attempts, account.as_deref(), now).await;
     }
 }
 
 /// Widen every open position on one account. Logs + skips per position.
-async fn widen_account(
-    env: &Env,
-    store: &KvStateStore,
+async fn widen_account<S, C>(
+    store: &S,
+    cron: &C,
     attempts: &[EntryAttempt],
     account: Option<&str>,
     now: DateTime<Utc>,
-) {
-    let Some(broker) = acquire_broker_for_account(env, account).await else {
-        rlog_err!(
+) where
+    S: StateStore,
+    C: CronEnv,
+{
+    let Some(broker) = cron.acquire_broker(account).await else {
+        tracing::error!(
             "blackout widen[{}]: broker acquisition failed; skipping account",
             account.unwrap_or("<global>"),
         );
@@ -113,7 +128,7 @@ async fn widen_account(
     let positions = match list_positions(&broker, account_id).await {
         Ok(p) => p,
         Err(err) => {
-            rlog_err!(
+            tracing::error!(
                 "blackout widen[{}]: list_open_positions: {err}",
                 account.unwrap_or("<global>"),
             );
@@ -143,8 +158,8 @@ async fn widen_account(
 /// back to a stop already at the original); the reverse (amend then crash)
 /// would strand a widened stop with no remembered original.
 #[allow(clippy::too_many_arguments)]
-async fn widen_one(
-    store: &KvStateStore,
+async fn widen_one<S: StateStore>(
+    store: &S,
     broker: &BrokerHandle,
     account: Option<&str>,
     attempts: &[EntryAttempt],
@@ -160,7 +175,7 @@ async fn widen_one(
 
     // Join → originating attempt (for trade_id + baked pip_size).
     let Some(attempt) = join_position_to_attempt(position, account, attempts) else {
-        rlog!(
+        tracing::info!(
             "blackout widen[{}]: position {} ({}) has no joinable EntryAttempt; skip (can't \
              resolve trade_id/pip)",
             account.unwrap_or("<global>"),
@@ -176,7 +191,7 @@ async fn widen_one(
     // double-widen or re-capture the (already-widened) SL as "original".
     match store.get_spread_blackout_record(&trade_id).await {
         Ok(Some(rec)) if rec.applied => {
-            rlog!(
+            tracing::info!(
                 "blackout widen[{}]: trade {trade_id} already applied; skip",
                 account.unwrap_or("<global>"),
             );
@@ -184,7 +199,7 @@ async fn widen_one(
         }
         Ok(_) => {}
         Err(err) => {
-            rlog_err!(
+            tracing::error!(
                 "blackout widen[{}]: get_record({trade_id}): {err}",
                 account.unwrap_or("<global>")
             );
@@ -194,7 +209,7 @@ async fn widen_one(
 
     // Pip from the joined attempt — never widen with a wrong/absent pip.
     let Some(pip_size) = attempt.pip_size.filter(|p| *p > 0.0 && p.is_finite()) else {
-        rlog!(
+        tracing::info!(
             "blackout widen[{}]: trade {trade_id} has no usable pip_size; skip (won't widen with \
              a wrong pip)",
             account.unwrap_or("<global>"),
@@ -206,7 +221,7 @@ async fn widen_one(
     let Some(spread_abs) =
         sample_instrument_spread(broker, &position.instrument, spread_cache).await
     else {
-        rlog_err!(
+        tracing::error!(
             "blackout widen[{}]: get_quote({}) failed; skip trade {trade_id}",
             account.unwrap_or("<global>"),
             position.instrument,
@@ -237,7 +252,7 @@ async fn widen_one(
         .upsert_spread_blackout_record(&record, BLACKOUT_BACKSTOP_SECONDS)
         .await
     {
-        rlog_err!(
+        tracing::error!(
             "blackout widen[{}]: upsert_record({trade_id}) FAILED ({err}); NOT amending (no \
              remembered original ⇒ no widen)",
             account.unwrap_or("<global>"),
@@ -248,7 +263,7 @@ async fn widen_one(
     // PRECONDITION-guarded amend: log the intended amend prominently so a
     // demo run can read it back and confirm `AmendCloseOrder`-on-open-position
     // actually moved the SL (and left TP) before this is trusted live.
-    rlog!(
+    tracing::info!(
         "blackout widen[{}]: INTENT amend_stop trade={trade_id} id={} instrument={} dir={:?} \
          original_sl={original_sl} spread_pips={spread_pips:.1} widen_pips={widen_pips} \
          new_sl={new_sl} (DEMO-CONFIRM AmendCloseOrder-on-open-position before trusting live)",
@@ -258,18 +273,18 @@ async fn widen_one(
         position.direction,
     );
     match amend(broker, account.unwrap_or(""), &position.order_id, new_sl).await {
-        Ok(()) => rlog!(
+        Ok(()) => tracing::info!(
             "blackout widen[{}]: amend_stop ok trade={trade_id} id={} -> {new_sl}",
             account.unwrap_or("<global>"),
             position.order_id,
         ),
-        Err(AmendError::NotFound) => rlog!(
+        Err(AmendError::NotFound) => tracing::info!(
             "blackout widen[{}]: amend_stop id={} not found (position closed?) trade={trade_id} — \
              benign; record stays for restore-as-noop / backstop clear",
             account.unwrap_or("<global>"),
             position.order_id,
         ),
-        Err(err) => rlog_err!(
+        Err(err) => tracing::error!(
             "blackout widen[{}]: amend_stop trade={trade_id} id={} -> {new_sl} FAILED ({err}); \
              record persisted so recovery still restores to original",
             account.unwrap_or("<global>"),

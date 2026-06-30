@@ -19,35 +19,42 @@
 //!    is `if !record.applied { return }`. Sub-plan 2 never sets
 //!    `applied = true` (only 4/5 do, after a real broker mutation), so
 //!    here the loop is effectively a no-op — the skeleton 4/5 fill.
+//!
+//! # Runtime-agnostic via the [`CronEnv`] seam
+//!
+//! Moved into `trade-control-cron` so both the wasm Cloudflare worker and the
+//! native VM scheduler run the *same* recovery watcher. The `&Env`-hidden broker
+//! acquisition travels through the [`CronEnv`] seam; the caller opens the
+//! [`StateStore`] and passes it in.
 
 use chrono::{DateTime, Duration, Utc};
 use trade_control_core::broker::{AmendError, Broker};
 use trade_control_core::state::{SpreadBlackoutRecord, StateStore};
-use worker::Env;
 
-use super::constants::BLACKOUT_BACKSTOP_SECONDS;
-use super::sweep::{BrokerHandle, acquire_broker_for_account, open_store};
-use crate::state::KvStateStore;
+use crate::broker_handle::BrokerHandle;
+use crate::constants::BLACKOUT_BACKSTOP_SECONDS;
+use crate::seam::CronEnv;
 
 /// Walk every per-trade spread-blackout record. For each `applied`
 /// record, clear it when the spread has recovered or the backstop has
 /// fired. Per-row errors are logged and skipped — one bad row must
 /// never abort the loop (same discipline as the order sweep).
-pub async fn watch_recovery(env: &Env, now: DateTime<Utc>) {
-    let Some(store) = open_store(env) else {
-        return;
-    };
+pub async fn watch_recovery<S, C>(store: &S, cron: &C, now: DateTime<Utc>)
+where
+    S: StateStore,
+    C: CronEnv,
+{
     let records = match store.list_all_spread_blackout_records().await {
         Ok(v) => v,
         Err(err) => {
-            rlog_err!("blackout watch: list failed: {err}");
+            tracing::error!("blackout watch: list failed: {err}");
             return;
         }
     };
-    rlog!("blackout watch: {} records", records.len());
+    tracing::info!("blackout watch: {} records", records.len());
     for record in records {
-        if let Err(err) = watch_one(env, &store, &record, now).await {
-            rlog_err!(
+        if let Err(err) = watch_one(store, cron, &record, now).await {
+            tracing::error!(
                 "blackout watch[{}/{}]: {err}",
                 record.trade_id,
                 record.instrument
@@ -58,12 +65,16 @@ pub async fn watch_recovery(env: &Env, now: DateTime<Utc>) {
 
 /// Per-record recovery decision + clear. Returns an error string so the
 /// caller can log with row context.
-async fn watch_one(
-    env: &Env,
-    store: &KvStateStore,
+async fn watch_one<S, C>(
+    store: &S,
+    cron: &C,
     record: &SpreadBlackoutRecord,
     now: DateTime<Utc>,
-) -> Result<(), String> {
+) -> Result<(), String>
+where
+    S: StateStore,
+    C: CronEnv,
+{
     // SAFETY RULE 3 — never-touch-what-you-didn't-apply.
     if !record.applied {
         return Ok(());
@@ -82,10 +93,10 @@ async fn watch_one(
         // (`original_stops` vs `cancelled_orders`), so they don't stomp each
         // other; a trade may carry both (multi-shot: an open position whose
         // stop was widened AND a resting re-entry order that was cancelled).
-        restore_remembered_stops(env, record).await;
-        super::blackout_restore::restore_cancelled_orders(env, store, record, now).await;
+        restore_remembered_stops(cron, record).await;
+        crate::restore_cancelled_orders(store, cron, record, now).await;
         clear(store, record, "backstop").await?;
-        rlog!(
+        tracing::info!(
             "blackout watch[{}]: backstop fired, cleared",
             record.trade_id
         );
@@ -95,7 +106,7 @@ async fn watch_one(
     // SAFETY RULE 1 — hard restore floor. Act whenever applied &&
     // spread-normal, REGARDLESS of the clock; we don't gate on
     // is_ny_close_edge.
-    let spread_abs = sample_spread(env, record).await?;
+    let spread_abs = sample_spread(cron, record).await?;
     // Convert the broker's absolute `ask − bid` to pips via the pip baked
     // onto the record at apply time (Cron 1). The whole feature works in
     // pips consistently; a `0.0`/non-finite pip means the apply path never
@@ -108,10 +119,10 @@ async fn watch_one(
         // independence + coexistence note):
         //  - System 2: widened stops → remembered originals.
         //  - System 3: cancelled resting orders → re-driven via the entry path.
-        restore_remembered_stops(env, record).await;
-        super::blackout_restore::restore_cancelled_orders(env, store, record, now).await;
+        restore_remembered_stops(cron, record).await;
+        crate::restore_cancelled_orders(store, cron, record, now).await;
         clear(store, record, "recovery").await?;
-        rlog!(
+        tracing::info!(
             "blackout watch[{}]: spread {spread_pips}p recovered, cleared",
             record.trade_id
         );
@@ -140,12 +151,12 @@ fn spread_in_pips(spread_abs: f64, pip_size: f64) -> f64 {
 /// logged and skipped so the clear still proceeds; a closed position yields
 /// `AmendError::NotFound` and is treated as benign (nothing to restore).
 /// System 2 only ever moves a stop — it never closes or tightens.
-async fn restore_remembered_stops(env: &Env, record: &SpreadBlackoutRecord) {
+async fn restore_remembered_stops<C: CronEnv>(cron: &C, record: &SpreadBlackoutRecord) {
     if record.original_stops.is_empty() {
         return;
     }
-    let Some(broker) = acquire_broker_for_account(env, record.account.as_deref()).await else {
-        rlog_err!(
+    let Some(broker) = cron.acquire_broker(record.account.as_deref()).await else {
+        tracing::error!(
             "blackout restore[{}]: broker acquisition failed — {} stop(s) left widened until \
              the operator restores them (backstop TTL is the final net)",
             record.trade_id,
@@ -174,19 +185,19 @@ async fn restore_remembered_stops(env: &Env, record: &SpreadBlackoutRecord) {
             }
         };
         match result {
-            Ok(()) => rlog!(
+            Ok(()) => tracing::info!(
                 "blackout restore[{}]: amend_stop ok id={} -> original {} (verbatim, no recompute)",
                 record.trade_id,
                 remembered.position_or_order_id,
                 remembered.original_stop,
             ),
-            Err(AmendError::NotFound) => rlog!(
+            Err(AmendError::NotFound) => tracing::info!(
                 "blackout restore[{}]: id={} gone (closed during window) — benign, nothing to \
                  restore",
                 record.trade_id,
                 remembered.position_or_order_id,
             ),
-            Err(err) => rlog_err!(
+            Err(err) => tracing::error!(
                 "blackout restore[{}]: amend_stop id={} -> {} FAILED ({err}) — stop left WIDENED, \
                  operator must restore manually",
                 record.trade_id,
@@ -200,8 +211,9 @@ async fn restore_remembered_stops(env: &Env, record: &SpreadBlackoutRecord) {
 /// Acquire the record's-account broker and read the current spread via
 /// the Sub-plan-1 `get_quote`. The per-broker match mirrors the order
 /// sweep's price-fetch dispatch.
-async fn sample_spread(env: &Env, record: &SpreadBlackoutRecord) -> Result<f64, String> {
-    let broker = acquire_broker_for_account(env, record.account.as_deref())
+async fn sample_spread<C: CronEnv>(cron: &C, record: &SpreadBlackoutRecord) -> Result<f64, String> {
+    let broker = cron
+        .acquire_broker(record.account.as_deref())
         .await
         .ok_or_else(|| "broker acquisition failed".to_string())?;
     let quote = match broker {
@@ -212,8 +224,8 @@ async fn sample_spread(env: &Env, record: &SpreadBlackoutRecord) -> Result<f64, 
     Ok(quote.spread())
 }
 
-async fn clear(
-    store: &KvStateStore,
+async fn clear<S: StateStore>(
+    store: &S,
     record: &SpreadBlackoutRecord,
     reason: &str,
 ) -> Result<(), String> {
@@ -239,16 +251,16 @@ pub fn backstop_due(opened_at: DateTime<Utc>, now: DateTime<Utc>) -> bool {
 /// pips via [`spread_in_pips`] using the `pip_size` baked onto the record at
 /// apply time (Cron 1) — resolving Sub-plan 2's "no intent in hand" open
 /// question. The cutoff itself lives beside System 1's *elevated* cutoff in
-/// `crate::spread_blackout` so the hysteresis pair is tuned in ONE place
-/// (`RECOVERED < ELEVATED`).
+/// `trade_control_core::spread_blackout` so the hysteresis pair is tuned in ONE
+/// place (`RECOVERED < ELEVATED`).
 pub fn spread_recovered(spread_pips: f64) -> bool {
     spread_pips <= recovered_cutoff()
 }
 
 /// The recovered-spread cutoff in pips. Single source of truth:
-/// `crate::spread_blackout::SPREAD_BLACKOUT_RECOVERED_PIPS`, co-located with
-/// System 1's elevated cutoff so the hysteresis invariant is visible and
-/// tuned in one file.
+/// `trade_control_core::spread_blackout::SPREAD_BLACKOUT_RECOVERED_PIPS`,
+/// co-located with System 1's elevated cutoff so the hysteresis invariant is
+/// visible and tuned in one file.
 ///
 /// TODO(open-question, spread-blackout): the recovered/elevated cutoffs are
 /// still uncalibrated placeholders and flat across instruments. If they
@@ -256,7 +268,7 @@ pub fn spread_recovered(spread_pips: f64) -> bool {
 /// question in `blackout_widen` / `blackout_apply`), thread the instrument
 /// through here. Calibrate on demo before relying on these.
 fn recovered_cutoff() -> f64 {
-    crate::spread_blackout::SPREAD_BLACKOUT_RECOVERED_PIPS
+    trade_control_core::spread_blackout::SPREAD_BLACKOUT_RECOVERED_PIPS
 }
 
 #[cfg(test)]
@@ -272,7 +284,7 @@ mod tests {
         // Pips now (reconciled units). Recovered cutoff is 4p.
         assert!(spread_recovered(2.0));
         assert!(
-            spread_recovered(crate::spread_blackout::SPREAD_BLACKOUT_RECOVERED_PIPS),
+            spread_recovered(trade_control_core::spread_blackout::SPREAD_BLACKOUT_RECOVERED_PIPS),
             "at cutoff counts as recovered"
         );
     }

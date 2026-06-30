@@ -2,8 +2,8 @@
 //! spread blackout and store their signed intent so the recovery watcher can
 //! re-drive them.
 //!
-//! Runs right after the System-2 stop-widen in [`super::blackout_apply`], on
-//! the same affected-account set. Per the master plan's "no classification"
+//! Runs right after the System-2 stop-widen in [`crate::apply_if_ny_close_edge`],
+//! on the same affected-account set. Per the master plan's "no classification"
 //! rule, each found order's instrument spread is sampled via `get_quote` and
 //! only an order on an *elevated* spread is cancelled — a major at ~5p resting
 //! through the trough is left alone.
@@ -28,39 +28,45 @@
 //! NO stored body (placed before this feature, or its body TTL'd out) can't be
 //! restored, so we **never cancel it** — leaving it resting is strictly safer
 //! than cancelling something we can't put back.
+//!
+//! # Runtime-agnostic via the [`CronEnv`] seam
+//!
+//! Moved into `trade-control-cron` so both runtimes share one cancel. The
+//! `&Env`-hidden broker acquisition + signing-key lookup travel through the
+//! [`CronEnv`] seam; the caller opens the [`StateStore`] and passes it in.
 
 use chrono::{DateTime, Duration, Utc};
 use trade_control_core::broker::{Broker, PendingOrder};
 use trade_control_core::incoming;
 use trade_control_core::state::{CancelledOrder, SpreadBlackoutRecord, StateStore};
-use worker::Env;
 
-use super::constants::BLACKOUT_BACKSTOP_SECONDS;
-use super::sweep::{BrokerHandle, acquire_broker_for_account, open_store};
-use crate::state::KvStateStore;
+use crate::broker_handle::BrokerHandle;
+use crate::constants::BLACKOUT_BACKSTOP_SECONDS;
+use crate::seam::CronEnv;
 
 /// Cancel + store every resting entry order on the affected accounts whose
 /// instrument spread is currently elevated. Affected accounts are sourced the
 /// same way the widen does — the set of `account`s on the existing
 /// `EntryAttempt` rows — so the two steps stay in lockstep.
-pub async fn cancel_resting_orders(env: &Env, now: DateTime<Utc>) {
-    let Some(store) = open_store(env) else {
-        return;
-    };
-    let key = match crate::signing_key(env) {
+pub async fn cancel_resting_orders<S, C>(store: &S, cron: &C, now: DateTime<Utc>)
+where
+    S: StateStore,
+    C: CronEnv,
+{
+    let key = match cron.signing_key() {
         Some(k) => k,
         // No signing key ⇒ we can't re-parse a stored body to find its trade_id
         // (and the restore side couldn't re-verify it either). Skip the whole
         // cancel step rather than cancel orders we can't book for restore.
         None => {
-            rlog_err!("blackout cancel: no signing key; skipping resting-order cancel");
+            tracing::error!("blackout cancel: no signing key; skipping resting-order cancel");
             return;
         }
     };
     let attempts = match store.list_all_entry_attempts().await {
         Ok(v) => v,
         Err(err) => {
-            rlog_err!("blackout cancel: list_all_entry_attempts: {err}");
+            tracing::error!("blackout cancel: list_all_entry_attempts: {err}");
             return;
         }
     };
@@ -70,22 +76,25 @@ pub async fn cancel_resting_orders(env: &Env, now: DateTime<Utc>) {
             accounts.push(a.account.clone());
         }
     }
-    rlog!("blackout cancel: {} affected account(s)", accounts.len());
+    tracing::info!("blackout cancel: {} affected account(s)", accounts.len());
     for account in accounts {
-        cancel_account(env, &store, &key, account.as_deref(), now).await;
+        cancel_account(store, cron, &key, account.as_deref(), now).await;
     }
 }
 
 /// Cancel + store resting orders on one account. Per-order errors log + skip.
-async fn cancel_account(
-    env: &Env,
-    store: &KvStateStore,
+async fn cancel_account<S, C>(
+    store: &S,
+    cron: &C,
     key: &[u8],
     account: Option<&str>,
     now: DateTime<Utc>,
-) {
-    let Some(broker) = acquire_broker_for_account(env, account).await else {
-        rlog_err!(
+) where
+    S: StateStore,
+    C: CronEnv,
+{
+    let Some(broker) = cron.acquire_broker(account).await else {
+        tracing::error!(
             "blackout cancel[{}]: broker acquisition failed; skipping account",
             account.unwrap_or("<global>"),
         );
@@ -95,7 +104,7 @@ async fn cancel_account(
     let pendings = match list_pending(&broker, account_id).await {
         Ok(p) => p,
         Err(err) => {
-            rlog_err!(
+            tracing::error!(
                 "blackout cancel[{}]: list_pending_orders: {err}",
                 account.unwrap_or("<global>"),
             );
@@ -109,8 +118,8 @@ async fn cancel_account(
 
 /// Cancel + store a single resting order. Order of operations is crash-safe
 /// (store, then cancel — see module docs).
-async fn cancel_one(
-    store: &KvStateStore,
+async fn cancel_one<S: StateStore>(
+    store: &S,
     broker: &BrokerHandle,
     key: &[u8],
     account: Option<&str>,
@@ -124,7 +133,7 @@ async fn cancel_one(
     let signed_body = match store.get_order_body(&order.order_id).await {
         Ok(Some(b)) => b,
         Ok(None) => {
-            rlog!(
+            tracing::info!(
                 "blackout cancel[{scope}]: no stored body for order {} — leaving it resting \
                  (can't restore what we can't re-parse)",
                 order.order_id,
@@ -132,7 +141,7 @@ async fn cancel_one(
             return;
         }
         Err(err) => {
-            rlog_err!(
+            tracing::error!(
                 "blackout cancel[{scope}]: get_order_body({}) failed: {err}; skip",
                 order.order_id,
             );
@@ -146,7 +155,7 @@ async fn cancel_one(
     let verified = match incoming::parse_and_verify(&signed_body, key, now) {
         Ok(v) => v,
         Err(err) => {
-            rlog!(
+            tracing::info!(
                 "blackout cancel[{scope}]: stored body for order {} won't verify ({err}); \
                  leaving it resting",
                 order.order_id,
@@ -164,7 +173,7 @@ async fn cancel_one(
         .pip_size
         .filter(|p| *p > 0.0 && p.is_finite())
     else {
-        rlog!(
+        tracing::info!(
             "blackout cancel[{scope}]: order {} (trade {trade_id}) has no usable pip_size; \
              skip (won't classify spread with a wrong pip)",
             order.order_id,
@@ -176,7 +185,7 @@ async fn cancel_one(
     let quote = match get_quote(broker, &order.instrument).await {
         Ok(q) => q,
         Err(err) => {
-            rlog_err!(
+            tracing::error!(
                 "blackout cancel[{scope}]: get_quote({}) failed: {err:?}; skip trade {trade_id}",
                 order.instrument,
             );
@@ -184,9 +193,9 @@ async fn cancel_one(
         }
     };
     let spread_pips = quote.spread() / pip_size;
-    let threshold = crate::spread_blackout::elevated_threshold_pips(&order.instrument);
+    let threshold = trade_control_core::spread_blackout::elevated_threshold_pips(&order.instrument);
     if spread_pips <= threshold {
-        rlog!(
+        tracing::info!(
             "blackout cancel[{scope}]: order {} ({}) spread {spread_pips:.1}p <= {threshold:.1}p \
              not elevated; leaving it resting",
             order.order_id,
@@ -200,7 +209,7 @@ async fn cancel_one(
     let existing = match store.get_spread_blackout_record(&trade_id).await {
         Ok(r) => r,
         Err(err) => {
-            rlog_err!(
+            tracing::error!(
                 "blackout cancel[{scope}]: get_record({trade_id}): {err}; skip (won't cancel \
                  without a durable record)",
             );
@@ -223,7 +232,7 @@ async fn cancel_one(
         .upsert_spread_blackout_record(&record, BLACKOUT_BACKSTOP_SECONDS)
         .await
     {
-        rlog_err!(
+        tracing::error!(
             "blackout cancel[{scope}]: upsert_record({trade_id}) FAILED ({err}); NOT cancelling \
              (no durable record ⇒ would strand the order)",
         );
@@ -233,14 +242,14 @@ async fn cancel_one(
     // Now cancel. A failure leaves the (idempotent) record in place; the
     // recovery re-drive of a still-live order is bounded by its own gates.
     match cancel(broker, account_id_of(account), &order.order_id).await {
-        Ok(()) => rlog!(
+        Ok(()) => tracing::info!(
             "blackout cancel[{scope}][{trade_id}]: cancelled resting {} order {} \
              (trigger={} spread={spread_pips:.1}p)",
             if order.is_stop { "stop" } else { "limit" },
             order.order_id,
             order.trigger,
         ),
-        Err(err) => rlog_err!(
+        Err(err) => tracing::error!(
             "blackout cancel[{scope}][{trade_id}]: cancel order {} FAILED ({err}); record stays \
              (recovery re-drive is bounded by gates if the order was actually still live)",
             order.order_id,

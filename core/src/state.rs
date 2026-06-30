@@ -1116,6 +1116,37 @@ pub trait StateStore {
         account: Option<&str>,
         trade_id: &str,
     ) -> impl Future<Output = Result<(), StateError>>;
+
+    /// Persist the raw signed alert body for a placed order so the
+    /// spread-blackout apply cron can recover + re-drive it on recovery (it
+    /// finds a broker *pending order*, not a signed intent). `order_id` is the
+    /// broker order id the adapter returned.
+    ///
+    /// Defaulted to a no-op so test/in-memory stores that never exercise the
+    /// blackout-restore path don't have to implement it; only the real KV /
+    /// Postgres backends override it.
+    fn put_order_body(
+        &self,
+        _order_id: &str,
+        _signed_body: &str,
+    ) -> impl Future<Output = Result<(), StateError>> {
+        async { Ok(()) }
+    }
+
+    /// Read the raw signed alert body for `order_id`, or `None` if absent /
+    /// purged. Defaulted to `None` for stores that don't persist order bodies.
+    fn get_order_body(
+        &self,
+        _order_id: &str,
+    ) -> impl Future<Output = Result<Option<String>, StateError>> {
+        async { Ok(None) }
+    }
+
+    /// Best-effort delete of an order-body row once it has been re-driven on
+    /// recovery (or the order is otherwise gone). Defaulted to a no-op.
+    fn delete_order_body(&self, _order_id: &str) -> impl Future<Output = Result<(), StateError>> {
+        async { Ok(()) }
+    }
 }
 
 /// A registered plan paired with the account scope it was stored under, as
@@ -2199,6 +2230,34 @@ mod memstore {
             ));
             Ok(())
         }
+
+        // Order-body recovery cache — a faithful in-memory reference for the KV
+        // / Postgres backends (NO TTL). Defaulting these to the trait's no-ops
+        // would make the conformance harness blind to an order-body parity gap,
+        // exactly the kind of drift the harness exists to catch.
+        async fn put_order_body(
+            &self,
+            order_id: &str,
+            signed_body: &str,
+        ) -> Result<(), StateError> {
+            // No TTL: a far-future expiry so `get_live` never ages it out.
+            self.put(
+                format!("order:{order_id}"),
+                signed_body.to_string(),
+                u64::from(u32::MAX),
+                self.now(),
+            );
+            Ok(())
+        }
+
+        async fn get_order_body(&self, order_id: &str) -> Result<Option<String>, StateError> {
+            Ok(self.get_live(&format!("order:{order_id}"), self.now()))
+        }
+
+        async fn delete_order_body(&self, order_id: &str) -> Result<(), StateError> {
+            self.delete(&format!("order:{order_id}"));
+            Ok(())
+        }
     }
 }
 
@@ -2208,12 +2267,30 @@ mod memstore {
 #[cfg(any(test, feature = "test-support"))]
 pub use memstore::MemStateStore;
 
+/// Cross-backend conformance harness (Mem vs Pg). Gated behind the same
+/// `test-support` feature as `MemStateStore` so the worker crate (a non-test
+/// consumer driving `PgStateStore`) can reach it. See the module docs.
+#[cfg(any(test, feature = "test-support"))]
+pub mod conformance;
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn ts(s: &str) -> DateTime<Utc> {
         s.parse().unwrap()
+    }
+
+    /// The cross-backend conformance harness, run against the in-memory
+    /// reference store. The identical harness runs against `PgStateStore` in
+    /// the `trade-control-worker` crate — if this passes but that fails (or
+    /// vice versa), the two `StateStore` backends have drifted. This is the
+    /// Mem half of the KV→Postgres parity gate.
+    #[test]
+    fn conformance_against_memstore() {
+        use super::memstore::MemStateStore;
+        let store = MemStateStore::new();
+        pollster::block_on(conformance::run_all(&store, "mem"));
     }
 
     #[test]

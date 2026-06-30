@@ -24,15 +24,8 @@
 //!   idempotent (window marker + per-record guard), so a double-fire
 //!   would be harmless; the minute gate just avoids 4× the broker calls.
 
-mod blackout_apply;
-mod blackout_cancel;
-mod blackout_hours;
-mod blackout_restore;
-mod blackout_watch;
-mod blackout_widen;
-mod breakeven_watch;
 mod constants;
-mod engine;
+mod seam;
 pub(crate) mod session_meta;
 mod session_refresh;
 mod sweep;
@@ -48,29 +41,57 @@ pub async fn scheduled(_event: ScheduledEvent, env: Env, ctx: ScheduleContext) {
     crate::tracing_console::ConsoleSubscriber::install();
     let now = chrono::Utc::now();
 
-    // Frequent upkeep — every 15-min tick.
+    // Frequent upkeep — every 15-min tick. `session_refresh` is wasm-only (it
+    // pre-warms the KV session cache, an optimization the native runtime doesn't
+    // need — it re-logins on demand via the broker factory), so it stays here on
+    // the raw `&Env` path with no native equivalent by design.
     session_refresh::refresh_stale_sessions(&env, now, constants::STALE_AFTER).await;
-    sweep::sweep_pending_orders(&env, now).await;
-    blackout_watch::watch_recovery(&env, now).await;
-    // Break-even stop management — move open positions' stops to entry once a
-    // candle closes past 50%-to-TP (BUG-replay-no-breakeven-stop-at-50pct).
-    breakeven_watch::watch(&env, now).await;
 
-    // Server-side trade-plan engine — evaluate every registered plan against
-    // fresh broker candles and dispatch fired intents. Runs in parallel with
-    // the webhook (no self-gate); the `*/15` schedule stays — the `*/1`–`*/5`
-    // bump is Stage F, once the engine is proven on demo.
-    engine::run_engine_tick(&env, &ctx, now).await;
+    // Open the KV store + our `CronEnv` impl once and reuse them for every cron
+    // job that now lives in the shared `trade-control-cron` crate: the order
+    // sweep, the spread-recovery watcher, the break-even watcher, the engine
+    // tick, the NY-close-edge apply, and the daily market-hours blackout refresh.
+    // Each is generic over its store + backend seam (`CronEnv`) so the *same*
+    // code runs on the native runtime (Task #5); here we wrap `&Env`/`&ctx` in
+    // `EnvCronEnv` and hand both in, never touching `Env` inside the shared logic.
+    if let Some(store) = sweep::open_store(&env) {
+        let cron_env = seam::EnvCronEnv {
+            env: &env,
+            ctx: &ctx,
+        };
 
-    // NY-close-edge job — fire exactly once per close hour, on the :00
-    // tick. `apply_if_ny_close_edge` re-checks `is_ny_close_edge` itself,
-    // so the minute gate is purely to avoid running it on all four ticks
-    // of the close hour.
-    if now.minute() < 15 {
-        blackout_apply::apply_if_ny_close_edge(&env, now).await;
-        // Daily market-hours blackout refresh — self-gates on its own hour
-        // (06:00 UTC). Resolves each traded instrument's current-season
-        // session into UTC no-entry windows and writes them to KV.
-        blackout_hours::refresh_if_due(&env, now).await;
+        // Order sweep — cancel + delete each pending `EntryAttempt` whose alert
+        // window expired, whose bar-expiry fired, that's caught in a market-hours
+        // blackout, or whose SL has been overtaken. Runs after session_refresh,
+        // before the spread-recovery watcher (call order preserved across the
+        // port to the shared crate).
+        trade_control_cron::sweep_pending_orders(&store, &cron_env, now).await;
+
+        // Spread-recovery watcher — clear each per-trade blackout record once the
+        // spread has recovered (or the backstop fires), restoring widened stops +
+        // re-driving cancelled resting orders before the clear.
+        trade_control_cron::watch_recovery(&store, &cron_env, now).await;
+
+        // Break-even stop management — move open positions' stops to entry once a
+        // candle closes past 50%-to-TP (BUG-replay-no-breakeven-stop-at-50pct).
+        trade_control_cron::breakeven_watch(&store, &cron_env, now).await;
+
+        // Server-side trade-plan engine — evaluate every registered plan against
+        // fresh broker candles and dispatch fired intents. Runs in parallel with
+        // the webhook (no self-gate); the `*/15` schedule stays — the `*/1`–`*/5`
+        // bump is Stage F, once the engine is proven on demo.
+        trade_control_cron::run_engine_tick(&store, &cron_env, now).await;
+
+        // NY-close-edge job — fire exactly once per close hour, on the :00
+        // tick. `apply_if_ny_close_edge` re-checks `is_ny_close_edge` itself,
+        // so the minute gate is purely to avoid running it on all four ticks
+        // of the close hour.
+        if now.minute() < 15 {
+            trade_control_cron::apply_if_ny_close_edge(&store, &cron_env, now).await;
+            // Daily market-hours blackout refresh — self-gates on its own hour
+            // (06:00 UTC). Resolves each traded instrument's current-season
+            // session into UTC no-entry windows and writes them to KV.
+            trade_control_cron::refresh_market_hours_if_due(&store, &cron_env, now).await;
+        }
     }
 }

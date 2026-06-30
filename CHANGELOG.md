@@ -1,5 +1,65 @@
 # Changelog
 
+## Unreleased — 2026-06-30 — strategy-v2 entry starvation + preps are life-of-trade (no TTL)
+
+**Why.** A plain iH&S where BCR enters and loses −1R came back as a spurious
+**0R, no entry** under `--strategy-v2` (replay trade 071, GBP/JPY H1). Two
+distinct defects compounded:
+
+1. **break-and-close re-stamp starvation (engine, shared — affects live + replay).**
+   A multi-shot (`--strategy-v2`) plan stays in `Phase::AwaitEntry`, so the
+   break-and-close arm re-runs every bar. `evaluate_break_and_close` had **no
+   latch guard**, so each later neckline re-cross re-stamped `break_close_at`
+   forward — pushing the already-seen retest *before* the new break window, so
+   `retest_satisfied` flipped false and the stop enter was starved forever
+   (re-prepping in place; the prep fired 4× despite `FireMode::Once`). The
+   reported "QM verdict clobbers stop verdict" aggregation theory was wrong; the
+   stop leg never reached `push_fire` because the retest gate re-closed under it.
+
+2. **missing-prep on every preps-gated enter (replay-only regression + a latent
+   wall-clock-TTL trap).** Commit `1c0a043` routed replay enters through the real
+   `run_enter` (whose prep gate is store-backed: `store.get_prep`), but the
+   replay loop never seeded store preps (`Action::Prep` fell into `_ => {}`).
+   Even once seeded, prep TTLs were computed `ttl_hours_until(now, trade_expiry)`
+   — wall-clock-relative — so a `--plan-out` plan armed against a *historical*
+   window (whose `trade_expiry` is already past relative to `now`) collapsed the
+   TTL to the 1h floor, ageing the break-and-close prep out ~12h before the
+   entry bar. Live (future `trade_expiry`) was unaffected, so this was a
+   replay-fidelity bug, not a live one.
+
+**What changed.**
+- **Engine (`engine/src/evaluate.rs`):**
+  - `evaluate_break_and_close` honours its `FireMode::Once` latch (skip if already
+    in `state.fired`), so a re-cross can't walk `break_close_at` forward.
+  - `stamp_retest` now **emits the `04-prep-retest` fire** the bar it stamps (and
+    only once), seeding the store the enter's prep gate reads — exactly as the TV
+    `04-prep-retest` alert did, and as `evaluate_break_and_close` already emitted
+    the break-and-close prep. The engine still validates retest internally via
+    `retest_satisfied`; the fire is what makes the store-backed `run_enter` gate
+    agree.
+- **CLI (`cli/src/trade_patterns.rs`):** the structural trade preps
+  (`break-and-close`, `retest`) are now **no-TTL** (`PREP_NO_EXPIRY_HOURS`, ~100y,
+  mirroring `core::state::NO_TTL_SECONDS`). A prep is a milestone the trade has
+  passed — it lives for the life of the trade and only has to happen once; the
+  trade is retired by its own `trade-expiry` veto, not by a prep ageing out.
+  Drops the now-unused `now` param from both prep builders.
+- **Replay (`cli/src/bin/replay_candles/replay.rs`):** the per-tick dispatch loop
+  routes `Action::Prep` fires through `handle_prep` (→ `set_prep`), mirroring the
+  worker's `dispatch_action` so the store the offline `run_enter` reads is seeded
+  identically.
+
+**Result.** `--strategy-v2` now fires `05-enter` exactly once and matches BCR
+fire-for-fire: both enter at 06-26 23:00 BNE and stop out at **−1R** (was a
+spurious 0R for v2). Verified on the live GBP/JPY chart, before/after.
+
+**Tests.** New `break_and_close_does_not_restamp_after_latching_under_multi_enter`
+(engine). Updated `entry_blocked_until_retest_then_fires_and_done` and
+`stop_enter_fires_only_after_break_and_close_then_retest` to expect the retest
+prep fire ahead of the enter(s). 587 cli+engine+tv-arm tests + 749 core green.
+
+**Follow-up.** Bug report `BUG-replay-strategy-v2-entry-starved-reprepping.md`
+can be closed; its suggested per-leg aggregation fix was not the actual cause.
+
 ## Unreleased — 2026-06-28 — Spread-blackout moved to `core`; replay applies it
 
 **Why.** The spread-blackout entry reject (System 1) lived in

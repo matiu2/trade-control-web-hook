@@ -1,0 +1,17 @@
+[package]
+name = "trade-control-cron"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+broker-oanda = { version = "0.1.0", path = "../broker-oanda" }
+broker-tradenation = { git = "https://github.com/matiu2/tradenation-api.git", tag = "broker-tradenation-v0.10.0", features = ["wasm_js"] }
+broker-tradenation-adapter = { version = "0.1.0", path = "../broker-tradenation-adapter" }
+tradenation-api = { git = "https://github.com/matiu2/tradenation-api.git", tag = "broker-tradenation-v0.10.0", features = ["wasm_js"] }
+chrono = { version = "0.4.45", default-features = false, features = ["serde", "alloc"] }
+tracing = { version = "0.1.44", default-features = false, features = ["std"] }
+trade-control-core = { version = "0.1.0", path = "../core" }
+trade-control-engine = { version = "0.1.0", path = "../engine" }
+
+[target.wasm32-unknown-unknown.dependencies]
+broker-tradenation-adapter = { version = "0.1.0", path = "../broker-tradenation-adapter", features = ["wasm_js"] }
