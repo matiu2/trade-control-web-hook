@@ -1,5 +1,37 @@
 # Changelog
 
+## Unreleased — 2026-06-30 — tv-arm: tolerate degenerate TradingView drawings
+
+**Why.** A `tv-arm-dev` arm on NZD/CAD aborted with
+`tv-mcp draw get kazo98 returned non-JSON output … invalid type: null, expected
+f64`. The chart carried a stray `parallel_channel` whose third anchor read back
+as `{"price": null, …}`. `Point.price` was a plain `f64`, so `serde` rejected
+the **entire** drawing — and because role classification fetches every stub's
+full drawing with `?`, one unrelated degenerate channel stranded the whole
+setup. The channel played no role in the arm at all.
+
+**What changed.**
+- `trading-view::drawings::Point` now tolerates a `null` price (→ `NaN`
+  sentinel) and a `null` time (→ `0` sentinel) via field deserializers, so the
+  parse survives. `Point::is_degenerate()` flags such an anchor;
+  `Drawing::has_degenerate_point()` flags a drawing carrying one.
+- `tv-arm::roles::classify` skips a drawing with a degenerate anchor (a `warn`,
+  then `continue`) instead of aborting. The points are **not** silently dropped
+  — the H&S/fib geometry indexes anchors positionally, so dropping would shift
+  the indices; declining the whole drawing is the safe choice.
+
+**Behaviour.** A stray/half-drawn channel or fib no longer strands a legitimate
+arm. Verified end-to-end against the live chart: the NZD/CAD arm now skips
+`kazo98` and runs to completion (then surfaces a *real* `1 start / 2 end`
+blackout-pairing chart error — the actionable message, not a crash).
+
+**Tests.** `null_price_anchor_parses_as_degenerate`,
+`null_time_anchor_is_degenerate`, `well_formed_drawing_is_not_degenerate`
+(trading-view); `degenerate_drawing_is_skipped_not_fatal` (tv-arm). 174 green
+across the two crates.
+
+**Breaking.** None. `Point`'s public fields keep their `f64`/`i64` types.
+
 ## Unreleased — 2026-06-30 — amend_stop no-TP fix (demo-verified) + TN v0.11.0
 
 **Why.** `amend_stop` on a position with **no take-profit** silently failed.

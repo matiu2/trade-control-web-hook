@@ -187,6 +187,20 @@ pub fn classify<F: DrawingFetcher>(
     for stub in stubs {
         let d = fetcher.get_drawing(&stub.id)?;
         let kind = stub.name.as_str();
+        // A drawing TradingView read back with a degenerate anchor
+        // (`null` price/time — typically a half-drawn or auto-extending
+        // channel/fib the operator left lying around) can't be
+        // role-matched on its geometry. Skip it with a warning rather
+        // than aborting the whole arm — one stray channel should not
+        // strand a legitimate setup.
+        if d.has_degenerate_point() {
+            warn!(
+                id = %stub.id,
+                kind,
+                "drawing skipped — TradingView returned a degenerate anchor (null price/time)",
+            );
+            continue;
+        }
         let lbl_owned = d.label().to_string();
         let lbl = lbl_owned.as_str();
 
@@ -770,6 +784,33 @@ mod tests {
 
         assert_eq!(roles.sr_levels.len(), 1);
         assert_eq!(roles.sr_levels[0].id, "sr");
+    }
+
+    #[test]
+    fn degenerate_drawing_is_skipped_not_fatal() {
+        // A stray `parallel_channel` whose third anchor read back with a
+        // null price (NaN sentinel) must NOT abort classification — it is
+        // skipped, and the legitimate neckline beside it still resolves.
+        let mut channel = drawing("chan", "", vec![(50, 1.10), (200, 1.10)]);
+        channel.points.push(Point {
+            time: 1772582400,
+            price: f64::NAN,
+        });
+        let (stubs, mcp) = fixture(vec![
+            (stub("chan", "parallel_channel"), channel),
+            (
+                stub("neck", "trend_line"),
+                drawing("neck", "neckline", vec![(50, 1.10), (200, 1.10)]),
+            ),
+        ]);
+
+        let roles = classify(&mcp, &stubs, ANY_RANGE, SlotPref::LatestWins)
+            .expect("a degenerate channel must not abort the arm");
+        assert_eq!(
+            roles.break_and_close.as_ref().unwrap().id,
+            "neck",
+            "the neckline still resolves alongside the skipped channel"
+        );
     }
 
     #[test]

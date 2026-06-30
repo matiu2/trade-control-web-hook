@@ -18,12 +18,55 @@ use crate::pair_lines::TimedAnchor;
 
 /// One drawing's anchor point. Time is UNIX seconds (tv-mcp emits
 /// integer seconds even when the chart uses millisecond bars).
+///
+/// TradingView occasionally reads back a **degenerate** anchor — a
+/// half-drawn or auto-extended drawing (e.g. a `parallel_channel`
+/// whose third anchor hasn't resolved) emits `"price": null` (or, more
+/// rarely, `"time": null`). A plain `f64`/`i64` field would make
+/// `serde` reject the *entire* drawing, which historically aborted the
+/// whole arm on one stray channel. So both coordinates tolerate `null`
+/// by mapping it to a sentinel (`NaN` price / `0` time) and the point
+/// is flagged [`Point::is_degenerate`]; the classifier declines any
+/// drawing carrying such a point rather than crashing.
 #[derive(Debug, Clone, Deserialize, PartialEq)]
 pub struct Point {
-    /// UNIX seconds of the anchor.
+    /// UNIX seconds of the anchor. `0` is the sentinel for a `null`
+    /// time read back from TradingView.
+    #[serde(deserialize_with = "null_time_to_sentinel")]
     pub time: i64,
-    /// Price level of the anchor.
+    /// Price level of the anchor. `NaN` is the sentinel for a `null`
+    /// price read back from TradingView.
+    #[serde(deserialize_with = "null_price_to_nan")]
     pub price: f64,
+}
+
+impl Point {
+    /// Was this anchor read back incomplete (a `null` price or time)?
+    /// Such a point can't be used for geometry, so a drawing that
+    /// carries one is declined during role classification rather than
+    /// silently dropped (dropping would shift the positional indices
+    /// the H&S/fib geometry relies on).
+    pub fn is_degenerate(&self) -> bool {
+        self.price.is_nan() || self.time <= 0
+    }
+}
+
+/// Map a `null` price to `NaN`; pass a real number through. Keeps the
+/// `price` field a plain `f64` for every downstream consumer while
+/// tolerating TradingView's degenerate readbacks.
+fn null_price_to_nan<'de, D>(de: D) -> Result<f64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<f64>::deserialize(de)?.unwrap_or(f64::NAN))
+}
+
+/// Map a `null` time to the `0` sentinel; pass a real epoch through.
+fn null_time_to_sentinel<'de, D>(de: D) -> Result<i64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<i64>::deserialize(de)?.unwrap_or(0))
 }
 
 /// Optional drawing properties tv-mcp returns. The `text` field is
@@ -93,6 +136,15 @@ impl Drawing {
     /// Trimmed label text, or empty string when absent.
     pub fn label(&self) -> &str {
         self.properties.text.as_deref().map(str::trim).unwrap_or("")
+    }
+
+    /// Does this drawing carry any degenerate anchor (a `null` price or
+    /// time read back from TradingView)? Such a drawing — typically a
+    /// half-drawn or auto-extending channel/fib the operator left on the
+    /// chart — can't be reliably role-matched, so the classifier skips
+    /// it instead of aborting the whole arm.
+    pub fn has_degenerate_point(&self) -> bool {
+        self.points.iter().any(Point::is_degenerate)
     }
 
     /// Latest anchor time across all the drawing's points. Used by
@@ -385,6 +437,49 @@ mod tests {
     #[test]
     fn intersects_window_pointless_drawing_is_never_in_window() {
         assert!(!pts(&[]).intersects_window(0, i64::MAX));
+    }
+
+    #[test]
+    fn null_price_anchor_parses_as_degenerate() {
+        // Real `parallel_channel` readback from TradingView: two valid
+        // anchors and a third whose price came back null (auto-extending
+        // third anchor not yet resolved). Before the fix this `null`
+        // made serde reject the whole drawing, aborting the arm.
+        let json = r#"{
+            "entity_id": "kazo98",
+            "points": [
+                {"price": 0.80513, "time": 1772582400},
+                {"price": 0.80513, "time": 1772582400},
+                {"price": null, "time": 1772582400}
+            ],
+            "name": "parallel_channel"
+        }"#;
+        let d: Drawing = serde_json::from_str(json).expect("parse must survive null price");
+        assert_eq!(d.points.len(), 3);
+        assert!(d.points[0].price.is_finite());
+        assert!(d.points[2].price.is_nan(), "null price → NaN sentinel");
+        assert!(d.points[2].is_degenerate());
+        assert!(!d.points[0].is_degenerate());
+        assert!(
+            d.has_degenerate_point(),
+            "drawing with a null anchor is degenerate"
+        );
+    }
+
+    #[test]
+    fn null_time_anchor_is_degenerate() {
+        let json = r#"{"id":"x","points":[{"time":null,"price":1.0}]}"#;
+        let d: Drawing = serde_json::from_str(json).expect("parse must survive null time");
+        assert_eq!(d.points[0].time, 0, "null time → 0 sentinel");
+        assert!(d.points[0].is_degenerate());
+        assert!(d.has_degenerate_point());
+    }
+
+    #[test]
+    fn well_formed_drawing_is_not_degenerate() {
+        let json = r#"{"id":"x","points":[{"time":1,"price":1.0},{"time":2,"price":2.0}]}"#;
+        let d: Drawing = serde_json::from_str(json).unwrap();
+        assert!(!d.has_degenerate_point());
     }
 
     #[test]
