@@ -52,6 +52,14 @@ Trading:
     Mixing the old and new forms on one intent is a validation error —
     pick one. Migrate to the new form on next regen.
   With no gate set the close is unconditional (operator emergency-close path).
+  - **Spine interaction (server-side engine).** A **news-windowed** reversal-close
+    is a "flatten *if* in a position" safety: when it fires it dispatches the
+    close but leaves the plan's spine intact, so a still-pending entry is **not**
+    starved (the `allow_close` gate already no-ops the flatten when flat). It only
+    fires *inside* an open news window — the engine mirrors the worker's active
+    `news:<trade_id>:<news_id>` check, so a reversal printing after `news-end`
+    doesn't fire. A **price-windowed** close (reversal back at the SR band) is a
+    thesis invalidation and *does* retire the plan.
 - `invalidate` — set a per-instrument cooldown (default 12 h) and cancel any pending
   orders. Use this when your setup is no longer valid (price drifted out of the
   expected range) and you want to be sure no entry fires while you sleep.

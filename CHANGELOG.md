@@ -39,6 +39,61 @@ cause.)
 **Tests.** Upstream `amend_order_body` unit tests (mode-3 with-TP, mode-2
 no-TP). Worker workspace green; clippy + fmt clean.
 
+## Unreleased — 2026-06-30 — news-windowed reversal-close: gate on the open window + non-terminal spine
+
+**Why.** A USD/CHF H1 H&S short (replay, `-dev` engine) had its whole plan
+**erased — zero entries** by `06-close-on-reversal`. Two stacked defects:
+
+1. **News-window gate leaked (engine).** The reversal-close is gated
+   `inside_window: ["news"]`, but the engine fired it on a qualifying *long*
+   reversal **9h after `news-end`** (2026-06-26 09:00, the window closed 00:00).
+   Root cause: the engine processed `news-start`/`news-end` control rules but
+   **discarded the open/closed state** — a news-only close was deliberately left
+   to "fire on the detector match alone (the worker's news-window KV gate decides
+   it)". In **replay** there is no such dispatch-time KV gate, so the permissive
+   fire went through unguarded; and even live, the engine had already retired the
+   spine before the worker's `run_close` could decline it.
+
+2. **A gated-off close still retired the spine (engine).** `evaluate_guards` set
+   `Phase::Done` on **every** guard fire. A news-windowed reversal-close is a
+   "flatten *if* in a position" safety, not a thesis invalidation — but it tore
+   the plan down (and starved every pending entry) even when it closed nothing
+   (`allow_close` blocks the flatten when flat).
+
+**What changed (engine — shared across the live worker cron and offline replay).**
+- **`PlanState::open_news_windows: BTreeSet<String>`** — the engine's pure mirror
+  of the worker's `news:<trade_id>:<news_id>` KV entries. `evaluate_controls`
+  inserts a `news_id` on a `NewsStart` fire and removes it on `NewsEnd`. Persisted
+  in the plan-state KV body, so it survives across cron ticks exactly like the
+  rest of the FSM state. `advanced_vs` now counts a window open/close as an
+  advance (so the recording trim doesn't drop the tick).
+- **`eval_pine_guard` gates the news close on an open window.** When the close
+  opted into `inside_window: ["news"]`, it may only fire while `open_news_windows`
+  is non-empty — mirroring `run_close`'s `list_news_windows_for_trade` check.
+  Outside the window → declined, spine untouched. (The price-window gate is
+  unchanged.)
+- **A news-windowed close is non-terminal for the spine** (`guard_is_terminal`).
+  It fires (dispatching the flatten, which the worker / replay `allow_close`
+  gates on the real position) but leaves the phase intact so pending entries
+  survive. A **price-windowed** close (reversal back at the SR band) stays
+  terminal — that *is* the thesis breaking.
+
+**Behaviour.** On the repro plan the spurious 09:00 close is gone; the plan stays
+in `AwaitEntry` past 09:00 and is retired the correct way (the `too-low`
+pcl-exhaustion veto at 06-26 22:00, price having run 80% to TP). A news close
+that *does* fire inside its window no longer starves pending entries.
+
+**Tests.** Engine: `news_close_does_not_fire_when_no_news_window_open`,
+`news_close_fires_while_a_news_window_is_open`,
+`news_close_does_not_fire_after_news_end_closed_the_window`,
+`news_close_is_non_terminal_for_the_spine`, `price_band_close_stays_terminal`;
+plus `PlanState` round-trip / `advanced_vs` coverage for the new field. 90 engine
++ 749 core tests green.
+
+**Follow-up.** The bug report's "expected two entries" wasn't realised — the
+`too-low` veto legitimately aborts the setup at 22:00 (the move completed 80% to
+TP without us). That's a *correct, separate* gate, not part of this fix.
+
 ## Unreleased — 2026-06-30 — strategy-v2 entry starvation + preps are life-of-trade (no TTL)
 
 **Why.** A plain iH&S where BCR enters and loses −1R came back as a spurious

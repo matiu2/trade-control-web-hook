@@ -362,7 +362,22 @@ fn evaluate_controls(
             push_fire(rule, candle, fired);
             state.fired.insert(rule.rule_id.clone());
             // No phase change: a pause/resume/news fire is state-only and never
-            // ends the setup.
+            // ends the setup. But a news-start/news-end fire *does* open/close a
+            // news window in `open_news_windows` — the pure mirror of the
+            // worker's `news:<trade_id>:<news_id>` KV entry that gates a
+            // news-only reversal-close. `news_id` is required on these intents
+            // (validated), so the `if let` only skips a malformed rule.
+            if let Some(news_id) = rule.intent.news_id.as_deref() {
+                match rule.intent.action {
+                    Action::NewsStart => {
+                        state.open_news_windows.insert(news_id.to_string());
+                    }
+                    Action::NewsEnd => {
+                        state.open_news_windows.remove(news_id);
+                    }
+                    _ => {}
+                }
+            }
         }
     }
 }
@@ -403,7 +418,15 @@ fn evaluate_guards(
         // guard trigger is the plain per-candle predicate.
         let signal = match &rule.trigger {
             Trigger::PinePattern { pattern, dir } => {
-                match eval_pine_guard(&rule.intent, candle, window, detector_cfg, *pattern, *dir) {
+                match eval_pine_guard(
+                    &rule.intent,
+                    candle,
+                    window,
+                    detector_cfg,
+                    *pattern,
+                    *dir,
+                    &state.open_news_windows,
+                ) {
                     Some(sig) => Some(sig),
                     None => continue,
                 }
@@ -417,11 +440,45 @@ fn evaluate_guards(
         };
         push_fire_signal(rule, candle, signal, fired);
         state.fired.insert(rule.rule_id.clone());
-        // Every veto guard is terminal for the plan's spine: the dispatched
-        // intent (cancel / close / invalidate) is the end of this setup.
-        state.phase = Phase::Done;
-        return;
+        // Most veto guards are terminal for the plan's spine: the dispatched
+        // intent (cancel / invalidate, or a price-windowed reversal-close at the
+        // SR band) is the end of this setup. A **news-windowed** reversal-close
+        // is the exception — it is a "flatten *if* in a position" safety, not a
+        // thesis invalidation. The engine can't see whether a position is open
+        // (no broker), and the worker's / replay's `allow_close` gate blocks the
+        // flatten when flat. So a news-close that fires before any entry filled
+        // must NOT retire the spine, or it starves every pending entry even
+        // though it closed nothing (USD/CHF 2026-06-26 Defect B). It still
+        // dispatches the flatten; the spine survives so pending entries proceed.
+        if guard_is_terminal(&rule.intent) {
+            state.phase = Phase::Done;
+            return;
+        }
+        // Non-terminal guard fired (news-close): keep scanning later rules this
+        // bar, but it has latched so it won't re-fire.
     }
+}
+
+/// Whether a fired guard retires the plan's spine. All guards are terminal
+/// **except** a news-windowed reversal-close — see the call site in
+/// [`evaluate_guards`] for why (it's a flatten-if-open safety, not a thesis
+/// invalidation, and the engine has no broker to know whether anything was
+/// flattened). A close that also opts into the price window stays terminal (a
+/// reversal back at the SR band *does* invalidate the thesis).
+fn guard_is_terminal(intent: &trade_control_core::intent::Intent) -> bool {
+    if intent.action != Action::Close {
+        return true;
+    }
+    let wants_news = intent
+        .inside_window
+        .contains(&trade_control_core::intent::EventWindow::News);
+    let wants_price = intent
+        .inside_window
+        .contains(&trade_control_core::intent::EventWindow::Price)
+        || intent.require_price_in_ranges.is_some();
+    // News-only close → non-terminal. A close with a price window (with or
+    // without news) is terminal: the at-band reversal is the thesis breaking.
+    !wants_news || wants_price
 }
 
 /// Evaluate the break-and-close prep. On fire it latches, records the lookback
@@ -702,19 +759,29 @@ fn eval_pine_entry(
 /// trade — a long reversal closes a short), and (when set) the kind matches.
 ///
 /// On top of the detector match it applies the **pure half** of the worker's
-/// `run_close` contextual gate: when the intent's `inside_window` lists `price`,
-/// the reversal candle's close must sit inside one of the intent's `sr_bands`.
-/// This is what makes the engine fire a *real* reversal-close (price back at the
-/// SR band) rather than any opposite-direction pattern anywhere on the chart —
-/// matching live, where `run_close` rejects a close whose broker price is out of
-/// every band. The **news-window** half of the gate is KV state the worker owns
-/// at dispatch, so it stays there; the engine only resolves the recomputable
-/// price gate. (When the worker dispatches this fire it re-runs the full gate
-/// against the live broker price, so a fire the price gate let through here can
-/// still be declined there — the engine is permissive-but-aligned, never
-/// stricter than live.)
+/// `run_close` contextual gate, mirroring **both** windows `run_close` checks:
+///
+///   - **Price window** (`inside_window` lists `price`): the reversal candle's
+///     close must sit inside one of the intent's `sr_bands`. Matches live, where
+///     `run_close` rejects a close whose broker price is out of every band.
+///   - **News window** (`inside_window` lists `news`): a news window must be
+///     **currently open** — i.e. `open_news_windows` is non-empty. This mirrors
+///     `run_close`'s `list_news_windows_for_trade` check against the
+///     `news:<trade_id>:<news_id>` KV the worker's `news-start`/`news-end`
+///     control fires maintain. The engine keeps the same window state in
+///     `PlanState::open_news_windows` (opened on a `NewsStart` fire, closed on
+///     `NewsEnd`), so it gates identically to live. **Without this the engine
+///     fired the close on *any* qualifying reversal anywhere on the chart**,
+///     including hours after `news-end` (USD/CHF 2026-06-26: a long reversal 9h
+///     past the GDP window erased two legitimate short entries by retiring the
+///     spine).
+///
+/// (When the worker dispatches this fire it re-runs the full gate against live
+/// state, so a fire let through here can still be declined there — the engine is
+/// permissive-but-aligned, never stricter than live.)
 ///
 /// Returns the latched signal to ride onto the shell, or `None` to not fire.
+#[allow(clippy::too_many_arguments)]
 fn eval_pine_guard(
     intent: &trade_control_core::intent::Intent,
     candle: &Candle,
@@ -722,7 +789,24 @@ fn eval_pine_guard(
     cfg: &DetectorConfig,
     pattern: Option<SignalKind>,
     dir: Direction,
+    open_news_windows: &std::collections::BTreeSet<String>,
 ) -> Option<LatchedSignal> {
+    // News-window gate (the engine's mirror of `run_close`'s
+    // `list_news_windows_for_trade`). When the close opted into the news window,
+    // it may only fire while at least one news window is open. Checked *before*
+    // the detector so a reversal printing outside the window is silently
+    // skipped, leaving the spine intact.
+    let wants_news = intent
+        .inside_window
+        .contains(&trade_control_core::intent::EventWindow::News);
+    if wants_news && open_news_windows.is_empty() {
+        tracing::debug!(
+            bar = %candle.time,
+            "pine-close: news-only close but no news window open — decline (spine survives)"
+        );
+        return None;
+    }
+
     // The detector match is shared with the entry path (direction / kind /
     // fires), so a close and an enter can't drift on what "a reversal printed"
     // means. `eval_pine_entry` logs under the `pine-enter` tag; the extra
@@ -2858,6 +2942,39 @@ mod tests {
         }
     }
 
+    /// A news-windowed `06-close-on-reversal` guard: `inside_window: ["news"]`,
+    /// no price band. This is the real shape `build_trade` emits for the safety
+    /// flatten; it only fires while a news window is open and is non-terminal
+    /// for the spine (Defect A + B fixtures).
+    fn news_close_on_reversal_rule(dir: Direction) -> ConditionRule {
+        let mut intent = intent(Action::Close);
+        intent.inside_window = vec![trade_control_core::intent::EventWindow::News];
+        intent.trade_id = Some("tid".into());
+        ConditionRule {
+            rule_id: "06-close-on-reversal".into(),
+            trigger: Trigger::PinePattern { pattern: None, dir },
+            fire_mode: FireMode::Once,
+            intent,
+        }
+    }
+
+    /// A `news-start` / `news-end` control rule firing at `at` (a `TimeReached`
+    /// trigger), carrying `news_id` so the engine opens / closes the window in
+    /// `open_news_windows`.
+    fn news_control_rule(rule_id: &str, action: Action, news_id: &str, at: &str) -> ConditionRule {
+        let mut intent = intent(action);
+        intent.trade_id = Some("tid".into());
+        intent.news_id = Some(news_id.into());
+        ConditionRule {
+            rule_id: rule_id.into(),
+            trigger: Trigger::TimeReached {
+                at_epoch: ts(at).timestamp(),
+            },
+            fire_mode: FireMode::Once,
+            intent,
+        }
+    }
+
     #[test]
     fn close_on_reversal_fires_on_a_long_reversal_in_the_band() {
         // THE bug: a SHORT trade's `06-close-on-reversal` is a PinePattern{Long}
@@ -2905,17 +3022,159 @@ mod tests {
     }
 
     #[test]
-    fn close_on_reversal_without_price_window_fires_on_detector_alone() {
-        // A news-only-shaped close (no `price` in inside_window, no sr_bands) has
-        // no recomputable price gate here, so the detector match alone fires it
-        // (the worker's news-window KV gate is what gates it at dispatch).
+    fn close_on_reversal_with_no_window_at_all_fires_on_detector_alone() {
+        // A close with NO contextual window (empty `inside_window`, no sr_bands)
+        // has neither a price nor a news gate here, so the detector match alone
+        // fires it. (This is the degenerate "ungated" shape; the real news close
+        // carries `inside_window: ["news"]` and is gated — see the news tests.)
         let p = plan(vec![close_on_reversal_rule(Direction::Long, None)]);
         let window = bullish_pinbar_window();
         let prior = seed_at(Phase::AwaitEntry, "2026-06-16T10:00:00Z");
         let eval = run_window(&p, &prior, &window[3..], &window);
-        assert_eq!(eval.fired.len(), 1, "no price gate → detector match fires");
+        assert_eq!(eval.fired.len(), 1, "no gate → detector match fires");
         assert_eq!(eval.fired[0].rule_id, "06-close-on-reversal");
         assert!(eval.done);
+    }
+
+    // ===== Defect A: news-windowed close only fires inside an open window =====
+
+    #[test]
+    fn news_close_does_not_fire_when_no_news_window_open() {
+        // THE USD/CHF 2026-06-26 bug: a news-only close (`inside_window:["news"]`)
+        // saw a qualifying long reversal 9h after `news-end` and fired, retiring
+        // the spine and erasing two legitimate short entries. With the news gate,
+        // a reversal printing while NO window is open must NOT fire, and the spine
+        // must survive in AwaitEntry.
+        let p = plan(vec![news_close_on_reversal_rule(Direction::Long)]);
+        let window = bullish_pinbar_window();
+        let prior = seed_at(Phase::AwaitEntry, "2026-06-16T10:00:00Z");
+        let eval = run_window(&p, &prior, &window[3..], &window);
+        assert!(
+            eval.fired.is_empty(),
+            "a news close must not fire outside an open news window"
+        );
+        assert!(
+            !eval.done,
+            "the spine must survive — pending entries proceed"
+        );
+        assert_eq!(eval.new_state.phase, Phase::AwaitEntry);
+    }
+
+    #[test]
+    fn news_close_fires_while_a_news_window_is_open() {
+        // Same reversal, but a news-start opened a window earlier and no news-end
+        // has closed it yet → the close fires (the engine mirrors run_close's
+        // active-window check). It is non-terminal (Defect B), so it dispatches
+        // the flatten but the spine stays alive.
+        let p = plan(vec![
+            news_control_rule(
+                "news-start-1",
+                Action::NewsStart,
+                "gdp",
+                "2026-06-16T09:00:00Z",
+            ),
+            news_close_on_reversal_rule(Direction::Long),
+        ]);
+        let window = bullish_pinbar_window();
+        let prior = seed_at(Phase::AwaitEntry, "2026-06-16T08:30:00Z");
+        // Feed the window from the news-start bar onward so the control fires
+        // before the reversal bar.
+        let eval = run_window(&p, &prior, &window[1..], &window);
+        let ids: Vec<&str> = eval.fired.iter().map(|f| f.rule_id.as_str()).collect();
+        assert!(ids.contains(&"news-start-1"), "the news window opens");
+        assert!(
+            ids.contains(&"06-close-on-reversal"),
+            "the close fires inside the open window: {ids:?}"
+        );
+        assert!(
+            eval.new_state.open_news_windows.contains("gdp"),
+            "the window stays open (no news-end fired)"
+        );
+    }
+
+    #[test]
+    fn news_close_does_not_fire_after_news_end_closed_the_window() {
+        // news-start then news-end before the reversal → the window is closed by
+        // the time the reversal prints → no fire (the exact 9h-late case). The
+        // close-on-reversal stays unfired and the spine survives.
+        let p = plan(vec![
+            news_control_rule(
+                "news-start-1",
+                Action::NewsStart,
+                "gdp",
+                "2026-06-16T09:00:00Z",
+            ),
+            news_control_rule("news-end-1", Action::NewsEnd, "gdp", "2026-06-16T10:00:00Z"),
+            news_close_on_reversal_rule(Direction::Long),
+        ]);
+        let window = bullish_pinbar_window();
+        let prior = seed_at(Phase::AwaitEntry, "2026-06-16T08:30:00Z");
+        let eval = run_window(&p, &prior, &window[1..], &window);
+        let ids: Vec<&str> = eval.fired.iter().map(|f| f.rule_id.as_str()).collect();
+        assert!(ids.contains(&"news-start-1") && ids.contains(&"news-end-1"));
+        assert!(
+            !ids.contains(&"06-close-on-reversal"),
+            "the close must not fire once the window closed: {ids:?}"
+        );
+        assert!(
+            eval.new_state.open_news_windows.is_empty(),
+            "news-end emptied the open-window set"
+        );
+        assert!(
+            !eval.done,
+            "spine survives a window that closed without a close"
+        );
+    }
+
+    // ===== Defect B: a news-windowed close is non-terminal for the spine =====
+
+    #[test]
+    fn news_close_is_non_terminal_for_the_spine() {
+        // A news close that DOES fire (inside its window) must not retire the
+        // spine — it's a flatten-if-open safety, not a thesis invalidation. The
+        // worker / replay `allow_close` gate decides whether anything flattens;
+        // the engine keeps pending entries alive regardless.
+        let p = plan(vec![
+            news_control_rule(
+                "news-start-1",
+                Action::NewsStart,
+                "gdp",
+                "2026-06-16T09:00:00Z",
+            ),
+            news_close_on_reversal_rule(Direction::Long),
+        ]);
+        let window = bullish_pinbar_window();
+        let prior = seed_at(Phase::AwaitEntry, "2026-06-16T08:30:00Z");
+        let eval = run_window(&p, &prior, &window[1..], &window);
+        assert!(
+            eval.fired
+                .iter()
+                .any(|f| f.rule_id == "06-close-on-reversal"),
+            "the news close fired"
+        );
+        assert!(
+            !eval.done,
+            "a news close is non-terminal — the spine survives for pending entries"
+        );
+        assert_eq!(eval.new_state.phase, Phase::AwaitEntry);
+    }
+
+    #[test]
+    fn price_band_close_stays_terminal() {
+        // Contrast: a price-windowed close at the SR band IS a thesis
+        // invalidation and must still retire the plan (unchanged behaviour).
+        let p = plan(vec![close_on_reversal_rule(
+            Direction::Long,
+            Some([1.15, 1.20]),
+        )]);
+        let window = bullish_pinbar_window();
+        let prior = seed_at(Phase::AwaitEntry, "2026-06-16T10:00:00Z");
+        let eval = run_window(&p, &prior, &window[3..], &window);
+        assert!(
+            eval.done,
+            "a price-band reversal-close still retires the plan"
+        );
+        assert_eq!(eval.new_state.phase, Phase::Done);
     }
 
     #[test]
