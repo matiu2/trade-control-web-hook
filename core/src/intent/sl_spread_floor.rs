@@ -289,6 +289,44 @@ mod tests {
     }
 
     #[test]
+    fn verdict_is_invariant_to_pip_size() {
+        // The floor is a pure ratio of two raw-price distances, so it must NOT
+        // depend on any instrument's `pip_size`. Neither the violation check nor
+        // the widen helper takes a `pip_size` argument — this test documents
+        // that property by computing the same geometry as if it came from two
+        // instruments with wildly different pip scales (an FX-like 0.0001 pip
+        // and a metal-like 0.00001 pip) and asserting identical verdicts.
+        //
+        // XAGUSD-style: tick 0.00001, spread ~10 ticks = 0.0001.
+        // WHEATUSD-style: tick 0.001, spread ~10 ticks = 0.010.
+        // Both have an SL distance of exactly 8× their spread → both violate.
+        let xag_spread = 0.0001;
+        let wheat_spread = 0.010;
+        assert!(sl_spread_floor_violation(8.0 * xag_spread, xag_spread));
+        assert!(sl_spread_floor_violation(8.0 * wheat_spread, wheat_spread));
+
+        // And the widen helper resolves the same SlWiden *shape* for matching
+        // ratios regardless of absolute price scale: both have a 5× SL and a
+        // 30× TP, so both widen to 11× and clear R = 30/11 ≈ 2.7.
+        let xag = widen_sl_to_spread_floor(
+            1.0000,
+            1.0000 - 5.0 * xag_spread,
+            1.0000 + 30.0 * xag_spread,
+            xag_spread,
+            1.0,
+        );
+        let wheat = widen_sl_to_spread_floor(
+            5.0000,
+            5.0000 - 5.0 * wheat_spread,
+            5.0000 + 30.0 * wheat_spread,
+            wheat_spread,
+            1.0,
+        );
+        assert!(matches!(xag, SlWiden::Widened { .. }), "{xag:?}");
+        assert!(matches!(wheat, SlWiden::Widened { .. }), "{wheat:?}");
+    }
+
+    #[test]
     fn wheat_short_salvaged() {
         // From the operator's wheat replay (2026-06-23): SHORT stop @ 5.9538,
         // SL 5.9882 (distance 0.0344), TP 5.7657. Rejected as sl-below-10x

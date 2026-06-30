@@ -605,11 +605,12 @@ pub async fn run_enter<B: Broker, S: StateStore>(
             let spread_price = quote.spread();
             let entry_price = entry_reference_price(&resolved.entry);
             let sl_distance = (entry_price - resolved.stop_loss).abs();
-            // Render distances in pips for any operator-facing message.
-            // `pip_size` is the baked intent value (or the secret/default
-            // fallback); guard against a non-positive divisor so a bad pip
-            // never produces a NaN/inf in a message body.
-            let to_pips = |d: f64| if pip_size > 0.0 { d / pip_size } else { d };
+            // Operator-facing messages render distances in **raw price**, the
+            // same unit the broker quotes in. The floor is a pure ratio of two
+            // price distances (`sl_distance` vs `spread`), so the rule — and
+            // its log — must not depend on `pip_size`: a wrong catalog pip
+            // would make a correct decision *read* wrong. (See the SL-floor
+            // spec; pip rendering was removed here for exactly this reason.)
 
             // SALVAGE-BY-WIDENING: rather than reject a too-tight stop outright,
             // try widening the SL to `SL_WIDEN_SPREAD_MULTIPLE`× the spread and
@@ -636,13 +637,10 @@ pub async fn run_enter<B: Broker, S: StateStore>(
                     new_r,
                 } => {
                     tracing::info!(
-                        "sl-spread-floor: widened SL {old_sl} -> {new_stop_loss} for {} (sl_distance {old_pips:.1} -> {new_pips:.1} pips, spread {spread_pips:.1} pips, {mult:.0}x floor; R now {new_r:.2} >= min_r {min_r:.2}) (id={})",
+                        "sl-spread-floor: widened SL {old_sl} -> {new_stop_loss} for {} (sl_distance {sl_distance} -> {new_sl_distance}, spread {spread_price}, {mult:.0}x floor; R now {new_r:.2} >= min_r {min_r:.2}) (id={})",
                         resolved.instrument,
                         verified.intent.id,
                         old_sl = resolved.stop_loss,
-                        old_pips = to_pips(sl_distance),
-                        new_pips = to_pips(new_sl_distance),
-                        spread_pips = to_pips(spread_price),
                         mult = crate::intent::SL_WIDEN_SPREAD_MULTIPLE,
                         min_r = resolved.min_r,
                     );
@@ -654,15 +652,13 @@ pub async fn run_enter<B: Broker, S: StateStore>(
                     min_r,
                 } => {
                     let message = format!(
-                        "entry blocked: SL too close to spread and widening to {mult:.0}x spread ({widened_pips:.1} pips) would drop R to {r_at_widen:.2} < min_r {min_r:.2}",
+                        "entry blocked: SL too close to spread and widening to {mult:.0}x spread (sl_distance {widened_sl_distance}, spread {spread_price}) would drop R to {r_at_widen:.2} < min_r {min_r:.2}",
                         mult = crate::intent::SL_WIDEN_SPREAD_MULTIPLE,
-                        widened_pips = to_pips(widened_sl_distance),
                     );
                     tracing::info!(
-                        "entry rejected: sl-widen-below-min-r instrument={} spread={spread_price} widened_sl_distance={widened_sl_distance} ({widened_pips:.1} pips) r_at_widen={r_at_widen:.3} < min_r={min_r} (id={})",
+                        "entry rejected: sl-widen-below-min-r instrument={} spread={spread_price} widened_sl_distance={widened_sl_distance} r_at_widen={r_at_widen:.3} < min_r={min_r} (id={})",
                         resolved.instrument,
                         verified.intent.id,
-                        widened_pips = to_pips(widened_sl_distance),
                     );
                     return ActionResult::Rejected {
                         status: 422,
