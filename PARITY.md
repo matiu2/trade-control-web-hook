@@ -39,28 +39,32 @@ The `Broker` trait (`core/src/broker.rs`) has these methods: `place_entry`,
 `ReplayBroker` differs from the real brokers is either faithful to the states the
 shared decision code branches on, or is a method the replay deliberately does not
 exercise (so its stub can't change a decision). The two quote-based entry gates
-(`spread-blackout`, `SL-spread-floor`) can't be *modelled* offline — but they
-**fail open** in both the replay and the live worker, so the replay never
-predicts a fill the live worker would reject *via those gates*. The single
-residual gap is explicitly a "can't reproduce", not a "predicts wrongly":
+(`spread-blackout`, `SL-spread-floor`) **are now reproduced offline**:
+`ReplayBroker::get_quote` synthesizes a two-sided `Quote` from the fire bar's
+bid/ask close (`bid_c`/`ask_c`), so a sustained wide spread in the candle data
+drives the same 423/422 rejection the live worker makes. The residual gap is now
+only the sub-bar timing edge:
 
-> The replay cannot reproduce a **live spread-blackout / SL-spread-floor
-> rejection that happened because a real quote was available and was wide**. In
-> that one situation the live worker would 423/422-reject the entry; the replay,
-> getting `Err(Transient)` from `ReplayBroker::get_quote`, fails open and
-> proceeds. This is a **conservative-for-the-strategy / optimistic-for-fills**
-> asymmetry: the replay may *fill a trade the live worker would have blocked on a
-> wide live spread*. It is bounded — it only bites inside the post-NY-close
-> spread-blackout window (System 1) or when a stop sits within 10× the live
-> spread — and it is a known, documented limitation of offline replay, not a
-> latent bug in the shared decision path. See the `get_quote` row for the full
-> argument and why it is acceptable.
+> The replay reproduces a spread-blackout / SL-spread-floor rejection whenever
+> the **fire bar's** bid/ask close is wide. What it cannot see is a spread that
+> **spikes intrabar and retraces by the bar close** — the live worker, sampling
+> at the instant of fire, could catch that spike and reject; the replay, reading
+> the closed bar's book, would not. This residual is **smallest exactly where the
+> gate matters most**: the spread-blackout window targets the sustained
+> post-NY-close liquidity trough, where spreads stay wide across whole bars, not
+> single-tick spikes. On **TradeNation** the gap is essentially nil — the live
+> `get_quote` is *itself* the last 1m bid/ask candle close, so the replay's
+> bar-close sample is the same kind of figure, only at the replay candle's
+> granularity. On **OANDA** the live quote is a true tick, so the replay's
+> bar-close sample is a genuine (but bounded) approximation. See the `get_quote`
+> row for the full argument.
 
 No `⚠️ Known unsound divergence` was found (a true unsoundness would be: the
 replay predicting a **fill or a pass the live worker would not give**, or
 **rejecting something the live worker would fill**, *outside* an already-fail-open
-gate). The quote gap is the opposite of optimistic-rejection and is gated by a
-window/condition; it is called out so it is not mistaken for parity.
+gate). The sub-bar-spike residual is a fidelity ceiling of candle-based replay
+(the same ceiling the fill simulator has), not a seam-specific unsoundness; it is
+called out so it is not mistaken for full tick parity.
 
 ---
 
@@ -71,7 +75,7 @@ window/condition; it is called out so it is not mistaken for parity.
 | **place_entry** | Does **not** POST. Consumes an out-of-band "armed" placement (`arm_placement`: intent + shell + the order id to return), records a `PlacedAttempt`, and returns that armed order id. No-arm → `Err(OrderRejected)` (wiring bug, fails loud). | POSTs a stop/limit/market order with attached SL/TP, runs the full risk-gate + sizing path (equity, FX, units), returns the broker order id. OANDA: `order_create_transaction.id`. TN: upstream order id (or `dry-run-<inst>`). | Replay records the attempt instead of placing; no sizing/risk-cap math runs offline. | **Sound.** The retry gate is shared, so its *expectations* are identical regardless of broker. What it needs from `place_entry` is (a) a returned order id that (b) `run_enter` stamps onto the `EntryAttempt` row and (c) a later `lookup_attempt_state` can correlate. ReplayBroker satisfies all three: the armed id is the standard `{intent.id}-{attempt_no}` shape `run_enter` would use, it's recorded keyed by that id, and `lookup_attempt_state` finds it by that id. The risk-cap/sizing math that only the real broker runs is broker-internal sizing, not a *dispatch decision* — the shared gates (RR floor, SL-spread floor) run before `place_entry` in shared code and are identical. The fill itself is modelled separately (see **fills**). |
 | **lookup_attempt_state** | Re-simulates the recorded attempt with `simulate_fill` over the candle prefix up to the gate's `as_of` bar, then maps `SimOutcome` → `AttemptState`: `NeverFilled` → `Pending`; `FilledOpen` → `OpenPosition`; `StoppedOut` → `ClosedLossOrBreakeven`; `TookProfit` → `ClosedWin`; `Declined`/`SpreadBlackout`/`Unresolved` → `Cancelled`; `attempt.cancelled` short-circuits to `Cancelled`. Unknown id → `Unknown`. | Queries live broker state via the shared four-step algorithm: pending order → `Pending`; open trade matched by originating order id → `OpenPosition`; closed trade by snapshotted trade id → `ClosedWin`/`ClosedLossOrBreakeven`; else `Cancelled`/`Unknown`. Transient failure → `Err(Transient)`. | Replay derives state from the candle path; real brokers read it from the venue. | **Sound and faithful to the branched-on states.** The retry gate (`core::retry_gate`, shared) branches on exactly the `AttemptState` variants the replay produces. The mapping is faithful: a resting-not-yet-filled order is `Pending` (so a sibling enter cancel-and-replaces it, as live), a filled-still-open order is `OpenPosition` (so a fresh enter is rejected `trade-already-open`, as live), a closed leg is `Closed*` (so re-entry is allowed, as live). The `as_of` bounding makes the open→closed transition *time-accurate* (test `open_then_closed_as_the_asof_bar_advances`). It never returns `Err(Transient)` — so the replay never exercises the gate's "reject this fire, retry next" transient branch, which is the conservative direction (a live transient would *reject*; the replay instead resolves a definite state, never fabricating an extra fill). |
 | **fills** (not a trait method; `place_entry` does not fill) | `simulate_fill` (engine) walks the bid/ask candle path separately: a stop/limit fills only once price crosses on the correct book side, **skipping the fire bar** (a resting order isn't live until its bar closes), then SL/TP are detected on the bid (long exit) / ask (short exit). | The venue fills server-side at the live touch, with real slippage, partials, gaps, and weekend handling. | Replay models fills from closed-bar OHLC bid/ask; the venue fills tick-by-tick. | **Sound — deliberate offline stand-in, conservative on the fire bar.** The bid/ask price-path model is the explicit offline substitute for a server-side fill. It is *conservative* about same-bar fills (skips the fire bar; an earlier fix corrected a 1-bar-early fill). It cannot see intrabar tick ordering, so a bar that touches both SL and TP is resolved by the engine's documented ambiguity rule, not by replay choice. This is a known fidelity ceiling of any candle-based simulation, not a seam-specific unsoundness; it is the same model every backtest in this repo uses. |
-| **get_quote** | Always `Err(LookupError::Transient)`. | Returns a live two-sided `Quote`. OANDA: pricing endpoint best bid/ask. TN: resolve market → `latest_bid_ask` (last 1m bid/ask close). Transient failure → `Err(Transient)`. | Replay has no live quote, so it always errors. | **Sound, with one documented can't-reproduce.** Both quote consumers in `core/src/dispatch/enter.rs` **fail open on a quote error**: the spread-blackout gate (only sampled inside an open blackout window) and the SL-vs-spread floor (sampled every entry). On `Err`, both log and *allow* the entry. So a live worker whose quote *also* failed would make the identical decision (proceed). The replay matches that. The **one** case the replay cannot reproduce: a live worker where a real quote *was* available and *was* wide — there the live worker 423/422-rejects, the replay fails open and fills. This is optimistic-for-fills (replay may fill a trade a wide live spread would have blocked) but it is **bounded** (only in the post-NY-close blackout window, or when SL < 10× live spread) and is an inherent limit of having no live order book offline — not a defect in the shared gate, which is byte-identical on both edges. `get_current_price` (the default over `get_quote`) likewise errors in replay; its only caller is the too-close fallback, which the replay never reaches (see `place_entry`). |
+| **get_quote** | Synthesizes a two-sided `Quote { bid: c.bid_c, ask: c.ask_c }` from the candle at/just-before the `as_of` bar (the fire bar the replay loop pinned via `set_as_of` before dispatching). No candle before `as_of` → `Err(Transient)` (fails open, as live on a quote hiccup). | Returns a live two-sided `Quote`. OANDA: pricing endpoint best bid/ask (true tick). TN: resolve market → `latest_bid_ask` (last 1m bid/ask close). Transient failure → `Err(Transient)`. | Replay reads the fire bar's closed-bar book; live reads a tick (OANDA) or the last-1m-close (TN). | **Sound — reproduces the common case, with a bounded sub-bar residual.** Both quote consumers in `core/src/dispatch/enter.rs` sample `quote.spread()`: the spread-blackout gate (only inside an open blackout window) and the SL-vs-spread floor (every entry). The replay now feeds them the **fire bar's real bid/ask close**, so a sustained wide spread in the candle data drives the *same* 423/422 rejection the live worker makes — the gate is byte-identical and now gets a real spread on both edges. **TradeNation parity is essentially exact** because the live `get_quote` is itself the last 1m bid/ask close, the same kind of figure. **OANDA** samples a true tick, so the replay's bar-close spread is a faithful proxy for sustained-wide windows but **cannot reproduce a spread that spikes intrabar and retraces by the close** — that single sub-bar case is the only residual, and it is the fill simulator's existing closed-bar ceiling, not a new seam gap. Both gates still **fail open** on `Err` (no candle before `as_of`), matching the live fail-open on a quote-endpoint hiccup. `get_current_price` (the default over `get_quote`) now likewise returns the bar mid; its only caller is the too-close fallback, which the replay never reaches (see `place_entry`). |
 | **close_positions** | No-op, returns `false` (nothing closed). | Closes all positions for the instrument; returns whether anything closed. OANDA: `close_position`. TN: upstream `close_positions`. | Replay doesn't actually close. | **Sound — not the seam the replay validates.** The replay characterises *entry/re-entry* decisions. Closes/reversals are applied by the engine's report post-pass (`report::apply_reversal_close` / `FillKind::ClosedOnReversal`) over the simulated path, not by a broker round-trip, so the broker's `close_positions` return is not consumed by any replay decision. A live close's effect (position gone) is modelled in the simulated path's exit, not here. |
 | **cancel_pending_for_instrument** | No-op, returns `0`. | Cancels all pending orders on the instrument; returns the count. OANDA: list pending, cancel each matching. TN: upstream. | Replay reports zero cancelled. | **Sound — only the M/W-cancel and invalidate paths call it.** In `run_enter` the M/W "validity floor breached" path calls it; the replay's M/W cancel still writes the `mw-cancel` veto (shared) which is what actually blocks the next enter. The return count is logged, not branched on. The per-order supersede cancel the retry gate uses goes through `cancel_order` (below), which the replay *does* honour. |
 | **cancel_order** | Marks the matching `PlacedAttempt.cancelled = true`; a later `resolve`/`lookup_attempt_state` then returns `Cancelled` regardless of price path. | Cancels one pending order by id; maps any failure to `CancelError::Transient` ("probably filled, re-lookup"). | Replay sets a flag instead of hitting the venue, and never returns `Transient`. | **Sound and faithful.** This is the retry gate's cancel-and-replace path: when a sibling enter supersedes a still-resting prior order, the gate cancels it, then places the replacement. ReplayBroker's flag makes the superseded attempt resolve to `Cancelled` on the next lookup — exactly the live post-cancel state the gate expects (the order is gone, the slot is free). Test `cancelled_order_resolves_cancelled` pins it. Not returning `Transient` is conservative: a live transient cancel would make the gate re-lookup (and possibly find a fill); the replay instead deterministically treats it cancelled, which can never *create* an extra fill. |
@@ -84,13 +88,17 @@ window/condition; it is called out so it is not mistaken for parity.
 
 ## Notes for a future refactorer
 
-- **Do not "fix" `ReplayBroker::get_quote` to return a synthetic quote** unless
-  you also feed it a live spread series. A fabricated tight quote would make the
-  replay *under*-reject (still fails open the same way); a fabricated wide quote
-  would make it reject trades the live worker (whose quote may have been fine)
-  would fill — turning a documented can't-reproduce into a genuine false
-  rejection. The current "always fail open, same as the live worker on a quote
-  error" is the conservative choice.
+- **`ReplayBroker::get_quote` synthesizes the quote from the fire bar's real
+  bid/ask close** (`bid_c`/`ask_c` at the `as_of` bar) — it is *not* a fabricated
+  figure, it is the actual book the candle data carries. Keep it reading
+  `bid_c`/`ask_c` of the `as_of` candle, not a mid ± a fudge factor: a fabricated
+  spread would make the replay reject (or pass) trades the live worker wouldn't,
+  which is exactly the false divergence to avoid. Sampling the real closed-bar
+  book is faithful for sustained-wide windows (the spread-blackout target) and on
+  TradeNation is the same mechanism the live broker uses. The only thing it
+  can't see is an intrabar spike that retraces by the close — that is the fill
+  simulator's existing candle-resolution ceiling, not something to "fix" with a
+  synthetic wider quote.
 - **Do not return `LookupError::Transient` from `lookup_attempt_state` in the
   replay.** It would inject the gate's transient-reject branch into an offline
   run that has a definite, derivable state — making re-entry counts diverge from
