@@ -15,6 +15,10 @@ path = "src/main.rs"
 name = "trade-control-accounts"
 path = "src/bin/accounts.rs"
 
+[[bin]]
+name = "trade-control-broker-check"
+path = "src/bin/broker_check.rs"
+
 [dependencies]
 axum = { version = "0.8.9", default-features = false, features = ["http1", "tokio", "json", "query"] }
 broker-oanda = { version = "0.1.0", path = "../broker-oanda" }
