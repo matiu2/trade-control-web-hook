@@ -1182,9 +1182,18 @@ fn level_crossed(
     prev_close: Option<f64>,
 ) -> bool {
     match bar {
-        // Intrabar: the bar's full range straddles the level; direction is read
-        // from where the close sits relative to it (the wick touched the level
-        // and the bar resolved on the firing side).
+        // Intrabar: the bar's range crosses the level *within the bar*, read
+        // from the wick on the cross side — NOT the close. On a tick timeline a
+        // bar that opened on one side of the level and traded through to the
+        // other genuinely crossed, even if it closed back on the original side
+        // (a retest tap, an invalidation spike-and-recover). Direction is the
+        // side the bar *came from* (its open) reaching *through* to the wick:
+        //   Down  ⇒ opened at/above and the low reached at/below  (came down through)
+        //   Up    ⇒ opened at/below and the high reached at/above  (came up through)
+        //   Either⇒ any straddle (the wick touched the level at all)
+        // (Close-confirmed crossing is `BarEvent::OnClose` — break-and-close —
+        // which must open one side and *close* the other; that arm is below and
+        // is deliberately unchanged.)
         BarEvent::Intrabar => {
             let straddles = candle.l <= level && level <= candle.h;
             if !straddles {
@@ -1192,8 +1201,8 @@ fn level_crossed(
             }
             match dir {
                 CrossDir::Either => true,
-                CrossDir::Up => candle.c >= level,
-                CrossDir::Down => candle.c <= level,
+                CrossDir::Up => candle.o <= level && candle.h >= level,
+                CrossDir::Down => candle.o >= level && candle.l <= level,
             }
         }
         // OnClose: a cross relative to the prior processed close. The seed bar
@@ -1574,28 +1583,66 @@ mod tests {
     }
 
     #[test]
-    fn intrabar_fires_when_range_straddles_and_close_on_firing_side() {
+    fn intrabar_fires_when_bar_crosses_from_its_open_side() {
+        // Intrabar direction is read from the wick on the cross side, NOT the
+        // close: an Up cross is "opened at/below the level and the high reached
+        // at/above it" — the bar came up *through* the level. Where it closes is
+        // irrelevant (that's `OnClose`, tested separately).
         let t = Trigger::HorizontalCross {
             level: 1.2000,
             dir: CrossDir::Up,
             bar: BarEvent::Intrabar,
         };
-        // Range straddles, close above → up fires.
+        // Opened below, high pushed above, closed above → up fires.
         assert!(et(
             &t,
             &candle("2026-06-16T12:00:00Z", 1.19, 1.21, 1.19, 1.2050),
             None
         ));
-        // Range straddles but close below the level → up does NOT fire.
+        // Opened below, high pushed above, then closed *back below* the level →
+        // still an up-cross (the wick crossed). The OLD close-confirmed rule
+        // wrongly rejected this; the new wick rule fires it.
+        assert!(et(
+            &t,
+            &candle("2026-06-16T12:00:00Z", 1.19, 1.21, 1.19, 1.1950),
+            None
+        ));
+        // Opened *above* the level (came from above, didn't cross up into it) —
+        // its low dips below but that's a down-move, not an up-cross → no fire.
         assert!(!et(
             &t,
             &candle("2026-06-16T12:00:00Z", 1.21, 1.21, 1.19, 1.1950),
             None
         ));
-        // Range doesn't reach the level → no fire.
+        // Range never reaches the level → no straddle, no fire.
         assert!(!et(
             &t,
             &candle("2026-06-16T12:00:00Z", 1.18, 1.195, 1.18, 1.19),
+            None
+        ));
+    }
+
+    /// The mirror: a Down intrabar cross is "opened at/above the level and the
+    /// low reached at/below it", close-agnostic — the AUD/JPY 6pm retest shape.
+    #[test]
+    fn intrabar_down_fires_on_open_above_low_below_regardless_of_close() {
+        let t = Trigger::HorizontalCross {
+            level: 1.2000,
+            dir: CrossDir::Down,
+            bar: BarEvent::Intrabar,
+        };
+        // Opened above, low dipped below, closed back above → down fires (the
+        // wick crossed). This is the bug the fix targets.
+        assert!(et(
+            &t,
+            &candle("2026-06-16T12:00:00Z", 1.21, 1.21, 1.19, 1.2050),
+            None
+        ));
+        // Opened *below* the level (came from below) — high pokes above but
+        // that's an up-move, not a down-cross → no fire.
+        assert!(!et(
+            &t,
+            &candle("2026-06-16T12:00:00Z", 1.19, 1.21, 1.19, 1.2050),
             None
         ));
     }
@@ -2325,6 +2372,64 @@ mod tests {
         );
     }
 
+    /// Real-incident regression: AUD/JPY iH&S long, 2026-06-29. The retest is a
+    /// **down**-cross of the descending neckline. The 6pm Brisbane bar
+    /// (29 Jun 18:00Z) opened *above* the neckline (O 111.582 > line 111.519)
+    /// and its **low wicked below** it (L 111.501 < line) before closing back
+    /// **above** (C 111.540 > line). On a tick timeline that bar genuinely
+    /// crossed down — it came from above and traded below — so the retest must
+    /// stamp here. The old close-confirmed Intrabar rule (`Down ⇒ close ≤ level`)
+    /// rejected it because the close sat above, starving the entry for ~6h until
+    /// a bar finally *closed* below the line (30 Jun 00:00Z). The fix reads the
+    /// wick on the cross side: `Down ⇒ open ≥ level && low ≤ level`.
+    #[test]
+    fn intrabar_down_retest_fires_on_wick_not_close() {
+        // Descending neckline interpolated to ~111.519 at the 6pm bar (matches
+        // the chart readout). Two anchors a bar apart with the right slope;
+        // `extend_forward` carries the line to the test bar.
+        let neckline = Trigger::TrendlineCross {
+            a: LinePoint {
+                at_epoch: ts("2026-06-29T16:00:00Z").timestamp(),
+                price: 111.5415,
+            },
+            b: LinePoint {
+                at_epoch: ts("2026-06-29T17:00:00Z").timestamp(),
+                price: 111.5303,
+            },
+            extend_forward: true,
+            bar_seconds: 3600,
+            dir: CrossDir::Down,
+            bar: BarEvent::Intrabar,
+        };
+        let p = plan(vec![
+            rule("04-prep-retest", neckline, FireMode::Once, Action::Prep),
+            rule(
+                "05-enter",
+                Trigger::MwEveryBar,
+                FireMode::Once,
+                Action::Enter,
+            ),
+        ]);
+        let mut prior = seed_at(Phase::AwaitEntry, "2026-06-29T17:00:00Z");
+        prior.break_close_at = Some(ts("2026-06-29T17:00:00Z"));
+
+        // The 6pm bar: opened above the line, low wicked below, closed above.
+        let six_pm = candle("2026-06-29T18:00:00Z", 111.582, 111.606, 111.501, 111.540);
+        let eval = run(&p, &prior, &[six_pm]);
+
+        assert_eq!(
+            eval.new_state.retest_seen_at,
+            Some(ts("2026-06-29T18:00:00Z")),
+            "an open-above/low-below bar is a down-cross of the retest line — \
+             the wick crossed even though the close recovered above"
+        );
+        let fired: Vec<&str> = eval.fired.iter().map(|f| f.rule_id.as_str()).collect();
+        assert!(
+            fired.contains(&"04-prep-retest"),
+            "the retest prep must fire on the 6pm wick bar, got {fired:?}"
+        );
+    }
+
     // ===== guards =====
 
     #[test]
@@ -2740,15 +2845,21 @@ mod tests {
     #[test]
     fn pine_entry_blocked_until_retest_seen() {
         // H&S short with a retest rule: the pinbar entry is gated until a retest
-        // up-cross has been stamped after the break-and-close.
+        // up-cross has been stamped after the break-and-close. The retest line
+        // sits at 1.35 — *above* the pinbar bar's high (1.30), so the bar never
+        // reaches it: no straddle, no up-cross, entry stays blocked. (Were the
+        // line within the bar's range, the new wick-based Intrabar rule would
+        // stamp an up-cross the moment the high pushed through it — open 1.12
+        // below the line, high reaching above is a genuine intrabar up-cross
+        // regardless of where the bar closes.)
         let neckline_up = Trigger::TrendlineCross {
             a: LinePoint {
                 at_epoch: ts("2026-06-16T00:00:00Z").timestamp(),
-                price: 1.25,
+                price: 1.35,
             },
             b: LinePoint {
                 at_epoch: ts("2026-06-16T01:00:00Z").timestamp(),
-                price: 1.25,
+                price: 1.35,
             },
             extend_forward: true,
             bar_seconds: 3600,
@@ -2760,15 +2871,16 @@ mod tests {
             pine_enter_rule(None, Direction::Short, false),
         ]);
         let window = bearish_pinbar_window();
-        // break_close set, but the pinbar bar (high 1.30) DOES straddle 1.25 with
-        // close 1.115 — wait, that's a down-close, so the Up retest doesn't stamp.
-        // So entry stays blocked.
         let mut prior = seed_at(Phase::AwaitEntry, "2026-06-16T10:00:00Z");
         prior.break_close_at = Some(ts("2026-06-16T10:30:00Z"));
         let eval = run_window(&p, &prior, &window[3..], &window);
         assert!(
             eval.fired.is_empty(),
-            "entry blocked: no retest up-cross stamped"
+            "entry blocked: retest line above the bar's high → no up-cross"
+        );
+        assert!(
+            eval.new_state.retest_seen_at.is_none(),
+            "no straddle → retest must not stamp"
         );
     }
 

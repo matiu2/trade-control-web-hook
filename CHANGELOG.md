@@ -1,5 +1,51 @@
 # Changelog
 
+## Unreleased — 2026-07-01 — intrabar cross reads the wick, not the close
+
+**Why.** The engine's intrabar directional cross (`level_crossed`, `BarEvent::Intrabar`)
+required the bar to **close** on the firing side (`Up ⇒ close ≥ level`,
+`Down ⇒ close ≤ level`) on top of straddling the level. That conflated "crossed
+the level intrabar" with "closed past it". A **retest** is a tap-and-bounce: on a
+descending neckline the bar opens above the line, its low wicks below (a genuine
+down-cross on any sub-bar timeline), then closes back above. The close-confirm
+gate threw those away, so the retest prep stamped only when a bar finally *closed*
+through the line — far too late. Real incident: AUD/JPY iH&S long, 2026-06-29 —
+break-and-close stamped 15:00 Brisbane, three golden signal candles printed at
+4/6/7pm, but the retest didn't stamp until 30 Jun 00:00 (the first close below
+the line), starving every entry. The 6pm bar (O 111.582 > line 111.519,
+L 111.501 < line, C 111.540 > line) had clearly crossed down — it just recovered.
+
+**What changed.** The `Intrabar` arm now reads the wick on the cross side,
+**close-agnostic**, discriminated by which side the bar *came from* (its open):
+
+- `Down`   ⇒ `open ≥ level && low ≤ level`  (came from above, reached below)
+- `Up`     ⇒ `open ≤ level && high ≥ level` (came from below, reached above)
+- `Either` ⇒ any straddle (unchanged)
+
+`BarEvent::OnClose` is **unchanged** — break-and-close still requires a real close
+through the line (open one side, close the other). Only the intrabar arm moved.
+
+**Breaking / behaviour.** This is a shared-engine change, so the live worker and
+the offline `replay-candles` get it identically (no drift). It reverts the
+earlier close-confirmed semantics for the **too-high invalidation** veto
+(`bug12_at_entry_level_vetos` / "too-high is close-confirmed now"): too-high/too-low
+and the M/W cancel/overshoot vetos are intrabar directional crosses and now fire
+on the wick-from-the-open-side rather than the close. A spike that opens on the
+expected side and wicks through now invalidates intrabar; a bar that merely closes
+through (without crossing from the right side) no longer does. Intentional — an
+intrabar cross should mean the bar genuinely traded through the level.
+
+**Tests.** New `intrabar_down_retest_fires_on_wick_not_close` (the real AUD/JPY 6pm
+geometry). Rewrote `intrabar_fires_when_bar_crosses_from_its_open_side` (was
+`…_and_close_on_firing_side`) and added `intrabar_down_fires_on_open_above_low_below_regardless_of_close`
+to assert the open-side/wick rule directly. Updated `pine_entry_blocked_until_retest_seen`
+to block via line-above-the-bar (no straddle) rather than the old close-side
+reasoning. engine 93 green, core 757, cli all green.
+
+**Follow-up.** A tunable cross-depth buffer (must cross by N ticks / X% of the
+line price) so a one-tick graze doesn't trigger a retest/invalidation — designed
+next, separate change.
+
 ## Unreleased — 2026-07-01 — SL-floor renders in raw price; broker-oanda native build
 
 **Why (SL-floor).** The SL-vs-spread floor is a pure ratio of two raw-price
