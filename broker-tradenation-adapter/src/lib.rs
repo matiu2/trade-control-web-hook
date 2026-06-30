@@ -276,15 +276,14 @@ impl Broker for TradeNationAdapter {
         new_stop: f64,
     ) -> Result<(), AmendError> {
         // `amend_order` needs the originating order id, market name, stake
-        // and BOTH prices ("pass existing to leave unchanged"). The
-        // trait-level id alone doesn't carry that, so re-fetch and locate
-        // the record. Positions first (the cron's primary target), then
-        // pending orders.
+        // and the new stop. The trait-level id alone doesn't carry that, so
+        // re-fetch and locate the record. Positions first (the cron's primary
+        // target), then pending orders.
         //
-        // UNVERIFIED: the upstream `amend_order` (`AmendCloseOrder`) has no
-        // callers and it is not yet confirmed it amends an OPEN position's
-        // SL keyed by the position's originating order id. Sub-plan 4 must
-        // demo-confirm before any live widening relies on this path.
+        // VERIFIED on the experimental demo 2026-06-30: `amend_order` does
+        // amend an OPEN position's SL keyed by its originating order id, and
+        // the with-TP path preserves the take-profit. The no-TP path (now a
+        // stop-only mode-2 amend, see below) moves the SL with no phantom TP.
         let details = tradenation_api::get_account_details(self.0.session())
             .await
             .map_err(|err| {
@@ -299,13 +298,17 @@ impl Broker for TradeNationAdapter {
         )
         .ok_or(AmendError::NotFound)?;
 
-        // TradeNation requires BOTH prices on `AmendCloseOrder`. We move
-        // the stop and leave TP unchanged by passing its existing value.
-        // A `None` TP becomes 0.0 — UNVERIFIED whether the platform reads
-        // that as "no TP" or "TP at 0". Sub-plan 4's demo must check; until
-        // then, an amend on a position with no TP is the riskier case.
-        let existing_tp = target.existing_take_profit.unwrap_or(0.0);
-
+        // Move the stop, leaving the take-profit untouched. `amend_order`
+        // takes the TP as `Option<f64>`:
+        //   Some(tp) → amend both legs (orderModeID 3), re-sending the
+        //              existing TP so it stays put.
+        //   None     → stop-only amend (orderModeID 2). Required for a
+        //              position with NO take-profit: passing 0.0 used to be
+        //              rejected by TradeNation as a TP at price 0
+        //              (`#5-9 "too close to market"`), silently failing to
+        //              move the stop. VERIFIED on the experimental demo
+        //              2026-06-30: with-TP amend preserves the TP; no-TP amend
+        //              now moves the SL and leaves the TP absent.
         tradenation_api::amend_order(
             self.0.client(),
             self.0.session(),
@@ -313,7 +316,7 @@ impl Broker for TradeNationAdapter {
             &target.market,
             target.stake,
             new_stop,
-            existing_tp,
+            target.existing_take_profit,
         )
         .await
         .map(|_| ())
