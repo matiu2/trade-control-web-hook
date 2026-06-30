@@ -281,18 +281,38 @@ Order matters — prove each layer before the next.
    `prep` with `trade-control-<env>` (whose baked webhook = the public URL) and
    POST it. Expect a 200 and a `request_records` row in Postgres. This exercises
    sig-verify + dispatch + recording end-to-end with zero broker exposure.
-5. **A dry-run enter on the demo account:** arm a setup with `--broker-dry-run`
-   (or `dry_run: true` on the enter intent). The worker runs the **full** gate
-   chain (resolve, retry, cooldown, prep, veto, spread-blackout, SL-spread floor)
-   and logs the placement **without** POSTing to the broker. Confirm in the log
-   the entry was accepted + "dry-run" and the engine tick keeps the plan alive.
-6. **A live demo enter:** drop `--broker-dry-run`, keep the account `kind=demo`
-   (so `OANDA_LIVE`/the account routes to practice). One real demo placement.
-   Reconcile the broker fill against the worker log + the `request_records` /
-   `tick_bundles` rows.
+5. **Register a plan against this worker.** `tv-arm --register-plan` only POSTs
+   to its compiled-in webhook, so to arm *this* worker, build the plan then
+   register it explicitly at `--endpoint`:
+   ```sh
+   tv-arm-<env> --plan-out plan.json                    # build only (no POST)
+   trade-control-<env> plan register plan.json \
+       --account-id <seeded-name> --endpoint <this-worker-url>   # → ok
+   trade-control-<env> plan list --endpoint <this-worker-url>    # confirms it
+   ```
+   The engine cron then logs `cron engine: N registered plans` and starts
+   evaluating it each tick. (Account name must be seeded in `accounts` **and**,
+   for TN, present in the enc store — see §4.)
+6. **A dry-run enter on the demo account:** register a plan whose enter carries
+   `dry_run: true` (tv-arm `--broker-dry-run`). When the enter fires, the worker
+   runs the **full** gate chain (resolve, retry, cooldown, prep, veto,
+   spread-blackout, SL-spread floor) and logs the placement **without** POSTing
+   to the broker. Confirm the log shows the entry accepted + "dry-run" and the
+   plan stays alive.
+7. **A live demo enter:** drop `--broker-dry-run`, keep the account `kind=demo`
+   (so it routes to practice). When the enter fires, one real demo placement goes
+   to TradeNation (via the enc-store session) / OANDA (practice). Reconcile the
+   broker fill against the worker log + the `request_records` / `tick_bundles`
+   rows.
 
-Only after 1–6 are clean is the box a candidate to take over a week's demo
+Only after 1–7 are clean is the box a candidate to take over a week's demo
 trading from the staging Cloudflare worker.
+
+> **Validated locally (2026-06-30):** steps 1–5 confirmed against the dev
+> Postgres — worker boots, `/health` 200, signed `status` round-trips + records,
+> and `plan register` → `plan list` → engine `1 registered plans` → `plan delete`
+> all work. Steps 6–7 (broker placement) await a TN demo session on a real
+> firing enter.
 
 ---
 
