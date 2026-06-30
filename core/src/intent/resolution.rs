@@ -87,6 +87,13 @@ pub struct Resolved {
     pub stop_loss: f64,
     pub take_profit: f64,
     pub risk: RiskBudget,
+    /// The effective R-floor this trade was held to at resolve time — the
+    /// intent's `min_r` override, or [`MIN_R_FLOOR`] (1.0) when omitted. The
+    /// resolve already enforced `implicit_R >= min_r`; carrying it forward lets
+    /// the worker's SL-widen path re-check the floor against the *widened*
+    /// geometry without re-resolving the (possibly scripted) `min_r` tunable.
+    /// See [`super::widen_sl_to_spread_floor`].
+    pub min_r: f64,
     /// Worker should compute the sizing as normal but skip placing the
     /// order — the inputs / calculations / output get logged instead.
     /// Defaults to false. See `Intent::dry_run`.
@@ -509,6 +516,10 @@ impl Resolved {
             // may be a script that reads `r_multiple` / `tp_distance`)
             // is resolved. Scripts never see `risk`.
             risk: RiskBudget::Percent(0.0),
+            // Placeholder — the real effective floor is resolved just below
+            // (min_r may be a script that reads this snapshot) and written
+            // onto the returned `Resolved`.
+            min_r: MIN_R_FLOOR,
             dry_run: intent.dry_run.unwrap_or(false),
             recover_entry,
             breakeven: intent.breakeven,
@@ -595,6 +606,7 @@ impl Resolved {
 
         Ok(Self {
             risk,
+            min_r,
             ..geometry_snapshot
         })
     }

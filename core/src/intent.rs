@@ -29,7 +29,10 @@ pub use mw_state::{MwAnchors, MwUpdate, effective_mw_params, plan_mw_update};
 #[cfg(feature = "cli")]
 pub use resolution::MIN_R_FLOOR;
 pub use resolution::{ResolveError, Resolved, ResolvedEntry, ResolvedRecoverEntry, RiskBudget};
-pub use sl_spread_floor::{SL_MIN_SPREAD_MULTIPLE, sl_spread_floor_violation};
+pub use sl_spread_floor::{
+    SL_MIN_SPREAD_MULTIPLE, SL_WIDEN_SPREAD_MULTIPLE, SlWiden, sl_spread_floor_violation,
+    widen_sl_to_spread_floor,
+};
 
 /// Plaintext outer YAML — the part TradingView substitutes `{{...}}` into.
 /// The intent fields sit alongside these at the top level of the signed

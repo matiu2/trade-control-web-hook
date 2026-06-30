@@ -141,6 +141,7 @@ mod tests {
             stop_loss: 1.0978,
             take_profit: 1.1044,
             risk: RiskBudget::Percent(0.5),
+            min_r: 1.0,
             dry_run: false,
             recover_entry: None,
             breakeven: None,
