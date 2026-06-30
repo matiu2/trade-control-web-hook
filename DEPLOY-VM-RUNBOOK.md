@@ -230,13 +230,16 @@ sudo systemctl reload caddy
 That's the whole TLS story — caddy provisions the cert on first request. (nginx +
 certbot works too if you prefer; the worker side is identical.)
 
-> **Health check caveat:** the native receiver currently exposes **only
-> `POST /`** — the wasm worker's `/diag/*` and `/admin/*` routes are **not yet
-> ported** (see `worker/src/http.rs` router doc). So there is *no* `GET /health`.
-> A proxy/uptime health probe should POST a tiny garbage body to `/` and expect a
-> **4xx** (signature-rejected) — a 4xx proves the worker is up and parsing.
-> Adding a real `GET /health` (and the admin surface) is a tracked Phase-2
-> follow-up.
+> **Health check:** the worker exposes **`GET /health`** — a cheap `200 OK`
+> liveness probe (no DB round-trip, so it stays green through a transient
+> Postgres blip rather than flapping the service out of the proxy). Point your
+> uptime/proxy check at it:
+> ```sh
+> curl -s -o /dev/null -w '%{http_code}\n' https://hook.<domain>/health   # → 200
+> ```
+> The wasm worker's richer `/diag/*` and `/admin/*` routes are still **not
+> ported** (see `worker/src/http.rs` router doc) — that's the Phase-2 admin
+> surface, separate from this liveness probe.
 
 ---
 
@@ -248,12 +251,13 @@ Order matters — prove each layer before the next.
    three boot log lines present.
 2. **Local reachability (bypass proxy):** from the box,
    ```sh
-   curl -s -o /dev/null -w '%{http_code}\n' -X POST localhost:8787/ -d 'garbage'
+   curl -s -o /dev/null -w '%{http_code}\n' localhost:8787/health   # → 200
    ```
-   Expect a **4xx** (bad signature / parse) — confirms axum + the dispatcher
-   thread are serving. A 000/connection-refused means the worker isn't bound.
-3. **Through the proxy (TLS):** same POST to `https://hook.<domain>/` → same 4xx
-   over HTTPS — confirms caddy → loopback forwarding + the cert.
+   A `200` confirms axum is serving. A 000/connection-refused means the worker
+   isn't bound. (A `POST localhost:8787/ -d garbage` → **4xx** additionally
+   confirms the dispatcher thread + sig-verify path.)
+3. **Through the proxy (TLS):** `curl https://hook.<domain>/health` → `200` over
+   HTTPS — confirms caddy → loopback forwarding + the cert.
 4. **A real signed control intent (no broker, no risk):** sign a `status` or
    `prep` with `trade-control-<env>` (whose baked webhook = the public URL) and
    POST it. Expect a 200 and a `request_records` row in Postgres. This exercises
@@ -290,8 +294,8 @@ not a strategy change.
 
 Tracked so they're not mistaken for bugs on the box:
 
-- **No `GET /health` / admin surface yet** — only `POST /`. Health probe must
-  POST-and-expect-4xx (see §6). Porting `/diag/*` + `/admin/*` is pending.
+- **`GET /health` exists** (liveness, §6); the richer `/diag/*` + `/admin/*`
+  admin surface from the wasm worker is **not** ported yet.
 - **Unnamed-account broker intent → 400.** The wasm worker had a global-OANDA
   default; the native receiver requires a *named* account for any broker action
   (`AccountResolveError::Required`). Default-account routing is a deferred TODO
@@ -314,7 +318,7 @@ Tracked so they're not mistaken for bugs on the box:
 | optional env | `MAX_RISK_PCT_PER_TRADE`, `MAX_OPEN_POSITIONS`, `OANDA_API_KEY`, `OANDA_LIVE`, `PIP_SIZE_<INSTR>` |
 | migrations | `worker/migrations/000{1..4}_*.sql`, auto-applied on boot |
 | bind | `127.0.0.1:8787` (loopback, proxy-only) |
-| routes | `POST /` only (so far) |
+| routes | `POST /` (webhook) + `GET /health` (liveness) |
 | TN creds | `~/.config/tradenation/accounts.enc` (by name) |
 | OANDA creds | token = `OANDA_API_KEY` env; sub-account = Postgres `accounts` |
 | branch | `feat/native-runtime` (unmerged) |

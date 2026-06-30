@@ -25,12 +25,19 @@
 //! time semantics (the seen-id / retry-gate state assumes no concurrent fire of
 //! the same id).
 //!
+//! ## Routes
+//! * `POST /` — the signed-alert webhook (the only request-processing route).
+//! * `GET /health` — liveness probe: a cheap `200 OK` proving the process is up
+//!   and serving, so a proxy/uptime check needn't POST a garbage body and read a
+//!   4xx. Deliberately liveness, not readiness — it does **no** DB round-trip, so
+//!   it stays green during a transient Postgres blip rather than flapping the
+//!   whole service out of the proxy. (A future readiness probe that pings the
+//!   pool can live at a separate path.)
+//!
 //! ## Not here yet (deliberate)
 //! * `PlanPurge` / `PurgeOlderThan` / `MarketInfo` need R2 (the tick bundles)
 //!   and the TradeNation market-info glue the wasm worker has; natively they
 //!   return `501 Not Implemented` until that glue lands (a later task).
-//! * Per-request recording to Postgres is Task #6 — for now a stub logs what it
-//!   *would* record.
 //! * Global / default-account routing for a `None`-account broker intent is a
 //!   follow-up — such an intent currently returns `400 account required`.
 
@@ -41,7 +48,7 @@ use axum::{
     extract::State,
     http::StatusCode,
     response::{IntoResponse, Response},
-    routing::post,
+    routing::{get, post},
 };
 use chrono::Utc;
 use tokio::sync::{mpsc, oneshot};
@@ -149,7 +156,9 @@ impl Dispatcher {
     }
 }
 
-/// Build the axum router. One route: `POST /` (the signed-alert webhook).
+/// Build the axum router:
+/// * `POST /` — the signed-alert webhook.
+/// * `GET /health` — liveness probe (cheap `200 OK`, no DB round-trip).
 ///
 /// Diagnostic / admin routes (`/diag/*`, `/admin/*`) the wasm worker also
 /// served are not part of this native receiver task — they'll be added with the
@@ -157,7 +166,19 @@ impl Dispatcher {
 pub fn router(dispatcher: Dispatcher) -> Router {
     Router::new()
         .route("/", post(webhook))
+        .route("/health", get(health))
         .with_state(dispatcher)
+}
+
+/// Liveness probe — a `Send` handler that returns `200 OK` without touching the
+/// dispatcher thread or Postgres. Proves the process is up and the axum server
+/// is accepting connections, which is what a proxy/uptime check needs. It is
+/// deliberately **not** readiness: it does no DB ping, so a transient Postgres
+/// blip won't flap the worker out of the proxy's pool (the request path itself
+/// fails loudly per-request if the DB is down). The `_dispatcher` state is unused
+/// but present because the router is typed `Router<()>` after `with_state`.
+async fn health() -> impl IntoResponse {
+    (StatusCode::OK, "ok")
 }
 
 /// The axum webhook handler — a thin `Send` shim. It captures the request body
@@ -515,6 +536,14 @@ mod tests {
         let body = "v: 1\nid: x\naction: status\ninstrument: EUR_USD\nsig: deadbeef\n";
         let err = parse_and_verify(body, &key(), now).unwrap_err();
         assert_eq!(err.disposition(), IncomingDisposition::Rejected);
+    }
+
+    #[tokio::test]
+    async fn health_returns_200_ok_without_state() {
+        // Liveness probe is state-free — it must answer 200 without a pool or
+        // dispatcher, so a proxy health check works even before/around a DB blip.
+        let resp = health().await.into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
     }
 
     #[test]
