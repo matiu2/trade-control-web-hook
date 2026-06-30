@@ -358,7 +358,7 @@ fn evaluate_controls(
         if !is_control_rule(rule) || state.fired.contains(&rule.rule_id) {
             continue;
         }
-        if fire_rule(rule, state, candle, window) {
+        if fire_rule(rule, state, candle, window, plan.cross_buffer_pct) {
             push_fire(rule, candle, fired);
             state.fired.insert(rule.rule_id.clone());
             // No phase change: a pause/resume/news fire is state-only and never
@@ -432,7 +432,7 @@ fn evaluate_guards(
                 }
             }
             _ => {
-                if !fire_rule(rule, state, candle, window) {
+                if !fire_rule(rule, state, candle, window, plan.cross_buffer_pct) {
                     continue;
                 }
                 None
@@ -507,7 +507,7 @@ fn evaluate_break_and_close(
     if state.fired.contains(&rule.rule_id) {
         return;
     }
-    if fire_rule(rule, state, candle, window) {
+    if fire_rule(rule, state, candle, window, plan.cross_buffer_pct) {
         state.fired.insert(rule.rule_id.clone());
         state.break_close_at = Some(candle.time);
         // The break-and-close prep itself is recorded server-side by dispatching
@@ -595,7 +595,7 @@ fn evaluate_one_entry(
         // Every other entry trigger (the M/W heartbeat) is a plain per-candle
         // predicate with no pattern geometry.
         _ => {
-            if !fire_rule(rule, state, candle, detector_window) {
+            if !fire_rule(rule, state, candle, detector_window, plan.cross_buffer_pct) {
                 return;
             }
             None
@@ -1059,6 +1059,7 @@ fn stamp_retest(
             candle,
             state.last_close.get(&rule.rule_id).copied(),
             window,
+            plan.cross_buffer_pct,
         )
     {
         state.retest_seen_at = Some(candle.time);
@@ -1094,9 +1095,10 @@ fn fire_rule(
     state: &mut PlanState,
     candle: &Candle,
     window: &[Candle],
+    buffer_pct: f64,
 ) -> bool {
     let prev_close = state.last_close.get(&rule.rule_id).copied();
-    let hit = eval_trigger(&rule.trigger, candle, prev_close, window);
+    let hit = eval_trigger(&rule.trigger, candle, prev_close, window, buffer_pct);
     record_last_close(&rule.rule_id, &rule.trigger, candle, state);
     hit
 }
@@ -1140,11 +1142,12 @@ pub fn eval_trigger(
     candle: &Candle,
     prev_close: Option<f64>,
     window: &[Candle],
+    buffer_pct: f64,
 ) -> bool {
     match trigger {
         Trigger::HorizontalCross { level, dir, bar }
         | Trigger::PriceValueCross { level, dir, bar } => {
-            level_crossed(*level, *dir, *bar, candle, prev_close)
+            level_crossed(*level, *dir, *bar, candle, prev_close, buffer_pct)
         }
         Trigger::TrendlineCross {
             a,
@@ -1158,7 +1161,7 @@ pub fn eval_trigger(
             else {
                 return false;
             };
-            level_crossed(level, *dir, *bar, candle, prev_close)
+            level_crossed(level, *dir, *bar, candle, prev_close, buffer_pct)
         }
         Trigger::TimeReached { at_epoch } => candle.time.timestamp() >= *at_epoch,
         // The M/W heartbeat fires on every closed bar — the wrapper feeds only
@@ -1174,26 +1177,39 @@ pub fn eval_trigger(
 }
 
 /// Did `candle` cross `level` in direction `dir` under the bar-event mode?
+///
+/// `buffer_pct` is a cross-depth buffer as a percent of `level`'s price: an
+/// *intrabar* directional cross must pierce the wick at least `buffer_pct%` past
+/// the line before it counts, so a one-tick graze of a retest / invalidation
+/// line doesn't trip it. `0.0` reproduces the bare wick-touch behaviour. The
+/// buffer is applied on the **far** side of the line (below for `Down`, above
+/// for `Up`); `Either` and `OnClose` ignore it (a bare straddle / a close past
+/// the line is already an unambiguous cross).
 fn level_crossed(
     level: f64,
     dir: CrossDir,
     bar: BarEvent,
     candle: &Candle,
     prev_close: Option<f64>,
+    buffer_pct: f64,
 ) -> bool {
+    // The depth the wick must reach past the line. `level` is positive (a price)
+    // and `buffer_pct` is small; a 0.0 buffer collapses to the raw level.
+    let buffer = level * buffer_pct / 100.0;
     match bar {
         // Intrabar: the bar's range crosses the level *within the bar*, read
         // from the wick on the cross side — NOT the close. On a tick timeline a
         // bar that opened on one side of the level and traded through to the
         // other genuinely crossed, even if it closed back on the original side
         // (a retest tap, an invalidation spike-and-recover). Direction is the
-        // side the bar *came from* (its open) reaching *through* to the wick:
-        //   Down  ⇒ opened at/above and the low reached at/below  (came down through)
-        //   Up    ⇒ opened at/below and the high reached at/above  (came up through)
-        //   Either⇒ any straddle (the wick touched the level at all)
+        // side the bar *came from* (its open) reaching *through* to the wick,
+        // and the wick must reach `buffer` past the line:
+        //   Down  ⇒ opened at/above and the low reached `level - buffer` or lower
+        //   Up    ⇒ opened at/below and the high reached `level + buffer` or higher
+        //   Either⇒ any straddle (the wick touched the level at all; buffer N/A)
         // (Close-confirmed crossing is `BarEvent::OnClose` — break-and-close —
         // which must open one side and *close* the other; that arm is below and
-        // is deliberately unchanged.)
+        // is deliberately unchanged, buffer N/A.)
         BarEvent::Intrabar => {
             let straddles = candle.l <= level && level <= candle.h;
             if !straddles {
@@ -1201,8 +1217,8 @@ fn level_crossed(
             }
             match dir {
                 CrossDir::Either => true,
-                CrossDir::Up => candle.o <= level && candle.h >= level,
-                CrossDir::Down => candle.o >= level && candle.l <= level,
+                CrossDir::Up => candle.o <= level && candle.h >= level + buffer,
+                CrossDir::Down => candle.o >= level && candle.l <= level - buffer,
             }
         }
         // OnClose: a cross relative to the prior processed close. The seed bar
@@ -1400,7 +1416,10 @@ mod tests {
     /// don't read it. Trendline tests call `eval_trigger` directly with a real
     /// window (bar-index interpolation needs it).
     fn et(trigger: &Trigger, candle: &Candle, prev_close: Option<f64>) -> bool {
-        eval_trigger(trigger, candle, prev_close, &[])
+        // No cross buffer in the unit-level cross tests — they assert the raw
+        // wick/close geometry. The buffer's own behaviour is covered by
+        // `intrabar_cross_buffer_*` tests that call `eval_trigger` directly.
+        eval_trigger(trigger, candle, prev_close, &[], 0.0)
     }
 
     /// A minimal intent carrying just the action the evaluator reads; the rest
@@ -1505,6 +1524,9 @@ mod tests {
     }
 
     fn plan(rules: Vec<ConditionRule>) -> TradePlan {
+        // Default test plan carries no cross buffer (0.0) so the existing cross
+        // tests assert the raw wick/close geometry; buffer behaviour has its own
+        // tests that set `cross_buffer_pct` explicitly.
         TradePlan {
             trade_id: "t".into(),
             instrument: "EUR_USD".into(),
@@ -1513,6 +1535,7 @@ mod tests {
             pip_size: 0.0001,
             rules,
             shadow: false,
+            cross_buffer_pct: 0.0,
         }
     }
 
@@ -1647,6 +1670,82 @@ mod tests {
         ));
     }
 
+    /// The cross-depth buffer rejects a graze: with `buffer_pct = 0.1` the wick
+    /// must pierce `level * 0.1% = 1.2 * 0.001 = 0.0012` past the line. A down
+    /// graze to 1.1995 (only 0.0005 below) does NOT fire; a dip to 1.1980
+    /// (0.0020 below, past the 1.1988 buffered level) does. The open is above
+    /// the line in both, so the came-from-above guard is satisfied either way —
+    /// the buffer is the discriminator.
+    #[test]
+    fn intrabar_down_buffer_rejects_a_graze_admits_a_real_cross() {
+        let t = Trigger::HorizontalCross {
+            level: 1.2000,
+            dir: CrossDir::Down,
+            bar: BarEvent::Intrabar,
+        };
+        let graze = candle("2026-06-16T12:00:00Z", 1.2010, 1.2010, 1.1995, 1.2005);
+        let real = candle("2026-06-16T12:00:00Z", 1.2010, 1.2010, 1.1980, 1.2005);
+
+        // No buffer (0.0) → both fire (bare wick touch).
+        assert!(eval_trigger(&t, &graze, None, &[], 0.0));
+        assert!(eval_trigger(&t, &real, None, &[], 0.0));
+
+        // 0.1% buffer → the graze is rejected, the real cross still fires.
+        assert!(
+            !eval_trigger(&t, &graze, None, &[], 0.1),
+            "a 5-pip graze (< 0.0012 buffer) must not count as a cross"
+        );
+        assert!(
+            eval_trigger(&t, &real, None, &[], 0.1),
+            "a 20-pip dip (> 0.0012 buffer) is a real cross"
+        );
+    }
+
+    /// Mirror for an up-cross: the high must reach `level + buffer` to fire.
+    #[test]
+    fn intrabar_up_buffer_rejects_a_graze_admits_a_real_cross() {
+        let t = Trigger::HorizontalCross {
+            level: 1.2000,
+            dir: CrossDir::Up,
+            bar: BarEvent::Intrabar,
+        };
+        // Opened below; buffer = 0.0012 → need high ≥ 1.2012.
+        let graze = candle("2026-06-16T12:00:00Z", 1.1990, 1.2005, 1.1990, 1.1995);
+        let real = candle("2026-06-16T12:00:00Z", 1.1990, 1.2020, 1.1990, 1.1995);
+        assert!(!eval_trigger(&t, &graze, None, &[], 0.1));
+        assert!(eval_trigger(&t, &real, None, &[], 0.1));
+    }
+
+    /// The buffer applies only to directional intrabar crosses, not `Either`
+    /// (a bare straddle is already an unambiguous touch) nor `OnClose` (the
+    /// close is past the line by construction). A graze straddle still fires
+    /// `Either` even with a buffer set.
+    #[test]
+    fn cross_buffer_ignored_by_either_and_on_close() {
+        let graze = candle("2026-06-16T12:00:00Z", 1.2010, 1.2010, 1.1995, 1.2005);
+        let either = Trigger::PriceValueCross {
+            level: 1.2000,
+            dir: CrossDir::Either,
+            bar: BarEvent::Intrabar,
+        };
+        assert!(
+            eval_trigger(&either, &graze, None, &[], 0.1),
+            "Either fires on any straddle regardless of the buffer"
+        );
+        // OnClose down: a bar that closed below the line fires irrespective of
+        // the buffer (the close, not the wick depth, is the test).
+        let on_close = Trigger::HorizontalCross {
+            level: 1.2000,
+            dir: CrossDir::Down,
+            bar: BarEvent::OnClose,
+        };
+        let closed_below = candle("2026-06-16T12:00:00Z", 1.2010, 1.2010, 1.1995, 1.1999);
+        assert!(
+            eval_trigger(&on_close, &closed_below, Some(1.2010), &[], 0.1),
+            "OnClose ignores the cross buffer"
+        );
+    }
+
     #[test]
     fn intrabar_either_fires_on_any_straddle() {
         let t = Trigger::PriceValueCross {
@@ -1712,7 +1811,7 @@ mod tests {
             l: 1.4,
             c: 1.55,
         };
-        assert!(eval_trigger(&t, &c, None, &win));
+        assert!(eval_trigger(&t, &c, None, &win, 0.0));
     }
 
     /// The core of the bug: a session gap must NOT slide the line. Bars are
@@ -1751,12 +1850,12 @@ mod tests {
         // one straddling only ~1.04 (the wall-clock level) does NOT.
         let at_index_level = candle("2026-06-16T14:00:00Z", 1.45, 1.55, 1.45, 1.52);
         assert!(
-            eval_trigger(&t, &at_index_level, None, &win),
+            eval_trigger(&t, &at_index_level, None, &win, 0.0),
             "bar-index level at bar 1 is 1.50 → straddle fires"
         );
         let at_wallclock_level = candle("2026-06-16T14:00:00Z", 1.0, 1.08, 1.0, 1.05);
         assert!(
-            !eval_trigger(&t, &at_wallclock_level, None, &win),
+            !eval_trigger(&t, &at_wallclock_level, None, &win, 0.0),
             "the old wall-clock level (~1.04) must NOT be where the line sits"
         );
         let _ = day1b;
@@ -1790,11 +1889,11 @@ mod tests {
             c: 1.0,
         };
         assert!(
-            !eval_trigger(&mk(false), &c, None, &win),
+            !eval_trigger(&mk(false), &c, None, &win, 0.0),
             "no eval past anchor when not extended"
         );
         assert!(
-            eval_trigger(&mk(true), &c, None, &win),
+            eval_trigger(&mk(true), &c, None, &win, 0.0),
             "extended → still evaluates"
         );
     }
@@ -2427,6 +2526,65 @@ mod tests {
         assert!(
             fired.contains(&"04-prep-retest"),
             "the retest prep must fire on the 6pm wick bar, got {fired:?}"
+        );
+    }
+
+    /// End-to-end: the plan-level `cross_buffer_pct` flows through
+    /// `evaluate_plan` to the retest cross. The 6pm bar dips ~0.018 below the
+    /// line (~0.016% of 111.519). A 0.1% buffer (~0.11 depth required) rejects
+    /// that shallow tap — the retest does **not** stamp; a 0.01% buffer
+    /// (~0.011 required) admits it. Proves the field is threaded, not just the
+    /// `eval_trigger` arg.
+    #[test]
+    fn plan_cross_buffer_pct_gates_the_retest() {
+        let neckline = Trigger::TrendlineCross {
+            a: LinePoint {
+                at_epoch: ts("2026-06-29T16:00:00Z").timestamp(),
+                price: 111.5415,
+            },
+            b: LinePoint {
+                at_epoch: ts("2026-06-29T17:00:00Z").timestamp(),
+                price: 111.5303,
+            },
+            extend_forward: true,
+            bar_seconds: 3600,
+            dir: CrossDir::Down,
+            bar: BarEvent::Intrabar,
+        };
+        let mk_plan = |buffer_pct: f64| {
+            let mut p = plan(vec![
+                rule(
+                    "04-prep-retest",
+                    neckline.clone(),
+                    FireMode::Once,
+                    Action::Prep,
+                ),
+                rule(
+                    "05-enter",
+                    Trigger::MwEveryBar,
+                    FireMode::Once,
+                    Action::Enter,
+                ),
+            ]);
+            p.cross_buffer_pct = buffer_pct;
+            p
+        };
+        let mut prior = seed_at(Phase::AwaitEntry, "2026-06-29T17:00:00Z");
+        prior.break_close_at = Some(ts("2026-06-29T17:00:00Z"));
+        let six_pm = candle("2026-06-29T18:00:00Z", 111.582, 111.606, 111.501, 111.540);
+
+        // 0.1% buffer → the shallow 0.016% tap is rejected.
+        let big = run(&mk_plan(0.1), &prior, &[six_pm]);
+        assert!(
+            big.new_state.retest_seen_at.is_none(),
+            "a 0.1% buffer rejects the shallow 6pm tap"
+        );
+        // 0.01% buffer → the tap is deep enough; retest stamps.
+        let small = run(&mk_plan(0.01), &prior, &[six_pm]);
+        assert_eq!(
+            small.new_state.retest_seen_at,
+            Some(ts("2026-06-29T18:00:00Z")),
+            "a 0.01% buffer admits the same tap"
         );
     }
 

@@ -933,6 +933,7 @@ mod tests {
             pip_size,
             rules: Vec::new(),
             shadow: false,
+            cross_buffer_pct: 0.0,
         }
     }
 

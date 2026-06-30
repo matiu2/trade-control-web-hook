@@ -715,6 +715,7 @@ mod tests {
                 intent: rule_intent,
             }],
             shadow: false,
+            cross_buffer_pct: 0.0,
         }
     }
 

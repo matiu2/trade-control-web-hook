@@ -96,6 +96,7 @@ pub fn build_trade_plan(
         pip_size: pip_size_of(alerts),
         rules,
         shadow,
+        cross_buffer_pct: trade_control_core::trade_plan::DEFAULT_CROSS_BUFFER_PCT,
     }
 }
 

@@ -207,6 +207,7 @@ mod tests {
             pip_size: 0.0001,
             rules: vec![],
             shadow: false,
+            cross_buffer_pct: 0.0,
         }
     }
 

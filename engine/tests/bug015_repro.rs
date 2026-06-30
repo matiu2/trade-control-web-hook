@@ -196,6 +196,7 @@ fn experimental_plan() -> TradePlan {
         pip_size: 0.0001,
         rules: vec![too_low, too_high, trade_expiry],
         shadow: false,
+        cross_buffer_pct: 0.0,
     }
 }
 

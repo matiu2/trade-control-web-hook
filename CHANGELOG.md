@@ -1,5 +1,40 @@
 # Changelog
 
+## Unreleased — 2026-07-01 — cross-depth buffer (% of line price)
+
+**Why.** With intrabar crosses now firing on the wick (previous entry), a
+*shallow* graze of a retest / invalidation line counts as a cross — including a
+one-tick poke that immediately retreats. On the AUD/JPY iH&S of 2026-06-29 the
+neckline got three shallow retest taps (low pierced only ~0.008–0.016% past the
+line) before the move that actually ran; each produced an entry that stopped
+out. The unbuffered trade is **−1.43R** (SL, SL, SL, then a +1.57R runner).
+
+**What changed.** New plan-level signed field `TradePlan.cross_buffer_pct` — a
+cross-depth buffer as a **percent of the crossed level's price**. An *intrabar*
+directional cross must pierce the wick at least `cross_buffer_pct%` past the
+line before it counts: `Down` needs `low <= level - (pct/100)*level`, `Up` needs
+`high >= level + (pct/100)*level`. `Either` (a bare straddle) and `OnClose`
+(break-and-close — the close is already past the line) ignore it. Threaded
+through `eval_trigger` → `level_crossed` in the shared engine, so the live worker
+and `replay-candles` apply it identically. `#[serde(default)]` → `0.0`, so plans
+signed before the field deserialize to the bare wick-touch behaviour unchanged.
+
+**Default.** `DEFAULT_CROSS_BUFFER_PCT = 0.02%`, baked by `tv-arm` at arm time.
+Chosen by a buffer sweep on the AUD/JPY trade: `0.0` → −1.43R; flips to **+0.57R
+net** at `0.02%` (the shallow taps are filtered, leaving only the entry that runs
+to TP); holds through ~0.07%; over-tightens into a starved 0-trade plan at 0.1%.
+`0.02%` is the threshold where the trade turns profitable. A `tv-arm
+--cross-buffer-pct` flag to override per-arm is a planned follow-up (the field +
+arm-time default land now; the flag is trivial on top).
+
+**Tests.** engine: `intrabar_down_buffer_rejects_a_graze_admits_a_real_cross`,
+`intrabar_up_buffer_rejects_a_graze_admits_a_real_cross`,
+`cross_buffer_ignored_by_either_and_on_close`, and the end-to-end
+`plan_cross_buffer_pct_gates_the_retest` (real 6pm geometry, proves the
+plan-level field threads through `evaluate_plan`). core:
+`missing_cross_buffer_pct_defaults_to_zero`, `cross_buffer_pct_round_trips`.
+engine 97 / core 759 / cli 57 / tv-arm 171 green; clippy + fmt clean.
+
 ## Unreleased — 2026-07-01 — intrabar cross reads the wick, not the close
 
 **Why.** The engine's intrabar directional cross (`level_crossed`, `BarEvent::Intrabar`)

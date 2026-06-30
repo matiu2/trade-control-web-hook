@@ -44,6 +44,18 @@ use serde::{Deserialize, Serialize};
 use crate::broker::Granularity;
 use crate::intent::{Direction, Intent};
 
+/// Default cross-depth buffer (percent of the crossed level's price) baked onto
+/// a plan at arm time. **`0.02%`** — calibrated on the AUD/JPY iH&S of
+/// 2026-06-29: a buffer sweep showed the trade is a **−1.43R** loss with no
+/// buffer (three shallow early retest taps each stop out before the runner),
+/// flips to **+0.57R net** at `0.02%` (the shallow taps are filtered, leaving
+/// only the entry that runs to TP), holds through `~0.07%`, and over-tightens
+/// into a starved 0-trade plan at `0.1%`. `0.02%` is the threshold where the
+/// trade turns profitable, so it is the default. Set a different value per-trade
+/// to tune (a future `tv-arm --cross-buffer-pct` flag overrides it); `0.0`
+/// restores the bare wick-touch behaviour. See [`TradePlan::cross_buffer_pct`].
+pub const DEFAULT_CROSS_BUFFER_PCT: f64 = 0.02;
+
 /// One signed trade, folded from every alert `tv-arm` would have created. The
 /// engine evaluates its [`rules`](Self::rules) against fresh candles each tick.
 ///
@@ -83,6 +95,20 @@ pub struct TradePlan {
     /// deserialize as **live** (`false`).
     #[serde(default)]
     pub shadow: bool,
+    /// Cross-depth buffer, as a **percent of the crossed level's price**, that
+    /// an *intrabar* directional cross must pierce past the line before it
+    /// counts. Guards against a one-tick graze tripping a retest / invalidation:
+    /// a `Down` cross needs `low <= level - (pct/100)*level`, an `Up` cross needs
+    /// `high >= level + (pct/100)*level`. `Either` keeps a bare straddle, and
+    /// `OnClose` (break-and-close) is unaffected — its close must already be on
+    /// the far side. `0.0` (the default) reproduces the pre-buffer behaviour, so
+    /// plans signed before this field deserialize unchanged.
+    ///
+    /// Plan-level (uniform across the plan's crosses) and signed as part of the
+    /// whole-body HMAC, so it's fixed at arm time. A future `tv-arm` flag can
+    /// override the arm-time default.
+    #[serde(default)]
+    pub cross_buffer_pct: f64,
 }
 
 /// One condition + the intent it fires. The engine evaluates [`trigger`] each
@@ -352,5 +378,30 @@ bar: on_close
             !plan.shadow,
             "absent shadow key must default to live (false)"
         );
+    }
+
+    /// A plan signed before `cross_buffer_pct` existed (no key in the wire body)
+    /// must deserialize with a `0.0` buffer — `#[serde(default)]` → the
+    /// pre-buffer bare-wick behaviour, so old plans are byte-for-byte unchanged.
+    #[test]
+    fn missing_cross_buffer_pct_defaults_to_zero() {
+        let json = r#"{"trade_id":"t-1","instrument":"EUR_USD","direction":"short",
+            "granularity":"h1","pip_size":0.0001,"rules":[]}"#;
+        let plan: TradePlan = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            plan.cross_buffer_pct, 0.0,
+            "absent cross_buffer_pct must default to 0.0 (no buffer)"
+        );
+    }
+
+    /// The `cross_buffer_pct` value survives a JSON round-trip when set.
+    #[test]
+    fn cross_buffer_pct_round_trips() {
+        let json = r#"{"trade_id":"t-1","instrument":"EUR_USD","direction":"short",
+            "granularity":"h1","pip_size":0.0001,"rules":[],"cross_buffer_pct":0.1}"#;
+        let plan: TradePlan = serde_json::from_str(json).unwrap();
+        assert_eq!(plan.cross_buffer_pct, 0.1);
+        let back: TradePlan = serde_json::from_str(&serde_json::to_string(&plan).unwrap()).unwrap();
+        assert_eq!(back.cross_buffer_pct, 0.1, "must survive a round-trip");
     }
 }
