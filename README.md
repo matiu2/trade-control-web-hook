@@ -2348,6 +2348,16 @@ What you draw on the chart:
 > you can clear the clutter. A per-role `dropped_out_of_window` count is logged
 > at `info`.
 
+> **Degenerate drawings are skipped, not fatal.** TradingView occasionally
+> reads a drawing back with a `null` anchor coordinate — most often an
+> auto-extending `parallel_channel` or half-drawn fib the operator left lying
+> around, whose final anchor hasn't resolved. `tv-arm` now tolerates the `null`
+> at parse time and **skips** that one drawing with a `warn`
+> (`drawing skipped — TradingView returned a degenerate anchor`), then keeps
+> classifying the rest. Previously a single such drawing made the whole arm
+> abort with a `invalid type: null, expected f64` deserialize error, even when
+> the drawing played no role in the setup.
+
 When news pairs *and* `support`/`resistance` lines are both present, a
 single `06-close-on-reversal` alert is emitted with
 `inside_window: [news, price]` — the close fires on an opposing reversal
