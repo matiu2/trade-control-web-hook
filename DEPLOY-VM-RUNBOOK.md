@@ -281,7 +281,15 @@ Order matters — prove each layer before the next.
    `prep` with `trade-control-<env>` (whose baked webhook = the public URL) and
    POST it. Expect a 200 and a `request_records` row in Postgres. This exercises
    sig-verify + dispatch + recording end-to-end with zero broker exposure.
-5. **Register a plan against this worker.** `tv-arm --register-plan` only POSTs
+5. **Pre-flight the broker session (read-only).** Before any enter, prove the
+   account's broker login actually works — the one path unit tests can't cover:
+   ```sh
+   trade-control-broker-check <seeded-name> --instrument EUR/USD
+   # → acquire_tn/acquire_oanda + one live get_quote; "broker session is LIVE"
+   ```
+   This catches a missing enc-store entry (TN) or a wrong `OANDA_API_KEY` *before*
+   a real trade depends on it. No order is placed.
+6. **Register a plan against this worker.** `tv-arm --register-plan` only POSTs
    to its compiled-in webhook, so to arm *this* worker, build the plan then
    register it explicitly at `--endpoint`:
    ```sh
@@ -293,26 +301,27 @@ Order matters — prove each layer before the next.
    The engine cron then logs `cron engine: N registered plans` and starts
    evaluating it each tick. (Account name must be seeded in `accounts` **and**,
    for TN, present in the enc store — see §4.)
-6. **A dry-run enter on the demo account:** register a plan whose enter carries
+7. **A dry-run enter on the demo account:** register a plan whose enter carries
    `dry_run: true` (tv-arm `--broker-dry-run`). When the enter fires, the worker
    runs the **full** gate chain (resolve, retry, cooldown, prep, veto,
    spread-blackout, SL-spread floor) and logs the placement **without** POSTing
    to the broker. Confirm the log shows the entry accepted + "dry-run" and the
    plan stays alive.
-7. **A live demo enter:** drop `--broker-dry-run`, keep the account `kind=demo`
+8. **A live demo enter:** drop `--broker-dry-run`, keep the account `kind=demo`
    (so it routes to practice). When the enter fires, one real demo placement goes
    to TradeNation (via the enc-store session) / OANDA (practice). Reconcile the
    broker fill against the worker log + the `request_records` / `tick_bundles`
    rows.
 
-Only after 1–7 are clean is the box a candidate to take over a week's demo
+Only after 1–8 are clean is the box a candidate to take over a week's demo
 trading from the staging Cloudflare worker.
 
-> **Validated locally (2026-06-30):** steps 1–5 confirmed against the dev
+> **Validated locally (2026-06-30):** steps 1–6 confirmed against the dev
 > Postgres — worker boots, `/health` 200, signed `status` round-trips + records,
-> and `plan register` → `plan list` → engine `1 registered plans` → `plan delete`
-> all work. Steps 6–7 (broker placement) await a TN demo session on a real
-> firing enter.
+> `plan register` → `plan list` → engine `1 registered plans` → `plan delete` all
+> work, and `trade-control-broker-check testing` pulled a live TN demo quote
+> (the broker login path works). Steps 7–8 (enter dispatch — dry-run then real
+> demo order) await a firing enter from a chart setup.
 
 ---
 
@@ -357,7 +366,7 @@ Tracked so they're not mistaken for bugs on the box:
 | Thing | Value |
 |---|---|
 | package | `trade-control-worker` (workspace member) |
-| binaries | `trade-control-worker` (the server) + `trade-control-accounts` (account-index CLI) |
+| binaries | `trade-control-worker` (server) · `trade-control-accounts` (account-index CLI) · `trade-control-broker-check` (broker-session pre-flight) |
 | config path arg | first positional arg, else `./trade-control.toml` |
 | required env | `SIGNING_KEY`, `ADMIN_KEY` |
 | optional env | `MAX_RISK_PCT_PER_TRADE`, `MAX_OPEN_POSITIONS`, `OANDA_API_KEY`, `OANDA_LIVE`, `PIP_SIZE_<INSTR>` |
