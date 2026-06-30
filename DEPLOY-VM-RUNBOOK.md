@@ -165,6 +165,25 @@ So before the first real intent, ensure the named account on the intent exists i
 both: the enc store (TN) / the `accounts` table (OANDA metadata: name, broker,
 kind=demo, caps).
 
+**Manage the `accounts` table with `trade-control-accounts`** (the native
+metadata CLI — talks straight to Postgres, no worker/HTTP, since the wasm
+`/admin/accounts` routes aren't ported):
+
+```sh
+trade-control-accounts list                                  # reads database.url from ./trade-control.toml
+trade-control-accounts add testing --broker tradenation --kind demo
+trade-control-accounts add ms-oanda-1 --broker oanda --kind demo \
+    --oanda-account-id 101-011-31142393-003 --max-risk-pct 0.5
+trade-control-accounts remove testing
+# point at a specific DB without a config file:
+trade-control-accounts --database-url postgresql://… list
+```
+
+It manages **metadata only**. TradeNation credentials still live in the enc store
+(by name); OANDA uses the shared `OANDA_API_KEY` env + the `oanda_account_id`
+recorded here. So "adding an account" is one metadata row + (for TN) an enc-store
+entry under the same name.
+
 ---
 
 ## 5. systemd unit
@@ -300,6 +319,11 @@ Tracked so they're not mistaken for bugs on the box:
   default; the native receiver requires a *named* account for any broker action
   (`AccountResolveError::Required`). Default-account routing is a deferred TODO
   (see `native_cron.rs::resolve_meta`).
+- **Account management is `trade-control-accounts` (DB-direct), not
+  `trade-control account` (HTTP/admin-route).** The latter hits the wasm worker's
+  `/admin/accounts*` + `wrangler secret put`, neither of which the native worker
+  has. Metadata-only, by design — credentials stay in the enc store (TN) /
+  `OANDA_API_KEY` env (OANDA). A native HTTP admin surface is a later follow-up.
 - **Per-request log capture is empty natively** — `RequestRecord.logs` isn't
   populated yet (the wasm worker buffered `console_log!` lines). The Cloudflare
   Real-time-Logs equivalent is `journalctl` for now.
@@ -312,7 +336,8 @@ Tracked so they're not mistaken for bugs on the box:
 
 | Thing | Value |
 |---|---|
-| package / binary | `trade-control-worker` |
+| package | `trade-control-worker` (workspace member) |
+| binaries | `trade-control-worker` (the server) + `trade-control-accounts` (account-index CLI) |
 | config path arg | first positional arg, else `./trade-control.toml` |
 | required env | `SIGNING_KEY`, `ADMIN_KEY` |
 | optional env | `MAX_RISK_PCT_PER_TRADE`, `MAX_OPEN_POSITIONS`, `OANDA_API_KEY`, `OANDA_LIVE`, `PIP_SIZE_<INSTR>` |

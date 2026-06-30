@@ -4268,6 +4268,7 @@ dependencies = [
  "broker-tradenation",
  "broker-tradenation-adapter",
  "chrono",
+ "clap",
  "color-eyre",
  "serde",
  "serde_json",
