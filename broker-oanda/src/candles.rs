@@ -11,7 +11,6 @@ use chrono::{DateTime, Utc};
 use oanda_client::OandaClient;
 use oanda_client::candles::Granularity as OandaGranularity;
 use trade_control_core::broker::{Candle, CandleError, Granularity, filter_new_candles};
-use worker::console_error;
 
 /// Engine granularity → `oanda_client` granularity. Total — every engine
 /// variant has a direct OANDA equivalent.
@@ -49,7 +48,7 @@ pub async fn get_candles(
         )
         .await
         .map_err(|err| {
-            console_error!("oanda get_candles_range({instrument}): {err:?}");
+            tracing::error!("oanda get_candles_range({instrument}): {err:?}");
             CandleError::Transient
         })?;
 
