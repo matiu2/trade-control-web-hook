@@ -47,7 +47,9 @@
 //! bid/ask book selection, and bar-expiry (`expiry_bars` bounds the fill window).
 
 use trade_control_core::broker::BidAskCandle;
-use trade_control_core::intent::{Direction, Intent, Resolved, ResolvedEntry, Shell};
+use trade_control_core::intent::{
+    Direction, Intent, Resolved, ResolvedEntry, Shell, SlWiden, widen_sl_to_spread_floor,
+};
 use trade_control_core::sweep_gate::{
     SweepReason, bar_expiry_due, breach_detected, market_blackout_due,
 };
@@ -135,7 +137,10 @@ pub fn simulate_fill(
     pip_size: f64,
     candles: &[BidAskCandle],
 ) -> SimOutcome {
-    let resolved = match Resolved::from_intent(intent, shell, pip_size) {
+    // `mut` so the SL-spread-floor widen mirror below can move `stop_loss` in
+    // place — exactly as the worker's `run_enter` does — before the fill / exit
+    // simulation reads it.
+    let mut resolved = match Resolved::from_intent(intent, shell, pip_size) {
         Ok(r) => r,
         Err(err) => return SimOutcome::Unresolved(err.to_string()),
     };
@@ -171,6 +176,39 @@ pub fn simulate_fill(
     // variant doc for why this is an approximation, not an exact mirror.
     if let Some(reject) = spread_blackout_reject(intent, shell, pip_size, candles) {
         return reject;
+    }
+
+    // SL-vs-spread floor SALVAGE (mirror of `run_enter`'s widen-then-reject):
+    // when the stop is closer than `10 × spread` to entry the worker widens it
+    // to `11 × spread` and re-checks R, entering with the wider stop if it still
+    // clears `min_r` and declining otherwise. `simulate_fill` doesn't run
+    // `run_enter`, so mirror that here off the recorded book — the fire bar's
+    // `ask_c − bid_c` IS the spread the worker quoted (same source the
+    // spread-blackout mirror uses). Without this the simulator would fill the
+    // entry (the worker placed it at the widened SL) but then check the *old*,
+    // un-widened stop, stopping the leg out at a level the live broker stop was
+    // never at. The widen mutates `resolved.stop_loss` so both `find_fill` and
+    // the exit loop below see the widened level — and break-even arms off the
+    // widened geometry, matching the live position.
+    if let Some(fire) = candles.first() {
+        let spread_price = fire.ask_c - fire.bid_c;
+        match widen_sl_to_spread_floor(
+            resolved.entry.reference_price(),
+            resolved.stop_loss,
+            resolved.take_profit,
+            spread_price,
+            resolved.min_r,
+        ) {
+            SlWiden::Unchanged => {}
+            SlWiden::Widened { new_stop_loss, .. } => {
+                resolved.stop_loss = new_stop_loss;
+            }
+            SlWiden::Reject { .. } => {
+                return SimOutcome::Declined {
+                    name: "sl-widen-below-min-r".to_string(),
+                };
+            }
+        }
     }
 
     // Phase 1 — find the fill (shared with `breakeven_armed_at`).
@@ -1011,17 +1049,58 @@ mod tests {
     }
 
     #[test]
-    fn elevated_spread_outside_window_fills() {
+    fn elevated_spread_outside_window_does_not_black_out() {
         // Control: the SAME wide 30-pip spread, but the fire bar is NOT at the
-        // NY-close edge → window closed → no blackout (the worker wouldn't even
-        // sample). Falls through to the normal path (NeverFilled here).
+        // NY-close edge → window closed → no spread-BLACKOUT (the worker wouldn't
+        // even sample). The spread is still wide enough to trip the SL-vs-spread
+        // floor though: this long stop's SL is 50 pips, so `10 × 30 = 300` pips
+        // >> 50 → the floor is violated, the widen pushes the stop to `11 × 30 =
+        // 330` pips, and R collapses to 100/330 ≈ 0.30 < 1 → Declined via the
+        // widen mirror (NOT a blackout). The point of this control is that the
+        // outcome is *not* `SpreadBlackout`; the SL-widen decline is the correct
+        // fall-through for a wide spread that's outside the blackout window.
         let intent = resolvable_long_stop();
         let shell = Shell::from_candle(&spread_fire_bar(NON_EDGE_TS, 1.1040, 0.0030).mid());
         let path = [spread_fire_bar(NON_EDGE_TS, 1.1040, 0.0030)];
+        let out = simulate_fill(&intent, &shell, 0.0001, &path);
+        assert!(
+            !matches!(out, SimOutcome::SpreadBlackout { .. }),
+            "a wide spread outside the close-edge window must not black out, got {out:?}"
+        );
         assert_eq!(
-            simulate_fill(&intent, &shell, 0.0001, &path),
-            SimOutcome::NeverFilled,
-            "a wide spread outside the close-edge window must not black out"
+            out,
+            SimOutcome::Declined {
+                name: "sl-widen-below-min-r".to_string(),
+            },
+            "the wide spread trips the SL-vs-spread floor; widening to 11x drops R<1 → declined"
+        );
+    }
+
+    #[test]
+    fn widened_sl_protects_the_leg_in_the_fill_path() {
+        // The follow-up bug (BUG-sl-spread-floor…, 2026-07-01): the widen was
+        // applied to the entry R-check but NOT to the stop the fill/exit sim
+        // checks against, so a leg stopped out at the OLD un-widened SL even
+        // though the live broker stop sat at the widened level.
+        //
+        // Geometry: long stop trigger 1.1050, SL 1.1000 (50 pips), TP 1.1150.
+        // A 6-pip spread trips the 10× floor (60 > 50) → widen to 11× = 66 pips
+        // → SL moves DOWN to 1.0984. R = 100/66 ≈ 1.52 ≥ 1 → entry stands.
+        // An adverse bar then dips its bid to 1.0990: that crosses the ORIGINAL
+        // 1.1000 SL (the buggy behaviour would stop out here) but NOT the
+        // widened 1.0984 — so with the fix the leg survives and stays open.
+        let intent = resolvable_long_stop();
+        let fire = spread_fire_bar(NON_EDGE_TS, 1.1040, 0.0006); // 6-pip spread
+        let shell = Shell::from_candle(&fire.mid());
+        // Fill bar: ask reaches the 1.1050 trigger (long fills on the ask book).
+        let fill_bar = ba_candle("2026-03-12T11:00:00Z", 1.1052, 1.1045, 1.1055, 1.1048);
+        // Adverse bar: bid dips to 1.0990 — past the OLD SL, short of the widened.
+        let dip_bar = ba_candle("2026-03-12T12:00:00Z", 1.1010, 1.0990, 1.1015, 1.0995);
+        let path = [fire, fill_bar, dip_bar];
+        let out = simulate_fill(&intent, &shell, 0.0001, &path);
+        assert!(
+            matches!(out, SimOutcome::FilledOpen { .. }),
+            "leg must survive: the dip crosses the old SL but not the widened one, got {out:?}"
         );
     }
 

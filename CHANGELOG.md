@@ -24,12 +24,32 @@ level — a widened stop may sit past `too-high` / `too-low`, and the continuous
 at-entry level vetos handle invalidation independently (per the operator's
 call).
 
-**Behaviour.** Verified on the wheat replay: the first two enters that used to
-0R now **fill** (one stopped out, one ran to break-even), the later three reject
-with `sl-widen-below-min-r` because by then price had fallen near the TP and
-widening would drop `R < 1.0`. Single code path (`run_enter`) shared by the
-live worker and the offline `replay-candles` simulator, so the widen reproduces
-identically in both (no drift).
+**Behaviour.** Verified on the wheat replay: the first enter that used to 0R now
+**fills and rides to break-even** (its widened stop survives the post-entry
+spike), the later enters reject with `sl-widen-below-min-r` because by then price
+had fallen near the TP and widening would drop `R < 1.0`. Single code path
+(`run_enter`) shared by the live worker and the offline `replay-candles`
+simulator, so the widen reproduces identically in both (no drift).
+
+**Follow-up (2026-07-01): apply the widened SL to the fill/exit + display
+paths, not just the entry R-check.** The first cut widened the SL inside
+`run_enter` (so the live worker *places* the widened stop), but the offline
+`simulate_fill` re-derived the bracket from the signed intent and never saw the
+widen — so a replayed leg filled at the widened entry yet was checked against
+the *old, tight* SL, stopping out at a level the live broker stop was never at.
+On the wheat replay this flipped leg 1 from a (correct) break-even into a
+spurious −1R. Fix: `simulate_fill` (in `engine`) now mirrors the widen exactly
+as it already mirrors the entry-level-veto and spread-blackout gates — off the
+fire bar's `ask_c − bid_c` — so the widened stop reaches `find_fill`, the exit
+loop, and break-even arming; a `Reject` becomes `SimOutcome::Declined
+{ sl-widen-below-min-r }`. The replay report's `order:` journaling line and
+annotation boxes apply the same widen (shared `apply_spread_floor_widen`
+helper) so the printed SL matches the protected stop instead of the un-widened
+signed level. The **live worker was already correct** (it places the widened SL
+and its break-even cron amends from the live broker position) — this was a
+replay-only drift. 2 new engine tests (widened SL protects the leg in the fill
+path; a wide spread outside the blackout window declines via the widen rather
+than blacking out).
 
 **Config.** New constant `SL_WIDEN_SPREAD_MULTIPLE = 11.0`. New pure helper
 `widen_sl_to_spread_floor(entry, sl, tp, spread, min_r) -> SlWiden` and the

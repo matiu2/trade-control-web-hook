@@ -20,7 +20,8 @@
 
 use chrono::{DateTime, Utc};
 use trade_control_core::intent::{
-    Action, Direction, NoEntryWindow, Resolved, ResolvedEntry, Shell,
+    Action, Direction, NoEntryWindow, Resolved, ResolvedEntry, Shell, SlWiden,
+    widen_sl_to_spread_floor,
 };
 use trade_control_core::spread_blackout::elevated_threshold_pips;
 use trade_control_engine::{
@@ -260,7 +261,7 @@ pub fn resolve_fire_any(plan: &TradePlan, fire: &Fire, closes: &[CloseFire]) -> 
         Some(sig) => Shell::from_candle_and_signal(candle, sig),
         None => Shell::from_candle(candle),
     };
-    let resolved = Resolved::from_intent(intent, &shell, plan.pip_size).ok()?;
+    let mut resolved = Resolved::from_intent(intent, &shell, plan.pip_size).ok()?;
     // For an open / not-taken trade the box runs to the last replayed bar;
     // closed trades override this with their exit bar below.
     let window_end = fire.forward.last().map(|c| c.time)?;
@@ -291,6 +292,11 @@ pub fn resolve_fire_any(plan: &TradePlan, fire: &Fire, closes: &[CloseFire]) -> 
             kind: FillKind::GateBlocked,
         });
     }
+
+    // Mirror `simulate_fill`'s SL-vs-spread-floor widen onto the *displayed*
+    // bracket so the annotation box (and the `order:` journaling line) show the
+    // same stop the sim and the live worker actually protect with.
+    apply_spread_floor_widen(&mut resolved, &fire.forward);
 
     let raw = simulate_fill(intent, &shell, plan.pip_size, &fire.forward);
     let (fill_at, until, entry_price, kind) = match apply_reversal_close(raw, closes) {
@@ -506,12 +512,17 @@ fn render_fire(
 
     // Resolve the bracket the worker would have placed (direction, entry, SL,
     // TP) and print it for every enter — even ones the price path never fills.
-    // This is the journaling line: what order went on at this bar.
+    // This is the journaling line: what order went on at this bar. The widen is
+    // applied so the printed SL matches the protected stop, not the un-widened
+    // signed level (the 2026-07-01 follow-up).
     match Resolved::from_intent(intent, &shell, plan.pip_size) {
-        Ok(resolved) => line.push_str(&format!(
-            "    {}\n",
-            describe_order(&resolved, plan.pip_size)
-        )),
+        Ok(mut resolved) => {
+            apply_spread_floor_widen(&mut resolved, &fire.forward);
+            line.push_str(&format!(
+                "    {}\n",
+                describe_order(&resolved, plan.pip_size)
+            ));
+        }
         Err(err) => line.push_str(&format!("    order: UNRESOLVED — {err:?}\n")),
     }
 
@@ -615,6 +626,34 @@ fn render_fire(
         }
     }
     line
+}
+
+/// Apply the worker's SL-vs-spread-floor *widen* to a resolved bracket so the
+/// journaled levels match the stop the live worker and `simulate_fill` actually
+/// protect with. The fire bar's `ask_c − bid_c` is the spread the worker would
+/// have quoted (same source `simulate_fill`/`run_enter` use). A `Reject` leaves
+/// the bracket as-is — the leg won't fill, so the intended (un-widened) bracket
+/// is still the right thing to journal. No-op when there's no fire bar or the
+/// stop already clears the floor. See `widen_sl_to_spread_floor` and the
+/// 2026-07-01 follow-up (widened SL must reach the fill/exit + display paths,
+/// not just the entry R-check).
+fn apply_spread_floor_widen(
+    resolved: &mut Resolved,
+    forward: &[trade_control_engine::BidAskCandle],
+) {
+    let Some(fire_bar) = forward.first() else {
+        return;
+    };
+    let spread_price = fire_bar.ask_c - fire_bar.bid_c;
+    if let SlWiden::Widened { new_stop_loss, .. } = widen_sl_to_spread_floor(
+        resolved.entry.reference_price(),
+        resolved.stop_loss,
+        resolved.take_profit,
+        spread_price,
+        resolved.min_r,
+    ) {
+        resolved.stop_loss = new_stop_loss;
+    }
 }
 
 /// One-line summary of the bracket order the worker would have placed: the
