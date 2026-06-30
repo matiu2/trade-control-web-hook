@@ -266,6 +266,29 @@ pub async fn run(
                         tracing::error!(rule = %fired.rule_id, error = %e, "apply_resume failed");
                     }
                 }
+                // A prep fire seeds the store the enter's prep gate then reads —
+                // exactly as the worker's `dispatch_action` routes `Action::Prep`
+                // through `handle_prep` (→ `store.set_prep`). Before this, the
+                // replay dropped prep fires (`_ => {}`), so `run_enter`'s prep
+                // gate always saw `None` and rejected every preps-gated enter
+                // with `missing-prep` — a silent divergence introduced when the
+                // enter decision moved to the real `run_enter` (commit 1c0a043).
+                // The break-and-close prep is emitted by the engine; the retest
+                // prep is emitted by `stamp_retest` (engine) the bar it stamps.
+                Action::Prep => {
+                    let verified = Verified {
+                        shell: Shell::from_candle(&fired.candle),
+                        intent: fired.intent.clone(),
+                    };
+                    let result = dispatch::handle_prep(&store, &verified, now).await;
+                    if !result.is_success() {
+                        tracing::error!(
+                            rule = %fired.rule_id,
+                            status = result.status,
+                            "handle_prep rejected in replay"
+                        );
+                    }
+                }
                 _ => {}
             }
 
