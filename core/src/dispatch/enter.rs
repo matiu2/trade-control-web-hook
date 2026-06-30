@@ -287,7 +287,9 @@ pub async fn run_enter<B: Broker, S: StateStore>(
         // standard dispatch, which itself routes baked M/W to from_mw_intent.
         None => Resolved::from_intent(&verified.intent, &verified.shell, pip_size),
     };
-    let resolved = match resolve_result {
+    // `mut` so the SL-spread-floor salvage below can widen `stop_loss` in
+    // place before the `EntryRequest` is built.
+    let mut resolved = match resolve_result {
         Ok(r) => r,
         // An M/W bar that hasn't completed its real-time arming sequence is
         // a *benign, expected* decline ("stay armed for the next bar"), not a
@@ -601,33 +603,73 @@ pub async fn run_enter<B: Broker, S: StateStore>(
         }
         Ok(quote) => {
             let spread_price = quote.spread();
-            let sl_distance = (entry_reference_price(&resolved.entry) - resolved.stop_loss).abs();
-            if crate::intent::sl_spread_floor_violation(sl_distance, spread_price) {
-                let min_sl = crate::intent::SL_MIN_SPREAD_MULTIPLE * spread_price;
-                // Render the distances in pips for the operator-facing message.
-                // `pip_size` is the baked intent value (or the secret/default
-                // fallback); guard against a non-positive divisor so a bad pip
-                // never produces a NaN/inf in the reject body.
-                let (sl_pips, spread_pips) = if pip_size > 0.0 {
-                    (sl_distance / pip_size, spread_price / pip_size)
-                } else {
-                    (sl_distance, spread_price)
-                };
-                let message = format!(
-                    "entry blocked: SL <= {mult:.0}x spread: SL distance {sl_pips:.1} pips; spread = {spread_pips:.1} pips",
-                    mult = crate::intent::SL_MIN_SPREAD_MULTIPLE,
-                );
-                tracing::info!(
-                    "entry rejected: sl-below-10x-spread instrument={} sl_distance={sl_distance} < {min_sl} (spread={spread_price}, {}x; {sl_pips:.1} pips vs {spread_pips:.1} pips) (id={})",
-                    resolved.instrument,
-                    crate::intent::SL_MIN_SPREAD_MULTIPLE,
-                    verified.intent.id
-                );
-                return ActionResult::Rejected {
-                    status: 422,
-                    body: message,
-                    outcome: "rejected: sl-below-10x-spread".into(),
-                };
+            let entry_price = entry_reference_price(&resolved.entry);
+            let sl_distance = (entry_price - resolved.stop_loss).abs();
+            // Render distances in pips for any operator-facing message.
+            // `pip_size` is the baked intent value (or the secret/default
+            // fallback); guard against a non-positive divisor so a bad pip
+            // never produces a NaN/inf in a message body.
+            let to_pips = |d: f64| if pip_size > 0.0 { d / pip_size } else { d };
+
+            // SALVAGE-BY-WIDENING: rather than reject a too-tight stop outright,
+            // try widening the SL to `SL_WIDEN_SPREAD_MULTIPLE`× the spread and
+            // re-check the trade still clears its R-floor. A wider stop is
+            // strictly *safer* against spread noise; we only reject if even the
+            // widened stop can't hold an `>= min_r` trade against the fixed TP.
+            // Pure decision in `crate::intent::widen_sl_to_spread_floor`; this
+            // is the live-quote wrapper. The widened SL may sit past the
+            // pattern's invalidation level — that's fine, the continuous
+            // entry-level vetos abort the trade independently if price reaches
+            // invalidation. Mutating `resolved.stop_loss` here flows into the
+            // `EntryRequest` built just below.
+            match crate::intent::widen_sl_to_spread_floor(
+                entry_price,
+                resolved.stop_loss,
+                resolved.take_profit,
+                spread_price,
+                resolved.min_r,
+            ) {
+                crate::intent::SlWiden::Unchanged => {}
+                crate::intent::SlWiden::Widened {
+                    new_stop_loss,
+                    new_sl_distance,
+                    new_r,
+                } => {
+                    tracing::info!(
+                        "sl-spread-floor: widened SL {old_sl} -> {new_stop_loss} for {} (sl_distance {old_pips:.1} -> {new_pips:.1} pips, spread {spread_pips:.1} pips, {mult:.0}x floor; R now {new_r:.2} >= min_r {min_r:.2}) (id={})",
+                        resolved.instrument,
+                        verified.intent.id,
+                        old_sl = resolved.stop_loss,
+                        old_pips = to_pips(sl_distance),
+                        new_pips = to_pips(new_sl_distance),
+                        spread_pips = to_pips(spread_price),
+                        mult = crate::intent::SL_WIDEN_SPREAD_MULTIPLE,
+                        min_r = resolved.min_r,
+                    );
+                    resolved.stop_loss = new_stop_loss;
+                }
+                crate::intent::SlWiden::Reject {
+                    widened_sl_distance,
+                    r_at_widen,
+                    min_r,
+                } => {
+                    let message = format!(
+                        "entry blocked: SL too close to spread and widening to {mult:.0}x spread ({widened_pips:.1} pips) would drop R to {r_at_widen:.2} < min_r {min_r:.2}",
+                        mult = crate::intent::SL_WIDEN_SPREAD_MULTIPLE,
+                        widened_pips = to_pips(widened_sl_distance),
+                    );
+                    tracing::info!(
+                        "entry rejected: sl-widen-below-min-r instrument={} spread={spread_price} widened_sl_distance={widened_sl_distance} ({widened_pips:.1} pips) r_at_widen={r_at_widen:.3} < min_r={min_r} (id={})",
+                        resolved.instrument,
+                        verified.intent.id,
+                        widened_pips = to_pips(widened_sl_distance),
+                    );
+                    return ActionResult::Rejected {
+                        status: 422,
+                        body: message,
+                        outcome: "rejected: sl-widen-below-min-r".into(),
+                    };
+                }
             }
         }
     }

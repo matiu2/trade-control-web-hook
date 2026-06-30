@@ -1,5 +1,52 @@
 # Changelog
 
+## Unreleased — 2026-06-30 — worker: salvage a too-tight SL by widening to 11× spread
+
+**Why.** The SL-vs-spread floor rejected every entry whose stop sat closer
+than `10 × spread` to entry — including wide-spread instruments (wheat) whose
+*charted* stop was a perfectly reasonable 34+ pips but still failed the floor
+because the spread itself is large. A real H&S short on WHEAT_USD
+(`hs-wheat-usd-7c4116b2`, 2026-06-23) had **all six** of its enter fires
+blocked `rejected: sl-below-10x-spread → 0R`, so the operator entered manually.
+Rejecting a too-tight stop throws away salvageable trades when the fix is simply
+to give the stop more room.
+
+**What changed.** On the worker enter path, a floor violation now triggers a
+**widen-then-reject** instead of an outright reject. The stop is moved to
+`11 × spread` (`SL_WIDEN_SPREAD_MULTIPLE`, strictly above the `10×` floor so it
+clears with a margin), *away* from entry — never tighter. If the trade still
+clears its R-floor at the wider stop (`R = tp_distance / (11 × spread) ≥
+min_r`), the order is placed with the widened SL and the worker logs the widen.
+If even the widened stop drops `R` below `min_r`, there is no legal stop and the
+entry is rejected with the new outcome `rejected: sl-widen-below-min-r` (HTTP
+422). The widen deliberately does **not** clamp to the pattern's invalidation
+level — a widened stop may sit past `too-high` / `too-low`, and the continuous
+at-entry level vetos handle invalidation independently (per the operator's
+call).
+
+**Behaviour.** Verified on the wheat replay: the first two enters that used to
+0R now **fill** (one stopped out, one ran to break-even), the later three reject
+with `sl-widen-below-min-r` because by then price had fallen near the TP and
+widening would drop `R < 1.0`. Single code path (`run_enter`) shared by the
+live worker and the offline `replay-candles` simulator, so the widen reproduces
+identically in both (no drift).
+
+**Config.** New constant `SL_WIDEN_SPREAD_MULTIPLE = 11.0`. New pure helper
+`widen_sl_to_spread_floor(entry, sl, tp, spread, min_r) -> SlWiden` and the
+`SlWiden` enum, both in `core::intent`. `Resolved` gains a `min_r: f64` field
+(the effective R-floor the trade was held to at resolve time) so the enter path
+can re-check the floor against the widened geometry without re-resolving a
+scripted `min_r` tunable.
+
+**Tests.** 8 new unit tests on the widen helper (unchanged / degenerate-spread /
+long-widen / short-widen / below-R-floor reject / min_r-override / wheat-short
+salvage). 756 core tests green; workspace builds (worker wasm + CLI).
+
+**Breaking.** `Resolved` gained a required `min_r` field — any out-of-tree
+struct-literal construction must set it (all in-tree sites updated). Wire format
+unchanged: nothing signed changed, the widen is a pure runtime decision, and
+no intent field was added.
+
 ## Unreleased — 2026-06-30 — tv-arm: tolerate degenerate TradingView drawings
 
 **Why.** A `tv-arm-dev` arm on NZD/CAD aborted with

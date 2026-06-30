@@ -795,6 +795,7 @@ mod tests {
             stop_loss: sl,
             take_profit: tp,
             risk: RiskBudget::Percent(1.0),
+            min_r: 1.0,
             dry_run: false,
             recover_entry: None,
             breakeven: None,
