@@ -1,5 +1,44 @@
 # Changelog
 
+## Unreleased — 2026-07-01 — SL-floor renders in raw price; broker-oanda native build
+
+**Why (SL-floor).** The SL-vs-spread floor is a pure ratio of two raw-price
+distances (`sl_distance` vs `spread = ask − bid`), so the unit cancels and the
+decision never depends on `pip_size`. But the operator-facing widen/reject
+messages in `run_enter` divided both distances by `pip_size` to print
+"34.3 pips vs 10.0 pips". On instruments whose catalog `pip_size` was wrong
+(fractional-pip metals, surfaced while journaling a Silver/XAGUSD entry), that
+made a *correct* decision *read* wrong, and it added a pip dependency the rule
+shouldn't have.
+
+**What changed (SL-floor).** Removed pip from the rendering entirely: the
+widened-SL log, the `sl-widen-below-min-r` reject body, and its tracing line now
+report `sl_distance` / widened distance / spread in **raw price**. The decision
+logic (`sl_spread_floor_violation`, `widen_sl_to_spread_floor`) was already
+pip-free and is unchanged. (Operator chose raw price over ticks — no new signed
+field; the worker has no `tick_size` in WASM.) New test
+`verdict_is_invariant_to_pip_size` documents the floor verdict is identical for
+an FX-scale (0.0001) and a metal-scale (0.00001) spread with matching ratios.
+
+**Why (broker-oanda).** The local native worker and `trade-control-broker-check`
+panicked ("function not implemented on non-wasm32 targets") the moment OANDA
+made its first TLS call: `broker-oanda` unconditionally enabled `oanda-client`'s
+`wasm_js` feature, forcing `getrandom/wasm_js` (browser RNG) into native
+binaries. TradeNation was unaffected (no `oanda-client` dep), which is why
+reversals worked natively and OANDA never could.
+
+**What changed (broker-oanda).** Moved `oanda-client { features = ["wasm_js"] }`
+and `worker = "0.8"` into `[target.'cfg(target_arch = "wasm32")'.dependencies]`;
+base `oanda-client` is now `default-features = false` so native getrandom uses
+the OS backend. `console_error!`/`console_log!` → `tracing::error!`/`info!`
+(wasm-safe). The `worker::Env` login path (`login` / `login_with_live` /
+`get_secret`) is `#[cfg(target_arch = "wasm32")]`-gated; native reaches the
+broker via `OandaBroker::from_api_key` (unchanged). Verified both targets build,
+40 broker-oanda tests pass, `getrandom` is `default` (no `wasm_js`) on native.
+
+**Tests.** 757 core (+1), 40 broker-oanda. wasm worker + native both build;
+clippy/fmt clean.
+
 ## Unreleased — 2026-06-30 — worker: salvage a too-tight SL by widening to 11× spread
 
 **Why.** The SL-vs-spread floor rejected every entry whose stop sat closer
