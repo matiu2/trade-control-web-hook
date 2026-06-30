@@ -252,41 +252,56 @@ Key facts a refactorer must preserve:
   `reversal_veto_plan()` helper (KV-free, unit-tested); the KV write
   is a thin wrapper.
 
-### `too-high` is close-confirmed now; `too-low` still fires on a wick
+### Intrabar crosses fire on the wick (from the open side), not the close
 
-The two at-level invalidation vetos a H&S enter carries are **not**
-symmetric in cross semantics, and that asymmetry is intentional — don't
-"fix" one to match the other.
+**Updated 2026-07-01 (`engine` commit `f231629`).** This reverts the earlier
+"too-high is close-confirmed" rule. The engine's `level_crossed`
+(`engine/src/evaluate.rs`) **`BarEvent::Intrabar`** arm now reads the wick on
+the cross side, **close-agnostic**, discriminated by which side the bar *came
+from* (its `open`):
 
-For a **short** trade (mirror for long):
+- `Up`     ⇒ `open <= level && high >= level`  (came from below, reached above)
+- `Down`   ⇒ `open >= level && low  <= level`  (came from above, reached below)
+- `Either` ⇒ any straddle (`low <= level <= high`) — unchanged
 
-- **`too-high` = invalidation** (the drawing-bound horizontal at the
-  shoulder cap). Built as `HorizontalCross { dir: Up, bar: Intrabar }`
-  in `tv-arm/src/trade_plan_build.rs::invalidation_or_pcl_trigger`. The
-  engine's intrabar `Up` cross requires the bar to **close** on the up
-  side: `straddles && candle.c >= level` (`engine/src/evaluate.rs`
-  `level_crossed`). **Previous behaviour was any wick above the level
-  (a touch); it is now a close above.** A bar whose high pokes above
-  `too-high` but closes back below does **not** fire. (Seen on
-  NZD/CHF 2026-06-19: the 10:45 Brisbane bar `H=0.46359 C=0.46351`
-  vs level `0.46354` — wick above, close below → no fire, by design.)
+The intuition (operator's framing): on a tick timeline a bar that opened on one
+side of the level and traded through to the other **did** cross, even if it
+closed back on the original side. The old rule required a confirming **close**
+(`Up ⇒ c >= level`), which silently dropped a retest tap-and-bounce — the bug
+this fixed (AUD/JPY iH&S long 2026-06-29: a 6pm bar opened above the descending
+neckline, wicked below, closed back above → the retest didn't stamp for ~6h).
+See `[[intrabar_cross_reads_wick_not_close]]`.
 
-- **`too-low` = pcl-exhausted** (the computed fib level, ~80% of the way
-  to TP). Built as `PriceValueCross { dir: Either, bar: Intrabar }`.
-  Intrabar `Either` fires on **any straddle** regardless of where the
-  close sits — so a wick down to the 80%-completion level **still
-  aborts** the trade. This is **unchanged** from the original behaviour
-  and must stay that way: if a short ran 80% to TP without us, a wick
-  alone is reason enough to abort.
+**`BarEvent::OnClose` is unchanged** — `03-prep-break-and-close` still requires a
+genuine close through the line (open one side, **close** the other). Only the
+intrabar arm moved.
 
-Why the asymmetry is right: an invalidation wick that immediately
-retreats is debatably *not* an invalidation (close-confirm filters the
-fakeout), whereas a pcl-exhaustion wick means the move you wanted
-already happened without you — abort on the touch. If you ever
-unify these, unify toward the operator's intent per-level, not toward
-one cross mode for both. (These levels are also baked onto the enter as
-continuous `entry_level_vetos` — see Bug #12 / `[[bug12_at_entry_level_vetos]]`
-— which is `is_past`-inclusive and independent of this cross-guard.)
+Consumers of the intrabar arm, all now wick-from-the-open-side (for a **short**;
+mirror for long):
+
+- **`too-high` = invalidation** (drawing-bound horizontal at the shoulder cap).
+  `HorizontalCross { dir: Up, bar: Intrabar }` from
+  `tv-arm/src/trade_plan_build.rs::invalidation_or_pcl_trigger`. A bar that
+  opened below `too-high` and whose **high reaches above** it now fires — a
+  spike-and-recover that crossed up from below invalidates intrabar. A bar that
+  merely *closes* above without crossing up from below does **not**. (The old
+  close-confirm NZD/CHF example no longer applies as written.)
+- **`too-low` = pcl-exhausted** (computed fib, ~80% to TP).
+  `PriceValueCross { dir: Either, bar: Intrabar }` — `Either`, so **any
+  straddle** aborts. Unchanged: if a short ran 80% to TP without us, a wick
+  alone is reason enough.
+- **`04-prep-retest`** — `TrendlineCross { dir: Down (long) / Up (short),
+  bar: Intrabar }`. The retest of the neckline: long = open above the descending
+  neckline, low wicks below. This is what the fix unblocked.
+- **M/W cancel / overshoot vetos** (`mw_price_trigger`) — same intrabar arm.
+
+These levels are also baked onto the enter as continuous `entry_level_vetos`
+(see Bug #12 / `[[bug12_at_entry_level_vetos]]`) — `is_past`-inclusive and
+independent of this cross-guard.
+
+**Follow-up (not built yet):** a tunable cross-depth buffer so a one-tick graze
+doesn't trigger — must cross by N ticks or ~0.1% of the line price. Designing
+next.
 
 ### tv_arm_hs.py: server-side trendline-cross eval is anchor-bounded
 
