@@ -320,27 +320,31 @@ fn invalidation_or_pcl_trigger(
         _ => return None,
     };
     if basename_dir == direction {
-        // Drawing-bound invalidation: short crosses up into the cap
-        // (literal `too-high`), long crosses down into the floor (`too-low`).
+        // Drawing-bound invalidation = the human's **drawn line** (below the
+        // shoulder/head for a long `too-low`, above for a short `too-high`).
         //
-        // The short-side `too-high` cap is **close-confirmed** (`OnClose`): a
-        // bar must genuinely *close* above the cap to invalidate — an intrabar
-        // spike above that closes back below does not. The long-side `too-low`
-        // floor mirror stays **intrabar** (wick) per the wick-cross change.
-        // (Operator call 2026-07-01: revert only the literal `too-high` name to
-        // close-confirm; leave the mirror on the wick.)
+        // A drawn line is **close-confirmed** (`OnClose`) in *both* directions:
+        // the operator's semantics are "the candle opened one side of my line
+        // and closed the other" — a genuine break. An intrabar spike through the
+        // line that closes back does not invalidate. This is the line-vs-fib
+        // distinction (operator 2026-07-01): the drawn line is close-confirm;
+        // the fib level (the `else` branch) is a wick-through. Direction only
+        // decides which *way* the line is crossed, not the confirm mode.
         let d = roles.invalidation.as_ref()?;
-        let (dir, bar) = match direction {
-            ConvDirection::Short => (CrossDir::Up, BarEvent::OnClose),
-            ConvDirection::Long => (CrossDir::Down, BarEvent::Intrabar),
+        let dir = match direction {
+            ConvDirection::Short => CrossDir::Up,  // close above the cap
+            ConvDirection::Long => CrossDir::Down, // close below the floor
         };
         Some(Trigger::HorizontalCross {
             level: horizontal_level(d)?,
             dir,
-            bar,
+            bar: BarEvent::OnClose,
         })
     } else {
-        // Opposite-name veto = pcl-exhausted, a computed price value.
+        // Opposite-name veto = pcl-exhausted, a computed **fib** level ("the
+        // power of the setup has been consumed"). A fib level is a
+        // **wick-through** (`Intrabar`, `Either`): any straddle aborts — if the
+        // move ran ~80% to TP without us, a wick alone is reason enough.
         let fib = roles.tp_fib.as_ref()?;
         Some(Trigger::PriceValueCross {
             level: pcl_exhausted_price_from_fib(&fib.prices(), direction),
@@ -713,14 +717,15 @@ mod tests {
         assert_eq!(enter.fire_mode, FireMode::Once);
     }
 
-    /// The long-side (IH&S) invalidation floor is the mirror of the short cap:
-    /// its alert is named `01-veto-too-low` and it stays on **intrabar (wick)**
-    /// semantics — a low wicking below the floor invalidates, no close required.
-    /// This pins the deliberate asymmetry introduced 2026-07-01: only the
-    /// literal `too-high` cap was reverted to `OnClose`; the `too-low` floor
-    /// keeps the wick-cross behaviour.
+    /// The long-side (IH&S) invalidation floor is a **drawn line** (named
+    /// `01-veto-too-low`), so it is **close-confirmed** (`OnClose`) — a bar must
+    /// open above and *close* below the floor to invalidate; an intrabar wick
+    /// through that closes back does not. This is the line-vs-fib rule (operator
+    /// 2026-07-01): the human's drawn line is close-confirm in *both* directions;
+    /// only the computed fib/pcl level is a wick-through. (Supersedes the earlier
+    /// asymmetry where only the short `too-high` cap was close-confirm.)
     #[test]
-    fn ihs_long_too_low_invalidation_stays_intrabar_wick() {
+    fn ihs_long_too_low_invalidation_is_close_confirmed() {
         let alerts = vec![
             alert("01-veto-too-low", Action::Veto),
             alert("03-prep-break-and-close", Action::Prep),
@@ -750,13 +755,14 @@ mod tests {
 
         let by_id = |id: &str| plan.rules.iter().find(|r| r.rule_id == id).unwrap();
 
-        // Long invalidation floor: crosses DOWN into the floor, intrabar (wick).
+        // Long invalidation floor: a drawn line → crosses DOWN into the floor,
+        // close-confirmed (OnClose).
         assert!(matches!(
             by_id("01-veto-too-low").trigger,
             Trigger::HorizontalCross {
                 level,
                 dir: CrossDir::Down,
-                bar: BarEvent::Intrabar,
+                bar: BarEvent::OnClose,
             } if (level - 1.1000).abs() < 1e-9
         ));
     }

@@ -1,5 +1,45 @@
 # Changelog
 
+## Unreleased — 2026-07-02 — invalidation: drawn line = close-confirm (both directions), fib = wick
+
+**Why.** The invalidation cross-mode was tied to the *name* (`too-high` →
+close-confirm, `too-low` → wick), which was only correct for short trades. For a
+**long** trade the `too-low` is the human's **drawn line** (below the
+shoulder/head) and must be close-confirmed — but it was baked as `Intrabar`
+(wick), so a 7am wick that closed back above the floor wrongly invalidated the
+setup (AUD/NZD long, 2026-07-01: too-low fired on a wick, killing the plan before
+the entry).
+
+**The correct rule (operator).** The two invalidation guards are two different
+*kinds*, and the kind — not the direction — decides the cross-mode:
+
+- **The drawn line** (human-annotated: `too-low` for a long, `too-high` for a
+  short) is **close-confirmed** (`OnClose`) in *both* directions — "the candle
+  opened one side of my line and closed the other" is a genuine break; an
+  intrabar spike that closes back does not invalidate.
+- **The computed fib / pcl level** (the opposite name: `too-high` for a long,
+  `too-low` for a short — "the power of the setup is consumed") is a
+  **wick-through** (`Intrabar`, `Either`): any straddle aborts.
+
+Direction only decides *which way* the drawn line is crossed (`Down` into the
+long floor, `Up` into the short cap), not the confirm mode.
+
+**What changed.** `invalidation_or_pcl_trigger` (`tv-arm/src/trade_plan_build.rs`)
+now emits the drawn-line branch as `HorizontalCross { bar: OnClose }` for both
+directions (was `Intrabar` for long). The fib/pcl branch is unchanged
+(`PriceValueCross { dir: Either, bar: Intrabar }`). This **supersedes** the
+2026-07-01 asymmetry where only the short `too-high` cap was reverted to
+`OnClose`.
+
+**Build-site only.** The engine's `OnClose`/`Intrabar` arms are unchanged; this
+only changes which `BarEvent` tv-arm bakes. `replay-candles` reads the same plan,
+so replay and the live worker both pick it up with no engine change.
+
+**Tests.** `ihs_long_too_low_invalidation_is_close_confirmed` (was
+`…stays_intrabar_wick`, flipped to assert `OnClose`);
+`builds_hs_short_rules_with_correct_triggers` still asserts the short cap
+`OnClose`. tv-arm 178 green; clippy + fmt clean.
+
 ## Unreleased — 2026-07-01 — bake `--start` into the plan for self-consistent replays
 
 **Why.** `tv-arm --start` only affected *arming* (which drawings to pick). The
