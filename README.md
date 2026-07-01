@@ -1631,7 +1631,12 @@ pair per event, then drops any pair whose window has already elapsed. The
   chart* and picks each role by its nearest-to-`--start` drawing, walking in the
   role's natural direction — neckline/retest = nearest *before* start,
   invalidation = nearest *either side*, trade-expiry = nearest *after*, M/W path
-  = the one whose shoulders bracket start. When a chart carries *both* a stray
+  = the one whose shoulders bracket start. The invalidation pick additionally
+  applies a **side-of-neckline filter**: a `too-low` floor must sit *below* the
+  neckline and a `too-high` cap *above* it, so a stale invalidation line left at
+  the wrong price by an earlier trade is dropped before the nearest-start
+  tiebreak (it won't be selected just because its anchor *time* sat nearer the
+  cursor). When a chart carries *both* a stray
   M/W path and an H&S neckline, the arm defers to whichever is anchored nearer
   `--start` (path neckline `C` vs the drawn neckline) — so a leftover path from
   an earlier setup can't hijack an H&S arm into M/W. The news/blackout vertical pairs

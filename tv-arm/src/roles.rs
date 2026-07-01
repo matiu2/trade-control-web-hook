@@ -293,13 +293,27 @@ pub fn classify<F: DrawingFetcher>(
 
     let mut roles = Roles::default();
 
-    if let Some((d, lbl)) =
-        pick_slot_with_label(invalidations, "invalidation", visible_range, slot_pref)
-    {
+    // Resolve the neckline first: under `--start` the invalidation picker uses
+    // it as a geometric reference (a valid `too-low` floor sits *below* the
+    // neckline, a `too-high` cap *above*) to drop a stale line left over from an
+    // earlier trade at the wrong price. See [`pick_slot_with_label`].
+    let break_and_close = pick_slot(break_lines, "break_and_close", visible_range, slot_pref);
+    let neckline_ref = break_and_close
+        .as_ref()
+        .map(|d| crate::geometry::line_mean_price(&d.prices()))
+        .filter(|p| p.is_finite());
+
+    if let Some((d, lbl)) = pick_slot_with_label(
+        invalidations,
+        "invalidation",
+        visible_range,
+        slot_pref,
+        neckline_ref,
+    ) {
         roles.invalidation = Some(d);
         roles.invalidation_label = Some(lbl);
     }
-    roles.break_and_close = pick_slot(break_lines, "break_and_close", visible_range, slot_pref);
+    roles.break_and_close = break_and_close;
     roles.retest = pick_slot(retest_lines, "retest", visible_range, slot_pref);
     roles.tp_fib = pick_slot(tp_fibs, "tp_fib", visible_range, slot_pref);
     roles.trade_expiry = pick_trade_expiry(trade_expiries, visible_range, slot_pref);
@@ -788,15 +802,34 @@ fn pick_window_aware(cands: Vec<Drawing>, role: &str, (from, to): (i64, i64)) ->
 /// Variant of [`pick_slot`] for drawings that carry an associated label
 /// (currently just `invalidation`). Selects the drawing under `pref`, then
 /// returns it with its label.
+///
+/// `neckline_ref` is the resolved neckline's mean price (or `None` if no
+/// neckline is on the chart). Under `--start` it drives a **side-of-neckline
+/// filter** that runs *before* the nearest-to-start tiebreak: a valid `too-low`
+/// floor sits **below** the neckline and a valid `too-high` cap **above** it, so
+/// any candidate on the wrong side is a stale line left over from a different
+/// trade (e.g. an old `too-low` still drawn up near a prior head) and is
+/// dropped. This is what stops the picker grabbing a stale invalidation purely
+/// because its anchor *time* happened to sit nearer the cursor than the real
+/// one's (AUD/JPY IH&S 2026-06-29: a stale `too-low` at 112.993 out-timed the
+/// real floor at 111.288 and blocked every entry via the baked entry-level
+/// veto). If the filter would drop everything (no neckline, or all candidates on
+/// the wrong side) it's skipped so we never select nothing.
 fn pick_slot_with_label(
     cands: Vec<(Drawing, String)>,
     role: &str,
     window: (i64, i64),
     pref: SlotPref,
+    neckline_ref: Option<f64>,
 ) -> Option<(Drawing, String)> {
     if cands.is_empty() {
         return None;
     }
+    // Side-of-neckline filter (— `--start` only). Keep each candidate only if
+    // its price is on the geometrically-correct side of the neckline for its own
+    // label. Applied before splitting labels off, since the side depends on the
+    // per-candidate label. Skipped when it would empty the set.
+    let cands = filter_invalidation_by_neckline_side(cands, pref, neckline_ref, role);
     // Split labels off into a lookup, pick on the drawings alone (so the
     // window-filter + tiebreak logic is shared), then re-attach the chosen
     // label by id.
@@ -819,6 +852,59 @@ fn pick_slot_with_label(
     };
     let lbl = labels.get(&chosen.id).cloned().unwrap_or_default();
     Some((chosen, lbl))
+}
+
+/// Drop invalidation candidates on the geometrically-wrong side of the neckline
+/// (`--start` only). A `too-low` floor must sit **below** the neckline, a
+/// `too-high` cap **above** it. Returns the filtered set, or the original set
+/// unchanged when the filter doesn't apply (not `--start`, no neckline, a
+/// non-finite candidate price) or would drop everything (so we never select
+/// nothing). Each dropped line is logged at debug.
+fn filter_invalidation_by_neckline_side(
+    cands: Vec<(Drawing, String)>,
+    pref: SlotPref,
+    neckline_ref: Option<f64>,
+    role: &str,
+) -> Vec<(Drawing, String)> {
+    let (SlotPref::NearestTo { .. }, Some(neck)) = (pref, neckline_ref) else {
+        return cands;
+    };
+    let correct_side = |d: &Drawing, lbl: &str| -> bool {
+        let price = crate::geometry::horizontal_price(&d.prices());
+        if !price.is_finite() {
+            return true; // can't judge → keep (never drop on missing data)
+        }
+        let l = lbl.trim().to_ascii_lowercase();
+        match l.as_str() {
+            "too-low" => price < neck,  // long floor sits below the neckline
+            "too-high" => price > neck, // short cap sits above the neckline
+            _ => true,                  // unknown label → keep
+        }
+    };
+    let (kept, dropped): (Vec<_>, Vec<_>) =
+        cands.into_iter().partition(|(d, lbl)| correct_side(d, lbl));
+    if kept.is_empty() {
+        // Everything is on the "wrong" side — the neckline reference is
+        // probably itself off (or the operator drew an unusual chart). Don't
+        // strand the setup; fall back to the full set.
+        debug!(
+            role,
+            neckline_ref = neck,
+            "side-of-neckline filter would drop every invalidation; keeping all"
+        );
+        return dropped;
+    }
+    for (d, lbl) in &dropped {
+        debug!(
+            role,
+            id = %d.id,
+            label = %lbl,
+            price = crate::geometry::horizontal_price(&d.prices()),
+            neckline_ref = neck,
+            "invalidation dropped — wrong side of the neckline (stale line?)"
+        );
+    }
+    kept
 }
 
 #[cfg(test)]
@@ -1229,6 +1315,96 @@ mod tests {
             .expect("classify ok");
         assert_eq!(roles.invalidation.as_ref().unwrap().id, "just-after");
         assert_eq!(roles.invalidation_label.as_deref(), Some("too-high"));
+    }
+
+    /// THE BUG (AUD/JPY IH&S 2026-06-29): two `too-low` lines on the chart — the
+    /// real floor at 111.288 (below the neckline ~111.5) and a stale one at
+    /// 112.993 (above it, left over from a prior trade). Nearest-to-start alone
+    /// grabbed the stale one because its anchor *time* sat nearer the cursor,
+    /// baking a floor above the entry that blocked every fill via the at-entry
+    /// veto. The side-of-neckline filter drops the above-neckline `too-low`
+    /// first, so the real floor wins even though it's anchored further in time.
+    #[test]
+    fn nearest_to_invalidation_drops_too_low_above_neckline() {
+        let (stubs, mcp) = fixture(vec![
+            // Neckline ~111.5 (mean of the two anchors).
+            (
+                stub("neck", "trend_line"),
+                drawing("neck", "neckline", vec![(400, 111.5), (500, 111.5)]),
+            ),
+            // Stale `too-low` ABOVE the neckline, anchored NEAR start (t=590).
+            (
+                stub("stale", "horizontal_line"),
+                drawing("stale", "too-low", vec![(590, 112.993)]),
+            ),
+            // Real `too-low` floor BELOW the neckline, anchored further (t=450).
+            (
+                stub("real", "horizontal_line"),
+                drawing("real", "too-low", vec![(450, 111.288)]),
+            ),
+        ]);
+        // start=600: by time alone `stale` (|590-600|=10) beats `real`
+        // (|450-600|=150) — but `stale` is above the neckline and is dropped.
+        let roles = classify(&mcp, &stubs, ANY_RANGE, SlotPref::NearestTo { start: 600 })
+            .expect("classify ok");
+        assert_eq!(
+            roles.invalidation.as_ref().unwrap().id,
+            "real",
+            "the below-neckline floor wins; the stale above-neckline line is dropped"
+        );
+        assert_eq!(roles.invalidation_label.as_deref(), Some("too-low"));
+    }
+
+    /// Mirror for a short: a stale `too-high` *below* the neckline is dropped so
+    /// the real cap above it wins, even when the stale one is nearer in time.
+    #[test]
+    fn nearest_to_invalidation_drops_too_high_below_neckline() {
+        let (stubs, mcp) = fixture(vec![
+            (
+                stub("neck", "trend_line"),
+                drawing("neck", "neckline", vec![(400, 111.5), (500, 111.5)]),
+            ),
+            // Stale `too-high` BELOW the neckline, near start.
+            (
+                stub("stale", "horizontal_line"),
+                drawing("stale", "too-high", vec![(590, 110.2)]),
+            ),
+            // Real `too-high` cap ABOVE the neckline, further in time.
+            (
+                stub("real", "horizontal_line"),
+                drawing("real", "too-high", vec![(450, 112.1)]),
+            ),
+        ]);
+        let roles = classify(&mcp, &stubs, ANY_RANGE, SlotPref::NearestTo { start: 600 })
+            .expect("classify ok");
+        assert_eq!(roles.invalidation.as_ref().unwrap().id, "real");
+        assert_eq!(roles.invalidation_label.as_deref(), Some("too-high"));
+    }
+
+    /// When *every* candidate is on the "wrong" side (an unusual chart, or a
+    /// mis-resolved neckline), the filter must not strand the setup — it falls
+    /// back to the full set and nearest-to-start still picks one.
+    #[test]
+    fn nearest_to_invalidation_side_filter_falls_back_when_all_wrong_side() {
+        let (stubs, mcp) = fixture(vec![
+            (
+                stub("neck", "trend_line"),
+                drawing("neck", "neckline", vec![(400, 111.5), (500, 111.5)]),
+            ),
+            // Both `too-low` lines above the neckline (would all be dropped).
+            (
+                stub("a", "horizontal_line"),
+                drawing("a", "too-low", vec![(590, 112.9)]),
+            ),
+            (
+                stub("b", "horizontal_line"),
+                drawing("b", "too-low", vec![(450, 112.5)]),
+            ),
+        ]);
+        // Filter would empty the set → keep all → nearest-to-start (t=590) wins.
+        let roles = classify(&mcp, &stubs, ANY_RANGE, SlotPref::NearestTo { start: 600 })
+            .expect("classify ok");
+        assert_eq!(roles.invalidation.as_ref().unwrap().id, "a");
     }
 
     /// The trade-expiry vertical sits forward of the setup, so `--start` picks

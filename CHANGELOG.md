@@ -1,5 +1,41 @@
 # Changelog
 
+## Unreleased — 2026-07-02 — --start: invalidation picks the line on the correct side of the neckline
+
+**Why.** A chart can carry two same-labelled invalidation lines — the real one
+plus a stale leftover from an earlier trade at a different price. Under `--start`
+the invalidation slot broke ties purely by anchor *time* (nearest either side of
+the cursor), so a stale `too-low` whose timestamp happened to sit nearer the
+cursor out-ranked the real floor. On AUD/JPY (IH&S long, 2026-06-29) the real
+`too-low` floor was 111.288 (below entry) but a stale one at 112.993 (above
+entry, above the neckline, above TP) won the slot — and because that level is
+baked onto the enter as a continuous at-entry veto (Bug #12), *every* `05-enter`
+fire was rejected `veto-active (too-low)` and the plan never filled.
+
+**What changed.** `classify` (`tv-arm/src/roles.rs`) now resolves the neckline
+(`break_and_close`) *before* the invalidation, and passes its mean price into
+`pick_slot_with_label`. Under `--start` a **side-of-neckline filter** runs before
+the nearest-to-start tiebreak: a `too-low` floor must sit **below** the neckline
+and a `too-high` cap **above** it (per each candidate's own label), so a
+wrong-side stale line is dropped. The filter falls back to the full candidate set
+when it would drop everything (no neckline, or all candidates on the wrong side)
+so a genuinely unusual chart is never stranded. Window-scoped modes
+(`LatestWins` / `WindowAware`) are unchanged — their visible-window filter
+already handles staleness.
+
+**Breaking.** `pick_slot_with_label` gains a `neckline_ref: Option<f64>` param
+(private fn — no external callers).
+
+**Config.** None. `--start`-only behaviour.
+
+**Tests.** `nearest_to_invalidation_drops_too_low_above_neckline` (the bug: stale
+above-neckline `too-low` out-times the real floor → real floor wins),
+`nearest_to_invalidation_drops_too_high_below_neckline` (short mirror), and
+`nearest_to_invalidation_side_filter_falls_back_when_all_wrong_side` (fallback
+never strands the setup). tv-arm 183 green.
+
+**Follow-up.** None.
+
 ## Unreleased — 2026-07-02 — --start: stray M/W path no longer hijacks an H&S arm
 
 **Why.** A chart can carry a leftover M/W `path` drawing from an earlier setup
