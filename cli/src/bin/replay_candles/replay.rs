@@ -239,6 +239,13 @@ pub async fn run(
 
         for warning in eval.warnings {
             if !warnings.contains(&warning) {
+                // Trendline-anchor diagnostics are recomputed every tick against a
+                // one-bar-wider window, so the same underlying condition produces a
+                // fresh string each bar (…153-bar…, …154-bar…). They're low-signal
+                // for a normal replay, so keep them out of the console report and
+                // emit them at debug level (RUST_LOG=debug) instead. Still recorded
+                // on the structured fixture for anyone who wants them.
+                tracing::debug!(target: "replay::trendline_anchor", "{warning}");
                 warnings.push(warning);
             }
         }

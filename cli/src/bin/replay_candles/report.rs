@@ -400,12 +400,10 @@ pub fn render(
         ));
     }
 
-    if !replay.warnings.is_empty() {
-        out.push_str("\nWarnings:\n");
-        for w in &replay.warnings {
-            out.push_str(&format!("  - {w}\n"));
-        }
-    }
+    // Trendline-anchor warnings are intentionally *not* rendered here — they
+    // recompute every tick against a growing window (one distinct string per
+    // bar) and are low-signal for a normal replay. They're emitted at debug
+    // level in `replay.rs` (RUST_LOG=debug) and recorded on the fixture.
 
     out.push_str(&format!(
         "\nDone: {}  |  final phase: {:?}  |  fires: {}",
