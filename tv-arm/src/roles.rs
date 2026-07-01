@@ -339,8 +339,12 @@ pub fn classify<F: DrawingFetcher>(
     // M/W paths are already in-window-filtered by `is_mw_path`, so latest-wins
     // among qualifiers is correct in both modes (the window filter inside
     // `pick_slot` is a no-op for them). Under `--start` the containment filter
-    // is dropped, so select the path whose two shoulders bracket the cursor.
-    roles.mw_path = pick_mw_path(mw_paths, slot_pref);
+    // is dropped, so select the path whose two shoulders bracket the cursor —
+    // and, when an H&S neckline is *also* on the chart, defer to whichever of
+    // the two (path neckline vs drawn neckline) is anchored nearer `start`, so a
+    // stray M/W path from an earlier setup can't hijack an H&S arm.
+    let neckline_anchor = roles.break_and_close.as_ref().map(|d| d.latest_time());
+    roles.mw_path = pick_mw_path(mw_paths, slot_pref, neckline_anchor);
     roles.position = latest_position(positions);
 
     Ok(roles)
@@ -493,10 +497,26 @@ pub enum SlotPref {
 /// `start` (unusual — a chart with only unrelated paths) fall back to plain
 /// latest so a single stray path isn't silently dropped.
 ///
+/// **H&S neckline tiebreak (`--start` only).** A chart can carry both an M/W
+/// path *and* an H&S neckline — e.g. a stray path from an earlier setup left on
+/// the chart while the operator journals an H&S. Because a path's presence alone
+/// routes the whole arm to M/W ([`super::pipeline`] keys on `roles.mw_path`), an
+/// old path must not win when the drawn H&S neckline is the setup actually being
+/// journaled. So when `neckline_anchor` is `Some`, compare the chosen path's own
+/// neckline anchor `C (points[2])` to it: whichever is anchored **nearer
+/// `start`** wins. If the drawn neckline is nearer, the path is dropped
+/// (`None` → H&S arm). This is what makes the 3-anchor relax rule safe — that
+/// rule (`start >= B`) otherwise matches *any* old path whose left shoulder
+/// predates the cursor.
+///
 /// Anchor order (see [`is_mw_path`]): `points[0]=A run-up-start`,
 /// `points[1]=B left-shoulder`, `points[2]=C neckline`, `points[3]=D
 /// right-shoulder` (optional).
-fn pick_mw_path(cands: Vec<Drawing>, pref: SlotPref) -> Option<Drawing> {
+fn pick_mw_path(
+    cands: Vec<Drawing>,
+    pref: SlotPref,
+    neckline_anchor: Option<i64>,
+) -> Option<Drawing> {
     let SlotPref::NearestTo { start } = pref else {
         return pick_slot(cands, "mw_path", (i64::MIN, i64::MAX), SlotPref::LatestWins);
     };
@@ -509,19 +529,40 @@ fn pick_mw_path(cands: Vec<Drawing>, pref: SlotPref) -> Option<Drawing> {
             None => start >= b,
         }
     };
-    let bracketing = cands
+    let chosen = cands
         .iter()
         .filter(|d| brackets(d))
         .max_by_key(|d| d.latest_time())
-        .cloned();
-    if let Some(d) = bracketing {
-        return Some(d);
+        .cloned()
+        .or_else(|| {
+            debug!(
+                role = "mw_path",
+                start, "no M/W path whose shoulders bracket --start; falling back to latest"
+            );
+            cands.into_iter().max_by_key(|d| d.latest_time())
+        })?;
+
+    // With both a path and a drawn H&S neckline on the chart, defer to whichever
+    // is anchored nearer the cursor. The path's own neckline is anchor C
+    // (`points[2]`); fall back to its latest anchor if the shape is short.
+    if let Some(neck) = neckline_anchor {
+        let path_neck = chosen
+            .points
+            .get(2)
+            .map(|p| p.time)
+            .unwrap_or_else(|| chosen.latest_time());
+        if (neck - start).abs() < (path_neck - start).abs() {
+            debug!(
+                role = "mw_path",
+                start,
+                path_neck,
+                neckline_anchor = neck,
+                "drawn H&S neckline is nearer --start than the M/W path; dropping the path (H&S arm)"
+            );
+            return None;
+        }
     }
-    debug!(
-        role = "mw_path",
-        start, "no M/W path whose shoulders bracket --start; falling back to latest"
-    );
-    cands.into_iter().max_by_key(|d| d.latest_time())
+    Some(chosen)
 }
 
 /// Pick a single-slot drawing, window-filtering first then breaking ties
@@ -1253,6 +1294,68 @@ mod tests {
         let roles = classify(&mcp, &stubs, ANY_RANGE, SlotPref::NearestTo { start: 580 })
             .expect("classify ok");
         assert_eq!(roles.mw_path.unwrap().id, "forming");
+    }
+
+    /// THE BUG (AUD/JPY 2026-06-29): a stray 3-anchor M/W path from an earlier
+    /// setup sits far to the left of `start`; the operator is journaling an H&S
+    /// whose neckline is drawn much nearer the cursor. The relax rule
+    /// (`start >= B`) makes the old path *bracket* start, and a path's mere
+    /// presence routes the whole arm to M/W — hijacking the H&S. With the drawn
+    /// neckline anchored nearer `start` than the path's own neckline (C), the
+    /// path is dropped and the arm stays H&S (`mw_path == None`).
+    #[test]
+    fn nearest_to_drops_stray_path_when_hs_neckline_is_nearer_start() {
+        let (stubs, mcp) = fixture(vec![
+            // Stray M/W path from a prior setup, neckline C at t=300, far left.
+            (
+                stub("stray", "path"),
+                drawing("stray", "", vec![(100, 1.0), (200, 1.1), (300, 1.05)]),
+            ),
+            // The H&S neckline the operator is actually journaling, near start.
+            (
+                stub("neck", "trend_line"),
+                drawing("neck", "neckline", vec![(850, 1.2), (900, 1.2)]),
+            ),
+        ]);
+        // start=950: path C(300) is |650| away; neckline(900) is |50| away → H&S.
+        let roles = classify(&mcp, &stubs, ANY_RANGE, SlotPref::NearestTo { start: 950 })
+            .expect("classify ok");
+        assert!(
+            roles.mw_path.is_none(),
+            "stray path far from start must not hijack the H&S arm"
+        );
+        assert_eq!(
+            roles.break_and_close.as_ref().unwrap().id,
+            "neck",
+            "the drawn H&S neckline drives the arm"
+        );
+    }
+
+    /// Mirror of the above: when the M/W path's own neckline (C) is the one
+    /// nearer `start`, the path wins even though an H&S-style trend line is also
+    /// present — a genuine M/W journaling arm is not accidentally demoted.
+    #[test]
+    fn nearest_to_keeps_path_when_it_is_nearer_start_than_neckline() {
+        let (stubs, mcp) = fixture(vec![
+            // A trend line far to the left (stale), C-equivalent at t=200.
+            (
+                stub("old-neck", "trend_line"),
+                drawing("old-neck", "neckline", vec![(150, 1.2), (200, 1.2)]),
+            ),
+            // The M/W path being journaled, neckline C at t=900, near start.
+            (
+                stub("path", "path"),
+                drawing("path", "", vec![(700, 1.0), (800, 1.1), (900, 1.05)]),
+            ),
+        ]);
+        // start=950: path C(900) is |50| away; neckline(200) is |750| → M/W wins.
+        let roles = classify(&mcp, &stubs, ANY_RANGE, SlotPref::NearestTo { start: 950 })
+            .expect("classify ok");
+        assert_eq!(
+            roles.mw_path.as_ref().unwrap().id,
+            "path",
+            "the near M/W path drives the arm over a stale trend line"
+        );
     }
 
     /// Under `--start` the news/blackout vertical pairs are scoped to

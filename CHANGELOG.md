@@ -1,5 +1,36 @@
 # Changelog
 
+## Unreleased — 2026-07-02 — --start: stray M/W path no longer hijacks an H&S arm
+
+**Why.** A chart can carry a leftover M/W `path` drawing from an earlier setup
+while the operator journals an H&S. Under `--start`, the 3-anchor path relax rule
+(`start >= left-shoulder B`) matched *any* old path whose left shoulder predated
+the cursor — and a path's mere presence routes the whole arm to M/W
+(`pipeline.rs` keys on `roles.mw_path`). So a 12-Jun path hijacked a 29-Jun H&S
+arm (AUD/JPY 2026-06-29): tv-arm resolved the M/W path instead of the drawn
+neckline.
+
+**What changed.** `pick_mw_path` (`tv-arm/src/roles.rs`) now takes the resolved
+H&S neckline anchor and, under `--start` only, compares it to the chosen path's
+own neckline anchor `C (points[2])`: whichever is anchored **nearer `start`**
+wins. If the drawn neckline is nearer, the path is dropped (`None` → H&S arm).
+This is what makes the permissive 3-anchor relax rule safe. `classify` threads
+`roles.break_and_close.latest_time()` into the picker (neckline is resolved
+before `mw_path`, so it's available).
+
+**Breaking.** `pick_mw_path` gains a `neckline_anchor: Option<i64>` param
+(private fn — no external callers).
+
+**Config.** None. `--start`-only behaviour; the window-scoped modes
+(`LatestWins` / `WindowAware`) are unchanged.
+
+**Tests.** `nearest_to_drops_stray_path_when_hs_neckline_is_nearer_start` (the
+bug: stray path far left + neckline near start → `mw_path == None`, H&S arm) and
+`nearest_to_keeps_path_when_it_is_nearer_start_than_neckline` (mirror: a genuine
+M/W journaling arm with a nearer path is not demoted). tv-arm 180 green.
+
+**Follow-up.** None. The `--cross-buffer-pct` arm-time flag is still separate/unbuilt.
+
 ## Unreleased — 2026-07-02 — invalidation: drawn line = close-confirm (both directions), fib = wick
 
 **Why.** The invalidation cross-mode was tied to the *name* (`too-high` →

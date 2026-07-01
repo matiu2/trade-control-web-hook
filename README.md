@@ -1631,7 +1631,10 @@ pair per event, then drops any pair whose window has already elapsed. The
   chart* and picks each role by its nearest-to-`--start` drawing, walking in the
   role's natural direction — neckline/retest = nearest *before* start,
   invalidation = nearest *either side*, trade-expiry = nearest *after*, M/W path
-  = the one whose shoulders bracket start. The news/blackout vertical pairs
+  = the one whose shoulders bracket start. When a chart carries *both* a stray
+  M/W path and an H&S neckline, the arm defers to whichever is anchored nearer
+  `--start` (path neckline `C` vs the drawn neckline) — so a leftover path from
+  an earlier setup can't hijack an H&S arm into M/W. The news/blackout vertical pairs
   (and the auto-drawn calendar bars) are scoped to `[start, trade-expiry]` — a
   pair outside the trade's own lifetime is dropped. The prune as-of becomes
   `--start` (`source=start-flag`).
