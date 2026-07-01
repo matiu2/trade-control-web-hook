@@ -259,7 +259,7 @@ pub fn classify<F: DrawingFetcher>(
             // so it's accepted purely on geometry — exactly 3 anchors,
             // all inside the visible range. A path that's the wrong
             // shape or scrolled off-screen is ignored (logged below).
-            kind::PATH if is_mw_path(&d, visible_range) => {
+            kind::PATH if is_mw_path(&d, visible_range, slot_pref) => {
                 mw_paths.push(d);
                 Some("mw_path")
             }
@@ -321,8 +321,9 @@ pub fn classify<F: DrawingFetcher>(
     roles.prep_expiries = latest_prep_expiry_per_step(prep_expiry_lines);
     // M/W paths are already in-window-filtered by `is_mw_path`, so latest-wins
     // among qualifiers is correct in both modes (the window filter inside
-    // `pick_slot` is a no-op for them).
-    roles.mw_path = pick_slot(mw_paths, "mw_path", visible_range, SlotPref::LatestWins);
+    // `pick_slot` is a no-op for them). Under `--start` the containment filter
+    // is dropped, so select the path whose two shoulders bracket the cursor.
+    roles.mw_path = pick_mw_path(mw_paths, slot_pref);
     roles.position = latest_position(positions);
 
     Ok(roles)
@@ -359,8 +360,17 @@ fn latest_position(mut cands: Vec<PositionDrawing>) -> Option<PositionDrawing> {
 /// optional `D right-shoulder` (arms immediately). Off-screen paths are
 /// stale leftovers; a path with 2 or 5+ anchors is a fat-fingered shape
 /// and is ignored rather than guessed at.
-fn is_mw_path(d: &Drawing, (from, to): (i64, i64)) -> bool {
-    matches!(d.points.len(), 3 | 4) && d.points.iter().all(|p| p.time >= from && p.time <= to)
+fn is_mw_path(d: &Drawing, (from, to): (i64, i64), pref: SlotPref) -> bool {
+    if !matches!(d.points.len(), 3 | 4) {
+        return false;
+    }
+    // `--start` searches the whole chart, so the visible-window containment
+    // check is dropped — the bracket-start picker (`pick_mw_path`) selects
+    // among all valid-shape paths instead.
+    if let SlotPref::NearestTo { .. } = pref {
+        return true;
+    }
+    d.points.iter().all(|p| p.time >= from && p.time <= to)
 }
 
 /// Keep only the vertical-line drawings whose anchor sits inside the
@@ -445,6 +455,56 @@ pub enum SlotPref {
     /// Prefer the drawing belonging to the visible window `(from, to)`
     /// (replay build).
     WindowAware((i64, i64)),
+    /// `--start`: ignore the visible window entirely and select each role by
+    /// its **nearest-to-start** drawing, walking in the role's natural
+    /// direction (see the per-role pickers). `start` is a unix second. The
+    /// default tiebreak for the generic single-slot roles (neckline / retest /
+    /// tp_fib) is *nearest anchored at-or-before start*; `invalidation`,
+    /// `trade_expiry`, and the M/W path apply their own directional rules.
+    NearestTo { start: i64 },
+}
+
+/// Pick the M/W path drawing.
+///
+/// In the window-scoped modes (`LatestWins` / `WindowAware`) the paths were
+/// already visible-window-filtered by [`is_mw_path`], so latest-wins among the
+/// qualifiers is correct. Under `--start` ([`SlotPref::NearestTo`]) that filter
+/// is dropped, so select the path whose two **shoulders bracket the cursor**:
+/// `B left-shoulder <= start <= D right-shoulder`. When the right shoulder
+/// isn't drawn (3-anchor path) it's still forming, so the rule relaxes to
+/// `start >= B`. Among the bracketing paths the latest wins; if none bracket
+/// `start` (unusual — a chart with only unrelated paths) fall back to plain
+/// latest so a single stray path isn't silently dropped.
+///
+/// Anchor order (see [`is_mw_path`]): `points[0]=A run-up-start`,
+/// `points[1]=B left-shoulder`, `points[2]=C neckline`, `points[3]=D
+/// right-shoulder` (optional).
+fn pick_mw_path(cands: Vec<Drawing>, pref: SlotPref) -> Option<Drawing> {
+    let SlotPref::NearestTo { start } = pref else {
+        return pick_slot(cands, "mw_path", (i64::MIN, i64::MAX), SlotPref::LatestWins);
+    };
+    let brackets = |d: &Drawing| {
+        let Some(b) = d.points.get(1).map(|p| p.time) else {
+            return false;
+        };
+        match d.points.get(3).map(|p| p.time) {
+            Some(right) => b <= start && start <= right,
+            None => start >= b,
+        }
+    };
+    let bracketing = cands
+        .iter()
+        .filter(|d| brackets(d))
+        .max_by_key(|d| d.latest_time())
+        .cloned();
+    if let Some(d) = bracketing {
+        return Some(d);
+    }
+    debug!(
+        role = "mw_path",
+        start, "no M/W path whose shoulders bracket --start; falling back to latest"
+    );
+    cands.into_iter().max_by_key(|d| d.latest_time())
 }
 
 /// Pick a single-slot drawing, window-filtering first then breaking ties
@@ -475,6 +535,11 @@ fn pick_slot(
 ) -> Option<Drawing> {
     if cands.is_empty() {
         return None;
+    }
+    // `--start` ignores the visible window: search the whole chart and let the
+    // nearest-to-start tiebreak choose. Skip the window partition entirely.
+    if let SlotPref::NearestTo { .. } = pref {
+        return finish_slot_pick(cands, role, pref);
     }
     let total = cands.len();
     let (in_window, out): (Vec<Drawing>, Vec<Drawing>) = cands
@@ -517,7 +582,32 @@ fn finish_slot_pick(mut cands: Vec<Drawing>, role: &str, pref: SlotPref) -> Opti
             cands.pop()
         }
         SlotPref::WindowAware(view) => pick_window_aware(cands, role, view),
+        SlotPref::NearestTo { start } => pick_nearest_before(cands, role, start),
     }
+}
+
+/// `--start` tiebreak for the generic single-slot roles (neckline / retest /
+/// tp_fib). These are drawn *before* the setup completes, so the right one is
+/// the drawing anchored **at-or-before `start`, closest to it** (largest
+/// `latest_time()` that is `<= start`). If none is at-or-before start — e.g. a
+/// chart where every candidate is to the right — fall back to the one whose
+/// anchor is nearest to `start` in absolute terms, so we never select nothing.
+fn pick_nearest_before(cands: Vec<Drawing>, role: &str, start: i64) -> Option<Drawing> {
+    let before = cands
+        .iter()
+        .filter(|d| d.latest_time() <= start)
+        .max_by_key(|d| d.latest_time())
+        .cloned();
+    if let Some(d) = before {
+        return Some(d);
+    }
+    debug!(
+        role,
+        start, "no drawing anchored at-or-before --start; using absolute-nearest anchor"
+    );
+    cands
+        .into_iter()
+        .min_by_key(|d| (d.latest_time() - start).abs())
 }
 
 /// Pick the trade-expiry vertical line.
@@ -545,6 +635,25 @@ fn pick_trade_expiry(
     const ROLE: &str = "trade_expiry";
     if cands.is_empty() {
         return None;
+    }
+    // `--start`: the expiry sits *forward* of the setup, so pick the nearest
+    // vertical at-or-after `start`; if none is forward (a chart with only a
+    // past expiry) fall back to the absolute-nearest so we never drop it.
+    if let SlotPref::NearestTo { start } = pref {
+        let after = cands
+            .iter()
+            .filter(|d| d.anchor_time() >= start)
+            .min_by_key(|d| d.anchor_time())
+            .cloned();
+        return after.or_else(|| {
+            debug!(
+                role = ROLE,
+                start, "no trade-expiry at-or-after --start; using absolute-nearest anchor"
+            );
+            cands
+                .into_iter()
+                .min_by_key(|d| (d.anchor_time() - start).abs())
+        });
     }
     // Forward margin = window width (saturating), so it scales with timeframe.
     let width = to.saturating_sub(from);
@@ -638,7 +747,18 @@ fn pick_slot_with_label(
         .map(|(d, lbl)| (d.id.clone(), lbl.clone()))
         .collect();
     let drawings: Vec<Drawing> = cands.into_iter().map(|(d, _)| d).collect();
-    let chosen = pick_slot(drawings, role, window, pref)?;
+    // The invalidation horizontals (`too-low` / `too-high`) *bracket* the
+    // pattern, so under `--start` the right one is the nearest **either side**
+    // of `start`, not nearest-before (a `too-high` cap above the right shoulder
+    // may be anchored just after the cursor). Every other single-slot role
+    // routes through `pick_slot`'s nearest-before default.
+    let chosen = if let SlotPref::NearestTo { start } = pref {
+        drawings
+            .into_iter()
+            .min_by_key(|d| (d.anchor_time() - start).abs())?
+    } else {
+        pick_slot(drawings, role, window, pref)?
+    };
     let lbl = labels.get(&chosen.id).cloned().unwrap_or_default();
     Some((chosen, lbl))
 }
@@ -998,6 +1118,124 @@ mod tests {
         let view = (0, 100);
         let roles = classify(&mcp, &stubs, view, SlotPref::WindowAware(view)).expect("ok");
         assert_eq!(roles.break_and_close.unwrap().id, "b");
+    }
+
+    // ===== `--start` (SlotPref::NearestTo) whole-chart matching ==========
+
+    /// `--start` picks the neckline anchored **before and nearest** the cursor,
+    /// ignoring the visible window entirely — a later (future) neckline that a
+    /// naive latest-wins would grab is skipped. This is the journaling case: the
+    /// chart shows the whole trade + future candles, but arming is anchored to
+    /// the shoulder moment.
+    #[test]
+    fn nearest_to_picks_neckline_before_and_nearest_start() {
+        let (stubs, mcp) = fixture(vec![
+            (
+                stub("old", "trend_line"),
+                drawing("old", "neckline", vec![(100, 1.0), (200, 1.0)]),
+            ),
+            (
+                stub("near", "trend_line"),
+                drawing("near", "neckline", vec![(400, 1.0), (500, 1.0)]),
+            ),
+            (
+                stub("future", "trend_line"),
+                drawing("future", "neckline", vec![(900, 1.0), (1000, 1.0)]),
+            ),
+        ]);
+        // start=600: `near` (latest_time 500 ≤ 600) is nearest-before; `future`
+        // (900) is after start and must not win despite being newest.
+        let roles = classify(&mcp, &stubs, ANY_RANGE, SlotPref::NearestTo { start: 600 })
+            .expect("classify ok");
+        assert_eq!(roles.break_and_close.unwrap().id, "near");
+    }
+
+    /// The invalidation horizontals bracket the pattern, so `--start` takes the
+    /// nearest **either side** of the cursor — a `too-high` cap anchored just
+    /// *after* start still wins if it's closest.
+    #[test]
+    fn nearest_to_invalidation_takes_nearest_either_side() {
+        let (stubs, mcp) = fixture(vec![
+            (
+                stub("far-before", "horizontal_line"),
+                drawing("far-before", "too-low", vec![(100, 1.0)]),
+            ),
+            (
+                stub("just-after", "horizontal_line"),
+                drawing("just-after", "too-high", vec![(650, 1.5)]),
+            ),
+        ]);
+        // start=600: `just-after` (|650-600|=50) beats `far-before`
+        // (|100-600|=500), even though it's anchored after the cursor.
+        let roles = classify(&mcp, &stubs, ANY_RANGE, SlotPref::NearestTo { start: 600 })
+            .expect("classify ok");
+        assert_eq!(roles.invalidation.as_ref().unwrap().id, "just-after");
+        assert_eq!(roles.invalidation_label.as_deref(), Some("too-high"));
+    }
+
+    /// The trade-expiry vertical sits forward of the setup, so `--start` picks
+    /// the nearest vertical **at-or-after** the cursor — a stale past expiry to
+    /// the left is skipped.
+    #[test]
+    fn nearest_to_trade_expiry_picks_nearest_after_start() {
+        let (stubs, mcp) = fixture(vec![
+            (
+                stub("past", "vertical_line"),
+                drawing("past", "trade-expiry", vec![(200, 0.0)]),
+            ),
+            (
+                stub("future", "vertical_line"),
+                drawing("future", "trade-expiry", vec![(800, 0.0)]),
+            ),
+        ]);
+        let roles = classify(&mcp, &stubs, ANY_RANGE, SlotPref::NearestTo { start: 600 })
+            .expect("classify ok");
+        assert_eq!(roles.trade_expiry.unwrap().id, "future");
+    }
+
+    /// The M/W path whose two **shoulders bracket** the cursor
+    /// (`B ≤ start ≤ D`) wins; a path that ended before the cursor is a prior
+    /// setup and is skipped even though it's older-but-complete.
+    #[test]
+    fn nearest_to_mw_path_brackets_start() {
+        // path anchors: [A run-up-start, B left-shoulder, C neckline, D right-shoulder]
+        let (stubs, mcp) = fixture(vec![
+            (
+                stub("earlier", "path"),
+                drawing(
+                    "earlier",
+                    "",
+                    vec![(10, 1.0), (20, 1.1), (30, 1.05), (40, 1.1)],
+                ),
+            ),
+            (
+                stub("bracketing", "path"),
+                drawing(
+                    "bracketing",
+                    "",
+                    vec![(500, 1.0), (550, 1.1), (600, 1.05), (700, 1.1)],
+                ),
+            ),
+        ]);
+        // start=620: only `bracketing` has B(550) ≤ 620 ≤ D(700).
+        let roles = classify(&mcp, &stubs, ANY_RANGE, SlotPref::NearestTo { start: 620 })
+            .expect("classify ok");
+        assert_eq!(roles.mw_path.unwrap().id, "bracketing");
+    }
+
+    /// A 3-anchor M/W path (no drawn right shoulder) brackets `start` when the
+    /// cursor is at-or-after the left shoulder (`start ≥ B`) — the right
+    /// shoulder is still forming.
+    #[test]
+    fn nearest_to_mw_path_three_anchor_relaxes_to_after_left_shoulder() {
+        let (stubs, mcp) = fixture(vec![(
+            stub("forming", "path"),
+            drawing("forming", "", vec![(500, 1.0), (550, 1.1), (600, 1.05)]),
+        )]);
+        // start=580 ≥ B(550), no D → qualifies.
+        let roles = classify(&mcp, &stubs, ANY_RANGE, SlotPref::NearestTo { start: 580 })
+            .expect("classify ok");
+        assert_eq!(roles.mw_path.unwrap().id, "forming");
     }
 
     #[test]

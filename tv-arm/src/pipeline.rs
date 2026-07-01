@@ -97,22 +97,43 @@ pub fn run(args: Args) -> Result<i32> {
     let chart_range = mcp.get_range().wrap_err("read TV visible range")?;
     let visible = chart_range.visible_range;
     let view = (visible.from, visible.to);
+    // `--start` (journaling): treat this timestamp as "live now" and find the
+    // setup's drawings by searching the whole chart, ignoring the visible
+    // window. Absent: the visible window scopes discovery as before.
+    let start = parse_start(&args)?;
+    if let Some(s) = start {
+        info!(
+            start = s,
+            "--start set: searching the whole chart (nearest-to-start), ignoring the visible window"
+        );
+    }
     // The replay cursor (the "as-of" time for pruning elapsed news/blackout
     // pairs) is the right edge of the *loaded bars*, NOT the visible window:
     // when the chart is rewound the visible window still extends past the
     // last bar into empty future space, so `visible_range.to` overshoots the
     // cursor (and would prune events that are genuinely upcoming relative to
     // it). `bars_range.to` is the last actually-rendered bar = the cursor.
-    let cursor_unix = chart_range.bars_range.to;
+    // `--start` overrides it outright.
+    let cursor_unix = start.unwrap_or(chart_range.bars_range.to);
     // Single-slot role selection follows the run mode (same signal as
-    // `BuildStrictness` below): live arming (`--register-plan`, king when both
+    // `BuildStrictness` below): `--start` searches the whole chart
+    // (nearest-to-start); else live arming (`--register-plan`, king when both
     // flags are set) trusts the newest drawing; an offline / replay build
     // (`--plan-out` alone) prefers the drawing belonging to the on-screen
     // window, so a rewound replay doesn't grab a recent, live-dated drawing.
-    let slot_pref = if args.register_plan {
+    let slot_pref = if let Some(s) = start {
+        SlotPref::NearestTo { start: s }
+    } else if args.register_plan {
         SlotPref::LatestWins
     } else {
         SlotPref::WindowAware(view)
+    };
+    // Calendar auto-draw range: `--start` uses `[start, +∞)` (the expiry_hint
+    // then caps the forward horizon), so news bars are drawn relative to the
+    // cursor, not whatever happens to be on screen. Else the visible range.
+    let calendar_range = match start {
+        Some(s) => (s, i64::MAX),
+        None => view,
     };
     let mut drawings = mcp.list_drawings().wrap_err("list TV drawings")?;
     let mut roles = classify(&mcp, &drawings, view, slot_pref)?;
@@ -128,9 +149,13 @@ pub fn run(args: Args) -> Result<i32> {
         // edge then bounds the window, and check_required (step 3)
         // surfaces the missing drawing as a hard error shortly anyway.
         let expiry_hint = read_trade_expiry(&roles).ok();
-        if let Err(e) =
-            auto_draw_calendar_lines(&mcp, &state.resolution, &resolved, view, expiry_hint)
-        {
+        if let Err(e) = auto_draw_calendar_lines(
+            &mcp,
+            &state.resolution,
+            &resolved,
+            calendar_range,
+            expiry_hint,
+        ) {
             warn!(error = ?e, "calendar auto-draw failed; continuing with chart as-is");
         } else {
             drawings = mcp.list_drawings().wrap_err("re-list TV drawings")?;
@@ -148,7 +173,7 @@ pub fn run(args: Args) -> Result<i32> {
     // now; an offline replay (`--plan-out`) prunes against the chart's replay
     // cursor so a blackout still upcoming relative to the cursor survives a
     // historical replay. See `drop_past_control_pairs` / `pick_prune_as_of`.
-    let prune_as_of = pick_prune_as_of(&args, now, cursor_unix);
+    let prune_as_of = pick_prune_as_of(&args, now, cursor_unix, start);
     drop_past_control_pairs(&mut roles, prune_as_of);
 
     // 2c. Position-tool direct entry. When one of --market-entry /
@@ -1217,10 +1242,25 @@ struct AsOf {
     source: &'static str,
 }
 
+/// Parse `--start` to a unix second, or `None` if the flag is absent. A
+/// malformed value is a hard error — unlike `--as-of` (which falls back to the
+/// cursor), `--start` fundamentally changes discovery, so a typo must not
+/// silently revert to visible-window matching.
+fn parse_start(args: &Args) -> Result<Option<i64>> {
+    let Some(raw) = args.start.as_deref() else {
+        return Ok(None);
+    };
+    let ts = DateTime::parse_from_rfc3339(raw)
+        .wrap_err_with(|| format!("--start is not valid RFC3339: {raw:?}"))?;
+    Ok(Some(ts.with_timezone(&Utc).timestamp()))
+}
+
 /// Pick the as-of time used to prune already-elapsed control pairs.
 ///
 /// - `--register-plan` (live arm): always wall-clock `now`. A genuinely stale
 ///   event must still be dropped when arming the live worker.
+/// - `--start <ts>`: the start cursor (overrides even a live arm — `--start`
+///   is an explicit "treat now as this" directive).
 /// - `--as-of <ts>` (offline override): the explicit cursor, for headless /
 ///   cron replays with no readable chart range.
 /// - offline `--plan-out` (replay): the chart's replay cursor (`bars_range.to`,
@@ -1228,7 +1268,15 @@ struct AsOf {
 ///   empty future space on a rewound chart), clamped to `now` so a normal live
 ///   `--plan-out` (cursor ≈ today) is unchanged and only a rewound replay
 ///   (cursor in the past) shifts the yardstick.
-fn pick_prune_as_of(args: &Args, now: DateTime<Utc>, cursor_unix: i64) -> AsOf {
+fn pick_prune_as_of(args: &Args, now: DateTime<Utc>, cursor_unix: i64, start: Option<i64>) -> AsOf {
+    if let Some(s) = start
+        && let Some(at) = DateTime::<Utc>::from_timestamp(s, 0)
+    {
+        return AsOf {
+            at,
+            source: "start-flag",
+        };
+    }
     if args.register_plan {
         return AsOf {
             at: now,
@@ -2033,6 +2081,7 @@ mod tests {
             &mw_args(&["--plan-out", "/tmp/x.json"]),
             now,
             cursor.timestamp(),
+            None,
         );
 
         assert_eq!(as_of.at, cursor);
@@ -2059,7 +2108,12 @@ mod tests {
         let now = now();
         let cursor = "2026-05-28T21:00:00Z".parse::<DateTime<Utc>>().unwrap();
 
-        let as_of = pick_prune_as_of(&mw_args(&["--register-plan"]), now, cursor.timestamp());
+        let as_of = pick_prune_as_of(
+            &mw_args(&["--register-plan"]),
+            now,
+            cursor.timestamp(),
+            None,
+        );
 
         assert_eq!(as_of.at, now);
         assert_eq!(as_of.source, "wallclock");
@@ -2072,7 +2126,12 @@ mod tests {
         let now = now();
         let cursor_unix = now.timestamp() + 7200; // cursor 2h ahead of now
 
-        let as_of = pick_prune_as_of(&mw_args(&["--plan-out", "/tmp/x.json"]), now, cursor_unix);
+        let as_of = pick_prune_as_of(
+            &mw_args(&["--plan-out", "/tmp/x.json"]),
+            now,
+            cursor_unix,
+            None,
+        );
 
         assert_eq!(as_of.at, now, "cursor clamped down to now");
     }
@@ -2092,6 +2151,7 @@ mod tests {
             ]),
             now,
             now.timestamp(),
+            None,
         );
 
         assert_eq!(as_of.at, forced);
@@ -2108,6 +2168,7 @@ mod tests {
             &mw_args(&["--plan-out", "/tmp/x.json", "--as-of", "not-a-date"]),
             now,
             cursor.timestamp(),
+            None,
         );
 
         assert_eq!(as_of.at, cursor);

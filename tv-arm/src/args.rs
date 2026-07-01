@@ -343,6 +343,33 @@ pub struct Args {
     #[arg(long)]
     pub as_of: Option<String>,
 
+    /// Treat this timestamp as "live now" and find the setup's drawings by
+    /// searching the **whole chart** (nearest-to-start), ignoring the visible
+    /// window (RFC3339, e.g. `2026-06-15T22:00:00Z`).
+    ///
+    /// The journaling use-case: put TradingView in replay mode with the last
+    /// visible candle mid-right-shoulder, but you no longer have to *hide* the
+    /// future candles — pass `--start <shoulder-time>` and tv-arm walks the
+    /// chart to find each role relative to that cursor instead of relying on
+    /// what's on screen:
+    /// - **H&S neckline** (break-and-close + retest): the nearest trendline
+    ///   *before* `--start`.
+    /// - **invalidation** (`too-low` / `too-high`): the nearest horizontal to
+    ///   `--start` (brackets the pattern).
+    /// - **M/W path**: the path whose two shoulders bracket `--start`
+    ///   (`B left-shoulder <= start <= D right-shoulder`; when the right
+    ///   shoulder isn't drawn, `start >= B` — it's still forming).
+    /// - **trade-expiry**: the nearest vertical *after* `--start`.
+    /// - **calendar / news bars**: auto-drawn over `[--start, trade-expiry]`.
+    ///
+    /// Also sets the prune cursor (like `--as-of`) to `--start`, so elapsed
+    /// news/blackout pairs are pruned relative to it. Absent: unchanged — the
+    /// visible window scopes discovery and the replay cursor is the loaded-bars
+    /// right edge. Intended for offline `--plan-out` journaling; on the live
+    /// `--register-plan` path it still overrides discovery + cursor if set.
+    #[arg(long)]
+    pub start: Option<String>,
+
     /// Half-width of the price band around each chart-drawn
     /// `support` / `resistance` line, as a percent of the line's
     /// price. Default 0.1 (= ±0.1% of price). Ignored when no

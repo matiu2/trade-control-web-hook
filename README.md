@@ -1606,6 +1606,21 @@ pair per event, then drops any pair whose window has already elapsed. The
   `as-of-flag`). The **same as-of** flows into the pause/news/calendar-bars
   builders so a pair that survives the prune isn't then rejected by their own
   "refusing to arm a stale blackout" past-window guard.
+- **`--start <RFC3339>` (whole-chart journaling):** treats the given timestamp
+  as "live now" **and** decouples drawing-discovery from the visible window.
+  Instead of scoping role-matching to what's on screen, it searches the *whole
+  chart* and picks each role by its nearest-to-`--start` drawing, walking in the
+  role's natural direction — neckline/retest = nearest *before* start,
+  invalidation = nearest *either side*, trade-expiry = nearest *after*, M/W path
+  = the one whose shoulders bracket start, calendar bars auto-drawn over
+  `[start, expiry]`. The prune as-of becomes `--start` (`source=start-flag`).
+  This is the journaling workflow: put TradingView in replay mode with the last
+  visible candle mid-right-shoulder, but **leave the future candles on screen** —
+  `--start <shoulder-time>` anchors the arm to that moment regardless of what's
+  visible, so you can see the whole trade play out while still arming as if it
+  were live at the shoulder. A malformed `--start` is a **hard error** (a typo
+  must not silently fall back to visible-window matching). The emitted plan is
+  identical to what you'd get by hiding the future and arming normally.
 
 **Zero-length blackout/news pairs are dropped, not fatal.** When `tv-arm`
 auto-draws calendar lines and reads them back, TradingView snaps each vertical

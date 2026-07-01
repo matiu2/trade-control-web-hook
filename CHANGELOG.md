@@ -1,5 +1,44 @@
 # Changelog
 
+## Unreleased — 2026-07-01 — tv-arm `--start`: whole-chart, nearest-to-start arming
+
+**Why.** Journaling a replay trade meant putting TradingView in replay mode with
+the last visible candle mid-right-shoulder (to simulate "now" at the entry
+moment) — which *hid* all the candles the trade actually plays out on. Painful
+for reviewing the outcome, and it forced the visible window to double as both
+the as-of cursor and the drawing-search scope.
+
+**What changed.** New `tv-arm --start <RFC3339>` flag. When set, tv-arm treats
+that timestamp as "live now" and finds the setup's drawings by searching the
+**whole chart** (nearest-to-start), ignoring the visible window — so you can
+leave the entire pattern *and* its future candles on screen. Per-role directional
+matching (`SlotPref::NearestTo`):
+- **H&S neckline** (break-and-close + retest): nearest trendline anchored
+  *at-or-before* `--start`.
+- **invalidation** (`too-low` / `too-high`): nearest horizontal to `--start`,
+  *either side* (the cap/floor bracket the pattern).
+- **M/W path**: the path whose two shoulders bracket `--start`
+  (`B ≤ start ≤ D`; `start ≥ B` when the right shoulder isn't drawn).
+- **trade-expiry**: nearest vertical *at-or-after* `--start`.
+- **calendar / news bars**: auto-drawn over `[--start, trade-expiry]`.
+
+`--start` also sets the prune cursor (like `--as-of`) to itself. A malformed
+value is a **hard error** (unlike `--as-of`, which falls back to the cursor) —
+`--start` changes discovery, so a typo must not silently revert to
+visible-window matching. Absent: behaviour is unchanged, bit-for-bit.
+
+**Scope.** tv-arm-only (arming). No engine / worker / signed-field change — the
+emitted plan is identical to what you'd get by hiding the future candles and
+arming normally. Intended for offline `--plan-out` journaling; on the live
+`--register-plan` path it still overrides discovery + cursor if set.
+
+**Tests.** roles: `nearest_to_picks_neckline_before_and_nearest_start`,
+`nearest_to_invalidation_takes_nearest_either_side`,
+`nearest_to_trade_expiry_picks_nearest_after_start`,
+`nearest_to_mw_path_brackets_start`,
+`nearest_to_mw_path_three_anchor_relaxes_to_after_left_shoulder`. tv-arm 177
+green; clippy + fmt clean.
+
 ## Unreleased — 2026-07-01 — too-high invalidation reverted to close-confirm
 
 **Why.** The prior "intrabar cross reads the wick" change flipped *every*
