@@ -87,6 +87,16 @@ Trading:
   account scopes — **live and archived** — so a terminated plan surfaced by
   `plan list --include-all` is still inspectable (an archived match carries an
   `archived_at` field). Drives `trade-control plan show <trade_id>`. KV-only.
+- `plan-timeline` — read-only: reconstruct the **event timeline** for one trade
+  from the worker's durable per-request recordings (`request_records`). Target
+  named by the intent's `trade_id`; returns every recorded `RequestRecord` for
+  that trade in `ts` order (enters, vetoes, preps and their dispatch outcomes),
+  so you can see what fired and when. This is the local-Postgres successor to
+  the retired R2/Cloudflare-log reconstruction — `plan show` gives the final
+  engine *state*, `plan timeline` gives the ordered event trail behind it.
+  Drives `trade-control plan timeline <trade_id>`. Recording-backed, so it's a
+  worker-local dispatch arm (not a generic `core` handler). 404 when the trade
+  has no recordings.
 - `plan-delete` — drop a registered plan and its `PlanState` — the inverse of
   `register`. Target named by the intent's `trade_id`; the worker scans all
   account scopes and deletes the matching `plan:` + `plan-state:` rows **and**
@@ -2614,6 +2624,9 @@ trade-control-dev plan list --yaml         # raw worker YAML (one entry per plan
 trade-control-dev plan show eurusd-hs-7    # full dump of one plan + its state
 trade-control-dev plan show eurusd-hs-7 --yaml
 trade-control-dev plan show eurusd-hs-7 --json   # same data as --yaml, JSON-encoded (pipe to jq)
+trade-control-dev plan timeline eurusd-hs-7          # reconstruct the event trail (what fired, when)
+trade-control-dev plan timeline eurusd-hs-7 --verbose  # include every recorded log line, not just errors
+trade-control-dev plan timeline eurusd-hs-7 --json     # raw RequestRecord list (pipe to jq)
 trade-control-dev plan export eurusd-hs-7  # bare TradePlan, exactly as imported (re-registerable)
 trade-control-dev plan delete eurusd-hs-7  # drop a plan (live and/or archived)
 trade-control-dev plan purge eurusd-hs-7   # wipe ALL KV + R2 traces of one trade
@@ -2632,6 +2645,23 @@ read-only KV-only control actions (`plan-list` / `plan-show`), signed like
 prints the raw worker YAML; `plan show --json` prints the *same data* as pretty
 JSON (each match's full `PlanDetail`) — handy for piping into `jq`. A `plan show`
 for an unknown id exits non-zero with `no registered plan with trade_id …`.
+
+`plan timeline <trade_id>` reconstructs the **event trail** for one trade from
+the worker's durable `request_records` — every inbound POST it recorded for that
+trade, oldest first, with each request's outcome and log lines. Where `plan show`
+answers *"what state did the plan end in?"*, `plan timeline` answers *"what fired,
+in what order, and why?"* — the local-Postgres successor to the old
+`trading-tax-tracker timeline --merged` reconstruction, which stitched the same
+picture from Cloudflare R2 + worker logs before the move off Cloudflare. The
+compact view prints one block per event (`ts · outcome (status) · request_id`)
+and, by default, only the `error`-level log lines (the outcome carries the
+headline); `--verbose` shows every recorded line, `--json` dumps the raw
+`RequestRecord` list. Unlike `plan show`, it reads recordings (not `StateStore`
+KV), so it's dispatched as a worker-local arm; an unknown/unrecorded id exits
+non-zero with `no recorded events for trade_id …`. It covers `request_records`
+(inbound POSTs) only for now — the cron-engine `tick_bundles` (engine-side
+fires) are a planned follow-up. P&L / fees / slippage accounting is deliberately
+*not* here; that stays broker-sourced in a separate tool.
 
 `plan export <trade_id>` is the re-registerable cousin of `show`: it strips the
 `PlanDetail` wrapper (account / state / archived_at) down to the bare

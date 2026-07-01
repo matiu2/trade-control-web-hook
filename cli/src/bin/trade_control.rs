@@ -25,7 +25,7 @@ use trade_control_cli::{
     AdoptBody, BuildStrictness, CalendarBarsArgs, KEY_LEN, TradePattern, add_account, adopt_trade,
     build_clear_prep_intent, build_clear_veto_intent, build_market_info_intent,
     build_news_from_spec, build_pause_from_spec, build_plan_delete_intent, build_plan_list_intent,
-    build_plan_purge_intent, build_plan_show_intent, build_prep_intent,
+    build_plan_purge_intent, build_plan_show_intent, build_plan_timeline_intent, build_prep_intent,
     build_purge_older_than_intent, build_register_intent, build_status_intent,
     build_trade_from_spec, build_trade_interactive, build_unlock_intent, build_veto_intent,
     delete_account, delete_secret, fill_missing_fields, generate_key_hex, list_accounts,
@@ -41,6 +41,7 @@ use trade_control_core::account::{
 use trade_control_core::incoming::signed_pairs_from_text;
 use trade_control_core::intent::Intent;
 use trade_control_core::intent::{BrokerKind, Direction, VetoLevel};
+use trade_control_core::recording::RequestRecord;
 use trade_control_core::sig::{self, SIG_FIELD};
 
 #[derive(Parser)]
@@ -173,6 +174,12 @@ enum PlanCmd {
     /// Dump one plan in full — every rule plus its persisted engine state.
     /// The worker scans all account scopes for the `trade_id`.
     Show(PlanShowArgs),
+    /// Reconstruct the event timeline for one trade from the worker's durable
+    /// per-request recordings — what fired and when (enters, vetoes, preps and
+    /// their dispatch outcomes), oldest first. The local-Postgres successor to
+    /// the retired R2/Cloudflare-log reconstruction. `plan show` gives the
+    /// final engine state; this gives the ordered event trail behind it.
+    Timeline(PlanTimelineArgs),
     /// Export one plan exactly as it was imported — the bare `TradePlan` body,
     /// encoded the same single-line flow JSON `register` puts on the wire. The
     /// inverse of arming: re-registerable as-is. (Unlike `show`, which wraps the
@@ -229,6 +236,26 @@ struct PlanShowArgs {
     /// just JSON-encoded. Handy for piping into `jq`.
     #[arg(long, conflicts_with = "yaml")]
     json: bool,
+    #[command(flatten)]
+    common: EndpointArgs,
+}
+
+#[derive(Parser)]
+struct PlanTimelineArgs {
+    /// The trade's `trade_id` (e.g. `hs-nzd-chf-d12eb831`) — matched exactly
+    /// against the recorded `trade_id`, returning every event for that trade.
+    trade_id: String,
+    /// Print the worker's raw YAML response (the full `RequestRecord` list)
+    /// instead of the compact event view.
+    #[arg(long, conflicts_with = "json")]
+    yaml: bool,
+    /// Print the records as pretty JSON. Handy for piping into `jq`.
+    #[arg(long, conflicts_with = "yaml")]
+    json: bool,
+    /// Show every recorded `logs[]` line per event. Without it, only the
+    /// error lines and the outcome are shown (the signal, not the chatter).
+    #[arg(long)]
+    verbose: bool,
     #[command(flatten)]
     common: EndpointArgs,
 }
@@ -1231,6 +1258,7 @@ fn run_plan(sub: PlanCmd) -> Result<()> {
     match sub {
         PlanCmd::List(args) => run_plan_list(args),
         PlanCmd::Show(args) => run_plan_show(args),
+        PlanCmd::Timeline(args) => run_plan_timeline(args),
         PlanCmd::Export(args) => run_plan_export(args),
         PlanCmd::Register(args) => run_plan_register(args),
         PlanCmd::Delete(args) => run_plan_delete(args),
@@ -1284,6 +1312,73 @@ fn run_plan_show(args: PlanShowArgs) -> Result<()> {
     }
     print!("{}", format_plan_show(&args.trade_id, &response));
     Ok(())
+}
+
+/// `plan timeline <trade_id>` — reconstruct the ordered event trail for one
+/// trade from the worker's `request_records`. Compact event view by default
+/// (`--verbose` for every log line); `--yaml`/`--json` for the raw records.
+fn run_plan_timeline(args: PlanTimelineArgs) -> Result<()> {
+    let key = load_key(&args.common.key_file)?;
+    let now = Utc::now();
+    let suffix = fresh_suffix()?;
+    let intent = build_plan_timeline_intent(&args.trade_id, now, &suffix);
+    let body = wrap_control(&intent, &key, now)?;
+    // A trade with no recordings is a 404; `post_control` surfaces the worker's
+    // body ("no recorded events for trade_id …") as an `Err` via `?`.
+    let response = post_control(&args.common.endpoint, &body)?;
+    if args.yaml {
+        print_raw(&response);
+        return Ok(());
+    }
+    if args.json {
+        // Round-trip YAML → records → pretty JSON so `--json` matches `plan
+        // show --json`'s jq-friendly shape.
+        let records: Vec<RequestRecord> = serde_yaml::from_str(&response)
+            .map_err(|e| eyre!("plan-timeline: parse worker YAML: {e}"))?;
+        let json = serde_json::to_string_pretty(&records)
+            .map_err(|e| eyre!("plan-timeline: serialise JSON: {e}"))?;
+        println!("{json}");
+        return Ok(());
+    }
+    print!(
+        "{}",
+        format_plan_timeline(&args.trade_id, &response, args.verbose)?
+    );
+    Ok(())
+}
+
+/// Render the worker's `request_records` YAML as a compact per-event timeline:
+/// one block per recorded request in `ts` order — a header
+/// (`ts · outcome (status) · request_id`) then its log lines. Without
+/// `verbose`, only `error`-level lines are shown (the outcome already carries
+/// the headline); with it, every `logs[]` line.
+fn format_plan_timeline(trade_id: &str, response: &str, verbose: bool) -> Result<String> {
+    use std::fmt::Write as _;
+
+    let records: Vec<RequestRecord> = serde_yaml::from_str(response)
+        .map_err(|e| eyre!("plan-timeline: parse worker YAML: {e}"))?;
+
+    let mut out = String::new();
+    let n = records.len();
+    let plural = if n == 1 { "event" } else { "events" };
+    let _ = writeln!(out, "timeline {trade_id} — {n} {plural}\n");
+
+    for rec in &records {
+        let _ = writeln!(
+            out,
+            "• {ts}  {outcome} ({status})  [{rid}]",
+            ts = rec.ts,
+            outcome = rec.outcome,
+            status = rec.status,
+            rid = rec.request_id,
+        );
+        for line in &rec.logs {
+            if verbose || line.level == "error" {
+                let _ = writeln!(out, "    {lvl:>5}  {msg}", lvl = line.level, msg = line.msg);
+            }
+        }
+    }
+    Ok(out)
 }
 
 /// `plan export <trade_id>` — emit the bare `TradePlan` body exactly as it was
@@ -2401,6 +2496,88 @@ reset_time: 10:00 PM
         );
         assert!(out.contains("trade_id: eurusd-hs-7"));
         assert!(out.contains("phase: await_entry"));
+    }
+
+    /// Two recorded requests for one trade: a veto fire (with a plain log line)
+    /// and an enter that errored. Mirrors the worker's `Vec<RequestRecord>` YAML.
+    fn timeline_fixture() -> &'static str {
+        "\
+- ts: '2026-06-18T19:15:00Z'
+  request_id: aaa111
+  method: POST
+  path: /
+  headers: []
+  body: 'action: veto'
+  intent_id: hs-nzd-chf-d12eb831-too-high
+  trade_id: hs-nzd-chf-d12eb831
+  status: 200
+  outcome: veto-set
+  logs:
+  - level: log
+    msg: 'veto too-high set'
+- ts: '2026-06-18T22:30:00Z'
+  request_id: bbb222
+  method: POST
+  path: /
+  headers: []
+  body: 'action: enter'
+  intent_id: hs-nzd-chf-d12eb831-enter
+  trade_id: hs-nzd-chf-d12eb831
+  status: 412
+  outcome: 'rejected: veto-active (too-high)'
+  logs:
+  - level: log
+    msg: 'entry id=hs-nzd-chf-d12eb831-enter'
+  - level: error
+    msg: 'blocked by veto too-high'
+"
+    }
+
+    #[test]
+    fn plan_timeline_compact_shows_headers_and_error_lines_only() {
+        let out = format_plan_timeline("hs-nzd-chf-d12eb831", timeline_fixture(), false).unwrap();
+        assert!(
+            out.starts_with("timeline hs-nzd-chf-d12eb831 — 2 events\n"),
+            "got: {out}"
+        );
+        // Both event headers present, in ts order.
+        assert!(out.contains("• 2026-06-18T19:15:00Z  veto-set (200)  [aaa111]"));
+        assert!(
+            out.contains(
+                "• 2026-06-18T22:30:00Z  rejected: veto-active (too-high) (412)  [bbb222]"
+            )
+        );
+        // Error line shown; the plain `log` lines are suppressed in compact mode.
+        assert!(out.contains("blocked by veto too-high"));
+        assert!(!out.contains("veto too-high set"));
+        assert!(!out.contains("entry id=hs-nzd-chf-d12eb831-enter"));
+    }
+
+    #[test]
+    fn plan_timeline_verbose_shows_every_log_line() {
+        let out = format_plan_timeline("hs-nzd-chf-d12eb831", timeline_fixture(), true).unwrap();
+        assert!(out.contains("veto too-high set"));
+        assert!(out.contains("entry id=hs-nzd-chf-d12eb831-enter"));
+        assert!(out.contains("blocked by veto too-high"));
+    }
+
+    #[test]
+    fn plan_timeline_singular_event_word() {
+        let one = "\
+- ts: '2026-06-18T19:15:00Z'
+  request_id: aaa111
+  method: POST
+  path: /
+  headers: []
+  body: ''
+  intent_id: null
+  trade_id: t
+  status: 200
+  outcome: ok
+  logs: []
+";
+        let out = format_plan_timeline("t", one, false).unwrap();
+        assert!(out.starts_with("timeline t — 1 event\n"), "got: {out}");
     }
 
     #[test]

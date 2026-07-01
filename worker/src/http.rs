@@ -57,7 +57,7 @@ use trade_control_core::dispatch::{
     ActionResult, ControlResult, handle_clear_prep, handle_clear_veto, handle_news_end,
     handle_news_start, handle_pause, handle_plan_delete, handle_plan_list, handle_plan_show,
     handle_prep, handle_prep_expire, handle_register, handle_resume, handle_status, handle_unlock,
-    handle_veto, is_multishot_enter, record_dispatcher_outcome, run_action,
+    handle_veto, is_multishot_enter, record_dispatcher_outcome, record_seen, run_action,
 };
 use trade_control_core::incoming::{IncomingDisposition, Verified, parse_and_verify};
 use trade_control_core::intent::{Action, BrokerKind, VetoLevel};
@@ -304,6 +304,11 @@ async fn dispatch_control(
         Action::Register => handle_register(store, verified, now).await,
         Action::PlanList => handle_plan_list(store, verified, now).await,
         Action::PlanShow => handle_plan_show(store, verified, now).await,
+        // Recording-backed (reads `request_records`), so it can't be a generic
+        // `core` handler like the others — it's dispatched here against the
+        // concrete `PgStateStore` pool, the same way the R2-backed purge arms
+        // are worker-local.
+        Action::PlanTimeline => handle_plan_timeline(store, verified, now).await,
         Action::PlanDelete => handle_plan_delete(store, verified, now).await,
         // Not yet supported natively — these need R2 (the `ticks/` bundles for
         // purge) or the TradeNation market-info call (MarketInfo). The wasm
@@ -317,6 +322,54 @@ async fn dispatch_control(
         _ => return None,
     };
     Some(r)
+}
+
+/// `plan timeline <trade_id>` — reconstruct the event timeline for one trade
+/// from the durable `request_records` recordings. The worker-local counterpart
+/// of the generic `handle_plan_show`: because the read hits the concrete
+/// Postgres pool (recordings are not part of the `StateStore` trait), it lives
+/// here rather than in `core`.
+///
+/// Returns the matching [`RequestRecord`]s as YAML (oldest first) on `Ok`, a
+/// 404 when the trade has no recordings, or a 400 when `trade_id` is missing.
+/// Recorded as seen on completion (idempotent read, like `plan-show`).
+async fn handle_plan_timeline(
+    store: &PgStateStore,
+    verified: &Verified,
+    now: chrono::DateTime<Utc>,
+) -> ControlResult {
+    let Some(target) = verified.intent.trade_id.as_deref() else {
+        return ControlResult::error("plan-timeline requires a `trade_id`", 400);
+    };
+
+    let records = match crate::recording_pg::request_records_for_trade(store.pool(), target).await {
+        Ok(v) => v,
+        Err(err) => {
+            tracing::error!("plan-timeline: request_records_for_trade: {err}");
+            return ControlResult::error("state error", 500);
+        }
+    };
+
+    if records.is_empty() {
+        record_seen(
+            store,
+            verified,
+            now,
+            &format!("plan-timeline: {target} not found"),
+        )
+        .await;
+        return ControlResult::error(format!("no recorded events for trade_id {target}"), 404);
+    }
+
+    let body = match serde_yaml::to_string(&records) {
+        Ok(s) => s,
+        Err(err) => {
+            tracing::error!("plan-timeline serialise: {err}");
+            return ControlResult::error("internal error", 500);
+        }
+    };
+    record_seen(store, verified, now, &format!("plan-timeline: {target}")).await;
+    ControlResult::ok(body)
 }
 
 /// Dispatch a broker action (Enter / Close / Invalidate / escalated Veto)

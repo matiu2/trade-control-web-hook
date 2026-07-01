@@ -48,7 +48,12 @@ pub fn begin() {
 /// Append a line to the per-request buffer. Used by the [`rlog!`] macros
 /// and by [`crate::tracing_console::ConsoleSubscriber`].
 pub fn push(level: &'static str, msg: String) {
-    LOG_BUFFER.with(|b| b.borrow_mut().push(LogLine { level, msg }));
+    LOG_BUFFER.with(|b| {
+        b.borrow_mut().push(LogLine {
+            level: level.into(),
+            msg,
+        })
+    });
 }
 
 /// Drain the buffer, returning everything captured this request.
@@ -148,11 +153,11 @@ mod tests {
             logs,
             vec![
                 LogLine {
-                    level: "log",
+                    level: "log".into(),
                     msg: "first".into()
                 },
                 LogLine {
-                    level: "error",
+                    level: "error".into(),
                     msg: "second".into()
                 },
             ]
@@ -178,14 +183,14 @@ mod tests {
         assert_eq!(
             logs[0],
             LogLine {
-                level: "log",
+                level: "log".into(),
                 msg: "hello world".into()
             }
         );
         assert_eq!(
             logs[1],
             LogLine {
-                level: "error",
+                level: "error".into(),
                 msg: "boom 42".into()
             }
         );

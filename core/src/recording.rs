@@ -15,13 +15,21 @@
 //! thread-local log buffer, R2 / Postgres I/O) live with each runtime, not
 //! here.
 
-use serde::Serialize;
+use std::borrow::Cow;
+
+use serde::{Deserialize, Serialize};
 
 /// One captured log line.
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+///
+/// `level` is a `Cow<'static, str>` so the write path can keep using the cheap
+/// `&'static "log"` / `"error"` literals while the read path (`plan timeline`)
+/// can still *deserialize* recorded records back — a borrowed `&'static str`
+/// alone cannot derive `Deserialize`. Serialized wire shape is an ordinary
+/// string either way.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct LogLine {
     /// `"log"` or `"error"` — mirrors console.log vs console.error.
-    pub level: &'static str,
+    pub level: Cow<'static, str>,
     /// The formatted message.
     pub msg: String,
 }
@@ -29,7 +37,7 @@ pub struct LogLine {
 /// The full per-request record. The wasm worker writes it to R2 as one JSON
 /// object; the native runtime inserts it into the `request_records` table as
 /// `jsonb` (plus the extracted correlation columns).
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct RequestRecord {
     /// UTC RFC3339 — when the request was received.
     pub ts: String,
@@ -169,5 +177,40 @@ mod tests {
             rec.r2_key(),
             "req/2026-06-15/2026-06-15T07:51:39.123Z-abc123.json"
         );
+    }
+
+    #[test]
+    fn record_round_trips_through_json() {
+        // The read side (`plan timeline`) deserializes what the write side
+        // serialized — this guards the `Deserialize` derive + `Cow` level field.
+        let rec = RequestRecord {
+            ts: "2026-06-15T07:51:39.123Z".into(),
+            request_id: "abc123".into(),
+            method: "POST".into(),
+            path: "/".into(),
+            headers: vec![("x-api-key".into(), "k".into())],
+            body: "action: enter".into(),
+            intent_id: Some("hs-eur-usd-abc".into()),
+            trade_id: Some("hs-eur-usd".into()),
+            status: 200,
+            outcome: "entered".into(),
+            logs: vec![
+                LogLine {
+                    level: "log".into(),
+                    msg: "entry placed".into(),
+                },
+                LogLine {
+                    level: "error".into(),
+                    msg: "boom".into(),
+                },
+            ],
+        };
+        let json = serde_json::to_string(&rec).unwrap();
+        let back: RequestRecord = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.trade_id.as_deref(), Some("hs-eur-usd"));
+        assert_eq!(back.logs.len(), 2);
+        assert_eq!(back.logs[0].level, "log");
+        assert_eq!(back.logs[1].level, "error");
+        assert_eq!(back.logs[1].msg, "boom");
     }
 }

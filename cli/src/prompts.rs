@@ -101,6 +101,7 @@ pub fn required_for_action(action: Action) -> &'static [&'static str] {
         // the interactive questionnaire.
         Action::PlanList
         | Action::PlanShow
+        | Action::PlanTimeline
         | Action::PlanDelete
         | Action::PlanPurge
         | Action::PurgeOlderThan => &[],

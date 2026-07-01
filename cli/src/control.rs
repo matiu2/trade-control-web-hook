@@ -166,6 +166,19 @@ pub fn build_plan_show_intent(trade_id: &str, now: DateTime<Utc>, suffix: &str) 
     intent
 }
 
+/// Build a `plan-timeline` query `Intent` for one `trade_id`. The worker
+/// returns every recorded `RequestRecord` for that trade (oldest first).
+/// `instrument` is an ignored placeholder; the target rides on `trade_id`.
+pub fn build_plan_timeline_intent(trade_id: &str, now: DateTime<Utc>, suffix: &str) -> Intent {
+    let id = format!(
+        "plan-timeline-{trade_id}-{}-{suffix}",
+        now.format("%Y-%m-%dT%H%M%S")
+    );
+    let mut intent = control_skeleton(Action::PlanTimeline, STATUS_INSTRUMENT, id, now);
+    intent.trade_id = Some(trade_id.to_string());
+    intent
+}
+
 /// Build a `plan-delete` `Intent` for one `trade_id` — the inverse of
 /// `register`. The worker scans every account scope and drops the matching
 /// plan + plan-state rows. `instrument` is an ignored placeholder; the target
