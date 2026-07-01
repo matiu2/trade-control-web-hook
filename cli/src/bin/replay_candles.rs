@@ -313,8 +313,11 @@ async fn main() -> Result<()> {
     // from the same TradeNation `market_info` source the live worker's
     // `blackout_hours` cron uses; OANDA stays empty (coming soon). Fail-soft —
     // any miss logs a WARN and yields no windows. See `market_hours`.
-    let blackout_windows =
-        market_hours::resolve_blackout_windows(args.source, raw_instrument).await;
+    //
+    // Pass the *resolved* broker symbol (`symbol`, e.g. TradeNation's `AUD/NZD`
+    // MarketName), not the raw plan string — `resolve_market` matches the
+    // catalog name exactly, so a slash-less/OANDA-form `raw_instrument` misses.
+    let blackout_windows = market_hours::resolve_blackout_windows(args.source, &symbol).await;
 
     print!(
         "{}",
