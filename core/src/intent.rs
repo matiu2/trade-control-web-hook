@@ -1151,11 +1151,12 @@ impl Intent {
         // looks vetos up by the entry's own trade_id — an untagged entry
         // could never match a (correctly tagged) veto. See the 2026-06-11
         // cross-trade veto-bleed fix.
-        // `PlanDelete` / `PlanPurge` join the trade-id-required set for a
-        // different reason: `trade_id` *names the plan/trade to drop*. Without
-        // it there is nothing to delete, so reject the malformed control message
-        // before dispatch. (`PurgeOlderThan` carries no trade_id — it's a bulk
-        // date sweep — so it is deliberately excluded.)
+        // `PlanDelete` / `PlanPurge` / `PlanTimeline` join the
+        // trade-id-required set for a different reason: `trade_id` *names the
+        // plan/trade to drop* (delete/purge) or *to reconstruct* (timeline).
+        // Without it there is nothing to act on, so reject the malformed
+        // control message before dispatch. (`PurgeOlderThan` carries no
+        // trade_id — it's a bulk date sweep — so it is deliberately excluded.)
         if matches!(
             self.action,
             Action::Enter
@@ -1163,6 +1164,7 @@ impl Intent {
                 | Action::ClearVeto
                 | Action::PlanDelete
                 | Action::PlanPurge
+                | Action::PlanTimeline
         ) && self.trade_id.is_none()
         {
             return Err(IntentValidationError::MissingTradeId);
@@ -1568,6 +1570,17 @@ pub enum Action {
     /// the worker scans every account scope and returns the match(es). KV-only,
     /// idempotent. Drives `trade-control plan show <trade_id>`.
     PlanShow,
+    /// Read-only query: reconstruct the event timeline for one trade from the
+    /// worker's durable per-request recordings (`request_records`). The target
+    /// is named by [`Intent::trade_id`] (`instrument` is an ignored
+    /// placeholder); the worker returns every [`RequestRecord`] whose
+    /// `trade_id` matches, in `ts` order, so the operator can see what fired
+    /// and when (enters, vetoes, preps and their dispatch outcomes). This is
+    /// the local-Postgres successor to the retired R2/Cloudflare-log
+    /// reconstruction. Recording-backed, not `StateStore`-trait-backed, so it
+    /// is dispatched as a worker-local arm (like [`Action::PlanPurge`]).
+    /// KV-only, idempotent. Drives `trade-control plan timeline <trade_id>`.
+    PlanTimeline,
     /// Delete a registered server-side
     /// [`TradePlan`](crate::trade_plan::TradePlan) and its
     /// [`PlanState`](crate::plan_state::PlanState) — the inverse of
@@ -3627,6 +3640,38 @@ mod tests {
             trade_id: eurusd-hs-1
             not_after: \"2026-05-13T20:00:00Z\"
             action: plan-delete
+            instrument: ALL
+        ";
+        let intent: Intent = serde_yaml::from_str(yaml).unwrap();
+        intent.validate().unwrap();
+    }
+
+    #[test]
+    fn validate_rejects_plan_timeline_without_trade_id() {
+        // Also pins the `plan-timeline` wire string → Action::PlanTimeline.
+        let yaml = "
+            v: 1
+            id: plan-timeline-no-tid
+            not_after: \"2026-05-13T20:00:00Z\"
+            action: plan-timeline
+            instrument: ALL
+        ";
+        let intent: Intent = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(intent.action, Action::PlanTimeline);
+        assert_eq!(
+            intent.validate(),
+            Err(IntentValidationError::MissingTradeId)
+        );
+    }
+
+    #[test]
+    fn validate_accepts_plan_timeline_with_trade_id() {
+        let yaml = "
+            v: 1
+            id: plan-timeline-ok
+            trade_id: hs-nzd-chf-d12eb831
+            not_after: \"2026-05-13T20:00:00Z\"
+            action: plan-timeline
             instrument: ALL
         ";
         let intent: Intent = serde_yaml::from_str(yaml).unwrap();

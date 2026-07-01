@@ -40,6 +40,7 @@ pub async fn run_action<B: Broker, S: StateStore>(
         | Action::Register
         | Action::PlanList
         | Action::PlanShow
+        | Action::PlanTimeline
         | Action::PlanDelete
         | Action::PlanPurge
         | Action::PurgeOlderThan

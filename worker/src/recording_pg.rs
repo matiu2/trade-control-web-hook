@@ -60,6 +60,42 @@ pub async fn record_request(
     .map(|_| ())
 }
 
+/// Read every [`RequestRecord`] for one trade, oldest first — the read side of
+/// [`record_request`], used by the `plan timeline` reconstruction.
+///
+/// Matches on the extracted `trade_id` column (indexed) and returns the full
+/// records in `ts` order so the caller can render the event timeline for that
+/// trade (enters, vetoes, preps and their per-request `logs[]`). Each row's
+/// `body jsonb` is deserialized back into the same [`RequestRecord`] the worker
+/// wrote — no shape drift, because both sides use the `core` type.
+///
+/// A row whose `body` fails to deserialize is skipped with a `warn!` rather
+/// than failing the whole timeline: one corrupt record must not hide the rest.
+pub async fn request_records_for_trade(
+    pool: &sqlx::PgPool,
+    trade_id: &str,
+) -> Result<Vec<RequestRecord>, sqlx::Error> {
+    let rows: Vec<(serde_json::Value,)> =
+        sqlx::query_as("SELECT body FROM request_records WHERE trade_id = $1 ORDER BY ts, id")
+            .bind(trade_id)
+            .fetch_all(pool)
+            .await?;
+
+    let records = rows
+        .into_iter()
+        .filter_map(
+            |(body,)| match serde_json::from_value::<RequestRecord>(body) {
+                Ok(rec) => Some(rec),
+                Err(err) => {
+                    tracing::warn!("timeline: skipping request_records row for {trade_id}: {err}");
+                    None
+                }
+            },
+        )
+        .collect();
+    Ok(records)
+}
+
 /// Insert one cron-engine [`TickBundle`] into `tick_bundles`. `tick_ts` is
 /// already a `DateTime<Utc>`; `body` is the whole bundle as `jsonb`.
 pub async fn record_tick(pool: &sqlx::PgPool, bundle: &TickBundle) -> Result<(), sqlx::Error> {

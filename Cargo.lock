@@ -4273,6 +4273,7 @@ dependencies = [
  "color-eyre",
  "serde",
  "serde_json",
+ "serde_yaml",
  "sqlx",
  "tokio",
  "toml",
