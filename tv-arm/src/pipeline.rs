@@ -872,8 +872,12 @@ fn check_required(roles: &Roles, args: &Args) -> std::result::Result<(), String>
     if roles.break_and_close.is_none() && !args.skip_break_and_close {
         missing.push("trend_line labeled 'neckline' (or 'break-and-close')");
     }
-    if roles.retest.is_none() && !args.skip_retest {
-        missing.push("trend_line labeled 'retest'");
+    // The retest reuses the neckline drawing (`resolve_retest`), so it's only
+    // *independently* missing when the retest is wanted but there's no neckline
+    // to derive it from — i.e. the neckline is skipped. A plain neckline setup
+    // satisfies both roles with one drawing.
+    if roles.retest.is_none() && !args.skip_retest && args.skip_break_and_close {
+        missing.push("trend_line labeled 'neckline' (needed for the retest)");
     }
     if roles.tp_fib.is_none() {
         missing.push("fib_retracement (TP)");

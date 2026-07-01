@@ -175,7 +175,7 @@ Basename ordering matters — `tv-arm` maps drawings to alerts by prefix.
 | `01-veto-too-low` | `veto` | Price crossing pcl-exhausted level | "Pattern completion level exhausted" — 80% of the way from the fib's midpoint to TP. Value-bound, computed by `tv-arm` from the fib geometry. Direction-mirrors the invalidation veto, but level is `stop-next-entry`, **not** `close-positions`: a pcl breach is in the trade's favour (price ran toward TP), so it only blocks a *late* entry and never touches an open position. (Was wrongly `close-positions` until the trade-046 fix — it closed an in-profit short ~31 ticks early.) |
 | `02-veto-trade-expiry` | `veto` | Vertical line crossing chart time | Hard stop: once the trade-expiry line passes, no more entries. |
 | `03-prep-break-and-close` | `prep` | Trendline crossing (neckline break) | Skippable for stocks / late entries with `--skip-break-and-close`. |
-| `04-prep-retest` | `prep` | Trendline crossing (intrabar retest of the neckline) | Skippable with `--skip-retest`. Fires **intrabar on the wick**, not the close: the bar must open on one side of the neckline and trade through to the other (long retest = open above the descending neckline, low dips at/below it). A tap-and-bounce that closes back on the original side still counts — see CHANGELOG "intrabar cross reads the wick". The wick must pierce at least `cross_buffer_pct%` of the line price past the line (plan-level field, default 0.02%) so a one-tick graze doesn't trip it. |
+| `04-prep-retest` | `prep` | Trendline crossing (intrabar retest of the neckline) | Skippable with `--skip-retest`. **Uses the same neckline drawing** as `03-prep-break-and-close` (opposite direction, intrabar) — you draw the neckline once. A separate `retest`/`neckline-retest`/`retrace` trendline is still honoured but **deprecated** (`tv-arm` warns). Fires **intrabar on the wick**, not the close: the bar must open on one side of the neckline and trade through to the other (long retest = open above the descending neckline, low dips at/below it). A tap-and-bounce that closes back on the original side still counts — see CHANGELOG "intrabar cross reads the wick". The wick must pierce at least `cross_buffer_pct%` of the line price past the line (plan-level field, default 0.02%) so a one-tick graze doesn't trip it. |
 | `05-enter` | `enter` | Pine `Candle Signals` golden candle | The actual trade. Gated on the preps above + opposing-direction veto absent. |
 | `09-enter-qm` | `enter` | Pine `Candle Signals` (same detector as `05-enter`) | **`tv-arm --strategy-v2` only.** The Quasimodo entry, armed alongside `05-enter`: no preps, confirmed-candle gated. Its entry spec is **identical to standalone `--quasimodo`** — a stop at signal_low − the ATR buffer (`offset_atr_pct: 0.5`; see "ATR buffer") with a `recover_entry: limit` fallback (fills on the pullback when the level was overrun), *not* a bare limit. Shares the trade's `trade_id` + `max_retries` with `05-enter`; first of the two to fire cancels the other's resting order (worker retry gate). See "Dual entry — `--strategy-v2`" below. |
 | `06-close-on-reversal` | `close` | Pine `Candle Signals` opposing reversal | Emitted when news-pairs and/or `support`/`resistance` lines are drawn. Carries `inside_window: [news?, price?]` (OR-composed) and, when `price` is listed, `sr_bands: [[lo, hi], ...]`. Defaults `needs_golden: true` for the candle-quality gate. With `tv-arm --veto-on-reversal` (experimental) it also carries `veto_on_reversal: true`, so a reversal off a band before entry vetoes the upcoming trade — see the `close` action notes above. |
@@ -260,10 +260,13 @@ wrong-side and rejects it if so.
 The day-to-day loop, end to end:
 
 1. **Draw the setup on a TradingView chart.** Mark the invalidation line,
-   the neckline (break-and-close prep), the retest, a fib retracement
-   spanning head → neckline, a `trade-expiry` vertical, and any optional
-   extras (`news-start`/`news-end` pairs around scheduled news,
-   `support`/`resistance` horizontals near key levels).
+   the neckline (which serves **both** the break-and-close prep **and** the
+   retest — one drawing, see below), a fib retracement spanning head →
+   neckline, a `trade-expiry` vertical, and any optional extras
+   (`news-start`/`news-end` pairs around scheduled news,
+   `support`/`resistance` horizontals near key levels). Drawing a separate
+   `retest` trendline still works but is **deprecated** — `tv-arm` warns and
+   reuses the neckline for the retest when no `retest` line is present.
 2. **Run `tv-arm`.** The Rust binary (`cargo run -p tv-arm --`) reads
    the chart geometry via tv-mcp, shells out to `trade-control
    build-trade --from-file` for `trade_id` minting + signing, then posts

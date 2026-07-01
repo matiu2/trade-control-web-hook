@@ -314,7 +314,19 @@ pub fn classify<F: DrawingFetcher>(
         roles.invalidation_label = Some(lbl);
     }
     roles.break_and_close = break_and_close;
-    roles.retest = pick_slot(retest_lines, "retest", visible_range, slot_pref);
+    // Retest = a cross back through the neckline (opposite direction, intrabar).
+    // TradingView used to force a *separate* `retest` trendline because a single
+    // drawing could only carry one alert; that limitation is gone, so the
+    // neckline (`break_and_close`) now serves both roles by default. A drawn
+    // `retest` line is still honoured — but it's **deprecated**: warn and keep it.
+    // With no `retest` line, fall back to the neckline drawing so `04-prep-retest`
+    // crosses the exact same geometry.
+    roles.retest = resolve_retest(
+        retest_lines,
+        &roles.break_and_close,
+        visible_range,
+        slot_pref,
+    );
     roles.tp_fib = pick_slot(tp_fibs, "tp_fib", visible_range, slot_pref);
     roles.trade_expiry = pick_trade_expiry(trade_expiries, visible_range, slot_pref);
 
@@ -362,6 +374,43 @@ pub fn classify<F: DrawingFetcher>(
     roles.position = latest_position(positions);
 
     Ok(roles)
+}
+
+/// Resolve the retest role.
+///
+/// Historically the retest was a **separate** `retest` trendline, because a
+/// single TradingView drawing could only carry one alert (so the neckline
+/// couldn't fire both the break-and-close *and* its own retest). That
+/// limitation is gone, and the retest is by definition a cross back through the
+/// **same neckline** — so the neckline drawing now serves both roles.
+///
+/// - A drawn `retest` line is still honoured (so old charts keep working), but
+///   it is **deprecated**: warn and keep using it.
+/// - With no drawn `retest` line, fall back to the resolved neckline
+///   (`break_and_close`). `04-prep-retest`'s trigger then crosses the identical
+///   geometry — just the opposite direction, intrabar (see `retest_dir` in
+///   `trade_plan_build`).
+fn resolve_retest(
+    retest_lines: Vec<Drawing>,
+    break_and_close: &Option<Drawing>,
+    visible_range: (i64, i64),
+    slot_pref: SlotPref,
+) -> Option<Drawing> {
+    if !retest_lines.is_empty() {
+        warn!(
+            count = retest_lines.len(),
+            "a separate `retest` trendline is deprecated — the neckline now serves \
+             both break-and-close and retest; honouring the drawn retest line for now, \
+             but you can delete it and draw only the neckline"
+        );
+        return pick_slot(retest_lines, "retest", visible_range, slot_pref);
+    }
+    // No drawn retest line: reuse the neckline drawing.
+    if let Some(neckline) = break_and_close {
+        debug!("no `retest` line drawn; reusing the neckline for the retest role");
+        return Some(neckline.clone());
+    }
+    None
 }
 
 /// A position tool qualifies only when it has an entry anchor and both
@@ -1048,6 +1097,64 @@ mod tests {
 
         assert_eq!(roles.sr_levels.len(), 1);
         assert_eq!(roles.sr_levels[0].id, "sr");
+    }
+
+    #[test]
+    fn neckline_serves_the_retest_when_no_retest_line_is_drawn() {
+        // No separate `retest` trendline: the retest role reuses the neckline
+        // drawing so `04-prep-retest` crosses the identical geometry.
+        let (stubs, mcp) = fixture(vec![(
+            stub("neck", "trend_line"),
+            drawing("neck", "neckline", vec![(50, 1.10), (200, 1.10)]),
+        )]);
+
+        let roles = classify(&mcp, &stubs, ANY_RANGE, SlotPref::LatestWins).expect("classify ok");
+        assert_eq!(roles.break_and_close.as_ref().unwrap().id, "neck");
+        assert_eq!(
+            roles.retest.as_ref().unwrap().id,
+            "neck",
+            "the retest role falls back to the neckline drawing"
+        );
+    }
+
+    #[test]
+    fn a_separate_retest_line_is_still_honoured_deprecated() {
+        // A drawn `retest` line still wins its own slot (backward compat) even
+        // though it's deprecated — the neckline would otherwise serve both.
+        let (stubs, mcp) = fixture(vec![
+            (
+                stub("neck", "trend_line"),
+                drawing("neck", "neckline", vec![(50, 1.10), (200, 1.10)]),
+            ),
+            (
+                stub("re", "trend_line"),
+                drawing("re", "retest", vec![(60, 1.11), (210, 1.11)]),
+            ),
+        ]);
+
+        let roles = classify(&mcp, &stubs, ANY_RANGE, SlotPref::LatestWins).expect("classify ok");
+        assert_eq!(roles.break_and_close.as_ref().unwrap().id, "neck");
+        assert_eq!(
+            roles.retest.as_ref().unwrap().id,
+            "re",
+            "a drawn retest line is honoured over the neckline fallback"
+        );
+    }
+
+    #[test]
+    fn no_neckline_and_no_retest_leaves_the_retest_role_empty() {
+        // With neither drawing there's nothing to derive the retest from.
+        let (stubs, mcp) = fixture(vec![(
+            stub("inv", "horizontal_line"),
+            drawing("inv", "too-high", vec![(100, 1.25)]),
+        )]);
+
+        let roles = classify(&mcp, &stubs, ANY_RANGE, SlotPref::LatestWins).expect("classify ok");
+        assert!(roles.break_and_close.is_none());
+        assert!(
+            roles.retest.is_none(),
+            "no neckline to fall back to → no retest"
+        );
     }
 
     #[test]

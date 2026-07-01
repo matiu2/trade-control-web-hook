@@ -1,5 +1,39 @@
 # Changelog
 
+## Unreleased — 2026-07-02 — tv-arm: neckline serves the retest (one drawing)
+
+**Why.** The `03-prep-break-and-close` and `04-prep-retest` rules cross the
+*same* neckline — the retest is by definition a cross back through it (opposite
+direction, intrabar). They only lived as two separate drawings because
+TradingView couldn't fire two alerts off one trendline. That limitation is gone,
+so making the operator draw the neckline twice is pure ceremony.
+
+**What changed.** `tv-arm`'s role resolution (`tv-arm/src/roles.rs`,
+`resolve_retest`) now reuses the resolved neckline (`break_and_close`) for the
+retest role **when no `retest` trendline is drawn** — `04-prep-retest` gets the
+identical geometry via the existing opposite-direction/intrabar trigger build,
+unchanged. A separately-drawn `retest`/`neckline-retest`/`retrace` line is still
+honoured (backward compat) but now **warns as deprecated**. `check_required`
+(`tv-arm/src/pipeline.rs`) no longer demands a standalone `retest` line — the
+neckline satisfies both; the retest is only *independently* required when the
+neckline itself is skipped (`--skip-break-and-close` without `--skip-retest`).
+
+**Breaking.** None. A chart with a separate retest line behaves as before (plus a
+deprecation warning); a chart with only a neckline now arms the retest too
+instead of erroring `missing … 'retest'`.
+
+**Config.** No new fields. Same labels (`neckline`/`break-and-close`;
+`retest`/`neckline-retest`/`retrace` still recognised for the deprecated path).
+
+**Tests.** `tv-arm/src/roles.rs`: `neckline_serves_the_retest_when_no_retest_line_is_drawn`,
+`a_separate_retest_line_is_still_honoured_deprecated`,
+`no_neckline_and_no_retest_leaves_the_retest_role_empty`. tv-arm 188 green,
+clippy + fmt clean.
+
+**Follow-up.** The `retest`/`neckline-retest`/`retrace` label vocabulary and the
+`--skip-retest` flag can eventually be retired once no live charts draw a
+separate retest line.
+
 ## Unreleased — 2026-07-02 — tv-arm: rename `--update` → `--replace` (alias kept)
 
 **Why.** The re-arm flag was named `--update`, which reads like an in-place
