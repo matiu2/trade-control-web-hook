@@ -582,6 +582,21 @@ fn evaluate_one_entry(
     detector_cfg: &DetectorConfig,
     fired: &mut Vec<FiredIntent>,
 ) {
+    // Replay-start entry floor (journaling only). When a plan carries a
+    // `replay_start` cursor (baked by `tv-arm --start`), the bars before it are
+    // warmup/context — "live now" begins at the cursor — so no enter may fire on
+    // a bar that opens before it. Without this, a free enter (the strategy-v2 QM
+    // enter, which has no prep spine) can latch onto a micro-pattern sitting
+    // right at the replay boundary and enter before the setup being journaled has
+    // even formed. The field is `None` on the live worker path (it ignores it),
+    // so this floor is inert in production — exactly the intent (live trading has
+    // no artificial start).
+    if let Some(start) = plan.replay_start
+        && candle.time.timestamp() < start
+    {
+        return;
+    }
+
     // A `PinePattern` enter is decided by the stateful candle detector over the
     // back-window, not by a per-candle level cross. It also produces the latched
     // signal geometry that rides onto the dispatched shell.
@@ -2296,6 +2311,42 @@ mod tests {
         assert_eq!(fired, vec!["09-enter-qm"], "only the QM enter fires");
         assert!(!eval.done, "plan stays alive (multi-shot enters)");
         assert_eq!(eval.new_state.phase, Phase::AwaitEntry);
+    }
+
+    #[test]
+    fn replay_start_floors_enters_to_the_start_cursor() {
+        // A journaling replay bakes `replay_start` onto the plan. Bars before it
+        // are warmup/context — no enter may fire on a bar that opens before the
+        // cursor, even a free (no-prep) QM enter that would otherwise latch onto
+        // a micro-pattern at the replay boundary. On/after the cursor the enter
+        // fires normally.
+        let mut p = strategy_v2_plan();
+        p.replay_start = Some(ts("2026-06-16T12:00:00Z").timestamp());
+
+        // Bar at 11:00 — one hour BEFORE the start cursor. The QM enter would
+        // fire here without the floor; it must not.
+        let prior = seed_at(Phase::AwaitEntry, "2026-06-16T10:00:00Z");
+        let before = candle("2026-06-16T11:00:00Z", 1.18, 1.185, 1.17, 1.182);
+        let eval_before = run(&p, &prior, &[before]);
+        assert!(
+            eval_before.fired.is_empty(),
+            "no enter fires before replay_start; got {:?}",
+            eval_before
+                .fired
+                .iter()
+                .map(|f| f.rule_id.as_str())
+                .collect::<Vec<_>>()
+        );
+
+        // Bar at 12:00 — exactly the start cursor. The QM enter fires.
+        let at_start = candle("2026-06-16T12:00:00Z", 1.18, 1.185, 1.17, 1.182);
+        let eval_at = run(&p, &eval_before.new_state, &[at_start]);
+        let fired: Vec<&str> = eval_at.fired.iter().map(|f| f.rule_id.as_str()).collect();
+        assert_eq!(
+            fired,
+            vec!["09-enter-qm"],
+            "the QM enter fires on the start bar"
+        );
     }
 
     #[test]
