@@ -384,9 +384,7 @@ pub fn render(
     }
 
     let closes = collect_close_fires(replay);
-    let mut wins = 0usize;
-    let mut losses = 0usize;
-    let mut reversal_closes = 0usize;
+    let mut tally = Tally::new();
     for fire in &replay.fires {
         out.push_str(&render_fire(
             plan,
@@ -394,9 +392,7 @@ pub fn render(
             simulate,
             &closes,
             blackout_windows,
-            &mut wins,
-            &mut losses,
-            &mut reversal_closes,
+            &mut tally,
         ));
     }
 
@@ -412,13 +408,81 @@ pub fn render(
         replay.fires.len()
     ));
     if simulate {
-        out.push_str(&format!("  |  TP: {wins}  SL: {losses}"));
-        if reversal_closes > 0 {
-            out.push_str(&format!("  REV: {reversal_closes}"));
+        out.push_str(&format!("  |  TP: {}  SL: {}", tally.wins, tally.losses));
+        if tally.reversal_closes > 0 {
+            out.push_str(&format!("  REV: {}", tally.reversal_closes));
         }
+        out.push_str(&tally.summary_line());
     }
     out.push('\n');
     out
+}
+
+/// The account size a `--simulate` P&L projection compounds from: 1% risk per
+/// taken trade against a fresh $100k. Every fill's R multiple grows or shrinks
+/// this balance so the report shows what the sequence would have made on a
+/// standard account, not just the raw R sum.
+const START_ACCOUNT: f64 = 100_000.0;
+
+/// Fraction of the *remaining* account risked on each taken trade (1%).
+const RISK_FRACTION: f64 = 0.01;
+
+/// Running tally across a simulated replay: outcome counts, the net R (sum of
+/// per-trade R multiples), and a $100k account compounding at 1% risk per
+/// taken trade. `net_r` and `account` only move on *taken* fills (TP / SL /
+/// reversal-close); not-taken kinds (never-filled, declined, gate-blocked)
+/// contribute 0R and leave the balance untouched.
+struct Tally {
+    wins: usize,
+    losses: usize,
+    reversal_closes: usize,
+    net_r: f64,
+    account: f64,
+}
+
+impl Tally {
+    fn new() -> Self {
+        Self {
+            wins: 0,
+            losses: 0,
+            reversal_closes: 0,
+            net_r: 0.0,
+            account: START_ACCOUNT,
+        }
+    }
+
+    /// Book one taken trade's R multiple: add it to the net R and compound the
+    /// account by `1% × account × R` (the P&L of risking 1% of what's left).
+    /// Returns the dollar P&L of this trade so the per-fill line can show it.
+    fn book(&mut self, r: f64) -> f64 {
+        self.net_r += r;
+        let pnl = RISK_FRACTION * self.account * r;
+        self.account += pnl;
+        pnl
+    }
+
+    /// The trailing summary segment: net R and the compounded $100k-account P&L.
+    fn summary_line(&self) -> String {
+        let profit = self.account - START_ACCOUNT;
+        format!(
+            "  |  Net R: {:+.2}  |  $100k acct (1%/trade): ${:.0} ({:+.0})",
+            self.net_r, self.account, profit
+        )
+    }
+}
+
+/// The realized R multiple of a taken fill: signed reward over risk. `entry −
+/// stop_loss` is the risk (positive for a long, negative for a short), and
+/// `exit − entry` is the reward with the trade's own sign, so the quotient is
+/// `+1` on a clean TP and `−1` on a clean SL for *both* directions without a
+/// direction branch. Returns `0.0` when the stop sits at the entry (a
+/// degenerate/zero-risk bracket) so it can't divide by zero.
+fn realized_r(entry: f64, stop_loss: f64, exit: f64) -> f64 {
+    let risk = entry - stop_loss;
+    if risk.abs() < f64::EPSILON {
+        return 0.0;
+    }
+    (exit - entry) / risk
 }
 
 /// Render the `--verbose` bar-by-bar trace: every live bar on which the engine
@@ -442,16 +506,13 @@ fn render_trace(replay: &Replay) -> String {
     out
 }
 
-#[allow(clippy::too_many_arguments)]
 fn render_fire(
     plan: &TradePlan,
     fire: &Fire,
     simulate: bool,
     closes: &[CloseFire],
     blackout_windows: &[NoEntryWindow],
-    wins: &mut usize,
-    losses: &mut usize,
-    reversal_closes: &mut usize,
+    tally: &mut Tally,
 ) -> String {
     let intent = &fire.fired.intent;
     let candle = &fire.fired.candle;
@@ -513,9 +574,13 @@ fn render_fire(
     // This is the journaling line: what order went on at this bar. The widen is
     // applied so the printed SL matches the protected stop, not the un-widened
     // signed level (the 2026-07-01 follow-up).
+    // The protected stop (after the spread-floor widen) — needed below to score
+    // the fill's R multiple. `None` when the bracket can't resolve.
+    let mut protected_stop: Option<f64> = None;
     match Resolved::from_intent(intent, &shell, plan.pip_size) {
         Ok(mut resolved) => {
             apply_spread_floor_widen(&mut resolved, &fire.forward);
+            protected_stop = Some(resolved.stop_loss);
             line.push_str(&format!(
                 "    {}\n",
                 describe_order(&resolved, plan.pip_size)
@@ -594,7 +659,8 @@ fn render_fire(
                 "    fill: CLOSED ON REVERSAL — in @ {entry_price} → exit {exit_price} ({})\n",
                 bne(exit_at)
             ));
-            *reversal_closes += 1;
+            tally.reversal_closes += 1;
+            book_and_render_r(&mut line, tally, protected_stop, entry_price, exit_price);
         }
         ReplayOutcome::Sim(outcome) => {
             // A `NeverFilled` order isn't necessarily one that passively never
@@ -617,13 +683,49 @@ fn render_fire(
             };
             line.push_str(&format!("    {detail}\n"));
             match outcome {
-                SimOutcome::TookProfit { .. } => *wins += 1,
-                SimOutcome::StoppedOut { .. } => *losses += 1,
+                SimOutcome::TookProfit {
+                    entry_price,
+                    exit_price,
+                    ..
+                } => {
+                    tally.wins += 1;
+                    book_and_render_r(&mut line, tally, protected_stop, entry_price, exit_price);
+                }
+                SimOutcome::StoppedOut {
+                    entry_price,
+                    exit_price,
+                    ..
+                } => {
+                    tally.losses += 1;
+                    book_and_render_r(&mut line, tally, protected_stop, entry_price, exit_price);
+                }
                 _ => {}
             }
         }
     }
     line
+}
+
+/// Score a taken fill's R multiple against its protected stop, book it into the
+/// running tally (net R + compounding $100k account), and append the per-fill
+/// `R: …  ($100k acct: …)` line so each trade shows its own contribution.
+/// A `None` stop (bracket that never resolved) is a no-op — nothing to score.
+fn book_and_render_r(
+    line: &mut String,
+    tally: &mut Tally,
+    protected_stop: Option<f64>,
+    entry_price: f64,
+    exit_price: f64,
+) {
+    let Some(stop_loss) = protected_stop else {
+        return;
+    };
+    let r = realized_r(entry_price, stop_loss, exit_price);
+    let pnl = tally.book(r);
+    line.push_str(&format!(
+        "    R: {r:+.2}  |  $100k acct (1% risk): {:+.0} → ${:.0}\n",
+        pnl, tally.account
+    ));
 }
 
 /// Apply the worker's SL-vs-spread-floor *widen* to a resolved bracket so the
@@ -837,6 +939,86 @@ mod tests {
             recover_entry: None,
             breakeven: None,
         }
+    }
+
+    #[test]
+    fn realized_r_is_plus_one_on_a_clean_tp_both_directions() {
+        // Long: entry 1.10, SL 1.09 (risk 0.01), TP 1.11 → +1R.
+        assert!((realized_r(1.10, 1.09, 1.11) - 1.0).abs() < 1e-9);
+        // Short: entry 1.10, SL 1.11 (risk 0.01 the other way), TP 1.09 → +1R.
+        assert!((realized_r(1.10, 1.11, 1.09) - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn realized_r_is_minus_one_on_a_clean_sl_both_directions() {
+        // Long stopped at its SL, short stopped at its SL → −1R each.
+        assert!((realized_r(1.10, 1.09, 1.09) + 1.0).abs() < 1e-9);
+        assert!((realized_r(1.10, 1.11, 1.11) + 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn realized_r_scales_with_a_partial_move() {
+        // Long risk 0.01, exit +0.005 → +0.5R; break-even scratch → 0R.
+        assert!((realized_r(1.10, 1.09, 1.105) - 0.5).abs() < 1e-9);
+        assert!(realized_r(1.10, 1.09, 1.10).abs() < 1e-9);
+    }
+
+    #[test]
+    fn realized_r_zero_risk_bracket_is_zero_not_nan() {
+        // SL sitting at the entry is a degenerate/zero-risk bracket — 0R, no div0.
+        let r = realized_r(1.10, 1.10, 1.11);
+        assert_eq!(r, 0.0);
+    }
+
+    #[test]
+    fn tally_compounds_a_100k_account_at_one_percent_risk() {
+        let mut t = Tally::new();
+        assert_eq!(t.account, 100_000.0);
+        // A +1R win risks 1% of 100k → +$1,000, account 101,000.
+        let pnl = t.book(1.0);
+        assert!((pnl - 1_000.0).abs() < 1e-6);
+        assert!((t.account - 101_000.0).abs() < 1e-6);
+        // A −1R loss now risks 1% of 101k → −$1,010, account 99,990.
+        let pnl = t.book(-1.0);
+        assert!((pnl + 1_010.0).abs() < 1e-6);
+        assert!((t.account - 99_990.0).abs() < 1e-6);
+        // Net R is the plain sum of the two multiples.
+        assert!(t.net_r.abs() < 1e-9);
+    }
+
+    #[test]
+    fn tally_summary_line_shows_net_r_and_projected_profit() {
+        let mut t = Tally::new();
+        t.book(1.0); // +$1,000 → 101,000
+        t.book(1.0); // +1% of 101,000 = +$1,010 → 102,010
+        let s = t.summary_line();
+        assert!(s.contains("Net R: +2.00"), "got: {s}");
+        assert!(s.contains("$102010"), "got: {s}");
+        assert!(s.contains("+2010"), "got: {s}");
+    }
+
+    #[test]
+    fn book_and_render_r_is_a_noop_without_a_stop() {
+        // An unresolved bracket (no protected stop) can't be scored → tally
+        // untouched, no line appended.
+        let mut line = String::new();
+        let mut t = Tally::new();
+        book_and_render_r(&mut line, &mut t, None, 1.10, 1.11);
+        assert!(line.is_empty());
+        assert_eq!(t.net_r, 0.0);
+        assert_eq!(t.account, 100_000.0);
+    }
+
+    #[test]
+    fn book_and_render_r_scores_and_prints_a_win() {
+        let mut line = String::new();
+        let mut t = Tally::new();
+        // Long: entry 1.10, SL 1.09, TP 1.11 → +1R, +$1,000.
+        book_and_render_r(&mut line, &mut t, Some(1.09), 1.10, 1.11);
+        assert!((t.net_r - 1.0).abs() < 1e-9);
+        assert!((t.account - 101_000.0).abs() < 1e-6);
+        assert!(line.contains("R: +1.00"), "got: {line}");
+        assert!(line.contains("$101000"), "got: {line}");
     }
 
     #[test]

@@ -1381,6 +1381,19 @@ under `REV:` (distinct from `TP:` / `SL:`). This matches the live worker, whose
 `run_close` flattens the broker position on the same fire; before the fix the
 close was inert and the position over-held to SL/TP/window-end.
 
+**Net R and a $100k-account P&L projection (`--simulate`).** Beyond the raw
+`TP:`/`SL:` counts, the report scores each *taken* fill's realized R multiple
+(`(exit − entry) / (entry − SL)`, signed off the protected stop, so `+1` on a
+clean TP and `−1` on a clean SL for both directions) and compounds it into a
+simulated **$100k account risking 1% of the remaining balance per trade**. Each
+fill gets a `R: +N.NN  |  $100k acct (1% risk): +PNL → $BALANCE` line beneath it,
+and the summary footer appends `… | Net R: +N.NN | $100k acct (1%/trade):
+$BALANCE (+PROFIT)`. Not-taken outcomes (never-filled, declined, gate-blocked,
+superseded) contribute 0R. `Net R` is the plain sum of R multiples (account-size
+independent); the dollar figure shows what the sequence would have made
+compounding — a losing streak shrinks the per-trade stake, a winning one grows
+it.
+
 **Seeing the engine's silent state changes (`--verbose` / `--all-events`).**
 The normal report lists only *fires* — intents the engine emits. But the engine
 also advances state per bar that fires nothing: the spine phase

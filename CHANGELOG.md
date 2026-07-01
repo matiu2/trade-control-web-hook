@@ -1,5 +1,40 @@
 # Changelog
 
+## Unreleased — 2026-07-02 — replay report: Net R + $100k-account P&L projection
+
+**Why.** The `replay-candles --simulate` report tallied only raw TP/SL counts.
+Reading a window's actual profitability meant summing R multiples by hand and
+guessing what the sequence would have made on a real account. The operator wants
+the bottom line — net R and a dollar figure — right in the report, and each fill
+to show its own contribution.
+
+**What changed.** `cli/src/bin/replay_candles/report.rs` now scores every *taken*
+fill's realized R multiple (`realized_r` = `(exit − entry) / (entry − SL)`,
+correctly signed for both directions off the protected stop after the
+spread-floor widen) and compounds it into a simulated **$100k account at 1% risk
+per trade** (`Tally`). Two new outputs:
+
+- **Per fill:** a `R: +N.NN  |  $100k acct (1% risk): +PNL → $BALANCE` line under
+  each TP / SL / reversal-close fill, showing that trade's R and the account after
+  it. Not-taken kinds (never-filled, declined, gate-blocked, superseded)
+  contribute 0R and print nothing.
+- **Summary footer:** `… | Net R: +N.NN | $100k acct (1%/trade): $BALANCE (+PROFIT)`
+  appended to the existing `TP:/SL:` line.
+
+The account compounds — each trade risks 1% of what's *left*, so a losing streak
+shrinks the per-trade stake and a winning one grows it. `Net R` is the plain sum
+of per-trade R multiples (account-independent). A zero-risk bracket (SL at entry)
+scores 0R rather than dividing by zero.
+
+**Breaking.** `render_fire`'s three `&mut usize` counters collapse into one
+`&mut Tally` (private fn — no external callers).
+
+**Config.** None. `--simulate`-only output; the $100k / 1% constants are fixed.
+
+**Tests.** 8 new in `report.rs`: `realized_r` sign/scale/zero-risk across both
+directions; `Tally` compounding + summary line; `book_and_render_r` no-op without
+a stop and its win-scoring path. cli 22 report-tests green.
+
 ## Unreleased — 2026-07-02 — --start: invalidation picks the line on the correct side of the neckline
 
 **Why.** A chart can carry two same-labelled invalidation lines — the real one
