@@ -2633,8 +2633,8 @@ trade-control-dev plan list --yaml         # raw worker YAML (one entry per plan
 trade-control-dev plan show eurusd-hs-7    # full dump of one plan + its state
 trade-control-dev plan show eurusd-hs-7 --yaml
 trade-control-dev plan show eurusd-hs-7 --json   # same data as --yaml, JSON-encoded (pipe to jq)
-trade-control-dev plan timeline eurusd-hs-7          # reconstruct the event trail (alerts + engine ticks, interleaved)
-trade-control-dev plan timeline eurusd-hs-7 --verbose  # include every recorded log line + no-fire ticks
+trade-control-dev plan timeline eurusd-hs-7          # replay-style trail: per-fire blocks + recorded dispatch outcomes
+trade-control-dev plan timeline eurusd-hs-7 --verbose  # + bar-by-bar engine trace and every alert log line
 trade-control-dev plan timeline eurusd-hs-7 --json     # raw {records, ticks} envelope (pipe to jq)
 trade-control-dev plan export eurusd-hs-7  # bare TradePlan, exactly as imported (re-registerable)
 trade-control-dev plan delete eurusd-hs-7  # drop a plan (live and/or archived)
@@ -2656,31 +2656,36 @@ JSON (each match's full `PlanDetail`) — handy for piping into `jq`. A `plan sh
 for an unknown id exits non-zero with `no registered plan with trade_id …`.
 
 `plan timeline <trade_id>` reconstructs the **event trail** for one trade from
-the worker's durable recordings across **both** event sources, interleaved by
-timestamp:
+the worker's durable recordings, and renders it in the **same style as the
+`replay-candles` report** — but from **recorded facts only**, never a
+re-simulation. The header, the `--verbose` bar-by-bar engine trace, and the
+per-fire `• <rule> <Action> @ <bar>  close=…` blocks all read identically to a
+replay; the crucial difference is *where the numbers come from*:
 
-- the inbound signed-alert `request_records` — every POST it recorded for that
-  trade, with each request's outcome and log lines (rendered with a `•` prefix);
-- the cron-engine `tick_bundles` — every tick that evaluated the plan
-  (`correlation_id == trade_id`), with the rules it fired and their dispatch
-  outcomes (rendered with a `⚙` prefix, and a `[done]` marker when the tick
-  finished the plan).
+- `replay-candles` **computes** the order bracket, the fill, break-even and
+  SL-widen by walking the price path forward — so it can show `order: LONG stop
+  @ … SL … TP …`, `fill: TOOK PROFIT …`, `be:`/`exit:` lines.
+- `plan timeline` shows only what the worker **recorded**: which rule fired on
+  which bar (from the cron-engine `tick_bundles`), the engine's phase transition
+  (from each bundle's `prior_state → new_state`), and the **real dispatch
+  outcome** (`dispatch: Ok(entered)   [recorded]` / `rejected:
+  trade-already-open` / …). There is deliberately **no** `order:`/`fill:`/`be:`/
+  `exit:` line — those weren't recorded, so inventing them would be fiction.
 
-The engine leg is the load-bearing addition: since the move to the cron engine,
-a veto or enter usually fires on a `*/15` tick, **not** an inbound POST — so a
-records-only timeline would show the alerts that armed a plan but not the tick
-that actually pulled the trigger. Where `plan show` answers *"what state did the
-plan end in?"*, `plan timeline` answers *"what fired, in what order, and why?"* —
-the local-Postgres successor to the old `trading-tax-tracker timeline --merged`
+The engine leg is load-bearing: since the move to the cron engine a veto or
+enter usually fires on a `*/15` tick, **not** an inbound POST — so the fire
+blocks are driven by `tick_bundles`. Inbound signed alerts (`request_records` —
+the POSTs that armed or controlled the plan) are folded in under an *Inbound
+alerts (HTTP)* section as `⊙` lines, Brisbane-stamped like the rest. Where `plan
+show` answers *"what state did the plan end in?"*, `plan timeline` answers *"what
+fired, in what order, and how did the worker actually respond?"* — the
+local-Postgres successor to the old `trading-tax-tracker timeline --merged`
 reconstruction, which stitched the same picture from Cloudflare R2 + worker logs
-before the move off Cloudflare. The compact view prints one block per event
-(alert: `ts · outcome (status) · request_id`; tick: `tick_ts · tick: <fired
-rules>`) and, by default, only `error`-level alert log lines plus fired ticks
-(no-fire ticks are suppressed); `--verbose` shows every recorded log line and
-every tick (including no-fire ones), `--json` dumps the raw `{records, ticks}`
-envelope. Unlike `plan show`, it reads recordings (not `StateStore` KV), so it's
-dispatched as a worker-local arm; an unknown/unrecorded id exits non-zero with
-`no recorded events for trade_id …`. P&L / fees / slippage accounting is
+before the move off Cloudflare. `--verbose` adds the bar-by-bar engine trace and
+every alert log line (not just `error`); `--json` dumps the raw `{records,
+ticks}` envelope. Unlike `plan show`, it reads recordings (not `StateStore` KV),
+so it's dispatched as a worker-local arm; an unknown/unrecorded id exits non-zero
+with `no recorded events for trade_id …`. P&L / fees / slippage accounting is
 deliberately *not* here; that stays broker-sourced in a separate tool.
 
 `plan export <trade_id>` is the re-registerable cousin of `show`: it strips the
