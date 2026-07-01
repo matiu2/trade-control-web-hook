@@ -88,15 +88,24 @@ Trading:
   `plan list --include-all` is still inspectable (an archived match carries an
   `archived_at` field). Drives `trade-control plan show <trade_id>`. KV-only.
 - `plan-timeline` — read-only: reconstruct the **event timeline** for one trade
-  from the worker's durable per-request recordings (`request_records`). Target
-  named by the intent's `trade_id`; returns every recorded `RequestRecord` for
-  that trade in `ts` order (enters, vetoes, preps and their dispatch outcomes),
-  so you can see what fired and when. This is the local-Postgres successor to
-  the retired R2/Cloudflare-log reconstruction — `plan show` gives the final
-  engine *state*, `plan timeline` gives the ordered event trail behind it.
-  Drives `trade-control plan timeline <trade_id>`. Recording-backed, so it's a
+  from the worker's durable recordings. Target named by the intent's `trade_id`;
+  returns a `PlanTimeline` envelope with **both** event streams for that trade,
+  each in timestamp order:
+  - `records` — the inbound signed-alert `RequestRecord`s (`request_records`
+    table): enters, vetoes, preps and their dispatch outcomes.
+  - `ticks` — the cron-engine `TickBundle`s (`tick_bundles` table, keyed on
+    `correlation_id == trade_id`): every tick that evaluated the plan, with the
+    rules it fired and their dispatch outcomes. A veto or enter that fired on a
+    cron tick — the common case now — lives only here, so a records-only
+    timeline would miss it.
+
+  The CLI interleaves the two by timestamp, so you see what fired and when
+  across both sources. This is the local-Postgres successor to the retired
+  R2/Cloudflare-log reconstruction — `plan show` gives the final engine *state*,
+  `plan timeline` gives the ordered event trail behind it. Drives
+  `trade-control plan timeline <trade_id>`. Recording-backed, so it's a
   worker-local dispatch arm (not a generic `core` handler). 404 when the trade
-  has no recordings.
+  has neither stream.
 - `plan-delete` — drop a registered plan and its `PlanState` — the inverse of
   `register`. Target named by the intent's `trade_id`; the worker scans all
   account scopes and deletes the matching `plan:` + `plan-state:` rows **and**
@@ -2624,9 +2633,9 @@ trade-control-dev plan list --yaml         # raw worker YAML (one entry per plan
 trade-control-dev plan show eurusd-hs-7    # full dump of one plan + its state
 trade-control-dev plan show eurusd-hs-7 --yaml
 trade-control-dev plan show eurusd-hs-7 --json   # same data as --yaml, JSON-encoded (pipe to jq)
-trade-control-dev plan timeline eurusd-hs-7          # reconstruct the event trail (what fired, when)
-trade-control-dev plan timeline eurusd-hs-7 --verbose  # include every recorded log line, not just errors
-trade-control-dev plan timeline eurusd-hs-7 --json     # raw RequestRecord list (pipe to jq)
+trade-control-dev plan timeline eurusd-hs-7          # reconstruct the event trail (alerts + engine ticks, interleaved)
+trade-control-dev plan timeline eurusd-hs-7 --verbose  # include every recorded log line + no-fire ticks
+trade-control-dev plan timeline eurusd-hs-7 --json     # raw {records, ticks} envelope (pipe to jq)
 trade-control-dev plan export eurusd-hs-7  # bare TradePlan, exactly as imported (re-registerable)
 trade-control-dev plan delete eurusd-hs-7  # drop a plan (live and/or archived)
 trade-control-dev plan purge eurusd-hs-7   # wipe ALL KV + R2 traces of one trade
@@ -2647,21 +2656,32 @@ JSON (each match's full `PlanDetail`) — handy for piping into `jq`. A `plan sh
 for an unknown id exits non-zero with `no registered plan with trade_id …`.
 
 `plan timeline <trade_id>` reconstructs the **event trail** for one trade from
-the worker's durable `request_records` — every inbound POST it recorded for that
-trade, oldest first, with each request's outcome and log lines. Where `plan show`
-answers *"what state did the plan end in?"*, `plan timeline` answers *"what fired,
-in what order, and why?"* — the local-Postgres successor to the old
-`trading-tax-tracker timeline --merged` reconstruction, which stitched the same
-picture from Cloudflare R2 + worker logs before the move off Cloudflare. The
-compact view prints one block per event (`ts · outcome (status) · request_id`)
-and, by default, only the `error`-level log lines (the outcome carries the
-headline); `--verbose` shows every recorded line, `--json` dumps the raw
-`RequestRecord` list. Unlike `plan show`, it reads recordings (not `StateStore`
-KV), so it's dispatched as a worker-local arm; an unknown/unrecorded id exits
-non-zero with `no recorded events for trade_id …`. It covers `request_records`
-(inbound POSTs) only for now — the cron-engine `tick_bundles` (engine-side
-fires) are a planned follow-up. P&L / fees / slippage accounting is deliberately
-*not* here; that stays broker-sourced in a separate tool.
+the worker's durable recordings across **both** event sources, interleaved by
+timestamp:
+
+- the inbound signed-alert `request_records` — every POST it recorded for that
+  trade, with each request's outcome and log lines (rendered with a `•` prefix);
+- the cron-engine `tick_bundles` — every tick that evaluated the plan
+  (`correlation_id == trade_id`), with the rules it fired and their dispatch
+  outcomes (rendered with a `⚙` prefix, and a `[done]` marker when the tick
+  finished the plan).
+
+The engine leg is the load-bearing addition: since the move to the cron engine,
+a veto or enter usually fires on a `*/15` tick, **not** an inbound POST — so a
+records-only timeline would show the alerts that armed a plan but not the tick
+that actually pulled the trigger. Where `plan show` answers *"what state did the
+plan end in?"*, `plan timeline` answers *"what fired, in what order, and why?"* —
+the local-Postgres successor to the old `trading-tax-tracker timeline --merged`
+reconstruction, which stitched the same picture from Cloudflare R2 + worker logs
+before the move off Cloudflare. The compact view prints one block per event
+(alert: `ts · outcome (status) · request_id`; tick: `tick_ts · tick: <fired
+rules>`) and, by default, only `error`-level alert log lines plus fired ticks
+(no-fire ticks are suppressed); `--verbose` shows every recorded log line and
+every tick (including no-fire ones), `--json` dumps the raw `{records, ticks}`
+envelope. Unlike `plan show`, it reads recordings (not `StateStore` KV), so it's
+dispatched as a worker-local arm; an unknown/unrecorded id exits non-zero with
+`no recorded events for trade_id …`. P&L / fees / slippage accounting is
+deliberately *not* here; that stays broker-sourced in a separate tool.
 
 `plan export <trade_id>` is the re-registerable cousin of `show`: it strips the
 `PlanDetail` wrapper (account / state / archived_at) down to the bare

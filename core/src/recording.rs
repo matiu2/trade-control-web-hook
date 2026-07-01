@@ -19,6 +19,38 @@ use std::borrow::Cow;
 
 use serde::{Deserialize, Serialize};
 
+use crate::tick_bundle::TickBundle;
+
+/// The whole event history for one trade, as the worker returns it to
+/// `plan timeline`: the inbound-HTTP [`RequestRecord`]s **and** the cron-engine
+/// [`TickBundle`]s, each already filtered to the one `trade_id` and sorted
+/// oldest-first.
+///
+/// Two record streams because a trade's life spans two event sources: an
+/// inbound signed alert becomes a `RequestRecord`; a cron-engine tick that
+/// evaluated the plan becomes a `TickBundle`. A veto or enter that fired on a
+/// cron tick (the common case now) shows up only in `ticks`, so a timeline that
+/// read `records` alone would miss it. The CLI renderer interleaves the two by
+/// timestamp.
+///
+/// Lives in `core` so the worker (write side) and the CLI (render side) share
+/// one shape and can't drift.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct PlanTimeline {
+    /// Inbound signed-alert records for this trade, oldest first.
+    pub records: Vec<RequestRecord>,
+    /// Cron-engine tick bundles that evaluated this trade's plan, oldest first.
+    pub ticks: Vec<TickBundle>,
+}
+
+impl PlanTimeline {
+    /// True when neither event stream has anything — the worker maps this to a
+    /// 404 (no recorded events for the trade).
+    pub fn is_empty(&self) -> bool {
+        self.records.is_empty() && self.ticks.is_empty()
+    }
+}
+
 /// One captured log line.
 ///
 /// `level` is a `Cow<'static, str>` so the write path can keep using the cheap

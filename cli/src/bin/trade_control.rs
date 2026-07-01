@@ -41,7 +41,7 @@ use trade_control_core::account::{
 use trade_control_core::incoming::signed_pairs_from_text;
 use trade_control_core::intent::Intent;
 use trade_control_core::intent::{BrokerKind, Direction, VetoLevel};
-use trade_control_core::recording::RequestRecord;
+use trade_control_core::recording::PlanTimeline;
 use trade_control_core::sig::{self, SIG_FIELD};
 
 #[derive(Parser)]
@@ -1331,11 +1331,11 @@ fn run_plan_timeline(args: PlanTimelineArgs) -> Result<()> {
         return Ok(());
     }
     if args.json {
-        // Round-trip YAML → records → pretty JSON so `--json` matches `plan
-        // show --json`'s jq-friendly shape.
-        let records: Vec<RequestRecord> = serde_yaml::from_str(&response)
+        // Round-trip YAML → PlanTimeline → pretty JSON so `--json` matches `plan
+        // show --json`'s jq-friendly shape (a `{records, ticks}` object).
+        let timeline: PlanTimeline = serde_yaml::from_str(&response)
             .map_err(|e| eyre!("plan-timeline: parse worker YAML: {e}"))?;
-        let json = serde_json::to_string_pretty(&records)
+        let json = serde_json::to_string_pretty(&timeline)
             .map_err(|e| eyre!("plan-timeline: serialise JSON: {e}"))?;
         println!("{json}");
         return Ok(());
@@ -1347,25 +1347,37 @@ fn run_plan_timeline(args: PlanTimelineArgs) -> Result<()> {
     Ok(())
 }
 
-/// Render the worker's `request_records` YAML as a compact per-event timeline:
-/// one block per recorded request in `ts` order — a header
-/// (`ts · outcome (status) · request_id`) then its log lines. Without
-/// `verbose`, only `error`-level lines are shown (the outcome already carries
-/// the headline); with it, every `logs[]` line.
+/// Render the worker's [`PlanTimeline`] YAML as a compact per-event timeline,
+/// interleaving the two event streams by timestamp:
+///
+/// * an inbound signed alert (`•` prefix) — a header
+///   (`ts · outcome (status) · request_id`) then its log lines. Without
+///   `verbose`, only `error`-level lines are shown; with it, every `logs[]`
+///   line.
+/// * a cron-engine tick (`⚙` prefix) — a header
+///   (`tick_ts · tick: <fired rules> · [done]`) then, for each fired rule, its
+///   dispatch outcome. A tick that fired nothing is noise, so it's shown only
+///   in `verbose` mode.
+///
+/// Sorting is by RFC3339 timestamp — lexicographic order matches chronological
+/// order for the fixed-offset `Z`/`+00:00` stamps the worker writes, so no
+/// datetime parse is needed just to order the rows.
 fn format_plan_timeline(trade_id: &str, response: &str, verbose: bool) -> Result<String> {
     use std::fmt::Write as _;
 
-    let records: Vec<RequestRecord> = serde_yaml::from_str(response)
+    let timeline: PlanTimeline = serde_yaml::from_str(response)
         .map_err(|e| eyre!("plan-timeline: parse worker YAML: {e}"))?;
 
-    let mut out = String::new();
-    let n = records.len();
-    let plural = if n == 1 { "event" } else { "events" };
-    let _ = writeln!(out, "timeline {trade_id} — {n} {plural}\n");
+    // Merge both streams into one (ts, rendered-block) list, then sort by ts so
+    // an engine tick and an inbound alert appear in the order they happened. A
+    // record's ts is already an RFC3339 string; a tick's is a DateTime we format
+    // back to RFC3339 for the same lexicographic ordering.
+    let mut rows: Vec<(String, String)> = Vec::new();
 
-    for rec in &records {
+    for rec in &timeline.records {
+        let mut block = String::new();
         let _ = writeln!(
-            out,
+            block,
             "• {ts}  {outcome} ({status})  [{rid}]",
             ts = rec.ts,
             outcome = rec.outcome,
@@ -1374,9 +1386,62 @@ fn format_plan_timeline(trade_id: &str, response: &str, verbose: bool) -> Result
         );
         for line in &rec.logs {
             if verbose || line.level == "error" {
-                let _ = writeln!(out, "    {lvl:>5}  {msg}", lvl = line.level, msg = line.msg);
+                let _ = writeln!(
+                    block,
+                    "    {lvl:>5}  {msg}",
+                    lvl = line.level,
+                    msg = line.msg
+                );
             }
         }
+        rows.push((rec.ts.clone(), block));
+    }
+
+    for bundle in &timeline.ticks {
+        // A tick that fired nothing carries no timeline signal — skip it unless
+        // the operator asked for the full trace.
+        if bundle.eval.fired.is_empty() && !verbose {
+            continue;
+        }
+        let ts = bundle.tick_ts.to_rfc3339();
+        let fired: Vec<&str> = bundle
+            .eval
+            .fired
+            .iter()
+            .map(|f| f.rule_id.as_str())
+            .collect();
+        let summary = if fired.is_empty() {
+            "no fire".to_string()
+        } else {
+            fired.join(", ")
+        };
+        let shadow = if bundle.shadow { " [shadow]" } else { "" };
+        let done = if bundle.eval.done { " [done]" } else { "" };
+
+        let mut block = String::new();
+        let _ = writeln!(block, "⚙ {ts}  tick: {summary}{shadow}{done}");
+        // The dispatch outcome for each fired rule — the "what actually
+        // happened" line (entered / rejected: veto-active / …). Empty for a
+        // shadow tick (dispatches nothing).
+        for d in &bundle.dispatch_outcomes {
+            let _ = writeln!(
+                block,
+                "    {rule}  {outcome}",
+                rule = d.rule_id,
+                outcome = d.outcome
+            );
+        }
+        rows.push((ts, block));
+    }
+
+    rows.sort_by(|a, b| a.0.cmp(&b.0));
+
+    let mut out = String::new();
+    let n = rows.len();
+    let plural = if n == 1 { "event" } else { "events" };
+    let _ = writeln!(out, "timeline {trade_id} — {n} {plural}\n");
+    for (_, block) in &rows {
+        out.push_str(block);
     }
     Ok(out)
 }
@@ -2499,9 +2564,11 @@ reset_time: 10:00 PM
     }
 
     /// Two recorded requests for one trade: a veto fire (with a plain log line)
-    /// and an enter that errored. Mirrors the worker's `Vec<RequestRecord>` YAML.
+    /// and an enter that errored, plus an empty `ticks` stream. Mirrors the
+    /// worker's `PlanTimeline` envelope YAML.
     fn timeline_fixture() -> &'static str {
         "\
+records:
 - ts: '2026-06-18T19:15:00Z'
   request_id: aaa111
   method: POST
@@ -2530,6 +2597,101 @@ reset_time: 10:00 PM
     msg: 'entry id=hs-nzd-chf-d12eb831-enter'
   - level: error
     msg: 'blocked by veto too-high'
+ticks: []
+"
+    }
+
+    /// A `PlanTimeline` with one inbound record and one cron-engine tick that
+    /// fired the enter (and finished the plan). The tick's `tick_ts` falls
+    /// *between* the record's ts and a later ts, so it exercises the interleave
+    /// sort. Built with the minimum bundle fields the renderer reads
+    /// (`tick_ts`, `eval.fired[].rule_id`, `eval.done`, `shadow`,
+    /// `dispatch_outcomes`).
+    fn timeline_with_tick_fixture() -> &'static str {
+        "\
+records:
+- ts: '2026-06-18T19:15:00Z'
+  request_id: aaa111
+  method: POST
+  path: /
+  headers: []
+  body: 'action: prep'
+  intent_id: hs-nzd-chf-d12eb831-prep
+  trade_id: hs-nzd-chf-d12eb831
+  status: 200
+  outcome: prep-set
+  logs: []
+ticks:
+- schema_version: 1
+  tick_ts: '2026-06-18T20:00:00Z'
+  correlation_id: hs-nzd-chf-d12eb831
+  account: experimental
+  request_id: hs-nzd-chf-d12eb831@2026-06-18T20:00:00Z
+  plan:
+    trade_id: hs-nzd-chf-d12eb831
+    instrument: NZD/CHF
+    direction: short
+    granularity: h1
+    pip_size: 0.0001
+    rules: []
+    shadow: false
+  prior_state:
+    watermark: '2026-06-18T19:00:00Z'
+    phase: await_entry
+    fired: []
+    last_close: {}
+    break_close_at: null
+    retest_seen_at: null
+    mw: null
+    expires_at: '2026-06-19T20:00:00Z'
+  new_candles: []
+  detector_window: []
+  now: '2026-06-18T20:00:00Z'
+  expires_at: '2026-06-19T20:00:00Z'
+  eval:
+    fired:
+    - rule_id: 05-enter
+      intent:
+        v: 1
+        id: hs-nzd-chf-d12eb831-enter
+        not_after: '2026-06-21T21:16:50Z'
+        action: enter
+        instrument: NZD/CHF
+        direction: short
+        broker: tradenation
+        account: experimental
+        trade_id: hs-nzd-chf-d12eb831
+      candle:
+        time: '2026-06-18T19:00:00Z'
+        o: 0.5
+        h: 0.51
+        l: 0.49
+        c: 0.5
+      signal: null
+    new_state:
+      watermark: '2026-06-18T19:00:00Z'
+      phase: done
+      fired:
+      - 05-enter
+      last_close: {}
+      break_close_at: null
+      retest_seen_at: null
+      mw: null
+      expires_at: '2026-06-19T20:00:00Z'
+    done: true
+  shadow: false
+  dispatch_outcomes:
+  - rule_id: 05-enter
+    intent_id: hs-nzd-chf-d12eb831-enter
+    outcome: Ok(entered)
+    seq: 0
+  kv:
+    key: 'plan-state:experimental:hs-nzd-chf-d12eb831'
+    before: null
+    after: null
+    cleared_plan: true
+    success: true
+    error: null
 "
     }
 
@@ -2564,6 +2726,7 @@ reset_time: 10:00 PM
     #[test]
     fn plan_timeline_singular_event_word() {
         let one = "\
+records:
 - ts: '2026-06-18T19:15:00Z'
   request_id: aaa111
   method: POST
@@ -2575,9 +2738,102 @@ reset_time: 10:00 PM
   status: 200
   outcome: ok
   logs: []
+ticks: []
 ";
         let out = format_plan_timeline("t", one, false).unwrap();
         assert!(out.starts_with("timeline t — 1 event\n"), "got: {out}");
+    }
+
+    #[test]
+    fn plan_timeline_interleaves_tick_between_records_by_timestamp() {
+        // record @19:15, tick @20:00 — the tick must render as its own `⚙` row
+        // in ts order (between the record and any later event), with its fired
+        // rule and dispatch outcome.
+        let out = format_plan_timeline("hs-nzd-chf-d12eb831", timeline_with_tick_fixture(), false)
+            .unwrap();
+        assert!(
+            out.starts_with("timeline hs-nzd-chf-d12eb831 — 2 events\n"),
+            "got: {out}"
+        );
+        // The engine-tick row is present and marks the plan done.
+        assert!(
+            out.contains("⚙ 2026-06-18T20:00:00+00:00  tick: 05-enter [done]"),
+            "got: {out}"
+        );
+        // The dispatch outcome is rendered under the tick.
+        assert!(out.contains("05-enter  Ok(entered)"), "got: {out}");
+        // Ordering: the 19:15 record comes before the 20:00 tick.
+        let rec_pos = out.find("• 2026-06-18T19:15:00Z").unwrap();
+        let tick_pos = out.find("⚙ 2026-06-18T20:00:00").unwrap();
+        assert!(rec_pos < tick_pos, "record must precede tick\n{out}");
+    }
+
+    #[test]
+    fn plan_timeline_hides_no_fire_ticks_unless_verbose() {
+        // A tick that fired nothing is noise: absent in compact, present (as
+        // `no fire`) in verbose. Small inline bundle with empty `fired` +
+        // empty `dispatch_outcomes` so the tick is a pure no-op.
+        let inline = "\
+records: []
+ticks:
+- schema_version: 1
+  tick_ts: '2026-06-18T20:00:00Z'
+  correlation_id: t
+  account: null
+  request_id: t@2026-06-18T20:00:00Z
+  plan:
+    trade_id: t
+    instrument: NZD/CHF
+    direction: short
+    granularity: h1
+    pip_size: 0.0001
+    rules: []
+    shadow: false
+  prior_state:
+    watermark: '2026-06-18T19:00:00Z'
+    phase: await_entry
+    fired: []
+    last_close: {}
+    break_close_at: null
+    retest_seen_at: null
+    mw: null
+    expires_at: '2026-06-19T20:00:00Z'
+  new_candles: []
+  detector_window: []
+  now: '2026-06-18T20:00:00Z'
+  expires_at: '2026-06-19T20:00:00Z'
+  eval:
+    fired: []
+    new_state:
+      watermark: '2026-06-18T19:00:00Z'
+      phase: await_entry
+      fired: []
+      last_close: {}
+      break_close_at: null
+      retest_seen_at: null
+      mw: null
+      expires_at: '2026-06-19T20:00:00Z'
+    done: false
+  shadow: false
+  dispatch_outcomes: []
+  kv:
+    key: 'plan-state::t'
+    before: null
+    after: null
+    cleared_plan: false
+    success: true
+    error: null
+";
+        let compact = format_plan_timeline("t", inline, false).unwrap();
+        assert!(
+            compact.starts_with("timeline t — 0 events\n"),
+            "no-fire tick must be hidden in compact\n{compact}"
+        );
+        let verbose = format_plan_timeline("t", inline, true).unwrap();
+        assert!(
+            verbose.contains("⚙ 2026-06-18T20:00:00+00:00  tick: no fire"),
+            "no-fire tick must show in verbose\n{verbose}"
+        );
     }
 
     #[test]

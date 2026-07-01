@@ -325,14 +325,20 @@ async fn dispatch_control(
 }
 
 /// `plan timeline <trade_id>` — reconstruct the event timeline for one trade
-/// from the durable `request_records` recordings. The worker-local counterpart
-/// of the generic `handle_plan_show`: because the read hits the concrete
-/// Postgres pool (recordings are not part of the `StateStore` trait), it lives
-/// here rather than in `core`.
+/// from the durable recordings. The worker-local counterpart of the generic
+/// `handle_plan_show`: because the read hits the concrete Postgres pool
+/// (recordings are not part of the `StateStore` trait), it lives here rather
+/// than in `core`.
 ///
-/// Returns the matching [`RequestRecord`]s as YAML (oldest first) on `Ok`, a
-/// 404 when the trade has no recordings, or a 400 when `trade_id` is missing.
-/// Recorded as seen on completion (idempotent read, like `plan-show`).
+/// A trade's life spans two event streams, so we read **both**: the inbound
+/// signed-alert [`RequestRecord`]s (`request_records`) and the cron-engine
+/// [`TickBundle`]s (`tick_bundles`, keyed on `correlation_id == trade_id`). A
+/// veto or enter that fired on a cron tick — the common case now — shows up
+/// only in the tick stream, so a records-only timeline would miss it.
+///
+/// Returns a [`PlanTimeline`] envelope as YAML on `Ok`, a 404 when the trade
+/// has neither stream, or a 400 when `trade_id` is missing. Recorded as seen on
+/// completion (idempotent read, like `plan-show`).
 async fn handle_plan_timeline(
     store: &PgStateStore,
     verified: &Verified,
@@ -349,8 +355,17 @@ async fn handle_plan_timeline(
             return ControlResult::error("state error", 500);
         }
     };
+    let ticks = match crate::recording_pg::tick_bundles_for_trade(store.pool(), target).await {
+        Ok(v) => v,
+        Err(err) => {
+            tracing::error!("plan-timeline: tick_bundles_for_trade: {err}");
+            return ControlResult::error("state error", 500);
+        }
+    };
 
-    if records.is_empty() {
+    let timeline = trade_control_core::recording::PlanTimeline { records, ticks };
+
+    if timeline.is_empty() {
         record_seen(
             store,
             verified,
@@ -361,7 +376,7 @@ async fn handle_plan_timeline(
         return ControlResult::error(format!("no recorded events for trade_id {target}"), 404);
     }
 
-    let body = match serde_yaml::to_string(&records) {
+    let body = match serde_yaml::to_string(&timeline) {
         Ok(s) => s,
         Err(err) => {
             tracing::error!("plan-timeline serialise: {err}");

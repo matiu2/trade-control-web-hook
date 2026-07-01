@@ -96,6 +96,41 @@ pub async fn request_records_for_trade(
     Ok(records)
 }
 
+/// Read every [`TickBundle`] for one trade, oldest first — the read side of
+/// [`record_tick`], used by the `plan timeline` reconstruction.
+///
+/// A trade is one `correlation_id` (== the plan's `trade_id`), so this is the
+/// engine-side analogue of [`request_records_for_trade`]: every cron tick that
+/// evaluated this trade's plan, in `tick_ts` order. Together the two streams
+/// cover a trade's whole life — inbound alerts and engine ticks. Bundle bodies
+/// round-trip through the same `core` [`TickBundle`], so no shape drift.
+///
+/// A row whose `body` fails to deserialize is skipped with a `warn!` rather
+/// than failing the whole timeline, matching [`request_records_for_trade`].
+pub async fn tick_bundles_for_trade(
+    pool: &sqlx::PgPool,
+    trade_id: &str,
+) -> Result<Vec<TickBundle>, sqlx::Error> {
+    let rows: Vec<(serde_json::Value,)> = sqlx::query_as(
+        "SELECT body FROM tick_bundles WHERE correlation_id = $1 ORDER BY tick_ts, id",
+    )
+    .bind(trade_id)
+    .fetch_all(pool)
+    .await?;
+
+    let bundles = rows
+        .into_iter()
+        .filter_map(|(body,)| match serde_json::from_value::<TickBundle>(body) {
+            Ok(bundle) => Some(bundle),
+            Err(err) => {
+                tracing::warn!("timeline: skipping tick_bundles row for {trade_id}: {err}");
+                None
+            }
+        })
+        .collect();
+    Ok(bundles)
+}
+
 /// Insert one cron-engine [`TickBundle`] into `tick_bundles`. `tick_ts` is
 /// already a `DateTime<Utc>`; `body` is the whole bundle as `jsonb`.
 pub async fn record_tick(pool: &sqlx::PgPool, bundle: &TickBundle) -> Result<(), sqlx::Error> {
