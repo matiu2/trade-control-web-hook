@@ -1612,8 +1612,10 @@ pair per event, then drops any pair whose window has already elapsed. The
   chart* and picks each role by its nearest-to-`--start` drawing, walking in the
   role's natural direction — neckline/retest = nearest *before* start,
   invalidation = nearest *either side*, trade-expiry = nearest *after*, M/W path
-  = the one whose shoulders bracket start, calendar bars auto-drawn over
-  `[start, expiry]`. The prune as-of becomes `--start` (`source=start-flag`).
+  = the one whose shoulders bracket start. The news/blackout vertical pairs
+  (and the auto-drawn calendar bars) are scoped to `[start, trade-expiry]` — a
+  pair outside the trade's own lifetime is dropped. The prune as-of becomes
+  `--start` (`source=start-flag`).
   This is the journaling workflow: put TradingView in replay mode with the last
   visible candle mid-right-shoulder, but **leave the future candles on screen** —
   `--start <shoulder-time>` anchors the arm to that moment regardless of what's

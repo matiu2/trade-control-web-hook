@@ -305,15 +305,32 @@ pub fn classify<F: DrawingFetcher>(
     roles.trade_expiry = pick_trade_expiry(trade_expiries, visible_range, slot_pref);
 
     // Pause/resume and news-start/news-end lines that sit outside the
-    // visible window are stale leftovers from a prior setup — a window
+    // scope window are stale leftovers from a prior setup — a window
     // that may already have closed. Pairing them would mint a blackout
     // whose `end_time` is in the past, which `build_pause_from_spec`
-    // rejects ("refusing to arm a stale blackout"). Drop off-screen
-    // lines up front so only the on-screen window is armed.
-    let blackout_starts = in_visible_window(blackout_starts, "blackout_start", visible_range);
-    let blackout_ends = in_visible_window(blackout_ends, "blackout_end", visible_range);
-    let news_starts = in_visible_window(news_starts, "news_start", visible_range);
-    let news_ends = in_visible_window(news_ends, "news_end", visible_range);
+    // rejects ("refusing to arm a stale blackout"). Drop off-window lines
+    // up front so only the relevant window is armed.
+    //
+    // Scope window: normally the visible range. Under `--start` the whole
+    // chart is in play, so bound the verticals to `[start, trade-expiry]`
+    // instead — a news/blackout line only matters if it falls within the
+    // trade's own lifetime. (No resolved expiry → no forward bound; the
+    // required-role check surfaces the missing expiry shortly.)
+    let vertical_window = match slot_pref {
+        SlotPref::NearestTo { start } => {
+            let expiry = roles
+                .trade_expiry
+                .as_ref()
+                .map(|d| d.anchor_time())
+                .unwrap_or(i64::MAX);
+            (start, expiry)
+        }
+        _ => visible_range,
+    };
+    let blackout_starts = in_visible_window(blackout_starts, "blackout_start", vertical_window);
+    let blackout_ends = in_visible_window(blackout_ends, "blackout_end", vertical_window);
+    let news_starts = in_visible_window(news_starts, "news_start", vertical_window);
+    let news_ends = in_visible_window(news_ends, "news_end", vertical_window);
 
     roles.blackout_pairs = pair_vertical_lines(blackout_starts, blackout_ends, "blackout")?;
     roles.news_pairs = pair_vertical_lines(news_starts, news_ends, "news")?;
@@ -1236,6 +1253,58 @@ mod tests {
         let roles = classify(&mcp, &stubs, ANY_RANGE, SlotPref::NearestTo { start: 580 })
             .expect("classify ok");
         assert_eq!(roles.mw_path.unwrap().id, "forming");
+    }
+
+    /// Under `--start` the news/blackout vertical pairs are scoped to
+    /// `[start, trade-expiry]` — a pair before `start` or after the expiry is a
+    /// stale/irrelevant leftover and is dropped; only a pair inside the trade's
+    /// own lifetime survives.
+    #[test]
+    fn nearest_to_scopes_vertical_pairs_to_start_expiry() {
+        let (stubs, mcp) = fixture(vec![
+            // trade-expiry vertical at t=1000 — the forward bound.
+            (
+                stub("exp", "vertical_line"),
+                drawing("exp", "trade-expiry", vec![(1000, 0.0)]),
+            ),
+            // A news pair BEFORE start (400..450) — dropped.
+            (
+                stub("early-s", "vertical_line"),
+                drawing("early-s", "news-start", vec![(400, 0.0)]),
+            ),
+            (
+                stub("early-e", "vertical_line"),
+                drawing("early-e", "news-end", vec![(450, 0.0)]),
+            ),
+            // A news pair INSIDE [start, expiry] (700..750) — kept.
+            (
+                stub("mid-s", "vertical_line"),
+                drawing("mid-s", "news-start", vec![(700, 0.0)]),
+            ),
+            (
+                stub("mid-e", "vertical_line"),
+                drawing("mid-e", "news-end", vec![(750, 0.0)]),
+            ),
+            // A news pair AFTER expiry (1200..1250) — dropped.
+            (
+                stub("late-s", "vertical_line"),
+                drawing("late-s", "news-start", vec![(1200, 0.0)]),
+            ),
+            (
+                stub("late-e", "vertical_line"),
+                drawing("late-e", "news-end", vec![(1250, 0.0)]),
+            ),
+        ]);
+        // start=600, expiry resolves to 1000 → only the 700..750 pair qualifies.
+        let roles = classify(&mcp, &stubs, ANY_RANGE, SlotPref::NearestTo { start: 600 })
+            .expect("classify ok");
+        assert_eq!(
+            roles.news_pairs.len(),
+            1,
+            "only the in-[start,expiry] news pair survives"
+        );
+        let (s, _e) = &roles.news_pairs[0];
+        assert_eq!(s.id, "mid-s");
     }
 
     #[test]

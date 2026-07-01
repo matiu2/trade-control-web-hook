@@ -20,7 +20,9 @@ matching (`SlotPref::NearestTo`):
 - **M/W path**: the path whose two shoulders bracket `--start`
   (`B ≤ start ≤ D`; `start ≥ B` when the right shoulder isn't drawn).
 - **trade-expiry**: nearest vertical *at-or-after* `--start`.
-- **calendar / news bars**: auto-drawn over `[--start, trade-expiry]`.
+- **news / blackout vertical pairs**: scoped to `[--start, trade-expiry]` — a
+  pair before start or after the expiry is dropped, only pairs inside the
+  trade's own lifetime survive. Auto-drawn calendar bars use the same window.
 
 `--start` also sets the prune cursor (like `--as-of`) to itself. A malformed
 value is a **hard error** (unlike `--as-of`, which falls back to the cursor) —

@@ -128,13 +128,6 @@ pub fn run(args: Args) -> Result<i32> {
     } else {
         SlotPref::WindowAware(view)
     };
-    // Calendar auto-draw range: `--start` uses `[start, +∞)` (the expiry_hint
-    // then caps the forward horizon), so news bars are drawn relative to the
-    // cursor, not whatever happens to be on screen. Else the visible range.
-    let calendar_range = match start {
-        Some(s) => (s, i64::MAX),
-        None => view,
-    };
     let mut drawings = mcp.list_drawings().wrap_err("list TV drawings")?;
     let mut roles = classify(&mcp, &drawings, view, slot_pref)?;
 
@@ -149,6 +142,17 @@ pub fn run(args: Args) -> Result<i32> {
         // edge then bounds the window, and check_required (step 3)
         // surfaces the missing drawing as a hard error shortly anyway.
         let expiry_hint = read_trade_expiry(&roles).ok();
+        // Calendar auto-draw range: `--start` bounds it to `[start, expiry]`
+        // (the trade's own lifetime), so news bars are drawn relative to the
+        // cursor and never past the trade end — not whatever's on screen. The
+        // expiry_hint below still widens the effective end to the resolved
+        // expiry, so a bare `start` start-point with no expiry can't run the
+        // fetch across all of time. Else the visible range, as before.
+        let calendar_range = match (start, expiry_hint) {
+            (Some(s), Some(expiry)) => (s, expiry.timestamp()),
+            (Some(s), None) => (s, s),
+            (None, _) => view,
+        };
         if let Err(e) = auto_draw_calendar_lines(
             &mcp,
             &state.resolution,
