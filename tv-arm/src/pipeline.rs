@@ -333,14 +333,14 @@ pub fn run(args: Args) -> Result<i32> {
     // the worker; `--register-plan` additionally POSTs it. Run the block for
     // either so `--plan-out` is no longer a silent no-op on its own.
     if args.register_plan || args.plan_out.is_some() {
-        // 8a. (--update) Re-arm: delete the prior plan for this instrument before
+        // 8a. (--replace) Re-arm: delete the prior plan for this instrument before
         //     registering the fresh one, so the old plan stops ticking and the
-        //     new one starts with clean engine state. No-op when --update absent.
+        //     new one starts with clean engine state. No-op when --replace absent.
         //     Only meaningful when actually registering.
         if args.register_plan
-            && let Some(update_target) = args.update.as_deref()
+            && let Some(replace_target) = args.replace.as_deref()
         {
-            update_existing_plan(update_target, &built_trade.instrument, &key, now)?;
+            replace_existing_plan(replace_target, &built_trade.instrument, &key, now)?;
         }
         register_trade_plan(
             &built_trade,
@@ -1737,24 +1737,24 @@ fn discover_or_fetch_calendar_bundles(
 }
 
 /// One registered plan as seen in the `plan-list` response — only the two
-/// fields `--update` needs to resolve a target. Other fields are ignored.
+/// fields `--replace` needs to resolve a target. Other fields are ignored.
 #[derive(serde::Deserialize)]
 struct PlanListEntry {
     trade_id: String,
     instrument: String,
 }
 
-/// Decide which trade_id `--update` should delete.
+/// Decide which trade_id `--replace` should delete.
 ///
 /// - An explicit, non-empty `target` is used verbatim (delete exactly that).
-/// - An empty `target` (bare `--update`) auto-resolves by instrument: exactly
+/// - An empty `target` (bare `--replace`) auto-resolves by instrument: exactly
 ///   one registered plan on `instrument` → delete it; none → `Ok(None)`
 ///   (nothing to clear, proceed); more than one → a hard error naming the
 ///   candidates so the operator re-runs with an explicit id.
 ///
 /// Pure (takes the parsed plan list), so the resolution rules are unit-tested
 /// without the worker.
-fn resolve_update_target(
+fn resolve_replace_target(
     target: &str,
     instrument: &str,
     plans: &[PlanListEntry],
@@ -1772,8 +1772,8 @@ fn resolve_update_target(
         [] => Ok(None),
         [only] => Ok(Some((*only).to_string())),
         many => Err(eyre!(
-            "--update: {} plans registered for {instrument} ({}); \
-             pass the trade_id explicitly: --update <trade-id>",
+            "--replace: {} plans registered for {instrument} ({}); \
+             pass the trade_id explicitly: --replace <trade-id>",
             many.len(),
             many.join(", "),
         )),
@@ -1781,13 +1781,13 @@ fn resolve_update_target(
 }
 
 /// Re-arm support for `--register-plan`: resolve the prior plan for this
-/// instrument (or the explicit `--update <id>`) and delete it from the engine
+/// instrument (or the explicit `--replace <id>`) and delete it from the engine
 /// before the fresh register. Queries `plan-list`, applies
-/// [`resolve_update_target`], then POSTs a signed `plan-delete` (which clears
+/// [`resolve_replace_target`], then POSTs a signed `plan-delete` (which clears
 /// both the `plan:` and `plan-state:` KV rows). A no-target resolution is a
 /// logged no-op. Hard-errors on an ambiguous auto-resolve or a worker rejection
 /// — better to stop than to leave a stale plan ticking beside the new one.
-fn update_existing_plan(
+fn replace_existing_plan(
     target: &str,
     instrument: &str,
     key: &[u8; KEY_LEN],
@@ -1798,20 +1798,20 @@ fn update_existing_plan(
     // plan in the archive must not count against the per-instrument tally.
     let list_intent = cli::build_plan_list_intent(now, &register_suffix(now), false);
     let list_body = cli::wrap_signed(&list_intent, key, now).wrap_err("sign plan-list intent")?;
-    let yaml = post_intent_blocking(list_body).wrap_err("query plan-list for --update")?;
+    let yaml = post_intent_blocking(list_body).wrap_err("query plan-list for --replace")?;
     let plans: Vec<PlanListEntry> =
         serde_yaml::from_str(&yaml).wrap_err("parse plan-list response")?;
 
-    let Some(trade_id) = resolve_update_target(target, instrument, &plans)? else {
-        info!(instrument = %instrument, "--update: no existing plan for this instrument; nothing to delete");
+    let Some(trade_id) = resolve_replace_target(target, instrument, &plans)? else {
+        info!(instrument = %instrument, "--replace: no existing plan for this instrument; nothing to delete");
         return Ok(());
     };
 
     let del_intent = cli::build_plan_delete_intent(&trade_id, now, &register_suffix(now));
     let del_body = cli::wrap_signed(&del_intent, key, now).wrap_err("sign plan-delete intent")?;
-    info!(trade_id = %trade_id, instrument = %instrument, "--update: deleting prior registered plan");
-    post_intent_blocking(del_body).wrap_err("delete prior plan for --update")?;
-    info!(trade_id = %trade_id, "--update: prior plan deleted");
+    info!(trade_id = %trade_id, instrument = %instrument, "--replace: deleting prior registered plan");
+    post_intent_blocking(del_body).wrap_err("delete prior plan for --replace")?;
+    info!(trade_id = %trade_id, "--replace: prior plan deleted");
     Ok(())
 }
 
@@ -2736,7 +2736,7 @@ mod tests {
         }
     }
 
-    // ===== --update target resolution =====
+    // ===== --replace target resolution =====
 
     fn plan_entry(trade_id: &str, instrument: &str) -> PlanListEntry {
         PlanListEntry {
@@ -2746,51 +2746,53 @@ mod tests {
     }
 
     #[test]
-    fn update_explicit_target_used_verbatim() {
+    fn replace_explicit_target_used_verbatim() {
         // An explicit id is deleted regardless of how many plans exist.
         let plans = [
             plan_entry("hs-eurusd-aaaa", "EUR_USD"),
             plan_entry("hs-eurusd-bbbb", "EUR_USD"),
         ];
-        let got = resolve_update_target("hs-eurusd-bbbb", "EUR_USD", &plans).unwrap();
+        let got = resolve_replace_target("hs-eurusd-bbbb", "EUR_USD", &plans).unwrap();
         assert_eq!(got.as_deref(), Some("hs-eurusd-bbbb"));
     }
 
     #[test]
-    fn update_auto_resolves_single_plan_for_instrument() {
+    fn replace_auto_resolves_single_plan_for_instrument() {
         let plans = [
             plan_entry("hs-eurusd-aaaa", "EUR_USD"),
             plan_entry("hs-gbpusd-cccc", "GBP_USD"),
         ];
-        let got = resolve_update_target("", "EUR_USD", &plans).unwrap();
+        let got = resolve_replace_target("", "EUR_USD", &plans).unwrap();
         assert_eq!(got.as_deref(), Some("hs-eurusd-aaaa"));
     }
 
     #[test]
-    fn update_auto_no_plan_for_instrument_is_noop() {
+    fn replace_auto_no_plan_for_instrument_is_noop() {
         let plans = [plan_entry("hs-gbpusd-cccc", "GBP_USD")];
-        let got = resolve_update_target("", "EUR_USD", &plans).unwrap();
+        let got = resolve_replace_target("", "EUR_USD", &plans).unwrap();
         assert!(got.is_none(), "no plan on instrument → nothing to delete");
     }
 
     #[test]
-    fn update_auto_multiple_plans_is_hard_error() {
+    fn replace_auto_multiple_plans_is_hard_error() {
         let plans = [
             plan_entry("hs-eurusd-aaaa", "EUR_USD"),
             plan_entry("mw-eurusd-bbbb", "EUR_USD"),
         ];
-        let err = resolve_update_target("", "EUR_USD", &plans).unwrap_err();
+        let err = resolve_replace_target("", "EUR_USD", &plans).unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("2 plans"), "msg = {msg}");
         assert!(msg.contains("hs-eurusd-aaaa"), "names candidates: {msg}");
         assert!(msg.contains("mw-eurusd-bbbb"), "names candidates: {msg}");
+        // The error text points the operator at the *new* flag name.
+        assert!(msg.contains("--replace"), "error names --replace: {msg}");
     }
 
     #[test]
-    fn update_whitespace_target_is_treated_as_auto() {
-        // clap's default_missing_value for a bare `--update` is "" → auto.
+    fn replace_whitespace_target_is_treated_as_auto() {
+        // clap's default_missing_value for a bare `--replace` is "" → auto.
         let plans = [plan_entry("hs-eurusd-aaaa", "EUR_USD")];
-        let got = resolve_update_target("  ", "EUR_USD", &plans).unwrap();
+        let got = resolve_replace_target("  ", "EUR_USD", &plans).unwrap();
         assert_eq!(got.as_deref(), Some("hs-eurusd-aaaa"));
     }
 }

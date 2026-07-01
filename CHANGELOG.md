@@ -1,5 +1,32 @@
 # Changelog
 
+## Unreleased — 2026-07-02 — tv-arm: rename `--update` → `--replace` (alias kept)
+
+**Why.** The re-arm flag was named `--update`, which reads like an in-place
+patch. It isn't: it *deletes* the prior plan and registers a brand-new one under
+a fresh `trade_id` with blank engine state (phase, vetos, seen-ids,
+entry-attempts, news/blackout windows are all `trade_id`-keyed, so nothing
+carries over). `--replace` names what actually happens.
+
+**What changed.** `tv-arm`'s `--update` flag is renamed `--replace`
+(`tv-arm/src/args.rs`); `--update` stays as a **`visible_alias`** so existing
+scripts and muscle memory keep working. Behaviour is byte-identical. The field
+`Args.update` → `Args.replace`; the helpers `resolve_update_target` →
+`resolve_replace_target` and `update_existing_plan` → `replace_existing_plan`
+(`tv-arm/src/pipeline.rs`); log lines and the ambiguous-target error now say
+`--replace`. The `--help` text also spells out the replace-not-patch semantics
+and the strand-a-live-order/position caveat.
+
+**Breaking.** None for the CLI surface (alias preserves `--update`). Internal
+fn/field renames only — no external callers.
+
+**Config.** None.
+
+**Tests.** args: `--replace` bare + with-target parse, and `--update` alias
+parses into the same field. pipeline: the 5 `resolve_*_target` tests renamed
+`replace_*`, plus the ambiguous-target error now asserts it names `--replace`.
+tv-arm 185 green; clippy + fmt clean.
+
 ## Unreleased — 2026-07-02 — replay report: Net R + $100k-account P&L projection
 
 **Why.** The `replay-candles --simulate` report tallied only raw TP/SL counts.

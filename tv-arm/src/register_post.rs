@@ -42,7 +42,7 @@ pub fn post_register_blocking(signed_body: String) -> Result<()> {
 /// POST any already-signed intent body to the worker and return the worker's
 /// 2xx response body. Same destination + runtime bridge as
 /// [`post_register_blocking`], but surfaces the response text — used by the
-/// `--update` flow to read the `plan-list` YAML (a register POST discards it).
+/// `--replace` flow to read the `plan-list` YAML (a register POST discards it).
 /// A non-2xx status or transport failure is an `Err` carrying the worker's
 /// message.
 pub fn post_intent_blocking(signed_body: String) -> Result<String> {

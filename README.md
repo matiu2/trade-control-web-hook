@@ -2617,29 +2617,42 @@ engine state is `core/src/plan_state.rs`; the FSM evaluator is
 `engine/src/evaluate.rs`; the candle-pattern detector port is
 `core/src/signals.rs`.
 
-#### Re-arming an existing setup (`--update`)
+#### Re-arming an existing setup (`--replace`)
 
 `tv-arm` mints a **fresh random `trade_id` every run**, so the engine treats
 each re-arm as a brand-new plan — and the *old* plan keeps ticking in KV until
 its TTL lapses. When you move annotations on the chart and re-run, pass
-`--update` (only meaningful alongside `--register-plan`) so the prior plan is
+`--replace` (only meaningful alongside `--register-plan`) so the prior plan is
 deleted from the engine first:
 
 ```sh
 # Auto-resolve by instrument: deletes the one existing plan on this instrument,
 # then registers the fresh one. Hard-errors if more than one plan is registered
 # for the instrument (re-run with the explicit id from `plan list`).
-tv-arm-staging --register-plan --update ...
+tv-arm-staging --register-plan --replace ...
 
 # Explicit: delete exactly this prior trade_id, then register fresh.
-tv-arm-staging --register-plan --update hs-eurusd-a3f9c1d2 ...
+tv-arm-staging --register-plan --replace hs-eurusd-a3f9c1d2 ...
 ```
 
-`--update` reconciles the server-side engine plan: it POSTs `plan-list` to find
+`--replace` reconciles the server-side engine plan: it POSTs `plan-list` to find
 the target, then a signed `plan-delete` that clears the plan's `plan:` +
-`plan-state:` KV (see `plan delete` below). A bare `--update` with no plan
+`plan-state:` KV (see `plan delete` below). A bare `--replace` with no plan
 registered for the instrument is a logged no-op. The resolution logic is the
-pure `resolve_update_target` (`tv-arm/src/pipeline.rs`), unit-tested.
+pure `resolve_replace_target` (`tv-arm/src/pipeline.rs`), unit-tested.
+
+**It's a replace, not an in-place patch.** The new plan gets a fresh `trade_id`
+and **blank engine state** — phase, vetos, seen-ids, entry-attempts, and open
+news/blackout windows are all keyed by `trade_id`, so none carry over. That's
+exactly what you want for a clean re-arm *before* entry. But once a plan has a
+**live resting order or open position**, replacing it can strand that
+order/position: `--replace` reconciles only KV, never the broker, so the old
+order isn't cancelled and the new plan can't see the open position to manage its
+break-even / SL / reversal-close. Check the broker before replacing a plan that
+may have already fired.
+
+> `--update` is a **deprecated alias** for `--replace` (same behaviour) — old
+> scripts keep working, but new usage should prefer `--replace`.
 
 #### Inspecting / managing registered plans (`trade-control plan list` / `show` / `delete`)
 
