@@ -1536,6 +1536,7 @@ mod tests {
             rules,
             shadow: false,
             cross_buffer_pct: 0.0,
+            replay_start: None,
         }
     }
 

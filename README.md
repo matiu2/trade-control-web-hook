@@ -1622,7 +1622,12 @@ pair per event, then drops any pair whose window has already elapsed. The
   visible, so you can see the whole trade play out while still arming as if it
   were live at the shoulder. A malformed `--start` is a **hard error** (a typo
   must not silently fall back to visible-window matching). The emitted plan is
-  identical to what you'd get by hiding the future and arming normally.
+  identical to what you'd get by hiding the future and arming normally, **plus**
+  the `--start` value is baked onto the plan as `replay_start` so the offline
+  `replay-candles` harness derives a self-consistent window from the plan alone
+  (`--start` flag → `plan.replay_start` → chart cursor) — you never have to line
+  up the TV chart's replay cursor before replaying. The worker ignores
+  `replay_start`; it's a journaling aid.
 
 **Zero-length blackout/news pairs are dropped, not fatal.** When `tv-arm`
 auto-draws calendar lines and reads them back, TradingView snaps each vertical

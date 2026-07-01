@@ -109,6 +109,15 @@ pub struct TradePlan {
     /// override the arm-time default.
     #[serde(default)]
     pub cross_buffer_pct: f64,
+    /// Arm-time replay cursor (`tv-arm --start`, a Unix second), baked so the
+    /// offline `replay-candles` harness can derive a self-consistent window
+    /// without reading the TradingView chart's replay cursor. The worker does
+    /// **not** act on this — it's a journaling aid. `replay-candles` uses it as
+    /// the start cursor (its own `--start` flag still overrides). `None` when
+    /// `tv-arm` was run without `--start`; `#[serde(skip_serializing_if)]` keeps
+    /// it out of the JSON entirely then, so pre-field plans round-trip unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replay_start: Option<i64>,
 }
 
 /// One condition + the intent it fires. The engine evaluates [`trigger`] each
@@ -403,5 +412,35 @@ bar: on_close
         assert_eq!(plan.cross_buffer_pct, 0.1);
         let back: TradePlan = serde_json::from_str(&serde_json::to_string(&plan).unwrap()).unwrap();
         assert_eq!(back.cross_buffer_pct, 0.1, "must survive a round-trip");
+    }
+
+    /// A plan with no `replay_start` deserializes to `None`, and re-serializing
+    /// omits the field entirely (so pre-field plans round-trip byte-clean).
+    #[test]
+    fn missing_replay_start_defaults_to_none_and_is_omitted() {
+        let json = r#"{"trade_id":"t-1","instrument":"EUR_USD","direction":"short",
+            "granularity":"h1","pip_size":0.0001,"rules":[]}"#;
+        let plan: TradePlan = serde_json::from_str(json).unwrap();
+        assert_eq!(plan.replay_start, None);
+        let out = serde_json::to_string(&plan).unwrap();
+        assert!(
+            !out.contains("replay_start"),
+            "None replay_start must be skipped in the JSON, got: {out}"
+        );
+    }
+
+    /// A baked `replay_start` (from `tv-arm --start`) survives a round-trip.
+    #[test]
+    fn replay_start_round_trips() {
+        let json = r#"{"trade_id":"t-1","instrument":"EUR_USD","direction":"short",
+            "granularity":"h1","pip_size":0.0001,"rules":[],"replay_start":1781208000}"#;
+        let plan: TradePlan = serde_json::from_str(json).unwrap();
+        assert_eq!(plan.replay_start, Some(1781208000));
+        let back: TradePlan = serde_json::from_str(&serde_json::to_string(&plan).unwrap()).unwrap();
+        assert_eq!(
+            back.replay_start,
+            Some(1781208000),
+            "must survive a round-trip"
+        );
     }
 }

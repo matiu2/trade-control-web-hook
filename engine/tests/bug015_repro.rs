@@ -197,6 +197,7 @@ fn experimental_plan() -> TradePlan {
         rules: vec![too_low, too_high, trade_expiry],
         shadow: false,
         cross_buffer_pct: 0.0,
+        replay_start: None,
     }
 }
 

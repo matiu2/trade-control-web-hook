@@ -1,5 +1,34 @@
 # Changelog
 
+## Unreleased — 2026-07-01 — bake `--start` into the plan for self-consistent replays
+
+**Why.** `tv-arm --start` only affected *arming* (which drawings to pick). The
+offline `replay-candles` harness still derived its window *start* from the
+TradingView chart's replay cursor — so even a correct `--start` arm failed if the
+chart's cursor wasn't lined up before the trade start. Concretely: a June-12
+`--start` arm produced a plan with expiry 22 Jun, but replay read the chart
+cursor at 22 Jun 16:00 (after the expiry) and errored `end before start`. The two
+tools didn't share the cursor.
+
+**What changed.** `tv-arm` now bakes the arm-time `--start` onto the plan as a new
+optional field `TradePlan.replay_start` (a Unix second). `replay-candles` prefers
+it for the window start: **`--start` flag → `plan.replay_start` → chart cursor**.
+So a `--start` journaling arm carries *both* ends of its window (start =
+replay_start, end = trade-expiry) and replay is fully deterministic — the TV chart
+position no longer matters. An arm without `--start` is unchanged (field omitted,
+chart cursor used as before).
+
+**Field.** `replay_start: Option<i64>`, `#[serde(default, skip_serializing_if =
+"Option::is_none")]` — omitted from the JSON entirely when absent, so pre-field
+plans round-trip byte-clean. Signed as part of the whole-body HMAC like every
+plan field. **The worker does not act on it** — it's a journaling aid the engine
+ignores.
+
+**Tests.** core: `missing_replay_start_defaults_to_none_and_is_omitted`,
+`replay_start_round_trips`. replay-candles: `window_start_comes_from_plan_replay_start`,
+`window_start_flag_overrides_plan_replay_start`. core 761 / cli 256 / replay-candles
+59 / tv-arm 178 / engine 97 green; clippy + fmt clean.
+
 ## Unreleased — 2026-07-01 — tv-arm `--start`: whole-chart, nearest-to-start arming
 
 **Why.** Journaling a replay trade meant putting TradingView in replay mode with

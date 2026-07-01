@@ -356,6 +356,7 @@ pub fn run(args: Args) -> Result<i32> {
             args.shadow,
             args.plan_out.as_deref(),
             args.register_plan,
+            start,
         )?;
     }
 
@@ -1849,6 +1850,7 @@ fn register_trade_plan(
     shadow: bool,
     plan_out: Option<&Path>,
     register: bool,
+    replay_start: Option<i64>,
 ) -> Result<()> {
     use cli::TradePattern;
     let is_mw = matches!(built_trade.spec.pattern, TradePattern::M | TradePattern::W);
@@ -1867,6 +1869,7 @@ fn register_trade_plan(
         granularity,
         is_mw,
         shadow,
+        replay_start,
     );
     // Unwrap the tv-arm bundle wrappers to the cli `BuiltPause`/`BuiltNews` the
     // appender reads (each carries the signed intents + window times).
@@ -2427,6 +2430,7 @@ mod tests {
             trade_control_core::broker::Granularity::H1,
             false,
             false,
+            None,
         )
     }
 

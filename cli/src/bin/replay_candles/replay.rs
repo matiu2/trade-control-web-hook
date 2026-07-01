@@ -496,6 +496,7 @@ mod tests {
             rules: Vec::new(),
             shadow: false,
             cross_buffer_pct: 0.0,
+            replay_start: None,
         };
         let candles: Vec<EngineCandle> = (0..20)
             .map(|i| candle(i * 3600, 1.30 + i as f64 * 0.001))
@@ -523,6 +524,7 @@ mod tests {
             rules: Vec::new(),
             shadow: false,
             cross_buffer_pct: 0.0,
+            replay_start: None,
         };
         let replay = run(&plan, &[], Granularity::H1, all_live(), all_live()).await;
         assert!(replay.fires.is_empty());

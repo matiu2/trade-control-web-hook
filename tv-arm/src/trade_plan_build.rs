@@ -68,10 +68,15 @@ pub fn resolution_to_granularity(resolution: &str) -> Option<Granularity> {
 ///   advances it but never dispatches its fires to the broker (see
 ///   [`TradePlan::shadow`](trade_control_core::trade_plan::TradePlan::shadow)).
 ///   The safe way to diff the engine against the live TV alerts on demo.
-// Eight parameters: each is a distinct chart-derived primitive (id, instrument,
-// alerts, direction, roles, granularity, is_mw, shadow) threaded once from the
-// single pipeline call site. Grouping them into a struct would just move the
-// same fields elsewhere without clarifying anything.
+/// - `replay_start` is the arm-time `--start` cursor (a Unix second), baked onto
+///   the plan so the offline `replay-candles` harness derives a self-consistent
+///   window without reading the TV chart's replay cursor. `None` when `--start`
+///   wasn't passed (see
+///   [`TradePlan::replay_start`](trade_control_core::trade_plan::TradePlan::replay_start)).
+// Nine parameters: each is a distinct chart-derived primitive (id, instrument,
+// alerts, direction, roles, granularity, is_mw, shadow, replay_start) threaded
+// once from the single pipeline call site. Grouping them into a struct would
+// just move the same fields elsewhere without clarifying anything.
 #[allow(clippy::too_many_arguments)]
 pub fn build_trade_plan(
     trade_id: &str,
@@ -82,6 +87,7 @@ pub fn build_trade_plan(
     granularity: Granularity,
     is_mw: bool,
     shadow: bool,
+    replay_start: Option<i64>,
 ) -> TradePlan {
     let rules = alerts
         .iter()
@@ -97,6 +103,7 @@ pub fn build_trade_plan(
         rules,
         shadow,
         cross_buffer_pct: trade_control_core::trade_plan::DEFAULT_CROSS_BUFFER_PCT,
+        replay_start,
     }
 }
 
@@ -643,6 +650,7 @@ mod tests {
             Granularity::H1,
             false,
             false,
+            None,
         );
 
         assert!(!plan.shadow, "default build is live, not shadow");
@@ -737,6 +745,7 @@ mod tests {
             Granularity::H1,
             false,
             false,
+            None,
         );
 
         let by_id = |id: &str| plan.rules.iter().find(|r| r.rule_id == id).unwrap();
@@ -781,6 +790,7 @@ mod tests {
             Granularity::H1,
             false,
             false,
+            None,
         );
 
         // This is exactly what `register_trade_plan` writes for `--plan-out`.
@@ -845,6 +855,7 @@ mod tests {
             Granularity::H1,
             true,
             false,
+            None,
         );
         let by_id = |id: &str| plan.rules.iter().find(|r| r.rule_id == id).unwrap();
 
@@ -890,6 +901,7 @@ mod tests {
             Granularity::H1,
             false,
             false,
+            None,
         );
         assert!(plan.rules.is_empty());
     }
@@ -908,6 +920,7 @@ mod tests {
             Granularity::H1,
             true,
             true,
+            None,
         );
         assert!(plan.shadow, "shadow=true must reach the built plan");
     }
@@ -985,6 +998,7 @@ mod tests {
             Granularity::H1,
             false,
             false,
+            None,
         );
         assert_eq!(plan.rules.len(), 1, "just the enter before appending");
 
