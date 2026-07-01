@@ -276,16 +276,26 @@ See `[[intrabar_cross_reads_wick_not_close]]`.
 genuine close through the line (open one side, **close** the other). Only the
 intrabar arm moved.
 
+**Exception — the literal `too-high` cap reverted to close-confirm (2026-07-01).**
+The engine semantics above are unchanged; what changed is which `BarEvent` the
+short-side invalidation cap is *built* with. `invalidation_or_pcl_trigger`
+(`tv-arm/src/trade_plan_build.rs`) now emits the short `too-high` cap as
+`HorizontalCross { dir: Up, bar: OnClose }` — a bar must **close** above the cap
+to invalidate; an intrabar spike above that closes back below does **not**. This
+is a deliberate *asymmetry* (operator call): only the literal `too-high` name
+reverted. The long-side invalidation floor (`too-low`, `dir: Down`) stays
+**intrabar (wick)** — a low wicking below the floor invalidates with no close
+required. Tests: `builds_hs_short_rules_with_correct_triggers` (asserts
+`OnClose`), `ihs_long_too_low_invalidation_stays_intrabar_wick` (asserts the
+mirror stays `Intrabar`).
+
 Consumers of the intrabar arm, all now wick-from-the-open-side (for a **short**;
 mirror for long):
 
 - **`too-high` = invalidation** (drawing-bound horizontal at the shoulder cap).
-  `HorizontalCross { dir: Up, bar: Intrabar }` from
-  `tv-arm/src/trade_plan_build.rs::invalidation_or_pcl_trigger`. A bar that
-  opened below `too-high` and whose **high reaches above** it now fires — a
-  spike-and-recover that crossed up from below invalidates intrabar. A bar that
-  merely *closes* above without crossing up from below does **not**. (The old
-  close-confirm NZD/CHF example no longer applies as written.)
+  **Reverted to `OnClose` — see the exception above.** The short cap is
+  close-confirmed; only the long-side `too-low` invalidation floor uses the
+  intrabar arm (`HorizontalCross { dir: Down, bar: Intrabar }`).
 - **`too-low` = pcl-exhausted** (computed fib, ~80% to TP).
   `PriceValueCross { dir: Either, bar: Intrabar }` — `Either`, so **any
   straddle** aborts. Unchanged: if a short ran 80% to TP without us, a wick
@@ -299,9 +309,13 @@ These levels are also baked onto the enter as continuous `entry_level_vetos`
 (see Bug #12 / `[[bug12_at_entry_level_vetos]]`) — `is_past`-inclusive and
 independent of this cross-guard.
 
-**Follow-up (not built yet):** a tunable cross-depth buffer so a one-tick graze
-doesn't trigger — must cross by N ticks or ~0.1% of the line price. Designing
-next.
+**Cross-depth buffer (built).** A tunable cross-depth buffer so a one-tick graze
+doesn't trigger — plan-level signed `TradePlan.cross_buffer_pct`, default
+**0.02%** of the line price. A directional **intrabar** `Down`/`Up` cross must
+pierce ≥`pct%` of the line price past the line (`Either` and `OnClose` ignore
+it). Calibrated on the AUD/JPY iH&S 2026-06-29 (0.0 = −1.43R, 0.02 = +0.57R,
+0.1 = starved). See `[[cross_buffer_pct]]`. Follow-up: a `tv-arm
+--cross-buffer-pct` flag to override the arm-time default per-trade (not built).
 
 ### tv_arm_hs.py: server-side trendline-cross eval is anchor-bounded
 

@@ -313,16 +313,24 @@ fn invalidation_or_pcl_trigger(
         _ => return None,
     };
     if basename_dir == direction {
-        // Drawing-bound invalidation: short crosses up into the cap, long
-        // crosses down into the floor. Intrabar, fire-once.
+        // Drawing-bound invalidation: short crosses up into the cap
+        // (literal `too-high`), long crosses down into the floor (`too-low`).
+        //
+        // The short-side `too-high` cap is **close-confirmed** (`OnClose`): a
+        // bar must genuinely *close* above the cap to invalidate — an intrabar
+        // spike above that closes back below does not. The long-side `too-low`
+        // floor mirror stays **intrabar** (wick) per the wick-cross change.
+        // (Operator call 2026-07-01: revert only the literal `too-high` name to
+        // close-confirm; leave the mirror on the wick.)
         let d = roles.invalidation.as_ref()?;
+        let (dir, bar) = match direction {
+            ConvDirection::Short => (CrossDir::Up, BarEvent::OnClose),
+            ConvDirection::Long => (CrossDir::Down, BarEvent::Intrabar),
+        };
         Some(Trigger::HorizontalCross {
             level: horizontal_level(d)?,
-            dir: match direction {
-                ConvDirection::Short => CrossDir::Up,
-                ConvDirection::Long => CrossDir::Down,
-            },
-            bar: BarEvent::Intrabar,
+            dir,
+            bar,
         })
     } else {
         // Opposite-name veto = pcl-exhausted, a computed price value.
@@ -646,13 +654,15 @@ mod tests {
 
         let by_id = |id: &str| plan.rules.iter().find(|r| r.rule_id == id).unwrap();
 
-        // Invalidation: short crosses UP into the cap, intrabar, fire-once.
+        // Invalidation: short crosses UP into the cap, **close-confirmed**
+        // (`OnClose`) — the literal `too-high` cap must close above to
+        // invalidate; a spike-and-recover does not. Fire-once.
         assert!(matches!(
             by_id("01-veto-too-high").trigger,
             Trigger::HorizontalCross {
                 level,
                 dir: CrossDir::Up,
-                bar: BarEvent::Intrabar,
+                bar: BarEvent::OnClose,
             } if (level - 1.2000).abs() < 1e-9
         ));
         // Break-and-close: short closes DOWN through the neckline, OnClose.
@@ -693,6 +703,53 @@ mod tests {
             }
         ));
         assert_eq!(enter.fire_mode, FireMode::Once);
+    }
+
+    /// The long-side (IH&S) invalidation floor is the mirror of the short cap:
+    /// its alert is named `01-veto-too-low` and it stays on **intrabar (wick)**
+    /// semantics — a low wicking below the floor invalidates, no close required.
+    /// This pins the deliberate asymmetry introduced 2026-07-01: only the
+    /// literal `too-high` cap was reverted to `OnClose`; the `too-low` floor
+    /// keeps the wick-cross behaviour.
+    #[test]
+    fn ihs_long_too_low_invalidation_stays_intrabar_wick() {
+        let alerts = vec![
+            alert("01-veto-too-low", Action::Veto),
+            alert("03-prep-break-and-close", Action::Prep),
+            alert("04-prep-retest", Action::Prep),
+            alert("02-veto-trade-expiry", Action::Invalidate),
+            alert("05-enter", Action::Enter),
+        ];
+        let roles = Roles {
+            invalidation: Some(horz(1.1000)),
+            break_and_close: Some(trend((10, 1.1100), (20, 1.1150))),
+            retest: Some(trend((10, 1.1100), (20, 1.1150))),
+            trade_expiry: Some(vert(99_000)),
+            ..Roles::default()
+        };
+
+        let plan = build_trade_plan(
+            "eurusd-ihs-1",
+            "EUR_USD",
+            &alerts,
+            ConvDirection::Long,
+            &roles,
+            Granularity::H1,
+            false,
+            false,
+        );
+
+        let by_id = |id: &str| plan.rules.iter().find(|r| r.rule_id == id).unwrap();
+
+        // Long invalidation floor: crosses DOWN into the floor, intrabar (wick).
+        assert!(matches!(
+            by_id("01-veto-too-low").trigger,
+            Trigger::HorizontalCross {
+                level,
+                dir: CrossDir::Down,
+                bar: BarEvent::Intrabar,
+            } if (level - 1.1000).abs() < 1e-9
+        ));
     }
 
     /// A built plan survives the exact JSON round-trip that `--plan-out` writes

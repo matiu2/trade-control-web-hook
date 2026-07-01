@@ -1,5 +1,34 @@
 # Changelog
 
+## Unreleased — 2026-07-01 — too-high invalidation reverted to close-confirm
+
+**Why.** The prior "intrabar cross reads the wick" change flipped *every*
+intrabar directional cross to fire on the wick, including the drawing-bound
+`too-high` invalidation cap. Operator call: the invalidation cap should only
+trip when a bar genuinely **closes** past it — an intrabar spike above the cap
+that closes back below is not an invalidation. Reverting the cap avoids
+premature invalidations on volatile shoulder-cap wicks while keeping the wick
+semantics where they matter (the retest tap-and-bounce).
+
+**What changed.** `invalidation_or_pcl_trigger`
+(`tv-arm/src/trade_plan_build.rs`) now emits the short-side `too-high` cap as
+`HorizontalCross { dir: Up, bar: OnClose }` (was `Intrabar`). A bar must close
+above the cap to invalidate. This is a **deliberate asymmetry**: only the literal
+`too-high` name reverted. The long-side invalidation **floor** (`too-low`,
+`dir: Down`) stays `Intrabar` — a low wicking below the floor still invalidates
+with no close required. The `too-low` pcl-exhausted veto (`CrossDir::Either`) and
+the retest (`TrendlineCross`, intrabar) are untouched.
+
+**Scope.** Pure tv-arm build-site change — no engine change (the engine's
+`OnClose` arm already implements close-confirm: `prev < level && close >= level`
+for `Up`). Only freshly-armed plans carry the new `OnClose`; plans already in KV
+keep whatever `BarEvent` they were signed with. The continuous `entry_level_vetos`
+(Bug #12) are an `is_past` predicate, independent of this cross-guard — unchanged.
+
+**Tests.** tv-arm: `builds_hs_short_rules_with_correct_triggers` updated to
+assert `OnClose`; new `ihs_long_too_low_invalidation_stays_intrabar_wick` pins
+the mirror staying `Intrabar`. tv-arm 172 green; clippy + fmt clean.
+
 ## Unreleased — 2026-07-01 — cross-depth buffer (% of line price)
 
 **Why.** With intrabar crosses now firing on the wick (previous entry), a
