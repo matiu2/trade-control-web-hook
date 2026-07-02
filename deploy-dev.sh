@@ -1,19 +1,26 @@
 #!/usr/bin/env bash
 # Deploy the DEV environment.
 #
-#   worker : trade-control-web-hook-dev       (branch: main)
+#   worker : LOCAL native/Postgres worker on 127.0.0.1:8787  (branch: main)
 #   CLIs   : trade-control-dev, tv-arm-dev, tv-news-dev, replay-candles-dev
 #
-# Every environment now carries a suffix. The old no-suffix worker
-# `trade-control-web-hook` is deprecated (kept running only until last week's
-# trades are journaled, then deleted) — this script targets the suffixed
-# `-dev` worker.
+# Dev now runs the local native/Postgres worker, NOT Cloudflare (only staging
+# is on Cloudflare). So this script does NOT `wrangler deploy` — it only bakes
+# each `-dev` CLI's default endpoint to the loopback worker and installs them.
+# The local worker itself is a long-running process managed outside this script:
+#
+#   SIGNING_KEY="$(tr -d '[:space:]' < ~/.config/trade-control/key.hex)" \
+#   ADMIN_KEY="$(tr -d '[:space:]' < ~/.config/trade-control/admin-key.hex)" \
+#     ./target/release/trade-control-worker <config.toml>
 
 set -euo pipefail
 
 ENV_NAME="dev"
 ENV_BRANCH="main"
-ENV_WEBHOOK="https://trade-control-web-hook-dev.msherborne.workers.dev"
+# Dev is now the LOCAL native/Postgres worker (127.0.0.1:8787), not Cloudflare.
+# Only staging still runs on Cloudflare. The suffixed `-dev` CLIs bake this as
+# their default endpoint so no `--endpoint` flag is needed.
+ENV_WEBHOOK="http://127.0.0.1:8787"
 ENV_SUFFIX="dev"
 # Pine study title tv-arm-dev arms against. Dev runs the newer Pine (v25,
 # which sends `open` for M/W body-extreme logic). The chart study MUST be
@@ -22,4 +29,5 @@ ENV_SUFFIX="dev"
 ENV_PINE_NAME="Candle Signals v25"
 
 source "$(dirname "$0")/deploy-lib.sh"
-deploy_env "$ENV_NAME" "$ENV_BRANCH" "$ENV_WEBHOOK" "$ENV_SUFFIX" "$ENV_PINE_NAME"
+# 6th arg "native" → skip wrangler deploy (local worker, CLIs only).
+deploy_env "$ENV_NAME" "$ENV_BRANCH" "$ENV_WEBHOOK" "$ENV_SUFFIX" "$ENV_PINE_NAME" native
