@@ -52,12 +52,8 @@ CLI_BINARIES=(trade-control tv-arm tv-news replay-candles)
 # environment pin a distinct Pine version living as a separate study on the
 # same chart (e.g. "Candle Signals v24" vs "Candle Signals v25"). Optional —
 # defaults to the canonical "Candle Signals" when empty/unset.
-# A 6th arg of "native" marks a LOCAL native/Postgres-worker environment (dev):
-# it skips `wrangler deploy` and the wrangler.toml host-check entirely, because
-# the worker is a long-running local process managed outside this script, not a
-# Cloudflare deploy. Anything else (or unset) keeps the Cloudflare path (staging).
 deploy_env() {
-  local env_name="$1" req_branch="$2" webhook="$3" suffix="$4" pine_name="${5:-Candle Signals}" worker_kind="${6:-cloudflare}"
+  local env_name="$1" req_branch="$2" webhook="$3" suffix="$4" pine_name="${5:-Candle Signals}"
 
   cd "$REPO_ROOT"
 
@@ -73,25 +69,18 @@ deploy_env() {
     exit 1
   fi
 
-  # 2. Deploy the worker — Cloudflare only. A native env's worker is a local
-  #    process (see the local-worker launch recipe), so there's nothing to
-  #    `wrangler deploy`; this script just bakes+installs its CLIs.
-  if [[ "$worker_kind" == "native" ]]; then
-    echo "==> [$env_name] native/local worker — skipping wrangler deploy"
-    echo "    (the worker on ${webhook} is a local process managed outside this script)"
-  else
-    # Sanity: the branch's wrangler.toml worker name should match the URL host.
-    local worker_name expected_host
-    worker_name="$(grep -E '^name *= *"' wrangler.toml | head -1 | sed -E 's/^name *= *"([^"]+)".*/\1/')"
-    expected_host="${webhook#https://}"; expected_host="${expected_host%%.*}"
-    if [[ "$worker_name" != "$expected_host" ]]; then
-      echo "WARN: wrangler.toml worker name '$worker_name' != webhook host '$expected_host'." >&2
-      echo "      Deploying anyway, but double-check the URL in deploy-$suffix.sh." >&2
-    fi
-
-    echo "==> [$env_name] wrangler deploy"
-    wrangler deploy
+  # Sanity: the branch's wrangler.toml worker name should match the URL host.
+  local worker_name expected_host
+  worker_name="$(grep -E '^name *= *"' wrangler.toml | head -1 | sed -E 's/^name *= *"([^"]+)".*/\1/')"
+  expected_host="${webhook#https://}"; expected_host="${expected_host%%.*}"
+  if [[ "$worker_name" != "$expected_host" ]]; then
+    echo "WARN: wrangler.toml worker name '$worker_name' != webhook host '$expected_host'." >&2
+    echo "      Deploying anyway, but double-check the URL in deploy-$suffix.sh." >&2
   fi
+
+  # 2. Deploy the worker.
+  echo "==> [$env_name] wrangler deploy"
+  wrangler deploy
 
   # 3. Build all CLIs with this environment's webhook + Pine study name
   #    baked in (build.rs → BAKED_WEBHOOK / BAKED_PINE_NAME).

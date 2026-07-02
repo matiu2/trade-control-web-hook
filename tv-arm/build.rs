@@ -26,11 +26,9 @@ fn main() {
     // binary (`tv-arm-staging`, `tv-arm-dev`, …) embeds its own
     // environment's URL as the TradingView alert destination
     // (`web_hook` in the tv-mcp JS template). A plain `cargo install` with
-    // no env set falls back to the local dev worker (dev is the native/Postgres
-    // worker on loopback now; only staging is on Cloudflare, and
-    // deploy-staging.sh sets TRADE_CONTROL_WEBHOOK explicitly).
+    // no env set falls back to the dev URL.
     let webhook = std::env::var("TRADE_CONTROL_WEBHOOK")
-        .unwrap_or_else(|_| "http://127.0.0.1:8787".to_string());
+        .unwrap_or_else(|_| "https://trade-control-web-hook.msherborne.workers.dev".to_string());
     println!("cargo:rustc-env=BAKED_WEBHOOK={webhook}");
     println!("cargo:rerun-if-env-changed=TRADE_CONTROL_WEBHOOK");
 

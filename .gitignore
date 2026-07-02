@@ -24,6 +24,3 @@ dell
 .claude/trade-calendar-maker
 TODO-bug015-ttl-and-purge.md
 TODO-track-D-candle-cache-wasm-kv.md
-
-# temp Cloudflare-dev R2 recovery tool + venv + object backups (2026-07)
-/cf-dev-export/
