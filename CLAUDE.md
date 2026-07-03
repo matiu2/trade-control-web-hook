@@ -252,25 +252,30 @@ Key facts a refactorer must preserve:
   `reversal_veto_plan()` helper (KV-free, unit-tested); the KV write
   is a thin wrapper.
 
-### Intrabar crosses fire on the wick (from the open side), not the close
+### Intrabar crosses fire on any straddle (high and low opposite sides), not the close
 
-**Updated 2026-07-01 (`engine` commit `f231629`).** This reverts the earlier
-"too-high is close-confirmed" rule. The engine's `level_crossed`
-(`engine/src/evaluate.rs`) **`BarEvent::Intrabar`** arm now reads the wick on
-the cross side, **close-agnostic**, discriminated by which side the bar *came
-from* (its `open`):
+**Updated 2026-07-03 (`engine`).** The `BarEvent::Intrabar` arm is now a **pure
+straddle**: the bar's high and low must sit on *opposite* sides of the level,
+with the directional wick reaching at/through the line. It is **both open- and
+close-agnostic** — this loosened the earlier "wick from the open side" rule
+(2026-07-01, `f231629`) by dropping the `open`-side guard. The engine's
+`level_crossed` (`engine/src/evaluate.rs`) arm:
 
-- `Up`     ⇒ `open <= level && high >= level`  (came from below, reached above)
-- `Down`   ⇒ `open >= level && low  <= level`  (came from above, reached below)
+- `Up`     ⇒ `high >= level + buffer`  (low ≤ level guaranteed by the straddle)
+- `Down`   ⇒ `low  <= level - buffer`  (high ≥ level guaranteed by the straddle)
 - `Either` ⇒ any straddle (`low <= level <= high`) — unchanged
 
-The intuition (operator's framing): on a tick timeline a bar that opened on one
-side of the level and traded through to the other **did** cross, even if it
-closed back on the original side. The old rule required a confirming **close**
-(`Up ⇒ c >= level`), which silently dropped a retest tap-and-bounce — the bug
-this fixed (AUD/JPY iH&S long 2026-06-29: a 6pm bar opened above the descending
-neckline, wicked below, closed back above → the retest didn't stamp for ~6h).
-See `[[intrabar_cross_reads_wick_not_close]]`.
+The intuition (operator's framing): on a tick timeline a bar whose *range* spans
+the level traded on both sides of it, which is enough to count as a touch/cross
+regardless of where it opened or closed. The previous rule additionally required
+the bar to have *opened* on the far side (`Up ⇒ open <= level`); a bar that
+opened on the near side, wicked through, and came back was rejected. The straddle
+rule fires it. (The even-older rule required a confirming **close** — that was
+already dropped 2026-07-01; the retest tap-and-bounce bug it fixed was AUD/JPY
+iH&S long 2026-06-29, a 6pm bar that wicked below the descending neckline and
+closed back above.) The directional `buffer` (`cross_buffer_pct`) still applies to
+the cross-side wick so a one-tick graze doesn't trip it. See
+`[[intrabar_cross_reads_wick_not_close]]`.
 
 **`BarEvent::OnClose` is unchanged** — `03-prep-break-and-close` still requires a
 genuine close through the line (open one side, **close** the other). Only the
@@ -289,8 +294,8 @@ required. Tests: `builds_hs_short_rules_with_correct_triggers` (asserts
 `OnClose`), `ihs_long_too_low_invalidation_stays_intrabar_wick` (asserts the
 mirror stays `Intrabar`).
 
-Consumers of the intrabar arm, all now wick-from-the-open-side (for a **short**;
-mirror for long):
+Consumers of the intrabar arm, all now pure-straddle (high/low opposite sides;
+for a **short**, mirror for long):
 
 - **`too-high` = invalidation** (drawing-bound horizontal at the shoulder cap).
   **Reverted to `OnClose` — see the exception above.** The short cap is

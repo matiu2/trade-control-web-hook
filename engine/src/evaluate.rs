@@ -1213,14 +1213,16 @@ fn level_crossed(
     let buffer = level * buffer_pct / 100.0;
     match bar {
         // Intrabar: the bar's range crosses the level *within the bar*, read
-        // from the wick on the cross side — NOT the close. On a tick timeline a
-        // bar that opened on one side of the level and traded through to the
-        // other genuinely crossed, even if it closed back on the original side
-        // (a retest tap, an invalidation spike-and-recover). Direction is the
-        // side the bar *came from* (its open) reaching *through* to the wick,
-        // and the wick must reach `buffer` past the line:
-        //   Down  ⇒ opened at/above and the low reached `level - buffer` or lower
-        //   Up    ⇒ opened at/below and the high reached `level + buffer` or higher
+        // from the wick — NOT the close, and (as of 2026-07-03) NOT the open
+        // either. The rule is now a pure straddle: the bar's high and low must
+        // sit on *opposite* sides of the line. On a tick timeline a bar whose
+        // range spans the level traded on both sides of it, which is enough to
+        // count as a touch/cross regardless of where it opened or closed (a
+        // retest tap, an invalidation spike-and-recover). The directional wick
+        // must still reach `buffer` past the line so a one-tick graze doesn't
+        // trip it:
+        //   Down  ⇒ low reached `level - buffer` or lower (high on/above by straddle)
+        //   Up    ⇒ high reached `level + buffer` or higher (low on/below by straddle)
         //   Either⇒ any straddle (the wick touched the level at all; buffer N/A)
         // (Close-confirmed crossing is `BarEvent::OnClose` — break-and-close —
         // which must open one side and *close* the other; that arm is below and
@@ -1232,8 +1234,8 @@ fn level_crossed(
             }
             match dir {
                 CrossDir::Either => true,
-                CrossDir::Up => candle.o <= level && candle.h >= level + buffer,
-                CrossDir::Down => candle.o >= level && candle.l <= level - buffer,
+                CrossDir::Up => candle.h >= level + buffer,
+                CrossDir::Down => candle.l <= level - buffer,
             }
         }
         // OnClose: a cross relative to the prior processed close. The seed bar
@@ -1622,11 +1624,11 @@ mod tests {
     }
 
     #[test]
-    fn intrabar_fires_when_bar_crosses_from_its_open_side() {
+    fn intrabar_fires_on_any_straddle_regardless_of_open() {
         // Intrabar direction is read from the wick on the cross side, NOT the
-        // close: an Up cross is "opened at/below the level and the high reached
-        // at/above it" — the bar came up *through* the level. Where it closes is
-        // irrelevant (that's `OnClose`, tested separately).
+        // close, and (as of 2026-07-03) NOT the open either: an Up cross is now
+        // "the bar's high and low sit on opposite sides of the level, and the
+        // high reached at/above it". Where it opened or closed is irrelevant.
         let t = Trigger::HorizontalCross {
             level: 1.2000,
             dir: CrossDir::Up,
@@ -1639,16 +1641,17 @@ mod tests {
             None
         ));
         // Opened below, high pushed above, then closed *back below* the level →
-        // still an up-cross (the wick crossed). The OLD close-confirmed rule
-        // wrongly rejected this; the new wick rule fires it.
+        // still an up-cross (the wick crossed). Close-agnostic.
         assert!(et(
             &t,
             &candle("2026-06-16T12:00:00Z", 1.19, 1.21, 1.19, 1.1950),
             None
         ));
-        // Opened *above* the level (came from above, didn't cross up into it) —
-        // its low dips below but that's a down-move, not an up-cross → no fire.
-        assert!(!et(
+        // Opened *above* the level, high on/above, low dips below → the high/low
+        // straddle the line so this now FIRES too (the previous open-side rule
+        // rejected it; the permissive straddle rule accepts any straddle whose
+        // high reached the level).
+        assert!(et(
             &t,
             &candle("2026-06-16T12:00:00Z", 1.21, 1.21, 1.19, 1.1950),
             None
@@ -1661,25 +1664,28 @@ mod tests {
         ));
     }
 
-    /// The mirror: a Down intrabar cross is "opened at/above the level and the
-    /// low reached at/below it", close-agnostic — the AUD/JPY 6pm retest shape.
+    /// The mirror: a Down intrabar cross now fires on any straddle whose low
+    /// reached at/below the level, open- and close-agnostic — the AUD/JPY 6pm
+    /// retest shape and, since 2026-07-03, any straddle regardless of open.
     #[test]
-    fn intrabar_down_fires_on_open_above_low_below_regardless_of_close() {
+    fn intrabar_down_fires_on_any_straddle_regardless_of_open() {
         let t = Trigger::HorizontalCross {
             level: 1.2000,
             dir: CrossDir::Down,
             bar: BarEvent::Intrabar,
         };
         // Opened above, low dipped below, closed back above → down fires (the
-        // wick crossed). This is the bug the fix targets.
+        // wick crossed).
         assert!(et(
             &t,
             &candle("2026-06-16T12:00:00Z", 1.21, 1.21, 1.19, 1.2050),
             None
         ));
-        // Opened *below* the level (came from below) — high pokes above but
-        // that's an up-move, not a down-cross → no fire.
-        assert!(!et(
+        // Opened *below* the level, low on/below, high pokes above → the high/low
+        // straddle so this now FIRES too (the previous open-side rule rejected
+        // it; the permissive straddle rule accepts any straddle whose low
+        // reached the level).
+        assert!(et(
             &t,
             &candle("2026-06-16T12:00:00Z", 1.19, 1.21, 1.19, 1.2050),
             None
@@ -1689,9 +1695,9 @@ mod tests {
     /// The cross-depth buffer rejects a graze: with `buffer_pct = 0.1` the wick
     /// must pierce `level * 0.1% = 1.2 * 0.001 = 0.0012` past the line. A down
     /// graze to 1.1995 (only 0.0005 below) does NOT fire; a dip to 1.1980
-    /// (0.0020 below, past the 1.1988 buffered level) does. The open is above
-    /// the line in both, so the came-from-above guard is satisfied either way —
-    /// the buffer is the discriminator.
+    /// (0.0020 below, past the 1.1988 buffered level) does. Both straddle the
+    /// line (high on/above, low below), so the straddle rule is satisfied either
+    /// way — the buffer depth on the low is the discriminator.
     #[test]
     fn intrabar_down_buffer_rejects_a_graze_admits_a_real_cross() {
         let t = Trigger::HorizontalCross {
@@ -2532,7 +2538,8 @@ mod tests {
     /// stamp here. The old close-confirmed Intrabar rule (`Down ⇒ close ≤ level`)
     /// rejected it because the close sat above, starving the entry for ~6h until
     /// a bar finally *closed* below the line (30 Jun 00:00Z). The fix reads the
-    /// wick on the cross side: `Down ⇒ open ≥ level && low ≤ level`.
+    /// wick, not the close: `Down ⇒ low ≤ level` (a straddle; open-agnostic as
+    /// of 2026-07-03 — here the bar happens to open above too).
     #[test]
     fn intrabar_down_retest_fires_on_wick_not_close() {
         // Descending neckline interpolated to ~111.519 at the 6pm bar (matches

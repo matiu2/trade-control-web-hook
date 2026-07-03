@@ -1,5 +1,46 @@
 # Changelog
 
+## Unreleased — 2026-07-03 — intrabar cross is a pure straddle (high/low opposite sides)
+
+**Why.** The retest (and every other intrabar cross) required the bar to have
+*opened* on the far side of the line and wicked through — "came from the open
+side". The operator wants the retest more permissive: a bar counts as crossing
+the neckline whenever its **high and low sit on opposite sides** of the line,
+regardless of where it opened or closed. A bar that opens on the near side, dips
+through, and comes back is a genuine touch on a tick timeline.
+
+**What changed.** `level_crossed`'s `BarEvent::Intrabar` arm
+(`engine/src/evaluate.rs`) dropped the `open`-side guard:
+- `Up`   was `open <= level && high >= level + buffer` → now `high >= level + buffer`
+- `Down` was `open >= level && low  <= level - buffer` → now `low  <= level - buffer`
+
+The `straddles` precondition (`low <= level <= high`) is unchanged and now carries
+the "opposite sides" requirement on its own; the directional wick + `buffer`
+(`cross_buffer_pct`) still gate a one-tick graze. `Either` and `OnClose` arms
+untouched — **break-and-close still requires a genuine close through the line**.
+
+**Behaviour.** Strictly *more* firings: any bar that used to fire still fires
+(open-side bars straddle too), plus bars that opened on the near side and wicked
+through now fire. Affects the retest (`04-prep-retest`), the `too-low`
+invalidation floor, the computed-fib pcl levels, and M/W cancel/overshoot vetos —
+every consumer of the intrabar arm. The literal `too-high` cap is `OnClose`
+(close-confirmed) and is unaffected.
+
+**Breaking.** None — pure engine decision, no signed field or API change.
+
+**Shared.** The rule lives in the shared `engine` crate (`level_crossed`), the
+single source of truth for both the live worker's engine tick and the offline
+`replay-candles` simulator (both route through `evaluate_plan`/`eval_trigger`) —
+one edit, no replayer/worker drift.
+
+**Tests.** Renamed + flipped the two open-side intrabar tests to assert
+any-straddle-fires (`intrabar_fires_on_any_straddle_regardless_of_open`,
+`intrabar_down_fires_on_any_straddle_regardless_of_open`); buffer + real-data
+AUD/JPY retest tests unchanged (their bars open on the far side anyway). engine 98
+green.
+
+**Follow-up.** None.
+
 ## Unreleased — 2026-07-03 — SL-spread salvage widens to exactly 10× (was 11×)
 
 **Why.** The SL-vs-spread salvage widened a too-tight stop to `11 × spread` — a
