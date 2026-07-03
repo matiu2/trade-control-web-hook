@@ -1,5 +1,45 @@
 # Changelog
 
+## Unreleased — 2026-07-04 — retest no longer gated behind an in-window break-and-close
+
+**Why.** A `--skip-break-and-close` plan (the operator armed *on* the retest,
+after the neckline break already happened) carries no `03-prep-break-and-close`
+rule, so `break_close_at` was never stamped. `stamp_retest` short-circuited on
+`break_close_at == None` and `retest_satisfied` returned false — so the retest
+(hence the entry) could **never** fire, regardless of price action. Silently
+forfeited a would-be winner on NZD/SGD `ihs-nzd-sgd-7b24d14c` (2026-06-30 iH&S
+long: the retest tapped the neckline at 17:00 but never stamped; price later ran
+through TP).
+
+**What changed.** A plan with **no** break-and-close rule is treated as
+break-already-satisfied by construction. New `effective_break_at(plan, state,
+window)` in the shared engine returns:
+- the stamped `break_close_at` when present (unchanged);
+- for a no-break-rule plan, a floor one second before the window's first candle,
+  so every in-window bar is eligible to stamp the retest (and the first bar
+  counts as `N=1` in the tolerance decay);
+- `None` (retest stays gated) when a break rule is present but hasn't fired —
+  the break genuinely mustn't be assumed.
+
+`stamp_retest` and `retest_satisfied` both key off this. Since it lives in the
+engine, the worker (wasm) and offline `replay-candles` pick it up identically —
+no drift.
+
+**Scope (deliberate).** This fixes only the *no-break-rule* case
+(`--skip-break-and-close`). A modern-spine plan that *has* the break rule but is
+replayed/armed **after** its break bar stays gated by design — the remedy there
+is to re-arm with `--skip-break-and-close`. (Operator decision.)
+
+**Breaking.** `retest_satisfied` now takes `&TradePlan` as its first argument
+(engine-internal).
+
+**Tests.** `skip_break_and_close_plan_stamps_retest_and_enters` (retest + enter
+fire with `break_close_at` never stamped),
+`break_rule_present_but_unfired_keeps_retest_gated` (the negative guard).
+Verified end-to-end on the NZD/SGD replay: the retest now stamps and the entry
+gate opens; a synthesised modern-spine variant still stamps break-before-retest
+in order.
+
 ## Unreleased — 2026-07-04 — replay-candles `--start`/`--end` accept Brisbane + explicit offsets
 
 **Why.** `replay-candles` renders every candle/fill/exit in Brisbane time

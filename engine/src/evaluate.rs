@@ -662,7 +662,7 @@ fn evaluate_one_entry(
     } else {
         plan.rules.iter().any(is_retest)
     };
-    if requires_retest && !retest_satisfied(state, candle.time) {
+    if requires_retest && !retest_satisfied(plan, state, candle.time) {
         return;
     }
     push_fire_signal(rule, candle, signal, fired);
@@ -1047,9 +1047,52 @@ fn entry_recover_entry(
     }
 }
 
+/// Whether the plan carries a `03-prep-break-and-close` rule at all. A
+/// `--skip-break-and-close` arm (the operator armed on the retest, after the
+/// break already happened) omits it, in which case the break is pre-satisfied
+/// by construction and the retest gate must not stay wedged shut.
+fn has_break_and_close(plan: &TradePlan) -> bool {
+    plan.rules.iter().any(is_break_and_close)
+}
+
+/// The lookback start the retest is measured from — the "break-and-close" edge.
+///
+/// - If a break-and-close was stamped this pass, that's the edge.
+/// - If the plan carries **no** break-and-close rule (`--skip-break-and-close`),
+///   the break happened before the arm by construction, so the edge sits *just
+///   before* the window start — every in-window candle is then eligible to stamp
+///   the retest (the caller's `candle.time <= break_at` guard is exclusive, so
+///   the floor must be strictly before the first candle, not equal to it), and
+///   the first candle counts as bar N=1 in the tolerance decay (tolerance 0,
+///   must reach the line).
+/// - If the plan **has** a break rule that simply hasn't fired yet, the gate
+///   stays closed (`None`) — the retest genuinely mustn't precede the break.
+///
+/// Returns `None` (retest stays gated) when there's a break rule and no stamp,
+/// or when the window is empty (nothing to anchor the floor to).
+fn effective_break_at(
+    plan: &TradePlan,
+    state: &PlanState,
+    window: &[Candle],
+) -> Option<DateTime<Utc>> {
+    match state.break_close_at {
+        Some(t) => Some(t),
+        None if has_break_and_close(plan) => None,
+        // One second before the earliest candle: strictly-less-than every real
+        // bar (bars are ≥ 1 minute apart), so the caller's exclusive
+        // `candle.time <= break_at` guard admits the first candle onward.
+        None => window
+            .first()
+            .map(|c| c.time - chrono::Duration::seconds(1)),
+    }
+}
+
 /// Stamp `retest_seen_at` if this candle satisfies the retest trendline
 /// geometry and falls after the break-and-close. No-op if there's no retest
-/// rule or no break-and-close has fired yet.
+/// rule, or the break-and-close is still pending (a plan carrying a break rule
+/// whose bar hasn't fired). A `--skip-break-and-close` plan (no break rule)
+/// treats the break as pre-satisfied from the window start — see
+/// [`effective_break_at`].
 fn stamp_retest(
     plan: &TradePlan,
     state: &mut PlanState,
@@ -1057,7 +1100,7 @@ fn stamp_retest(
     window: &[Candle],
     fired: &mut Vec<FiredIntent>,
 ) {
-    let Some(break_at) = state.break_close_at else {
+    let Some(break_at) = effective_break_at(plan, state, window) else {
         return;
     };
     if candle.time <= break_at {
@@ -1190,9 +1233,20 @@ fn retest_crossed(
 }
 
 /// Is a retest seen within `(break_close_at, entry]`?
-fn retest_satisfied(state: &PlanState, entry_time: DateTime<Utc>) -> bool {
+///
+/// For a plan carrying a break-and-close rule this is unchanged: a retest counts
+/// only when it falls strictly after the stamped break and at/before the entry.
+/// For a `--skip-break-and-close` plan (no break rule, so `break_close_at` is
+/// never stamped) the break is pre-satisfied by construction, so any retest seen
+/// at/before the entry counts — mirroring [`effective_break_at`], which lets
+/// `stamp_retest` stamp it in the first place.
+fn retest_satisfied(plan: &TradePlan, state: &PlanState, entry_time: DateTime<Utc>) -> bool {
     match (state.break_close_at, state.retest_seen_at) {
         (Some(break_at), Some(seen)) => seen > break_at && seen <= entry_time,
+        // No break stamped: only valid when the plan omits the break rule
+        // (--skip-break-and-close). A break rule present-but-unfired keeps the
+        // gate shut.
+        (None, Some(seen)) => !has_break_and_close(plan) && seen <= entry_time,
         _ => false,
     }
 }
@@ -2332,6 +2386,108 @@ mod tests {
         );
         assert_eq!(eval.fired.len(), 1);
         assert_eq!(eval.fired[0].rule_id, "03-prep-break-and-close");
+    }
+
+    /// A `--skip-break-and-close` H&S plan: the operator armed on the retest,
+    /// after the neckline break already happened, so the plan carries **no**
+    /// `03-prep-break-and-close` rule — only the retest prep and the enter. By
+    /// construction the break is pre-satisfied. Same neckline flat at 1.2000.
+    fn skip_break_hs_plan() -> TradePlan {
+        let neckline = |dir, bar| Trigger::TrendlineCross {
+            a: LinePoint {
+                at_epoch: ts("2026-06-16T00:00:00Z").timestamp(),
+                price: 1.2000,
+            },
+            b: LinePoint {
+                at_epoch: ts("2026-06-16T01:00:00Z").timestamp(),
+                price: 1.2000,
+            },
+            extend_forward: true,
+            bar_seconds: 3600,
+            dir,
+            bar,
+        };
+        plan(vec![
+            // No break-and-close rule — the break happened before the arm.
+            rule(
+                "04-prep-retest",
+                neckline(CrossDir::Up, BarEvent::Intrabar),
+                FireMode::Once,
+                Action::Prep,
+            ),
+            rule(
+                "05-enter",
+                Trigger::MwEveryBar,
+                FireMode::Once,
+                Action::Enter,
+            ),
+        ])
+    }
+
+    #[test]
+    fn skip_break_and_close_plan_stamps_retest_and_enters() {
+        // Regression for "retest gated behind an in-window break-and-close"
+        // (NZD/SGD ihs-nzd-sgd-7b24d14c, 2026-07-04): a plan armed *after* its
+        // break-and-close omits the `03-prep-break-and-close` rule, so
+        // `break_close_at` is never stamped. Before the fix `stamp_retest`
+        // short-circuited on `break_close_at == None` and the retest — hence the
+        // enter — could never fire. A plan with no break rule is by construction
+        // one where the break already happened, so the retest gate opens from the
+        // window start.
+        let p = skip_break_hs_plan();
+        // No break rule → initial phase is AwaitEntry directly.
+        assert_eq!(initial_phase(&p), Phase::AwaitEntry);
+        let prior = seed_at(Phase::AwaitEntry, "2026-06-16T09:00:00Z");
+
+        // Bar 1 (10:00): a straddle bar (low below, high above the neckline) with
+        // the retest's Up wick reaching through → retest stamps and, the gate now
+        // satisfied, the single-shot enter fires the same bar. break_close_at
+        // stays None the whole time (there's no break rule to stamp it).
+        let c1 = candle("2026-06-16T10:00:00Z", 1.19, 1.205, 1.19, 1.2010);
+        let eval = run(&p, &prior, &[c1]);
+        let fired: Vec<&str> = eval.fired.iter().map(|f| f.rule_id.as_str()).collect();
+        assert!(
+            fired.contains(&"04-prep-retest"),
+            "retest prep fires without any break-and-close: {fired:?}"
+        );
+        assert!(
+            fired.contains(&"05-enter"),
+            "enter fires once the retest is seen: {fired:?}"
+        );
+        assert_eq!(
+            eval.new_state.break_close_at, None,
+            "no break rule ⇒ break_close_at never stamped, yet the retest opened"
+        );
+        assert_eq!(
+            eval.new_state.retest_seen_at,
+            Some(ts("2026-06-16T10:00:00Z"))
+        );
+    }
+
+    #[test]
+    fn break_rule_present_but_unfired_keeps_retest_gated() {
+        // The mirror of the skip-plan fix: a plan that DOES carry a
+        // `03-prep-break-and-close` rule must NOT treat the break as
+        // pre-satisfied. If we're in AwaitEntry (e.g. seeded there) with the
+        // break rule present but `break_close_at` still None, the retest stays
+        // gated — the break genuinely hasn't happened. (A real single-enter H&S
+        // plan starts in AwaitBreakAndClose so it can't reach here, but the
+        // guard must hold regardless of how the state was constructed.)
+        let p = hs_plan();
+        assert!(has_break_and_close(&p));
+        let prior = seed_at(Phase::AwaitEntry, "2026-06-16T09:00:00Z");
+        // A clean straddle bar that WOULD stamp the retest if the gate were open.
+        let c1 = candle("2026-06-16T10:00:00Z", 1.19, 1.205, 1.19, 1.2010);
+        let eval = run(&p, &prior, &[c1]);
+        assert!(
+            eval.new_state.retest_seen_at.is_none(),
+            "break rule present + unfired ⇒ retest must stay gated"
+        );
+        let fired: Vec<&str> = eval.fired.iter().map(|f| f.rule_id.as_str()).collect();
+        assert!(
+            !fired.contains(&"04-prep-retest") && !fired.contains(&"05-enter"),
+            "neither retest nor enter fires while the break is pending: {fired:?}"
+        );
     }
 
     // ===== strategy-v2: two enters in one plan =====
