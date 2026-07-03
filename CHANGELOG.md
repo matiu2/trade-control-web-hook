@@ -1,5 +1,30 @@
 # Changelog
 
+## Unreleased — 2026-07-04 — replay-candles `--start`/`--end` accept Brisbane + explicit offsets
+
+**Why.** `replay-candles` renders every candle/fill/exit in Brisbane time
+(UTC+10), and the operator works in Brisbane, but the `--start`/`--end` window
+flags parsed a bare datetime as **UTC** — so the input read differently from the
+output, and passing a timezone (`...+10:00`) failed outright with "is not a valid
+UTC datetime".
+
+**What changed.** `parse_start_end` (was `parse_utc`):
+
+- A **bare** datetime (no offset) is now interpreted as **Brisbane (UTC+10, no
+  DST)** — matching the tool's own output zone. `--start 2026-06-30T17:00` is
+  17:00 Brisbane = 07:00 UTC.
+- An **explicit offset or `Z`** is honoured as written: `...T07:00Z` = UTC,
+  `...T17:00+10:00` = Brisbane spelled out, any offset respected. Both minute and
+  second precision accepted on every form (RFC3339's mandatory-seconds gap is
+  covered by a `%z` fallback + trailing-`Z` normalisation).
+
+**Breaking.** None on the wire; a script that relied on bare `--start`/`--end`
+being **UTC** now shifts 10h earlier — append `Z` to keep the old UTC reading.
+
+**Tests.** `bare_datetime_is_brisbane_minute_and_second_precision`,
+`explicit_offset_is_honoured` (Z / +10:00 / +02:00), `rejects_garbage_datetime`;
+two window-resolution tests pinned to `...Z` to stay zone-independent.
+
 ## Unreleased — 2026-07-03 — time-decaying retest tolerance
 
 **Why.** The retest required the wick to *reach* the neckline on every bar. The

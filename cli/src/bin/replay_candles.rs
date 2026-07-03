@@ -56,7 +56,7 @@ mod replay_candles {
 use std::fs;
 use std::path::PathBuf;
 
-use chrono::{DateTime, Duration, NaiveDateTime, TimeZone, Utc};
+use chrono::{DateTime, Duration, FixedOffset, NaiveDateTime, TimeZone, Utc};
 use clap::{CommandFactory, Parser};
 use clap_complete::{Shell, generate};
 use color_eyre::eyre::{Context, Result, eyre};
@@ -101,13 +101,16 @@ struct Args {
     #[arg(long, value_enum, default_value_t = CandleSource::TradeNation)]
     source: CandleSource,
 
-    /// Window start, UTC (e.g. `2026-06-18T11:00` or `2026-06-18T11:00:00`).
+    /// Window start. A bare datetime is Brisbane time (UTC+10, no DST) — the
+    /// zone this tool renders every candle/fill in — e.g. `2026-06-30T17:00`.
+    /// An explicit offset or `Z` is honoured (`...T07:00Z`, `...T17:00+10:00`).
     /// Overrides the chart's last-shown-candle (replay cursor). Omit to read it
     /// from the TradingView chart.
     #[arg(long)]
     start: Option<String>,
 
-    /// Window end, UTC. Overrides the plan's trade-expiry. Omit to use the
+    /// Window end. Same time format as `--start` (bare = Brisbane, explicit
+    /// offset/`Z` honoured). Overrides the plan's trade-expiry. Omit to use the
     /// plan's trade-expiry (or, if it has none, the chart's visible-region end).
     #[arg(long)]
     end: Option<String>,
@@ -505,7 +508,7 @@ fn resolve_window(args: &Args, plan: &TradePlan) -> Result<ResolvedWindow> {
         .or_else(|| tv.as_ref().map(|d: &TvDefaults| d.instrument.clone()));
 
     let start = match (&args.start, plan_start, &tv) {
-        (Some(s), _, _) => parse_utc(s).wrap_err("parse --start")?,
+        (Some(s), _, _) => parse_start_end(s).wrap_err("parse --start")?,
         (None, Some(baked), _) => baked,
         (None, None, Some(d)) => d.start,
         (None, None, None) => {
@@ -516,7 +519,7 @@ fn resolve_window(args: &Args, plan: &TradePlan) -> Result<ResolvedWindow> {
     };
 
     let end = match (&args.end, plan_expiry, &tv) {
-        (Some(e), _, _) => parse_utc(e).wrap_err("parse --end")?,
+        (Some(e), _, _) => parse_start_end(e).wrap_err("parse --end")?,
         (None, Some(expiry), _) => expiry,
         (None, None, Some(d)) => d.fallback_end,
         (None, None, None) => {
@@ -554,18 +557,49 @@ fn load_plan(path: &PathBuf) -> Result<TradePlan> {
     serde_json::from_str(&text).wrap_err_with(|| format!("parse plan JSON {}", path.display()))
 }
 
-/// Parse a naive datetime string as UTC. Accepts both minute and second
-/// precision (`...T11:00` and `...T11:00:00`).
-fn parse_utc(s: &str) -> Result<DateTime<Utc>> {
+/// Parse a `--start` / `--end` datetime. A **bare** datetime (no offset) is
+/// interpreted as **Brisbane time (UTC+10, no DST)** — the operator's zone and
+/// the zone this tool renders every candle/fill/exit in, so the window flags
+/// read the same way as the report. An **explicit** offset or `Z` is honoured
+/// as written (e.g. `...T07:00Z` = UTC, `...T17:00+10:00` = Brisbane spelled
+/// out). Accepts both minute and second precision on the bare form
+/// (`...T17:00` and `...T17:00:00`).
+fn parse_start_end(s: &str) -> Result<DateTime<Utc>> {
+    // Explicit offset / Z wins — honour exactly what was written. `parse_from_rfc3339`
+    // requires seconds + a `Z`/offset; the `%z` forms below also accept an offset
+    // with minute-only precision (`...T17:00+10:00`), which RFC3339 rejects.
+    if let Ok(dt) = DateTime::parse_from_rfc3339(s) {
+        return Ok(dt.with_timezone(&Utc));
+    }
+    // Normalise a trailing `Z` to `+0000` so the `%z` parser accepts minute- and
+    // second-precision UTC (`...T07:00Z`), which RFC3339 rejects without seconds.
+    let normalised = s.strip_suffix('Z').map(|body| format!("{body}+0000"));
+    let candidate = normalised.as_deref().unwrap_or(s);
+    for fmt in ["%Y-%m-%dT%H:%M:%S%z", "%Y-%m-%dT%H:%M%z"] {
+        if let Ok(dt) = DateTime::parse_from_str(candidate, fmt) {
+            return Ok(dt.with_timezone(&Utc));
+        }
+    }
+    // Bare datetime (no offset) → interpret in Brisbane (+10), convert to UTC.
+    let brisbane = FixedOffset::east_opt(BRISBANE_OFFSET_SECS)
+        .ok_or_else(|| eyre!("10h is a valid fixed offset"))?;
     for fmt in ["%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M"] {
         if let Ok(naive) = NaiveDateTime::parse_from_str(s, fmt) {
-            return Ok(Utc.from_utc_datetime(&naive));
+            return brisbane
+                .from_local_datetime(&naive)
+                .single()
+                .map(|dt| dt.with_timezone(&Utc))
+                .ok_or_else(|| eyre!("{s:?} is ambiguous in Brisbane time"));
         }
     }
     Err(eyre!(
-        "{s:?} is not a valid UTC datetime (expected YYYY-MM-DDTHH:MM[:SS])"
+        "{s:?} is not a valid datetime (expected Brisbane YYYY-MM-DDTHH:MM[:SS], \
+         or an explicit offset like ...T07:00Z / ...T17:00+10:00)"
     ))
 }
+
+/// Brisbane's fixed UTC offset in seconds (+10:00, no DST).
+const BRISBANE_OFFSET_SECS: i32 = 10 * 3600;
 
 /// Emit the clap-generated zsh completion script. Binds the completion to the
 /// invoked binary name (argv[0] stem) so a renamed-on-install copy emits
@@ -600,16 +634,37 @@ mod tests {
     use trade_control_engine::Granularity;
 
     #[test]
-    fn parses_minute_and_second_precision() {
-        let a = parse_utc("2026-06-18T11:00").unwrap();
-        let b = parse_utc("2026-06-18T11:00:00").unwrap();
+    fn bare_datetime_is_brisbane_minute_and_second_precision() {
+        // A bare (offset-less) datetime is Brisbane (+10). 17:00 Brisbane is
+        // 07:00 UTC. Minute and second precision agree.
+        let a = parse_start_end("2026-06-30T17:00").unwrap();
+        let b = parse_start_end("2026-06-30T17:00:00").unwrap();
         assert_eq!(a, b);
-        assert_eq!(a, Utc.with_ymd_and_hms(2026, 6, 18, 11, 0, 0).unwrap());
+        assert_eq!(a, Utc.with_ymd_and_hms(2026, 6, 30, 7, 0, 0).unwrap());
+    }
+
+    #[test]
+    fn explicit_offset_is_honoured() {
+        // `+10:00` spelled out == the bare Brisbane reading.
+        assert_eq!(
+            parse_start_end("2026-06-30T17:00+10:00").unwrap(),
+            parse_start_end("2026-06-30T17:00").unwrap(),
+        );
+        // `Z` is UTC, not Brisbane.
+        assert_eq!(
+            parse_start_end("2026-06-30T07:00Z").unwrap(),
+            Utc.with_ymd_and_hms(2026, 6, 30, 7, 0, 0).unwrap(),
+        );
+        // An arbitrary offset is respected: 09:00+02:00 == 07:00 UTC.
+        assert_eq!(
+            parse_start_end("2026-06-30T09:00:00+02:00").unwrap(),
+            Utc.with_ymd_and_hms(2026, 6, 30, 7, 0, 0).unwrap(),
+        );
     }
 
     #[test]
     fn rejects_garbage_datetime() {
-        assert!(parse_utc("yesterday").is_err());
+        assert!(parse_start_end("yesterday").is_err());
     }
 
     /// Build a minimal `TradePlan` from JSON, with the given rules spliced in.
@@ -711,7 +766,7 @@ mod tests {
         plan.replay_start = Some(1_781_208_000); // 2026-06-11 20:00 UTC
         let mut args = base_args();
         args.instrument = Some("EUR_USD".into());
-        args.end = Some("2026-06-21T22:00:00".into());
+        args.end = Some("2026-06-21T22:00:00Z".into());
         let w = resolve_window(&args, &plan).expect("resolve");
         assert_eq!(w.start, Utc.timestamp_opt(1_781_208_000, 0).unwrap());
         assert_eq!(w.end, Utc.with_ymd_and_hms(2026, 6, 21, 22, 0, 0).unwrap());
@@ -724,8 +779,8 @@ mod tests {
         plan.replay_start = Some(1_781_208_000);
         let mut args = base_args();
         args.instrument = Some("EUR_USD".into());
-        args.end = Some("2026-06-21T22:00:00".into());
-        args.start = Some("2026-06-12T00:00:00".into());
+        args.end = Some("2026-06-21T22:00:00Z".into());
+        args.start = Some("2026-06-12T00:00:00Z".into());
         let w = resolve_window(&args, &plan).expect("resolve");
         assert_eq!(w.start, Utc.with_ymd_and_hms(2026, 6, 12, 0, 0, 0).unwrap());
     }
