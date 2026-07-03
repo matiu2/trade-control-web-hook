@@ -281,6 +281,20 @@ the cross-side wick so a one-tick graze doesn't trip it. See
 genuine close through the line (open one side, **close** the other). Only the
 intrabar arm moved.
 
+**Retest closeness decays over time (2026-07-03).** The `04-prep-retest` cross
+(only the retest, not other intrabar consumers) carries a **near-side tolerance
+that grows with bars since the break-and-close**: `tolerance(N) = (N-1) ×
+plan.retest_atr_step × ATR`, where `N` counts bars after `break_close_at` (first
+= 1 → tolerance 0, must reach the line) and `ATR` is the Wilder ATR over the
+detector window. A wick that comes *within* the tolerance of the line stamps the
+retest even without reaching it. Lives in `stamp_retest` → `retest_tolerance` +
+`retest_crossed` (`engine/src/evaluate.rs`); the signed field is
+`TradePlan.retest_atr_step` (default `DEFAULT_RETEST_ATR_STEP = 0.075`, tv-arm
+`--retest-atr-step`). ATR **hard-fails** if absent — structurally unreachable by
+the retest phase (window is warm past `atr_length_for(granularity)`), so a `None`
+means a mis-sized window, surfaced not swallowed. This *loosens*; the separate
+`cross_buffer_pct` *tightens* and still governs the non-retest crosses.
+
 **Exception — the literal `too-high` cap reverted to close-confirm (2026-07-01).**
 The engine semantics above are unchanged; what changed is which `BarEvent` the
 short-side invalidation cap is *built* with. `invalidation_or_pcl_trigger`

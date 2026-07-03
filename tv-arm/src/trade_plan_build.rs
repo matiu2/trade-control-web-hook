@@ -73,10 +73,16 @@ pub fn resolution_to_granularity(resolution: &str) -> Option<Granularity> {
 ///   window without reading the TV chart's replay cursor. `None` when `--start`
 ///   wasn't passed (see
 ///   [`TradePlan::replay_start`](trade_control_core::trade_plan::TradePlan::replay_start)).
-// Nine parameters: each is a distinct chart-derived primitive (id, instrument,
-// alerts, direction, roles, granularity, is_mw, shadow, replay_start) threaded
-// once from the single pipeline call site. Grouping them into a struct would
-// just move the same fields elsewhere without clarifying anything.
+// - `retest_atr_step` is the per-bar ATR-multiple decay of the retest tolerance
+//   (`tv-arm --retest-atr-step`, default
+//   [`DEFAULT_RETEST_ATR_STEP`](trade_control_core::trade_plan::DEFAULT_RETEST_ATR_STEP)),
+//   baked onto the plan's `retest_atr_step`.
+//
+// Ten parameters: each is a distinct chart-derived primitive (id, instrument,
+// alerts, direction, roles, granularity, is_mw, shadow, replay_start,
+// retest_atr_step) threaded once from the single pipeline call site. Grouping
+// them into a struct would just move the same fields elsewhere without
+// clarifying anything.
 #[allow(clippy::too_many_arguments)]
 pub fn build_trade_plan(
     trade_id: &str,
@@ -88,6 +94,7 @@ pub fn build_trade_plan(
     is_mw: bool,
     shadow: bool,
     replay_start: Option<i64>,
+    retest_atr_step: f64,
 ) -> TradePlan {
     let rules = alerts
         .iter()
@@ -103,6 +110,7 @@ pub fn build_trade_plan(
         rules,
         shadow,
         cross_buffer_pct: trade_control_core::trade_plan::DEFAULT_CROSS_BUFFER_PCT,
+        retest_atr_step,
         replay_start,
     }
 }
@@ -655,6 +663,7 @@ mod tests {
             false,
             false,
             None,
+            trade_control_core::trade_plan::DEFAULT_RETEST_ATR_STEP,
         );
 
         assert!(!plan.shadow, "default build is live, not shadow");
@@ -751,6 +760,7 @@ mod tests {
             false,
             false,
             None,
+            trade_control_core::trade_plan::DEFAULT_RETEST_ATR_STEP,
         );
 
         let by_id = |id: &str| plan.rules.iter().find(|r| r.rule_id == id).unwrap();
@@ -797,6 +807,7 @@ mod tests {
             false,
             false,
             None,
+            trade_control_core::trade_plan::DEFAULT_RETEST_ATR_STEP,
         );
 
         // This is exactly what `register_trade_plan` writes for `--plan-out`.
@@ -862,6 +873,7 @@ mod tests {
             true,
             false,
             None,
+            trade_control_core::trade_plan::DEFAULT_RETEST_ATR_STEP,
         );
         let by_id = |id: &str| plan.rules.iter().find(|r| r.rule_id == id).unwrap();
 
@@ -908,6 +920,7 @@ mod tests {
             false,
             false,
             None,
+            trade_control_core::trade_plan::DEFAULT_RETEST_ATR_STEP,
         );
         assert!(plan.rules.is_empty());
     }
@@ -927,8 +940,50 @@ mod tests {
             true,
             true,
             None,
+            trade_control_core::trade_plan::DEFAULT_RETEST_ATR_STEP,
         );
         assert!(plan.shadow, "shadow=true must reach the built plan");
+    }
+
+    #[test]
+    fn retest_atr_step_carried_onto_plan() {
+        let alerts = vec![alert("05-enter", Action::Enter)];
+        // A custom step threads through to the signed plan field.
+        let custom = build_trade_plan(
+            "t",
+            "EUR_USD",
+            &alerts,
+            ConvDirection::Short,
+            &Roles::default(),
+            Granularity::H1,
+            false,
+            false,
+            None,
+            0.2,
+        );
+        assert!(
+            (custom.retest_atr_step - 0.2).abs() < 1e-9,
+            "--retest-atr-step value must reach the built plan, got {}",
+            custom.retest_atr_step
+        );
+        // The pipeline passes the default const when the flag is absent.
+        let defaulted = build_trade_plan(
+            "t",
+            "EUR_USD",
+            &alerts,
+            ConvDirection::Short,
+            &Roles::default(),
+            Granularity::H1,
+            false,
+            false,
+            None,
+            trade_control_core::trade_plan::DEFAULT_RETEST_ATR_STEP,
+        );
+        assert!(
+            (defaulted.retest_atr_step - 0.075).abs() < 1e-9,
+            "default step is 0.075, got {}",
+            defaulted.retest_atr_step
+        );
     }
 
     // ===== append_control_rules =====
@@ -1005,6 +1060,7 @@ mod tests {
             false,
             false,
             None,
+            trade_control_core::trade_plan::DEFAULT_RETEST_ATR_STEP,
         );
         assert_eq!(plan.rules.len(), 1, "just the enter before appending");
 

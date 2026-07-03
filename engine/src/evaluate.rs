@@ -64,7 +64,9 @@ use trade_control_core::broker::Candle;
 use trade_control_core::intent::{Action, Direction, SignalKind};
 use trade_control_core::plan_eval::{FiredIntent, PlanEval};
 use trade_control_core::plan_state::{Phase, PlanState};
-use trade_control_core::signals::{DetectorConfig, LatchedSignal, latched_signal_at};
+use trade_control_core::signals::{
+    DetectorConfig, LatchedSignal, atr_length_for, latched_signal_at, wilder_atr,
+};
 use trade_control_core::trade_plan::{
     BarEvent, ConditionRule, CrossDir, LinePoint, TradePlan, Trigger,
 };
@@ -1064,17 +1066,23 @@ fn stamp_retest(
     let Some(rule) = plan.rules.iter().find(|r| is_retest(r)) else {
         return;
     };
+    // Time-decaying closeness tolerance: the first bar after the break must
+    // reach the neckline; each later bar loosens by `retest_atr_step × ATR` of
+    // near-side slack (see `TradePlan::retest_atr_step`). `N` counts bars in the
+    // window strictly after the break, up to & including this one (first = 1).
+    let tol = retest_tolerance(plan, break_at, candle, window);
     // Only stamp once: the retest is a milestone the trade passes a single
     // time. Without this latch a later re-cross would re-stamp `retest_seen_at`
     // and re-emit the prep fire every bar (the break-and-close analogue of the
     // strategy-v2 starvation bug).
     if state.retest_seen_at.is_none()
-        && eval_trigger(
+        && retest_crossed(
             &rule.trigger,
             candle,
             state.last_close.get(&rule.rule_id).copied(),
             window,
             plan.cross_buffer_pct,
+            tol,
         )
     {
         state.retest_seen_at = Some(candle.time);
@@ -1091,6 +1099,94 @@ fn stamp_retest(
     // The retest's `last_close` is tracked so an OnClose retest works across
     // ticks; record it regardless of whether it fired.
     record_last_close(&rule.rule_id, &rule.trigger, candle, state);
+}
+
+/// The retest's near-side closeness tolerance for this bar, in **price units**.
+///
+/// `(N - 1) × plan.retest_atr_step × ATR`, where `N` is the number of bars in
+/// `window` strictly after `break_at` up to & including `candle` (first bar
+/// after the break = 1, so its tolerance is 0 — it must reach the line). ATR is
+/// the Wilder ATR at this bar over `window`.
+///
+/// **Hard-fails** (panics) if the ATR can't be computed: by the time a plan is
+/// stamping retests it is in `Phase::AwaitEntry`, well past the detector's
+/// warmup, so `window` always spans more than `atr_length_for(granularity)`
+/// bars. A `None` here means the window was mis-sized upstream — a bug we want
+/// surfaced loudly, not silently papered over with a 0 tolerance (which would
+/// masquerade as the strict "must reach" rule and hide the real fault).
+fn retest_tolerance(
+    plan: &TradePlan,
+    break_at: DateTime<Utc>,
+    candle: &Candle,
+    window: &[Candle],
+) -> f64 {
+    let bars_since_break = window
+        .iter()
+        .filter(|c| c.time > break_at && c.time <= candle.time)
+        .count();
+    if bars_since_break <= 1 {
+        return 0.0;
+    }
+    let atr = wilder_atr(window, atr_length_for(plan.granularity)).expect(
+        "retest tolerance needs ATR, but wilder_atr returned None — the window is too short \
+         for atr_length_for(granularity); by the retest phase it should always be warmed",
+    );
+    (bars_since_break as f64 - 1.0) * plan.retest_atr_step * atr
+}
+
+/// A retest cross, loosened by a near-side `tol` (price units). Identical to
+/// [`eval_trigger`] except the *intrabar directional* arm accepts a wick that
+/// comes **within `tol`** of the line on the retest side, rather than requiring
+/// it to reach/pierce the line. `tol == 0.0` is exactly [`eval_trigger`] (the
+/// first-bar / no-decay case). `OnClose` and `Either` are unaffected — a
+/// close-confirmed or bare-straddle retest ignores the closeness tolerance.
+fn retest_crossed(
+    trigger: &Trigger,
+    candle: &Candle,
+    prev_close: Option<f64>,
+    window: &[Candle],
+    buffer_pct: f64,
+    tol: f64,
+) -> bool {
+    // With no slack, defer to the shared evaluator (single source of truth for
+    // the strict cross, buffer, and OnClose/Either arms).
+    if tol <= 0.0 {
+        return eval_trigger(trigger, candle, prev_close, window, buffer_pct);
+    }
+    // Resolve the crossed level. Only trendline / horizontal / price-value
+    // crosses have a level; anything else falls back to the strict evaluator.
+    let (level, dir, bar) = match trigger {
+        Trigger::HorizontalCross { level, dir, bar }
+        | Trigger::PriceValueCross { level, dir, bar } => (*level, *dir, *bar),
+        Trigger::TrendlineCross {
+            a,
+            b,
+            extend_forward,
+            bar_seconds,
+            dir,
+            bar,
+        } => {
+            let Some(level) = line_price_at(a, b, candle, *extend_forward, *bar_seconds, window)
+            else {
+                return false;
+            };
+            (level, *dir, *bar)
+        }
+        _ => return eval_trigger(trigger, candle, prev_close, window, buffer_pct),
+    };
+    // The closeness tolerance only loosens the *intrabar directional* arm; an
+    // OnClose or Either retest keeps its exact semantics.
+    match bar {
+        BarEvent::Intrabar => match dir {
+            // Near-side loosening: the wick only has to come within `tol` of the
+            // line, not reach it. Long retest (`Down`): low dips to `level + tol`
+            // or lower. Short (`Up`): high rises to `level - tol` or higher.
+            CrossDir::Down => candle.l <= level + tol,
+            CrossDir::Up => candle.h >= level - tol,
+            CrossDir::Either => candle.l <= level + tol && candle.h >= level - tol,
+        },
+        BarEvent::OnClose => level_crossed(level, dir, bar, candle, prev_close, buffer_pct),
+    }
 }
 
 /// Is a retest seen within `(break_close_at, entry]`?
@@ -1553,6 +1649,7 @@ mod tests {
             rules,
             shadow: false,
             cross_buffer_pct: 0.0,
+            retest_atr_step: trade_control_core::trade_plan::DEFAULT_RETEST_ATR_STEP,
             replay_start: None,
         }
     }
@@ -2644,6 +2741,287 @@ mod tests {
             small.new_state.retest_seen_at,
             Some(ts("2026-06-29T18:00:00Z")),
             "a 0.01% buffer admits the same tap"
+        );
+    }
+
+    // ===== retest time-decaying tolerance =====
+
+    /// Build a warm window of `n` flat H1 bars ending at `last`, each with a
+    /// true range of exactly 0.010 so the Wilder ATR is a clean 0.010. The bars
+    /// sit well *above* a 1.2000 retest line (mid ~1.2100) so they never
+    /// themselves cross it — only the injected retest bar does. Returns the
+    /// window; the caller appends the retest bar(s) it wants to test.
+    fn warm_atr_window(n: usize, first_epoch: i64) -> Vec<Candle> {
+        (0..n)
+            .map(|i| {
+                let t = first_epoch + (i as i64) * 3600;
+                let ct = DateTime::from_timestamp(t, 0).expect("ts");
+                // o=c=1.2100, h=1.2150, l=1.2050 → TR 0.010, flat closes → ATR 0.010.
+                Candle {
+                    time: ct,
+                    o: 1.2100,
+                    h: 1.2150,
+                    l: 1.2050,
+                    c: 1.2100,
+                }
+            })
+            .collect()
+    }
+
+    fn retest_line_down() -> Trigger {
+        // Flat retest line at 1.2000 (a horizontal, so the level is constant and
+        // the tolerance maths is easy to reason about), Down = long retest.
+        Trigger::HorizontalCross {
+            level: 1.2000,
+            dir: CrossDir::Down,
+            bar: BarEvent::Intrabar,
+        }
+    }
+
+    /// Bar 1 after the break has zero tolerance: a near-miss that doesn't reach
+    /// the line does NOT stamp; a bar that reaches it does.
+    #[test]
+    fn retest_bar_one_must_reach_the_line() {
+        let first = ts("2026-06-01T00:00:00Z").timestamp();
+        let mut window = warm_atr_window(24, first);
+        let break_epoch = first + 24 * 3600;
+        // The single post-break bar is N=1 → tolerance 0.
+        let n1 = break_epoch + 3600;
+        let n1t = DateTime::from_timestamp(n1, 0).unwrap();
+        let p = plan(vec![
+            rule(
+                "04-prep-retest",
+                retest_line_down(),
+                FireMode::Once,
+                Action::Prep,
+            ),
+            rule(
+                "05-enter",
+                Trigger::MwEveryBar,
+                FireMode::Once,
+                Action::Enter,
+            ),
+        ]);
+        let mut prior = seed_at(Phase::AwaitEntry, "2026-06-01T23:00:00Z");
+        prior.break_close_at = Some(DateTime::from_timestamp(break_epoch, 0).unwrap());
+
+        // Near-miss: low 1.2005 stays 0.0005 ABOVE the 1.2000 line → no reach, no stamp.
+        let miss = Candle {
+            time: n1t,
+            o: 1.2100,
+            h: 1.2150,
+            l: 1.2005,
+            c: 1.2100,
+        };
+        window.push(miss);
+        let eval = run_window(&p, &prior, &[miss], &window);
+        assert!(
+            eval.new_state.retest_seen_at.is_none(),
+            "bar 1 has zero tolerance — a low that doesn't reach the line must not stamp"
+        );
+
+        // Reaches: low 1.2000 touches the line → stamps.
+        let mut window2 = warm_atr_window(24, first);
+        let touch = Candle {
+            time: n1t,
+            o: 1.2100,
+            h: 1.2150,
+            l: 1.2000,
+            c: 1.2100,
+        };
+        window2.push(touch);
+        let eval2 = run_window(&p, &prior, &[touch], &window2);
+        assert_eq!(
+            eval2.new_state.retest_seen_at,
+            Some(n1t),
+            "bar 1 stamps when the low reaches the line exactly"
+        );
+    }
+
+    /// A later bar accepts a near-miss within its grown tolerance. At N=11 with
+    /// ATR 0.010 and step 0.075 the tolerance is (11-1)*0.075*0.010 = 0.0075, so
+    /// a low that stops 0.005 short of the line (within 0.0075) stamps — where
+    /// the same low on bar 1 would not.
+    #[test]
+    fn retest_later_bar_accepts_a_near_miss_within_tolerance() {
+        let first = ts("2026-06-01T00:00:00Z").timestamp();
+        let break_epoch = first + 24 * 3600;
+        let p = plan(vec![
+            rule(
+                "04-prep-retest",
+                retest_line_down(),
+                FireMode::Once,
+                Action::Prep,
+            ),
+            rule(
+                "05-enter",
+                Trigger::MwEveryBar,
+                FireMode::Once,
+                Action::Enter,
+            ),
+        ]);
+        let mut prior = seed_at(Phase::AwaitEntry, "2026-06-01T23:00:00Z");
+        prior.break_close_at = Some(DateTime::from_timestamp(break_epoch, 0).unwrap());
+
+        // Window = warm bars + ten intervening near-miss bars (each stays above
+        // the line so none stamps) so the *eleventh* post-break bar is N=11.
+        let mut window = warm_atr_window(24, first);
+        for k in 1..=10 {
+            let t = break_epoch + k * 3600;
+            let ct = DateTime::from_timestamp(t, 0).unwrap();
+            // Above the line (low 1.2050) — never a retest itself.
+            window.push(Candle {
+                time: ct,
+                o: 1.2100,
+                h: 1.2150,
+                l: 1.2050,
+                c: 1.2100,
+            });
+        }
+        let n11 = break_epoch + 11 * 3600;
+        let n11t = DateTime::from_timestamp(n11, 0).unwrap();
+        // Near-miss 0.005 short of the line: low 1.2050? no — 1.2000+0.005 = 1.2050
+        // is exactly the boundary; use 1.2005 (0.0005 short, well within 0.0075).
+        let near = Candle {
+            time: n11t,
+            o: 1.2100,
+            h: 1.2150,
+            l: 1.2005,
+            c: 1.2100,
+        };
+        window.push(near);
+        let eval = run_window(&p, &prior, &[near], &window);
+        assert_eq!(
+            eval.new_state.retest_seen_at,
+            Some(n11t),
+            "at N=11 the tolerance is 0.0075; a low 0.0005 short of the line stamps"
+        );
+    }
+
+    /// Beyond the grown tolerance still rejects: at N=11 (tol 0.0075) a low that
+    /// stops 0.010 short of the line does NOT stamp.
+    #[test]
+    fn retest_beyond_tolerance_still_rejects() {
+        let first = ts("2026-06-01T00:00:00Z").timestamp();
+        let break_epoch = first + 24 * 3600;
+        let p = plan(vec![
+            rule(
+                "04-prep-retest",
+                retest_line_down(),
+                FireMode::Once,
+                Action::Prep,
+            ),
+            rule(
+                "05-enter",
+                Trigger::MwEveryBar,
+                FireMode::Once,
+                Action::Enter,
+            ),
+        ]);
+        let mut prior = seed_at(Phase::AwaitEntry, "2026-06-01T23:00:00Z");
+        prior.break_close_at = Some(DateTime::from_timestamp(break_epoch, 0).unwrap());
+
+        let mut window = warm_atr_window(24, first);
+        for k in 1..=10 {
+            let t = break_epoch + k * 3600;
+            let ct = DateTime::from_timestamp(t, 0).unwrap();
+            window.push(Candle {
+                time: ct,
+                o: 1.2100,
+                h: 1.2150,
+                l: 1.2050,
+                c: 1.2100,
+            });
+        }
+        let n11 = break_epoch + 11 * 3600;
+        let n11t = DateTime::from_timestamp(n11, 0).unwrap();
+        // 0.010 short of the line (low 1.2100) — beyond the 0.0075 tolerance.
+        let far = Candle {
+            time: n11t,
+            o: 1.2120,
+            h: 1.2150,
+            l: 1.2100,
+            c: 1.2120,
+        };
+        window.push(far);
+        let eval = run_window(&p, &prior, &[far], &window);
+        assert!(
+            eval.new_state.retest_seen_at.is_none(),
+            "at N=11 a low 0.010 short of the line is beyond the 0.0075 tolerance"
+        );
+    }
+
+    /// The tolerance helper: N=1 → 0; grows linearly at step×ATR per bar.
+    #[test]
+    fn retest_tolerance_grows_linearly() {
+        let first = ts("2026-06-01T00:00:00Z").timestamp();
+        let break_epoch = first + 24 * 3600;
+        let break_at = DateTime::from_timestamp(break_epoch, 0).unwrap();
+        let mut p = plan(vec![rule(
+            "04-prep-retest",
+            retest_line_down(),
+            FireMode::Once,
+            Action::Prep,
+        )]);
+        p.retest_atr_step = 0.075;
+
+        // Window: 24 warm bars (ATR 0.010) + bars at N=1..3 after the break.
+        let mut window = warm_atr_window(24, first);
+        for k in 1..=3 {
+            let t = break_epoch + k * 3600;
+            window.push(Candle {
+                time: DateTime::from_timestamp(t, 0).unwrap(),
+                o: 1.2100,
+                h: 1.2150,
+                l: 1.2050,
+                c: 1.2100,
+            });
+        }
+        let at = |k: i64| DateTime::from_timestamp(break_epoch + k * 3600, 0).unwrap();
+        let tol1 = retest_tolerance(
+            &p,
+            break_at,
+            &Candle {
+                time: at(1),
+                o: 0.0,
+                h: 0.0,
+                l: 0.0,
+                c: 0.0,
+            },
+            &window,
+        );
+        let tol2 = retest_tolerance(
+            &p,
+            break_at,
+            &Candle {
+                time: at(2),
+                o: 0.0,
+                h: 0.0,
+                l: 0.0,
+                c: 0.0,
+            },
+            &window,
+        );
+        let tol3 = retest_tolerance(
+            &p,
+            break_at,
+            &Candle {
+                time: at(3),
+                o: 0.0,
+                h: 0.0,
+                l: 0.0,
+                c: 0.0,
+            },
+            &window,
+        );
+        assert!(tol1.abs() < 1e-12, "N=1 tolerance is 0, got {tol1}");
+        assert!(
+            (tol2 - 0.00075).abs() < 1e-9,
+            "N=2 → 1*0.075*0.010, got {tol2}"
+        );
+        assert!(
+            (tol3 - 0.0015).abs() < 1e-9,
+            "N=3 → 2*0.075*0.010, got {tol3}"
         );
     }
 

@@ -1,3 +1,40 @@
+# TODO — time-decaying retest tolerance (IN PROGRESS 2026-07-03)
+
+Loosen the retest intrabar cross so its closeness-to-neckline requirement
+**decays as bars pass** since the break-and-close.
+
+## Spec (operator, 2026-07-03)
+
+`N` = bars since break-and-close (first bar after break = `N=1`), counted in
+`detector_window` with `time > break_close_at`, up to & incl. the current bar.
+
+```
+atr = wilder_atr(detector_window, atr_length_for(plan.granularity))  // hard-fail if None (unreachable at retest phase)
+tol = (N - 1) × plan.retest_atr_step × atr                            // N=1 → 0
+```
+
+- Bar 1: `tol = 0` → wick must **reach the line**.
+- Each later bar: `+ retest_atr_step · ATR` of **near-side** slack.
+- `retest_atr_step` default **0.075** (~1 ATR of slack by bar ~14).
+
+"Within tol" loosens the retest side (long/`Down`: `low <= line + tol`;
+short/`Up`: `high >= line - tol`), replacing "must reach/pierce". Only the
+retest uses it; `cross_buffer_pct` still governs other intrabar consumers.
+
+## Tasks
+- [x] core: `TradePlan.retest_atr_step: f64`, serde-default 0.075 (signed)
+- [x] engine: tolerance-aware retest cross in `stamp_retest` (count N, wilder_atr,
+      near-side tolerance in `retest_crossed`; hard-fail on None ATR)
+- [x] engine tests: N=1 must-reach; N>1 near-miss-within-tol fires; beyond rejects;
+      tolerance-grows-linearly (4 new)
+- [x] tv-arm: `--retest-atr-step` flag bakes the field (+ test)
+- [x] parity: shared engine → worker + replay follow
+- [ ] README + CLAUDE.md + CHANGELOG; clippy+fmt; commit/push/parent-bump;
+      deploy-dev + rebuild native worker
+- [ ] (later, operator) visually tune `retest_atr_step`
+
+---
+
 # TODO — native runtime migration (CF Worker → VM + Postgres)
 
 Branch: `feat/native-runtime` (off `feat/pg-state-store`); worktree sibling.

@@ -298,6 +298,16 @@ pub struct Args {
     #[arg(long)]
     pub breakeven_pct: Option<f64>,
 
+    /// Per-bar decay step (in ATR multiples) for the retest's
+    /// closeness-to-neckline tolerance (default 0.075). The first bar after the
+    /// break-and-close must reach the neckline; each subsequent bar loosens the
+    /// retest by `step × ATR` of near-side slack (so a wick within the tolerance
+    /// still stamps the retest). Higher = more permissive faster; `0` freezes the
+    /// retest at "must reach the line" for the whole window. Bakes onto the
+    /// signed plan's `retest_atr_step`.
+    #[arg(long)]
+    pub retest_atr_step: Option<f64>,
+
     /// Drop the break-and-close prep from the bundle (no alert
     /// emitted and the entry no longer requires it).
     #[arg(long)]

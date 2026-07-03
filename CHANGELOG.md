@@ -1,5 +1,53 @@
 # Changelog
 
+## Unreleased — 2026-07-03 — time-decaying retest tolerance
+
+**Why.** The retest required the wick to *reach* the neckline on every bar. The
+original author's insight: a retest right after the break should be tight, but
+the further price drifts in time the less its exact distance to the neckline
+matters. So the closeness requirement should **loosen as bars pass** since the
+break-and-close.
+
+**What changed.** The retest cross now carries a per-bar decaying **near-side
+tolerance**. With `N` = bars since the break-and-close (first bar after = 1) and
+`ATR` the Wilder ATR at the bar:
+
+```
+tolerance(N) = (N - 1) × retest_atr_step × ATR
+```
+
+- Bar 1: tolerance 0 → the wick must **reach** the neckline (unchanged).
+- Each later bar: `+ retest_atr_step × ATR` of slack — a wick that comes *within*
+  the tolerance of the line stamps the retest even without reaching it.
+
+`retest_atr_step` defaults to **0.075** (≈1 ATR of slack by ~bar 14). Implemented
+in `engine/src/evaluate.rs` (`stamp_retest` → `retest_tolerance` +
+`retest_crossed`); ATR comes from the engine's existing `wilder_atr` over the
+detector window (`atr_length_for(granularity)`) and **hard-fails** if absent
+(structurally unreachable by the retest phase — a `None` signals a mis-sized
+window, surfaced loudly rather than silently papered over as tolerance 0).
+
+**Config.** New signed field `TradePlan.retest_atr_step: f64` (serde-default
+0.075, `DEFAULT_RETEST_ATR_STEP`). New `tv-arm --retest-atr-step <f64>` bakes it
+per-trade; absent → the default. Only the **retest** uses it; `cross_buffer_pct`
+(which *tightens*) still governs the other intrabar consumers.
+
+**Behaviour.** Strictly *more permissive* for the retest after bar 1: near-misses
+that used to be ignored now stamp once enough bars have passed. Bar-1 behaviour
+and every non-retest cross are unchanged.
+
+**Breaking.** `build_trade_plan` gains a `retest_atr_step: f64` parameter; every
+`TradePlan { … }` literal gains the field (serde-default keeps old plans valid).
+
+**Shared.** Engine rule → live worker tick + replay simulator both follow (one
+edit, no drift). tv-arm bakes the signed field.
+
+**Tests.** engine: bar-1-must-reach, later-bar-near-miss-within-tol fires,
+beyond-tol rejects, tolerance-grows-linearly (4 new). tv-arm:
+retest_atr_step-carried-onto-plan. engine 102 + tv-arm 189 green.
+
+**Follow-up.** Visual tuning of `retest_atr_step` on past charts (operator).
+
 ## Unreleased — 2026-07-03 — intrabar cross is a pure straddle (high/low opposite sides)
 
 **Why.** The retest (and every other intrabar cross) required the bar to have

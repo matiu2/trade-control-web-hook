@@ -503,6 +503,7 @@ mod tests {
             rules: Vec::new(),
             shadow: false,
             cross_buffer_pct: 0.0,
+            retest_atr_step: trade_control_core::trade_plan::DEFAULT_RETEST_ATR_STEP,
             replay_start: None,
         };
         let candles: Vec<EngineCandle> = (0..20)
@@ -531,6 +532,7 @@ mod tests {
             rules: Vec::new(),
             shadow: false,
             cross_buffer_pct: 0.0,
+            retest_atr_step: trade_control_core::trade_plan::DEFAULT_RETEST_ATR_STEP,
             replay_start: None,
         };
         let replay = run(&plan, &[], Granularity::H1, all_live(), all_live()).await;

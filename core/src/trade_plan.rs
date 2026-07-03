@@ -56,6 +56,18 @@ use crate::intent::{Direction, Intent};
 /// restores the bare wick-touch behaviour. See [`TradePlan::cross_buffer_pct`].
 pub const DEFAULT_CROSS_BUFFER_PCT: f64 = 0.02;
 
+/// Default per-bar decay step (in ATR multiples) for the retest tolerance —
+/// **0.075**. The first bar after the break must reach the neckline; each later
+/// bar loosens by `0.075 × ATR`, so the retest accepts a wick within ~1 ATR of
+/// the line by ~bar 14. Chosen by the operator as a starting point for visual
+/// tuning; override per-trade with `tv-arm --retest-atr-step`. See
+/// [`TradePlan::retest_atr_step`].
+pub const DEFAULT_RETEST_ATR_STEP: f64 = 0.075;
+
+fn default_retest_atr_step() -> f64 {
+    DEFAULT_RETEST_ATR_STEP
+}
+
 /// One signed trade, folded from every alert `tv-arm` would have created. The
 /// engine evaluates its [`rules`](Self::rules) against fresh candles each tick.
 ///
@@ -109,6 +121,26 @@ pub struct TradePlan {
     /// override the arm-time default.
     #[serde(default)]
     pub cross_buffer_pct: f64,
+    /// Per-bar decay step (in **ATR multiples**) for the retest's
+    /// closeness-to-neckline tolerance. The retest cross loosens as bars pass
+    /// since the break-and-close: the first bar after the break must actually
+    /// *reach* the neckline (tolerance 0), and each subsequent bar adds
+    /// `retest_atr_step × ATR` of **near-side** slack, so a wick that comes
+    /// *within* the tolerance of the line (without reaching it) still stamps the
+    /// retest. With `N` = bars since break-and-close (first = 1) and `ATR` the
+    /// Wilder ATR at the current bar, the tolerance is `(N-1) × retest_atr_step ×
+    /// ATR`. The rationale (operator): a retest right after the break should be
+    /// tight, but the further price drifts in time the less its exact distance to
+    /// the neckline matters.
+    ///
+    /// Only the retest rule uses this; every other intrabar cross keeps
+    /// [`Self::cross_buffer_pct`] (which tightens, not loosens). Signed as part of
+    /// the whole-body HMAC, so it's fixed at arm time; `tv-arm --retest-atr-step`
+    /// overrides the default. `#[serde(default = …)]` gives plans signed before
+    /// this field the same **0.075** default rather than a silent `0.0` (which
+    /// would freeze the retest at "must reach" forever).
+    #[serde(default = "default_retest_atr_step")]
+    pub retest_atr_step: f64,
     /// Arm-time replay cursor (`tv-arm --start`, a Unix second), baked so the
     /// offline `replay-candles` harness can derive a self-consistent window
     /// without reading the TradingView chart's replay cursor. The worker does
