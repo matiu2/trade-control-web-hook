@@ -29,10 +29,14 @@
 pub const SL_MIN_SPREAD_MULTIPLE: f64 = 10.0;
 
 /// The multiple a too-tight stop is **widened to** when salvaging an entry.
-/// Strictly above [`SL_MIN_SPREAD_MULTIPLE`] so the widened stop clears the
-/// floor with a margin rather than landing exactly on the `<` boundary — a
-/// stop placed at precisely `10 ×` spread is still essentially all spread.
-pub const SL_WIDEN_SPREAD_MULTIPLE: f64 = 11.0;
+/// Equal to [`SL_MIN_SPREAD_MULTIPLE`]: a salvaged stop is moved to exactly the
+/// floor, no further. This lands on the `<` boundary of
+/// [`sl_spread_floor_violation`] — `sl_distance == 10 × spread` is **not** a
+/// violation (the check is strict `<`), so a stop widened to precisely the
+/// floor passes. The widened distance is computed with the same `10.0 × spread`
+/// multiplication as the check, so the two are bit-identical and there is no
+/// floating-point boundary risk.
+pub const SL_WIDEN_SPREAD_MULTIPLE: f64 = SL_MIN_SPREAD_MULTIPLE;
 
 /// Does this entry violate the SL-vs-spread floor?
 ///
@@ -228,8 +232,8 @@ mod tests {
     #[test]
     fn too_tight_long_widens_and_stays_legal() {
         // Long: entry 1.1000, SL 1.0995 (5 pips), spread 0.0001 → floor 0.0010,
-        // violated. Widen to 11× = 0.0011 below entry → 1.0989. TP 1.1050 is
-        // 0.0050 above entry → R = 0.0050 / 0.0011 ≈ 4.5 ≥ 1.0 → widened.
+        // violated. Widen to 10× = 0.0010 below entry → 1.0990. TP 1.1050 is
+        // 0.0050 above entry → R = 0.0050 / 0.0010 = 5.0 ≥ 1.0 → widened.
         let out = widen_sl_to_spread_floor(1.1000, 1.0995, 1.1050, 0.0001, 1.0);
         match out {
             SlWiden::Widened {
@@ -237,8 +241,8 @@ mod tests {
                 new_sl_distance,
                 new_r,
             } => {
-                assert!((new_stop_loss - 1.0989).abs() < 1e-9, "{new_stop_loss}");
-                assert!((new_sl_distance - 0.0011).abs() < 1e-9, "{new_sl_distance}");
+                assert!((new_stop_loss - 1.0990).abs() < 1e-9, "{new_stop_loss}");
+                assert!((new_sl_distance - 0.0010).abs() < 1e-9, "{new_sl_distance}");
                 assert!(new_r > 4.0, "{new_r}");
             }
             other => panic!("expected Widened, got {other:?}"),
@@ -248,8 +252,8 @@ mod tests {
     #[test]
     fn too_tight_short_widens_above_entry() {
         // Short: entry 1.1000, SL 1.1005 (5 pips above), spread 0.0001.
-        // Widen to 0.0011 ABOVE entry → 1.1011. TP 1.0950 (0.0050 below) →
-        // R ≈ 4.5 ≥ 1.0 → widened, stop stays on the short side.
+        // Widen to 0.0010 ABOVE entry → 1.1010. TP 1.0950 (0.0050 below) →
+        // R = 5.0 ≥ 1.0 → widened, stop stays on the short side.
         let out = widen_sl_to_spread_floor(1.1000, 1.1005, 1.0950, 0.0001, 1.0);
         match out {
             SlWiden::Widened { new_stop_loss, .. } => {
@@ -257,7 +261,7 @@ mod tests {
                     new_stop_loss > 1.1000,
                     "stop must stay above entry: {new_stop_loss}"
                 );
-                assert!((new_stop_loss - 1.1011).abs() < 1e-9, "{new_stop_loss}");
+                assert!((new_stop_loss - 1.1010).abs() < 1e-9, "{new_stop_loss}");
             }
             other => panic!("expected Widened, got {other:?}"),
         }
@@ -265,8 +269,8 @@ mod tests {
 
     #[test]
     fn widening_below_r_floor_is_rejected() {
-        // Entry 1.1000, SL 1.0999 (1 pip), spread 0.0001. Widen to 0.0011.
-        // TP only 1.1008 → tp_distance 0.0008. R = 0.0008 / 0.0011 ≈ 0.73 < 1.0
+        // Entry 1.1000, SL 1.0999 (1 pip), spread 0.0001. Widen to 0.0010.
+        // TP only 1.1008 → tp_distance 0.0008. R = 0.0008 / 0.0010 = 0.8 < 1.0
         // → reject (no legal stop).
         let out = widen_sl_to_spread_floor(1.1000, 1.0999, 1.1008, 0.0001, 1.0);
         match out {
@@ -307,7 +311,7 @@ mod tests {
 
         // And the widen helper resolves the same SlWiden *shape* for matching
         // ratios regardless of absolute price scale: both have a 5× SL and a
-        // 30× TP, so both widen to 11× and clear R = 30/11 ≈ 2.7.
+        // 30× TP, so both widen to 10× and clear R = 30/10 = 3.0.
         let xag = widen_sl_to_spread_floor(
             1.0000,
             1.0000 - 5.0 * xag_spread,
@@ -331,9 +335,9 @@ mod tests {
         // From the operator's wheat replay (2026-06-23): SHORT stop @ 5.9538,
         // SL 5.9882 (distance 0.0344), TP 5.7657. Rejected as sl-below-10x
         // because wheat's spread is wide. With a representative 0.005 spread the
-        // 10× floor is 0.05 > 0.0344 → violated. Widen to 11× = 0.055 above
-        // entry → 6.0088; TP distance = 5.9538 − 5.7657 = 0.1881 →
-        // R = 0.1881 / 0.055 ≈ 3.42 ≥ 1.0 → entry salvaged.
+        // 10× floor is 0.05 > 0.0344 → violated. Widen to 10× = 0.05 above
+        // entry → 6.0038; TP distance = 5.9538 − 5.7657 = 0.1881 →
+        // R = 0.1881 / 0.05 ≈ 3.76 ≥ 1.0 → entry salvaged.
         let out = widen_sl_to_spread_floor(5.9538, 5.9882, 5.7657, 0.005, 1.0);
         match out {
             SlWiden::Widened {

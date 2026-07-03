@@ -1,5 +1,41 @@
 # Changelog
 
+## Unreleased — 2026-07-03 — SL-spread salvage widens to exactly 10× (was 11×)
+
+**Why.** The SL-vs-spread salvage widened a too-tight stop to `11 × spread` — a
+deliberate margin above the `10×` floor. The operator wants the salvage to move
+the stop only as far as strictly necessary: to the floor itself, `10 × spread`,
+and no further. A stop pushed to `11×` gives away an extra `1 × spread` of risk
+on every salvaged entry for no rule benefit.
+
+**What changed.** `SL_WIDEN_SPREAD_MULTIPLE` in
+`core/src/intent/sl_spread_floor.rs` is now `= SL_MIN_SPREAD_MULTIPLE` (10.0)
+instead of `11.0`. A salvaged stop lands exactly on the floor. This is safe:
+`sl_spread_floor_violation` uses a strict `<` (`sl_distance < 10 × spread`), so a
+stop at exactly `10 × spread` is **not** a violation, and the widened distance is
+the same `10.0 × spread` multiplication as the check — bit-identical, no
+floating-point boundary risk.
+
+**Behaviour.** Salvaged entries now enter with a slightly *tighter* (more
+favourable) stop and correspondingly *higher* R than before. Entries that were
+salvageable at 11× remain salvageable at 10× (the R only improves). The
+reject/accept boundary shifts marginally: a trade whose R at 11× was just under
+`min_r` may now clear it at 10× and enter. Reject and log messages print `10x`
+automatically (built from the constant).
+
+**Breaking.** None — the constant is internal; no signed-field or API change.
+
+**Shared.** Pure `core` helper, so the live worker (`run_enter`) and the offline
+replay simulator (`engine/src/simulator.rs`, which calls the same
+`widen_sl_to_spread_floor`) both follow with one edit — no replayer/worker drift.
+
+**Tests.** Updated the 11×-hardcoded expectations in `sl_spread_floor.rs` (3
+widen tests) and `simulator.rs` (2 tests; `widened_sl_protects_the_leg`'s dip bar
+moved from 1.0990→1.0994 since the widened SL is now 1.0990, not 1.0984). core
+764 + engine 98 green.
+
+**Follow-up.** None.
+
 ## Unreleased — 2026-07-02 — tv-arm: neckline serves the retest (one drawing)
 
 **Why.** The `03-prep-break-and-close` and `04-prep-retest` rules cross the

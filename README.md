@@ -643,10 +643,10 @@ reward:risk floor.
 - **At fire time (worker) — widen-then-reject.** Every `enter` samples
   the live spread (`get_quote`). When the stop is *too tight*
   (`sl_distance < 10 × spread`) the worker no longer rejects outright —
-  it first tries to **widen the stop to `11 × spread`** (pushing it
-  *further* from entry, never tighter) and re-checks the trade still
-  clears its R-floor against the fixed TP:
-    - **Widened → entry proceeds.** If `R = tp_distance / (11 × spread)`
+  it first tries to **widen the stop to `10 × spread`** (exactly the
+  floor, pushing it *further* from entry, never tighter) and re-checks
+  the trade still clears its R-floor against the fixed TP:
+    - **Widened → entry proceeds.** If `R = tp_distance / (10 × spread)`
       is still `≥ min_r` (default 1.0, or the intent's override), the
       worker places the order with the widened SL and logs
       `sl-spread-floor: widened SL <old> -> <new> … R now <r> >= min_r`.
@@ -654,10 +654,10 @@ reward:risk floor.
       that's fine; the continuous at-entry level vetos (`too-high` /
       `too-low`) abort the trade independently if price actually reaches
       invalidation.
-    - **Can't stay legal → reject.** If even the `11 × spread` stop drops
+    - **Can't stay legal → reject.** If even the `10 × spread` stop drops
       `R` below `min_r`, there is no legal stop and the entry is rejected
       with **HTTP 422 / `rejected: sl-widen-below-min-r`** (body:
-      `entry blocked: SL too close to spread and widening to 11x spread
+      `entry blocked: SL too close to spread and widening to 10x spread
       (sl_distance <d>, spread <s>) would drop R to <r> < min_r <m>`). This
       is the wide-spread instrument case where the TP is too near to
       support an honest stop.
