@@ -1,5 +1,37 @@
 # Changelog
 
+## Unreleased — 2026-07-05 — replay System-2 stop-widen gates on the NY-close edge
+
+**Why.** The live spread-blackout stop-widen (System 2,
+`trade-control-cron/src/blackout_apply.rs`) fires **only at the NY-close edge**
+(21:00 UTC under EDT / 22:00 under EST), where the post-close spread blowout it
+guards against occurs. The offline replay's mirror
+(`engine::simulator::widened_stop_at`) had **no such gate** — it widened on the
+*first* post-fill bar whose spread crossed the trigger, at any hour. On a trade
+whose spread flared away from the NY close, the replay would widen a stop the
+live worker would have left alone: a replay-vs-live divergence.
+
+Surfaced by the EUR/AUD journal bug `hs-eur-aud-3d0b5dda` (demo-journal
+`BUG-replay-sl-widen-uses-wrong-bar-spread-and-synthetic-candles.md`). That
+report's two headline claims were misdiagnoses — the widen it flagged fired on
+the **NY-close bar** (01-Jul 21:00 UTC), on **real** OANDA `price=MBA` bid/ask
+(the replay already pulls real books) — but it half-found this real gap.
+
+**What changed.** `widened_stop_at` now `continue`s past any post-fill bar where
+`trade_control_core::ny_clock::is_ny_close_edge(c.time)` is false, so the replay
+widens only on the NY-close bar — identical to the live cron. Shared engine ⇒
+worker (wasm) and replay can't drift.
+
+**Compatibility.** No signed-field or schema change. Behaviour only changes for a
+replay whose open-position spread crosses the widen trigger on a non-NY-close bar
+(previously widened, now correctly ignored). Trades whose wide bar *is* the
+NY-close bar (the common case, incl. `hs-eur-aud-3d0b5dda`) are unaffected.
+
+**Tests.** `widened_stop_at_ignores_a_wide_bar_off_the_ny_close_edge`,
+`widened_stop_at_widens_on_the_ny_close_bar_not_the_first_wide_bar`;
+`widened_stop_at_reports_the_widen_bar_for_a_long` moved onto 21:00 UTC (it
+previously used 12:00 UTC, silently encoding the pre-fix "any bar" behaviour).
+
 ## Unreleased — 2026-07-05 — break-and-close reads a buffered *zone*, not the bare line
 
 **Why.** The `OnClose` cross (break-and-close, invalidation caps) required a

@@ -567,19 +567,30 @@ pub struct SpreadWiden {
 /// the **exit price** — without this, a replay would stop the position out at
 /// the original (tighter) level and diverge from the live worker.
 ///
+/// **The NY-close-edge gate.** The live cron only widens at the NY-close edge —
+/// `apply_if_ny_close_edge` no-ops every other tick — because that is when the
+/// post-close spread blowout the widen guards against occurs. So a bar only
+/// qualifies here if [`trade_control_core::ny_clock::is_ny_close_edge`] is true
+/// on its open time (21:00 UTC under EDT / 22:00 under EST). Without this gate
+/// the replay widened on the *first* wide-spread bar at any hour, diverging from
+/// the worker on a trade whose spread flared off the NY close (EUR/AUD
+/// `hs-eur-aud-3d0b5dda`, journal bug).
+///
 /// **The trigger.** The caller passes `widen_trigger_pips` — the instrument's
 /// spread-blackout threshold (`baked-baseline × 5`) via
 /// [`trade_control_core::spread_blackout::elevated_threshold_pips`], the *same*
 /// number the System-1 entry-reject uses. Now that the baked baseline lives in
 /// shared `core` the engine links it directly, so this is the **exact**
 /// per-instrument threshold the live worker's `blackout_apply` widens against —
-/// no longer the flat `WIDEN_FLOOR_PIPS` proxy. The first post-fill bar whose
-/// **spread** (`ask_c − bid_c`, in pips) meets or exceeds it — *while the stop
-/// hasn't yet been hit* — is the widen bar. The amount it widens by is still
-/// floored/clamped 22–40 pips via [`trade_control_core::blackout_widen::clamp_widen`].
+/// no longer the flat `WIDEN_FLOOR_PIPS` proxy. The first **NY-close-edge**
+/// post-fill bar whose **spread** (`ask_c − bid_c`, in pips) meets or exceeds it
+/// — *while the stop hasn't yet been hit* — is the widen bar. The amount it
+/// widens by is still floored/clamped 22–40 pips via
+/// [`trade_control_core::blackout_widen::clamp_widen`].
 ///
 /// Pure and side-effect-free. Returns `None` when the enter has no fill, exits
-/// before any qualifying spread bar, or no bar's spread reaches the trigger.
+/// before any qualifying spread bar, or no NY-close-edge bar's spread reaches
+/// the trigger.
 pub fn widened_stop_at(
     intent: &Intent,
     shell: &Shell,
@@ -603,6 +614,19 @@ pub fn widened_stop_at(
             || book_crosses(c, exit_book, resolved.take_profit)
         {
             return None;
+        }
+        // NY-close-edge gate — mirror the live cron. `blackout_apply`'s
+        // `apply_if_ny_close_edge` widens open stops ONLY at the NY-close edge
+        // (21:00 UTC under EDT / 22:00 under EST), where the post-close spread
+        // blowout happens. Without this gate the replay widened on the *first*
+        // wide-spread bar at any hour, diverging from the worker on any trade
+        // whose spread flared off the NY close. `c.time` is the bar-open instant;
+        // `is_ny_close_edge` matches on the hour, so the 21:00/22:00 UTC bar
+        // qualifies. (EUR/AUD `hs-eur-aud-3d0b5dda` journal bug — the report
+        // mistook a correct NY-close widen for a wrong-bar widen; this closes the
+        // *actual* gap it half-found.)
+        if !trade_control_core::ny_clock::is_ny_close_edge(c.time) {
+            continue;
         }
         let spread_pips = (c.ask_c - c.bid_c) / pip_size;
         if spread_pips.is_finite() && spread_pips >= widen_trigger_pips {
@@ -1286,9 +1310,9 @@ mod tests {
         }
     }
 
-    /// A long position whose post-fill path includes a wide-spread bar reports
-    /// the widen: the bar's time, the original SL, and a stop moved DOWN (away
-    /// from price for a long) by the clamped live spread.
+    /// A long position whose post-fill path includes a wide-spread bar **on the
+    /// NY-close edge** reports the widen: the bar's time, the original SL, and a
+    /// stop moved DOWN (away from price for a long) by the clamped live spread.
     #[test]
     fn widened_stop_at_reports_the_widen_bar_for_a_long() {
         use trade_control_core::blackout_widen::{WIDEN_FLOOR_PIPS, widened_stop};
@@ -1298,9 +1322,11 @@ mod tests {
         // Fire bar (skipped), then a zero-spread bar whose ASK reaches the 1.1000
         // long trigger → fill. Then a wide-spread bar (ask_c − bid_c = 1.10315 −
         // 1.10010 = 0.00305 = 30.5 pips, within the 22–40 clamp) that does NOT hit
-        // SL/TP → widen.
+        // SL/TP → widen. The wide bar sits at 21:00 UTC — the NY-close edge under
+        // EDT (2026-06-17 is inside the DST window) — which the widen gate
+        // requires, mirroring the live cron.
         let fill_bar = candle("2026-06-17T11:00:00Z", 1.1000, 1.1001, 1.0999, 1.1000);
-        let wide = ba_candle("2026-06-17T12:00:00Z", 1.10015, 1.10010, 1.10315, 1.10310);
+        let wide = ba_candle("2026-06-17T21:00:00Z", 1.10015, 1.10010, 1.10315, 1.10310);
         let spread_pips = (wide.ask_c - wide.bid_c) / 0.0001; // 30.5
         let path = [fire_bar(), fill_bar, wide];
 
@@ -1319,6 +1345,55 @@ mod tests {
         assert!(
             widen.widened_stop < 1.0950,
             "a long widen moves the SL DOWN"
+        );
+    }
+
+    /// A wide-spread bar that is **not** on the NY-close edge does NOT widen —
+    /// the live System-2 cron only widens at the NY close (`is_ny_close_edge`),
+    /// so the replay mirror must too. Without the gate this bar (12:00 UTC, a
+    /// 30.5-pip spread) would trip the widen; with it, it's ignored. This is the
+    /// parity gap from the EUR/AUD `hs-eur-aud-3d0b5dda` journal bug: the report
+    /// mistook a NY-close-edge widen for a "wrong bar", but the real defect was
+    /// the replay widening on *any* wide bar, not only the NY-close one.
+    #[test]
+    fn widened_stop_at_ignores_a_wide_bar_off_the_ny_close_edge() {
+        use trade_control_core::blackout_widen::WIDEN_FLOOR_PIPS;
+        let mut intent = long_stop_intent();
+        i_set_levels(&mut intent, 1.1000, 1.0950, 1.1100);
+        let shell = trigger_shell();
+        let fill_bar = candle("2026-06-17T11:00:00Z", 1.1000, 1.1001, 1.0999, 1.1000);
+        // 30.5-pip spread — well over the floor — but 12:00 UTC is not the NY
+        // close (21:00 UTC under EDT). Gate rejects it.
+        let wide = ba_candle("2026-06-17T12:00:00Z", 1.10015, 1.10010, 1.10315, 1.10310);
+        let path = [fire_bar(), fill_bar, wide];
+        assert_eq!(
+            widened_stop_at(&intent, &shell, 0.0001, &path, WIDEN_FLOOR_PIPS),
+            None,
+            "a wide bar off the NY-close edge must not widen"
+        );
+    }
+
+    /// Two wide-spread bars — one off the edge (12:00 UTC), one on it (21:00
+    /// UTC). The widen must land on the NY-close bar, not the earlier off-edge
+    /// one, proving the loop skips non-edge bars rather than firing on the first
+    /// wide bar it sees.
+    #[test]
+    fn widened_stop_at_widens_on_the_ny_close_bar_not_the_first_wide_bar() {
+        use trade_control_core::blackout_widen::WIDEN_FLOOR_PIPS;
+        let mut intent = long_stop_intent();
+        i_set_levels(&mut intent, 1.1000, 1.0950, 1.1100);
+        let shell = trigger_shell();
+        let fill_bar = candle("2026-06-17T11:00:00Z", 1.1000, 1.1001, 1.0999, 1.1000);
+        // Off-edge wide bar (12:00 UTC) — must be skipped.
+        let off_edge = ba_candle("2026-06-17T12:00:00Z", 1.10015, 1.10010, 1.10315, 1.10310);
+        // NY-close-edge wide bar (21:00 UTC under EDT) — must be the widen bar.
+        let on_edge = ba_candle("2026-06-17T21:00:00Z", 1.10015, 1.10010, 1.10315, 1.10310);
+        let path = [fire_bar(), fill_bar, off_edge, on_edge];
+        let widen = widened_stop_at(&intent, &shell, 0.0001, &path, WIDEN_FLOOR_PIPS)
+            .expect("the NY-close-edge bar must trip the widen");
+        assert_eq!(
+            widen.at, on_edge.time,
+            "widen must land on the NY-close bar, not the first wide bar"
         );
     }
 
