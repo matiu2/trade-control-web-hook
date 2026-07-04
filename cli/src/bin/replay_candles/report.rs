@@ -627,24 +627,41 @@ fn render_fire(
         ));
     }
 
-    // Spread-widen (System 2): a post-fill bar whose spread reaches the widen
-    // trigger moves the broker SL *away* from price (live cron
-    // `blackout_apply`). A widened stop changes the exit price, so surface it —
-    // otherwise a wider-than-bracket stop-out below looks wrong. The trigger is
-    // the instrument's *real* spread-blackout threshold (`baseline × 5`), now
-    // that the baked baseline lives in shared `core` and the engine links it —
-    // the same `elevated_threshold_pips` the System-1 entry-reject uses, so the
-    // two stay exact and in lockstep with the live worker.
+    // Spread-widen (System 2): a NY-close-edge bar whose spread reaches the
+    // widen trigger moves the broker SL *away* from price (live cron
+    // `blackout_apply`). This widen is **transient** — the live recovery watcher
+    // (`blackout_watch`) restores the original stop once the spread recovers
+    // (≤4p) or the 3h backstop fires; `restored_at` reconstructs that bar. We
+    // surface BOTH the widen and the restore so the journal shows the shield
+    // snapping back, not a permanent risk change (the EUR/AUD `hs-eur-aud-…`
+    // "permanent widen" question). The trigger is the instrument's *real*
+    // spread-blackout threshold (`baseline × 5`), the same `elevated_threshold_pips`
+    // the System-1 entry-reject uses, so replay and live stay in lockstep.
+    //
+    // NOTE: this is informational only — `simulate_fill` below computes the exit
+    // against the un-widened bracket (System 2 is not applied to the simulated
+    // stop-out), so these lines annotate what the *live broker stop* did, not the
+    // replay's exit level.
     let widen_trigger = elevated_threshold_pips(&intent.instrument);
     if let Some(widen) =
         widened_stop_at(intent, &shell, plan.pip_size, &fire.forward, widen_trigger)
     {
         line.push_str(&format!(
-            "    exit: SL widened to {} (spread blackout System 2) @ {} (from {})\n",
+            "    note: SL widened to {} (spread blackout System 2, transient) @ {} (from {})\n",
             fmt_price(widen.widened_stop, plan.pip_size),
             bne(widen.at),
             fmt_price(widen.original_stop, plan.pip_size)
         ));
+        match widen.restored_at {
+            Some(restored_at) => line.push_str(&format!(
+                "    note: SL restored to {} @ {} (spread recovered / backstop — widen was transient)\n",
+                fmt_price(widen.original_stop, plan.pip_size),
+                bne(restored_at),
+            )),
+            None => line.push_str(
+                "    note: SL still widened at window end (spread never recovered before the path ended)\n",
+            ),
+        }
     }
 
     let raw = simulate_fill(intent, &shell, plan.pip_size, &fire.forward);

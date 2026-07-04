@@ -111,6 +111,19 @@ pub const SPREAD_BLACKOUT_ELEVATED_PIPS: f64 = 8.0;
 /// MUST be calibrated together on demo — see [`elevated_threshold_pips`].
 pub const SPREAD_BLACKOUT_RECOVERED_PIPS: f64 = 4.0;
 
+/// Spread-blackout backstop, in seconds (~3h). Single source of truth: the
+/// global window-marker TTL (apply), each per-trade record's TTL, and the
+/// recovery watcher's "clear regardless of spread" backstop (watch) all derive
+/// from this one constant so they can never drift apart. The post-NY-close
+/// liquidity trough is ~1h; 3h is a generous safety ceiling after which a
+/// still-`applied` record is force-cleared.
+///
+/// Lives in `core` (not the cron crate) so the offline replay's transient-widen
+/// reconstruction (`engine::simulator::restore_bar`) computes the same backstop
+/// as the live recovery watcher without depending on `trade-control-cron`. The
+/// cron crate re-exports this as `constants::BLACKOUT_BACKSTOP_SECONDS`.
+pub const BLACKOUT_BACKSTOP_SECONDS: u64 = 3 * 60 * 60;
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -1,5 +1,42 @@
 # Changelog
 
+## Unreleased — 2026-07-05 — replay shows the System-2 widen as *transient* (widen + restore)
+
+**Why.** The NY-close stop-widen (System 2) is **transient live**: the recovery
+watcher (`trade-control-cron/src/blackout_watch.rs`) restores the original stop as
+soon as the spread recovers (≤4p) or a 3h backstop fires. But the replay printed
+only the *widen* line and no *restore*, and (because `widened_stop_at` is a
+display-only annotation, never applied to `simulate_fill`'s exit) the journal read
+as a permanent, un-reverted stop inflation. Raised by the operator on EUR/AUD
+`hs-eur-aud-3d0b5dda` (demo-journal
+`BUG-ny-close-widen-is-permanent-not-transient.md`): "why does a temporary
+NY-close protection permanently widen my stop and never put it back?" The live
+worker already does put it back — the replay just didn't say so.
+
+**What changed.**
+- `engine::simulator::SpreadWiden` gains `restored_at: Option<DateTime<Utc>>`,
+  reconstructed by a new `restore_bar` helper that mirrors the live watcher's two
+  restore triggers: the first post-widen bar with spread ≤
+  `SPREAD_BLACKOUT_RECOVERED_PIPS` (4p, clock-agnostic), else the
+  `BLACKOUT_BACKSTOP_SECONDS` (3h) backstop.
+- The replay report now prints a matching **"SL restored to … @ …"** line (or
+  "still widened at window end" when neither trigger lands), and the widen line is
+  relabelled `note:` and marked *transient* + *informational only* (the simulated
+  exit uses the un-widened bracket).
+
+**Refactor.** `BLACKOUT_BACKSTOP_SECONDS` moved from
+`trade-control-cron::constants` into `trade_control_core::spread_blackout` (beside
+the recovered/elevated cutoffs — spread-blackout tuning now lives in one place) so
+the engine can compute the same backstop without depending on the cron crate. The
+cron `constants` module re-exports it, so every existing consumer is unchanged.
+
+**Compatibility.** Replay reporting only — no signed field, no live-worker change
+(live was already transient). No behaviour change to any simulated exit.
+
+**Tests.** `widened_stop_at_reports_restore_on_spread_recovery`,
+`widened_stop_at_restore_is_none_when_spread_stays_wide`,
+`widened_stop_at_restore_fires_on_the_backstop`.
+
 ## Unreleased — 2026-07-05 — replay System-2 stop-widen gates on the NY-close edge
 
 **Why.** The live spread-blackout stop-widen (System 2,

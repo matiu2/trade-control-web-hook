@@ -544,7 +544,9 @@ pub fn sweep_reason(
 }
 
 /// A System-2 spread-widen the replay reconstructs from the candle path: the
-/// bar whose spread tripped the widen, and the new (widened) stop level.
+/// bar whose spread tripped the widen, the new (widened) stop level, and — since
+/// the widen is *transient* live — the bar at which the recovery watcher would
+/// restore the original stop.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SpreadWiden {
     /// Open-time of the bar whose spread crossed the widen trigger.
@@ -554,6 +556,15 @@ pub struct SpreadWiden {
     /// The stop after widening away from price (the shared
     /// [`trade_control_core::blackout_widen::widened_stop`] result).
     pub widened_stop: f64,
+    /// Open-time of the bar at which the live recovery watcher
+    /// (`blackout_watch::watch_recovery`) would restore the original stop:
+    /// the first post-widen bar whose spread has dropped to/under the recovered
+    /// cutoff (4 pips), or — if the spread stays elevated — the 3-hour backstop.
+    /// `None` when neither happens before the position exits or the window ends
+    /// (the widen would still be active at exit). The widen is a **transient**
+    /// shield, not a permanent risk change — this field is what makes the replay
+    /// journal say so.
+    pub restored_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 /// Reconstruct a System-2 spread-blackout stop widen from the candle path, if
@@ -607,7 +618,7 @@ pub fn widened_stop_at(
     let exit_book = book_for(Leg::Exit, dir);
     let original_stop = resolved.stop_loss;
 
-    for c in fill.rest {
+    for (i, c) in fill.rest.iter().enumerate() {
         // The original stop is still the live one until a widen fires, so an
         // exit (SL/TP) before any qualifying spread bar means no widen applied.
         if book_crosses(c, exit_book, original_stop)
@@ -637,11 +648,46 @@ pub fn widened_stop_at(
                 widen_pips,
                 pip_size,
             );
+            let restored_at = restore_bar(&fill.rest[i + 1..], c.time, pip_size);
             return Some(SpreadWiden {
                 at: c.time,
                 original_stop,
                 widened_stop: widened,
+                restored_at,
             });
+        }
+    }
+    None
+}
+
+/// When the live recovery watcher (`blackout_watch::watch_recovery`) would
+/// restore the widened stop, reconstructed from the post-widen candle path.
+///
+/// Mirrors the two live restore triggers (Safety Rules 1 & 2 in
+/// `blackout_watch`): the first bar whose spread has dropped to/under the
+/// recovered cutoff (`SPREAD_BLACKOUT_RECOVERED_PIPS`, 4 pips) — clock-agnostic,
+/// so recovery is NOT gated on the NY-close edge — or, failing that, the 3-hour
+/// backstop (`BLACKOUT_BACKSTOP_SECONDS`), whichever comes first. `bars` are the
+/// candles strictly after the widen bar; `widen_at` is the widen bar's open
+/// time. `None` when neither trigger lands within the provided path (the widen
+/// is still active at the window's end).
+fn restore_bar(
+    bars: &[BidAskCandle],
+    widen_at: chrono::DateTime<chrono::Utc>,
+    pip_size: f64,
+) -> Option<chrono::DateTime<chrono::Utc>> {
+    let recovered_cutoff = trade_control_core::spread_blackout::SPREAD_BLACKOUT_RECOVERED_PIPS;
+    let backstop_secs = trade_control_core::spread_blackout::BLACKOUT_BACKSTOP_SECONDS;
+    let backstop_at = widen_at + chrono::Duration::seconds(backstop_secs as i64);
+    for c in bars {
+        // Backstop fires first if this bar is at/after the 3h mark, regardless
+        // of spread — the live watcher clears unconditionally there.
+        if c.time >= backstop_at {
+            return Some(c.time);
+        }
+        let spread_pips = (c.ask_c - c.bid_c) / pip_size;
+        if spread_pips.is_finite() && spread_pips <= recovered_cutoff {
+            return Some(c.time);
         }
     }
     None
@@ -1394,6 +1440,83 @@ mod tests {
         assert_eq!(
             widen.at, on_edge.time,
             "widen must land on the NY-close bar, not the first wide bar"
+        );
+    }
+
+    /// The widen is **transient**: once a post-widen bar's spread recovers to/
+    /// under the 4-pip cutoff, `restored_at` reports that bar — mirroring the
+    /// live recovery watcher (`blackout_watch`). This is what lets the replay
+    /// journal show the stop snapping back instead of a permanent widen (the
+    /// EUR/AUD `hs-eur-aud-3d0b5dda` "permanent widen" journal question).
+    #[test]
+    fn widened_stop_at_reports_restore_on_spread_recovery() {
+        use trade_control_core::blackout_widen::WIDEN_FLOOR_PIPS;
+        let mut intent = long_stop_intent();
+        i_set_levels(&mut intent, 1.1000, 1.0950, 1.1100);
+        let shell = trigger_shell();
+        let fill_bar = candle("2026-06-17T11:00:00Z", 1.1000, 1.1001, 1.0999, 1.1000);
+        // Widen bar: 30.5p spread on the NY-close edge (21:00 UTC, EDT).
+        let wide = ba_candle("2026-06-17T21:00:00Z", 1.10015, 1.10010, 1.10315, 1.10310);
+        // Next bar: spread back to 2p (≤ the 4p recovered cutoff) → restore here.
+        let recovered = ba_candle("2026-06-17T22:00:00Z", 1.10010, 1.10005, 1.10030, 1.10025);
+        let path = [fire_bar(), fill_bar, wide, recovered];
+
+        let widen = widened_stop_at(&intent, &shell, 0.0001, &path, WIDEN_FLOOR_PIPS)
+            .expect("the NY-close-edge bar must trip the widen");
+        assert_eq!(widen.at, wide.time);
+        assert_eq!(
+            widen.restored_at,
+            Some(recovered.time),
+            "the widen must restore at the first recovered-spread bar"
+        );
+    }
+
+    /// If the spread never recovers before the path ends, `restored_at` is
+    /// `None` (the widen would still be active at the window's end — the 3-hour
+    /// backstop hasn't landed within these bars either).
+    #[test]
+    fn widened_stop_at_restore_is_none_when_spread_stays_wide() {
+        use trade_control_core::blackout_widen::WIDEN_FLOOR_PIPS;
+        let mut intent = long_stop_intent();
+        i_set_levels(&mut intent, 1.1000, 1.0950, 1.1100);
+        let shell = trigger_shell();
+        let fill_bar = candle("2026-06-17T11:00:00Z", 1.1000, 1.1001, 1.0999, 1.1000);
+        let wide = ba_candle("2026-06-17T21:00:00Z", 1.10015, 1.10010, 1.10315, 1.10310);
+        // Still ~30p an hour later — under the 3h backstop, spread not recovered.
+        let still_wide = ba_candle("2026-06-17T22:00:00Z", 1.10015, 1.10010, 1.10315, 1.10310);
+        let path = [fire_bar(), fill_bar, wide, still_wide];
+
+        let widen = widened_stop_at(&intent, &shell, 0.0001, &path, WIDEN_FLOOR_PIPS)
+            .expect("the NY-close-edge bar must trip the widen");
+        assert_eq!(
+            widen.restored_at, None,
+            "no recovery, no backstop → no restore"
+        );
+    }
+
+    /// The 3-hour backstop restores even if the spread stays elevated — the live
+    /// watcher's Safety Rule 2. A bar ≥ 3h after the widen restores regardless
+    /// of its (still-wide) spread.
+    #[test]
+    fn widened_stop_at_restore_fires_on_the_backstop() {
+        use trade_control_core::blackout_widen::WIDEN_FLOOR_PIPS;
+        let mut intent = long_stop_intent();
+        i_set_levels(&mut intent, 1.1000, 1.0950, 1.1100);
+        let shell = trigger_shell();
+        let fill_bar = candle("2026-06-17T11:00:00Z", 1.1000, 1.1001, 1.0999, 1.1000);
+        let wide = ba_candle("2026-06-17T21:00:00Z", 1.10015, 1.10010, 1.10315, 1.10310);
+        // Still wide at +1h/+2h (no recovery), then a bar at +3h → backstop.
+        let hour1 = ba_candle("2026-06-17T22:00:00Z", 1.10015, 1.10010, 1.10315, 1.10310);
+        let hour2 = ba_candle("2026-06-17T23:00:00Z", 1.10015, 1.10010, 1.10315, 1.10310);
+        let backstop = ba_candle("2026-06-18T00:00:00Z", 1.10015, 1.10010, 1.10315, 1.10310);
+        let path = [fire_bar(), fill_bar, wide, hour1, hour2, backstop];
+
+        let widen = widened_stop_at(&intent, &shell, 0.0001, &path, WIDEN_FLOOR_PIPS)
+            .expect("the NY-close-edge bar must trip the widen");
+        assert_eq!(
+            widen.restored_at,
+            Some(backstop.time),
+            "the 3h backstop must restore even with the spread still wide"
         );
     }
 

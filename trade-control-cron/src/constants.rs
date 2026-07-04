@@ -4,13 +4,13 @@
 //! values shared by the moved blackout cluster live here so the worker and the
 //! native runtime can't drift.
 
-/// Spread-blackout backstop, in seconds (~3h). Single source of truth: the
-/// global window-marker TTL (apply), each per-trade record's TTL, and the
-/// recovery watcher's "clear regardless of spread" backstop (watch) all derive
-/// from this one constant so they can never drift apart. The post-NY-close
-/// liquidity trough is ~1h; 3h is a generous safety ceiling after which a
-/// still-`applied` record is force-cleared.
-pub const BLACKOUT_BACKSTOP_SECONDS: u64 = 3 * 60 * 60;
+/// Spread-blackout backstop, in seconds (~3h). Re-exported from
+/// [`trade_control_core::spread_blackout::BLACKOUT_BACKSTOP_SECONDS`] — the value
+/// moved into `core` so the offline replay's transient-widen reconstruction
+/// computes the same backstop as the live recovery watcher without depending on
+/// this crate. Kept re-exported here (rather than fixing up every call site) so
+/// the apply/watch/record TTLs still read it from `constants` unchanged.
+pub use trade_control_core::spread_blackout::BLACKOUT_BACKSTOP_SECONDS;
 
 /// Forex pip-size fallback used by the blackout re-drive when neither the baked
 /// intent `pip_size` nor the per-trade record's pip is usable. Mirrors the
