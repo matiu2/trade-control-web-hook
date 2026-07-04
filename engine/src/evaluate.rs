@@ -1343,13 +1343,23 @@ pub fn eval_trigger(
 
 /// Did `candle` cross `level` in direction `dir` under the bar-event mode?
 ///
-/// `buffer_pct` is a cross-depth buffer as a percent of `level`'s price: an
-/// *intrabar* directional cross must pierce the wick at least `buffer_pct%` past
-/// the line before it counts, so a one-tick graze of a retest / invalidation
-/// line doesn't trip it. `0.0` reproduces the bare wick-touch behaviour. The
-/// buffer is applied on the **far** side of the line (below for `Down`, above
-/// for `Up`); `Either` and `OnClose` ignore it (a bare straddle / a close past
-/// the line is already an unambiguous cross).
+/// `buffer_pct` is a cross-depth buffer as a percent of `level`'s price. It
+/// widens the raw line into a **zone** `[level - buffer, level + buffer]`, so a
+/// wick or close that only grazes the line doesn't count as a cross:
+///
+/// - *Intrabar* directional cross — the wick must pierce at least `buffer` past
+///   the line (below for `Down`, above for `Up`); `Either` ignores it (a bare
+///   straddle is already an unambiguous touch).
+/// - *OnClose* directional cross — the close must land past the *far* zone edge,
+///   and the prior close must not have already been past it. This is the
+///   break-and-close "zone of the line" (2026-07-05): a candle that dips into
+///   the zone and closes just on the near side no longer poisons the prior-close
+///   comparison so the next candle's genuine close-through registers. `Either`
+///   fires on a close past *either* zone edge.
+///
+/// `0.0` reproduces the bare line (no zone): the OnClose arm collapses to the
+/// old strict `prev`/`close`-vs-raw-line comparison, so existing plans with no
+/// `cross_buffer_pct` are byte-identical.
 fn level_crossed(
     level: f64,
     dir: CrossDir,
@@ -1375,8 +1385,7 @@ fn level_crossed(
         //   Up    ⇒ high reached `level + buffer` or higher (low on/below by straddle)
         //   Either⇒ any straddle (the wick touched the level at all; buffer N/A)
         // (Close-confirmed crossing is `BarEvent::OnClose` — break-and-close —
-        // which must open one side and *close* the other; that arm is below and
-        // is deliberately unchanged, buffer N/A.)
+        // which must close past the buffered *zone* edge; that arm is below.)
         BarEvent::Intrabar => {
             let straddles = candle.l <= level && level <= candle.h;
             if !straddles {
@@ -1388,18 +1397,35 @@ fn level_crossed(
                 CrossDir::Down => candle.l <= level - buffer,
             }
         }
-        // OnClose: a cross relative to the prior processed close. The seed bar
-        // (no prev_close) never fires.
+        // OnClose: a cross relative to the prior processed close, measured
+        // against the buffered *zone* edges (see the fn doc). The seed bar (no
+        // prev_close) never fires. `upper`/`lower` collapse to `level` when the
+        // buffer is 0.0, reproducing the old strict raw-line comparison.
+        //
+        // For a directional cross we require that the prior close was **not
+        // already past the far edge** (so the crossing bar is the one that first
+        // closes through), and that this close lands past that far edge. Using
+        // the zone edge for the prior-close guard is the fix for the
+        // "zone of the line" bug (NAS100 short 2026-07-02): a bar that closes
+        // just inside the zone on the near side must not pre-arm the guard and
+        // block the next bar's genuine close-through.
         BarEvent::OnClose => {
             let Some(prev) = prev_close else {
                 return false;
             };
+            // Inclusivity mirrors the old raw-line rule (`prev < edge && c >=
+            // edge`): the prior close is "not yet past" when strictly on the
+            // near side of the far edge, and this close counts as past when it
+            // reaches the far edge. With buffer 0.0 (`upper == lower == level`)
+            // this is byte-identical to the pre-zone comparison.
+            let upper = level + buffer;
+            let lower = level - buffer;
+            let up = prev < upper && candle.c >= upper;
+            let down = prev > lower && candle.c <= lower;
             match dir {
-                CrossDir::Up => prev < level && candle.c >= level,
-                CrossDir::Down => prev > level && candle.c <= level,
-                CrossDir::Either => {
-                    (prev < level && candle.c >= level) || (prev > level && candle.c <= level)
-                }
+                CrossDir::Up => up,
+                CrossDir::Down => down,
+                CrossDir::Either => up || down,
             }
         }
     }
@@ -1889,12 +1915,12 @@ mod tests {
         assert!(eval_trigger(&t, &real, None, &[], 0.1));
     }
 
-    /// The buffer applies only to directional intrabar crosses, not `Either`
-    /// (a bare straddle is already an unambiguous touch) nor `OnClose` (the
-    /// close is past the line by construction). A graze straddle still fires
-    /// `Either` even with a buffer set.
+    /// The intrabar buffer applies only to directional crosses, not `Either`
+    /// (a bare straddle is already an unambiguous touch). A graze straddle still
+    /// fires `Either` even with a buffer set. (OnClose's own buffer behaviour is
+    /// covered by `on_close_zone_*` below.)
     #[test]
-    fn cross_buffer_ignored_by_either_and_on_close() {
+    fn cross_buffer_ignored_by_intrabar_either() {
         let graze = candle("2026-06-16T12:00:00Z", 1.2010, 1.2010, 1.1995, 1.2005);
         let either = Trigger::PriceValueCross {
             level: 1.2000,
@@ -1905,18 +1931,68 @@ mod tests {
             eval_trigger(&either, &graze, None, &[], 0.1),
             "Either fires on any straddle regardless of the buffer"
         );
-        // OnClose down: a bar that closed below the line fires irrespective of
-        // the buffer (the close, not the wick depth, is the test).
-        let on_close = Trigger::HorizontalCross {
+    }
+
+    /// OnClose with a 0.0 buffer is the old raw-line comparison exactly: a close
+    /// past the line fires, and the prior-close guard uses the bare line.
+    #[test]
+    fn on_close_zero_buffer_is_raw_line() {
+        let down = Trigger::HorizontalCross {
             level: 1.2000,
             dir: CrossDir::Down,
             bar: BarEvent::OnClose,
         };
+        // prev above, close just below the raw line, no buffer → fires.
         let closed_below = candle("2026-06-16T12:00:00Z", 1.2010, 1.2010, 1.1995, 1.1999);
+        assert!(eval_trigger(&down, &closed_below, Some(1.2010), &[], 0.0));
+    }
+
+    /// The core "zone of the line" fix (NAS100 short 2026-07-02): a candle that
+    /// closes just inside the zone on the near side must NOT pre-arm the guard,
+    /// so the *next* candle's genuine close through the far zone edge fires.
+    #[test]
+    fn on_close_zone_break_registers_after_near_side_dip() {
+        let down = Trigger::HorizontalCross {
+            level: 1.2000,
+            // 0.1% of 1.2000 = 0.0012 → zone [1.1988, 1.2012].
+            dir: CrossDir::Down,
+            bar: BarEvent::OnClose,
+        };
+        // Bar 1: dips into the zone, closes at 1.2001 — inside the zone, on the
+        // near (upper) side of the lower edge. With the raw-line rule this close
+        // (< 1.2000? no, 1.2001 > level) would not have crossed anyway, but the
+        // point is it does not fire and does not consume the break.
+        let near_dip = candle("2026-06-16T12:00:00Z", 1.2030, 1.2030, 1.1990, 1.2001);
         assert!(
-            eval_trigger(&on_close, &closed_below, Some(1.2010), &[], 0.1),
-            "OnClose ignores the cross buffer"
+            !eval_trigger(&down, &near_dip, Some(1.2030), &[], 0.1),
+            "a close inside the zone (near side) is not yet a break"
         );
+        // Bar 2: opens inside the zone, closes well below the lower edge — the
+        // genuine break. prev_close (1.2001) is still above the lower edge
+        // (1.1988), so the guard admits it.
+        let breakthrough = candle("2026-06-16T13:00:00Z", 1.2001, 1.2005, 1.1950, 1.1955);
+        assert!(
+            eval_trigger(&down, &breakthrough, Some(1.2001), &[], 0.1),
+            "a close below the lower zone edge after a near-side dip fires the break"
+        );
+    }
+
+    /// A close that only reaches into the zone (not past the far edge) does not
+    /// fire — the zone is a band the close must clear, not merely touch.
+    #[test]
+    fn on_close_zone_close_inside_zone_does_not_fire() {
+        let down = Trigger::HorizontalCross {
+            level: 1.2000,
+            dir: CrossDir::Down,
+            bar: BarEvent::OnClose,
+        };
+        // Zone [1.1988, 1.2012]; close 1.1995 is inside the zone (above the
+        // lower edge) → not a break yet.
+        let into_zone = candle("2026-06-16T12:00:00Z", 1.2030, 1.2030, 1.1990, 1.1995);
+        assert!(!eval_trigger(&down, &into_zone, Some(1.2030), &[], 0.1));
+        // Same bar but closing past the lower edge → fires.
+        let through = candle("2026-06-16T12:00:00Z", 1.2030, 1.2030, 1.1980, 1.1985);
+        assert!(eval_trigger(&down, &through, Some(1.2030), &[], 0.1));
     }
 
     #[test]

@@ -1,5 +1,47 @@
 # Changelog
 
+## Unreleased — 2026-07-05 — break-and-close reads a buffered *zone*, not the bare line
+
+**Why.** The `OnClose` cross (break-and-close, invalidation caps) required a
+*strict* cross of the raw line against the single prior processed close:
+`prev > level && close <= level` (down). A candle that dipped **into the zone of
+the line** and closed a hair on the near side poisoned the next bar's
+`prev_close`, so an obviously-clean close-through was silently rejected. Caught
+on NAS100 short iH&S 2026-07-02 (`hs-nas100-usd-514640f9`): the 15:00 (3pm)
+candle closed at **29844.2**, 0.9 pt *above* the neckline (29843.3); the 16:00
+(4pm) candle broke down hard (close **29713.4**) but `prev_close 29844.2 >
+neckline 29844.3` was **false** by 0.1 pt → the break never stamped, killing the
+whole retest→enter spine.
+
+**What changed.** `level_crossed`'s `OnClose` arm now measures against the
+buffered **zone** `[level - buffer, level + buffer]` (the same
+`cross_buffer_pct` already used by the intrabar arm, default 0.02%). A
+directional break fires when the close lands past the **far zone edge** and the
+prior close was **not already past that edge**:
+- **Down** — `prev > level - buffer && close <= level - buffer`
+- **Up** — `prev < level + buffer && close >= level + buffer`
+- **Either** — a close past either edge.
+
+Because the prior-close guard uses the *zone edge*, a candle that only dips into
+the zone on the near side no longer pre-arms the guard and blocks the next bar's
+genuine close-through. On the NAS100 chart the break now stamps **at 4pm**,
+exactly where the chart breaks. Applies to **all** `OnClose` crosses (the
+too-high invalidation cap too — consistent, single code path). Lives in the
+shared engine, so worker (wasm) + `replay-candles` pick it up identically.
+
+**Compatibility.** With `buffer 0.0` (`upper == lower == level`) the arm is
+byte-identical to the old raw-line comparison — plans without `cross_buffer_pct`
+are unchanged. Inclusivity mirrors the old rule (`prev < edge && c >= edge`).
+
+**Tests.** `on_close_zone_break_registers_after_near_side_dip` (the fix — a
+near-side dip then a genuine break the next bar),
+`on_close_zone_close_inside_zone_does_not_fire` (a close into but not past the
+zone is not a break), `on_close_zero_buffer_is_raw_line` (0.0 buffer =
+old behaviour). Renamed `cross_buffer_ignored_by_either_and_on_close` →
+`cross_buffer_ignored_by_intrabar_either` (OnClose no longer ignores the
+buffer). Verified end-to-end: the NAS100 replay stamps break-and-close at 4pm
+and progresses the spine to the retest.
+
 ## Unreleased — 2026-07-04 — retest no longer gated behind an in-window break-and-close
 
 **Why.** A `--skip-break-and-close` plan (the operator armed *on* the retest,
