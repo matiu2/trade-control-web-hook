@@ -624,25 +624,27 @@ pub struct SpreadWiden {
 /// the **exit price** — without this, a replay would stop the position out at
 /// the original (tighter) level and diverge from the live worker.
 ///
-/// **The NY-close-edge gate.** The live cron only widens at the NY-close edge —
-/// `apply_if_ny_close_edge` no-ops every other tick — because that is when the
-/// post-close spread blowout the widen guards against occurs. So a bar only
-/// qualifies here if [`trade_control_core::ny_clock::is_ny_close_edge`] is true
-/// on its open time (21:00 UTC under EDT / 22:00 under EST). Without this gate
-/// the replay widened on the *first* wide-spread bar at any hour, diverging from
-/// the worker on a trade whose spread flared off the NY close (EUR/AUD
-/// `hs-eur-aud-3d0b5dda`, journal bug).
+/// **The per-instrument spread-hour gate (2026-07-05).** The live cron widens
+/// at each instrument's *own* learned spread hours (baked from the sampler
+/// data), not one global NY-close hour — Gold overnight, EUR/USD at 21:00,
+/// indices at their own — via
+/// [`trade_control_core::spread_blackout::spread_hour_widen_pips`]. This replay
+/// mirrors that: a bar qualifies when `spread_hour_widen_pips(instrument,
+/// c.time)` is `Some` (in/leading into a learned spread hour → widen by the
+/// baked p90), OR — for an **un-sampled** instrument with no learned hours — the
+/// bar is at the legacy NY-close edge
+/// ([`trade_control_core::ny_clock::is_ny_close_edge`], 21:00 UTC EDT / 22:00
+/// EST) AND its live spread reaches `widen_trigger_pips`. The pre-2026-07-05
+/// behaviour (global NY-close gate + `clamp_widen`) survives verbatim on the
+/// fallback path so un-sampled assets don't regress.
 ///
-/// **The trigger.** The caller passes `widen_trigger_pips` — the instrument's
-/// spread-blackout threshold (`baked-baseline × 5`) via
-/// [`trade_control_core::spread_blackout::elevated_threshold_pips`], the *same*
-/// number the System-1 entry-reject uses. Now that the baked baseline lives in
-/// shared `core` the engine links it directly, so this is the **exact**
-/// per-instrument threshold the live worker's `blackout_apply` widens against —
-/// no longer the flat `WIDEN_FLOOR_PIPS` proxy. The first **NY-close-edge**
-/// post-fill bar whose **spread** (`ask_c − bid_c`, in pips) meets or exceeds it
-/// — *while the stop hasn't yet been hit* — is the widen bar. The amount it
-/// widens by is still floored/clamped 22–40 pips via
+/// **The trigger / widen size.** For a baked spread-hour bar the widen is
+/// [`trade_control_core::blackout_widen::spread_hour_widen_size`] — baked p90
+/// primary, live spread as a floor, per-instrument ceiling (see that fn's
+/// docs). For the legacy fallback the caller's `widen_trigger_pips` (the
+/// instrument's `baked-baseline × 5` from
+/// [`trade_control_core::spread_blackout::elevated_threshold_pips`], the same
+/// number System 1 uses) still gates, and the amount is the flat 22–40
 /// [`trade_control_core::blackout_widen::clamp_widen`].
 ///
 /// Pure and side-effect-free. Returns `None` when the enter has no fill, exits
@@ -679,37 +681,52 @@ pub fn widened_stop_at(
         {
             return None;
         }
-        // NY-close-edge gate — mirror the live cron. `blackout_apply`'s
-        // `apply_if_ny_close_edge` widens open stops ONLY at the NY-close edge
-        // (21:00 UTC under EDT / 22:00 under EST), where the post-close spread
-        // blowout happens. Without this gate the replay widened on the *first*
-        // wide-spread bar at any hour, diverging from the worker on any trade
-        // whose spread flared off the NY close. `c.time` is the bar-open instant;
-        // `is_ny_close_edge` matches on the hour, so the 21:00/22:00 UTC bar
-        // qualifies. (EUR/AUD `hs-eur-aud-3d0b5dda` journal bug — the report
-        // mistook a correct NY-close widen for a wrong-bar widen; this closes the
-        // *actual* gap it half-found.)
-        if !trade_control_core::ny_clock::is_ny_close_edge(c.time) {
+        // Per-instrument spread-hour gate — mirror the live cron's System 2
+        // (`widen_open_stops_for_spread_hours`). `spread_hour_widen_pips`
+        // returns `Some(baked_p90)` iff this bar's instrument is in (or leading
+        // into) one of its learned spread hours; `None` means either "not a
+        // spread hour now" or "un-sampled instrument", disambiguated by the
+        // legacy `is_ny_close_edge` fallback (so un-sampled assets keep the old
+        // NY-close-only behaviour). Before 2026-07-05 this was a single global
+        // `is_ny_close_edge` gate for ALL instruments — see
+        // `[[strategy_changes_in_both_replayer_and_worker]]`; the worker + this
+        // replay must gate identically.
+        let baked_p90 =
+            trade_control_core::spread_blackout::spread_hour_widen_pips(&intent.instrument, c.time);
+        if baked_p90.is_none() && !trade_control_core::ny_clock::is_ny_close_edge(c.time) {
             continue;
         }
         let spread_pips = (c.ask_c - c.bid_c) / pip_size;
-        if spread_pips.is_finite() && spread_pips >= widen_trigger_pips {
-            let widen_pips = trade_control_core::blackout_widen::clamp_widen(spread_pips);
-            let widened = trade_control_core::blackout_widen::widened_stop(
-                dir,
-                original_stop,
-                widen_pips,
-                pip_size,
-            );
-            let restored_at = restore_bar(&fill.rest[i + 1..], c.time, pip_size);
-            return Some(SpreadWiden {
-                at: c.time,
-                original_stop,
-                widen_spread_pips: spread_pips,
-                widened_stop: widened,
-                restored_at,
-            });
+        if !spread_pips.is_finite() {
+            continue;
         }
+        // A baked spread-hour bar widens regardless of the live spread reading
+        // (the baked p90 is the primary widen; the timing is what the mask
+        // asserts). The legacy fallback still requires the live spread to reach
+        // the per-instrument trigger, matching the pre-2026-07-05 behaviour.
+        let widen_pips = match baked_p90 {
+            Some(p90) => {
+                trade_control_core::blackout_widen::spread_hour_widen_size(p90, spread_pips)
+            }
+            None if spread_pips >= widen_trigger_pips => {
+                trade_control_core::blackout_widen::clamp_widen(spread_pips)
+            }
+            None => continue,
+        };
+        let widened = trade_control_core::blackout_widen::widened_stop(
+            dir,
+            original_stop,
+            widen_pips,
+            pip_size,
+        );
+        let restored_at = restore_bar(&fill.rest[i + 1..], c.time, pip_size);
+        return Some(SpreadWiden {
+            at: c.time,
+            original_stop,
+            widen_spread_pips: spread_pips,
+            widened_stop: widened,
+            restored_at,
+        });
     }
     None
 }
@@ -1530,6 +1547,53 @@ mod tests {
         assert_eq!(
             widen.at, on_edge.time,
             "widen must land on the NY-close bar, not the first wide bar"
+        );
+    }
+
+    /// A **baked** spread-hour instrument (TN-named `EUR/USD`, whose baked mask
+    /// has bit 21 set with a ~5p p90) widens by the baked p90 via
+    /// `spread_hour_widen_size`, NOT the legacy 22p `clamp_widen` floor — this
+    /// is the whole point of the per-instrument path. The bar's live spread is
+    /// tight (2p), so the legacy path would have needed the trigger *and* would
+    /// have floored to 22p; the baked path fires on the mask alone and widens by
+    /// ~5p. Depends on the committed sampler baseline (EUR/USD 21:00 spike).
+    #[test]
+    fn widened_stop_at_uses_baked_p90_for_a_sampled_instrument() {
+        use trade_control_core::blackout_widen::WIDEN_FLOOR_PIPS;
+        use trade_control_core::spread_blackout::spread_hour_widen_pips;
+
+        let mut intent = long_stop_intent();
+        intent.instrument = "EUR/USD".into(); // TN name → in the baked table
+        i_set_levels(&mut intent, 1.1000, 1.0950, 1.1100);
+        let shell = trigger_shell();
+
+        // Guard: the baseline must actually carry EUR/USD's 21:00 spread hour,
+        // else this test is vacuous. 21:00 UTC on an EDT date is a spread hour.
+        let at21 = ts("2026-06-17T21:00:00Z");
+        let baked = spread_hour_widen_pips("EUR/USD", at21)
+            .expect("EUR/USD must have a baked 21:00 spread hour");
+
+        let fill_bar = candle("2026-06-17T11:00:00Z", 1.1000, 1.1001, 1.0999, 1.1000);
+        // 21:00 UTC bar with a TIGHT 2p spread — the baked mask fires anyway.
+        let tight = ba_candle("2026-06-17T21:00:00Z", 1.10010, 1.10005, 1.10030, 1.10025);
+        let path = [fire_bar(), fill_bar, tight];
+
+        let widen = widened_stop_at(&intent, &shell, 0.0001, &path, WIDEN_FLOOR_PIPS)
+            .expect("the baked spread hour must trip the widen even on a tight-spread bar");
+        assert_eq!(widen.at, tight.time);
+        // Widen distance = baked p90 (~5p), NOT the 22p legacy floor. Long ⇒ SL
+        // moves DOWN from 1.0950 by baked p90 pips.
+        let expected = 1.0950 - baked * 0.0001;
+        assert!(
+            (widen.widened_stop - expected).abs() < 1e-9,
+            "widened by baked p90 {baked}p (expected SL {expected}), got {}",
+            widen.widened_stop,
+        );
+        // Sanity: the baked p90 is much smaller than the legacy 22p floor, so
+        // this genuinely exercises the new path.
+        assert!(
+            baked < WIDEN_FLOOR_PIPS,
+            "baked p90 {baked} should be < 22p floor"
         );
     }
 

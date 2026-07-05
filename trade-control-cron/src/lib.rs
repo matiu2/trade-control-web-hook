@@ -38,7 +38,7 @@ pub use broker_handle::BrokerHandle;
 pub use engine::run_engine_tick;
 pub use seam::CronEnv;
 
-pub use blackout_apply::apply_if_ny_close_edge;
+pub use blackout_apply::{apply_if_ny_close_edge, widen_open_stops_for_spread_hours};
 pub use blackout_cancel::cancel_resting_orders;
 pub use blackout_hours::refresh_if_due as refresh_market_hours_if_due;
 pub use blackout_restore::restore_cancelled_orders;

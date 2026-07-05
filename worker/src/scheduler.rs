@@ -62,7 +62,7 @@ use std::time::Duration;
 
 use trade_control_cron::{
     apply_if_ny_close_edge, breakeven_watch, refresh_market_hours_if_due, run_engine_tick,
-    sweep_pending_orders, watch_recovery,
+    sweep_pending_orders, watch_recovery, widen_open_stops_for_spread_hours,
 };
 
 use crate::SchedulerConfig;
@@ -243,6 +243,10 @@ async fn blackout_apply_loop(state: Arc<AppState>, cron: NativeCronEnv, period: 
     loop {
         interval.tick().await;
         let now = chrono::Utc::now();
+        // System 2 — per-instrument spread-hour widen, every tick (self-gates
+        // per-instrument on the baked mask). System 1 window + System 3 cancel
+        // stay NY-close-edge-gated inside `apply_if_ny_close_edge`.
+        widen_open_stops_for_spread_hours(&state.store, &cron, now).await;
         apply_if_ny_close_edge(&state.store, &cron, now).await;
     }
 }

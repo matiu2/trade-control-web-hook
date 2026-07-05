@@ -82,10 +82,18 @@ pub async fn scheduled(_event: ScheduledEvent, env: Env, ctx: ScheduleContext) {
         // bump is Stage F, once the engine is proven on demo.
         trade_control_cron::run_engine_tick(&store, &cron_env, now).await;
 
-        // NY-close-edge job — fire exactly once per close hour, on the :00
-        // tick. `apply_if_ny_close_edge` re-checks `is_ny_close_edge` itself,
-        // so the minute gate is purely to avoid running it on all four ticks
-        // of the close hour.
+        // System 2 — per-instrument spread-hour stop-widen. Fires on EVERY
+        // tick (not just the NY-close hour) because spread hours are
+        // per-instrument and the ~30-min lead straddles the top of the hour;
+        // the widen self-gates per-instrument on the baked spread-hour mask,
+        // so most ticks no-op cheaply.
+        trade_control_cron::widen_open_stops_for_spread_hours(&store, &cron_env, now).await;
+
+        // NY-close-edge job — System 1 (entry-reject window) + System 3
+        // (cancel resting orders), fired exactly once per close hour on the
+        // :00 tick. `apply_if_ny_close_edge` re-checks `is_ny_close_edge`
+        // itself, so the minute gate is purely to avoid running it on all
+        // four ticks of the close hour.
         if now.minute() < 15 {
             trade_control_cron::apply_if_ny_close_edge(&store, &cron_env, now).await;
             // Daily market-hours blackout refresh — self-gates on its own hour

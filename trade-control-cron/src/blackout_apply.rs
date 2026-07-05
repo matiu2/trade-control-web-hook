@@ -28,19 +28,30 @@
 use std::collections::HashMap;
 
 use chrono::{DateTime, Duration, Utc};
-use trade_control_core::blackout_widen::{clamp_widen, widened_stop};
+use trade_control_core::blackout_widen::{clamp_widen, spread_hour_widen_size, widened_stop};
 use trade_control_core::broker::{AmendError, Broker, OpenPosition};
 use trade_control_core::ny_clock::is_ny_close_edge;
+use trade_control_core::spread_blackout::spread_hour_widen_pips;
 use trade_control_core::state::{EntryAttempt, RememberedStop, SpreadBlackoutRecord, StateStore};
 
 use crate::broker_handle::BrokerHandle;
 use crate::constants::BLACKOUT_BACKSTOP_SECONDS;
 use crate::seam::CronEnv;
 
-/// Open the global spread-blackout window marker iff `now` is the
-/// NY-close edge, then widen open stops (System 2). The caller fires this on
-/// every candidate tick; `is_ny_close_edge` decides which is the real edge this
-/// season and no-ops the rest.
+/// Open the global spread-blackout window marker + cancel resting entry
+/// orders iff `now` is the NY-close edge. **System 1 (entry-reject window)
+/// and System 3 (cancel resting orders)** — both keyed to the single global
+/// NY-close concept. The caller fires this on every candidate tick;
+/// `is_ny_close_edge` decides which is the real edge this season and no-ops
+/// the rest.
+///
+/// **System 2 (widen open stops) is NOT here** — it moved to
+/// [`widen_open_stops_for_spread_hours`], which is per-instrument (each
+/// instrument's own learned spread hours from the baked sampler data) and
+/// fires on every tick, not just at the NY-close edge. See that fn's docs
+/// for why the split happened (the 2026-07-05 spread-hour analysis: the
+/// widen must fire at *each instrument's* elevated hours — Gold overnight,
+/// EUR/USD 21:00, indices at their own — not one global NY-close hour).
 pub async fn apply_if_ny_close_edge<S, C>(store: &S, cron: &C, now: DateTime<Utc>)
 where
     S: StateStore,
@@ -58,14 +69,46 @@ where
         Err(err) => tracing::error!("blackout: failed to open window: {err}"),
     }
 
-    // System 2 — widen open stops away from price.
-    widen_open_stops(store, cron, now).await;
     // System 3 — cancel resting entry orders on elevated-spread instruments
     // and store their signed intent for the recovery watcher to re-drive.
-    // Runs on the SAME affected-account set as the widen; the two share one
-    // `SpreadBlackoutRecord` per trade (widened stops in `original_stops`,
-    // cancelled orders in `cancelled_orders`) and the watcher restores both.
+    // Shares the `SpreadBlackoutRecord` per trade with System 2's widen
+    // (widened stops in `original_stops`, cancelled orders in
+    // `cancelled_orders`) and the watcher restores both.
     crate::cancel_resting_orders(store, cron, now).await;
+}
+
+/// **System 2** — pre-emptively widen every open position's stop away from
+/// price during that instrument's learned **spread hour(s)**, so the spread
+/// spike can't clip the stop, remembering each original on a per-trade
+/// `SpreadBlackoutRecord` for the recovery watcher to restore.
+///
+/// # Why this is separate from [`apply_if_ny_close_edge`]
+///
+/// The widen used to fire only at the single global NY-close edge (21:00/
+/// 22:00 UTC). The 2026-07-05 sampler analysis (1183 instruments) showed
+/// spread hours are **per-instrument** session boundaries — Gold spreads
+/// overnight (18:00–06:00 UTC), EUR/USD spikes at 21:00, indices at their
+/// own hours — and the NY-close hour is nearly the emptiest peak. So the
+/// widen now gates per-instrument on
+/// [`spread_hour_widen_pips`](trade_control_core::spread_blackout::spread_hour_widen_pips):
+/// the baked mask says *when* (this instrument's elevated hours, with a
+/// ~30-min lead so the stop is out of the way before the top-of-hour spike)
+/// and the baked p90 says *how much*. Un-sampled instruments fall back to
+/// the legacy `is_ny_close_edge` gate via
+/// [`is_spread_hour`](trade_control_core::spread_blackout::is_spread_hour).
+///
+/// Fires on **every** tick (the caller does not gate it) because the lead
+/// window straddles the top of the hour — the per-instrument mask check is
+/// cheap and no-ops when no open position is in a spread hour. Applies to
+/// **all** open positions including breakeven-locked ones (a breakeven stop
+/// sits exactly at entry and is the *most* spread-vulnerable — see the
+/// widen decision in `widen_one`).
+pub async fn widen_open_stops_for_spread_hours<S, C>(store: &S, cron: &C, now: DateTime<Utc>)
+where
+    S: StateStore,
+    C: CronEnv,
+{
+    widen_open_stops(store, cron, now).await;
 }
 
 /// List open positions per affected account, join each to its originating
@@ -173,6 +216,20 @@ async fn widen_one<S: StateStore>(
         return;
     };
 
+    // Per-instrument spread-hour gate (cheap; do it before the join/quote).
+    // `Some(p90)` ⇒ this instrument IS in (or leading into) a learned spread
+    // hour now, and `p90` is the baked widen size. `None` ⇒ either this
+    // instrument has baked spread hours but now isn't one of them, OR it's
+    // un-sampled — disambiguate with the legacy NY-close-edge fallback so
+    // un-sampled assets keep their prior behaviour.
+    let baked_p90 = spread_hour_widen_pips(&position.instrument, now);
+    if baked_p90.is_none() && !is_ny_close_edge(now) {
+        // Not a spread hour for this instrument, and not the legacy fallback
+        // edge either → nothing to widen this tick. (Silent: the common case
+        // on most ticks for most instruments.)
+        return;
+    }
+
     // Join → originating attempt (for trade_id + baked pip_size).
     let Some(attempt) = join_position_to_attempt(position, account, attempts) else {
         tracing::info!(
@@ -229,7 +286,15 @@ async fn widen_one<S: StateStore>(
         return;
     };
     let spread_pips = spread_abs / pip_size;
-    let widen_pips = clamp_widen(spread_pips);
+    // Widen size: with a baked per-instrument p90 for this spread hour, blend
+    // it with the live spread (baked primary, live as a floor, per-instrument
+    // ceiling) via `spread_hour_widen_size`. Without one (an un-sampled
+    // instrument on the legacy NY-close-edge fallback), keep the flat 22–40
+    // `clamp_widen`. See `blackout_widen` for the documented blend rationale.
+    let widen_pips = match baked_p90 {
+        Some(p90) => spread_hour_widen_size(p90, spread_pips),
+        None => clamp_widen(spread_pips),
+    };
     let new_sl = widened_stop(position.direction, original_sl, widen_pips, pip_size);
 
     // RECORD FIRST (crash-safe), then amend. `order_id` is the documented
@@ -263,10 +328,15 @@ async fn widen_one<S: StateStore>(
     // PRECONDITION-guarded amend: log the intended amend prominently so a
     // demo run can read it back and confirm `AmendCloseOrder`-on-open-position
     // actually moved the SL (and left TP) before this is trusted live.
+    let widen_source = match baked_p90 {
+        Some(p90) => format!("baked-p90 {p90:.1}p (spread-hour)"),
+        None => "legacy ny-close clamp".to_string(),
+    };
     tracing::info!(
         "blackout widen[{}]: INTENT amend_stop trade={trade_id} id={} instrument={} dir={:?} \
          original_sl={original_sl} spread_pips={spread_pips:.1} widen_pips={widen_pips} \
-         new_sl={new_sl} (DEMO-CONFIRM AmendCloseOrder-on-open-position before trusting live)",
+         new_sl={new_sl} via {widen_source} (DEMO-CONFIRM AmendCloseOrder-on-open-position before \
+         trusting live)",
         account.unwrap_or("<global>"),
         position.order_id,
         position.instrument,
