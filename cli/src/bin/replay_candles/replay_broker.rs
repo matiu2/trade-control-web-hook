@@ -36,6 +36,18 @@ struct PlacedAttempt {
     cancelled: bool,
 }
 
+/// The geometry the replay loop arms before each `run_enter` so this broker's
+/// `place_entry` can mint a correlatable order id and record the attempt. The
+/// real dispatch (`run_enter`) calls `broker.place_entry` with only an
+/// `EntryRequest`, which lacks the intent + shell the offline prior-attempt
+/// resolver needs — so the loop hands them in out-of-band here.
+#[derive(Clone)]
+struct ArmedPlacement {
+    order_id: String,
+    intent: Intent,
+    shell: Shell,
+}
+
 /// Offline broker that resolves prior-attempt state from the candle window.
 pub struct ReplayBroker {
     /// The full pulled bid/ask candle window (warm-up + live), ascending. Each
@@ -48,6 +60,9 @@ pub struct ReplayBroker {
     /// simulation at this bar (time-accurate prior-state resolution).
     as_of: RefCell<DateTime<Utc>>,
     placed: RefCell<Vec<PlacedAttempt>>,
+    /// The placement the loop armed for the next `run_enter` (its intent, shell,
+    /// and the order id `place_entry` should return). Consumed by `place_entry`.
+    armed: RefCell<Option<ArmedPlacement>>,
 }
 
 impl ReplayBroker {
@@ -58,6 +73,7 @@ impl ReplayBroker {
             pip_size,
             as_of: RefCell::new(last),
             placed: RefCell::new(Vec::new()),
+            armed: RefCell::new(None),
         }
     }
 
@@ -67,10 +83,24 @@ impl ReplayBroker {
         *self.as_of.borrow_mut() = as_of;
     }
 
+    /// Arm the placement for the next `run_enter`: the order id `place_entry`
+    /// should return and the intent + shell needed to resolve this attempt's
+    /// later state. Call right before dispatching the enter; `place_entry`
+    /// consumes it. `order_id` must match what the gate stores on the
+    /// `EntryAttempt` (`run_enter` stamps `place_entry`'s return there), so the
+    /// minted id is the standard `{intent.id}-{attempt_no}` form.
+    pub fn arm_placement(&self, order_id: String, intent: Intent, shell: Shell) {
+        *self.armed.borrow_mut() = Some(ArmedPlacement {
+            order_id,
+            intent,
+            shell,
+        });
+    }
+
     /// Register a placed attempt so a later lookup can resolve it. `order_id`
     /// must match what the gate stored on the `EntryAttempt` (the replay uses
     /// the same id when it `record_placement`s).
-    pub fn record_attempt(&self, order_id: String, intent: Intent, shell: Shell) {
+    fn record_attempt(&self, order_id: String, intent: Intent, shell: Shell) {
         self.placed.borrow_mut().push(PlacedAttempt {
             order_id,
             intent,
@@ -101,6 +131,17 @@ impl ReplayBroker {
             .filter(|c| c.time <= as_of)
             .cloned()
             .collect()
+    }
+
+    /// The bid/ask candle at the current `as_of` bar (the bar `run_enter` is
+    /// firing on, since the replay loop calls `set_as_of(fire_bar.time)` right
+    /// before dispatching). This is the closed fire bar whose book the live
+    /// worker would sample with a `get_quote` round-trip. Falls back to the last
+    /// candle at/before `as_of` if the exact open time isn't present (it always
+    /// is in the replay's closed loop, but stay robust).
+    fn candle_at_as_of(&self) -> Option<&BidAskCandle> {
+        let as_of = *self.as_of.borrow();
+        self.candles.iter().rfind(|c| c.time <= as_of)
     }
 
     /// Resolve a placed attempt's current state from its price path up to
@@ -155,9 +196,29 @@ impl Broker for ReplayBroker {
         _max_open_positions: u32,
         _req: &EntryRequest<'_>,
     ) -> Result<String, EntryError> {
-        // The replay places via simulate_fill in its own loop, not through the
-        // broker trait. The gate never calls this.
-        unreachable!("ReplayBroker: place_entry is driven by the replay loop, not the gate")
+        // The real dispatch (`run_enter`) calls this to "place" the order. The
+        // replay loop armed the geometry out-of-band (intent + shell + the order
+        // id to return) because `EntryRequest` lacks what the offline
+        // prior-attempt resolver needs. Record the attempt so a later
+        // `lookup_attempt_state` can resolve it, and hand back the armed id —
+        // which `run_enter` then stamps onto the `EntryAttempt` row, keeping the
+        // gate's correlation intact.
+        let armed = self.armed.borrow_mut().take();
+        match armed {
+            Some(a) => {
+                self.record_attempt(a.order_id.clone(), a.intent, a.shell);
+                Ok(a.order_id)
+            }
+            // No armed placement means the loop dispatched an enter without
+            // arming first — a wiring bug, not a broker condition. Fail the
+            // placement loudly rather than fabricate an id.
+            None => {
+                tracing::error!(
+                    "ReplayBroker::place_entry called with no armed placement — replay wiring bug"
+                );
+                Err(EntryError::OrderRejected)
+            }
+        }
     }
 
     async fn close_positions(&self, _instrument: &str) -> bool {
@@ -201,7 +262,30 @@ impl Broker for ReplayBroker {
     }
 
     async fn get_quote(&self, _instrument: &str) -> Result<Quote, LookupError> {
-        Err(LookupError::Transient)
+        // The shared entry gates (spread-blackout + SL-vs-spread floor in
+        // `dispatch::run_enter`) sample the live spread via this round-trip. The
+        // replay candles carry the real book (`bid_c`/`ask_c`), so synthesize the
+        // quote from the fire bar's close rather than failing open: that lets the
+        // offline replay REPRODUCE a spread rejection the live worker would make,
+        // tightening replay↔live parity.
+        //
+        // Fidelity caveat: a closed bar's `bid_c`/`ask_c` is the spread *at the
+        // bar's close*, a coarse proxy for the live worker's instant-of-fire
+        // sample. It captures sustained-wide spreads — exactly the post-NY-close
+        // liquidity trough the spread-blackout window targets — but not a brief
+        // intrabar spike that retraces by the close. So the replay reproduces the
+        // common case (sustained wide) and under-reports the sub-bar-spike edge.
+        // Better than the old unconditional fail-open, which reproduced nothing.
+        match self.candle_at_as_of() {
+            Some(c) => Ok(Quote {
+                bid: c.bid_c,
+                ask: c.ask_c,
+            }),
+            // No candle at/before `as_of` — should never happen in the replay's
+            // closed loop (the fire bar is always present), but if it does, fail
+            // open the same way the live worker does on a transient quote error.
+            None => Err(LookupError::Transient),
+        }
     }
 
     async fn list_open_positions(
@@ -308,6 +392,61 @@ mod tests {
             }"#,
         )
         .expect("valid enter intent")
+    }
+
+    /// A bar carrying an explicit bid/ask close spread, so `get_quote` has a
+    /// non-zero book to surface. Mid OHLC are left at `c` for simplicity (the
+    /// quote path reads only the bid/ask closes).
+    fn spread_candle(epoch: i64, bid_c: f64, ask_c: f64) -> BidAskCandle {
+        let mid = (bid_c + ask_c) / 2.0;
+        BidAskCandle {
+            time: Utc.timestamp_opt(epoch, 0).unwrap(),
+            o: mid,
+            h: mid + 0.001,
+            l: mid - 0.001,
+            c: mid,
+            bid_o: bid_c,
+            bid_h: bid_c + 0.001,
+            bid_l: bid_c - 0.001,
+            bid_c,
+            ask_o: ask_c,
+            ask_h: ask_c + 0.001,
+            ask_l: ask_c - 0.001,
+            ask_c,
+        }
+    }
+
+    #[tokio::test]
+    async fn get_quote_synthesizes_the_as_of_bar_book() {
+        // Two bars with different spreads; `get_quote` must reflect whichever
+        // bar `as_of` points at (the fire bar the worker would sample).
+        let tight = spread_candle(0, 1.10000, 1.10002); // 0.2 pip
+        let wide = spread_candle(3600, 1.10000, 1.10050); // 5.0 pip (blackout-class)
+        let b = ReplayBroker::new(vec![tight, wide], 0.0001);
+
+        // As-of the tight bar → tight quote.
+        b.set_as_of(Utc.timestamp_opt(0, 0).unwrap());
+        let q0 = b.get_quote("EUR/USD").await.unwrap();
+        assert_eq!(q0.bid, 1.10000);
+        assert_eq!(q0.ask, 1.10002);
+        assert!((q0.spread() / 0.0001 - 0.2).abs() < 1e-9, "0.2 pip spread");
+
+        // As-of the wide bar → wide quote (the spread the blackout gate rejects).
+        b.set_as_of(Utc.timestamp_opt(3600, 0).unwrap());
+        let q1 = b.get_quote("EUR/USD").await.unwrap();
+        assert_eq!(q1.bid, 1.10000);
+        assert_eq!(q1.ask, 1.10050);
+        assert!((q1.spread() / 0.0001 - 5.0).abs() < 1e-9, "5.0 pip spread");
+    }
+
+    #[tokio::test]
+    async fn get_quote_fails_open_with_no_candle_before_as_of() {
+        // `as_of` before any candle → no book to sample → transient (fail open),
+        // matching the live worker's behaviour on a quote-endpoint hiccup.
+        let b = ReplayBroker::new(vec![spread_candle(3600, 1.10000, 1.10002)], 0.0001);
+        b.set_as_of(Utc.timestamp_opt(0, 0).unwrap());
+        let err = b.get_quote("EUR/USD").await.unwrap_err();
+        assert_eq!(err, LookupError::Transient);
     }
 
     #[tokio::test]

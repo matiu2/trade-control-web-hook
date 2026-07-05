@@ -30,9 +30,9 @@ pub use calendar_bars::{
 pub use control::{
     build_clear_prep_intent, build_clear_veto_intent, build_market_info_intent,
     build_plan_delete_intent, build_plan_list_intent, build_plan_purge_intent,
-    build_plan_show_intent, build_prep_intent, build_purge_older_than_intent,
-    build_register_intent, build_status_intent, build_unlock_intent, build_veto_intent,
-    wrap_signed, wrap_signed_direct_enter, wrap_signed_template,
+    build_plan_show_intent, build_plan_timeline_intent, build_prep_intent,
+    build_purge_older_than_intent, build_register_intent, build_status_intent, build_unlock_intent,
+    build_veto_intent, wrap_signed, wrap_signed_direct_enter, wrap_signed_template,
 };
 /// Re-export forex-factory's event + impact types so downstream
 /// consumers (tv-news, future strategy binaries) don't have to pin the

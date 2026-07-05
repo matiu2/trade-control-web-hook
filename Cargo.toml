@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["broker-oanda", "cli", "conventions", "core", "engine", "trading-view", "tv-arm", "tv-news"]
+members = ["broker-oanda", "broker-tradenation-adapter", "cli", "conventions", "core", "engine", "trade-control-cron", "trading-view", "tv-arm", "tv-news", "worker"]
 
 [package]
 name = "trade-control-web-hook"
@@ -12,8 +12,8 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 broker-oanda = { version = "0.1.0", path = "broker-oanda" }
-broker-tradenation = { git = "https://github.com/matiu2/tradenation-api.git", tag = "broker-tradenation-v0.10.0", features = ["wasm_js"] }
-tradenation-api = { git = "https://github.com/matiu2/tradenation-api.git", tag = "broker-tradenation-v0.10.0", features = ["wasm_js"] }
+broker-tradenation = { git = "https://github.com/matiu2/tradenation-api.git", tag = "broker-tradenation-v0.11.0", features = ["wasm_js"] }
+tradenation-api = { git = "https://github.com/matiu2/tradenation-api.git", tag = "broker-tradenation-v0.11.0", features = ["wasm_js"] }
 chrono = { version = "0.4.44", default-features = false, features = ["alloc", "serde"] }
 hex = "0.4.3"
 serde = { version = "1.0.228", features = ["derive"] }
@@ -24,9 +24,10 @@ worker = "^0.8"
 tracing = { version = "0.1.44", default-features = false, features = ["std"] }
 candle-model = { version = "0.1.0", path = "../candle-model" }
 trade-control-engine = { version = "0.1.0", path = "engine" }
+broker-tradenation-adapter = { version = "0.1.0", path = "broker-tradenation-adapter" }
+trade-control-cron = { version = "0.1.0", path = "trade-control-cron" }
 
 [dev-dependencies]
-pollster = "0.4.0"
 trade-control-core = { path = "core", features = ["test-support"] }
 
 # The spread-baseline bake (per-instrument thresholds from the

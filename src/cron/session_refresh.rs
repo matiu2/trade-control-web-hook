@@ -4,6 +4,17 @@
 //! forces a re-login via the existing `acquire_tn_broker` helper.
 //! Re-login itself writes the fresh `cached_at` via `cache_and_open`,
 //! so this module only decides "is it time to refresh?"
+//!
+//! # wasm-only — NOT ported to `trade-control-cron`, by design
+//!
+//! This job exists because the wasm Cloudflare worker can't easily re-login
+//! mid-request, so it pre-warms the TN sessions into the KV session cache out of
+//! band. The native runtime has **no KV session cache to pre-warm**: its
+//! `acquire_tn` logs in on demand against the encrypted account store every time
+//! the broker factory is asked for a broker. So `session_refresh` has **no
+//! native equivalent and is deliberately not ported** — it is a wasm-only
+//! optimization, a considered divergence between the two runtimes, not a missing
+//! port. Do not move or genericize it into the shared cron crate.
 
 use chrono::{DateTime, Duration, Utc};
 use worker::Env;

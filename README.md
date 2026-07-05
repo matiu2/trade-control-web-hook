@@ -52,6 +52,14 @@ Trading:
     Mixing the old and new forms on one intent is a validation error —
     pick one. Migrate to the new form on next regen.
   With no gate set the close is unconditional (operator emergency-close path).
+  - **Spine interaction (server-side engine).** A **news-windowed** reversal-close
+    is a "flatten *if* in a position" safety: when it fires it dispatches the
+    close but leaves the plan's spine intact, so a still-pending entry is **not**
+    starved (the `allow_close` gate already no-ops the flatten when flat). It only
+    fires *inside* an open news window — the engine mirrors the worker's active
+    `news:<trade_id>:<news_id>` check, so a reversal printing after `news-end`
+    doesn't fire. A **price-windowed** close (reversal back at the SR band) is a
+    thesis invalidation and *does* retire the plan.
 - `invalidate` — set a per-instrument cooldown (default 12 h) and cancel any pending
   orders. Use this when your setup is no longer valid (price drifted out of the
   expected range) and you want to be sure no entry fires while you sleep.
@@ -79,6 +87,25 @@ Trading:
   account scopes — **live and archived** — so a terminated plan surfaced by
   `plan list --include-all` is still inspectable (an archived match carries an
   `archived_at` field). Drives `trade-control plan show <trade_id>`. KV-only.
+- `plan-timeline` — read-only: reconstruct the **event timeline** for one trade
+  from the worker's durable recordings. Target named by the intent's `trade_id`;
+  returns a `PlanTimeline` envelope with **both** event streams for that trade,
+  each in timestamp order:
+  - `records` — the inbound signed-alert `RequestRecord`s (`request_records`
+    table): enters, vetoes, preps and their dispatch outcomes.
+  - `ticks` — the cron-engine `TickBundle`s (`tick_bundles` table, keyed on
+    `correlation_id == trade_id`): every tick that evaluated the plan, with the
+    rules it fired and their dispatch outcomes. A veto or enter that fired on a
+    cron tick — the common case now — lives only here, so a records-only
+    timeline would miss it.
+
+  The CLI interleaves the two by timestamp, so you see what fired and when
+  across both sources. This is the local-Postgres successor to the retired
+  R2/Cloudflare-log reconstruction — `plan show` gives the final engine *state*,
+  `plan timeline` gives the ordered event trail behind it. Drives
+  `trade-control plan timeline <trade_id>`. Recording-backed, so it's a
+  worker-local dispatch arm (not a generic `core` handler). 404 when the trade
+  has neither stream.
 - `plan-delete` — drop a registered plan and its `PlanState` — the inverse of
   `register`. Target named by the intent's `trade_id`; the worker scans all
   account scopes and deletes the matching `plan:` + `plan-state:` rows **and**
@@ -144,11 +171,11 @@ Basename ordering matters — `tv-arm` maps drawings to alerts by prefix.
 
 | Basename | Action | Fires on | Notes |
 |---|---|---|---|
-| `01-veto-too-high` | `veto` | Horizontal line crossing | Invalidation veto, level `close-positions`. Drawing-bound. Trade-direction sensitive (`too-low` for bullish IH&S). Fires when price runs back past the right shoulder → structure broken, so an open trade is flattened. |
+| `01-veto-too-high` | `veto` | Horizontal line crossing | Invalidation veto, level `close-positions`. Drawing-bound. Trade-direction sensitive (`too-low` for bullish IH&S). Fires when price runs back past the right shoulder → structure broken, so an open trade is flattened. **A drawn invalidation line is close-confirmed in *both* directions** — a bar must open one side and *close* the other; an intrabar spike that closes back does not invalidate. This is the **line-vs-fib rule**: the human's drawn line (short-side `too-high` cap, long-side `too-low` floor) is close-confirm (`OnClose`); the *computed fib* pcl level (the opposite name) is a wick-through (`Intrabar`). Direction only decides which way the line is crossed, not the confirm mode. (Supersedes the earlier asymmetry where only the short cap was close-confirm — see CHANGELOG.) |
 | `01-veto-too-low` | `veto` | Price crossing pcl-exhausted level | "Pattern completion level exhausted" — 80% of the way from the fib's midpoint to TP. Value-bound, computed by `tv-arm` from the fib geometry. Direction-mirrors the invalidation veto, but level is `stop-next-entry`, **not** `close-positions`: a pcl breach is in the trade's favour (price ran toward TP), so it only blocks a *late* entry and never touches an open position. (Was wrongly `close-positions` until the trade-046 fix — it closed an in-profit short ~31 ticks early.) |
 | `02-veto-trade-expiry` | `veto` | Vertical line crossing chart time | Hard stop: once the trade-expiry line passes, no more entries. |
 | `03-prep-break-and-close` | `prep` | Trendline crossing (neckline break) | Skippable for stocks / late entries with `--skip-break-and-close`. |
-| `04-prep-retest` | `prep` | Trendline crossing (retest from below) | Skippable with `--skip-retest`. |
+| `04-prep-retest` | `prep` | Trendline crossing (intrabar retest of the neckline) | Skippable with `--skip-retest`. **Uses the same neckline drawing** as `03-prep-break-and-close` (opposite direction, intrabar) — you draw the neckline once. A separate `retest`/`neckline-retest`/`retrace` trendline is still honoured but **deprecated** (`tv-arm` warns). Fires **intrabar on the wick**, not the close, and (as of 2026-07-03) not the open either: the bar's **high and low just have to straddle the neckline** — sit on opposite sides — with the directional wick reaching at/through the line (long retest = the low dips at/below the descending neckline). Open- and close-agnostic: a tap-and-bounce that opens *and* closes on the same side still counts — see CHANGELOG "intrabar cross is a pure straddle". **The closeness requirement decays over time:** the first bar after the break-and-close must actually reach the neckline, and each subsequent bar loosens it by `retest_atr_step × ATR` of near-side slack (default step **0.075**, `tv-arm --retest-atr-step`), so a wick that comes *within* the growing tolerance of the line stamps the retest even without reaching it — the further price drifts in time, the less its exact distance to the neckline matters. See CHANGELOG "time-decaying retest tolerance". The wick must pierce at least `cross_buffer_pct%` of the line price past the line (plan-level field, default 0.02%) so a one-tick graze doesn't trip it. |
 | `05-enter` | `enter` | Pine `Candle Signals` golden candle | The actual trade. Gated on the preps above + opposing-direction veto absent. |
 | `09-enter-qm` | `enter` | Pine `Candle Signals` (same detector as `05-enter`) | **`tv-arm --strategy-v2` only.** The Quasimodo entry, armed alongside `05-enter`: no preps, confirmed-candle gated. Its entry spec is **identical to standalone `--quasimodo`** — a stop at signal_low − the ATR buffer (`offset_atr_pct: 0.5`; see "ATR buffer") with a `recover_entry: limit` fallback (fills on the pullback when the level was overrun), *not* a bare limit. Shares the trade's `trade_id` + `max_retries` with `05-enter`; first of the two to fire cancels the other's resting order (worker retry gate). See "Dual entry — `--strategy-v2`" below. |
 | `06-close-on-reversal` | `close` | Pine `Candle Signals` opposing reversal | Emitted when news-pairs and/or `support`/`resistance` lines are drawn. Carries `inside_window: [news?, price?]` (OR-composed) and, when `price` is listed, `sr_bands: [[lo, hi], ...]`. Defaults `needs_golden: true` for the candle-quality gate. With `tv-arm --veto-on-reversal` (experimental) it also carries `veto_on_reversal: true`, so a reversal off a band before entry vetoes the upcoming trade — see the `close` action notes above. |
@@ -233,10 +260,13 @@ wrong-side and rejects it if so.
 The day-to-day loop, end to end:
 
 1. **Draw the setup on a TradingView chart.** Mark the invalidation line,
-   the neckline (break-and-close prep), the retest, a fib retracement
-   spanning head → neckline, a `trade-expiry` vertical, and any optional
-   extras (`news-start`/`news-end` pairs around scheduled news,
-   `support`/`resistance` horizontals near key levels).
+   the neckline (which serves **both** the break-and-close prep **and** the
+   retest — one drawing, see below), a fib retracement spanning head →
+   neckline, a `trade-expiry` vertical, and any optional extras
+   (`news-start`/`news-end` pairs around scheduled news,
+   `support`/`resistance` horizontals near key levels). Drawing a separate
+   `retest` trendline still works but is **deprecated** — `tv-arm` warns and
+   reuses the neckline for the retest when no `retest` line is present.
 2. **Run `tv-arm`.** The Rust binary (`cargo run -p tv-arm --`) reads
    the chart geometry via tv-mcp, shells out to `trade-control
    build-trade --from-file` for `trade_id` minting + signing, then posts
@@ -604,27 +634,56 @@ moves past one of your fixed levels.
 
 **SL-vs-spread floor (hard limit):** an entry's stop-loss distance must
 be at least **10× the live bid-ask spread**, so a stop is a genuine
-market level and not dominated by the cost of crossing the book. Enforced
-in two places against the same fixed constant
-(`trade_control_core::intent::SL_MIN_SPREAD_MULTIPLE`):
+market level and not dominated by the cost of crossing the book. The
+multiple is a server-side constant
+(`trade_control_core::intent::SL_MIN_SPREAD_MULTIPLE`) — it cannot be
+weakened per-intent, the same discipline as the `min_r` ≥ 1.0
+reward:risk floor.
 
-- **At fire time (worker)** — every `enter` samples the live spread
-  (`get_quote`) and rejects with **HTTP 422 / `rejected:
-  sl-below-10x-spread`** if `sl_distance < 10 × spread`. The response body
-  names the offending distances in pips, e.g. `entry blocked: SL <= 10x
-  spread: SL distance 8.0 pips; spread = 1.0 pips` (pips are
-  `distance / pip_size` using the intent's baked `pip_size`). Like the other
-  entry gates this is a non-poisoning reject (the id can refire once the
-  spread tightens), and it **fails open** on a quote-fetch error so a
-  transient broker hiccup never strands a real entry.
+- **At fire time (worker) — widen-then-reject.** Every `enter` samples
+  the live spread (`get_quote`). When the stop is *too tight*
+  (`sl_distance < 10 × spread`) the worker no longer rejects outright —
+  it first tries to **widen the stop to `10 × spread`** (exactly the
+  floor, pushing it *further* from entry, never tighter) and re-checks
+  the trade still clears its R-floor against the fixed TP:
+    - **Widened → entry proceeds.** If `R = tp_distance / (10 × spread)`
+      is still `≥ min_r` (default 1.0, or the intent's override), the
+      worker places the order with the widened SL and logs
+      `sl-spread-floor: widened SL <old> -> <new> … R now <r> >= min_r`.
+      The widened stop may sit *past* the pattern's invalidation level —
+      that's fine; the continuous at-entry level vetos (`too-high` /
+      `too-low`) abort the trade independently if price actually reaches
+      invalidation.
+    - **Can't stay legal → reject.** If even the `10 × spread` stop drops
+      `R` below `min_r`, there is no legal stop and the entry is rejected
+      with **HTTP 422 / `rejected: sl-widen-below-min-r`** (body:
+      `entry blocked: SL too close to spread and widening to 10x spread
+      (sl_distance <d>, spread <s>) would drop R to <r> < min_r <m>`). This
+      is the wide-spread instrument case where the TP is too near to
+      support an honest stop.
+
+  The floor is a **pure ratio of two raw-price distances** (`sl_distance`
+  vs `spread = ask − bid`), so the unit cancels and the decision never
+  depends on an instrument's `pip_size`. The operator-facing log/reject
+  messages therefore render distances in **raw price** (not pips) — on an
+  instrument whose catalog pip was wrong, a pip-rendered message used to
+  make a *correct* decision *read* wrong. This makes the rule
+  instrument-class-agnostic (forex, commodity, index, metal — all the
+  same).
+
+  Both outcomes are decided by the pure
+  `trade_control_core::intent::widen_sl_to_spread_floor`. Like the other
+  entry gates the reject is non-poisoning (the id can refire once the
+  spread tightens or the geometry improves) and it **fails open** on a
+  quote-fetch error so a transient broker hiccup never strands a real
+  entry. The same shared `run_enter` path runs in the offline
+  `replay-candles` simulator, so the widen reproduces identically in
+  replay and live (no drift).
 - **At build/arm time (M/W only)** — `trade-control build-trade` and
-  `tv-arm` reject a too-tight M/W setup before it's ever signed, using the
-  arm-time spread baked into the path geometry. H&S has no build-time SL
-  (it anchors to the fire-time signal extreme), so H&S relies on the
-  worker gate alone.
-
-The multiple is a server-side constant — it cannot be weakened
-per-intent, the same discipline as the `min_r` ≥ 1.0 reward:risk floor.
+  `tv-arm` still *reject* a too-tight M/W setup before it's ever signed
+  (no widen at arm time), using the arm-time spread baked into the path
+  geometry. H&S has no build-time SL (it anchors to the fire-time signal
+  extreme), so H&S relies on the worker gate alone.
 
 `id` is the **replay-protection key** — the worker remembers each id it
 **successfully fulfilled** until just past `not_after`. Gate rejections
@@ -839,11 +898,15 @@ Two consumers honour it identically, sharing one pure helper in
   `breakeven_pct: null` to disable for that trade, or a custom fraction to
   change the threshold. Values outside `(0, 1)` are clamped to 0.5.
 
-> **Demo-confirm before trusting live.** Like the spread-blackout stop widen,
-> the break-even move uses `amend_stop` on an **open** position; TradeNation's
-> `AmendCloseOrder`-on-open-position path is demo-unverified. Every intended
-> amend is logged prominently first so a demo run can read it back (SL moved to
-> entry, TP unchanged) before this is trusted on a live account.
+> **Demo-verified 2026-06-30.** Like the spread-blackout stop widen, the
+> break-even move uses `amend_stop` on an **open** position via TradeNation's
+> `AmendCloseOrder`. This path is now **confirmed on the experimental demo**:
+> the with-TP amend moves the SL and preserves the TP, and the no-TP amend moves
+> the SL with no phantom TP (it surfaced and fixed a bug where a no-TP position
+> sent `limitOrderPrice 0.0` and the broker rejected the whole amend — fixed in
+> `tradenation-api` **v0.11.0** via an `orderModeID: 2` stop-only amend). Every
+> intended amend is still logged prominently first. Both the break-even cron and
+> the blackout widen are **cleared for live** on the amend path.
 
 ## Using `expiry_bars`
 
@@ -1321,6 +1384,19 @@ under `REV:` (distinct from `TP:` / `SL:`). This matches the live worker, whose
 `run_close` flattens the broker position on the same fire; before the fix the
 close was inert and the position over-held to SL/TP/window-end.
 
+**Net R and a $100k-account P&L projection (`--simulate`).** Beyond the raw
+`TP:`/`SL:` counts, the report scores each *taken* fill's realized R multiple
+(`(exit − entry) / (entry − SL)`, signed off the protected stop, so `+1` on a
+clean TP and `−1` on a clean SL for both directions) and compounds it into a
+simulated **$100k account risking 1% of the remaining balance per trade**. Each
+fill gets a `R: +N.NN  |  $100k acct (1% risk): +PNL → $BALANCE` line beneath it,
+and the summary footer appends `… | Net R: +N.NN | $100k acct (1%/trade):
+$BALANCE (+PROFIT)`. Not-taken outcomes (never-filled, declined, gate-blocked,
+superseded) contribute 0R. `Net R` is the plain sum of R multiples (account-size
+independent); the dollar figure shows what the sequence would have made
+compounding — a losing streak shrinks the per-trade stake, a winning one grows
+it.
+
 **Seeing the engine's silent state changes (`--verbose` / `--all-events`).**
 The normal report lists only *fires* — intents the engine emits. But the engine
 also advances state per bar that fires nothing: the spine phase
@@ -1565,6 +1641,36 @@ pair per event, then drops any pair whose window has already elapsed. The
   `as-of-flag`). The **same as-of** flows into the pause/news/calendar-bars
   builders so a pair that survives the prune isn't then rejected by their own
   "refusing to arm a stale blackout" past-window guard.
+- **`--start <RFC3339>` (whole-chart journaling):** treats the given timestamp
+  as "live now" **and** decouples drawing-discovery from the visible window.
+  Instead of scoping role-matching to what's on screen, it searches the *whole
+  chart* and picks each role by its nearest-to-`--start` drawing, walking in the
+  role's natural direction — neckline/retest = nearest *before* start,
+  invalidation = nearest *either side*, trade-expiry = nearest *after*, M/W path
+  = the one whose shoulders bracket start. The invalidation pick additionally
+  applies a **side-of-neckline filter**: a `too-low` floor must sit *below* the
+  neckline and a `too-high` cap *above* it, so a stale invalidation line left at
+  the wrong price by an earlier trade is dropped before the nearest-start
+  tiebreak (it won't be selected just because its anchor *time* sat nearer the
+  cursor). When a chart carries *both* a stray
+  M/W path and an H&S neckline, the arm defers to whichever is anchored nearer
+  `--start` (path neckline `C` vs the drawn neckline) — so a leftover path from
+  an earlier setup can't hijack an H&S arm into M/W. The news/blackout vertical pairs
+  (and the auto-drawn calendar bars) are scoped to `[start, trade-expiry]` — a
+  pair outside the trade's own lifetime is dropped. The prune as-of becomes
+  `--start` (`source=start-flag`).
+  This is the journaling workflow: put TradingView in replay mode with the last
+  visible candle mid-right-shoulder, but **leave the future candles on screen** —
+  `--start <shoulder-time>` anchors the arm to that moment regardless of what's
+  visible, so you can see the whole trade play out while still arming as if it
+  were live at the shoulder. A malformed `--start` is a **hard error** (a typo
+  must not silently fall back to visible-window matching). The emitted plan is
+  identical to what you'd get by hiding the future and arming normally, **plus**
+  the `--start` value is baked onto the plan as `replay_start` so the offline
+  `replay-candles` harness derives a self-consistent window from the plan alone
+  (`--start` flag → `plan.replay_start` → chart cursor) — you never have to line
+  up the TV chart's replay cursor before replaying. The worker ignores
+  `replay_start`; it's a journaling aid.
 
 **Zero-length blackout/news pairs are dropped, not fatal.** When `tv-arm`
 auto-draws calendar lines and reads them back, TradingView snaps each vertical
@@ -1602,9 +1708,10 @@ leaving TP / trigger / stake untouched), and `list_pending_orders`.
 **foundations for the spread-blackout feature and carry no operator-visible
 behaviour** — no worker action calls them yet. TradeNation implements all
 four; OANDA implements all four via its v20 trade/order/pricing endpoints.
-**Caveat (TradeNation `amend_stop`):** the upstream `AmendCloseOrder`
-endpoint is unverified against an *open position's* SL — a later sub-plan
-must demo-confirm it before any live stop-widening.
+**TradeNation `amend_stop` — demo-verified 2026-06-30:** the upstream
+`AmendCloseOrder` endpoint moves an *open position's* SL (with-TP preserves
+the TP; no-TP moves the SL via an `orderModeID: 2` stop-only amend, fixed in
+`tradenation-api` v0.11.0). Cleared for live stop-widening.
 
 ### Spread-blackout window
 
@@ -1759,15 +1866,14 @@ spread normalises (or a ~3h backstop fires).
   broker amend, so a crash between them can't strand a widened stop with no
   remembered original (the worst case is a restore that's a harmless no-op).
 
-> **PRECONDITION — demo-confirm `amend_stop` on an OPEN position first.**
-> TradeNation's `AmendCloseOrder` has zero existing callers and it is
-> **UNVERIFIED** whether it moves an *open position's* SL (vs only a resting
-> order's). System 2 depends on it. Before trusting the widen live: open a
-> demo position on `reversals` with a known SL, `amend_stop` it, read it
-> back, confirm the SL moved and the TP is unchanged. The apply cron logs an
-> `INTENT amend_stop …` line before every amend precisely so a dry-run/demo
-> can confirm the read-back. **Do not enable live widening until this is
-> demo-confirmed.** See `TODO.md`.
+> **PRECONDITION SATISFIED — `amend_stop` on an OPEN position demo-verified
+> 2026-06-30.** TradeNation's `AmendCloseOrder` does move an *open position's*
+> SL. Confirmed on the experimental demo for both the with-TP case (SL moves,
+> TP preserved) and the no-TP case (SL moves, no phantom TP) — the latter after
+> fixing a bug where a no-TP amend sent `limitOrderPrice 0.0` and was rejected
+> (`tradenation-api` v0.11.0, `orderModeID: 2` stop-only). System 2's widen is
+> **cleared for live**. The apply cron still logs an `INTENT amend_stop …` line
+> before every amend for read-back visibility.
 
 #### System 3 — cancel resting entry orders during the window, restore after
 
@@ -2336,6 +2442,16 @@ What you draw on the chart:
 > you can clear the clutter. A per-role `dropped_out_of_window` count is logged
 > at `info`.
 
+> **Degenerate drawings are skipped, not fatal.** TradingView occasionally
+> reads a drawing back with a `null` anchor coordinate — most often an
+> auto-extending `parallel_channel` or half-drawn fib the operator left lying
+> around, whose final anchor hasn't resolved. `tv-arm` now tolerates the `null`
+> at parse time and **skips** that one drawing with a `warn`
+> (`drawing skipped — TradingView returned a degenerate anchor`), then keeps
+> classifying the rest. Previously a single such drawing made the whole arm
+> abort with a `invalid type: null, expected f64` deserialize error, even when
+> the drawing played no role in the setup.
+
 When news pairs *and* `support`/`resistance` lines are both present, a
 single `06-close-on-reversal` alert is emitted with
 `inside_window: [news, price]` — the close fires on an opposing reversal
@@ -2504,29 +2620,42 @@ engine state is `core/src/plan_state.rs`; the FSM evaluator is
 `engine/src/evaluate.rs`; the candle-pattern detector port is
 `core/src/signals.rs`.
 
-#### Re-arming an existing setup (`--update`)
+#### Re-arming an existing setup (`--replace`)
 
 `tv-arm` mints a **fresh random `trade_id` every run**, so the engine treats
 each re-arm as a brand-new plan — and the *old* plan keeps ticking in KV until
 its TTL lapses. When you move annotations on the chart and re-run, pass
-`--update` (only meaningful alongside `--register-plan`) so the prior plan is
+`--replace` (only meaningful alongside `--register-plan`) so the prior plan is
 deleted from the engine first:
 
 ```sh
 # Auto-resolve by instrument: deletes the one existing plan on this instrument,
 # then registers the fresh one. Hard-errors if more than one plan is registered
 # for the instrument (re-run with the explicit id from `plan list`).
-tv-arm-staging --register-plan --update ...
+tv-arm-staging --register-plan --replace ...
 
 # Explicit: delete exactly this prior trade_id, then register fresh.
-tv-arm-staging --register-plan --update hs-eurusd-a3f9c1d2 ...
+tv-arm-staging --register-plan --replace hs-eurusd-a3f9c1d2 ...
 ```
 
-`--update` reconciles the server-side engine plan: it POSTs `plan-list` to find
+`--replace` reconciles the server-side engine plan: it POSTs `plan-list` to find
 the target, then a signed `plan-delete` that clears the plan's `plan:` +
-`plan-state:` KV (see `plan delete` below). A bare `--update` with no plan
+`plan-state:` KV (see `plan delete` below). A bare `--replace` with no plan
 registered for the instrument is a logged no-op. The resolution logic is the
-pure `resolve_update_target` (`tv-arm/src/pipeline.rs`), unit-tested.
+pure `resolve_replace_target` (`tv-arm/src/pipeline.rs`), unit-tested.
+
+**It's a replace, not an in-place patch.** The new plan gets a fresh `trade_id`
+and **blank engine state** — phase, vetos, seen-ids, entry-attempts, and open
+news/blackout windows are all keyed by `trade_id`, so none carry over. That's
+exactly what you want for a clean re-arm *before* entry. But once a plan has a
+**live resting order or open position**, replacing it can strand that
+order/position: `--replace` reconciles only KV, never the broker, so the old
+order isn't cancelled and the new plan can't see the open position to manage its
+break-even / SL / reversal-close. Check the broker before replacing a plan that
+may have already fired.
+
+> `--update` is a **deprecated alias** for `--replace` (same behaviour) — old
+> scripts keep working, but new usage should prefer `--replace`.
 
 #### Inspecting / managing registered plans (`trade-control plan list` / `show` / `delete`)
 
@@ -2541,6 +2670,9 @@ trade-control-dev plan list --yaml         # raw worker YAML (one entry per plan
 trade-control-dev plan show eurusd-hs-7    # full dump of one plan + its state
 trade-control-dev plan show eurusd-hs-7 --yaml
 trade-control-dev plan show eurusd-hs-7 --json   # same data as --yaml, JSON-encoded (pipe to jq)
+trade-control-dev plan timeline eurusd-hs-7          # replay-style trail: per-fire blocks + recorded dispatch outcomes
+trade-control-dev plan timeline eurusd-hs-7 --verbose  # + bar-by-bar engine trace and every alert log line
+trade-control-dev plan timeline eurusd-hs-7 --json     # raw {records, ticks} envelope (pipe to jq)
 trade-control-dev plan export eurusd-hs-7  # bare TradePlan, exactly as imported (re-registerable)
 trade-control-dev plan delete eurusd-hs-7  # drop a plan (live and/or archived)
 trade-control-dev plan purge eurusd-hs-7   # wipe ALL KV + R2 traces of one trade
@@ -2559,6 +2691,39 @@ read-only KV-only control actions (`plan-list` / `plan-show`), signed like
 prints the raw worker YAML; `plan show --json` prints the *same data* as pretty
 JSON (each match's full `PlanDetail`) — handy for piping into `jq`. A `plan show`
 for an unknown id exits non-zero with `no registered plan with trade_id …`.
+
+`plan timeline <trade_id>` reconstructs the **event trail** for one trade from
+the worker's durable recordings, and renders it in the **same style as the
+`replay-candles` report** — but from **recorded facts only**, never a
+re-simulation. The header, the `--verbose` bar-by-bar engine trace, and the
+per-fire `• <rule> <Action> @ <bar>  close=…` blocks all read identically to a
+replay; the crucial difference is *where the numbers come from*:
+
+- `replay-candles` **computes** the order bracket, the fill, break-even and
+  SL-widen by walking the price path forward — so it can show `order: LONG stop
+  @ … SL … TP …`, `fill: TOOK PROFIT …`, `be:`/`exit:` lines.
+- `plan timeline` shows only what the worker **recorded**: which rule fired on
+  which bar (from the cron-engine `tick_bundles`), the engine's phase transition
+  (from each bundle's `prior_state → new_state`), and the **real dispatch
+  outcome** (`dispatch: Ok(entered)   [recorded]` / `rejected:
+  trade-already-open` / …). There is deliberately **no** `order:`/`fill:`/`be:`/
+  `exit:` line — those weren't recorded, so inventing them would be fiction.
+
+The engine leg is load-bearing: since the move to the cron engine a veto or
+enter usually fires on a `*/15` tick, **not** an inbound POST — so the fire
+blocks are driven by `tick_bundles`. Inbound signed alerts (`request_records` —
+the POSTs that armed or controlled the plan) are folded in under an *Inbound
+alerts (HTTP)* section as `⊙` lines, Brisbane-stamped like the rest. Where `plan
+show` answers *"what state did the plan end in?"*, `plan timeline` answers *"what
+fired, in what order, and how did the worker actually respond?"* — the
+local-Postgres successor to the old `trading-tax-tracker timeline --merged`
+reconstruction, which stitched the same picture from Cloudflare R2 + worker logs
+before the move off Cloudflare. `--verbose` adds the bar-by-bar engine trace and
+every alert log line (not just `error`); `--json` dumps the raw `{records,
+ticks}` envelope. Unlike `plan show`, it reads recordings (not `StateStore` KV),
+so it's dispatched as a worker-local arm; an unknown/unrecorded id exits non-zero
+with `no recorded events for trade_id …`. P&L / fees / slippage accounting is
+deliberately *not* here; that stays broker-sourced in a separate tool.
 
 `plan export <trade_id>` is the re-registerable cousin of `show`: it strips the
 `PlanDetail` wrapper (account / state / archived_at) down to the bare

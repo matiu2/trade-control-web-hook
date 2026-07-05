@@ -176,9 +176,10 @@ pub fn fill_for(plan: &TradePlan, fire: &Fire, simulate: bool) -> Option<SimOutc
     if !simulate || fire.fired.intent.action != Action::Enter {
         return None;
     }
-    // A suppressed enter (paused by a news blackout) never placed an order, so
-    // its standalone fill is fiction — no fill, exactly like a superseded one.
-    if fire.suppressed_by.is_some() {
+    // An enter the real `run_enter` rejected (paused, cooled-down, vetoed, …)
+    // never placed an order, so its standalone fill is fiction — no fill, exactly
+    // like a superseded one.
+    if fire.rejected_reason().is_some() {
         return None;
     }
     let candle = &fire.fired.candle;
@@ -207,7 +208,7 @@ impl ReplayOutcome {
                 candle_time: fire.fired.candle.time,
                 candle_close: fire.fired.candle.c,
                 fill: fill_for(plan, fire, simulate).map(|o| (&o).into()),
-                suppressed_by: fire.suppressed_by.clone().unwrap_or_default(),
+                suppressed_by: fire.suppressed_by(),
             })
             .collect();
         ReplayOutcome {

@@ -8,11 +8,12 @@
 //! fill.
 
 use chrono::{DateTime, Duration, Utc};
+use trade_control_core::dispatch::{self, ActionResult};
+use trade_control_core::dispatch_config::DispatchConfig;
+use trade_control_core::incoming::Verified;
 use trade_control_core::intent::{Action, Shell};
-use trade_control_core::pause_gate::{self, EntryGate};
-use trade_control_core::retry_gate::{self, RetryGateOutcome};
+use trade_control_core::pause_gate;
 use trade_control_core::state::MemStateStore;
-use trade_control_core::tunable::Tunable;
 use trade_control_engine::BidAskCandle as EngineCandle;
 use trade_control_engine::{
     Candle, FiredIntent, Granularity, PlanState, TradePlan, evaluate_plan, seed_plan_state,
@@ -21,29 +22,87 @@ use trade_control_engine::{
 use super::replay_broker::ReplayBroker;
 use super::verbose::BarTrace;
 
+/// The entry decision the **real** dispatch (`trade_control_core::dispatch::run_enter`)
+/// reached for one fired `enter`, carried on the [`Fire`] so the report reads it
+/// without re-deriving any gate. This is the whole point of routing the replay
+/// through `run_enter`: the offline entry decision == the live worker's, so the
+/// replay can't drift from the engine
+/// (`[[strategy_changes_in_both_replayer_and_worker]]`).
+#[derive(Debug, Clone)]
+pub enum EnterGateOutcome {
+    /// `run_enter` accepted + placed (`ActionResult::Ok`). `order_id` is what the
+    /// broker handed back (the `{intent.id}-{attempt_no}` id for a multi-shot
+    /// enter), used to correlate the gate's cancel-and-replace back to this fire.
+    /// `None` for a placement that recorded no broker id (e.g. a dry-run enter).
+    Placed { order_id: Option<String> },
+    /// `run_enter` rejected before placing (`ActionResult::Rejected`) — a 0R
+    /// skip. `reason` is the real dispatch outcome string (e.g.
+    /// `rejected: cooled-down`, `rejected: veto-active (too-low)`,
+    /// `rejected: paused [...]`, `rejected: missing-prep (...)`).
+    Rejected { reason: String },
+    /// This fire isn't an enter (a veto / prep / pause / resume), so no entry
+    /// gate ran. The report renders these from the intent action alone.
+    NotAnEnter,
+}
+
 /// One fired intent plus the forward candle path needed to simulate its fill.
 pub struct Fire {
     pub fired: FiredIntent,
     /// Bid/ask candles at or after the firing bar (ascending) — the fill
     /// simulator's input (it fills each leg on the relevant book side).
     pub forward: Vec<EngineCandle>,
-    /// The broker order id this enter placed under (`{intent.id}-{attempt_no}`),
-    /// for a gated multi-shot enter. `None` for non-enters and single-shot
-    /// enters (which never enter the gate). Used to correlate the gate's
-    /// cancel-and-replace decisions back to this fire.
-    pub order_id: Option<String>,
+    /// The unified entry decision the real `run_enter` reached for this fire.
+    /// For an enter it's `Placed` / `Rejected`; for anything else `NotAnEnter`.
+    /// The report reads this directly instead of re-deriving any gate.
+    pub gate_outcome: EnterGateOutcome,
     /// Set when a **later** enter superseded this fire's still-resting order
     /// (the gate's cancel-and-replace path). A superseded order was cancelled
     /// before it could fill, so the report must show it as cancelled — not its
     /// standalone simulated fill. The faithful model: a new entry cancels any
     /// resting sibling/prior order on the same setup.
     pub superseded: bool,
-    /// Set on an `enter` fire that landed inside an active news-blackout pause:
-    /// the blackout gate (`core::pause_gate::entry_blocked`) rejected it, so no
-    /// order went on — a hard skip matching the live worker, which 423s a paused
-    /// entry. Carries the active blackout ids for the report. `None` for any
-    /// fire the gate let through (or that never hit the gate).
-    pub suppressed_by: Option<Vec<String>>,
+}
+
+impl Fire {
+    /// The placed broker order id, when this fire was an accepted enter — the
+    /// key `mark_superseded` correlates the gate's cancel-and-replace against.
+    /// `None` for a rejected enter, a non-enter, or a placement with no id.
+    pub fn order_id(&self) -> Option<&str> {
+        match &self.gate_outcome {
+            EnterGateOutcome::Placed { order_id } => order_id.as_deref(),
+            _ => None,
+        }
+    }
+
+    /// The 0R-skip reason when this enter was rejected by `run_enter`, else
+    /// `None`. The report surfaces it in place of a simulated fill.
+    pub fn rejected_reason(&self) -> Option<&str> {
+        match &self.gate_outcome {
+            EnterGateOutcome::Rejected { reason } => Some(reason.as_str()),
+            _ => None,
+        }
+    }
+
+    /// The active news-blackout ids when this enter was rejected by the pause
+    /// gate (`rejected: paused [a,b]`), else an empty Vec. Lets the fixture
+    /// snapshot freeze a news-blackout SKIP as a regression, the way the old
+    /// `suppressed_by` field did, without storing a second field.
+    pub fn suppressed_by(&self) -> Vec<String> {
+        let Some(reason) = self.rejected_reason() else {
+            return Vec::new();
+        };
+        // Format from `run_enter`: `rejected: paused [id1,id2(reason)]`.
+        let Some(inner) = reason
+            .strip_prefix("rejected: paused [")
+            .and_then(|s| s.strip_suffix(']'))
+        else {
+            return Vec::new();
+        };
+        if inner.is_empty() {
+            return Vec::new();
+        }
+        inner.split(',').map(|s| s.trim().to_string()).collect()
+    }
 }
 
 /// The outcome of replaying a plan over a candle series.
@@ -180,6 +239,13 @@ pub async fn run(
 
         for warning in eval.warnings {
             if !warnings.contains(&warning) {
+                // Trendline-anchor diagnostics are recomputed every tick against a
+                // one-bar-wider window, so the same underlying condition produces a
+                // fresh string each bar (…153-bar…, …154-bar…). They're low-signal
+                // for a normal replay, so keep them out of the console report and
+                // emit them at debug level (RUST_LOG=debug) instead. Still recorded
+                // on the structured fixture for anyone who wants them.
+                tracing::debug!(target: "replay::trendline_anchor", "{warning}");
                 warnings.push(warning);
             }
         }
@@ -192,9 +258,10 @@ pub async fn run(
                 "tick: rule fired"
             );
             // News-blackout control fires set/clear pause state in the SAME
-            // store the enter gate reads, via the SAME core helpers the worker
-            // uses (so the replay can't drift from live). A pause/resume isn't
-            // an enter — record it through as a non-fill fire afterwards.
+            // store `run_enter`'s pause gate reads, via the SAME core helpers the
+            // worker uses (so the replay can't drift from live). A pause/resume
+            // isn't an enter — these seed the store state the enter gate then
+            // consults; record them through as `NotAnEnter` fires afterwards.
             match fired.intent.action {
                 Action::Pause => {
                     if let Err(e) = pause_gate::apply_pause(&store, &fired.intent, now).await {
@@ -206,56 +273,69 @@ pub async fn run(
                         tracing::error!(rule = %fired.rule_id, error = %e, "apply_resume failed");
                     }
                 }
+                // A prep fire seeds the store the enter's prep gate then reads —
+                // exactly as the worker's `dispatch_action` routes `Action::Prep`
+                // through `handle_prep` (→ `store.set_prep`). Before this, the
+                // replay dropped prep fires (`_ => {}`), so `run_enter`'s prep
+                // gate always saw `None` and rejected every preps-gated enter
+                // with `missing-prep` — a silent divergence introduced when the
+                // enter decision moved to the real `run_enter` (commit 1c0a043).
+                // The break-and-close prep is emitted by the engine; the retest
+                // prep is emitted by `stamp_retest` (engine) the bar it stamps.
+                Action::Prep => {
+                    let verified = Verified {
+                        shell: Shell::from_candle(&fired.candle),
+                        intent: fired.intent.clone(),
+                    };
+                    let result = dispatch::handle_prep(&store, &verified, now).await;
+                    if !result.is_success() {
+                        tracing::error!(
+                            rule = %fired.rule_id,
+                            status = result.status,
+                            "handle_prep rejected in replay"
+                        );
+                    }
+                }
                 _ => {}
             }
 
-            // Blackout gate — an enter that lands inside an active pause is a
-            // hard skip (the live worker 423s it). Record the suppressed fire so
-            // the report shows the 0R skip legibly, but place no order / no fill.
-            let mut suppressed_by = None;
-            if fired.intent.action == Action::Enter {
-                match pause_gate::entry_blocked(&store, &fired.intent).await {
-                    Ok(EntryGate::Blocked { blackouts }) => {
-                        tracing::debug!(
-                            rule = %fired.rule_id,
-                            blackouts = ?blackouts,
-                            "tick: enter suppressed — trade paused (news blackout)"
-                        );
-                        suppressed_by = Some(blackouts);
-                    }
-                    Ok(EntryGate::Allowed) => {}
-                    Err(e) => {
-                        tracing::error!(rule = %fired.rule_id, error = %e, "entry_blocked check failed");
-                    }
-                }
-            }
+            // Decide the entry ONCE, here, via the REAL dispatch. For an enter
+            // fire we call `trade_control_core::dispatch::run_enter` — the exact
+            // function the live worker runs — so the offline entry decision is
+            // the live engine's: every gate (pause, retry/multi-shot, cooldown,
+            // prep, veto, entry-level veto, allow_entry, market/spread blackout,
+            // SL-floor) is applied identically, and the report reads the verdict
+            // off the fire instead of re-deriving any of them. Non-enters carry
+            // `NotAnEnter`.
+            let gate_outcome = if fired.intent.action == Action::Enter {
+                dispatch_enter(
+                    &replay_broker,
+                    &store,
+                    &fired,
+                    &plan_pip(plan),
+                    now,
+                    plan.granularity,
+                )
+                .await
+            } else {
+                EnterGateOutcome::NotAnEnter
+            };
 
-            // An enter fire on a multi-shot plan must clear the retry gate before
-            // it counts as a placement; any other fire (veto/prep, or a
-            // single-shot enter) records straight through. A suppressed enter
-            // skips the retry gate entirely — it never reaches placement.
-            let mut order_id = None;
-            if suppressed_by.is_none()
-                && fired.intent.action == Action::Enter
-                && is_multi_shot(&fired.intent.max_retries)
-            {
-                match gate_enter(&replay_broker, &store, &fired, now, plan.pip_size).await {
-                    Some(id) => order_id = Some(id), // Proceed — record the placement.
-                    None => continue,                // Rejected (open / cap) — no placement.
-                }
-                // The gate may have cancelled a prior resting order to replace it
-                // (cancel-and-replace). Stamp any superseded fire so the report
-                // shows it cancelled instead of its standalone simulated fill.
+            // A `run_enter` placement may have cancelled a prior resting order to
+            // replace it (cancel-and-replace, via the retry gate). Stamp any
+            // already-recorded enter fire whose order the broker cancelled so the
+            // report shows it superseded instead of its standalone simulated fill.
+            if matches!(gate_outcome, EnterGateOutcome::Placed { .. }) {
                 mark_superseded(&mut fires, &replay_broker);
             }
+
             // The fill simulator walks candles at/after the firing bar.
             let forward = candles[i..].to_vec();
             fires.push(Fire {
                 fired,
                 forward,
-                order_id,
+                gate_outcome,
                 superseded: false,
-                suppressed_by,
             });
         }
 
@@ -274,86 +354,105 @@ pub async fn run(
     }
 }
 
-/// Is this enter opted into multi-shot (any non-default `max_retries`)? Mirrors
-/// the worker's gate-entry check in `run_enter`.
-fn is_multi_shot(max_retries: &Tunable<u32>) -> bool {
-    !matches!(max_retries, Tunable::Static(0))
+/// The pip size every resolution in the replay uses — the plan's baked value.
+/// `run_enter` prefers the intent's own `pip_size` and falls back to this, so a
+/// `DispatchConfig` built with `plan.pip_size` matches what the worker resolves.
+fn plan_pip(plan: &TradePlan) -> f64 {
+    plan.pip_size
 }
 
-/// Stamp `superseded = true` on any already-recorded enter `Fire` whose order
-/// the gate has now cancelled (cancel-and-replace). Called right after each
-/// gate `Proceed`: the gate cancels at most a prior resting order, and the
-/// matching fire is the one carrying that `order_id`. Idempotent — a fire
-/// already marked stays marked.
-fn mark_superseded(fires: &mut [Fire], broker: &ReplayBroker) {
-    let cancelled = broker.cancelled_order_ids();
-    for fire in fires.iter_mut() {
-        if let Some(id) = &fire.order_id
-            && cancelled.contains(id)
-        {
-            fire.superseded = true;
-        }
-    }
-}
-
-/// Run one multi-shot enter fire through the shared retry gate, backed by the
-/// offline broker. On `Proceed`, register the placement with the broker (so a
-/// later re-entry's gate sees this attempt) and the store, and return the
-/// placed `order_id` to record on the fire. On any `Rejected` (a prior attempt
-/// still open, the cap reached, …) return `None` so the loop skips it — no
-/// placement happened.
-async fn gate_enter(
+/// Dispatch one fired `enter` through the REAL `run_enter`, returning the
+/// unified [`EnterGateOutcome`] the report reads. This is the single decision
+/// point: `run_enter` applies every entry gate (pause/retry/cooldown/prep/veto/
+/// entry-level-veto/allow_entry/blackouts/SL-floor) exactly as the live worker
+/// does, so the offline verdict can't drift from the engine.
+///
+/// The offline `ReplayBroker` needs the intent + shell to resolve a prior
+/// attempt's later state, but `run_enter` calls `broker.place_entry` with only an
+/// `EntryRequest`. So we arm the broker with the firing geometry + a unique order
+/// id first; `place_entry` consumes it and hands the id back, which `run_enter`
+/// records on the `EntryAttempt`. `set_as_of` points the broker's prior-attempt
+/// resolution at this bar (time-accurate, for the multi-shot retry gate).
+async fn dispatch_enter(
     broker: &ReplayBroker,
     store: &MemStateStore,
     fired: &FiredIntent,
+    pip_size: &f64,
     now: DateTime<Utc>,
-    pip_size: f64,
-) -> Option<String> {
+    granularity: Granularity,
+) -> EnterGateOutcome {
     let intent = &fired.intent;
-    // Reconstruct the firing shell exactly as the worker's dispatch would, so the
-    // gate's `max_retries` script (if any) resolves against the same anchors.
+    // Reconstruct the firing shell exactly as the worker's dispatch would (an
+    // H&S Pine fire folds its latched signal; a stop/limit enter has none), so
+    // every gate + resolution sees the same anchors.
     let shell = match &fired.signal {
         Some(sig) => Shell::from_candle_and_signal(&fired.candle, sig),
         None => Shell::from_candle(&fired.candle),
     };
 
-    // Point the broker's prior-attempt resolution at this bar (time-accurate).
+    // Point the broker's prior-attempt resolution at this bar (time-accurate),
+    // and arm the placement the dispatch will reach for. The order id is unique
+    // per fire (`{intent.id}-{shell.time}`) so the retry gate correlates this
+    // attempt against later re-entries.
     broker.set_as_of(fired.candle.time);
+    let order_id = format!("{}-{}", intent.id, shell.time.timestamp());
+    broker.arm_placement(order_id.clone(), intent.clone(), shell.clone());
 
-    match retry_gate::evaluate(broker, store, intent, &shell).await {
-        RetryGateOutcome::Proceed { next_attempt_no } => {
-            let order_id = format!("{}-{next_attempt_no}", intent.id);
-            // Register with the broker so the next re-entry's gate can resolve
-            // this attempt's state from the candles.
-            broker.record_attempt(order_id.clone(), intent.clone(), shell.clone());
-            // Persist the EntryAttempt + retry-fire-seen mark via the SAME
-            // `record_placement` the worker uses, so the cap counts correctly.
-            let resolved_sl =
-                trade_control_core::intent::Resolved::from_intent(intent, &shell, pip_size)
-                    .ok()
-                    .map(|r| r.stop_loss)
-                    .unwrap_or(0.0);
-            retry_gate::record_placement(
-                store,
-                intent,
-                shell.time,
-                intent.not_after,
-                now,
-                next_attempt_no,
-                &order_id,
-                intent
-                    .direction
-                    .unwrap_or(trade_control_core::intent::Direction::Long),
-                resolved_sl,
-                None,
-                // The replay drives break-even directly in `simulate_fill` (it
-                // walks the candle path), so it doesn't need the cron snapshot.
-                None,
-            )
-            .await;
-            Some(order_id)
+    let verified = Verified {
+        shell,
+        intent: intent.clone(),
+    };
+    // The replay isn't risk-limiting — these are the worker defaults
+    // (`MAX_RISK_PCT_PER_TRADE` / `MAX_OPEN_POSITIONS`). `pip_size` is the plan's
+    // baked value (the intent's own `pip_size` still takes precedence inside
+    // `run_enter`); `caps` default to no per-account narrowing.
+    let cfg = DispatchConfig {
+        worker_max_risk_pct: 1.0,
+        worker_max_open_positions: 3,
+        pip_size: *pip_size,
+        caps: Default::default(),
+    };
+
+    match dispatch::run_enter(broker, store, &verified, &cfg, now, None, Some(granularity)).await {
+        ActionResult::Ok(outcome) => {
+            tracing::debug!(rule = %fired.rule_id, %outcome, "tick: enter placed");
+            EnterGateOutcome::Placed {
+                order_id: Some(order_id),
+            }
         }
-        RetryGateOutcome::Rejected { .. } => None,
+        ActionResult::Rejected { outcome, .. } => {
+            tracing::debug!(rule = %fired.rule_id, %outcome, "tick: enter rejected (0R skip)");
+            EnterGateOutcome::Rejected { reason: outcome }
+        }
+        ActionResult::Failed(reason) => {
+            // The ReplayBroker never returns a broker error on a properly-armed
+            // placement, so this is a wiring fault, not a market outcome. Treat
+            // it as a no-fill (no placed order), and log it loudly.
+            tracing::error!(
+                rule = %fired.rule_id,
+                %reason,
+                "tick: enter dispatch FAILED unexpectedly under ReplayBroker"
+            );
+            EnterGateOutcome::Rejected {
+                reason: format!("failed: {reason}"),
+            }
+        }
+    }
+}
+
+/// Stamp `superseded = true` on any already-recorded enter `Fire` whose order
+/// the gate has now cancelled (cancel-and-replace). Called right after each
+/// accepted placement: the gate cancels at most a prior resting order, and the
+/// matching fire is the one carrying that `order_id`. Idempotent — a fire
+/// already marked stays marked.
+fn mark_superseded(fires: &mut [Fire], broker: &ReplayBroker) {
+    let cancelled = broker.cancelled_order_ids();
+    for fire in fires.iter_mut() {
+        if let Some(id) = fire.order_id()
+            && cancelled.contains(&id.to_string())
+        {
+            fire.superseded = true;
+        }
     }
 }
 
@@ -403,6 +502,9 @@ mod tests {
             pip_size: 0.0001,
             rules: Vec::new(),
             shadow: false,
+            cross_buffer_pct: 0.0,
+            retest_atr_step: trade_control_core::trade_plan::DEFAULT_RETEST_ATR_STEP,
+            replay_start: None,
         };
         let candles: Vec<EngineCandle> = (0..20)
             .map(|i| candle(i * 3600, 1.30 + i as f64 * 0.001))
@@ -429,6 +531,9 @@ mod tests {
             pip_size: 0.0001,
             rules: Vec::new(),
             shadow: false,
+            cross_buffer_pct: 0.0,
+            retest_atr_step: trade_control_core::trade_plan::DEFAULT_RETEST_ATR_STEP,
+            replay_start: None,
         };
         let replay = run(&plan, &[], Granularity::H1, all_live(), all_live()).await;
         assert!(replay.fires.is_empty());
@@ -571,8 +676,8 @@ mod tests {
             .find(|f| f.fired.rule_id == "05-enter")
             .expect("enter fired");
         assert_eq!(
-            enter.suppressed_by.as_deref(),
-            Some(&["cad-gdp(CAD GDP)".to_string()][..]),
+            enter.suppressed_by(),
+            vec!["cad-gdp(CAD GDP)".to_string()],
             "the enter must be suppressed by the active cad-gdp blackout"
         );
 
@@ -621,7 +726,7 @@ mod tests {
             .find(|f| f.fired.rule_id == "05-enter")
             .expect("enter fired");
         assert!(
-            enter.suppressed_by.is_none(),
+            enter.suppressed_by().is_empty(),
             "no active pause at the enter bar → not suppressed"
         );
         let report =

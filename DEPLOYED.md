@@ -53,9 +53,9 @@ from `main` carrying the week's accumulated changes.
 | part | version | deployed (Brisbane) | notes |
 |---|---|---|---|
 | pine | `v2.5` (study title `Candle Signals v25`) | — | manual republish; sends `open` for M/W body logic. `tv-arm-dev` bakes this study title (`ENV_PINE_NAME`) — rename the chart study to match. |
-| tv-arm | `0.1.0` | 2026-06-15 | installed as `tv-arm-dev` (dev URL + `Candle Signals v25` baked) |
-| trade-control | `0.2.0` | 2026-06-15 | installed as `trade-control-dev` (dev URL baked) |
-| backend | `v25` | 2026-06-15 | M/W real-time arming (v24) + dynamic geometry / `open` (v25) |
+| tv-arm | `0.1.0` | 2026-06-30 | installed as `tv-arm-dev` (dev URL + `Candle Signals v25` baked) |
+| trade-control | `0.2.0` | 2026-06-30 | installed as `trade-control-dev` (dev URL baked) |
+| backend | `main` @ `73794a9` | 2026-06-30 | Version `c5eda72c`. Activates **break-even stop** + **spread-blackout widen** (previously dormant) on the amend path now demo-verified (TN **v0.11.0** no-TP fix). Also carries the close-on-reversal / news-close / strategy-v2 fixes merged to `main` since the last dev deploy. |
 | contract | `v3` | — | unchanged by v24/v25 (`open` is optional) |
 
 ### staging

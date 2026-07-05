@@ -32,7 +32,6 @@
 //! silently falling back to 1.0 would mis-size the trade.
 
 use oanda_client::OandaClient;
-use worker::console_error;
 
 /// Failure modes for [`resolve_quote_to_account_rate`].
 #[derive(Debug)]
@@ -131,7 +130,7 @@ async fn try_mid(
             // transient errors without parsing the error body, so the
             // pragmatic thing is to log and treat any error as "try the
             // inverse" — if both fail we surface Unresolved.
-            console_error!("oanda pricing {instrument}: {err:?}");
+            tracing::error!("oanda pricing {instrument}: {err:?}");
             Ok(None)
         }
     }

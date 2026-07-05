@@ -187,6 +187,20 @@ pub fn classify<F: DrawingFetcher>(
     for stub in stubs {
         let d = fetcher.get_drawing(&stub.id)?;
         let kind = stub.name.as_str();
+        // A drawing TradingView read back with a degenerate anchor
+        // (`null` price/time — typically a half-drawn or auto-extending
+        // channel/fib the operator left lying around) can't be
+        // role-matched on its geometry. Skip it with a warning rather
+        // than aborting the whole arm — one stray channel should not
+        // strand a legitimate setup.
+        if d.has_degenerate_point() {
+            warn!(
+                id = %stub.id,
+                kind,
+                "drawing skipped — TradingView returned a degenerate anchor (null price/time)",
+            );
+            continue;
+        }
         let lbl_owned = d.label().to_string();
         let lbl = lbl_owned.as_str();
 
@@ -245,7 +259,7 @@ pub fn classify<F: DrawingFetcher>(
             // so it's accepted purely on geometry — exactly 3 anchors,
             // all inside the visible range. A path that's the wrong
             // shape or scrolled off-screen is ignored (logged below).
-            kind::PATH if is_mw_path(&d, visible_range) => {
+            kind::PATH if is_mw_path(&d, visible_range, slot_pref) => {
                 mw_paths.push(d);
                 Some("mw_path")
             }
@@ -279,27 +293,70 @@ pub fn classify<F: DrawingFetcher>(
 
     let mut roles = Roles::default();
 
-    if let Some((d, lbl)) =
-        pick_slot_with_label(invalidations, "invalidation", visible_range, slot_pref)
-    {
+    // Resolve the neckline first: under `--start` the invalidation picker uses
+    // it as a geometric reference (a valid `too-low` floor sits *below* the
+    // neckline, a `too-high` cap *above*) to drop a stale line left over from an
+    // earlier trade at the wrong price. See [`pick_slot_with_label`].
+    let break_and_close = pick_slot(break_lines, "break_and_close", visible_range, slot_pref);
+    let neckline_ref = break_and_close
+        .as_ref()
+        .map(|d| crate::geometry::line_mean_price(&d.prices()))
+        .filter(|p| p.is_finite());
+
+    if let Some((d, lbl)) = pick_slot_with_label(
+        invalidations,
+        "invalidation",
+        visible_range,
+        slot_pref,
+        neckline_ref,
+    ) {
         roles.invalidation = Some(d);
         roles.invalidation_label = Some(lbl);
     }
-    roles.break_and_close = pick_slot(break_lines, "break_and_close", visible_range, slot_pref);
-    roles.retest = pick_slot(retest_lines, "retest", visible_range, slot_pref);
+    roles.break_and_close = break_and_close;
+    // Retest = a cross back through the neckline (opposite direction, intrabar).
+    // TradingView used to force a *separate* `retest` trendline because a single
+    // drawing could only carry one alert; that limitation is gone, so the
+    // neckline (`break_and_close`) now serves both roles by default. A drawn
+    // `retest` line is still honoured — but it's **deprecated**: warn and keep it.
+    // With no `retest` line, fall back to the neckline drawing so `04-prep-retest`
+    // crosses the exact same geometry.
+    roles.retest = resolve_retest(
+        retest_lines,
+        &roles.break_and_close,
+        visible_range,
+        slot_pref,
+    );
     roles.tp_fib = pick_slot(tp_fibs, "tp_fib", visible_range, slot_pref);
     roles.trade_expiry = pick_trade_expiry(trade_expiries, visible_range, slot_pref);
 
     // Pause/resume and news-start/news-end lines that sit outside the
-    // visible window are stale leftovers from a prior setup — a window
+    // scope window are stale leftovers from a prior setup — a window
     // that may already have closed. Pairing them would mint a blackout
     // whose `end_time` is in the past, which `build_pause_from_spec`
-    // rejects ("refusing to arm a stale blackout"). Drop off-screen
-    // lines up front so only the on-screen window is armed.
-    let blackout_starts = in_visible_window(blackout_starts, "blackout_start", visible_range);
-    let blackout_ends = in_visible_window(blackout_ends, "blackout_end", visible_range);
-    let news_starts = in_visible_window(news_starts, "news_start", visible_range);
-    let news_ends = in_visible_window(news_ends, "news_end", visible_range);
+    // rejects ("refusing to arm a stale blackout"). Drop off-window lines
+    // up front so only the relevant window is armed.
+    //
+    // Scope window: normally the visible range. Under `--start` the whole
+    // chart is in play, so bound the verticals to `[start, trade-expiry]`
+    // instead — a news/blackout line only matters if it falls within the
+    // trade's own lifetime. (No resolved expiry → no forward bound; the
+    // required-role check surfaces the missing expiry shortly.)
+    let vertical_window = match slot_pref {
+        SlotPref::NearestTo { start } => {
+            let expiry = roles
+                .trade_expiry
+                .as_ref()
+                .map(|d| d.anchor_time())
+                .unwrap_or(i64::MAX);
+            (start, expiry)
+        }
+        _ => visible_range,
+    };
+    let blackout_starts = in_visible_window(blackout_starts, "blackout_start", vertical_window);
+    let blackout_ends = in_visible_window(blackout_ends, "blackout_end", vertical_window);
+    let news_starts = in_visible_window(news_starts, "news_start", vertical_window);
+    let news_ends = in_visible_window(news_ends, "news_end", vertical_window);
 
     roles.blackout_pairs = pair_vertical_lines(blackout_starts, blackout_ends, "blackout")?;
     roles.news_pairs = pair_vertical_lines(news_starts, news_ends, "news")?;
@@ -307,11 +364,53 @@ pub fn classify<F: DrawingFetcher>(
     roles.prep_expiries = latest_prep_expiry_per_step(prep_expiry_lines);
     // M/W paths are already in-window-filtered by `is_mw_path`, so latest-wins
     // among qualifiers is correct in both modes (the window filter inside
-    // `pick_slot` is a no-op for them).
-    roles.mw_path = pick_slot(mw_paths, "mw_path", visible_range, SlotPref::LatestWins);
+    // `pick_slot` is a no-op for them). Under `--start` the containment filter
+    // is dropped, so select the path whose two shoulders bracket the cursor —
+    // and, when an H&S neckline is *also* on the chart, defer to whichever of
+    // the two (path neckline vs drawn neckline) is anchored nearer `start`, so a
+    // stray M/W path from an earlier setup can't hijack an H&S arm.
+    let neckline_anchor = roles.break_and_close.as_ref().map(|d| d.latest_time());
+    roles.mw_path = pick_mw_path(mw_paths, slot_pref, neckline_anchor);
     roles.position = latest_position(positions);
 
     Ok(roles)
+}
+
+/// Resolve the retest role.
+///
+/// Historically the retest was a **separate** `retest` trendline, because a
+/// single TradingView drawing could only carry one alert (so the neckline
+/// couldn't fire both the break-and-close *and* its own retest). That
+/// limitation is gone, and the retest is by definition a cross back through the
+/// **same neckline** — so the neckline drawing now serves both roles.
+///
+/// - A drawn `retest` line is still honoured (so old charts keep working), but
+///   it is **deprecated**: warn and keep using it.
+/// - With no drawn `retest` line, fall back to the resolved neckline
+///   (`break_and_close`). `04-prep-retest`'s trigger then crosses the identical
+///   geometry — just the opposite direction, intrabar (see `retest_dir` in
+///   `trade_plan_build`).
+fn resolve_retest(
+    retest_lines: Vec<Drawing>,
+    break_and_close: &Option<Drawing>,
+    visible_range: (i64, i64),
+    slot_pref: SlotPref,
+) -> Option<Drawing> {
+    if !retest_lines.is_empty() {
+        warn!(
+            count = retest_lines.len(),
+            "a separate `retest` trendline is deprecated — the neckline now serves \
+             both break-and-close and retest; honouring the drawn retest line for now, \
+             but you can delete it and draw only the neckline"
+        );
+        return pick_slot(retest_lines, "retest", visible_range, slot_pref);
+    }
+    // No drawn retest line: reuse the neckline drawing.
+    if let Some(neckline) = break_and_close {
+        debug!("no `retest` line drawn; reusing the neckline for the retest role");
+        return Some(neckline.clone());
+    }
+    None
 }
 
 /// A position tool qualifies only when it has an entry anchor and both
@@ -345,8 +444,17 @@ fn latest_position(mut cands: Vec<PositionDrawing>) -> Option<PositionDrawing> {
 /// optional `D right-shoulder` (arms immediately). Off-screen paths are
 /// stale leftovers; a path with 2 or 5+ anchors is a fat-fingered shape
 /// and is ignored rather than guessed at.
-fn is_mw_path(d: &Drawing, (from, to): (i64, i64)) -> bool {
-    matches!(d.points.len(), 3 | 4) && d.points.iter().all(|p| p.time >= from && p.time <= to)
+fn is_mw_path(d: &Drawing, (from, to): (i64, i64), pref: SlotPref) -> bool {
+    if !matches!(d.points.len(), 3 | 4) {
+        return false;
+    }
+    // `--start` searches the whole chart, so the visible-window containment
+    // check is dropped — the bracket-start picker (`pick_mw_path`) selects
+    // among all valid-shape paths instead.
+    if let SlotPref::NearestTo { .. } = pref {
+        return true;
+    }
+    d.points.iter().all(|p| p.time >= from && p.time <= to)
 }
 
 /// Keep only the vertical-line drawings whose anchor sits inside the
@@ -431,6 +539,93 @@ pub enum SlotPref {
     /// Prefer the drawing belonging to the visible window `(from, to)`
     /// (replay build).
     WindowAware((i64, i64)),
+    /// `--start`: ignore the visible window entirely and select each role by
+    /// its **nearest-to-start** drawing, walking in the role's natural
+    /// direction (see the per-role pickers). `start` is a unix second. The
+    /// default tiebreak for the generic single-slot roles (neckline / retest /
+    /// tp_fib) is *nearest anchored at-or-before start*; `invalidation`,
+    /// `trade_expiry`, and the M/W path apply their own directional rules.
+    NearestTo { start: i64 },
+}
+
+/// Pick the M/W path drawing.
+///
+/// In the window-scoped modes (`LatestWins` / `WindowAware`) the paths were
+/// already visible-window-filtered by [`is_mw_path`], so latest-wins among the
+/// qualifiers is correct. Under `--start` ([`SlotPref::NearestTo`]) that filter
+/// is dropped, so select the path whose two **shoulders bracket the cursor**:
+/// `B left-shoulder <= start <= D right-shoulder`. When the right shoulder
+/// isn't drawn (3-anchor path) it's still forming, so the rule relaxes to
+/// `start >= B`. Among the bracketing paths the latest wins; if none bracket
+/// `start` (unusual — a chart with only unrelated paths) fall back to plain
+/// latest so a single stray path isn't silently dropped.
+///
+/// **H&S neckline tiebreak (`--start` only).** A chart can carry both an M/W
+/// path *and* an H&S neckline — e.g. a stray path from an earlier setup left on
+/// the chart while the operator journals an H&S. Because a path's presence alone
+/// routes the whole arm to M/W ([`super::pipeline`] keys on `roles.mw_path`), an
+/// old path must not win when the drawn H&S neckline is the setup actually being
+/// journaled. So when `neckline_anchor` is `Some`, compare the chosen path's own
+/// neckline anchor `C (points[2])` to it: whichever is anchored **nearer
+/// `start`** wins. If the drawn neckline is nearer, the path is dropped
+/// (`None` → H&S arm). This is what makes the 3-anchor relax rule safe — that
+/// rule (`start >= B`) otherwise matches *any* old path whose left shoulder
+/// predates the cursor.
+///
+/// Anchor order (see [`is_mw_path`]): `points[0]=A run-up-start`,
+/// `points[1]=B left-shoulder`, `points[2]=C neckline`, `points[3]=D
+/// right-shoulder` (optional).
+fn pick_mw_path(
+    cands: Vec<Drawing>,
+    pref: SlotPref,
+    neckline_anchor: Option<i64>,
+) -> Option<Drawing> {
+    let SlotPref::NearestTo { start } = pref else {
+        return pick_slot(cands, "mw_path", (i64::MIN, i64::MAX), SlotPref::LatestWins);
+    };
+    let brackets = |d: &Drawing| {
+        let Some(b) = d.points.get(1).map(|p| p.time) else {
+            return false;
+        };
+        match d.points.get(3).map(|p| p.time) {
+            Some(right) => b <= start && start <= right,
+            None => start >= b,
+        }
+    };
+    let chosen = cands
+        .iter()
+        .filter(|d| brackets(d))
+        .max_by_key(|d| d.latest_time())
+        .cloned()
+        .or_else(|| {
+            debug!(
+                role = "mw_path",
+                start, "no M/W path whose shoulders bracket --start; falling back to latest"
+            );
+            cands.into_iter().max_by_key(|d| d.latest_time())
+        })?;
+
+    // With both a path and a drawn H&S neckline on the chart, defer to whichever
+    // is anchored nearer the cursor. The path's own neckline is anchor C
+    // (`points[2]`); fall back to its latest anchor if the shape is short.
+    if let Some(neck) = neckline_anchor {
+        let path_neck = chosen
+            .points
+            .get(2)
+            .map(|p| p.time)
+            .unwrap_or_else(|| chosen.latest_time());
+        if (neck - start).abs() < (path_neck - start).abs() {
+            debug!(
+                role = "mw_path",
+                start,
+                path_neck,
+                neckline_anchor = neck,
+                "drawn H&S neckline is nearer --start than the M/W path; dropping the path (H&S arm)"
+            );
+            return None;
+        }
+    }
+    Some(chosen)
 }
 
 /// Pick a single-slot drawing, window-filtering first then breaking ties
@@ -461,6 +656,11 @@ fn pick_slot(
 ) -> Option<Drawing> {
     if cands.is_empty() {
         return None;
+    }
+    // `--start` ignores the visible window: search the whole chart and let the
+    // nearest-to-start tiebreak choose. Skip the window partition entirely.
+    if let SlotPref::NearestTo { .. } = pref {
+        return finish_slot_pick(cands, role, pref);
     }
     let total = cands.len();
     let (in_window, out): (Vec<Drawing>, Vec<Drawing>) = cands
@@ -503,7 +703,32 @@ fn finish_slot_pick(mut cands: Vec<Drawing>, role: &str, pref: SlotPref) -> Opti
             cands.pop()
         }
         SlotPref::WindowAware(view) => pick_window_aware(cands, role, view),
+        SlotPref::NearestTo { start } => pick_nearest_before(cands, role, start),
     }
+}
+
+/// `--start` tiebreak for the generic single-slot roles (neckline / retest /
+/// tp_fib). These are drawn *before* the setup completes, so the right one is
+/// the drawing anchored **at-or-before `start`, closest to it** (largest
+/// `latest_time()` that is `<= start`). If none is at-or-before start — e.g. a
+/// chart where every candidate is to the right — fall back to the one whose
+/// anchor is nearest to `start` in absolute terms, so we never select nothing.
+fn pick_nearest_before(cands: Vec<Drawing>, role: &str, start: i64) -> Option<Drawing> {
+    let before = cands
+        .iter()
+        .filter(|d| d.latest_time() <= start)
+        .max_by_key(|d| d.latest_time())
+        .cloned();
+    if let Some(d) = before {
+        return Some(d);
+    }
+    debug!(
+        role,
+        start, "no drawing anchored at-or-before --start; using absolute-nearest anchor"
+    );
+    cands
+        .into_iter()
+        .min_by_key(|d| (d.latest_time() - start).abs())
 }
 
 /// Pick the trade-expiry vertical line.
@@ -531,6 +756,25 @@ fn pick_trade_expiry(
     const ROLE: &str = "trade_expiry";
     if cands.is_empty() {
         return None;
+    }
+    // `--start`: the expiry sits *forward* of the setup, so pick the nearest
+    // vertical at-or-after `start`; if none is forward (a chart with only a
+    // past expiry) fall back to the absolute-nearest so we never drop it.
+    if let SlotPref::NearestTo { start } = pref {
+        let after = cands
+            .iter()
+            .filter(|d| d.anchor_time() >= start)
+            .min_by_key(|d| d.anchor_time())
+            .cloned();
+        return after.or_else(|| {
+            debug!(
+                role = ROLE,
+                start, "no trade-expiry at-or-after --start; using absolute-nearest anchor"
+            );
+            cands
+                .into_iter()
+                .min_by_key(|d| (d.anchor_time() - start).abs())
+        });
     }
     // Forward margin = window width (saturating), so it scales with timeframe.
     let width = to.saturating_sub(from);
@@ -607,15 +851,34 @@ fn pick_window_aware(cands: Vec<Drawing>, role: &str, (from, to): (i64, i64)) ->
 /// Variant of [`pick_slot`] for drawings that carry an associated label
 /// (currently just `invalidation`). Selects the drawing under `pref`, then
 /// returns it with its label.
+///
+/// `neckline_ref` is the resolved neckline's mean price (or `None` if no
+/// neckline is on the chart). Under `--start` it drives a **side-of-neckline
+/// filter** that runs *before* the nearest-to-start tiebreak: a valid `too-low`
+/// floor sits **below** the neckline and a valid `too-high` cap **above** it, so
+/// any candidate on the wrong side is a stale line left over from a different
+/// trade (e.g. an old `too-low` still drawn up near a prior head) and is
+/// dropped. This is what stops the picker grabbing a stale invalidation purely
+/// because its anchor *time* happened to sit nearer the cursor than the real
+/// one's (AUD/JPY IH&S 2026-06-29: a stale `too-low` at 112.993 out-timed the
+/// real floor at 111.288 and blocked every entry via the baked entry-level
+/// veto). If the filter would drop everything (no neckline, or all candidates on
+/// the wrong side) it's skipped so we never select nothing.
 fn pick_slot_with_label(
     cands: Vec<(Drawing, String)>,
     role: &str,
     window: (i64, i64),
     pref: SlotPref,
+    neckline_ref: Option<f64>,
 ) -> Option<(Drawing, String)> {
     if cands.is_empty() {
         return None;
     }
+    // Side-of-neckline filter (— `--start` only). Keep each candidate only if
+    // its price is on the geometrically-correct side of the neckline for its own
+    // label. Applied before splitting labels off, since the side depends on the
+    // per-candidate label. Skipped when it would empty the set.
+    let cands = filter_invalidation_by_neckline_side(cands, pref, neckline_ref, role);
     // Split labels off into a lookup, pick on the drawings alone (so the
     // window-filter + tiebreak logic is shared), then re-attach the chosen
     // label by id.
@@ -624,9 +887,73 @@ fn pick_slot_with_label(
         .map(|(d, lbl)| (d.id.clone(), lbl.clone()))
         .collect();
     let drawings: Vec<Drawing> = cands.into_iter().map(|(d, _)| d).collect();
-    let chosen = pick_slot(drawings, role, window, pref)?;
+    // The invalidation horizontals (`too-low` / `too-high`) *bracket* the
+    // pattern, so under `--start` the right one is the nearest **either side**
+    // of `start`, not nearest-before (a `too-high` cap above the right shoulder
+    // may be anchored just after the cursor). Every other single-slot role
+    // routes through `pick_slot`'s nearest-before default.
+    let chosen = if let SlotPref::NearestTo { start } = pref {
+        drawings
+            .into_iter()
+            .min_by_key(|d| (d.anchor_time() - start).abs())?
+    } else {
+        pick_slot(drawings, role, window, pref)?
+    };
     let lbl = labels.get(&chosen.id).cloned().unwrap_or_default();
     Some((chosen, lbl))
+}
+
+/// Drop invalidation candidates on the geometrically-wrong side of the neckline
+/// (`--start` only). A `too-low` floor must sit **below** the neckline, a
+/// `too-high` cap **above** it. Returns the filtered set, or the original set
+/// unchanged when the filter doesn't apply (not `--start`, no neckline, a
+/// non-finite candidate price) or would drop everything (so we never select
+/// nothing). Each dropped line is logged at debug.
+fn filter_invalidation_by_neckline_side(
+    cands: Vec<(Drawing, String)>,
+    pref: SlotPref,
+    neckline_ref: Option<f64>,
+    role: &str,
+) -> Vec<(Drawing, String)> {
+    let (SlotPref::NearestTo { .. }, Some(neck)) = (pref, neckline_ref) else {
+        return cands;
+    };
+    let correct_side = |d: &Drawing, lbl: &str| -> bool {
+        let price = crate::geometry::horizontal_price(&d.prices());
+        if !price.is_finite() {
+            return true; // can't judge → keep (never drop on missing data)
+        }
+        let l = lbl.trim().to_ascii_lowercase();
+        match l.as_str() {
+            "too-low" => price < neck,  // long floor sits below the neckline
+            "too-high" => price > neck, // short cap sits above the neckline
+            _ => true,                  // unknown label → keep
+        }
+    };
+    let (kept, dropped): (Vec<_>, Vec<_>) =
+        cands.into_iter().partition(|(d, lbl)| correct_side(d, lbl));
+    if kept.is_empty() {
+        // Everything is on the "wrong" side — the neckline reference is
+        // probably itself off (or the operator drew an unusual chart). Don't
+        // strand the setup; fall back to the full set.
+        debug!(
+            role,
+            neckline_ref = neck,
+            "side-of-neckline filter would drop every invalidation; keeping all"
+        );
+        return dropped;
+    }
+    for (d, lbl) in &dropped {
+        debug!(
+            role,
+            id = %d.id,
+            label = %lbl,
+            price = crate::geometry::horizontal_price(&d.prices()),
+            neckline_ref = neck,
+            "invalidation dropped — wrong side of the neckline (stale line?)"
+        );
+    }
+    kept
 }
 
 #[cfg(test)]
@@ -770,6 +1097,91 @@ mod tests {
 
         assert_eq!(roles.sr_levels.len(), 1);
         assert_eq!(roles.sr_levels[0].id, "sr");
+    }
+
+    #[test]
+    fn neckline_serves_the_retest_when_no_retest_line_is_drawn() {
+        // No separate `retest` trendline: the retest role reuses the neckline
+        // drawing so `04-prep-retest` crosses the identical geometry.
+        let (stubs, mcp) = fixture(vec![(
+            stub("neck", "trend_line"),
+            drawing("neck", "neckline", vec![(50, 1.10), (200, 1.10)]),
+        )]);
+
+        let roles = classify(&mcp, &stubs, ANY_RANGE, SlotPref::LatestWins).expect("classify ok");
+        assert_eq!(roles.break_and_close.as_ref().unwrap().id, "neck");
+        assert_eq!(
+            roles.retest.as_ref().unwrap().id,
+            "neck",
+            "the retest role falls back to the neckline drawing"
+        );
+    }
+
+    #[test]
+    fn a_separate_retest_line_is_still_honoured_deprecated() {
+        // A drawn `retest` line still wins its own slot (backward compat) even
+        // though it's deprecated — the neckline would otherwise serve both.
+        let (stubs, mcp) = fixture(vec![
+            (
+                stub("neck", "trend_line"),
+                drawing("neck", "neckline", vec![(50, 1.10), (200, 1.10)]),
+            ),
+            (
+                stub("re", "trend_line"),
+                drawing("re", "retest", vec![(60, 1.11), (210, 1.11)]),
+            ),
+        ]);
+
+        let roles = classify(&mcp, &stubs, ANY_RANGE, SlotPref::LatestWins).expect("classify ok");
+        assert_eq!(roles.break_and_close.as_ref().unwrap().id, "neck");
+        assert_eq!(
+            roles.retest.as_ref().unwrap().id,
+            "re",
+            "a drawn retest line is honoured over the neckline fallback"
+        );
+    }
+
+    #[test]
+    fn no_neckline_and_no_retest_leaves_the_retest_role_empty() {
+        // With neither drawing there's nothing to derive the retest from.
+        let (stubs, mcp) = fixture(vec![(
+            stub("inv", "horizontal_line"),
+            drawing("inv", "too-high", vec![(100, 1.25)]),
+        )]);
+
+        let roles = classify(&mcp, &stubs, ANY_RANGE, SlotPref::LatestWins).expect("classify ok");
+        assert!(roles.break_and_close.is_none());
+        assert!(
+            roles.retest.is_none(),
+            "no neckline to fall back to → no retest"
+        );
+    }
+
+    #[test]
+    fn degenerate_drawing_is_skipped_not_fatal() {
+        // A stray `parallel_channel` whose third anchor read back with a
+        // null price (NaN sentinel) must NOT abort classification — it is
+        // skipped, and the legitimate neckline beside it still resolves.
+        let mut channel = drawing("chan", "", vec![(50, 1.10), (200, 1.10)]);
+        channel.points.push(Point {
+            time: 1772582400,
+            price: f64::NAN,
+        });
+        let (stubs, mcp) = fixture(vec![
+            (stub("chan", "parallel_channel"), channel),
+            (
+                stub("neck", "trend_line"),
+                drawing("neck", "neckline", vec![(50, 1.10), (200, 1.10)]),
+            ),
+        ]);
+
+        let roles = classify(&mcp, &stubs, ANY_RANGE, SlotPref::LatestWins)
+            .expect("a degenerate channel must not abort the arm");
+        assert_eq!(
+            roles.break_and_close.as_ref().unwrap().id,
+            "neck",
+            "the neckline still resolves alongside the skipped channel"
+        );
     }
 
     #[test]
@@ -957,6 +1369,328 @@ mod tests {
         let view = (0, 100);
         let roles = classify(&mcp, &stubs, view, SlotPref::WindowAware(view)).expect("ok");
         assert_eq!(roles.break_and_close.unwrap().id, "b");
+    }
+
+    // ===== `--start` (SlotPref::NearestTo) whole-chart matching ==========
+
+    /// `--start` picks the neckline anchored **before and nearest** the cursor,
+    /// ignoring the visible window entirely — a later (future) neckline that a
+    /// naive latest-wins would grab is skipped. This is the journaling case: the
+    /// chart shows the whole trade + future candles, but arming is anchored to
+    /// the shoulder moment.
+    #[test]
+    fn nearest_to_picks_neckline_before_and_nearest_start() {
+        let (stubs, mcp) = fixture(vec![
+            (
+                stub("old", "trend_line"),
+                drawing("old", "neckline", vec![(100, 1.0), (200, 1.0)]),
+            ),
+            (
+                stub("near", "trend_line"),
+                drawing("near", "neckline", vec![(400, 1.0), (500, 1.0)]),
+            ),
+            (
+                stub("future", "trend_line"),
+                drawing("future", "neckline", vec![(900, 1.0), (1000, 1.0)]),
+            ),
+        ]);
+        // start=600: `near` (latest_time 500 ≤ 600) is nearest-before; `future`
+        // (900) is after start and must not win despite being newest.
+        let roles = classify(&mcp, &stubs, ANY_RANGE, SlotPref::NearestTo { start: 600 })
+            .expect("classify ok");
+        assert_eq!(roles.break_and_close.unwrap().id, "near");
+    }
+
+    /// The invalidation horizontals bracket the pattern, so `--start` takes the
+    /// nearest **either side** of the cursor — a `too-high` cap anchored just
+    /// *after* start still wins if it's closest.
+    #[test]
+    fn nearest_to_invalidation_takes_nearest_either_side() {
+        let (stubs, mcp) = fixture(vec![
+            (
+                stub("far-before", "horizontal_line"),
+                drawing("far-before", "too-low", vec![(100, 1.0)]),
+            ),
+            (
+                stub("just-after", "horizontal_line"),
+                drawing("just-after", "too-high", vec![(650, 1.5)]),
+            ),
+        ]);
+        // start=600: `just-after` (|650-600|=50) beats `far-before`
+        // (|100-600|=500), even though it's anchored after the cursor.
+        let roles = classify(&mcp, &stubs, ANY_RANGE, SlotPref::NearestTo { start: 600 })
+            .expect("classify ok");
+        assert_eq!(roles.invalidation.as_ref().unwrap().id, "just-after");
+        assert_eq!(roles.invalidation_label.as_deref(), Some("too-high"));
+    }
+
+    /// THE BUG (AUD/JPY IH&S 2026-06-29): two `too-low` lines on the chart — the
+    /// real floor at 111.288 (below the neckline ~111.5) and a stale one at
+    /// 112.993 (above it, left over from a prior trade). Nearest-to-start alone
+    /// grabbed the stale one because its anchor *time* sat nearer the cursor,
+    /// baking a floor above the entry that blocked every fill via the at-entry
+    /// veto. The side-of-neckline filter drops the above-neckline `too-low`
+    /// first, so the real floor wins even though it's anchored further in time.
+    #[test]
+    fn nearest_to_invalidation_drops_too_low_above_neckline() {
+        let (stubs, mcp) = fixture(vec![
+            // Neckline ~111.5 (mean of the two anchors).
+            (
+                stub("neck", "trend_line"),
+                drawing("neck", "neckline", vec![(400, 111.5), (500, 111.5)]),
+            ),
+            // Stale `too-low` ABOVE the neckline, anchored NEAR start (t=590).
+            (
+                stub("stale", "horizontal_line"),
+                drawing("stale", "too-low", vec![(590, 112.993)]),
+            ),
+            // Real `too-low` floor BELOW the neckline, anchored further (t=450).
+            (
+                stub("real", "horizontal_line"),
+                drawing("real", "too-low", vec![(450, 111.288)]),
+            ),
+        ]);
+        // start=600: by time alone `stale` (|590-600|=10) beats `real`
+        // (|450-600|=150) — but `stale` is above the neckline and is dropped.
+        let roles = classify(&mcp, &stubs, ANY_RANGE, SlotPref::NearestTo { start: 600 })
+            .expect("classify ok");
+        assert_eq!(
+            roles.invalidation.as_ref().unwrap().id,
+            "real",
+            "the below-neckline floor wins; the stale above-neckline line is dropped"
+        );
+        assert_eq!(roles.invalidation_label.as_deref(), Some("too-low"));
+    }
+
+    /// Mirror for a short: a stale `too-high` *below* the neckline is dropped so
+    /// the real cap above it wins, even when the stale one is nearer in time.
+    #[test]
+    fn nearest_to_invalidation_drops_too_high_below_neckline() {
+        let (stubs, mcp) = fixture(vec![
+            (
+                stub("neck", "trend_line"),
+                drawing("neck", "neckline", vec![(400, 111.5), (500, 111.5)]),
+            ),
+            // Stale `too-high` BELOW the neckline, near start.
+            (
+                stub("stale", "horizontal_line"),
+                drawing("stale", "too-high", vec![(590, 110.2)]),
+            ),
+            // Real `too-high` cap ABOVE the neckline, further in time.
+            (
+                stub("real", "horizontal_line"),
+                drawing("real", "too-high", vec![(450, 112.1)]),
+            ),
+        ]);
+        let roles = classify(&mcp, &stubs, ANY_RANGE, SlotPref::NearestTo { start: 600 })
+            .expect("classify ok");
+        assert_eq!(roles.invalidation.as_ref().unwrap().id, "real");
+        assert_eq!(roles.invalidation_label.as_deref(), Some("too-high"));
+    }
+
+    /// When *every* candidate is on the "wrong" side (an unusual chart, or a
+    /// mis-resolved neckline), the filter must not strand the setup — it falls
+    /// back to the full set and nearest-to-start still picks one.
+    #[test]
+    fn nearest_to_invalidation_side_filter_falls_back_when_all_wrong_side() {
+        let (stubs, mcp) = fixture(vec![
+            (
+                stub("neck", "trend_line"),
+                drawing("neck", "neckline", vec![(400, 111.5), (500, 111.5)]),
+            ),
+            // Both `too-low` lines above the neckline (would all be dropped).
+            (
+                stub("a", "horizontal_line"),
+                drawing("a", "too-low", vec![(590, 112.9)]),
+            ),
+            (
+                stub("b", "horizontal_line"),
+                drawing("b", "too-low", vec![(450, 112.5)]),
+            ),
+        ]);
+        // Filter would empty the set → keep all → nearest-to-start (t=590) wins.
+        let roles = classify(&mcp, &stubs, ANY_RANGE, SlotPref::NearestTo { start: 600 })
+            .expect("classify ok");
+        assert_eq!(roles.invalidation.as_ref().unwrap().id, "a");
+    }
+
+    /// The trade-expiry vertical sits forward of the setup, so `--start` picks
+    /// the nearest vertical **at-or-after** the cursor — a stale past expiry to
+    /// the left is skipped.
+    #[test]
+    fn nearest_to_trade_expiry_picks_nearest_after_start() {
+        let (stubs, mcp) = fixture(vec![
+            (
+                stub("past", "vertical_line"),
+                drawing("past", "trade-expiry", vec![(200, 0.0)]),
+            ),
+            (
+                stub("future", "vertical_line"),
+                drawing("future", "trade-expiry", vec![(800, 0.0)]),
+            ),
+        ]);
+        let roles = classify(&mcp, &stubs, ANY_RANGE, SlotPref::NearestTo { start: 600 })
+            .expect("classify ok");
+        assert_eq!(roles.trade_expiry.unwrap().id, "future");
+    }
+
+    /// The M/W path whose two **shoulders bracket** the cursor
+    /// (`B ≤ start ≤ D`) wins; a path that ended before the cursor is a prior
+    /// setup and is skipped even though it's older-but-complete.
+    #[test]
+    fn nearest_to_mw_path_brackets_start() {
+        // path anchors: [A run-up-start, B left-shoulder, C neckline, D right-shoulder]
+        let (stubs, mcp) = fixture(vec![
+            (
+                stub("earlier", "path"),
+                drawing(
+                    "earlier",
+                    "",
+                    vec![(10, 1.0), (20, 1.1), (30, 1.05), (40, 1.1)],
+                ),
+            ),
+            (
+                stub("bracketing", "path"),
+                drawing(
+                    "bracketing",
+                    "",
+                    vec![(500, 1.0), (550, 1.1), (600, 1.05), (700, 1.1)],
+                ),
+            ),
+        ]);
+        // start=620: only `bracketing` has B(550) ≤ 620 ≤ D(700).
+        let roles = classify(&mcp, &stubs, ANY_RANGE, SlotPref::NearestTo { start: 620 })
+            .expect("classify ok");
+        assert_eq!(roles.mw_path.unwrap().id, "bracketing");
+    }
+
+    /// A 3-anchor M/W path (no drawn right shoulder) brackets `start` when the
+    /// cursor is at-or-after the left shoulder (`start ≥ B`) — the right
+    /// shoulder is still forming.
+    #[test]
+    fn nearest_to_mw_path_three_anchor_relaxes_to_after_left_shoulder() {
+        let (stubs, mcp) = fixture(vec![(
+            stub("forming", "path"),
+            drawing("forming", "", vec![(500, 1.0), (550, 1.1), (600, 1.05)]),
+        )]);
+        // start=580 ≥ B(550), no D → qualifies.
+        let roles = classify(&mcp, &stubs, ANY_RANGE, SlotPref::NearestTo { start: 580 })
+            .expect("classify ok");
+        assert_eq!(roles.mw_path.unwrap().id, "forming");
+    }
+
+    /// THE BUG (AUD/JPY 2026-06-29): a stray 3-anchor M/W path from an earlier
+    /// setup sits far to the left of `start`; the operator is journaling an H&S
+    /// whose neckline is drawn much nearer the cursor. The relax rule
+    /// (`start >= B`) makes the old path *bracket* start, and a path's mere
+    /// presence routes the whole arm to M/W — hijacking the H&S. With the drawn
+    /// neckline anchored nearer `start` than the path's own neckline (C), the
+    /// path is dropped and the arm stays H&S (`mw_path == None`).
+    #[test]
+    fn nearest_to_drops_stray_path_when_hs_neckline_is_nearer_start() {
+        let (stubs, mcp) = fixture(vec![
+            // Stray M/W path from a prior setup, neckline C at t=300, far left.
+            (
+                stub("stray", "path"),
+                drawing("stray", "", vec![(100, 1.0), (200, 1.1), (300, 1.05)]),
+            ),
+            // The H&S neckline the operator is actually journaling, near start.
+            (
+                stub("neck", "trend_line"),
+                drawing("neck", "neckline", vec![(850, 1.2), (900, 1.2)]),
+            ),
+        ]);
+        // start=950: path C(300) is |650| away; neckline(900) is |50| away → H&S.
+        let roles = classify(&mcp, &stubs, ANY_RANGE, SlotPref::NearestTo { start: 950 })
+            .expect("classify ok");
+        assert!(
+            roles.mw_path.is_none(),
+            "stray path far from start must not hijack the H&S arm"
+        );
+        assert_eq!(
+            roles.break_and_close.as_ref().unwrap().id,
+            "neck",
+            "the drawn H&S neckline drives the arm"
+        );
+    }
+
+    /// Mirror of the above: when the M/W path's own neckline (C) is the one
+    /// nearer `start`, the path wins even though an H&S-style trend line is also
+    /// present — a genuine M/W journaling arm is not accidentally demoted.
+    #[test]
+    fn nearest_to_keeps_path_when_it_is_nearer_start_than_neckline() {
+        let (stubs, mcp) = fixture(vec![
+            // A trend line far to the left (stale), C-equivalent at t=200.
+            (
+                stub("old-neck", "trend_line"),
+                drawing("old-neck", "neckline", vec![(150, 1.2), (200, 1.2)]),
+            ),
+            // The M/W path being journaled, neckline C at t=900, near start.
+            (
+                stub("path", "path"),
+                drawing("path", "", vec![(700, 1.0), (800, 1.1), (900, 1.05)]),
+            ),
+        ]);
+        // start=950: path C(900) is |50| away; neckline(200) is |750| → M/W wins.
+        let roles = classify(&mcp, &stubs, ANY_RANGE, SlotPref::NearestTo { start: 950 })
+            .expect("classify ok");
+        assert_eq!(
+            roles.mw_path.as_ref().unwrap().id,
+            "path",
+            "the near M/W path drives the arm over a stale trend line"
+        );
+    }
+
+    /// Under `--start` the news/blackout vertical pairs are scoped to
+    /// `[start, trade-expiry]` — a pair before `start` or after the expiry is a
+    /// stale/irrelevant leftover and is dropped; only a pair inside the trade's
+    /// own lifetime survives.
+    #[test]
+    fn nearest_to_scopes_vertical_pairs_to_start_expiry() {
+        let (stubs, mcp) = fixture(vec![
+            // trade-expiry vertical at t=1000 — the forward bound.
+            (
+                stub("exp", "vertical_line"),
+                drawing("exp", "trade-expiry", vec![(1000, 0.0)]),
+            ),
+            // A news pair BEFORE start (400..450) — dropped.
+            (
+                stub("early-s", "vertical_line"),
+                drawing("early-s", "news-start", vec![(400, 0.0)]),
+            ),
+            (
+                stub("early-e", "vertical_line"),
+                drawing("early-e", "news-end", vec![(450, 0.0)]),
+            ),
+            // A news pair INSIDE [start, expiry] (700..750) — kept.
+            (
+                stub("mid-s", "vertical_line"),
+                drawing("mid-s", "news-start", vec![(700, 0.0)]),
+            ),
+            (
+                stub("mid-e", "vertical_line"),
+                drawing("mid-e", "news-end", vec![(750, 0.0)]),
+            ),
+            // A news pair AFTER expiry (1200..1250) — dropped.
+            (
+                stub("late-s", "vertical_line"),
+                drawing("late-s", "news-start", vec![(1200, 0.0)]),
+            ),
+            (
+                stub("late-e", "vertical_line"),
+                drawing("late-e", "news-end", vec![(1250, 0.0)]),
+            ),
+        ]);
+        // start=600, expiry resolves to 1000 → only the 700..750 pair qualifies.
+        let roles = classify(&mcp, &stubs, ANY_RANGE, SlotPref::NearestTo { start: 600 })
+            .expect("classify ok");
+        assert_eq!(
+            roles.news_pairs.len(),
+            1,
+            "only the in-[start,expiry] news pair survives"
+        );
+        let (s, _e) = &roles.news_pairs[0];
+        assert_eq!(s.id, "mid-s");
     }
 
     #[test]

@@ -44,6 +44,30 @@ use serde::{Deserialize, Serialize};
 use crate::broker::Granularity;
 use crate::intent::{Direction, Intent};
 
+/// Default cross-depth buffer (percent of the crossed level's price) baked onto
+/// a plan at arm time. **`0.02%`** — calibrated on the AUD/JPY iH&S of
+/// 2026-06-29: a buffer sweep showed the trade is a **−1.43R** loss with no
+/// buffer (three shallow early retest taps each stop out before the runner),
+/// flips to **+0.57R net** at `0.02%` (the shallow taps are filtered, leaving
+/// only the entry that runs to TP), holds through `~0.07%`, and over-tightens
+/// into a starved 0-trade plan at `0.1%`. `0.02%` is the threshold where the
+/// trade turns profitable, so it is the default. Set a different value per-trade
+/// to tune (a future `tv-arm --cross-buffer-pct` flag overrides it); `0.0`
+/// restores the bare wick-touch behaviour. See [`TradePlan::cross_buffer_pct`].
+pub const DEFAULT_CROSS_BUFFER_PCT: f64 = 0.02;
+
+/// Default per-bar decay step (in ATR multiples) for the retest tolerance —
+/// **0.075**. The first bar after the break must reach the neckline; each later
+/// bar loosens by `0.075 × ATR`, so the retest accepts a wick within ~1 ATR of
+/// the line by ~bar 14. Chosen by the operator as a starting point for visual
+/// tuning; override per-trade with `tv-arm --retest-atr-step`. See
+/// [`TradePlan::retest_atr_step`].
+pub const DEFAULT_RETEST_ATR_STEP: f64 = 0.075;
+
+fn default_retest_atr_step() -> f64 {
+    DEFAULT_RETEST_ATR_STEP
+}
+
 /// One signed trade, folded from every alert `tv-arm` would have created. The
 /// engine evaluates its [`rules`](Self::rules) against fresh candles each tick.
 ///
@@ -83,6 +107,49 @@ pub struct TradePlan {
     /// deserialize as **live** (`false`).
     #[serde(default)]
     pub shadow: bool,
+    /// Cross-depth buffer, as a **percent of the crossed level's price**, that
+    /// an *intrabar* directional cross must pierce past the line before it
+    /// counts. Guards against a one-tick graze tripping a retest / invalidation:
+    /// a `Down` cross needs `low <= level - (pct/100)*level`, an `Up` cross needs
+    /// `high >= level + (pct/100)*level`. `Either` keeps a bare straddle, and
+    /// `OnClose` (break-and-close) is unaffected — its close must already be on
+    /// the far side. `0.0` (the default) reproduces the pre-buffer behaviour, so
+    /// plans signed before this field deserialize unchanged.
+    ///
+    /// Plan-level (uniform across the plan's crosses) and signed as part of the
+    /// whole-body HMAC, so it's fixed at arm time. A future `tv-arm` flag can
+    /// override the arm-time default.
+    #[serde(default)]
+    pub cross_buffer_pct: f64,
+    /// Per-bar decay step (in **ATR multiples**) for the retest's
+    /// closeness-to-neckline tolerance. The retest cross loosens as bars pass
+    /// since the break-and-close: the first bar after the break must actually
+    /// *reach* the neckline (tolerance 0), and each subsequent bar adds
+    /// `retest_atr_step × ATR` of **near-side** slack, so a wick that comes
+    /// *within* the tolerance of the line (without reaching it) still stamps the
+    /// retest. With `N` = bars since break-and-close (first = 1) and `ATR` the
+    /// Wilder ATR at the current bar, the tolerance is `(N-1) × retest_atr_step ×
+    /// ATR`. The rationale (operator): a retest right after the break should be
+    /// tight, but the further price drifts in time the less its exact distance to
+    /// the neckline matters.
+    ///
+    /// Only the retest rule uses this; every other intrabar cross keeps
+    /// [`Self::cross_buffer_pct`] (which tightens, not loosens). Signed as part of
+    /// the whole-body HMAC, so it's fixed at arm time; `tv-arm --retest-atr-step`
+    /// overrides the default. `#[serde(default = …)]` gives plans signed before
+    /// this field the same **0.075** default rather than a silent `0.0` (which
+    /// would freeze the retest at "must reach" forever).
+    #[serde(default = "default_retest_atr_step")]
+    pub retest_atr_step: f64,
+    /// Arm-time replay cursor (`tv-arm --start`, a Unix second), baked so the
+    /// offline `replay-candles` harness can derive a self-consistent window
+    /// without reading the TradingView chart's replay cursor. The worker does
+    /// **not** act on this — it's a journaling aid. `replay-candles` uses it as
+    /// the start cursor (its own `--start` flag still overrides). `None` when
+    /// `tv-arm` was run without `--start`; `#[serde(skip_serializing_if)]` keeps
+    /// it out of the JSON entirely then, so pre-field plans round-trip unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replay_start: Option<i64>,
 }
 
 /// One condition + the intent it fires. The engine evaluates [`trigger`] each
@@ -351,6 +418,61 @@ bar: on_close
         assert!(
             !plan.shadow,
             "absent shadow key must default to live (false)"
+        );
+    }
+
+    /// A plan signed before `cross_buffer_pct` existed (no key in the wire body)
+    /// must deserialize with a `0.0` buffer — `#[serde(default)]` → the
+    /// pre-buffer bare-wick behaviour, so old plans are byte-for-byte unchanged.
+    #[test]
+    fn missing_cross_buffer_pct_defaults_to_zero() {
+        let json = r#"{"trade_id":"t-1","instrument":"EUR_USD","direction":"short",
+            "granularity":"h1","pip_size":0.0001,"rules":[]}"#;
+        let plan: TradePlan = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            plan.cross_buffer_pct, 0.0,
+            "absent cross_buffer_pct must default to 0.0 (no buffer)"
+        );
+    }
+
+    /// The `cross_buffer_pct` value survives a JSON round-trip when set.
+    #[test]
+    fn cross_buffer_pct_round_trips() {
+        let json = r#"{"trade_id":"t-1","instrument":"EUR_USD","direction":"short",
+            "granularity":"h1","pip_size":0.0001,"rules":[],"cross_buffer_pct":0.1}"#;
+        let plan: TradePlan = serde_json::from_str(json).unwrap();
+        assert_eq!(plan.cross_buffer_pct, 0.1);
+        let back: TradePlan = serde_json::from_str(&serde_json::to_string(&plan).unwrap()).unwrap();
+        assert_eq!(back.cross_buffer_pct, 0.1, "must survive a round-trip");
+    }
+
+    /// A plan with no `replay_start` deserializes to `None`, and re-serializing
+    /// omits the field entirely (so pre-field plans round-trip byte-clean).
+    #[test]
+    fn missing_replay_start_defaults_to_none_and_is_omitted() {
+        let json = r#"{"trade_id":"t-1","instrument":"EUR_USD","direction":"short",
+            "granularity":"h1","pip_size":0.0001,"rules":[]}"#;
+        let plan: TradePlan = serde_json::from_str(json).unwrap();
+        assert_eq!(plan.replay_start, None);
+        let out = serde_json::to_string(&plan).unwrap();
+        assert!(
+            !out.contains("replay_start"),
+            "None replay_start must be skipped in the JSON, got: {out}"
+        );
+    }
+
+    /// A baked `replay_start` (from `tv-arm --start`) survives a round-trip.
+    #[test]
+    fn replay_start_round_trips() {
+        let json = r#"{"trade_id":"t-1","instrument":"EUR_USD","direction":"short",
+            "granularity":"h1","pip_size":0.0001,"rules":[],"replay_start":1781208000}"#;
+        let plan: TradePlan = serde_json::from_str(json).unwrap();
+        assert_eq!(plan.replay_start, Some(1781208000));
+        let back: TradePlan = serde_json::from_str(&serde_json::to_string(&plan).unwrap()).unwrap();
+        assert_eq!(
+            back.replay_start,
+            Some(1781208000),
+            "must survive a round-trip"
         );
     }
 }

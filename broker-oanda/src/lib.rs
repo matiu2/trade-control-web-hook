@@ -20,21 +20,44 @@ use oanda::{
     amend_stop as amend_stop_impl, cancel_order as cancel_order_impl,
     cancel_pending_for_instrument, close_positions, get_quote as get_quote_impl,
     list_open_positions as list_open_positions_impl,
-    list_pending_orders as list_pending_orders_impl, login as login_client,
+    list_pending_orders as list_pending_orders_impl,
     lookup_attempt_state as lookup_attempt_state_impl, place_entry,
 };
+#[cfg(target_arch = "wasm32")]
+use oanda::{login as login_client, login_with_live};
 use oanda_client::OandaClient;
 use trade_control_core::broker::{
     AmendError, AttemptState, Broker, CancelError, Candle, CandleError, EntryError, EntryRequest,
     Granularity, LookupError, OpenPosition, PendingOrder, Quote,
 };
-use worker::{Env, console_error};
+#[cfg(target_arch = "wasm32")]
+use worker::Env;
 
 /// Authenticated OANDA broker handle. Holds the API client and the account id
 /// resolved from the Worker secrets at login time.
 pub struct OandaBroker {
     client: OandaClient,
     account_id: String,
+}
+
+impl OandaBroker {
+    /// Construct a broker directly from an API key + sub-account id, with no
+    /// Worker `Env` involved. This is the **native-runtime** entry point (the
+    /// VM + Postgres binary): it reads `OANDA_API_KEY` from the process
+    /// environment / config and the account id from the Postgres account index,
+    /// rather than from Worker secrets. `live` picks the OANDA host (live vs
+    /// practice), normally derived from the account's `kind`.
+    ///
+    /// The `login*(env)` helpers below stay the wasm-worker path; both build the
+    /// same `OandaBroker` value, so all `impl Broker` methods are shared.
+    pub fn from_api_key(api_key: String, account_id: String, live: bool) -> Self {
+        let client = if live {
+            OandaClient::new_live(api_key)
+        } else {
+            OandaClient::new(api_key)
+        };
+        Self { client, account_id }
+    }
 }
 
 impl Broker for OandaBroker {
@@ -143,11 +166,12 @@ impl Broker for OandaBroker {
 /// Uses the worker-global `OANDA_ACCOUNT_ID` secret for the sub-account
 /// id — call [`login_with_account_id`] instead when the intent names a
 /// specific account whose id lives on its metadata record.
+#[cfg(target_arch = "wasm32")]
 pub async fn login(env: &Env) -> Option<OandaBroker> {
     let account_id = match get_secret(OANDA_ACCOUNT_ID, env) {
         Some(s) => s,
         None => {
-            console_error!("missing required secret: {OANDA_ACCOUNT_ID}");
+            tracing::error!("missing required secret: {OANDA_ACCOUNT_ID}");
             return None;
         }
     };
@@ -161,16 +185,18 @@ pub async fn login(env: &Env) -> Option<OandaBroker> {
 /// the account's `kind`) so each account hits its own OANDA environment
 /// regardless of the worker-global `OANDA_LIVE` secret. The API token is
 /// still the shared worker-wide `OANDA_API_KEY`.
+#[cfg(target_arch = "wasm32")]
 pub async fn login_with_account_id(
     env: &Env,
     account_id: String,
     live: bool,
 ) -> Option<OandaBroker> {
-    let client = oanda::login_with_live(env, live).await?;
+    let client = login_with_live(env, live).await?;
     Some(OandaBroker { client, account_id })
 }
 
 /// Read a secret. Returns `None` if the binding is absent or unreadable.
+#[cfg(target_arch = "wasm32")]
 fn get_secret(name: &str, env: &Env) -> Option<String> {
     env.secret(name).map(|value| value.to_string()).ok()
 }

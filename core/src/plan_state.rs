@@ -90,6 +90,17 @@ pub struct PlanState {
     /// without a wire-format break.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mw: Option<crate::state::MwState>,
+    /// `news_id`s of news windows that are **currently open** — a `news-start`
+    /// control rule adds its id here, the matching `news-end` removes it. This
+    /// is the engine's pure mirror of the worker's `news:<trade_id>:<news_id>`
+    /// KV entries (which `run_close` consults via `list_news_windows_for_trade`).
+    /// A news-gated reversal-close (`inside_window: ["news"]`) may only fire
+    /// while this set is non-empty — without it the engine would fire the close
+    /// on any qualifying reversal anywhere across the plan window, including
+    /// hours after the news window closed (the bug that erased two legitimate
+    /// entries on USD/CHF 2026-06-26: the close fired 9h after `news-end`).
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub open_news_windows: BTreeSet<String>,
     /// Safety TTL — like [`MwState::expires_at`](crate::state::MwState), this
     /// just ages an orphaned row out; the authoritative end of a plan is its
     /// dispatch, a terminal veto, or the KV TTL on the plan itself.
@@ -127,6 +138,7 @@ impl PlanState {
             || self.break_close_at != prior.break_close_at
             || self.retest_seen_at != prior.retest_seen_at
             || self.mw != prior.mw
+            || self.open_news_windows != prior.open_news_windows
     }
 
     /// A fresh, never-ticked state for `phase`. The first engine tick seeds the
@@ -141,6 +153,7 @@ impl PlanState {
             break_close_at: None,
             retest_seen_at: None,
             mw: None,
+            open_news_windows: BTreeSet::new(),
             expires_at,
         }
     }

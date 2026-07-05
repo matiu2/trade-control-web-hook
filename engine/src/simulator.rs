@@ -46,9 +46,10 @@
 //! (the fill bar is in the exit search, pessimistic on SL/TP ties), per-bar
 //! bid/ask book selection, and bar-expiry (`expiry_bars` bounds the fill window).
 
-use trade_control_core::allow_entry_gate::{self, AllowEntryOutcome};
 use trade_control_core::broker::BidAskCandle;
-use trade_control_core::intent::{Direction, Intent, Resolved, ResolvedEntry, Shell};
+use trade_control_core::intent::{
+    Direction, Intent, Resolved, ResolvedEntry, Shell, SlWiden, widen_sl_to_spread_floor,
+};
 use trade_control_core::sweep_gate::{
     SweepReason, bar_expiry_due, breach_detected, market_blackout_due,
 };
@@ -136,7 +137,10 @@ pub fn simulate_fill(
     pip_size: f64,
     candles: &[BidAskCandle],
 ) -> SimOutcome {
-    let resolved = match Resolved::from_intent(intent, shell, pip_size) {
+    // `mut` so the SL-spread-floor widen mirror below can move `stop_loss` in
+    // place — exactly as the worker's `run_enter` does — before the fill / exit
+    // simulation reads it.
+    let mut resolved = match Resolved::from_intent(intent, shell, pip_size) {
         Ok(r) => r,
         Err(err) => return SimOutcome::Unresolved(err.to_string()),
     };
@@ -172,6 +176,24 @@ pub fn simulate_fill(
     // variant doc for why this is an approximation, not an exact mirror.
     if let Some(reject) = spread_blackout_reject(intent, shell, pip_size, candles) {
         return reject;
+    }
+
+    // SL-vs-spread floor SALVAGE (mirror of `run_enter`'s widen-then-reject):
+    // when the stop is closer than `10 × spread` to entry the worker widens it
+    // to `10 × spread` and re-checks R, entering with the wider stop if it still
+    // clears `min_r` and declining otherwise. `simulate_fill` doesn't run
+    // `run_enter`, so mirror that here off the recorded book — the fire bar's
+    // `ask_c − bid_c` IS the spread the worker quoted (same source the
+    // spread-blackout mirror uses). Without this the simulator would fill the
+    // entry (the worker placed it at the widened SL) but then check the *old*,
+    // un-widened stop, stopping the leg out at a level the live broker stop was
+    // never at. The widen mutates `resolved.stop_loss` so both `find_fill` and
+    // the exit loop below see the widened level — and break-even arms off the
+    // widened geometry, matching the live position.
+    if let EntryFloor::Rejected = apply_entry_spread_floor(&mut resolved, pip_size, candles) {
+        return SimOutcome::Declined {
+            name: "sl-widen-below-min-r".to_string(),
+        };
     }
 
     // Phase 1 — find the fill (shared with `breakeven_armed_at`).
@@ -506,73 +528,89 @@ pub fn sweep_reason(
     None
 }
 
-/// Why the worker's pre-broker entry gate would have **rejected** this enter,
-/// so the offline replay can report a block instead of silently filling an
-/// order the live worker never would have placed.
-///
-/// These mirror the worker's `run_enter` `allow_entry_gate::evaluate` outcomes
-/// (the `allow_entry` Rhai script + the AND-composed candle-quality gate). The
-/// `Declined` (at-entry-level veto) and `Unresolved` rejections already live in
-/// [`SimOutcome`]; this covers the two that didn't, without touching that enum.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum GateBlock {
-    /// The `allow_entry` Rhai script evaluated to `false`. The live worker 412s.
-    AllowEntryFalse,
-    /// The `allow_entry` script failed to parse / eval / returned the wrong
-    /// type. The live worker 412s with the kind in its rejection log.
-    AllowEntryScriptError {
-        /// `parse` / `eval` / `wrong-type`.
-        kind: &'static str,
-        /// The script error's display string.
-        message: String,
-    },
-    /// `needs_golden` was set on the enter but the (signal-folded) shell did not
-    /// carry `golden: Some(true)`. The live worker 412s "needs-golden".
-    NeedsGoldenUnmet,
-    /// `needs_confirmed` was set but the shell did not carry
-    /// `signal_confirmed: Some(true)`. The live worker 412s "needs-confirmed".
-    NeedsConfirmedUnmet,
+/// Outcome of the System-1 entry SL-spread floor applied to a resolved bracket.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum EntryFloor {
+    /// The floor left the stop where it was (already ≥ 10× spread), or moved it
+    /// to `10 × spread`. `spread_pips` is the fire-bar spread the floor used —
+    /// surfaced so the journal can show *which* spread sized the placed stop.
+    Applied { spread_pips: f64 },
+    /// Widening to `10 × spread` would drop R below `min_r` — the live worker
+    /// declines the entry, so the sim/replay must too.
+    Rejected,
 }
 
-/// Would the worker's pre-broker entry gate have **rejected** this fired enter?
+/// Apply the System-1 entry SL-spread floor to `resolved` **in place**, off the
+/// fire bar (`candles.first()`) — the single source of the placed stop.
 ///
-/// `simulate_fill` reproduces only the price-path fill; the worker's `run_enter`
-/// also runs the `allow_entry` script + candle-quality gate before any
-/// placement. Both now live in the shared [`allow_entry_gate`] (in `core`), so
-/// the replay can apply them identically — this is that call.
+/// This is the mirror of `run_enter`'s widen-then-reject: when the signed stop
+/// sits closer than `10 × spread` to entry, the worker widens it to `10 × spread`
+/// (entering with the wider stop if R still clears `min_r`, declining otherwise).
+/// Both `simulate_fill` (the exit sim) and `widened_stop_at` (the System-2
+/// baseline) call this so the placed stop, the simulated exit, and the System-2
+/// "from" level are all the **same** floored number — they can't drift into the
+/// three-different-SLs confusion the journal showed on EUR/AUD
+/// `hs-eur-aud-3d0b5dda`. Returns the spread used (for display) or a reject.
 ///
-/// Standalone and pure (it resolves the bracket itself, like
-/// [`breakeven_armed_at`]), so it leaves [`SimOutcome`] and `simulate_fill`'s
-/// fill behaviour untouched: the report calls it first and, on `Some`, prints a
-/// gate-block line instead of the simulated fill.
-///
-/// Returns `None` when the gate would let the entry through, the intent can't be
-/// resolved (an `Unresolved`/`Declined` `simulate_fill` already reports that),
-/// or the action isn't an enter.
-pub fn entry_gate_block(intent: &Intent, shell: &Shell, pip_size: f64) -> Option<GateBlock> {
-    let resolved = Resolved::from_intent(intent, shell, pip_size).ok()?;
-    match allow_entry_gate::evaluate(intent, shell, &resolved, pip_size) {
-        AllowEntryOutcome::Proceed => None,
-        AllowEntryOutcome::Blocked => Some(GateBlock::AllowEntryFalse),
-        AllowEntryOutcome::NeedsGoldenUnmet => Some(GateBlock::NeedsGoldenUnmet),
-        AllowEntryOutcome::NeedsConfirmedUnmet => Some(GateBlock::NeedsConfirmedUnmet),
-        AllowEntryOutcome::ScriptError { kind, message } => {
-            Some(GateBlock::AllowEntryScriptError { kind, message })
+/// No fire bar (empty path) ⇒ `Applied { spread_pips: 0.0 }` — nothing to floor.
+pub fn apply_entry_spread_floor(
+    resolved: &mut Resolved,
+    pip_size: f64,
+    candles: &[BidAskCandle],
+) -> EntryFloor {
+    let Some(fire) = candles.first() else {
+        return EntryFloor::Applied { spread_pips: 0.0 };
+    };
+    let spread_price = fire.ask_c - fire.bid_c;
+    match widen_sl_to_spread_floor(
+        resolved.entry.reference_price(),
+        resolved.stop_loss,
+        resolved.take_profit,
+        spread_price,
+        resolved.min_r,
+    ) {
+        SlWiden::Unchanged => {}
+        SlWiden::Widened { new_stop_loss, .. } => {
+            resolved.stop_loss = new_stop_loss;
         }
+        SlWiden::Reject { .. } => return EntryFloor::Rejected,
     }
+    let spread_pips = if pip_size > 0.0 && pip_size.is_finite() {
+        spread_price / pip_size
+    } else {
+        f64::NAN
+    };
+    EntryFloor::Applied { spread_pips }
 }
 
 /// A System-2 spread-widen the replay reconstructs from the candle path: the
-/// bar whose spread tripped the widen, and the new (widened) stop level.
+/// bar whose spread tripped the widen, the new (widened) stop level, and — since
+/// the widen is *transient* live — the bar at which the recovery watcher would
+/// restore the original stop.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SpreadWiden {
     /// Open-time of the bar whose spread crossed the widen trigger.
     pub at: chrono::DateTime<chrono::Utc>,
-    /// The original (resolved) stop level, before widening.
+    /// The stop the open position actually carried before this widen — i.e. the
+    /// resolved stop **after** the System-1 entry spread floor (the same number
+    /// the `order:` line and `simulate_fill` place at). System 2 widens from and
+    /// restores to THIS level, so the journal's widen/restore lines reconcile
+    /// with the placed stop instead of the un-floored signed level.
     pub original_stop: f64,
+    /// Pips crossed on the widen bar (`ask_c − bid_c`), for the journal display.
+    pub widen_spread_pips: f64,
     /// The stop after widening away from price (the shared
     /// [`trade_control_core::blackout_widen::widened_stop`] result).
     pub widened_stop: f64,
+    /// Open-time of the bar at which the live recovery watcher
+    /// (`blackout_watch::watch_recovery`) would restore the original stop:
+    /// the first post-widen bar whose spread has dropped to/under the recovered
+    /// cutoff (4 pips), or — if the spread stays elevated — the 3-hour backstop.
+    /// `None` when neither happens before the position exits or the window ends
+    /// (the widen would still be active at exit). The widen is a **transient**
+    /// shield, not a permanent risk change — this field is what makes the replay
+    /// journal say so.
+    pub restored_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 /// Reconstruct a System-2 spread-blackout stop widen from the candle path, if
@@ -586,19 +624,32 @@ pub struct SpreadWiden {
 /// the **exit price** — without this, a replay would stop the position out at
 /// the original (tighter) level and diverge from the live worker.
 ///
-/// **The trigger.** The caller passes `widen_trigger_pips` — the instrument's
-/// spread-blackout threshold (`baked-baseline × 5`) via
-/// [`trade_control_core::spread_blackout::elevated_threshold_pips`], the *same*
-/// number the System-1 entry-reject uses. Now that the baked baseline lives in
-/// shared `core` the engine links it directly, so this is the **exact**
-/// per-instrument threshold the live worker's `blackout_apply` widens against —
-/// no longer the flat `WIDEN_FLOOR_PIPS` proxy. The first post-fill bar whose
-/// **spread** (`ask_c − bid_c`, in pips) meets or exceeds it — *while the stop
-/// hasn't yet been hit* — is the widen bar. The amount it widens by is still
-/// floored/clamped 22–40 pips via [`trade_control_core::blackout_widen::clamp_widen`].
+/// **The per-instrument spread-hour gate (2026-07-05).** The live cron widens
+/// at each instrument's *own* learned spread hours (baked from the sampler
+/// data), not one global NY-close hour — Gold overnight, EUR/USD at 21:00,
+/// indices at their own — via
+/// [`trade_control_core::spread_blackout::spread_hour_widen_pips`]. This replay
+/// mirrors that: a bar qualifies when `spread_hour_widen_pips(instrument,
+/// c.time)` is `Some` (in/leading into a learned spread hour → widen by the
+/// baked p90), OR — for an **un-sampled** instrument with no learned hours — the
+/// bar is at the legacy NY-close edge
+/// ([`trade_control_core::ny_clock::is_ny_close_edge`], 21:00 UTC EDT / 22:00
+/// EST) AND its live spread reaches `widen_trigger_pips`. The pre-2026-07-05
+/// behaviour (global NY-close gate + `clamp_widen`) survives verbatim on the
+/// fallback path so un-sampled assets don't regress.
+///
+/// **The trigger / widen size.** For a baked spread-hour bar the widen is
+/// [`trade_control_core::blackout_widen::spread_hour_widen_size`] — baked p90
+/// primary, live spread as a floor, per-instrument ceiling (see that fn's
+/// docs). For the legacy fallback the caller's `widen_trigger_pips` (the
+/// instrument's `baked-baseline × 5` from
+/// [`trade_control_core::spread_blackout::elevated_threshold_pips`], the same
+/// number System 1 uses) still gates, and the amount is the flat 22–40
+/// [`trade_control_core::blackout_widen::clamp_widen`].
 ///
 /// Pure and side-effect-free. Returns `None` when the enter has no fill, exits
-/// before any qualifying spread bar, or no bar's spread reaches the trigger.
+/// before any qualifying spread bar, or no NY-close-edge bar's spread reaches
+/// the trigger.
 pub fn widened_stop_at(
     intent: &Intent,
     shell: &Shell,
@@ -609,13 +660,20 @@ pub fn widened_stop_at(
     if !pip_size.is_finite() || pip_size <= 0.0 {
         return None;
     }
-    let resolved = Resolved::from_intent(intent, shell, pip_size).ok()?;
+    let mut resolved = Resolved::from_intent(intent, shell, pip_size).ok()?;
+    // Floor the baseline to the placed stop (System 1) so System 2 widens from
+    // and restores to the SAME level the order line shows — not the un-floored
+    // signed SL. A reject means the live worker declined the entry, so there's
+    // no open position to widen.
+    if let EntryFloor::Rejected = apply_entry_spread_floor(&mut resolved, pip_size, candles) {
+        return None;
+    }
     let dir = resolved.direction;
     let fill = find_fill(&resolved, intent, shell, dir, candles)?;
     let exit_book = book_for(Leg::Exit, dir);
     let original_stop = resolved.stop_loss;
 
-    for c in fill.rest {
+    for (i, c) in fill.rest.iter().enumerate() {
         // The original stop is still the live one until a widen fires, so an
         // exit (SL/TP) before any qualifying spread bar means no widen applied.
         if book_crosses(c, exit_book, original_stop)
@@ -623,20 +681,84 @@ pub fn widened_stop_at(
         {
             return None;
         }
+        // Per-instrument spread-hour gate — mirror the live cron's System 2
+        // (`widen_open_stops_for_spread_hours`). `spread_hour_widen_pips`
+        // returns `Some(baked_p90)` iff this bar's instrument is in (or leading
+        // into) one of its learned spread hours; `None` means either "not a
+        // spread hour now" or "un-sampled instrument", disambiguated by the
+        // legacy `is_ny_close_edge` fallback (so un-sampled assets keep the old
+        // NY-close-only behaviour). Before 2026-07-05 this was a single global
+        // `is_ny_close_edge` gate for ALL instruments — see
+        // `[[strategy_changes_in_both_replayer_and_worker]]`; the worker + this
+        // replay must gate identically.
+        let baked_p90 =
+            trade_control_core::spread_blackout::spread_hour_widen_pips(&intent.instrument, c.time);
+        if baked_p90.is_none() && !trade_control_core::ny_clock::is_ny_close_edge(c.time) {
+            continue;
+        }
         let spread_pips = (c.ask_c - c.bid_c) / pip_size;
-        if spread_pips.is_finite() && spread_pips >= widen_trigger_pips {
-            let widen_pips = trade_control_core::blackout_widen::clamp_widen(spread_pips);
-            let widened = trade_control_core::blackout_widen::widened_stop(
-                dir,
-                original_stop,
-                widen_pips,
-                pip_size,
-            );
-            return Some(SpreadWiden {
-                at: c.time,
-                original_stop,
-                widened_stop: widened,
-            });
+        if !spread_pips.is_finite() {
+            continue;
+        }
+        // A baked spread-hour bar widens regardless of the live spread reading
+        // (the baked p90 is the primary widen; the timing is what the mask
+        // asserts). The legacy fallback still requires the live spread to reach
+        // the per-instrument trigger, matching the pre-2026-07-05 behaviour.
+        let widen_pips = match baked_p90 {
+            Some(p90) => {
+                trade_control_core::blackout_widen::spread_hour_widen_size(p90, spread_pips)
+            }
+            None if spread_pips >= widen_trigger_pips => {
+                trade_control_core::blackout_widen::clamp_widen(spread_pips)
+            }
+            None => continue,
+        };
+        let widened = trade_control_core::blackout_widen::widened_stop(
+            dir,
+            original_stop,
+            widen_pips,
+            pip_size,
+        );
+        let restored_at = restore_bar(&fill.rest[i + 1..], c.time, pip_size);
+        return Some(SpreadWiden {
+            at: c.time,
+            original_stop,
+            widen_spread_pips: spread_pips,
+            widened_stop: widened,
+            restored_at,
+        });
+    }
+    None
+}
+
+/// When the live recovery watcher (`blackout_watch::watch_recovery`) would
+/// restore the widened stop, reconstructed from the post-widen candle path.
+///
+/// Mirrors the two live restore triggers (Safety Rules 1 & 2 in
+/// `blackout_watch`): the first bar whose spread has dropped to/under the
+/// recovered cutoff (`SPREAD_BLACKOUT_RECOVERED_PIPS`, 4 pips) — clock-agnostic,
+/// so recovery is NOT gated on the NY-close edge — or, failing that, the 3-hour
+/// backstop (`BLACKOUT_BACKSTOP_SECONDS`), whichever comes first. `bars` are the
+/// candles strictly after the widen bar; `widen_at` is the widen bar's open
+/// time. `None` when neither trigger lands within the provided path (the widen
+/// is still active at the window's end).
+fn restore_bar(
+    bars: &[BidAskCandle],
+    widen_at: chrono::DateTime<chrono::Utc>,
+    pip_size: f64,
+) -> Option<chrono::DateTime<chrono::Utc>> {
+    let recovered_cutoff = trade_control_core::spread_blackout::SPREAD_BLACKOUT_RECOVERED_PIPS;
+    let backstop_secs = trade_control_core::spread_blackout::BLACKOUT_BACKSTOP_SECONDS;
+    let backstop_at = widen_at + chrono::Duration::seconds(backstop_secs as i64);
+    for c in bars {
+        // Backstop fires first if this bar is at/after the 3h mark, regardless
+        // of spread — the live watcher clears unconditionally there.
+        if c.time >= backstop_at {
+            return Some(c.time);
+        }
+        let spread_pips = (c.ask_c - c.bid_c) / pip_size;
+        if spread_pips.is_finite() && spread_pips <= recovered_cutoff {
+            return Some(c.time);
         }
     }
     None
@@ -1068,17 +1190,58 @@ mod tests {
     }
 
     #[test]
-    fn elevated_spread_outside_window_fills() {
+    fn elevated_spread_outside_window_does_not_black_out() {
         // Control: the SAME wide 30-pip spread, but the fire bar is NOT at the
-        // NY-close edge → window closed → no blackout (the worker wouldn't even
-        // sample). Falls through to the normal path (NeverFilled here).
+        // NY-close edge → window closed → no spread-BLACKOUT (the worker wouldn't
+        // even sample). The spread is still wide enough to trip the SL-vs-spread
+        // floor though: this long stop's SL is 50 pips, so `10 × 30 = 300` pips
+        // >> 50 → the floor is violated, the widen pushes the stop to `10 × 30 =
+        // 300` pips, and R collapses to 100/300 ≈ 0.33 < 1 → Declined via the
+        // widen mirror (NOT a blackout). The point of this control is that the
+        // outcome is *not* `SpreadBlackout`; the SL-widen decline is the correct
+        // fall-through for a wide spread that's outside the blackout window.
         let intent = resolvable_long_stop();
         let shell = Shell::from_candle(&spread_fire_bar(NON_EDGE_TS, 1.1040, 0.0030).mid());
         let path = [spread_fire_bar(NON_EDGE_TS, 1.1040, 0.0030)];
+        let out = simulate_fill(&intent, &shell, 0.0001, &path);
+        assert!(
+            !matches!(out, SimOutcome::SpreadBlackout { .. }),
+            "a wide spread outside the close-edge window must not black out, got {out:?}"
+        );
         assert_eq!(
-            simulate_fill(&intent, &shell, 0.0001, &path),
-            SimOutcome::NeverFilled,
-            "a wide spread outside the close-edge window must not black out"
+            out,
+            SimOutcome::Declined {
+                name: "sl-widen-below-min-r".to_string(),
+            },
+            "the wide spread trips the SL-vs-spread floor; widening to 10x drops R<1 → declined"
+        );
+    }
+
+    #[test]
+    fn widened_sl_protects_the_leg_in_the_fill_path() {
+        // The follow-up bug (BUG-sl-spread-floor…, 2026-07-01): the widen was
+        // applied to the entry R-check but NOT to the stop the fill/exit sim
+        // checks against, so a leg stopped out at the OLD un-widened SL even
+        // though the live broker stop sat at the widened level.
+        //
+        // Geometry: long stop trigger 1.1050, SL 1.1000 (50 pips), TP 1.1150.
+        // A 6-pip spread trips the 10× floor (60 > 50) → widen to 10× = 60 pips
+        // → SL moves DOWN to 1.0990. R = 100/60 ≈ 1.67 ≥ 1 → entry stands.
+        // An adverse bar then dips its bid to 1.0994: that crosses the ORIGINAL
+        // 1.1000 SL (the buggy behaviour would stop out here) but NOT the
+        // widened 1.0990 — so with the fix the leg survives and stays open.
+        let intent = resolvable_long_stop();
+        let fire = spread_fire_bar(NON_EDGE_TS, 1.1040, 0.0006); // 6-pip spread
+        let shell = Shell::from_candle(&fire.mid());
+        // Fill bar: ask reaches the 1.1050 trigger (long fills on the ask book).
+        let fill_bar = ba_candle("2026-03-12T11:00:00Z", 1.1052, 1.1045, 1.1055, 1.1048);
+        // Adverse bar: bid dips to 1.0994 — past the OLD SL, short of the widened.
+        let dip_bar = ba_candle("2026-03-12T12:00:00Z", 1.1010, 1.0994, 1.1015, 1.0998);
+        let path = [fire, fill_bar, dip_bar];
+        let out = simulate_fill(&intent, &shell, 0.0001, &path);
+        assert!(
+            matches!(out, SimOutcome::FilledOpen { .. }),
+            "leg must survive: the dip crosses the old SL but not the widened one, got {out:?}"
         );
     }
 
@@ -1264,9 +1427,45 @@ mod tests {
         }
     }
 
-    /// A long position whose post-fill path includes a wide-spread bar reports
-    /// the widen: the bar's time, the original SL, and a stop moved DOWN (away
-    /// from price for a long) by the clamped live spread.
+    /// The System-2 baseline (`original_stop`) is the stop the position actually
+    /// carried — i.e. the signed SL **after** the System-1 entry spread floor —
+    /// not the raw signed SL. This is the display-reconciliation fix: the widen
+    /// must move from the *placed* stop, so the journal's order/widen/restore
+    /// lines all key off one number (EUR/AUD `hs-eur-aud-3d0b5dda` showed three
+    /// different SLs because System 2 used the un-floored signed level).
+    #[test]
+    fn widened_stop_at_baseline_is_the_floored_stop_not_the_signed_sl() {
+        use trade_control_core::blackout_widen::WIDEN_FLOOR_PIPS;
+        // Long entry 1.1000, SIGNED SL 1.0995 (5p — inside the floor).
+        let mut intent = long_stop_intent();
+        i_set_levels(&mut intent, 1.1000, 1.0995, 1.1100);
+        let shell = trigger_shell();
+        // Fire bar carries a 3p spread (bid_c 1.10120, ask_c 1.10150) away from
+        // the 1.1000 entry trigger so it doesn't fill on bar 0. 10× 3p = 30p →
+        // the SL floors DOWN from 1.0995 to 1.0970.
+        let fire = ba_candle("2026-06-17T10:30:00Z", 1.10150, 1.10120, 1.10150, 1.10120);
+        let fill_bar = candle("2026-06-17T11:00:00Z", 1.1000, 1.1001, 1.0999, 1.1000);
+        // NY-close-edge wide bar → widen from the FLOORED baseline (1.0970).
+        let wide = ba_candle("2026-06-17T21:00:00Z", 1.10015, 1.10010, 1.10315, 1.10310);
+        let path = [fire, fill_bar, wide];
+
+        let widen = widened_stop_at(&intent, &shell, 0.0001, &path, WIDEN_FLOOR_PIPS)
+            .expect("the NY-close-edge bar must trip the widen");
+        assert!(
+            (widen.original_stop - 1.0970).abs() < 1e-9,
+            "baseline must be the floored stop 1.0970 (10× 3p), not the signed 1.0995; got {}",
+            widen.original_stop
+        );
+        // And the widen moves further DOWN from the floored baseline.
+        assert!(
+            widen.widened_stop < 1.0970,
+            "a long widen moves the SL further DOWN from the floored baseline"
+        );
+    }
+
+    /// A long position whose post-fill path includes a wide-spread bar **on the
+    /// NY-close edge** reports the widen: the bar's time, the original SL, and a
+    /// stop moved DOWN (away from price for a long) by the clamped live spread.
     #[test]
     fn widened_stop_at_reports_the_widen_bar_for_a_long() {
         use trade_control_core::blackout_widen::{WIDEN_FLOOR_PIPS, widened_stop};
@@ -1276,9 +1475,11 @@ mod tests {
         // Fire bar (skipped), then a zero-spread bar whose ASK reaches the 1.1000
         // long trigger → fill. Then a wide-spread bar (ask_c − bid_c = 1.10315 −
         // 1.10010 = 0.00305 = 30.5 pips, within the 22–40 clamp) that does NOT hit
-        // SL/TP → widen.
+        // SL/TP → widen. The wide bar sits at 21:00 UTC — the NY-close edge under
+        // EDT (2026-06-17 is inside the DST window) — which the widen gate
+        // requires, mirroring the live cron.
         let fill_bar = candle("2026-06-17T11:00:00Z", 1.1000, 1.1001, 1.0999, 1.1000);
-        let wide = ba_candle("2026-06-17T12:00:00Z", 1.10015, 1.10010, 1.10315, 1.10310);
+        let wide = ba_candle("2026-06-17T21:00:00Z", 1.10015, 1.10010, 1.10315, 1.10310);
         let spread_pips = (wide.ask_c - wide.bid_c) / 0.0001; // 30.5
         let path = [fire_bar(), fill_bar, wide];
 
@@ -1297,6 +1498,179 @@ mod tests {
         assert!(
             widen.widened_stop < 1.0950,
             "a long widen moves the SL DOWN"
+        );
+    }
+
+    /// A wide-spread bar that is **not** on the NY-close edge does NOT widen —
+    /// the live System-2 cron only widens at the NY close (`is_ny_close_edge`),
+    /// so the replay mirror must too. Without the gate this bar (12:00 UTC, a
+    /// 30.5-pip spread) would trip the widen; with it, it's ignored. This is the
+    /// parity gap from the EUR/AUD `hs-eur-aud-3d0b5dda` journal bug: the report
+    /// mistook a NY-close-edge widen for a "wrong bar", but the real defect was
+    /// the replay widening on *any* wide bar, not only the NY-close one.
+    #[test]
+    fn widened_stop_at_ignores_a_wide_bar_off_the_ny_close_edge() {
+        use trade_control_core::blackout_widen::WIDEN_FLOOR_PIPS;
+        let mut intent = long_stop_intent();
+        i_set_levels(&mut intent, 1.1000, 1.0950, 1.1100);
+        let shell = trigger_shell();
+        let fill_bar = candle("2026-06-17T11:00:00Z", 1.1000, 1.1001, 1.0999, 1.1000);
+        // 30.5-pip spread — well over the floor — but 12:00 UTC is not the NY
+        // close (21:00 UTC under EDT). Gate rejects it.
+        let wide = ba_candle("2026-06-17T12:00:00Z", 1.10015, 1.10010, 1.10315, 1.10310);
+        let path = [fire_bar(), fill_bar, wide];
+        assert_eq!(
+            widened_stop_at(&intent, &shell, 0.0001, &path, WIDEN_FLOOR_PIPS),
+            None,
+            "a wide bar off the NY-close edge must not widen"
+        );
+    }
+
+    /// Two wide-spread bars — one off the edge (12:00 UTC), one on it (21:00
+    /// UTC). The widen must land on the NY-close bar, not the earlier off-edge
+    /// one, proving the loop skips non-edge bars rather than firing on the first
+    /// wide bar it sees.
+    #[test]
+    fn widened_stop_at_widens_on_the_ny_close_bar_not_the_first_wide_bar() {
+        use trade_control_core::blackout_widen::WIDEN_FLOOR_PIPS;
+        let mut intent = long_stop_intent();
+        i_set_levels(&mut intent, 1.1000, 1.0950, 1.1100);
+        let shell = trigger_shell();
+        let fill_bar = candle("2026-06-17T11:00:00Z", 1.1000, 1.1001, 1.0999, 1.1000);
+        // Off-edge wide bar (12:00 UTC) — must be skipped.
+        let off_edge = ba_candle("2026-06-17T12:00:00Z", 1.10015, 1.10010, 1.10315, 1.10310);
+        // NY-close-edge wide bar (21:00 UTC under EDT) — must be the widen bar.
+        let on_edge = ba_candle("2026-06-17T21:00:00Z", 1.10015, 1.10010, 1.10315, 1.10310);
+        let path = [fire_bar(), fill_bar, off_edge, on_edge];
+        let widen = widened_stop_at(&intent, &shell, 0.0001, &path, WIDEN_FLOOR_PIPS)
+            .expect("the NY-close-edge bar must trip the widen");
+        assert_eq!(
+            widen.at, on_edge.time,
+            "widen must land on the NY-close bar, not the first wide bar"
+        );
+    }
+
+    /// A **baked** spread-hour instrument (TN-named `EUR/USD`, whose baked mask
+    /// has bit 21 set with a ~5p p90) widens by the baked p90 via
+    /// `spread_hour_widen_size`, NOT the legacy 22p `clamp_widen` floor — this
+    /// is the whole point of the per-instrument path. The bar's live spread is
+    /// tight (2p), so the legacy path would have needed the trigger *and* would
+    /// have floored to 22p; the baked path fires on the mask alone and widens by
+    /// ~5p. Depends on the committed sampler baseline (EUR/USD 21:00 spike).
+    #[test]
+    fn widened_stop_at_uses_baked_p90_for_a_sampled_instrument() {
+        use trade_control_core::blackout_widen::WIDEN_FLOOR_PIPS;
+        use trade_control_core::spread_blackout::spread_hour_widen_pips;
+
+        let mut intent = long_stop_intent();
+        intent.instrument = "EUR/USD".into(); // TN name → in the baked table
+        i_set_levels(&mut intent, 1.1000, 1.0950, 1.1100);
+        let shell = trigger_shell();
+
+        // Guard: the baseline must actually carry EUR/USD's 21:00 spread hour,
+        // else this test is vacuous. 21:00 UTC on an EDT date is a spread hour.
+        let at21 = ts("2026-06-17T21:00:00Z");
+        let baked = spread_hour_widen_pips("EUR/USD", at21)
+            .expect("EUR/USD must have a baked 21:00 spread hour");
+
+        let fill_bar = candle("2026-06-17T11:00:00Z", 1.1000, 1.1001, 1.0999, 1.1000);
+        // 21:00 UTC bar with a TIGHT 2p spread — the baked mask fires anyway.
+        let tight = ba_candle("2026-06-17T21:00:00Z", 1.10010, 1.10005, 1.10030, 1.10025);
+        let path = [fire_bar(), fill_bar, tight];
+
+        let widen = widened_stop_at(&intent, &shell, 0.0001, &path, WIDEN_FLOOR_PIPS)
+            .expect("the baked spread hour must trip the widen even on a tight-spread bar");
+        assert_eq!(widen.at, tight.time);
+        // Widen distance = baked p90 (~5p), NOT the 22p legacy floor. Long ⇒ SL
+        // moves DOWN from 1.0950 by baked p90 pips.
+        let expected = 1.0950 - baked * 0.0001;
+        assert!(
+            (widen.widened_stop - expected).abs() < 1e-9,
+            "widened by baked p90 {baked}p (expected SL {expected}), got {}",
+            widen.widened_stop,
+        );
+        // Sanity: the baked p90 is much smaller than the legacy 22p floor, so
+        // this genuinely exercises the new path.
+        assert!(
+            baked < WIDEN_FLOOR_PIPS,
+            "baked p90 {baked} should be < 22p floor"
+        );
+    }
+
+    /// The widen is **transient**: once a post-widen bar's spread recovers to/
+    /// under the 4-pip cutoff, `restored_at` reports that bar — mirroring the
+    /// live recovery watcher (`blackout_watch`). This is what lets the replay
+    /// journal show the stop snapping back instead of a permanent widen (the
+    /// EUR/AUD `hs-eur-aud-3d0b5dda` "permanent widen" journal question).
+    #[test]
+    fn widened_stop_at_reports_restore_on_spread_recovery() {
+        use trade_control_core::blackout_widen::WIDEN_FLOOR_PIPS;
+        let mut intent = long_stop_intent();
+        i_set_levels(&mut intent, 1.1000, 1.0950, 1.1100);
+        let shell = trigger_shell();
+        let fill_bar = candle("2026-06-17T11:00:00Z", 1.1000, 1.1001, 1.0999, 1.1000);
+        // Widen bar: 30.5p spread on the NY-close edge (21:00 UTC, EDT).
+        let wide = ba_candle("2026-06-17T21:00:00Z", 1.10015, 1.10010, 1.10315, 1.10310);
+        // Next bar: spread back to 2p (≤ the 4p recovered cutoff) → restore here.
+        let recovered = ba_candle("2026-06-17T22:00:00Z", 1.10010, 1.10005, 1.10030, 1.10025);
+        let path = [fire_bar(), fill_bar, wide, recovered];
+
+        let widen = widened_stop_at(&intent, &shell, 0.0001, &path, WIDEN_FLOOR_PIPS)
+            .expect("the NY-close-edge bar must trip the widen");
+        assert_eq!(widen.at, wide.time);
+        assert_eq!(
+            widen.restored_at,
+            Some(recovered.time),
+            "the widen must restore at the first recovered-spread bar"
+        );
+    }
+
+    /// If the spread never recovers before the path ends, `restored_at` is
+    /// `None` (the widen would still be active at the window's end — the 3-hour
+    /// backstop hasn't landed within these bars either).
+    #[test]
+    fn widened_stop_at_restore_is_none_when_spread_stays_wide() {
+        use trade_control_core::blackout_widen::WIDEN_FLOOR_PIPS;
+        let mut intent = long_stop_intent();
+        i_set_levels(&mut intent, 1.1000, 1.0950, 1.1100);
+        let shell = trigger_shell();
+        let fill_bar = candle("2026-06-17T11:00:00Z", 1.1000, 1.1001, 1.0999, 1.1000);
+        let wide = ba_candle("2026-06-17T21:00:00Z", 1.10015, 1.10010, 1.10315, 1.10310);
+        // Still ~30p an hour later — under the 3h backstop, spread not recovered.
+        let still_wide = ba_candle("2026-06-17T22:00:00Z", 1.10015, 1.10010, 1.10315, 1.10310);
+        let path = [fire_bar(), fill_bar, wide, still_wide];
+
+        let widen = widened_stop_at(&intent, &shell, 0.0001, &path, WIDEN_FLOOR_PIPS)
+            .expect("the NY-close-edge bar must trip the widen");
+        assert_eq!(
+            widen.restored_at, None,
+            "no recovery, no backstop → no restore"
+        );
+    }
+
+    /// The 3-hour backstop restores even if the spread stays elevated — the live
+    /// watcher's Safety Rule 2. A bar ≥ 3h after the widen restores regardless
+    /// of its (still-wide) spread.
+    #[test]
+    fn widened_stop_at_restore_fires_on_the_backstop() {
+        use trade_control_core::blackout_widen::WIDEN_FLOOR_PIPS;
+        let mut intent = long_stop_intent();
+        i_set_levels(&mut intent, 1.1000, 1.0950, 1.1100);
+        let shell = trigger_shell();
+        let fill_bar = candle("2026-06-17T11:00:00Z", 1.1000, 1.1001, 1.0999, 1.1000);
+        let wide = ba_candle("2026-06-17T21:00:00Z", 1.10015, 1.10010, 1.10315, 1.10310);
+        // Still wide at +1h/+2h (no recovery), then a bar at +3h → backstop.
+        let hour1 = ba_candle("2026-06-17T22:00:00Z", 1.10015, 1.10010, 1.10315, 1.10310);
+        let hour2 = ba_candle("2026-06-17T23:00:00Z", 1.10015, 1.10010, 1.10315, 1.10310);
+        let backstop = ba_candle("2026-06-18T00:00:00Z", 1.10015, 1.10010, 1.10315, 1.10310);
+        let path = [fire_bar(), fill_bar, wide, hour1, hour2, backstop];
+
+        let widen = widened_stop_at(&intent, &shell, 0.0001, &path, WIDEN_FLOOR_PIPS)
+            .expect("the NY-close-edge bar must trip the widen");
+        assert_eq!(
+            widen.restored_at,
+            Some(backstop.time),
+            "the 3h backstop must restore even with the spread still wide"
         );
     }
 
@@ -1846,65 +2220,5 @@ mod tests {
             sweep_reason(&intent, &shell, 0.0001, &path, &[]),
             Some((SweepReason::SlBreached, ts("2026-06-17T12:00:00Z")))
         );
-    }
-
-    /// A resolvable market enter so the gate-block tests exercise the gate, not
-    /// the resolver (an `Unresolved` short-circuits before `allow_entry_gate`).
-    fn market_enter() -> Intent {
-        let mut i = base_enter();
-        i.direction = Some(Direction::Long);
-        i.entry = Some(EntrySpec::Market);
-        i.stop_loss = Some(PriceRef::Absolute { absolute: 1.1000 });
-        i.take_profit = Some(TakeProfit::Anchored(PriceRef::Absolute {
-            absolute: 1.1150,
-        }));
-        i
-    }
-
-    #[test]
-    fn entry_gate_block_none_when_gate_passes() {
-        // No allow_entry script, no candle-quality requirement → the worker
-        // would place the order, so the replay must not block it.
-        let intent = market_enter();
-        let shell = trigger_shell();
-        assert_eq!(entry_gate_block(&intent, &shell, 0.0001), None);
-    }
-
-    #[test]
-    fn entry_gate_block_allow_entry_false() {
-        // The worker's `run_enter` 412s a static-false `allow_entry`; the replay
-        // must surface that block instead of filling the order.
-        let mut intent = market_enter();
-        intent.allow_entry = Some(Tunable::Static(false));
-        let shell = trigger_shell();
-        assert_eq!(
-            entry_gate_block(&intent, &shell, 0.0001),
-            Some(GateBlock::AllowEntryFalse)
-        );
-    }
-
-    #[test]
-    fn entry_gate_block_needs_golden_unmet() {
-        // `needs_golden` set but the shell carries `golden: None` (the realistic
-        // non-golden case) → the worker rejects "needs-golden"; replay mirrors it.
-        let mut intent = market_enter();
-        intent.needs_golden = true;
-        let shell = trigger_shell();
-        assert_eq!(shell.golden, None);
-        assert_eq!(
-            entry_gate_block(&intent, &shell, 0.0001),
-            Some(GateBlock::NeedsGoldenUnmet)
-        );
-    }
-
-    #[test]
-    fn entry_gate_block_script_error_surfaces_kind() {
-        let mut intent = market_enter();
-        intent.allow_entry = Some(Tunable::from_script("if if if"));
-        let shell = trigger_shell();
-        match entry_gate_block(&intent, &shell, 0.0001) {
-            Some(GateBlock::AllowEntryScriptError { kind, .. }) => assert_eq!(kind, "parse"),
-            other => panic!("expected AllowEntryScriptError(parse), got {other:?}"),
-        }
     }
 }

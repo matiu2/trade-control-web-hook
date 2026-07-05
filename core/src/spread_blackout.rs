@@ -84,9 +84,98 @@ pub fn baked_baseline(instrument: &str) -> Option<(f64, f64, f64)> {
         .binary_search_by(|(name, ..)| name.cmp(&instrument))
         .ok()
         .map(|i| {
-            let (_, low, high, median, _n) = baseline::SPREAD_BASELINE[i];
+            let (_, low, high, median, ..) = baseline::SPREAD_BASELINE[i];
             (low, high, median)
         })
+}
+
+/// The baked `(elevated_hours_mask, hour_widen_pips)` for an instrument, or
+/// `None` when it isn't in the baseline. The mask's bit `h` = UTC hour `h`
+/// is a learned spread hour; `hour_widen_pips[h]` is that hour's p90 widen
+/// size (0.0 when not elevated). See `core/build.rs::spread_hours`.
+fn baked_spread_hours(instrument: &str) -> Option<(u32, [f64; 24])> {
+    baseline::SPREAD_BASELINE
+        .binary_search_by(|(name, ..)| name.cmp(&instrument))
+        .ok()
+        .map(|i| {
+            let (.., mask, widen) = baseline::SPREAD_BASELINE[i];
+            (mask, widen)
+        })
+}
+
+/// How many minutes ahead of an elevated hour's start we pre-emptively
+/// widen an open stop. The spread spike is at the top of the hour; widening
+/// ~30 min early means the stop is already out of the way before the spike
+/// lands, rather than racing it. Shared constant so the worker cron and the
+/// offline replay lead by the same amount.
+pub const SPREAD_HOUR_LEAD_MINUTES: i64 = 30;
+
+/// The pre-emptive widen size (in pips) for `instrument` at `now`, or `None`
+/// when `now` is **not** in (or within [`SPREAD_HOUR_LEAD_MINUTES`] of the
+/// start of) one of this instrument's learned spread hours.
+///
+/// Timing is entirely from baked history — no live spread read is needed to
+/// decide *when* or *how much* to widen (the caller may still floor the
+/// result by the live spread; see the System-2 consumer). The returned pips
+/// is the elevated hour's baked p90.
+///
+/// Lead handling: if `now` is within the lead window of the *next* UTC hour
+/// and that next hour is elevated, we return the next hour's widen (so the
+/// stop is out of the way before the spike). Otherwise we return the current
+/// hour's widen iff the current hour is elevated.
+///
+/// `None` for an instrument absent from the baseline, or one whose samples
+/// yielded no learnable spread hours (mask 0) — the caller falls back to the
+/// legacy [`is_ny_close_edge`](crate::ny_clock::is_ny_close_edge) gate for
+/// those, so nothing regresses for un-sampled assets.
+pub fn spread_hour_widen_pips(instrument: &str, now: chrono::DateTime<chrono::Utc>) -> Option<f64> {
+    let (mask, widen) = baked_spread_hours(instrument)?;
+    spread_hour_widen_for(mask, &widen, now)
+}
+
+/// Pure spread-hour-widen decision over an explicit `(mask, widen)` — the
+/// unit-testable seam behind [`spread_hour_widen_pips`], free of the baked
+/// table so tests can drive it with synthetic instrument shapes.
+///
+/// Returns the widen pips iff `now`'s hour is elevated, or `now` is within
+/// [`SPREAD_HOUR_LEAD_MINUTES`] of the top of a next hour that is elevated
+/// (look-ahead, so the stop is out of the way before the spike). `None`
+/// otherwise (including a mask of 0).
+fn spread_hour_widen_for(
+    mask: u32,
+    widen: &[f64; 24],
+    now: chrono::DateTime<chrono::Utc>,
+) -> Option<f64> {
+    use chrono::Timelike;
+    if mask == 0 {
+        return None;
+    }
+    let hour = now.hour() as usize;
+    // Within the lead window of the next hour's top? Then look ahead.
+    let minutes_into_hour = now.minute() as i64;
+    let lead_reaches_next = 60 - minutes_into_hour <= SPREAD_HOUR_LEAD_MINUTES;
+    if lead_reaches_next {
+        let next = (hour + 1) % 24;
+        if mask & (1 << next) != 0 {
+            return Some(widen[next]);
+        }
+    }
+    if mask & (1 << hour) != 0 {
+        return Some(widen[hour]);
+    }
+    None
+}
+
+/// Is `now` a spread hour for `instrument` (per-instrument, learned)? A thin
+/// bool wrapper over [`spread_hour_widen_pips`]. Unknown instrument / no
+/// learned hours ⇒ fall back to the legacy NY-close-edge gate so un-sampled
+/// assets keep their prior behaviour.
+pub fn is_spread_hour(instrument: &str, now: chrono::DateTime<chrono::Utc>) -> bool {
+    match baked_spread_hours(instrument) {
+        Some((mask, _)) if mask != 0 => spread_hour_widen_pips(instrument, now).is_some(),
+        // No learned hours for this instrument → legacy fallback.
+        _ => crate::ny_clock::is_ny_close_edge(now),
+    }
 }
 
 /// Placeholder cutoff. A thin FX cross normally spreads ~2p and blows to
@@ -110,6 +199,19 @@ pub const SPREAD_BLACKOUT_ELEVATED_PIPS: f64 = 8.0;
 /// spread has fallen all the way back to ≤4p. Both are provisional and
 /// MUST be calibrated together on demo — see [`elevated_threshold_pips`].
 pub const SPREAD_BLACKOUT_RECOVERED_PIPS: f64 = 4.0;
+
+/// Spread-blackout backstop, in seconds (~3h). Single source of truth: the
+/// global window-marker TTL (apply), each per-trade record's TTL, and the
+/// recovery watcher's "clear regardless of spread" backstop (watch) all derive
+/// from this one constant so they can never drift apart. The post-NY-close
+/// liquidity trough is ~1h; 3h is a generous safety ceiling after which a
+/// still-`applied` record is force-cleared.
+///
+/// Lives in `core` (not the cron crate) so the offline replay's transient-widen
+/// reconstruction (`engine::simulator::restore_bar`) computes the same backstop
+/// as the live recovery watcher without depending on `trade-control-cron`. The
+/// cron crate re-exports this as `constants::BLACKOUT_BACKSTOP_SECONDS`.
+pub const BLACKOUT_BACKSTOP_SECONDS: u64 = 3 * 60 * 60;
 
 #[cfg(test)]
 mod tests {
@@ -164,7 +266,7 @@ mod tests {
         // The generated table must be sorted by name (binary_search relies
         // on it) and every row must satisfy low <= median <= high.
         let mut prev: Option<&str> = None;
-        for (name, low, high, median, n) in baseline::SPREAD_BASELINE {
+        for (name, low, high, median, n, mask, widen) in baseline::SPREAD_BASELINE {
             if let Some(p) = prev {
                 assert!(p < *name, "baseline not sorted: {p:?} !< {name:?}");
             }
@@ -174,6 +276,18 @@ mod tests {
                 *low <= *median && *median <= *high,
                 "{name}: low {low} median {median} high {high} not ordered",
             );
+            // Mask/widen coherence: an elevated hour must carry a positive
+            // widen, and a non-elevated hour must bake 0.0 (nothing to widen
+            // by). This guards the build.rs render against drift.
+            for h in 0..24 {
+                let elevated = mask & (1 << h) != 0;
+                let w = widen[h];
+                if elevated {
+                    assert!(w > 0.0, "{name}: hour {h} elevated but widen {w} <= 0");
+                } else {
+                    assert!(w == 0.0, "{name}: hour {h} not elevated but widen {w} != 0");
+                }
+            }
         }
     }
 
@@ -182,12 +296,124 @@ mod tests {
         // For every baked instrument the threshold is exactly 5x its
         // median normal spread — high enough to pass resting/busy-news
         // widening, low enough to reject a ≥10x spread-hour blowout.
-        for (name, _low, _high, median, _n) in baseline::SPREAD_BASELINE {
+        for (name, _low, _high, median, ..) in baseline::SPREAD_BASELINE {
             let t = elevated_threshold_pips(name);
             assert!(
                 (t - median * SPREAD_REJECT_MULTIPLE).abs() < 1e-9,
                 "{name}: threshold {t} != 5x median {median}",
             );
         }
+    }
+
+    // --- spread-hour widen lookup (pure seam, synthetic tables) ---
+
+    use chrono::{DateTime, Utc};
+
+    fn ts(s: &str) -> DateTime<Utc> {
+        s.parse().expect("valid rfc3339 fixture")
+    }
+
+    /// A EUR/USD-shaped mask: a single spike hour (21:00 UTC), widen 5p.
+    fn eurusd_shape() -> (u32, [f64; 24]) {
+        let mut w = [0.0; 24];
+        w[21] = 5.0;
+        (1 << 21, w)
+    }
+
+    /// A Gold-shaped mask: a structural overnight block (18:00–06:00 UTC),
+    /// widen 75p across the block.
+    fn gold_shape() -> (u32, [f64; 24]) {
+        let mut mask = 0u32;
+        let mut w = [0.0; 24];
+        for h in (18..24).chain(0..7) {
+            mask |= 1 << h;
+            w[h] = 75.0;
+        }
+        (mask, w)
+    }
+
+    #[test]
+    fn widen_fires_inside_the_elevated_hour() {
+        let (m, w) = eurusd_shape();
+        // 21:15 UTC — squarely inside the elevated hour.
+        assert_eq!(
+            spread_hour_widen_for(m, &w, ts("2026-07-01T21:15:00Z")),
+            Some(5.0),
+        );
+    }
+
+    #[test]
+    fn widen_none_outside_any_elevated_hour() {
+        let (m, w) = eurusd_shape();
+        // Midday, nowhere near 21:00.
+        assert_eq!(
+            spread_hour_widen_for(m, &w, ts("2026-07-01T12:00:00Z")),
+            None
+        );
+    }
+
+    #[test]
+    fn widen_leads_into_the_next_elevated_hour() {
+        let (m, w) = eurusd_shape();
+        // 20:35 UTC — 25 min before 21:00, inside the 30-min lead → widen now.
+        assert_eq!(
+            spread_hour_widen_for(m, &w, ts("2026-07-01T20:35:00Z")),
+            Some(5.0),
+        );
+        // 20:29 UTC — 31 min before, just outside the lead → not yet.
+        assert_eq!(
+            spread_hour_widen_for(m, &w, ts("2026-07-01T20:29:00Z")),
+            None
+        );
+    }
+
+    #[test]
+    fn widen_lead_wraps_across_midnight() {
+        // Gold's block includes hour 0. At 23:40 UTC the next hour (0) is
+        // elevated and within the lead → widen, exercising the (h+1)%24 wrap.
+        let (m, w) = gold_shape();
+        assert_eq!(
+            spread_hour_widen_for(m, &w, ts("2026-07-01T23:40:00Z")),
+            Some(75.0),
+        );
+    }
+
+    #[test]
+    fn widen_covers_a_structural_overnight_block() {
+        let (m, w) = gold_shape();
+        // Deep in the overnight block.
+        assert_eq!(
+            spread_hour_widen_for(m, &w, ts("2026-07-01T02:00:00Z")),
+            Some(75.0),
+        );
+        // Daytime, block is closed.
+        assert_eq!(
+            spread_hour_widen_for(m, &w, ts("2026-07-01T12:00:00Z")),
+            None
+        );
+    }
+
+    #[test]
+    fn widen_empty_mask_never_fires() {
+        // A flat-fat-tail instrument bakes mask 0 → never a spread hour.
+        assert_eq!(
+            spread_hour_widen_for(0, &[0.0; 24], ts("2026-07-01T21:15:00Z")),
+            None
+        );
+    }
+
+    #[test]
+    fn is_spread_hour_unknown_instrument_falls_back_to_ny_close() {
+        // No baseline row → fall back to the legacy NY-close-edge gate.
+        // 12-Mar-2026 is EDT, close edge 21:00 UTC.
+        assert!(is_spread_hour(
+            "DEFINITELY NOT A REAL MARKET ZZZ",
+            ts("2026-03-12T21:00:00Z")
+        ));
+        // A non-edge hour on the same (unknown) instrument → false.
+        assert!(!is_spread_hour(
+            "DEFINITELY NOT A REAL MARKET ZZZ",
+            ts("2026-03-12T10:00:00Z")
+        ));
     }
 }

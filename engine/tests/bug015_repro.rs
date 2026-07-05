@@ -196,6 +196,9 @@ fn experimental_plan() -> TradePlan {
         pip_size: 0.0001,
         rules: vec![too_low, too_high, trade_expiry],
         shadow: false,
+        cross_buffer_pct: 0.0,
+        retest_atr_step: trade_control_core::trade_plan::DEFAULT_RETEST_ATR_STEP,
+        replay_start: None,
     }
 }
 

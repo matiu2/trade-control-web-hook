@@ -1,5 +1,1017 @@
 # Changelog
 
+## Unreleased — 2026-07-05 — replay journal: reconcile the SL lines + tag entries with an id
+
+**Why.** On EUR/AUD `hs-eur-aud-3d0b5dda` the enter block printed **three
+different stop-losses that didn't reconcile**: `order: SL 1.65787`, then "widened
+to 1.65458 (from 1.65238)", then "restored to 1.65238" — the widen/restore moved
+to *tighter* levels than the placed stop. Cause: the `order:` line applied the
+System-1 entry spread floor (fire-bar spread 8.3p → 10× floor → SL 1.65787) but
+`widened_stop_at` (System 2) re-resolved from scratch and used the **un-floored
+signed SL** (1.65238) as its baseline. Two systems, two baselines, one confusing
+journal. Also, the widen/restore notes were undated-looking lines bunched under
+the entry bar, with no way to tell which entry they belonged to when several
+enters fired.
+
+**What changed.**
+- **One baseline.** New shared `engine::apply_entry_spread_floor` (returns the
+  floored stop + the spread used, or a reject) replaces the ad-hoc floor in
+  `simulate_fill` *and* is now applied inside `widened_stop_at`, so the placed
+  stop, the simulated exit, and System 2's widen/restore all key off the **same**
+  floored level. On the worked trade the lines now read: order 1.65787 → widened
+  1.66007 → restored 1.65787 — monotonic and correct.
+- **Show the spread.** The `order:` line gains a "SL floored to 10× spread
+  (Np @ entry bar)" note when the floor moved the stop, and the System-2 widen
+  line shows the widen-bar spread ("…, Np spread…"). No more mystery-wide stops.
+- **Entry ids + per-bar events.** Each enter fire is tagged `[entry #N]`, and its
+  time-based sub-events (break-even, widen, restore) now read
+  `entry #N @ <their own bar>: …` — a mini timeline under the entry instead of
+  undated lines. `SpreadWiden` gains `widen_spread_pips`.
+
+**Compatibility.** Replay reporting only — no signed field, no live-worker
+behaviour change. The entry-floor *logic* is unchanged (still fire-bar spread,
+per the operator's call); this only reconciles the display and threads the id.
+
+**Tests.** `widened_stop_at_baseline_is_the_floored_stop_not_the_signed_sl`
+(guards the reconciliation); existing widen tests unchanged (their signed SLs
+already clear the floor, so flooring is a no-op).
+
+## Unreleased — 2026-07-05 — replay shows the System-2 widen as *transient* (widen + restore)
+
+**Why.** The NY-close stop-widen (System 2) is **transient live**: the recovery
+watcher (`trade-control-cron/src/blackout_watch.rs`) restores the original stop as
+soon as the spread recovers (≤4p) or a 3h backstop fires. But the replay printed
+only the *widen* line and no *restore*, and (because `widened_stop_at` is a
+display-only annotation, never applied to `simulate_fill`'s exit) the journal read
+as a permanent, un-reverted stop inflation. Raised by the operator on EUR/AUD
+`hs-eur-aud-3d0b5dda` (demo-journal
+`BUG-ny-close-widen-is-permanent-not-transient.md`): "why does a temporary
+NY-close protection permanently widen my stop and never put it back?" The live
+worker already does put it back — the replay just didn't say so.
+
+**What changed.**
+- `engine::simulator::SpreadWiden` gains `restored_at: Option<DateTime<Utc>>`,
+  reconstructed by a new `restore_bar` helper that mirrors the live watcher's two
+  restore triggers: the first post-widen bar with spread ≤
+  `SPREAD_BLACKOUT_RECOVERED_PIPS` (4p, clock-agnostic), else the
+  `BLACKOUT_BACKSTOP_SECONDS` (3h) backstop.
+- The replay report now prints a matching **"SL restored to … @ …"** line (or
+  "still widened at window end" when neither trigger lands), and the widen line is
+  relabelled `note:` and marked *transient* + *informational only* (the simulated
+  exit uses the un-widened bracket).
+
+**Refactor.** `BLACKOUT_BACKSTOP_SECONDS` moved from
+`trade-control-cron::constants` into `trade_control_core::spread_blackout` (beside
+the recovered/elevated cutoffs — spread-blackout tuning now lives in one place) so
+the engine can compute the same backstop without depending on the cron crate. The
+cron `constants` module re-exports it, so every existing consumer is unchanged.
+
+**Compatibility.** Replay reporting only — no signed field, no live-worker change
+(live was already transient). No behaviour change to any simulated exit.
+
+**Tests.** `widened_stop_at_reports_restore_on_spread_recovery`,
+`widened_stop_at_restore_is_none_when_spread_stays_wide`,
+`widened_stop_at_restore_fires_on_the_backstop`.
+
+## Unreleased — 2026-07-05 — replay System-2 stop-widen gates on the NY-close edge
+
+**Why.** The live spread-blackout stop-widen (System 2,
+`trade-control-cron/src/blackout_apply.rs`) fires **only at the NY-close edge**
+(21:00 UTC under EDT / 22:00 under EST), where the post-close spread blowout it
+guards against occurs. The offline replay's mirror
+(`engine::simulator::widened_stop_at`) had **no such gate** — it widened on the
+*first* post-fill bar whose spread crossed the trigger, at any hour. On a trade
+whose spread flared away from the NY close, the replay would widen a stop the
+live worker would have left alone: a replay-vs-live divergence.
+
+Surfaced by the EUR/AUD journal bug `hs-eur-aud-3d0b5dda` (demo-journal
+`BUG-replay-sl-widen-uses-wrong-bar-spread-and-synthetic-candles.md`). That
+report's two headline claims were misdiagnoses — the widen it flagged fired on
+the **NY-close bar** (01-Jul 21:00 UTC), on **real** OANDA `price=MBA` bid/ask
+(the replay already pulls real books) — but it half-found this real gap.
+
+**What changed.** `widened_stop_at` now `continue`s past any post-fill bar where
+`trade_control_core::ny_clock::is_ny_close_edge(c.time)` is false, so the replay
+widens only on the NY-close bar — identical to the live cron. Shared engine ⇒
+worker (wasm) and replay can't drift.
+
+**Compatibility.** No signed-field or schema change. Behaviour only changes for a
+replay whose open-position spread crosses the widen trigger on a non-NY-close bar
+(previously widened, now correctly ignored). Trades whose wide bar *is* the
+NY-close bar (the common case, incl. `hs-eur-aud-3d0b5dda`) are unaffected.
+
+**Tests.** `widened_stop_at_ignores_a_wide_bar_off_the_ny_close_edge`,
+`widened_stop_at_widens_on_the_ny_close_bar_not_the_first_wide_bar`;
+`widened_stop_at_reports_the_widen_bar_for_a_long` moved onto 21:00 UTC (it
+previously used 12:00 UTC, silently encoding the pre-fix "any bar" behaviour).
+
+## Unreleased — 2026-07-05 — break-and-close reads a buffered *zone*, not the bare line
+
+**Why.** The `OnClose` cross (break-and-close, invalidation caps) required a
+*strict* cross of the raw line against the single prior processed close:
+`prev > level && close <= level` (down). A candle that dipped **into the zone of
+the line** and closed a hair on the near side poisoned the next bar's
+`prev_close`, so an obviously-clean close-through was silently rejected. Caught
+on NAS100 short iH&S 2026-07-02 (`hs-nas100-usd-514640f9`): the 15:00 (3pm)
+candle closed at **29844.2**, 0.9 pt *above* the neckline (29843.3); the 16:00
+(4pm) candle broke down hard (close **29713.4**) but `prev_close 29844.2 >
+neckline 29844.3` was **false** by 0.1 pt → the break never stamped, killing the
+whole retest→enter spine.
+
+**What changed.** `level_crossed`'s `OnClose` arm now measures against the
+buffered **zone** `[level - buffer, level + buffer]` (the same
+`cross_buffer_pct` already used by the intrabar arm, default 0.02%). A
+directional break fires when the close lands past the **far zone edge** and the
+prior close was **not already past that edge**:
+- **Down** — `prev > level - buffer && close <= level - buffer`
+- **Up** — `prev < level + buffer && close >= level + buffer`
+- **Either** — a close past either edge.
+
+Because the prior-close guard uses the *zone edge*, a candle that only dips into
+the zone on the near side no longer pre-arms the guard and blocks the next bar's
+genuine close-through. On the NAS100 chart the break now stamps **at 4pm**,
+exactly where the chart breaks. Applies to **all** `OnClose` crosses (the
+too-high invalidation cap too — consistent, single code path). Lives in the
+shared engine, so worker (wasm) + `replay-candles` pick it up identically.
+
+**Compatibility.** With `buffer 0.0` (`upper == lower == level`) the arm is
+byte-identical to the old raw-line comparison — plans without `cross_buffer_pct`
+are unchanged. Inclusivity mirrors the old rule (`prev < edge && c >= edge`).
+
+**Tests.** `on_close_zone_break_registers_after_near_side_dip` (the fix — a
+near-side dip then a genuine break the next bar),
+`on_close_zone_close_inside_zone_does_not_fire` (a close into but not past the
+zone is not a break), `on_close_zero_buffer_is_raw_line` (0.0 buffer =
+old behaviour). Renamed `cross_buffer_ignored_by_either_and_on_close` →
+`cross_buffer_ignored_by_intrabar_either` (OnClose no longer ignores the
+buffer). Verified end-to-end: the NAS100 replay stamps break-and-close at 4pm
+and progresses the spine to the retest.
+
+## Unreleased — 2026-07-04 — retest no longer gated behind an in-window break-and-close
+
+**Why.** A `--skip-break-and-close` plan (the operator armed *on* the retest,
+after the neckline break already happened) carries no `03-prep-break-and-close`
+rule, so `break_close_at` was never stamped. `stamp_retest` short-circuited on
+`break_close_at == None` and `retest_satisfied` returned false — so the retest
+(hence the entry) could **never** fire, regardless of price action. Silently
+forfeited a would-be winner on NZD/SGD `ihs-nzd-sgd-7b24d14c` (2026-06-30 iH&S
+long: the retest tapped the neckline at 17:00 but never stamped; price later ran
+through TP).
+
+**What changed.** A plan with **no** break-and-close rule is treated as
+break-already-satisfied by construction. New `effective_break_at(plan, state,
+window)` in the shared engine returns:
+- the stamped `break_close_at` when present (unchanged);
+- for a no-break-rule plan, a floor one second before the window's first candle,
+  so every in-window bar is eligible to stamp the retest (and the first bar
+  counts as `N=1` in the tolerance decay);
+- `None` (retest stays gated) when a break rule is present but hasn't fired —
+  the break genuinely mustn't be assumed.
+
+`stamp_retest` and `retest_satisfied` both key off this. Since it lives in the
+engine, the worker (wasm) and offline `replay-candles` pick it up identically —
+no drift.
+
+**Scope (deliberate).** This fixes only the *no-break-rule* case
+(`--skip-break-and-close`). A modern-spine plan that *has* the break rule but is
+replayed/armed **after** its break bar stays gated by design — the remedy there
+is to re-arm with `--skip-break-and-close`. (Operator decision.)
+
+**Breaking.** `retest_satisfied` now takes `&TradePlan` as its first argument
+(engine-internal).
+
+**Tests.** `skip_break_and_close_plan_stamps_retest_and_enters` (retest + enter
+fire with `break_close_at` never stamped),
+`break_rule_present_but_unfired_keeps_retest_gated` (the negative guard).
+Verified end-to-end on the NZD/SGD replay: the retest now stamps and the entry
+gate opens; a synthesised modern-spine variant still stamps break-before-retest
+in order.
+
+## Unreleased — 2026-07-04 — replay-candles `--start`/`--end` accept Brisbane + explicit offsets
+
+**Why.** `replay-candles` renders every candle/fill/exit in Brisbane time
+(UTC+10), and the operator works in Brisbane, but the `--start`/`--end` window
+flags parsed a bare datetime as **UTC** — so the input read differently from the
+output, and passing a timezone (`...+10:00`) failed outright with "is not a valid
+UTC datetime".
+
+**What changed.** `parse_start_end` (was `parse_utc`):
+
+- A **bare** datetime (no offset) is now interpreted as **Brisbane (UTC+10, no
+  DST)** — matching the tool's own output zone. `--start 2026-06-30T17:00` is
+  17:00 Brisbane = 07:00 UTC.
+- An **explicit offset or `Z`** is honoured as written: `...T07:00Z` = UTC,
+  `...T17:00+10:00` = Brisbane spelled out, any offset respected. Both minute and
+  second precision accepted on every form (RFC3339's mandatory-seconds gap is
+  covered by a `%z` fallback + trailing-`Z` normalisation).
+
+**Breaking.** None on the wire; a script that relied on bare `--start`/`--end`
+being **UTC** now shifts 10h earlier — append `Z` to keep the old UTC reading.
+
+**Tests.** `bare_datetime_is_brisbane_minute_and_second_precision`,
+`explicit_offset_is_honoured` (Z / +10:00 / +02:00), `rejects_garbage_datetime`;
+two window-resolution tests pinned to `...Z` to stay zone-independent.
+
+## Unreleased — 2026-07-03 — time-decaying retest tolerance
+
+**Why.** The retest required the wick to *reach* the neckline on every bar. The
+original author's insight: a retest right after the break should be tight, but
+the further price drifts in time the less its exact distance to the neckline
+matters. So the closeness requirement should **loosen as bars pass** since the
+break-and-close.
+
+**What changed.** The retest cross now carries a per-bar decaying **near-side
+tolerance**. With `N` = bars since the break-and-close (first bar after = 1) and
+`ATR` the Wilder ATR at the bar:
+
+```
+tolerance(N) = (N - 1) × retest_atr_step × ATR
+```
+
+- Bar 1: tolerance 0 → the wick must **reach** the neckline (unchanged).
+- Each later bar: `+ retest_atr_step × ATR` of slack — a wick that comes *within*
+  the tolerance of the line stamps the retest even without reaching it.
+
+`retest_atr_step` defaults to **0.075** (≈1 ATR of slack by ~bar 14). Implemented
+in `engine/src/evaluate.rs` (`stamp_retest` → `retest_tolerance` +
+`retest_crossed`); ATR comes from the engine's existing `wilder_atr` over the
+detector window (`atr_length_for(granularity)`) and **hard-fails** if absent
+(structurally unreachable by the retest phase — a `None` signals a mis-sized
+window, surfaced loudly rather than silently papered over as tolerance 0).
+
+**Config.** New signed field `TradePlan.retest_atr_step: f64` (serde-default
+0.075, `DEFAULT_RETEST_ATR_STEP`). New `tv-arm --retest-atr-step <f64>` bakes it
+per-trade; absent → the default. Only the **retest** uses it; `cross_buffer_pct`
+(which *tightens*) still governs the other intrabar consumers.
+
+**Behaviour.** Strictly *more permissive* for the retest after bar 1: near-misses
+that used to be ignored now stamp once enough bars have passed. Bar-1 behaviour
+and every non-retest cross are unchanged.
+
+**Breaking.** `build_trade_plan` gains a `retest_atr_step: f64` parameter; every
+`TradePlan { … }` literal gains the field (serde-default keeps old plans valid).
+
+**Shared.** Engine rule → live worker tick + replay simulator both follow (one
+edit, no drift). tv-arm bakes the signed field.
+
+**Tests.** engine: bar-1-must-reach, later-bar-near-miss-within-tol fires,
+beyond-tol rejects, tolerance-grows-linearly (4 new). tv-arm:
+retest_atr_step-carried-onto-plan. engine 102 + tv-arm 189 green.
+
+**Follow-up.** Visual tuning of `retest_atr_step` on past charts (operator).
+
+## Unreleased — 2026-07-03 — intrabar cross is a pure straddle (high/low opposite sides)
+
+**Why.** The retest (and every other intrabar cross) required the bar to have
+*opened* on the far side of the line and wicked through — "came from the open
+side". The operator wants the retest more permissive: a bar counts as crossing
+the neckline whenever its **high and low sit on opposite sides** of the line,
+regardless of where it opened or closed. A bar that opens on the near side, dips
+through, and comes back is a genuine touch on a tick timeline.
+
+**What changed.** `level_crossed`'s `BarEvent::Intrabar` arm
+(`engine/src/evaluate.rs`) dropped the `open`-side guard:
+- `Up`   was `open <= level && high >= level + buffer` → now `high >= level + buffer`
+- `Down` was `open >= level && low  <= level - buffer` → now `low  <= level - buffer`
+
+The `straddles` precondition (`low <= level <= high`) is unchanged and now carries
+the "opposite sides" requirement on its own; the directional wick + `buffer`
+(`cross_buffer_pct`) still gate a one-tick graze. `Either` and `OnClose` arms
+untouched — **break-and-close still requires a genuine close through the line**.
+
+**Behaviour.** Strictly *more* firings: any bar that used to fire still fires
+(open-side bars straddle too), plus bars that opened on the near side and wicked
+through now fire. Affects the retest (`04-prep-retest`), the `too-low`
+invalidation floor, the computed-fib pcl levels, and M/W cancel/overshoot vetos —
+every consumer of the intrabar arm. The literal `too-high` cap is `OnClose`
+(close-confirmed) and is unaffected.
+
+**Breaking.** None — pure engine decision, no signed field or API change.
+
+**Shared.** The rule lives in the shared `engine` crate (`level_crossed`), the
+single source of truth for both the live worker's engine tick and the offline
+`replay-candles` simulator (both route through `evaluate_plan`/`eval_trigger`) —
+one edit, no replayer/worker drift.
+
+**Tests.** Renamed + flipped the two open-side intrabar tests to assert
+any-straddle-fires (`intrabar_fires_on_any_straddle_regardless_of_open`,
+`intrabar_down_fires_on_any_straddle_regardless_of_open`); buffer + real-data
+AUD/JPY retest tests unchanged (their bars open on the far side anyway). engine 98
+green.
+
+**Follow-up.** None.
+
+## Unreleased — 2026-07-03 — SL-spread salvage widens to exactly 10× (was 11×)
+
+**Why.** The SL-vs-spread salvage widened a too-tight stop to `11 × spread` — a
+deliberate margin above the `10×` floor. The operator wants the salvage to move
+the stop only as far as strictly necessary: to the floor itself, `10 × spread`,
+and no further. A stop pushed to `11×` gives away an extra `1 × spread` of risk
+on every salvaged entry for no rule benefit.
+
+**What changed.** `SL_WIDEN_SPREAD_MULTIPLE` in
+`core/src/intent/sl_spread_floor.rs` is now `= SL_MIN_SPREAD_MULTIPLE` (10.0)
+instead of `11.0`. A salvaged stop lands exactly on the floor. This is safe:
+`sl_spread_floor_violation` uses a strict `<` (`sl_distance < 10 × spread`), so a
+stop at exactly `10 × spread` is **not** a violation, and the widened distance is
+the same `10.0 × spread` multiplication as the check — bit-identical, no
+floating-point boundary risk.
+
+**Behaviour.** Salvaged entries now enter with a slightly *tighter* (more
+favourable) stop and correspondingly *higher* R than before. Entries that were
+salvageable at 11× remain salvageable at 10× (the R only improves). The
+reject/accept boundary shifts marginally: a trade whose R at 11× was just under
+`min_r` may now clear it at 10× and enter. Reject and log messages print `10x`
+automatically (built from the constant).
+
+**Breaking.** None — the constant is internal; no signed-field or API change.
+
+**Shared.** Pure `core` helper, so the live worker (`run_enter`) and the offline
+replay simulator (`engine/src/simulator.rs`, which calls the same
+`widen_sl_to_spread_floor`) both follow with one edit — no replayer/worker drift.
+
+**Tests.** Updated the 11×-hardcoded expectations in `sl_spread_floor.rs` (3
+widen tests) and `simulator.rs` (2 tests; `widened_sl_protects_the_leg`'s dip bar
+moved from 1.0990→1.0994 since the widened SL is now 1.0990, not 1.0984). core
+764 + engine 98 green.
+
+**Follow-up.** None.
+
+## Unreleased — 2026-07-02 — tv-arm: neckline serves the retest (one drawing)
+
+**Why.** The `03-prep-break-and-close` and `04-prep-retest` rules cross the
+*same* neckline — the retest is by definition a cross back through it (opposite
+direction, intrabar). They only lived as two separate drawings because
+TradingView couldn't fire two alerts off one trendline. That limitation is gone,
+so making the operator draw the neckline twice is pure ceremony.
+
+**What changed.** `tv-arm`'s role resolution (`tv-arm/src/roles.rs`,
+`resolve_retest`) now reuses the resolved neckline (`break_and_close`) for the
+retest role **when no `retest` trendline is drawn** — `04-prep-retest` gets the
+identical geometry via the existing opposite-direction/intrabar trigger build,
+unchanged. A separately-drawn `retest`/`neckline-retest`/`retrace` line is still
+honoured (backward compat) but now **warns as deprecated**. `check_required`
+(`tv-arm/src/pipeline.rs`) no longer demands a standalone `retest` line — the
+neckline satisfies both; the retest is only *independently* required when the
+neckline itself is skipped (`--skip-break-and-close` without `--skip-retest`).
+
+**Breaking.** None. A chart with a separate retest line behaves as before (plus a
+deprecation warning); a chart with only a neckline now arms the retest too
+instead of erroring `missing … 'retest'`.
+
+**Config.** No new fields. Same labels (`neckline`/`break-and-close`;
+`retest`/`neckline-retest`/`retrace` still recognised for the deprecated path).
+
+**Tests.** `tv-arm/src/roles.rs`: `neckline_serves_the_retest_when_no_retest_line_is_drawn`,
+`a_separate_retest_line_is_still_honoured_deprecated`,
+`no_neckline_and_no_retest_leaves_the_retest_role_empty`. tv-arm 188 green,
+clippy + fmt clean.
+
+**Follow-up.** The `retest`/`neckline-retest`/`retrace` label vocabulary and the
+`--skip-retest` flag can eventually be retired once no live charts draw a
+separate retest line.
+
+## Unreleased — 2026-07-02 — tv-arm: rename `--update` → `--replace` (alias kept)
+
+**Why.** The re-arm flag was named `--update`, which reads like an in-place
+patch. It isn't: it *deletes* the prior plan and registers a brand-new one under
+a fresh `trade_id` with blank engine state (phase, vetos, seen-ids,
+entry-attempts, news/blackout windows are all `trade_id`-keyed, so nothing
+carries over). `--replace` names what actually happens.
+
+**What changed.** `tv-arm`'s `--update` flag is renamed `--replace`
+(`tv-arm/src/args.rs`); `--update` stays as a **`visible_alias`** so existing
+scripts and muscle memory keep working. Behaviour is byte-identical. The field
+`Args.update` → `Args.replace`; the helpers `resolve_update_target` →
+`resolve_replace_target` and `update_existing_plan` → `replace_existing_plan`
+(`tv-arm/src/pipeline.rs`); log lines and the ambiguous-target error now say
+`--replace`. The `--help` text also spells out the replace-not-patch semantics
+and the strand-a-live-order/position caveat.
+
+**Breaking.** None for the CLI surface (alias preserves `--update`). Internal
+fn/field renames only — no external callers.
+
+**Config.** None.
+
+**Tests.** args: `--replace` bare + with-target parse, and `--update` alias
+parses into the same field. pipeline: the 5 `resolve_*_target` tests renamed
+`replace_*`, plus the ambiguous-target error now asserts it names `--replace`.
+tv-arm 185 green; clippy + fmt clean.
+
+## Unreleased — 2026-07-02 — replay report: Net R + $100k-account P&L projection
+
+**Why.** The `replay-candles --simulate` report tallied only raw TP/SL counts.
+Reading a window's actual profitability meant summing R multiples by hand and
+guessing what the sequence would have made on a real account. The operator wants
+the bottom line — net R and a dollar figure — right in the report, and each fill
+to show its own contribution.
+
+**What changed.** `cli/src/bin/replay_candles/report.rs` now scores every *taken*
+fill's realized R multiple (`realized_r` = `(exit − entry) / (entry − SL)`,
+correctly signed for both directions off the protected stop after the
+spread-floor widen) and compounds it into a simulated **$100k account at 1% risk
+per trade** (`Tally`). Two new outputs:
+
+- **Per fill:** a `R: +N.NN  |  $100k acct (1% risk): +PNL → $BALANCE` line under
+  each TP / SL / reversal-close fill, showing that trade's R and the account after
+  it. Not-taken kinds (never-filled, declined, gate-blocked, superseded)
+  contribute 0R and print nothing.
+- **Summary footer:** `… | Net R: +N.NN | $100k acct (1%/trade): $BALANCE (+PROFIT)`
+  appended to the existing `TP:/SL:` line.
+
+The account compounds — each trade risks 1% of what's *left*, so a losing streak
+shrinks the per-trade stake and a winning one grows it. `Net R` is the plain sum
+of per-trade R multiples (account-independent). A zero-risk bracket (SL at entry)
+scores 0R rather than dividing by zero.
+
+**Breaking.** `render_fire`'s three `&mut usize` counters collapse into one
+`&mut Tally` (private fn — no external callers).
+
+**Config.** None. `--simulate`-only output; the $100k / 1% constants are fixed.
+
+**Tests.** 8 new in `report.rs`: `realized_r` sign/scale/zero-risk across both
+directions; `Tally` compounding + summary line; `book_and_render_r` no-op without
+a stop and its win-scoring path. cli 22 report-tests green.
+
+## Unreleased — 2026-07-02 — --start: invalidation picks the line on the correct side of the neckline
+
+**Why.** A chart can carry two same-labelled invalidation lines — the real one
+plus a stale leftover from an earlier trade at a different price. Under `--start`
+the invalidation slot broke ties purely by anchor *time* (nearest either side of
+the cursor), so a stale `too-low` whose timestamp happened to sit nearer the
+cursor out-ranked the real floor. On AUD/JPY (IH&S long, 2026-06-29) the real
+`too-low` floor was 111.288 (below entry) but a stale one at 112.993 (above
+entry, above the neckline, above TP) won the slot — and because that level is
+baked onto the enter as a continuous at-entry veto (Bug #12), *every* `05-enter`
+fire was rejected `veto-active (too-low)` and the plan never filled.
+
+**What changed.** `classify` (`tv-arm/src/roles.rs`) now resolves the neckline
+(`break_and_close`) *before* the invalidation, and passes its mean price into
+`pick_slot_with_label`. Under `--start` a **side-of-neckline filter** runs before
+the nearest-to-start tiebreak: a `too-low` floor must sit **below** the neckline
+and a `too-high` cap **above** it (per each candidate's own label), so a
+wrong-side stale line is dropped. The filter falls back to the full candidate set
+when it would drop everything (no neckline, or all candidates on the wrong side)
+so a genuinely unusual chart is never stranded. Window-scoped modes
+(`LatestWins` / `WindowAware`) are unchanged — their visible-window filter
+already handles staleness.
+
+**Breaking.** `pick_slot_with_label` gains a `neckline_ref: Option<f64>` param
+(private fn — no external callers).
+
+**Config.** None. `--start`-only behaviour.
+
+**Tests.** `nearest_to_invalidation_drops_too_low_above_neckline` (the bug: stale
+above-neckline `too-low` out-times the real floor → real floor wins),
+`nearest_to_invalidation_drops_too_high_below_neckline` (short mirror), and
+`nearest_to_invalidation_side_filter_falls_back_when_all_wrong_side` (fallback
+never strands the setup). tv-arm 183 green.
+
+**Follow-up.** None.
+
+## Unreleased — 2026-07-02 — --start: stray M/W path no longer hijacks an H&S arm
+
+**Why.** A chart can carry a leftover M/W `path` drawing from an earlier setup
+while the operator journals an H&S. Under `--start`, the 3-anchor path relax rule
+(`start >= left-shoulder B`) matched *any* old path whose left shoulder predated
+the cursor — and a path's mere presence routes the whole arm to M/W
+(`pipeline.rs` keys on `roles.mw_path`). So a 12-Jun path hijacked a 29-Jun H&S
+arm (AUD/JPY 2026-06-29): tv-arm resolved the M/W path instead of the drawn
+neckline.
+
+**What changed.** `pick_mw_path` (`tv-arm/src/roles.rs`) now takes the resolved
+H&S neckline anchor and, under `--start` only, compares it to the chosen path's
+own neckline anchor `C (points[2])`: whichever is anchored **nearer `start`**
+wins. If the drawn neckline is nearer, the path is dropped (`None` → H&S arm).
+This is what makes the permissive 3-anchor relax rule safe. `classify` threads
+`roles.break_and_close.latest_time()` into the picker (neckline is resolved
+before `mw_path`, so it's available).
+
+**Breaking.** `pick_mw_path` gains a `neckline_anchor: Option<i64>` param
+(private fn — no external callers).
+
+**Config.** None. `--start`-only behaviour; the window-scoped modes
+(`LatestWins` / `WindowAware`) are unchanged.
+
+**Tests.** `nearest_to_drops_stray_path_when_hs_neckline_is_nearer_start` (the
+bug: stray path far left + neckline near start → `mw_path == None`, H&S arm) and
+`nearest_to_keeps_path_when_it_is_nearer_start_than_neckline` (mirror: a genuine
+M/W journaling arm with a nearer path is not demoted). tv-arm 180 green.
+
+**Follow-up.** None. The `--cross-buffer-pct` arm-time flag is still separate/unbuilt.
+
+## Unreleased — 2026-07-02 — invalidation: drawn line = close-confirm (both directions), fib = wick
+
+**Why.** The invalidation cross-mode was tied to the *name* (`too-high` →
+close-confirm, `too-low` → wick), which was only correct for short trades. For a
+**long** trade the `too-low` is the human's **drawn line** (below the
+shoulder/head) and must be close-confirmed — but it was baked as `Intrabar`
+(wick), so a 7am wick that closed back above the floor wrongly invalidated the
+setup (AUD/NZD long, 2026-07-01: too-low fired on a wick, killing the plan before
+the entry).
+
+**The correct rule (operator).** The two invalidation guards are two different
+*kinds*, and the kind — not the direction — decides the cross-mode:
+
+- **The drawn line** (human-annotated: `too-low` for a long, `too-high` for a
+  short) is **close-confirmed** (`OnClose`) in *both* directions — "the candle
+  opened one side of my line and closed the other" is a genuine break; an
+  intrabar spike that closes back does not invalidate.
+- **The computed fib / pcl level** (the opposite name: `too-high` for a long,
+  `too-low` for a short — "the power of the setup is consumed") is a
+  **wick-through** (`Intrabar`, `Either`): any straddle aborts.
+
+Direction only decides *which way* the drawn line is crossed (`Down` into the
+long floor, `Up` into the short cap), not the confirm mode.
+
+**What changed.** `invalidation_or_pcl_trigger` (`tv-arm/src/trade_plan_build.rs`)
+now emits the drawn-line branch as `HorizontalCross { bar: OnClose }` for both
+directions (was `Intrabar` for long). The fib/pcl branch is unchanged
+(`PriceValueCross { dir: Either, bar: Intrabar }`). This **supersedes** the
+2026-07-01 asymmetry where only the short `too-high` cap was reverted to
+`OnClose`.
+
+**Build-site only.** The engine's `OnClose`/`Intrabar` arms are unchanged; this
+only changes which `BarEvent` tv-arm bakes. `replay-candles` reads the same plan,
+so replay and the live worker both pick it up with no engine change.
+
+**Tests.** `ihs_long_too_low_invalidation_is_close_confirmed` (was
+`…stays_intrabar_wick`, flipped to assert `OnClose`);
+`builds_hs_short_rules_with_correct_triggers` still asserts the short cap
+`OnClose`. tv-arm 178 green; clippy + fmt clean.
+
+## Unreleased — 2026-07-01 — bake `--start` into the plan for self-consistent replays
+
+**Why.** `tv-arm --start` only affected *arming* (which drawings to pick). The
+offline `replay-candles` harness still derived its window *start* from the
+TradingView chart's replay cursor — so even a correct `--start` arm failed if the
+chart's cursor wasn't lined up before the trade start. Concretely: a June-12
+`--start` arm produced a plan with expiry 22 Jun, but replay read the chart
+cursor at 22 Jun 16:00 (after the expiry) and errored `end before start`. The two
+tools didn't share the cursor.
+
+**What changed.** `tv-arm` now bakes the arm-time `--start` onto the plan as a new
+optional field `TradePlan.replay_start` (a Unix second). `replay-candles` prefers
+it for the window start: **`--start` flag → `plan.replay_start` → chart cursor**.
+So a `--start` journaling arm carries *both* ends of its window (start =
+replay_start, end = trade-expiry) and replay is fully deterministic — the TV chart
+position no longer matters. An arm without `--start` is unchanged (field omitted,
+chart cursor used as before).
+
+**Field.** `replay_start: Option<i64>`, `#[serde(default, skip_serializing_if =
+"Option::is_none")]` — omitted from the JSON entirely when absent, so pre-field
+plans round-trip byte-clean. Signed as part of the whole-body HMAC like every
+plan field. **The worker does not act on it** — it's a journaling aid the engine
+ignores.
+
+**Tests.** core: `missing_replay_start_defaults_to_none_and_is_omitted`,
+`replay_start_round_trips`. replay-candles: `window_start_comes_from_plan_replay_start`,
+`window_start_flag_overrides_plan_replay_start`. core 761 / cli 256 / replay-candles
+59 / tv-arm 178 / engine 97 green; clippy + fmt clean.
+
+## Unreleased — 2026-07-01 — tv-arm `--start`: whole-chart, nearest-to-start arming
+
+**Why.** Journaling a replay trade meant putting TradingView in replay mode with
+the last visible candle mid-right-shoulder (to simulate "now" at the entry
+moment) — which *hid* all the candles the trade actually plays out on. Painful
+for reviewing the outcome, and it forced the visible window to double as both
+the as-of cursor and the drawing-search scope.
+
+**What changed.** New `tv-arm --start <RFC3339>` flag. When set, tv-arm treats
+that timestamp as "live now" and finds the setup's drawings by searching the
+**whole chart** (nearest-to-start), ignoring the visible window — so you can
+leave the entire pattern *and* its future candles on screen. Per-role directional
+matching (`SlotPref::NearestTo`):
+- **H&S neckline** (break-and-close + retest): nearest trendline anchored
+  *at-or-before* `--start`.
+- **invalidation** (`too-low` / `too-high`): nearest horizontal to `--start`,
+  *either side* (the cap/floor bracket the pattern).
+- **M/W path**: the path whose two shoulders bracket `--start`
+  (`B ≤ start ≤ D`; `start ≥ B` when the right shoulder isn't drawn).
+- **trade-expiry**: nearest vertical *at-or-after* `--start`.
+- **news / blackout vertical pairs**: scoped to `[--start, trade-expiry]` — a
+  pair before start or after the expiry is dropped, only pairs inside the
+  trade's own lifetime survive. Auto-drawn calendar bars use the same window.
+
+`--start` also sets the prune cursor (like `--as-of`) to itself. A malformed
+value is a **hard error** (unlike `--as-of`, which falls back to the cursor) —
+`--start` changes discovery, so a typo must not silently revert to
+visible-window matching. Absent: behaviour is unchanged, bit-for-bit.
+
+**Scope.** tv-arm-only (arming). No engine / worker / signed-field change — the
+emitted plan is identical to what you'd get by hiding the future candles and
+arming normally. Intended for offline `--plan-out` journaling; on the live
+`--register-plan` path it still overrides discovery + cursor if set.
+
+**Tests.** roles: `nearest_to_picks_neckline_before_and_nearest_start`,
+`nearest_to_invalidation_takes_nearest_either_side`,
+`nearest_to_trade_expiry_picks_nearest_after_start`,
+`nearest_to_mw_path_brackets_start`,
+`nearest_to_mw_path_three_anchor_relaxes_to_after_left_shoulder`. tv-arm 177
+green; clippy + fmt clean.
+
+## Unreleased — 2026-07-01 — too-high invalidation reverted to close-confirm
+
+**Why.** The prior "intrabar cross reads the wick" change flipped *every*
+intrabar directional cross to fire on the wick, including the drawing-bound
+`too-high` invalidation cap. Operator call: the invalidation cap should only
+trip when a bar genuinely **closes** past it — an intrabar spike above the cap
+that closes back below is not an invalidation. Reverting the cap avoids
+premature invalidations on volatile shoulder-cap wicks while keeping the wick
+semantics where they matter (the retest tap-and-bounce).
+
+**What changed.** `invalidation_or_pcl_trigger`
+(`tv-arm/src/trade_plan_build.rs`) now emits the short-side `too-high` cap as
+`HorizontalCross { dir: Up, bar: OnClose }` (was `Intrabar`). A bar must close
+above the cap to invalidate. This is a **deliberate asymmetry**: only the literal
+`too-high` name reverted. The long-side invalidation **floor** (`too-low`,
+`dir: Down`) stays `Intrabar` — a low wicking below the floor still invalidates
+with no close required. The `too-low` pcl-exhausted veto (`CrossDir::Either`) and
+the retest (`TrendlineCross`, intrabar) are untouched.
+
+**Scope.** Pure tv-arm build-site change — no engine change (the engine's
+`OnClose` arm already implements close-confirm: `prev < level && close >= level`
+for `Up`). Only freshly-armed plans carry the new `OnClose`; plans already in KV
+keep whatever `BarEvent` they were signed with. The continuous `entry_level_vetos`
+(Bug #12) are an `is_past` predicate, independent of this cross-guard — unchanged.
+
+**Tests.** tv-arm: `builds_hs_short_rules_with_correct_triggers` updated to
+assert `OnClose`; new `ihs_long_too_low_invalidation_stays_intrabar_wick` pins
+the mirror staying `Intrabar`. tv-arm 172 green; clippy + fmt clean.
+
+## Unreleased — 2026-07-01 — cross-depth buffer (% of line price)
+
+**Why.** With intrabar crosses now firing on the wick (previous entry), a
+*shallow* graze of a retest / invalidation line counts as a cross — including a
+one-tick poke that immediately retreats. On the AUD/JPY iH&S of 2026-06-29 the
+neckline got three shallow retest taps (low pierced only ~0.008–0.016% past the
+line) before the move that actually ran; each produced an entry that stopped
+out. The unbuffered trade is **−1.43R** (SL, SL, SL, then a +1.57R runner).
+
+**What changed.** New plan-level signed field `TradePlan.cross_buffer_pct` — a
+cross-depth buffer as a **percent of the crossed level's price**. An *intrabar*
+directional cross must pierce the wick at least `cross_buffer_pct%` past the
+line before it counts: `Down` needs `low <= level - (pct/100)*level`, `Up` needs
+`high >= level + (pct/100)*level`. `Either` (a bare straddle) and `OnClose`
+(break-and-close — the close is already past the line) ignore it. Threaded
+through `eval_trigger` → `level_crossed` in the shared engine, so the live worker
+and `replay-candles` apply it identically. `#[serde(default)]` → `0.0`, so plans
+signed before the field deserialize to the bare wick-touch behaviour unchanged.
+
+**Default.** `DEFAULT_CROSS_BUFFER_PCT = 0.02%`, baked by `tv-arm` at arm time.
+Chosen by a buffer sweep on the AUD/JPY trade: `0.0` → −1.43R; flips to **+0.57R
+net** at `0.02%` (the shallow taps are filtered, leaving only the entry that runs
+to TP); holds through ~0.07%; over-tightens into a starved 0-trade plan at 0.1%.
+`0.02%` is the threshold where the trade turns profitable. A `tv-arm
+--cross-buffer-pct` flag to override per-arm is a planned follow-up (the field +
+arm-time default land now; the flag is trivial on top).
+
+**Tests.** engine: `intrabar_down_buffer_rejects_a_graze_admits_a_real_cross`,
+`intrabar_up_buffer_rejects_a_graze_admits_a_real_cross`,
+`cross_buffer_ignored_by_either_and_on_close`, and the end-to-end
+`plan_cross_buffer_pct_gates_the_retest` (real 6pm geometry, proves the
+plan-level field threads through `evaluate_plan`). core:
+`missing_cross_buffer_pct_defaults_to_zero`, `cross_buffer_pct_round_trips`.
+engine 97 / core 759 / cli 57 / tv-arm 171 green; clippy + fmt clean.
+
+## Unreleased — 2026-07-01 — intrabar cross reads the wick, not the close
+
+**Why.** The engine's intrabar directional cross (`level_crossed`, `BarEvent::Intrabar`)
+required the bar to **close** on the firing side (`Up ⇒ close ≥ level`,
+`Down ⇒ close ≤ level`) on top of straddling the level. That conflated "crossed
+the level intrabar" with "closed past it". A **retest** is a tap-and-bounce: on a
+descending neckline the bar opens above the line, its low wicks below (a genuine
+down-cross on any sub-bar timeline), then closes back above. The close-confirm
+gate threw those away, so the retest prep stamped only when a bar finally *closed*
+through the line — far too late. Real incident: AUD/JPY iH&S long, 2026-06-29 —
+break-and-close stamped 15:00 Brisbane, three golden signal candles printed at
+4/6/7pm, but the retest didn't stamp until 30 Jun 00:00 (the first close below
+the line), starving every entry. The 6pm bar (O 111.582 > line 111.519,
+L 111.501 < line, C 111.540 > line) had clearly crossed down — it just recovered.
+
+**What changed.** The `Intrabar` arm now reads the wick on the cross side,
+**close-agnostic**, discriminated by which side the bar *came from* (its open):
+
+- `Down`   ⇒ `open ≥ level && low ≤ level`  (came from above, reached below)
+- `Up`     ⇒ `open ≤ level && high ≥ level` (came from below, reached above)
+- `Either` ⇒ any straddle (unchanged)
+
+`BarEvent::OnClose` is **unchanged** — break-and-close still requires a real close
+through the line (open one side, close the other). Only the intrabar arm moved.
+
+**Breaking / behaviour.** This is a shared-engine change, so the live worker and
+the offline `replay-candles` get it identically (no drift). It reverts the
+earlier close-confirmed semantics for the **too-high invalidation** veto
+(`bug12_at_entry_level_vetos` / "too-high is close-confirmed now"): too-high/too-low
+and the M/W cancel/overshoot vetos are intrabar directional crosses and now fire
+on the wick-from-the-open-side rather than the close. A spike that opens on the
+expected side and wicks through now invalidates intrabar; a bar that merely closes
+through (without crossing from the right side) no longer does. Intentional — an
+intrabar cross should mean the bar genuinely traded through the level.
+
+**Tests.** New `intrabar_down_retest_fires_on_wick_not_close` (the real AUD/JPY 6pm
+geometry). Rewrote `intrabar_fires_when_bar_crosses_from_its_open_side` (was
+`…_and_close_on_firing_side`) and added `intrabar_down_fires_on_open_above_low_below_regardless_of_close`
+to assert the open-side/wick rule directly. Updated `pine_entry_blocked_until_retest_seen`
+to block via line-above-the-bar (no straddle) rather than the old close-side
+reasoning. engine 93 green, core 757, cli all green.
+
+**Follow-up.** A tunable cross-depth buffer (must cross by N ticks / X% of the
+line price) so a one-tick graze doesn't trigger a retest/invalidation — designed
+next, separate change.
+
+## Unreleased — 2026-07-01 — SL-floor renders in raw price; broker-oanda native build
+
+**Why (SL-floor).** The SL-vs-spread floor is a pure ratio of two raw-price
+distances (`sl_distance` vs `spread = ask − bid`), so the unit cancels and the
+decision never depends on `pip_size`. But the operator-facing widen/reject
+messages in `run_enter` divided both distances by `pip_size` to print
+"34.3 pips vs 10.0 pips". On instruments whose catalog `pip_size` was wrong
+(fractional-pip metals, surfaced while journaling a Silver/XAGUSD entry), that
+made a *correct* decision *read* wrong, and it added a pip dependency the rule
+shouldn't have.
+
+**What changed (SL-floor).** Removed pip from the rendering entirely: the
+widened-SL log, the `sl-widen-below-min-r` reject body, and its tracing line now
+report `sl_distance` / widened distance / spread in **raw price**. The decision
+logic (`sl_spread_floor_violation`, `widen_sl_to_spread_floor`) was already
+pip-free and is unchanged. (Operator chose raw price over ticks — no new signed
+field; the worker has no `tick_size` in WASM.) New test
+`verdict_is_invariant_to_pip_size` documents the floor verdict is identical for
+an FX-scale (0.0001) and a metal-scale (0.00001) spread with matching ratios.
+
+**Why (broker-oanda).** The local native worker and `trade-control-broker-check`
+panicked ("function not implemented on non-wasm32 targets") the moment OANDA
+made its first TLS call: `broker-oanda` unconditionally enabled `oanda-client`'s
+`wasm_js` feature, forcing `getrandom/wasm_js` (browser RNG) into native
+binaries. TradeNation was unaffected (no `oanda-client` dep), which is why
+reversals worked natively and OANDA never could.
+
+**What changed (broker-oanda).** Moved `oanda-client { features = ["wasm_js"] }`
+and `worker = "0.8"` into `[target.'cfg(target_arch = "wasm32")'.dependencies]`;
+base `oanda-client` is now `default-features = false` so native getrandom uses
+the OS backend. `console_error!`/`console_log!` → `tracing::error!`/`info!`
+(wasm-safe). The `worker::Env` login path (`login` / `login_with_live` /
+`get_secret`) is `#[cfg(target_arch = "wasm32")]`-gated; native reaches the
+broker via `OandaBroker::from_api_key` (unchanged). Verified both targets build,
+40 broker-oanda tests pass, `getrandom` is `default` (no `wasm_js`) on native.
+
+**Tests.** 757 core (+1), 40 broker-oanda. wasm worker + native both build;
+clippy/fmt clean.
+
+## Unreleased — 2026-06-30 — worker: salvage a too-tight SL by widening to 11× spread
+
+**Why.** The SL-vs-spread floor rejected every entry whose stop sat closer
+than `10 × spread` to entry — including wide-spread instruments (wheat) whose
+*charted* stop was a perfectly reasonable 34+ pips but still failed the floor
+because the spread itself is large. A real H&S short on WHEAT_USD
+(`hs-wheat-usd-7c4116b2`, 2026-06-23) had **all six** of its enter fires
+blocked `rejected: sl-below-10x-spread → 0R`, so the operator entered manually.
+Rejecting a too-tight stop throws away salvageable trades when the fix is simply
+to give the stop more room.
+
+**What changed.** On the worker enter path, a floor violation now triggers a
+**widen-then-reject** instead of an outright reject. The stop is moved to
+`11 × spread` (`SL_WIDEN_SPREAD_MULTIPLE`, strictly above the `10×` floor so it
+clears with a margin), *away* from entry — never tighter. If the trade still
+clears its R-floor at the wider stop (`R = tp_distance / (11 × spread) ≥
+min_r`), the order is placed with the widened SL and the worker logs the widen.
+If even the widened stop drops `R` below `min_r`, there is no legal stop and the
+entry is rejected with the new outcome `rejected: sl-widen-below-min-r` (HTTP
+422). The widen deliberately does **not** clamp to the pattern's invalidation
+level — a widened stop may sit past `too-high` / `too-low`, and the continuous
+at-entry level vetos handle invalidation independently (per the operator's
+call).
+
+**Behaviour.** Verified on the wheat replay: the first enter that used to 0R now
+**fills and rides to break-even** (its widened stop survives the post-entry
+spike), the later enters reject with `sl-widen-below-min-r` because by then price
+had fallen near the TP and widening would drop `R < 1.0`. Single code path
+(`run_enter`) shared by the live worker and the offline `replay-candles`
+simulator, so the widen reproduces identically in both (no drift).
+
+**Follow-up (2026-07-01): apply the widened SL to the fill/exit + display
+paths, not just the entry R-check.** The first cut widened the SL inside
+`run_enter` (so the live worker *places* the widened stop), but the offline
+`simulate_fill` re-derived the bracket from the signed intent and never saw the
+widen — so a replayed leg filled at the widened entry yet was checked against
+the *old, tight* SL, stopping out at a level the live broker stop was never at.
+On the wheat replay this flipped leg 1 from a (correct) break-even into a
+spurious −1R. Fix: `simulate_fill` (in `engine`) now mirrors the widen exactly
+as it already mirrors the entry-level-veto and spread-blackout gates — off the
+fire bar's `ask_c − bid_c` — so the widened stop reaches `find_fill`, the exit
+loop, and break-even arming; a `Reject` becomes `SimOutcome::Declined
+{ sl-widen-below-min-r }`. The replay report's `order:` journaling line and
+annotation boxes apply the same widen (shared `apply_spread_floor_widen`
+helper) so the printed SL matches the protected stop instead of the un-widened
+signed level. The **live worker was already correct** (it places the widened SL
+and its break-even cron amends from the live broker position) — this was a
+replay-only drift. 2 new engine tests (widened SL protects the leg in the fill
+path; a wide spread outside the blackout window declines via the widen rather
+than blacking out).
+
+**Config.** New constant `SL_WIDEN_SPREAD_MULTIPLE = 11.0`. New pure helper
+`widen_sl_to_spread_floor(entry, sl, tp, spread, min_r) -> SlWiden` and the
+`SlWiden` enum, both in `core::intent`. `Resolved` gains a `min_r: f64` field
+(the effective R-floor the trade was held to at resolve time) so the enter path
+can re-check the floor against the widened geometry without re-resolving a
+scripted `min_r` tunable.
+
+**Tests.** 8 new unit tests on the widen helper (unchanged / degenerate-spread /
+long-widen / short-widen / below-R-floor reject / min_r-override / wheat-short
+salvage). 756 core tests green; workspace builds (worker wasm + CLI).
+
+**Breaking.** `Resolved` gained a required `min_r` field — any out-of-tree
+struct-literal construction must set it (all in-tree sites updated). Wire format
+unchanged: nothing signed changed, the widen is a pure runtime decision, and
+no intent field was added.
+
+## Unreleased — 2026-06-30 — tv-arm: tolerate degenerate TradingView drawings
+
+**Why.** A `tv-arm-dev` arm on NZD/CAD aborted with
+`tv-mcp draw get kazo98 returned non-JSON output … invalid type: null, expected
+f64`. The chart carried a stray `parallel_channel` whose third anchor read back
+as `{"price": null, …}`. `Point.price` was a plain `f64`, so `serde` rejected
+the **entire** drawing — and because role classification fetches every stub's
+full drawing with `?`, one unrelated degenerate channel stranded the whole
+setup. The channel played no role in the arm at all.
+
+**What changed.**
+- `trading-view::drawings::Point` now tolerates a `null` price (→ `NaN`
+  sentinel) and a `null` time (→ `0` sentinel) via field deserializers, so the
+  parse survives. `Point::is_degenerate()` flags such an anchor;
+  `Drawing::has_degenerate_point()` flags a drawing carrying one.
+- `tv-arm::roles::classify` skips a drawing with a degenerate anchor (a `warn`,
+  then `continue`) instead of aborting. The points are **not** silently dropped
+  — the H&S/fib geometry indexes anchors positionally, so dropping would shift
+  the indices; declining the whole drawing is the safe choice.
+
+**Behaviour.** A stray/half-drawn channel or fib no longer strands a legitimate
+arm. Verified end-to-end against the live chart: the NZD/CAD arm now skips
+`kazo98` and runs to completion (then surfaces a *real* `1 start / 2 end`
+blackout-pairing chart error — the actionable message, not a crash).
+
+**Tests.** `null_price_anchor_parses_as_degenerate`,
+`null_time_anchor_is_degenerate`, `well_formed_drawing_is_not_degenerate`
+(trading-view); `degenerate_drawing_is_skipped_not_fatal` (tv-arm). 174 green
+across the two crates.
+
+**Breaking.** None. `Point`'s public fields keep their `f64`/`i64` types.
+
+## Unreleased — 2026-06-30 — amend_stop no-TP fix (demo-verified) + TN v0.11.0
+
+**Why.** `amend_stop` on a position with **no take-profit** silently failed.
+The adapter sent `existing_tp.unwrap_or(0.0)`, and TradeNation's
+`AmendCloseOrder` (orderModeID 3, "Both") read `0.0` as a real take-profit at
+price 0 — a closing order on the wrong side of the market — and rejected the
+whole amend (`#5-9 "too close to market"`). The stop never moved. This is the
+exact path the **break-even cron** (`breakeven_watch`) and the **spread-blackout
+widen** (`blackout_apply`) depend on, so it was the gate before either could go
+live (TEST-REPORT-amend-stop-on-open-position.md).
+
+**What changed.**
+- Upstream `tradenation-api` (tag **broker-tradenation-v0.11.0**):
+  `amend_order`'s `limit_order_price` is now `Option<f64>`. `Some(tp)` →
+  orderModeID 3 (both legs, unchanged). `None` → orderModeID 2 (Stop only) with
+  `limitOrderPrice: "0"`, which the platform accepts and leaves the TP absent.
+- `broker-tradenation-adapter::amend_stop` now passes
+  `target.existing_take_profit` (the `Option<f64>`) straight through instead of
+  collapsing `None` to `0.0`.
+- Bumped every `tradenation-api` / `broker-tradenation` /
+  `tradenation-instrument-cache` git-dep pin (root, cli, tv-arm, cron, worker,
+  adapter) to **broker-tradenation-v0.11.0** (one tag → no lockfile skew).
+
+**Verified on the experimental DEMO 2026-06-30** via the real
+`TradeNationAdapter::amend_stop` (not a re-implementation):
+- **With TP** — SL moved, TP preserved (Some→Some unchanged). PASS.
+- **No TP** — SL moved, TP stayed absent (None→None, no phantom 0). PASS.
+
+So the break-even stop and the blackout widen are now **clear for live** on the
+amend path. (Earlier, mode 3 + `0.0` was reproduced rejected; mode 2 + `"0"`
+isolated as the fix; a valid-TP control confirmed SL distance was never the
+cause.)
+
+**Breaking.** `tradenation_api::amend_order` /
+`TradeNationClient::amend_order` — `limit_order_price: f64` → `Option<f64>`.
+
+**Tests.** Upstream `amend_order_body` unit tests (mode-3 with-TP, mode-2
+no-TP). Worker workspace green; clippy + fmt clean.
+
+## Unreleased — 2026-06-30 — news-windowed reversal-close: gate on the open window + non-terminal spine
+
+**Why.** A USD/CHF H1 H&S short (replay, `-dev` engine) had its whole plan
+**erased — zero entries** by `06-close-on-reversal`. Two stacked defects:
+
+1. **News-window gate leaked (engine).** The reversal-close is gated
+   `inside_window: ["news"]`, but the engine fired it on a qualifying *long*
+   reversal **9h after `news-end`** (2026-06-26 09:00, the window closed 00:00).
+   Root cause: the engine processed `news-start`/`news-end` control rules but
+   **discarded the open/closed state** — a news-only close was deliberately left
+   to "fire on the detector match alone (the worker's news-window KV gate decides
+   it)". In **replay** there is no such dispatch-time KV gate, so the permissive
+   fire went through unguarded; and even live, the engine had already retired the
+   spine before the worker's `run_close` could decline it.
+
+2. **A gated-off close still retired the spine (engine).** `evaluate_guards` set
+   `Phase::Done` on **every** guard fire. A news-windowed reversal-close is a
+   "flatten *if* in a position" safety, not a thesis invalidation — but it tore
+   the plan down (and starved every pending entry) even when it closed nothing
+   (`allow_close` blocks the flatten when flat).
+
+**What changed (engine — shared across the live worker cron and offline replay).**
+- **`PlanState::open_news_windows: BTreeSet<String>`** — the engine's pure mirror
+  of the worker's `news:<trade_id>:<news_id>` KV entries. `evaluate_controls`
+  inserts a `news_id` on a `NewsStart` fire and removes it on `NewsEnd`. Persisted
+  in the plan-state KV body, so it survives across cron ticks exactly like the
+  rest of the FSM state. `advanced_vs` now counts a window open/close as an
+  advance (so the recording trim doesn't drop the tick).
+- **`eval_pine_guard` gates the news close on an open window.** When the close
+  opted into `inside_window: ["news"]`, it may only fire while `open_news_windows`
+  is non-empty — mirroring `run_close`'s `list_news_windows_for_trade` check.
+  Outside the window → declined, spine untouched. (The price-window gate is
+  unchanged.)
+- **A news-windowed close is non-terminal for the spine** (`guard_is_terminal`).
+  It fires (dispatching the flatten, which the worker / replay `allow_close`
+  gates on the real position) but leaves the phase intact so pending entries
+  survive. A **price-windowed** close (reversal back at the SR band) stays
+  terminal — that *is* the thesis breaking.
+
+**Behaviour.** On the repro plan the spurious 09:00 close is gone; the plan stays
+in `AwaitEntry` past 09:00 and is retired the correct way (the `too-low`
+pcl-exhaustion veto at 06-26 22:00, price having run 80% to TP). A news close
+that *does* fire inside its window no longer starves pending entries.
+
+**Tests.** Engine: `news_close_does_not_fire_when_no_news_window_open`,
+`news_close_fires_while_a_news_window_is_open`,
+`news_close_does_not_fire_after_news_end_closed_the_window`,
+`news_close_is_non_terminal_for_the_spine`, `price_band_close_stays_terminal`;
+plus `PlanState` round-trip / `advanced_vs` coverage for the new field. 90 engine
++ 749 core tests green.
+
+**Follow-up.** The bug report's "expected two entries" wasn't realised — the
+`too-low` veto legitimately aborts the setup at 22:00 (the move completed 80% to
+TP without us). That's a *correct, separate* gate, not part of this fix.
+
+## Unreleased — 2026-06-30 — strategy-v2 entry starvation + preps are life-of-trade (no TTL)
+
+**Why.** A plain iH&S where BCR enters and loses −1R came back as a spurious
+**0R, no entry** under `--strategy-v2` (replay trade 071, GBP/JPY H1). Two
+distinct defects compounded:
+
+1. **break-and-close re-stamp starvation (engine, shared — affects live + replay).**
+   A multi-shot (`--strategy-v2`) plan stays in `Phase::AwaitEntry`, so the
+   break-and-close arm re-runs every bar. `evaluate_break_and_close` had **no
+   latch guard**, so each later neckline re-cross re-stamped `break_close_at`
+   forward — pushing the already-seen retest *before* the new break window, so
+   `retest_satisfied` flipped false and the stop enter was starved forever
+   (re-prepping in place; the prep fired 4× despite `FireMode::Once`). The
+   reported "QM verdict clobbers stop verdict" aggregation theory was wrong; the
+   stop leg never reached `push_fire` because the retest gate re-closed under it.
+
+2. **missing-prep on every preps-gated enter (replay-only regression + a latent
+   wall-clock-TTL trap).** Commit `1c0a043` routed replay enters through the real
+   `run_enter` (whose prep gate is store-backed: `store.get_prep`), but the
+   replay loop never seeded store preps (`Action::Prep` fell into `_ => {}`).
+   Even once seeded, prep TTLs were computed `ttl_hours_until(now, trade_expiry)`
+   — wall-clock-relative — so a `--plan-out` plan armed against a *historical*
+   window (whose `trade_expiry` is already past relative to `now`) collapsed the
+   TTL to the 1h floor, ageing the break-and-close prep out ~12h before the
+   entry bar. Live (future `trade_expiry`) was unaffected, so this was a
+   replay-fidelity bug, not a live one.
+
+**What changed.**
+- **Engine (`engine/src/evaluate.rs`):**
+  - `evaluate_break_and_close` honours its `FireMode::Once` latch (skip if already
+    in `state.fired`), so a re-cross can't walk `break_close_at` forward.
+  - `stamp_retest` now **emits the `04-prep-retest` fire** the bar it stamps (and
+    only once), seeding the store the enter's prep gate reads — exactly as the TV
+    `04-prep-retest` alert did, and as `evaluate_break_and_close` already emitted
+    the break-and-close prep. The engine still validates retest internally via
+    `retest_satisfied`; the fire is what makes the store-backed `run_enter` gate
+    agree.
+- **CLI (`cli/src/trade_patterns.rs`):** the structural trade preps
+  (`break-and-close`, `retest`) are now **no-TTL** (`PREP_NO_EXPIRY_HOURS`, ~100y,
+  mirroring `core::state::NO_TTL_SECONDS`). A prep is a milestone the trade has
+  passed — it lives for the life of the trade and only has to happen once; the
+  trade is retired by its own `trade-expiry` veto, not by a prep ageing out.
+  Drops the now-unused `now` param from both prep builders.
+- **Replay (`cli/src/bin/replay_candles/replay.rs`):** the per-tick dispatch loop
+  routes `Action::Prep` fires through `handle_prep` (→ `set_prep`), mirroring the
+  worker's `dispatch_action` so the store the offline `run_enter` reads is seeded
+  identically.
+
+**Result.** `--strategy-v2` now fires `05-enter` exactly once and matches BCR
+fire-for-fire: both enter at 06-26 23:00 BNE and stop out at **−1R** (was a
+spurious 0R for v2). Verified on the live GBP/JPY chart, before/after.
+
+**Tests.** New `break_and_close_does_not_restamp_after_latching_under_multi_enter`
+(engine). Updated `entry_blocked_until_retest_then_fires_and_done` and
+`stop_enter_fires_only_after_break_and_close_then_retest` to expect the retest
+prep fire ahead of the enter(s). 587 cli+engine+tv-arm tests + 749 core green.
+
+**Follow-up.** Bug report `BUG-replay-strategy-v2-entry-starved-reprepping.md`
+can be closed; its suggested per-leg aggregation fix was not the actual cause.
+
 ## Unreleased — 2026-06-28 — Spread-blackout moved to `core`; replay applies it
 
 **Why.** The spread-blackout entry reject (System 1) lived in
@@ -169,10 +1181,13 @@ arm), CLI (default 50% baked on the enter only; `null` disables; custom carried)
 worker cron (join). Full workspace green; clippy + fmt clean.
 
 **Follow-up.** Tag + deploy **deferred** — `staging` is mid-bake on v60 (the
-week-long promotion gate). Demo-confirm `amend_stop` on an open TN position
-before trusting the live move (shared precondition with the blackout widen).
-The operator's stance ("the SL is handled by the broker") means BE only needs
-to arm once and set the broker-native stop.
+week-long promotion gate). ~~Demo-confirm `amend_stop` on an open TN position
+before trusting the live move~~ — **DONE 2026-06-30** (see the amend_stop no-TP
+fix entry at the top): `amend_stop` is now demo-verified on the experimental
+account for both the with-TP and no-TP cases, after fixing a no-TP rejection
+bug this test surfaced. Shared precondition with the blackout widen is
+satisfied. The operator's stance ("the SL is handled by the broker") means BE
+only needs to arm once and set the broker-native stop.
 ## v61 — 2026-06-28 — ATR-based entry/SL buffer (`offset_atr_pct`)
 
 **Why.** The entry and stop-loss were offset from the signal candle by a

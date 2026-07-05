@@ -23,7 +23,7 @@ trade-calendar-maker = { version = "0.1.0", path = "../../../trade-calendar-make
 trade-control-cli = { version = "0.2.0", path = "../cli" }
 trade-control-conventions = { version = "0.1.0", path = "../conventions" }
 trade-control-core = { version = "0.1.0", path = "../core" }
-tradenation-api = { git = "https://github.com/matiu2/tradenation-api.git", tag = "broker-tradenation-v0.8.0", version = "0.2.0" }
+tradenation-api = { git = "https://github.com/matiu2/tradenation-api.git", tag = "broker-tradenation-v0.11.0", version = "0.3.0" }
 trading-view = { version = "0.1.0", path = "../trading-view" }
 
 [dev-dependencies]

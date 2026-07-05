@@ -5,6 +5,13 @@ edition = "2024"
 
 [dependencies]
 chrono = { version = "0.4.45", default-features = false, features = ["alloc"] }
-oanda-client = { version = "0.2.0", path = "../../oanda-client", default-features = false, features = ["wasm_js"] }
+oanda-client = { version = "0.2.0", path = "../../oanda-client", default-features = false }
 trade-control-core = { version = "0.1.0", path = "../core" }
+tracing = "0.1"
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+# Only the wasm (Cloudflare worker) build pulls in the wasm RNG backend and
+# the `worker` crate. On native, `oanda-client` uses `getrandom`'s default OS
+# backend, and the `worker::Env` login path is `#[cfg]`-gated out.
+oanda-client = { version = "0.2.0", path = "../../oanda-client", default-features = false, features = ["wasm_js"] }
 worker = "0.8"

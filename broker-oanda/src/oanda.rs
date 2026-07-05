@@ -7,8 +7,8 @@ use oanda_client::orders::{
 };
 use oanda_client::positions::ClosePositionResponse;
 use oanda_client::trades::{Trade, TradeQueryParams, TradeState};
+#[cfg(target_arch = "wasm32")]
 use worker::Env;
-use worker::console_error;
 
 use crate::fx::{quote_currency, resolve_quote_to_account_rate};
 use crate::risk;
@@ -17,20 +17,22 @@ use trade_control_core::broker::{
     PendingOrder as CorePendingOrder, Quote,
 };
 use trade_control_core::intent::{Direction, ResolvedEntry, RiskBudget};
-use worker::console_log;
 
 /// Closed-trade scan window. Plan §3 recommends ~50 — large enough to
 /// catch any reasonable retry-window trade, small enough to keep the
 /// per-fire round-trip cheap.
 const CLOSED_TRADE_SCAN_COUNT: i32 = 50;
 
+#[cfg(target_arch = "wasm32")]
 const OANDA_API_KEY: &str = "OANDA_API_KEY";
 pub const OANDA_ACCOUNT_ID: &str = "OANDA_ACCOUNT_ID";
+#[cfg(target_arch = "wasm32")]
 const OANDA_LIVE: &str = "OANDA_LIVE";
 
 /// Parse the worker-global `OANDA_LIVE` secret into a live/practice flag.
 /// Absent / non-`true` → practice. Pure so the parsing is unit-testable
 /// without a Worker `Env`.
+#[cfg(any(target_arch = "wasm32", test))]
 pub(super) fn live_flag_from_secret(raw: Option<String>) -> bool {
     raw.map(|s| s.to_lowercase() == "true").unwrap_or(false)
 }
@@ -38,6 +40,7 @@ pub(super) fn live_flag_from_secret(raw: Option<String>) -> bool {
 /// Log in to oanda using the worker-global `OANDA_LIVE` secret to pick
 /// practice vs live. Used by the legacy global path (`account: None`).
 /// If it can't, it'll log the error and give you nothing.
+#[cfg(target_arch = "wasm32")]
 pub async fn login(env: &Env) -> Option<OandaClient> {
     let live = live_flag_from_secret(super::get_secret(OANDA_LIVE, env));
     login_with_live(env, live).await
@@ -46,11 +49,12 @@ pub async fn login(env: &Env) -> Option<OandaClient> {
 /// Like [`login`] but the caller supplies the live/practice flag
 /// directly — e.g. derived from a named account's `kind` so each account
 /// hits its own OANDA environment regardless of the global `OANDA_LIVE`.
+#[cfg(target_arch = "wasm32")]
 pub async fn login_with_live(env: &Env, live: bool) -> Option<OandaClient> {
     let api_key = match super::get_secret(OANDA_API_KEY, env) {
         Some(s) => s,
         None => {
-            console_error!("missing required secret: {OANDA_API_KEY}");
+            tracing::error!("missing required secret: {OANDA_API_KEY}");
             return None;
         }
     };
@@ -74,7 +78,7 @@ pub async fn close_positions(
             ..
         }) => !related_transaction_ids.is_empty(),
         Err(err) => {
-            console_error!("Error closing positions: {err:?}");
+            tracing::error!("Error closing positions: {err:?}");
             false
         }
     }
@@ -91,7 +95,7 @@ pub async fn cancel_pending_for_instrument(
     let pending = match client.get_pending_orders(account_id).await {
         Ok(p) => p,
         Err(err) => {
-            console_error!("Error fetching pending orders: {err:?}");
+            tracing::error!("Error fetching pending orders: {err:?}");
             return 0;
         }
     };
@@ -99,7 +103,7 @@ pub async fn cancel_pending_for_instrument(
     for order in pending.into_iter().filter(|o| o.instrument == instrument) {
         match client.cancel_order(account_id, &order.id).await {
             Ok(_) => cancelled += 1,
-            Err(err) => console_error!("Error cancelling order {}: {err:?}", order.id),
+            Err(err) => tracing::error!("Error cancelling order {}: {err:?}", order.id),
         }
     }
     cancelled
@@ -125,7 +129,7 @@ pub async fn place_entry(
     }
 
     let account = client.get_account(account_id).await.map_err(|err| {
-        console_error!("get_account: {err:?}");
+        tracing::error!("get_account: {err:?}");
         EntryError::AccountFetch
     })?;
 
@@ -165,7 +169,7 @@ pub async fn place_entry(
     {
         Ok(r) => r,
         Err(err) => {
-            console_error!(
+            tracing::error!(
                 "oanda fx resolve failed instrument={} quote={quote_ccy} account_ccy={account_ccy}: {err}",
                 req.instrument
             );
@@ -221,7 +225,7 @@ pub async fn place_entry(
         }
     };
     let dry = if req.dry_run { "DRY-RUN " } else { "" };
-    console_log!(
+    tracing::info!(
         "{dry}oanda sizing: instrument={} mode={:?} equity={equity} account_ccy={account_ccy} quote_ccy={quote_ccy} fx_quote_to_account={fx_rate} effective_pct={effective_pct:.4} entry_ref={reference_price} sl={} units={units}",
         req.instrument,
         req.risk,
@@ -258,7 +262,7 @@ pub async fn place_entry(
             )
             .await
             .map_err(|err| {
-                console_error!("buy_with_stops: {err:?}");
+                tracing::error!("buy_with_stops: {err:?}");
                 EntryError::OrderRejected
             })?,
         (ResolvedEntry::Market { .. }, Direction::Short) => client
@@ -272,7 +276,7 @@ pub async fn place_entry(
             )
             .await
             .map_err(|err| {
-                console_error!("sell_with_stops: {err:?}");
+                tracing::error!("sell_with_stops: {err:?}");
                 EntryError::OrderRejected
             })?,
         (ResolvedEntry::Stop { trigger_price }, dir) => {
@@ -295,7 +299,7 @@ pub async fn place_entry(
                 .place_stop_order(account_id, order)
                 .await
                 .map_err(|err| {
-                    console_error!("place_stop_order: {err:?}");
+                    tracing::error!("place_stop_order: {err:?}");
                     EntryError::OrderRejected
                 })?
         }
@@ -319,7 +323,7 @@ pub async fn place_entry(
                 .place_limit_order(account_id, order)
                 .await
                 .map_err(|err| {
-                    console_error!("place_limit_order: {err:?}");
+                    tracing::error!("place_limit_order: {err:?}");
                     EntryError::OrderRejected
                 })?
         }
@@ -347,7 +351,7 @@ pub async fn lookup_attempt_state(
     broker_trade_id: Option<&str>,
 ) -> Result<AttemptState, LookupError> {
     let pending = client.get_pending_orders(account_id).await.map_err(|err| {
-        console_error!("oanda lookup get_pending_orders: {err:?}");
+        tracing::error!("oanda lookup get_pending_orders: {err:?}");
         LookupError::Transient
     })?;
 
@@ -358,7 +362,7 @@ pub async fn lookup_attempt_state(
         .get_trades(account_id, Some(open_params))
         .await
         .map_err(|err| {
-            console_error!("oanda lookup get_trades(Open): {err:?}");
+            tracing::error!("oanda lookup get_trades(Open): {err:?}");
             LookupError::Transient
         })?;
 
@@ -374,7 +378,7 @@ pub async fn lookup_attempt_state(
             .get_trades(account_id, Some(closed_params))
             .await
             .map_err(|err| {
-                console_error!("oanda lookup get_trades(Closed): {err:?}");
+                tracing::error!("oanda lookup get_trades(Closed): {err:?}");
                 LookupError::Transient
             })?;
         Some(trades)
@@ -405,7 +409,7 @@ pub async fn cancel_order(
         .await
         .map(|_| ())
         .map_err(|err| {
-            console_error!("oanda cancel_order({broker_order_id}): {err:?}");
+            tracing::error!("oanda cancel_order({broker_order_id}): {err:?}");
             CancelError::Transient
         })
 }
@@ -422,19 +426,19 @@ pub async fn get_quote(
         .get_pricing(account_id, &[instrument])
         .await
         .map_err(|err| {
-            console_error!("oanda get_pricing({instrument}): {err:?}");
+            tracing::error!("oanda get_pricing({instrument}): {err:?}");
             LookupError::Transient
         })?;
     let tick = pricing.prices.first().ok_or_else(|| {
-        console_error!("oanda get_pricing({instrument}): empty prices array");
+        tracing::error!("oanda get_pricing({instrument}): empty prices array");
         LookupError::Transient
     })?;
     let bid = tick.best_bid().ok_or_else(|| {
-        console_error!("oanda get_pricing({instrument}): missing bid");
+        tracing::error!("oanda get_pricing({instrument}): missing bid");
         LookupError::Transient
     })?;
     let ask = tick.best_ask().ok_or_else(|| {
-        console_error!("oanda get_pricing({instrument}): missing ask");
+        tracing::error!("oanda get_pricing({instrument}): missing ask");
         LookupError::Transient
     })?;
     Ok(Quote { bid, ask })
@@ -457,7 +461,7 @@ pub async fn list_open_positions(
         .get_trades(account_id, Some(params))
         .await
         .map_err(|err| {
-            console_error!("oanda list_open_positions get_trades: {err:?}");
+            tracing::error!("oanda list_open_positions get_trades: {err:?}");
             LookupError::Transient
         })?;
     Ok(trades.iter().map(oanda_trade_to_open).collect())
@@ -469,7 +473,7 @@ pub async fn list_pending_orders(
     account_id: &str,
 ) -> Result<Vec<CorePendingOrder>, LookupError> {
     let orders = client.get_pending_orders(account_id).await.map_err(|err| {
-        console_error!("oanda list_pending_orders get_pending_orders: {err:?}");
+        tracing::error!("oanda list_pending_orders get_pending_orders: {err:?}");
         LookupError::Transient
     })?;
     Ok(orders.iter().filter_map(oanda_order_to_pending).collect())
@@ -489,7 +493,7 @@ pub async fn amend_stop(
         .get_trade(account_id, position_or_order_id)
         .await
         .map_err(|err| {
-            console_error!("oanda amend_stop get_trade({position_or_order_id}): {err:?}");
+            tracing::error!("oanda amend_stop get_trade({position_or_order_id}): {err:?}");
             // OANDA returns an error (404) for an unknown trade id; we
             // can't cheaply distinguish 404 from a transient 5xx here, so
             // treat "couldn't fetch the trade" as NotFound — the caller
@@ -506,7 +510,7 @@ pub async fn amend_stop(
         .await
         .map(|_| ())
         .map_err(|err| {
-            console_error!("oanda amend_stop modify_trade_stops({}): {err:?}", trade.id);
+            tracing::error!("oanda amend_stop modify_trade_stops({}): {err:?}", trade.id);
             AmendError::Transient
         })
 }

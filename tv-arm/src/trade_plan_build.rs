@@ -68,10 +68,21 @@ pub fn resolution_to_granularity(resolution: &str) -> Option<Granularity> {
 ///   advances it but never dispatches its fires to the broker (see
 ///   [`TradePlan::shadow`](trade_control_core::trade_plan::TradePlan::shadow)).
 ///   The safe way to diff the engine against the live TV alerts on demo.
-// Eight parameters: each is a distinct chart-derived primitive (id, instrument,
-// alerts, direction, roles, granularity, is_mw, shadow) threaded once from the
-// single pipeline call site. Grouping them into a struct would just move the
-// same fields elsewhere without clarifying anything.
+/// - `replay_start` is the arm-time `--start` cursor (a Unix second), baked onto
+///   the plan so the offline `replay-candles` harness derives a self-consistent
+///   window without reading the TV chart's replay cursor. `None` when `--start`
+///   wasn't passed (see
+///   [`TradePlan::replay_start`](trade_control_core::trade_plan::TradePlan::replay_start)).
+// - `retest_atr_step` is the per-bar ATR-multiple decay of the retest tolerance
+//   (`tv-arm --retest-atr-step`, default
+//   [`DEFAULT_RETEST_ATR_STEP`](trade_control_core::trade_plan::DEFAULT_RETEST_ATR_STEP)),
+//   baked onto the plan's `retest_atr_step`.
+//
+// Ten parameters: each is a distinct chart-derived primitive (id, instrument,
+// alerts, direction, roles, granularity, is_mw, shadow, replay_start,
+// retest_atr_step) threaded once from the single pipeline call site. Grouping
+// them into a struct would just move the same fields elsewhere without
+// clarifying anything.
 #[allow(clippy::too_many_arguments)]
 pub fn build_trade_plan(
     trade_id: &str,
@@ -82,6 +93,8 @@ pub fn build_trade_plan(
     granularity: Granularity,
     is_mw: bool,
     shadow: bool,
+    replay_start: Option<i64>,
+    retest_atr_step: f64,
 ) -> TradePlan {
     let rules = alerts
         .iter()
@@ -96,6 +109,9 @@ pub fn build_trade_plan(
         pip_size: pip_size_of(alerts),
         rules,
         shadow,
+        cross_buffer_pct: trade_control_core::trade_plan::DEFAULT_CROSS_BUFFER_PCT,
+        retest_atr_step,
+        replay_start,
     }
 }
 
@@ -312,19 +328,31 @@ fn invalidation_or_pcl_trigger(
         _ => return None,
     };
     if basename_dir == direction {
-        // Drawing-bound invalidation: short crosses up into the cap, long
-        // crosses down into the floor. Intrabar, fire-once.
+        // Drawing-bound invalidation = the human's **drawn line** (below the
+        // shoulder/head for a long `too-low`, above for a short `too-high`).
+        //
+        // A drawn line is **close-confirmed** (`OnClose`) in *both* directions:
+        // the operator's semantics are "the candle opened one side of my line
+        // and closed the other" — a genuine break. An intrabar spike through the
+        // line that closes back does not invalidate. This is the line-vs-fib
+        // distinction (operator 2026-07-01): the drawn line is close-confirm;
+        // the fib level (the `else` branch) is a wick-through. Direction only
+        // decides which *way* the line is crossed, not the confirm mode.
         let d = roles.invalidation.as_ref()?;
+        let dir = match direction {
+            ConvDirection::Short => CrossDir::Up,  // close above the cap
+            ConvDirection::Long => CrossDir::Down, // close below the floor
+        };
         Some(Trigger::HorizontalCross {
             level: horizontal_level(d)?,
-            dir: match direction {
-                ConvDirection::Short => CrossDir::Up,
-                ConvDirection::Long => CrossDir::Down,
-            },
-            bar: BarEvent::Intrabar,
+            dir,
+            bar: BarEvent::OnClose,
         })
     } else {
-        // Opposite-name veto = pcl-exhausted, a computed price value.
+        // Opposite-name veto = pcl-exhausted, a computed **fib** level ("the
+        // power of the setup has been consumed"). A fib level is a
+        // **wick-through** (`Intrabar`, `Either`): any straddle aborts — if the
+        // move ran ~80% to TP without us, a wick alone is reason enough.
         let fib = roles.tp_fib.as_ref()?;
         Some(Trigger::PriceValueCross {
             level: pcl_exhausted_price_from_fib(&fib.prices(), direction),
@@ -634,6 +662,8 @@ mod tests {
             Granularity::H1,
             false,
             false,
+            None,
+            trade_control_core::trade_plan::DEFAULT_RETEST_ATR_STEP,
         );
 
         assert!(!plan.shadow, "default build is live, not shadow");
@@ -645,13 +675,15 @@ mod tests {
 
         let by_id = |id: &str| plan.rules.iter().find(|r| r.rule_id == id).unwrap();
 
-        // Invalidation: short crosses UP into the cap, intrabar, fire-once.
+        // Invalidation: short crosses UP into the cap, **close-confirmed**
+        // (`OnClose`) — the literal `too-high` cap must close above to
+        // invalidate; a spike-and-recover does not. Fire-once.
         assert!(matches!(
             by_id("01-veto-too-high").trigger,
             Trigger::HorizontalCross {
                 level,
                 dir: CrossDir::Up,
-                bar: BarEvent::Intrabar,
+                bar: BarEvent::OnClose,
             } if (level - 1.2000).abs() < 1e-9
         ));
         // Break-and-close: short closes DOWN through the neckline, OnClose.
@@ -694,6 +726,57 @@ mod tests {
         assert_eq!(enter.fire_mode, FireMode::Once);
     }
 
+    /// The long-side (IH&S) invalidation floor is a **drawn line** (named
+    /// `01-veto-too-low`), so it is **close-confirmed** (`OnClose`) — a bar must
+    /// open above and *close* below the floor to invalidate; an intrabar wick
+    /// through that closes back does not. This is the line-vs-fib rule (operator
+    /// 2026-07-01): the human's drawn line is close-confirm in *both* directions;
+    /// only the computed fib/pcl level is a wick-through. (Supersedes the earlier
+    /// asymmetry where only the short `too-high` cap was close-confirm.)
+    #[test]
+    fn ihs_long_too_low_invalidation_is_close_confirmed() {
+        let alerts = vec![
+            alert("01-veto-too-low", Action::Veto),
+            alert("03-prep-break-and-close", Action::Prep),
+            alert("04-prep-retest", Action::Prep),
+            alert("02-veto-trade-expiry", Action::Invalidate),
+            alert("05-enter", Action::Enter),
+        ];
+        let roles = Roles {
+            invalidation: Some(horz(1.1000)),
+            break_and_close: Some(trend((10, 1.1100), (20, 1.1150))),
+            retest: Some(trend((10, 1.1100), (20, 1.1150))),
+            trade_expiry: Some(vert(99_000)),
+            ..Roles::default()
+        };
+
+        let plan = build_trade_plan(
+            "eurusd-ihs-1",
+            "EUR_USD",
+            &alerts,
+            ConvDirection::Long,
+            &roles,
+            Granularity::H1,
+            false,
+            false,
+            None,
+            trade_control_core::trade_plan::DEFAULT_RETEST_ATR_STEP,
+        );
+
+        let by_id = |id: &str| plan.rules.iter().find(|r| r.rule_id == id).unwrap();
+
+        // Long invalidation floor: a drawn line → crosses DOWN into the floor,
+        // close-confirmed (OnClose).
+        assert!(matches!(
+            by_id("01-veto-too-low").trigger,
+            Trigger::HorizontalCross {
+                level,
+                dir: CrossDir::Down,
+                bar: BarEvent::OnClose,
+            } if (level - 1.1000).abs() < 1e-9
+        ));
+    }
+
     /// A built plan survives the exact JSON round-trip that `--plan-out` writes
     /// and the offline `replay-candles` harness reads back. Guards the contract
     /// between tv-arm dumping the plan and the harness deserialising it: every
@@ -723,6 +806,8 @@ mod tests {
             Granularity::H1,
             false,
             false,
+            None,
+            trade_control_core::trade_plan::DEFAULT_RETEST_ATR_STEP,
         );
 
         // This is exactly what `register_trade_plan` writes for `--plan-out`.
@@ -787,6 +872,8 @@ mod tests {
             Granularity::H1,
             true,
             false,
+            None,
+            trade_control_core::trade_plan::DEFAULT_RETEST_ATR_STEP,
         );
         let by_id = |id: &str| plan.rules.iter().find(|r| r.rule_id == id).unwrap();
 
@@ -832,6 +919,8 @@ mod tests {
             Granularity::H1,
             false,
             false,
+            None,
+            trade_control_core::trade_plan::DEFAULT_RETEST_ATR_STEP,
         );
         assert!(plan.rules.is_empty());
     }
@@ -850,8 +939,51 @@ mod tests {
             Granularity::H1,
             true,
             true,
+            None,
+            trade_control_core::trade_plan::DEFAULT_RETEST_ATR_STEP,
         );
         assert!(plan.shadow, "shadow=true must reach the built plan");
+    }
+
+    #[test]
+    fn retest_atr_step_carried_onto_plan() {
+        let alerts = vec![alert("05-enter", Action::Enter)];
+        // A custom step threads through to the signed plan field.
+        let custom = build_trade_plan(
+            "t",
+            "EUR_USD",
+            &alerts,
+            ConvDirection::Short,
+            &Roles::default(),
+            Granularity::H1,
+            false,
+            false,
+            None,
+            0.2,
+        );
+        assert!(
+            (custom.retest_atr_step - 0.2).abs() < 1e-9,
+            "--retest-atr-step value must reach the built plan, got {}",
+            custom.retest_atr_step
+        );
+        // The pipeline passes the default const when the flag is absent.
+        let defaulted = build_trade_plan(
+            "t",
+            "EUR_USD",
+            &alerts,
+            ConvDirection::Short,
+            &Roles::default(),
+            Granularity::H1,
+            false,
+            false,
+            None,
+            trade_control_core::trade_plan::DEFAULT_RETEST_ATR_STEP,
+        );
+        assert!(
+            (defaulted.retest_atr_step - 0.075).abs() < 1e-9,
+            "default step is 0.075, got {}",
+            defaulted.retest_atr_step
+        );
     }
 
     // ===== append_control_rules =====
@@ -927,6 +1059,8 @@ mod tests {
             Granularity::H1,
             false,
             false,
+            None,
+            trade_control_core::trade_plan::DEFAULT_RETEST_ATR_STEP,
         );
         assert_eq!(plan.rules.len(), 1, "just the enter before appending");
 

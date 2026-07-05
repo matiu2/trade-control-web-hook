@@ -25,15 +25,15 @@ use trade_control_cli::{
     AdoptBody, BuildStrictness, CalendarBarsArgs, KEY_LEN, TradePattern, add_account, adopt_trade,
     build_clear_prep_intent, build_clear_veto_intent, build_market_info_intent,
     build_news_from_spec, build_pause_from_spec, build_plan_delete_intent, build_plan_list_intent,
-    build_plan_purge_intent, build_plan_show_intent, build_prep_intent,
-    build_purge_older_than_intent, build_status_intent, build_trade_from_spec,
-    build_trade_interactive, build_unlock_intent, build_veto_intent, delete_account, delete_secret,
-    fill_missing_fields, generate_key_hex, list_accounts, load_cache, load_news_spec_from_file,
-    load_pause_spec_from_file, load_spec_from_file, pick_pattern_interactive,
-    pick_template_interactive, prompt_save_as_template, put_secret, record_account_use,
-    record_prep_use, record_veto_use, require_local_tn_account, run_calendar_bars,
-    secret_binding_for, test_account, validate_instrument, wrap_signed, wrap_signed_template,
-    write_news, write_pause, write_trade,
+    build_plan_purge_intent, build_plan_show_intent, build_plan_timeline_intent, build_prep_intent,
+    build_purge_older_than_intent, build_register_intent, build_status_intent,
+    build_trade_from_spec, build_trade_interactive, build_unlock_intent, build_veto_intent,
+    delete_account, delete_secret, fill_missing_fields, generate_key_hex, list_accounts,
+    load_cache, load_news_spec_from_file, load_pause_spec_from_file, load_spec_from_file,
+    pick_pattern_interactive, pick_template_interactive, prompt_save_as_template, put_secret,
+    record_account_use, record_prep_use, record_veto_use, require_local_tn_account,
+    run_calendar_bars, secret_binding_for, test_account, validate_instrument, wrap_signed,
+    wrap_signed_template, write_news, write_pause, write_trade,
 };
 use trade_control_core::account::{
     AccountKind, AccountMetadata, Credentials, TradeNationCreds, TradeNationKind,
@@ -41,6 +41,7 @@ use trade_control_core::account::{
 use trade_control_core::incoming::signed_pairs_from_text;
 use trade_control_core::intent::Intent;
 use trade_control_core::intent::{BrokerKind, Direction, VetoLevel};
+use trade_control_core::recording::PlanTimeline;
 use trade_control_core::sig::{self, SIG_FIELD};
 
 #[derive(Parser)]
@@ -173,11 +174,27 @@ enum PlanCmd {
     /// Dump one plan in full — every rule plus its persisted engine state.
     /// The worker scans all account scopes for the `trade_id`.
     Show(PlanShowArgs),
+    /// Reconstruct the event timeline for one trade from the worker's durable
+    /// per-request recordings — what fired and when (enters, vetoes, preps and
+    /// their dispatch outcomes), oldest first. The local-Postgres successor to
+    /// the retired R2/Cloudflare-log reconstruction. `plan show` gives the
+    /// final engine state; this gives the ordered event trail behind it.
+    Timeline(PlanTimelineArgs),
     /// Export one plan exactly as it was imported — the bare `TradePlan` body,
     /// encoded the same single-line flow JSON `register` puts on the wire. The
     /// inverse of arming: re-registerable as-is. (Unlike `show`, which wraps the
     /// plan with engine state; this is *just* the plan.)
     Export(PlanExportArgs),
+    /// Register a bare `TradePlan` JSON file with the worker's engine — the
+    /// programmatic counterpart of `tv-arm --register-plan`, but POSTable to
+    /// **any** `--endpoint` (so a `tv-arm --plan-out plan.json` build can be
+    /// armed against a local/native worker, not only the baked webhook). The
+    /// plan rides one signed `register` carrier intent (whole-body HMAC); the
+    /// `--account-id` scopes it (`plan:{account}:{trade_id}`) and must match the
+    /// account the trade's vetos/preps use. Re-registering the same `trade_id`
+    /// mints a fresh carrier id, so the seen-id replay check won't reject it;
+    /// `plan delete <id>` first if you want the old engine state cleared.
+    Register(PlanRegisterArgs),
     /// Delete a registered plan and its engine state — the inverse of
     /// register. The worker scans all account scopes and drops the matching
     /// `plan:` + `plan-state:` rows. Idempotent (deleting a missing plan is a
@@ -224,9 +241,44 @@ struct PlanShowArgs {
 }
 
 #[derive(Parser)]
+struct PlanTimelineArgs {
+    /// The trade's `trade_id` (e.g. `hs-nzd-chf-d12eb831`) — matched exactly
+    /// against the recorded `trade_id`, returning every event for that trade.
+    trade_id: String,
+    /// Print the worker's raw YAML response (the `{records, ticks}` envelope)
+    /// instead of the rendered timeline.
+    #[arg(long, conflicts_with = "json")]
+    yaml: bool,
+    /// Print the `{records, ticks}` envelope as pretty JSON. Handy for `jq`.
+    #[arg(long, conflicts_with = "yaml")]
+    json: bool,
+    /// Show the bar-by-bar engine trace and every recorded alert `logs[]` line.
+    /// Without it, only the fire blocks and error lines are shown (the signal,
+    /// not the chatter).
+    #[arg(long)]
+    verbose: bool,
+    #[command(flatten)]
+    common: EndpointArgs,
+}
+
+#[derive(Parser)]
 struct PlanExportArgs {
     /// The plan's `trade_id` (e.g. `eurusd-hs-7`).
     trade_id: String,
+    #[command(flatten)]
+    common: EndpointArgs,
+}
+
+#[derive(Parser)]
+struct PlanRegisterArgs {
+    /// Path to a bare `TradePlan` JSON file (e.g. the output of
+    /// `tv-arm --plan-out plan.json`).
+    plan_file: PathBuf,
+    /// Operator account name that scopes the plan (`plan:{account}:{trade_id}`).
+    /// Must match the account the trade's vetos/preps use. Omit to keep the
+    /// legacy global `_` scope (then `plan list` shows `-` under ACCOUNT).
+    #[arg(long)]
+    account_id: Option<String>,
     #[command(flatten)]
     common: EndpointArgs,
 }
@@ -1207,7 +1259,9 @@ fn run_plan(sub: PlanCmd) -> Result<()> {
     match sub {
         PlanCmd::List(args) => run_plan_list(args),
         PlanCmd::Show(args) => run_plan_show(args),
+        PlanCmd::Timeline(args) => run_plan_timeline(args),
         PlanCmd::Export(args) => run_plan_export(args),
+        PlanCmd::Register(args) => run_plan_register(args),
         PlanCmd::Delete(args) => run_plan_delete(args),
         PlanCmd::Purge(args) => run_plan_purge(args),
     }
@@ -1261,6 +1315,210 @@ fn run_plan_show(args: PlanShowArgs) -> Result<()> {
     Ok(())
 }
 
+/// `plan timeline <trade_id>` — reconstruct the ordered event trail for one
+/// trade from the worker's `request_records`. Compact event view by default
+/// (`--verbose` for every log line); `--yaml`/`--json` for the raw records.
+fn run_plan_timeline(args: PlanTimelineArgs) -> Result<()> {
+    let key = load_key(&args.common.key_file)?;
+    let now = Utc::now();
+    let suffix = fresh_suffix()?;
+    let intent = build_plan_timeline_intent(&args.trade_id, now, &suffix);
+    let body = wrap_control(&intent, &key, now)?;
+    // A trade with no recordings is a 404; `post_control` surfaces the worker's
+    // body ("no recorded events for trade_id …") as an `Err` via `?`.
+    let response = post_control(&args.common.endpoint, &body)?;
+    if args.yaml {
+        print_raw(&response);
+        return Ok(());
+    }
+    if args.json {
+        // Round-trip YAML → PlanTimeline → pretty JSON so `--json` matches `plan
+        // show --json`'s jq-friendly shape (a `{records, ticks}` object).
+        let timeline: PlanTimeline = serde_yaml::from_str(&response)
+            .map_err(|e| eyre!("plan-timeline: parse worker YAML: {e}"))?;
+        let json = serde_json::to_string_pretty(&timeline)
+            .map_err(|e| eyre!("plan-timeline: serialise JSON: {e}"))?;
+        println!("{json}");
+        return Ok(());
+    }
+    print!(
+        "{}",
+        format_plan_timeline(&args.trade_id, &response, args.verbose)?
+    );
+    Ok(())
+}
+
+/// Format a UTC instant as Brisbane time (`+10:00`, no DST) — the same zone the
+/// `replay-candles` report uses so both tools read identically. Kept local
+/// (the replay binary's `bne` isn't importable across binaries) and tiny.
+fn bne(dt: chrono::DateTime<Utc>) -> String {
+    let brisbane = chrono::FixedOffset::east_opt(10 * 3600).expect("10h is a valid fixed offset");
+    dt.with_timezone(&brisbane)
+        .format("%Y-%m-%d %H:%M:%S %:z")
+        .to_string()
+}
+
+/// Render the worker's [`PlanTimeline`] YAML in the same style as the
+/// `replay-candles` report — but from **recorded facts only**, never a
+/// re-simulation. The two tools now read alike; the crucial difference is that
+/// `replay-candles` *computes* the order bracket, fill, break-even and SL-widen
+/// by walking the price path, whereas this shows only what the worker actually
+/// *recorded*: which rule fired on which bar, the engine's phase transition, and
+/// the real dispatch outcome (`Ok(entered)` / `rejected: trade-already-open` /
+/// …). There is deliberately **no** `order:` bracket, `fill:`, `be:` or `exit:`
+/// line — those weren't recorded, so inventing them would be fiction.
+///
+/// Layout, driven by the cron-engine `tick_bundles` (the source of truth for
+/// what fired live):
+///
+/// * a header `Plan <id> (<instrument>, <gran>) — N fire(s) over the window`;
+/// * under `--verbose`, a bar-by-bar engine trace: every tick that did
+///   something (a phase move or a fire), reconstructed from each bundle's
+///   `prior_state` → `eval.new_state` diff plus `eval.fired`;
+/// * one `•` block per fired intent: `<rule> <Action> @ <bar>  close=<c>` and,
+///   below it, the recorded `dispatch:` outcome (a non-enter fire is annotated
+///   `(non-enter fire — dispatch only)`).
+///
+/// Inbound signed-alert `records` (preps/vetoes arriving over HTTP) are folded
+/// in as `⊙` lines by timestamp, so an alert that armed the plan sits in order
+/// next to the engine ticks that acted on it.
+fn format_plan_timeline(trade_id: &str, response: &str, verbose: bool) -> Result<String> {
+    use std::fmt::Write as _;
+
+    let timeline: PlanTimeline = serde_yaml::from_str(response)
+        .map_err(|e| eyre!("plan-timeline: parse worker YAML: {e}"))?;
+
+    let mut out = String::new();
+
+    // Header — pull plan identity from the first recorded tick (every bundle
+    // carries the same plan). With no ticks (records-only history) fall back to
+    // the bare trade_id so the tool still renders something useful.
+    let total_fires: usize = timeline.ticks.iter().map(|b| b.eval.fired.len()).sum();
+    match timeline.ticks.first() {
+        Some(b) => {
+            let _ = writeln!(
+                out,
+                "Plan {} ({}, {:?}) — {} fire(s) over the window",
+                b.plan.trade_id, b.plan.instrument, b.plan.granularity, total_fires
+            );
+        }
+        None => {
+            let _ = writeln!(out, "Plan {trade_id} — no engine ticks recorded");
+        }
+    }
+
+    if verbose {
+        out.push_str(&render_timeline_trace(&timeline));
+    }
+
+    // Per-fire blocks, in bar order across every tick. A tick's `dispatch_outcomes`
+    // are keyed by `rule_id`, so match each fired rule to its recorded outcome.
+    for bundle in &timeline.ticks {
+        for fired in &bundle.eval.fired {
+            let intent = &fired.intent;
+            let candle = &fired.candle;
+            let _ = writeln!(
+                out,
+                "\n• {} {:?} @ {}  close={}",
+                fired.rule_id,
+                intent.action,
+                bne(candle.time),
+                candle.c
+            );
+            let outcome = bundle
+                .dispatch_outcomes
+                .iter()
+                .find(|d| d.rule_id == fired.rule_id)
+                .map(|d| d.outcome.as_str());
+            match (intent.action, outcome) {
+                // An enter/close/veto that dispatched — show the recorded verdict.
+                (_, Some(o)) => {
+                    let _ = writeln!(out, "    dispatch: {o}   [recorded]");
+                }
+                // Fired but no dispatch outcome recorded: a shadow tick dispatches
+                // nothing, and a non-enter fire (veto/prep) may carry no outcome
+                // string. Say so rather than leave the block dangling.
+                (trade_control_core::intent::Action::Enter, None) if bundle.shadow => {
+                    let _ = writeln!(out, "    dispatch: (shadow tick — not dispatched)");
+                }
+                (_, None) => {
+                    let _ = writeln!(out, "    (non-enter fire — dispatch only)");
+                }
+            }
+        }
+    }
+
+    // Inbound alerts, folded in by timestamp as their own `⊙` lines. These are
+    // the signed POSTs (preps/vetoes/enters arriving over HTTP) that armed or
+    // controlled the plan, distinct from the engine ticks that acted on them.
+    if !timeline.records.is_empty() {
+        out.push_str("\nInbound alerts (HTTP):\n");
+        for rec in &timeline.records {
+            let ts = chrono::DateTime::parse_from_rfc3339(&rec.ts)
+                .map(|dt| bne(dt.with_timezone(&Utc)))
+                .unwrap_or_else(|_| rec.ts.clone());
+            let _ = writeln!(
+                out,
+                "  ⊙ {ts}  {outcome} ({status})  [{rid}]",
+                outcome = rec.outcome,
+                status = rec.status,
+                rid = rec.request_id,
+            );
+            for line in &rec.logs {
+                if verbose || line.level == "error" {
+                    let _ = writeln!(
+                        out,
+                        "      {lvl:>5}  {msg}",
+                        lvl = line.level,
+                        msg = line.msg
+                    );
+                }
+            }
+        }
+    }
+
+    Ok(out)
+}
+
+/// The `--verbose` bar-by-bar engine trace, in the `replay-candles` style but
+/// reconstructed from recorded ticks: for each tick that wasn't quiet, one
+/// indented block showing the phase after the tick, any phase transition
+/// (`prior_state.phase → eval.new_state.phase`), and the rules it fired. A tick
+/// that neither moved the phase nor fired anything is skipped, so the trace
+/// shows only bars where the engine did something.
+fn render_timeline_trace(timeline: &PlanTimeline) -> String {
+    use std::fmt::Write as _;
+
+    let mut out = String::from("\nBar-by-bar engine trace (--verbose):\n");
+    let mut any = false;
+    for bundle in &timeline.ticks {
+        let before = &bundle.prior_state.phase;
+        let after = &bundle.eval.new_state.phase;
+        let moved = before != after;
+        let fired: Vec<&str> = bundle
+            .eval
+            .fired
+            .iter()
+            .map(|f| f.rule_id.as_str())
+            .collect();
+        if !moved && fired.is_empty() {
+            continue; // quiet bar
+        }
+        any = true;
+        let _ = writeln!(out, "  bar {} phase={after:?}", bne(bundle.tick_ts));
+        if moved {
+            let _ = writeln!(out, "    phase {before:?}→{after:?}");
+        }
+        for rule in &fired {
+            let _ = writeln!(out, "    → fired {rule}");
+        }
+    }
+    if !any {
+        out.push_str("  (no phase moves or fires — every tick seeded silently)\n");
+    }
+    out
+}
+
 /// `plan export <trade_id>` — emit the bare `TradePlan` body exactly as it was
 /// imported, one match per line in the same single-line flow JSON `register`
 /// puts on the wire. Re-registerable as-is. Goes through the same read-only
@@ -1306,6 +1564,32 @@ fn format_plan_export(response: &str) -> Result<String> {
         out.push('\n');
     }
     Ok(out)
+}
+
+/// `plan register <plan.json>` — POST a bare `TradePlan` JSON to any
+/// `--endpoint` as one signed `register` carrier. The programmatic counterpart
+/// of `tv-arm --register-plan`, but endpoint-overridable (the arming pipeline
+/// only POSTs to the compiled-in `BAKED_WEBHOOK`), so a `tv-arm --plan-out`
+/// build can be armed against a local/native worker. Prints the worker's
+/// response verbatim.
+fn run_plan_register(args: PlanRegisterArgs) -> Result<()> {
+    let key = load_key(&args.common.key_file)?;
+    let now = Utc::now();
+    let suffix = fresh_suffix()?;
+
+    // Read + parse the bare TradePlan. A malformed/empty file is a clear
+    // operator error (wrong path, or a `plan show` dump rather than the bare
+    // `plan export` / `--plan-out` body), so surface the parse error directly.
+    let text = std::fs::read_to_string(&args.plan_file)
+        .map_err(|e| eyre!("read plan file {}: {e}", args.plan_file.display()))?;
+    let plan: trade_control_core::trade_plan::TradePlan = serde_json::from_str(&text)
+        .map_err(|e| eyre!("parse TradePlan from {}: {e}", args.plan_file.display()))?;
+
+    let intent = build_register_intent(plan, args.account_id.as_deref(), now, &suffix);
+    let body = wrap_control(&intent, &key, now)?;
+    let response = post_control(&args.common.endpoint, &body)?;
+    print_raw(&response);
+    Ok(())
 }
 
 /// `plan delete <trade_id>` — drop a registered plan and its engine state.
@@ -2350,6 +2634,306 @@ reset_time: 10:00 PM
         );
         assert!(out.contains("trade_id: eurusd-hs-7"));
         assert!(out.contains("phase: await_entry"));
+    }
+
+    /// Two recorded requests for one trade: a veto fire (with a plain log line)
+    /// and an enter that errored, plus an empty `ticks` stream. Mirrors the
+    /// worker's `PlanTimeline` envelope YAML.
+    fn timeline_fixture() -> &'static str {
+        "\
+records:
+- ts: '2026-06-18T19:15:00Z'
+  request_id: aaa111
+  method: POST
+  path: /
+  headers: []
+  body: 'action: veto'
+  intent_id: hs-nzd-chf-d12eb831-too-high
+  trade_id: hs-nzd-chf-d12eb831
+  status: 200
+  outcome: veto-set
+  logs:
+  - level: log
+    msg: 'veto too-high set'
+- ts: '2026-06-18T22:30:00Z'
+  request_id: bbb222
+  method: POST
+  path: /
+  headers: []
+  body: 'action: enter'
+  intent_id: hs-nzd-chf-d12eb831-enter
+  trade_id: hs-nzd-chf-d12eb831
+  status: 412
+  outcome: 'rejected: veto-active (too-high)'
+  logs:
+  - level: log
+    msg: 'entry id=hs-nzd-chf-d12eb831-enter'
+  - level: error
+    msg: 'blocked by veto too-high'
+ticks: []
+"
+    }
+
+    /// A `PlanTimeline` with one inbound record and one cron-engine tick that
+    /// fired the enter (and finished the plan). The tick's `tick_ts` falls
+    /// *between* the record's ts and a later ts, so it exercises the interleave
+    /// sort. Built with the minimum bundle fields the renderer reads
+    /// (`tick_ts`, `eval.fired[].rule_id`, `eval.done`, `shadow`,
+    /// `dispatch_outcomes`).
+    fn timeline_with_tick_fixture() -> &'static str {
+        "\
+records:
+- ts: '2026-06-18T19:15:00Z'
+  request_id: aaa111
+  method: POST
+  path: /
+  headers: []
+  body: 'action: prep'
+  intent_id: hs-nzd-chf-d12eb831-prep
+  trade_id: hs-nzd-chf-d12eb831
+  status: 200
+  outcome: prep-set
+  logs: []
+ticks:
+- schema_version: 1
+  tick_ts: '2026-06-18T20:00:00Z'
+  correlation_id: hs-nzd-chf-d12eb831
+  account: experimental
+  request_id: hs-nzd-chf-d12eb831@2026-06-18T20:00:00Z
+  plan:
+    trade_id: hs-nzd-chf-d12eb831
+    instrument: NZD/CHF
+    direction: short
+    granularity: h1
+    pip_size: 0.0001
+    rules: []
+    shadow: false
+  prior_state:
+    watermark: '2026-06-18T19:00:00Z'
+    phase: await_entry
+    fired: []
+    last_close: {}
+    break_close_at: null
+    retest_seen_at: null
+    mw: null
+    expires_at: '2026-06-19T20:00:00Z'
+  new_candles: []
+  detector_window: []
+  now: '2026-06-18T20:00:00Z'
+  expires_at: '2026-06-19T20:00:00Z'
+  eval:
+    fired:
+    - rule_id: 05-enter
+      intent:
+        v: 1
+        id: hs-nzd-chf-d12eb831-enter
+        not_after: '2026-06-21T21:16:50Z'
+        action: enter
+        instrument: NZD/CHF
+        direction: short
+        broker: tradenation
+        account: experimental
+        trade_id: hs-nzd-chf-d12eb831
+      candle:
+        time: '2026-06-18T19:00:00Z'
+        o: 0.5
+        h: 0.51
+        l: 0.49
+        c: 0.5
+      signal: null
+    new_state:
+      watermark: '2026-06-18T19:00:00Z'
+      phase: done
+      fired:
+      - 05-enter
+      last_close: {}
+      break_close_at: null
+      retest_seen_at: null
+      mw: null
+      expires_at: '2026-06-19T20:00:00Z'
+    done: true
+  shadow: false
+  dispatch_outcomes:
+  - rule_id: 05-enter
+    intent_id: hs-nzd-chf-d12eb831-enter
+    outcome: Ok(entered)
+    seq: 0
+  kv:
+    key: 'plan-state:experimental:hs-nzd-chf-d12eb831'
+    before: null
+    after: null
+    cleared_plan: true
+    success: true
+    error: null
+"
+    }
+
+    #[test]
+    fn plan_timeline_records_only_renders_inbound_alerts() {
+        // No ticks recorded (records-only history): header falls back to the
+        // bare trade_id, and the two inbound alerts render under the HTTP
+        // section. Compact mode shows only the error-level log line.
+        let out = format_plan_timeline("hs-nzd-chf-d12eb831", timeline_fixture(), false).unwrap();
+        assert!(
+            out.starts_with("Plan hs-nzd-chf-d12eb831 — no engine ticks recorded\n"),
+            "got: {out}"
+        );
+        assert!(out.contains("Inbound alerts (HTTP):"));
+        // Both alerts present, Brisbane-stamped (19:15Z → 05:15+10 next day).
+        assert!(out.contains("veto-set (200)  [aaa111]"), "got: {out}");
+        assert!(
+            out.contains("rejected: veto-active (too-high) (412)  [bbb222]"),
+            "got: {out}"
+        );
+        // Error line shown; the plain `log` lines are suppressed in compact mode.
+        assert!(out.contains("blocked by veto too-high"));
+        assert!(!out.contains("veto too-high set"));
+        assert!(!out.contains("entry id=hs-nzd-chf-d12eb831-enter"));
+    }
+
+    #[test]
+    fn plan_timeline_verbose_shows_every_log_line() {
+        let out = format_plan_timeline("hs-nzd-chf-d12eb831", timeline_fixture(), true).unwrap();
+        assert!(out.contains("veto too-high set"));
+        assert!(out.contains("entry id=hs-nzd-chf-d12eb831-enter"));
+        assert!(out.contains("blocked by veto too-high"));
+    }
+
+    #[test]
+    fn plan_timeline_replay_style_header_and_fire_block() {
+        // A tick that fired the enter: header carries the plan identity + fire
+        // count, and the fire block shows `<rule> Enter @ <bar>  close=…` with
+        // the recorded dispatch outcome underneath.
+        let out = format_plan_timeline("hs-nzd-chf-d12eb831", timeline_with_tick_fixture(), false)
+            .unwrap();
+        assert!(
+            out.starts_with("Plan hs-nzd-chf-d12eb831 (NZD/CHF, H1) — 1 fire(s) over the window\n"),
+            "got: {out}"
+        );
+        // The fire block: rule, action, Brisbane bar time, close, then dispatch.
+        assert!(
+            out.contains("• 05-enter Enter @ 2026-06-19 05:00:00 +10:00  close=0.5"),
+            "got: {out}"
+        );
+        assert!(
+            out.contains("dispatch: Ok(entered)   [recorded]"),
+            "got: {out}"
+        );
+        // The inbound prep alert is folded in under the HTTP section.
+        assert!(out.contains("Inbound alerts (HTTP):"), "got: {out}");
+        assert!(out.contains("prep-set (200)  [aaa111]"), "got: {out}");
+    }
+
+    #[test]
+    fn plan_timeline_verbose_trace_shows_phase_transition_and_fire() {
+        // The `--verbose` bar-by-bar trace reconstructs the phase move from the
+        // bundle's prior_state→new_state diff (await_entry → done) plus the fire.
+        let out = format_plan_timeline("hs-nzd-chf-d12eb831", timeline_with_tick_fixture(), true)
+            .unwrap();
+        assert!(
+            out.contains("Bar-by-bar engine trace (--verbose):"),
+            "got: {out}"
+        );
+        assert!(
+            out.contains("bar 2026-06-19 06:00:00 +10:00 phase=Done"),
+            "got: {out}"
+        );
+        assert!(out.contains("phase AwaitEntry→Done"), "got: {out}");
+        assert!(out.contains("→ fired 05-enter"), "got: {out}");
+    }
+
+    #[test]
+    fn plan_timeline_non_enter_fire_shows_dispatch_only_note() {
+        // A tick with no ticks-side dispatch outcome for its fired rule renders
+        // the `(non-enter fire — dispatch only)` note rather than a dangling
+        // block. Empty `fired` → 0-fire header, non-empty fired w/o outcome →
+        // the note.
+        let inline = "\
+records: []
+ticks:
+- schema_version: 1
+  tick_ts: '2026-06-18T20:00:00Z'
+  correlation_id: t
+  account: null
+  request_id: t@2026-06-18T20:00:00Z
+  plan:
+    trade_id: t
+    instrument: NZD/CHF
+    direction: short
+    granularity: h1
+    pip_size: 0.0001
+    rules: []
+    shadow: false
+  prior_state:
+    watermark: '2026-06-18T19:00:00Z'
+    phase: await_entry
+    fired: []
+    last_close: {}
+    break_close_at: null
+    retest_seen_at: null
+    mw: null
+    expires_at: '2026-06-19T20:00:00Z'
+  new_candles: []
+  detector_window: []
+  now: '2026-06-18T20:00:00Z'
+  expires_at: '2026-06-19T20:00:00Z'
+  eval:
+    fired:
+    - rule_id: 01-veto-too-high
+      intent:
+        v: 1
+        id: t-too-high
+        not_after: '2026-06-21T21:16:50Z'
+        action: veto
+        instrument: NZD/CHF
+        direction: short
+        broker: tradenation
+        account: null
+        trade_id: t
+      candle:
+        time: '2026-06-18T19:00:00Z'
+        o: 0.5
+        h: 0.51
+        l: 0.49
+        c: 0.51298
+      signal: null
+    new_state:
+      watermark: '2026-06-18T19:00:00Z'
+      phase: done
+      fired:
+      - 01-veto-too-high
+      last_close: {}
+      break_close_at: null
+      retest_seen_at: null
+      mw: null
+      expires_at: '2026-06-19T20:00:00Z'
+    done: true
+  shadow: false
+  dispatch_outcomes: []
+  kv:
+    key: 'plan-state::t'
+    before: null
+    after: null
+    cleared_plan: true
+    success: true
+    error: null
+";
+        let out = format_plan_timeline("t", inline, false).unwrap();
+        // The veto fire renders, with the dispatch-only note (no recorded
+        // outcome string for it).
+        assert!(
+            out.contains("• 01-veto-too-high Veto @ 2026-06-19 05:00:00 +10:00  close=0.51298"),
+            "got: {out}"
+        );
+        assert!(
+            out.contains("(non-enter fire — dispatch only)"),
+            "got: {out}"
+        );
+        // Header counts the single fire.
+        assert!(
+            out.starts_with("Plan t (NZD/CHF, H1) — 1 fire(s) over the window\n"),
+            "got: {out}"
+        );
     }
 
     #[test]

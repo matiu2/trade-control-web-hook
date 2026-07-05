@@ -151,17 +151,27 @@ pub struct Args {
     /// the old one stops ticking). Use after moving annotations on the chart
     /// and re-running. Only meaningful with `--register-plan`.
     ///
-    /// - **`--update`** (no value): auto-resolves the target by instrument —
+    /// This is a **replace**, not an in-place patch: the new plan gets a fresh
+    /// `trade_id` and a blank engine state (phase, vetos, seen-ids,
+    /// entry-attempts, news/blackout windows are all keyed by trade_id, so none
+    /// carry over). Safe as a clean re-arm *before* entry; once a plan has a
+    /// live resting order or open position, replacing it can strand that
+    /// order/position — the new plan can't see it (`--replace` reconciles only
+    /// KV, never the broker).
+    ///
+    /// - **`--replace`** (no value): auto-resolves the target by instrument —
     ///   if exactly one plan is registered for this instrument it's deleted; if
     ///   none, it's a no-op; if more than one, it's a hard error (pass the id).
-    /// - **`--update <trade-id>`**: deletes exactly that plan, no matter how
+    /// - **`--replace <trade-id>`**: deletes exactly that plan, no matter how
     ///   many are registered. The trade_id comes from `trade-control plan list`.
     ///
     /// Leaves TradingView alerts untouched — this reconciles only the engine
     /// plan. (tv-arm mints a fresh random trade_id each run, so without
-    /// `--update` a re-arm leaves the old plan ticking until its TTL.)
-    #[arg(long, num_args = 0..=1, default_missing_value = "")]
-    pub update: Option<String>,
+    /// `--replace` a re-arm leaves the old plan ticking until its TTL.)
+    ///
+    /// `--update` is a deprecated alias for `--replace` (same behaviour).
+    #[arg(long, visible_alias = "update", num_args = 0..=1, default_missing_value = "")]
+    pub replace: Option<String>,
 
     /// Register the plan in **observe-only (shadow) mode**: the server-side
     /// engine evaluates it and advances its state exactly as a live plan, but
@@ -288,6 +298,16 @@ pub struct Args {
     #[arg(long)]
     pub breakeven_pct: Option<f64>,
 
+    /// Per-bar decay step (in ATR multiples) for the retest's
+    /// closeness-to-neckline tolerance (default 0.075). The first bar after the
+    /// break-and-close must reach the neckline; each subsequent bar loosens the
+    /// retest by `step × ATR` of near-side slack (so a wick within the tolerance
+    /// still stamps the retest). Higher = more permissive faster; `0` freezes the
+    /// retest at "must reach the line" for the whole window. Bakes onto the
+    /// signed plan's `retest_atr_step`.
+    #[arg(long)]
+    pub retest_atr_step: Option<f64>,
+
     /// Drop the break-and-close prep from the bundle (no alert
     /// emitted and the entry no longer requires it).
     #[arg(long)]
@@ -342,6 +362,33 @@ pub struct Args {
     /// chart range is readable. Ignored on the `--register-plan` live path.
     #[arg(long)]
     pub as_of: Option<String>,
+
+    /// Treat this timestamp as "live now" and find the setup's drawings by
+    /// searching the **whole chart** (nearest-to-start), ignoring the visible
+    /// window (RFC3339, e.g. `2026-06-15T22:00:00Z`).
+    ///
+    /// The journaling use-case: put TradingView in replay mode with the last
+    /// visible candle mid-right-shoulder, but you no longer have to *hide* the
+    /// future candles — pass `--start <shoulder-time>` and tv-arm walks the
+    /// chart to find each role relative to that cursor instead of relying on
+    /// what's on screen:
+    /// - **H&S neckline** (break-and-close + retest): the nearest trendline
+    ///   *before* `--start`.
+    /// - **invalidation** (`too-low` / `too-high`): the nearest horizontal to
+    ///   `--start` (brackets the pattern).
+    /// - **M/W path**: the path whose two shoulders bracket `--start`
+    ///   (`B left-shoulder <= start <= D right-shoulder`; when the right
+    ///   shoulder isn't drawn, `start >= B` — it's still forming).
+    /// - **trade-expiry**: the nearest vertical *after* `--start`.
+    /// - **calendar / news bars**: auto-drawn over `[--start, trade-expiry]`.
+    ///
+    /// Also sets the prune cursor (like `--as-of`) to `--start`, so elapsed
+    /// news/blackout pairs are pruned relative to it. Absent: unchanged — the
+    /// visible window scopes discovery and the replay cursor is the loaded-bars
+    /// right edge. Intended for offline `--plan-out` journaling; on the live
+    /// `--register-plan` path it still overrides discovery + cursor if set.
+    #[arg(long)]
+    pub start: Option<String>,
 
     /// Half-width of the price band around each chart-drawn
     /// `support` / `resistance` line, as a percent of the line's
@@ -452,6 +499,30 @@ mod tests {
         assert!(!args.broker_dry_run);
         assert!(!args.skip_calendar_bars);
         assert_eq!(args.reversal_band_pct, 0.1);
+        // Re-arm flag is opt-in.
+        assert!(args.replace.is_none());
+    }
+
+    #[test]
+    fn replace_flag_parses_bare_and_with_a_target() {
+        // Bare `--replace` → empty string (auto-resolve by instrument).
+        let args = Args::try_parse_from(["tv-arm", "--replace"]).expect("parse bare");
+        assert_eq!(args.replace.as_deref(), Some(""));
+        // `--replace <id>` → the explicit target.
+        let args =
+            Args::try_parse_from(["tv-arm", "--replace", "hs-eurusd-aaaa"]).expect("parse target");
+        assert_eq!(args.replace.as_deref(), Some("hs-eurusd-aaaa"));
+    }
+
+    #[test]
+    fn update_is_a_deprecated_alias_for_replace() {
+        // The old `--update` name still parses into the same `replace` field so
+        // existing scripts / muscle memory keep working.
+        let args = Args::try_parse_from(["tv-arm", "--update"]).expect("parse bare alias");
+        assert_eq!(args.replace.as_deref(), Some(""));
+        let args =
+            Args::try_parse_from(["tv-arm", "--update", "hs-eurusd-bbbb"]).expect("parse alias id");
+        assert_eq!(args.replace.as_deref(), Some("hs-eurusd-bbbb"));
     }
 
     #[test]
