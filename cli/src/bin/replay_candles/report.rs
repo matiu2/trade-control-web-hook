@@ -20,13 +20,12 @@
 
 use chrono::{DateTime, Utc};
 use trade_control_core::intent::{
-    Action, Direction, NoEntryWindow, Resolved, ResolvedEntry, Shell, SlWiden,
-    widen_sl_to_spread_floor,
+    Action, Direction, NoEntryWindow, Resolved, ResolvedEntry, Shell,
 };
 use trade_control_core::spread_blackout::elevated_threshold_pips;
 use trade_control_engine::{
-    SimOutcome, SweepReason, TradePlan, breakeven_armed_at, simulate_fill, sweep_reason,
-    widened_stop_at,
+    EntryFloor, SimOutcome, SweepReason, TradePlan, apply_entry_spread_floor, breakeven_armed_at,
+    simulate_fill, sweep_reason, widened_stop_at,
 };
 
 use super::brisbane::bne;
@@ -295,8 +294,10 @@ pub fn resolve_fire_any(plan: &TradePlan, fire: &Fire, closes: &[CloseFire]) -> 
 
     // Mirror `simulate_fill`'s SL-vs-spread-floor widen onto the *displayed*
     // bracket so the annotation box (and the `order:` journaling line) show the
-    // same stop the sim and the live worker actually protect with.
-    apply_spread_floor_widen(&mut resolved, &fire.forward);
+    // same stop the sim and the live worker actually protect with. Shared helper
+    // so the annotation, the order line, the sim exit, and System 2's baseline
+    // all floor identically.
+    apply_entry_spread_floor(&mut resolved, plan.pip_size, &fire.forward);
 
     let raw = simulate_fill(intent, &shell, plan.pip_size, &fire.forward);
     let (fill_at, until, entry_price, kind) = match apply_reversal_close(raw, closes) {
@@ -385,10 +386,21 @@ pub fn render(
 
     let closes = collect_close_fires(replay);
     let mut tally = Tally::new();
+    // A monotonic id for each ENTER fire, so the journal can refer to an entry
+    // (and its later widen/restore/break-even events) by a stable "#N" label
+    // instead of leaving those events ambiguous when several enters fire.
+    let mut entry_no = 0u32;
     for fire in &replay.fires {
+        let this_entry = if fire.fired.intent.action == Action::Enter {
+            entry_no += 1;
+            Some(entry_no)
+        } else {
+            None
+        };
         out.push_str(&render_fire(
             plan,
             fire,
+            this_entry,
             simulate,
             &closes,
             blackout_windows,
@@ -509,6 +521,7 @@ fn render_trace(replay: &Replay) -> String {
 fn render_fire(
     plan: &TradePlan,
     fire: &Fire,
+    entry_no: Option<u32>,
     simulate: bool,
     closes: &[CloseFire],
     blackout_windows: &[NoEntryWindow],
@@ -516,9 +529,20 @@ fn render_fire(
 ) -> String {
     let intent = &fire.fired.intent;
     let candle = &fire.fired.candle;
+    // Label for time-based sub-events (widen / restore / break-even) so each
+    // reads as "entry #N @ <its own bar>: …" — a mini timeline under the entry
+    // rather than undated lines bunched in the fire bar.
+    let ev = match entry_no {
+        Some(n) => format!("entry #{n}"),
+        None => "entry".to_string(),
+    };
+    let id_tag = entry_no
+        .map(|n| format!(" [entry #{n}]"))
+        .unwrap_or_default();
     let mut line = format!(
-        "\n• {} {:?} @ {}  close={}\n",
+        "\n• {}{} {:?} @ {}  close={}\n",
         fire.fired.rule_id,
+        id_tag,
         intent.action,
         bne(candle.time),
         candle.c
@@ -579,12 +603,23 @@ fn render_fire(
     let mut protected_stop: Option<f64> = None;
     match Resolved::from_intent(intent, &shell, plan.pip_size) {
         Ok(mut resolved) => {
-            apply_spread_floor_widen(&mut resolved, &fire.forward);
+            let signed_sl = resolved.stop_loss;
+            let floor = apply_entry_spread_floor(&mut resolved, plan.pip_size, &fire.forward);
             protected_stop = Some(resolved.stop_loss);
             line.push_str(&format!(
                 "    {}\n",
                 describe_order(&resolved, plan.pip_size)
             ));
+            // When the entry spread floor actually moved the stop, show the
+            // spread that sized it — otherwise a wide placed stop looks arbitrary.
+            if let EntryFloor::Applied { spread_pips } = floor
+                && (resolved.stop_loss - signed_sl).abs() > f64::EPSILON
+            {
+                line.push_str(&format!(
+                    "    note: SL floored to 10× spread ({spread_pips:.1}p @ entry bar) — signed SL was {}\n",
+                    fmt_price(signed_sl, plan.pip_size),
+                ));
+            }
         }
         Err(err) => line.push_str(&format!("    order: UNRESOLVED — {err:?}\n")),
     }
@@ -622,7 +657,7 @@ fn render_fire(
     // (otherwise a BREAK-EVEN stop-out below looks like it came from nowhere).
     if let Some(armed_at) = breakeven_armed_at(intent, &shell, plan.pip_size, &fire.forward) {
         line.push_str(&format!(
-            "    be: SL→break-even @ {} (a candle closed past 50%-to-TP; live cron amends the broker SL here)\n",
+            "    {ev} @ {}: SL→break-even (a candle closed past 50%-to-TP; live cron amends the broker SL here)\n",
             bne(armed_at)
         ));
     }
@@ -647,20 +682,21 @@ fn render_fire(
         widened_stop_at(intent, &shell, plan.pip_size, &fire.forward, widen_trigger)
     {
         line.push_str(&format!(
-            "    note: SL widened to {} (spread blackout System 2, transient) @ {} (from {})\n",
-            fmt_price(widen.widened_stop, plan.pip_size),
+            "    {ev} @ {}: SL widened to {} (spread blackout System 2, transient, {:.1}p spread; from {})\n",
             bne(widen.at),
+            fmt_price(widen.widened_stop, plan.pip_size),
+            widen.widen_spread_pips,
             fmt_price(widen.original_stop, plan.pip_size)
         ));
         match widen.restored_at {
             Some(restored_at) => line.push_str(&format!(
-                "    note: SL restored to {} @ {} (spread recovered / backstop — widen was transient)\n",
-                fmt_price(widen.original_stop, plan.pip_size),
+                "    {ev} @ {}: SL restored to {} (spread recovered / backstop — widen was transient)\n",
                 bne(restored_at),
+                fmt_price(widen.original_stop, plan.pip_size),
             )),
-            None => line.push_str(
-                "    note: SL still widened at window end (spread never recovered before the path ended)\n",
-            ),
+            None => line.push_str(&format!(
+                "    {ev}: SL still widened at window end (spread never recovered before the path ended)\n",
+            )),
         }
     }
 
@@ -743,34 +779,6 @@ fn book_and_render_r(
         "    R: {r:+.2}  |  $100k acct (1% risk): {:+.0} → ${:.0}\n",
         pnl, tally.account
     ));
-}
-
-/// Apply the worker's SL-vs-spread-floor *widen* to a resolved bracket so the
-/// journaled levels match the stop the live worker and `simulate_fill` actually
-/// protect with. The fire bar's `ask_c − bid_c` is the spread the worker would
-/// have quoted (same source `simulate_fill`/`run_enter` use). A `Reject` leaves
-/// the bracket as-is — the leg won't fill, so the intended (un-widened) bracket
-/// is still the right thing to journal. No-op when there's no fire bar or the
-/// stop already clears the floor. See `widen_sl_to_spread_floor` and the
-/// 2026-07-01 follow-up (widened SL must reach the fill/exit + display paths,
-/// not just the entry R-check).
-fn apply_spread_floor_widen(
-    resolved: &mut Resolved,
-    forward: &[trade_control_engine::BidAskCandle],
-) {
-    let Some(fire_bar) = forward.first() else {
-        return;
-    };
-    let spread_price = fire_bar.ask_c - fire_bar.bid_c;
-    if let SlWiden::Widened { new_stop_loss, .. } = widen_sl_to_spread_floor(
-        resolved.entry.reference_price(),
-        resolved.stop_loss,
-        resolved.take_profit,
-        spread_price,
-        resolved.min_r,
-    ) {
-        resolved.stop_loss = new_stop_loss;
-    }
 }
 
 /// One-line summary of the bracket order the worker would have placed: the

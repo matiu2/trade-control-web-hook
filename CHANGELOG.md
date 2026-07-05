@@ -1,5 +1,41 @@
 # Changelog
 
+## Unreleased — 2026-07-05 — replay journal: reconcile the SL lines + tag entries with an id
+
+**Why.** On EUR/AUD `hs-eur-aud-3d0b5dda` the enter block printed **three
+different stop-losses that didn't reconcile**: `order: SL 1.65787`, then "widened
+to 1.65458 (from 1.65238)", then "restored to 1.65238" — the widen/restore moved
+to *tighter* levels than the placed stop. Cause: the `order:` line applied the
+System-1 entry spread floor (fire-bar spread 8.3p → 10× floor → SL 1.65787) but
+`widened_stop_at` (System 2) re-resolved from scratch and used the **un-floored
+signed SL** (1.65238) as its baseline. Two systems, two baselines, one confusing
+journal. Also, the widen/restore notes were undated-looking lines bunched under
+the entry bar, with no way to tell which entry they belonged to when several
+enters fired.
+
+**What changed.**
+- **One baseline.** New shared `engine::apply_entry_spread_floor` (returns the
+  floored stop + the spread used, or a reject) replaces the ad-hoc floor in
+  `simulate_fill` *and* is now applied inside `widened_stop_at`, so the placed
+  stop, the simulated exit, and System 2's widen/restore all key off the **same**
+  floored level. On the worked trade the lines now read: order 1.65787 → widened
+  1.66007 → restored 1.65787 — monotonic and correct.
+- **Show the spread.** The `order:` line gains a "SL floored to 10× spread
+  (Np @ entry bar)" note when the floor moved the stop, and the System-2 widen
+  line shows the widen-bar spread ("…, Np spread…"). No more mystery-wide stops.
+- **Entry ids + per-bar events.** Each enter fire is tagged `[entry #N]`, and its
+  time-based sub-events (break-even, widen, restore) now read
+  `entry #N @ <their own bar>: …` — a mini timeline under the entry instead of
+  undated lines. `SpreadWiden` gains `widen_spread_pips`.
+
+**Compatibility.** Replay reporting only — no signed field, no live-worker
+behaviour change. The entry-floor *logic* is unchanged (still fire-bar spread,
+per the operator's call); this only reconciles the display and threads the id.
+
+**Tests.** `widened_stop_at_baseline_is_the_floored_stop_not_the_signed_sl`
+(guards the reconciliation); existing widen tests unchanged (their signed SLs
+already clear the floor, so flooring is a no-op).
+
 ## Unreleased — 2026-07-05 — replay shows the System-2 widen as *transient* (widen + restore)
 
 **Why.** The NY-close stop-widen (System 2) is **transient live**: the recovery

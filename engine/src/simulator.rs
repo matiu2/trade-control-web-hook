@@ -190,25 +190,10 @@ pub fn simulate_fill(
     // never at. The widen mutates `resolved.stop_loss` so both `find_fill` and
     // the exit loop below see the widened level — and break-even arms off the
     // widened geometry, matching the live position.
-    if let Some(fire) = candles.first() {
-        let spread_price = fire.ask_c - fire.bid_c;
-        match widen_sl_to_spread_floor(
-            resolved.entry.reference_price(),
-            resolved.stop_loss,
-            resolved.take_profit,
-            spread_price,
-            resolved.min_r,
-        ) {
-            SlWiden::Unchanged => {}
-            SlWiden::Widened { new_stop_loss, .. } => {
-                resolved.stop_loss = new_stop_loss;
-            }
-            SlWiden::Reject { .. } => {
-                return SimOutcome::Declined {
-                    name: "sl-widen-below-min-r".to_string(),
-                };
-            }
-        }
+    if let EntryFloor::Rejected = apply_entry_spread_floor(&mut resolved, pip_size, candles) {
+        return SimOutcome::Declined {
+            name: "sl-widen-below-min-r".to_string(),
+        };
     }
 
     // Phase 1 — find the fill (shared with `breakeven_armed_at`).
@@ -543,6 +528,61 @@ pub fn sweep_reason(
     None
 }
 
+/// Outcome of the System-1 entry SL-spread floor applied to a resolved bracket.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum EntryFloor {
+    /// The floor left the stop where it was (already ≥ 10× spread), or moved it
+    /// to `10 × spread`. `spread_pips` is the fire-bar spread the floor used —
+    /// surfaced so the journal can show *which* spread sized the placed stop.
+    Applied { spread_pips: f64 },
+    /// Widening to `10 × spread` would drop R below `min_r` — the live worker
+    /// declines the entry, so the sim/replay must too.
+    Rejected,
+}
+
+/// Apply the System-1 entry SL-spread floor to `resolved` **in place**, off the
+/// fire bar (`candles.first()`) — the single source of the placed stop.
+///
+/// This is the mirror of `run_enter`'s widen-then-reject: when the signed stop
+/// sits closer than `10 × spread` to entry, the worker widens it to `10 × spread`
+/// (entering with the wider stop if R still clears `min_r`, declining otherwise).
+/// Both `simulate_fill` (the exit sim) and `widened_stop_at` (the System-2
+/// baseline) call this so the placed stop, the simulated exit, and the System-2
+/// "from" level are all the **same** floored number — they can't drift into the
+/// three-different-SLs confusion the journal showed on EUR/AUD
+/// `hs-eur-aud-3d0b5dda`. Returns the spread used (for display) or a reject.
+///
+/// No fire bar (empty path) ⇒ `Applied { spread_pips: 0.0 }` — nothing to floor.
+pub fn apply_entry_spread_floor(
+    resolved: &mut Resolved,
+    pip_size: f64,
+    candles: &[BidAskCandle],
+) -> EntryFloor {
+    let Some(fire) = candles.first() else {
+        return EntryFloor::Applied { spread_pips: 0.0 };
+    };
+    let spread_price = fire.ask_c - fire.bid_c;
+    match widen_sl_to_spread_floor(
+        resolved.entry.reference_price(),
+        resolved.stop_loss,
+        resolved.take_profit,
+        spread_price,
+        resolved.min_r,
+    ) {
+        SlWiden::Unchanged => {}
+        SlWiden::Widened { new_stop_loss, .. } => {
+            resolved.stop_loss = new_stop_loss;
+        }
+        SlWiden::Reject { .. } => return EntryFloor::Rejected,
+    }
+    let spread_pips = if pip_size > 0.0 && pip_size.is_finite() {
+        spread_price / pip_size
+    } else {
+        f64::NAN
+    };
+    EntryFloor::Applied { spread_pips }
+}
+
 /// A System-2 spread-widen the replay reconstructs from the candle path: the
 /// bar whose spread tripped the widen, the new (widened) stop level, and — since
 /// the widen is *transient* live — the bar at which the recovery watcher would
@@ -551,8 +591,14 @@ pub fn sweep_reason(
 pub struct SpreadWiden {
     /// Open-time of the bar whose spread crossed the widen trigger.
     pub at: chrono::DateTime<chrono::Utc>,
-    /// The original (resolved) stop level, before widening.
+    /// The stop the open position actually carried before this widen — i.e. the
+    /// resolved stop **after** the System-1 entry spread floor (the same number
+    /// the `order:` line and `simulate_fill` place at). System 2 widens from and
+    /// restores to THIS level, so the journal's widen/restore lines reconcile
+    /// with the placed stop instead of the un-floored signed level.
     pub original_stop: f64,
+    /// Pips crossed on the widen bar (`ask_c − bid_c`), for the journal display.
+    pub widen_spread_pips: f64,
     /// The stop after widening away from price (the shared
     /// [`trade_control_core::blackout_widen::widened_stop`] result).
     pub widened_stop: f64,
@@ -612,7 +658,14 @@ pub fn widened_stop_at(
     if !pip_size.is_finite() || pip_size <= 0.0 {
         return None;
     }
-    let resolved = Resolved::from_intent(intent, shell, pip_size).ok()?;
+    let mut resolved = Resolved::from_intent(intent, shell, pip_size).ok()?;
+    // Floor the baseline to the placed stop (System 1) so System 2 widens from
+    // and restores to the SAME level the order line shows — not the un-floored
+    // signed SL. A reject means the live worker declined the entry, so there's
+    // no open position to widen.
+    if let EntryFloor::Rejected = apply_entry_spread_floor(&mut resolved, pip_size, candles) {
+        return None;
+    }
     let dir = resolved.direction;
     let fill = find_fill(&resolved, intent, shell, dir, candles)?;
     let exit_book = book_for(Leg::Exit, dir);
@@ -652,6 +705,7 @@ pub fn widened_stop_at(
             return Some(SpreadWiden {
                 at: c.time,
                 original_stop,
+                widen_spread_pips: spread_pips,
                 widened_stop: widened,
                 restored_at,
             });
@@ -1354,6 +1408,42 @@ mod tests {
             }
             other => panic!("expected StoppedOut at original SL (no BE arm), got {other:?}"),
         }
+    }
+
+    /// The System-2 baseline (`original_stop`) is the stop the position actually
+    /// carried — i.e. the signed SL **after** the System-1 entry spread floor —
+    /// not the raw signed SL. This is the display-reconciliation fix: the widen
+    /// must move from the *placed* stop, so the journal's order/widen/restore
+    /// lines all key off one number (EUR/AUD `hs-eur-aud-3d0b5dda` showed three
+    /// different SLs because System 2 used the un-floored signed level).
+    #[test]
+    fn widened_stop_at_baseline_is_the_floored_stop_not_the_signed_sl() {
+        use trade_control_core::blackout_widen::WIDEN_FLOOR_PIPS;
+        // Long entry 1.1000, SIGNED SL 1.0995 (5p — inside the floor).
+        let mut intent = long_stop_intent();
+        i_set_levels(&mut intent, 1.1000, 1.0995, 1.1100);
+        let shell = trigger_shell();
+        // Fire bar carries a 3p spread (bid_c 1.10120, ask_c 1.10150) away from
+        // the 1.1000 entry trigger so it doesn't fill on bar 0. 10× 3p = 30p →
+        // the SL floors DOWN from 1.0995 to 1.0970.
+        let fire = ba_candle("2026-06-17T10:30:00Z", 1.10150, 1.10120, 1.10150, 1.10120);
+        let fill_bar = candle("2026-06-17T11:00:00Z", 1.1000, 1.1001, 1.0999, 1.1000);
+        // NY-close-edge wide bar → widen from the FLOORED baseline (1.0970).
+        let wide = ba_candle("2026-06-17T21:00:00Z", 1.10015, 1.10010, 1.10315, 1.10310);
+        let path = [fire, fill_bar, wide];
+
+        let widen = widened_stop_at(&intent, &shell, 0.0001, &path, WIDEN_FLOOR_PIPS)
+            .expect("the NY-close-edge bar must trip the widen");
+        assert!(
+            (widen.original_stop - 1.0970).abs() < 1e-9,
+            "baseline must be the floored stop 1.0970 (10× 3p), not the signed 1.0995; got {}",
+            widen.original_stop
+        );
+        // And the widen moves further DOWN from the floored baseline.
+        assert!(
+            widen.widened_stop < 1.0970,
+            "a long widen moves the SL further DOWN from the floored baseline"
+        );
     }
 
     /// A long position whose post-fill path includes a wide-spread bar **on the
