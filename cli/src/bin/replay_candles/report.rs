@@ -24,8 +24,8 @@ use trade_control_core::intent::{
 };
 use trade_control_core::spread_blackout::elevated_threshold_pips;
 use trade_control_engine::{
-    EntryFloor, SimOutcome, SweepReason, TradePlan, apply_entry_spread_floor, breakeven_armed_at,
-    simulate_fill, sweep_reason, widened_stop_at,
+    BidAskCandle as EngineCandle, EntryFloor, SimOutcome, SweepReason, TradePlan,
+    apply_entry_spread_floor, breakeven_armed_at, simulate_fill, sweep_reason, widened_stop_at,
 };
 
 use super::brisbane::bne;
@@ -390,6 +390,12 @@ pub fn render(
     // (and its later widen/restore/break-even events) by a stable "#N" label
     // instead of leaving those events ambiguous when several enters fire.
     let mut entry_no = 0u32;
+    // Every event from every fire, collected flat then sorted by time — one
+    // top-level chronological stream (the place/fill/widen/restore/exit of all
+    // entries interleaved by when they actually happened). The tally is booked
+    // in fire order inside `render_fire` (so the compounding sequence is
+    // correct); the events only carry the resulting text.
+    let mut events: Vec<EntryEvent> = Vec::new();
     for fire in &replay.fires {
         let this_entry = if fire.fired.intent.action == Action::Enter {
             entry_no += 1;
@@ -397,7 +403,7 @@ pub fn render(
         } else {
             None
         };
-        out.push_str(&render_fire(
+        events.extend(render_fire(
             plan,
             fire,
             this_entry,
@@ -406,6 +412,17 @@ pub fn render(
             blackout_windows,
             &mut tally,
         ));
+    }
+
+    // Stable sort by time: same-bar events keep their emission order (placed
+    // before fill before widen on a shared bar).
+    events.sort_by_key(|e| e.at);
+    for e in &events {
+        out.push_str(&format!("{}  {}", bne(e.at), e.note));
+        if let Some(close) = e.close {
+            out.push_str(&format!("  (close={close})"));
+        }
+        out.push('\n');
     }
 
     // Trendline-anchor warnings are intentionally *not* rendered here — they
@@ -518,6 +535,11 @@ fn render_trace(replay: &Replay) -> String {
     out
 }
 
+/// Build the flat, time-ordered event stream for one fire. Every event is a
+/// top-level line (`render` sorts them across all fires by time); nothing is
+/// nested. Books the tally in fire order (correct compounding) and folds the
+/// resulting R into the exit event's note. Non-enter fires (prep / close /
+/// other) contribute their own single event.
 fn render_fire(
     plan: &TradePlan,
     fire: &Fire,
@@ -526,64 +548,67 @@ fn render_fire(
     closes: &[CloseFire],
     blackout_windows: &[NoEntryWindow],
     tally: &mut Tally,
-) -> String {
+) -> Vec<EntryEvent> {
     let intent = &fire.fired.intent;
     let candle = &fire.fired.candle;
-    // Label for time-based sub-events (widen / restore / break-even) so each
-    // reads as "entry #N @ <its own bar>: …" — a mini timeline under the entry
-    // rather than undated lines bunched in the fire bar.
+    // Stable "entry #N" label so each event names which entry it belongs to in
+    // the merged stream (several enters can be in flight at once).
     let ev = match entry_no {
         Some(n) => format!("entry #{n}"),
         None => "entry".to_string(),
     };
-    let id_tag = entry_no
-        .map(|n| format!(" [entry #{n}]"))
-        .unwrap_or_default();
-    let mut line = format!(
-        "\n• {}{} {:?} @ {}  close={}\n",
-        fire.fired.rule_id,
-        id_tag,
-        intent.action,
-        bne(candle.time),
-        candle.c
-    );
 
+    // Without --simulate we only note the fire itself (no fill sim / bracket).
     if !simulate {
-        return line;
+        return vec![EntryEvent {
+            at: candle.time,
+            note: format!("{} {:?} ({ev})", fire.fired.rule_id, intent.action),
+            close: Some(candle.c),
+        }];
     }
     if intent.action == Action::Prep {
         // A prep carries no bracket of its own — preview the plan's *enter*
-        // bracket resolved against this prep bar, so the journal shows the
-        // SL/TP the eventual order would carry even when it never fills.
-        line.push_str(&prep_would_enter_line(plan, fire));
-        return line;
+        // bracket resolved against this prep bar so the journal shows the SL/TP
+        // the eventual order would carry even when it never fills.
+        return vec![EntryEvent {
+            at: candle.time,
+            note: format!(
+                "prep ({}) — {}",
+                fire.fired.rule_id,
+                prep_preview(plan, fire)
+            ),
+            close: Some(candle.c),
+        }];
     }
     if intent.action == Action::Close {
-        // A close fire has no fill of its own — it flattens whatever enter is
-        // open. The worker's `allow_close` gate (shared core) can block it: a
-        // blocked close keeps the position OPEN, so it must NOT flatten the
-        // simulated enter (it's already excluded from `collect_close_fires`).
-        // Surface either case so the reversal exit is legible next to the enter
-        // it closes (which renders its own `CLOSED ON REVERSAL` fill line when
-        // the gate passes).
-        if close_gate_passes(fire) {
-            line.push_str(&format!(
-                "    close-on-reversal: reversal candle @ {} (close {}) — flattens the open position\n",
-                bne(candle.time),
-                candle.c
-            ));
+        // A close fire flattens whatever enter is open (or is blocked by the
+        // allow_close gate, keeping the position open).
+        let note = if close_gate_passes(fire) {
+            format!(
+                "close-on-reversal ({}) — flattens the open position",
+                fire.fired.rule_id
+            )
         } else {
-            line.push_str(&format!(
-                "    close: BLOCKED by allow_close gate (position stays open) @ {} (close {})\n",
-                bne(candle.time),
-                candle.c
-            ));
-        }
-        return line;
+            format!(
+                "close BLOCKED by allow_close gate ({}) — position stays open",
+                fire.fired.rule_id
+            )
+        };
+        return vec![EntryEvent {
+            at: candle.time,
+            note,
+            close: Some(candle.c),
+        }];
     }
     if intent.action != Action::Enter {
-        line.push_str("    (non-enter fire — no fill simulated)\n");
-        return line;
+        return vec![EntryEvent {
+            at: candle.time,
+            note: format!(
+                "{:?} ({}) — no fill simulated",
+                intent.action, fire.fired.rule_id
+            ),
+            close: Some(candle.c),
+        }];
     }
 
     // Reconstruct the shell exactly as the worker's dispatch would, so the
@@ -593,110 +618,113 @@ fn render_fire(
         None => Shell::from_candle(candle),
     };
 
-    // Resolve the bracket the worker would have placed (direction, entry, SL,
-    // TP) and print it for every enter — even ones the price path never fills.
-    // This is the journaling line: what order went on at this bar. The widen is
-    // applied so the printed SL matches the protected stop, not the un-widened
-    // signed level (the 2026-07-01 follow-up).
-    // The protected stop (after the spread-floor widen) — needed below to score
-    // the fill's R multiple. `None` when the bracket can't resolve.
+    // The "placed" event carries the resolved bracket (direction, entry, SL,
+    // TP) — the journaling record of what order went on. The spread-floor widen
+    // is applied so the shown SL is the protected stop, not the signed level.
+    // `protected_stop` is needed to score the fill's R below.
     let mut protected_stop: Option<f64> = None;
-    match Resolved::from_intent(intent, &shell, plan.pip_size) {
+    let placed_note = match Resolved::from_intent(intent, &shell, plan.pip_size) {
         Ok(mut resolved) => {
             let signed_sl = resolved.stop_loss;
             let floor = apply_entry_spread_floor(&mut resolved, plan.pip_size, &fire.forward);
             protected_stop = Some(resolved.stop_loss);
-            line.push_str(&format!(
-                "    {}\n",
-                describe_order(&resolved, plan.pip_size)
-            ));
-            // When the entry spread floor actually moved the stop, show the
-            // spread that sized it — otherwise a wide placed stop looks arbitrary.
+            let mut note = format!("{ev} placed — {}", describe_order(&resolved, plan.pip_size));
+            // When the floor moved the stop, note the spread that sized it.
             if let EntryFloor::Applied { spread_pips } = floor
                 && (resolved.stop_loss - signed_sl).abs() > f64::EPSILON
             {
-                line.push_str(&format!(
-                    "    note: SL floored to 10× spread ({spread_pips:.1}p @ entry bar) — signed SL was {}\n",
+                note.push_str(&format!(
+                    " [SL floored to 10× spread ({spread_pips:.1}p @ entry bar); signed SL was {}]",
                     fmt_price(signed_sl, plan.pip_size),
                 ));
             }
+            note
         }
-        Err(err) => line.push_str(&format!("    order: UNRESOLVED — {err:?}\n")),
-    }
+        Err(err) => format!("{ev} placed — order UNRESOLVED: {err:?}"),
+    };
+    let mut events: Vec<EntryEvent> = vec![EntryEvent {
+        at: candle.time,
+        note: placed_note,
+        close: Some(candle.c),
+    }];
 
     // A superseded enter had its resting order cancelled by a later entry
-    // (cancel-and-replace) before it could fill, so its standalone simulated
-    // fill is fiction — report the cancellation instead and don't tally it.
-    // (Checked before the rejection branch: a placed-then-superseded enter has a
-    // `Placed` outcome, not a rejection, so the gate verdict wouldn't catch it.)
+    // (cancel-and-replace) before it could fill — report the cancellation and
+    // don't tally it.
     if fire.superseded {
-        line.push_str("    fill: SUPERSEDED — resting order cancelled by a later entry (cancel-and-replace)\n");
-        return line;
+        events.push(EntryEvent {
+            at: candle.time,
+            note: format!(
+                "{ev} SUPERSEDED — resting order cancelled by a later entry (cancel-and-replace)"
+            ),
+            close: Some(candle.c),
+        });
+        return events;
     }
 
-    // The entry decision came from the REAL `run_enter` in the tick loop. A
-    // `Rejected` enter is a 0R skip — the live worker 412/422/423s it before
-    // placing an order — so surface the real dispatch reason and don't simulate
-    // a fill or tally it. A pause rejection keeps the legible "SUPPRESSED"
-    // wording; every other gate (cooldown / prep / veto / entry-level-veto /
-    // allow_entry / blackouts / SL-floor) prints its own reason verbatim.
+    // The entry decision came from the REAL `run_enter`. A `Rejected` enter is a
+    // 0R skip — surface the real dispatch reason and don't simulate a fill.
     if let Some(reason) = fire.rejected_reason() {
         let detail = if reason.starts_with("rejected: paused") {
-            format!("fill: SUPPRESSED — trade paused by news blackout [{reason}] → NO FILL / 0R")
+            format!("{ev} SUPPRESSED — trade paused by news blackout [{reason}] → NO FILL / 0R")
         } else {
-            format!("fill: BLOCKED — {reason} → NO FILL / 0R")
+            format!("{ev} BLOCKED — {reason} → NO FILL / 0R")
         };
-        line.push_str(&format!("    {detail}\n"));
-        return line;
+        events.push(EntryEvent {
+            at: candle.time,
+            note: detail,
+            close: Some(candle.c),
+        });
+        return events;
     }
 
-    // Break-even arming: the bar whose close runs past the threshold
-    // (50%-to-TP by default). In production the live cron (`breakeven_watch`)
-    // sends `amend_stop(entry)` to the broker on the tick that observes this
-    // candle; surface it so the journal shows *when* the SL moved to break-even
-    // (otherwise a BREAK-EVEN stop-out below looks like it came from nowhere).
+    // Break-even arming: the bar whose close runs past 50%-to-TP. The live cron
+    // (`breakeven_watch`) amends the broker SL to entry here.
     if let Some(armed_at) = breakeven_armed_at(intent, &shell, plan.pip_size, &fire.forward) {
-        line.push_str(&format!(
-            "    {ev} @ {}: SL→break-even (a candle closed past 50%-to-TP; live cron amends the broker SL here)\n",
-            bne(armed_at)
-        ));
+        events.push(EntryEvent {
+            at: armed_at,
+            note: format!("{ev} SL→break-even (a candle closed past 50%-to-TP)"),
+            close: bar_close(&fire.forward, armed_at),
+        });
     }
 
-    // Spread-widen (System 2): a NY-close-edge bar whose spread reaches the
-    // widen trigger moves the broker SL *away* from price (live cron
-    // `blackout_apply`). This widen is **transient** — the live recovery watcher
-    // (`blackout_watch`) restores the original stop once the spread recovers
-    // (≤4p) or the 3h backstop fires; `restored_at` reconstructs that bar. We
-    // surface BOTH the widen and the restore so the journal shows the shield
-    // snapping back, not a permanent risk change (the EUR/AUD `hs-eur-aud-…`
-    // "permanent widen" question). The trigger is the instrument's *real*
-    // spread-blackout threshold (`baseline × 5`), the same `elevated_threshold_pips`
-    // the System-1 entry-reject uses, so replay and live stay in lockstep.
-    //
-    // NOTE: this is informational only — `simulate_fill` below computes the exit
-    // against the un-widened bracket (System 2 is not applied to the simulated
-    // stop-out), so these lines annotate what the *live broker stop* did, not the
-    // replay's exit level.
+    // Spread-widen (System 2): a spread-hour bar moves the broker SL *away* from
+    // price (`blackout_apply`), transiently — the recovery watcher
+    // (`blackout_watch`) restores the original once the spread recovers (≤4p) or
+    // the 3h backstop fires. We surface BOTH so the journal shows the shield
+    // snapping back, not a permanent risk change. Informational only —
+    // `simulate_fill` scores the exit against the un-widened bracket.
     let widen_trigger = elevated_threshold_pips(&intent.instrument);
     if let Some(widen) =
         widened_stop_at(intent, &shell, plan.pip_size, &fire.forward, widen_trigger)
     {
-        line.push_str(&format!(
-            "    {ev} @ {}: SL widened to {} (spread blackout System 2, transient, {:.1}p spread; from {})\n",
-            bne(widen.at),
-            fmt_price(widen.widened_stop, plan.pip_size),
-            widen.widen_spread_pips,
-            fmt_price(widen.original_stop, plan.pip_size)
-        ));
-        match widen.restored_at {
-            Some(restored_at) => line.push_str(&format!(
-                "    {ev} @ {}: SL restored to {} (spread recovered / backstop — widen was transient)\n",
-                bne(restored_at),
+        events.push(EntryEvent {
+            at: widen.at,
+            note: format!(
+                "{ev} SL widened → {} (spread blackout System 2, transient, {:.1}p; from {})",
+                fmt_price(widen.widened_stop, plan.pip_size),
+                widen.widen_spread_pips,
                 fmt_price(widen.original_stop, plan.pip_size),
-            )),
-            None => line.push_str(&format!(
-                "    {ev}: SL still widened at window end (spread never recovered before the path ended)\n",
-            )),
+            ),
+            close: bar_close(&fire.forward, widen.at),
+        });
+        match widen.restored_at {
+            Some(restored_at) => events.push(EntryEvent {
+                at: restored_at,
+                note: format!(
+                    "{ev} SL restored → {} (spread recovered / backstop — widen was transient)",
+                    fmt_price(widen.original_stop, plan.pip_size),
+                ),
+                close: bar_close(&fire.forward, restored_at),
+            }),
+            None => {
+                let at = fire.forward.last().map(|c| c.time).unwrap_or(widen.at);
+                events.push(EntryEvent {
+                    at,
+                    note: format!("{ev} SL still widened at window end (spread never recovered)"),
+                    close: bar_close(&fire.forward, at),
+                });
+            }
         }
     }
 
@@ -706,79 +734,133 @@ fn render_fire(
             entry_price,
             exit_at,
             exit_price,
-            ..
+            fill_at,
         } => {
-            line.push_str(&format!(
-                "    fill: CLOSED ON REVERSAL — in @ {entry_price} → exit {exit_price} ({})\n",
-                bne(exit_at)
-            ));
+            events.push(EntryEvent {
+                at: fill_at,
+                note: format!("{ev} FILLED @ {}", fmt_price(entry_price, plan.pip_size)),
+                close: bar_close(&fire.forward, fill_at),
+            });
             tally.reversal_closes += 1;
-            book_and_render_r(&mut line, tally, protected_stop, entry_price, exit_price);
+            let r = book_r(tally, protected_stop, entry_price, exit_price);
+            events.push(EntryEvent {
+                at: exit_at,
+                note: format!(
+                    "{ev} CLOSED ON REVERSAL → {}{r}",
+                    fmt_price(exit_price, plan.pip_size)
+                ),
+                close: bar_close(&fire.forward, exit_at),
+            });
         }
-        ReplayOutcome::Sim(outcome) => {
-            // A `NeverFilled` order isn't necessarily one that passively never
-            // triggered — the live cron sweep actively cancels a still-resting
-            // order once its window expires, its bar-expiry passes, or price
-            // overtakes its SL. Surface *why* the worker would have swept it so
-            // the replay distinguishes a swept order from an untriggered one.
-            let detail = match &outcome {
-                SimOutcome::NeverFilled => {
-                    let swept = sweep_reason(
-                        intent,
-                        &shell,
-                        plan.pip_size,
-                        &fire.forward,
-                        blackout_windows,
-                    );
-                    describe_never_filled(swept)
-                }
-                other => describe_outcome(other),
-            };
-            line.push_str(&format!("    {detail}\n"));
-            match outcome {
-                SimOutcome::TookProfit {
-                    entry_price,
-                    exit_price,
-                    ..
-                } => {
-                    tally.wins += 1;
-                    book_and_render_r(&mut line, tally, protected_stop, entry_price, exit_price);
-                }
-                SimOutcome::StoppedOut {
-                    entry_price,
-                    exit_price,
-                    ..
-                } => {
-                    tally.losses += 1;
-                    book_and_render_r(&mut line, tally, protected_stop, entry_price, exit_price);
-                }
-                _ => {}
+        ReplayOutcome::Sim(outcome) => match outcome {
+            SimOutcome::FilledOpen {
+                fill_at,
+                entry_price,
+            } => events.push(EntryEvent {
+                at: fill_at,
+                note: format!(
+                    "{ev} FILLED @ {} (still open at window end)",
+                    fmt_price(entry_price, plan.pip_size)
+                ),
+                close: bar_close(&fire.forward, fill_at),
+            }),
+            SimOutcome::TookProfit {
+                fill_at,
+                entry_price,
+                exit_at,
+                exit_price,
+            } => {
+                events.push(EntryEvent {
+                    at: fill_at,
+                    note: format!("{ev} FILLED @ {}", fmt_price(entry_price, plan.pip_size)),
+                    close: bar_close(&fire.forward, fill_at),
+                });
+                tally.wins += 1;
+                let r = book_r(tally, protected_stop, entry_price, exit_price);
+                events.push(EntryEvent {
+                    at: exit_at,
+                    note: format!(
+                        "{ev} TOOK PROFIT → {}{r}",
+                        fmt_price(exit_price, plan.pip_size)
+                    ),
+                    close: bar_close(&fire.forward, exit_at),
+                });
             }
-        }
+            SimOutcome::StoppedOut {
+                fill_at,
+                entry_price,
+                exit_at,
+                exit_price,
+            } => {
+                events.push(EntryEvent {
+                    at: fill_at,
+                    note: format!("{ev} FILLED @ {}", fmt_price(entry_price, plan.pip_size)),
+                    close: bar_close(&fire.forward, fill_at),
+                });
+                tally.losses += 1;
+                let r = book_r(tally, protected_stop, entry_price, exit_price);
+                events.push(EntryEvent {
+                    at: exit_at,
+                    note: format!(
+                        "{ev} STOPPED OUT → {}{r}",
+                        fmt_price(exit_price, plan.pip_size)
+                    ),
+                    close: bar_close(&fire.forward, exit_at),
+                });
+            }
+            // Not-taken outcomes: a single note on the fire bar, no tally move.
+            other => {
+                let detail = match &other {
+                    SimOutcome::NeverFilled => {
+                        let swept = sweep_reason(
+                            intent,
+                            &shell,
+                            plan.pip_size,
+                            &fire.forward,
+                            blackout_windows,
+                        );
+                        describe_never_filled(swept)
+                    }
+                    o => describe_outcome(o),
+                };
+                events.push(EntryEvent {
+                    at: candle.time,
+                    note: format!("{ev} {detail}"),
+                    close: Some(candle.c),
+                });
+            }
+        },
     }
-    line
+
+    events
+}
+
+/// The close of the forward-path bar at `at`, if present — for the `close=…`
+/// context on an event that lands on a later bar (widen / restore / exit).
+fn bar_close(forward: &[EngineCandle], at: DateTime<Utc>) -> Option<f64> {
+    forward.iter().find(|c| c.time == at).map(|c| c.c)
 }
 
 /// Score a taken fill's R multiple against its protected stop, book it into the
-/// running tally (net R + compounding $100k account), and append the per-fill
-/// `R: …  ($100k acct: …)` line so each trade shows its own contribution.
-/// A `None` stop (bracket that never resolved) is a no-op — nothing to score.
-fn book_and_render_r(
-    line: &mut String,
+/// running tally (net R + compounding $100k account), and return the trailing
+/// `  (R: …  $100k acct: …)` fragment to append to the exit event. A `None`
+/// stop (bracket that never resolved) books nothing and returns an empty
+/// string.
+fn book_r(
     tally: &mut Tally,
     protected_stop: Option<f64>,
     entry_price: f64,
     exit_price: f64,
-) {
+) -> String {
     let Some(stop_loss) = protected_stop else {
-        return;
+        return String::new();
     };
     let r = realized_r(entry_price, stop_loss, exit_price);
     let pnl = tally.book(r);
-    line.push_str(&format!(
-        "    R: {r:+.2}  |  $100k acct (1% risk): {:+.0} → ${:.0}\n",
+    format!(
+        "  (R: {r:+.2}  |  $100k acct (1% risk): {:+.0} → ${:.0})",
         pnl, tally.account
-    ));
+    )
 }
 
 /// One-line summary of the bracket order the worker would have placed: the
@@ -819,9 +901,9 @@ fn describe_order(resolved: &Resolved, pip_size: f64) -> String {
 /// Falls back to a short note when the plan has no enter rule or the
 /// enter can't resolve at this bar (e.g. a PinePattern enter that needs a
 /// latched signal the prep bar doesn't yet have).
-fn prep_would_enter_line(plan: &TradePlan, fire: &Fire) -> String {
+fn prep_preview(plan: &TradePlan, fire: &Fire) -> String {
     let Some(enter) = plan_enter_intent(plan) else {
-        return "    (prep — plan has no enter rule to preview)\n".to_string();
+        return "plan has no enter rule to preview".to_string();
     };
     let candle = &fire.fired.candle;
     let shell = match &fire.fired.signal {
@@ -830,12 +912,12 @@ fn prep_would_enter_line(plan: &TradePlan, fire: &Fire) -> String {
     };
     match Resolved::from_intent(enter, &shell, plan.pip_size) {
         Ok(resolved) => format!(
-            "    would-enter: {}\n",
+            "would-enter: {}",
             describe_order(&resolved, plan.pip_size)
                 .strip_prefix("order: ")
                 .unwrap_or("?")
         ),
-        Err(_) => "    (prep — enter bracket not resolvable at this bar yet)\n".to_string(),
+        Err(_) => "enter bracket not resolvable at this bar yet".to_string(),
     }
 }
 
@@ -860,6 +942,16 @@ fn fmt_price(price: f64, pip_size: f64) -> String {
         5
     };
     format!("{price:.decimals$}")
+}
+
+/// One top-level event in the flat, time-ordered replay stream — the bar's
+/// time, the note (e.g. "entry #1 placed — LONG limit …", "entry #1 FILLED"),
+/// and optionally the bar's close for price context. `render` sorts these by
+/// `at` across all fires and prints one per line.
+struct EntryEvent {
+    at: DateTime<Utc>,
+    note: String,
+    close: Option<f64>,
 }
 
 /// The `NEVER FILLED` line, annotated with the sweep reason when the live cron
@@ -1023,27 +1115,25 @@ mod tests {
     }
 
     #[test]
-    fn book_and_render_r_is_a_noop_without_a_stop() {
+    fn book_r_is_a_noop_without_a_stop() {
         // An unresolved bracket (no protected stop) can't be scored → tally
-        // untouched, no line appended.
-        let mut line = String::new();
+        // untouched, empty fragment returned.
         let mut t = Tally::new();
-        book_and_render_r(&mut line, &mut t, None, 1.10, 1.11);
-        assert!(line.is_empty());
+        let frag = book_r(&mut t, None, 1.10, 1.11);
+        assert!(frag.is_empty());
         assert_eq!(t.net_r, 0.0);
         assert_eq!(t.account, 100_000.0);
     }
 
     #[test]
-    fn book_and_render_r_scores_and_prints_a_win() {
-        let mut line = String::new();
+    fn book_r_scores_and_formats_a_win() {
         let mut t = Tally::new();
         // Long: entry 1.10, SL 1.09, TP 1.11 → +1R, +$1,000.
-        book_and_render_r(&mut line, &mut t, Some(1.09), 1.10, 1.11);
+        let frag = book_r(&mut t, Some(1.09), 1.10, 1.11);
         assert!((t.net_r - 1.0).abs() < 1e-9);
         assert!((t.account - 101_000.0).abs() < 1e-6);
-        assert!(line.contains("R: +1.00"), "got: {line}");
-        assert!(line.contains("$101000"), "got: {line}");
+        assert!(frag.contains("R: +1.00"), "got: {frag}");
+        assert!(frag.contains("$101000"), "got: {frag}");
     }
 
     #[test]
@@ -1183,6 +1273,66 @@ mod tests {
             "a placed enter fills along the forward path (got {:?})",
             result.kind
         );
+    }
+
+    #[test]
+    fn render_emits_a_flat_time_ordered_event_stream() {
+        // A placed enter that fills then takes profit → the report is a flat,
+        // top-level, chronological event stream: `placed` on the fire bar,
+        // `FILLED` on the trigger bar, `TOOK PROFIT` on the TP bar — each its
+        // own line at its own timestamp, none nested under the entry.
+        let fire = enter_fire(
+            golden_stop_enter(false),
+            1_781_244_000,
+            EnterGateOutcome::Placed { order_id: None },
+        );
+        let replay = Replay {
+            fires: vec![fire],
+            final_state: trade_control_engine::PlanState::seed(
+                trade_control_engine::Phase::Done,
+                at(1_781_244_000 + 7200),
+            ),
+            done: true,
+            warnings: Vec::new(),
+            traces: Vec::new(),
+        };
+        let out = render(&plan_for(0.0001), &replay, true, false, &[]);
+
+        // Top-level event lines, each naming entry #1 — no "bars (entry
+        // timeline):" sub-heading, no OHLC dump, no leading-indent nested
+        // "    order:" block (the bracket is inline on the placed line).
+        assert!(
+            out.contains("entry #1 placed — order: LONG"),
+            "placed line:\n{out}"
+        );
+        assert!(out.contains("entry #1 FILLED @"), "fill line:\n{out}");
+        assert!(
+            out.contains("entry #1 STOPPED OUT →") || out.contains("entry #1 TOOK PROFIT →"),
+            "exit line:\n{out}"
+        );
+        assert!(
+            !out.contains("bars (entry timeline)"),
+            "no candle listing:\n{out}"
+        );
+        assert!(
+            !out.contains("\n    order:"),
+            "no nested order line:\n{out}"
+        );
+
+        // Events are time-ordered: placed before fill before exit.
+        let placed = out.find("placed").expect("placed present");
+        let filled = out.find("FILLED").expect("filled present");
+        let exit = out
+            .find("STOPPED OUT")
+            .or_else(|| out.find("TOOK PROFIT"))
+            .expect("exit present");
+        assert!(
+            placed < filled && filled <= exit,
+            "not time-ordered:\n{out}"
+        );
+
+        // The exit line carries the booked R fragment.
+        assert!(out.contains("R: "), "exit carries R:\n{out}");
     }
 
     fn at(secs: i64) -> DateTime<Utc> {
