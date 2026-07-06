@@ -27,11 +27,12 @@ ENV_BRANCH="staging"
 # `-staging` CLIs bake this as their default endpoint so no `--endpoint` needed.
 ENV_WEBHOOK="http://127.0.0.1:8788"
 ENV_SUFFIX="staging"
-# Pine study title tv-arm-staging arms against. Its chart study must be
-# renamed to exactly this base title. Cut fresh from main on 2026-06-23
-# (the prior staging week was unusable), so staging now tracks the current
-# Pine v25 in lockstep with dev.
-ENV_PINE_NAME="Candle Signals v25"
+# Legacy Pine study title. DEAD PLUMBING: signal detection moved fully into
+# Rust (core/src/signals/, evaluated server-side as PinePattern), so tv-arm no
+# longer matches a chart study by name and nothing reads BAKED_PINE_NAME. Kept
+# only so the deploy_env signature is stable. Identical to deploy-dev.sh's value
+# so dev and staging stay in lockstep. Set to the canonical source title.
+ENV_PINE_NAME="Candle Signals"
 
 source "$(dirname "$0")/deploy-lib.sh"
 # 6th arg "native" → skip wrangler deploy (local worker, CLIs only).
