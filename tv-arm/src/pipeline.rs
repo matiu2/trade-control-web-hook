@@ -861,6 +861,8 @@ fn build_mw_trade_spec(
         } else {
             Some(args.breakeven_pct.unwrap_or(0.5))
         },
+        // Entry SL-spread floor window baked onto the enter; `None` → worker default (5).
+        spread_window: args.spread_window,
     }
 }
 
@@ -1105,6 +1107,8 @@ fn build_trade_spec(
         } else {
             Some(args.breakeven_pct.unwrap_or(0.5))
         },
+        // Entry SL-spread floor window baked onto the enter; `None` → worker default (5).
+        spread_window: args.spread_window,
     };
     if args.sl_from_recent {
         spec.sl_anchor = Some(match direction {

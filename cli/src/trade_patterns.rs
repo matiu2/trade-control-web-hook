@@ -561,6 +561,18 @@ pub struct TradeSpec {
     /// to 0.5 by the worker/replay (`Breakeven::sane`).
     #[serde(default = "default_breakeven_pct")]
     pub breakeven_pct: Option<f64>,
+    /// Trailing-candle window the entry SL-spread floor averages the bid-ask
+    /// spread over, baked onto the `05-enter` intent's
+    /// [`spread_window`](trade_control_core::intent::Intent::spread_window).
+    ///
+    /// The floor requires `sl_distance ≥ 10 × spread`; sizing that off a single
+    /// spiky entry bar can widen the stop too far, so the worker + replay
+    /// average `ask − bid` over the last `spread_window` candles instead.
+    /// `None` (the default) leaves the field off the intent, so the worker uses
+    /// its own [`DEFAULT_SPREAD_WINDOW`](trade_control_core::intent::DEFAULT_SPREAD_WINDOW)
+    /// (5) — byte-identical wire form to pre-feature specs. Meaningful on enters.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spread_window: Option<u32>,
 }
 
 /// Default for [`TradeSpec::breakeven_pct`]: break-even is **on at 50%** unless
@@ -1015,6 +1027,9 @@ fn build_pattern(
         strategy_v2: false,
         // Break-even on at 50% by default (the standing lesson).
         breakeven_pct: default_breakeven_pct(),
+        // Interactive builder: use the worker's default window (5); the flag
+        // path (tv-arm) is where an override is set.
+        spread_window: None,
     };
     // The interactive prompt is explicitly pip-based, so thread the prompted
     // values through as the pips form (not the ATR-pct default).
@@ -1146,6 +1161,7 @@ fn assemble_trade(
         spec.recover_entry,
         false, // BCR leg → 05-enter
         breakeven_from_pct(spec.breakeven_pct),
+        spec.spread_window,
     ));
     // strategy-v2: a second enter — the Quasimodo entry — armed alongside the
     // BCR stop entry on the same setup. No preps (both skipped),
@@ -1196,6 +1212,7 @@ fn assemble_trade(
             RecoverEntryAction::Limit, // wrong-side fallback, like standalone QM
             true,                      // QM leg → 09-enter-qm
             breakeven_from_pct(spec.breakeven_pct),
+            spec.spread_window,
         ));
     }
     if spec.close_on_news || !spec.sr_reversal_ranges.is_empty() {
@@ -1359,6 +1376,7 @@ fn build_mw_pattern(spec: TradeSpec, now: DateTime<Utc>) -> Result<BuiltTrade> {
             &spec.broker,
             &spec.account,
             breakeven_from_pct(spec.breakeven_pct),
+            spec.spread_window,
         ),
     ];
 
@@ -1513,6 +1531,7 @@ fn build_mw_enter_alert(
     broker: &BrokerKind,
     account: &str,
     breakeven: Option<trade_control_core::intent::Breakeven>,
+    spread_window: Option<u32>,
 ) -> BuiltAlert {
     let id = format!("{trade_id}-enter");
     let mut intent = skeleton(
@@ -1525,6 +1544,7 @@ fn build_mw_enter_alert(
         trade_id,
     );
     intent.direction = Some(direction);
+    intent.spread_window = spread_window;
     // entry / stop_loss / take_profit deliberately left None — the worker
     // computes all three from `mw` + the shell OHLC (mid-correct).
     intent.mw = Some(mw.to_params());
@@ -1943,6 +1963,7 @@ fn build_enter_alert(
     recover_entry: RecoverEntryAction,
     qm: bool,
     breakeven: Option<trade_control_core::intent::Breakeven>,
+    spread_window: Option<u32>,
 ) -> BuiltAlert {
     // The QM leg (strategy-v2's second enter) gets the `09-enter-qm`
     // basename; every other pattern enter gets `05-enter`. This is keyed
@@ -2080,6 +2101,10 @@ fn build_enter_alert(
     // to break-even once a candle closes past this fraction of entry→TP. Default
     // on at 50% (see `TradeSpec::breakeven_pct`).
     intent.breakeven = breakeven;
+    // Entry SL-spread floor window — the worker + replay average `ask − bid`
+    // over the last `spread_window` candles instead of a single spiky bar
+    // (see `TradeSpec::spread_window`). `None` → the worker's default (5).
+    intent.spread_window = spread_window;
     let purpose = if is_qm {
         "enter: quasimodo limit at signal level, confirmed-candle gated, no preps"
     } else {
@@ -2492,6 +2517,7 @@ mod tests {
                 RecoverEntryAction::Skip,
                 false,
                 None,
+                None,
             ),
         ];
         let trade = BuiltTrade {
@@ -2535,6 +2561,7 @@ mod tests {
                 recover_entry: RecoverEntryAction::Skip,
                 strategy_v2: false,
                 breakeven_pct: default_breakeven_pct(),
+                spread_window: None,
             },
         };
         let manifest = render_manifest(&trade);
@@ -2579,6 +2606,7 @@ mod tests {
             &[],
             RecoverEntryAction::Skip,
             false,
+            None,
             None,
         );
         assert_eq!(alert.intent.direction, Some(Direction::Short));
@@ -2675,6 +2703,7 @@ mod tests {
                 recover,
                 qm,
                 None,
+                None,
             )
         };
         let alert = build(true, RecoverEntryAction::Limit);
@@ -2766,6 +2795,7 @@ mod tests {
             RecoverEntryAction::Skip,
             false,
             None,
+            None,
         );
         assert_eq!(alert.intent.entry_level_vetos, levels);
     }
@@ -2804,6 +2834,7 @@ mod tests {
             &[],
             RecoverEntryAction::Skip,
             false,
+            None,
             None,
         );
         assert_eq!(alert.intent.direction, Some(Direction::Long));
@@ -2882,6 +2913,7 @@ mod tests {
             &[],
             RecoverEntryAction::Skip,
             false,
+            None,
             None,
         );
         match &alert.intent.stop_loss {
@@ -3012,6 +3044,7 @@ mod tests {
             recover_entry: RecoverEntryAction::Skip,
             strategy_v2: false,
             breakeven_pct: default_breakeven_pct(),
+            spread_window: None,
         }
     }
 
@@ -3954,6 +3987,36 @@ tp_price: 1.05
             Some(be) => assert!((be.threshold - 0.7).abs() < 1e-9),
             None => panic!("custom breakeven_pct must be carried"),
         }
+    }
+
+    #[test]
+    fn build_trade_from_spec_default_spread_window_is_absent() {
+        // No `spread_window` in the spec → the enter leaves the field off, so
+        // the worker uses its own default (5). Absent, not baked, keeps the
+        // wire form byte-identical to pre-feature specs.
+        let now = ts("2026-05-20T00:00:00Z");
+        let spec = sample_spec(TradePattern::Hs, ts("2026-05-25T00:00:00Z"));
+        let trade = build_trade_from_spec(spec, now, BuildStrictness::Strict).unwrap();
+        let enter = trade.alerts.last().unwrap();
+        assert_eq!(
+            enter.intent.spread_window, None,
+            "default spread_window must be absent (worker default)"
+        );
+    }
+
+    #[test]
+    fn build_trade_from_spec_custom_spread_window_is_carried() {
+        // `spread_window: Some(N)` bakes onto the 05-enter intent.
+        let now = ts("2026-05-20T00:00:00Z");
+        let mut spec = sample_spec(TradePattern::Hs, ts("2026-05-25T00:00:00Z"));
+        spec.spread_window = Some(8);
+        let trade = build_trade_from_spec(spec, now, BuildStrictness::Strict).unwrap();
+        let enter = trade.alerts.last().unwrap();
+        assert_eq!(
+            enter.intent.spread_window,
+            Some(8),
+            "custom spread_window must be carried onto the enter"
+        );
     }
 
     #[test]

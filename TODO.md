@@ -30,7 +30,7 @@ System 2 (spread-hour transient widen) is **unchanged**.
 - [x] **4. broker-tradenation-adapter: real `get_bidask_candles`.**
 - [x] **5. worker `run_enter`: use windowed mean spread (fail-open to get_quote).**
 - [x] **6. replayer `apply_entry_spread_floor`: use windowed mean spread.**
-- [ ] **7. tv-arm `--spread-window N` → bake onto signed intent (+ build-trade).**
+- [x] **7. tv-arm `--spread-window N` → bake onto signed intent (+ build-trade).**
 - [ ] **8. README + CHANGELOG vNN + memory; clippy+fmt; commit/push/parent-bump.**
 
 ## Hazards to preserve
