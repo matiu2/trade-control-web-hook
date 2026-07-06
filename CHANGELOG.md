@@ -1,5 +1,52 @@
 # Changelog
 
+## v65 — 2026-07-07 — a reversal-close before any entry no longer kills the plan
+
+**Why.** `06-close-on-reversal` is "flatten the position *if* one is open". But
+the server-side engine retired the plan on **every** price-windowed reversal-close
+fire, even when **no entry had ever fired** — so a reversal candle that printed in
+the SR band *before* the trade entered archived the whole plan, and the pending
+enter never got its window. Caught live on EUR/CHF 2026-07-06
+(`ihs-eur-chf-29ebb72b`): a `06-close-on-reversal` fired at 22:00 Brisbane, was
+correctly rejected `needs-golden` (it closed nothing — the plan was still
+`AwaitEntry`), yet the plan was marked `Done` and archived at that instant. The
+`05-enter` (multi-shot, `max_retries: 5`) never fired. Operator's framing: "that
+alert only closes an existing trade; other trades can still happen after — if it
+fires when nothing is open it should only be logged."
+
+**What changed.** A reversal-close is now terminal **only if the plan has already
+fired an enter** (a position may exist → an at-band reversal is the thesis
+breaking). Before the first enter fires, the close still dispatches (for
+visibility / the harmless flatten) but the spine survives, so the pending enter
+keeps its window. This generalises the earlier news-only carve-out (v-series
+"Defect B", USD/CHF 2026-06-26) — the real discriminator is *have we entered*,
+not *news vs price*.
+
+- **New durable marker.** `PlanState::entry_fired_at: Option<DateTime<Utc>>`
+  (signed/persisted, `advanced_vs`-tracked) — stamped whenever an entry rule
+  fires. It's the only "have we tried to open a position?" signal the engine has,
+  because a **multi-shot** enter (`max_retries > 0`) never latches into `fired`
+  (it stays in `AwaitEntry` to re-enter). Exactly the EUR/CHF case.
+- **`guard_is_terminal(intent, entered)`** — gains the `entered` arg. `!entered`
+  → non-terminal regardless of window shape. `entered` → prior rule (news-only
+  non-terminal, price-windowed terminal).
+- **Shared engine** — both the live worker cron and the offline `replay-candles`
+  sim get the fix (one `evaluate_plan`). The replay's reversal-close post-pass
+  already only flattens an *open* position, so a pre-entry fire that closes
+  nothing is a no-op there too — consistent, no replay-side change.
+
+**Breaking.** None (wire-compatible: `entry_fired_at` is `#[serde(default)]`).
+
+**Config.** None.
+
+**Tests.** `price_close_before_any_entry_fires_but_is_non_terminal` (the EUR/CHF
+repro), `news_close_stays_non_terminal_even_after_an_entry` (the `entered` gate
+must not make news-closes terminal); the two prior price-close terminal tests now
+seed an entry first (`seed_entered_at`). 120 engine + 785 core green.
+
+**Follow-up.** None. Same-class as the news carve-out and the shared-engine rule
+(`strategy_changes_in_both_replayer_and_worker`).
+
 ## v64 — 2026-07-06 — entry SL-spread floor: mean spread over a trailing window (one shared bar provider)
 
 **Why.** The entry SL-vs-spread floor (`sl_distance ≥ 10 × spread`) sized off a
