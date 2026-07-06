@@ -133,16 +133,17 @@ struct Args {
     verbose: bool,
 
     /// After replaying, draw each *filled* position onto the live TradingView
-    /// chart (two rectangles per trade: entry→TP green, entry→SL red), spanning
-    /// the fill bar to the exit. Prior `--annotate` drawings are cleared first;
-    /// your hand-drawn necklines/fibs are left alone. Implies `--simulate`
-    /// (annotation needs the simulated fill). Uses the same tv-mcp chart as
-    /// window resolution (`--tv-mcp-root`).
+    /// chart as a native long/short position tool (green profit zone, red stop
+    /// zone) plus a small outcome label, spanning the fill bar to the exit.
+    /// Prior `--annotate` drawings are cleared first (tracked by entity-id in a
+    /// sidecar manifest); your hand-drawn necklines/fibs are left alone. Implies
+    /// `--simulate` (annotation needs the simulated fill). Uses the same tv-mcp
+    /// chart as window resolution (`--tv-mcp-root`).
     #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
     annotate: bool,
 
     /// Also annotate *not-taken* trades — pending orders that never filled and
-    /// entries the worker declined — as muted grey boxes at the fire bar. Only
+    /// entries the worker declined — as muted grey brackets at the fire bar. Only
     /// meaningful with `--annotate` (and implies it). Off by default, so a
     /// plain `--annotate` shows just the taken positions.
     #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
@@ -266,7 +267,17 @@ async fn main() -> Result<()> {
     // actually fires (without it the window stops one bar short and the plan
     // never retires). Harmless when there's no expiry: the engine stops at the
     // first `done`, and trailing candles are ignored.
-    let pull_end = end + Duration::seconds(gran.engine().seconds());
+    let pull_end_raw = end + Duration::seconds(gran.engine().seconds());
+    // Clamp to the last *closed* bar: a plan whose trade-expiry is still in the
+    // future asks for candles that don't exist yet, and OANDA rejects a request
+    // whose `from` lands in the future ("Invalid value specified for 'from'.
+    // Time is in the future") — the request optimizer's gap-fill chunk for the
+    // not-yet-printed tail starts at a future `from`. There's nothing to replay
+    // past now anyway — the engine only sees bars that have printed. Snap the
+    // pull end back to one bar before now, so we only ever request fully closed
+    // bars and never the current still-forming one.
+    let last_closed = Utc::now() - Duration::seconds(gran.engine().seconds());
+    let pull_end = pull_end_raw.min(last_closed);
 
     // Pull a silent warm-up prefix before `start`: these bars seed the detector
     // (warm ATR, pattern context) and the FSM but fire nothing — the plan goes

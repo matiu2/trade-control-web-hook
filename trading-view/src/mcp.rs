@@ -141,11 +141,10 @@ impl TvMcp {
     /// its `transparency` (0 = opaque, 100 = invisible) and labelled with
     /// its `text`. Returns the new drawing's entity-id.
     ///
-    /// This is the primitive `replay-candles --annotate` draws positions
-    /// with: TradingView's native position tool can't be created through
-    /// tv-mcp (`createMultipointShape` silently no-ops for it), but the
-    /// rectangle lands cleanly, so a position is two rectangles
-    /// (entry→TP green, entry→SL red).
+    /// General-purpose zone primitive. `replay-candles --annotate` used to
+    /// draw positions as two of these; it now uses the native position tool
+    /// ([`Self::draw_position_tool`]) instead, since that *can* be created
+    /// through tv-mcp once its create-promise is awaited.
     pub fn draw_rectangle(&self, rect: &Rect<'_>) -> Result<DrawShapeResult> {
         let overrides = rectangle_overrides(rect.color, rect.transparency);
         self.call_json(&[
@@ -168,11 +167,118 @@ impl TvMcp {
         ])
     }
 
+    /// Draw a native TradingView long/short **position tool** (its
+    /// risk/reward bracket) from absolute entry / stop / take-profit prices.
+    ///
+    /// Unlike [`Self::draw_rectangle`], this lands the real position tool —
+    /// the bridge converts the absolute stop/profit prices into the tool's
+    /// tick-offset `stopLevel`/`profitLevel` using the live series mintick,
+    /// and *awaits* `createShape`'s promise (the non-awaited path reports the
+    /// tool as not-landed even though it does). The position tool carries **no
+    /// text field**, so the caller tags/cleans it via a sidecar id manifest,
+    /// not a `replay:` text prefix. Returns the new drawing's entity-id.
+    pub fn draw_position_tool(&self, pos: &Position<'_>) -> Result<DrawShapeResult> {
+        let dir = match pos.direction {
+            PositionSide::Long => "long",
+            PositionSide::Short => "short",
+        };
+        let overrides = position_overrides(pos.color, pos.transparency);
+        self.call_json(&[
+            "draw",
+            "position",
+            "-d",
+            dir,
+            "--time",
+            &pos.time1.to_string(),
+            "-p",
+            &pos.entry.to_string(),
+            "--stop",
+            &pos.stop_loss.to_string(),
+            "--profit",
+            &pos.take_profit.to_string(),
+            "--time2",
+            &pos.time2.to_string(),
+            "--overrides",
+            &overrides,
+        ])
+    }
+
+    /// Draw a small text label anchored at `time`/`price`, tinted `color`.
+    /// Used to stamp a position's outcome (`TP`/`SL`/`no-fill`/`open`) next to
+    /// the native position tool, which has no text field of its own. Returns
+    /// the new drawing's entity-id so the caller can track it for cleanup.
+    pub fn draw_text(
+        &self,
+        time: i64,
+        price: f64,
+        text: &str,
+        color: &str,
+    ) -> Result<DrawShapeResult> {
+        let overrides = format!("{{\"color\":{color:?}}}");
+        self.call_json(&[
+            "draw",
+            "shape",
+            "-t",
+            "text",
+            "--time",
+            &time.to_string(),
+            "-p",
+            &price.to_string(),
+            "--overrides",
+            &overrides,
+            "--text",
+            text,
+        ])
+    }
+
     /// `draw remove <id>` — delete one drawing by entity-id. Used to
-    /// clear prior `--annotate` rectangles before redrawing.
+    /// clear prior `--annotate` drawings before redrawing.
     pub fn remove_drawing(&self, entity_id: &str) -> Result<RemoveDrawingResult> {
         self.call_json(&["draw", "remove", entity_id])
     }
+}
+
+/// Which side a [`Position`] tool is drawn for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PositionSide {
+    /// A long risk/reward bracket (stop below entry, profit above).
+    Long,
+    /// A short risk/reward bracket (stop above entry, profit below).
+    Short,
+}
+
+/// A native position tool to draw: entry anchored at `(time1, entry)`, with
+/// absolute `stop_loss` / `take_profit` prices and a `time2` right edge for
+/// the box extent. `color`/`transparency` tint the profit & stop zones. The
+/// bridge converts the SL/TP prices into the tool's tick-offset levels.
+#[derive(Debug, Clone, Copy)]
+pub struct Position<'a> {
+    /// Entry-bar time (UNIX seconds).
+    pub time1: i64,
+    /// Right-edge time (UNIX seconds) — where the box ends.
+    pub time2: i64,
+    /// Entry price (absolute).
+    pub entry: f64,
+    /// Stop-loss price (absolute).
+    pub stop_loss: f64,
+    /// Take-profit price (absolute).
+    pub take_profit: f64,
+    /// Long or short bracket.
+    pub direction: PositionSide,
+    /// `#rrggbb` line tint.
+    pub color: &'a str,
+    /// Zone-fill transparency: 0 opaque … 100 invisible.
+    pub transparency: u8,
+}
+
+/// Build the `--overrides` JSON for a position tool: tint the bracket line
+/// and set both stop/profit zone transparencies. Kept separate so it's
+/// unit-testable without shelling to Node. (The tool rejects a `text`
+/// override — that throws "Value is undefined" — so none is set here.)
+fn position_overrides(color: &str, transparency: u8) -> String {
+    format!(
+        "{{\"linecolor\":{color:?},\"stopBackgroundTransparency\":{transparency},\"profitBackgroundTransparency\":{transparency}}}"
+    )
 }
 
 /// Result of `tv-mcp draw shape`. The CLI returns `{success, shape,
@@ -282,6 +388,20 @@ mod tests {
         // The box must stay finite — no chart-spanning extension.
         assert_eq!(parsed["extendLeft"], false);
         assert_eq!(parsed["extendRight"], false);
+    }
+
+    #[test]
+    fn position_overrides_tints_line_and_zone_transparency() {
+        let o = position_overrides("#26a69a", 80);
+        let parsed: serde_json::Value = serde_json::from_str(&o).expect("valid json");
+        assert_eq!(parsed["linecolor"], "#26a69a");
+        assert_eq!(parsed["stopBackgroundTransparency"], 80);
+        assert_eq!(parsed["profitBackgroundTransparency"], 80);
+        // No `text` key — the position tool rejects it ("Value is undefined").
+        assert!(
+            parsed.get("text").is_none(),
+            "position tool takes no text override"
+        );
     }
 
     #[test]
