@@ -23,13 +23,7 @@ ENV_BRANCH="main"
 # bake this as their default endpoint so no `--endpoint` flag is needed.
 ENV_WEBHOOK="http://127.0.0.1:8787"
 ENV_SUFFIX="dev"
-# Legacy Pine study title. DEAD PLUMBING: signal detection moved fully into
-# Rust (core/src/signals/, evaluated server-side as PinePattern), so tv-arm no
-# longer matches a chart study by name and nothing reads BAKED_PINE_NAME. Kept
-# only so the deploy_env signature is stable. Dev and staging share this exact
-# value in lockstep — see deploy-staging.sh. Set to the canonical source title.
-ENV_PINE_NAME="Candle Signals"
 
 source "$(dirname "$0")/deploy-lib.sh"
-# 6th arg "native" → skip wrangler deploy (local worker, CLIs only).
-deploy_env "$ENV_NAME" "$ENV_BRANCH" "$ENV_WEBHOOK" "$ENV_SUFFIX" "$ENV_PINE_NAME" native
+# 5th arg "native" → skip wrangler deploy (local worker, CLIs only).
+deploy_env "$ENV_NAME" "$ENV_BRANCH" "$ENV_WEBHOOK" "$ENV_SUFFIX" native
