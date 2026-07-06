@@ -73,6 +73,41 @@ impl BidAskCandle {
             c: self.c,
         }
     }
+
+    /// This bar's close spread, `ask_c − bid_c` (raw price). The per-bar sample
+    /// the entry SL-spread floor averages.
+    pub fn close_spread(&self) -> f64 {
+        self.ask_c - self.bid_c
+    }
+}
+
+/// The mean close spread (`ask_c − bid_c`) over the **last `window`** candles of
+/// an ascending `candles` slice, and how many bars fed the mean — the single
+/// "trailing window → spread" reduction shared by the live worker
+/// (`run_enter`'s `windowed_entry_spread`, over broker-fetched candles) and the
+/// offline replay (its `Fire`-builder, over the recorded series). Both fetch the
+/// candles through the **same** provider ([`super::Broker::get_bidask_candles`])
+/// and then call THIS to reduce them, so they can't size the floor off different
+/// statistics.
+///
+/// `window` is the trade's [`spread_window`](crate::intent::Intent::spread_window)
+/// (already defaulted). Takes the most recent `window` bars (the tail, since the
+/// slice is ascending), maps each to its [`BidAskCandle::close_spread`], and
+/// means them via [`crate::intent::mean_spread`] (which drops degenerate
+/// samples). `None` when `candles` is empty or every recent bar is degenerate —
+/// the caller then fails open to its single-sample path.
+pub fn trailing_spread_mean(candles: &[BidAskCandle], window: u32) -> Option<(f64, usize)> {
+    if candles.is_empty() {
+        return None;
+    }
+    let window = window.max(1) as usize;
+    let start = candles.len().saturating_sub(window);
+    let spreads: Vec<f64> = candles[start..]
+        .iter()
+        .map(BidAskCandle::close_spread)
+        .collect();
+    let mean = crate::intent::mean_spread(&spreads)?;
+    Some((mean, spreads.len()))
 }
 
 /// The candle timeframes the engine fetches. Deliberately a small closed set —
@@ -162,6 +197,74 @@ mod tests {
             l: c,
             c,
         }
+    }
+
+    /// A bid/ask candle whose close spread is exactly `spread` (bid_c = mid,
+    /// ask_c = mid + spread). Only the close books matter for `close_spread`.
+    fn ba(time: &str, mid: f64, spread: f64) -> BidAskCandle {
+        BidAskCandle {
+            time: ts(time),
+            o: mid,
+            h: mid,
+            l: mid,
+            c: mid,
+            bid_o: mid,
+            bid_h: mid,
+            bid_l: mid,
+            bid_c: mid,
+            ask_o: mid + spread,
+            ask_h: mid + spread,
+            ask_l: mid + spread,
+            ask_c: mid + spread,
+        }
+    }
+
+    #[test]
+    fn trailing_mean_averages_last_window_bars() {
+        // Five bars; window 3 → mean of the LAST three spreads (0.0002, 0.0002,
+        // 0.0020) = 0.0008. The two earlier calm bars are outside the window.
+        let bars = vec![
+            ba("2026-07-05T18:00:00Z", 1.10, 0.0001),
+            ba("2026-07-05T19:00:00Z", 1.10, 0.0001),
+            ba("2026-07-05T20:00:00Z", 1.10, 0.0002),
+            ba("2026-07-05T21:00:00Z", 1.10, 0.0002),
+            ba("2026-07-05T22:00:00Z", 1.10, 0.0020),
+        ];
+        let (mean, n) = trailing_spread_mean(&bars, 3).expect("some");
+        assert_eq!(n, 3);
+        assert!((mean - 0.0008).abs() < 1e-9, "{mean}");
+    }
+
+    #[test]
+    fn trailing_mean_window_larger_than_series_uses_all() {
+        let bars = vec![
+            ba("2026-07-05T20:00:00Z", 1.10, 0.0002),
+            ba("2026-07-05T21:00:00Z", 1.10, 0.0004),
+        ];
+        let (mean, n) = trailing_spread_mean(&bars, 10).expect("some");
+        assert_eq!(n, 2);
+        assert!((mean - 0.0003).abs() < 1e-9, "{mean}");
+    }
+
+    #[test]
+    fn trailing_mean_empty_is_none() {
+        assert_eq!(trailing_spread_mean(&[], 5), None);
+    }
+
+    #[test]
+    fn trailing_mean_damps_a_spiky_entry_bar() {
+        // The bug this fixes: the ENTRY bar (last) is spiky (20 pips) while the
+        // prior four are calm (1.5). Single-sample would floor off 0.0020; the
+        // windowed mean over 5 is (4×0.00015 + 0.0020)/5 = 0.00052.
+        let bars = vec![
+            ba("2026-07-05T18:00:00Z", 1.10, 0.00015),
+            ba("2026-07-05T19:00:00Z", 1.10, 0.00015),
+            ba("2026-07-05T20:00:00Z", 1.10, 0.00015),
+            ba("2026-07-05T21:00:00Z", 1.10, 0.00015),
+            ba("2026-07-05T22:00:00Z", 1.10, 0.0020),
+        ];
+        let (mean, _) = trailing_spread_mean(&bars, 5).expect("some");
+        assert!((mean - 0.00052).abs() < 1e-9, "{mean}");
     }
 
     #[test]

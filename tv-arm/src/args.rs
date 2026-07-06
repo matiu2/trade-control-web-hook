@@ -308,6 +308,16 @@ pub struct Args {
     #[arg(long)]
     pub retest_atr_step: Option<f64>,
 
+    /// Number of trailing candles the entry SL-spread floor averages the bid-ask
+    /// spread over (default 5). The floor requires `sl_distance ≥ 10 × spread`;
+    /// sizing that off a single spiky entry bar can widen the stop too far, so
+    /// the worker + replay average `ask − bid` over the last `N` candles
+    /// instead. Higher = smoother (a lone spike diluted more); `1` = the old
+    /// single-bar behaviour. Bakes onto the signed `05-enter` intent's
+    /// `spread_window`; omit to use the worker's default (5).
+    #[arg(long)]
+    pub spread_window: Option<u32>,
+
     /// Drop the break-and-close prep from the bundle (no alert
     /// emitted and the entry no longer requires it).
     #[arg(long)]

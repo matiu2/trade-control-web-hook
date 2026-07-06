@@ -8,10 +8,11 @@
 //! fill.
 
 use chrono::{DateTime, Duration, Utc};
+use trade_control_core::broker::Broker;
 use trade_control_core::dispatch::{self, ActionResult};
 use trade_control_core::dispatch_config::DispatchConfig;
 use trade_control_core::incoming::Verified;
-use trade_control_core::intent::{Action, Shell};
+use trade_control_core::intent::{Action, Intent as TcIntent, Shell};
 use trade_control_core::pause_gate;
 use trade_control_core::state::MemStateStore;
 use trade_control_engine::BidAskCandle as EngineCandle;
@@ -61,6 +62,14 @@ pub struct Fire {
     /// standalone simulated fill. The faithful model: a new entry cancels any
     /// resting sibling/prior order on the same setup.
     pub superseded: bool,
+    /// The MEAN bid-ask spread over the trailing `spread_window` bars at the
+    /// fire bar, fetched through the SAME `Broker::get_bidask_candles` provider
+    /// (on the `ReplayBroker`) that `run_enter`'s gate used to place the stop.
+    /// The report's displayed bracket + simulated exit + System-2 baseline all
+    /// floor off THIS, so they match the gate's placed stop instead of the
+    /// single fire-bar spread. `None` when unavailable (falls back to the fire
+    /// bar's own close spread — the pre-window behaviour).
+    pub entry_spread_price: Option<f64>,
 }
 
 impl Fire {
@@ -331,11 +340,21 @@ pub async fn run(
 
             // The fill simulator walks candles at/after the firing bar.
             let forward = candles[i..].to_vec();
+            // Capture the entry-spread window through the SAME provider the gate
+            // used (`ReplayBroker::get_bidask_candles`, bounded at the fire bar),
+            // so the report's bracket/exit floor off the identical statistic the
+            // gate placed the stop with. Only meaningful for an enter.
+            let entry_spread_price = if fired.intent.action == Action::Enter {
+                entry_spread_for(&replay_broker, &fired.intent, granularity, now).await
+            } else {
+                None
+            };
             fires.push(Fire {
                 fired,
                 forward,
                 gate_outcome,
                 superseded: false,
+                entry_spread_price,
             });
         }
 
@@ -352,6 +371,31 @@ pub async fn run(
         warnings,
         traces,
     }
+}
+
+/// The mean bid-ask spread over the trailing `spread_window` bars at the fire
+/// bar, read through the SAME `Broker::get_bidask_candles` provider the gate
+/// used — so the report's displayed/simulated floor matches the gate's placed
+/// stop. Mirrors the gate's count-back window (`window + 2` bars of slack) and
+/// reduces with the shared `trailing_spread_mean`. `None` when unavailable (the
+/// report then falls back to the fire bar's own close spread).
+async fn entry_spread_for(
+    broker: &ReplayBroker,
+    intent: &TcIntent,
+    granularity: Granularity,
+    now: DateTime<Utc>,
+) -> Option<f64> {
+    let window = intent
+        .spread_window
+        .unwrap_or(trade_control_core::intent::DEFAULT_SPREAD_WINDOW)
+        .max(1);
+    let lookback_bars = (window as i64) + 2;
+    let since = now - Duration::seconds(granularity.seconds() * lookback_bars);
+    let candles = broker
+        .get_bidask_candles(&intent.instrument, granularity, since, now)
+        .await
+        .ok()?;
+    trade_control_core::broker::trailing_spread_mean(&candles, window).map(|(mean, _)| mean)
 }
 
 /// The pip size every resolution in the replay uses — the plan's baked value.

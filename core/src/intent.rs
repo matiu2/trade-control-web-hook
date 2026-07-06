@@ -30,8 +30,8 @@ pub use mw_state::{MwAnchors, MwUpdate, effective_mw_params, plan_mw_update};
 pub use resolution::MIN_R_FLOOR;
 pub use resolution::{ResolveError, Resolved, ResolvedEntry, ResolvedRecoverEntry, RiskBudget};
 pub use sl_spread_floor::{
-    SL_MIN_SPREAD_MULTIPLE, SL_WIDEN_SPREAD_MULTIPLE, SlWiden, sl_spread_floor_violation,
-    widen_sl_to_spread_floor,
+    DEFAULT_SPREAD_WINDOW, SL_MIN_SPREAD_MULTIPLE, SL_WIDEN_SPREAD_MULTIPLE, SlWiden, mean_spread,
+    sl_spread_floor_violation, widen_sl_to_spread_floor,
 };
 
 /// Plaintext outer YAML — the part TradingView substitutes `{{...}}` into.
@@ -824,6 +824,21 @@ pub struct Intent {
     /// `tv-arm` sets both to the same number.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pip_size: Option<f64>,
+    /// Number of trailing candles the **entry SL-spread floor** averages the
+    /// bid-ask spread over (see [`sl_spread_floor::mean_spread`]).
+    ///
+    /// The floor requires `sl_distance ≥ SL_MIN_SPREAD_MULTIPLE × spread`. Sizing
+    /// that off a single sample lets a spiky entry candle blow the stop out;
+    /// averaging over the last `spread_window` candles (including the entry bar)
+    /// damps a lone spike. Both consumers use it identically — the live worker
+    /// (`run_enter`, over broker bid/ask candles) and the offline replay
+    /// (`apply_entry_spread_floor`, over the recorded book) — so they can't drift.
+    ///
+    /// Absent ⇒ [`sl_spread_floor::DEFAULT_SPREAD_WINDOW`] (5). Signed as part of
+    /// the whole-body HMAC; `#[serde(default)]` + skip-if-none keep the wire form
+    /// byte-identical to pre-feature intents. Meaningful on `Action::Enter`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spread_window: Option<u32>,
     /// Server-side [`TradePlan`](crate::trade_plan::TradePlan) — present only
     /// on an [`Action::Register`] intent, absent on every other action. The
     /// engine reads this, persists the plan, and from then on evaluates the

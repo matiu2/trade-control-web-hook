@@ -274,6 +274,7 @@ fn build_pause_intent(
         reason: spec.reason.clone(),
         mw: None,
         pip_size: None,
+        spread_window: None,
         trade_plan: None,
         blackout_close: trade_control_core::intent::BlackoutCloseAction::default(),
         breakeven: None,

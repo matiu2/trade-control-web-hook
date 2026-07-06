@@ -25,7 +25,8 @@ use trade_control_core::intent::{
 use trade_control_core::spread_blackout::elevated_threshold_pips;
 use trade_control_engine::{
     BidAskCandle as EngineCandle, EntryFloor, SimOutcome, SweepReason, TradePlan,
-    apply_entry_spread_floor, breakeven_armed_at, simulate_fill, sweep_reason, widened_stop_at,
+    apply_entry_spread_floor, breakeven_armed_at, simulate_fill_windowed, sweep_reason,
+    widened_stop_at,
 };
 
 use super::brisbane::bne;
@@ -297,9 +298,20 @@ pub fn resolve_fire_any(plan: &TradePlan, fire: &Fire, closes: &[CloseFire]) -> 
     // same stop the sim and the live worker actually protect with. Shared helper
     // so the annotation, the order line, the sim exit, and System 2's baseline
     // all floor identically.
-    apply_entry_spread_floor(&mut resolved, plan.pip_size, &fire.forward);
+    apply_entry_spread_floor(
+        &mut resolved,
+        plan.pip_size,
+        &fire.forward,
+        fire.entry_spread_price,
+    );
 
-    let raw = simulate_fill(intent, &shell, plan.pip_size, &fire.forward);
+    let raw = simulate_fill_windowed(
+        intent,
+        &shell,
+        plan.pip_size,
+        &fire.forward,
+        fire.entry_spread_price,
+    );
     let (fill_at, until, entry_price, kind) = match apply_reversal_close(raw, closes) {
         ReplayOutcome::ClosedOnReversal {
             fill_at,
@@ -626,7 +638,12 @@ fn render_fire(
     let placed_note = match Resolved::from_intent(intent, &shell, plan.pip_size) {
         Ok(mut resolved) => {
             let signed_sl = resolved.stop_loss;
-            let floor = apply_entry_spread_floor(&mut resolved, plan.pip_size, &fire.forward);
+            let floor = apply_entry_spread_floor(
+                &mut resolved,
+                plan.pip_size,
+                &fire.forward,
+                fire.entry_spread_price,
+            );
             protected_stop = Some(resolved.stop_loss);
             let mut note = format!("{ev} placed — {}", describe_order(&resolved, plan.pip_size));
             // When the floor moved the stop, note the spread that sized it.
@@ -695,9 +712,14 @@ fn render_fire(
     // snapping back, not a permanent risk change. Informational only —
     // `simulate_fill` scores the exit against the un-widened bracket.
     let widen_trigger = elevated_threshold_pips(&intent.instrument);
-    if let Some(widen) =
-        widened_stop_at(intent, &shell, plan.pip_size, &fire.forward, widen_trigger)
-    {
+    if let Some(widen) = widened_stop_at(
+        intent,
+        &shell,
+        plan.pip_size,
+        &fire.forward,
+        widen_trigger,
+        fire.entry_spread_price,
+    ) {
         events.push(EntryEvent {
             at: widen.at,
             note: format!(
@@ -728,7 +750,13 @@ fn render_fire(
         }
     }
 
-    let raw = simulate_fill(intent, &shell, plan.pip_size, &fire.forward);
+    let raw = simulate_fill_windowed(
+        intent,
+        &shell,
+        plan.pip_size,
+        &fire.forward,
+        fire.entry_spread_price,
+    );
     match apply_reversal_close(raw, closes) {
         ReplayOutcome::ClosedOnReversal {
             entry_price,
@@ -1216,6 +1244,10 @@ mod tests {
             ],
             gate_outcome,
             superseded: false,
+            // No windowed spread in the fixture → the floor falls back to the
+            // fire bar's own close spread, the pre-window behaviour these tests
+            // were written against.
+            entry_spread_price: None,
         }
     }
 

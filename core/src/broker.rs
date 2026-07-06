@@ -382,6 +382,30 @@ pub trait Broker {
         since: DateTime<Utc>,
         now: DateTime<Utc>,
     ) -> impl Future<Output = Result<Vec<Candle>, CandleError>>;
+
+    /// Fetch **closed** candles carrying **both** mid and the broker's per-bar
+    /// bid/ask books ([`BidAskCandle`]), same `(since, now]` windowing contract
+    /// as [`Broker::get_candles`] (closed-only, strictly-after-`since`,
+    /// ascending). The extra books let a caller read the real spread bar-by-bar
+    /// — the [`entry SL-spread floor`](crate::intent::mean_spread) averages
+    /// `ask_c − bid_c` over the last N to avoid sizing off one spiky bar.
+    ///
+    /// **Default impl returns [`CandleError::Transient`]** so a broker that
+    /// hasn't implemented a two-sided candle feed compiles unchanged and its
+    /// callers **fail open** (the SL-floor caller falls back to its single
+    /// live-quote path — the pre-window behaviour). A real impl (OANDA keeps the
+    /// `MBA` bid/ask it already fetches; TradeNation fetches bid+ask) overrides
+    /// this. Distinct from `get_candles` so the engine's mid-only evaluation
+    /// path (which must stay mid) is untouched.
+    fn get_bidask_candles(
+        &self,
+        _instrument: &str,
+        _granularity: Granularity,
+        _since: DateTime<Utc>,
+        _now: DateTime<Utc>,
+    ) -> impl Future<Output = Result<Vec<BidAskCandle>, CandleError>> {
+        async { Err(CandleError::Transient) }
+    }
 }
 
 #[cfg(test)]

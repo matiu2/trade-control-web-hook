@@ -1,5 +1,55 @@
 # Changelog
 
+## v64 — 2026-07-06 — entry SL-spread floor: mean spread over a trailing window (one shared bar provider)
+
+**Why.** The entry SL-vs-spread floor (`sl_distance ≥ 10 × spread`) sized off a
+**single** spread sample — one live `get_quote` on the worker, the fire bar's
+`ask_c − bid_c` in replay. Entry candles are often spiky (high volatility → a
+momentarily wide spread on that exact bar), so a one-off spike blew the 10×
+floor out and widened the stop far past the instrument's normal spread. Observed
+on live demo entries where the placed stop was noticeably wider than warranted.
+
+**What changed.** The floor now sizes off the **mean `ask − bid` over the last N
+candles** (default **5**, per-trade tunable), and the worker and the offline
+replay reach that window through the **same bar provider** so they can't drift.
+
+- **One shared provider + reducer.** `Broker::get_bidask_candles` (new trait
+  method, default no-op) is the single window source; `core::broker::
+  trailing_spread_mean(candles, window)` is the single reducer (mean of the last
+  N bars' close spread, degenerate samples dropped). Real impls: OANDA (keeps the
+  `MBA` bid/ask it already fetches) and TradeNation (three `PriceType` fetches
+  zipped by timestamp).
+- **Worker** (`run_enter`): `windowed_entry_spread` fetches the last N via
+  `get_bidask_candles` and reduces with `trailing_spread_mean`; feeds the floor.
+  Fails open to a single live `get_quote` when the window is unavailable (no plan
+  granularity, fetch error, or all-degenerate window) — the pre-window behaviour.
+- **Replay**: `ReplayBroker` now implements `get_bidask_candles` from its own
+  recorded series (bounded at `as_of`), so the replay's entry **gate** runs the
+  identical `run_enter` + windowed floor. The displayed bracket / simulated exit /
+  System-2 baseline read the same windowed mean off `Fire.entry_spread_price`.
+- **Engine**: `apply_entry_spread_floor` gains `entry_spread_price: Option<f64>`
+  (prefer the windowed mean; fall back to the fire bar). `simulate_fill_windowed`
+  + `widened_stop_at` thread it; `simulate_fill` stays a `None` wrapper so all
+  prior sim tests are byte-identical.
+- **tv-arm**: `--spread-window N` bakes onto the signed `05-enter` intent.
+
+**Config.** New signed `Intent.spread_window: Option<u32>` (default absent →
+worker default 5) + `TradeSpec.spread_window` + `tv-arm --spread-window`. System
+2 (spread-hour transient widen) is **unchanged** — this is only the System-1
+entry floor.
+
+**Breaking.** `Broker` gains `get_bidask_candles` (default-impl'd, so existing
+impls compile). `apply_entry_spread_floor` / `widened_stop_at` gained an
+`entry_spread_price` arg; `simulate_fill` unchanged (new `simulate_fill_windowed`
+carries the window).
+
+**Tests.** `trailing_spread_mean` (mean / window>series / empty / spike-damp),
+`mean_spread` (skip-degenerate / spike-damp), engine
+`entry_floor_prefers_supplied_window_spread_over_fire_bar`, tv-arm
+`build_trade_from_spec_{default,custom}_spread_window`. Full workspace green
+single-threaded (one annotate test is a pre-existing `HOME` env race under the
+parallel runner).
+
 ## v63 — 2026-07-06 — replay: gap-through fills, native position-tool annotation, window clamp; Cloudflare fully retired
 
 **Why.** A batch of replay-fidelity fixes plus the environment/tooling cleanup

@@ -137,6 +137,24 @@ pub fn simulate_fill(
     pip_size: f64,
     candles: &[BidAskCandle],
 ) -> SimOutcome {
+    // Single-sample entry floor (fire bar's own spread) — the pre-window
+    // behaviour. Callers with a trailing spread window use `simulate_fill_windowed`.
+    simulate_fill_windowed(intent, shell, pip_size, candles, None)
+}
+
+/// [`simulate_fill`] with an explicit `entry_spread_price` — the MEAN spread
+/// over the trailing window, computed by the caller through the shared
+/// `get_bidask_candles` provider + `trailing_spread_mean` (so the simulated
+/// exit is floored off the SAME statistic the live worker's gate placed the
+/// stop with). `None` falls back to the fire bar's own close spread — identical
+/// to [`simulate_fill`].
+pub fn simulate_fill_windowed(
+    intent: &Intent,
+    shell: &Shell,
+    pip_size: f64,
+    candles: &[BidAskCandle],
+    entry_spread_price: Option<f64>,
+) -> SimOutcome {
     // `mut` so the SL-spread-floor widen mirror below can move `stop_loss` in
     // place — exactly as the worker's `run_enter` does — before the fill / exit
     // simulation reads it.
@@ -190,7 +208,9 @@ pub fn simulate_fill(
     // never at. The widen mutates `resolved.stop_loss` so both `find_fill` and
     // the exit loop below see the widened level — and break-even arms off the
     // widened geometry, matching the live position.
-    if let EntryFloor::Rejected = apply_entry_spread_floor(&mut resolved, pip_size, candles) {
+    if let EntryFloor::Rejected =
+        apply_entry_spread_floor(&mut resolved, pip_size, candles, entry_spread_price)
+    {
         return SimOutcome::Declined {
             name: "sl-widen-below-min-r".to_string(),
         };
@@ -572,11 +592,23 @@ pub fn apply_entry_spread_floor(
     resolved: &mut Resolved,
     pip_size: f64,
     candles: &[BidAskCandle],
+    entry_spread_price: Option<f64>,
 ) -> EntryFloor {
-    let Some(fire) = candles.first() else {
-        return EntryFloor::Applied { spread_pips: 0.0 };
+    // The spread the floor sizes off. Prefer a caller-supplied
+    // `entry_spread_price` — the MEAN over the trailing spread window, computed
+    // once by the caller via the shared `get_bidask_candles` provider +
+    // `trailing_spread_mean` (so worker and replay agree). Fall back to the fire
+    // bar's own close spread (`candles.first()`) when the caller has no window —
+    // the pre-window single-sample behaviour every existing test relies on.
+    let spread_price = match entry_spread_price {
+        Some(s) => s,
+        None => {
+            let Some(fire) = candles.first() else {
+                return EntryFloor::Applied { spread_pips: 0.0 };
+            };
+            fire.close_spread()
+        }
     };
-    let spread_price = fire.ask_c - fire.bid_c;
     match widen_sl_to_spread_floor(
         resolved.entry.reference_price(),
         resolved.stop_loss,
@@ -671,6 +703,7 @@ pub fn widened_stop_at(
     pip_size: f64,
     candles: &[BidAskCandle],
     widen_trigger_pips: f64,
+    entry_spread_price: Option<f64>,
 ) -> Option<SpreadWiden> {
     if !pip_size.is_finite() || pip_size <= 0.0 {
         return None;
@@ -678,9 +711,12 @@ pub fn widened_stop_at(
     let mut resolved = Resolved::from_intent(intent, shell, pip_size).ok()?;
     // Floor the baseline to the placed stop (System 1) so System 2 widens from
     // and restores to the SAME level the order line shows — not the un-floored
-    // signed SL. A reject means the live worker declined the entry, so there's
-    // no open position to widen.
-    if let EntryFloor::Rejected = apply_entry_spread_floor(&mut resolved, pip_size, candles) {
+    // signed SL. Uses the SAME trailing-window entry spread as the gate/sim
+    // (via `entry_spread_price`) so all three floor to one number. A reject
+    // means the live worker declined the entry, so there's no position to widen.
+    if let EntryFloor::Rejected =
+        apply_entry_spread_floor(&mut resolved, pip_size, candles, entry_spread_price)
+    {
         return None;
     }
     let dir = resolved.direction;
@@ -944,6 +980,65 @@ mod tests {
         i
     }
 
+    #[test]
+    fn entry_floor_prefers_supplied_window_spread_over_fire_bar() {
+        // A short entry at 1.1000, SL 1.1005 (5 pips above), TP 1.0950. The fire
+        // bar is spiky (20-pip spread) but the WINDOWED mean is calm (1 pip).
+        let mut intent = base_enter();
+        intent.direction = Some(Direction::Short);
+        intent.entry = Some(EntrySpec::Stop {
+            from: PriceAnchor::Close,
+            offset_pips: 0.0,
+            at: Some(1.1000),
+            offset_atr_pct: None,
+            recover_entry: None,
+        });
+        intent.stop_loss = Some(PriceRef::Absolute { absolute: 1.1005 });
+        // TP far enough (400 pips) that even the fire-bar 200-pip widen keeps
+        // R ≥ 1, so both paths are Applied and the test isolates the *spread
+        // source*, not the R-reject.
+        intent.take_profit = Some(TakeProfit::Anchored(PriceRef::Absolute {
+            absolute: 1.0600,
+        }));
+        let shell = Shell::from_candle(
+            &candle("2026-06-17T10:00:00Z", 1.1002, 1.1006, 1.0999, 1.1003).mid(),
+        );
+        // Fire bar carries a 20-pip spread (bid 1.0990 / ask 1.1010 close).
+        let fire = [ba_candle(
+            "2026-06-17T10:30:00Z",
+            1.0990,
+            1.0990,
+            1.1010,
+            1.1010,
+        )];
+
+        // Fire-bar path (entry_spread_price = None) → floor off 0.0020 → widen to
+        // 10× = 0.0200 above entry → SL 1.1200.
+        let mut r_fire = Resolved::from_intent(&intent, &shell, 0.0001).expect("resolves");
+        let out_fire = apply_entry_spread_floor(&mut r_fire, 0.0001, &fire, None);
+        assert!(
+            matches!(out_fire, EntryFloor::Applied { .. }),
+            "{out_fire:?}"
+        );
+        assert!(
+            (r_fire.stop_loss - 1.1200).abs() < 1e-9,
+            "fire-bar spread widens to 1.1200, got {}",
+            r_fire.stop_loss
+        );
+
+        // Windowed path (entry_spread_price = Some(1 pip)) → floor off 0.0001 →
+        // 10× = 0.0010 above entry → SL 1.1010, far tighter. The SAME fire slice,
+        // only the supplied spread differs — proving the window wins.
+        let mut r_win = Resolved::from_intent(&intent, &shell, 0.0001).expect("resolves");
+        let out_win = apply_entry_spread_floor(&mut r_win, 0.0001, &fire, Some(0.0001));
+        assert!(matches!(out_win, EntryFloor::Applied { .. }), "{out_win:?}");
+        assert!(
+            (r_win.stop_loss - 1.1010).abs() < 1e-9,
+            "windowed spread widens to 1.1010, got {}",
+            r_win.stop_loss
+        );
+    }
+
     fn base_enter() -> Intent {
         Intent {
             entry_level_vetos: Vec::new(),
@@ -989,6 +1084,7 @@ mod tests {
             reason: None,
             mw: None,
             pip_size: None,
+            spread_window: None,
             trade_plan: None,
             blackout_close: trade_control_core::intent::BlackoutCloseAction::default(),
             breakeven: None,
@@ -1602,7 +1698,7 @@ mod tests {
         let wide = ba_candle("2026-06-17T21:00:00Z", 1.10015, 1.10010, 1.10315, 1.10310);
         let path = [fire, fill_bar, wide];
 
-        let widen = widened_stop_at(&intent, &shell, 0.0001, &path, WIDEN_FLOOR_PIPS)
+        let widen = widened_stop_at(&intent, &shell, 0.0001, &path, WIDEN_FLOOR_PIPS, None)
             .expect("the NY-close-edge bar must trip the widen");
         assert!(
             (widen.original_stop - 1.0970).abs() < 1e-9,
@@ -1636,7 +1732,7 @@ mod tests {
         let spread_pips = (wide.ask_c - wide.bid_c) / 0.0001; // 30.5
         let path = [fire_bar(), fill_bar, wide];
 
-        let widen = widened_stop_at(&intent, &shell, 0.0001, &path, WIDEN_FLOOR_PIPS)
+        let widen = widened_stop_at(&intent, &shell, 0.0001, &path, WIDEN_FLOOR_PIPS, None)
             .expect("a 30.5-pip spread bar must trip the widen");
         assert_eq!(widen.at, wide.time);
         assert!((widen.original_stop - 1.0950).abs() < 1e-9);
@@ -1673,7 +1769,7 @@ mod tests {
         let wide = ba_candle("2026-06-17T12:00:00Z", 1.10015, 1.10010, 1.10315, 1.10310);
         let path = [fire_bar(), fill_bar, wide];
         assert_eq!(
-            widened_stop_at(&intent, &shell, 0.0001, &path, WIDEN_FLOOR_PIPS),
+            widened_stop_at(&intent, &shell, 0.0001, &path, WIDEN_FLOOR_PIPS, None),
             None,
             "a wide bar off the NY-close edge must not widen"
         );
@@ -1695,7 +1791,7 @@ mod tests {
         // NY-close-edge wide bar (21:00 UTC under EDT) — must be the widen bar.
         let on_edge = ba_candle("2026-06-17T21:00:00Z", 1.10015, 1.10010, 1.10315, 1.10310);
         let path = [fire_bar(), fill_bar, off_edge, on_edge];
-        let widen = widened_stop_at(&intent, &shell, 0.0001, &path, WIDEN_FLOOR_PIPS)
+        let widen = widened_stop_at(&intent, &shell, 0.0001, &path, WIDEN_FLOOR_PIPS, None)
             .expect("the NY-close-edge bar must trip the widen");
         assert_eq!(
             widen.at, on_edge.time,
@@ -1731,7 +1827,7 @@ mod tests {
         let tight = ba_candle("2026-06-17T21:00:00Z", 1.10010, 1.10005, 1.10030, 1.10025);
         let path = [fire_bar(), fill_bar, tight];
 
-        let widen = widened_stop_at(&intent, &shell, 0.0001, &path, WIDEN_FLOOR_PIPS)
+        let widen = widened_stop_at(&intent, &shell, 0.0001, &path, WIDEN_FLOOR_PIPS, None)
             .expect("the baked spread hour must trip the widen even on a tight-spread bar");
         assert_eq!(widen.at, tight.time);
         // Widen distance = baked p90 (~5p), NOT the 22p legacy floor. Long ⇒ SL
@@ -1768,7 +1864,7 @@ mod tests {
         let recovered = ba_candle("2026-06-17T22:00:00Z", 1.10010, 1.10005, 1.10030, 1.10025);
         let path = [fire_bar(), fill_bar, wide, recovered];
 
-        let widen = widened_stop_at(&intent, &shell, 0.0001, &path, WIDEN_FLOOR_PIPS)
+        let widen = widened_stop_at(&intent, &shell, 0.0001, &path, WIDEN_FLOOR_PIPS, None)
             .expect("the NY-close-edge bar must trip the widen");
         assert_eq!(widen.at, wide.time);
         assert_eq!(
@@ -1793,7 +1889,7 @@ mod tests {
         let still_wide = ba_candle("2026-06-17T22:00:00Z", 1.10015, 1.10010, 1.10315, 1.10310);
         let path = [fire_bar(), fill_bar, wide, still_wide];
 
-        let widen = widened_stop_at(&intent, &shell, 0.0001, &path, WIDEN_FLOOR_PIPS)
+        let widen = widened_stop_at(&intent, &shell, 0.0001, &path, WIDEN_FLOOR_PIPS, None)
             .expect("the NY-close-edge bar must trip the widen");
         assert_eq!(
             widen.restored_at, None,
@@ -1818,7 +1914,7 @@ mod tests {
         let backstop = ba_candle("2026-06-18T00:00:00Z", 1.10015, 1.10010, 1.10315, 1.10310);
         let path = [fire_bar(), fill_bar, wide, hour1, hour2, backstop];
 
-        let widen = widened_stop_at(&intent, &shell, 0.0001, &path, WIDEN_FLOOR_PIPS)
+        let widen = widened_stop_at(&intent, &shell, 0.0001, &path, WIDEN_FLOOR_PIPS, None)
             .expect("the NY-close-edge bar must trip the widen");
         assert_eq!(
             widen.restored_at,
@@ -1839,7 +1935,7 @@ mod tests {
         let tight = ba_candle("2026-06-17T12:00:00Z", 1.10010, 1.10005, 1.10030, 1.10025);
         let path = [fire_bar(), fill_bar, tight];
         assert_eq!(
-            widened_stop_at(&intent, &shell, 0.0001, &path, WIDEN_FLOOR_PIPS),
+            widened_stop_at(&intent, &shell, 0.0001, &path, WIDEN_FLOOR_PIPS, None),
             None
         );
     }
@@ -1859,7 +1955,7 @@ mod tests {
         let wide = ba_candle("2026-06-17T13:00:00Z", 1.10015, 1.10010, 1.10315, 1.10310);
         let path = [fire_bar(), fill_bar, to_sl, wide];
         assert_eq!(
-            widened_stop_at(&intent, &shell, 0.0001, &path, WIDEN_FLOOR_PIPS),
+            widened_stop_at(&intent, &shell, 0.0001, &path, WIDEN_FLOOR_PIPS, None),
             None
         );
     }
