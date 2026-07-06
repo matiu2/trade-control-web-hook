@@ -91,14 +91,22 @@ Trading:
     Mixing the old and new forms on one intent is a validation error —
     pick one. Migrate to the new form on next regen.
   With no gate set the close is unconditional (operator emergency-close path).
-  - **Spine interaction (server-side engine).** A **news-windowed** reversal-close
-    is a "flatten *if* in a position" safety: when it fires it dispatches the
-    close but leaves the plan's spine intact, so a still-pending entry is **not**
-    starved (the `allow_close` gate already no-ops the flatten when flat). It only
-    fires *inside* an open news window — the engine mirrors the worker's active
-    `news:<trade_id>:<news_id>` check, so a reversal printing after `news-end`
-    doesn't fire. A **price-windowed** close (reversal back at the SR band) is a
-    thesis invalidation and *does* retire the plan.
+  - **Spine interaction (server-side engine).** A reversal-close is "flatten
+    *if* in a position", so whether it retires the plan depends on whether a
+    position could even be open:
+    - **Before any entry has fired** (the plan is still awaiting its break/retest/
+      entry), the close can't be closing anything this plan opened, so it
+      **never** retires the spine — it dispatches harmlessly (the `allow_close`
+      gate no-ops the flatten when flat) and the pending entry keeps its window.
+      This holds for *both* news- and price-windowed closes. (EUR/CHF 2026-07-06:
+      a price-windowed close fired pre-entry, was correctly rejected
+      `needs-golden`, but used to archive the plan before it could ever enter.)
+    - **After an entry has fired**, a **news-windowed** close stays non-terminal
+      (a flatten-if-open news safety — it only fires *inside* an open news window;
+      the engine mirrors the worker's active `news:<trade_id>:<news_id>` check, so
+      a reversal printing after `news-end` doesn't fire), while a **price-windowed**
+      close (reversal back at the SR band) is a thesis invalidation and **does**
+      retire the plan.
 - `invalidate` — set a per-instrument cooldown (default 12 h) and cancel any pending
   orders. Use this when your setup is no longer valid (price drifted out of the
   expected range) and you want to be sure no entry fires while you sleep.
