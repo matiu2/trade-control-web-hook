@@ -133,16 +133,17 @@ struct Args {
     verbose: bool,
 
     /// After replaying, draw each *filled* position onto the live TradingView
-    /// chart (two rectangles per trade: entry→TP green, entry→SL red), spanning
-    /// the fill bar to the exit. Prior `--annotate` drawings are cleared first;
-    /// your hand-drawn necklines/fibs are left alone. Implies `--simulate`
-    /// (annotation needs the simulated fill). Uses the same tv-mcp chart as
-    /// window resolution (`--tv-mcp-root`).
+    /// chart as a native long/short position tool (green profit zone, red stop
+    /// zone) plus a small outcome label, spanning the fill bar to the exit.
+    /// Prior `--annotate` drawings are cleared first (tracked by entity-id in a
+    /// sidecar manifest); your hand-drawn necklines/fibs are left alone. Implies
+    /// `--simulate` (annotation needs the simulated fill). Uses the same tv-mcp
+    /// chart as window resolution (`--tv-mcp-root`).
     #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
     annotate: bool,
 
     /// Also annotate *not-taken* trades — pending orders that never filled and
-    /// entries the worker declined — as muted grey boxes at the fire bar. Only
+    /// entries the worker declined — as muted grey brackets at the fire bar. Only
     /// meaningful with `--annotate` (and implies it). Off by default, so a
     /// plain `--annotate` shows just the taken positions.
     #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
