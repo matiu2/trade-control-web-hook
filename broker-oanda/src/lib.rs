@@ -27,8 +27,8 @@ use oanda::{
 use oanda::{login as login_client, login_with_live};
 use oanda_client::OandaClient;
 use trade_control_core::broker::{
-    AmendError, AttemptState, Broker, CancelError, Candle, CandleError, EntryError, EntryRequest,
-    Granularity, LookupError, OpenPosition, PendingOrder, Quote,
+    AmendError, AttemptState, BidAskCandle, Broker, CancelError, Candle, CandleError, EntryError,
+    EntryRequest, Granularity, LookupError, OpenPosition, PendingOrder, Quote,
 };
 #[cfg(target_arch = "wasm32")]
 use worker::Env;
@@ -157,6 +157,16 @@ impl Broker for OandaBroker {
         now: DateTime<Utc>,
     ) -> Result<Vec<Candle>, CandleError> {
         candles::get_candles(&self.client, instrument, granularity, since, now).await
+    }
+
+    async fn get_bidask_candles(
+        &self,
+        instrument: &str,
+        granularity: Granularity,
+        since: DateTime<Utc>,
+        now: DateTime<Utc>,
+    ) -> Result<Vec<BidAskCandle>, CandleError> {
+        candles::get_bidask_candles(&self.client, instrument, granularity, since, now).await
     }
 }
 

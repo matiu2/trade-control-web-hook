@@ -9,8 +9,8 @@ use broker_tradenation::TradeNationBroker;
 use candle_model::Granularity as CmGranularity;
 use chrono::{DateTime, Utc};
 use trade_control_core::broker::{
-    AmendError, AttemptState, Broker, CancelError, Candle, CandleError, EntryError, EntryRequest,
-    Granularity, LookupError, OpenPosition, PendingOrder, Quote,
+    AmendError, AttemptState, BidAskCandle, Broker, CancelError, Candle, CandleError, EntryError,
+    EntryRequest, Granularity, LookupError, OpenPosition, PendingOrder, Quote,
 };
 use trade_control_core::intent::{Direction, ResolvedEntry, RiskBudget};
 use tradenation_api::ohlcv::PriceType;
@@ -267,6 +267,97 @@ impl Broker for TradeNationAdapter {
         Ok(trade_control_core::broker::filter_new_candles(
             candles, since,
         ))
+    }
+
+    async fn get_bidask_candles(
+        &self,
+        instrument: &str,
+        granularity: Granularity,
+        since: DateTime<Utc>,
+        now: DateTime<Utc>,
+    ) -> Result<Vec<BidAskCandle>, CandleError> {
+        if since >= now {
+            return Err(CandleError::BadRange);
+        }
+        // Same native-TF + count-back windowing as `get_candles`. TN serves one
+        // OHLCV series per `PriceType`, so a two-sided read is THREE fetches
+        // (mid for the OHLC the engine convention uses, bid + ask for the
+        // books) zipped by timestamp.
+        let (cm_gran, native) = to_cm_granularity(granularity);
+        if !native {
+            tracing::error!(
+                "tn get_bidask_candles({instrument}): granularity {granularity:?} not TN-native"
+            );
+            return Err(CandleError::BadRange);
+        }
+        let count = candle_count_for_window(granularity, since, now);
+
+        let market = tradenation_api::resolve_market(self.0.client(), self.0.session(), instrument)
+            .await
+            .map_err(|err| {
+                tracing::error!("tn get_bidask_candles resolve_market({instrument}): {err:?}");
+                CandleError::Transient
+            })?;
+
+        let fetch = |price: PriceType| {
+            tradenation_api::ohlcv::get_candles_range(
+                self.0.client(),
+                market.market_id,
+                cm_gran,
+                price,
+                count,
+                now,
+            )
+        };
+        // Three series for the same window/count → aligned by index and
+        // timestamp. Fetched sequentially (the session client is `!Send`; the
+        // three calls are cheap relative to the round-trip).
+        let map_err = |err| {
+            tracing::error!(
+                "tn get_bidask_candles({instrument}, market_id={}, count={count}): {err:?}",
+                market.market_id
+            );
+            CandleError::Transient
+        };
+        let mid = fetch(PriceType::Mid).await.map_err(map_err)?;
+        let bid = fetch(PriceType::Bid).await.map_err(map_err)?;
+        let ask = fetch(PriceType::Ask).await.map_err(map_err)?;
+
+        // Index bid/ask by timestamp so a length/gap mismatch between the series
+        // drops that bar rather than mis-aligning the whole window.
+        let bid_by_ts: std::collections::HashMap<_, _> =
+            bid.iter().map(|c| (c.timestamp, c)).collect();
+        let ask_by_ts: std::collections::HashMap<_, _> =
+            ask.iter().map(|c| (c.timestamp, c)).collect();
+
+        let mut candles: Vec<BidAskCandle> = mid
+            .iter()
+            .filter_map(|m| {
+                let b = bid_by_ts.get(&m.timestamp)?;
+                let a = ask_by_ts.get(&m.timestamp)?;
+                let time = m.timestamp.with_timezone(&Utc);
+                if time <= since {
+                    return None; // strictly after the watermark
+                }
+                Some(BidAskCandle {
+                    time,
+                    o: m.open,
+                    h: m.high,
+                    l: m.low,
+                    c: m.close,
+                    bid_o: b.open,
+                    bid_h: b.high,
+                    bid_l: b.low,
+                    bid_c: b.close,
+                    ask_o: a.open,
+                    ask_h: a.high,
+                    ask_l: a.low,
+                    ask_c: a.close,
+                })
+            })
+            .collect();
+        candles.sort_by_key(|c| c.time);
+        Ok(candles)
     }
 
     async fn amend_stop(

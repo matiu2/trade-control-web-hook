@@ -25,9 +25,9 @@ System 2 (spread-hour transient widen) is **unchanged**.
 
 ## Steps (each ≤600 lines, tests green before moving on)
 - [ ] **1. core: `mean_spread` helper + signed `spread_window` field + default const.**
-- [ ] **2. core/broker: `get_bidask_candles` trait method (default-impl'd).**
-- [ ] **3. broker-oanda: real `get_bidask_candles` (keep the MBA bid/ask).**
-- [ ] **4. broker-tradenation-adapter: real `get_bidask_candles`.**
+- [x] **2. core/broker: `get_bidask_candles` trait method (default-impl'd).**
+- [x] **3. broker-oanda: real `get_bidask_candles` (keep the MBA bid/ask).**
+- [x] **4. broker-tradenation-adapter: real `get_bidask_candles`.**
 - [ ] **5. worker `run_enter`: use windowed mean spread (fail-open to get_quote).**
 - [ ] **6. replayer `apply_entry_spread_floor`: use windowed mean spread.**
 - [ ] **7. tv-arm `--spread-window N` → bake onto signed intent (+ build-trade).**
