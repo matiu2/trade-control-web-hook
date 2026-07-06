@@ -24,8 +24,24 @@ The running staging/dev workers were booted with `OANDA_TOKEN` set and
 - [x] Add tests: `OANDA_TOKEN` accepted; `OANDA_TOKEN` wins when both set;
       `OANDA_API_KEY` still works as fallback.
 - [x] `cargo test -p trade-control-worker --lib secrets::` (7 ok), clippy, fmt.
-- [ ] Operational: rebuild + restart staging worker (deploy-staging.sh) so the
-      running worker picks up the new binary; the already-exported `OANDA_TOKEN`
-      then resolves. Or, as an immediate unblock without a rebuild, restart the
-      current worker with `OANDA_API_KEY` also exported.
-- [ ] Commit + push; advance parent submodule pointer after merge to main.
+- [x] Merged fix → `main` and → `staging`; both pushed.
+- [x] Rebuilt `trade-control-worker` (release) + redeployed `-dev` and
+      `-staging` CLIs.
+- [x] Restarted BOTH workers from canonical on-disk sources (keys from
+      `~/.config/trade-control/{key,admin-key}.hex`, `OANDA_TOKEN` from
+      `~/.zshenv` via `zsh -l`). Logs: `~/.local/state/trade-control/{dev,staging}-worker.log`.
+      New PIDs: dev 3164944, staging 3170130. Staging reloaded its 6 live
+      plans from Postgres — no state lost.
+- [x] Verified end-to-end on both: the same arm command no longer 500s on
+      "oanda login failed"; it now reaches the trade-quality gate and returns
+      a legitimate 422 (SL too close to spread, R < min_r 1.00). OANDA login
+      works.
+- [ ] Advance parent submodule pointer after merge to main (final step).
+
+## Note
+
+The 422 is a real property of THIS setup (EUR/CHF SL drawn too tight for the
+spread), not a bug — a wider-SL setup passes the gate. Separate from this fix.
+
+Reboot still kills these `nohup` workers (no systemd locally) — restart
+manually after a reboot.
