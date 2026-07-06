@@ -3,9 +3,11 @@
 Two layers live in this repo:
 
 1. **Rust worker + CLI** (`src/`, `core/`, `cli/`, `broker-oanda/`) — the
-   Cloudflare Worker that receives signed TradingView alerts and the
-   `trade-control` CLI that signs them. The README covers the wire format,
-   actions (`enter`/`prep`/`veto`/...), and CLI subcommands in depth.
+   worker that receives signed TradingView alerts and the `trade-control` CLI
+   that signs them. The README covers the wire format, actions
+   (`enter`/`prep`/`veto`/...), and CLI subcommands in depth. **Runtime note:
+   this is now a native local Postgres worker (`trade-control-worker`), NOT a
+   Cloudflare Worker** — see the environments section below.
 2. **Chart-driven Python tool** (`scripts/tv_arm_hs.py`) — reads a
    TradingView head-and-shoulders chart via tv-mcp and produces the full
    alert bundle for one setup by shelling out to `trade-control build-trade
@@ -14,40 +16,68 @@ Two layers live in this repo:
 
 Read the README first for the user-facing story. This file is for hazards.
 
+## Runtime: fully local, no Cloudflare (2026-07)
+
+**Cloudflare is fully retired.** Both environments run as **native
+Postgres-backed workers on the local desktop** — the `trade-control-worker`
+binary (axum HTTP + tokio scheduler), backed by a local PostgreSQL instance,
+migrating its schema on boot. No Cloudflare Worker, no KV, no R2, no `wrangler`
+anywhere in the live path. What was KV is now Postgres rows; what was R2
+recording is Postgres / the `ticks/` prefix; what were `wrangler secret`s are
+worker process env vars (`SIGNING_KEY`, `ADMIN_KEY`, `OANDA_TOKEN`).
+
+**The Oracle Cloud host is still the long-term target but not available yet.**
+Its Autonomous DB (region `uk-london-1`) is live and the Postgres→Oracle port
+is de-risked (`SPIKE-oracle-findings.md`), but the OKE compute has **0 nodes**
+(London out of ARM capacity). Until a node lands, **local is the deploy
+target** — not a permanent state, just where we run this week. The backend is a
+compile-time Cargo-feature swap (`postgres` XOR `oracle`), so Oracle is a
+rebuild, not a rewrite (`SCOPING-oracle-db-swappable.md`).
+
 ## Branches are environments — know which one you're on
 
-Each git **branch is a deploy environment**, and each carries its **own
-`wrangler.toml`** (own worker name, KV namespace, R2 bucket). A plain
-`wrangler deploy` on a branch targets that environment — so the branch you
-have checked out decides which live worker you'd affect. Check it before
-deploying anything.
+Each git **branch is a deploy environment**. Each carries its own worker
+config file under `~/.config/trade-control/` (its own bind port + Postgres
+database), and the deploy scripts branch-guard so you can't cross wires.
 
-| branch | environment | worker | CLIs | who uses it |
-|---|---|---|---|---|
-| `main` | **dev** | `trade-control-web-hook-dev` | `*-dev` | coding / development |
-| `staging` | **staging (demo)** | `trade-control-web-hook-staging` | `*-staging` | the week's live demo trading |
-| `prod` | **prod (real money)** | `trade-control-web-hook-prod` | `*-prod` | **not stood up yet** — first promotion target |
+| branch | environment | worker | port | Postgres role / DB | CLIs | who uses it |
+|---|---|---|---|---|---|---|
+| `main` | **dev** | `trade-control-worker` (local) | `8787` | `candle_cache` / `trade_control_dev` | `*-dev` | coding / development |
+| `staging` | **staging (demo)** | `trade-control-worker` (local) | `8788` | `tc_staging` / `trade_control_staging` | `*-staging` | the week's live demo trading |
+| `prod` | **prod (real money)** | — | — | — | `*-prod` | **not stood up yet** — first promotion target (Oracle) |
 
-**Every environment now carries a suffix** (`-dev` / `-staging` / `-prod`).
-The old **no-suffix** worker `trade-control-web-hook` + its R2 bucket
-`trade-control-recording` are **deprecated**: left running only while last
-week's demo trades are journaled, then deleted. Don't deploy to them.
+One local PostgreSQL server (`:5432`), two databases, two worker processes.
+Dev stays on the `candle_cache` role (avoids table-ownership churn); staging
+has a dedicated `tc_staging` role + `trade_control_staging` DB. The suffixed
+CLIs bake their worker URL (`http://127.0.0.1:8787|8788`) at compile time.
 
-Current working split (2026-06): **trading runs on `staging`** (demo
-account, real-time), **coding happens on `main`**. So treat the `staging`
-worker as live — don't redeploy it casually mid-week, because a week of
-unchanged + profitable running is the promotion gate. Develop on `main`,
-let it bake on `staging`.
+Current working split: **trading runs on `staging`** (demo account,
+real-time), **coding happens on `main`**. Treat the `staging` worker as live —
+don't redeploy it casually mid-week, because a week of unchanged + profitable
+running is the promotion gate. Develop on `main`, let it bake on `staging`.
 
-**Deploy** with the per-environment scripts, never bare `wrangler deploy`
-(the scripts also rebuild + install the matching suffixed CLIs and bake the
-right webhook URL into them):
+**Deploy** with the per-environment scripts (they rebuild + install the
+matching suffixed CLIs and restart the local worker; neither calls `wrangler`):
 
 ```sh
-git checkout main    && ./deploy-dev.sh       # dev
-git checkout staging && ./deploy-staging.sh   # staging
-# ./deploy-live.sh is added at the first prod promotion.
+git checkout main    && ./deploy-dev.sh       # dev  → :8787
+git checkout staging && ./deploy-staging.sh   # staging → :8788
+# ./deploy-live.sh is added at the first prod promotion (Oracle).
 ```
+
+Or run a worker directly (long-running, both keys + OANDA token required):
+
+```sh
+SIGNING_KEY="$(tr -d '[:space:]' < ~/.config/trade-control/key.hex)" \
+ADMIN_KEY="$(tr -d '[:space:]' < ~/.config/trade-control/admin-key.hex)" \
+OANDA_TOKEN="$your_token" \
+  ./target/release/trade-control-worker ~/.config/trade-control/<local|staging>-worker.toml
+# health: curl 127.0.0.1:<port>/health → ok
+```
+
+⚠️ These are foreground/`nohup` processes — a **reboot kills them** (a
+Hyprland/compositor crash does not). No systemd unit yet; restart manually
+after a reboot.
 
 The scripts branch-guard, so they refuse to deploy from the wrong branch.
 `deploy-lib.sh` holds shared logic; the per-env wrappers hold only the
@@ -77,15 +107,15 @@ binary `trade-control`).
 ### Promotion (staging → prod), the upcoming `prod` branch
 
 `prod` doesn't exist yet. The plan: when `staging` has run a full week
-unchanged + profitable, it gets merged into a new `prod` branch with a
-prod-pointed `wrangler.toml`, and a fresh `staging` is cut from `main`.
-Under the **everything-suffixed** model, prod is its own worker
-`trade-control-web-hook-prod` (R2 `trade-control-recording-prod`) — a clean
-new env, *not* a rename of an existing worker. `deploy-live.sh` (added at
-that point) points at `-prod`; `main`/`-dev` and `staging`/`-staging` keep
-their own workers. The legacy no-suffix worker is retired separately (after
-the journaling window) and is **not** repurposed as prod. Keep each branch's
-`wrangler.toml` divergent and pointed at its own suffixed worker.
+unchanged + profitable, it gets merged into a new `prod` branch with its own
+worker config (its own port + Postgres database, or the Oracle DSN once Oracle
+compute lands), and a fresh `staging` is cut from `main`. Prod is a clean new
+env with its own worker process + database, *not* a rename of an existing one.
+`deploy-live.sh` (added at that point) targets it; `main`/`-dev` and
+`staging`/`-staging` keep their own workers. Prod is the **first Oracle
+promotion target** — if OKE compute is available by then, prod is the env that
+runs against the Oracle Autonomous DB (compile the worker with the `oracle`
+feature); otherwise it stands up locally like the others until Oracle lands.
 
 ## Things the README doesn't shout
 

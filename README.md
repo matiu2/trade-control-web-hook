@@ -1,9 +1,48 @@
 # Trade Control Web Hook
 
-Cloudflare Worker that receives TradingView alerts and controls OANDA /
-TradeNation trades. The body is cleartext YAML with an HMAC-SHA256
-signature, so a leaked webhook URL can't be weaponised by anyone who
-doesn't also have the signing key.
+A signed-webhook trade controller that receives TradingView alerts and
+controls OANDA / TradeNation trades. The body is cleartext YAML with an
+HMAC-SHA256 signature, so a leaked webhook URL can't be weaponised by anyone
+who doesn't also have the signing key.
+
+> ### ⚠️ Runtime: fully local, no Cloudflare (2026-07)
+>
+> **This project no longer runs on Cloudflare at all.** Both environments now
+> run as **native Postgres-backed workers on the local desktop** — the
+> `trade-control-worker` binary (axum HTTP + a tokio scheduler), backed by a
+> local PostgreSQL instance, migrating its schema on boot. There is no
+> Cloudflare Worker, no KV, no R2, and no `wrangler` in the live path.
+>
+> | env | branch | worker | port | Postgres role / DB |
+> |---|---|---|---|---|
+> | **dev** | `main` | `trade-control-worker` (local) | `8787` | `candle_cache` / `trade_control_dev` |
+> | **staging** | `staging` | `trade-control-worker` (local) | `8788` | `tc_staging` / `trade_control_staging` |
+>
+> Deploy with `./deploy-dev.sh` (from `main`) and `./deploy-staging.sh` (from
+> `staging`) — both now build + install the suffixed CLIs and (re)start the
+> local worker; neither calls `wrangler`. Run a worker directly with:
+> ```sh
+> SIGNING_KEY="$(tr -d '[:space:]' < ~/.config/trade-control/key.hex)" \
+> ADMIN_KEY="$(tr -d '[:space:]' < ~/.config/trade-control/admin-key.hex)" \
+> OANDA_TOKEN="$your_token" \
+>   ./target/release/trade-control-worker ~/.config/trade-control/<local|staging>-worker.toml
+> ```
+> Health check: `curl 127.0.0.1:<port>/health` → `ok`.
+>
+> **The Oracle Cloud target is still pending.** The intended long-term home is a
+> free-tier Oracle Cloud host (region `uk-london-1`); its Autonomous DB is
+> live and the Postgres→Oracle backend port is de-risked (see
+> `SPIKE-oracle-findings.md`), but the OKE compute has **0 nodes** (London is
+> out of ARM capacity). Until a node lands, local is the deploy target. The
+> backend is a **compile-time Cargo-feature swap** (`postgres` XOR `oracle`), so
+> moving to Oracle is a rebuild, not a rewrite. See
+> `SCOPING-oracle-db-swappable.md`.
+>
+> **Everything below that mentions Cloudflare, `wrangler`, KV, or R2 is
+> historical** — the mechanism (signed alerts, actions, gates, the cron engine,
+> the CLI) is unchanged, but the *substrate* is now local Postgres. KV keys are
+> Postgres rows; R2 recordings are Postgres/`ticks/` rows; `wrangler secret`s
+> are worker env vars.
 
 Fifteen actions are supported. The first five are the day-to-day trading
 verbs; the rest are state management for multi-event setups and scheduled

@@ -223,8 +223,8 @@ pub fn simulate_fill(
         .map(|be| be.arms_at(entry_price, resolved.take_profit));
     let mut active_stop = resolved.stop_loss;
     for c in rest {
-        let hit_sl = book_crosses(c, exit_book, active_stop);
-        let hit_tp = book_crosses(c, exit_book, resolved.take_profit);
+        let hit_sl = book_reaches(c, exit_book, active_stop, stop_approach(dir));
+        let hit_tp = book_reaches(c, exit_book, resolved.take_profit, tp_approach(dir));
         match (hit_sl, hit_tp) {
             (true, _) => {
                 return SimOutcome::StoppedOut {
@@ -345,6 +345,21 @@ fn find_fill<'a>(
             rest: candles,
         }),
         ResolvedEntry::Stop { trigger_price } | ResolvedEntry::Limit { trigger_price } => {
+            // The side price must approach the trigger from for the order to
+            // fill. A *stop* sits on the far side of the market in the trade's
+            // direction (long-stop above → price rises into it → `FromBelow`;
+            // short-stop below → price falls into it → `FromAbove`). A *limit*
+            // is the mirror (long-limit below → `FromAbove`). Using the
+            // directional `book_reaches` (not the old bracket test) is what lets
+            // a bar that *gaps through* the trigger fill — the bug this fixes.
+            let entry_approach = match (&resolved.entry, dir) {
+                (ResolvedEntry::Stop { .. }, Direction::Long)
+                | (ResolvedEntry::Limit { .. }, Direction::Short) => Approach::FromBelow,
+                (ResolvedEntry::Stop { .. }, Direction::Short)
+                | (ResolvedEntry::Limit { .. }, Direction::Long) => Approach::FromAbove,
+                // Market handled above; unreachable in this arm.
+                (ResolvedEntry::Market { .. }, _) => Approach::FromBelow,
+            };
             // Skip the fire bar (index 0): the resting order isn't live until
             // after it closes. `get(1..)` is empty when the fire bar is the only
             // recorded candle, yielding `None` (no later bar to fill on yet).
@@ -370,7 +385,7 @@ fn find_fill<'a>(
             };
             let i = fill_window
                 .iter()
-                .position(|c| book_crosses(c, entry_book, trigger_price))?;
+                .position(|c| book_reaches(c, entry_book, trigger_price, entry_approach))?;
             // `i` indexes `fill_window` (a prefix of `after_fire`), so the fill
             // bar is `candles[i + 1]`. The post-fill search **includes** the fill
             // bar itself (`candles[i + 1..]`): an order that fills mid-bar can be
@@ -417,8 +432,8 @@ pub fn breakeven_armed_at(
     // Walk the post-fill path exactly as Phase 2 does: an exit (SL/TP) before any
     // arming close means break-even never armed during the position's life.
     for c in fill.rest {
-        if book_crosses(c, exit_book, resolved.stop_loss)
-            || book_crosses(c, exit_book, resolved.take_profit)
+        if book_reaches(c, exit_book, resolved.stop_loss, stop_approach(dir))
+            || book_reaches(c, exit_book, resolved.take_profit, tp_approach(dir))
         {
             return None;
         }
@@ -676,8 +691,8 @@ pub fn widened_stop_at(
     for (i, c) in fill.rest.iter().enumerate() {
         // The original stop is still the live one until a widen fires, so an
         // exit (SL/TP) before any qualifying spread bar means no widen applied.
-        if book_crosses(c, exit_book, original_stop)
-            || book_crosses(c, exit_book, resolved.take_profit)
+        if book_reaches(c, exit_book, original_stop, stop_approach(dir))
+            || book_reaches(c, exit_book, resolved.take_profit, tp_approach(dir))
         {
             return None;
         }
@@ -792,16 +807,58 @@ fn book_for(leg: Leg, dir: Direction) -> Book {
     }
 }
 
-/// Whether the candle's chosen book range spans `level` (an exact-level touch).
-/// Direction-agnostic on the level itself: a long stop above and a short stop
-/// below are both "this book's high–low range reached the level". The *book*
-/// (bid vs ask) is what carries the real per-bar spread.
-fn book_crosses(c: &BidAskCandle, book: Book, level: f64) -> bool {
+/// The side a **stop-loss** is approached from for the given trade direction: a
+/// long's SL sits below (price falls into it → `FromAbove`); a short's sits above
+/// (`FromBelow`).
+fn stop_approach(dir: Direction) -> Approach {
+    match dir {
+        Direction::Long => Approach::FromAbove,
+        Direction::Short => Approach::FromBelow,
+    }
+}
+
+/// The side a **take-profit** is approached from — the mirror of the stop: a
+/// long's TP is above (price rises into it → `FromBelow`), a short's below.
+fn tp_approach(dir: Direction) -> Approach {
+    match dir {
+        Direction::Long => Approach::FromBelow,
+        Direction::Short => Approach::FromAbove,
+    }
+}
+
+/// Which side price approaches a level from — the load-bearing distinction for a
+/// *touch* (a triggered stop/limit, an SL/TP hit) versus mere *containment*.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Approach {
+    /// Price rises to the level: touched when the bar's high reaches it.
+    /// A long-stop entry, a long's take-profit, a short's stop-loss.
+    FromBelow,
+    /// Price falls to the level: touched when the bar's low reaches it.
+    /// A short-stop entry, a short's take-profit, a long's stop-loss.
+    FromAbove,
+}
+
+/// Whether the candle's chosen book range **reaches** `level`, approaching from
+/// the given side. This is a *directional touch*, not containment: a bar that
+/// gaps or opens already past the level (its whole range on the far side) still
+/// counts, because price traded through the level to get there.
+///
+/// `FromBelow` ⇒ `high >= level` (an ascending order/target is hit the moment the
+/// high reaches it, even if the low never dips back below). `FromAbove` ⇒
+/// `low <= level`. The old bracket test (`lo <= level <= hi`) silently *missed*
+/// the gap-through case — an up-gap through a long-stop trigger left every
+/// post-fire bar's low above the trigger, so the order was reported NeverFilled
+/// even though a real broker stop fills on the gap. The *book* (bid vs ask) still
+/// carries the real per-bar spread. See BUG-replay-stop-fill-gap.
+fn book_reaches(c: &BidAskCandle, book: Book, level: f64, approach: Approach) -> bool {
     let (lo, hi) = match book {
         Book::Bid => (c.bid_l, c.bid_h),
         Book::Ask => (c.ask_l, c.ask_h),
     };
-    lo <= level && level <= hi
+    match approach {
+        Approach::FromBelow => hi >= level,
+        Approach::FromAbove => lo <= level,
+    }
 }
 
 /// The resolved trade direction — a small public helper so callers can label a
@@ -1038,6 +1095,102 @@ mod tests {
             simulate_fill(&intent, &shell, 0.0001, &still_open),
             SimOutcome::FilledOpen { .. }
         ));
+    }
+
+    /// Regression for BUG-replay-stop-fill-gap (AUD/NZD iH&S long 2026-07-06):
+    /// price **gapped up through** the long-stop trigger, so every post-fire bar
+    /// OPENED already above it — the bar's low never dipped back to the trigger.
+    /// The old bracket fill test (`lo <= trigger <= hi`) reported NeverFilled even
+    /// though a real broker stop fills on the gap. `book_reaches`/`FromBelow`
+    /// (`hi >= trigger`) fills it.
+    #[test]
+    fn long_stop_fills_when_price_gaps_up_through_trigger() {
+        // Long stop 10 pips above close → trigger 1.1050.
+        let mut intent = long_stop_intent();
+        intent.entry = Some(EntrySpec::Stop {
+            from: PriceAnchor::Close,
+            offset_pips: 10.0,
+            offset_atr_pct: None,
+            at: None,
+            recover_entry: None,
+        });
+        let shell = trigger_shell();
+
+        // The fillable bar OPENS at 1.1052 (already past the 1.1050 trigger) and
+        // its whole range 1.1051–1.1060 sits ABOVE the trigger — a gap-through.
+        // Old bracket test: low 1.1051 > 1.1050 → missed. New: high 1.1060 >=
+        // 1.1050 → fills @ the trigger price.
+        let gap_up = [
+            fire_bar(),
+            candle("2026-06-17T11:00:00Z", 1.1052, 1.1060, 1.1051, 1.1058), // gaps through
+            candle("2026-06-17T12:00:00Z", 1.1058, 1.1160, 1.1056, 1.1155), // hits TP 1.1150
+        ];
+        match simulate_fill(&intent, &shell, 0.0001, &gap_up) {
+            SimOutcome::TookProfit { entry_price, .. } => {
+                assert!(
+                    (entry_price - 1.1050).abs() < 1e-9,
+                    "fills at the stop trigger, not the gap-open price"
+                );
+            }
+            other => panic!("gapped-through long stop must fill, got {other:?}"),
+        }
+    }
+
+    /// Mirror of the above for a **short** stop: price gaps DOWN through the
+    /// trigger, every post-fire bar's high stays below it. `FromAbove`
+    /// (`lo <= trigger`) fills it; the old bracket test missed it.
+    #[test]
+    fn short_stop_fills_when_price_gaps_down_through_trigger() {
+        // Absolute sell-stop trigger 1.1000, SL 1.1030 (above), TP 1.0950 (below).
+        let intent = short_stop_intent();
+        let shell = trigger_shell();
+
+        // Fillable bar OPENS at 1.0998 (already below the 1.1000 trigger), whole
+        // range 1.0990–1.0999 below it — a down-gap. High 1.0999 < 1.1000 so the
+        // old bracket test missed it; low 1.0990 <= 1.1000 fills.
+        let gap_down = [
+            fire_bar(),
+            candle("2026-06-17T11:00:00Z", 1.0998, 1.0999, 1.0990, 1.0992), // gaps through
+            candle("2026-06-17T12:00:00Z", 1.0992, 1.0994, 1.0945, 1.0948), // hits TP 1.0950
+        ];
+        match simulate_fill(&intent, &shell, 0.0001, &gap_down) {
+            SimOutcome::TookProfit { entry_price, .. } => {
+                assert!(
+                    (entry_price - 1.1000).abs() < 1e-9,
+                    "fills at the short-stop trigger"
+                );
+            }
+            other => panic!("gapped-through short stop must fill, got {other:?}"),
+        }
+    }
+
+    /// A long whose stop-loss is **gapped through** (bar opens already below the
+    /// SL, low and high both under it) must still stop out — the same gap bug on
+    /// the exit leg. `stop_approach(Long)` = `FromAbove` (`lo <= sl`) catches it.
+    #[test]
+    fn long_stops_out_when_price_gaps_down_through_sl() {
+        let mut intent = long_stop_intent();
+        intent.entry = Some(EntrySpec::Stop {
+            from: PriceAnchor::Close,
+            offset_pips: 10.0,
+            offset_atr_pct: None,
+            at: None,
+            recover_entry: None,
+        });
+        let shell = trigger_shell();
+        // Fills @1.1050, then a bar GAPS DOWN entirely below the SL 1.1000
+        // (range 1.0980–1.0990, both under 1.1000). Bracket test would miss it.
+        let gap_sl = [
+            fire_bar(),
+            candle("2026-06-17T11:00:00Z", 1.1042, 1.1055, 1.1041, 1.1052), // fills @1.1050
+            candle("2026-06-17T12:00:00Z", 1.0990, 1.0990, 1.0980, 1.0985), // gaps below SL
+        ];
+        match simulate_fill(&intent, &shell, 0.0001, &gap_sl) {
+            SimOutcome::StoppedOut { exit_price, .. } => {
+                assert!((exit_price - 1.1000).abs() < 1e-9);
+            }
+            other => panic!("gapped-through SL must stop out, got {other:?}"),
+        }
     }
 
     #[test]
