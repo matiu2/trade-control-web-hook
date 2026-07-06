@@ -679,8 +679,21 @@ multiple is a server-side constant
 weakened per-intent, the same discipline as the `min_r` ≥ 1.0
 reward:risk floor.
 
-- **At fire time (worker) — widen-then-reject.** Every `enter` samples
-  the live spread (`get_quote`). When the stop is *too tight*
+- **At fire time (worker) — widen-then-reject.** Every `enter` sizes the
+  floor off the **mean bid-ask spread over the last `spread_window`
+  candles** (default **5**, per-trade via `tv-arm --spread-window N` →
+  the signed `05-enter` `spread_window` field). Sizing off a *single*
+  sample let a spiky entry candle (high volatility → a momentarily wide
+  spread) blow the floor out and widen the stop far past the instrument's
+  normal spread; averaging over the recent window dilutes a lone spike
+  while still tracking a genuinely-elevated regime. The window is fetched
+  through the broker's `get_bidask_candles` — **the same provider the
+  offline replay uses** (its `ReplayBroker` serves it from the recorded
+  series), so worker and replay size the floor off an identical statistic
+  and can't drift. If the windowed read is unavailable (no plan
+  granularity, a candle-fetch error, or an all-degenerate window) the
+  worker **fails open** to a single live `get_quote` spread — the
+  pre-window behaviour. When the stop is *too tight*
   (`sl_distance < 10 × spread`) the worker no longer rejects outright —
   it first tries to **widen the stop to `10 × spread`** (exactly the
   floor, pushing it *further* from entry, never tighter) and re-checks
