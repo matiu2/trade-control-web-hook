@@ -203,34 +203,6 @@ impl TvMcp {
         ])
     }
 
-    /// Draw a small text label anchored at `time`/`price`, tinted `color`.
-    /// Used to stamp a position's outcome (`TP`/`SL`/`no-fill`/`open`) next to
-    /// the native position tool, which has no text field of its own. Returns
-    /// the new drawing's entity-id so the caller can track it for cleanup.
-    pub fn draw_text(
-        &self,
-        time: i64,
-        price: f64,
-        text: &str,
-        color: &str,
-    ) -> Result<DrawShapeResult> {
-        let overrides = format!("{{\"color\":{color:?}}}");
-        self.call_json(&[
-            "draw",
-            "shape",
-            "-t",
-            "text",
-            "--time",
-            &time.to_string(),
-            "-p",
-            &price.to_string(),
-            "--overrides",
-            &overrides,
-            "--text",
-            text,
-        ])
-    }
-
     /// `draw remove <id>` — delete one drawing by entity-id. Used to
     /// clear prior `--annotate` drawings before redrawing.
     pub fn remove_drawing(&self, entity_id: &str) -> Result<RemoveDrawingResult> {
