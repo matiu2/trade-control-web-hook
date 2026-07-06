@@ -45,19 +45,16 @@ CARGO_BIN="${CARGO_HOME:-$HOME/.cargo}/bin"
 CLI_PACKAGES=(trade-control-cli tv-arm tv-news)
 CLI_BINARIES=(trade-control tv-arm tv-news replay-candles)
 
-# deploy_env <env-name> <required-branch> <webhook-url> <suffix> <pine-name>
+# deploy_env <env-name> <required-branch> <webhook-url> <suffix> [worker-kind]
 #
-# <pine-name> is the Pine study title this environment's tv-arm arms
-# against (baked via TRADE_CONTROL_PINE_NAME → BAKED_PINE_NAME). Lets each
-# environment pin a distinct Pine version living as a separate study on the
-# same chart (e.g. "Candle Signals v24" vs "Candle Signals v25"). Optional —
-# defaults to the canonical "Candle Signals" when empty/unset.
-# A 6th arg of "native" marks a LOCAL native/Postgres-worker environment (dev):
-# it skips `wrangler deploy` and the wrangler.toml host-check entirely, because
-# the worker is a long-running local process managed outside this script, not a
-# Cloudflare deploy. Anything else (or unset) keeps the Cloudflare path (staging).
+# A 5th arg of "native" marks a LOCAL native/Postgres-worker environment: it
+# skips `wrangler deploy` and the wrangler.toml host-check entirely, because the
+# worker is a long-running local process managed outside this script, not a
+# Cloudflare deploy. Anything else (or unset) keeps the Cloudflare path.
+# (Both dev and staging are native now; the Cloudflare path is retained only
+# until the last Cloudflare env is gone.)
 deploy_env() {
-  local env_name="$1" req_branch="$2" webhook="$3" suffix="$4" pine_name="${5:-Candle Signals}" worker_kind="${6:-cloudflare}"
+  local env_name="$1" req_branch="$2" webhook="$3" suffix="$4" worker_kind="${5:-cloudflare}"
 
   cd "$REPO_ROOT"
 
@@ -93,16 +90,15 @@ deploy_env() {
     wrangler deploy
   fi
 
-  # 3. Build all CLIs with this environment's webhook + Pine study name
-  #    baked in (build.rs → BAKED_WEBHOOK / BAKED_PINE_NAME).
+  # 3. Build all CLIs with this environment's webhook baked in
+  #    (build.rs → BAKED_WEBHOOK).
   echo "==> [$env_name] building CLIs with TRADE_CONTROL_WEBHOOK=$webhook"
-  echo "==> [$env_name] Pine study target: $pine_name"
   local pkg_args=()
   local pkg
   for pkg in "${CLI_PACKAGES[@]}"; do
     pkg_args+=(-p "$pkg")
   done
-  TRADE_CONTROL_WEBHOOK="$webhook" TRADE_CONTROL_PINE_NAME="$pine_name" \
+  TRADE_CONTROL_WEBHOOK="$webhook" \
     cargo build --release "${pkg_args[@]}"
 
   # 4. Install suffixed copies into ~/.cargo/bin.
