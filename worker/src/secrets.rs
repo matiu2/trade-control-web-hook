@@ -9,11 +9,13 @@
 //! | `ADMIN_KEY` | yes | — | auth for the `/admin/*` write routes (`X-Admin-Key`). |
 //! | `MAX_RISK_PCT_PER_TRADE` | no | `1.0` | worker-wide risk cap %. |
 //! | `MAX_OPEN_POSITIONS` | no | `3` | worker-wide max open positions. |
-//! | `OANDA_API_KEY` | no* | — | OANDA bearer token (shared across sub-accounts). |
+//! | `OANDA_TOKEN` (or `OANDA_API_KEY`) | no* | — | OANDA bearer token (shared across sub-accounts). |
 //! | `OANDA_LIVE` | no | `false` | global live/practice flag; `"true"` → live. |
 //!
-//! `*` OANDA_API_KEY is only required if any OANDA account is configured; a
-//! TradeNation-only deployment can omit it. Per-instrument `PIP_SIZE_<INSTR>`
+//! `*` An OANDA token is only required if any OANDA account is configured; a
+//! TradeNation-only deployment can omit it. `OANDA_TOKEN` (the name the docs,
+//! `tv-arm`, and the replay CLI use) is preferred; `OANDA_API_KEY` is accepted
+//! as a fallback. Per-instrument `PIP_SIZE_<INSTR>`
 //! overrides are read lazily on demand (there's an open set of them), not
 //! eagerly into this struct — see [`Secrets::pip_size_override`].
 //!
@@ -84,7 +86,12 @@ impl Secrets {
         let max_risk_pct = parse_or_default("MAX_RISK_PCT_PER_TRADE", DEFAULT_MAX_RISK_PCT)?;
         let max_open_positions =
             parse_or_default("MAX_OPEN_POSITIONS", DEFAULT_MAX_OPEN_POSITIONS)?;
-        let oanda_api_key = optional("OANDA_API_KEY");
+        // Prefer `OANDA_TOKEN` (the name the docs, `tv-arm`, and the replay CLI
+        // all use), falling back to `OANDA_API_KEY`. Historically the worker only
+        // read `OANDA_API_KEY`, so a worker booted with the documented
+        // `OANDA_TOKEN` had no token and every OANDA account 500'd with
+        // "oanda login failed".
+        let oanda_api_key = optional("OANDA_TOKEN").or_else(|| optional("OANDA_API_KEY"));
         let oanda_live = optional("OANDA_LIVE")
             .map(|s| s.eq_ignore_ascii_case("true"))
             .unwrap_or(false);
@@ -149,6 +156,7 @@ mod tests {
             "ADMIN_KEY",
             "MAX_RISK_PCT_PER_TRADE",
             "MAX_OPEN_POSITIONS",
+            "OANDA_TOKEN",
             "OANDA_API_KEY",
             "OANDA_LIVE",
         ] {
@@ -217,6 +225,52 @@ mod tests {
         let s = Secrets::from_env().unwrap();
         assert!(s.oanda_live);
         assert_eq!(s.oanda_api_key.as_deref(), Some("tok"));
+        clear_all();
+    }
+
+    #[test]
+    fn oanda_token_is_accepted() {
+        // The documented boot command (CLAUDE.md / README) and the rest of the
+        // codebase export `OANDA_TOKEN`; the worker must honour it, not only the
+        // legacy `OANDA_API_KEY`.
+        let _g = ENV_LOCK.lock().unwrap();
+        clear_all();
+        unsafe {
+            std::env::set_var("SIGNING_KEY", "sk");
+            std::env::set_var("ADMIN_KEY", "ak");
+            std::env::set_var("OANDA_TOKEN", "from-token");
+        }
+        let s = Secrets::from_env().unwrap();
+        assert_eq!(s.oanda_api_key.as_deref(), Some("from-token"));
+        clear_all();
+    }
+
+    #[test]
+    fn oanda_token_wins_over_oanda_api_key() {
+        let _g = ENV_LOCK.lock().unwrap();
+        clear_all();
+        unsafe {
+            std::env::set_var("SIGNING_KEY", "sk");
+            std::env::set_var("ADMIN_KEY", "ak");
+            std::env::set_var("OANDA_TOKEN", "from-token");
+            std::env::set_var("OANDA_API_KEY", "from-api-key");
+        }
+        let s = Secrets::from_env().unwrap();
+        assert_eq!(s.oanda_api_key.as_deref(), Some("from-token"));
+        clear_all();
+    }
+
+    #[test]
+    fn oanda_api_key_still_works_as_fallback() {
+        let _g = ENV_LOCK.lock().unwrap();
+        clear_all();
+        unsafe {
+            std::env::set_var("SIGNING_KEY", "sk");
+            std::env::set_var("ADMIN_KEY", "ak");
+            std::env::set_var("OANDA_API_KEY", "from-api-key");
+        }
+        let s = Secrets::from_env().unwrap();
+        assert_eq!(s.oanda_api_key.as_deref(), Some("from-api-key"));
         clear_all();
     }
 }
