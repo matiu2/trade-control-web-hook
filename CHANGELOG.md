@@ -1,6 +1,47 @@
 # Changelog
 
-## Unreleased — 2026-07-05 — replay journal: reconcile the SL lines + tag entries with an id
+## v63 — 2026-07-06 — replay: gap-through fills, native position-tool annotation, window clamp; Cloudflare fully retired
+
+**Why.** A batch of replay-fidelity fixes plus the environment/tooling cleanup
+now that both dev and staging run as local native/Postgres workers.
+
+**What changed.**
+- **Gap-through fills (replay).** The offline fill simulator decided a
+  stop/limit filled with a *containment* test (`lo ≤ level ≤ hi`), which missed a
+  fill when price **gapped through** the trigger (whole bar range on the far
+  side). Replaced with a directional touch (`book_reaches` +
+  `Approach::{FromBelow,FromAbove}`) on all six touch sites (entry + SL/TP exits).
+  Replay-only — the live worker places a real broker stop. Found on AUD/NZD
+  `ihs-aud-nzd-37d31f02` (was `NEVER FILLED`, now fills → +1.09R).
+- **Native position-tool annotation.** `replay-candles --annotate` now draws each
+  filled position as TradingView's **native long/short position tool** (green
+  profit / red stop zone) + a small outcome label, instead of two rectangles.
+  The tool *is* creatable via tv-mcp after all — `createShape`'s promise must be
+  awaited, and stop/profit are mintick-derived tick offsets. Re-run cleanup moved
+  from a `replay:` text prefix to a sidecar entity-id manifest
+  (`~/.config/trade-control/replay-annotations.json`), since the tool has no text
+  field. Hand drawings untouched.
+- **Future-window clamp.** A plan whose trade-expiry is still in the future asked
+  OANDA for candles that don't exist yet ("Invalid value for 'from'. Time is in
+  the future"). `pull_end` now clamps to the last closed bar.
+- **Cloudflare fully retired (docs).** README + CLAUDE.md updated: both envs are
+  native local Postgres workers now; Oracle is the long-term target, blocked on
+  OKE compute.
+- **Dead Pine plumbing removed.** Signal detection is fully server-side Rust
+  (`core/src/signals/`, `PinePattern`); the `BAKED_PINE_NAME` / `ENV_PINE_NAME` /
+  `TRADE_CONTROL_PINE_NAME` study-name plumbing had zero consumers and was ripped
+  out (`deploy_env`'s `native` marker is now the 5th arg).
+
+**Tests.** New: simulator gap-through regressions (3), `position_overrides`,
+annotate manifest/box-style/outcome-label. All suites green (256+70+21 cli,
+117+3 engine, 38 trading-view); no golden fixture shifted.
+
+**Breaking.** `deploy-lib.sh`'s `deploy_env` drops the `<pine-name>` positional
+(worker-kind marker moves 6th → 5th). Affects only the deploy scripts.
+
+---
+
+## v63 also folds in — 2026-07-05 — replay journal: reconcile the SL lines + tag entries with an id
 
 **Why.** On EUR/AUD `hs-eur-aud-3d0b5dda` the enter block printed **three
 different stop-losses that didn't reconcile**: `order: SL 1.65787`, then "widened
