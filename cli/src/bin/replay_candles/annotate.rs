@@ -4,22 +4,22 @@
 //! [`FireResult`]) becomes a native TradingView **position tool** — a
 //! long/short risk-reward bracket from the fill price to its stop and
 //! take-profit — spanning the fill bar to the exit bar (or the window end,
-//! for a still-open trade), plus a small text label carrying the outcome
-//! (`TP` / `SL` / `open` / …). This turns the text journal into the visual
-//! position zones the operator studies on the chart.
+//! for a still-open trade). This turns the text journal into the visual
+//! position zones the operator studies on the chart. The tool's own built-in
+//! stats (R:R, P&L) and the green/red zones convey the outcome; the text
+//! journal carries the detail, so no on-chart label is drawn.
 //!
 //! Why the native position tool (this replaced two rectangles): the tool
 //! *can* be created via tv-mcp after all — `createShape` returns a Promise
 //! that must be **awaited** (the old fire-and-forget path saw `null` and
 //! wrongly concluded it no-ops), and its stop/profit are set as tick
-//! offsets, which the bridge derives from the live series mintick. The tool
-//! carries **no text field**, so a companion text label stamps the outcome.
+//! offsets, which the bridge derives from the live series mintick.
 //!
 //! Re-run hygiene: the position tool has no text to tag, so every drawing
-//! this makes (positions + labels) is tracked by **entity-id in a sidecar
-//! manifest** ([`manifest_path`]). A later run reads the manifest, removes
-//! exactly those ids, then rewrites it — leaving the operator's hand-drawn
-//! necklines / fibs / H&S anchors untouched.
+//! this makes is tracked by **entity-id in a sidecar manifest**
+//! ([`manifest_path`]). A later run reads the manifest, removes exactly those
+//! ids, then rewrites it — leaving the operator's hand-drawn necklines / fibs
+//! / H&S anchors untouched.
 
 use std::fs;
 use std::path::PathBuf;
@@ -131,10 +131,10 @@ fn clear_prior(mcp: &TvMcp) -> Result<usize> {
 }
 
 /// Draw one position as a native position tool spanning the fill bar to the
-/// exit (or window end), plus a small outcome label at the entry. A *taken*
-/// trade gets the green/red bracket; a *not-taken* one (never-filled /
-/// declined) gets a muted-grey bracket at the fire bar, since it never went
-/// on. Every entity-id drawn is pushed into `ids` for the sidecar manifest.
+/// exit (or window end). A *taken* trade gets the green/red bracket; a
+/// *not-taken* one (never-filled / declined) gets a muted-grey bracket at the
+/// fire bar, since it never went on. The tool's entity-id is pushed into `ids`
+/// for the sidecar manifest.
 fn draw_position(mcp: &TvMcp, pos: &FireResult, ids: &mut Vec<String>) -> Result<()> {
     let taken = pos.kind.is_taken();
     let (color, transparency) = box_style(taken, pos.direction);
@@ -157,14 +157,6 @@ fn draw_position(mcp: &TvMcp, pos: &FireResult, ids: &mut Vec<String>) -> Result
         ids.push(id);
     } else {
         tracing::warn!(direction = ?pos.direction, "position tool did not land");
-    }
-
-    // Outcome label at the entry, so the fate is readable at a glance (the
-    // position tool has no text field of its own).
-    let label = format!("{}:{}", outcome_label(pos.kind), bne(pos.fill_at));
-    let text = mcp.draw_text(pos.fill_at.timestamp(), pos.entry_price, &label, color)?;
-    if let Some(id) = text.entity_id {
-        ids.push(id);
     }
 
     let shape = if taken {
