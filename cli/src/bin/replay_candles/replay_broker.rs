@@ -340,8 +340,39 @@ impl Broker for ReplayBroker {
         _since: DateTime<Utc>,
         _now: DateTime<Utc>,
     ) -> Result<Vec<Candle>, CandleError> {
-        // The replay feeds candles directly; the gate never fetches them.
+        // The replay feeds MID candles directly; the gate never fetches them.
         Ok(Vec::new())
+    }
+
+    async fn get_bidask_candles(
+        &self,
+        _instrument: &str,
+        _granularity: Granularity,
+        since: DateTime<Utc>,
+        now: DateTime<Utc>,
+    ) -> Result<Vec<BidAskCandle>, CandleError> {
+        // THE shared bar feeder for the entry SL-spread floor: `run_enter`'s
+        // `windowed_entry_spread` calls this to average the last N bars' spread
+        // — the SAME code path the live worker drives through its real broker.
+        // The replay serves it from its own recorded series, so worker and
+        // replay size the floor off an identical statistic (no hand-sliced
+        // window, no duplicated floor logic → no drift).
+        //
+        // Bound the window to `(since, now]`, clamped at the `as_of` bar so a
+        // fire never sees candles after the bar it fired on (time-accurate,
+        // same discipline as `window_to_as_of`). Closed bars only — the replay
+        // series is already all-closed.
+        if since >= now {
+            return Err(CandleError::BadRange);
+        }
+        let as_of = *self.as_of.borrow();
+        let upper = now.min(as_of);
+        Ok(self
+            .candles
+            .iter()
+            .filter(|c| c.time > since && c.time <= upper)
+            .cloned()
+            .collect())
     }
 }
 

@@ -593,79 +593,113 @@ pub async fn run_enter<B: Broker, S: StateStore>(
     // a `Skip` in `seen_decision` (no `mark_seen`), so it never poisons the
     // intent id — the next signal bar refires and re-checks. Do NOT add a KV
     // write on this path.
-    match broker.get_quote(&resolved.instrument).await {
-        Err(err) => {
-            tracing::error!(
-                "sl-spread-floor: get_quote failed for {} (id={}): {err:?} — failing open (allowing entry)",
+    // The spread the floor sizes off. Prefer the MEAN of `ask_c − bid_c` over
+    // the last `spread_window` closed bid/ask candles (default 5), so a single
+    // spiky entry bar can't blow the 10× floor out; fall back to a single live
+    // `get_quote` when the windowed read is unavailable (no plan granularity —
+    // the webhook / blackout-restore paths pass `enter_granularity: None` — or a
+    // candle-fetch error / all-degenerate window). See
+    // `crate::intent::mean_spread`.
+    let spread_source = windowed_entry_spread(
+        broker,
+        &resolved.instrument,
+        &verified.intent,
+        now,
+        enter_granularity,
+    )
+    .await;
+    let effective_spread = match spread_source {
+        Some((mean, n)) => {
+            tracing::info!(
+                "sl-spread-floor: using windowed mean spread {mean} over last {n} candles for {} (id={})",
                 resolved.instrument,
-                verified.intent.id
+                verified.intent.id,
             );
+            Some(mean)
         }
-        Ok(quote) => {
-            let spread_price = quote.spread();
-            let entry_price = entry_reference_price(&resolved.entry);
-            let sl_distance = (entry_price - resolved.stop_loss).abs();
-            // Operator-facing messages render distances in **raw price**, the
-            // same unit the broker quotes in. The floor is a pure ratio of two
-            // price distances (`sl_distance` vs `spread`), so the rule — and
-            // its log — must not depend on `pip_size`: a wrong catalog pip
-            // would make a correct decision *read* wrong. (See the SL-floor
-            // spec; pip rendering was removed here for exactly this reason.)
+        None => match broker.get_quote(&resolved.instrument).await {
+            Err(err) => {
+                tracing::error!(
+                    "sl-spread-floor: windowed spread unavailable and get_quote failed for {} (id={}): {err:?} — failing open (allowing entry)",
+                    resolved.instrument,
+                    verified.intent.id
+                );
+                None
+            }
+            Ok(quote) => {
+                tracing::info!(
+                    "sl-spread-floor: windowed spread unavailable, falling back to live quote spread {} for {} (id={})",
+                    quote.spread(),
+                    resolved.instrument,
+                    verified.intent.id,
+                );
+                Some(quote.spread())
+            }
+        },
+    };
+    if let Some(spread_price) = effective_spread {
+        let entry_price = entry_reference_price(&resolved.entry);
+        let sl_distance = (entry_price - resolved.stop_loss).abs();
+        // Operator-facing messages render distances in **raw price**, the
+        // same unit the broker quotes in. The floor is a pure ratio of two
+        // price distances (`sl_distance` vs `spread`), so the rule — and
+        // its log — must not depend on `pip_size`: a wrong catalog pip
+        // would make a correct decision *read* wrong. (See the SL-floor
+        // spec; pip rendering was removed here for exactly this reason.)
 
-            // SALVAGE-BY-WIDENING: rather than reject a too-tight stop outright,
-            // try widening the SL to `SL_WIDEN_SPREAD_MULTIPLE`× the spread and
-            // re-check the trade still clears its R-floor. A wider stop is
-            // strictly *safer* against spread noise; we only reject if even the
-            // widened stop can't hold an `>= min_r` trade against the fixed TP.
-            // Pure decision in `crate::intent::widen_sl_to_spread_floor`; this
-            // is the live-quote wrapper. The widened SL may sit past the
-            // pattern's invalidation level — that's fine, the continuous
-            // entry-level vetos abort the trade independently if price reaches
-            // invalidation. Mutating `resolved.stop_loss` here flows into the
-            // `EntryRequest` built just below.
-            match crate::intent::widen_sl_to_spread_floor(
-                entry_price,
-                resolved.stop_loss,
-                resolved.take_profit,
-                spread_price,
-                resolved.min_r,
-            ) {
-                crate::intent::SlWiden::Unchanged => {}
-                crate::intent::SlWiden::Widened {
-                    new_stop_loss,
-                    new_sl_distance,
-                    new_r,
-                } => {
-                    tracing::info!(
-                        "sl-spread-floor: widened SL {old_sl} -> {new_stop_loss} for {} (sl_distance {sl_distance} -> {new_sl_distance}, spread {spread_price}, {mult:.0}x floor; R now {new_r:.2} >= min_r {min_r:.2}) (id={})",
-                        resolved.instrument,
-                        verified.intent.id,
-                        old_sl = resolved.stop_loss,
-                        mult = crate::intent::SL_WIDEN_SPREAD_MULTIPLE,
-                        min_r = resolved.min_r,
-                    );
-                    resolved.stop_loss = new_stop_loss;
-                }
-                crate::intent::SlWiden::Reject {
-                    widened_sl_distance,
-                    r_at_widen,
-                    min_r,
-                } => {
-                    let message = format!(
-                        "entry blocked: SL too close to spread and widening to {mult:.0}x spread (sl_distance {widened_sl_distance}, spread {spread_price}) would drop R to {r_at_widen:.2} < min_r {min_r:.2}",
-                        mult = crate::intent::SL_WIDEN_SPREAD_MULTIPLE,
-                    );
-                    tracing::info!(
-                        "entry rejected: sl-widen-below-min-r instrument={} spread={spread_price} widened_sl_distance={widened_sl_distance} r_at_widen={r_at_widen:.3} < min_r={min_r} (id={})",
-                        resolved.instrument,
-                        verified.intent.id,
-                    );
-                    return ActionResult::Rejected {
-                        status: 422,
-                        body: message,
-                        outcome: "rejected: sl-widen-below-min-r".into(),
-                    };
-                }
+        // SALVAGE-BY-WIDENING: rather than reject a too-tight stop outright,
+        // try widening the SL to `SL_WIDEN_SPREAD_MULTIPLE`× the spread and
+        // re-check the trade still clears its R-floor. A wider stop is
+        // strictly *safer* against spread noise; we only reject if even the
+        // widened stop can't hold an `>= min_r` trade against the fixed TP.
+        // Pure decision in `crate::intent::widen_sl_to_spread_floor`; this
+        // is the live-quote wrapper. The widened SL may sit past the
+        // pattern's invalidation level — that's fine, the continuous
+        // entry-level vetos abort the trade independently if price reaches
+        // invalidation. Mutating `resolved.stop_loss` here flows into the
+        // `EntryRequest` built just below.
+        match crate::intent::widen_sl_to_spread_floor(
+            entry_price,
+            resolved.stop_loss,
+            resolved.take_profit,
+            spread_price,
+            resolved.min_r,
+        ) {
+            crate::intent::SlWiden::Unchanged => {}
+            crate::intent::SlWiden::Widened {
+                new_stop_loss,
+                new_sl_distance,
+                new_r,
+            } => {
+                tracing::info!(
+                    "sl-spread-floor: widened SL {old_sl} -> {new_stop_loss} for {} (sl_distance {sl_distance} -> {new_sl_distance}, spread {spread_price}, {mult:.0}x floor; R now {new_r:.2} >= min_r {min_r:.2}) (id={})",
+                    resolved.instrument,
+                    verified.intent.id,
+                    old_sl = resolved.stop_loss,
+                    mult = crate::intent::SL_WIDEN_SPREAD_MULTIPLE,
+                    min_r = resolved.min_r,
+                );
+                resolved.stop_loss = new_stop_loss;
+            }
+            crate::intent::SlWiden::Reject {
+                widened_sl_distance,
+                r_at_widen,
+                min_r,
+            } => {
+                let message = format!(
+                    "entry blocked: SL too close to spread and widening to {mult:.0}x spread (sl_distance {widened_sl_distance}, spread {spread_price}) would drop R to {r_at_widen:.2} < min_r {min_r:.2}",
+                    mult = crate::intent::SL_WIDEN_SPREAD_MULTIPLE,
+                );
+                tracing::info!(
+                    "entry rejected: sl-widen-below-min-r instrument={} spread={spread_price} widened_sl_distance={widened_sl_distance} r_at_widen={r_at_widen:.3} < min_r={min_r} (id={})",
+                    resolved.instrument,
+                    verified.intent.id,
+                );
+                return ActionResult::Rejected {
+                    status: 422,
+                    body: message,
+                    outcome: "rejected: sl-widen-below-min-r".into(),
+                };
             }
         }
     }
@@ -1090,4 +1124,63 @@ fn entry_reference_price(entry: &crate::intent::ResolvedEntry) -> f64 {
         ResolvedEntry::Stop { trigger_price } => *trigger_price,
         ResolvedEntry::Limit { trigger_price } => *trigger_price,
     }
+}
+
+/// The mean bid-ask spread (raw price) over the last `intent.spread_window`
+/// closed bid/ask candles, and how many bars fed the mean — or `None` when a
+/// windowed read isn't available.
+///
+/// The entry SL-spread floor uses this in preference to a single live
+/// `get_quote` so a spiky entry candle can't dominate the `10× spread` floor
+/// (see [`crate::intent::mean_spread`]). It mirrors the replay's
+/// `apply_entry_spread_floor` window so worker and replay size the floor off the
+/// same statistic.
+///
+/// Returns `None` (caller falls back to the live quote) when:
+/// - `enter_granularity` is absent (webhook / blackout-restore paths have no
+///   plan timeframe to fetch on),
+/// - the broker's `get_bidask_candles` errors or is the default no-op (a broker
+///   with no two-sided feed), or
+/// - every candle in the window has a degenerate spread (`mean_spread` → `None`).
+///
+/// The window is a count-back: `since = now − (window + 2) × bar`, giving a
+/// little slack so at least `window` closed bars return; the **last** `window`
+/// of them (the most recent, including the just-closed entry bar) feed the mean.
+async fn windowed_entry_spread<B: Broker>(
+    broker: &B,
+    instrument: &str,
+    intent: &crate::intent::Intent,
+    now: chrono::DateTime<chrono::Utc>,
+    enter_granularity: Option<crate::broker::Granularity>,
+) -> Option<(f64, usize)> {
+    let granularity = enter_granularity?;
+    let window = intent
+        .spread_window
+        .unwrap_or(crate::intent::DEFAULT_SPREAD_WINDOW)
+        .max(1);
+    // Count-back with slack so >= `window` closed bars land in the range.
+    let lookback_bars = (window as i64) + 2;
+    let since = now - chrono::Duration::seconds(granularity.seconds() * lookback_bars);
+    let candles = match broker
+        .get_bidask_candles(instrument, granularity, since, now)
+        .await
+    {
+        Ok(c) if !c.is_empty() => c,
+        Ok(_) => {
+            tracing::info!(
+                "sl-spread-floor: windowed spread read returned no candles for {instrument} — falling back to live quote"
+            );
+            return None;
+        }
+        Err(err) => {
+            tracing::info!(
+                "sl-spread-floor: windowed spread read failed for {instrument}: {err} — falling back to live quote"
+            );
+            return None;
+        }
+    };
+    // Reduce via the SHARED trailing-window mean (the same fn the replay's
+    // Fire-builder calls on candles from the same `get_bidask_candles`
+    // provider), so worker and replay size the floor off an identical statistic.
+    crate::broker::trailing_spread_mean(&candles, window)
 }
