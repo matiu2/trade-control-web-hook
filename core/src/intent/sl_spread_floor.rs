@@ -38,6 +38,43 @@ pub const SL_MIN_SPREAD_MULTIPLE: f64 = 10.0;
 /// floating-point boundary risk.
 pub const SL_WIDEN_SPREAD_MULTIPLE: f64 = SL_MIN_SPREAD_MULTIPLE;
 
+/// Default number of trailing candles the entry SL-spread floor averages the
+/// bid-ask spread over, when a trade doesn't specify its own
+/// [`super::Intent::spread_window`].
+///
+/// # Why a window at all
+///
+/// The floor multiplies a spread by [`SL_MIN_SPREAD_MULTIPLE`]. Sizing that off
+/// a **single** sample — one live quote (worker) or one bar's `ask − bid`
+/// (replay) — lets a spiky entry candle (high volatility → a momentarily wide
+/// spread) blow the floor out and widen the stop far past what the instrument's
+/// normal spread warrants. Averaging over the last N candles dilutes a lone
+/// spike while still tracking a genuinely-elevated spread regime. `5` is short
+/// enough to stay "recent" yet long enough to damp a single bar.
+pub const DEFAULT_SPREAD_WINDOW: u32 = 5;
+
+/// Arithmetic mean of the finite, strictly-positive spreads in `spreads`, or
+/// `None` when none qualify.
+///
+/// Each element is a raw-price `ask − bid` for one candle. Non-finite (NaN /
+/// ∞), zero, and negative (crossed-book) samples are **dropped** before the
+/// mean — the same "a degenerate spread is unjudgeable" discipline
+/// [`sl_spread_floor_violation`] applies to a single spread, lifted to the
+/// window. An all-degenerate (or empty) window yields `None`, which the callers
+/// treat as "no usable spread read" and fall through to their fail-open path
+/// (worker: the live `get_quote`; replay: no floor). Averaging only the good
+/// samples means a single NaN bar can't poison an otherwise-clean window.
+pub fn mean_spread(spreads: &[f64]) -> Option<f64> {
+    let (sum, n) = spreads
+        .iter()
+        .filter(|s| s.is_finite() && **s > 0.0)
+        .fold((0.0, 0u32), |(sum, n), s| (sum + s, n + 1));
+    if n == 0 {
+        return None;
+    }
+    Some(sum / f64::from(n))
+}
+
 /// Does this entry violate the SL-vs-spread floor?
 ///
 /// Both arguments are in **price units** (the same units the broker quotes in),
@@ -328,6 +365,47 @@ mod tests {
         );
         assert!(matches!(xag, SlWiden::Widened { .. }), "{xag:?}");
         assert!(matches!(wheat, SlWiden::Widened { .. }), "{wheat:?}");
+    }
+
+    // ---- mean_spread --------------------------------------------------------
+
+    #[test]
+    fn mean_of_clean_window() {
+        let m = mean_spread(&[0.0001, 0.0002, 0.0003]).expect("some");
+        assert!((m - 0.0002).abs() < 1e-12, "{m}");
+    }
+
+    #[test]
+    fn mean_skips_degenerate_samples() {
+        // NaN, zero and a crossed-book negative are all dropped; the mean is of
+        // the two good samples only (0.0001 and 0.0003 → 0.0002).
+        let m = mean_spread(&[0.0001, f64::NAN, 0.0, -0.0005, 0.0003]).expect("some");
+        assert!((m - 0.0002).abs() < 1e-12, "{m}");
+    }
+
+    #[test]
+    fn mean_of_empty_or_all_degenerate_is_none() {
+        assert_eq!(mean_spread(&[]), None);
+        assert_eq!(mean_spread(&[0.0, -1.0, f64::NAN, f64::INFINITY]), None);
+    }
+
+    #[test]
+    fn mean_damps_a_single_spike() {
+        // The exact problem: four normal ~1.5-pip bars and one 20-pip spike.
+        // The single-sample floor would size off the 0.0020 spike; the mean is
+        // (4×0.00015 + 0.0020)/5 = 0.00052 — a quarter of the spike, so the
+        // floor sizes off ~5 pips not ~20.
+        let m = mean_spread(&[0.00015, 0.00015, 0.00015, 0.00015, 0.0020]).expect("some");
+        assert!(
+            m < 0.0020 / 3.0,
+            "spike must be diluted well below itself, got {m}"
+        );
+        assert!(m > 0.00015, "but still above the calm baseline, got {m}");
+    }
+
+    #[test]
+    fn default_spread_window_is_five() {
+        assert_eq!(DEFAULT_SPREAD_WINDOW, 5);
     }
 
     #[test]

@@ -386,6 +386,7 @@ mod tests {
             reason: None,
             mw: Some(mw),
             pip_size: Some(mw.pip_size),
+            spread_window: None,
             trade_plan: None,
             blackout_close: crate::intent::BlackoutCloseAction::default(),
             breakeven: None,

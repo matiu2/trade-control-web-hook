@@ -1,3 +1,46 @@
+# TODO — spread-window SL floor (mean spread over trailing N candles) — IN PROGRESS 2026-07-06
+
+## Problem
+
+The System-1 entry SL-spread floor sizes the "10× spread" floor off a **single**
+spread sample:
+- **Worker** (`run_enter`): one live `get_quote` at entry time.
+- **Replayer** (`apply_entry_spread_floor`): the fire bar's `ask_c − bid_c`.
+
+Entry candles are often spiky (high volatility → wide spread on that exact bar),
+so a one-off spread spike blows the 10× floor out and widens the stop too far.
+
+## Fix
+
+Size the floor off the **mean** `(ask − bid)` over the trailing **N** candles
+(including the entry bar), where **N is tunable at trade-design time**, default
+**5**. Keeps the protective floor; stops one spiky bar from dominating it.
+System 2 (spread-hour transient widen) is **unchanged**.
+
+## Design decisions (from operator)
+- Mean (not median/max) of the last N candles' close spread `(ask_c − bid_c)`.
+- N tunable per-trade, default 5.
+- Worker + replayer compute the **same** average (shared core helper).
+- `pip_size`-free: the floor stays a pure ratio of price distances.
+
+## Steps (each ≤600 lines, tests green before moving on)
+- [ ] **1. core: `mean_spread` helper + signed `spread_window` field + default const.**
+- [ ] **2. core/broker: `get_bidask_candles` trait method (default-impl'd).**
+- [ ] **3. broker-oanda: real `get_bidask_candles` (keep the MBA bid/ask).**
+- [ ] **4. broker-tradenation-adapter: real `get_bidask_candles`.**
+- [ ] **5. worker `run_enter`: use windowed mean spread (fail-open to get_quote).**
+- [ ] **6. replayer `apply_entry_spread_floor`: use windowed mean spread.**
+- [ ] **7. tv-arm `--spread-window N` → bake onto signed intent (+ build-trade).**
+- [ ] **8. README + CHANGELOG vNN + memory; clippy+fmt; commit/push/parent-bump.**
+
+## Hazards to preserve
+- `strategy_changes_in_both_replayer_and_worker` — steps 5 & 6 land together.
+- Signed-body scan is top-level single-line only.
+- Mid `get_candles` contract is load-bearing for the engine — don't touch it.
+- Fail-open on the worker floor (quote/candle error must not strand a legit entry).
+
+---
+
 # TODO — time-decaying retest tolerance (IN PROGRESS 2026-07-03)
 
 Loosen the retest intrabar cross so its closeness-to-neckline requirement
