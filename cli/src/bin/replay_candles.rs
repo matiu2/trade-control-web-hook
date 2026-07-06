@@ -267,7 +267,17 @@ async fn main() -> Result<()> {
     // actually fires (without it the window stops one bar short and the plan
     // never retires). Harmless when there's no expiry: the engine stops at the
     // first `done`, and trailing candles are ignored.
-    let pull_end = end + Duration::seconds(gran.engine().seconds());
+    let pull_end_raw = end + Duration::seconds(gran.engine().seconds());
+    // Clamp to the last *closed* bar: a plan whose trade-expiry is still in the
+    // future asks for candles that don't exist yet, and OANDA rejects a request
+    // whose `from` lands in the future ("Invalid value specified for 'from'.
+    // Time is in the future") — the request optimizer's gap-fill chunk for the
+    // not-yet-printed tail starts at a future `from`. There's nothing to replay
+    // past now anyway — the engine only sees bars that have printed. Snap the
+    // pull end back to one bar before now, so we only ever request fully closed
+    // bars and never the current still-forming one.
+    let last_closed = Utc::now() - Duration::seconds(gran.engine().seconds());
+    let pull_end = pull_end_raw.min(last_closed);
 
     // Pull a silent warm-up prefix before `start`: these bars seed the detector
     // (warm ATR, pattern context) and the FSM but fire nothing — the plan goes
