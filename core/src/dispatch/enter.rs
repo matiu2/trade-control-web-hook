@@ -15,6 +15,24 @@ use crate::spread_blackout;
 use crate::state::{StateStore, veto_ttl_seconds};
 use crate::sweep_gate::now_utc_minute_of_day;
 
+/// Render a raw price for an operator-facing message: fixed generous precision
+/// (enough for 5dp FX and finer) with trailing zeros trimmed, so an index level
+/// like `209.99` doesn't print as `209.9930432131929` (float dust from the
+/// spread-mean arithmetic) nor as `209.99000`. Deliberately **pip-independent**
+/// — the SL-spread floor is a pure price-distance ratio and its messages must
+/// not depend on an instrument's catalog pip (a wrong pip would make a correct
+/// decision *read* wrong; see the SL-floor spec).
+fn fmt_price_trim(v: f64) -> String {
+    if !v.is_finite() {
+        return format!("{v}");
+    }
+    // 6 dp rounds off the float dust while keeping sub-tick precision for every
+    // instrument class; trim trailing zeros (and a bare trailing dot).
+    let s = format!("{v:.6}");
+    let trimmed = s.trim_end_matches('0').trim_end_matches('.');
+    trimmed.to_string()
+}
+
 /// Run an `enter` intent end-to-end (gates → sizing → broker placement →
 /// `recover_entry` fallback).
 ///
@@ -682,27 +700,33 @@ pub async fn run_enter<B: Broker, S: StateStore>(
                 resolved.stop_loss = new_stop_loss;
             }
             crate::intent::SlWiden::Reject {
+                widened_stop_loss,
                 widened_sl_distance,
                 r_at_widen,
                 min_r,
             } => {
+                let spread_str = fmt_price_trim(spread_price);
+                let widened_lvl_str = fmt_price_trim(widened_stop_loss);
+                let widened_dist_str = fmt_price_trim(widened_sl_distance);
                 let message = format!(
-                    "entry blocked: SL too close to spread and widening to {mult:.0}x spread (sl_distance {widened_sl_distance}, spread {spread_price}) would drop R to {r_at_widen:.2} < min_r {min_r:.2}",
+                    "entry blocked: SL too close to spread and widening to {mult:.0}x spread (SL would move to {widened_lvl_str}, sl_distance {widened_dist_str}, spread {spread_str}) would drop R to {r_at_widen:.2} < min_r {min_r:.2}",
                     mult = crate::intent::SL_WIDEN_SPREAD_MULTIPLE,
                 );
                 tracing::info!(
-                    "entry rejected: sl-widen-below-min-r instrument={} spread={spread_price} widened_sl_distance={widened_sl_distance} r_at_widen={r_at_widen:.3} < min_r={min_r} (id={})",
+                    "entry rejected: sl-widen-below-min-r instrument={} spread={spread_str} widened_stop_loss={widened_lvl_str} widened_sl_distance={widened_dist_str} r_at_widen={r_at_widen:.3} < min_r={min_r} (id={})",
                     resolved.instrument,
                     verified.intent.id,
                 );
                 // Fold the deciding numbers into `outcome` (not just `body`):
                 // the offline replay surfaces `outcome` verbatim on its
                 // "BLOCKED — rejected: …" line, so without them the operator
-                // sees the reject name but not *why* — the spread, the widened
-                // SL distance, and the R it would leave vs the floor. `body`
+                // sees the reject name but not *why*. Show the spread, the
+                // widened SL **price level** (`widened_sl_lvl`, same price units
+                // as the entry/SL/TP levels — what the stop would move to) and
+                // its distance, and the R it would leave vs the floor. `body`
                 // (the 422 text) still carries the fuller sentence.
                 let outcome = format!(
-                    "rejected: sl-widen-below-min-r (spread={spread_price} widened_sl={widened_sl_distance} r_at_widen={r_at_widen:.2} < min_r={min_r:.2})",
+                    "rejected: sl-widen-below-min-r (spread={spread_str} widened_sl_lvl={widened_lvl_str} widened_sl={widened_dist_str} r_at_widen={r_at_widen:.2} < min_r={min_r:.2})",
                 );
                 return ActionResult::Rejected {
                     status: 422,
@@ -1192,4 +1216,22 @@ async fn windowed_entry_spread<B: Broker>(
     // Fire-builder calls on candles from the same `get_bidask_candles`
     // provider), so worker and replay size the floor off an identical statistic.
     crate::broker::trailing_spread_mean(&candles, window)
+}
+
+#[cfg(test)]
+mod fmt_tests {
+    use super::fmt_price_trim;
+
+    #[test]
+    fn trims_float_dust_and_trailing_zeros() {
+        // Index-scale level with float dust → trimmed to its real precision.
+        assert_eq!(fmt_price_trim(209.9930432131929), "209.993043");
+        // A clean whole-ish level keeps no trailing zeros or dot.
+        assert_eq!(fmt_price_trim(209.99), "209.99");
+        assert_eq!(fmt_price_trim(10.0), "10");
+        // Sub-tick FX precision (5dp) survives.
+        assert_eq!(fmt_price_trim(1.10345), "1.10345");
+        // Non-finite falls back to the default float render, not a panic.
+        assert_eq!(fmt_price_trim(f64::NAN), "NaN");
+    }
 }
