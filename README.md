@@ -723,11 +723,14 @@ reward:risk floor.
       invalidation.
     - **Can't stay legal → reject.** If even the `10 × spread` stop drops
       `R` below `min_r`, there is no legal stop and the entry is rejected
-      with **HTTP 422 / `rejected: sl-widen-below-min-r`** (body:
-      `entry blocked: SL too close to spread and widening to 10x spread
-      (sl_distance <d>, spread <s>) would drop R to <r> < min_r <m>`). This
-      is the wide-spread instrument case where the TP is too near to
-      support an honest stop.
+      with **HTTP 422 / `rejected: sl-widen-below-min-r (spread=<s>
+      widened_sl=<d> r_at_widen=<r> < min_r=<m>)`** (body: `entry blocked:
+      SL too close to spread and widening to 10x spread (sl_distance <d>,
+      spread <s>) would drop R to <r> < min_r <m>`). The deciding numbers
+      are folded into the short `outcome` string (not just the body) so the
+      offline `replay-candles` report shows *why* on its `BLOCKED —
+      rejected: …` line, not just the reject name. This is the wide-spread
+      instrument case where the TP is too near to support an honest stop.
 
   The floor is a **pure ratio of two raw-price distances** (`sl_distance`
   vs `spread = ask − bid`), so the unit cancels and the decision never
