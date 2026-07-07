@@ -149,13 +149,18 @@ struct Args {
     #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
     annotate_unfilled: bool,
 
-    /// Number of extra candles pulled *before* the window start as a silent
+    /// Number of **real** candles to pull *before* the window start as a silent
     /// warm-up prefix. These bars seed the detector (so ATR is warm and the
     /// candle patterns have context) and prime the FSM, but fire nothing — the
     /// plan only goes live at the window start. Without this, a `needs_golden`
     /// enter can never fire (ATR never warms) and a stale veto-level touch in
     /// the warm-up span would wrongly retire the plan. 200 covers the 96-bar
     /// 15m ATR plus pattern lookback; raise it for very long-lookback configs.
+    ///
+    /// This is a **candle count, not a wall-clock span**: a market gap (weekend
+    /// / session close) inside the naive `count × bar` estimate would yield
+    /// fewer real candles, so the pull widens its look-back and retries — hopping
+    /// the gap — until it has this many real candles (or hits a back-off cap).
     #[arg(long, default_value_t = 200)]
     warmup_bars: usize,
 
@@ -281,43 +286,30 @@ async fn main() -> Result<()> {
 
     // Pull a silent warm-up prefix before `start`: these bars seed the detector
     // (warm ATR, pattern context) and the FSM but fire nothing — the plan goes
-    // live at `start` (see `replay::run`'s `live_start`). The cache pull is
-    // time-windowed, so size the prefix by time = warmup_bars × bar.
+    // live at `start` (see `replay::run`'s `live_start`). `warmup_bars` is a
+    // count of *real* candles we want before `start`, not a wall-clock span —
+    // that distinction is load-bearing. The cache pull is time-windowed, so we
+    // start from a time estimate (`warmup_bars × bar`) but a **market gap**
+    // (weekend, session close) inside that span yields fewer real candles than
+    // wall-time bars. A crypto CFD on TradeNation, say, gaps Fri→Sun, so 200
+    // bars of wall-time over a weekend can return ~18 candles — far short of the
+    // 96-bar M15 ATR, leaving ATR `na` for the whole replay so a `needs_golden`
+    // enter never fires (the "not seeing the entry candle" bug). So we pull,
+    // count the real pre-`start` candles, and if short, widen the look-back and
+    // retry — hopping the gap — until we have enough or hit a back-off cap.
     let bar_secs = gran.engine().seconds();
-    let pull_from = start - Duration::seconds(bar_secs * args.warmup_bars as i64);
-
-    tracing::info!(
-        instrument = %symbol,
-        granularity = %gran_label,
-        source = ?args.source,
-        warmup_from = %brisbane::bne(pull_from),
-        start = %brisbane::bne(start),
-        end = %brisbane::bne(end),
-        pull_end = %brisbane::bne(pull_end),
-        warmup_bars = args.warmup_bars,
-        "pulling candles (times in Brisbane, UTC+10)"
-    );
-    let candles = candles::pull(
+    let candles = pull_with_warmup(
         args.source,
         &symbol,
         gran,
-        pull_from,
+        gran_label,
+        start,
         pull_end,
+        bar_secs,
+        args.warmup_bars,
         args.cache_dir.clone(),
     )
     .await?;
-    if candles.is_empty() {
-        return Err(eyre!(
-            "no candles returned for {symbol} {gran_label} in [{pull_from}, {pull_end}]"
-        ));
-    }
-    let warmup_count = candles.iter().filter(|c| c.time < start).count();
-    tracing::info!(
-        count = candles.len(),
-        warmup = warmup_count,
-        live = candles.len() - warmup_count,
-        "pulled candles"
-    );
 
     // Keep the state TTL past the window so nothing expires mid-replay.
     let expires_at = end + Duration::days(365);
@@ -368,6 +360,118 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Max look-back back-off attempts before we give up widening the warm-up pull.
+/// Each attempt doubles the span, so 6 attempts reaches 2⁵ = 32× the initial
+/// wall-clock estimate — enough to hop a weekend gap several times over even on
+/// a sparse instrument. Beyond this we replay with whatever warm-up we got and
+/// let the report be honest about the shallow ATR rather than loop forever.
+const MAX_WARMUP_BACKOFF_ATTEMPTS: u32 = 6;
+
+/// Pull the warm-up prefix + live window, sizing the prefix by a **count of real
+/// candles** (`want_warmup`) rather than wall-clock time. Starts from the naive
+/// time estimate (`want_warmup × bar` before `start`) and, if a market gap
+/// (weekend / session close) leaves fewer than `want_warmup` real candles before
+/// `start`, widens the look-back and re-pulls — hopping the gap — until it has
+/// enough or exhausts [`MAX_WARMUP_BACKOFF_ATTEMPTS`]. A persistent shortfall
+/// WARNs (the ATR may stay cold, e.g. a `needs_golden` enter won't fire) but
+/// does not fail: the replay runs on what's available and the trace shows why.
+#[allow(clippy::too_many_arguments)]
+async fn pull_with_warmup(
+    source: CandleSource,
+    symbol: &str,
+    gran: granularity::ReplayGranularity,
+    gran_label: &str,
+    start: DateTime<Utc>,
+    pull_end: DateTime<Utc>,
+    bar_secs: i64,
+    want_warmup: usize,
+    cache_dir: Option<PathBuf>,
+) -> Result<Vec<EngineCandle>> {
+    let mut pull_from = start - Duration::seconds(bar_secs * want_warmup as i64);
+    let mut attempt: u32 = 0;
+    loop {
+        tracing::info!(
+            instrument = %symbol,
+            granularity = %gran_label,
+            source = ?source,
+            warmup_from = %brisbane::bne(pull_from),
+            start = %brisbane::bne(start),
+            pull_end = %brisbane::bne(pull_end),
+            want_warmup,
+            attempt,
+            "pulling candles (times in Brisbane, UTC+10)"
+        );
+        let candles =
+            candles::pull(source, symbol, gran, pull_from, pull_end, cache_dir.clone()).await?;
+        if candles.is_empty() {
+            return Err(eyre!(
+                "no candles returned for {symbol} {gran_label} in [{pull_from}, {pull_end}]"
+            ));
+        }
+        let warmup_count = candles.iter().filter(|c| c.time < start).count();
+        tracing::info!(
+            count = candles.len(),
+            warmup = warmup_count,
+            live = candles.len() - warmup_count,
+            attempt,
+            "pulled candles"
+        );
+
+        if warmup_count >= want_warmup {
+            return Ok(candles);
+        }
+        if attempt >= MAX_WARMUP_BACKOFF_ATTEMPTS {
+            tracing::warn!(
+                warmup = warmup_count,
+                want_warmup,
+                "warm-up prefix short of target after {MAX_WARMUP_BACKOFF_ATTEMPTS} back-offs — \
+                 likely a market gap (weekend/session close) leaving sparse history. The ATR \
+                 may stay cold, so a needs-golden enter can fail to fire. Replaying anyway."
+            );
+            return Ok(candles);
+        }
+        // Widen the look-back and retry. Base the next span on the *observed*
+        // density (bars per wall-second so far) so we jump past the gap in one
+        // step rather than doubling blindly, but never shrink and always at
+        // least double, so a zero-density prefix still makes progress.
+        let next = next_pull_from(start, pull_from, warmup_count, want_warmup, bar_secs);
+        pull_from = next.min(pull_from - Duration::seconds(bar_secs * want_warmup as i64));
+        attempt += 1;
+    }
+}
+
+/// Given the current pull span `[pull_from, start]` yielded `have` real warm-up
+/// candles but we want `want`, estimate a new (earlier) `pull_from` that should
+/// cover the shortfall. Pure arithmetic so it's unit-testable without a broker.
+///
+/// Extrapolates from the observed density: the span so far delivered `have`
+/// candles over `(start - pull_from)` seconds, so the shortfall `want - have`
+/// needs roughly `(want - have) / density` more seconds of look-back. When
+/// `have == 0` (the whole span was a gap) density is unknown, so fall back to
+/// doubling the current span. The caller additionally clamps so the span never
+/// shrinks and always advances by at least the naive estimate.
+fn next_pull_from(
+    start: DateTime<Utc>,
+    pull_from: DateTime<Utc>,
+    have: usize,
+    want: usize,
+    bar_secs: i64,
+) -> DateTime<Utc> {
+    let span_secs = (start - pull_from).num_seconds().max(bar_secs);
+    let shortfall = want.saturating_sub(have);
+    let extra_secs = if have == 0 {
+        // No density signal — double the current span.
+        span_secs
+    } else {
+        // Seconds-per-real-candle × shortfall, so we reach the target.
+        (span_secs as f64 / have as f64 * shortfall as f64).ceil() as i64
+    };
+    // A safety margin (25%) so a gap that recurs (a second weekend) doesn't leave
+    // us one bar short and force another round-trip.
+    let extra_secs = extra_secs + extra_secs / 4;
+    pull_from - Duration::seconds(extra_secs.max(bar_secs))
 }
 
 /// The fixtures directory: `--fixtures-dir` if given, else the repo-root default.
@@ -820,5 +924,55 @@ mod tests {
             check: false,
             fixtures_dir: None,
         }
+    }
+
+    // ---- warm-up back-off (`next_pull_from`) --------------------------------
+
+    const M15: i64 = 15 * 60;
+
+    /// A dense span (no gap) extrapolates linearly: got half the target over the
+    /// span, so the next look-back roughly doubles it (plus the 25% margin) to
+    /// reach the whole target.
+    #[test]
+    fn next_pull_from_extrapolates_from_density() {
+        let start = Utc.with_ymd_and_hms(2026, 7, 6, 1, 30, 0).unwrap();
+        // 48 candles over a 48-bar span → density 1 candle/bar. Want 96 → need
+        // 48 more bars of look-back.
+        let pull_from = start - Duration::seconds(M15 * 48);
+        let next = next_pull_from(start, pull_from, 48, 96, M15);
+        // Extra = 48 bars × (1 + 0.25 margin) = 60 bars earlier than pull_from.
+        let extra = (pull_from - next).num_seconds();
+        assert_eq!(extra, M15 * 60, "shortfall × density + 25% margin");
+    }
+
+    /// The pathological weekend-gap case: the whole span landed in a gap and
+    /// returned zero real candles. With no density signal, fall back to doubling
+    /// the span so we still make progress toward hopping the gap.
+    #[test]
+    fn next_pull_from_doubles_when_span_was_all_gap() {
+        let start = Utc.with_ymd_and_hms(2026, 7, 6, 1, 30, 0).unwrap();
+        let pull_from = start - Duration::seconds(M15 * 200); // 50h wall-time
+        let next = next_pull_from(start, pull_from, 0, 96, M15);
+        // have == 0 → extra = span (200 bars) + 25% = 250 bars earlier.
+        let extra = (pull_from - next).num_seconds();
+        assert_eq!(
+            extra,
+            M15 * 250,
+            "zero-density falls back to doubling +margin"
+        );
+        assert!(next < pull_from, "always reaches further back");
+    }
+
+    /// Never returns a `pull_from` at or after the existing one (monotonic
+    /// progress), even for a degenerate near-target span.
+    #[test]
+    fn next_pull_from_always_moves_earlier() {
+        let start = Utc.with_ymd_and_hms(2026, 7, 6, 1, 30, 0).unwrap();
+        let pull_from = start - Duration::seconds(M15 * 96);
+        let next = next_pull_from(start, pull_from, 95, 96, M15);
+        assert!(
+            next <= pull_from - Duration::seconds(M15),
+            "advances ≥ 1 bar"
+        );
     }
 }
