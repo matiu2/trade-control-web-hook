@@ -56,7 +56,6 @@ use trade_control_core::dispatch::{
 use trade_control_core::incoming::Verified;
 use trade_control_core::intent::{Action, Shell, VetoLevel};
 use trade_control_core::plan_state::PlanState;
-use trade_control_core::position_view::{NoPositions, OpenSet, PositionView};
 use trade_control_core::state::{StateStore, StoredPlan};
 use trade_control_core::tick_bundle::{
     DispatchOutcome, KvTickTransition, TICK_BUNDLE_SCHEMA_VERSION, TickBundle,
@@ -162,28 +161,7 @@ where
     // window is unused and `fresh` stands in.
     let detector_window = detector_window_for(&broker, plan, &fresh, now).await?;
 
-    // Ground truth for the reversal-close terminate decision (see
-    // `PositionView`). Only a plan carrying a `06-close-on-reversal` can even ask
-    // whether a position is open, so we snapshot the broker's open positions only
-    // then — quiet ticks and reversal-close-free plans pay nothing. On a broker
-    // error we fall back to a flat book (`NoPositions`): a missed terminate just
-    // re-checks next tick, whereas a wrong terminate archives the plan
-    // irrecoverably, so flat is the safe default.
-    let positions: Box<dyn PositionView> = if plan_has_reversal_close(plan) {
-        Box::new(snapshot_positions(&broker, account, &plan.instrument).await)
-    } else {
-        Box::new(NoPositions)
-    };
-
-    let eval = evaluate_plan(
-        plan,
-        &prior,
-        &fresh,
-        &detector_window,
-        now,
-        expires_at,
-        positions.as_ref(),
-    );
+    let eval = evaluate_plan(plan, &prior, &fresh, &detector_window, now, expires_at);
 
     // Surface any trendline out-of-window anchor diagnostics the pure evaluator
     // can't log itself. An out-of-window anchor falls back to the `bar_seconds`
@@ -587,48 +565,6 @@ fn pine_lookback_since(
     let cfg = DetectorConfig::pine_defaults(plan.granularity);
     let lookback = min_lookback_bars(&cfg) as i64;
     Some(earliest_fresh - chrono::Duration::seconds(plan.granularity.seconds() * lookback))
-}
-
-/// Does this plan carry a `06-close-on-reversal` (a `Close` guard with a
-/// `PinePattern` trigger)? Only such a plan can ask the engine whether a
-/// position is open, so it gates the (bounded) `list_open_positions` snapshot.
-fn plan_has_reversal_close(plan: &trade_control_core::trade_plan::TradePlan) -> bool {
-    use trade_control_core::trade_plan::Trigger;
-    plan.rules.iter().any(|r| {
-        r.intent.action == Action::Close && matches!(r.trigger, Trigger::PinePattern { .. })
-    })
-}
-
-/// Snapshot the broker's open positions on `instrument` into an [`OpenSet`] the
-/// engine can query. Filters to the plan's instrument and reduces each position
-/// to `(instrument, direction)` — all the terminate decision needs. A broker
-/// error yields an **empty** set (flat book → the reversal-close is
-/// non-terminal), the safe default; it's logged, not swallowed.
-async fn snapshot_positions(
-    broker: &BrokerHandle,
-    account: Option<&str>,
-    instrument: &str,
-) -> OpenSet {
-    let account_id = account.unwrap_or("");
-    let positions = match broker {
-        BrokerHandle::Oanda(b) => b.list_open_positions(account_id).await,
-        BrokerHandle::TradeNation(b) => b.list_open_positions(account_id).await,
-    };
-    match positions {
-        Ok(list) => OpenSet::new(
-            list.into_iter()
-                .filter(|p| p.instrument == instrument)
-                .map(|p| (p.instrument, p.direction))
-                .collect(),
-        ),
-        Err(err) => {
-            tracing::warn!(
-                "cron engine: list_open_positions({instrument}) failed: {err}; \
-                 treating book as flat (reversal-close non-terminal this tick)"
-            );
-            OpenSet::default()
-        }
-    }
 }
 
 /// The fetch start the plan's trendlines need: the earliest anchor epoch across
