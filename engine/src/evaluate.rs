@@ -64,7 +64,6 @@ use trade_control_core::broker::Candle;
 use trade_control_core::intent::{Action, Direction, SignalKind};
 use trade_control_core::plan_eval::{FiredIntent, PlanEval};
 use trade_control_core::plan_state::{Phase, PlanState};
-use trade_control_core::position_view::PositionView;
 use trade_control_core::signals::{
     DetectorConfig, LatchedSignal, atr_length_for, latched_signal_at, wilder_atr,
 };
@@ -182,7 +181,6 @@ pub fn evaluate_plan(
     detector_window: &[Candle],
     _now: DateTime<Utc>,
     expires_at: DateTime<Utc>,
-    positions: &dyn PositionView,
 ) -> PlanEval {
     let mut state = prior.clone();
     state.expires_at = expires_at;
@@ -205,7 +203,6 @@ pub fn evaluate_plan(
             candle,
             detector_window,
             &detector_cfg,
-            positions,
             &mut fired,
         );
         if state.phase == Phase::Done {
@@ -409,7 +406,6 @@ fn evaluate_guards(
     candle: &Candle,
     window: &[Candle],
     detector_cfg: &DetectorConfig,
-    positions: &dyn PositionView,
     fired: &mut Vec<FiredIntent>,
 ) {
     for rule in &plan.rules {
@@ -446,57 +442,48 @@ fn evaluate_guards(
         };
         push_fire_signal(rule, candle, signal, fired);
         state.fired.insert(rule.rule_id.clone());
-        // Terminate decision. A cancel / invalidate veto is always terminal —
-        // the dispatched intent is the end of the setup. A `06-close-on-reversal`
-        // is "flatten the position *if* one is open", so it retires the spine
-        // **iff a position is actually open** on this instrument in the trade's
-        // direction — ground truth from `positions`, not a proxy. Flat → the
-        // close dispatches a harmless no-op and the spine survives so a pending
-        // enter keeps its window.
-        if guard_is_terminal(&rule.intent, plan.direction, positions) {
+        // Terminate decision. A cancel / invalidate veto (`too-high` / `too-low`
+        // invalidation, `trade-expiry`) is terminal — its trigger means the
+        // *setup* is dead, so the plan retires. A `06-close-on-reversal` is
+        // **never** terminal: it is a per-*trade* exit ("flatten any open
+        // position on a confirming reversal"), not a setup invalidation. The
+        // flatten is dispatched independently (`run_close` → `close_positions`,
+        // a no-op when flat), and the spine stays in `AwaitEntry` so a multi-shot
+        // plan can still re-enter on the next signal bar. The plan retires the
+        // normal way — a terminal invalidation veto, `trade-expiry`, or the
+        // enter's `not_after` window closing. (Closing a trade must not stop the
+        // retries: place → fill → close-on-reversal → re-enter is the whole point
+        // of multi-shot.)
+        if guard_is_terminal(&rule.intent) {
             state.phase = Phase::Done;
             return;
         }
-        // Non-terminal guard fired (a reversal-close over a flat book): keep
-        // scanning later rules this bar, but it has latched so it won't re-fire.
+        // Non-terminal guard fired (a reversal-close): keep scanning later rules
+        // this bar, but it has latched so it won't re-fire.
     }
 }
 
 /// Whether a fired guard retires the plan's spine.
 ///
-/// Non-`Close` guards (cancel / invalidate vetos) are always terminal — the
-/// dispatched intent is the end of the setup.
+/// - **Non-`Close` guards** (cancel / invalidate vetos — `too-high` / `too-low`
+///   invalidation, `trade-expiry`) → **terminal**. Their trigger means the setup
+///   itself is invalid, so the dispatched intent is the end of it.
+/// - **`Close` guards** (`06-close-on-reversal`) → **never terminal**. A
+///   reversal-close is a per-*trade* exit, not a setup invalidation: it flattens
+///   any open position (dispatched independently — a no-op when flat) but must
+///   leave the plan in `AwaitEntry` so a multi-shot enter can re-enter on the
+///   next signal bar. Making it terminal killed the retries (the operator's
+///   point: "close any open trades, but don't stop the retries"). A single-shot
+///   enter already sets `Phase::Done` at entry, so its reversal-close never even
+///   runs — "never terminal" is correct for both.
 ///
-/// A `Close` guard (`06-close-on-reversal`) is "flatten the position *if* one is
-/// open", so it retires the spine **iff a position is open** on `instrument` in
-/// `direction`. This is *ground truth* via [`PositionView`] — the worker answers
-/// from the broker's live positions, the replay from its fill sim — replacing the
-/// old proxy chain (always-terminal → window-shape → `entry_fired_at`), each of
-/// which had a blind spot that re-opened the same bug (see the
-/// `reversal_close_spine_retire_recurring` project memory).
-///
-/// - **Position open** → the reversal is flattening a real trade → thesis broken
-///   → terminal (and the close dispatches the flatten).
-/// - **Flat** → nothing to close → **non-terminal**: the close dispatches a
-///   logged no-op and the pending enter keeps its window. Covers both the
-///   pre-entry case (EUR/CHF 2026-07-06 `ihs-eur-chf-29ebb72b`, fired before any
-///   fill) and a genuinely flat book. The operator's framing: "that alert only
-///   closes an existing trade; if none is open it should only be logged".
-///
-/// Note this makes a **news-windowed** close terminal too *when a position is
-/// open* — a news-reversal that actually flattened a live trade ends it, same as
-/// a price one. The old "news is always non-terminal" carve-out only existed
-/// because the engine couldn't tell open from flat; with ground truth the
-/// distinction collapses to the honest question.
-fn guard_is_terminal(
-    intent: &trade_control_core::intent::Intent,
-    direction: Direction,
-    positions: &dyn PositionView,
-) -> bool {
-    if intent.action != Action::Close {
-        return true;
-    }
-    positions.is_open(&intent.instrument, direction)
+/// This retires the whole "terminal reversal-close" path (and the `PositionView`
+/// machinery v66 added to gate it): whether a position is *open* decides whether
+/// the flatten does anything, not whether the plan dies — and that decision lives
+/// at dispatch (`close_positions`), not in the spine. See the
+/// `reversal_close_spine_retire_recurring` project memory.
+fn guard_is_terminal(intent: &trade_control_core::intent::Intent) -> bool {
+    intent.action != Action::Close
 }
 
 /// Evaluate the break-and-close prep. On fire it latches, records the lookback
@@ -1757,46 +1744,17 @@ mod tests {
         s
     }
 
-    /// An [`OpenSet`] holding a position in the **test plan's own direction**
-    /// (`Short` — see `plan()`), so a fired `06-close-on-reversal` is flattening
-    /// a real trade and therefore retires the spine. `guard_is_terminal` checks
-    /// `is_open(instrument, plan.direction)`, so the open position must match the
-    /// plan's direction, not the reversal-close's opposite `PinePattern` dir.
-    fn open_plan_position() -> trade_control_core::position_view::OpenSet {
-        trade_control_core::position_view::OpenSet::new(vec![("EUR_USD".into(), Direction::Short)])
-    }
-
     fn run(p: &TradePlan, prior: &PlanState, candles: &[Candle]) -> PlanEval {
         // Non-Pine tests pass the same slice as both the new-candles and the
         // detector window; only a `PinePattern` entry reads the latter.
         run_window(p, prior, candles, candles)
     }
 
-    /// Evaluate with a **flat** book (`NoPositions`) — the default for the vast
-    /// majority of tests, which don't exercise an open position.
     fn run_window(
         p: &TradePlan,
         prior: &PlanState,
         new_candles: &[Candle],
         detector_window: &[Candle],
-    ) -> PlanEval {
-        run_window_pos(
-            p,
-            prior,
-            new_candles,
-            detector_window,
-            &trade_control_core::position_view::NoPositions,
-        )
-    }
-
-    /// Evaluate with an explicit [`PositionView`] — used by the reversal-close
-    /// terminate tests, which turn on whether a position is open.
-    fn run_window_pos(
-        p: &TradePlan,
-        prior: &PlanState,
-        new_candles: &[Candle],
-        detector_window: &[Candle],
-        positions: &dyn PositionView,
     ) -> PlanEval {
         evaluate_plan(
             p,
@@ -1805,7 +1763,6 @@ mod tests {
             detector_window,
             ts("2026-06-16T20:00:00Z"),
             ts("2026-06-30T00:00:00Z"),
-            positions,
         )
     }
 
@@ -3963,19 +3920,18 @@ mod tests {
 
     #[test]
     fn close_on_reversal_fires_on_a_long_reversal_in_the_band() {
-        // THE bug: a SHORT trade's `06-close-on-reversal` is a PinePattern{Long}
-        // close. A bullish reversal candle whose close (1.18) sits inside the SR
-        // band must fire the close and retire the plan — the engine fires it for
-        // both the worker (dispatch run_close) and the replay (exit the position).
-        // A position IS open (open_long) so the fired close is flattening a real
-        // trade and therefore retires the spine (thesis breaking at the SR band).
+        // A SHORT trade's `06-close-on-reversal` is a PinePattern{Long} close. A
+        // bullish reversal candle whose close (1.18) sits inside the SR band must
+        // FIRE the close (dispatched to flatten any open position) but must NOT
+        // retire the plan — a reversal-close is a per-trade exit, not a setup
+        // invalidation, so the multi-shot spine stays alive to re-enter.
         let p = plan(vec![close_on_reversal_rule(
             Direction::Long,
             Some([1.15, 1.20]),
         )]);
         let window = bullish_pinbar_window();
         let prior = seed_at(Phase::AwaitEntry, "2026-06-16T10:00:00Z");
-        let eval = run_window_pos(&p, &prior, &window[3..], &window, &open_plan_position());
+        let eval = run_window(&p, &prior, &window[3..], &window);
         assert_eq!(eval.fired.len(), 1, "the bullish reversal fires the close");
         let f = &eval.fired[0];
         assert_eq!(f.rule_id, "06-close-on-reversal");
@@ -3984,7 +3940,11 @@ mod tests {
             .signal
             .expect("a PinePattern close carries latched geometry");
         assert_eq!(sig.direction, Direction::Long);
-        assert!(eval.done, "a terminal close retires the plan");
+        assert!(
+            !eval.done,
+            "a reversal-close flattens but never retires the plan (retries continue)"
+        );
+        assert_eq!(eval.new_state.phase, Phase::AwaitEntry);
     }
 
     #[test]
@@ -4017,38 +3977,35 @@ mod tests {
         // carries `inside_window: ["news"]` and is gated — see the news tests.)
         let p = plan(vec![close_on_reversal_rule(Direction::Long, None)]);
         let window = bullish_pinbar_window();
-        // Position open → an ungated close is terminal on its detector match.
         let prior = seed_at(Phase::AwaitEntry, "2026-06-16T10:00:00Z");
-        let eval = run_window_pos(&p, &prior, &window[3..], &window, &open_plan_position());
+        let eval = run_window(&p, &prior, &window[3..], &window);
         assert_eq!(eval.fired.len(), 1, "no gate → detector match fires");
         assert_eq!(eval.fired[0].rule_id, "06-close-on-reversal");
-        assert!(eval.done);
+        // A reversal-close never retires the plan (flattens only).
+        assert!(!eval.done);
+        assert_eq!(eval.new_state.phase, Phase::AwaitEntry);
     }
 
     #[test]
-    fn price_close_over_a_flat_book_fires_but_is_non_terminal() {
-        // EUR/CHF 2026-07-06 (ihs-eur-chf-29ebb72b): a price-windowed
-        // `06-close-on-reversal` fired on a reversal candle in the SR band, but
-        // the book was FLAT (no position open — the enter hadn't filled). The
-        // close is "flatten if in a position" — with nothing open it closes
-        // nothing (the worker rejected it `needs-golden`). It must dispatch (for
-        // visibility) but must NOT retire the spine, so the pending enter keeps
-        // its window. Before the position-aware fix this archived the plan and
-        // the trade never entered. Discriminator is now ground truth (flat book
-        // via NoPositions), not the old `entry_fired_at` proxy.
+    fn price_close_fires_but_never_retires_the_plan() {
+        // EUR/CHF 2026-07-06 (ihs-eur-chf-29ebb72b) provenance: a price-windowed
+        // `06-close-on-reversal` fired on a reversal candle in the SR band and
+        // archived the whole plan before the (multi-shot) trade could enter. A
+        // reversal-close is a per-trade exit, not a setup invalidation — it must
+        // dispatch (flatten any open position) but NEVER retire the spine, so the
+        // pending / multi-shot enter keeps its window.
         let p = plan(vec![close_on_reversal_rule(
             Direction::Long,
             Some([1.15, 1.20]),
         )]);
         let window = bullish_pinbar_window();
         let prior = seed_at(Phase::AwaitEntry, "2026-06-16T10:00:00Z");
-        // run_window defaults to a flat book (NoPositions).
         let eval = run_window(&p, &prior, &window[3..], &window);
         assert_eq!(eval.fired.len(), 1, "the close still fires (dispatched)");
         assert_eq!(eval.fired[0].rule_id, "06-close-on-reversal");
         assert!(
             !eval.done,
-            "a reversal-close over a flat book must not retire the plan"
+            "a reversal-close flattens but never retires the plan"
         );
         assert_eq!(
             eval.new_state.phase,
@@ -4147,15 +4104,13 @@ mod tests {
         );
     }
 
-    // ===== Defect B: a news-windowed close is non-terminal for the spine =====
+    // ===== a reversal-close (news- or price-windowed) is never terminal =====
 
     #[test]
-    fn news_close_is_non_terminal_over_a_flat_book() {
-        // A news close that DOES fire (inside its window) over a FLAT book must
-        // not retire the spine — it's a flatten-if-open safety and there's
-        // nothing open to flatten (run_window = NoPositions). The spine survives
-        // for pending entries. (With a position open it WOULD be terminal — see
-        // news_close_is_terminal_when_a_position_is_open.)
+    fn news_close_is_non_terminal() {
+        // A news close that DOES fire (inside its window) must not retire the
+        // spine — a reversal-close flattens any open position but never ends the
+        // plan, so the spine survives for pending / multi-shot entries.
         let p = plan(vec![
             news_control_rule(
                 "news-start-1",
@@ -4182,30 +4137,37 @@ mod tests {
     }
 
     #[test]
-    fn price_band_close_is_terminal_when_a_position_is_open() {
-        // A price-windowed close at the SR band while a position IS open is a
-        // thesis invalidation and retires the plan (ground truth: open_long).
+    fn price_band_close_is_never_terminal() {
+        // A price-windowed close at the SR band flattens any open position but is
+        // NOT a setup invalidation — the multi-shot spine must stay alive to
+        // re-enter. (The plan retires only via an invalidation veto / trade-expiry
+        // / the enter window closing.) This is the operator's rule: "close any
+        // open trades, but don't stop the retries."
         let p = plan(vec![close_on_reversal_rule(
             Direction::Long,
             Some([1.15, 1.20]),
         )]);
         let window = bullish_pinbar_window();
         let prior = seed_at(Phase::AwaitEntry, "2026-06-16T10:00:00Z");
-        let eval = run_window_pos(&p, &prior, &window[3..], &window, &open_plan_position());
+        let eval = run_window(&p, &prior, &window[3..], &window);
         assert!(
-            eval.done,
-            "a price-band reversal-close over an open position retires the plan"
+            eval.fired
+                .iter()
+                .any(|f| f.rule_id == "06-close-on-reversal"),
+            "the price-band reversal-close fires (dispatched to flatten)"
         );
-        assert_eq!(eval.new_state.phase, Phase::Done);
+        assert!(
+            !eval.done,
+            "a price-band reversal-close flattens but never retires the plan"
+        );
+        assert_eq!(eval.new_state.phase, Phase::AwaitEntry);
     }
 
     #[test]
-    fn news_close_is_terminal_when_a_position_is_open() {
-        // Behaviour change under ground truth: a news-windowed reversal-close
-        // that fires while a position IS open flattened a real trade → the trade
-        // is over → terminal. (The old "news is always non-terminal" carve-out
-        // only existed because the engine couldn't tell open from flat. With
-        // open_long the honest answer is terminal.)
+    fn news_close_is_never_terminal_even_when_it_fires() {
+        // A news-windowed reversal-close that fires (inside its window) flattens
+        // any open position but never retires the plan — same rule as the price
+        // close. Fires + spine survives.
         let p = plan(vec![
             news_control_rule(
                 "news-start-1",
@@ -4217,7 +4179,7 @@ mod tests {
         ]);
         let window = bullish_pinbar_window();
         let prior = seed_at(Phase::AwaitEntry, "2026-06-16T08:30:00Z");
-        let eval = run_window_pos(&p, &prior, &window[1..], &window, &open_plan_position());
+        let eval = run_window(&p, &prior, &window[1..], &window);
         assert!(
             eval.fired
                 .iter()
@@ -4225,10 +4187,10 @@ mod tests {
             "the news close fired"
         );
         assert!(
-            eval.done,
-            "a news close that flattened an open position retires the plan"
+            !eval.done,
+            "a news reversal-close flattens but never retires the plan"
         );
-        assert_eq!(eval.new_state.phase, Phase::Done);
+        assert_eq!(eval.new_state.phase, Phase::AwaitEntry);
     }
 
     #[test]
