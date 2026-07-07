@@ -1,5 +1,58 @@
 # Changelog
 
+## v66 — 2026-07-07 — reversal-close terminate decision uses real position state (ends the proxy chain)
+
+**Why.** `06-close-on-reversal` is "flatten the position *if* one is open", so
+whether it retires the plan's spine depends on whether a position is actually
+open. But the engine (`evaluate_plan`) is broker-free and decided `done` *before*
+the cron ever consulted the broker — so it had to **guess** with a proxy. This is
+the same bug fixed three times (always-terminal → window-shape → `entry_fired_at`,
+v65), each proxy with a blind spot. This replaces the guessing with ground truth.
+
+**What changed.** The engine now asks a `PositionView` whether a position is open
+on the plan's instrument + direction, and a reversal-close is terminal **iff** it
+is. Injected at the seam so the engine stays pure + synchronous.
+
+- **New `core::position_view`** — `trait PositionView { fn is_open(instrument,
+  direction) -> bool }`, plus `NoPositions` (flat stub) and `OpenSet` (the
+  `(instrument, direction)` list both callers reduce to). `OpenPosition` carries
+  no `trade_id`, so the honest question is instrument+direction, which is what the
+  terminate decision needs (the engine knows `plan.direction`).
+- **`evaluate_plan` / `guard_is_terminal`** gain the view. `guard_is_terminal`
+  collapses to: non-`Close` → terminal; `Close` → `positions.is_open(...)`. The
+  whole proxy chain (`entry_fired_at`, news/price window-shape branch) is **gone**.
+- **Worker** (`trade-control-cron`) snapshots `broker.list_open_positions` once
+  per tick — only for a plan carrying a reversal-close (`plan_has_reversal_close`)
+  — filtered to the instrument. Broker error → flat book (non-terminal), the safe
+  default (a missed terminate re-checks next tick; a wrong one archives the plan).
+- **Replay** reads its existing sim-backed `ReplayBroker::list_open_positions`
+  (resolves each placed attempt to open/closed as-of the cursor) into the same
+  `OpenSet` — identical `PositionView` path to the worker, zero fill-logic
+  duplication.
+
+**Breaking.** `evaluate_plan` gains a `positions: &dyn PositionView` param.
+`PlanState::entry_fired_at` (added in v65) is **removed** — a one-day-old proxy
+with no external consumer; leaving it would be the "dead proxy lingering" trap.
+Wire-compatible (was `#[serde(default)]`).
+
+**Behaviour change.** A **news-windowed** reversal-close that fires **while a
+position is open** is now terminal (it flattened a real trade → trade over). The
+old "news = always non-terminal" carve-out only existed because the engine
+couldn't tell open from flat; with ground truth the distinction collapses. A news
+close over a flat book is still non-terminal, and still only fires inside an open
+news window.
+
+**Config.** None.
+
+**Tests.** `core::position_view` (3). Engine reversal-close terminate tests
+rewritten onto real position views (`open_plan_position` vs flat `NoPositions`):
+price/news close terminal when open, non-terminal when flat; the EUR/CHF flat-book
+repro. Replay `open_short_closes_on_a_reversal_candle_in_the_band` now exercises
+the sim-backed view end-to-end. 120 engine + 788 core + 258 cli + 70 cron green.
+
+**Follow-up.** None outstanding. Same-class as the shared-engine rule
+(`strategy_changes_in_both_replayer_and_worker`).
+
 ## v65 — 2026-07-07 — a reversal-close before any entry no longer kills the plan
 
 **Why.** `06-close-on-reversal` is "flatten the position *if* one is open". But
