@@ -1,5 +1,50 @@
 # Changelog
 
+## v67 — 2026-07-07 — a reversal-close is never terminal (flattens the trade, keeps the retries)
+
+**Why.** v64/v65/v66 all treated the question "should a `06-close-on-reversal`
+retire the plan?" as turning on whether a position is open. That was the wrong
+question. A reversal-close is a per-**trade** exit ("flatten the open position on
+a confirming reversal"), **not** a setup invalidation. Retiring the plan on it —
+even when it genuinely flattened a trade — **stops the multi-shot retries**, which
+is exactly what the operator does *not* want: place → fill → close-on-reversal →
+re-enter on the next signal bar is the whole point of multi-shot. Operator's
+framing: "close any open trades, but don't stop the retries."
+
+**What changed.** A `06-close-on-reversal` is now **never terminal**. It fires →
+dispatches the flatten (`run_close` → `close_positions`, a no-op when flat, and
+independent of the terminate decision) → and the spine stays in `AwaitEntry`. The
+plan retires only via a genuine invalidation guard (`too-high` / `too-low`
+invalidation veto), `trade-expiry`, or the enter's `not_after` window closing. A
+single-shot enter already reaches `Phase::Done` at entry, so its reversal-close
+never runs — "never terminal" is correct for both single- and multi-shot.
+
+- **`guard_is_terminal(intent)`** collapses to `intent.action != Action::Close`
+  (non-`Close` invalidation guards stay terminal; every `Close` is non-terminal).
+
+**Breaking / reverts.** This **reverts v66's approach**: `core::position_view`
+(the `PositionView` trait + `OpenSet`/`NoPositions`), the `positions: &dyn
+PositionView` param on `evaluate_plan`/`evaluate_guards`, and the worker/replay
+position snapshots are all **removed** — the terminate decision no longer needs
+"is a position open?", so the machinery built to answer it is gone. `evaluate_plan`
+loses the `positions` param. (v65's `PlanState::entry_fired_at` was already removed
+in v66 and stays removed.)
+
+**Behaviour.** Net effect vs v63 (before this whole saga): a price- or
+news-windowed reversal-close fires + flattens exactly as before, but no longer
+archives the plan — multi-shot plans keep re-entering. Fixes the regression where
+a reversal-close could stop retries mid-setup.
+
+**Config.** None.
+
+**Tests.** Engine reversal-close tests assert fire + `!done` + stays `AwaitEntry`
+(price and news, flat or open — the position no longer matters to termination).
+Replay `open_short_closes_on_a_reversal_candle_in_the_band` now asserts the short
+CLOSES ON REVERSAL **and** the (multi-shot) plan stays alive (`!r.done`). 120
+engine + 786 core + 258 cli + 73 cron green.
+
+**Follow-up.** None.
+
 ## v66 — 2026-07-07 — reversal-close terminate decision uses real position state (ends the proxy chain)
 
 **Why.** `06-close-on-reversal` is "flatten the position *if* one is open", so

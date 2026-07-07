@@ -91,29 +91,19 @@ Trading:
     Mixing the old and new forms on one intent is a validation error —
     pick one. Migrate to the new form on next regen.
   With no gate set the close is unconditional (operator emergency-close path).
-  - **Spine interaction (server-side engine).** A reversal-close is "flatten
-    *if* in a position", so whether it retires the plan turns on **whether a
-    position is actually open** — ground truth, not a proxy. The engine asks a
-    `PositionView`: the live worker snapshots the broker's open positions (only
-    for a plan that carries a reversal-close, and only when one could fire), the
-    offline replay reads back its fill simulation. Both answer the same honest
-    question — "is a position open on this instrument in the trade's direction?"
-    — so the terminate decision can't drift between live and replay.
-    - **Flat book** → the close dispatches a harmless no-op (the `allow_close`
-      gate blocks the flatten when flat) and the spine **survives**, so a pending
-      entry keeps its window. Covers the pre-entry case (EUR/CHF 2026-07-06: a
-      price-windowed close fired before any fill, was rejected `needs-golden`, but
-      used to archive the plan before it could ever enter) and a genuinely flat
-      book alike.
-    - **Position open** → the reversal flattened a real trade → the trade is over
-      → the close **retires** the plan. This holds for *both* price- and
-      news-windowed closes (a news-window close still only *fires* inside an open
-      news window, but if it fires with a position open it's terminal — the old
-      "news is always non-terminal" carve-out only existed because the engine
-      couldn't tell open from flat).
-    - On a broker error snapshotting positions, the worker treats the book as
-      flat (non-terminal) — a missed terminate just re-checks next tick, whereas a
-      wrong terminate archives the plan irrecoverably.
+  - **Spine interaction (server-side engine).** A reversal-close is a
+    per-**trade** exit — "flatten any open position on a confirming reversal" —
+    **not** a setup invalidation. So it **never retires the plan**: it dispatches
+    the flatten (`run_close` → `close_positions`, a no-op when flat) and leaves
+    the plan in `AwaitEntry`, so a **multi-shot** enter can still re-enter on the
+    next signal bar. Closing a trade must not stop the retries — place → fill →
+    close-on-reversal → re-enter is the whole point of multi-shot. The plan
+    retires only the normal way: a terminal invalidation veto (`too-high` /
+    `too-low`), `trade-expiry`, or the enter's `not_after` window closing. (A
+    single-shot enter already reaches `Done` at entry, so its reversal-close never
+    even runs — "never terminal" is correct for both.) Only the genuine
+    invalidation guards, whose triggers mean the *setup* is dead, terminate the
+    spine.
 - `invalidate` — set a per-instrument cooldown (default 12 h) and cancel any pending
   orders. Use this when your setup is no longer valid (price drifted out of the
   expected range) and you want to be sure no entry fires while you sleep.
