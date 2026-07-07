@@ -44,4 +44,51 @@ impl ActionResult {
             Self::Rejected { outcome, .. } => format!("Rejected({outcome})"),
         }
     }
+
+    /// The canonical, information-rich outcome string to persist in the
+    /// request record — the *same* string `record_dispatcher_outcome` logs
+    /// and the offline replay surfaces verbatim on its `BLOCKED — …` line.
+    ///
+    /// This deliberately differs from the HTTP response body for
+    /// [`Self::Rejected`] and [`Self::Failed`]: the body is the caller-facing
+    /// message (e.g. the long "entry blocked: SL too close to spread …"
+    /// prose, or a flat `"action failed"`), whereas the recorded outcome is
+    /// the concise gate verdict a later `plan timeline` / `status` read wants
+    /// (e.g. `rejected: sl-widen-below-min-r (spread=1 widened_sl_lvl=… …)`).
+    /// Persisting this instead of the body is what makes the live worker's
+    /// record match what the replay already shows for the same reject.
+    pub fn record_outcome(&self) -> &str {
+        match self {
+            Self::Ok(s) | Self::Failed(s) => s,
+            Self::Rejected { outcome, .. } => outcome,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn record_outcome_returns_the_rich_string_for_every_variant() {
+        assert_eq!(
+            ActionResult::Ok("entered".into()).record_outcome(),
+            "entered"
+        );
+        assert_eq!(
+            ActionResult::Failed("broker 500".into()).record_outcome(),
+            "broker 500"
+        );
+        // For a rejection it is the concise `outcome`, NOT the human-facing
+        // `body` — the two diverge on purpose (see the method doc).
+        let reject = ActionResult::Rejected {
+            status: 422,
+            body: "entry blocked: SL too close to spread …".into(),
+            outcome: "rejected: sl-widen-below-min-r (spread=1 …)".into(),
+        };
+        assert_eq!(
+            reject.record_outcome(),
+            "rejected: sl-widen-below-min-r (spread=1 …)"
+        );
+    }
 }
