@@ -229,6 +229,7 @@ fn bug015_too_low_fires_on_the_cross_not_expiry() {
         fresh,
         ts("2026-06-24T10:05:00Z"),
         expires,
+        &trade_control_core::position_view::NoPositions,
     );
 
     let fired_ids: Vec<&str> = eval.fired.iter().map(|f| f.rule_id.as_str()).collect();
@@ -281,6 +282,7 @@ fn bug015_too_low_wins_even_in_one_batch_with_expiry() {
         fresh,
         ts("2026-06-24T10:05:00Z"),
         expires,
+        &trade_control_core::position_view::NoPositions,
     );
     let fired_ids: Vec<&str> = eval.fired.iter().map(|f| f.rule_id.as_str()).collect();
 
@@ -329,6 +331,7 @@ fn bug015_reseed_after_cross_skips_too_low_and_only_expiry_fires() {
         fresh,
         ts("2026-06-24T10:05:00Z"),
         expires,
+        &trade_control_core::position_view::NoPositions,
     );
     let fired_ids: Vec<&str> = eval.fired.iter().map(|f| f.rule_id.as_str()).collect();
 

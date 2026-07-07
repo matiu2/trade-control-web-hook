@@ -235,7 +235,34 @@ pub async fn run(
         // intent). A cheap clone; the diff is a pure `PlanState` comparison.
         let before = state.clone();
 
-        let eval = evaluate_plan(plan, &state, new, detector_window, now, expires_at);
+        // Ground truth for the reversal-close terminate decision, faked from the
+        // sim: point the broker at this bar and read back the positions its
+        // placed-attempt resolver says are open as of now. Same `PositionView`
+        // path the live worker takes (`snapshot_positions`), so the engine's
+        // terminate decision can't drift between replay and live. Only meaningful
+        // for a plan with a `06-close-on-reversal`, but cheap enough to always
+        // build; `list_open_positions` never errors here.
+        replay_broker.set_as_of(candles[i].time);
+        let open = replay_broker
+            .list_open_positions("")
+            .await
+            .unwrap_or_default();
+        let positions = trade_control_core::position_view::OpenSet::new(
+            open.into_iter()
+                .filter(|p| p.instrument == plan.instrument)
+                .map(|p| (p.instrument, p.direction))
+                .collect(),
+        );
+
+        let eval = evaluate_plan(
+            plan,
+            &state,
+            new,
+            detector_window,
+            now,
+            expires_at,
+            &positions,
+        );
         state = eval.new_state;
 
         let fired_rules: Vec<String> = eval.fired.iter().map(|f| f.rule_id.clone()).collect();

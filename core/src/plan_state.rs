@@ -83,28 +83,6 @@ pub struct PlanState {
     /// `(break_close_at, entry]`?". `None` until a retest is seen.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retest_seen_at: Option<DateTime<Utc>>,
-    /// Open-time of the candle on which an entry rule (`05-enter` / the M/W or
-    /// QM enter) most recently **fired**. `None` until the plan has ever fired
-    /// an enter. This is the engine's only durable "have we tried to open a
-    /// position from this plan yet?" marker — a **multi-shot** enter
-    /// (`max_retries > 0`) does *not* latch into [`fired`](Self::fired) (it
-    /// stays in [`Phase::AwaitEntry`] to re-enter on the next signal bar), so
-    /// `fired` can't answer the question.
-    ///
-    /// Why it matters: a `06-close-on-reversal` is "flatten the position *if*
-    /// one is open". The engine has no broker, so it can't see fills — but it
-    /// *can* see whether it ever dispatched an enter. A reversal-close that
-    /// fires while this is still `None` cannot be closing anything this plan
-    /// opened, so it must **not** retire the spine (it dispatches harmlessly —
-    /// the worker's / replay's `allow_close` no-ops it when flat — and the
-    /// pending enter keeps its window). Once an enter has fired, a
-    /// price-windowed reversal-close *is* a thesis break and stays terminal.
-    /// See [`guard_is_terminal`](../engine/src/evaluate.rs) and the EUR/CHF
-    /// 2026-07-06 report (`ihs-eur-chf-29ebb72b`: a close fired pre-entry,
-    /// was rejected `needs-golden`, yet archived the plan before it could
-    /// enter).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub entry_fired_at: Option<DateTime<Utc>>,
     /// Reserved for M/W neckline-evolution state. **Unused in Stage D** — the
     /// engine delegates all M/W geometry to the existing
     /// `run_enter → maybe_update_mw_state` path (one implementation), so this
@@ -159,7 +137,6 @@ impl PlanState {
             || self.fired != prior.fired
             || self.break_close_at != prior.break_close_at
             || self.retest_seen_at != prior.retest_seen_at
-            || self.entry_fired_at != prior.entry_fired_at
             || self.mw != prior.mw
             || self.open_news_windows != prior.open_news_windows
     }
@@ -175,7 +152,6 @@ impl PlanState {
             last_close: BTreeMap::new(),
             break_close_at: None,
             retest_seen_at: None,
-            entry_fired_at: None,
             mw: None,
             open_news_windows: BTreeSet::new(),
             expires_at,
