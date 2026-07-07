@@ -695,10 +695,19 @@ pub async fn run_enter<B: Broker, S: StateStore>(
                     resolved.instrument,
                     verified.intent.id,
                 );
+                // Fold the deciding numbers into `outcome` (not just `body`):
+                // the offline replay surfaces `outcome` verbatim on its
+                // "BLOCKED — rejected: …" line, so without them the operator
+                // sees the reject name but not *why* — the spread, the widened
+                // SL distance, and the R it would leave vs the floor. `body`
+                // (the 422 text) still carries the fuller sentence.
+                let outcome = format!(
+                    "rejected: sl-widen-below-min-r (spread={spread_price} widened_sl={widened_sl_distance} r_at_widen={r_at_widen:.2} < min_r={min_r:.2})",
+                );
                 return ActionResult::Rejected {
                     status: 422,
                     body: message,
-                    outcome: "rejected: sl-widen-below-min-r".into(),
+                    outcome,
                 };
             }
         }
