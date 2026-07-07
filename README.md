@@ -1344,6 +1344,16 @@ This is the authoritative archive the tax-tracker / timeline tools consume
 — it removes the old need to *reconstruct* the message body from the TV
 alert template (which fails once the alert is deleted).
 
+The recorded **outcome** is the concise, information-rich gate verdict —
+the same string the offline replay surfaces on its `BLOCKED — …` line —
+not the caller-facing HTTP body. They diverge for a broker rejection: the
+HTTP body stays the human-facing message (e.g. the long "entry blocked: SL
+too close to spread …" prose), while the record keeps the terse verdict
+(e.g. `rejected: sl-widen-below-min-r (spread=1 widened_sl_lvl=209.993043
+r_at_widen=0.35 < min_r=1.00)`) so a later `plan timeline` / `status` read
+sees *why* a reject fired, matching the replay. (`ActionResult::record_outcome`
+in `core`, threaded through the native worker's `DispatchOutcome`.)
+
 **Object layout:** `req/<YYYY-MM-DD>/<ts>-<request_id>.json`. A day's
 requests list under one date prefix and sort by time; filter the records'
 `trade_id` field to gather one setup's fires.
