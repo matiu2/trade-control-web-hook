@@ -892,10 +892,34 @@ fn pick_slot_with_label(
     // of `start`, not nearest-before (a `too-high` cap above the right shoulder
     // may be anchored just after the cursor). Every other single-slot role
     // routes through `pick_slot`'s nearest-before default.
+    //
+    // Secondary tiebreak on **level**: when two invalidation lines are anchored
+    // at the same time (an ambiguous chart with both a `too-low` and a
+    // `too-high` drawn — e.g. two overlapping H&S setups), the time-distance
+    // tiebreak is a dead tie and `min_by_key` would pick arbitrarily by vec
+    // order, silently choosing the trade direction. Break such ties by picking
+    // the line **closest to the neckline**: a genuine cap/floor hugs the
+    // neckline, whereas a line far from it is a stale leftover from a larger,
+    // different setup. (Stellar iH&S/H&S 2026-07-06: too-low 143.1 and too-high
+    // 202.1 tied on time; neckline 200.2 → too-high wins → short, the intended
+    // trade.) Only applies on an exact time tie; when times differ, time still
+    // dominates.
     let chosen = if let SlotPref::NearestTo { start } = pref {
-        drawings
-            .into_iter()
-            .min_by_key(|d| (d.anchor_time() - start).abs())?
+        let level_gap = |d: &Drawing| -> f64 {
+            match neckline_ref {
+                Some(neck) => (crate::geometry::horizontal_price(&d.prices()) - neck).abs(),
+                None => f64::INFINITY,
+            }
+        };
+        drawings.into_iter().min_by(|a, b| {
+            let ta = (a.anchor_time() - start).abs();
+            let tb = (b.anchor_time() - start).abs();
+            ta.cmp(&tb).then_with(|| {
+                level_gap(a)
+                    .partial_cmp(&level_gap(b))
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+        })?
     } else {
         pick_slot(drawings, role, window, pref)?
     };
@@ -1460,6 +1484,44 @@ mod tests {
             "the below-neckline floor wins; the stale above-neckline line is dropped"
         );
         assert_eq!(roles.invalidation_label.as_deref(), Some("too-low"));
+    }
+
+    /// THE TIE (Stellar 2026-07-06): a `too-low` (143.1) and a `too-high`
+    /// (202.1) both anchored at the **same time**, both on their correct side of
+    /// the neckline (200.2) so the side-of-neckline filter keeps both. The
+    /// time-distance tiebreak is a dead tie; without a secondary key `min_by`
+    /// picks by vec order (too-low → long, the wrong direction). The level
+    /// tiebreak picks the line closest to the neckline — too-high (Δ1.9) over
+    /// too-low (Δ57.1) → short, the intended trade.
+    #[test]
+    fn nearest_to_invalidation_time_tie_breaks_on_level_closest_to_neckline() {
+        let (stubs, mcp) = fixture(vec![
+            // Neckline ~200.2 (mean of the two anchors).
+            (
+                stub("neck", "trend_line"),
+                drawing("neck", "neckline", vec![(400, 200.2), (500, 200.2)]),
+            ),
+            // too-low FAR below the neckline, same anchor time as too-high.
+            (
+                stub("low", "horizontal_line"),
+                drawing("low", "too-low", vec![(450, 143.1)]),
+            ),
+            // too-high just ABOVE the neckline, same anchor time.
+            (
+                stub("high", "horizontal_line"),
+                drawing("high", "too-high", vec![(450, 202.1)]),
+            ),
+        ]);
+        // start=600: both invalidations |450-600|=150 — an exact time tie.
+        // Level breaks it: |202.1-200.2|=1.9 < |143.1-200.2|=57.1 → `high`.
+        let roles = classify(&mcp, &stubs, ANY_RANGE, SlotPref::NearestTo { start: 600 })
+            .expect("classify ok");
+        assert_eq!(
+            roles.invalidation.as_ref().unwrap().id,
+            "high",
+            "the neckline-hugging cap wins the time-tie; the far stale floor loses"
+        );
+        assert_eq!(roles.invalidation_label.as_deref(), Some("too-high"));
     }
 
     /// Mirror for a short: a stale `too-high` *below* the neckline is dropped so
