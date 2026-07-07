@@ -92,21 +92,28 @@ Trading:
     pick one. Migrate to the new form on next regen.
   With no gate set the close is unconditional (operator emergency-close path).
   - **Spine interaction (server-side engine).** A reversal-close is "flatten
-    *if* in a position", so whether it retires the plan depends on whether a
-    position could even be open:
-    - **Before any entry has fired** (the plan is still awaiting its break/retest/
-      entry), the close can't be closing anything this plan opened, so it
-      **never** retires the spine — it dispatches harmlessly (the `allow_close`
-      gate no-ops the flatten when flat) and the pending entry keeps its window.
-      This holds for *both* news- and price-windowed closes. (EUR/CHF 2026-07-06:
-      a price-windowed close fired pre-entry, was correctly rejected
-      `needs-golden`, but used to archive the plan before it could ever enter.)
-    - **After an entry has fired**, a **news-windowed** close stays non-terminal
-      (a flatten-if-open news safety — it only fires *inside* an open news window;
-      the engine mirrors the worker's active `news:<trade_id>:<news_id>` check, so
-      a reversal printing after `news-end` doesn't fire), while a **price-windowed**
-      close (reversal back at the SR band) is a thesis invalidation and **does**
-      retire the plan.
+    *if* in a position", so whether it retires the plan turns on **whether a
+    position is actually open** — ground truth, not a proxy. The engine asks a
+    `PositionView`: the live worker snapshots the broker's open positions (only
+    for a plan that carries a reversal-close, and only when one could fire), the
+    offline replay reads back its fill simulation. Both answer the same honest
+    question — "is a position open on this instrument in the trade's direction?"
+    — so the terminate decision can't drift between live and replay.
+    - **Flat book** → the close dispatches a harmless no-op (the `allow_close`
+      gate blocks the flatten when flat) and the spine **survives**, so a pending
+      entry keeps its window. Covers the pre-entry case (EUR/CHF 2026-07-06: a
+      price-windowed close fired before any fill, was rejected `needs-golden`, but
+      used to archive the plan before it could ever enter) and a genuinely flat
+      book alike.
+    - **Position open** → the reversal flattened a real trade → the trade is over
+      → the close **retires** the plan. This holds for *both* price- and
+      news-windowed closes (a news-window close still only *fires* inside an open
+      news window, but if it fires with a position open it's terminal — the old
+      "news is always non-terminal" carve-out only existed because the engine
+      couldn't tell open from flat).
+    - On a broker error snapshotting positions, the worker treats the book as
+      flat (non-terminal) — a missed terminate just re-checks next tick, whereas a
+      wrong terminate archives the plan irrecoverably.
 - `invalidate` — set a per-instrument cooldown (default 12 h) and cancel any pending
   orders. Use this when your setup is no longer valid (price drifted out of the
   expected range) and you want to be sure no entry fires while you sleep.
