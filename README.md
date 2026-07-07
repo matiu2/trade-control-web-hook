@@ -724,18 +724,22 @@ reward:risk floor.
     - **Can't stay legal → reject.** If even the `10 × spread` stop drops
       `R` below `min_r`, there is no legal stop and the entry is rejected
       with **HTTP 422 / `rejected: sl-widen-below-min-r (spread=<s>
-      widened_sl_lvl=<lvl> widened_sl=<d> r_at_widen=<r> < min_r=<m>)`**
-      (body: `entry blocked: SL too close to spread and widening to 10x
-      spread (SL would move to <lvl>, sl_distance <d>, spread <s>) would
-      drop R to <r> < min_r <m>`). `widened_sl_lvl` is the stop **price
-      level** the widen would have moved to (same price units as the
-      entry/SL/TP levels); `widened_sl` and `spread` are raw price
-      distances. All are folded into the short `outcome` string (not just
-      the body) so the offline `replay-candles` report shows *why* on its
-      `BLOCKED — rejected: …` line, not just the reject name. Price fields
-      render in raw price with float dust trimmed (pip-independent — the
-      floor is a pure price-distance ratio). This is the wide-spread
-      instrument case where the TP is too near to support an honest stop.
+      widened_sl_lvl=<lvl> r_at_widen=<r> < min_r=<m>)`** (body: `entry
+      blocked: SL too close to spread and widening to 10x spread (SL would
+      move to <lvl>, sl_distance <d>, spread <s>) would drop R to <r> <
+      min_r <m>`). `spread` is the raw ask−bid distance (in **price**, the
+      same units as the levels — what the floor sizes off); `widened_sl_lvl`
+      is the stop **price level** the widen would have moved to (`entry ±
+      10 × spread`, same price units as the entry/SL/TP levels). The widened
+      *distance* is omitted from the short outcome — it is always exactly
+      `10 × spread`, redundant with the level + spread — but the `body` keeps
+      it (`sl_distance <d>`). These are folded into the short `outcome`
+      string (not just the body) so the offline `replay-candles` report
+      shows *why* on its `BLOCKED — rejected: …` line, not just the reject
+      name. Price fields render in raw price with float dust trimmed
+      (pip-independent — the floor is a pure price-distance ratio). This is
+      the wide-spread instrument case where the TP is too near to support an
+      honest stop.
 
   The floor is a **pure ratio of two raw-price distances** (`sl_distance`
   vs `spread = ask − bid`), so the unit cancels and the decision never
