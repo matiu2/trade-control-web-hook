@@ -720,13 +720,16 @@ pub async fn run_enter<B: Broker, S: StateStore>(
                 // Fold the deciding numbers into `outcome` (not just `body`):
                 // the offline replay surfaces `outcome` verbatim on its
                 // "BLOCKED — rejected: …" line, so without them the operator
-                // sees the reject name but not *why*. Show the spread, the
+                // sees the reject name but not *why*. Show the `spread` (the
+                // ask−bid distance in price, what the floor sizes off), the
                 // widened SL **price level** (`widened_sl_lvl`, same price units
-                // as the entry/SL/TP levels — what the stop would move to) and
-                // its distance, and the R it would leave vs the floor. `body`
-                // (the 422 text) still carries the fuller sentence.
+                // as the entry/SL/TP levels — what the stop would move to), and
+                // the R it would leave vs the floor. The widened *distance* is
+                // omitted: it is always `10 × spread` (redundant with the level
+                // + spread), and `body` keeps the fuller "widening to 10x
+                // spread" sentence.
                 let outcome = format!(
-                    "rejected: sl-widen-below-min-r (spread={spread_str} widened_sl_lvl={widened_lvl_str} widened_sl={widened_dist_str} r_at_widen={r_at_widen:.2} < min_r={min_r:.2})",
+                    "rejected: sl-widen-below-min-r (spread={spread_str} widened_sl_lvl={widened_lvl_str} r_at_widen={r_at_widen:.2} < min_r={min_r:.2})",
                 );
                 return ActionResult::Rejected {
                     status: 422,
