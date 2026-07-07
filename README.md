@@ -724,12 +724,17 @@ reward:risk floor.
     - **Can't stay legal → reject.** If even the `10 × spread` stop drops
       `R` below `min_r`, there is no legal stop and the entry is rejected
       with **HTTP 422 / `rejected: sl-widen-below-min-r (spread=<s>
-      widened_sl=<d> r_at_widen=<r> < min_r=<m>)`** (body: `entry blocked:
-      SL too close to spread and widening to 10x spread (sl_distance <d>,
-      spread <s>) would drop R to <r> < min_r <m>`). The deciding numbers
-      are folded into the short `outcome` string (not just the body) so the
-      offline `replay-candles` report shows *why* on its `BLOCKED —
-      rejected: …` line, not just the reject name. This is the wide-spread
+      widened_sl_lvl=<lvl> widened_sl=<d> r_at_widen=<r> < min_r=<m>)`**
+      (body: `entry blocked: SL too close to spread and widening to 10x
+      spread (SL would move to <lvl>, sl_distance <d>, spread <s>) would
+      drop R to <r> < min_r <m>`). `widened_sl_lvl` is the stop **price
+      level** the widen would have moved to (same price units as the
+      entry/SL/TP levels); `widened_sl` and `spread` are raw price
+      distances. All are folded into the short `outcome` string (not just
+      the body) so the offline `replay-candles` report shows *why* on its
+      `BLOCKED — rejected: …` line, not just the reject name. Price fields
+      render in raw price with float dust trimmed (pip-independent — the
+      floor is a pure price-distance ratio). This is the wide-spread
       instrument case where the TP is too near to support an honest stop.
 
   The floor is a **pure ratio of two raw-price distances** (`sl_distance`

@@ -121,6 +121,10 @@ pub enum SlWiden {
     /// the entry (same outcome as before the widen feature existed). The
     /// fields drive the operator-facing reject message.
     Reject {
+        /// The stop **price** the widen would have moved to (`entry ±
+        /// widened_sl_distance`, on the stop's existing side) — surfaced so the
+        /// reject message can show the concrete level, not just the distance.
+        widened_stop_loss: f64,
         widened_sl_distance: f64,
         r_at_widen: f64,
         min_r: f64,
@@ -197,6 +201,7 @@ pub fn widen_sl_to_spread_floor(
         }
     } else {
         SlWiden::Reject {
+            widened_stop_loss: new_stop_loss,
             widened_sl_distance: widened_distance,
             r_at_widen: new_r,
             min_r,
@@ -312,10 +317,19 @@ mod tests {
         let out = widen_sl_to_spread_floor(1.1000, 1.0999, 1.1008, 0.0001, 1.0);
         match out {
             SlWiden::Reject {
-                r_at_widen, min_r, ..
+                widened_stop_loss,
+                widened_sl_distance,
+                r_at_widen,
+                min_r,
             } => {
                 assert!(r_at_widen < 1.0, "{r_at_widen}");
                 assert!((min_r - 1.0).abs() < 1e-9);
+                assert!((widened_sl_distance - 0.0010).abs() < 1e-9);
+                // Long (SL below entry) → widened stop = entry − 10×spread.
+                assert!(
+                    (widened_stop_loss - (1.1000 - 0.0010)).abs() < 1e-9,
+                    "widened stop level: {widened_stop_loss}"
+                );
             }
             other => panic!("expected Reject, got {other:?}"),
         }
