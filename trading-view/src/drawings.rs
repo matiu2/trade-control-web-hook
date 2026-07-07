@@ -192,14 +192,13 @@ impl Drawing {
 }
 
 /// Vertical lines have a single anchor; `TimedAnchor` returns that
-/// point's time. Lets [`crate::pair_lines::pair_vertical_lines`]
-/// operate directly on `Drawing` without re-implementing the
-/// anchor-time accessor.
+/// point's time so tv-arm's single-slot role pickers can sort/compare
+/// drawings by anchor time without re-implementing the accessor.
 impl TimedAnchor for Drawing {
     fn anchor_time(&self) -> i64 {
         // Single-anchor drawings use points[0]; multi-anchor ones
-        // (none of the vertical lines we pair) fall back to the
-        // earliest point so the sort key is still deterministic.
+        // fall back to the earliest point so the sort key is still
+        // deterministic.
         self.points.iter().map(|p| p.time).min().unwrap_or(0)
     }
 }

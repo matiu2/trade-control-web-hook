@@ -356,10 +356,23 @@ pub struct Args {
 
     /// Skip the automatic calendar-bars step. By default, after
     /// build-trade `tv-arm` fetches this week's forex-factory events
-    /// for the chart's currency pair and arms one pause-pair + one
-    /// news-pair per event.
+    /// for the chart's currency pair and arms one blackout window +
+    /// one news window per event, resolved from the calendar directly
+    /// (no drawn chart lines).
     #[arg(long)]
     pub skip_calendar_bars: bool,
+
+    /// Blackout (pause) window width **before** each news event, in hours
+    /// (fractional allowed, e.g. `0.5` = 30 min). Overrides the chart
+    /// timeframe's default run-up buffer. Absent: use the timeframe default.
+    #[arg(long)]
+    pub news_before_hours: Option<f64>,
+
+    /// News window width **after** each news event, in hours (fractional
+    /// allowed). Overrides the chart timeframe's default post-release buffer.
+    /// Absent: use the timeframe default.
+    #[arg(long)]
+    pub news_after_hours: Option<f64>,
 
     /// Override the "as-of" time used to prune already-elapsed news /
     /// blackout control pairs (RFC3339, e.g. `2026-05-28T21:00:00Z`).

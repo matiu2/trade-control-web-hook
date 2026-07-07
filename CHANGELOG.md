@@ -1,5 +1,58 @@
 # Changelog
 
+## v68 — 2026-07-07 — news/blackout windows come from the calendar, not drawn chart lines
+
+**Why.** tv-arm resolved news/blackout windows by *drawing* pause/resume and
+news-start/news-end vertical lines on the chart, then *reading them back* and
+pairing sorted starts to sorted ends. Two problems: (1) TradingView snaps each
+line to its bar's timestamp on readback, so a real 14:30 event on an H1 chart
+came back as 14:00 — the true event minute was lost; (2) under `--start` the
+starts and ends were pruned **independently** against `[start, trade-expiry]`, so
+a window whose `pause` fell before the cursor but whose `resume` fell after it
+had its start dropped and its end orphaned, aborting the whole arm with
+`blackout lines must come in matched start/end pairs; found 1 start and 2 ends`.
+The one-alert-per-drawing constraint that forced the drawn-line design is gone
+(the engine is server-side Rust), so the round-trip is pure downside.
+
+**What changed.** tv-arm now resolves windows straight from the forex-factory
+calendar (`calendar_windows` → `plan_calendar_bars_within`) at **real
+event-minute precision** and pushes them into the plan as a new `NewsWindow`
+type — no tv-mcp draws, no readback, no pairing step. The split-pair abort and
+the bar-snap precision loss are both structurally impossible now. **Drawn
+pause/resume/news vertical lines left on a chart are ignored.** The calendar
+event scope is the trade's own lifetime `[cursor, trade-expiry]` (cursor =
+`--start`, else the last loaded bar), **not** the chart's visible area — so
+scrolling/zooming the chart no longer changes which news is armed.
+
+**Server compatibility.** The signed intent format is **unchanged** — tv-arm
+still emits `pause`/`resume`/`news-start`/`news-end` `TimeReached` rules (just
+sourced from the calendar), so the worker/engine enforce them exactly as before.
+Already-registered old-style plans keep working.
+
+**Breaking.** `Roles::blackout_pairs` / `news_pairs` are now
+`Vec<NewsWindow>` (were `Vec<(Drawing, Drawing)>`). The drawn-line
+classification arms, `in_visible_window` (for these), `auto_draw_calendar_lines`,
+`draw_pair_lines`, and `pair_vertical_lines` are removed; `pair_lines.rs` keeps
+only the `TimedAnchor` trait. The `BLACKOUT_*` / `NEWS_*` label vocabularies are
+no longer consulted by tv-arm.
+
+**Config.** New tv-arm flags `--news-before-hours` / `--news-after-hours`
+(fractional) override the timeframe's blackout run-up / post-release buffers
+(H1+ defaults 8h / 1h). `--skip-calendar-bars` still opts out entirely.
+
+**Tests.** New `news_window` module tests (boundary ordering, sub-minute
+precision, `is_past` end-inclusive); `calendar_scope_range` cursor/expiry +
+empty-range tests; roles/pipeline tests updated to assert drawn lines are ignored
+and windows use `NewsWindow`. 192 tv-arm + 31 trading-view tests pass. Verified
+end-to-end on live EUR/USD (2 high-impact events → 2 blackout + 2 news windows).
+
+**Follow-up (PR1b).** Retire the now-dead drawn-line CLI generators
+(`CalendarBars` / `BuildPause` / `BuildNews` subcommands, `run_calendar_bars`,
+`discover_calendar_bundles`) and the always-empty `BuiltCalendarBundle` arm of
+`append_control_rules`. Also: intrabar / fill-instant news gating (PR2), and the
+pre-existing `plan_calendar_bars_within` gap where a USD-high "blocks all
+instruments" event isn't kept for a non-USD pair.
+
 ## v67 — 2026-07-07 — a reversal-close is never terminal (flattens the trade, keeps the retries)
 
 **Why.** v64/v65/v66 all treated the question "should a `06-close-on-reversal`

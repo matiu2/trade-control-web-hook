@@ -26,6 +26,7 @@ mod geometry;
 mod instrument_recovery;
 mod instrument_resolution;
 mod mw_geometry;
+mod news_window;
 mod pipeline;
 mod position_trade;
 mod register_post;
