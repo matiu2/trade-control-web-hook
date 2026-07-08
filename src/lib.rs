@@ -958,6 +958,10 @@ pub(crate) async fn build_dispatch_config(
         worker_max_risk_pct: secret_or_default(env, MAX_RISK_PCT_PER_TRADE_SECRET, 1.0),
         worker_max_open_positions: secret_or_default(env, MAX_OPEN_POSITIONS_SECRET, 3.0) as u32,
         pip_size: pip_size_for(env, &verified.intent.instrument),
+        // No wasm-side tick override; the baked `Intent::tick_size` wins in
+        // `run_enter`, falling back to `pip_size`. (This is the dead wasm stub —
+        // the live worker is `worker/`.)
+        tick_size: None,
         caps,
     }
 }

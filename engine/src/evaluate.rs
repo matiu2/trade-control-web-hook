@@ -995,7 +995,10 @@ fn pine_entry_dispatchable(
     // dispatches. An `Err` (degenerate geometry, below-min-R, out-of-range, …)
     // is a decline-this-bar, not a fire.
     let shell = trade_control_core::intent::Shell::from_candle_and_signal(candle, sig);
-    match trade_control_core::intent::Resolved::from_intent(intent, &shell, pip_size) {
+    // Same tick fallback as the worker/replay (baked intent tick → pip) so a
+    // rounding-induced out-of-range/sub-R rejection is reflected here too.
+    let tick_size = intent.tick_size.unwrap_or(pip_size);
+    match trade_control_core::intent::Resolved::from_intent(intent, &shell, pip_size, tick_size) {
         Ok(_) => {
             tracing::debug!(bar = %candle.time, "pine-enter: dispatchable — will fire enter");
             true
@@ -1736,6 +1739,7 @@ mod tests {
             reason: None,
             mw: None,
             pip_size: None,
+            tick_size: None,
             spread_window: None,
             trade_plan: None,
             blackout_close: trade_control_core::intent::BlackoutCloseAction::default(),

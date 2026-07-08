@@ -133,7 +133,11 @@ where
         .filter(|p| *p > 0.0 && p.is_finite())
         .or(Some(record.pip_size).filter(|p| *p > 0.0 && p.is_finite()))
         .unwrap_or(DEFAULT_PIP_SIZE);
-    let resolved = Resolved::from_intent(&verified.intent, &verified.shell, pip)
+    // tick: prefer the baked intent value, else the pip fallback (a safe
+    // coarser grid) — same chain as the worker so re-placed prices round
+    // identically. Snaps the restored order onto the instrument's tick grid.
+    let tick = verified.intent.tick_size.unwrap_or(pip);
+    let resolved = Resolved::from_intent(&verified.intent, &verified.shell, pip, tick)
         .map_err(|e| format!("resolve: {e}"))?;
     let quote = get_quote(&broker, &resolved.instrument)
         .await

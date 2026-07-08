@@ -508,6 +508,14 @@ pub struct TradeSpec {
     /// default (pre-feature behaviour).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pip_size: Option<f64>,
+    /// Instrument tick size (minimum price increment) baked onto the `05-enter`
+    /// intent so the worker snaps entry/SL/TP onto the broker's price grid
+    /// before placement (OANDA rejects an over-precise price with
+    /// `PRICE_PRECISION_EXCEEDED`). From `instrument-lookup` (`asset.tick_size`),
+    /// overridable via `--tick-size`. Finer than [`Self::pip_size`] for
+    /// fractional-pip FX. Absent = the worker falls back to `pip_size`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tick_size: Option<f64>,
     /// What the market-hours blackout sweep should do with this trade's
     /// still-pending resting order if it's caught inside the instrument's
     /// daily close→open gap. Lands on the `05-enter` intent's
@@ -625,6 +633,11 @@ pub struct MwSpec {
     pub spread_pips: f64,
     /// Instrument pip size at arm time (e.g. `0.0001`). `> 0`.
     pub pip_size: f64,
+    /// Instrument tick size at arm time, baked onto the enter's top-level
+    /// `tick_size` so the worker snaps the mid-correct M/W entry/SL/TP onto the
+    /// broker's price grid. `None` = fall back to `pip_size` in the worker.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tick_size: Option<f64>,
 }
 
 impl MwSpec {
@@ -1014,6 +1027,7 @@ fn build_pattern(
         sl_anchor: None,
         mw: None,
         pip_size: None,
+        tick_size: None,
         // Interactive path keeps the safe default (cancel a resting order,
         // never close a position). The `--blackout-close` flag lives on the
         // `--from-file` / scripted path.
@@ -1150,6 +1164,7 @@ fn assemble_trade(
         spec.needs_confirmed,
         &spec.skip_preps,
         spec.pip_size,
+        spec.tick_size,
         spec.blackout_close,
         &spec.broker,
         &spec.account,
@@ -1204,6 +1219,7 @@ fn assemble_trade(
             true, // QM is always confirmed-candle gated
             &qm_skip_preps,
             spec.pip_size,
+            spec.tick_size,
             spec.blackout_close,
             &spec.broker,
             &spec.account,
@@ -1547,10 +1563,15 @@ fn build_mw_enter_alert(
     intent.spread_window = spread_window;
     // entry / stop_loss / take_profit deliberately left None — the worker
     // computes all three from `mw` + the shell OHLC (mid-correct).
+    // Read the tick before `to_params` consumes `mw`; baked onto the top-level
+    // field so the worker snaps the mid-correct M/W prices onto the grid.
+    let mw_tick = mw.tick_size;
+    let mw_pip = mw.pip_size;
     intent.mw = Some(mw.to_params());
     // Carry the same pip on the top-level field so the worker's shared
     // sizing tail (`pip_size_for`) sees the baked value, not its default.
-    intent.pip_size = Some(mw.pip_size);
+    intent.pip_size = Some(mw_pip);
+    intent.tick_size = mw_tick;
     match risk_amount {
         Some(amount) => {
             intent.risk_amount = Some(trade_control_core::tunable::Tunable::Static(amount))
@@ -1734,6 +1755,7 @@ fn skeleton(
         reason: None,
         mw: None,
         pip_size: None,
+        tick_size: None,
         spread_window: None,
         trade_plan: None,
         blackout_close: trade_control_core::intent::BlackoutCloseAction::default(),
@@ -1955,6 +1977,7 @@ fn build_enter_alert(
     needs_confirmed: bool,
     skip_preps: &[String],
     pip_size: Option<f64>,
+    tick_size: Option<f64>,
     blackout_close: BlackoutCloseAction,
     broker: &BrokerKind,
     account: &str,
@@ -1994,6 +2017,7 @@ fn build_enter_alert(
     // Baked pip scales the entry/SL offset_pips at the worker; absent =
     // worker falls back to its secret/default.
     intent.pip_size = pip_size;
+    intent.tick_size = tick_size;
     let (entry_offset_pips, entry_offset_atr_pct) = entry_offset.as_fields();
     intent.entry = Some(match entry_mode {
         EntryMode::Stop => EntrySpec::Stop {
@@ -2153,6 +2177,9 @@ pub struct PositionEnterSpec {
     pub risk_amount: Option<f64>,
     /// Pip size baked onto the intent (from instrument-lookup).
     pub pip_size: Option<f64>,
+    /// Tick size baked onto the intent (from instrument-lookup) so the worker
+    /// snaps entry/SL/TP onto the broker's grid before placement.
+    pub tick_size: Option<f64>,
     /// When true, the worker logs the order but doesn't push to broker.
     pub dry_run: bool,
 }
@@ -2216,6 +2243,7 @@ pub fn build_position_enter(
     );
     intent.direction = Some(spec.direction);
     intent.pip_size = spec.pip_size;
+    intent.tick_size = spec.tick_size;
     intent.entry = Some(entry);
     intent.stop_loss = Some(PriceRef::Absolute {
         absolute: spec.stop_loss,
@@ -2509,6 +2537,7 @@ mod tests {
                 false,
                 &[],
                 None,
+                None,
                 BlackoutCloseAction::default(),
                 &BrokerKind::Oanda,
                 "demo",
@@ -2556,6 +2585,7 @@ mod tests {
                 sl_anchor: None,
                 mw: None,
                 pip_size: None,
+                tick_size: None,
                 blackout_close: BlackoutCloseAction::default(),
                 entry_level_vetos: Vec::new(),
                 recover_entry: RecoverEntryAction::Skip,
@@ -2598,6 +2628,7 @@ mod tests {
             false,
             false,
             &[],
+            None,
             None,
             BlackoutCloseAction::default(),
             &BrokerKind::Oanda,
@@ -2695,6 +2726,7 @@ mod tests {
                 true, // confirmed-candle gated
                 &["break-and-close".to_string(), "retest".to_string()],
                 None,
+                None,
                 BlackoutCloseAction::default(),
                 &BrokerKind::Oanda,
                 "demo",
@@ -2787,6 +2819,7 @@ mod tests {
             false,
             &[],
             None,
+            None,
             BlackoutCloseAction::default(),
             &BrokerKind::Oanda,
             "demo",
@@ -2826,6 +2859,7 @@ mod tests {
             false,
             false,
             &[],
+            None,
             None,
             BlackoutCloseAction::default(),
             &BrokerKind::Oanda,
@@ -2906,6 +2940,7 @@ mod tests {
             false,
             &[],
             None,
+            None,
             BlackoutCloseAction::default(),
             &BrokerKind::Oanda,
             "demo",
@@ -2945,6 +2980,7 @@ mod tests {
             trade_expiry: ts("2026-05-25T00:00:00Z"),
             risk_amount: None,
             pip_size: Some(0.0001),
+            tick_size: Some(0.0001),
             dry_run: false,
         }
     }
@@ -3039,6 +3075,7 @@ mod tests {
             sl_anchor: None,
             mw: None,
             pip_size: None,
+            tick_size: None,
             blackout_close: BlackoutCloseAction::default(),
             entry_level_vetos: Vec::new(),
             recover_entry: RecoverEntryAction::Skip,
@@ -3431,6 +3468,7 @@ mod tests {
             right_shoulder: None,
             spread_pips: 1.0,
             pip_size: 0.0001,
+            tick_size: None,
         }
     }
 
@@ -3568,10 +3606,13 @@ mod tests {
         let now = ts("2026-05-20T00:00:00Z");
         let mut spec = sample_spec(TradePattern::Hs, ts("2026-05-25T00:00:00Z"));
         spec.pip_size = Some(0.01); // JPY-scale
+        spec.tick_size = Some(0.001); // finer than the pip — baked independently
         let trade = build_trade_from_spec(spec, now, BuildStrictness::Strict).unwrap();
         let enter = &trade.alerts[5].intent;
         assert_eq!(enter.action, Action::Enter);
         assert_eq!(enter.pip_size, Some(0.01));
+        // The tick is baked onto the enter so the worker snaps prices to grid.
+        assert_eq!(enter.tick_size, Some(0.001));
         enter.validate().expect("hs enter with pip valid");
     }
 
