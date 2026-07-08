@@ -2719,13 +2719,12 @@ override the window width around each event: `--news-before-hours` (blackout
 run-up, default = the chart timeframe's `buffer_before`, 8h on H1+) and
 `--news-after-hours` (post-release news window, default 1h).
 
-**Seeing the armed news on the chart — `--draw-news-markers` (2026-07).** Because
-the windows go straight into the plan and nothing is drawn, the chart gives no
-visual cue about which events tv-arm is watching. Pass `--draw-news-markers` (opt-in)
-and tv-arm draws one **cosmetic** vertical line per event it reacts to — exactly the
-High-impact, `[cursor, trade-expiry]`-scoped set it bakes into the plan, drawn *after*
-elapsed windows are pruned, so **the lines are the armed set one-for-one**. Each line
-is labelled `<CCY>-<n>-star-<HH:MM>` in **Brisbane** time (matching your charts and
+**Seeing the armed news on the chart — cosmetic markers (default on, 2026-07).**
+Alongside arming the calendar windows, tv-arm also draws (by default) one
+**cosmetic** vertical line per event it reacts to — exactly the High-impact,
+`[cursor, trade-expiry]`-scoped set it bakes into the plan, drawn *after* elapsed
+windows are pruned, so **the lines are the armed set one-for-one**. Each line is
+labelled `<CCY>-<n>-star-<HH:MM>` in **Brisbane** time (matching your charts and
 journals), e.g. `USD-3-star-04:00`. Events that land in the same chart bar collapse to
 a single line whose label space-joins them (`USD-3-star-22:00 EUR-2-star-22:30`), since
 TradingView renders one drawing per bar cell. The lines **never affect the signed plan**
@@ -2733,7 +2732,9 @@ TradingView renders one drawing per bar cell. The lines **never affect the signe
 (unlike `tv-news`, which hard-errors) so a flaky draw never blocks a live
 `--register-plan`. This is narrower than running `tv-news` standalone, which draws a
 looser Medium+ / visible-window set; these markers are only what tv-arm actually arms.
-The pure line-grouping helper is `news_marker_lines` (`tv-arm/src/news_marker.rs`).
+`--skip-calendar-bars` opts out of the whole calendar step — no windows armed **and**
+no markers drawn. The pure line-grouping helper is `news_marker_lines`
+(`tv-arm/src/news_marker.rs`).
 
 The plan builder
 is `tv-arm/src/trade_plan_build.rs` (the inverse of `alert_spec.rs`); the

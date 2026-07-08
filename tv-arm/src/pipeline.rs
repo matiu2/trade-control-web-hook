@@ -183,12 +183,13 @@ pub fn run(args: Args) -> Result<i32> {
     let prune_as_of = pick_prune_as_of(&args, now, cursor_unix, start);
     drop_past_control_pairs(&mut roles, prune_as_of);
 
-    // Cosmetic chart annotation (opt-in): draw a vertical line for exactly the
-    // news events tv-arm reacts to — the armed set, post-prune, so drawn ==
+    // Cosmetic chart annotation (default on): draw a vertical line for exactly
+    // the news events tv-arm reacts to — the armed set, post-prune, so drawn ==
     // armed. Never touches the plan; a draw failure warns and continues.
-    if args.draw_news_markers {
-        draw_news_markers(&mcp, &roles, &state.resolution);
-    }
+    // `--skip-calendar-bars` opts out of the whole calendar step above, leaving
+    // `news_markers` empty, so this then draws nothing (that flag skips both the
+    // news windows and their markers).
+    draw_news_markers(&mcp, &roles, &state.resolution);
 
     // 2c. Position-tool direct entry. When one of --market-entry /
     //     --stop-entry / --limit-entry is set, ignore the pattern
@@ -1264,7 +1265,7 @@ fn drop_past_control_pairs(roles: &mut Roles, as_of: AsOf) {
 /// per-line failures are counted, not propagated.
 fn draw_news_markers(mcp: &TvMcp, roles: &Roles, resolution: &str) {
     if roles.news_markers.is_empty() {
-        info!("--draw-news-markers: no armed news events to draw");
+        info!("news markers: no armed news events to draw");
         return;
     }
     let bar_secs = news_marker_lines_bar_secs(resolution);
@@ -1280,12 +1281,12 @@ fn draw_news_markers(mcp: &TvMcp, roles: &Roles, resolution: &str) {
                 warn!(
                     label = %line.label,
                     error = s.error.as_deref().unwrap_or("(no message)"),
-                    "--draw-news-markers: tv-mcp reported a failed draw; continuing",
+                    "news markers: tv-mcp reported a failed draw; continuing",
                 );
             }
             Err(e) => {
                 failed += 1;
-                warn!(label = %line.label, error = %e, "--draw-news-markers: draw call errored; continuing");
+                warn!(label = %line.label, error = %e, "news markers: draw call errored; continuing");
             }
         }
     }
@@ -1294,7 +1295,7 @@ fn draw_news_markers(mcp: &TvMcp, roles: &Roles, resolution: &str) {
         lines = lines.len(),
         drawn,
         failed,
-        "--draw-news-markers: drew news markers for the armed event set",
+        "news markers: drew news markers for the armed event set",
     );
 }
 
@@ -1621,7 +1622,8 @@ fn calendar_scope_range(cursor_unix: i64, expiry_hint: Option<DateTime<Utc>>) ->
 /// **blackout** window `[event − before, event]` (no new entries in the run-up),
 /// a **news** window `[event, event + after]` (post-release), and a cosmetic
 /// **marker** (currency + stars + event minute) carrying the event detail the
-/// windows drop — used only by `--draw-news-markers`. `before` / `after` default
+/// windows drop — used to draw the cosmetic armed-news lines (default on, opt
+/// out with `--skip-calendar-bars`). `before` / `after` default
 /// to the chart timeframe's buffers, overridden per-run by `--news-before-hours`
 /// / `--news-after-hours` when set.
 ///

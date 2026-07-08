@@ -3,10 +3,12 @@
 //! tv-arm folds High-impact calendar events over `[cursor, trade-expiry]` into
 //! the signed `TradePlan` as pause/news control windows (see
 //! [`crate::news_window`]). Those windows are gate machinery, not chart
-//! annotations — nothing is drawn. When debugging or replaying a trade it's
-//! useful to *see* exactly the events tv-arm armed against, so
-//! `--draw-news-markers` draws one cosmetic vertical line per event, labelled
-//! with its currency, star rating and Brisbane-local time.
+//! annotations. To make debugging or replaying a trade easier, tv-arm *also*
+//! draws (by default) one cosmetic vertical line per event alongside arming the
+//! windows, so the operator can *see* exactly the events tv-arm armed against —
+//! labelled with its currency, star rating and Brisbane-local time.
+//! `--skip-calendar-bars` opts out of the whole calendar step (windows **and**
+//! markers).
 //!
 //! This is deliberately narrower than tv-news's annotation:
 //! - **tv-news** draws Medium+ events for the asset's currencies (3★ for USD
