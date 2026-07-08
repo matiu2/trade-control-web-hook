@@ -256,6 +256,45 @@ pub fn evaluate_plan(
     }
 }
 
+/// Run **only** the control rules (pause/resume/news-start/news-end) against a
+/// wall-clock instant, with no new candle. This is the sub-bar tick: the live
+/// worker fires it on its 5s cron between bar closes, and the replay injects it
+/// at each control epoch that lands between two bars — so a mid-bar window
+/// (a 14:30 event on an H1 chart) opens/closes at its real epoch in **both**
+/// drivers, not at the enclosing bar boundary.
+///
+/// `last_candle` is the most recent closed bar — control `TimeReached` fires are
+/// gated purely on `now` (see [`control_rule_fires`]), so the candle is only
+/// context for `push_fire` / any defensive non-time fallback; it is **not**
+/// advanced through the spine and no guard runs. The spine, guards, and
+/// trendline warnings are the province of the candle-driven [`evaluate_plan`];
+/// this path never changes `phase` and never retires the plan.
+///
+/// Returns a [`PlanEval`] whose `fired` holds only control intents; `done` is
+/// carried through from `prior` unchanged (a control tick can't end a plan).
+pub fn evaluate_controls_only(
+    plan: &TradePlan,
+    prior: &PlanState,
+    last_candle: &Candle,
+    now: DateTime<Utc>,
+    expires_at: DateTime<Utc>,
+) -> PlanEval {
+    let mut state = prior.clone();
+    state.expires_at = expires_at;
+    let mut fired = Vec::new();
+    // The detector window is unused by control rules (they're pure TimeReached),
+    // so the last candle stands in — no history fetch needed for a control tick.
+    let window = std::slice::from_ref(last_candle);
+    evaluate_controls(plan, &mut state, last_candle, window, now, &mut fired);
+    let done = state.phase == Phase::Done;
+    PlanEval {
+        fired,
+        new_state: state,
+        done,
+        warnings: Vec::new(),
+    }
+}
+
 /// How a trendline anchor resolved against the candle window — the diagnostic
 /// the warning surface reports.
 enum AnchorResolution {
@@ -3443,6 +3482,59 @@ mod tests {
         assert!(
             early.fired.is_empty(),
             "before the wall-clock epoch the window stays shut"
+        );
+    }
+
+    #[test]
+    fn evaluate_controls_only_opens_and_closes_a_window_with_no_new_bar() {
+        // The sub-bar tick path: `evaluate_controls_only` fires control edges
+        // against a wall-clock `now` with only the last-known candle and NO new
+        // bar — exactly what the worker's candle-less 5s tick and the replay's
+        // injected virtual tick call. A news window opens at 14:30 and closes at
+        // 15:15, both between H1 bar closes, driven purely by `now`.
+        let p = plan(vec![
+            news_control_rule(
+                "news-start-evt1",
+                Action::NewsStart,
+                "evt1",
+                "2026-06-16T14:30:00Z",
+            ),
+            news_control_rule(
+                "news-end-evt1",
+                Action::NewsEnd,
+                "evt1",
+                "2026-06-16T15:15:00Z",
+            ),
+        ]);
+        let prior = seed_at(Phase::AwaitEntry, "2026-06-16T12:00:00Z");
+        let last = candle("2026-06-16T14:00:00Z", 1.0, 1.0, 1.0, 1.0);
+        let expires = ts("2026-06-30T00:00:00Z");
+
+        // Virtual tick at 14:30 (mid-bar): opens the window, no bar consumed.
+        let open = evaluate_controls_only(&p, &prior, &last, ts("2026-06-16T14:30:00Z"), expires);
+        let open_ids: Vec<&str> = open.fired.iter().map(|f| f.rule_id.as_str()).collect();
+        assert_eq!(open_ids, vec!["news-start-evt1"]);
+        assert!(open.new_state.open_news_windows.contains("evt1"));
+        assert!(!open.done, "a control tick never ends the plan");
+        assert_eq!(
+            open.new_state.phase,
+            Phase::AwaitEntry,
+            "the spine phase is untouched by a control-only tick"
+        );
+
+        // Virtual tick at 15:15 (mid the next bar): closes the window.
+        let close = evaluate_controls_only(
+            &p,
+            &open.new_state,
+            &last,
+            ts("2026-06-16T15:15:00Z"),
+            expires,
+        );
+        let close_ids: Vec<&str> = close.fired.iter().map(|f| f.rule_id.as_str()).collect();
+        assert_eq!(close_ids, vec!["news-end-evt1"]);
+        assert!(
+            !close.new_state.open_news_windows.contains("evt1"),
+            "the news window is recorded closed"
         );
     }
 

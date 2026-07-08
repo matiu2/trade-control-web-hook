@@ -47,13 +47,14 @@ Shared pure boundary logic lives in the engine so worker + replay can't diverge
       `pause_and_resume_fire_when_wallclock_reaches_each_epoch_and_dont_refire`
       to drive `now` per tick. Added `run_at` test helper. 121 engine tests pass.
 
-### 2. Engine: candle-less control tick entry point  [ ]
-- [ ] Add a way to run control-only evaluation with `now` and the last-known
-      candle but no *new* candle (so worker/replay can tick controls between
-      bars). Likely `evaluate_plan` with an empty `new_candles` + a
-      `last_candle` for context, OR a dedicated `evaluate_controls_at(now)`.
-      Decide the cleanest seam; keep spine/guards untouched when no new candle.
-- [ ] Tests for the candle-less path (open + close a window with zero new bars).
+### 2. Engine: candle-less control tick entry point  [x]
+- [x] Added `pub fn evaluate_controls_only(plan, prior, last_candle, now,
+      expires_at) -> PlanEval`: runs ONLY control rules against `now` + the
+      last-known candle, no new bar. Never touches phase/guards/spine; exported
+      from engine lib.
+- [x] Test `evaluate_controls_only_opens_and_closes_a_window_with_no_new_bar`
+      (open 14:30 + close 15:15, both mid-bar, zero new candles; phase stays
+      AwaitEntry). 122 engine tests pass.
 
 ### 3. Worker: fire controls on candle-less 5s ticks  [ ]
 - [ ] `trade-control-cron/src/engine.rs`: when `fresh.is_empty()`, instead of
