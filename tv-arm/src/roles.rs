@@ -113,8 +113,8 @@ pub struct Roles {
     /// News windows (`news-start`/`news-end`), same calendar-resolved source.
     pub news_pairs: Vec<NewsWindow>,
     /// The individual news events tv-arm reacts to (currency + stars + event
-    /// minute), carried alongside the windows purely so `--draw-news-markers`
-    /// can annotate the chart with the *exact* armed set. Never signed, never
+    /// minute), carried alongside the windows purely so tv-arm can draw the
+    /// cosmetic markers annotating the *exact* armed set. Never signed, never
     /// gate machinery — cosmetic. Same filter/scope as `news_pairs`, pruned
     /// together in `drop_past_control_pairs`.
     pub news_markers: Vec<NewsMarker>,

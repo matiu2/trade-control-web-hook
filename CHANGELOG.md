@@ -1,5 +1,36 @@
 # Changelog
 
+## v72 — 2026-07-08 — news markers draw by default; `--skip-calendar-bars` skips both
+
+**Why.** v71 shipped the armed-news markers behind an opt-in `--draw-news-markers`
+flag. In practice the operator always wants to *see* the armed news when arming a
+trade, so the flag was pure friction. Make drawing the default and fold the opt-out
+into the existing `--skip-calendar-bars` (which already skipped the windows) so a
+single flag turns off the whole calendar step — windows **and** markers — matching
+the mental model "no calendar → nothing calendar-related on the chart".
+
+**What changed.**
+- **Markers now draw by default.** tv-arm draws the cosmetic armed-news lines
+  whenever it arms calendar windows (same one-for-one armed set, same
+  `<CCY>-<n>-star-<HH:MM>` Brisbane labels, same same-bar merge). No flag needed.
+- **`--draw-news-markers` removed.** The behaviour is unconditional (post-prune,
+  so drawn == armed). Nothing to opt into.
+- **`--skip-calendar-bars` now skips both** the news/blackout windows *and* the
+  markers. It already gated the calendar step, so with markers built from that same
+  step, skipping it leaves `news_markers` empty and nothing draws — no separate
+  guard needed.
+
+**Breaking.** CLI: `--draw-news-markers` no longer exists (was a no-op default-off
+bool in v71; removing it errors on unknown-flag if any script passed it). No
+wire/plan change.
+
+**Config.** One fewer flag. `--skip-calendar-bars` semantics broadened to cover the
+markers.
+
+**Tests.** Existing `news_marker.rs` + `pipeline.rs` lock-step-prune coverage is
+unchanged and still passes; the `defaults_are_sensible` args test still asserts
+`--skip-calendar-bars` defaults off.
+
 ## v71 — 2026-07-08 — `tv-arm --draw-news-markers` (cosmetic armed-news lines)
 
 **Why.** Since v68/PR1 the news/blackout windows tv-arm reacts to go straight into
