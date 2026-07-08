@@ -24,6 +24,7 @@ pub mod plan_state;
 pub mod recording;
 pub mod recover_entry;
 pub mod retry_gate;
+pub mod rounding;
 pub mod rules;
 pub mod sig;
 pub mod signals;

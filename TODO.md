@@ -1,3 +1,50 @@
+# TODO — Fix OANDA PRICE_PRECISION_EXCEEDED (order not rounded to tick) — IN PROGRESS 2026-07-08
+
+Incident: `hs-au200-aud-b89106ee` QM entry fired correctly (r=2.195) but OANDA
+rejected it (`PRICE_PRECISION_EXCEEDED`) — worker sent 5-dp price on a 0.1-tick
+instrument. Same rejection hit XAU_USD, AUD_JPY same tick → systemic. Missed a
+winning trade (price ran to TP, then `01-veto-too-low` archived the plan).
+
+## Bug B — instrument-lookup catalog (separate repo: ../../instrument-lookup)
+- [ ] `AU200AUD` duplicate entry has `tick_size 1.0 / dp 0`; canonical `AU200`
+      correctly has `0.1 / 1`. Fix the duplicate to match (or dedupe). tv-arm
+      resolves via the OANDA-derived `AU200AUD` id → got the wrong tick.
+- [ ] Test + `cargo install --path .` so tv-arm picks up the fix.
+- [ ] Audit other OANDA index entries for wrong tick (follow-up).
+
+## Bug A — worker never rounds order price/SL/TP to instrument tick — PR-1 DONE
+- [x] `core/src/rounding.rs`: `round_to_tick`/`round_price`/`round_stop_loss`/
+      `round_take_profit` (identity on tick<=0; directional SL/TP). 10 tests.
+- [x] `Intent.tick_size: Option<f64>` (auto-signed line-scan HMAC) +
+      `DispatchConfig.tick_size`. incoming.rs sign/round-trip/tamper tests.
+      (EntryAttempt/TradePlan intentionally NOT added — intent field is the
+      authoritative source both worker+replay read; would be dead/churny.)
+- [x] Resolver: `tick_size` param on from_intent/from_mw_intent/
+      finish_with_sizing; rounds entry/SL/TP BEFORE in-range + R-floor checks.
+      Tests: AU200 8806.70784→8806.7; sub-1R-after-rounding rejected.
+- [x] Worker edge (enter.rs:284): tick = intent.tick_size → cfg.tick_size →
+      pip_size (fail-open). Threaded to from_intent.
+- [x] Replay/engine parity: simulator.rs `replay_tick`, evaluate.rs, report.rs
+      `replay_report_tick`, replay.rs DispatchConfig, blackout_restore.rs — all
+      round with intent.tick_size→pip fallback (matches worker).
+- [x] tv-arm bakes `asset.tick_size` onto H&S + M/W + position enters
+      (--tick-size override); TradeSpec/MwSpec/PositionEnterSpec carry it.
+- [x] clippy clean (1 pre-existing spread_blackout warning untouched) + fmt.
+- [x] All 24 live-crate test suites green.
+
+## Verify (Task #6) — DONE
+- [x] Replayed the REAL `hs-au200-aud-b89106ee` plan (exported from staging) over
+      the incident window (OANDA candles, 2026-07-07→09). With tick 0.1 baked the
+      enter resolves `entry=8806.7 sl=8841.4 tp=8730.6` (the exact price OANDA
+      rejected at 8806.70784), PLACES, FILLS @ 8806.7, and TAKES PROFIT → +2.19R
+      (+$2,193 on $100k). Unfixed (no baked tick → pip fallback 1.0) resolves
+      8807.0 and also places (any grid beats the raw 5-dp reject). Confirms the
+      fix recovers the missed winner. instrument-lookup resolve AU200_AUD → AU200
+      row (tick 0.1) wins first-match, so tv-arm already bakes 0.1 for AU200 →
+      PR-1 fixes it without the PR-2/3 catalog work.
+
+---
+
 # TODO — spread-window SL floor (mean spread over trailing N candles) — IN PROGRESS 2026-07-06
 
 ## Problem

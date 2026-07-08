@@ -38,6 +38,12 @@ pub struct DispatchConfig {
     /// result (per-instrument `PIP_SIZE_<INSTR>` override, then the forex
     /// default). Resolved at the edge so the dispatch needs no secret lookup.
     pub pip_size: f64,
+    /// Tick size fallback for this intent's instrument, resolved at the edge
+    /// (per-instrument override, else `None`). The baked `Intent::tick_size` is
+    /// preferred at the call site; when both are absent the dispatch falls back
+    /// to `pip_size`. `None` here means "no edge-resolved tick" — see the
+    /// fallback chain in `dispatch::enter`.
+    pub tick_size: Option<f64>,
     /// Per-account risk caps for this intent's account (default — all `None` —
     /// for an unnamed account or a missing record). Resolved against the
     /// worker-wide scalars above inside the dispatch.
@@ -68,6 +74,7 @@ mod tests {
             worker_max_risk_pct: 1.0,
             worker_max_open_positions: 3,
             pip_size: 0.0001,
+            tick_size: None,
             caps: AccountCaps::default(),
         }
     }

@@ -68,6 +68,7 @@ fn control_skeleton(action: Action, instrument: &str, id: String, now: DateTime<
         reason: None,
         mw: None,
         pip_size: None,
+        tick_size: None,
         spread_window: None,
         trade_plan: None,
         blackout_close: trade_control_core::intent::BlackoutCloseAction::default(),

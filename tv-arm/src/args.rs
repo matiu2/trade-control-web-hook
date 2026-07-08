@@ -460,6 +460,15 @@ pub struct Args {
     #[arg(long)]
     pub pip_size: Option<f64>,
 
+    /// Override the instrument tick size (minimum price increment) baked into
+    /// the enter intent. When omitted, the tick comes from `instrument-lookup`
+    /// (`asset.tick_size`) — the per-broker price grid (0.00001 for 5-dp FX,
+    /// 0.1 for AU200 on OANDA, etc.). The worker snaps every order price onto
+    /// this grid before placement so the broker doesn't reject it as
+    /// over-precise. Pass this only to force a non-catalog value.
+    #[arg(long)]
+    pub tick_size: Option<f64>,
+
     /// (Position-tool entry only) Trade-expiry window in hours from now,
     /// used when the chart carries no `trade-expiry` vertical line. The
     /// emitted enter self-cancels (if still resting) / the setup expires

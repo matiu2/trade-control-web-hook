@@ -237,6 +237,7 @@ impl Resolved {
         intent: &Intent,
         shell: &Shell,
         pip_size: f64,
+        tick_size: f64,
     ) -> Result<Self, ResolveError> {
         if intent.action != Action::Enter {
             return Err(ResolveError::NotAnEntry);
@@ -245,7 +246,7 @@ impl Resolved {
         // shell OHLC instead of `entry` / `stop_loss` / `take_profit`
         // (which are absent). Dedicated branch — see `mw_resolution`.
         if let Some(mw) = &intent.mw {
-            return Self::from_mw_intent(intent, shell, mw);
+            return Self::from_mw_intent(intent, shell, mw, tick_size);
         }
         let direction = intent
             .direction
@@ -437,6 +438,7 @@ impl Resolved {
             intent,
             shell,
             pip_size,
+            tick_size,
             direction,
             entry,
             reference_price,
@@ -457,6 +459,7 @@ impl Resolved {
         intent: &Intent,
         shell: &Shell,
         pip_size: f64,
+        tick_size: f64,
         direction: Direction,
         entry: ResolvedEntry,
         reference_price: f64,
@@ -464,6 +467,21 @@ impl Resolved {
         take_profit: f64,
         recover_entry: Option<ResolvedRecoverEntry>,
     ) -> Result<Self, ResolveError> {
+        // Snap every order price onto the instrument's tick grid BEFORE the
+        // in-range and R-floor checks below, so those invariants are verified
+        // against the prices we'll actually send to the broker (an unrounded
+        // price is rejected by OANDA as `PRICE_PRECISION_EXCEEDED`). Directional
+        // rounding keeps the snap from silently changing risk: SL away from
+        // entry (never tighter), TP toward entry (never inflates R), entry to
+        // nearest. `tick_size <= 0` is identity — see `crate::rounding`.
+        //
+        // Both worker and replay resolve through here, so rounding here (not at
+        // EntryRequest-build) keeps them in parity.
+        let reference_price = crate::rounding::round_price(reference_price, tick_size);
+        let entry = round_resolved_entry(entry, tick_size);
+        let stop_loss = crate::rounding::round_stop_loss(stop_loss, reference_price, tick_size);
+        let take_profit =
+            crate::rounding::round_take_profit(take_profit, reference_price, tick_size);
         // Sizing-mode selection. `risk_pct` is always present (default
         // `Static(1.0)`), so it's the fallback. `risk_amount` and
         // `size_units` are mutually exclusive with each other and with
@@ -649,6 +667,24 @@ fn resolve_f64_tunable(
 /// price units) so the broker `#19-10` recovery path is bounded without
 /// the operator having to supply a number. `limit` / `skip` carry no
 /// bound.
+/// Snap the price carried inside a [`ResolvedEntry`] onto the tick grid.
+/// The trigger (or market reference) is a level, so it rounds to nearest —
+/// the directional SL/TP rounding lives in `finish_with_sizing`. `tick_size
+/// <= 0` is identity (see [`crate::rounding`]).
+fn round_resolved_entry(entry: ResolvedEntry, tick_size: f64) -> ResolvedEntry {
+    match entry {
+        ResolvedEntry::Market { reference_price } => ResolvedEntry::Market {
+            reference_price: crate::rounding::round_price(reference_price, tick_size),
+        },
+        ResolvedEntry::Stop { trigger_price } => ResolvedEntry::Stop {
+            trigger_price: crate::rounding::round_price(trigger_price, tick_size),
+        },
+        ResolvedEntry::Limit { trigger_price } => ResolvedEntry::Limit {
+            trigger_price: crate::rounding::round_price(trigger_price, tick_size),
+        },
+    }
+}
+
 fn resolve_recover_entry(
     rec: super::RecoverEntry,
     pip_size: f64,
@@ -769,6 +805,7 @@ mod tests {
             reason: None,
             mw: None,
             pip_size: None,
+            tick_size: None,
             spread_window: None,
             trade_plan: None,
             blackout_close: crate::intent::BlackoutCloseAction::default(),
@@ -779,7 +816,7 @@ mod tests {
 
     #[test]
     fn long_market_resolves_r_multiple_tp() {
-        let r = Resolved::from_intent(&long_market_intent(), &shell(), 0.0001).unwrap();
+        let r = Resolved::from_intent(&long_market_intent(), &shell(), 0.0001, 0.0).unwrap();
         // SL = 1.0980 - 2*0.0001 = 1.0978
         assert!((r.stop_loss - 1.0978).abs() < 1e-9);
         // entry = 1.1000, R = 0.0022, TP = 1.1000 + 2*0.0022 = 1.1044
@@ -800,7 +837,7 @@ mod tests {
             offset_pips: -10.0,
             offset_atr_pct: None,
         }));
-        let r = Resolved::from_intent(&intent, &shell(), 0.0001).unwrap();
+        let r = Resolved::from_intent(&intent, &shell(), 0.0001, 0.0).unwrap();
         // SL = 1.1020 + 2*0.0001 = 1.1022
         assert!((r.stop_loss - 1.1022).abs() < 1e-9);
         // TP = 1.0980 - 10*0.0001 = 1.0970
@@ -817,7 +854,7 @@ mod tests {
             at: None,
             recover_entry: None,
         });
-        let r = Resolved::from_intent(&intent, &shell(), 0.0001).unwrap();
+        let r = Resolved::from_intent(&intent, &shell(), 0.0001, 0.0).unwrap();
         // trigger = 1.1020 + 2*0.0001 = 1.1022
         match r.entry {
             ResolvedEntry::Stop { trigger_price } => assert!((trigger_price - 1.1022).abs() < 1e-9),
@@ -850,7 +887,7 @@ mod tests {
         intent.take_profit = Some(TakeProfit::Anchored(PriceRef::Absolute {
             absolute: 1.1200,
         }));
-        let r = Resolved::from_intent(&intent, &shell(), 0.0001).unwrap();
+        let r = Resolved::from_intent(&intent, &shell(), 0.0001, 0.0).unwrap();
         match r.entry {
             ResolvedEntry::Stop { trigger_price } => {
                 assert!((trigger_price - 1.1000).abs() < 1e-9, "{trigger_price}")
@@ -874,7 +911,7 @@ mod tests {
         intent.take_profit = Some(TakeProfit::Anchored(PriceRef::Absolute {
             absolute: 1.1100,
         }));
-        let r = Resolved::from_intent(&intent, &shell(), 0.0001).unwrap();
+        let r = Resolved::from_intent(&intent, &shell(), 0.0001, 0.0).unwrap();
         match r.entry {
             ResolvedEntry::Limit { trigger_price } => {
                 assert!((trigger_price - 1.1000).abs() < 1e-9, "{trigger_price}")
@@ -938,8 +975,8 @@ mod tests {
         confirmed_candle.signal_high = Some(signal_high);
         confirmed_candle.signal_low = Some(signal_low);
 
-        let r1 = Resolved::from_intent(&intent, &break_candle, pip).unwrap();
-        let r2 = Resolved::from_intent(&intent, &confirmed_candle, pip).unwrap();
+        let r1 = Resolved::from_intent(&intent, &break_candle, pip, 0.0).unwrap();
+        let r2 = Resolved::from_intent(&intent, &confirmed_candle, pip, 0.0).unwrap();
 
         // Stop-loss is the pattern high + 1 pip on BOTH fires — no drift.
         assert!((r1.stop_loss - (signal_high + pip)).abs() < 1e-9);
@@ -968,7 +1005,7 @@ mod tests {
                 max_slippage_pips: Some(8.0),
             }),
         });
-        let r = Resolved::from_intent(&intent, &shell(), 0.0001).unwrap();
+        let r = Resolved::from_intent(&intent, &shell(), 0.0001, 0.0).unwrap();
         let rec = r.recover_entry.expect("recovery carried onto Resolved");
         assert_eq!(rec.action, RecoverEntryAction::Market);
         // 8 pips * 0.0001 pip_size = 0.0008 in price units.
@@ -979,7 +1016,7 @@ mod tests {
     fn market_entry_has_no_recover_entry() {
         // Recovery is a stop-entry concept; a market entry never carries
         // it even if some future caller sets it.
-        let r = Resolved::from_intent(&long_market_intent(), &shell(), 0.0001).unwrap();
+        let r = Resolved::from_intent(&long_market_intent(), &shell(), 0.0001, 0.0).unwrap();
         assert!(r.recover_entry.is_none());
     }
 
@@ -997,7 +1034,7 @@ mod tests {
                 max_slippage_pips: None,
             }),
         });
-        let r = Resolved::from_intent(&intent, &shell(), 0.0001).unwrap();
+        let r = Resolved::from_intent(&intent, &shell(), 0.0001, 0.0).unwrap();
         let rec = r.recover_entry.unwrap();
         assert_eq!(rec.action, RecoverEntryAction::Skip);
         assert!(rec.max_slippage_price.is_none());
@@ -1038,7 +1075,7 @@ mod tests {
     #[test]
     fn wrong_side_short_stop_bare_still_drops() {
         // No recover_entry → today's behaviour: InvalidGeometry (drop).
-        let r = Resolved::from_intent(&wrong_side_short_stop(None), &shell(), 0.0001);
+        let r = Resolved::from_intent(&wrong_side_short_stop(None), &shell(), 0.0001, 0.0);
         assert!(matches!(r, Err(ResolveError::InvalidGeometry)));
     }
 
@@ -1048,7 +1085,7 @@ mod tests {
             action: RecoverEntryAction::Skip,
             max_slippage_pips: None,
         });
-        let r = Resolved::from_intent(&wrong_side_short_stop(rec), &shell(), 0.0001);
+        let r = Resolved::from_intent(&wrong_side_short_stop(rec), &shell(), 0.0001, 0.0);
         assert!(matches!(r, Err(ResolveError::InvalidGeometry)));
     }
 
@@ -1058,7 +1095,7 @@ mod tests {
             action: RecoverEntryAction::Market,
             max_slippage_pips: None, // → derived bound
         });
-        let r = Resolved::from_intent(&wrong_side_short_stop(rec), &shell(), 0.0001).unwrap();
+        let r = Resolved::from_intent(&wrong_side_short_stop(rec), &shell(), 0.0001, 0.0).unwrap();
         // Re-keyed to a market entry at the current close.
         match r.entry {
             ResolvedEntry::Market { reference_price } => {
@@ -1078,7 +1115,7 @@ mod tests {
             action: RecoverEntryAction::Market,
             max_slippage_pips: Some(12.0),
         });
-        let r = Resolved::from_intent(&wrong_side_short_stop(rec), &shell(), 0.0001).unwrap();
+        let r = Resolved::from_intent(&wrong_side_short_stop(rec), &shell(), 0.0001, 0.0).unwrap();
         let recd = r.recover_entry.unwrap();
         // Explicit 12 pips * 0.0001 = 0.0012 (overrides the derived 0.0030).
         assert!((recd.max_slippage_price.unwrap() - 0.0012).abs() < 1e-9);
@@ -1090,7 +1127,7 @@ mod tests {
             action: RecoverEntryAction::Limit,
             max_slippage_pips: None,
         });
-        let r = Resolved::from_intent(&wrong_side_short_stop(rec), &shell(), 0.0001).unwrap();
+        let r = Resolved::from_intent(&wrong_side_short_stop(rec), &shell(), 0.0001, 0.0).unwrap();
         match r.entry {
             ResolvedEntry::Limit { trigger_price } => {
                 assert!((trigger_price - 1.1010).abs() < 1e-9);
@@ -1124,7 +1161,7 @@ mod tests {
             offset_pips: -20.0, // TP 1.0980, reward = 20 pips → R = 0.4
             offset_atr_pct: None,
         }));
-        let r = Resolved::from_intent(&intent, &shell(), 0.0001);
+        let r = Resolved::from_intent(&intent, &shell(), 0.0001, 0.0);
         assert!(
             matches!(r, Err(ResolveError::BelowMinR { .. })),
             "got {r:?}"
@@ -1144,7 +1181,7 @@ mod tests {
             offset_pips: 10.0, // TP 1.1010 — above the 1.1000 close
             offset_atr_pct: None,
         }));
-        let r = Resolved::from_intent(&intent, &shell(), 0.0001);
+        let r = Resolved::from_intent(&intent, &shell(), 0.0001, 0.0);
         assert!(
             matches!(r, Err(ResolveError::EntryOutsideRange { .. })),
             "got {r:?}"
@@ -1188,7 +1225,7 @@ mod tests {
             low: 6301.2,
             ..shell()
         };
-        let r = Resolved::from_intent(&intent, &euro_shell, 1.0).unwrap();
+        let r = Resolved::from_intent(&intent, &euro_shell, 1.0, 0.0).unwrap();
         match r.entry {
             ResolvedEntry::Limit { trigger_price } => {
                 assert!(
@@ -1212,7 +1249,7 @@ mod tests {
             offset_atr_pct: None,
             at: None,
         });
-        let r = Resolved::from_intent(&intent, &shell(), 0.0001).unwrap();
+        let r = Resolved::from_intent(&intent, &shell(), 0.0001, 0.0).unwrap();
         match r.entry {
             ResolvedEntry::Limit { trigger_price } => {
                 // 1.0980 + 5*0.0001 = 1.0985
@@ -1233,7 +1270,7 @@ mod tests {
             at: None,
         });
         assert!(matches!(
-            Resolved::from_intent(&intent, &shell(), 0.0001),
+            Resolved::from_intent(&intent, &shell(), 0.0001, 0.0),
             Err(ResolveError::InvalidGeometry)
         ));
     }
@@ -1254,7 +1291,7 @@ mod tests {
             offset_atr_pct: None,
             at: None,
         });
-        let r = Resolved::from_intent(&intent, &shell(), 0.0001).unwrap();
+        let r = Resolved::from_intent(&intent, &shell(), 0.0001, 0.0).unwrap();
         match r.entry {
             ResolvedEntry::Limit { trigger_price } => {
                 // 1.1020 - 5*0.0001 = 1.1015
@@ -1276,7 +1313,7 @@ mod tests {
             recover_entry: None,
         });
         assert!(matches!(
-            Resolved::from_intent(&intent, &shell(), 0.0001),
+            Resolved::from_intent(&intent, &shell(), 0.0001, 0.0),
             Err(ResolveError::InvalidGeometry)
         ));
     }
@@ -1290,7 +1327,7 @@ mod tests {
             offset_atr_pct: None,
         });
         assert!(matches!(
-            Resolved::from_intent(&intent, &shell(), 0.0001),
+            Resolved::from_intent(&intent, &shell(), 0.0001, 0.0),
             Err(ResolveError::EntryOutsideRange { .. })
         ));
     }
@@ -1307,9 +1344,62 @@ mod tests {
         }));
         let mut s = shell();
         s.close = 1.86500; // simulates a trigger candle inside the SL..TP range
-        let r = Resolved::from_intent(&intent, &s, 0.0001).unwrap();
+        let r = Resolved::from_intent(&intent, &s, 0.0001, 0.0).unwrap();
         assert!((r.stop_loss - 1.86236).abs() < 1e-9);
         assert!((r.take_profit - 1.86899).abs() < 1e-9);
+    }
+
+    #[test]
+    fn au200_short_rounds_prices_to_tick_grid() {
+        // The 2026-07-08 incident: AU200_AUD ticks 0.1 but the resolver produced
+        // a 5-dp short. With the instrument tick passed, entry/SL/TP snap to the
+        // 0.1 grid so OANDA no longer rejects `PRICE_PRECISION_EXCEEDED`.
+        let mut intent = long_market_intent();
+        intent.direction = Some(Direction::Short);
+        intent.stop_loss = Some(PriceRef::Absolute {
+            absolute: 8841.39216,
+        });
+        intent.take_profit = Some(TakeProfit::Anchored(PriceRef::Absolute {
+            absolute: 8730.56867,
+        }));
+        let mut s = shell();
+        s.close = 8806.70784; // market entry at the un-snapped close
+        let r = Resolved::from_intent(&intent, &s, 1.0, 0.1).unwrap();
+        // Entry snapped to nearest tick.
+        assert_eq!(r.entry.reference_price(), 8806.7);
+        // Short SL is above entry → rounds UP (away from entry, never tighter).
+        assert_eq!(r.stop_loss, 8841.4);
+        // Short TP is below entry → rounds UP (toward entry, never inflates R).
+        assert_eq!(r.take_profit, 8730.6);
+        // Every price is on the 0.1 grid (no sub-tick dust).
+        for p in [r.entry.reference_price(), r.stop_loss, r.take_profit] {
+            let steps = p / 0.1;
+            assert!((steps - steps.round()).abs() < 1e-6, "{p} not on 0.1 grid");
+        }
+    }
+
+    #[test]
+    fn tick_rounding_below_min_r_is_rejected() {
+        // A geometry that clears 1R raw but drops below it once snapped to a
+        // coarse (1.0) grid must be rejected, not placed sub-1R. Entry 100.4,
+        // SL 100.0 (0.4 risk), TP 100.85 (0.45 reward, R=1.125 raw). On a 1.0
+        // grid: entry→100.0 collides with SL after away-rounding — the in-range
+        // or R check refuses it rather than shipping a degenerate trade.
+        let mut intent = long_market_intent();
+        intent.direction = Some(Direction::Long);
+        intent.stop_loss = Some(PriceRef::Absolute { absolute: 100.0 });
+        intent.take_profit = Some(TakeProfit::Anchored(PriceRef::Absolute {
+            absolute: 100.85,
+        }));
+        let mut s = shell();
+        s.close = 100.4;
+        // Raw (no rounding) this resolves fine…
+        assert!(Resolved::from_intent(&intent, &s, 0.01, 0.0).is_ok());
+        // …but snapped to a 1.0 grid the geometry collapses and is refused.
+        assert!(matches!(
+            Resolved::from_intent(&intent, &s, 0.01, 1.0),
+            Err(ResolveError::EntryOutsideRange { .. } | ResolveError::BelowMinR { .. })
+        ));
     }
 
     #[test]
@@ -1321,7 +1411,7 @@ mod tests {
         }));
         let mut s = shell();
         s.close = 1.87000; // gapped past TP
-        match Resolved::from_intent(&intent, &s, 0.0001) {
+        match Resolved::from_intent(&intent, &s, 0.0001, 0.0) {
             Err(ResolveError::EntryOutsideRange { entry, .. }) => {
                 assert!((entry - 1.87000).abs() < 1e-9);
             }
@@ -1339,7 +1429,7 @@ mod tests {
         let mut s = shell();
         s.close = 1.86000; // gapped below SL
         assert!(matches!(
-            Resolved::from_intent(&intent, &s, 0.0001),
+            Resolved::from_intent(&intent, &s, 0.0001, 0.0),
             Err(ResolveError::EntryOutsideRange { .. })
         ));
     }
@@ -1355,7 +1445,7 @@ mod tests {
         let mut s = shell();
         s.close = 1.86100; // below the TP — invalid for short
         assert!(matches!(
-            Resolved::from_intent(&intent, &s, 0.0001),
+            Resolved::from_intent(&intent, &s, 0.0001, 0.0),
             Err(ResolveError::EntryOutsideRange { .. })
         ));
     }
@@ -1374,7 +1464,7 @@ mod tests {
         // Amount rather than failing or doubling up.
         let mut intent = long_market_intent();
         intent.risk_amount = Some(Tunable::Static(1.0));
-        let r = Resolved::from_intent(&intent, &shell(), 0.0001).unwrap();
+        let r = Resolved::from_intent(&intent, &shell(), 0.0001, 0.0).unwrap();
         match r.risk {
             RiskBudget::Amount(a) => assert!((a - 1.0).abs() < 1e-9),
             other => panic!("expected Amount, got {other:?}"),
@@ -1386,7 +1476,7 @@ mod tests {
         let mut intent = long_market_intent();
         intent.risk_amount = Some(Tunable::Static(0.0));
         assert!(matches!(
-            Resolved::from_intent(&intent, &shell(), 0.0001),
+            Resolved::from_intent(&intent, &shell(), 0.0001, 0.0),
             Err(ResolveError::InvalidRiskAmount { .. })
         ));
     }
@@ -1396,7 +1486,7 @@ mod tests {
         let mut intent = long_market_intent();
         intent.risk_amount = Some(Tunable::Static(-1.0));
         assert!(matches!(
-            Resolved::from_intent(&intent, &shell(), 0.0001),
+            Resolved::from_intent(&intent, &shell(), 0.0001, 0.0),
             Err(ResolveError::InvalidRiskAmount { .. })
         ));
     }
@@ -1406,7 +1496,7 @@ mod tests {
         let mut intent = long_market_intent();
         intent.risk_amount = Some(Tunable::Static(f64::NAN));
         assert!(matches!(
-            Resolved::from_intent(&intent, &shell(), 0.0001),
+            Resolved::from_intent(&intent, &shell(), 0.0001, 0.0),
             Err(ResolveError::InvalidRiskAmount { .. })
         ));
     }
@@ -1415,7 +1505,7 @@ mod tests {
     fn size_units_resolves_to_units_budget() {
         let mut intent = long_market_intent();
         intent.size_units = Some(Tunable::Static(0.01));
-        let r = Resolved::from_intent(&intent, &shell(), 0.0001).unwrap();
+        let r = Resolved::from_intent(&intent, &shell(), 0.0001, 0.0).unwrap();
         match r.risk {
             RiskBudget::Units(u) => assert!((u - 0.01).abs() < 1e-9),
             other => panic!("expected Units, got {other:?}"),
@@ -1429,7 +1519,7 @@ mod tests {
         // mutually exclusive post-flatten.
         let mut intent = long_market_intent();
         intent.size_units = Some(Tunable::Static(0.01));
-        let r = Resolved::from_intent(&intent, &shell(), 0.0001).unwrap();
+        let r = Resolved::from_intent(&intent, &shell(), 0.0001, 0.0).unwrap();
         match r.risk {
             RiskBudget::Units(u) => assert!((u - 0.01).abs() < 1e-9),
             other => panic!("expected Units, got {other:?}"),
@@ -1445,7 +1535,7 @@ mod tests {
         intent.risk_amount = Some(Tunable::Static(1.0));
         intent.size_units = Some(Tunable::Static(0.01));
         assert!(matches!(
-            Resolved::from_intent(&intent, &shell(), 0.0001),
+            Resolved::from_intent(&intent, &shell(), 0.0001, 0.0),
             Err(ResolveError::BothRiskModesSet)
         ));
     }
@@ -1455,7 +1545,7 @@ mod tests {
         let mut intent = long_market_intent();
         intent.size_units = Some(Tunable::Static(0.0));
         assert!(matches!(
-            Resolved::from_intent(&intent, &shell(), 0.0001),
+            Resolved::from_intent(&intent, &shell(), 0.0001, 0.0),
             Err(ResolveError::InvalidSizeUnits { .. })
         ));
     }
@@ -1465,7 +1555,7 @@ mod tests {
         let mut intent = long_market_intent();
         intent.size_units = Some(Tunable::Static(-0.01));
         assert!(matches!(
-            Resolved::from_intent(&intent, &shell(), 0.0001),
+            Resolved::from_intent(&intent, &shell(), 0.0001, 0.0),
             Err(ResolveError::InvalidSizeUnits { .. })
         ));
     }
@@ -1475,14 +1565,14 @@ mod tests {
         let mut intent = long_market_intent();
         intent.size_units = Some(Tunable::Static(f64::NAN));
         assert!(matches!(
-            Resolved::from_intent(&intent, &shell(), 0.0001),
+            Resolved::from_intent(&intent, &shell(), 0.0001, 0.0),
             Err(ResolveError::InvalidSizeUnits { .. })
         ));
     }
 
     #[test]
     fn dry_run_defaults_false() {
-        let r = Resolved::from_intent(&long_market_intent(), &shell(), 0.0001).unwrap();
+        let r = Resolved::from_intent(&long_market_intent(), &shell(), 0.0001, 0.0).unwrap();
         assert!(!r.dry_run);
     }
 
@@ -1490,14 +1580,14 @@ mod tests {
     fn dry_run_propagates_to_resolved() {
         let mut intent = long_market_intent();
         intent.dry_run = Some(true);
-        let r = Resolved::from_intent(&intent, &shell(), 0.0001).unwrap();
+        let r = Resolved::from_intent(&intent, &shell(), 0.0001, 0.0).unwrap();
         assert!(r.dry_run);
     }
 
     #[test]
     fn default_min_r_passes_when_r_above_one() {
         // R = 2.0 trade (R-multiple TP at 2.0), no min_r override → passes.
-        let r = Resolved::from_intent(&long_market_intent(), &shell(), 0.0001).unwrap();
+        let r = Resolved::from_intent(&long_market_intent(), &shell(), 0.0001, 0.0).unwrap();
         // entry=1.10, SL=1.0978, TP=1.1044 → R = 22/22 = 2.0
         let actual = (r.take_profit - 1.10) / (1.10 - r.stop_loss);
         assert!((actual - 2.0).abs() < 1e-9);
@@ -1512,7 +1602,7 @@ mod tests {
             offset_pips: 1.0,
             offset_atr_pct: None,
         }));
-        match Resolved::from_intent(&intent, &shell(), 0.0001) {
+        match Resolved::from_intent(&intent, &shell(), 0.0001, 0.0) {
             Err(ResolveError::BelowMinR { actual, min }) => {
                 assert!((min - 1.0).abs() < 1e-9);
                 assert!(actual < 1.0, "actual R was {actual}");
@@ -1527,7 +1617,7 @@ mod tests {
         let mut intent = long_market_intent();
         intent.min_r = Some(Tunable::Static(3.0));
         assert!(matches!(
-            Resolved::from_intent(&intent, &shell(), 0.0001),
+            Resolved::from_intent(&intent, &shell(), 0.0001, 0.0),
             Err(ResolveError::BelowMinR { .. })
         ));
     }
@@ -1536,7 +1626,7 @@ mod tests {
     fn min_r_override_above_floor_passes_when_met() {
         let mut intent = long_market_intent();
         intent.min_r = Some(Tunable::Static(2.0)); // exactly meets the actual R
-        assert!(Resolved::from_intent(&intent, &shell(), 0.0001).is_ok());
+        assert!(Resolved::from_intent(&intent, &shell(), 0.0001, 0.0).is_ok());
     }
 
     #[test]
@@ -1544,7 +1634,7 @@ mod tests {
         // Defense in depth: even if encoder somehow allowed it.
         let mut intent = long_market_intent();
         intent.min_r = Some(Tunable::Static(0.5));
-        match Resolved::from_intent(&intent, &shell(), 0.0001) {
+        match Resolved::from_intent(&intent, &shell(), 0.0001, 0.0) {
             Err(ResolveError::MinRBelowFloor { requested }) => {
                 assert!((requested - 0.5).abs() < 1e-9);
             }
@@ -1557,7 +1647,7 @@ mod tests {
         let mut intent = long_market_intent();
         intent.min_r = Some(Tunable::Static(0.0));
         assert!(matches!(
-            Resolved::from_intent(&intent, &shell(), 0.0001),
+            Resolved::from_intent(&intent, &shell(), 0.0001, 0.0),
             Err(ResolveError::MinRBelowFloor { .. })
         ));
     }
@@ -1567,7 +1657,7 @@ mod tests {
         let mut intent = long_market_intent();
         intent.min_r = Some(Tunable::Static(-1.0));
         assert!(matches!(
-            Resolved::from_intent(&intent, &shell(), 0.0001),
+            Resolved::from_intent(&intent, &shell(), 0.0001, 0.0),
             Err(ResolveError::MinRBelowFloor { .. })
         ));
     }
@@ -1588,7 +1678,7 @@ mod tests {
             offset_atr_pct: None,
         }));
         assert!(matches!(
-            Resolved::from_intent(&intent, &shell(), 0.0001),
+            Resolved::from_intent(&intent, &shell(), 0.0001, 0.0),
             Err(ResolveError::BelowMinR { .. })
         ));
     }
@@ -1598,7 +1688,7 @@ mod tests {
         let mut intent = long_market_intent();
         intent.action = Action::Close;
         assert!(matches!(
-            Resolved::from_intent(&intent, &shell(), 0.0001),
+            Resolved::from_intent(&intent, &shell(), 0.0001, 0.0),
             Err(ResolveError::NotAnEntry)
         ));
     }
@@ -1610,7 +1700,7 @@ mod tests {
         // Sanity: the existing tests already cover this via
         // long_market_intent(), but pin it explicitly.
         let intent = long_market_intent();
-        let r = Resolved::from_intent(&intent, &shell(), 0.0001).unwrap();
+        let r = Resolved::from_intent(&intent, &shell(), 0.0001, 0.0).unwrap();
         match r.risk {
             RiskBudget::Percent(p) => assert!((p - 0.5).abs() < 1e-9),
             other => panic!("expected Percent(0.5), got {other:?}"),
@@ -1622,7 +1712,7 @@ mod tests {
         // R = 2.0 on the fixture; script picks 1.0% if R >= 2 else 0.5%.
         let mut intent = long_market_intent();
         intent.risk_pct = Tunable::from_script("if r_multiple >= 2.0 { 1.0 } else { 0.5 }");
-        let r = Resolved::from_intent(&intent, &shell(), 0.0001).unwrap();
+        let r = Resolved::from_intent(&intent, &shell(), 0.0001, 0.0).unwrap();
         match r.risk {
             RiskBudget::Percent(p) => assert!((p - 1.0).abs() < 1e-9),
             other => panic!("expected Percent(1.0), got {other:?}"),
@@ -1637,7 +1727,7 @@ mod tests {
         intent.risk_pct = Tunable::from_script("if golden == true { 1.0 } else { 0.25 }");
         let mut s = shell();
         s.golden = Some(true);
-        let r = Resolved::from_intent(&intent, &s, 0.0001).unwrap();
+        let r = Resolved::from_intent(&intent, &s, 0.0001, 0.0).unwrap();
         assert!(matches!(r.risk, RiskBudget::Percent(p) if (p - 1.0).abs() < 1e-9));
     }
 
@@ -1645,7 +1735,7 @@ mod tests {
     fn risk_pct_script_returning_zero_rejected() {
         let mut intent = long_market_intent();
         intent.risk_pct = Tunable::from_script("0.0");
-        match Resolved::from_intent(&intent, &shell(), 0.0001) {
+        match Resolved::from_intent(&intent, &shell(), 0.0001, 0.0) {
             Err(ResolveError::InvalidTunableValue { field, value }) => {
                 assert_eq!(field, "risk_pct");
                 assert_eq!(value, 0.0);
@@ -1659,7 +1749,7 @@ mod tests {
         let mut intent = long_market_intent();
         intent.risk_pct = Tunable::from_script("-0.5");
         assert!(matches!(
-            Resolved::from_intent(&intent, &shell(), 0.0001),
+            Resolved::from_intent(&intent, &shell(), 0.0001, 0.0),
             Err(ResolveError::InvalidTunableValue {
                 field: "risk_pct",
                 ..
@@ -1671,7 +1761,7 @@ mod tests {
     fn risk_pct_script_parse_error_surfaces() {
         let mut intent = long_market_intent();
         intent.risk_pct = Tunable::from_script("if if if");
-        match Resolved::from_intent(&intent, &shell(), 0.0001) {
+        match Resolved::from_intent(&intent, &shell(), 0.0001, 0.0) {
             Err(ResolveError::ScriptFailed { field, kind, .. }) => {
                 assert_eq!(field, "risk_pct");
                 assert_eq!(kind, "parse");
@@ -1685,7 +1775,7 @@ mod tests {
         // Script returns bool, not f64.
         let mut intent = long_market_intent();
         intent.risk_pct = Tunable::from_script("true");
-        match Resolved::from_intent(&intent, &shell(), 0.0001) {
+        match Resolved::from_intent(&intent, &shell(), 0.0001, 0.0) {
             Err(ResolveError::ScriptFailed { field, kind, .. }) => {
                 assert_eq!(field, "risk_pct");
                 assert_eq!(kind, "wrong-type");
@@ -1767,7 +1857,7 @@ risk_pct: !script "if r_multiple >= 2.0 { 1.0 } else { 0.5 }"
         // the Tunable promotion.
         let mut intent = long_market_intent();
         intent.risk_amount = Some(Tunable::Static(2.5));
-        let r = Resolved::from_intent(&intent, &shell(), 0.0001).unwrap();
+        let r = Resolved::from_intent(&intent, &shell(), 0.0001, 0.0).unwrap();
         match r.risk {
             RiskBudget::Amount(a) => assert!((a - 2.5).abs() < 1e-9),
             other => panic!("expected Amount(2.5), got {other:?}"),
@@ -1782,7 +1872,7 @@ risk_pct: !script "if r_multiple >= 2.0 { 1.0 } else { 0.5 }"
         intent.risk_amount = Some(Tunable::from_script(
             "if r_multiple >= 2.0 { 2.0 } else { 1.0 }",
         ));
-        let r = Resolved::from_intent(&intent, &shell(), 0.0001).unwrap();
+        let r = Resolved::from_intent(&intent, &shell(), 0.0001, 0.0).unwrap();
         match r.risk {
             RiskBudget::Amount(a) => assert!((a - 2.0).abs() < 1e-9),
             other => panic!("expected Amount(2.0), got {other:?}"),
@@ -1798,7 +1888,7 @@ risk_pct: !script "if r_multiple >= 2.0 { 1.0 } else { 0.5 }"
         ));
         let mut s = shell();
         s.golden = Some(true);
-        let r = Resolved::from_intent(&intent, &s, 0.0001).unwrap();
+        let r = Resolved::from_intent(&intent, &s, 0.0001, 0.0).unwrap();
         assert!(matches!(r.risk, RiskBudget::Amount(a) if (a - 5.0).abs() < 1e-9));
     }
 
@@ -1806,7 +1896,7 @@ risk_pct: !script "if r_multiple >= 2.0 { 1.0 } else { 0.5 }"
     fn risk_amount_script_returning_zero_rejected() {
         let mut intent = long_market_intent();
         intent.risk_amount = Some(Tunable::from_script("0.0"));
-        match Resolved::from_intent(&intent, &shell(), 0.0001) {
+        match Resolved::from_intent(&intent, &shell(), 0.0001, 0.0) {
             Err(ResolveError::InvalidRiskAmount { value }) => assert_eq!(value, 0.0),
             other => panic!("expected InvalidRiskAmount, got {other:?}"),
         }
@@ -1817,7 +1907,7 @@ risk_pct: !script "if r_multiple >= 2.0 { 1.0 } else { 0.5 }"
         let mut intent = long_market_intent();
         intent.risk_amount = Some(Tunable::from_script("-1.0"));
         assert!(matches!(
-            Resolved::from_intent(&intent, &shell(), 0.0001),
+            Resolved::from_intent(&intent, &shell(), 0.0001, 0.0),
             Err(ResolveError::InvalidRiskAmount { .. })
         ));
     }
@@ -1826,7 +1916,7 @@ risk_pct: !script "if r_multiple >= 2.0 { 1.0 } else { 0.5 }"
     fn risk_amount_script_parse_error_surfaces() {
         let mut intent = long_market_intent();
         intent.risk_amount = Some(Tunable::from_script("if if if"));
-        match Resolved::from_intent(&intent, &shell(), 0.0001) {
+        match Resolved::from_intent(&intent, &shell(), 0.0001, 0.0) {
             Err(ResolveError::ScriptFailed { field, kind, .. }) => {
                 assert_eq!(field, "risk_amount");
                 assert_eq!(kind, "parse");
@@ -1839,7 +1929,7 @@ risk_pct: !script "if r_multiple >= 2.0 { 1.0 } else { 0.5 }"
     fn risk_amount_script_wrong_return_type_surfaces() {
         let mut intent = long_market_intent();
         intent.risk_amount = Some(Tunable::from_script("true"));
-        match Resolved::from_intent(&intent, &shell(), 0.0001) {
+        match Resolved::from_intent(&intent, &shell(), 0.0001, 0.0) {
             Err(ResolveError::ScriptFailed { field, kind, .. }) => {
                 assert_eq!(field, "risk_amount");
                 assert_eq!(kind, "wrong-type");
@@ -1892,7 +1982,7 @@ risk_amount: !script "if r_multiple >= 2.0 { 2.0 } else { 1.0 }"
     fn size_units_static_path_unchanged() {
         let mut intent = long_market_intent();
         intent.size_units = Some(Tunable::Static(0.05));
-        let r = Resolved::from_intent(&intent, &shell(), 0.0001).unwrap();
+        let r = Resolved::from_intent(&intent, &shell(), 0.0001, 0.0).unwrap();
         match r.risk {
             RiskBudget::Units(u) => assert!((u - 0.05).abs() < 1e-9),
             other => panic!("expected Units(0.05), got {other:?}"),
@@ -1906,7 +1996,7 @@ risk_amount: !script "if r_multiple >= 2.0 { 2.0 } else { 1.0 }"
         intent.size_units = Some(Tunable::from_script(
             "if r_multiple >= 2.0 { 0.02 } else { 0.01 }",
         ));
-        let r = Resolved::from_intent(&intent, &shell(), 0.0001).unwrap();
+        let r = Resolved::from_intent(&intent, &shell(), 0.0001, 0.0).unwrap();
         match r.risk {
             RiskBudget::Units(u) => assert!((u - 0.02).abs() < 1e-9),
             other => panic!("expected Units(0.02), got {other:?}"),
@@ -1921,7 +2011,7 @@ risk_amount: !script "if r_multiple >= 2.0 { 2.0 } else { 1.0 }"
         ));
         let mut s = shell();
         s.golden = Some(true);
-        let r = Resolved::from_intent(&intent, &s, 0.0001).unwrap();
+        let r = Resolved::from_intent(&intent, &s, 0.0001, 0.0).unwrap();
         assert!(matches!(r.risk, RiskBudget::Units(u) if (u - 0.05).abs() < 1e-9));
     }
 
@@ -1929,7 +2019,7 @@ risk_amount: !script "if r_multiple >= 2.0 { 2.0 } else { 1.0 }"
     fn size_units_script_returning_zero_rejected() {
         let mut intent = long_market_intent();
         intent.size_units = Some(Tunable::from_script("0.0"));
-        match Resolved::from_intent(&intent, &shell(), 0.0001) {
+        match Resolved::from_intent(&intent, &shell(), 0.0001, 0.0) {
             Err(ResolveError::InvalidSizeUnits { value }) => assert_eq!(value, 0.0),
             other => panic!("expected InvalidSizeUnits, got {other:?}"),
         }
@@ -1940,7 +2030,7 @@ risk_amount: !script "if r_multiple >= 2.0 { 2.0 } else { 1.0 }"
         let mut intent = long_market_intent();
         intent.size_units = Some(Tunable::from_script("-0.01"));
         assert!(matches!(
-            Resolved::from_intent(&intent, &shell(), 0.0001),
+            Resolved::from_intent(&intent, &shell(), 0.0001, 0.0),
             Err(ResolveError::InvalidSizeUnits { .. })
         ));
     }
@@ -1949,7 +2039,7 @@ risk_amount: !script "if r_multiple >= 2.0 { 2.0 } else { 1.0 }"
     fn size_units_script_parse_error_surfaces() {
         let mut intent = long_market_intent();
         intent.size_units = Some(Tunable::from_script("if if if"));
-        match Resolved::from_intent(&intent, &shell(), 0.0001) {
+        match Resolved::from_intent(&intent, &shell(), 0.0001, 0.0) {
             Err(ResolveError::ScriptFailed { field, kind, .. }) => {
                 assert_eq!(field, "size_units");
                 assert_eq!(kind, "parse");
@@ -1962,7 +2052,7 @@ risk_amount: !script "if r_multiple >= 2.0 { 2.0 } else { 1.0 }"
     fn size_units_script_wrong_return_type_surfaces() {
         let mut intent = long_market_intent();
         intent.size_units = Some(Tunable::from_script("true"));
-        match Resolved::from_intent(&intent, &shell(), 0.0001) {
+        match Resolved::from_intent(&intent, &shell(), 0.0001, 0.0) {
             Err(ResolveError::ScriptFailed { field, kind, .. }) => {
                 assert_eq!(field, "size_units");
                 assert_eq!(kind, "wrong-type");
@@ -2014,7 +2104,7 @@ size_units: !script "if r_multiple >= 2.0 { 0.02 } else { 0.01 }"
         let mut intent = long_market_intent();
         intent.min_r = Some(Tunable::Static(1.5));
         // Fixture R = 2.0, override demands 1.5 → passes.
-        assert!(Resolved::from_intent(&intent, &shell(), 0.0001).is_ok());
+        assert!(Resolved::from_intent(&intent, &shell(), 0.0001, 0.0).is_ok());
     }
 
     #[test]
@@ -2024,7 +2114,7 @@ size_units: !script "if r_multiple >= 2.0 { 0.02 } else { 0.01 }"
         intent.min_r = Some(Tunable::from_script(
             "if direction == \"long\" { 1.5 } else { 1.0 }",
         ));
-        assert!(Resolved::from_intent(&intent, &shell(), 0.0001).is_ok());
+        assert!(Resolved::from_intent(&intent, &shell(), 0.0001, 0.0).is_ok());
     }
 
     #[test]
@@ -2032,7 +2122,7 @@ size_units: !script "if r_multiple >= 2.0 { 0.02 } else { 0.01 }"
         // Script returns 0.5, below floor → MinRBelowFloor.
         let mut intent = long_market_intent();
         intent.min_r = Some(Tunable::from_script("0.5"));
-        match Resolved::from_intent(&intent, &shell(), 0.0001) {
+        match Resolved::from_intent(&intent, &shell(), 0.0001, 0.0) {
             Err(ResolveError::MinRBelowFloor { requested }) => {
                 assert!((requested - 0.5).abs() < 1e-9);
             }
@@ -2046,7 +2136,7 @@ size_units: !script "if r_multiple >= 2.0 { 0.02 } else { 0.01 }"
         let mut intent = long_market_intent();
         intent.min_r = Some(Tunable::from_script("0.0 / 0.0"));
         assert!(matches!(
-            Resolved::from_intent(&intent, &shell(), 0.0001),
+            Resolved::from_intent(&intent, &shell(), 0.0001, 0.0),
             Err(ResolveError::MinRBelowFloor { .. })
         ));
     }
@@ -2055,7 +2145,7 @@ size_units: !script "if r_multiple >= 2.0 { 0.02 } else { 0.01 }"
     fn min_r_script_parse_error_surfaces() {
         let mut intent = long_market_intent();
         intent.min_r = Some(Tunable::from_script("if if if"));
-        match Resolved::from_intent(&intent, &shell(), 0.0001) {
+        match Resolved::from_intent(&intent, &shell(), 0.0001, 0.0) {
             Err(ResolveError::ScriptFailed { field, kind, .. }) => {
                 assert_eq!(field, "min_r");
                 assert_eq!(kind, "parse");
@@ -2068,7 +2158,7 @@ size_units: !script "if r_multiple >= 2.0 { 0.02 } else { 0.01 }"
     fn min_r_script_wrong_return_type_surfaces() {
         let mut intent = long_market_intent();
         intent.min_r = Some(Tunable::from_script("true"));
-        match Resolved::from_intent(&intent, &shell(), 0.0001) {
+        match Resolved::from_intent(&intent, &shell(), 0.0001, 0.0) {
             Err(ResolveError::ScriptFailed { field, kind, .. }) => {
                 assert_eq!(field, "min_r");
                 assert_eq!(kind, "wrong-type");
@@ -2159,8 +2249,13 @@ min_r: !script "if direction == \"long\" { 1.5 } else { 1.0 }"
         // atr = 0.0040, pct = 0.5 → buffer = 0.5/100 * 0.0040 = 0.00002.
         // Entry anchor signal_low (1.0900) pushes DOWN: 1.0900 - 0.00002.
         // SL anchor signal_high (1.1000) pushes UP:   1.1000 + 0.00002.
-        let r = Resolved::from_intent(&atr_short_intent(0.5), &atr_short_shell(0.0040), 0.0001)
-            .unwrap();
+        let r = Resolved::from_intent(
+            &atr_short_intent(0.5),
+            &atr_short_shell(0.0040),
+            0.0001,
+            0.0,
+        )
+        .unwrap();
         let buffer = 0.5 / 100.0 * 0.0040;
         match r.entry {
             ResolvedEntry::Stop { trigger_price } => {
@@ -2182,10 +2277,20 @@ min_r: !script "if direction == \"long\" { 1.5 } else { 1.0 }"
     fn atr_pct_scales_with_volatility() {
         // Same pct, different ATR → proportionally wider buffer. A 4x ATR
         // gives a 4x buffer (the whole point of the feature).
-        let tight = Resolved::from_intent(&atr_short_intent(0.5), &atr_short_shell(0.0010), 0.0001)
-            .unwrap();
-        let wide = Resolved::from_intent(&atr_short_intent(0.5), &atr_short_shell(0.0040), 0.0001)
-            .unwrap();
+        let tight = Resolved::from_intent(
+            &atr_short_intent(0.5),
+            &atr_short_shell(0.0010),
+            0.0001,
+            0.0,
+        )
+        .unwrap();
+        let wide = Resolved::from_intent(
+            &atr_short_intent(0.5),
+            &atr_short_shell(0.0040),
+            0.0001,
+            0.0,
+        )
+        .unwrap();
         let tight_dist = (1.0900 - tight.entry.reference_price()).abs();
         let wide_dist = (1.0900 - wide.entry.reference_price()).abs();
         assert!(
@@ -2199,7 +2304,7 @@ min_r: !script "if direction == \"long\" { 1.5 } else { 1.0 }"
         // Warmup / short-feed: shell carries no ATR. Fail-closed.
         let mut s = atr_short_shell(0.0040);
         s.atr = None;
-        let r = Resolved::from_intent(&atr_short_intent(0.5), &s, 0.0001);
+        let r = Resolved::from_intent(&atr_short_intent(0.5), &s, 0.0001, 0.0);
         assert!(
             matches!(r, Err(ResolveError::Offset(OffsetError::AtrUnavailable))),
             "got {r:?}"
@@ -2215,7 +2320,7 @@ min_r: !script "if direction == \"long\" { 1.5 } else { 1.0 }"
             offset_pips: 1.0,
             offset_atr_pct: Some(0.5),
         });
-        let r = Resolved::from_intent(&intent, &atr_short_shell(0.0040), 0.0001);
+        let r = Resolved::from_intent(&intent, &atr_short_shell(0.0040), 0.0001, 0.0);
         assert!(
             matches!(r, Err(ResolveError::Offset(OffsetError::BothOffsetsSet))),
             "got {r:?}"
@@ -2230,7 +2335,7 @@ min_r: !script "if direction == \"long\" { 1.5 } else { 1.0 }"
             offset_pips: 0.0,
             offset_atr_pct: Some(0.5),
         });
-        let r = Resolved::from_intent(&intent, &atr_short_shell(0.0040), 0.0001);
+        let r = Resolved::from_intent(&intent, &atr_short_shell(0.0040), 0.0001, 0.0);
         assert!(
             matches!(
                 r,
@@ -2242,7 +2347,12 @@ min_r: !script "if direction == \"long\" { 1.5 } else { 1.0 }"
 
     #[test]
     fn negative_atr_pct_rejects() {
-        let r = Resolved::from_intent(&atr_short_intent(-0.5), &atr_short_shell(0.0040), 0.0001);
+        let r = Resolved::from_intent(
+            &atr_short_intent(-0.5),
+            &atr_short_shell(0.0040),
+            0.0001,
+            0.0,
+        );
         assert!(
             matches!(r, Err(ResolveError::Offset(OffsetError::NegativeAtrPct(_)))),
             "got {r:?}"
@@ -2261,7 +2371,7 @@ min_r: !script "if direction == \"long\" { 1.5 } else { 1.0 }"
         });
         let mut s = shell();
         s.atr = Some(0.0040); // present but must be ignored on the pips path
-        let r = Resolved::from_intent(&intent, &s, 0.0001).unwrap();
+        let r = Resolved::from_intent(&intent, &s, 0.0001, 0.0).unwrap();
         // 1.0980 - 2*0.0001 = 1.0978, unchanged.
         assert!((r.stop_loss - 1.0978).abs() < 1e-9, "{}", r.stop_loss);
     }

@@ -131,6 +131,16 @@ pub enum SimOutcome {
 ///
 /// When the data source only serves mid (bid == ask == mid per bar), this
 /// degrades cleanly to exact-level mid fills.
+///
+/// The tick size the replay rounds order prices to, mirroring the worker's
+/// fallback chain (`dispatch::enter`): the baked `Intent::tick_size` when
+/// present, else `pip_size` (a safe coarser grid). Keeping this identical to the
+/// worker is what preserves replay↔worker parity — both resolve through
+/// `Resolved::from_intent`, which snaps the prices before its checks.
+fn replay_tick(intent: &Intent, pip_size: f64) -> f64 {
+    intent.tick_size.unwrap_or(pip_size)
+}
+
 pub fn simulate_fill(
     intent: &Intent,
     shell: &Shell,
@@ -158,10 +168,11 @@ pub fn simulate_fill_windowed(
     // `mut` so the SL-spread-floor widen mirror below can move `stop_loss` in
     // place — exactly as the worker's `run_enter` does — before the fill / exit
     // simulation reads it.
-    let mut resolved = match Resolved::from_intent(intent, shell, pip_size) {
-        Ok(r) => r,
-        Err(err) => return SimOutcome::Unresolved(err.to_string()),
-    };
+    let mut resolved =
+        match Resolved::from_intent(intent, shell, pip_size, replay_tick(intent, pip_size)) {
+            Ok(r) => r,
+            Err(err) => return SimOutcome::Unresolved(err.to_string()),
+        };
     let dir = resolved.direction;
 
     // At-entry level veto (Bug #12) — the worker's `run_enter` rejects an
@@ -443,7 +454,8 @@ pub fn breakeven_armed_at(
     candles: &[BidAskCandle],
 ) -> Option<chrono::DateTime<chrono::Utc>> {
     let be = intent.breakeven?;
-    let resolved = Resolved::from_intent(intent, shell, pip_size).ok()?;
+    let resolved =
+        Resolved::from_intent(intent, shell, pip_size, replay_tick(intent, pip_size)).ok()?;
     let dir = resolved.direction;
     let fill = find_fill(&resolved, intent, shell, dir, candles)?;
 
@@ -508,7 +520,8 @@ pub fn sweep_reason(
     candles: &[BidAskCandle],
     blackout_windows: &[trade_control_core::intent::NoEntryWindow],
 ) -> Option<(SweepReason, chrono::DateTime<chrono::Utc>)> {
-    let resolved = Resolved::from_intent(intent, shell, pip_size).ok()?;
+    let resolved =
+        Resolved::from_intent(intent, shell, pip_size, replay_tick(intent, pip_size)).ok()?;
 
     // A Market entry fills at once (it never rests), so a `NeverFilled` Market is
     // not a swept order — there's nothing for the sweep to cancel.
@@ -708,7 +721,8 @@ pub fn widened_stop_at(
     if !pip_size.is_finite() || pip_size <= 0.0 {
         return None;
     }
-    let mut resolved = Resolved::from_intent(intent, shell, pip_size).ok()?;
+    let mut resolved =
+        Resolved::from_intent(intent, shell, pip_size, replay_tick(intent, pip_size)).ok()?;
     // Floor the baseline to the placed stop (System 1) so System 2 widens from
     // and restores to the SAME level the order line shows — not the un-floored
     // signed SL. Uses the SAME trailing-window entry spread as the gate/sim
@@ -1014,7 +1028,7 @@ mod tests {
 
         // Fire-bar path (entry_spread_price = None) → floor off 0.0020 → widen to
         // 10× = 0.0200 above entry → SL 1.1200.
-        let mut r_fire = Resolved::from_intent(&intent, &shell, 0.0001).expect("resolves");
+        let mut r_fire = Resolved::from_intent(&intent, &shell, 0.0001, 0.0).expect("resolves");
         let out_fire = apply_entry_spread_floor(&mut r_fire, 0.0001, &fire, None);
         assert!(
             matches!(out_fire, EntryFloor::Applied { .. }),
@@ -1029,7 +1043,7 @@ mod tests {
         // Windowed path (entry_spread_price = Some(1 pip)) → floor off 0.0001 →
         // 10× = 0.0010 above entry → SL 1.1010, far tighter. The SAME fire slice,
         // only the supplied spread differs — proving the window wins.
-        let mut r_win = Resolved::from_intent(&intent, &shell, 0.0001).expect("resolves");
+        let mut r_win = Resolved::from_intent(&intent, &shell, 0.0001, 0.0).expect("resolves");
         let out_win = apply_entry_spread_floor(&mut r_win, 0.0001, &fire, Some(0.0001));
         assert!(matches!(out_win, EntryFloor::Applied { .. }), "{out_win:?}");
         assert!(
@@ -1084,6 +1098,7 @@ mod tests {
             reason: None,
             mw: None,
             pip_size: None,
+            tick_size: None,
             spread_window: None,
             trade_plan: None,
             blackout_close: trade_control_core::intent::BlackoutCloseAction::default(),
@@ -2091,6 +2106,11 @@ mod tests {
         intent.take_profit = Some(TakeProfit::Anchored(PriceRef::Absolute {
             absolute: 1.0950,
         }));
+        // Real EUR_USD tick (0.00001, one finer than the 0.0001 pip) so the
+        // sub-pip ATR-buffered trigger stays on-grid and isn't snapped away by
+        // the resolver's rounding — mirrors the baked `Intent::tick_size` a real
+        // armed EUR_USD trade carries.
+        intent.tick_size = Some(0.00001);
 
         // Shell carries the latched pattern low + ATR; close sits between the
         // trigger and SL so the short stop is correct-side (trigger < close).
