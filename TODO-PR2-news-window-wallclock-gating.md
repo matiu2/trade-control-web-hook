@@ -68,16 +68,23 @@ Shared pure boundary logic lives in the engine so worker + replay can't diverge
       control tick processes no bar), so the real bar still ticks next.
 - [x] No detector-window fetch on the control path (controls are pure TimeReached).
 
-### 4. Replay: inject virtual boundary ticks  [ ]
-- [ ] `cli/src/bin/replay_candles/replay.rs`: between bar `i` and `i+1`, collect
-      unfired control epochs in `(close_i, close_{i+1})`, and for each (ascending)
-      set virtual clock + run control-only eval with the last-known candle.
-- [ ] Bar ticks unchanged; virtual ticks only add control fires at exact epochs.
-- [ ] Replay report/trace shows the window opening at the epoch, not the bar.
+### 4. Replay: inject virtual boundary ticks  [x]
+- [x] `cli/src/bin/replay_candles/replay.rs`: `inject_control_ticks(...)` runs
+      before each bar's `evaluate_plan`, replaying every unfired control epoch in
+      `(prev_close, this_close)` (strict, so a bar-close epoch isn't double-fired)
+      via `evaluate_controls_only` at the epoch — the SAME engine entry the worker
+      calls. Pins the virtual clock, applies pause/resume through the same
+      `pause_gate` helpers, records the fires. `control_epochs_between` selects them.
+- [x] Bar ticks unchanged; virtual ticks only add control fires at exact epochs.
 
-### 5. Parity test  [ ]
-- [ ] One scenario (mid-bar news window on H1) asserted to produce the SAME
-      open/close fire instants via the worker-path eval and the replay-path eval.
+### 5. Parity test  [x]
+- [x] `virtual_tick_opens_window_at_same_instant_as_worker_controls_only`: drives
+      both the worker path (`evaluate_controls_only`) and the replay path
+      (`control_epochs_between` + `inject_control_ticks`) at a 10.5h sub-bar epoch
+      and asserts they fire the SAME rule.
+- [x] `sub_bar_pause_epoch_opens_via_virtual_tick_and_suppresses_enter`: an
+      end-to-end `run(...)` where a sub-bar pause opens via the virtual tick and
+      suppresses a later enter. 75 replay tests pass; clippy/fmt clean.
 
 ### 6. Wrap up  [ ]
 - [ ] cargo test / clippy / fmt (engine, cli, worker, cron).
