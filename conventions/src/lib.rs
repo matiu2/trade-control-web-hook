@@ -24,6 +24,7 @@ mod broker;
 mod instrument;
 mod labels;
 mod pine;
+mod roles;
 
 pub use basenames::AlertBasename;
 pub use broker::Broker;
@@ -37,3 +38,4 @@ pub use pine::{
     ALERT_EVERY_BAR_CLOSE, ALERT_LONG_PATTERN, ALERT_SHORT_PATTERN, Direction, PINE_INDICATOR_NAME,
     entry_alert_for, mw_direction_from_label, reversal_close_alert_for,
 };
+pub use roles::RuleKind;

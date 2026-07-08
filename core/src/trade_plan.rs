@@ -40,6 +40,7 @@
 //! [`EveryBar`]: FireMode::EveryBar
 
 use serde::{Deserialize, Serialize};
+pub use trade_control_conventions::RuleKind;
 
 use crate::broker::Granularity;
 use crate::intent::{Direction, Intent};
@@ -172,6 +173,19 @@ pub struct ConditionRule {
     /// signed action the TV alert would have POSTed (an `enter`, a `veto`, a
     /// `prep`, a `close`, etc.).
     pub intent: Intent,
+    /// The rule's behaviour class in the engine spine, resolved once at arm time
+    /// from its basename (see [`RuleKind`]). The engine reads this instead of
+    /// re-deriving "what kind of guard is this?" from `rule_id`/`Action` in six
+    /// places (the seam behind the v73 pre-break-arming bug).
+    ///
+    /// `#[serde(default)]` → plans signed before this field deserialize as
+    /// [`RuleKind::Unspecified`] and round-trip byte-identically (the field is
+    /// nested inside the whole-`TradePlan` signed line, not a new top-level
+    /// signed key — same as `cross_buffer_pct` / `pip_size` / `tick_size`). The
+    /// engine treats `Unspecified` as "derive the old way" during the migration
+    /// window, so an absent kind never mis-classifies an in-flight plan.
+    #[serde(default)]
+    pub kind: RuleKind,
 }
 
 /// What fires a [`ConditionRule`]. Each variant maps 1:1 from a TradingView
@@ -473,6 +487,44 @@ bar: on_close
             back.replay_start,
             Some(1781208000),
             "must survive a round-trip"
+        );
+    }
+
+    /// A rule signed before `kind` existed (no `kind` key) deserializes as
+    /// `Unspecified` — never a real kind — so the engine falls back to legacy
+    /// derivation and an old plan's `too-high` isn't silently mis-classified.
+    #[test]
+    fn missing_rule_kind_defaults_to_unspecified() {
+        let json = r#"{"rule_id":"01-veto-too-high",
+            "trigger":{"type":"horizontal_cross","level":1.2,"dir":"up","bar":"on_close"},
+            "fire_mode":"once",
+            "intent":{"v":1,"action":"veto","instrument":"EUR_USD","id":"veto-1",
+                "not_after":"2026-05-13T20:00:00Z"}}"#;
+        let rule: ConditionRule = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            rule.kind,
+            RuleKind::Unspecified,
+            "absent kind must default to Unspecified, not a real class"
+        );
+    }
+
+    /// A stamped `kind` survives a JSON round-trip in its snake_case wire form.
+    #[test]
+    fn rule_kind_round_trips() {
+        let json = r#"{"rule_id":"01-veto-too-high",
+            "trigger":{"type":"horizontal_cross","level":1.2,"dir":"up","bar":"on_close"},
+            "fire_mode":"once",
+            "intent":{"v":1,"action":"veto","instrument":"EUR_USD","id":"veto-1",
+                "not_after":"2026-05-13T20:00:00Z"},
+            "kind":"setup_invalidation"}"#;
+        let rule: ConditionRule = serde_json::from_str(json).unwrap();
+        assert_eq!(rule.kind, RuleKind::SetupInvalidation);
+        let back: ConditionRule =
+            serde_json::from_str(&serde_json::to_string(&rule).unwrap()).unwrap();
+        assert_eq!(
+            back.kind,
+            RuleKind::SetupInvalidation,
+            "kind must survive a round-trip"
         );
     }
 }

@@ -1679,7 +1679,7 @@ mod tests {
 
     use trade_control_core::broker::Granularity;
     use trade_control_core::intent::{BrokerKind, Direction, Intent};
-    use trade_control_core::trade_plan::FireMode;
+    use trade_control_core::trade_plan::{FireMode, RuleKind};
     use trade_control_core::tunable::Tunable;
 
     fn ts(s: &str) -> DateTime<Utc> {
@@ -1768,6 +1768,7 @@ mod tests {
             trigger,
             fire_mode,
             intent: intent(action),
+            kind: RuleKind::Unspecified,
         }
     }
 
@@ -1806,6 +1807,7 @@ mod tests {
             trigger: Trigger::PinePattern { pattern, dir },
             fire_mode: FireMode::Once,
             intent,
+            kind: RuleKind::Unspecified,
         }
     }
 
@@ -2692,6 +2694,7 @@ mod tests {
             trigger: Trigger::MwEveryBar,
             fire_mode: FireMode::Once,
             intent,
+            kind: RuleKind::Unspecified,
         }
     }
 
@@ -4257,6 +4260,7 @@ mod tests {
             trigger: Trigger::PinePattern { pattern: None, dir },
             fire_mode: FireMode::Once,
             intent,
+            kind: RuleKind::Unspecified,
         }
     }
 
@@ -4273,6 +4277,7 @@ mod tests {
             trigger: Trigger::PinePattern { pattern: None, dir },
             fire_mode: FireMode::Once,
             intent,
+            kind: RuleKind::Unspecified,
         }
     }
 
@@ -4290,6 +4295,7 @@ mod tests {
             },
             fire_mode: FireMode::Once,
             intent,
+            kind: RuleKind::Unspecified,
         }
     }
 
