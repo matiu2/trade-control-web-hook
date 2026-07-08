@@ -89,6 +89,32 @@ pub fn run(args: Args) -> Result<i32> {
         "arming reversal setup"
     );
 
+    // Effective pip/tick: prefer the LIVE TradingView Symbol-info for the
+    // instrument we're arming (the same tick the chart shows), falling back
+    // to the instrument-lookup catalog. A tick mismatch is logged so a stale
+    // catalog surfaces at arm time without blocking the trade. The
+    // `--pip-size` / `--tick-size` flags still override both, downstream in
+    // the trade builders.
+    let effective = match mcp.get_symbol_info() {
+        Ok(tv_info) => crate::precision::resolve_effective_precision(resolved.asset, &tv_info),
+        Err(e) => {
+            // Reading symbol-info shouldn't ever block arming — fall back to
+            // the catalog and note why.
+            warn!(error = %e, "could not read live TV symbol-info; using catalog precision");
+            crate::precision::EffectivePrecision {
+                pip_size: resolved.asset.pip_size,
+                tick_size: resolved.asset.tick_size,
+                tick_from_tv: false,
+            }
+        }
+    };
+    info!(
+        pip_size = effective.pip_size,
+        tick_size = effective.tick_size,
+        tick_from_tv = effective.tick_from_tv,
+        "resolved effective precision"
+    );
+
     // 2. First-pass classify. If no blackout/news pairs are present
     //    and the operator didn't opt out, auto-draw from
     //    forex-factory calendar.
@@ -219,31 +245,31 @@ pub fn run(args: Args) -> Result<i32> {
     //    `?`-returning resolver hard-errors on a bad setup; a clean
     //    operator-facing rejection returns Ok(1).
     let resolved_spec = if roles.mw_path.is_some() {
-        // Pip size for the baked MwSpec comes from the canonical
-        // instrument-lookup catalog (`asset.pip_size`), overridable via
-        // --pip-size for the rare non-catalog case.
+        // Pip/tick for the baked MwSpec come from `effective` — live
+        // TradingView precision when available, else the instrument-lookup
+        // catalog. --pip-size / --tick-size override downstream.
         resolve_mw_trade(
             &args,
             &roles,
             &instrument,
             &account,
             broker,
-            resolved.asset.pip_size,
-            resolved.asset.tick_size,
+            effective.pip_size,
+            effective.tick_size,
         )
     } else {
-        // Bake the canonical instrument-lookup pip AND tick onto the H&S enter:
-        // pip scales offset_pips (JPY/indices), tick snaps every order price
-        // onto the broker's grid so it isn't rejected as over-precise.
-        // --pip-size overrides pip for the rare non-catalog case.
+        // Bake the effective pip AND tick onto the H&S enter: pip scales
+        // offset_pips (JPY/indices), tick snaps every order price onto the
+        // broker's grid so it isn't rejected as over-precise. `effective`
+        // prefers live TV; --pip-size / --tick-size override downstream.
         resolve_hs_trade(
             &args,
             &roles,
             &instrument,
             &account,
             broker,
-            resolved.asset.pip_size,
-            resolved.asset.tick_size,
+            effective.pip_size,
+            effective.tick_size,
         )
     };
     let (direction, trade_spec) = match resolved_spec {
