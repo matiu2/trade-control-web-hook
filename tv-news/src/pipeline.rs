@@ -227,8 +227,7 @@ fn confidence_str(c: Confidence) -> &'static str {
 
 /// Run the multi-week forex-factory fetch on a fresh tokio runtime.
 /// Keeps the rest of tv-news sync so the binary doesn't have to be
-/// `#[tokio::main]` — matches the same pattern `cli::run_calendar_bars`
-/// uses.
+/// `#[tokio::main]`.
 fn fetch_events(ctx: &ChartContext) -> Result<Vec<EconomicEvent>> {
     let runtime = tokio::runtime::Runtime::new()
         .map_err(|e| eyre!("starting tokio runtime for forex-factory fetch: {e}"))?;

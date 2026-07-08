@@ -301,11 +301,8 @@ pub fn run(args: Args) -> Result<i32> {
 
     // 8. Calendar control bars now come from the calendar directly, resolved in
     //    step 2 into `roles.blackout_pairs` / `news_pairs` and built into
-    //    `pause_bundles` / `news_bundles` above. The old supplemental
-    //    `discover_or_fetch_calendar_bundles` path (used only when the operator
-    //    drew their own pause/news lines) would now double-arm, so the
-    //    supplemental `built_calendar` is always empty.
-    let built_calendar: Vec<cli::BuiltCalendarBundle> = Vec::new();
+    //    `pause_bundles` / `news_bundles` above. The old drawn-line-era
+    //    supplemental `built_calendar` path was retired in PR1b.
 
     // 8b. (--register-plan) Fold the whole trade — main alert conditions PLUS
     //     the pause/news/calendar control bars built above — into ONE signed
@@ -333,7 +330,6 @@ pub fn run(args: Args) -> Result<i32> {
             &state.resolution,
             &pause_bundles,
             &news_bundles,
-            &built_calendar,
             &key,
             &account,
             now,
@@ -973,7 +969,8 @@ fn default_key_path() -> Result<PathBuf> {
 }
 
 /// Same precedence as [`read_key`] but returns the path instead of
-/// the bytes — needed for `CalendarBarsArgs.key_file`.
+/// the bytes — needed when a downstream builder wants the key-file path
+/// rather than the loaded key material.
 fn key_path_resolved() -> Result<PathBuf> {
     if let Ok(env) = env::var("TRADE_CONTROL_KEY_FILE")
         && !env.trim().is_empty()
@@ -1746,7 +1743,6 @@ fn register_trade_plan(
     resolution: &str,
     pause_bundles: &[PauseBundle],
     news_bundles: &[NewsBundle],
-    built_calendar: &[cli::BuiltCalendarBundle],
     key: &[u8; KEY_LEN],
     account: &str,
     now: DateTime<Utc>,
@@ -1780,7 +1776,7 @@ fn register_trade_plan(
     // appender reads (each carries the signed intents + window times).
     let pauses: Vec<&cli::BuiltPause> = pause_bundles.iter().map(|b| &b.built).collect();
     let newses: Vec<&cli::BuiltNews> = news_bundles.iter().map(|b| &b.built).collect();
-    append_control_rules(&mut plan, &pauses, &newses, built_calendar);
+    append_control_rules(&mut plan, &pauses, &newses);
     let rule_count = plan.rules.len();
     // Dump the fully-built plan (control rules folded in) for offline replay,
     // before `build_register_intent` moves it into the register intent.

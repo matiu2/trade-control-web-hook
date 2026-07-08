@@ -1,5 +1,43 @@
 # Changelog
 
+## v69 — 2026-07-08 — retire the dead drawn-line news/blackout generators (PR1b)
+
+**Why.** v68 made tv-arm resolve news/blackout windows straight from the
+calendar, leaving the old drawn-line generator path dead but still compiled in.
+This is the promised PR1b cleanup: delete the code nothing calls anymore.
+
+**What changed.** Removed the `calendar-bars`, `build-pause`, and `build-news`
+CLI subcommands and their `run_calendar_bars` / `run_build_pause` /
+`run_build_news` handlers, arg structs, and `CalendarBarsArgs` /
+`CalendarBrokerArg` / `BuiltCalendarBundle` types plus the `print_summary_table`
+/ `row_is_stale` helpers only they used. tv-arm's `register_trade_plan` and
+`append_control_rules` drop the always-empty `built_calendar` /
+`BuiltCalendarBundle` parameter — control rules now come solely from the
+calendar-sourced pause/news bundles.
+
+**Kept (still live).** `PauseSpec` / `NewsSpec` / `build_pause_from_spec` /
+`build_news_from_spec` / `write_pause` / `write_news` (the enter-builder and
+calendar path still build+sign windows through them), and
+`plan_calendar_bars` / `plan_calendar_bars_within` / `fetch_events_for_range` /
+`dedupe_and_filter_events` / `TimeframeArg` / `PlanInputs` / `parse_instrument`.
+The server (worker/core/engine) is untouched and the signed intent format is
+unchanged — old-style plans keep working.
+
+**Breaking.** `trade_control_cli` no longer re-exports `BuiltCalendarBundle`,
+`CalendarBarsArgs`, `CalendarBrokerArg`, `run_calendar_bars`, or
+`print_summary_table`. `append_control_rules` loses its `calendar_bundles`
+argument.
+
+**Tests.** Dropped the `run_calendar_bars`-only `row_is_stale` test; rewrote
+`control_rules_appended_from_pause_news_and_calendar_bundles` →
+`control_rules_appended_from_pause_and_news_bundles` (no calendar bundle). 26
+calendar_bars + 192 tv-arm + 21 cli-bin tests pass; clippy/fmt clean. Net −443
+/ +43 lines.
+
+**Follow-up.** Intrabar / fill-instant news gating (PR2); the pre-existing
+`plan_calendar_bars_within` gap where a USD-high "blocks all instruments" event
+isn't kept for a non-USD pair.
+
 ## v68 — 2026-07-07 — news/blackout windows come from the calendar, not drawn chart lines
 
 **Why.** tv-arm resolved news/blackout windows by *drawing* pause/resume and

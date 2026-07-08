@@ -231,9 +231,13 @@ its functionality folds into a single `06-close-on-reversal` whose
 recognised by the worker for inbound decode of any in-flight alerts
 left over from the old shape.
 
-Each news pair adds two more (`01-news-start-<id>` + `02-news-end-<id>`)
-via a separate `build-news` shell-out, and each pause pair adds
-`01-pause-<id>` + `02-resume-<id>` via `build-pause`.
+Each news window adds two more control rules (`01-news-start-<id>` +
+`02-news-end-<id>`) and each blackout window adds `01-pause-<id>` +
+`02-resume-<id>`. These windows are resolved from the forex-factory
+calendar at arm time (over `[cursor, trade-expiry]`) and folded straight
+into the registered `TradePlan` — there's no longer a `build-news` /
+`build-pause` shell-out (those subcommands were retired in v68; the
+worker still decodes any old-shape bundles still in flight).
 
 ### M/W (double-top / double-bottom) bundle
 

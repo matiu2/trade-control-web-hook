@@ -21,7 +21,7 @@
 //! `Ok(None)` semantics `build_alert_spec` uses), so a trade missing, say, a
 //! retest trendline simply yields a plan without that rule.
 
-use trade_control_cli::{BuiltAlert, BuiltCalendarBundle, BuiltNews, BuiltPause};
+use trade_control_cli::{BuiltAlert, BuiltNews, BuiltPause};
 use trade_control_conventions::{AlertBasename, Direction as ConvDirection};
 use trade_control_core::broker::Granularity;
 use trade_control_core::intent::{Direction, Intent};
@@ -121,36 +121,25 @@ pub fn build_trade_plan(
 /// pause-start / news-start, end for pause-resume / news-end).
 ///
 /// This is what makes `--register-plan` open/close the same blackout + news
-/// windows the `--create-alerts` path POSTs as TradingView alerts. The chart-
-/// drawn pairs arrive as [`BuiltPause`]/[`BuiltNews`] bundles; the auto-fetched
-/// forex-factory events arrive as [`BuiltCalendarBundle`]s (each holding one
-/// pause + one news). All three feed the same per-alert conversion.
+/// windows the `--create-alerts` path POSTs as TradingView alerts. Since PR1b
+/// the windows always arrive as [`BuiltPause`]/[`BuiltNews`] bundles — sourced
+/// from the calendar directly (`calendar_windows` in `pipeline.rs`), not from
+/// drawn lines. Both feed the same per-alert conversion.
 ///
 /// `build_trade_plan`'s `trigger_for` deliberately does **not** handle these
 /// basenames anymore: it only ever saw `roles.*_pairs.first()` (one pair) and
 /// the control alerts were never in `built_trade.alerts` to begin with — so the
-/// rules came from here, where every window (and every calendar event) is
-/// represented.
+/// rules came from here, where every window is represented.
 pub fn append_control_rules(
     plan: &mut TradePlan,
     pause_bundles: &[&BuiltPause],
     news_bundles: &[&BuiltNews],
-    calendar_bundles: &[BuiltCalendarBundle],
 ) {
     for b in pause_bundles {
         push_window_rules(plan, &b.alerts, b.start_time, b.end_time);
     }
     for b in news_bundles {
         push_window_rules(plan, &b.alerts, b.start_time, b.end_time);
-    }
-    for cb in calendar_bundles {
-        push_window_rules(
-            plan,
-            &cb.pause.alerts,
-            cb.pause.start_time,
-            cb.pause.end_time,
-        );
-        push_window_rules(plan, &cb.news.alerts, cb.news.start_time, cb.news.end_time);
     }
 }
 
@@ -989,9 +978,7 @@ mod tests {
 
     // ===== append_control_rules =====
 
-    use trade_control_cli::{
-        BuiltCalendarBundle, NewsSpec, PauseSpec, build_news_from_spec, build_pause_from_spec,
-    };
+    use trade_control_cli::{NewsSpec, PauseSpec, build_news_from_spec, build_pause_from_spec};
     use trade_control_core::intent::{Action as CoreAction, BrokerKind};
 
     fn pause_spec(trade_id: &str, start: &str, end: &str) -> PauseSpec {
@@ -1020,11 +1007,11 @@ mod tests {
         }
     }
 
-    /// A plan with one chart-drawn pause pair, one news pair, and a calendar
-    /// event (its own pause + news) gains a `TimeReached` rule per window edge,
-    /// each carrying the matching control action at the right epoch.
+    /// A plan with one pause window and one news window (both now sourced from
+    /// the calendar, arriving as built bundles) gains a `TimeReached` rule per
+    /// window edge, each carrying the matching control action at the right epoch.
     #[test]
-    fn control_rules_appended_from_pause_news_and_calendar_bundles() {
+    fn control_rules_appended_from_pause_and_news_bundles() {
         let now = ts("2026-06-15T00:00:00Z");
         let pause = build_pause_from_spec(
             pause_spec("t", "2026-06-16T10:00:00Z", "2026-06-16T11:00:00Z"),
@@ -1036,20 +1023,6 @@ mod tests {
             now,
         )
         .unwrap();
-        // Calendar event: a separate pause + news window.
-        let cal = BuiltCalendarBundle {
-            event_slug: "usd-cpi-1".into(),
-            pause: build_pause_from_spec(
-                pause_spec("t", "2026-06-17T14:00:00Z", "2026-06-17T14:30:00Z"),
-                now,
-            )
-            .unwrap(),
-            news: build_news_from_spec(
-                news_spec("t", "2026-06-17T14:30:00Z", "2026-06-17T15:00:00Z"),
-                now,
-            )
-            .unwrap(),
-        };
 
         let mut plan = build_trade_plan(
             "t",
@@ -1065,11 +1038,10 @@ mod tests {
         );
         assert_eq!(plan.rules.len(), 1, "just the enter before appending");
 
-        append_control_rules(&mut plan, &[&pause], &[&news], &[cal]);
+        append_control_rules(&mut plan, &[&pause], &[&news]);
 
-        // 1 enter + (pause-start, pause-resume) + (news-start, news-end)
-        // + calendar (pause start/resume + news start/end) = 1 + 2 + 2 + 4 = 9.
-        assert_eq!(plan.rules.len(), 9);
+        // 1 enter + (pause-start, pause-resume) + (news-start, news-end) = 5.
+        assert_eq!(plan.rules.len(), 5);
 
         let by_action = |a: CoreAction| {
             plan.rules
@@ -1077,30 +1049,28 @@ mod tests {
                 .filter(|r| r.intent.action == a)
                 .collect::<Vec<_>>()
         };
-        // Two pause windows (chart + calendar) → two Pause + two Resume.
-        assert_eq!(by_action(CoreAction::Pause).len(), 2);
-        assert_eq!(by_action(CoreAction::Resume).len(), 2);
-        // Two news windows → two NewsStart + two NewsEnd.
-        assert_eq!(by_action(CoreAction::NewsStart).len(), 2);
-        assert_eq!(by_action(CoreAction::NewsEnd).len(), 2);
+        assert_eq!(by_action(CoreAction::Pause).len(), 1);
+        assert_eq!(by_action(CoreAction::Resume).len(), 1);
+        assert_eq!(by_action(CoreAction::NewsStart).len(), 1);
+        assert_eq!(by_action(CoreAction::NewsEnd).len(), 1);
 
-        // The chart pause anchors its start/end epochs to the window edges.
+        // The pause anchors its start/end epochs to the window edges.
         let pause_start = by_action(CoreAction::Pause)
             .into_iter()
             .find(|r| {
                 matches!(r.trigger, Trigger::TimeReached { at_epoch }
                     if at_epoch == ts("2026-06-16T10:00:00Z").timestamp())
             })
-            .expect("chart pause-start at its start epoch");
+            .expect("pause-start at its start epoch");
         assert_eq!(pause_start.fire_mode, FireMode::Once);
 
-        // The calendar news-end anchors to the calendar window's end.
+        // The news-end anchors to the news window's end.
         assert!(
             by_action(CoreAction::NewsEnd).iter().any(|r| {
                 matches!(r.trigger, Trigger::TimeReached { at_epoch }
-                    if at_epoch == ts("2026-06-17T15:00:00Z").timestamp())
+                    if at_epoch == ts("2026-06-16T13:00:00Z").timestamp())
             }),
-            "calendar news-end at the calendar window end"
+            "news-end at the news window end"
         );
     }
 }
