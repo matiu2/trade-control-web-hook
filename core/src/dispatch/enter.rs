@@ -283,6 +283,20 @@ pub async fn run_enter<B: Broker, S: StateStore>(
     // during rollout. See `DispatchConfig` / `pip_size_for`.
     let pip_size = verified.intent.pip_size.unwrap_or(cfg.pip_size);
 
+    // Tick size precedence mirrors pip: baked signed intent (tv-arm reads it
+    // from `instrument-lookup`) → `cfg.tick_size` (edge-resolved) → `pip_size`.
+    // The pip fallback is a safe coarser over-approximation (`tick <= pip` for
+    // every asset class) so a legacy intent with no baked tick still rounds
+    // acceptably and still places — fail-open, never fail-closed. The resolver
+    // treats a non-positive tick as identity, so worst case is today's
+    // behaviour (no rounding). Used to snap order prices onto the instrument's
+    // grid before the broker rejects over-precision.
+    let tick_size = verified
+        .intent
+        .tick_size
+        .or(cfg.tick_size)
+        .unwrap_or(pip_size);
+
     // M/W real-time geometry. For M/W enters carrying a `trade_id`, evolve
     // the live neckline / right-shoulder per bar (Phase B): a deeper body
     // still inside the 60% validity floor revises the neckline; a higher
@@ -300,10 +314,10 @@ pub async fn run_enter<B: Broker, S: StateStore>(
 
     let resolve_result = match &mw_effective {
         // M/W with live geometry: resolve against the effective params.
-        Some(mw) => Resolved::from_mw_intent(&verified.intent, &verified.shell, mw),
+        Some(mw) => Resolved::from_mw_intent(&verified.intent, &verified.shell, mw, tick_size),
         // Everything else (and M/W with no trade_id / no `open`): the
         // standard dispatch, which itself routes baked M/W to from_mw_intent.
-        None => Resolved::from_intent(&verified.intent, &verified.shell, pip_size),
+        None => Resolved::from_intent(&verified.intent, &verified.shell, pip_size, tick_size),
     };
     // `mut` so the SL-spread-floor salvage below can widen `stop_loss` in
     // place before the `EntryRequest` is built.

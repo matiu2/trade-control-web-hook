@@ -228,11 +228,13 @@ pub fn run(args: Args) -> Result<i32> {
             &account,
             broker,
             resolved.asset.pip_size,
+            resolved.asset.tick_size,
         )
     } else {
-        // Bake the canonical instrument-lookup pip onto the H&S enter so
-        // the worker scales offset_pips correctly (JPY/indices in
-        // particular); --pip-size overrides for the rare non-catalog case.
+        // Bake the canonical instrument-lookup pip AND tick onto the H&S enter:
+        // pip scales offset_pips (JPY/indices), tick snaps every order price
+        // onto the broker's grid so it isn't rejected as over-precise.
+        // --pip-size overrides pip for the rare non-catalog case.
         resolve_hs_trade(
             &args,
             &roles,
@@ -240,6 +242,7 @@ pub fn run(args: Args) -> Result<i32> {
             &account,
             broker,
             resolved.asset.pip_size,
+            resolved.asset.tick_size,
         )
     };
     let (direction, trade_spec) = match resolved_spec {
@@ -510,6 +513,7 @@ fn resolve_hs_trade(
     account: &str,
     broker: Broker,
     catalog_pip: f64,
+    catalog_tick: f64,
 ) -> std::result::Result<(Direction, cli::TradeSpec), ResolveError> {
     if let Err(msg) = check_required(roles, args) {
         return Err(ResolveError::Reject(msg));
@@ -532,8 +536,9 @@ fn resolve_hs_trade(
     // rejects an entry already past either — independent of the cross-guard.
     let entry_level_vetos = hs_entry_level_vetos(roles, direction);
     let expiry = read_trade_expiry(roles)?;
-    // --pip-size overrides the canonical catalog value when set.
+    // --pip-size / --tick-size override the canonical catalog values when set.
     let pip_size = args.pip_size.unwrap_or(catalog_pip);
+    let tick_size = args.tick_size.unwrap_or(catalog_tick);
     let spec = build_trade_spec(
         args,
         instrument,
@@ -544,6 +549,7 @@ fn resolve_hs_trade(
         tp,
         roles,
         pip_size,
+        tick_size,
         entry_level_vetos,
     );
     Ok((direction, spec))
@@ -565,9 +571,11 @@ fn resolve_mw_trade(
     account: &str,
     broker: Broker,
     catalog_pip: f64,
+    catalog_tick: f64,
 ) -> std::result::Result<(Direction, cli::TradeSpec), ResolveError> {
-    // --pip-size overrides the canonical catalog value when set.
+    // --pip-size / --tick-size override the canonical catalog values when set.
     let pip_size = args.pip_size.unwrap_or(catalog_pip);
+    let tick_size = args.tick_size.unwrap_or(catalog_tick);
     check_mw_required(roles)?;
     // The arm-time broker spread is read live (OANDA /pricing or the
     // TradeNation chart endpoint) and baked into the enter intent so the
@@ -582,6 +590,7 @@ fn resolve_mw_trade(
         account,
         broker,
         pip_size,
+        tick_size,
         spread_pips,
     )
 }
@@ -621,6 +630,7 @@ fn resolve_mw_trade_with_spread(
     account: &str,
     broker: Broker,
     pip_size: f64,
+    tick_size: f64,
     spread_pips: f64,
 ) -> std::result::Result<(Direction, cli::TradeSpec), ResolveError> {
     check_mw_required(roles)?;
@@ -689,6 +699,7 @@ fn resolve_mw_trade_with_spread(
             right_shoulder,
             spread_pips,
             pip_size,
+            tick_size,
         },
     );
     Ok((direction, spec))
@@ -729,6 +740,9 @@ struct MwSpecAnchors {
     right_shoulder: Option<f64>,
     spread_pips: f64,
     pip_size: f64,
+    /// Canonical instrument tick size (or `--tick-size`), baked onto the enter
+    /// so the worker snaps the mid-correct M/W prices onto the broker's grid.
+    tick_size: f64,
 }
 
 /// Gate the neckline-retracement percentage. Default ceiling is
@@ -828,10 +842,13 @@ fn build_mw_trade_spec(
             right_shoulder: anchors.right_shoulder,
             spread_pips: anchors.spread_pips,
             pip_size: anchors.pip_size,
+            tick_size: Some(anchors.tick_size),
         }),
         // Mirror the M/W pip onto the top-level field (the cli M/W builder
         // also does this); keeps the worker's sizing tail on the baked pip.
         pip_size: Some(anchors.pip_size),
+        // Baked tick so the worker snaps the mid-correct M/W prices onto grid.
+        tick_size: Some(anchors.tick_size),
         blackout_close: args.blackout_close.into_core(),
         // M/W has no fib / invalidation drawing — its abort/cancel/overshoot
         // vetos cover the level guards, so no continuous entry-level vetos.
@@ -1008,6 +1025,7 @@ fn build_trade_spec(
     tp: f64,
     roles: &Roles,
     pip_size: f64,
+    tick_size: f64,
     entry_level_vetos: Vec<trade_control_core::intent::EntryLevelVeto>,
 ) -> cli::TradeSpec {
     use cli::TradePattern;
@@ -1076,6 +1094,9 @@ fn build_trade_spec(
         // Baked from instrument-lookup (or --pip-size) so the worker scales
         // the entry/SL offset_pips with the right pip, not its forex default.
         pip_size: Some(pip_size),
+        // Baked from instrument-lookup (or --tick-size) so the worker snaps
+        // entry/SL/TP onto the broker's price grid before placement.
+        tick_size: Some(tick_size),
         blackout_close: args.blackout_close.into_core(),
         entry_level_vetos,
         // Wrong-side stop recovery (H&S / iH&S). Explicit `--recover-entry`
@@ -1546,6 +1567,7 @@ fn run_position_entry(
         trade_expiry,
         risk_amount: args.risk_amount,
         pip_size: args.pip_size.or(Some(resolved.asset.pip_size)),
+        tick_size: args.tick_size.or(Some(resolved.asset.tick_size)),
         dry_run: args.broker_dry_run,
     };
 
@@ -2316,7 +2338,10 @@ mod tests {
         catalog_pip: f64,
     ) -> std::result::Result<(Direction, cli::TradeSpec), ResolveError> {
         let pip_size = args.pip_size.unwrap_or(catalog_pip);
-        resolve_mw_trade_with_spread(args, roles, instrument, "ms-tn-1", broker, pip_size, SPREAD)
+        // Tests bake tick == pip (no separate catalog tick threaded here).
+        resolve_mw_trade_with_spread(
+            args, roles, instrument, "ms-tn-1", broker, pip_size, pip_size, SPREAD,
+        )
     }
 
     #[test]
@@ -2399,11 +2424,14 @@ mod tests {
             150.0,
             &Roles::default(),
             0.01,
+            // Distinct tick (finer than pip) to prove it's baked independently.
+            0.001,
             Vec::new(),
         );
         assert_eq!(spec.pattern, cli::TradePattern::Hs);
         assert!(spec.mw.is_none());
         assert_eq!(spec.pip_size, Some(0.01));
+        assert_eq!(spec.tick_size, Some(0.001));
     }
 
     #[test]
@@ -2422,6 +2450,7 @@ mod tests {
             1.05,
             &Roles::default(),
             0.0001,
+            0.0001,
             Vec::new(),
         );
         assert!(
@@ -2438,6 +2467,7 @@ mod tests {
             now() + chrono::Duration::days(1),
             1.05,
             &Roles::default(),
+            0.0001,
             0.0001,
             Vec::new(),
         );
@@ -2463,6 +2493,7 @@ mod tests {
             now() + chrono::Duration::days(1),
             1.05,
             &Roles::default(),
+            0.0001,
             0.0001,
             Vec::new(),
         );
@@ -2571,6 +2602,7 @@ mod tests {
             right_shoulder: None,
             spread_pips: 1.0,
             pip_size: 0.0001,
+            tick_size: 0.0001,
         };
         let default = build_mw_trade_spec(
             &mw_args(&[]),
@@ -2614,6 +2646,7 @@ mod tests {
             now() + chrono::Duration::days(1),
             1.05,
             &Roles::default(),
+            pip_size,
             pip_size,
             Vec::new(),
         );

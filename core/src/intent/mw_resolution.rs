@@ -184,6 +184,7 @@ impl Resolved {
         intent: &Intent,
         shell: &Shell,
         mw: &MwParams,
+        tick_size: f64,
     ) -> Result<Self, ResolveError> {
         let direction = intent
             .direction
@@ -288,6 +289,7 @@ impl Resolved {
             intent,
             shell,
             pip,
+            tick_size,
             direction,
             ResolvedEntry::Stop {
                 trigger_price: entry,
@@ -386,6 +388,7 @@ mod tests {
             reason: None,
             mw: Some(mw),
             pip_size: Some(mw.pip_size),
+            tick_size: None,
             spread_window: None,
             trade_plan: None,
             blackout_close: crate::intent::BlackoutCloseAction::default(),
@@ -434,8 +437,13 @@ mod tests {
         // below) → stop sits below close → placeable.
         let intent = mw_intent(Direction::Short, m_params());
         // high = 1.1200 (the peak) sits inside the [1.1176, 1.1224) window.
-        let r = Resolved::from_mw_intent(&intent, &shell_hlc(1.1200, 1.1120, 1.1120), &m_params())
-            .unwrap();
+        let r = Resolved::from_mw_intent(
+            &intent,
+            &shell_hlc(1.1200, 1.1120, 1.1120),
+            &m_params(),
+            0.0,
+        )
+        .unwrap();
         let trigger = match r.entry {
             ResolvedEntry::Stop { trigger_price } => trigger_price,
             other => panic!("expected Stop, got {other:?}"),
@@ -455,8 +463,13 @@ mod tests {
     fn w_long_levels_match_hand_calc() {
         let intent = mw_intent(Direction::Long, w_params());
         // low = 1.1000 (the trough) sits inside the (1.0976, 1.1024] window.
-        let r = Resolved::from_mw_intent(&intent, &shell_hlc(1.1080, 1.1000, 1.1080), &w_params())
-            .unwrap();
+        let r = Resolved::from_mw_intent(
+            &intent,
+            &shell_hlc(1.1080, 1.1000, 1.1080),
+            &w_params(),
+            0.0,
+        )
+        .unwrap();
         let trigger = match r.entry {
             ResolvedEntry::Stop { trigger_price } => trigger_price,
             other => panic!("expected Stop, got {other:?}"),
@@ -478,7 +491,8 @@ mod tests {
         let mut mw = m_params();
         mw.spread_pips = 0.0;
         let intent = mw_intent(Direction::Short, mw);
-        let r = Resolved::from_mw_intent(&intent, &shell_hlc(1.1200, 1.1120, 1.1120), &mw).unwrap();
+        let r = Resolved::from_mw_intent(&intent, &shell_hlc(1.1200, 1.1120, 1.1120), &mw, 0.0)
+            .unwrap();
         let trigger = match r.entry {
             ResolvedEntry::Stop { trigger_price } => trigger_price,
             other => panic!("expected Stop, got {other:?}"),
@@ -495,8 +509,12 @@ mod tests {
         // can't be placed below the close → NotArmedYet (stay armed).
         let intent = mw_intent(Direction::Short, m_params());
         // high passes the window; close 1.1100 is below entry → stop-side fail.
-        let err =
-            Resolved::from_mw_intent(&intent, &shell_hlc(1.1200, 1.1100, 1.1100), &m_params());
+        let err = Resolved::from_mw_intent(
+            &intent,
+            &shell_hlc(1.1200, 1.1100, 1.1100),
+            &m_params(),
+            0.0,
+        );
         assert!(matches!(err, Err(ResolveError::NotArmedYet)), "{err:?}");
     }
 
@@ -504,8 +522,12 @@ mod tests {
     fn long_stop_on_wrong_side_is_declined() {
         let intent = mw_intent(Direction::Long, w_params());
         // low passes the window; close 1.1090 is above entry → stop-side fail.
-        let err =
-            Resolved::from_mw_intent(&intent, &shell_hlc(1.1090, 1.1000, 1.1090), &w_params());
+        let err = Resolved::from_mw_intent(
+            &intent,
+            &shell_hlc(1.1090, 1.1000, 1.1090),
+            &w_params(),
+            0.0,
+        );
         assert!(matches!(err, Err(ResolveError::NotArmedYet)), "{err:?}");
     }
 
@@ -533,8 +555,12 @@ mod tests {
         // The motivating bug: high 0.98430 < min_retrace 0.98458 → decline,
         // even though the close sits above the entry stop (~0.98326).
         let intent = mw_intent(Direction::Short, audcad_m());
-        let err =
-            Resolved::from_mw_intent(&intent, &shell_hlc(0.98430, 0.98300, 0.98400), &audcad_m());
+        let err = Resolved::from_mw_intent(
+            &intent,
+            &shell_hlc(0.98430, 0.98300, 0.98400),
+            &audcad_m(),
+            0.0,
+        );
         assert!(matches!(err, Err(ResolveError::NotArmedYet)), "{err:?}");
     }
 
@@ -542,9 +568,13 @@ mod tests {
     fn m_high_inside_window_is_armed() {
         // high 0.98470 ≥ min_retrace 0.98458 and < cancel 0.98560 → armed.
         let intent = mw_intent(Direction::Short, audcad_m());
-        let r =
-            Resolved::from_mw_intent(&intent, &shell_hlc(0.98470, 0.98300, 0.98400), &audcad_m())
-                .expect("bar inside window arms");
+        let r = Resolved::from_mw_intent(
+            &intent,
+            &shell_hlc(0.98470, 0.98300, 0.98400),
+            &audcad_m(),
+            0.0,
+        )
+        .expect("bar inside window arms");
         assert!(matches!(r.entry, ResolvedEntry::Stop { .. }));
     }
 
@@ -553,8 +583,12 @@ mod tests {
         // high 0.98560 == cancel → past the 1.3 extension → decline (safety
         // net for the mw-cancel veto). Upper bound is exclusive.
         let intent = mw_intent(Direction::Short, audcad_m());
-        let err =
-            Resolved::from_mw_intent(&intent, &shell_hlc(0.98560, 0.98300, 0.98400), &audcad_m());
+        let err = Resolved::from_mw_intent(
+            &intent,
+            &shell_hlc(0.98560, 0.98300, 0.98400),
+            &audcad_m(),
+            0.0,
+        );
         assert!(matches!(err, Err(ResolveError::NotArmedYet)), "{err:?}");
     }
 
@@ -564,8 +598,12 @@ mod tests {
         //   neckline 1.1080, B 1.1000 → min_retrace 1.1024, cancel 1.0976.
         // A low of 1.1030 hasn't dropped to 1.1024 → decline.
         let intent = mw_intent(Direction::Long, w_params());
-        let err =
-            Resolved::from_mw_intent(&intent, &shell_hlc(1.1080, 1.1030, 1.1080), &w_params());
+        let err = Resolved::from_mw_intent(
+            &intent,
+            &shell_hlc(1.1080, 1.1030, 1.1080),
+            &w_params(),
+            0.0,
+        );
         assert!(matches!(err, Err(ResolveError::NotArmedYet)), "{err:?}");
     }
 
@@ -573,8 +611,12 @@ mod tests {
     fn w_low_below_cancel_is_declined() {
         // low 1.0976 == cancel → past the 1.3 extension downward → decline.
         let intent = mw_intent(Direction::Long, w_params());
-        let err =
-            Resolved::from_mw_intent(&intent, &shell_hlc(1.1080, 1.0976, 1.1080), &w_params());
+        let err = Resolved::from_mw_intent(
+            &intent,
+            &shell_hlc(1.1080, 1.0976, 1.1080),
+            &w_params(),
+            0.0,
+        );
         assert!(matches!(err, Err(ResolveError::NotArmedYet)), "{err:?}");
     }
 
@@ -591,8 +633,12 @@ mod tests {
         // close 0.98450 is still ≥ mid50 0.98424 → price hasn't rolled back
         // through the middle of the M yet → decline, stay armed.
         let intent = mw_intent(Direction::Short, audcad_m());
-        let err =
-            Resolved::from_mw_intent(&intent, &shell_hlc(0.98470, 0.98300, 0.98450), &audcad_m());
+        let err = Resolved::from_mw_intent(
+            &intent,
+            &shell_hlc(0.98470, 0.98300, 0.98450),
+            &audcad_m(),
+            0.0,
+        );
         assert!(matches!(err, Err(ResolveError::NotArmedYet)), "{err:?}");
     }
 
@@ -601,9 +647,13 @@ mod tests {
         // high 0.98470 confirms the right tower; close 0.98400 < mid50 0.98424
         // → crossed down through the middle → armed.
         let intent = mw_intent(Direction::Short, audcad_m());
-        let r =
-            Resolved::from_mw_intent(&intent, &shell_hlc(0.98470, 0.98300, 0.98400), &audcad_m())
-                .expect("right tower + downward cross arms");
+        let r = Resolved::from_mw_intent(
+            &intent,
+            &shell_hlc(0.98470, 0.98300, 0.98400),
+            &audcad_m(),
+            0.0,
+        )
+        .expect("right tower + downward cross arms");
         assert!(matches!(r.entry, ResolvedEntry::Stop { .. }));
     }
 
@@ -611,8 +661,12 @@ mod tests {
     fn m_close_at_mid50_is_declined() {
         // Boundary: close == mid50 0.98424 is not strictly below → not crossed.
         let intent = mw_intent(Direction::Short, audcad_m());
-        let err =
-            Resolved::from_mw_intent(&intent, &shell_hlc(0.98470, 0.98300, 0.98424), &audcad_m());
+        let err = Resolved::from_mw_intent(
+            &intent,
+            &shell_hlc(0.98470, 0.98300, 0.98424),
+            &audcad_m(),
+            0.0,
+        );
         assert!(matches!(err, Err(ResolveError::NotArmedYet)), "{err:?}");
     }
 
@@ -625,8 +679,12 @@ mod tests {
         // 1.1030 is still ≤ mid50 1.1040 → hasn't crossed up through the middle
         // → decline, stay armed.
         let intent = mw_intent(Direction::Long, w_params());
-        let err =
-            Resolved::from_mw_intent(&intent, &shell_hlc(1.1080, 1.1020, 1.1030), &w_params());
+        let err = Resolved::from_mw_intent(
+            &intent,
+            &shell_hlc(1.1080, 1.1020, 1.1030),
+            &w_params(),
+            0.0,
+        );
         assert!(matches!(err, Err(ResolveError::NotArmedYet)), "{err:?}");
     }
 
@@ -636,8 +694,13 @@ mod tests {
         // crossed up through the middle; close < entry 1.10809 so the breakout
         // stop sits above the close → armed.
         let intent = mw_intent(Direction::Long, w_params());
-        let r = Resolved::from_mw_intent(&intent, &shell_hlc(1.1080, 1.1020, 1.1080), &w_params())
-            .expect("right trough + upward cross arms");
+        let r = Resolved::from_mw_intent(
+            &intent,
+            &shell_hlc(1.1080, 1.1020, 1.1080),
+            &w_params(),
+            0.0,
+        )
+        .expect("right trough + upward cross arms");
         assert!(matches!(r.entry, ResolvedEntry::Stop { .. }));
     }
 
@@ -650,17 +713,29 @@ mod tests {
         // `InvalidGeometry` (a 400 bad-request). See bug-007.
         let intent = mw_intent(Direction::Short, audcad_m());
         // (1) right tower not confirmed: high 0.98430 < right_tower 0.98458.
-        let g1 =
-            Resolved::from_mw_intent(&intent, &shell_hlc(0.98430, 0.98300, 0.98400), &audcad_m());
+        let g1 = Resolved::from_mw_intent(
+            &intent,
+            &shell_hlc(0.98430, 0.98300, 0.98400),
+            &audcad_m(),
+            0.0,
+        );
         assert!(matches!(g1, Err(ResolveError::NotArmedYet)), "gate1 {g1:?}");
         // (2) right tower confirmed but middle not crossed: close 0.98450 ≥ mid50.
-        let g2 =
-            Resolved::from_mw_intent(&intent, &shell_hlc(0.98470, 0.98300, 0.98450), &audcad_m());
+        let g2 = Resolved::from_mw_intent(
+            &intent,
+            &shell_hlc(0.98470, 0.98300, 0.98450),
+            &audcad_m(),
+            0.0,
+        );
         assert!(matches!(g2, Err(ResolveError::NotArmedYet)), "gate2 {g2:?}");
         // (3) tower + cross OK but breakout stop on the wrong side of close.
         // entry ≈ 0.98326; a close below it fails the stop-side check.
-        let g3 =
-            Resolved::from_mw_intent(&intent, &shell_hlc(0.98470, 0.98300, 0.98320), &audcad_m());
+        let g3 = Resolved::from_mw_intent(
+            &intent,
+            &shell_hlc(0.98470, 0.98300, 0.98320),
+            &audcad_m(),
+            0.0,
+        );
         assert!(matches!(g3, Err(ResolveError::NotArmedYet)), "gate3 {g3:?}");
     }
 
@@ -688,7 +763,7 @@ mod tests {
         // so close 1.1125 > entry → stop-side satisfied.
         let mw = m_params_4pt(1.1180);
         let intent = mw_intent(Direction::Short, mw);
-        let r = Resolved::from_mw_intent(&intent, &shell_hlc(1.1130, 1.1122, 1.1125), &mw)
+        let r = Resolved::from_mw_intent(&intent, &shell_hlc(1.1130, 1.1122, 1.1125), &mw, 0.0)
             .expect("4-point M arms immediately, no mid-cross required");
         assert!(matches!(r.entry, ResolvedEntry::Stop { .. }));
     }
@@ -701,7 +776,7 @@ mod tests {
         // 1.3 extension → declined even on a 4-point path.
         let mw = m_params_4pt(1.1230);
         let intent = mw_intent(Direction::Short, mw);
-        let err = Resolved::from_mw_intent(&intent, &shell_hlc(1.1263, 1.1100, 1.1118), &mw);
+        let err = Resolved::from_mw_intent(&intent, &shell_hlc(1.1263, 1.1100, 1.1118), &mw, 0.0);
         assert!(matches!(err, Err(ResolveError::NotArmedYet)), "{err:?}");
     }
 
@@ -714,7 +789,7 @@ mod tests {
         let mw = m_params_4pt(1.1230);
         let intent = mw_intent(Direction::Short, mw);
         // close 1.1125 > entry 1.11191 → short stop sits below the close.
-        let r = Resolved::from_mw_intent(&intent, &shell_hlc(1.1240, 1.1122, 1.1125), &mw)
+        let r = Resolved::from_mw_intent(&intent, &shell_hlc(1.1240, 1.1122, 1.1125), &mw, 0.0)
             .expect("high inside the higher shoulder's 1.3 ceiling arms");
         assert!(matches!(r.entry, ResolvedEntry::Stop { .. }));
     }
@@ -726,7 +801,7 @@ mod tests {
         // through) → NotArmedYet.
         let mw = m_params_4pt(1.1180);
         let intent = mw_intent(Direction::Short, mw);
-        let err = Resolved::from_mw_intent(&intent, &shell_hlc(1.1130, 1.1090, 1.1100), &mw);
+        let err = Resolved::from_mw_intent(&intent, &shell_hlc(1.1130, 1.1090, 1.1100), &mw, 0.0);
         assert!(matches!(err, Err(ResolveError::NotArmedYet)), "{err:?}");
     }
 
@@ -742,7 +817,7 @@ mod tests {
             ..w_params()
         };
         let intent = mw_intent(Direction::Long, mw);
-        let r = Resolved::from_mw_intent(&intent, &shell_hlc(1.1078, 1.1030, 1.1078), &mw)
+        let r = Resolved::from_mw_intent(&intent, &shell_hlc(1.1078, 1.1030, 1.1078), &mw, 0.0)
             .expect("4-point W arms immediately, no mid-cross required");
         assert!(matches!(r.entry, ResolvedEntry::Stop { .. }));
     }

@@ -824,6 +824,18 @@ pub struct Intent {
     /// `tv-arm` sets both to the same number.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pip_size: Option<f64>,
+    /// Instrument tick size (minimum price increment), baked by `tv-arm` at arm
+    /// time from `instrument-lookup` (`asset.tick_size`): `0.00001` for 5-dp FX,
+    /// `0.1`/`1.0` for indices, etc. When present, the worker snaps every order
+    /// price (entry/SL/TP) onto this grid before placement so the broker doesn't
+    /// reject it as over-precise (`PRICE_PRECISION_EXCEEDED`). Absent = the
+    /// worker falls back to `cfg.tick_size` then `pip_size` (a safe coarser
+    /// grid, since `tick <= pip`), keeping the wire form byte-identical to
+    /// pre-feature intents. `tick_size` is finer than `pip_size` for
+    /// fractional-pip FX — see the `pip_size != tick_size` distinction in
+    /// `instrument-lookup`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tick_size: Option<f64>,
     /// Number of trailing candles the **entry SL-spread floor** averages the
     /// bid-ask spread over (see [`sl_spread_floor::mean_spread`]).
     ///

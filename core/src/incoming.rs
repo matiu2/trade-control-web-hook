@@ -459,6 +459,56 @@ mod tests {
         ));
     }
 
+    /// Build a signed `enter` carrying a baked top-level `tick_size` (in
+    /// addition to `pip_size`). A plain top-level line, so the whole-body HMAC
+    /// covers it with no signing-code change — this test is the guard.
+    fn build_signed_enter_with_tick(tick_size: &str) -> String {
+        let body_without_sig = [
+            "close: 152.000",
+            "high: 152.050",
+            "low: 151.950",
+            "time: \"2026-05-13T12:00:00Z\"",
+            "v: 1",
+            "action: enter",
+            "instrument: USD_JPY",
+            "id: hs-usdjpy-tick",
+            "trade_id: usdjpy-hs-1",
+            "not_after: \"2026-05-13T20:00:00Z\"",
+            "direction: long",
+            "entry: {\"type\":\"stop\",\"from\":\"high\",\"offset_pips\":1.0}",
+            "stop_loss: {\"from\":\"low\",\"offset_pips\":-1.0}",
+            "take_profit: {\"absolute\":153.0}",
+            "pip_size: 0.01",
+            &format!("tick_size: {tick_size}"),
+            "",
+        ]
+        .join("\n");
+        let pairs = signed_pairs_from_text(&body_without_sig).unwrap();
+        let sig = crate::sig::sign(&KEY, &pairs).unwrap();
+        format!("{body_without_sig}sig: \"{sig}\"\n")
+    }
+
+    #[test]
+    fn signed_path_tick_size_round_trips() {
+        let yaml = build_signed_enter_with_tick("0.001");
+        let now: DateTime<Utc> = "2026-05-13T12:01:00Z".parse().unwrap();
+        let v = parse_and_verify(&yaml, &KEY, now).unwrap();
+        assert_eq!(v.intent.tick_size, Some(0.001));
+    }
+
+    #[test]
+    fn signed_path_tick_size_tamper_rejected() {
+        // tick_size is a signed value — flipping it after signing (e.g. to
+        // relax the price grid past what the broker allows) must fail.
+        let yaml =
+            build_signed_enter_with_tick("0.001").replace("tick_size: 0.001", "tick_size: 0.01");
+        let now: DateTime<Utc> = "2026-05-13T12:01:00Z".parse().unwrap();
+        assert!(matches!(
+            parse_and_verify(&yaml, &KEY, now),
+            Err(IncomingError::Sig(SigError::Mismatch))
+        ));
+    }
+
     /// Build a signed `enter` carrying an explicit `blackout_close` policy
     /// (the market-hours entry blackout field). A scalar enum on its own
     /// top-level line, so it's covered by the whole-body HMAC like any other

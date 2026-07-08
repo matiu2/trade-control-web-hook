@@ -20,7 +20,7 @@
 
 use chrono::{DateTime, Utc};
 use trade_control_core::intent::{
-    Action, Direction, NoEntryWindow, Resolved, ResolvedEntry, Shell,
+    Action, Direction, Intent, NoEntryWindow, Resolved, ResolvedEntry, Shell,
 };
 use trade_control_core::spread_blackout::elevated_threshold_pips;
 use trade_control_engine::{
@@ -31,6 +31,14 @@ use trade_control_engine::{
 
 use super::brisbane::bne;
 use super::replay::{Fire, Replay};
+
+/// The tick size the replay report rounds order prices to — the baked
+/// `Intent::tick_size` when present, else the plan's `pip_size`. Mirrors the
+/// worker's fallback chain (`dispatch::enter`) so the report's resolved prices
+/// match what the worker would place. See `simulator::replay_tick`.
+fn replay_report_tick(intent: &Intent, plan: &TradePlan) -> f64 {
+    intent.tick_size.unwrap_or(plan.pip_size)
+}
 
 /// A fired `06-close-on-reversal` close, reduced to what the fill resolution
 /// needs: the bar it fired on and the price the position flattens at. The
@@ -261,7 +269,13 @@ pub fn resolve_fire_any(plan: &TradePlan, fire: &Fire, closes: &[CloseFire]) -> 
         Some(sig) => Shell::from_candle_and_signal(candle, sig),
         None => Shell::from_candle(candle),
     };
-    let mut resolved = Resolved::from_intent(intent, &shell, plan.pip_size).ok()?;
+    let mut resolved = Resolved::from_intent(
+        intent,
+        &shell,
+        plan.pip_size,
+        replay_report_tick(intent, plan),
+    )
+    .ok()?;
     // For an open / not-taken trade the box runs to the last replayed bar;
     // closed trades override this with their exit bar below.
     let window_end = fire.forward.last().map(|c| c.time)?;
@@ -635,7 +649,12 @@ fn render_fire(
     // is applied so the shown SL is the protected stop, not the signed level.
     // `protected_stop` is needed to score the fill's R below.
     let mut protected_stop: Option<f64> = None;
-    let placed_note = match Resolved::from_intent(intent, &shell, plan.pip_size) {
+    let placed_note = match Resolved::from_intent(
+        intent,
+        &shell,
+        plan.pip_size,
+        replay_report_tick(intent, plan),
+    ) {
         Ok(mut resolved) => {
             let signed_sl = resolved.stop_loss;
             let floor = apply_entry_spread_floor(
@@ -938,7 +957,12 @@ fn prep_preview(plan: &TradePlan, fire: &Fire) -> String {
         Some(sig) => Shell::from_candle_and_signal(candle, sig),
         None => Shell::from_candle(candle),
     };
-    match Resolved::from_intent(enter, &shell, plan.pip_size) {
+    match Resolved::from_intent(
+        enter,
+        &shell,
+        plan.pip_size,
+        replay_report_tick(enter, plan),
+    ) {
         Ok(resolved) => format!(
             "would-enter: {}",
             describe_order(&resolved, plan.pip_size)

@@ -33,6 +33,10 @@ pub fn build_dispatch_config_native(
         pip_size: secrets
             .pip_size_override(instrument)
             .unwrap_or(DEFAULT_PIP_SIZE),
+        // No edge-side tick override (no `TICK_SIZE_<INSTR>` secret): the baked
+        // `Intent::tick_size` from tv-arm is the authority, falling back to
+        // `pip_size` inside `run_enter` when absent. `None` = no edge tick.
+        tick_size: None,
         caps,
     }
 }

@@ -477,6 +477,10 @@ async fn dispatch_enter(
         worker_max_risk_pct: 1.0,
         worker_max_open_positions: 3,
         pip_size: *pip_size,
+        // No edge-resolved tick in replay; the baked `Intent::tick_size` takes
+        // precedence inside `run_enter`, falling back to `pip_size` when absent
+        // — same chain as the worker.
+        tick_size: None,
         caps: Default::default(),
     };
 
