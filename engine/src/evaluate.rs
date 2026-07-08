@@ -483,7 +483,7 @@ fn evaluate_guards(
         if !is_guard(rule) || state.fired.contains(&rule.rule_id) {
             continue;
         }
-        if !armed_in(&rule.rule_id, state.phase) {
+        if !armed_in_rule(rule, state.phase) {
             continue;
         }
         // A `PinePattern` guard (the close-on-reversal close) is decided by the
@@ -1645,16 +1645,30 @@ fn is_retest(rule: &ConditionRule) -> bool {
     rule.rule_id.contains(ROLE_RETEST)
 }
 
-/// When a veto guard is armed within the spine. Kept permissive for Stage D —
-/// the dispatched intent's own gates (e.g. `run_close`'s windows) are
-/// authoritative; the engine's job is only to fire the same intent the TV alert
-/// would have. Trade-expiry (a `TimeReached` veto) is armed in every phase; the
-/// rest arm from `AwaitEntry` onward (before that there's no order or position
-/// to act on).
-fn armed_in(rule_id: &str, phase: Phase) -> bool {
-    if rule_id.contains("trade-expiry") {
+/// When a guard is armed within the spine. Kept permissive for Stage D — the
+/// dispatched intent's own gates (e.g. `run_close`'s windows) are authoritative;
+/// the engine's job is only to fire the same intent the TV alert would have.
+///
+/// The split is by *what the guard means*, mirroring [`guard_is_terminal`]:
+///
+/// - **Terminal guards** — an invalidation / cancel veto (`too-high` / `too-low`,
+///   the M/W cancel/abort/overshoot vetos) or `trade-expiry` — mean the *setup*
+///   is dead. A setup can be invalidated **before** it ever breaks-and-closes
+///   (price runs up away from a short and the H&S is void), so these are armed in
+///   **every** phase. Arming them `AwaitEntry`-only silently dropped a pre-break
+///   invalidation: the too-high cap closed above for hours while the spine sat in
+///   `AwaitBreakAndClose`, so the guard never ran and the plan was journaled as
+///   blocked by a *later* rule (BUG-replay-skips-pre-pause-bars, AUD/NZD H&S
+///   short 2026-07-07).
+/// - **`Close` guards** (`06-close-on-reversal`) are a per-*trade* exit, not a
+///   setup invalidation — they need a position to act on, so they stay armed from
+///   `AwaitEntry` onward. Before entry there is nothing to close.
+fn armed_in_rule(rule: &ConditionRule, phase: Phase) -> bool {
+    if guard_is_terminal(&rule.intent) {
+        // Setup invalidation — valid to fire in any phase, pre-break included.
         return true;
     }
+    // Per-trade Close guard — needs an entry to have happened.
     matches!(phase, Phase::AwaitEntry)
 }
 
@@ -3982,6 +3996,110 @@ mod tests {
             "the veto fires after a resolve-failed enter, got {ids:?}"
         );
         assert!(eval2.done, "the terminal veto finishes the plan");
+    }
+
+    #[test]
+    fn too_high_invalidation_fires_during_await_break_and_close() {
+        // Regression (BUG-replay-skips-pre-pause-bars): a `too-high` invalidation
+        // veto is a *setup* invalidation — price running up away from the short
+        // kills the H&S before it ever breaks-and-closes. It must be armed (and
+        // able to retire the plan) while the spine is still `AwaitBreakAndClose`,
+        // not only once it reaches `AwaitEntry`. The live AUD/NZD H&S short
+        // (2026-07-07) closed above its 1.22001 cap for hours right after the arm
+        // yet too-high never fired, because the guard was armed `AwaitEntry`-only;
+        // the plan ran on and was journaled as blocked by a *later* too-low.
+        // A break-and-close neckline flat at 1.2150. The bars below close ABOVE
+        // it (never a down-close-through), so the spine genuinely stays in
+        // `AwaitBreakAndClose` — exactly the pre-break window the live plan sat in.
+        let neckline = |dir, bar| Trigger::TrendlineCross {
+            a: LinePoint {
+                at_epoch: ts("2026-06-16T00:00:00Z").timestamp(),
+                price: 1.2150,
+            },
+            b: LinePoint {
+                at_epoch: ts("2026-06-16T01:00:00Z").timestamp(),
+                price: 1.2150,
+            },
+            extend_forward: true,
+            bar_seconds: 3600,
+            dir,
+            bar,
+        };
+        let p = plan(vec![
+            rule(
+                "03-prep-break-and-close",
+                neckline(CrossDir::Down, BarEvent::OnClose),
+                FireMode::Once,
+                Action::Prep,
+            ),
+            rule(
+                "01-veto-too-high",
+                Trigger::HorizontalCross {
+                    level: 1.22001,
+                    dir: CrossDir::Up,
+                    bar: BarEvent::OnClose,
+                },
+                FireMode::Once,
+                Action::Veto,
+            ),
+        ]);
+        let prior = seed_at(Phase::AwaitBreakAndClose, "2026-06-16T09:00:00Z");
+
+        // Tick 1: close BELOW the cap (but above the neckline) → seeds last_close,
+        // no cross, plan alive and still pre-break.
+        let c1 = candle("2026-06-16T10:00:00Z", 1.2198, 1.2201, 1.2196, 1.21978);
+        let eval1 = run(&p, &prior, &[c1]);
+        assert!(eval1.fired.is_empty(), "no cross while still below the cap");
+        assert!(!eval1.done);
+        assert_eq!(
+            eval1.new_state.phase,
+            Phase::AwaitBreakAndClose,
+            "still pre-break"
+        );
+
+        // Tick 2: close ABOVE the cap → too-high must fire and retire the plan,
+        // even though we never left AwaitBreakAndClose.
+        let c2 = candle("2026-06-16T11:00:00Z", 1.21979, 1.2205, 1.21978, 1.22026);
+        let eval2 = run(&p, &eval1.new_state, &[c2]);
+        let ids: Vec<&str> = eval2.fired.iter().map(|f| f.rule_id.as_str()).collect();
+        assert!(
+            ids.contains(&"01-veto-too-high"),
+            "too-high fires pre-break, got {ids:?}"
+        );
+        assert!(eval2.done, "the terminal invalidation retires the plan");
+    }
+
+    #[test]
+    fn close_on_reversal_guard_stays_await_entry_only() {
+        // The counterpart to the above: a `06-close-on-reversal` (Action::Close)
+        // is a per-*trade* exit, not a setup invalidation — it needs a position to
+        // act on, so it stays armed `AwaitEntry`-onward and must NOT fire while the
+        // spine is still `AwaitBreakAndClose`. Widening the arming for invalidation
+        // vetos must not drag the Close guard along with it.
+        assert!(!armed_in_rule(
+            &rule(
+                "06-close-on-reversal",
+                Trigger::PinePattern {
+                    pattern: None,
+                    dir: Direction::Long,
+                },
+                FireMode::Once,
+                Action::Close,
+            ),
+            Phase::AwaitBreakAndClose,
+        ));
+        assert!(armed_in_rule(
+            &rule(
+                "06-close-on-reversal",
+                Trigger::PinePattern {
+                    pattern: None,
+                    dir: Direction::Long,
+                },
+                FireMode::Once,
+                Action::Close,
+            ),
+            Phase::AwaitEntry,
+        ));
     }
 
     #[test]
