@@ -1,5 +1,56 @@
 # Changelog
 
+## v70 — 2026-07-08 — sub-bar wall-clock news/blackout gating (PR2)
+
+**Why.** Pause/resume/news-start/news-end are wall-clock window edges, and
+`tv-arm` bakes the real event minute onto each `TimeReached` epoch (v68). But the
+engine tested that epoch per **closed candle** (`candle.time >= at_epoch`), so a
+14:30 event on an H1 chart only opened when the 15:00 bar closed — ~30 min late,
+and the resume/close was late too. The baked precision was thrown away at the
+enforcement layer.
+
+**What changed.**
+- **Engine.** Control `TimeReached` rules now fire against the tick's wall-clock
+  `now` (already a param of `evaluate_plan` both drivers pass), via a new
+  `control_rule_fires` helper. Guards and the spine are untouched — `trade-expiry`
+  etc. still fire on `candle.time`. A control rule with a non-`TimeReached`
+  trigger (none today) falls back to the candle path, keeping the helper total.
+- **Engine.** New `evaluate_controls_only(plan, prior, last_candle, now,
+  expires_at)`: runs ONLY the control rules against a wall-clock instant with no
+  new candle. Never advances the spine/watermark, never retires the plan. This is
+  the shared sub-bar tick entry point both drivers call.
+- **Worker.** The 5s engine cron used to bail the instant no new bar had closed;
+  it now runs `tick_controls_only` on that path, evaluating the control rules
+  against `now` + the last-known bar and dispatching any window edge through the
+  same state/dispatch/tick-bundle pipeline. So a mid-bar window opens ~14:30:05
+  live, not at the next bar close. No control fire → the old cheap no-op.
+- **Replay.** The offline replay owns a virtual clock, so it reproduces the
+  worker's sub-bar behaviour **exactly** (not approximately): before each bar's
+  `evaluate_plan`, `inject_control_ticks` replays every unfired control epoch in
+  `(prev_close, this_close)` by pinning the clock to the epoch and running the
+  same `evaluate_controls_only`. Worker and replay open/close every window at the
+  identical instant.
+
+**Parity.** The engine boundary predicate is the single source of truth; the two
+drivers differ only in *how* they present `now` (worker: real 5s ticks; replay:
+injected virtual ticks). New tests assert the worker path and the replay path
+fire the same control rule at the same sub-bar epoch, plus an end-to-end replay
+where a sub-bar pause suppresses a later enter.
+
+**Breaking.** `evaluate_plan`'s `now` param is now load-bearing for control rules
+(was `_now`). Engine gains a public `evaluate_controls_only`.
+
+**Tests.** Engine: `control_window_fires_sub_bar_when_now_reaches_epoch_before_candle_time`,
+`evaluate_controls_only_opens_and_closes_a_window_with_no_new_bar`, rewrote the
+pause/resume staggering test to drive `now` per tick (added `run_at`). Replay:
+`virtual_tick_opens_window_at_same_instant_as_worker_controls_only`,
+`sub_bar_pause_epoch_opens_via_virtual_tick_and_suppresses_enter`. 122 engine +
+75 replay + 21 cron tests pass; clippy/fmt clean.
+
+**Follow-up.** None outstanding for news gating. The pre-existing
+`plan_calendar_bars_within` gap (a USD-high "blocks all instruments" event not
+kept for a non-USD pair) is still separate and unaddressed.
+
 ## v69 — 2026-07-08 — retire the dead drawn-line news/blackout generators (PR1b)
 
 **Why.** v68 made tv-arm resolve news/blackout windows straight from the

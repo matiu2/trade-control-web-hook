@@ -87,9 +87,9 @@ Shared pure boundary logic lives in the engine so worker + replay can't diverge
       suppresses a later enter. 75 replay tests pass; clippy/fmt clean.
 
 ### 6. Wrap up  [ ]
-- [ ] cargo test / clippy / fmt (engine, cli, worker, cron).
-- [ ] README + CHANGELOG (v70). Note the sub-bar semantics + replay virtual ticks.
-- [ ] Merge to main, tag, advance parent pointer. Deploy to dev + staging.
+- [x] cargo test / clippy / fmt (engine 122, cron 21, cli 257+75; worker builds).
+- [x] README (wall-clock control note) + CHANGELOG (v70).
+- [ ] Merge to main, tag v70, advance parent pointer. Deploy to dev + staging.
 
 ## Parity invariant (do not break)
 Worker and replay MUST open/close each window at the same wall-clock instant.

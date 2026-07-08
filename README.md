@@ -207,6 +207,18 @@ Per-trade window state (paired alerts):
   with `news` in its `inside_window` list) to flatten the trade on an
   opposing reversal candle.
 
+These four control edges are **wall-clock**, not bar-quantised (v70). Each is a
+`TimeReached` rule whose epoch `tv-arm` bakes at the real event minute
+(e.g. 14:30), and the engine opens/closes the window the instant the tick's
+wall-clock reaches that epoch — **not** on the next bar close. The worker's
+engine cron runs every 5s, so a 14:30 event on an H1 chart blacks out at
+~14:30:05, not 15:00. Guards (`trade-expiry` etc.) stay candle-driven; only the
+pause/resume/news-start/news-end controls moved to wall-clock. The offline replay
+reproduces this exactly: it owns a virtual clock and injects a sub-bar tick at
+each control epoch that lands between two bar closes, so a replayed blackout
+opens at the same instant the live worker would. See CHANGELOG "sub-bar
+wall-clock news/blackout gating".
+
 ## Alert basenames emitted by `build-trade`
 
 When `tv-arm` (the chart-arming binary) calls `trade-control build-trade
