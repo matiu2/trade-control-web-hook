@@ -168,6 +168,7 @@ mod tests {
             exchange: "Trade Nation".into(),
             description: "ALPHABET".into(),
             asset_type: "stock".into(),
+            ..Default::default()
         }
     }
 
@@ -195,6 +196,7 @@ mod tests {
             exchange: "Fake".into(),
             description: "DEFINITELY_NOT_A_REAL_ASSET_QQQ".into(),
             asset_type: "stock".into(),
+            ..Default::default()
         };
         let out = build_patched_asset(&info).expect("ok");
         assert!(out.is_none(), "should not have resolved: {out:?}");

@@ -30,6 +30,7 @@ mod news_marker;
 mod news_window;
 mod pipeline;
 mod position_trade;
+mod precision;
 mod register_post;
 mod roles;
 mod spread;
