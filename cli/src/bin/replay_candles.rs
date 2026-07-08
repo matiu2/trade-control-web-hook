@@ -655,8 +655,13 @@ fn resolve_window(args: &Args, plan: &TradePlan) -> Result<ResolvedWindow> {
 /// on. Returns `None` for a plan with no such rule (the caller then falls back
 /// to the chart's visible-region end).
 fn trade_expiry_epoch(plan: &TradePlan) -> Option<i64> {
+    use trade_control_conventions::AlertBasename;
     plan.rules.iter().find_map(|rule| {
-        if !rule.rule_id.contains("trade-expiry") {
+        // Match the trade-expiry *basename* specifically — not the whole
+        // `SetupInvalidation` class, which also covers too-high/too-low and the
+        // M/W vetos (picking any of those would yield the wrong epoch). The typed
+        // parse replaces the old raw `rule_id.contains("trade-expiry")` substring.
+        if AlertBasename::parse(&rule.rule_id) != Some(AlertBasename::VetoTradeExpiry) {
             return None;
         }
         match rule.trigger {
