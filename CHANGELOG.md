@@ -1,5 +1,47 @@
 # Changelog
 
+## v71 — 2026-07-08 — `tv-arm --draw-news-markers` (cosmetic armed-news lines)
+
+**Why.** Since v68/PR1 the news/blackout windows tv-arm reacts to go straight into
+the signed plan as `TimeReached` control rules — nothing is drawn on the chart. That's
+correct for the gate machinery, but it leaves no visual cue when debugging or replaying
+a trade: you can't *see* which events tv-arm armed against. Running `tv-news` standalone
+draws a different (looser Medium+, visible-window) set, so its lines don't match what
+tv-arm actually watches.
+
+**What changed.**
+- **New opt-in flag `tv-arm --draw-news-markers`.** Draws one cosmetic vertical line per
+  news event tv-arm reacts to — exactly the High-impact, `[cursor, trade-expiry]`-scoped
+  set baked into the plan, drawn *after* elapsed windows are pruned, so drawn == armed,
+  one-for-one. Off by default.
+- **Label format** is tv-arm's own: `<CCY>-<n>-star-<HH:MM>` in **Brisbane** time (UTC+10,
+  matching the operator's charts/journals), e.g. `USD-3-star-04:00`. Events sharing a chart
+  bar collapse to one line whose label space-joins each event
+  (`USD-3-star-22:00 EUR-2-star-22:30`), since TradingView renders one drawing per bar cell.
+- **Cosmetic only.** The lines never touch the signed plan. A tv-mcp draw failure warns and
+  continues (deliberately unlike `tv-news`, which hard-errors) so a flaky draw can't block a
+  live `--register-plan`.
+- **Plumbing.** `calendar_windows` now also returns a `Vec<NewsMarker>` (currency + stars +
+  event minute) built from the kept `CalendarBarRow`s — the detail the collapsed `NewsWindow`s
+  drop. Stored on `Roles.news_markers`, pruned in lock-step with the news windows in
+  `drop_past_control_pairs` (a marker survives iff its post-release news window is still open,
+  so a passed-minute-but-open-tail event still draws). New module `tv-arm/src/news_marker.rs`.
+
+**Breaking.** Internal only: `calendar_windows` returns a 3-tuple
+`(blackout, news, markers)` (was 2-tuple); `Roles` gains `news_markers: Vec<NewsMarker>`.
+No wire/plan/CLI-output change.
+
+**Config.** New flag `--draw-news-markers` (bool, default off). No env, no signed-field change.
+
+**Tests.** `news_marker.rs`: label format (Brisbane time, currency upper-cased, star mapping),
+same-bar merge / multi-bar grouping, empty + non-positive-`bar_secs` guards, `resolution_to_secs`
+table. `pipeline.rs`: markers pruned in lock-step with surviving news windows (incl. the
+passed-event-minute-but-open-tail case).
+
+**Follow-up.** `--skip-calendar-bars` is now misleadingly named (it skips building news windows
+*into the plan*, not drawing bars) — an optional rename to `--skip-news-windows` (old name kept
+as a hidden alias) is noted but not done here.
+
 ## v70 — 2026-07-08 — sub-bar wall-clock news/blackout gating (PR2)
 
 **Why.** Pause/resume/news-start/news-end are wall-clock window edges, and
