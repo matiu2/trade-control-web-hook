@@ -37,6 +37,7 @@ use crate::args::PositionEntry;
 use crate::geometry::{horizontal_price, pcl_exhausted_price_from_fib, tp_price_from_fib};
 use crate::instrument_resolution::ResolvedInstrument;
 use crate::mw_geometry;
+use crate::news_marker::{NewsMarker, news_marker_lines};
 use crate::news_window::NewsWindow;
 use crate::position_trade::{core_direction, resolve_levels};
 use crate::register_post::{post_intent_blocking, post_register_blocking};
@@ -158,9 +159,10 @@ pub fn run(args: Args) -> Result<i32> {
             args.news_before_hours,
             args.news_after_hours,
         ) {
-            Ok((blackout, news)) => {
+            Ok((blackout, news, markers)) => {
                 roles.blackout_pairs = blackout;
                 roles.news_pairs = news;
+                roles.news_markers = markers;
             }
             Err(e) => {
                 warn!(error = ?e, "calendar window resolution failed; continuing with no news/blackout windows");
@@ -180,6 +182,13 @@ pub fn run(args: Args) -> Result<i32> {
     // historical replay. See `drop_past_control_pairs` / `pick_prune_as_of`.
     let prune_as_of = pick_prune_as_of(&args, now, cursor_unix, start);
     drop_past_control_pairs(&mut roles, prune_as_of);
+
+    // Cosmetic chart annotation (opt-in): draw a vertical line for exactly the
+    // news events tv-arm reacts to — the armed set, post-prune, so drawn ==
+    // armed. Never touches the plan; a draw failure warns and continues.
+    if args.draw_news_markers {
+        draw_news_markers(&mcp, &roles, &state.resolution);
+    }
 
     // 2c. Position-tool direct entry. When one of --market-entry /
     //     --stop-entry / --limit-entry is set, ignore the pattern
@@ -1219,6 +1228,81 @@ fn drop_past_control_pairs(roles: &mut Roles, as_of: AsOf) {
             );
         }
     }
+    // Keep the cosmetic markers exactly in lock-step with the surviving news
+    // windows, so a drawn marker always corresponds to an armed window. A news
+    // window is `[event_time, event_time + after]`, so a marker survives iff a
+    // surviving news window opens at its event minute — this correctly keeps a
+    // marker whose event minute has passed but whose post-release window is
+    // still open (drawn == armed, not drawn == future).
+    let live_event_secs: std::collections::HashSet<i64> = roles
+        .news_pairs
+        .iter()
+        .map(|w| w.start().timestamp())
+        .collect();
+    let before = roles.news_markers.len();
+    roles
+        .news_markers
+        .retain(|m| live_event_secs.contains(&m.event_time.timestamp()));
+    let dropped = before - roles.news_markers.len();
+    if dropped > 0 {
+        info!(
+            dropped,
+            as_of = %as_of.at.to_rfc3339(),
+            source = as_of.source,
+            "dropping news marker(s) whose news window already closed",
+        );
+    }
+}
+
+/// Draw one cosmetic vertical line per news event tv-arm reacts to (`roles.news_markers`),
+/// grouped so events sharing a chart bar collapse to a single line. Purely a chart
+/// annotation for debugging / replay — it never affects the signed plan.
+///
+/// Failure is non-fatal: a tv-mcp draw error (or an empty marker set) logs a warning
+/// and returns. Unlike tv-news — which hard-errors on a half-drawn chart — a flaky
+/// tv-mcp must never block a live `--register-plan`, so every line is attempted and
+/// per-line failures are counted, not propagated.
+fn draw_news_markers(mcp: &TvMcp, roles: &Roles, resolution: &str) {
+    if roles.news_markers.is_empty() {
+        info!("--draw-news-markers: no armed news events to draw");
+        return;
+    }
+    let bar_secs = news_marker_lines_bar_secs(resolution);
+    let lines = news_marker_lines(&roles.news_markers, bar_secs);
+    let mut drawn = 0usize;
+    let mut failed = 0usize;
+    for line in &lines {
+        // Price is ignored for vertical lines but the CLI requires a value.
+        match mcp.draw_vertical_line(line.anchor_epoch, 1.0, &line.label) {
+            Ok(s) if s.success => drawn += 1,
+            Ok(s) => {
+                failed += 1;
+                warn!(
+                    label = %line.label,
+                    error = s.error.as_deref().unwrap_or("(no message)"),
+                    "--draw-news-markers: tv-mcp reported a failed draw; continuing",
+                );
+            }
+            Err(e) => {
+                failed += 1;
+                warn!(label = %line.label, error = %e, "--draw-news-markers: draw call errored; continuing");
+            }
+        }
+    }
+    info!(
+        events = roles.news_markers.len(),
+        lines = lines.len(),
+        drawn,
+        failed,
+        "--draw-news-markers: drew news markers for the armed event set",
+    );
+}
+
+/// Bar width (seconds) for grouping same-bar markers, from the chart resolution,
+/// falling back to the 1h default on an unparseable resolution.
+fn news_marker_lines_bar_secs(resolution: &str) -> i64 {
+    crate::news_marker::resolution_to_secs(resolution)
+        .unwrap_or(crate::news_marker::DEFAULT_BAR_SECS)
 }
 
 /// The "as-of" time control pairs are pruned against, plus where it came from
@@ -1533,11 +1617,13 @@ fn calendar_scope_range(cursor_unix: i64, expiry_hint: Option<DateTime<Utc>>) ->
 /// longer changes which events are considered. An empty or reversed range
 /// (`to <= from`, e.g. a missing expiry) yields no windows.
 ///
-/// Returns `(blackout_windows, news_windows)`. Each kept event yields a
-/// **blackout** window `[event − before, event]` (no new entries in the run-up)
-/// and a **news** window `[event, event + after]` (post-release). `before` /
-/// `after` default to the chart timeframe's buffers, overridden per-run by
-/// `--news-before-hours` / `--news-after-hours` when set.
+/// Returns `(blackout_windows, news_windows, markers)`. Each kept event yields a
+/// **blackout** window `[event − before, event]` (no new entries in the run-up),
+/// a **news** window `[event, event + after]` (post-release), and a cosmetic
+/// **marker** (currency + stars + event minute) carrying the event detail the
+/// windows drop — used only by `--draw-news-markers`. `before` / `after` default
+/// to the chart timeframe's buffers, overridden per-run by `--news-before-hours`
+/// / `--news-after-hours` when set.
 ///
 /// No chart lines are drawn and nothing is read back — the returned windows are
 /// pushed straight into `Roles`, preserving the true event minute (e.g. a 14:30
@@ -1548,7 +1634,7 @@ fn calendar_windows(
     range: (i64, i64),
     before_hours: Option<f64>,
     after_hours: Option<f64>,
-) -> Result<(Vec<NewsWindow>, Vec<NewsWindow>)> {
+) -> Result<(Vec<NewsWindow>, Vec<NewsWindow>, Vec<NewsMarker>)> {
     let timeframe = infer_calendar_timeframe(resolution).ok_or_else(|| {
         eyre!("chart resolution {resolution:?} is below 15m; calendar bars skipped")
     })?;
@@ -1566,7 +1652,7 @@ fn calendar_windows(
             lookahead_end = %lookahead_end.to_rfc3339(),
             "calendar range is empty (to <= from) — no calendar windows",
         );
-        return Ok((Vec::new(), Vec::new()));
+        return Ok((Vec::new(), Vec::new(), Vec::new()));
     }
     // Synthesise the tcm Instrument straight from the catalog Asset so non-FX
     // assets (SMI, gold, indices) get correct news-currency exposure without
@@ -1599,6 +1685,7 @@ fn calendar_windows(
     let after = after_hours.map(hours_to_duration).transpose()?;
     let mut blackout = Vec::with_capacity(plan.rows.len());
     let mut news = Vec::with_capacity(plan.rows.len());
+    let mut markers = Vec::with_capacity(plan.rows.len());
     for row in &plan.rows {
         let pause_start = match before {
             Some(d) => row.event_time - d,
@@ -1610,6 +1697,9 @@ fn calendar_windows(
         };
         blackout.push(NewsWindow::new(pause_start, row.event_time));
         news.push(NewsWindow::new(row.event_time, news_end));
+        // Cosmetic marker: same kept row, carrying the currency/impact the
+        // windows discard. Drawn (opt-in) at the real event minute.
+        markers.push(NewsMarker::new(&row.currency, row.impact, row.event_time));
     }
     info!(
         events_fetched = events.len(),
@@ -1620,7 +1710,7 @@ fn calendar_windows(
         lookahead_end = %lookahead_end.to_rfc3339(),
         "calendar windows resolved",
     );
-    Ok((blackout, news))
+    Ok((blackout, news, markers))
 }
 
 /// Convert a fractional-hours buffer (e.g. `0.5` = 30 min) to a `Duration`.
@@ -1970,6 +2060,43 @@ mod tests {
         assert_eq!(roles.blackout_pairs[0], live);
         assert_eq!(roles.news_pairs.len(), 1);
         assert_eq!(roles.news_pairs[0], live);
+    }
+
+    /// Cosmetic news markers stay in lock-step with the surviving news windows:
+    /// a marker survives iff a surviving news window opens at its event minute.
+    /// Crucially, a marker whose event minute has *passed* but whose post-release
+    /// news window is still open must survive — drawn == armed, not drawn ==
+    /// future. Uses `trade_control_cli::Impact` via the `NewsMarker` ctor.
+    #[test]
+    fn drop_past_control_pairs_keeps_markers_in_lockstep_with_news_windows() {
+        use trade_control_cli::Impact;
+        let t = now().timestamp();
+        // Live: event minute already passed (event = now-60), but the news
+        // window [event, event+1800] is still open → both window and marker live.
+        let live_event = DateTime::<Utc>::from_timestamp(t - 60, 0).unwrap();
+        // Past: whole news window elapsed → window dropped, marker dropped.
+        let past_event = DateTime::<Utc>::from_timestamp(t - 7200, 0).unwrap();
+        let mut roles = Roles {
+            news_pairs: vec![
+                nw(past_event.timestamp(), past_event.timestamp() + 1800), // ends t-5400 → past
+                nw(live_event.timestamp(), live_event.timestamp() + 1800), // ends t+1740 → live
+            ],
+            news_markers: vec![
+                NewsMarker::new("EUR", Impact::High, past_event),
+                NewsMarker::new("USD", Impact::High, live_event),
+            ],
+            ..Default::default()
+        };
+
+        drop_past_control_pairs(&mut roles, wallclock(now()));
+
+        // The past news window is gone; the live one (post-release tail still
+        // open, though its event minute already passed) survives.
+        assert_eq!(roles.news_pairs.len(), 1);
+        // The marker for the surviving window survives; the past one is dropped.
+        assert_eq!(roles.news_markers.len(), 1);
+        assert_eq!(roles.news_markers[0].currency, "USD");
+        assert_eq!(roles.news_markers[0].event_time, live_event);
     }
 
     #[test]

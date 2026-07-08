@@ -39,6 +39,7 @@ use trade_control_conventions::{
     matches, prep_name_from_expiry_label,
 };
 
+use crate::news_marker::NewsMarker;
 use crate::news_window::NewsWindow;
 use trading_view::drawings::{Drawing, DrawingStub};
 use trading_view::mcp::TvMcp;
@@ -111,6 +112,12 @@ pub struct Roles {
     pub blackout_pairs: Vec<NewsWindow>,
     /// News windows (`news-start`/`news-end`), same calendar-resolved source.
     pub news_pairs: Vec<NewsWindow>,
+    /// The individual news events tv-arm reacts to (currency + stars + event
+    /// minute), carried alongside the windows purely so `--draw-news-markers`
+    /// can annotate the chart with the *exact* armed set. Never signed, never
+    /// gate machinery — cosmetic. Same filter/scope as `news_pairs`, pruned
+    /// together in `drop_past_control_pairs`.
+    pub news_markers: Vec<NewsMarker>,
     /// Support / resistance horizontal lines. Each one contributes
     /// an `[lo, hi]` price band to the consolidated
     /// `06-close-on-reversal` alert (`inside_window` gets `price`
