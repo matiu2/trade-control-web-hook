@@ -362,6 +362,22 @@ pub struct Args {
     #[arg(long)]
     pub skip_calendar_bars: bool,
 
+    /// Draw a cosmetic vertical line on the chart for every news event tv-arm
+    /// actually reacts to — exactly the High-impact, `[cursor, trade-expiry]`-
+    /// scoped set it bakes into the plan (after elapsed windows are pruned).
+    /// Each line is labelled `<CCY>-<n>-star-<HH:MM>` in Brisbane time; events
+    /// that share a chart bar collapse to one line whose label space-joins them
+    /// (`"USD-3-star-22:00 EUR-2-star-22:30"`).
+    ///
+    /// Purely for debugging / replay — the lines never affect the signed plan.
+    /// A draw failure warns and continues (unlike tv-news, which hard-errors),
+    /// so a flaky tv-mcp never blocks a live `--register-plan`. Off by default.
+    ///
+    /// This is narrower than running `tv-news`, which draws a looser Medium+ /
+    /// visible-window set; these markers are the armed set, one-for-one.
+    #[arg(long)]
+    pub draw_news_markers: bool,
+
     /// Blackout (pause) window width **before** each news event, in hours
     /// (fractional allowed, e.g. `0.5` = 30 min). Overrides the chart
     /// timeframe's default run-up buffer. Absent: use the timeframe default.
