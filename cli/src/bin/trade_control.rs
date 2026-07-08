@@ -1358,14 +1358,37 @@ fn bne(dt: chrono::DateTime<Utc>) -> String {
         .to_string()
 }
 
+/// Strip the outer `ActionResult::describe()` wrapper (`Ok(…)` / `Failed(…)` /
+/// `Rejected(…)`) off a recorded `dispatch_outcomes[].outcome` for display.
+///
+/// The engine stores the *wrapped* form (e.g. `Rejected(rejected:
+/// sl-widen-below-min-r (spread=1 …))`), which reads as a double-"rejected" in
+/// the timeline. The inner string is already the information-rich verdict — the
+/// same one the offline replay surfaces on its `BLOCKED — …` line — so peeling
+/// the wrapper gives the clean `rejected: sl-widen-below-min-r (spread=1 …)`.
+/// Only the three known wrappers are peeled (matched by prefix + a trailing
+/// `)`); anything else is returned untouched, so a future/unknown format can't
+/// be silently mangled.
+fn unwrap_dispatch_outcome(outcome: &str) -> &str {
+    for prefix in ["Ok(", "Failed(", "Rejected("] {
+        if let Some(inner) = outcome.strip_prefix(prefix)
+            && let Some(inner) = inner.strip_suffix(')')
+        {
+            return inner;
+        }
+    }
+    outcome
+}
+
 /// Render the worker's [`PlanTimeline`] YAML in the same style as the
 /// `replay-candles` report — but from **recorded facts only**, never a
 /// re-simulation. The two tools now read alike; the crucial difference is that
 /// `replay-candles` *computes* the order bracket, fill, break-even and SL-widen
 /// by walking the price path, whereas this shows only what the worker actually
 /// *recorded*: which rule fired on which bar, the engine's phase transition, and
-/// the real dispatch outcome (`Ok(entered)` / `rejected: trade-already-open` /
-/// …). There is deliberately **no** `order:` bracket, `fill:`, `be:` or `exit:`
+/// the real dispatch outcome (`entered` / `rejected: trade-already-open` /
+/// …, `ActionResult::describe()`-wrapper peeled by [`unwrap_dispatch_outcome`]).
+/// There is deliberately **no** `order:` bracket, `fill:`, `be:` or `exit:`
 /// line — those weren't recorded, so inventing them would be fiction.
 ///
 /// Layout, driven by the cron-engine `tick_bundles` (the source of truth for
@@ -1431,9 +1454,15 @@ fn format_plan_timeline(trade_id: &str, response: &str, verbose: bool) -> Result
                 .find(|d| d.rule_id == fired.rule_id)
                 .map(|d| d.outcome.as_str());
             match (intent.action, outcome) {
-                // An enter/close/veto that dispatched — show the recorded verdict.
+                // An enter/close/veto that dispatched — show the recorded verdict,
+                // with the `describe()` wrapper peeled so the rich reject reads
+                // `rejected: sl-widen-below-min-r (…)` not `Rejected(rejected: …)`.
                 (_, Some(o)) => {
-                    let _ = writeln!(out, "    dispatch: {o}   [recorded]");
+                    let _ = writeln!(
+                        out,
+                        "    dispatch: {}   [recorded]",
+                        unwrap_dispatch_outcome(o)
+                    );
                 }
                 // Fired but no dispatch outcome recorded: a shadow tick dispatches
                 // nothing, and a non-enter fire (veto/prep) may carry no outcome
@@ -2792,6 +2821,31 @@ ticks:
     }
 
     #[test]
+    fn unwrap_dispatch_outcome_peels_the_describe_wrapper() {
+        // The rich sl-widen reject: the inner verdict (with all its numbers) is
+        // preserved verbatim; only the outer `Rejected(…)` is peeled.
+        assert_eq!(
+            unwrap_dispatch_outcome(
+                "Rejected(rejected: sl-widen-below-min-r (spread=1 widened_sl_lvl=209.993043 \
+                 r_at_widen=0.35 < min_r=1.00))"
+            ),
+            "rejected: sl-widen-below-min-r (spread=1 widened_sl_lvl=209.993043 \
+             r_at_widen=0.35 < min_r=1.00)"
+        );
+        assert_eq!(unwrap_dispatch_outcome("Ok(entered)"), "entered");
+        assert_eq!(unwrap_dispatch_outcome("Failed(broker 500)"), "broker 500");
+        // Inner parens (the reject's own `(…)`) survive — we only strip the
+        // outermost wrapper, keyed on a known prefix + a trailing `)`.
+        assert_eq!(
+            unwrap_dispatch_outcome("Ok(entered: order=42 (long))"),
+            "entered: order=42 (long)"
+        );
+        // An unrecognised string is returned untouched (no silent mangling).
+        assert_eq!(unwrap_dispatch_outcome("prep-set"), "prep-set");
+        assert_eq!(unwrap_dispatch_outcome("Rejected("), "Rejected(");
+    }
+
+    #[test]
     fn plan_timeline_verbose_shows_every_log_line() {
         let out = format_plan_timeline("hs-nzd-chf-d12eb831", timeline_fixture(), true).unwrap();
         assert!(out.contains("veto too-high set"));
@@ -2815,10 +2869,9 @@ ticks:
             out.contains("• 05-enter Enter @ 2026-06-19 05:00:00 +10:00  close=0.5"),
             "got: {out}"
         );
-        assert!(
-            out.contains("dispatch: Ok(entered)   [recorded]"),
-            "got: {out}"
-        );
+        // The `Ok(…)` describe-wrapper is peeled for display.
+        assert!(out.contains("dispatch: entered   [recorded]"), "got: {out}");
+        assert!(!out.contains("Ok(entered)"), "wrapper not peeled: {out}");
         // The inbound prep alert is folded in under the HTTP section.
         assert!(out.contains("Inbound alerts (HTTP):"), "got: {out}");
         assert!(out.contains("prep-set (200)  [aaa111]"), "got: {out}");
