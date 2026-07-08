@@ -1,5 +1,43 @@
 # Changelog
 
+## v73 — 2026-07-09 — invalidation vetos arm pre-break (too-high/too-low fire in AwaitBreakAndClose)
+
+**Why.** A `too-high` / `too-low` invalidation veto is a *setup* invalidation:
+price running up away from a short (or down away from a long) kills the H&S/IH&S
+setup **before** it ever breaks-and-closes. The engine armed these guards
+`AwaitEntry`-only, so a breach while the spine still sat in `AwaitBreakAndClose`
+never fired — the plan ran on and was journaled as blocked by a *later*, different
+veto. Live and replay agreed with each other but both disagreed with the price
+tape. Caught on AUD/NZD H&S short 2026-07-07 (H1, OANDA): price closed above the
+1.22001 cap from 07-07 19:00 +10 for hours, yet the recorded blocker was a too-low
+at 07-08 13:00 (0R). (`BUG-replay-skips-pre-pause-bars-too-high-never-fires.md`.)
+
+**What changed.**
+- **`engine::evaluate::armed_in` → `armed_in_rule`.** Arming now splits by what the
+  guard *means*, mirroring `guard_is_terminal`: a **terminal** guard (invalidation /
+  cancel veto — `too-high`, `too-low`, the M/W cancel/abort/overshoot vetos — or
+  `trade-expiry`) is armed in **every** phase, pre-break included, because a setup
+  can be invalidated before break-and-close. A **`Close`** guard
+  (`06-close-on-reversal`) is a per-*trade* exit that needs a position, so it stays
+  armed `AwaitEntry`-onward. Previously only `trade-expiry` was special-cased to
+  all-phases and everything else was `AwaitEntry`-only.
+
+**Behaviour.** On the repro plan the corrected outcome is **too-high @ 07-07 19:00**
+(protective — price ran up away from the short), retiring the plan in one fire,
+versus the pre-fix **too-low @ 07-08 13:00**. Single fix in the shared `engine`
+crate, so live worker (`trade-control-cron`) and offline `replay-candles` both get
+it from one place.
+
+**Breaking.** None. No wire/plan/CLI change; internal fn rename only. M/W plans
+start in `AwaitEntry` already, so widening the mw-* vetos' arming is a no-op for
+them.
+
+**Tests.** `too_high_invalidation_fires_during_await_break_and_close` (the
+regression: too-high fires while genuinely pre-break, with a real break-and-close
+neckline the up-closing bars never cross down through) and
+`close_on_reversal_guard_stays_await_entry_only` (the Close guard is *not* dragged
+along — still AwaitEntry-only). Full engine suite green (127).
+
 ## v72 — 2026-07-08 — news markers draw by default; `--skip-calendar-bars` skips both
 
 **Why.** v71 shipped the armed-news markers behind an opt-in `--draw-news-markers`
