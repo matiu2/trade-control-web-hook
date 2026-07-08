@@ -179,7 +179,7 @@ pub fn evaluate_plan(
     prior: &PlanState,
     new_candles: &[Candle],
     detector_window: &[Candle],
-    _now: DateTime<Utc>,
+    now: DateTime<Utc>,
     expires_at: DateTime<Utc>,
 ) -> PlanEval {
     let mut state = prior.clone();
@@ -193,7 +193,7 @@ pub fn evaluate_plan(
         // window) without touching the trade's spine. Non-terminal — they fire,
         // latch, and the machine carries on. A window can land in any phase, so
         // these are evaluated every bar regardless of `state.phase`.
-        evaluate_controls(plan, &mut state, candle, detector_window, &mut fired);
+        evaluate_controls(plan, &mut state, candle, detector_window, now, &mut fired);
 
         // Always-armed guards next: a terminal veto can end the plan on any
         // bar, regardless of spine phase.
@@ -354,13 +354,14 @@ fn evaluate_controls(
     state: &mut PlanState,
     candle: &Candle,
     window: &[Candle],
+    now: DateTime<Utc>,
     fired: &mut Vec<FiredIntent>,
 ) {
     for rule in &plan.rules {
         if !is_control_rule(rule) || state.fired.contains(&rule.rule_id) {
             continue;
         }
-        if fire_rule(rule, state, candle, window, plan.cross_buffer_pct) {
+        if control_rule_fires(rule, state, candle, window, plan.cross_buffer_pct, now) {
             push_fire(rule, candle, fired);
             state.fired.insert(rule.rule_id.clone());
             // No phase change: a pause/resume/news fire is state-only and never
@@ -381,6 +382,37 @@ fn evaluate_controls(
                 }
             }
         }
+    }
+}
+
+/// Whether a **control** rule (pause/resume/news-start/news-end) fires this tick.
+///
+/// Control rules are wall-clock window edges: a `TimeReached { at_epoch }` is
+/// tested against the tick's real `now`, **not** `candle.time`. This is the
+/// whole point of PR2 — a 14:30 event baked onto an H1 plan opens the window at
+/// 14:30 (the first tick whose wall-clock reaches the epoch), instead of waiting
+/// for the enclosing 15:00 bar to close. Both drivers already pass a real `now`
+/// to [`evaluate_plan`] (the worker its 5s-tick wall-clock, the replay its
+/// virtual per-tick clock), so worker and replay open/close each window at the
+/// same instant by construction.
+///
+/// Guards and the spine are deliberately unaffected — they keep testing
+/// `candle.time` via [`fire_rule`] (e.g. `trade-expiry` still fires on the bar
+/// whose open passes expiry). Only control `TimeReached` moves to wall-clock.
+///
+/// A control rule carrying a non-`TimeReached` trigger (none are built today,
+/// but keep this total) falls back to the candle-based [`fire_rule`].
+fn control_rule_fires(
+    rule: &ConditionRule,
+    state: &mut PlanState,
+    candle: &Candle,
+    window: &[Candle],
+    buffer_pct: f64,
+    now: DateTime<Utc>,
+) -> bool {
+    match rule.trigger {
+        Trigger::TimeReached { at_epoch } => now.timestamp() >= at_epoch,
+        _ => fire_rule(rule, state, candle, window, buffer_pct),
     }
 }
 
@@ -1748,6 +1780,22 @@ mod tests {
         // Non-Pine tests pass the same slice as both the new-candles and the
         // detector window; only a `PinePattern` entry reads the latter.
         run_window(p, prior, candles, candles)
+    }
+
+    /// Like [`run`] but with an explicit wall-clock `now` — control-rule
+    /// (pause/news) `TimeReached` fires are tested against this, not the
+    /// candle's timestamp (PR2). The live worker passes its 5s-tick clock and
+    /// the replay its per-tick virtual clock; a test that wants to observe a
+    /// window open at a precise instant drives `now` the same way.
+    fn run_at(p: &TradePlan, prior: &PlanState, candles: &[Candle], now: &str) -> PlanEval {
+        evaluate_plan(
+            p,
+            prior,
+            candles,
+            candles,
+            ts(now),
+            ts("2026-06-30T00:00:00Z"),
+        )
     }
 
     fn run_window(
@@ -3319,9 +3367,12 @@ mod tests {
     }
 
     #[test]
-    fn pause_and_resume_fire_on_their_own_bars_and_dont_refire() {
-        // Resume comes a bar after pause. Each fires once on the first bar at or
-        // past its epoch; a re-tick of a later bar doesn't refire either.
+    fn pause_and_resume_fire_when_wallclock_reaches_each_epoch_and_dont_refire() {
+        // PR2 wall-clock semantics: pause/resume fire on the first *tick whose
+        // `now` reaches the epoch*, not the first bar whose open passes it. The
+        // resume epoch is a bar later, so we drive `now` at each epoch (exactly
+        // as the worker's 5s tick / the replay's virtual tick would) to observe
+        // them stagger.
         let pause_at = ts("2026-06-16T15:00:00Z").timestamp();
         let resume_at = ts("2026-06-16T16:00:00Z").timestamp();
         let p = plan(vec![
@@ -3341,20 +3392,58 @@ mod tests {
             ),
         ]);
         let prior = seed_at(Phase::AwaitEntry, "2026-06-16T13:00:00Z");
-        // Bar 1 (15:00): only pause fires.
+        // Tick at 15:00 (now = pause epoch): only pause fires. Resume's epoch
+        // (16:00) hasn't been reached in wall-clock yet.
         let c1 = candle("2026-06-16T15:00:00Z", 1.0, 1.0, 1.0, 1.0);
-        let e1 = run(&p, &prior, &[c1]);
+        let e1 = run_at(&p, &prior, &[c1], "2026-06-16T15:00:00Z");
         let ids1: Vec<&str> = e1.fired.iter().map(|f| f.rule_id.as_str()).collect();
         assert_eq!(ids1, vec!["pause-start-news1"]);
-        // Bar 2 (16:00): only resume fires (pause already latched).
+        // Tick at 16:00 (now = resume epoch): only resume fires (pause latched).
         let c2 = candle("2026-06-16T16:00:00Z", 1.0, 1.0, 1.0, 1.0);
-        let e2 = run(&p, &e1.new_state, &[c2]);
+        let e2 = run_at(&p, &e1.new_state, &[c2], "2026-06-16T16:00:00Z");
         let ids2: Vec<&str> = e2.fired.iter().map(|f| f.rule_id.as_str()).collect();
         assert_eq!(ids2, vec!["pause-resume-news1"]);
-        // Bar 3: neither refires.
+        // Tick at 17:00: neither refires.
         let c3 = candle("2026-06-16T17:00:00Z", 1.0, 1.0, 1.0, 1.0);
-        let e3 = run(&p, &e2.new_state, &[c3]);
+        let e3 = run_at(&p, &e2.new_state, &[c3], "2026-06-16T17:00:00Z");
         assert!(e3.fired.is_empty(), "latched controls must not refire");
+    }
+
+    #[test]
+    fn control_window_fires_sub_bar_when_now_reaches_epoch_before_candle_time() {
+        // The PR2 win: a 14:30 event on an H1 chart. The tick that observes the
+        // still-open 14:00 bar runs with a wall-clock `now` of 14:30 (a mid-bar
+        // 5s worker tick / an injected replay virtual tick). The control window
+        // opens **now**, even though `candle.time` (14:00) has NOT reached the
+        // epoch. Under the old candle-driven rule this waited for the 15:00 bar.
+        let p = plan(vec![news_control_rule(
+            "news-start-evt1",
+            Action::NewsStart,
+            "evt1",
+            "2026-06-16T14:30:00Z",
+        )]);
+        let prior = seed_at(Phase::AwaitEntry, "2026-06-16T12:00:00Z");
+        // The last-known closed bar is the 14:00 H1 candle (open time 14:00 <
+        // 14:30 epoch), but the tick's wall-clock now is 14:30.
+        let c = candle("2026-06-16T14:00:00Z", 1.0, 1.0, 1.0, 1.0);
+        let eval = run_at(&p, &prior, &[c], "2026-06-16T14:30:00Z");
+        let ids: Vec<&str> = eval.fired.iter().map(|f| f.rule_id.as_str()).collect();
+        assert!(
+            ids.contains(&"news-start-evt1"),
+            "news window must open at its wall-clock epoch, not the next bar close"
+        );
+        assert!(
+            eval.new_state.open_news_windows.contains("evt1"),
+            "the news window is recorded open"
+        );
+
+        // Sanity: the SAME candle with a `now` that has NOT yet reached the epoch
+        // (14:29) must NOT fire — proving it's `now`, not `candle.time`, gating.
+        let early = run_at(&p, &prior, &[c], "2026-06-16T14:29:00Z");
+        assert!(
+            early.fired.is_empty(),
+            "before the wall-clock epoch the window stays shut"
+        );
     }
 
     #[test]
