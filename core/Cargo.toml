@@ -17,6 +17,7 @@ subtle = "2.6.1"
 # below covers it). Kept off the default/wasm build.
 serde_json = { version = "1.0.149", optional = true }
 tracing = "0.1.44"
+trade-control-conventions = { version = "0.1.0", path = "../conventions" }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 rhai = { version = "1.25.0", default-features = false, features = ["std", "wasm-bindgen", "serde"] }
