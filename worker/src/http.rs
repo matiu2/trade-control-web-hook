@@ -195,14 +195,63 @@ async fn webhook(State(dispatcher): State<Dispatcher>, body: String) -> Response
 /// inserts a row into the Postgres `request_records` table instead.
 async fn dispatch_request(state: &Arc<AppState>, body: &str) -> (StatusCode, String) {
     let now = Utc::now();
-    let parts = dispatch_inner(state, body, now).await;
+    let outcome = dispatch_inner(state, body, now).await;
     // Record off the response's critical path: the recorder is fire-and-forget
     // (matches the tick recorder + the wasm worker's `wait_until`), so the
     // response returns immediately and the next single-flight request isn't held
     // behind this insert. The spawned task logs the response + whether the insert
     // landed, so the trail stays visible.
-    record_request(state, body, now, &parts);
-    parts
+    record_request(state, body, now, &outcome);
+    (outcome.status, outcome.body)
+}
+
+/// A single dispatch outcome, carrying the caller-facing HTTP response
+/// (`status` + `body`) *and* the string to persist in `request_records`
+/// (`record`).
+///
+/// For most paths `record == body` (the body is already a fine short outcome —
+/// `"replay"`, `"declined: intent-expired"`, `"ok"`). They diverge for a broker
+/// [`ActionResult`]: the caller sees the human-facing `body` (e.g. the long
+/// "entry blocked: SL too close to spread …" prose or a flat "action failed"),
+/// but the record keeps the concise, information-rich gate verdict
+/// ([`ActionResult::record_outcome`]) — the same string the offline replay
+/// surfaces on its `BLOCKED — …` line — so a later `plan timeline` / `status`
+/// read sees *why* the reject fired, not just the prose.
+struct DispatchOutcome {
+    status: StatusCode,
+    body: String,
+    record: String,
+}
+
+impl DispatchOutcome {
+    /// Response and record string are the same (the common case).
+    fn plain(status: StatusCode, body: impl Into<String>) -> Self {
+        let body = body.into();
+        Self {
+            status,
+            record: body.clone(),
+            body,
+        }
+    }
+
+    /// Map a broker [`ActionResult`] to its HTTP response while keeping the
+    /// rich outcome string for the record. The status/body mapping matches the
+    /// wasm worker (`action_to_parts`); the `record` diverges for
+    /// `Failed`/`Rejected` (see the struct doc).
+    fn from_action(result: &ActionResult) -> Self {
+        let (status, body) = action_to_parts(result);
+        Self {
+            status,
+            body,
+            record: result.record_outcome().to_string(),
+        }
+    }
+}
+
+impl From<(StatusCode, String)> for DispatchOutcome {
+    fn from((status, body): (StatusCode, String)) -> Self {
+        Self::plain(status, body)
+    }
 }
 
 /// The actual decision logic, factored out so [`dispatch_request`] can wrap
@@ -211,7 +260,7 @@ async fn dispatch_inner(
     state: &AppState,
     body: &str,
     now: chrono::DateTime<Utc>,
-) -> (StatusCode, String) {
+) -> DispatchOutcome {
     // --- Parse + verify (shared). ---
     let verified = match parse_and_verify(body, &state.signing_key, now) {
         Ok(v) => v,
@@ -223,15 +272,15 @@ async fn dispatch_inner(
                 // wasm worker (bug #9).
                 IncomingDisposition::DeclinedExpired => {
                     tracing::info!("incoming declined: {err} | body_len={}", body.len());
-                    (StatusCode::OK, "declined: intent-expired".to_string())
+                    DispatchOutcome::plain(StatusCode::OK, "declined: intent-expired")
                 }
                 IncomingDisposition::DeclinedTooEarly => {
                     tracing::info!("incoming declined: {err} | body_len={}", body.len());
-                    (StatusCode::OK, "declined: intent-too-early".to_string())
+                    DispatchOutcome::plain(StatusCode::OK, "declined: intent-too-early")
                 }
                 IncomingDisposition::Rejected => {
                     tracing::error!("incoming rejected: {err} | body_len={}", body.len());
-                    (StatusCode::BAD_REQUEST, "rejected".to_string())
+                    DispatchOutcome::plain(StatusCode::BAD_REQUEST, "rejected")
                 }
             };
         }
@@ -247,17 +296,17 @@ async fn dispatch_inner(
                 verified.intent.id
             );
         }
-        Ok(true) => return (StatusCode::CONFLICT, "replay".to_string()),
+        Ok(true) => return DispatchOutcome::plain(StatusCode::CONFLICT, "replay"),
         Ok(false) => {}
         Err(err) => {
             tracing::error!("is_seen: {err}");
-            return (StatusCode::INTERNAL_SERVER_ERROR, "state error".to_string());
+            return DispatchOutcome::plain(StatusCode::INTERNAL_SERVER_ERROR, "state error");
         }
     }
 
     // --- Control actions (no broker). ---
     if let Some(result) = dispatch_control(state, &verified, now).await {
-        return control_to_parts(result);
+        return control_to_parts(result).into();
     }
 
     // --- Broker actions (Enter / Close / Invalidate / escalated Veto). ---
@@ -395,7 +444,7 @@ async fn dispatch_broker(
     verified: &Verified,
     body: &str,
     now: chrono::DateTime<Utc>,
-) -> (StatusCode, String) {
+) -> DispatchOutcome {
     // Resolve the account metadata. A named account that isn't in the index is a
     // 400; an unnamed account with a broker intent has no credentials to route
     // to (global/default-account routing is a follow-up) — also a 400.
@@ -403,16 +452,16 @@ async fn dispatch_broker(
         Ok(m) => m,
         Err(AccountResolveError::Unknown(name)) => {
             tracing::error!("unknown account '{name}'");
-            return (StatusCode::BAD_REQUEST, "unknown account".to_string());
+            return DispatchOutcome::plain(StatusCode::BAD_REQUEST, "unknown account");
         }
         Err(AccountResolveError::Required) => {
             // TODO: global/default-account routing for an unnamed broker intent.
             tracing::error!("broker intent without a named account — no default routing yet");
-            return (StatusCode::BAD_REQUEST, "account required".to_string());
+            return DispatchOutcome::plain(StatusCode::BAD_REQUEST, "account required");
         }
         Err(AccountResolveError::Backend(msg)) => {
             tracing::error!("account lookup failed: {msg}");
-            return (StatusCode::INTERNAL_SERVER_ERROR, "state error".to_string());
+            return DispatchOutcome::plain(StatusCode::INTERNAL_SERVER_ERROR, "state error");
         }
     };
 
@@ -426,9 +475,9 @@ async fn dispatch_broker(
             Ok(broker) => run_action(&broker, &state.store, verified, &cfg, now, body).await,
             Err(err) => {
                 tracing::error!("oanda acquire failed: {err}");
-                return (
+                return DispatchOutcome::plain(
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    "oanda login failed".to_string(),
+                    "oanda login failed",
                 );
             }
         },
@@ -436,11 +485,10 @@ async fn dispatch_broker(
             Ok(broker) => run_action(&broker, &state.store, verified, &cfg, now, body).await,
             Err(err) => {
                 tracing::error!("tradenation acquire failed: {err}");
-                return (
+                return DispatchOutcome::plain(
                     StatusCode::SERVICE_UNAVAILABLE,
                     "tradenation login failed (missing account, bad credentials, or expired \
-                     session — check logs)"
-                        .to_string(),
+                     session — check logs)",
                 );
             }
         },
@@ -448,7 +496,10 @@ async fn dispatch_broker(
 
     // Shared seen-index write (only `Ok` marks; `Failed`/`Rejected` log only).
     record_dispatcher_outcome(&state.store, verified, now, &result).await;
-    action_to_parts(&result)
+    // The HTTP body is caller-facing; the *record* keeps the rich outcome
+    // (`ActionResult::record_outcome`) so `plan timeline` / `status` shows the
+    // same concise verdict the offline replay does — see `DispatchOutcome`.
+    DispatchOutcome::from_action(&result)
 }
 
 /// Account-resolution failure modes at the native edge.
@@ -511,18 +562,20 @@ fn action_to_parts(result: &ActionResult) -> (StatusCode, String) {
 ///   worker's thread-local `LOG_BUFFER` is a Cloudflare single-thread-per-
 ///   request artifact). We record `logs: vec![]`; per-request log capture is a
 ///   follow-up.
-/// * **outcome** — the dispatch response body doubles as the short outcome
-///   string (e.g. `"ok"`, `"replay"`, `"rejected"`, `"declined: …"`), exactly
-///   the strings the `*_to_parts` mappers produce.
+/// * **outcome** — [`DispatchOutcome::record`] carries the short outcome string
+///   to persist. For most paths that's the response body itself (`"ok"`,
+///   `"replay"`, `"declined: …"`); for a broker [`ActionResult`] it's the rich
+///   [`ActionResult::record_outcome`] (e.g. `rejected: sl-widen-below-min-r
+///   (spread=… widened_sl_lvl=… …)`) rather than the human-facing body — so the
+///   record matches what the offline replay surfaces for the same reject.
 fn record_request(
     state: &Arc<AppState>,
     body: &str,
     now: chrono::DateTime<Utc>,
-    parts: &(StatusCode, String),
+    outcome: &DispatchOutcome,
 ) {
     use trade_control_core::recording::{RequestRecord, ids_from_body, mint_request_id};
 
-    let (status, outcome) = parts;
     let (intent_id, trade_id) = ids_from_body(body);
     let record = RequestRecord {
         ts: now.to_rfc3339(),
@@ -533,8 +586,8 @@ fn record_request(
         body: body.to_string(),
         intent_id,
         trade_id,
-        status: status.as_u16(),
-        outcome: outcome.clone(),
+        status: outcome.status.as_u16(),
+        outcome: outcome.record.clone(),
         logs: vec![],
     };
 
@@ -643,5 +696,53 @@ mod tests {
         });
         assert_eq!(s, StatusCode::PRECONDITION_FAILED);
         assert_eq!(b, "veto-active (reversal)");
+    }
+
+    #[test]
+    fn dispatch_outcome_records_rich_outcome_not_the_prose_body() {
+        // The caller-facing body stays the human-facing message, but the
+        // *record* keeps the concise, information-rich gate verdict — the same
+        // string the offline replay surfaces on its `BLOCKED — …` line. Locks
+        // the divergence for the sl-widen reject that motivated this.
+        let reject = ActionResult::Rejected {
+            status: 422,
+            body: "entry blocked: SL too close to spread and widening to 10x spread \
+                   would drop R to 0.35 < min_r 1.00"
+                .into(),
+            outcome: "rejected: sl-widen-below-min-r (spread=1 widened_sl_lvl=209.993043 \
+                      r_at_widen=0.35 < min_r=1.00)"
+                .into(),
+        };
+        let out = DispatchOutcome::from_action(&reject);
+        assert_eq!(out.status, StatusCode::UNPROCESSABLE_ENTITY);
+        // HTTP body: the prose message (unchanged, caller-facing).
+        assert!(
+            out.body
+                .starts_with("entry blocked: SL too close to spread")
+        );
+        // Record: the rich outcome verbatim (what `plan timeline` / `status`
+        // now shows, matching the replay).
+        assert_eq!(
+            out.record,
+            "rejected: sl-widen-below-min-r (spread=1 widened_sl_lvl=209.993043 \
+             r_at_widen=0.35 < min_r=1.00)"
+        );
+
+        // Failed: body is the flat "action failed", record keeps the reason.
+        let failed = ActionResult::Failed("broker 500".into());
+        let out = DispatchOutcome::from_action(&failed);
+        assert_eq!(out.body, "action failed");
+        assert_eq!(out.record, "broker 500");
+
+        // Ok: body "ok", record the success outcome.
+        let ok = ActionResult::Ok("entered: order=42".into());
+        let out = DispatchOutcome::from_action(&ok);
+        assert_eq!(out.body, "ok");
+        assert_eq!(out.record, "entered: order=42");
+
+        // The `plain` constructor keeps body == record (the common path).
+        let plain = DispatchOutcome::plain(StatusCode::CONFLICT, "replay");
+        assert_eq!(plain.body, "replay");
+        assert_eq!(plain.record, "replay");
     }
 }
