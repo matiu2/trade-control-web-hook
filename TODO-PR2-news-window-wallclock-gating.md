@@ -56,12 +56,17 @@ Shared pure boundary logic lives in the engine so worker + replay can't diverge
       (open 14:30 + close 15:15, both mid-bar, zero new candles; phase stays
       AwaitEntry). 122 engine tests pass.
 
-### 3. Worker: fire controls on candle-less 5s ticks  [ ]
-- [ ] `trade-control-cron/src/engine.rs`: when `fresh.is_empty()`, instead of
-      bare `return Ok(())`, run the control-only eval against `now` + last-known
-      candle; persist + dispatch any control fires. Keep the fast-path cheap
-      (no detector window fetch when only controls run).
-- [ ] Confirm no double-fire: `state.fired` latch already dedupes across ticks.
+### 3. Worker: fire controls on candle-less 5s ticks  [x]
+- [x] `trade-control-cron/src/engine.rs`: replaced the bare `fresh.is_empty()`
+      early-return with `tick_controls_only(...)`: runs `evaluate_controls_only`
+      against `now` + last-known closed bar (kept from the fetch before
+      `filter_new_candles`; synthesized flat bar at watermark if the fetch was
+      empty), and if anything fired persists + dispatches via the SAME
+      persist/dispatch/bundle path (empty candle windows, never `done`, shadow
+      honoured). No control fire → the old cheap no-op.
+- [x] No double-fire: `state.fired` latch dedupes; watermark not advanced (a
+      control tick processes no bar), so the real bar still ticks next.
+- [x] No detector-window fetch on the control path (controls are pure TimeReached).
 
 ### 4. Replay: inject virtual boundary ticks  [ ]
 - [ ] `cli/src/bin/replay_candles/replay.rs`: between bar `i` and `i+1`, collect
