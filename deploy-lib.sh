@@ -30,6 +30,11 @@ set -euo pipefail
 # Resolve repo root from this lib's location, regardless of caller cwd.
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CARGO_BIN="${CARGO_HOME:-$HOME/.cargo}/bin"
+# Stable install path for the native worker binaries. Each native env gets its
+# own suffixed copy (trade-control-worker-dev / -staging) so a rebuild of one
+# env never clobbers the code the other env is running. The systemd user units
+# (~/.config/systemd/user/trade-control-worker-<suffix>.service) exec these.
+WORKER_BIN_DIR="$HOME/.local/bin"
 
 # The CLIs we ship. CLI_PACKAGES are the workspace package names passed to
 # `cargo build -p` (note: the cli package is `trade-control-cli` but its
@@ -44,6 +49,52 @@ CARGO_BIN="${CARGO_HOME:-$HOME/.cargo}/bin"
 # the other dev/staging tools.
 CLI_PACKAGES=(trade-control-cli tv-arm tv-news)
 CLI_BINARIES=(trade-control tv-arm tv-news replay-candles)
+
+# roll_native_worker <env-name> <suffix>
+#
+# Build the native worker, install it to the per-env stable path, and restart
+# the matching systemd user service so the deploy rolls the running process,
+# not just the CLIs. Called only for native envs.
+#
+# The service name matches the binary suffix: trade-control-worker-<suffix>.
+# If that unit isn't installed on this host (e.g. a fresh checkout that hasn't
+# run the systemd setup yet), we install the binary and warn instead of failing
+# — the operator can start the worker manually or install the unit.
+roll_native_worker() {
+  local env_name="$1" suffix="$2"
+  local service="trade-control-worker-${suffix}"
+  local worker_dest="$WORKER_BIN_DIR/trade-control-worker-${suffix}"
+
+  echo "==> [$env_name] building native worker (trade-control-worker)"
+  cargo build --release -p trade-control-worker
+
+  mkdir -p "$WORKER_BIN_DIR"
+  cp -f "$REPO_ROOT/target/release/trade-control-worker" "$worker_dest"
+  echo "==> [$env_name] installed $worker_dest"
+
+  # Restart the service if its unit is known to the user systemd instance.
+  # `list-unit-files` is the reliable "is this unit installed?" probe.
+  if systemctl --user list-unit-files "${service}.service" >/dev/null 2>&1 \
+     && systemctl --user cat "${service}.service" >/dev/null 2>&1; then
+    # Pick up any unit-file edits, then restart onto the fresh binary.
+    systemctl --user daemon-reload
+    echo "==> [$env_name] restarting ${service}.service"
+    systemctl --user restart "${service}.service"
+    # Brief settle + health confirmation so a failed roll is loud, not silent.
+    sleep 2
+    if systemctl --user is-active --quiet "${service}.service"; then
+      echo "==> [$env_name] ${service} is active"
+    else
+      echo "ERROR: ${service} failed to come up after restart." >&2
+      echo "       Inspect: journalctl --user -u ${service} -n 40 --no-pager" >&2
+      exit 1
+    fi
+  else
+    echo "WARN: systemd user unit '${service}.service' not found — binary installed" >&2
+    echo "      but the worker was NOT restarted. Install the unit and enable it:" >&2
+    echo "        systemctl --user enable --now ${service}.service" >&2
+  fi
+}
 
 # deploy_env <env-name> <required-branch> <webhook-url> <suffix> [worker-kind]
 #
@@ -109,6 +160,16 @@ deploy_env() {
     cp -f "$REPO_ROOT/target/release/$bin" "$dest"
     echo "==> [$env_name] installed $dest"
   done
+
+  # 5. Native envs: rebuild + install the worker binary and restart its systemd
+  #    user service. Cloudflare envs skip this (their worker is `wrangler
+  #    deploy`d above). We're on localhost for the foreseeable future, so a
+  #    deploy should roll the whole env — binary AND running process — not just
+  #    the CLIs. The per-suffix binary path + per-suffix unit keep dev and
+  #    staging isolated (see WORKER_BIN_DIR above).
+  if [[ "$worker_kind" == "native" ]]; then
+    roll_native_worker "$env_name" "$suffix"
+  fi
 
   echo "==> [$env_name] done. Shell commands now available:"
   for bin in "${CLI_BINARIES[@]}"; do

@@ -6,13 +6,12 @@
 #
 # Dev runs the local native/Postgres worker, NOT Cloudflare. (Cloudflare is
 # fully retired — staging is native/Postgres too now.) So this script does NOT
-# `wrangler deploy` — it only bakes each `-dev` CLI's default endpoint to the
-# loopback worker and installs them.
-# The local worker itself is a long-running process managed outside this script:
-#
-#   SIGNING_KEY="$(tr -d '[:space:]' < ~/.config/trade-control/key.hex)" \
-#   ADMIN_KEY="$(tr -d '[:space:]' < ~/.config/trade-control/admin-key.hex)" \
-#     ./target/release/trade-control-worker <config.toml>
+# `wrangler deploy`. It bakes each `-dev` CLI's default endpoint to the loopback
+# worker, installs them, AND rolls the worker itself: rebuilds
+# trade-control-worker, installs it to ~/.local/bin/trade-control-worker-dev,
+# and restarts the systemd user service trade-control-worker-dev (see
+# roll_native_worker in deploy-lib.sh). Secrets come from the service's
+# EnvironmentFile (~/.config/trade-control/worker-secrets.env), not this script.
 
 set -euo pipefail
 
