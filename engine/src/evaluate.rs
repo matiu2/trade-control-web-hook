@@ -4102,6 +4102,78 @@ mod tests {
         ));
     }
 
+    /// Guard-semantics truth table — one row per guard role tv-arm actually
+    /// emits, pinning its full behavioural triple: `is_guard`,
+    /// `guard_is_terminal`, and `armed_in_rule` across **every** phase.
+    ///
+    /// Why this exists: guard behaviour is decided in four separate places
+    /// (`is_guard` by action, `guard_is_terminal` by action, `armed_in_rule` by
+    /// terminality, and the `rule_id` role-substring checks), keyed three
+    /// different ways, with nothing forcing them to agree. The original bug
+    /// (BUG-replay-skips-pre-pause-bars) was exactly such a drift: `armed_in`
+    /// classified `too-high` as `AwaitEntry`-only while `guard_is_terminal`
+    /// (correctly) treated it as a terminal setup-invalidation, so the guard
+    /// never ran pre-break. This table is the single place that asserts the two
+    /// meanings of "veto" — **setup invalidation** (fires in any phase, retires
+    /// the plan) vs **per-trade Close** (needs a position, `AwaitEntry`-only) —
+    /// stay consistent. A future rename or re-keying that desyncs them fails
+    /// here, named by role, instead of silently mis-journaling a live trade.
+    #[test]
+    fn guard_semantics_truth_table() {
+        // (role rule_id, action, is_guard, is_terminal, armed pre-break).
+        // Every current tv-arm guard: the three invalidation/cancel vetos, the
+        // trade-expiry invalidate, and the one per-trade Close.
+        let cases: &[(&str, Action, bool, bool, bool)] = &[
+            // Setup invalidations — terminal, armed in every phase (incl. pre-break).
+            ("01-veto-too-high", Action::Veto, true, true, true),
+            ("01-veto-too-low", Action::Veto, true, true, true),
+            ("01-veto-mw-cancel", Action::Veto, true, true, true),
+            ("01-veto-mw-abort", Action::Veto, true, true, true),
+            ("01-veto-mw-overshoot", Action::Veto, true, true, true),
+            ("02-veto-trade-expiry", Action::Invalidate, true, true, true),
+            // Per-trade exit — NON-terminal, needs a position (AwaitEntry only).
+            ("06-close-on-reversal", Action::Close, true, false, false),
+        ];
+
+        for &(rule_id, action, want_guard, want_terminal, want_armed_pre_break) in cases {
+            let r = rule(
+                rule_id,
+                Trigger::HorizontalCross {
+                    level: 1.0,
+                    dir: CrossDir::Up,
+                    bar: BarEvent::OnClose,
+                },
+                FireMode::Once,
+                action,
+            );
+            assert_eq!(is_guard(&r), want_guard, "{rule_id}: is_guard");
+            assert_eq!(
+                guard_is_terminal(&r.intent),
+                want_terminal,
+                "{rule_id}: guard_is_terminal"
+            );
+            // Pre-break phase arms exactly the terminal setup-invalidations.
+            assert_eq!(
+                armed_in_rule(&r, Phase::AwaitBreakAndClose),
+                want_armed_pre_break,
+                "{rule_id}: armed_in_rule(AwaitBreakAndClose)"
+            );
+            // Every guard is armed once we reach AwaitEntry.
+            assert!(
+                armed_in_rule(&r, Phase::AwaitEntry),
+                "{rule_id}: every guard is armed in AwaitEntry"
+            );
+            // A terminal setup-invalidation is armed in *every* phase, so its
+            // Done arming equals its pre-break arming (true); the per-trade Close
+            // guard is armed in neither (false). Either way, Done == pre-break.
+            assert_eq!(
+                armed_in_rule(&r, Phase::Done),
+                want_armed_pre_break,
+                "{rule_id}: armed_in_rule(Done) matches the all-phases terminal rule"
+            );
+        }
+    }
+
     #[test]
     fn pine_enter_needs_golden_declines_on_non_golden_bar() {
         // Finding B1: a `needs_golden` Pine enter must not fire on a bar whose
