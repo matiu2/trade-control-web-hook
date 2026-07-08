@@ -21,19 +21,16 @@
 //! [`pause_pattern`]: crate::pause_pattern
 //! [`news_pattern`]: crate::news_pattern
 
-use std::path::PathBuf;
-
 use chrono::{DateTime, Local, Utc};
-use clap::{Parser, ValueEnum};
-use color_eyre::eyre::{Context, Result, eyre};
+use clap::ValueEnum;
+use color_eyre::eyre::{Result, eyre};
 use forex_factory::{EconomicEvent, Impact};
 use trade_calendar_maker::{Instrument, InstrumentType, Timeframe};
 use trade_control_core::intent::BrokerKind;
-use trade_control_core::sig::KEY_LEN;
 
 use crate::forex_factory_cache::get_week_events_cached;
-use crate::news_pattern::{BuiltNews, NewsSpec, build_news_from_spec, write_news};
-use crate::pause_pattern::{BuiltPause, PauseSpec, build_pause_from_spec, write_pause};
+use crate::news_pattern::NewsSpec;
+use crate::pause_pattern::PauseSpec;
 
 /// One calendar-derived row: original event metadata, plus the two
 /// specs that the I/O layer will hand to `build_pause_from_spec` and
@@ -58,22 +55,9 @@ pub struct CalendarBarPlan {
     pub rows: Vec<CalendarBarRow>,
 }
 
-/// One event's in-memory built pause + news bundles, returned from
-/// [`run_calendar_bars`] alongside the on-disk signed YAMLs. The disk
-/// bundles drive the TradingView alert path (re-discovered via
-/// `discover_calendar_bundles`); these in-memory ones let the server-side
-/// `--register-plan` path fold the same pause/resume/news-start/news-end
-/// intents into the `TradePlan` without re-parsing the signed YAML.
-#[derive(Debug)]
-pub struct BuiltCalendarBundle {
-    pub event_slug: String,
-    pub pause: BuiltPause,
-    pub news: BuiltNews,
-}
-
 /// Inputs the planner needs that aren't on the calendar event itself.
-/// Mirrors the `args` half of `CalendarBarsArgs` but stays free of clap
-/// types so unit tests can construct it directly without `parse_from`.
+/// Kept free of clap types so unit tests can construct it directly
+/// without `parse_from`.
 #[derive(Debug, Clone)]
 pub struct PlanInputs {
     pub trade_id: String,
@@ -370,68 +354,6 @@ impl From<TimeframeArg> for Timeframe {
     }
 }
 
-/// Clap-side mirror of [`BrokerKind`]. Re-declared here so the module
-/// is self-contained — the binary's own `BrokerKindArg` is private to
-/// `trade_control.rs` and we don't want to make it public just for this.
-#[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
-#[clap(rename_all = "lowercase")]
-pub enum CalendarBrokerArg {
-    Oanda,
-    TradeNation,
-}
-
-impl From<CalendarBrokerArg> for BrokerKind {
-    fn from(v: CalendarBrokerArg) -> Self {
-        match v {
-            CalendarBrokerArg::Oanda => BrokerKind::Oanda,
-            CalendarBrokerArg::TradeNation => BrokerKind::TradeNation,
-        }
-    }
-}
-
-#[derive(Parser, Debug)]
-pub struct CalendarBarsArgs {
-    /// Instrument the trade is on, in the broker's native form (e.g.
-    /// `EUR_USD`). Underscore-stripped to match
-    /// [`Instrument::from_oanda_symbol`].
-    #[arg(long)]
-    pub instrument: String,
-    /// Parent trade the auto-drawn bars apply to. Must match the
-    /// `trade_id` of the `05-enter` alert the operator is arming —
-    /// pause + news KV entries are partitioned by trade_id.
-    #[arg(long)]
-    pub trade_id: String,
-    /// Account name from the local history cache. Validated the same
-    /// way `build-pause` / `build-news` validate theirs.
-    #[arg(long)]
-    pub account: String,
-    /// Broker the parent trade targets. Stamped onto every emitted
-    /// alert; defaults to OANDA to match the typical demo flow.
-    #[arg(long, value_enum, default_value_t = CalendarBrokerArg::Oanda)]
-    pub broker: CalendarBrokerArg,
-    /// TradingView chart timeframe — picks both the impact threshold
-    /// and the look-ahead/buffer windows. M15 = 2-star+ within 3h;
-    /// H1plus = 3-star only within 8h. See `trade-calendar-maker`'s
-    /// own `Timeframe` for the source-of-truth values.
-    #[arg(long, value_enum)]
-    pub timeframe: TimeframeArg,
-    /// Path to a hex-encoded 32-byte signing key. Same key the other
-    /// `build-*` paths use — calendar-bars alerts go through the same
-    /// HMAC pipeline as manually-drawn ones.
-    #[arg(long, env = "TRADE_CONTROL_KEY_FILE")]
-    pub key_file: PathBuf,
-    /// Directory to write emitted YAMLs under. Created if missing.
-    /// Default: `./calendar-bars/<trade_id>/`. Each event becomes a
-    /// `<event_slug>/{pause,news}/` subtree so operators can prune
-    /// per-event.
-    #[arg(long)]
-    pub output_dir: Option<PathBuf>,
-    /// Print the plan to stdout but write nothing. Useful for previewing
-    /// what bars the calendar would arm before committing them.
-    #[arg(long, default_value_t = false)]
-    pub dry_run: bool,
-}
-
 /// Async wrapper around `forex_factory::CalendarService::get_week_events_for`,
 /// routed through the disk cache at `~/.cache/tv-arm/forex-factory/`
 /// (see [`crate::forex_factory_cache`]). Splits I/O from the pure
@@ -531,135 +453,6 @@ pub fn dedupe_and_filter_events(
         }
     }
     out
-}
-
-/// Pretty-print the plan as a one-event-per-row summary. Same shape as
-/// the per-alert lines `build-pause` / `build-news` print — operators
-/// (and `tv_arm_hs.py`, eventually) can parse the per-event header to
-/// locate each output dir.
-pub fn print_summary_table(plan: &CalendarBarPlan) {
-    if plan.rows.is_empty() {
-        println!("no qualifying events in window");
-        return;
-    }
-    println!("event_time              currency  impact   event");
-    for row in &plan.rows {
-        println!(
-            "{:23}  {:8}  {:6}   {}",
-            row.event_time.to_rfc3339(),
-            row.currency,
-            format!("{:?}", row.impact),
-            row.event_name,
-        );
-    }
-}
-
-/// Whether a calendar row's window has already elapsed as of `now`, so it has
-/// nothing left to arm and must be skipped rather than fed to
-/// `build_pause_from_spec` / `build_news_from_spec` (which reject a past window
-/// with a hard "stale blackout" error). A row needs BOTH its pause and news
-/// halves built, so it's stale if EITHER end is at-or-before `now` — a
-/// half-stale event straddling `now` is a degenerate edge not worth arming.
-fn row_is_stale(row: &CalendarBarRow, now: DateTime<Utc>) -> bool {
-    row.pause_spec.end_time <= now || row.news_spec.end_time <= now
-}
-
-/// Sync entry point for the binary. Builds its own multi-thread tokio
-/// runtime for the single async fetch — keeps the rest of the CLI sync
-/// and avoids forcing every other subcommand into `#[tokio::main]`.
-///
-/// `window` overrides the event window. `None` is the standalone-CLI
-/// default: fetch the current week and plan the next buffer window from
-/// `now`. `Some((start, end))` (passed by tv-arm with the chart's
-/// visible range) fetches and plans `[start, end]`, so arming an OLD
-/// trade still picks up the calendar events it overlapped.
-pub fn run_calendar_bars(
-    args: CalendarBarsArgs,
-    key: [u8; KEY_LEN],
-    now: DateTime<Utc>,
-    window: Option<(DateTime<Utc>, DateTime<Utc>)>,
-) -> Result<Vec<BuiltCalendarBundle>> {
-    let instrument = parse_instrument(&args.instrument, args.broker.into())?;
-    let timeframe: Timeframe = args.timeframe.into();
-    let inputs = PlanInputs {
-        trade_id: args.trade_id.clone(),
-        instrument: args.instrument.clone(),
-        account: args.account.clone(),
-        broker: args.broker.into(),
-    };
-
-    let runtime = tokio::runtime::Runtime::new().context("starting tokio runtime")?;
-    let (events_fetched, plan) = match window {
-        Some((start, end)) => {
-            let events = runtime.block_on(fetch_events_for_range(start, end))?;
-            let plan =
-                plan_calendar_bars_within(&events, &instrument, timeframe, start, end, &inputs)?;
-            (events.len(), plan)
-        }
-        None => {
-            let events = runtime.block_on(fetch_week_events(now))?;
-            let plan = plan_calendar_bars(&events, &instrument, timeframe, now, &inputs)?;
-            (events.len(), plan)
-        }
-    };
-
-    println!("trade_id: {}", args.trade_id);
-    println!("instrument: {}", args.instrument);
-    println!("timeframe: {timeframe}");
-    println!("events_fetched: {events_fetched}");
-    println!("events_kept: {}", plan.rows.len());
-    print_summary_table(&plan);
-
-    if args.dry_run {
-        println!("(dry-run — no files written)");
-        return Ok(Vec::new());
-    }
-    if plan.rows.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    let out_root = args
-        .output_dir
-        .clone()
-        .unwrap_or_else(|| PathBuf::from("calendar-bars").join(&args.trade_id));
-    println!("output: {}", out_root.display());
-
-    let mut built = Vec::with_capacity(plan.rows.len());
-    for row in &plan.rows {
-        // Skip a row whose window has already elapsed (see `row_is_stale`).
-        // Common when the calendar window overlaps OLD bars on the chart (an
-        // event from a previous trade): there's nothing left to arm, and
-        // building it would hard-fail "refusing to arm a stale blackout",
-        // aborting the whole build and losing the still-live rows with it.
-        if row_is_stale(row, now) {
-            tracing::debug!(
-                event = %row.event_slug,
-                pause_end = %row.pause_spec.end_time.to_rfc3339(),
-                news_end = %row.news_spec.end_time.to_rfc3339(),
-                "skipping stale calendar event (window already closed)"
-            );
-            continue;
-        }
-        let event_dir = out_root.join(&row.event_slug);
-        let built_pause = build_pause_from_spec(row.pause_spec.clone(), now)
-            .with_context(|| format!("building pause for {}", row.event_slug))?;
-        let written_pause = write_pause(&built_pause, &key, &event_dir.join("pause"))?;
-        let built_news = build_news_from_spec(row.news_spec.clone(), now)
-            .with_context(|| format!("building news for {}", row.event_slug))?;
-        let written_news = write_news(&built_news, &key, &event_dir.join("news"))?;
-        println!(
-            "  - {} → pause: {}, news: {}",
-            row.event_slug,
-            written_pause.display(),
-            written_news.display(),
-        );
-        built.push(BuiltCalendarBundle {
-            event_slug: row.event_slug.clone(),
-            pause: built_pause,
-            news: built_news,
-        });
-    }
-    Ok(built)
 }
 
 #[cfg(test)]
@@ -783,43 +576,6 @@ mod tests {
         .unwrap();
         assert_eq!(plan.rows.len(), 1, "only the in-window past event is kept");
         assert_eq!(plan.rows[0].event_name, "ECB Rate");
-    }
-
-    #[test]
-    fn row_is_stale_flags_elapsed_windows_so_the_build_skips_them() {
-        // The chokepoint for the "refusing to arm a stale blackout" abort: a
-        // calendar row whose window is in the past (an OLD trade's event that
-        // the visible-range window happened to span) must be detected as stale
-        // by `row_is_stale`, so `run_calendar_bars` skips it instead of letting
-        // `build_pause_from_spec` hard-fail and abort the whole build.
-        let window_start = ts("2026-06-01T06:00:00Z");
-        let lookahead_end = ts("2026-06-03T11:00:00Z");
-        let event_in_past = ev("ECB Rate", "EUR", Impact::High, "2026-06-02T12:00:00Z");
-        let plan = plan_calendar_bars_within(
-            &[event_in_past],
-            &eur_usd(),
-            Timeframe::H1Plus,
-            window_start,
-            lookahead_end,
-            &inputs(),
-        )
-        .unwrap();
-        let row = &plan.rows[0];
-
-        // Wall-clock "now" well after the event (the IRL present-time arm in the
-        // bug report) → stale, skipped.
-        let now_after = ts("2026-06-26T10:00:00Z");
-        assert!(
-            row_is_stale(row, now_after),
-            "an event whose window ended days ago must be stale"
-        );
-
-        // "Now" before the window → live, built.
-        let now_before = ts("2026-06-02T00:00:00Z");
-        assert!(
-            !row_is_stale(row, now_before),
-            "an event still ahead of `now` must be armable"
-        );
     }
 
     #[test]

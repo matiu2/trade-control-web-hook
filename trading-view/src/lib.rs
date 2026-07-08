@@ -11,10 +11,10 @@
 //!   get, draw shape, range).
 //! - `drawings` — the serde shapes for tv-mcp's JSON output
 //!   (`DrawingStub`, `Drawing`, `ChartState`, etc.).
-//! - `pair_lines` — pairing logic for vertical lines that come in
-//!   ordered pairs (blackout-start / blackout-end, news-start /
-//!   news-end). The `TimedAnchor` trait lets `Drawing` plug in
-//!   without re-implementing the anchor-time accessor.
+//! - `pair_lines` — the `TimedAnchor` trait, letting `Drawing` expose its
+//!   anchor time to tv-arm's role pickers. (It once also paired drawn
+//!   blackout/news vertical lines; that pairing is gone — those windows now
+//!   come from the calendar.)
 //!
 //! What does **not** live here: anything strategy-specific. The
 //! H&S role classifier (`tv-arm/src/roles.rs`) consumes from this

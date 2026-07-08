@@ -26,23 +26,26 @@
 //! chart (more than one drawing left in-window for a single-slot role) is
 //! logged at `warn` so the operator can clean up the clutter.
 //!
-//! Blackout and news vertical-line pairs are collected as multi-slot
-//! lists and chronologically paired via
-//! [`trading_view::pair_lines::pair_vertical_lines`]; an odd count or a
-//! reversed pair is a hard error so a misdrawn chart can't silently
-//! arm half a window.
+//! Blackout and news windows are **not** collected here. They are resolved from
+//! the economic calendar at real event-minute precision by the pipeline's
+//! `calendar_windows` step (see [`crate::news_window`]) and pushed into
+//! `Roles::blackout_pairs` / `news_pairs` after `classify`. Drawn pause/resume
+//! /news vertical lines left on a chart are ignored.
 
 use color_eyre::eyre::Result;
 use tracing::{debug, info, warn};
 use trade_control_conventions::{
-    BLACKOUT_END_LABELS, BLACKOUT_START_LABELS, BREAK_LABELS, INVALIDATION_LABELS, NEWS_END_LABELS,
-    NEWS_START_LABELS, RETEST_LABELS, SR_LEVEL_LABELS, TRADE_EXPIRY_LABELS, matches,
-    prep_name_from_expiry_label,
+    BREAK_LABELS, INVALIDATION_LABELS, RETEST_LABELS, SR_LEVEL_LABELS, TRADE_EXPIRY_LABELS,
+    matches, prep_name_from_expiry_label,
 };
 
+use crate::news_window::NewsWindow;
 use trading_view::drawings::{Drawing, DrawingStub};
 use trading_view::mcp::TvMcp;
-use trading_view::pair_lines::{TimedAnchor, pair_vertical_lines};
+// `TimedAnchor::anchor_time` is still used by the single-slot pickers
+// (`pick_slot` / nearest-to) below; only the `pair_vertical_lines` pairing
+// helper is gone now that windows come from the calendar.
+use trading_view::pair_lines::TimedAnchor;
 
 /// Drawing kinds emitted by tv-mcp.
 mod kind {
@@ -102,10 +105,12 @@ pub struct Roles {
     pub tp_fib: Option<Drawing>,
     /// Vertical line marking the trade-expiry veto.
     pub trade_expiry: Option<Drawing>,
-    /// Chronologically paired blackout (pause/resume) windows.
-    pub blackout_pairs: Vec<(Drawing, Drawing)>,
-    /// Chronologically paired news-window pairs.
-    pub news_pairs: Vec<(Drawing, Drawing)>,
+    /// Blackout (pause/resume) windows, resolved from the calendar at real
+    /// event-minute precision. No longer read back off drawn chart lines —
+    /// see [`crate::news_window`].
+    pub blackout_pairs: Vec<NewsWindow>,
+    /// News windows (`news-start`/`news-end`), same calendar-resolved source.
+    pub news_pairs: Vec<NewsWindow>,
     /// Support / resistance horizontal lines. Each one contributes
     /// an `[lo, hi]` price band to the consolidated
     /// `06-close-on-reversal` alert (`inside_window` gets `price`
@@ -170,10 +175,6 @@ pub fn classify<F: DrawingFetcher>(
     let mut retest_lines: Vec<Drawing> = Vec::new();
     let mut tp_fibs: Vec<Drawing> = Vec::new();
     let mut trade_expiries: Vec<Drawing> = Vec::new();
-    let mut blackout_starts: Vec<Drawing> = Vec::new();
-    let mut blackout_ends: Vec<Drawing> = Vec::new();
-    let mut news_starts: Vec<Drawing> = Vec::new();
-    let mut news_ends: Vec<Drawing> = Vec::new();
     let mut sr_levels: Vec<Drawing> = Vec::new();
     // Prep-expiry lines, grouped by resolved canonical prep step so a
     // duplicate (re-armed) line keeps only the latest per step.
@@ -239,22 +240,11 @@ pub fn classify<F: DrawingFetcher>(
                 trade_expiries.push(d);
                 Some("trade_expiry")
             }
-            kind::VERTICAL_LINE if matches(lbl, BLACKOUT_START_LABELS) => {
-                blackout_starts.push(d);
-                Some("blackout_start")
-            }
-            kind::VERTICAL_LINE if matches(lbl, BLACKOUT_END_LABELS) => {
-                blackout_ends.push(d);
-                Some("blackout_end")
-            }
-            kind::VERTICAL_LINE if matches(lbl, NEWS_START_LABELS) => {
-                news_starts.push(d);
-                Some("news_start")
-            }
-            kind::VERTICAL_LINE if matches(lbl, NEWS_END_LABELS) => {
-                news_ends.push(d);
-                Some("news_end")
-            }
+            // Blackout (pause/resume) and news (news-start/news-end) windows are
+            // no longer read off drawn chart lines — they come from the calendar
+            // planner at real event-minute precision (see `crate::news_window`
+            // and the pipeline's `calendar_windows`). A stray pause/news vertical
+            // line left on the chart is simply ignored here.
             // M/W reversal path: no label (the tool has no text field),
             // so it's accepted purely on geometry — exactly 3 anchors,
             // all inside the visible range. A path that's the wrong
@@ -330,36 +320,10 @@ pub fn classify<F: DrawingFetcher>(
     roles.tp_fib = pick_slot(tp_fibs, "tp_fib", visible_range, slot_pref);
     roles.trade_expiry = pick_trade_expiry(trade_expiries, visible_range, slot_pref);
 
-    // Pause/resume and news-start/news-end lines that sit outside the
-    // scope window are stale leftovers from a prior setup — a window
-    // that may already have closed. Pairing them would mint a blackout
-    // whose `end_time` is in the past, which `build_pause_from_spec`
-    // rejects ("refusing to arm a stale blackout"). Drop off-window lines
-    // up front so only the relevant window is armed.
-    //
-    // Scope window: normally the visible range. Under `--start` the whole
-    // chart is in play, so bound the verticals to `[start, trade-expiry]`
-    // instead — a news/blackout line only matters if it falls within the
-    // trade's own lifetime. (No resolved expiry → no forward bound; the
-    // required-role check surfaces the missing expiry shortly.)
-    let vertical_window = match slot_pref {
-        SlotPref::NearestTo { start } => {
-            let expiry = roles
-                .trade_expiry
-                .as_ref()
-                .map(|d| d.anchor_time())
-                .unwrap_or(i64::MAX);
-            (start, expiry)
-        }
-        _ => visible_range,
-    };
-    let blackout_starts = in_visible_window(blackout_starts, "blackout_start", vertical_window);
-    let blackout_ends = in_visible_window(blackout_ends, "blackout_end", vertical_window);
-    let news_starts = in_visible_window(news_starts, "news_start", vertical_window);
-    let news_ends = in_visible_window(news_ends, "news_end", vertical_window);
-
-    roles.blackout_pairs = pair_vertical_lines(blackout_starts, blackout_ends, "blackout")?;
-    roles.news_pairs = pair_vertical_lines(news_starts, news_ends, "news")?;
+    // Blackout / news windows are populated later, in the pipeline, from the
+    // calendar planner (`calendar_windows`) — not from drawn chart lines. So
+    // `classify` leaves `roles.blackout_pairs` / `news_pairs` empty here; there
+    // is no readback, no independent start/end pruning, and no split-pair abort.
     roles.sr_levels = sr_levels;
     roles.prep_expiries = latest_prep_expiry_per_step(prep_expiry_lines);
     // M/W paths are already in-window-filtered by `is_mw_path`, so latest-wins
@@ -455,32 +419,6 @@ fn is_mw_path(d: &Drawing, (from, to): (i64, i64), pref: SlotPref) -> bool {
         return true;
     }
     d.points.iter().all(|p| p.time >= from && p.time <= to)
-}
-
-/// Keep only the vertical-line drawings whose anchor sits inside the
-/// visible window `[from, to]` (inclusive). Off-screen pause / resume /
-/// news lines are stale leftovers from a prior, possibly already-closed
-/// window — arming them would mint a blackout with a past `end_time` that
-/// `build_pause_from_spec` rejects. Each dropped line is logged so an
-/// operator who scrolled a line off-screen can see why it was ignored.
-fn in_visible_window(cands: Vec<Drawing>, role: &str, (from, to): (i64, i64)) -> Vec<Drawing> {
-    cands
-        .into_iter()
-        .filter(|d| {
-            let t = d.anchor_time();
-            let kept = t >= from && t <= to;
-            if !kept {
-                debug!(
-                    role,
-                    anchor_time = t,
-                    window_from = from,
-                    window_to = to,
-                    "vertical line ignored — anchor outside visible window",
-                );
-            }
-            kept
-        })
-        .collect()
 }
 
 /// Collapse the per-step prep-expiry candidates to one drawing each —
@@ -1057,8 +995,9 @@ mod tests {
     #[test]
     fn classifies_full_short_h_and_s_chart() {
         // Realistic short-trade chart: invalidation cap, neckline,
-        // retest, fib, trade-expiry, plus one blackout pair and one
-        // news pair and one S/R level.
+        // retest, fib, trade-expiry, and one S/R level. Stray
+        // blackout/news vertical lines are left on the chart to prove
+        // `classify` now IGNORES them (windows come from the calendar).
         let (stubs, mcp) = fixture(vec![
             (
                 stub("inv", "horizontal_line"),
@@ -1111,13 +1050,10 @@ mod tests {
         assert_eq!(roles.tp_fib.as_ref().unwrap().id, "fib");
         assert_eq!(roles.trade_expiry.as_ref().unwrap().id, "exp");
 
-        assert_eq!(roles.blackout_pairs.len(), 1);
-        assert_eq!(roles.blackout_pairs[0].0.id, "bs");
-        assert_eq!(roles.blackout_pairs[0].1.id, "be");
-
-        assert_eq!(roles.news_pairs.len(), 1);
-        assert_eq!(roles.news_pairs[0].0.id, "ns");
-        assert_eq!(roles.news_pairs[0].1.id, "ne");
+        // Drawn pause/resume and news-start/news-end lines are no longer
+        // classified — the calendar is the sole source of these windows.
+        assert!(roles.blackout_pairs.is_empty());
+        assert!(roles.news_pairs.is_empty());
 
         assert_eq!(roles.sr_levels.len(), 1);
         assert_eq!(roles.sr_levels[0].id, "sr");
@@ -1209,41 +1145,22 @@ mod tests {
     }
 
     #[test]
-    fn pause_and_news_lines_outside_visible_window_are_ignored() {
-        // Two pause/resume pairs and two news pairs: one of each sits
-        // inside the visible window [200, 500], the other is a stale
-        // leftover anchored before it. Only the in-window pair survives —
-        // off-screen lines would otherwise mint a blackout whose end_time
-        // is already in the past and `build_pause_from_spec` would reject.
+    fn drawn_pause_and_news_lines_are_ignored_regardless_of_window() {
+        // Blackout/news windows are resolved from the calendar, not from drawn
+        // chart lines. Any pause/resume/news-start/news-end verticals left on
+        // the chart — in or out of the visible window — are simply ignored, so
+        // `classify` never populates the pair lists. (This replaces the old
+        // window-filter tests, whose independent start/end pruning caused the
+        // `--start` straddle "1 start / 2 ends" abort.)
         let (stubs, mcp) = fixture(vec![
-            // Stale (off-screen) blackout pair — anchored well before the window.
-            (
-                stub("bs_old", "vertical_line"),
-                drawing("bs_old", "pause", vec![(10, 1.0)]),
-            ),
-            (
-                stub("be_old", "vertical_line"),
-                drawing("be_old", "resume", vec![(20, 1.0)]),
-            ),
-            // In-window blackout pair.
             (
                 stub("bs", "vertical_line"),
-                drawing("bs", "blackout-start", vec![(300, 1.0)]),
+                drawing("bs", "pause", vec![(300, 1.0)]),
             ),
             (
                 stub("be", "vertical_line"),
-                drawing("be", "blackout-end", vec![(350, 1.0)]),
+                drawing("be", "resume", vec![(350, 1.0)]),
             ),
-            // Stale (off-screen) news pair.
-            (
-                stub("ns_old", "vertical_line"),
-                drawing("ns_old", "news-start", vec![(30, 1.0)]),
-            ),
-            (
-                stub("ne_old", "vertical_line"),
-                drawing("ne_old", "news-end", vec![(40, 1.0)]),
-            ),
-            // In-window news pair.
             (
                 stub("ns", "vertical_line"),
                 drawing("ns", "news-start", vec![(400, 1.0)]),
@@ -1255,33 +1172,8 @@ mod tests {
         ]);
 
         let roles = classify(&mcp, &stubs, (200, 500), SlotPref::LatestWins).expect("classify ok");
-
-        // Exactly the in-window pairs survive; the off-screen lines are dropped.
-        assert_eq!(roles.blackout_pairs.len(), 1);
-        assert_eq!(roles.blackout_pairs[0].0.id, "bs");
-        assert_eq!(roles.blackout_pairs[0].1.id, "be");
-
-        assert_eq!(roles.news_pairs.len(), 1);
-        assert_eq!(roles.news_pairs[0].0.id, "ns");
-        assert_eq!(roles.news_pairs[0].1.id, "ne");
-    }
-
-    #[test]
-    fn pause_line_on_window_boundary_is_kept() {
-        // Anchors exactly on the window edges [200, 500] are inclusive —
-        // a line drawn at the boundary is on-screen and must survive.
-        let (stubs, mcp) = fixture(vec![
-            (
-                stub("bs", "vertical_line"),
-                drawing("bs", "pause", vec![(200, 1.0)]),
-            ),
-            (
-                stub("be", "vertical_line"),
-                drawing("be", "resume", vec![(500, 1.0)]),
-            ),
-        ]);
-        let roles = classify(&mcp, &stubs, (200, 500), SlotPref::LatestWins).expect("classify ok");
-        assert_eq!(roles.blackout_pairs.len(), 1);
+        assert!(roles.blackout_pairs.is_empty());
+        assert!(roles.news_pairs.is_empty());
     }
 
     #[test]
@@ -1707,53 +1599,6 @@ mod tests {
     /// `[start, trade-expiry]` — a pair before `start` or after the expiry is a
     /// stale/irrelevant leftover and is dropped; only a pair inside the trade's
     /// own lifetime survives.
-    #[test]
-    fn nearest_to_scopes_vertical_pairs_to_start_expiry() {
-        let (stubs, mcp) = fixture(vec![
-            // trade-expiry vertical at t=1000 — the forward bound.
-            (
-                stub("exp", "vertical_line"),
-                drawing("exp", "trade-expiry", vec![(1000, 0.0)]),
-            ),
-            // A news pair BEFORE start (400..450) — dropped.
-            (
-                stub("early-s", "vertical_line"),
-                drawing("early-s", "news-start", vec![(400, 0.0)]),
-            ),
-            (
-                stub("early-e", "vertical_line"),
-                drawing("early-e", "news-end", vec![(450, 0.0)]),
-            ),
-            // A news pair INSIDE [start, expiry] (700..750) — kept.
-            (
-                stub("mid-s", "vertical_line"),
-                drawing("mid-s", "news-start", vec![(700, 0.0)]),
-            ),
-            (
-                stub("mid-e", "vertical_line"),
-                drawing("mid-e", "news-end", vec![(750, 0.0)]),
-            ),
-            // A news pair AFTER expiry (1200..1250) — dropped.
-            (
-                stub("late-s", "vertical_line"),
-                drawing("late-s", "news-start", vec![(1200, 0.0)]),
-            ),
-            (
-                stub("late-e", "vertical_line"),
-                drawing("late-e", "news-end", vec![(1250, 0.0)]),
-            ),
-        ]);
-        // start=600, expiry resolves to 1000 → only the 700..750 pair qualifies.
-        let roles = classify(&mcp, &stubs, ANY_RANGE, SlotPref::NearestTo { start: 600 })
-            .expect("classify ok");
-        assert_eq!(
-            roles.news_pairs.len(),
-            1,
-            "only the in-[start,expiry] news pair survives"
-        );
-        let (s, _e) = &roles.news_pairs[0];
-        assert_eq!(s.id, "mid-s");
-    }
 
     #[test]
     fn latest_wins_drops_out_of_window_drawing_even_when_newer() {
@@ -1829,8 +1674,10 @@ mod tests {
     }
 
     #[test]
-    fn label_aliases_accepted() {
-        // `pause`/`resume` are aliases for `blackout-start`/`blackout-end`.
+    fn pause_resume_labels_are_no_longer_classified() {
+        // `pause`/`resume` (and `blackout-start`/`blackout-end`) verticals used
+        // to classify into a blackout pair. Windows now come from the calendar,
+        // so these labels are ignored — a stray drawn line arms nothing.
         let (stubs, mcp) = fixture(vec![
             (
                 stub("ps", "vertical_line"),
@@ -1842,7 +1689,7 @@ mod tests {
             ),
         ]);
         let roles = classify(&mcp, &stubs, ANY_RANGE, SlotPref::LatestWins).expect("ok");
-        assert_eq!(roles.blackout_pairs.len(), 1);
+        assert!(roles.blackout_pairs.is_empty());
     }
 
     #[test]
@@ -1856,34 +1703,6 @@ mod tests {
         let roles = classify(&mcp, &stubs, ANY_RANGE, SlotPref::LatestWins).expect("ok");
         assert!(roles.break_and_close.is_none());
         assert!(roles.retest.is_none());
-    }
-
-    #[test]
-    fn odd_blackout_count_errors() {
-        let (stubs, mcp) = fixture(vec![(
-            stub("bs", "vertical_line"),
-            drawing("bs", "blackout-start", vec![(300, 1.0)]),
-        )]);
-        let err = classify(&mcp, &stubs, ANY_RANGE, SlotPref::LatestWins).unwrap_err();
-        assert!(format!("{err}").contains("blackout"));
-    }
-
-    #[test]
-    fn reversed_news_pair_errors() {
-        let (stubs, mcp) = fixture(vec![
-            (
-                stub("ns", "vertical_line"),
-                drawing("ns", "news-start", vec![(500, 1.0)]),
-            ),
-            (
-                stub("ne", "vertical_line"),
-                drawing("ne", "news-end", vec![(400, 1.0)]),
-            ),
-        ]);
-        let err = classify(&mcp, &stubs, ANY_RANGE, SlotPref::LatestWins).unwrap_err();
-        let msg = format!("{err}");
-        assert!(msg.contains("news"), "msg = {msg}");
-        assert!(msg.contains("reversed"), "msg = {msg}");
     }
 
     #[test]

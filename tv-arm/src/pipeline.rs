@@ -37,6 +37,7 @@ use crate::args::PositionEntry;
 use crate::geometry::{horizontal_price, pcl_exhausted_price_from_fib, tp_price_from_fib};
 use crate::instrument_resolution::ResolvedInstrument;
 use crate::mw_geometry;
+use crate::news_window::NewsWindow;
 use crate::position_trade::{core_direction, resolve_levels};
 use crate::register_post::{post_intent_blocking, post_register_blocking};
 use crate::roles::{Roles, SlotPref, classify};
@@ -128,42 +129,42 @@ pub fn run(args: Args) -> Result<i32> {
     } else {
         SlotPref::WindowAware(view)
     };
-    let mut drawings = mcp.list_drawings().wrap_err("list TV drawings")?;
+    let drawings = mcp.list_drawings().wrap_err("list TV drawings")?;
     let mut roles = classify(&mcp, &drawings, view, slot_pref)?;
 
-    let should_auto_draw =
-        !args.skip_calendar_bars && roles.blackout_pairs.is_empty() && roles.news_pairs.is_empty();
-    if should_auto_draw {
-        // Auto-draw over the chart's visible range (`view`) so rewinding
-        // an OLD trade into view still draws the news bars it overlapped.
-        // The trade-expiry drawing only widens the horizon past the
-        // visible right edge (live multi-day trades zoomed in tight); if
-        // it's missing or unparseable we fall back to None — the visible
-        // edge then bounds the window, and check_required (step 3)
-        // surfaces the missing drawing as a hard error shortly anyway.
+    // Resolve blackout/news windows straight from the economic calendar at real
+    // event-minute precision and push them into `roles`. No chart lines are
+    // drawn and nothing is read back — the old draw + re-classify round-trip
+    // (which snapped every window to a bar boundary and could split a window
+    // straddling `--start` into an orphaned half) is gone. `--skip-calendar-bars`
+    // opts out entirely.
+    if !args.skip_calendar_bars {
+        // Scope the news filter to the trade's own lifetime `[cursor, expiry]`,
+        // NOT the chart's visible area:
+        //   - left edge = the cursor (`--start` when given, else the last loaded
+        //     bar `bars_range.to`) — so only news at or after "live now" matters,
+        //     independent of how far left the chart is scrolled;
+        //   - right edge = the trade-expiry vertical, so only news the open trade
+        //     could still run into is considered.
+        // A missing/unparseable expiry collapses the range to empty (no windows)
+        // rather than fetching across all of time; check_required (step 3)
+        // surfaces the absent expiry drawing as a hard error shortly anyway.
         let expiry_hint = read_trade_expiry(&roles).ok();
-        // Calendar auto-draw range: `--start` bounds it to `[start, expiry]`
-        // (the trade's own lifetime), so news bars are drawn relative to the
-        // cursor and never past the trade end — not whatever's on screen. The
-        // expiry_hint below still widens the effective end to the resolved
-        // expiry, so a bare `start` start-point with no expiry can't run the
-        // fetch across all of time. Else the visible range, as before.
-        let calendar_range = match (start, expiry_hint) {
-            (Some(s), Some(expiry)) => (s, expiry.timestamp()),
-            (Some(s), None) => (s, s),
-            (None, _) => view,
-        };
-        if let Err(e) = auto_draw_calendar_lines(
-            &mcp,
+        let calendar_range = calendar_scope_range(cursor_unix, expiry_hint);
+        match calendar_windows(
             &state.resolution,
             &resolved,
             calendar_range,
-            expiry_hint,
+            args.news_before_hours,
+            args.news_after_hours,
         ) {
-            warn!(error = ?e, "calendar auto-draw failed; continuing with chart as-is");
-        } else {
-            drawings = mcp.list_drawings().wrap_err("re-list TV drawings")?;
-            roles = classify(&mcp, &drawings, view, slot_pref)?;
+            Ok((blackout, news)) => {
+                roles.blackout_pairs = blackout;
+                roles.news_pairs = news;
+            }
+            Err(e) => {
+                warn!(error = ?e, "calendar window resolution failed; continuing with no news/blackout windows");
+            }
         }
     }
 
@@ -260,9 +261,6 @@ pub fn run(args: Args) -> Result<i32> {
     } else {
         cli::BuildStrictness::Lenient
     };
-    // Capture the expiry before `trade_spec` is consumed — it bounds the
-    // supplemental calendar window in step 8 (`calendar_window`).
-    let trade_expiry = trade_spec.trade_expiry;
     let built_trade =
         cli::build_trade_from_spec(trade_spec, now, strictness).wrap_err("build trade bundle")?;
     let trade_id = built_trade.trade_id.clone();
@@ -301,27 +299,10 @@ pub fn run(args: Args) -> Result<i32> {
         prune_as_of.at,
     )?;
 
-    // 8. Calendar bundles (skipped if auto-draw already handled it,
-    //    or if --skip-calendar-bars was passed). When auto-draw ran,
-    //    the operator now has blackout-/news-pairs on the chart, so
-    //    we skip the cli's calendar-bars step to avoid double-arming.
-    let built_calendar = if should_auto_draw || args.skip_calendar_bars {
-        Vec::new()
-    } else {
-        discover_or_fetch_calendar_bundles(
-            &args,
-            &state,
-            &trade_id,
-            &instrument,
-            &account,
-            broker,
-            &out_dir,
-            &key,
-            prune_as_of.at,
-            view,
-            trade_expiry,
-        )?
-    };
+    // 8. Calendar control bars now come from the calendar directly, resolved in
+    //    step 2 into `roles.blackout_pairs` / `news_pairs` and built into
+    //    `pause_bundles` / `news_bundles` above. The old drawn-line-era
+    //    supplemental `built_calendar` path was retired in PR1b.
 
     // 8b. (--register-plan) Fold the whole trade — main alert conditions PLUS
     //     the pause/news/calendar control bars built above — into ONE signed
@@ -349,7 +330,6 @@ pub fn run(args: Args) -> Result<i32> {
             &state.resolution,
             &pause_bundles,
             &news_bundles,
-            &built_calendar,
             &key,
             &account,
             now,
@@ -989,7 +969,8 @@ fn default_key_path() -> Result<PathBuf> {
 }
 
 /// Same precedence as [`read_key`] but returns the path instead of
-/// the bytes — needed for `CalendarBarsArgs.key_file`.
+/// the bytes — needed when a downstream builder wants the key-file path
+/// rather than the loaded key material.
 fn key_path_resolved() -> Result<PathBuf> {
     if let Ok(env) = env::var("TRADE_CONTROL_KEY_FILE")
         && !env.trim().is_empty()
@@ -1201,15 +1182,11 @@ fn round5(v: f64) -> f64 {
 /// In-memory representation of one built pause / news bundle so the
 /// payload loop downstream can iterate without re-reading disk.
 struct PauseBundle {
-    start: Drawing,
-    end: Drawing,
     built: cli::BuiltPause,
     out_dir: PathBuf,
 }
 
 struct NewsBundle {
-    start: Drawing,
-    end: Drawing,
     built: cli::BuiltNews,
     out_dir: PathBuf,
 }
@@ -1225,14 +1202,12 @@ struct NewsBundle {
 /// blackout". Drop it here, once, so the log line, `close_on_news`, and both
 /// bundle builders all see a consistent live-only view.
 fn drop_past_control_pairs(roles: &mut Roles, as_of: AsOf) {
-    let as_of_unix = as_of.at.timestamp();
-    let is_past = |pair: &(Drawing, Drawing)| pair.1.anchor_time_seconds() <= as_of_unix;
     for (kind, pairs) in [
         ("blackout", &mut roles.blackout_pairs),
         ("news", &mut roles.news_pairs),
     ] {
         let before = pairs.len();
-        pairs.retain(|p| !is_past(p));
+        pairs.retain(|w| !w.is_past(as_of.at));
         let dropped = before - pairs.len();
         if dropped > 0 {
             info!(
@@ -1340,10 +1315,9 @@ fn build_pause_bundles(
             "have blackout pairs but trade has no trade_id; refusing to arm"
         ));
     }
-    for (i, (start_d, end_d)) in roles.blackout_pairs.iter().enumerate() {
+    for (i, w) in roles.blackout_pairs.iter().enumerate() {
         let pair_idx = i + 1;
-        let start_iso = utc_iso(start_d.anchor_time_seconds())?;
-        let end_iso = utc_iso(end_d.anchor_time_seconds())?;
+        let start_time = w.start();
         let pause_dir = out_dir.join(format!("pause-{pair_idx}"));
         fs::create_dir_all(&pause_dir).with_context(|| format!("mkdir {}", pause_dir.display()))?;
         let spec = cli::PauseSpec {
@@ -1352,17 +1326,15 @@ fn build_pause_bundles(
             instrument: instrument.to_string(),
             account: account.to_string(),
             broker: broker_to_kind(broker),
-            start_time: parse_iso(&start_iso)?,
-            end_time: parse_iso(&end_iso)?,
-            reason: Some(format!("news:{instrument}-{start_iso}")),
+            start_time,
+            end_time: w.end(),
+            reason: Some(format!("news:{instrument}-{}", start_time.to_rfc3339())),
         };
         let built = cli::build_pause_from_spec(spec, now)
             .with_context(|| format!("build pause #{pair_idx}"))?;
         cli::write_pause(&built, key, &pause_dir)
             .with_context(|| format!("write pause #{pair_idx}"))?;
         bundles.push(PauseBundle {
-            start: start_d.clone(),
-            end: end_d.clone(),
             built,
             out_dir: pause_dir,
         });
@@ -1391,10 +1363,9 @@ fn build_news_bundles(
             "have news pairs but trade has no trade_id; refusing to arm"
         ));
     }
-    for (i, (start_d, end_d)) in roles.news_pairs.iter().enumerate() {
+    for (i, w) in roles.news_pairs.iter().enumerate() {
         let pair_idx = i + 1;
-        let start_iso = utc_iso(start_d.anchor_time_seconds())?;
-        let end_iso = utc_iso(end_d.anchor_time_seconds())?;
+        let start_time = w.start();
         let news_dir = out_dir.join(format!("news-{pair_idx}"));
         fs::create_dir_all(&news_dir).with_context(|| format!("mkdir {}", news_dir.display()))?;
         let spec = cli::NewsSpec {
@@ -1403,17 +1374,15 @@ fn build_news_bundles(
             instrument: instrument.to_string(),
             account: account.to_string(),
             broker: broker_to_kind(broker),
-            start_time: parse_iso(&start_iso)?,
-            end_time: parse_iso(&end_iso)?,
-            reason: Some(format!("news:{instrument}-{start_iso}")),
+            start_time,
+            end_time: w.end(),
+            reason: Some(format!("news:{instrument}-{}", start_time.to_rfc3339())),
         };
         let built = cli::build_news_from_spec(spec, now)
             .with_context(|| format!("build news #{pair_idx}"))?;
         cli::write_news(&built, key, &news_dir)
             .with_context(|| format!("write news #{pair_idx}"))?;
         bundles.push(NewsBundle {
-            start: start_d.clone(),
-            end: end_d.clone(),
             built,
             out_dir: news_dir,
         });
@@ -1539,66 +1508,69 @@ fn read_trade_expiry(roles: &Roles) -> Result<DateTime<Utc>> {
         .ok_or_else(|| eyre!("invalid trade_expiry timestamp {expiry_unix}"))
 }
 
-/// Resolve the calendar event window `[window_start, lookahead_end]` from
-/// the chart's visible range (`view = (from_unix, to_unix)`), widening the
-/// right edge to the trade expiry when that sits past the visible edge.
+/// Compute the calendar news-scope range `[cursor, expiry]` in unix seconds.
 ///
-/// The left edge (`window_start`) is the load-bearing fix for old trades:
-/// events before it are dropped, events after are kept regardless of `now`,
-/// so a trade rewound into view still draws the bars it overlapped. Returns
-/// `None` when the window is empty (`lookahead_end <= window_start`).
-fn calendar_window(
-    view: (i64, i64),
-    expiry_hint: Option<DateTime<Utc>>,
-) -> Result<Option<(DateTime<Utc>, DateTime<Utc>)>> {
-    let window_start = Utc
-        .timestamp_opt(view.0, 0)
-        .single()
-        .ok_or_else(|| eyre!("invalid visible-range start {}", view.0))?;
-    let visible_end = Utc
-        .timestamp_opt(view.1, 0)
-        .single()
-        .ok_or_else(|| eyre!("invalid visible-range end {}", view.1))?;
-    let lookahead_end = match expiry_hint {
-        Some(expiry) => expiry.max(visible_end),
-        None => visible_end,
-    };
-    if lookahead_end <= window_start {
-        return Ok(None);
-    }
-    Ok(Some((window_start, lookahead_end)))
+/// Left edge is the cursor (`--start` when given, else the last loaded bar) —
+/// so the scope is the trade's own lifetime, not the chart's visible area, and
+/// scrolling the chart doesn't change which news is considered. Right edge is
+/// the trade-expiry vertical; with no resolved expiry it collapses to the
+/// cursor, giving an empty range (`calendar_windows` then returns no windows)
+/// rather than fetching across all of time.
+fn calendar_scope_range(cursor_unix: i64, expiry_hint: Option<DateTime<Utc>>) -> (i64, i64) {
+    (
+        cursor_unix,
+        expiry_hint.map(|e| e.timestamp()).unwrap_or(cursor_unix),
+    )
 }
 
-/// Auto-draw vertical lines on the chart from forex-factory events
-/// over the window the operator is looking at. Used when the operator
-/// hasn't drawn any blackout/news pairs themselves.
+/// Resolve blackout (pause) and news windows from the economic calendar over
+/// the trade's own lifetime `[from, to]`, at real event-minute precision.
 ///
-/// The window is the chart's **visible range** (`view = (from, to)`),
-/// so it works for an OLD trade rewound into view — events the trade
-/// actually overlapped (all in the past relative to `now`) are still
-/// fetched and kept. The right edge is widened to the trade expiry when
-/// that is later than the visible edge, so a live multi-day H1+ trade
-/// zoomed in tight still picks up events out to expiry.
-fn auto_draw_calendar_lines(
-    mcp: &TvMcp,
+/// `range` is `[cursor, trade-expiry]` in unix seconds — the cursor (`--start`
+/// or the last loaded bar) as the left edge, the trade-expiry vertical as the
+/// right. It is used **verbatim**: the news filter is bounded to the trade's
+/// lifetime, NOT the chart's visible area, so scrolling the chart left/right no
+/// longer changes which events are considered. An empty or reversed range
+/// (`to <= from`, e.g. a missing expiry) yields no windows.
+///
+/// Returns `(blackout_windows, news_windows)`. Each kept event yields a
+/// **blackout** window `[event − before, event]` (no new entries in the run-up)
+/// and a **news** window `[event, event + after]` (post-release). `before` /
+/// `after` default to the chart timeframe's buffers, overridden per-run by
+/// `--news-before-hours` / `--news-after-hours` when set.
+///
+/// No chart lines are drawn and nothing is read back — the returned windows are
+/// pushed straight into `Roles`, preserving the true event minute (e.g. a 14:30
+/// event on an H1 chart) instead of snapping it to a bar boundary.
+fn calendar_windows(
     resolution: &str,
     resolved: &crate::instrument_resolution::ResolvedInstrument,
-    view: (i64, i64),
-    expiry_hint: Option<DateTime<Utc>>,
-) -> Result<()> {
+    range: (i64, i64),
+    before_hours: Option<f64>,
+    after_hours: Option<f64>,
+) -> Result<(Vec<NewsWindow>, Vec<NewsWindow>)> {
     let timeframe = infer_calendar_timeframe(resolution).ok_or_else(|| {
         eyre!("chart resolution {resolution:?} is below 15m; calendar bars skipped")
     })?;
-    let (window_start, lookahead_end) = match calendar_window(view, expiry_hint)? {
-        Some(w) => w,
-        None => {
-            info!("visible window is empty — nothing to auto-draw");
-            return Ok(());
-        }
-    };
-    // Synthesise the tcm Instrument straight from the catalog Asset
-    // so non-FX assets (SMI, gold, indices) get correct news-currency
-    // exposure without the FX-only cli::parse_instrument path.
+    let window_start = Utc
+        .timestamp_opt(range.0, 0)
+        .single()
+        .ok_or_else(|| eyre!("invalid calendar-range start {}", range.0))?;
+    let lookahead_end = Utc
+        .timestamp_opt(range.1, 0)
+        .single()
+        .ok_or_else(|| eyre!("invalid calendar-range end {}", range.1))?;
+    if lookahead_end <= window_start {
+        info!(
+            window_start = %window_start.to_rfc3339(),
+            lookahead_end = %lookahead_end.to_rfc3339(),
+            "calendar range is empty (to <= from) — no calendar windows",
+        );
+        return Ok((Vec::new(), Vec::new()));
+    }
+    // Synthesise the tcm Instrument straight from the catalog Asset so non-FX
+    // assets (SMI, gold, indices) get correct news-currency exposure without
+    // the FX-only cli::parse_instrument path.
     let instrument_parsed =
         crate::instrument_resolution::synthesize_calendar_instrument(resolved.asset);
     let runtime = tokio::runtime::Runtime::new().context("starting tokio runtime")?;
@@ -1606,7 +1578,6 @@ fn auto_draw_calendar_lines(
         .block_on(cli::fetch_events_for_range(window_start, lookahead_end))
         .wrap_err("fetch_events_for_range")?;
     let inputs = cli::PlanInputs {
-        // trade_id isn't used for the line geometry — empty string is fine.
         trade_id: String::new(),
         instrument: resolved.broker_symbol.clone(),
         account: String::new(),
@@ -1621,129 +1592,48 @@ fn auto_draw_calendar_lines(
         &inputs,
     )
     .wrap_err("plan_calendar_bars_within")?;
+
+    // Per-run buffer overrides. When a flag is absent, keep the planner's
+    // timeframe-derived spec boundary; when set, recompute from the event time.
+    let before = before_hours.map(hours_to_duration).transpose()?;
+    let after = after_hours.map(hours_to_duration).transpose()?;
+    let mut blackout = Vec::with_capacity(plan.rows.len());
+    let mut news = Vec::with_capacity(plan.rows.len());
+    for row in &plan.rows {
+        let pause_start = match before {
+            Some(d) => row.event_time - d,
+            None => row.pause_spec.start_time,
+        };
+        let news_end = match after {
+            Some(d) => row.event_time + d,
+            None => row.news_spec.end_time,
+        };
+        blackout.push(NewsWindow::new(pause_start, row.event_time));
+        news.push(NewsWindow::new(row.event_time, news_end));
+    }
     info!(
         events_fetched = events.len(),
         events_kept = plan.rows.len(),
+        blackout_windows = blackout.len(),
+        news_windows = news.len(),
         window_start = %window_start.to_rfc3339(),
         lookahead_end = %lookahead_end.to_rfc3339(),
-        "calendar fetch + plan",
+        "calendar windows resolved",
     );
-    if plan.rows.is_empty() {
-        info!("no calendar events in window — nothing to auto-draw");
-        return Ok(());
-    }
-    // For each event, draw two pause vertical lines and two news
-    // vertical lines (start + end of each window). The operator can
-    // re-run after editing the chart to fine-tune.
-    for row in &plan.rows {
-        draw_pair_lines(
-            mcp,
-            &row.pause_spec.start_time,
-            &row.pause_spec.end_time,
-            "pause",
-            "resume",
-        )?;
-        draw_pair_lines(
-            mcp,
-            &row.news_spec.start_time,
-            &row.news_spec.end_time,
-            "news-start",
-            "news-end",
-        )?;
-    }
-    info!(events = plan.rows.len(), "calendar lines auto-drawn");
-    Ok(())
+    Ok((blackout, news))
 }
 
-fn draw_pair_lines(
-    mcp: &TvMcp,
-    start: &DateTime<Utc>,
-    end: &DateTime<Utc>,
-    start_label: &str,
-    end_label: &str,
-) -> Result<()> {
-    let s = mcp.draw_vertical_line(start.timestamp(), 1.0, start_label)?;
-    let e = mcp.draw_vertical_line(end.timestamp(), 1.0, end_label)?;
-    if !s.success {
+/// Convert a fractional-hours buffer (e.g. `0.5` = 30 min) to a `Duration`.
+/// Negative values are a hard error — a buffer can't run backwards.
+fn hours_to_duration(hours: f64) -> Result<chrono::Duration> {
+    if hours < 0.0 || !hours.is_finite() {
         return Err(eyre!(
-            "tv-mcp draw {start_label} failed: {:?}",
-            s.error.as_deref().unwrap_or("(no error message)")
+            "news buffer hours must be finite and >= 0, got {hours}"
         ));
     }
-    if !e.success {
-        return Err(eyre!(
-            "tv-mcp draw {end_label} failed: {:?}",
-            e.error.as_deref().unwrap_or("(no error message)")
-        ));
-    }
-    Ok(())
-}
-
-/// Run the calendar-bars CLI and discover the resulting bundles.
-///
-/// Returns the in-memory [`cli::BuiltCalendarBundle`]s (carrying the signed
-/// pause/news intents + window times, so `--register-plan` can fold the same
-/// control actions into the `TradePlan` without re-parsing the YAML).
-#[allow(clippy::too_many_arguments)]
-fn discover_or_fetch_calendar_bundles(
-    args: &Args,
-    state: &trading_view::drawings::ChartState,
-    trade_id: &str,
-    instrument: &str,
-    account: &str,
-    broker: Broker,
-    out_dir: &Path,
-    key: &[u8; KEY_LEN],
-    // The arm's reference time — wall-clock now for a live `--register-plan`
-    // arm, the replay cursor for an offline `--plan-out` build. Passed through
-    // to `run_calendar_bars`, whose `build_pause_from_spec` /
-    // `build_news_from_spec` reject a pair whose window ended before it. Using
-    // the cursor here (not wall-clock now) is the second half of the
-    // stale-blackout fix: it keeps a historical replay's still-upcoming
-    // calendar bars from being rejected as "stale". See `pick_prune_as_of`.
-    as_of: DateTime<Utc>,
-    view: (i64, i64),
-    trade_expiry: DateTime<Utc>,
-) -> Result<Vec<cli::BuiltCalendarBundle>> {
-    if args.skip_calendar_bars {
-        return Ok(Vec::new());
-    }
-    let timeframe = match infer_calendar_timeframe(&state.resolution) {
-        Some(t) => t,
-        None => {
-            info!(resolution = %state.resolution, "below 15m — skipping calendar-bars");
-            return Ok(Vec::new());
-        }
-    };
-    let cli_broker = match broker {
-        Broker::Oanda => cli::CalendarBrokerArg::Oanda,
-        Broker::TradeNation => cli::CalendarBrokerArg::TradeNation,
-    };
-    let key_path = key_path_resolved()?;
-    let cb_args = cli::CalendarBarsArgs {
-        trade_id: trade_id.to_string(),
-        instrument: instrument.to_string(),
-        account: account.to_string(),
-        broker: cli_broker,
-        timeframe,
-        key_file: key_path,
-        output_dir: Some(out_dir.join("calendar-bars").join(trade_id)),
-        dry_run: false,
-    };
-    // Window the supplemental calendar over the visible chart range
-    // (widened to the trade expiry), so arming an OLD trade with manually
-    // drawn pairs still picks up the calendar events it overlapped instead
-    // of only this week's future events.
-    let window = calendar_window(view, Some(trade_expiry))?;
-    let built = match cli::run_calendar_bars(cb_args, *key, as_of, window) {
-        Ok(b) => b,
-        Err(e) => {
-            warn!(error = ?e, "calendar-bars failed; continuing without it");
-            return Ok(Vec::new());
-        }
-    };
-    info!(count = built.len(), "calendar bundles built");
-    Ok(built)
+    let secs = (hours * 3600.0).round() as i64;
+    chrono::Duration::try_seconds(secs)
+        .ok_or_else(|| eyre!("news buffer {hours}h is out of representable range"))
 }
 
 /// One registered plan as seen in the `plan-list` response — only the two
@@ -1853,7 +1743,6 @@ fn register_trade_plan(
     resolution: &str,
     pause_bundles: &[PauseBundle],
     news_bundles: &[NewsBundle],
-    built_calendar: &[cli::BuiltCalendarBundle],
     key: &[u8; KEY_LEN],
     account: &str,
     now: DateTime<Utc>,
@@ -1887,7 +1776,7 @@ fn register_trade_plan(
     // appender reads (each carries the signed intents + window times).
     let pauses: Vec<&cli::BuiltPause> = pause_bundles.iter().map(|b| &b.built).collect();
     let newses: Vec<&cli::BuiltNews> = news_bundles.iter().map(|b| &b.built).collect();
-    append_control_rules(&mut plan, &pauses, &newses, built_calendar);
+    append_control_rules(&mut plan, &pauses, &newses);
     let rule_count = plan.rules.len();
     // Dump the fully-built plan (control rules folded in) for offline replay,
     // before `build_register_intent` moves it into the register intent.
@@ -1927,20 +1816,6 @@ fn register_trade_plan(
 /// Derived from the sub-second clock — no rand dependency.
 fn register_suffix(now: DateTime<Utc>) -> String {
     format!("{:06}", now.timestamp_subsec_micros() % 1_000_000)
-}
-
-fn utc_iso(unix: i64) -> Result<String> {
-    let dt = Utc
-        .timestamp_opt(unix, 0)
-        .single()
-        .ok_or_else(|| eyre!("invalid epoch {unix}"))?;
-    Ok(dt.format("%Y-%m-%dT%H:%M:%SZ").to_string())
-}
-
-fn parse_iso(s: &str) -> Result<DateTime<Utc>> {
-    DateTime::parse_from_rfc3339(s)
-        .map(|d| d.with_timezone(&Utc))
-        .map_err(|e| eyre!("parse_iso({s:?}): {e}"))
 }
 
 // `Drawing::anchor_time_seconds` shim — `TimedAnchor::anchor_time`
@@ -1985,6 +1860,15 @@ mod tests {
             at,
             source: "wallclock",
         }
+    }
+
+    /// A `NewsWindow` from two unix-second boundaries — the calendar-resolved
+    /// replacement for the old `(vline, vline)` drawn pair in these tests.
+    fn nw(start_unix: i64, end_unix: i64) -> NewsWindow {
+        NewsWindow::new(
+            DateTime::<Utc>::from_timestamp(start_unix, 0).expect("valid start"),
+            DateTime::<Utc>::from_timestamp(end_unix, 0).expect("valid end"),
+        )
     }
 
     #[test]
@@ -2040,6 +1924,29 @@ mod tests {
         assert_eq!(prep_expiry_steps(&roles), vec!["break-and-close", "retest"]);
     }
 
+    // ===== calendar news-scope range ====================================
+
+    #[test]
+    fn calendar_scope_range_is_cursor_to_expiry() {
+        // With an expiry, the range is [cursor, expiry] verbatim — the chart's
+        // visible area plays no part.
+        let cursor = now().timestamp();
+        let expiry = now() + chrono::Duration::hours(30);
+        let range = calendar_scope_range(cursor, Some(expiry));
+        assert_eq!(range, (cursor, expiry.timestamp()));
+    }
+
+    #[test]
+    fn calendar_scope_range_without_expiry_is_empty() {
+        // No resolved expiry → right edge collapses to the cursor, giving an
+        // empty [t, t] range so `calendar_windows` yields nothing (rather than
+        // fetching across all of time).
+        let cursor = now().timestamp();
+        let range = calendar_scope_range(cursor, None);
+        assert_eq!(range, (cursor, cursor));
+        assert!(range.1 <= range.0, "empty range: to <= from");
+    }
+
     // ===== past control-pair drop =======================================
 
     #[test]
@@ -2049,20 +1956,20 @@ mod tests {
         // survive — an elapsed window has nothing left to act on, and feeding
         // it to build_pause/news_from_spec would hard-fail as a "stale" arm.
         let t = now().timestamp();
-        let live = (vline("ls", t + 1800), vline("le", t + 3600));
-        let past = (vline("ps", t - 7200), vline("pe", t - 3600));
+        let live = nw(t + 1800, t + 3600);
+        let past = nw(t - 7200, t - 3600);
         let mut roles = Roles {
-            blackout_pairs: vec![past.clone(), live.clone()],
-            news_pairs: vec![past.clone(), live.clone()],
+            blackout_pairs: vec![past, live],
+            news_pairs: vec![past, live],
             ..Default::default()
         };
 
         drop_past_control_pairs(&mut roles, wallclock(now()));
 
         assert_eq!(roles.blackout_pairs.len(), 1);
-        assert_eq!(roles.blackout_pairs[0].1.id, "le");
+        assert_eq!(roles.blackout_pairs[0], live);
         assert_eq!(roles.news_pairs.len(), 1);
-        assert_eq!(roles.news_pairs[0].1.id, "le");
+        assert_eq!(roles.news_pairs[0], live);
     }
 
     #[test]
@@ -2071,10 +1978,11 @@ mod tests {
         // live; one ending exactly at `now` is treated as elapsed (the gate
         // is `end <= now`), mirroring build_pause_from_spec's own check.
         let t = now().timestamp();
+        let live = nw(t, t + 1); // ends 1s out → live
         let mut roles = Roles {
             news_pairs: vec![
-                (vline("a_s", t - 60), vline("a_e", t)), // ends exactly now → past
-                (vline("b_s", t), vline("b_e", t + 1)),  // ends 1s out → live
+                nw(t - 60, t), // ends exactly now → past
+                live,          // ends 1s out → live
             ],
             ..Default::default()
         };
@@ -2082,7 +1990,7 @@ mod tests {
         drop_past_control_pairs(&mut roles, wallclock(now()));
 
         assert_eq!(roles.news_pairs.len(), 1);
-        assert_eq!(roles.news_pairs[0].1.id, "b_e");
+        assert_eq!(roles.news_pairs[0], live);
     }
 
     // ===== as-of selection for control-pair pruning =====================
@@ -2109,7 +2017,7 @@ mod tests {
         // An event 12h after the cursor (still in the past vs `now`) survives.
         let event_end = cursor.timestamp() + 12 * 3600;
         let mut roles = Roles {
-            blackout_pairs: vec![(vline("s", event_end - 1800), vline("e", event_end))],
+            blackout_pairs: vec![nw(event_end - 1800, event_end)],
             ..Default::default()
         };
         drop_past_control_pairs(&mut roles, as_of);

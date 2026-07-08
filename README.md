@@ -207,6 +207,18 @@ Per-trade window state (paired alerts):
   with `news` in its `inside_window` list) to flatten the trade on an
   opposing reversal candle.
 
+These four control edges are **wall-clock**, not bar-quantised (v70). Each is a
+`TimeReached` rule whose epoch `tv-arm` bakes at the real event minute
+(e.g. 14:30), and the engine opens/closes the window the instant the tick's
+wall-clock reaches that epoch — **not** on the next bar close. The worker's
+engine cron runs every 5s, so a 14:30 event on an H1 chart blacks out at
+~14:30:05, not 15:00. Guards (`trade-expiry` etc.) stay candle-driven; only the
+pause/resume/news-start/news-end controls moved to wall-clock. The offline replay
+reproduces this exactly: it owns a virtual clock and injects a sub-bar tick at
+each control epoch that lands between two bar closes, so a replayed blackout
+opens at the same instant the live worker would. See CHANGELOG "sub-bar
+wall-clock news/blackout gating".
+
 ## Alert basenames emitted by `build-trade`
 
 When `tv-arm` (the chart-arming binary) calls `trade-control build-trade
@@ -231,9 +243,13 @@ its functionality folds into a single `06-close-on-reversal` whose
 recognised by the worker for inbound decode of any in-flight alerts
 left over from the old shape.
 
-Each news pair adds two more (`01-news-start-<id>` + `02-news-end-<id>`)
-via a separate `build-news` shell-out, and each pause pair adds
-`01-pause-<id>` + `02-resume-<id>` via `build-pause`.
+Each news window adds two more control rules (`01-news-start-<id>` +
+`02-news-end-<id>`) and each blackout window adds `01-pause-<id>` +
+`02-resume-<id>`. These windows are resolved from the forex-factory
+calendar at arm time (over `[cursor, trade-expiry]`) and folded straight
+into the registered `TradePlan` — there's no longer a `build-news` /
+`build-pause` shell-out (those subcommands were retired in v68; the
+worker still decodes any old-shape bundles still in flight).
 
 ### M/W (double-top / double-bottom) bundle
 
@@ -1734,10 +1750,10 @@ pair per event, then drops any pair whose window has already elapsed. The
   cursor). When a chart carries *both* a stray
   M/W path and an H&S neckline, the arm defers to whichever is anchored nearer
   `--start` (path neckline `C` vs the drawn neckline) — so a leftover path from
-  an earlier setup can't hijack an H&S arm into M/W. The news/blackout vertical pairs
-  (and the auto-drawn calendar bars) are scoped to `[start, trade-expiry]` — a
-  pair outside the trade's own lifetime is dropped. The prune as-of becomes
-  `--start` (`source=start-flag`).
+  an earlier setup can't hijack an H&S arm into M/W. The calendar news/blackout
+  windows are scoped to `[cursor, trade-expiry]` where the cursor is `--start`
+  (else the last loaded bar) — an event outside the trade's own lifetime is
+  dropped. The prune as-of becomes `--start` (`source=start-flag`).
   This is the journaling workflow: put TradingView in replay mode with the last
   visible candle mid-right-shoulder, but **leave the future candles on screen** —
   `--start <shoulder-time>` anchors the arm to that moment regardless of what's
@@ -1751,16 +1767,17 @@ pair per event, then drops any pair whose window has already elapsed. The
   up the TV chart's replay cursor before replaying. The worker ignores
   `replay_start`; it's a journaling aid.
 
-**Zero-length blackout/news pairs are dropped, not fatal.** When `tv-arm`
-auto-draws calendar lines and reads them back, TradingView snaps each vertical
-line to its bar's timestamp — so two distinct planned times that fall in the same
-bar (e.g. one event's `resume` and the next event's `pause` 8h apart on an H1+
-chart) come back on the *same* timestamp. The readback pairing
-(`trading-view/src/pair_lines.rs`) zips sorted starts to sorted ends and now
-**drops any pair whose start and end snapped to the same time** — a zero-length
-window arms nothing — instead of hard-erroring `blackout pair is reversed` and
-aborting the whole arm. A genuinely reversed pair (`start > end`, drawn out of
-order) is still a hard error.
+**News/blackout windows no longer round-trip through drawn chart lines
+(2026-07).** `tv-arm` used to draw pause/resume/news vertical lines and read them
+back, which snapped each window to a bar boundary and — because sorted starts and
+ends were pruned independently against `[cursor, expiry]` — could split a window
+straddling the cursor into an orphaned half (`blackout lines must come in matched
+start/end pairs; found 1 start and 2 ends`). That whole pathway is gone: windows
+come straight from the calendar as `NewsWindow`s at real event-minute precision
+(see the calendar section above). No draw, no readback, no pairing — so bar-snap
+zero-length windows and split-pair aborts are both structurally impossible. The
+`pair_lines` module now holds only the `TimedAnchor` trait; `pair_vertical_lines`
+and the drawn-line classification are deleted.
 
 ## Brokers
 
@@ -2503,8 +2520,7 @@ What you draw on the chart:
 | Fib retracement | (label optional) | Drives both TP (`2 × neckline − head`) and the `pcl-exhausted` veto price (`midpoint + 0.8 × (TP − midpoint)`). Draw spanning **head → neckline**. |
 | Vertical line | `trade-expiry` | `not_after` for every alert in the bundle. |
 | Vertical line | `<prep>-expiry` (`break-and-close-expiry`, `retest-expiry`; aliases `neckline-expiry` / `retrace-expiry`) | Cutoff for that prep: emits an `08-prep-expire-<step>` alert that blocks the prep once crossed, so a setup whose prep lands too late never enters. **tv-arm errors** if the line is in the future but its prep trend line is missing (the setup could never enter); **warns** if the line is in the past (re-arm later). |
-| Vertical line pair | `news-start` / `news-end` | Each pair emits a `build-news` bundle. **Presence of any *live* pair also adds `news` to the consolidated `06-close-on-reversal` alert's `inside_window`** — no extra flag. **Only lines anchored inside the chart's visible window are armed** — off-screen lines are treated as stale leftovers and ignored. **A pair whose window has already fully elapsed (`end_time ≤ now`) is also dropped silently** — common when arming off a chart showing historical bars (the line is on-screen but its window has passed in wall-clock terms); there is nothing left to act on, so it is no longer a hard "stale blackout" rejection. |
-| Vertical line pair | `blackout-start` / `blackout-end` (or `pause` / `resume` aliases) | Each pair emits a `build-pause` bundle. Blocks entries while active. **Only lines anchored inside the chart's visible window are armed** — off-screen lines are ignored as stale. **A pair whose window has already fully elapsed (`end_time ≤ now`) is dropped silently** rather than rejected, so arming off a historical chart no longer fails on a past blackout. |
+| ~~Vertical line pair~~ `news-start`/`news-end`, `blackout-start`/`blackout-end` (aliases `pause`/`resume`) | **No longer classified (2026-07).** News and blackout windows are resolved from the forex-factory calendar over `[cursor, trade-expiry]` and pushed into the plan directly (see "News/blackout windows come from the calendar" below). Any such vertical lines left on the chart are **ignored** — no `build-news`/`build-pause` bundle, no arming. The *presence of any live news window still adds `news` to the `06-close-on-reversal` alert's `inside_window`*, but that window now comes from the calendar, not a drawn pair. A window whose `end_time ≤ cursor` is dropped silently (nothing left to act on). |
 | Horizontal line | `support` or `resistance` | Each line adds an `[lo, hi]` band of ±`--reversal-band-pct` (default `0.1%`) to the `06-close-on-reversal` alert's `sr_bands` list, and adds `price` to its `inside_window`. Multiple lines union. |
 
 > **Single-slot roles are scoped to the visible window.** The invalidation,
@@ -2668,29 +2684,40 @@ triggers and vetos.
 
 **Calendar / news bars are folded into the plan too.** A registered plan
 carries not just the trade's own conditions but the **pause/resume** (blackout)
-and **news-start/news-end** (news-window) control bars — both the operator's
-chart-drawn pairs and the auto-fetched forex-factory events. Each becomes a `TimeReached` rule
-carrying the matching `pause` / `resume` / `news-start` / `news-end` intent and
-firing at the window edge; the engine fires them **non-terminally** (they set
-the blackout / news-window KV state without ending the trade's spine) and the
-cron dispatches them through the same handlers the webhook uses. In `--shadow`
-they're logged, not applied, like every other fire. (Before this, a
-`--register-plan` produced a plan with *no* calendar bars — the register POST
-ran before the bundles were built; fixed in Stage E.10 / v37.) The folding lives
-in `append_control_rules` (`tv-arm/src/trade_plan_build.rs`); the non-terminal
+and **news-start/news-end** (news-window) control bars, resolved from the
+forex-factory economic calendar. Each becomes a `TimeReached` rule carrying the
+matching `pause` / `resume` / `news-start` / `news-end` intent and firing at the
+window edge; the engine fires them **non-terminally** (they set the blackout /
+news-window KV state without ending the trade's spine) and the cron dispatches
+them through the same handlers the webhook uses. In `--shadow` they're logged,
+not applied, like every other fire. The intent format is unchanged, so the
+worker/engine still enforce these exactly as before. The folding lives in
+`append_control_rules` (`tv-arm/src/trade_plan_build.rs`); the non-terminal
 evaluation is `evaluate_controls` (`engine/src/evaluate.rs`).
 
-The auto-fetched events are windowed over the **chart's visible range**
-(`get_range().visible_range`), widened to the trade expiry when that sits past
-the visible right edge. This is what lets you re-arm an **old** trade scrolled
-back into view and still get the news bars it overlapped — events in the visible
-window are kept even though they're all in the past relative to `now`. (Before
-this, the calendar fetch was anchored to `now` and only looked forward, so an
-old trade silently got *zero* news bars; manually drawn `news-start`/`news-end`
-pairs were unaffected and always armed.) Both the auto-draw path
-(`auto_draw_calendar_lines`) and the supplemental fetch when you've hand-drawn
-some pairs (`discover_or_fetch_calendar_bundles` → `run_calendar_bars`) use the
-visible window via the shared `calendar_window` helper.
+**News/blackout windows come from the calendar, not drawn chart lines
+(2026-07).** tv-arm no longer draws pause/resume/news-start/news-end vertical
+lines and reads them back — that round-trip snapped every window to a bar
+boundary (losing a real 14:30 event minute on an H1 chart) and, worse, pruned a
+window's start and end independently so a window straddling `--start` split into
+an orphaned half and aborted the arm ("blackout lines must come in matched
+start/end pairs; found 1 start and 2 ends"). Instead, `calendar_windows`
+(`tv-arm/src/pipeline.rs`) fetches the events and pushes each computed window
+straight into the plan as a `NewsWindow` at **real event-minute precision** — no
+tv-mcp draws, no readback, no pairing step, so the split-pair failure is
+structurally impossible. **Any pause/resume/news lines left on the chart are now
+ignored.**
+
+The events are windowed over the **trade's own lifetime `[cursor, trade-expiry]`**
+— *not* the chart's visible area. The `cursor` is `--start` when given, else the
+last loaded bar (`bars_range.to`); the right edge is the trade-expiry vertical.
+So scrolling or zooming the chart no longer changes which news is considered —
+only events the open trade could actually run into are armed. A missing expiry
+collapses the range to empty (no windows) and the required-role check surfaces
+the absent expiry drawing. The scope helper is `calendar_scope_range`. Two flags
+override the window width around each event: `--news-before-hours` (blackout
+run-up, default = the chart timeframe's `buffer_before`, 8h on H1+) and
+`--news-after-hours` (post-release news window, default 1h).
 
 The plan builder
 is `tv-arm/src/trade_plan_build.rs` (the inverse of `alert_spec.rs`); the

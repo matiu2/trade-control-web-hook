@@ -17,7 +17,8 @@ use trade_control_core::pause_gate;
 use trade_control_core::state::MemStateStore;
 use trade_control_engine::BidAskCandle as EngineCandle;
 use trade_control_engine::{
-    Candle, FiredIntent, Granularity, PlanState, TradePlan, evaluate_plan, seed_plan_state,
+    Candle, FiredIntent, Granularity, PlanState, TradePlan, Trigger, evaluate_controls_only,
+    evaluate_plan, seed_plan_state,
 };
 
 use super::replay_broker::ReplayBroker;
@@ -214,6 +215,28 @@ pub async fn run(
         // close time as `now` so wall-clock-derived state (TTLs, logging) lines
         // up with the live worker, which ticks on wall-clock, not bar-open.
         let now = candles[i].time + bar;
+
+        // Sub-bar control ticks: before this bar's close, replay any pause/news
+        // window edge whose wall-clock epoch fell *inside* the just-elapsed bar
+        // (a 14:30 event on an H1 chart, between the 14:00 and 15:00 closes). The
+        // live worker's 5s cron opens/closes it there; the replay's virtual clock
+        // reproduces that exactly by running the SAME `evaluate_controls_only` at
+        // each such epoch. `i >= seed_end >= 1`, so `i - 1` is always valid — the
+        // prior close and the last-closed bar (`mid[i - 1]`) are the shell.
+        let prev_close = candles[i - 1].time + bar;
+        inject_control_ticks(
+            plan,
+            &mut state,
+            &store,
+            &mut fires,
+            &mid[i - 1],
+            &candles[i..],
+            prev_close,
+            now,
+            expires_at,
+        )
+        .await;
+
         // Pin the store's clock to this tick so historically-dated pause TTLs
         // aren't judged "expired" against real wall-clock — the same
         // wall-clock-vs-cursor trap that drops blackout state in replay.
@@ -500,6 +523,105 @@ fn mark_superseded(fires: &mut [Fire], broker: &ReplayBroker) {
     }
 }
 
+/// The distinct, ascending, unfired control-rule epochs (pause/resume/
+/// news-start/news-end `TimeReached`) that fall **strictly between** `lo` and
+/// `hi` — i.e. inside a bar, not on either bar close. The bar ticks already fire
+/// any epoch that lands on a close, so injecting those again would double-fire;
+/// the latch (`state.fired`) makes a duplicate harmless but we keep the interval
+/// half-open on both ends to be explicit.
+fn control_epochs_between(
+    plan: &TradePlan,
+    state: &PlanState,
+    lo: DateTime<Utc>,
+    hi: DateTime<Utc>,
+) -> Vec<DateTime<Utc>> {
+    let (lo, hi) = (lo.timestamp(), hi.timestamp());
+    let mut epochs: Vec<i64> = plan
+        .rules
+        .iter()
+        .filter(|r| {
+            matches!(
+                r.intent.action,
+                Action::Pause | Action::Resume | Action::NewsStart | Action::NewsEnd
+            ) && !state.fired.contains(&r.rule_id)
+        })
+        .filter_map(|r| match r.trigger {
+            Trigger::TimeReached { at_epoch } if at_epoch > lo && at_epoch < hi => Some(at_epoch),
+            _ => None,
+        })
+        .collect();
+    epochs.sort_unstable();
+    epochs.dedup();
+    epochs
+        .into_iter()
+        .filter_map(|e| DateTime::from_timestamp(e, 0))
+        .collect()
+}
+
+/// Inject the worker's sub-bar control ticks into the replay. The live worker's
+/// 5s cron opens/closes a pause or news window the instant its wall-clock epoch
+/// passes — which, for an event baked at a sub-bar minute (14:30 on H1), is
+/// **between** two bar closes. The replay owns a virtual clock, so it reproduces
+/// that exactly: for each unfired control epoch in `(prev_close, this_close)` it
+/// pins the clock to the epoch and runs [`evaluate_controls_only`] — the SAME
+/// engine entry point the worker's candle-less tick calls — so both drivers
+/// open/close every window at the identical instant
+/// (`[[strategy_changes_in_both_replayer_and_worker]]`).
+///
+/// Control fires never fill and are always `NotAnEnter`; pause/resume seed the
+/// same store state the enter gate reads (via the same `pause_gate` helpers the
+/// bar loop uses), and news-start/news-end are reflected in the returned `state`
+/// (`open_news_windows`). `last_candle` is the last closed bar (the fire shell);
+/// `forward` is unused for a non-filling control fire but recorded for shape.
+#[allow(clippy::too_many_arguments)]
+async fn inject_control_ticks(
+    plan: &TradePlan,
+    state: &mut PlanState,
+    store: &MemStateStore,
+    fires: &mut Vec<Fire>,
+    last_candle: &Candle,
+    forward: &[EngineCandle],
+    prev_close: DateTime<Utc>,
+    this_close: DateTime<Utc>,
+    expires_at: DateTime<Utc>,
+) {
+    for epoch in control_epochs_between(plan, state, prev_close, this_close) {
+        store.set_clock(epoch);
+        let eval = evaluate_controls_only(plan, state, last_candle, epoch, expires_at);
+        *state = eval.new_state;
+        for fired in eval.fired {
+            tracing::debug!(
+                virtual_tick = %epoch,
+                rule = %fired.rule_id,
+                action = ?fired.intent.action,
+                "sub-bar control tick fired"
+            );
+            match fired.intent.action {
+                Action::Pause => {
+                    if let Err(e) = pause_gate::apply_pause(store, &fired.intent, epoch).await {
+                        tracing::error!(rule = %fired.rule_id, error = %e, "apply_pause failed");
+                    }
+                }
+                Action::Resume => {
+                    if let Err(e) = pause_gate::apply_resume(store, &fired.intent).await {
+                        tracing::error!(rule = %fired.rule_id, error = %e, "apply_resume failed");
+                    }
+                }
+                // NewsStart / NewsEnd are reflected in `state.open_news_windows`
+                // already (the engine mutated it); nothing to seed in the store.
+                _ => {}
+            }
+            fires.push(Fire {
+                fired,
+                forward: forward.to_vec(),
+                gate_outcome: EnterGateOutcome::NotAnEnter,
+                superseded: false,
+                entry_spread_price: None,
+            });
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -740,6 +862,114 @@ mod tests {
         assert!(
             report.contains("TP: 0  SL: 0"),
             "a suppressed enter is not tallied as a win:\n{report}"
+        );
+    }
+
+    #[tokio::test]
+    async fn sub_bar_pause_epoch_opens_via_virtual_tick_and_suppresses_enter() {
+        // PR2 parity: the pause epoch is at 10.5h — BETWEEN the bar-10 close
+        // (11h) and... no: it lands strictly inside bar 10's life (open 10h,
+        // close 11h), i.e. in the injection interval for bar 10
+        // (prev_close 10h, this_close 11h). The live worker's 5s cron would open
+        // the blackout at 10.5h; the replay injects a virtual tick there. The
+        // enter crosses at bar 12, well after 10.5h, so the (still-open) blackout
+        // must suppress it — exactly as the bar-aligned pause test does, but now
+        // proving the SUB-BAR open path.
+        let mut candles: Vec<EngineCandle> = (0..10).map(|i| candle(i * 3600, 1.1040)).collect();
+        candles.push(candle(10 * 3600, 1.1040)); // bar 10
+        candles.push(candle(11 * 3600, 1.1045)); // bar 11
+        candles.push(ohlc(12 * 3600, 1.1045, 1.1058, 1.1042, 1.1055)); // bar 12: enter cross
+        candles.push(ohlc(13 * 3600, 1.1060, 1.1120, 1.1055, 1.1110));
+        candles.push(ohlc(14 * 3600, 1.1110, 1.1310, 1.1185, 1.1300));
+
+        let pause_epoch = 10 * 3600 + 1800; // 10.5h — sub-bar, inside bar 10
+        let resume_epoch = 100 * 3600; // far past — blackout stays active
+        let r = run(
+            &paused_enter_plan(pause_epoch, resume_epoch),
+            &candles,
+            Granularity::H1,
+            all_live(),
+            expires(),
+        )
+        .await;
+
+        // The pause fired at its exact sub-bar epoch via a virtual tick.
+        let pause = r
+            .fires
+            .iter()
+            .find(|f| f.fired.rule_id == "01-pause-cad-gdp")
+            .expect("sub-bar pause fired");
+        assert_eq!(
+            pause.fired.intent.action,
+            Action::Pause,
+            "the sub-bar control fire is the pause"
+        );
+
+        // And it suppressed the later enter, same as a bar-aligned blackout.
+        let enter = r
+            .fires
+            .iter()
+            .find(|f| f.fired.rule_id == "05-enter")
+            .expect("enter fired");
+        assert_eq!(
+            enter.suppressed_by(),
+            vec!["cad-gdp(CAD GDP)".to_string()],
+            "the enter must be suppressed by the sub-bar-opened cad-gdp blackout"
+        );
+    }
+
+    #[tokio::test]
+    async fn virtual_tick_opens_window_at_same_instant_as_worker_controls_only() {
+        // Parity invariant: the replay's virtual tick and the worker's
+        // candle-less tick both call `evaluate_controls_only`, so a sub-bar epoch
+        // opens the window at the SAME instant in each. Here we drive both paths
+        // directly and assert they agree.
+        let pause_epoch = 10 * 3600 + 1800; // 10.5h, sub-bar
+        let plan = paused_enter_plan(pause_epoch, 100 * 3600);
+        let prior = seed_plan_state(&plan, &[], expires());
+        let last = Candle {
+            time: Utc.timestamp_opt(10 * 3600, 0).unwrap(),
+            o: 1.1,
+            h: 1.1,
+            l: 1.1,
+            c: 1.1,
+        };
+        let epoch_dt = Utc.timestamp_opt(pause_epoch, 0).unwrap();
+
+        // Worker path: control-only eval at the epoch.
+        let worker = evaluate_controls_only(&plan, &prior, &last, epoch_dt, expires());
+        let worker_ids: Vec<&str> = worker.fired.iter().map(|f| f.rule_id.as_str()).collect();
+        assert_eq!(worker_ids, vec!["01-pause-cad-gdp"]);
+
+        // Replay path: the epoch is inside the (10h, 11h) bar interval, so the
+        // injector picks it up, and firing it lands the SAME rule.
+        let picked = control_epochs_between(
+            &plan,
+            &prior,
+            Utc.timestamp_opt(10 * 3600, 0).unwrap(),
+            Utc.timestamp_opt(11 * 3600, 0).unwrap(),
+        );
+        assert_eq!(picked, vec![epoch_dt], "injector picks the sub-bar epoch");
+
+        let store = MemStateStore::default();
+        let mut fires = Vec::new();
+        let mut state = prior.clone();
+        inject_control_ticks(
+            &plan,
+            &mut state,
+            &store,
+            &mut fires,
+            &last,
+            &[],
+            Utc.timestamp_opt(10 * 3600, 0).unwrap(),
+            Utc.timestamp_opt(11 * 3600, 0).unwrap(),
+            expires(),
+        )
+        .await;
+        let replay_ids: Vec<&str> = fires.iter().map(|f| f.fired.rule_id.as_str()).collect();
+        assert_eq!(
+            replay_ids, worker_ids,
+            "replay virtual tick fires the same control rule as the worker"
         );
     }
 

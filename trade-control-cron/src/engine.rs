@@ -60,7 +60,7 @@ use trade_control_core::state::{StateStore, StoredPlan};
 use trade_control_core::tick_bundle::{
     DispatchOutcome, KvTickTransition, TICK_BUNDLE_SCHEMA_VERSION, TickBundle,
 };
-use trade_control_engine::{PlanEval, evaluate_plan, seed_plan_state};
+use trade_control_engine::{PlanEval, evaluate_controls_only, evaluate_plan, seed_plan_state};
 
 use crate::broker_handle::BrokerHandle;
 use crate::seam::CronEnv;
@@ -150,9 +150,27 @@ where
         None => return seed_first_tick(store, &broker, plan, account, expires_at, now).await,
     };
     let candles = fetch_candles(&broker, &plan.instrument, plan.granularity, since, now).await?;
+    // Keep the most recent closed bar before `filter_new_candles` consumes the
+    // fetch — a candle-less control tick (below) needs a shell to fire against.
+    let last_closed = candles.last().copied();
     let fresh = filter_new_candles(candles, since);
     if fresh.is_empty() {
-        return Ok(());
+        // No new bar closed, but a pause/news window edge may have passed in
+        // wall-clock time since the last bar (a 14:30 event on an H1 chart). The
+        // 5s cron reaches that instant long before the next bar closes, so run
+        // the control rules against `now` alone (PR2). Guards/spine need a real
+        // bar and stay dormant here. No control fires → the old fast no-op.
+        return tick_controls_only(
+            store,
+            cron,
+            stored,
+            &prior,
+            &broker,
+            last_closed,
+            now,
+            expires_at,
+        )
+        .await;
     }
 
     // The H&S `PinePattern` entry is stateful and needs lookback the
@@ -259,6 +277,122 @@ where
         &prior,
         &fresh,
         &detector_window,
+        eval,
+        now,
+        expires_at,
+        dispatch_outcomes,
+        kv,
+    );
+    cron.record_tick(bundle);
+    Ok(())
+}
+
+/// A candle-less **control-only** tick: no new bar closed, but a pause/news
+/// window edge may have passed in wall-clock time (a 14:30 event on an H1
+/// chart). Runs the control rules against `now` alone via
+/// [`evaluate_controls_only`] and, if any fired, persists + dispatches them
+/// exactly as the candle-driven path does — just with empty candle windows and
+/// no chance of retiring the plan (controls are non-terminal). No control fire
+/// → a bare `Ok(())`, preserving the old cheap between-bars no-op.
+///
+/// The replay mirrors this by injecting a virtual tick at each control epoch
+/// that lands between two bars, so worker and replay open/close every window at
+/// the same instant (`[[strategy_changes_in_both_replayer_and_worker]]`).
+#[allow(clippy::too_many_arguments)]
+async fn tick_controls_only<S, C>(
+    store: &S,
+    cron: &C,
+    stored: &StoredPlan,
+    prior: &PlanState,
+    broker: &BrokerHandle,
+    last_closed: Option<Candle>,
+    now: DateTime<Utc>,
+    expires_at: DateTime<Utc>,
+) -> Result<(), String>
+where
+    S: StateStore,
+    C: CronEnv,
+{
+    let plan = &stored.plan;
+    let account = stored.account.as_deref();
+    // A control `TimeReached` reads only `now`, never the candle's prices, so a
+    // synthesized flat bar at the watermark is a fine shell when the fetch
+    // returned nothing at all (quiet instrument, no bars in the window).
+    let last_candle = last_closed.unwrap_or_else(|| {
+        let time = prior.watermark.unwrap_or(now);
+        Candle {
+            time,
+            o: 0.0,
+            h: 0.0,
+            l: 0.0,
+            c: 0.0,
+        }
+    });
+
+    let eval = evaluate_controls_only(plan, prior, &last_candle, now, expires_at);
+    // Nothing fired: the between-bars fast path. No state advanced, so skip the
+    // KV write and the fat bundle entirely (same as the old empty-`fresh` bail).
+    if eval.fired.is_empty() {
+        return Ok(());
+    }
+
+    // Persist the control state (open_news_windows / blackout) before dispatch,
+    // so a dispatch failure can't replay a fired window edge. A control tick
+    // never advances the watermark (no bar processed) and is never `done`.
+    let kv = persist_plan_state(store, plan, account, &eval, now, prior).await;
+    if !kv.success {
+        let bundle = build_tick_bundle(
+            stored,
+            prior,
+            &[],
+            &[],
+            eval,
+            now,
+            expires_at,
+            Vec::new(),
+            kv.clone(),
+        );
+        cron.record_tick(bundle);
+        return Err(format!("put_plan_state: {}", kv.error.unwrap_or_default()));
+    }
+
+    // Shadow plans observe only — log the would-fire and record the bundle, but
+    // never touch the broker.
+    if plan.shadow {
+        for fired in &eval.fired {
+            log_shadow_fire(&plan.trade_id, fired);
+        }
+        let bundle = build_tick_bundle(
+            stored,
+            prior,
+            &[],
+            &[],
+            eval,
+            now,
+            expires_at,
+            Vec::new(),
+            kv,
+        );
+        cron.record_tick(bundle);
+        return Ok(());
+    }
+
+    let mut dispatch_outcomes = Vec::with_capacity(eval.fired.len());
+    for (seq, fired) in eval.fired.iter().enumerate() {
+        let outcome = dispatch_fired(cron, store, broker, fired, plan.granularity, now).await;
+        dispatch_outcomes.push(DispatchOutcome {
+            rule_id: fired.rule_id.clone(),
+            intent_id: fired.intent.id.clone(),
+            outcome,
+            seq: seq as u32,
+        });
+    }
+
+    let bundle = build_tick_bundle(
+        stored,
+        prior,
+        &[],
+        &[],
         eval,
         now,
         expires_at,

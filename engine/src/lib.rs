@@ -57,7 +57,9 @@ pub use trade_control_core::trade_plan::{
 };
 
 mod evaluate;
-pub use evaluate::{eval_trigger, evaluate_plan, initial_phase, seed_plan_state};
+pub use evaluate::{
+    eval_trigger, evaluate_controls_only, evaluate_plan, initial_phase, seed_plan_state,
+};
 
 mod simulator;
 pub use simulator::{
