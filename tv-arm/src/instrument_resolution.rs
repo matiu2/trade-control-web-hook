@@ -22,6 +22,8 @@ use instrument_lookup::{Asset, AssetClass, Broker as IlBroker};
 use trade_calendar_maker::types::{Instrument as TcmInstrument, InstrumentType};
 use trade_control_conventions::Broker as ConvBroker;
 
+use crate::precision::CatalogPrecision;
+
 /// One chart-symbol → broker-canonical-symbol resolution result.
 ///
 /// Holds a static reference back into the catalog (the catalog is
@@ -36,6 +38,13 @@ pub struct ResolvedInstrument {
     /// `cli::build_trade_from_spec` (e.g. `"EUR/USD"` for TradeNation,
     /// `"EUR_USD"` for OANDA).
     pub broker_symbol: String,
+    /// The **per-broker** catalog precision for the chosen broker's leg,
+    /// from the native instrument-primary catalog. This is the correct
+    /// fallback beneath live TradingView: OANDA and TradeNation legs of the
+    /// same underlying can genuinely tick differently (AU200 OANDA 0.1 vs TN
+    /// 1.0). Falls back to the legacy single-tick `Asset` precision only when
+    /// the native catalog has no row for this (broker, symbol).
+    pub precision: CatalogPrecision,
 }
 
 /// Resolve a TV-form symbol (e.g. `"TRADENATION:EURUSD"`, `"OANDA:EUR_USD"`,
@@ -72,10 +81,24 @@ pub fn resolve_for_broker(tv_symbol: &str, broker: ConvBroker) -> Result<Resolve
         )
     })?;
 
+    let precision = precision_for(il_broker, broker_symbol, asset);
+
     Ok(ResolvedInstrument {
         asset,
         broker_symbol: broker_symbol.to_string(),
+        precision,
     })
+}
+
+/// Resolve the per-broker precision for this leg from the native
+/// instrument-primary catalog, falling back to the legacy `Asset`'s
+/// single-tick precision when the native catalog has no matching row (a
+/// build predating the data-fill, or a symbol only in the legacy overlay).
+fn precision_for(broker: IlBroker, broker_symbol: &str, asset: &Asset) -> CatalogPrecision {
+    match instrument_lookup::resolve_for(broker, broker_symbol) {
+        Ok(Some(inst)) => CatalogPrecision::from_instrument(inst),
+        _ => CatalogPrecision::from_asset(asset),
+    }
 }
 
 /// Build a `trade-calendar-maker::Instrument` from an `Asset` so the
@@ -163,6 +186,27 @@ mod tests {
             resolve_for_broker("TRADENATION:EURUSD", ConvBroker::TradeNation).expect("resolves");
         assert_eq!(r.asset.id, "EURUSD");
         assert_eq!(r.broker_symbol, "EUR/USD");
+    }
+
+    #[test]
+    fn au200_oanda_leg_carries_native_per_broker_tick() {
+        // The PRICE_PRECISION_EXCEEDED instrument, and the whole reason for
+        // this migration. The legacy `resolve()` lands on a *duplicate*
+        // `AU200AUD` Asset row that carries the WRONG class-default tick 1.0
+        // (that's what sent OANDA a 5-decimal price it rejected). The
+        // per-broker precision must instead come from the native instrument
+        // catalog, keyed off the broker order symbol — tick 0.1.
+        let r = resolve_for_broker("OANDA:AU200AUD", ConvBroker::Oanda).expect("resolves");
+        assert_eq!(r.broker_symbol, "AU200_AUD");
+        // Precision is the native per-broker value, NOT the legacy Asset's.
+        assert_eq!(r.precision.tick_size, 0.1, "OANDA AU200 ticks in 0.1");
+        assert_eq!(r.precision.pip_size, 1.0, "index sizes on a whole point");
+        // Prove the native lookup actually corrected a wrong legacy tick:
+        // the Asset it resolved to still carries the stale value.
+        assert_ne!(
+            r.asset.tick_size, r.precision.tick_size,
+            "native precision must override the legacy Asset's wrong tick"
+        );
     }
 
     #[test]

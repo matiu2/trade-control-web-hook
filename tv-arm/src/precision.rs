@@ -13,9 +13,45 @@
 //! the operator's manual escape hatch; this module only decides the
 //! TV-vs-catalog layer beneath them.
 
-use instrument_lookup::{Asset, pip_size_from};
+use instrument_lookup::{Asset, AssetClass, Instrument, pip_size_from};
 use tracing::warn;
 use trading_view::symbol_info::SymbolInfo;
+
+/// The catalog's own view of an instrument's precision — the fallback layer
+/// beneath live TradingView. Sourced from the native per-broker
+/// [`Instrument`] (preferred) or the legacy [`Asset`] (single-tick), so
+/// `resolve_effective_precision` doesn't care which structure supplied it.
+#[derive(Debug, Clone, Copy)]
+pub struct CatalogPrecision {
+    pub tick_size: f64,
+    pub pip_size: f64,
+    pub decimal_places: u8,
+    pub class: AssetClass,
+}
+
+impl CatalogPrecision {
+    /// Per-broker precision from the native instrument-primary catalog row —
+    /// the correct source (OANDA and TradeNation legs can genuinely differ).
+    pub fn from_instrument(i: &Instrument) -> Self {
+        Self {
+            tick_size: i.tick_size,
+            pip_size: i.pip_size,
+            decimal_places: i.decimal_places,
+            class: i.class,
+        }
+    }
+
+    /// Legacy single-tick precision from an [`Asset`]. Used only when the
+    /// native catalog has no row for this (broker, symbol).
+    pub fn from_asset(a: &Asset) -> Self {
+        Self {
+            tick_size: a.tick_size,
+            pip_size: a.pip_size,
+            decimal_places: a.decimal_places,
+            class: a.class,
+        }
+    }
+}
 
 /// The pip and tick tv-arm will bake onto the intent, plus where each came
 /// from (for logging / tests).
@@ -27,23 +63,22 @@ pub struct EffectivePrecision {
     pub tick_from_tv: bool,
 }
 
-/// Decide the effective pip/tick from the catalog asset and the live chart
-/// Symbol-info. TV wins when it supplied a usable tick; otherwise the
+/// Decide the effective pip/tick from the catalog precision and the live
+/// chart Symbol-info. TV wins when it supplied a usable tick; otherwise the
 /// catalog value stands. A mismatch between the two is logged at WARN.
 ///
 /// Pip is derived from TV's tick via the catalog's own `pip_size_from` rule
-/// (keyed on the asset class), so a live tick still yields a class-correct
-/// pip — TV's popup exposes tick, not the sizing pip, and re-deriving keeps
-/// the fractional-pip FX / index-point conventions intact.
-pub fn resolve_effective_precision(asset: &Asset, tv: &SymbolInfo) -> EffectivePrecision {
-    let catalog_tick = asset.tick_size;
-    let catalog_pip = asset.pip_size;
+/// (keyed on the class), so a live tick still yields a class-correct pip —
+/// TV's popup exposes tick, not the sizing pip, and re-deriving keeps the
+/// fractional-pip FX / index-point conventions intact.
+pub fn resolve_effective_precision(cat: CatalogPrecision, tv: &SymbolInfo) -> EffectivePrecision {
+    let catalog_tick = cat.tick_size;
+    let catalog_pip = cat.pip_size;
 
     match tv.tick_size {
         Some(tv_tick) if tv_tick.is_finite() && tv_tick > 0.0 => {
             if !ticks_match(tv_tick, catalog_tick) {
                 warn!(
-                    asset = %asset.id,
                     catalog_tick,
                     tv_tick,
                     tv_key = tv.pro_name.as_deref().unwrap_or(&tv.full_name),
@@ -53,8 +88,8 @@ pub fn resolve_effective_precision(asset: &Asset, tv: &SymbolInfo) -> EffectiveP
             }
             // Re-derive pip from the live tick using the class rule, so a
             // corrected tick also corrects the sizing pip.
-            let tv_dp = tv.decimal_places.unwrap_or(asset.decimal_places);
-            let tv_pip = pip_size_from(asset.class, tv_dp, tv_tick);
+            let tv_dp = tv.decimal_places.unwrap_or(cat.decimal_places);
+            let tv_pip = pip_size_from(cat.class, tv_dp, tv_tick);
             EffectivePrecision {
                 pip_size: tv_pip,
                 tick_size: tv_tick,
@@ -126,7 +161,7 @@ mod tests {
         // Catalog says index tick 1.0 (the AU200 bug); TV says 0.1.
         let a = asset(AssetClass::Index, 1.0, 0, 1.0);
         let tv = tv_info(Some(0.1), Some(1));
-        let eff = resolve_effective_precision(&a, &tv);
+        let eff = resolve_effective_precision(CatalogPrecision::from_asset(&a), &tv);
         assert_eq!(eff.tick_size, 0.1);
         assert!(eff.tick_from_tv);
         // Index pip is always 1.0 regardless of tick.
@@ -137,7 +172,7 @@ mod tests {
     fn falls_back_to_catalog_when_tv_has_no_tick() {
         let a = asset(AssetClass::Forex, 0.00001, 5, 0.0001);
         let tv = tv_info(None, None); // old-build payload
-        let eff = resolve_effective_precision(&a, &tv);
+        let eff = resolve_effective_precision(CatalogPrecision::from_asset(&a), &tv);
         assert_eq!(eff.tick_size, 0.00001);
         assert_eq!(eff.pip_size, 0.0001);
         assert!(!eff.tick_from_tv);
@@ -149,7 +184,7 @@ mod tests {
         // truth), pip re-derived identically.
         let a = asset(AssetClass::Forex, 0.00001, 5, 0.0001);
         let tv = tv_info(Some(0.00001), Some(5));
-        let eff = resolve_effective_precision(&a, &tv);
+        let eff = resolve_effective_precision(CatalogPrecision::from_asset(&a), &tv);
         assert_eq!(eff.tick_size, 0.00001);
         assert_eq!(eff.pip_size, 0.0001);
         assert!(eff.tick_from_tv);
@@ -166,7 +201,7 @@ mod tests {
             0.5, /* wrong catalog pip */
         );
         let tv = tv_info(Some(0.001), Some(3));
-        let eff = resolve_effective_precision(&a, &tv);
+        let eff = resolve_effective_precision(CatalogPrecision::from_asset(&a), &tv);
         assert_eq!(eff.tick_size, 0.001);
         assert_eq!(eff.pip_size, 0.01); // corrected, not the wrong 0.5
     }
@@ -176,7 +211,7 @@ mod tests {
         let a = asset(AssetClass::Forex, 0.00001, 5, 0.0001);
         for bad in [Some(0.0), Some(f64::NAN), Some(-0.1)] {
             let tv = tv_info(bad, Some(5));
-            let eff = resolve_effective_precision(&a, &tv);
+            let eff = resolve_effective_precision(CatalogPrecision::from_asset(&a), &tv);
             assert_eq!(eff.tick_size, 0.00001, "bad tv tick {bad:?} → catalog");
             assert!(!eff.tick_from_tv);
         }
