@@ -853,7 +853,10 @@ fn build_mw_trade_spec(
         // M/W entry is always a stop order at the worker-computed level;
         // --entry-market is an H&S flag and is ignored here.
         entry_mode: cli::EntryMode::Stop,
-        needs_golden: !args.skip_golden,
+        // Golden is a Head-and-Shoulders signal-candle concept; M/W entry is a
+        // geometry-driven stop the worker resolves, so it never gates on golden.
+        // (`--skip-golden` is an H&S-only lever and is irrelevant here.)
+        needs_golden: false,
         needs_confirmed: args.require_confirmation,
         // No close-on-reversal for M/W (TP is a hard 1R), so news/SR
         // close coverage is not wired.
@@ -2620,9 +2623,9 @@ mod tests {
     }
 
     #[test]
-    fn skip_golden_clears_needs_golden_on_mw_spec() {
-        // Same guard on the M/W spec builder — `--skip-golden` clears it,
-        // default keeps it on.
+    fn mw_spec_never_needs_golden() {
+        // Golden is an H&S signal-candle gate; M/W entry is geometry-driven, so
+        // the M/W spec carries needs_golden: false regardless of --skip-golden.
         let anchors = || MwSpecAnchors {
             runup_start: 1.0500,
             first_point: 1.1000,
@@ -2641,7 +2644,7 @@ mod tests {
             now() + chrono::Duration::days(1),
             anchors(),
         );
-        assert!(default.needs_golden, "golden on by default for M/W too");
+        assert!(!default.needs_golden, "M/W never gates on golden");
 
         let skipped = build_mw_trade_spec(
             &mw_args(&["--skip-golden"]),
@@ -2654,7 +2657,7 @@ mod tests {
         );
         assert!(
             !skipped.needs_golden,
-            "--skip-golden must clear needs_golden on the M/W spec"
+            "M/W stays golden-free with --skip-golden too"
         );
     }
 
