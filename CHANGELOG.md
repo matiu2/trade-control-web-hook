@@ -1,5 +1,38 @@
 # Changelog
 
+## v76 — 2026-07-09 — strategy-v2 QM leg requires golden by default
+
+**Why.** ESPIX_EUR 2026-07-07: `--strategy-v2 --qm-entry=market` fired
+`09-enter-qm` on a **confirmed but non-golden** short (a small candle a few bars
+into the move) at 21:00, which was whipsawed out at SL one bar later. The QM leg
+hardcoded `needs_golden: false` (added in v74 to keep it from starving on
+"golden AND confirmed"), which silently **stripped the golden requirement from
+`--strategy-v2`** — every other enter honours `--skip-golden` (golden on by
+default), but the QM leg never did. The operator's rule is golden-by-default on
+every enter; the QM leg is no exception.
+
+**What changed.**
+- **QM leg (`09-enter-qm`) now threads `spec.needs_golden`** instead of hardcoding
+  `false`. Golden is required by default (`needs_golden: true`); `--skip-golden`
+  clears it (giving the old confirmed-only gate for setups where size genuinely
+  isn't the filter). `needs_confirmed: true` is unchanged — confirmation is
+  intrinsic to the QM leg.
+- The default QM gate is now **golden AND confirmed**. A confirmed-but-small
+  signal no longer fires the QM enter by default.
+
+**Config.** No new flags. `--skip-golden` (existing) now also clears golden on the
+QM leg, consistently with the BCR leg.
+
+**Compatibility.** Behaviour change (deliberate): `--strategy-v2` without
+`--skip-golden` now requires golden on the QM leg. To reproduce the old
+confirmed-only QM entry (e.g. DE30_EUR 2026-07-07's non-golden +5.26R short),
+pass `--skip-golden`.
+
+**Tests.** cli `strategy_v2_qm_leg_requires_golden_by_default_and_skip_golden_clears_it`
+(default golden-on, `--skip-golden` clears it); updated
+`strategy_v2_qm_entry_limit_makes_qm_a_limit_with_stop_recovery` +
+`strategy_v2_qm_entry_limit_...` to set `needs_golden`.
+
 ## v75 — 2026-07-09 — --qm-entry: per-leg entry order type for strategy-v2
 
 **Why.** `--strategy-v2` arms two legs (BCR stop `05-enter` + QM confirmed
