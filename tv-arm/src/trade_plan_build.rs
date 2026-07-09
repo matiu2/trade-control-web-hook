@@ -22,7 +22,7 @@
 //! retest trendline simply yields a plan without that rule.
 
 use trade_control_cli::{BuiltAlert, BuiltNews, BuiltPause};
-use trade_control_conventions::{AlertBasename, Direction as ConvDirection};
+use trade_control_conventions::{AlertBasename, Direction as ConvDirection, RuleKind};
 use trade_control_core::broker::Granularity;
 use trade_control_core::intent::{Direction, Intent};
 use trade_control_core::trade_plan::{
@@ -167,6 +167,7 @@ fn push_window_rules<A: WindowAlert>(
             trigger: Trigger::TimeReached { at_epoch },
             fire_mode: FireMode::Once,
             intent: alert.intent().clone(),
+            kind: RuleKind::from(&basename),
         });
     }
 }
@@ -212,11 +213,13 @@ fn build_rule(
     let basename = AlertBasename::parse(&alert.basename)?;
     let trigger = trigger_for(&basename, direction, roles, granularity, is_mw)?;
     let fire_mode = fire_mode_for(&trigger);
+    let kind = RuleKind::from(&basename);
     Some(ConditionRule {
         rule_id: alert.basename.clone(),
         trigger,
         fire_mode,
         intent: alert.intent.clone(),
+        kind,
     })
 }
 

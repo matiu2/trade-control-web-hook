@@ -35,7 +35,7 @@ use trade_control_core::broker::{Candle, Granularity};
 use trade_control_core::intent::{Action, BrokerKind, Direction, Intent, VetoLevel};
 use trade_control_core::plan_state::Phase;
 use trade_control_core::trade_plan::{
-    BarEvent, ConditionRule, CrossDir, FireMode, TradePlan, Trigger,
+    BarEvent, ConditionRule, CrossDir, FireMode, RuleKind, TradePlan, Trigger,
 };
 use trade_control_core::tunable::Tunable;
 use trade_control_engine::{evaluate_plan, seed_plan_state};
@@ -161,6 +161,7 @@ fn experimental_plan() -> TradePlan {
             "too-low",
             VetoLevel::ClosePositions,
         ),
+        kind: RuleKind::SetupInvalidation,
     };
     let too_high = ConditionRule {
         rule_id: "01-veto-too-high".into(),
@@ -175,6 +176,7 @@ fn experimental_plan() -> TradePlan {
             "too-high",
             VetoLevel::StopNextEntry,
         ),
+        kind: RuleKind::SetupInvalidation,
     };
     let mut expiry_intent = veto_intent(
         "ihs-gbp-usd-5175abbe-trade-expiry",
@@ -189,6 +191,7 @@ fn experimental_plan() -> TradePlan {
         },
         fire_mode: FireMode::Once,
         intent: expiry_intent,
+        kind: RuleKind::SetupInvalidation,
     };
     TradePlan {
         trade_id: "ihs-gbp-usd-5175abbe".into(),

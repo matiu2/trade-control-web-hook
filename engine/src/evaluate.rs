@@ -68,7 +68,7 @@ use trade_control_core::signals::{
     DetectorConfig, LatchedSignal, atr_length_for, latched_signal_at, wilder_atr,
 };
 use trade_control_core::trade_plan::{
-    BarEvent, ConditionRule, CrossDir, LinePoint, TradePlan, Trigger,
+    BarEvent, ConditionRule, CrossDir, LinePoint, RuleKind, TradePlan, Trigger,
 };
 
 /// Substrings that identify a rule's role from its `rule_id` (the alert
@@ -118,11 +118,7 @@ pub fn initial_phase(plan: &TradePlan) -> Phase {
     if is_multi_enter(plan) {
         return Phase::AwaitEntry;
     }
-    if plan
-        .rules
-        .iter()
-        .any(|r| r.rule_id.contains(ROLE_BREAK_AND_CLOSE))
-    {
+    if plan.rules.iter().any(is_break_and_close) {
         Phase::AwaitBreakAndClose
     } else {
         Phase::AwaitEntry
@@ -525,36 +521,13 @@ fn evaluate_guards(
         // enter's `not_after` window closing. (Closing a trade must not stop the
         // retries: place → fill → close-on-reversal → re-enter is the whole point
         // of multi-shot.)
-        if guard_is_terminal(&rule.intent) {
+        if guard_is_terminal(rule) {
             state.phase = Phase::Done;
             return;
         }
         // Non-terminal guard fired (a reversal-close): keep scanning later rules
         // this bar, but it has latched so it won't re-fire.
     }
-}
-
-/// Whether a fired guard retires the plan's spine.
-///
-/// - **Non-`Close` guards** (cancel / invalidate vetos — `too-high` / `too-low`
-///   invalidation, `trade-expiry`) → **terminal**. Their trigger means the setup
-///   itself is invalid, so the dispatched intent is the end of it.
-/// - **`Close` guards** (`06-close-on-reversal`) → **never terminal**. A
-///   reversal-close is a per-*trade* exit, not a setup invalidation: it flattens
-///   any open position (dispatched independently — a no-op when flat) but must
-///   leave the plan in `AwaitEntry` so a multi-shot enter can re-enter on the
-///   next signal bar. Making it terminal killed the retries (the operator's
-///   point: "close any open trades, but don't stop the retries"). A single-shot
-///   enter already sets `Phase::Done` at entry, so its reversal-close never even
-///   runs — "never terminal" is correct for both.
-///
-/// This retires the whole "terminal reversal-close" path (and the `PositionView`
-/// machinery v66 added to gate it): whether a position is *open* decides whether
-/// the flatten does anything, not whether the plan dies — and that decision lives
-/// at dispatch (`close_positions`), not in the spine. See the
-/// `reversal_close_spine_retire_recurring` project memory.
-fn guard_is_terminal(intent: &trade_control_core::intent::Intent) -> bool {
-    intent.action != Action::Close
 }
 
 /// Evaluate the break-and-close prep. On fire it latches, records the lookback
@@ -1616,14 +1589,65 @@ fn push_fire_signal(
     });
 }
 
-/// A guard is a veto rule (a `Veto`/`Invalidate`/`Close` action) — the
-/// always-armed half of the machine, distinct from the prep spine and the
-/// entry.
+/// The rule's behaviour class, read from the typed [`RuleKind`] `tv-arm` stamps
+/// at arm time — with a legacy fallback for plans signed before that field
+/// existed (`RuleKind::Unspecified`), which derive it the old way from
+/// `rule_id`/`Action`. This is the single seam the whole GuardKind refactor
+/// removes: after the deprecation window, PR-C drops the fallback and every
+/// classifier reads `rule.kind` directly.
+///
+/// Consolidating the six ad-hoc classifiers behind one resolved kind is what
+/// makes the class of the v73 bug — the classifiers disagreeing about what
+/// `too-high` is — structurally impossible: there is now exactly one answer.
+fn resolved_kind(rule: &ConditionRule) -> RuleKind {
+    match rule.kind {
+        RuleKind::Unspecified => legacy_kind(rule),
+        kind => kind,
+    }
+}
+
+/// Legacy classification for a plan signed before the `kind` field: re-derive
+/// the role from the `rule_id` substring / resolved `Action`, exactly as the
+/// pre-refactor engine did. Kept only for the migration window; removed by PR-C
+/// once no `Unspecified` plan can be live. Order matters — the `rule_id`
+/// role-checks (break-and-close / retest) win over the coarser `Action` split.
+fn legacy_kind(rule: &ConditionRule) -> RuleKind {
+    if rule.rule_id.contains(ROLE_BREAK_AND_CLOSE) {
+        return RuleKind::PrepBreakAndClose;
+    }
+    if rule.rule_id.contains(ROLE_RETEST) {
+        return RuleKind::PrepRetest;
+    }
+    match rule.intent.action {
+        // A veto/invalidate is a terminal setup-invalidation; a Close is the
+        // non-terminal per-trade exit. This is the exact pre-refactor split
+        // (`guard_is_terminal` = action != Close within the guard set).
+        Action::Veto | Action::Invalidate => RuleKind::SetupInvalidation,
+        Action::Close => RuleKind::PerTradeExit,
+        Action::Pause | Action::Resume | Action::NewsStart | Action::NewsEnd => RuleKind::Control,
+        Action::Enter => RuleKind::Enter,
+        // Prep / PrepExpire / other — not spine-classified by the old engine.
+        _ => RuleKind::Unspecified,
+    }
+}
+
+/// A guard is the always-armed half of the machine (distinct from the prep spine
+/// and the entry): a setup-invalidation veto or the per-trade Close exit.
 fn is_guard(rule: &ConditionRule) -> bool {
     matches!(
-        rule.intent.action,
-        Action::Veto | Action::Invalidate | Action::Close
+        resolved_kind(rule),
+        RuleKind::SetupInvalidation | RuleKind::PerTradeExit
     )
+}
+
+/// Whether firing this guard retires the whole plan. A **setup invalidation**
+/// (`too-high`/`too-low`, the M/W cancel/abort/overshoot vetos, `trade-expiry`)
+/// means the setup is dead → terminal. A **per-trade Close** (`06-close-on-
+/// reversal`) flattens an open position but the plan lives on (multi-shot
+/// re-entry). See the long note at the fire site and the
+/// `reversal_close_spine_retire_recurring` memory.
+fn guard_is_terminal(rule: &ConditionRule) -> bool {
+    matches!(resolved_kind(rule), RuleKind::SetupInvalidation)
 }
 
 /// A control rule sets the worker's blackout / news-window KV state on a
@@ -1631,40 +1655,35 @@ fn is_guard(rule: &ConditionRule) -> bool {
 /// news-start/news-end open and close a news window). Always-armed but
 /// non-terminal — it never ends the trade's spine, unlike a guard.
 fn is_control_rule(rule: &ConditionRule) -> bool {
-    matches!(
-        rule.intent.action,
-        Action::Pause | Action::Resume | Action::NewsStart | Action::NewsEnd
-    )
+    matches!(resolved_kind(rule), RuleKind::Control)
 }
 
 fn is_break_and_close(rule: &ConditionRule) -> bool {
-    rule.rule_id.contains(ROLE_BREAK_AND_CLOSE)
+    matches!(resolved_kind(rule), RuleKind::PrepBreakAndClose)
 }
 
 fn is_retest(rule: &ConditionRule) -> bool {
-    rule.rule_id.contains(ROLE_RETEST)
+    matches!(resolved_kind(rule), RuleKind::PrepRetest)
 }
 
 /// When a guard is armed within the spine. Kept permissive for Stage D — the
 /// dispatched intent's own gates (e.g. `run_close`'s windows) are authoritative;
 /// the engine's job is only to fire the same intent the TV alert would have.
 ///
-/// The split is by *what the guard means*, mirroring [`guard_is_terminal`]:
+/// The split is by *what the guard means*:
 ///
-/// - **Terminal guards** — an invalidation / cancel veto (`too-high` / `too-low`,
-///   the M/W cancel/abort/overshoot vetos) or `trade-expiry` — mean the *setup*
-///   is dead. A setup can be invalidated **before** it ever breaks-and-closes
-///   (price runs up away from a short and the H&S is void), so these are armed in
-///   **every** phase. Arming them `AwaitEntry`-only silently dropped a pre-break
-///   invalidation: the too-high cap closed above for hours while the spine sat in
-///   `AwaitBreakAndClose`, so the guard never ran and the plan was journaled as
-///   blocked by a *later* rule (BUG-replay-skips-pre-pause-bars, AUD/NZD H&S
-///   short 2026-07-07).
-/// - **`Close` guards** (`06-close-on-reversal`) are a per-*trade* exit, not a
-///   setup invalidation — they need a position to act on, so they stay armed from
-///   `AwaitEntry` onward. Before entry there is nothing to close.
+/// - **Setup invalidations** (`SetupInvalidation`) — `too-high`/`too-low`, the
+///   M/W cancel/abort/overshoot vetos, `trade-expiry` — mean the *setup* is dead.
+///   A setup can be invalidated **before** it ever breaks-and-closes (price runs
+///   up away from a short and the H&S is void), so these are armed in **every**
+///   phase. Arming them `AwaitEntry`-only silently dropped a pre-break
+///   invalidation (BUG-replay-skips-pre-pause-bars, AUD/NZD H&S short
+///   2026-07-07).
+/// - **Per-trade `Close` guards** (`PerTradeExit`, `06-close-on-reversal`) need a
+///   position to act on, so they stay armed from `AwaitEntry` onward. Before
+///   entry there is nothing to close.
 fn armed_in_rule(rule: &ConditionRule, phase: Phase) -> bool {
-    if guard_is_terminal(&rule.intent) {
+    if guard_is_terminal(rule) {
         // Setup invalidation — valid to fire in any phase, pre-break included.
         return true;
     }
@@ -1768,6 +1787,7 @@ mod tests {
             trigger,
             fire_mode,
             intent: intent(action),
+            kind: RuleKind::Unspecified,
         }
     }
 
@@ -1806,6 +1826,7 @@ mod tests {
             trigger: Trigger::PinePattern { pattern, dir },
             fire_mode: FireMode::Once,
             intent,
+            kind: RuleKind::Unspecified,
         }
     }
 
@@ -2692,6 +2713,7 @@ mod tests {
             trigger: Trigger::MwEveryBar,
             fire_mode: FireMode::Once,
             intent,
+            kind: RuleKind::Unspecified,
         }
     }
 
@@ -4106,37 +4128,91 @@ mod tests {
     /// emits, pinning its full behavioural triple: `is_guard`,
     /// `guard_is_terminal`, and `armed_in_rule` across **every** phase.
     ///
-    /// Why this exists: guard behaviour is decided in four separate places
-    /// (`is_guard` by action, `guard_is_terminal` by action, `armed_in_rule` by
-    /// terminality, and the `rule_id` role-substring checks), keyed three
-    /// different ways, with nothing forcing them to agree. The original bug
+    /// Why this exists: guard behaviour used to be decided in six separate places
+    /// keyed three different ways (`Action`, `rule_id` substring, terminality)
+    /// with nothing forcing them to agree. The original bug
     /// (BUG-replay-skips-pre-pause-bars) was exactly such a drift: `armed_in`
     /// classified `too-high` as `AwaitEntry`-only while `guard_is_terminal`
     /// (correctly) treated it as a terminal setup-invalidation, so the guard
-    /// never ran pre-break. This table is the single place that asserts the two
-    /// meanings of "veto" — **setup invalidation** (fires in any phase, retires
-    /// the plan) vs **per-trade Close** (needs a position, `AwaitEntry`-only) —
-    /// stay consistent. A future rename or re-keying that desyncs them fails
-    /// here, named by role, instead of silently mis-journaling a live trade.
+    /// never ran pre-break. The GuardKind refactor collapses those to one typed
+    /// `RuleKind`; this table pins that every classifier reads the same answer.
+    ///
+    /// Each row is asserted **twice** — once with the `kind` field left
+    /// `Unspecified` (so the engine's `legacy_kind` fallback re-derives the role
+    /// from `rule_id`/`Action`, the migration path an in-flight plan takes) and
+    /// once with the real `RuleKind` stamped (the arm-time path a fresh plan
+    /// takes). Both must yield the identical triple: the fallback and the typed
+    /// path can't disagree.
     #[test]
     fn guard_semantics_truth_table() {
-        // (role rule_id, action, is_guard, is_terminal, armed pre-break).
-        // Every current tv-arm guard: the three invalidation/cancel vetos, the
+        // (role rule_id, action, stamped kind, is_guard, is_terminal, armed pre-break).
+        // Every current tv-arm guard: the invalidation/cancel vetos, the
         // trade-expiry invalidate, and the one per-trade Close.
-        let cases: &[(&str, Action, bool, bool, bool)] = &[
+        let cases: &[(&str, Action, RuleKind, bool, bool, bool)] = &[
             // Setup invalidations — terminal, armed in every phase (incl. pre-break).
-            ("01-veto-too-high", Action::Veto, true, true, true),
-            ("01-veto-too-low", Action::Veto, true, true, true),
-            ("01-veto-mw-cancel", Action::Veto, true, true, true),
-            ("01-veto-mw-abort", Action::Veto, true, true, true),
-            ("01-veto-mw-overshoot", Action::Veto, true, true, true),
-            ("02-veto-trade-expiry", Action::Invalidate, true, true, true),
+            (
+                "01-veto-too-high",
+                Action::Veto,
+                RuleKind::SetupInvalidation,
+                true,
+                true,
+                true,
+            ),
+            (
+                "01-veto-too-low",
+                Action::Veto,
+                RuleKind::SetupInvalidation,
+                true,
+                true,
+                true,
+            ),
+            (
+                "01-veto-mw-cancel",
+                Action::Veto,
+                RuleKind::SetupInvalidation,
+                true,
+                true,
+                true,
+            ),
+            (
+                "01-veto-mw-abort",
+                Action::Veto,
+                RuleKind::SetupInvalidation,
+                true,
+                true,
+                true,
+            ),
+            (
+                "01-veto-mw-overshoot",
+                Action::Veto,
+                RuleKind::SetupInvalidation,
+                true,
+                true,
+                true,
+            ),
+            (
+                "02-veto-trade-expiry",
+                Action::Invalidate,
+                RuleKind::SetupInvalidation,
+                true,
+                true,
+                true,
+            ),
             // Per-trade exit — NON-terminal, needs a position (AwaitEntry only).
-            ("06-close-on-reversal", Action::Close, true, false, false),
+            (
+                "06-close-on-reversal",
+                Action::Close,
+                RuleKind::PerTradeExit,
+                true,
+                false,
+                false,
+            ),
         ];
 
-        for &(rule_id, action, want_guard, want_terminal, want_armed_pre_break) in cases {
-            let r = rule(
+        for &(rule_id, action, stamped, want_guard, want_terminal, want_armed_pre_break) in cases {
+            // Two rules with identical (rule_id, action): one relying on the
+            // legacy fallback (`Unspecified`), one carrying the stamped kind.
+            let legacy = rule(
                 rule_id,
                 Trigger::HorizontalCross {
                     level: 1.0,
@@ -4146,32 +4222,84 @@ mod tests {
                 FireMode::Once,
                 action,
             );
-            assert_eq!(is_guard(&r), want_guard, "{rule_id}: is_guard");
             assert_eq!(
-                guard_is_terminal(&r.intent),
-                want_terminal,
-                "{rule_id}: guard_is_terminal"
+                legacy.kind,
+                RuleKind::Unspecified,
+                "{rule_id}: the `rule` helper must leave kind Unspecified so this row exercises the fallback"
             );
-            // Pre-break phase arms exactly the terminal setup-invalidations.
-            assert_eq!(
-                armed_in_rule(&r, Phase::AwaitBreakAndClose),
-                want_armed_pre_break,
-                "{rule_id}: armed_in_rule(AwaitBreakAndClose)"
-            );
-            // Every guard is armed once we reach AwaitEntry.
-            assert!(
-                armed_in_rule(&r, Phase::AwaitEntry),
-                "{rule_id}: every guard is armed in AwaitEntry"
-            );
-            // A terminal setup-invalidation is armed in *every* phase, so its
-            // Done arming equals its pre-break arming (true); the per-trade Close
-            // guard is armed in neither (false). Either way, Done == pre-break.
-            assert_eq!(
-                armed_in_rule(&r, Phase::Done),
-                want_armed_pre_break,
-                "{rule_id}: armed_in_rule(Done) matches the all-phases terminal rule"
-            );
+            let mut stamped_rule = legacy.clone();
+            stamped_rule.kind = stamped;
+
+            for (label, r) in [("legacy", &legacy), ("stamped", &stamped_rule)] {
+                // The resolved kind agrees regardless of path.
+                assert_eq!(
+                    resolved_kind(r),
+                    stamped,
+                    "{rule_id}/{label}: resolved_kind"
+                );
+                assert_eq!(is_guard(r), want_guard, "{rule_id}/{label}: is_guard");
+                assert_eq!(
+                    guard_is_terminal(r),
+                    want_terminal,
+                    "{rule_id}/{label}: guard_is_terminal"
+                );
+                // Pre-break phase arms exactly the terminal setup-invalidations.
+                assert_eq!(
+                    armed_in_rule(r, Phase::AwaitBreakAndClose),
+                    want_armed_pre_break,
+                    "{rule_id}/{label}: armed_in_rule(AwaitBreakAndClose)"
+                );
+                // Every guard is armed once we reach AwaitEntry.
+                assert!(
+                    armed_in_rule(r, Phase::AwaitEntry),
+                    "{rule_id}/{label}: every guard is armed in AwaitEntry"
+                );
+                // A terminal setup-invalidation is armed in *every* phase, so its
+                // Done arming equals its pre-break arming (true); the per-trade
+                // Close guard is armed in neither (false). Either way, Done ==
+                // pre-break.
+                assert_eq!(
+                    armed_in_rule(r, Phase::Done),
+                    want_armed_pre_break,
+                    "{rule_id}/{label}: armed_in_rule(Done) matches the all-phases terminal rule"
+                );
+            }
         }
+    }
+
+    /// The stamped `kind` is authoritative — it wins over what the legacy
+    /// `rule_id`/`Action` derivation would say. This is what makes PR-B a real
+    /// switch to the typed field (not just a no-op wrapper): give a rule a
+    /// `rule_id` and `Action` that legacy-derive to a *different* class than its
+    /// stamped kind, and every classifier must follow the stamp. (An
+    /// `Unspecified` twin of the same rule takes the legacy answer, confirming
+    /// the two paths genuinely diverge.)
+    #[test]
+    fn stamped_kind_overrides_legacy_derivation() {
+        // rule_id/Action say "per-trade Close" (legacy → PerTradeExit,
+        // non-terminal), but the stamp says SetupInvalidation (terminal).
+        let mut r = rule(
+            "06-close-on-reversal",
+            Trigger::PinePattern {
+                pattern: None,
+                dir: Direction::Long,
+            },
+            FireMode::Once,
+            Action::Close,
+        );
+        // Unspecified twin → legacy path → PerTradeExit (non-terminal, AwaitEntry-only).
+        assert_eq!(resolved_kind(&r), RuleKind::PerTradeExit);
+        assert!(!guard_is_terminal(&r));
+        assert!(!armed_in_rule(&r, Phase::AwaitBreakAndClose));
+
+        // Stamp it as a setup invalidation → the engine follows the stamp.
+        r.kind = RuleKind::SetupInvalidation;
+        assert_eq!(resolved_kind(&r), RuleKind::SetupInvalidation);
+        assert!(guard_is_terminal(&r), "stamped kind must make it terminal");
+        assert!(
+            armed_in_rule(&r, Phase::AwaitBreakAndClose),
+            "stamped setup-invalidation arms pre-break, overriding the Close-action legacy read"
+        );
     }
 
     #[test]
@@ -4257,6 +4385,7 @@ mod tests {
             trigger: Trigger::PinePattern { pattern: None, dir },
             fire_mode: FireMode::Once,
             intent,
+            kind: RuleKind::Unspecified,
         }
     }
 
@@ -4273,6 +4402,7 @@ mod tests {
             trigger: Trigger::PinePattern { pattern: None, dir },
             fire_mode: FireMode::Once,
             intent,
+            kind: RuleKind::Unspecified,
         }
     }
 
@@ -4290,6 +4420,7 @@ mod tests {
             },
             fire_mode: FireMode::Once,
             intent,
+            kind: RuleKind::Unspecified,
         }
     }
 

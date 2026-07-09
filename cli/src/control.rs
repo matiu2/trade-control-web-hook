@@ -710,7 +710,7 @@ mod tests {
     fn sample_plan() -> trade_control_core::trade_plan::TradePlan {
         use trade_control_core::broker::Granularity;
         use trade_control_core::trade_plan::{
-            BarEvent, ConditionRule, CrossDir, FireMode, TradePlan, Trigger,
+            BarEvent, ConditionRule, CrossDir, FireMode, RuleKind, TradePlan, Trigger,
         };
         let rule_intent = control_skeleton(Action::Veto, "EUR_USD", "veto-1".into(), t());
         TradePlan {
@@ -728,6 +728,7 @@ mod tests {
                 },
                 fire_mode: FireMode::Once,
                 intent: rule_intent,
+                kind: RuleKind::SetupInvalidation,
             }],
             shadow: false,
             cross_buffer_pct: 0.0,
