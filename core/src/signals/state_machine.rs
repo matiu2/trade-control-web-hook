@@ -105,6 +105,15 @@ struct Tracked {
     direction: Direction,
     high: f64,
     low: f64,
+    /// The signal candle's own range (`high - low` for floating; kind-specific
+    /// span otherwise) and pattern kind / start time — carried per-signal so a
+    /// `LatchedSignal` can be rebuilt for *this* signal (not just the latch) by
+    /// [`first_confirmed_signal_at`].
+    range: f64,
+    kind: SignalKind,
+    start_time: DateTime<Utc>,
+    /// ATR at the signal's print bar (the value the latch carried at print).
+    atr: Option<f64>,
     /// Bar index the signal printed on.
     signal_bar: usize,
     state: SigState,
@@ -186,6 +195,10 @@ pub fn latched_signal_at(
                 direction: d.direction,
                 high: d.geometry.high,
                 low: d.geometry.low,
+                range: d.geometry.range,
+                kind: d.geometry.kind,
+                start_time: d.geometry.start_time,
+                atr,
                 signal_bar: bar,
                 state: SigState::Pending,
                 golden,
@@ -230,6 +243,131 @@ pub fn latched_signal_at(
         recent_high,
         recent_low,
         fires: fired_on_as_of,
+    })
+}
+
+/// Like [`latched_signal_at`], but returns the **first signal to confirm**
+/// rather than the single most-recent latch — the per-signal ("first one wins")
+/// entry the operator's rule describes.
+///
+/// # Why this exists
+///
+/// [`latched_signal_at`] keeps exactly one latch slot: a fresh print overwrites
+/// it, so when an *earlier* signal validates a few bars later, its confirmation
+/// is written to the latch **only if that signal is still the latched one**
+/// (Pine `signal_high_v == sig_high`; here `is_latched`). In a fast run of
+/// back-to-back same-direction signals — e.g. DE30_EUR 2026-07-07, a golden
+/// short at 6pm, another short at 7pm — the 7pm print displaces the 6pm signal
+/// before its 2-bar confirm window closes, so the 6pm confirmation never
+/// surfaces to the engine even though the chart draws its VALID triangle. The
+/// engine then never enters a setup the operator can see confirming.
+///
+/// This function tracks **every** signal to its own resolution and returns the
+/// **earliest-printing** signal that has reached `Valid` by `as_of`, carrying
+/// *that signal's own* geometry (its base becomes the entry level). "First one
+/// wins": the engine's fire-once latch (`state.fired`) blocks the later
+/// signals' confirmations once this one has fired the enter.
+///
+/// `fires` is set on the bar the returned signal **just** validated (so the
+/// engine's `sig.fires` gate triggers the entry exactly at confirmation), and
+/// also on the signal's own print bar for parity with the alert semantics. A
+/// signal that confirmed on an *earlier* bar than `as_of` still returns (so a
+/// re-evaluation after the confirm bar sees the confirmed signal), but with
+/// `fires = false` on those later bars — the enter fires once, on the
+/// confirmation bar.
+pub fn first_confirmed_signal_at(
+    candles: &[Candle],
+    as_of: usize,
+    cfg: &DetectorConfig,
+) -> Option<LatchedSignal> {
+    if as_of >= candles.len() {
+        return None;
+    }
+    let atr_len = atr_length_for(cfg.granularity);
+    let mut tracked: Vec<Tracked> = Vec::new();
+    // The signal_bar of the first signal that reached Valid, and the bar it did
+    // so on (for `fires`). Latched once and never overwritten — first wins.
+    let mut first_confirmed_bar: Option<usize> = None;
+    let mut confirmed_on: Option<usize> = None;
+
+    for bar in 0..=as_of {
+        // ---- 1. Update existing tracked signals against this bar. ----
+        let printed = detect_at(candles, bar, &cfg.detect);
+        // Snapshot which signals were already Valid so we can detect a
+        // *fresh* validation this bar (a PENDING→VALID transition).
+        let was_valid: Vec<bool> = tracked.iter().map(|t| t.state == SigState::Valid).collect();
+        // `update_tracked` also maintains the single latch, but this path
+        // ignores it — pass a throwaway.
+        let mut discard_latch: Option<Latch> = None;
+        let mut discard_just_valid = false;
+        update_tracked(
+            &mut tracked,
+            bar,
+            candles,
+            cfg,
+            printed.as_ref(),
+            &mut discard_latch,
+            None,
+            &mut discard_just_valid,
+        );
+
+        // Record the earliest-printing signal that just reached Valid this bar.
+        // Iterate in print order (tracked is push-ordered) and take the first
+        // fresh validation; only latch it if we haven't already committed to a
+        // first winner.
+        if first_confirmed_bar.is_none() {
+            for (i, t) in tracked.iter().enumerate() {
+                let freshly_valid =
+                    t.state == SigState::Valid && !was_valid.get(i).copied().unwrap_or(false);
+                if freshly_valid {
+                    first_confirmed_bar = Some(t.signal_bar);
+                    confirmed_on = Some(bar);
+                    break;
+                }
+            }
+        }
+
+        // ---- 2. Capture a new signal printing this bar. ----
+        if let Some(d) = printed {
+            let atr = wilder_atr(&candles[..=bar], atr_len);
+            let golden = atr.is_some_and(|a| d.is_golden(a));
+            tracked.push(Tracked {
+                direction: d.direction,
+                high: d.geometry.high,
+                low: d.geometry.low,
+                range: d.geometry.range,
+                kind: d.geometry.kind,
+                start_time: d.geometry.start_time,
+                atr,
+                signal_bar: bar,
+                state: SigState::Pending,
+                golden,
+                broke: false,
+            });
+        }
+    }
+
+    // The winning signal's own tracked entry (its confirmation may have been
+    // followed by an invalidation on a later bar — but "first confirmed wins"
+    // fires the enter on the confirmation bar, so we report it confirmed as of
+    // that bar). Look it up by signal_bar.
+    let winner_bar = first_confirmed_bar?;
+    let t = tracked.iter().find(|t| t.signal_bar == winner_bar)?;
+    let (recent_high, recent_low) = recent_extremes(candles, t.signal_bar, cfg.sl_lookback);
+    Some(LatchedSignal {
+        direction: t.direction,
+        kind: t.kind,
+        signal_high: t.high,
+        signal_low: t.low,
+        signal_range: t.range,
+        signal_start_time: t.start_time,
+        golden: t.golden,
+        signal_confirmed: true,
+        atr: t.atr,
+        recent_high,
+        recent_low,
+        // Fire only on the confirmation bar (the bar the winner validated).
+        fires: confirmed_on == Some(as_of),
     })
 }
 
@@ -496,5 +634,77 @@ mod tests {
             k("2026-06-16T10:00:00Z", 1.0, 1.0, 1.0, 1.0),
         ];
         assert!(latched_signal_at(&candles, 1, &cfg()).is_none());
+    }
+
+    /// Two back-to-back short floating engulfers (a descending staircase), the
+    /// DE30_EUR 2026-07-07 shape in miniature. The FIRST (bar 1) signal confirms
+    /// — the next bars push below its low without breaching its high — but a
+    /// SECOND short prints at bar 2 and overwrites the single latch before bar 1
+    /// resolves. `latched_signal_at` therefore reports the *second* signal (and
+    /// does not surface bar 1's confirmation); `first_confirmed_signal_at`
+    /// reports the *first* signal with its own base as the level.
+    fn two_short_engulfers_first_confirms() -> Vec<Candle> {
+        vec![
+            // bar 0: bearish context so bar 1 can engulf it.
+            k("2026-06-16T09:00:00Z", 120.0, 121.0, 118.0, 118.5),
+            // bar 1: short floating engulfer #1 ("6pm"). bearish, close 110.5 <
+            // prev.low 118, close in bottom-25% of 110..117.5. high 117.5 / low 110.
+            k("2026-06-16T10:00:00Z", 117.0, 117.5, 110.0, 110.5),
+            // bar 2: short floating engulfer #2 ("7pm"). bearish, close 104.5 <
+            // prev.low 110 → this bar's low (104) pushes below bar1's low (110),
+            // a confirming push for bar 1; its own high 112 stays *below* bar1's
+            // high 117.5 so it does NOT breach/invalidate bar 1. high 112 / low 104.
+            k("2026-06-16T11:00:00Z", 110.0, 112.0, 104.0, 104.5),
+            // bar 3: window-end for bar 1 (bars_elapsed = 2). Prints NO signal —
+            // no breakout (low 104.5 > bar2.low 104, so no bullish pinbar), not
+            // an engulfer, highs stay under both signals' highs so nothing is
+            // breached. Bar 1 validates here off the bar-2 push.
+            k("2026-06-16T12:00:00Z", 105.0, 106.0, 104.5, 105.3),
+        ]
+    }
+
+    #[test]
+    fn latched_reports_the_second_signal_missing_first_confirmation() {
+        // Baseline / bug-characterisation: the single latch holds the *second*
+        // signal at bar 3, and its confirmation state is the second signal's
+        // (not bar 1's) — exactly why the engine misses the entry.
+        let candles = two_short_engulfers_first_confirms();
+        let l = latched_signal_at(&candles, 3, &cfg()).expect("latched");
+        assert_eq!(l.direction, Direction::Short);
+        // The latch is the SECOND signal (bar 2): high 112 / low 104.
+        assert!((l.signal_high - 112.0).abs() < 1e-9, "hi {}", l.signal_high);
+        assert!((l.signal_low - 104.0).abs() < 1e-9, "lo {}", l.signal_low);
+    }
+
+    #[test]
+    fn first_confirmed_reports_the_first_signal_with_its_own_base() {
+        // The fix: the FIRST signal (bar 1) confirmed at bar 3, so
+        // `first_confirmed_signal_at` returns bar 1's geometry — its own low
+        // (110) is the base the entry anchors to — with fires=true on the
+        // confirmation bar.
+        let candles = two_short_engulfers_first_confirms();
+        let f = first_confirmed_signal_at(&candles, 3, &cfg()).expect("first-confirmed");
+        assert_eq!(f.direction, Direction::Short);
+        assert!(f.signal_confirmed, "first signal is confirmed");
+        assert!(f.fires, "fires on the confirmation bar");
+        // Bar 1's OWN geometry — high 117.5 / low 110 — not the second signal's.
+        assert!((f.signal_high - 117.5).abs() < 1e-9, "hi {}", f.signal_high);
+        assert!((f.signal_low - 110.0).abs() < 1e-9, "lo {}", f.signal_low);
+    }
+
+    #[test]
+    fn first_confirmed_only_fires_on_the_confirmation_bar() {
+        // Before the confirmation bar there is no confirmed signal yet; after
+        // it, the signal is still reported (so a later re-eval sees it) but
+        // fires=false — the enter fires once, on the confirmation bar.
+        let candles = two_short_engulfers_first_confirms();
+        // bar 2: bar 1 not yet resolved (bars_elapsed = 1) → nothing confirmed.
+        assert!(
+            first_confirmed_signal_at(&candles, 2, &cfg()).is_none(),
+            "no confirmation before the window closes"
+        );
+        // bar 3: confirmed, fires.
+        let at3 = first_confirmed_signal_at(&candles, 3, &cfg()).expect("confirmed at 3");
+        assert!(at3.fires, "fires on confirmation bar");
     }
 }

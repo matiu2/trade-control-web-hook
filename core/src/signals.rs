@@ -51,7 +51,9 @@ mod state_machine;
 pub use atr::{atr_length_for, wilder_atr};
 pub use detect::{DetectFlags, Detected, SignalGeometry, detect_at};
 pub use metrics::CandleMetrics;
-pub use state_machine::{DetectorConfig, LatchedSignal, latched_signal_at};
+pub use state_machine::{
+    DetectorConfig, LatchedSignal, first_confirmed_signal_at, latched_signal_at,
+};
 
 /// The default detector config the H&S chart study ships with (`confirm_bars =
 /// 2`, `sl_lookback = 5`, `similarity_pct = 20`, all five patterns on). Matches

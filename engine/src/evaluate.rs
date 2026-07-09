@@ -65,7 +65,8 @@ use trade_control_core::intent::{Action, Direction, SignalKind};
 use trade_control_core::plan_eval::{FiredIntent, PlanEval};
 use trade_control_core::plan_state::{Phase, PlanState};
 use trade_control_core::signals::{
-    DetectorConfig, LatchedSignal, atr_length_for, latched_signal_at, wilder_atr,
+    DetectorConfig, LatchedSignal, atr_length_for, first_confirmed_signal_at, latched_signal_at,
+    wilder_atr,
 };
 use trade_control_core::trade_plan::{
     BarEvent, ConditionRule, CrossDir, LinePoint, RuleKind, TradePlan, Trigger,
@@ -651,7 +652,16 @@ fn evaluate_one_entry(
     // signal geometry that rides onto the dispatched shell.
     let signal = match &rule.trigger {
         Trigger::PinePattern { pattern, dir } => {
-            match eval_pine_entry(candle, detector_window, detector_cfg, *pattern, *dir) {
+            // A `needs_confirmed` enter reads the first-confirmed signal (its own
+            // base as the level); a golden-only enter keeps the single latch.
+            match eval_pine_entry(
+                candle,
+                detector_window,
+                detector_cfg,
+                *pattern,
+                *dir,
+                rule.intent.needs_confirmed,
+            ) {
                 Some(sig) => Some(sig),
                 None => return,
             }
@@ -757,6 +767,7 @@ fn eval_pine_entry(
     cfg: &DetectorConfig,
     pattern: Option<SignalKind>,
     dir: Direction,
+    confirmed_first: bool,
 ) -> Option<LatchedSignal> {
     let Some(idx) = detector_window.iter().position(|c| c.time == candle.time) else {
         tracing::debug!(
@@ -765,11 +776,25 @@ fn eval_pine_entry(
         );
         return None;
     };
-    let Some(sig) = latched_signal_at(detector_window, idx, cfg) else {
+    // `confirmed_first` (a `needs_confirmed` enter): surface the FIRST signal to
+    // confirm, carrying its own base as the level, instead of the single latch.
+    // The latch is overwritten by a fresher print, so an earlier signal's
+    // confirmation never reaches a confirmation-gated enter — the DE30_EUR
+    // 2026-07-07 miss (see `first_confirmed_signal_at`). The guard/close and
+    // golden-only enters keep the latch (`false`): they want "the newest signal
+    // right now", and golden-only enters were never confirmation-blocked.
+    let sig = if confirmed_first {
+        first_confirmed_signal_at(detector_window, idx, cfg)
+    } else {
+        latched_signal_at(detector_window, idx, cfg)
+    };
+    let Some(sig) = sig else {
         tracing::debug!(
             bar = %candle.time,
             window_len = detector_window.len(),
-            "pine-enter: no latched signal yet (detector warming / no pattern printed)"
+            confirmed_first,
+            "pine-enter: no latched signal yet (detector warming / no pattern printed / \
+             no confirmed signal yet)"
         );
         return None;
     };
@@ -875,7 +900,9 @@ fn eval_pine_guard(
     // fires), so a close and an enter can't drift on what "a reversal printed"
     // means. `eval_pine_entry` logs under the `pine-enter` tag; the extra
     // band gate below logs under `pine-close`.
-    let sig = eval_pine_entry(candle, detector_window, cfg, pattern, dir)?;
+    // The close-on-reversal guard wants "a reversal printed/validated *now*" —
+    // the single latch, not first-confirmed. `confirmed_first: false`.
+    let sig = eval_pine_entry(candle, detector_window, cfg, pattern, dir, false)?;
 
     // Price-band gate (the pure half of `run_close`'s contextual window). Only
     // applied when the intent opted into the price window; a news-only
@@ -3837,6 +3864,96 @@ mod tests {
         assert!((sig.signal_low - 1.10).abs() < 1e-12);
         // single-shot enter ends the spine.
         assert!(eval.done);
+    }
+
+    /// Two back-to-back short floating engulfers (a descending staircase — the
+    /// DE30_EUR 2026-07-07 shape). The FIRST prints on bar 1 and confirms on bar
+    /// 3 (bars 2 & 3 push below its low, neither breaches its high); a SECOND
+    /// short prints on bar 2 and overwrites the single latch. A `needs_confirmed`
+    /// enter reading the latch would see the *second* signal (unconfirmed at the
+    /// bar the first validates) and never enter — the live bug. Reading the
+    /// first-confirmed signal, the enter fires off the FIRST signal's base.
+    fn two_short_engulfers_window() -> Vec<Candle> {
+        vec![
+            candle("2026-06-16T09:00:00Z", 120.0, 121.0, 118.0, 118.5),
+            // bar 1: short engulfer #1 — high 117.5 / low 110.
+            candle("2026-06-16T10:00:00Z", 117.0, 117.5, 110.0, 110.5),
+            // bar 2: short engulfer #2 — high 112 / low 104. Its low pushes below
+            // bar1's low (confirm push); its high 112 < bar1's 117.5 (no breach).
+            candle("2026-06-16T11:00:00Z", 110.0, 112.0, 104.0, 104.5),
+            // bar 3: prints nothing; bar 1 validates here (bars_elapsed = 2).
+            candle("2026-06-16T12:00:00Z", 105.0, 106.0, 104.5, 105.3),
+        ]
+    }
+
+    #[test]
+    fn confirmed_enter_fires_off_first_confirmed_signal_base() {
+        // The DE30_EUR fix end-to-end: a `needs_confirmed` short enter fires on
+        // the confirmation bar (bar 3) carrying the FIRST signal's geometry
+        // (high 117.5 / low 110), NOT the second signal that overwrote the latch
+        // (112 / 104). Entry anchors to SignalLow → the first signal's base.
+        let mut rule = pine_enter_rule(None, Direction::Short, false);
+        rule.intent.needs_confirmed = true;
+        // strategy-v2's confirmed enter is a LIMIT resting at the signal base
+        // (fills on the pullback back to the level). At the confirmation bar
+        // price has already fallen below the base, so a *stop* there would be
+        // wrong-side; the limit rests correctly. Anchor at SignalLow, offset 0.
+        rule.intent.entry = Some(trade_control_core::intent::EntrySpec::Limit {
+            from: trade_control_core::intent::PriceAnchor::SignalLow,
+            offset_pips: 0.0,
+            offset_atr_pct: None,
+            at: None,
+        });
+        // Absolute TP well below the ~110 base so the short bracket clears the
+        // ≥1R floor (SL ≈ 117.5, entry ≈ 110).
+        rule.intent.take_profit = Some(trade_control_core::intent::TakeProfit::Anchored(
+            trade_control_core::intent::PriceRef::Absolute { absolute: 90.0 },
+        ));
+        let p = plan(vec![rule]);
+        let window = two_short_engulfers_window();
+        let prior = seed_at(Phase::AwaitEntry, "2026-06-16T11:00:00Z");
+        // Bar 3 (the confirmation bar) is the only new candle this tick.
+        let eval = run_window(&p, &prior, &window[3..], &window);
+        assert_eq!(
+            eval.fired.len(),
+            1,
+            "the confirmed enter fires on the confirmation bar"
+        );
+        let sig = eval.fired[0]
+            .signal
+            .expect("a PinePattern fire carries latched geometry");
+        assert_eq!(sig.direction, Direction::Short);
+        assert!(sig.signal_confirmed, "rides the confirmed first signal");
+        // FIRST signal's own geometry — high 117.5 / low 110 — the base the entry
+        // anchors to. The second signal's 112 / 104 would be the latch-bug value.
+        assert!(
+            (sig.signal_high - 117.5).abs() < 1e-9,
+            "hi {}",
+            sig.signal_high
+        );
+        assert!(
+            (sig.signal_low - 110.0).abs() < 1e-9,
+            "lo {}",
+            sig.signal_low
+        );
+    }
+
+    #[test]
+    fn confirmed_enter_does_not_fire_before_confirmation_bar() {
+        // On bar 2 (first signal not yet resolved, bars_elapsed = 1) the confirmed
+        // enter must not fire — no confirmed signal exists yet.
+        let mut rule = pine_enter_rule(None, Direction::Short, false);
+        rule.intent.needs_confirmed = true;
+        let p = plan(vec![rule]);
+        let window = two_short_engulfers_window();
+        let prior = seed_at(Phase::AwaitEntry, "2026-06-16T10:00:00Z");
+        // Feed up to bar 2 only.
+        let eval = run_window(&p, &prior, &window[2..3], &window[..3]);
+        assert!(
+            eval.fired.is_empty(),
+            "no confirmed signal before the window closes"
+        );
+        assert!(!eval.done, "a pre-confirmation decline is non-terminal");
     }
 
     #[test]
