@@ -71,7 +71,12 @@ pub enum RecoverEntry {
     /// Rest a limit at the original trigger and wait for the pullback —
     /// preserves the planned R exactly.
     Limit,
-    /// Drop the entry (today's behaviour for an un-opted stop).
+    /// Rest a **stop** at the original trigger. The mirror of `Limit`, for a
+    /// wrong-side **limit** entry: price already crossed the level, so a stop
+    /// catches the continuation through it. This is the default recovery for
+    /// `--entry-limit`.
+    Stop,
+    /// Drop the entry (today's behaviour for an un-opted stop/limit).
     Abort,
 }
 
@@ -82,6 +87,7 @@ impl RecoverEntry {
         match self {
             Self::Market => Core::Market,
             Self::Limit => Core::Limit,
+            Self::Stop => Core::Stop,
             Self::Abort => Core::Skip,
         }
     }
@@ -219,9 +225,25 @@ pub struct Args {
 
     /// Use a market order for entry instead of the default pending
     /// stop-entry at the geometry anchor. SL still anchors to
-    /// geometry. (Pattern path — H&S / M/W.)
-    #[arg(long)]
+    /// geometry. (Pattern path — H&S / M/W.) Mutually exclusive with
+    /// `--entry-stop` / `--entry-limit`.
+    #[arg(long, group = "pattern_entry")]
     pub entry_market: bool,
+
+    /// **Pattern path.** Explicit pending **stop** entry at the geometry
+    /// anchor — the default, so this is only needed to be explicit or to
+    /// override a config default. Mutually exclusive with `--entry-market`
+    /// / `--entry-limit`.
+    #[arg(long, group = "pattern_entry")]
+    pub entry_stop: bool,
+
+    /// **Pattern path.** Rest a **limit** at the geometry anchor (fills on a
+    /// pullback back to the level rather than a break through it). If price has
+    /// already crossed the level (wrong-side) it recovers to a **stop** at the
+    /// same level — see `--entry-recover` (default `stop` for a limit). Mutually
+    /// exclusive with `--entry-market` / `--entry-stop`.
+    #[arg(long, group = "pattern_entry")]
+    pub entry_limit: bool,
 
     /// **Position-tool direct entry.** Read the long/short *position*
     /// tool drawn on the chart and place a **market** order immediately
@@ -280,7 +302,7 @@ pub struct Args {
     /// `--max-retries 0` is rejected at validation.
     #[arg(
         long,
-        conflicts_with_all = ["quasimodo", "entry_market", "skip_break_and_close", "skip_retest"]
+        conflicts_with_all = ["quasimodo", "entry_market", "entry_stop", "entry_limit", "skip_break_and_close", "skip_retest"]
     )]
     pub strategy_v2: bool,
 
@@ -531,6 +553,46 @@ impl Args {
             _ => None,
         }
     }
+
+    /// The selected **pattern-path** entry order type (H&S / M/W), or `None`
+    /// when none of `--entry-market` / `--entry-stop` / `--entry-limit` is set
+    /// — then the pipeline uses its default (stop). The `pattern_entry` clap
+    /// group guarantees at most one is set. `--entry-stop` returns `Stop`
+    /// explicitly (same as the default) so an operator can override a config
+    /// default back to stop.
+    pub fn pattern_entry_mode(&self) -> Option<PatternEntry> {
+        match (self.entry_market, self.entry_stop, self.entry_limit) {
+            (true, _, _) => Some(PatternEntry::Market),
+            (_, true, _) => Some(PatternEntry::Stop),
+            (_, _, true) => Some(PatternEntry::Limit),
+            _ => None,
+        }
+    }
+
+    /// The wrong-side recovery for a `--entry-limit`: honour an explicit
+    /// `--recover-entry`, else default to **stop** (the operator's rule — a
+    /// wrong-side limit becomes a stop at the same level). For a stop/market
+    /// entry the pipeline's own default applies; this is only consulted on the
+    /// limit arm.
+    pub fn limit_recover_action(&self) -> trade_control_core::intent::RecoverEntryAction {
+        self.recover_entry
+            .map(|r| r.into_core())
+            .unwrap_or(trade_control_core::intent::RecoverEntryAction::Stop)
+    }
+}
+
+/// Which order type a **pattern-path** (H&S / M/W) entry should place. The
+/// mirror of [`PositionEntry`] for the pattern arming path. Set by
+/// [`Args::pattern_entry_mode`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PatternEntry {
+    /// Market order on the confirmation/signal bar.
+    Market,
+    /// Pending stop at the geometry anchor (the default).
+    Stop,
+    /// Pending limit at the geometry anchor (fills on the pullback; recovers to
+    /// a stop when wrong-side — see [`Args::limit_recover_action`]).
+    Limit,
 }
 
 #[cfg(test)]
@@ -739,6 +801,38 @@ mod tests {
     fn position_entry_flags_are_mutually_exclusive() {
         let res = Args::try_parse_from(["tv-arm", "--market-entry", "--stop-entry"]);
         assert!(res.is_err(), "expected parse error, got {res:?}");
+    }
+
+    #[test]
+    fn pattern_entry_flags_resolve() {
+        // No flag → None (pipeline defaults to stop).
+        let args = Args::try_parse_from(["tv-arm"]).expect("parse");
+        assert_eq!(args.pattern_entry_mode(), None);
+
+        let m = Args::try_parse_from(["tv-arm", "--entry-market"]).expect("parse");
+        assert_eq!(m.pattern_entry_mode(), Some(PatternEntry::Market));
+        let s = Args::try_parse_from(["tv-arm", "--entry-stop"]).expect("parse");
+        assert_eq!(s.pattern_entry_mode(), Some(PatternEntry::Stop));
+        let l = Args::try_parse_from(["tv-arm", "--entry-limit"]).expect("parse");
+        assert_eq!(l.pattern_entry_mode(), Some(PatternEntry::Limit));
+    }
+
+    #[test]
+    fn pattern_entry_flags_are_mutually_exclusive() {
+        let res = Args::try_parse_from(["tv-arm", "--entry-market", "--entry-limit"]);
+        assert!(res.is_err(), "expected parse error, got {res:?}");
+    }
+
+    #[test]
+    fn entry_limit_defaults_recover_to_stop() {
+        use trade_control_core::intent::RecoverEntryAction;
+        // --entry-limit with no --recover-entry → recovers to STOP (the rule).
+        let l = Args::try_parse_from(["tv-arm", "--entry-limit"]).expect("parse");
+        assert_eq!(l.limit_recover_action(), RecoverEntryAction::Stop);
+        // Explicit --recover-entry wins.
+        let l2 = Args::try_parse_from(["tv-arm", "--entry-limit", "--recover-entry", "abort"])
+            .expect("parse");
+        assert_eq!(l2.limit_recover_action(), RecoverEntryAction::Skip);
     }
 
     #[test]

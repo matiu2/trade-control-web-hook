@@ -385,6 +385,7 @@ impl Resolved {
                 offset_pips,
                 offset_atr_pct,
                 at,
+                recover_entry: rec,
             } => {
                 let trigger = match at {
                     Some(absolute) => *absolute,
@@ -402,26 +403,56 @@ impl Resolved {
                 // Limit sits on the *near* side of current price for the direction:
                 // long limits below close, short limits above. If it's the wrong
                 // side, OANDA would fill instantly (turning the limit into a
-                // market order at a worse price) — reject as a typo. Skipped for
-                // an absolute `at` (see the Stop arm: operator-drawn level, shell
-                // close == trigger, broker arbitrates wrong-side).
-                if at.is_none() {
-                    match direction {
-                        Direction::Long if trigger >= shell.close => {
-                            return Err(ResolveError::InvalidGeometry);
+                // market order at a worse price). Skipped for an absolute `at`
+                // (see the Stop arm: operator-drawn level, shell close == trigger,
+                // broker arbitrates wrong-side).
+                let wrong_side = at.is_none()
+                    && match direction {
+                        Direction::Long => trigger >= shell.close,
+                        Direction::Short => trigger <= shell.close,
+                    };
+                if wrong_side {
+                    // Recover to a STOP at the same level when the intent opted
+                    // in (the mirror of the Stop arm's limit recovery). Price has
+                    // already crossed the level during the confirmation wait, so
+                    // a stop here catches the continuation through it. Re-check it
+                    // rests on the correct *stop* side (long stop above close,
+                    // short below); a degenerate case that isn't a genuine
+                    // overrun would be a wrong-side stop → drop.
+                    match rec.map(|o| o.action) {
+                        Some(super::RecoverEntryAction::Stop) => {
+                            let stop_ok = match direction {
+                                Direction::Long => trigger >= shell.close,
+                                Direction::Short => trigger <= shell.close,
+                            };
+                            if !stop_ok {
+                                return Err(ResolveError::InvalidGeometry);
+                            }
+                            recover_entry =
+                                rec.map(|o| resolve_recover_entry(o, pip_size, stop_loss, trigger));
+                            (
+                                ResolvedEntry::Stop {
+                                    trigger_price: trigger,
+                                },
+                                trigger,
+                            )
                         }
-                        Direction::Short if trigger <= shell.close => {
-                            return Err(ResolveError::InvalidGeometry);
-                        }
-                        _ => {}
+                        // No opt-in / Skip / (Market|Limit — nonsensical for a
+                        // wrong-side limit) → today's drop.
+                        _ => return Err(ResolveError::InvalidGeometry),
                     }
+                } else {
+                    // Correct-side limit: carry any recovery through for the
+                    // worker's broker-reject path, exactly as the Stop arm does.
+                    recover_entry =
+                        rec.map(|o| resolve_recover_entry(o, pip_size, stop_loss, trigger));
+                    (
+                        ResolvedEntry::Limit {
+                            trigger_price: trigger,
+                        },
+                        trigger,
+                    )
                 }
-                (
-                    ResolvedEntry::Limit {
-                        trigger_price: trigger,
-                    },
-                    trigger,
-                )
             }
         };
 
@@ -906,6 +937,7 @@ mod tests {
             offset_pips: 5.0,
             offset_atr_pct: None,
             at: Some(1.1000),
+            recover_entry: None,
         });
         intent.stop_loss = Some(PriceRef::Absolute { absolute: 1.0900 });
         intent.take_profit = Some(TakeProfit::Anchored(PriceRef::Absolute {
@@ -1248,6 +1280,7 @@ mod tests {
             offset_pips: 5.0,
             offset_atr_pct: None,
             at: None,
+            recover_entry: None,
         });
         let r = Resolved::from_intent(&intent, &shell(), 0.0001, 0.0).unwrap();
         match r.entry {
@@ -1268,6 +1301,7 @@ mod tests {
             offset_pips: -10.0,
             offset_atr_pct: None,
             at: None,
+            recover_entry: None,
         });
         assert!(matches!(
             Resolved::from_intent(&intent, &shell(), 0.0001, 0.0),
@@ -1290,6 +1324,7 @@ mod tests {
             offset_pips: -5.0,
             offset_atr_pct: None,
             at: None,
+            recover_entry: None,
         });
         let r = Resolved::from_intent(&intent, &shell(), 0.0001, 0.0).unwrap();
         match r.entry {
@@ -1299,6 +1334,61 @@ mod tests {
             }
             _ => panic!("expected limit entry"),
         }
+    }
+
+    #[test]
+    fn wrong_side_short_limit_recovers_to_stop() {
+        // A SHORT limit at 1.0990 is *below* the 1.1000 close → wrong-side
+        // (price already crossed the level). With recover_entry: Stop it becomes
+        // a sell-stop at the same level (catches the continuation down). This is
+        // the operator's rule: "--entry-limit + price past the level → stop".
+        let mut intent = long_market_intent();
+        intent.direction = Some(Direction::Short);
+        intent.stop_loss = Some(PriceRef::Anchored {
+            from: PriceAnchor::High,
+            offset_pips: 10.0,
+            offset_atr_pct: None,
+        });
+        intent.entry = Some(EntrySpec::Limit {
+            from: PriceAnchor::Low, // 1.0980
+            offset_pips: 10.0,      // → 1.0990, below the 1.1000 close
+            offset_atr_pct: None,
+            at: None,
+            recover_entry: Some(RecoverEntry {
+                action: RecoverEntryAction::Stop,
+                max_slippage_pips: None,
+            }),
+        });
+        let r = Resolved::from_intent(&intent, &shell(), 0.0001, 0.0).unwrap();
+        match r.entry {
+            ResolvedEntry::Stop { trigger_price } => {
+                assert!((trigger_price - 1.0990).abs() < 1e-9, "{trigger_price}");
+            }
+            other => panic!("expected a recovered stop, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn wrong_side_short_limit_without_recovery_is_dropped() {
+        // Same wrong-side limit, but no recover_entry → today's drop.
+        let mut intent = long_market_intent();
+        intent.direction = Some(Direction::Short);
+        intent.stop_loss = Some(PriceRef::Anchored {
+            from: PriceAnchor::High,
+            offset_pips: 10.0,
+            offset_atr_pct: None,
+        });
+        intent.entry = Some(EntrySpec::Limit {
+            from: PriceAnchor::Low,
+            offset_pips: 10.0, // 1.0990, wrong side
+            offset_atr_pct: None,
+            at: None,
+            recover_entry: None,
+        });
+        assert!(matches!(
+            Resolved::from_intent(&intent, &shell(), 0.0001, 0.0),
+            Err(ResolveError::InvalidGeometry)
+        ));
     }
 
     #[test]

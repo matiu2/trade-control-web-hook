@@ -58,6 +58,14 @@ pub enum RecoverEntryPlan {
     /// when the alert window / `expiry_bars` lapses — no broker-native
     /// GTD required.
     Limit { trigger_price: f64 },
+    /// Re-place as a **stop** order resting at `trigger_price` — the mirror of
+    /// `Limit`, used when a *limit* was wrong-side (price already crossed the
+    /// level during the confirmation wait). A stop at the same level catches the
+    /// continuation *through* it. Like `Limit`, the entry reference is unchanged,
+    /// so the caller reuses the original stop-distance math (no fresh sizing),
+    /// and the resting stop is a normal `EntryAttempt` the cron sweep cancels on
+    /// window / `expiry_bars` lapse.
+    Stop { trigger_price: f64 },
     /// Don't recover — keep the failure terminal (`Failed` → 502, no
     /// seen-id poison, next bar retries). `reason` is a short
     /// telemetry-friendly suffix for the log / outcome string.
@@ -129,6 +137,29 @@ pub fn recover_entry_plan(
             } else {
                 RecoverEntryPlan::Skip {
                     reason: "recover-entry-limit-wrong-side",
+                }
+            }
+        }
+        RecoverEntryAction::Stop => {
+            if !current_price.is_finite() || !trigger_price.is_finite() {
+                return RecoverEntryPlan::Skip {
+                    reason: "recover-entry-price-unavailable",
+                };
+            }
+            // A long stop must rest at/above the market, a short stop at/below —
+            // the mirror of the limit check. For a genuine wrong-side *limit* the
+            // price has crossed the level (long: current >= trigger; short:
+            // current <= trigger), so the original trigger is the correct *stop*
+            // side and fills on the continuation through it.
+            let correct_side = match direction {
+                Direction::Long => current_price <= trigger_price,
+                Direction::Short => current_price >= trigger_price,
+            };
+            if correct_side {
+                RecoverEntryPlan::Stop { trigger_price }
+            } else {
+                RecoverEntryPlan::Skip {
+                    reason: "recover-entry-stop-wrong-side",
                 }
             }
         }

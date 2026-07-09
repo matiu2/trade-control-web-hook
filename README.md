@@ -233,7 +233,7 @@ Basename ordering matters — `tv-arm` maps drawings to alerts by prefix.
 | `03-prep-break-and-close` | `prep` | Trendline crossing (neckline break) | Skippable for stocks / late entries with `--skip-break-and-close`. |
 | `04-prep-retest` | `prep` | Trendline crossing (intrabar retest of the neckline) | Skippable with `--skip-retest`. **Uses the same neckline drawing** as `03-prep-break-and-close` (opposite direction, intrabar) — you draw the neckline once. A separate `retest`/`neckline-retest`/`retrace` trendline is still honoured but **deprecated** (`tv-arm` warns). Fires **intrabar on the wick**, not the close, and (as of 2026-07-03) not the open either: the bar's **high and low just have to straddle the neckline** — sit on opposite sides — with the directional wick reaching at/through the line (long retest = the low dips at/below the descending neckline). Open- and close-agnostic: a tap-and-bounce that opens *and* closes on the same side still counts — see CHANGELOG "intrabar cross is a pure straddle". **The closeness requirement decays over time:** the first bar after the break-and-close must actually reach the neckline, and each subsequent bar loosens it by `retest_atr_step × ATR` of near-side slack (default step **0.075**, `tv-arm --retest-atr-step`), so a wick that comes *within* the growing tolerance of the line stamps the retest even without reaching it — the further price drifts in time, the less its exact distance to the neckline matters. See CHANGELOG "time-decaying retest tolerance". The wick must pierce at least `cross_buffer_pct%` of the line price past the line (plan-level field, default 0.02%) so a one-tick graze doesn't trip it. |
 | `05-enter` | `enter` | Pine `Candle Signals` golden candle | The actual trade. Gated on the preps above + opposing-direction veto absent. |
-| `09-enter-qm` | `enter` | Pine `Candle Signals` (same detector as `05-enter`) | **`tv-arm --strategy-v2` only.** The Quasimodo entry, armed alongside `05-enter`: no preps, confirmed-candle gated. Its entry spec is **identical to standalone `--quasimodo`** — a stop at signal_low − the ATR buffer (`offset_atr_pct: 0.5`; see "ATR buffer") with a `recover_entry: limit` fallback (fills on the pullback when the level was overrun), *not* a bare limit. Shares the trade's `trade_id` + `max_retries` with `05-enter`; first of the two to fire cancels the other's resting order (worker retry gate). See "Dual entry — `--strategy-v2`" below. |
+| `09-enter-qm` | `enter` | Pine `Candle Signals` (same detector as `05-enter`) | **`tv-arm --strategy-v2` only.** The Quasimodo entry, armed alongside `05-enter`: no preps, **confirmed-candle gated (not golden)** — confirmation is its sole quality gate (golden is `05-enter`'s break-and-close gate; requiring both would starve the confirmed leg on a confirmed-but-small signal). It reads the **first signal to confirm** at/after the break-and-close, carrying *that* signal's own base as the entry level, rather than the single most-recent latch (which a fresher print overwrites — the DE30_EUR 2026-07-07 miss; see "First-confirmed entry" and CHANGELOG). Its entry spec is **identical to standalone `--quasimodo`** — a stop at signal_low − the ATR buffer (`offset_atr_pct: 0.5`; see "ATR buffer") with a `recover_entry: limit` fallback (fills on the pullback when the level was overrun), *not* a bare limit. Shares the trade's `trade_id` + `max_retries` with `05-enter`; first of the two to fire cancels the other's resting order (worker retry gate). See "Dual entry — `--strategy-v2`" below. |
 | `06-close-on-reversal` | `close` | Pine `Candle Signals` opposing reversal | Emitted when news-pairs and/or `support`/`resistance` lines are drawn. Carries `inside_window: [news?, price?]` (OR-composed) and, when `price` is listed, `sr_bands: [[lo, hi], ...]`. Defaults `needs_golden: true` for the candle-quality gate. With `tv-arm --veto-on-reversal` (experimental) it also carries `veto_on_reversal: true`, so a reversal off a band before entry vetoes the upcoming trade — see the `close` action notes above. |
 | `08-prep-expire-<step>` | `prep-expire` | Vertical line crossing chart time | Emitted once per chart-drawn `<prep>-expiry` line (`break-and-close-expiry`, `retest-expiry`). When crossed, blocks any further `<step>` prep on the trade — so a setup whose prep lands too late never enters. Drawing-bound. `<step>` is the canonical prep name and may contain hyphens. |
 
@@ -663,12 +663,30 @@ rejections to the generic case (the resolve-time recovery is
 broker-agnostic).
 
 **Arming via `tv-arm` (H&S / iH&S):** pass `--recover-entry
-market|limit|abort` to bake the policy onto the `05-enter` intent
+market|limit|stop|abort` to bake the policy onto the `05-enter` intent
 (`abort` → `skip`). When the flag is **omitted**, the default is keyed off
-`--require-confirmation`: a confirmation-required setup (whose
-confirmation lag is exactly what strands the stop) defaults to **`limit`**;
-otherwise the default is **drop** (`skip`). M/W is out of scope — it has
-no stop `EntrySpec` and is unaffected.
+the **entry order type**:
+
+- `--entry-limit`: a wrong-side limit (price already crossed the level)
+  defaults to **`stop`** — rest a stop at the same level to catch the
+  continuation through it. This is the operator's rule: "pass `--entry-limit`
+  and if price is above the level, turn it into a stop." `EntrySpec::Limit`
+  carries its own `recover_entry` for this (the mirror of the stop→limit
+  recovery below).
+- stop entry + `--require-confirmation`: defaults to **`limit`** (the
+  confirmation lag is exactly what strands the stop).
+- otherwise: **drop** (`skip`).
+
+**Pattern entry order type (`--entry-market` / `--entry-stop` /
+`--entry-limit`):** the H&S / iH&S / M/W pattern path defaults to a pending
+**stop** at the geometry anchor. Override with one of the three mutually
+exclusive flags: `--entry-market` (market on the signal bar), `--entry-stop`
+(explicit default), `--entry-limit` (rest a limit, recovering to a stop when
+wrong-side — see above). Not to be confused with the **position-tool**
+`--market-entry` / `--stop-entry` / `--limit-entry` (note the reversed word
+order), which read a drawn position tool instead of a pattern. `--strategy-v2`
+conflicts with all three pattern flags (its two legs have fixed shapes). M/W's
+own resolution is unaffected — it has no stop `EntrySpec`.
 
 **Bar-based order expiry (`expiry_bars`):** a resting stop/limit order
 that never fills otherwise sits until `not_after`. Set `expiry_bars: N`
@@ -2562,7 +2580,8 @@ cargo run -p tv-arm -- \
   --reversal-band-pct 0.1 \           # half-width % around support/resistance lines (default 0.1)
   --veto-on-reversal \                # experimental: a reversal off a band before entry also vetoes the upcoming trade (default off)
   --quasimodo \                       # alias: --skip-break-and-close --skip-retest --require-confirmation (drop both H&S preps, gate on a confirmed candle)
-  --strategy-v2 \                     # arm BOTH a stop entry AND a Quasimodo limit entry on one setup; first to fire cancels the other (see below). Conflicts with --quasimodo/--entry-market/--skip-*; needs --max-retries > 0
+  --strategy-v2 \                     # arm BOTH a stop entry AND a Quasimodo confirmed entry on one setup; first to fire cancels the other (see below). Conflicts with --quasimodo/--entry-{market,stop,limit}/--skip-*; needs --max-retries > 0
+  --entry-limit \                     # pattern entry order type: stop (default) | --entry-market | --entry-limit (limit; recovers to a stop when wrong-side). Mutually exclusive; NOT the position-tool --*-entry flags
   --no-breakeven \                    # disable break-even stop management (default ON at 50%; see "Break-even stop management")
   --breakeven-pct 0.7 \               # override the break-even arm threshold as a fraction of entry→TP (default 0.5)
   --skip-break-and-close \            # for stocks (no after-hours retests)
