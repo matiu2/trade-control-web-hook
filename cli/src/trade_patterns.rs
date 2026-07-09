@@ -1263,17 +1263,39 @@ fn assemble_trade(
             spec.spread_window,
         ));
     }
-    if spec.close_on_news || !spec.sr_reversal_ranges.is_empty() {
-        alerts.push(build_close_on_reversal_alert(
+    // Reversal-close split (2026-07-09). The operator's rule: a golden opposite
+    // reversal candle closes the trade **at close** only (1) off a
+    // support/resistance line OR (2) during a news window; outside both it is
+    // ignored. Each context is now its own alert with a **single** contextual
+    // window, so each fires on its own gate and the two OR-compose at the worker
+    // (`evaluate_close_gates`) — no single alert carries both windows, which is
+    // what let the engine AND-drop the S/R-only case (EUR_USD 2026-07-08).
+    //
+    //   - `07-close-on-sr-reversal` — `inside_window: ["price"]` + `sr_bands`,
+    //     armed whenever S/R lines are drawn, independent of any news window.
+    //     Carries the `veto_on_reversal` flag (needs the price band to bite).
+    //   - `06-close-on-reversal`   — `inside_window: ["news"]`, the news-window
+    //     safety flatten (`--close-on-news`). Never carries a price band.
+    if !spec.sr_reversal_ranges.is_empty() {
+        alerts.push(build_sr_reversal_close_alert(
             &spec.instrument,
             &trade_id,
             spec.trade_expiry,
             &spec.broker,
             &spec.account,
-            spec.close_on_news,
             spec.sr_reversal_ranges.clone(),
             spec.needs_confirmed_close,
             spec.veto_on_reversal,
+        ));
+    }
+    if spec.close_on_news {
+        alerts.push(build_news_reversal_close_alert(
+            &spec.instrument,
+            &trade_id,
+            spec.trade_expiry,
+            &spec.broker,
+            &spec.account,
+            spec.needs_confirmed_close,
         ));
     }
 
@@ -2335,37 +2357,87 @@ fn mint_position_trade_id(instrument: &str) -> Result<String> {
     Ok(format!("pos-{instr}-{suffix}"))
 }
 
-/// Build the consolidated `06-close-on-reversal` alert: an
-/// opposing-direction reversal close that the worker only honours
-/// when at least one of the configured contextual windows is active.
-/// The Python side wires this YAML to the same `Candle Signals` Pine
-/// study as `05-enter` but to the *opposite* direction's
-/// `alertcondition` plot — so when a confirming reversal candle
-/// prints against the open trade, the worker flattens only if the
-/// contextual gate passes.
+/// Set the candle-quality gate on a reversal-close intent: `needs_confirmed`
+/// when the operator asked for it, otherwise the default `needs_golden`. A
+/// golden opposite reversal is the whole point of the close — size is the
+/// filter unless the operator flips to confirmation.
+fn set_reversal_close_quality(
+    intent: &mut trade_control_core::intent::Intent,
+    needs_confirmed: bool,
+) {
+    if needs_confirmed {
+        intent.needs_confirmed = true;
+    } else {
+        intent.needs_golden = true;
+    }
+}
+
+/// Build the `07-close-on-sr-reversal` alert: an opposing-direction golden
+/// reversal candle that closes the trade **at close** when its close sits inside
+/// one of the drawn support/resistance bands. Gated on the **price window only**
+/// (`inside_window: ["price"]` + `sr_bands`) — it is armed whenever S/R lines
+/// are present, independent of any news window. This is the "in all types of
+/// trade, a golden reversal off an S/R line closes it" rule (operator 2026-07-09).
 ///
-/// Contextual gates (OR-composed via `inside_window`):
+/// Split out of the old consolidated `06-close-on-reversal` (which carried both
+/// the news and price windows on one intent). Keeping the S/R half on its own
+/// single-window intent means the engine's per-window gate can't AND-drop it
+/// when no news window is open — the divergence that rode EUR_USD 2026-07-08
+/// back to break-even.
 ///
-/// - `news` — an open `news:<trade_id>:*` KV entry.
-/// - `price` — current broker price inside at least one
-///   `sr_bands` entry.
-///
-/// At least one of the two must be requested (the caller has
-/// already checked).
-///
-/// Candle-quality gate: defaults to `needs_golden: true`. Operator
-/// can flip to `needs_confirmed: true` via the spec field.
+/// Candle-quality gate: defaults to `needs_golden: true`; `needs_confirmed: true`
+/// via the spec field. Carries `veto_on_reversal` when set (it needs the price
+/// band to bite).
 #[allow(clippy::too_many_arguments)]
-fn build_close_on_reversal_alert(
+fn build_sr_reversal_close_alert(
     instrument: &str,
     trade_id: &str,
     trade_expiry: DateTime<Utc>,
     broker: &BrokerKind,
     account: &str,
-    include_news_window: bool,
     sr_bands: Vec<[f64; 2]>,
     needs_confirmed: bool,
     veto_on_reversal: bool,
+) -> BuiltAlert {
+    let id = format!("{trade_id}-close-on-sr-reversal");
+    let mut intent = skeleton(
+        Action::Close,
+        instrument,
+        id,
+        trade_expiry,
+        *broker,
+        account,
+        trade_id,
+    );
+    intent.inside_window = vec![trade_control_core::intent::EventWindow::Price];
+    intent.sr_bands = sr_bands;
+    if veto_on_reversal {
+        intent.veto_on_reversal = true;
+    }
+    set_reversal_close_quality(&mut intent, needs_confirmed);
+    intent.reason = Some("support/resistance reversal".into());
+    BuiltAlert {
+        basename: AlertBasename::CloseOnSrReversal.as_str().into_owned(),
+        purpose: "close: opposing golden reversal candle at a support/resistance band".into(),
+        intent,
+    }
+}
+
+/// Build the `06-close-on-reversal` alert: the **news-window** safety flatten
+/// (`--close-on-news`). An opposing-direction reversal closes the trade only
+/// while a `news:<trade_id>:*` window is open (`inside_window: ["news"]`, no
+/// price band). Never carries `veto_on_reversal` (that needs a price band — the
+/// S/R half owns it).
+///
+/// Candle-quality gate: defaults to `needs_golden: true`; `needs_confirmed: true`
+/// via the spec field.
+fn build_news_reversal_close_alert(
+    instrument: &str,
+    trade_id: &str,
+    trade_expiry: DateTime<Utc>,
+    broker: &BrokerKind,
+    account: &str,
+    needs_confirmed: bool,
 ) -> BuiltAlert {
     let id = format!("{trade_id}-close-on-reversal");
     let mut intent = skeleton(
@@ -2377,40 +2449,12 @@ fn build_close_on_reversal_alert(
         account,
         trade_id,
     );
-    let mut inside_window: Vec<trade_control_core::intent::EventWindow> = Vec::new();
-    if include_news_window {
-        inside_window.push(trade_control_core::intent::EventWindow::News);
-    }
-    let has_sr_bands = !sr_bands.is_empty();
-    if has_sr_bands {
-        inside_window.push(trade_control_core::intent::EventWindow::Price);
-    }
-    intent.inside_window = inside_window;
-    intent.sr_bands = sr_bands;
-    // veto_on_reversal only bites with a price window (sr_bands). Gate it
-    // on `has_sr_bands` so a news-only reversal-close can't carry a flag
-    // the worker would reject at validate time.
-    if veto_on_reversal && has_sr_bands {
-        intent.veto_on_reversal = true;
-    }
-    if needs_confirmed {
-        intent.needs_confirmed = true;
-    } else {
-        intent.needs_golden = true;
-    }
-    intent.reason = Some(
-        match (include_news_window, has_sr_bands) {
-            (true, true) => "news-or-price reversal",
-            (true, false) => "news-window reversal",
-            (false, true) => "support/resistance reversal",
-            (false, false) => "reversal", // unreachable — caller gated
-        }
-        .into(),
-    );
+    intent.inside_window = vec![trade_control_core::intent::EventWindow::News];
+    set_reversal_close_quality(&mut intent, needs_confirmed);
+    intent.reason = Some("news-window reversal".into());
     BuiltAlert {
         basename: AlertBasename::CloseOnReversal.as_str().into_owned(),
-        purpose: "close: opposing reversal candle, gated on the configured contextual window(s)"
-            .into(),
+        purpose: "close: opposing reversal candle during an open news window".into(),
         intent,
     }
 }
@@ -3364,17 +3408,36 @@ mod tests {
         assert_eq!(trade.spec.pattern, TradePattern::Hs);
     }
 
+    /// The first reversal-close alert (index 6, after the 6-alert base bundle).
+    /// With the 06/07 split, `07-close-on-sr-reversal` is pushed before
+    /// `06-close-on-reversal`, so `alerts[6]` is the SR close when S/R bands are
+    /// present.
+    fn reversal_close_by_basename<'a>(
+        trade: &'a BuiltTrade,
+        basename: &str,
+    ) -> Option<&'a trade_control_core::intent::Intent> {
+        trade
+            .alerts
+            .iter()
+            .find(|a| a.basename == basename)
+            .map(|a| &a.intent)
+    }
+
     #[test]
-    fn build_trade_from_spec_emits_seven_alerts_when_close_on_news() {
-        // close_on_news → consolidated 06-close-on-reversal with
-        // inside_window = [news] only.
+    fn build_trade_from_spec_emits_news_close_only_when_close_on_news() {
+        // close_on_news → a lone 06-close-on-reversal with inside_window =
+        // [news] only. No 07 (no S/R bands).
         let now = ts("2026-05-20T00:00:00Z");
         let mut spec = sample_spec(TradePattern::Hs, ts("2026-05-25T00:00:00Z"));
         spec.close_on_news = true;
         let trade = build_trade_from_spec(spec, now, BuildStrictness::Strict).unwrap();
         assert_eq!(trade.alerts.len(), 7);
         assert_eq!(trade.alerts[6].basename, "06-close-on-reversal");
-        let close = &trade.alerts[6].intent;
+        assert!(
+            reversal_close_by_basename(&trade, "07-close-on-sr-reversal").is_none(),
+            "no S/R bands → no 07"
+        );
+        let close = reversal_close_by_basename(&trade, "06-close-on-reversal").unwrap();
         assert_eq!(close.action, Action::Close);
         assert_eq!(
             close.inside_window,
@@ -3391,16 +3454,21 @@ mod tests {
     }
 
     #[test]
-    fn build_trade_from_spec_emits_seven_alerts_when_sr_reversal_ranges_set() {
-        // sr_reversal_ranges only → consolidated 06-close-on-reversal
-        // with inside_window = [price] + sr_bands populated.
+    fn build_trade_from_spec_emits_sr_close_only_when_sr_reversal_ranges_set() {
+        // sr_reversal_ranges only → a lone 07-close-on-sr-reversal with
+        // inside_window = [price] + sr_bands. No 06 (no news flag). This is the
+        // always-armed S/R reversal close (operator 2026-07-09).
         let now = ts("2026-05-20T00:00:00Z");
         let mut spec = sample_spec(TradePattern::Hs, ts("2026-05-25T00:00:00Z"));
         spec.sr_reversal_ranges = vec![[1.0950, 1.0970], [1.1000, 1.1020]];
         let trade = build_trade_from_spec(spec, now, BuildStrictness::Strict).unwrap();
         assert_eq!(trade.alerts.len(), 7);
-        assert_eq!(trade.alerts[6].basename, "06-close-on-reversal");
-        let close = &trade.alerts[6].intent;
+        assert_eq!(trade.alerts[6].basename, "07-close-on-sr-reversal");
+        assert!(
+            reversal_close_by_basename(&trade, "06-close-on-reversal").is_none(),
+            "no news flag → no 06"
+        );
+        let close = reversal_close_by_basename(&trade, "07-close-on-sr-reversal").unwrap();
         assert_eq!(close.action, Action::Close);
         assert_eq!(
             close.inside_window,
@@ -3415,50 +3483,61 @@ mod tests {
     }
 
     #[test]
-    fn build_trade_from_spec_emits_one_consolidated_alert_when_both_close_flags_set() {
-        // Both flags set: one 06 alert with inside_window = [news, price]
-        // (OR-composed by the worker). The split 06/07 alerts are gone.
+    fn build_trade_from_spec_emits_both_split_closes_when_both_flags_set() {
+        // Both flags set → TWO separate single-window alerts: 07 (price) + 06
+        // (news). They OR-compose at the worker. The old single consolidated
+        // `[news, price]` alert is gone (the shape that let the engine AND-drop
+        // the S/R-only case).
         let now = ts("2026-05-20T00:00:00Z");
         let mut spec = sample_spec(TradePattern::Hs, ts("2026-05-25T00:00:00Z"));
         spec.close_on_news = true;
         spec.sr_reversal_ranges = vec![[1.0950, 1.0970]];
         let trade = build_trade_from_spec(spec, now, BuildStrictness::Strict).unwrap();
-        assert_eq!(trade.alerts.len(), 7);
-        assert_eq!(trade.alerts[6].basename, "06-close-on-reversal");
-        let close = &trade.alerts[6].intent;
+        assert_eq!(trade.alerts.len(), 8, "base 6 + 07 + 06");
+        // SR close pushed first.
+        assert_eq!(trade.alerts[6].basename, "07-close-on-sr-reversal");
+        assert_eq!(trade.alerts[7].basename, "06-close-on-reversal");
+
+        let sr = reversal_close_by_basename(&trade, "07-close-on-sr-reversal").unwrap();
         assert_eq!(
-            close.inside_window,
-            vec![
-                trade_control_core::intent::EventWindow::News,
-                trade_control_core::intent::EventWindow::Price,
-            ]
+            sr.inside_window,
+            vec![trade_control_core::intent::EventWindow::Price]
         );
-        assert_eq!(close.sr_bands, vec![[1.0950, 1.0970]]);
-        assert!(close.needs_golden);
-        assert!(
-            !trade
-                .alerts
-                .iter()
-                .any(|a| a.basename == "07-close-on-sr-reversal")
+        assert_eq!(sr.sr_bands, vec![[1.0950, 1.0970]]);
+        assert!(sr.needs_golden);
+        sr.validate().expect("sr close valid");
+
+        let news = reversal_close_by_basename(&trade, "06-close-on-reversal").unwrap();
+        assert_eq!(
+            news.inside_window,
+            vec![trade_control_core::intent::EventWindow::News]
         );
-        close.validate().expect("consolidated close intent valid");
+        assert!(news.sr_bands.is_empty());
+        assert!(news.needs_golden);
+        news.validate().expect("news close valid");
+
+        // Distinct intent ids so replay-dedup keeps them apart.
+        assert_ne!(sr.id, news.id);
     }
 
     #[test]
     fn build_trade_from_spec_close_uses_needs_confirmed_when_flag_set() {
-        // needs_confirmed_close flips the candle-quality gate from
-        // golden to confirmed.
+        // needs_confirmed_close flips the candle-quality gate from golden to
+        // confirmed on BOTH split closes.
         let now = ts("2026-05-20T00:00:00Z");
         let mut spec = sample_spec(TradePattern::Hs, ts("2026-05-25T00:00:00Z"));
         spec.close_on_news = true;
+        spec.sr_reversal_ranges = vec![[1.0950, 1.0970]];
         spec.needs_confirmed_close = true;
         let trade = build_trade_from_spec(spec, now, BuildStrictness::Strict).unwrap();
-        let close = &trade.alerts[6].intent;
-        assert!(close.needs_confirmed);
-        assert!(!close.needs_golden);
-        close
-            .validate()
-            .expect("needs_confirmed close intent valid");
+        for basename in ["07-close-on-sr-reversal", "06-close-on-reversal"] {
+            let close = reversal_close_by_basename(&trade, basename).unwrap();
+            assert!(close.needs_confirmed, "{basename} confirmed");
+            assert!(!close.needs_golden, "{basename} not golden");
+            close
+                .validate()
+                .expect("needs_confirmed close intent valid");
+        }
     }
 
     #[test]
@@ -3468,7 +3547,7 @@ mod tests {
         let mut spec = sample_spec(TradePattern::Hs, ts("2026-05-25T00:00:00Z"));
         spec.sr_reversal_ranges = vec![[1.0950, 1.0970]];
         let trade = build_trade_from_spec(spec, now, BuildStrictness::Strict).unwrap();
-        let close = &trade.alerts[6].intent;
+        let close = reversal_close_by_basename(&trade, "07-close-on-sr-reversal").unwrap();
         assert!(!close.veto_on_reversal);
         // The enter (05-enter) must NOT list `reversal` when the flag is off.
         assert_eq!(trade.alerts[5].basename, "05-enter");
@@ -3479,12 +3558,13 @@ mod tests {
 
     #[test]
     fn build_trade_from_spec_close_sets_veto_on_reversal_when_armed() {
+        // veto_on_reversal rides the 07 (S/R) half — it needs the price band.
         let now = ts("2026-05-20T00:00:00Z");
         let mut spec = sample_spec(TradePattern::Hs, ts("2026-05-25T00:00:00Z"));
         spec.sr_reversal_ranges = vec![[1.0950, 1.0970]];
         spec.veto_on_reversal = true;
         let trade = build_trade_from_spec(spec, now, BuildStrictness::Strict).unwrap();
-        let close = &trade.alerts[6].intent;
+        let close = reversal_close_by_basename(&trade, "07-close-on-sr-reversal").unwrap();
         assert!(close.veto_on_reversal);
         // The paired half: the enter MUST list `reversal` in its vetos, or
         // the veto the worker writes would never gate the entry.
@@ -3511,7 +3591,7 @@ mod tests {
         spec.close_on_news = true;
         spec.veto_on_reversal = true;
         let trade = build_trade_from_spec(spec, now, BuildStrictness::Strict).unwrap();
-        let close = &trade.alerts[6].intent;
+        let close = reversal_close_by_basename(&trade, "06-close-on-reversal").unwrap();
         assert!(!close.veto_on_reversal);
         let enter = &trade.alerts[5].intent;
         assert!(!enter.vetos.iter().any(|v| v == "reversal"));
