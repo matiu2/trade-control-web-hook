@@ -1066,6 +1066,7 @@ fn log_rejected_entry_spec(
             offset_pips,
             offset_atr_pct,
             at,
+            ..
         }) => (
             "limit",
             Some(at.unwrap_or_else(|| {
@@ -3923,6 +3924,7 @@ mod tests {
             offset_pips: 0.0,
             offset_atr_pct: None,
             at: None,
+            recover_entry: None,
         });
         // Absolute TP well below the ~110 base so the short bracket clears the
         // ≥1R floor (SL ≈ 117.5, entry ≈ 110).

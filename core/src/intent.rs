@@ -1821,6 +1821,15 @@ pub enum EntrySpec {
         /// `from`/`offset_pips`/`offset_atr_pct`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         at: Option<f64>,
+        /// Optional recovery for when this limit can't rest on the correct side
+        /// — price has already crossed the level during the confirmation wait,
+        /// so a limit here would fill instantly at a worse price (wrong-side).
+        /// The mirror of [`EntrySpec::Stop::recover_entry`]: the natural action
+        /// is [`RecoverEntryAction::Stop`] — rest a stop at the same level to
+        /// catch the continuation through it. Absent = today's behaviour: the
+        /// wrong-side limit is dropped (`InvalidGeometry`). See [`RecoverEntry`].
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        recover_entry: Option<RecoverEntry>,
     },
 }
 
@@ -1858,6 +1867,14 @@ pub enum RecoverEntryAction {
     /// intended entry). Geometry-validated so it doesn't become a
     /// wrong-side limit (`#19-9`), preserving the planned R.
     Limit,
+    /// Re-place the level as a **stop** order. The mirror of `Limit`: used by a
+    /// wrong-side *limit* (not a wrong-side stop). When a limit at the base is on
+    /// the wrong side — price already crossed the level during the confirmation
+    /// wait — resting a stop at the same level catches the *continuation* through
+    /// it instead of the pullback. Preserves the planned R (same trigger price).
+    /// For a short this is a sell-stop below market (fills on the break down); a
+    /// long a buy-stop above market.
+    Stop,
     /// Do nothing — drop the entry (resolve-time) or let the placement
     /// fail (502, no seen-id poison, broker-time) so the next signal bar
     /// can retry. Identical to omitting `recover_entry` entirely. The
@@ -2626,6 +2643,7 @@ mod tests {
                 offset_pips,
                 offset_atr_pct: _,
                 at,
+                ..
             }) => {
                 assert_eq!(from, PriceAnchor::Low);
                 assert!((offset_pips - -5.0).abs() < 1e-9);

@@ -2064,6 +2064,19 @@ fn build_enter_alert(
             offset_pips: 0.0,
             offset_atr_pct: None,
             at: None,
+            // Wrong-side recovery for a limit: `Skip` drops (today), `Stop`
+            // rests a stop at the same level to catch the continuation when
+            // price has already crossed it (the operator's rule: "if I pass
+            // --entry-limit and price is above the level, turn it into a stop").
+            // `Market`/`Limit` are nonsensical for a wrong-side limit and the
+            // resolver drops them.
+            recover_entry: match recover_entry {
+                RecoverEntryAction::Skip => None,
+                action => Some(RecoverEntry {
+                    action,
+                    max_slippage_pips: None,
+                }),
+            },
         },
     });
     // SL is normally anchored to the pattern extreme + offset. The
@@ -2232,6 +2245,9 @@ pub fn build_position_enter(
             offset_pips: 0.0,
             offset_atr_pct: None,
             at: Some(spec.entry_price),
+            // Operator-drawn absolute level: the resolver skips the wrong-side
+            // check (broker arbitrates), so no recovery is needed here.
+            recover_entry: None,
         },
     };
 
