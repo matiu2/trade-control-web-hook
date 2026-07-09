@@ -867,7 +867,8 @@ fn eval_pine_entry(
 /// trade — a long reversal closes a short), and (when set) the kind matches.
 ///
 /// On top of the detector match it applies the **pure half** of the worker's
-/// `run_close` contextual gate, mirroring **both** windows `run_close` checks:
+/// `run_close` contextual gate via [`close_windows_pass`], **OR-composing** the
+/// two windows exactly like `core::dispatch::close::evaluate_close_gates`:
 ///
 ///   - **Price window** (`inside_window` lists `price`): the reversal candle's
 ///     close must sit inside one of the intent's `sr_bands`. Matches live, where
@@ -878,11 +879,18 @@ fn eval_pine_entry(
 ///     `news:<trade_id>:<news_id>` KV the worker's `news-start`/`news-end`
 ///     control fires maintain. The engine keeps the same window state in
 ///     `PlanState::open_news_windows` (opened on a `NewsStart` fire, closed on
-///     `NewsEnd`), so it gates identically to live. **Without this the engine
-///     fired the close on *any* qualifying reversal anywhere on the chart**,
-///     including hours after `news-end` (USD/CHF 2026-06-26: a long reversal 9h
-///     past the GDP window erased two legitimate short entries by retiring the
-///     spine).
+///     `NewsEnd`), so it gates identically to live. This is what stops the close
+///     from firing on *any* qualifying reversal anywhere on the chart (USD/CHF
+///     2026-06-26: a long reversal 9h past the GDP window erased two legitimate
+///     short entries by retiring the spine).
+///
+/// The two are **OR**, not AND: a close carrying both windows fires when the
+/// price is in-band OR a news window is open — matching the operator's rule (a
+/// golden opposite reversal closes only off an S/R line or during news, and is
+/// ignored otherwise) and the live worker's `evaluate_close_gates`. An earlier
+/// engine copy AND-composed them (early-returned on a news miss before checking
+/// the band), so an S/R-only reversal was silently dropped — the EUR_USD
+/// 2026-07-08 short rode back to break-even. See [`close_windows_pass`].
 ///
 /// (When the worker dispatches this fire it re-runs the full gate against live
 /// state, so a fire let through here can still be declined there — the engine is
@@ -899,62 +907,85 @@ fn eval_pine_guard(
     dir: Direction,
     open_news_windows: &std::collections::BTreeSet<String>,
 ) -> Option<LatchedSignal> {
-    // News-window gate (the engine's mirror of `run_close`'s
-    // `list_news_windows_for_trade`). When the close opted into the news window,
-    // it may only fire while at least one news window is open. Checked *before*
-    // the detector so a reversal printing outside the window is silently
-    // skipped, leaving the spine intact.
-    let wants_news = intent
-        .inside_window
-        .contains(&trade_control_core::intent::EventWindow::News);
-    if wants_news && open_news_windows.is_empty() {
-        tracing::debug!(
-            bar = %candle.time,
-            "pine-close: news-only close but no news window open — decline (spine survives)"
-        );
-        return None;
-    }
-
     // The detector match is shared with the entry path (direction / kind /
     // fires), so a close and an enter can't drift on what "a reversal printed"
     // means. `eval_pine_entry` logs under the `pine-enter` tag; the extra
-    // band gate below logs under `pine-close`.
+    // window gate below logs under `pine-close`.
     // The close-on-reversal guard wants "a reversal printed/validated *now*" —
     // the single latch, not first-confirmed. `confirmed_first: false` (so the
-    // floor is unused — pass `None`).
+    // floor is unused — pass `None`). Computed before the contextual gate so the
+    // decision below only ever fires on a genuine opposite reversal.
     let sig = eval_pine_entry(candle, detector_window, cfg, pattern, dir, false, None)?;
 
-    // Price-band gate (the pure half of `run_close`'s contextual window). Only
-    // applied when the intent opted into the price window; a news-only
-    // reversal-close has no recomputable price gate here and fires on the
-    // detector match alone (the worker's news-window KV gate decides it).
+    // Contextual window gate — the pure mirror of the worker's
+    // `core::dispatch::close::evaluate_close_gates`, **OR-composed**. The
+    // operator's rule: a golden opposite reversal closes the trade only (1) off
+    // a support/resistance line (close inside an `sr_bands` band) OR (2) during
+    // an open news window. Outside both it is ignored. Each configured gate
+    // votes Passed / Failed; the close fires if *any* set gate passed (or none
+    // was set), and is skipped only when every set gate failed.
+    //
+    // The earlier engine copy AND-composed these — it early-returned `None` on a
+    // news-window miss *before* checking the price band — so an S/R-only reversal
+    // (news gate set but no window open) was silently dropped even though the
+    // worker's OR gate would have closed it. That divergence rode the EUR_USD
+    // short 2026-07-08 back to break-even (the 11:00 BNE golden bullish pinbar off
+    // 1.14032 closed in-band but no news window was open). This matches live.
+    if !close_windows_pass(intent, candle, open_news_windows) {
+        return None;
+    }
+    Some(sig)
+}
+
+/// OR-compose the reversal-close's contextual windows, mirroring the worker's
+/// `evaluate_close_gates`. Returns `true` when the close may fire: no window was
+/// configured, or at least one configured window passed. Returns `false` only
+/// when every configured window failed (news set but none open **and** price set
+/// but the candle's close is out of every band).
+fn close_windows_pass(
+    intent: &trade_control_core::intent::Intent,
+    candle: &Candle,
+    open_news_windows: &std::collections::BTreeSet<String>,
+) -> bool {
+    let wants_news = intent
+        .inside_window
+        .contains(&trade_control_core::intent::EventWindow::News);
     let wants_price = intent
         .inside_window
         .contains(&trade_control_core::intent::EventWindow::Price);
-    if wants_price {
-        // The reversal candle's close is the pure proxy for the broker's
-        // current price the worker checks. Bands come from the signed intent.
-        if price_in_any_band(candle.c, &intent.sr_bands).is_none() {
-            tracing::debug!(
-                bar = %candle.time,
-                close = candle.c,
-                bands = ?intent.sr_bands,
-                "pine-close: reversal candle outside every SR band — decline"
-            );
-            return None;
-        }
+
+    // News window (engine mirror of `run_close`'s `list_news_windows_for_trade`):
+    // passes iff at least one news window is currently open.
+    let news_passed = wants_news && !open_news_windows.is_empty();
+    // Price window (pure half of `run_close`'s contextual window): the reversal
+    // candle's close is the proxy for the broker's live price. Passes iff that
+    // close sits inside one of the signed `sr_bands`.
+    let price_passed = wants_price && price_in_any_band(candle.c, &intent.sr_bands).is_some();
+
+    let any_set = wants_news || wants_price;
+    let any_passed = news_passed || price_passed;
+    let fires = any_passed || !any_set;
+
+    if fires {
         tracing::debug!(
             bar = %candle.time,
             close = candle.c,
-            "pine-close: reversal candle inside an SR band — close fires"
+            news_passed,
+            price_passed,
+            any_set,
+            "pine-close: contextual window gate passed (OR) — close fires"
         );
     } else {
         tracing::debug!(
             bar = %candle.time,
-            "pine-close: reversal detector fired (no price-band gate) — close fires"
+            close = candle.c,
+            wants_news,
+            wants_price,
+            bands = ?intent.sr_bands,
+            "pine-close: every configured close window failed — decline (spine survives)"
         );
     }
-    Some(sig)
+    fires
 }
 
 /// The first `[lo, hi]` band that contains `price` (inclusive of both
@@ -4545,6 +4576,27 @@ mod tests {
         }
     }
 
+    /// A `06-close-on-reversal` guard carrying **both** contextual windows
+    /// (`inside_window: ["news","price"]` + an SR band) — the real shape the
+    /// EUR_USD 2026-07-08 plan emitted. The two windows are OR-composed: the
+    /// close fires when the price is in-band OR a news window is open.
+    fn news_and_price_close_on_reversal_rule(dir: Direction, band: [f64; 2]) -> ConditionRule {
+        let mut intent = intent(Action::Close);
+        intent.inside_window = vec![
+            trade_control_core::intent::EventWindow::News,
+            trade_control_core::intent::EventWindow::Price,
+        ];
+        intent.sr_bands = vec![band];
+        intent.trade_id = Some("tid".into());
+        ConditionRule {
+            rule_id: "06-close-on-reversal".into(),
+            trigger: Trigger::PinePattern { pattern: None, dir },
+            fire_mode: FireMode::Once,
+            intent,
+            kind: RuleKind::Unspecified,
+        }
+    }
+
     /// A `news-start` / `news-end` control rule firing at `at` (a `TimeReached`
     /// trigger), carrying `news_id` so the engine opens / closes the window in
     /// `open_news_windows`.
@@ -4747,6 +4799,64 @@ mod tests {
             !eval.done,
             "spine survives a window that closed without a close"
         );
+    }
+
+    // ===== both windows OR-compose (EUR_USD 2026-07-08 regression) =====
+
+    #[test]
+    fn both_windows_close_fires_on_price_band_with_no_news_window() {
+        // THE EUR_USD 2026-07-08 bug (plan hs-eur-usd-c285cc7c). The
+        // `06-close-on-reversal` carried BOTH windows (`inside_window:
+        // ["news","price"]` + SR band). The 11:00 BNE golden bullish pinbar off
+        // 1.14032 closed IN the band, but NO news window was open. The worker's
+        // OR gate would have closed the short; the engine's old AND logic
+        // early-returned on the news miss and silently skipped the close, so the
+        // trade rode back to break-even and stopped out at 0R.
+        //
+        // With OR-composition the price gate alone fires it (news not open, price
+        // in-band → any_passed). Non-terminal: the flatten dispatches, the spine
+        // stays in AwaitEntry.
+        let p = plan(vec![news_and_price_close_on_reversal_rule(
+            Direction::Long,
+            [1.15, 1.20],
+        )]);
+        let window = bullish_pinbar_window();
+        let prior = seed_at(Phase::AwaitEntry, "2026-06-16T10:00:00Z");
+        // No news-start rule ⇒ open_news_windows stays empty on every bar.
+        let eval = run_window(&p, &prior, &window[3..], &window);
+        assert_eq!(
+            eval.fired.len(),
+            1,
+            "price in-band fires the close even with no news window open (OR)"
+        );
+        assert_eq!(eval.fired[0].rule_id, "06-close-on-reversal");
+        assert!(
+            !eval.done,
+            "the reversal-close flattens but never retires the plan"
+        );
+        assert_eq!(eval.new_state.phase, Phase::AwaitEntry);
+    }
+
+    #[test]
+    fn both_windows_close_declines_when_price_out_of_band_and_no_news() {
+        // The OR gate's reject arm: both windows configured, but the reversal's
+        // close is OUTSIDE every band AND no news window is open → every set gate
+        // failed → the close must NOT fire and the spine survives. (Confirms OR
+        // still rejects when *neither* context holds — the operator's "ignore a
+        // golden opposite reversal outside S/R and news".)
+        let p = plan(vec![news_and_price_close_on_reversal_rule(
+            Direction::Long,
+            [1.30, 1.40],
+        )]);
+        let window = bullish_pinbar_window();
+        let prior = seed_at(Phase::AwaitEntry, "2026-06-16T10:00:00Z");
+        let eval = run_window(&p, &prior, &window[3..], &window);
+        assert!(
+            eval.fired.is_empty(),
+            "out-of-band close with no news window must not fire"
+        );
+        assert!(!eval.done, "spine survives");
+        assert_eq!(eval.new_state.phase, Phase::AwaitEntry);
     }
 
     // ===== a reversal-close (news- or price-windowed) is never terminal =====

@@ -59,7 +59,16 @@ Trading:
     carries the data for the `price` member. The two fields are paired —
     `price` ∈ `inside_window` iff `sr_bands` is non-empty. The close
     passes when *any* listed window matches (active news window for the
-    `trade_id`, or current broker price inside a band).
+    `trade_id`, or current broker price inside a band). **The gate is
+    genuinely OR** — a close carrying both windows fires when the price is
+    in-band *or* a news window is open. (An intent may still legally carry
+    both members; the worker's `evaluate_close_gates` and the server-side
+    engine's `close_windows_pass` both OR them. Since 2026-07-09 the CLI/tv-arm
+    pipeline instead emits the S/R half and the news half as **two separate
+    single-window closes** — `07-close-on-sr-reversal` (`[price]`) and
+    `06-close-on-reversal` (`[news]`) — so each fires on its own gate and the
+    per-window engine check can never AND-drop the S/R-only case. See the
+    alert table below.)
   - **Candle-quality gate** (AND-composed with the window): `needs_golden:
     true` or `needs_confirmed: true` requires the incoming shell to carry
     `golden: true` / `signal_confirmed: true` from the Pine study.
@@ -81,11 +90,14 @@ Trading:
     already performs. Written on every gate-pass (idempotent, TTL = life of
     the alert window). Requires a price window (`inside_window` ∋ `price` +
     `sr_bands`, or the deprecated `require_price_in_ranges`) and a
-    `trade_id`; rejected at validate time otherwise. The worker only checks
-    veto names an `enter` lists in its own `vetos`, so when this hook is
-    armed the CLI/tv-arm pipeline **also adds `reversal` to the matching
-    `05-enter`'s `vetos`** — both halves move together. Arming the close
-    flag by hand without the enter half writes a veto nothing reads.
+    `trade_id`; rejected at validate time otherwise. Since the 2026-07-09
+    split this flag rides the price-windowed **`07-close-on-sr-reversal`**
+    (the S/R half owns the band); the news-only `06-close-on-reversal` never
+    carries it. The worker only checks veto names an `enter` lists in its own
+    `vetos`, so when this hook is armed the CLI/tv-arm pipeline **also adds
+    `reversal` to the matching `05-enter`'s `vetos`** — both halves move
+    together. Arming the close flag by hand without the enter half writes a
+    veto nothing reads.
   - **Deprecated form** (still accepted for in-flight alerts):
     `require_news_window: true` and/or `require_price_in_ranges: [[lo, hi], ...]`.
     Mixing the old and new forms on one intent is a validation error —
@@ -234,14 +246,27 @@ Basename ordering matters — `tv-arm` maps drawings to alerts by prefix.
 | `04-prep-retest` | `prep` | Trendline crossing (intrabar retest of the neckline) | Skippable with `--skip-retest`. **Uses the same neckline drawing** as `03-prep-break-and-close` (opposite direction, intrabar) — you draw the neckline once. A separate `retest`/`neckline-retest`/`retrace` trendline is still honoured but **deprecated** (`tv-arm` warns). Fires **intrabar on the wick**, not the close, and (as of 2026-07-03) not the open either: the bar's **high and low just have to straddle the neckline** — sit on opposite sides — with the directional wick reaching at/through the line (long retest = the low dips at/below the descending neckline). Open- and close-agnostic: a tap-and-bounce that opens *and* closes on the same side still counts — see CHANGELOG "intrabar cross is a pure straddle". **The closeness requirement decays over time:** the first bar after the break-and-close must actually reach the neckline, and each subsequent bar loosens it by `retest_atr_step × ATR` of near-side slack (default step **0.075**, `tv-arm --retest-atr-step`), so a wick that comes *within* the growing tolerance of the line stamps the retest even without reaching it — the further price drifts in time, the less its exact distance to the neckline matters. See CHANGELOG "time-decaying retest tolerance". The wick must pierce at least `cross_buffer_pct%` of the line price past the line (plan-level field, default 0.02%) so a one-tick graze doesn't trip it. |
 | `05-enter` | `enter` | Pine `Candle Signals` golden candle | The actual trade. Gated on the preps above + opposing-direction veto absent. |
 | `09-enter-qm` | `enter` | Pine `Candle Signals` (same detector as `05-enter`) | **`tv-arm --strategy-v2` only.** The Quasimodo entry, armed alongside `05-enter`: no preps, **golden AND confirmed gated by default** — it threads `needs_golden` like every other enter (golden on by default; `--skip-golden` clears it for a confirmed-only gate), plus `needs_confirmed: true` intrinsically. (An earlier build hardcoded `needs_golden: false` here, which silently stripped golden from `--strategy-v2` and fired `09-enter-qm` on a confirmed-but-small non-golden candle — ESPIX_EUR 2026-07-07, whipsawed at SL. Golden is now required by default; pass `--skip-golden` to recover the confirmed-only behaviour.) It reads the **first signal to confirm** at/after the break-and-close, carrying *that* signal's own base as the entry level, rather than the single most-recent latch (which a fresher print overwrites — the DE30_EUR 2026-07-07 miss; see "First-confirmed entry" and CHANGELOG). Its entry order type is set by **`--qm-entry <market\|stop\|limit>`** (default **`limit`**, independent of the BCR leg's `--entry-*`): `limit` (the default) rests a limit at the signal level with a `recover_entry: stop` fallback (catches the continuation when price has already crossed it); `stop` is a stop at signal_low − the ATR buffer (`offset_atr_pct: 0.5`; see "ATR buffer") with a `recover_entry: limit` fallback; `market` enters on the confirmation bar. So `--strategy-v2` alone gives **BCR stop + QM limit on one setup**; pass `--qm-entry stop`/`market` to override the QM leg only. Shares the trade's `trade_id` + `max_retries` with `05-enter`; first of the two to fire cancels the other's resting order (worker retry gate). See "Dual entry — `--strategy-v2`" below. |
-| `06-close-on-reversal` | `close` | Pine `Candle Signals` opposing reversal | Emitted when news-pairs and/or `support`/`resistance` lines are drawn. Carries `inside_window: [news?, price?]` (OR-composed) and, when `price` is listed, `sr_bands: [[lo, hi], ...]`. Defaults `needs_golden: true` for the candle-quality gate. With `tv-arm --veto-on-reversal` (experimental) it also carries `veto_on_reversal: true`, so a reversal off a band before entry vetoes the upcoming trade — see the `close` action notes above. |
+| `07-close-on-sr-reversal` | `close` | Pine `Candle Signals` opposing reversal | Emitted when `support`/`resistance` lines are drawn. Carries `inside_window: [price]` + `sr_bands: [[lo, hi], ...]`. **Armed independent of any news window** — a golden opposing reversal candle whose close sits in a band flattens the trade at close, in all trade types. Defaults `needs_golden: true`. With `tv-arm --veto-on-reversal` (experimental) it also carries `veto_on_reversal: true` (this half owns the band). |
+| `06-close-on-reversal` | `close` | Pine `Candle Signals` opposing reversal | The **news-window** safety flatten — emitted when news-pairs are drawn (`--close-on-news`). Carries `inside_window: [news]` only, never a price band. Defaults `needs_golden: true`. |
 | `08-prep-expire-<step>` | `prep-expire` | Vertical line crossing chart time | Emitted once per chart-drawn `<prep>-expiry` line (`break-and-close-expiry`, `retest-expiry`). When crossed, blocks any further `<step>` prep on the trade — so a setup whose prep lands too late never enters. Drawing-bound. `<step>` is the canonical prep name and may contain hyphens. |
 
-The legacy `07-close-on-sr-reversal` basename is no longer emitted —
-its functionality folds into a single `06-close-on-reversal` whose
-`inside_window` list includes `price`. The enum variant is still
-recognised by the worker for inbound decode of any in-flight alerts
-left over from the old shape.
+**Reversal-close split (2026-07-09).** The operator's rule: a golden
+opposing reversal candle closes the trade **at close** only (1) off a
+support/resistance line **or** (2) during a news window — outside both it
+is ignored. Each context is its own single-window alert:
+`07-close-on-sr-reversal` (`[price]` + `sr_bands`, always-armed) and
+`06-close-on-reversal` (`[news]`, the `--close-on-news` flatten). They
+OR-compose across the two rules. Both are emitted when both news-pairs and
+S/R lines are drawn. This replaced the old single consolidated
+`06-close-on-reversal` that carried `[news, price]` on one intent — that
+shape let the **server-side engine** AND-drop the S/R-only case (it
+early-returned on a news-window miss before checking the band), which rode
+the EUR_USD 2026-07-08 short back to a break-even stop-out instead of
+closing early on the 11:00 golden pinbar off support. The engine's
+`close_windows_pass` now OR-composes exactly like the worker, and the split
+keeps each alert on one window so the divergence can't recur. The worker
+still decodes an in-flight `[news, price]` intent (OR-composed) for any
+alert left over from the old shape.
 
 Each news window adds two more control rules (`01-news-start-<id>` +
 `02-news-end-<id>`) and each blackout window adds `01-pause-<id>` +
