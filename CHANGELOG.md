@@ -1,5 +1,71 @@
 # Changelog
 
+## v74 — 2026-07-09 — first-confirmed entry + pattern entry-order flags + wrong-side limit→stop
+
+**Why.** A confirmed-candle enter (`09-enter-qm`, strategy-v2) never fired on
+setups the chart clearly showed confirming. On DE30_EUR H1 2026-07-07 the
+operator watched a short confirm at 9pm, but the engine entered nothing and the
+plan died on `too-low` at midnight. Three separate causes, all found by replaying
+the plan off the candle tape (not the report):
+
+1. **Single-latch confirmation.** The engine's `PinePattern` enter read
+   `latched_signal_at`, which keeps one latch slot holding the *most-recent*
+   signal. A fresh same-direction print overwrites it, so when an earlier signal
+   validates a few bars later its confirmation is written to the latch **only if
+   that signal is still latched** (Pine `signal_high_v == sig_high`). In a fast
+   run of back-to-back signals the earlier one is displaced before its confirm
+   window closes — the confirmation is computed per-signal (chart triangle) but
+   never reaches the confirmation-gated enter. **Not a Pine⇄Rust divergence**:
+   Pine has the identical guard; it's a single-latch design, and the alerts it
+   was built for are retired for this consumer.
+2. **QM enter required golden AND confirmed.** The strategy-v2 QM leg inherited
+   `spec.needs_golden` (default true), so it needed a signal that was *both*
+   golden and confirmed. The DE30 confirmed short (9pm) was non-golden → never
+   fired. The operator's confirmation rule has no size test; golden is the
+   *break-and-close* leg's gate.
+3. **Wrong-side limit dropped.** `EntrySpec::Limit` had no wrong-side recovery
+   (only `Stop` did), so a limit at the base — when price had already crossed it
+   during the confirmation wait — was dropped as `InvalidGeometry`.
+
+**What changed.**
+- **`core::signals::first_confirmed_signal_at`** — replays the same per-bar state
+  machine but returns the **earliest-printing** signal (matching the plan's
+  direction/kind, at/after a setup floor) to reach `Valid`, carrying *its own*
+  base as the entry level. The engine's enter path uses it for `needs_confirmed`
+  enters; golden-only enters and the close-on-reversal guard keep the single latch
+  (they want "the newest signal now"). Scoped to the setup via the later of
+  `break_close_at` and `replay_start` so a warmup-era signal can't claim it.
+  `Tracked` gained kind/range/start_time/atr. **Pine unchanged** (alert-only,
+  visual confirmation already correct).
+- **QM leg drops `needs_golden`** (`cli::trade_patterns`) — confirmation is its
+  gate; the BCR `05-enter` keeps golden.
+- **`--entry-market` / `--entry-stop` / `--entry-limit`** (`tv-arm`) — expose the
+  pattern-path entry order type (was market-or-stop only). Mutually exclusive;
+  `--strategy-v2` conflicts with all three.
+- **Wrong-side limit → stop** — new `RecoverEntryAction::Stop` +
+  `RecoverEntryPlan::Stop`; `EntrySpec::Limit` gains a signed `recover_entry`
+  field. The resolver converts a wrong-side limit (recover=Stop) to a stop at the
+  same level, re-checked for correct side and re-run through the ≥1R / in-range
+  floor — the mirror of the existing stop→limit recovery. `--entry-limit`
+  defaults its recovery to `stop` (`--recover-entry` now accepts `stop`).
+
+**Breaking.** `EntrySpec::Limit` gains `recover_entry` (additive,
+`skip_serializing_if None` — old plans deserialize with it absent = today's
+drop). `RecoverEntryAction` / `RecoverEntryPlan` gain a `Stop` variant.
+
+**Config.** `tv-arm`: `--entry-stop`, `--entry-limit` (new; `--entry-market`
+existed); `--recover-entry stop` (new value).
+
+**Tests.** core `first_confirmed_*` (bug-characterisation, direction filter,
+not-before floor, fire-once timing), `wrong_side_short_limit_recovers_to_stop`
+(+ no-recovery drop); engine `confirmed_enter_fires_off_first_confirmed_signal_base`
+(+ pre-confirmation decline); tv-arm `pattern_entry_flags_*`,
+`entry_limit_defaults_recover_to_stop`. Verified end-to-end: the DE30 plan now
+fires `09-enter-qm` short @ 25705.2 → break-even → +5.26R.
+
+**Follow-up.** First-confirmed is `needs_confirmed`-scoped; a golden-only enter
+that overlaps signals still uses the latch (was never confirmation-blocked).
+
 ## v73 — 2026-07-09 — invalidation vetos arm pre-break (too-high/too-low fire in AwaitBreakAndClose)
 
 **Why.** A `too-high` / `too-low` invalidation veto is a *setup* invalidation:
