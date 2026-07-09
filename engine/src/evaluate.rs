@@ -647,6 +647,21 @@ fn evaluate_one_entry(
         return;
     }
 
+    // The setup floor for a first-confirmed enter: the confirmed signal must
+    // print at/after the *later* of the break-and-close time and the replay-start
+    // cursor. This scopes "first confirmed" to the setup forming now, not an
+    // ancient warmup-era signal (the DE30 24979 case). Both are `None` on a live
+    // QM enter with no break — then the whole window is in scope (the detector
+    // back-window is already bounded on the live path).
+    let confirmed_floor = [
+        state.break_close_at,
+        plan.replay_start
+            .and_then(|s| chrono::DateTime::from_timestamp(s, 0)),
+    ]
+    .into_iter()
+    .flatten()
+    .max();
+
     // A `PinePattern` enter is decided by the stateful candle detector over the
     // back-window, not by a per-candle level cross. It also produces the latched
     // signal geometry that rides onto the dispatched shell.
@@ -661,6 +676,7 @@ fn evaluate_one_entry(
                 *pattern,
                 *dir,
                 rule.intent.needs_confirmed,
+                confirmed_floor,
             ) {
                 Some(sig) => Some(sig),
                 None => return,
@@ -768,6 +784,7 @@ fn eval_pine_entry(
     pattern: Option<SignalKind>,
     dir: Direction,
     confirmed_first: bool,
+    confirmed_floor: Option<chrono::DateTime<chrono::Utc>>,
 ) -> Option<LatchedSignal> {
     let Some(idx) = detector_window.iter().position(|c| c.time == candle.time) else {
         tracing::debug!(
@@ -783,8 +800,10 @@ fn eval_pine_entry(
     // 2026-07-07 miss (see `first_confirmed_signal_at`). The guard/close and
     // golden-only enters keep the latch (`false`): they want "the newest signal
     // right now", and golden-only enters were never confirmation-blocked.
+    // `confirmed_floor` scopes the first-confirmed scan to the setup (past the
+    // break/replay-start), so a warmup-era signal can't claim it.
     let sig = if confirmed_first {
-        first_confirmed_signal_at(detector_window, idx, cfg)
+        first_confirmed_signal_at(detector_window, idx, cfg, dir, pattern, confirmed_floor)
     } else {
         latched_signal_at(detector_window, idx, cfg)
     };
@@ -901,8 +920,9 @@ fn eval_pine_guard(
     // means. `eval_pine_entry` logs under the `pine-enter` tag; the extra
     // band gate below logs under `pine-close`.
     // The close-on-reversal guard wants "a reversal printed/validated *now*" —
-    // the single latch, not first-confirmed. `confirmed_first: false`.
-    let sig = eval_pine_entry(candle, detector_window, cfg, pattern, dir, false)?;
+    // the single latch, not first-confirmed. `confirmed_first: false` (so the
+    // floor is unused — pass `None`).
+    let sig = eval_pine_entry(candle, detector_window, cfg, pattern, dir, false, None)?;
 
     // Price-band gate (the pure half of `run_close`'s contextual window). Only
     // applied when the intent opted into the price window; a news-only

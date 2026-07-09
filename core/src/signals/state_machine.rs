@@ -263,14 +263,33 @@ pub fn latched_signal_at(
 /// engine then never enters a setup the operator can see confirming.
 ///
 /// This function tracks **every** signal to its own resolution and returns the
-/// **earliest-printing** signal that has reached `Valid` by `as_of`, carrying
-/// *that signal's own* geometry (its base becomes the entry level). "First one
-/// wins": the engine's fire-once latch (`state.fired`) blocks the later
-/// signals' confirmations once this one has fired the enter.
+/// **earliest-printing** signal *matching `want_dir` (and `want_kind` when set)*
+/// that has reached `Valid` by `as_of`, carrying *that signal's own* geometry
+/// (its base becomes the entry level). "First one wins": the engine's fire-once
+/// latch (`state.fired`) blocks the later signals' confirmations once this one
+/// has fired the enter.
+///
+/// **The direction/kind filter is essential**, not cosmetic: the detector prints
+/// signals in *both* directions, and an opposite-direction signal often confirms
+/// *first* (DE30_EUR 2026-07-07: a long pinbar confirmed before the short we
+/// want). Without the filter this returned that long, the caller's post-hoc
+/// direction check declined it, and the confirmed short was never considered —
+/// re-introducing the very miss this function exists to fix. The filter mirrors
+/// the caller's `dir`/`pattern` gate (`eval_pine_entry`) so "first confirmed"
+/// means "first confirmed signal the enter would actually take".
+///
+/// `not_before` bounds *which signals count as the setup's*: only a signal
+/// whose print time is `>= not_before` may win. This is essential — the detector
+/// window carries a long warmup tail (hundreds of bars back), and without the
+/// bound the "first confirmed short" is some ancient warmup-era signal, not the
+/// one forming at the setup. The engine passes the setup floor (the later of the
+/// break-and-close time and the replay-start cursor); `None` = no lower bound
+/// (consider the whole window). The state machine still *replays* from bar 0
+/// (confirmation/invalidation history must be complete) — the bound only filters
+/// which validations may *claim the winner slot*.
 ///
 /// `fires` is set on the bar the returned signal **just** validated (so the
-/// engine's `sig.fires` gate triggers the entry exactly at confirmation), and
-/// also on the signal's own print bar for parity with the alert semantics. A
+/// engine's `sig.fires` gate triggers the entry exactly at confirmation). A
 /// signal that confirmed on an *earlier* bar than `as_of` still returns (so a
 /// re-evaluation after the confirm bar sees the confirmed signal), but with
 /// `fires = false` on those later bars — the enter fires once, on the
@@ -279,6 +298,9 @@ pub fn first_confirmed_signal_at(
     candles: &[Candle],
     as_of: usize,
     cfg: &DetectorConfig,
+    want_dir: Direction,
+    want_kind: Option<SignalKind>,
+    not_before: Option<DateTime<Utc>>,
 ) -> Option<LatchedSignal> {
     if as_of >= candles.len() {
         return None;
@@ -319,7 +341,15 @@ pub fn first_confirmed_signal_at(
             for (i, t) in tracked.iter().enumerate() {
                 let freshly_valid =
                     t.state == SigState::Valid && !was_valid.get(i).copied().unwrap_or(false);
-                if freshly_valid {
+                // Only the plan's direction (and kind, when the enter pins one)
+                // counts — an opposite-direction signal confirming first must not
+                // claim the slot (see the doc-comment: the DE30 long-pinbar case).
+                let matches = t.direction == want_dir && want_kind.is_none_or(|k| t.kind == k);
+                // ...and only a signal at/after the setup floor — a warmup-era
+                // signal must not claim the slot (the print time is the signal
+                // bar's candle time).
+                let in_scope = not_before.is_none_or(|floor| candles[t.signal_bar].time >= floor);
+                if freshly_valid && matches && in_scope {
                     first_confirmed_bar = Some(t.signal_bar);
                     confirmed_on = Some(bar);
                     break;
@@ -683,7 +713,8 @@ mod tests {
         // (110) is the base the entry anchors to — with fires=true on the
         // confirmation bar.
         let candles = two_short_engulfers_first_confirms();
-        let f = first_confirmed_signal_at(&candles, 3, &cfg()).expect("first-confirmed");
+        let f = first_confirmed_signal_at(&candles, 3, &cfg(), Direction::Short, None, None)
+            .expect("first-confirmed");
         assert_eq!(f.direction, Direction::Short);
         assert!(f.signal_confirmed, "first signal is confirmed");
         assert!(f.fires, "fires on the confirmation bar");
@@ -700,11 +731,56 @@ mod tests {
         let candles = two_short_engulfers_first_confirms();
         // bar 2: bar 1 not yet resolved (bars_elapsed = 1) → nothing confirmed.
         assert!(
-            first_confirmed_signal_at(&candles, 2, &cfg()).is_none(),
+            first_confirmed_signal_at(&candles, 2, &cfg(), Direction::Short, None, None).is_none(),
             "no confirmation before the window closes"
         );
         // bar 3: confirmed, fires.
-        let at3 = first_confirmed_signal_at(&candles, 3, &cfg()).expect("confirmed at 3");
+        let at3 = first_confirmed_signal_at(&candles, 3, &cfg(), Direction::Short, None, None)
+            .expect("confirmed at 3");
         assert!(at3.fires, "fires on confirmation bar");
+    }
+
+    #[test]
+    fn first_confirmed_filters_by_direction() {
+        // The two engulfers are SHORT. Asking for a confirmed LONG in the same
+        // window returns None — an opposite-direction confirmation must never be
+        // handed to a short enter (the DE30 long-pinbar-confirmed-first bug: the
+        // filter is what stops the caller latching onto the wrong signal and
+        // declining, missing the confirmed short entirely).
+        let candles = two_short_engulfers_first_confirms();
+        assert!(
+            first_confirmed_signal_at(&candles, 3, &cfg(), Direction::Long, None, None).is_none(),
+            "no confirmed LONG in a short-only window"
+        );
+    }
+
+    #[test]
+    fn first_confirmed_respects_the_not_before_floor() {
+        // With a floor past the first signal's print bar, that signal can no
+        // longer claim the winner slot — mirroring the engine scoping "first
+        // confirmed" to the setup (past break-and-close / replay-start) so a
+        // warmup-era signal isn't picked. Here the only confirmed short prints on
+        // bar 1; a floor at bar 2's time excludes it → None.
+        let candles = two_short_engulfers_first_confirms();
+        let floor = candles[2].time; // strictly after the bar-1 signal print
+        assert!(
+            first_confirmed_signal_at(&candles, 3, &cfg(), Direction::Short, None, Some(floor))
+                .is_none(),
+            "a signal printing before the floor can't win"
+        );
+        // A floor at the signal's own print bar still admits it (>= is inclusive).
+        let floor_incl = candles[1].time;
+        assert!(
+            first_confirmed_signal_at(
+                &candles,
+                3,
+                &cfg(),
+                Direction::Short,
+                None,
+                Some(floor_incl)
+            )
+            .is_some(),
+            "the floor is inclusive of a signal printing exactly at it"
+        );
     }
 }

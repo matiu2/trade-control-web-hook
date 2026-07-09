@@ -1215,8 +1215,15 @@ fn assemble_trade(
             spec.expiry_bars,
             spec.allow_entry.as_deref(),
             EntryMode::Stop, // identical order shape to standalone --quasimodo
-            spec.needs_golden,
-            true, // QM is always confirmed-candle gated
+            // The QM leg is gated on CONFIRMATION, not golden. Requiring both
+            // (golden AND confirmed) means a confirmed-but-small signal — the
+            // common case a few bars into a move — never fires the confirmed
+            // enter (DE30_EUR 2026-07-07: the 9pm confirmed short was non-golden,
+            // so a golden+confirmed QM never triggered). The operator's
+            // confirmation rule ("2 closes, price pushed below and not above") has
+            // no size test; golden is the *break-and-close* leg's quality gate.
+            false, // needs_golden: confirmation is the QM leg's gate
+            true,  // QM is always confirmed-candle gated
             &qm_skip_preps,
             spec.pip_size,
             spec.tick_size,
