@@ -1153,11 +1153,12 @@ fn build_trade_spec(
             },
             strategy_v2: args.strategy_v2,
             // QM leg (`09-enter-qm`) entry order type — `--qm-entry`, default
-            // Stop (today's shape). Independent of the BCR leg's `entry_mode`.
+            // Limit (rest at the signal level, recover to a stop when price has
+            // already crossed it). Independent of the BCR leg's `entry_mode`.
             qm_entry_mode: match args.qm_entry {
                 Some(crate::args::QmEntry::Market) => cli::EntryMode::Market,
-                Some(crate::args::QmEntry::Limit) => cli::EntryMode::Limit,
-                Some(crate::args::QmEntry::Stop) | None => cli::EntryMode::Stop,
+                Some(crate::args::QmEntry::Stop) => cli::EntryMode::Stop,
+                Some(crate::args::QmEntry::Limit) | None => cli::EntryMode::Limit,
             },
             // Break-even on at 50% by default; `--no-breakeven` opts out,
             // `--breakeven-pct` overrides the threshold.
@@ -2638,6 +2639,39 @@ mod tests {
                 rule.rule_id
             );
         }
+    }
+
+    #[test]
+    fn strategy_v2_default_qm_leg_is_a_limit_bcr_stays_a_stop() {
+        // Default (no --qm-entry): the QM leg (09-enter-qm) rests as a LIMIT at
+        // the signal level (recover→stop when wrong-side); the BCR leg
+        // (05-enter) stays a STOP. `--qm-entry stop`/`market` override the QM
+        // leg only.
+        use trade_control_core::intent::{Action, EntrySpec};
+        let plan = emitted_plan_with(&["--strategy-v2"]);
+        let json = serde_json::to_string_pretty(&plan).unwrap();
+
+        let qm = plan
+            .rules
+            .iter()
+            .find(|r| r.intent.action == Action::Enter && r.rule_id.contains("enter-qm"))
+            .unwrap_or_else(|| panic!("no QM enter rule in plan\n{json}"));
+        let bcr = plan
+            .rules
+            .iter()
+            .find(|r| r.intent.action == Action::Enter && !r.rule_id.contains("enter-qm"))
+            .unwrap_or_else(|| panic!("no BCR enter rule in plan\n{json}"));
+
+        assert!(
+            matches!(qm.intent.entry, Some(EntrySpec::Limit { .. })),
+            "QM leg should default to a Limit, got {:?}",
+            qm.intent.entry
+        );
+        assert!(
+            matches!(bcr.intent.entry, Some(EntrySpec::Stop { .. })),
+            "BCR leg should stay a Stop, got {:?}",
+            bcr.intent.entry
+        );
     }
 
     #[test]

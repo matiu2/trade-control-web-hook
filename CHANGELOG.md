@@ -1,5 +1,34 @@
 # Changelog
 
+## v77 — 2026-07-09 — strategy-v2 QM leg defaults to a limit order
+
+**Why.** The QM leg (`09-enter-qm`) default was a **stop**; the operator wants
+the default to be a **limit** at the signal level (a stop is the override). A
+resting limit fills on a pullback into the level; when price has already crossed
+it (wrong-side for a short), the leg recovers to a stop and catches the
+continuation.
+
+**What changed.**
+- **`--qm-entry` default flips from `stop` to `limit`.** No `--qm-entry` →
+  QM leg is a `EntrySpec::Limit` at the signal level with `recover_entry: stop`.
+  `--qm-entry stop` (recover→limit) and `--qm-entry market` are now explicit
+  overrides. BCR leg (`05-enter`) is unchanged — always a stop.
+- Resolution site: `tv-arm/src/pipeline.rs` (`None => Limit`). Recovery mapping
+  in `cli` already derives `Limit → recover:stop`, so the default gets stop
+  recovery automatically.
+
+**Config.** `tv-arm --qm-entry <market|stop|limit>`: omitted now = `limit`
+(was `stop`).
+
+**Compatibility.** Behaviour change: `--strategy-v2` alone now arms BCR stop +
+**QM limit** (was QM stop). Pass `--qm-entry stop` for the old default.
+
+**Tests.** tv-arm `strategy_v2_default_qm_leg_is_a_limit_bcr_stays_a_stop`
+(emitted-plan assertion: QM = Limit, BCR = Stop). Verified via replay on
+ESPIX_EUR 2026-07-07: default limit → wrong-side at 02:00 → recovers to a stop
+→ fills on the pullback → +2.73R (still only the golden 2am entry; 21:00
+non-golden skipped by v76).
+
 ## v76 — 2026-07-09 — strategy-v2 QM leg requires golden by default
 
 **Why.** ESPIX_EUR 2026-07-07: `--strategy-v2 --qm-entry=market` fired
