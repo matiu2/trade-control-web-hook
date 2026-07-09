@@ -1,5 +1,55 @@
 # Changelog
 
+## v78 — 2026-07-09 — golden reversal candle off S/R closes the trade (engine OR-fix + 06/07 split)
+
+**Why.** Operator rule: a **golden opposing reversal candle** closes the open
+trade **at close** in exactly two contexts — (1) off a support/resistance line,
+or (2) during a news window — and is **ignored** outside both. EUR_USD short
+(plan `hs-eur-usd-c285cc7c`) should have closed early on the 2026-07-08 11:00 BNE
+golden bullish pinbar off support (1.14032, close 1.14055 inside the reversal
+band [1.13918, 1.14146]), but rode back to a break-even stop-out at **0R**.
+
+**Root cause.** Two halves:
+1. **Engine AND vs worker OR.** The `06-close-on-reversal` carried
+   `inside_window: [news, price]`. The worker's `evaluate_close_gates`
+   **OR**-composes (price-in-band OR news-open → close). The server-side engine's
+   `eval_pine_guard` **AND**-composed: it early-returned on a news-window miss
+   *before* checking the price band. At 11:00 no news window was open → the
+   S/R-only reversal was silently dropped. The engine was stricter than live.
+2. **No always-armed price-only reversal close.** The S/R reversal only worked
+   when a news window was *also* open (per the AND-bug).
+
+**What changed.**
+- **Engine OR-fix** (`engine/src/evaluate.rs`): new `close_windows_pass` OR-composes
+  the news + price windows exactly like `core::dispatch::close::evaluate_close_gates`
+  — fires when any set window passes (or none is set), skips only when every set
+  window fails. Never stricter than live.
+- **Reversal-close split** (`cli/src/trade_patterns.rs`): the consolidated
+  `06-close-on-reversal` is replaced by two single-window alerts —
+  - **`07-close-on-sr-reversal`** — `inside_window: [price]` + `sr_bands`,
+    emitted whenever S/R lines are drawn, **armed independent of news**. Carries
+    `veto_on_reversal` (this half owns the band).
+  - **`06-close-on-reversal`** — `inside_window: [news]` only, the
+    `--close-on-news` safety flatten.
+  Each fires on its own gate; together they OR-compose. No single alert carries
+  both windows, so the per-window engine check can never AND-drop the S/R case.
+
+**Wire / behavior.** `07-close-on-sr-reversal` is emitted again (was a
+scaffolded-but-unused basename). A trade with both news-pairs and S/R lines now
+emits **both** `07` (price) and `06` (news) closes with distinct intent ids. The
+worker still decodes an in-flight `[news, price]` intent (OR) for old-shape alerts.
+
+**Tests.** Engine: `both_windows_close_fires_on_price_band_with_no_news_window`
+(the regression — price in-band, no news → fires) +
+`both_windows_close_declines_when_price_out_of_band_and_no_news`. CLI: 6
+reversal-close tests rewritten for the split (news-only, sr-only, both-split,
+needs_confirmed on both, veto_on_reversal on 07). 130 engine + 259 cli + 810 core
++ 22 worker + 214 tv-arm all green.
+
+**Verified.** Re-armed the EUR_USD plan and replayed: `07-close-on-sr-reversal`
+fires at **11:00 BNE** (close 1.14055 in band) → flattens the short at **+1.03R**
+(was 0R break-even stop-out).
+
 ## v77 — 2026-07-09 — strategy-v2 QM leg defaults to a limit order
 
 **Why.** The QM leg (`09-enter-qm`) default was a **stop**; the operator wants

@@ -96,14 +96,14 @@ pub fn run(args: Args) -> Result<i32> {
     // `--pip-size` / `--tick-size` flags still override both, downstream in
     // the trade builders.
     let effective = match mcp.get_symbol_info() {
-        Ok(tv_info) => crate::precision::resolve_effective_precision(resolved.asset, &tv_info),
+        Ok(tv_info) => crate::precision::resolve_effective_precision(resolved.precision, &tv_info),
         Err(e) => {
             // Reading symbol-info shouldn't ever block arming — fall back to
-            // the catalog and note why.
+            // the per-broker catalog precision and note why.
             warn!(error = %e, "could not read live TV symbol-info; using catalog precision");
             crate::precision::EffectivePrecision {
-                pip_size: resolved.asset.pip_size,
-                tick_size: resolved.asset.tick_size,
+                pip_size: resolved.precision.pip_size,
+                tick_size: resolved.precision.tick_size,
                 tick_from_tv: false,
             }
         }
@@ -493,9 +493,16 @@ fn resolve_with_recovery(
     // tv-arm-invocation per unknown symbol, so the leak is bounded
     // and tiny.
     let leaked: &'static instrument_lookup::Asset = Box::leak(Box::new(patched.asset));
+    // A just-recovered asset isn't in the native instrument catalog yet
+    // (it was only added to the legacy overlay above), so its precision
+    // falls back to the legacy single-tick `Asset` value. Live TradingView
+    // still overrides this downstream, so a divergent index recovered this
+    // way is still armed correctly.
+    let precision = crate::precision::CatalogPrecision::from_asset(leaked);
     Ok(crate::instrument_resolution::ResolvedInstrument {
         asset: leaked,
         broker_symbol,
+        precision,
     })
 }
 
@@ -1575,9 +1582,9 @@ fn run_position_entry(
         return Ok(1);
     };
 
-    // Tick-distance SL/TP → absolute prices. tick_size is the catalog
-    // value (NOT pip_size — see position_trade docs).
-    let levels = resolve_levels(pos, resolved.asset.tick_size)?;
+    // Tick-distance SL/TP → absolute prices. tick_size is the per-broker
+    // catalog value (NOT pip_size — see position_trade docs).
+    let levels = resolve_levels(pos, resolved.precision.tick_size)?;
 
     // Expiry: a drawn trade-expiry line wins; otherwise now + flag hours.
     let trade_expiry = match read_trade_expiry(roles) {
@@ -1599,7 +1606,7 @@ fn run_position_entry(
         entry = levels.entry,
         stop_loss = levels.stop_loss,
         take_profit = levels.take_profit,
-        tick_size = resolved.asset.tick_size,
+        tick_size = resolved.precision.tick_size,
         trade_expiry = %trade_expiry.to_rfc3339(),
         "position-tool direct entry"
     );
@@ -1615,8 +1622,8 @@ fn run_position_entry(
         take_profit: levels.take_profit,
         trade_expiry,
         risk_amount: args.risk_amount,
-        pip_size: args.pip_size.or(Some(resolved.asset.pip_size)),
-        tick_size: args.tick_size.or(Some(resolved.asset.tick_size)),
+        pip_size: args.pip_size.or(Some(resolved.precision.pip_size)),
+        tick_size: args.tick_size.or(Some(resolved.precision.tick_size)),
         dry_run: args.broker_dry_run,
     };
 
