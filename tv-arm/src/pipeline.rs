@@ -1070,87 +1070,96 @@ fn build_trade_spec(
     if args.skip_retest {
         skip_preps.push("retest".to_string());
     }
-    let mut spec = cli::TradeSpec {
-        pattern,
-        instrument: instrument.to_string(),
-        account: account.to_string(),
-        broker: broker_to_kind(broker),
-        trade_expiry: expiry,
-        risk_pct: args.risk_pct.unwrap_or(1.0),
-        risk_amount: args.risk_amount,
-        dry_run: args.broker_dry_run,
-        // strategy-v2 needs a non-zero max_retries on both enters: it's the
-        // multi_shot flag that keeps the engine plan alive after the first
-        // enter fires, so the worker retry gate can cancel the sibling's
-        // resting order. Floor to 1 (a `--max-retries 0` with `--strategy-v2`
-        // is rejected by validate_args, so this floor is just belt-and-braces).
-        max_retries: if args.strategy_v2 {
-            args.max_retries.unwrap_or(5).max(1)
-        } else {
-            args.max_retries.unwrap_or(5)
-        },
-        expiry_bars: args.expiry_bars,
-        skip_preps,
-        entry_offset_pips: None,
-        sl_offset_pips: None,
-        // Both offset forms None → the shared builder applies the ATR-pct
-        // default (DEFAULT_BUFFER_ATR_PCT). Unused on the M/W path (worker
-        // computes geometry); the H&S enter inherits the volatility-scaled buffer.
-        entry_offset_atr_pct: None,
-        sl_offset_atr_pct: None,
-        sl_anchor: None,
-        tp_price: round5(tp),
-        // H&S anchors SL to the pattern extreme, not an absolute price.
-        sl_price: None,
-        entry_deadline_pct: 80,
-        allow_entry: args.entry_filter_script.clone(),
-        entry_mode: if args.entry_market {
-            cli::EntryMode::Market
-        } else {
-            cli::EntryMode::Stop
-        },
-        needs_golden: !args.skip_golden,
-        needs_confirmed: args.require_confirmation,
-        close_on_news: !roles.news_pairs.is_empty(),
-        sr_reversal_ranges: build_sr_ranges(roles, args.reversal_band_pct),
-        veto_on_reversal: args.veto_on_reversal,
-        needs_confirmed_close: false,
-        // Populated from the chart's `<prep>-expiry` vertical lines —
-        // see `prep_expiry_steps`.
-        prep_expiries: prep_expiry_steps(roles),
-        // H&S path: no M/W static geometry. The M/W branch (commit 9)
-        // builds its spec separately, keyed on `roles.mw_path`.
-        mw: None,
-        // Baked from instrument-lookup (or --pip-size) so the worker scales
-        // the entry/SL offset_pips with the right pip, not its forex default.
-        pip_size: Some(pip_size),
-        // Baked from instrument-lookup (or --tick-size) so the worker snaps
-        // entry/SL/TP onto the broker's price grid before placement.
-        tick_size: Some(tick_size),
-        blackout_close: args.blackout_close.into_core(),
-        entry_level_vetos,
-        // Wrong-side stop recovery (H&S / iH&S). Explicit `--recover-entry`
-        // wins; otherwise a confirmation-required setup defaults to `limit`
-        // (the confirmation lag is what strands the stop), and everything
-        // else keeps today's drop (`skip`).
-        recover_entry: args.recover_entry.map(|r| r.into_core()).unwrap_or(
-            if args.require_confirmation {
-                trade_control_core::intent::RecoverEntryAction::Limit
+    let mut spec =
+        cli::TradeSpec {
+            pattern,
+            instrument: instrument.to_string(),
+            account: account.to_string(),
+            broker: broker_to_kind(broker),
+            trade_expiry: expiry,
+            risk_pct: args.risk_pct.unwrap_or(1.0),
+            risk_amount: args.risk_amount,
+            dry_run: args.broker_dry_run,
+            // strategy-v2 needs a non-zero max_retries on both enters: it's the
+            // multi_shot flag that keeps the engine plan alive after the first
+            // enter fires, so the worker retry gate can cancel the sibling's
+            // resting order. Floor to 1 (a `--max-retries 0` with `--strategy-v2`
+            // is rejected by validate_args, so this floor is just belt-and-braces).
+            max_retries: if args.strategy_v2 {
+                args.max_retries.unwrap_or(5).max(1)
             } else {
-                trade_control_core::intent::RecoverEntryAction::Skip
+                args.max_retries.unwrap_or(5)
             },
-        ),
-        strategy_v2: args.strategy_v2,
-        // Break-even on at 50% by default; `--no-breakeven` opts out,
-        // `--breakeven-pct` overrides the threshold.
-        breakeven_pct: if args.no_breakeven {
-            None
-        } else {
-            Some(args.breakeven_pct.unwrap_or(0.5))
-        },
-        // Entry SL-spread floor window baked onto the enter; `None` → worker default (5).
-        spread_window: args.spread_window,
-    };
+            expiry_bars: args.expiry_bars,
+            skip_preps,
+            entry_offset_pips: None,
+            sl_offset_pips: None,
+            // Both offset forms None → the shared builder applies the ATR-pct
+            // default (DEFAULT_BUFFER_ATR_PCT). Unused on the M/W path (worker
+            // computes geometry); the H&S enter inherits the volatility-scaled buffer.
+            entry_offset_atr_pct: None,
+            sl_offset_atr_pct: None,
+            sl_anchor: None,
+            tp_price: round5(tp),
+            // H&S anchors SL to the pattern extreme, not an absolute price.
+            sl_price: None,
+            entry_deadline_pct: 80,
+            allow_entry: args.entry_filter_script.clone(),
+            // Pattern-path entry order type: explicit `--entry-{market,stop,limit}`
+            // wins; default is stop.
+            entry_mode: match args.pattern_entry_mode() {
+                Some(crate::args::PatternEntry::Market) => cli::EntryMode::Market,
+                Some(crate::args::PatternEntry::Limit) => cli::EntryMode::Limit,
+                Some(crate::args::PatternEntry::Stop) | None => cli::EntryMode::Stop,
+            },
+            needs_golden: !args.skip_golden,
+            needs_confirmed: args.require_confirmation,
+            close_on_news: !roles.news_pairs.is_empty(),
+            sr_reversal_ranges: build_sr_ranges(roles, args.reversal_band_pct),
+            veto_on_reversal: args.veto_on_reversal,
+            needs_confirmed_close: false,
+            // Populated from the chart's `<prep>-expiry` vertical lines —
+            // see `prep_expiry_steps`.
+            prep_expiries: prep_expiry_steps(roles),
+            // H&S path: no M/W static geometry. The M/W branch (commit 9)
+            // builds its spec separately, keyed on `roles.mw_path`.
+            mw: None,
+            // Baked from instrument-lookup (or --pip-size) so the worker scales
+            // the entry/SL offset_pips with the right pip, not its forex default.
+            pip_size: Some(pip_size),
+            // Baked from instrument-lookup (or --tick-size) so the worker snaps
+            // entry/SL/TP onto the broker's price grid before placement.
+            tick_size: Some(tick_size),
+            blackout_close: args.blackout_close.into_core(),
+            entry_level_vetos,
+            // Wrong-side recovery (H&S / iH&S). Explicit `--recover-entry` wins.
+            // Otherwise the default depends on the entry mode:
+            //  - `--entry-limit`: a wrong-side limit recovers to a **stop** at the
+            //    same level (the operator's rule; `limit_recover_action`).
+            //  - stop entry + `--require-confirmation`: defaults to `limit` (the
+            //    confirmation lag is what strands the stop).
+            //  - everything else: today's drop (`skip`).
+            recover_entry: match args.pattern_entry_mode() {
+                Some(crate::args::PatternEntry::Limit) => args.limit_recover_action(),
+                _ => args.recover_entry.map(|r| r.into_core()).unwrap_or(
+                    if args.require_confirmation {
+                        trade_control_core::intent::RecoverEntryAction::Limit
+                    } else {
+                        trade_control_core::intent::RecoverEntryAction::Skip
+                    },
+                ),
+            },
+            strategy_v2: args.strategy_v2,
+            // Break-even on at 50% by default; `--no-breakeven` opts out,
+            // `--breakeven-pct` overrides the threshold.
+            breakeven_pct: if args.no_breakeven {
+                None
+            } else {
+                Some(args.breakeven_pct.unwrap_or(0.5))
+            },
+            // Entry SL-spread floor window baked onto the enter; `None` → worker default (5).
+            spread_window: args.spread_window,
+        };
     if args.sl_from_recent {
         spec.sl_anchor = Some(match direction {
             Direction::Short => cli::PriceAnchor::RecentHigh,

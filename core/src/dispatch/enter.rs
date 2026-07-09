@@ -1162,6 +1162,41 @@ async fn place_entry_too_close_fallback<B: Broker>(
                 }
             }
         }
+        recover_entry::RecoverEntryPlan::Stop { trigger_price } => {
+            tracing::info!(
+                "too-close fallback: re-placing as STOP at original trigger (id={intent_id} trigger={trigger_price} price={current_price})"
+            );
+            // Mirror of the Limit arm: the entry reference (trigger) is
+            // unchanged, so sizing is identical. A stop at the original level
+            // catches the continuation through it (used when a *limit* was
+            // wrong-side).
+            let stop_request = EntryRequest {
+                instrument: &resolved.instrument,
+                direction: resolved.direction,
+                entry: ResolvedEntry::Stop { trigger_price },
+                stop_loss: resolved.stop_loss,
+                take_profit: resolved.take_profit,
+                risk: resolved.risk,
+                dry_run: resolved.dry_run,
+            };
+            match broker
+                .place_entry(max_risk_pct, max_open_positions, &stop_request)
+                .await
+            {
+                Ok(order_id) => {
+                    tracing::info!(
+                        "too-close fallback: stop re-place succeeded (id={intent_id} order={order_id})"
+                    );
+                    Ok(order_id)
+                }
+                Err(err) => {
+                    tracing::error!(
+                        "too-close fallback: stop re-place failed: {err} (id={intent_id})"
+                    );
+                    Err(EntryError::EntryTooCloseToMarket)
+                }
+            }
+        }
     }
 }
 
