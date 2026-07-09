@@ -557,6 +557,17 @@ pub struct TradeSpec {
     /// single-enter spec yaml.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub strategy_v2: bool,
+    /// **strategy-v2 only.** Entry order type for the *QM leg* (`09-enter-qm`),
+    /// independent of [`Self::entry_mode`] (which drives the BCR `05-enter`
+    /// leg). Default `Stop` preserves today's behaviour — the QM leg was a
+    /// hardcoded stop at the signal level with a `RecoverEntryAction::Limit`
+    /// fallback. `Limit` rests a limit at the level (fills on the pullback back
+    /// to it) with a `RecoverEntryAction::Stop` fallback (catches the
+    /// continuation when price already crossed the level). This is what lets an
+    /// operator run the BCR leg as a stop and the QM leg as a limit on one
+    /// `--strategy-v2` setup. Set by `tv-arm --qm-entry`.
+    #[serde(default, skip_serializing_if = "is_default_entry_mode")]
+    pub qm_entry_mode: EntryMode,
     /// Break-even stop management (BUG-replay-no-breakeven-stop-at-50pct).
     /// **Default ON at 50%.** Bakes a [`Breakeven`] rule onto the `05-enter`
     /// intent (H&S, M/W, and the strategy-v2 QM enter) so the live worker's
@@ -1039,6 +1050,7 @@ fn build_pattern(
         // strategy-v2 (dual stop + QM enter) is a tv-arm opt-in, not an
         // interactive-questionnaire option.
         strategy_v2: false,
+        qm_entry_mode: EntryMode::Stop,
         // Break-even on at 50% by default (the standing lesson).
         breakeven_pct: default_breakeven_pct(),
         // Interactive builder: use the worker's default window (5); the flag
@@ -1214,7 +1226,9 @@ fn assemble_trade(
             spec.max_retries,
             spec.expiry_bars,
             spec.allow_entry.as_deref(),
-            EntryMode::Stop, // identical order shape to standalone --quasimodo
+            // QM leg entry order type — `--qm-entry` (default Stop, today's
+            // shape). Independent of the BCR leg's `entry_mode`.
+            spec.qm_entry_mode,
             // The QM leg is gated on CONFIRMATION, not golden. Requiring both
             // (golden AND confirmed) means a confirmed-but-small signal — the
             // common case a few bars into a move — never fires the confirmed
@@ -1232,8 +1246,16 @@ fn assemble_trade(
             &spec.account,
             spec.veto_on_reversal && !spec.sr_reversal_ranges.is_empty(),
             &spec.entry_level_vetos,
-            RecoverEntryAction::Limit, // wrong-side fallback, like standalone QM
-            true,                      // QM leg → 09-enter-qm
+            // Wrong-side recovery keyed to the QM order type: a Stop recovers to
+            // a Limit (price ran through the trigger → wait for the pullback);
+            // a Limit recovers to a Stop (price already crossed the level →
+            // catch the continuation). Market has no resting order to recover.
+            match spec.qm_entry_mode {
+                EntryMode::Stop => RecoverEntryAction::Limit,
+                EntryMode::Limit => RecoverEntryAction::Stop,
+                EntryMode::Market => RecoverEntryAction::Skip,
+            },
+            true, // QM leg → 09-enter-qm
             breakeven_from_pct(spec.breakeven_pct),
             spec.spread_window,
         ));
@@ -2613,6 +2635,7 @@ mod tests {
                 entry_level_vetos: Vec::new(),
                 recover_entry: RecoverEntryAction::Skip,
                 strategy_v2: false,
+                qm_entry_mode: EntryMode::Stop,
                 breakeven_pct: default_breakeven_pct(),
                 spread_window: None,
             },
@@ -3103,6 +3126,7 @@ mod tests {
             entry_level_vetos: Vec::new(),
             recover_entry: RecoverEntryAction::Skip,
             strategy_v2: false,
+            qm_entry_mode: EntryMode::Stop,
             breakeven_pct: default_breakeven_pct(),
             spread_window: None,
         }
@@ -3175,6 +3199,47 @@ mod tests {
             qm.intent.max_retries,
             trade_control_core::tunable::Tunable::Static(5)
         ));
+    }
+
+    #[test]
+    fn strategy_v2_qm_entry_limit_makes_qm_a_limit_with_stop_recovery() {
+        // `--qm-entry limit` (spec.qm_entry_mode = Limit): the QM leg
+        // (09-enter-qm) becomes a LIMIT at the signal level with a
+        // `recover_entry: Stop` fallback, while the BCR leg (05-enter) stays a
+        // STOP untouched. This is the "BCR stop + QM limit on one setup" case.
+        let now = ts("2026-05-20T00:00:00Z");
+        let mut spec = sample_spec(TradePattern::Hs, ts("2026-05-25T00:00:00Z"));
+        spec.strategy_v2 = true;
+        spec.max_retries = 5;
+        spec.qm_entry_mode = EntryMode::Limit;
+        let trade = build_trade_from_spec(spec, now, BuildStrictness::Strict).unwrap();
+        let stop = &trade.alerts[5];
+        let qm = &trade.alerts[6];
+        assert_eq!(stop.basename, "05-enter");
+        assert_eq!(qm.basename, "09-enter-qm");
+        // BCR leg unaffected — still a stop.
+        assert!(matches!(stop.intent.entry, Some(EntrySpec::Stop { .. })));
+        // QM leg is now a Limit with recover_entry: Stop.
+        match &qm.intent.entry {
+            Some(EntrySpec::Limit {
+                from,
+                recover_entry,
+                ..
+            }) => {
+                assert_eq!(*from, PriceAnchor::SignalLow);
+                assert_eq!(
+                    recover_entry.as_ref().map(|r| r.action),
+                    Some(RecoverEntryAction::Stop),
+                    "wrong-side limit recovers to a stop (the operator's rule)"
+                );
+            }
+            other => panic!("expected Limit QM entry, got {other:?}"),
+        }
+        // The two legs now DIFFER (stop vs limit) — the point of --qm-entry.
+        assert_ne!(stop.intent.entry, qm.intent.entry);
+        // QM leg still confirmed-gated, not golden.
+        assert!(qm.intent.needs_confirmed);
+        assert!(!qm.intent.needs_golden);
     }
 
     #[test]
