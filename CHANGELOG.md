@@ -1,5 +1,38 @@
 # Changelog
 
+## v75 — 2026-07-09 — --qm-entry: per-leg entry order type for strategy-v2
+
+**Why.** `--strategy-v2` arms two legs (BCR stop `05-enter` + QM confirmed
+`09-enter-qm`), each with a fixed order shape. A single `--entry-*` flag is
+ambiguous — which leg? — so `--strategy-v2 --entry-stop` was a hard clap
+conflict. The operator wanted the **QM leg as a limit** while the **BCR leg
+stays a stop** on one setup, which the fixed QM shape (hardcoded `EntryMode::Stop`)
+couldn't express.
+
+**What changed.**
+- **`tv-arm --qm-entry <market|stop|limit>`** (requires `--strategy-v2`) sets the
+  QM leg's order type independently of the BCR leg (`--entry-*`). Default `stop`
+  keeps today's shape byte-identical.
+- **`TradeSpec.qm_entry_mode`** (`cli`, serde-additive, `skip_serializing_if`
+  default Stop). The QM-leg builder reads it instead of hardcoding `EntryMode::Stop`,
+  and derives the wrong-side recovery from it: Stop→`recover:limit` (today), Limit→
+  `recover:stop` (the v74 rule — a wrong-side limit becomes a stop), Market→`skip`.
+- Rejected the alternative `--and`/`--or` connective syntax — a large ambiguous
+  argv-expression parser for what is really per-leg control.
+
+**Config.** `tv-arm`: `--qm-entry <market|stop|limit>` (new). `--recover-entry`
+gained `stop` in v74.
+
+**Compatibility.** Default (`--qm-entry` omitted) = QM leg stop with limit
+recovery, unchanged. `--strategy-v2 --qm-entry limit` → BCR stop, QM limit
+(recover→stop).
+
+**Tests.** cli `strategy_v2_qm_entry_limit_makes_qm_a_limit_with_stop_recovery`
+(BCR stays stop, QM becomes limit+recover:stop, specs now differ); tv-arm
+`qm_entry_flag_resolves_and_requires_strategy_v2`. Existing
+`qm_enter_matches_standalone_quasimodo` still green (default path unchanged).
+Suites: cli 258 / tv-arm 212 / core 810 / engine 128.
+
 ## v74 — 2026-07-09 — first-confirmed entry + pattern entry-order flags + wrong-side limit→stop
 
 **Why.** A confirmed-candle enter (`09-enter-qm`, strategy-v2) never fired on

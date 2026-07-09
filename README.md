@@ -233,7 +233,7 @@ Basename ordering matters — `tv-arm` maps drawings to alerts by prefix.
 | `03-prep-break-and-close` | `prep` | Trendline crossing (neckline break) | Skippable for stocks / late entries with `--skip-break-and-close`. |
 | `04-prep-retest` | `prep` | Trendline crossing (intrabar retest of the neckline) | Skippable with `--skip-retest`. **Uses the same neckline drawing** as `03-prep-break-and-close` (opposite direction, intrabar) — you draw the neckline once. A separate `retest`/`neckline-retest`/`retrace` trendline is still honoured but **deprecated** (`tv-arm` warns). Fires **intrabar on the wick**, not the close, and (as of 2026-07-03) not the open either: the bar's **high and low just have to straddle the neckline** — sit on opposite sides — with the directional wick reaching at/through the line (long retest = the low dips at/below the descending neckline). Open- and close-agnostic: a tap-and-bounce that opens *and* closes on the same side still counts — see CHANGELOG "intrabar cross is a pure straddle". **The closeness requirement decays over time:** the first bar after the break-and-close must actually reach the neckline, and each subsequent bar loosens it by `retest_atr_step × ATR` of near-side slack (default step **0.075**, `tv-arm --retest-atr-step`), so a wick that comes *within* the growing tolerance of the line stamps the retest even without reaching it — the further price drifts in time, the less its exact distance to the neckline matters. See CHANGELOG "time-decaying retest tolerance". The wick must pierce at least `cross_buffer_pct%` of the line price past the line (plan-level field, default 0.02%) so a one-tick graze doesn't trip it. |
 | `05-enter` | `enter` | Pine `Candle Signals` golden candle | The actual trade. Gated on the preps above + opposing-direction veto absent. |
-| `09-enter-qm` | `enter` | Pine `Candle Signals` (same detector as `05-enter`) | **`tv-arm --strategy-v2` only.** The Quasimodo entry, armed alongside `05-enter`: no preps, **confirmed-candle gated (not golden)** — confirmation is its sole quality gate (golden is `05-enter`'s break-and-close gate; requiring both would starve the confirmed leg on a confirmed-but-small signal). It reads the **first signal to confirm** at/after the break-and-close, carrying *that* signal's own base as the entry level, rather than the single most-recent latch (which a fresher print overwrites — the DE30_EUR 2026-07-07 miss; see "First-confirmed entry" and CHANGELOG). Its entry spec is **identical to standalone `--quasimodo`** — a stop at signal_low − the ATR buffer (`offset_atr_pct: 0.5`; see "ATR buffer") with a `recover_entry: limit` fallback (fills on the pullback when the level was overrun), *not* a bare limit. Shares the trade's `trade_id` + `max_retries` with `05-enter`; first of the two to fire cancels the other's resting order (worker retry gate). See "Dual entry — `--strategy-v2`" below. |
+| `09-enter-qm` | `enter` | Pine `Candle Signals` (same detector as `05-enter`) | **`tv-arm --strategy-v2` only.** The Quasimodo entry, armed alongside `05-enter`: no preps, **confirmed-candle gated (not golden)** — confirmation is its sole quality gate (golden is `05-enter`'s break-and-close gate; requiring both would starve the confirmed leg on a confirmed-but-small signal). It reads the **first signal to confirm** at/after the break-and-close, carrying *that* signal's own base as the entry level, rather than the single most-recent latch (which a fresher print overwrites — the DE30_EUR 2026-07-07 miss; see "First-confirmed entry" and CHANGELOG). Its entry order type is set by **`--qm-entry <market\|stop\|limit>`** (default **`stop`**, independent of the BCR leg's `--entry-*`): `stop` is a stop at signal_low − the ATR buffer (`offset_atr_pct: 0.5`; see "ATR buffer") with a `recover_entry: limit` fallback (the default, identical to standalone `--quasimodo`); `limit` rests a limit at the level with a `recover_entry: stop` fallback (catches the continuation when price already crossed it) — this is how you run **BCR as a stop and QM as a limit on one setup** (`--strategy-v2 --qm-entry limit`). Shares the trade's `trade_id` + `max_retries` with `05-enter`; first of the two to fire cancels the other's resting order (worker retry gate). See "Dual entry — `--strategy-v2`" below. |
 | `06-close-on-reversal` | `close` | Pine `Candle Signals` opposing reversal | Emitted when news-pairs and/or `support`/`resistance` lines are drawn. Carries `inside_window: [news?, price?]` (OR-composed) and, when `price` is listed, `sr_bands: [[lo, hi], ...]`. Defaults `needs_golden: true` for the candle-quality gate. With `tv-arm --veto-on-reversal` (experimental) it also carries `veto_on_reversal: true`, so a reversal off a band before entry vetoes the upcoming trade — see the `close` action notes above. |
 | `08-prep-expire-<step>` | `prep-expire` | Vertical line crossing chart time | Emitted once per chart-drawn `<prep>-expiry` line (`break-and-close-expiry`, `retest-expiry`). When crossed, blocks any further `<step>` prep on the trade — so a setup whose prep lands too late never enters. Drawing-bound. `<step>` is the canonical prep name and may contain hyphens. |
 
@@ -2581,6 +2581,7 @@ cargo run -p tv-arm -- \
   --veto-on-reversal \                # experimental: a reversal off a band before entry also vetoes the upcoming trade (default off)
   --quasimodo \                       # alias: --skip-break-and-close --skip-retest --require-confirmation (drop both H&S preps, gate on a confirmed candle)
   --strategy-v2 \                     # arm BOTH a stop entry AND a Quasimodo confirmed entry on one setup; first to fire cancels the other (see below). Conflicts with --quasimodo/--entry-{market,stop,limit}/--skip-*; needs --max-retries > 0
+  --qm-entry limit \                  # strategy-v2 only: QM leg (09-enter-qm) order type <market|stop|limit>, default stop. limit → rests at the level, recovers to a stop when wrong-side. BCR leg stays a stop. Requires --strategy-v2
   --entry-limit \                     # pattern entry order type: stop (default) | --entry-market | --entry-limit (limit; recovers to a stop when wrong-side). Mutually exclusive; NOT the position-tool --*-entry flags
   --no-breakeven \                    # disable break-even stop management (default ON at 50%; see "Break-even stop management")
   --breakeven-pct 0.7 \               # override the break-even arm threshold as a fraction of entry→TP (default 0.5)
@@ -2607,12 +2608,20 @@ once**, competing for the same trade:
    preps and a confirmed signal candle, placed as a stop order that triggers
    on a break *through* the signal level.
 2. **Quasimodo (QM) entry** — no preps at all, gated only on a confirmed
-   signal candle. Its order spec is **identical to standalone `--quasimodo`**:
-   a stop at the signal level (signal_low − 1 pip for a short) carrying a
-   `recover_entry: limit` fallback. It fires as a resting stop on a normal
-   break, and when the signal candle has already overrun the level the engine
-   recovers it to a **limit** resting at the level — so it still fills on the
-   pullback *back* to the level, the mirror of the break-through.
+   signal candle. Its order type is set by **`--qm-entry <market|stop|limit>`**
+   (default `stop`), *independent* of the BCR leg's `--entry-*`:
+   - **`stop`** (default) — a stop at the signal level (signal_low − the ATR
+     buffer for a short) with a `recover_entry: limit` fallback, **identical to
+     standalone `--quasimodo`**. Fires as a resting stop on a normal break, and
+     when the signal candle has already overrun the level the engine recovers it
+     to a **limit** resting at the level — filling on the pullback *back* to it.
+   - **`limit`** — a limit at the level with a `recover_entry: stop` fallback
+     (the mirror): rests waiting for the pullback, and when price has *already*
+     crossed the level it recovers to a **stop** to catch the continuation
+     through it. Use `--strategy-v2 --qm-entry limit` to run the **BCR leg as a
+     stop and the QM leg as a limit** on one setup.
+   - **`market`** — enters at market on the confirmation bar (no resting order,
+     no recovery).
 
    > Earlier strategy-v2 builds armed this leg as a bare `EntrySpec::Limit` at
    > the level with *no* recovery. For a short whose confirmation candle closed

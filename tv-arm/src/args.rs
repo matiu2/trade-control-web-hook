@@ -306,6 +306,17 @@ pub struct Args {
     )]
     pub strategy_v2: bool,
 
+    /// **strategy-v2 only.** Entry order type for the **QM leg**
+    /// (`09-enter-qm`) — independent of the BCR leg (which stays a stop). This
+    /// is how you run the BCR leg as a stop and the QM leg as a limit on one
+    /// setup: `--strategy-v2 --qm-entry limit`. `limit` rests at the signal
+    /// level and recovers to a **stop** when price already crossed it (the
+    /// operator's rule); `stop` (the default) is today's shape (recovers to a
+    /// limit); `market` enters on the confirmation bar. Requires
+    /// `--strategy-v2`.
+    #[arg(long, value_enum, requires = "strategy_v2")]
+    pub qm_entry: Option<QmEntry>,
+
     /// Disable break-even stop management for this trade. By default the
     /// `05-enter` carries a break-even rule (50% of entry→TP) so the live
     /// worker moves the stop to break-even once a candle closes past the
@@ -581,6 +592,21 @@ impl Args {
     }
 }
 
+/// Entry order type for the strategy-v2 **QM leg** (`09-enter-qm`). Maps to
+/// `cli::EntryMode`; distinct from [`PatternEntry`] only so it can be a
+/// `--qm-entry <value>` value-enum flag (the pattern flags are three booleans).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+#[clap(rename_all = "lowercase")]
+pub enum QmEntry {
+    /// Market order on the confirmation bar.
+    Market,
+    /// Pending stop at the signal level (recovers to a limit when wrong-side).
+    /// The default — today's QM shape.
+    Stop,
+    /// Pending limit at the signal level (recovers to a stop when wrong-side).
+    Limit,
+}
+
 /// Which order type a **pattern-path** (H&S / M/W) entry should place. The
 /// mirror of [`PositionEntry`] for the pattern arming path. Set by
 /// [`Args::pattern_entry_mode`].
@@ -821,6 +847,24 @@ mod tests {
     fn pattern_entry_flags_are_mutually_exclusive() {
         let res = Args::try_parse_from(["tv-arm", "--entry-market", "--entry-limit"]);
         assert!(res.is_err(), "expected parse error, got {res:?}");
+    }
+
+    #[test]
+    fn qm_entry_flag_resolves_and_requires_strategy_v2() {
+        // No flag → None (QM leg keeps its default stop shape).
+        let a = Args::try_parse_from(["tv-arm", "--strategy-v2"]).expect("parse");
+        assert_eq!(a.qm_entry, None);
+
+        let l = Args::try_parse_from(["tv-arm", "--strategy-v2", "--qm-entry", "limit"])
+            .expect("parse");
+        assert_eq!(l.qm_entry, Some(QmEntry::Limit));
+        let s =
+            Args::try_parse_from(["tv-arm", "--strategy-v2", "--qm-entry", "stop"]).expect("parse");
+        assert_eq!(s.qm_entry, Some(QmEntry::Stop));
+
+        // --qm-entry requires --strategy-v2 (the QM leg only exists there).
+        let res = Args::try_parse_from(["tv-arm", "--qm-entry", "limit"]);
+        assert!(res.is_err(), "expected requires error, got {res:?}");
     }
 
     #[test]
