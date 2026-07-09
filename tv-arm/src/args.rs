@@ -307,13 +307,13 @@ pub struct Args {
     pub strategy_v2: bool,
 
     /// **strategy-v2 only.** Entry order type for the **QM leg**
-    /// (`09-enter-qm`) — independent of the BCR leg (which stays a stop). This
-    /// is how you run the BCR leg as a stop and the QM leg as a limit on one
-    /// setup: `--strategy-v2 --qm-entry limit`. `limit` rests at the signal
-    /// level and recovers to a **stop** when price already crossed it (the
-    /// operator's rule); `stop` (the default) is today's shape (recovers to a
-    /// limit); `market` enters on the confirmation bar. Requires
-    /// `--strategy-v2`.
+    /// (`09-enter-qm`) — independent of the BCR leg (which stays a stop).
+    /// `limit` (**the default**) rests at the signal level and recovers to a
+    /// **stop** when price has already crossed it (the operator's rule); `stop`
+    /// enters on the pullback at signal_low − buffer and recovers to a limit;
+    /// `market` enters on the confirmation bar. So `--strategy-v2` alone gives
+    /// BCR stop + QM limit; pass `--qm-entry stop`/`market` to override the QM
+    /// leg. Requires `--strategy-v2`.
     #[arg(long, value_enum, requires = "strategy_v2")]
     pub qm_entry: Option<QmEntry>,
 
@@ -601,9 +601,9 @@ pub enum QmEntry {
     /// Market order on the confirmation bar.
     Market,
     /// Pending stop at the signal level (recovers to a limit when wrong-side).
-    /// The default — today's QM shape.
     Stop,
     /// Pending limit at the signal level (recovers to a stop when wrong-side).
+    /// The default QM shape.
     Limit,
 }
 
