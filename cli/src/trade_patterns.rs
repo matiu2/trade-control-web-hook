@@ -1229,15 +1229,18 @@ fn assemble_trade(
             // QM leg entry order type — `--qm-entry` (default Stop, today's
             // shape). Independent of the BCR leg's `entry_mode`.
             spec.qm_entry_mode,
-            // The QM leg is gated on CONFIRMATION, not golden. Requiring both
-            // (golden AND confirmed) means a confirmed-but-small signal — the
-            // common case a few bars into a move — never fires the confirmed
-            // enter (DE30_EUR 2026-07-07: the 9pm confirmed short was non-golden,
-            // so a golden+confirmed QM never triggered). The operator's
-            // confirmation rule ("2 closes, price pushed below and not above") has
-            // no size test; golden is the *break-and-close* leg's quality gate.
-            false, // needs_golden: confirmation is the QM leg's gate
-            true,  // QM is always confirmed-candle gated
+            // The QM leg is golden-gated (default on) AND confirmed-gated. It
+            // honours `spec.needs_golden` like every other enter — golden is
+            // required by default, `--skip-golden` opts out. An earlier version
+            // hardcoded `false` here (confirmation-only), but that silently
+            // stripped the golden requirement from `--strategy-v2`: ESPIX_EUR
+            // 2026-07-07 fired `09-enter-qm` on a CONFIRMED but non-golden short
+            // (a small candle a few bars into the move) and got whipsawed. The
+            // operator's rule is golden-by-default on every enter; the QM leg is
+            // no exception. `--skip-golden` still gives the confirmed-only gate
+            // for setups where size is genuinely not the filter.
+            spec.needs_golden, // needs_golden: default true, --skip-golden clears
+            true,              // QM is always confirmed-candle gated
             &qm_skip_preps,
             spec.pip_size,
             spec.tick_size,
@@ -3212,6 +3215,7 @@ mod tests {
         spec.strategy_v2 = true;
         spec.max_retries = 5;
         spec.qm_entry_mode = EntryMode::Limit;
+        spec.needs_golden = true; // the real default (pipeline: !skip_golden)
         let trade = build_trade_from_spec(spec, now, BuildStrictness::Strict).unwrap();
         let stop = &trade.alerts[5];
         let qm = &trade.alerts[6];
@@ -3237,9 +3241,62 @@ mod tests {
         }
         // The two legs now DIFFER (stop vs limit) — the point of --qm-entry.
         assert_ne!(stop.intent.entry, qm.intent.entry);
-        // QM leg still confirmed-gated, not golden.
+        // QM leg is confirmed-gated AND golden-gated — it threads
+        // `spec.needs_golden` like every other enter (ESPIX_EUR 2026-07-07
+        // fired a non-golden confirmed short → require golden). This spec sets
+        // `needs_golden` (the real default in pipeline.rs is `!skip_golden`).
         assert!(qm.intent.needs_confirmed);
-        assert!(!qm.intent.needs_golden);
+        assert!(
+            qm.intent.needs_golden,
+            "QM leg threads spec.needs_golden (golden gate)"
+        );
+    }
+
+    #[test]
+    fn strategy_v2_qm_leg_requires_golden_by_default_and_skip_golden_clears_it() {
+        // ESPIX_EUR 2026-07-07: `09-enter-qm` fired a CONFIRMED but non-golden
+        // short (a small candle a few bars into the move) → whipsaw stop-out.
+        // The operator's rule: golden is required by default on every enter,
+        // including the QM leg. The QM leg previously hardcoded
+        // `needs_golden: false`, silently stripping the golden gate from
+        // `--strategy-v2`. It now threads `spec.needs_golden` (default true,
+        // `--skip-golden` clears it) exactly like the BCR leg.
+        let now = ts("2026-05-20T00:00:00Z");
+
+        // Default (pipeline sets needs_golden = !skip_golden = true): golden ON.
+        let mut spec = sample_spec(TradePattern::Hs, ts("2026-05-25T00:00:00Z"));
+        spec.strategy_v2 = true;
+        spec.needs_golden = true;
+        let trade = build_trade_from_spec(spec, now, BuildStrictness::Strict).unwrap();
+        let qm = trade
+            .alerts
+            .iter()
+            .find(|a| a.basename.starts_with("09-enter-qm"))
+            .expect("qm leg present under --strategy-v2");
+        assert!(
+            qm.intent.needs_golden,
+            "QM leg must require golden by default"
+        );
+        assert!(qm.intent.needs_confirmed, "QM leg stays confirmed-gated");
+
+        // --skip-golden (spec.needs_golden = false): golden OFF, confirmed-only.
+        let mut spec = sample_spec(TradePattern::Hs, ts("2026-05-25T00:00:00Z"));
+        spec.strategy_v2 = true;
+        spec.needs_golden = false;
+        let trade = build_trade_from_spec(spec, now, BuildStrictness::Strict).unwrap();
+        let qm = trade
+            .alerts
+            .iter()
+            .find(|a| a.basename.starts_with("09-enter-qm"))
+            .expect("qm leg present under --strategy-v2");
+        assert!(
+            !qm.intent.needs_golden,
+            "--skip-golden must clear golden on the QM leg too (opt-out)"
+        );
+        assert!(
+            qm.intent.needs_confirmed,
+            "confirmation is intrinsic to the QM leg regardless of golden"
+        );
     }
 
     #[test]
