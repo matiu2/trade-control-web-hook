@@ -1,5 +1,58 @@
 # Changelog
 
+## v79 — 2026-07-10 — multi-shot QM re-entry advances to the next confirmed signal
+
+**Why.** A strategy-v2 QM enter (`09-enter-qm`, `needs_confirmed: true`,
+multi-shot `max_retries=5`) fired **only once** — on the first confirmed signal
+— and never re-entered, even though the plan stayed alive after a stop-out.
+Repro: UK100_GBP H1, `tv-arm --start 2026-07-07T18:00:00+10:00 --strategy-v2
+--qm-entry=market`. Expected: entry #1 (18:00 pinbar, confirms 20:00) → SL;
+entry #2 (next confirmed short, 11pm candle confirming ~01:00 BNE) → TP. Actual:
+only entry #1, then the plan died on the too-low veto. The operator's rule: a
+multi-shot QM re-enters on each **subsequent** confirmed signal until the cap /
+a terminal veto.
+
+**Root cause.** The confirmed-first entry scan
+(`first_confirmed_signal_at`, `core/src/signals/state_machine.rs`) returns the
+**earliest** confirmed signal ("first wins") and sets `fires=true` only on that
+signal's single confirmation bar. A multi-shot enter correctly stays in
+`AwaitEntry` (it doesn't latch `state.fired`), but the scan was **frozen on the
+first winner** — on every later bar it returned the same signal with
+`fires=false`, so no re-entry ever fired. The golden-latch enter (`05-enter`,
+`needs_confirmed=false`) never had this problem: its `fires` tracks the live
+latch.
+
+**What changed.**
+- New persisted field `PlanState.last_confirmed_enter_at` — the print-bar time
+  of the last confirmed QM enter's signal. Serde-elided when `None` (every
+  existing plan's row is byte-identical), included in `advanced_vs`.
+- `first_confirmed_signal_at` gains an **exclusive** `after` bound: a signal
+  whose print bar is `<= after` cannot win. Composes with the existing inclusive
+  `not_before` setup floor.
+- `LatchedSignal` gains `signal_bar_time` (the print bar `N`, distinct from
+  `signal_start_time` = earliest covered bar `N-1` for 2-bar patterns) so the
+  watermark and the scan's `after` filter key on the *same* quantity.
+- Engine (`evaluate_one_entry`): folds `last_confirmed_enter_at` into the
+  confirmed-first scan and, when a **confirmed multi-shot** enter fires, stamps
+  the watermark to that signal's print bar. The next re-eval takes the *next*
+  confirmed signal. Single-shot (`Static(0)`) and golden-latch paths are
+  untouched.
+
+**The cap stays the worker's job.** The engine now emits a QM fire per distinct
+confirmed signal; the placement cap (`max_retries`) and "don't stack while a
+prior attempt is still open" remain the retry gate's job (which the replay runs
+too). Replay of the repro now shows entry #1 → SL (−1R), the 8pm candle skipped
+(never confirmed), entry #2 → TP (+1.54R), and a third fire correctly BLOCKED by
+the open-position backstop. Net **+0.54R** vs −1.00R before.
+
+**Tests.** `core`: `after_watermark_advances_to_the_next_confirmed_short`,
+`last_confirmed_enter_at` round-trip + advance-detection. `engine`:
+`confirmed_multi_shot_enter_re_fires_on_the_next_confirmed_signal`,
+`single_shot_confirmed_enter_fires_once_only`. All prior core (813) + engine
+(132) + cli (356) tests green; single-shot / golden-latch behaviour byte-identical.
+
+**Follow-up.** None outstanding.
+
 ## v78 — 2026-07-09 — golden reversal candle off S/R closes the trade (engine OR-fix + 06/07 split)
 
 **Why.** Operator rule: a **golden opposing reversal candle** closes the open

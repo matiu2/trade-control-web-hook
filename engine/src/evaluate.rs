@@ -669,6 +669,9 @@ fn evaluate_one_entry(
         Trigger::PinePattern { pattern, dir } => {
             // A `needs_confirmed` enter reads the first-confirmed signal (its own
             // base as the level); a golden-only enter keeps the single latch.
+            // The re-entry watermark (`last_confirmed_enter_at`) advances the
+            // confirmed-first scan past the signal an earlier multi-shot fire
+            // already consumed, so a re-entry takes the *next* confirmed signal.
             match eval_pine_entry(
                 candle,
                 detector_window,
@@ -677,6 +680,7 @@ fn evaluate_one_entry(
                 *dir,
                 rule.intent.needs_confirmed,
                 confirmed_floor,
+                state.last_confirmed_enter_at,
             ) {
                 Some(sig) => Some(sig),
                 None => return,
@@ -762,6 +766,20 @@ fn evaluate_one_entry(
         rule.intent.max_retries,
         trade_control_core::tunable::Tunable::Static(0)
     );
+    // Advance the confirmed-first re-entry watermark past the signal just
+    // consumed, so the *next* re-eval of a multi-shot `needs_confirmed` enter
+    // takes the next confirmed signal instead of re-firing on this one forever.
+    // Only a confirmed multi-shot enter needs it — a single-shot enter latches
+    // in `state.fired` below and never re-evaluates, and a golden-latch enter
+    // re-fires off the live latch (its `fires` already advances). Keyed off the
+    // print-bar time (`signal_bar_time`), the exact quantity the confirmed-first
+    // scan's `after` bound filters on.
+    if rule.intent.needs_confirmed
+        && multi_shot
+        && let Some(sig) = &signal
+    {
+        state.last_confirmed_enter_at = Some(sig.signal_bar_time);
+    }
     if matches!(
         rule.fire_mode,
         trade_control_core::trade_plan::FireMode::Once
@@ -777,6 +795,7 @@ fn evaluate_one_entry(
 /// fires on it, the latched direction matches the plan's, and (when set) the
 /// kind matches. Returns the latched signal to ride onto the shell, or `None`
 /// to not fire.
+#[allow(clippy::too_many_arguments)]
 fn eval_pine_entry(
     candle: &Candle,
     detector_window: &[Candle],
@@ -785,6 +804,7 @@ fn eval_pine_entry(
     dir: Direction,
     confirmed_first: bool,
     confirmed_floor: Option<chrono::DateTime<chrono::Utc>>,
+    confirmed_after: Option<chrono::DateTime<chrono::Utc>>,
 ) -> Option<LatchedSignal> {
     let Some(idx) = detector_window.iter().position(|c| c.time == candle.time) else {
         tracing::debug!(
@@ -803,7 +823,15 @@ fn eval_pine_entry(
     // `confirmed_floor` scopes the first-confirmed scan to the setup (past the
     // break/replay-start), so a warmup-era signal can't claim it.
     let sig = if confirmed_first {
-        first_confirmed_signal_at(detector_window, idx, cfg, dir, pattern, confirmed_floor)
+        first_confirmed_signal_at(
+            detector_window,
+            idx,
+            cfg,
+            dir,
+            pattern,
+            confirmed_floor,
+            confirmed_after,
+        )
     } else {
         latched_signal_at(detector_window, idx, cfg)
     };
@@ -913,9 +941,19 @@ fn eval_pine_guard(
     // window gate below logs under `pine-close`.
     // The close-on-reversal guard wants "a reversal printed/validated *now*" —
     // the single latch, not first-confirmed. `confirmed_first: false` (so the
-    // floor is unused — pass `None`). Computed before the contextual gate so the
-    // decision below only ever fires on a genuine opposite reversal.
-    let sig = eval_pine_entry(candle, detector_window, cfg, pattern, dir, false, None)?;
+    // floor and the re-entry watermark are both unused — pass `None`). Computed
+    // before the contextual gate so the decision below only ever fires on a
+    // genuine opposite reversal.
+    let sig = eval_pine_entry(
+        candle,
+        detector_window,
+        cfg,
+        pattern,
+        dir,
+        false,
+        None,
+        None,
+    )?;
 
     // Contextual window gate — the pure mirror of the worker's
     // `core::dispatch::close::evaluate_close_gates`, **OR-composed**. The
@@ -4035,6 +4073,126 @@ mod tests {
         assert!(
             !eval.new_state.fired.contains("05-enter"),
             "a multi-shot enter must not latch in `fired` (it re-fires on new bars)"
+        );
+    }
+
+    /// A descending staircase of short signals: signal A (bar 1, high 117.5 /
+    /// low 110) confirms on bar 3; the next short down (bar 4, high 112 / low
+    /// 108) confirms on bar 6. Each confirmation bar closes *below* its signal's
+    /// base so a resting sell-stop entry (`pine_enter_rule`'s default) is
+    /// correct-side and the bracket resolves. Mirrors the live UK100_GBP
+    /// 2026-07-07 multi-shot QM shape in miniature.
+    fn descending_short_staircase_window() -> Vec<Candle> {
+        vec![
+            candle("2026-06-16T09:00:00Z", 120.0, 121.0, 118.0, 118.5),
+            // bar 1: short engulfer A. high 117.5 / low 110.
+            candle("2026-06-16T10:00:00Z", 117.0, 117.5, 110.0, 110.5),
+            // bar 2: pushes below A's low (109) → confirming push; no breach.
+            candle("2026-06-16T11:00:00Z", 110.2, 111.0, 109.0, 109.5),
+            // bar 3: A's window-end → A validates. Closes at 108.5, below A's base
+            // (110), so the resting sell-stop is correct-side.
+            candle("2026-06-16T12:00:00Z", 109.5, 110.0, 108.0, 108.5),
+            // bar 4: next short down B (engulfs bar 3). high 112 / low 106.
+            candle("2026-06-16T13:00:00Z", 111.0, 112.0, 106.0, 106.5),
+            // bar 5: pushes below B's low (105) → confirming push; no breach.
+            candle("2026-06-16T14:00:00Z", 106.2, 107.0, 105.0, 105.5),
+            // bar 6: B's window-end → B validates. Closes at 104, below B's base
+            // (106), correct-side for the re-entry's sell-stop.
+            candle("2026-06-16T15:00:00Z", 105.5, 106.0, 104.0, 104.0),
+        ]
+    }
+
+    #[test]
+    fn confirmed_multi_shot_enter_re_fires_on_the_next_confirmed_signal() {
+        // THE re-entry fix, end-to-end. A `needs_confirmed` multi-shot enter must
+        // fire on signal A's confirmation bar AND AGAIN on the next confirmed
+        // short's confirmation bar — not stay frozen on A. Before the fix the
+        // confirmed-first scan was pinned to A and `fires` only on A's one
+        // confirmation bar, so the second fire never happened (UK100_GBP
+        // 2026-07-07: entered once, stopped out, never re-entered).
+        let mut rule = pine_enter_rule(None, Direction::Short, false);
+        rule.intent.needs_confirmed = true;
+        rule.intent.max_retries = trade_control_core::tunable::Tunable::Static(5);
+        // Market entry (the `--qm-entry=market` shape from the repro) — always
+        // resolvable regardless of where the confirmation bar closes relative to
+        // the base. Deep absolute TP so both brackets clear the ≥1R floor.
+        rule.intent.entry = Some(trade_control_core::intent::EntrySpec::Market);
+        rule.intent.take_profit = Some(trade_control_core::intent::TakeProfit::Anchored(
+            trade_control_core::intent::PriceRef::Absolute { absolute: 50.0 },
+        ));
+        let p = plan(vec![rule]);
+        let window = descending_short_staircase_window();
+        // Seed just before the window's live bars; feed the whole window as new so
+        // both confirmation bars (3 and 6) are evaluated in one pass.
+        let prior = seed_at(Phase::AwaitEntry, "2026-06-16T09:00:00Z");
+        let eval = run_window(&p, &prior, &window[1..], &window);
+
+        let qm_fires: Vec<_> = eval
+            .fired
+            .iter()
+            .filter(|f| f.rule_id == "05-enter")
+            .collect();
+        assert_eq!(
+            qm_fires.len(),
+            2,
+            "the confirmed multi-shot enter fires twice — once per confirmed signal"
+        );
+        // Fire 1 rides signal A (high 117.5); fire 2 rides the next short down
+        // (high 112) — a DIFFERENT signal, proving the watermark advanced.
+        let a = qm_fires[0].signal.expect("fire 1 geometry");
+        let b = qm_fires[1].signal.expect("fire 2 geometry");
+        assert!(
+            (a.signal_high - 117.5).abs() < 1e-9,
+            "fire 1 hi {}",
+            a.signal_high
+        );
+        assert!(
+            (b.signal_high - 112.0).abs() < 1e-9,
+            "fire 2 hi {}",
+            b.signal_high
+        );
+        assert!(
+            b.signal_bar_time > a.signal_bar_time,
+            "the re-entry takes a later signal"
+        );
+        // The plan stays armed (multi-shot never retires here) and the watermark
+        // now points at the second signal, so a third re-entry would look past it.
+        assert!(!eval.done, "multi-shot plan stays alive");
+        assert_eq!(eval.new_state.phase, Phase::AwaitEntry);
+        assert_eq!(
+            eval.new_state.last_confirmed_enter_at,
+            Some(b.signal_bar_time),
+            "watermark advanced to the last consumed signal"
+        );
+    }
+
+    #[test]
+    fn single_shot_confirmed_enter_fires_once_only() {
+        // The single-shot QM (max_retries = 0) must be byte-identical to before:
+        // it fires on the first confirmed signal and retires the plan — the
+        // watermark path is inert (no re-fire, no stamp).
+        let mut rule = pine_enter_rule(None, Direction::Short, false);
+        rule.intent.needs_confirmed = true;
+        // max_retries defaults to Static(0) → single-shot. Market entry.
+        rule.intent.entry = Some(trade_control_core::intent::EntrySpec::Market);
+        rule.intent.take_profit = Some(trade_control_core::intent::TakeProfit::Anchored(
+            trade_control_core::intent::PriceRef::Absolute { absolute: 50.0 },
+        ));
+        let p = plan(vec![rule]);
+        let window = descending_short_staircase_window();
+        let prior = seed_at(Phase::AwaitEntry, "2026-06-16T09:00:00Z");
+        let eval = run_window(&p, &prior, &window[1..], &window);
+
+        let qm_fires = eval
+            .fired
+            .iter()
+            .filter(|f| f.rule_id == "05-enter")
+            .count();
+        assert_eq!(qm_fires, 1, "single-shot fires exactly once");
+        assert!(eval.done, "single-shot retires the plan on its fire");
+        assert!(
+            eval.new_state.last_confirmed_enter_at.is_none(),
+            "single-shot never stamps the re-entry watermark"
         );
     }
 

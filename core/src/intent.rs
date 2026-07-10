@@ -2226,6 +2226,7 @@ mod tests {
             signal_low: 1.1000,
             signal_range: 0.2000,
             signal_start_time: candle.time,
+            signal_bar_time: candle.time,
             golden: true,
             signal_confirmed: true,
             atr: Some(0.05),
