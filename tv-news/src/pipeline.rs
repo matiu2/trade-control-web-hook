@@ -23,7 +23,7 @@ use crate::bucket::{EventBucket, bucket_events};
 use crate::filter::{events_needing_drawing, filter_events};
 use crate::label::is_news_label;
 use crate::resolution::{DEFAULT_BAR_SECS, resolution_to_secs};
-use crate::sentiment::{
+use news_sentiment_tv::{
     Confidence, CurrencySentiment, SentimentAnalysis, SentimentDirection, analyze_sentiment,
     sentiment_lookback_start,
 };

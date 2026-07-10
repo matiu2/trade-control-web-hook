@@ -1,0 +1,12 @@
+[package]
+name = "news-sentiment-tv"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+chrono = { version = "0.4.44", default-features = false, features = ["serde", "alloc", "clock"] }
+forex-factory = { git = "https://github.com/matiu2/forex-factory.git", version = "0.2.0", default-features = false, features = ["native-tls", "brotli", "http2"] }
+serde = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+serde_json = "1"

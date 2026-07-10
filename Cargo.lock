@@ -2145,6 +2145,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "650eef8c711430f1a879fdd01d4745a7deea475becfb90269c06775983bbf086"
 
 [[package]]
+name = "news-sentiment-tv"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "forex-factory",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "nom"
 version = "8.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4308,6 +4318,7 @@ dependencies = [
  "clap_complete",
  "color-eyre",
  "instrument-lookup",
+ "news-sentiment-tv",
  "tokio",
  "tracing",
  "tracing-error",
