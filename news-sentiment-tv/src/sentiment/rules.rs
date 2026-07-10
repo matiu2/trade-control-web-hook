@@ -6,12 +6,14 @@
 //!   here, since central banks tend to tighten, which strengthens the
 //!   currency.
 
-use trade_control_cli::{EconomicEvent, Impact};
+use forex_factory::{EconomicEvent, Impact};
+use serde::{Deserialize, Serialize};
 
 use super::parser::compare_values;
 
 /// Direction of sentiment.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum SentimentDirection {
     Bullish,
     Bearish,
@@ -20,7 +22,7 @@ pub enum SentimentDirection {
 }
 
 /// Sentiment analysis result for a single event.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EventSentiment {
     pub event_name: String,
     pub currency: String,

@@ -33,6 +33,7 @@ mod position_trade;
 mod precision;
 mod register_post;
 mod roles;
+mod sentiment;
 mod spread;
 mod timeframe;
 mod trade_plan_build;

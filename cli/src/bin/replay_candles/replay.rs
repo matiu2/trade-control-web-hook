@@ -675,6 +675,8 @@ mod tests {
             cross_buffer_pct: 0.0,
             retest_atr_step: trade_control_core::trade_plan::DEFAULT_RETEST_ATR_STEP,
             replay_start: None,
+            armed_at: None,
+            armed_sentiment: None,
         };
         let candles: Vec<EngineCandle> = (0..20)
             .map(|i| candle(i * 3600, 1.30 + i as f64 * 0.001))
@@ -704,6 +706,8 @@ mod tests {
             cross_buffer_pct: 0.0,
             retest_atr_step: trade_control_core::trade_plan::DEFAULT_RETEST_ATR_STEP,
             replay_start: None,
+            armed_at: None,
+            armed_sentiment: None,
         };
         let replay = run(&plan, &[], Granularity::H1, all_live(), all_live()).await;
         assert!(replay.fires.is_empty());
@@ -858,6 +862,7 @@ mod tests {
             true,
             false,
             &[],
+            None,
         );
         assert!(
             report.contains("SUPPRESSED") && report.contains("NO FILL"),
@@ -1007,8 +1012,14 @@ mod tests {
             enter.suppressed_by().is_empty(),
             "no active pause at the enter bar → not suppressed"
         );
-        let report =
-            crate::report::render(&paused_enter_plan(3600, 2 * 3600), &r, true, false, &[]);
+        let report = crate::report::render(
+            &paused_enter_plan(3600, 2 * 3600),
+            &r,
+            true,
+            false,
+            &[],
+            None,
+        );
         assert!(
             report.contains("TP: 1"),
             "without an active blackout the enter fills and takes profit:\n{report}"
@@ -1259,7 +1270,7 @@ mod tests {
         // The report must reflect this: the superseded stop shows SUPERSEDED (no
         // fabricated fill), and exactly one trade is tallied (the limit's TP) —
         // not two overlapping positions.
-        let report = crate::report::render(&two_enter_v2_plan(), &r, true, false, &[]);
+        let report = crate::report::render(&two_enter_v2_plan(), &r, true, false, &[], None);
         assert!(
             report.contains("SUPERSEDED"),
             "report must show the cancelled stop as SUPERSEDED:\n{report}"
@@ -1369,7 +1380,7 @@ mod tests {
         );
 
         // The replay report shows the short CLOSED ON REVERSAL, not held open.
-        let report = crate::report::render(&plan, &r, true, false, &[]);
+        let report = crate::report::render(&plan, &r, true, false, &[], None);
         assert!(
             report.contains("CLOSED ON REVERSAL"),
             "the open short must close on the reversal candle:\n{report}"

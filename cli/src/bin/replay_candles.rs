@@ -48,6 +48,7 @@ mod replay_candles {
     pub mod replay;
     pub mod replay_broker;
     pub mod report;
+    pub mod sentiment;
     pub mod source;
     pub mod tv;
     pub mod verbose;
@@ -68,7 +69,8 @@ use replay_candles::fixture::{self, FixtureMeta, ReplayOutcome};
 use replay_candles::source::CandleSource;
 use replay_candles::tv::TvDefaults;
 use replay_candles::{
-    annotate, brisbane, candles, granularity, instrument, market_hours, replay, report, tv,
+    annotate, brisbane, candles, granularity, instrument, market_hours, replay, report, sentiment,
+    tv,
 };
 use trade_control_engine::{BidAskCandle as EngineCandle, Granularity, TradePlan, Trigger};
 use trading_view::mcp::TvMcp;
@@ -325,9 +327,21 @@ async fn main() -> Result<()> {
     // catalog name exactly, so a slash-less/OANDA-form `raw_instrument` misses.
     let blackout_windows = market_hours::resolve_blackout_windows(args.source, &symbol).await;
 
+    // Recompute the news-sentiment verdict for the replay window (same algorithm
+    // tv-news / tv-arm use), as of the plan's armed_at or the window start.
+    // Fail-soft — `None` on any miss, and the report simply omits the block.
+    let replay_sentiment = sentiment::resolve_replay_sentiment(&plan, start).await;
+
     print!(
         "{}",
-        report::render(&plan, &replay, simulate, args.verbose, &blackout_windows)
+        report::render(
+            &plan,
+            &replay,
+            simulate,
+            args.verbose,
+            &blackout_windows,
+            replay_sentiment.as_ref(),
+        )
     );
 
     if annotate {
@@ -507,7 +521,14 @@ async fn run_test_mode(args: &Args) -> Result<()> {
     // froze their verdict before this feature, so this keeps them byte-stable.
     print!(
         "{}",
-        report::render(&inputs.plan, &replay, args.simulate, args.verbose, &[])
+        report::render(
+            &inputs.plan,
+            &replay,
+            args.simulate,
+            args.verbose,
+            &[],
+            None,
+        )
     );
 
     if args.check {
