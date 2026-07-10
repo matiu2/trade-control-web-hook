@@ -14,15 +14,10 @@ sha2 = "0.11.0"
 subtle = "2.6.1"
 # Optional: only the `MemStateStore` impl needs it, and only when exposed to
 # non-test consumers via `test-support` (in `cfg(test)` the dev-dependency
-# below covers it). Kept off the default/wasm build.
+# below covers it). Kept off the default build.
 serde_json = { version = "1.0.149", optional = true }
 tracing = "0.1.44"
 trade-control-conventions = { version = "0.1.0", path = "../conventions" }
-
-[target.'cfg(target_arch = "wasm32")'.dependencies]
-rhai = { version = "1.25.0", default-features = false, features = ["std", "wasm-bindgen", "serde"] }
-
-[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 rhai = { version = "1.25.0", default-features = false, features = ["std", "serde"] }
 
 [features]
@@ -31,7 +26,7 @@ cli = []
 serde_json = []
 # Exposes `MemStateStore` (the in-memory `StateStore`) to non-test consumers —
 # the native replay CLI drives the engine against it offline. Off by default so
-# it never leaks into the wasm worker release build. Pulls in `serde_json`
+# it never leaks into the worker release build. Pulls in `serde_json`
 # (`MemStateStore` (de)serializes state values) and `chrono/clock` (it stamps
 # TTLs with `Utc::now()`); both are dev-deps in `cfg(test)`, so this only matters
 # for the non-test CLI build.

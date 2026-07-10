@@ -2,44 +2,11 @@
 resolver = "3"
 members = ["broker-oanda", "broker-tradenation-adapter", "cli", "conventions", "core", "engine", "trade-control-cron", "trading-view", "tv-arm", "tv-news", "worker"]
 
-[package]
-name = "trade-control-web-hook"
-version = "0.2.0"
-edition = "2024"
-
-[lib]
-crate-type = ["cdylib", "rlib"]
-
-[dependencies]
-broker-oanda = { version = "0.1.0", path = "broker-oanda" }
-broker-tradenation = { git = "https://github.com/matiu2/tradenation-api.git", tag = "broker-tradenation-v0.11.0", features = ["wasm_js"] }
-tradenation-api = { git = "https://github.com/matiu2/tradenation-api.git", tag = "broker-tradenation-v0.11.0", features = ["wasm_js"] }
-chrono = { version = "0.4.44", default-features = false, features = ["alloc", "serde"] }
-hex = "0.4.3"
-serde = { version = "1.0.228", features = ["derive"] }
-serde_json = "1.0.149"
-serde_yaml = "0.9.34"
-trade-control-core = { path = "core" }
-worker = "^0.8"
-tracing = { version = "0.1.44", default-features = false, features = ["std"] }
-candle-model = { version = "0.1.0", path = "../candle-model" }
-trade-control-engine = { version = "0.1.0", path = "engine" }
-broker-tradenation-adapter = { version = "0.1.0", path = "broker-tradenation-adapter" }
-trade-control-cron = { version = "0.1.0", path = "trade-control-cron" }
-
-[dev-dependencies]
-trade-control-core = { path = "core", features = ["test-support"] }
-
-# The spread-baseline bake (per-instrument thresholds from the
-# spread-sampler-cron YAML) moved to `core/build.rs` so the offline replay
-# (which links `core`, not this worker `cdylib`) shares it. No worker-side
-# build.rs / build-dependencies remain — see `src/spread_blackout.rs`.
-
-# `tradenation-api` is consumed as a git dep; its `ohlcv` module exposes
-# `candle_model::Granularity` / `CandleData` from a candle-model vendored
-# inside that git checkout. The worker also depends on the local `candle-model`
-# (for naming `Granularity` in the candle-fetch adapter). Without this patch
-# the two are distinct crates and the types don't unify (E0308). Redirect the
-# git-sourced candle-model to the same local path so there is one crate.
+# `tradenation-api` is consumed as a git dep by workspace members (`worker`,
+# `cli`, `tv-arm`, …); its `ohlcv` module exposes `candle_model::Granularity` /
+# `CandleData` from a candle-model vendored inside that git checkout. Members
+# also depend on the local `candle-model`. Without this patch the two are
+# distinct crates and the types don't unify (E0308). Redirect the git-sourced
+# candle-model to the same local path so there is one crate.
 [patch."https://github.com/matiu2/tradenation-api.git"]
 candle-model = { path = "../candle-model" }
