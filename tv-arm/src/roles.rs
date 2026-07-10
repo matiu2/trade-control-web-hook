@@ -179,7 +179,6 @@ pub fn classify<F: DrawingFetcher>(
 ) -> Result<Roles> {
     let mut invalidations: Vec<(Drawing, String)> = Vec::new();
     let mut break_lines: Vec<Drawing> = Vec::new();
-    let mut retest_lines: Vec<Drawing> = Vec::new();
     let mut tp_fibs: Vec<Drawing> = Vec::new();
     let mut trade_expiries: Vec<Drawing> = Vec::new();
     let mut sr_levels: Vec<Drawing> = Vec::new();
@@ -225,9 +224,27 @@ pub fn classify<F: DrawingFetcher>(
                 break_lines.push(d);
                 Some("break_and_close")
             }
+            // A separately-drawn `retest` trendline is deliberately NOT
+            // classified. Historically the retest was its own trendline because
+            // a single TradingView drawing could only carry one alert (so the
+            // neckline couldn't fire both the break-and-close *and* its own
+            // retest). That limitation is gone, and the retest is *by
+            // definition* a cross back through the **same neckline** — so the
+            // retest role always reuses the resolved neckline
+            // (`roles.break_and_close`). Honouring a drawn retest line only let a
+            // stale one from an earlier setup silently arm a never-firing cross:
+            // USD/ZAR iH&S, 2026-07 — a May-anchored retest line, extrapolated
+            // forward with `extend_forward`, sat ~2000 pips below price, so
+            // `04-prep-retest` could never cross and the enter never became
+            // eligible. Log-and-ignore so such a line is a visible no-op, not a
+            // silent footgun.
             kind::TREND_LINE if matches(lbl, RETEST_LABELS) => {
-                retest_lines.push(d);
-                Some("retest")
+                debug!(
+                    id = %stub.id,
+                    label = lbl,
+                    "drawn `retest` trendline ignored — the neckline serves the retest role",
+                );
+                None
             }
             kind::FIB_RETRACEMENT => {
                 tp_fibs.push(d);
@@ -310,20 +327,13 @@ pub fn classify<F: DrawingFetcher>(
         roles.invalidation = Some(d);
         roles.invalidation_label = Some(lbl);
     }
-    roles.break_and_close = break_and_close;
     // Retest = a cross back through the neckline (opposite direction, intrabar).
-    // TradingView used to force a *separate* `retest` trendline because a single
-    // drawing could only carry one alert; that limitation is gone, so the
-    // neckline (`break_and_close`) now serves both roles by default. A drawn
-    // `retest` line is still honoured — but it's **deprecated**: warn and keep it.
-    // With no `retest` line, fall back to the neckline drawing so `04-prep-retest`
-    // crosses the exact same geometry.
-    roles.retest = resolve_retest(
-        retest_lines,
-        &roles.break_and_close,
-        visible_range,
-        slot_pref,
-    );
+    // The retest is *by definition* the same neckline as the break-and-close, so
+    // it always reuses that resolved drawing. Drawn `retest` trendlines are no
+    // longer honoured — they're ignored in `classify` (a stale one could arm a
+    // never-firing cross; see the ignore arm there for the USD/ZAR regression).
+    roles.retest = break_and_close.clone();
+    roles.break_and_close = break_and_close;
     roles.tp_fib = pick_slot(tp_fibs, "tp_fib", visible_range, slot_pref);
     roles.trade_expiry = pick_trade_expiry(trade_expiries, visible_range, slot_pref);
 
@@ -345,43 +355,6 @@ pub fn classify<F: DrawingFetcher>(
     roles.position = latest_position(positions);
 
     Ok(roles)
-}
-
-/// Resolve the retest role.
-///
-/// Historically the retest was a **separate** `retest` trendline, because a
-/// single TradingView drawing could only carry one alert (so the neckline
-/// couldn't fire both the break-and-close *and* its own retest). That
-/// limitation is gone, and the retest is by definition a cross back through the
-/// **same neckline** — so the neckline drawing now serves both roles.
-///
-/// - A drawn `retest` line is still honoured (so old charts keep working), but
-///   it is **deprecated**: warn and keep using it.
-/// - With no drawn `retest` line, fall back to the resolved neckline
-///   (`break_and_close`). `04-prep-retest`'s trigger then crosses the identical
-///   geometry — just the opposite direction, intrabar (see `retest_dir` in
-///   `trade_plan_build`).
-fn resolve_retest(
-    retest_lines: Vec<Drawing>,
-    break_and_close: &Option<Drawing>,
-    visible_range: (i64, i64),
-    slot_pref: SlotPref,
-) -> Option<Drawing> {
-    if !retest_lines.is_empty() {
-        warn!(
-            count = retest_lines.len(),
-            "a separate `retest` trendline is deprecated — the neckline now serves \
-             both break-and-close and retest; honouring the drawn retest line for now, \
-             but you can delete it and draw only the neckline"
-        );
-        return pick_slot(retest_lines, "retest", visible_range, slot_pref);
-    }
-    // No drawn retest line: reuse the neckline drawing.
-    if let Some(neckline) = break_and_close {
-        debug!("no `retest` line drawn; reusing the neckline for the retest role");
-        return Some(neckline.clone());
-    }
-    None
 }
 
 /// A position tool qualifies only when it has an entry anchor and both
@@ -1053,7 +1026,9 @@ mod tests {
         assert!(roles.invalidation.is_some());
         assert_eq!(roles.invalidation_label.as_deref(), Some("too-high"));
         assert_eq!(roles.break_and_close.as_ref().unwrap().id, "neck");
-        assert_eq!(roles.retest.as_ref().unwrap().id, "re");
+        // The drawn `retest` line ("re") is no longer classified; the retest
+        // role reuses the resolved neckline ("neck").
+        assert_eq!(roles.retest.as_ref().unwrap().id, "neck");
         assert_eq!(roles.tp_fib.as_ref().unwrap().id, "fib");
         assert_eq!(roles.trade_expiry.as_ref().unwrap().id, "exp");
 
@@ -1085,9 +1060,12 @@ mod tests {
     }
 
     #[test]
-    fn a_separate_retest_line_is_still_honoured_deprecated() {
-        // A drawn `retest` line still wins its own slot (backward compat) even
-        // though it's deprecated — the neckline would otherwise serve both.
+    fn a_drawn_retest_line_is_ignored_neckline_wins() {
+        // Support for separately-drawn `retest` trendlines was dropped: the
+        // retest is by definition the same neckline, and a stale drawn retest
+        // line (anchored weeks off) could silently arm a cross that never fires
+        // (USD/ZAR iH&S 2026-07). The drawn `retest` line is now a no-op; the
+        // retest role always reuses the resolved neckline.
         let (stubs, mcp) = fixture(vec![
             (
                 stub("neck", "trend_line"),
@@ -1103,8 +1081,8 @@ mod tests {
         assert_eq!(roles.break_and_close.as_ref().unwrap().id, "neck");
         assert_eq!(
             roles.retest.as_ref().unwrap().id,
-            "re",
-            "a drawn retest line is honoured over the neckline fallback"
+            "neck",
+            "a drawn retest line is ignored; the neckline serves the retest role"
         );
     }
 
@@ -1121,6 +1099,38 @@ mod tests {
         assert!(
             roles.retest.is_none(),
             "no neckline to fall back to → no retest"
+        );
+    }
+
+    #[test]
+    fn stale_retest_line_before_start_does_not_win_over_neckline() {
+        // USD/ZAR iH&S regression (2026-07): a `retest` trendline left over
+        // from an earlier setup was anchored ~weeks before `--start` and, with
+        // its own slope extrapolated forward, sat far from the neckline — so
+        // `04-prep-retest` armed a cross that could never fire. Under `--start`
+        // the old drawn-retest picker took the stale line; now the drawn line
+        // is ignored and the retest reuses the in-window neckline instead.
+        let start = 500;
+        let (stubs, mcp) = fixture(vec![
+            // In-window neckline the operator is actually journaling.
+            (
+                stub("neck", "trend_line"),
+                drawing("neck", "neckline", vec![(400, 16.28), (480, 16.26)]),
+            ),
+            // Stale retest line anchored long before start, far in price.
+            (
+                stub("stale", "trend_line"),
+                drawing("stale", "retest", vec![(50, 16.36), (80, 16.35)]),
+            ),
+        ]);
+
+        let roles =
+            classify(&mcp, &stubs, ANY_RANGE, SlotPref::NearestTo { start }).expect("classify ok");
+        assert_eq!(roles.break_and_close.as_ref().unwrap().id, "neck");
+        assert_eq!(
+            roles.retest.as_ref().unwrap().id,
+            "neck",
+            "the stale drawn retest line must not win; retest reuses the neckline",
         );
     }
 
