@@ -1,5 +1,42 @@
 # Changelog
 
+## v83 — 2026-07-11 — invalidation pick: neckline-closeness is primary, anchor-time is the tiebreak
+
+**Why.** Exposed by the v82 USD/ZAR iH&S replay. The chart carried both a
+`too-low` floor (16.194, Δ0.077 from the neckline ~16.271) and a `too-high` cap
+(16.478, Δ0.207) — a stale leftover from a bigger setup. Under `--start` the
+invalidation picker keyed on **anchor-time distance to the cursor** first, and
+the stale `too-high` happened to be anchored nearer `start`, so it won and armed
+a **short** — when the closer `too-low` floor should have armed a **long**.
+Which invalidation wins *is* the trade direction, so a mispick silently flips the
+whole trade.
+
+**What changed.** In `pick_slot_with_label` (`tv-arm/src/roles.rs`), under
+`--start` the comparator now keys on **closeness to the neckline** first and
+anchor-time distance only as the tiebreak (previously the reverse — level was
+only consulted on an exact time tie). A genuine cap/floor for *this* setup hugs
+the neckline; a line far from it is a leftover from a larger, different pattern,
+and it can easily be anchored *nearer* the cursor than the real one — so time
+can't be the primary key. With **no** neckline reference (`neckline_ref` None),
+`level_gap` is `∞` for every candidate and the pick cleanly falls through to the
+nearest-anchor rule, unchanged.
+
+**Behaviour.** USD/ZAR now arms **long (iH&S)** with `too-low` = 16.1939, the
+drawn floor. The Stellar 2026-07-06 case is unchanged (too-high was both closer
+*and* the intended short). The side-of-neckline filter is unchanged and still
+runs first.
+
+**Tests.** New `nearest_to_invalidation_closeness_beats_time_usd_zar` (the
+discriminating shape: closer line anchored *further* in time). Renamed
+`…time_tie_breaks_on_level…` → `…picks_level_closest_to_neckline` (level is no
+longer just a tie-breaker). `…side_filter_falls_back_when_all_wrong_side` now
+picks the closer line in the fallback (was time-nearest). Full tv-arm suite green
+(220).
+
+**Follow-up.** Considered a creation-order (draw-list position) tiebreak for
+charts where two invalidations are near-equidistant from the neckline; deferred —
+`Drawing` carries no creation timestamp and closeness resolves the known cases.
+
 ## v82 — 2026-07-11 — drop drawn `retest` trendlines; the neckline always serves the retest
 
 **Why.** A USD/ZAR iH&S journaling replay (arm `--start 2026-07-06 18:00`) never

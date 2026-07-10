@@ -806,22 +806,23 @@ fn pick_slot_with_label(
         .collect();
     let drawings: Vec<Drawing> = cands.into_iter().map(|(d, _)| d).collect();
     // The invalidation horizontals (`too-low` / `too-high`) *bracket* the
-    // pattern, so under `--start` the right one is the nearest **either side**
-    // of `start`, not nearest-before (a `too-high` cap above the right shoulder
-    // may be anchored just after the cursor). Every other single-slot role
-    // routes through `pick_slot`'s nearest-before default.
+    // pattern. When a chart carries both (two overlapping H&S / iH&S setups, or a
+    // stale leftover from a bigger setup), picking the wrong one silently flips
+    // the trade *direction* (`too-high` cap → short; `too-low` floor → long). So
+    // under `--start` the primary selector is **closeness to the neckline**: a
+    // genuine cap/floor for *this* setup hugs the neckline, whereas a line far
+    // from it is a leftover from a larger, different pattern. Anchor-time distance
+    // to `start` is only the tiebreak (two lines equally close to the neckline —
+    // rare — fall back to the nearest anchor either side of the cursor).
     //
-    // Secondary tiebreak on **level**: when two invalidation lines are anchored
-    // at the same time (an ambiguous chart with both a `too-low` and a
-    // `too-high` drawn — e.g. two overlapping H&S setups), the time-distance
-    // tiebreak is a dead tie and `min_by_key` would pick arbitrarily by vec
-    // order, silently choosing the trade direction. Break such ties by picking
-    // the line **closest to the neckline**: a genuine cap/floor hugs the
-    // neckline, whereas a line far from it is a stale leftover from a larger,
-    // different setup. (Stellar iH&S/H&S 2026-07-06: too-low 143.1 and too-high
-    // 202.1 tied on time; neckline 200.2 → too-high wins → short, the intended
-    // trade.) Only applies on an exact time tie; when times differ, time still
-    // dominates.
+    // Why closeness beats time: the stale line can easily be anchored *nearer*
+    // the cursor than the real one, so a time-primary rule mispicks it. (USD/ZAR
+    // iH&S 2026-07-06: too-low 16.137 Δ0.135 from neckline 16.271, too-high 16.478
+    // Δ0.207; too-high was anchored nearer `start` and won under the old
+    // time-primary rule → armed a *short* when the closer too-low floor should
+    // have armed a *long*.) The Stellar iH&S/H&S 2026-07-06 case is unchanged:
+    // too-low 143.1 Δ57.1, too-high 202.1 Δ1.9 from neckline 200.2 → too-high is
+    // both closer *and* was the intended short, so it still wins.
     let chosen = if let SlotPref::NearestTo { start } = pref {
         let level_gap = |d: &Drawing| -> f64 {
             match neckline_ref {
@@ -832,11 +833,11 @@ fn pick_slot_with_label(
         drawings.into_iter().min_by(|a, b| {
             let ta = (a.anchor_time() - start).abs();
             let tb = (b.anchor_time() - start).abs();
-            ta.cmp(&tb).then_with(|| {
-                level_gap(a)
-                    .partial_cmp(&level_gap(b))
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            })
+            // Primary: closest to the neckline. Tiebreak: nearest anchor to start.
+            level_gap(a)
+                .partial_cmp(&level_gap(b))
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| ta.cmp(&tb))
         })?
     } else {
         pick_slot(drawings, role, window, pref)?
@@ -1395,15 +1396,13 @@ mod tests {
         assert_eq!(roles.invalidation_label.as_deref(), Some("too-low"));
     }
 
-    /// THE TIE (Stellar 2026-07-06): a `too-low` (143.1) and a `too-high`
-    /// (202.1) both anchored at the **same time**, both on their correct side of
-    /// the neckline (200.2) so the side-of-neckline filter keeps both. The
-    /// time-distance tiebreak is a dead tie; without a secondary key `min_by`
-    /// picks by vec order (too-low → long, the wrong direction). The level
-    /// tiebreak picks the line closest to the neckline — too-high (Δ1.9) over
-    /// too-low (Δ57.1) → short, the intended trade.
+    /// Stellar 2026-07-06: a `too-low` (143.1) and a `too-high` (202.1), both on
+    /// their correct side of the neckline (200.2) so the side-of-neckline filter
+    /// keeps both. Closeness-to-neckline is the primary selector: too-high (Δ1.9)
+    /// beats too-low (Δ57.1) → short, the intended trade. (Anchoring both at the
+    /// same time here just makes the point that level alone decides.)
     #[test]
-    fn nearest_to_invalidation_time_tie_breaks_on_level_closest_to_neckline() {
+    fn nearest_to_invalidation_picks_level_closest_to_neckline() {
         let (stubs, mcp) = fixture(vec![
             // Neckline ~200.2 (mean of the two anchors).
             (
@@ -1421,16 +1420,52 @@ mod tests {
                 drawing("high", "too-high", vec![(450, 202.1)]),
             ),
         ]);
-        // start=600: both invalidations |450-600|=150 — an exact time tie.
-        // Level breaks it: |202.1-200.2|=1.9 < |143.1-200.2|=57.1 → `high`.
+        // Closeness decides: |202.1-200.2|=1.9 < |143.1-200.2|=57.1 → `high`.
         let roles = classify(&mcp, &stubs, ANY_RANGE, SlotPref::NearestTo { start: 600 })
             .expect("classify ok");
         assert_eq!(
             roles.invalidation.as_ref().unwrap().id,
             "high",
-            "the neckline-hugging cap wins the time-tie; the far stale floor loses"
+            "the neckline-hugging cap wins; the far stale floor loses"
         );
         assert_eq!(roles.invalidation_label.as_deref(), Some("too-high"));
+    }
+
+    /// USD/ZAR iH&S 2026-07-06: the closer line was anchored *further* in time,
+    /// so the old time-primary rule mispicked. `too-low` (16.194, Δ0.077 from the
+    /// neckline ~16.271) is the real floor → long; `too-high` (16.478, Δ0.207) is
+    /// a stale cap left over from a bigger setup and is anchored *nearer* start.
+    /// Neckline-closeness must dominate anchor time so the closer `too-low` wins
+    /// and the trade arms **long**, not short.
+    #[test]
+    fn nearest_to_invalidation_closeness_beats_time_usd_zar() {
+        let (stubs, mcp) = fixture(vec![
+            // Neckline ~16.271 (mean of the two anchors).
+            (
+                stub("neck", "trend_line"),
+                drawing("neck", "neckline", vec![(400, 16.285), (500, 16.2577)]),
+            ),
+            // Real floor BELOW the neckline, anchored FURTHER from start (t=430).
+            (
+                stub("low", "horizontal_line"),
+                drawing("low", "too-low", vec![(430, 16.1939)]),
+            ),
+            // Stale cap ABOVE the neckline, anchored NEARER start (t=590).
+            (
+                stub("high", "horizontal_line"),
+                drawing("high", "too-high", vec![(590, 16.478)]),
+            ),
+        ]);
+        // start=600: by time `high` (|590-600|=10) beats `low` (|430-600|=170),
+        // but closeness wins: |16.1939-16.271|=0.077 < |16.478-16.271|=0.207.
+        let roles = classify(&mcp, &stubs, ANY_RANGE, SlotPref::NearestTo { start: 600 })
+            .expect("classify ok");
+        assert_eq!(
+            roles.invalidation.as_ref().unwrap().id,
+            "low",
+            "the closer too-low floor wins over the stale nearer-in-time too-high cap",
+        );
+        assert_eq!(roles.invalidation_label.as_deref(), Some("too-low"));
     }
 
     /// Mirror for a short: a stale `too-high` *below* the neckline is dropped so
@@ -1461,7 +1496,9 @@ mod tests {
 
     /// When *every* candidate is on the "wrong" side (an unusual chart, or a
     /// mis-resolved neckline), the filter must not strand the setup — it falls
-    /// back to the full set and nearest-to-start still picks one.
+    /// back to the full set and still picks one. With neckline-closeness the
+    /// primary key, the line **closest to the neckline** wins the fallback (a
+    /// better proxy for the real cap/floor than mere anchor time).
     #[test]
     fn nearest_to_invalidation_side_filter_falls_back_when_all_wrong_side() {
         let (stubs, mcp) = fixture(vec![
@@ -1470,6 +1507,7 @@ mod tests {
                 drawing("neck", "neckline", vec![(400, 111.5), (500, 111.5)]),
             ),
             // Both `too-low` lines above the neckline (would all be dropped).
+            // `b` (112.5) hugs the neckline closer than `a` (112.9).
             (
                 stub("a", "horizontal_line"),
                 drawing("a", "too-low", vec![(590, 112.9)]),
@@ -1479,10 +1517,12 @@ mod tests {
                 drawing("b", "too-low", vec![(450, 112.5)]),
             ),
         ]);
-        // Filter would empty the set → keep all → nearest-to-start (t=590) wins.
+        // Filter would empty the set → keep all → closest-to-neckline wins:
+        // |112.5-111.5|=1.0 < |112.9-111.5|=1.4 → `b`, even though `a` is anchored
+        // nearer start (time is only the tiebreak now).
         let roles = classify(&mcp, &stubs, ANY_RANGE, SlotPref::NearestTo { start: 600 })
             .expect("classify ok");
-        assert_eq!(roles.invalidation.as_ref().unwrap().id, "a");
+        assert_eq!(roles.invalidation.as_ref().unwrap().id, "b");
     }
 
     /// The trade-expiry vertical sits forward of the setup, so `--start` picks
