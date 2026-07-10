@@ -1,5 +1,48 @@
 # Changelog
 
+## v80 — 2026-07-10 — replay's SL→break-even line no longer drops when a wick sits between the signed and floored SL
+
+**Why.** A USD/SGD iH&S replay (`tv-arm --start 2026-07-07T18:00:00+10:00
+--strategy-v2`) looked like break-even had stopped working: the trade ran well
+past the 50%-to-TP level, retraced, and scratched at exactly entry (+0.00R) — but
+the report printed **no** `SL→break-even` line, so it read as "BE never moved."
+Break-even was in fact working (the +0.00R scratch IS the moved stop); the
+**annotation** was silently missing.
+
+**Root cause.** `engine/src/simulator.rs` had two functions that must agree on
+the trade's stop level: `simulate_fill_windowed` (the fill/exit sim) and
+`breakeven_armed_at` (the report's SL→break-even annotator). Commit `13d3469`
+(2026-07-01 — itself the previous break-even fix) added the SL-vs-spread floor
+(`apply_entry_spread_floor`, which *widens* the stop to 10× spread) to
+`simulate_fill_windowed` **only**. `breakeven_armed_at` kept walking the candle
+path against the tighter *un-floored* signed SL. When a wick dipped between the
+signed SL and the wider floored SL, `breakeven_armed_at` falsely concluded
+"stopped out before arming" → returned `None` → the line vanished, while the sim
+(on the wider stop) correctly armed BE and scratched at entry. Same root
+divergence as `13d3469` fixed for the *outcome*; this is its second symptom on
+the *report* side.
+
+**What changed.** Both functions now obtain their `Resolved` bracket
+exclusively through a new shared `resolve_effective_bracket()` — the single
+place the entry-decision gates (level-veto, spread-blackout) and the SL-spread
+floor are applied. The floored stop lives in one place, so the fill path and the
+report path can never again walk against different levels. As a side-effect,
+`breakeven_armed_at` now also correctly returns `None` on a level-veto /
+spread-blackout entry (previously it ignored those), matching the sim.
+
+**Breaking.** `breakeven_armed_at` gains an `entry_spread_price: Option<f64>`
+parameter (the same trailing-mean the report already feeds
+`simulate_fill_windowed`).
+
+**Config.** None.
+
+**Tests.** New `breakeven_armed_at_applies_the_sl_spread_floor` reproduces the
+exact wick-between-stops case (verified to fail without the fix, pass with it).
+All 133 engine + 356 CLI tests green.
+
+**Follow-up.** None — the shared helper is the durable fix for this class of
+"two copies of a decision drift apart."
+
 ## v79 — 2026-07-10 — multi-shot QM re-entry advances to the next confirmed signal
 
 **Why.** A strategy-v2 QM enter (`09-enter-qm`, `needs_confirmed: true`,
