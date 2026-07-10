@@ -176,7 +176,18 @@ pub struct Args {
     /// `--replace` a re-arm leaves the old plan ticking until its TTL.)
     ///
     /// `--update` is a deprecated alias for `--replace` (same behaviour).
-    #[arg(long, visible_alias = "update", num_args = 0..=1, default_missing_value = "")]
+    ///
+    /// `--replace` is **not** a boolean: its value (when given) is a trade_id,
+    /// so `--replace=true` / `--replace=false` are rejected with a hint to use
+    /// bare `--replace`. Otherwise `=true` would be silently taken as
+    /// "delete the plan whose id is `true`" — a no-such-plan worker 400.
+    #[arg(
+        long,
+        visible_alias = "update",
+        num_args = 0..=1,
+        default_missing_value = "",
+        value_parser = parse_replace_target
+    )]
     pub replace: Option<String>,
 
     /// Register the plan in **observe-only (shadow) mode**: the server-side
@@ -592,6 +603,22 @@ impl Args {
     }
 }
 
+/// Value parser for `--replace <trade-id>`. Rejects the boolean-looking
+/// literals `true` / `false` so `--replace=true` (a common "it's a flag, so
+/// =true means yes" reflex) fails loudly instead of being taken as a trade_id
+/// of `"true"` — which the worker can't find and 400s on. Any other value
+/// (including a real trade_id) passes through verbatim.
+fn parse_replace_target(value: &str) -> Result<String, String> {
+    if matches!(value.trim().to_ascii_lowercase().as_str(), "true" | "false") {
+        return Err(format!(
+            "--replace does not take a boolean; `{value}` looks like one. \
+             Use bare `--replace` to auto-resolve the plan for this instrument, \
+             or `--replace <trade-id>` to target a specific plan."
+        ));
+    }
+    Ok(value.to_string())
+}
+
 /// Entry order type for the strategy-v2 **QM leg** (`09-enter-qm`). Maps to
 /// `cli::EntryMode`; distinct from [`PatternEntry`] only so it can be a
 /// `--qm-entry <value>` value-enum flag (the pattern flags are three booleans).
@@ -645,6 +672,21 @@ mod tests {
         let args =
             Args::try_parse_from(["tv-arm", "--replace", "hs-eurusd-aaaa"]).expect("parse target");
         assert_eq!(args.replace.as_deref(), Some("hs-eurusd-aaaa"));
+    }
+
+    #[test]
+    fn replace_rejects_boolean_looking_values() {
+        // `--replace=true` used to be silently taken as trade_id "true" and
+        // 400'd at the worker. It must now be a parse error, case-insensitively,
+        // for both `true` and `false`.
+        for v in ["true", "false", "TRUE", "False"] {
+            let res = Args::try_parse_from(["tv-arm", &format!("--replace={v}")]);
+            assert!(res.is_err(), "--replace={v} must be rejected");
+        }
+        // A real trade_id that merely contains those substrings still parses.
+        let args = Args::try_parse_from(["tv-arm", "--replace", "hs-truest-aaaa"])
+            .expect("real id parses");
+        assert_eq!(args.replace.as_deref(), Some("hs-truest-aaaa"));
     }
 
     #[test]
