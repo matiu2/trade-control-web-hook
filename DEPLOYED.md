@@ -12,7 +12,7 @@ The system has four independently-versioned parts that must interoperate:
 | **pine** | the alert-emitting Pine script | **manual** paste into TradingView |
 | **tv-arm** | local CLI that arms charts → signed alerts | `cargo install --path tv-arm` |
 | **trade-control** (cli) | local CLI that builds/signs intents | `cargo install --path cli` |
-| **backend** | the Cloudflare Worker (this repo's `src/`) | `wrangler deploy` |
+| **backend** | the native worker (`worker/`, `trade-control-worker`) | `./deploy-{dev,staging}.sh` → systemd `--user` service |
 | **contract** | the signed wire format both speak | bumped only on wire-format change |
 
 The version numbers do **not** move in lockstep — only the **contract**
@@ -21,26 +21,23 @@ message wire format changes.
 
 ## Branch → environment model
 
-| branch | environment | worker name | deploy rule |
+| branch | environment | worker service / port | deploy rule |
 |---|---|---|---|
-| `main` | dev | `trade-control-web-hook-dev` | deploy freely |
-| `staging` | staging (demo account) | `trade-control-web-hook-staging` | deploy freely; must run **1 week unchanged + profitable** to promote |
-| `prod` | prod (live account, later) | `trade-control-web-hook-prod` | only promoted-from-staging code |
+| `main` | dev | `trade-control-worker-dev` (:8787) | deploy freely |
+| `staging` | staging (demo account) | `trade-control-worker-staging` (:8788) | deploy freely; must run **1 week unchanged + profitable** to promote |
+| `prod` | prod (live account, later) | `trade-control-worker-prod` | only promoted-from-staging code; not stood up yet |
 
-**Every environment carries a suffix** (`-dev` / `-staging` / `-prod`). The
-old no-suffix worker `trade-control-web-hook` + R2 `trade-control-recording`
-are deprecated — left running only until last week's demo trades are
-journaled, then deleted. The dev R2 bucket is now `trade-control-recording-dev`.
+**Every environment carries a suffix** (`-dev` / `-staging` / `-prod`) on both
+its CLIs and its worker binary/service. Each is a LOCAL native/Postgres worker
+(Cloudflare fully retired): one Postgres server (`:5432`), one database + worker
+process per env. `./deploy-{dev,staging}.sh` (branch-guarded) rebuild + install
+the suffixed CLIs and roll the matching `trade-control-worker-<suffix>` systemd
+`--user` service. There is no `wrangler`, no KV, no R2.
 
-Each branch carries its own `wrangler.toml` (own worker name, KV
-namespace, R2 bucket) so a plain `wrangler deploy` on a branch targets
-that environment — no `--env` flag to forget. Isolation is total: separate
-worker, separate KV, separate R2.
-
-**Promotion (staging → prod), Mondays:** if staging ran a full week with
-no code changes and turned a profit, merge `staging` → `prod`, set the
-prod `wrangler.toml` pointers, deploy prod, then cut a fresh `staging`
-from `main` carrying the week's accumulated changes.
+**Promotion (staging → prod):** if staging ran a full week with no code changes
+and turned a profit, merge `staging` → `prod`, stand up the prod worker (its own
+port + Postgres DB, or the Oracle DSN once OKE compute lands), deploy it, then
+cut a fresh `staging` from `main` carrying the week's accumulated changes.
 
 ---
 

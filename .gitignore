@@ -1,6 +1,4 @@
 target/
-.wrangler/
-.dev.vars
 scripts/__pycache__/
 scripts/tmp.json
 # replay-candles disk cache (transient; candles are frozen into replay-fixtures/ instead)
@@ -13,7 +11,6 @@ candle_cache/
 *.log.json
 logs.json
 7-days.log.json
-wrangler.log
 tradenation-instruments.json
 nzd-chf-replay.txt
 dell
@@ -24,6 +21,3 @@ dell
 .claude/trade-calendar-maker
 TODO-bug015-ttl-and-purge.md
 TODO-track-D-candle-cache-wasm-kv.md
-
-# temp Cloudflare-dev R2 recovery tool + venv + object backups (2026-07)
-/cf-dev-export/

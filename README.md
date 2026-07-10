@@ -2365,6 +2365,11 @@ V1 supports TradeNation accounts only; OANDA adoption returns 501
 
 ## KV namespace
 
+> **Historical (Cloudflare-era).** The native worker stores this state as
+> Postgres rows, not Cloudflare KV — there is no namespace to create and no
+> `wrangler.toml`. See the runtime banner at the top of this README. The rest of
+> this section describes the retired KV mechanism and is kept for reference.
+
 The worker uses Cloudflare KV for replay protection and instrument cooldowns.
 Create the namespace once and paste its id into `wrangler.toml` under the
 `TRADE_CONTROL_KV` binding:
@@ -2441,24 +2446,21 @@ the authoritative per-entry TTL keys (`veto:…`, `cooldown:…`) are untouched.
 
 ## Deploy
 
-There are three environments, one per git branch, each an isolated worker
-(own name, KV namespace, R2 bucket). The branch carries its own
-`wrangler.toml`, so a plain `wrangler deploy` on a branch targets that
-environment. See `DEPLOYED.md` for the full branch → environment model and
-the staging → prod promotion rule.
+Each environment is a **local native/Postgres worker** (`trade-control-worker`),
+one per git branch, each with its own bind port + Postgres database + systemd
+`--user` service. Cloudflare is fully retired — no `wrangler`, no KV, no R2. See
+`DEPLOYED.md` for the full branch → environment model and the staging → prod
+promotion rule.
 
-**Every environment carries a suffix** (`-dev` / `-staging` / `-prod`). The
-old no-suffix worker `trade-control-web-hook` + its R2 bucket
-`trade-control-recording` are deprecated — kept running only until last
-week's demo trades are journaled, then deleted. Do not deploy to them.
+**Every environment carries a suffix** (`-dev` / `-staging` / `-prod`) on both
+its CLIs and its worker service (`trade-control-worker-<suffix>`).
 
-Use the per-environment deploy script — **never** call `wrangler deploy`
-directly for a real deploy, because the scripts also rebuild and install
-the matching CLIs:
+Use the per-environment deploy script (they are branch-guarded, rebuild +
+install the matching suffixed CLIs, and roll the worker service):
 
 ```sh
-git checkout main    && ./deploy-dev.sh       # dev     -> trade-control-web-hook-dev
-git checkout staging && ./deploy-staging.sh   # staging -> trade-control-web-hook-staging
+git checkout main    && ./deploy-dev.sh       # dev     -> :8787, trade-control-worker-dev
+git checkout staging && ./deploy-staging.sh   # staging -> :8788, trade-control-worker-staging
 # ./deploy-live.sh is added at the first prod promotion.
 ```
 
@@ -2466,16 +2468,18 @@ Each script:
 
 1. **Asserts the branch** matches the environment (won't let you deploy
    staging code to the dev worker).
-2. `wrangler deploy`s the worker.
-3. Rebuilds `trade-control`, `tv-arm`, `tv-news` with
+2. Rebuilds `trade-control`, `tv-arm`, `tv-news` with
    `TRADE_CONTROL_WEBHOOK` set so each binary **bakes that environment's
    worker URL** as its compiled-in default endpoint (`build.rs` →
    `BAKED_WEBHOOK`).
-4. Installs the binaries into `~/.cargo/bin` under **suffixed names** —
+3. Installs the CLIs into `~/.cargo/bin` under **suffixed names** —
    `trade-control-staging`, `tv-arm-staging`, `tv-news-staging` (and the
    `-dev` set). So you pick an environment by which command you run; no env
    var to set. The worker URL each `tv-arm-<env>` registers its `TradePlan`
    against is baked in the same way.
+4. Rebuilds `trade-control-worker`, installs it to
+   `~/.local/bin/trade-control-worker-<suffix>`, and restarts the matching
+   systemd `--user` service so the deploy rolls the running process too.
 
 `deploy-lib.sh` holds the shared logic; the per-env wrappers hold only the
 branch + URL (one place each), so standing up a new environment (e.g. the

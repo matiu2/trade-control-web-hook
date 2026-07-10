@@ -11,15 +11,19 @@
 # local install side-effects — every step is idempotent):
 #   1. Assert we're on the branch that owns this environment (guards
 #      against deploying staging code to the dev worker, or vice versa).
-#   2. `wrangler deploy` the worker (wrangler.toml on the branch already
-#      points at the right worker name / KV / R2).
-#   3. Build the CLIs with TRADE_CONTROL_WEBHOOK set so each webhook-talking
+#   2. Build the CLIs with TRADE_CONTROL_WEBHOOK set so each webhook-talking
 #      binary bakes this environment's URL as its compiled-in default endpoint
 #      (build.rs → BAKED_WEBHOOK; see cli/build.rs and tv-arm/build.rs).
-#   4. Copy the freshly-built binaries into ~/.cargo/bin under their
+#   3. Copy the freshly-built binaries into ~/.cargo/bin under their
 #      suffixed names (trade-control-staging, tv-arm-staging, …). The
 #      binary is identical bar the baked URL; the suffix is how you pick
 #      an environment from the shell.
+#   4. Rebuild + install the native worker binary and restart its systemd
+#      user service so the deploy rolls the running process, not just the CLIs.
+#
+# Every env is a LOCAL native/Postgres worker (Cloudflare fully retired). There
+# is no `wrangler deploy` — the worker is a long-running local process managed
+# by its systemd --user unit.
 #
 # This is a Cargo *workspace* (root Cargo.toml lists cli/tv-arm/tv-news as
 # members), so one `cargo build --release` produces every binary into the
@@ -54,7 +58,7 @@ CLI_BINARIES=(trade-control tv-arm tv-news replay-candles)
 #
 # Build the native worker, install it to the per-env stable path, and restart
 # the matching systemd user service so the deploy rolls the running process,
-# not just the CLIs. Called only for native envs.
+# not just the CLIs.
 #
 # The service name matches the binary suffix: trade-control-worker-<suffix>.
 # If that unit isn't installed on this host (e.g. a fresh checkout that hasn't
@@ -96,23 +100,21 @@ roll_native_worker() {
   fi
 }
 
-# deploy_env <env-name> <required-branch> <webhook-url> <suffix> [worker-kind]
+# deploy_env <env-name> <required-branch> <webhook-url> <suffix>
 #
-# A 5th arg of "native" marks a LOCAL native/Postgres-worker environment: it
-# skips `wrangler deploy` and the wrangler.toml host-check entirely, because the
-# worker is a long-running local process managed outside this script, not a
-# Cloudflare deploy. Anything else (or unset) keeps the Cloudflare path.
-# (Both dev and staging are native now; the Cloudflare path is retained only
-# until the last Cloudflare env is gone.)
+# Every environment is a LOCAL native/Postgres worker (Cloudflare retired). The
+# worker is a long-running local process managed by its systemd --user unit, so
+# there is nothing to `wrangler deploy`; this bakes+installs the suffixed CLIs
+# and rolls the worker service.
 deploy_env() {
-  local env_name="$1" req_branch="$2" webhook="$3" suffix="$4" worker_kind="${5:-cloudflare}"
+  local env_name="$1" req_branch="$2" webhook="$3" suffix="$4"
 
   cd "$REPO_ROOT"
 
   echo "==> [$env_name] target worker URL: $webhook"
 
-  # 1. Branch guard. The branch carries the wrangler.toml that names the
-  #    worker, so deploying from the wrong branch would hit the wrong env.
+  # 1. Branch guard — each branch owns one environment, so deploying from the
+  #    wrong branch would roll the wrong env's worker + CLIs.
   local cur_branch
   cur_branch="$(git rev-parse --abbrev-ref HEAD)"
   if [[ "$cur_branch" != "$req_branch" ]]; then
@@ -121,27 +123,9 @@ deploy_env() {
     exit 1
   fi
 
-  # 2. Deploy the worker — Cloudflare only. A native env's worker is a local
-  #    process (see the local-worker launch recipe), so there's nothing to
-  #    `wrangler deploy`; this script just bakes+installs its CLIs.
-  if [[ "$worker_kind" == "native" ]]; then
-    echo "==> [$env_name] native/local worker — skipping wrangler deploy"
-    echo "    (the worker on ${webhook} is a local process managed outside this script)"
-  else
-    # Sanity: the branch's wrangler.toml worker name should match the URL host.
-    local worker_name expected_host
-    worker_name="$(grep -E '^name *= *"' wrangler.toml | head -1 | sed -E 's/^name *= *"([^"]+)".*/\1/')"
-    expected_host="${webhook#https://}"; expected_host="${expected_host%%.*}"
-    if [[ "$worker_name" != "$expected_host" ]]; then
-      echo "WARN: wrangler.toml worker name '$worker_name' != webhook host '$expected_host'." >&2
-      echo "      Deploying anyway, but double-check the URL in deploy-$suffix.sh." >&2
-    fi
+  echo "==> [$env_name] native/local worker on ${webhook} (managed by its systemd unit)"
 
-    echo "==> [$env_name] wrangler deploy"
-    wrangler deploy
-  fi
-
-  # 3. Build all CLIs with this environment's webhook baked in
+  # 2. Build all CLIs with this environment's webhook baked in
   #    (build.rs → BAKED_WEBHOOK).
   echo "==> [$env_name] building CLIs with TRADE_CONTROL_WEBHOOK=$webhook"
   local pkg_args=()
@@ -152,7 +136,7 @@ deploy_env() {
   TRADE_CONTROL_WEBHOOK="$webhook" \
     cargo build --release "${pkg_args[@]}"
 
-  # 4. Install suffixed copies into ~/.cargo/bin.
+  # 3. Install suffixed copies into ~/.cargo/bin.
   mkdir -p "$CARGO_BIN"
   local bin dest
   for bin in "${CLI_BINARIES[@]}"; do
@@ -161,15 +145,11 @@ deploy_env() {
     echo "==> [$env_name] installed $dest"
   done
 
-  # 5. Native envs: rebuild + install the worker binary and restart its systemd
-  #    user service. Cloudflare envs skip this (their worker is `wrangler
-  #    deploy`d above). We're on localhost for the foreseeable future, so a
-  #    deploy should roll the whole env — binary AND running process — not just
+  # 4. Rebuild + install the worker binary and restart its systemd user service,
+  #    so a deploy rolls the whole env — binary AND running process — not just
   #    the CLIs. The per-suffix binary path + per-suffix unit keep dev and
   #    staging isolated (see WORKER_BIN_DIR above).
-  if [[ "$worker_kind" == "native" ]]; then
-    roll_native_worker "$env_name" "$suffix"
-  fi
+  roll_native_worker "$env_name" "$suffix"
 
   echo "==> [$env_name] done. Shell commands now available:"
   for bin in "${CLI_BINARIES[@]}"; do

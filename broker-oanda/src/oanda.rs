@@ -7,8 +7,6 @@ use oanda_client::orders::{
 };
 use oanda_client::positions::ClosePositionResponse;
 use oanda_client::trades::{Trade, TradeQueryParams, TradeState};
-#[cfg(target_arch = "wasm32")]
-use worker::Env;
 
 use crate::fx::{quote_currency, resolve_quote_to_account_rate};
 use crate::risk;
@@ -23,46 +21,15 @@ use trade_control_core::intent::{Direction, ResolvedEntry, RiskBudget};
 /// per-fire round-trip cheap.
 const CLOSED_TRADE_SCAN_COUNT: i32 = 50;
 
-#[cfg(target_arch = "wasm32")]
-const OANDA_API_KEY: &str = "OANDA_API_KEY";
 pub const OANDA_ACCOUNT_ID: &str = "OANDA_ACCOUNT_ID";
-#[cfg(target_arch = "wasm32")]
-const OANDA_LIVE: &str = "OANDA_LIVE";
 
-/// Parse the worker-global `OANDA_LIVE` secret into a live/practice flag.
-/// Absent / non-`true` → practice. Pure so the parsing is unit-testable
-/// without a Worker `Env`.
-#[cfg(any(target_arch = "wasm32", test))]
+/// Parse an `OANDA_LIVE`-style secret string into a live/practice flag.
+/// Absent / non-`true` → practice. Pure so the parsing is unit-testable.
+/// Retained for its unit tests; the native runtime derives live/practice from
+/// each account's `kind` rather than a global secret.
+#[cfg(test)]
 pub(super) fn live_flag_from_secret(raw: Option<String>) -> bool {
     raw.map(|s| s.to_lowercase() == "true").unwrap_or(false)
-}
-
-/// Log in to oanda using the worker-global `OANDA_LIVE` secret to pick
-/// practice vs live. Used by the legacy global path (`account: None`).
-/// If it can't, it'll log the error and give you nothing.
-#[cfg(target_arch = "wasm32")]
-pub async fn login(env: &Env) -> Option<OandaClient> {
-    let live = live_flag_from_secret(super::get_secret(OANDA_LIVE, env));
-    login_with_live(env, live).await
-}
-
-/// Like [`login`] but the caller supplies the live/practice flag
-/// directly — e.g. derived from a named account's `kind` so each account
-/// hits its own OANDA environment regardless of the global `OANDA_LIVE`.
-#[cfg(target_arch = "wasm32")]
-pub async fn login_with_live(env: &Env, live: bool) -> Option<OandaClient> {
-    let api_key = match super::get_secret(OANDA_API_KEY, env) {
-        Some(s) => s,
-        None => {
-            tracing::error!("missing required secret: {OANDA_API_KEY}");
-            return None;
-        }
-    };
-    Some(if live {
-        OandaClient::new_live(api_key)
-    } else {
-        OandaClient::new(api_key)
-    })
 }
 
 /// Closes all positions for a selected instrument. Returns true if any positions were closed;

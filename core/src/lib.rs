@@ -1,9 +1,9 @@
 //! Shared, broker-agnostic logic for the trade-control web hook.
 //!
-//! Everything in this crate is pure data + wasm-friendly — no `worker`
-//! crate, no broker SDKs, no filesystem. The root crate (the Cloudflare
-//! Worker binary) pulls these in and wires them up to the CF-specific bits
-//! (KV state store, `#[event(fetch)]` entry point, broker dispatch).
+//! Everything in this crate is pure data — no broker SDKs, no filesystem, no
+//! runtime coupling. The native worker (`trade-control-worker`) and the offline
+//! replay CLI both link this crate and wire it up to their concrete bits
+//! (the Postgres `StateStore`, the axum receiver, broker dispatch).
 
 pub mod account;
 pub mod allow_close_gate;
