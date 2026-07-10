@@ -1,5 +1,43 @@
 # Changelog
 
+## v82 — 2026-07-11 — drop drawn `retest` trendlines; the neckline always serves the retest
+
+**Why.** A USD/ZAR iH&S journaling replay (arm `--start 2026-07-06 18:00`) never
+fired the expected retest. Root cause: a stale `retest` trendline left on the
+chart from a **May** setup was classified and won the retest slot. Extrapolated
+forward with `extend_forward`, its May slope put the line at ~15.95–16.01 during
+the July window — ~2000 pips *below* price (~16.25–16.41). `04-prep-retest` is a
+`dir=down intrabar` cross, so it could never fire; the enter never became
+eligible and the plan ran out at `01-veto-too-high`. The break-and-close line
+(correctly July-anchored) was unaffected, which is why only the retest broke.
+
+**What changed.**
+- **Drawn `retest`/`neckline-retest`/`retrace` trendlines are no longer
+  honoured.** `classify` (`tv-arm/src/roles.rs`) matches them and
+  **log-and-ignores** (a `debug!` breadcrumb, not silent) instead of pushing
+  them into a retest-candidate pool.
+- **The retest role always reuses the resolved neckline** (`break_and_close`).
+  The retest *is* a cross back through the same neckline (opposite direction,
+  intrabar), so there was never a reason for separate geometry. Removed
+  `resolve_retest` and its `pick_slot`/`--start` path entirely — `roles.retest =
+  break_and_close.clone()`.
+- **Docs:** README §"draw the setup" and the `04-prep-retest` row updated from
+  "still honoured but deprecated" to "ignored".
+
+**Breaking.** A chart that *relied* on a hand-drawn retest line with geometry
+different from the neckline will now use the neckline instead. This is the
+intended fix — such a line was almost always a stale leftover. Charts that draw
+only the neckline (the documented flow) are unchanged.
+
+**Tests.** `a_drawn_retest_line_is_ignored_neckline_wins` (flipped from the old
+"honoured/deprecated" test), new `stale_retest_line_before_start_does_not_win_over_neckline`
+(the USD/ZAR shape under `--start`), and `classifies_full_short_h_and_s_chart`
+now asserts the retest reuses the neckline. Full tv-arm suite green (219).
+
+**Follow-up.** The legacy Python `scripts/tv_arm_hs.py` still classifies drawn
+retest lines; it's superseded by the Rust `tv-arm` and not on the live path, so
+left as-is.
+
 ## v81 — 2026-07-11 — arm-time datetime + news-sentiment journalling on the plan
 
 **Why.** No way to read back *when* a plan was armed, nor the news picture at
