@@ -1406,6 +1406,20 @@ fn parse_start(args: &Args) -> Result<Option<i64>> {
     Ok(Some(ts.with_timezone(&Utc).timestamp()))
 }
 
+/// The instant a plan should be recorded as armed at.
+///
+/// When `--start` (the journaling replay cursor, `replay_start` as a Unix
+/// second) is given, the plan is recorded *as if* it were armed at that
+/// moment — so a replayed arming reads back the historical time, and the
+/// arm-time news sentiment is computed as of that point. Otherwise it's the
+/// real wall-clock `now`. A `replay_start` that can't be represented as a
+/// `DateTime` (out-of-range) falls back to `now` rather than failing arming.
+fn effective_arm_time(replay_start: Option<i64>, now: DateTime<Utc>) -> DateTime<Utc> {
+    replay_start
+        .and_then(|s| DateTime::<Utc>::from_timestamp(s, 0))
+        .unwrap_or(now)
+}
+
 /// Pick the as-of time used to prune already-elapsed control pairs.
 ///
 /// - `--register-plan` (live arm): always wall-clock `now`. A genuinely stale
@@ -1929,6 +1943,11 @@ fn register_trade_plan(
              cannot register a server-side plan (supported: 1/5/15/60/240/D)"
         )
     })?;
+    // Effective arm time: when `--start` (journaling replay) is given, record
+    // the plan *as if* it were armed at that cursor, not at the wall-clock run
+    // time — so a replayed arming reads back the historical moment. Otherwise
+    // use the real `now`.
+    let armed_at = effective_arm_time(replay_start, now);
     let mut plan = build_trade_plan(
         &built_trade.trade_id,
         &built_trade.instrument,
@@ -1940,6 +1959,7 @@ fn register_trade_plan(
         shadow,
         replay_start,
         retest_atr_step,
+        armed_at,
     );
     // Unwrap the tv-arm bundle wrappers to the cli `BuiltPause`/`BuiltNews` the
     // appender reads (each carries the signed intents + window times).
@@ -2022,6 +2042,22 @@ mod tests {
 
     fn now() -> DateTime<Utc> {
         "2026-06-08T00:00:00Z".parse().unwrap()
+    }
+
+    #[test]
+    fn effective_arm_time_uses_wallclock_without_start() {
+        // No `--start` → the plan is armed at the real run time.
+        assert_eq!(effective_arm_time(None, now()), now());
+    }
+
+    #[test]
+    fn effective_arm_time_uses_start_cursor_when_given() {
+        // `--start` present → record the plan as if armed at that historical
+        // cursor, not the wall-clock run time.
+        let cursor = Utc.with_ymd_and_hms(2026, 5, 1, 9, 30, 0).unwrap();
+        let armed = effective_arm_time(Some(cursor.timestamp()), now());
+        assert_eq!(armed, cursor);
+        assert_ne!(armed, now());
     }
 
     fn wallclock(at: DateTime<Utc>) -> AsOf {
@@ -2567,6 +2603,7 @@ mod tests {
             false,
             None,
             trade_control_core::trade_plan::DEFAULT_RETEST_ATR_STEP,
+            chrono::Utc::now(),
         )
     }
 

@@ -77,11 +77,14 @@ pub fn resolution_to_granularity(resolution: &str) -> Option<Granularity> {
 //   (`tv-arm --retest-atr-step`, default
 //   [`DEFAULT_RETEST_ATR_STEP`](trade_control_core::trade_plan::DEFAULT_RETEST_ATR_STEP)),
 //   baked onto the plan's `retest_atr_step`.
+// - `armed_at` is the arm-time wall-clock (`Utc::now()` from the pipeline),
+//   baked onto the plan for read-back only (see
+//   [`TradePlan::armed_at`](trade_control_core::trade_plan::TradePlan::armed_at)).
 //
-// Ten parameters: each is a distinct chart-derived primitive (id, instrument,
+// Eleven parameters: each is a distinct chart-derived primitive (id, instrument,
 // alerts, direction, roles, granularity, is_mw, shadow, replay_start,
-// retest_atr_step) threaded once from the single pipeline call site. Grouping
-// them into a struct would just move the same fields elsewhere without
+// retest_atr_step, armed_at) threaded once from the single pipeline call site.
+// Grouping them into a struct would just move the same fields elsewhere without
 // clarifying anything.
 #[allow(clippy::too_many_arguments)]
 pub fn build_trade_plan(
@@ -95,6 +98,7 @@ pub fn build_trade_plan(
     shadow: bool,
     replay_start: Option<i64>,
     retest_atr_step: f64,
+    armed_at: chrono::DateTime<chrono::Utc>,
 ) -> TradePlan {
     let rules = alerts
         .iter()
@@ -112,6 +116,7 @@ pub fn build_trade_plan(
         cross_buffer_pct: trade_control_core::trade_plan::DEFAULT_CROSS_BUFFER_PCT,
         retest_atr_step,
         replay_start,
+        armed_at: Some(armed_at),
     }
 }
 
@@ -658,6 +663,7 @@ mod tests {
             false,
             None,
             trade_control_core::trade_plan::DEFAULT_RETEST_ATR_STEP,
+            chrono::Utc::now(),
         );
 
         assert!(!plan.shadow, "default build is live, not shadow");
@@ -755,6 +761,7 @@ mod tests {
             false,
             None,
             trade_control_core::trade_plan::DEFAULT_RETEST_ATR_STEP,
+            chrono::Utc::now(),
         );
 
         let by_id = |id: &str| plan.rules.iter().find(|r| r.rule_id == id).unwrap();
@@ -802,6 +809,7 @@ mod tests {
             false,
             None,
             trade_control_core::trade_plan::DEFAULT_RETEST_ATR_STEP,
+            chrono::Utc::now(),
         );
 
         // This is exactly what `register_trade_plan` writes for `--plan-out`.
@@ -868,6 +876,7 @@ mod tests {
             false,
             None,
             trade_control_core::trade_plan::DEFAULT_RETEST_ATR_STEP,
+            chrono::Utc::now(),
         );
         let by_id = |id: &str| plan.rules.iter().find(|r| r.rule_id == id).unwrap();
 
@@ -915,6 +924,7 @@ mod tests {
             false,
             None,
             trade_control_core::trade_plan::DEFAULT_RETEST_ATR_STEP,
+            chrono::Utc::now(),
         );
         assert!(plan.rules.is_empty());
     }
@@ -935,6 +945,7 @@ mod tests {
             true,
             None,
             trade_control_core::trade_plan::DEFAULT_RETEST_ATR_STEP,
+            chrono::Utc::now(),
         );
         assert!(plan.shadow, "shadow=true must reach the built plan");
     }
@@ -954,6 +965,7 @@ mod tests {
             false,
             None,
             0.2,
+            chrono::Utc::now(),
         );
         assert!(
             (custom.retest_atr_step - 0.2).abs() < 1e-9,
@@ -972,6 +984,7 @@ mod tests {
             false,
             None,
             trade_control_core::trade_plan::DEFAULT_RETEST_ATR_STEP,
+            chrono::Utc::now(),
         );
         assert!(
             (defaulted.retest_atr_step - 0.075).abs() < 1e-9,
@@ -1039,6 +1052,7 @@ mod tests {
             false,
             None,
             trade_control_core::trade_plan::DEFAULT_RETEST_ATR_STEP,
+            chrono::Utc::now(),
         );
         assert_eq!(plan.rules.len(), 1, "just the enter before appending");
 

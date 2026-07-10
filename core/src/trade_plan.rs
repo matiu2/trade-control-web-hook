@@ -39,6 +39,7 @@
 //! [`Once`]: FireMode::Once
 //! [`EveryBar`]: FireMode::EveryBar
 
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 pub use trade_control_conventions::RuleKind;
 
@@ -151,6 +152,16 @@ pub struct TradePlan {
     /// it out of the JSON entirely then, so pre-field plans round-trip unchanged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub replay_start: Option<i64>,
+    /// Wall-clock instant this plan was armed by `tv-arm` (`Utc::now()` at
+    /// arm time). Baked so the arming datetime can be read back later from
+    /// the plan — a journaling aid only. The worker/engine does **not** act
+    /// on it (it never gates or schedules off `armed_at`). `None` for plans
+    /// registered before this field existed; `#[serde(skip_serializing_if)]`
+    /// keeps it out of the JSON entirely then, so pre-field plans round-trip
+    /// unchanged. Nested inside the whole-`TradePlan` signed line (like
+    /// `replay_start`), so it adds no new top-level signed key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub armed_at: Option<DateTime<Utc>>,
 }
 
 /// One condition + the intent it fires. The engine evaluates [`trigger`] each
@@ -488,6 +499,35 @@ bar: on_close
             Some(1781208000),
             "must survive a round-trip"
         );
+    }
+
+    /// A plan with no `armed_at` deserializes to `None` and re-serializes
+    /// without the key, so plans registered before the field round-trip clean.
+    #[test]
+    fn missing_armed_at_defaults_to_none_and_is_omitted() {
+        let json = r#"{"trade_id":"t-1","instrument":"EUR_USD","direction":"short",
+            "granularity":"h1","pip_size":0.0001,"rules":[]}"#;
+        let plan: TradePlan = serde_json::from_str(json).unwrap();
+        assert_eq!(plan.armed_at, None);
+        let out = serde_json::to_string(&plan).unwrap();
+        assert!(
+            !out.contains("armed_at"),
+            "None armed_at must be skipped in the JSON, got: {out}"
+        );
+    }
+
+    /// A baked `armed_at` (the arm-time datetime `tv-arm` records) survives a
+    /// round-trip.
+    #[test]
+    fn armed_at_round_trips() {
+        let json = r#"{"trade_id":"t-1","instrument":"EUR_USD","direction":"short",
+            "granularity":"h1","pip_size":0.0001,"rules":[],
+            "armed_at":"2026-05-01T09:30:00Z"}"#;
+        let plan: TradePlan = serde_json::from_str(json).unwrap();
+        let expected = "2026-05-01T09:30:00Z".parse::<DateTime<Utc>>().unwrap();
+        assert_eq!(plan.armed_at, Some(expected));
+        let back: TradePlan = serde_json::from_str(&serde_json::to_string(&plan).unwrap()).unwrap();
+        assert_eq!(back.armed_at, Some(expected), "must survive a round-trip");
     }
 
     /// A rule signed before `kind` existed (no `kind` key) deserializes as
