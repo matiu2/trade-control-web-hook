@@ -23,6 +23,7 @@ forex-factory = { git = "https://github.com/matiu2/forex-factory.git", version =
 getrandom = "0.4.2"
 hex = "0.4.3"
 instrument-lookup = { version = "0.3.0", path = "../../instrument-lookup" }
+news-sentiment-tv = { version = "0.1.0", path = "../news-sentiment-tv" }
 oanda-client = { version = "0.2.0", path = "../../oanda-client" }
 reqwest = { version = "^0.12", default-features = false, features = ["rustls-tls", "blocking"] }
 serde = { version = "1.0.228", features = ["derive"] }

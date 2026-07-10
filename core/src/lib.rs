@@ -20,6 +20,7 @@ pub mod intent;
 pub mod ny_clock;
 pub mod pause_gate;
 pub mod plan_eval;
+pub mod plan_sentiment;
 pub mod plan_state;
 pub mod recording;
 pub mod recover_entry;

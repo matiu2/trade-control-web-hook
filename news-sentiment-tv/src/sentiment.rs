@@ -17,8 +17,9 @@ mod rules;
 pub use rules::{EventSentiment, SentimentDirection, analyze_event};
 
 use chrono::{DateTime, Datelike, Local, TimeDelta, Weekday};
+use forex_factory::{EconomicEvent, Impact};
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use trade_control_cli::{EconomicEvent, Impact};
 
 /// Start of the sentiment lookback window relative to `at`.
 ///
@@ -33,7 +34,7 @@ pub fn sentiment_lookback_start(at: DateTime<Local>) -> DateTime<Local> {
 }
 
 /// Overall sentiment analysis result for an instrument.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SentimentAnalysis {
     pub period_start: DateTime<Local>,
     pub period_end: DateTime<Local>,
@@ -43,7 +44,7 @@ pub struct SentimentAnalysis {
 }
 
 /// Sentiment scored for a single currency.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CurrencySentiment {
     pub currency: String,
     pub events: Vec<EventSentiment>,
@@ -91,7 +92,8 @@ impl CurrencySentiment {
 }
 
 /// Confidence label for the overall analysis.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Confidence {
     High,
     Medium,
@@ -403,5 +405,34 @@ mod tests {
         )];
         let a = analyze_sentiment(&ccys(&["EUR", "USD"]), &events, at);
         assert_eq!(a.overall_direction, SentimentDirection::Bullish);
+    }
+
+    #[test]
+    fn serde_round_trip_preserves_analysis() {
+        let at = Local.with_ymd_and_hms(2026, 1, 23, 14, 0, 0).unwrap();
+        let when = Local.with_ymd_and_hms(2026, 1, 23, 10, 0, 0).unwrap();
+        let events = vec![
+            event("EUR", Impact::High, Some("0.8%"), Some("0.5%"), None, when),
+            event(
+                "USD",
+                Impact::Medium,
+                Some("150K"),
+                Some("180K"),
+                None,
+                when,
+            ),
+        ];
+        let a = analyze_sentiment(&ccys(&["EUR", "USD"]), &events, at);
+        let json = serde_json::to_string(&a).unwrap();
+        let back: SentimentAnalysis = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.overall_direction, a.overall_direction);
+        assert_eq!(back.confidence, a.confidence);
+        assert_eq!(back.currency_sentiments.len(), a.currency_sentiments.len());
+        for (k, v) in &a.currency_sentiments {
+            let bv = back.currency_sentiments.get(k).unwrap();
+            assert_eq!(bv.direction, v.direction);
+            assert!((bv.net_score() - v.net_score()).abs() < 1e-9);
+            assert_eq!(bv.events.len(), v.events.len());
+        }
     }
 }

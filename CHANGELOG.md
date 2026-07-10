@@ -1,5 +1,47 @@
 # Changelog
 
+## v81 — 2026-07-11 — arm-time datetime + news-sentiment journalling on the plan
+
+**Why.** No way to read back *when* a plan was armed, nor the news picture at
+that moment. All three additions are journalling/read-back aids — the
+worker/engine never read them and behaviour is unchanged.
+
+**What changed.**
+- **`TradePlan.armed_at: Option<DateTime<Utc>>`** — the instant `tv-arm` armed
+  the plan. When `--start` (the journaling replay cursor) is passed, records
+  *that* historical cursor (arming "as if" at that point); otherwise the real
+  `Utc::now()`. Helper `effective_arm_time(replay_start, now)`. Surfaces on
+  `plan show` verbatim (no CLI change).
+- **`TradePlan.armed_sentiment: Option<PlanSentiment>`** — the news-sentiment
+  verdict as of `armed_at`. A lean, string-typed mirror
+  (`core::plan_sentiment::PlanSentiment`) so `core` stays free of the
+  forex-factory stack. `tv-arm` computes it, prints a summary, and bakes it.
+  Fail-soft: a fetch failure logs a WARN and bakes `None` — arming never blocks.
+- **`replay-candles`** recomputes the same verdict for its window (as of
+  `armed_at` else window start) and prints a `News sentiment (…)` block. It is
+  **not** added to the golden `ReplayOutcome` JSON (kept deterministic).
+- **`news-sentiment-tv` crate** — the sentiment analysis (was private to the
+  `tv-news` binary) extracted into a shared library crate with serde derives,
+  depending directly on the `forex-factory` git dep (not `cli`). `tv-news`,
+  `tv-arm`, `replay-candles` all consume it; one `SentimentAnalysis →
+  PlanSentiment` conversion.
+
+**Breaking.** `build_trade_plan` gained `armed_at` + `armed_sentiment`
+parameters; `report::render` gained a `sentiment` parameter (both internal to
+this repo). `TradePlan` gained two `#[serde(default, skip_serializing_if)]`
+fields — pre-field plans round-trip byte-clean, so no wire break.
+
+**Config.** None. New `tv-news` binary no longer owns the sentiment module.
+
+**Tests.** effective-arm-time (wallclock vs `--start`); `TradePlan` round-trip
++ pre-field `None`-omission for both new fields; `SentimentAnalysis →
+PlanSentiment` sort/mirror; replay report `render_sentiment` (with/without
+events); serde round-trip in `news-sentiment-tv`. Full workspace green
+(tests + clippy + fmt).
+
+**Follow-up.** None required. Sentiment is deliberately out of the golden
+fixture; revisit only if a deterministic sentiment fixture is wanted.
+
 ## v80 — 2026-07-10 — replay's SL→break-even line no longer drops when a wick sits between the signed and floored SL
 
 **Why.** A USD/SGD iH&S replay (`tv-arm --start 2026-07-07T18:00:00+10:00
