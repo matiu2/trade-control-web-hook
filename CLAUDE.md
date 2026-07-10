@@ -42,8 +42,8 @@ database), and the deploy scripts branch-guard so you can't cross wires.
 
 | branch | environment | worker | port | Postgres role / DB | CLIs | who uses it |
 |---|---|---|---|---|---|---|
-| `main` | **dev** | `trade-control-worker` (local) | `8787` | `candle_cache` / `trade_control_dev` | `*-dev` | coding / development |
-| `staging` | **staging (demo)** | `trade-control-worker` (local) | `8788` | `tc_staging` / `trade_control_staging` | `*-staging` | the week's live demo trading |
+| `main` | **dev** | `trade-control-worker` (local) | `8787` | `candle_cache` / `trade_control_dev` | `*-dev` | coding branch; **worker not currently driven** |
+| `staging` | **staging (demo)** | `trade-control-worker` (local) | `8788` | `tc_staging` / `trade_control_staging` | `*-staging` | live demo trading — **updated as we go, no stable freeze yet** |
 | `prod` | **prod (real money)** | — | — | — | `*-prod` | **not stood up yet** — first promotion target (Oracle) |
 
 One local PostgreSQL server (`:5432`), two databases, two worker processes.
@@ -51,10 +51,25 @@ Dev stays on the `candle_cache` role (avoids table-ownership churn); staging
 has a dedicated `tc_staging` role + `trade_control_staging` DB. The suffixed
 CLIs bake their worker URL (`http://127.0.0.1:8787|8788`) at compile time.
 
-Current working split: **trading runs on `staging`** (demo account,
-real-time), **coding happens on `main`**. Treat the `staging` worker as live —
-don't redeploy it casually mid-week, because a week of unchanged + profitable
-running is the promotion gate. Develop on `main`, let it bake on `staging`.
+Current working split (2026-07): **there is no stable staging yet, and `dev`
+is not in use.** We code on `main` and merge to `staging` continuously —
+`staging` is **updated as we go**, redeployed whenever a fix lands. All the
+real work (coding + the live demo worker) happens on `main` → `staging`; the
+`dev` worker exists but nothing is being driven through it right now.
+
+So, for now, **do redeploy `staging` freely** as fixes land — the "don't
+redeploy mid-week" caution below applies only *once the promotion clock has
+started*, which it hasn't. The promotion gate is a **two-stage clock, not yet
+running**:
+
+1. **A week of `staging` with no bugs found.** Keep fixing + redeploying until
+   a full week passes without a new bug surfacing.
+2. **Then a second week with no changes at all.** Only after stage 1 do we
+   freeze `staging` and let it run a full week *unchanged* + profitable. That
+   frozen-and-profitable week is what promotes to `prod`.
+
+Until stage 2 begins, treat `staging` as a fast-moving demo, not a frozen
+release — merge to it and redeploy the moment a fix is green.
 
 **Deploy** with the per-environment scripts (they rebuild + install the
 matching suffixed CLIs and restart the local worker; neither calls `wrangler`):
@@ -106,8 +121,10 @@ binary `trade-control`).
 
 ### Promotion (staging → prod), the upcoming `prod` branch
 
-`prod` doesn't exist yet. The plan: when `staging` has run a full week
-unchanged + profitable, it gets merged into a new `prod` branch with its own
+`prod` doesn't exist yet, and the promotion clock hasn't started (see the
+two-stage gate under "Branches are environments"): first a week of `staging`
+with no bug found, *then* a second week frozen + profitable. When that frozen
+week completes, `staging` gets merged into a new `prod` branch with its own
 worker config (its own port + Postgres database, or the Oracle DSN once Oracle
 compute lands), and a fresh `staging` is cut from `main`. Prod is a clean new
 env with its own worker process + database, *not* a rename of an existing one.
