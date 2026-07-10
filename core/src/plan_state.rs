@@ -83,6 +83,22 @@ pub struct PlanState {
     /// `(break_close_at, entry]`?". `None` until a retest is seen.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retest_seen_at: Option<DateTime<Utc>>,
+    /// Print-time of the signal the **last** `needs_confirmed` (QM) enter fired
+    /// on. The confirmed-first entry scan
+    /// ([`first_confirmed_signal_at`](crate::signals::first_confirmed_signal_at))
+    /// takes this as an **exclusive** lower bound, so a multi-shot QM enter
+    /// re-fires on the *next* confirmed signal after the one it already
+    /// consumed — not forever on the first winner.
+    ///
+    /// Without this the confirmed-first scan is frozen on the earliest confirmed
+    /// signal and only `fires` on its single confirmation bar, so a multi-shot
+    /// QM enter fires exactly once even though the plan stays in
+    /// [`Phase::AwaitEntry`] (the golden-latch enter has no such problem — its
+    /// latch tracks the live signal). Stamped in the engine's
+    /// `evaluate_one_entry` when a multi-shot confirmed enter fires; `None`
+    /// until then, and always `None` for golden-only / single-shot plans.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_confirmed_enter_at: Option<DateTime<Utc>>,
     /// Reserved for M/W neckline-evolution state. **Unused in Stage D** — the
     /// engine delegates all M/W geometry to the existing
     /// `run_enter → maybe_update_mw_state` path (one implementation), so this
@@ -137,6 +153,7 @@ impl PlanState {
             || self.fired != prior.fired
             || self.break_close_at != prior.break_close_at
             || self.retest_seen_at != prior.retest_seen_at
+            || self.last_confirmed_enter_at != prior.last_confirmed_enter_at
             || self.mw != prior.mw
             || self.open_news_windows != prior.open_news_windows
     }
@@ -152,6 +169,7 @@ impl PlanState {
             last_close: BTreeMap::new(),
             break_close_at: None,
             retest_seen_at: None,
+            last_confirmed_enter_at: None,
             mw: None,
             open_news_windows: BTreeSet::new(),
             expires_at,
@@ -218,9 +236,33 @@ mod tests {
         s.last_close.insert("01-veto-too-high".into(), 1.2345);
         s.break_close_at = Some(ts("2026-06-16T11:00:00Z"));
         s.retest_seen_at = Some(ts("2026-06-16T11:30:00Z"));
+        s.last_confirmed_enter_at = Some(ts("2026-06-16T12:00:00Z"));
         let json = serde_json::to_string(&s).unwrap();
         let back: PlanState = serde_json::from_str(&json).unwrap();
         assert_eq!(back, s);
+    }
+
+    #[test]
+    fn last_confirmed_enter_at_elided_when_none() {
+        // The new field is None on golden-only / single-shot plans, so it must
+        // not bloat the serialised row (keeps the idempotent-retick byte-form
+        // stable for every existing plan).
+        let s = PlanState::seed(Phase::AwaitEntry, ts("2026-06-20T00:00:00Z"));
+        let json = serde_json::to_string(&s).unwrap();
+        assert!(
+            !json.contains("last_confirmed_enter_at"),
+            "json was: {json}"
+        );
+    }
+
+    #[test]
+    fn advanced_vs_detects_last_confirmed_enter_stamp() {
+        // Stamping the QM re-entry watermark is a meaningful advance (a fresh
+        // confirmed enter fired), so a recording driver must not trim it.
+        let prior = prior_state();
+        let mut next = prior.clone();
+        next.last_confirmed_enter_at = Some(ts("2026-06-16T12:00:00Z"));
+        assert!(next.advanced_vs(&prior));
     }
 
     // ===== advanced_vs: meaningful-state comparison (the trim predicate) =====

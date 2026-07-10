@@ -85,6 +85,15 @@ pub struct LatchedSignal {
     pub signal_low: f64,
     pub signal_range: f64,
     pub signal_start_time: DateTime<Utc>,
+    /// Open-time of the **print bar** (bar `N`) — the bar the signal was
+    /// detected on. Distinct from [`signal_start_time`](Self::signal_start_time),
+    /// which is the pattern's earliest *covered* bar (`N-1` for 2-bar kinds). The
+    /// engine's confirmed-first re-entry watermark
+    /// ([`PlanState::last_confirmed_enter_at`](crate::plan_state::PlanState::last_confirmed_enter_at))
+    /// stores this exact value so the next scan's `after` bound excludes the
+    /// consumed signal precisely (the scan filters on the print bar's time, so a
+    /// watermark of `start_time` would be one bar early for 2-bar patterns).
+    pub signal_bar_time: DateTime<Utc>,
     pub golden: bool,
     pub signal_confirmed: bool,
     /// ATR at the as-of bar (the value Pine latches as `atr`).
@@ -237,6 +246,7 @@ pub fn latched_signal_at(
         signal_low: latch.low,
         signal_range: latch.range,
         signal_start_time: latch.start_time,
+        signal_bar_time: candles[signal_bar].time,
         golden: latch.golden,
         signal_confirmed: latch.confirmed,
         atr: latch.atr,
@@ -294,6 +304,15 @@ pub fn latched_signal_at(
 /// re-evaluation after the confirm bar sees the confirmed signal), but with
 /// `fires = false` on those later bars — the enter fires once, on the
 /// confirmation bar.
+///
+/// `after` is the **exclusive** re-entry watermark: a signal whose print time is
+/// `<= after` cannot win. Where `not_before` is the inclusive setup floor (which
+/// signals belong to *this* setup), `after` is how a multi-shot QM enter skips
+/// the confirmed signal it *already consumed* and advances to the next one. The
+/// engine passes `state.last_confirmed_enter_at` here; `None` = no re-entry
+/// watermark (the first confirmed signal in scope wins, the single-shot / first-
+/// entry case). Both bounds compose: a winner must satisfy `>= not_before` **and**
+/// `> after`.
 pub fn first_confirmed_signal_at(
     candles: &[Candle],
     as_of: usize,
@@ -301,6 +320,7 @@ pub fn first_confirmed_signal_at(
     want_dir: Direction,
     want_kind: Option<SignalKind>,
     not_before: Option<DateTime<Utc>>,
+    after: Option<DateTime<Utc>>,
 ) -> Option<LatchedSignal> {
     if as_of >= candles.len() {
         return None;
@@ -349,7 +369,12 @@ pub fn first_confirmed_signal_at(
                 // signal must not claim the slot (the print time is the signal
                 // bar's candle time).
                 let in_scope = not_before.is_none_or(|floor| candles[t.signal_bar].time >= floor);
-                if freshly_valid && matches && in_scope {
+                // ...and only a signal strictly *after* the re-entry watermark:
+                // a multi-shot QM enter that already fired on an earlier
+                // confirmed signal must advance to the next one, not re-take the
+                // consumed signal forever.
+                let after_watermark = after.is_none_or(|w| candles[t.signal_bar].time > w);
+                if freshly_valid && matches && in_scope && after_watermark {
                     first_confirmed_bar = Some(t.signal_bar);
                     confirmed_on = Some(bar);
                     break;
@@ -391,6 +416,7 @@ pub fn first_confirmed_signal_at(
         signal_low: t.low,
         signal_range: t.range,
         signal_start_time: t.start_time,
+        signal_bar_time: candles[t.signal_bar].time,
         golden: t.golden,
         signal_confirmed: true,
         atr: t.atr,
@@ -713,7 +739,7 @@ mod tests {
         // (110) is the base the entry anchors to — with fires=true on the
         // confirmation bar.
         let candles = two_short_engulfers_first_confirms();
-        let f = first_confirmed_signal_at(&candles, 3, &cfg(), Direction::Short, None, None)
+        let f = first_confirmed_signal_at(&candles, 3, &cfg(), Direction::Short, None, None, None)
             .expect("first-confirmed");
         assert_eq!(f.direction, Direction::Short);
         assert!(f.signal_confirmed, "first signal is confirmed");
@@ -731,12 +757,14 @@ mod tests {
         let candles = two_short_engulfers_first_confirms();
         // bar 2: bar 1 not yet resolved (bars_elapsed = 1) → nothing confirmed.
         assert!(
-            first_confirmed_signal_at(&candles, 2, &cfg(), Direction::Short, None, None).is_none(),
+            first_confirmed_signal_at(&candles, 2, &cfg(), Direction::Short, None, None, None)
+                .is_none(),
             "no confirmation before the window closes"
         );
         // bar 3: confirmed, fires.
-        let at3 = first_confirmed_signal_at(&candles, 3, &cfg(), Direction::Short, None, None)
-            .expect("confirmed at 3");
+        let at3 =
+            first_confirmed_signal_at(&candles, 3, &cfg(), Direction::Short, None, None, None)
+                .expect("confirmed at 3");
         assert!(at3.fires, "fires on confirmation bar");
     }
 
@@ -749,7 +777,8 @@ mod tests {
         // declining, missing the confirmed short entirely).
         let candles = two_short_engulfers_first_confirms();
         assert!(
-            first_confirmed_signal_at(&candles, 3, &cfg(), Direction::Long, None, None).is_none(),
+            first_confirmed_signal_at(&candles, 3, &cfg(), Direction::Long, None, None, None)
+                .is_none(),
             "no confirmed LONG in a short-only window"
         );
     }
@@ -764,8 +793,16 @@ mod tests {
         let candles = two_short_engulfers_first_confirms();
         let floor = candles[2].time; // strictly after the bar-1 signal print
         assert!(
-            first_confirmed_signal_at(&candles, 3, &cfg(), Direction::Short, None, Some(floor))
-                .is_none(),
+            first_confirmed_signal_at(
+                &candles,
+                3,
+                &cfg(),
+                Direction::Short,
+                None,
+                Some(floor),
+                None
+            )
+            .is_none(),
             "a signal printing before the floor can't win"
         );
         // A floor at the signal's own print bar still admits it (>= is inclusive).
@@ -777,10 +814,118 @@ mod tests {
                 &cfg(),
                 Direction::Short,
                 None,
-                Some(floor_incl)
+                Some(floor_incl),
+                None,
             )
             .is_some(),
             "the floor is inclusive of a signal printing exactly at it"
+        );
+    }
+
+    /// A descending staircase of short signals, the multi-shot QM re-entry shape.
+    /// Signal A (bar 1, high 117.5 / low 110) confirms on bar 3. Further short
+    /// signals print lower down the staircase — the next one to confirm after A
+    /// is the bar-4 engulfer (high 112 / low 108), which validates on bar 6. This
+    /// is exactly the live case: after entering + stopping out on A, the plan
+    /// re-enters on the *next* confirmed short, not on A forever.
+    fn descending_short_staircase() -> Vec<Candle> {
+        vec![
+            // bar 0: bearish context for signal A to engulf.
+            k("2026-06-16T09:00:00Z", 120.0, 121.0, 118.0, 118.5),
+            // bar 1: short engulfer A. high 117.5 / low 110.
+            k("2026-06-16T10:00:00Z", 117.0, 117.5, 110.0, 110.5),
+            // bar 2: pushes below A's low (109 < 110) without breaching A's high →
+            // confirming push for A.
+            k("2026-06-16T11:00:00Z", 110.2, 111.0, 109.0, 109.5),
+            // bar 3: A's window-end (elapsed 2) → A validates. Prints no signal.
+            k("2026-06-16T12:00:00Z", 110.0, 111.5, 109.6, 110.8),
+            // bar 4: the next short down the staircase (engulfs bar 3). high 112 /
+            // low 108 — the signal a re-entry should take once A is consumed.
+            k("2026-06-16T13:00:00Z", 111.0, 112.0, 108.0, 108.5),
+            // bar 5: prints its own lower short and pushes below bar-4's low
+            // (100 < 108) without breaching bar-4's high → confirming push for
+            // bar-4.
+            k("2026-06-16T14:00:00Z", 107.0, 107.5, 100.0, 100.5),
+            // bar 6: bar-4's window-end (elapsed 2) → bar-4 validates.
+            k("2026-06-16T15:00:00Z", 100.2, 101.0, 99.0, 99.5),
+        ]
+    }
+
+    #[test]
+    fn after_watermark_advances_to_the_next_confirmed_short() {
+        // The multi-shot QM re-entry fix. Without `after`, the confirmed-first
+        // scan is frozen on signal A forever (fires only on A's one confirmation
+        // bar). With `after` = A's print time, A is excluded and the *next*
+        // confirmed short down the staircase becomes the winner — on its own,
+        // later, confirmation bar.
+        let candles = descending_short_staircase();
+
+        // No watermark: A wins on its confirmation bar (bar 3), fires there, and
+        // never fires again (frozen — the exact multi-shot bug).
+        let a = first_confirmed_signal_at(&candles, 3, &cfg(), Direction::Short, None, None, None)
+            .expect("A confirmed at bar 3");
+        assert!(a.fires, "A fires on its confirmation bar");
+        assert!(
+            (a.signal_high - 117.5).abs() < 1e-9,
+            "A hi {}",
+            a.signal_high
+        );
+        assert_eq!(
+            a.signal_bar_time, candles[1].time,
+            "A's print-bar watermark"
+        );
+        let a_watermark = a.signal_bar_time;
+        // Frozen: at bar 6, still A, no longer firing — this is what starves the
+        // re-entry without the watermark.
+        let frozen =
+            first_confirmed_signal_at(&candles, 6, &cfg(), Direction::Short, None, None, None)
+                .expect("still A at bar 6");
+        assert!((frozen.signal_high - 117.5).abs() < 1e-9);
+        assert!(
+            !frozen.fires,
+            "A no longer fires after its confirmation bar"
+        );
+
+        // With `after` = A's print time, A can no longer win. Before the next
+        // signal confirms (bar 3) → None; on the next signal's confirmation bar
+        // (bar 6) → the next short wins and fires.
+        assert!(
+            first_confirmed_signal_at(
+                &candles,
+                3,
+                &cfg(),
+                Direction::Short,
+                None,
+                None,
+                Some(a_watermark)
+            )
+            .is_none(),
+            "A is excluded by the watermark and no later short has confirmed yet"
+        );
+        let next = first_confirmed_signal_at(
+            &candles,
+            6,
+            &cfg(),
+            Direction::Short,
+            None,
+            None,
+            Some(a_watermark),
+        )
+        .expect("next confirmed short at bar 6");
+        assert!(
+            next.fires,
+            "the next short fires on its own confirmation bar"
+        );
+        // A DIFFERENT signal than A: the bar-4 engulfer (high 112 / low 108),
+        // printing strictly after A.
+        assert!(
+            (next.signal_high - 112.0).abs() < 1e-9,
+            "next hi {}",
+            next.signal_high
+        );
+        assert!(
+            next.signal_bar_time > a_watermark,
+            "next signal prints after A"
         );
     }
 }
