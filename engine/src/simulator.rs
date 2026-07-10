@@ -141,6 +141,93 @@ fn replay_tick(intent: &Intent, pip_size: f64) -> f64 {
     intent.tick_size.unwrap_or(pip_size)
 }
 
+/// Why the effective bracket couldn't be produced — the entry never became a
+/// live position, so both the fill sim and the break-even report treat it as "no
+/// fill". Each variant carries what the caller needs to render its own outcome.
+enum BracketReject {
+    /// `Resolved::from_intent` failed (bad anchors / geometry).
+    Unresolved(String),
+    /// The entry was already past a baked at-entry level veto (Bug #12).
+    LevelVeto(String),
+    /// System-1 spread-blackout rejected the brand-new entry.
+    SpreadBlackout {
+        spread_pips: f64,
+        threshold_pips: f64,
+    },
+    /// The SL-vs-spread floor widened the stop below `min_r` → declined.
+    FloorRejected,
+}
+
+/// Resolve the intent to its **effective** trade bracket — the one the live
+/// position actually rested on — by running the same entry-decision pipeline the
+/// worker's `run_enter` does, in the same order:
+///
+/// 1. resolve the raw bracket (`Resolved::from_intent`, mid + tick-snapped),
+/// 2. reject an entry already past a baked at-entry level veto (Bug #12),
+/// 3. reject a System-1 spread-blackout entry,
+/// 4. apply the SL-vs-spread floor, which **widens `stop_loss`** to the 10×
+///    floor (or rejects when the wider stop drops R below `min_r`).
+///
+/// This is the **single source of truth** for the floored stop. Both
+/// [`simulate_fill_windowed`] (the fill/exit sim) and [`breakeven_armed_at`] (the
+/// report's SL→break-even annotation) obtain their `Resolved` exclusively through
+/// here, so the two can never again walk the candle path against *different* stop
+/// levels — the divergence that silently dropped the break-even line when a wick
+/// sat between the signed and the floored SL (USD/SGD iH&S replay, 2026-07-10).
+/// Any future stop-modifying step added here is automatically visible to both.
+fn resolve_effective_bracket(
+    intent: &Intent,
+    shell: &Shell,
+    pip_size: f64,
+    candles: &[BidAskCandle],
+    entry_spread_price: Option<f64>,
+) -> Result<Resolved, BracketReject> {
+    // `mut` so the SL-spread-floor widen can move `stop_loss` in place — exactly
+    // as the worker's `run_enter` does — before any fill / exit / break-even
+    // simulation reads it.
+    let mut resolved =
+        Resolved::from_intent(intent, shell, pip_size, replay_tick(intent, pip_size))
+            .map_err(|err| BracketReject::Unresolved(err.to_string()))?;
+
+    // At-entry level veto (Bug #12) — the worker's `run_enter` rejects an entry
+    // already past a baked pcl-exhausted / invalidation level before any
+    // placement, independent of the cross-event guard.
+    let entry_ref_price = resolved.entry.reference_price();
+    if let Some(elv) = intent
+        .entry_level_vetos
+        .iter()
+        .find(|elv| elv.is_past(entry_ref_price))
+    {
+        return Err(BracketReject::LevelVeto(elv.name.clone()));
+    }
+
+    // Spread-blackout (System 1) — the worker rejects a brand-new entry that
+    // fires during the post-NY-close liquidity trough when the live spread is
+    // elevated. Mirrored here off the recorded fire-bar book.
+    if let Some(SimOutcome::SpreadBlackout {
+        spread_pips,
+        threshold_pips,
+    }) = spread_blackout_reject(intent, shell, pip_size, candles)
+    {
+        return Err(BracketReject::SpreadBlackout {
+            spread_pips,
+            threshold_pips,
+        });
+    }
+
+    // SL-vs-spread floor SALVAGE (mirror of `run_enter`'s widen-then-reject): a
+    // stop closer than `10 × spread` to entry is widened to `10 × spread` and R
+    // re-checked; the widen mutates `resolved.stop_loss` so every downstream
+    // reader (fill, exit, break-even) sees the widened level.
+    if let EntryFloor::Rejected =
+        apply_entry_spread_floor(&mut resolved, pip_size, candles, entry_spread_price)
+    {
+        return Err(BracketReject::FloorRejected);
+    }
+
+    Ok(resolved)
+}
+
 pub fn simulate_fill(
     intent: &Intent,
     shell: &Shell,
@@ -165,67 +252,32 @@ pub fn simulate_fill_windowed(
     candles: &[BidAskCandle],
     entry_spread_price: Option<f64>,
 ) -> SimOutcome {
-    // `mut` so the SL-spread-floor widen mirror below can move `stop_loss` in
-    // place — exactly as the worker's `run_enter` does — before the fill / exit
-    // simulation reads it.
-    let mut resolved =
-        match Resolved::from_intent(intent, shell, pip_size, replay_tick(intent, pip_size)) {
+    // Resolve the effective (floored) bracket through the shared pipeline — the
+    // single place the entry-decision gates + SL-spread floor are applied, so the
+    // fill/exit sim and `breakeven_armed_at` can't walk against different stops.
+    // Each rejection maps to the outcome the worker's `run_enter` would have
+    // produced.
+    let resolved =
+        match resolve_effective_bracket(intent, shell, pip_size, candles, entry_spread_price) {
             Ok(r) => r,
-            Err(err) => return SimOutcome::Unresolved(err.to_string()),
+            Err(BracketReject::Unresolved(err)) => return SimOutcome::Unresolved(err),
+            Err(BracketReject::LevelVeto(name)) => return SimOutcome::Declined { name },
+            Err(BracketReject::SpreadBlackout {
+                spread_pips,
+                threshold_pips,
+            }) => {
+                return SimOutcome::SpreadBlackout {
+                    spread_pips,
+                    threshold_pips,
+                };
+            }
+            Err(BracketReject::FloorRejected) => {
+                return SimOutcome::Declined {
+                    name: "sl-widen-below-min-r".to_string(),
+                };
+            }
         };
     let dir = resolved.direction;
-
-    // At-entry level veto (Bug #12) — the worker's `run_enter` rejects an
-    // entry already past a baked pcl-exhausted / invalidation level before any
-    // placement, independent of the cross-event guard. `simulate_fill` doesn't
-    // run `run_enter`, so mirror that gate here: a past level → no fill.
-    let entry_ref_price = resolved.entry.reference_price();
-    if let Some(elv) = intent
-        .entry_level_vetos
-        .iter()
-        .find(|elv| elv.is_past(entry_ref_price))
-    {
-        return SimOutcome::Declined {
-            name: elv.name.clone(),
-        };
-    }
-
-    // Spread-blackout (System 1) — the worker's `run_enter` rejects a
-    // brand-new entry that fires during the post-NY-close liquidity trough
-    // when the live spread on the instrument is elevated. `simulate_fill`
-    // doesn't run `run_enter`, so mirror that gate here from the recorded
-    // book: the fire bar's `ask_c − bid_c` IS the spread the worker would
-    // have sampled. The decision + per-instrument threshold are shared with
-    // the worker (`core::spread_blackout`) so the two can't drift.
-    //
-    // `window_open` stand-in: the live gate only samples when the KV
-    // `spread-blackout:window` marker is set (written by the daily cron at
-    // the NY-close edge). Offline there is no KV, so we approximate it with
-    // `is_ny_close_edge` on the fire bar's open time — see the `SpreadBlackout`
-    // variant doc for why this is an approximation, not an exact mirror.
-    if let Some(reject) = spread_blackout_reject(intent, shell, pip_size, candles) {
-        return reject;
-    }
-
-    // SL-vs-spread floor SALVAGE (mirror of `run_enter`'s widen-then-reject):
-    // when the stop is closer than `10 × spread` to entry the worker widens it
-    // to `10 × spread` and re-checks R, entering with the wider stop if it still
-    // clears `min_r` and declining otherwise. `simulate_fill` doesn't run
-    // `run_enter`, so mirror that here off the recorded book — the fire bar's
-    // `ask_c − bid_c` IS the spread the worker quoted (same source the
-    // spread-blackout mirror uses). Without this the simulator would fill the
-    // entry (the worker placed it at the widened SL) but then check the *old*,
-    // un-widened stop, stopping the leg out at a level the live broker stop was
-    // never at. The widen mutates `resolved.stop_loss` so both `find_fill` and
-    // the exit loop below see the widened level — and break-even arms off the
-    // widened geometry, matching the live position.
-    if let EntryFloor::Rejected =
-        apply_entry_spread_floor(&mut resolved, pip_size, candles, entry_spread_price)
-    {
-        return SimOutcome::Declined {
-            name: "sl-widen-below-min-r".to_string(),
-        };
-    }
 
     // Phase 1 — find the fill (shared with `breakeven_armed_at`).
     let Some(fill) = find_fill(&resolved, intent, shell, dir, candles) else {
@@ -441,8 +493,10 @@ fn find_fill<'a>(
 /// that observes a closed candle past the threshold. The bar returned here is
 /// exactly that candle, so a replay can show "this is when the worker would have
 /// amended the broker SL to break-even." It shares the same arming predicate
-/// ([`Breakeven::close_arms`]) and fill-finding ([`find_fill`]) as the fill
-/// simulator, so the reported bar can't drift from the simulated outcome.
+/// ([`Breakeven::close_arms`]), fill-finding ([`find_fill`]), and SL-spread floor
+/// ([`apply_entry_spread_floor`]) as the fill simulator, so the reported bar can't
+/// drift from the simulated outcome. `entry_spread_price` is the same trailing
+/// mean the report feeds `simulate_fill_windowed`.
 ///
 /// Pure and side-effect-free; the report calls it independently of
 /// [`simulate_fill`] so the `SimOutcome` enum (and every saved fixture) is
@@ -452,10 +506,17 @@ pub fn breakeven_armed_at(
     shell: &Shell,
     pip_size: f64,
     candles: &[BidAskCandle],
+    entry_spread_price: Option<f64>,
 ) -> Option<chrono::DateTime<chrono::Utc>> {
     let be = intent.breakeven?;
+    // Resolve the effective (floored) bracket through the SAME shared pipeline the
+    // fill sim uses. Any rejection (unresolved / level-veto / spread-blackout /
+    // floor-below-min-r) means the worker never placed the entry, so break-even
+    // never armed → `None`. Crucially, walking against the shared floored stop is
+    // what stops a wick between the signed and floored SL from falsely reporting
+    // "stopped out before arming" and suppressing the SL→break-even line.
     let resolved =
-        Resolved::from_intent(intent, shell, pip_size, replay_tick(intent, pip_size)).ok()?;
+        resolve_effective_bracket(intent, shell, pip_size, candles, entry_spread_price).ok()?;
     let dir = resolved.direction;
     let fill = find_fill(&resolved, intent, shell, dir, candles)?;
 
@@ -1510,6 +1571,47 @@ mod tests {
     }
 
     #[test]
+    fn breakeven_armed_at_applies_the_sl_spread_floor() {
+        use trade_control_core::intent::Breakeven;
+        // Regression for the USD/SGD iH&S replay (2026-07-10): the SL→break-even
+        // annotation line went missing even though the leg armed BE and scratched
+        // at entry. Root cause — `breakeven_armed_at` walked the path against the
+        // *un-floored* signed SL while `simulate_fill_windowed` had widened the SL
+        // to the 10× spread floor. A wick dipping between the two levels made
+        // `breakeven_armed_at` falsely report "stopped out before arming" → None,
+        // so the report suppressed the line while the sim still scratched at BE.
+        //
+        // Same geometry as `widened_sl_protects_the_leg_in_the_fill_path`: long
+        // stop trigger 1.1050, signed SL 1.1000, TP 1.1150; a 6-pip spread trips
+        // the 10× floor and widens the SL DOWN to 1.0990. BE 50%-to-TP level =
+        // 1.1050 + 0.5×(1.1150−1.1050) = 1.1100.
+        let mut intent = resolvable_long_stop();
+        intent.breakeven = Some(Breakeven::at_half());
+        let fire = spread_fire_bar(NON_EDGE_TS, 1.1040, 0.0006); // 6-pip spread
+        let shell = Shell::from_candle(&fire.mid());
+        // Fill: ask reaches the 1.1050 trigger.
+        let fill_bar = ba_candle("2026-03-12T11:00:00Z", 1.1052, 1.1045, 1.1055, 1.1048);
+        // Pre-arming dip: bid low 1.0994 — past the signed 1.1000 SL, short of the
+        // widened 1.0990. The real (floored) leg survives; the un-floored walk
+        // used to bail out here.
+        let dip_bar = ba_candle("2026-03-12T12:00:00Z", 1.1010, 1.0994, 1.1015, 1.0998);
+        // Arming bar: mid close ≥ 1.1100 (bid 1.1105 / ask 1.1109 → mid 1.1107).
+        let arm_bar = ba_candle("2026-03-12T13:00:00Z", 1.1110, 1.1103, 1.1112, 1.1105);
+        let path = [fire, fill_bar, dip_bar, arm_bar];
+
+        // Without the floor the walk bails at `dip_bar` (bid 1.0994 ≤ signed 1.1000).
+        // With the floor applied the widened 1.0990 stop holds and BE arms on
+        // `arm_bar`.
+        let armed = breakeven_armed_at(&intent, &shell, 0.0001, &path, None);
+        assert_eq!(
+            armed,
+            Some(arm_bar.time),
+            "BE must arm on the bar past 50%-to-TP; the pre-arming dip crosses the \
+             signed SL but not the floored one, so it must not suppress the arm"
+        );
+    }
+
+    #[test]
     fn mid_only_feed_never_blacks_out() {
         // A mid-only data source has bid == ask == mid → zero spread. Even a
         // fire bar at the close edge must never black out (we don't fabricate a
@@ -1618,7 +1720,7 @@ mod tests {
         let bounce_to_orig_sl = candle("2026-06-17T13:00:00Z", 1.0945, 1.1041, 1.0944, 1.1000);
         let path = [fire_bar(), fill_bar, runs_past_50, bounce_to_orig_sl];
 
-        let armed = breakeven_armed_at(&intent, &shell, 0.0001, &path);
+        let armed = breakeven_armed_at(&intent, &shell, 0.0001, &path, None);
         assert_eq!(
             armed,
             Some(runs_past_50.time),
@@ -1638,7 +1740,10 @@ mod tests {
         let fill_bar = candle("2026-06-17T11:00:00Z", 1.1005, 1.1005, 1.0995, 1.1000);
         let runs_past_50 = candle("2026-06-17T12:00:00Z", 1.0990, 1.0992, 1.0935, 1.0940);
         let path = [fire_bar(), fill_bar, runs_past_50];
-        assert_eq!(breakeven_armed_at(&intent, &shell, 0.0001, &path), None);
+        assert_eq!(
+            breakeven_armed_at(&intent, &shell, 0.0001, &path, None),
+            None
+        );
     }
 
     /// A position stopped out at the original SL **before** any candle arms BE
@@ -1657,7 +1762,10 @@ mod tests {
         let fill_bar = candle("2026-06-17T11:00:00Z", 1.1005, 1.1005, 1.0995, 1.1000);
         let straight_to_sl = candle("2026-06-17T12:00:00Z", 1.1005, 1.1041, 1.1000, 1.1030);
         let path = [fire_bar(), fill_bar, straight_to_sl];
-        assert_eq!(breakeven_armed_at(&intent, &shell, 0.0001, &path), None);
+        assert_eq!(
+            breakeven_armed_at(&intent, &shell, 0.0001, &path, None),
+            None
+        );
     }
 
     /// A candle that only WICKS past the 50% level (but closes back short of it)
