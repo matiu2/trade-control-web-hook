@@ -22,6 +22,7 @@ use chrono::{DateTime, Utc};
 use trade_control_core::intent::{
     Action, Direction, Intent, NoEntryWindow, Resolved, ResolvedEntry, Shell,
 };
+use trade_control_core::plan_sentiment::PlanSentiment;
 use trade_control_core::spread_blackout::elevated_threshold_pips;
 use trade_control_engine::{
     BidAskCandle as EngineCandle, EntryFloor, SimOutcome, SweepReason, TradePlan,
@@ -396,6 +397,7 @@ pub fn render(
     simulate: bool,
     verbose: bool,
     blackout_windows: &[NoEntryWindow],
+    sentiment: Option<&PlanSentiment>,
 ) -> String {
     let mut out = String::new();
     out.push_str(&format!(
@@ -405,6 +407,10 @@ pub fn render(
         plan.granularity,
         replay.fires.len()
     ));
+
+    if let Some(s) = sentiment {
+        out.push_str(&render_sentiment(s));
+    }
 
     if verbose {
         out.push_str(&render_trace(replay));
@@ -470,6 +476,33 @@ pub fn render(
         out.push_str(&tally.summary_line());
     }
     out.push('\n');
+    out
+}
+
+/// Render the news-sentiment block: the overall verdict line, then one line per
+/// currency with its net score and the events that moved it. Mirrors what
+/// `tv-news` logs, formatted for the replay report.
+fn render_sentiment(s: &PlanSentiment) -> String {
+    let mut out = format!(
+        "News sentiment ({} → {}): {}, confidence {}\n",
+        bne(s.period_start),
+        bne(s.period_end),
+        s.overall_direction,
+        s.confidence,
+    );
+    if s.currencies.is_empty() {
+        out.push_str("  (no released events in the lookback window)\n");
+        return out;
+    }
+    for c in &s.currencies {
+        out.push_str(&format!(
+            "  {} — {} (net {:+.1})\n",
+            c.currency, c.direction, c.net_score
+        ));
+        for ev in &c.events {
+            out.push_str(&format!("      {ev}\n"));
+        }
+    }
     out
 }
 
@@ -1360,7 +1393,7 @@ mod tests {
             warnings: Vec::new(),
             traces: Vec::new(),
         };
-        let out = render(&plan_for(0.0001), &replay, true, false, &[]);
+        let out = render(&plan_for(0.0001), &replay, true, false, &[], None);
 
         // Top-level event lines, each naming entry #1 — no "bars (entry
         // timeline):" sub-heading, no OHLC dump, no leading-indent nested
@@ -1575,5 +1608,41 @@ mod tests {
             describe_order(&limit, 0.0001),
             "order: LONG limit @ 1.10400  SL 1.10000  TP 1.11500"
         );
+    }
+
+    #[test]
+    fn renders_sentiment_block() {
+        use trade_control_core::plan_sentiment::{CurrencySnapshot, PlanSentiment};
+        let snap = PlanSentiment {
+            period_start: at(0),
+            period_end: at(86_400),
+            overall_direction: "bullish".into(),
+            confidence: "high".into(),
+            currencies: vec![CurrencySnapshot {
+                currency: "EUR".into(),
+                direction: "bullish".into(),
+                net_score: 3.0,
+                events: vec!["GDP q/q: Actual (0.8%) beat forecast (0.5%)".into()],
+            }],
+        };
+        let out = render_sentiment(&snap);
+        assert!(out.contains("News sentiment"), "header:\n{out}");
+        assert!(out.contains("bullish, confidence high"), "verdict:\n{out}");
+        assert!(out.contains("EUR — bullish (net +3.0)"), "currency:\n{out}");
+        assert!(out.contains("GDP q/q"), "event line:\n{out}");
+    }
+
+    #[test]
+    fn renders_sentiment_block_with_no_events() {
+        use trade_control_core::plan_sentiment::PlanSentiment;
+        let snap = PlanSentiment {
+            period_start: at(0),
+            period_end: at(86_400),
+            overall_direction: "neutral".into(),
+            confidence: "low".into(),
+            currencies: vec![],
+        };
+        let out = render_sentiment(&snap);
+        assert!(out.contains("no released events"), "empty note:\n{out}");
     }
 }

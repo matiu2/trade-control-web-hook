@@ -10,8 +10,10 @@
 //! The output types derive `serde::{Serialize, Deserialize}` — the only
 //! change from the original `tv-news` copy; the algorithm is identical.
 
+mod plan_snapshot;
 mod sentiment;
 
+pub use plan_snapshot::{confidence_str, direction_str};
 pub use sentiment::{
     Confidence, CurrencySentiment, EventSentiment, SentimentAnalysis, SentimentDirection,
     analyze_event, analyze_sentiment, sentiment_lookback_start,

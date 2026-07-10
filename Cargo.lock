@@ -2152,6 +2152,7 @@ dependencies = [
  "forex-factory",
  "serde",
  "serde_json",
+ "trade-control-core",
 ]
 
 [[package]]
@@ -4122,6 +4123,7 @@ dependencies = [
  "getrandom 0.4.2",
  "hex",
  "instrument-lookup",
+ "news-sentiment-tv",
  "oanda-client",
  "reqwest 0.12.23",
  "serde",

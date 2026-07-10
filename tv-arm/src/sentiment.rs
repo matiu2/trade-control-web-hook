@@ -10,11 +10,11 @@
 
 use chrono::{DateTime, Local, Utc};
 use news_sentiment_tv::{
-    CurrencySentiment, SentimentAnalysis, SentimentDirection, analyze_sentiment,
+    CurrencySentiment, SentimentAnalysis, analyze_sentiment, confidence_str, direction_str,
     sentiment_lookback_start,
 };
 use tracing::{info, warn};
-use trade_control_core::plan_sentiment::{CurrencySnapshot, PlanSentiment};
+use trade_control_core::plan_sentiment::PlanSentiment;
 
 /// Compute the arm-time sentiment snapshot for `instrument` (identified by its
 /// `news_currencies`) as of `armed_at`, print a summary, and return the lean
@@ -42,7 +42,7 @@ pub fn arm_time_sentiment(
 
     let analysis = analyze_sentiment(news_currencies, &events, at_local);
     print_summary(asset_id, news_currencies, &analysis);
-    Some(to_plan_sentiment(&analysis))
+    Some(analysis.to_plan_sentiment())
 }
 
 /// Fetch forex-factory events for the lookback window on a fresh tokio runtime,
@@ -55,35 +55,6 @@ fn fetch_events(
     let runtime = tokio::runtime::Runtime::new()
         .map_err(|e| eyre!("starting tokio runtime for sentiment fetch: {e}"))?;
     runtime.block_on(trade_control_cli::fetch_events_for_range(from, to))
-}
-
-/// Convert the rich analysis into the lean, string-typed journalling mirror
-/// that lives on the plan.
-fn to_plan_sentiment(a: &SentimentAnalysis) -> PlanSentiment {
-    let mut currencies: Vec<CurrencySnapshot> = a
-        .currency_sentiments
-        .values()
-        .map(|cs| CurrencySnapshot {
-            currency: cs.currency.clone(),
-            direction: direction_str(cs.direction).to_string(),
-            net_score: cs.net_score(),
-            events: cs
-                .events
-                .iter()
-                .map(|ev| format!("{}: {}", ev.event_name, ev.reason))
-                .collect(),
-        })
-        .collect();
-    // Deterministic order for a stable read-back (HashMap iteration is not).
-    currencies.sort_by(|x, y| x.currency.cmp(&y.currency));
-
-    PlanSentiment {
-        period_start: a.period_start.to_utc(),
-        period_end: a.period_end.to_utc(),
-        overall_direction: direction_str(a.overall_direction).to_string(),
-        confidence: confidence_str(a.confidence).to_string(),
-        currencies,
-    }
 }
 
 /// Print a short human summary of the arm-time sentiment verdict — the same
@@ -124,66 +95,10 @@ fn print_currency(cs: &CurrencySentiment) {
     }
 }
 
-fn direction_str(d: SentimentDirection) -> &'static str {
-    match d {
-        SentimentDirection::Bullish => "bullish",
-        SentimentDirection::Bearish => "bearish",
-        SentimentDirection::Neutral => "neutral",
-    }
-}
-
-fn confidence_str(c: news_sentiment_tv::Confidence) -> &'static str {
-    match c {
-        news_sentiment_tv::Confidence::High => "high",
-        news_sentiment_tv::Confidence::Medium => "medium",
-        news_sentiment_tv::Confidence::Low => "low",
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use chrono::TimeZone;
-    use news_sentiment_tv::analyze_sentiment;
-    use trade_control_cli::{EconomicEvent, Impact};
-
-    fn event(currency: &str, actual: &str, forecast: &str) -> EconomicEvent {
-        EconomicEvent {
-            name: format!("{currency} GDP q/q"),
-            currency: currency.to_string(),
-            impact: Impact::High,
-            datetime: Local.with_ymd_and_hms(2026, 1, 23, 10, 0, 0).unwrap(),
-            actual: Some(actual.to_string()),
-            forecast: Some(forecast.to_string()),
-            previous: None,
-        }
-    }
-
-    #[test]
-    fn to_plan_sentiment_mirrors_analysis() {
-        let at = Local.with_ymd_and_hms(2026, 1, 23, 14, 0, 0).unwrap();
-        let events = vec![event("EUR", "0.8%", "0.5%"), event("USD", "150K", "180K")];
-        let ccys = vec!["EUR".to_string(), "USD".to_string()];
-        let a = analyze_sentiment(&ccys, &events, at);
-
-        let snap = to_plan_sentiment(&a);
-        assert_eq!(snap.overall_direction, direction_str(a.overall_direction));
-        assert_eq!(snap.confidence, confidence_str(a.confidence));
-        // Currencies sorted, one per scored currency, each with its event lines.
-        assert_eq!(snap.currencies.len(), a.currency_sentiments.len());
-        assert!(
-            snap.currencies
-                .windows(2)
-                .all(|w| w[0].currency <= w[1].currency)
-        );
-        let eur = snap
-            .currencies
-            .iter()
-            .find(|c| c.currency == "EUR")
-            .expect("EUR present");
-        assert_eq!(eur.direction, "bullish");
-        assert!(eur.events.iter().any(|e| e.contains("GDP q/q")));
-    }
 
     #[test]
     fn empty_currencies_yields_none() {
