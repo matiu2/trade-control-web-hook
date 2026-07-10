@@ -45,6 +45,7 @@ pub use trade_control_conventions::RuleKind;
 
 use crate::broker::Granularity;
 use crate::intent::{Direction, Intent};
+use crate::plan_sentiment::PlanSentiment;
 
 /// Default cross-depth buffer (percent of the crossed level's price) baked onto
 /// a plan at arm time. **`0.02%`** — calibrated on the AUD/JPY iH&S of
@@ -162,6 +163,17 @@ pub struct TradePlan {
     /// `replay_start`), so it adds no new top-level signed key.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub armed_at: Option<DateTime<Utc>>,
+    /// The news-sentiment verdict as of [`armed_at`](Self::armed_at), captured
+    /// by `tv-arm` at arm time and baked here for **journalling only** — the
+    /// worker/engine never reads it. A lean, string-typed mirror
+    /// ([`PlanSentiment`]) of `news_sentiment_tv::SentimentAnalysis` so `core`
+    /// needn't depend on the news stack. `None` when sentiment couldn't be
+    /// computed (fetch failure — arming never blocks on it) or for plans armed
+    /// before this field existed; `#[serde(skip_serializing_if)]` keeps it out
+    /// of the JSON entirely then. Nested inside the whole-`TradePlan` signed
+    /// line (like `armed_at`), so it adds no new top-level signed key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub armed_sentiment: Option<PlanSentiment>,
 }
 
 /// One condition + the intent it fires. The engine evaluates [`trigger`] each

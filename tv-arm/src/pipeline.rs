@@ -362,6 +362,16 @@ pub fn run(args: Args) -> Result<i32> {
         {
             replace_existing_plan(replace_target, &built_trade.instrument, &key, now)?;
         }
+        // Arm-time news-sentiment snapshot: computed as of the *effective* arm
+        // time (`--start` cursor when journaling, else `now`), printed for the
+        // operator, and baked onto the plan for after-the-fact journalling only.
+        // Fail-soft — a fetch failure yields `None` and never blocks arming.
+        let armed_at = effective_arm_time(start, now);
+        let armed_sentiment = crate::sentiment::arm_time_sentiment(
+            &resolved.asset.id,
+            &resolved.asset.news_currencies,
+            armed_at,
+        );
         register_trade_plan(
             &built_trade,
             direction,
@@ -378,6 +388,7 @@ pub fn run(args: Args) -> Result<i32> {
             start,
             args.retest_atr_step
                 .unwrap_or(trade_control_core::trade_plan::DEFAULT_RETEST_ATR_STEP),
+            armed_sentiment,
         )?;
     }
 
@@ -1934,6 +1945,7 @@ fn register_trade_plan(
     register: bool,
     replay_start: Option<i64>,
     retest_atr_step: f64,
+    armed_sentiment: Option<trade_control_core::plan_sentiment::PlanSentiment>,
 ) -> Result<()> {
     use cli::TradePattern;
     let is_mw = matches!(built_trade.spec.pattern, TradePattern::M | TradePattern::W);
@@ -1960,6 +1972,7 @@ fn register_trade_plan(
         replay_start,
         retest_atr_step,
         armed_at,
+        armed_sentiment,
     );
     // Unwrap the tv-arm bundle wrappers to the cli `BuiltPause`/`BuiltNews` the
     // appender reads (each carries the signed intents + window times).
@@ -2604,6 +2617,7 @@ mod tests {
             None,
             trade_control_core::trade_plan::DEFAULT_RETEST_ATR_STEP,
             chrono::Utc::now(),
+            None,
         )
     }
 

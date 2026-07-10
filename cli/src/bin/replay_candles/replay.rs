@@ -676,6 +676,7 @@ mod tests {
             retest_atr_step: trade_control_core::trade_plan::DEFAULT_RETEST_ATR_STEP,
             replay_start: None,
             armed_at: None,
+            armed_sentiment: None,
         };
         let candles: Vec<EngineCandle> = (0..20)
             .map(|i| candle(i * 3600, 1.30 + i as f64 * 0.001))
@@ -706,6 +707,7 @@ mod tests {
             retest_atr_step: trade_control_core::trade_plan::DEFAULT_RETEST_ATR_STEP,
             replay_start: None,
             armed_at: None,
+            armed_sentiment: None,
         };
         let replay = run(&plan, &[], Granularity::H1, all_live(), all_live()).await;
         assert!(replay.fires.is_empty());

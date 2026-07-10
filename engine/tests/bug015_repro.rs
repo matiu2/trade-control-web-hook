@@ -205,6 +205,7 @@ fn experimental_plan() -> TradePlan {
         retest_atr_step: trade_control_core::trade_plan::DEFAULT_RETEST_ATR_STEP,
         replay_start: None,
         armed_at: None,
+        armed_sentiment: None,
     }
 }
 
