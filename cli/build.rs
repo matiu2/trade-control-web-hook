@@ -27,8 +27,8 @@ fn main() {
     // suffixed binary (`trade-control-staging`, `-dev`, …) contains its own
     // environment's URL as the compiled-in default endpoint. A plain
     // `cargo install` with no env set falls back to the local dev worker
-    // (dev is the native/Postgres worker on loopback now; only staging is on
-    // Cloudflare, and deploy-staging.sh sets TRADE_CONTROL_WEBHOOK explicitly).
+    // (every env is a native/Postgres worker on loopback now — dev :8787,
+    // staging :8788 — and the deploy scripts set TRADE_CONTROL_WEBHOOK).
     let webhook = std::env::var("TRADE_CONTROL_WEBHOOK")
         .unwrap_or_else(|_| "http://127.0.0.1:8787".to_string());
     println!("cargo:rustc-env=BAKED_WEBHOOK={webhook}");

@@ -237,9 +237,9 @@ the remaining ~47h of the alert window. Fires 5
 Pattern an unwary refactorer might fall back into: "let's mark seen
 on every dispatcher outcome too, for visibility in `status`." Don't.
 The cost of poisoning legitimate retryable rejections far outweighs
-the visibility gain — and gate rejections are already visible in
-Cloudflare Real-time Logs via the `console_log!` line in
-`log_skip`.
+the visibility gain — and gate rejections are already visible in the
+worker's `tracing` logs (journalctl for the systemd unit) via the
+`log_skip` line.
 
 If you find yourself looking at a 409 on an `enter` and wondering
 "but the prior fires all failed — why didn't the retry gate let it
