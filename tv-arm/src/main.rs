@@ -32,6 +32,7 @@ mod pipeline;
 mod position_trade;
 mod precision;
 mod register_post;
+mod replay;
 mod roles;
 mod sentiment;
 mod spread;

@@ -41,7 +41,6 @@ mod replay_candles {
     pub mod annotate;
     pub mod brisbane;
     pub mod candles;
-    pub mod detector_marks;
     pub mod fixture;
     pub mod granularity;
     pub mod instrument;
@@ -50,7 +49,6 @@ mod replay_candles {
     pub mod replay_broker;
     pub mod report;
     pub mod sentiment;
-    pub mod source;
     pub mod tv;
     pub mod verbose;
 }
@@ -66,161 +64,15 @@ use tracing_error::ErrorLayer;
 use tracing_subscriber::prelude::*;
 use tracing_subscriber::{EnvFilter, fmt};
 
-use replay_candles::detector_marks::{DetectorMarkConfig, DirectionFilter, GoldenFilter};
 use replay_candles::fixture::{self, FixtureMeta, ReplayOutcome};
-use replay_candles::source::CandleSource;
 use replay_candles::tv::TvDefaults;
 use replay_candles::{
     annotate, brisbane, candles, granularity, instrument, market_hours, replay, report, sentiment,
     tv,
 };
+use trade_control_cli::replay_args::{CandleSource, DetectorMarkConfig, ReplayArgs as Args};
 use trade_control_engine::{BidAskCandle as EngineCandle, Granularity, TradePlan, Trigger};
 use trading_view::mcp::TvMcp;
-
-#[derive(Parser)]
-#[command(name = "replay-candles")]
-#[command(about = "Replay a candle window through the engine's decision logic, offline")]
-struct Args {
-    /// Path to the TradePlan JSON written by `tv-arm --plan-out`. Required for a
-    /// live replay; omitted (and ignored) under `--test-mode`, where the plan
-    /// comes from the saved fixture.
-    #[arg(long)]
-    plan: Option<PathBuf>,
-
-    /// Instrument to pull candles for (e.g. `eur/cad`). Overrides the chart's
-    /// symbol; falls back to the TradingView chart, then the plan's instrument.
-    /// Resolved per-source via instrument-lookup.
-    #[arg(long)]
-    instrument: Option<String>,
-
-    /// Candle granularity (`1m`/`5m`/`15m`/`1h`/`4h`/`1d`). Defaults to the
-    /// plan's granularity; pass this only to override it (the override must
-    /// still match the plan's granularity).
-    #[arg(long)]
-    granularity: Option<String>,
-
-    /// Which broker candle-cache pulls from. Both sources always go through
-    /// candle-cache (filling the on-disk cache either way); this only selects
-    /// the broker. TradeNation matches the live engine.
-    #[arg(long, value_enum, default_value_t = CandleSource::TradeNation)]
-    source: CandleSource,
-
-    /// Window start. A bare datetime is Brisbane time (UTC+10, no DST) — the
-    /// zone this tool renders every candle/fill in — e.g. `2026-06-30T17:00`.
-    /// An explicit offset or `Z` is honoured (`...T07:00Z`, `...T17:00+10:00`).
-    /// Overrides the chart's last-shown-candle (replay cursor). Omit to read it
-    /// from the TradingView chart.
-    #[arg(long)]
-    start: Option<String>,
-
-    /// Window end. Same time format as `--start` (bare = Brisbane, explicit
-    /// offset/`Z` honoured). Overrides the plan's trade-expiry. Omit to use the
-    /// plan's trade-expiry (or, if it has none, the chart's visible-region end).
-    #[arg(long)]
-    end: Option<String>,
-
-    /// Override the tv-mcp module root used to read the chart when window flags
-    /// are omitted. Defaults to the hard-coded `~/Downloads/tradingview-mcp-jackson`.
-    #[arg(long)]
-    tv_mcp_root: Option<PathBuf>,
-
-    /// Run the fill simulator on each fired enter (default on).
-    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
-    simulate: bool,
-
-    /// Print a bar-by-bar trace of the engine's silent state changes before the
-    /// fire report: phase transitions, the break-and-close stamp, and the
-    /// **retest stamp** (which never fires an intent, so it's invisible in the
-    /// normal report). Quiet bars are omitted. For debugging "why did/didn't the
-    /// entry fire" — it shows exactly which bar armed the retest gate.
-    #[arg(long, visible_alias = "all-events", default_value_t = false)]
-    verbose: bool,
-
-    /// Which detected-signal DIRECTIONS to mark on the report, relative to the
-    /// plan's trade direction: `with` (trade direction only — the entry
-    /// candidates), `against` (opposite — invalidation candidates), `both`, or
-    /// `none` (disable marking). Marks EVERY qualifying candle the detector
-    /// printed, whether or not the plan entered on it — the "golden candle we
-    /// never entered on" debugging surface. Setting either this or
-    /// `--candle-detector-golden` to `none` turns marking off entirely.
-    #[arg(long, value_enum, default_value_t = DirectionFilter::With)]
-    candle_detector_direction: DirectionFilter,
-
-    /// Which detected-signal GOLDEN-ness to mark: `golden` (size ≥ ATR — the
-    /// default), `non-golden`, `both`, or `none` (disable). Pairs with
-    /// `--candle-detector-direction`; `none` on either axis turns marking off.
-    #[arg(long, value_enum, default_value_t = GoldenFilter::Golden)]
-    candle_detector_golden: GoldenFilter,
-
-    /// After replaying, draw each *filled* position onto the live TradingView
-    /// chart as a native long/short position tool (green profit zone, red stop
-    /// zone) plus a small outcome label, spanning the fill bar to the exit.
-    /// Prior `--annotate` drawings are cleared first (tracked by entity-id in a
-    /// sidecar manifest); your hand-drawn necklines/fibs are left alone. Implies
-    /// `--simulate` (annotation needs the simulated fill). Uses the same tv-mcp
-    /// chart as window resolution (`--tv-mcp-root`).
-    #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
-    annotate: bool,
-
-    /// Also annotate *not-taken* trades — pending orders that never filled and
-    /// entries the worker declined — as muted grey brackets at the fire bar. Only
-    /// meaningful with `--annotate` (and implies it). Off by default, so a
-    /// plain `--annotate` shows just the taken positions.
-    #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
-    annotate_unfilled: bool,
-
-    /// Number of **real** candles to pull *before* the window start as a silent
-    /// warm-up prefix. These bars seed the detector (so ATR is warm and the
-    /// candle patterns have context) and prime the FSM, but fire nothing — the
-    /// plan only goes live at the window start. Without this, a `needs_golden`
-    /// enter can never fire (ATR never warms) and a stale veto-level touch in
-    /// the warm-up span would wrongly retire the plan. 200 covers the 96-bar
-    /// 15m ATR plus pattern lookback; raise it for very long-lookback configs.
-    ///
-    /// This is a **candle count, not a wall-clock span**: a market gap (weekend
-    /// / session close) inside the naive `count × bar` estimate would yield
-    /// fewer real candles, so the pull widens its look-back and retries — hopping
-    /// the gap — until it has this many real candles (or hits a back-off cap).
-    #[arg(long, default_value_t = 200)]
-    warmup_bars: usize,
-
-    /// Override the candle-cache disk cache directory.
-    #[arg(long)]
-    cache_dir: Option<PathBuf>,
-
-    /// Print the zsh completion script to stdout and exit. Source it into your
-    /// fpath (or `source <(replay-candles --print-completions)`).
-    #[arg(long)]
-    print_completions: bool,
-
-    /// After a live replay, freeze this run's inputs (plan + the pulled candle
-    /// window + resolved meta) and its outcome into `<fixtures-dir>/<NAME>/`, a
-    /// golden regression case the test suite re-runs offline. Run it once a
-    /// replay is producing the verdict you want.
-    #[arg(long, value_name = "NAME")]
-    save: Option<String>,
-
-    /// Replay a saved fixture **offline**: load plan + candles + meta from
-    /// `<fixtures-dir>/<--fixture>/` instead of pulling from the broker (no
-    /// network, no env vars, no TradingView). Requires `--fixture`.
-    #[arg(long, requires = "fixture")]
-    test_mode: bool,
-
-    /// Name of the fixture under `<fixtures-dir>/` to replay with `--test-mode`.
-    #[arg(long, value_name = "NAME")]
-    fixture: Option<String>,
-
-    /// Under `--test-mode`, also compare the replay's outcome against the
-    /// fixture's `expected.json` and exit non-zero on any mismatch (printing the
-    /// diff). The gate proof for a fixture.
-    #[arg(long)]
-    check: bool,
-
-    /// Directory holding the saved fixtures. Defaults to `replay-fixtures` at the
-    /// repo root (relative to the cli crate's manifest).
-    #[arg(long)]
-    fixtures_dir: Option<PathBuf>,
-}
 
 /// Default fixtures directory: `<repo-root>/replay-fixtures`, resolved from the
 /// cli crate's manifest dir (`.../cli`) so it's stable regardless of cwd.
@@ -807,6 +659,7 @@ fn init_tracing() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use trade_control_cli::replay_args::{DirectionFilter, GoldenFilter};
     use trade_control_engine::Granularity;
 
     #[test]

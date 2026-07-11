@@ -30,7 +30,7 @@ use trade_control_engine::{
 };
 
 use super::replay::{Fire, Replay};
-use super::source::CandleSource;
+use trade_control_cli::replay_args::CandleSource;
 
 /// The resolved scalars a fixture replay needs, beyond the plan + candles. Saved
 /// so `--test-mode` can reconstruct the run without re-resolving from flags, the
@@ -290,6 +290,7 @@ mod tests {
     use super::*;
     use chrono::TimeZone;
     use std::path::PathBuf;
+    use trade_control_cli::replay_args::{DetectorMarkConfig, DirectionFilter, GoldenFilter};
 
     /// List the fixture directories under `replay-fixtures/` (each holding the
     /// four JSON files), sorted for deterministic test ordering. Empty when the
@@ -341,9 +342,9 @@ mod tests {
             // Detector marking off (either axis `None`) — the fixture round-trip
             // compares the frozen outcome, which predates this feature and never
             // carried marks.
-            let mark_cfg = super::super::detector_marks::DetectorMarkConfig::new(
-                super::super::detector_marks::DirectionFilter::None,
-                super::super::detector_marks::GoldenFilter::None,
+            let mark_cfg = DetectorMarkConfig::new(
+                DirectionFilter::None,
+                GoldenFilter::None,
                 inputs.plan.direction,
             );
             let replay = super::super::replay::run(

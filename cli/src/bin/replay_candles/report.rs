@@ -31,8 +31,8 @@ use trade_control_engine::{
 };
 
 use super::brisbane::bne;
-use super::detector_marks::DetectorMarkConfig;
 use super::replay::{Fire, Replay};
+use trade_control_cli::replay_args::DetectorMarkConfig;
 
 /// The tick size the replay report rounds order prices to — the baked
 /// `Intent::tick_size` when present, else the plan's `pip_size`. Mirrors the
@@ -1186,10 +1186,10 @@ fn describe_outcome(outcome: &SimOutcome) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::super::detector_marks::{DirectionFilter, GoldenFilter};
     use super::super::replay::EnterGateOutcome;
     use super::*;
     use chrono::{TimeZone, Utc};
+    use trade_control_cli::replay_args::{DirectionFilter, GoldenFilter};
 
     /// Detector marking off — the summary line is empty, so report assertions
     /// that predate this feature stay byte-stable.

@@ -28,7 +28,7 @@ use super::brisbane::bne;
 
 /// A pattern the signal detector printed on a bar, whether or not the plan acted
 /// on it. Attached to a [`BarTrace`] when the bar's detected signal passes the
-/// active [`DetectorMarkConfig`](super::detector_marks::DetectorMarkConfig)
+/// active [`DetectorMarkConfig`](trade_control_cli::replay_args::DetectorMarkConfig)
 /// filter. Computed with the SAME `detect_at` + `wilder_atr` the engine uses, so
 /// a marked golden is exactly what the engine detected.
 #[derive(Debug, Clone, Copy, PartialEq)]

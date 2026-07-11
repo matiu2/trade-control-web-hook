@@ -1,5 +1,67 @@
 # Changelog
 
+## v86 — 2026-07-12 — tv-arm `--replay` + shared replay clap args; per-broker account defaults; quieter not-golden declines
+
+**Why.** Three things. (1) Arming and then replaying the plan was two commands
+with a copy-pasted plan path in between; `tv-arm --replay` collapses that into
+one. (2) The `replay-candles` CLI surface lived in the binary, so `tv-arm`
+couldn't build/validate a replay invocation without drift — the args are now a
+shared library struct. (3) The per-broker default account indices were the old
+`ms-tn-1` / `ms-oanda-1` placeholders; they're now the real `reversals` (TN) /
+`m-and-w` (OANDA) accounts. Plus a bug: under the default golden-only mark view,
+the replay showed `✗ not entered: needs golden but signal is not golden` — a
+tautological decline (a non-golden signal declined *for* being non-golden) that
+the operator, having asked for golden-only candles, never wanted to see.
+
+**What changed.**
+- **Shared replay clap args.** The `replay-candles` `Args` struct moved out of
+  the binary into the `cli` library as `trade_control_cli::replay_args::ReplayArgs`,
+  alongside the value-enums it references (`CandleSource`, `DirectionFilter`,
+  `GoldenFilter`) and the resolved `DetectorMarkConfig`. The binary now `use`s
+  the shared struct — behaviour byte-identical. One source of truth for the
+  flags, defaults, help text, and validation.
+- **`tv-arm --replay`.** After arming, chains into the environment-matched
+  `replay-candles-<env>` binary on the just-built plan (plan written to
+  `--plan-out` if given, else a temp file). Defaults `--verbose --annotate true
+  --source <resolved-broker>`; any tokens after `--replay` pass through to
+  `replay-candles` and override the defaults, validated against the shared
+  `ReplayArgs` before shell-out. Post-arm convenience: a replay failure surfaces
+  but doesn't un-arm. Needs neither `--plan-out` nor `--register-plan`.
+  tv-arm learns its env from a new `BAKED_ENV_SUFFIX` (build.rs, fed by
+  `TRADE_CONTROL_ENV_SUFFIX` in the deploy scripts); a plain build falls back to
+  `replay-candles` on PATH.
+- **Per-broker account defaults.** `Broker::default_account_index()`
+  (`conventions`) → TradeNation `reversals`, OANDA `m-and-w` (was `ms-tn-1` /
+  `ms-oanda-1`). Affects any caller that doesn't pass `--account-id` /
+  `TRADE_CONTROL_ACCOUNT`.
+- **Quieter not-golden declines.** Under `--candle-detector-golden golden` (the
+  default) the replay suppresses the `needs golden but signal is not golden`
+  entry-decline from both the always-on rollup and the per-bar `✗ not entered`
+  line — it's noise in a golden-only view. `--candle-detector-golden both` /
+  `non-golden` still show it; every other decline reason is always shown. The
+  two candle-quality reason strings are now shared constants
+  (`plan_eval::NOT_GOLDEN_DECLINE` / `NOT_CONFIRMED_DECLINE`) so the engine write
+  side and the replay filter agree on the exact wording.
+
+**Breaking.** `Broker::default_account_index()` return values changed. No
+signature changes. `replay-candles`' CLI is unchanged (same flags, same
+behaviour) despite the struct move.
+
+**Config.** New build-time env `TRADE_CONTROL_ENV_SUFFIX` (deploy scripts set
+it; empty for a plain build). New tv-arm flag `--replay` + trailing passthrough.
+
+**Tests.** `replay_args` (7): filter matrix + `suppresses_not_golden_decline` +
+source wire form. tv-arm `replay` module (7): binary-name/suffix, broker→source,
+plan-path resolution, argv defaults-then-passthrough, shared-clap validation
+accept/reject. tv-arm args (2): `--replay` collects passthrough incl. hyphenated
+flags; tv-arm's own flags before `--replay` still bind to tv-arm. replay bin:
+`not_golden_decline_suppressed_under_golden_only_filter` (a genuinely non-golden
+detected signal; decline hidden under golden-only, kept under `both`).
+conventions: updated default-account assertions.
+
+**Follow-up.** `--replay` always writes the temp plan even when `--plan-out`
+isn't given; no cleanup of the temp file (bounded, one per trade_id).
+
 ## v85 — 2026-07-12 — replay: show *why* a marked golden didn't enter
 
 **Why.** v84's golden-candle marker answered "did a golden print here?" but not
