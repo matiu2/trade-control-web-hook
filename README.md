@@ -1632,6 +1632,13 @@ is not confirmed`, and the `EntryOutsideRange` / geometry resolve errors. The
 reason string is the engine's own — the same one the worker's `run_enter` would
 log — so the offline replay can't drift from live.
 
+**Golden-only view suppresses the `not golden` decline.** Under the default
+`--candle-detector-golden golden` you're explicitly asking for golden candles
+only, so a `needs golden but signal is not golden` decline is tautological noise
+(a non-golden signal declined *for* being non-golden) — the replay drops it from
+both the rollup and the per-bar line. Pass `--candle-detector-golden both` (or
+`non-golden`) to see those declines; every other decline reason is always shown.
+
 **Break-even arming (`be:` line).** Break-even is *not* a fill-time decision —
 in production the live cron (`breakeven_watch`) sends `amend_stop(entry)` to the
 broker on the first 15-min tick that observes a candle closing past the
@@ -2675,7 +2682,7 @@ CLI:
 ```sh
 cargo run -p tv-arm -- \
   --broker tradenation \              # or oanda; auto-detected from chart exchange
-  --account-id ms-tn-1 \              # defaults to ms-<broker>-1
+  --account-id reversals \            # defaults per broker: tradenation → reversals, oanda → m-and-w
   --risk-pct 0.5 \                    # % of NAV (or --risk-amount <home-ccy>)
   --reversal-band-pct 0.1 \           # half-width % around support/resistance lines (default 0.1)
   --veto-on-reversal \                # experimental: a reversal off a band before entry also vetoes the upcoming trade (default off)
@@ -2693,11 +2700,44 @@ cargo run -p tv-arm -- \
   --recover-entry limit \             # H&S/iH&S: how to recover a stop entry gone wrong-side during confirmation — market | limit | abort. Omit to default off --require-confirmation (limit) else drop
   --blackout-close close \            # market-hours blackout: also flatten an open position if caught in the close→open gap (default: cancel = cancel the resting order only)
   --register-plan \                   # arm the trade: register one signed TradePlan with the server-side engine
-  --shadow                            # register observe-only: engine evaluates + logs, but never places orders (safe dry watch)
+  --shadow \                          # register observe-only: engine evaluates + logs, but never places orders (safe dry watch)
+  --replay                            # after arming, chain into replay-candles on the just-built plan (see below). Tokens AFTER --replay pass through to replay-candles
 ```
 
 Run `tv-arm --help` for the full flag surface — it has diverged from the
 deprecated Python script.
+
+#### `--replay`: arm then immediately replay the plan
+
+`--replay` chains straight from arming into the offline
+[`replay-candles`](#candle-replay-replay-candles--golden-fixtures) report on the
+plan `tv-arm` just built — no second command, no copying the plan path. It:
+
+1. writes the plan JSON (to `--plan-out <path>` if given, else a temp file), then
+2. shells out to the **environment-matched** `replay-candles-<env>` binary
+   (`tv-arm-staging --replay` → `replay-candles-staging`), with sensible
+   defaults: `--verbose --annotate true --source <resolved-broker>`.
+
+Any tokens **after** `--replay` pass through to `replay-candles` verbatim and
+**override** the defaults (clap's last-value-wins), validated against the shared
+`ReplayArgs` clap definition before the shell-out so a bad flag fails with
+`replay-candles`' own error:
+
+```sh
+# arm + replay with defaults (verbose, annotate the chart, source = the plan's broker)
+tv-arm --replay
+
+# override: don't annotate, widen the warm-up, mark both golden and non-golden
+tv-arm --replay --annotate false --warmup-bars 400 --candle-detector-golden both
+
+# if a passthrough flag collides with one of tv-arm's own, end tv-arm's flags with `--`
+tv-arm --start 2026-07-01T00:00 --replay -- --start 2026-07-01T00:00
+```
+
+The replay is a **post-arm convenience** — the plan is already armed by the time
+it runs; a replay failure is surfaced as an error but doesn't un-arm the plan.
+`--replay` needs neither `--plan-out` nor `--register-plan`: on its own it builds
+the plan, writes it to a temp file, and replays it.
 
 ### Dual entry — `--strategy-v2` (stop + Quasimodo)
 

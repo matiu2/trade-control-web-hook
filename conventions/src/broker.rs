@@ -43,8 +43,8 @@ impl Broker {
     /// caller hasn't passed `--account-id` or set `TRADE_CONTROL_ACCOUNT`.
     pub fn default_account_index(self) -> &'static str {
         match self {
-            Self::Oanda => "ms-oanda-1",
-            Self::TradeNation => "ms-tn-1",
+            Self::Oanda => "m-and-w",
+            Self::TradeNation => "reversals",
         }
     }
 }
@@ -78,7 +78,7 @@ mod tests {
 
     #[test]
     fn default_account_indices() {
-        assert_eq!(Broker::Oanda.default_account_index(), "ms-oanda-1");
-        assert_eq!(Broker::TradeNation.default_account_index(), "ms-tn-1");
+        assert_eq!(Broker::Oanda.default_account_index(), "m-and-w");
+        assert_eq!(Broker::TradeNation.default_account_index(), "reversals");
     }
 }

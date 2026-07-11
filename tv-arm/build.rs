@@ -33,4 +33,13 @@ fn main() {
         .unwrap_or_else(|_| "http://127.0.0.1:8787".to_string());
     println!("cargo:rustc-env=BAKED_WEBHOOK={webhook}");
     println!("cargo:rerun-if-env-changed=TRADE_CONTROL_WEBHOOK");
+
+    // Bake this environment's CLI suffix (`dev` / `staging`, empty for a plain
+    // `cargo build`). The deploy scripts set `TRADE_CONTROL_ENV_SUFFIX` so
+    // `tv-arm-<suffix> --replay` shells out to the matching
+    // `replay-candles-<suffix>` binary. An empty suffix falls back to the plain
+    // `replay-candles` on PATH.
+    let env_suffix = std::env::var("TRADE_CONTROL_ENV_SUFFIX").unwrap_or_default();
+    println!("cargo:rustc-env=BAKED_ENV_SUFFIX={env_suffix}");
+    println!("cargo:rerun-if-env-changed=TRADE_CONTROL_ENV_SUFFIX");
 }

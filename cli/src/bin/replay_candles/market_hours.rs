@@ -38,7 +38,7 @@ use color_eyre::eyre::{Result, eyre};
 use trade_control_core::intent::{Buffers, NoEntryWindow, windows_from_session};
 use tradenation_api::{Session, get_market_info, login, login_demo, resolve_market};
 
-use super::source::CandleSource;
+use trade_control_cli::replay_args::CandleSource;
 
 /// Resolve `instrument`'s market-hours no-entry windows from the same source the
 /// live worker uses, or an empty set (with a `WARN`) on any miss.

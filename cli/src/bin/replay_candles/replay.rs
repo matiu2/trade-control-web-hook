@@ -23,9 +23,9 @@ use trade_control_engine::{
 
 use trade_control_core::signals::{DetectFlags, atr_length_for, detect_at, wilder_atr};
 
-use super::detector_marks::DetectorMarkConfig;
 use super::replay_broker::ReplayBroker;
 use super::verbose::{BarTrace, DetectedMark};
+use trade_control_cli::replay_args::DetectorMarkConfig;
 
 /// The entry decision the **real** dispatch (`trade_control_core::dispatch::run_enter`)
 /// reached for one fired `enter`, carried on the [`Fire`] so the report reads it
@@ -277,9 +277,17 @@ pub async fn run(
         // needs-confirmed / resolve-failed like below-min-R). `evaluate_plan`
         // saw only this one new bar, so every decline belongs to `candles[i]` —
         // this is the "golden seen but no entry, here's why" line.
+        //
+        // Suppress the `not golden` decline when marking golden-only candles: in
+        // that view it's tautological noise (the operator already said they only
+        // care about golden signals). See `suppresses_not_golden_decline`.
+        let hide_not_golden = mark_cfg.suppresses_not_golden_decline();
         let decline_reasons: Vec<String> = eval
             .entry_declines
             .iter()
+            .filter(|d| {
+                !(hide_not_golden && d.reason == trade_control_core::plan_eval::NOT_GOLDEN_DECLINE)
+            })
             .map(|d| d.reason.clone())
             .collect();
         traces.push(BarTrace::diff(
@@ -681,9 +689,9 @@ async fn inject_control_ticks(
 
 #[cfg(test)]
 mod tests {
-    use super::super::detector_marks::{DirectionFilter, GoldenFilter};
     use super::*;
     use chrono::TimeZone;
+    use trade_control_cli::replay_args::{DirectionFilter, GoldenFilter};
     use trade_control_engine::intent::Direction;
 
     /// The detector-mark config for tests that don't exercise marking: feature
@@ -1710,5 +1718,119 @@ mod tests {
             verbose.contains("◆ GOLDEN") && verbose.contains("✗ not entered:"),
             "verbose joins the golden mark and the decline on the bar:\n{verbose}"
         );
+    }
+
+    /// A window whose warm-up bars have a WIDE range (large ATR) so the trailing
+    /// bullish pinbar is a valid detected signal but its size is BELOW ATR — i.e.
+    /// **non-golden**. Mirrors `window_with_golden_pinbar`'s geometry, scaled so
+    /// the pinbar is small relative to the warm-up volatility.
+    fn window_with_non_golden_pinbar() -> (Vec<EngineCandle>, DateTime<Utc>) {
+        // 30 WIDE warm-up bars (range 0.20 → large ATR ≈ 0.20).
+        let mut candles: Vec<EngineCandle> = (0..30)
+            .map(|i| ohlc(i * 3600, 1.10, 1.20, 1.00, 1.10))
+            .collect();
+        // bar 30: prior bar whose low 1.085 the pinbar must undercut.
+        candles.push(ohlc(30 * 3600, 1.10, 1.11, 1.085, 1.09));
+        // bar 31: a SMALL bullish pinbar — range 1.06..1.11 (0.05 ≪ ATR ≈ 0.20),
+        // body in the top quartile, long lower wick, low 1.06 < prior low 1.085.
+        // Detected as a bullish reversal, but size 0.05 < ATR → NOT golden.
+        candles.push(ohlc(31 * 3600, 1.10, 1.11, 1.06, 1.105));
+        // bar 32: trailing flat bar so bar 31 is a fully-closed live bar.
+        candles.push(ohlc(32 * 3600, 1.105, 1.11, 1.10, 1.105));
+        let live = candles[25].time;
+        (candles, live)
+    }
+
+    /// A `needs_golden` long enter whose trigger sits far away so it never fires;
+    /// a non-golden signal on any bar produces the `not golden` decline.
+    fn needs_golden_never_fires_plan() -> TradePlan {
+        serde_json::from_str(
+            r#"{
+                "trade_id": "needs-golden",
+                "instrument": "EUR_USD",
+                "direction": "long",
+                "granularity": "h1",
+                "pip_size": 0.0001,
+                "rules": [{
+                    "rule_id": "05-enter",
+                    "trigger": { "type": "pine_pattern", "dir": "long" },
+                    "fire_mode": "once",
+                    "intent": {
+                        "v": 1, "id": "needs-golden-enter", "not_after": "2099-01-01T00:00:00Z",
+                        "action": "enter", "instrument": "EUR_USD", "direction": "long",
+                        "needs_golden": true,
+                        "entry": { "type": "stop", "from": "signal_high", "offset_pips": 0.0 },
+                        "stop_loss": { "from": "signal_low", "offset_pips": 0.0 },
+                        "take_profit": { "absolute": 9.99 },
+                        "broker": "oanda", "trade_id": "needs-golden", "max_retries": 0
+                    }
+                }]
+            }"#,
+        )
+        .expect("parse needs-golden plan")
+    }
+
+    /// The bug: with `--candle-detector-golden golden` (the default), a
+    /// `needs golden but signal is not golden` decline is tautological noise —
+    /// the operator asked to see golden-only candles. It must be suppressed from
+    /// BOTH the per-bar trace and the always-on rollup. Under `both`, it's kept.
+    #[tokio::test]
+    async fn not_golden_decline_suppressed_under_golden_only_filter() {
+        let (candles, live) = window_with_non_golden_pinbar();
+        let plan = needs_golden_never_fires_plan();
+
+        // Default view: golden-only. The non-golden pinbar declines with the
+        // NOT_GOLDEN reason, which must be suppressed.
+        let golden_only =
+            DetectorMarkConfig::new(DirectionFilter::With, GoldenFilter::Golden, Direction::Long);
+        let r = run(
+            &plan,
+            &candles,
+            Granularity::H1,
+            live,
+            expires(),
+            golden_only,
+        )
+        .await;
+
+        // Sanity: the signal is genuinely non-golden (else this test proves
+        // nothing). Under a `both` golden filter it's marked and NOT golden.
+        let both =
+            DetectorMarkConfig::new(DirectionFilter::With, GoldenFilter::Both, Direction::Long);
+        let r_both = run(&plan, &candles, Granularity::H1, live, expires(), both).await;
+        let marked: Vec<&super::super::verbose::DetectedMark> = r_both
+            .traces
+            .iter()
+            .filter_map(|t| t.detected.as_ref())
+            .collect();
+        assert!(
+            marked.iter().any(|m| !m.golden),
+            "the pinbar is a detected NON-golden signal: {marked:?}"
+        );
+
+        // Under golden-only: the NOT_GOLDEN decline is gone from every trace…
+        let hidden = r
+            .traces
+            .iter()
+            .flat_map(|t| t.entry_declines.iter())
+            .any(|d| d == trade_control_core::plan_eval::NOT_GOLDEN_DECLINE);
+        assert!(
+            !hidden,
+            "not-golden decline suppressed from traces under golden-only"
+        );
+        // …and from the always-on rollup + verbose bar lines.
+        let report = crate::report::render(&plan, &r, true, true, &[], None, &golden_only);
+        assert!(
+            !report.contains("needs golden but signal is not golden"),
+            "not-golden decline absent from the report under golden-only:\n{report}"
+        );
+
+        // Under `both`: the decline IS kept (the operator wants non-golden info).
+        let kept = r_both
+            .traces
+            .iter()
+            .flat_map(|t| t.entry_declines.iter())
+            .any(|d| d == trade_control_core::plan_eval::NOT_GOLDEN_DECLINE);
+        assert!(kept, "not-golden decline retained under the `both` filter");
     }
 }
