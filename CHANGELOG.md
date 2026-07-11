@@ -1,5 +1,61 @@
 # Changelog
 
+## v88 — 2026-07-12 — spread-hour "rubbish candle": suppress entries, signals, crosses
+
+**Why.** A `--replay --strategy-v2` of AUD/CHF over 2026-07-08 booked −2R. Entry
+#1 (a resting short-stop) **filled and stopped out inside a single H1 bar** at
+07:00 Brisbane (21:00 UTC) — AUD/CHF's biggest learned spread hour (baked p90
+12p). Tick data confirmed the bid/ask gapped the spread to ~12p at the top of the
+hour, straddling the whole entry/SL bracket: it's a liquidity-vacuum spike, not a
+market move. The operator's framing: **treat spread-hour candles as rubbish** and
+refuse to originate anything from them.
+
+**What changed.** On a **spread hour** for an instrument
+(`trade_control_core::spread_blackout::is_spread_hour` — the baked per-instrument
+mask + 30-min lead, or the NY-close-edge fallback for un-sampled instruments), the
+engine now suppresses, on that bar:
+- **new entries** — leading guard in `evaluate_one_entry` (covers PinePattern H&S
+  and M/W enters);
+- **level crosses** — gated in `fire_rule` (break-and-close, invalidation vetos,
+  control crosses, M/W triggers) and in `stamp_retest` (the retest);
+- **signal detection** — the reversal-close `eval_pine_guard` arm in
+  `evaluate_guards`;
+- **replay pending fills** — `find_fill` skips a Stop/Limit that would first fill
+  on a spread-hour bar; the order stays resting and fills on the next clean bar.
+
+Because the live worker's cron runs the **same** `evaluate_plan`, the
+entry/signal/cross suppression is live automatically — no worker-side code. The
+`find_fill` gate is replay-only (the worker uses real broker fills; its engine
+gate already stops the enter *firing*, so no order is placed on a rubbish bar).
+
+**Not suppressed (deliberate).** SL/TP exits — a real broker stops you regardless;
+that exposure is the job of the separate open-position **stop-widen** (System 2).
+The `is_past`-inclusive `entry_level_vetos` gap-past protection (Bug #12) is a
+separate path and untouched.
+
+**Correctness.** `record_last_close` runs BEFORE the `fire_rule` suppression, so a
+spread-hour bar still seeds `last_close` — an OnClose cross on the next clean bar
+is measured correctly (no desync). Every gate is a leading `if is_spread_hour {…}`
+in front of unchanged logic, so the predicate-false path is byte-identical.
+
+**Config.** No new fields; reuses the baked spread-hour table. Un-sampled
+instruments fall back to the NY-close edge.
+
+**Verbose.** A golden marked on a spread-hour bar renders
+`⌀ spread-hour (rubbish candle) — entry/detection/crosses suppressed`, so a
+"golden printed but nothing fired" bar is explained.
+
+**Tests.** New: entry suppressed + clean twin fires (`evaluate.rs`);
+break-and-close cross suppressed but `last_close` preserved + clean recovery;
+retest stamp suppressed + clean stamp; reversal-close detection suppressed + clean
+twin; `find_fill` skips a spread-hour bar and fills the next clean one + non-edge
+twin fills immediately (`simulator.rs`); verbose `⌀` marker rendered / quiet
+without a mark (`verbose.rs`). Full suites green (816 core, 144 engine, all cli).
+
+**Follow-up.** A redundant live-clock reject in `run_enter` (defense-in-depth for
+a manually re-POSTed alert) was scoped but deferred — the engine gate already
+blocks the fire in both worker and replay.
+
 ## v87 — 2026-07-12 — replay: `✗ not taken` — why a marked golden's enter never fired
 
 **Why.** v85's `✗ not entered` explains a golden whose enter *fired* and was

@@ -1825,6 +1825,28 @@ marker with `core::ny_clock::is_ny_close_edge(fire_bar.time)` — exactly the
 close-edge hour, where the live window can persist a little longer until the
 recovery watcher clears it.
 
+**Spread-hour "rubbish candle": entries, signal detection, and level crosses are
+suppressed.** During a learned **spread hour** for an instrument (its baked
+per-instrument mask + a 30-min lead, or the NY-close-edge fallback for
+un-sampled instruments — the same `trade_control_core::spread_blackout::is_spread_hour`
+the pre-emptive stop-widen uses) the candle's OHLC is a liquidity-vacuum spread
+blowout, not a real market move. So the engine **originates nothing** off it: no
+new-entry fire, no golden/confirmed signal detection, no level cross
+(break-and-close, retest, invalidation veto, reversal-close detection, M/W
+triggers). The next clean bar re-evaluates. This lives in the shared
+`evaluate_plan` / `simulate_fill`, so the live worker and the offline replay
+behave identically. **Not suppressed:** SL/TP exits — a real broker stops you
+regardless (the separate open-position stop-widen covers that exposure), and the
+`is_past`-inclusive `entry_level_vetos` gap-past protection (Bug #12), which is a
+separate path. A pending Stop/Limit that would fill on a spread-hour bar stays
+resting and fills on the next clean bar. In `--verbose`, a golden marked on a
+spread-hour bar (still shown in the detector summary) carries a
+`⌀ spread-hour (rubbish candle) — entry/detection/crosses suppressed` line so a
+"golden printed but nothing fired" bar is explained, not a silent mystery.
+Motivated by AUD/CHF 2026-07-08 07:00 Brisbane (21:00 UTC, the instrument's
+biggest baked spread hour at 12p p90), where a resting short-stop filled and
+stopped out inside a single 12p-spread bar.
+
 **Replay applies the pre-broker entry gate (`allow_entry` + candle-quality).**
 The live worker's `run_enter` rejects an entry — before any order reaches the
 broker — when the intent's `allow_entry` Rhai script returns `false` (or fails

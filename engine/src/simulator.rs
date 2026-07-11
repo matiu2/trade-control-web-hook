@@ -466,9 +466,19 @@ fn find_fill<'a>(
                     .unwrap_or(&[]),
                 None => after_fire,
             };
-            let i = fill_window
-                .iter()
-                .position(|c| book_reaches(c, entry_book, trigger_price, entry_approach))?;
+            // Spread-hour "rubbish candle": a pending Stop/Limit whose trigger is
+            // first reached on a learned spread hour must NOT fill there — the
+            // bar is a liquidity-vacuum spike, not a real touch (the AUD/CHF
+            // 2026-07-08 fill-into-the-spread-hour case). The order stays resting
+            // and fills on the next clean bar. Mirrors the worker's entry gate so
+            // replay == live. See SCOPING-spread-hour-rubbish-candle.md.
+            let i = fill_window.iter().position(|c| {
+                book_reaches(c, entry_book, trigger_price, entry_approach)
+                    && !trade_control_core::spread_blackout::is_spread_hour(
+                        &intent.instrument,
+                        c.time,
+                    )
+            })?;
             // `i` indexes `fill_window` (a prefix of `after_fire`), so the fill
             // bar is `candles[i + 1]`. The post-fill search **includes** the fill
             // bar itself (`candles[i + 1..]`): an order that fills mid-bar can be
@@ -1333,6 +1343,67 @@ mod tests {
                 );
             }
             other => panic!("gapped-through short stop must fill, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pending_stop_does_not_fill_on_a_spread_hour_bar() {
+        // A resting sell-stop (trigger 1.1000) whose price is first reached on a
+        // 21:00Z spread-hour bar must NOT fill there — the candle is a rubbish
+        // liquidity-vacuum spike. The order stays resting and fills on the next
+        // CLEAN bar (23:00Z), then takes profit. Mirrors the AUD/CHF 2026-07-08
+        // fill-into-the-spread-hour case that motivated this. `EUR_USD` is
+        // un-sampled, so `is_spread_hour` uses the 21:00Z NY-close-edge fallback.
+        let intent = short_stop_intent();
+        let shell = trigger_shell();
+        let path = [
+            // fire bar (skipped), well before the spread hour.
+            candle("2026-06-17T20:00:00Z", 1.1042, 1.1045, 1.1041, 1.1043),
+            // 21:00Z SPREAD HOUR: range straddles the 1.1000 trigger (low 1.0990)
+            // — WOULD fill, but is rubbish → skipped.
+            candle("2026-06-17T21:00:00Z", 1.0998, 1.1002, 1.0990, 1.0995),
+            // 23:00Z CLEAN: reaches the trigger again → fills here.
+            candle("2026-06-17T23:00:00Z", 1.0999, 1.1001, 1.0992, 1.0996),
+            // TP bar: runs to 1.0950.
+            candle("2026-06-18T00:00:00Z", 1.0994, 1.0996, 1.0945, 1.0948),
+        ];
+        match simulate_fill(&intent, &shell, 0.0001, &path) {
+            SimOutcome::TookProfit {
+                fill_at,
+                entry_price,
+                ..
+            } => {
+                assert_eq!(
+                    fill_at,
+                    ts("2026-06-17T23:00:00Z"),
+                    "fill must skip the 21:00Z spread-hour bar and land on the clean 23:00Z bar"
+                );
+                assert!((entry_price - 1.1000).abs() < 1e-9);
+            }
+            other => panic!("expected a clean-bar fill then TP, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pending_stop_fills_on_the_same_bar_off_a_spread_hour() {
+        // Predicate-false twin: the exact same fill bar on a NON-edge hour fills
+        // immediately (byte-identical to today). 12:00Z is not an NY-close edge.
+        let intent = short_stop_intent();
+        let shell = trigger_shell();
+        let path = [
+            candle("2026-06-17T10:30:00Z", 1.1042, 1.1045, 1.1041, 1.1043),
+            candle("2026-06-17T11:00:00Z", 1.0998, 1.1002, 1.0990, 1.0995),
+            candle("2026-06-17T12:00:00Z", 1.0994, 1.0996, 1.0945, 1.0948),
+        ];
+        match simulate_fill(&intent, &shell, 0.0001, &path) {
+            SimOutcome::TookProfit { fill_at, .. } => {
+                assert_eq!(
+                    fill_at,
+                    ts("2026-06-17T11:00:00Z"),
+                    "a clean-hour bar fills immediately as today"
+                );
+            }
+            other => panic!("expected an immediate fill then TP, got {other:?}"),
         }
     }
 
