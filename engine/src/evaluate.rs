@@ -62,7 +62,7 @@ use chrono::{DateTime, Utc};
 
 use trade_control_core::broker::Candle;
 use trade_control_core::intent::{Action, Direction, SignalKind};
-use trade_control_core::plan_eval::{FiredIntent, PlanEval};
+use trade_control_core::plan_eval::{EntryDecline, FiredIntent, PlanEval};
 use trade_control_core::plan_state::{Phase, PlanState};
 use trade_control_core::signals::{
     DetectorConfig, LatchedSignal, atr_length_for, first_confirmed_signal_at, latched_signal_at,
@@ -182,6 +182,7 @@ pub fn evaluate_plan(
     let mut state = prior.clone();
     state.expires_at = expires_at;
     let mut fired = Vec::new();
+    let mut entry_declines: Vec<EntryDecline> = Vec::new();
     let detector_cfg = DetectorConfig::pine_defaults(plan.granularity);
 
     for candle in new_candles {
@@ -232,6 +233,7 @@ pub fn evaluate_plan(
                     detector_window,
                     &detector_cfg,
                     &mut fired,
+                    &mut entry_declines,
                 );
             }
             Phase::Done => {}
@@ -250,6 +252,7 @@ pub fn evaluate_plan(
         new_state: state,
         done,
         warnings,
+        entry_declines,
     }
 }
 
@@ -289,6 +292,8 @@ pub fn evaluate_controls_only(
         new_state: state,
         done,
         warnings: Vec::new(),
+        // Control-only ticks never evaluate an enter, so there are no declines.
+        entry_declines: Vec::new(),
     }
 }
 
@@ -582,6 +587,7 @@ fn evaluate_entry(
     detector_window: &[Candle],
     detector_cfg: &DetectorConfig,
     fired: &mut Vec<FiredIntent>,
+    declines: &mut Vec<EntryDecline>,
 ) {
     // Snapshot the enter rule_ids up front so we can borrow `plan` immutably in
     // the loop while mutating `state`. Skip ones already latched (a fired
@@ -607,6 +613,7 @@ fn evaluate_entry(
             detector_window,
             detector_cfg,
             fired,
+            declines,
         );
         // A terminal single-shot enter ends the spine — stop evaluating the
         // rest (there is at most one such enter, and the plan is now Done).
@@ -631,6 +638,7 @@ fn evaluate_one_entry(
     detector_window: &[Candle],
     detector_cfg: &DetectorConfig,
     fired: &mut Vec<FiredIntent>,
+    declines: &mut Vec<EntryDecline>,
 ) {
     // Replay-start entry floor (journaling only). When a plan carries a
     // `replay_start` cursor (baked by `tv-arm --start`), the bars before it are
@@ -712,8 +720,16 @@ fn evaluate_one_entry(
     // `run_enter → maybe_update_mw_state`, so pre-resolving it here would
     // wrongly suppress the heartbeat. `signal.is_some()` ⇔ a Pine fire.
     if let Some(sig) = &signal
-        && !pine_entry_dispatchable(&rule.intent, candle, sig, plan.pip_size)
+        && let Err(reason) = pine_entry_dispatchable(&rule.intent, candle, sig, plan.pip_size)
     {
+        // Record *why* the enter declined this bar so the offline replay can show
+        // it on the marked candle (needs-golden / needs-confirmed / resolve
+        // failure like below-min-R). Diagnostic only — the plan stays armed.
+        declines.push(EntryDecline {
+            bar: candle.time,
+            rule_id: rule.rule_id.clone(),
+            reason,
+        });
         return;
     }
 
@@ -1063,26 +1079,28 @@ fn pine_entry_dispatchable(
     candle: &Candle,
     sig: &LatchedSignal,
     pip_size: f64,
-) -> bool {
+) -> Result<(), String> {
     // Candle-quality gate — `None`/`false` both fail (conservative reject),
-    // matching `candle_gate::evaluate`.
+    // matching `candle_gate::evaluate`. The reason strings are the human wording
+    // the replay report surfaces on the bar.
     if intent.needs_golden && !sig.golden {
         tracing::debug!(
             bar = %candle.time,
             "pine-enter: NOT dispatchable — needs_golden but signal is not golden"
         );
-        return false;
+        return Err("needs golden but signal is not golden".to_string());
     }
     if intent.needs_confirmed && !sig.signal_confirmed {
         tracing::debug!(
             bar = %candle.time,
             "pine-enter: NOT dispatchable — needs_confirmed but signal is not confirmed"
         );
-        return false;
+        return Err("needs confirmation but signal is not confirmed".to_string());
     }
     // Bracket resolution against the same signal-folded shell the worker
     // dispatches. An `Err` (degenerate geometry, below-min-R, out-of-range, …)
-    // is a decline-this-bar, not a fire.
+    // is a decline-this-bar, not a fire. The `ResolveError`'s own Display carries
+    // the specifics (e.g. "trade R=0.914 is below the required minimum of 1.000").
     let shell = trade_control_core::intent::Shell::from_candle_and_signal(candle, sig);
     // Same tick fallback as the worker/replay (baked intent tick → pip) so a
     // rounding-induced out-of-range/sub-R rejection is reflected here too.
@@ -1090,11 +1108,11 @@ fn pine_entry_dispatchable(
     match trade_control_core::intent::Resolved::from_intent(intent, &shell, pip_size, tick_size) {
         Ok(_) => {
             tracing::debug!(bar = %candle.time, "pine-enter: dispatchable — will fire enter");
-            true
+            Ok(())
         }
         Err(e) => {
             log_rejected_entry_spec(&e, intent, &shell, pip_size);
-            false
+            Err(e.to_string())
         }
     }
 }
@@ -4306,6 +4324,42 @@ mod tests {
             !eval.new_state.fired.contains("05-enter"),
             "the enter rule does not latch on a resolve-failure"
         );
+        // The decline reason is recorded on the eval so the offline replay can
+        // show *why* the enter didn't fire (was silently `debug!`-only before).
+        assert_eq!(
+            eval.entry_declines.len(),
+            1,
+            "the resolve-failed enter records exactly one decline"
+        );
+        assert_eq!(eval.entry_declines[0].rule_id, "05-enter");
+        assert!(
+            eval.entry_declines[0].reason.contains("range")
+                || eval.entry_declines[0].reason.contains("R="),
+            "the decline carries the resolve error's own wording: {}",
+            eval.entry_declines[0].reason
+        );
+    }
+
+    #[test]
+    fn needs_golden_decline_is_recorded_with_reason() {
+        // A `needs_golden` enter on a non-golden latch declines — and records the
+        // human reason (not just a silent return), so the replay can surface it.
+        let mut r = pine_enter_rule(None, Direction::Short, false);
+        r.intent.needs_golden = true;
+        let p = plan(vec![r]);
+        let window = bearish_pinbar_window();
+        let prior = seed_at(Phase::AwaitEntry, "2026-06-16T10:00:00Z");
+        let eval = run_window(&p, &prior, &window[3..], &window);
+        assert!(
+            eval.fired.is_empty(),
+            "needs_golden blocks the non-golden bar"
+        );
+        assert_eq!(eval.entry_declines.len(), 1, "one decline recorded");
+        assert!(
+            eval.entry_declines[0].reason.contains("golden"),
+            "reason names the golden gate: {}",
+            eval.entry_declines[0].reason
+        );
     }
 
     #[test]
@@ -4662,19 +4716,24 @@ mod tests {
         let sig = latched_signal_at(&window, 3, &DetectorConfig::pine_defaults(Granularity::H1))
             .expect("the window prints a latched signal on the pinbar");
 
-        // Resolvable, no gates → dispatchable.
+        // Resolvable, no gates → dispatchable (Ok).
         let ok = pine_enter_rule(None, Direction::Short, false).intent;
-        assert!(pine_entry_dispatchable(&ok, &last, &sig, 0.0001));
+        assert!(pine_entry_dispatchable(&ok, &last, &sig, 0.0001).is_ok());
 
-        // needs_golden on a non-golden latch → not dispatchable.
+        // needs_golden on a non-golden latch → declines with the golden reason.
         let mut golden = ok.clone();
         golden.needs_golden = true;
         assert!(!sig.golden, "fixture precondition: latch is non-golden");
-        assert!(!pine_entry_dispatchable(&golden, &last, &sig, 0.0001));
+        let err = pine_entry_dispatchable(&golden, &last, &sig, 0.0001)
+            .expect_err("needs_golden must decline on a non-golden latch");
+        assert!(
+            err.contains("golden"),
+            "reason names the golden gate: {err}"
+        );
 
-        // Unresolvable bracket → not dispatchable.
+        // Unresolvable bracket → declines with the resolve error's wording.
         let bad = pine_enter_rule_unresolvable_tp().intent;
-        assert!(!pine_entry_dispatchable(&bad, &last, &sig, 0.0001));
+        assert!(pine_entry_dispatchable(&bad, &last, &sig, 0.0001).is_err());
     }
 
     // ===== close-on-reversal (PinePattern guard) =====
