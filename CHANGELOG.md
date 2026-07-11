@@ -1,5 +1,52 @@
 # Changelog
 
+## v85 — 2026-07-12 — replay: show *why* a marked golden didn't enter
+
+**Why.** v84's golden-candle marker answered "did a golden print here?" but not
+"then why didn't it enter?". A golden can fire the detector, match the trade
+direction, and still be declined by the engine's pre-flight
+(`pine_entry_dispatchable`) — the candle-quality gate (`needs_golden` /
+`needs_confirmed`) or a bracket resolve failure (below-min-R, entry outside
+SL..TP, degenerate geometry). That decline was a `tracing::debug!`-only line, so
+without `RUST_LOG=…=debug` the golden looked like it should have entered and
+mysteriously didn't. Surfaced by a USD/ZAR iH&S replay: a golden Short engulfer
+was R=0.914 < 1.0 and silently skipped.
+
+**What changed.** The engine now *records* each `PinePattern` enter decline
+instead of only logging it: `pine_entry_dispatchable` returns the reason string
+(candle-quality wording, or the `ResolveError`'s own Display), `evaluate_plan`
+collects them into a new `PlanEval.entry_declines: Vec<EntryDecline>` (bar +
+rule_id + reason). The replay surfaces them **always on, no flag**:
+
+- an `Entry declines:` rollup near the top of the report (bar + `✗ reason`), and
+- under `--verbose`, a `✗ not entered: <reason>` line right under the `◆` mark on
+  the same bar.
+
+The reason string is the engine's own (the same one the worker's `run_enter`
+would log), so the offline replay can't drift from live
+(`[[strategy_changes_in_both_replayer_and_worker]]`).
+
+**Breaking.** `PlanEval` gained `entry_declines` (`#[serde(default)]`, so older
+tick bundles still deserialise; not part of the replay diff — like `warnings`).
+`pine_entry_dispatchable` now returns `Result<(), String>` instead of `bool`;
+`evaluate_entry` / `evaluate_one_entry` gained a `&mut Vec<EntryDecline>` param.
+All engine-internal.
+
+**Config.** None — the decline surface is always on. No new flags, no plan
+changes.
+
+**Tests.** Engine: `pine_enter_resolve_failed_does_not_retire_plan` now asserts
+the decline is recorded with the R-floor / range wording; new
+`needs_golden_decline_is_recorded_with_reason`; `pine_entry_dispatchable_unit`
+updated to the `Result` API. Replay: new
+`golden_enter_decline_reason_surfaces_on_the_bar_and_in_summary` (resolve-fail
+golden → decline shown in the always-on rollup and the verbose `✗` line). Engine
+134, core 816, cli 88 green; the v84 fixture still matches `expected.json`.
+
+**Follow-up.** The rollup lists every declined bar; on a long multi-shot window
+with many sub-R signals it could get chatty — a `--max-declines N` cap or a
+dedupe-by-reason could tidy it if it ever bites. Not needed today.
+
 ## v84 — 2026-07-12 — replay: mark every golden candle the detector saw
 
 **Why.** The `replay-candles` report only ever surfaces a signal when it

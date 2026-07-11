@@ -12,12 +12,38 @@
 //! the round-trip test compare the **serialized JSON** instead — which is the
 //! right equality for float-bearing data anyway.
 
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::broker::Candle;
 use crate::intent::Intent;
 use crate::plan_state::PlanState;
 use crate::signals::LatchedSignal;
+
+/// A bar on which a `PinePattern` enter's signal fired + matched direction, but
+/// the enter was **declined** before it could fire an intent — the pure,
+/// recomputable-here pre-flight rejections (`pine_entry_dispatchable`): the
+/// candle-quality gate (`needs_golden` / `needs_confirmed`) or a bracket
+/// `resolve` failure (below-min-R, out-of-range, degenerate geometry, …).
+///
+/// This is the "the golden printed but nothing entered — why?" surface. The
+/// engine used to swallow the reason at `tracing::debug!`; recording it here
+/// lets the offline replay show it right on the bar, no `RUST_LOG` needed.
+///
+/// Diagnostic only — like [`PlanEval::warnings`], it recomputes from the same
+/// inputs and is **not** part of the replay diff.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EntryDecline {
+    /// Open-time of the bar the enter declined on.
+    pub bar: DateTime<Utc>,
+    /// The enter rule that declined (e.g. `05-enter`).
+    pub rule_id: String,
+    /// Human-readable reason, already worded for display (e.g.
+    /// `needs golden but signal is not golden`, `needs confirmation but signal
+    /// is not confirmed`, `trade R=0.914 is below the required minimum of
+    /// 1.000`).
+    pub reason: String,
+}
 
 /// One intent the evaluator decided to fire this run, tagged with the candle
 /// that triggered it. The wrapper synthesises a `Shell` from `candle` and
@@ -68,6 +94,15 @@ pub struct PlanEval {
     /// recorded inputs).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub warnings: Vec<String>,
+    /// Per-bar `PinePattern` enter declines: a signal fired + matched the plan
+    /// direction, but the pre-flight (`pine_entry_dispatchable`) rejected it
+    /// (needs-golden / needs-confirmed / resolve-failed), so no intent fired and
+    /// the plan stayed armed. The offline replay renders these on the bar so
+    /// "golden seen but no entry" reads its own reason. `#[serde(default)]` keeps
+    /// older tick bundles deserialisable; **not** part of the replay diff (it
+    /// recomputes from the same inputs, exactly like `warnings`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub entry_declines: Vec<EntryDecline>,
 }
 
 impl PlanEval {

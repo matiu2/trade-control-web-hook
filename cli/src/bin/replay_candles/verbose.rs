@@ -88,6 +88,12 @@ pub struct BarTrace {
     /// no signal printed, the signal didn't pass the filter, or the feature is
     /// off. This is the "golden candle we never entered on" surface.
     pub detected: Option<DetectedMark>,
+    /// Why a `PinePattern` enter *declined* this bar, when it did: a signal that
+    /// fired and matched direction, but the pre-flight rejected it (needs-golden,
+    /// needs-confirmed, or resolve-failed like below-min-R). Empty on bars where
+    /// no enter was even evaluated or one fired cleanly. Paired with `detected`,
+    /// this turns "golden seen but no entry" into a one-line answer.
+    pub entry_declines: Vec<String>,
 }
 
 impl BarTrace {
@@ -101,6 +107,7 @@ impl BarTrace {
         after: &PlanState,
         fired_rules: Vec<String>,
         detected: Option<DetectedMark>,
+        entry_declines: Vec<String>,
     ) -> Self {
         let phase_from = (before.phase != after.phase).then_some(before.phase);
         let break_close_stamped = before.break_close_at.is_none() && after.break_close_at.is_some();
@@ -113,6 +120,7 @@ impl BarTrace {
             retest_stamped,
             fired_rules,
             detected,
+            entry_declines,
         }
     }
 
@@ -125,6 +133,7 @@ impl BarTrace {
             && !self.retest_stamped
             && self.fired_rules.is_empty()
             && self.detected.is_none()
+            && self.entry_declines.is_empty()
     }
 
     /// Render this trace as one indented block under a `bar …` header. Returns
@@ -145,6 +154,9 @@ impl BarTrace {
         }
         if let Some(mark) = &self.detected {
             out.push_str(&mark.render());
+        }
+        for reason in &self.entry_declines {
+            out.push_str(&format!("    ✗ not entered: {reason}\n"));
         }
         for rule in &self.fired_rules {
             out.push_str(&format!("    → fired {rule}\n"));
@@ -169,7 +181,7 @@ mod tests {
     #[test]
     fn quiet_bar_renders_empty() {
         let s = state(Phase::AwaitEntry);
-        let t = BarTrace::diff(at(16), &s, &s, Vec::new(), None);
+        let t = BarTrace::diff(at(16), &s, &s, Vec::new(), None, Vec::new());
         assert!(t.is_quiet());
         assert_eq!(t.render(), "");
     }
@@ -179,13 +191,13 @@ mod tests {
         let before = state(Phase::AwaitEntry);
         let mut after = before.clone();
         after.retest_seen_at = Some(at(16));
-        let t = BarTrace::diff(at(16), &before, &after, Vec::new(), None);
+        let t = BarTrace::diff(at(16), &before, &after, Vec::new(), None, Vec::new());
         assert!(t.retest_stamped);
         assert!(!t.is_quiet());
         assert!(t.render().contains("retest stamped"));
 
         // Already-set on the prior bar → not re-reported.
-        let t2 = BarTrace::diff(at(17), &after, &after, Vec::new(), None);
+        let t2 = BarTrace::diff(at(17), &after, &after, Vec::new(), None, Vec::new());
         assert!(!t2.retest_stamped);
         assert!(t2.is_quiet());
     }
@@ -196,7 +208,7 @@ mod tests {
         let mut after = before.clone();
         after.break_close_at = Some(at(15));
         after.phase = Phase::AwaitEntry;
-        let t = BarTrace::diff(at(15), &before, &after, Vec::new(), None);
+        let t = BarTrace::diff(at(15), &before, &after, Vec::new(), None, Vec::new());
         assert!(t.break_close_stamped);
         assert_eq!(t.phase_from, Some(Phase::AwaitBreakAndClose));
         let r = t.render();
@@ -209,7 +221,14 @@ mod tests {
         let before = state(Phase::AwaitEntry);
         let mut after = before.clone();
         after.phase = Phase::Done;
-        let t = BarTrace::diff(at(18), &before, &after, vec!["05-enter".into()], None);
+        let t = BarTrace::diff(
+            at(18),
+            &before,
+            &after,
+            vec!["05-enter".into()],
+            None,
+            Vec::new(),
+        );
         let r = t.render();
         assert!(r.contains("→ fired 05-enter"));
         assert!(r.contains("AwaitEntry→Done"));
@@ -218,7 +237,14 @@ mod tests {
     #[test]
     fn fire_alone_is_not_quiet() {
         let s = state(Phase::AwaitEntry);
-        let t = BarTrace::diff(at(22), &s, &s, vec!["01-veto-too-low".into()], None);
+        let t = BarTrace::diff(
+            at(22),
+            &s,
+            &s,
+            vec!["01-veto-too-low".into()],
+            None,
+            Vec::new(),
+        );
         assert!(!t.is_quiet());
         assert!(t.render().contains("→ fired 01-veto-too-low"));
     }
@@ -236,7 +262,7 @@ mod tests {
             atr: Some(0.0031),
             golden: true,
         };
-        let t = BarTrace::diff(at(16), &s, &s, Vec::new(), Some(mark));
+        let t = BarTrace::diff(at(16), &s, &s, Vec::new(), Some(mark), Vec::new());
         assert!(!t.is_quiet());
         let r = t.render();
         assert!(r.contains("◆ GOLDEN"), "golden mark rendered: {r}");
@@ -254,7 +280,7 @@ mod tests {
             atr: Some(0.0031),
             golden: false,
         };
-        let t = BarTrace::diff(at(16), &s, &s, Vec::new(), Some(mark));
+        let t = BarTrace::diff(at(16), &s, &s, Vec::new(), Some(mark), Vec::new());
         let r = t.render();
         assert!(r.contains("◆ signal"), "non-golden mark: {r}");
         assert!(!r.contains("GOLDEN"), "not tagged golden: {r}");

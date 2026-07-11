@@ -1600,6 +1600,38 @@ Candle detector (Both / Both): 2 bar(s) marked — 1 golden, 1 non-golden
     ◆ GOLDEN Long Pinbar (size=0.00420 atr=0.00310)
 ```
 
+**Why a marked golden didn't enter (`Entry declines` / `✗ not entered`).** A
+golden can print, match the trade direction, and *still* not enter — the engine
+pre-flights every `PinePattern` enter (`pine_entry_dispatchable`) and declines
+the bar if the candle-quality gate (`needs_golden` / `needs_confirmed`) or the
+bracket resolution (below-min-R, entry outside SL..TP range, degenerate
+geometry) fails. The plan stays armed; no intent fires. This used to be a
+`debug`-only log line, so "the golden printed but nothing entered" was a mystery
+without `RUST_LOG`. Now the engine records the reason and the replay surfaces it
+**two ways, always on** (no flag needed):
+
+- An always-on rollup near the top of the report:
+
+  ```text
+  Entry declines: 1 bar(s) an enter fired but was skipped —
+    2026-07-09 23:00:00 +10:00  ✗ trade R=0.914 is below the required minimum of 1.000
+  ```
+
+- And, under `--verbose`, a `✗ not entered:` line right under the `◆` mark on the
+  same bar, so the golden and its decline reason read together:
+
+  ```text
+  bar 2026-07-09 23:00:00 +10:00 phase=AwaitEntry
+    ◆ GOLDEN Short RegularEngulfer (size=0.04940 atr=0.03352)
+    ✗ not entered: trade R=0.914 is below the required minimum of 1.000
+  ```
+
+Typical reasons: `trade R=… is below the required minimum of 1.000` (the R:R
+floor), `needs golden but signal is not golden`, `needs confirmation but signal
+is not confirmed`, and the `EntryOutsideRange` / geometry resolve errors. The
+reason string is the engine's own — the same one the worker's `run_enter` would
+log — so the offline replay can't drift from live.
+
 **Break-even arming (`be:` line).** Break-even is *not* a fill-time decision —
 in production the live cron (`breakeven_watch`) sends `amend_stop(entry)` to the
 broker on the first 15-min tick that observes a candle closing past the
