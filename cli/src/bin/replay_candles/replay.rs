@@ -305,6 +305,8 @@ pub async fn run(
             &fired_rules,
             &decline_reasons,
         );
+        let spread_hour =
+            trade_control_core::spread_blackout::is_spread_hour(&plan.instrument, candles[i].time);
         traces.push(BarTrace::diff(
             candles[i].time,
             &before,
@@ -313,6 +315,7 @@ pub async fn run(
             detected,
             decline_reasons,
             not_taken,
+            spread_hour,
         ));
 
         for warning in eval.warnings {

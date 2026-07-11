@@ -493,6 +493,17 @@ fn evaluate_guards(
         // guard trigger is the plain per-candle predicate.
         let signal = match &rule.trigger {
             Trigger::PinePattern { pattern, dir } => {
+                // Spread-hour "rubbish candle": a reversal-close detector match on
+                // a learned spread hour is a liquidity-vacuum wick — don't flatten
+                // a position off a garbage candle. (The `_` level-cross arm below
+                // is gated inside `fire_rule`.) Shared with the worker (replay ==
+                // live). See SCOPING-spread-hour-rubbish-candle.md.
+                if trade_control_core::spread_blackout::is_spread_hour(
+                    &rule.intent.instrument,
+                    candle.time,
+                ) {
+                    continue;
+                }
                 match eval_pine_guard(
                     &rule.intent,
                     candle,
@@ -652,6 +663,17 @@ fn evaluate_one_entry(
     if let Some(start) = plan.replay_start
         && candle.time.timestamp() < start
     {
+        return;
+    }
+
+    // Spread-hour "rubbish candle": on a learned spread hour (per-instrument
+    // baked mask + 30-min lead, or the NY-close-edge fallback for un-sampled
+    // instruments) the bar's OHLC is a liquidity-vacuum spread blowout, not a
+    // market move — so no new entry may fire off it. A pending Stop/Limit stays
+    // resting (the simulator's `find_fill` skips the bar too); the next clean
+    // bar re-triggers. Shared with the worker so replay == live. See
+    // SCOPING-spread-hour-rubbish-candle.md.
+    if trade_control_core::spread_blackout::is_spread_hour(&plan.instrument, candle.time) {
         return;
     }
 
@@ -1299,11 +1321,19 @@ fn stamp_retest(
     // near-side slack (see `TradePlan::retest_atr_step`). `N` counts bars in the
     // window strictly after the break, up to & including this one (first = 1).
     let tol = retest_tolerance(plan, break_at, candle, window);
+    // Spread-hour "rubbish candle": a retest cross landing on a learned spread
+    // hour is a liquidity-vacuum wick, not a genuine retest — don't stamp it.
+    // `record_last_close` at the tail still runs, so a genuine retest on the
+    // next clean bar is measured correctly. Shared with the worker (replay ==
+    // live). See SCOPING-spread-hour-rubbish-candle.md.
+    let spread_hour =
+        trade_control_core::spread_blackout::is_spread_hour(&plan.instrument, candle.time);
     // Only stamp once: the retest is a milestone the trade passes a single
     // time. Without this latch a later re-cross would re-stamp `retest_seen_at`
     // and re-emit the prep fire every bar (the break-and-close analogue of the
     // strategy-v2 starvation bug).
-    if state.retest_seen_at.is_none()
+    if !spread_hour
+        && state.retest_seen_at.is_none()
         && retest_crossed(
             &rule.trigger,
             candle,
@@ -1537,7 +1567,21 @@ fn fire_rule(
 ) -> bool {
     let prev_close = state.last_close.get(&rule.rule_id).copied();
     let hit = eval_trigger(&rule.trigger, candle, prev_close, window, buffer_pct);
+    // Persist last_close BEFORE the spread-hour gate: a spread-hour bar still
+    // seeds `last_close` so a genuine OnClose cross on the next clean bar is
+    // measured against it — the suppression gates the FIRE decision, not the
+    // bookkeeping (desyncing `last_close` would break the next bar's cross).
     record_last_close(&rule.rule_id, &rule.trigger, candle, state);
+    // Spread-hour "rubbish candle": a level cross (break-and-close, retest,
+    // invalidation veto, control cross, M/W trigger) that lands on a learned
+    // spread hour is a liquidity-vacuum wick, not a real cross — do not fire.
+    // The next clean bar re-evaluates. Shared with the worker (replay == live).
+    // See SCOPING-spread-hour-rubbish-candle.md.
+    if hit
+        && trade_control_core::spread_blackout::is_spread_hour(&rule.intent.instrument, candle.time)
+    {
+        return false;
+    }
     hit
 }
 
@@ -3202,6 +3246,52 @@ mod tests {
     }
 
     #[test]
+    fn spread_hour_bar_suppresses_the_retest_stamp() {
+        // Break stamps on a clean bar. A retest cross that lands on a 21:00Z
+        // spread-hour bar must NOT stamp `retest_seen_at` (rubbish wick), so the
+        // stop enter stays gated. A retest on the next clean bar stamps normally.
+        let p = strategy_v2_plan();
+        let mut prior = seed_at(Phase::AwaitEntry, "2026-06-16T18:00:00Z");
+        prior
+            .last_close
+            .insert("03-prep-break-and-close".into(), 1.2050);
+
+        // Bar 1 (19:00, clean): break-and-close stamps.
+        let c1 = candle("2026-06-16T19:00:00Z", 1.205, 1.205, 1.195, 1.1950);
+        let eval1 = run(&p, &prior, &[c1]);
+        assert_eq!(
+            eval1.new_state.break_close_at,
+            Some(ts("2026-06-16T19:00:00Z"))
+        );
+
+        // Bar 2 (21:00, SPREAD HOUR): straddles up through the neckline — WOULD
+        // stamp the retest, but the bar is rubbish → no stamp, no retest prep,
+        // stop enter stays gated.
+        let c2 = candle("2026-06-16T21:00:00Z", 1.19, 1.205, 1.19, 1.2010);
+        let eval2 = run(&p, &eval1.new_state, &[c2]);
+        assert!(
+            eval2.new_state.retest_seen_at.is_none(),
+            "retest must not stamp on a spread-hour bar (got {:?})",
+            eval2.new_state.retest_seen_at
+        );
+        let f2: Vec<&str> = eval2.fired.iter().map(|f| f.rule_id.as_str()).collect();
+        assert!(!f2.contains(&"04-prep-retest"), "no retest prep on rubbish");
+        assert!(!f2.contains(&"05-enter"), "stop stays gated: no retest");
+
+        // Bar 3 (23:00, clean): the same retest cross stamps normally.
+        let c3 = candle("2026-06-16T23:00:00Z", 1.19, 1.205, 1.19, 1.2010);
+        let eval3 = run(&p, &eval2.new_state, &[c3]);
+        assert_eq!(
+            eval3.new_state.retest_seen_at,
+            Some(ts("2026-06-16T23:00:00Z")),
+            "a clean-bar retest stamps after the spread hour"
+        );
+        let f3: Vec<&str> = eval3.fired.iter().map(|f| f.rule_id.as_str()).collect();
+        assert!(f3.contains(&"04-prep-retest"));
+        assert!(f3.contains(&"05-enter"), "stop fires once retest seen");
+    }
+
+    #[test]
     fn break_and_close_does_not_restamp_after_latching_under_multi_enter() {
         // Regression for the strategy-v2 entry-starvation bug (replay trade 071,
         // GBP/JPY iH&S): a multi-shot plan stays in AwaitEntry, so the break-and-
@@ -4016,6 +4106,58 @@ mod tests {
     }
 
     #[test]
+    fn spread_hour_bar_suppresses_a_break_and_close_cross_but_keeps_last_close() {
+        // A break-and-close OnClose down-cross that lands on a 21:00Z spread-hour
+        // bar must NOT fire (the candle is rubbish). Crucially, the bar's close
+        // is STILL recorded as `last_close` so a genuine cross on the next clean
+        // bar still works — the suppression gates the fire decision, not the
+        // bookkeeping.
+        let p = hs_plan();
+        let prior = seed_at(Phase::AwaitBreakAndClose, "2026-06-16T19:00:00Z");
+        let mut prior = prior;
+        // Seed a prior close above the neckline so an OnClose down-cross is armed.
+        prior
+            .last_close
+            .insert("03-prep-break-and-close".into(), 1.2050);
+        // Spread-hour bar closes below the neckline — WOULD cross, but is rubbish.
+        let c1 = candle("2026-06-16T21:00:00Z", 1.205, 1.205, 1.195, 1.1950);
+        let eval1 = run(&p, &prior, &[c1]);
+        assert!(
+            eval1.fired.is_empty(),
+            "break-and-close must not fire on a spread-hour bar (got {:?})",
+            eval1.fired
+        );
+        assert!(
+            !eval1.new_state.fired.contains("03-prep-break-and-close"),
+            "the cross did not fire, so the rule is not latched"
+        );
+        // Bookkeeping preserved: last_close updated to this bar's close.
+        assert_eq!(
+            eval1
+                .new_state
+                .last_close
+                .get("03-prep-break-and-close")
+                .copied(),
+            Some(1.1950),
+            "record_last_close must still run under suppression"
+        );
+        // Next bar is a clean (22:00Z is also an edge; use 23:00Z which is NOT).
+        // Its close stays below → no NEW down-cross (already below), so to prove
+        // recovery we lift back above then cross again on a clean bar.
+        let c2 = candle("2026-06-16T23:00:00Z", 1.205, 1.210, 1.205, 1.2050);
+        let eval2 = run(&p, &eval1.new_state, &[c2]);
+        assert!(eval2.fired.is_empty(), "back above neckline: no cross");
+        let c3 = candle("2026-06-17T00:00:00Z", 1.205, 1.205, 1.195, 1.1950);
+        let eval3 = run(&p, &eval2.new_state, &[c3]);
+        assert_eq!(
+            eval3.fired.len(),
+            1,
+            "a clean-bar down-cross fires normally after the spread hour"
+        );
+        assert_eq!(eval3.fired[0].rule_id, "03-prep-break-and-close");
+    }
+
+    #[test]
     fn watermark_is_monotonic_and_advances_to_last_candle() {
         let p = plan(vec![rule(
             "05-enter",
@@ -4163,6 +4305,82 @@ mod tests {
         assert!((sig.signal_high - 1.30).abs() < 1e-12);
         assert!((sig.signal_low - 1.10).abs() < 1e-12);
         // single-shot enter ends the spine.
+        assert!(eval.done);
+    }
+
+    // ---- spread-hour "rubbish candle" suppression ----------------------
+    //
+    // On a learned spread-hour bar the candle's OHLC is untrustworthy (a
+    // liquidity-vacuum spread blowout, not a market move), so the engine must
+    // not ORIGINATE anything from it: no new-entry fire, no signal detection,
+    // no level cross. Exit honouring (SL/TP) is NOT gated — that lives in the
+    // simulator and a real broker stops you regardless (hence the separate
+    // open-position stop-widen). See SCOPING-spread-hour-rubbish-candle.md.
+    //
+    // The tests key off the `is_spread_hour` NY-close-edge FALLBACK for the
+    // un-sampled test instrument `EUR_USD`: 21:00Z is the EDT NY-close edge, so
+    // `is_spread_hour("EUR_USD", 21:00Z) == true` with NO dependence on the
+    // baked per-instrument spread table (which may not be checked out at build
+    // time). A twin at a non-edge hour proves the predicate-false path is
+    // byte-identical to today.
+
+    /// The `bearish_pinbar_window` geometry, verbatim, shifted so the pinbar
+    /// lands on a chosen top-of-hour. Keeps the same relative spacing (the
+    /// prior bar is one hour before) so the detector sees an identical pattern —
+    /// only the absolute timestamps move.
+    fn pinbar_window_ending_at(pinbar_hour_z: &str) -> Vec<Candle> {
+        let end = ts(pinbar_hour_z);
+        let h = chrono::Duration::hours(1);
+        vec![
+            candle_at(end - h * 3, 1.10, 1.11, 1.09, 1.10),
+            candle_at(end - h * 2, 1.10, 1.11, 1.09, 1.10),
+            // prior bar — high 1.12 is the level the pinbar must exceed.
+            candle_at(end - h, 1.10, 1.12, 1.09, 1.105),
+            // the bearish pinbar (identical geometry to bearish_pinbar_window).
+            candle_at(end, 1.12, 1.30, 1.10, 1.115),
+        ]
+    }
+
+    fn candle_at(time: DateTime<Utc>, o: f64, hi: f64, lo: f64, c: f64) -> Candle {
+        Candle {
+            time,
+            o,
+            h: hi,
+            l: lo,
+            c,
+        }
+    }
+
+    #[test]
+    fn spread_hour_bar_suppresses_a_pine_entry_fire() {
+        // Same pinbar + enter as `pine_short_entry_fires_with_signal_geometry`,
+        // but the pinbar prints on the 21:00Z NY-close edge → `is_spread_hour`
+        // true → the enter must NOT fire on this rubbish bar.
+        let p = plan(vec![pine_enter_rule(None, Direction::Short, false)]);
+        let window = pinbar_window_ending_at("2026-06-16T21:00:00Z");
+        let prior = seed_at(Phase::AwaitEntry, "2026-06-16T20:00:00Z");
+        let new = &window[3..];
+        let eval = run_window(&p, &prior, new, &window);
+        assert!(
+            eval.fired.is_empty(),
+            "no enter may fire on a spread-hour bar (got {:?})",
+            eval.fired
+        );
+        assert!(!eval.done, "the plan stays armed for the next clean bar");
+        assert_eq!(eval.new_state.phase, Phase::AwaitEntry);
+    }
+
+    #[test]
+    fn clean_hour_twin_of_the_spread_hour_entry_still_fires() {
+        // The identical pinbar on a NON-edge hour (11:00Z) fires exactly as
+        // today — the suppression is inert when the predicate is false.
+        let p = plan(vec![pine_enter_rule(None, Direction::Short, false)]);
+        let window = pinbar_window_ending_at("2026-06-16T11:00:00Z");
+        let prior = seed_at(Phase::AwaitEntry, "2026-06-16T10:00:00Z");
+        let new = &window[3..];
+        let eval = run_window(&p, &prior, new, &window);
+        assert_eq!(eval.fired.len(), 1, "clean-hour pinbar fires the enter");
+        assert_eq!(eval.fired[0].rule_id, "05-enter");
         assert!(eval.done);
     }
 
@@ -5090,6 +5308,43 @@ mod tests {
         // A reversal-close never retires the plan (flattens only).
         assert!(!eval.done);
         assert_eq!(eval.new_state.phase, Phase::AwaitEntry);
+    }
+
+    /// `bullish_pinbar_window` geometry shifted so the reversal pinbar lands on
+    /// a chosen top-of-hour (to place it on / off a spread hour).
+    fn bullish_pinbar_window_ending_at(pinbar_hour_z: &str) -> Vec<Candle> {
+        let end = ts(pinbar_hour_z);
+        let h = chrono::Duration::hours(1);
+        vec![
+            candle_at(end - h * 3, 1.10, 1.11, 1.09, 1.10),
+            candle_at(end - h * 2, 1.10, 1.11, 1.09, 1.10),
+            candle_at(end - h, 1.10, 1.11, 1.09, 1.105),
+            candle_at(end, 1.16, 1.20, 1.00, 1.18),
+        ]
+    }
+
+    #[test]
+    fn spread_hour_bar_suppresses_a_reversal_close_detection() {
+        // The reversal-close detector (`eval_pine_guard`) matching a bullish
+        // reversal candle on a 21:00Z spread-hour bar is a rubbish wick — it must
+        // NOT fire the close (we don't flatten a position off a garbage candle).
+        // A clean-hour twin fires exactly as today.
+        let p = plan(vec![close_on_reversal_rule(Direction::Long, None)]);
+        let spread = bullish_pinbar_window_ending_at("2026-06-16T21:00:00Z");
+        let prior = seed_at(Phase::AwaitEntry, "2026-06-16T20:00:00Z");
+        let eval = run_window(&p, &prior, &spread[3..], &spread);
+        assert!(
+            eval.fired.is_empty(),
+            "reversal-close must not fire on a spread-hour bar (got {:?})",
+            eval.fired
+        );
+
+        // Clean-hour twin (11:00Z) fires as today.
+        let clean = bullish_pinbar_window_ending_at("2026-06-16T11:00:00Z");
+        let prior2 = seed_at(Phase::AwaitEntry, "2026-06-16T10:00:00Z");
+        let eval2 = run_window(&p, &prior2, &clean[3..], &clean);
+        assert_eq!(eval2.fired.len(), 1, "clean-hour reversal fires the close");
+        assert_eq!(eval2.fired[0].rule_id, "06-close-on-reversal");
     }
 
     #[test]
