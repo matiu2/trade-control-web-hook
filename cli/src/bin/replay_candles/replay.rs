@@ -17,8 +17,8 @@ use trade_control_core::pause_gate;
 use trade_control_core::state::MemStateStore;
 use trade_control_engine::BidAskCandle as EngineCandle;
 use trade_control_engine::{
-    Candle, FiredIntent, Granularity, PlanState, TradePlan, Trigger, evaluate_controls_only,
-    evaluate_plan, seed_plan_state,
+    Candle, FiredIntent, Granularity, PlanState, TradePlan, Trigger, enter_preconditions_unmet,
+    evaluate_controls_only, evaluate_plan, seed_plan_state,
 };
 
 use trade_control_core::signals::{DetectFlags, atr_length_for, detect_at, wilder_atr};
@@ -290,6 +290,21 @@ pub async fn run(
             })
             .map(|d| d.reason.clone())
             .collect();
+        // "not-taken" reason: a marked signal that fired NO enter and produced
+        // NO decline was blocked by an unmet *precondition* (the trigger never
+        // fired) — wrong phase (break-and-close outstanding), an unstamped
+        // retest, or a confirmation requirement. `EntryDecline` only covers the
+        // fired-then-declined case; this covers the never-fired case. Compute it
+        // only for a marked bar with no fire and no decline, so it doesn't add
+        // noise where the golden actually entered or was already explained.
+        let not_taken = not_taken_reason(
+            plan,
+            &state,
+            candles[i].time,
+            detected.is_some(),
+            &fired_rules,
+            &decline_reasons,
+        );
         traces.push(BarTrace::diff(
             candles[i].time,
             &before,
@@ -297,6 +312,7 @@ pub async fn run(
             fired_rules,
             detected,
             decline_reasons,
+            not_taken,
         ));
 
         for warning in eval.warnings {
@@ -455,6 +471,43 @@ fn detect_mark(
         atr,
         golden,
     })
+}
+
+/// Why a *marked* signal on this bar wasn't taken as an entry — the
+/// precondition gate(s) it was blocked by (break-and-close / confirmation /
+/// retest). Only meaningful for a bar that carries a mark, fired no enter, and
+/// produced no `EntryDecline`: those two cases already explain themselves (the
+/// enter fired, or the dispatchable pre-flight declined it with a reason).
+///
+/// Delegates the actual gate logic to the engine's `enter_preconditions_unmet`
+/// so the "why not taken" answer can't drift from the real per-bar decision.
+/// Returns a single joined reason string (e.g.
+/// `requires break-and-close (prep not satisfied yet) and requires retest (…)`)
+/// for the `not-taken:` line, or `None` when nothing was outstanding.
+fn not_taken_reason(
+    plan: &TradePlan,
+    state: &PlanState,
+    bar: DateTime<Utc>,
+    marked: bool,
+    fired_rules: &[String],
+    decline_reasons: &[String],
+) -> Option<String> {
+    // Only annotate a marked-but-unexplained bar: a fire or an existing decline
+    // already tells the story.
+    if !marked || !fired_rules.is_empty() || !decline_reasons.is_empty() {
+        return None;
+    }
+    let blocks = enter_preconditions_unmet(plan, state, bar);
+    if blocks.is_empty() {
+        return None;
+    }
+    Some(
+        blocks
+            .iter()
+            .map(|b| b.reason())
+            .collect::<Vec<_>>()
+            .join(" and "),
+    )
 }
 
 /// The mean bid-ask spread over the trailing `spread_window` bars at the fire
@@ -1832,5 +1885,123 @@ mod tests {
             .flat_map(|t| t.entry_declines.iter())
             .any(|d| d == trade_control_core::plan_eval::NOT_GOLDEN_DECLINE);
         assert!(kept, "not-golden decline retained under the `both` filter");
+    }
+
+    /// A single-enter plan WITH a break-and-close prep rule whose trigger never
+    /// fires — so the spine stays `AwaitBreakAndClose` and the pine enter is
+    /// never even considered. A golden pinbar in the window is marked, fires no
+    /// enter, and produces no decline (the trigger never ran), so the replay
+    /// annotates it `not taken: requires break-and-close`.
+    fn break_and_close_pending_plan() -> TradePlan {
+        serde_json::from_str(
+            r#"{
+                "trade_id": "bc-pending",
+                "instrument": "EUR_USD",
+                "direction": "long",
+                "granularity": "h1",
+                "pip_size": 0.0001,
+                "rules": [
+                    {
+                        "rule_id": "03-prep-break-and-close",
+                        "trigger": { "type": "horizontal_cross", "level": 9.99, "dir": "up", "bar": "on_close" },
+                        "fire_mode": "once",
+                        "intent": {
+                            "v": 1, "id": "bc-pending-prep", "not_after": "2099-01-01T00:00:00Z",
+                            "action": "prep", "instrument": "EUR_USD",
+                            "broker": "oanda", "trade_id": "bc-pending"
+                        }
+                    },
+                    {
+                        "rule_id": "05-enter",
+                        "trigger": { "type": "pine_pattern", "dir": "long" },
+                        "fire_mode": "once",
+                        "intent": {
+                            "v": 1, "id": "bc-pending-enter", "not_after": "2099-01-01T00:00:00Z",
+                            "action": "enter", "instrument": "EUR_USD", "direction": "long",
+                            "needs_golden": true,
+                            "requires_preps": ["break-and-close"],
+                            "entry": { "type": "stop", "from": "signal_high", "offset_pips": 0.0 },
+                            "stop_loss": { "from": "signal_low", "offset_pips": 0.0 },
+                            "take_profit": { "absolute": 9.99 },
+                            "broker": "oanda", "trade_id": "bc-pending", "max_retries": 0
+                        }
+                    }
+                ]
+            }"#,
+        )
+        .expect("parse break-and-close-pending plan")
+    }
+
+    /// The user's ask: a marked golden that never *fired* an enter (because a
+    /// precondition — here break-and-close — is unmet) should say WHY it wasn't
+    /// taken. Distinct from the fired-then-declined `EntryDecline` surface.
+    #[tokio::test]
+    async fn golden_not_taken_surfaces_unmet_precondition() {
+        let (candles, live) = window_with_golden_pinbar();
+        let plan = break_and_close_pending_plan();
+        let cfg =
+            DetectorMarkConfig::new(DirectionFilter::With, GoldenFilter::Golden, Direction::Long);
+        let r = run(&plan, &candles, Granularity::H1, live, expires(), cfg).await;
+
+        // The enter never fires: break-and-close never crossed 9.99, so the
+        // spine stays AwaitBreakAndClose and the enter is never considered.
+        assert!(
+            r.fires.iter().all(|f| f.fired.rule_id != "05-enter"),
+            "the enter must not fire while break-and-close is pending"
+        );
+
+        // The golden bar carries a `not_taken` reason naming break-and-close, and
+        // NO entry-decline (the trigger never fired, so there's nothing to decline).
+        let marked_bar = r
+            .traces
+            .iter()
+            .find(|t| t.detected.is_some())
+            .expect("the golden pinbar is marked");
+        assert!(
+            marked_bar.entry_declines.is_empty(),
+            "no EntryDecline on a never-fired enter: {:?}",
+            marked_bar.entry_declines
+        );
+        let reason = marked_bar
+            .not_taken
+            .as_ref()
+            .expect("golden bar carries a not_taken reason");
+        assert!(
+            reason.contains("break-and-close"),
+            "not_taken names the outstanding precondition: {reason}"
+        );
+
+        // And it renders under --verbose right beneath the ◆ mark.
+        let verbose = crate::report::render(&plan, &r, true, true, &[], None, &cfg);
+        assert!(
+            verbose.contains("◆ GOLDEN") && verbose.contains("✗ not taken:"),
+            "verbose joins the golden mark and the not-taken reason:\n{verbose}"
+        );
+    }
+
+    /// A golden that DID fire + was declined keeps the `EntryDecline` path and
+    /// gets NO `not_taken` (the two surfaces are mutually exclusive per bar).
+    #[tokio::test]
+    async fn fired_then_declined_golden_has_no_not_taken() {
+        let (candles, live) = window_with_golden_pinbar();
+        let plan = golden_enter_resolve_fails_plan();
+        let cfg =
+            DetectorMarkConfig::new(DirectionFilter::With, GoldenFilter::Golden, Direction::Long);
+        let r = run(&plan, &candles, Granularity::H1, live, expires(), cfg).await;
+
+        let marked_bar = r
+            .traces
+            .iter()
+            .find(|t| t.detected.is_some())
+            .expect("golden marked");
+        assert!(
+            !marked_bar.entry_declines.is_empty(),
+            "this golden fired and was declined (has an EntryDecline)"
+        );
+        assert!(
+            marked_bar.not_taken.is_none(),
+            "a declined bar must NOT also carry a not_taken: {:?}",
+            marked_bar.not_taken
+        );
     }
 }

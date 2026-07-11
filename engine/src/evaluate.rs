@@ -1436,6 +1436,94 @@ fn retest_satisfied(plan: &TradePlan, state: &PlanState, entry_time: DateTime<Ut
     }
 }
 
+/// Why a `PinePattern` enter did **not** fire on a bar where its signal was
+/// otherwise present (golden, right direction) — the *precondition* gates that
+/// silently return before the enter can fire, and which produce **no**
+/// [`EntryDecline`] (those are only recorded once the trigger fires and the
+/// dispatchable pre-flight runs). This is the "golden marked but nothing
+/// entered, and no decline explains it" surface for the offline replay.
+///
+/// The variants mirror the gate order in [`evaluate_one_entry`]:
+/// phase (break-and-close) → confirmation → retest.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EnterBlock {
+    /// The spine is still `AwaitBreakAndClose`: the neckline break-and-close prep
+    /// hasn't fired, so the enter isn't even considered yet.
+    NeedsBreakAndClose,
+    /// The enter is `needs_confirmed` and no confirmed signal has surfaced yet
+    /// (the detector's confirmed-first scan found nothing), so the trigger never
+    /// fires.
+    NeedsConfirmation,
+    /// In `AwaitEntry`, but this enter requires a retest and none has been
+    /// stamped in `(break_close_at, bar]` yet.
+    NeedsRetest,
+}
+
+impl EnterBlock {
+    /// A short operator-facing reason, worded for the replay's `not-taken:` line.
+    pub fn reason(self) -> &'static str {
+        match self {
+            Self::NeedsBreakAndClose => "requires break-and-close (prep not satisfied yet)",
+            Self::NeedsConfirmation => "requires confirmation (no confirmed signal yet)",
+            Self::NeedsRetest => "requires retest (neckline retest not stamped yet)",
+        }
+    }
+}
+
+/// For a plan's *enter* rules, report the preconditions still outstanding on
+/// `bar` — the reasons a present-and-golden signal wouldn't have fired an enter.
+/// Pure: reads only the plan + the post-tick [`PlanState`], the same inputs
+/// [`evaluate_one_entry`]'s gates read, so it can't drift from the real
+/// decision. Empty when nothing blocks the enter (it either fired, or was
+/// declined by the dispatchable pre-flight — which the caller surfaces via
+/// [`EntryDecline`] instead — or it's a free QM-style enter with no preps).
+///
+/// Order mirrors the gate order in [`evaluate_one_entry`]: break-and-close →
+/// confirmation → retest. A `strategy-v2` plan arms two enters (a prep-gated
+/// stop enter and a prep-free QM enter); the outstanding gates reported are the
+/// union across the not-yet-latched enters, deduped, so a single "not-taken"
+/// line can read e.g. "requires break-and-close … and retest".
+pub fn enter_preconditions_unmet(
+    plan: &TradePlan,
+    state: &PlanState,
+    bar: DateTime<Utc>,
+) -> Vec<EnterBlock> {
+    let mut blocks = Vec::new();
+    // Break-and-close first: while AwaitBreakAndClose the enter code never runs
+    // for ANY enter rule, so this is plan-wide, not per-rule.
+    if state.phase == Phase::AwaitBreakAndClose && has_break_and_close(plan) {
+        blocks.push(EnterBlock::NeedsBreakAndClose);
+    }
+    // Then per-enter confirmation / retest gates a present golden would still be
+    // blocked by. Skip already-latched enters (a fired single-shot enter isn't
+    // "blocked").
+    for rule in plan
+        .rules
+        .iter()
+        .filter(|r| r.intent.action == Action::Enter)
+        .filter(|r| !state.fired.contains(&r.rule_id))
+    {
+        if rule.intent.needs_confirmed && !blocks.contains(&EnterBlock::NeedsConfirmation) {
+            blocks.push(EnterBlock::NeedsConfirmation);
+        }
+        let requires_retest = if is_multi_enter(plan) {
+            rule.intent
+                .requires_preps
+                .iter()
+                .any(|p| p == PREP_STEP_RETEST)
+        } else {
+            plan.rules.iter().any(is_retest)
+        };
+        if requires_retest
+            && !retest_satisfied(plan, state, bar)
+            && !blocks.contains(&EnterBlock::NeedsRetest)
+        {
+            blocks.push(EnterBlock::NeedsRetest);
+        }
+    }
+    blocks
+}
+
 /// Fire a rule against a candle: evaluate its trigger (updating the rule's
 /// `last_close` memory) and return whether it fired this bar. Latched rules
 /// don't re-fire (the caller checks `state.fired` for guards; this also guards
@@ -2625,6 +2713,108 @@ mod tests {
             ),
         ]);
         assert_eq!(initial_phase(&p), Phase::AwaitBreakAndClose);
+    }
+
+    // ===== enter_preconditions_unmet (the "not taken: requires X" surface) =====
+
+    #[test]
+    fn precondition_reports_break_and_close_while_awaiting_it() {
+        let neckline = Trigger::TrendlineCross {
+            a: LinePoint {
+                at_epoch: 0,
+                price: 1.2,
+            },
+            b: LinePoint {
+                at_epoch: 100,
+                price: 1.2,
+            },
+            extend_forward: true,
+            bar_seconds: 100,
+            dir: CrossDir::Down,
+            bar: BarEvent::OnClose,
+        };
+        let p = plan(vec![
+            rule(
+                "03-prep-break-and-close",
+                neckline,
+                FireMode::Once,
+                Action::Prep,
+            ),
+            pine_enter_rule(None, Direction::Short, true),
+        ]);
+        let state = PlanState::seed(Phase::AwaitBreakAndClose, ts("2099-01-01T00:00:00Z"));
+        let blocks = enter_preconditions_unmet(&p, &state, ts("2026-06-30T12:00:00Z"));
+        assert_eq!(blocks, vec![EnterBlock::NeedsBreakAndClose]);
+        assert!(blocks[0].reason().contains("break-and-close"));
+    }
+
+    #[test]
+    fn precondition_reports_retest_in_await_entry_without_stamp() {
+        // A break-and-close plan now in AwaitEntry (break stamped), a retest rule
+        // present but retest_seen_at unset → the enter is retest-gated.
+        let neckline = Trigger::TrendlineCross {
+            a: LinePoint {
+                at_epoch: 0,
+                price: 1.2,
+            },
+            b: LinePoint {
+                at_epoch: 100,
+                price: 1.2,
+            },
+            extend_forward: true,
+            bar_seconds: 100,
+            dir: CrossDir::Down,
+            bar: BarEvent::OnClose,
+        };
+        let p = plan(vec![
+            rule(
+                "03-prep-break-and-close",
+                neckline.clone(),
+                FireMode::Once,
+                Action::Prep,
+            ),
+            rule("04-prep-retest", neckline, FireMode::Once, Action::Prep),
+            pine_enter_rule(None, Direction::Short, true),
+        ]);
+        let mut state = PlanState::seed(Phase::AwaitEntry, ts("2099-01-01T00:00:00Z"));
+        state.break_close_at = Some(ts("2026-06-30T10:00:00Z"));
+        // retest_seen_at still None → gate shut.
+        let blocks = enter_preconditions_unmet(&p, &state, ts("2026-06-30T12:00:00Z"));
+        assert_eq!(blocks, vec![EnterBlock::NeedsRetest]);
+    }
+
+    #[test]
+    fn precondition_empty_when_break_stamped_and_no_retest() {
+        // A break-and-close plan in AwaitEntry with the break stamped and NO
+        // retest rule → nothing blocks the enter (it just didn't fire for
+        // detector reasons the mark already shows). Empty.
+        let neckline = Trigger::TrendlineCross {
+            a: LinePoint {
+                at_epoch: 0,
+                price: 1.2,
+            },
+            b: LinePoint {
+                at_epoch: 100,
+                price: 1.2,
+            },
+            extend_forward: true,
+            bar_seconds: 100,
+            dir: CrossDir::Down,
+            bar: BarEvent::OnClose,
+        };
+        let p = plan(vec![
+            rule(
+                "03-prep-break-and-close",
+                neckline,
+                FireMode::Once,
+                Action::Prep,
+            ),
+            pine_enter_rule(None, Direction::Short, true),
+        ]);
+        let mut state = PlanState::seed(Phase::AwaitEntry, ts("2099-01-01T00:00:00Z"));
+        state.break_close_at = Some(ts("2026-06-30T10:00:00Z"));
+        let blocks = enter_preconditions_unmet(&p, &state, ts("2026-06-30T12:00:00Z"));
+        assert!(blocks.is_empty(), "no gate outstanding: {blocks:?}");
     }
 
     // ===== full evaluate_plan: M/W heartbeat =====

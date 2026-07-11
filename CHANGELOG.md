@@ -1,5 +1,42 @@
 # Changelog
 
+## v87 — 2026-07-12 — replay: `✗ not taken` — why a marked golden's enter never fired
+
+**Why.** v85's `✗ not entered` explains a golden whose enter *fired* and was
+declined by the dispatchable pre-flight (needs-golden / needs-confirmed /
+resolve-fail). But a golden can be marked while the enter's trigger **never
+fires at all** — the spine is still `AwaitBreakAndClose`, the retest isn't
+stamped, or a `needs_confirmed` enter has no confirmed signal yet — so no
+`EntryDecline` is recorded and the `◆ GOLDEN` line sat there with no explanation
+(`tv-arm-staging --start … --replay --strategy-v2`, a 16:00 golden
+FloatingEngulfer with no reason shown).
+
+**What changed.** New pure engine helper `enter_preconditions_unmet(plan, state,
+bar) -> Vec<EnterBlock>` (`engine/src/evaluate.rs`, exported) reports which
+precondition gate(s) an otherwise-present golden would still be blocked by,
+mirroring the gate order in `evaluate_one_entry` (break-and-close → confirmation
+→ retest). The replay renders it as a `✗ not taken: <reason(s)>` line under the
+`◆` mark, **only** on a marked bar that fired no enter and produced no decline
+(the two surfaces are mutually exclusive per bar). Multiple outstanding gates
+join with "and". Because the helper reads the same plan + `PlanState` the real
+entry gates read, the "why not taken" answer can't drift from the live decision.
+
+New `BarTrace.not_taken: Option<String>` (`verbose.rs`) carries it; computed by
+`not_taken_reason` in `replay.rs`, gated on `marked && no-fire && no-decline`.
+
+**Breaking.** `BarTrace::diff` gained a 7th arg (`not_taken`). Internal to the
+replay binary; no public API.
+
+**Config.** None.
+
+**Tests.** engine (3): `enter_preconditions_unmet` reports break-and-close in
+`AwaitBreakAndClose`, retest when unstamped in `AwaitEntry`, empty when nothing's
+outstanding. replay bin (2): `golden_not_taken_surfaces_unmet_precondition` (a
+break-and-close-pending plan; golden marked, no decline, `not taken: requires
+break-and-close`), `fired_then_declined_golden_has_no_not_taken` (a declined
+golden gets no `not_taken`). Verified end-to-end on a real AUD/CHF strategy-v2
+plan: `✗ not taken: requires retest … and requires confirmation …`.
+
 ## v86 — 2026-07-12 — tv-arm `--replay` + shared replay clap args; per-broker account defaults; quieter not-golden declines
 
 **Why.** Three things. (1) Arming and then replaying the plan was two commands

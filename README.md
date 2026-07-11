@@ -1639,6 +1639,27 @@ only, so a `needs golden but signal is not golden` decline is tautological noise
 both the rollup and the per-bar line. Pass `--candle-detector-golden both` (or
 `non-golden`) to see those declines; every other decline reason is always shown.
 
+**When the enter never *fired* (`✗ not taken`).** `✗ not entered` above is the
+*fired-then-declined* case: the enter's trigger fired and the dispatchable
+pre-flight rejected it. A golden can also be marked while the enter's trigger
+**never fires at all** — a precondition isn't met yet — so there's no decline to
+show. For that case, `--verbose` adds a `✗ not taken:` line under the `◆` mark
+naming the outstanding precondition(s): **break-and-close** (spine still
+`AwaitBreakAndClose`), **retest** (neckline retest not stamped yet), and/or
+**confirmation** (a `needs_confirmed` enter with no confirmed signal yet). They
+join with "and" when several are outstanding:
+
+```text
+  bar 2026-07-08 16:00:00 +10:00 phase=AwaitEntry
+    ◆ GOLDEN Short Pinbar (size=0.00058 atr=0.00057)
+    ✗ not taken: requires retest (neckline retest not stamped yet) and requires confirmation (no confirmed signal yet)
+```
+
+The two surfaces are mutually exclusive per bar (a bar either fired and was
+declined, or never fired). The precondition logic is the engine's own
+(`enter_preconditions_unmet`), reading the same plan + `PlanState` gates
+`evaluate_one_entry` reads, so it can't drift from the real decision.
+
 **Break-even arming (`be:` line).** Break-even is *not* a fill-time decision —
 in production the live cron (`breakeven_watch`) sends `amend_stop(entry)` to the
 broker on the first 15-min tick that observes a candle closing past the

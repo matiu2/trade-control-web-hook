@@ -94,6 +94,12 @@ pub struct BarTrace {
     /// no enter was even evaluated or one fired cleanly. Paired with `detected`,
     /// this turns "golden seen but no entry" into a one-line answer.
     pub entry_declines: Vec<String>,
+    /// Why a *marked* signal wasn't taken when its enter never even fired —
+    /// blocked by an unmet precondition (break-and-close outstanding, no
+    /// confirmed signal yet, retest unstamped). Distinct from `entry_declines`,
+    /// which is the fired-then-declined case. Only set on a marked bar with no
+    /// fire and no decline; `None` otherwise.
+    pub not_taken: Option<String>,
 }
 
 impl BarTrace {
@@ -108,6 +114,7 @@ impl BarTrace {
         fired_rules: Vec<String>,
         detected: Option<DetectedMark>,
         entry_declines: Vec<String>,
+        not_taken: Option<String>,
     ) -> Self {
         let phase_from = (before.phase != after.phase).then_some(before.phase);
         let break_close_stamped = before.break_close_at.is_none() && after.break_close_at.is_some();
@@ -121,6 +128,7 @@ impl BarTrace {
             fired_rules,
             detected,
             entry_declines,
+            not_taken,
         }
     }
 
@@ -134,6 +142,7 @@ impl BarTrace {
             && self.fired_rules.is_empty()
             && self.detected.is_none()
             && self.entry_declines.is_empty()
+            && self.not_taken.is_none()
     }
 
     /// Render this trace as one indented block under a `bar …` header. Returns
@@ -158,6 +167,9 @@ impl BarTrace {
         for reason in &self.entry_declines {
             out.push_str(&format!("    ✗ not entered: {reason}\n"));
         }
+        if let Some(reason) = &self.not_taken {
+            out.push_str(&format!("    ✗ not taken: {reason}\n"));
+        }
         for rule in &self.fired_rules {
             out.push_str(&format!("    → fired {rule}\n"));
         }
@@ -181,7 +193,7 @@ mod tests {
     #[test]
     fn quiet_bar_renders_empty() {
         let s = state(Phase::AwaitEntry);
-        let t = BarTrace::diff(at(16), &s, &s, Vec::new(), None, Vec::new());
+        let t = BarTrace::diff(at(16), &s, &s, Vec::new(), None, Vec::new(), None);
         assert!(t.is_quiet());
         assert_eq!(t.render(), "");
     }
@@ -191,13 +203,13 @@ mod tests {
         let before = state(Phase::AwaitEntry);
         let mut after = before.clone();
         after.retest_seen_at = Some(at(16));
-        let t = BarTrace::diff(at(16), &before, &after, Vec::new(), None, Vec::new());
+        let t = BarTrace::diff(at(16), &before, &after, Vec::new(), None, Vec::new(), None);
         assert!(t.retest_stamped);
         assert!(!t.is_quiet());
         assert!(t.render().contains("retest stamped"));
 
         // Already-set on the prior bar → not re-reported.
-        let t2 = BarTrace::diff(at(17), &after, &after, Vec::new(), None, Vec::new());
+        let t2 = BarTrace::diff(at(17), &after, &after, Vec::new(), None, Vec::new(), None);
         assert!(!t2.retest_stamped);
         assert!(t2.is_quiet());
     }
@@ -208,7 +220,7 @@ mod tests {
         let mut after = before.clone();
         after.break_close_at = Some(at(15));
         after.phase = Phase::AwaitEntry;
-        let t = BarTrace::diff(at(15), &before, &after, Vec::new(), None, Vec::new());
+        let t = BarTrace::diff(at(15), &before, &after, Vec::new(), None, Vec::new(), None);
         assert!(t.break_close_stamped);
         assert_eq!(t.phase_from, Some(Phase::AwaitBreakAndClose));
         let r = t.render();
@@ -228,6 +240,7 @@ mod tests {
             vec!["05-enter".into()],
             None,
             Vec::new(),
+            None,
         );
         let r = t.render();
         assert!(r.contains("→ fired 05-enter"));
@@ -244,6 +257,7 @@ mod tests {
             vec!["01-veto-too-low".into()],
             None,
             Vec::new(),
+            None,
         );
         assert!(!t.is_quiet());
         assert!(t.render().contains("→ fired 01-veto-too-low"));
@@ -262,7 +276,7 @@ mod tests {
             atr: Some(0.0031),
             golden: true,
         };
-        let t = BarTrace::diff(at(16), &s, &s, Vec::new(), Some(mark), Vec::new());
+        let t = BarTrace::diff(at(16), &s, &s, Vec::new(), Some(mark), Vec::new(), None);
         assert!(!t.is_quiet());
         let r = t.render();
         assert!(r.contains("◆ GOLDEN"), "golden mark rendered: {r}");
@@ -280,7 +294,7 @@ mod tests {
             atr: Some(0.0031),
             golden: false,
         };
-        let t = BarTrace::diff(at(16), &s, &s, Vec::new(), Some(mark), Vec::new());
+        let t = BarTrace::diff(at(16), &s, &s, Vec::new(), Some(mark), Vec::new(), None);
         let r = t.render();
         assert!(r.contains("◆ signal"), "non-golden mark: {r}");
         assert!(!r.contains("GOLDEN"), "not tagged golden: {r}");
