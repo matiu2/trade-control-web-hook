@@ -304,6 +304,17 @@ pub fn run(args: Args) -> Result<i32> {
         cli::build_trade_from_spec(trade_spec, now, strictness).wrap_err("build trade bundle")?;
     let trade_id = built_trade.trade_id.clone();
     cli::write_trade(&built_trade, &key, &out_dir).wrap_err("write trade bundle")?;
+
+    // `--replay` needs the plan JSON on disk to hand to `replay-candles`. When
+    // the operator gave `--plan-out`, use that; for a bare `--replay` synthesise
+    // a temp path so the register block below writes the plan there and the
+    // replay can read it back. This is the ONLY thing that turns the register
+    // block on for a bare `--replay` (no `--register-plan`, no `--plan-out`).
+    let effective_plan_out: Option<PathBuf> = match (&args.plan_out, args.replay) {
+        (Some(p), _) => Some(p.clone()),
+        (None, true) => Some(crate::replay::plan_path(None, &trade_id)),
+        (None, false) => None,
+    };
     info!(
         trade_id = %trade_id,
         out_dir = %out_dir.display(),
@@ -352,7 +363,7 @@ pub fn run(args: Args) -> Result<i32> {
     // `--plan-out` alone builds the plan and writes the JSON without touching
     // the worker; `--register-plan` additionally POSTs it. Run the block for
     // either so `--plan-out` is no longer a silent no-op on its own.
-    if args.register_plan || args.plan_out.is_some() {
+    if args.register_plan || effective_plan_out.is_some() {
         // 8a. (--replace) Re-arm: delete the prior plan for this instrument before
         //     registering the fresh one, so the old plan stops ticking and the
         //     new one starts with clean engine state. No-op when --replace absent.
@@ -383,7 +394,7 @@ pub fn run(args: Args) -> Result<i32> {
             &account,
             now,
             args.shadow,
-            args.plan_out.as_deref(),
+            effective_plan_out.as_deref(),
             args.register_plan,
             start,
             args.retest_atr_step
@@ -397,6 +408,22 @@ pub fn run(args: Args) -> Result<i32> {
     // trade is now: build + sign the bundle to disk (above) and register it as a
     // `TradePlan` with the worker (step 8b, gated on `--register-plan`).
     info!(trade_id = %trade_id, "signed bundle on disk; arm via --register-plan");
+
+    // 9. (--replay) Chain into `replay-candles` on the plan we just wrote. The
+    //    register block above wrote the JSON to `effective_plan_out` (the
+    //    operator's `--plan-out`, or a temp path for a bare `--replay`). The
+    //    replay is a post-arm convenience: a failure here surfaces as an error
+    //    but the plan is already armed.
+    if args.replay {
+        crate::replay::run_replay(
+            effective_plan_out.as_deref(),
+            &trade_id,
+            broker,
+            &args.replay_args,
+        )
+        .wrap_err("replay after arm (--replay)")?;
+    }
+
     Ok(0)
 }
 

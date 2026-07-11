@@ -10,7 +10,7 @@
 use color_eyre::eyre::{Result, eyre};
 use instrument_lookup::{Broker, by_broker_symbol, resolve};
 
-use super::source::CandleSource;
+use trade_control_cli::replay_args::CandleSource;
 
 /// Resolve `raw` (e.g. `eur/cad`, `EUR_CAD`, `EURCAD`) to the broker symbol the
 /// `source` feed expects. Tries a direct broker-symbol hit first, then the

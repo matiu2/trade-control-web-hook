@@ -21,7 +21,7 @@ use trade_control_core::broker::BidAskCandle as EngineCandle;
 use tradenation_api::TradeNationClient;
 
 use super::granularity::ReplayGranularity;
-use super::source::CandleSource;
+use trade_control_cli::replay_args::CandleSource;
 
 /// Pull `[from, to]` bid/ask candles for `symbol` at `granularity` from
 /// `source`, in ascending time order, already converted to engine bid/ask

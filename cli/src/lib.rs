@@ -13,6 +13,7 @@ mod interactive;
 mod news_pattern;
 mod pause_pattern;
 mod prompts;
+pub mod replay_args;
 mod script_validator;
 mod templates;
 mod trade_patterns;

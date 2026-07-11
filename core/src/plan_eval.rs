@@ -20,6 +20,17 @@ use crate::intent::Intent;
 use crate::plan_state::PlanState;
 use crate::signals::LatchedSignal;
 
+/// Decline reason emitted when a `needs_golden` enter sees a non-golden signal.
+/// Shared so the engine's write side ([`crate::plan_eval::EntryDecline`]) and
+/// the replay's presentation filter agree on the exact wording — the replay
+/// suppresses this reason when the operator asked to mark golden-only candles
+/// (a "not golden" decline is tautological noise in that view).
+pub const NOT_GOLDEN_DECLINE: &str = "needs golden but signal is not golden";
+
+/// Decline reason emitted when a `needs_confirmed` enter sees an unconfirmed
+/// signal. Shared for the same reason as [`NOT_GOLDEN_DECLINE`].
+pub const NOT_CONFIRMED_DECLINE: &str = "needs confirmation but signal is not confirmed";
+
 /// A bar on which a `PinePattern` enter's signal fired + matched direction, but
 /// the enter was **declined** before it could fire an intent — the pure,
 /// recomputable-here pre-flight rejections (`pine_entry_dispatchable`): the

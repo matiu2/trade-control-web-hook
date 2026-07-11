@@ -1088,14 +1088,14 @@ fn pine_entry_dispatchable(
             bar = %candle.time,
             "pine-enter: NOT dispatchable — needs_golden but signal is not golden"
         );
-        return Err("needs golden but signal is not golden".to_string());
+        return Err(trade_control_core::plan_eval::NOT_GOLDEN_DECLINE.to_string());
     }
     if intent.needs_confirmed && !sig.signal_confirmed {
         tracing::debug!(
             bar = %candle.time,
             "pine-enter: NOT dispatchable — needs_confirmed but signal is not confirmed"
         );
-        return Err("needs confirmation but signal is not confirmed".to_string());
+        return Err(trade_control_core::plan_eval::NOT_CONFIRMED_DECLINE.to_string());
     }
     // Bracket resolution against the same signal-folded shell the worker
     // dispatches. An `Err` (degenerate geometry, below-min-R, out-of-range, …)

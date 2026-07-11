@@ -121,8 +121,8 @@ pub struct Args {
     #[arg(long)]
     pub broker: Option<BrokerArg>,
 
-    /// Worker account index (e.g. `ms-oanda-1`, `ms-tn-1`). Defaults
-    /// per broker; also `TRADE_CONTROL_ACCOUNT` env.
+    /// Worker account index. Defaults per broker (`tradenation` → `reversals`,
+    /// `oanda` → `m-and-w`); also `TRADE_CONTROL_ACCOUNT` env.
     #[arg(long, env = "TRADE_CONTROL_ACCOUNT")]
     pub account_id: Option<String>,
 
@@ -529,6 +529,32 @@ pub struct Args {
     /// `~/Downloads/tradingview-mcp-jackson` path.
     #[arg(long)]
     pub tv_mcp_root: Option<PathBuf>,
+
+    /// After arming, chain straight into `replay-candles` on the freshly-built
+    /// plan. The plan JSON is written (to `--plan-out` if given, else a temp
+    /// file) and `replay-candles-<env>` is invoked with sensible defaults
+    /// (`--verbose --annotate true --source <resolved-broker>`). tv-arm picks
+    /// the suffixed binary matching its own environment (`tv-arm-staging` →
+    /// `replay-candles-staging`).
+    ///
+    /// Any tokens after `--replay` are passed through to `replay-candles`
+    /// verbatim and **override** the defaults, e.g.
+    /// `tv-arm --replay --annotate false --warmup-bars 400`. Use `--` to end
+    /// tv-arm's own flags first if a passthrough flag collides with one of
+    /// tv-arm's: `tv-arm --start … -- --start 2026-07-01T00:00`.
+    #[arg(long)]
+    pub replay: bool,
+
+    /// Passthrough arguments for `replay-candles`, collected after `--replay`.
+    /// Parsed against the shared `ReplayArgs` clap definition before the
+    /// shell-out, so a bad flag is caught with `replay-candles`' own error.
+    /// Only meaningful with `--replay`.
+    #[arg(
+        trailing_var_arg = true,
+        allow_hyphen_values = true,
+        value_name = "REPLAY_ARGS"
+    )]
+    pub replay_args: Vec<String>,
 }
 
 impl Args {
@@ -661,6 +687,51 @@ mod tests {
         assert_eq!(args.reversal_band_pct, 0.1);
         // Re-arm flag is opt-in.
         assert!(args.replace.is_none());
+        // --replay is opt-in with no passthrough by default.
+        assert!(!args.replay);
+        assert!(args.replay_args.is_empty());
+    }
+
+    #[test]
+    fn replay_flag_collects_passthrough_args() {
+        // Bare --replay: on, no passthrough.
+        let args = Args::try_parse_from(["tv-arm", "--replay"]).expect("bare --replay");
+        assert!(args.replay);
+        assert!(args.replay_args.is_empty());
+
+        // Tokens after --replay are collected verbatim for replay-candles,
+        // including hyphenated flags (trailing_var_arg + allow_hyphen_values).
+        let args = Args::try_parse_from([
+            "tv-arm",
+            "--replay",
+            "--annotate",
+            "false",
+            "--warmup-bars",
+            "400",
+        ])
+        .expect("--replay with passthrough");
+        assert!(args.replay);
+        assert_eq!(
+            args.replay_args,
+            vec!["--annotate", "false", "--warmup-bars", "400"]
+        );
+    }
+
+    #[test]
+    fn replay_passthrough_does_not_swallow_tv_arm_flags_before_replay() {
+        // tv-arm's own flags placed BEFORE --replay still bind to tv-arm; only
+        // tokens AFTER --replay become passthrough.
+        let args = Args::try_parse_from([
+            "tv-arm",
+            "--skip-calendar-bars",
+            "--replay",
+            "--source",
+            "oanda",
+        ])
+        .expect("mixed parse");
+        assert!(args.skip_calendar_bars);
+        assert!(args.replay);
+        assert_eq!(args.replay_args, vec!["--source", "oanda"]);
     }
 
     #[test]

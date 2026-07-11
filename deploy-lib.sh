@@ -133,7 +133,11 @@ deploy_env() {
   for pkg in "${CLI_PACKAGES[@]}"; do
     pkg_args+=(-p "$pkg")
   done
+  # `TRADE_CONTROL_ENV_SUFFIX` is baked into tv-arm (build.rs → BAKED_ENV_SUFFIX)
+  # so `tv-arm-<suffix> --replay` shells out to the matching
+  # `replay-candles-<suffix>` binary (same environment).
   TRADE_CONTROL_WEBHOOK="$webhook" \
+  TRADE_CONTROL_ENV_SUFFIX="$suffix" \
     cargo build --release "${pkg_args[@]}"
 
   # 3. Install suffixed copies into ~/.cargo/bin.
