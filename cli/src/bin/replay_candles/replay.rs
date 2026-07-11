@@ -272,12 +272,23 @@ pub async fn run(
         // still surfaces. Filtered by the active `--candle-detector-*` config;
         // `None` when the feature is off or nothing passes the filter.
         let detected = detect_mark(&mid, i, granularity, &mark_cfg);
+        // The enter declines the engine recorded this tick: a signal fired +
+        // matched direction but the pre-flight rejected it (needs-golden /
+        // needs-confirmed / resolve-failed like below-min-R). `evaluate_plan`
+        // saw only this one new bar, so every decline belongs to `candles[i]` —
+        // this is the "golden seen but no entry, here's why" line.
+        let decline_reasons: Vec<String> = eval
+            .entry_declines
+            .iter()
+            .map(|d| d.reason.clone())
+            .collect();
         traces.push(BarTrace::diff(
             candles[i].time,
             &before,
             &state,
             fired_rules,
             detected,
+            decline_reasons,
         ));
 
         for warning in eval.warnings {
@@ -1626,6 +1637,78 @@ mod tests {
         assert!(
             !report.contains("Candle detector"),
             "summary omitted when off:\n{report}"
+        );
+    }
+
+    /// A LONG `pine_pattern` enter whose TP sits BELOW the entry (wrong side for a
+    /// long → `EntryOutsideRange`), so the golden bullish pinbar fires the
+    /// detector but the bracket can't resolve. `needs_golden` so only the golden
+    /// bar is a candidate. The plan must record the decline reason.
+    fn golden_enter_resolve_fails_plan() -> TradePlan {
+        serde_json::from_str(
+            r#"{
+                "trade_id": "gold-decline",
+                "instrument": "EUR_USD",
+                "direction": "long",
+                "granularity": "h1",
+                "pip_size": 0.0001,
+                "rules": [{
+                    "rule_id": "05-enter",
+                    "trigger": { "type": "pine_pattern", "dir": "long" },
+                    "fire_mode": "once",
+                    "intent": {
+                        "v": 1, "id": "gold-decline-enter", "not_after": "2099-01-01T00:00:00Z",
+                        "action": "enter", "instrument": "EUR_USD", "direction": "long",
+                        "needs_golden": true,
+                        "entry": { "type": "stop", "from": "signal_high", "offset_pips": 0.0 },
+                        "stop_loss": { "from": "signal_low", "offset_pips": 0.0 },
+                        "take_profit": { "absolute": 0.90 },
+                        "broker": "oanda", "trade_id": "gold-decline", "max_retries": 0
+                    }
+                }]
+            }"#,
+        )
+        .expect("parse golden-enter resolve-fail plan")
+    }
+
+    #[tokio::test]
+    async fn golden_enter_decline_reason_surfaces_on_the_bar_and_in_summary() {
+        let (candles, live) = window_with_golden_pinbar();
+        let cfg =
+            DetectorMarkConfig::new(DirectionFilter::With, GoldenFilter::Golden, Direction::Long);
+        let plan = golden_enter_resolve_fails_plan();
+        let r = run(&plan, &candles, Granularity::H1, live, expires(), cfg).await;
+
+        // The golden fired the detector but the enter declined — nothing fired.
+        assert!(
+            r.fires.iter().all(|f| f.fired.rule_id != "05-enter"),
+            "the resolve-failed enter must not fire"
+        );
+
+        // The decline is recorded on the golden bar's trace with a reason.
+        let declines: Vec<&String> = r
+            .traces
+            .iter()
+            .flat_map(|t| t.entry_declines.iter())
+            .collect();
+        assert_eq!(declines.len(), 1, "exactly one decline: {declines:?}");
+        assert!(
+            declines[0].contains("range") || declines[0].contains("R="),
+            "decline carries the resolve reason: {}",
+            declines[0]
+        );
+
+        // The always-on report surfaces it (no --verbose needed), and --verbose
+        // shows the ✗ line right under the ◆ GOLDEN mark on the same bar.
+        let plain = crate::report::render(&plan, &r, true, false, &[], None, &cfg);
+        assert!(
+            plain.contains("Entry declines:"),
+            "always-on decline rollup present:\n{plain}"
+        );
+        let verbose = crate::report::render(&plan, &r, true, true, &[], None, &cfg);
+        assert!(
+            verbose.contains("◆ GOLDEN") && verbose.contains("✗ not entered:"),
+            "verbose joins the golden mark and the decline on the bar:\n{verbose}"
         );
     }
 }

@@ -411,6 +411,7 @@ pub fn render(
     ));
 
     out.push_str(&render_detector_summary(replay, mark_cfg));
+    out.push_str(&render_entry_declines(replay));
 
     if let Some(s) = sentiment {
         out.push_str(&render_sentiment(s));
@@ -603,6 +604,32 @@ fn render_detector_summary(replay: &Replay, mark_cfg: &DetectorMarkConfig) -> St
         "Candle detector ({:?} / {:?}): {total} bar(s) marked — {golden} golden, {non_golden} non-golden\n",
         mark_cfg.direction, mark_cfg.golden
     )
+}
+
+/// Always-on entry-decline rollup: bars on which a `PinePattern` enter's signal
+/// fired + matched direction but the engine's pre-flight declined it
+/// (needs-golden / needs-confirmed / resolve-failed like below-min-R). This is
+/// the direct answer to "the golden printed but nothing entered — why?"; it's
+/// **independent** of the `--candle-detector-*` marking (a decline is worth
+/// showing whether or not the operator asked for golden marks) and always on.
+/// Empty string when no enter declined over the window.
+fn render_entry_declines(replay: &Replay) -> String {
+    let declined: Vec<(chrono::DateTime<Utc>, &String)> = replay
+        .traces
+        .iter()
+        .flat_map(|t| t.entry_declines.iter().map(move |r| (t.bar, r)))
+        .collect();
+    if declined.is_empty() {
+        return String::new();
+    }
+    let mut out = format!(
+        "Entry declines: {} bar(s) an enter fired but was skipped —\n",
+        declined.len()
+    );
+    for (bar, reason) in declined {
+        out.push_str(&format!("  {}  ✗ {reason}\n", bne(bar)));
+    }
+    out
 }
 
 /// Render the `--verbose` bar-by-bar trace: every live bar on which the engine

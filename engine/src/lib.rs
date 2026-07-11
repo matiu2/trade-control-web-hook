@@ -48,7 +48,7 @@
 // without each reaching into `trade_control_core` independently.
 pub use trade_control_core::broker::{BidAskCandle, Broker, Candle, CandleError, Granularity};
 pub use trade_control_core::intent::{self, Action, Intent};
-pub use trade_control_core::plan_eval::{FiredIntent, PlanEval};
+pub use trade_control_core::plan_eval::{EntryDecline, FiredIntent, PlanEval};
 pub use trade_control_core::plan_state::{Phase, PlanState};
 pub use trade_control_core::signals::{DetectorConfig, LatchedSignal};
 pub use trade_control_core::state::{StateError, StateStore, StoredPlan};
