@@ -21,8 +21,11 @@ use trade_control_engine::{
     evaluate_plan, seed_plan_state,
 };
 
+use trade_control_core::signals::{DetectFlags, atr_length_for, detect_at, wilder_atr};
+
+use super::detector_marks::DetectorMarkConfig;
 use super::replay_broker::ReplayBroker;
-use super::verbose::BarTrace;
+use super::verbose::{BarTrace, DetectedMark};
 
 /// The entry decision the **real** dispatch (`trade_control_core::dispatch::run_enter`)
 /// reached for one fired `enter`, carried on the [`Fire`] so the report reads it
@@ -157,6 +160,7 @@ pub async fn run(
     granularity: Granularity,
     live_start: DateTime<Utc>,
     expires_at: DateTime<Utc>,
+    mark_cfg: DetectorMarkConfig,
 ) -> Replay {
     // The engine evaluates on MID (matching the live worker, whose
     // `Broker::get_candles` is contractually mid); the bid/ask books are only
@@ -262,11 +266,18 @@ pub async fn run(
         state = eval.new_state;
 
         let fired_rules: Vec<String> = eval.fired.iter().map(|f| f.rule_id.clone()).collect();
+        // Mark the candle detector's verdict on THIS bar — the same `detect_at`
+        // + `wilder_atr` the engine's `latched_signal_at` runs — so a golden the
+        // plan never entered on (wrong phase, watermark-skipped, opposite dir)
+        // still surfaces. Filtered by the active `--candle-detector-*` config;
+        // `None` when the feature is off or nothing passes the filter.
+        let detected = detect_mark(&mid, i, granularity, &mark_cfg);
         traces.push(BarTrace::diff(
             candles[i].time,
             &before,
             &state,
             fired_rules,
+            detected,
         ));
 
         for warning in eval.warnings {
@@ -394,6 +405,37 @@ pub async fn run(
         warnings,
         traces,
     }
+}
+
+/// The candle-detector mark for `mid[i]`, filtered by `cfg`. Runs the SAME
+/// `detect_at` + `wilder_atr` the engine's `latched_signal_at` uses per bar (all
+/// five patterns on — [`DetectFlags::default`] — per the design decision), so a
+/// marked golden is exactly what the engine would have detected on that bar. The
+/// golden test compares `Detected::size` against the Wilder ATR over `mid[..=i]`
+/// at the granularity's `atr_length_for`. Returns `None` when the feature is
+/// off, no pattern printed, or the signal fails the direction/golden filter.
+fn detect_mark(
+    mid: &[Candle],
+    i: usize,
+    granularity: Granularity,
+    cfg: &DetectorMarkConfig,
+) -> Option<DetectedMark> {
+    if cfg.is_off() {
+        return None;
+    }
+    let d = detect_at(mid, i, &DetectFlags::default())?;
+    let atr = wilder_atr(&mid[..=i], atr_length_for(granularity));
+    let golden = atr.is_some_and(|a| d.is_golden(a));
+    if !cfg.accepts(d.direction, golden) {
+        return None;
+    }
+    Some(DetectedMark {
+        direction: d.direction,
+        kind: d.geometry.kind,
+        size: d.size,
+        atr,
+        golden,
+    })
 }
 
 /// The mean bid-ask spread over the trailing `spread_window` bars at the fire
@@ -628,8 +670,17 @@ async fn inject_control_ticks(
 
 #[cfg(test)]
 mod tests {
+    use super::super::detector_marks::{DirectionFilter, GoldenFilter};
     use super::*;
     use chrono::TimeZone;
+    use trade_control_engine::intent::Direction;
+
+    /// The detector-mark config for tests that don't exercise marking: feature
+    /// off (either axis `None`), so `run` records no marks and behaves exactly as
+    /// before this feature landed.
+    fn no_marks() -> DetectorMarkConfig {
+        DetectorMarkConfig::new(DirectionFilter::None, GoldenFilter::None, Direction::Long)
+    }
 
     /// A bid==ask==mid bar (zero spread): the engine sees the mid OHLC, the fill
     /// simulator's books equal it, so these wiring tests need no spread.
@@ -683,7 +734,15 @@ mod tests {
             .collect();
         let expires = Utc.timestamp_opt(99 * 3600, 0).unwrap();
 
-        let replay = run(&plan, &candles, Granularity::H1, all_live(), expires).await;
+        let replay = run(
+            &plan,
+            &candles,
+            Granularity::H1,
+            all_live(),
+            expires,
+            no_marks(),
+        )
+        .await;
 
         assert!(replay.fires.is_empty(), "no rules → no fires");
         assert!(!replay.done);
@@ -709,7 +768,15 @@ mod tests {
             armed_at: None,
             armed_sentiment: None,
         };
-        let replay = run(&plan, &[], Granularity::H1, all_live(), all_live()).await;
+        let replay = run(
+            &plan,
+            &[],
+            Granularity::H1,
+            all_live(),
+            all_live(),
+            no_marks(),
+        )
+        .await;
         assert!(replay.fires.is_empty());
     }
 
@@ -731,6 +798,7 @@ mod tests {
             Granularity::H1,
             all_live(),
             expires(),
+            no_marks(),
         )
         .await;
         assert!(
@@ -755,6 +823,7 @@ mod tests {
             Granularity::H1,
             all_live(),
             expires(),
+            no_marks(),
         )
         .await;
         assert!(!replay.done);
@@ -841,6 +910,7 @@ mod tests {
             Granularity::H1,
             all_live(),
             expires(),
+            no_marks(),
         )
         .await;
 
@@ -863,6 +933,7 @@ mod tests {
             false,
             &[],
             None,
+            &no_marks(),
         );
         assert!(
             report.contains("SUPPRESSED") && report.contains("NO FILL"),
@@ -899,6 +970,7 @@ mod tests {
             Granularity::H1,
             all_live(),
             expires(),
+            no_marks(),
         )
         .await;
 
@@ -1000,6 +1072,7 @@ mod tests {
             Granularity::H1,
             all_live(),
             expires(),
+            no_marks(),
         )
         .await;
 
@@ -1019,6 +1092,7 @@ mod tests {
             false,
             &[],
             None,
+            &no_marks(),
         );
         assert!(
             report.contains("TP: 1"),
@@ -1095,6 +1169,7 @@ mod tests {
             Granularity::H1,
             live_at,
             expires(),
+            no_marks(),
         )
         .await;
         assert_eq!(
@@ -1235,6 +1310,7 @@ mod tests {
             Granularity::H1,
             all_live(),
             expires(),
+            no_marks(),
         )
         .await;
 
@@ -1270,7 +1346,15 @@ mod tests {
         // The report must reflect this: the superseded stop shows SUPERSEDED (no
         // fabricated fill), and exactly one trade is tallied (the limit's TP) —
         // not two overlapping positions.
-        let report = crate::report::render(&two_enter_v2_plan(), &r, true, false, &[], None);
+        let report = crate::report::render(
+            &two_enter_v2_plan(),
+            &r,
+            true,
+            false,
+            &[],
+            None,
+            &no_marks(),
+        );
         assert!(
             report.contains("SUPERSEDED"),
             "report must show the cancelled stop as SUPERSEDED:\n{report}"
@@ -1357,7 +1441,15 @@ mod tests {
         candles.push(ohlc(15 * 3600, 1.18, 1.19, 1.17, 1.18));
 
         let plan = short_with_close_on_reversal_plan();
-        let r = run(&plan, &candles, Granularity::H1, all_live(), expires()).await;
+        let r = run(
+            &plan,
+            &candles,
+            Granularity::H1,
+            all_live(),
+            expires(),
+            no_marks(),
+        )
+        .await;
 
         // Both fired: the short enter, then the close guard on the reversal.
         assert!(
@@ -1380,7 +1472,7 @@ mod tests {
         );
 
         // The replay report shows the short CLOSED ON REVERSAL, not held open.
-        let report = crate::report::render(&plan, &r, true, false, &[], None);
+        let report = crate::report::render(&plan, &r, true, false, &[], None, &no_marks());
         assert!(
             report.contains("CLOSED ON REVERSAL"),
             "the open short must close on the reversal candle:\n{report}"
@@ -1392,6 +1484,148 @@ mod tests {
         assert!(
             !report.contains("still open at window end"),
             "the short must not be reported as still open:\n{report}"
+        );
+    }
+
+    /// A LONG plan whose enter never crosses its trigger — so nothing fires —
+    /// still surfaces a golden **bullish** pinbar in the live window as a mark
+    /// (direction `with` the trade). This is the whole point of the feature: the
+    /// "golden candle we never entered on" is visible even with zero fires.
+    fn never_firing_long_plan() -> TradePlan {
+        // Enter is an up-cross of 9.99 — far above the ~1.x price band, so it
+        // never triggers over the window. The plan just advances the watermark.
+        serde_json::from_str(
+            r#"{
+                "trade_id": "gold-mark",
+                "instrument": "EUR_USD",
+                "direction": "long",
+                "granularity": "h1",
+                "pip_size": 0.0001,
+                "rules": [{
+                    "rule_id": "05-enter",
+                    "trigger": { "type": "horizontal_cross", "level": 9.99, "dir": "up", "bar": "on_close" },
+                    "fire_mode": "once",
+                    "intent": {
+                        "v": 1, "id": "gold-mark-enter", "not_after": "2099-01-01T00:00:00Z",
+                        "action": "enter", "instrument": "EUR_USD", "direction": "long",
+                        "entry": { "type": "stop", "from": "close", "offset_pips": 0.0, "at": 9.99 },
+                        "stop_loss": { "absolute": 9.90 },
+                        "take_profit": { "absolute": 10.5 },
+                        "broker": "oanda", "trade_id": "gold-mark", "max_retries": 0
+                    }
+                }]
+            }"#,
+        )
+        .expect("parse never-firing long plan")
+    }
+
+    /// Build a window: 30 warm-up bars to warm the H1 ATR (length 24), then a
+    /// prior bar and a golden bullish pinbar (size 0.20 ≫ the ~0.01 ATR of the
+    /// flat warm-up) in the live window. Returns (candles, live_start).
+    fn window_with_golden_pinbar() -> (Vec<EngineCandle>, DateTime<Utc>) {
+        // 30 flat warm-up bars (tiny 0.01 range → small ATR).
+        let mut candles: Vec<EngineCandle> = (0..30)
+            .map(|i| ohlc(i * 3600, 1.10, 1.105, 1.095, 1.10))
+            .collect();
+        // bar 30: prior bar for the pinbar (its low 1.05 must be undercut).
+        candles.push(ohlc(30 * 3600, 1.10, 1.12, 1.05, 1.06));
+        // bar 31: GOLDEN bullish pinbar — range 1.00..1.20 (0.20), body top
+        // quartile, long lower wick, low 1.00 < prior low 1.05. size 0.20 ≫ ATR.
+        candles.push(ohlc(31 * 3600, 1.16, 1.20, 1.00, 1.18));
+        // bar 32: a trailing flat bar so bar 31 is a fully-closed live bar.
+        candles.push(ohlc(32 * 3600, 1.18, 1.185, 1.175, 1.18));
+        // live_start at bar 25 → the pinbar (bar 31) is in the live window.
+        let live = candles[25].time;
+        (candles, live)
+    }
+
+    fn marks(r: &Replay) -> Vec<&super::super::verbose::DetectedMark> {
+        r.traces
+            .iter()
+            .filter_map(|t| t.detected.as_ref())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn golden_pinbar_marked_even_though_no_enter_fires() {
+        let (candles, live) = window_with_golden_pinbar();
+        let cfg =
+            DetectorMarkConfig::new(DirectionFilter::With, GoldenFilter::Golden, Direction::Long);
+        let r = run(
+            &never_firing_long_plan(),
+            &candles,
+            Granularity::H1,
+            live,
+            expires(),
+            cfg,
+        )
+        .await;
+
+        // Nothing fired (the enter never crossed 9.99), yet the golden bullish
+        // pinbar is marked.
+        assert!(r.fires.is_empty(), "the enter never crosses → no fires");
+        let m = marks(&r);
+        assert_eq!(m.len(), 1, "exactly the golden pinbar is marked: {m:?}");
+        assert!(m[0].golden, "the pinbar is golden (size ≫ ATR)");
+        assert_eq!(m[0].direction, Direction::Long, "bullish → Long");
+
+        // And the always-on summary counts it.
+        let report =
+            crate::report::render(&never_firing_long_plan(), &r, true, false, &[], None, &cfg);
+        assert!(
+            report.contains("1 golden"),
+            "summary reports the golden mark:\n{report}"
+        );
+    }
+
+    #[tokio::test]
+    async fn against_and_none_filters_hide_the_bullish_golden() {
+        let (candles, live) = window_with_golden_pinbar();
+
+        // `against` on a LONG plan wants SHORT signals — the bullish pinbar is
+        // filtered out.
+        let against = DetectorMarkConfig::new(
+            DirectionFilter::Against,
+            GoldenFilter::Golden,
+            Direction::Long,
+        );
+        let r = run(
+            &never_firing_long_plan(),
+            &candles,
+            Granularity::H1,
+            live,
+            expires(),
+            against,
+        )
+        .await;
+        assert!(marks(&r).is_empty(), "against-dir hides the bullish golden");
+
+        // `none` on either axis disables marking entirely — and the summary is
+        // omitted.
+        let off =
+            DetectorMarkConfig::new(DirectionFilter::None, GoldenFilter::Golden, Direction::Long);
+        let r_off = run(
+            &never_firing_long_plan(),
+            &candles,
+            Granularity::H1,
+            live,
+            expires(),
+            off,
+        )
+        .await;
+        assert!(marks(&r_off).is_empty(), "none disables marking");
+        let report = crate::report::render(
+            &never_firing_long_plan(),
+            &r_off,
+            true,
+            false,
+            &[],
+            None,
+            &off,
+        );
+        assert!(
+            !report.contains("Candle detector"),
+            "summary omitted when off:\n{report}"
         );
     }
 }
