@@ -1568,6 +1568,38 @@ Bar-by-bar engine trace (--verbose):
 It's a pure diff of the `PlanState` before/after each tick — no engine change,
 no extra evaluation — so it's always safe to add to any replay.
 
+**Marking every golden candle the detector saw (`--candle-detector-*`).** The
+normal report only ever surfaces a signal when it produced a *fired* enter. A
+golden candle the plan never acted on — wrong phase, plan not yet `AwaitEntry`, a
+golden the multi-shot watermark skipped, or a golden *opposite*-direction signal
+that only invalidates — is invisible, which makes "why didn't my entry fire?"
+hard to debug. Two flags mark **every** qualifying candle the detector printed,
+whether or not the plan entered on it:
+
+- `--candle-detector-direction=with|against|both|none` (default `with`) — which
+  directions to mark, relative to the plan's trade direction. `with` = the entry
+  candidates; `against` = invalidation/opposite-reversal candidates.
+- `--candle-detector-golden=golden|non-golden|both|none` (default `golden`) —
+  which golden-ness to mark.
+
+`none` on **either** axis turns marking off entirely (and omits the summary).
+The marks are computed with the *same* `detect_at` + `wilder_atr` the engine's
+`latched_signal_at` runs per bar (all five patterns on), so a marked golden is
+exactly what the engine detected — no re-implemented detector to drift. An
+always-on summary line reports the count; `--verbose` adds a per-bar `◆` detail
+line (direction, kind, size, ATR):
+
+```sh
+replay-candles --plan plan.json --candle-detector-direction both --candle-detector-golden both --verbose
+```
+
+```text
+Candle detector (Both / Both): 2 bar(s) marked — 1 golden, 1 non-golden
+...
+  bar 2026-06-19 22:00:00 +10:00 phase=AwaitEntry
+    ◆ GOLDEN Long Pinbar (size=0.00420 atr=0.00310)
+```
+
 **Break-even arming (`be:` line).** Break-even is *not* a fill-time decision —
 in production the live cron (`breakeven_watch`) sends `amend_stop(entry)` to the
 broker on the first 15-min tick that observes a candle closing past the

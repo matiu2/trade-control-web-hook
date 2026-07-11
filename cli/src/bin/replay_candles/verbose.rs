@@ -21,9 +21,44 @@
 //! legible, or show them under a future `--all-bars`.
 
 use chrono::{DateTime, Utc};
+use trade_control_engine::intent::{Direction, SignalKind};
 use trade_control_engine::{Phase, PlanState};
 
 use super::brisbane::bne;
+
+/// A pattern the signal detector printed on a bar, whether or not the plan acted
+/// on it. Attached to a [`BarTrace`] when the bar's detected signal passes the
+/// active [`DetectorMarkConfig`](super::detector_marks::DetectorMarkConfig)
+/// filter. Computed with the SAME `detect_at` + `wilder_atr` the engine uses, so
+/// a marked golden is exactly what the engine detected.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DetectedMark {
+    pub direction: Direction,
+    pub kind: SignalKind,
+    /// The size compared against ATR for the golden test (`Detected::size`).
+    pub size: f64,
+    /// The Wilder ATR at this bar, when warm — `None` if the window is too short
+    /// to size ATR (then `golden` is necessarily false, same as the engine).
+    pub atr: Option<f64>,
+    /// `size >= atr` — the golden flag, exactly as the engine latches it.
+    pub golden: bool,
+}
+
+impl DetectedMark {
+    /// One-line detail for the `--verbose` bar block.
+    fn render(&self) -> String {
+        let tag = if self.golden { "GOLDEN" } else { "signal" };
+        let atr = self
+            .atr
+            .map(|a| format!("{a:.5}"))
+            .unwrap_or_else(|| "na".to_string());
+        let size = self.size;
+        format!(
+            "    ◆ {tag} {:?} {:?} (size={size:.5} atr={atr})\n",
+            self.direction, self.kind
+        )
+    }
+}
 
 /// What changed on one live bar: the spine phase after the tick, any phase
 /// transition, the two lookback stamps if newly set this bar, and the rule ids
@@ -48,6 +83,11 @@ pub struct BarTrace {
     /// Rule ids that fired on this bar (in fire order), for cross-referencing the
     /// trace against the fire report.
     pub fired_rules: Vec<String>,
+    /// A detected signal on this bar that passed the active detector-mark filter
+    /// (`--candle-detector-*`), whether or not the plan acted on it. `None` when
+    /// no signal printed, the signal didn't pass the filter, or the feature is
+    /// off. This is the "golden candle we never entered on" surface.
+    pub detected: Option<DetectedMark>,
 }
 
 impl BarTrace {
@@ -60,6 +100,7 @@ impl BarTrace {
         before: &PlanState,
         after: &PlanState,
         fired_rules: Vec<String>,
+        detected: Option<DetectedMark>,
     ) -> Self {
         let phase_from = (before.phase != after.phase).then_some(before.phase);
         let break_close_stamped = before.break_close_at.is_none() && after.break_close_at.is_some();
@@ -71,6 +112,7 @@ impl BarTrace {
             break_close_stamped,
             retest_stamped,
             fired_rules,
+            detected,
         }
     }
 
@@ -82,6 +124,7 @@ impl BarTrace {
             && !self.break_close_stamped
             && !self.retest_stamped
             && self.fired_rules.is_empty()
+            && self.detected.is_none()
     }
 
     /// Render this trace as one indented block under a `bar …` header. Returns
@@ -99,6 +142,9 @@ impl BarTrace {
         }
         if self.retest_stamped {
             out.push_str("    ✓ retest stamped (entry gate now satisfied)\n");
+        }
+        if let Some(mark) = &self.detected {
+            out.push_str(&mark.render());
         }
         for rule in &self.fired_rules {
             out.push_str(&format!("    → fired {rule}\n"));
@@ -123,7 +169,7 @@ mod tests {
     #[test]
     fn quiet_bar_renders_empty() {
         let s = state(Phase::AwaitEntry);
-        let t = BarTrace::diff(at(16), &s, &s, Vec::new());
+        let t = BarTrace::diff(at(16), &s, &s, Vec::new(), None);
         assert!(t.is_quiet());
         assert_eq!(t.render(), "");
     }
@@ -133,13 +179,13 @@ mod tests {
         let before = state(Phase::AwaitEntry);
         let mut after = before.clone();
         after.retest_seen_at = Some(at(16));
-        let t = BarTrace::diff(at(16), &before, &after, Vec::new());
+        let t = BarTrace::diff(at(16), &before, &after, Vec::new(), None);
         assert!(t.retest_stamped);
         assert!(!t.is_quiet());
         assert!(t.render().contains("retest stamped"));
 
         // Already-set on the prior bar → not re-reported.
-        let t2 = BarTrace::diff(at(17), &after, &after, Vec::new());
+        let t2 = BarTrace::diff(at(17), &after, &after, Vec::new(), None);
         assert!(!t2.retest_stamped);
         assert!(t2.is_quiet());
     }
@@ -150,7 +196,7 @@ mod tests {
         let mut after = before.clone();
         after.break_close_at = Some(at(15));
         after.phase = Phase::AwaitEntry;
-        let t = BarTrace::diff(at(15), &before, &after, Vec::new());
+        let t = BarTrace::diff(at(15), &before, &after, Vec::new(), None);
         assert!(t.break_close_stamped);
         assert_eq!(t.phase_from, Some(Phase::AwaitBreakAndClose));
         let r = t.render();
@@ -163,7 +209,7 @@ mod tests {
         let before = state(Phase::AwaitEntry);
         let mut after = before.clone();
         after.phase = Phase::Done;
-        let t = BarTrace::diff(at(18), &before, &after, vec!["05-enter".into()]);
+        let t = BarTrace::diff(at(18), &before, &after, vec!["05-enter".into()], None);
         let r = t.render();
         assert!(r.contains("→ fired 05-enter"));
         assert!(r.contains("AwaitEntry→Done"));
@@ -172,8 +218,45 @@ mod tests {
     #[test]
     fn fire_alone_is_not_quiet() {
         let s = state(Phase::AwaitEntry);
-        let t = BarTrace::diff(at(22), &s, &s, vec!["01-veto-too-low".into()]);
+        let t = BarTrace::diff(at(22), &s, &s, vec!["01-veto-too-low".into()], None);
         assert!(!t.is_quiet());
         assert!(t.render().contains("→ fired 01-veto-too-low"));
+    }
+
+    /// A golden mark on a bar where nothing else happened is NOT quiet and
+    /// renders the ◆ GOLDEN line — this is the "golden candle we never entered
+    /// on" surface, visible even when no rule fired.
+    #[test]
+    fn golden_mark_alone_is_not_quiet_and_renders() {
+        let s = state(Phase::AwaitEntry);
+        let mark = DetectedMark {
+            direction: Direction::Long,
+            kind: SignalKind::Pinbar,
+            size: 0.0042,
+            atr: Some(0.0031),
+            golden: true,
+        };
+        let t = BarTrace::diff(at(16), &s, &s, Vec::new(), Some(mark));
+        assert!(!t.is_quiet());
+        let r = t.render();
+        assert!(r.contains("◆ GOLDEN"), "golden mark rendered: {r}");
+        assert!(r.contains("Long"), "direction shown: {r}");
+    }
+
+    /// A non-golden mark renders as `signal`, not `GOLDEN`.
+    #[test]
+    fn non_golden_mark_renders_as_signal() {
+        let s = state(Phase::AwaitEntry);
+        let mark = DetectedMark {
+            direction: Direction::Short,
+            kind: SignalKind::Tweezer,
+            size: 0.0010,
+            atr: Some(0.0031),
+            golden: false,
+        };
+        let t = BarTrace::diff(at(16), &s, &s, Vec::new(), Some(mark));
+        let r = t.render();
+        assert!(r.contains("◆ signal"), "non-golden mark: {r}");
+        assert!(!r.contains("GOLDEN"), "not tagged golden: {r}");
     }
 }

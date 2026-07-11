@@ -31,6 +31,7 @@ use trade_control_engine::{
 };
 
 use super::brisbane::bne;
+use super::detector_marks::DetectorMarkConfig;
 use super::replay::{Fire, Replay};
 
 /// The tick size the replay report rounds order prices to — the baked
@@ -398,6 +399,7 @@ pub fn render(
     verbose: bool,
     blackout_windows: &[NoEntryWindow],
     sentiment: Option<&PlanSentiment>,
+    mark_cfg: &DetectorMarkConfig,
 ) -> String {
     let mut out = String::new();
     out.push_str(&format!(
@@ -407,6 +409,8 @@ pub fn render(
         plan.granularity,
         replay.fires.len()
     ));
+
+    out.push_str(&render_detector_summary(replay, mark_cfg));
 
     if let Some(s) = sentiment {
         out.push_str(&render_sentiment(s));
@@ -571,6 +575,34 @@ fn realized_r(entry: f64, stop_loss: f64, exit: f64) -> f64 {
         return 0.0;
     }
     (exit - entry) / risk
+}
+
+/// The always-on candle-detector summary line: how many bars the detector
+/// printed a signal the active `--candle-detector-*` filter accepted, split by
+/// golden / non-golden. This is the "golden candle we never entered on" count —
+/// it's driven off the SAME per-bar marks the `--verbose` trace renders in
+/// detail. Returns an empty string when marking is off (either axis `none`), per
+/// the "omit summary when off" decision.
+fn render_detector_summary(replay: &Replay, mark_cfg: &DetectorMarkConfig) -> String {
+    if mark_cfg.is_off() {
+        return String::new();
+    }
+    let marks = replay.traces.iter().filter_map(|t| t.detected.as_ref());
+    let (mut golden, mut non_golden) = (0usize, 0usize);
+    for m in marks {
+        if m.golden {
+            golden += 1;
+        } else {
+            non_golden += 1;
+        }
+    }
+    let total = golden + non_golden;
+    // Describe the active filter so the count is unambiguous (e.g. a `0` under
+    // `with golden` vs a `0` under `both both` mean different things).
+    format!(
+        "Candle detector ({:?} / {:?}): {total} bar(s) marked — {golden} golden, {non_golden} non-golden\n",
+        mark_cfg.direction, mark_cfg.golden
+    )
 }
 
 /// Render the `--verbose` bar-by-bar trace: every live bar on which the engine
@@ -1127,9 +1159,16 @@ fn describe_outcome(outcome: &SimOutcome) -> String {
 
 #[cfg(test)]
 mod tests {
+    use super::super::detector_marks::{DirectionFilter, GoldenFilter};
     use super::super::replay::EnterGateOutcome;
     use super::*;
     use chrono::{TimeZone, Utc};
+
+    /// Detector marking off — the summary line is empty, so report assertions
+    /// that predate this feature stay byte-stable.
+    fn no_marks() -> DetectorMarkConfig {
+        DetectorMarkConfig::new(DirectionFilter::None, GoldenFilter::None, Direction::Long)
+    }
     use trade_control_core::intent::RiskBudget;
 
     fn resolved(direction: Direction, entry: ResolvedEntry, sl: f64, tp: f64) -> Resolved {
@@ -1393,7 +1432,15 @@ mod tests {
             warnings: Vec::new(),
             traces: Vec::new(),
         };
-        let out = render(&plan_for(0.0001), &replay, true, false, &[], None);
+        let out = render(
+            &plan_for(0.0001),
+            &replay,
+            true,
+            false,
+            &[],
+            None,
+            &no_marks(),
+        );
 
         // Top-level event lines, each naming entry #1 — no "bars (entry
         // timeline):" sub-heading, no OHLC dump, no leading-indent nested
