@@ -338,12 +338,21 @@ mod tests {
             // `live_start` is the saved window start: the frozen candles include
             // the warm-up prefix pulled before it, so the plan goes live at the
             // same boundary it did at save time.
+            // Detector marking off (either axis `None`) — the fixture round-trip
+            // compares the frozen outcome, which predates this feature and never
+            // carried marks.
+            let mark_cfg = super::super::detector_marks::DetectorMarkConfig::new(
+                super::super::detector_marks::DirectionFilter::None,
+                super::super::detector_marks::GoldenFilter::None,
+                inputs.plan.direction,
+            );
             let replay = super::super::replay::run(
                 &inputs.plan,
                 &inputs.candles,
                 inputs.meta.granularity,
                 inputs.meta.start,
                 expires_at,
+                mark_cfg,
             )
             .await;
             // Fixtures are saved from `--simulate` runs (the default), so the

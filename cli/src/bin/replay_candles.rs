@@ -41,6 +41,7 @@ mod replay_candles {
     pub mod annotate;
     pub mod brisbane;
     pub mod candles;
+    pub mod detector_marks;
     pub mod fixture;
     pub mod granularity;
     pub mod instrument;
@@ -65,6 +66,7 @@ use tracing_error::ErrorLayer;
 use tracing_subscriber::prelude::*;
 use tracing_subscriber::{EnvFilter, fmt};
 
+use replay_candles::detector_marks::{DetectorMarkConfig, DirectionFilter, GoldenFilter};
 use replay_candles::fixture::{self, FixtureMeta, ReplayOutcome};
 use replay_candles::source::CandleSource;
 use replay_candles::tv::TvDefaults;
@@ -133,6 +135,22 @@ struct Args {
     /// entry fire" — it shows exactly which bar armed the retest gate.
     #[arg(long, visible_alias = "all-events", default_value_t = false)]
     verbose: bool,
+
+    /// Which detected-signal DIRECTIONS to mark on the report, relative to the
+    /// plan's trade direction: `with` (trade direction only — the entry
+    /// candidates), `against` (opposite — invalidation candidates), `both`, or
+    /// `none` (disable marking). Marks EVERY qualifying candle the detector
+    /// printed, whether or not the plan entered on it — the "golden candle we
+    /// never entered on" debugging surface. Setting either this or
+    /// `--candle-detector-golden` to `none` turns marking off entirely.
+    #[arg(long, value_enum, default_value_t = DirectionFilter::With)]
+    candle_detector_direction: DirectionFilter,
+
+    /// Which detected-signal GOLDEN-ness to mark: `golden` (size ≥ ATR — the
+    /// default), `non-golden`, `both`, or `none` (disable). Pairs with
+    /// `--candle-detector-direction`; `none` on either axis turns marking off.
+    #[arg(long, value_enum, default_value_t = GoldenFilter::Golden)]
+    candle_detector_golden: GoldenFilter,
 
     /// After replaying, draw each *filled* position onto the live TradingView
     /// chart as a native long/short position tool (green profit zone, red stop
@@ -313,9 +331,17 @@ async fn main() -> Result<()> {
     )
     .await?;
 
+    // The candle-detector mark config, from the two `--candle-detector-*` flags,
+    // relative to the plan's trade direction (the `with`/`against` reference).
+    let mark_cfg = DetectorMarkConfig::new(
+        args.candle_detector_direction,
+        args.candle_detector_golden,
+        plan.direction,
+    );
+
     // Keep the state TTL past the window so nothing expires mid-replay.
     let expires_at = end + Duration::days(365);
-    let replay = replay::run(&plan, &candles, gran.engine(), start, expires_at).await;
+    let replay = replay::run(&plan, &candles, gran.engine(), start, expires_at, mark_cfg).await;
 
     // Market-hours no-entry windows (for the blackout sweep reason). Resolved
     // from the same TradeNation `market_info` source the live worker's
@@ -341,6 +367,7 @@ async fn main() -> Result<()> {
             args.verbose,
             &blackout_windows,
             replay_sentiment.as_ref(),
+            &mark_cfg,
         )
     );
 
@@ -508,11 +535,17 @@ async fn run_test_mode(args: &Args) -> Result<()> {
     tracing::info!(dir = %dir.display(), "replaying fixture offline");
 
     let inputs = fixture::load(&dir)?;
+    let mark_cfg = DetectorMarkConfig::new(
+        args.candle_detector_direction,
+        args.candle_detector_golden,
+        inputs.plan.direction,
+    );
     let replay = run_frozen(
         &inputs.plan,
         &inputs.candles,
         inputs.meta.granularity,
         inputs.meta.start,
+        mark_cfg,
     )
     .await;
 
@@ -528,6 +561,7 @@ async fn run_test_mode(args: &Args) -> Result<()> {
             args.verbose,
             &[],
             None,
+            &mark_cfg,
         )
     );
 
@@ -552,9 +586,10 @@ async fn run_frozen(
     candles: &[EngineCandle],
     gran: Granularity,
     live_start: DateTime<Utc>,
+    mark_cfg: DetectorMarkConfig,
 ) -> replay::Replay {
     let expires_at = candles.last().map(|c| c.time).unwrap_or_else(Utc::now) + Duration::days(365);
-    replay::run(plan, candles, gran, live_start, expires_at).await
+    replay::run(plan, candles, gran, live_start, expires_at, mark_cfg).await
 }
 
 /// Build a readable diff error when a fixture's computed outcome diverges from
@@ -939,6 +974,8 @@ mod tests {
             tv_mcp_root: None,
             simulate: true,
             verbose: false,
+            candle_detector_direction: DirectionFilter::With,
+            candle_detector_golden: GoldenFilter::Golden,
             annotate: false,
             annotate_unfilled: false,
             warmup_bars: 200,

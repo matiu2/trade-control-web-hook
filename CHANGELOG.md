@@ -1,5 +1,46 @@
 # Changelog
 
+## v84 — 2026-07-12 — replay: mark every golden candle the detector saw
+
+**Why.** The `replay-candles` report only ever surfaces a signal when it
+produced a *fired* enter. A golden candle the plan never acted on — wrong phase,
+plan not yet `AwaitEntry`, a golden the multi-shot watermark skipped, or a golden
+*opposite*-direction signal that only invalidates — was invisible, which made
+"why didn't my entry fire?" hard to debug.
+
+**What changed.** Two new `replay-candles` flags mark **every** qualifying
+candle the detector printed, regardless of whether the plan entered on it:
+
+- `--candle-detector-direction=with|against|both|none` (default `with`) —
+  directions to mark, relative to the plan's trade direction.
+- `--candle-detector-golden=golden|non-golden|both|none` (default `golden`) —
+  golden-ness to mark.
+
+`none` on either axis disables marking (and omits the summary). An always-on
+summary line reports the count (golden / non-golden); `--verbose` adds a per-bar
+`◆` detail line (direction, kind, size, ATR). Marks are computed with the SAME
+`detect_at` + `wilder_atr` the engine's `latched_signal_at` runs per bar (all
+five patterns on, `DetectFlags::default`), so a marked golden is exactly what the
+engine detected — no re-implemented detector to drift
+(`[[pine_rust_signal_detector_parity]]`).
+
+**Breaking.** `replay::run` and `report::render` gained a trailing
+`DetectorMarkConfig` argument; `run_frozen` too. Internal to the `replay-candles`
+binary — no wire/API surface.
+
+**Config.** New CLI flags only (above). No plan/intent/secret changes; the mark
+is a pure post-hoc read of the mid candle window.
+
+**Tests.** `detector_marks` filter matrix (with/against/both/none × golden/
+non-golden/none); `verbose` mark rendering (golden vs signal); replay
+integration — a golden bullish pinbar is marked on a plan whose enter never fires,
+and `against`/`none` filter it out; summary omitted when off. All 87 binary tests
+green.
+
+**Follow-up.** A `--candle-detector` could later mirror the plan's own
+`DetectorConfig` pattern set instead of `DetectFlags::default` if a plan disables
+patterns; not needed today (the wider net is the debugging goal).
+
 ## v83 — 2026-07-11 — invalidation pick: neckline-closeness is primary, anchor-time is the tiebreak
 
 **Why.** Exposed by the v82 USD/ZAR iH&S replay. The chart carried both a
