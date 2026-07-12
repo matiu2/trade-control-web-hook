@@ -97,12 +97,11 @@ pub fn annotate(
         tracing::info!(cleared, "removed prior replay annotations");
     }
 
-    let closes = report::collect_close_fires(replay);
     let resolve = |f: &_| {
         if include_unfilled {
-            report::resolve_fire_any(plan, f, &closes)
+            report::resolve_fire_any(plan, f)
         } else {
-            report::resolve_fire(plan, f, &closes)
+            report::resolve_fire(plan, f)
         }
     };
     let positions: Vec<FireResult> = replay.fires.iter().filter_map(resolve).collect();

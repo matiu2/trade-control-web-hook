@@ -81,8 +81,14 @@ fn close_gate_passes(fire: &Fire) -> bool {
 /// (matching the live worker); the blocked close still renders its own
 /// `BLOCKED` line via [`render_fire`].
 pub fn collect_close_fires(replay: &Replay) -> Vec<CloseFire> {
-    replay
-        .fires
+    collect_close_fires_from(&replay.fires)
+}
+
+/// [`collect_close_fires`] over a bare fire slice — so the replay loop can build
+/// the reversal-close set (to hand to `broker.realized_outcome`) before the
+/// `Replay` value is assembled. Same filter: gate-passing `Action::Close` fires.
+pub fn collect_close_fires_from(fires: &[Fire]) -> Vec<CloseFire> {
+    fires
         .iter()
         .filter(|f| f.fired.intent.action == Action::Close)
         .filter(|f| close_gate_passes(f))
@@ -232,18 +238,16 @@ pub struct FireResult {
     pub kind: FillKind,
 }
 
-/// Resolve the bracket + simulate the fill for one fire, returning a
-/// [`FireResult`] **only** when it's an enter that actually filled
-/// (`Open` / `StoppedOut` / `TookProfit`). Non-enters, unresolved
-/// brackets, declined entries, and never-filled pending orders yield
+/// The taken/filled outcome for one fire, returning a [`FireResult`]
+/// **only** when it's an enter that actually filled
+/// (`Open` / `StoppedOut` / `TookProfit` / `ClosedOnReversal`). Non-enters,
+/// unresolved brackets, declined entries, and never-filled pending orders yield
 /// `None` — they have no *taken* position to annotate.
 ///
-/// The shell reconstruction mirrors the worker's dispatch (an H&S Pine
-/// fire folds its latched signal onto the shell), so the levels match
-/// what the live worker would have placed — and the report's `order:`
-/// line, which resolves the same way.
-pub fn resolve_fire(plan: &TradePlan, fire: &Fire, closes: &[CloseFire]) -> Option<FireResult> {
-    resolve_fire_any(plan, fire, closes).filter(|r| r.kind.is_taken())
+/// The fill/exit outcome is the `ReplayBroker` ledger's (PR 4b-2), stashed on
+/// the fire by the replay loop; this function reads it, it does not re-simulate.
+pub fn resolve_fire(plan: &TradePlan, fire: &Fire) -> Option<FireResult> {
+    resolve_fire_any(plan, fire).filter(|r| r.kind.is_taken())
 }
 
 /// Like [`resolve_fire`], but also returns the *not-taken* enters —
@@ -254,7 +258,7 @@ pub fn resolve_fire(plan: &TradePlan, fire: &Fire, closes: &[CloseFire]) -> Opti
 ///
 /// Still `None` for non-enters and for enters whose bracket can't resolve
 /// (an `Unresolved` outcome — nothing meaningful to draw).
-pub fn resolve_fire_any(plan: &TradePlan, fire: &Fire, closes: &[CloseFire]) -> Option<FireResult> {
+pub fn resolve_fire_any(plan: &TradePlan, fire: &Fire) -> Option<FireResult> {
     let intent = &fire.fired.intent;
     if intent.action != Action::Enter {
         return None;
@@ -267,32 +271,27 @@ pub fn resolve_fire_any(plan: &TradePlan, fire: &Fire, closes: &[CloseFire]) -> 
         return None;
     }
     let candle = &fire.fired.candle;
-    let shell = match &fire.fired.signal {
-        Some(sig) => Shell::from_candle_and_signal(candle, sig),
-        None => Shell::from_candle(candle),
-    };
-    let mut resolved = Resolved::from_intent(
-        intent,
-        &shell,
-        plan.pip_size,
-        replay_report_tick(intent, plan),
-    )
-    .ok()?;
-    // For an open / not-taken trade the box runs to the last replayed bar;
-    // closed trades override this with their exit bar below.
-    let window_end = fire.forward.last().map(|c| c.time)?;
-    // The fire bar is the not-taken anchor: an order that never filled (or was
-    // declined) was still "placed" at this bar, so draw the intended bracket
-    // there.
-    let fire_at = candle.time;
 
     // The entry decision was made ONCE in the tick loop by the REAL `run_enter`
     // (every gate: pause / retry / cooldown / prep / veto / entry-level-veto /
     // allow_entry / blackouts / SL-floor). A `Rejected` enter is not-taken — the
     // live worker 412/422/423s it before placing an order — so anchor the
-    // intended bracket at the fire bar as a `GateBlocked` and tally 0R. This
-    // path no longer re-derives any gate; the verdict comes off the fire.
+    // intended bracket at the fire bar as a `GateBlocked` and tally 0R. This is a
+    // gate verdict, not fill physics, so it stays in the report: resolve the raw
+    // bracket for the drawn levels and short-circuit before the broker outcome.
     if fire.rejected_reason().is_some() {
+        let shell = match &fire.fired.signal {
+            Some(sig) => Shell::from_candle_and_signal(candle, sig),
+            None => Shell::from_candle(candle),
+        };
+        let resolved = Resolved::from_intent(
+            intent,
+            &shell,
+            plan.pip_size,
+            replay_report_tick(intent, plan),
+        )
+        .ok()?;
+        let window_end = fire.forward.last().map(|c| c.time)?;
         tracing::debug!(
             bar = %candle.time,
             reason = ?fire.rejected_reason(),
@@ -300,7 +299,7 @@ pub fn resolve_fire_any(plan: &TradePlan, fire: &Fire, closes: &[CloseFire]) -> 
         );
         return Some(FireResult {
             direction: resolved.direction,
-            fill_at: fire_at,
+            fill_at: candle.time,
             until: window_end,
             entry_price: resolved.entry.reference_price(),
             stop_loss: resolved.stop_loss,
@@ -309,81 +308,22 @@ pub fn resolve_fire_any(plan: &TradePlan, fire: &Fire, closes: &[CloseFire]) -> 
         });
     }
 
-    // Mirror `simulate_fill`'s SL-vs-spread-floor widen onto the *displayed*
-    // bracket so the annotation box (and the `order:` journaling line) show the
-    // same stop the sim and the live worker actually protect with. Shared helper
-    // so the annotation, the order line, the sim exit, and System 2's baseline
-    // all floor identically.
-    apply_entry_spread_floor(
-        &mut resolved,
-        plan.pip_size,
-        &fire.forward,
-        fire.entry_spread_price,
-    );
-
-    let raw = simulate_fill_windowed(
-        intent,
-        &shell,
-        plan.pip_size,
-        &fire.forward,
-        fire.entry_spread_price,
-    );
-    let (fill_at, until, entry_price, kind) = match apply_reversal_close(raw, closes) {
-        ReplayOutcome::ClosedOnReversal {
-            fill_at,
-            exit_at,
-            entry_price,
-            ..
-        } => (fill_at, exit_at, entry_price, FillKind::ClosedOnReversal),
-        ReplayOutcome::Sim(sim) => match sim {
-            SimOutcome::FilledOpen {
-                fill_at,
-                entry_price,
-            } => (fill_at, window_end, entry_price, FillKind::Open),
-            SimOutcome::StoppedOut {
-                fill_at,
-                entry_price,
-                exit_at,
-                ..
-            } => (fill_at, exit_at, entry_price, FillKind::StoppedOut),
-            SimOutcome::TookProfit {
-                fill_at,
-                entry_price,
-                exit_at,
-                ..
-            } => (fill_at, exit_at, entry_price, FillKind::TookProfit),
-            // Not taken: anchor the intended bracket at the fire bar, running
-            // to the window end. The placed level (`resolved`) is the entry.
-            SimOutcome::NeverFilled => (
-                fire_at,
-                window_end,
-                resolved.entry.reference_price(),
-                FillKind::NeverFilled,
-            ),
-            SimOutcome::Declined { .. } => (
-                fire_at,
-                window_end,
-                resolved.entry.reference_price(),
-                FillKind::Declined,
-            ),
-            SimOutcome::SpreadBlackout { .. } => (
-                fire_at,
-                window_end,
-                resolved.entry.reference_price(),
-                FillKind::SpreadBlackout,
-            ),
-            // Nothing meaningful to draw.
-            SimOutcome::Unresolved(_) => return None,
-        },
-    };
+    // Fill physics now belong to the broker (PR 4b-2). The replay loop attached
+    // this order's geometry to the `ReplayBroker` ledger and stashed the ledger's
+    // realized outcome on the fire — fill / exit / floored SL/TP / reversal-close,
+    // computed by the SAME engine sims this function used to call directly. The
+    // report is pure formatting now: read the broker's verdict and map it to a
+    // `FireResult`. `None` means the order was cancelled or its bracket didn't
+    // resolve — nothing to draw, exactly as before.
+    let r = fire.realized.as_ref()?;
     Some(FireResult {
-        direction: resolved.direction,
-        fill_at,
-        until,
-        entry_price,
-        stop_loss: resolved.stop_loss,
-        take_profit: resolved.take_profit,
-        kind,
+        direction: r.direction,
+        fill_at: r.fill_at,
+        until: r.until,
+        entry_price: r.entry_price,
+        stop_loss: r.stop_loss,
+        take_profit: r.take_profit,
+        kind: r.kind,
     })
 }
 
@@ -1355,28 +1295,49 @@ mod tests {
         fire_secs: i64,
         gate_outcome: EnterGateOutcome,
     ) -> Fire {
+        // Forward path rises through the 1.1000 stop trigger, then on to the
+        // 1.1100 TP — so a `Placed` enter would fill + take profit.
+        let forward = vec![
+            ba(fire_secs, 1.0980),
+            ba(fire_secs + 3600, 1.1010),
+            ba(fire_secs + 7200, 1.1110),
+        ];
+        let fired = trade_control_engine::FiredIntent {
+            rule_id: "05-enter".into(),
+            intent,
+            candle: ba(fire_secs, 1.0980).mid(),
+            // A stop/limit enter has no latched Pine signal — exactly the case
+            // that strips `golden` off the reconstructed shell.
+            signal: None,
+        };
+        // Mirror the replay loop: a placed enter gets its outcome from the broker
+        // ledger, which the report then reads (PR 4b-2). A rejected/other gate
+        // outcome leaves `realized: None` — the report renders it from gate state.
+        let realized = if matches!(gate_outcome, EnterGateOutcome::Placed { .. }) {
+            let broker =
+                crate::replay_candles::replay_broker::ReplayBroker::new(forward.clone(), 0.0001);
+            let shell = Shell::from_candle(&fired.candle);
+            broker.record_order(
+                "e1".into(),
+                fired.intent.clone(),
+                shell,
+                forward.clone(),
+                None,
+            );
+            broker.realized_outcome("e1", &[])
+        } else {
+            None
+        };
         Fire {
-            fired: trade_control_engine::FiredIntent {
-                rule_id: "05-enter".into(),
-                intent,
-                candle: ba(fire_secs, 1.0980).mid(),
-                // A stop/limit enter has no latched Pine signal — exactly the
-                // case that strips `golden` off the reconstructed shell.
-                signal: None,
-            },
-            // Forward path rises through the 1.1000 stop trigger, then on to the
-            // 1.1100 TP — so a `Placed` enter would fill + take profit.
-            forward: vec![
-                ba(fire_secs, 1.0980),
-                ba(fire_secs + 3600, 1.1010),
-                ba(fire_secs + 7200, 1.1110),
-            ],
+            fired,
+            forward,
             gate_outcome,
             superseded: false,
             // No windowed spread in the fixture → the floor falls back to the
             // fire bar's own close spread, the pre-window behaviour these tests
             // were written against.
             entry_spread_price: None,
+            realized,
         }
     }
 
@@ -1410,7 +1371,7 @@ mod tests {
                 reason: "rejected: needs-golden".into(),
             },
         );
-        let result = resolve_fire_any(&plan_for(0.0001), &fire, &[]).expect("an enter result");
+        let result = resolve_fire_any(&plan_for(0.0001), &fire).expect("an enter result");
         assert_eq!(
             result.kind,
             FillKind::GateBlocked,
@@ -1418,7 +1379,7 @@ mod tests {
         );
         assert!(!result.kind.is_taken());
         // And resolve_fire (taken-only) drops it entirely.
-        assert!(resolve_fire(&plan_for(0.0001), &fire, &[]).is_none());
+        assert!(resolve_fire(&plan_for(0.0001), &fire).is_none());
     }
 
     #[test]
@@ -1430,7 +1391,7 @@ mod tests {
             1_781_244_000,
             EnterGateOutcome::Placed { order_id: None },
         );
-        let result = resolve_fire_any(&plan_for(0.0001), &fire, &[]).expect("an enter result");
+        let result = resolve_fire_any(&plan_for(0.0001), &fire).expect("an enter result");
         assert!(
             result.kind.is_taken(),
             "a placed enter fills along the forward path (got {:?})",

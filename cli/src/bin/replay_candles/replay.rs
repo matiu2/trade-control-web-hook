@@ -23,7 +23,7 @@ use trade_control_engine::{
 
 use trade_control_core::signals::{DetectFlags, atr_length_for, detect_at, wilder_atr};
 
-use super::replay_broker::ReplayBroker;
+use super::replay_broker::{RealizedOutcome, ReplayBroker};
 use super::verbose::{BarTrace, DetectedMark};
 use trade_control_cli::replay_args::DetectorMarkConfig;
 
@@ -74,6 +74,16 @@ pub struct Fire {
     /// single fire-bar spread. `None` when unavailable (falls back to the fire
     /// bar's own close spread — the pre-window behaviour).
     pub entry_spread_price: Option<f64>,
+    /// The broker-ledger realized outcome for this enter (PR 4b-2): the fill /
+    /// exit / floored bracket the `ReplayBroker`'s position ledger computed for
+    /// the placed order, so the report reads it instead of re-simulating the fill
+    /// itself. Populated by [`run`] after the loop (once the reversal-close set is
+    /// known) for a **placed** enter that resolved to a drawable outcome; `None`
+    /// for a non-enter, a rejected/superseded enter (the report renders those from
+    /// gate state), or an unresolved bracket (nothing to draw). The report's
+    /// not-taken kinds (`NeverFilled` / `Declined` / `SpreadBlackout`) come
+    /// through here as `Some` — they're fill physics the broker owns.
+    pub realized: Option<RealizedOutcome>,
 }
 
 impl Fire {
@@ -421,18 +431,61 @@ pub async fn run(
             } else {
                 None
             };
+            // Attach the position-ledger geometry to the placed order so the
+            // broker owns its fill/exit outcome (PR 4b-2). The dispatch's
+            // `place_entry` already recorded a geometry-less attempt under this
+            // order id; `record_order` upgrades it in place with the forward path
+            // + entry-spread the report used to walk. The report then reads
+            // `broker.realized_outcome(order_id, closes)` instead of re-simulating.
+            // The shell must be the SAME one the dispatch armed — rebuild it the
+            // identical way (signal-folded for an H&S Pine fire, plain otherwise).
+            if let EnterGateOutcome::Placed {
+                order_id: Some(order_id),
+            } = &gate_outcome
+            {
+                let shell = match &fired.signal {
+                    Some(sig) => Shell::from_candle_and_signal(&fired.candle, sig),
+                    None => Shell::from_candle(&fired.candle),
+                };
+                replay_broker.record_order(
+                    order_id.clone(),
+                    fired.intent.clone(),
+                    shell,
+                    forward.clone(),
+                    entry_spread_price,
+                );
+            }
             fires.push(Fire {
                 fired,
                 forward,
                 gate_outcome,
                 superseded: false,
                 entry_spread_price,
+                realized: None,
             });
         }
 
         if eval.done {
             done = true;
             break;
+        }
+    }
+
+    // PR 4b-2: the report reads each placed enter's outcome from the broker
+    // ledger. The reversal-close set is plan-wide (a `06-close-on-reversal` can
+    // flatten a position that filled bars earlier), so it's only known now that
+    // every fire is collected. Build it, then ask the broker to realize each
+    // placed order against it and stash the outcome on the fire. A superseded
+    // order (its resting order cancelled by a later entry) is skipped — the
+    // report renders it as cancelled, not a fill, exactly as before.
+    let closes = super::report::collect_close_fires_from(&fires);
+    for fire in fires.iter_mut() {
+        if fire.superseded {
+            continue;
+        }
+        let order_id = fire.order_id().map(str::to_owned);
+        if let Some(order_id) = order_id {
+            fire.realized = replay_broker.realized_outcome(&order_id, &closes);
         }
     }
 
@@ -738,6 +791,9 @@ async fn inject_control_ticks(
                 gate_outcome: EnterGateOutcome::NotAnEnter,
                 superseded: false,
                 entry_spread_price: None,
+                // A control tick (pause/resume/news) is not an enter — no order,
+                // no ledger outcome.
+                realized: None,
             });
         }
     }

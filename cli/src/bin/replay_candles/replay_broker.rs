@@ -48,23 +48,21 @@ struct PlacedAttempt {
     /// state answers (`lookup_attempt_state` etc., which bound at `as_of`) are
     /// untouched by the ledger, which walks the FULL forward path like the report.
     //
-    // Dead outside `cfg(test)` until PR 4b-2 wires `record_order` /
-    // `realized_outcome` into the replay loop + report; the shadow-parity tests
-    // are the ledger's only consumer in 4b-1. Every `allow(dead_code)` below is
-    // removed the moment 4b-2 switches the report over to broker state.
-    #[allow(dead_code)]
+    // Consumed by the report (4b-2): the loop attaches geometry via `record_order`
+    // and the report reads `realized_outcome` instead of re-simulating the fill.
     ledger: Option<LedgerGeometry>,
 }
 
-/// The per-order geometry the position ledger (PR 4b-1) advances a realized
-/// outcome against — the SAME inputs `report.rs::resolve_fire_any` walks: the
-/// full forward bid/ask path from the fire bar, the trailing entry-spread mean
-/// (for the SL floor), and the reversal-close fires that could flatten the
-/// position early. The ledger reuses the engine's fill physics
-/// (`simulate_fill_windowed`, `apply_entry_spread_floor`, and the reversal-close
-/// post-pass) so its outcome reproduces the report's bit-for-bit.
+/// The per-order geometry the position ledger advances a realized outcome
+/// against — the SAME per-order inputs `report.rs::resolve_fire_any` used to walk:
+/// the full forward bid/ask path from the fire bar and the trailing entry-spread
+/// mean (for the SL floor). The reversal-close fires are **not** stored here —
+/// they're a plan-wide fire-set collected after the loop and passed to
+/// [`ReplayBroker::realized_outcome`] as an argument. The ledger reuses the
+/// engine's fill physics (`simulate_fill_windowed`, `apply_entry_spread_floor`,
+/// and the reversal-close post-pass) so its outcome reproduces the report's
+/// bit-for-bit.
 #[derive(Clone)]
-#[allow(dead_code)] // 4b-1 scaffold; consumed by tests, wired into the loop in 4b-2.
 struct LedgerGeometry {
     /// Bid/ask candles at/after the fire bar (ascending) — the fill sim input
     /// and the `until` window-end anchor (`forward.last()`).
@@ -73,20 +71,15 @@ struct LedgerGeometry {
     /// `get_bidask_candles` provider) the SL floor sizes off. `None` ⇒ fall back
     /// to the fire bar's own close spread (mirrors the report).
     entry_spread_price: Option<f64>,
-    /// The `06-close-on-reversal` fires the position could exit on before its
-    /// SL/TP (the reversal-close post-pass). Empty ⇒ no reversal-close applies.
-    closes: Vec<CloseFire>,
 }
 
 /// A reversal-close that flattened an open ledger position before its SL/TP —
 /// the [`apply_reversal_close`] verdict, carrying the fill it applies to and the
 /// close bar/price. Mirrors `report.rs`'s private `ReplayOutcome::ClosedOnReversal`.
-#[allow(dead_code)] // 4b-1 scaffold; consumed by tests, wired into the loop in 4b-2.
 struct ReversalClose {
     fill_at: DateTime<Utc>,
     entry_price: f64,
     exit_at: DateTime<Utc>,
-    exit_price: f64,
 }
 
 /// Whether a `06-close-on-reversal` fire flattens this outcome's open position
@@ -95,7 +88,6 @@ struct ReversalClose {
 /// after the fill (and strictly before any SL/TP exit) closes the position; the
 /// earliest such close wins. `None` ⇒ no reversal applies (untaken outcomes, or a
 /// close that lands outside the open window).
-#[allow(dead_code)] // 4b-1 scaffold; consumed by tests, wired into the loop in 4b-2.
 fn apply_reversal_close(outcome: &SimOutcome, closes: &[CloseFire]) -> Option<ReversalClose> {
     let (fill_at, entry_price, exit_limit) = match outcome {
         SimOutcome::FilledOpen {
@@ -133,21 +125,19 @@ fn apply_reversal_close(outcome: &SimOutcome, closes: &[CloseFire]) -> Option<Re
             fill_at,
             entry_price,
             exit_at: c.at,
-            exit_price: c.price,
         })
 }
 
 /// A placed order's *realized* outcome, driven from the position ledger — the
-/// broker-owned equivalent of the report's `FireResult` (PR 4b-1 shadow). Carries
-/// the same load-bearing fields `resolve_fire_any` produces so the report can
-/// later (4b-2) read this instead of re-simulating: direction, the fill bar +
-/// price, the box's right edge, the (floored) SL/TP, and the taken/closed kind.
+/// broker-owned equivalent of the report's `FireResult`. Carries the same
+/// load-bearing fields `resolve_fire_any` produces, which the report reads
+/// (4b-2) instead of re-simulating: direction, the fill bar + price, the box's
+/// right edge, the (floored) SL/TP, and the taken/closed kind.
 ///
 /// A cancelled order has no realized outcome — `realized_outcome` returns `None`
 /// for it, which is the whole point of the ledger (a spread-hour cancel later
 /// flows into a "no fill" here).
 #[derive(Debug, Clone, PartialEq)]
-#[allow(dead_code)] // 4b-1 scaffold; consumed by tests, wired into the loop in 4b-2.
 pub struct RealizedOutcome {
     pub direction: Direction,
     /// Open-time of the bar the entry filled on (or the fire bar, for a
@@ -238,15 +228,20 @@ impl ReplayBroker {
         });
     }
 
-    /// Record a placed order **with its position-ledger geometry** (PR 4b-1) so a
-    /// later [`ReplayBroker::realized_outcome`] can advance it to a realized
-    /// outcome. `forward` is the fire bar onward, `entry_spread_price` the
-    /// trailing-window mean the SL floor sizes off, and `closes` the
-    /// reversal-close fires that could flatten it early — the SAME three inputs
-    /// `report.rs::resolve_fire_any` walks. Retry-gate state answers are
-    /// unaffected: `resolve` (bounded at `as_of`) still drives them from the raw
-    /// intent + shell.
-    #[allow(dead_code)] // 4b-1 scaffold; consumed by tests, wired into the loop in 4b-2.
+    /// Attach position-ledger geometry to a placed order so a later
+    /// [`ReplayBroker::realized_outcome`] can advance it to a realized outcome.
+    /// `forward` is the fire bar onward and `entry_spread_price` the
+    /// trailing-window mean the SL floor sizes off — the per-order inputs
+    /// `report.rs::resolve_fire_any` used to walk. The reversal-close fires are a
+    /// plan-wide set passed to `realized_outcome` separately.
+    ///
+    /// If an attempt with this `order_id` already exists (the usual path: the
+    /// dispatch's `place_entry` recorded a geometry-less attempt first), its
+    /// ledger is **upgraded** in place — so there's exactly one attempt per order,
+    /// and the retry-gate state answers keyed on it are untouched. Otherwise a
+    /// fresh attempt is pushed (the direct-record path the unit tests use).
+    /// Retry-gate answers stay driven by `resolve` (bounded at `as_of`) off the
+    /// raw intent + shell.
     pub fn record_order(
         &self,
         order_id: String,
@@ -254,36 +249,46 @@ impl ReplayBroker {
         shell: Shell,
         forward: Vec<EngineCandle>,
         entry_spread_price: Option<f64>,
-        closes: Vec<CloseFire>,
     ) {
-        self.placed.borrow_mut().push(PlacedAttempt {
-            order_id,
-            intent,
-            shell,
-            cancelled: false,
-            ledger: Some(LedgerGeometry {
-                forward,
-                entry_spread_price,
-                closes,
+        let geometry = LedgerGeometry {
+            forward,
+            entry_spread_price,
+        };
+        let mut placed = self.placed.borrow_mut();
+        match placed.iter_mut().find(|a| a.order_id == order_id) {
+            Some(existing) => existing.ledger = Some(geometry),
+            None => placed.push(PlacedAttempt {
+                order_id,
+                intent,
+                shell,
+                cancelled: false,
+                ledger: Some(geometry),
             }),
-        });
+        }
     }
 
-    /// The realized outcome of a ledger-tracked order (PR 4b-1) — the
-    /// broker-owned equivalent of `report.rs::resolve_fire_any`'s taken/closed
-    /// verdict for the same enter. Advances the order's forward path through the
-    /// SAME engine physics the report uses, in the SAME per-bar precedence:
+    /// The realized outcome of a ledger-tracked order — the broker-owned
+    /// equivalent of `report.rs::resolve_fire_any`'s taken/closed verdict for the
+    /// same enter. Advances the order's forward path through the SAME engine
+    /// physics the report used, in the SAME per-bar precedence:
     ///
     ///   fill → strategy-side/simulator SL/TP → reversal-close → break-even
     ///
     /// (break-even is folded into `simulate_fill_windowed`, and the SL floor into
     /// `apply_entry_spread_floor` — so this driver just calls them in report order).
+    /// `closes` is the plan-wide `06-close-on-reversal` fire-set (collected after
+    /// the loop by the report); a reversal in it that lands while the position is
+    /// open flattens it before its SL/TP.
     ///
     /// Returns `None` when the order was **cancelled** (no fill, no outcome — the
-    /// lifecycle-cancel case later stages exercise) or wasn't recorded with ledger
-    /// geometry (a plain retry-gate attempt).
-    #[allow(dead_code)] // 4b-1 scaffold; consumed by tests, wired into the loop in 4b-2.
-    pub fn realized_outcome(&self, order_id: &str) -> Option<RealizedOutcome> {
+    /// lifecycle-cancel case later stages exercise), wasn't recorded with ledger
+    /// geometry (a plain retry-gate attempt), or its bracket can't resolve
+    /// (`Unresolved` — nothing to draw, exactly as the report returned `None`).
+    pub fn realized_outcome(
+        &self,
+        order_id: &str,
+        closes: &[CloseFire],
+    ) -> Option<RealizedOutcome> {
         let placed = self.placed.borrow();
         let attempt = placed.iter().find(|a| a.order_id == order_id)?;
         // A cancelled order never fills — no realized outcome (the whole point of
@@ -292,39 +297,43 @@ impl ReplayBroker {
             return None;
         }
         let geo = attempt.ledger.as_ref()?;
-        Some(self.realize(&attempt.intent, &attempt.shell, geo))
+        self.realize(&attempt.intent, &attempt.shell, geo, closes)
     }
 
     /// Compute a ledger order's realized outcome by replaying the report's exact
-    /// sequence — `apply_entry_spread_floor` (floors the DISPLAYED SL/TP) then
-    /// `simulate_fill_windowed` (the fill/exit, with the same floor + break-even
-    /// baked in) then the reversal-close post-pass — and map to a
+    /// sequence — `Resolved::from_intent` → `apply_entry_spread_floor` (floors the
+    /// DISPLAYED SL/TP) → `simulate_fill_windowed` (the fill/exit, with the same
+    /// floor + break-even baked in) → the reversal-close post-pass — and map to a
     /// [`RealizedOutcome`]. This is a verbatim lift of `resolve_fire_any`'s taken
-    /// path, so the two agree bit-for-bit (the 4b-1 shadow-parity gate).
-    #[allow(dead_code)] // 4b-1 scaffold; consumed by tests, wired into the loop in 4b-2.
-    fn realize(&self, intent: &Intent, shell: &Shell, geo: &LedgerGeometry) -> RealizedOutcome {
+    /// path, so the two agree bit-for-bit (the shadow-parity gate).
+    ///
+    /// `None` when the bracket can't resolve or the sim returns `Unresolved` —
+    /// the report drew nothing in those cases (`Resolved::from_intent(...).ok()?`
+    /// and the `Unresolved => return None` arm), so the ledger reports nothing too.
+    fn realize(
+        &self,
+        intent: &Intent,
+        shell: &Shell,
+        geo: &LedgerGeometry,
+        closes: &[CloseFire],
+    ) -> Option<RealizedOutcome> {
         let pip_size = self.pip_size;
         let tick = intent.tick_size.unwrap_or(pip_size);
         // The floored bracket the position rests on: resolve, then apply the
         // entry-spread floor in place (mirrors `resolve_fire_any`, which floors
-        // `resolved` before reading its SL/TP). A resolution failure can't happen
-        // for a ledger order the report would have drawn (it resolved to place the
-        // order), so fall back to the raw resolve and let the sim's `Unresolved`
-        // path drive the outcome.
-        let mut resolved = Resolved::from_intent(intent, shell, pip_size, tick).ok();
-        if let Some(r) = resolved.as_mut() {
-            apply_entry_spread_floor(r, pip_size, &geo.forward, geo.entry_spread_price);
-        }
-        let direction = resolved
-            .as_ref()
-            .map(|r| r.direction)
-            .unwrap_or(Direction::Long);
-        let stop_loss = resolved.as_ref().map(|r| r.stop_loss).unwrap_or(0.0);
-        let take_profit = resolved.as_ref().map(|r| r.take_profit).unwrap_or(0.0);
-        let placed_level = resolved
-            .as_ref()
-            .map(|r| r.entry.reference_price())
-            .unwrap_or(0.0);
+        // `resolved` before reading its SL/TP). A resolve failure is `None` — the
+        // report's `.ok()?` drew nothing.
+        let mut resolved = Resolved::from_intent(intent, shell, pip_size, tick).ok()?;
+        apply_entry_spread_floor(
+            &mut resolved,
+            pip_size,
+            &geo.forward,
+            geo.entry_spread_price,
+        );
+        let direction = resolved.direction;
+        let stop_loss = resolved.stop_loss;
+        let take_profit = resolved.take_profit;
+        let placed_level = resolved.entry.reference_price();
         // The not-taken / open box runs to the last forward bar; a closed trade
         // overrides `until` with its exit bar below.
         let window_end = geo.forward.last().map(|c| c.time).unwrap_or(shell.time);
@@ -337,7 +346,7 @@ impl ReplayBroker {
             &geo.forward,
             geo.entry_spread_price,
         );
-        let (fill_at, until, entry_price, kind) = match apply_reversal_close(&raw, &geo.closes) {
+        let (fill_at, until, entry_price, kind) = match apply_reversal_close(&raw, closes) {
             Some(rc) => (
                 rc.fill_at,
                 rc.exit_at,
@@ -370,15 +379,12 @@ impl ReplayBroker {
                 SimOutcome::SpreadBlackout { .. } => {
                     (fire_at, window_end, placed_level, FillKind::SpreadBlackout)
                 }
-                // `Unresolved` has nothing to draw; the report returns `None`. The
-                // ledger surfaces a not-taken Declined so the API stays total —
-                // callers filter on `kind.is_taken()` exactly as the report does.
-                SimOutcome::Unresolved(_) => {
-                    (fire_at, window_end, placed_level, FillKind::Declined)
-                }
+                // `Unresolved` has nothing to draw — the report returned `None`
+                // from its `Unresolved => return None` arm, so the ledger does too.
+                SimOutcome::Unresolved(_) => return None,
             },
         };
-        RealizedOutcome {
+        Some(RealizedOutcome {
             direction,
             fill_at,
             until,
@@ -386,7 +392,7 @@ impl ReplayBroker {
             stop_loss,
             take_profit,
             kind,
-        }
+        })
     }
 
     /// The order ids the gate has cancelled so far (the cancel-and-replace
@@ -1001,16 +1007,17 @@ mod tests {
             },
             superseded: false,
             entry_spread_price: None,
+            realized: None,
         }
     }
 
-    /// Feed a fire's geometry into the broker ledger (via `record_order`) exactly
-    /// as the loop will in 4b-2, then compare `realized_outcome` to the report's
-    /// `resolve_fire_any` for the same fire. Asserts every load-bearing field.
-    fn assert_shadow_parity(fire: &Fire, closes: &[CloseFire], order_id: &str) {
+    /// Drive a fire through the broker ledger exactly as the replay loop does
+    /// (record its geometry, realize it against the close-fire set, stash the
+    /// outcome on the fire), then assert the report's `resolve_fire_any` reads
+    /// that outcome back faithfully — every load-bearing field. This is the 4b-2
+    /// wiring guarantee: the report is pure formatting of the broker's ledger.
+    fn assert_shadow_parity(mut fire: Fire, closes: &[CloseFire], order_id: &str) {
         let plan = ledger_plan();
-        let expected = resolve_fire_any(&plan, fire, closes).expect("report resolves this enter");
-
         let broker = ReplayBroker::new(fire.forward.clone(), plan.pip_size);
         let shell = Shell::from_candle(&fire.fired.candle);
         broker.record_order(
@@ -1019,33 +1026,37 @@ mod tests {
             shell,
             fire.forward.clone(),
             fire.entry_spread_price,
-            closes.to_vec(),
         );
-        let got = broker
-            .realized_outcome(order_id)
+        // The loop stashes the broker's realized outcome on the fire; the report
+        // reads it (never re-simulating).
+        let realized = broker
+            .realized_outcome(order_id, closes)
             .expect("ledger realizes this order");
+        fire.realized = Some(realized.clone());
 
-        assert_eq!(got.kind, expected.kind, "kind must match the report");
-        assert_eq!(got.direction, expected.direction, "direction");
-        assert_eq!(got.fill_at, expected.fill_at, "fill_at");
-        assert_eq!(got.until, expected.until, "until (box right edge)");
+        let got = resolve_fire_any(&plan, &fire).expect("report resolves this enter");
+
+        assert_eq!(got.kind, realized.kind, "kind must match the broker");
+        assert_eq!(got.direction, realized.direction, "direction");
+        assert_eq!(got.fill_at, realized.fill_at, "fill_at");
+        assert_eq!(got.until, realized.until, "until (box right edge)");
         assert!(
-            (got.entry_price - expected.entry_price).abs() < 1e-12,
+            (got.entry_price - realized.entry_price).abs() < 1e-12,
             "entry_price {} vs {}",
             got.entry_price,
-            expected.entry_price
+            realized.entry_price
         );
         assert!(
-            (got.stop_loss - expected.stop_loss).abs() < 1e-12,
+            (got.stop_loss - realized.stop_loss).abs() < 1e-12,
             "stop_loss {} vs {}",
             got.stop_loss,
-            expected.stop_loss
+            realized.stop_loss
         );
         assert!(
-            (got.take_profit - expected.take_profit).abs() < 1e-12,
+            (got.take_profit - realized.take_profit).abs() < 1e-12,
             "take_profit {} vs {}",
             got.take_profit,
-            expected.take_profit
+            realized.take_profit
         );
     }
 
@@ -1059,7 +1070,7 @@ mod tests {
             candle(7200, 1.1110), // bid reaches the 1.1100 TP → exit
         ];
         let fire = placed_enter_fire(long_stop_enter(), forward, "o-tp");
-        assert_shadow_parity(&fire, &[], "o-tp");
+        assert_shadow_parity(fire, &[], "o-tp");
     }
 
     #[test]
@@ -1071,7 +1082,7 @@ mod tests {
             candle(7200, 1.0949), // bid through the 1.0950 SL → stopped
         ];
         let fire = placed_enter_fire(long_stop_enter(), forward, "o-sl");
-        assert_shadow_parity(&fire, &[], "o-sl");
+        assert_shadow_parity(fire, &[], "o-sl");
     }
 
     #[test]
@@ -1083,7 +1094,7 @@ mod tests {
             candle(7200, 1.0990),
         ];
         let fire = placed_enter_fire(long_stop_enter(), forward, "o-nf");
-        assert_shadow_parity(&fire, &[], "o-nf");
+        assert_shadow_parity(fire, &[], "o-nf");
     }
 
     #[test]
@@ -1103,7 +1114,7 @@ mod tests {
             at: Utc.timestamp_opt(7200, 0).unwrap(),
             price: 1.1015,
         }];
-        assert_shadow_parity(&fire, &closes, "o-rev");
+        assert_shadow_parity(fire, &closes, "o-rev");
     }
 
     #[test]
@@ -1116,7 +1127,7 @@ mod tests {
             candle(7200, 1.1020),
         ];
         let fire = placed_enter_fire(long_stop_enter(), forward, "o-open");
-        assert_shadow_parity(&fire, &[], "o-open");
+        assert_shadow_parity(fire, &[], "o-open");
     }
 
     #[tokio::test]
@@ -1138,14 +1149,19 @@ mod tests {
             shell,
             forward,
             None,
-            Vec::new(),
         );
         // Sanity: it realizes to a taken outcome before the cancel.
-        assert!(broker.realized_outcome("o-cancel").unwrap().kind.is_taken());
+        assert!(
+            broker
+                .realized_outcome("o-cancel", &[])
+                .unwrap()
+                .kind
+                .is_taken()
+        );
         // After cancel: no realized outcome.
         broker.cancel_order("", "o-cancel").await.unwrap();
         assert!(
-            broker.realized_outcome("o-cancel").is_none(),
+            broker.realized_outcome("o-cancel", &[]).is_none(),
             "a cancelled order has no realized outcome"
         );
     }
