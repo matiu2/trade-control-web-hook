@@ -78,6 +78,74 @@ pub trait EnterConfigProvider {
     async fn dispatch_config(&self, verified: &Verified) -> DispatchConfig;
 }
 
+/// The outcome of recovering the [`Verified`] behind a resting/cancelled order.
+/// The two error arms mirror `parse_and_verify`'s meaningful failures so the
+/// callers can distinguish "drop, the window closed" from "leave resting, can't
+/// trust it".
+pub enum Recovered {
+    /// The authentic intent+shell to cancel or re-drive.
+    Ok(Box<Verified>),
+    /// The signed window closed during the blackout (`Expired`/`StaleShellTime`)
+    /// — on re-drive: drop the order; on cancel: leave it resting.
+    Expired,
+    /// No recoverable payload (no stored body, or it won't verify / is
+    /// tampered). Leave the order resting — never cancel what can't be restored.
+    Unrecoverable,
+}
+
+/// The seam that turns a resting order into the [`Verified`] the lifecycle needs
+/// — the ONE place the live/replay split lives on the payload side.
+///
+/// - **Live:** `parse_and_verify` the HMAC-signed body the worker stored under
+///   `order:{id}` (untrusted-wire authentication, a live-only concern).
+/// - **Replay:** hand back the `Verified` the fake broker was *armed* with when
+///   it "placed" the order. The offline replay has the intent+shell in hand
+///   already (`ArmedPlacement`) — which is exactly what `parse_and_verify`
+///   *produces* — so it needs no signing round-trip and no stored body.
+///
+/// `recover` is asked once per order id; the impl owns where the payload comes
+/// from (store read vs armed map), so RAIL 2 ("no recoverable payload ⇒ never
+/// cancel") is expressed uniformly as [`Recovered::Unrecoverable`].
+#[allow(async_fn_in_trait)]
+pub trait VerifiedSource {
+    /// Recover the `Verified` behind `order_id`. `signed_body` is the payload the
+    /// caller has on hand for this order (the store's `order:{id}` row on the
+    /// cancel side, or the `CancelledOrder.signed_intent` on the re-drive side);
+    /// the live impl verifies it, the replay impl ignores it in favour of its
+    /// armed map keyed by `order_id`.
+    async fn recover(
+        &self,
+        order_id: &str,
+        signed_body: Option<&str>,
+        now: DateTime<Utc>,
+    ) -> Recovered;
+}
+
+/// The live [`VerifiedSource`]: `parse_and_verify` the stored HMAC body with the
+/// worker's signing key. This is today's behaviour, made explicit as the seam.
+pub struct SignedBodySource<'k> {
+    /// The HMAC signing key the HTTP path verifies with.
+    pub key: &'k [u8],
+}
+
+impl VerifiedSource for SignedBodySource<'_> {
+    async fn recover(
+        &self,
+        _order_id: &str,
+        signed_body: Option<&str>,
+        now: DateTime<Utc>,
+    ) -> Recovered {
+        let Some(body) = signed_body else {
+            return Recovered::Unrecoverable;
+        };
+        match incoming::parse_and_verify(body, self.key, now) {
+            Ok(v) => Recovered::Ok(Box::new(v)),
+            Err(IncomingError::Expired) | Err(IncomingError::StaleShellTime) => Recovered::Expired,
+            Err(_) => Recovered::Unrecoverable,
+        }
+    }
+}
+
 /// The forex pip-size fallback used only to resolve absolute prices during the
 /// fill-side pre-check when neither the intent nor the record carries a usable
 /// pip. Mirrors `trade-control-cron::constants::DEFAULT_PIP_SIZE`.
@@ -119,33 +187,34 @@ pub enum RestoreReason {
 /// order held until the baked hour ends (its deterministic off-signal). Same
 /// function, the broker supplies the recovery signal — see the module's ON/OFF
 /// asymmetry.
-pub async fn pending_order_lifecycle<B, S, P>(
+pub async fn pending_order_lifecycle<B, S, P, V>(
     broker: &B,
     store: &S,
     cfg_provider: &P,
+    src: &V,
     account: Option<&str>,
-    signing_key: &[u8],
     now: DateTime<Utc>,
 ) -> LifecycleReport
 where
     B: Broker,
     S: StateStore,
     P: EnterConfigProvider,
+    V: VerifiedSource,
 {
     let mut report = LifecycleReport::default();
-    cancel_pass(broker, store, account, signing_key, now, &mut report).await;
-    recover_pass(broker, store, cfg_provider, signing_key, now, &mut report).await;
+    cancel_pass(broker, store, src, account, now, &mut report).await;
+    recover_pass(broker, store, cfg_provider, src, now, &mut report).await;
     report
 }
 
 // --- ON side: cancel + back up (baked clock only, no live quote) ---
 
 /// Enumerate resting orders and cancel each that has entered a spread hour.
-async fn cancel_pass<B: Broker, S: StateStore>(
+async fn cancel_pass<B: Broker, S: StateStore, V: VerifiedSource>(
     broker: &B,
     store: &S,
+    src: &V,
     account: Option<&str>,
-    key: &[u8],
     now: DateTime<Utc>,
     report: &mut LifecycleReport,
 ) {
@@ -164,35 +233,29 @@ async fn cancel_pass<B: Broker, S: StateStore>(
             report.skipped.push(order.order_id.clone());
             continue;
         }
-        try_cancel_one(broker, store, account, key, order, now, report).await;
+        try_cancel_one(broker, store, src, account, order, now, report).await;
     }
 }
 
 /// Cancel + store a single resting order. Store-before-cancel (safety rail 1);
-/// no-body / won't-verify ⇒ leave resting (rails 2, 3).
-async fn try_cancel_one<B: Broker, S: StateStore>(
+/// no-recoverable-payload / won't-verify ⇒ leave resting (rails 2, 3).
+async fn try_cancel_one<B: Broker, S: StateStore, V: VerifiedSource>(
     broker: &B,
     store: &S,
+    src: &V,
     account: Option<&str>,
-    key: &[u8],
     order: &PendingOrder,
     now: DateTime<Utc>,
     report: &mut LifecycleReport,
 ) {
     let scope = account.unwrap_or("<global>");
 
-    // RAIL 2 — no stored body ⇒ never cancel (can't restore what we can't
-    // re-parse).
-    let signed_body = match store.get_order_body(&order.order_id).await {
-        Ok(Some(b)) => b,
-        Ok(None) => {
-            tracing::info!(
-                "pending-lifecycle[{scope}]: no stored body for order {} — leaving it resting",
-                order.order_id,
-            );
-            report.skipped.push(order.order_id.clone());
-            return;
-        }
+    // The payload the live impl verifies: the store's `order:{id}` body. The
+    // replay impl ignores it (uses its armed map). A store error is skip (can't
+    // safely proceed). `None`/`Some` both flow into the seam, which decides
+    // recoverability uniformly (RAIL 2).
+    let stored_body = match store.get_order_body(&order.order_id).await {
+        Ok(b) => b,
         Err(err) => {
             tracing::error!(
                 "pending-lifecycle[{scope}]: get_order_body({}) failed: {err}; skip",
@@ -202,20 +265,30 @@ async fn try_cancel_one<B: Broker, S: StateStore>(
         }
     };
 
-    // RAIL 3 — body won't verify ⇒ leave resting. Also recovers the trade_id
-    // (record key) + pip_size (baked onto the record for the OFF-side pips math).
-    let verified = match incoming::parse_and_verify(&signed_body, key, now) {
-        Ok(v) => v,
-        Err(err) => {
+    // RAILS 2 + 3 — recover the Verified via the seam. Unrecoverable (no body /
+    // won't verify) or Expired ⇒ leave the order resting (never cancel what we
+    // can't restore). `Ok` also recovers the trade_id (record key) + pip_size
+    // (baked onto the record for the OFF-side pips math).
+    let verified = match src
+        .recover(&order.order_id, stored_body.as_deref(), now)
+        .await
+    {
+        Recovered::Ok(v) => *v,
+        Recovered::Expired | Recovered::Unrecoverable => {
             tracing::info!(
-                "pending-lifecycle[{scope}]: stored body for order {} won't verify ({err}); \
-                 leaving it resting",
+                "pending-lifecycle[{scope}]: order {} has no recoverable/valid payload — leaving \
+                 it resting",
                 order.order_id,
             );
             report.skipped.push(order.order_id.clone());
             return;
         }
     };
+    // The signed payload to persist on the record for the re-drive side. Live:
+    // the verified body. Replay: a placeholder — the replay's re-drive source
+    // keys off the armed map by order_id, not this string.
+    let signed_intent =
+        stored_body.unwrap_or_else(|| format!("replay-order: {}\n", order.order_id));
     let trade_id = verified
         .intent
         .trade_id
@@ -255,7 +328,7 @@ async fn try_cancel_one<B: Broker, S: StateStore>(
         pip_size,
         CancelledOrder {
             order_id: order.order_id.clone(),
-            signed_intent: signed_body,
+            signed_intent,
         },
         now,
     );
@@ -340,11 +413,11 @@ fn merge_cancelled_order(
 
 /// Walk every per-trade record and, for each `applied` one whose trough has
 /// lifted, re-drive its cancelled orders then clear it.
-async fn recover_pass<B: Broker, S: StateStore, P: EnterConfigProvider>(
+async fn recover_pass<B: Broker, S: StateStore, P: EnterConfigProvider, V: VerifiedSource>(
     broker: &B,
     store: &S,
     cfg_provider: &P,
-    key: &[u8],
+    src: &V,
     now: DateTime<Utc>,
     report: &mut LifecycleReport,
 ) {
@@ -356,18 +429,18 @@ async fn recover_pass<B: Broker, S: StateStore, P: EnterConfigProvider>(
         }
     };
     for record in records {
-        recover_one(broker, store, cfg_provider, key, &record, now, report).await;
+        recover_one(broker, store, cfg_provider, src, &record, now, report).await;
     }
 }
 
 /// Per-record OFF decision + clear. `!applied` ⇒ untouched (rail 4); backstop
 /// clears unconditionally (rail 5); otherwise recovery (live spread) or the
 /// baked spread hour ending clears it. Restore precedes clear (rail 6).
-async fn recover_one<B: Broker, S: StateStore, P: EnterConfigProvider>(
+async fn recover_one<B: Broker, S: StateStore, P: EnterConfigProvider, V: VerifiedSource>(
     broker: &B,
     store: &S,
     cfg_provider: &P,
-    key: &[u8],
+    src: &V,
     record: &SpreadBlackoutRecord,
     now: DateTime<Utc>,
     report: &mut LifecycleReport,
@@ -379,7 +452,7 @@ async fn recover_one<B: Broker, S: StateStore, P: EnterConfigProvider>(
 
     // RAIL 5 — backstop: clear regardless of spread.
     if backstop_due(record.opened_at, now) {
-        restore_cancelled_orders(broker, store, cfg_provider, key, record, now).await;
+        restore_cancelled_orders(broker, store, cfg_provider, src, record, now).await;
         if clear(store, record).await {
             report
                 .restored
@@ -393,7 +466,7 @@ async fn recover_one<B: Broker, S: StateStore, P: EnterConfigProvider>(
     // (replay's off-signal, also a live off-signal).
     if off_now(broker, record, now).await {
         // RAIL 6 — restore BEFORE clear.
-        restore_cancelled_orders(broker, store, cfg_provider, key, record, now).await;
+        restore_cancelled_orders(broker, store, cfg_provider, src, record, now).await;
         if clear(store, record).await {
             report
                 .restored
@@ -425,17 +498,22 @@ async fn off_now<B: Broker>(broker: &B, record: &SpreadBlackoutRecord, now: Date
 
 /// Re-drive (or drop) every cancelled resting order on a record. Relocated from
 /// `blackout_restore`. Per-order errors log + skip so the clear still proceeds.
-async fn restore_cancelled_orders<B: Broker, S: StateStore, P: EnterConfigProvider>(
+async fn restore_cancelled_orders<
+    B: Broker,
+    S: StateStore,
+    P: EnterConfigProvider,
+    V: VerifiedSource,
+>(
     broker: &B,
     store: &S,
     cfg_provider: &P,
-    key: &[u8],
+    src: &V,
     record: &SpreadBlackoutRecord,
     now: DateTime<Utc>,
 ) {
     for cancelled in &record.cancelled_orders {
         if let Err(err) =
-            restore_one_order(broker, store, cfg_provider, key, record, cancelled, now).await
+            restore_one_order(broker, store, cfg_provider, src, record, cancelled, now).await
         {
             tracing::error!(
                 "pending-lifecycle restore[{}]: order {} re-drive error: {err}",
@@ -451,21 +529,25 @@ async fn restore_cancelled_orders<B: Broker, S: StateStore, P: EnterConfigProvid
 /// logging, so the watcher treats them as handled. Relocated verbatim from
 /// `blackout_restore::restore_one_order` (RAIL 7).
 #[allow(clippy::too_many_arguments)]
-async fn restore_one_order<B: Broker, S: StateStore, P: EnterConfigProvider>(
+async fn restore_one_order<B: Broker, S: StateStore, P: EnterConfigProvider, V: VerifiedSource>(
     broker: &B,
     store: &S,
     cfg_provider: &P,
-    key: &[u8],
+    src: &V,
     record: &SpreadBlackoutRecord,
     cancelled: &CancelledOrder,
     now: DateTime<Utc>,
 ) -> Result<(), String> {
     let tid = &record.trade_id;
 
-    // 1. Reconstruct an authentic Verified from the stored signed body.
-    let verified = match incoming::parse_and_verify(&cancelled.signed_intent, key, now) {
-        Ok(v) => v,
-        Err(IncomingError::Expired) | Err(IncomingError::StaleShellTime) => {
+    // 1. Reconstruct an authentic Verified via the seam (live: parse+verify the
+    //    stored body; replay: the armed Verified for this order_id).
+    let verified = match src
+        .recover(&cancelled.order_id, Some(&cancelled.signed_intent), now)
+        .await
+    {
+        Recovered::Ok(v) => *v,
+        Recovered::Expired => {
             tracing::info!(
                 "pending-lifecycle restore[{tid}]: stored intent expired, dropped order {} \
                  (window closed during blackout)",
@@ -474,7 +556,12 @@ async fn restore_one_order<B: Broker, S: StateStore, P: EnterConfigProvider>(
             cleanup_body(store, &cancelled.order_id).await;
             return Ok(());
         }
-        Err(e) => return Err(format!("re-verify stored intent: {e}")),
+        Recovered::Unrecoverable => {
+            return Err(format!(
+                "re-verify stored intent for {}",
+                cancelled.order_id
+            ));
+        }
     };
 
     // 2. Fill-side pre-check using the pure restore_plan + a fresh quote.
@@ -798,6 +885,16 @@ mod tests {
     }
 
     /// Offline dispatch-config provider — a fixed config, never reads a backend.
+    /// A signing key for the live-style [`SignedBodySource`] used in these
+    /// tests. None of the ON/OFF-gate tests drive a re-verify (no stored body /
+    /// no cancelled_orders), so the key value is inert — it just satisfies the
+    /// seam. The behaviour under test is byte-identical to the pre-seam code.
+    const KEY: [u8; 32] = [9u8; 32];
+
+    fn src() -> SignedBodySource<'static> {
+        SignedBodySource { key: &KEY }
+    }
+
     struct StubCfg;
     impl EnterConfigProvider for StubCfg {
         async fn dispatch_config(&self, _verified: &Verified) -> DispatchConfig {
@@ -837,8 +934,8 @@ mod tests {
             &broker,
             &store,
             &StubCfg,
+            &src(),
             Some("reversals"),
-            &[9u8; 32],
             now,
         ));
         assert!(
@@ -859,7 +956,12 @@ mod tests {
         let now = ts("2026-07-08T12:00:00Z");
         store.set_clock(now);
         let report = run(pending_order_lifecycle(
-            &broker, &store, &StubCfg, None, &[9u8; 32], now,
+            &broker,
+            &store,
+            &StubCfg,
+            &src(),
+            None,
+            now,
         ));
         assert!(broker.cancel_calls.borrow().is_empty());
         assert!(report.cancelled.is_empty());
@@ -939,7 +1041,7 @@ mod tests {
             &broker,
             &store,
             &StubCfg,
-            &[9u8; 32],
+            &src(),
             &rec,
             now,
             &mut report,
@@ -962,21 +1064,136 @@ mod tests {
                 .await
                 .expect("upsert record");
             let mut report = LifecycleReport::default();
-            recover_one(
-                &broker,
-                &store,
-                &StubCfg,
-                &[9u8; 32],
-                &rec,
-                now,
-                &mut report,
-            )
-            .await;
+            recover_one(&broker, &store, &StubCfg, &src(), &rec, now, &mut report).await;
             assert_eq!(
                 report.restored,
                 vec![("t-off".to_string(), RestoreReason::Backstop)],
                 "backstop must clear the stuck record"
             );
         });
+    }
+
+    // --- replay-style VerifiedSource: cancel WITHOUT any signed body (PR 4a) ---
+
+    /// A replay-style [`VerifiedSource`]: hands back an armed `Verified` keyed by
+    /// `order_id`, ignoring the (absent) signed body. This is the offline seam —
+    /// the fake broker armed the intent+shell at placement, so the lifecycle
+    /// re-drives with NO HMAC round-trip. Mirrors what `ReplayBroker` will hold.
+    struct ArmedSource {
+        armed: std::collections::HashMap<String, Verified>,
+    }
+    impl VerifiedSource for ArmedSource {
+        async fn recover(
+            &self,
+            order_id: &str,
+            _signed_body: Option<&str>,
+            _now: DateTime<Utc>,
+        ) -> Recovered {
+            match self.armed.get(order_id) {
+                Some(v) => Recovered::Ok(Box::new(v.clone())),
+                None => Recovered::Unrecoverable,
+            }
+        }
+    }
+
+    /// A minimal valid enter `Verified` (serde-built intent + a plain shell),
+    /// carrying a trade_id + pip_size so the cancel side can key the record.
+    fn armed_verified(order_instrument: &str) -> Verified {
+        use crate::broker::Candle;
+        use crate::intent::{Intent, Shell};
+        let intent: Intent = serde_json::from_str(&format!(
+            r#"{{
+                "v": 1,
+                "id": "t-enter",
+                "not_after": "2026-07-09T00:00:00Z",
+                "action": "enter",
+                "instrument": "{order_instrument}",
+                "direction": "short",
+                "entry": {{ "type": "stop", "from": "close", "offset_pips": 0.0, "at": 0.5598 }},
+                "stop_loss": {{ "absolute": 0.5607 }},
+                "take_profit": {{ "absolute": 0.5560 }},
+                "broker": "tradenation",
+                "trade_id": "t",
+                "pip_size": 0.0001
+            }}"#
+        ))
+        .expect("valid enter intent");
+        let shell = Shell::from_candle(&Candle {
+            time: ts("2026-07-08T20:00:00Z"),
+            o: 0.5600,
+            h: 0.5605,
+            l: 0.5595,
+            c: 0.5600,
+        });
+        Verified { shell, intent }
+    }
+
+    /// The offline seam works: a resting order with an ARMED verified (no stored
+    /// signed body) IS cancelled + backed up in a spread hour — the capability
+    /// the old signed-body-only path lacked. This is what lets replay reproduce
+    /// the live cancel without threading a signing key through the loop.
+    #[test]
+    fn armed_source_cancels_without_a_signed_body() {
+        let broker = MockBroker::with_pending(pending("t-enter-o1", "AUD/CHF"));
+        let store = MemStateStore::new();
+        let mut armed = std::collections::HashMap::new();
+        armed.insert("t-enter-o1".to_string(), armed_verified("AUD/CHF"));
+        let source = ArmedSource { armed };
+
+        let now = ts("2026-07-08T21:00:00Z"); // AUD/CHF baked spread hour
+        store.set_clock(now);
+        let report = run(pending_order_lifecycle(
+            &broker,
+            &store,
+            &StubCfg,
+            &source,
+            Some("reversals"),
+            now,
+        ));
+        assert_eq!(
+            report.cancelled,
+            vec!["t-enter-o1".to_string()],
+            "armed order in a spread hour must be cancelled with no signed body"
+        );
+        assert_eq!(
+            broker.cancel_calls.borrow().len(),
+            1,
+            "the broker cancel must have been issued"
+        );
+        // And the crash-safe record was written (store-before-cancel, RAIL 1).
+        run(async {
+            let rec = store
+                .get_spread_blackout_record("t")
+                .await
+                .expect("record read");
+            let rec = rec.expect("a record was upserted before the cancel");
+            assert!(rec.applied);
+            assert_eq!(rec.cancelled_orders.len(), 1);
+            assert_eq!(rec.cancelled_orders[0].order_id, "t-enter-o1");
+        });
+    }
+
+    /// The predicate-false twin: the SAME armed order on a clean bar is left
+    /// resting (ON = baked clock), proving the seam didn't change the gate.
+    #[test]
+    fn armed_source_leaves_order_resting_on_a_clean_bar() {
+        let broker = MockBroker::with_pending(pending("t-enter-o1", "AUD/CHF"));
+        let store = MemStateStore::new();
+        let mut armed = std::collections::HashMap::new();
+        armed.insert("t-enter-o1".to_string(), armed_verified("AUD/CHF"));
+        let source = ArmedSource { armed };
+
+        let now = ts("2026-07-08T12:00:00Z"); // clean
+        store.set_clock(now);
+        let report = run(pending_order_lifecycle(
+            &broker,
+            &store,
+            &StubCfg,
+            &source,
+            Some("reversals"),
+            now,
+        ));
+        assert!(report.cancelled.is_empty());
+        assert!(broker.cancel_calls.borrow().is_empty());
     }
 }
