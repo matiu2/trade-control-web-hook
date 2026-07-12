@@ -472,6 +472,18 @@ fn find_fill<'a>(
             // 2026-07-08 fill-into-the-spread-hour case). The order stays resting
             // and fills on the next clean bar. Mirrors the worker's entry gate so
             // replay == live. See SCOPING-spread-hour-rubbish-candle.md.
+            //
+            // PR 4b-3 relationship (KEPT — option a, not removed): the shared
+            // `pending_order_lifecycle` now *cancels* a resting order in a spread
+            // hour at the broker, and `resolve()` reads THIS skip to report the
+            // order as still-`Pending` on the spike bar — which is exactly what
+            // lets the lifecycle *see* it as resting and cancel it. So the two are
+            // complementary, not duplicate: this skip keeps the fill from landing
+            // on the spike (and is the resting-state the lifecycle acts on); the
+            // lifecycle is the live-matching cancel+backup. Removing this skip
+            // would (1) break the engine's own `pending_stop_does_not_fill_*`
+            // tests and (2) make `resolve()` report the order FILLED on the spike
+            // bar, so the lifecycle would never see it resting to cancel it.
             let i = fill_window.iter().position(|c| {
                 book_reaches(c, entry_book, trigger_price, entry_approach)
                     && !trade_control_core::spread_blackout::is_spread_hour(

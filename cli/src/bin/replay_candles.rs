@@ -44,6 +44,7 @@ mod replay_candles {
     pub mod fixture;
     pub mod granularity;
     pub mod instrument;
+    pub mod lifecycle;
     pub mod market_hours;
     pub mod replay;
     pub mod replay_broker;

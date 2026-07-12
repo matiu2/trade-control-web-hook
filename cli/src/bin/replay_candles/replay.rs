@@ -217,6 +217,11 @@ pub async fn run(
     // (the engine retires them after one fire).
     let replay_broker = ReplayBroker::new(candles.to_vec(), plan.pip_size);
     let store = MemStateStore::default();
+    // PR 4b-3: the SAME shared spread-hour resting-order lifecycle the live cron
+    // runs, driven per bar below. Its two offline seams — a fixed dispatch config
+    // and an armed-Verified source reading the broker ledger — live in
+    // `super::lifecycle`; the broker + store are the ones above.
+    let lifecycle_cfg = super::lifecycle::ReplayConfigProvider::new(plan.pip_size);
 
     // The detector window grows with each tick: Pine / trendline triggers need
     // the full back-window of closed candles, not just the single new bar.
@@ -464,6 +469,25 @@ pub async fn run(
                 realized: None,
             });
         }
+
+        // PR 4b-3: run the shared resting-order lifecycle for this bar AFTER the
+        // enter dispatch, so any order that just went resting is visible. In a
+        // spread hour it cancels + backs up the resting order through the
+        // engine→broker path (the cancel sets the ledger's `cancelled` flag →
+        // `realized_outcome` → None → the report shows no fill); on a later clean
+        // bar it re-drives it. The `is_spread_hour` gate is the ON trigger, so a
+        // clean bar is a no-op. Account is `None` — the ReplayBroker doesn't scope
+        // orders by account, and `is_spread_hour` keys on instrument + time only.
+        let src = super::lifecycle::ReplayVerifiedSource::new(&replay_broker);
+        trade_control_core::pending_lifecycle::pending_order_lifecycle(
+            &replay_broker,
+            &store,
+            &lifecycle_cfg,
+            &src,
+            None,
+            now,
+        )
+        .await;
 
         if eval.done {
             done = true;
@@ -2061,6 +2085,287 @@ mod tests {
             marked_bar.not_taken.is_none(),
             "a declined bar must NOT also carry a not_taken: {:?}",
             marked_bar.not_taken
+        );
+    }
+
+    // --- PR 4b-3: spread-hour resting order cancelled via the shared lifecycle ---
+
+    /// An OHLC bid==ask==mid bar at an RFC3339 instant (the spread-hour golden
+    /// needs real calendar times so `is_spread_hour` reads AUD/CHF's baked hours).
+    fn ohlc_at(rfc3339: &str, o: f64, h: f64, l: f64, c: f64) -> EngineCandle {
+        let time: DateTime<Utc> = rfc3339.parse().expect("valid rfc3339");
+        EngineCandle {
+            time,
+            o,
+            h,
+            l,
+            c,
+            bid_o: o,
+            bid_h: h,
+            bid_l: l,
+            bid_c: c,
+            ask_o: o,
+            ask_h: h,
+            ask_l: l,
+            ask_c: c,
+        }
+    }
+
+    /// A single-shot SHORT plan (the AUD/CHF 2026-07-08 origin case, on EUR/USD so
+    /// the spread hour is a single, un-wrapped block): the enter fires on an
+    /// OnClose down-cross of 1.1010 and rests a short stop-entry at 1.1000
+    /// (SL 1.1020, TP 1.0950). The trigger is first reached on the 21:00Z
+    /// spread-hour bar.
+    ///
+    /// EUR/USD's baked spread hours are the single hour 21:00Z (NY-close block),
+    /// so 22:00Z/23:00Z are genuinely clean — the restore re-drive lands there and
+    /// fills. (AUD/CHF's own block runs 21:00–05:00Z, so its first clean bar is
+    /// 06:00Z; the mechanism is identical, EUR/USD just keeps the golden compact.)
+    fn eurusd_spread_hour_plan() -> TradePlan {
+        serde_json::from_str(
+            r#"{
+                "trade_id": "eurusd-sh",
+                "instrument": "EUR/USD",
+                "direction": "short",
+                "granularity": "h1",
+                "pip_size": 0.0001,
+                "rules": [
+                    {
+                        "rule_id": "05-enter",
+                        "trigger": { "type": "horizontal_cross", "level": 1.1010, "dir": "down", "bar": "on_close" },
+                        "fire_mode": "once",
+                        "intent": {
+                            "v": 1, "id": "eurusd-sh-enter", "not_after": "2099-01-01T00:00:00Z",
+                            "action": "enter", "instrument": "EUR/USD", "direction": "short",
+                            "entry": { "type": "stop", "from": "close", "offset_pips": 0.0, "at": 1.1000 },
+                            "stop_loss": { "absolute": 1.1020 },
+                            "take_profit": { "absolute": 1.0950 },
+                            "broker": "tradenation", "trade_id": "eurusd-sh", "max_retries": 0,
+                            "pip_size": 0.0001
+                        }
+                    }
+                ]
+            }"#,
+        )
+        .expect("parse EUR/USD spread-hour plan")
+    }
+
+    /// GOLDEN (AUD/CHF 2026-07-08 origin): a resting short-stop whose trigger is
+    /// first reached inside the 21:00Z spread hour must be **cancelled by the
+    /// shared lifecycle** on the spike bar (engine → `broker.cancel_order`), then
+    /// **restored (re-driven)** on the next clean bar (engine → `broker.place_entry`
+    /// re-activates the resting order) so it **fills on the 23:00Z clean bar** and
+    /// runs to TP — NOT a fill inside the 12p-spread rubbish spike. This is the
+    /// full cancel→restore→fill sequence the live path runs, and it reproduces
+    /// v88's shipped intent ("skip the rubbish bar, fill on the next clean bar")
+    /// through the real broker mechanism instead of the `find_fill` skip alone.
+    #[tokio::test]
+    async fn spread_hour_order_is_cancelled_then_restored_and_fills_on_the_clean_bar() {
+        // The lifecycle keys on the bar's CLOSE (`now = open + 1h`); the find_fill
+        // spread-hour skip keys on the bar's OPEN. EUR/USD's only spread hour is
+        // 21:00Z, so the timeline is:
+        //   19:00Z bar (close 20:00Z, clean): enter fires, short stop rests @1.1000
+        //                                     (high stays above 1.1000 — no touch).
+        //   20:00Z bar (close 21:00Z, SPREAD HOUR): lifecycle CANCELS the resting
+        //                                     order (now=21:00Z); no touch here.
+        //   21:00Z bar (open 21:00Z spike, close 22:00Z clean): lifecycle RESTORES
+        //                                     it (now=22:00Z clean); the low taps
+        //                                     1.1000 but find_fill skips the spike
+        //                                     open — no fill.
+        //   22:00Z bar (open+close clean): reaches 1.1000 → FILLS here.
+        //   23:00Z bar: runs to TP 1.0950.
+        // 10 warm-up bars above the 1.1010 enter level so the live window starts at
+        // 19:00Z (past the SEED_BARS floor).
+        let mut candles: Vec<EngineCandle> = (9..19)
+            .map(|h| {
+                ohlc_at(
+                    &format!("2026-07-08T{h:02}:00:00Z"),
+                    1.1020,
+                    1.1022,
+                    1.1018,
+                    1.1020,
+                )
+            })
+            .collect();
+        // 19:00Z: closes below 1.1010 → 05-enter fires, short stop rests @1.1000
+        // (low 1.1006 stays above the trigger — no touch).
+        candles.push(ohlc_at(
+            "2026-07-08T19:00:00Z",
+            1.1016,
+            1.1017,
+            1.1006,
+            1.1008,
+        ));
+        // 20:00Z (close 21:00Z = SPREAD HOUR): lifecycle cancels; low 1.1005 keeps
+        // the order untouched so nothing fills before the cancel.
+        candles.push(ohlc_at(
+            "2026-07-08T20:00:00Z",
+            1.1008,
+            1.1009,
+            1.1005,
+            1.1007,
+        ));
+        // 21:00Z (open = spread hour spike): straddles 1.1000 (low 1.0995) but the
+        // find_fill spike-open skip blocks the fill; lifecycle restores (now clean).
+        candles.push(ohlc_at(
+            "2026-07-08T21:00:00Z",
+            1.1002,
+            1.1004,
+            1.0995,
+            1.0999,
+        ));
+        // 22:00Z CLEAN (open + close clean): re-reaches 1.1000 → the restored order
+        // fills here.
+        candles.push(ohlc_at(
+            "2026-07-08T22:00:00Z",
+            1.1001,
+            1.1003,
+            1.0994,
+            1.0997,
+        ));
+        // 23:00Z: runs to TP 1.0950.
+        candles.push(ohlc_at(
+            "2026-07-08T23:00:00Z",
+            1.0995,
+            1.0997,
+            1.0948,
+            1.0951,
+        ));
+        let live_at: DateTime<Utc> = "2026-07-08T19:00:00Z".parse().unwrap();
+        let expires_at: DateTime<Utc> = "2026-07-10T00:00:00Z".parse().unwrap();
+
+        let r = run(
+            &eurusd_spread_hour_plan(),
+            &candles,
+            Granularity::H1,
+            live_at,
+            expires_at,
+            no_marks(),
+        )
+        .await;
+
+        // The enter fired (the down-cross), placing the resting short-stop.
+        let enter = r
+            .fires
+            .iter()
+            .find(|f| f.fired.rule_id == "05-enter")
+            .expect("the short enter must fire on the 19:00Z down-cross");
+
+        // The lifecycle cancelled the resting order in the 21:00Z spread hour,
+        // then RESTORED (re-drove) it on the next clean bar — so it fills on the
+        // 22:00Z clean bar and runs to TP. The observable: a TOOK PROFIT whose
+        // fill_at is 22:00Z, NOT the 21:00Z rubbish spike.
+        let realized = enter
+            .realized
+            .as_ref()
+            .expect("the restored order must have a realized outcome (cancel→restore→fill)");
+        assert_eq!(
+            realized.kind,
+            crate::report::FillKind::TookProfit,
+            "the restored order fills on the clean bar and runs to TP, got {:?}",
+            realized.kind
+        );
+        let clean_bar: DateTime<Utc> = "2026-07-08T22:00:00Z".parse().unwrap();
+        let spike_bar: DateTime<Utc> = "2026-07-08T21:00:00Z".parse().unwrap();
+        assert_eq!(
+            realized.fill_at, clean_bar,
+            "the fill must land on the 22:00Z clean bar, not the 21:00Z spread-hour spike"
+        );
+        assert_ne!(
+            realized.fill_at, spike_bar,
+            "the order must NOT fill on the rubbish spread-hour spike"
+        );
+
+        // The report reflects the taken TP (exactly one win, no loss).
+        let report = crate::report::render(
+            &eurusd_spread_hour_plan(),
+            &r,
+            true,
+            false,
+            &[],
+            None,
+            &no_marks(),
+        );
+        assert!(
+            report.contains("TOOK PROFIT"),
+            "the restored order must show its TP fill:\n{report}"
+        );
+        assert!(
+            report.contains("TP: 1  SL: 0"),
+            "exactly one taken position (the restored order's TP), no loss:\n{report}"
+        );
+    }
+
+    /// The predicate-false twin: the SAME setup on a CLEAN hour is NOT cancelled
+    /// by the lifecycle — the resting order fills as normal. Proves the lifecycle
+    /// only acts in a spread hour (the ON trigger), so it can't be silently
+    /// cancelling every resting order.
+    #[tokio::test]
+    async fn clean_hour_resting_order_is_not_cancelled_and_fills() {
+        // Identical geometry in the 00:00Z..12:00Z clean stretch (no EUR/USD spread
+        // hour — its only spread hour is 21:00Z): 10 warm-up bars, the enter fires
+        // at 12:00Z and the stop fills on the 13:00Z bar, uncancelled.
+        let mut candles: Vec<EngineCandle> = (2..12)
+            .map(|h| {
+                ohlc_at(
+                    &format!("2026-07-08T{h:02}:00:00Z"),
+                    1.1020,
+                    1.1022,
+                    1.1018,
+                    1.1020,
+                )
+            })
+            .collect();
+        // 12:00Z: closes below 1.1010 → enter fires, short stop rests @1.1000.
+        candles.push(ohlc_at(
+            "2026-07-08T12:00:00Z",
+            1.1016,
+            1.1017,
+            1.1006,
+            1.1008,
+        ));
+        // 13:00Z CLEAN: straddles 1.1000 → fills here (no spread-hour cancel).
+        candles.push(ohlc_at(
+            "2026-07-08T13:00:00Z",
+            1.1002,
+            1.1004,
+            1.0995,
+            1.0999,
+        ));
+        // 14:00Z: runs to TP 1.0950.
+        candles.push(ohlc_at(
+            "2026-07-08T14:00:00Z",
+            1.0995,
+            1.0997,
+            1.0948,
+            1.0951,
+        ));
+        let live_at: DateTime<Utc> = "2026-07-08T12:00:00Z".parse().unwrap();
+        let expires_at: DateTime<Utc> = "2026-07-10T00:00:00Z".parse().unwrap();
+
+        let r = run(
+            &eurusd_spread_hour_plan(),
+            &candles,
+            Granularity::H1,
+            live_at,
+            expires_at,
+            no_marks(),
+        )
+        .await;
+
+        let enter = r
+            .fires
+            .iter()
+            .find(|f| f.fired.rule_id == "05-enter")
+            .expect("the short enter must fire on the 12:00Z down-cross");
+        let realized = enter
+            .realized
+            .as_ref()
+            .expect("a clean-hour resting order must fill (not cancelled)");
+        assert!(
+            realized.kind.is_taken(),
+            "the clean-hour order fills — a taken outcome, got {:?}",
+            realized.kind
         );
     }
 }

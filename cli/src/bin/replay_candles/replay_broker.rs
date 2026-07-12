@@ -19,7 +19,8 @@ use trade_control_core::broker::{
     AmendError, AttemptState, BidAskCandle, Broker, CancelError, Candle, CandleError, EntryError,
     EntryRequest, Granularity, LookupError, OpenPosition, PendingOrder, Quote,
 };
-use trade_control_core::intent::{Direction, Intent, Resolved, Shell};
+use trade_control_core::incoming::Verified;
+use trade_control_core::intent::{Direction, Intent, Resolved, ResolvedEntry, Shell};
 use trade_control_engine::{
     BidAskCandle as EngineCandle, SimOutcome, apply_entry_spread_floor, simulate_fill,
     simulate_fill_windowed,
@@ -80,6 +81,22 @@ struct ReversalClose {
     fill_at: DateTime<Utc>,
     entry_price: f64,
     exit_at: DateTime<Utc>,
+}
+
+/// Exact equality of two resolved entries — same variant, same price. Used to
+/// match a lifecycle re-drive `EntryRequest` back to the cancelled attempt it
+/// restores; both sides resolve from the SAME intent+shell, so the f64s are
+/// identical (no tolerance). A cross-variant pair (stop vs limit) never matches.
+fn entries_match(a: &ResolvedEntry, b: &ResolvedEntry) -> bool {
+    match (a, b) {
+        (ResolvedEntry::Stop { trigger_price: x }, ResolvedEntry::Stop { trigger_price: y })
+        | (ResolvedEntry::Limit { trigger_price: x }, ResolvedEntry::Limit { trigger_price: y })
+        | (
+            ResolvedEntry::Market { reference_price: x },
+            ResolvedEntry::Market { reference_price: y },
+        ) => x == y,
+        _ => false,
+    }
 }
 
 /// Whether a `06-close-on-reversal` fire flattens this outcome's open position
@@ -265,6 +282,75 @@ impl ReplayBroker {
                 ledger: Some(geometry),
             }),
         }
+    }
+
+    /// The armed [`Verified`] (intent + firing shell) the broker holds for a
+    /// placed order — the offline seam the shared `pending_order_lifecycle` needs
+    /// to cancel/re-drive a resting order WITHOUT an HMAC-signed body (PR 4b-3).
+    /// The fake broker already recorded the intent+shell at placement, so a
+    /// replay-side `VerifiedSource` reads this instead of `parse_and_verify`.
+    ///
+    /// The intent's `pip_size` is guaranteed present — the lifecycle's cancel side
+    /// (`try_cancel_one`) refuses to cancel an order whose intent has no usable
+    /// pip (it needs it to key the record's OFF-side pips math). The plan's baked
+    /// `pip_size` is stamped on when the intent didn't carry its own, mirroring
+    /// how `dispatch_config` / `run_enter` fall back to the plan pip in replay.
+    /// `None` only for an **unknown** order id — a cancelled order still exposes
+    /// its armed Verified, because the lifecycle's restore side re-drives it
+    /// *after* the cancel (the cancel flag gates the fill outcome, not the payload
+    /// seam).
+    pub fn armed_verified(&self, order_id: &str) -> Option<Verified> {
+        let placed = self.placed.borrow();
+        let attempt = placed.iter().find(|a| a.order_id == order_id)?;
+        let mut intent = attempt.intent.clone();
+        if !intent.pip_size.is_some_and(|p| p > 0.0 && p.is_finite()) {
+            intent.pip_size = Some(self.pip_size);
+        }
+        Some(Verified {
+            shell: attempt.shell.clone(),
+            intent,
+        })
+    }
+
+    /// Re-activate the resting order a spread-hour cancel took down, matched by an
+    /// incoming re-drive [`EntryRequest`] (PR 4b-3 restore). The lifecycle
+    /// re-drives a cancelled order through `run_enter` → `place_entry`; that
+    /// request carries the bracket resolved from the SAME recovered intent+shell
+    /// the broker armed originally, so an exact match on
+    /// `(instrument, direction, entry, stop_loss, take_profit)` against a
+    /// `cancelled` attempt identifies it unambiguously (identical inputs → identical
+    /// f64s — no tolerance needed). On a match: flip `cancelled` back to false and
+    /// return its existing `order_id`; the resting order is restored and the ledger
+    /// resolves it normally against its forward path (fills on the next clean bar,
+    /// the spike bar still skipped by `find_fill`). `None` when nothing matches.
+    fn reactivate_matching_cancelled(&self, req: &EntryRequest<'_>) -> Option<String> {
+        let mut placed = self.placed.borrow_mut();
+        let matched = placed.iter_mut().find(|a| {
+            if !a.cancelled {
+                return false;
+            }
+            if a.intent.instrument != req.instrument {
+                return false;
+            }
+            // Resolve the attempt's bracket the same way the report/ledger do; a
+            // resolution failure can't match a resolved request.
+            let tick = a.intent.tick_size.unwrap_or(self.pip_size);
+            let Ok(resolved) = Resolved::from_intent(&a.intent, &a.shell, self.pip_size, tick)
+            else {
+                return false;
+            };
+            resolved.direction == req.direction
+                && entries_match(&resolved.entry, &req.entry)
+                && resolved.stop_loss == req.stop_loss
+                && resolved.take_profit == req.take_profit
+        })?;
+        matched.cancelled = false;
+        tracing::info!(
+            order_id = %matched.order_id,
+            instrument = %matched.intent.instrument,
+            "ReplayBroker: re-activated a spread-hour-cancelled resting order (lifecycle restore)"
+        );
+        Some(matched.order_id.clone())
     }
 
     /// The realized outcome of a ledger-tracked order — the broker-owned
@@ -509,7 +595,7 @@ impl Broker for ReplayBroker {
         &self,
         _max_risk_pct: f64,
         _max_open_positions: u32,
-        _req: &EntryRequest<'_>,
+        req: &EntryRequest<'_>,
     ) -> Result<String, EntryError> {
         // The real dispatch (`run_enter`) calls this to "place" the order. The
         // replay loop armed the geometry out-of-band (intent + shell + the order
@@ -524,15 +610,29 @@ impl Broker for ReplayBroker {
                 self.record_attempt(a.order_id.clone(), a.intent, a.shell);
                 Ok(a.order_id)
             }
-            // No armed placement means the loop dispatched an enter without
-            // arming first — a wiring bug, not a broker condition. Fail the
-            // placement loudly rather than fabricate an id.
-            None => {
-                tracing::error!(
-                    "ReplayBroker::place_entry called with no armed placement — replay wiring bug"
-                );
-                Err(EntryError::OrderRejected)
-            }
+            // No armed placement: this is the shared `pending_order_lifecycle`
+            // RE-DRIVING a spread-hour-cancelled order (PR 4b-3). The broker
+            // already holds that order's `PlacedAttempt` (intent + shell +
+            // order_id, `cancelled == true`), so "place it again" means
+            // **re-activate** that resting order — flip `cancelled` back to false
+            // and hand back its existing id. The order resumes resting and, with
+            // the spike bar behind it, fills on the next clean bar (the `find_fill`
+            // spread-hour skip still blocks the rubbish-bar fill). This is the
+            // broker restoring the resting order the engine told it to re-place —
+            // faithful to the cancel→restore→fill sequence the live path runs.
+            None => match self.reactivate_matching_cancelled(req) {
+                Some(order_id) => Ok(order_id),
+                // Neither armed nor a matching cancelled attempt — a genuine
+                // wiring fault (an enter dispatched without arming, and not a
+                // known re-drive). Fail loudly rather than fabricate an id.
+                None => {
+                    tracing::error!(
+                        "ReplayBroker::place_entry: no armed placement and no matching cancelled \
+                         order to re-activate — replay wiring bug"
+                    );
+                    Err(EntryError::OrderRejected)
+                }
+            },
         }
     }
 
