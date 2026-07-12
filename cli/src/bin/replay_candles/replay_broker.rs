@@ -187,6 +187,35 @@ impl ReplayBroker {
             | SimOutcome::Unresolved(_) => AttemptState::Cancelled,
         }
     }
+
+    /// Build the [`PendingOrder`] a live broker would report for a still-resting
+    /// attempt. `trigger`/`is_stop` come from resolving the intent's entry
+    /// against its shell; a Market entry (which never rests) or a resolution
+    /// failure falls back to the shell close as the trigger and `is_stop=true`.
+    /// The lifecycle's cancel decision keys off `instrument` + `order_id`, so
+    /// `trigger`/`stake` are informational — but resolve them accurately when we
+    /// can so a report renders the right level.
+    fn pending_from_attempt(&self, a: &PlacedAttempt) -> PendingOrder {
+        use trade_control_core::intent::{Direction, Resolved, ResolvedEntry};
+        let direction = a.intent.direction.unwrap_or(Direction::Long);
+        let (trigger, is_stop) =
+            match Resolved::from_intent(&a.intent, &a.shell, self.pip_size, self.pip_size) {
+                Ok(r) => match r.entry {
+                    ResolvedEntry::Stop { trigger_price } => (trigger_price, true),
+                    ResolvedEntry::Limit { trigger_price } => (trigger_price, false),
+                    ResolvedEntry::Market { reference_price } => (reference_price, true),
+                },
+                Err(_) => (a.shell.close, true),
+            };
+        PendingOrder {
+            order_id: a.order_id.clone(),
+            instrument: a.intent.instrument.clone(),
+            direction,
+            trigger,
+            is_stop,
+            stake: 1.0,
+        }
+    }
 }
 
 impl Broker for ReplayBroker {
@@ -330,7 +359,21 @@ impl Broker for ReplayBroker {
         &self,
         _account_id: &str,
     ) -> Result<Vec<PendingOrder>, LookupError> {
-        Ok(Vec::new())
+        // Report a synthetic resting order for every placed attempt that
+        // `resolve`s to `Pending` at `as_of` — i.e. an order that has been
+        // "placed" but not yet filled/cancelled by the asking bar. This is what
+        // the shared `pending_order_lifecycle` (core) lists to decide what to
+        // cancel through a spread hour; a mock that always returned `[]` (the
+        // pre-PR-3 stub) would make the lifecycle a no-op offline, so replay
+        // could never reproduce the live cancel/restore. Mirrors
+        // `list_open_positions`' reconstruction from `placed`.
+        let placed = self.placed.borrow();
+        let pendings = placed
+            .iter()
+            .filter(|a| matches!(self.resolve(a), AttemptState::Pending))
+            .map(|a| self.pending_from_attempt(a))
+            .collect();
+        Ok(pendings)
     }
 
     async fn get_candles(
@@ -543,6 +586,66 @@ mod tests {
         assert!(
             matches!(late, AttemptState::ClosedLossOrBreakeven { .. }),
             "SL hit by bar 2 → closed, got {late:?}"
+        );
+    }
+
+    // --- PR 3: list_pending_orders fidelity (shared pending-lifecycle) ---
+    //
+    // The shared `pending_order_lifecycle` (core) lists broker pending orders to
+    // decide what to cancel through a spread hour. Before PR 3 this mock always
+    // returned `[]`, so the lifecycle was a no-op offline — replay could never
+    // reproduce the live cancel/restore. These pin the fidelity: a still-resting
+    // attempt IS reported (so the lifecycle can act on it) and one that filled or
+    // was cancelled is NOT (it's no longer resting).
+
+    #[tokio::test]
+    async fn list_pending_reports_a_resting_order() {
+        // Same geometry as `open_then_closed_...`: at the fire bar the short-stop
+        // is placed but not yet filled → a live resting order → must appear in
+        // list_pending_orders with its resolved trigger + is_stop.
+        let fire_bar = candle(0, 1.1010);
+        let fill_bar = candle(3600, 1.1000);
+        let b = ReplayBroker::new(vec![fire_bar, fill_bar], 0.0001);
+        let shell = Shell::from_candle(&fire_bar.mid());
+        b.record_attempt("o1".into(), short_enter_intent(), shell);
+
+        b.set_as_of(Utc.timestamp_opt(0, 0).unwrap());
+        let pendings = b.list_pending_orders("").await.unwrap();
+        assert_eq!(pendings.len(), 1, "resting order must be reported");
+        let o = &pendings[0];
+        assert_eq!(o.order_id, "o1");
+        assert_eq!(o.instrument, "EUR/USD");
+        assert!(o.is_stop, "the intent is a stop entry");
+        assert!(
+            (o.trigger - 1.1000).abs() < 1e-9,
+            "trigger resolves to the absolute 1.1000 stop level, got {}",
+            o.trigger,
+        );
+    }
+
+    #[tokio::test]
+    async fn list_pending_drops_filled_and_cancelled_orders() {
+        // Once the order fills (as-of the fill bar it's an OpenPosition, not
+        // resting) it must NOT appear; and a cancelled order never appears.
+        let fire_bar = candle(0, 1.1010);
+        let fill_bar = candle(3600, 1.1000); // bid reaches the 1.1000 sell-stop
+        let b = ReplayBroker::new(vec![fire_bar, fill_bar], 0.0001);
+        let shell = Shell::from_candle(&fire_bar.mid());
+        b.record_attempt("o1".into(), short_enter_intent(), shell);
+
+        // As-of the fill bar → filled → not resting → not listed.
+        b.set_as_of(Utc.timestamp_opt(3600, 0).unwrap());
+        assert!(
+            b.list_pending_orders("").await.unwrap().is_empty(),
+            "a filled (open) order is no longer resting"
+        );
+
+        // Cancel it, rewind to the fire bar → cancelled overrides → not listed.
+        b.cancel_order("", "o1").await.unwrap();
+        b.set_as_of(Utc.timestamp_opt(0, 0).unwrap());
+        assert!(
+            b.list_pending_orders("").await.unwrap().is_empty(),
+            "a cancelled order is never resting"
         );
     }
 }
