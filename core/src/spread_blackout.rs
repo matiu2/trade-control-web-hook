@@ -416,4 +416,64 @@ mod tests {
             ts("2026-03-12T10:00:00Z")
         ));
     }
+
+    // --- Golden origin-case anchor (PR 0, shared-pending-lifecycle) ---
+    //
+    // These pin the ON-trigger for the case that motivated the whole
+    // shared-lifecycle work: the AUD/CHF 2026-07-08T21:00Z fill-into-the-
+    // spread-hour −2R (SCOPING-spread-hour-rubbish-candle.md). They assert the
+    // *invariant* — "is 21:00Z a baked spread hour for AUD/CHF, and does its
+    // widen ≈ the 12p gap we observed" — NOT the raw mask int, which is
+    // data-derived and drifts as `spread-sampler-cron` accrues samples. When
+    // PR 2 flips the live cancel trigger from a live-quote sample to this baked
+    // predicate, this is the regression baseline that must stay green.
+
+    /// The exact origin bar (07:00 Brisbane = 21:00 UTC, 2026-07-08) is a baked
+    /// spread hour for AUD/CHF, and its baked widen is the ~12p blowout that
+    /// straddled the entry/SL bracket. This is the ON-trigger the shared
+    /// lifecycle keys off — no live quote.
+    #[test]
+    fn aud_chf_origin_bar_is_a_baked_spread_hour() {
+        let origin = ts("2026-07-08T21:00:00Z");
+        assert!(
+            is_spread_hour("AUD/CHF", origin),
+            "AUD/CHF 21:00Z (the −2R origin bar) must read as a baked spread hour"
+        );
+        // Widen at that hour is the p90 blowout — ~12p (the observed spread gap
+        // that straddled entry 0.55980 / SL 0.56070). Assert it is a real
+        // blowout (>= 10p), tolerant of sample-driven drift in the exact value.
+        let widen =
+            spread_hour_widen_pips("AUD/CHF", origin).expect("origin bar must carry a baked widen");
+        assert!(
+            widen >= 10.0,
+            "AUD/CHF 21:00Z widen {widen} must be a >=10p blowout (observed ~12p)"
+        );
+    }
+
+    /// The 30-min lead applies to the origin case too: 20:35 UTC (25 min before
+    /// the 21:00Z spike) already reads as a spread hour, so a resting order is
+    /// removed *before* the blowout lands, not racing it.
+    #[test]
+    fn aud_chf_origin_bar_lead_window_is_a_spread_hour() {
+        assert!(
+            is_spread_hour("AUD/CHF", ts("2026-07-08T20:35:00Z")),
+            "25 min before the 21:00Z spike is inside the 30-min lead → spread hour"
+        );
+        assert!(
+            !is_spread_hour("AUD/CHF", ts("2026-07-08T20:25:00Z")),
+            "35 min before is outside the lead → not yet a spread hour"
+        );
+    }
+
+    /// A clean AUD/CHF hour (well away from the overnight/NY-close blocks) is
+    /// NOT a spread hour — the predicate-false side of the origin anchor, so a
+    /// removed order restores on such a bar. 12:00 UTC is midday London,
+    /// squarely outside AUD/CHF's baked blocks.
+    #[test]
+    fn aud_chf_midday_is_not_a_spread_hour() {
+        assert!(
+            !is_spread_hour("AUD/CHF", ts("2026-07-08T12:00:00Z")),
+            "midday is a clean bar → an order removed at 21:00Z restores here"
+        );
+    }
 }

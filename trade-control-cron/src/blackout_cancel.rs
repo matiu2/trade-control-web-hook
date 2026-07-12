@@ -450,4 +450,31 @@ mod tests {
         );
         assert_eq!(rec.pip_size, 0.0001, "backfilled from the cancel's pip");
     }
+
+    // --- PR 0 baseline: the CURRENT (pre-shared-lifecycle) cancel TRIGGER ---
+    //
+    // Today `maybe_cancel_one` (above, ~line 184) decides whether to cancel a
+    // resting order by SAMPLING A LIVE QUOTE and cancelling only when
+    // `spread_pips > elevated_threshold_pips(instrument)`. The shared-lifecycle
+    // work (PR 2) replaces that live-quote trigger with the pure baked-clock
+    // `is_spread_hour` predicate (the ON side of the ON/OFF asymmetry). These
+    // tests pin the current threshold so that flip is a visible, reviewed delta,
+    // not a silent behaviour change. If PR 2 lands correctly the trigger no
+    // longer reads a quote — so these become the "what we removed" record.
+
+    /// The live-quote trigger's cutoff for AUD/CHF (the origin instrument) is
+    /// 5× its baked median spread — the number the current cancel path compares
+    /// the sampled live spread against. PR 2 stops reading the live spread on
+    /// the cancel (ON) side entirely; recording the cutoff here anchors that.
+    #[test]
+    fn current_cancel_trigger_uses_5x_median_threshold_for_aud_chf() {
+        let threshold = trade_control_core::spread_blackout::elevated_threshold_pips("AUD/CHF");
+        // AUD/CHF baked median ~0.9p → threshold ~4.5p. Assert it is a small
+        // multiple of a tight-cross spread (the current live-quote gate), not
+        // the 12p blowout the baked mask records for the origin hour.
+        assert!(
+            (2.0..=8.0).contains(&threshold),
+            "AUD/CHF live-quote cancel threshold {threshold}p should be ~5x its ~0.9p median",
+        );
+    }
 }
