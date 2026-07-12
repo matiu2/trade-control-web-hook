@@ -35,8 +35,16 @@ use trade_control_core::spread_blackout::spread_hour_widen_pips;
 use trade_control_core::state::{EntryAttempt, RememberedStop, SpreadBlackoutRecord, StateStore};
 
 use crate::broker_handle::BrokerHandle;
-use crate::constants::BLACKOUT_BACKSTOP_SECONDS;
+use crate::constants::spread_block_ttl_seconds;
 use crate::seam::CronEnv;
+
+/// The coarse legacy NY-close-edge **window marker** TTL (~3h). This is the
+/// global "the NY-close spread window is open" flag the entry gate reads
+/// (`dispatch::enter`), NOT a per-trade cancel-record — so it is deliberately
+/// decoupled from both split backstop concerns (the per-record block-length TTL
+/// and the safety force-restore ceiling). Kept at its historical 3h so the
+/// legacy `is_ny_close_edge` entry-gating behaviour is unchanged.
+const NY_CLOSE_WINDOW_MARKER_TTL_SECONDS: u64 = 3 * 60 * 60;
 
 /// Open the global spread-blackout window marker + cancel resting entry
 /// orders iff `now` is the NY-close edge. **System 1 (entry-reject window)
@@ -61,9 +69,10 @@ where
         tracing::info!("blackout: cron fired but not NY-close edge ({now}); no-op");
         return;
     }
-    // The window TTL keys off the same backstop the recovery watcher
-    // uses, so the marker and the per-record backstop can never drift.
-    let ttl = BLACKOUT_BACKSTOP_SECONDS;
+    // The coarse NY-close-edge window marker keeps its own ~3h TTL, decoupled
+    // from the per-record block-length TTL and the safety ceiling (see the
+    // backstop split).
+    let ttl = NY_CLOSE_WINDOW_MARKER_TTL_SECONDS;
     match store.set_spread_blackout_window(now, ttl).await {
         Ok(()) => tracing::info!("blackout: window opened at {now} (ttl {ttl}s)"),
         Err(err) => tracing::error!("blackout: failed to open window: {err}"),
@@ -299,13 +308,17 @@ async fn widen_one<S: StateStore>(
 
     // RECORD FIRST (crash-safe), then amend. `order_id` is the documented
     // TN amend key — store the same id so restore amends the same handle.
+    // Record TTL = block length + grace so it outlives its own block (concern 1
+    // of the backstop split): the recovery watcher's block-lift restore must
+    // still find the widened-stop record to restore the original SL.
+    let ttl = spread_block_ttl_seconds(&position.instrument, now);
     let record = SpreadBlackoutRecord {
         trade_id: trade_id.clone(),
         instrument: position.instrument.clone(),
         account: account.map(|s| s.to_string()),
         applied: true,
         opened_at: now,
-        expires_at: now + Duration::seconds(BLACKOUT_BACKSTOP_SECONDS as i64),
+        expires_at: now + Duration::seconds(ttl as i64),
         pip_size,
         original_stops: vec![RememberedStop {
             position_or_order_id: position.order_id.clone(),
@@ -313,10 +326,7 @@ async fn widen_one<S: StateStore>(
         }],
         cancelled_orders: Vec::new(),
     };
-    if let Err(err) = store
-        .upsert_spread_blackout_record(&record, BLACKOUT_BACKSTOP_SECONDS)
-        .await
-    {
+    if let Err(err) = store.upsert_spread_blackout_record(&record, ttl).await {
         tracing::error!(
             "blackout widen[{}]: upsert_record({trade_id}) FAILED ({err}); NOT amending (no \
              remembered original ⇒ no widen)",

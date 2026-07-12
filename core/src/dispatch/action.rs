@@ -23,7 +23,9 @@ pub async fn run_action<B: Broker, S: StateStore>(
     raw_body: &str,
 ) -> ActionResult {
     match verified.intent.action {
-        Action::Enter => run_enter(broker, store, verified, cfg, now, Some(raw_body), None).await,
+        Action::Enter => {
+            run_enter(broker, store, verified, cfg, now, Some(raw_body), None, false).await
+        }
         Action::Close => run_close(broker, store, verified, now).await,
         Action::Invalidate => run_invalidate(broker, store, verified, now).await,
         Action::Veto => run_veto_with_broker(broker, store, verified, now).await,

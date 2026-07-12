@@ -41,7 +41,7 @@ use trade_control_core::incoming;
 use trade_control_core::state::{CancelledOrder, SpreadBlackoutRecord, StateStore};
 
 use crate::broker_handle::BrokerHandle;
-use crate::constants::BLACKOUT_BACKSTOP_SECONDS;
+use crate::constants::spread_block_ttl_seconds;
 use crate::seam::CronEnv;
 
 /// Cancel + store every resting entry order on the affected accounts whose
@@ -228,10 +228,10 @@ async fn cancel_one<S: StateStore>(
         },
         now,
     );
-    if let Err(err) = store
-        .upsert_spread_blackout_record(&record, BLACKOUT_BACKSTOP_SECONDS)
-        .await
-    {
+    // TTL = block length + grace so the record outlives its own block (the
+    // block-lift restore must still find it — concern 1 of the backstop split).
+    let ttl = spread_block_ttl_seconds(&order.instrument, record.opened_at);
+    if let Err(err) = store.upsert_spread_blackout_record(&record, ttl).await {
         tracing::error!(
             "blackout cancel[{scope}]: upsert_record({trade_id}) FAILED ({err}); NOT cancelling \
              (no durable record ⇒ would strand the order)",
@@ -280,12 +280,16 @@ fn merge_cancelled_order(
         account: account.map(|s| s.to_string()),
         applied: false,
         opened_at: now,
-        expires_at: now + Duration::seconds(BLACKOUT_BACKSTOP_SECONDS as i64),
+        // Placeholder — overwritten below from the block-length TTL.
+        expires_at: now,
         pip_size,
         original_stops: Vec::new(),
         cancelled_orders: Vec::new(),
     });
     record.applied = true;
+    // Record TTL = block length + grace so it outlives its own block (concern 1).
+    record.expires_at = record.opened_at
+        + Duration::seconds(spread_block_ttl_seconds(instrument, record.opened_at) as i64);
     // Keep pip_size current if the prior record had none (Sub-plan-2-era row).
     if !(record.pip_size > 0.0 && record.pip_size.is_finite()) {
         record.pip_size = pip_size;

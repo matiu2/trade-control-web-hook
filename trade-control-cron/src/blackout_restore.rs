@@ -240,14 +240,19 @@ where
 {
     // Resolve the dispatch config at this edge (mirrors the webhook fetch
     // path) so `run_enter` is backend-free. The re-driven enter is the SAME
-    // intended entry, so its caps/pip/risk resolve identically.
+    // intended entry, so its caps/pip/risk resolve identically. `restore = true`
+    // bypasses the retry gate: a restore re-places the order this cron cancelled,
+    // so it must not be `retry-fire-replay`-rejected on its already-seen
+    // `shell.time` nor burn a multi-shot slot. Before this, a multi-shot resting
+    // order's restore was rejected outright and never re-placed (a live-money
+    // bug); single-shot restores were unaffected (they already skip the gate).
     let cfg = cron.dispatch_config(verified).await;
     match broker {
         BrokerHandle::Oanda(b) => {
-            run_enter(b, store, verified, &cfg, now, Some(raw_body), None).await
+            run_enter(b, store, verified, &cfg, now, Some(raw_body), None, true).await
         }
         BrokerHandle::TradeNation(b) => {
-            run_enter(b, store, verified, &cfg, now, Some(raw_body), None).await
+            run_enter(b, store, verified, &cfg, now, Some(raw_body), None, true).await
         }
     }
 }

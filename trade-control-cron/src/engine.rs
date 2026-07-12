@@ -806,7 +806,17 @@ where
             // Resolve the dispatch config at this edge (mirrors the webhook
             // fetch path) so `run_enter` is backend-free.
             let cfg = cron.dispatch_config(verified).await;
-            run_enter(broker, store, verified, &cfg, now, None, Some(granularity)).await
+            run_enter(
+                broker,
+                store,
+                verified,
+                &cfg,
+                now,
+                None,
+                Some(granularity),
+                false,
+            )
+            .await
         }
         Action::Close => run_close(broker, store, verified, now).await,
         Action::Invalidate => run_invalidate(broker, store, verified, now).await,

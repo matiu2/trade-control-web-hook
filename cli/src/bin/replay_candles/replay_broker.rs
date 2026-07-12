@@ -21,6 +21,7 @@ use trade_control_core::broker::{
 };
 use trade_control_core::incoming::Verified;
 use trade_control_core::intent::{Direction, Intent, Resolved, ResolvedEntry, Shell};
+use trade_control_core::spread_blackout::{elevated_threshold_pips, is_spread_hour};
 use trade_control_engine::{
     BidAskCandle as EngineCandle, SimOutcome, apply_entry_spread_floor, simulate_fill,
     simulate_fill_windowed,
@@ -81,6 +82,7 @@ struct ReversalClose {
     fill_at: DateTime<Utc>,
     entry_price: f64,
     exit_at: DateTime<Utc>,
+    exit_price: f64,
 }
 
 /// Exact equality of two resolved entries — same variant, same price. Used to
@@ -142,6 +144,7 @@ fn apply_reversal_close(outcome: &SimOutcome, closes: &[CloseFire]) -> Option<Re
             fill_at,
             entry_price,
             exit_at: c.at,
+            exit_price: c.price,
         })
 }
 
@@ -168,6 +171,14 @@ pub struct RealizedOutcome {
     /// The floored stop the position rested on.
     pub stop_loss: f64,
     pub take_profit: f64,
+    /// The price the position actually exited at — the SL price for a
+    /// `StoppedOut` (or the break-even price when SL→BE moved it to entry), the
+    /// TP price for a `TookProfit`, or the reversal-close bar price for a
+    /// `ClosedOnReversal`. `None` for a still-`Open` position (no exit yet) or a
+    /// not-taken kind (`NeverFilled` / `Declined` / `SpreadBlackout`). The report
+    /// scores R off THIS (`realized_r(entry, stop_loss, exit_price)`) so the
+    /// journal's Net R comes from the broker ledger, not a re-simulation.
+    pub exit_price: Option<f64>,
     pub kind: FillKind,
 }
 
@@ -339,10 +350,16 @@ impl ReplayBroker {
             else {
                 return false;
             };
-            resolved.direction == req.direction
-                && entries_match(&resolved.entry, &req.entry)
-                && resolved.stop_loss == req.stop_loss
-                && resolved.take_profit == req.take_profit
+            // Match on the STABLE identity of the resting order: instrument +
+            // direction + entry trigger. The entry trigger is anchored to the
+            // signal (e.g. `signal_low`) and is byte-identical between the original
+            // placement and the restore. SL/TP are deliberately NOT compared: the
+            // restore re-drives `run_enter`, which re-applies the spread-SL floor at
+            // the *restore* bar, so the re-floored SL legitimately differs from the
+            // original placement's floored (or the stored intent's signed) SL. There
+            // is exactly one resting order per cancelled attempt, so entry-trigger
+            // identity is unambiguous without the SL/TP tie-break.
+            resolved.direction == req.direction && entries_match(&resolved.entry, &req.entry)
         })?;
         matched.cancelled = false;
         tracing::info!(
@@ -432,44 +449,70 @@ impl ReplayBroker {
             &geo.forward,
             geo.entry_spread_price,
         );
-        let (fill_at, until, entry_price, kind) = match apply_reversal_close(&raw, closes) {
-            Some(rc) => (
-                rc.fill_at,
-                rc.exit_at,
-                rc.entry_price,
-                FillKind::ClosedOnReversal,
-            ),
-            None => match &raw {
-                SimOutcome::FilledOpen {
-                    fill_at,
-                    entry_price,
-                } => (*fill_at, window_end, *entry_price, FillKind::Open),
-                SimOutcome::StoppedOut {
-                    fill_at,
-                    entry_price,
-                    exit_at,
-                    ..
-                } => (*fill_at, *exit_at, *entry_price, FillKind::StoppedOut),
-                SimOutcome::TookProfit {
-                    fill_at,
-                    entry_price,
-                    exit_at,
-                    ..
-                } => (*fill_at, *exit_at, *entry_price, FillKind::TookProfit),
-                SimOutcome::NeverFilled => {
-                    (fire_at, window_end, placed_level, FillKind::NeverFilled)
-                }
-                SimOutcome::Declined { .. } => {
-                    (fire_at, window_end, placed_level, FillKind::Declined)
-                }
-                SimOutcome::SpreadBlackout { .. } => {
-                    (fire_at, window_end, placed_level, FillKind::SpreadBlackout)
-                }
-                // `Unresolved` has nothing to draw — the report returned `None`
-                // from its `Unresolved => return None` arm, so the ledger does too.
-                SimOutcome::Unresolved(_) => return None,
-            },
-        };
+        let (fill_at, until, entry_price, exit_price, kind) =
+            match apply_reversal_close(&raw, closes) {
+                Some(rc) => (
+                    rc.fill_at,
+                    rc.exit_at,
+                    rc.entry_price,
+                    Some(rc.exit_price),
+                    FillKind::ClosedOnReversal,
+                ),
+                None => match &raw {
+                    SimOutcome::FilledOpen {
+                        fill_at,
+                        entry_price,
+                    } => (*fill_at, window_end, *entry_price, None, FillKind::Open),
+                    // `exit_price` carries the ACTUAL exit — the break-even price when
+                    // SL→BE moved the stop to entry, else the floored SL — so the
+                    // report's R (`realized_r(entry, stop_loss, exit_price)`) matches
+                    // the sim without re-deriving break-even off stale geometry.
+                    SimOutcome::StoppedOut {
+                        fill_at,
+                        entry_price,
+                        exit_at,
+                        exit_price,
+                    } => (
+                        *fill_at,
+                        *exit_at,
+                        *entry_price,
+                        Some(*exit_price),
+                        FillKind::StoppedOut,
+                    ),
+                    SimOutcome::TookProfit {
+                        fill_at,
+                        entry_price,
+                        exit_at,
+                        exit_price,
+                    } => (
+                        *fill_at,
+                        *exit_at,
+                        *entry_price,
+                        Some(*exit_price),
+                        FillKind::TookProfit,
+                    ),
+                    SimOutcome::NeverFilled => (
+                        fire_at,
+                        window_end,
+                        placed_level,
+                        None,
+                        FillKind::NeverFilled,
+                    ),
+                    SimOutcome::Declined { .. } => {
+                        (fire_at, window_end, placed_level, None, FillKind::Declined)
+                    }
+                    SimOutcome::SpreadBlackout { .. } => (
+                        fire_at,
+                        window_end,
+                        placed_level,
+                        None,
+                        FillKind::SpreadBlackout,
+                    ),
+                    // `Unresolved` has nothing to draw — the report returned `None`
+                    // from its `Unresolved => return None` arm, so the ledger does too.
+                    SimOutcome::Unresolved(_) => return None,
+                },
+            };
         Some(RealizedOutcome {
             direction,
             fill_at,
@@ -477,6 +520,7 @@ impl ReplayBroker {
             entry_price,
             stop_loss,
             take_profit,
+            exit_price,
             kind,
         })
     }
@@ -676,7 +720,7 @@ impl Broker for ReplayBroker {
         Ok(())
     }
 
-    async fn get_quote(&self, _instrument: &str) -> Result<Quote, LookupError> {
+    async fn get_quote(&self, instrument: &str) -> Result<Quote, LookupError> {
         // The shared entry gates (spread-blackout + SL-vs-spread floor in
         // `dispatch::run_enter`) sample the live spread via this round-trip. The
         // replay candles carry the real book (`bid_c`/`ask_c`), so synthesize the
@@ -691,6 +735,30 @@ impl Broker for ReplayBroker {
         // intrabar spike that retraces by the close. So the replay reproduces the
         // common case (sustained wide) and under-reports the sub-bar-spike edge.
         // Better than the old unconditional fail-open, which reproduced nothing.
+        let as_of = *self.as_of.borrow();
+        // Inside a baked spread hour, the OVERNIGHT LIQUIDITY TROUGH is wide *by
+        // definition* — the whole reason the block exists — even when a particular
+        // bar's CLOSE happens to print a narrow spread (the trough is sustained;
+        // the close is a noisy sub-sample). The replay has no live tick to know the
+        // instantaneous spread, so a real bar's close-spread mid-block is an
+        // unreliable recovery signal: it dips narrow on some bars and would make
+        // the OFF-side (`pending_lifecycle::off_now`) FALSELY "recover" the trade
+        // early, restoring a cancelled resting order that then gets re-cancelled the
+        // next in-block bar — a cancel↔restore ping-pong. It also mis-lets an entry
+        // fire inside the trough. So in-block we report a spread AT the elevated
+        // threshold: the OFF-side stays held until the baked hour ENDS (its stated
+        // deterministic off-signal), and the entry gate correctly sees the trough.
+        // Out of block, the real close-spread flows through unchanged.
+        if is_spread_hour(instrument, as_of)
+            && let Some(c) = self.candle_at_as_of()
+        {
+            let mid = (c.bid_c + c.ask_c) / 2.0;
+            let half = elevated_threshold_pips(instrument) * self.pip_size / 2.0;
+            return Ok(Quote {
+                bid: mid - half,
+                ask: mid + half,
+            });
+        }
         match self.candle_at_as_of() {
             Some(c) => Ok(Quote {
                 bid: c.bid_c,

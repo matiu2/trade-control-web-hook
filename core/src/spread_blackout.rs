@@ -200,18 +200,110 @@ pub const SPREAD_BLACKOUT_ELEVATED_PIPS: f64 = 8.0;
 /// MUST be calibrated together on demo — see [`elevated_threshold_pips`].
 pub const SPREAD_BLACKOUT_RECOVERED_PIPS: f64 = 4.0;
 
-/// Spread-blackout backstop, in seconds (~3h). Single source of truth: the
-/// global window-marker TTL (apply), each per-trade record's TTL, and the
-/// recovery watcher's "clear regardless of spread" backstop (watch) all derive
-/// from this one constant so they can never drift apart. The post-NY-close
-/// liquidity trough is ~1h; 3h is a generous safety ceiling after which a
-/// still-`applied` record is force-cleared.
+/// The spread-blackout backstop's two concerns, split (2026-07).
 ///
-/// Lives in `core` (not the cron crate) so the offline replay's transient-widen
-/// reconstruction (`engine::simulator::restore_bar`) computes the same backstop
-/// as the live recovery watcher without depending on `trade-control-cron`. The
-/// cron crate re-exports this as `constants::BLACKOUT_BACKSTOP_SECONDS`.
-pub const BLACKOUT_BACKSTOP_SECONDS: u64 = 3 * 60 * 60;
+/// Historically a single `BLACKOUT_BACKSTOP_SECONDS = 3h` drove BOTH the
+/// per-trade record's TTL and the "force-restore a stuck record" safety
+/// ceiling. That conflation broke for **multi-hour** learned blocks: AUD/CHF's
+/// baked block is 21:00–05:00Z (8h), but the record expired at 21:00 + 3h =
+/// 00:00Z — mid-block, *before* the block-lift restore at 05:00Z could find it —
+/// so the cancelled order was never restored (0R instead of the intended
+/// deferred fill). And the 3h backstop *itself* would fire at 00:00Z, force-
+/// restoring the order back INTO the still-active trough. The two roles want
+/// opposite sizing, so they're now separate:
+///
+/// 1. **Record TTL = the block's own length + grace** ([`spread_block_ttl_seconds`]).
+///    The cancel-record must always OUTLIVE its own spread-hour block so the
+///    normal OFF-side restore (block-lifted / spread-recovered) can still find it.
+///    Per-instrument, derived from the baked mask.
+/// 2. **Safety force-restore ceiling** ([`SAFETY_FORCE_RESTORE_SECONDS`]) — a
+///    tight, global last-resort for a record that is somehow still `applied` long
+///    after it should have cleared. Gated so it NEVER fires while the instrument
+///    is still in a spread hour (see `backstop_due` call sites), so it can't
+///    restore into an active block.
+///
+/// The normal block-lift restore should almost always win first (TTL ≥ block);
+/// the safety ceiling is belt-and-braces.
+///
+/// Sized as a genuine LAST-RESORT: **longer than any realistic learned block** so
+/// it fires only when the normal `off_now` restore has somehow failed to clear a
+/// record for far longer than a legitimate block (e.g. a persistent quote-error
+/// storm, or a repeatedly-failing `clear`). At 12h it sits comfortably past the
+/// widest overnight FX block (~8h) yet well under a full day; combined with the
+/// `!is_spread_hour` gate on its call site, it can never restore into an active
+/// block even for a mis-baked over-long mask. (The old 3h value was BOTH the
+/// per-record TTL and this ceiling — a conflation that expired an 8h AUD/CHF
+/// record at 3h, before its block-lift restore. TTL is now [`spread_block_ttl_seconds`].)
+///
+/// Lives in `core` (not the cron crate) so the offline replay computes the same
+/// values as the live recovery watcher without depending on `trade-control-cron`.
+/// The cron crate re-exports both.
+pub const SAFETY_FORCE_RESTORE_SECONDS: u64 = 12 * 60 * 60;
+
+/// Grace tail added to a block's own length when sizing a cancel-record's TTL,
+/// so the record comfortably outlives the block-lift restore (which fires the
+/// tick the block ends). One extra hour: enough slack for the OFF-side pass to
+/// run at/after the lift without the record having lapsed.
+pub const SPREAD_BLOCK_TTL_GRACE_SECONDS: u64 = 60 * 60;
+
+/// Hard ceiling on a walked block length (defensive): no learned block should
+/// span the whole day, but if a (buggy) mask were all-ones we must not loop 24×
+/// and hand back a 24h TTL. Caps the walk at 23 hours.
+const MAX_BLOCK_HOURS: u32 = 23;
+
+/// The TTL (seconds) a spread-hour cancel-record should carry so it OUTLIVES its
+/// own block: the length of the contiguous spread-hour run that `opened_at` sits
+/// in, plus [`SPREAD_BLOCK_TTL_GRACE_SECONDS`].
+///
+/// Walks forward hour-by-hour from `opened_at` through
+/// [`is_spread_hour`] until the first non-spread hour (wrap-around midnight is
+/// handled by [`is_spread_hour`]'s hour-of-day mask). A record opened at the very
+/// top of the block gets `block_len + grace`; one opened partway through gets the
+/// *remaining* block + grace, which is still ≥ the time to the lift (all we need:
+/// the record must live until the lift). Falls back to `grace` alone when
+/// `opened_at` is somehow not itself a spread hour (nothing to outlive), and is
+/// capped at [`MAX_BLOCK_HOURS`] + grace for a pathological all-hours mask.
+pub fn spread_block_ttl_seconds(instrument: &str, opened_at: chrono::DateTime<chrono::Utc>) -> u64 {
+    use chrono::Timelike;
+    // Walk on the pure per-instrument hour mask when the instrument has one
+    // (deterministic block edges); fall back to a real-clock probe through
+    // `is_spread_hour` for legacy NY-close-edge instruments (no baked mask).
+    let hours = match baked_spread_hours(instrument) {
+        Some((mask, _)) if mask != 0 => block_hours_from_mask(mask, opened_at.hour()),
+        _ => block_hours_by_probe(instrument, opened_at),
+    };
+    hours as u64 * 3600 + SPREAD_BLOCK_TTL_GRACE_SECONDS
+}
+
+/// The number of consecutive elevated hours in `mask` starting at (and
+/// including) `opened_hour`, wrapping around midnight, capped at
+/// [`MAX_BLOCK_HOURS`]. `0` when `opened_hour` itself isn't elevated (nothing to
+/// outlive). Pure over the 24-bit mask so it's testable with synthetic shapes.
+fn block_hours_from_mask(mask: u32, opened_hour: u32) -> u32 {
+    let mut hours: u32 = 0;
+    while hours < MAX_BLOCK_HOURS {
+        let h = (opened_hour + hours) % 24;
+        if mask & (1 << h) == 0 {
+            break;
+        }
+        hours += 1;
+    }
+    hours
+}
+
+/// Real-clock fallback for legacy (no-mask) instruments: probe `is_spread_hour`
+/// forward hour-by-hour from `opened_at`.
+fn block_hours_by_probe(instrument: &str, opened_at: chrono::DateTime<chrono::Utc>) -> u32 {
+    let mut hours: u32 = 0;
+    while hours < MAX_BLOCK_HOURS {
+        let probe = opened_at + chrono::Duration::hours(hours as i64);
+        if !is_spread_hour(instrument, probe) {
+            break;
+        }
+        hours += 1;
+    }
+    hours
+}
 
 #[cfg(test)]
 mod tests {
@@ -474,6 +566,86 @@ mod tests {
         assert!(
             !is_spread_hour("AUD/CHF", ts("2026-07-08T12:00:00Z")),
             "midday is a clean bar → an order removed at 21:00Z restores here"
+        );
+    }
+
+    // --- block-length TTL (concern 1 of the backstop split) ---
+
+    /// A contiguous 8h block (bits 21..=23 + 0..=4, AUD/CHF-shaped) opened at its
+    /// top (hour 21) spans all 8 hours.
+    #[test]
+    fn block_hours_multi_hour_wrap_from_top() {
+        // 21,22,23,0,1,2,3,4 set.
+        let mask: u32 = (1 << 21)
+            | (1 << 22)
+            | (1 << 23)
+            | (1 << 0)
+            | (1 << 1)
+            | (1 << 2)
+            | (1 << 3)
+            | (1 << 4);
+        assert_eq!(block_hours_from_mask(mask, 21), 8);
+    }
+
+    /// Opened partway through the same 8h block (hour 0) → the REMAINING block
+    /// (0,1,2,3,4 = 5h). Still ≥ the time to the lift, which is all the TTL needs.
+    #[test]
+    fn block_hours_multi_hour_wrap_from_middle() {
+        let mask: u32 = (1 << 21)
+            | (1 << 22)
+            | (1 << 23)
+            | (1 << 0)
+            | (1 << 1)
+            | (1 << 2)
+            | (1 << 3)
+            | (1 << 4);
+        assert_eq!(block_hours_from_mask(mask, 0), 5);
+    }
+
+    /// A single elevated hour (majors-shaped, just 21:00Z) → a 1h block.
+    #[test]
+    fn block_hours_single_hour() {
+        assert_eq!(block_hours_from_mask(1 << 21, 21), 1);
+    }
+
+    /// Opening on a non-elevated hour → 0 (nothing to outlive); the TTL is then
+    /// just the grace.
+    #[test]
+    fn block_hours_zero_off_block() {
+        assert_eq!(block_hours_from_mask(1 << 21, 12), 0);
+    }
+
+    /// A degenerate all-ones mask is capped at MAX_BLOCK_HOURS (never 24) so the
+    /// TTL can't blow out to a full day.
+    #[test]
+    fn block_hours_all_ones_is_capped() {
+        assert_eq!(block_hours_from_mask(u32::MAX, 0), MAX_BLOCK_HOURS);
+    }
+
+    /// The public seconds helper: block hours × 3600 + grace.
+    #[test]
+    fn ttl_seconds_adds_grace() {
+        // 1h block + 1h grace = 2h. Use the pure mask helper's math directly so
+        // the assertion doesn't depend on the baked table.
+        let hours = block_hours_from_mask(1 << 21, 21);
+        let ttl = hours as u64 * 3600 + SPREAD_BLOCK_TTL_GRACE_SECONDS;
+        assert_eq!(ttl, 2 * 3600);
+    }
+
+    /// AUD/CHF's baked block, opened at 21:00Z, must yield a TTL that OUTLIVES the
+    /// block AND exceeds the 3h that used to expire it prematurely — the whole
+    /// point of the split. (Uses the baked table via the public helper.)
+    #[test]
+    fn aud_chf_block_ttl_outlives_the_block_and_beats_the_old_3h() {
+        let ttl = spread_block_ttl_seconds("AUD/CHF", ts("2026-07-08T21:00:00Z"));
+        assert!(
+            ttl > 3 * 3600,
+            "AUD/CHF block TTL must exceed the old 3h that expired the record mid-block, got {ttl}s"
+        );
+        // Sanity: a multi-hour block + 1h grace lands well above 3h and below a day.
+        assert!(
+            ttl < 24 * 3600,
+            "TTL must not blow out to a full day, got {ttl}s"
         );
     }
 }

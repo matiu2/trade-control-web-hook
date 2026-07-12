@@ -62,7 +62,8 @@ use crate::dispatch_config::DispatchConfig;
 use crate::incoming::{self, IncomingError, Verified};
 use crate::intent::Resolved;
 use crate::spread_blackout::{
-    BLACKOUT_BACKSTOP_SECONDS, SPREAD_BLACKOUT_RECOVERED_PIPS, is_spread_hour,
+    SAFETY_FORCE_RESTORE_SECONDS, SPREAD_BLACKOUT_RECOVERED_PIPS, is_spread_hour,
+    spread_block_ttl_seconds,
 };
 use crate::state::{CancelledOrder, SpreadBlackoutRecord, StateStore};
 
@@ -332,10 +333,10 @@ async fn try_cancel_one<B: Broker, S: StateStore, V: VerifiedSource>(
         },
         now,
     );
-    if let Err(err) = store
-        .upsert_spread_blackout_record(&record, BLACKOUT_BACKSTOP_SECONDS)
-        .await
-    {
+    // TTL = block length + grace (concern 1), keyed off the record's own
+    // `opened_at` so it matches the `expires_at` the merge stamped.
+    let ttl = spread_block_ttl_seconds(&order.instrument, record.opened_at);
+    if let Err(err) = store.upsert_spread_blackout_record(&record, ttl).await {
         tracing::error!(
             "pending-lifecycle[{scope}]: upsert_record({trade_id}) FAILED ({err}); NOT cancelling \
              (no durable record ⇒ would strand the order)",
@@ -390,12 +391,18 @@ fn merge_cancelled_order(
         account: account.map(|s| s.to_string()),
         applied: false,
         opened_at: now,
-        expires_at: now + Duration::seconds(BLACKOUT_BACKSTOP_SECONDS as i64),
+        // Placeholder — overwritten below from the block-length TTL.
+        expires_at: now,
         pip_size,
         original_stops: Vec::new(),
         cancelled_orders: Vec::new(),
     });
     record.applied = true;
+    // Concern 1: the record must OUTLIVE its own spread-hour block so the
+    // block-lift restore can find it. Size the TTL from the block length off the
+    // (possibly-preserved) `opened_at`, not a flat backstop.
+    record.expires_at = record.opened_at
+        + Duration::seconds(spread_block_ttl_seconds(instrument, record.opened_at) as i64);
     if !(record.pip_size > 0.0 && record.pip_size.is_finite()) {
         record.pip_size = pip_size;
     }
@@ -450,20 +457,10 @@ async fn recover_one<B: Broker, S: StateStore, P: EnterConfigProvider, V: Verifi
         return;
     }
 
-    // RAIL 5 — backstop: clear regardless of spread.
-    if backstop_due(record.opened_at, now) {
-        restore_cancelled_orders(broker, store, cfg_provider, src, record, now).await;
-        if clear(store, record).await {
-            report
-                .restored
-                .push((record.trade_id.clone(), RestoreReason::Backstop));
-        }
-        return;
-    }
-
-    // OFF trigger — the ON/OFF asymmetry. `off_now` is true when EITHER the
-    // live spread has recovered (live only) OR the baked spread hour has ended
-    // (replay's off-signal, also a live off-signal).
+    // NORMAL OFF trigger FIRST — the block lifted (`!is_spread_hour`) OR the live
+    // spread recovered. This is the path that should restore AUD/CHF at the
+    // 05:00Z block lift; because the record TTL now outlives its block (concern 1),
+    // this wins BEFORE any expiry and long before the safety ceiling.
     if off_now(broker, record, now).await {
         // RAIL 6 — restore BEFORE clear.
         restore_cancelled_orders(broker, store, cfg_provider, src, record, now).await;
@@ -471,6 +468,26 @@ async fn recover_one<B: Broker, S: StateStore, P: EnterConfigProvider, V: Verifi
             report
                 .restored
                 .push((record.trade_id.clone(), RestoreReason::Recovered));
+        }
+        return;
+    }
+
+    // SAFETY force-restore (last resort) — a record still `applied` a very long
+    // time after `opened_at`, i.e. the normal `off_now` restore above never
+    // cleared it (a persistent quote-error storm, a repeatedly-failing `clear`,
+    // or a mis-baked over-long mask that never reports a lift). The timer
+    // (SAFETY_FORCE_RESTORE_SECONDS = 12h) is deliberately LONGER than any
+    // realistic block, so by the time it fires we are past any legitimate block —
+    // it cannot force-restore into an active block the way the old 3h ceiling did
+    // (21:00+3h=00:00Z, mid-AUD/CHF's-8h-block). Belt-and-braces: for a normal
+    // block it never fires because `off_now` restores at the lift first. A stuck
+    // record is force-cleared rather than pinning the trade forever.
+    if backstop_due(record.opened_at, now) {
+        restore_cancelled_orders(broker, store, cfg_provider, src, record, now).await;
+        if clear(store, record).await {
+            report
+                .restored
+                .push((record.trade_id.clone(), RestoreReason::Backstop));
         }
     }
 }
@@ -625,7 +642,10 @@ async fn restore_one_order<B: Broker, S: StateStore, P: EnterConfigProvider, V: 
 
     // 3. Re-drive through run_enter. SAME intended entry — we do NOT mark_seen
     //    (off the HTTP is_seen path) and we pass the signed body so a re-placed
-    //    order re-stores its own order:{order_id} row.
+    //    order re-stores its own order:{order_id} row. `restore = true` bypasses
+    //    the retry gate: this is a re-placement of the order we cancelled, not a
+    //    fresh fire, so it must not be `retry-fire-replay`-rejected on its own
+    //    already-seen `shell.time` nor burn a multi-shot slot (RAIL 7).
     let cfg = cfg_provider.dispatch_config(&verified).await;
     let result = run_enter(
         broker,
@@ -635,6 +655,7 @@ async fn restore_one_order<B: Broker, S: StateStore, P: EnterConfigProvider, V: 
         now,
         Some(&cancelled.signed_intent),
         None,
+        true,
     )
     .await;
     tracing::info!(
@@ -669,9 +690,12 @@ async fn clear<S: StateStore>(store: &S, record: &SpreadBlackoutRecord) -> bool 
 
 // --- pure predicates (relocated from blackout_watch, unit-tested) ---
 
-/// Backstop: true once `now >= opened_at + BLACKOUT_BACKSTOP_SECONDS`.
+/// Safety force-restore timer: true once `now >= opened_at +
+/// SAFETY_FORCE_RESTORE_SECONDS`. This is only the *timer* half of the safety
+/// gate — the caller (`recover_one`) ANDs it with `!is_spread_hour` so the
+/// force-restore never fires back into an active block.
 pub fn backstop_due(opened_at: DateTime<Utc>, now: DateTime<Utc>) -> bool {
-    now >= opened_at + Duration::seconds(BLACKOUT_BACKSTOP_SECONDS as i64)
+    now >= opened_at + Duration::seconds(SAFETY_FORCE_RESTORE_SECONDS as i64)
 }
 
 /// Convert an absolute `ask − bid` spread to pips via the record's baked pip.
@@ -716,16 +740,20 @@ mod tests {
     // --- pure predicates (relocated from blackout_watch) ---
 
     #[test]
-    fn backstop_due_at_or_after_three_hours() {
+    fn safety_force_restore_due_at_or_after_twelve_hours() {
+        // The safety ceiling is now 12h (SAFETY_FORCE_RESTORE_SECONDS), longer
+        // than any realistic block so it can't fire mid-block.
         let opened = ts("2026-07-08T21:05:00Z");
-        assert!(backstop_due(opened, ts("2026-07-09T00:05:00Z")));
-        assert!(backstop_due(opened, ts("2026-07-09T00:05:01Z")));
+        assert!(backstop_due(opened, ts("2026-07-09T09:05:00Z")));
+        assert!(backstop_due(opened, ts("2026-07-09T09:05:01Z")));
     }
 
     #[test]
-    fn backstop_not_due_before_three_hours() {
+    fn safety_force_restore_not_due_before_twelve_hours() {
         let opened = ts("2026-07-08T21:05:00Z");
-        assert!(!backstop_due(opened, ts("2026-07-09T00:04:59Z")));
+        assert!(!backstop_due(opened, ts("2026-07-09T09:04:59Z")));
+        // Notably NOT due at 3h (00:05Z) — the old bug fired here, mid-AUD/CHF-block.
+        assert!(!backstop_due(opened, ts("2026-07-09T00:05:00Z")));
         assert!(!backstop_due(opened, ts("2026-07-08T21:20:00Z")));
     }
 
@@ -977,7 +1005,7 @@ mod tests {
             account: None,
             applied: true,
             opened_at: ts(opened),
-            expires_at: ts(opened) + Duration::seconds(BLACKOUT_BACKSTOP_SECONDS as i64),
+            expires_at: ts(opened) + Duration::seconds(SAFETY_FORCE_RESTORE_SECONDS as i64),
             pip_size: 0.0001,
             original_stops: Vec::new(),
             cancelled_orders: Vec::new(),
@@ -1049,18 +1077,26 @@ mod tests {
         assert!(report.restored.is_empty(), "unapplied ⇒ never cleared");
     }
 
-    /// RAIL 5 — the backstop clears a stuck applied record unconditionally,
-    /// regardless of spread. No cancelled orders here → no run_enter drive.
+    /// SAFETY force-restore — the last-resort ceiling clears a stuck applied
+    /// record. To exercise it in isolation the normal `off_now` restore must be
+    /// UNABLE to fire: `now` is chosen to be a spread hour for AUD/CHF (so
+    /// `off_now`'s block-lift branch is false) with no quote (so its recovery
+    /// branch is false too) AND ≥ 12h after `opened_at` (so the safety timer is
+    /// due). This is the pathological "off_now never cleared it" case the safety
+    /// net exists for; in a normal block `off_now` restores at the lift first and
+    /// this never fires. No cancelled orders here → no run_enter drive.
     #[test]
     fn backstop_clears_applied_record() {
         let broker = MockBroker::default(); // no quote → never "recovered"
         let store = MemStateStore::new();
         let rec = applied_record("AUD/CHF", "2026-07-08T21:05:00Z");
-        let now = ts("2026-07-09T00:10:00Z"); // > 3h after opened_at
+        // Next day's spread hour: still in-block per the mask (off_now false) and
+        // > 12h after opened_at (safety timer due).
+        let now = ts("2026-07-09T21:30:00Z");
         store.set_clock(now);
         run(async {
             store
-                .upsert_spread_blackout_record(&rec, BLACKOUT_BACKSTOP_SECONDS)
+                .upsert_spread_blackout_record(&rec, SAFETY_FORCE_RESTORE_SECONDS)
                 .await
                 .expect("upsert record");
             let mut report = LifecycleReport::default();

@@ -4,13 +4,20 @@
 //! values shared by the moved blackout cluster live here so the worker and the
 //! native runtime can't drift.
 
-/// Spread-blackout backstop, in seconds (~3h). Re-exported from
-/// [`trade_control_core::spread_blackout::BLACKOUT_BACKSTOP_SECONDS`] — the value
-/// moved into `core` so the offline replay's transient-widen reconstruction
-/// computes the same backstop as the live recovery watcher without depending on
-/// this crate. Kept re-exported here (rather than fixing up every call site) so
-/// the apply/watch/record TTLs still read it from `constants` unchanged.
-pub use trade_control_core::spread_blackout::BLACKOUT_BACKSTOP_SECONDS;
+/// The spread-blackout backstop's two split concerns, re-exported from `core`
+/// (2026-07). Historically a single `BLACKOUT_BACKSTOP_SECONDS = 3h` drove both
+/// the per-record TTL and the safety force-restore ceiling; that broke for
+/// multi-hour blocks (an 8h AUD/CHF record expired at 3h before its block-lift
+/// restore, and the 3h backstop force-restored back into the active trough).
+/// Now:
+/// - [`spread_block_ttl_seconds`] — per-instrument record TTL = block length + grace.
+/// - [`SAFETY_FORCE_RESTORE_SECONDS`] — global last-resort force-restore ceiling.
+///
+/// Both live in `core` so the offline replay computes identical values without
+/// depending on this crate.
+pub use trade_control_core::spread_blackout::{
+    SAFETY_FORCE_RESTORE_SECONDS, spread_block_ttl_seconds,
+};
 
 /// Forex pip-size fallback used by the blackout re-drive when neither the baked
 /// intent `pip_size` nor the per-trade record's pip is usable. Mirrors the

@@ -32,7 +32,7 @@ use trade_control_core::broker::{AmendError, Broker};
 use trade_control_core::state::{SpreadBlackoutRecord, StateStore};
 
 use crate::broker_handle::BrokerHandle;
-use crate::constants::BLACKOUT_BACKSTOP_SECONDS;
+use crate::constants::SAFETY_FORCE_RESTORE_SECONDS;
 use crate::seam::CronEnv;
 
 /// Walk every per-trade spread-blackout record. For each `applied`
@@ -80,32 +80,12 @@ where
         return Ok(());
     }
 
-    // SAFETY RULE 2 — backstop timeout. Clear regardless of spread so a
-    // stuck record never pins a trade forever.
-    if backstop_due(record.opened_at, now) {
-        // Restore BEFORE clearing — a stranded record would otherwise
-        // re-detect forever. Both restore halves run on the backstop branch:
-        //  - System 2 (Sub-plan 4): widened stops back to their remembered
-        //    originals.
-        //  - System 3 (Sub-plan 5): cancelled resting orders re-driven (or
-        //    dropped) via the entry path.
-        // They operate on independent lists of the SAME record
-        // (`original_stops` vs `cancelled_orders`), so they don't stomp each
-        // other; a trade may carry both (multi-shot: an open position whose
-        // stop was widened AND a resting re-entry order that was cancelled).
-        restore_remembered_stops(cron, record).await;
-        crate::restore_cancelled_orders(store, cron, record, now).await;
-        clear(store, record, "backstop").await?;
-        tracing::info!(
-            "blackout watch[{}]: backstop fired, cleared",
-            record.trade_id
-        );
-        return Ok(());
-    }
-
-    // SAFETY RULE 1 — hard restore floor. Act whenever applied &&
-    // spread-normal, REGARDLESS of the clock; we don't gate on
-    // is_ny_close_edge.
+    // NORMAL restore FIRST (SAFETY RULE 1 — hard restore floor). Act whenever
+    // applied && spread-normal, REGARDLESS of the clock. This is the path that
+    // restores at the block's end when the live spread genuinely recovers; with
+    // the per-record TTL now sized to outlive the block (concern 1 of the
+    // backstop split), it wins BEFORE any expiry and long before the safety
+    // ceiling.
     let spread_abs = sample_spread(cron, record).await?;
     // Convert the broker's absolute `ask − bid` to pips via the pip baked
     // onto the record at apply time (Cron 1). The whole feature works in
@@ -115,15 +95,36 @@ where
     // only clear, rather than declaring recovery on a bogus pip division.
     let spread_pips = spread_in_pips(spread_abs, record.pip_size);
     if spread_recovered(spread_pips) {
-        // Restore both halves before clearing (see the backstop branch for the
-        // independence + coexistence note):
+        // Restore both halves before clearing:
         //  - System 2: widened stops → remembered originals.
         //  - System 3: cancelled resting orders → re-driven via the entry path.
+        // They operate on independent lists of the SAME record (`original_stops`
+        // vs `cancelled_orders`), so they don't stomp each other; a trade may
+        // carry both (multi-shot: an open position whose stop was widened AND a
+        // resting re-entry order that was cancelled).
         restore_remembered_stops(cron, record).await;
         crate::restore_cancelled_orders(store, cron, record, now).await;
         clear(store, record, "recovery").await?;
         tracing::info!(
             "blackout watch[{}]: spread {spread_pips}p recovered, cleared",
+            record.trade_id
+        );
+        return Ok(());
+    }
+
+    // SAFETY force-restore (last resort, SAFETY RULE 2) — a record still
+    // `applied` a very long time after `opened_at`, i.e. the live spread never
+    // recovered enough to clear it above. The timer (SAFETY_FORCE_RESTORE_SECONDS
+    // = 12h) is LONGER than any realistic block so it fires only past any
+    // legitimate block — it can no longer force-restore into an active trough the
+    // way the old 3h ceiling did (21:00+3h=00:00Z, mid-AUD/CHF's-8h-block). A
+    // stuck record is force-cleared rather than pinning the trade forever.
+    if backstop_due(record.opened_at, now) {
+        restore_remembered_stops(cron, record).await;
+        crate::restore_cancelled_orders(store, cron, record, now).await;
+        clear(store, record, "backstop").await?;
+        tracing::info!(
+            "blackout watch[{}]: safety force-restore fired, cleared",
             record.trade_id
         );
     }
@@ -235,11 +236,12 @@ async fn clear<S: StateStore>(
         .map_err(|e| format!("{reason} clear: {e}"))
 }
 
-/// Pure backstop predicate: true once `now` is at/after
-/// `opened_at + BLACKOUT_BACKSTOP_SECONDS`. Unit-testable without
-/// KV/broker. Mirrors `sweep::bar_expiry_due`.
+/// Pure safety force-restore predicate: true once `now` is at/after
+/// `opened_at + SAFETY_FORCE_RESTORE_SECONDS` (the 12h last-resort ceiling, not
+/// the per-record TTL). Unit-testable without KV/broker. Mirrors
+/// `sweep::bar_expiry_due`.
 pub fn backstop_due(opened_at: DateTime<Utc>, now: DateTime<Utc>) -> bool {
-    now >= opened_at + Duration::seconds(BLACKOUT_BACKSTOP_SECONDS as i64)
+    now >= opened_at + Duration::seconds(SAFETY_FORCE_RESTORE_SECONDS as i64)
 }
 
 /// Pure recovery predicate — unit-testable without KV/broker. True when
@@ -309,19 +311,21 @@ mod tests {
     }
 
     #[test]
-    fn backstop_due_at_or_after_three_hours() {
+    fn safety_force_restore_due_at_or_after_twelve_hours() {
         let opened = ts("2026-03-12T21:05:00Z");
-        // exactly 3h later → due.
-        assert!(backstop_due(opened, ts("2026-03-13T00:05:00Z")));
-        // 3h + 1s → due.
-        assert!(backstop_due(opened, ts("2026-03-13T00:05:01Z")));
+        // exactly 12h later (the SAFETY_FORCE_RESTORE_SECONDS ceiling) → due.
+        assert!(backstop_due(opened, ts("2026-03-13T09:05:00Z")));
+        // 12h + 1s → due.
+        assert!(backstop_due(opened, ts("2026-03-13T09:05:01Z")));
     }
 
     #[test]
-    fn backstop_not_due_before_three_hours() {
+    fn safety_force_restore_not_due_before_twelve_hours() {
         let opened = ts("2026-03-12T21:05:00Z");
-        // 1s short of 3h → not yet.
-        assert!(!backstop_due(opened, ts("2026-03-13T00:04:59Z")));
+        // 1s short of 12h → not yet.
+        assert!(!backstop_due(opened, ts("2026-03-13T09:04:59Z")));
+        // NOT due at the old 3h mark — that fired mid-block for multi-hour blocks.
+        assert!(!backstop_due(opened, ts("2026-03-13T00:05:00Z")));
         // freshly opened → not yet.
         assert!(!backstop_due(opened, ts("2026-03-12T21:20:00Z")));
     }

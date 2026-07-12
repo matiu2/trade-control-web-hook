@@ -25,9 +25,8 @@ use trade_control_core::intent::{
 use trade_control_core::plan_sentiment::PlanSentiment;
 use trade_control_core::spread_blackout::elevated_threshold_pips;
 use trade_control_engine::{
-    BidAskCandle as EngineCandle, EntryFloor, SimOutcome, SweepReason, TradePlan,
-    apply_entry_spread_floor, breakeven_armed_at, simulate_fill_windowed, sweep_reason,
-    widened_stop_at,
+    BidAskCandle as EngineCandle, EntryFloor, SweepReason, TradePlan, apply_entry_spread_floor,
+    breakeven_armed_at, sweep_reason, widened_stop_at,
 };
 
 use super::brisbane::bne;
@@ -80,13 +79,9 @@ fn close_gate_passes(fire: &Fire) -> bool {
 /// `allow_close` gate would block is dropped here so the position stays open
 /// (matching the live worker); the blocked close still renders its own
 /// `BLOCKED` line via [`render_fire`].
-pub fn collect_close_fires(replay: &Replay) -> Vec<CloseFire> {
-    collect_close_fires_from(&replay.fires)
-}
-
-/// [`collect_close_fires`] over a bare fire slice — so the replay loop can build
-/// the reversal-close set (to hand to `broker.realized_outcome`) before the
-/// `Replay` value is assembled. Same filter: gate-passing `Action::Close` fires.
+/// Collect the gate-passing `Action::Close` reversal fires over a fire slice —
+/// so the replay loop can build the reversal-close set (to hand to
+/// `broker.realized_outcome`) before the `Replay` value is assembled.
 pub fn collect_close_fires_from(fires: &[Fire]) -> Vec<CloseFire> {
     fires
         .iter()
@@ -97,84 +92,6 @@ pub fn collect_close_fires_from(fires: &[Fire]) -> Vec<CloseFire> {
             price: f.fired.candle.c,
         })
         .collect()
-}
-
-/// Apply any reversal-close to a per-enter [`SimOutcome`]. A close fire flattens
-/// the position when its bar lands **after the fill** and **at-or-before** the
-/// outcome's own exit — i.e. the reversal printed while the trade was still
-/// open. The earliest such close wins (a position only closes once).
-///
-/// - `FilledOpen` (no SL/TP touched) → closed on the first post-fill reversal.
-/// - `StoppedOut` / `TookProfit` → only overridden if a reversal fires *strictly
-///   before* that exit bar; a close on/after the SL/TP bar is moot (the position
-///   was already flat). Ties go to the SL/TP (the simulator's pessimistic
-///   stance, and the close can't pre-empt an exit that already happened).
-/// - `NeverFilled` / `Declined` / `SpreadBlackout` / `Unresolved` → untouched
-///   (no open position).
-///
-/// Returns the (possibly overridden) outcome; on override it's the new
-/// [`ReplayOutcome::ClosedOnReversal`] carrying the close bar + price.
-fn apply_reversal_close(outcome: SimOutcome, closes: &[CloseFire]) -> ReplayOutcome {
-    let (fill_at, entry_price, exit_limit) = match &outcome {
-        SimOutcome::FilledOpen {
-            fill_at,
-            entry_price,
-        } => (*fill_at, *entry_price, None),
-        SimOutcome::StoppedOut {
-            fill_at,
-            entry_price,
-            exit_at,
-            ..
-        }
-        | SimOutcome::TookProfit {
-            fill_at,
-            entry_price,
-            exit_at,
-            ..
-        } => (*fill_at, *entry_price, Some(*exit_at)),
-        // No open position to close.
-        SimOutcome::NeverFilled
-        | SimOutcome::Declined { .. }
-        | SimOutcome::SpreadBlackout { .. }
-        | SimOutcome::Unresolved(_) => {
-            return ReplayOutcome::Sim(outcome);
-        }
-    };
-
-    let reversal = closes
-        .iter()
-        .filter(|c| c.at > fill_at)
-        .filter(|c| match exit_limit {
-            // Only a reversal strictly before the SL/TP bar pre-empts it.
-            Some(exit_at) => c.at < exit_at,
-            None => true,
-        })
-        .min_by_key(|c| c.at);
-
-    match reversal {
-        Some(c) => ReplayOutcome::ClosedOnReversal {
-            fill_at,
-            entry_price,
-            exit_at: c.at,
-            exit_price: c.price,
-        },
-        None => ReplayOutcome::Sim(outcome),
-    }
-}
-
-/// A per-enter fill outcome after the replay's reversal-close post-pass: either
-/// the pure simulator's verdict ([`SimOutcome`]) or a reversal close that
-/// flattened the position before its SL/TP/window-end.
-#[derive(Debug, Clone)]
-enum ReplayOutcome {
-    Sim(SimOutcome),
-    /// The position was flattened by a `06-close-on-reversal` fire while open.
-    ClosedOnReversal {
-        fill_at: DateTime<Utc>,
-        entry_price: f64,
-        exit_at: DateTime<Utc>,
-        exit_price: f64,
-    },
 }
 
 /// How a position resolved, for annotation purposes. The first three are
@@ -235,6 +152,11 @@ pub struct FireResult {
     pub entry_price: f64,
     pub stop_loss: f64,
     pub take_profit: f64,
+    /// The actual exit price for a closed trade (SL / break-even / TP / reversal
+    /// bar). `None` for a still-open or not-taken outcome. Sourced from the
+    /// broker ledger's `RealizedOutcome::exit_price`, so the report's R and exit
+    /// line come from the ledger, not a re-simulation.
+    pub exit_price: Option<f64>,
     pub kind: FillKind,
 }
 
@@ -304,6 +226,7 @@ pub fn resolve_fire_any(plan: &TradePlan, fire: &Fire) -> Option<FireResult> {
             entry_price: resolved.entry.reference_price(),
             stop_loss: resolved.stop_loss,
             take_profit: resolved.take_profit,
+            exit_price: None,
             kind: FillKind::GateBlocked,
         });
     }
@@ -323,6 +246,7 @@ pub fn resolve_fire_any(plan: &TradePlan, fire: &Fire) -> Option<FireResult> {
         entry_price: r.entry_price,
         stop_loss: r.stop_loss,
         take_profit: r.take_profit,
+        exit_price: r.exit_price,
         kind: r.kind,
     })
 }
@@ -361,7 +285,6 @@ pub fn render(
         out.push_str(&render_trace(replay));
     }
 
-    let closes = collect_close_fires(replay);
     let mut tally = Tally::new();
     // A monotonic id for each ENTER fire, so the journal can refer to an entry
     // (and its later widen/restore/break-even events) by a stable "#N" label
@@ -385,7 +308,6 @@ pub fn render(
             fire,
             this_entry,
             simulate,
-            &closes,
             blackout_windows,
             &mut tally,
         ));
@@ -603,7 +525,6 @@ fn render_fire(
     fire: &Fire,
     entry_no: Option<u32>,
     simulate: bool,
-    closes: &[CloseFire],
     blackout_windows: &[NoEntryWindow],
     tally: &mut Tally,
 ) -> Vec<EntryEvent> {
@@ -679,8 +600,8 @@ fn render_fire(
     // The "placed" event carries the resolved bracket (direction, entry, SL,
     // TP) — the journaling record of what order went on. The spread-floor widen
     // is applied so the shown SL is the protected stop, not the signed level.
-    // `protected_stop` is needed to score the fill's R below.
-    let mut protected_stop: Option<f64> = None;
+    // The fill's R is scored off the ledger's floored stop (`resolve_fire_any`
+    // below), not this preview — this block only formats the placed line.
     let placed_note = match Resolved::from_intent(
         intent,
         &shell,
@@ -695,7 +616,6 @@ fn render_fire(
                 &fire.forward,
                 fire.entry_spread_price,
             );
-            protected_stop = Some(resolved.stop_loss);
             let mut note = format!("{ev} placed — {}", describe_order(&resolved, plan.pip_size));
             // When the floor moved the stop, note the spread that sized it.
             if let EntryFloor::Applied { spread_pips } = floor
@@ -807,114 +727,127 @@ fn render_fire(
         }
     }
 
-    let raw = simulate_fill_windowed(
-        intent,
-        &shell,
-        plan.pip_size,
-        &fire.forward,
-        fire.entry_spread_price,
-    );
-    match apply_reversal_close(raw, closes) {
-        ReplayOutcome::ClosedOnReversal {
-            entry_price,
-            exit_at,
-            exit_price,
-            fill_at,
-        } => {
+    // Fill physics belong to the broker ledger (PR 4b-2/4b-4). The single fill
+    // verdict is `fire.realized`, read here via `resolve_fire_any` — the SAME
+    // source the `--annotate` path uses — so the text journal and the chart can
+    // never disagree. This function no longer re-simulates the fill; it formats
+    // the ledger's outcome (kind + entry / exit / R). A `None` verdict means the
+    // order never went on (cancelled by the spread-hour lifecycle and NOT
+    // restored, or an unresolved bracket) — render that as a 0R no-fill, don't
+    // tally it. Before this change, a direct `simulate_fill_windowed` here walked
+    // the original resting order's path blind to the lifecycle cancel, so a
+    // cancelled order still reported a full FILLED → exit → R sequence.
+    let Some(result) = resolve_fire_any(plan, fire) else {
+        events.push(EntryEvent {
+            at: candle.time,
+            note: format!("{ev} NO FILL — order cancelled in spread hour (not restored) → 0R"),
+            close: Some(candle.c),
+        });
+        return events;
+    };
+    let entry_price = result.entry_price;
+    // Score R off the ledger's floored stop + actual exit — the ledger is the
+    // single source of truth for the fill.
+    let ledger_stop = Some(result.stop_loss);
+    let exit_price = result.exit_price.unwrap_or(entry_price);
+    match result.kind {
+        FillKind::ClosedOnReversal => {
             events.push(EntryEvent {
-                at: fill_at,
+                at: result.fill_at,
                 note: format!("{ev} FILLED @ {}", fmt_price(entry_price, plan.pip_size)),
-                close: bar_close(&fire.forward, fill_at),
+                close: bar_close(&fire.forward, result.fill_at),
             });
             tally.reversal_closes += 1;
-            let r = book_r(tally, protected_stop, entry_price, exit_price);
+            let r = book_r(tally, ledger_stop, entry_price, exit_price);
             events.push(EntryEvent {
-                at: exit_at,
+                at: result.until,
                 note: format!(
                     "{ev} CLOSED ON REVERSAL → {}{r}",
                     fmt_price(exit_price, plan.pip_size)
                 ),
-                close: bar_close(&fire.forward, exit_at),
+                close: bar_close(&fire.forward, result.until),
             });
         }
-        ReplayOutcome::Sim(outcome) => match outcome {
-            SimOutcome::FilledOpen {
-                fill_at,
-                entry_price,
-            } => events.push(EntryEvent {
-                at: fill_at,
+        FillKind::Open => events.push(EntryEvent {
+            at: result.fill_at,
+            note: format!(
+                "{ev} FILLED @ {} (still open at window end)",
+                fmt_price(entry_price, plan.pip_size)
+            ),
+            close: bar_close(&fire.forward, result.fill_at),
+        }),
+        FillKind::TookProfit => {
+            events.push(EntryEvent {
+                at: result.fill_at,
+                note: format!("{ev} FILLED @ {}", fmt_price(entry_price, plan.pip_size)),
+                close: bar_close(&fire.forward, result.fill_at),
+            });
+            tally.wins += 1;
+            let r = book_r(tally, ledger_stop, entry_price, exit_price);
+            events.push(EntryEvent {
+                at: result.until,
                 note: format!(
-                    "{ev} FILLED @ {} (still open at window end)",
-                    fmt_price(entry_price, plan.pip_size)
+                    "{ev} TOOK PROFIT → {}{r}",
+                    fmt_price(exit_price, plan.pip_size)
                 ),
-                close: bar_close(&fire.forward, fill_at),
-            }),
-            SimOutcome::TookProfit {
-                fill_at,
-                entry_price,
-                exit_at,
-                exit_price,
-            } => {
-                events.push(EntryEvent {
-                    at: fill_at,
-                    note: format!("{ev} FILLED @ {}", fmt_price(entry_price, plan.pip_size)),
-                    close: bar_close(&fire.forward, fill_at),
-                });
-                tally.wins += 1;
-                let r = book_r(tally, protected_stop, entry_price, exit_price);
-                events.push(EntryEvent {
-                    at: exit_at,
-                    note: format!(
-                        "{ev} TOOK PROFIT → {}{r}",
-                        fmt_price(exit_price, plan.pip_size)
-                    ),
-                    close: bar_close(&fire.forward, exit_at),
-                });
-            }
-            SimOutcome::StoppedOut {
-                fill_at,
-                entry_price,
-                exit_at,
-                exit_price,
-            } => {
-                events.push(EntryEvent {
-                    at: fill_at,
-                    note: format!("{ev} FILLED @ {}", fmt_price(entry_price, plan.pip_size)),
-                    close: bar_close(&fire.forward, fill_at),
-                });
-                tally.losses += 1;
-                let r = book_r(tally, protected_stop, entry_price, exit_price);
-                events.push(EntryEvent {
-                    at: exit_at,
-                    note: format!(
-                        "{ev} STOPPED OUT → {}{r}",
-                        fmt_price(exit_price, plan.pip_size)
-                    ),
-                    close: bar_close(&fire.forward, exit_at),
-                });
-            }
-            // Not-taken outcomes: a single note on the fire bar, no tally move.
-            other => {
-                let detail = match &other {
-                    SimOutcome::NeverFilled => {
-                        let swept = sweep_reason(
-                            intent,
-                            &shell,
-                            plan.pip_size,
-                            &fire.forward,
-                            blackout_windows,
-                        );
-                        describe_never_filled(swept)
-                    }
-                    o => describe_outcome(o),
-                };
-                events.push(EntryEvent {
-                    at: candle.time,
-                    note: format!("{ev} {detail}"),
-                    close: Some(candle.c),
-                });
-            }
-        },
+                close: bar_close(&fire.forward, result.until),
+            });
+        }
+        FillKind::StoppedOut => {
+            events.push(EntryEvent {
+                at: result.fill_at,
+                note: format!("{ev} FILLED @ {}", fmt_price(entry_price, plan.pip_size)),
+                close: bar_close(&fire.forward, result.fill_at),
+            });
+            tally.losses += 1;
+            let r = book_r(tally, ledger_stop, entry_price, exit_price);
+            // A break-even scratch (SL→BE moved the stop to entry) exits at the
+            // entry price for 0R, not a −1R loss — label it as such.
+            let label = if (exit_price - entry_price).abs() < 1e-9 {
+                "SL→BREAK-EVEN"
+            } else {
+                "STOPPED OUT"
+            };
+            events.push(EntryEvent {
+                at: result.until,
+                note: format!("{ev} {label} → {}{r}", fmt_price(exit_price, plan.pip_size)),
+                close: bar_close(&fire.forward, result.until),
+            });
+        }
+        // Not-taken outcomes the ledger owns: a single note on the fire bar, no
+        // tally move. `NeverFilled` carries a sweep reason; the others describe
+        // the gate/quality decline.
+        FillKind::NeverFilled => {
+            let swept = sweep_reason(
+                intent,
+                &shell,
+                plan.pip_size,
+                &fire.forward,
+                blackout_windows,
+            );
+            events.push(EntryEvent {
+                at: candle.time,
+                note: format!("{ev} {}", describe_never_filled(swept)),
+                close: Some(candle.c),
+            });
+        }
+        FillKind::Declined => events.push(EntryEvent {
+            at: candle.time,
+            note: format!("{ev} fill: DECLINED — entry past a gate level (no order placed)"),
+            close: Some(candle.c),
+        }),
+        FillKind::SpreadBlackout => events.push(EntryEvent {
+            at: candle.time,
+            note: format!("{ev} fill: SPREAD BLACKOUT — entry rejected on fire-bar spread"),
+            close: Some(candle.c),
+        }),
+        // A gate rejection is handled by the `rejected_reason` branch above; if
+        // the ledger ever surfaces it here, render it plainly.
+        FillKind::GateBlocked => events.push(EntryEvent {
+            at: candle.time,
+            note: format!("{ev} BLOCKED by a pre-broker gate → NO FILL / 0R"),
+            close: Some(candle.c),
+        }),
     }
 
     events
@@ -1066,61 +999,6 @@ fn describe_never_filled(swept: Option<(SweepReason, DateTime<Utc>)>) -> String 
             bne(at)
         ),
         None => "fill: NEVER FILLED (pending order untriggered in window)".to_string(),
-    }
-}
-
-fn describe_outcome(outcome: &SimOutcome) -> String {
-    match outcome {
-        SimOutcome::NeverFilled => {
-            "fill: NEVER FILLED (pending order untriggered in window)".into()
-        }
-        SimOutcome::FilledOpen {
-            fill_at,
-            entry_price,
-        } => format!(
-            "fill: FILLED @ {entry_price} ({}) — still open at window end",
-            bne(*fill_at)
-        ),
-        SimOutcome::StoppedOut {
-            fill_at,
-            entry_price,
-            exit_at,
-            exit_price,
-        } => {
-            // When the stop landed at the entry price, break-even management
-            // (BUG-replay-no-breakeven-stop-at-50pct) moved it there after a
-            // candle closed past 50%-to-TP — a 0R scratch, not a −1R loss.
-            let label = if (exit_price - entry_price).abs() < 1e-9 {
-                "BREAK-EVEN (SL→BE) — in @"
-            } else {
-                "STOPPED OUT — in @"
-            };
-            format!(
-                "fill: {label} {entry_price} ({}) → SL {exit_price} ({})",
-                bne(*fill_at),
-                bne(*exit_at)
-            )
-        }
-        SimOutcome::TookProfit {
-            fill_at,
-            entry_price,
-            exit_at,
-            exit_price,
-        } => format!(
-            "fill: TOOK PROFIT — in @ {entry_price} ({}) → TP {exit_price} ({})",
-            bne(*fill_at),
-            bne(*exit_at)
-        ),
-        SimOutcome::Unresolved(reason) => format!("fill: UNRESOLVED — {reason}"),
-        SimOutcome::Declined { name } => {
-            format!("fill: DECLINED — entry past the {name} level (no order placed)")
-        }
-        SimOutcome::SpreadBlackout {
-            spread_pips,
-            threshold_pips,
-        } => format!(
-            "spread: REJECTED — spread {spread_pips:.1}p > {threshold_pips:.1}p threshold inside the NY-close-edge window (no order placed; live worker 423s)"
-        ),
     }
 }
 
@@ -1471,99 +1349,10 @@ mod tests {
         Utc.timestamp_opt(secs, 0).unwrap()
     }
 
-    fn cf(secs: i64, price: f64) -> CloseFire {
-        CloseFire {
-            at: at(secs),
-            price,
-        }
-    }
-
-    #[test]
-    fn reversal_close_flattens_an_open_position() {
-        // FilledOpen + a reversal after the fill → ClosedOnReversal at that bar.
-        let open = SimOutcome::FilledOpen {
-            fill_at: at(100),
-            entry_price: 5.871,
-        };
-        match apply_reversal_close(open, &[cf(300, 5.860)]) {
-            ReplayOutcome::ClosedOnReversal {
-                fill_at,
-                entry_price,
-                exit_at,
-                exit_price,
-            } => {
-                assert_eq!(fill_at, at(100));
-                assert!((entry_price - 5.871).abs() < 1e-9);
-                assert_eq!(exit_at, at(300));
-                assert!((exit_price - 5.860).abs() < 1e-9);
-            }
-            other => panic!("expected ClosedOnReversal, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn reversal_before_the_fill_is_ignored() {
-        // A close fire BEFORE the fill belongs to no open position → untouched.
-        let open = SimOutcome::FilledOpen {
-            fill_at: at(200),
-            entry_price: 5.871,
-        };
-        assert!(matches!(
-            apply_reversal_close(open, &[cf(100, 5.860)]),
-            ReplayOutcome::Sim(SimOutcome::FilledOpen { .. })
-        ));
-    }
-
-    #[test]
-    fn reversal_after_sl_does_not_override_the_stop() {
-        // The position already stopped out at bar 250; a reversal at 300 is moot.
-        let stopped = SimOutcome::StoppedOut {
-            fill_at: at(100),
-            entry_price: 5.871,
-            exit_at: at(250),
-            exit_price: 5.90,
-        };
-        assert!(matches!(
-            apply_reversal_close(stopped, &[cf(300, 5.86)]),
-            ReplayOutcome::Sim(SimOutcome::StoppedOut { .. })
-        ));
-    }
-
-    #[test]
-    fn reversal_before_sl_pre_empts_the_stop() {
-        // A reversal that fires strictly before the SL bar closes the position
-        // first — the trade exited on the reversal, never reaching its stop.
-        let stopped = SimOutcome::StoppedOut {
-            fill_at: at(100),
-            entry_price: 5.871,
-            exit_at: at(400),
-            exit_price: 5.90,
-        };
-        match apply_reversal_close(stopped, &[cf(300, 5.86)]) {
-            ReplayOutcome::ClosedOnReversal { exit_at, .. } => assert_eq!(exit_at, at(300)),
-            other => panic!("expected ClosedOnReversal, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn earliest_reversal_wins() {
-        let open = SimOutcome::FilledOpen {
-            fill_at: at(100),
-            entry_price: 5.871,
-        };
-        match apply_reversal_close(open, &[cf(400, 5.85), cf(250, 5.86)]) {
-            ReplayOutcome::ClosedOnReversal { exit_at, .. } => assert_eq!(exit_at, at(250)),
-            other => panic!("expected the earliest reversal, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn never_filled_is_untouched_by_a_reversal() {
-        assert!(matches!(
-            apply_reversal_close(SimOutcome::NeverFilled, &[cf(300, 5.86)]),
-            ReplayOutcome::Sim(SimOutcome::NeverFilled)
-        ));
-    }
+    // The reversal-close post-pass now lives on the broker ledger
+    // (`replay_broker.rs::apply_reversal_close` + `shadow_parity_fill_then_reversal_close`),
+    // the single fill-verdict source the report reads via `resolve_fire_any`; the
+    // former report-layer copy + its unit tests were removed in PR 4b-4.
 
     #[test]
     fn short_stop_order_shows_direction_entry_and_levels() {
