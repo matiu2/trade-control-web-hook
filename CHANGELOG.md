@@ -52,9 +52,14 @@ twin; `find_fill` skips a spread-hour bar and fills the next clean one + non-edg
 twin fills immediately (`simulator.rs`); verbose `⌀` marker rendered / quiet
 without a mark (`verbose.rs`). Full suites green (816 core, 144 engine, all cli).
 
-**Follow-up.** A redundant live-clock reject in `run_enter` (defense-in-depth for
-a manually re-POSTed alert) was scoped but deferred — the engine gate already
-blocks the fire in both worker and replay.
+**Non-goal (by design).** No second/redundant spread-hour reject in the worker's
+`run_enter` — the single shared engine gate is the only check. A duplicate
+live-clock reject would add complication for no gain (and risk double-rejecting a
+legitimately-fired late-arriving enter). One gate, shared, no redundancy.
+
+**Re-enable.** Suppression is a pure per-bar predicate re-evaluated each bar —
+nothing is latched off. The first bar outside the spread hour (+ 30-min lead)
+behaves exactly as before, with no state to reset.
 
 ## v87 — 2026-07-12 — replay: `✗ not taken` — why a marked golden's enter never fired
 

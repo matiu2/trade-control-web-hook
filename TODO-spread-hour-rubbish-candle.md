@@ -43,9 +43,14 @@ new entries, signal detection, level crosses. NOT stop-outs.
   (Bug #12) — untouched, so gap-past protection still works during spread hours.
 - Exit honouring (SL/TP) in `simulate_fill_windowed` is NOT gated — a real
   broker stops you regardless; the open-position stop-widen covers that case.
+- Suppression is a **pure per-bar predicate** (`is_spread_hour(instrument,
+  bar.time)`), re-evaluated fresh every bar. Nothing is latched off — the moment
+  a bar falls outside the spread hour (+ 30-min lead) it re-enables with no state
+  to reset. A skipped pending order fills on the next clean bar.
 
-## Deferred follow-up (not built)
-- A redundant live-clock reject in the worker's `run_enter` (defense-in-depth
-  for a manually re-POSTed alert). Skipped: the engine gate already blocks the
-  fire in both worker + replay, and a live-clock reject risks double-rejecting a
-  legitimately-fired late-arriving enter. Add only if a concrete gap appears.
+## Explicit non-goal (by design, NOT deferred)
+- We deliberately do NOT add a second/redundant spread-hour reject in the
+  worker's `run_enter`. The single shared engine gate (`evaluate_plan`) is the
+  only check — a duplicate live-clock reject would add complication for no gain
+  and risk double-rejecting a legitimately-fired late-arriving enter. One gate,
+  shared, no redundancy.
