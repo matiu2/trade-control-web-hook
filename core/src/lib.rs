@@ -19,6 +19,7 @@ pub mod incoming;
 pub mod intent;
 pub mod ny_clock;
 pub mod pause_gate;
+pub mod pending_lifecycle;
 pub mod plan_eval;
 pub mod plan_sentiment;
 pub mod plan_state;

@@ -23,7 +23,7 @@ use trade_control_engine::{
 
 use trade_control_core::signals::{DetectFlags, atr_length_for, detect_at, wilder_atr};
 
-use super::replay_broker::ReplayBroker;
+use super::replay_broker::{RealizedOutcome, ReplayBroker};
 use super::verbose::{BarTrace, DetectedMark};
 use trade_control_cli::replay_args::DetectorMarkConfig;
 
@@ -74,6 +74,16 @@ pub struct Fire {
     /// single fire-bar spread. `None` when unavailable (falls back to the fire
     /// bar's own close spread — the pre-window behaviour).
     pub entry_spread_price: Option<f64>,
+    /// The broker-ledger realized outcome for this enter (PR 4b-2): the fill /
+    /// exit / floored bracket the `ReplayBroker`'s position ledger computed for
+    /// the placed order, so the report reads it instead of re-simulating the fill
+    /// itself. Populated by [`run`] after the loop (once the reversal-close set is
+    /// known) for a **placed** enter that resolved to a drawable outcome; `None`
+    /// for a non-enter, a rejected/superseded enter (the report renders those from
+    /// gate state), or an unresolved bracket (nothing to draw). The report's
+    /// not-taken kinds (`NeverFilled` / `Declined` / `SpreadBlackout`) come
+    /// through here as `Some` — they're fill physics the broker owns.
+    pub realized: Option<RealizedOutcome>,
 }
 
 impl Fire {
@@ -207,6 +217,11 @@ pub async fn run(
     // (the engine retires them after one fire).
     let replay_broker = ReplayBroker::new(candles.to_vec(), plan.pip_size);
     let store = MemStateStore::default();
+    // PR 4b-3: the SAME shared spread-hour resting-order lifecycle the live cron
+    // runs, driven per bar below. Its two offline seams — a fixed dispatch config
+    // and an armed-Verified source reading the broker ledger — live in
+    // `super::lifecycle`; the broker + store are the ones above.
+    let lifecycle_cfg = super::lifecycle::ReplayConfigProvider::new(plan.pip_size);
 
     // The detector window grows with each tick: Pine / trendline triggers need
     // the full back-window of closed candles, not just the single new bar.
@@ -305,6 +320,8 @@ pub async fn run(
             &fired_rules,
             &decline_reasons,
         );
+        let spread_hour =
+            trade_control_core::spread_blackout::is_spread_hour(&plan.instrument, candles[i].time);
         traces.push(BarTrace::diff(
             candles[i].time,
             &before,
@@ -313,6 +330,7 @@ pub async fn run(
             detected,
             decline_reasons,
             not_taken,
+            spread_hour,
         ));
 
         for warning in eval.warnings {
@@ -418,18 +436,92 @@ pub async fn run(
             } else {
                 None
             };
+            // Attach the position-ledger geometry to the placed order so the
+            // broker owns its fill/exit outcome (PR 4b-2). The dispatch's
+            // `place_entry` already recorded a geometry-less attempt under this
+            // order id; `record_order` upgrades it in place with the forward path
+            // + entry-spread the report used to walk. The report then reads
+            // `broker.realized_outcome(order_id, closes)` instead of re-simulating.
+            // The shell must be the SAME one the dispatch armed — rebuild it the
+            // identical way (signal-folded for an H&S Pine fire, plain otherwise).
+            if let EnterGateOutcome::Placed {
+                order_id: Some(order_id),
+            } = &gate_outcome
+            {
+                let shell = match &fired.signal {
+                    Some(sig) => Shell::from_candle_and_signal(&fired.candle, sig),
+                    None => Shell::from_candle(&fired.candle),
+                };
+                replay_broker.record_order(
+                    order_id.clone(),
+                    fired.intent.clone(),
+                    shell,
+                    forward.clone(),
+                    entry_spread_price,
+                );
+            }
             fires.push(Fire {
                 fired,
                 forward,
                 gate_outcome,
                 superseded: false,
                 entry_spread_price,
+                realized: None,
             });
         }
+
+        // PR 4b-3: run the shared resting-order lifecycle for this bar AFTER the
+        // enter dispatch, so any order that just went resting is visible. In a
+        // spread hour it cancels + backs up the resting order through the
+        // engine→broker path (the cancel sets the ledger's `cancelled` flag →
+        // `realized_outcome` → None → the report shows no fill); on a later clean
+        // bar it re-drives it. The `is_spread_hour` gate is the ON trigger, so a
+        // clean bar is a no-op. Account is `None` — the ReplayBroker doesn't scope
+        // orders by account, and `is_spread_hour` keys on instrument + time only.
+        //
+        // Point the broker's prior-attempt clock at THIS bar first. `set_as_of` is
+        // otherwise only called per-enter inside `dispatch_enter`, so without this
+        // the lifecycle's `list_pending_orders`/`resolve` would judge pending-ness
+        // against the last fire bar, not the current one — a resting order would be
+        // listed (or not) as of stale time. Use the same `now` the lifecycle runs
+        // at so the cancel/restore timing is bar-accurate.
+        replay_broker.set_as_of(now);
+        let src = super::lifecycle::ReplayVerifiedSource::new(&replay_broker);
+        // Replay is the SOLE owner of the record (no System 2 widened stops
+        // offline), so it clears the record itself — `ClearRecord`, the default
+        // behaviour, byte-identical to before the Option-A clear-policy split.
+        trade_control_core::pending_lifecycle::pending_order_lifecycle(
+            &replay_broker,
+            &store,
+            &lifecycle_cfg,
+            &src,
+            None,
+            now,
+            trade_control_core::pending_lifecycle::ClearPolicy::ClearRecord,
+        )
+        .await;
 
         if eval.done {
             done = true;
             break;
+        }
+    }
+
+    // PR 4b-2: the report reads each placed enter's outcome from the broker
+    // ledger. The reversal-close set is plan-wide (a `06-close-on-reversal` can
+    // flatten a position that filled bars earlier), so it's only known now that
+    // every fire is collected. Build it, then ask the broker to realize each
+    // placed order against it and stash the outcome on the fire. A superseded
+    // order (its resting order cancelled by a later entry) is skipped — the
+    // report renders it as cancelled, not a fill, exactly as before.
+    let closes = super::report::collect_close_fires_from(&fires);
+    for fire in fires.iter_mut() {
+        if fire.superseded {
+            continue;
+        }
+        let order_id = fire.order_id().map(str::to_owned);
+        if let Some(order_id) = order_id {
+            fire.realized = replay_broker.realized_outcome(&order_id, &closes);
         }
     }
 
@@ -598,7 +690,18 @@ async fn dispatch_enter(
         caps: Default::default(),
     };
 
-    match dispatch::run_enter(broker, store, &verified, &cfg, now, None, Some(granularity)).await {
+    match dispatch::run_enter(
+        broker,
+        store,
+        &verified,
+        &cfg,
+        now,
+        None,
+        Some(granularity),
+        false,
+    )
+    .await
+    {
         ActionResult::Ok(outcome) => {
             tracing::debug!(rule = %fired.rule_id, %outcome, "tick: enter placed");
             EnterGateOutcome::Placed {
@@ -735,6 +838,9 @@ async fn inject_control_ticks(
                 gate_outcome: EnterGateOutcome::NotAnEnter,
                 superseded: false,
                 entry_spread_price: None,
+                // A control tick (pause/resume/news) is not an enter — no order,
+                // no ledger outcome.
+                realized: None,
             });
         }
     }
@@ -2002,6 +2108,665 @@ mod tests {
             marked_bar.not_taken.is_none(),
             "a declined bar must NOT also carry a not_taken: {:?}",
             marked_bar.not_taken
+        );
+    }
+
+    // --- PR 4b-3: spread-hour resting order cancelled via the shared lifecycle ---
+
+    /// An OHLC bid==ask==mid bar at an RFC3339 instant (the spread-hour golden
+    /// needs real calendar times so `is_spread_hour` reads AUD/CHF's baked hours).
+    fn ohlc_at(rfc3339: &str, o: f64, h: f64, l: f64, c: f64) -> EngineCandle {
+        let time: DateTime<Utc> = rfc3339.parse().expect("valid rfc3339");
+        EngineCandle {
+            time,
+            o,
+            h,
+            l,
+            c,
+            bid_o: o,
+            bid_h: h,
+            bid_l: l,
+            bid_c: c,
+            ask_o: o,
+            ask_h: h,
+            ask_l: l,
+            ask_c: c,
+        }
+    }
+
+    /// A single-shot SHORT plan (the AUD/CHF 2026-07-08 origin case, on EUR/USD so
+    /// the spread hour is a single, un-wrapped block): the enter fires on an
+    /// OnClose down-cross of 1.1010 and rests a short stop-entry at 1.1000
+    /// (SL 1.1020, TP 1.0950). The trigger is first reached on the 21:00Z
+    /// spread-hour bar.
+    ///
+    /// EUR/USD's baked spread hours are the single hour 21:00Z (NY-close block),
+    /// so 22:00Z/23:00Z are genuinely clean — the restore re-drive lands there and
+    /// fills. (AUD/CHF's own block runs 21:00–05:00Z, so its first clean bar is
+    /// 06:00Z; the mechanism is identical, EUR/USD just keeps the golden compact.)
+    fn eurusd_spread_hour_plan() -> TradePlan {
+        serde_json::from_str(
+            r#"{
+                "trade_id": "eurusd-sh",
+                "instrument": "EUR/USD",
+                "direction": "short",
+                "granularity": "h1",
+                "pip_size": 0.0001,
+                "rules": [
+                    {
+                        "rule_id": "05-enter",
+                        "trigger": { "type": "horizontal_cross", "level": 1.1010, "dir": "down", "bar": "on_close" },
+                        "fire_mode": "once",
+                        "intent": {
+                            "v": 1, "id": "eurusd-sh-enter", "not_after": "2099-01-01T00:00:00Z",
+                            "action": "enter", "instrument": "EUR/USD", "direction": "short",
+                            "entry": { "type": "stop", "from": "close", "offset_pips": 0.0, "at": 1.1000 },
+                            "stop_loss": { "absolute": 1.1020 },
+                            "take_profit": { "absolute": 1.0950 },
+                            "broker": "tradenation", "trade_id": "eurusd-sh", "max_retries": 0,
+                            "pip_size": 0.0001
+                        }
+                    }
+                ]
+            }"#,
+        )
+        .expect("parse EUR/USD spread-hour plan")
+    }
+
+    /// GOLDEN (AUD/CHF 2026-07-08 origin): a **single-shot** resting short-stop
+    /// (`max_retries: 0`) whose trigger is first reached on the 21:00Z spread-hour
+    /// spike still ends up filling on the next **clean** bar (22:00Z), NOT inside
+    /// the 12p-spread rubbish spike.
+    ///
+    /// IMPORTANT — what this test does and does NOT exercise: because the enter is
+    /// single-shot, the engine retires the plan (`Phase::Done`) the moment it fires
+    /// (19:00Z), so the replay loop **breaks before ever reaching the 20:00Z
+    /// spread-hour bar** — the shared `pending_order_lifecycle` never lists, cancels
+    /// or restores this order. The clean-bar fill here is produced solely by
+    /// `find_fill`'s spread-hour spike-skip (the v88 mechanism), *not* by the
+    /// cancel→restore lifecycle. The lifecycle cancel→restore path — which only runs
+    /// for a **multi-shot** enter whose plan stays `AwaitEntry` into the spread hour
+    /// — is exercised by
+    /// [`multishot_spread_hour_order_is_cancelled_and_deduped_restore_shows_no_fill`]
+    /// below. (The former docstring claimed this test drove the cancel→restore
+    /// mechanism; it never did — see PR 4b-4.)
+    #[tokio::test]
+    async fn spread_hour_order_is_cancelled_then_restored_and_fills_on_the_clean_bar() {
+        // The lifecycle keys on the bar's CLOSE (`now = open + 1h`); the find_fill
+        // spread-hour skip keys on the bar's OPEN. EUR/USD's only spread hour is
+        // 21:00Z, so the timeline is:
+        //   19:00Z bar (close 20:00Z, clean): enter fires, short stop rests @1.1000
+        //                                     (high stays above 1.1000 — no touch).
+        //   20:00Z bar (close 21:00Z, SPREAD HOUR): lifecycle CANCELS the resting
+        //                                     order (now=21:00Z); no touch here.
+        //   21:00Z bar (open 21:00Z spike, close 22:00Z clean): lifecycle RESTORES
+        //                                     it (now=22:00Z clean); the low taps
+        //                                     1.1000 but find_fill skips the spike
+        //                                     open — no fill.
+        //   22:00Z bar (open+close clean): reaches 1.1000 → FILLS here.
+        //   23:00Z bar: runs to TP 1.0950.
+        // 10 warm-up bars above the 1.1010 enter level so the live window starts at
+        // 19:00Z (past the SEED_BARS floor).
+        let mut candles: Vec<EngineCandle> = (9..19)
+            .map(|h| {
+                ohlc_at(
+                    &format!("2026-07-08T{h:02}:00:00Z"),
+                    1.1020,
+                    1.1022,
+                    1.1018,
+                    1.1020,
+                )
+            })
+            .collect();
+        // 19:00Z: closes below 1.1010 → 05-enter fires, short stop rests @1.1000
+        // (low 1.1006 stays above the trigger — no touch).
+        candles.push(ohlc_at(
+            "2026-07-08T19:00:00Z",
+            1.1016,
+            1.1017,
+            1.1006,
+            1.1008,
+        ));
+        // 20:00Z (close 21:00Z = SPREAD HOUR): lifecycle cancels; low 1.1005 keeps
+        // the order untouched so nothing fills before the cancel.
+        candles.push(ohlc_at(
+            "2026-07-08T20:00:00Z",
+            1.1008,
+            1.1009,
+            1.1005,
+            1.1007,
+        ));
+        // 21:00Z (open = spread hour spike): straddles 1.1000 (low 1.0995) but the
+        // find_fill spike-open skip blocks the fill; lifecycle restores (now clean).
+        candles.push(ohlc_at(
+            "2026-07-08T21:00:00Z",
+            1.1002,
+            1.1004,
+            1.0995,
+            1.0999,
+        ));
+        // 22:00Z CLEAN (open + close clean): re-reaches 1.1000 → the restored order
+        // fills here.
+        candles.push(ohlc_at(
+            "2026-07-08T22:00:00Z",
+            1.1001,
+            1.1003,
+            1.0994,
+            1.0997,
+        ));
+        // 23:00Z: runs to TP 1.0950.
+        candles.push(ohlc_at(
+            "2026-07-08T23:00:00Z",
+            1.0995,
+            1.0997,
+            1.0948,
+            1.0951,
+        ));
+        let live_at: DateTime<Utc> = "2026-07-08T19:00:00Z".parse().unwrap();
+        let expires_at: DateTime<Utc> = "2026-07-10T00:00:00Z".parse().unwrap();
+
+        let r = run(
+            &eurusd_spread_hour_plan(),
+            &candles,
+            Granularity::H1,
+            live_at,
+            expires_at,
+            no_marks(),
+        )
+        .await;
+
+        // The enter fired (the down-cross), placing the resting short-stop.
+        let enter = r
+            .fires
+            .iter()
+            .find(|f| f.fired.rule_id == "05-enter")
+            .expect("the short enter must fire on the 19:00Z down-cross");
+
+        // The lifecycle cancelled the resting order in the 21:00Z spread hour,
+        // then RESTORED (re-drove) it on the next clean bar — so it fills on the
+        // 22:00Z clean bar and runs to TP. The observable: a TOOK PROFIT whose
+        // fill_at is 22:00Z, NOT the 21:00Z rubbish spike.
+        let realized = enter
+            .realized
+            .as_ref()
+            .expect("the restored order must have a realized outcome (cancel→restore→fill)");
+        assert_eq!(
+            realized.kind,
+            crate::report::FillKind::TookProfit,
+            "the restored order fills on the clean bar and runs to TP, got {:?}",
+            realized.kind
+        );
+        let clean_bar: DateTime<Utc> = "2026-07-08T22:00:00Z".parse().unwrap();
+        let spike_bar: DateTime<Utc> = "2026-07-08T21:00:00Z".parse().unwrap();
+        assert_eq!(
+            realized.fill_at, clean_bar,
+            "the fill must land on the 22:00Z clean bar, not the 21:00Z spread-hour spike"
+        );
+        assert_ne!(
+            realized.fill_at, spike_bar,
+            "the order must NOT fill on the rubbish spread-hour spike"
+        );
+
+        // The report reflects the taken TP (exactly one win, no loss).
+        let report = crate::report::render(
+            &eurusd_spread_hour_plan(),
+            &r,
+            true,
+            false,
+            &[],
+            None,
+            &no_marks(),
+        );
+        assert!(
+            report.contains("TOOK PROFIT"),
+            "the restored order must show its TP fill:\n{report}"
+        );
+        assert!(
+            report.contains("TP: 1  SL: 0"),
+            "exactly one taken position (the restored order's TP), no loss:\n{report}"
+        );
+    }
+
+    /// The predicate-false twin: the SAME setup on a CLEAN hour is NOT cancelled
+    /// by the lifecycle — the resting order fills as normal. Proves the lifecycle
+    /// only acts in a spread hour (the ON trigger), so it can't be silently
+    /// cancelling every resting order.
+    #[tokio::test]
+    async fn clean_hour_resting_order_is_not_cancelled_and_fills() {
+        // Identical geometry in the 00:00Z..12:00Z clean stretch (no EUR/USD spread
+        // hour — its only spread hour is 21:00Z): 10 warm-up bars, the enter fires
+        // at 12:00Z and the stop fills on the 13:00Z bar, uncancelled.
+        let mut candles: Vec<EngineCandle> = (2..12)
+            .map(|h| {
+                ohlc_at(
+                    &format!("2026-07-08T{h:02}:00:00Z"),
+                    1.1020,
+                    1.1022,
+                    1.1018,
+                    1.1020,
+                )
+            })
+            .collect();
+        // 12:00Z: closes below 1.1010 → enter fires, short stop rests @1.1000.
+        candles.push(ohlc_at(
+            "2026-07-08T12:00:00Z",
+            1.1016,
+            1.1017,
+            1.1006,
+            1.1008,
+        ));
+        // 13:00Z CLEAN: straddles 1.1000 → fills here (no spread-hour cancel).
+        candles.push(ohlc_at(
+            "2026-07-08T13:00:00Z",
+            1.1002,
+            1.1004,
+            1.0995,
+            1.0999,
+        ));
+        // 14:00Z: runs to TP 1.0950.
+        candles.push(ohlc_at(
+            "2026-07-08T14:00:00Z",
+            1.0995,
+            1.0997,
+            1.0948,
+            1.0951,
+        ));
+        let live_at: DateTime<Utc> = "2026-07-08T12:00:00Z".parse().unwrap();
+        let expires_at: DateTime<Utc> = "2026-07-10T00:00:00Z".parse().unwrap();
+
+        let r = run(
+            &eurusd_spread_hour_plan(),
+            &candles,
+            Granularity::H1,
+            live_at,
+            expires_at,
+            no_marks(),
+        )
+        .await;
+
+        let enter = r
+            .fires
+            .iter()
+            .find(|f| f.fired.rule_id == "05-enter")
+            .expect("the short enter must fire on the 12:00Z down-cross");
+        let realized = enter
+            .realized
+            .as_ref()
+            .expect("a clean-hour resting order must fill (not cancelled)");
+        assert!(
+            realized.kind.is_taken(),
+            "the clean-hour order fills — a taken outcome, got {:?}",
+            realized.kind
+        );
+    }
+
+    /// The **multi-shot** twin of [`eurusd_spread_hour_plan`] (`max_retries: 1`).
+    /// A multi-shot enter keeps the plan in `AwaitEntry` after firing (the engine
+    /// does NOT retire it), so the replay loop runs on into the spread hour and the
+    /// shared `pending_order_lifecycle` genuinely lists + cancels the resting order.
+    fn eurusd_spread_hour_plan_multishot() -> TradePlan {
+        serde_json::from_str(
+            r#"{
+                "trade_id": "eurusd-sh-ms",
+                "instrument": "EUR/USD",
+                "direction": "short",
+                "granularity": "h1",
+                "pip_size": 0.0001,
+                "rules": [
+                    {
+                        "rule_id": "05-enter",
+                        "trigger": { "type": "horizontal_cross", "level": 1.1010, "dir": "down", "bar": "on_close" },
+                        "fire_mode": "once",
+                        "intent": {
+                            "v": 1, "id": "eurusd-sh-ms-enter", "not_after": "2099-01-01T00:00:00Z",
+                            "action": "enter", "instrument": "EUR/USD", "direction": "short",
+                            "entry": { "type": "stop", "from": "close", "offset_pips": 0.0, "at": 1.1000 },
+                            "stop_loss": { "absolute": 1.1020 },
+                            "take_profit": { "absolute": 1.0950 },
+                            "broker": "tradenation", "trade_id": "eurusd-sh-ms", "max_retries": 1,
+                            "pip_size": 0.0001
+                        }
+                    }
+                ]
+            }"#,
+        )
+        .expect("parse EUR/USD multi-shot spread-hour plan")
+    }
+
+    /// GOLDEN (the real AUD/CHF QM cancel→restore mechanism, on EUR/USD's compact
+    /// 1h block): a **multi-shot** resting order still pending when the 21:00Z
+    /// spread hour arrives is **cancelled by the shared lifecycle** on the spike
+    /// bar (engine → `broker.cancel_order`), held cancelled through the block, then
+    /// **RESTORED (re-driven → reactivated, `cancelled=false`)** once the block
+    /// lifts, so it **fills on the clean 22:00Z bar** and runs to TP. The full
+    /// cancel→restore→fill sequence the live path runs, end to end.
+    ///
+    /// This is the mechanism PR 4b-4 repaired. Two bugs had to be fixed for the
+    /// restore to actually happen (both in the SHARED core path, so LIVE gets the
+    /// same fix):
+    ///   1. **Retry-gate bypass on restore** (`run_enter(.., restore = true)`).
+    ///      The RAIL-7 re-drive carries the ORIGINAL fire's `shell.time`, which the
+    ///      retry gate had already marked seen — so a multi-shot order's restore was
+    ///      `retry-fire-replay`-REJECTED and never re-placed. A restore is a
+    ///      re-placement of a known-cancelled order, not a fresh fire, so it now
+    ///      skips the retry gate (exactly as single-shot already did).
+    ///   2. **Reactivate match on the STABLE key.** The restore re-drives through
+    ///      `run_enter`, which re-floors the SL at the restore bar, so the
+    ///      re-floored SL differs from the original. `reactivate_matching_cancelled`
+    ///      matches on instrument + direction + entry trigger (stable), not the
+    ///      re-floored SL/TP.
+    ///
+    /// Asserts on BOTH `enter.realized` (the ledger) AND the rendered report text /
+    /// `Net R` / `TP:/SL:`, so the split-brain (report re-simulating a phantom fill
+    /// blind to the cancel) can never regress silently. EUR/USD's block is 1h
+    /// (21:00–22:00Z) so the block lifts well inside the record's backstop — it does
+    /// NOT hit the 8h-block-vs-3h-backstop record-expiry race that AUD/CHF's
+    /// overnight block does (a separate, flagged follow-up).
+    #[tokio::test]
+    async fn multishot_spread_hour_order_is_cancelled_then_restored_and_fills() {
+        // 10 warm-up bars above 1.1010 so the live window starts at 19:00Z.
+        let mut candles: Vec<EngineCandle> = (9..19)
+            .map(|h| {
+                ohlc_at(
+                    &format!("2026-07-08T{h:02}:00:00Z"),
+                    1.1020,
+                    1.1022,
+                    1.1018,
+                    1.1020,
+                )
+            })
+            .collect();
+        // 19:00Z (close 20:00Z, clean): closes below 1.1010 → 05-enter fires, short
+        // stop rests @1.1000. Low 1.1006 stays above the trigger — no touch. The
+        // multi-shot enter keeps the plan in AwaitEntry, so the loop runs on.
+        candles.push(ohlc_at(
+            "2026-07-08T19:00:00Z",
+            1.1016,
+            1.1017,
+            1.1006,
+            1.1008,
+        ));
+        // 20:00Z (close 21:00Z = SPREAD HOUR): low 1.1005 keeps the order untouched;
+        // the lifecycle CANCELS the still-resting order here (now=21:00Z).
+        candles.push(ohlc_at(
+            "2026-07-08T20:00:00Z",
+            1.1008,
+            1.1009,
+            1.1005,
+            1.1007,
+        ));
+        // 21:00Z (open = spread-hour spike): straddles 1.1000 (low 1.0995), but the
+        // order is cancelled (held through the block) so no fill lands here.
+        candles.push(ohlc_at(
+            "2026-07-08T21:00:00Z",
+            1.1002,
+            1.1004,
+            1.0995,
+            1.0999,
+        ));
+        // 22:00Z CLEAN (block lifted): the lifecycle RESTORES (reactivates) the
+        // order, it rests again, and price re-reaches 1.1000 → FILLS here.
+        candles.push(ohlc_at(
+            "2026-07-08T22:00:00Z",
+            1.1001,
+            1.1003,
+            1.0994,
+            1.0997,
+        ));
+        // 23:00Z: runs to TP 1.0950.
+        candles.push(ohlc_at(
+            "2026-07-08T23:00:00Z",
+            1.0995,
+            1.0997,
+            1.0948,
+            1.0951,
+        ));
+        let live_at: DateTime<Utc> = "2026-07-08T19:00:00Z".parse().unwrap();
+        let expires_at: DateTime<Utc> = "2026-07-10T00:00:00Z".parse().unwrap();
+
+        let r = run(
+            &eurusd_spread_hour_plan_multishot(),
+            &candles,
+            Granularity::H1,
+            live_at,
+            expires_at,
+            no_marks(),
+        )
+        .await;
+
+        // The enter fired (the down-cross) and placed the resting short-stop.
+        let enter = r
+            .fires
+            .iter()
+            .find(|f| f.fired.rule_id == "05-enter")
+            .expect("the short enter must fire on the 19:00Z down-cross");
+
+        // MECHANISM: cancelled in the block, RESTORED (reactivated) when it lifts,
+        // fills on the clean 22:00Z bar and runs to TP — a real ledger outcome, NOT
+        // `None`. The fill must land on 22:00Z (the clean bar), never the 21:00Z
+        // spike (the `find_fill` spread-hour skip still blocks the rubbish bar).
+        let realized = enter
+            .realized
+            .as_ref()
+            .expect("the restored order must have a realized outcome (cancel→restore→fill)");
+        assert_eq!(
+            realized.kind,
+            crate::report::FillKind::TookProfit,
+            "the restored order fills on the clean bar and runs to TP, got {:?}",
+            realized.kind
+        );
+        assert_eq!(
+            realized.fill_at,
+            "2026-07-08T22:00:00Z".parse::<DateTime<Utc>>().unwrap(),
+            "the restored order must fill on the 22:00Z clean bar, not the 21:00Z spike"
+        );
+
+        // REPORT TEXT agrees with the ledger — the split-brain guard. Exactly one
+        // taken position (the restored order's TP), no loss, positive Net R.
+        let report = crate::report::render(
+            &eurusd_spread_hour_plan_multishot(),
+            &r,
+            true,
+            false,
+            &[],
+            None,
+            &no_marks(),
+        );
+        assert!(
+            report.contains("TOOK PROFIT"),
+            "the restored order must show its TP fill in the journal:\n{report}"
+        );
+        assert!(
+            !report.contains("NO FILL"),
+            "the restored order fills — the journal must NOT show a NO FILL line:\n{report}"
+        );
+        assert!(
+            report.contains("TP: 1  SL: 0"),
+            "exactly one taken position (the restored order's TP), no loss:\n{report}"
+        );
+    }
+
+    /// A **multi-shot AUD/CHF** plan — the real 2026-07-08 QM instrument, whose
+    /// baked spread block is the 8h overnight run (21:00–05:00Z), NOT a single
+    /// hour. Exercises the backstop SPLIT: the cancel-record's TTL must be sized to
+    /// the 8h block (concern 1) so it OUTLIVES the block; the order is then restored
+    /// at the block lift by the normal `off_now` path, NOT the safety ceiling. This
+    /// is the regression guard for the TTL-vs-block relationship — with the old flat
+    /// 3h TTL the record expired at 00:00Z (mid-block) and the order was never
+    /// restored (0R).
+    fn audchf_spread_block_plan_multishot() -> TradePlan {
+        serde_json::from_str(
+            r#"{
+                "trade_id": "audchf-sh-ms",
+                "instrument": "AUD/CHF",
+                "direction": "short",
+                "granularity": "h1",
+                "pip_size": 0.0001,
+                "rules": [
+                    {
+                        "rule_id": "05-enter",
+                        "trigger": { "type": "horizontal_cross", "level": 0.5610, "dir": "down", "bar": "on_close" },
+                        "fire_mode": "once",
+                        "intent": {
+                            "v": 1, "id": "audchf-sh-ms-enter", "not_after": "2099-01-01T00:00:00Z",
+                            "action": "enter", "instrument": "AUD/CHF", "direction": "short",
+                            "entry": { "type": "stop", "from": "close", "offset_pips": 0.0, "at": 0.5600 },
+                            "stop_loss": { "absolute": 0.5620 },
+                            "take_profit": { "absolute": 0.5560 },
+                            "broker": "tradenation", "trade_id": "audchf-sh-ms", "max_retries": 1,
+                            "pip_size": 0.0001
+                        }
+                    }
+                ]
+            }"#,
+        )
+        .expect("parse AUD/CHF multi-shot spread-block plan")
+    }
+
+    /// GOLDEN (multi-hour block): a multi-shot AUD/CHF resting order cancelled at
+    /// the 21:00Z block start is held cancelled ACROSS the full 8h overnight block
+    /// (its record TTL sized to the block, so it never expires mid-block), then
+    /// restored at the block lift and filled on a clean post-block bar → TP. The
+    /// TTL-vs-block regression guard: assert the fill lands AFTER the block start
+    /// (a genuinely deferred entry) and the journal shows a taken TP, not a 0R
+    /// no-fill.
+    #[tokio::test]
+    async fn multishot_multi_hour_block_order_is_held_then_restored_at_block_end() {
+        // Warm-up bars above 0.5610 through the daytime (clean) hours, so the live
+        // window starts at 19:00Z (2 clean bars before the 21:00Z block start).
+        let mut candles: Vec<EngineCandle> = (9..19)
+            .map(|h| {
+                ohlc_at(
+                    &format!("2026-07-08T{h:02}:00:00Z"),
+                    0.5620,
+                    0.5622,
+                    0.5618,
+                    0.5620,
+                )
+            })
+            .collect();
+        // 19:00Z (clean): closes below 0.5610 → 05-enter fires, short stop rests
+        // @0.5600. Low 0.5606 stays above the trigger — no touch. Multi-shot keeps
+        // the plan AwaitEntry so the loop runs on into the block.
+        candles.push(ohlc_at(
+            "2026-07-08T19:00:00Z",
+            0.5616,
+            0.5617,
+            0.5606,
+            0.5608,
+        ));
+        // 20:00Z (close 21:00Z = BLOCK START): low 0.5605 keeps the order untouched;
+        // the lifecycle CANCELS the resting order here (now=21:00Z, in-block).
+        candles.push(ohlc_at(
+            "2026-07-08T20:00:00Z",
+            0.5608,
+            0.5609,
+            0.5605,
+            0.5607,
+        ));
+        // 21:00Z .. 04:00Z — the 8h overnight block. The order is held cancelled the
+        // whole way; even bars whose low dips to the trigger must NOT fill (order is
+        // cancelled). Keep lows just above 0.5600 so geometry is unambiguous.
+        for h in [21u32, 22, 23] {
+            candles.push(ohlc_at(
+                &format!("2026-07-08T{h:02}:00:00Z"),
+                0.5606,
+                0.5608,
+                0.5602,
+                0.5605,
+            ));
+        }
+        for h in [0u32, 1, 2, 3, 4] {
+            candles.push(ohlc_at(
+                &format!("2026-07-09T{h:02}:00:00Z"),
+                0.5606,
+                0.5608,
+                0.5602,
+                0.5605,
+            ));
+        }
+        // 05:00Z / 06:00Z — the block lifts here. The order is restored, rests, and
+        // the 06:00Z bar's low 0.5599 reaches the 0.5600 trigger → FILLS.
+        candles.push(ohlc_at(
+            "2026-07-09T05:00:00Z",
+            0.5605,
+            0.5607,
+            0.5601,
+            0.5603,
+        ));
+        candles.push(ohlc_at(
+            "2026-07-09T06:00:00Z",
+            0.5602,
+            0.5603,
+            0.5599,
+            0.5601,
+        ));
+        // 07:00Z: runs to TP 0.5560.
+        candles.push(ohlc_at(
+            "2026-07-09T07:00:00Z",
+            0.5600,
+            0.5601,
+            0.5558,
+            0.5560,
+        ));
+        let live_at: DateTime<Utc> = "2026-07-08T19:00:00Z".parse().unwrap();
+        let expires_at: DateTime<Utc> = "2026-07-11T00:00:00Z".parse().unwrap();
+
+        let r = run(
+            &audchf_spread_block_plan_multishot(),
+            &candles,
+            Granularity::H1,
+            live_at,
+            expires_at,
+            no_marks(),
+        )
+        .await;
+
+        let enter = r
+            .fires
+            .iter()
+            .find(|f| f.fired.rule_id == "05-enter")
+            .expect("the short enter must fire on the 19:00Z down-cross");
+
+        // MECHANISM: cancelled at 21:00Z, held across the full 8h block (the record
+        // TTL outlives it), restored at the block lift, filled on a clean post-block
+        // bar. The realized fill must exist (not None) and land AFTER the 21:00Z
+        // block start — a genuinely deferred entry, the operator's intent.
+        let realized = enter
+            .realized
+            .as_ref()
+            .expect("the held-then-restored order must fill after the block (cancel→hold→restore)");
+        assert!(
+            realized.kind.is_taken(),
+            "the restored order fills after the block — a taken outcome, got {:?}",
+            realized.kind
+        );
+        let block_start: DateTime<Utc> = "2026-07-08T21:00:00Z".parse().unwrap();
+        assert!(
+            realized.fill_at > block_start,
+            "the entry must be DEFERRED past the 21:00Z block start (held cancelled across the \
+             block), filled at {}",
+            realized.fill_at
+        );
+
+        // REPORT TEXT: a taken position with a positive Net R, NOT a 0R no-fill (the
+        // old flat-3h-TTL bug expired the record mid-block → NO FILL / 0R).
+        let report = crate::report::render(
+            &audchf_spread_block_plan_multishot(),
+            &r,
+            true,
+            false,
+            &[],
+            None,
+            &no_marks(),
+        );
+        assert!(
+            !report.contains("NO FILL"),
+            "the deferred order fills after the block — NOT a NO FILL / 0R:\n{report}"
+        );
+        assert!(
+            report.contains("TP: 1  SL: 0"),
+            "exactly one taken position (the deferred order's TP):\n{report}"
         );
     }
 }

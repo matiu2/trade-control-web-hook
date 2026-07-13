@@ -466,9 +466,31 @@ fn find_fill<'a>(
                     .unwrap_or(&[]),
                 None => after_fire,
             };
-            let i = fill_window
-                .iter()
-                .position(|c| book_reaches(c, entry_book, trigger_price, entry_approach))?;
+            // Spread-hour "rubbish candle": a pending Stop/Limit whose trigger is
+            // first reached on a learned spread hour must NOT fill there — the
+            // bar is a liquidity-vacuum spike, not a real touch (the AUD/CHF
+            // 2026-07-08 fill-into-the-spread-hour case). The order stays resting
+            // and fills on the next clean bar. Mirrors the worker's entry gate so
+            // replay == live. See SCOPING-spread-hour-rubbish-candle.md.
+            //
+            // PR 4b-3 relationship (KEPT — option a, not removed): the shared
+            // `pending_order_lifecycle` now *cancels* a resting order in a spread
+            // hour at the broker, and `resolve()` reads THIS skip to report the
+            // order as still-`Pending` on the spike bar — which is exactly what
+            // lets the lifecycle *see* it as resting and cancel it. So the two are
+            // complementary, not duplicate: this skip keeps the fill from landing
+            // on the spike (and is the resting-state the lifecycle acts on); the
+            // lifecycle is the live-matching cancel+backup. Removing this skip
+            // would (1) break the engine's own `pending_stop_does_not_fill_*`
+            // tests and (2) make `resolve()` report the order FILLED on the spike
+            // bar, so the lifecycle would never see it resting to cancel it.
+            let i = fill_window.iter().position(|c| {
+                book_reaches(c, entry_book, trigger_price, entry_approach)
+                    && !trade_control_core::spread_blackout::is_spread_hour(
+                        &intent.instrument,
+                        c.time,
+                    )
+            })?;
             // `i` indexes `fill_window` (a prefix of `after_fire`), so the fill
             // bar is `candles[i + 1]`. The post-fill search **includes** the fill
             // bar itself (`candles[i + 1..]`): an order that fills mid-bar can be
@@ -860,30 +882,31 @@ pub fn widened_stop_at(
 /// When the live recovery watcher (`blackout_watch::watch_recovery`) would
 /// restore the widened stop, reconstructed from the post-widen candle path.
 ///
-/// Mirrors the two live restore triggers (Safety Rules 1 & 2 in
-/// `blackout_watch`): the first bar whose spread has dropped to/under the
-/// recovered cutoff (`SPREAD_BLACKOUT_RECOVERED_PIPS`, 4 pips) — clock-agnostic,
-/// so recovery is NOT gated on the NY-close edge — or, failing that, the 3-hour
-/// backstop (`BLACKOUT_BACKSTOP_SECONDS`), whichever comes first. `bars` are the
-/// candles strictly after the widen bar; `widen_at` is the widen bar's open
-/// time. `None` when neither trigger lands within the provided path (the widen
-/// is still active at the window's end).
+/// Mirrors the live restore triggers in `blackout_watch::watch_one`: the first
+/// bar whose spread has dropped to/under the recovered cutoff
+/// (`SPREAD_BLACKOUT_RECOVERED_PIPS`, 4 pips) — clock-agnostic, so recovery is
+/// NOT gated on the NY-close edge — or, failing that, the safety force-restore
+/// ceiling (`SAFETY_FORCE_RESTORE_SECONDS`, 12h; the last-resort timer, no longer
+/// the per-record TTL after the 2026-07 backstop split), whichever comes first.
+/// `bars` are the candles strictly after the widen bar; `widen_at` is the widen
+/// bar's open time. `None` when neither trigger lands within the provided path
+/// (the widen is still active at the window's end).
 fn restore_bar(
     bars: &[BidAskCandle],
     widen_at: chrono::DateTime<chrono::Utc>,
     pip_size: f64,
 ) -> Option<chrono::DateTime<chrono::Utc>> {
     let recovered_cutoff = trade_control_core::spread_blackout::SPREAD_BLACKOUT_RECOVERED_PIPS;
-    let backstop_secs = trade_control_core::spread_blackout::BLACKOUT_BACKSTOP_SECONDS;
-    let backstop_at = widen_at + chrono::Duration::seconds(backstop_secs as i64);
+    let safety_secs = trade_control_core::spread_blackout::SAFETY_FORCE_RESTORE_SECONDS;
+    let safety_at = widen_at + chrono::Duration::seconds(safety_secs as i64);
     for c in bars {
-        // Backstop fires first if this bar is at/after the 3h mark, regardless
-        // of spread — the live watcher clears unconditionally there.
-        if c.time >= backstop_at {
-            return Some(c.time);
-        }
+        // Recovery first (the normal path): the spread dropping back to normal.
         let spread_pips = (c.ask_c - c.bid_c) / pip_size;
         if spread_pips.is_finite() && spread_pips <= recovered_cutoff {
+            return Some(c.time);
+        }
+        // Safety force-restore: this bar is at/after the 12h last-resort ceiling.
+        if c.time >= safety_at {
             return Some(c.time);
         }
     }
@@ -1333,6 +1356,67 @@ mod tests {
                 );
             }
             other => panic!("gapped-through short stop must fill, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pending_stop_does_not_fill_on_a_spread_hour_bar() {
+        // A resting sell-stop (trigger 1.1000) whose price is first reached on a
+        // 21:00Z spread-hour bar must NOT fill there — the candle is a rubbish
+        // liquidity-vacuum spike. The order stays resting and fills on the next
+        // CLEAN bar (23:00Z), then takes profit. Mirrors the AUD/CHF 2026-07-08
+        // fill-into-the-spread-hour case that motivated this. `EUR_USD` is
+        // un-sampled, so `is_spread_hour` uses the 21:00Z NY-close-edge fallback.
+        let intent = short_stop_intent();
+        let shell = trigger_shell();
+        let path = [
+            // fire bar (skipped), well before the spread hour.
+            candle("2026-06-17T20:00:00Z", 1.1042, 1.1045, 1.1041, 1.1043),
+            // 21:00Z SPREAD HOUR: range straddles the 1.1000 trigger (low 1.0990)
+            // — WOULD fill, but is rubbish → skipped.
+            candle("2026-06-17T21:00:00Z", 1.0998, 1.1002, 1.0990, 1.0995),
+            // 23:00Z CLEAN: reaches the trigger again → fills here.
+            candle("2026-06-17T23:00:00Z", 1.0999, 1.1001, 1.0992, 1.0996),
+            // TP bar: runs to 1.0950.
+            candle("2026-06-18T00:00:00Z", 1.0994, 1.0996, 1.0945, 1.0948),
+        ];
+        match simulate_fill(&intent, &shell, 0.0001, &path) {
+            SimOutcome::TookProfit {
+                fill_at,
+                entry_price,
+                ..
+            } => {
+                assert_eq!(
+                    fill_at,
+                    ts("2026-06-17T23:00:00Z"),
+                    "fill must skip the 21:00Z spread-hour bar and land on the clean 23:00Z bar"
+                );
+                assert!((entry_price - 1.1000).abs() < 1e-9);
+            }
+            other => panic!("expected a clean-bar fill then TP, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pending_stop_fills_on_the_same_bar_off_a_spread_hour() {
+        // Predicate-false twin: the exact same fill bar on a NON-edge hour fills
+        // immediately (byte-identical to today). 12:00Z is not an NY-close edge.
+        let intent = short_stop_intent();
+        let shell = trigger_shell();
+        let path = [
+            candle("2026-06-17T10:30:00Z", 1.1042, 1.1045, 1.1041, 1.1043),
+            candle("2026-06-17T11:00:00Z", 1.0998, 1.1002, 1.0990, 1.0995),
+            candle("2026-06-17T12:00:00Z", 1.0994, 1.0996, 1.0945, 1.0948),
+        ];
+        match simulate_fill(&intent, &shell, 0.0001, &path) {
+            SimOutcome::TookProfit { fill_at, .. } => {
+                assert_eq!(
+                    fill_at,
+                    ts("2026-06-17T11:00:00Z"),
+                    "a clean-hour bar fills immediately as today"
+                );
+            }
+            other => panic!("expected an immediate fill then TP, got {other:?}"),
         }
     }
 
@@ -2020,29 +2104,32 @@ mod tests {
         );
     }
 
-    /// The 3-hour backstop restores even if the spread stays elevated — the live
-    /// watcher's Safety Rule 2. A bar ≥ 3h after the widen restores regardless
-    /// of its (still-wide) spread.
+    /// The SAFETY force-restore ceiling restores even if the spread stays
+    /// elevated — the live watcher's last-resort rule. After the 2026-07 backstop
+    /// split it is 12h (`SAFETY_FORCE_RESTORE_SECONDS`), not 3h — long enough to
+    /// never fire mid-block. A bar ≥ 12h after the widen restores regardless of
+    /// its (still-wide) spread.
     #[test]
-    fn widened_stop_at_restore_fires_on_the_backstop() {
+    fn widened_stop_at_restore_fires_on_the_safety_ceiling() {
         use trade_control_core::blackout_widen::WIDEN_FLOOR_PIPS;
         let mut intent = long_stop_intent();
         i_set_levels(&mut intent, 1.1000, 1.0950, 1.1100);
         let shell = trigger_shell();
         let fill_bar = candle("2026-06-17T11:00:00Z", 1.1000, 1.1001, 1.0999, 1.1000);
         let wide = ba_candle("2026-06-17T21:00:00Z", 1.10015, 1.10010, 1.10315, 1.10310);
-        // Still wide at +1h/+2h (no recovery), then a bar at +3h → backstop.
-        let hour1 = ba_candle("2026-06-17T22:00:00Z", 1.10015, 1.10010, 1.10315, 1.10310);
-        let hour2 = ba_candle("2026-06-17T23:00:00Z", 1.10015, 1.10010, 1.10315, 1.10310);
-        let backstop = ba_candle("2026-06-18T00:00:00Z", 1.10015, 1.10010, 1.10315, 1.10310);
-        let path = [fire_bar(), fill_bar, wide, hour1, hour2, backstop];
+        // Still wide 3h later (the OLD backstop mark — must NOT restore now), then
+        // a bar at +12h → the safety ceiling fires.
+        let hour3 = ba_candle("2026-06-18T00:00:00Z", 1.10015, 1.10010, 1.10315, 1.10310);
+        let safety = ba_candle("2026-06-18T09:00:00Z", 1.10015, 1.10010, 1.10315, 1.10310);
+        let path = [fire_bar(), fill_bar, wide, hour3, safety];
 
         let widen = widened_stop_at(&intent, &shell, 0.0001, &path, WIDEN_FLOOR_PIPS, None)
             .expect("the NY-close-edge bar must trip the widen");
         assert_eq!(
             widen.restored_at,
-            Some(backstop.time),
-            "the 3h backstop must restore even with the spread still wide"
+            Some(safety.time),
+            "the 12h safety ceiling must restore even with the spread still wide; \
+             the old 3h bar must NOT have restored"
         );
     }
 

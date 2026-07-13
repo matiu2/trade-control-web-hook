@@ -100,6 +100,13 @@ pub struct BarTrace {
     /// which is the fired-then-declined case. Only set on a marked bar with no
     /// fire and no decline; `None` otherwise.
     pub not_taken: Option<String>,
+    /// This bar is a learned **spread hour** for the instrument (per-instrument
+    /// baked mask + 30-min lead, or the NY-close-edge fallback) — a rubbish
+    /// liquidity-vacuum candle. The engine suppresses entries, signal detection,
+    /// and level crosses on it (shared with the worker), so a golden that prints
+    /// here (still marked in the detector summary) does NOT fire. Rendered so the
+    /// "golden but no fire" isn't a silent mystery.
+    pub spread_hour: bool,
 }
 
 impl BarTrace {
@@ -107,6 +114,7 @@ impl BarTrace {
     /// the ids the engine reported firing this bar (the caller pulls them from
     /// `PlanEval::fired`). The stamp flags are edge-triggered: `None → Some` only,
     /// so a stamp set on an earlier bar isn't re-reported.
+    #[allow(clippy::too_many_arguments)]
     pub fn diff(
         bar: DateTime<Utc>,
         before: &PlanState,
@@ -115,6 +123,7 @@ impl BarTrace {
         detected: Option<DetectedMark>,
         entry_declines: Vec<String>,
         not_taken: Option<String>,
+        spread_hour: bool,
     ) -> Self {
         let phase_from = (before.phase != after.phase).then_some(before.phase);
         let break_close_stamped = before.break_close_at.is_none() && after.break_close_at.is_some();
@@ -129,6 +138,7 @@ impl BarTrace {
             detected,
             entry_declines,
             not_taken,
+            spread_hour,
         }
     }
 
@@ -164,6 +174,15 @@ impl BarTrace {
         if let Some(mark) = &self.detected {
             out.push_str(&mark.render());
         }
+        // A spread-hour bar is rubbish: the engine suppressed entries, signal
+        // detection, and level crosses on it. Only surface it when a signal was
+        // MARKED here (else every spread hour would add noise) — that's the
+        // "golden printed but nothing fired" case that would otherwise mystify.
+        if self.spread_hour && self.detected.is_some() {
+            out.push_str(
+                "    ⌀ spread-hour (rubbish candle) — entry/detection/crosses suppressed\n",
+            );
+        }
         for reason in &self.entry_declines {
             out.push_str(&format!("    ✗ not entered: {reason}\n"));
         }
@@ -193,7 +212,7 @@ mod tests {
     #[test]
     fn quiet_bar_renders_empty() {
         let s = state(Phase::AwaitEntry);
-        let t = BarTrace::diff(at(16), &s, &s, Vec::new(), None, Vec::new(), None);
+        let t = BarTrace::diff(at(16), &s, &s, Vec::new(), None, Vec::new(), None, false);
         assert!(t.is_quiet());
         assert_eq!(t.render(), "");
     }
@@ -203,13 +222,31 @@ mod tests {
         let before = state(Phase::AwaitEntry);
         let mut after = before.clone();
         after.retest_seen_at = Some(at(16));
-        let t = BarTrace::diff(at(16), &before, &after, Vec::new(), None, Vec::new(), None);
+        let t = BarTrace::diff(
+            at(16),
+            &before,
+            &after,
+            Vec::new(),
+            None,
+            Vec::new(),
+            None,
+            false,
+        );
         assert!(t.retest_stamped);
         assert!(!t.is_quiet());
         assert!(t.render().contains("retest stamped"));
 
         // Already-set on the prior bar → not re-reported.
-        let t2 = BarTrace::diff(at(17), &after, &after, Vec::new(), None, Vec::new(), None);
+        let t2 = BarTrace::diff(
+            at(17),
+            &after,
+            &after,
+            Vec::new(),
+            None,
+            Vec::new(),
+            None,
+            false,
+        );
         assert!(!t2.retest_stamped);
         assert!(t2.is_quiet());
     }
@@ -220,7 +257,16 @@ mod tests {
         let mut after = before.clone();
         after.break_close_at = Some(at(15));
         after.phase = Phase::AwaitEntry;
-        let t = BarTrace::diff(at(15), &before, &after, Vec::new(), None, Vec::new(), None);
+        let t = BarTrace::diff(
+            at(15),
+            &before,
+            &after,
+            Vec::new(),
+            None,
+            Vec::new(),
+            None,
+            false,
+        );
         assert!(t.break_close_stamped);
         assert_eq!(t.phase_from, Some(Phase::AwaitBreakAndClose));
         let r = t.render();
@@ -241,6 +287,7 @@ mod tests {
             None,
             Vec::new(),
             None,
+            false,
         );
         let r = t.render();
         assert!(r.contains("→ fired 05-enter"));
@@ -258,6 +305,7 @@ mod tests {
             None,
             Vec::new(),
             None,
+            false,
         );
         assert!(!t.is_quiet());
         assert!(t.render().contains("→ fired 01-veto-too-low"));
@@ -276,7 +324,16 @@ mod tests {
             atr: Some(0.0031),
             golden: true,
         };
-        let t = BarTrace::diff(at(16), &s, &s, Vec::new(), Some(mark), Vec::new(), None);
+        let t = BarTrace::diff(
+            at(16),
+            &s,
+            &s,
+            Vec::new(),
+            Some(mark),
+            Vec::new(),
+            None,
+            false,
+        );
         assert!(!t.is_quiet());
         let r = t.render();
         assert!(r.contains("◆ GOLDEN"), "golden mark rendered: {r}");
@@ -294,9 +351,60 @@ mod tests {
             atr: Some(0.0031),
             golden: false,
         };
-        let t = BarTrace::diff(at(16), &s, &s, Vec::new(), Some(mark), Vec::new(), None);
+        let t = BarTrace::diff(
+            at(16),
+            &s,
+            &s,
+            Vec::new(),
+            Some(mark),
+            Vec::new(),
+            None,
+            false,
+        );
         let r = t.render();
         assert!(r.contains("◆ signal"), "non-golden mark: {r}");
         assert!(!r.contains("GOLDEN"), "not tagged golden: {r}");
+    }
+
+    /// A golden marked on a SPREAD-HOUR bar renders both the ◆ mark AND the
+    /// `⌀ spread-hour` line, so a golden that printed but didn't fire is
+    /// explained rather than silently missing.
+    #[test]
+    fn spread_hour_mark_renders_the_rubbish_note() {
+        let s = state(Phase::AwaitEntry);
+        let mark = DetectedMark {
+            direction: Direction::Short,
+            kind: SignalKind::Pinbar,
+            size: 0.0006,
+            atr: Some(0.0005),
+            golden: true,
+        };
+        let t = BarTrace::diff(
+            at(21),
+            &s,
+            &s,
+            Vec::new(),
+            Some(mark),
+            Vec::new(),
+            None,
+            true,
+        );
+        assert!(!t.is_quiet());
+        let r = t.render();
+        assert!(r.contains("◆ GOLDEN"), "golden still marked: {r}");
+        assert!(
+            r.contains("⌀ spread-hour"),
+            "rubbish-candle note rendered: {r}"
+        );
+    }
+
+    /// A spread-hour bar with NO detected mark stays quiet — we don't want every
+    /// spread hour adding a line to the trace.
+    #[test]
+    fn spread_hour_without_a_mark_stays_quiet() {
+        let s = state(Phase::AwaitEntry);
+        let t = BarTrace::diff(at(21), &s, &s, Vec::new(), None, Vec::new(), None, true);
+        assert!(t.is_quiet(), "spread hour alone is not noteworthy");
+        assert_eq!(t.render(), "");
     }
 }

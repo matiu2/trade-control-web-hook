@@ -23,15 +23,14 @@
 //! by design — a deliberate divergence, not a missing port.
 
 mod blackout_apply;
-mod blackout_cancel;
 mod blackout_hours;
-mod blackout_restore;
 mod blackout_watch;
 mod breakeven_watch;
 mod broker_handle;
 mod constants;
 mod engine;
 mod seam;
+mod spread_lifecycle;
 mod sweep;
 
 pub use broker_handle::BrokerHandle;
@@ -39,9 +38,7 @@ pub use engine::run_engine_tick;
 pub use seam::CronEnv;
 
 pub use blackout_apply::{apply_if_ny_close_edge, widen_open_stops_for_spread_hours};
-pub use blackout_cancel::cancel_resting_orders;
 pub use blackout_hours::refresh_if_due as refresh_market_hours_if_due;
-pub use blackout_restore::restore_cancelled_orders;
 pub use blackout_watch::watch_recovery;
 pub use breakeven_watch::watch as breakeven_watch;
 pub use sweep::sweep_pending_orders;

@@ -44,6 +44,7 @@ fn fmt_price_trim(v: f64) -> String {
 /// body is available (there is none today — both the HTTP path and the
 /// blackout re-drive supply it); a `None` simply skips the order-body write, so
 /// such an order can't be blackout-cancelled-and-restored.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_enter<B: Broker, S: StateStore>(
     broker: &B,
     store: &S,
@@ -59,6 +60,20 @@ pub async fn run_enter<B: Broker, S: StateStore>(
     // signed enter still carries its `breakeven` rule; only the cron snapshot
     // is skipped without a granularity to fetch on).
     enter_granularity: Option<crate::broker::Granularity>,
+    // `true` when this call is the spread-hour lifecycle **restoring** a resting
+    // order it earlier cancelled (RAIL 7), NOT a fresh alert fire or a multi-shot
+    // re-entry. A restore re-places the SAME order the lifecycle owns the
+    // cancel→restore correlation for, so it must bypass the retry gate entirely —
+    // exactly as a single-shot enter already does. Skipping the gate:
+    //   * avoids the same-bar `is_retry_fire_seen` dedup that would otherwise
+    //     `retry-fire-replay`-REJECT the re-drive (the original fire on this
+    //     `shell.time` was already marked seen when it first placed), and
+    //   * consumes NO `max_retries` slot / records no new `EntryAttempt` (the
+    //     re-placement continues the original attempt, it is not a new re-entry).
+    // Every non-restore caller passes `false` and keeps the full gate. This is the
+    // `restoring` flag the blackout-restore docstring anticipated as the correct
+    // long-term answer to "a multi-shot re-drive shouldn't burn a slot".
+    restore: bool,
 ) -> ActionResult {
     // Blackout gate — if any pause for this trade_id is active, reject
     // before doing any other work. Pauses are intentionally cheap to
@@ -110,10 +125,18 @@ pub async fn run_enter<B: Broker, S: StateStore>(
     // path (`max_retries: Static(0)`, the default) skips this branch
     // entirely so no new KV/broker calls land on the byte-identical
     // baseline.
-    let retry_attempt_no = if !matches!(
-        verified.intent.max_retries,
-        crate::tunable::Tunable::Static(0)
-    ) {
+    // A restore re-places an order the lifecycle already cancelled — it is
+    // neither a fresh fire nor a new multi-shot re-entry, so it skips the retry
+    // gate entirely (like single-shot). This is what un-blocks the cancel→restore
+    // sequence: without it, the re-drive of a multi-shot resting order is
+    // `retry-fire-replay`-rejected on its own already-seen `shell.time` and the
+    // order is never re-placed (a live-money bug for multi-shot resting orders,
+    // hidden until now behind the replay's phantom fill).
+    let retry_attempt_no = if !restore
+        && !matches!(
+            verified.intent.max_retries,
+            crate::tunable::Tunable::Static(0)
+        ) {
         match crate::retry_gate::evaluate(broker, store, &verified.intent, &verified.shell).await {
             crate::retry_gate::RetryGateOutcome::Proceed { next_attempt_no } => {
                 Some(next_attempt_no)
