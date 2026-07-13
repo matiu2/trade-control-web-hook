@@ -82,6 +82,48 @@ fn baked_candle_mask(instrument: &str) -> Option<u32> {
         .map(|(.., _reviewed, mask, _widen)| *mask)
 }
 
+/// The candle-derived `(elevated_hours_mask, hour_widen_frac[24])` for
+/// `instrument`, or `None` when it isn't in the candle table. Bit `h` of the
+/// mask ⇒ UTC hour `h` is a spread hour; `widen_frac[h]` is that hour's p90
+/// `spread/mid` **fraction** (0.0 when not elevated). Unlike the sampler's
+/// `baked_spread_hours` (pips), the widen here is a scale-free fraction — the
+/// System-2 consumer converts it to pips with a reference price + pip size via
+/// [`widen_frac_to_pips`].
+fn baked_candle_spread_hours(instrument: &str) -> Option<(u32, [f64; 24])> {
+    baseline_candle::SPREAD_BASELINE_CANDLE
+        .iter()
+        .find(|(_broker, symbol, ..)| *symbol == instrument)
+        .map(|(.., _reviewed, mask, widen)| (*mask, *widen))
+}
+
+/// Convert a candle-derived widen **fraction** (`spread/mid`) to pips, given a
+/// reference price near the current market and the instrument's pip size:
+/// `pips = frac × reference_price / pip_size`.
+///
+/// The reference price only needs to be within a fraction of a percent of the
+/// live mid (the stop-loss price or the current close both qualify) — a small
+/// error in it scales the widen by the same small fraction, negligible for a
+/// protective stop nudge. Pure; a non-finite input yields a non-finite result
+/// and the caller skips the widen upstream (as with a bad live spread).
+pub fn widen_frac_to_pips(frac: f64, reference_price: f64, pip_size: f64) -> f64 {
+    frac * reference_price / pip_size
+}
+
+/// The candle-derived pre-emptive widen **fraction** (`spread/mid`) for
+/// `instrument` at `now`, or `None` when `now` is not in (or within
+/// [`SPREAD_HOUR_LEAD_MINUTES`] of the start of) one of this instrument's
+/// candle-learned spread hours.
+///
+/// This is the candle-table twin of the sampler's [`spread_hour_widen_pips`],
+/// returning a scale-free fraction instead of pips (the caller converts via
+/// [`widen_frac_to_pips`]). Same lead look-ahead as the sampler path, driven by
+/// the same pure [`spread_hour_widen_for`] seam over the candle
+/// `(mask, widen_frac)`.
+pub fn spread_hour_widen_frac(instrument: &str, now: chrono::DateTime<chrono::Utc>) -> Option<f64> {
+    let (mask, widen) = baked_candle_spread_hours(instrument)?;
+    spread_hour_widen_for(mask, &widen, now)
+}
+
 /// The reject line, as a multiple of an instrument's *normal* (median)
 /// spread. The 2026-06-23 spread-hour data showed the post-NY-close
 /// blowout is an **FX** phenomenon — FX crosses spike 10–20× their normal
@@ -688,13 +730,48 @@ mod tests {
             "AUD/CHF 21:00Z (the −2R origin bar) must read as a baked spread hour"
         );
         // Widen at that hour is the p90 blowout — ~12p (the observed spread gap
-        // that straddled entry 0.55980 / SL 0.56070). Assert it is a real
-        // blowout (>= 10p), tolerant of sample-driven drift in the exact value.
-        let widen =
-            spread_hour_widen_pips("AUD/CHF", origin).expect("origin bar must carry a baked widen");
+        // that straddled entry 0.55980 / SL 0.56070). Via the candle path: the
+        // widen FRACTION converts to pips at the bracket price (~0.56, pip
+        // 0.0001). Assert it is a real blowout (>= 10p), tolerant of
+        // sample-driven drift in the exact value.
+        let frac = spread_hour_widen_frac("AUD/CHF", origin)
+            .expect("origin bar must carry a baked widen fraction");
+        let widen = widen_frac_to_pips(frac, 0.56, 0.0001);
         assert!(
             widen >= 10.0,
-            "AUD/CHF 21:00Z widen {widen} must be a >=10p blowout (observed ~12p)"
+            "AUD/CHF 21:00Z widen {widen}p must be a >=10p blowout (observed ~12p)"
+        );
+    }
+
+    /// `widen_frac_to_pips` converts a spread FRACTION to pips at a reference
+    /// price: `pips = frac × price / pip_size`. A 0.0004 (0.04%) fraction on a
+    /// EUR/USD-scale 1.10 price at pip 0.0001 → 4.4 pips.
+    #[test]
+    fn widen_frac_to_pips_converts_at_reference_price() {
+        let pips = widen_frac_to_pips(0.0004, 1.10, 0.0001);
+        assert!(
+            (pips - 4.4).abs() < 1e-9,
+            "0.04% of 1.10 / 0.0001 = 4.4p, got {pips}"
+        );
+        // A gold-scale example: 0.001 (0.1%) of 2400 at pip 0.01 → 240p.
+        let gold = widen_frac_to_pips(0.001, 2400.0, 0.01);
+        assert!(
+            (gold - 240.0).abs() < 1e-6,
+            "0.1% of 2400 / 0.01 = 240p, got {gold}"
+        );
+    }
+
+    /// The candle widen fraction is scale-free — the SAME fraction gives
+    /// proportionally larger pips at a larger price, which is exactly what a
+    /// per-instrument pip widen needs. Guards against a units regression.
+    #[test]
+    fn widen_frac_scales_with_price() {
+        let frac = 0.0005;
+        let cheap = widen_frac_to_pips(frac, 1.0, 0.0001);
+        let dear = widen_frac_to_pips(frac, 2.0, 0.0001);
+        assert!(
+            (dear - 2.0 * cheap).abs() < 1e-9,
+            "twice the price → twice the pips"
         );
     }
 

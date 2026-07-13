@@ -31,7 +31,7 @@ use chrono::{DateTime, Duration, Utc};
 use trade_control_core::blackout_widen::{clamp_widen, spread_hour_widen_size, widened_stop};
 use trade_control_core::broker::{AmendError, Broker, OpenPosition};
 use trade_control_core::ny_clock::is_ny_close_edge;
-use trade_control_core::spread_blackout::spread_hour_widen_pips;
+use trade_control_core::spread_blackout::{spread_hour_widen_frac, widen_frac_to_pips};
 use trade_control_core::state::{EntryAttempt, RememberedStop, SpreadBlackoutRecord, StateStore};
 
 use crate::broker_handle::BrokerHandle;
@@ -96,11 +96,14 @@ where
 /// overnight (18:00–06:00 UTC), EUR/USD spikes at 21:00, indices at their
 /// own hours — and the NY-close hour is nearly the emptiest peak. So the
 /// widen now gates per-instrument on
-/// [`spread_hour_widen_pips`](trade_control_core::spread_blackout::spread_hour_widen_pips):
-/// the baked mask says *when* (this instrument's elevated hours, with a
+/// [`spread_hour_widen_frac`](trade_control_core::spread_blackout::spread_hour_widen_frac):
+/// the candle mask says *when* (this instrument's elevated hours, with a
 /// ~30-min lead so the stop is out of the way before the top-of-hour spike)
-/// and the baked p90 says *how much*. Un-sampled instruments fall back to
-/// the legacy `is_ny_close_edge` gate via
+/// and the baked p90 **fraction** says *how much* (converted to pips at the
+/// stop-loss price via
+/// [`widen_frac_to_pips`](trade_control_core::spread_blackout::widen_frac_to_pips)).
+/// Instruments not in the candle table fall back to the legacy `is_ny_close_edge`
+/// gate via
 /// [`is_spread_hour`](trade_control_core::spread_blackout::is_spread_hour).
 ///
 /// Fires on **every** tick (the caller does not gate it) because the lead
@@ -223,13 +226,15 @@ async fn widen_one<S: StateStore>(
     };
 
     // Per-instrument spread-hour gate (cheap; do it before the join/quote).
-    // `Some(p90)` ⇒ this instrument IS in (or leading into) a learned spread
-    // hour now, and `p90` is the baked widen size. `None` ⇒ either this
-    // instrument has baked spread hours but now isn't one of them, OR it's
-    // un-sampled — disambiguate with the legacy NY-close-edge fallback so
-    // un-sampled assets keep their prior behaviour.
-    let baked_p90 = spread_hour_widen_pips(&position.instrument, now);
-    if baked_p90.is_none() && !is_ny_close_edge(now) {
+    // The candle table gives the widen as a scale-free FRACTION (`spread/mid`);
+    // we keep the fraction here (the pips conversion needs `pip_size`, resolved
+    // below after the join) and only gate on presence. `Some(frac)` ⇒ this
+    // instrument IS in (or leading into) a learned spread hour now. `None` ⇒
+    // either this instrument has candle spread hours but now isn't one, OR it's
+    // not in the candle table — disambiguate with the legacy NY-close-edge
+    // fallback so uncovered assets keep their prior behaviour.
+    let baked_widen_frac = spread_hour_widen_frac(&position.instrument, now);
+    if baked_widen_frac.is_none() && !is_ny_close_edge(now) {
         // Not a spread hour for this instrument, and not the legacy fallback
         // edge either → nothing to widen this tick. (Silent: the common case
         // on most ticks for most instruments.)
@@ -292,11 +297,16 @@ async fn widen_one<S: StateStore>(
         return;
     };
     let spread_pips = spread_abs / pip_size;
+    // Convert the candle widen FRACTION → pips now that `pip_size` is known,
+    // using the stop-loss price as the reference (near the live mid; a small
+    // error scales the widen by the same small fraction — negligible).
+    let baked_p90 = baked_widen_frac.map(|frac| widen_frac_to_pips(frac, original_sl, pip_size));
     // Widen size: with a baked per-instrument p90 for this spread hour, blend
     // it with the live spread (baked primary, live as a floor, per-instrument
-    // ceiling) via `spread_hour_widen_size`. Without one (an un-sampled
-    // instrument on the legacy NY-close-edge fallback), keep the flat 22–40
-    // `clamp_widen`. See `blackout_widen` for the documented blend rationale.
+    // ceiling) via `spread_hour_widen_size`. Without one (an instrument not in
+    // the candle table, on the legacy NY-close-edge fallback), keep the flat
+    // 22–40 `clamp_widen`. See `blackout_widen` for the documented blend
+    // rationale.
     let widen_pips = match baked_p90 {
         Some(p90) => spread_hour_widen_size(p90, spread_pips),
         None => clamp_widen(spread_pips),
