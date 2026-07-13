@@ -1,5 +1,70 @@
 # Changelog
 
+## v89 — 2026-07-13 — shared spread-hour pending-order lifecycle: replay ≡ live
+
+**Why.** v88 suppressed *originating* off a spread-hour bar, but a resting order
+placed on a clean bar and still pending when the spread hour arrived was handled
+by two *parallel* code paths — the offline replay reconstructed the outcome in its
+report layer, while the live worker ran its own hand-rolled `blackout_cancel` /
+`blackout_watch` / `blackout_restore` cron. They could drift, and the replay's
+`--start 2026-07-08T23:00+10 --strategy-v2` (AUD/CHF) reported −1R as a **phantom**
+(the report re-simulating a cancelled order as if it never cancelled). Worse, the
+restore never actually worked: a multi-shot resting order's re-drive was silently
+rejected by the retry-fire dedup — **in the live worker too**, hidden behind the
+replay phantom.
+
+**What changed.** One shared `trade_control_core::pending_lifecycle::
+pending_order_lifecycle`, generic over `Broker` + `StateStore`, is now the single
+source of the spread-hour resting-order cancel/restore decision (System 3). Both
+the offline replay and the live cron call it — replay and live run the *identical*
+code.
+
+- **Replay** drives it per bar via the `ReplayBroker` (a stateful position ledger)
+  + the armed-`Verified` seam; the report reads the broker's realized outcome
+  (`fire.realized`) instead of re-simulating (`render_fire` no longer calls
+  `simulate_fill_windowed`). The −1R is now **by mechanism**: cancel at the 21:00Z
+  block start → held across AUD/CHF's 8h overnight block → genuine re-activation at
+  the 06:00Z block lift → fill ~Brisbane 16:00 → stop −1R.
+- **Live cron** (PR 2 cutover): `blackout_cancel.rs` + `blackout_restore.rs`
+  deleted (−758 lines); a 106-line `spread_lifecycle.rs` driver acquires the
+  account broker, matches once to `impl Broker`, and calls the shared fn. The live
+  cancel **trigger flips from a live-quote spread sample to the baked clock**
+  (`is_spread_hour`) — deterministic, identical to replay.
+
+**Fixes surfaced along the way.**
+- **Multi-shot restore un-blocked** (live + replay): `run_enter(restore: true)`
+  skips the retry gate (a restore re-places an order the lifecycle already
+  cancelled — not a fresh fire or a new re-entry), so it no longer
+  `retry-fire-replay`-rejects on its own already-seen `shell.time`, and burns no
+  `max_retries` slot.
+- **Blackout backstop split** (`BLACKOUT_BACKSTOP_SECONDS` was one constant doing
+  two jobs): per-record TTL = block length + grace (`spread_block_ttl_seconds`
+  walks the baked hour mask) so the cancel-record always outlives its block; a
+  separate `SAFETY_FORCE_RESTORE_SECONDS` (12h, longer than any block) is the
+  last-resort force-restore ceiling — it can no longer fire *into* an active block
+  (the old 3h ceiling expired mid-block for AUD/CHF's 8h block → no restore).
+- **Multi-account isolation**: `recover_pass` is account-scoped
+  (`record.account == account`), symmetric with the already-scoped cancel side.
+
+**Breaking.** `run_enter` gains a `restore: bool` param (all non-restore callers
+pass `false`). `pending_order_lifecycle` gains a `ClearPolicy` arg (live watcher
+passes `LeaveForCaller` so it owns the single record clear after also restoring
+System 2's widened stops; replay passes `ClearRecord`). `BLACKOUT_BACKSTOP_SECONDS`
+removed — replaced by `spread_block_ttl_seconds` + `SAFETY_FORCE_RESTORE_SECONDS`.
+
+**Config.** No new secrets/fields; `tv-arm --retest-atr-step` etc. unchanged.
+
+**Tests.** core 844, cron 11, engine 144, cli 267 + replay 93 + 22 — all green.
+New goldens: multishot 1h-block cancel→restore→TP; multi-hour-block
+held→restored-at-block-end (TTL-vs-block guard); System-2-only-record survives the
+shared fn (`leave_for_caller_restores_but_does_not_clear_the_record`); baked-clock
+cancel trigger (`cancel_trigger_is_baked_clock_not_live_quote`).
+
+**Follow-up.** PR 5 (fold market-hours blackout into the lifecycle); the
+report-side `widened_stop_at`/`sweep_reason` System-2 *preview* lines (cosmetic,
+not the Net-R path); PR 1b (NY-local DST calibration — separate track). Option B
+(split System 2/System 3 into separate records) left as a future cleanup.
+
 ## v88 — 2026-07-12 — spread-hour "rubbish candle": suppress entries, signals, crosses
 
 **Why.** A `--replay --strategy-v2` of AUD/CHF over 2026-07-08 booked −2R. Entry
