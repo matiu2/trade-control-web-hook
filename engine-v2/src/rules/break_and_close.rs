@@ -77,8 +77,9 @@ impl Rule for BreakAndClose<'_> {
             return Vec::new();
         }
 
-        // Break-and-close only runs on a real closed bar this slice.
-        let Some(candle) = w.candle else {
+        // The current closed bar (last of the window). Absent only for an empty
+        // window, which the driver already guards.
+        let Some(candle) = w.current() else {
             return Vec::new();
         };
 
@@ -136,7 +137,8 @@ impl BreakAndClose<'_> {
         Trigger::TrendlineCross {
             a: line.a,
             b: line.b,
-            extend_forward: line.extend_forward,
+            // A neckline always projects forward past its second anchor.
+            extend_forward: true,
             bar_seconds,
             dir: self.rule.dir,
             bar: self.rule.bar,

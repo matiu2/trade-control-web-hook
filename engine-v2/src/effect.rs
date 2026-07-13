@@ -49,7 +49,7 @@ use crate::facts::FactValue;
 #[derive(Debug, Clone)]
 pub enum Effect {
     /// Dispatch this intent — the driver appends it to the fired list it returns
-    /// to the caller of [`drive`](crate::driver::drive).
+    /// to the caller of [`tick_once`](crate::driver::tick_once).
     Fire(Box<FiredIntent>),
     /// Record a **shared** trade fact at `(line, kind)`. The driver applies it to
     /// the plan's [`Facts`](crate::facts::Facts) so the next candle's ticks see it.

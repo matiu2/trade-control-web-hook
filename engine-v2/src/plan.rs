@@ -32,9 +32,9 @@ use trade_control_core::trade_plan::{BarEvent, CrossDir, LinePoint};
 /// `a`/`b` are the two (time, price) anchors, reusing v1's [`LinePoint`] (it's
 /// exactly `{ at_epoch, price }`, which is all a v2 line needs). A horizontal
 /// line is expressed with `a.price == b.price`; a sloped neckline has distinct
-/// prices. `extend_forward` mirrors the TV / v1 `extend_forward` flag: whether a
-/// cross is evaluated past the second anchor's bar-index (almost always `true`
-/// for a neckline).
+/// prices. A line is always evaluated extend-forward (crosses past the second
+/// anchor's bar-index count) — a neckline always projects forward, so there is
+/// no per-line flag.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Line {
     /// The line's name, e.g. `"neckline"`. Facts are keyed by this.
@@ -43,8 +43,6 @@ pub struct Line {
     pub a: LinePoint,
     /// Second anchor (time, price).
     pub b: LinePoint,
-    /// Evaluate crossings past the second anchor?
-    pub extend_forward: bool,
 }
 
 /// The behaviour class of a [`PlanRule`]. Starts with the one variant slice-1

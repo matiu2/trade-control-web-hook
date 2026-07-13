@@ -21,12 +21,14 @@ use crate::plan::TradePlan;
 pub struct World<'a> {
     /// The tick's wall-clock instant. A candle-driven cross (break-and-close)
     /// ignores it; the field is here for the control/time rules of later slices.
+    /// A rule derives bar-relative properties (e.g. "is this bar stale", "are we
+    /// mid-bar") from `now` vs [`current`](World::current)`.time` — the driver
+    /// stamps no such flag (that would smuggle mode-branching into the rules).
     pub now: DateTime<Utc>,
-    /// The candle being processed. `None` on a sub-bar (mid-candle) tick —
-    /// unused this slice (break-and-close only runs on a closed bar).
-    pub candle: Option<&'a Candle>,
-    /// The ascending detector window used to resolve a sloped line's level in
-    /// bar-index space. Unused for a horizontal line.
+    /// The ascending detector window ending at the bar under evaluation.
+    /// [`current`](World::current) is `window.last()` — the closed bar this tick
+    /// processes. Also what a sloped line resolves its level against in
+    /// bar-index space (unused for a horizontal line).
     pub window: &'a [Candle],
     /// The fact blackboard — **read-only**. Read facts other rules wrote (and
     /// your own scratch); to write, return a
@@ -36,4 +38,13 @@ pub struct World<'a> {
     pub facts: &'a Facts,
     /// The v2 plan — for its lines, rules, and `cross_buffer_pct`.
     pub plan: &'a TradePlan,
+}
+
+impl<'a> World<'a> {
+    /// The current bar this tick processes — the last of the [`window`](World::window).
+    /// `None` only if the window is empty (the driver returns early in that
+    /// case, so rules receiving a `World` can rely on `Some`).
+    pub fn current(&self) -> Option<&'a Candle> {
+        self.window.last()
+    }
 }

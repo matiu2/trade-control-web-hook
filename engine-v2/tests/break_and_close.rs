@@ -1,9 +1,11 @@
 //! Fact-based break-and-close tests for engine-v2.
 //!
-//! These drive a hand-built v2 [`TradePlan`] through [`drive`] and assert on the
-//! [`Facts`] blackboard + returned [`Effect`]s — the fact-based contract, no
-//! `Phase`. The "known-hard" cases (sloped neckline, weekend gap, extend_forward)
-//! prove the reused `cross.rs` projection still works in the v2 line shape.
+//! These drive a hand-built v2 [`TradePlan`] one bar at a time via
+//! `tick_once` (through the `drive_series` caller-owns-loop test helper) and
+//! assert on the [`Facts`] blackboard + returned [`Effect`]s — the fact-based
+//! contract, no `Phase`. The "known-hard" cases (sloped neckline, weekend gap,
+//! forward projection past the second anchor) prove the reused `cross.rs`
+//! projection still works in the v2 line shape.
 
 use chrono::{DateTime, Utc};
 
@@ -13,7 +15,7 @@ use trade_control_core::trade_plan::{BarEvent, CrossDir, LinePoint};
 use trade_control_core::tunable::Tunable;
 
 use trade_control_engine_v2::{
-    Effect, FactValue, Facts, Line, PlanRule, RuleKind, TradePlan, drive,
+    Effect, FactValue, Facts, Line, PlanRule, RuleKind, TradePlan, tick_once,
 };
 
 // ---------------------------------------------------------------------------
@@ -117,7 +119,6 @@ fn horizontal_line(name: &str, price: f64, a_time: &str, b_time: &str) -> Line {
             at_epoch: ts(b_time).timestamp(),
             price,
         },
-        extend_forward: true,
     }
 }
 
@@ -139,6 +140,21 @@ fn fires(effects: &[Effect]) -> usize {
         .iter()
         .filter(|e| matches!(e, Effect::Fire(_)))
         .count()
+}
+
+/// Drive a whole candle series one bar at a time (caller-owns-loop), the way
+/// the live worker / replay will. Returns all fires across the series.
+fn drive_series(
+    plan: &TradePlan,
+    facts: &mut Facts,
+    candles: &[Candle],
+    now: DateTime<Utc>,
+) -> Vec<Effect> {
+    let mut fires = Vec::new();
+    for i in 0..candles.len() {
+        fires.extend(tick_once(plan, facts, &candles[..=i], now));
+    }
+    fires
 }
 
 // ---------------------------------------------------------------------------
@@ -167,13 +183,7 @@ fn onclose_cross_stamps_fact_and_fires() {
     ];
 
     let mut facts = Facts::new();
-    let effects = drive(
-        &p,
-        &mut facts,
-        &candles,
-        &candles,
-        ts("2026-06-01T13:00:05Z"),
-    );
+    let effects = drive_series(&p, &mut facts, &candles, ts("2026-06-01T13:00:05Z"));
 
     assert_eq!(fires(&effects), 1, "expected exactly one fire");
     assert_eq!(
@@ -202,13 +212,7 @@ fn no_cross_sets_no_fact_and_no_fire() {
     ];
 
     let mut facts = Facts::new();
-    let effects = drive(
-        &p,
-        &mut facts,
-        &candles,
-        &candles,
-        ts("2026-06-01T13:00:05Z"),
-    );
+    let effects = drive_series(&p, &mut facts, &candles, ts("2026-06-01T13:00:05Z"));
 
     assert_eq!(fires(&effects), 0, "no cross → no fire");
     assert!(
@@ -241,13 +245,7 @@ fn latch_prevents_refire_and_restamp() {
     ];
 
     let mut facts = Facts::new();
-    let effects = drive(
-        &p,
-        &mut facts,
-        &candles,
-        &candles,
-        ts("2026-06-01T15:00:05Z"),
-    );
+    let effects = drive_series(&p, &mut facts, &candles, ts("2026-06-01T15:00:05Z"));
 
     assert_eq!(fires(&effects), 1, "latched → only the first cross fires");
     assert_eq!(
@@ -280,7 +278,6 @@ fn sloped_neckline_interpolated_at_bar_index() {
             at_epoch: ts(b).timestamp(),
             price: 1.1000,
         },
-        extend_forward: true,
     };
     // Descending neckline, short → cross DOWN through the sloped line.
     let rule = bc_rule("neckline", BarEvent::OnClose, CrossDir::Down);
@@ -288,24 +285,21 @@ fn sloped_neckline_interpolated_at_bar_index() {
 
     // bar2 (12:00) level = 1.1050. Seed bar1 (11:00, level 1.1075) closes above;
     // bar2 closes at 1.1040, below the interpolated 1.1050 → down close-through.
-    let window = vec![
+    let window = [
         candle("2026-06-01T10:00:00Z", 1.1100, 1.1105, 1.1095, 1.1100),
         candle("2026-06-01T11:00:00Z", 1.1090, 1.1095, 1.1080, 1.1085),
         candle("2026-06-01T12:00:00Z", 1.1080, 1.1085, 1.1035, 1.1040),
         candle("2026-06-01T13:00:00Z", 1.1040, 1.1045, 1.1030, 1.1038),
         candle("2026-06-01T14:00:00Z", 1.1038, 1.1042, 1.1000, 1.1010),
     ];
-    // Drive only bars 1..=2; window is the full 5-bar series for interpolation.
+    // Drive bars 1..=2 one bar at a time (caller-owns-loop). For bar i the
+    // window is `new_candles[..=i]`; the sloped anchors that fall outside the
+    // growing prefix extrapolate in bar-index space (hourly `bar_seconds`) to
+    // the same interpolated level as the full window — bar2's level is 1.1050.
     let new_candles = &window[1..=2];
 
     let mut facts = Facts::new();
-    let effects = drive(
-        &p,
-        &mut facts,
-        new_candles,
-        &window,
-        ts("2026-06-01T12:00:05Z"),
-    );
+    let effects = drive_series(&p, &mut facts, new_candles, ts("2026-06-01T12:00:05Z"));
 
     assert_eq!(
         fires(&effects),
@@ -329,7 +323,7 @@ fn sloped_neckline_interpolated_at_bar_index() {
 fn weekend_gap_uses_bar_index_not_wallclock() {
     // Three Friday bars then three Monday bars — a real weekend gap. Neckline
     // anchored on the first Friday bar and the last Monday bar; descending.
-    let window = vec![
+    let window = [
         candle("2026-06-05T12:00:00Z", 1.1100, 1.1105, 1.1095, 1.1100), // Fri bar0
         candle("2026-06-05T13:00:00Z", 1.1095, 1.1100, 1.1090, 1.1095), // Fri bar1
         candle("2026-06-05T14:00:00Z", 1.1090, 1.1095, 1.1085, 1.1090), // Fri bar2
@@ -349,23 +343,20 @@ fn weekend_gap_uses_bar_index_not_wallclock() {
             at_epoch: window[5].time.timestamp(),
             price: 1.1050,
         },
-        extend_forward: true,
     };
     let rule = bc_rule("neckline", BarEvent::OnClose, CrossDir::Down);
     let p = plan(vec![ln], vec![rule]);
 
-    // Seed bar3 (level 1.1070) closes 1.1085 above; bar4 closes 1.1040 below the
-    // bar-index level 1.1060 → down close-through.
+    // Seed bar3 closes 1.1085 above; bar4 closes 1.1040 below the interpolated
+    // level → down close-through. Drive only the two Monday bars one at a time
+    // (the Friday bars are window-only history for anchoring, never processed):
+    // for bar i the window is `new_candles[..=i]`, and the anchors outside that
+    // prefix extrapolate in bar-index space (hourly `bar_seconds`) across the
+    // weekend gap — the cross still lands on bar4 (Mon 10:00).
     let new_candles = &window[3..=4];
 
     let mut facts = Facts::new();
-    let effects = drive(
-        &p,
-        &mut facts,
-        new_candles,
-        &window,
-        ts("2026-06-08T10:00:05Z"),
-    );
+    let effects = drive_series(&p, &mut facts, new_candles, ts("2026-06-08T10:00:05Z"));
 
     assert_eq!(
         fires(&effects),
@@ -378,15 +369,16 @@ fn weekend_gap_uses_bar_index_not_wallclock() {
     );
 }
 
-/// (c) extend_forward true vs false past the second anchor. A candle beyond the
-/// second anchor's bar-index only sees the line when `extend_forward = true`;
-/// with `false` the projection returns `None` → no cross, no fire.
+/// (c) A cross past the second anchor's bar-index still fires — a line always
+/// projects forward (the `extend_forward` field was removed; a neckline always
+/// extends). The cross candle sits beyond the second anchor and must still see
+/// the forward-projected level.
 #[test]
-fn extend_forward_gates_crosses_past_second_anchor() {
+fn cross_past_second_anchor_fires_via_forward_projection() {
     // Window; neckline anchored bar0 @ 1.1100 → bar2 @ 1.1000 (slope −0.005/bar).
     // Forward projection: bar3 level = 1.0950, bar4 level = 1.0900. The cross
     // candle is bar4, PAST the second anchor (bar2).
-    let window = vec![
+    let window = [
         candle("2026-06-01T10:00:00Z", 1.1100, 1.1105, 1.1095, 1.1100),
         candle("2026-06-01T11:00:00Z", 1.1080, 1.1085, 1.1070, 1.1075),
         candle("2026-06-01T12:00:00Z", 1.1010, 1.1015, 1.1000, 1.1005),
@@ -406,56 +398,24 @@ fn extend_forward_gates_crosses_past_second_anchor() {
         },
     );
 
-    // extend_forward = true → the line projects forward; bar4 crosses → fires.
-    let ln_true = Line {
+    // The line projects forward; bar4 crosses → fires. Drive only the two bars
+    // past the anchor (bar3 seed, bar4 cross) one at a time.
+    let ln = Line {
         name: "neckline".into(),
         a: anchors.0,
         b: anchors.1,
-        extend_forward: true,
     };
-    let p_true = plan(
-        vec![ln_true],
+    let p = plan(
+        vec![ln],
         vec![bc_rule("neckline", BarEvent::OnClose, CrossDir::Down)],
     );
-    let mut facts_true = Facts::new();
-    let eff_true = drive(
-        &p_true,
-        &mut facts_true,
-        &window[3..=4],
-        &window,
-        ts("2026-06-01T14:00:05Z"),
-    );
+    let mut facts = Facts::new();
+    let effects = drive_series(&p, &mut facts, &window[3..=4], ts("2026-06-01T14:00:05Z"));
     assert_eq!(
-        fires(&eff_true),
+        fires(&effects),
         1,
-        "extend_forward=true projects the line past the anchor → cross fires"
+        "the line projects forward past the anchor → the cross past it fires"
     );
-
-    // extend_forward = false → projection is None past the anchor; no fire.
-    let ln_false = Line {
-        name: "neckline".into(),
-        a: anchors.0,
-        b: anchors.1,
-        extend_forward: false,
-    };
-    let p_false = plan(
-        vec![ln_false],
-        vec![bc_rule("neckline", BarEvent::OnClose, CrossDir::Down)],
-    );
-    let mut facts_false = Facts::new();
-    let eff_false = drive(
-        &p_false,
-        &mut facts_false,
-        &window[3..=4],
-        &window,
-        ts("2026-06-01T14:00:05Z"),
-    );
-    assert_eq!(
-        fires(&eff_false),
-        0,
-        "extend_forward=false → no line past the anchor → no cross"
-    );
-    assert!(!facts_false.is_set("neckline", "break_close"));
 }
 
 // ---------------------------------------------------------------------------
@@ -487,13 +447,7 @@ fn last_close_scratch_recorded_on_seed_bar() {
     )];
 
     let mut facts = Facts::new();
-    let _ = drive(
-        &p,
-        &mut facts,
-        &candles,
-        &candles,
-        ts("2026-06-01T12:00:05Z"),
-    );
+    let _ = drive_series(&p, &mut facts, &candles, ts("2026-06-01T12:00:05Z"));
 
     assert_eq!(
         facts.get_scratch("03-prep-break-and-close", "last_close"),
@@ -527,13 +481,7 @@ fn last_close_scratch_not_visible_in_shared_facts() {
     )];
 
     let mut facts = Facts::new();
-    let _ = drive(
-        &p,
-        &mut facts,
-        &candles,
-        &candles,
-        ts("2026-06-01T12:00:05Z"),
-    );
+    let _ = drive_series(&p, &mut facts, &candles, ts("2026-06-01T12:00:05Z"));
 
     // Scratch is set...
     assert_eq!(

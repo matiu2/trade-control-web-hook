@@ -23,8 +23,8 @@
 //!   [`Effect`] enum (`Fire` + `WriteFact` + `WriteScratch`),
 //! - [`BreakAndClose`], the first rule, reusing the proven `cross.rs`
 //!   line-projection, and
-//! - a minimal [`drive`] loop that ticks the plan's break-and-close rules and
-//!   collects effects.
+//! - a minimal [`tick_once`] entry point that ticks the plan's break-and-close
+//!   rules for **one** bar (the caller owns the bar loop) and collects effects.
 //!
 //! No `Broker`/`Storage`, no entry/retest/news rules, no ordering system — those
 //! are later slices, added on demand as each rule requires them.
@@ -51,7 +51,7 @@ mod world;
 
 mod rules;
 
-pub use driver::drive;
+pub use driver::tick_once;
 pub use effect::Effect;
 pub use facts::{FactValue, Facts};
 pub use plan::{Line, PlanRule, RuleKind, TradePlan};
