@@ -346,6 +346,91 @@ pub fn spread_block_ttl_seconds(instrument: &str, opened_at: chrono::DateTime<ch
     hours as u64 * 3600 + SPREAD_BLOCK_TTL_GRACE_SECONDS
 }
 
+/// The contiguous spread-hour block that `now` sits in, as a `(start, end)` pair
+/// of UTC instants — `start` is the top of the first elevated hour of the run,
+/// `end` is the top of the first non-elevated hour after it (so the block is
+/// `[start, end)`, half-open). `None` when `now` is not itself a spread hour.
+///
+/// The window is what the offline replay prints when a signal confirmed inside a
+/// spread block but the entry was suppressed ("not entering — spread-hour from X
+/// to Y"). It is derived the same way the TTL is: the pure per-instrument hour
+/// mask when the instrument has one, a real-clock probe through
+/// [`is_spread_hour`] otherwise (legacy NY-close-edge instruments). The bounds
+/// snap to the top of the hour — the mask is hour-of-day granularity, so
+/// sub-hour precision would be false detail. The 30-minute *lead* that
+/// [`is_spread_hour`] adds before an elevated hour is intentionally **not**
+/// folded into `start`: the reported window is the elevated block itself, not the
+/// stop-widening lead-in.
+pub fn spread_block_window(
+    instrument: &str,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Option<(chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>)> {
+    use chrono::{Duration, Timelike};
+    // The hour containing `now` must itself be elevated (ignore the lead — we
+    // report the block, not the lead-in). Use the pure mask when available.
+    let hour_top = now
+        .with_minute(0)
+        .and_then(|t| t.with_second(0))
+        .and_then(|t| t.with_nanosecond(0))?;
+    let (back, fwd) = match baked_spread_hours(instrument) {
+        Some((mask, _)) if mask != 0 => {
+            if mask & (1 << now.hour()) == 0 {
+                return None;
+            }
+            (
+                block_start_hours_from_mask(mask, now.hour()),
+                block_hours_from_mask(mask, now.hour()),
+            )
+        }
+        // Legacy no-mask instrument: probe the real clock hour-by-hour. Require
+        // `now`'s own hour to be a spread hour (probe at the hour top so the lead
+        // of the *next* hour can't spoof membership).
+        _ => {
+            if !is_spread_hour(instrument, hour_top) {
+                return None;
+            }
+            (
+                block_start_hours_by_probe(instrument, hour_top),
+                block_hours_by_probe(instrument, hour_top),
+            )
+        }
+    };
+    let start = hour_top - Duration::hours(back as i64);
+    let end = hour_top + Duration::hours(fwd as i64);
+    Some((start, end))
+}
+
+/// Consecutive elevated hours in `mask` ending at (and including) `hour`, walking
+/// **backward** and wrapping midnight, capped at [`MAX_BLOCK_HOURS`]. The count
+/// of hours strictly *before* `hour` that are still in the block — so
+/// `hour - result` is the block's first elevated hour. `0` when the hour before
+/// `hour` isn't elevated (this hour is the block start). Pure over the mask.
+fn block_start_hours_from_mask(mask: u32, hour: u32) -> u32 {
+    let mut back: u32 = 0;
+    while back < MAX_BLOCK_HOURS {
+        let h = (hour + 24 - ((back + 1) % 24)) % 24;
+        if mask & (1 << h) == 0 {
+            break;
+        }
+        back += 1;
+    }
+    back
+}
+
+/// Real-clock backward twin of [`block_hours_by_probe`] for legacy (no-mask)
+/// instruments: probe [`is_spread_hour`] backward hour-by-hour from `now`.
+fn block_start_hours_by_probe(instrument: &str, now: chrono::DateTime<chrono::Utc>) -> u32 {
+    let mut back: u32 = 0;
+    while back < MAX_BLOCK_HOURS {
+        let probe = now - chrono::Duration::hours((back + 1) as i64);
+        if !is_spread_hour(instrument, probe) {
+            break;
+        }
+        back += 1;
+    }
+    back
+}
+
 /// The number of consecutive elevated hours in `mask` starting at (and
 /// including) `opened_hour`, wrapping around midnight, capped at
 /// [`MAX_BLOCK_HOURS`]. `0` when `opened_hour` itself isn't elevated (nothing to
@@ -728,6 +813,49 @@ mod tests {
         let hours = block_hours_from_mask(1 << 21, 21);
         let ttl = hours as u64 * 3600 + SPREAD_BLOCK_TTL_GRACE_SECONDS;
         assert_eq!(ttl, 2 * 3600);
+    }
+
+    /// Backward walk: hours BEFORE `hour` still in the block. A 21→05 (wrap)
+    /// block probed at 02:00 has 5 earlier in-block hours (21,22,23,00,01).
+    #[test]
+    fn block_start_hours_walks_back_across_midnight() {
+        let mask = (1 << 21) | (1 << 22) | (1 << 23) | (1 << 0) | (1 << 1) | (1 << 2) | (1 << 3);
+        assert_eq!(block_start_hours_from_mask(mask, 2), 5);
+        // At the block's first hour there's nothing before it.
+        assert_eq!(block_start_hours_from_mask(mask, 21), 0);
+    }
+
+    /// The public `(start, end)` window over a synthetic 21→05 wrap block: a bar
+    /// at 02:00Z reports start=21:00 (prev day) and end=05:00 (same day).
+    #[test]
+    fn spread_block_window_spans_a_wrap_block_via_mask() {
+        // GBP/AUD's real baked block is 21..=05 UTC — assert against the baked
+        // table so the reported window matches what the operator sees live.
+        // Baked GBP/AUD elevated hours are 21,22,23,00,01,02,03,04,05 UTC, so the
+        // block runs 21:00 (prev day) up to the first clean hour, 06:00.
+        let (start, end) =
+            spread_block_window("GBP/AUD", ts("2026-07-10T02:00:00Z")).expect("in block");
+        assert_eq!(
+            start,
+            ts("2026-07-09T21:00:00Z"),
+            "block starts 21:00 prev day"
+        );
+        assert_eq!(
+            end,
+            ts("2026-07-10T06:00:00Z"),
+            "block ends at first clean hour 06:00"
+        );
+    }
+
+    /// The confirmation bar in the reported GBP/AUD case (12:00 Brisbane = 02:00Z)
+    /// sits inside the block; a midday bar well outside it returns None.
+    #[test]
+    fn spread_block_window_none_outside_the_block() {
+        assert!(spread_block_window("GBP/AUD", ts("2026-07-10T02:00:00Z")).is_some());
+        assert!(
+            spread_block_window("GBP/AUD", ts("2026-07-10T12:00:00Z")).is_none(),
+            "12:00Z is a liquid hour, not a spread hour"
+        );
     }
 
     /// AUD/CHF's baked block, opened at 21:00Z, must yield a TTL that OUTLIVES the
