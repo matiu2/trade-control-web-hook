@@ -6,6 +6,7 @@ edition = "2024"
 [dependencies]
 chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
 serde = { version = "1.0.228", features = ["derive"] }
+tracing = "0.1.44"
 trade-control-core = { version = "0.1.0", path = "../core" }
 
 [dev-dependencies]

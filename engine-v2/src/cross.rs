@@ -83,7 +83,7 @@ pub fn eval_trigger(
 /// buffer]`. `0.0` reproduces the bare line exactly. See the old engine's
 /// `level_crossed` doc comment for the full semantics (intrabar straddle,
 /// OnClose zone-edge comparison).
-fn level_crossed(
+pub(crate) fn level_crossed(
     level: f64,
     dir: CrossDir,
     bar: BarEvent,
@@ -123,7 +123,7 @@ fn level_crossed(
 
 /// Interpolate a trendline's price at candle `t`, in bar-index space. Port of
 /// the old engine's `line_price_at`.
-fn line_price_at(
+pub(crate) fn line_price_at(
     a: &LinePoint,
     b: &LinePoint,
     t: &Candle,

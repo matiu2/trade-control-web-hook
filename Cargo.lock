@@ -4200,6 +4200,7 @@ dependencies = [
  "chrono",
  "serde",
  "serde_json",
+ "tracing",
  "trade-control-core",
 ]
 

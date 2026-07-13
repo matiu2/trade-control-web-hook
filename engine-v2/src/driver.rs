@@ -4,10 +4,12 @@
 //! v2 shape: **no phase, no ordering intelligence, no seeding of a state
 //! machine.** Rules are pure ([`Rule::tick`] takes `&World`); the driver is the
 //! single site that mutates [`Facts`]. For the current bar it builds a fresh
-//! read-only [`World`] over the shared blackboard, ticks each break-and-close
-//! rule in plan order, and applies every [`Effect`] returned:
-//! [`WriteFact`](Effect::WriteFact) / [`WriteScratch`](Effect::WriteScratch) are
-//! written into `facts`; [`Fire`](Effect::Fire) is collected for the caller.
+//! read-only [`World`] over the shared blackboard, ticks **every** rule in plan
+//! order — dispatching each [`PlanRule`](crate::plan::PlanRule) to the matching
+//! [`Rule`] impl by its [`RuleKind`](crate::plan::RuleKind) — and applies every
+//! [`Effect`] returned: [`WriteFact`](Effect::WriteFact) /
+//! [`WriteScratch`](Effect::WriteScratch) are written into `facts`;
+//! [`Fire`](Effect::Fire) is collected for the caller.
 //!
 //! # One bar per call — the caller owns the loop
 //!
@@ -33,11 +35,13 @@
 //!   ticks, so a later rule in list order already sees an earlier rule's writes
 //!   this bar — the producer/consumer chain (break-and-close → retest → enter)
 //!   is correct by the baked list order (see `SCOPING-rule-based-engine.md`,
-//!   "Ordering — baked by tv-arm").
+//!   "Ordering — baked by tv-arm"). This is load-bearing: a retest rule listed
+//!   *after* its break-and-close in `plan.rules` sees the `break_close` fact
+//!   that break-and-close wrote **earlier this same bar**.
 //!
-//! Slice 1 instantiates only break-and-close rules (`kind ==
-//! RuleKind::BreakAndClose`). No `Broker`/`Storage` yet — those thread in when
-//! the entry rules land.
+//! Slice 1 instantiates break-and-close and retest rules, dispatched by
+//! [`RuleKind`](crate::plan::RuleKind). No `Broker`/`Storage` yet — those thread
+//! in when the entry rules land.
 
 use chrono::{DateTime, Utc};
 
@@ -45,9 +49,9 @@ use trade_control_core::broker::Candle;
 
 use crate::effect::Effect;
 use crate::facts::Facts;
-use crate::plan::TradePlan;
+use crate::plan::{PlanRule, RuleKind, TradePlan};
 use crate::rule::Rule;
-use crate::rules::{BreakAndClose, is_break_and_close};
+use crate::rules::{BreakAndClose, Retest};
 use crate::world::World;
 
 /// Tick `plan`'s (pure) break-and-close rules for **one** bar — the current bar
@@ -92,8 +96,12 @@ pub fn tick_once(
 
     let mut fires = Vec::new();
 
-    for rule in plan.rules.iter().filter(|r| is_break_and_close(r)) {
-        let bc = BreakAndClose::new(rule);
+    // Tick EVERY rule in plan order, dispatching each to its behaviour impl by
+    // `kind`. Effects are applied to `facts` immediately (before the next rule)
+    // so a later rule this same bar sees an earlier rule's writes — the
+    // producer/consumer chain (break-and-close → retest) is correct by list
+    // order. See the module docs' "within a bar" ordering note.
+    for rule in plan.rules.iter() {
         // A fresh read-only World over the current facts. Scoped so the shared
         // `&facts` borrow ends before we apply the effects below.
         let effects = {
@@ -103,7 +111,7 @@ pub fn tick_once(
                 facts,
                 plan,
             };
-            bc.tick(&world)
+            tick_rule(rule, &world)
         };
         // Apply this rule's writes to `facts` immediately (before the next rule),
         // and collect its fires.
@@ -111,6 +119,16 @@ pub fn tick_once(
     }
 
     fires
+}
+
+/// Tick one [`PlanRule`] via the [`Rule`] impl matching its
+/// [`RuleKind`](crate::plan::RuleKind). Both impls borrow the rule, so this
+/// constructs the impl inline and ticks it (no per-rule boxing needed).
+fn tick_rule(rule: &PlanRule, world: &World) -> Vec<Effect> {
+    match rule.kind {
+        RuleKind::BreakAndClose => BreakAndClose::new(rule).tick(world),
+        RuleKind::Retest => Retest::new(rule).tick(world),
+    }
 }
 
 /// Apply one tick's `effects`: write facts/scratch into `facts`, collect fires

@@ -22,9 +22,13 @@
 //! - the [`Rule`] behaviour trait (pure: `tick(&World) -> Vec<Effect>`) and the
 //!   [`Effect`] enum (`Fire` + `WriteFact` + `WriteScratch`),
 //! - [`BreakAndClose`], the first rule, reusing the proven `cross.rs`
-//!   line-projection, and
-//! - a minimal [`tick_once`] entry point that ticks the plan's break-and-close
-//!   rules for **one** bar (the caller owns the bar loop) and collects effects.
+//!   line-projection,
+//! - [`Retest`], the first fact **consumer** — it gates on the
+//!   `("neckline", "break_close")` fact break-and-close produced, then writes
+//!   `("neckline", "retest")` on a genuine (tolerance-decayed) retest cross, and
+//! - a minimal [`tick_once`] entry point that ticks the plan's rules for **one**
+//!   bar (the caller owns the bar loop), dispatching each by
+//!   [`RuleKind`], and collects effects.
 //!
 //! No `Broker`/`Storage`, no entry/retest/news rules, no ordering system — those
 //! are later slices, added on demand as each rule requires them.
@@ -56,5 +60,5 @@ pub use effect::Effect;
 pub use facts::{FactValue, Facts};
 pub use plan::{Line, PlanRule, RuleKind, TradePlan};
 pub use rule::Rule;
-pub use rules::BreakAndClose;
+pub use rules::{BreakAndClose, Retest, is_break_and_close, is_retest};
 pub use world::World;

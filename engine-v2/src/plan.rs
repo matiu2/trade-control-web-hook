@@ -56,6 +56,12 @@ pub enum RuleKind {
     /// Break-and-close on a line — the first prep. Writes the
     /// `(line, "break_close")` fact on a genuine close through the line.
     BreakAndClose,
+    /// The retest of a line after its break-and-close. Reads the
+    /// `(line, "break_close")` fact (does nothing until it is set) and, on a
+    /// genuine retest cross strictly after the break, writes the
+    /// `(line, "retest")` fact. The first fact *consumer* in v2 — it gates on a
+    /// fact another rule produced.
+    Retest,
 }
 
 /// A rule as **plan data** — it references a [`Line`] by name, says how the
@@ -108,6 +114,12 @@ pub struct TradePlan {
     /// directional cross must pierce this far past the line to count (a one-tick
     /// graze doesn't). `0.0` reproduces the bare line.
     pub cross_buffer_pct: f64,
+    /// Near-side tolerance step for the retest: a retest's closeness tolerance
+    /// is `(N - 1) × retest_atr_step × ATR`, where `N` is the number of bars
+    /// after the break-and-close (first = 1 → tolerance 0, must reach the line).
+    /// Default [`trade_control_core::trade_plan::DEFAULT_RETEST_ATR_STEP`]
+    /// (0.075). See [`RuleKind::Retest`].
+    pub retest_atr_step: f64,
 }
 
 impl TradePlan {
