@@ -1518,23 +1518,53 @@ pub fn enter_preconditions_unmet(
     state: &PlanState,
     bar: DateTime<Utc>,
 ) -> Vec<EnterBlock> {
+    // Flat, deduped union of what every still-blocked leg is waiting on — the
+    // historical shape. Order preserved (break-and-close → confirmation →
+    // retest) by pushing in that order per leg. Renders as an AND-join for a
+    // single-enter plan; multi-enter callers should prefer
+    // `enter_preconditions_reason`, which respects the OR-across-legs structure.
     let mut blocks = Vec::new();
-    // Break-and-close first: while AwaitBreakAndClose the enter code never runs
-    // for ANY enter rule, so this is plan-wide, not per-rule.
-    if state.phase == Phase::AwaitBreakAndClose && has_break_and_close(plan) {
-        blocks.push(EnterBlock::NeedsBreakAndClose);
+    for leg in enter_preconditions_by_leg(plan, state, bar) {
+        for b in leg {
+            if !blocks.contains(&b) {
+                blocks.push(b);
+            }
+        }
     }
-    // Then per-enter confirmation / retest gates a present golden would still be
-    // blocked by. Skip already-latched enters (a fired single-shot enter isn't
-    // "blocked").
+    blocks
+}
+
+/// Per-enter-leg breakdown of the outstanding preconditions: one inner `Vec`
+/// per still-blocked enter rule, each holding the gates *that leg* is waiting
+/// on (in gate order: break-and-close → confirmation → retest). Legs that are
+/// fully clear (nothing outstanding) are omitted.
+///
+/// The two levels model the real entry logic: a leg enters when **all** its
+/// gates clear (AND within a leg), and the *plan* enters when **any** leg
+/// enters (OR across legs). A `strategy-v2` plan has two legs — a retest-gated
+/// stop enter and a confirmation-gated prep-free QM enter — so its outstanding
+/// reason is `retest OR confirmation`, not `retest AND confirmation`. A
+/// single-enter plan returns at most one inner vec, so the OR collapses.
+pub fn enter_preconditions_by_leg(
+    plan: &TradePlan,
+    state: &PlanState,
+    bar: DateTime<Utc>,
+) -> Vec<Vec<EnterBlock>> {
+    let mut legs = Vec::new();
     for rule in plan
         .rules
         .iter()
         .filter(|r| r.intent.action == Action::Enter)
         .filter(|r| !state.fired.contains(&r.rule_id))
     {
-        if rule.intent.needs_confirmed && !blocks.contains(&EnterBlock::NeedsConfirmation) {
-            blocks.push(EnterBlock::NeedsConfirmation);
+        let mut leg = Vec::new();
+        // Break-and-close: while AwaitBreakAndClose the enter code never runs for
+        // ANY enter rule. It's phase-wide, but it gates each leg that requires it.
+        if state.phase == Phase::AwaitBreakAndClose && has_break_and_close(plan) {
+            leg.push(EnterBlock::NeedsBreakAndClose);
+        }
+        if rule.intent.needs_confirmed {
+            leg.push(EnterBlock::NeedsConfirmation);
         }
         let requires_retest = if is_multi_enter(plan) {
             rule.intent
@@ -1544,14 +1574,44 @@ pub fn enter_preconditions_unmet(
         } else {
             plan.rules.iter().any(is_retest)
         };
-        if requires_retest
-            && !retest_satisfied(plan, state, bar)
-            && !blocks.contains(&EnterBlock::NeedsRetest)
-        {
-            blocks.push(EnterBlock::NeedsRetest);
+        if requires_retest && !retest_satisfied(plan, state, bar) {
+            leg.push(EnterBlock::NeedsRetest);
+        }
+        if !leg.is_empty() {
+            legs.push(leg);
         }
     }
-    blocks
+    legs
+}
+
+/// Human-facing "why not taken" reason for a marked-but-unentered bar, built
+/// from [`enter_preconditions_by_leg`]. Gates within a leg join with `and`;
+/// legs join with `or` (any leg firing enters the plan). `None` when no leg is
+/// blocked. This is the string the offline replay prints on a golden bar that
+/// carried no fire and no [`EntryDecline`].
+pub fn enter_preconditions_reason(
+    plan: &TradePlan,
+    state: &PlanState,
+    bar: DateTime<Utc>,
+) -> Option<String> {
+    let legs = enter_preconditions_by_leg(plan, state, bar);
+    if legs.is_empty() {
+        return None;
+    }
+    // Dedup identical legs (e.g. two legs both blocked only on confirmation)
+    // so the OR-join doesn't read "confirmation or confirmation".
+    let mut rendered: Vec<String> = Vec::new();
+    for leg in &legs {
+        let text = leg
+            .iter()
+            .map(|b| b.reason())
+            .collect::<Vec<_>>()
+            .join(" and ");
+        if !rendered.contains(&text) {
+            rendered.push(text);
+        }
+    }
+    Some(rendered.join(" or "))
 }
 
 /// Fire a rule against a candle: evaluate its trigger (updating the rule's
@@ -2859,6 +2919,82 @@ mod tests {
         state.break_close_at = Some(ts("2026-06-30T10:00:00Z"));
         let blocks = enter_preconditions_unmet(&p, &state, ts("2026-06-30T12:00:00Z"));
         assert!(blocks.is_empty(), "no gate outstanding: {blocks:?}");
+    }
+
+    #[test]
+    fn strategy_v2_reason_joins_legs_with_or_not_and() {
+        // strategy-v2 in AwaitEntry, break stamped, retest NOT stamped. The stop
+        // leg is blocked on retest; the QM leg (needs_confirmed) on confirmation.
+        // The two legs are alternatives — the plan enters if EITHER clears — so
+        // the reason must read "retest OR confirmation", not "retest AND
+        // confirmation".
+        let mut p = strategy_v2_plan();
+        // Mark the QM enter as confirmation-gated (what tv-arm bakes for the QM
+        // leg); the stop leg stays retest-gated via its requires_preps.
+        for r in &mut p.rules {
+            if r.rule_id == "09-enter-qm" {
+                r.intent.needs_confirmed = true;
+            }
+        }
+        let mut state = PlanState::seed(Phase::AwaitEntry, ts("2099-01-01T00:00:00Z"));
+        state.break_close_at = Some(ts("2026-06-30T10:00:00Z"));
+        // retest_seen_at still None → stop leg's retest gate shut.
+
+        let legs = enter_preconditions_by_leg(&p, &state, ts("2026-06-30T12:00:00Z"));
+        assert_eq!(legs.len(), 2, "one group per blocked enter leg: {legs:?}");
+        assert!(legs.iter().any(|l| l == &[EnterBlock::NeedsRetest]));
+        assert!(legs.iter().any(|l| l == &[EnterBlock::NeedsConfirmation]));
+
+        let reason = enter_preconditions_reason(&p, &state, ts("2026-06-30T12:00:00Z"))
+            .expect("both legs blocked");
+        assert!(
+            reason.contains(" or "),
+            "legs must join with OR: {reason:?}"
+        );
+        assert!(!reason.contains(" and "), "no AND across legs: {reason:?}");
+        assert!(reason.contains("retest") && reason.contains("confirmation"));
+    }
+
+    #[test]
+    fn single_enter_reason_joins_gates_with_and() {
+        // A single-enter plan whose lone enter needs BOTH confirmation and retest
+        // reads them AND-joined (one leg, both gates), preserving prior behaviour.
+        let neckline = Trigger::TrendlineCross {
+            a: LinePoint {
+                at_epoch: 0,
+                price: 1.2,
+            },
+            b: LinePoint {
+                at_epoch: 100,
+                price: 1.2,
+            },
+            extend_forward: true,
+            bar_seconds: 100,
+            dir: CrossDir::Down,
+            bar: BarEvent::OnClose,
+        };
+        let mut enter = pine_enter_rule(None, Direction::Short, true);
+        enter.intent.needs_confirmed = true;
+        let p = plan(vec![
+            rule(
+                "03-prep-break-and-close",
+                neckline.clone(),
+                FireMode::Once,
+                Action::Prep,
+            ),
+            rule("04-prep-retest", neckline, FireMode::Once, Action::Prep),
+            enter,
+        ]);
+        let mut state = PlanState::seed(Phase::AwaitEntry, ts("2099-01-01T00:00:00Z"));
+        state.break_close_at = Some(ts("2026-06-30T10:00:00Z"));
+
+        let reason = enter_preconditions_reason(&p, &state, ts("2026-06-30T12:00:00Z"))
+            .expect("gates outstanding");
+        assert!(reason.contains(" and "), "one leg, AND-joined: {reason:?}");
+        assert!(
+            !reason.contains(" or "),
+            "no OR for a single leg: {reason:?}"
+        );
     }
 
     // ===== full evaluate_plan: M/W heartbeat =====

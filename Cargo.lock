@@ -3392,6 +3392,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "spread-baseline-gen"
+version = "0.1.0"
+dependencies = [
+ "broker-tradenation",
+ "broker-tradenation-adapter",
+ "chrono",
+ "clap",
+ "color-eyre",
+ "instrument-lookup",
+ "oanda-client",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "tracing-error",
+ "tracing-subscriber",
+ "trade-control-core",
+ "tradenation-api",
+]
+
+[[package]]
 name = "sqlx"
 version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"

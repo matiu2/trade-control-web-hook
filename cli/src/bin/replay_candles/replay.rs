@@ -17,7 +17,7 @@ use trade_control_core::pause_gate;
 use trade_control_core::state::MemStateStore;
 use trade_control_engine::BidAskCandle as EngineCandle;
 use trade_control_engine::{
-    Candle, FiredIntent, Granularity, PlanState, TradePlan, Trigger, enter_preconditions_unmet,
+    Candle, FiredIntent, Granularity, PlanState, TradePlan, Trigger, enter_preconditions_reason,
     evaluate_controls_only, evaluate_plan, seed_plan_state,
 };
 
@@ -571,10 +571,11 @@ fn detect_mark(
 /// produced no `EntryDecline`: those two cases already explain themselves (the
 /// enter fired, or the dispatchable pre-flight declined it with a reason).
 ///
-/// Delegates the actual gate logic to the engine's `enter_preconditions_unmet`
+/// Delegates the actual gate logic to the engine's `enter_preconditions_reason`
 /// so the "why not taken" answer can't drift from the real per-bar decision.
-/// Returns a single joined reason string (e.g.
-/// `requires break-and-close (prep not satisfied yet) and requires retest (…)`)
+/// Returns a joined reason string (gates within an enter leg join with `and`,
+/// alternative enter legs join with `or`, e.g.
+/// `requires retest (…) or requires confirmation (…)` for strategy-v2)
 /// for the `not-taken:` line, or `None` when nothing was outstanding.
 fn not_taken_reason(
     plan: &TradePlan,
@@ -589,17 +590,11 @@ fn not_taken_reason(
     if !marked || !fired_rules.is_empty() || !decline_reasons.is_empty() {
         return None;
     }
-    let blocks = enter_preconditions_unmet(plan, state, bar);
-    if blocks.is_empty() {
-        return None;
-    }
-    Some(
-        blocks
-            .iter()
-            .map(|b| b.reason())
-            .collect::<Vec<_>>()
-            .join(" and "),
-    )
+    // Per-leg reason: gates within an enter leg join with "and", legs join with
+    // "or" (any leg firing enters). For strategy-v2 this reads e.g. "requires
+    // retest … or requires confirmation …" — the two enters are alternatives,
+    // not a single enter needing both. Single-enter plans collapse to one leg.
+    enter_preconditions_reason(plan, state, bar)
 }
 
 /// The mean bid-ask spread over the trailing `spread_window` bars at the fire
