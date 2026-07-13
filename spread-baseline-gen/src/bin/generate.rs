@@ -305,11 +305,40 @@ fn print_validation(rows: &[BaselineRow]) {
             );
         }
     }
+    let insufficient = rows
+        .iter()
+        .filter(|r| {
+            matches!(
+                r.profile.review,
+                spread_baseline_gen::ReviewStatus::InsufficientData
+            )
+        })
+        .count();
     println!(
-        "  {} of {} instruments have ≥1 spread hour\n",
+        "  {} of {} instruments have ≥1 spread hour ({} reviewed-flat, \
+         {} insufficient-data)\n",
         flagged,
-        rows.len()
+        rows.len(),
+        rows.len() - flagged - insufficient,
+        insufficient,
     );
+    if insufficient > 0 {
+        println!("  INSUFFICIENT DATA (mask=0, gate falls back to NY-close-edge):");
+        for r in rows.iter().filter(|r| {
+            matches!(
+                r.profile.review,
+                spread_baseline_gen::ReviewStatus::InsufficientData
+            )
+        }) {
+            println!(
+                "    {:<12} {:<12} n={}",
+                r.broker.as_str(),
+                r.symbol,
+                r.profile.n_bars
+            );
+        }
+        println!();
+    }
 }
 
 fn parse_brokers(s: &str) -> Result<Vec<Broker>> {

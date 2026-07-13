@@ -78,6 +78,20 @@ pub const MIN_INSTRUMENT_BARS: usize = 48;
 /// print, which `max` would chase).
 pub const WIDEN_PERCENTILE: f64 = 0.90;
 
+/// The outcome of reviewing one instrument — an EXPLICIT verdict so a baked
+/// `elevated_hours == 0` isn't ambiguous between "analysed, genuinely flat" and
+/// "never looked / too little data". Recorded per row so we can see which
+/// instruments have actually been analysed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReviewStatus {
+    /// Analysed with enough data; the mask (possibly empty) is the verdict.
+    /// An empty mask here means "reviewed, genuinely no spread hour".
+    Reviewed,
+    /// Too few usable bars / hours to compute a trustworthy verdict. The mask
+    /// is 0 and the gate should fall back to its NY-close-edge default.
+    InsufficientData,
+}
+
 /// The computed spread profile for one (broker, instrument).
 #[derive(Debug, Clone, PartialEq)]
 pub struct SpreadProfile {
@@ -96,14 +110,18 @@ pub struct SpreadProfile {
     /// Per-UTC-hour `ratio(h) = p90_frac / vol` (0.0 for an under-sampled
     /// hour). For the `--dump-hours` calibration report.
     pub hour_ratio: [f64; 24],
+    /// Whether this instrument was analysed with enough data. An empty
+    /// `elevated_hours` means "genuinely no spread hour" iff `review ==
+    /// Reviewed`; with `InsufficientData` it means "couldn't tell".
+    pub review: ReviewStatus,
     /// Number of usable bars that contributed.
     pub n_bars: usize,
 }
 
 impl SpreadProfile {
-    /// The empty profile — no spread hours, used when data is too thin or
-    /// volatility is degenerate. Falls the gate back to the NY-close-edge
-    /// default for this instrument.
+    /// The insufficient-data profile — no spread hours because the data was
+    /// too thin or volatility degenerate to compute a trustworthy verdict.
+    /// Falls the gate back to the NY-close-edge default for this instrument.
     pub fn empty(n_bars: usize) -> Self {
         Self {
             elevated_hours: 0,
@@ -112,6 +130,7 @@ impl SpreadProfile {
             median_ratio: 0.0,
             hour_p90_frac: [0.0; 24],
             hour_ratio: [0.0; 24],
+            review: ReviewStatus::InsufficientData,
             n_bars,
         }
     }
@@ -229,6 +248,7 @@ pub fn profile_for_instrument(bars: &[Bar]) -> SpreadProfile {
         median_ratio,
         hour_p90_frac: hour_p90,
         hour_ratio: ratio_flat,
+        review: ReviewStatus::Reviewed,
         n_bars: n,
     }
 }
