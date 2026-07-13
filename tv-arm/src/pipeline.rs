@@ -987,11 +987,19 @@ fn check_required(roles: &Roles, args: &Args) -> std::result::Result<(), String>
 /// Canonical prep-step names that have a `<prep>-expiry` cutoff line on
 /// the chart — fed into `cli::TradeSpec.prep_expiries` so the CLI emits
 /// one `08-prep-expire-<step>` alert per line.
-fn prep_expiry_steps(roles: &Roles) -> Vec<String> {
+///
+/// A step that is *also* being skipped (`skip_preps`, e.g. `--quasimodo`
+/// drops `break-and-close`) is filtered out: there is no prep left to
+/// expire, so a stale drawn `<step>-expiry` line on the chart is just
+/// context, not a cutoff to arm. Emitting it anyway would put the same
+/// name in both `skip_preps` and `prep_expiries`, which the CLI validator
+/// rejects (`can't expire a prep that's been dropped`).
+fn prep_expiry_steps(roles: &Roles, skip_preps: &[String]) -> Vec<String> {
     roles
         .prep_expiries
         .iter()
         .map(|(step, _)| step.clone())
+        .filter(|step| !skip_preps.iter().any(|s| s == step))
         .collect()
 }
 
@@ -1117,6 +1125,8 @@ fn build_trade_spec(
     if args.skip_retest {
         skip_preps.push("retest".to_string());
     }
+    // Borrow `skip_preps` before it's moved into the struct literal below.
+    let prep_expiries = prep_expiry_steps(roles, &skip_preps);
     let mut spec =
         cli::TradeSpec {
             pattern,
@@ -1166,8 +1176,10 @@ fn build_trade_spec(
             veto_on_reversal: args.veto_on_reversal,
             needs_confirmed_close: false,
             // Populated from the chart's `<prep>-expiry` vertical lines —
-            // see `prep_expiry_steps`.
-            prep_expiries: prep_expiry_steps(roles),
+            // see `prep_expiry_steps`. Skipped preps (e.g. `--quasimodo`
+            // drops break-and-close) are filtered out so a stale expiry line
+            // doesn't collide with `skip_preps`.
+            prep_expiries,
             // H&S path: no M/W static geometry. The M/W branch (commit 9)
             // builds its spec separately, keyed on `roles.mw_path`.
             mw: None,
@@ -2166,7 +2178,27 @@ mod tests {
             ],
             ..Default::default()
         };
-        assert_eq!(prep_expiry_steps(&roles), vec!["break-and-close", "retest"]);
+        assert_eq!(
+            prep_expiry_steps(&roles, &[]),
+            vec!["break-and-close", "retest"]
+        );
+    }
+
+    #[test]
+    fn prep_expiry_steps_drops_skipped_preps() {
+        // A `break-and-close-expiry` line is drawn, but `--quasimodo` puts
+        // `break-and-close` in skip_preps — there's no prep to expire, so the
+        // step must be filtered out (else the CLI validator rejects the same
+        // name appearing in both skip_preps and prep_expiries).
+        let roles = Roles {
+            prep_expiries: vec![
+                ("break-and-close".into(), vline("a", 1)),
+                ("retest".into(), vline("b", 2)),
+            ],
+            ..Default::default()
+        };
+        let skip = vec!["break-and-close".to_string()];
+        assert_eq!(prep_expiry_steps(&roles, &skip), vec!["retest"]);
     }
 
     // ===== calendar news-scope range ====================================
