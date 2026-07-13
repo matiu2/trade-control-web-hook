@@ -17,9 +17,10 @@
 //! - a v2 [`TradePlan`] / [`Line`] / [`PlanRule`] model — lines (named geometry)
 //!   separated from rules (behaviour referencing a line by name),
 //! - the [`Facts`] blackboard ([`FactValue`], keyed by `(line, kind)`),
-//! - a v2 [`World`] (no `PlanState`, no phase — holds `&mut Facts` + the v2
-//!   plan),
-//! - the [`Rule`] behaviour trait and the [`Effect`] enum (`Fire` only),
+//! - a v2 [`World`] (no `PlanState`, no phase — holds a read-only `&Facts` + the
+//!   v2 plan),
+//! - the [`Rule`] behaviour trait (pure: `tick(&World) -> Vec<Effect>`) and the
+//!   [`Effect`] enum (`Fire` + `WriteFact` + `WriteScratch`),
 //! - [`BreakAndClose`], the first rule, reusing the proven `cross.rs`
 //!   line-projection, and
 //! - a minimal [`drive`] loop that ticks the plan's break-and-close rules and

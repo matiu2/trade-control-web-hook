@@ -1,11 +1,14 @@
 //! [`World`] — the per-tick context the driver hands each rule's
 //! [`tick`](crate::rule::Rule::tick).
 //!
-//! v2 shape (fact-based): there is **no `PlanState` and no `phase`**. A rule
-//! reads the [`Facts`] blackboard (facts other rules wrote) and the v2
-//! [`TradePlan`] (its lines + rules + buffer), and writes its own facts back.
-//! The driver rebuilds a fresh `World` per candle; every borrow is tied to that
-//! one tick by the lifetime `'a`.
+//! v2 shape (fact-based, **pure rules**): there is **no `PlanState` and no
+//! `phase`**. A rule *reads* the [`Facts`] blackboard (facts other rules wrote)
+//! and the v2 [`TradePlan`] (its lines + rules + buffer), but it does **not**
+//! write anything through the `World` — `facts` is a shared `&Facts`, read-only.
+//! Every output (fires and fact/scratch writes) leaves the rule as an
+//! [`Effect`](crate::effect::Effect); the driver applies those. The driver
+//! rebuilds a fresh `World` per candle; every borrow is tied to that one tick by
+//! the lifetime `'a`.
 
 use chrono::{DateTime, Utc};
 
@@ -25,8 +28,12 @@ pub struct World<'a> {
     /// The ascending detector window used to resolve a sloped line's level in
     /// bar-index space. Unused for a horizontal line.
     pub window: &'a [Candle],
-    /// The fact blackboard — read facts other rules wrote, write your own.
-    pub facts: &'a mut Facts,
+    /// The fact blackboard — **read-only**. Read facts other rules wrote (and
+    /// your own scratch); to write, return a
+    /// [`WriteFact`](crate::effect::Effect::WriteFact) /
+    /// [`WriteScratch`](crate::effect::Effect::WriteScratch) effect for the
+    /// driver to apply.
+    pub facts: &'a Facts,
     /// The v2 plan — for its lines, rules, and `cross_buffer_pct`.
     pub plan: &'a TradePlan,
 }

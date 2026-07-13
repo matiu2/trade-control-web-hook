@@ -1,23 +1,30 @@
-//! [`BreakAndClose`] — the break-and-close prep rule, **fact-based**.
+//! [`BreakAndClose`] — the break-and-close prep rule, **fact-based & pure**.
 //!
-//! This is the v2 rewrite of the first prep. It reads/writes only the
+//! This is the v2 rewrite of the first prep. It only *reads* the
 //! [`Facts`](crate::facts::Facts) blackboard — there is **no `Phase`** and no
-//! `PlanState`. On a genuine close through its line it writes the fact
-//! `(line, "break_close") = At(candle.time)` and emits [`Effect::Fire`].
+//! `PlanState`, and it **mutates nothing**. Everything it produces leaves as an
+//! [`Effect`] for the driver to apply: on a genuine close through its line it
+//! returns [`Effect::WriteFact`] stamping `(line, "break_close") =
+//! At(candle.time)` **and** [`Effect::Fire`]; its cross bookkeeping leaves as an
+//! [`Effect::WriteScratch`].
 //!
 //! # What it reproduces from the proven v1 logic
 //!
-//! 1. **Latch** — if `(line, "break_close")` is already set, do nothing and
-//!    write nothing. (v1: `state.fired.contains(rule_id)`.)
+//! 1. **Latch** — if `(line, "break_close")` is already set, do nothing and emit
+//!    nothing. (v1: `state.fired.contains(rule_id)`.) Reading the fact to latch
+//!    is fine — only *writing* moves to effects.
 //! 2. **`last_close` bookkeeping before the gate** — an `OnClose` cross measures
 //!    this candle's close against the rule's *prior* close. That prior close is
-//!    itself a fact: `(line, "last_close") = Num(close)`. It is recorded on
-//!    **every** tick (even a spread-hour bar and even a non-firing bar), so a
+//!    **rule-private scratch**, keyed `(rule_id, "last_close")` — not a shared
+//!    `(line, kind)` fact (see [`facts`](crate::facts)). The rule emits a
+//!    [`WriteScratch`](Effect::WriteScratch) for it on **every** tick that gets
+//!    past the latch (even a spread-hour bar and even a non-firing bar), so a
 //!    genuine cross on the next clean bar is measured correctly. This is v1's
 //!    "record `last_close` before the spread-hour gate" subtlety, expressed as a
-//!    fact instead of `PlanState.last_close`.
+//!    scratch effect instead of an in-place `PlanState.last_close` mutation.
 //! 3. **Spread-hour suppression gates the FIRE, not the bookkeeping** — a hit on
-//!    a spread-hour bar records `last_close` but does not fire.
+//!    a spread-hour bar still emits the `last_close` scratch write but does not
+//!    fire or stamp `break_close`.
 //!
 //! # Cross evaluation
 //!
@@ -32,15 +39,16 @@ use trade_control_core::trade_plan::Trigger;
 
 use crate::cross::{eval_trigger, trigger_uses_close};
 use crate::effect::Effect;
-use crate::facts::{FactValue, Facts};
+use crate::facts::FactValue;
 use crate::plan::{Line, PlanRule};
 use crate::rule::Rule;
 use crate::world::World;
 
-/// Fact kind for the break-and-close stamp.
+/// Shared-fact kind for the break-and-close stamp (keyed `(line, kind)`).
 const KIND_BREAK_CLOSE: &str = "break_close";
-/// Fact kind for the per-rule prior-close bookkeeping.
-const KIND_LAST_CLOSE: &str = "last_close";
+/// Rule-private scratch kind for the prior-close bookkeeping (keyed
+/// `(rule_id, kind)`).
+const SCRATCH_LAST_CLOSE: &str = "last_close";
 
 /// The break-and-close prep, bound to a v2 [`PlanRule`]. Borrowed so
 /// instantiating it per tick is free.
@@ -61,9 +69,10 @@ impl Rule for BreakAndClose<'_> {
         &self.rule.id
     }
 
-    fn tick(&self, w: &mut World) -> Vec<Effect> {
+    fn tick(&self, w: &World) -> Vec<Effect> {
         // Latch: once the break-and-close fact is set, this rule is done — it
-        // never re-stamps (v1's multi-enter re-cross guard).
+        // never re-stamps (v1's multi-enter re-cross guard). Reading to latch is
+        // fine; a pure rule may read facts, it just can't write them.
         if w.facts.is_set(&self.rule.line, KIND_BREAK_CLOSE) {
             return Vec::new();
         }
@@ -79,18 +88,43 @@ impl Rule for BreakAndClose<'_> {
         };
 
         let trigger = self.trigger_for(line, w.plan.granularity.seconds());
+        let prev_close = w.facts.num_scratch(&self.rule.id, SCRATCH_LAST_CLOSE);
+        let hit = eval_trigger(
+            &trigger,
+            candle,
+            prev_close,
+            w.window,
+            w.plan.cross_buffer_pct,
+        );
 
-        if !self.fire(&trigger, candle, w.window, w.plan.cross_buffer_pct, w.facts) {
-            return Vec::new();
+        let mut effects = Vec::new();
+
+        // `last_close` bookkeeping BEFORE the gate — emitted on every past-latch
+        // tick (firing or not), as a rule-private scratch write for the driver
+        // to apply. Only `OnClose` triggers track it.
+        if trigger_uses_close(&trigger) {
+            effects.push(Effect::WriteScratch {
+                rule_id: self.rule.id.clone(),
+                kind: SCRATCH_LAST_CLOSE.to_string(),
+                value: FactValue::Num(candle.c),
+            });
         }
 
-        // Genuine cross: stamp the break-close fact and dispatch the prep intent.
-        w.facts.set(
-            &self.rule.line,
-            KIND_BREAK_CLOSE,
-            FactValue::At(candle.time),
-        );
-        vec![Effect::Fire(crate::rule::fired_intent(self.rule, candle))]
+        if !self.should_fire(hit, candle) {
+            return effects;
+        }
+
+        // Genuine cross: stamp the break-close shared fact AND dispatch the prep
+        // intent — both as effects, applied by the driver.
+        effects.push(Effect::WriteFact {
+            line: self.rule.line.clone(),
+            kind: KIND_BREAK_CLOSE.to_string(),
+            value: FactValue::At(candle.time),
+        });
+        effects.push(Effect::Fire(Box::new(crate::rule::fired_intent(
+            self.rule, candle,
+        ))));
+        effects
     }
 }
 
@@ -109,37 +143,13 @@ impl BreakAndClose<'_> {
         }
     }
 
-    /// Evaluate the trigger for one candle: record the `last_close` fact
-    /// (before the gate), then gate the *fire* on the spread hour. Returns
-    /// whether it fired.
-    fn fire(
-        &self,
-        trigger: &Trigger,
-        candle: &Candle,
-        window: &[Candle],
-        buffer_pct: f64,
-        facts: &mut Facts,
-    ) -> bool {
-        let prev_close = facts.num(&self.rule.line, KIND_LAST_CLOSE);
-        let hit = eval_trigger(trigger, candle, prev_close, window, buffer_pct);
-        self.record_last_close(trigger, candle, facts);
-        if hit
-            && trade_control_core::spread_blackout::is_spread_hour(
-                &self.rule.intent.instrument,
-                candle.time,
-            )
-        {
-            return false;
-        }
-        hit
-    }
-
-    /// Persist this candle's close as the rule's `last_close` fact, so an
-    /// `OnClose` cross can be detected against it next bar (only `OnClose`
-    /// triggers track it).
-    fn record_last_close(&self, trigger: &Trigger, candle: &Candle, facts: &mut Facts) {
-        if trigger_uses_close(trigger) {
-            facts.set(&self.rule.line, KIND_LAST_CLOSE, FactValue::Num(candle.c));
-        }
+    /// Does a raw cross `hit` translate into a fire? Suppressed on a spread-hour
+    /// bar (the gate applies to the fire only, never to the `last_close`
+    /// bookkeeping — that's already been emitted by the caller).
+    fn should_fire(&self, hit: bool, candle: &Candle) -> bool {
+        hit && !trade_control_core::spread_blackout::is_spread_hour(
+            &self.rule.intent.instrument,
+            candle.time,
+        )
     }
 }

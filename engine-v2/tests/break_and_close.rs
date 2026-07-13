@@ -462,10 +462,12 @@ fn extend_forward_gates_crosses_past_second_anchor() {
 // Fact model spot-check
 // ---------------------------------------------------------------------------
 
-/// The `last_close` bookkeeping fact is recorded even on a non-firing bar, so a
-/// genuine cross on the *next* bar measures against the right prior close.
+/// The `last_close` bookkeeping is recorded (as rule-private scratch) even on a
+/// non-firing bar, so a genuine cross on the *next* bar measures against the
+/// right prior close. It lives in the scratch namespace keyed by the rule id —
+/// NOT the shared `(line, kind)` fact map.
 #[test]
-fn last_close_fact_recorded_on_seed_bar() {
+fn last_close_scratch_recorded_on_seed_bar() {
     let ln = horizontal_line(
         "neckline",
         1.1000,
@@ -494,9 +496,57 @@ fn last_close_fact_recorded_on_seed_bar() {
     );
 
     assert_eq!(
-        facts.get("neckline", "last_close"),
+        facts.get_scratch("03-prep-break-and-close", "last_close"),
         Some(&FactValue::Num(1.1010)),
-        "seed bar's close persisted as last_close for the next OnClose cross"
+        "seed bar's close persisted as rule-private last_close scratch"
     );
     assert!(!facts.is_set("neckline", "break_close"));
+}
+
+/// Reading the SHARED fact namespace must never surface the `last_close`
+/// scratch — it is reachable only via the scratch accessor, keyed by rule id.
+/// Guards the namespace split (a future rule reading `("neckline","last_close")`
+/// must not pick up another rule's private bookkeeping).
+#[test]
+fn last_close_scratch_not_visible_in_shared_facts() {
+    let ln = horizontal_line(
+        "neckline",
+        1.1000,
+        "2026-06-01T09:00:00Z",
+        "2026-06-01T20:00:00Z",
+    );
+    let rule = bc_rule("neckline", BarEvent::OnClose, CrossDir::Down);
+    let p = plan(vec![ln], vec![rule]);
+
+    let candles = vec![candle(
+        "2026-06-01T12:00:00Z",
+        1.1012,
+        1.1015,
+        1.1008,
+        1.1010,
+    )];
+
+    let mut facts = Facts::new();
+    let _ = drive(
+        &p,
+        &mut facts,
+        &candles,
+        &candles,
+        ts("2026-06-01T12:00:05Z"),
+    );
+
+    // Scratch is set...
+    assert_eq!(
+        facts.num_scratch("03-prep-break-and-close", "last_close"),
+        Some(1.1010),
+    );
+    // ...but the SHARED namespace never surfaces it — under the line name it
+    // used to (mistakenly) share, nor under the rule id.
+    assert_eq!(
+        facts.get("neckline", "last_close"),
+        None,
+        "scratch must not leak into the shared (line, kind) fact map"
+    );
+    assert!(!facts.is_set("neckline", "last_close"));
+    assert_eq!(facts.get("03-prep-break-and-close", "last_close"), None);
 }

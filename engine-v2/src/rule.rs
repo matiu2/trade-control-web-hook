@@ -1,9 +1,11 @@
 //! The [`Rule`] trait — the single seam the driver ticks (behaviour), plus the
 //! [`fired_intent`] helper that turns a fired [`PlanRule`] into a [`FiredIntent`].
 //!
-//! A rule reads the [`World`] (facts + candle + plan), may write facts to the
-//! blackboard (`World::facts`), and returns the [`Effect`]s it wants done. The
-//! driver interprets those effects (this slice: collects `Fire`).
+//! A rule is a **pure** function of the [`World`] (facts + candle + plan): it
+//! reads facts other rules wrote (and its own scratch), and returns **all** its
+//! outputs as [`Effect`]s — fires *and* fact/scratch writes. It never mutates the
+//! world. The driver interprets those effects: applies the writes to the shared
+//! [`Facts`](crate::facts::Facts) and collects the `Fire`s.
 //!
 //! Note the name split (see [`crate::plan`]): the **data** struct is
 //! [`PlanRule`], this **behaviour** trait is `Rule`.
@@ -23,9 +25,10 @@ pub trait Rule {
     /// key facts.
     fn rule_id(&self) -> &str;
 
-    /// Tick this rule against one candle. Reads [`World`], may write facts to
-    /// `w.facts`, and returns the [`Effect`]s produced this candle.
-    fn tick(&self, w: &mut World) -> Vec<Effect>;
+    /// Tick this rule against one candle. **Pure**: reads [`World`] and returns
+    /// the [`Effect`]s produced this candle (fires + fact/scratch writes). Must
+    /// not mutate anything — the driver applies the returned writes.
+    fn tick(&self, w: &World) -> Vec<Effect>;
 }
 
 /// Build a [`FiredIntent`] for a rule that fired on `candle`, cloning the intent
