@@ -175,12 +175,40 @@ pub enum RestoreReason {
     Recovered,
 }
 
+/// Who owns deleting the per-trade [`SpreadBlackoutRecord`] after the OFF-side
+/// restore. The record can carry BOTH System 3 (cancelled resting orders, which
+/// this fn restores) AND System 2 (widened open-position stops, which this fn
+/// does NOT touch). Whoever restores System 2 must clear the record — so the
+/// caller declares the ownership:
+///
+/// - [`ClearPolicy::ClearRecord`] (default) — this fn deletes the record after
+///   restoring System 3. The **replay** owner: it has no System 2, is the sole
+///   record owner, and today's clearing behaviour is byte-identical.
+/// - [`ClearPolicy::LeaveForCaller`] — this fn restores System 3 but LEAVES the
+///   record for the caller to delete. The **live watcher** owner: it restores
+///   System 2 (widened stops) alongside and issues the single `clear` itself, so
+///   the coexistence contract ("restore both, clear once") is preserved. Without
+///   this, the shared fn would delete a System-2-carrying record before its
+///   widened stops were restored — leaving an open position's SL widened.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClearPolicy {
+    /// Delete the record after restoring System 3 (default; replay).
+    ClearRecord,
+    /// Restore System 3 but leave the record for the caller to delete (live
+    /// watcher, which also restores System 2 then clears once).
+    LeaveForCaller,
+}
+
 /// Run one resting-order lifecycle pass for a single `(broker, account)` at
 /// `now`. Cancels resting orders that entered a spread hour and re-drives
 /// records whose trough has lifted. The caller (live cron / replay loop) owns
 /// the per-account fan-out and passes the already-acquired broker + signing key
 /// in — mirroring how [`run_enter`] is per-enter and the cron loops accounts
 /// around it.
+///
+/// `clear` declares who deletes the record on the OFF side — see [`ClearPolicy`].
+/// Replay passes `ClearRecord` (sole owner); the live watcher passes
+/// `LeaveForCaller` so it can restore System 2 then clear once.
 ///
 /// The OFF-side live-spread recovery reads through `broker.get_quote`: the live
 /// worker's real broker returns the current spread (so it can un-block early);
@@ -195,6 +223,7 @@ pub async fn pending_order_lifecycle<B, S, P, V>(
     src: &V,
     account: Option<&str>,
     now: DateTime<Utc>,
+    clear: ClearPolicy,
 ) -> LifecycleReport
 where
     B: Broker,
@@ -204,7 +233,17 @@ where
 {
     let mut report = LifecycleReport::default();
     cancel_pass(broker, store, src, account, now, &mut report).await;
-    recover_pass(broker, store, cfg_provider, src, now, &mut report).await;
+    recover_pass(
+        broker,
+        store,
+        cfg_provider,
+        src,
+        account,
+        now,
+        clear,
+        &mut report,
+    )
+    .await;
     report
 }
 
@@ -418,14 +457,26 @@ fn merge_cancelled_order(
 
 // --- OFF side: recover (restore before clear) ---
 
-/// Walk every per-trade record and, for each `applied` one whose trough has
-/// lifted, re-drive its cancelled orders then clear it.
+/// Walk the per-trade records **for this account** and, for each `applied` one
+/// whose trough has lifted, re-drive its cancelled orders then (under
+/// `ClearRecord`) clear it.
+///
+/// Account-scoped, symmetric with [`cancel_pass`] (which scopes on
+/// `list_pending_orders(account_id)`): the caller passes ONE account's broker,
+/// so recover must only touch THAT account's records — else the live multi-account
+/// cron would `off_now`/re-drive account-Y's records against account-X's broker.
+/// `store.list_all_spread_blackout_records` is store-wide, so we filter by
+/// `record.account == account`. The replay passes `account = None` and its records
+/// carry `account = None`, so its behaviour is unchanged.
+#[allow(clippy::too_many_arguments)]
 async fn recover_pass<B: Broker, S: StateStore, P: EnterConfigProvider, V: VerifiedSource>(
     broker: &B,
     store: &S,
     cfg_provider: &P,
     src: &V,
+    account: Option<&str>,
     now: DateTime<Utc>,
+    clear_policy: ClearPolicy,
     report: &mut LifecycleReport,
 ) {
     let records = match store.list_all_spread_blackout_records().await {
@@ -436,13 +487,31 @@ async fn recover_pass<B: Broker, S: StateStore, P: EnterConfigProvider, V: Verif
         }
     };
     for record in records {
-        recover_one(broker, store, cfg_provider, src, &record, now, report).await;
+        if record.account.as_deref() != account {
+            continue;
+        }
+        recover_one(
+            broker,
+            store,
+            cfg_provider,
+            src,
+            &record,
+            now,
+            clear_policy,
+            report,
+        )
+        .await;
     }
 }
 
 /// Per-record OFF decision + clear. `!applied` ⇒ untouched (rail 4); backstop
 /// clears unconditionally (rail 5); otherwise recovery (live spread) or the
 /// baked spread hour ending clears it. Restore precedes clear (rail 6).
+///
+/// `clear_policy` decides who deletes the record after the System-3 restore (see
+/// [`ClearPolicy`]): `ClearRecord` deletes it here (replay); `LeaveForCaller`
+/// leaves it for the live watcher to delete after it also restores System 2.
+#[allow(clippy::too_many_arguments)]
 async fn recover_one<B: Broker, S: StateStore, P: EnterConfigProvider, V: VerifiedSource>(
     broker: &B,
     store: &S,
@@ -450,6 +519,7 @@ async fn recover_one<B: Broker, S: StateStore, P: EnterConfigProvider, V: Verifi
     src: &V,
     record: &SpreadBlackoutRecord,
     now: DateTime<Utc>,
+    clear_policy: ClearPolicy,
     report: &mut LifecycleReport,
 ) {
     // RAIL 4 — never touch what you didn't apply.
@@ -464,11 +534,14 @@ async fn recover_one<B: Broker, S: StateStore, P: EnterConfigProvider, V: Verifi
     if off_now(broker, record, now).await {
         // RAIL 6 — restore BEFORE clear.
         restore_cancelled_orders(broker, store, cfg_provider, src, record, now).await;
-        if clear(store, record).await {
-            report
-                .restored
-                .push((record.trade_id.clone(), RestoreReason::Recovered));
-        }
+        finish_recover(
+            store,
+            record,
+            clear_policy,
+            RestoreReason::Recovered,
+            report,
+        )
+        .await;
         return;
     }
 
@@ -484,10 +557,32 @@ async fn recover_one<B: Broker, S: StateStore, P: EnterConfigProvider, V: Verifi
     // record is force-cleared rather than pinning the trade forever.
     if backstop_due(record.opened_at, now) {
         restore_cancelled_orders(broker, store, cfg_provider, src, record, now).await;
-        if clear(store, record).await {
-            report
-                .restored
-                .push((record.trade_id.clone(), RestoreReason::Backstop));
+        finish_recover(store, record, clear_policy, RestoreReason::Backstop, report).await;
+    }
+}
+
+/// The tail of a successful OFF-side System-3 restore: clear the record (only
+/// under [`ClearPolicy::ClearRecord`]) and record the restore in the report.
+///
+/// Under `LeaveForCaller` the record is deliberately NOT deleted here — the live
+/// watcher restores System 2 (widened stops) then issues the single clear itself
+/// (Option A). The `report.restored` push happens either way: the System-3
+/// restore DID occur, and the report is the caller's signal that it did.
+async fn finish_recover<S: StateStore>(
+    store: &S,
+    record: &SpreadBlackoutRecord,
+    clear_policy: ClearPolicy,
+    reason: RestoreReason,
+    report: &mut LifecycleReport,
+) {
+    match clear_policy {
+        ClearPolicy::ClearRecord => {
+            if clear(store, record).await {
+                report.restored.push((record.trade_id.clone(), reason));
+            }
+        }
+        ClearPolicy::LeaveForCaller => {
+            report.restored.push((record.trade_id.clone(), reason));
         }
     }
 }
@@ -965,6 +1060,7 @@ mod tests {
             &src(),
             Some("reversals"),
             now,
+            ClearPolicy::ClearRecord,
         ));
         assert!(
             broker.cancel_calls.borrow().is_empty(),
@@ -990,6 +1086,7 @@ mod tests {
             &src(),
             None,
             now,
+            ClearPolicy::ClearRecord,
         ));
         assert!(broker.cancel_calls.borrow().is_empty());
         assert!(report.cancelled.is_empty());
@@ -1072,6 +1169,7 @@ mod tests {
             &src(),
             &rec,
             now,
+            ClearPolicy::ClearRecord,
             &mut report,
         ));
         assert!(report.restored.is_empty(), "unapplied ⇒ never cleared");
@@ -1100,12 +1198,123 @@ mod tests {
                 .await
                 .expect("upsert record");
             let mut report = LifecycleReport::default();
-            recover_one(&broker, &store, &StubCfg, &src(), &rec, now, &mut report).await;
+            recover_one(
+                &broker,
+                &store,
+                &StubCfg,
+                &src(),
+                &rec,
+                now,
+                ClearPolicy::ClearRecord,
+                &mut report,
+            )
+            .await;
             assert_eq!(
                 report.restored,
                 vec![("t-off".to_string(), RestoreReason::Backstop)],
                 "backstop must clear the stuck record"
             );
+        });
+    }
+
+    /// Option A — `ClearPolicy::LeaveForCaller`: the OFF-side System-3 restore
+    /// runs and the report records it, but the shared fn does NOT delete the
+    /// record — the live watcher (which also restores System 2) owns the single
+    /// clear. Uses a block-ENDED bar so `off_now` fires without any quote.
+    #[test]
+    fn leave_for_caller_restores_but_does_not_clear_the_record() {
+        use crate::state::RememberedStop;
+        let broker = MockBroker::default(); // no quote; block-end drives off_now
+        let store = MemStateStore::new();
+        // A System-2-ONLY record: EMPTY cancelled_orders (nothing for System 3 to
+        // restore) but a WIDENED STOP in original_stops (System 2's data). This is
+        // the exact regression case: the shared fn must NOT delete this record —
+        // the live watcher still needs it to restore the widened stop, then clears.
+        let mut rec = applied_record("AUD/CHF", "2026-07-08T21:05:00Z");
+        rec.original_stops = vec![RememberedStop {
+            position_or_order_id: "POS-9".into(),
+            original_stop: 0.5620,
+        }];
+        let now = ts("2026-07-08T12:00:00Z"); // midday — block ended → off_now true
+        store.set_clock(now);
+        run(async {
+            store
+                .upsert_spread_blackout_record(&rec, SAFETY_FORCE_RESTORE_SECONDS)
+                .await
+                .expect("upsert record");
+            let mut report = LifecycleReport::default();
+            recover_one(
+                &broker,
+                &store,
+                &StubCfg,
+                &src(),
+                &rec,
+                now,
+                ClearPolicy::LeaveForCaller,
+                &mut report,
+            )
+            .await;
+            // The restore is reported (System 3 restore did occur — here a no-op
+            // over empty cancelled_orders — and the caller is signalled).
+            assert_eq!(
+                report.restored,
+                vec![("t-off".to_string(), RestoreReason::Recovered)],
+                "LeaveForCaller still reports the restore"
+            );
+            // The record is LEFT for the caller — NOT deleted here — AND it still
+            // carries its widened stop, so the watcher can restore System 2.
+            let still_there = store
+                .get_spread_blackout_record("t-off")
+                .await
+                .expect("record read")
+                .expect(
+                    "LeaveForCaller must NOT delete the System-2-only record — the watcher \
+                     restores its widened stop then clears",
+                );
+            assert_eq!(
+                still_there.original_stops.len(),
+                1,
+                "the widened-stop data survives for the watcher's System-2 restore"
+            );
+            assert_eq!(still_there.original_stops[0].position_or_order_id, "POS-9");
+        });
+    }
+
+    /// The twin: `ClearPolicy::ClearRecord` (replay/default) DOES delete the
+    /// record on the same OFF trigger — so the policy actually gates the delete.
+    #[test]
+    fn clear_record_deletes_the_record_on_off() {
+        let broker = MockBroker::default();
+        let store = MemStateStore::new();
+        let rec = applied_record("AUD/CHF", "2026-07-08T21:05:00Z");
+        let now = ts("2026-07-08T12:00:00Z"); // block ended → off_now true
+        store.set_clock(now);
+        run(async {
+            store
+                .upsert_spread_blackout_record(&rec, SAFETY_FORCE_RESTORE_SECONDS)
+                .await
+                .expect("upsert record");
+            let mut report = LifecycleReport::default();
+            recover_one(
+                &broker,
+                &store,
+                &StubCfg,
+                &src(),
+                &rec,
+                now,
+                ClearPolicy::ClearRecord,
+                &mut report,
+            )
+            .await;
+            assert_eq!(
+                report.restored,
+                vec![("t-off".to_string(), RestoreReason::Recovered)]
+            );
+            let gone = store
+                .get_spread_blackout_record("t-off")
+                .await
+                .expect("record read");
+            assert!(gone.is_none(), "ClearRecord deletes the record");
         });
     }
 
@@ -1185,6 +1394,7 @@ mod tests {
             &source,
             Some("reversals"),
             now,
+            ClearPolicy::ClearRecord,
         ));
         assert_eq!(
             report.cancelled,
@@ -1209,6 +1419,43 @@ mod tests {
         });
     }
 
+    /// PR-2 TRIGGER DELTA (characterisation): the ON-side cancel now fires on the
+    /// pure baked clock (`is_spread_hour`) and DOES NOT read the live quote. The
+    /// old live-cron cancel sampled `get_quote` and cancelled only when
+    /// `spread_pips > elevated_threshold` (~5× the instrument's median, e.g.
+    /// ~4.5p for AUD/CHF). This test pins the NEW behaviour: inside a baked spread
+    /// hour the order is cancelled EVEN WITH A NARROW live spread (2p, well under
+    /// the old ~4.5p threshold) — proving the quote no longer gates the cancel.
+    /// Replaces the deleted `current_cancel_trigger_uses_5x_median_threshold_for_aud_chf`.
+    #[test]
+    fn cancel_trigger_is_baked_clock_not_live_quote() {
+        let broker = MockBroker::with_pending(pending("t-enter-o1", "AUD/CHF"));
+        // A NARROW live spread (2p) — the old 5×-median live-quote gate (~4.5p)
+        // would have left this order resting. The baked clock ignores it.
+        broker.set_quote(0.5600, 0.5602);
+        let store = MemStateStore::new();
+        let mut armed = std::collections::HashMap::new();
+        armed.insert("t-enter-o1".to_string(), armed_verified("AUD/CHF"));
+        let source = ArmedSource { armed };
+
+        let now = ts("2026-07-08T21:00:00Z"); // AUD/CHF baked spread hour
+        store.set_clock(now);
+        let report = run(pending_order_lifecycle(
+            &broker,
+            &store,
+            &StubCfg,
+            &source,
+            Some("reversals"),
+            now,
+            ClearPolicy::ClearRecord,
+        ));
+        assert_eq!(
+            report.cancelled,
+            vec!["t-enter-o1".to_string()],
+            "baked-clock ON trigger cancels in a spread hour regardless of a narrow live spread"
+        );
+    }
+
     /// The predicate-false twin: the SAME armed order on a clean bar is left
     /// resting (ON = baked clock), proving the seam didn't change the gate.
     #[test]
@@ -1228,6 +1475,7 @@ mod tests {
             &source,
             Some("reversals"),
             now,
+            ClearPolicy::ClearRecord,
         ));
         assert!(report.cancelled.is_empty());
         assert!(broker.cancel_calls.borrow().is_empty());

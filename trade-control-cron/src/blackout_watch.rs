@@ -1,147 +1,143 @@
-//! Cron 2 step — spread-recovery watcher. Runs every 15 min alongside
-//! the order sweep. For each per-trade blackout record with
-//! `applied == true`, decide whether the blackout has lifted; if so,
-//! clear the record. The ACTUAL restore of widened stops (Sub-plan 4)
-//! and cancelled orders (Sub-plan 5) hooks in at the marked points —
-//! Sub-plan 2 only owns the flag lifecycle + the clear.
+//! The every-tick spread-blackout driver (PR 2 — live cron cutover to the shared
+//! resting-order lifecycle).
 //!
-//! Three safety rules are quoted from the master plan and enforced here
-//! (do NOT optimise them out):
+//! Per affected account it runs the SHARED
+//! [`core::pending_order_lifecycle`](trade_control_core::pending_lifecycle::pending_order_lifecycle)
+//! — the SAME function the offline replay drives, so the resting-order cancel +
+//! restore DECISION (System 3) runs identically live and in replay. It is called
+//! with [`ClearPolicy::LeaveForCaller`](trade_control_core::pending_lifecycle::ClearPolicy),
+//! so the shared fn restores System 3 but LEAVES the record; this watcher then
+//! restores **System 2** (widened open-position stops → remembered originals) and
+//! issues the single record `clear`. The coexistence contract — restore both
+//! System 2 and System 3, then clear once — is preserved on ONE unified OFF
+//! trigger (the shared fn's `off_now`: block-lifted OR live-spread-recovered).
 //!
-//! 1. **Hard restore floor** — act whenever `applied && spread-normal`,
-//!    REGARDLESS of the clock. Recovery is never gated on
-//!    `is_ny_close_edge`; a blackout that lifts in 20 min restores in
-//!    20 min.
-//! 2. **Backstop timeout** — `now >= opened_at + BLACKOUT_BACKSTOP_SECONDS`
-//!    clears unconditionally, so a stuck record (broker flaky, spread
-//!    genuinely elevated for hours) never pins a trade forever.
-//! 3. **Never-touch-what-you-didn't-apply** — the watcher's first line
-//!    is `if !record.applied { return }`. Sub-plan 2 never sets
-//!    `applied = true` (only 4/5 do, after a real broker mutation), so
-//!    here the loop is effectively a no-op — the skeleton 4/5 fill.
+//! ## What moved to the shared fn (`core::pending_lifecycle`)
+//!
+//! - The ON cancel (now the pure baked clock `is_spread_hour`, was a live-quote
+//!   `spread > 5×median` sample — the PR-2 trigger delta).
+//! - The OFF recovery decision + the safety force-restore ceiling + their pure
+//!   predicates and tests.
+//! - The System-3 re-drive via `run_enter` (RAIL 7, `restore = true`).
+//!
+//! ## What stays live-specific here
+//!
+//! - **System 2** ([`restore_remembered_stops`]) — `amend_stop` an open
+//!   position's widened SL back to its remembered original. Not part of the shared
+//!   System-3 fn (see the `LeaveForCaller` note in [`ClearPolicy`]).
+//! - The per-account fan-out + the single record `clear`.
 //!
 //! # Runtime-agnostic via the [`CronEnv`] seam
 //!
-//! Moved into `trade-control-cron` so both the wasm Cloudflare worker and the
-//! native VM scheduler run the *same* recovery watcher. The `&Env`-hidden broker
-//! acquisition travels through the [`CronEnv`] seam; the caller opens the
-//! [`StateStore`] and passes it in.
+//! Both the wasm worker and the native scheduler drive this via [`CronEnv`]; the
+//! caller opens the [`StateStore`] and passes it in.
 
-use chrono::{DateTime, Duration, Utc};
+use chrono::{DateTime, Utc};
 use trade_control_core::broker::{AmendError, Broker};
+use trade_control_core::pending_lifecycle::ClearPolicy;
 use trade_control_core::state::{SpreadBlackoutRecord, StateStore};
 
 use crate::broker_handle::BrokerHandle;
-use crate::constants::SAFETY_FORCE_RESTORE_SECONDS;
 use crate::seam::CronEnv;
+use crate::spread_lifecycle::run_spread_lifecycle_for_account;
 
-/// Walk every per-trade spread-blackout record. For each `applied`
-/// record, clear it when the spread has recovered or the backstop has
-/// fired. Per-row errors are logged and skipped — one bad row must
+/// The single every-tick spread-blackout driver (PR 2).
+///
+/// For EACH affected account it runs the SHARED
+/// `core::pending_order_lifecycle` (the SAME fn the offline replay calls) with
+/// [`ClearPolicy::LeaveForCaller`]: that CANCELS resting orders entering a
+/// per-instrument spread hour (baked clock, System 3 ON) and RESTORES System 3
+/// for records whose trough has lifted — but LEAVES each record. Then, for every
+/// record the shared fn reported restored, this watcher restores **System 2**
+/// (widened open-position stops → remembered originals) and issues the single
+/// record `clear`. So the coexistence contract holds ("restore System 2 + System
+/// 3, clear once") on ONE unified OFF trigger (the shared fn's `off_now`).
+///
+/// Why the CANCEL lives here (not in the NY-close apply): the shared fn does
+/// cancel + recover in one call, so driving it from ONE loop makes each happen
+/// exactly once per tick with no double-run. The watch loop is every-tick, so a
+/// resting order entering ANY instrument's baked spread hour is cancelled
+/// promptly — not just at the single global NY-close edge the old apply-side
+/// cancel keyed on.
+///
+/// Per-account / per-record errors are logged and skipped — one bad row must
 /// never abort the loop (same discipline as the order sweep).
 pub async fn watch_recovery<S, C>(store: &S, cron: &C, now: DateTime<Utc>)
 where
     S: StateStore,
     C: CronEnv,
 {
-    let records = match store.list_all_spread_blackout_records().await {
-        Ok(v) => v,
-        Err(err) => {
-            tracing::error!("blackout watch: list failed: {err}");
-            return;
-        }
-    };
-    tracing::info!("blackout watch: {} records", records.len());
-    for record in records {
-        if let Err(err) = watch_one(store, cron, &record, now).await {
-            tracing::error!(
-                "blackout watch[{}/{}]: {err}",
-                record.trade_id,
-                record.instrument
-            );
-        }
+    for account in affected_accounts(store).await {
+        watch_account(store, cron, account.as_deref(), now).await;
     }
 }
 
-/// Per-record recovery decision + clear. Returns an error string so the
-/// caller can log with row context.
-async fn watch_one<S, C>(
-    store: &S,
-    cron: &C,
-    record: &SpreadBlackoutRecord,
-    now: DateTime<Utc>,
-) -> Result<(), String>
+/// The distinct accounts to drive this tick: the union of accounts on existing
+/// blackout records (their System 2/3 may need restoring) and on tracked
+/// `EntryAttempt` rows (their resting orders may need CANCELLING before any
+/// record exists). Mirrors the old cancel path's account discovery, plus the
+/// record side the watcher already walked.
+async fn affected_accounts<S: StateStore>(store: &S) -> Vec<Option<String>> {
+    let mut accounts: Vec<Option<String>> = Vec::new();
+    let mut push = |acc: &Option<String>| {
+        if !accounts.contains(acc) {
+            accounts.push(acc.clone());
+        }
+    };
+    match store.list_all_entry_attempts().await {
+        Ok(v) => v.iter().for_each(|a| push(&a.account)),
+        Err(err) => tracing::error!("blackout watch: list_all_entry_attempts: {err}"),
+    }
+    match store.list_all_spread_blackout_records().await {
+        Ok(v) => v.iter().for_each(|r| push(&r.account)),
+        Err(err) => tracing::error!("blackout watch: list records failed: {err}"),
+    }
+    accounts
+}
+
+/// Drive one account: shared cancel+restore (System 3, leaving records), then
+/// per restored record restore System 2 + clear.
+async fn watch_account<S, C>(store: &S, cron: &C, account: Option<&str>, now: DateTime<Utc>)
 where
     S: StateStore,
     C: CronEnv,
 {
-    // SAFETY RULE 3 — never-touch-what-you-didn't-apply.
-    if !record.applied {
-        return Ok(());
-    }
+    // System 1/3 cancel + restore via the shared fn — leaves the record for us.
+    let report =
+        run_spread_lifecycle_for_account(store, cron, account, now, ClearPolicy::LeaveForCaller)
+            .await;
 
-    // NORMAL restore FIRST (SAFETY RULE 1 — hard restore floor). Act whenever
-    // applied && spread-normal, REGARDLESS of the clock. This is the path that
-    // restores at the block's end when the live spread genuinely recovers; with
-    // the per-record TTL now sized to outlive the block (concern 1 of the
-    // backstop split), it wins BEFORE any expiry and long before the safety
-    // ceiling.
-    let spread_abs = sample_spread(cron, record).await?;
-    // Convert the broker's absolute `ask − bid` to pips via the pip baked
-    // onto the record at apply time (Cron 1). The whole feature works in
-    // pips consistently; a `0.0`/non-finite pip means the apply path never
-    // baked one (a Sub-plan-2-era row, or a position with no joinable
-    // EntryAttempt) — fall back to a never-recover so the backstop is the
-    // only clear, rather than declaring recovery on a bogus pip division.
-    let spread_pips = spread_in_pips(spread_abs, record.pip_size);
-    if spread_recovered(spread_pips) {
-        // Restore both halves before clearing:
-        //  - System 2: widened stops → remembered originals.
-        //  - System 3: cancelled resting orders → re-driven via the entry path.
-        // They operate on independent lists of the SAME record (`original_stops`
-        // vs `cancelled_orders`), so they don't stomp each other; a trade may
-        // carry both (multi-shot: an open position whose stop was widened AND a
-        // resting re-entry order that was cancelled).
-        restore_remembered_stops(cron, record).await;
-        crate::restore_cancelled_orders(store, cron, record, now).await;
-        clear(store, record, "recovery").await?;
-        tracing::info!(
-            "blackout watch[{}]: spread {spread_pips}p recovered, cleared",
-            record.trade_id
-        );
-        return Ok(());
+    // For every record the shared fn reported restored (its OFF trigger fired,
+    // System 3 restored), restore System 2 then clear — SAME OFF decision, so
+    // both halves restore together and the record clears once (coexistence).
+    for (trade_id, _reason) in &report.restored {
+        if let Err(err) = finish_system2_and_clear(store, cron, trade_id).await {
+            tracing::error!("blackout watch[{trade_id}]: System-2 restore/clear: {err}");
+        }
     }
-
-    // SAFETY force-restore (last resort, SAFETY RULE 2) — a record still
-    // `applied` a very long time after `opened_at`, i.e. the live spread never
-    // recovered enough to clear it above. The timer (SAFETY_FORCE_RESTORE_SECONDS
-    // = 12h) is LONGER than any realistic block so it fires only past any
-    // legitimate block — it can no longer force-restore into an active trough the
-    // way the old 3h ceiling did (21:00+3h=00:00Z, mid-AUD/CHF's-8h-block). A
-    // stuck record is force-cleared rather than pinning the trade forever.
-    if backstop_due(record.opened_at, now) {
-        restore_remembered_stops(cron, record).await;
-        crate::restore_cancelled_orders(store, cron, record, now).await;
-        clear(store, record, "backstop").await?;
-        tracing::info!(
-            "blackout watch[{}]: safety force-restore fired, cleared",
-            record.trade_id
-        );
-    }
-    Ok(())
 }
 
-/// Convert an absolute `ask − bid` spread to pips using the record's baked
-/// pip size. Returns `f64::INFINITY` when `pip_size` is unusable
-/// (`0.0`/non-finite) so the caller never declares recovery on a bogus
-/// division — the backstop becomes the only clear path for that record.
-/// Pure — unit-testable without KV/broker.
-fn spread_in_pips(spread_abs: f64, pip_size: f64) -> f64 {
-    if pip_size > 0.0 && pip_size.is_finite() {
-        spread_abs / pip_size
-    } else {
-        f64::INFINITY
-    }
+/// The System-2 half + the single clear for one restored record. Re-reads the
+/// record (the shared fn left it under `LeaveForCaller`), restores its widened
+/// stops verbatim, then deletes the record. A record already gone (raced clear)
+/// is benign.
+async fn finish_system2_and_clear<S, C>(store: &S, cron: &C, trade_id: &str) -> Result<(), String>
+where
+    S: StateStore,
+    C: CronEnv,
+{
+    let record = match store.get_spread_blackout_record(trade_id).await {
+        Ok(Some(r)) => r,
+        // Already cleared (raced) — nothing to do.
+        Ok(None) => return Ok(()),
+        Err(err) => return Err(format!("get_record: {err}")),
+    };
+    // System 2: widened stops → remembered originals (independent of System 3's
+    // cancelled_orders list; a trade may carry both).
+    restore_remembered_stops(cron, &record).await;
+    clear(store, &record, "recovery").await?;
+    tracing::info!("blackout watch[{trade_id}]: System 2 restored + record cleared",);
+    Ok(())
 }
 
 /// Restore every remembered widened stop to its **remembered original**,
@@ -209,22 +205,6 @@ async fn restore_remembered_stops<C: CronEnv>(cron: &C, record: &SpreadBlackoutR
     }
 }
 
-/// Acquire the record's-account broker and read the current spread via
-/// the Sub-plan-1 `get_quote`. The per-broker match mirrors the order
-/// sweep's price-fetch dispatch.
-async fn sample_spread<C: CronEnv>(cron: &C, record: &SpreadBlackoutRecord) -> Result<f64, String> {
-    let broker = cron
-        .acquire_broker(record.account.as_deref())
-        .await
-        .ok_or_else(|| "broker acquisition failed".to_string())?;
-    let quote = match broker {
-        BrokerHandle::Oanda(b) => b.get_quote(&record.instrument).await,
-        BrokerHandle::TradeNation(b) => b.get_quote(&record.instrument).await,
-    }
-    .map_err(|err| format!("get_quote: {err}"))?;
-    Ok(quote.spread())
-}
-
 async fn clear<S: StateStore>(
     store: &S,
     record: &SpreadBlackoutRecord,
@@ -236,118 +216,16 @@ async fn clear<S: StateStore>(
         .map_err(|e| format!("{reason} clear: {e}"))
 }
 
-/// Pure safety force-restore predicate: true once `now` is at/after
-/// `opened_at + SAFETY_FORCE_RESTORE_SECONDS` (the 12h last-resort ceiling, not
-/// the per-record TTL). Unit-testable without KV/broker. Mirrors
-/// `sweep::bar_expiry_due`.
-pub fn backstop_due(opened_at: DateTime<Utc>, now: DateTime<Utc>) -> bool {
-    now >= opened_at + Duration::seconds(SAFETY_FORCE_RESTORE_SECONDS as i64)
-}
+// The OFF-side recovery/backstop DECISION (spread-recovered, block-lift, the 12h
+// safety ceiling) moved to `core::pending_lifecycle` (PR 2) — the SAME fn the
+// replay drives — so the cron no longer owns those predicates. `spread_recovered`
+// / `backstop_due` / `spread_in_pips` and their tests now live in `core`. This
+// module keeps only the LIVE-specific System-2 restore (`restore_remembered_stops`)
+// + the record `clear`.
 
-/// Pure recovery predicate — unit-testable without KV/broker. True when
-/// the sampled spread (**in pips**) has dropped back to/under the recovered
-/// cutoff.
-///
-/// UNITS (reconciled in Sub-plan 4): the whole spread-blackout feature now
-/// works in pips. The caller converts the broker's absolute `ask − bid` to
-/// pips via [`spread_in_pips`] using the `pip_size` baked onto the record at
-/// apply time (Cron 1) — resolving Sub-plan 2's "no intent in hand" open
-/// question. The cutoff itself lives beside System 1's *elevated* cutoff in
-/// `trade_control_core::spread_blackout` so the hysteresis pair is tuned in ONE
-/// place (`RECOVERED < ELEVATED`).
-pub fn spread_recovered(spread_pips: f64) -> bool {
-    spread_pips <= recovered_cutoff()
-}
-
-/// The recovered-spread cutoff in pips. Single source of truth:
-/// `trade_control_core::spread_blackout::SPREAD_BLACKOUT_RECOVERED_PIPS`,
-/// co-located with System 1's elevated cutoff so the hysteresis invariant is
-/// visible and tuned in one file.
-///
-/// TODO(open-question, spread-blackout): the recovered/elevated cutoffs are
-/// still uncalibrated placeholders and flat across instruments. If they
-/// become per-instrument (tied to the per-instrument widen-clamp open
-/// question in `blackout_widen` / `blackout_apply`), thread the instrument
-/// through here. Calibrate on demo before relying on these.
-fn recovered_cutoff() -> f64 {
-    trade_control_core::spread_blackout::SPREAD_BLACKOUT_RECOVERED_PIPS
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn ts(s: &str) -> DateTime<Utc> {
-        s.parse().expect("valid rfc3339 fixture")
-    }
-
-    #[test]
-    fn spread_recovered_below_cutoff() {
-        // Pips now (reconciled units). Recovered cutoff is 4p.
-        assert!(spread_recovered(2.0));
-        assert!(
-            spread_recovered(trade_control_core::spread_blackout::SPREAD_BLACKOUT_RECOVERED_PIPS),
-            "at cutoff counts as recovered"
-        );
-    }
-
-    #[test]
-    fn spread_not_recovered_above_cutoff() {
-        // ~20 pips during the trough — still elevated; also the 8p elevated
-        // band (between recovered 4p and elevated 8p) is NOT yet recovered.
-        assert!(!spread_recovered(20.0));
-        assert!(!spread_recovered(6.0), "hysteresis band is not recovered");
-    }
-
-    #[test]
-    fn spread_in_pips_uses_record_pip_size() {
-        // 0.0022 absolute at 0.0001 pip = 22 pips.
-        assert!((spread_in_pips(0.0022, 0.0001) - 22.0).abs() < 1e-9);
-        // Unusable pip (0.0 / non-finite) -> INFINITY so recovery never
-        // fires on a bogus division; backstop is the only clear.
-        assert_eq!(spread_in_pips(0.0022, 0.0), f64::INFINITY);
-        assert_eq!(spread_in_pips(0.0022, f64::NAN), f64::INFINITY);
-        assert!(!spread_recovered(spread_in_pips(0.0001, 0.0)));
-    }
-
-    #[test]
-    fn safety_force_restore_due_at_or_after_twelve_hours() {
-        let opened = ts("2026-03-12T21:05:00Z");
-        // exactly 12h later (the SAFETY_FORCE_RESTORE_SECONDS ceiling) → due.
-        assert!(backstop_due(opened, ts("2026-03-13T09:05:00Z")));
-        // 12h + 1s → due.
-        assert!(backstop_due(opened, ts("2026-03-13T09:05:01Z")));
-    }
-
-    #[test]
-    fn safety_force_restore_not_due_before_twelve_hours() {
-        let opened = ts("2026-03-12T21:05:00Z");
-        // 1s short of 12h → not yet.
-        assert!(!backstop_due(opened, ts("2026-03-13T09:04:59Z")));
-        // NOT due at the old 3h mark — that fired mid-block for multi-hour blocks.
-        assert!(!backstop_due(opened, ts("2026-03-13T00:05:00Z")));
-        // freshly opened → not yet.
-        assert!(!backstop_due(opened, ts("2026-03-12T21:20:00Z")));
-    }
-
-    /// Documents the `!applied` short-circuit as a value-level invariant:
-    /// a record the box never touched is left alone. The watcher's first
-    /// line enforces it; this asserts the field default that makes it safe.
-    #[test]
-    fn unapplied_record_is_the_left_alone_default() {
-        let record = SpreadBlackoutRecord {
-            trade_id: "hs-eur-nzd-c1e0f25b".into(),
-            instrument: "EUR_NZD".into(),
-            account: Some("reversals".into()),
-            applied: false,
-            opened_at: ts("2026-03-12T21:05:00Z"),
-            expires_at: ts("2026-03-13T00:05:00Z"),
-            pip_size: 0.0001,
-            original_stops: Vec::new(),
-            cancelled_orders: Vec::new(),
-        };
-        // The watcher returns early on this; even a long-past backstop
-        // must not matter, because `applied` is checked first.
-        assert!(!record.applied);
-    }
-}
+// The OFF-side recovery/backstop DECISION tests (spread_recovered / backstop_due
+// / spread_in_pips / the `!applied` short-circuit) moved to
+// `core::pending_lifecycle::tests` with the decision itself (PR 2), so the live
+// cron and the replay assert the SAME behaviour once. What remains live-specific
+// here (System-2 widen restore, the record clear, the account fan-out) is covered
+// by the shared-fn tests + the worker build.

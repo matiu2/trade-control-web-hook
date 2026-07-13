@@ -46,21 +46,25 @@ use crate::seam::CronEnv;
 /// legacy `is_ny_close_edge` entry-gating behaviour is unchanged.
 const NY_CLOSE_WINDOW_MARKER_TTL_SECONDS: u64 = 3 * 60 * 60;
 
-/// Open the global spread-blackout window marker + cancel resting entry
-/// orders iff `now` is the NY-close edge. **System 1 (entry-reject window)
-/// and System 3 (cancel resting orders)** — both keyed to the single global
-/// NY-close concept. The caller fires this on every candidate tick;
-/// `is_ny_close_edge` decides which is the real edge this season and no-ops
-/// the rest.
+/// Open the global spread-blackout **window marker** (System 1, the
+/// entry-reject window the entry gate reads) iff `now` is the NY-close edge. The
+/// caller fires this on every candidate tick; `is_ny_close_edge` decides which is
+/// the real edge this season and no-ops the rest.
 ///
-/// **System 2 (widen open stops) is NOT here** — it moved to
-/// [`widen_open_stops_for_spread_hours`], which is per-instrument (each
-/// instrument's own learned spread hours from the baked sampler data) and
-/// fires on every tick, not just at the NY-close edge. See that fn's docs
-/// for why the split happened (the 2026-07-05 spread-hour analysis: the
-/// widen must fire at *each instrument's* elevated hours — Gold overnight,
-/// EUR/USD 21:00, indices at their own — not one global NY-close hour).
-pub async fn apply_if_ny_close_edge<S, C>(store: &S, cron: &C, now: DateTime<Utc>)
+/// **System 3 (cancel resting orders) is NO LONGER here** (PR 2). It moved to the
+/// shared `core::pending_order_lifecycle`, driven per-account by the recovery
+/// watcher ([`crate::watch_recovery`]) every tick on the per-instrument baked
+/// clock (`is_spread_hour`) — the SAME function the offline replay calls. The old
+/// NY-close-gated, live-quote-triggered cancel is gone; a resting order entering
+/// ANY instrument's learned spread hour is now cancelled promptly by the watch
+/// loop, not just at the single global NY-close hour.
+///
+/// **System 2 (widen open stops) is NOT here either** — it lives in
+/// [`widen_open_stops_for_spread_hours`], per-instrument on every tick. See that
+/// fn's docs (the 2026-07-05 spread-hour analysis).
+///
+/// So this fn is now System-1-only: it opens the coarse NY-close window marker.
+pub async fn apply_if_ny_close_edge<S, C>(store: &S, _cron: &C, now: DateTime<Utc>)
 where
     S: StateStore,
     C: CronEnv,
@@ -77,13 +81,6 @@ where
         Ok(()) => tracing::info!("blackout: window opened at {now} (ttl {ttl}s)"),
         Err(err) => tracing::error!("blackout: failed to open window: {err}"),
     }
-
-    // System 3 — cancel resting entry orders on elevated-spread instruments
-    // and store their signed intent for the recovery watcher to re-drive.
-    // Shares the `SpreadBlackoutRecord` per trade with System 2's widen
-    // (widened stops in `original_stops`, cancelled orders in
-    // `cancelled_orders`) and the watcher restores both.
-    crate::cancel_resting_orders(store, cron, now).await;
 }
 
 /// **System 2** — pre-emptively widen every open position's stop away from

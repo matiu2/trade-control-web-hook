@@ -487,6 +487,9 @@ pub async fn run(
         // at so the cancel/restore timing is bar-accurate.
         replay_broker.set_as_of(now);
         let src = super::lifecycle::ReplayVerifiedSource::new(&replay_broker);
+        // Replay is the SOLE owner of the record (no System 2 widened stops
+        // offline), so it clears the record itself — `ClearRecord`, the default
+        // behaviour, byte-identical to before the Option-A clear-policy split.
         trade_control_core::pending_lifecycle::pending_order_lifecycle(
             &replay_broker,
             &store,
@@ -494,6 +497,7 @@ pub async fn run(
             &src,
             None,
             now,
+            trade_control_core::pending_lifecycle::ClearPolicy::ClearRecord,
         )
         .await;
 
