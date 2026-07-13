@@ -37,7 +37,32 @@ pub struct Bar {
 /// instrument's own median hourly ratio. `3×` — validated across the full
 /// sampler + OANDA-candle audit (normal hours 0.5–1.7×, elevated-but-fine
 /// band ~3.7×, genuine spikes 5.6–20×). See the memory.
+///
+/// **Necessary but not sufficient** — an hour must ALSO clear
+/// [`PEAK_FRAC`]. See [`profile_for_instrument`] for why both gates are needed.
 pub const MED_MULT: f64 = 3.0;
+
+/// An hour is elevated only if its ratio is also at least this fraction of the
+/// instrument's PEAK hourly ratio. `0.60` — the spike-dominance gate.
+///
+/// **Why both gates.** The full 2026-07-13 run exposed a med3 weakness on
+/// ~11 TradeNation pairs (USD/CHF, USD/CAD, EUR/JPY, GBP/JPY, USD/ZAR, …) with
+/// a *three-tier* spread: a genuine 21:00 UTC (NY-close, 07:00 Brisbane) spike
+/// (ratio 2.4–5.5×), a benign "wide" off-session band (0.65–1.8×), and a very
+/// tight London/NY-session core (0.22–0.41×). The tight core is the most
+/// hours, so it drags the median down until the benign wide band clears
+/// `3×median` — re-flagging the 10am–3pm Brisbane block as "rubbish" (the
+/// original over-flag bug). AUD/CHF stays clean because its tiers sit closer.
+///
+/// The peak-fraction gate strips the benign band: the wide band sits at
+/// 0.65–1.8× while the spike peak is 2.4–5.5×, so the band is well under 60%
+/// of peak and drops out — while the spike (the peak itself) stays. It is
+/// self-scaling (a fraction of the instrument's own peak, no absolute floor to
+/// calibrate per broker), and it needs the med3 gate as its partner: on a
+/// genuinely FLAT instrument (Spot Gold, peak only ~1.25× its median) nothing
+/// clears `3×median`, so 60%-of-a-low-peak never mis-fires. Two gates: med3
+/// keeps flat instruments empty, peak-frac keeps 3-tier instruments spike-only.
+pub const PEAK_FRAC: f64 = 0.60;
 
 /// An hour needs at least this many bars before we trust its p90 spread —
 /// fewer and a 1–2-bar bucket could declare a spread hour on noise.
@@ -65,6 +90,12 @@ pub struct SpreadProfile {
     pub vol: f64,
     /// Median over hours of `ratio(h)` — the med3 denominator; for the report.
     pub median_ratio: f64,
+    /// Per-UTC-hour `p90(spread/mid)` (0.0 for an under-sampled hour). For the
+    /// `--dump-hours` calibration report; not baked into the gate table.
+    pub hour_p90_frac: [f64; 24],
+    /// Per-UTC-hour `ratio(h) = p90_frac / vol` (0.0 for an under-sampled
+    /// hour). For the `--dump-hours` calibration report.
+    pub hour_ratio: [f64; 24],
     /// Number of usable bars that contributed.
     pub n_bars: usize,
 }
@@ -79,6 +110,8 @@ impl SpreadProfile {
             hour_widen_frac: [0.0; 24],
             vol: 0.0,
             median_ratio: 0.0,
+            hour_p90_frac: [0.0; 24],
+            hour_ratio: [0.0; 24],
             n_bars,
         }
     }
@@ -167,16 +200,25 @@ pub fn profile_for_instrument(bars: &[Bar]) -> SpreadProfile {
     if !(median_ratio.is_finite() && median_ratio > 0.0) {
         return SpreadProfile::empty(n);
     }
+    // Peak hourly ratio — the spike-dominance denominator. Non-empty (we have
+    // ≥12 populated hours), so `fold` with -inf is safe.
+    let peak_ratio = ratios.iter().copied().fold(f64::NEG_INFINITY, f64::max);
 
-    let threshold = MED_MULT * median_ratio;
+    // Two gates (both required): `3×median` isolates elevation from a flat
+    // baseline; `PEAK_FRAC × peak` strips a benign wide off-session band from
+    // the genuine spike on 3-tier instruments. See MED_MULT / PEAK_FRAC.
+    let med_threshold = MED_MULT * median_ratio;
+    let peak_threshold = PEAK_FRAC * peak_ratio;
     let mut mask: u32 = 0;
     let mut widen = [0.0_f64; 24];
+    let mut ratio_flat = [0.0_f64; 24];
     for h in 0..24 {
-        if let Some(r) = hour_ratio[h]
-            && r >= threshold
-        {
-            mask |= 1 << h;
-            widen[h] = hour_p90[h];
+        if let Some(r) = hour_ratio[h] {
+            ratio_flat[h] = r;
+            if r >= med_threshold && r >= peak_threshold {
+                mask |= 1 << h;
+                widen[h] = hour_p90[h];
+            }
         }
     }
 
@@ -185,6 +227,8 @@ pub fn profile_for_instrument(bars: &[Bar]) -> SpreadProfile {
         hour_widen_frac: widen,
         vol,
         median_ratio,
+        hour_p90_frac: hour_p90,
+        hour_ratio: ratio_flat,
         n_bars: n,
     }
 }
@@ -254,6 +298,62 @@ mod tests {
         // The baked widen for hour 21 is its p90 spread fraction (~the spike).
         assert!(p.hour_widen_frac[21] > 0.0009);
         assert_eq!(p.hour_widen_frac[20], 0.0);
+    }
+
+    /// A three-tier series like the over-flagged TN pairs: a tight session
+    /// core (most hours), a benign wide off-session band, and one real spike.
+    /// `core_frac` < `wide_frac` < `spike_frac`. Wide band = hours 0..=5 and
+    /// 22..=23; spike = hour 21; core = everything else.
+    fn three_tier_day(days: usize, core: f64, wide: f64, spike: f64) -> Vec<Bar> {
+        let mut bars = Vec::new();
+        let mut mid = 1.0000_f64;
+        for _ in 0..days {
+            for h in 0..24u8 {
+                mid += if h % 2 == 0 { 0.0002 } else { -0.0002 };
+                let frac = if h == 21 {
+                    spike
+                } else if h <= 5 || h >= 22 {
+                    wide
+                } else {
+                    core
+                };
+                bars.push(bar(h, frac, mid));
+            }
+        }
+        bars
+    }
+
+    #[test]
+    fn three_tier_flags_only_the_spike_not_the_wide_band() {
+        // USD/CHF-shaped: tight core 0.00009, benign wide band 0.00032,
+        // real spike 0.00128. With med3 alone the wide band clears (median is
+        // dragged down by the tight core); the peak-fraction gate strips it.
+        let bars = three_tier_day(6, 0.00009, 0.00032, 0.00128);
+        let p = profile_for_instrument(&bars);
+        assert_eq!(
+            p.elevated_vec(),
+            vec![21],
+            "the benign wide off-session band must NOT flag — only the spike \
+             (the 12pm-Brisbane-rubbish over-flag fix)"
+        );
+    }
+
+    #[test]
+    fn three_tier_med3_alone_would_over_flag() {
+        // Sanity: prove the peak-fraction gate is what's doing the work — the
+        // wide band DOES clear 3×median (so med3 alone would flag it).
+        let bars = three_tier_day(6, 0.00009, 0.00032, 0.00128);
+        let p = profile_for_instrument(&bars);
+        let med_threshold = MED_MULT * p.median_ratio;
+        // A wide-band hour (e.g. 0) clears 3×median but is < 60% of the peak.
+        assert!(
+            p.hour_ratio[0] >= med_threshold,
+            "wide band should clear 3×median (that's the med3 weakness)"
+        );
+        assert!(
+            p.hour_ratio[0] < PEAK_FRAC * p.hour_ratio[21],
+            "wide band must be under 60% of the spike peak (peak-frac excludes it)"
+        );
     }
 
     #[test]

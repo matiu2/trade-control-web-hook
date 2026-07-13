@@ -50,6 +50,11 @@ struct Args {
     /// Print the per-hour ratio table for each instrument (verbose).
     #[arg(long)]
     verbose: bool,
+
+    /// Print the full per-UTC-hour `p90(spread/mid)` + `ratio` table for each
+    /// instrument (for threshold calibration). Implies a small `--only` set.
+    #[arg(long)]
+    dump_hours: bool,
 }
 
 /// Known anchor masks (UTC hours) to diff against — proves parity with the
@@ -119,6 +124,9 @@ async fn main() -> Result<()> {
                         row.profile.median_ratio,
                         row.profile.n_bars,
                     );
+                }
+                if args.dump_hours {
+                    dump_hours(&row);
                 }
                 rows.push(row);
             }
@@ -196,6 +204,45 @@ async fn acquire_tn() -> Result<broker_tradenation_adapter::TradeNationAdapter> 
         .await
         .ok_or_else(|| eyre!("broker_tradenation::login returned None"))?;
     Ok(broker_tradenation_adapter::TradeNationAdapter(broker))
+}
+
+/// Print the full per-UTC-hour `p90(spread/mid)` and `ratio` table for one
+/// instrument, marking the elevated hours. For threshold calibration — shows
+/// WHY an hour did or didn't clear `3 × median_ratio`.
+fn dump_hours(row: &BaselineRow) {
+    let p = &row.profile;
+    let threshold = spread_baseline_gen::compute::MED_MULT * p.median_ratio;
+    println!(
+        "\n--- {} {}  vol={:.6}  med_ratio={:.3}  threshold(3x)={:.3}  n={} ---",
+        row.broker.as_str(),
+        row.symbol,
+        p.vol,
+        p.median_ratio,
+        threshold,
+        p.n_bars,
+    );
+    println!(
+        "  {:>3} {:>4} {:>13} {:>7}",
+        "UTC", "Bris", "p90_spr/mid", "ratio"
+    );
+    for h in 0..24usize {
+        if p.hour_p90_frac[h] == 0.0 && p.hour_ratio[h] == 0.0 {
+            continue; // under-sampled hour
+        }
+        let flag = if p.elevated_hours & (1 << h) != 0 {
+            "  <== SPREAD HOUR"
+        } else {
+            ""
+        };
+        println!(
+            "  {:>3} {:>4} {:>13.6} {:>7.2}{}",
+            h,
+            (h + 10) % 24,
+            p.hour_p90_frac[h],
+            p.hour_ratio[h],
+            flag,
+        );
+    }
 }
 
 /// Diff the computed masks against the known anchors and print a pass/fail
