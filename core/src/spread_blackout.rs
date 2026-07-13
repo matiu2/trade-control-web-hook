@@ -39,8 +39,47 @@ pub fn spread_blackout_decision(window_open: bool, spread_pips: f64, threshold_p
 /// `core/build.rs` from the `spread-sampler-cron` YAML samples. Each row is
 /// `(tradenation_market_name, low_pips, high_pips, median_pips, n)`,
 /// sorted by name. Empty when no samples are checked out (→ flat fallback).
+///
+/// **Being retired.** The spread-HOUR mask now comes from the candle-derived
+/// [`baseline_candle`] table (see `baked_candle_mask`); the sampler table still
+/// backs the pip *baseline* stats (`baked_baseline` → `elevated_threshold_pips`
+/// / operator message) and the System-2 *widen* (`baked_spread_hours`) until
+/// those migrate to the candle table too. See
+/// `SCOPING-candle-derived-spread-baseline.md`.
 mod baseline {
     include!(concat!(env!("OUT_DIR"), "/spread_baseline.rs"));
+}
+
+/// The candle-derived, **per-broker** spread-hour table produced offline by the
+/// `spread-baseline-gen` binary and committed as a source file (not build-time
+/// generated — the fetch is a network op). Each row is
+/// `(broker, symbol, reviewed, elevated_hours_mask, hour_widen_frac[24])`,
+/// sorted by `(broker, symbol)`.
+///
+/// This is the source of truth for **which UTC hours are spread hours**
+/// (`is_spread_hour`). It supersedes the sampler mask, which over-flagged tight
+/// crosses' whole overnight block (the "12pm Brisbane rubbish" bug). The
+/// per-broker keying means OANDA `EUR_USD` and TradeNation `EUR/USD` carry their
+/// own masks — no canonical sharing. Symbol strings never collide across
+/// brokers, so the lookup keys on the symbol alone.
+mod baseline_candle {
+    include!("spread_baseline_candle.rs");
+}
+
+/// The candle-derived spread-hour **mask** for `instrument`, or `None` when it
+/// isn't in the candle table. Keyed on the broker symbol string (the same
+/// `resolved.instrument` the gate passes); symbols are unique across brokers,
+/// so the `broker` column is not needed to disambiguate the lookup.
+///
+/// The table is sorted by `(broker, symbol)`, NOT by `symbol` alone, so a plain
+/// `binary_search` on the symbol would be wrong — we scan for an exact symbol
+/// match. The table is small (~200 rows) and this is called per-tick per-plan,
+/// which is cheap; a symbol-sorted index can be added if it ever matters.
+fn baked_candle_mask(instrument: &str) -> Option<u32> {
+    baseline_candle::SPREAD_BASELINE_CANDLE
+        .iter()
+        .find(|(_broker, symbol, ..)| *symbol == instrument)
+        .map(|(.., _reviewed, mask, _widen)| *mask)
 }
 
 /// The reject line, as a multiple of an instrument's *normal* (median)
@@ -166,16 +205,48 @@ fn spread_hour_widen_for(
     None
 }
 
-/// Is `now` a spread hour for `instrument` (per-instrument, learned)? A thin
-/// bool wrapper over [`spread_hour_widen_pips`]. Unknown instrument / no
-/// learned hours ⇒ fall back to the legacy NY-close-edge gate so un-sampled
-/// assets keep their prior behaviour.
+/// Is `now` a spread hour for `instrument` (per-instrument, learned)?
+///
+/// The hour membership comes from the **candle-derived** mask
+/// ([`baked_candle_mask`]) — the source of truth that fixed the sampler's
+/// whole-overnight over-flag. The same [`SPREAD_HOUR_LEAD_MINUTES`] look-ahead
+/// as the System-2 widen applies (so System 3 cancels a resting order 30 min
+/// before the spike, matching the widen lead).
+///
+/// Fallbacks preserve prior behaviour for anything the candle table doesn't
+/// cover: an instrument absent from the candle table, or present with an empty
+/// mask, drops to the legacy NY-close-edge gate. (An empty candle mask can mean
+/// "reviewed, genuinely flat" — for those the NY-close-edge fallback is the
+/// same conservative default the sampler gave an un-learned instrument; a later
+/// stage can honour the explicit `reviewed` verdict to skip the fallback.)
 pub fn is_spread_hour(instrument: &str, now: chrono::DateTime<chrono::Utc>) -> bool {
-    match baked_spread_hours(instrument) {
-        Some((mask, _)) if mask != 0 => spread_hour_widen_pips(instrument, now).is_some(),
-        // No learned hours for this instrument → legacy fallback.
+    match baked_candle_mask(instrument) {
+        Some(mask) if mask != 0 => mask_active_with_lead(mask, now),
+        // Absent, or reviewed-flat (mask 0) → legacy fallback.
         _ => crate::ny_clock::is_ny_close_edge(now),
     }
+}
+
+/// Is `mask` active at `now`, honouring the [`SPREAD_HOUR_LEAD_MINUTES`]
+/// look-ahead? The mask-only twin of [`spread_hour_widen_for`] (which returns
+/// the widen size); this returns just the boolean membership so `is_spread_hour`
+/// can key off the candle mask without a widen array. Kept structurally
+/// identical to `spread_hour_widen_for` so the two never drift.
+fn mask_active_with_lead(mask: u32, now: chrono::DateTime<chrono::Utc>) -> bool {
+    use chrono::Timelike;
+    if mask == 0 {
+        return false;
+    }
+    let hour = now.hour() as usize;
+    let minutes_into_hour = now.minute() as i64;
+    let lead_reaches_next = 60 - minutes_into_hour <= SPREAD_HOUR_LEAD_MINUTES;
+    if lead_reaches_next {
+        let next = (hour + 1) % 24;
+        if mask & (1 << next) != 0 {
+            return true;
+        }
+    }
+    mask & (1 << hour) != 0
 }
 
 /// Placeholder cutoff. A thin FX cross normally spreads ~2p and blows to
@@ -273,6 +344,91 @@ pub fn spread_block_ttl_seconds(instrument: &str, opened_at: chrono::DateTime<ch
         _ => block_hours_by_probe(instrument, opened_at),
     };
     hours as u64 * 3600 + SPREAD_BLOCK_TTL_GRACE_SECONDS
+}
+
+/// The contiguous spread-hour block that `now` sits in, as a `(start, end)` pair
+/// of UTC instants — `start` is the top of the first elevated hour of the run,
+/// `end` is the top of the first non-elevated hour after it (so the block is
+/// `[start, end)`, half-open). `None` when `now` is not itself a spread hour.
+///
+/// The window is what the offline replay prints when a signal confirmed inside a
+/// spread block but the entry was suppressed ("not entering — spread-hour from X
+/// to Y"). It is derived the same way the TTL is: the pure per-instrument hour
+/// mask when the instrument has one, a real-clock probe through
+/// [`is_spread_hour`] otherwise (legacy NY-close-edge instruments). The bounds
+/// snap to the top of the hour — the mask is hour-of-day granularity, so
+/// sub-hour precision would be false detail. The 30-minute *lead* that
+/// [`is_spread_hour`] adds before an elevated hour is intentionally **not**
+/// folded into `start`: the reported window is the elevated block itself, not the
+/// stop-widening lead-in.
+pub fn spread_block_window(
+    instrument: &str,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Option<(chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>)> {
+    use chrono::{Duration, Timelike};
+    // The hour containing `now` must itself be elevated (ignore the lead — we
+    // report the block, not the lead-in). Use the pure mask when available.
+    let hour_top = now
+        .with_minute(0)
+        .and_then(|t| t.with_second(0))
+        .and_then(|t| t.with_nanosecond(0))?;
+    let (back, fwd) = match baked_spread_hours(instrument) {
+        Some((mask, _)) if mask != 0 => {
+            if mask & (1 << now.hour()) == 0 {
+                return None;
+            }
+            (
+                block_start_hours_from_mask(mask, now.hour()),
+                block_hours_from_mask(mask, now.hour()),
+            )
+        }
+        // Legacy no-mask instrument: probe the real clock hour-by-hour. Require
+        // `now`'s own hour to be a spread hour (probe at the hour top so the lead
+        // of the *next* hour can't spoof membership).
+        _ => {
+            if !is_spread_hour(instrument, hour_top) {
+                return None;
+            }
+            (
+                block_start_hours_by_probe(instrument, hour_top),
+                block_hours_by_probe(instrument, hour_top),
+            )
+        }
+    };
+    let start = hour_top - Duration::hours(back as i64);
+    let end = hour_top + Duration::hours(fwd as i64);
+    Some((start, end))
+}
+
+/// Consecutive elevated hours in `mask` ending at (and including) `hour`, walking
+/// **backward** and wrapping midnight, capped at [`MAX_BLOCK_HOURS`]. The count
+/// of hours strictly *before* `hour` that are still in the block — so
+/// `hour - result` is the block's first elevated hour. `0` when the hour before
+/// `hour` isn't elevated (this hour is the block start). Pure over the mask.
+fn block_start_hours_from_mask(mask: u32, hour: u32) -> u32 {
+    let mut back: u32 = 0;
+    while back < MAX_BLOCK_HOURS {
+        let h = (hour + 24 - ((back + 1) % 24)) % 24;
+        if mask & (1 << h) == 0 {
+            break;
+        }
+        back += 1;
+    }
+    back
+}
+
+/// Real-clock backward twin of [`block_hours_by_probe`] for legacy (no-mask)
+/// instruments: probe [`is_spread_hour`] backward hour-by-hour from `now`.
+fn block_start_hours_by_probe(instrument: &str, now: chrono::DateTime<chrono::Utc>) -> u32 {
+    let mut back: u32 = 0;
+    while back < MAX_BLOCK_HOURS {
+        let probe = now - chrono::Duration::hours((back + 1) as i64);
+        if !is_spread_hour(instrument, probe) {
+            break;
+        }
+        back += 1;
+    }
+    back
 }
 
 /// The number of consecutive elevated hours in `mask` starting at (and
@@ -569,6 +725,33 @@ mod tests {
         );
     }
 
+    /// Regression for the GBP/AUD QM bug: the old sampler mask flagged GBP/AUD's
+    /// whole overnight block (UTC [0-5,21,22,23] = Brisbane 07:00-15:00), so a
+    /// 10am golden Pinbar confirming at 12pm (UTC ~02:00) had its confirmation
+    /// bar suppressed and the QM leg never entered. The candle-derived mask is
+    /// [21] only, so the daytime block is NO LONGER a spread hour — the
+    /// confirmation fires and the entry can go in.
+    #[test]
+    fn gbp_aud_daytime_is_not_a_spread_hour_candle_mask() {
+        // TradeNation GBP/AUD candle mask is [21] only.
+        // 02:00 UTC (Brisbane 12:00, the confirmation bar) must be CLEAN now.
+        assert!(
+            !is_spread_hour("GBP/AUD", ts("2026-07-08T02:00:00Z")),
+            "GBP/AUD 02:00Z (Bris 12:00, the QM confirmation bar) must NOT be a \
+             spread hour under the candle mask (was wrongly flagged by the sampler)"
+        );
+        // The genuine 21:00Z NY-close spike is still a spread hour.
+        assert!(
+            is_spread_hour("GBP/AUD", ts("2026-07-08T21:00:00Z")),
+            "GBP/AUD 21:00Z (the genuine NY-close spike) is still a spread hour"
+        );
+        // The rest of the old wrongly-flagged block is clean: 03:00Z (Bris 13:00).
+        assert!(
+            !is_spread_hour("GBP/AUD", ts("2026-07-08T03:00:00Z")),
+            "GBP/AUD 03:00Z (Bris 13:00) must NOT be a spread hour"
+        );
+    }
+
     // --- block-length TTL (concern 1 of the backstop split) ---
 
     /// A contiguous 8h block (bits 21..=23 + 0..=4, AUD/CHF-shaped) opened at its
@@ -630,6 +813,49 @@ mod tests {
         let hours = block_hours_from_mask(1 << 21, 21);
         let ttl = hours as u64 * 3600 + SPREAD_BLOCK_TTL_GRACE_SECONDS;
         assert_eq!(ttl, 2 * 3600);
+    }
+
+    /// Backward walk: hours BEFORE `hour` still in the block. A 21→05 (wrap)
+    /// block probed at 02:00 has 5 earlier in-block hours (21,22,23,00,01).
+    #[test]
+    fn block_start_hours_walks_back_across_midnight() {
+        let mask = (1 << 21) | (1 << 22) | (1 << 23) | (1 << 0) | (1 << 1) | (1 << 2) | (1 << 3);
+        assert_eq!(block_start_hours_from_mask(mask, 2), 5);
+        // At the block's first hour there's nothing before it.
+        assert_eq!(block_start_hours_from_mask(mask, 21), 0);
+    }
+
+    /// The public `(start, end)` window over a synthetic 21→05 wrap block: a bar
+    /// at 02:00Z reports start=21:00 (prev day) and end=05:00 (same day).
+    #[test]
+    fn spread_block_window_spans_a_wrap_block_via_mask() {
+        // GBP/AUD's real baked block is 21..=05 UTC — assert against the baked
+        // table so the reported window matches what the operator sees live.
+        // Baked GBP/AUD elevated hours are 21,22,23,00,01,02,03,04,05 UTC, so the
+        // block runs 21:00 (prev day) up to the first clean hour, 06:00.
+        let (start, end) =
+            spread_block_window("GBP/AUD", ts("2026-07-10T02:00:00Z")).expect("in block");
+        assert_eq!(
+            start,
+            ts("2026-07-09T21:00:00Z"),
+            "block starts 21:00 prev day"
+        );
+        assert_eq!(
+            end,
+            ts("2026-07-10T06:00:00Z"),
+            "block ends at first clean hour 06:00"
+        );
+    }
+
+    /// The confirmation bar in the reported GBP/AUD case (12:00 Brisbane = 02:00Z)
+    /// sits inside the block; a midday bar well outside it returns None.
+    #[test]
+    fn spread_block_window_none_outside_the_block() {
+        assert!(spread_block_window("GBP/AUD", ts("2026-07-10T02:00:00Z")).is_some());
+        assert!(
+            spread_block_window("GBP/AUD", ts("2026-07-10T12:00:00Z")).is_none(),
+            "12:00Z is a liquid hour, not a spread hour"
+        );
     }
 
     /// AUD/CHF's baked block, opened at 21:00Z, must yield a TTL that OUTLIVES the

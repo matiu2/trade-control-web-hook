@@ -21,7 +21,9 @@ use trade_control_engine::{
     evaluate_controls_only, evaluate_plan, seed_plan_state,
 };
 
-use trade_control_core::signals::{DetectFlags, atr_length_for, detect_at, wilder_atr};
+use trade_control_core::signals::{
+    DetectFlags, DetectorConfig, atr_length_for, detect_at, first_confirmed_signal_at, wilder_atr,
+};
 
 use super::replay_broker::{RealizedOutcome, ReplayBroker};
 use super::verbose::{BarTrace, DetectedMark};
@@ -206,6 +208,11 @@ pub async fn run(
     let mut warnings: Vec<String> = Vec::new();
     let mut traces: Vec<BarTrace> = Vec::new();
     let mut done = false;
+    // Edge-trigger the "signal confirmed, not entering (spread-hour)" line: a
+    // confirmed signal that lands inside a spread block persists confirmed for
+    // many bars, but we only want ONE line — on the bar the confirmation first
+    // becomes ready while still suppressed — not a line per suppressed bar.
+    let mut prev_confirmed_ready = false;
 
     // Multi-shot plumbing: the SAME async retry gate the worker runs, backed by
     // an offline `ReplayBroker` (resolves a prior attempt's state by simulating
@@ -322,6 +329,27 @@ pub async fn run(
         );
         let spread_hour =
             trade_control_core::spread_blackout::is_spread_hour(&plan.instrument, candles[i].time);
+        // On a spread-hour bar, resolve the block bounds and whether a confirmed
+        // signal is ready — so the trace can say "signal confirmed, not entering,
+        // spread-hour X→Y". The confirmation typically lands a couple of bars
+        // AFTER the golden printed (and on a bar that prints no fresh mark of its
+        // own), so this is deliberately NOT gated on `detected.is_some()`: it fires
+        // on the first suppressed bar where the QM enter would have become
+        // eligible. Edge-triggered via `prev_confirmed_ready` so a confirmation
+        // that stays ready across a long block yields one line, not one per bar.
+        let confirmed_ready = spread_hour && confirmed_signal_ready(plan, &state, &mid, i);
+        let (spread_block, confirmed_while_suppressed) = if spread_hour {
+            (
+                trade_control_core::spread_blackout::spread_block_window(
+                    &plan.instrument,
+                    candles[i].time,
+                ),
+                confirmed_ready && !prev_confirmed_ready,
+            )
+        } else {
+            (None, false)
+        };
+        prev_confirmed_ready = confirmed_ready;
         traces.push(BarTrace::diff(
             candles[i].time,
             &before,
@@ -331,6 +359,8 @@ pub async fn run(
             decline_reasons,
             not_taken,
             spread_hour,
+            spread_block,
+            confirmed_while_suppressed,
         ));
 
         for warning in eval.warnings {
@@ -563,6 +593,28 @@ fn detect_mark(
         atr,
         golden,
     })
+}
+
+/// Does a confirmed signal in the plan's direction exist as of bar `i`? Runs the
+/// engine's own [`first_confirmed_signal_at`] over `mid[..=i]` with the same
+/// `confirmed_floor` [`evaluate_one_entry`](trade_control_engine) uses (the later
+/// of the break-and-close stamp and the replay-start cursor), so "confirmed" here
+/// means exactly what a confirmation-gated (QM) enter would see. Used only to
+/// enrich the spread-hour line: when this is true on a suppressed spread-hour bar,
+/// a ready-to-enter setup was held back purely by the spread hour. `want_kind` is
+/// `None` (any pattern) and the re-entry watermark is ignored — this is a report,
+/// not the fire path.
+fn confirmed_signal_ready(plan: &TradePlan, state: &PlanState, mid: &[Candle], i: usize) -> bool {
+    let cfg = DetectorConfig::pine_defaults(plan.granularity);
+    let confirmed_floor = [
+        state.break_close_at,
+        plan.replay_start
+            .and_then(|s| chrono::DateTime::from_timestamp(s, 0)),
+    ]
+    .into_iter()
+    .flatten()
+    .max();
+    first_confirmed_signal_at(mid, i, &cfg, plan.direction, None, confirmed_floor, None).is_some()
 }
 
 /// Why a *marked* signal on this bar wasn't taken as an entry — the
