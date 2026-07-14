@@ -39,9 +39,12 @@
 //!   *after* its break-and-close in `plan.rules` sees the `break_close` fact
 //!   that break-and-close wrote **earlier this same bar**.
 //!
-//! Slice 1 instantiates break-and-close and retest rules, dispatched by
-//! [`RuleKind`](crate::plan::RuleKind). No `Broker`/`Storage` yet — those thread
-//! in when the entry rules land.
+//! Rules instantiated: break-and-close, retest, and enter, dispatched by
+//! [`RuleKind`](crate::plan::RuleKind). The enter emits the first **acquisitive**
+//! effect ([`Effect::PlaceOrder`]); the driver gates it on `live_bar` (see
+//! [`apply`]) but does **not** yet *execute* it — running the async `Broker` call
+//! is a separate driver step added with the executor. So `tick_once` stays pure
+//! and sync; `Broker`/`Storage` thread into that later execute step, not here.
 
 use chrono::{DateTime, Utc};
 
@@ -51,7 +54,7 @@ use crate::effect::Effect;
 use crate::facts::Facts;
 use crate::plan::{PlanRule, RuleKind, TradePlan};
 use crate::rule::Rule;
-use crate::rules::{BreakAndClose, Retest};
+use crate::rules::{BreakAndClose, Enter, Retest};
 use crate::world::World;
 
 /// Tick `plan`'s (pure) break-and-close rules for **one** bar — the current bar
@@ -87,6 +90,7 @@ pub fn tick_once(
     facts: &mut Facts,
     window: &[Candle],
     now: DateTime<Utc>,
+    live_bar: bool,
 ) -> Vec<Effect> {
     // No bar ⇒ nothing to do. Rules read the current bar via `World::current`
     // (`window.last()`); the guard here just avoids ticking on an empty window.
@@ -114,8 +118,9 @@ pub fn tick_once(
             tick_rule(rule, &world)
         };
         // Apply this rule's writes to `facts` immediately (before the next rule),
-        // and collect its fires.
-        apply(facts, &mut fires, effects);
+        // and collect its fires. `live_bar` gates acquisitive effects (see
+        // `apply`): on a backlog bar a `PlaceOrder` is dropped.
+        apply(facts, &mut fires, effects, live_bar);
     }
 
     fires
@@ -128,12 +133,34 @@ fn tick_rule(rule: &PlanRule, world: &World) -> Vec<Effect> {
     match rule.kind {
         RuleKind::BreakAndClose => BreakAndClose::new(rule).tick(world),
         RuleKind::Retest => Retest::new(rule).tick(world),
+        RuleKind::Enter => Enter::new(rule).tick(world),
     }
 }
 
 /// Apply one tick's `effects`: write facts/scratch into `facts`, collect fires
-/// into `fires`. This is the ONLY place `facts` is mutated.
-fn apply(facts: &mut Facts, fires: &mut Vec<Effect>, effects: Vec<Effect>) {
+/// (and live-bar `PlaceOrder`s) into `fires`. This is the ONLY place `facts` is
+/// mutated.
+///
+/// # Catch-up gate (real-money safety)
+///
+/// `live_bar` is `true` only for the **newest** bar the caller is processing
+/// (normally every tick; `false` only for the older bars of a post-downtime
+/// catch-up backlog). Effects are gated by category — the fact-based model maps
+/// cleanly onto "what is safe to do on a stale bar" (see
+/// `SCOPING-rule-based-engine.md`, "Catch-up policy after downtime"):
+///
+/// - **Fact/scratch writes** are *timeless knowledge* → always applied, backlog
+///   or live. "The neckline broke at bar -5" is true whenever we learn it, so the
+///   `break_close`/`retest` facts catch up across the backlog.
+/// - **`PlaceOrder`** is *acquisitive* → **live bar only.** Dropping it on a
+///   backlog bar is the whole point: never place an order for a signal that fired
+///   hours ago. Because the facts above caught up, when the enter re-ticks on the
+///   *live* bar its preconditions are already satisfied — so it enters at the
+///   current price iff the setup is still valid now, and doesn't otherwise.
+///
+/// (`Fire` — the prep dispatch — is neither: it is folded into `fires`
+/// regardless. No prep is acquisitive; only `PlaceOrder` is gated.)
+fn apply(facts: &mut Facts, fires: &mut Vec<Effect>, effects: Vec<Effect>, live_bar: bool) {
     for effect in effects {
         match effect {
             Effect::WriteFact { line, kind, value } => facts.set(&line, &kind, value),
@@ -143,6 +170,12 @@ fn apply(facts: &mut Facts, fires: &mut Vec<Effect>, effects: Vec<Effect>) {
                 value,
             } => facts.set_scratch(&rule_id, &kind, value),
             Effect::Fire(_) => fires.push(effect),
+            // Acquisitive: keep only on the live bar; drop on a stale backlog bar.
+            Effect::PlaceOrder { .. } => {
+                if live_bar {
+                    fires.push(effect);
+                }
+            }
         }
     }
 }

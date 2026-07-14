@@ -21,11 +21,45 @@
 //! engine is *about*) and call the data struct `PlanRule` (it's "a rule *in the
 //! plan*"). A `PlanRule` is turned into a boxed `dyn Rule` by the driver.
 
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 
 use trade_control_core::broker::Granularity;
 use trade_control_core::intent::{Direction, Intent};
 use trade_control_core::trade_plan::{BarEvent, CrossDir, LinePoint};
+
+/// An enter rule's precondition map: for each named line, the **ordered** list of
+/// milestone fact-kinds that must have stamped on it, earliest first.
+///
+/// `{ "neckline": ["break_close", "retest"] }` means: before this enter may
+/// place, `(neckline, break_close)` must be set AND `(neckline, retest)` must be
+/// set with a **strictly later** fact-time. Lines are independent (no cross-line
+/// ordering); ALL lines must be satisfied. Milestones are fact-**kind** strings,
+/// not rule ids — the enter references the facts, decoupled from which rule wrote
+/// them (see [`engine_v2_enter_preps_layered`] and `SCOPING-rule-based-engine.md`).
+///
+/// A `BTreeMap` (not `HashMap`) for a stable, deterministic iteration order — the
+/// satisfaction check must be order-independent across lines, and deterministic
+/// iteration keeps tests and any future logging reproducible.
+pub type PrepMap = BTreeMap<String, Vec<String>>;
+
+/// How an [`RuleKind::Enter`] places its order — the entry **mechanism**, an axis
+/// orthogonal to its [`PrepMap`] preconditions (stop/limit/market = *how* to
+/// place; preps = *what must hold first*). One `Enter` kind × this field replaces
+/// a combinatorial `StopEntry`/`LimitEntry`/… enum (see
+/// `SCOPING-rule-based-engine.md`, "`RuleKind` is the fork for entry").
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EntryMechanism {
+    /// A resting stop order above (long) / below (short) the trigger — fills only
+    /// if price trades *through* it. The first mechanism built (slice: stop-entry).
+    Stop,
+    /// A resting limit order — fills at or better than the trigger. Not yet built.
+    Limit,
+    /// A market order at the current price. Not yet built.
+    Market,
+}
 
 /// One named line — the geometric substrate a [`PlanRule`] references.
 ///
@@ -62,6 +96,13 @@ pub enum RuleKind {
     /// `(line, "retest")` fact. The first fact *consumer* in v2 — it gates on a
     /// fact another rule produced.
     Retest,
+    /// The entry. Reads the enter's [`PlanRule::preps`] map — for every named
+    /// line, all listed milestone facts must be set and their times strictly
+    /// increasing in list order — and, only when all lines are satisfied, emits
+    /// an acquisitive [`Effect::PlaceOrder`](crate::effect::Effect::PlaceOrder).
+    /// The *mechanism* (stop/limit/market) is the separate
+    /// [`PlanRule::mechanism`] field. The first rule to produce a broker effect.
+    Enter,
 }
 
 /// A rule as **plan data** — it references a [`Line`] by name, says how the
@@ -85,6 +126,23 @@ pub struct PlanRule {
     pub bar: BarEvent,
     /// Which direction through the line counts as a cross.
     pub dir: CrossDir,
+    /// **Enter-only** precondition map (see [`PrepMap`]). Empty for non-enter
+    /// rules and for a no-prep enter. `#[serde(default)]` so prep rules — and
+    /// pre-preps plans on the wire — deserialize with an empty map.
+    #[serde(default)]
+    pub preps: PrepMap,
+    /// **Enter-only** entry mechanism (see [`EntryMechanism`]). Ignored by
+    /// non-enter rules. Defaults to [`EntryMechanism::Stop`] (the first — and, in
+    /// this slice, only — mechanism built), so non-enter rules and older wire
+    /// plans deserialize without it.
+    #[serde(default = "default_mechanism")]
+    pub mechanism: EntryMechanism,
+}
+
+/// Serde default for [`PlanRule::mechanism`] — [`EntryMechanism::Stop`], the
+/// mechanism this slice builds. Non-enter rules carry it harmlessly.
+fn default_mechanism() -> EntryMechanism {
+    EntryMechanism::Stop
 }
 
 /// A v2 trade plan — lines + rules, per-line-generic, no phase.

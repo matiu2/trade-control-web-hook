@@ -8,8 +8,10 @@
 //! plain `kind == RuleKind::...` check.
 
 mod break_and_close;
+mod enter;
 mod retest;
 pub use break_and_close::BreakAndClose;
+pub use enter::Enter;
 pub use retest::Retest;
 
 use crate::plan::{PlanRule, RuleKind};
@@ -22,4 +24,9 @@ pub fn is_break_and_close(rule: &PlanRule) -> bool {
 /// Is this rule the retest prep?
 pub fn is_retest(rule: &PlanRule) -> bool {
     rule.kind == RuleKind::Retest
+}
+
+/// Is this rule the entry?
+pub fn is_enter(rule: &PlanRule) -> bool {
+    rule.kind == RuleKind::Enter
 }

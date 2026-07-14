@@ -31,14 +31,21 @@
 //! `(rule_id, kind)` — so a single variant would carry an unused key half in each
 //! mode. The split keeps each variant's fields exactly the key it needs.
 //!
-//! A later slice adds `PlaceOrder` / `CancelPending` / `WidenStop` / … once the
-//! `Broker` trait lands; those too are effects the driver executes.
+//! - [`Effect::PlaceOrder`] — the first **acquisitive** effect: the enter rule
+//!   emits it once its preps are satisfied. Unlike the writes above it is
+//!   **live-bar-only** — the driver's `apply` drops it on a stale backlog bar
+//!   (real-money catch-up safety). Executing it (the async `Broker` call) is a
+//!   separate driver step, not part of the pure tick.
+//!
+//! A later slice adds `CancelPending` / `WidenStop` / … as the spread systems
+//! land; those too are effects the driver executes.
 //!
 //! [`facts`]: crate::facts
 
 use trade_control_core::plan_eval::FiredIntent;
 
 use crate::facts::FactValue;
+use crate::plan::EntryMechanism;
 
 /// What a [`Rule`](crate::rule::Rule) asks the driver to do after a tick.
 ///
@@ -70,5 +77,28 @@ pub enum Effect {
         kind: String,
         /// The value to store.
         value: FactValue,
+    },
+    /// Place an entry order — the first **acquisitive** effect (the enter rule
+    /// emits it once its preps are all satisfied).
+    ///
+    /// # Acquisitive ⇒ live-bar-only (real-money catch-up safety)
+    ///
+    /// Unlike the timeless fact/scratch writes, a `PlaceOrder` **must never be
+    /// executed on a stale backlog bar** — placing an order now for a signal
+    /// hours ago chases a dead price. The gate lives in the driver's `apply`
+    /// (keyed on `tick_once`'s `live_bar`), NOT in the rule: the rule stays pure
+    /// and mode-blind and always emits this; the **driver drops it on a backlog
+    /// bar** and keeps it only on the live bar. See `SCOPING-rule-based-engine.md`,
+    /// "Catch-up policy after downtime".
+    ///
+    /// The [`FiredIntent`] payload is boxed for the same size reason as
+    /// [`Fire`](Effect::Fire). [`mechanism`](Effect::PlaceOrder::mechanism) tells
+    /// the (later, async) executor how to place — stop/limit/market; this slice
+    /// executes only [`EntryMechanism::Stop`].
+    PlaceOrder {
+        /// The fired enter intent (rule id + intent + the firing candle).
+        fired: Box<FiredIntent>,
+        /// How to place the order (stop/limit/market).
+        mechanism: EntryMechanism,
     },
 }

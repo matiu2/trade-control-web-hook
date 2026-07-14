@@ -17,7 +17,8 @@ use trade_control_core::trade_plan::{BarEvent, CrossDir, LinePoint};
 use trade_control_core::tunable::Tunable;
 
 use trade_control_engine_v2::{
-    Effect, FactValue, Facts, Line, PlanRule, RuleKind, TradePlan, tick_once,
+    Effect, EntryMechanism, FactValue, Facts, Line, PlanRule, PrepMap, RuleKind, TradePlan,
+    tick_once,
 };
 
 // ---------------------------------------------------------------------------
@@ -115,6 +116,8 @@ fn bc_rule(instrument: &str, line: &str, bar: BarEvent, dir: CrossDir) -> PlanRu
         intent: intent(instrument),
         bar,
         dir,
+        preps: PrepMap::new(),
+        mechanism: EntryMechanism::Stop,
     }
 }
 
@@ -127,6 +130,8 @@ fn retest_rule(instrument: &str, line: &str, bar: BarEvent, dir: CrossDir) -> Pl
         intent: intent(instrument),
         bar,
         dir,
+        preps: PrepMap::new(),
+        mechanism: EntryMechanism::Stop,
     }
 }
 
@@ -175,7 +180,9 @@ fn drive_series(
 ) -> Vec<Effect> {
     let mut fires = Vec::new();
     for i in 0..candles.len() {
-        fires.extend(tick_once(plan, facts, &candles[..=i], now));
+        // Prep rules are live-bar-agnostic (they emit no acquisitive effect), so
+        // every bar is driven as the live bar here.
+        fires.extend(tick_once(plan, facts, &candles[..=i], now, true));
     }
     fires
 }
