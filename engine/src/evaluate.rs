@@ -1632,12 +1632,24 @@ fn fire_rule(
     // measured against it — the suppression gates the FIRE decision, not the
     // bookkeeping (desyncing `last_close` would break the next bar's cross).
     record_last_close(&rule.rule_id, &rule.trigger, candle, state);
-    // Spread-hour "rubbish candle": a level cross (break-and-close, retest,
-    // invalidation veto, control cross, M/W trigger) that lands on a learned
-    // spread hour is a liquidity-vacuum wick, not a real cross — do not fire.
-    // The next clean bar re-evaluates. Shared with the worker (replay == live).
+    // Spread-hour "rubbish candle": an **intrabar (wick-read)** level cross
+    // (retest, invalidation veto, M/W trigger) that lands on a learned spread
+    // hour is a liquidity-vacuum wick, not a real cross — do not fire. The next
+    // clean bar re-evaluates. Shared with the worker (replay == live).
     // See SCOPING-spread-hour-rubbish-candle.md.
+    //
+    // But an **OnClose (close-confirmed)** cross — the break-and-close prep,
+    // any close-through veto — reads the bar's *settled close*, not its wick.
+    // A spread trough doesn't invalidate a genuine close-through, and (unlike an
+    // entry, which merely defers to the next clean bar) suppressing a
+    // break-and-close *prep stamp* would strand the plan in `AwaitBreakAndClose`
+    // forever if the close happens to land on a spread hour. This exact case bit
+    // AUD/USD's Sunday-reopen (Sun 21:00 UTC = the EDT NY-close edge): the
+    // neckline close-through was real but got thrown away as a rubbish wick, so
+    // the whole setup never armed. So: gate wick crosses, never close crosses.
+    let is_wick_cross = !trigger_uses_close(&rule.trigger);
     if hit
+        && is_wick_cross
         && trade_control_core::spread_blackout::is_spread_hour(&rule.intent.instrument, candle.time)
     {
         return false;
@@ -4242,30 +4254,45 @@ mod tests {
     }
 
     #[test]
-    fn spread_hour_bar_suppresses_a_break_and_close_cross_but_keeps_last_close() {
+    fn spread_hour_bar_still_fires_break_and_close_and_keeps_last_close() {
         // A break-and-close OnClose down-cross that lands on a 21:00Z spread-hour
-        // bar must NOT fire (the candle is rubbish). Crucially, the bar's close
-        // is STILL recorded as `last_close` so a genuine cross on the next clean
-        // bar still works — the suppression gates the fire decision, not the
-        // bookkeeping.
+        // bar STILL fires: it reads the bar's *settled close*, not a wick, so the
+        // rubbish-candle gate (which targets liquidity-vacuum wicks) must not
+        // suppress it. Previously it was suppressed — that stranded the AUD/USD
+        // Sunday-reopen setup forever when price never re-crossed the neckline.
+        // The bar's close is also recorded as `last_close`, as always.
         let p = hs_plan();
-        let prior = seed_at(Phase::AwaitBreakAndClose, "2026-06-16T19:00:00Z");
-        let mut prior = prior;
+        let mut prior = seed_at(Phase::AwaitBreakAndClose, "2026-06-16T20:00:00Z");
         // Seed a prior close above the neckline so an OnClose down-cross is armed.
         prior
             .last_close
             .insert("03-prep-break-and-close".into(), 1.2050);
-        // Spread-hour bar closes below the neckline — WOULD cross, but is rubbish.
+        // Confirm the premise: 21:00Z is a spread hour for this instrument.
+        assert!(
+            trade_control_core::spread_blackout::is_spread_hour(
+                &p.instrument,
+                ts("2026-06-16T21:00:00Z")
+            ),
+            "test premise: 21:00Z must be a spread hour"
+        );
+        // Spread-hour bar closes below the neckline — a genuine close-through.
         let c1 = candle("2026-06-16T21:00:00Z", 1.205, 1.205, 1.195, 1.1950);
         let eval1 = run(&p, &prior, &[c1]);
-        assert!(
-            eval1.fired.is_empty(),
-            "break-and-close must not fire on a spread-hour bar (got {:?})",
+        assert_eq!(
+            eval1.fired.len(),
+            1,
+            "break-and-close (OnClose) fires on a spread-hour bar (got {:?})",
             eval1.fired
         );
+        assert_eq!(eval1.fired[0].rule_id, "03-prep-break-and-close");
         assert!(
-            !eval1.new_state.fired.contains("03-prep-break-and-close"),
-            "the cross did not fire, so the rule is not latched"
+            eval1.new_state.fired.contains("03-prep-break-and-close"),
+            "the cross fired, so the rule is latched"
+        );
+        assert_eq!(
+            eval1.new_state.phase,
+            Phase::AwaitEntry,
+            "firing the break advances the spine"
         );
         // Bookkeeping preserved: last_close updated to this bar's close.
         assert_eq!(
@@ -4275,22 +4302,54 @@ mod tests {
                 .get("03-prep-break-and-close")
                 .copied(),
             Some(1.1950),
-            "record_last_close must still run under suppression"
+            "record_last_close runs as always"
         );
-        // Next bar is a clean (22:00Z is also an edge; use 23:00Z which is NOT).
-        // Its close stays below → no NEW down-cross (already below), so to prove
-        // recovery we lift back above then cross again on a clean bar.
-        let c2 = candle("2026-06-16T23:00:00Z", 1.205, 1.210, 1.205, 1.2050);
+    }
+
+    #[test]
+    fn spread_hour_bar_suppresses_an_intrabar_veto_cross() {
+        // The rubbish-candle gate STILL applies to intrabar (wick-read) crosses:
+        // a `too-low` invalidation veto (PriceValueCross / Either / Intrabar)
+        // whose wick pierces the level on a 21:00Z spread-hour bar must NOT fire
+        // (a spread spike through a level is spurious). This is the half of the
+        // gate the OnClose fix deliberately leaves intact.
+        let level = 1.1900;
+        let veto = rule(
+            "01-veto-too-low",
+            Trigger::PriceValueCross {
+                level,
+                dir: CrossDir::Either,
+                bar: BarEvent::Intrabar,
+            },
+            FireMode::Once,
+            Action::Veto,
+        );
+        let p = plan(vec![
+            veto,
+            rule(
+                "05-enter",
+                Trigger::MwEveryBar,
+                FireMode::Once,
+                Action::Enter,
+            ),
+        ]);
+        let prior = seed_at(Phase::AwaitEntry, "2026-06-16T20:00:00Z");
+        // Spread-hour bar whose low wicks through the veto level, close back above.
+        let c1 = candle("2026-06-16T21:00:00Z", 1.195, 1.196, 1.185, 1.1950);
+        let eval1 = run(&p, &prior, &[c1]);
+        let fired: Vec<&str> = eval1.fired.iter().map(|f| f.rule_id.as_str()).collect();
+        assert!(
+            !fired.contains(&"01-veto-too-low"),
+            "an intrabar veto wick must stay suppressed on a spread hour (got {fired:?})"
+        );
+        // Clean bar (23:00Z) with the same wick fires the veto normally.
+        let c2 = candle("2026-06-16T23:00:00Z", 1.195, 1.196, 1.185, 1.1950);
         let eval2 = run(&p, &eval1.new_state, &[c2]);
-        assert!(eval2.fired.is_empty(), "back above neckline: no cross");
-        let c3 = candle("2026-06-17T00:00:00Z", 1.205, 1.205, 1.195, 1.1950);
-        let eval3 = run(&p, &eval2.new_state, &[c3]);
-        assert_eq!(
-            eval3.fired.len(),
-            1,
-            "a clean-bar down-cross fires normally after the spread hour"
+        let fired2: Vec<&str> = eval2.fired.iter().map(|f| f.rule_id.as_str()).collect();
+        assert!(
+            fired2.contains(&"01-veto-too-low"),
+            "the same intrabar veto fires on a clean bar (got {fired2:?})"
         );
-        assert_eq!(eval3.fired[0].rule_id, "03-prep-break-and-close");
     }
 
     #[test]
