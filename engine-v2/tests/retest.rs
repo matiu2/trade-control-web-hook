@@ -180,8 +180,8 @@ fn drive_series(
 ) -> Vec<Effect> {
     let mut fires = Vec::new();
     for i in 0..candles.len() {
-        // Prep rules are live-bar-agnostic (they emit no acquisitive effect), so
-        // every bar is driven as the live bar here.
+        // Prep rules are latest-bar-agnostic (they emit no acquisitive effect), so
+        // every bar is driven as the latest bar here.
         fires.extend(tick_once(plan, facts, &candles[..=i], now, true));
     }
     fires

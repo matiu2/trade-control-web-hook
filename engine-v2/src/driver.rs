@@ -41,7 +41,7 @@
 //!
 //! Rules instantiated: break-and-close, retest, and enter, dispatched by
 //! [`RuleKind`](crate::plan::RuleKind). The enter emits the first **acquisitive**
-//! effect ([`Effect::PlaceOrder`]); the driver gates it on `live_bar` (see
+//! effect ([`Effect::PlaceOrder`]); the driver gates it on `latest_bar` (see
 //! [`apply`]) but does **not** yet *execute* it — running the async `Broker` call
 //! is a separate driver step added with the executor. So `tick_once` stays pure
 //! and sync; `Broker`/`Storage` thread into that later execute step, not here.
@@ -85,12 +85,19 @@ use crate::world::World;
 ///   driver stamps no "is-live"/"is-replay" flag (that would smuggle
 ///   mode-branching into the rules — replay and live must differ only in the
 ///   `Broker`/`Storage` impls).
+/// - `latest_bar` — is the current bar the **newest available** to the caller?
+///   `true` for every bar in normal ticking and replay; `false` only for the
+///   older bars of a post-downtime catch-up backlog. It names a property of the
+///   bar ("this is the freshest one I have"), **not** a live-vs-replay mode — the
+///   distinction the whole engine is built to avoid. It gates only acquisitive
+///   effects in [`apply`] (a stale backlog bar must not place an order for a
+///   signal hours ago); fact/scratch writes ignore it.
 pub fn tick_once(
     plan: &TradePlan,
     facts: &mut Facts,
     window: &[Candle],
     now: DateTime<Utc>,
-    live_bar: bool,
+    latest_bar: bool,
 ) -> Vec<Effect> {
     // No bar ⇒ nothing to do. Rules read the current bar via `World::current`
     // (`window.last()`); the guard here just avoids ticking on an empty window.
@@ -118,9 +125,9 @@ pub fn tick_once(
             tick_rule(rule, &world)
         };
         // Apply this rule's writes to `facts` immediately (before the next rule),
-        // and collect its fires. `live_bar` gates acquisitive effects (see
-        // `apply`): on a backlog bar a `PlaceOrder` is dropped.
-        apply(facts, &mut fires, effects, live_bar);
+        // and collect its fires. `latest_bar` gates acquisitive effects (see
+        // `apply`): on a stale backlog bar a `PlaceOrder` is dropped.
+        apply(facts, &mut fires, effects, latest_bar);
     }
 
     fires
@@ -138,29 +145,30 @@ fn tick_rule(rule: &PlanRule, world: &World) -> Vec<Effect> {
 }
 
 /// Apply one tick's `effects`: write facts/scratch into `facts`, collect fires
-/// (and live-bar `PlaceOrder`s) into `fires`. This is the ONLY place `facts` is
+/// (and latest-bar `PlaceOrder`s) into `fires`. This is the ONLY place `facts` is
 /// mutated.
 ///
 /// # Catch-up gate (real-money safety)
 ///
-/// `live_bar` is `true` only for the **newest** bar the caller is processing
+/// `latest_bar` is `true` only for the **newest** bar the caller is processing
 /// (normally every tick; `false` only for the older bars of a post-downtime
 /// catch-up backlog). Effects are gated by category — the fact-based model maps
 /// cleanly onto "what is safe to do on a stale bar" (see
 /// `SCOPING-rule-based-engine.md`, "Catch-up policy after downtime"):
 ///
-/// - **Fact/scratch writes** are *timeless knowledge* → always applied, backlog
-///   or live. "The neckline broke at bar -5" is true whenever we learn it, so the
-///   `break_close`/`retest` facts catch up across the backlog.
-/// - **`PlaceOrder`** is *acquisitive* → **live bar only.** Dropping it on a
-///   backlog bar is the whole point: never place an order for a signal that fired
-///   hours ago. Because the facts above caught up, when the enter re-ticks on the
-///   *live* bar its preconditions are already satisfied — so it enters at the
-///   current price iff the setup is still valid now, and doesn't otherwise.
+/// - **Fact/scratch writes** are *timeless knowledge* → always applied, on a
+///   backlog bar or the latest one. "The neckline broke at bar -5" is true
+///   whenever we learn it, so the `break_close`/`retest` facts catch up across
+///   the backlog.
+/// - **`PlaceOrder`** is *acquisitive* → **latest bar only.** Dropping it on a
+///   stale backlog bar is the whole point: never place an order for a signal that
+///   fired hours ago. Because the facts above caught up, when the enter re-ticks
+///   on the *latest* bar its preconditions are already satisfied — so it enters at
+///   the current price iff the setup is still valid now, and doesn't otherwise.
 ///
 /// (`Fire` — the prep dispatch — is neither: it is folded into `fires`
 /// regardless. No prep is acquisitive; only `PlaceOrder` is gated.)
-fn apply(facts: &mut Facts, fires: &mut Vec<Effect>, effects: Vec<Effect>, live_bar: bool) {
+fn apply(facts: &mut Facts, fires: &mut Vec<Effect>, effects: Vec<Effect>, latest_bar: bool) {
     for effect in effects {
         match effect {
             Effect::WriteFact { line, kind, value } => facts.set(&line, &kind, value),
@@ -170,9 +178,9 @@ fn apply(facts: &mut Facts, fires: &mut Vec<Effect>, effects: Vec<Effect>, live_
                 value,
             } => facts.set_scratch(&rule_id, &kind, value),
             Effect::Fire(_) => fires.push(effect),
-            // Acquisitive: keep only on the live bar; drop on a stale backlog bar.
+            // Acquisitive: keep only on the latest bar; drop on a stale backlog bar.
             Effect::PlaceOrder { .. } => {
-                if live_bar {
+                if latest_bar {
                     fires.push(effect);
                 }
             }

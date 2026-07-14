@@ -54,12 +54,12 @@
 //! # NO catch-up / late-entry logic here (it's the driver's job)
 //!
 //! The enter emits `PlaceOrder` on **every** bar its preconditions hold — it does
-//! NOT check whether this is the live bar, nor simulate the gap. That real-money
-//! catch-up safety ("place now iff it's parity with never having been down") is
-//! resolved by the driver via [`late_entry`](crate::late_entry), keyed on
-//! `tick_once`'s `live_bar`. Keeping it out of the rule is deliberate: the rule
-//! stays pure and mode-blind, so replay and live exercise identical rule logic and
-//! differ only in the `Broker`/`Storage` impls.
+//! NOT check whether this is the latest bar, nor simulate the gap. That
+//! real-money catch-up safety ("place now iff it's parity with never having been
+//! down") is resolved by the driver via [`late_entry`](crate::late_entry), keyed
+//! on `tick_once`'s `latest_bar`. Keeping it out of the rule is deliberate: the
+//! rule stays pure and mode-blind, so replay and live exercise identical rule
+//! logic and differ only in the `Broker`/`Storage` impls.
 
 use trade_control_core::plan_eval::FiredIntent;
 
@@ -116,8 +116,8 @@ impl Rule for Enter<'_> {
 
         // Emit the placement, unconditionally. Whether it becomes a real order
         // now, a caught-up place-late, or a logged "missed" is the DRIVER's call
-        // (via `late_entry`), keyed on `live_bar`. The rule stays pure and
-        // mode-blind — it does not know or care whether this is the live bar.
+        // (via `late_entry`), keyed on `latest_bar`. The rule stays pure and
+        // mode-blind — it does not know or care whether this is the latest bar.
         let fired = FiredIntent {
             rule_id: self.rule.id.clone(),
             intent: self.rule.intent.clone(),

@@ -81,15 +81,15 @@ pub enum Effect {
     /// Place an entry order — the first **acquisitive** effect (the enter rule
     /// emits it once its preps are all satisfied).
     ///
-    /// # Acquisitive ⇒ live-bar-only (real-money catch-up safety)
+    /// # Acquisitive ⇒ latest-bar-only (real-money catch-up safety)
     ///
     /// Unlike the timeless fact/scratch writes, a `PlaceOrder` **must never be
     /// executed on a stale backlog bar** — placing an order now for a signal
     /// hours ago chases a dead price. The gate lives in the driver's `apply`
-    /// (keyed on `tick_once`'s `live_bar`), NOT in the rule: the rule stays pure
-    /// and mode-blind and always emits this; the **driver drops it on a backlog
-    /// bar** and keeps it only on the live bar. See `SCOPING-rule-based-engine.md`,
-    /// "Catch-up policy after downtime".
+    /// (keyed on `tick_once`'s `latest_bar`), NOT in the rule: the rule stays pure
+    /// and mode-blind and always emits this; the **driver drops it on a stale
+    /// backlog bar** and keeps it only on the latest bar. See
+    /// `SCOPING-rule-based-engine.md`, "Catch-up policy after downtime".
     ///
     /// The [`FiredIntent`] payload is boxed for the same size reason as
     /// [`Fire`](Effect::Fire). [`mechanism`](Effect::PlaceOrder::mechanism) tells

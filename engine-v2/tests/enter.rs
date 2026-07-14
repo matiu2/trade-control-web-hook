@@ -385,19 +385,19 @@ fn no_prep_enter_places_immediately() {
 }
 
 /// Catch-up safety (interim): the chain is complete but this is a **backlog** bar
-/// (`live_bar = false`), so the driver drops the `PlaceOrder`. The enter does NOT
-/// self-latch (the latch is a driver-stamped `entry_outcome`, unset here), so when
-/// the setup is still satisfied on the following **live** bar the enter re-emits
-/// and the driver keeps it.
+/// (`latest_bar = false`), so the driver drops the `PlaceOrder`. The enter does
+/// not go quiet on its own (that is driven by a driver-stamped `entry_outcome`,
+/// unset here), so when the setup is still satisfied on the following **latest**
+/// bar the enter re-emits and the driver keeps it.
 ///
 /// This pins the *interim* blunt-drop behaviour. The next slice replaces the
 /// blunt drop with `late_entry::resolve` (missed-vs-place-late parity) and stamps
 /// `entry_outcome` — at which point a backlog whose order would still be resting
-/// place-lates on the live bar, and a would-have-triggered one is marked missed
+/// place-lates on the latest bar, and a would-have-triggered one is marked missed
 /// (and never re-placed). `late_entry.rs`'s own unit tests already pin that logic;
-/// this test pins the driver's live-bar gate on the acquisitive effect.
+/// this test pins the driver's latest-bar gate on the acquisitive effect.
 #[test]
-fn enter_dropped_on_backlog_bar_then_places_live() {
+fn enter_dropped_on_backlog_bar_then_places_on_latest() {
     let plan = enter_only_plan(
         "EUR_USD",
         enter_rule(
@@ -418,7 +418,7 @@ fn enter_dropped_on_backlog_bar_then_places_live() {
         FactValue::At(ts("2026-06-02T04:00:00Z")),
     );
 
-    // Backlog bar: preconditions satisfied, but not the live bar → PlaceOrder
+    // Backlog bar: preconditions satisfied, but not the latest bar → PlaceOrder
     // dropped by the driver.
     let backlog = candle("2026-06-02T05:00:00Z", 1.10, 1.11, 1.09, 1.10);
     let fires = tick_once(&plan, &mut facts, &[backlog], backlog.time, false);
@@ -427,15 +427,15 @@ fn enter_dropped_on_backlog_bar_then_places_live() {
         "an acquisitive PlaceOrder must be dropped on a stale backlog bar",
     );
 
-    // The live bar re-ticks: the setup is still valid (facts persisted) → it now
+    // The latest bar re-ticks: the setup is still valid (facts persisted) → it now
     // places at the current price. This is the "don't chase a stale entry, but
-    // take it if it's still live" property.
-    let live = candle("2026-06-02T06:00:00Z", 1.10, 1.11, 1.09, 1.10);
-    let fires2 = tick_once(&plan, &mut facts, &[live], live.time, true);
+    // take it if it's still valid now" property.
+    let latest = candle("2026-06-02T06:00:00Z", 1.10, 1.11, 1.09, 1.10);
+    let fires2 = tick_once(&plan, &mut facts, &[latest], latest.time, true);
     assert_eq!(
         place_orders(&fires2).len(),
         1,
-        "the live bar places once the caught-up facts satisfy the preconditions",
+        "the latest bar places once the caught-up facts satisfy the preconditions",
     );
 }
 
@@ -538,9 +538,9 @@ fn end_to_end_break_retest_enter() {
     let mut facts = Facts::new();
     let mut all_fires = Vec::new();
     for i in 0..candles.len() {
-        // The last bar of the series is the live bar; the rest are historical but
-        // for this in-order replay every bar is "live" as it is processed. Drive
-        // them all as live (a fresh replay, not a downtime backlog).
+        // The last bar of the series is the latest bar; the rest are historical
+        // but for this in-order replay every bar is the latest as it is processed.
+        // Drive them all as latest (a fresh replay, not a downtime backlog).
         all_fires.extend(tick_once(&plan, &mut facts, &candles[..=i], now, true));
     }
 

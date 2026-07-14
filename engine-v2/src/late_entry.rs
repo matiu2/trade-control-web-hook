@@ -21,7 +21,7 @@
 //!   the entry as missed. (A **market** order is *always* missed off its own bar —
 //!   an instantaneous fill at a past instant can't be reproduced now.)
 //! - [`LateEntry::PlaceLate`] — the order **would still be resting** (it never
-//!   triggered across the gap) **and** at the live bar price is still on the side
+//!   triggered across the gap) **and** at the latest bar price is still on the side
 //!   that would let it trigger later. Placing it now — unchanged, at its original
 //!   trigger — is exact parity: it would just be sitting there waiting, so we sit
 //!   and wait too.
@@ -40,9 +40,9 @@
 //!   *above* and fills when a bar's **high ≥ trigger**.
 //! - **Market** — fills instantly on its own bar; never "rests".
 //!
-//! The gap window the caller passes is `(placement_bar, live_bar]` — the bars
+//! The gap window the caller passes is `(placement_bar, latest_bar]` — the bars
 //! strictly after the bar that would have placed the order, up to and including
-//! the live bar. The placement bar itself is excluded (the order isn't resting
+//! the latest bar. The placement bar itself is excluded (the order isn't resting
 //! *during* the bar that creates it — see `[[replay_fill_skips_fire_bar]]`).
 
 use trade_control_core::broker::Candle;
@@ -74,25 +74,25 @@ pub enum LateEntry {
     /// counterfactual trade already happened and can't be reconstructed — record
     /// it as missed, place nothing.
     Missed,
-    /// The order would still be resting and is still valid at the live bar: place
-    /// it now, unchanged, at its original trigger.
+    /// The order would still be resting and is still valid at the latest bar:
+    /// place it now, unchanged, at its original trigger.
     PlaceLate,
 }
 
 /// Resolve a backlog-bar placement to [`Missed`](LateEntry::Missed) or
 /// [`PlaceLate`](LateEntry::PlaceLate), by replaying `order` against the `gap`
-/// candles (the bars strictly after the placement bar, through the live bar).
+/// candles (the bars strictly after the placement bar, through the latest bar).
 ///
 /// - `order` — the resolved order (mechanism + direction + trigger).
-/// - `gap` — the gap window `(placement_bar, live_bar]`, ascending. The **last**
-///   element is the live bar, whose close is the "current price" the still-valid
+/// - `gap` — the gap window `(placement_bar, latest_bar]`, ascending. The **last**
+///   element is the latest bar, whose close is the "current price" the still-valid
 ///   side check uses. An **empty** gap means there is no bar between placement and
-///   now to fill against *and* no live bar to place on — treated as `Missed`
+///   now to fill against *and* no latest bar to place on — treated as `Missed`
 ///   (there is nothing to place late onto; the caller should not have routed a
-///   live-bar placement here).
+///   latest-bar placement here).
 ///
 /// Market ⇒ always [`Missed`]. Stop/limit ⇒ [`Missed`] if it would have triggered
-/// anywhere in `gap`, else [`PlaceLate`] iff the live-bar close is still on the
+/// anywhere in `gap`, else [`PlaceLate`] iff the latest-bar close is still on the
 /// resting side of the trigger.
 pub fn resolve(order: &LateEntryOrder, gap: &[Candle]) -> LateEntry {
     // A market order can never be placed late — its counterfactual fill was an
@@ -107,9 +107,9 @@ pub fn resolve(order: &LateEntryOrder, gap: &[Candle]) -> LateEntry {
         return LateEntry::Missed;
     };
 
-    // The live bar is the last of the gap; its close is "current price". No live
-    // bar ⇒ nothing to place onto ⇒ missed.
-    let Some(live) = gap.last() else {
+    // The latest bar is the last of the gap; its close is "current price". No
+    // latest bar ⇒ nothing to place onto ⇒ missed.
+    let Some(latest) = gap.last() else {
         return LateEntry::Missed;
     };
 
@@ -122,11 +122,11 @@ pub fn resolve(order: &LateEntryOrder, gap: &[Candle]) -> LateEntry {
         return LateEntry::Missed;
     }
 
-    // It never triggered. Place late iff the live close is still on the resting
+    // It never triggered. Place late iff the latest close is still on the resting
     // side of the trigger — i.e. the order could still trigger *later* from here.
     // (Otherwise price has run past the trigger the "wrong" way and a fresh
     // placement wouldn't behave like the original resting order.)
-    if still_valid_side(order.mechanism, order.direction, trigger, live.c) {
+    if still_valid_side(order.mechanism, order.direction, trigger, latest.c) {
         LateEntry::PlaceLate
     } else {
         LateEntry::Missed
@@ -156,7 +156,7 @@ fn would_trigger(
     }
 }
 
-/// Is `price` (the live bar's close) still on the side of `trigger` from which the
+/// Is `price` (the latest bar's close) still on the side of `trigger` from which the
 /// order could trigger *later* — i.e. would a fresh placement behave like the
 /// original resting order rather than fill instantly / never?
 ///
