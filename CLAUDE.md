@@ -337,10 +337,19 @@ detector window. A wick that comes *within* the tolerance of the line stamps the
 retest even without reaching it. Lives in `stamp_retest` → `retest_tolerance` +
 `retest_crossed` (`engine/src/evaluate.rs`); the signed field is
 `TradePlan.retest_atr_step` (default `DEFAULT_RETEST_ATR_STEP = 0.075`, tv-arm
-`--retest-atr-step`). ATR **hard-fails** if absent — structurally unreachable by
-the retest phase (window is warm past `atr_length_for(granularity)`), so a `None`
-means a mis-sized window, surfaced not swallowed. This *loosens*; the separate
-`cross_buffer_pct` *tightens* and still governs the non-retest crosses.
+`--retest-atr-step`). If the ATR can't be computed (window shorter than
+`atr_length_for(granularity)`), `retest_tolerance` **degrades to 0.0 (strict
+must-reach-the-line)** and `warn!`s — it does **not** panic. It used to
+`.expect()`-panic on the theory that the window is always warm past ATR warmup
+by the retest phase; that theory was false (`detector_window_for` only reaches
+back to the earliest trendline anchor, so a trendline-only / M-W plan with
+recent anchors can present a short window) and the panic unwound the whole
+shared `tc-scheduler` thread — silently freezing EVERY plan's cron tick for
+~17h (staging incident 2026-07-14 04:32Z). `engine_tick_loop`
+(`worker/src/scheduler.rs`) now also isolates each tick via `run_isolated`
+(`spawn_local` + `JoinHandle` panic-catch) so one bad plan can never kill the
+scheduler again. This *loosens*; the separate `cross_buffer_pct` *tightens* and
+still governs the non-retest crosses.
 
 **Exception — the literal `too-high` cap reverted to close-confirm (2026-07-01).**
 The engine semantics above are unchanged; what changed is which `BarEvent` the

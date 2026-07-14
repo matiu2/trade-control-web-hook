@@ -149,6 +149,46 @@ fn skip_interval(period: Duration) -> tokio::time::Interval {
     interval
 }
 
+/// Run one cron-job iteration on an isolated `LocalSet` task so a **panic**
+/// inside it is caught (via the task's `JoinHandle`) instead of unwinding the
+/// shared `tc-scheduler` thread.
+///
+/// All cron loops run under one `tokio::join!` on one current-thread runtime in
+/// one thread. Awaiting a job future *directly* means a single panic (e.g. an
+/// `.expect()` deep in the engine tick against one bad plan) unwinds the whole
+/// thread and silently kills EVERY cron job — the axum HTTP thread survives, so
+/// the outage is invisible (staging incident 2026-07-14 04:32Z: a
+/// `retest_tolerance` ATR panic froze all plan watermarks for ~17h). Spawning
+/// the job as a `spawn_local` task contains the unwind to that task; the
+/// `JoinError` is logged and the loop's next interval tick proceeds normally.
+///
+/// `job` is a labelled name for the log line; `fut` is the iteration's future.
+async fn run_isolated<F>(job: &str, fut: F)
+where
+    F: std::future::Future<Output = ()> + 'static,
+{
+    match tokio::task::spawn_local(fut).await {
+        Ok(()) => {}
+        Err(err) if err.is_panic() => {
+            // The panic payload is usually a `&str`/`String`; surface whatever we
+            // can so a genuinely-broken tick is visible rather than a silent gap.
+            let payload = err.into_panic();
+            let msg = payload
+                .downcast_ref::<&str>()
+                .map(|s| s.to_string())
+                .or_else(|| payload.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "<non-string panic payload>".to_string());
+            tracing::error!(
+                "scheduler: cron job '{job}' PANICKED (isolated, loop continues): {msg}"
+            );
+        }
+        Err(err) => {
+            // Cancelled — only happens on runtime shutdown; nothing to recover.
+            tracing::warn!("scheduler: cron job '{job}' task ended abnormally: {err}");
+        }
+    }
+}
+
 /// The engine-tick job: one long-lived re-arming [`tokio::time::interval`] that
 /// runs [`run_engine_tick`] every `period`. See the module docs for why this is
 /// a single interval (not a sleep-per-iteration loop) and why missed ticks are
@@ -161,11 +201,17 @@ async fn engine_tick_loop(state: Arc<AppState>, cron: NativeCronEnv, period: Dur
     loop {
         interval.tick().await;
         let now = chrono::Utc::now();
-        // The tick is fail-soft per plan (it logs + skips a single plan's
-        // failure), so a panic here would be a bug, not an expected path — but it
-        // would still take down only this scheduler thread, never the HTTP
-        // receiver (separate thread + runtime).
-        run_engine_tick(&state.store, &cron, now).await;
+        // The tick is fail-soft per plan for *errors* (logs + skips a single
+        // plan's `Err`), but NOT for panics — `tick_one` returns `Result` and a
+        // panic unwinds straight past it. `run_isolated` contains any panic to
+        // this one task so a single bad plan can't kill the whole scheduler
+        // thread (and with it every other cron job). Clone the cheaply-cloneable
+        // handles so the spawned task owns its inputs (`'static`).
+        let (state, cron) = (state.clone(), cron.clone());
+        run_isolated("engine_tick", async move {
+            run_engine_tick(&state.store, &cron, now).await;
+        })
+        .await;
     }
 }
 

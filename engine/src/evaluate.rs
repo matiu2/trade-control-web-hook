@@ -1366,12 +1366,21 @@ fn stamp_retest(
 /// after the break = 1, so its tolerance is 0 — it must reach the line). ATR is
 /// the Wilder ATR at this bar over `window`.
 ///
-/// **Hard-fails** (panics) if the ATR can't be computed: by the time a plan is
-/// stamping retests it is in `Phase::AwaitEntry`, well past the detector's
-/// warmup, so `window` always spans more than `atr_length_for(granularity)`
-/// bars. A `None` here means the window was mis-sized upstream — a bug we want
-/// surfaced loudly, not silently papered over with a 0 tolerance (which would
-/// masquerade as the strict "must reach" rule and hide the real fault).
+/// **Degrades to 0.0 (strict "must reach the line") if the ATR can't be
+/// computed** rather than panicking. The expectation is that by the time a plan
+/// is stamping retests it is in `Phase::AwaitEntry`, well past the detector's
+/// warmup, so `window` spans more than `atr_length_for(granularity)` bars and
+/// `wilder_atr` is `Some`. But that is NOT guaranteed: `detector_window_for`
+/// (in `trade-control-cron`) only reaches back to the earliest trendline anchor
+/// (or the Pine lookback), so a trendline-only / M-W plan with recent anchors
+/// can present a window shorter than the ATR length. A `None` here used to
+/// `.expect()`-panic, which unwound the whole shared `tc-scheduler` thread and
+/// silently froze EVERY plan's cron tick (staging incident 2026-07-14 04:32Z).
+/// A too-short window must degrade, not crash: 0.0 tolerance is the same
+/// conservative "must reach the line" rule already used for the first post-break
+/// bar (`bars_since_break <= 1`) and the `tol <= 0.0` strict-evaluator path, so
+/// the retest simply requires the wick to reach the neckline until the window
+/// warms. We `warn!` so a genuinely mis-sized window is still visible.
 fn retest_tolerance(
     plan: &TradePlan,
     break_at: DateTime<Utc>,
@@ -1385,10 +1394,16 @@ fn retest_tolerance(
     if bars_since_break <= 1 {
         return 0.0;
     }
-    let atr = wilder_atr(window, atr_length_for(plan.granularity)).expect(
-        "retest tolerance needs ATR, but wilder_atr returned None — the window is too short \
-         for atr_length_for(granularity); by the retest phase it should always be warmed",
-    );
+    let Some(atr) = wilder_atr(window, atr_length_for(plan.granularity)) else {
+        tracing::warn!(
+            instrument = %plan.instrument,
+            window_len = window.len(),
+            atr_length = atr_length_for(plan.granularity),
+            "retest tolerance: window too short to warm the ATR — falling back to 0.0 \
+             (strict must-reach-the-line retest) until the detector window warms",
+        );
+        return 0.0;
+    };
     (bars_since_break as f64 - 1.0) * plan.retest_atr_step * atr
 }
 
@@ -3951,6 +3966,50 @@ mod tests {
             (tol3 - 0.0015).abs() < 1e-9,
             "N=3 → 2*0.075*0.010, got {tol3}"
         );
+    }
+
+    /// A retest window shorter than `atr_length_for(granularity)` (so
+    /// `wilder_atr` returns `None`) must NOT panic — it degrades to 0.0
+    /// tolerance. Regression test for the staging incident 2026-07-14 04:32Z,
+    /// where the `.expect()` here unwound the whole shared scheduler thread and
+    /// silently froze every plan's cron tick.
+    #[test]
+    fn retest_tolerance_short_window_degrades_to_zero_no_panic() {
+        let first = ts("2026-06-01T00:00:00Z").timestamp();
+        // 3 warm bars + 2 post-break = 5 H1 bars total, but atr_length_for(H1)
+        // = 24 → the window is far too short and wilder_atr returns None.
+        let mut window = warm_atr_window(3, first);
+        let break_epoch = first + 3 * 3600;
+        // Two bars after the break so bars_since_break = 2 (past the N<=1 early
+        // return) — this is the path that previously reached the panicking ATR.
+        for k in 1..=2 {
+            let t = break_epoch + k * 3600;
+            window.push(Candle {
+                time: DateTime::from_timestamp(t, 0).unwrap(),
+                o: 1.2100,
+                h: 1.2150,
+                l: 1.2050,
+                c: 1.2100,
+            });
+        }
+        let break_at = DateTime::from_timestamp(break_epoch, 0).unwrap();
+        let candle = Candle {
+            time: DateTime::from_timestamp(break_epoch + 2 * 3600, 0).unwrap(),
+            o: 0.0,
+            h: 0.0,
+            l: 0.0,
+            c: 0.0,
+        };
+        let mut p = plan(vec![rule(
+            "04-prep-retest",
+            retest_line_down(),
+            FireMode::Once,
+            Action::Prep,
+        )]);
+        p.retest_atr_step = 0.075;
+        // Must return 0.0 (strict must-reach), not panic.
+        let tol = retest_tolerance(&p, break_at, &candle, &window);
+        assert!(tol.abs() < 1e-12, "short window → 0.0 tolerance, got {tol}");
     }
 
     // ===== guards =====
