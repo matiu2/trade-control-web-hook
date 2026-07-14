@@ -95,10 +95,38 @@ pub enum Effect {
     /// [`Fire`](Effect::Fire). [`mechanism`](Effect::PlaceOrder::mechanism) tells
     /// the (later, async) executor how to place — stop/limit/market; this slice
     /// executes only [`EntryMechanism::Stop`].
+    ///
+    /// # `trigger_price` + `candle_close` — so a late resolve needs no re-derivation
+    ///
+    /// The effect carries the two numbers [`late_entry::resolve`] needs to decide
+    /// missed-vs-place-late on a caught-up bar, stamped at fire time so the
+    /// resolver never has to re-derive them from the intent:
+    ///
+    /// - `trigger_price` — the price the order is trying to place *at*
+    ///   (`None` for a market order, which has no resting trigger).
+    /// - `candle_close` — the close of the bar the enter fired on, the reference
+    ///   "price when we decided" that the parity check compares against.
+    ///
+    /// The same two are what the live-system spread-hour restore case will need
+    /// (when resting orders are pulled before the 07:00-Brisbane spread hour and
+    /// restored after — price may have moved, so restoring is the same
+    /// missed-vs-place-late question). See `[[spread_hour_rubbish_candle_suppression]]`.
+    ///
+    /// [`late_entry::resolve`]: crate::late_entry::resolve
     PlaceOrder {
         /// The fired enter intent (rule id + intent + the firing candle).
         fired: Box<FiredIntent>,
         /// How to place the order (stop/limit/market).
         mechanism: EntryMechanism,
+        /// The price the order is trying to place *at* — the resting trigger.
+        /// `None` for a market order (no resting trigger) and, in this slice,
+        /// wherever the trigger has not yet been resolved from the intent's
+        /// `EntrySpec` (that resolution is the executor's job, a later slice); the
+        /// enter emits `None` today and the executor fills it in.
+        trigger_price: Option<f64>,
+        /// The close of the bar the enter fired on — the reference price the
+        /// late-resolve parity check compares against. Filled by the enter from
+        /// its firing candle.
+        candle_close: f64,
     },
 }

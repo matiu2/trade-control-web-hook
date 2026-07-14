@@ -267,11 +267,20 @@ fn enter_fires_when_chain_complete() {
     let orders = place_orders(&fires);
     assert_eq!(orders.len(), 1, "one PlaceOrder when the chain is complete");
     match orders[0] {
-        Effect::PlaceOrder { fired, mechanism } => {
+        Effect::PlaceOrder {
+            fired,
+            mechanism,
+            trigger_price,
+            candle_close,
+        } => {
             assert_eq!(fired.rule_id, "05-enter");
             assert_eq!(fired.intent.action, Action::Enter);
             assert_eq!(fired.intent.instrument, "EUR_USD");
             assert_eq!(*mechanism, EntryMechanism::Stop);
+            // Trigger resolution is the executor's job (later slice) → None today.
+            assert_eq!(*trigger_price, None);
+            // candle_close is the close of the firing bar (a_bar closes at 1.10).
+            assert_eq!(*candle_close, bar.c);
         }
         _ => unreachable!(),
     }
