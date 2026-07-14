@@ -6,7 +6,7 @@
 //! the `("neckline","break_close")` fact a break-and-close rule produced, then
 //! writes `("neckline","retest")`. The headline test drives BOTH rules through
 //! the driver (the first two-rule producer/consumer chain), the rest exercise
-//! the producer gate, the time-decaying tolerance, the latch, and the
+//! the producer gate, the time-decaying tolerance, the fire-once guard, and the
 //! spread-hour "rubbish candle" suppression.
 
 use chrono::{DateTime, Utc};
@@ -403,12 +403,12 @@ fn tolerance_grows_with_bars_since_break() {
 }
 
 // ---------------------------------------------------------------------------
-// (4) Latch — once stamped, a later cross does not re-stamp
+// (4) Fire-once — once stamped, a later cross does not re-stamp
 // ---------------------------------------------------------------------------
 
 /// Once the retest stamps, a later crossing bar leaves the fact time unchanged.
 #[test]
-fn latch_prevents_restamp() {
+fn fire_once_prevents_restamp() {
     let ln = horizontal_line(
         "neckline",
         1.2000,
@@ -428,7 +428,7 @@ fn latch_prevents_restamp() {
     let candles = vec![
         // First retest: low reaches the line → stamps at 13:00.
         candle("2026-06-01T13:00:00Z", 1.2020, 1.2030, 1.1998, 1.2010),
-        // Second, later cross that must NOT re-stamp (rule already latched).
+        // Second, later cross that must NOT re-stamp (rule already done).
         candle("2026-06-01T15:00:00Z", 1.2020, 1.2030, 1.1990, 1.2010),
     ];
     let _ = drive_series(&p, &mut facts, &candles, ts("2026-06-01T15:00:05Z"));
@@ -436,7 +436,7 @@ fn latch_prevents_restamp() {
     assert_eq!(
         facts.at("neckline", "retest"),
         Some(ts("2026-06-01T13:00:00Z")),
-        "latched → stamp stays at the first cross, not re-stamped to 15:00"
+        "already done → stamp stays at the first cross, not re-stamped to 15:00"
     );
 }
 

@@ -234,11 +234,11 @@ fn enter_requires_monotonic_prep_order() {
 /// Both milestones present and in order → the enter emits exactly one
 /// `PlaceOrder` carrying the enter intent + mechanism.
 ///
-/// Single-shot latching (not double-placing on the next bar) is driven by the
+/// Single-shot behaviour (not double-placing on the next bar) is driven by the
 /// driver-stamped `entry_outcome` fact, which the driver does NOT yet write in
-/// this slice — so re-ticking here would re-emit. That latch is pinned by
-/// `enter_latches_off_entry_outcome_fact` below (simulating the driver's stamp)
-/// and wired for real in the next slice (driver late-entry routing).
+/// this slice — so re-ticking here would re-emit. That fire-once guard is pinned
+/// by `enter_done_once_entry_outcome_stamped` below (simulating the driver's
+/// stamp) and wired for real in the next slice (driver late-entry routing).
 #[test]
 fn enter_fires_when_chain_complete() {
     let plan = enter_only_plan(
@@ -277,13 +277,14 @@ fn enter_fires_when_chain_complete() {
     }
 }
 
-/// The single-shot latch: the enter reads a `(rule_id, "entry_outcome")` fact —
-/// which the DRIVER stamps when it resolves a placement — and stops emitting once
-/// it is set. Here we simulate the driver's stamp by setting the fact directly,
-/// then assert the enter goes quiet. (The driver actually stamps it in the next
-/// slice's late-entry routing; this pins the rule's half of the contract now.)
+/// The single-shot fire-once guard: the enter reads a `(rule_id, "entry_outcome")`
+/// fact — which the DRIVER stamps when it resolves a placement — and stops
+/// emitting once it is set (the enter is done). Here we simulate the driver's
+/// stamp by setting the fact directly, then assert the enter goes quiet. (The
+/// driver actually stamps it in the next slice's late-entry routing; this pins the
+/// rule's half of the contract now.)
 #[test]
-fn enter_latches_off_entry_outcome_fact() {
+fn enter_done_once_entry_outcome_stamped() {
     let plan = enter_only_plan(
         "EUR_USD",
         enter_rule(
@@ -554,9 +555,9 @@ fn end_to_end_break_retest_enter() {
     // And the enter placed after the full break → retest chain completed. It
     // emits on every bar its preconditions hold — here the retest bar and the
     // continuation bar — so ≥1 place. Exact single-shot (place ONCE) is enforced
-    // by the driver-stamped `entry_outcome` latch, wired in the next slice; this
-    // e2e drives the rules directly with no driver stamping, so it pins that the
-    // chain PRODUCES a placement, not the dedup.
+    // by the driver-stamped `entry_outcome` fire-once guard, wired in the next
+    // slice; this e2e drives the rules directly with no driver stamping, so it
+    // pins that the chain PRODUCES a placement, not the dedup.
     assert!(
         !place_orders(&all_fires).is_empty(),
         "enter places after the full break → retest chain",

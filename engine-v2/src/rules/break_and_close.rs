@@ -10,16 +10,16 @@
 //!
 //! # What it reproduces from the proven v1 logic
 //!
-//! 1. **Latch** — if `(line, "break_close")` is already set, do nothing and emit
-//!    nothing. (v1: `state.fired.contains(rule_id)`.) Reading the fact to latch
-//!    is fine — only *writing* moves to effects.
+//! 1. **Fire-once** — if `(line, "break_close")` is already set, this rule is done:
+//!    do nothing and emit nothing. (v1: `state.fired.contains(rule_id)`.) Reading
+//!    the fact to check "already done" is fine — only *writing* moves to effects.
 //! 2. **`last_close` bookkeeping before the gate** — an `OnClose` cross measures
 //!    this candle's close against the rule's *prior* close. That prior close is
 //!    **rule-private scratch**, keyed `(rule_id, "last_close")` — not a shared
 //!    `(line, kind)` fact (see [`facts`](crate::facts)). The rule emits a
 //!    [`WriteScratch`](Effect::WriteScratch) for it on **every** tick that gets
-//!    past the latch (even a spread-hour bar and even a non-firing bar), so a
-//!    genuine cross on the next clean bar is measured correctly. This is v1's
+//!    past the fire-once check (even a spread-hour bar and even a non-firing bar),
+//!    so a genuine cross on the next clean bar is measured correctly. This is v1's
 //!    "record `last_close` before the spread-hour gate" subtlety, expressed as a
 //!    scratch effect instead of an in-place `PlanState.last_close` mutation.
 //! 3. **Spread-hour suppression gates the FIRE, not the bookkeeping** — a hit on
@@ -70,9 +70,10 @@ impl Rule for BreakAndClose<'_> {
     }
 
     fn tick(&self, w: &World) -> Vec<Effect> {
-        // Latch: once the break-and-close fact is set, this rule is done — it
-        // never re-stamps (v1's multi-enter re-cross guard). Reading to latch is
-        // fine; a pure rule may read facts, it just can't write them.
+        // Fire-once: once the break-and-close fact is set, this rule is done — it
+        // never re-stamps (v1's multi-enter re-cross guard). Reading to check
+        // "already done" is fine; a pure rule may read facts, it just can't write
+        // them.
         if w.facts.is_set(&self.rule.line, KIND_BREAK_CLOSE) {
             return Vec::new();
         }
@@ -100,9 +101,9 @@ impl Rule for BreakAndClose<'_> {
 
         let mut effects = Vec::new();
 
-        // `last_close` bookkeeping BEFORE the gate — emitted on every past-latch
-        // tick (firing or not), as a rule-private scratch write for the driver
-        // to apply. Only `OnClose` triggers track it.
+        // `last_close` bookkeeping BEFORE the gate — emitted on every tick that
+        // passed the fire-once check (firing or not), as a rule-private scratch
+        // write for the driver to apply. Only `OnClose` triggers track it.
         if trigger_uses_close(&trigger) {
             effects.push(Effect::WriteScratch {
                 rule_id: self.rule.id.clone(),

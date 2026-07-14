@@ -33,23 +33,25 @@
 //! market-structure entry with no break/retest), expressed as data, not a
 //! distinct rule.
 //!
-//! # Latch — off a DRIVER-stamped terminal outcome (not a rule write)
+//! # Fire-once — off a DRIVER-stamped terminal outcome (not a rule write)
 //!
-//! Without a latch the enter would emit `PlaceOrder` on *every* bar its preps
-//! hold — double-placing. But the enter must **not** stamp its own latch: on a
-//! backlog bar the driver may resolve the placement to *missed* or *place-late*
-//! (see below), and a rule-written latch would fire on a bar whose placement was
-//! then dropped, silently losing a still-valid setup (the catch-up trap).
+//! Without a fire-once guard the enter would emit `PlaceOrder` on *every* bar its
+//! preps hold — double-placing. But the enter must **not** stamp its own guard:
+//! on a backlog bar the driver may resolve the placement to *missed* or
+//! *place-late* (see below), and a rule-written guard would be set on a bar whose
+//! placement was then dropped, silently losing a still-valid setup (the catch-up
+//! trap).
 //!
-//! So the latch is a **fact the DRIVER stamps** when it resolves an acquisitive
+//! So the guard is a **fact the DRIVER stamps** when it resolves an acquisitive
 //! effect to a terminal outcome — `(rule_id, "entry_outcome")`, set to the bar
-//! time on a real placement (live now, or a caught-up place-late) **and** on a
+//! time on a real placement (latest bar, or a caught-up place-late) **and** on a
 //! *missed* (the counterfactual trade already played out — don't re-enter later).
-//! The enter only **reads** it to latch. Keyed by the enter's **rule id** (not a
-//! geometry line) so multiple enters in one plan latch independently, and it can
-//! never collide with a line fact. (Multi-shot re-entry — firing repeatedly
-//! *without* latching — is a later rule; see
-//! `[[multishot_engine_keeps_plan_alive]]`. This slice is single-shot.)
+//! The enter only **reads** it: if it's set, the enter is **done** and emits
+//! nothing. Keyed by the enter's **rule id** (not a geometry line) so multiple
+//! enters in one plan finish independently, and it can never collide with a line
+//! fact. (Multi-shot re-entry — firing repeatedly *without* going done — is a
+//! later rule; see `[[multishot_engine_keeps_plan_alive]]`. This slice is
+//! single-shot.)
 //!
 //! # NO catch-up / late-entry logic here (it's the driver's job)
 //!
@@ -70,7 +72,8 @@ use crate::world::World;
 
 /// Shared-fact kind of the enter's **terminal entry outcome**, stamped by the
 /// DRIVER (not this rule) when it resolves a placement — a real placement *or* a
-/// missed catch-up. The enter reads it to latch (single-shot). Keyed by the
+/// missed catch-up. The enter reads it as its fire-once guard (single-shot: if
+/// set, the enter is done). Keyed by the
 /// enter's **rule id** (not a geometry line) so it is unique to this enter.
 pub const KIND_ENTRY_OUTCOME: &str = "entry_outcome";
 
@@ -94,10 +97,11 @@ impl Rule for Enter<'_> {
     }
 
     fn tick(&self, w: &World) -> Vec<Effect> {
-        // Latch: once the driver has stamped a terminal entry outcome for this
+        // Fire-once: once the driver has stamped a terminal entry outcome for this
         // enter (placed OR missed), it is done (single-shot). The rule only READS
         // this fact — the driver writes it when it resolves the placement, so a
-        // backlog bar whose placement the driver later drops never latches here.
+        // backlog bar whose placement the driver later drops never marks this enter
+        // done.
         if w.facts.is_set(&self.rule.id, KIND_ENTRY_OUTCOME) {
             return Vec::new();
         }

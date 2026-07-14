@@ -22,7 +22,7 @@
 //! # Effect-application ordering (LOAD-BEARING)
 //!
 //! A rule *reads* facts a **prior** bar's effects wrote (its `break_close`
-//! latch, its `last_close` scratch). Two orderings keep this correct:
+//! fire-once fact, its `last_close` scratch). Two orderings keep this correct:
 //!
 //! - **Across bars (the caller's job):** the caller must apply this bar's write
 //!   effects — which `tick_once` does in place, into the `facts` it was handed —

@@ -10,8 +10,8 @@
 //!
 //! # What it reproduces from the proven v1 logic (`engine::evaluate::stamp_retest`)
 //!
-//! 1. **Latch** — if `(line, "retest")` is already set, do nothing. (v1:
-//!    `state.retest_seen_at.is_some()`.)
+//! 1. **Fire-once** — if `(line, "retest")` is already set, this rule is done: do
+//!    nothing. (v1: `state.retest_seen_at.is_some()`.)
 //! 2. **Producer gate** — read `(line, "break_close")`; if unset, do nothing.
 //!    The retest is meaningless until the neckline has been broken and closed.
 //!    (v1: `effective_break_at` returning the stamped break time.)
@@ -90,7 +90,7 @@ impl Rule for Retest<'_> {
     }
 
     fn tick(&self, w: &World) -> Vec<Effect> {
-        // Latch: once the retest fact is set, this rule is done — it never
+        // Fire-once: once the retest fact is set, this rule is done — it never
         // re-stamps (v1's `retest_seen_at.is_some()` guard).
         if w.facts.is_set(&self.rule.line, KIND_RETEST) {
             return Vec::new();

@@ -227,9 +227,9 @@ fn no_cross_sets_no_fact_and_no_fire() {
     );
 }
 
-/// Latch: once fired, a later crossing candle must not re-fire or re-stamp.
+/// Fire-once: once fired, a later crossing candle must not re-fire or re-stamp.
 #[test]
-fn latch_prevents_refire_and_restamp() {
+fn fire_once_prevents_refire_and_restamp() {
     let ln = horizontal_line(
         "neckline",
         1.1000,
@@ -246,14 +246,14 @@ fn latch_prevents_refire_and_restamp() {
         // Price pops back above the line...
         candle("2026-06-01T14:00:00Z", 1.0992, 1.1013, 1.0990, 1.1010),
         // ...and closes back below — a second genuine down-cross that must be
-        // ignored because the rule already latched.
+        // ignored because the rule already fired (fire-once).
         candle("2026-06-01T15:00:00Z", 1.1008, 1.1009, 1.0980, 1.0985),
     ];
 
     let mut facts = Facts::new();
     let effects = drive_series(&p, &mut facts, &candles, ts("2026-06-01T15:00:05Z"));
 
-    assert_eq!(fires(&effects), 1, "latched → only the first cross fires");
+    assert_eq!(fires(&effects), 1, "fire-once → only the first cross fires");
     assert_eq!(
         facts.at("neckline", "break_close"),
         Some(ts("2026-06-01T13:00:00Z")),
