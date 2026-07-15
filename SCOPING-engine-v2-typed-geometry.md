@@ -159,9 +159,39 @@ slice (that's where it's written).
     rule knows its line at compile time; `_named` where it's genuinely plan-driven.
   - **Serialize round-trip test** guards the string-on-the-wire boundary: a
     `TradePlan` → serialize → deserialize → same typed facts read back.
-- **4c — split `PriceLevel` out of `Line`.** `TooHigh`/`TooLow` become
-  `PriceLevel(single price)` with the new no-projection cross path. Plan model +
-  the rules that reference them + tests.
+- **4c — split `PriceLevel` out of `Line`. DONE** (`f7a1441`→`ea7fb68`,
+  feat/engine-v2-slice1). `TooHigh`/`TooLow` became `PriceLevel { name, price }`
+  (single price) with a no-projection cross path — and, per the build-time
+  decision to not ship a dead type, a working `Invalidate` rule consumes it.
+  Landed in 5 reviewed/green steps:
+  1. **`PriceLevel` model** in types-v2: `TradePlan.levels: Vec<PriceLevel>`
+     (`#[serde(default)]`), `level`/`level_typed::<L>()` mirroring the line pair.
+     Reuses the existing `TooHigh`/`TooLow` `LineName` markers as the level-name
+     axis (the split is *geometry*, not the name).
+  2. **`eval_level`** in `cross.rs`: assembles `Trigger::HorizontalCross`, routes
+     through the existing `eval_trigger` with an **empty window** (that arm ignores
+     it), so `line_price_at` never runs. The proven `Line` projection path is
+     byte-identical. `cross_buffer_pct` still applies (a cap won't trip on a graze);
+     the retest time-decay tolerance correctly does *not* (a cap is strict).
+  3. **`Effect::Invalidate { rule_id }`** + an `Invalidated` fact kind + a
+     `PLAN_SCOPE = "__plan__"` sentinel. The driver stamps `(PLAN_SCOPE,
+     invalidated)=At(now)` on apply **and** folds the effect into the returned
+     list. NOT `latest_bar`-gated (invalidation is timeless).
+  4. **`Invalidate<'r, L: LineName>`** rule mirroring `BreakAndClose`
+     (PhantomData over its cap, plan-scoped fire-once, `level_typed::<L>()`,
+     `eval_level`, spread-hour gate). Two `RuleKind`s — `InvalidateHigh`→`TooHigh`,
+     `InvalidateLow`→`TooLow` — so the cap is fixed by the kind, never a runtime
+     string (keeps the 4b invariant). `StopNextEntry`-only: retire blocks the
+     enter, never closes a position.
+  5. **Enter second fire-once guard**: reads `(PLAN_SCOPE, invalidated)`; a retired
+     plan blocks the enter. End-to-end test: cap cross → `eval_level` →
+     `Effect::Invalidate` → driver retire → enter blocked on the same bar.
+
+  Design decisions taken via review (AskUserQuestion): separate `levels` Vec (not
+  a `geometry` enum); build the `Invalidate` rule now (not model-only); reach
+  `cross.rs` via a `HorizontalCross` `Trigger`; explicit `Effect::Invalidate`
+  variant (not a bare fact write); two `RuleKind`s (not one kind + a runtime level
+  ref). The `Line` projection path and its tests were left untouched.
 - **4d — split `TimeMarker` out of `Line`.** `NewsEvent`/`Expiry` become
   `TimeMarker(timestamp)` with the `time >= marker` path. (No rule consumes these
   yet in the current slice set — this mostly future-proofs the model; keep it
