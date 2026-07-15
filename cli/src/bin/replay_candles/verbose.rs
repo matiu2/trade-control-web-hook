@@ -26,6 +26,14 @@ use trade_control_engine::{Phase, PlanState};
 
 use super::brisbane::bne;
 
+/// Render a UTC instant as `YYYY-MM-DD HH:MM` for the spread-block window. UTC
+/// (not Brisbane like the bar headers) because the spread-hour mask is defined
+/// in UTC hours — showing the block in UTC keeps it aligned with the baked mask
+/// the operator is calibrating.
+fn utc_hm(t: DateTime<Utc>) -> String {
+    t.format("%Y-%m-%d %H:%M").to_string()
+}
+
 /// A pattern the signal detector printed on a bar, whether or not the plan acted
 /// on it. Attached to a [`BarTrace`] when the bar's detected signal passes the
 /// active [`DetectorMarkConfig`](trade_control_cli::replay_args::DetectorMarkConfig)
@@ -107,6 +115,19 @@ pub struct BarTrace {
     /// here (still marked in the detector summary) does NOT fire. Rendered so the
     /// "golden but no fire" isn't a silent mystery.
     pub spread_hour: bool,
+    /// The `(start, end)` UTC bounds of the spread-hour block covering this bar,
+    /// when `spread_hour` is set — half-open `[start, end)`, hour-snapped. Shown
+    /// in the spread-hour line so the operator sees exactly how long the block
+    /// runs ("spread-hour 21:00 → 06:00 UTC"). `None` when this isn't a spread
+    /// hour (or the window couldn't be resolved).
+    pub spread_block: Option<(DateTime<Utc>, DateTime<Utc>)>,
+    /// A confirmed signal (matching the plan direction) exists as of this bar, so
+    /// a confirmation-gated (QM) enter WOULD have been eligible — but this bar is
+    /// a spread hour, so the engine suppressed the entry. This is the exact
+    /// "10:00 bar confirmed, not entering due to the spread hour" case: without
+    /// it, a confirmed setup whose confirmation lands inside a spread block reads
+    /// as a plain suppressed golden with no hint that it was ready to enter.
+    pub confirmed_while_suppressed: bool,
 }
 
 impl BarTrace {
@@ -124,6 +145,8 @@ impl BarTrace {
         entry_declines: Vec<String>,
         not_taken: Option<String>,
         spread_hour: bool,
+        spread_block: Option<(DateTime<Utc>, DateTime<Utc>)>,
+        confirmed_while_suppressed: bool,
     ) -> Self {
         let phase_from = (before.phase != after.phase).then_some(before.phase);
         let break_close_stamped = before.break_close_at.is_none() && after.break_close_at.is_some();
@@ -139,6 +162,8 @@ impl BarTrace {
             entry_declines,
             not_taken,
             spread_hour,
+            spread_block,
+            confirmed_while_suppressed,
         }
     }
 
@@ -153,6 +178,7 @@ impl BarTrace {
             && self.detected.is_none()
             && self.entry_declines.is_empty()
             && self.not_taken.is_none()
+            && !self.confirmed_while_suppressed
     }
 
     /// Render this trace as one indented block under a `bar …` header. Returns
@@ -175,13 +201,33 @@ impl BarTrace {
             out.push_str(&mark.render());
         }
         // A spread-hour bar is rubbish: the engine suppressed entries, signal
-        // detection, and level crosses on it. Only surface it when a signal was
-        // MARKED here (else every spread hour would add noise) — that's the
-        // "golden printed but nothing fired" case that would otherwise mystify.
-        if self.spread_hour && self.detected.is_some() {
-            out.push_str(
-                "    ⌀ spread-hour (rubbish candle) — entry/detection/crosses suppressed\n",
-            );
+        // detection, and level crosses on it.
+        //
+        // Two surfaces, both showing the block bounds:
+        // - `confirmed_while_suppressed`: a confirmed signal became ready to enter
+        //   on this suppressed bar (the QM enter would have fired but for the
+        //   spread hour). This is the "10:00 setup confirmed, not entering because
+        //   the spread hour runs X→Y" case the operator asked for. Shown even
+        //   without a fresh mark on this bar, because confirmation lands a couple
+        //   of bars after the golden printed.
+        // - a fresh MARK on a spread-hour bar (golden printed but suppressed):
+        //   the "golden printed and nothing fired" case that would otherwise
+        //   mystify. Only shown when a mark is present (else every spread hour
+        //   would add noise).
+        if self.spread_hour && (self.confirmed_while_suppressed || self.detected.is_some()) {
+            let window = self
+                .spread_block
+                .map(|(s, e)| format!(" {} → {} UTC", utc_hm(s), utc_hm(e)))
+                .unwrap_or_default();
+            if self.confirmed_while_suppressed {
+                out.push_str(&format!(
+                    "    ⌀ spread-hour{window} — signal confirmed, not entering (spread-hour suppressed)\n"
+                ));
+            } else {
+                out.push_str(&format!(
+                    "    ⌀ spread-hour{window} (rubbish candle) — entry/detection/crosses suppressed\n"
+                ));
+            }
         }
         for reason in &self.entry_declines {
             out.push_str(&format!("    ✗ not entered: {reason}\n"));
@@ -212,7 +258,18 @@ mod tests {
     #[test]
     fn quiet_bar_renders_empty() {
         let s = state(Phase::AwaitEntry);
-        let t = BarTrace::diff(at(16), &s, &s, Vec::new(), None, Vec::new(), None, false);
+        let t = BarTrace::diff(
+            at(16),
+            &s,
+            &s,
+            Vec::new(),
+            None,
+            Vec::new(),
+            None,
+            false,
+            None,
+            false,
+        );
         assert!(t.is_quiet());
         assert_eq!(t.render(), "");
     }
@@ -231,6 +288,8 @@ mod tests {
             Vec::new(),
             None,
             false,
+            None,
+            false,
         );
         assert!(t.retest_stamped);
         assert!(!t.is_quiet());
@@ -244,6 +303,8 @@ mod tests {
             Vec::new(),
             None,
             Vec::new(),
+            None,
+            false,
             None,
             false,
         );
@@ -264,6 +325,8 @@ mod tests {
             Vec::new(),
             None,
             Vec::new(),
+            None,
+            false,
             None,
             false,
         );
@@ -288,6 +351,8 @@ mod tests {
             Vec::new(),
             None,
             false,
+            None,
+            false,
         );
         let r = t.render();
         assert!(r.contains("→ fired 05-enter"));
@@ -304,6 +369,8 @@ mod tests {
             vec!["01-veto-too-low".into()],
             None,
             Vec::new(),
+            None,
+            false,
             None,
             false,
         );
@@ -333,6 +400,8 @@ mod tests {
             Vec::new(),
             None,
             false,
+            None,
+            false,
         );
         assert!(!t.is_quiet());
         let r = t.render();
@@ -358,6 +427,8 @@ mod tests {
             Vec::new(),
             Some(mark),
             Vec::new(),
+            None,
+            false,
             None,
             false,
         );
@@ -388,6 +459,8 @@ mod tests {
             Vec::new(),
             None,
             true,
+            Some((at(21), at(23))),
+            false,
         );
         assert!(!t.is_quiet());
         let r = t.render();
@@ -396,6 +469,50 @@ mod tests {
             r.contains("⌀ spread-hour"),
             "rubbish-candle note rendered: {r}"
         );
+        // Bare (not-confirmed) suppression keeps the "rubbish candle" wording, and
+        // now shows the block window bounds.
+        assert!(r.contains("rubbish candle"), "not-confirmed wording: {r}");
+        assert!(r.contains("UTC"), "block window bounds shown: {r}");
+    }
+
+    /// A golden that ALSO confirmed on a spread-hour bar renders the enriched
+    /// line — "signal confirmed, not entering (spread-hour suppressed)" plus the
+    /// block window — instead of the bare rubbish-candle note. This is the case
+    /// the operator asked for: a ready-to-enter setup held back only by the
+    /// spread hour.
+    #[test]
+    fn spread_hour_confirmed_signal_renders_not_entering_with_window() {
+        let s = state(Phase::AwaitEntry);
+        // No fresh mark on this bar — the golden printed a couple of bars earlier
+        // and only CONFIRMED here. The line must still render (not gated on a
+        // fresh mark) and the bar must not be quiet.
+        let t = BarTrace::diff(
+            at(23),
+            &s,
+            &s,
+            Vec::new(),
+            None,
+            Vec::new(),
+            None,
+            true,
+            Some((at(21), at(23))),
+            true,
+        );
+        assert!(
+            !t.is_quiet(),
+            "a confirmation-while-suppressed bar is noteworthy"
+        );
+        let r = t.render();
+        assert!(
+            r.contains("signal confirmed, not entering"),
+            "confirmed-but-suppressed wording: {r}"
+        );
+        assert!(r.contains("spread-hour suppressed"), "reason shown: {r}");
+        assert!(r.contains("UTC"), "block window bounds shown: {r}");
+        assert!(
+            !r.contains("rubbish candle"),
+            "confirmed case drops the bare rubbish wording: {r}"
+        );
     }
 
     /// A spread-hour bar with NO detected mark stays quiet — we don't want every
@@ -403,7 +520,18 @@ mod tests {
     #[test]
     fn spread_hour_without_a_mark_stays_quiet() {
         let s = state(Phase::AwaitEntry);
-        let t = BarTrace::diff(at(21), &s, &s, Vec::new(), None, Vec::new(), None, true);
+        let t = BarTrace::diff(
+            at(21),
+            &s,
+            &s,
+            Vec::new(),
+            None,
+            Vec::new(),
+            None,
+            true,
+            Some((at(21), at(23))),
+            false,
+        );
         assert!(t.is_quiet(), "spread hour alone is not noteworthy");
         assert_eq!(t.render(), "");
     }

@@ -60,7 +60,7 @@
 
 use chrono::{DateTime, Utc};
 
-use trade_control_core::broker::Candle;
+use trade_control_core::broker::{Candle, Granularity};
 use trade_control_core::intent::{Action, Direction, SignalKind};
 use trade_control_core::plan_eval::{EntryDecline, FiredIntent, PlanEval};
 use trade_control_core::plan_state::{Phase, PlanState};
@@ -402,7 +402,15 @@ fn evaluate_controls(
         if !is_control_rule(rule) || state.fired.contains(&rule.rule_id) {
             continue;
         }
-        if control_rule_fires(rule, state, candle, window, plan.cross_buffer_pct, now) {
+        if control_rule_fires(
+            rule,
+            state,
+            candle,
+            window,
+            plan.cross_buffer_pct,
+            now,
+            plan.granularity,
+        ) {
             push_fire(rule, candle, fired);
             state.fired.insert(rule.rule_id.clone());
             // No phase change: a pause/resume/news fire is state-only and never
@@ -450,10 +458,11 @@ fn control_rule_fires(
     window: &[Candle],
     buffer_pct: f64,
     now: DateTime<Utc>,
+    granularity: Granularity,
 ) -> bool {
     match rule.trigger {
         Trigger::TimeReached { at_epoch } => now.timestamp() >= at_epoch,
-        _ => fire_rule(rule, state, candle, window, buffer_pct),
+        _ => fire_rule(rule, state, candle, window, buffer_pct, granularity),
     }
 }
 
@@ -496,11 +505,14 @@ fn evaluate_guards(
                 // Spread-hour "rubbish candle": a reversal-close detector match on
                 // a learned spread hour is a liquidity-vacuum wick — don't flatten
                 // a position off a garbage candle. (The `_` level-cross arm below
-                // is gated inside `fire_rule`.) Shared with the worker (replay ==
-                // live). See SCOPING-spread-hour-rubbish-candle.md.
-                if trade_control_core::spread_blackout::is_spread_hour(
+                // is gated inside `fire_rule`.) Gated on bar size too — only 15m/1h
+                // bars are dominated by the spread hour; H4+ is left alone. Shared
+                // with the worker (replay == live). See
+                // SCOPING-spread-hour-rubbish-candle.md.
+                if trade_control_core::spread_blackout::suppress_on_spread_hour(
                     &rule.intent.instrument,
                     candle.time,
+                    plan.granularity,
                 ) {
                     continue;
                 }
@@ -518,7 +530,14 @@ fn evaluate_guards(
                 }
             }
             _ => {
-                if !fire_rule(rule, state, candle, window, plan.cross_buffer_pct) {
+                if !fire_rule(
+                    rule,
+                    state,
+                    candle,
+                    window,
+                    plan.cross_buffer_pct,
+                    plan.granularity,
+                ) {
                     continue;
                 }
                 None
@@ -573,7 +592,14 @@ fn evaluate_break_and_close(
     if state.fired.contains(&rule.rule_id) {
         return;
     }
-    if fire_rule(rule, state, candle, window, plan.cross_buffer_pct) {
+    if fire_rule(
+        rule,
+        state,
+        candle,
+        window,
+        plan.cross_buffer_pct,
+        plan.granularity,
+    ) {
         state.fired.insert(rule.rule_id.clone());
         state.break_close_at = Some(candle.time);
         // The break-and-close prep itself is recorded server-side by dispatching
@@ -671,9 +697,15 @@ fn evaluate_one_entry(
     // instruments) the bar's OHLC is a liquidity-vacuum spread blowout, not a
     // market move — so no new entry may fire off it. A pending Stop/Limit stays
     // resting (the simulator's `find_fill` skips the bar too); the next clean
-    // bar re-triggers. Shared with the worker so replay == live. See
-    // SCOPING-spread-hour-rubbish-candle.md.
-    if trade_control_core::spread_blackout::is_spread_hour(&plan.instrument, candle.time) {
+    // bar re-triggers. Gated on bar size: only 15m/1h bars are dominated by the
+    // spread hour, so H4+ entries are NOT suppressed (the other 3h of an H4 bar
+    // dilute the spread-hour rubbish). Shared with the worker so replay == live.
+    // See SCOPING-spread-hour-rubbish-candle.md.
+    if trade_control_core::spread_blackout::suppress_on_spread_hour(
+        &plan.instrument,
+        candle.time,
+        plan.granularity,
+    ) {
         return;
     }
 
@@ -719,7 +751,14 @@ fn evaluate_one_entry(
         // Every other entry trigger (the M/W heartbeat) is a plain per-candle
         // predicate with no pattern geometry.
         _ => {
-            if !fire_rule(rule, state, candle, detector_window, plan.cross_buffer_pct) {
+            if !fire_rule(
+                rule,
+                state,
+                candle,
+                detector_window,
+                plan.cross_buffer_pct,
+                plan.granularity,
+            ) {
                 return;
             }
             None
@@ -1324,10 +1363,14 @@ fn stamp_retest(
     // Spread-hour "rubbish candle": a retest cross landing on a learned spread
     // hour is a liquidity-vacuum wick, not a genuine retest — don't stamp it.
     // `record_last_close` at the tail still runs, so a genuine retest on the
-    // next clean bar is measured correctly. Shared with the worker (replay ==
-    // live). See SCOPING-spread-hour-rubbish-candle.md.
-    let spread_hour =
-        trade_control_core::spread_blackout::is_spread_hour(&plan.instrument, candle.time);
+    // next clean bar is measured correctly. Gated on bar size — only 15m/1h bars
+    // are dominated by the spread hour; an H4 retest is left to stamp. Shared
+    // with the worker (replay == live). See SCOPING-spread-hour-rubbish-candle.md.
+    let spread_hour = trade_control_core::spread_blackout::suppress_on_spread_hour(
+        &plan.instrument,
+        candle.time,
+        plan.granularity,
+    );
     // Only stamp once: the retest is a milestone the trade passes a single
     // time. Without this latch a later re-cross would re-stamp `retest_seen_at`
     // and re-emit the prep fire every bar (the break-and-close analogue of the
@@ -1366,12 +1409,21 @@ fn stamp_retest(
 /// after the break = 1, so its tolerance is 0 — it must reach the line). ATR is
 /// the Wilder ATR at this bar over `window`.
 ///
-/// **Hard-fails** (panics) if the ATR can't be computed: by the time a plan is
-/// stamping retests it is in `Phase::AwaitEntry`, well past the detector's
-/// warmup, so `window` always spans more than `atr_length_for(granularity)`
-/// bars. A `None` here means the window was mis-sized upstream — a bug we want
-/// surfaced loudly, not silently papered over with a 0 tolerance (which would
-/// masquerade as the strict "must reach" rule and hide the real fault).
+/// **Degrades to 0.0 (strict "must reach the line") if the ATR can't be
+/// computed** rather than panicking. The expectation is that by the time a plan
+/// is stamping retests it is in `Phase::AwaitEntry`, well past the detector's
+/// warmup, so `window` spans more than `atr_length_for(granularity)` bars and
+/// `wilder_atr` is `Some`. But that is NOT guaranteed: `detector_window_for`
+/// (in `trade-control-cron`) only reaches back to the earliest trendline anchor
+/// (or the Pine lookback), so a trendline-only / M-W plan with recent anchors
+/// can present a window shorter than the ATR length. A `None` here used to
+/// `.expect()`-panic, which unwound the whole shared `tc-scheduler` thread and
+/// silently froze EVERY plan's cron tick (staging incident 2026-07-14 04:32Z).
+/// A too-short window must degrade, not crash: 0.0 tolerance is the same
+/// conservative "must reach the line" rule already used for the first post-break
+/// bar (`bars_since_break <= 1`) and the `tol <= 0.0` strict-evaluator path, so
+/// the retest simply requires the wick to reach the neckline until the window
+/// warms. We `warn!` so a genuinely mis-sized window is still visible.
 fn retest_tolerance(
     plan: &TradePlan,
     break_at: DateTime<Utc>,
@@ -1385,10 +1437,16 @@ fn retest_tolerance(
     if bars_since_break <= 1 {
         return 0.0;
     }
-    let atr = wilder_atr(window, atr_length_for(plan.granularity)).expect(
-        "retest tolerance needs ATR, but wilder_atr returned None — the window is too short \
-         for atr_length_for(granularity); by the retest phase it should always be warmed",
-    );
+    let Some(atr) = wilder_atr(window, atr_length_for(plan.granularity)) else {
+        tracing::warn!(
+            instrument = %plan.instrument,
+            window_len = window.len(),
+            atr_length = atr_length_for(plan.granularity),
+            "retest tolerance: window too short to warm the ATR — falling back to 0.0 \
+             (strict must-reach-the-line retest) until the detector window warms",
+        );
+        return 0.0;
+    };
     (bars_since_break as f64 - 1.0) * plan.retest_atr_step * atr
 }
 
@@ -1518,23 +1576,53 @@ pub fn enter_preconditions_unmet(
     state: &PlanState,
     bar: DateTime<Utc>,
 ) -> Vec<EnterBlock> {
+    // Flat, deduped union of what every still-blocked leg is waiting on — the
+    // historical shape. Order preserved (break-and-close → confirmation →
+    // retest) by pushing in that order per leg. Renders as an AND-join for a
+    // single-enter plan; multi-enter callers should prefer
+    // `enter_preconditions_reason`, which respects the OR-across-legs structure.
     let mut blocks = Vec::new();
-    // Break-and-close first: while AwaitBreakAndClose the enter code never runs
-    // for ANY enter rule, so this is plan-wide, not per-rule.
-    if state.phase == Phase::AwaitBreakAndClose && has_break_and_close(plan) {
-        blocks.push(EnterBlock::NeedsBreakAndClose);
+    for leg in enter_preconditions_by_leg(plan, state, bar) {
+        for b in leg {
+            if !blocks.contains(&b) {
+                blocks.push(b);
+            }
+        }
     }
-    // Then per-enter confirmation / retest gates a present golden would still be
-    // blocked by. Skip already-latched enters (a fired single-shot enter isn't
-    // "blocked").
+    blocks
+}
+
+/// Per-enter-leg breakdown of the outstanding preconditions: one inner `Vec`
+/// per still-blocked enter rule, each holding the gates *that leg* is waiting
+/// on (in gate order: break-and-close → confirmation → retest). Legs that are
+/// fully clear (nothing outstanding) are omitted.
+///
+/// The two levels model the real entry logic: a leg enters when **all** its
+/// gates clear (AND within a leg), and the *plan* enters when **any** leg
+/// enters (OR across legs). A `strategy-v2` plan has two legs — a retest-gated
+/// stop enter and a confirmation-gated prep-free QM enter — so its outstanding
+/// reason is `retest OR confirmation`, not `retest AND confirmation`. A
+/// single-enter plan returns at most one inner vec, so the OR collapses.
+pub fn enter_preconditions_by_leg(
+    plan: &TradePlan,
+    state: &PlanState,
+    bar: DateTime<Utc>,
+) -> Vec<Vec<EnterBlock>> {
+    let mut legs = Vec::new();
     for rule in plan
         .rules
         .iter()
         .filter(|r| r.intent.action == Action::Enter)
         .filter(|r| !state.fired.contains(&r.rule_id))
     {
-        if rule.intent.needs_confirmed && !blocks.contains(&EnterBlock::NeedsConfirmation) {
-            blocks.push(EnterBlock::NeedsConfirmation);
+        let mut leg = Vec::new();
+        // Break-and-close: while AwaitBreakAndClose the enter code never runs for
+        // ANY enter rule. It's phase-wide, but it gates each leg that requires it.
+        if state.phase == Phase::AwaitBreakAndClose && has_break_and_close(plan) {
+            leg.push(EnterBlock::NeedsBreakAndClose);
+        }
+        if rule.intent.needs_confirmed {
+            leg.push(EnterBlock::NeedsConfirmation);
         }
         let requires_retest = if is_multi_enter(plan) {
             rule.intent
@@ -1544,14 +1632,44 @@ pub fn enter_preconditions_unmet(
         } else {
             plan.rules.iter().any(is_retest)
         };
-        if requires_retest
-            && !retest_satisfied(plan, state, bar)
-            && !blocks.contains(&EnterBlock::NeedsRetest)
-        {
-            blocks.push(EnterBlock::NeedsRetest);
+        if requires_retest && !retest_satisfied(plan, state, bar) {
+            leg.push(EnterBlock::NeedsRetest);
+        }
+        if !leg.is_empty() {
+            legs.push(leg);
         }
     }
-    blocks
+    legs
+}
+
+/// Human-facing "why not taken" reason for a marked-but-unentered bar, built
+/// from [`enter_preconditions_by_leg`]. Gates within a leg join with `and`;
+/// legs join with `or` (any leg firing enters the plan). `None` when no leg is
+/// blocked. This is the string the offline replay prints on a golden bar that
+/// carried no fire and no [`EntryDecline`].
+pub fn enter_preconditions_reason(
+    plan: &TradePlan,
+    state: &PlanState,
+    bar: DateTime<Utc>,
+) -> Option<String> {
+    let legs = enter_preconditions_by_leg(plan, state, bar);
+    if legs.is_empty() {
+        return None;
+    }
+    // Dedup identical legs (e.g. two legs both blocked only on confirmation)
+    // so the OR-join doesn't read "confirmation or confirmation".
+    let mut rendered: Vec<String> = Vec::new();
+    for leg in &legs {
+        let text = leg
+            .iter()
+            .map(|b| b.reason())
+            .collect::<Vec<_>>()
+            .join(" and ");
+        if !rendered.contains(&text) {
+            rendered.push(text);
+        }
+    }
+    Some(rendered.join(" or "))
 }
 
 /// Fire a rule against a candle: evaluate its trigger (updating the rule's
@@ -1564,6 +1682,7 @@ fn fire_rule(
     candle: &Candle,
     window: &[Candle],
     buffer_pct: f64,
+    granularity: Granularity,
 ) -> bool {
     let prev_close = state.last_close.get(&rule.rule_id).copied();
     let hit = eval_trigger(&rule.trigger, candle, prev_close, window, buffer_pct);
@@ -1572,13 +1691,34 @@ fn fire_rule(
     // measured against it — the suppression gates the FIRE decision, not the
     // bookkeeping (desyncing `last_close` would break the next bar's cross).
     record_last_close(&rule.rule_id, &rule.trigger, candle, state);
-    // Spread-hour "rubbish candle": a level cross (break-and-close, retest,
-    // invalidation veto, control cross, M/W trigger) that lands on a learned
-    // spread hour is a liquidity-vacuum wick, not a real cross — do not fire.
-    // The next clean bar re-evaluates. Shared with the worker (replay == live).
+    // Spread-hour "rubbish candle": an **intrabar (wick-read)** level cross
+    // (retest, invalidation veto, M/W trigger) that lands on a learned spread
+    // hour is a liquidity-vacuum wick, not a real cross — do not fire. The next
+    // clean bar re-evaluates. Shared with the worker (replay == live).
     // See SCOPING-spread-hour-rubbish-candle.md.
+    //
+    // But an **OnClose (close-confirmed)** cross — the break-and-close prep,
+    // any close-through veto — reads the bar's *settled close*, not its wick.
+    // A spread trough doesn't invalidate a genuine close-through, and (unlike an
+    // entry, which merely defers to the next clean bar) suppressing a
+    // break-and-close *prep stamp* would strand the plan in `AwaitBreakAndClose`
+    // forever if the close happens to land on a spread hour. This exact case bit
+    // AUD/USD's Sunday-reopen (Sun 21:00 UTC = the EDT NY-close edge): the
+    // neckline close-through was real but got thrown away as a rubbish wick, so
+    // the whole setup never armed. So: gate wick crosses, never close crosses.
+    //
+    // `suppress_on_spread_hour` also gates on bar size: a 1h spread hour is the
+    // whole of a 15m/1h bar (rubbish) but only a quarter of an H4 bar (the other
+    // 3h of real trading dilute it), so H4+ is never suppressed. We trade only
+    // 15m/1h/4h/D, so this is "suppress on 15m+1h, allow on 4h+D".
+    let is_wick_cross = !trigger_uses_close(&rule.trigger);
     if hit
-        && trade_control_core::spread_blackout::is_spread_hour(&rule.intent.instrument, candle.time)
+        && is_wick_cross
+        && trade_control_core::spread_blackout::suppress_on_spread_hour(
+            &rule.intent.instrument,
+            candle.time,
+            granularity,
+        )
     {
         return false;
     }
@@ -2861,6 +3001,82 @@ mod tests {
         assert!(blocks.is_empty(), "no gate outstanding: {blocks:?}");
     }
 
+    #[test]
+    fn strategy_v2_reason_joins_legs_with_or_not_and() {
+        // strategy-v2 in AwaitEntry, break stamped, retest NOT stamped. The stop
+        // leg is blocked on retest; the QM leg (needs_confirmed) on confirmation.
+        // The two legs are alternatives — the plan enters if EITHER clears — so
+        // the reason must read "retest OR confirmation", not "retest AND
+        // confirmation".
+        let mut p = strategy_v2_plan();
+        // Mark the QM enter as confirmation-gated (what tv-arm bakes for the QM
+        // leg); the stop leg stays retest-gated via its requires_preps.
+        for r in &mut p.rules {
+            if r.rule_id == "09-enter-qm" {
+                r.intent.needs_confirmed = true;
+            }
+        }
+        let mut state = PlanState::seed(Phase::AwaitEntry, ts("2099-01-01T00:00:00Z"));
+        state.break_close_at = Some(ts("2026-06-30T10:00:00Z"));
+        // retest_seen_at still None → stop leg's retest gate shut.
+
+        let legs = enter_preconditions_by_leg(&p, &state, ts("2026-06-30T12:00:00Z"));
+        assert_eq!(legs.len(), 2, "one group per blocked enter leg: {legs:?}");
+        assert!(legs.iter().any(|l| l == &[EnterBlock::NeedsRetest]));
+        assert!(legs.iter().any(|l| l == &[EnterBlock::NeedsConfirmation]));
+
+        let reason = enter_preconditions_reason(&p, &state, ts("2026-06-30T12:00:00Z"))
+            .expect("both legs blocked");
+        assert!(
+            reason.contains(" or "),
+            "legs must join with OR: {reason:?}"
+        );
+        assert!(!reason.contains(" and "), "no AND across legs: {reason:?}");
+        assert!(reason.contains("retest") && reason.contains("confirmation"));
+    }
+
+    #[test]
+    fn single_enter_reason_joins_gates_with_and() {
+        // A single-enter plan whose lone enter needs BOTH confirmation and retest
+        // reads them AND-joined (one leg, both gates), preserving prior behaviour.
+        let neckline = Trigger::TrendlineCross {
+            a: LinePoint {
+                at_epoch: 0,
+                price: 1.2,
+            },
+            b: LinePoint {
+                at_epoch: 100,
+                price: 1.2,
+            },
+            extend_forward: true,
+            bar_seconds: 100,
+            dir: CrossDir::Down,
+            bar: BarEvent::OnClose,
+        };
+        let mut enter = pine_enter_rule(None, Direction::Short, true);
+        enter.intent.needs_confirmed = true;
+        let p = plan(vec![
+            rule(
+                "03-prep-break-and-close",
+                neckline.clone(),
+                FireMode::Once,
+                Action::Prep,
+            ),
+            rule("04-prep-retest", neckline, FireMode::Once, Action::Prep),
+            enter,
+        ]);
+        let mut state = PlanState::seed(Phase::AwaitEntry, ts("2099-01-01T00:00:00Z"));
+        state.break_close_at = Some(ts("2026-06-30T10:00:00Z"));
+
+        let reason = enter_preconditions_reason(&p, &state, ts("2026-06-30T12:00:00Z"))
+            .expect("gates outstanding");
+        assert!(reason.contains(" and "), "one leg, AND-joined: {reason:?}");
+        assert!(
+            !reason.contains(" or "),
+            "no OR for a single leg: {reason:?}"
+        );
+    }
+
     // ===== full evaluate_plan: M/W heartbeat =====
 
     #[test]
@@ -3805,6 +4021,50 @@ mod tests {
         );
     }
 
+    /// A retest window shorter than `atr_length_for(granularity)` (so
+    /// `wilder_atr` returns `None`) must NOT panic — it degrades to 0.0
+    /// tolerance. Regression test for the staging incident 2026-07-14 04:32Z,
+    /// where the `.expect()` here unwound the whole shared scheduler thread and
+    /// silently froze every plan's cron tick.
+    #[test]
+    fn retest_tolerance_short_window_degrades_to_zero_no_panic() {
+        let first = ts("2026-06-01T00:00:00Z").timestamp();
+        // 3 warm bars + 2 post-break = 5 H1 bars total, but atr_length_for(H1)
+        // = 24 → the window is far too short and wilder_atr returns None.
+        let mut window = warm_atr_window(3, first);
+        let break_epoch = first + 3 * 3600;
+        // Two bars after the break so bars_since_break = 2 (past the N<=1 early
+        // return) — this is the path that previously reached the panicking ATR.
+        for k in 1..=2 {
+            let t = break_epoch + k * 3600;
+            window.push(Candle {
+                time: DateTime::from_timestamp(t, 0).unwrap(),
+                o: 1.2100,
+                h: 1.2150,
+                l: 1.2050,
+                c: 1.2100,
+            });
+        }
+        let break_at = DateTime::from_timestamp(break_epoch, 0).unwrap();
+        let candle = Candle {
+            time: DateTime::from_timestamp(break_epoch + 2 * 3600, 0).unwrap(),
+            o: 0.0,
+            h: 0.0,
+            l: 0.0,
+            c: 0.0,
+        };
+        let mut p = plan(vec![rule(
+            "04-prep-retest",
+            retest_line_down(),
+            FireMode::Once,
+            Action::Prep,
+        )]);
+        p.retest_atr_step = 0.075;
+        // Must return 0.0 (strict must-reach), not panic.
+        let tol = retest_tolerance(&p, break_at, &candle, &window);
+        assert!(tol.abs() < 1e-12, "short window → 0.0 tolerance, got {tol}");
+    }
+
     // ===== guards =====
 
     #[test]
@@ -4106,30 +4366,45 @@ mod tests {
     }
 
     #[test]
-    fn spread_hour_bar_suppresses_a_break_and_close_cross_but_keeps_last_close() {
+    fn spread_hour_bar_still_fires_break_and_close_and_keeps_last_close() {
         // A break-and-close OnClose down-cross that lands on a 21:00Z spread-hour
-        // bar must NOT fire (the candle is rubbish). Crucially, the bar's close
-        // is STILL recorded as `last_close` so a genuine cross on the next clean
-        // bar still works — the suppression gates the fire decision, not the
-        // bookkeeping.
+        // bar STILL fires: it reads the bar's *settled close*, not a wick, so the
+        // rubbish-candle gate (which targets liquidity-vacuum wicks) must not
+        // suppress it. Previously it was suppressed — that stranded the AUD/USD
+        // Sunday-reopen setup forever when price never re-crossed the neckline.
+        // The bar's close is also recorded as `last_close`, as always.
         let p = hs_plan();
-        let prior = seed_at(Phase::AwaitBreakAndClose, "2026-06-16T19:00:00Z");
-        let mut prior = prior;
+        let mut prior = seed_at(Phase::AwaitBreakAndClose, "2026-06-16T20:00:00Z");
         // Seed a prior close above the neckline so an OnClose down-cross is armed.
         prior
             .last_close
             .insert("03-prep-break-and-close".into(), 1.2050);
-        // Spread-hour bar closes below the neckline — WOULD cross, but is rubbish.
+        // Confirm the premise: 21:00Z is a spread hour for this instrument.
+        assert!(
+            trade_control_core::spread_blackout::is_spread_hour(
+                &p.instrument,
+                ts("2026-06-16T21:00:00Z")
+            ),
+            "test premise: 21:00Z must be a spread hour"
+        );
+        // Spread-hour bar closes below the neckline — a genuine close-through.
         let c1 = candle("2026-06-16T21:00:00Z", 1.205, 1.205, 1.195, 1.1950);
         let eval1 = run(&p, &prior, &[c1]);
-        assert!(
-            eval1.fired.is_empty(),
-            "break-and-close must not fire on a spread-hour bar (got {:?})",
+        assert_eq!(
+            eval1.fired.len(),
+            1,
+            "break-and-close (OnClose) fires on a spread-hour bar (got {:?})",
             eval1.fired
         );
+        assert_eq!(eval1.fired[0].rule_id, "03-prep-break-and-close");
         assert!(
-            !eval1.new_state.fired.contains("03-prep-break-and-close"),
-            "the cross did not fire, so the rule is not latched"
+            eval1.new_state.fired.contains("03-prep-break-and-close"),
+            "the cross fired, so the rule is latched"
+        );
+        assert_eq!(
+            eval1.new_state.phase,
+            Phase::AwaitEntry,
+            "firing the break advances the spine"
         );
         // Bookkeeping preserved: last_close updated to this bar's close.
         assert_eq!(
@@ -4139,22 +4414,54 @@ mod tests {
                 .get("03-prep-break-and-close")
                 .copied(),
             Some(1.1950),
-            "record_last_close must still run under suppression"
+            "record_last_close runs as always"
         );
-        // Next bar is a clean (22:00Z is also an edge; use 23:00Z which is NOT).
-        // Its close stays below → no NEW down-cross (already below), so to prove
-        // recovery we lift back above then cross again on a clean bar.
-        let c2 = candle("2026-06-16T23:00:00Z", 1.205, 1.210, 1.205, 1.2050);
+    }
+
+    #[test]
+    fn spread_hour_bar_suppresses_an_intrabar_veto_cross() {
+        // The rubbish-candle gate STILL applies to intrabar (wick-read) crosses:
+        // a `too-low` invalidation veto (PriceValueCross / Either / Intrabar)
+        // whose wick pierces the level on a 21:00Z spread-hour bar must NOT fire
+        // (a spread spike through a level is spurious). This is the half of the
+        // gate the OnClose fix deliberately leaves intact.
+        let level = 1.1900;
+        let veto = rule(
+            "01-veto-too-low",
+            Trigger::PriceValueCross {
+                level,
+                dir: CrossDir::Either,
+                bar: BarEvent::Intrabar,
+            },
+            FireMode::Once,
+            Action::Veto,
+        );
+        let p = plan(vec![
+            veto,
+            rule(
+                "05-enter",
+                Trigger::MwEveryBar,
+                FireMode::Once,
+                Action::Enter,
+            ),
+        ]);
+        let prior = seed_at(Phase::AwaitEntry, "2026-06-16T20:00:00Z");
+        // Spread-hour bar whose low wicks through the veto level, close back above.
+        let c1 = candle("2026-06-16T21:00:00Z", 1.195, 1.196, 1.185, 1.1950);
+        let eval1 = run(&p, &prior, &[c1]);
+        let fired: Vec<&str> = eval1.fired.iter().map(|f| f.rule_id.as_str()).collect();
+        assert!(
+            !fired.contains(&"01-veto-too-low"),
+            "an intrabar veto wick must stay suppressed on a spread hour (got {fired:?})"
+        );
+        // Clean bar (23:00Z) with the same wick fires the veto normally.
+        let c2 = candle("2026-06-16T23:00:00Z", 1.195, 1.196, 1.185, 1.1950);
         let eval2 = run(&p, &eval1.new_state, &[c2]);
-        assert!(eval2.fired.is_empty(), "back above neckline: no cross");
-        let c3 = candle("2026-06-17T00:00:00Z", 1.205, 1.205, 1.195, 1.1950);
-        let eval3 = run(&p, &eval2.new_state, &[c3]);
-        assert_eq!(
-            eval3.fired.len(),
-            1,
-            "a clean-bar down-cross fires normally after the spread hour"
+        let fired2: Vec<&str> = eval2.fired.iter().map(|f| f.rule_id.as_str()).collect();
+        assert!(
+            fired2.contains(&"01-veto-too-low"),
+            "the same intrabar veto fires on a clean bar (got {fired2:?})"
         );
-        assert_eq!(eval3.fired[0].rule_id, "03-prep-break-and-close");
     }
 
     #[test]
@@ -4380,6 +4687,30 @@ mod tests {
         let new = &window[3..];
         let eval = run_window(&p, &prior, new, &window);
         assert_eq!(eval.fired.len(), 1, "clean-hour pinbar fires the enter");
+        assert_eq!(eval.fired[0].rule_id, "05-enter");
+        assert!(eval.done);
+    }
+
+    #[test]
+    fn spread_hour_does_not_suppress_an_h4_entry() {
+        // The SAME 21:00Z spread-hour pinbar that an H1 plan suppresses (see
+        // `spread_hour_bar_suppresses_a_pine_entry_fire`) MUST fire on an H4
+        // plan: a 1h spread hour is only a quarter of the H4 bar, so the other
+        // 3h of real trading dilute the rubbish. We only trade 15m/1h/4h/D, so
+        // H4 is the first size where suppression stops applying. Operator rule:
+        // "don't suppress 7am entries on the 4h chart, only 15m and 1h."
+        let mut p = plan(vec![pine_enter_rule(None, Direction::Short, false)]);
+        p.granularity = Granularity::H4;
+        let window = pinbar_window_ending_at("2026-06-16T21:00:00Z");
+        let prior = seed_at(Phase::AwaitEntry, "2026-06-16T20:00:00Z");
+        let new = &window[3..];
+        let eval = run_window(&p, &prior, new, &window);
+        assert_eq!(
+            eval.fired.len(),
+            1,
+            "an H4 entry on a spread hour still fires (got {:?})",
+            eval.fired
+        );
         assert_eq!(eval.fired[0].rule_id, "05-enter");
         assert!(eval.done);
     }

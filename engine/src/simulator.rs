@@ -411,6 +411,20 @@ struct Fill<'a> {
 /// can fill on is the **next** one, so we search from `candles[1..]`. A Market
 /// entry is the exception: it fills at the fire bar's close (the shell price).
 ///
+/// The bar length in seconds inferred from the smallest positive gap between
+/// consecutive candle open-times in `candles`. Weekend/session gaps are larger
+/// multiples of the true bar length, so the **minimum** positive delta is the
+/// bar size (H1 = 3600, H4 = 14400, …). Returns `0` for a window with fewer
+/// than two distinct times — callers treat that as "unknown, fail safe".
+fn bar_seconds_of(candles: &[BidAskCandle]) -> i64 {
+    candles
+        .windows(2)
+        .map(|w| w[1].time.timestamp() - w[0].time.timestamp())
+        .filter(|d| *d > 0)
+        .min()
+        .unwrap_or(0)
+}
+
 /// Returns `None` when the pending order never fills within the window (the
 /// caller maps that to `NeverFilled`).
 fn find_fill<'a>(
@@ -484,11 +498,19 @@ fn find_fill<'a>(
             // would (1) break the engine's own `pending_stop_does_not_fill_*`
             // tests and (2) make `resolve()` report the order FILLED on the spike
             // bar, so the lifecycle would never see it resting to cancel it.
+            // Bar length inferred from consecutive candle times, so the spread-
+            // hour fill skip is gated on bar size exactly as the engine's entry
+            // suppression is (only 15m/1h are dominated by a 1h spread hour; H4+
+            // fill normally). Derived here rather than threaded as `Granularity`
+            // to avoid churning every simulator signature. `0` (a one-candle
+            // window) fails safe to "short bar" in the helper → still skips.
+            let bar_seconds = bar_seconds_of(candles);
             let i = fill_window.iter().position(|c| {
                 book_reaches(c, entry_book, trigger_price, entry_approach)
-                    && !trade_control_core::spread_blackout::is_spread_hour(
+                    && !trade_control_core::spread_blackout::suppress_on_spread_hour_bar_seconds(
                         &intent.instrument,
                         c.time,
+                        bar_seconds,
                     )
             })?;
             // `i` indexes `fill_window` (a prefix of `after_fire`), so the fill
@@ -839,8 +861,15 @@ pub fn widened_stop_at(
         // `is_ny_close_edge` gate for ALL instruments — see
         // `[[strategy_changes_in_both_replayer_and_worker]]`; the worker + this
         // replay must gate identically.
+        // Candle table gives the widen as a scale-free FRACTION (`spread/mid`);
+        // convert to pips with the bar's mid close as the reference price via
+        // `widen_frac_to_pips`. Matches the live worker's cron widen (which uses
+        // the stop-loss price as its reference).
         let baked_p90 =
-            trade_control_core::spread_blackout::spread_hour_widen_pips(&intent.instrument, c.time);
+            trade_control_core::spread_blackout::spread_hour_widen_frac(&intent.instrument, c.time)
+                .map(|frac| {
+                    trade_control_core::spread_blackout::widen_frac_to_pips(frac, c.c, pip_size)
+                });
         if baked_p90.is_none() && !trade_control_core::ny_clock::is_ny_close_edge(c.time) {
             continue;
         }
@@ -2016,23 +2045,29 @@ mod tests {
     #[test]
     fn widened_stop_at_uses_baked_p90_for_a_sampled_instrument() {
         use trade_control_core::blackout_widen::WIDEN_FLOOR_PIPS;
-        use trade_control_core::spread_blackout::spread_hour_widen_pips;
+        use trade_control_core::spread_blackout::{spread_hour_widen_frac, widen_frac_to_pips};
 
         let mut intent = long_stop_intent();
-        intent.instrument = "EUR/USD".into(); // TN name → in the baked table
+        intent.instrument = "EUR/USD".into(); // TN name → in the candle table
         i_set_levels(&mut intent, 1.1000, 1.0950, 1.1100);
         let shell = trigger_shell();
 
-        // Guard: the baseline must actually carry EUR/USD's 21:00 spread hour,
-        // else this test is vacuous. 21:00 UTC on an EDT date is a spread hour.
+        // Guard: the candle table must actually carry EUR/USD's 21:00 spread
+        // hour, else this test is vacuous. 21:00 UTC on an EDT date is a spread
+        // hour. The production path (widened_stop_at) converts the widen
+        // FRACTION → pips at the bar's mid close, so mirror that here.
         let at21 = ts("2026-06-17T21:00:00Z");
-        let baked = spread_hour_widen_pips("EUR/USD", at21)
-            .expect("EUR/USD must have a baked 21:00 spread hour");
+        let frac = spread_hour_widen_frac("EUR/USD", at21)
+            .expect("EUR/USD must have a baked 21:00 spread-hour widen fraction");
 
         let fill_bar = candle("2026-06-17T11:00:00Z", 1.1000, 1.1001, 1.0999, 1.1000);
         // 21:00 UTC bar with a TIGHT 2p spread — the baked mask fires anyway.
         let tight = ba_candle("2026-06-17T21:00:00Z", 1.10010, 1.10005, 1.10030, 1.10025);
         let path = [fire_bar(), fill_bar, tight];
+
+        // The production widen converts the fraction at the tight bar's mid
+        // close (`c.c` = 1.10025), same reference the simulator uses.
+        let baked = widen_frac_to_pips(frac, tight.c, 0.0001);
 
         let widen = widened_stop_at(&intent, &shell, 0.0001, &path, WIDEN_FLOOR_PIPS, None)
             .expect("the baked spread hour must trip the widen even on a tight-spread bar");

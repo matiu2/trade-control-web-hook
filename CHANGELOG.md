@@ -60,10 +60,17 @@ held→restored-at-block-end (TTL-vs-block guard); System-2-only-record survives
 shared fn (`leave_for_caller_restores_but_does_not_clear_the_record`); baked-clock
 cancel trigger (`cancel_trigger_is_baked_clock_not_live_quote`).
 
-**Follow-up.** PR 5 (fold market-hours blackout into the lifecycle); the
-report-side `widened_stop_at`/`sweep_reason` System-2 *preview* lines (cosmetic,
-not the Net-R path); PR 1b (NY-local DST calibration — separate track). Option B
-(split System 2/System 3 into separate records) left as a future cleanup.
+**Follow-up.** PR 5 (fold market-hours blackout into the lifecycle) — **evaluated
+and correctly a no-op:** market-hours blackout is a *terminal* order-expiry
+(cancel + delete a resting order whose market has closed; never restored), so it
+belongs in the sweep alongside alert-window / bar-expiry, NOT in the restore-
+oriented `pending_order_lifecycle`; and it *already* shares its decision predicate
+(`core::sweep_gate::market_blackout_due`) + window deriver (`core::
+windows_from_session`) across replay and live, so the replay↔live parity invariant
+is already satisfied. No fold needed. Remaining: the report-side
+`widened_stop_at`/`sweep_reason` System-2 *preview* lines (cosmetic, not the Net-R
+path); PR 1b (NY-local DST calibration — separate track); and splitting System 2 /
+System 3 into separate records (a future cleanup, distinct from PR 5).
 
 ## v88 — 2026-07-12 — spread-hour "rubbish candle": suppress entries, signals, crosses
 
