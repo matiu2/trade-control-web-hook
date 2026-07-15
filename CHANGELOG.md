@@ -1,5 +1,30 @@
 # Changelog
 
+## v91 — 2026-07-15 — deprecate cross_buffer_pct in favour of cross_buffer_atr
+
+**Why.** The percent-of-price cross buffer (`cross_buffer_pct`) is
+volatility-blind: the same 0.02% is ~1.7p on EUR/GBP but a very different pip
+count on Gold or an index, and 0.1% is ~8.5p — far too wide for a close that
+broke a neckline by <1p. The ATR-relative buffer (`cross_buffer_atr`, added in
+v90) self-scales and is the right unit, so the percent term is being retired.
+
+**What changed.**
+- `DEFAULT_CROSS_BUFFER_PCT` **0.02 → 0.0**: new arms have **no** percent buffer
+  by default. The cross buffer is now `cross_buffer_atr·ATR` unless the operator
+  opts into a percent term.
+- `tv-arm --cross-buffer-pct` is **deprecated**: hidden from `--help`, and arming
+  with it logs a `warn!` (it still works — the percent term is summed on top of
+  the ATR term — for anyone who wants a fixed floor while we tune the ATR unit).
+- `--cross-buffer-atr` is now the documented, preferred buffer knob.
+
+**Not breaking.** The `cross_buffer_pct` **field** stays on `TradePlan` (the 13
+live signed plans carry it; removing it would break their deserialize/signature).
+Only its default and the CLI surface changed. Full removal waits until no live
+plan uses it.
+
+**Tests.** core 854, engine 155, tv-arm 232 — all green; no test asserted the old
+0.02 default numerically (they key on the symbol `DEFAULT_CROSS_BUFFER_PCT`).
+
 ## v90 — 2026-07-15 — OnClose origin-side break, cross-buffer flag, slope-scaled retest
 
 **Why.** Three related fixes to how the engine reads the neckline, all triggered

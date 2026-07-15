@@ -378,6 +378,18 @@ pub fn run(args: Args) -> Result<i32> {
         // operator, and baked onto the plan for after-the-fact journalling only.
         // Fail-soft — a fetch failure yields `None` and never blocks arming.
         let armed_at = effective_arm_time(start, now);
+        // `--cross-buffer-pct` is deprecated in favour of the volatility-relative
+        // `--cross-buffer-atr`. If the operator still passes it, honour it (it's
+        // summed on top of the ATR term) but warn — a fixed % of price is
+        // volatility-blind and easy to mis-size across instruments.
+        if let Some(pct) = args.cross_buffer_pct {
+            tracing::warn!(
+                cross_buffer_pct = pct,
+                "--cross-buffer-pct is DEPRECATED (a fixed % of price is \
+                 volatility-blind); prefer --cross-buffer-atr. The percent term is \
+                 summed on top of the ATR term for this arm."
+            );
+        }
         let armed_sentiment = crate::sentiment::arm_time_sentiment(
             &resolved.asset.id,
             &resolved.asset.news_currencies,
