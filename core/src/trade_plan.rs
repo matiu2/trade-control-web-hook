@@ -47,17 +47,22 @@ use crate::broker::Granularity;
 use crate::intent::{Direction, Intent};
 use crate::plan_sentiment::PlanSentiment;
 
-/// Default cross-depth buffer (percent of the crossed level's price) baked onto
-/// a plan at arm time. **`0.02%`** — calibrated on the AUD/JPY iH&S of
-/// 2026-06-29: a buffer sweep showed the trade is a **−1.43R** loss with no
-/// buffer (three shallow early retest taps each stop out before the runner),
-/// flips to **+0.57R net** at `0.02%` (the shallow taps are filtered, leaving
-/// only the entry that runs to TP), holds through `~0.07%`, and over-tightens
-/// into a starved 0-trade plan at `0.1%`. `0.02%` is the threshold where the
-/// trade turns profitable, so it is the default. Set a different value per-trade
-/// to tune (a future `tv-arm --cross-buffer-pct` flag overrides it); `0.0`
-/// restores the bare wick-touch behaviour. See [`TradePlan::cross_buffer_pct`].
-pub const DEFAULT_CROSS_BUFFER_PCT: f64 = 0.02;
+/// Default percent-of-price cross-depth buffer baked onto a plan at arm time —
+/// **`0.0` (off) as of 2026-07-15**. The percent buffer is being **deprecated in
+/// favour of the ATR-relative buffer** ([`DEFAULT_CROSS_BUFFER_ATR`]): a fixed %
+/// of price is volatility-blind (the same 0.02% is ~1.7p on EUR/GBP but a very
+/// different pip count on Gold or an index), so new arms default to **no**
+/// percent term and use `cross_buffer_atr` instead. The field and
+/// `--cross-buffer-pct` flag are retained (the flag is hidden/deprecated) so
+/// existing signed plans still deserialize and a per-trade percent override is
+/// still possible while we tune the ATR buffer.
+///
+/// History: this was **`0.02%`**, calibrated on the AUD/JPY iH&S of 2026-06-29 —
+/// a buffer sweep showed that trade is **−1.43R** with no buffer (three shallow
+/// early retest taps each stop out before the runner), flips to **+0.57R net** at
+/// `0.02%`, holds through `~0.07%`, and starves to 0 trades at `0.1%`. That
+/// calibration now belongs to the ATR term instead.
+pub const DEFAULT_CROSS_BUFFER_PCT: f64 = 0.0;
 
 /// Default **ATR-fraction** cross buffer — **0.0** (off). The buffer a cross
 /// must clear is `cross_buffer_pct%·level + cross_buffer_atr·ATR`; this is the
