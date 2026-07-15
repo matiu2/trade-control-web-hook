@@ -363,9 +363,23 @@ pub struct Args {
     /// `cross_buffer_pct`. Raise it to reject noisy one-tick breaks; lower it when
     /// a genuine break closed only just past the line and the default buffer ate
     /// it (e.g. EUR/GBP 2026-07-15, close 0.7p above a neckline the 1.7p buffer
-    /// rejected).
+    /// rejected). **Volatility-blind** (a fixed % of price) — for a
+    /// volatility-relative buffer prefer `--cross-buffer-atr`.
     #[arg(long)]
     pub cross_buffer_pct: Option<f64>,
+
+    /// **ATR-fraction** cross buffer (default 0 = off), added on top of
+    /// `--cross-buffer-pct`: the total buffer a cross must clear is
+    /// `(pct/100)·level + atr·ATR`, where `ATR` is the Wilder ATR at the current
+    /// bar. Unlike the percent buffer this **self-scales with the instrument's
+    /// volatility** — one value (e.g. `0.15` = 15% of a typical bar's range)
+    /// works across EUR/GBP, Gold, indices, where a fixed % of price does not
+    /// (0.1% is ~1.7p on EUR/GBP but far too wide for a close that broke by <1p).
+    /// The two terms sum; set `--cross-buffer-pct 0 --cross-buffer-atr <f>` for a
+    /// pure volatility-relative buffer. Bakes onto the signed plan's
+    /// `cross_buffer_atr`.
+    #[arg(long)]
+    pub cross_buffer_atr: Option<f64>,
 
     /// Number of trailing candles the entry SL-spread floor averages the bid-ask
     /// spread over (default 5). The floor requires `sl_distance ≥ 10 × spread`;

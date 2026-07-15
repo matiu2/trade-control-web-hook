@@ -31,6 +31,15 @@ by EUR/GBP & GBP/USD iH&S setups getting stranded in `AwaitBreakAndClose`.
   mode by `rule.intent.action` (`OnCloseRefs { settled: action != Enter }`).
 - **`tv-arm --cross-buffer-pct <pct>`** overrides the arm-time
   `cross_buffer_pct` (mirrors `--retest-atr-step`); `0` restores the bare line.
+- **ATR-relative cross buffer (`engine` + `tv-arm --cross-buffer-atr <f>`).** The
+  percent buffer is volatility-blind (0.1% is ~1.7p on EUR/GBP but ~8.5p is far
+  too wide for a close that broke by <1p). New additive term `cross_buffer_atr`:
+  the total buffer is `(cross_buffer_pct/100)·level + cross_buffer_atr·ATR`, the
+  ATR term self-scaling with the instrument's volatility (one value works across
+  EUR/GBP, Gold, indices). Either term may be 0; default `cross_buffer_atr = 0`
+  (off) so existing plans are unchanged. Fail-soft: ATR unavailable → the ATR
+  term degrades to 0, the percent term survives. `level_crossed` now takes a
+  `CrossBuffer { pct, atr_abs }` (resolved once per bar via `resolve_cross_buffer`).
 - **Slope-scaled retest (`engine`).** `tolerance(N) = (N-1) × retest_atr_step ×
   |neckline slope per bar|` (the ATR cancels; it still guards the fail-soft
   degrade-to-0 on a too-short window). A **horizontal neckline (slope 0) never
@@ -39,15 +48,19 @@ by EUR/GBP & GBP/USD iH&S setups getting stranded in `AwaitBreakAndClose`.
 **Breaking.** `PlanState` gains `origin_open` (serde-default empty; migration-safe
 — a plan still awaiting its break sets origin from its next bar's open, one still
 on the origin side; a plan past the break has the rule latched and never re-runs).
-`eval_trigger` is now private (no external users). `retest_tolerance` /
-`build_trade_plan` gained a parameter each (internal).
+`TradePlan` gains `cross_buffer_atr` (serde-default 0.0; pre-field plans
+unchanged). `eval_trigger` is now private (no external users). `retest_tolerance`
+/ `build_trade_plan` gained a parameter each; `level_crossed` now takes a
+`CrossBuffer` instead of a bare percent (internal).
 
-**Config.** New signed override `tv-arm --cross-buffer-pct`. No new plan fields
-beyond `origin_open` on `PlanState` (not signed — it's runtime state).
+**Config.** New signed overrides `tv-arm --cross-buffer-pct` and
+`--cross-buffer-atr` (the latter bakes the new signed `TradePlan.cross_buffer_atr`
+field). `origin_open` on `PlanState` is runtime state, not signed.
 
-**Tests.** engine 153 (origin-below / skipped-transition / entry-edge-mode /
-slope-scaled / horizontal-stays-zero cases), core 852, tv-arm 231
-(`cross_buffer_pct_carried_onto_plan`), cli replay 94, cron 11. Validated by
+**Tests.** engine 155 (origin-below / skipped-transition / entry-edge-mode /
+slope-scaled / horizontal-stays-zero / cross-buffer-sum / resolve-atr-degrade),
+core 854 (`cross_buffer_atr` default + round-trip), tv-arm 232
+(`cross_buffer_atr_carried_onto_plan`), cli replay 94, cron 11. Validated by
 replaying the live EUR/GBP plan: with the buffer forced to 0 the break-and-close
 fires and the plan advances to `AwaitEntry` (origin-side path exercised).
 
