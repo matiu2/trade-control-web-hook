@@ -78,6 +78,21 @@ pub const MIN_INSTRUMENT_BARS: usize = 48;
 /// print, which `max` would chase).
 pub const WIDEN_PERCENTILE: f64 = 0.90;
 
+/// The per-hour percentile used as the *flag* statistic in the minute-based
+/// path ([`profile_from_minutes`]). `0.75` — the "bulk of the hour" line that
+/// separates a genuine spread hour from a boundary bleed:
+/// - A ≤10-minute end-of-hour ramp (the 21:00 spike leaking into hour 20's last
+///   minutes) is ~⅙ of the hour, so it sits above p75 and cannot lift it → the
+///   bleed hour is NOT flagged.
+/// - A real spike filling ≥¼ of the hour (OANDA EUR_USD 21:00 is short but
+///   genuine: p75 ratio 1.35× vs 1.24× threshold) DOES lift p75 → flagged.
+///
+/// p50 (median) was too strict (dropped EUR_USD's short-but-real 21:00 spike);
+/// p90 was the original H1-close bleed statistic. Validated on OANDA EUR_USD
+/// (short spike, must flag) and GBP_AUD (hour-20 bleed must drop, hour-21 must
+/// flag). See the `gbpaud_spread_hour_minute_truth` memory.
+pub const FLAG_PERCENTILE: f64 = 0.75;
+
 /// The outcome of reviewing one instrument — an EXPLICIT verdict so a baked
 /// `elevated_hours == 0` isn't ambiguous between "analysed, genuinely flat" and
 /// "never looked / too little data". Recorded per row so we can see which
@@ -198,7 +213,9 @@ pub fn profile_for_instrument(bars: &[Bar]) -> SpreadProfile {
         }
     }
 
-    // Per-hour p90 spread-frac and ratio (only hours with enough bars).
+    // Per-hour p90 spread-frac; the H1 flag statistic is that same p90 (only
+    // hours with enough bars participate). The minute path swaps the flag
+    // statistic for the hour's median; both share `apply_gates`.
     let mut hour_p90: [f64; 24] = [0.0; 24];
     let mut hour_ratio: [Option<f64>; 24] = [None; 24];
     for h in 0..24 {
@@ -210,29 +227,142 @@ pub fn profile_for_instrument(bars: &[Bar]) -> SpreadProfile {
         hour_ratio[h] = Some(p90 / vol);
     }
 
-    let ratios: Vec<f64> = hour_ratio.iter().filter_map(|r| *r).collect();
-    // Need a spread of populated hours to have a meaningful median-of-ratios.
-    if ratios.len() < 12 {
+    apply_gates(hour_ratio, hour_p90, vol, n)
+}
+
+/// One minute bar reduced to what the minute-aware computation needs: the UTC
+/// hour it fell in, its spread fraction, and its mid close (for the hourly
+/// volatility resample). Built by the fetchers from each broker's M1 candles.
+#[derive(Debug, Clone, Copy)]
+pub struct MinuteBar {
+    /// UTC timestamp minute-of-day `0..=1439` (`hour*60 + minute`).
+    pub utc_minute_of_day: u16,
+    /// `(ask_close - bid_close) / mid_close`. Must be finite and ≥ 0.
+    pub spread_frac: f64,
+    /// Mid close price (> 0), for the hourly-resampled volatility series.
+    pub mid_close: f64,
+}
+
+impl MinuteBar {
+    /// The UTC hour `0..=23` this minute falls in.
+    pub fn utc_hour(&self) -> usize {
+        (self.utc_minute_of_day / 60) as usize
+    }
+}
+
+/// Minute-level minimum: an hour needs at least this many *minute* samples
+/// before we trust its median/p90. A spread hour lasting the full hour has ~60
+/// minutes across many days; a boundary ramp is only ~6/hour/day, so this keeps
+/// a thinly-sampled hour out of the flag.
+pub const MIN_HOUR_MINUTES: usize = 20;
+
+/// Compute the spread profile from **minute** bars — the bleed-resistant path.
+///
+/// The H1 [`profile_for_instrument`] samples each hour by its bar *close* spread,
+/// so a spike beginning in the last few minutes of the *previous* hour
+/// contaminates that hour's bucket and flags a whole hour that is calm for
+/// 53/60 minutes (the OANDA GBP_AUD hour-20 / 06:00-Brisbane over-flag). This
+/// path instead:
+/// - buckets every minute's `spread_frac` by its true UTC hour,
+/// - flags an hour on its **p75** minute-ratio (see [`FLAG_PERCENTILE`]): a ≤10-
+///   minute end-of-hour ramp sits in the top decile so it can't move the p75 →
+///   the bleed hour no longer flags, while a genuine spike that fills ≥¼ of the
+///   hour (even a short one like OANDA EUR_USD 21:00) still lifts the p75 over
+///   the threshold. The median (p50) was too strict — it dropped EUR_USD's real
+///   but short 21:00 spike; p90 was too lenient (the original bleed statistic).
+/// - sizes the widen from the **p90** minute-frac (still the spike magnitude).
+///
+/// `vol` is `median(|Δmid|/mid)` over **hourly-resampled** mids (last minute of
+/// each UTC hour) — the SAME scale as the H1 path, so the med3/peak-frac
+/// thresholds are unchanged and comparable.
+///
+/// Bars must be in timestamp order. Same empty-profile guards as the H1 path.
+pub fn profile_from_minutes(bars: &[MinuteBar]) -> SpreadProfile {
+    let n = bars.len();
+    // Minute bars are ~60× denser; require the equivalent of MIN_INSTRUMENT_BARS
+    // *hours* of coverage so a thin sample still can't compute a mask.
+    if n < MIN_INSTRUMENT_BARS * MIN_HOUR_MINUTES {
         return SpreadProfile::empty(n);
+    }
+
+    // Hourly-resampled mids for the volatility baseline: one mid per contiguous
+    // UTC-hour run (bars are in timestamp order, so a change in hour-of-day
+    // marks a new hour). Consecutive hourly samples give a |Δmid| series on the
+    // same scale as the H1 path.
+    let mut hourly_mids: Vec<f64> = Vec::new();
+    let mut last_hour: Option<usize> = None;
+    for b in bars {
+        let h = b.utc_hour();
+        if last_hour != Some(h) {
+            hourly_mids.push(b.mid_close);
+            last_hour = Some(h);
+        }
+    }
+    let rets: Vec<f64> = hourly_mids
+        .windows(2)
+        .filter(|w| w[0] > 0.0)
+        .map(|w| (w[1] - w[0]).abs() / w[0])
+        .collect();
+    let vol = median(&rets);
+    if !(vol.is_finite() && vol > 0.0) {
+        return SpreadProfile::empty(n);
+    }
+
+    // Bucket minute spreads by UTC hour.
+    let mut by_hour: [Vec<f64>; 24] = Default::default();
+    for b in bars {
+        let h = b.utc_hour();
+        if h < 24 {
+            by_hour[h].push(b.spread_frac);
+        }
+    }
+
+    // Per-hour flag statistic = p75 minute spread-frac (bulk-of-hour, see
+    // FLAG_PERCENTILE), and widen = p90 minute spread-frac (spike magnitude).
+    // Only hours with enough minute samples participate.
+    let mut hour_flag: [Option<f64>; 24] = [None; 24];
+    let mut hour_p90: [f64; 24] = [0.0; 24];
+    for h in 0..24 {
+        if by_hour[h].len() < MIN_HOUR_MINUTES {
+            continue;
+        }
+        hour_flag[h] = Some(percentile(&by_hour[h], FLAG_PERCENTILE));
+        hour_p90[h] = percentile(&by_hour[h], WIDEN_PERCENTILE);
+    }
+
+    let flag_ratio: [Option<f64>; 24] = std::array::from_fn(|h| hour_flag[h].map(|m| m / vol));
+    apply_gates(flag_ratio, hour_p90, vol, n)
+}
+
+/// Shared med3 + peak-fraction gate over per-hour flag ratios and widen p90s.
+/// Both the H1 close-based and minute-based paths funnel through this so the
+/// elevation logic lives in one place.
+///
+/// `flag_ratio[h]` = the hour's flag statistic ÷ vol (`None` = under-sampled).
+/// `hour_p90[h]` = the hour's p90 spread-frac (the baked widen when elevated).
+fn apply_gates(
+    flag_ratio: [Option<f64>; 24],
+    hour_p90: [f64; 24],
+    vol: f64,
+    n_bars: usize,
+) -> SpreadProfile {
+    let ratios: Vec<f64> = flag_ratio.iter().filter_map(|r| *r).collect();
+    if ratios.len() < 12 {
+        return SpreadProfile::empty(n_bars);
     }
     let median_ratio = median(&ratios);
     if !(median_ratio.is_finite() && median_ratio > 0.0) {
-        return SpreadProfile::empty(n);
+        return SpreadProfile::empty(n_bars);
     }
-    // Peak hourly ratio — the spike-dominance denominator. Non-empty (we have
-    // ≥12 populated hours), so `fold` with -inf is safe.
     let peak_ratio = ratios.iter().copied().fold(f64::NEG_INFINITY, f64::max);
-
-    // Two gates (both required): `3×median` isolates elevation from a flat
-    // baseline; `PEAK_FRAC × peak` strips a benign wide off-session band from
-    // the genuine spike on 3-tier instruments. See MED_MULT / PEAK_FRAC.
     let med_threshold = MED_MULT * median_ratio;
     let peak_threshold = PEAK_FRAC * peak_ratio;
+
     let mut mask: u32 = 0;
     let mut widen = [0.0_f64; 24];
     let mut ratio_flat = [0.0_f64; 24];
     for h in 0..24 {
-        if let Some(r) = hour_ratio[h] {
+        if let Some(r) = flag_ratio[h] {
             ratio_flat[h] = r;
             if r >= med_threshold && r >= peak_threshold {
                 mask |= 1 << h;
@@ -249,7 +379,7 @@ pub fn profile_for_instrument(bars: &[Bar]) -> SpreadProfile {
         hour_p90_frac: hour_p90,
         hour_ratio: ratio_flat,
         review: ReviewStatus::Reviewed,
-        n_bars: n,
+        n_bars,
     }
 }
 
@@ -408,5 +538,123 @@ mod tests {
         assert_eq!(percentile(&v, 0.0), 0.0);
         assert_eq!(percentile(&v, 1.0), 4.0);
         assert_eq!(percentile(&v, 0.5), 2.0);
+    }
+
+    // ---- minute-based path ----
+
+    fn min_bar(hour: u8, minute: u8, spread_frac: f64, mid: f64) -> MinuteBar {
+        MinuteBar {
+            utc_minute_of_day: hour as u16 * 60 + minute as u16,
+            spread_frac,
+            mid_close: mid,
+        }
+    }
+
+    /// `days` days of full 60-min hours at `normal` spread, with a small mid
+    /// wobble for vol. `elevated` = closure `(hour, minute) -> Option<frac>`
+    /// overriding the spread for specific minutes.
+    fn minute_days(
+        days: usize,
+        normal: f64,
+        elevated: impl Fn(u8, u8) -> Option<f64>,
+    ) -> Vec<MinuteBar> {
+        let mut bars = Vec::new();
+        let mut mid = 1.0000_f64;
+        for _ in 0..days {
+            for h in 0..24u8 {
+                mid += if h % 2 == 0 { 0.0002 } else { -0.0002 };
+                for m in 0..60u8 {
+                    let frac = elevated(h, m).unwrap_or(normal);
+                    bars.push(min_bar(h, m, frac, mid));
+                }
+            }
+        }
+        bars
+    }
+
+    #[test]
+    fn minute_end_of_hour_ramp_does_not_flag_the_hour() {
+        // Hour 20 is calm for :00–:52 and only ramps in the last ~7 minutes
+        // (the 21:00 spike bleeding back — the OANDA GBP_AUD hour-20 case).
+        // Hour 21 is a genuine full-hour spike. Only 21 must flag.
+        let bars = minute_days(5, 0.0001, |h, m| match (h, m) {
+            (20, 53..=59) => Some(0.0010), // 7-min end-of-hour ramp
+            (21, _) => Some(0.0010),       // full-hour spike
+            _ => None,
+        });
+        let p = profile_from_minutes(&bars);
+        assert_eq!(
+            p.elevated_vec(),
+            vec![21],
+            "an end-of-hour ramp in hour 20 must NOT flag hour 20 (bleed fix); \
+             only the full-hour spike (21) flags"
+        );
+    }
+
+    #[test]
+    fn minute_full_hour_spike_flags_and_widen_is_p90_sized() {
+        let bars = minute_days(5, 0.0001, |h, _m| (h == 21).then_some(0.0010));
+        let p = profile_from_minutes(&bars);
+        assert_eq!(p.elevated_vec(), vec![21]);
+        // Widen for hour 21 is its p90 minute spread-frac ≈ the spike size.
+        assert!(
+            p.hour_widen_frac[21] > 0.0009,
+            "widen must be p90-sized (spike), got {}",
+            p.hour_widen_frac[21]
+        );
+        assert_eq!(p.hour_widen_frac[20], 0.0);
+    }
+
+    #[test]
+    fn minute_flat_flags_nothing() {
+        let bars = minute_days(5, 0.0001, |_h, _m| None);
+        let p = profile_from_minutes(&bars);
+        assert_eq!(p.elevated_vec(), Vec::<u8>::new());
+    }
+
+    #[test]
+    fn minute_thin_data_is_empty() {
+        // One hour of minutes only → below the coverage floor → empty.
+        let bars = minute_days(1, 0.0001, |_h, _m| None);
+        // Truncate to a single hour's worth.
+        let bars = &bars[..60];
+        let p = profile_from_minutes(bars);
+        assert_eq!(p.review, ReviewStatus::InsufficientData);
+        assert_eq!(p.elevated_hours, 0);
+    }
+
+    #[test]
+    fn minute_short_real_spike_flags_but_shorter_bleed_does_not() {
+        // The EUR_USD-vs-GBP_AUD calibration in one test: a genuine spike that
+        // fills ~20 min of the hour (hour 21, EUR_USD-like short spike) MUST
+        // flag; a ~7-min end-of-hour ramp (hour 20 bleed) must NOT. Proves p75
+        // is the separating line — p50 would drop the 20-min spike, p90 would
+        // keep the 7-min bleed (on H1-close sampling).
+        let bars = minute_days(6, 0.0001, |h, m| match (h, m) {
+            (21, 40..=59) => Some(0.0015), // 20-min genuine spike
+            (20, 53..=59) => Some(0.0015), // 7-min bleed
+            _ => None,
+        });
+        let p = profile_from_minutes(&bars);
+        assert_eq!(
+            p.elevated_vec(),
+            vec![21],
+            "a 20-min real spike must flag (p75 lifts) while a 7-min bleed must \
+             not (p75 unmoved) — the EUR_USD/GBP_AUD calibration"
+        );
+    }
+
+    #[test]
+    fn minute_half_hour_spike_flags_it() {
+        // A spike that fills HALF the hour (30 min) still moves the median over
+        // 3× — it's a real (if shorter) spread hour, not a boundary artifact.
+        let bars = minute_days(5, 0.0001, |h, m| ((h == 21) && m >= 30).then_some(0.0012));
+        let p = profile_from_minutes(&bars);
+        // Median of hour 21 = midpoint of 30 calm + 30 spike ≈ boundary; with a
+        // 12× spike the median sits at the spike side → flags.
+        assert!(
+            p.elevated_vec().contains(&21),
+            "a half-hour-plus spike should still flag (median crosses 3×)"
+        );
     }
 }

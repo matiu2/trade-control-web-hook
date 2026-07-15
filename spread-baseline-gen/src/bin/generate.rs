@@ -22,8 +22,8 @@ use clap::Parser;
 use color_eyre::eyre::{Result, WrapErr, eyre};
 use tracing::{info, warn};
 
-use spread_baseline_gen::compute::profile_for_instrument;
-use spread_baseline_gen::fetch::{bars_from_bidask, fetch_oanda};
+use spread_baseline_gen::compute::profile_from_minutes;
+use spread_baseline_gen::fetch::{fetch_oanda_minutes, minutes_from_bidask};
 use spread_baseline_gen::render::render_table;
 use spread_baseline_gen::universe::{WorkItem, work_items};
 use spread_baseline_gen::{BaselineRow, Broker};
@@ -46,6 +46,13 @@ struct Args {
     /// Include Stock-class instruments (deferred by default in Stage 1).
     #[arg(long)]
     include_stocks: bool,
+
+    /// Lookback window in days for the minute-level fetch. Keep this WITHIN one
+    /// US-DST season — the NY-close spike sits at 21:00 UTC in summer / 22:00 in
+    /// winter, and a window spanning a DST transition smears the spike across
+    /// both hours (see TODO / the DST note). Default 90d.
+    #[arg(long, default_value_t = 90)]
+    days: i64,
 
     /// Print the per-hour ratio table for each instrument (verbose).
     #[arg(long)]
@@ -112,7 +119,7 @@ async fn main() -> Result<()> {
 
     let mut rows: Vec<BaselineRow> = Vec::new();
     for item in &items {
-        match profile_one(item, oanda.as_ref(), tn.as_ref()).await {
+        match profile_one(item, args.days, oanda.as_ref(), tn.as_ref()).await {
             Ok(Some(row)) => {
                 if args.verbose {
                     info!(
@@ -154,9 +161,11 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-/// Profile a single work item against whichever client its broker needs.
+/// Profile a single work item against whichever client its broker needs, using
+/// the **minute-level** (bleed-resistant) path over the last `days`.
 async fn profile_one(
     item: &WorkItem,
+    days: i64,
     oanda: Option<&oanda_client::OandaClient>,
     tn: Option<&broker_tradenation_adapter::TradeNationAdapter>,
 ) -> Result<Option<BaselineRow>> {
@@ -165,26 +174,26 @@ async fn profile_one(
     let bars = match item.broker {
         Broker::Oanda => {
             let client = oanda.ok_or_else(|| eyre!("OANDA client not built"))?;
-            fetch_oanda(client, &item.symbol).await?
+            fetch_oanda_minutes(client, &item.symbol, days).await?
         }
         Broker::TradeNation => {
             let broker = tn.ok_or_else(|| eyre!("TN broker not built"))?;
-            // ~2000 H1 bars back from now.
             let now = chrono::Utc::now();
-            let since =
-                now - chrono::Duration::hours(spread_baseline_gen::fetch::CANDLE_COUNT as i64);
+            let since = now - chrono::Duration::days(days);
+            // The adapter now pages M1 in ≤1000-bar chunks, so a multi-day
+            // window returns full history (was capped at ~1 day).
             let candles = broker
-                .get_bidask_candles(&item.symbol, Granularity::H1, since, now)
+                .get_bidask_candles(&item.symbol, Granularity::M1, since, now)
                 .await
                 .map_err(|e| eyre!("tn get_bidask_candles({}): {e:?}", item.symbol))?;
-            bars_from_bidask(&candles)
+            minutes_from_bidask(&candles)
         }
     };
 
     if bars.is_empty() {
         return Ok(None);
     }
-    let profile = profile_for_instrument(&bars);
+    let profile = profile_from_minutes(&bars);
     Ok(Some(BaselineRow {
         broker: item.broker,
         symbol: item.symbol.clone(),

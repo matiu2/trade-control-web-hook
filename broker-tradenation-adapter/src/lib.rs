@@ -7,7 +7,7 @@
 
 use broker_tradenation::TradeNationBroker;
 use candle_model::Granularity as CmGranularity;
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Duration, Utc};
 use trade_control_core::broker::{
     AmendError, AttemptState, BidAskCandle, Broker, CancelError, Candle, CandleError, EntryError,
     EntryRequest, Granularity, LookupError, OpenPosition, PendingOrder, Quote,
@@ -290,8 +290,6 @@ impl Broker for TradeNationAdapter {
             );
             return Err(CandleError::BadRange);
         }
-        let count = candle_count_for_window(granularity, since, now);
-
         let market = tradenation_api::resolve_market(self.0.client(), self.0.session(), instrument)
             .await
             .map_err(|err| {
@@ -299,47 +297,54 @@ impl Broker for TradeNationAdapter {
                 CandleError::Transient
             })?;
 
-        let fetch = |price: PriceType| {
-            tradenation_api::ohlcv::get_candles_range(
-                self.0.client(),
-                market.market_id,
-                cm_gran,
-                price,
-                count,
-                now,
-            )
-        };
-        // Three series for the same window/count → aligned by index and
-        // timestamp. Fetched sequentially (the session client is `!Send`; the
-        // three calls are cheap relative to the round-trip).
         let map_err = |err| {
             tracing::error!(
-                "tn get_bidask_candles({instrument}, market_id={}, count={count}): {err:?}",
+                "tn get_bidask_candles({instrument}, market_id={}): {err:?}",
                 market.market_id
             );
             CandleError::Transient
         };
-        let mid = fetch(PriceType::Mid).await.map_err(map_err)?;
-        let bid = fetch(PriceType::Bid).await.map_err(map_err)?;
-        let ask = fetch(PriceType::Ask).await.map_err(map_err)?;
 
-        // Index bid/ask by timestamp so a length/gap mismatch between the series
-        // drops that bar rather than mis-aligning the whole window.
-        let bid_by_ts: std::collections::HashMap<_, _> =
-            bid.iter().map(|c| (c.timestamp, c)).collect();
-        let ask_by_ts: std::collections::HashMap<_, _> =
-            ask.iter().map(|c| (c.timestamp, c)).collect();
+        // A window wider than TN's per-request ceiling (e.g. many days of M1) is
+        // fetched in several count-back chunks walking backward from `now`; a
+        // window that fits is a single chunk. Each chunk is three series (mid +
+        // bid + ask) zipped by timestamp, then all chunks union-dedup by
+        // timestamp so the +slack seam overlap collapses to one bar.
+        let mut by_ts: std::collections::HashMap<DateTime<Utc>, BidAskCandle> =
+            std::collections::HashMap::new();
+        for (count, end) in chunk_windows(granularity, since, now) {
+            let fetch = |price: PriceType| {
+                tradenation_api::ohlcv::get_candles_range(
+                    self.0.client(),
+                    market.market_id,
+                    cm_gran,
+                    price,
+                    count,
+                    end,
+                )
+            };
+            // Sequential (the session client is `!Send`).
+            let mid = fetch(PriceType::Mid).await.map_err(map_err)?;
+            let bid = fetch(PriceType::Bid).await.map_err(map_err)?;
+            let ask = fetch(PriceType::Ask).await.map_err(map_err)?;
 
-        let mut candles: Vec<BidAskCandle> = mid
-            .iter()
-            .filter_map(|m| {
-                let b = bid_by_ts.get(&m.timestamp)?;
-                let a = ask_by_ts.get(&m.timestamp)?;
+            // Index bid/ask by timestamp so a length/gap mismatch between the
+            // series drops that bar rather than mis-aligning the whole window.
+            let bid_by_ts: std::collections::HashMap<_, _> =
+                bid.iter().map(|c| (c.timestamp, c)).collect();
+            let ask_by_ts: std::collections::HashMap<_, _> =
+                ask.iter().map(|c| (c.timestamp, c)).collect();
+
+            for m in &mid {
+                let (Some(b), Some(a)) = (bid_by_ts.get(&m.timestamp), ask_by_ts.get(&m.timestamp))
+                else {
+                    continue;
+                };
                 let time = m.timestamp.with_timezone(&Utc);
                 if time <= since {
-                    return None; // strictly after the watermark
+                    continue; // strictly after the watermark
                 }
-                Some(BidAskCandle {
+                by_ts.entry(time).or_insert(BidAskCandle {
                     time,
                     o: m.open,
                     h: m.high,
@@ -353,9 +358,11 @@ impl Broker for TradeNationAdapter {
                     ask_h: a.high,
                     ask_l: a.low,
                     ask_c: a.close,
-                })
-            })
-            .collect();
+                });
+            }
+        }
+
+        let mut candles: Vec<BidAskCandle> = by_ts.into_values().collect();
         candles.sort_by_key(|c| c.time);
         Ok(candles)
     }
@@ -564,11 +571,64 @@ fn to_cm_granularity(g: Granularity) -> (CmGranularity, bool) {
 /// Pure — unit-tested.
 fn candle_count_for_window(g: Granularity, since: DateTime<Utc>, now: DateTime<Utc>) -> usize {
     const SLACK: i64 = 3;
-    /// TN's chart endpoint caps a single request; keep well under it.
-    const MAX: i64 = 1000;
     let span = (now - since).num_seconds().max(0);
     let bars = span / g.seconds() + 1 + SLACK;
-    bars.clamp(1, MAX) as usize
+    bars.clamp(1, TN_MAX_CANDLES_PER_REQUEST) as usize
+}
+
+/// TN's chart endpoint caps a single request; keep well under it. A window
+/// wider than this many bars must be fetched in multiple count-back requests
+/// (see [`chunk_windows`]).
+const TN_MAX_CANDLES_PER_REQUEST: i64 = 1000;
+
+/// Split `(since, now]` into count-back request windows, each fetching at most
+/// [`TN_MAX_CANDLES_PER_REQUEST`] bars, walking **backward** from `now`.
+///
+/// TN's OHLCV endpoint is count-back-from-an-`end`, capped per request. A wide
+/// window (e.g. 30 days of M1 ≈ 43k bars) therefore needs several requests, each
+/// ending one granularity-step before the previous chunk's earliest bar. Returns
+/// `(count, end)` pairs newest-first; the caller fetches each, unions, and trims
+/// to `(since, now]`. Each `count` carries the same `+1+SLACK` boundary slack as
+/// [`candle_count_for_window`] so adjacent chunks overlap by a bar rather than
+/// leaving a gap (the union dedups by timestamp).
+///
+/// Pure — unit-tested. A degenerate (`since >= now`) span yields one minimal
+/// window (the caller guards `BadRange` earlier anyway).
+fn chunk_windows(
+    g: Granularity,
+    since: DateTime<Utc>,
+    now: DateTime<Utc>,
+) -> Vec<(usize, DateTime<Utc>)> {
+    const SLACK: i64 = 3;
+    let step = g.seconds().max(1);
+    // Time span one full request covers, in seconds.
+    let chunk_span = TN_MAX_CANDLES_PER_REQUEST * step;
+
+    let mut windows = Vec::new();
+    let mut end = now;
+    loop {
+        // Bars from `since` up to this chunk's `end`, capped at the per-request
+        // ceiling (+slack), never zero.
+        let span = (end - since).num_seconds().max(0);
+        let bars = (span / step + 1 + SLACK).clamp(1, TN_MAX_CANDLES_PER_REQUEST) as usize;
+        windows.push((bars, end));
+
+        // Earliest bar this chunk reaches back to (approx). Once it's at/below
+        // `since` we've covered the whole window.
+        let reached = end - Duration::seconds(chunk_span);
+        if reached <= since {
+            break;
+        }
+        // Next chunk ends one step before this chunk's earliest bar; the +slack
+        // overlap means the union has no gap at the seam.
+        end = reached + Duration::seconds(step);
+        // Safety: never loop unboundedly (a year of M1 is ~525 chunks; cap far
+        // above any real request).
+        if windows.len() >= 1024 {
+            break;
+        }
+    }
+    windows
 }
 
 fn from_upstream_error(e: broker_tradenation::EntryError) -> EntryError {
@@ -929,6 +989,63 @@ mod candle_fetch_tests {
         let since = ts("2025-06-16T00:00:00Z");
         let now = ts("2026-06-16T00:00:00Z");
         assert_eq!(candle_count_for_window(Granularity::M1, since, now), 1000);
+    }
+
+    #[test]
+    fn chunk_windows_single_for_small_range() {
+        // 5 H1 bars fit in one request → one window, ending at `now`.
+        let since = ts("2026-06-16T00:00:00Z");
+        let now = ts("2026-06-16T05:00:00Z");
+        let w = chunk_windows(Granularity::H1, since, now);
+        assert_eq!(w.len(), 1);
+        assert_eq!(w[0].1, now);
+        assert_eq!(w[0].0, 9); // 5 + 1 + 3 slack, same as candle_count_for_window
+    }
+
+    #[test]
+    fn chunk_windows_pages_wide_m1_range() {
+        // 3 days of M1 = 4320 bars; at 1000/request that's ≥ 5 chunks.
+        let since = ts("2026-06-13T00:00:00Z");
+        let now = ts("2026-06-16T00:00:00Z");
+        let w = chunk_windows(Granularity::M1, since, now);
+        assert!(
+            w.len() >= 5,
+            "expected ≥5 chunks for 3d of M1, got {}",
+            w.len()
+        );
+        // Newest chunk ends at `now`.
+        assert_eq!(w[0].1, now);
+        // Every chunk stays under the per-request ceiling.
+        assert!(w.iter().all(|(c, _)| *c <= 1000));
+        // Chunks walk strictly backward in time.
+        assert!(w.windows(2).all(|p| p[1].1 < p[0].1));
+        // The oldest chunk reaches back to at least `since` (its count-back span
+        // covers the remaining window).
+        let oldest_end = w.last().unwrap().1;
+        assert!(
+            oldest_end - Duration::seconds(1000 * 60) <= since,
+            "oldest chunk must cover back to `since`"
+        );
+    }
+
+    #[test]
+    fn chunk_windows_seams_overlap_not_gap() {
+        // Adjacent chunks must overlap (slack) so the union has no missing bar.
+        let since = ts("2026-06-13T00:00:00Z");
+        let now = ts("2026-06-16T00:00:00Z");
+        let w = chunk_windows(Granularity::M1, since, now);
+        let step = 60i64;
+        for pair in w.windows(2) {
+            let newer_end = pair[0].1;
+            let newer_earliest = newer_end - Duration::seconds(1000 * step);
+            let older_end = pair[1].1;
+            // The older chunk's end is at/after the newer chunk's earliest bar
+            // (minus a step) → they meet or overlap, never leave a gap.
+            assert!(
+                older_end >= newer_earliest - Duration::seconds(step),
+                "seam gap between chunks"
+            );
+        }
     }
 }
 

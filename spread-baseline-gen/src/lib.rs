@@ -18,7 +18,9 @@ pub mod fetch;
 pub mod render;
 pub mod universe;
 
-pub use compute::{Bar, ReviewStatus, SpreadProfile, profile_for_instrument};
+pub use compute::{
+    Bar, MinuteBar, ReviewStatus, SpreadProfile, profile_for_instrument, profile_from_minutes,
+};
 pub use render::render_table;
 
 /// Which broker a computed profile belongs to. Tags each table row so the
