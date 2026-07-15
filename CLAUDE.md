@@ -324,9 +324,34 @@ closed back above.) The directional `buffer` (`cross_buffer_pct`) still applies 
 the cross-side wick so a one-tick graze doesn't trip it. See
 `[[intrabar_cross_reads_wick_not_close]]`.
 
-**`BarEvent::OnClose` is unchanged** — `03-prep-break-and-close` still requires a
-genuine close through the line (open one side, **close** the other). Only the
-intrabar arm moved.
+**`BarEvent::OnClose` now reads the ORIGIN side, not the prior close (2026-07-15).**
+An OnClose cross used to be an **edge detector** (`prev_close < far_edge &&
+close >= far_edge`) — it fired only on the bar that made the below→above (or
+above→below) *transition*. That lost a genuine break-and-close whenever the
+transition bar was suppressed (a spread-hour rubbish candle) or the plan armed
+already-past the line: the next clean bar had a `prev` already on the far side,
+so `prev < far_edge` was false and it never stamped. Stranded EUR/GBP & GBP/USD
+setups in `AwaitBreakAndClose` forever.
+
+The rule is now **origin-side / settled-close** for the latching consumers: the
+**origin** (the open of the first bar the rule ever saw — the arm-time bar in
+practice, stored once in `PlanState.origin_open`) fixes which side the plan
+started on, and **any bar that CLOSES on the far side of the line from the
+origin fires**, whether or not the transition happened on that bar. Operator's
+model: "we know which side we started on; the first bar that *closes* across is
+the break." Robust to a suppressed/skipped transition bar. The "must reach the
+far *zone* edge" half is retained, so the NAS100 "zone of the line" fix stands
+(a close that only dips into the buffer zone is not a break). Applies to **all
+latching OnClose rules**: `03-prep-break-and-close`, `04-prep-retest` (when
+OnClose), the `too-high`/`too-low` invalidation caps, M/W abort, drawn lines.
+
+**Exception — entry OnClose crosses keep EDGE semantics.** The strategy-v2 stop
+/ Quasimodo-limit `05-enter`/`09-enter-qm` OnClose crosses (`HorizontalCross …
+on_close` with `action: enter`) still fire once **per transition**, reading the
+prior close — a multi-shot entry cross must not re-place an order on every
+settled far-side bar. `fire_rule` picks the mode by `rule.intent.action`
+(`OnCloseRefs { settled: action != Enter }`); the `Intrabar` arm is unchanged
+(reads the wick). See `[[break_close_edge_detector_misses_already_above]]`.
 
 **Retest closeness decays over time (2026-07-03).** The `04-prep-retest` cross
 (only the retest, not other intrabar consumers) carries a **near-side tolerance

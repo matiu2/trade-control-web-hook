@@ -59,7 +59,7 @@ pub use trade_control_core::trade_plan::{
 mod evaluate;
 pub use evaluate::{
     EnterBlock, enter_preconditions_by_leg, enter_preconditions_reason, enter_preconditions_unmet,
-    eval_trigger, evaluate_controls_only, evaluate_plan, initial_phase, seed_plan_state,
+    evaluate_controls_only, evaluate_plan, initial_phase, seed_plan_state,
 };
 
 mod simulator;

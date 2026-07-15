@@ -71,6 +71,21 @@ pub struct PlanState {
     /// different cron ticks. Seeded (without firing) on the first tick.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub last_close: BTreeMap<String, f64>,
+    /// **Origin open** per `rule_id`: the *open* price of the first bar an
+    /// `OnClose` cross rule ever evaluated. Set exactly once (never overwritten)
+    /// and defines which side of the line the plan started on — the operator's
+    /// model for a break-and-close: an `OnClose` directional cross fires when a
+    /// bar's *close* settles on the **opposite** side of the line from this
+    /// origin, past the far buffer-zone edge. This replaces the old
+    /// prior-close *edge* detection (`prev < edge && c >= edge`), which lost a
+    /// genuine break whenever the transition bar was suppressed (spread hour) or
+    /// the plan armed already-past the line — the first *clean* bar then had a
+    /// `prev` already on the far side and never stamped. Keyed off the arm-time /
+    /// replay-start bar in practice (the first bar the plan processes). Seeded
+    /// (without firing) alongside `last_close`; a bar can both set the origin and
+    /// — if it closed to the far side — fire on that same bar.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub origin_open: BTreeMap<String, f64>,
     /// Open-time of the candle on which break-and-close fired — the start of
     /// the retest lookback window. `None` until that rule fires (or for plans
     /// with no break-and-close prep).
@@ -144,6 +159,12 @@ impl PlanState {
     ///   tick is safe for replay: the next *noteworthy* bundle loads the
     ///   up-to-date `last_close` from KV.
     ///
+    /// [`origin_open`](Self::origin_open) is likewise excluded: it's set exactly
+    /// once (the first bar a rule sees) and then never changes, so it can only
+    /// differ on the seeding tick — which always moves another field too. Like
+    /// `last_close` it's authoritative cross-detection memory, self-contained per
+    /// recorded bundle, so it never needs to make a tick "noteworthy" on its own.
+    ///
     /// So this compares only the fields a tick advancing them genuinely means
     /// "something happened": the spine `phase`, the `fired` latches, the
     /// `break_close_at` / `retest_seen_at` lookback stamps, and the reserved
@@ -167,6 +188,7 @@ impl PlanState {
             phase,
             fired: BTreeSet::new(),
             last_close: BTreeMap::new(),
+            origin_open: BTreeMap::new(),
             break_close_at: None,
             retest_seen_at: None,
             last_confirmed_enter_at: None,
