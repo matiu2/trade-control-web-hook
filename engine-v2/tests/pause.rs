@@ -245,3 +245,75 @@ fn writes(effects: &[Effect]) -> usize {
         .filter(|e| matches!(e, Effect::WriteFact { .. }))
         .count()
 }
+
+/// Count the `PlaceOrder` effects.
+fn place_orders(effects: &[Effect]) -> usize {
+    effects
+        .iter()
+        .filter(|e| matches!(e, Effect::PlaceOrder { .. }))
+        .count()
+}
+
+/// A no-prep enter rule (`Action::Enter`) — would place immediately each tick
+/// unless blocked (paused / retired / done).
+fn enter_rule() -> PlanRule {
+    let mut i = intent();
+    i.action = Action::Enter;
+    PlanRule {
+        id: "05-enter".into(),
+        kind: RuleKind::Enter,
+        intent: i,
+        bar: BarEvent::OnClose,
+        dir: CrossDir::Up,
+        preps: PrepMap::new(),
+        mechanism: EntryMechanism::Stop,
+    }
+}
+
+/// End-to-end auto-resume: a plan with a pause window and a no-prep enter. The
+/// enter is blocked while `now` is inside the window and places on the first bar
+/// after it clears (v1's "entries resume at the event time"). The pause rule is
+/// ordered first so its flag is applied before the enter ticks each bar.
+#[test]
+fn enter_blocked_during_pause_then_places_after() {
+    let win = NewsWindow::new(ts("2026-06-01T10:00:00Z"), ts("2026-06-01T14:00:00Z"));
+    let p = plan(vec![win], vec![pause_rule(), enter_rule()]);
+    let mut facts = Facts::default();
+
+    // A bar inside the window: paused → enter blocked, no PlaceOrder.
+    let inside = tick_once(
+        &p,
+        &mut facts,
+        &[candle("2026-06-01T12:00:00Z")],
+        ts("2026-06-01T12:00:00Z"),
+        true,
+    );
+    assert_eq!(
+        place_orders(&inside),
+        0,
+        "enter is blocked while inside the pause window",
+    );
+    assert_eq!(facts.flag_named("__plan__", "paused"), Some(true));
+
+    // A bar at/after the window end: flag clears, enter is live again → places.
+    let after = tick_once(
+        &p,
+        &mut facts,
+        &[
+            candle("2026-06-01T12:00:00Z"),
+            candle("2026-06-01T14:00:00Z"),
+        ],
+        ts("2026-06-01T14:00:00Z"),
+        true,
+    );
+    assert_eq!(
+        facts.flag_named("__plan__", "paused"),
+        Some(false),
+        "resumed"
+    );
+    assert_eq!(
+        place_orders(&after),
+        1,
+        "enter places on the first bar after the pause clears (auto-resume)",
+    );
+}
