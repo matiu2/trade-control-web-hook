@@ -135,9 +135,6 @@ pub fn eval_level(
 ///
 /// - `marker_epoch` — the marker time (Unix seconds).
 /// - `candle` — the bar under evaluation; its `time` is compared to the marker.
-// Consumed by the `Expiry` rule (4d step 3); landed here first so the time-marker
-// path is proven in isolation before a rule depends on it.
-#[allow(dead_code)]
 pub fn eval_time(marker_epoch: i64, candle: &Candle) -> bool {
     candle.time.timestamp() >= marker_epoch
 }

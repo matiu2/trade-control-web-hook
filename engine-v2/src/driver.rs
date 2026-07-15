@@ -53,9 +53,11 @@ use trade_control_core::broker::Candle;
 use crate::effect::Effect;
 use crate::facts::{FactKind, FactValue, Facts, Invalidated, PLAN_SCOPE};
 use crate::rule::Rule;
-use crate::rules::{BreakAndClose, Enter, Invalidate, Retest};
+use crate::rules::{BreakAndClose, Enter, Expiry, Invalidate, Retest};
 use crate::world::World;
-use crate::{Neckline, PlanRule, RuleKind, TooHigh, TooLow, TradePlan};
+// The `Expiry` LineName marker and the `Expiry` rule share a name — alias the
+// marker so `Expiry::<ExpiryMarker>` in `tick_rule` reads unambiguously.
+use crate::{Expiry as ExpiryMarker, Neckline, PlanRule, RuleKind, TooHigh, TooLow, TradePlan};
 
 /// Tick `plan`'s (pure) break-and-close rules for **one** bar — the current bar
 /// is `window.last()` — applying their write effects to the shared `facts`
@@ -138,12 +140,14 @@ pub fn tick_once(
 /// [`RuleKind`](crate::RuleKind). The impls borrow the rule, so this
 /// constructs the impl inline and ticks it (no per-rule boxing needed).
 ///
-/// The line/level-generic rules ([`BreakAndClose`], [`Retest`], [`Invalidate`])
-/// are generic over the [`LineName`](crate::LineName) they target; the driver
-/// binds that name from the `kind`. The preps target [`Neckline`](crate::Neckline);
-/// the invalidation caps target [`TooHigh`](crate::TooHigh) /
-/// [`TooLow`](crate::TooLow) (horizontal [`PriceLevel`](crate::PriceLevel)s) — one
-/// kind per cap so the level is fixed by the type, never a runtime string.
+/// The geometry-generic rules ([`BreakAndClose`], [`Retest`], [`Invalidate`],
+/// [`Expiry`](crate::rules::Expiry)) are generic over the
+/// [`LineName`](crate::LineName) they target; the driver binds that name from the
+/// `kind`. The preps target [`Neckline`](crate::Neckline); the invalidation caps
+/// target [`TooHigh`](crate::TooHigh) / [`TooLow`](crate::TooLow) (horizontal
+/// [`PriceLevel`](crate::PriceLevel)s); the expiry targets
+/// [`Expiry`](crate::Expiry) (a [`TimeMarker`](crate::TimeMarker)) — one kind per
+/// target so the geometry is fixed by the type, never a runtime string.
 fn tick_rule(rule: &PlanRule, world: &World) -> Vec<Effect> {
     match rule.kind {
         RuleKind::BreakAndClose => BreakAndClose::<Neckline>::new(rule).tick(world),
@@ -154,6 +158,9 @@ fn tick_rule(rule: &PlanRule, world: &World) -> Vec<Effect> {
         // projection inside the rule.
         RuleKind::InvalidateHigh => Invalidate::<TooHigh>::new(rule).tick(world),
         RuleKind::InvalidateLow => Invalidate::<TooLow>::new(rule).tick(world),
+        // Trade-expiry binds the `Expiry` `TimeMarker` — a wall-clock cutoff,
+        // crossed by `candle.time >= marker` (no price) inside the rule.
+        RuleKind::Expiry => Expiry::<ExpiryMarker>::new(rule).tick(world),
     }
 }
 

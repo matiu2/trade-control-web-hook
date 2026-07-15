@@ -119,6 +119,12 @@ pub enum RuleKind {
     /// level is a type, bound by the kind" — a plan can carry both caps as two
     /// rules.
     InvalidateLow,
+    /// Trade-expiry on the [`Expiry`](crate::Expiry) [`TimeMarker`](crate::TimeMarker)
+    /// — a wall-clock cutoff, not a price. When the bar reaches the marker it
+    /// retires the plan (emits `Effect::Invalidate`, reusing the invalidation
+    /// retire path), blocking any pending entry. Bound to the `Expiry` marker by
+    /// the kind, same as the caps bind their level.
+    Expiry,
 }
 
 /// A rule as **plan data** — it says how the cross is tested (`bar`/`dir`), what

@@ -70,8 +70,11 @@ pub use effect::Effect;
 pub use facts::{FactValue, Facts};
 pub use late_entry::{LateEntry, LateEntryOrder, resolve as resolve_late_entry};
 pub use rule::Rule;
+// The expiry *rule* is re-exported as `ExpiryRule` — the bare `Expiry` name is the
+// `TimeMarker` marker (re-exported above), mirroring how the fact `Retest` is
+// `RetestFact` while the rule keeps the bare `Retest`.
 pub use rules::{
-    BreakAndClose, Enter, Invalidate, Retest, is_break_and_close, is_enter, is_invalidate,
-    is_retest,
+    BreakAndClose, Enter, Expiry as ExpiryRule, Invalidate, Retest, is_break_and_close, is_enter,
+    is_expiry, is_invalidate, is_retest,
 };
 pub use world::World;

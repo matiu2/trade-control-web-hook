@@ -9,10 +9,12 @@
 
 mod break_and_close;
 mod enter;
+mod expiry;
 mod invalidate;
 mod retest;
 pub use break_and_close::BreakAndClose;
 pub use enter::Enter;
+pub use expiry::Expiry;
 pub use invalidate::Invalidate;
 pub use retest::Retest;
 
@@ -39,4 +41,9 @@ pub fn is_invalidate(rule: &PlanRule) -> bool {
         rule.kind,
         RuleKind::InvalidateHigh | RuleKind::InvalidateLow
     )
+}
+
+/// Is this rule the trade-expiry?
+pub fn is_expiry(rule: &PlanRule) -> bool {
+    rule.kind == RuleKind::Expiry
 }
