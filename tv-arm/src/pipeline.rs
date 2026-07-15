@@ -401,6 +401,8 @@ pub fn run(args: Args) -> Result<i32> {
                 .unwrap_or(trade_control_core::trade_plan::DEFAULT_RETEST_ATR_STEP),
             args.cross_buffer_pct
                 .unwrap_or(trade_control_core::trade_plan::DEFAULT_CROSS_BUFFER_PCT),
+            args.cross_buffer_atr
+                .unwrap_or(trade_control_core::trade_plan::DEFAULT_CROSS_BUFFER_ATR),
             armed_sentiment,
         )?;
     }
@@ -1987,6 +1989,7 @@ fn register_trade_plan(
     replay_start: Option<i64>,
     retest_atr_step: f64,
     cross_buffer_pct: f64,
+    cross_buffer_atr: f64,
     armed_sentiment: Option<trade_control_core::plan_sentiment::PlanSentiment>,
 ) -> Result<()> {
     use cli::TradePattern;
@@ -2014,6 +2017,7 @@ fn register_trade_plan(
         replay_start,
         retest_atr_step,
         cross_buffer_pct,
+        cross_buffer_atr,
         armed_at,
         armed_sentiment,
     );
@@ -2680,6 +2684,7 @@ mod tests {
             None,
             trade_control_core::trade_plan::DEFAULT_RETEST_ATR_STEP,
             trade_control_core::trade_plan::DEFAULT_CROSS_BUFFER_PCT,
+            trade_control_core::trade_plan::DEFAULT_CROSS_BUFFER_ATR,
             chrono::Utc::now(),
             None,
         )

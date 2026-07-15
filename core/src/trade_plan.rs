@@ -59,6 +59,16 @@ use crate::plan_sentiment::PlanSentiment;
 /// restores the bare wick-touch behaviour. See [`TradePlan::cross_buffer_pct`].
 pub const DEFAULT_CROSS_BUFFER_PCT: f64 = 0.02;
 
+/// Default **ATR-fraction** cross buffer — **0.0** (off). The buffer a cross
+/// must clear is `cross_buffer_pct%·level + cross_buffer_atr·ATR`; this is the
+/// ATR term. `0.0` keeps the historical percent-only behaviour, so existing
+/// plans are unchanged. Unlike [`DEFAULT_CROSS_BUFFER_PCT`] (a fixed % of price,
+/// volatility-blind — 0.1% is ~1.7p on EUR/GBP but ~8.5p is far too much for a
+/// close that broke by <1p), the ATR term self-scales with the instrument's
+/// volatility, so one value works across EUR/GBP, Gold, indices. Override with
+/// `tv-arm --cross-buffer-atr`. See [`TradePlan::cross_buffer_atr`].
+pub const DEFAULT_CROSS_BUFFER_ATR: f64 = 0.0;
+
 /// Default per-bar decay step (in ATR multiples) for the retest tolerance —
 /// **0.075**. The first bar after the break must reach the neckline; each later
 /// bar loosens by `0.075 × ATR`, so the retest accepts a wick within ~1 ATR of
@@ -128,8 +138,33 @@ pub struct TradePlan {
     /// Plan-level (uniform across the plan's crosses) and signed as part of the
     /// whole-body HMAC, so it's fixed at arm time. `tv-arm --cross-buffer-pct`
     /// overrides the arm-time default ([`DEFAULT_CROSS_BUFFER_PCT`]).
+    ///
+    /// **Volatility-blind** — a fixed % of price. The same 0.02% is ~1.7p on
+    /// EUR/GBP but a very different pip count on Gold or an index, and it ignores
+    /// how much the instrument actually moves. For a volatility-relative buffer
+    /// use [`Self::cross_buffer_atr`] (added on top); either or both may be set.
     #[serde(default)]
     pub cross_buffer_pct: f64,
+    /// **ATR-fraction** cross buffer, added on top of the
+    /// [`cross_buffer_pct`](Self::cross_buffer_pct) term: the total buffer a
+    /// cross must clear is `(cross_buffer_pct/100)·level + cross_buffer_atr·ATR`,
+    /// where `ATR` is the Wilder ATR (`atr_length_for(granularity)`) over the
+    /// detector window at the current bar. This term **self-scales with the
+    /// instrument's volatility** — one value (e.g. `0.15` = 15% of a typical
+    /// bar's range) works across EUR/GBP, Gold, indices, where a fixed % of price
+    /// does not. The two terms are **summed**, each may be `0.0`:
+    /// - percent-only (legacy): `cross_buffer_pct > 0`, `cross_buffer_atr = 0`;
+    /// - ATR-only (recommended): `cross_buffer_pct = 0`, `cross_buffer_atr > 0`;
+    /// - both: a fixed floor plus a volatility-scaled component.
+    ///
+    /// If the ATR can't be computed (detector window shorter than the ATR
+    /// length), the ATR term **degrades to 0.0** (the percent term still applies)
+    /// rather than failing — same fail-soft as the retest tolerance. `0.0` (the
+    /// default) means "no ATR term", so plans signed before this field
+    /// deserialize unchanged. Signed as part of the whole-body HMAC; overridden
+    /// by `tv-arm --cross-buffer-atr` ([`DEFAULT_CROSS_BUFFER_ATR`]).
+    #[serde(default)]
+    pub cross_buffer_atr: f64,
     /// Per-bar step for the retest's closeness-to-neckline tolerance — the retest
     /// zone is a near-side band that **fattens over time, at a rate set by the
     /// neckline's slope**. The first bar after the break must actually *reach* the
@@ -499,6 +534,30 @@ bar: on_close
         assert_eq!(plan.cross_buffer_pct, 0.1);
         let back: TradePlan = serde_json::from_str(&serde_json::to_string(&plan).unwrap()).unwrap();
         assert_eq!(back.cross_buffer_pct, 0.1, "must survive a round-trip");
+    }
+
+    /// `cross_buffer_atr` defaults to 0.0 (off) when absent, so plans signed
+    /// before it existed deserialize unchanged.
+    #[test]
+    fn missing_cross_buffer_atr_defaults_to_zero() {
+        let json = r#"{"trade_id":"t-1","instrument":"EUR_USD","direction":"short",
+            "granularity":"h1","pip_size":0.0001,"rules":[]}"#;
+        let plan: TradePlan = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            plan.cross_buffer_atr, 0.0,
+            "absent cross_buffer_atr must default to 0.0 (no ATR term)"
+        );
+    }
+
+    /// The `cross_buffer_atr` value survives a JSON round-trip when set.
+    #[test]
+    fn cross_buffer_atr_round_trips() {
+        let json = r#"{"trade_id":"t-1","instrument":"EUR_USD","direction":"short",
+            "granularity":"h1","pip_size":0.0001,"rules":[],"cross_buffer_atr":0.15}"#;
+        let plan: TradePlan = serde_json::from_str(json).unwrap();
+        assert_eq!(plan.cross_buffer_atr, 0.15);
+        let back: TradePlan = serde_json::from_str(&serde_json::to_string(&plan).unwrap()).unwrap();
+        assert_eq!(back.cross_buffer_atr, 0.15, "must survive a round-trip");
     }
 
     /// A plan with no `replay_start` deserializes to `None`, and re-serializing
