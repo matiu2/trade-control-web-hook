@@ -111,17 +111,23 @@ pub struct TradePlan {
     #[serde(default)]
     pub shadow: bool,
     /// Cross-depth buffer, as a **percent of the crossed level's price**, that
-    /// an *intrabar* directional cross must pierce past the line before it
-    /// counts. Guards against a one-tick graze tripping a retest / invalidation:
-    /// a `Down` cross needs `low <= level - (pct/100)*level`, an `Up` cross needs
-    /// `high >= level + (pct/100)*level`. `Either` keeps a bare straddle, and
-    /// `OnClose` (break-and-close) is unaffected — its close must already be on
-    /// the far side. `0.0` (the default) reproduces the pre-buffer behaviour, so
+    /// widens each line into a zone `[level ± (pct/100)·level]` a cross must clear.
+    /// Guards against a one-tick graze tripping a cross:
+    /// - an *intrabar* directional cross must pierce `pct%` past the line: a `Down`
+    ///   cross needs `low <= level - buffer`, an `Up` cross `high >= level +
+    ///   buffer`; `Either` keeps a bare straddle;
+    /// - an *`OnClose`* directional cross (break-and-close, invalidation caps)
+    ///   must **close** past the *far zone edge* (`Up`: `close >= level + buffer`;
+    ///   `Down`: `close <= level - buffer`). A close that only dips into the zone
+    ///   short of the far edge is not a break — this is the "zone of the line" fix
+    ///   (NAS100 short 2026-07-02).
+    ///
+    /// `0.0` (the default) reproduces the bare wick/close-touch behaviour, so
     /// plans signed before this field deserialize unchanged.
     ///
     /// Plan-level (uniform across the plan's crosses) and signed as part of the
-    /// whole-body HMAC, so it's fixed at arm time. A future `tv-arm` flag can
-    /// override the arm-time default.
+    /// whole-body HMAC, so it's fixed at arm time. `tv-arm --cross-buffer-pct`
+    /// overrides the arm-time default ([`DEFAULT_CROSS_BUFFER_PCT`]).
     #[serde(default)]
     pub cross_buffer_pct: f64,
     /// Per-bar decay step (in **ATR multiples**) for the retest's

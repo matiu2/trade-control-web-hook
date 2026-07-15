@@ -352,6 +352,19 @@ pub struct Args {
     #[arg(long)]
     pub retest_atr_step: Option<f64>,
 
+    /// Cross-depth buffer, as a **percent of the crossed level's price** (default
+    /// 0.02 = 0.02%). Widens each line into a zone `[level ± (pct/100)·level]` so
+    /// a graze doesn't count: an intrabar directional cross must pierce `pct%`
+    /// past the line, and an `OnClose` break must **close** past the far zone
+    /// edge. Lower = more sensitive (a smaller move counts as a break); `0`
+    /// restores the bare wick/close-touch behaviour. Bakes onto the signed plan's
+    /// `cross_buffer_pct`. Raise it to reject noisy one-tick breaks; lower it when
+    /// a genuine break closed only just past the line and the default buffer ate
+    /// it (e.g. EUR/GBP 2026-07-15, close 0.7p above a neckline the 1.7p buffer
+    /// rejected).
+    #[arg(long)]
+    pub cross_buffer_pct: Option<f64>,
+
     /// Number of trailing candles the entry SL-spread floor averages the bid-ask
     /// spread over (default 5). The floor requires `sl_distance ≥ 10 × spread`;
     /// sizing that off a single spiky entry bar can widen the stop too far, so
