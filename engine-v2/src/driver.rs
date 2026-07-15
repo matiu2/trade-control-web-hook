@@ -177,9 +177,15 @@ fn tick_rule(rule: &PlanRule, world: &World) -> Vec<Effect> {
 fn apply(facts: &mut Facts, fires: &mut Vec<Effect>, effects: Vec<Effect>, latest_bar: bool) {
     for effect in effects {
         match effect {
-            // The effect carries the kind as a runtime string (a rule already
-            // resolved it from `K::NAME` when it built the effect), so the driver
-            // applies it via the by-name setters.
+            // The effect carries line/kind as strings, and the driver applies
+            // them via the by-name setters — NOT because the typed `Facts` API is
+            // avoided here, but because the driver is downstream of a deliberate
+            // type-erasure boundary: a heterogeneous `Vec<Effect>` (writes from
+            // several rules, each with its own K/L) can't stay generic, so each
+            // rule erased its `K`/`L` into `K::NAME`/`L::NAME` when it built the
+            // effect. The strings are always resolved NAMEs, never hand-typed
+            // literals. Full reasoning on `Effect`'s docs ("Why the write variants
+            // key on `String`"). Don't try to route this back through `set::<K, L>`.
             Effect::WriteFact { line, kind, value } => facts.set_named(&line, &kind, value),
             Effect::WriteScratch {
                 rule_id,

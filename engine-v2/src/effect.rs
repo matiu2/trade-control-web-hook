@@ -49,6 +49,35 @@ use crate::plan::EntryMechanism;
 
 /// What a [`Rule`](crate::rule::Rule) asks the driver to do after a tick.
 ///
+/// # Why the write variants key on `String`, not the typed `FactKind`/`LineName`
+///
+/// A rule *knows* its line and kind at compile time — break-and-close writes
+/// `(Neckline, BreakClose)` — and reads/writes facts through the fully-typed
+/// [`Facts`] API (`set::<BreakClose, Neckline>()`). So it's tempting to make the
+/// effect typed too. It **can't be**, and this is a deliberate type-erasure
+/// boundary, not an un-migrated leftover:
+///
+/// - `Rule::tick` returns **`Vec<Effect>`**, and different rules — break-and-
+///   close, retest, the enter — put their writes in the *same* vec. A single
+///   `Effect` enum therefore has to hold *any* rule's `(line, kind)`. You cannot
+///   parameterise it (`Effect<K, L>`) without making the return type — and every
+///   collection the driver builds over it — generic over each rule's specific
+///   kind/line, which a heterogeneous `Vec` fundamentally can't be. The moment
+///   heterogeneous typed writes share one collection, the compile-time type is
+///   gone (same reason `dyn Any` exists).
+/// - So the rule **erases** its `K`/`L` into their stable [`NAME`](crate::facts::FactKind::NAME)
+///   strings *at the point it emits the effect* (`line: L::NAME.to_string()`), and
+///   the driver re-applies them by name via [`Facts::set_named`]. The driver being
+///   "downstream of the erasure" is correct — it is literally the consumer of an
+///   already-erased, heterogeneous list.
+///
+/// The typing still bought us everything it should: the erased string is always
+/// `L::NAME` / `K::NAME` — a *resolved* known name, never a hand-typed literal —
+/// so the collision surface the typed API closed stays closed. The `String` here
+/// is the honest "I have crossed into a heterogeneous collection" marker, not a
+/// missed migration. Don't try to make it `Effect<K, L>`; it doesn't compose with
+/// `Vec<Effect>`.
+///
 /// [`Fire`](Effect::Fire) boxes its [`FiredIntent`] — that payload is large
 /// (~1.3 KB) and would otherwise bloat every `Effect` (including the small write
 /// variants) to its size. Boxing keeps `Effect` cheap to move around in the
