@@ -85,11 +85,11 @@ pub fn resolution_to_granularity(resolution: &str) -> Option<Granularity> {
 //   never blocks on it). See
 //   [`TradePlan::armed_sentiment`](trade_control_core::trade_plan::TradePlan::armed_sentiment).
 //
-// Twelve parameters: each is a distinct chart-derived primitive (id, instrument,
+// Thirteen parameters: each is a distinct chart-derived primitive (id, instrument,
 // alerts, direction, roles, granularity, is_mw, shadow, replay_start,
-// retest_atr_step, armed_at, armed_sentiment) threaded once from the single
-// pipeline call site. Grouping them into a struct would just move the same
-// fields elsewhere without clarifying anything.
+// retest_atr_step, cross_buffer_pct, armed_at, armed_sentiment) threaded once
+// from the single pipeline call site. Grouping them into a struct would just move
+// the same fields elsewhere without clarifying anything.
 #[allow(clippy::too_many_arguments)]
 pub fn build_trade_plan(
     trade_id: &str,
@@ -102,6 +102,7 @@ pub fn build_trade_plan(
     shadow: bool,
     replay_start: Option<i64>,
     retest_atr_step: f64,
+    cross_buffer_pct: f64,
     armed_at: chrono::DateTime<chrono::Utc>,
     armed_sentiment: Option<trade_control_core::plan_sentiment::PlanSentiment>,
 ) -> TradePlan {
@@ -118,7 +119,7 @@ pub fn build_trade_plan(
         pip_size: pip_size_of(alerts),
         rules,
         shadow,
-        cross_buffer_pct: trade_control_core::trade_plan::DEFAULT_CROSS_BUFFER_PCT,
+        cross_buffer_pct,
         retest_atr_step,
         replay_start,
         armed_at: Some(armed_at),
@@ -669,6 +670,7 @@ mod tests {
             false,
             None,
             trade_control_core::trade_plan::DEFAULT_RETEST_ATR_STEP,
+            trade_control_core::trade_plan::DEFAULT_CROSS_BUFFER_PCT,
             chrono::Utc::now(),
             None,
         );
@@ -768,6 +770,7 @@ mod tests {
             false,
             None,
             trade_control_core::trade_plan::DEFAULT_RETEST_ATR_STEP,
+            trade_control_core::trade_plan::DEFAULT_CROSS_BUFFER_PCT,
             chrono::Utc::now(),
             None,
         );
@@ -817,6 +820,7 @@ mod tests {
             false,
             None,
             trade_control_core::trade_plan::DEFAULT_RETEST_ATR_STEP,
+            trade_control_core::trade_plan::DEFAULT_CROSS_BUFFER_PCT,
             chrono::Utc::now(),
             None,
         );
@@ -885,6 +889,7 @@ mod tests {
             false,
             None,
             trade_control_core::trade_plan::DEFAULT_RETEST_ATR_STEP,
+            trade_control_core::trade_plan::DEFAULT_CROSS_BUFFER_PCT,
             chrono::Utc::now(),
             None,
         );
@@ -934,6 +939,7 @@ mod tests {
             false,
             None,
             trade_control_core::trade_plan::DEFAULT_RETEST_ATR_STEP,
+            trade_control_core::trade_plan::DEFAULT_CROSS_BUFFER_PCT,
             chrono::Utc::now(),
             None,
         );
@@ -956,6 +962,7 @@ mod tests {
             true,
             None,
             trade_control_core::trade_plan::DEFAULT_RETEST_ATR_STEP,
+            trade_control_core::trade_plan::DEFAULT_CROSS_BUFFER_PCT,
             chrono::Utc::now(),
             None,
         );
@@ -977,6 +984,7 @@ mod tests {
             false,
             None,
             0.2,
+            trade_control_core::trade_plan::DEFAULT_CROSS_BUFFER_PCT,
             chrono::Utc::now(),
             None,
         );
@@ -997,6 +1005,7 @@ mod tests {
             false,
             None,
             trade_control_core::trade_plan::DEFAULT_RETEST_ATR_STEP,
+            trade_control_core::trade_plan::DEFAULT_CROSS_BUFFER_PCT,
             chrono::Utc::now(),
             None,
         );
@@ -1004,6 +1013,56 @@ mod tests {
             (defaulted.retest_atr_step - 0.075).abs() < 1e-9,
             "default step is 0.075, got {}",
             defaulted.retest_atr_step
+        );
+    }
+
+    #[test]
+    fn cross_buffer_pct_carried_onto_plan() {
+        let alerts = vec![alert("05-enter", Action::Enter)];
+        // A custom buffer (e.g. `--cross-buffer-pct 0`) threads to the plan field.
+        let custom = build_trade_plan(
+            "t",
+            "EUR_USD",
+            &alerts,
+            ConvDirection::Short,
+            &Roles::default(),
+            Granularity::H1,
+            false,
+            false,
+            None,
+            trade_control_core::trade_plan::DEFAULT_RETEST_ATR_STEP,
+            0.0,
+            chrono::Utc::now(),
+            None,
+        );
+        assert!(
+            custom.cross_buffer_pct.abs() < 1e-9,
+            "--cross-buffer-pct 0 must reach the built plan, got {}",
+            custom.cross_buffer_pct
+        );
+        // The pipeline passes the default const when the flag is absent.
+        let defaulted = build_trade_plan(
+            "t",
+            "EUR_USD",
+            &alerts,
+            ConvDirection::Short,
+            &Roles::default(),
+            Granularity::H1,
+            false,
+            false,
+            None,
+            trade_control_core::trade_plan::DEFAULT_RETEST_ATR_STEP,
+            trade_control_core::trade_plan::DEFAULT_CROSS_BUFFER_PCT,
+            chrono::Utc::now(),
+            None,
+        );
+        assert!(
+            (defaulted.cross_buffer_pct - trade_control_core::trade_plan::DEFAULT_CROSS_BUFFER_PCT)
+                .abs()
+                < 1e-9,
+            "default buffer is {}, got {}",
+            trade_control_core::trade_plan::DEFAULT_CROSS_BUFFER_PCT,
+            defaulted.cross_buffer_pct
         );
     }
 
@@ -1066,6 +1125,7 @@ mod tests {
             false,
             None,
             trade_control_core::trade_plan::DEFAULT_RETEST_ATR_STEP,
+            trade_control_core::trade_plan::DEFAULT_CROSS_BUFFER_PCT,
             chrono::Utc::now(),
             None,
         );

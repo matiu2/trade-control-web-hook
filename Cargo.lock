@@ -4214,6 +4214,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "trade-control-engine-v2"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "serde",
+ "serde_json",
+ "tracing",
+ "trade-control-core",
+ "trade-control-types-v2",
+]
+
+[[package]]
+name = "trade-control-types-v2"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "trade-control-core",
+]
+
+[[package]]
 name = "trade-control-worker"
 version = "0.1.0"
 dependencies = [
