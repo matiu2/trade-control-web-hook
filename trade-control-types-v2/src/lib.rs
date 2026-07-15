@@ -37,7 +37,9 @@
 mod fact_kind;
 mod line_name;
 mod plan;
+mod price_level;
 
 pub use fact_kind::{BreakClose, EntryOutcome, FactKind, LastClose, Retest};
 pub use line_name::{LineName, Neckline, TooHigh, TooLow};
 pub use plan::{EntryMechanism, Line, PlanRule, PrepMap, RuleKind, TradePlan};
+pub use price_level::PriceLevel;

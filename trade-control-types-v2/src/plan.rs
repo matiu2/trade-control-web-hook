@@ -25,7 +25,7 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::LineName;
+use crate::{LineName, PriceLevel};
 
 use trade_control_core::broker::Granularity;
 use trade_control_core::intent::{Direction, Intent};
@@ -173,8 +173,16 @@ pub struct TradePlan {
     /// Chart granularity — used to resolve a trendline's `bar_seconds` fallback
     /// divisor when an anchor predates the fetched window.
     pub granularity: Granularity,
-    /// The named lines rules reference.
+    /// The named lines rules reference — real two-anchor geometry crossed by
+    /// bar-index projection (the neckline). See [`Line`].
     pub lines: Vec<Line>,
+    /// The named horizontal price levels rules reference — the invalidation /
+    /// exhaustion caps (`too_high`/`too_low`), crossed with **no projection**.
+    /// Split out of [`lines`](Self::lines) in 4c (see [`PriceLevel`]).
+    /// `#[serde(default)]` so a plan with no caps — and any pre-4c plan predating
+    /// the field — deserializes with an empty vec.
+    #[serde(default)]
+    pub levels: Vec<PriceLevel>,
     /// The rules, in fire order.
     pub rules: Vec<PlanRule>,
     /// Plan-level cross-depth buffer as a percentage of the line price — a
@@ -201,5 +209,19 @@ impl TradePlan {
     /// [`L::NAME`](LineName::NAME).
     pub fn line_typed<L: LineName>(&self) -> Option<&Line> {
         self.line(L::NAME)
+    }
+
+    /// Look up a price level by **runtime name**. The level sibling of
+    /// [`line`](Self::line).
+    pub fn level(&self, name: &str) -> Option<&PriceLevel> {
+        self.levels.iter().find(|l| l.name == name)
+    }
+
+    /// Look up a price level by its compile-time [`LineName`] — an invalidation
+    /// rule's path (it knows its cap as a type, e.g. `TooHigh`). Delegates to
+    /// [`level`](Self::level) at [`L::NAME`](LineName::NAME). The level sibling of
+    /// [`line_typed`](Self::line_typed).
+    pub fn level_typed<L: LineName>(&self) -> Option<&PriceLevel> {
+        self.level(L::NAME)
     }
 }

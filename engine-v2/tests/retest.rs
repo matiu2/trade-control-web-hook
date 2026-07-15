@@ -164,6 +164,7 @@ fn plan(
         direction: Direction::Long,
         granularity: Granularity::H1,
         lines,
+        levels: Vec::new(),
         rules,
         cross_buffer_pct: 0.0,
         retest_atr_step,
