@@ -57,6 +57,7 @@ mod tests {
             granularity: Granularity::H1,
             lines: Vec::new(),
             levels,
+            markers: Vec::new(),
             rules: Vec::new(),
             cross_buffer_pct: 0.0,
             retest_atr_step: 0.0,

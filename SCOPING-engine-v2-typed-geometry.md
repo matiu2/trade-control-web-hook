@@ -192,10 +192,30 @@ slice (that's where it's written).
   `cross.rs` via a `HorizontalCross` `Trigger`; explicit `Effect::Invalidate`
   variant (not a bare fact write); two `RuleKind`s (not one kind + a runtime level
   ref). The `Line` projection path and its tests were left untouched.
-- **4d — split `TimeMarker` out of `Line`.** `NewsEvent`/`Expiry` become
-  `TimeMarker(timestamp)` with the `time >= marker` path. (No rule consumes these
-  yet in the current slice set — this mostly future-proofs the model; keep it
-  minimal.)
+- **4d — split `TimeMarker` out of `Line`. DONE** (`993c933`→`4527b9f`).
+  `Expiry` became a `TimeMarker { name, at_epoch }` with the `candle.time >=
+  marker` path — and, keeping the 4c lesson (don't ship a dead type), a working
+  `Expiry` **rule** consumes it. 3 reviewed/green steps:
+  1. **`TimeMarker` model** in types-v2: `TradePlan.markers` (`#[serde(default)]`),
+     `marker`/`marker_typed::<L>()` mirroring the line/level pairs; new `Expiry`
+     `LineName` marker.
+  2. **`eval_time`** in `cross.rs`: `candle.time.timestamp() >= marker_epoch`, the
+     v1 `TimeReached` arm. Reads the **bar's** time (v1 spine `trade-expiry` fires
+     on the bar whose open passes expiry), NOT the tick's `now` (which only v1's
+     *control* `TimeReached` — pause/news, not built in engine-v2 — uses).
+  3. **`Expiry<'r, L>`** rule + `RuleKind::Expiry`: fire-once on the retire fact,
+     `marker_typed::<L>()`, `eval_time`, emits **`Effect::Invalidate`** — reusing
+     4c's retire wholesale (expiry *is* a retirement). Simpler than the caps: no
+     `last_close`, no spread-hour gate (a time check has neither). Enter unchanged
+     (already blocked by the retire fact). End-to-end test: expiry blocks the
+     enter on the bar it expired.
+
+  Decision (AskUserQuestion): `TimeMarker` + a `trade-expiry` rule (not model-only,
+  not the full news-windows slice). **`pause`/`resume` + `news-start`/`news-end`
+  deferred** — they need a news-window / pause state concept engine-v2's fact
+  blackboard doesn't model yet (v1's `open_news_windows`/`PlanState`); that's its
+  own design slice (how a news window lives as facts, how the enter/close gate on
+  it). Build when the news rules land.
 
 ## Risks / watch-points
 
