@@ -304,9 +304,41 @@ pub fn simulate_fill_windowed(
     let be_arms_at = resolved
         .breakeven
         .map(|be| be.arms_at(entry_price, resolved.take_profit));
+
+    // System-2 spread-hour widen (replay==live): during a learned spread hour the
+    // live cron amends the broker stop *away* from price, transiently, then the
+    // recovery watcher restores it. The SHARED reconstruction `widened_stop_at`
+    // computes that same widen from the same floored bracket + candle path this
+    // sim resolved, so the exit is scored against the stop the LIVE broker would
+    // actually hold — not the un-widened level (BUG-spread-hour-widen-no-subhour-
+    // lead.md: the widen was previously journal-only, so a spread-hour spike stopped
+    // the position out at the original stop even though live it was widened clear).
+    // The widen governs bars in `[effective_from, restored_at)`; outside it the
+    // break-even-managed `active_stop` applies.
+    let widen_trigger =
+        trade_control_core::spread_blackout::elevated_threshold_pips(&intent.instrument);
+    let widen = widened_stop_at(
+        intent,
+        shell,
+        pip_size,
+        candles,
+        widen_trigger,
+        entry_spread_price,
+    );
+
     let mut active_stop = resolved.stop_loss;
     for c in rest {
-        let hit_sl = book_reaches(c, exit_book, active_stop, stop_approach(dir));
+        // The stop the live broker holds on THIS bar: the widened stop while the
+        // transient widen is active (`[effective_from, restored_at)`), else the
+        // break-even-managed stop. The widen moves the stop AWAY from price, so it
+        // can only ever protect (loosen) — it never fabricates a tighter exit.
+        let effective_stop = match widen {
+            Some(w) if w.effective_from <= c.time && w.restored_at.is_none_or(|r| c.time < r) => {
+                w.widened_stop
+            }
+            _ => active_stop,
+        };
+        let hit_sl = book_reaches(c, exit_book, effective_stop, stop_approach(dir));
         let hit_tp = book_reaches(c, exit_book, resolved.take_profit, tp_approach(dir));
         match (hit_sl, hit_tp) {
             (true, _) => {
@@ -314,7 +346,7 @@ pub fn simulate_fill_windowed(
                     fill_at,
                     entry_price,
                     exit_at: c.time,
-                    exit_price: active_stop,
+                    exit_price: effective_stop,
                 };
             }
             (false, true) => {
@@ -754,8 +786,20 @@ pub fn apply_entry_spread_floor(
 /// restore the original stop.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SpreadWiden {
-    /// Open-time of the bar whose spread crossed the widen trigger.
+    /// The **sub-candle instant** the live cron would fire the widen — the 30-min
+    /// lead moment before a flagged hour (e.g. 20:30Z ahead of a 21:00Z spike), or
+    /// the bar open when the bar's own hour is already flagged. This is the
+    /// journal-display time; use [`SpreadWiden::effective_from`] for the bar the
+    /// widened stop first governs the exit on.
     pub at: chrono::DateTime<chrono::Utc>,
+    /// Open-time of the candle the widen fired on — the bar from which the
+    /// widened stop governs the exit simulation, up to (but excluding)
+    /// [`restored_at`](Self::restored_at). Unlike [`at`](Self::at) (a sub-candle
+    /// instant), this is a bar boundary so the exit loop can compare it to each
+    /// candle's `time`. The exit sim applies the widened stop on bars in
+    /// `[effective_from, restored_at)`; outside that window the pre-widen stop
+    /// (original / break-even) applies — matching the live broker amend+restore.
+    pub effective_from: chrono::DateTime<chrono::Utc>,
     /// The stop the open position actually carried before this widen — i.e. the
     /// resolved stop **after** the System-1 entry spread floor (the same number
     /// the `order:` line and `simulate_fill` place at). System 2 widens from and
@@ -876,16 +920,17 @@ pub fn widened_stop_at(
         // the bar open when the bar's own hour is already flagged. `None` ⇒ this
         // bar neither is nor leads into a spread hour.
         // The candle table gives the widen as a scale-free FRACTION (`spread/mid`);
-        // convert to pips with the bar's mid close as the reference price via
-        // `widen_frac_to_pips`. Matches the live worker's cron widen (which uses
-        // the stop-loss price as its reference).
+        // convert to pips with the ORIGINAL STOP as the reference price via
+        // `widen_frac_to_pips` — the SAME reference the live cron uses
+        // (`blackout_apply::widen_one` passes `original_sl`), so the widened stop
+        // this replay reconstructs matches the one the live broker holds to the pip.
         let widen_instant = trade_control_core::spread_blackout::spread_hour_widen_instant(
             &intent.instrument,
             c.time,
             bar_seconds,
         );
         let baked_p90 = widen_instant.map(|(_at, frac)| {
-            trade_control_core::spread_blackout::widen_frac_to_pips(frac, c.c, pip_size)
+            trade_control_core::spread_blackout::widen_frac_to_pips(frac, original_stop, pip_size)
         });
         if baked_p90.is_none() && !trade_control_core::ny_clock::is_ny_close_edge(c.time) {
             continue;
@@ -922,6 +967,7 @@ pub fn widened_stop_at(
         let restored_at = restore_bar(&fill.rest[i + 1..], c.time, pip_size);
         return Some(SpreadWiden {
             at: widen_at,
+            effective_from: c.time,
             original_stop,
             widen_spread_pips: spread_pips,
             widened_stop: widened,
@@ -2078,7 +2124,8 @@ mod tests {
         // Guard: the candle table must actually carry EUR/USD's 21:00 spread
         // hour, else this test is vacuous. 21:00 UTC on an EDT date is a spread
         // hour. The production path (widened_stop_at) converts the widen
-        // FRACTION → pips at the bar's mid close, so mirror that here.
+        // FRACTION → pips at the ORIGINAL STOP (the same reference the live cron
+        // uses), so mirror that here.
         let at21 = ts("2026-06-17T21:00:00Z");
         let frac = spread_hour_widen_frac("EUR/USD", at21)
             .expect("EUR/USD must have a baked 21:00 spread-hour widen fraction");
@@ -2088,16 +2135,15 @@ mod tests {
         let tight = ba_candle("2026-06-17T21:00:00Z", 1.10010, 1.10005, 1.10030, 1.10025);
         let path = [fire_bar(), fill_bar, tight];
 
-        // The production widen converts the fraction at the tight bar's mid
-        // close (`c.c` = 1.10025), same reference the simulator uses.
-        let baked = widen_frac_to_pips(frac, tight.c, 0.0001);
-
         let widen = widened_stop_at(&intent, &shell, 0.0001, &path, WIDEN_FLOOR_PIPS, None)
             .expect("the baked spread hour must trip the widen even on a tight-spread bar");
         assert_eq!(widen.at, tight.time);
+        // The production widen converts the fraction at the ORIGINAL (floored)
+        // stop — the same reference `widened_stop_at` and the live cron use.
+        let baked = widen_frac_to_pips(frac, widen.original_stop, 0.0001);
         // Widen distance = baked p90 (~5p), NOT the 22p legacy floor. Long ⇒ SL
-        // moves DOWN from 1.0950 by baked p90 pips.
-        let expected = 1.0950 - baked * 0.0001;
+        // moves DOWN from the original stop by baked p90 pips.
+        let expected = widen.original_stop - baked * 0.0001;
         assert!(
             (widen.widened_stop - expected).abs() < 1e-9,
             "widened by baked p90 {baked}p (expected SL {expected}), got {}",
@@ -2153,6 +2199,89 @@ mod tests {
             "widen must report the sub-candle 30-min lead instant (20:30Z = 06:30 Bris), \
              not the 20:00 bar open and not the 21:00 spike"
         );
+    }
+
+    /// THE MONEY-PATH FIX: `simulate_fill` scores the exit against the WIDENED
+    /// stop during the spread hour, so a spike that clips the original stop but
+    /// NOT the widened one no longer books a false stop-out. This is the GBP/AUD
+    /// shape the operator hit: entry filled, the 21:00Z spread-hour spike wicks
+    /// past the original SL, but live the broker stop was already widened clear —
+    /// so the position survives. Before this fix `simulate_fill` was blind to the
+    /// widen and returned StoppedOut at the original stop (a −1R the live worker
+    /// never took → replay↔live divergence).
+    #[test]
+    fn simulate_fill_survives_spread_hour_spike_via_the_widened_stop() {
+        let mut intent = short_stop_intent();
+        intent.instrument = "GBP/AUD".into(); // TN mask [21]; 21:00Z is a spread hour
+        // Short: sell-stop entry 1.1000, SL 1.1030 (30p above), TP 1.0950.
+        // GBP/AUD's baked 21:00 widen frac (~0.00128) converts to ~14p at ~1.10,
+        // so the widened SL sits ~1.1044 — above the original 1.1030.
+        let shell = Shell::from_candle(
+            &candle("2026-07-13T10:00:00Z", 1.1010, 1.1012, 1.0998, 1.1005).mid(),
+        );
+        // Fill bar (short fills on the BID reaching 1.1000).
+        let fill_bar = ba_candle("2026-07-13T19:00:00Z", 1.1000, 1.0999, 1.1002, 1.1001);
+        // 20:00Z lead bar: tight, no exit.
+        let lead = ba_candle("2026-07-13T20:00:00Z", 1.10010, 1.10005, 1.10030, 1.10025);
+        // 21:00Z spike: ask HIGH 1.1035 — past the ORIGINAL SL 1.1030 (a short
+        // exits on the ask) but BELOW the ~1.1044 widened SL. With the widen
+        // applied the stop is NOT hit; without it, StoppedOut at 1.1030.
+        let spike = ba_candle("2026-07-13T21:00:00Z", 1.10330, 1.10300, 1.10350, 1.10320);
+        // 22:00Z recovered + heads to TP (bid low reaches 1.0950).
+        let tp_bar = ba_candle("2026-07-13T22:00:00Z", 1.09500, 1.09480, 1.09520, 1.09500);
+        let path = [fire_bar(), fill_bar, lead, spike, tp_bar];
+
+        // Guard the premise: the reconstruction widens ABOVE the spike's ask high.
+        let widen = widened_stop_at(&intent, &shell, 0.0001, &path, 22.0, None)
+            .expect("21:00Z spread hour must widen the short stop");
+        assert!(
+            widen.widened_stop > 1.10350,
+            "widened SL {} must clear the spike ask-high 1.1035",
+            widen.widened_stop
+        );
+        assert!(
+            widen.original_stop <= 1.10300,
+            "original SL {} is the one the spike wicks past",
+            widen.original_stop
+        );
+
+        // The exit sim must NOT stop out on the spike — it survives to TP.
+        match simulate_fill(&intent, &shell, 0.0001, &path) {
+            SimOutcome::TookProfit { .. } => {}
+            other => panic!("widen must save the trade → TookProfit, got {other:?}"),
+        }
+    }
+
+    /// The widen only PROTECTS — it never invents a tighter exit. If the spike
+    /// blows past even the widened stop, the position still stops out, but at the
+    /// WIDENED level (the stop the live broker actually held), not the original.
+    #[test]
+    fn simulate_fill_stops_out_at_the_widened_stop_when_the_spike_overruns_it() {
+        let mut intent = short_stop_intent();
+        intent.instrument = "GBP/AUD".into();
+        let shell = Shell::from_candle(
+            &candle("2026-07-13T10:00:00Z", 1.1010, 1.1012, 1.0998, 1.1005).mid(),
+        );
+        let fill_bar = ba_candle("2026-07-13T19:00:00Z", 1.1000, 1.0999, 1.1002, 1.1001);
+        let lead = ba_candle("2026-07-13T20:00:00Z", 1.10010, 1.10005, 1.10030, 1.10025);
+        // A monster spike: ask HIGH 1.1060 — past even the ~1.1044 widened SL.
+        let spike = ba_candle("2026-07-13T21:00:00Z", 1.10560, 1.10500, 1.10600, 1.10520);
+        let path = [fire_bar(), fill_bar, lead, spike];
+
+        let widen = widened_stop_at(&intent, &shell, 0.0001, &path, 22.0, None)
+            .expect("spread hour widens the stop");
+
+        match simulate_fill(&intent, &shell, 0.0001, &path) {
+            SimOutcome::StoppedOut { exit_price, .. } => {
+                assert!(
+                    (exit_price - widen.widened_stop).abs() < 1e-9,
+                    "must stop out at the WIDENED stop {}, not the original {}; got {exit_price}",
+                    widen.widened_stop,
+                    widen.original_stop,
+                );
+            }
+            other => panic!("an overrun spike still stops out, got {other:?}"),
+        }
     }
 
     /// The widen is **transient**: once a post-widen bar's spread recovers to/

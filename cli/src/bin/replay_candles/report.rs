@@ -686,8 +686,11 @@ fn render_fire(
     // price (`blackout_apply`), transiently — the recovery watcher
     // (`blackout_watch`) restores the original once the spread recovers (≤4p) or
     // the 3h backstop fires. We surface BOTH so the journal shows the shield
-    // snapping back, not a permanent risk change. Informational only —
-    // `simulate_fill` scores the exit against the un-widened bracket.
+    // snapping back, not a permanent risk change. `simulate_fill` now ALSO applies
+    // this same widen (via the shared `widened_stop_at`) when scoring the exit — so
+    // a spread-hour spike that clears the widened stop no longer books a false
+    // stop-out. These journal lines and the scored outcome read the same
+    // reconstruction, so they can't disagree.
     let widen_trigger = elevated_threshold_pips(&intent.instrument);
     if let Some(widen) = widened_stop_at(
         intent,
