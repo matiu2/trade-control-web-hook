@@ -44,7 +44,8 @@ use serde::{Deserialize, Serialize};
 // `trade-control-types-v2` (a plan builder names preps with them without pulling
 // in the engine). The `Facts` blackboard here keys on their `NAME`s.
 pub use trade_control_types_v2::{
-    BreakClose, EntryOutcome, FactKind, Invalidated, LastClose, LineName, PLAN_SCOPE, Retest,
+    BreakClose, EntryOutcome, FactKind, Invalidated, LastClose, LineName, PLAN_SCOPE, Paused,
+    Retest,
 };
 
 /// A single fact's value. Kept deliberately small — a fact is either a
@@ -191,6 +192,26 @@ impl Facts {
         }
     }
 
+    /// Convenience: the `Flag(b)` at `(L, K)`, if set to a boolean.
+    ///
+    /// `None` when the fact is unset or is not a `Flag`. Distinguishes a
+    /// deliberate `Flag(false)` (returns `Some(false)`) from "never set"
+    /// (`None`) — the pause guard treats both as "not paused", but the toggle
+    /// rule needs the difference to avoid re-emitting an unchanged flag.
+    pub fn flag<K: FactKind, L: LineName>(&self) -> Option<bool> {
+        self.flag_named(L::NAME, K::NAME)
+    }
+
+    /// Convenience: the `Flag(b)` at `(line, kind)` by **runtime kind name** — the
+    /// pause path (the `paused` flag is plan-scoped, keyed by the runtime
+    /// `PLAN_SCOPE` slot, not a geometry line).
+    pub fn flag_named(&self, line: &str, kind: &str) -> Option<bool> {
+        match self.get_named(line, kind) {
+            Some(FactValue::Flag(b)) => Some(*b),
+            _ => None,
+        }
+    }
+
     // --- Rule-private scratch, keyed `(rule_id, K)` ----------------------------
 
     /// Set (or overwrite) the rule-private scratch value at `(rule_id, K)`.
@@ -286,7 +307,33 @@ mod tests {
         assert_eq!(EntryOutcome::NAME, "entry_outcome");
         assert_eq!(LastClose::NAME, "last_close");
         assert_eq!(Invalidated::NAME, "invalidated");
+        assert_eq!(Paused::NAME, "paused");
         assert_eq!(PLAN_SCOPE, "__plan__");
+    }
+
+    /// `flag_named` reads a `Flag(b)` and distinguishes `Flag(false)` from unset —
+    /// the distinction the pause toggle rule needs. A non-`Flag` value reads `None`.
+    #[test]
+    fn flag_named_distinguishes_false_from_unset() {
+        let mut f = Facts::new();
+        // Unset ⇒ None.
+        assert_eq!(f.flag_named(PLAN_SCOPE, Paused::NAME), None, "unset ⇒ None");
+        // Flag(true) / Flag(false) read back as themselves.
+        f.set_named(PLAN_SCOPE, Paused::NAME, FactValue::Flag(true));
+        assert_eq!(f.flag_named(PLAN_SCOPE, Paused::NAME), Some(true));
+        f.set_named(PLAN_SCOPE, Paused::NAME, FactValue::Flag(false));
+        assert_eq!(
+            f.flag_named(PLAN_SCOPE, Paused::NAME),
+            Some(false),
+            "Flag(false) is Some(false), not None — distinct from unset",
+        );
+        // A non-Flag value at the same key ⇒ None (not a boolean).
+        f.set_named(PLAN_SCOPE, Paused::NAME, FactValue::Num(1.0));
+        assert_eq!(
+            f.flag_named(PLAN_SCOPE, Paused::NAME),
+            None,
+            "non-Flag ⇒ None"
+        );
     }
 
     /// Scratch is a separate namespace: a `last_close` scratch under a rule id is
