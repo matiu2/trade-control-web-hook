@@ -56,6 +56,7 @@ mod tests {
             lines: Vec::new(),
             levels: Vec::new(),
             markers,
+            pause_windows: Vec::new(),
             rules: Vec::new(),
             cross_buffer_pct: 0.0,
             retest_atr_step: 0.0,

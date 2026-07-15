@@ -133,6 +133,7 @@ fn plan(markers: Vec<TimeMarker>, rules: Vec<PlanRule>) -> TradePlan {
         lines: Vec::new(),
         levels: Vec::new(),
         markers,
+        pause_windows: Vec::new(),
         rules,
         cross_buffer_pct: 0.0,
         retest_atr_step: trade_control_core::trade_plan::DEFAULT_RETEST_ATR_STEP,

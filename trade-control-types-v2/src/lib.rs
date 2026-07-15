@@ -39,6 +39,7 @@ mod line_name;
 mod plan;
 mod price_level;
 mod time_marker;
+mod window;
 
 pub use fact_kind::{
     BreakClose, EntryOutcome, FactKind, Invalidated, LastClose, PLAN_SCOPE, Retest,
@@ -47,3 +48,4 @@ pub use line_name::{Expiry, LineName, Neckline, TooHigh, TooLow};
 pub use plan::{EntryMechanism, Line, PlanRule, PrepMap, RuleKind, TradePlan};
 pub use price_level::PriceLevel;
 pub use time_marker::TimeMarker;
+pub use window::NewsWindow;

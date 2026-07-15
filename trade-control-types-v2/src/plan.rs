@@ -25,7 +25,7 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::{LineName, PriceLevel, TimeMarker};
+use crate::{LineName, NewsWindow, PriceLevel, TimeMarker};
 
 use trade_control_core::broker::Granularity;
 use trade_control_core::intent::{Direction, Intent};
@@ -209,6 +209,15 @@ pub struct TradePlan {
     /// pre-4d plan predating the field — deserializes with an empty vec.
     #[serde(default)]
     pub markers: Vec<TimeMarker>,
+    /// The **pause** windows — `[event − before, event]` standoffs around
+    /// qualifying economic-news events. While `now` is inside any of these, the
+    /// [`Pause`](crate::rules::Pause) rule sets a `paused` flag and the enter is
+    /// blocked (the trade resumes automatically at the window's end). Baked at arm
+    /// time from the calendar (see [`NewsWindow`] and `SCOPING-engine-v2-news.md`).
+    /// `#[serde(default)]` so a plan with no news — and any plan predating the
+    /// field — deserializes with an empty vec.
+    #[serde(default)]
+    pub pause_windows: Vec<NewsWindow>,
     /// The rules, in fire order.
     pub rules: Vec<PlanRule>,
     /// Plan-level cross-depth buffer as a percentage of the line price — a

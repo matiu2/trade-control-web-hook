@@ -61,8 +61,8 @@ mod rules;
 // surface and needn't depend on the types crate directly.
 pub use trade_control_types_v2::{
     BreakClose, EntryMechanism, EntryOutcome, Expiry, FactKind, LastClose, Line, LineName,
-    Neckline, PlanRule, PrepMap, PriceLevel, Retest as RetestFact, RuleKind, TimeMarker, TooHigh,
-    TooLow, TradePlan,
+    Neckline, NewsWindow, PlanRule, PrepMap, PriceLevel, Retest as RetestFact, RuleKind,
+    TimeMarker, TooHigh, TooLow, TradePlan,
 };
 
 pub use driver::tick_once;
