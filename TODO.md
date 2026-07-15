@@ -44,15 +44,32 @@ lead was the right *effect* but the wrong *displayed time*.
       (asserts 20:30Z).
 - [x] core 862 / engine 156 pass; clippy clean; fmt run.
 
-## STILL OPEN — the exit sim ignores the widen (why it's still −2R)
-`simulate_fill` (engine/src/simulator.rs:308) scores every stop-out against the
-ORIGINAL stop; `widened_stop_at` is annotation-only (report.rs:690 says so). So
-the journal shows "SL widened → 1.93498" but the −1R is scored at the original
-1.93251. That's a replay↔live PARITY gap: live actually amends the broker stop,
-so a spread-hour stop-out can diverge. Fix = make `simulate_fill` apply the
-transient widened stop in `[widen.at, restored_at)`. NOT done — touches money-path
-scoring + fixtures; awaiting operator go-ahead. First verify the widened stop
-(1.93498) would even have survived the 21:00Z ask-high (else −2R is correct).
+## DONE — exit sim now honours the widen (replay==live, shared code)
+`simulate_fill_windowed` now reconstructs the System-2 widen via the SHARED
+`widened_stop_at` and applies the transient widened stop in `[effective_from,
+restored_at)` when scoring the exit — so a spread-hour spike that clears the
+widened stop no longer books a false stop-out. The widen only PROTECTS (moves the
+stop away); an overrun spike still stops out, but at the WIDENED level (the stop
+the live broker actually held), not the original.
+- [x] `SpreadWiden` gains `effective_from` (widen bar open) so the exit loop can
+      gate per-bar; `at` stays the sub-candle display instant.
+- [x] `widened_stop_at` reference price aligned to `original_stop` (matches the
+      live cron's `blackout_apply::widen_one`, which uses `original_sl`) → widened
+      stop matches the live broker's to the pip.
+- [x] report.rs:690 comment corrected (no longer "un-widened bracket").
+- [x] Tests: `simulate_fill_survives_spread_hour_spike_via_the_widened_stop`,
+      `simulate_fill_stops_out_at_the_widened_stop_when_the_spike_overruns_it`.
+      engine 158 / core 862 pass; clippy clean; fmt run.
+- [x] VERIFIED end-to-end on the real plan `/tmp/tv-arm-replay-hs-gbp-aud-
+      89697831.json`: entry #1 widens at 06:30, survives the 07:00 spike, TOOK
+      PROFIT +4.96R (was −1.00R stop-out). Plan Net R −2.00 → +4.96.
+
+### BE-before-widen edge (noted, not blocking)
+`widened_stop_at` widens from the resolved/floored original SL, not a
+break-even-moved stop. If BE armed BEFORE the widen, live remembers the
+BE stop as the "original" and widens from there; the replay widens from the
+signed original. Rare (BE arms at 50%-to-TP; a spread hour usually hits first)
+and both still protect. Refine only if a real trade shows the drift.
 
 ## Note
 The mask over-flag half (OANDA GBP_AUD [20,21]) is a SEPARATE change (regenerate
