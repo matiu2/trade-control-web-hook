@@ -130,6 +130,7 @@ mod tests {
             tick_size: tick,
             decimal_places: dp,
             pip_size: pip,
+            spread_schedule: "none".into(),
             symbols: AssetSymbols {
                 oanda: Some("TEST".into()),
                 tradenation: None,
