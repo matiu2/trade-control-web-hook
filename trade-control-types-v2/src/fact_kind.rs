@@ -12,26 +12,26 @@
 //!
 //! Each kind is a zero-size marker struct implementing [`FactKind`], whose only
 //! payload is a stable [`FactKind::NAME`]. That name is what actually lands in the
-//! serialized [`Facts`](super::Facts) blackboard (the on-the-wire format is
-//! unchanged — still strings), so the type layer is a **compile-time convenience
-//! over a string-keyed store**, not a new wire format. Rules refer to kinds by
-//! type (`facts.set::<Neckline, BreakClose>(…)`); the store holds `NAME`.
+//! serialized `Facts` blackboard (the engine's, in `trade-control-engine-v2`) —
+//! the on-the-wire format is unchanged, still strings — so the type layer is a
+//! **compile-time convenience over a string-keyed store**, not a new wire format.
+//! Rules refer to kinds by type (`facts.set::<BreakClose, Neckline>(…)`); the
+//! store holds `NAME`.
 //!
 //! An open trait (rather than one closed `enum FactKind`) is deliberate: kinds
 //! live in whatever crate owns the rule that writes them. The four below are the
 //! ones the current slice needs; a new setup adds its own marker structs in its
 //! own crate.
 //!
-//! The **line** half of the key is *not* here — it stays a runtime string until
-//! the typed-geometry slice (see `SCOPING-engine-v2-typed-geometry.md`, 4b), and
-//! `rule_id` (scratch) is inherently runtime. Only the kind is typed in this
-//! slice.
+//! The **line** half of the key is the sibling [`LineName`](crate::LineName)
+//! trait (also here); `rule_id` (scratch) is inherently runtime and stays a
+//! string.
 
 /// A fact kind, identified by a stable serialized [`NAME`](FactKind::NAME).
 ///
 /// Implemented by zero-size marker structs (below). The `NAME` is the string the
-/// [`Facts`](super::Facts) store keys on and serializes — keep it stable across
-/// releases (it is persisted state).
+/// engine's `Facts` store keys on and serializes — keep it stable across releases
+/// (it is persisted state).
 pub trait FactKind {
     /// The stable, serialized name of this kind (e.g. `"break_close"`). Persisted
     /// — do not rename without a migration.

@@ -14,8 +14,8 @@ use chrono::{DateTime, Utc};
 
 use trade_control_core::broker::Candle;
 
+use crate::TradePlan;
 use crate::facts::Facts;
-use crate::plan::TradePlan;
 
 /// The per-candle context the driver passes to each rule.
 pub struct World<'a> {

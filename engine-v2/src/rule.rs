@@ -7,14 +7,14 @@
 //! world. The driver interprets those effects: applies the writes to the shared
 //! [`Facts`](crate::facts::Facts) and collects the `Fire`s.
 //!
-//! Note the name split (see [`crate::plan`]): the **data** struct is
+//! Note the name split (see [`crate`]): the **data** struct is
 //! [`PlanRule`], this **behaviour** trait is `Rule`.
 
 use trade_control_core::broker::Candle;
 use trade_control_core::plan_eval::FiredIntent;
 
+use crate::PlanRule;
 use crate::effect::Effect;
-use crate::plan::PlanRule;
 use crate::world::World;
 
 /// A single rule the driver ticks once per candle.

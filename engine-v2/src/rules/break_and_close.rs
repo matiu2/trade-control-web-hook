@@ -42,9 +42,9 @@ use trade_control_core::trade_plan::Trigger;
 use crate::cross::{eval_trigger, trigger_uses_close};
 use crate::effect::Effect;
 use crate::facts::{BreakClose, FactKind, FactValue, LastClose};
-use crate::plan::{Line, LineName, PlanRule};
 use crate::rule::Rule;
 use crate::world::World;
+use crate::{Line, LineName, PlanRule};
 
 /// The break-and-close prep, bound to a v2 [`PlanRule`] and a compile-time line
 /// `L` (the line it targets — `Neckline` today). Borrowed so instantiating it

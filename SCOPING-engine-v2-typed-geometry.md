@@ -33,6 +33,32 @@ Two decisions from the 2026-07 review:
    model match the eval reality: a `PriceLevel` cross skips projection — a
    **correctness + clarity win**, not just a rename.
 
+## Shared model lives in `trade-control-types-v2` (extracted 2026-07)
+
+The v2 **plan model** + the `FactKind`/`LineName` marker traits were extracted
+from `engine-v2` into a dedicated **`trade-control-types-v2`** crate. Rationale:
+the model is *data* every v2 participant agrees on — a builder writes it, the
+engine consumes it — whereas the engine's *behaviour* (`Rule`, `Effect`, `Facts`,
+`driver`, `cross`, `late_entry`, the rule impls) is private machinery a builder
+never needs. Splitting the two stops `tv-arm-v2` / `trade-control-v2` from having
+to pull the whole engine in just to emit a `TradePlan`.
+
+```text
+        trade-control-types-v2   (TradePlan/Line/PlanRule/RuleKind/EntryMechanism
+        ╱          │          ╲   + LineName & FactKind traits + markers)
+  engine-v2    tv-arm-v2   trade-control-v2(cli)
+```
+
+- **In it:** `TradePlan`, `Line`, `PlanRule`, `RuleKind`, `EntryMechanism`,
+  `PrepMap`; `LineName` + `Neckline`/`TooHigh`/`TooLow`; `FactKind` +
+  `BreakClose`/`Retest`/`EntryOutcome`/`LastClose`. Deps: `serde` +
+  `trade-control-core`.
+- **NOT in it:** all behaviour (stays in `engine-v2`). `engine-v2` depends on
+  types-v2 and **re-exports** it, so an engine consumer keeps one import surface.
+- **Naming:** picked `trade-control-types-v2` (descriptive of *what it holds*).
+  `tv-arm-v2` / `trade-control-v2` don't exist yet — they're the future builders
+  that will depend on this crate directly.
+
 ## Vocabulary today (H&S + M/W only)
 
 - **Lines:** `Neckline` (the only real line).

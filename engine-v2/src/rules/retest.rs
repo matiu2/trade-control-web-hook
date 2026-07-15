@@ -60,9 +60,9 @@ use trade_control_core::trade_plan::{BarEvent, CrossDir, Trigger};
 use crate::cross::{eval_trigger, level_crossed, line_price_at, trigger_uses_close};
 use crate::effect::Effect;
 use crate::facts::{BreakClose, FactKind, FactValue, LastClose, Retest as RetestKind};
-use crate::plan::{Line, LineName, PlanRule};
 use crate::rule::Rule;
 use crate::world::World;
+use crate::{Line, LineName, PlanRule};
 
 /// The retest prep, bound to a v2 [`PlanRule`] and a compile-time line `L`
 /// (`Neckline` today). Borrowed so instantiating it per tick is free; `L` is a
@@ -223,7 +223,7 @@ impl<L: LineName> Retest<'_, L> {
         break_at: chrono::DateTime<chrono::Utc>,
         candle: &Candle,
         window: &[Candle],
-        plan: &crate::plan::TradePlan,
+        plan: &crate::TradePlan,
     ) -> Option<f64> {
         let bars_since_break = window
             .iter()

@@ -44,8 +44,8 @@
 
 use trade_control_core::plan_eval::FiredIntent;
 
+use crate::EntryMechanism;
 use crate::facts::FactValue;
-use crate::plan::EntryMechanism;
 
 /// What a [`Rule`](crate::rule::Rule) asks the driver to do after a tick.
 ///

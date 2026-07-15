@@ -1,7 +1,7 @@
 //! [`LineName`] — a geometry line's **compile-time name**.
 //!
 //! The line half of a fact key `(line, kind)`. This mirrors
-//! [`FactKind`](crate::facts::FactKind) exactly: line names were string literals
+//! [`FactKind`](crate::FactKind) exactly: line names were string literals
 //! (`"neckline"`), collision-prone across the rule that writes a fact and the
 //! rule that reads it. Here they become zero-size marker types, so a fact key is
 //! type-checked on **both** axes — a rule can no longer target the wrong line by
@@ -63,7 +63,7 @@ mod tests {
 
     /// The stable serialized line NAMEs — persisted state (a fact keys on
     /// `(NAME, kind)`), so a change here is a migration. Pin them, exactly as
-    /// [`kind_names_are_stable`](crate::facts) pins the kind names.
+    /// `kind_names_are_stable` pins the kind names.
     #[test]
     fn line_names_are_stable() {
         assert_eq!(Neckline::NAME, "neckline");

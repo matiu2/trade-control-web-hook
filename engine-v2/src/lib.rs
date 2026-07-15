@@ -50,22 +50,24 @@ mod driver;
 mod effect;
 mod facts;
 mod late_entry;
-mod plan;
 mod rule;
 mod world;
 
 mod rules;
 
+// The v2 plan model + the `FactKind`/`LineName` marker traits live in the shared
+// `trade-control-types-v2` crate (a plan builder depends on them without pulling
+// in the engine). Re-exported here so an engine consumer keeps a single import
+// surface and needn't depend on the types crate directly.
+pub use trade_control_types_v2::{
+    BreakClose, EntryMechanism, EntryOutcome, FactKind, LastClose, Line, LineName, Neckline,
+    PlanRule, PrepMap, Retest as RetestFact, RuleKind, TooHigh, TooLow, TradePlan,
+};
+
 pub use driver::tick_once;
 pub use effect::Effect;
-pub use facts::{
-    BreakClose, EntryOutcome, FactKind, FactValue, Facts, LastClose, Retest as RetestFact,
-};
+pub use facts::{FactValue, Facts};
 pub use late_entry::{LateEntry, LateEntryOrder, resolve as resolve_late_entry};
-pub use plan::{
-    EntryMechanism, Line, LineName, Neckline, PlanRule, PrepMap, RuleKind, TooHigh, TooLow,
-    TradePlan,
-};
 pub use rule::Rule;
 pub use rules::{BreakAndClose, Enter, Retest, is_break_and_close, is_enter, is_retest};
 pub use world::World;

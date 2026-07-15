@@ -48,7 +48,7 @@
 use trade_control_core::broker::Candle;
 use trade_control_core::intent::Direction;
 
-use crate::plan::EntryMechanism;
+use crate::EntryMechanism;
 
 /// The minimal order shape the parity simulator needs: how it would rest, which
 /// way it trades, and its resolved trigger price. Deliberately decoupled from the

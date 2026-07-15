@@ -6,7 +6,7 @@
 //! precondition model (see the `engine_v2_enter_preps_layered` memory and
 //! `SCOPING-rule-based-engine.md`) — and does nothing until **every** line's
 //! chain is satisfied. Then it emits one [`Effect::PlaceOrder`] carrying the
-//! fired intent and the entry [`EntryMechanism`](crate::plan::EntryMechanism).
+//! fired intent and the entry [`EntryMechanism`](crate::EntryMechanism).
 //!
 //! Like the preps it only *reads* the [`Facts`](crate::facts::Facts) blackboard
 //! and mutates nothing; the `PlaceOrder` leaves as an effect for the driver to
@@ -65,9 +65,9 @@
 
 use trade_control_core::plan_eval::FiredIntent;
 
+use crate::PlanRule;
 use crate::effect::Effect;
 use crate::facts::{EntryOutcome, FactKind};
-use crate::plan::PlanRule;
 use crate::rule::Rule;
 use crate::world::World;
 

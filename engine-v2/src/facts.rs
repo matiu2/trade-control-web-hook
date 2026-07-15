@@ -40,10 +40,10 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-mod fact_kind;
-pub use fact_kind::{BreakClose, EntryOutcome, FactKind, LastClose, Retest};
-
-use crate::plan::LineName;
+// Fact-kind + line-name markers are the shared v2 model — they live in
+// `trade-control-types-v2` (a plan builder names preps with them without pulling
+// in the engine). The `Facts` blackboard here keys on their `NAME`s.
+pub use trade_control_types_v2::{BreakClose, EntryOutcome, FactKind, LastClose, LineName, Retest};
 
 /// A single fact's value. Kept deliberately small — a fact is either a
 /// timestamp (when something happened) or a flag/number.
@@ -248,7 +248,7 @@ impl Facts {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::plan::LineName;
+    use crate::LineName;
     use chrono::TimeZone;
 
     fn t(h: u32) -> DateTime<Utc> {
@@ -262,7 +262,7 @@ mod tests {
     /// (the wire/serialized form).
     #[test]
     fn typed_and_named_apis_agree() {
-        use crate::plan::Neckline;
+        use crate::Neckline;
 
         let mut f = Facts::new();
         f.set::<BreakClose, Neckline>(FactValue::At(t(3)));
@@ -289,7 +289,7 @@ mod tests {
     /// NOT visible as a shared `(line, kind)` fact.
     #[test]
     fn scratch_is_not_a_shared_fact() {
-        use crate::plan::Neckline;
+        use crate::Neckline;
 
         let mut f = Facts::new();
         f.set_scratch::<LastClose>("03-prep", FactValue::Num(1.2345));

@@ -5,8 +5,8 @@
 //! machine.** Rules are pure ([`Rule::tick`] takes `&World`); the driver is the
 //! single site that mutates [`Facts`]. For the current bar it builds a fresh
 //! read-only [`World`] over the shared blackboard, ticks **every** rule in plan
-//! order — dispatching each [`PlanRule`](crate::plan::PlanRule) to the matching
-//! [`Rule`] impl by its [`RuleKind`](crate::plan::RuleKind) — and applies every
+//! order — dispatching each [`PlanRule`](crate::PlanRule) to the matching
+//! [`Rule`] impl by its [`RuleKind`](crate::RuleKind) — and applies every
 //! [`Effect`] returned: [`WriteFact`](Effect::WriteFact) /
 //! [`WriteScratch`](Effect::WriteScratch) are written into `facts`;
 //! [`Fire`](Effect::Fire) is collected for the caller.
@@ -40,7 +40,7 @@
 //!   that break-and-close wrote **earlier this same bar**.
 //!
 //! Rules instantiated: break-and-close, retest, and enter, dispatched by
-//! [`RuleKind`](crate::plan::RuleKind). The enter emits the first **acquisitive**
+//! [`RuleKind`](crate::RuleKind). The enter emits the first **acquisitive**
 //! effect ([`Effect::PlaceOrder`]); the driver gates it on `latest_bar` (see
 //! [`apply`]) but does **not** yet *execute* it — running the async `Broker` call
 //! is a separate driver step added with the executor. So `tick_once` stays pure
@@ -52,10 +52,10 @@ use trade_control_core::broker::Candle;
 
 use crate::effect::Effect;
 use crate::facts::Facts;
-use crate::plan::{Neckline, PlanRule, RuleKind, TradePlan};
 use crate::rule::Rule;
 use crate::rules::{BreakAndClose, Enter, Retest};
 use crate::world::World;
+use crate::{Neckline, PlanRule, RuleKind, TradePlan};
 
 /// Tick `plan`'s (pure) break-and-close rules for **one** bar — the current bar
 /// is `window.last()` — applying their write effects to the shared `facts`
@@ -134,13 +134,13 @@ pub fn tick_once(
 }
 
 /// Tick one [`PlanRule`] via the [`Rule`] impl matching its
-/// [`RuleKind`](crate::plan::RuleKind). The impls borrow the rule, so this
+/// [`RuleKind`](crate::RuleKind). The impls borrow the rule, so this
 /// constructs the impl inline and ticks it (no per-rule boxing needed).
 ///
 /// The producer rules ([`BreakAndClose`], [`Retest`]) are generic over the line
-/// [`LineName`](crate::plan::LineName) they target; the driver binds that line
+/// [`LineName`](crate::LineName) they target; the driver binds that line
 /// from the `kind`. In the current setup vocabulary both target
-/// [`Neckline`](crate::plan::Neckline) — when an invalidation rule targeting
+/// [`Neckline`](crate::Neckline) — when an invalidation rule targeting
 /// `TooHigh`/`TooLow` lands, it gets its own `RuleKind` arm binding that line.
 fn tick_rule(rule: &PlanRule, world: &World) -> Vec<Effect> {
     match rule.kind {

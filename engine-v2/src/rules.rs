@@ -14,7 +14,7 @@ pub use break_and_close::BreakAndClose;
 pub use enter::Enter;
 pub use retest::Retest;
 
-use crate::plan::{PlanRule, RuleKind};
+use crate::{PlanRule, RuleKind};
 
 /// Is this rule the break-and-close prep?
 pub fn is_break_and_close(rule: &PlanRule) -> bool {

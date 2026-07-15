@@ -25,8 +25,7 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-mod line_name;
-pub use line_name::{LineName, Neckline, TooHigh, TooLow};
+use crate::LineName;
 
 use trade_control_core::broker::Granularity;
 use trade_control_core::intent::{Direction, Intent};
