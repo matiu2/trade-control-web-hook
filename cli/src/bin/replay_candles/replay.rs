@@ -327,8 +327,15 @@ pub async fn run(
             &fired_rules,
             &decline_reasons,
         );
-        let spread_hour =
-            trade_control_core::spread_blackout::is_spread_hour(&plan.instrument, candles[i].time);
+        // Gated on bar size like the engine's entry suppression: only 15m/1h are
+        // dominated by a 1h spread hour, so on H4+ the "signal confirmed, not
+        // entering (spread-hour suppressed)" trace line must NOT appear — the H4
+        // entry actually fires. Keeps the trace honest (replay == live).
+        let spread_hour = trade_control_core::spread_blackout::suppress_on_spread_hour(
+            &plan.instrument,
+            candles[i].time,
+            plan.granularity,
+        );
         // On a spread-hour bar, resolve the block bounds and whether a confirmed
         // signal is ready — so the trace can say "signal confirmed, not entering,
         // spread-hour X→Y". The confirmation typically lands a couple of bars
