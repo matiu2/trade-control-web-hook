@@ -1855,7 +1855,7 @@ dependencies = [
 
 [[package]]
 name = "instrument-lookup"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "clap",
  "clap_complete",
@@ -3398,6 +3398,7 @@ dependencies = [
  "broker-tradenation",
  "broker-tradenation-adapter",
  "chrono",
+ "chrono-tz",
  "clap",
  "color-eyre",
  "instrument-lookup",
@@ -4176,6 +4177,7 @@ version = "0.1.0"
 dependencies = [
  "base64",
  "chrono",
+ "chrono-tz",
  "hex",
  "hmac",
  "pollster",

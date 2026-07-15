@@ -11,7 +11,7 @@
 use chrono::Timelike;
 use color_eyre::eyre::{Result, eyre};
 
-use crate::compute::Bar;
+use crate::compute::{Bar, MinuteBar};
 
 /// How many H1 candles to pull per instrument. ~2000 ≈ 83 weekday-days
 /// (~4 wall-months) — enough for stable per-UTC-hour p90 buckets, validated
@@ -68,6 +68,112 @@ pub fn bars_from_bidask(candles: &[trade_control_core::broker::BidAskCandle]) ->
         .collect()
 }
 
+// ---- minute-level path (bleed-resistant mask) ----
+
+/// Reduce one minute's mid/bid/ask closes to a [`MinuteBar`], stamping both its
+/// UTC minute-of-day and its **schedule-LOCAL** hour (via `tz`). `None` for a
+/// degenerate bar (bad mid / inverted spread).
+///
+/// The local hour is `utc_ts.with_timezone(&tz).hour()` — `with_timezone` is
+/// total (no `LocalResult` ambiguity on the read side), so a spring-forward gap
+/// or fall-back overlap in the source zone can't produce a missing/ambiguous
+/// value here. The local hour is what the profile buckets on, making the mask
+/// DST-invariant.
+fn minute_bar_from_closes(
+    utc_ts: chrono::DateTime<chrono::Utc>,
+    tz: chrono_tz::Tz,
+    mid_close: f64,
+    bid_close: f64,
+    ask_close: f64,
+) -> Option<MinuteBar> {
+    if !(mid_close.is_finite() && mid_close > 0.0) {
+        return None;
+    }
+    let spread = ask_close - bid_close;
+    if !spread.is_finite() || spread < 0.0 {
+        return None;
+    }
+    let utc_minute_of_day = (utc_ts.hour() * 60 + utc_ts.minute()) as u16;
+    let local_hour = utc_ts.with_timezone(&tz).hour() as u8;
+    Some(MinuteBar {
+        utc_minute_of_day,
+        local_hour,
+        spread_frac: spread / mid_close,
+        mid_close,
+    })
+}
+
+/// Fetch OANDA M1 bid/ask candles for the last `days`, paging **forward** from
+/// `since` in 5000-bar chunks (OANDA's per-request ceiling), normalized to
+/// [`MinuteBar`]s in timestamp order.
+pub async fn fetch_oanda_minutes(
+    client: &oanda_client::OandaClient,
+    instrument: &str,
+    days: i64,
+    tz: chrono_tz::Tz,
+) -> Result<Vec<MinuteBar>> {
+    use chrono::{Duration, Utc};
+    use oanda_client::candles::Granularity;
+
+    let now = Utc::now();
+    let since = now - Duration::days(days);
+    let mut cursor = since.fixed_offset();
+    let per = 5000usize;
+    let mut out: Vec<MinuteBar> = Vec::new();
+    let mut last_seen: Option<chrono::DateTime<Utc>> = None;
+    loop {
+        let resp = client
+            .get_candles_from(instrument, cursor, per, Granularity::OneMinute)
+            .await
+            .map_err(|e| eyre!("oanda get_candles_from({instrument}): {e}"))?;
+        if resp.candles.is_empty() {
+            break;
+        }
+        let mut latest = cursor.with_timezone(&Utc);
+        for c in &resp.candles {
+            let (Some(bid), Some(ask), Some(mid)) = (&c.raw.bid, &c.raw.ask, &c.raw.mid) else {
+                continue;
+            };
+            let t = c.raw.time.with_timezone(&Utc);
+            latest = latest.max(t);
+            if t >= now {
+                continue;
+            }
+            // Skip anything at/older than the last bar we already recorded
+            // (chunks overlap by design).
+            if last_seen.is_some_and(|ls| t <= ls) {
+                continue;
+            }
+            if let Some(mb) = minute_bar_from_closes(t, tz, mid.c(), bid.c(), ask.c()) {
+                out.push(mb);
+                last_seen = Some(t);
+            }
+        }
+        if latest >= now || resp.candles.len() < per {
+            break;
+        }
+        let next = latest + Duration::minutes(1);
+        if next.fixed_offset() <= cursor {
+            break; // no forward progress
+        }
+        cursor = next.fixed_offset();
+    }
+    Ok(out)
+}
+
+/// Normalize core `BidAskCandle`s (TradeNation M1, from the paged adapter) to
+/// [`MinuteBar`]s, stamping each with its schedule-LOCAL hour via `tz`.
+/// Unit-testable without a TN session.
+pub fn minutes_from_bidask(
+    candles: &[trade_control_core::broker::BidAskCandle],
+    tz: chrono_tz::Tz,
+) -> Vec<MinuteBar> {
+    candles
+        .iter()
+        .filter_map(|c| minute_bar_from_closes(c.time, tz, c.c, c.bid_c, c.ask_c))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -89,5 +195,43 @@ mod tests {
     #[test]
     fn bar_from_closes_rejects_inverted_spread() {
         assert!(bar_from_closes(0, 1.0, 1.0002, 0.9998).is_none());
+    }
+
+    // ---- minute-level local-hour stamping (DST invariance) ----
+
+    use chrono::{TimeZone, Utc};
+
+    /// The same UTC hour (22:00) maps to DIFFERENT New-York local hours across a
+    /// DST boundary: 17:00 EST (winter, UTC−5) in January, 18:00 EDT (summer,
+    /// UTC−4) in July. This is the whole point of Stage 2 — bucketing on
+    /// local_hour keeps the NY-close spike in one local hour year-round instead
+    /// of smearing it across two UTC hours. Fixed timestamps, no `Utc::now()`.
+    #[test]
+    fn minute_bar_local_hour_tracks_ny_dst() {
+        let ny = chrono_tz::America::New_York;
+
+        // 2026-01-15 22:00 UTC → 17:00 EST (winter, UTC−5).
+        let jan = Utc
+            .with_ymd_and_hms(2026, 1, 15, 22, 0, 0)
+            .single()
+            .unwrap();
+        let jan_bar = minute_bar_from_closes(jan, ny, 1.0000, 0.9998, 1.0002).expect("valid bar");
+        assert_eq!(jan_bar.local_hour, 17, "Jan 22:00 UTC = 17:00 EST");
+
+        // 2026-07-15 22:00 UTC → 18:00 EDT (summer, UTC−4).
+        let jul = Utc
+            .with_ymd_and_hms(2026, 7, 15, 22, 0, 0)
+            .single()
+            .unwrap();
+        let jul_bar = minute_bar_from_closes(jul, ny, 1.0000, 0.9998, 1.0002).expect("valid bar");
+        assert_eq!(jul_bar.local_hour, 18, "Jul 22:00 UTC = 18:00 EDT");
+
+        assert_ne!(
+            jan_bar.local_hour, jul_bar.local_hour,
+            "same UTC hour must land on different local hours across DST"
+        );
+        // utc_minute_of_day is unchanged across the boundary (both 22:00 UTC).
+        assert_eq!(jan_bar.utc_minute_of_day, 22 * 60);
+        assert_eq!(jul_bar.utc_minute_of_day, 22 * 60);
     }
 }

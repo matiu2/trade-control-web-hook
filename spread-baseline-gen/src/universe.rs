@@ -20,6 +20,13 @@ pub struct WorkItem {
     pub symbol: String,
     pub class: AssetClass,
     pub display_name: String,
+    /// The asset's `spread_schedule` FK name (e.g. `"ny"`, `"asx"`, `"none"`).
+    /// Generate.rs resolves this to an IANA tz for local-hour bucketing and
+    /// emits it as a table column so Stage 3 can bake it.
+    pub spread_schedule: String,
+    /// The IANA tz id for this asset's schedule, or `None` for `none`/unknown.
+    /// `None` ⇒ the asset has no spread hour and is skipped for profiling.
+    pub spread_schedule_tz: Option<String>,
 }
 
 /// Ordering rank for a class — lower runs first. FX/metals/24h-indices are what
@@ -65,6 +72,8 @@ pub fn work_items(assets: &[Asset], brokers: &[Broker], include_stocks: bool) ->
                 symbol: sym.to_string(),
                 class: asset.class,
                 display_name: asset.display_name.clone(),
+                spread_schedule: asset.spread_schedule.clone(),
+                spread_schedule_tz: asset.spread_schedule_tz(),
             });
         }
     }

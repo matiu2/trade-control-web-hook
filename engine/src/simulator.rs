@@ -1518,6 +1518,106 @@ mod tests {
         }
     }
 
+    /// Stage 4 — the engine-level payoff of the DST-aware spread-hour mask:
+    /// the SAME schedule-LOCAL spread hour (5pm New York) suppresses a
+    /// pending-order fill in BOTH summer and winter, at the correspondingly
+    /// different UTC hours — and a bar one UTC hour off in each season is NOT
+    /// suppressed. This proves the engine keys on the local-hour mask, not a
+    /// fixed UTC hour.
+    ///
+    /// `AUD_CHF` (oanda, schedule `ny`, mask `1<<17`) is a real row in the baked
+    /// candle table with the 17:00-local bit set.
+    ///
+    /// **Why replay == live.** The fill loop in `find_fill` skips a spread-hour
+    /// bar via `trade_control_core::spread_blackout::suppress_on_spread_hour_bar_seconds`
+    /// (see the call at the top of this file). The live worker's entry
+    /// suppression consumes that *same* core seam. So an engine-level assertion
+    /// on that seam — for the four (summer-hit, winter-hit, summer-miss,
+    /// winter-miss) instants — is a faithful proof that the replay engine and the
+    /// live worker inherit identical DST-correct behaviour. We assert on the seam
+    /// directly (the exact call the simulator makes) AND drive the full
+    /// `simulate_fill` path for the summer/winter hits to prove the fill actually
+    /// skips the spike bar.
+    #[test]
+    fn spread_hour_suppression_is_dst_invariant() {
+        use trade_control_core::spread_blackout::suppress_on_spread_hour_bar_seconds;
+
+        // The engine derives `bar_seconds` from consecutive candle spacing; H1 is
+        // 3600s, ≤ the max short-bar threshold, so the suppression reduces to the
+        // pure DST-aware `is_spread_hour` mask lookup.
+        const H1: i64 = 3600;
+
+        // Summer (EDT, UTC-4): 2026-07-09 17:00 New York == 21:00 UTC.
+        let summer_hit = ts("2026-07-09T21:00:00Z");
+        // Winter (EST, UTC-5): 2026-01-15 17:00 New York == 22:00 UTC.
+        let winter_hit = ts("2026-01-15T22:00:00Z");
+        // Negatives: one UTC hour off in each season is a DIFFERENT local hour.
+        // 22:00 UTC in summer = 18:00 EDT (clean); 21:00 UTC in winter = 16:00
+        // EST (clean). A fixed-UTC bug would flag the wrong one of these.
+        let summer_miss = ts("2026-07-09T22:00:00Z");
+        let winter_miss = ts("2026-01-15T21:00:00Z");
+
+        // Seam parity: the exact call the fill loop makes, for all four instants.
+        assert!(
+            suppress_on_spread_hour_bar_seconds("AUD_CHF", summer_hit, H1),
+            "17:00 EDT (21:00 UTC) must suppress the fill"
+        );
+        assert!(
+            suppress_on_spread_hour_bar_seconds("AUD_CHF", winter_hit, H1),
+            "17:00 EST (22:00 UTC) must suppress the fill — SAME local hour"
+        );
+        assert!(
+            !suppress_on_spread_hour_bar_seconds("AUD_CHF", summer_miss, H1),
+            "18:00 EDT (22:00 UTC) is NOT the 17:00 spike — must not suppress"
+        );
+        assert!(
+            !suppress_on_spread_hour_bar_seconds("AUD_CHF", winter_miss, H1),
+            "16:00 EST (21:00 UTC) is NOT the 17:00 spike — must not suppress"
+        );
+
+        // Full fill-path proof: a resting sell-stop reaches its 1.1000 trigger on
+        // the spread-hour spike bar but does NOT fill there — it fills on the next
+        // clean bar, then takes profit. Mirrors `pending_stop_does_not_fill_on_a_
+        // spread_hour_bar` but on the *table-driven* `AUD_CHF` mask, at the two
+        // DST-shifted UTC hours.
+        let mut intent = short_stop_intent();
+        intent.instrument = "AUD_CHF".into();
+        let shell = trigger_shell();
+
+        // Summer: spike at 21:00Z (17:00 EDT), clean fill at 23:00Z.
+        let summer_path = [
+            candle("2026-07-09T20:00:00Z", 1.1042, 1.1045, 1.1041, 1.1043), // fire (skipped)
+            candle("2026-07-09T21:00:00Z", 1.0998, 1.1002, 1.0990, 1.0995), // spike → skipped
+            candle("2026-07-09T23:00:00Z", 1.0999, 1.1001, 1.0992, 1.0996), // clean → fills
+            candle("2026-07-10T00:00:00Z", 1.0994, 1.0996, 1.0945, 1.0948), // TP 1.0950
+        ];
+        match simulate_fill(&intent, &shell, 0.0001, &summer_path) {
+            SimOutcome::TookProfit { fill_at, .. } => assert_eq!(
+                fill_at,
+                ts("2026-07-09T23:00:00Z"),
+                "summer fill must skip the 21:00Z (17:00 EDT) spike bar"
+            ),
+            other => panic!("summer: expected clean-bar fill then TP, got {other:?}"),
+        }
+
+        // Winter: spike shifts to 22:00Z (17:00 EST), clean fill at 23:00Z. Same
+        // LOCAL spread hour, one UTC hour later — the DST-invariance payoff.
+        let winter_path = [
+            candle("2026-01-15T21:00:00Z", 1.1042, 1.1045, 1.1041, 1.1043), // fire (skipped)
+            candle("2026-01-15T22:00:00Z", 1.0998, 1.1002, 1.0990, 1.0995), // spike → skipped
+            candle("2026-01-15T23:00:00Z", 1.0999, 1.1001, 1.0992, 1.0996), // clean → fills
+            candle("2026-01-16T00:00:00Z", 1.0994, 1.0996, 1.0945, 1.0948), // TP 1.0950
+        ];
+        match simulate_fill(&intent, &shell, 0.0001, &winter_path) {
+            SimOutcome::TookProfit { fill_at, .. } => assert_eq!(
+                fill_at,
+                ts("2026-01-15T23:00:00Z"),
+                "winter fill must skip the 22:00Z (17:00 EST) spike bar"
+            ),
+            other => panic!("winter: expected clean-bar fill then TP, got {other:?}"),
+        }
+    }
+
     /// A long whose stop-loss is **gapped through** (bar opens already below the
     /// SL, low and high both under it) must still stop out — the same gap bug on
     /// the exit leg. `stop_approach(Long)` = `FromAbove` (`lo <= sl`) catches it.
