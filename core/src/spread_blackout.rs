@@ -1050,23 +1050,29 @@ mod tests {
     }
 
     /// A fixed-UTC (no US-DST) schedule (`tokyo`, JST = UTC+9 all year) is a
-    /// spread hour at the SAME UTC hour year-round — no seasonal shift.
+    /// spread hour at the SAME UTC hour year-round — no seasonal shift. Tested on
+    /// the pure `mask_active_with_lead` helper with a synthetic 15:00-JST mask so
+    /// the assertion is independent of whatever the baked table currently holds
+    /// for a Japanese instrument (real indices are flat, mask 0).
     #[test]
     fn tokyo_schedule_is_fixed_utc_year_round() {
-        // Fixture: oanda/JP225_USD is tokyo with mask 1<<15 (15:00 JST).
-        // 15:00 JST == 06:00 UTC in both July and January.
+        // Synthetic mask: bit 15 set (15:00 JST). 15:00 JST == 06:00 UTC all year.
+        let mask = 1u32 << 15;
+        let tz = chrono_tz::Asia::Tokyo;
         assert!(
-            is_spread_hour("JP225_USD", ts("2026-07-09T06:00:00Z")),
+            mask_active_with_lead(mask, tz, ts("2026-07-09T06:00:00Z")),
             "15:00 JST (06:00 UTC) is a spread hour in summer"
         );
         assert!(
-            is_spread_hour("JP225_USD", ts("2026-01-15T06:00:00Z")),
+            mask_active_with_lead(mask, tz, ts("2026-01-15T06:00:00Z")),
             "15:00 JST (06:00 UTC) is a spread hour in winter — no DST shift"
         );
         // A UTC hour that would be 15:00-local only if Japan observed DST is NOT
-        // a spread hour — Japan has none, so 05:00 UTC stays clean.
+        // a spread hour — Japan has none, so 05:00 UTC stays clean. (05:00 UTC =
+        // 14:00 JST; the 30-min lead reaches into 06:00 UTC's 15:00-JST hour only
+        // from :30+, and this ts is at :00, so it must be clean.)
         assert!(
-            !is_spread_hour("JP225_USD", ts("2026-07-09T05:00:00Z")),
+            !mask_active_with_lead(mask, tz, ts("2026-07-09T05:00:00Z")),
             "05:00 UTC (14:00 JST) is not the spike; Japan has no DST"
         );
     }
@@ -1358,16 +1364,16 @@ mod tests {
 
     // --- block TTL / window against the candle fixture, DST-aware ---
 
-    /// GBP_AUD fixture is ny with a two-hour LOCAL block (17:00 + 18:00). A
-    /// record opened at the block top (17:00 EDT = 21:00 UTC in summer) yields a
-    /// 2h block + grace TTL; the SAME local block gives the same TTL in winter
-    /// (17:00 EST = 22:00 UTC) — DST-invariant.
+    /// EUR_HUF (baked ny mask bits 17+18) is a real two-hour LOCAL block
+    /// (17:00 + 18:00 New York). A record opened at the block top (17:00 EDT =
+    /// 21:00 UTC in summer) yields a 2h block + grace TTL; the SAME local block
+    /// gives the same TTL in winter (17:00 EST = 22:00 UTC) — DST-invariant.
     #[test]
     fn block_ttl_from_candle_fixture_is_dst_invariant() {
         let summer_top = ts("2026-07-09T21:00:00Z"); // 17:00 EDT
         let winter_top = ts("2026-01-15T22:00:00Z"); // 17:00 EST
-        let ttl_s = spread_block_ttl_seconds("GBP_AUD", summer_top);
-        let ttl_w = spread_block_ttl_seconds("GBP_AUD", winter_top);
+        let ttl_s = spread_block_ttl_seconds("EUR_HUF", summer_top);
+        let ttl_w = spread_block_ttl_seconds("EUR_HUF", winter_top);
         // 2 local hours + 1h grace = 3h.
         assert_eq!(ttl_s, 2 * 3600 + SPREAD_BLOCK_TTL_GRACE_SECONDS);
         assert_eq!(
@@ -1376,12 +1382,12 @@ mod tests {
         );
     }
 
-    /// The `(start, end)` window for the GBP_AUD 2-hour local block, reported in
-    /// UTC. Summer: 17:00–19:00 EDT == 21:00–23:00 UTC.
+    /// The `(start, end)` window for the EUR_HUF 2-hour local block (bits 17+18),
+    /// reported in UTC. Summer: 17:00–19:00 EDT == 21:00–23:00 UTC.
     #[test]
     fn block_window_from_candle_fixture_summer() {
         let (start, end) =
-            spread_block_window("GBP_AUD", ts("2026-07-09T21:30:00Z")).expect("in block");
+            spread_block_window("EUR_HUF", ts("2026-07-09T21:30:00Z")).expect("in block");
         assert_eq!(
             start,
             ts("2026-07-09T21:00:00Z"),
@@ -1393,7 +1399,7 @@ mod tests {
             "block end 19:00 EDT = 23:00 UTC"
         );
         // A clean midday bar returns None.
-        assert!(spread_block_window("GBP_AUD", ts("2026-07-09T12:00:00Z")).is_none());
+        assert!(spread_block_window("EUR_HUF", ts("2026-07-09T12:00:00Z")).is_none());
     }
 
     /// Absent instrument block window falls through the probe path (NY-close
