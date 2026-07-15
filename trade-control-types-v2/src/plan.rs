@@ -25,7 +25,7 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::{LineName, PriceLevel};
+use crate::{LineName, PriceLevel, TimeMarker};
 
 use trade_control_core::broker::Granularity;
 use trade_control_core::intent::{Direction, Intent};
@@ -197,6 +197,12 @@ pub struct TradePlan {
     /// the field — deserializes with an empty vec.
     #[serde(default)]
     pub levels: Vec<PriceLevel>,
+    /// The named wall-clock markers rules reference — a time cutoff (`expiry`),
+    /// crossed by "has the bar reached this time?" (no price). Added in 4d (see
+    /// [`TimeMarker`]). `#[serde(default)]` so a plan with no expiry — and any
+    /// pre-4d plan predating the field — deserializes with an empty vec.
+    #[serde(default)]
+    pub markers: Vec<TimeMarker>,
     /// The rules, in fire order.
     pub rules: Vec<PlanRule>,
     /// Plan-level cross-depth buffer as a percentage of the line price — a
@@ -237,5 +243,19 @@ impl TradePlan {
     /// [`line_typed`](Self::line_typed).
     pub fn level_typed<L: LineName>(&self) -> Option<&PriceLevel> {
         self.level(L::NAME)
+    }
+
+    /// Look up a time marker by **runtime name**. The marker sibling of
+    /// [`line`](Self::line) / [`level`](Self::level).
+    pub fn marker(&self, name: &str) -> Option<&TimeMarker> {
+        self.markers.iter().find(|m| m.name == name)
+    }
+
+    /// Look up a time marker by its compile-time [`LineName`] — the expiry rule's
+    /// path (it knows its marker as a type, e.g. `Expiry`). Delegates to
+    /// [`marker`](Self::marker) at [`L::NAME`](LineName::NAME). The marker sibling
+    /// of [`line_typed`](Self::line_typed) / [`level_typed`](Self::level_typed).
+    pub fn marker_typed<L: LineName>(&self) -> Option<&TimeMarker> {
+        self.marker(L::NAME)
     }
 }

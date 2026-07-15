@@ -50,11 +50,20 @@ impl LineName for TooHigh {
 }
 
 /// The lower **invalidation / pcl-exhausted cap** (a short's "pcl exhausted" ~80%
-/// to TP, or an iH&S long's floor). Horizontal price level, degenerate `Line`
-/// today; `PriceLevel` in 4c.
+/// to TP, or an iH&S long's floor). A horizontal [`PriceLevel`](crate::PriceLevel)
+/// (split out of `Line` in 4c).
 pub struct TooLow;
 impl LineName for TooLow {
     const NAME: &'static str = "too_low";
+}
+
+/// The **trade-expiry** marker — a wall-clock time after which the plan is dead.
+/// A [`TimeMarker`](crate::TimeMarker), not a line or a level: its "cross" is
+/// "has the bar reached this time?" (no price). When the expiry rule fires it
+/// retires the plan, exactly as an invalidation cap does. Added in 4d.
+pub struct Expiry;
+impl LineName for Expiry {
+    const NAME: &'static str = "expiry";
 }
 
 #[cfg(test)]
@@ -69,5 +78,6 @@ mod tests {
         assert_eq!(Neckline::NAME, "neckline");
         assert_eq!(TooHigh::NAME, "too_high");
         assert_eq!(TooLow::NAME, "too_low");
+        assert_eq!(Expiry::NAME, "expiry");
     }
 }
