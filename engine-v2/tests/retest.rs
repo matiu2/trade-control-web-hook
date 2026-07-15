@@ -238,7 +238,7 @@ fn retest_gated_on_producer_fact() {
     let _ = drive_series(&p, &mut facts, &candles, ts("2026-06-01T13:00:05Z"));
 
     assert!(
-        !facts.is_set("neckline", "retest"),
+        !facts.is_set_named("neckline", "retest"),
         "no break_close fact ⇒ the retest never stamps, even on a genuine cross"
     );
 }
@@ -264,7 +264,7 @@ fn first_bar_after_break_needs_to_reach_line() {
     // Case A: N=1 wick falls SHORT of the line (low 1.2005 > 1.2000) → no stamp.
     {
         let mut facts = Facts::new();
-        facts.set(
+        facts.set_named(
             "neckline",
             "break_close",
             FactValue::At(ts("2026-06-01T12:00:00Z")),
@@ -279,7 +279,7 @@ fn first_bar_after_break_needs_to_reach_line() {
         )];
         let _ = drive_series(&p, &mut facts, &candles, ts("2026-06-01T13:00:05Z"));
         assert!(
-            !facts.is_set("neckline", "retest"),
+            !facts.is_set_named("neckline", "retest"),
             "N=1 tol 0: a wick short of the line must NOT stamp"
         );
     }
@@ -287,7 +287,7 @@ fn first_bar_after_break_needs_to_reach_line() {
     // Case B: N=1 wick REACHES the line (low 1.1998 <= 1.2000) → stamp.
     {
         let mut facts = Facts::new();
-        facts.set(
+        facts.set_named(
             "neckline",
             "break_close",
             FactValue::At(ts("2026-06-01T12:00:00Z")),
@@ -301,7 +301,7 @@ fn first_bar_after_break_needs_to_reach_line() {
         )];
         let _ = drive_series(&p, &mut facts, &candles, ts("2026-06-01T13:00:05Z"));
         assert_eq!(
-            facts.at("neckline", "retest"),
+            facts.at_named("neckline", "retest"),
             Some(ts("2026-06-01T13:00:00Z")),
             "N=1 tol 0: a wick reaching the line stamps at that bar's time"
         );
@@ -366,13 +366,13 @@ fn tolerance_grows_with_bars_since_break() {
 
     {
         let mut facts = Facts::new();
-        facts.set("neckline", "break_close", FactValue::At(break_at));
+        facts.set_named("neckline", "break_close", FactValue::At(break_at));
         let mut series = warm.clone();
         series.push(n1);
         series.push(n2_within);
         let _ = drive_series(&p, &mut facts, &series, ts("2026-06-05T00:00:00Z"));
         assert_eq!(
-            facts.at("neckline", "retest"),
+            facts.at_named("neckline", "retest"),
             Some(n2_within.time),
             "N=2 within-tolerance wick stamps at the N=2 bar (N=1 fell short)"
         );
@@ -383,7 +383,7 @@ fn tolerance_grows_with_bars_since_break() {
     // later bar stamps".
     {
         let mut facts = Facts::new();
-        facts.set("neckline", "break_close", FactValue::At(break_at));
+        facts.set_named("neckline", "break_close", FactValue::At(break_at));
         let n2_outside = candle_at(
             DateTime::from_timestamp(break_bar_epoch + 2 * 3600, 0).expect("ts"),
             1.2010,
@@ -396,7 +396,7 @@ fn tolerance_grows_with_bars_since_break() {
         series.push(n2_outside);
         let _ = drive_series(&p, &mut facts, &series, ts("2026-06-05T00:00:00Z"));
         assert!(
-            !facts.is_set("neckline", "retest"),
+            !facts.is_set_named("neckline", "retest"),
             "N=2 wick beyond tolerance must NOT stamp"
         );
     }
@@ -419,7 +419,7 @@ fn fire_once_prevents_restamp() {
     let p = plan("EUR_USD", vec![ln], vec![rr], 0.075);
 
     let mut facts = Facts::new();
-    facts.set(
+    facts.set_named(
         "neckline",
         "break_close",
         FactValue::At(ts("2026-06-01T12:00:00Z")),
@@ -434,7 +434,7 @@ fn fire_once_prevents_restamp() {
     let _ = drive_series(&p, &mut facts, &candles, ts("2026-06-01T15:00:05Z"));
 
     assert_eq!(
-        facts.at("neckline", "retest"),
+        facts.at_named("neckline", "retest"),
         Some(ts("2026-06-01T13:00:00Z")),
         "already done → stamp stays at the first cross, not re-stamped to 15:00"
     );
@@ -462,7 +462,7 @@ fn spread_hour_cross_does_not_stamp_but_scratch_advances() {
     let p = plan("EUR_USD", vec![ln], vec![rr], 0.075);
 
     let mut facts = Facts::new();
-    facts.set(
+    facts.set_named(
         "neckline",
         "break_close",
         FactValue::At(ts("2026-06-15T20:00:00Z")),
@@ -479,13 +479,13 @@ fn spread_hour_cross_does_not_stamp_but_scratch_advances() {
     let _ = drive_series(&p, &mut facts, &candles, ts("2026-06-15T21:00:05Z"));
 
     assert!(
-        !facts.is_set("neckline", "retest"),
+        !facts.is_set_named("neckline", "retest"),
         "a retest cross on a spread hour is a rubbish candle — must NOT stamp"
     );
     // ...but the last_close scratch DID advance to the spread-hour bar's close,
     // so the next clean bar's OnClose cross measures correctly.
     assert_eq!(
-        facts.num_scratch("04-prep-retest", "last_close"),
+        facts.num_scratch_named("04-prep-retest", "last_close"),
         Some(1.1990),
         "last_close scratch advances even on the suppressed spread-hour bar"
     );
@@ -543,10 +543,10 @@ fn break_and_close_then_retest_end_to_end() {
     );
 
     let break_at = facts
-        .at("neckline", "break_close")
+        .at_named("neckline", "break_close")
         .expect("break_close fact must land");
     let retest_at = facts
-        .at("neckline", "retest")
+        .at_named("neckline", "retest")
         .expect("retest fact must land");
 
     assert_eq!(

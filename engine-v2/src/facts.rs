@@ -40,6 +40,9 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+mod fact_kind;
+pub use fact_kind::{BreakClose, EntryOutcome, FactKind, LastClose, Retest};
+
 /// A single fact's value. Kept deliberately small — a fact is either a
 /// timestamp (when something happened) or a flag/number.
 ///
@@ -96,8 +99,20 @@ impl Facts {
         Self::default()
     }
 
-    /// Set (or overwrite) the fact at `(line, kind)`.
-    pub fn set(&mut self, line: &str, kind: &str, v: FactValue) {
+    /// Set (or overwrite) the fact at `(line, K)`. The kind is a compile-time
+    /// [`FactKind`] type; the store keys on its [`NAME`](FactKind::NAME).
+    pub fn set<K: FactKind>(&mut self, line: &str, v: FactValue) {
+        self.set_named(line, K::NAME, v);
+    }
+
+    /// Set (or overwrite) the fact at `(line, kind)` by **runtime kind name**.
+    ///
+    /// The typed [`set`](Self::set) is the rule-facing path (a rule knows its kind
+    /// at compile time). This by-name variant exists for the two places the kind
+    /// is genuinely runtime: the driver applying an [`Effect::WriteFact`] (whose
+    /// `kind` is the string a rule already resolved from `K::NAME`), and reads of
+    /// kinds named in an enter's `preps` map. Prefer [`set`](Self::set) elsewhere.
+    pub fn set_named(&mut self, line: &str, kind: &str, v: FactValue) {
         if let Some(e) = self
             .entries
             .iter_mut()
@@ -113,40 +128,76 @@ impl Facts {
         }
     }
 
-    /// Read the raw fact at `(line, kind)`.
-    pub fn get(&self, line: &str, kind: &str) -> Option<&FactValue> {
+    /// Read the raw fact at `(line, K)`.
+    pub fn get<K: FactKind>(&self, line: &str) -> Option<&FactValue> {
+        self.get_named(line, K::NAME)
+    }
+
+    /// Read the raw fact at `(line, kind)` by **runtime kind name** (see
+    /// [`set_named`](Self::set_named) for when the kind is runtime).
+    pub fn get_named(&self, line: &str, kind: &str) -> Option<&FactValue> {
         self.entries
             .iter()
             .find(|e| e.line == line && e.kind == kind)
             .map(|e| &e.value)
     }
 
-    /// Convenience: the `At(time)` at `(line, kind)`, if set to a timestamp.
-    pub fn at(&self, line: &str, kind: &str) -> Option<DateTime<Utc>> {
-        match self.get(line, kind) {
+    /// Convenience: the `At(time)` at `(line, kind)` by **runtime kind name**.
+    /// The runtime-kind sibling of [`at`](Self::at) — used to read a kind named in
+    /// an enter's `preps` map.
+    pub fn at_named(&self, line: &str, kind: &str) -> Option<DateTime<Utc>> {
+        match self.get_named(line, kind) {
             Some(FactValue::At(t)) => Some(*t),
             _ => None,
         }
     }
 
-    /// Convenience: the `Num(n)` at `(line, kind)`, if set to a number.
-    pub fn num(&self, line: &str, kind: &str) -> Option<f64> {
-        match self.get(line, kind) {
+    /// Convenience: the `At(time)` at `(line, K)`, if set to a timestamp.
+    pub fn at<K: FactKind>(&self, line: &str) -> Option<DateTime<Utc>> {
+        match self.get::<K>(line) {
+            Some(FactValue::At(t)) => Some(*t),
+            _ => None,
+        }
+    }
+
+    /// Convenience: the `Num(n)` at `(line, K)`, if set to a number.
+    pub fn num<K: FactKind>(&self, line: &str) -> Option<f64> {
+        match self.get::<K>(line) {
             Some(FactValue::Num(n)) => Some(*n),
             _ => None,
         }
     }
 
-    /// Convenience: is any fact set at `(line, kind)`?
-    pub fn is_set(&self, line: &str, kind: &str) -> bool {
-        self.get(line, kind).is_some()
+    /// Convenience: is any fact set at `(line, K)`?
+    pub fn is_set<K: FactKind>(&self, line: &str) -> bool {
+        self.get::<K>(line).is_some()
     }
 
-    // --- Rule-private scratch, keyed `(rule_id, kind)` -------------------------
+    /// Convenience: is any fact set at `(line, kind)` by **runtime kind name**?
+    pub fn is_set_named(&self, line: &str, kind: &str) -> bool {
+        self.get_named(line, kind).is_some()
+    }
 
-    /// Set (or overwrite) the rule-private scratch value at `(rule_id, kind)`.
+    /// Convenience: the `Num(n)` at `(line, kind)` by **runtime kind name**.
+    pub fn num_named(&self, line: &str, kind: &str) -> Option<f64> {
+        match self.get_named(line, kind) {
+            Some(FactValue::Num(n)) => Some(*n),
+            _ => None,
+        }
+    }
+
+    // --- Rule-private scratch, keyed `(rule_id, K)` ----------------------------
+
+    /// Set (or overwrite) the rule-private scratch value at `(rule_id, K)`.
     /// Never surfaces through the shared-fact accessors above.
-    pub fn set_scratch(&mut self, rule_id: &str, kind: &str, v: FactValue) {
+    pub fn set_scratch<K: FactKind>(&mut self, rule_id: &str, v: FactValue) {
+        self.set_scratch_named(rule_id, K::NAME, v);
+    }
+
+    /// Set scratch at `(rule_id, kind)` by **runtime kind name** — the driver's
+    /// path for applying an [`Effect::WriteScratch`] (see
+    /// [`set_named`](Self::set_named)).
+    pub fn set_scratch_named(&mut self, rule_id: &str, kind: &str, v: FactValue) {
         if let Some(e) = self
             .scratch
             .iter_mut()
@@ -162,19 +213,81 @@ impl Facts {
         }
     }
 
-    /// Read the raw rule-private scratch value at `(rule_id, kind)`.
-    pub fn get_scratch(&self, rule_id: &str, kind: &str) -> Option<&FactValue> {
+    /// Read the raw rule-private scratch value at `(rule_id, K)`.
+    pub fn get_scratch<K: FactKind>(&self, rule_id: &str) -> Option<&FactValue> {
+        self.get_scratch_named(rule_id, K::NAME)
+    }
+
+    /// Read scratch at `(rule_id, kind)` by **runtime kind name** (see
+    /// [`set_named`](Self::set_named)).
+    pub fn get_scratch_named(&self, rule_id: &str, kind: &str) -> Option<&FactValue> {
         self.scratch
             .iter()
             .find(|e| e.rule_id == rule_id && e.kind == kind)
             .map(|e| &e.value)
     }
 
-    /// Convenience: the `Num(n)` scratch at `(rule_id, kind)`, if a number.
-    pub fn num_scratch(&self, rule_id: &str, kind: &str) -> Option<f64> {
-        match self.get_scratch(rule_id, kind) {
+    /// Convenience: the `Num(n)` scratch at `(rule_id, K)`, if a number.
+    pub fn num_scratch<K: FactKind>(&self, rule_id: &str) -> Option<f64> {
+        self.num_scratch_named(rule_id, K::NAME)
+    }
+
+    /// Convenience: the `Num(n)` scratch at `(rule_id, kind)` by **runtime kind
+    /// name**.
+    pub fn num_scratch_named(&self, rule_id: &str, kind: &str) -> Option<f64> {
+        match self.get_scratch_named(rule_id, kind) {
             Some(FactValue::Num(n)) => Some(*n),
             _ => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::TimeZone;
+
+    fn t(h: u32) -> DateTime<Utc> {
+        Utc.with_ymd_and_hms(2026, 6, 2, h, 0, 0)
+            .single()
+            .expect("valid")
+    }
+
+    /// The typed API keys on `K::NAME` — a value written with `set::<K>` reads
+    /// back with `at::<K>`, and the by-name accessor sees the same `NAME` string
+    /// (the wire/serialized form).
+    #[test]
+    fn typed_and_named_apis_agree() {
+        let mut f = Facts::new();
+        f.set::<BreakClose>("neckline", FactValue::At(t(3)));
+
+        assert_eq!(f.at::<BreakClose>("neckline"), Some(t(3)));
+        // Same fact, read by the runtime-name accessor at the stable NAME.
+        assert_eq!(f.at_named("neckline", BreakClose::NAME), Some(t(3)));
+        assert_eq!(f.at_named("neckline", "break_close"), Some(t(3)));
+        // A different kind at the same line is absent.
+        assert!(!f.is_set::<Retest>("neckline"));
+    }
+
+    /// The stable serialized NAMEs — these are persisted state; a change here is a
+    /// migration, so pin them.
+    #[test]
+    fn kind_names_are_stable() {
+        assert_eq!(BreakClose::NAME, "break_close");
+        assert_eq!(Retest::NAME, "retest");
+        assert_eq!(EntryOutcome::NAME, "entry_outcome");
+        assert_eq!(LastClose::NAME, "last_close");
+    }
+
+    /// Scratch is a separate namespace: a `last_close` scratch under a rule id is
+    /// NOT visible as a shared `(line, kind)` fact.
+    #[test]
+    fn scratch_is_not_a_shared_fact() {
+        let mut f = Facts::new();
+        f.set_scratch::<LastClose>("03-prep", FactValue::Num(1.2345));
+
+        assert_eq!(f.num_scratch::<LastClose>("03-prep"), Some(1.2345));
+        // Not surfaced as a shared fact keyed by the rule id as a "line".
+        assert!(!f.is_set::<LastClose>("03-prep"));
     }
 }

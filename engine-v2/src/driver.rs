@@ -171,12 +171,15 @@ fn tick_rule(rule: &PlanRule, world: &World) -> Vec<Effect> {
 fn apply(facts: &mut Facts, fires: &mut Vec<Effect>, effects: Vec<Effect>, latest_bar: bool) {
     for effect in effects {
         match effect {
-            Effect::WriteFact { line, kind, value } => facts.set(&line, &kind, value),
+            // The effect carries the kind as a runtime string (a rule already
+            // resolved it from `K::NAME` when it built the effect), so the driver
+            // applies it via the by-name setters.
+            Effect::WriteFact { line, kind, value } => facts.set_named(&line, &kind, value),
             Effect::WriteScratch {
                 rule_id,
                 kind,
                 value,
-            } => facts.set_scratch(&rule_id, &kind, value),
+            } => facts.set_scratch_named(&rule_id, &kind, value),
             Effect::Fire(_) => fires.push(effect),
             // Acquisitive: keep only on the latest bar; drop on a stale backlog bar.
             Effect::PlaceOrder { .. } => {

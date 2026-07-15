@@ -179,7 +179,7 @@ fn enter_blocked_until_all_preps_satisfied() {
     );
     let mut facts = Facts::new();
     // Only the first milestone is present.
-    facts.set(
+    facts.set_named(
         "neckline",
         "break_close",
         FactValue::At(ts("2026-06-02T03:00:00Z")),
@@ -194,7 +194,7 @@ fn enter_blocked_until_all_preps_satisfied() {
     );
     // And no terminal entry outcome was stamped (the driver stamps that on a
     // resolved placement; nothing placed here).
-    assert!(!facts.is_set("05-enter", "entry_outcome"));
+    assert!(!facts.is_set_named("05-enter", "entry_outcome"));
 }
 
 /// The chain is out of order (retest stamped BEFORE break_close) — the enter
@@ -211,12 +211,12 @@ fn enter_requires_monotonic_prep_order() {
     );
     let mut facts = Facts::new();
     // retest stamped EARLIER than break_close — pathological ordering.
-    facts.set(
+    facts.set_named(
         "neckline",
         "break_close",
         FactValue::At(ts("2026-06-02T04:00:00Z")),
     );
-    facts.set(
+    facts.set_named(
         "neckline",
         "retest",
         FactValue::At(ts("2026-06-02T03:00:00Z")),
@@ -250,12 +250,12 @@ fn enter_fires_when_chain_complete() {
         ),
     );
     let mut facts = Facts::new();
-    facts.set(
+    facts.set_named(
         "neckline",
         "break_close",
         FactValue::At(ts("2026-06-02T03:00:00Z")),
     );
-    facts.set(
+    facts.set_named(
         "neckline",
         "retest",
         FactValue::At(ts("2026-06-02T04:00:00Z")),
@@ -303,18 +303,18 @@ fn enter_done_once_entry_outcome_stamped() {
         ),
     );
     let mut facts = Facts::new();
-    facts.set(
+    facts.set_named(
         "neckline",
         "break_close",
         FactValue::At(ts("2026-06-02T03:00:00Z")),
     );
-    facts.set(
+    facts.set_named(
         "neckline",
         "retest",
         FactValue::At(ts("2026-06-02T04:00:00Z")),
     );
     // Simulate the driver having resolved a placement → terminal entry outcome.
-    facts.set(
+    facts.set_named(
         "05-enter",
         "entry_outcome",
         FactValue::At(ts("2026-06-02T05:00:00Z")),
@@ -342,12 +342,12 @@ fn enter_independent_across_lines() {
     let mut facts = Facts::new();
 
     // neckline chain complete; supportline NOT yet → no place.
-    facts.set(
+    facts.set_named(
         "neckline",
         "break_close",
         FactValue::At(ts("2026-06-02T03:00:00Z")),
     );
-    facts.set(
+    facts.set_named(
         "neckline",
         "retest",
         FactValue::At(ts("2026-06-02T04:00:00Z")),
@@ -361,7 +361,7 @@ fn enter_independent_across_lines() {
 
     // Now satisfy supportline (a time UNRELATED to the neckline chain — lines are
     // independent, so its ordering vs the neckline doesn't matter).
-    facts.set(
+    facts.set_named(
         "supportline",
         "broke_below",
         FactValue::At(ts("2026-06-02T02:00:00Z")),
@@ -417,12 +417,12 @@ fn enter_dropped_on_backlog_bar_then_places_on_latest() {
         ),
     );
     let mut facts = Facts::new();
-    facts.set(
+    facts.set_named(
         "neckline",
         "break_close",
         FactValue::At(ts("2026-06-02T03:00:00Z")),
     );
-    facts.set(
+    facts.set_named(
         "neckline",
         "retest",
         FactValue::At(ts("2026-06-02T04:00:00Z")),
@@ -556,9 +556,9 @@ fn end_to_end_break_retest_enter() {
 
     // Both preps stamped, in order.
     let bc_at = facts
-        .at("neckline", "break_close")
+        .at_named("neckline", "break_close")
         .expect("break_close set");
-    let retest_at = facts.at("neckline", "retest").expect("retest set");
+    let retest_at = facts.at_named("neckline", "retest").expect("retest set");
     assert!(bc_at < retest_at, "break_close before retest");
 
     // And the enter placed after the full break → retest chain completed. It

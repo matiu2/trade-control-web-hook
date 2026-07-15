@@ -58,7 +58,9 @@ mod rules;
 
 pub use driver::tick_once;
 pub use effect::Effect;
-pub use facts::{FactValue, Facts};
+pub use facts::{
+    BreakClose, EntryOutcome, FactKind, FactValue, Facts, LastClose, Retest as RetestFact,
+};
 pub use late_entry::{LateEntry, LateEntryOrder, resolve as resolve_late_entry};
 pub use plan::{EntryMechanism, Line, PlanRule, PrepMap, RuleKind, TradePlan};
 pub use rule::Rule;

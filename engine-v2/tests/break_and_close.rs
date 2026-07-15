@@ -193,7 +193,7 @@ fn onclose_cross_stamps_fact_and_fires() {
 
     assert_eq!(fires(&effects), 1, "expected exactly one fire");
     assert_eq!(
-        facts.at("neckline", "break_close"),
+        facts.at_named("neckline", "break_close"),
         Some(ts("2026-06-01T13:00:00Z")),
         "break_close fact stamped to the cross candle's time"
     );
@@ -222,7 +222,7 @@ fn no_cross_sets_no_fact_and_no_fire() {
 
     assert_eq!(fires(&effects), 0, "no cross → no fire");
     assert!(
-        !facts.is_set("neckline", "break_close"),
+        !facts.is_set_named("neckline", "break_close"),
         "no cross → no break_close fact"
     );
 }
@@ -255,7 +255,7 @@ fn fire_once_prevents_refire_and_restamp() {
 
     assert_eq!(fires(&effects), 1, "fire-once → only the first cross fires");
     assert_eq!(
-        facts.at("neckline", "break_close"),
+        facts.at_named("neckline", "break_close"),
         Some(ts("2026-06-01T13:00:00Z")),
         "stamp stays at the first cross's time, not re-stamped to 15:00"
     );
@@ -313,7 +313,7 @@ fn sloped_neckline_interpolated_at_bar_index() {
         "close broke the interpolated sloped level"
     );
     assert_eq!(
-        facts.at("neckline", "break_close"),
+        facts.at_named("neckline", "break_close"),
         Some(ts("2026-06-01T12:00:00Z"))
     );
 
@@ -370,7 +370,7 @@ fn weekend_gap_uses_bar_index_not_wallclock() {
         "cross detected against the bar-index-interpolated level across the gap"
     );
     assert_eq!(
-        facts.at("neckline", "break_close"),
+        facts.at_named("neckline", "break_close"),
         Some(ts("2026-06-08T10:00:00Z"))
     );
 }
@@ -456,11 +456,11 @@ fn last_close_scratch_recorded_on_seed_bar() {
     let _ = drive_series(&p, &mut facts, &candles, ts("2026-06-01T12:00:05Z"));
 
     assert_eq!(
-        facts.get_scratch("03-prep-break-and-close", "last_close"),
+        facts.get_scratch_named("03-prep-break-and-close", "last_close"),
         Some(&FactValue::Num(1.1010)),
         "seed bar's close persisted as rule-private last_close scratch"
     );
-    assert!(!facts.is_set("neckline", "break_close"));
+    assert!(!facts.is_set_named("neckline", "break_close"));
 }
 
 /// Reading the SHARED fact namespace must never surface the `last_close`
@@ -491,16 +491,19 @@ fn last_close_scratch_not_visible_in_shared_facts() {
 
     // Scratch is set...
     assert_eq!(
-        facts.num_scratch("03-prep-break-and-close", "last_close"),
+        facts.num_scratch_named("03-prep-break-and-close", "last_close"),
         Some(1.1010),
     );
     // ...but the SHARED namespace never surfaces it — under the line name it
     // used to (mistakenly) share, nor under the rule id.
     assert_eq!(
-        facts.get("neckline", "last_close"),
+        facts.get_named("neckline", "last_close"),
         None,
         "scratch must not leak into the shared (line, kind) fact map"
     );
-    assert!(!facts.is_set("neckline", "last_close"));
-    assert_eq!(facts.get("03-prep-break-and-close", "last_close"), None);
+    assert!(!facts.is_set_named("neckline", "last_close"));
+    assert_eq!(
+        facts.get_named("03-prep-break-and-close", "last_close"),
+        None
+    );
 }

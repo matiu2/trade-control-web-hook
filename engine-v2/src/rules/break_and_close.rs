@@ -39,16 +39,10 @@ use trade_control_core::trade_plan::Trigger;
 
 use crate::cross::{eval_trigger, trigger_uses_close};
 use crate::effect::Effect;
-use crate::facts::FactValue;
+use crate::facts::{BreakClose, FactKind, FactValue, LastClose};
 use crate::plan::{Line, PlanRule};
 use crate::rule::Rule;
 use crate::world::World;
-
-/// Shared-fact kind for the break-and-close stamp (keyed `(line, kind)`).
-const KIND_BREAK_CLOSE: &str = "break_close";
-/// Rule-private scratch kind for the prior-close bookkeeping (keyed
-/// `(rule_id, kind)`).
-const SCRATCH_LAST_CLOSE: &str = "last_close";
 
 /// The break-and-close prep, bound to a v2 [`PlanRule`]. Borrowed so
 /// instantiating it per tick is free.
@@ -74,7 +68,7 @@ impl Rule for BreakAndClose<'_> {
         // never re-stamps (v1's multi-enter re-cross guard). Reading to check
         // "already done" is fine; a pure rule may read facts, it just can't write
         // them.
-        if w.facts.is_set(&self.rule.line, KIND_BREAK_CLOSE) {
+        if w.facts.is_set::<BreakClose>(&self.rule.line) {
             return Vec::new();
         }
 
@@ -90,7 +84,7 @@ impl Rule for BreakAndClose<'_> {
         };
 
         let trigger = self.trigger_for(line, w.plan.granularity.seconds());
-        let prev_close = w.facts.num_scratch(&self.rule.id, SCRATCH_LAST_CLOSE);
+        let prev_close = w.facts.num_scratch::<LastClose>(&self.rule.id);
         let hit = eval_trigger(
             &trigger,
             candle,
@@ -107,7 +101,7 @@ impl Rule for BreakAndClose<'_> {
         if trigger_uses_close(&trigger) {
             effects.push(Effect::WriteScratch {
                 rule_id: self.rule.id.clone(),
-                kind: SCRATCH_LAST_CLOSE.to_string(),
+                kind: LastClose::NAME.to_string(),
                 value: FactValue::Num(candle.c),
             });
         }
@@ -120,7 +114,7 @@ impl Rule for BreakAndClose<'_> {
         // intent — both as effects, applied by the driver.
         effects.push(Effect::WriteFact {
             line: self.rule.line.clone(),
-            kind: KIND_BREAK_CLOSE.to_string(),
+            kind: BreakClose::NAME.to_string(),
             value: FactValue::At(candle.time),
         });
         effects.push(Effect::Fire(Box::new(crate::rule::fired_intent(

@@ -57,18 +57,10 @@ use trade_control_core::trade_plan::{BarEvent, CrossDir, Trigger};
 
 use crate::cross::{eval_trigger, level_crossed, line_price_at, trigger_uses_close};
 use crate::effect::Effect;
-use crate::facts::FactValue;
+use crate::facts::{BreakClose, FactKind, FactValue, LastClose, Retest as RetestKind};
 use crate::plan::{Line, PlanRule};
 use crate::rule::Rule;
 use crate::world::World;
-
-/// Shared-fact kind for the retest stamp (keyed `(line, kind)`).
-const KIND_RETEST: &str = "retest";
-/// Shared-fact kind of the *producer* fact this rule gates on.
-const KIND_BREAK_CLOSE: &str = "break_close";
-/// Rule-private scratch kind for the prior-close bookkeeping (keyed
-/// `(rule_id, kind)`).
-const SCRATCH_LAST_CLOSE: &str = "last_close";
 
 /// The retest prep, bound to a v2 [`PlanRule`]. Borrowed so instantiating it per
 /// tick is free.
@@ -92,12 +84,12 @@ impl Rule for Retest<'_> {
     fn tick(&self, w: &World) -> Vec<Effect> {
         // Fire-once: once the retest fact is set, this rule is done — it never
         // re-stamps (v1's `retest_seen_at.is_some()` guard).
-        if w.facts.is_set(&self.rule.line, KIND_RETEST) {
+        if w.facts.is_set::<RetestKind>(&self.rule.line) {
             return Vec::new();
         }
 
         // Producer gate: nothing to do until break-and-close has stamped.
-        let Some(break_at) = w.facts.at(&self.rule.line, KIND_BREAK_CLOSE) else {
+        let Some(break_at) = w.facts.at::<BreakClose>(&self.rule.line) else {
             return Vec::new();
         };
 
@@ -128,7 +120,7 @@ impl Rule for Retest<'_> {
         if trigger_uses_close(&trigger) {
             effects.push(Effect::WriteScratch {
                 rule_id: self.rule.id.clone(),
-                kind: SCRATCH_LAST_CLOSE.to_string(),
+                kind: LastClose::NAME.to_string(),
                 value: FactValue::Num(candle.c),
             });
         }
@@ -157,7 +149,7 @@ impl Rule for Retest<'_> {
             return effects;
         };
 
-        let prev_close = w.facts.num_scratch(&self.rule.id, SCRATCH_LAST_CLOSE);
+        let prev_close = w.facts.num_scratch::<LastClose>(&self.rule.id);
         let crossed = retest_crossed(
             &trigger,
             candle,
@@ -180,7 +172,7 @@ impl Rule for Retest<'_> {
             // this fact directly (see module docs).
             effects.push(Effect::WriteFact {
                 line: self.rule.line.clone(),
-                kind: KIND_RETEST.to_string(),
+                kind: RetestKind::NAME.to_string(),
                 value: FactValue::At(candle.time),
             });
         }

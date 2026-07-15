@@ -66,16 +66,10 @@
 use trade_control_core::plan_eval::FiredIntent;
 
 use crate::effect::Effect;
+use crate::facts::EntryOutcome;
 use crate::plan::PlanRule;
 use crate::rule::Rule;
 use crate::world::World;
-
-/// Shared-fact kind of the enter's **terminal entry outcome**, stamped by the
-/// DRIVER (not this rule) when it resolves a placement — a real placement *or* a
-/// missed catch-up. The enter reads it as its fire-once guard (single-shot: if
-/// set, the enter is done). Keyed by the
-/// enter's **rule id** (not a geometry line) so it is unique to this enter.
-pub const KIND_ENTRY_OUTCOME: &str = "entry_outcome";
 
 /// The entry rule, bound to a v2 [`PlanRule`]. Borrowed so instantiating it per
 /// tick is free.
@@ -102,7 +96,7 @@ impl Rule for Enter<'_> {
         // this fact — the driver writes it when it resolves the placement, so a
         // backlog bar whose placement the driver later drops never marks this enter
         // done.
-        if w.facts.is_set(&self.rule.id, KIND_ENTRY_OUTCOME) {
+        if w.facts.is_set::<EntryOutcome>(&self.rule.id) {
             return Vec::new();
         }
 
@@ -163,8 +157,11 @@ impl Enter<'_> {
 fn line_chain_satisfied(w: &World, line: &str, kinds: &[String]) -> bool {
     let mut prev: Option<chrono::DateTime<chrono::Utc>> = None;
     for kind in kinds {
-        // The milestone must be present AND a timestamp fact.
-        let Some(at) = w.facts.at(line, kind) else {
+        // The milestone must be present AND a timestamp fact. This is the one read
+        // where the kind is genuinely RUNTIME — it comes from the enter's `preps`
+        // map (plan data listing milestone kind *names*), so it uses the by-name
+        // accessor, not the typed `at::<K>`.
+        let Some(at) = w.facts.at_named(line, kind) else {
             return false;
         };
         // Strictly after the previous milestone in this line's chain.
