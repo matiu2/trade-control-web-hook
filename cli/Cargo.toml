@@ -22,7 +22,7 @@ dialoguer = { version = "0.12.0", default-features = false, features = ["fuzzy-s
 forex-factory = { git = "https://github.com/matiu2/forex-factory.git", version = "0.2.0", default-features = false, features = ["native-tls", "brotli", "http2"] }
 getrandom = "0.4.2"
 hex = "0.4.3"
-instrument-lookup = { version = "0.3.0", path = "../../instrument-lookup" }
+instrument-lookup = { version = "0.4.0", path = "../../instrument-lookup" }
 news-sentiment-tv = { version = "0.1.0", path = "../news-sentiment-tv" }
 oanda-client = { version = "0.2.0", path = "../../oanda-client" }
 reqwest = { version = "^0.12", default-features = false, features = ["rustls-tls", "blocking"] }

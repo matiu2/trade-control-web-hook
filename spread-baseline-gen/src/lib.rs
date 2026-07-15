@@ -51,5 +51,9 @@ pub struct BaselineRow {
     pub symbol: String,
     /// Human display name (for the validation report only).
     pub display_name: String,
+    /// The asset's `spread_schedule` FK name (e.g. `"ny"`) whose LOCAL hour the
+    /// mask is bucketed in. Emitted as a table column so Stage 3 can bake it and
+    /// the gate can DST-shift the mask at read time.
+    pub spread_schedule: String,
     pub profile: SpreadProfile,
 }

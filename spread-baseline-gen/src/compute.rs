@@ -230,13 +230,25 @@ pub fn profile_for_instrument(bars: &[Bar]) -> SpreadProfile {
     apply_gates(hour_ratio, hour_p90, vol, n)
 }
 
-/// One minute bar reduced to what the minute-aware computation needs: the UTC
-/// hour it fell in, its spread fraction, and its mid close (for the hourly
-/// volatility resample). Built by the fetchers from each broker's M1 candles.
+/// One minute bar reduced to what the minute-aware computation needs: the
+/// **schedule-LOCAL** hour it fell in (for DST-invariant bucketing), the UTC
+/// minute-of-day (retained for reference / debugging), its spread fraction, and
+/// its mid close (for the hourly volatility resample). Built by the fetchers
+/// from each broker's M1 candles.
+///
+/// The bucketing hour is `local_hour`, computed at fetch time from the full UTC
+/// timestamp and the asset's schedule timezone (see [`fetch`](crate::fetch)).
+/// This is the Stage-2 change: a full year of a NY-close spike lands in the same
+/// LOCAL hour instead of smearing across two UTC hours as the DST offset shifts.
 #[derive(Debug, Clone, Copy)]
 pub struct MinuteBar {
-    /// UTC timestamp minute-of-day `0..=1439` (`hour*60 + minute`).
+    /// UTC timestamp minute-of-day `0..=1439` (`hour*60 + minute`). Retained
+    /// for reference; the profile buckets on [`local_hour`](Self::local_hour).
     pub utc_minute_of_day: u16,
+    /// Schedule-LOCAL hour-of-day `0..=23` this minute fell in, computed from
+    /// the asset's spread-schedule timezone. This is the bucketing key — it is
+    /// DST-invariant, unlike [`utc_minute_of_day`](Self::utc_minute_of_day).
+    pub local_hour: u8,
     /// `(ask_close - bid_close) / mid_close`. Must be finite and ≥ 0.
     pub spread_frac: f64,
     /// Mid close price (> 0), for the hourly-resampled volatility series.
@@ -244,7 +256,8 @@ pub struct MinuteBar {
 }
 
 impl MinuteBar {
-    /// The UTC hour `0..=23` this minute falls in.
+    /// The UTC hour `0..=23` this minute falls in. Kept for reference /
+    /// debugging; the profile buckets on [`local_hour`](Self::local_hour).
     pub fn utc_hour(&self) -> usize {
         (self.utc_minute_of_day / 60) as usize
     }
@@ -286,13 +299,15 @@ pub fn profile_from_minutes(bars: &[MinuteBar]) -> SpreadProfile {
     }
 
     // Hourly-resampled mids for the volatility baseline: one mid per contiguous
-    // UTC-hour run (bars are in timestamp order, so a change in hour-of-day
-    // marks a new hour). Consecutive hourly samples give a |Δmid| series on the
-    // same scale as the H1 path.
+    // LOCAL-hour run (bars are in timestamp order, so a change in local hour-of-
+    // day marks a new hour). We resample on the SAME hour we bucket on
+    // (`local_hour`) so the vol series and the spread buckets partition the bars
+    // identically. Consecutive hourly samples give a |Δmid| series on the same
+    // scale as the H1 path (whole-hour DST offsets don't change the run count).
     let mut hourly_mids: Vec<f64> = Vec::new();
-    let mut last_hour: Option<usize> = None;
+    let mut last_hour: Option<u8> = None;
     for b in bars {
-        let h = b.utc_hour();
+        let h = b.local_hour;
         if last_hour != Some(h) {
             hourly_mids.push(b.mid_close);
             last_hour = Some(h);
@@ -308,10 +323,10 @@ pub fn profile_from_minutes(bars: &[MinuteBar]) -> SpreadProfile {
         return SpreadProfile::empty(n);
     }
 
-    // Bucket minute spreads by UTC hour.
+    // Bucket minute spreads by schedule-LOCAL hour (DST-invariant).
     let mut by_hour: [Vec<f64>; 24] = Default::default();
     for b in bars {
-        let h = b.utc_hour();
+        let h = b.local_hour as usize;
         if h < 24 {
             by_hour[h].push(b.spread_frac);
         }
@@ -542,9 +557,30 @@ mod tests {
 
     // ---- minute-based path ----
 
+    /// Build a minute bar whose UTC hour and LOCAL hour coincide (no DST offset)
+    /// — so the existing minute tests, which reason in a single "hour" space,
+    /// keep their meaning after the local_hour bucketing switch.
     fn min_bar(hour: u8, minute: u8, spread_frac: f64, mid: f64) -> MinuteBar {
         MinuteBar {
             utc_minute_of_day: hour as u16 * 60 + minute as u16,
+            local_hour: hour,
+            spread_frac,
+            mid_close: mid,
+        }
+    }
+
+    /// Build a minute bar with an explicit LOCAL hour distinct from the UTC
+    /// minute-of-day, to prove `profile_from_minutes` buckets on `local_hour`.
+    fn min_bar_local(
+        utc_hour: u8,
+        minute: u8,
+        local_hour: u8,
+        spread_frac: f64,
+        mid: f64,
+    ) -> MinuteBar {
+        MinuteBar {
+            utc_minute_of_day: utc_hour as u16 * 60 + minute as u16,
+            local_hour,
             spread_frac,
             mid_close: mid,
         }
@@ -642,6 +678,36 @@ mod tests {
             "a 20-min real spike must flag (p75 lifts) while a 7-min bleed must \
              not (p75 unmoved) — the EUR_USD/GBP_AUD calibration"
         );
+    }
+
+    #[test]
+    fn profile_buckets_on_local_hour_not_utc() {
+        // The spike sits at UTC hour 22 but is stamped LOCAL hour 17 (a −5h
+        // NY-EST offset). Bucketing must key on local_hour, so the flagged hour
+        // is 17, NOT 22. This is the DST-invariance guarantee: whatever UTC hour
+        // the spike lands in, it accrues to its fixed local hour.
+        let mut bars = Vec::new();
+        let mut mid = 1.0000_f64;
+        for _ in 0..5 {
+            for h in 0..24u8 {
+                mid += if h % 2 == 0 { 0.0002 } else { -0.0002 };
+                // Local hour = UTC hour shifted −5 (mod 24), an EST-like offset.
+                let local = ((h as i16 - 5).rem_euclid(24)) as u8;
+                for m in 0..60u8 {
+                    // Spike lives at UTC hour 22 ⇒ local hour 17.
+                    let frac = if h == 22 { 0.0010 } else { 0.0001 };
+                    bars.push(min_bar_local(h, m, local, frac, mid));
+                }
+            }
+        }
+        let p = profile_from_minutes(&bars);
+        assert_eq!(
+            p.elevated_vec(),
+            vec![17],
+            "spike at UTC 22 / local 17 must flag LOCAL hour 17, not 22"
+        );
+        assert!(p.hour_widen_frac[17] > 0.0009);
+        assert_eq!(p.hour_widen_frac[22], 0.0);
     }
 
     #[test]
