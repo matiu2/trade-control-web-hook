@@ -843,6 +843,20 @@ pub fn widened_stop_at(
     let exit_book = book_for(Leg::Exit, dir);
     let original_stop = resolved.stop_loss;
 
+    // The look-ahead lead this replay must use so the widen pre-arms on the bar
+    // BEFORE a flagged spread hour (BUG-spread-hour-widen-no-subhour-lead.md).
+    // The replay only evaluates at bar closes (`c.time` is the bar OPEN, so on an
+    // H1 stream `minute == 0`), where `core`'s default 30-min lead is structurally
+    // unreachable (`60 - 0 = 60 > 30`). Passing a lead ≥ the bar length makes the
+    // look-ahead reachable at that boundary, so the 20:00 bar widens ahead of a
+    // 21:00 spike — matching what the live cron achieves via its mid-bar 15-min
+    // tick (which lands inside the :30–:59 window). Both paths thus widen "on the
+    // bar before the spike" and converge. Fall back to the core default when the
+    // window is too short to infer a bar length (single-candle path).
+    let bar_minutes = bar_seconds_of(candles) / 60;
+    let widen_lead_minutes =
+        trade_control_core::spread_blackout::SPREAD_HOUR_LEAD_MINUTES.max(bar_minutes);
+
     for (i, c) in fill.rest.iter().enumerate() {
         // The original stop is still the live one until a widen fires, so an
         // exit (SL/TP) before any qualifying spread bar means no widen applied.
@@ -865,11 +879,12 @@ pub fn widened_stop_at(
         // convert to pips with the bar's mid close as the reference price via
         // `widen_frac_to_pips`. Matches the live worker's cron widen (which uses
         // the stop-loss price as its reference).
-        let baked_p90 =
-            trade_control_core::spread_blackout::spread_hour_widen_frac(&intent.instrument, c.time)
-                .map(|frac| {
-                    trade_control_core::spread_blackout::widen_frac_to_pips(frac, c.c, pip_size)
-                });
+        let baked_p90 = trade_control_core::spread_blackout::spread_hour_widen_frac_with_lead(
+            &intent.instrument,
+            c.time,
+            widen_lead_minutes,
+        )
+        .map(|frac| trade_control_core::spread_blackout::widen_frac_to_pips(frac, c.c, pip_size));
         if baked_p90.is_none() && !trade_control_core::ny_clock::is_ny_close_edge(c.time) {
             continue;
         }
@@ -2085,6 +2100,51 @@ mod tests {
         assert!(
             baked < WIDEN_FLOOR_PIPS,
             "baked p90 {baked} should be < 22p floor"
+        );
+    }
+
+    /// Regression for `BUG-spread-hour-widen-no-subhour-lead.md`: on an **H1**
+    /// stream the widen must pre-arm on the bar BEFORE the flagged spread hour,
+    /// not collide with the spike on the same bar. GBP/AUD's baked candle mask is
+    /// a single hour [21]; the 21:00Z spike wicks the stop out. Before the fix,
+    /// the replay only evaluated at bar closes (`minute == 0`), where core's 30-min
+    /// lead is unreachable — so the widen fired on the 21:00 bar (too late) or not
+    /// at all. With the bar-length lead, the 20:00 bar (a full H1 bar before the
+    /// spike) widens, matching what the live 15-min cron achieves at ~20:45.
+    #[test]
+    fn widened_stop_at_pre_arms_a_full_bar_before_the_spread_hour_on_h1() {
+        use trade_control_core::blackout_widen::WIDEN_FLOOR_PIPS;
+
+        let mut intent = long_stop_intent();
+        intent.instrument = "GBP/AUD".into(); // TN name, candle mask [21] only
+        i_set_levels(&mut intent, 1.1000, 1.0950, 1.1100);
+        let shell = trigger_shell();
+
+        // H1 spacing (3600s bar): fire → fill → clean 20:00 bar → 21:00 spike.
+        let fill_bar = candle("2026-07-13T11:00:00Z", 1.1000, 1.1001, 1.0999, 1.1000);
+        // 20:00Z: the bar IMMEDIATELY before the flagged 21:00 hour. Tight 2p
+        // spread — the legacy path would never widen here; only the mask look-ahead
+        // does. Must not hit SL(1.0950)/TP(1.1100).
+        let pre_hour = ba_candle("2026-07-13T20:00:00Z", 1.10010, 1.10005, 1.10030, 1.10025);
+        // 21:00Z: the spread-hour blowout (30.5p spread). If the widen only armed
+        // here it would already be racing the spike.
+        let spike = ba_candle("2026-07-13T21:00:00Z", 1.10015, 1.10010, 1.10315, 1.10310);
+        let path = [fire_bar(), fill_bar, pre_hour, spike];
+
+        // The path is a clean H1 grid apart from the fire/fill warmup, so the
+        // inferred bar length is 3600s → lead 60 min → the 20:00 boundary reaches
+        // the 21:00 look-ahead.
+        assert_eq!(
+            bar_seconds_of(&path),
+            3600,
+            "path must be H1-spaced for the full-bar-lead premise"
+        );
+
+        let widen = widened_stop_at(&intent, &shell, 0.0001, &path, WIDEN_FLOOR_PIPS, None)
+            .expect("the widen must pre-arm on the bar before the 21:00 spread hour");
+        assert_eq!(
+            widen.at, pre_hour.time,
+            "widen must land on the 20:00 bar (a full bar before the spike), not the 21:00 spike bar"
         );
     }
 

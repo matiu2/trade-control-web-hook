@@ -119,9 +119,37 @@ pub fn widen_frac_to_pips(frac: f64, reference_price: f64, pip_size: f64) -> f64
 /// [`widen_frac_to_pips`]). Same lead look-ahead as the sampler path, driven by
 /// the same pure [`spread_hour_widen_for`] seam over the candle
 /// `(mask, widen_frac)`.
+///
+/// Uses the default [`SPREAD_HOUR_LEAD_MINUTES`] (30-min) look-ahead — the value
+/// the **live cron** wants, since it ticks every 15 min and so lands inside the
+/// :30–:59 lead window before the top-of-hour spike. A caller that only
+/// evaluates at bar boundaries (the offline replay) must instead use
+/// [`spread_hour_widen_frac_with_lead`] with a lead ≥ its bar length, or the
+/// look-ahead is unreachable at `minute == 0`. See
+/// `BUG-spread-hour-widen-no-subhour-lead.md`.
 pub fn spread_hour_widen_frac(instrument: &str, now: chrono::DateTime<chrono::Utc>) -> Option<f64> {
+    spread_hour_widen_frac_with_lead(instrument, now, SPREAD_HOUR_LEAD_MINUTES)
+}
+
+/// [`spread_hour_widen_frac`] with an explicit look-ahead `lead_minutes` instead
+/// of the fixed [`SPREAD_HOUR_LEAD_MINUTES`].
+///
+/// The lead is how far ahead of a flagged hour's top we pre-arm the widen. The
+/// **live cron** ticks every 15 min so a 30-min lead is reached in time; the
+/// **offline replay** only evaluates at bar closes (`minute == 0` on H1), where a
+/// 30-min lead is structurally unreachable (`60 - 0 = 60 > 30`). So the replay
+/// passes a lead ≥ its bar length (a full bar): on an H1 close a `lead = 60`
+/// makes `60 - 0 <= 60` fire, widening on the bar **before** the flagged hour —
+/// exactly what the live cron achieves via its mid-bar tick. Both paths thus
+/// converge on "widen on the bar before the spike," curing the replay ↔ live
+/// divergence (`BUG-spread-hour-widen-no-subhour-lead.md`).
+pub fn spread_hour_widen_frac_with_lead(
+    instrument: &str,
+    now: chrono::DateTime<chrono::Utc>,
+    lead_minutes: i64,
+) -> Option<f64> {
     let (mask, widen) = baked_candle_spread_hours(instrument)?;
-    spread_hour_widen_for(mask, &widen, now)
+    spread_hour_widen_for(mask, &widen, now, lead_minutes)
 }
 
 /// The reject line, as a multiple of an instrument's *normal* (median)
@@ -211,7 +239,7 @@ pub const SPREAD_HOUR_LEAD_MINUTES: i64 = 30;
 /// those, so nothing regresses for un-sampled assets.
 pub fn spread_hour_widen_pips(instrument: &str, now: chrono::DateTime<chrono::Utc>) -> Option<f64> {
     let (mask, widen) = baked_spread_hours(instrument)?;
-    spread_hour_widen_for(mask, &widen, now)
+    spread_hour_widen_for(mask, &widen, now, SPREAD_HOUR_LEAD_MINUTES)
 }
 
 /// Pure spread-hour-widen decision over an explicit `(mask, widen)` — the
@@ -219,13 +247,19 @@ pub fn spread_hour_widen_pips(instrument: &str, now: chrono::DateTime<chrono::Ut
 /// table so tests can drive it with synthetic instrument shapes.
 ///
 /// Returns the widen pips iff `now`'s hour is elevated, or `now` is within
-/// [`SPREAD_HOUR_LEAD_MINUTES`] of the top of a next hour that is elevated
-/// (look-ahead, so the stop is out of the way before the spike). `None`
-/// otherwise (including a mask of 0).
+/// `lead_minutes` of the top of a next hour that is elevated (look-ahead, so the
+/// stop is out of the way before the spike). `None` otherwise (including a mask
+/// of 0).
+///
+/// `lead_minutes` is explicit so the two callers can differ: the live cron
+/// passes [`SPREAD_HOUR_LEAD_MINUTES`] (30, reachable by its 15-min tick); the
+/// offline replay passes ≥ its bar length so the look-ahead is reachable at a bar
+/// boundary (`minute == 0`). See [`spread_hour_widen_frac_with_lead`].
 fn spread_hour_widen_for(
     mask: u32,
     widen: &[f64; 24],
     now: chrono::DateTime<chrono::Utc>,
+    lead_minutes: i64,
 ) -> Option<f64> {
     use chrono::Timelike;
     if mask == 0 {
@@ -234,7 +268,7 @@ fn spread_hour_widen_for(
     let hour = now.hour() as usize;
     // Within the lead window of the next hour's top? Then look ahead.
     let minutes_into_hour = now.minute() as i64;
-    let lead_reaches_next = 60 - minutes_into_hour <= SPREAD_HOUR_LEAD_MINUTES;
+    let lead_reaches_next = 60 - minutes_into_hour <= lead_minutes;
     if lead_reaches_next {
         let next = (hour + 1) % 24;
         if mask & (1 << next) != 0 {
@@ -675,7 +709,7 @@ mod tests {
         let (m, w) = eurusd_shape();
         // 21:15 UTC — squarely inside the elevated hour.
         assert_eq!(
-            spread_hour_widen_for(m, &w, ts("2026-07-01T21:15:00Z")),
+            spread_hour_widen_for(m, &w, ts("2026-07-01T21:15:00Z"), SPREAD_HOUR_LEAD_MINUTES),
             Some(5.0),
         );
     }
@@ -685,7 +719,7 @@ mod tests {
         let (m, w) = eurusd_shape();
         // Midday, nowhere near 21:00.
         assert_eq!(
-            spread_hour_widen_for(m, &w, ts("2026-07-01T12:00:00Z")),
+            spread_hour_widen_for(m, &w, ts("2026-07-01T12:00:00Z"), SPREAD_HOUR_LEAD_MINUTES),
             None
         );
     }
@@ -695,12 +729,12 @@ mod tests {
         let (m, w) = eurusd_shape();
         // 20:35 UTC — 25 min before 21:00, inside the 30-min lead → widen now.
         assert_eq!(
-            spread_hour_widen_for(m, &w, ts("2026-07-01T20:35:00Z")),
+            spread_hour_widen_for(m, &w, ts("2026-07-01T20:35:00Z"), SPREAD_HOUR_LEAD_MINUTES),
             Some(5.0),
         );
         // 20:29 UTC — 31 min before, just outside the lead → not yet.
         assert_eq!(
-            spread_hour_widen_for(m, &w, ts("2026-07-01T20:29:00Z")),
+            spread_hour_widen_for(m, &w, ts("2026-07-01T20:29:00Z"), SPREAD_HOUR_LEAD_MINUTES),
             None
         );
     }
@@ -711,7 +745,7 @@ mod tests {
         // elevated and within the lead → widen, exercising the (h+1)%24 wrap.
         let (m, w) = gold_shape();
         assert_eq!(
-            spread_hour_widen_for(m, &w, ts("2026-07-01T23:40:00Z")),
+            spread_hour_widen_for(m, &w, ts("2026-07-01T23:40:00Z"), SPREAD_HOUR_LEAD_MINUTES),
             Some(75.0),
         );
     }
@@ -721,12 +755,12 @@ mod tests {
         let (m, w) = gold_shape();
         // Deep in the overnight block.
         assert_eq!(
-            spread_hour_widen_for(m, &w, ts("2026-07-01T02:00:00Z")),
+            spread_hour_widen_for(m, &w, ts("2026-07-01T02:00:00Z"), SPREAD_HOUR_LEAD_MINUTES),
             Some(75.0),
         );
         // Daytime, block is closed.
         assert_eq!(
-            spread_hour_widen_for(m, &w, ts("2026-07-01T12:00:00Z")),
+            spread_hour_widen_for(m, &w, ts("2026-07-01T12:00:00Z"), SPREAD_HOUR_LEAD_MINUTES),
             None
         );
     }
@@ -735,8 +769,75 @@ mod tests {
     fn widen_empty_mask_never_fires() {
         // A flat-fat-tail instrument bakes mask 0 → never a spread hour.
         assert_eq!(
-            spread_hour_widen_for(0, &[0.0; 24], ts("2026-07-01T21:15:00Z")),
+            spread_hour_widen_for(
+                0,
+                &[0.0; 24],
+                ts("2026-07-01T21:15:00Z"),
+                SPREAD_HOUR_LEAD_MINUTES
+            ),
             None
+        );
+    }
+
+    // --- lead is parameterizable (BUG-spread-hour-widen-no-subhour-lead) ---
+
+    #[test]
+    fn widen_30min_lead_is_dead_at_a_bar_boundary() {
+        // The bug: at a bar close (`minute == 0`, an H1 stream), the 30-min lead
+        // is structurally unreachable — `60 - 0 = 60 > 30` — so the look-ahead
+        // into the next flagged hour never fires. The 20:00 bar sits one full
+        // hour before the 21:00 spike but is NOT flagged and its successor's
+        // look-ahead is dead at a 30-min lead.
+        let (m, w) = eurusd_shape();
+        assert_eq!(
+            spread_hour_widen_for(m, &w, ts("2026-07-01T20:00:00Z"), SPREAD_HOUR_LEAD_MINUTES),
+            None,
+            "the 30-min lead can't reach the next hour from a :00 bar boundary"
+        );
+    }
+
+    #[test]
+    fn widen_full_bar_lead_pre_arms_on_the_prior_bar() {
+        // The fix: a lead ≥ the bar length (60 min for H1) makes the look-ahead
+        // reachable at a :00 boundary — `60 - 0 = 60 <= 60` — so the 20:00 bar
+        // (immediately before the 21:00 spike) widens. This is what lets the
+        // offline replay pre-arm a FULL BAR early, matching the live cron's
+        // mid-bar 30-min tick.
+        let (m, w) = eurusd_shape();
+        assert_eq!(
+            spread_hour_widen_for(m, &w, ts("2026-07-01T20:00:00Z"), 60),
+            Some(5.0),
+            "a 60-min (full H1 bar) lead widens on the 20:00 bar, before the 21:00 spike"
+        );
+        // But the bar TWO hours before (19:00) still must not widen — its
+        // successor (20:00) isn't flagged, and 19:00 itself isn't.
+        assert_eq!(
+            spread_hour_widen_for(m, &w, ts("2026-07-01T19:00:00Z"), 60),
+            None,
+            "only the immediately-prior bar pre-arms, not two bars early"
+        );
+    }
+
+    #[test]
+    fn widen_frac_with_lead_matches_the_default_helper() {
+        // The default `spread_hour_widen_frac` must equal the lead-aware form at
+        // the 30-min default — the delegation is behaviour-preserving for the
+        // live cron. EUR/USD is in the candle table (21:00 spike).
+        let inside = ts("2026-07-08T21:15:00Z");
+        assert_eq!(
+            spread_hour_widen_frac("EUR/USD", inside),
+            spread_hour_widen_frac_with_lead("EUR/USD", inside, SPREAD_HOUR_LEAD_MINUTES),
+        );
+        // And the full-bar lead reaches the spike from the prior H1 close where
+        // the 30-min default cannot.
+        let prior_close = ts("2026-07-08T20:00:00Z");
+        assert!(
+            spread_hour_widen_frac("EUR/USD", prior_close).is_none(),
+            "30-min default: dead at the 20:00 boundary"
+        );
+        assert!(
+            spread_hour_widen_frac_with_lead("EUR/USD", prior_close, 60).is_some(),
+            "60-min lead: pre-arms on the 20:00 bar"
         );
     }
 
