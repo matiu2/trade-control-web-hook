@@ -138,11 +138,35 @@ fn drive_series(
     out
 }
 
+/// A no-prep enter rule (`Action::Enter`) — places immediately once it ticks
+/// unless the plan is retired. Used by the end-to-end block test.
+fn enter_rule() -> PlanRule {
+    let mut i = intent();
+    i.action = Action::Enter;
+    PlanRule {
+        id: "05-enter".into(),
+        kind: RuleKind::Enter,
+        intent: i,
+        bar: BarEvent::OnClose,
+        dir: CrossDir::Up,
+        preps: PrepMap::new(),
+        mechanism: EntryMechanism::Stop,
+    }
+}
+
 /// Count the `Invalidate` effects.
 fn invalidates(effects: &[Effect]) -> usize {
     effects
         .iter()
         .filter(|e| matches!(e, Effect::Invalidate { .. }))
+        .count()
+}
+
+/// Count the `PlaceOrder` effects.
+fn place_orders(effects: &[Effect]) -> usize {
+    effects
+        .iter()
+        .filter(|e| matches!(e, Effect::PlaceOrder { .. }))
         .count()
 }
 
@@ -305,4 +329,38 @@ fn buffer_suppresses_a_graze() {
         "a graze inside the buffer does not retire"
     );
     assert!(!facts.is_set_named("__plan__", "invalidated"));
+}
+
+/// End-to-end: a plan with an invalidation cap **and** a no-prep enter. On the bar
+/// the cap crosses, the driver retires the plan (cap rule ordered first), and the
+/// enter — which would otherwise place immediately (empty preps) — is blocked by
+/// its second fire-once guard on the same bar. No `PlaceOrder` ever leaves.
+#[test]
+fn invalidation_blocks_the_enter_end_to_end() {
+    let levels = vec![PriceLevel {
+        name: "too_high".into(),
+        price: 1.1050,
+    }];
+    // Cap FIRST, enter second — within a bar the driver applies the cap's retire
+    // fact before the enter ticks (the load-bearing within-bar ordering).
+    let cap = cap_rule(
+        "01-veto-too-high",
+        RuleKind::InvalidateHigh,
+        BarEvent::Intrabar,
+        CrossDir::Up,
+    );
+    let p = plan(levels, vec![cap, enter_rule()]);
+    let mut facts = Facts::default();
+
+    // A single bar whose high pierces the cap (retire) — the enter's empty preps
+    // are vacuously satisfied, so without the guard it would place on this bar.
+    let cross = candle("2026-06-01T10:00:00Z", 1.103, 1.106, 1.102, 1.104);
+    let out = drive_series(&p, &mut facts, &[cross], ts(NOW));
+
+    assert_eq!(invalidates(&out), 1, "the cap retires the plan");
+    assert_eq!(
+        place_orders(&out),
+        0,
+        "the retired plan blocks the enter on the very bar the cap crossed",
+    );
 }

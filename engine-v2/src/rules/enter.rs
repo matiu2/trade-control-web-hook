@@ -53,6 +53,18 @@
 //! later rule; see `[[multishot_engine_keeps_plan_alive]]`. This slice is
 //! single-shot.)
 //!
+//! # Second fire-once — plan retirement (invalidation)
+//!
+//! The enter also reads a **plan-scoped** retire fact `(PLAN_SCOPE,
+//! "invalidated")`, stamped by the driver when it applies an
+//! [`Effect::Invalidate`](crate::effect::Effect::Invalidate) from an
+//! [`Invalidate`](crate::rules::Invalidate) rule: an invalidation cap
+//! (`too_high`/`too_low`) was crossed, so the setup is dead. If it's set the enter
+//! is done — same "read a driver-stamped fact, emit nothing" shape as
+//! `entry_outcome`, but plan-scoped (one invalidation retires the whole plan)
+//! rather than rule-id-scoped. It is `StopNextEntry`-only: it blocks entry, it
+//! never closes a position (single-shot, no position management yet).
+//!
 //! # NO catch-up / late-entry logic here (it's the driver's job)
 //!
 //! The enter emits `PlaceOrder` on **every** bar its preconditions hold — it does
@@ -67,7 +79,7 @@ use trade_control_core::plan_eval::FiredIntent;
 
 use crate::PlanRule;
 use crate::effect::Effect;
-use crate::facts::{EntryOutcome, FactKind};
+use crate::facts::{EntryOutcome, FactKind, Invalidated, PLAN_SCOPE};
 use crate::rule::Rule;
 use crate::world::World;
 
@@ -100,6 +112,17 @@ impl Rule for Enter<'_> {
         // a geometry `LineName`) — so this uses the by-name accessor. See the
         // `entry_outcome` note above and `facts` on the two namespaces.
         if w.facts.is_set_named(&self.rule.id, EntryOutcome::NAME) {
+            return Vec::new();
+        }
+
+        // Second fire-once guard: if the plan has been RETIRED — an invalidation
+        // cap (`too_high`/`too_low`) was crossed and the driver stamped
+        // `(PLAN_SCOPE, "invalidated")` — the setup's thesis is dead. The enter is
+        // done and never places, even if its preps would otherwise be satisfied.
+        // Plan-scoped (not rule-id-scoped like `entry_outcome`) because one
+        // invalidation retires the whole plan. StopNextEntry-only: this blocks the
+        // entry; nothing here closes a position (v2 is single-shot).
+        if w.facts.is_set_named(PLAN_SCOPE, Invalidated::NAME) {
             return Vec::new();
         }
 

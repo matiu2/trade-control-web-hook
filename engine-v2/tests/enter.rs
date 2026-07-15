@@ -393,6 +393,32 @@ fn no_prep_enter_places_immediately() {
     );
 }
 
+/// Second fire-once guard: a no-prep enter that WOULD place immediately does
+/// **not** place when the plan is retired — the plan-scoped `(__plan__,
+/// "invalidated")` fact is set (as the driver stamps it on an `Effect::Invalidate`
+/// from an invalidation cap). The enter is done, StopNextEntry-only.
+#[test]
+fn retired_plan_blocks_the_enter() {
+    let plan = enter_only_plan(
+        "EUR_USD",
+        enter_rule("EUR_USD", PrepMap::new(), EntryMechanism::Stop),
+    );
+    let mut facts = Facts::new();
+    // Simulate a prior invalidation-cap cross: the driver stamped the retire fact.
+    facts.set_named(
+        "__plan__",
+        "invalidated",
+        FactValue::At(ts("2026-06-01T00:00:00Z")),
+    );
+
+    let bar = a_bar();
+    let fires = tick_once(&plan, &mut facts, &[bar], bar.time, true);
+    assert!(
+        place_orders(&fires).is_empty(),
+        "a retired plan blocks the enter even with satisfied (empty) preps",
+    );
+}
+
 /// Catch-up safety (interim): the chain is complete but this is a **backlog** bar
 /// (`latest_bar = false`), so the driver drops the `PlaceOrder`. The enter does
 /// not go quiet on its own (that is driven by a driver-stamped `entry_outcome`,
