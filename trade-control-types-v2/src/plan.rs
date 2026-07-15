@@ -125,6 +125,13 @@ pub enum RuleKind {
     /// retire path), blocking any pending entry. Bound to the `Expiry` marker by
     /// the kind, same as the caps bind their level.
     Expiry,
+    /// Economic-news **entry pause**. Each tick it recomputes whether `now` is
+    /// inside any of the plan's [`pause_windows`](TradePlan::pause_windows) and
+    /// maintains the plan-scoped `paused` flag. While the flag is set the enter is
+    /// blocked (the 8h/3h standoff); it clears automatically at the window's end
+    /// (the event), so the trade resumes. Unlike the retire rules this is
+    /// **non-terminal** — it toggles, it never retires the plan.
+    Pause,
 }
 
 /// A rule as **plan data** — it says how the cross is tested (`bar`/`dir`), what
