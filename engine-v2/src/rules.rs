@@ -11,11 +11,13 @@ mod break_and_close;
 mod enter;
 mod expiry;
 mod invalidate;
+mod pause;
 mod retest;
 pub use break_and_close::BreakAndClose;
 pub use enter::Enter;
 pub use expiry::Expiry;
 pub use invalidate::Invalidate;
+pub use pause::Pause;
 pub use retest::Retest;
 
 use crate::{PlanRule, RuleKind};
@@ -46,4 +48,9 @@ pub fn is_invalidate(rule: &PlanRule) -> bool {
 /// Is this rule the trade-expiry?
 pub fn is_expiry(rule: &PlanRule) -> bool {
     rule.kind == RuleKind::Expiry
+}
+
+/// Is this rule the economic-news entry pause?
+pub fn is_pause(rule: &PlanRule) -> bool {
+    rule.kind == RuleKind::Pause
 }

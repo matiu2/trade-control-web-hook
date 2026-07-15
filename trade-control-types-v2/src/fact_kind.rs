@@ -80,9 +80,27 @@ impl FactKind for Invalidated {
     const NAME: &'static str = "invalidated";
 }
 
+/// `paused` — the plan's **entry-pause** flag (shared fact, keyed by
+/// [`PLAN_SCOPE`]). A [`FactValue::Flag`](../../trade_control_engine_v2/facts/enum.FactValue.html)
+/// (bool), **not** an `At`: `Flag(true)` while `now` is inside an economic-news
+/// pause window, `Flag(false)` once outside. Written by the
+/// [`Pause`](../../trade_control_engine_v2/rules/struct.Pause.html) rule and read
+/// by the enter as a **third guard** (block, do not place, while paused).
+///
+/// # Not latching, unlike [`Invalidated`]
+///
+/// The retire fact is set once and never clears (the plan is dead). `paused`
+/// **toggles** — the pause window opens and then closes at the event, so the enter
+/// resumes automatically. This is the one non-terminal plan-scoped fact: it tracks
+/// live window membership, it doesn't record a milestone.
+pub struct Paused;
+impl FactKind for Paused {
+    const NAME: &'static str = "paused";
+}
+
 /// The reserved "line" slot for **plan-scoped** shared facts — facts about the
 /// whole plan rather than a single line. Chosen with surrounding double
 /// underscores so it can never collide with a real [`LineName`](crate::LineName)
-/// (`"neckline"`/`"too_high"`/…) or an operator-assigned rule id. Used today by
-/// the [`Invalidated`] retire fact.
+/// (`"neckline"`/`"too_high"`/…) or an operator-assigned rule id. Used by the
+/// [`Invalidated`] retire fact and the [`Paused`] entry-pause flag.
 pub const PLAN_SCOPE: &str = "__plan__";

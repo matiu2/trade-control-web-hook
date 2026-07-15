@@ -53,7 +53,7 @@ use trade_control_core::broker::Candle;
 use crate::effect::Effect;
 use crate::facts::{FactKind, FactValue, Facts, Invalidated, PLAN_SCOPE};
 use crate::rule::Rule;
-use crate::rules::{BreakAndClose, Enter, Expiry, Invalidate, Retest};
+use crate::rules::{BreakAndClose, Enter, Expiry, Invalidate, Pause, Retest};
 use crate::world::World;
 // The `Expiry` LineName marker and the `Expiry` rule share a name — alias the
 // marker so `Expiry::<ExpiryMarker>` in `tick_rule` reads unambiguously.
@@ -161,6 +161,9 @@ fn tick_rule(rule: &PlanRule, world: &World) -> Vec<Effect> {
         // Trade-expiry binds the `Expiry` `TimeMarker` — a wall-clock cutoff,
         // crossed by `candle.time >= marker` (no price) inside the rule.
         RuleKind::Expiry => Expiry::<ExpiryMarker>::new(rule).tick(world),
+        // The news entry-pause reads plan-level `pause_windows` (no geometry
+        // type), toggling the `paused` flag against wall-clock `now`.
+        RuleKind::Pause => Pause::new(rule).tick(world),
     }
 }
 

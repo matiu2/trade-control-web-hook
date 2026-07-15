@@ -61,8 +61,8 @@ mod rules;
 // surface and needn't depend on the types crate directly.
 pub use trade_control_types_v2::{
     BreakClose, EntryMechanism, EntryOutcome, Expiry, FactKind, LastClose, Line, LineName,
-    Neckline, PlanRule, PrepMap, PriceLevel, Retest as RetestFact, RuleKind, TimeMarker, TooHigh,
-    TooLow, TradePlan,
+    Neckline, NewsWindow, PlanRule, PrepMap, PriceLevel, Retest as RetestFact, RuleKind,
+    TimeMarker, TooHigh, TooLow, TradePlan,
 };
 
 pub use driver::tick_once;
@@ -74,7 +74,7 @@ pub use rule::Rule;
 // `TimeMarker` marker (re-exported above), mirroring how the fact `Retest` is
 // `RetestFact` while the rule keeps the bare `Retest`.
 pub use rules::{
-    BreakAndClose, Enter, Expiry as ExpiryRule, Invalidate, Retest, is_break_and_close, is_enter,
-    is_expiry, is_invalidate, is_retest,
+    BreakAndClose, Enter, Expiry as ExpiryRule, Invalidate, Pause, Retest, is_break_and_close,
+    is_enter, is_expiry, is_invalidate, is_pause, is_retest,
 };
 pub use world::World;

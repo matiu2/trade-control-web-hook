@@ -65,6 +65,16 @@
 //! rather than rule-id-scoped. It is `StopNextEntry`-only: it blocks entry, it
 //! never closes a position (single-shot, no position management yet).
 //!
+//! # Third guard — economic-news PAUSE (temporary, not terminal)
+//!
+//! The enter also reads the plan-scoped [`Paused`](crate::facts::Paused) flag,
+//! toggled by the [`Pause`](crate::rules::Pause) rule while `now` is inside an
+//! economic-news standoff window. Unlike the two guards above this is **not** a
+//! done/fire-once state: the flag *clears* at the window's end, so the enter is
+//! live again on the next tick and places if its preps still hold (v1's "entries
+//! resume at the event time"). Also `StopNextEntry`-only — a pause blocks the
+//! entry, never closes a position.
+//!
 //! # NO catch-up / late-entry logic here (it's the driver's job)
 //!
 //! The enter emits `PlaceOrder` on **every** bar its preconditions hold — it does
@@ -79,7 +89,7 @@ use trade_control_core::plan_eval::FiredIntent;
 
 use crate::PlanRule;
 use crate::effect::Effect;
-use crate::facts::{EntryOutcome, FactKind, Invalidated, PLAN_SCOPE};
+use crate::facts::{EntryOutcome, FactKind, Invalidated, PLAN_SCOPE, Paused};
 use crate::rule::Rule;
 use crate::world::World;
 
@@ -123,6 +133,19 @@ impl Rule for Enter<'_> {
         // invalidation retires the whole plan. StopNextEntry-only: this blocks the
         // entry; nothing here closes a position (v2 is single-shot).
         if w.facts.is_set_named(PLAN_SCOPE, Invalidated::NAME) {
+            return Vec::new();
+        }
+
+        // Third guard — economic-news PAUSE (temporary, NOT terminal). While the
+        // plan-scoped `paused` flag is `Flag(true)` — `now` is inside a news-event
+        // standoff window, maintained by the `Pause` rule — the enter does not
+        // place. Unlike the two guards above this is **not** a done/fire-once state:
+        // the flag clears at the window's end, and on the next tick the enter is
+        // live again and places if its preps still hold (v1's "entries resume at the
+        // event time"). StopNextEntry-only: it blocks the entry, never closes a
+        // position. A cleared or never-set flag (`Some(false)` / `None`) is "not
+        // paused".
+        if w.facts.flag_named(PLAN_SCOPE, Paused::NAME) == Some(true) {
             return Vec::new();
         }
 
