@@ -411,7 +411,7 @@ fn evaluate_controls(
             state,
             candle,
             window,
-            plan.cross_buffer_pct,
+            resolve_cross_buffer(plan, window),
             now,
             plan.granularity,
         ) {
@@ -460,13 +460,13 @@ fn control_rule_fires(
     state: &mut PlanState,
     candle: &Candle,
     window: &[Candle],
-    buffer_pct: f64,
+    buffer: CrossBuffer,
     now: DateTime<Utc>,
     granularity: Granularity,
 ) -> bool {
     match rule.trigger {
         Trigger::TimeReached { at_epoch } => now.timestamp() >= at_epoch,
-        _ => fire_rule(rule, state, candle, window, buffer_pct, granularity),
+        _ => fire_rule(rule, state, candle, window, buffer, granularity),
     }
 }
 
@@ -539,7 +539,7 @@ fn evaluate_guards(
                     state,
                     candle,
                     window,
-                    plan.cross_buffer_pct,
+                    resolve_cross_buffer(plan, window),
                     plan.granularity,
                 ) {
                     continue;
@@ -601,7 +601,7 @@ fn evaluate_break_and_close(
         state,
         candle,
         window,
-        plan.cross_buffer_pct,
+        resolve_cross_buffer(plan, window),
         plan.granularity,
     ) {
         state.fired.insert(rule.rule_id.clone());
@@ -760,7 +760,7 @@ fn evaluate_one_entry(
                 state,
                 candle,
                 detector_window,
-                plan.cross_buffer_pct,
+                resolve_cross_buffer(plan, detector_window),
                 plan.granularity,
             ) {
                 return;
@@ -1397,7 +1397,7 @@ fn stamp_retest(
             candle,
             refs,
             window,
-            plan.cross_buffer_pct,
+            resolve_cross_buffer(plan, window),
             tol,
         )
     {
@@ -1527,13 +1527,13 @@ fn retest_crossed(
     candle: &Candle,
     refs: OnCloseRefs,
     window: &[Candle],
-    buffer_pct: f64,
+    buffer: CrossBuffer,
     tol: f64,
 ) -> bool {
     // With no slack, defer to the shared evaluator (single source of truth for
     // the strict cross, buffer, and OnClose/Either arms).
     if tol <= 0.0 {
-        return eval_trigger(trigger, candle, refs, window, buffer_pct);
+        return eval_trigger(trigger, candle, refs, window, buffer);
     }
     // Resolve the crossed level. Only trendline / horizontal / price-value
     // crosses have a level; anything else falls back to the strict evaluator.
@@ -1554,7 +1554,7 @@ fn retest_crossed(
             };
             (level, *dir, *bar)
         }
-        _ => return eval_trigger(trigger, candle, refs, window, buffer_pct),
+        _ => return eval_trigger(trigger, candle, refs, window, buffer),
     };
     // The closeness tolerance only loosens the *intrabar directional* arm; an
     // OnClose or Either retest keeps its exact semantics.
@@ -1567,7 +1567,7 @@ fn retest_crossed(
             CrossDir::Up => candle.h >= level - tol,
             CrossDir::Either => candle.l <= level + tol && candle.h >= level - tol,
         },
-        BarEvent::OnClose => level_crossed(level, dir, bar, candle, refs, buffer_pct),
+        BarEvent::OnClose => level_crossed(level, dir, bar, candle, refs, buffer),
     }
 }
 
@@ -1747,7 +1747,7 @@ fn fire_rule(
     state: &mut PlanState,
     candle: &Candle,
     window: &[Candle],
-    buffer_pct: f64,
+    buffer: CrossBuffer,
     granularity: Granularity,
 ) -> bool {
     // Record the origin side BEFORE evaluating, so the very first bar a rule
@@ -1765,7 +1765,7 @@ fn fire_rule(
         prev_close: state.last_close.get(&rule.rule_id).copied(),
         settled: rule.intent.action != Action::Enter,
     };
-    let hit = eval_trigger(&rule.trigger, candle, refs, window, buffer_pct);
+    let hit = eval_trigger(&rule.trigger, candle, refs, window, buffer);
     // Persist last_close BEFORE the spread-hour gate: an entry OnClose cross's
     // edge detection reads it, and a spread-hour bar must still seed it so the
     // next clean bar's cross is measured correctly. The suppression gates the
@@ -1862,12 +1862,12 @@ fn eval_trigger(
     candle: &Candle,
     refs: OnCloseRefs,
     window: &[Candle],
-    buffer_pct: f64,
+    buffer: CrossBuffer,
 ) -> bool {
     match trigger {
         Trigger::HorizontalCross { level, dir, bar }
         | Trigger::PriceValueCross { level, dir, bar } => {
-            level_crossed(*level, *dir, *bar, candle, refs, buffer_pct)
+            level_crossed(*level, *dir, *bar, candle, refs, buffer)
         }
         Trigger::TrendlineCross {
             a,
@@ -1881,7 +1881,7 @@ fn eval_trigger(
             else {
                 return false;
             };
-            level_crossed(level, *dir, *bar, candle, refs, buffer_pct)
+            level_crossed(level, *dir, *bar, candle, refs, buffer)
         }
         Trigger::TimeReached { at_epoch } => candle.time.timestamp() >= *at_epoch,
         // The M/W heartbeat fires on every closed bar — the wrapper feeds only
@@ -1917,11 +1917,55 @@ struct OnCloseRefs {
     settled: bool,
 }
 
+/// The cross-depth buffer split into its two additive terms. The absolute buffer
+/// distance a cross must clear past a line at price `level` is
+/// `level·pct/100 + atr_abs`:
+/// - `pct` is a **percent of the crossed level's price** (volatility-blind);
+/// - `atr_abs` is a pre-resolved **absolute** price distance = `cross_buffer_atr
+///   × ATR` (self-scaling with volatility). It's level-independent, so it can be
+///   resolved once outside `level_crossed` even for a `TrendlineCross` whose
+///   level is only known inside.
+///
+/// Either term may be `0.0`; both `0.0` reproduces the bare line.
+#[derive(Debug, Clone, Copy, Default)]
+struct CrossBuffer {
+    pct: f64,
+    atr_abs: f64,
+}
+
+impl CrossBuffer {
+    /// The absolute buffer distance (price units) at a line priced `level`.
+    fn at(&self, level: f64) -> f64 {
+        level * self.pct / 100.0 + self.atr_abs
+    }
+}
+
+/// Resolve the plan's cross buffer for this bar: the percent term verbatim, plus
+/// the ATR term `cross_buffer_atr × ATR` as an absolute distance. The ATR
+/// (`atr_length_for(granularity)` over `window`) **degrades to 0.0** for the ATR
+/// term when it can't be computed (window too short) — the percent term still
+/// applies, and the whole thing is fail-soft like the retest tolerance (no
+/// panic). When `cross_buffer_atr` is 0.0 (the default) the ATR isn't consulted.
+fn resolve_cross_buffer(plan: &TradePlan, window: &[Candle]) -> CrossBuffer {
+    let atr_abs = if plan.cross_buffer_atr != 0.0 {
+        wilder_atr(window, atr_length_for(plan.granularity))
+            .map(|atr| plan.cross_buffer_atr * atr)
+            .unwrap_or(0.0)
+    } else {
+        0.0
+    };
+    CrossBuffer {
+        pct: plan.cross_buffer_pct,
+        atr_abs,
+    }
+}
+
 /// Did `candle` cross `level` in direction `dir` under the bar-event mode?
 ///
-/// `buffer_pct` is a cross-depth buffer as a percent of `level`'s price. It
-/// widens the raw line into a **zone** `[level - buffer, level + buffer]`, so a
-/// wick or close that only grazes the line doesn't count as a cross:
+/// `buffer` is a cross-depth buffer ([`CrossBuffer`]: a percent-of-`level` term
+/// plus an absolute ATR term). It widens the raw line into a **zone**
+/// `[level - buffer, level + buffer]`, so a wick or close that only grazes the
+/// line doesn't count as a cross:
 ///
 /// - *Intrabar* directional cross — the wick must pierce at least `buffer` past
 ///   the line (below for `Down`, above for `Up`); `Either` ignores it (a bare
@@ -1945,11 +1989,11 @@ fn level_crossed(
     bar: BarEvent,
     candle: &Candle,
     refs: OnCloseRefs,
-    buffer_pct: f64,
+    buffer: CrossBuffer,
 ) -> bool {
-    // The depth the wick must reach past the line. `level` is positive (a price)
-    // and `buffer_pct` is small; a 0.0 buffer collapses to the raw level.
-    let buffer = level * buffer_pct / 100.0;
+    // The depth the wick must reach past the line: the percent-of-level term plus
+    // the absolute ATR term. A zero buffer collapses to the raw level.
+    let buffer = buffer.at(level);
     match bar {
         // Intrabar: the bar's range crosses the level *within the bar*, read
         // from the wick — NOT the close, and (as of 2026-07-03) NOT the open
@@ -2283,7 +2327,7 @@ mod tests {
         // side of the line the plan started on) — these tests assert the
         // SETTLED/origin semantics (break-and-close & vetos). Ignored by
         // intrabar/time/mw triggers. No cross buffer here — the raw geometry.
-        eval_trigger(trigger, candle, settled_origin(origin), &[], 0.0)
+        eval_trigger(trigger, candle, settled_origin(origin), &[], pct(0.0))
     }
 
     /// Settled/origin `OnCloseRefs` for the unit cross tests (break-and-close &
@@ -2304,6 +2348,12 @@ mod tests {
             prev_close,
             settled: false,
         }
+    }
+
+    /// A percent-only `CrossBuffer` for the unit cross tests (the ATR term is
+    /// exercised separately by the plan-level tests).
+    fn pct(pct: f64) -> CrossBuffer {
+        CrossBuffer { pct, atr_abs: 0.0 }
     }
 
     /// A minimal intent carrying just the action the evaluator reads; the rest
@@ -2424,6 +2474,7 @@ mod tests {
             rules,
             shadow: false,
             cross_buffer_pct: 0.0,
+            cross_buffer_atr: 0.0,
             retest_atr_step: trade_control_core::trade_plan::DEFAULT_RETEST_ATR_STEP,
             replay_start: None,
             armed_at: None,
@@ -2557,17 +2608,17 @@ mod tests {
         let above = candle("2026-06-16T12:00:00Z", 1.2010, 1.2050, 1.2005, 1.2030);
         // Transition bar: prev close below → this close above → fires.
         assert!(
-            eval_trigger(&up, &above, edge_prev(Some(1.1990)), &[], 0.0),
+            eval_trigger(&up, &above, edge_prev(Some(1.1990)), &[], pct(0.0)),
             "edge fires when the prior close was below and this close is above"
         );
         // Already-above bar: prev close already above → NO fire (the whole point
         // of edge mode for a multi-shot entry).
         assert!(
-            !eval_trigger(&up, &above, edge_prev(Some(1.2010)), &[], 0.0),
+            !eval_trigger(&up, &above, edge_prev(Some(1.2010)), &[], pct(0.0)),
             "edge does NOT re-fire when the prior close was already above"
         );
         // Seed (no prev close) → never fires.
-        assert!(!eval_trigger(&up, &above, edge_prev(None), &[], 0.0));
+        assert!(!eval_trigger(&up, &above, edge_prev(None), &[], pct(0.0)));
     }
 
     #[test]
@@ -2639,6 +2690,61 @@ mod tests {
         ));
     }
 
+    /// `CrossBuffer::at` sums the percent-of-level term and the absolute ATR
+    /// term: `level·pct/100 + atr_abs`.
+    #[test]
+    fn cross_buffer_sums_pct_and_atr_terms() {
+        let b = CrossBuffer {
+            pct: 0.02,
+            atr_abs: 0.0005,
+        };
+        // level 1.2000: pct term 1.2000*0.02/100 = 0.00024; + 0.0005 = 0.00074.
+        assert!(
+            (b.at(1.2000) - 0.00074).abs() < 1e-9,
+            "got {}",
+            b.at(1.2000)
+        );
+        // pct term scales with level; atr term does not.
+        assert!((b.at(2.4000) - (0.00048 + 0.0005)).abs() < 1e-9);
+        // Percent-only and ATR-only collapse cleanly.
+        assert!((pct(0.02).at(1.2000) - 0.00024).abs() < 1e-9);
+        let atr_only = CrossBuffer {
+            pct: 0.0,
+            atr_abs: 0.0005,
+        };
+        assert!((atr_only.at(1.2000) - 0.0005).abs() < 1e-9);
+    }
+
+    /// `resolve_cross_buffer`: the ATR term is `cross_buffer_atr × ATR`; the pct
+    /// term is passed through; a too-short window degrades the ATR term to 0.0
+    /// (the pct term survives), and `cross_buffer_atr == 0` skips the ATR entirely.
+    #[test]
+    fn resolve_cross_buffer_atr_term_and_degrade() {
+        let first = ts("2026-06-01T00:00:00Z").timestamp();
+        // 24 warm H1 bars → ATR 0.010 (warm_atr_window builds TR 0.010 flat).
+        let window = warm_atr_window(24, first);
+        let mut p = plan(vec![]);
+        p.granularity = Granularity::H1; // atr_length_for(H1) = 24
+        p.cross_buffer_pct = 0.02;
+        p.cross_buffer_atr = 0.15;
+        let b = resolve_cross_buffer(&p, &window);
+        assert!((b.pct - 0.02).abs() < 1e-12, "pct passed through");
+        assert!(
+            (b.atr_abs - 0.15 * 0.010).abs() < 1e-9,
+            "atr term = 0.15 × ATR(0.010), got {}",
+            b.atr_abs
+        );
+        // Too-short window → ATR None → atr term degrades to 0.0, pct survives.
+        let short = warm_atr_window(3, first);
+        let b2 = resolve_cross_buffer(&p, &short);
+        assert!((b2.pct - 0.02).abs() < 1e-12);
+        assert!(b2.atr_abs.abs() < 1e-12, "short window → atr term 0.0");
+        // cross_buffer_atr == 0 → ATR never consulted, atr term 0.0.
+        p.cross_buffer_atr = 0.0;
+        let b3 = resolve_cross_buffer(&p, &window);
+        assert!(b3.atr_abs.abs() < 1e-12);
+    }
+
     /// The cross-depth buffer rejects a graze: with `buffer_pct = 0.1` the wick
     /// must pierce `level * 0.1% = 1.2 * 0.001 = 0.0012` past the line. A down
     /// graze to 1.1995 (only 0.0005 below) does NOT fire; a dip to 1.1980
@@ -2656,16 +2762,22 @@ mod tests {
         let real = candle("2026-06-16T12:00:00Z", 1.2010, 1.2010, 1.1980, 1.2005);
 
         // No buffer (0.0) → both fire (bare wick touch).
-        assert!(eval_trigger(&t, &graze, settled_origin(None), &[], 0.0));
-        assert!(eval_trigger(&t, &real, settled_origin(None), &[], 0.0));
+        assert!(eval_trigger(
+            &t,
+            &graze,
+            settled_origin(None),
+            &[],
+            pct(0.0)
+        ));
+        assert!(eval_trigger(&t, &real, settled_origin(None), &[], pct(0.0)));
 
         // 0.1% buffer → the graze is rejected, the real cross still fires.
         assert!(
-            !eval_trigger(&t, &graze, settled_origin(None), &[], 0.1),
+            !eval_trigger(&t, &graze, settled_origin(None), &[], pct(0.1)),
             "a 5-pip graze (< 0.0012 buffer) must not count as a cross"
         );
         assert!(
-            eval_trigger(&t, &real, settled_origin(None), &[], 0.1),
+            eval_trigger(&t, &real, settled_origin(None), &[], pct(0.1)),
             "a 20-pip dip (> 0.0012 buffer) is a real cross"
         );
     }
@@ -2681,8 +2793,14 @@ mod tests {
         // Opened below; buffer = 0.0012 → need high ≥ 1.2012.
         let graze = candle("2026-06-16T12:00:00Z", 1.1990, 1.2005, 1.1990, 1.1995);
         let real = candle("2026-06-16T12:00:00Z", 1.1990, 1.2020, 1.1990, 1.1995);
-        assert!(!eval_trigger(&t, &graze, settled_origin(None), &[], 0.1));
-        assert!(eval_trigger(&t, &real, settled_origin(None), &[], 0.1));
+        assert!(!eval_trigger(
+            &t,
+            &graze,
+            settled_origin(None),
+            &[],
+            pct(0.1)
+        ));
+        assert!(eval_trigger(&t, &real, settled_origin(None), &[], pct(0.1)));
     }
 
     /// The intrabar buffer applies only to directional crosses, not `Either`
@@ -2698,7 +2816,7 @@ mod tests {
             bar: BarEvent::Intrabar,
         };
         assert!(
-            eval_trigger(&either, &graze, settled_origin(None), &[], 0.1),
+            eval_trigger(&either, &graze, settled_origin(None), &[], pct(0.1)),
             "Either fires on any straddle regardless of the buffer"
         );
     }
@@ -2719,7 +2837,7 @@ mod tests {
             &closed_below,
             settled_origin(Some(1.2010)),
             &[],
-            0.0
+            pct(0.0)
         ));
     }
 
@@ -2740,7 +2858,13 @@ mod tests {
         // "must reach the far edge" half that preserves the zone fix.
         let near_dip = candle("2026-06-16T12:00:00Z", 1.2030, 1.2030, 1.1990, 1.2001);
         assert!(
-            !eval_trigger(&down, &near_dip, settled_origin(Some(1.2030)), &[], 0.1),
+            !eval_trigger(
+                &down,
+                &near_dip,
+                settled_origin(Some(1.2030)),
+                &[],
+                pct(0.1)
+            ),
             "a close inside the zone (near side) is not yet a break"
         );
         // Bar 2 (same origin above the line): closes well below the lower edge —
@@ -2749,7 +2873,13 @@ mod tests {
         // and blocked this; under origin-side there's nothing to poison.
         let breakthrough = candle("2026-06-16T13:00:00Z", 1.2001, 1.2005, 1.1950, 1.1955);
         assert!(
-            eval_trigger(&down, &breakthrough, settled_origin(Some(1.2030)), &[], 0.1),
+            eval_trigger(
+                &down,
+                &breakthrough,
+                settled_origin(Some(1.2030)),
+                &[],
+                pct(0.1)
+            ),
             "a close below the lower zone edge after a near-side dip fires the break"
         );
     }
@@ -2771,7 +2901,7 @@ mod tests {
             &into_zone,
             settled_origin(Some(1.2030)),
             &[],
-            0.1
+            pct(0.1)
         ));
         // Same bar but closing past the lower edge → fires.
         let through = candle("2026-06-16T12:00:00Z", 1.2030, 1.2030, 1.1980, 1.1985);
@@ -2780,7 +2910,7 @@ mod tests {
             &through,
             settled_origin(Some(1.2030)),
             &[],
-            0.1
+            pct(0.1)
         ));
     }
 
@@ -2849,7 +2979,7 @@ mod tests {
             l: 1.4,
             c: 1.55,
         };
-        assert!(eval_trigger(&t, &c, settled_origin(None), &win, 0.0));
+        assert!(eval_trigger(&t, &c, settled_origin(None), &win, pct(0.0)));
     }
 
     /// The core of the bug: a session gap must NOT slide the line. Bars are
@@ -2888,12 +3018,18 @@ mod tests {
         // one straddling only ~1.04 (the wall-clock level) does NOT.
         let at_index_level = candle("2026-06-16T14:00:00Z", 1.45, 1.55, 1.45, 1.52);
         assert!(
-            eval_trigger(&t, &at_index_level, settled_origin(None), &win, 0.0),
+            eval_trigger(&t, &at_index_level, settled_origin(None), &win, pct(0.0)),
             "bar-index level at bar 1 is 1.50 → straddle fires"
         );
         let at_wallclock_level = candle("2026-06-16T14:00:00Z", 1.0, 1.08, 1.0, 1.05);
         assert!(
-            !eval_trigger(&t, &at_wallclock_level, settled_origin(None), &win, 0.0),
+            !eval_trigger(
+                &t,
+                &at_wallclock_level,
+                settled_origin(None),
+                &win,
+                pct(0.0)
+            ),
             "the old wall-clock level (~1.04) must NOT be where the line sits"
         );
         let _ = day1b;
@@ -2927,11 +3063,11 @@ mod tests {
             c: 1.0,
         };
         assert!(
-            !eval_trigger(&mk(false), &c, settled_origin(None), &win, 0.0),
+            !eval_trigger(&mk(false), &c, settled_origin(None), &win, pct(0.0)),
             "no eval past anchor when not extended"
         );
         assert!(
-            eval_trigger(&mk(true), &c, settled_origin(None), &win, 0.0),
+            eval_trigger(&mk(true), &c, settled_origin(None), &win, pct(0.0)),
             "extended → still evaluates"
         );
     }

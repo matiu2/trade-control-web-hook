@@ -378,6 +378,18 @@ pub fn run(args: Args) -> Result<i32> {
         // operator, and baked onto the plan for after-the-fact journalling only.
         // Fail-soft — a fetch failure yields `None` and never blocks arming.
         let armed_at = effective_arm_time(start, now);
+        // `--cross-buffer-pct` is deprecated in favour of the volatility-relative
+        // `--cross-buffer-atr`. If the operator still passes it, honour it (it's
+        // summed on top of the ATR term) but warn — a fixed % of price is
+        // volatility-blind and easy to mis-size across instruments.
+        if let Some(pct) = args.cross_buffer_pct {
+            tracing::warn!(
+                cross_buffer_pct = pct,
+                "--cross-buffer-pct is DEPRECATED (a fixed % of price is \
+                 volatility-blind); prefer --cross-buffer-atr. The percent term is \
+                 summed on top of the ATR term for this arm."
+            );
+        }
         let armed_sentiment = crate::sentiment::arm_time_sentiment(
             &resolved.asset.id,
             &resolved.asset.news_currencies,
@@ -401,6 +413,8 @@ pub fn run(args: Args) -> Result<i32> {
                 .unwrap_or(trade_control_core::trade_plan::DEFAULT_RETEST_ATR_STEP),
             args.cross_buffer_pct
                 .unwrap_or(trade_control_core::trade_plan::DEFAULT_CROSS_BUFFER_PCT),
+            args.cross_buffer_atr
+                .unwrap_or(trade_control_core::trade_plan::DEFAULT_CROSS_BUFFER_ATR),
             armed_sentiment,
         )?;
     }
@@ -1987,6 +2001,7 @@ fn register_trade_plan(
     replay_start: Option<i64>,
     retest_atr_step: f64,
     cross_buffer_pct: f64,
+    cross_buffer_atr: f64,
     armed_sentiment: Option<trade_control_core::plan_sentiment::PlanSentiment>,
 ) -> Result<()> {
     use cli::TradePattern;
@@ -2014,6 +2029,7 @@ fn register_trade_plan(
         replay_start,
         retest_atr_step,
         cross_buffer_pct,
+        cross_buffer_atr,
         armed_at,
         armed_sentiment,
     );
@@ -2680,6 +2696,7 @@ mod tests {
             None,
             trade_control_core::trade_plan::DEFAULT_RETEST_ATR_STEP,
             trade_control_core::trade_plan::DEFAULT_CROSS_BUFFER_PCT,
+            trade_control_core::trade_plan::DEFAULT_CROSS_BUFFER_ATR,
             chrono::Utc::now(),
             None,
         )

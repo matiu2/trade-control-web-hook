@@ -354,18 +354,26 @@ pub struct Args {
     #[arg(long)]
     pub retest_atr_step: Option<f64>,
 
-    /// Cross-depth buffer, as a **percent of the crossed level's price** (default
-    /// 0.02 = 0.02%). Widens each line into a zone `[level ± (pct/100)·level]` so
-    /// a graze doesn't count: an intrabar directional cross must pierce `pct%`
-    /// past the line, and an `OnClose` break must **close** past the far zone
-    /// edge. Lower = more sensitive (a smaller move counts as a break); `0`
-    /// restores the bare wick/close-touch behaviour. Bakes onto the signed plan's
-    /// `cross_buffer_pct`. Raise it to reject noisy one-tick breaks; lower it when
-    /// a genuine break closed only just past the line and the default buffer ate
-    /// it (e.g. EUR/GBP 2026-07-15, close 0.7p above a neckline the 1.7p buffer
-    /// rejected).
-    #[arg(long)]
+    /// **DEPRECATED** (2026-07-15) — use `--cross-buffer-atr` instead. Cross-depth
+    /// buffer as a **percent of the crossed level's price**. Volatility-blind: the
+    /// same 0.02% is ~1.7p on EUR/GBP but a very different pip count on Gold or an
+    /// index, so it's been superseded by the ATR-relative buffer. **Defaults to 0
+    /// (off)** now — pass this only to deliberately add a fixed percent term on top
+    /// of the ATR buffer; a deprecation warning is logged when you do. Bakes onto
+    /// the signed plan's `cross_buffer_pct`. Hidden from `--help`.
+    #[arg(long, hide = true)]
     pub cross_buffer_pct: Option<f64>,
+
+    /// **ATR-fraction** cross buffer (default 0 = off) — the preferred cross
+    /// buffer. The buffer a cross must clear is `atr·ATR`, where `ATR` is the
+    /// Wilder ATR at the current bar. **Self-scales with the instrument's
+    /// volatility** — one value (e.g. `0.15` = 15% of a typical bar's range) works
+    /// across EUR/GBP, Gold, indices, where a fixed % of price does not (0.1% is
+    /// ~8.5p on EUR/GBP, far too wide for a close that broke by <1p). Bakes onto
+    /// the signed plan's `cross_buffer_atr`. (A deprecated `--cross-buffer-pct`
+    /// percent term, default 0, is summed on top if you pass it.)
+    #[arg(long)]
+    pub cross_buffer_atr: Option<f64>,
 
     /// Number of trailing candles the entry SL-spread floor averages the bid-ask
     /// spread over (default 5). The floor requires `sl_distance ≥ 10 × spread`;
