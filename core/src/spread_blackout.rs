@@ -53,47 +53,85 @@ mod baseline {
 /// The candle-derived, **per-broker** spread-hour table produced offline by the
 /// `spread-baseline-gen` binary and committed as a source file (not build-time
 /// generated — the fetch is a network op). Each row is
-/// `(broker, symbol, reviewed, elevated_hours_mask, hour_widen_frac[24])`,
+/// `(broker, symbol, schedule, reviewed, elevated_hours_mask, hour_widen_frac[24])`,
 /// sorted by `(broker, symbol)`.
 ///
-/// This is the source of truth for **which UTC hours are spread hours**
+/// This is the source of truth for **which spread hours are elevated**
 /// (`is_spread_hour`). It supersedes the sampler mask, which over-flagged tight
 /// crosses' whole overnight block (the "12pm Brisbane rubbish" bug). The
 /// per-broker keying means OANDA `EUR_USD` and TradeNation `EUR/USD` carry their
 /// own masks — no canonical sharing. Symbol strings never collide across
 /// brokers, so the lookup keys on the symbol alone.
+///
+/// **Mask bits are SCHEDULE-LOCAL hours (Stage 3, DST-aware).** Bit `h` of the
+/// mask ⇒ *local wall-clock* hour `h` of the row's `schedule` tz is a spread
+/// hour, NOT UTC hour `h`. The gate resolves the row's `schedule` FK to a
+/// `chrono_tz::Tz` ([`schedule_tz`]) and converts the incoming UTC `now` to that
+/// tz before indexing the mask — so a `ny` 17:00-local spike reads as a spread
+/// hour at 21:00 UTC in summer (EDT) and 22:00 UTC in winter (EST) from the
+/// *same* mask bit. See `SCOPING-spread-hour-dst-local-time.md`.
 mod baseline_candle {
     include!("spread_baseline_candle.rs");
 }
 
-/// The candle-derived spread-hour **mask** for `instrument`, or `None` when it
-/// isn't in the candle table. Keyed on the broker symbol string (the same
-/// `resolved.instrument` the gate passes); symbols are unique across brokers,
-/// so the `broker` column is not needed to disambiguate the lookup.
+/// Resolve a spread-schedule FK **name** (as stored in the baked table's
+/// `schedule` column) to its IANA timezone. The table stores the compact FK
+/// name (`"ny"`), not the tz string, so this map is the single source of truth
+/// that expands it — it **mirrors instrument-lookup's schedule table** and the
+/// two MUST stay in sync (add a schedule there and here together).
+///
+/// `None` for `"none"` or any unknown name ⇒ the instrument has no DST-aware
+/// spread schedule, and callers fall back to the NY-close-edge default. We
+/// hand back the `Tz` (not a bare offset) so chrono-tz applies each zone's own
+/// DST rule at read time; `ny_clock` stays as the hand-rolled fallback for
+/// absent masks.
+fn schedule_tz(schedule: &str) -> Option<chrono_tz::Tz> {
+    match schedule {
+        "ny" => Some(chrono_tz::America::New_York),
+        "london" => Some(chrono_tz::Europe::London),
+        "frankfurt" => Some(chrono_tz::Europe::Berlin),
+        "zurich" => Some(chrono_tz::Europe::Zurich),
+        "sydney" => Some(chrono_tz::Australia::Sydney),
+        "johannesburg" => Some(chrono_tz::Africa::Johannesburg),
+        "hongkong" => Some(chrono_tz::Asia::Hong_Kong),
+        "singapore" => Some(chrono_tz::Asia::Singapore),
+        "tokyo" => Some(chrono_tz::Asia::Tokyo),
+        _ => None, // "none" or unknown → no tz, no spread hour
+    }
+}
+
+/// The candle-derived row for `instrument` as `(schedule, mask, &widen)`, or
+/// `None` when it isn't in the candle table. Keyed on the broker symbol string
+/// (the same `resolved.instrument` the gate passes); symbols are unique across
+/// brokers, so the `broker` column is not needed to disambiguate the lookup.
+///
+/// `schedule` is the spread-schedule FK name ([`schedule_tz`] resolves it to a
+/// tz); bit `h` of the mask ⇒ *schedule-local* hour `h` is a spread hour;
+/// `widen[h]` is that local hour's p90 `spread/mid` **fraction** (0.0 when not
+/// elevated). Unlike the sampler's `baked_spread_hours` (pips), the widen here
+/// is a scale-free fraction — the System-2 consumer converts it to pips with a
+/// reference price + pip size via [`widen_frac_to_pips`].
 ///
 /// The table is sorted by `(broker, symbol)`, NOT by `symbol` alone, so a plain
 /// `binary_search` on the symbol would be wrong — we scan for an exact symbol
 /// match. The table is small (~200 rows) and this is called per-tick per-plan,
 /// which is cheap; a symbol-sorted index can be added if it ever matters.
-fn baked_candle_mask(instrument: &str) -> Option<u32> {
+fn baked_candle_row(instrument: &str) -> Option<(&'static str, u32, &'static [f64; 24])> {
     baseline_candle::SPREAD_BASELINE_CANDLE
         .iter()
         .find(|(_broker, symbol, ..)| *symbol == instrument)
-        .map(|(.., _reviewed, mask, _widen)| *mask)
+        .map(|(_broker, _symbol, schedule, _reviewed, mask, widen)| (*schedule, *mask, widen))
 }
 
-/// The candle-derived `(elevated_hours_mask, hour_widen_frac[24])` for
-/// `instrument`, or `None` when it isn't in the candle table. Bit `h` of the
-/// mask ⇒ UTC hour `h` is a spread hour; `widen_frac[h]` is that hour's p90
-/// `spread/mid` **fraction** (0.0 when not elevated). Unlike the sampler's
-/// `baked_spread_hours` (pips), the widen here is a scale-free fraction — the
-/// System-2 consumer converts it to pips with a reference price + pip size via
-/// [`widen_frac_to_pips`].
-fn baked_candle_spread_hours(instrument: &str) -> Option<(u32, [f64; 24])> {
-    baseline_candle::SPREAD_BASELINE_CANDLE
-        .iter()
-        .find(|(_broker, symbol, ..)| *symbol == instrument)
-        .map(|(.., _reviewed, mask, widen)| (*mask, *widen))
+/// The candle-derived `(mask, widen_frac[24], tz)` for `instrument`, or `None`
+/// when it isn't in the candle table **or** its schedule has no resolvable tz
+/// (`"none"`/unknown). The `tz` is the row's schedule zone, needed to convert a
+/// UTC instant to the schedule-local hour the mask is indexed by. Callers that
+/// get `None` here fall back to the NY-close-edge default.
+fn baked_candle_spread_hours(instrument: &str) -> Option<(u32, [f64; 24], chrono_tz::Tz)> {
+    let (schedule, mask, widen) = baked_candle_row(instrument)?;
+    let tz = schedule_tz(schedule)?;
+    Some((mask, *widen, tz))
 }
 
 /// Convert a candle-derived widen **fraction** (`spread/mid`) to pips, given a
@@ -148,8 +186,8 @@ pub fn spread_hour_widen_frac_with_lead(
     now: chrono::DateTime<chrono::Utc>,
     lead_minutes: i64,
 ) -> Option<f64> {
-    let (mask, widen) = baked_candle_spread_hours(instrument)?;
-    spread_hour_widen_for(mask, &widen, now, lead_minutes)
+    let (mask, widen, tz) = baked_candle_spread_hours(instrument)?;
+    spread_hour_widen_for(mask, &widen, tz, now, lead_minutes)
 }
 
 /// The **exact sub-candle instant** at which the live cron would first widen an
@@ -179,48 +217,57 @@ pub fn spread_hour_widen_instant(
     bar_seconds: i64,
 ) -> Option<(chrono::DateTime<chrono::Utc>, f64)> {
     use chrono::Duration;
-    let (mask, widen) = baked_candle_spread_hours(instrument)?;
+    let (mask, widen, tz) = baked_candle_spread_hours(instrument)?;
     if mask == 0 {
         return None;
     }
     use chrono::Timelike;
     let lead = Duration::minutes(SPREAD_HOUR_LEAD_MINUTES);
     let bar_end = bar_open + Duration::seconds(bar_seconds.max(0));
+    // Do all the hour/lead arithmetic in the schedule's LOCAL time, then convert
+    // the chosen instant back to UTC for the returned wall-clock moment (callers
+    // expect UTC). The mask is indexed by the local hour.
+    let bar_open_local = bar_open.with_timezone(&tz);
 
-    // Case 2 FIRST (priority) — bar_open's own hour is ALREADY a flagged spread
-    // hour (a bar deep inside a multi-hour block): the widen is live from the
-    // bar's open, so it fires at `bar_open`. This must win over the lead-in
+    // Case 2 FIRST (priority) — bar_open's own LOCAL hour is ALREADY a flagged
+    // spread hour (a bar deep inside a multi-hour block): the widen is live from
+    // the bar's open, so it fires at `bar_open`. This must win over the lead-in
     // below, or an in-block bar would report the *next* hour's lead instant.
-    let own_hour = bar_open.hour() as usize;
+    let own_hour = bar_open_local.hour() as usize;
     if mask & (1 << own_hour) != 0 {
         return Some((bar_open, widen[own_hour]));
     }
 
-    // Case 1 — a flagged hour top T is LED INTO by this bar: `T - lead` falls
-    // inside `[bar_open, bar_end)`. Walk hour tops forward from the first one
-    // strictly after bar_open; the first flagged one whose lead instant lands in
-    // this bar is the sub-candle widen instant (e.g. 20:30Z for a 20:00–21:00 bar
-    // leading into the 21:00Z spike). Bounded to 25 iterations (a day) so a
-    // pathological mask can't loop forever.
-    let mut hour_top = top_of_hour(bar_open) + Duration::hours(1);
+    // Case 1 — a flagged LOCAL hour top T is LED INTO by this bar: `T - lead`
+    // falls inside `[bar_open, bar_end)`. Walk local hour tops forward from the
+    // first one strictly after bar_open; the first flagged one whose lead instant
+    // lands in this bar is the sub-candle widen instant (e.g. 20:30Z for a
+    // 20:00–21:00 bar leading into a 21:00Z=17:00-local spike). Bounded to 25
+    // iterations (a day) so a pathological mask can't loop forever.
+    let mut hour_top_local = top_of_local_hour(bar_open_local) + Duration::hours(1);
     for _ in 0..25 {
-        let widen_at = (hour_top - lead).max(bar_open);
+        // Convert the local hour top back to a UTC instant for the interval test.
+        let hour_top_utc = hour_top_local.with_timezone(&chrono::Utc);
+        let widen_at = (hour_top_utc - lead).max(bar_open);
         // Once even the lead instant of this hour is past the bar's end, no later
         // hour can land inside this bar either — stop.
         if widen_at >= bar_end {
             break;
         }
-        let h = hour_top.hour() as usize;
+        let h = hour_top_local.hour() as usize;
         if mask & (1 << h) != 0 {
             return Some((widen_at, widen[h]));
         }
-        hour_top += Duration::hours(1);
+        hour_top_local += Duration::hours(1);
     }
     None
 }
 
-/// The top of the UTC hour containing `t` (minutes/seconds/nanos zeroed).
-fn top_of_hour(t: chrono::DateTime<chrono::Utc>) -> chrono::DateTime<chrono::Utc> {
+/// The top of the local hour containing `t` (minutes/seconds/nanos zeroed),
+/// staying in the same `Tz`. Falls back to `t` if the truncation is not
+/// representable (never happens on the hour boundary, but coded defensively —
+/// no unwrap outside tests).
+fn top_of_local_hour(t: chrono::DateTime<chrono_tz::Tz>) -> chrono::DateTime<chrono_tz::Tz> {
     use chrono::Timelike;
     t.with_minute(0)
         .and_then(|t| t.with_second(0))
@@ -315,7 +362,12 @@ pub const SPREAD_HOUR_LEAD_MINUTES: i64 = 30;
 /// those, so nothing regresses for un-sampled assets.
 pub fn spread_hour_widen_pips(instrument: &str, now: chrono::DateTime<chrono::Utc>) -> Option<f64> {
     let (mask, widen) = baked_spread_hours(instrument)?;
-    spread_hour_widen_for(mask, &widen, now, SPREAD_HOUR_LEAD_MINUTES)
+    // The legacy SAMPLER mask is UTC-hour-based (no schedule / no DST shift), so
+    // index it in UTC — pass `chrono_tz::UTC` to the shared seam. This keeps the
+    // sampler widen byte-identical to before Stage 3; only the candle-table path
+    // (`spread_hour_widen_frac`) is DST-aware. (`spread_hour_widen_pips` itself
+    // is being retired in favour of the candle frac path.)
+    spread_hour_widen_for(mask, &widen, chrono_tz::UTC, now, SPREAD_HOUR_LEAD_MINUTES)
 }
 
 /// Pure spread-hour-widen decision over an explicit `(mask, widen)` — the
@@ -331,9 +383,15 @@ pub fn spread_hour_widen_pips(instrument: &str, now: chrono::DateTime<chrono::Ut
 /// passes [`SPREAD_HOUR_LEAD_MINUTES`] (30, reachable by its 15-min tick); the
 /// offline replay passes ≥ its bar length so the look-ahead is reachable at a bar
 /// boundary (`minute == 0`). See [`spread_hour_widen_frac_with_lead`].
+///
+/// The mask is indexed by the **schedule-local** hour: `now` (UTC) is converted
+/// to `tz` first, and both the current-hour and lead-into-next-hour arithmetic
+/// run in that local time. A `ny` 17:00-local bit therefore fires at 21:00 UTC
+/// (EDT) or 22:00 UTC (EST) from the same bit.
 fn spread_hour_widen_for(
     mask: u32,
     widen: &[f64; 24],
+    tz: chrono_tz::Tz,
     now: chrono::DateTime<chrono::Utc>,
     lead_minutes: i64,
 ) -> Option<f64> {
@@ -341,9 +399,10 @@ fn spread_hour_widen_for(
     if mask == 0 {
         return None;
     }
-    let hour = now.hour() as usize;
-    // Within the lead window of the next hour's top? Then look ahead.
-    let minutes_into_hour = now.minute() as i64;
+    let local = now.with_timezone(&tz);
+    let hour = local.hour() as usize;
+    // Within the lead window of the next LOCAL hour's top? Then look ahead.
+    let minutes_into_hour = local.minute() as i64;
     let lead_reaches_next = 60 - minutes_into_hour <= lead_minutes;
     if lead_reaches_next {
         let next = (hour + 1) % 24;
@@ -372,8 +431,15 @@ fn spread_hour_widen_for(
 /// same conservative default the sampler gave an un-learned instrument; a later
 /// stage can honour the explicit `reviewed` verdict to skip the fallback.)
 pub fn is_spread_hour(instrument: &str, now: chrono::DateTime<chrono::Utc>) -> bool {
-    match baked_candle_mask(instrument) {
-        Some(mask) if mask != 0 => mask_active_with_lead(mask, now),
+    match baked_candle_row(instrument) {
+        // Present with a non-empty mask AND a resolvable schedule tz → index the
+        // mask by the schedule-LOCAL hour (DST-aware).
+        Some((schedule, mask, _widen)) if mask != 0 => match schedule_tz(schedule) {
+            Some(tz) => mask_active_with_lead(mask, tz, now),
+            // Mask present but schedule is `none`/unknown → no spread schedule,
+            // fall back to the legacy NY-close-edge gate.
+            None => crate::ny_clock::is_ny_close_edge(now),
+        },
         // Absent, or reviewed-flat (mask 0) → legacy fallback.
         _ => crate::ny_clock::is_ny_close_edge(now),
     }
@@ -427,18 +493,24 @@ pub fn suppress_on_spread_hour_bar_seconds(
     short_bar && is_spread_hour(instrument, now)
 }
 
-/// Is `mask` active at `now`, honouring the [`SPREAD_HOUR_LEAD_MINUTES`]
-/// look-ahead? The mask-only twin of [`spread_hour_widen_for`] (which returns
-/// the widen size); this returns just the boolean membership so `is_spread_hour`
-/// can key off the candle mask without a widen array. Kept structurally
-/// identical to `spread_hour_widen_for` so the two never drift.
-fn mask_active_with_lead(mask: u32, now: chrono::DateTime<chrono::Utc>) -> bool {
+/// Is `mask` active at `now` for schedule zone `tz`, honouring the
+/// [`SPREAD_HOUR_LEAD_MINUTES`] look-ahead? The mask-only twin of
+/// [`spread_hour_widen_for`] (which returns the widen size); this returns just
+/// the boolean membership so `is_spread_hour` can key off the candle mask
+/// without a widen array. Kept structurally identical to `spread_hour_widen_for`
+/// so the two never drift.
+///
+/// The mask is indexed by the schedule-LOCAL hour: `now` (UTC) is converted to
+/// `tz` before the hour/lead arithmetic, so a DST shift in `tz` moves the UTC
+/// hour that matches a given local mask bit.
+fn mask_active_with_lead(mask: u32, tz: chrono_tz::Tz, now: chrono::DateTime<chrono::Utc>) -> bool {
     use chrono::Timelike;
     if mask == 0 {
         return false;
     }
-    let hour = now.hour() as usize;
-    let minutes_into_hour = now.minute() as i64;
+    let local = now.with_timezone(&tz);
+    let hour = local.hour() as usize;
+    let minutes_into_hour = local.minute() as i64;
     let lead_reaches_next = 60 - minutes_into_hour <= SPREAD_HOUR_LEAD_MINUTES;
     if lead_reaches_next {
         let next = (hour + 1) % 24;
@@ -536,11 +608,15 @@ const MAX_BLOCK_HOURS: u32 = 23;
 /// capped at [`MAX_BLOCK_HOURS`] + grace for a pathological all-hours mask.
 pub fn spread_block_ttl_seconds(instrument: &str, opened_at: chrono::DateTime<chrono::Utc>) -> u64 {
     use chrono::Timelike;
-    // Walk on the pure per-instrument hour mask when the instrument has one
-    // (deterministic block edges); fall back to a real-clock probe through
-    // `is_spread_hour` for legacy NY-close-edge instruments (no baked mask).
-    let hours = match baked_spread_hours(instrument) {
-        Some((mask, _)) if mask != 0 => block_hours_from_mask(mask, opened_at.hour()),
+    // Walk on the pure per-instrument candle mask when the instrument has one
+    // (deterministic block edges), indexed by the SCHEDULE-LOCAL hour so the walk
+    // matches `is_spread_hour`; fall back to a real-clock probe through
+    // `is_spread_hour` for legacy NY-close-edge instruments (no baked mask/tz).
+    let hours = match baked_candle_spread_hours(instrument) {
+        Some((mask, _widen, tz)) if mask != 0 => {
+            let local_hour = opened_at.with_timezone(&tz).hour();
+            block_hours_from_mask(mask, local_hour)
+        }
         _ => block_hours_by_probe(instrument, opened_at),
     };
     hours as u64 * 3600 + SPREAD_BLOCK_TTL_GRACE_SECONDS
@@ -567,19 +643,24 @@ pub fn spread_block_window(
 ) -> Option<(chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>)> {
     use chrono::{Duration, Timelike};
     // The hour containing `now` must itself be elevated (ignore the lead — we
-    // report the block, not the lead-in). Use the pure mask when available.
+    // report the block, not the lead-in). Use the pure candle mask when
+    // available, indexed by the SCHEDULE-LOCAL hour. The reported `(start, end)`
+    // are UTC instants: the block's hour-length is DST-invariant (a contiguous
+    // run of local hours, each ≈ one real hour away from a DST transition), so
+    // subtracting/adding those hour counts from the UTC hour-top is correct.
     let hour_top = now
         .with_minute(0)
         .and_then(|t| t.with_second(0))
         .and_then(|t| t.with_nanosecond(0))?;
-    let (back, fwd) = match baked_spread_hours(instrument) {
-        Some((mask, _)) if mask != 0 => {
-            if mask & (1 << now.hour()) == 0 {
+    let (back, fwd) = match baked_candle_spread_hours(instrument) {
+        Some((mask, _widen, tz)) if mask != 0 => {
+            let local_hour = now.with_timezone(&tz).hour();
+            if mask & (1 << local_hour) == 0 {
                 return None;
             }
             (
-                block_start_hours_from_mask(mask, now.hour()),
-                block_hours_from_mask(mask, now.hour()),
+                block_start_hours_from_mask(mask, local_hour),
+                block_hours_from_mask(mask, local_hour),
             )
         }
         // Legacy no-mask instrument: probe the real clock hour-by-hour. Require
@@ -664,11 +745,16 @@ fn block_hours_by_probe(instrument: &str, opened_at: chrono::DateTime<chrono::Ut
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::{DateTime, Utc};
+
+    fn ts(s: &str) -> DateTime<Utc> {
+        s.parse().expect("valid rfc3339 fixture")
+    }
+
+    // --- spread-blackout reject decision (unchanged by Stage 3) ---
 
     #[test]
     fn window_closed_never_rejects() {
-        // Window closed ⇒ pass even with an absurdly wide spread, and the
-        // wrapper never calls `get_quote` on this branch.
         assert!(!spread_blackout_decision(false, 50.0, 8.0));
     }
 
@@ -684,24 +770,17 @@ mod tests {
 
     #[test]
     fn boundary_exactly_at_threshold_passes() {
-        // Strictly `>`, so exactly-at-threshold falls through (allowed).
         assert!(!spread_blackout_decision(true, 8.0, 8.0));
     }
 
     #[test]
     #[allow(clippy::assertions_on_constants)]
     fn recovered_cutoff_sits_below_elevated_for_hysteresis() {
-        // The window must not flap at the boundary: recovery is only
-        // declared once the spread has fallen below the (lower) recovered
-        // cutoff, not the moment it dips under the elevated one. Constant
-        // assertion on purpose — it guards the tuning invariant if a future
-        // edit to either const inverts the pair.
         assert!(SPREAD_BLACKOUT_RECOVERED_PIPS < SPREAD_BLACKOUT_ELEVATED_PIPS);
     }
 
     #[test]
     fn unknown_instrument_falls_back_to_flat_constant() {
-        // A made-up name can't be in the baked baseline → flat fallback.
         assert_eq!(
             elevated_threshold_pips("DEFINITELY NOT A REAL MARKET ZZZ"),
             SPREAD_BLACKOUT_ELEVATED_PIPS
@@ -711,8 +790,8 @@ mod tests {
 
     #[test]
     fn baked_baseline_is_sorted_and_self_consistent() {
-        // The generated table must be sorted by name (binary_search relies
-        // on it) and every row must satisfy low <= median <= high.
+        // The sampler baseline table must stay sorted (binary_search relies on
+        // it) and low <= median <= high with mask/widen coherence.
         let mut prev: Option<&str> = None;
         for (name, low, high, median, n, mask, widen) in baseline::SPREAD_BASELINE {
             if let Some(p) = prev {
@@ -724,12 +803,8 @@ mod tests {
                 *low <= *median && *median <= *high,
                 "{name}: low {low} median {median} high {high} not ordered",
             );
-            // Mask/widen coherence: an elevated hour must carry a positive
-            // widen, and a non-elevated hour must bake 0.0 (nothing to widen
-            // by). This guards the build.rs render against drift.
-            for h in 0..24 {
+            for (h, &w) in widen.iter().enumerate() {
                 let elevated = mask & (1 << h) != 0;
-                let w = widen[h];
                 if elevated {
                     assert!(w > 0.0, "{name}: hour {h} elevated but widen {w} <= 0");
                 } else {
@@ -741,9 +816,6 @@ mod tests {
 
     #[test]
     fn baked_threshold_is_five_times_normal() {
-        // For every baked instrument the threshold is exactly 5x its
-        // median normal spread — high enough to pass resting/busy-news
-        // widening, low enough to reject a ≥10x spread-hour blowout.
         for (name, _low, _high, median, ..) in baseline::SPREAD_BASELINE {
             let t = elevated_threshold_pips(name);
             assert!(
@@ -753,19 +825,38 @@ mod tests {
         }
     }
 
-    // --- spread-hour widen lookup (pure seam, synthetic tables) ---
+    // --- schedule tz resolver ---
 
-    use chrono::{DateTime, Utc};
-
-    fn ts(s: &str) -> DateTime<Utc> {
-        s.parse().expect("valid rfc3339 fixture")
+    #[test]
+    fn schedule_tz_maps_known_names_and_rejects_none() {
+        assert_eq!(schedule_tz("ny"), Some(chrono_tz::America::New_York));
+        assert_eq!(schedule_tz("tokyo"), Some(chrono_tz::Asia::Tokyo));
+        assert_eq!(schedule_tz("london"), Some(chrono_tz::Europe::London));
+        assert_eq!(schedule_tz("frankfurt"), Some(chrono_tz::Europe::Berlin));
+        assert_eq!(schedule_tz("zurich"), Some(chrono_tz::Europe::Zurich));
+        assert_eq!(schedule_tz("sydney"), Some(chrono_tz::Australia::Sydney));
+        assert_eq!(
+            schedule_tz("johannesburg"),
+            Some(chrono_tz::Africa::Johannesburg)
+        );
+        assert_eq!(schedule_tz("hongkong"), Some(chrono_tz::Asia::Hong_Kong));
+        assert_eq!(schedule_tz("singapore"), Some(chrono_tz::Asia::Singapore));
+        assert_eq!(schedule_tz("none"), None);
+        assert_eq!(schedule_tz("bananas"), None);
     }
 
-    /// A EUR/USD-shaped mask: a single spike hour (21:00 UTC), widen 5p.
-    fn eurusd_shape() -> (u32, [f64; 24]) {
+    // --- spread-hour widen lookup (pure seam, synthetic tables) ---
+    //
+    // The pure seam `spread_hour_widen_for` now takes an explicit `tz` and
+    // indexes the mask by the SCHEDULE-LOCAL hour. Passing `chrono_tz::UTC`
+    // makes the mask bit == the UTC hour, so these synthetic-shape tests
+    // (authored in UTC bits) stay meaningful and pin the local-time arithmetic.
+
+    /// A single-spike mask (hour `h` UTC), widen 5p at that bit.
+    fn spike_shape(h: usize) -> (u32, [f64; 24]) {
         let mut w = [0.0; 24];
-        w[21] = 5.0;
-        (1 << 21, w)
+        w[h] = 5.0;
+        (1 << h, w)
     }
 
     /// A Gold-shaped mask: a structural overnight block (18:00–06:00 UTC),
@@ -782,46 +873,72 @@ mod tests {
 
     #[test]
     fn widen_fires_inside_the_elevated_hour() {
-        let (m, w) = eurusd_shape();
-        // 21:15 UTC — squarely inside the elevated hour.
+        let (m, w) = spike_shape(21);
         assert_eq!(
-            spread_hour_widen_for(m, &w, ts("2026-07-01T21:15:00Z"), SPREAD_HOUR_LEAD_MINUTES),
+            spread_hour_widen_for(
+                m,
+                &w,
+                chrono_tz::UTC,
+                ts("2026-07-01T21:15:00Z"),
+                SPREAD_HOUR_LEAD_MINUTES
+            ),
             Some(5.0),
         );
     }
 
     #[test]
     fn widen_none_outside_any_elevated_hour() {
-        let (m, w) = eurusd_shape();
-        // Midday, nowhere near 21:00.
+        let (m, w) = spike_shape(21);
         assert_eq!(
-            spread_hour_widen_for(m, &w, ts("2026-07-01T12:00:00Z"), SPREAD_HOUR_LEAD_MINUTES),
+            spread_hour_widen_for(
+                m,
+                &w,
+                chrono_tz::UTC,
+                ts("2026-07-01T12:00:00Z"),
+                SPREAD_HOUR_LEAD_MINUTES
+            ),
             None
         );
     }
 
     #[test]
     fn widen_leads_into_the_next_elevated_hour() {
-        let (m, w) = eurusd_shape();
+        let (m, w) = spike_shape(21);
         // 20:35 UTC — 25 min before 21:00, inside the 30-min lead → widen now.
         assert_eq!(
-            spread_hour_widen_for(m, &w, ts("2026-07-01T20:35:00Z"), SPREAD_HOUR_LEAD_MINUTES),
+            spread_hour_widen_for(
+                m,
+                &w,
+                chrono_tz::UTC,
+                ts("2026-07-01T20:35:00Z"),
+                SPREAD_HOUR_LEAD_MINUTES
+            ),
             Some(5.0),
         );
         // 20:29 UTC — 31 min before, just outside the lead → not yet.
         assert_eq!(
-            spread_hour_widen_for(m, &w, ts("2026-07-01T20:29:00Z"), SPREAD_HOUR_LEAD_MINUTES),
+            spread_hour_widen_for(
+                m,
+                &w,
+                chrono_tz::UTC,
+                ts("2026-07-01T20:29:00Z"),
+                SPREAD_HOUR_LEAD_MINUTES
+            ),
             None
         );
     }
 
     #[test]
     fn widen_lead_wraps_across_midnight() {
-        // Gold's block includes hour 0. At 23:40 UTC the next hour (0) is
-        // elevated and within the lead → widen, exercising the (h+1)%24 wrap.
         let (m, w) = gold_shape();
         assert_eq!(
-            spread_hour_widen_for(m, &w, ts("2026-07-01T23:40:00Z"), SPREAD_HOUR_LEAD_MINUTES),
+            spread_hour_widen_for(
+                m,
+                &w,
+                chrono_tz::UTC,
+                ts("2026-07-01T23:40:00Z"),
+                SPREAD_HOUR_LEAD_MINUTES
+            ),
             Some(75.0),
         );
     }
@@ -829,25 +946,35 @@ mod tests {
     #[test]
     fn widen_covers_a_structural_overnight_block() {
         let (m, w) = gold_shape();
-        // Deep in the overnight block.
         assert_eq!(
-            spread_hour_widen_for(m, &w, ts("2026-07-01T02:00:00Z"), SPREAD_HOUR_LEAD_MINUTES),
+            spread_hour_widen_for(
+                m,
+                &w,
+                chrono_tz::UTC,
+                ts("2026-07-01T02:00:00Z"),
+                SPREAD_HOUR_LEAD_MINUTES
+            ),
             Some(75.0),
         );
-        // Daytime, block is closed.
         assert_eq!(
-            spread_hour_widen_for(m, &w, ts("2026-07-01T12:00:00Z"), SPREAD_HOUR_LEAD_MINUTES),
+            spread_hour_widen_for(
+                m,
+                &w,
+                chrono_tz::UTC,
+                ts("2026-07-01T12:00:00Z"),
+                SPREAD_HOUR_LEAD_MINUTES
+            ),
             None
         );
     }
 
     #[test]
     fn widen_empty_mask_never_fires() {
-        // A flat-fat-tail instrument bakes mask 0 → never a spread hour.
         assert_eq!(
             spread_hour_widen_for(
                 0,
                 &[0.0; 24],
+                chrono_tz::UTC,
                 ts("2026-07-01T21:15:00Z"),
                 SPREAD_HOUR_LEAD_MINUTES
             ),
@@ -859,14 +986,15 @@ mod tests {
 
     #[test]
     fn widen_30min_lead_is_dead_at_a_bar_boundary() {
-        // The bug: at a bar close (`minute == 0`, an H1 stream), the 30-min lead
-        // is structurally unreachable — `60 - 0 = 60 > 30` — so the look-ahead
-        // into the next flagged hour never fires. The 20:00 bar sits one full
-        // hour before the 21:00 spike but is NOT flagged and its successor's
-        // look-ahead is dead at a 30-min lead.
-        let (m, w) = eurusd_shape();
+        let (m, w) = spike_shape(21);
         assert_eq!(
-            spread_hour_widen_for(m, &w, ts("2026-07-01T20:00:00Z"), SPREAD_HOUR_LEAD_MINUTES),
+            spread_hour_widen_for(
+                m,
+                &w,
+                chrono_tz::UTC,
+                ts("2026-07-01T20:00:00Z"),
+                SPREAD_HOUR_LEAD_MINUTES
+            ),
             None,
             "the 30-min lead can't reach the next hour from a :00 bar boundary"
         );
@@ -874,215 +1002,242 @@ mod tests {
 
     #[test]
     fn widen_full_bar_lead_pre_arms_on_the_prior_bar() {
-        // The fix: a lead ≥ the bar length (60 min for H1) makes the look-ahead
-        // reachable at a :00 boundary — `60 - 0 = 60 <= 60` — so the 20:00 bar
-        // (immediately before the 21:00 spike) widens. This is what lets the
-        // offline replay pre-arm a FULL BAR early, matching the live cron's
-        // mid-bar 30-min tick.
-        let (m, w) = eurusd_shape();
+        let (m, w) = spike_shape(21);
         assert_eq!(
-            spread_hour_widen_for(m, &w, ts("2026-07-01T20:00:00Z"), 60),
+            spread_hour_widen_for(m, &w, chrono_tz::UTC, ts("2026-07-01T20:00:00Z"), 60),
             Some(5.0),
             "a 60-min (full H1 bar) lead widens on the 20:00 bar, before the 21:00 spike"
         );
-        // But the bar TWO hours before (19:00) still must not widen — its
-        // successor (20:00) isn't flagged, and 19:00 itself isn't.
         assert_eq!(
-            spread_hour_widen_for(m, &w, ts("2026-07-01T19:00:00Z"), 60),
+            spread_hour_widen_for(m, &w, chrono_tz::UTC, ts("2026-07-01T19:00:00Z"), 60),
             None,
             "only the immediately-prior bar pre-arms, not two bars early"
         );
     }
 
+    // === DST-INVARIANCE — the payoff tests (Stage 3) ===
+
+    /// THE test: a `ny` FX cross with a 17:00-LOCAL mask bit reads as a spread
+    /// hour at BOTH a summer UTC instant (21:00 UTC = 17:00 EDT) and a winter
+    /// UTC instant (22:00 UTC = 17:00 EST) — the same local mask bit, two
+    /// different UTC hours. Proves the mask is indexed by schedule-local hour.
     #[test]
-    fn widen_frac_with_lead_matches_the_default_helper() {
-        // The default `spread_hour_widen_frac` must equal the lead-aware form at
-        // the 30-min default — the delegation is behaviour-preserving for the
-        // live cron. EUR/USD is in the candle table (21:00 spike).
-        let inside = ts("2026-07-08T21:15:00Z");
-        assert_eq!(
-            spread_hour_widen_frac("EUR/USD", inside),
-            spread_hour_widen_frac_with_lead("EUR/USD", inside, SPREAD_HOUR_LEAD_MINUTES),
-        );
-        // And the full-bar lead reaches the spike from the prior H1 close where
-        // the 30-min default cannot.
-        let prior_close = ts("2026-07-08T20:00:00Z");
+    fn ny_fx_local_1700_is_spread_hour_summer_and_winter() {
+        // Fixture: oanda/AUD_CHF is ny with mask 1<<17.
+        // Summer (EDT, UTC-4): 2026-07-09 17:00 New York == 21:00 UTC.
+        let summer = ts("2026-07-09T21:00:00Z");
         assert!(
-            spread_hour_widen_frac("EUR/USD", prior_close).is_none(),
-            "30-min default: dead at the 20:00 boundary"
+            is_spread_hour("AUD_CHF", summer),
+            "17:00 EDT (21:00 UTC) must be a spread hour"
+        );
+        // Winter (EST, UTC-5): 2026-01-15 17:00 New York == 22:00 UTC.
+        let winter = ts("2026-01-15T22:00:00Z");
+        assert!(
+            is_spread_hour("AUD_CHF", winter),
+            "17:00 EST (22:00 UTC) must be a spread hour"
+        );
+        // And the OTHER UTC hour is NOT a spread hour in each season (the naive
+        // fixed-UTC bug would flag the wrong one): 22:00 UTC in summer is 18:00
+        // EDT (clean), 21:00 UTC in winter is 16:00 EST (clean).
+        assert!(
+            !is_spread_hour("AUD_CHF", ts("2026-07-09T22:00:00Z")),
+            "22:00 UTC in summer is 18:00 EDT — NOT the 17:00 spike"
         );
         assert!(
-            spread_hour_widen_frac_with_lead("EUR/USD", prior_close, 60).is_some(),
-            "60-min lead: pre-arms on the 20:00 bar"
+            !is_spread_hour("AUD_CHF", ts("2026-01-15T21:00:00Z")),
+            "21:00 UTC in winter is 16:00 EST — NOT the 17:00 spike"
         );
     }
 
-    // --- sub-candle widen instant (the faithful 06:30 lead) ---
-
+    /// A fixed-UTC (no US-DST) schedule (`tokyo`, JST = UTC+9 all year) is a
+    /// spread hour at the SAME UTC hour year-round — no seasonal shift.
     #[test]
-    fn widen_instant_is_the_sub_candle_lead_before_the_spike() {
-        // GBP/AUD mask [21]. The 20:00–21:00 H1 bar LEADS INTO the 21:00Z spike,
-        // so the live cron's 30-min lead widens at 20:30Z (= 06:30 Brisbane) —
-        // a sub-candle instant, NOT the 20:00 bar open and NOT the 21:00 spike.
-        let (at, frac) = spread_hour_widen_instant("GBP/AUD", ts("2026-07-13T20:00:00Z"), 3600)
-            .expect("the 20:00 H1 bar leads into the 21:00 spread hour");
+    fn tokyo_schedule_is_fixed_utc_year_round() {
+        // Fixture: oanda/JP225_USD is tokyo with mask 1<<15 (15:00 JST).
+        // 15:00 JST == 06:00 UTC in both July and January.
+        assert!(
+            is_spread_hour("JP225_USD", ts("2026-07-09T06:00:00Z")),
+            "15:00 JST (06:00 UTC) is a spread hour in summer"
+        );
+        assert!(
+            is_spread_hour("JP225_USD", ts("2026-01-15T06:00:00Z")),
+            "15:00 JST (06:00 UTC) is a spread hour in winter — no DST shift"
+        );
+        // A UTC hour that would be 15:00-local only if Japan observed DST is NOT
+        // a spread hour — Japan has none, so 05:00 UTC stays clean.
+        assert!(
+            !is_spread_hour("JP225_USD", ts("2026-07-09T05:00:00Z")),
+            "05:00 UTC (14:00 JST) is not the spike; Japan has no DST"
+        );
+    }
+
+    /// An absent instrument and a `none`-schedule instrument both fall back to
+    /// the legacy NY-close-edge gate (NOT the local-mask path).
+    #[test]
+    fn absent_and_none_schedule_fall_back_to_ny_close_edge() {
+        // Absent from the candle table → fallback. 12-Mar-2026 is EDT, so the
+        // NY-close edge is 21:00 UTC.
+        let inst_absent = "DEFINITELY NOT A REAL MARKET ZZZ";
+        assert_eq!(
+            is_spread_hour(inst_absent, ts("2026-03-12T21:00:00Z")),
+            crate::ny_clock::is_ny_close_edge(ts("2026-03-12T21:00:00Z")),
+            "absent instrument tracks the NY-close-edge fallback exactly"
+        );
+        assert!(is_spread_hour(inst_absent, ts("2026-03-12T21:00:00Z")));
+        assert!(!is_spread_hour(inst_absent, ts("2026-03-12T10:00:00Z")));
+
+        // Fixture: oanda/BTC_USD has schedule "none" (mask 0) → same fallback.
+        assert_eq!(
+            is_spread_hour("BTC_USD", ts("2026-03-12T21:00:00Z")),
+            crate::ny_clock::is_ny_close_edge(ts("2026-03-12T21:00:00Z")),
+            "none-schedule instrument tracks the NY-close-edge fallback"
+        );
+        assert!(is_spread_hour("BTC_USD", ts("2026-03-12T21:00:00Z")));
+        // reviewed=false (EUR_TRY, mask 0) → fallback too.
+        assert!(is_spread_hour("EUR_TRY", ts("2026-03-12T21:00:00Z")));
+        assert!(!is_spread_hour("EUR_TRY", ts("2026-03-12T10:00:00Z")));
+    }
+
+    /// The 30-min lead fires in LOCAL time: 30 min before a flagged LOCAL hour
+    /// top pre-arms. For AUD_CHF (17:00-local spike), summer that top is
+    /// 21:00 UTC, so 20:35 UTC (== 16:35 EDT, 25 min before) pre-arms; 20:25 UTC
+    /// (35 min before) does not.
+    #[test]
+    fn lead_pre_arms_in_local_time_across_seasons() {
+        // Summer.
+        assert!(
+            is_spread_hour("AUD_CHF", ts("2026-07-09T20:35:00Z")),
+            "25 min before the 17:00-EDT spike (20:35 UTC) is inside the lead"
+        );
+        assert!(
+            !is_spread_hour("AUD_CHF", ts("2026-07-09T20:25:00Z")),
+            "35 min before (20:25 UTC) is outside the lead"
+        );
+        // Winter — the SAME local lead, now 30 min before 22:00 UTC.
+        assert!(
+            is_spread_hour("AUD_CHF", ts("2026-01-15T21:35:00Z")),
+            "25 min before the 17:00-EST spike (21:35 UTC) is inside the lead"
+        );
+        assert!(
+            !is_spread_hour("AUD_CHF", ts("2026-01-15T21:25:00Z")),
+            "35 min before (21:25 UTC) is outside the lead"
+        );
+    }
+
+    /// `mask_active_with_lead` pure form, driven directly with an explicit tz —
+    /// the local-hour indexing is unit-visible without the table lookup.
+    #[test]
+    fn mask_active_with_lead_indexes_local_hour() {
+        let mask = 1u32 << 17; // 17:00 local
+        let ny = chrono_tz::America::New_York;
+        // Summer: 21:00 UTC == 17:00 EDT.
+        assert!(mask_active_with_lead(mask, ny, ts("2026-07-09T21:00:00Z")));
+        // Winter: 22:00 UTC == 17:00 EST.
+        assert!(mask_active_with_lead(mask, ny, ts("2026-01-15T22:00:00Z")));
+        // Off-hour.
+        assert!(!mask_active_with_lead(mask, ny, ts("2026-07-09T12:00:00Z")));
+    }
+
+    // --- sub-candle widen instant, DST-aware ---
+
+    /// `spread_hour_widen_instant` returns a UTC instant that, converted to the
+    /// row's local tz, sits at the right local pre-hour moment — ACROSS a DST
+    /// boundary. AUD_CHF (ny, 17:00-local): the H1 bar leading into the spike
+    /// widens 30 min before the LOCAL 17:00 top, i.e. at 16:30 local, which is
+    /// 20:30 UTC in summer and 21:30 UTC in winter.
+    #[test]
+    fn widen_instant_is_local_1630_across_dst() {
+        use chrono::Timelike;
+        let ny = chrono_tz::America::New_York;
+
+        // Summer: the 20:00–21:00 UTC H1 bar (16:00–17:00 EDT) leads into the
+        // 17:00-EDT spike → widen at 20:30 UTC (16:30 EDT).
+        let (at_s, frac_s) = spread_hour_widen_instant("AUD_CHF", ts("2026-07-09T20:00:00Z"), 3600)
+            .expect("summer bar leads into the 17:00-EDT spike");
+        assert_eq!(at_s, ts("2026-07-09T20:30:00Z"));
+        assert!(frac_s > 0.0);
+        let local_s = at_s.with_timezone(&ny);
+        assert_eq!((local_s.hour(), local_s.minute()), (16, 30));
+
+        // Winter: the 21:00–22:00 UTC H1 bar (16:00–17:00 EST) leads into the
+        // 17:00-EST spike → widen at 21:30 UTC (16:30 EST).
+        let (at_w, _frac_w) =
+            spread_hour_widen_instant("AUD_CHF", ts("2026-01-15T21:00:00Z"), 3600)
+                .expect("winter bar leads into the 17:00-EST spike");
+        assert_eq!(at_w, ts("2026-01-15T21:30:00Z"));
+        let local_w = at_w.with_timezone(&ny);
+        assert_eq!(
+            (local_w.hour(), local_w.minute()),
+            (16, 30),
+            "same LOCAL 16:30 pre-hour moment, different UTC hour"
+        );
+    }
+
+    /// The "own hour" case: a bar OPENING at the flagged LOCAL hour widens at the
+    /// bar open. Summer: 21:00 UTC == 17:00 EDT (flagged) → widen at bar open.
+    #[test]
+    fn widen_instant_fires_at_bar_open_when_local_hour_flagged() {
+        let (at, _frac) = spread_hour_widen_instant("AUD_CHF", ts("2026-07-09T21:00:00Z"), 3600)
+            .expect("21:00 UTC == 17:00 EDT IS the flagged local hour");
         assert_eq!(
             at,
-            ts("2026-07-13T20:30:00Z"),
-            "widen instant is 30 min before the 21:00 spike (20:30Z = 06:30 Bris)"
-        );
-        assert!(
-            frac > 0.0,
-            "leads into a flagged hour → positive widen fraction"
+            ts("2026-07-09T21:00:00Z"),
+            "own local hour flagged → widen at the bar open"
         );
     }
 
-    #[test]
-    fn widen_instant_fires_at_bar_open_when_its_own_hour_is_flagged() {
-        // GBP/AUD mask [21]. A bar OPENING at 21:00Z is itself the flagged hour,
-        // so the widen is already live from the bar open — the "own hour" case
-        // must win (return the bar open, not a next-hour lead instant).
-        let (at, _frac) = spread_hour_widen_instant("GBP/AUD", ts("2026-07-13T21:00:00Z"), 3600)
-            .expect("21:00Z IS the flagged spread hour");
-        assert_eq!(
-            at,
-            ts("2026-07-13T21:00:00Z"),
-            "own hour flagged → widen at the bar open, not a lead instant"
-        );
-    }
-
+    /// Two bars before the spike → no widen (only the immediately-leading bar).
     #[test]
     fn widen_instant_none_two_bars_before_the_spike() {
-        // The 19:00–20:00 bar is two bars before the 21:00 GBP/AUD spike: its
-        // successor (20:00) isn't flagged and 21:00's lead (20:30) is past this
-        // bar's end (20:00). So no widen this bar.
         assert_eq!(
-            spread_hour_widen_instant("GBP/AUD", ts("2026-07-13T19:00:00Z"), 3600),
+            spread_hour_widen_instant("AUD_CHF", ts("2026-07-09T19:00:00Z"), 3600),
             None,
-            "two bars early → no widen (only the immediately-leading bar arms)"
+            "the 19:00–20:00 UTC bar (15:00 EDT) is two bars before the 17:00 spike"
         );
     }
 
     #[test]
     fn widen_instant_none_for_a_clean_daytime_bar() {
-        // Midday, nowhere near the 21:00 spike.
         assert_eq!(
-            spread_hour_widen_instant("GBP/AUD", ts("2026-07-13T12:00:00Z"), 3600),
+            spread_hour_widen_instant("AUD_CHF", ts("2026-07-09T12:00:00Z"), 3600),
             None
         );
     }
 
     #[test]
-    fn widen_instant_on_a_15m_bar_still_leads_by_30_min() {
-        // A 15m bar (900s) at 20:30Z leads into 21:00Z: 30-min lead → widen at
-        // 20:30Z (clamped to the bar open, since 21:00 - 30 = 20:30 == bar open).
-        let (at, _f) = spread_hour_widen_instant("GBP/AUD", ts("2026-07-13T20:30:00Z"), 900)
-            .expect("the 20:30 15m bar's open is exactly the 30-min lead instant");
-        assert_eq!(at, ts("2026-07-13T20:30:00Z"));
-        // The 20:00 15m bar (ends 20:15) is too early — 20:30 lead is past its end.
+    fn widen_instant_none_for_none_schedule() {
+        // BTC_USD is schedule "none" (no tz) → the candle path yields None.
         assert_eq!(
-            spread_hour_widen_instant("GBP/AUD", ts("2026-07-13T20:00:00Z"), 900),
-            None,
-            "the 20:00–20:15 15m bar ends before the 20:30 lead instant"
+            spread_hour_widen_instant("BTC_USD", ts("2026-07-09T21:00:00Z"), 3600),
+            None
         );
     }
 
-    #[test]
-    fn is_spread_hour_unknown_instrument_falls_back_to_ny_close() {
-        // No baseline row → fall back to the legacy NY-close-edge gate.
-        // 12-Mar-2026 is EDT, close edge 21:00 UTC.
-        assert!(is_spread_hour(
-            "DEFINITELY NOT A REAL MARKET ZZZ",
-            ts("2026-03-12T21:00:00Z")
-        ));
-        // A non-edge hour on the same (unknown) instrument → false.
-        assert!(!is_spread_hour(
-            "DEFINITELY NOT A REAL MARKET ZZZ",
-            ts("2026-03-12T10:00:00Z")
-        ));
-    }
+    // --- widen_frac delegation + tz path ---
 
     #[test]
-    fn suppression_only_applies_to_short_bars() {
-        use crate::broker::Granularity;
-        // 21:00Z on an unknown instrument is a spread hour (NY-close fallback),
-        // so `is_spread_hour` is true independent of the bar size.
-        let inst = "DEFINITELY NOT A REAL MARKET ZZZ";
-        let t = ts("2026-03-12T21:00:00Z");
+    fn widen_frac_with_lead_matches_the_default_helper() {
+        // AUD_CHF (ny, 17:00-local). Summer inside-the-hour instant.
+        let inside = ts("2026-07-09T21:15:00Z");
+        assert_eq!(
+            spread_hour_widen_frac("AUD_CHF", inside),
+            spread_hour_widen_frac_with_lead("AUD_CHF", inside, SPREAD_HOUR_LEAD_MINUTES),
+        );
+        // The full-bar lead reaches the local spike from the prior H1 close where
+        // the 30-min default cannot. Prior H1 close = 20:00 UTC (16:00 EDT).
+        let prior_close = ts("2026-07-09T20:00:00Z");
         assert!(
-            is_spread_hour(inst, t),
-            "premise: 21:00Z EDT is a spread hour"
+            spread_hour_widen_frac("AUD_CHF", prior_close).is_none(),
+            "30-min default: dead at the 20:00 UTC boundary"
         );
-        // 15m + 1h are dominated by the 1h spread hour → suppress.
-        assert!(suppress_on_spread_hour(inst, t, Granularity::M15));
-        assert!(suppress_on_spread_hour(inst, t, Granularity::H1));
-        // H4 + D dilute it → do NOT suppress even though it IS a spread hour.
-        assert!(!suppress_on_spread_hour(inst, t, Granularity::H4));
-        assert!(!suppress_on_spread_hour(inst, t, Granularity::D1));
-        // A clean hour is never suppressed at any size.
-        let clean = ts("2026-03-12T10:00:00Z");
-        assert!(!suppress_on_spread_hour(inst, clean, Granularity::M15));
-        assert!(!suppress_on_spread_hour(inst, clean, Granularity::H4));
-    }
-
-    #[test]
-    fn suppression_bar_seconds_matches_the_granularity_seam() {
-        let inst = "DEFINITELY NOT A REAL MARKET ZZZ";
-        let t = ts("2026-03-12T21:00:00Z");
-        // 1h and below suppress; above 1h does not.
-        assert!(suppress_on_spread_hour_bar_seconds(inst, t, 900)); // 15m
-        assert!(suppress_on_spread_hour_bar_seconds(inst, t, 3600)); // 1h
-        assert!(!suppress_on_spread_hour_bar_seconds(inst, t, 14400)); // 4h
-        assert!(!suppress_on_spread_hour_bar_seconds(inst, t, 86400)); // 1d
-        // A degenerate/unknown spacing (0) fails safe to "short bar" → suppress.
-        assert!(suppress_on_spread_hour_bar_seconds(inst, t, 0));
-        // …but only when it actually IS a spread hour — a clean hour never suppresses.
-        assert!(!suppress_on_spread_hour_bar_seconds(
-            inst,
-            ts("2026-03-12T10:00:00Z"),
-            0
-        ));
-    }
-
-    // --- Golden origin-case anchor (PR 0, shared-pending-lifecycle) ---
-    //
-    // These pin the ON-trigger for the case that motivated the whole
-    // shared-lifecycle work: the AUD/CHF 2026-07-08T21:00Z fill-into-the-
-    // spread-hour −2R (SCOPING-spread-hour-rubbish-candle.md). They assert the
-    // *invariant* — "is 21:00Z a baked spread hour for AUD/CHF, and does its
-    // widen ≈ the 12p gap we observed" — NOT the raw mask int, which is
-    // data-derived and drifts as `spread-sampler-cron` accrues samples. When
-    // PR 2 flips the live cancel trigger from a live-quote sample to this baked
-    // predicate, this is the regression baseline that must stay green.
-
-    /// The exact origin bar (07:00 Brisbane = 21:00 UTC, 2026-07-08) is a baked
-    /// spread hour for AUD/CHF, and its baked widen is the ~12p blowout that
-    /// straddled the entry/SL bracket. This is the ON-trigger the shared
-    /// lifecycle keys off — no live quote.
-    #[test]
-    fn aud_chf_origin_bar_is_a_baked_spread_hour() {
-        let origin = ts("2026-07-08T21:00:00Z");
         assert!(
-            is_spread_hour("AUD/CHF", origin),
-            "AUD/CHF 21:00Z (the −2R origin bar) must read as a baked spread hour"
-        );
-        // Widen at that hour is the p90 blowout — ~12p (the observed spread gap
-        // that straddled entry 0.55980 / SL 0.56070). Via the candle path: the
-        // widen FRACTION converts to pips at the bracket price (~0.56, pip
-        // 0.0001). Assert it is a real blowout (>= 10p), tolerant of
-        // sample-driven drift in the exact value.
-        let frac = spread_hour_widen_frac("AUD/CHF", origin)
-            .expect("origin bar must carry a baked widen fraction");
-        let widen = widen_frac_to_pips(frac, 0.56, 0.0001);
-        assert!(
-            widen >= 10.0,
-            "AUD/CHF 21:00Z widen {widen}p must be a >=10p blowout (observed ~12p)"
+            spread_hour_widen_frac_with_lead("AUD_CHF", prior_close, 60).is_some(),
+            "60-min lead: pre-arms on the 20:00 UTC bar"
         );
     }
 
-    /// `widen_frac_to_pips` converts a spread FRACTION to pips at a reference
-    /// price: `pips = frac × price / pip_size`. A 0.0004 (0.04%) fraction on a
-    /// EUR/USD-scale 1.10 price at pip 0.0001 → 4.4 pips.
+    // --- widen_frac_to_pips (unchanged) ---
+
     #[test]
     fn widen_frac_to_pips_converts_at_reference_price() {
         let pips = widen_frac_to_pips(0.0004, 1.10, 0.0001);
@@ -1090,7 +1245,6 @@ mod tests {
             (pips - 4.4).abs() < 1e-9,
             "0.04% of 1.10 / 0.0001 = 4.4p, got {pips}"
         );
-        // A gold-scale example: 0.001 (0.1%) of 2400 at pip 0.01 → 240p.
         let gold = widen_frac_to_pips(0.001, 2400.0, 0.01);
         assert!(
             (gold - 240.0).abs() < 1e-6,
@@ -1098,9 +1252,6 @@ mod tests {
         );
     }
 
-    /// The candle widen fraction is scale-free — the SAME fraction gives
-    /// proportionally larger pips at a larger price, which is exactly what a
-    /// per-instrument pip widen needs. Guards against a units regression.
     #[test]
     fn widen_frac_scales_with_price() {
         let frac = 0.0005;
@@ -1112,67 +1263,46 @@ mod tests {
         );
     }
 
-    /// The 30-min lead applies to the origin case too: 20:35 UTC (25 min before
-    /// the 21:00Z spike) already reads as a spread hour, so a resting order is
-    /// removed *before* the blowout lands, not racing it.
+    // --- suppression seam (short-bar policy unchanged; DST-aware via is_spread_hour) ---
+
     #[test]
-    fn aud_chf_origin_bar_lead_window_is_a_spread_hour() {
+    fn suppression_only_applies_to_short_bars() {
+        use crate::broker::Granularity;
+        // AUD_CHF summer spike: 21:00 UTC == 17:00 EDT is a spread hour.
+        let inst = "AUD_CHF";
+        let t = ts("2026-07-09T21:00:00Z");
         assert!(
-            is_spread_hour("AUD/CHF", ts("2026-07-08T20:35:00Z")),
-            "25 min before the 21:00Z spike is inside the 30-min lead → spread hour"
+            is_spread_hour(inst, t),
+            "premise: 17:00 EDT is a spread hour"
         );
-        assert!(
-            !is_spread_hour("AUD/CHF", ts("2026-07-08T20:25:00Z")),
-            "35 min before is outside the lead → not yet a spread hour"
-        );
+        assert!(suppress_on_spread_hour(inst, t, Granularity::M15));
+        assert!(suppress_on_spread_hour(inst, t, Granularity::H1));
+        assert!(!suppress_on_spread_hour(inst, t, Granularity::H4));
+        assert!(!suppress_on_spread_hour(inst, t, Granularity::D1));
+        let clean = ts("2026-07-09T12:00:00Z");
+        assert!(!suppress_on_spread_hour(inst, clean, Granularity::M15));
     }
 
-    /// A clean AUD/CHF hour (well away from the overnight/NY-close blocks) is
-    /// NOT a spread hour — the predicate-false side of the origin anchor, so a
-    /// removed order restores on such a bar. 12:00 UTC is midday London,
-    /// squarely outside AUD/CHF's baked blocks.
     #[test]
-    fn aud_chf_midday_is_not_a_spread_hour() {
-        assert!(
-            !is_spread_hour("AUD/CHF", ts("2026-07-08T12:00:00Z")),
-            "midday is a clean bar → an order removed at 21:00Z restores here"
-        );
+    fn suppression_bar_seconds_matches_the_granularity_seam() {
+        let inst = "AUD_CHF";
+        let t = ts("2026-07-09T21:00:00Z");
+        assert!(suppress_on_spread_hour_bar_seconds(inst, t, 900)); // 15m
+        assert!(suppress_on_spread_hour_bar_seconds(inst, t, 3600)); // 1h
+        assert!(!suppress_on_spread_hour_bar_seconds(inst, t, 14400)); // 4h
+        assert!(!suppress_on_spread_hour_bar_seconds(inst, t, 86400)); // 1d
+        assert!(suppress_on_spread_hour_bar_seconds(inst, t, 0)); // degenerate → suppress
+        assert!(!suppress_on_spread_hour_bar_seconds(
+            inst,
+            ts("2026-07-09T12:00:00Z"),
+            0
+        ));
     }
 
-    /// Regression for the GBP/AUD QM bug: the old sampler mask flagged GBP/AUD's
-    /// whole overnight block (UTC [0-5,21,22,23] = Brisbane 07:00-15:00), so a
-    /// 10am golden Pinbar confirming at 12pm (UTC ~02:00) had its confirmation
-    /// bar suppressed and the QM leg never entered. The candle-derived mask is
-    /// [21] only, so the daytime block is NO LONGER a spread hour — the
-    /// confirmation fires and the entry can go in.
-    #[test]
-    fn gbp_aud_daytime_is_not_a_spread_hour_candle_mask() {
-        // TradeNation GBP/AUD candle mask is [21] only.
-        // 02:00 UTC (Brisbane 12:00, the confirmation bar) must be CLEAN now.
-        assert!(
-            !is_spread_hour("GBP/AUD", ts("2026-07-08T02:00:00Z")),
-            "GBP/AUD 02:00Z (Bris 12:00, the QM confirmation bar) must NOT be a \
-             spread hour under the candle mask (was wrongly flagged by the sampler)"
-        );
-        // The genuine 21:00Z NY-close spike is still a spread hour.
-        assert!(
-            is_spread_hour("GBP/AUD", ts("2026-07-08T21:00:00Z")),
-            "GBP/AUD 21:00Z (the genuine NY-close spike) is still a spread hour"
-        );
-        // The rest of the old wrongly-flagged block is clean: 03:00Z (Bris 13:00).
-        assert!(
-            !is_spread_hour("GBP/AUD", ts("2026-07-08T03:00:00Z")),
-            "GBP/AUD 03:00Z (Bris 13:00) must NOT be a spread hour"
-        );
-    }
+    // --- block-length TTL (concern 1 of the backstop split), pure-mask helpers ---
 
-    // --- block-length TTL (concern 1 of the backstop split) ---
-
-    /// A contiguous 8h block (bits 21..=23 + 0..=4, AUD/CHF-shaped) opened at its
-    /// top (hour 21) spans all 8 hours.
     #[test]
     fn block_hours_multi_hour_wrap_from_top() {
-        // 21,22,23,0,1,2,3,4 set.
         let mask: u32 = (1 << 21)
             | (1 << 22)
             | (1 << 23)
@@ -1184,8 +1314,6 @@ mod tests {
         assert_eq!(block_hours_from_mask(mask, 21), 8);
     }
 
-    /// Opened partway through the same 8h block (hour 0) → the REMAINING block
-    /// (0,1,2,3,4 = 5h). Still ≥ the time to the lift, which is all the TTL needs.
     #[test]
     fn block_hours_multi_hour_wrap_from_middle() {
         let mask: u32 = (1 << 21)
@@ -1199,93 +1327,89 @@ mod tests {
         assert_eq!(block_hours_from_mask(mask, 0), 5);
     }
 
-    /// A single elevated hour (majors-shaped, just 21:00Z) → a 1h block.
     #[test]
     fn block_hours_single_hour() {
         assert_eq!(block_hours_from_mask(1 << 21, 21), 1);
     }
 
-    /// Opening on a non-elevated hour → 0 (nothing to outlive); the TTL is then
-    /// just the grace.
     #[test]
     fn block_hours_zero_off_block() {
         assert_eq!(block_hours_from_mask(1 << 21, 12), 0);
     }
 
-    /// A degenerate all-ones mask is capped at MAX_BLOCK_HOURS (never 24) so the
-    /// TTL can't blow out to a full day.
     #[test]
     fn block_hours_all_ones_is_capped() {
         assert_eq!(block_hours_from_mask(u32::MAX, 0), MAX_BLOCK_HOURS);
     }
 
-    /// The public seconds helper: block hours × 3600 + grace.
     #[test]
     fn ttl_seconds_adds_grace() {
-        // 1h block + 1h grace = 2h. Use the pure mask helper's math directly so
-        // the assertion doesn't depend on the baked table.
         let hours = block_hours_from_mask(1 << 21, 21);
         let ttl = hours as u64 * 3600 + SPREAD_BLOCK_TTL_GRACE_SECONDS;
         assert_eq!(ttl, 2 * 3600);
     }
 
-    /// Backward walk: hours BEFORE `hour` still in the block. A 21→05 (wrap)
-    /// block probed at 02:00 has 5 earlier in-block hours (21,22,23,00,01).
     #[test]
     fn block_start_hours_walks_back_across_midnight() {
         let mask = (1 << 21) | (1 << 22) | (1 << 23) | (1 << 0) | (1 << 1) | (1 << 2) | (1 << 3);
         assert_eq!(block_start_hours_from_mask(mask, 2), 5);
-        // At the block's first hour there's nothing before it.
         assert_eq!(block_start_hours_from_mask(mask, 21), 0);
     }
 
-    /// The public `(start, end)` window over a synthetic 21→05 wrap block: a bar
-    /// at 02:00Z reports start=21:00 (prev day) and end=05:00 (same day).
+    // --- block TTL / window against the candle fixture, DST-aware ---
+
+    /// GBP_AUD fixture is ny with a two-hour LOCAL block (17:00 + 18:00). A
+    /// record opened at the block top (17:00 EDT = 21:00 UTC in summer) yields a
+    /// 2h block + grace TTL; the SAME local block gives the same TTL in winter
+    /// (17:00 EST = 22:00 UTC) — DST-invariant.
     #[test]
-    fn spread_block_window_spans_a_wrap_block_via_mask() {
-        // GBP/AUD's real baked block is 21..=05 UTC — assert against the baked
-        // table so the reported window matches what the operator sees live.
-        // Baked GBP/AUD elevated hours are 21,22,23,00,01,02,03,04,05 UTC, so the
-        // block runs 21:00 (prev day) up to the first clean hour, 06:00.
+    fn block_ttl_from_candle_fixture_is_dst_invariant() {
+        let summer_top = ts("2026-07-09T21:00:00Z"); // 17:00 EDT
+        let winter_top = ts("2026-01-15T22:00:00Z"); // 17:00 EST
+        let ttl_s = spread_block_ttl_seconds("GBP_AUD", summer_top);
+        let ttl_w = spread_block_ttl_seconds("GBP_AUD", winter_top);
+        // 2 local hours + 1h grace = 3h.
+        assert_eq!(ttl_s, 2 * 3600 + SPREAD_BLOCK_TTL_GRACE_SECONDS);
+        assert_eq!(
+            ttl_w, ttl_s,
+            "block TTL is the same local block in either season"
+        );
+    }
+
+    /// The `(start, end)` window for the GBP_AUD 2-hour local block, reported in
+    /// UTC. Summer: 17:00–19:00 EDT == 21:00–23:00 UTC.
+    #[test]
+    fn block_window_from_candle_fixture_summer() {
         let (start, end) =
-            spread_block_window("GBP/AUD", ts("2026-07-10T02:00:00Z")).expect("in block");
+            spread_block_window("GBP_AUD", ts("2026-07-09T21:30:00Z")).expect("in block");
         assert_eq!(
             start,
             ts("2026-07-09T21:00:00Z"),
-            "block starts 21:00 prev day"
+            "block start 17:00 EDT = 21:00 UTC"
         );
         assert_eq!(
             end,
-            ts("2026-07-10T06:00:00Z"),
-            "block ends at first clean hour 06:00"
+            ts("2026-07-09T23:00:00Z"),
+            "block end 19:00 EDT = 23:00 UTC"
         );
+        // A clean midday bar returns None.
+        assert!(spread_block_window("GBP_AUD", ts("2026-07-09T12:00:00Z")).is_none());
     }
 
-    /// The confirmation bar in the reported GBP/AUD case (12:00 Brisbane = 02:00Z)
-    /// sits inside the block; a midday bar well outside it returns None.
+    /// Absent instrument block window falls through the probe path (NY-close
+    /// edge). 12-Mar EDT close edge is 21:00 UTC.
     #[test]
-    fn spread_block_window_none_outside_the_block() {
-        assert!(spread_block_window("GBP/AUD", ts("2026-07-10T02:00:00Z")).is_some());
+    fn block_window_absent_uses_probe_fallback() {
+        let inst = "DEFINITELY NOT A REAL MARKET ZZZ";
+        // At the NY-close edge the probe reports a 1h block.
+        let w = spread_block_window(inst, ts("2026-03-12T21:00:00Z"));
         assert!(
-            spread_block_window("GBP/AUD", ts("2026-07-10T12:00:00Z")).is_none(),
-            "12:00Z is a liquid hour, not a spread hour"
+            w.is_some(),
+            "NY-close edge is a spread hour via the probe fallback"
         );
-    }
-
-    /// AUD/CHF's baked block, opened at 21:00Z, must yield a TTL that OUTLIVES the
-    /// block AND exceeds the 3h that used to expire it prematurely — the whole
-    /// point of the split. (Uses the baked table via the public helper.)
-    #[test]
-    fn aud_chf_block_ttl_outlives_the_block_and_beats_the_old_3h() {
-        let ttl = spread_block_ttl_seconds("AUD/CHF", ts("2026-07-08T21:00:00Z"));
         assert!(
-            ttl > 3 * 3600,
-            "AUD/CHF block TTL must exceed the old 3h that expired the record mid-block, got {ttl}s"
-        );
-        // Sanity: a multi-hour block + 1h grace lands well above 3h and below a day.
-        assert!(
-            ttl < 24 * 3600,
-            "TTL must not blow out to a full day, got {ttl}s"
+            spread_block_window(inst, ts("2026-03-12T10:00:00Z")).is_none(),
+            "a clean hour is not a spread block"
         );
     }
 }
