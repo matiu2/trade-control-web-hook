@@ -1,5 +1,60 @@
 # Changelog
 
+## v90 — 2026-07-15 — OnClose origin-side break, cross-buffer flag, slope-scaled retest
+
+**Why.** Three related fixes to how the engine reads the neckline, all triggered
+by EUR/GBP & GBP/USD iH&S setups getting stranded in `AwaitBreakAndClose`.
+
+1. **OnClose break-and-close was an edge detector.** It fired only on the bar
+   that made the below→above (or above→below) *transition* (`prev_close <
+   far_edge && close >= far_edge`). When the transition bar was suppressed (a
+   spread-hour rubbish candle) or the plan armed already-past the line, the next
+   clean bar had a `prev` already on the far side and it never stamped — the
+   break was lost forever.
+2. **The `cross_buffer_pct` zone was hardcoded** at arm time with no override, so
+   a genuine break that closed only just past the neckline (EUR/GBP: 0.7p above,
+   inside the 1.7p buffer) was rejected with no way to lower the buffer per-trade.
+3. **The retest tolerance decayed regardless of neckline angle** — a flat
+   horizontal neckline widened its retest band over time just like a steep one,
+   which is wrong (a horizontal is an exact price level).
+
+**What changed.**
+
+- **Origin-side OnClose (`engine`).** Latching OnClose rules
+  (`03-prep-break-and-close`, the OnClose retest, `too-high`/`too-low`
+  invalidation caps, M/W abort, drawn lines) now fire on a **settled close on
+  the far side of the line from the plan's ORIGIN** (the open of the first bar
+  the rule saw — the arm bar — stored once in `PlanState.origin_open`), not on
+  the prior-close transition edge. Robust to a suppressed/skipped transition bar.
+  **Entry** OnClose crosses keep EDGE semantics (a multi-shot entry cross must
+  fire once per transition, not every settled-past bar); `fire_rule` picks the
+  mode by `rule.intent.action` (`OnCloseRefs { settled: action != Enter }`).
+- **`tv-arm --cross-buffer-pct <pct>`** overrides the arm-time
+  `cross_buffer_pct` (mirrors `--retest-atr-step`); `0` restores the bare line.
+- **Slope-scaled retest (`engine`).** `tolerance(N) = (N-1) × retest_atr_step ×
+  |neckline slope per bar|` (the ATR cancels; it still guards the fail-soft
+  degrade-to-0 on a too-short window). A **horizontal neckline (slope 0) never
+  widens** — must reach the exact line; a steeper neckline fattens faster.
+
+**Breaking.** `PlanState` gains `origin_open` (serde-default empty; migration-safe
+— a plan still awaiting its break sets origin from its next bar's open, one still
+on the origin side; a plan past the break has the rule latched and never re-runs).
+`eval_trigger` is now private (no external users). `retest_tolerance` /
+`build_trade_plan` gained a parameter each (internal).
+
+**Config.** New signed override `tv-arm --cross-buffer-pct`. No new plan fields
+beyond `origin_open` on `PlanState` (not signed — it's runtime state).
+
+**Tests.** engine 153 (origin-below / skipped-transition / entry-edge-mode /
+slope-scaled / horizontal-stays-zero cases), core 852, tv-arm 231
+(`cross_buffer_pct_carried_onto_plan`), cli replay 94, cron 11. Validated by
+replaying the live EUR/GBP plan: with the buffer forced to 0 the break-and-close
+fires and the plan advances to `AwaitEntry` (origin-side path exercised).
+
+**Follow-up.** A better OHLC volatility estimator (Parkinson / Yang-Zhang) could
+replace the ATR calibration unit if the retest band is later found mis-sized on
+gappy instruments — drop-in (same `&[Candle] → Option<f64>` shape as `wilder_atr`).
+
 ## v89 — 2026-07-13 — shared spread-hour pending-order lifecycle: replay ≡ live
 
 **Why.** v88 suppressed *originating* off a spread-hour bar, but a resting order
