@@ -152,6 +152,82 @@ pub fn spread_hour_widen_frac_with_lead(
     spread_hour_widen_for(mask, &widen, now, lead_minutes)
 }
 
+/// The **exact sub-candle instant** at which the live cron would first widen an
+/// open stop for `instrument`, for a bar spanning `[bar_open, bar_open +
+/// bar_seconds)`, plus that widen's `spread/mid` fraction — or `None` when no
+/// flagged spread hour is reached in (or led into by) this bar.
+///
+/// This is the faithful replay stand-in for the live 15-min cron's mid-bar
+/// widen: it returns the precise wall-clock moment (e.g. 20:30Z = 30 min before
+/// a 21:00Z spike) the widen would fire, NOT the bar-open time. So an H1 replay
+/// reports "SL widened at 06:30" — the same sub-candle instant the live worker
+/// hits — rather than snapping it to a bar boundary
+/// (`BUG-spread-hour-widen-no-subhour-lead.md`).
+///
+/// Two cases, in priority order. **Already inside** wins: when `bar_open`'s own
+/// hour is flagged the widen is already active, so it fires at `bar_open`.
+/// Otherwise **lead-in**: when a flagged hour's top `T` is led into by this bar
+/// (its `T - lead` instant falls inside `[bar_open, bar_end)`), the widen fires at
+/// `T - lead` (clamped to `bar_open`, so it never predates the bar).
+///
+/// The lead is the fixed [`SPREAD_HOUR_LEAD_MINUTES`] (30) — the live value — so
+/// the replay reproduces the live instant exactly; the earlier "full bar early"
+/// lead is superseded by this precise sub-candle instant.
+pub fn spread_hour_widen_instant(
+    instrument: &str,
+    bar_open: chrono::DateTime<chrono::Utc>,
+    bar_seconds: i64,
+) -> Option<(chrono::DateTime<chrono::Utc>, f64)> {
+    use chrono::Duration;
+    let (mask, widen) = baked_candle_spread_hours(instrument)?;
+    if mask == 0 {
+        return None;
+    }
+    use chrono::Timelike;
+    let lead = Duration::minutes(SPREAD_HOUR_LEAD_MINUTES);
+    let bar_end = bar_open + Duration::seconds(bar_seconds.max(0));
+
+    // Case 2 FIRST (priority) — bar_open's own hour is ALREADY a flagged spread
+    // hour (a bar deep inside a multi-hour block): the widen is live from the
+    // bar's open, so it fires at `bar_open`. This must win over the lead-in
+    // below, or an in-block bar would report the *next* hour's lead instant.
+    let own_hour = bar_open.hour() as usize;
+    if mask & (1 << own_hour) != 0 {
+        return Some((bar_open, widen[own_hour]));
+    }
+
+    // Case 1 — a flagged hour top T is LED INTO by this bar: `T - lead` falls
+    // inside `[bar_open, bar_end)`. Walk hour tops forward from the first one
+    // strictly after bar_open; the first flagged one whose lead instant lands in
+    // this bar is the sub-candle widen instant (e.g. 20:30Z for a 20:00–21:00 bar
+    // leading into the 21:00Z spike). Bounded to 25 iterations (a day) so a
+    // pathological mask can't loop forever.
+    let mut hour_top = top_of_hour(bar_open) + Duration::hours(1);
+    for _ in 0..25 {
+        let widen_at = (hour_top - lead).max(bar_open);
+        // Once even the lead instant of this hour is past the bar's end, no later
+        // hour can land inside this bar either — stop.
+        if widen_at >= bar_end {
+            break;
+        }
+        let h = hour_top.hour() as usize;
+        if mask & (1 << h) != 0 {
+            return Some((widen_at, widen[h]));
+        }
+        hour_top += Duration::hours(1);
+    }
+    None
+}
+
+/// The top of the UTC hour containing `t` (minutes/seconds/nanos zeroed).
+fn top_of_hour(t: chrono::DateTime<chrono::Utc>) -> chrono::DateTime<chrono::Utc> {
+    use chrono::Timelike;
+    t.with_minute(0)
+        .and_then(|t| t.with_second(0))
+        .and_then(|t| t.with_nanosecond(0))
+        .unwrap_or(t)
+}
+
 /// The reject line, as a multiple of an instrument's *normal* (median)
 /// spread. The 2026-06-23 spread-hour data showed the post-NY-close
 /// blowout is an **FX** phenomenon — FX crosses spike 10–20× their normal
@@ -838,6 +914,76 @@ mod tests {
         assert!(
             spread_hour_widen_frac_with_lead("EUR/USD", prior_close, 60).is_some(),
             "60-min lead: pre-arms on the 20:00 bar"
+        );
+    }
+
+    // --- sub-candle widen instant (the faithful 06:30 lead) ---
+
+    #[test]
+    fn widen_instant_is_the_sub_candle_lead_before_the_spike() {
+        // GBP/AUD mask [21]. The 20:00–21:00 H1 bar LEADS INTO the 21:00Z spike,
+        // so the live cron's 30-min lead widens at 20:30Z (= 06:30 Brisbane) —
+        // a sub-candle instant, NOT the 20:00 bar open and NOT the 21:00 spike.
+        let (at, frac) = spread_hour_widen_instant("GBP/AUD", ts("2026-07-13T20:00:00Z"), 3600)
+            .expect("the 20:00 H1 bar leads into the 21:00 spread hour");
+        assert_eq!(
+            at,
+            ts("2026-07-13T20:30:00Z"),
+            "widen instant is 30 min before the 21:00 spike (20:30Z = 06:30 Bris)"
+        );
+        assert!(
+            frac > 0.0,
+            "leads into a flagged hour → positive widen fraction"
+        );
+    }
+
+    #[test]
+    fn widen_instant_fires_at_bar_open_when_its_own_hour_is_flagged() {
+        // GBP/AUD mask [21]. A bar OPENING at 21:00Z is itself the flagged hour,
+        // so the widen is already live from the bar open — the "own hour" case
+        // must win (return the bar open, not a next-hour lead instant).
+        let (at, _frac) = spread_hour_widen_instant("GBP/AUD", ts("2026-07-13T21:00:00Z"), 3600)
+            .expect("21:00Z IS the flagged spread hour");
+        assert_eq!(
+            at,
+            ts("2026-07-13T21:00:00Z"),
+            "own hour flagged → widen at the bar open, not a lead instant"
+        );
+    }
+
+    #[test]
+    fn widen_instant_none_two_bars_before_the_spike() {
+        // The 19:00–20:00 bar is two bars before the 21:00 GBP/AUD spike: its
+        // successor (20:00) isn't flagged and 21:00's lead (20:30) is past this
+        // bar's end (20:00). So no widen this bar.
+        assert_eq!(
+            spread_hour_widen_instant("GBP/AUD", ts("2026-07-13T19:00:00Z"), 3600),
+            None,
+            "two bars early → no widen (only the immediately-leading bar arms)"
+        );
+    }
+
+    #[test]
+    fn widen_instant_none_for_a_clean_daytime_bar() {
+        // Midday, nowhere near the 21:00 spike.
+        assert_eq!(
+            spread_hour_widen_instant("GBP/AUD", ts("2026-07-13T12:00:00Z"), 3600),
+            None
+        );
+    }
+
+    #[test]
+    fn widen_instant_on_a_15m_bar_still_leads_by_30_min() {
+        // A 15m bar (900s) at 20:30Z leads into 21:00Z: 30-min lead → widen at
+        // 20:30Z (clamped to the bar open, since 21:00 - 30 = 20:30 == bar open).
+        let (at, _f) = spread_hour_widen_instant("GBP/AUD", ts("2026-07-13T20:30:00Z"), 900)
+            .expect("the 20:30 15m bar's open is exactly the 30-min lead instant");
+        assert_eq!(at, ts("2026-07-13T20:30:00Z"));
+        // The 20:00 15m bar (ends 20:15) is too early — 20:30 lead is past its end.
+        assert_eq!(
+            spread_hour_widen_instant("GBP/AUD", ts("2026-07-13T20:00:00Z"), 900),
+            None,
+            "the 20:00–20:15 15m bar ends before the 20:30 lead instant"
         );
     }
 
