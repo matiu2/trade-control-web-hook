@@ -9,9 +9,11 @@
 
 mod break_and_close;
 mod enter;
+mod invalidate;
 mod retest;
 pub use break_and_close::BreakAndClose;
 pub use enter::Enter;
+pub use invalidate::Invalidate;
 pub use retest::Retest;
 
 use crate::{PlanRule, RuleKind};
@@ -29,4 +31,12 @@ pub fn is_retest(rule: &PlanRule) -> bool {
 /// Is this rule the entry?
 pub fn is_enter(rule: &PlanRule) -> bool {
     rule.kind == RuleKind::Enter
+}
+
+/// Is this rule an invalidation cap (either the upper or lower cap)?
+pub fn is_invalidate(rule: &PlanRule) -> bool {
+    matches!(
+        rule.kind,
+        RuleKind::InvalidateHigh | RuleKind::InvalidateLow
+    )
 }

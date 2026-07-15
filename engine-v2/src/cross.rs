@@ -101,9 +101,6 @@ pub fn eval_trigger(
 /// - `bar` — intrabar straddle vs a confirmed close.
 /// - `prev_close` — the rule's last close, for an `OnClose` cap (`None` on seed).
 /// - `buffer_pct` — the plan-level cross-depth buffer.
-// Consumed by the `Invalidate` rule (4c step 4); landed here first so the
-// no-projection cross path is proven in isolation before a rule depends on it.
-#[allow(dead_code)]
 pub fn eval_level(
     level: f64,
     dir: CrossDir,

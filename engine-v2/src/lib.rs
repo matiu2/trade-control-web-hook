@@ -69,5 +69,8 @@ pub use effect::Effect;
 pub use facts::{FactValue, Facts};
 pub use late_entry::{LateEntry, LateEntryOrder, resolve as resolve_late_entry};
 pub use rule::Rule;
-pub use rules::{BreakAndClose, Enter, Retest, is_break_and_close, is_enter, is_retest};
+pub use rules::{
+    BreakAndClose, Enter, Invalidate, Retest, is_break_and_close, is_enter, is_invalidate,
+    is_retest,
+};
 pub use world::World;

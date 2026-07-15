@@ -105,6 +105,20 @@ pub enum RuleKind {
     /// The *mechanism* (stop/limit/market) is the separate
     /// [`PlanRule::mechanism`] field. The first rule to produce a broker effect.
     Enter,
+    /// Invalidate on the **upper** cap ([`TooHigh`](crate::TooHigh)) — a horizontal
+    /// [`PriceLevel`](crate::PriceLevel), not a line. On a genuine cross of the cap
+    /// it retires the plan (emits `Effect::Invalidate`), blocking any pending
+    /// entry. A short's "too high" / an iH&S long's ceiling. The line is fixed by
+    /// the *kind* (→ `TooHigh`), same as `BreakAndClose` → `Neckline`; a `too_low`
+    /// cap is the separate [`InvalidateLow`](Self::InvalidateLow) kind.
+    InvalidateHigh,
+    /// Invalidate on the **lower** cap ([`TooLow`](crate::TooLow)) — a horizontal
+    /// [`PriceLevel`](crate::PriceLevel). Mirror of
+    /// [`InvalidateHigh`](Self::InvalidateHigh): a short's pcl-exhausted cap / an
+    /// iH&S long's floor. Two kinds (not one with a runtime level ref) keep "the
+    /// level is a type, bound by the kind" — a plan can carry both caps as two
+    /// rules.
+    InvalidateLow,
 }
 
 /// A rule as **plan data** — it says how the cross is tested (`bar`/`dir`), what

@@ -53,9 +53,9 @@ use trade_control_core::broker::Candle;
 use crate::effect::Effect;
 use crate::facts::{FactKind, FactValue, Facts, Invalidated, PLAN_SCOPE};
 use crate::rule::Rule;
-use crate::rules::{BreakAndClose, Enter, Retest};
+use crate::rules::{BreakAndClose, Enter, Invalidate, Retest};
 use crate::world::World;
-use crate::{Neckline, PlanRule, RuleKind, TradePlan};
+use crate::{Neckline, PlanRule, RuleKind, TooHigh, TooLow, TradePlan};
 
 /// Tick `plan`'s (pure) break-and-close rules for **one** bar — the current bar
 /// is `window.last()` — applying their write effects to the shared `facts`
@@ -138,16 +138,22 @@ pub fn tick_once(
 /// [`RuleKind`](crate::RuleKind). The impls borrow the rule, so this
 /// constructs the impl inline and ticks it (no per-rule boxing needed).
 ///
-/// The producer rules ([`BreakAndClose`], [`Retest`]) are generic over the line
-/// [`LineName`](crate::LineName) they target; the driver binds that line
-/// from the `kind`. In the current setup vocabulary both target
-/// [`Neckline`](crate::Neckline) — when an invalidation rule targeting
-/// `TooHigh`/`TooLow` lands, it gets its own `RuleKind` arm binding that line.
+/// The line/level-generic rules ([`BreakAndClose`], [`Retest`], [`Invalidate`])
+/// are generic over the [`LineName`](crate::LineName) they target; the driver
+/// binds that name from the `kind`. The preps target [`Neckline`](crate::Neckline);
+/// the invalidation caps target [`TooHigh`](crate::TooHigh) /
+/// [`TooLow`](crate::TooLow) (horizontal [`PriceLevel`](crate::PriceLevel)s) — one
+/// kind per cap so the level is fixed by the type, never a runtime string.
 fn tick_rule(rule: &PlanRule, world: &World) -> Vec<Effect> {
     match rule.kind {
         RuleKind::BreakAndClose => BreakAndClose::<Neckline>::new(rule).tick(world),
         RuleKind::Retest => Retest::<Neckline>::new(rule).tick(world),
         RuleKind::Enter => Enter::new(rule).tick(world),
+        // The invalidation caps bind their level from the kind, same as the preps
+        // bind `Neckline` — `TooHigh`/`TooLow` are `PriceLevel`s, crossed with no
+        // projection inside the rule.
+        RuleKind::InvalidateHigh => Invalidate::<TooHigh>::new(rule).tick(world),
+        RuleKind::InvalidateLow => Invalidate::<TooLow>::new(rule).tick(world),
     }
 }
 
