@@ -107,11 +107,11 @@ fn intent(instrument: &str) -> Intent {
     }
 }
 
-/// A break-and-close rule referencing the named line.
-fn bc_rule(instrument: &str, line: &str, bar: BarEvent, dir: CrossDir) -> PlanRule {
+/// A break-and-close rule (targets `Neckline`, the line the driver binds for
+/// `RuleKind::BreakAndClose`).
+fn bc_rule(instrument: &str, bar: BarEvent, dir: CrossDir) -> PlanRule {
     PlanRule {
         id: "03-prep-break-and-close".into(),
-        line: line.into(),
         kind: RuleKind::BreakAndClose,
         intent: intent(instrument),
         bar,
@@ -121,11 +121,11 @@ fn bc_rule(instrument: &str, line: &str, bar: BarEvent, dir: CrossDir) -> PlanRu
     }
 }
 
-/// A retest rule referencing the named line.
-fn retest_rule(instrument: &str, line: &str, bar: BarEvent, dir: CrossDir) -> PlanRule {
+/// A retest rule (targets `Neckline`, the line the driver binds for
+/// `RuleKind::Retest`).
+fn retest_rule(instrument: &str, bar: BarEvent, dir: CrossDir) -> PlanRule {
     PlanRule {
         id: "04-prep-retest".into(),
-        line: line.into(),
         kind: RuleKind::Retest,
         intent: intent(instrument),
         bar,
@@ -225,7 +225,7 @@ fn retest_gated_on_producer_fact() {
         "2026-06-01T20:00:00Z",
     );
     // Long retest = Down intrabar (a low reaching the line from above).
-    let rr = retest_rule("EUR_USD", "neckline", BarEvent::Intrabar, CrossDir::Down);
+    let rr = retest_rule("EUR_USD", BarEvent::Intrabar, CrossDir::Down);
     let p = plan("EUR_USD", vec![ln], vec![rr], 0.075);
 
     let candles = vec![
@@ -258,7 +258,7 @@ fn first_bar_after_break_needs_to_reach_line() {
         "2026-06-01T00:00:00Z",
         "2026-06-05T00:00:00Z",
     );
-    let rr = retest_rule("EUR_USD", "neckline", BarEvent::Intrabar, CrossDir::Down);
+    let rr = retest_rule("EUR_USD", BarEvent::Intrabar, CrossDir::Down);
     let p = plan("EUR_USD", vec![ln], vec![rr], 0.075);
 
     // Case A: N=1 wick falls SHORT of the line (low 1.2005 > 1.2000) → no stamp.
@@ -342,7 +342,7 @@ fn tolerance_grows_with_bars_since_break() {
             price: 1.2000,
         },
     };
-    let rr = retest_rule("EUR_USD", "neckline", BarEvent::Intrabar, CrossDir::Down);
+    let rr = retest_rule("EUR_USD", BarEvent::Intrabar, CrossDir::Down);
     let p = plan("EUR_USD", vec![ln], vec![rr], 0.075);
 
     // N=1 bar (tol 0): low 1.2003 — short of the line → no stamp.
@@ -415,7 +415,7 @@ fn fire_once_prevents_restamp() {
         "2026-06-01T00:00:00Z",
         "2026-06-05T00:00:00Z",
     );
-    let rr = retest_rule("EUR_USD", "neckline", BarEvent::Intrabar, CrossDir::Down);
+    let rr = retest_rule("EUR_USD", BarEvent::Intrabar, CrossDir::Down);
     let p = plan("EUR_USD", vec![ln], vec![rr], 0.075);
 
     let mut facts = Facts::new();
@@ -458,7 +458,7 @@ fn spread_hour_cross_does_not_stamp_but_scratch_advances() {
         "2026-06-15T09:00:00Z",
         "2026-06-16T00:00:00Z",
     );
-    let rr = retest_rule("EUR_USD", "neckline", BarEvent::OnClose, CrossDir::Down);
+    let rr = retest_rule("EUR_USD", BarEvent::OnClose, CrossDir::Down);
     let p = plan("EUR_USD", vec![ln], vec![rr], 0.075);
 
     let mut facts = Facts::new();
@@ -511,8 +511,8 @@ fn break_and_close_then_retest_end_to_end() {
         "2026-06-05T00:00:00Z",
     );
     // b&c FIRST in plan.rules, retest SECOND — the baked producer→consumer order.
-    let bc = bc_rule("EUR_USD", "neckline", BarEvent::OnClose, CrossDir::Down);
-    let rr = retest_rule("EUR_USD", "neckline", BarEvent::Intrabar, CrossDir::Down);
+    let bc = bc_rule("EUR_USD", BarEvent::OnClose, CrossDir::Down);
+    let rr = retest_rule("EUR_USD", BarEvent::Intrabar, CrossDir::Down);
     let p = plan("EUR_USD", vec![ln], vec![bc, rr], 0.075);
 
     // Kept short (4 bars) so the retest lands at N=1 (tol 0, no ATR needed) —

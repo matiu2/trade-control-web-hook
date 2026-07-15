@@ -95,11 +95,11 @@ fn intent() -> Intent {
     }
 }
 
-/// A break-and-close rule referencing the named line.
-fn bc_rule(line: &str, bar: BarEvent, dir: CrossDir) -> PlanRule {
+/// A break-and-close rule (targets `Neckline`, the line the driver binds for
+/// `RuleKind::BreakAndClose`).
+fn bc_rule(bar: BarEvent, dir: CrossDir) -> PlanRule {
     PlanRule {
         id: "03-prep-break-and-close".into(),
-        line: line.into(),
         kind: RuleKind::BreakAndClose,
         intent: intent(),
         bar,
@@ -178,7 +178,7 @@ fn onclose_cross_stamps_fact_and_fires() {
         "2026-06-01T09:00:00Z",
         "2026-06-01T20:00:00Z",
     );
-    let rule = bc_rule("neckline", BarEvent::OnClose, CrossDir::Down);
+    let rule = bc_rule(BarEvent::OnClose, CrossDir::Down);
     let p = plan(vec![ln], vec![rule]);
 
     let candles = vec![
@@ -208,7 +208,7 @@ fn no_cross_sets_no_fact_and_no_fire() {
         "2026-06-01T09:00:00Z",
         "2026-06-01T20:00:00Z",
     );
-    let rule = bc_rule("neckline", BarEvent::OnClose, CrossDir::Down);
+    let rule = bc_rule(BarEvent::OnClose, CrossDir::Down);
     let p = plan(vec![ln], vec![rule]);
 
     let candles = vec![
@@ -236,7 +236,7 @@ fn fire_once_prevents_refire_and_restamp() {
         "2026-06-01T09:00:00Z",
         "2026-06-02T20:00:00Z",
     );
-    let rule = bc_rule("neckline", BarEvent::OnClose, CrossDir::Down);
+    let rule = bc_rule(BarEvent::OnClose, CrossDir::Down);
     let p = plan(vec![ln], vec![rule]);
 
     let candles = vec![
@@ -286,7 +286,7 @@ fn sloped_neckline_interpolated_at_bar_index() {
         },
     };
     // Descending neckline, short → cross DOWN through the sloped line.
-    let rule = bc_rule("neckline", BarEvent::OnClose, CrossDir::Down);
+    let rule = bc_rule(BarEvent::OnClose, CrossDir::Down);
     let p = plan(vec![ln], vec![rule]);
 
     // bar2 (12:00) level = 1.1050. Seed bar1 (11:00, level 1.1075) closes above;
@@ -350,7 +350,7 @@ fn weekend_gap_uses_bar_index_not_wallclock() {
             price: 1.1050,
         },
     };
-    let rule = bc_rule("neckline", BarEvent::OnClose, CrossDir::Down);
+    let rule = bc_rule(BarEvent::OnClose, CrossDir::Down);
     let p = plan(vec![ln], vec![rule]);
 
     // Seed bar3 closes 1.1085 above; bar4 closes 1.1040 below the interpolated
@@ -411,10 +411,7 @@ fn cross_past_second_anchor_fires_via_forward_projection() {
         a: anchors.0,
         b: anchors.1,
     };
-    let p = plan(
-        vec![ln],
-        vec![bc_rule("neckline", BarEvent::OnClose, CrossDir::Down)],
-    );
+    let p = plan(vec![ln], vec![bc_rule(BarEvent::OnClose, CrossDir::Down)]);
     let mut facts = Facts::new();
     let effects = drive_series(&p, &mut facts, &window[3..=4], ts("2026-06-01T14:00:05Z"));
     assert_eq!(
@@ -440,7 +437,7 @@ fn last_close_scratch_recorded_on_seed_bar() {
         "2026-06-01T09:00:00Z",
         "2026-06-01T20:00:00Z",
     );
-    let rule = bc_rule("neckline", BarEvent::OnClose, CrossDir::Down);
+    let rule = bc_rule(BarEvent::OnClose, CrossDir::Down);
     let p = plan(vec![ln], vec![rule]);
 
     // Only the seed bar — no cross yet.
@@ -475,7 +472,7 @@ fn last_close_scratch_not_visible_in_shared_facts() {
         "2026-06-01T09:00:00Z",
         "2026-06-01T20:00:00Z",
     );
-    let rule = bc_rule("neckline", BarEvent::OnClose, CrossDir::Down);
+    let rule = bc_rule(BarEvent::OnClose, CrossDir::Down);
     let p = plan(vec![ln], vec![rule]);
 
     let candles = vec![candle(
@@ -505,5 +502,65 @@ fn last_close_scratch_not_visible_in_shared_facts() {
     assert_eq!(
         facts.get_named("03-prep-break-and-close", "last_close"),
         None
+    );
+}
+
+// ---------------------------------------------------------------------------
+// (4b) Wire round-trip — the string-on-the-wire boundary
+// ---------------------------------------------------------------------------
+
+/// The 4b boundary guard: typed geometry names serialize as their stable
+/// strings, and a plan survives a serialize → deserialize round-trip AND still
+/// drives identically.
+///
+/// This exercises the two wire facts 4b rests on:
+///
+/// 1. **`PlanRule` no longer carries a `line` field** — the serialized JSON must
+///    contain no `"line":` key on the rule (the line is fixed by the rule's
+///    type, `Neckline`, bound by the driver from `RuleKind::BreakAndClose`).
+/// 2. **`Line.name` is still the wire label** — the geometry the driver finds
+///    via `line_typed::<Neckline>()` resolves off the serialized `"neckline"`
+///    string, so the deserialized plan stamps `("neckline","break_close")`
+///    exactly as the in-memory one did.
+#[test]
+fn plan_wire_roundtrip_still_drives_and_stamps() {
+    let ln = horizontal_line(
+        "neckline",
+        1.1000,
+        "2026-06-01T09:00:00Z",
+        "2026-06-01T20:00:00Z",
+    );
+    let rule = bc_rule(BarEvent::OnClose, CrossDir::Down);
+    let p = plan(vec![ln], vec![rule]);
+
+    // Serialize to the wire form and assert the removed field is gone.
+    let wire = serde_json::to_string(&p).expect("plan serializes");
+    assert!(
+        !wire.contains("\"line\":"),
+        "PlanRule must not serialize a `line` field (the line is its type): {wire}"
+    );
+    assert!(
+        wire.contains("\"neckline\""),
+        "Line.name is still the wire label the driver resolves geometry from: {wire}"
+    );
+
+    // Round-trip back and drive the DESERIALIZED plan.
+    let p2: TradePlan = serde_json::from_str(&wire).expect("plan deserializes");
+
+    let candles = vec![
+        candle("2026-06-01T12:00:00Z", 1.1012, 1.1015, 1.1008, 1.1010),
+        candle("2026-06-01T13:00:00Z", 1.1008, 1.1009, 1.0985, 1.0990),
+    ];
+    let mut facts = Facts::new();
+    let effects = drive_series(&p2, &mut facts, &candles, ts("2026-06-01T13:00:05Z"));
+
+    // Identical outcome to the in-memory plan: one fire, break_close stamped to
+    // the cross candle — the `line_typed::<Neckline>()` lookup found the geometry
+    // off the round-tripped `"neckline"` string.
+    assert_eq!(fires(&effects), 1, "deserialized plan fires once");
+    assert_eq!(
+        facts.at_named("neckline", "break_close"),
+        Some(ts("2026-06-01T13:00:00Z")),
+        "deserialized plan stamps break_close identically"
     );
 }

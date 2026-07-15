@@ -66,7 +66,7 @@
 use trade_control_core::plan_eval::FiredIntent;
 
 use crate::effect::Effect;
-use crate::facts::EntryOutcome;
+use crate::facts::{EntryOutcome, FactKind};
 use crate::plan::PlanRule;
 use crate::rule::Rule;
 use crate::world::World;
@@ -96,7 +96,10 @@ impl Rule for Enter<'_> {
         // this fact — the driver writes it when it resolves the placement, so a
         // backlog bar whose placement the driver later drops never marks this enter
         // done.
-        if w.facts.is_set::<EntryOutcome>(&self.rule.id) {
+        // Keyed by the enter's **rule id** in the line slot (a runtime string, not
+        // a geometry `LineName`) — so this uses the by-name accessor. See the
+        // `entry_outcome` note above and `facts` on the two namespaces.
+        if w.facts.is_set_named(&self.rule.id, EntryOutcome::NAME) {
             return Vec::new();
         }
 

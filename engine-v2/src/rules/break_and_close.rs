@@ -34,41 +34,48 @@
 //! horizontal line is just a trendline whose two anchor prices are equal, so one
 //! code path covers both. Nothing in `cross.rs` was changed.
 
+use std::marker::PhantomData;
+
 use trade_control_core::broker::Candle;
 use trade_control_core::trade_plan::Trigger;
 
 use crate::cross::{eval_trigger, trigger_uses_close};
 use crate::effect::Effect;
 use crate::facts::{BreakClose, FactKind, FactValue, LastClose};
-use crate::plan::{Line, PlanRule};
+use crate::plan::{Line, LineName, PlanRule};
 use crate::rule::Rule;
 use crate::world::World;
 
-/// The break-and-close prep, bound to a v2 [`PlanRule`]. Borrowed so
-/// instantiating it per tick is free.
-pub struct BreakAndClose<'r> {
+/// The break-and-close prep, bound to a v2 [`PlanRule`] and a compile-time line
+/// `L` (the line it targets — `Neckline` today). Borrowed so instantiating it
+/// per tick is free; `L` is a zero-size [`PhantomData`] marker.
+pub struct BreakAndClose<'r, L: LineName> {
     /// The rule this wraps.
     pub rule: &'r PlanRule,
+    _line: PhantomData<L>,
 }
 
-impl<'r> BreakAndClose<'r> {
-    /// Wrap a break-and-close [`PlanRule`].
+impl<'r, L: LineName> BreakAndClose<'r, L> {
+    /// Wrap a break-and-close [`PlanRule`] targeting line `L`.
     pub fn new(rule: &'r PlanRule) -> Self {
-        Self { rule }
+        Self {
+            rule,
+            _line: PhantomData,
+        }
     }
 }
 
-impl Rule for BreakAndClose<'_> {
+impl<L: LineName> Rule for BreakAndClose<'_, L> {
     fn rule_id(&self) -> &str {
         &self.rule.id
     }
 
     fn tick(&self, w: &World) -> Vec<Effect> {
-        // Fire-once: once the break-and-close fact is set, this rule is done — it
-        // never re-stamps (v1's multi-enter re-cross guard). Reading to check
-        // "already done" is fine; a pure rule may read facts, it just can't write
-        // them.
-        if w.facts.is_set::<BreakClose>(&self.rule.line) {
+        // Fire-once: once the break-and-close fact is set on line `L`, this rule
+        // is done — it never re-stamps (v1's multi-enter re-cross guard). Reading
+        // to check "already done" is fine; a pure rule may read facts, it just
+        // can't write them.
+        if w.facts.is_set::<BreakClose, L>() {
             return Vec::new();
         }
 
@@ -78,8 +85,8 @@ impl Rule for BreakAndClose<'_> {
             return Vec::new();
         };
 
-        // The line this rule references must exist in the plan.
-        let Some(line) = w.plan.line(&self.rule.line) else {
+        // The line `L` this rule targets must exist in the plan.
+        let Some(line) = w.plan.line_typed::<L>() else {
             return Vec::new();
         };
 
@@ -111,9 +118,11 @@ impl Rule for BreakAndClose<'_> {
         }
 
         // Genuine cross: stamp the break-close shared fact AND dispatch the prep
-        // intent — both as effects, applied by the driver.
+        // intent — both as effects, applied by the driver. The effect carries the
+        // line/kind as runtime strings (the driver's apply path is by-name); the
+        // rule resolves them from its compile-time `L`/`BreakClose`.
         effects.push(Effect::WriteFact {
-            line: self.rule.line.clone(),
+            line: L::NAME.to_string(),
             kind: BreakClose::NAME.to_string(),
             value: FactValue::At(candle.time),
         });
@@ -124,7 +133,7 @@ impl Rule for BreakAndClose<'_> {
     }
 }
 
-impl BreakAndClose<'_> {
+impl<L: LineName> BreakAndClose<'_, L> {
     /// Assemble the v1 [`Trigger::TrendlineCross`] that `cross.rs` evaluates,
     /// from the v2 line + the rule's bar/dir. A horizontal line falls out as
     /// `a.price == b.price`.

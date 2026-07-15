@@ -104,10 +104,8 @@ fn enter_intent(instrument: &str) -> Intent {
 fn enter_rule(instrument: &str, preps: PrepMap, mechanism: EntryMechanism) -> PlanRule {
     PlanRule {
         id: "05-enter".into(),
-        // The enter is not tested against a geometry line directly — its
-        // preconditions come from `preps`. `line` is unused by the enter but the
-        // struct requires it; point it at the neckline for realism.
-        line: "neckline".into(),
+        // The enter references lines only through its `preps` map keys (runtime
+        // names), not a fixed geometry line — so there is no `line` field to set.
         kind: RuleKind::Enter,
         intent: enter_intent(instrument),
         bar: BarEvent::OnClose,
@@ -469,7 +467,6 @@ fn end_to_end_break_retest_enter() {
 
     let bc = PlanRule {
         id: "03-prep-break-and-close".into(),
-        line: "neckline".into(),
         kind: RuleKind::BreakAndClose,
         intent: {
             let mut i = enter_intent("EUR_USD");
@@ -484,7 +481,6 @@ fn end_to_end_break_retest_enter() {
     };
     let retest = PlanRule {
         id: "04-prep-retest".into(),
-        line: "neckline".into(),
         kind: RuleKind::Retest,
         intent: {
             let mut i = enter_intent("EUR_USD");

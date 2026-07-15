@@ -62,7 +62,10 @@ pub use facts::{
     BreakClose, EntryOutcome, FactKind, FactValue, Facts, LastClose, Retest as RetestFact,
 };
 pub use late_entry::{LateEntry, LateEntryOrder, resolve as resolve_late_entry};
-pub use plan::{EntryMechanism, Line, PlanRule, PrepMap, RuleKind, TradePlan};
+pub use plan::{
+    EntryMechanism, Line, LineName, Neckline, PlanRule, PrepMap, RuleKind, TooHigh, TooLow,
+    TradePlan,
+};
 pub use rule::Rule;
 pub use rules::{BreakAndClose, Enter, Retest, is_break_and_close, is_enter, is_retest};
 pub use world::World;

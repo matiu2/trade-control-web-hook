@@ -43,6 +43,8 @@ use serde::{Deserialize, Serialize};
 mod fact_kind;
 pub use fact_kind::{BreakClose, EntryOutcome, FactKind, LastClose, Retest};
 
+use crate::plan::LineName;
+
 /// A single fact's value. Kept deliberately small — a fact is either a
 /// timestamp (when something happened) or a flag/number.
 ///
@@ -99,10 +101,11 @@ impl Facts {
         Self::default()
     }
 
-    /// Set (or overwrite) the fact at `(line, K)`. The kind is a compile-time
-    /// [`FactKind`] type; the store keys on its [`NAME`](FactKind::NAME).
-    pub fn set<K: FactKind>(&mut self, line: &str, v: FactValue) {
-        self.set_named(line, K::NAME, v);
+    /// Set (or overwrite) the fact at `(L, K)`. Both axes are compile-time types:
+    /// the line [`LineName`] and the kind [`FactKind`]; the store keys on their
+    /// [`NAME`](FactKind::NAME)s.
+    pub fn set<K: FactKind, L: LineName>(&mut self, v: FactValue) {
+        self.set_named(L::NAME, K::NAME, v);
     }
 
     /// Set (or overwrite) the fact at `(line, kind)` by **runtime kind name**.
@@ -128,9 +131,9 @@ impl Facts {
         }
     }
 
-    /// Read the raw fact at `(line, K)`.
-    pub fn get<K: FactKind>(&self, line: &str) -> Option<&FactValue> {
-        self.get_named(line, K::NAME)
+    /// Read the raw fact at `(L, K)`.
+    pub fn get<K: FactKind, L: LineName>(&self) -> Option<&FactValue> {
+        self.get_named(L::NAME, K::NAME)
     }
 
     /// Read the raw fact at `(line, kind)` by **runtime kind name** (see
@@ -152,25 +155,25 @@ impl Facts {
         }
     }
 
-    /// Convenience: the `At(time)` at `(line, K)`, if set to a timestamp.
-    pub fn at<K: FactKind>(&self, line: &str) -> Option<DateTime<Utc>> {
-        match self.get::<K>(line) {
+    /// Convenience: the `At(time)` at `(L, K)`, if set to a timestamp.
+    pub fn at<K: FactKind, L: LineName>(&self) -> Option<DateTime<Utc>> {
+        match self.get::<K, L>() {
             Some(FactValue::At(t)) => Some(*t),
             _ => None,
         }
     }
 
-    /// Convenience: the `Num(n)` at `(line, K)`, if set to a number.
-    pub fn num<K: FactKind>(&self, line: &str) -> Option<f64> {
-        match self.get::<K>(line) {
+    /// Convenience: the `Num(n)` at `(L, K)`, if set to a number.
+    pub fn num<K: FactKind, L: LineName>(&self) -> Option<f64> {
+        match self.get::<K, L>() {
             Some(FactValue::Num(n)) => Some(*n),
             _ => None,
         }
     }
 
-    /// Convenience: is any fact set at `(line, K)`?
-    pub fn is_set<K: FactKind>(&self, line: &str) -> bool {
-        self.get::<K>(line).is_some()
+    /// Convenience: is any fact set at `(L, K)`?
+    pub fn is_set<K: FactKind, L: LineName>(&self) -> bool {
+        self.get::<K, L>().is_some()
     }
 
     /// Convenience: is any fact set at `(line, kind)` by **runtime kind name**?
@@ -245,6 +248,7 @@ impl Facts {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::plan::LineName;
     use chrono::TimeZone;
 
     fn t(h: u32) -> DateTime<Utc> {
@@ -258,15 +262,17 @@ mod tests {
     /// (the wire/serialized form).
     #[test]
     fn typed_and_named_apis_agree() {
-        let mut f = Facts::new();
-        f.set::<BreakClose>("neckline", FactValue::At(t(3)));
+        use crate::plan::Neckline;
 
-        assert_eq!(f.at::<BreakClose>("neckline"), Some(t(3)));
-        // Same fact, read by the runtime-name accessor at the stable NAME.
-        assert_eq!(f.at_named("neckline", BreakClose::NAME), Some(t(3)));
+        let mut f = Facts::new();
+        f.set::<BreakClose, Neckline>(FactValue::At(t(3)));
+
+        assert_eq!(f.at::<BreakClose, Neckline>(), Some(t(3)));
+        // Same fact, read by the runtime-name accessor at the stable NAMEs.
+        assert_eq!(f.at_named(Neckline::NAME, BreakClose::NAME), Some(t(3)));
         assert_eq!(f.at_named("neckline", "break_close"), Some(t(3)));
         // A different kind at the same line is absent.
-        assert!(!f.is_set::<Retest>("neckline"));
+        assert!(!f.is_set::<Retest, Neckline>());
     }
 
     /// The stable serialized NAMEs — these are persisted state; a change here is a
@@ -283,11 +289,14 @@ mod tests {
     /// NOT visible as a shared `(line, kind)` fact.
     #[test]
     fn scratch_is_not_a_shared_fact() {
+        use crate::plan::Neckline;
+
         let mut f = Facts::new();
         f.set_scratch::<LastClose>("03-prep", FactValue::Num(1.2345));
 
         assert_eq!(f.num_scratch::<LastClose>("03-prep"), Some(1.2345));
-        // Not surfaced as a shared fact keyed by the rule id as a "line".
-        assert!(!f.is_set::<LastClose>("03-prep"));
+        // Not surfaced as a shared fact — a scratch value under a rule id is not a
+        // `(line, kind)` fact on any line.
+        assert!(!f.is_set::<LastClose, Neckline>());
     }
 }

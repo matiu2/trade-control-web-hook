@@ -25,6 +25,9 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
+mod line_name;
+pub use line_name::{LineName, Neckline, TooHigh, TooLow};
+
 use trade_control_core::broker::Granularity;
 use trade_control_core::intent::{Direction, Intent};
 use trade_control_core::trade_plan::{BarEvent, CrossDir, LinePoint};
@@ -105,10 +108,19 @@ pub enum RuleKind {
     Enter,
 }
 
-/// A rule as **plan data** — it references a [`Line`] by name, says how the
-/// cross is tested (`bar`/`dir`), what role it plays (`kind`), and what
-/// [`Intent`] to fire. See the module doc for why this is `PlanRule`, not
-/// `Rule`.
+/// A rule as **plan data** — it says how the cross is tested (`bar`/`dir`), what
+/// role it plays (`kind`), and what [`Intent`] to fire. See the module doc for
+/// why this is `PlanRule`, not `Rule`.
+///
+/// # No `line` field — a producer rule's line is fixed by its *type*
+///
+/// A producer rule (break-and-close, retest) always targets a
+/// compile-time-known [`LineName`] — an H&S retest is *always* a `Neckline`
+/// retest. So the driver constructs the rule impl (`BreakAndClose<Neckline>`,
+/// `Retest<Neckline>`) with the line its [`RuleKind`] implies; the line is not
+/// carried here as wire data. The one rule that references lines *by runtime
+/// name* is the [`Enter`](crate::rules::Enter), and it does so through its
+/// [`preps`](Self::preps) map keys, not a single `line` field.
 // No `PartialEq`: `Intent` (below) does not implement it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PlanRule {
@@ -116,8 +128,6 @@ pub struct PlanRule {
     /// attribution and as the [`FiredIntent`](trade_control_core::plan_eval::FiredIntent)
     /// `rule_id`.
     pub id: String,
-    /// The [`Line::name`] this rule tests its cross against.
-    pub line: String,
     /// The rule's behaviour class.
     pub kind: RuleKind,
     /// The intent this rule dispatches when it fires.
@@ -181,8 +191,16 @@ pub struct TradePlan {
 }
 
 impl TradePlan {
-    /// Look up a line by name.
+    /// Look up a line by **runtime name** — the enter's path (its `preps` map
+    /// carries line names as plan data).
     pub fn line(&self, name: &str) -> Option<&Line> {
         self.lines.iter().find(|l| l.name == name)
+    }
+
+    /// Look up a line by its compile-time [`LineName`] — a producer rule's path
+    /// (it knows its line as a type). Delegates to [`line`](Self::line) at
+    /// [`L::NAME`](LineName::NAME).
+    pub fn line_typed<L: LineName>(&self) -> Option<&Line> {
+        self.line(L::NAME)
     }
 }

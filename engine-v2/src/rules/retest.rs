@@ -51,6 +51,8 @@
 //! (v1 keeps its `.expect()`; only the v2 driver-loop context needs the softer
 //! landing.)
 
+use std::marker::PhantomData;
+
 use trade_control_core::broker::Candle;
 use trade_control_core::signals::{atr_length_for, wilder_atr};
 use trade_control_core::trade_plan::{BarEvent, CrossDir, Trigger};
@@ -58,38 +60,43 @@ use trade_control_core::trade_plan::{BarEvent, CrossDir, Trigger};
 use crate::cross::{eval_trigger, level_crossed, line_price_at, trigger_uses_close};
 use crate::effect::Effect;
 use crate::facts::{BreakClose, FactKind, FactValue, LastClose, Retest as RetestKind};
-use crate::plan::{Line, PlanRule};
+use crate::plan::{Line, LineName, PlanRule};
 use crate::rule::Rule;
 use crate::world::World;
 
-/// The retest prep, bound to a v2 [`PlanRule`]. Borrowed so instantiating it per
-/// tick is free.
-pub struct Retest<'r> {
+/// The retest prep, bound to a v2 [`PlanRule`] and a compile-time line `L`
+/// (`Neckline` today). Borrowed so instantiating it per tick is free; `L` is a
+/// zero-size [`PhantomData`] marker.
+pub struct Retest<'r, L: LineName> {
     /// The rule this wraps.
     pub rule: &'r PlanRule,
+    _line: PhantomData<L>,
 }
 
-impl<'r> Retest<'r> {
-    /// Wrap a retest [`PlanRule`].
+impl<'r, L: LineName> Retest<'r, L> {
+    /// Wrap a retest [`PlanRule`] targeting line `L`.
     pub fn new(rule: &'r PlanRule) -> Self {
-        Self { rule }
+        Self {
+            rule,
+            _line: PhantomData,
+        }
     }
 }
 
-impl Rule for Retest<'_> {
+impl<L: LineName> Rule for Retest<'_, L> {
     fn rule_id(&self) -> &str {
         &self.rule.id
     }
 
     fn tick(&self, w: &World) -> Vec<Effect> {
-        // Fire-once: once the retest fact is set, this rule is done — it never
-        // re-stamps (v1's `retest_seen_at.is_some()` guard).
-        if w.facts.is_set::<RetestKind>(&self.rule.line) {
+        // Fire-once: once the retest fact is set on line `L`, this rule is done —
+        // it never re-stamps (v1's `retest_seen_at.is_some()` guard).
+        if w.facts.is_set::<RetestKind, L>() {
             return Vec::new();
         }
 
-        // Producer gate: nothing to do until break-and-close has stamped.
-        let Some(break_at) = w.facts.at::<BreakClose>(&self.rule.line) else {
+        // Producer gate: nothing to do until break-and-close has stamped on `L`.
+        let Some(break_at) = w.facts.at::<BreakClose, L>() else {
             return Vec::new();
         };
 
@@ -104,8 +111,8 @@ impl Rule for Retest<'_> {
             return Vec::new();
         }
 
-        // The line this rule references must exist in the plan.
-        let Some(line) = w.plan.line(&self.rule.line) else {
+        // The line `L` this rule targets must exist in the plan.
+        let Some(line) = w.plan.line_typed::<L>() else {
             return Vec::new();
         };
 
@@ -169,9 +176,10 @@ impl Rule for Retest<'_> {
 
         if crossed && !spread_hour {
             // Genuine retest: stamp the shared fact. No `Fire` — the enter reads
-            // this fact directly (see module docs).
+            // this fact directly (see module docs). The effect carries line/kind
+            // as runtime strings (the driver's by-name apply); resolved from `L`.
             effects.push(Effect::WriteFact {
-                line: self.rule.line.clone(),
+                line: L::NAME.to_string(),
                 kind: RetestKind::NAME.to_string(),
                 value: FactValue::At(candle.time),
             });
@@ -181,7 +189,7 @@ impl Rule for Retest<'_> {
     }
 }
 
-impl Retest<'_> {
+impl<L: LineName> Retest<'_, L> {
     /// Assemble the v1 [`Trigger::TrendlineCross`] that the cross helpers
     /// evaluate, from the v2 line + the rule's bar/dir. A horizontal line falls
     /// out as `a.price == b.price`. Same shape as

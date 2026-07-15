@@ -52,7 +52,7 @@ use trade_control_core::broker::Candle;
 
 use crate::effect::Effect;
 use crate::facts::Facts;
-use crate::plan::{PlanRule, RuleKind, TradePlan};
+use crate::plan::{Neckline, PlanRule, RuleKind, TradePlan};
 use crate::rule::Rule;
 use crate::rules::{BreakAndClose, Enter, Retest};
 use crate::world::World;
@@ -134,12 +134,18 @@ pub fn tick_once(
 }
 
 /// Tick one [`PlanRule`] via the [`Rule`] impl matching its
-/// [`RuleKind`](crate::plan::RuleKind). Both impls borrow the rule, so this
+/// [`RuleKind`](crate::plan::RuleKind). The impls borrow the rule, so this
 /// constructs the impl inline and ticks it (no per-rule boxing needed).
+///
+/// The producer rules ([`BreakAndClose`], [`Retest`]) are generic over the line
+/// [`LineName`](crate::plan::LineName) they target; the driver binds that line
+/// from the `kind`. In the current setup vocabulary both target
+/// [`Neckline`](crate::plan::Neckline) — when an invalidation rule targeting
+/// `TooHigh`/`TooLow` lands, it gets its own `RuleKind` arm binding that line.
 fn tick_rule(rule: &PlanRule, world: &World) -> Vec<Effect> {
     match rule.kind {
-        RuleKind::BreakAndClose => BreakAndClose::new(rule).tick(world),
-        RuleKind::Retest => Retest::new(rule).tick(world),
+        RuleKind::BreakAndClose => BreakAndClose::<Neckline>::new(rule).tick(world),
+        RuleKind::Retest => Retest::<Neckline>::new(rule).tick(world),
         RuleKind::Enter => Enter::new(rule).tick(world),
     }
 }
