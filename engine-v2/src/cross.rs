@@ -115,6 +115,33 @@ pub fn eval_level(
     eval_trigger(&trigger, candle, prev_close, &[], buffer_pct)
 }
 
+/// Has `candle` reached a **wall-clock marker** — the no-price path for a
+/// [`TimeMarker`](trade_control_types_v2::TimeMarker) (today: `expiry`).
+///
+/// A [`Line`](trade_control_types_v2::Line) crosses a price by projection; a
+/// [`PriceLevel`](trade_control_types_v2::PriceLevel) crosses a price directly; a
+/// `TimeMarker` has no price at all — the "cross" is `candle.time >= marker`. This
+/// is the v1 `Trigger::TimeReached` arm.
+///
+/// # Which clock — `candle.time`, NOT the tick's `now`
+///
+/// This deliberately tests the **bar's** timestamp, not the tick wall-clock. In
+/// v1 `trade-expiry` is a **spine** rule (it retires the plan), and spine rules
+/// fire on `candle.time` via `fire_rule` — "trade-expiry fires on the bar whose
+/// open passes expiry" (`engine::evaluate` `control_rule_fires` doc). Only v1's
+/// *control* `TimeReached` (pause/resume/news) uses wall-clock `now`; those aren't
+/// built in engine-v2 yet. So the expiry rule that consumes this passes
+/// `candle.time`, matching the proven spine semantics.
+///
+/// - `marker_epoch` — the marker time (Unix seconds).
+/// - `candle` — the bar under evaluation; its `time` is compared to the marker.
+// Consumed by the `Expiry` rule (4d step 3); landed here first so the time-marker
+// path is proven in isolation before a rule depends on it.
+#[allow(dead_code)]
+pub fn eval_time(marker_epoch: i64, candle: &Candle) -> bool {
+    candle.time.timestamp() >= marker_epoch
+}
+
 /// Did `candle` cross `level` in direction `dir` under the bar-event mode?
 /// Port of the old engine's `level_crossed`.
 ///
@@ -269,6 +296,43 @@ mod tests {
         assert!(
             eval_level(1.30, CrossDir::Up, BarEvent::Intrabar, &pierce, None, 0.1),
             "piercing past the buffer zone is a genuine cross",
+        );
+    }
+
+    /// A candle at a specific time (OHLC irrelevant) — for the time-marker path.
+    fn candle_at(y: i32, mo: u32, d: u32, h: u32) -> Candle {
+        Candle {
+            time: Utc.with_ymd_and_hms(y, mo, d, h, 0, 0).unwrap(),
+            o: 1.0,
+            h: 1.0,
+            l: 1.0,
+            c: 1.0,
+        }
+    }
+
+    /// [`eval_time`] fires exactly when the bar's time reaches the marker — at or
+    /// after, not before. It reads `candle.time`, no price.
+    #[test]
+    fn eval_time_fires_when_bar_reaches_marker() {
+        let marker = Utc
+            .with_ymd_and_hms(2026, 6, 1, 12, 0, 0)
+            .unwrap()
+            .timestamp();
+
+        // Before the marker: no fire.
+        assert!(
+            !eval_time(marker, &candle_at(2026, 6, 1, 11)),
+            "a bar before the marker does not reach it",
+        );
+        // Exactly at the marker: fires (>=).
+        assert!(
+            eval_time(marker, &candle_at(2026, 6, 1, 12)),
+            "a bar at the marker time reaches it",
+        );
+        // After the marker: fires.
+        assert!(
+            eval_time(marker, &candle_at(2026, 6, 1, 13)),
+            "a bar after the marker reaches it",
         );
     }
 }
