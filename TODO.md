@@ -28,8 +28,31 @@ the live cron keeps the 30-min default.
       Test: `widened_stop_at_pre_arms_a_full_bar_before_the_spread_hour_on_h1`
       (GBP/AUD [21] mask, H1 grid → widen lands on the 20:00 bar, not 21:00).
 - [x] Live cron unchanged (still calls `spread_hour_widen_frac` = 30-min lead).
-- [x] core 857 / engine 156 / cron 11 pass; clippy clean (pre-existing
-      `for h in 0..24` warning only); fmt run.
+
+## Follow-up (2026-07-15): report the widen at its SUB-CANDLE instant (06:30)
+Operator: the replay showed the widen at 06:00 (bar open), but the live cron
+widens mid-bar at ~06:30 (30-min lead before the 07:00 spike). The full-bar-early
+lead was the right *effect* but the wrong *displayed time*.
+- [x] core: new `spread_hour_widen_instant(instrument, bar_open, bar_seconds)`
+      returns the EXACT sub-candle widen moment + its widen fraction: the
+      `T - SPREAD_HOUR_LEAD_MINUTES` lead instant when the bar leads into a flagged
+      hour (20:30Z for a 20:00–21:00 bar), or `bar_open` when the bar's own hour is
+      already flagged. Tests: `widen_instant_*` (5).
+- [x] engine: `widened_stop_at` calls `spread_hour_widen_instant` and reports
+      `SpreadWiden.at` at the sub-candle instant (06:30), not the bar open.
+      Test renamed `widened_stop_at_reports_the_sub_candle_lead_instant_on_h1`
+      (asserts 20:30Z).
+- [x] core 862 / engine 156 pass; clippy clean; fmt run.
+
+## STILL OPEN — the exit sim ignores the widen (why it's still −2R)
+`simulate_fill` (engine/src/simulator.rs:308) scores every stop-out against the
+ORIGINAL stop; `widened_stop_at` is annotation-only (report.rs:690 says so). So
+the journal shows "SL widened → 1.93498" but the −1R is scored at the original
+1.93251. That's a replay↔live PARITY gap: live actually amends the broker stop,
+so a spread-hour stop-out can diverge. Fix = make `simulate_fill` apply the
+transient widened stop in `[widen.at, restored_at)`. NOT done — touches money-path
+scoring + fixtures; awaiting operator go-ahead. First verify the widened stop
+(1.93498) would even have survived the 21:00Z ask-high (else −2R is correct).
 
 ## Note
 The mask over-flag half (OANDA GBP_AUD [20,21]) is a SEPARATE change (regenerate
