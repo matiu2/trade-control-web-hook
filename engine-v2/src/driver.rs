@@ -51,7 +51,7 @@ use chrono::{DateTime, Utc};
 use trade_control_core::broker::Candle;
 
 use crate::effect::Effect;
-use crate::facts::Facts;
+use crate::facts::{FactKind, FactValue, Facts, Invalidated, PLAN_SCOPE};
 use crate::rule::Rule;
 use crate::rules::{BreakAndClose, Enter, Retest};
 use crate::world::World;
@@ -126,8 +126,9 @@ pub fn tick_once(
         };
         // Apply this rule's writes to `facts` immediately (before the next rule),
         // and collect its fires. `latest_bar` gates acquisitive effects (see
-        // `apply`): on a stale backlog bar a `PlaceOrder` is dropped.
-        apply(facts, &mut fires, effects, latest_bar);
+        // `apply`): on a stale backlog bar a `PlaceOrder` is dropped. `now` stamps
+        // the plan-scoped retire fact for an `Invalidate`.
+        apply(facts, &mut fires, effects, latest_bar, now);
     }
 
     fires
@@ -174,7 +175,13 @@ fn tick_rule(rule: &PlanRule, world: &World) -> Vec<Effect> {
 ///
 /// (`Fire` — the prep dispatch — is neither: it is folded into `fires`
 /// regardless. No prep is acquisitive; only `PlaceOrder` is gated.)
-fn apply(facts: &mut Facts, fires: &mut Vec<Effect>, effects: Vec<Effect>, latest_bar: bool) {
+fn apply(
+    facts: &mut Facts,
+    fires: &mut Vec<Effect>,
+    effects: Vec<Effect>,
+    latest_bar: bool,
+    now: DateTime<Utc>,
+) {
     for effect in effects {
         match effect {
             // The effect carries line/kind as strings, and the driver applies
@@ -199,6 +206,87 @@ fn apply(facts: &mut Facts, fires: &mut Vec<Effect>, effects: Vec<Effect>, lates
                     fires.push(effect);
                 }
             }
+            // Terminal retire: stamp the plan-scoped `invalidated` fact so the
+            // (pure) enter observes the retirement on the blackboard — its second
+            // fire-once guard — then fold the effect into `fires` so the caller
+            // sees the terminal signal explicitly. Timeless like a fact write
+            // (NOT acquisitive): it applies on a backlog bar too, so a cap that
+            // broke during downtime still retires the plan on catch-up.
+            Effect::Invalidate { .. } => {
+                facts.set_named(PLAN_SCOPE, Invalidated::NAME, FactValue::At(now));
+                fires.push(effect);
+            }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::TimeZone;
+
+    /// Applying an [`Effect::Invalidate`] stamps the plan-scoped `invalidated`
+    /// retire fact **and** folds the effect into the returned list — the two halves
+    /// of the terminal-retire wiring. Exercises the private `apply` directly (the
+    /// full rule → cross → retire path is the step-4 integration test).
+    #[test]
+    fn invalidate_stamps_retire_fact_and_is_returned() {
+        let mut facts = Facts::default();
+        let mut fires = Vec::new();
+        let now = Utc.with_ymd_and_hms(2026, 6, 1, 12, 0, 0).unwrap();
+
+        assert!(
+            !facts.is_set_named(PLAN_SCOPE, Invalidated::NAME),
+            "not retired before the invalidate",
+        );
+
+        apply(
+            &mut facts,
+            &mut fires,
+            vec![Effect::Invalidate {
+                rule_id: "01-veto-too-high".into(),
+            }],
+            true,
+            now,
+        );
+
+        assert!(
+            facts.is_set_named(PLAN_SCOPE, Invalidated::NAME),
+            "the retire fact is stamped so the enter's guard sees it",
+        );
+        assert_eq!(
+            facts.at_named(PLAN_SCOPE, Invalidated::NAME),
+            Some(now),
+            "stamped at the tick's `now`",
+        );
+        assert!(
+            matches!(fires.as_slice(), [Effect::Invalidate { .. }]),
+            "the Invalidate effect is returned to the caller as the terminal signal",
+        );
+    }
+
+    /// The retire is **not** gated by `latest_bar` — a cap that broke on a stale
+    /// backlog bar still retires the plan (invalidation is timeless knowledge,
+    /// like a fact write, unlike an acquisitive `PlaceOrder`).
+    #[test]
+    fn invalidate_applies_on_a_backlog_bar() {
+        let mut facts = Facts::default();
+        let mut fires = Vec::new();
+        let now = Utc.with_ymd_and_hms(2026, 6, 1, 12, 0, 0).unwrap();
+
+        apply(
+            &mut facts,
+            &mut fires,
+            vec![Effect::Invalidate {
+                rule_id: "01-veto-too-high".into(),
+            }],
+            false, // NOT the latest bar
+            now,
+        );
+
+        assert!(
+            facts.is_set_named(PLAN_SCOPE, Invalidated::NAME),
+            "invalidation applies on a backlog bar, unlike an acquisitive PlaceOrder",
+        );
     }
 }

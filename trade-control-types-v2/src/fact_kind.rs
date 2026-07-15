@@ -66,3 +66,23 @@ pub struct LastClose;
 impl FactKind for LastClose {
     const NAME: &'static str = "last_close";
 }
+
+/// `invalidated` — the plan's **terminal retire** stamp (shared fact, keyed by
+/// the plan-scope sentinel [`PLAN_SCOPE`], not a line or a rule id). Written by
+/// the DRIVER when it applies an
+/// [`Effect::Invalidate`](../../trade_control_engine_v2/enum.Effect.html): an
+/// invalidation cap (`too_high`/`too_low`) has been crossed, so the setup's
+/// thesis is dead. Read by the enter as a **second fire-once guard** — a
+/// retired plan never enters. `StopNextEntry`-only: it blocks entry, it does not
+/// close a position (v2 is single-shot with no open position to manage).
+pub struct Invalidated;
+impl FactKind for Invalidated {
+    const NAME: &'static str = "invalidated";
+}
+
+/// The reserved "line" slot for **plan-scoped** shared facts — facts about the
+/// whole plan rather than a single line. Chosen with surrounding double
+/// underscores so it can never collide with a real [`LineName`](crate::LineName)
+/// (`"neckline"`/`"too_high"`/…) or an operator-assigned rule id. Used today by
+/// the [`Invalidated`] retire fact.
+pub const PLAN_SCOPE: &str = "__plan__";

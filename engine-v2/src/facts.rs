@@ -43,7 +43,9 @@ use serde::{Deserialize, Serialize};
 // Fact-kind + line-name markers are the shared v2 model — they live in
 // `trade-control-types-v2` (a plan builder names preps with them without pulling
 // in the engine). The `Facts` blackboard here keys on their `NAME`s.
-pub use trade_control_types_v2::{BreakClose, EntryOutcome, FactKind, LastClose, LineName, Retest};
+pub use trade_control_types_v2::{
+    BreakClose, EntryOutcome, FactKind, Invalidated, LastClose, LineName, PLAN_SCOPE, Retest,
+};
 
 /// A single fact's value. Kept deliberately small — a fact is either a
 /// timestamp (when something happened) or a flag/number.
@@ -283,6 +285,8 @@ mod tests {
         assert_eq!(Retest::NAME, "retest");
         assert_eq!(EntryOutcome::NAME, "entry_outcome");
         assert_eq!(LastClose::NAME, "last_close");
+        assert_eq!(Invalidated::NAME, "invalidated");
+        assert_eq!(PLAN_SCOPE, "__plan__");
     }
 
     /// Scratch is a separate namespace: a `last_close` scratch under a rule id is

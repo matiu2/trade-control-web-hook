@@ -158,4 +158,36 @@ pub enum Effect {
         /// its firing candle.
         candle_close: f64,
     },
+    /// **Retire the plan** — a terminal invalidation. The [`Invalidate`] rule
+    /// emits it when an invalidation cap (`too_high`/`too_low`) is crossed: the
+    /// setup's thesis is dead, so no entry should fire for this plan again.
+    ///
+    /// # `StopNextEntry`-only — never closes a position
+    ///
+    /// In this slice the enter is single-shot with no position management, so
+    /// "retire" means exactly **block the enter**, not flatten an open trade. This
+    /// keeps faith with the `veto_close_only_when_thesis_invalidated` rule: an
+    /// invalidation cap stops the *next* entry; it does not carry a
+    /// close-positions action. (When position management lands, a separate
+    /// close-effect handles an open trade — this variant stays entry-blocking.)
+    ///
+    /// # How the driver applies it
+    ///
+    /// The driver stamps the plan-scoped retire fact
+    /// `(`[`PLAN_SCOPE`](crate::facts::PLAN_SCOPE)`, `[`Invalidated`](crate::facts::Invalidated)`)`
+    /// so the (pure) enter observes the retirement on the blackboard — the same
+    /// mechanism as its `entry_outcome` fire-once guard — **and** folds this effect
+    /// into the returned list so the caller sees the terminal signal explicitly.
+    /// It is neither acquisitive nor gated by `latest_bar`: an invalidation is
+    /// timeless knowledge (the cap broke whenever we learn it), so it applies on a
+    /// backlog bar exactly as a fact write does.
+    ///
+    /// [`Invalidate`]: crate::rules::Invalidate
+    Invalidate {
+        /// The invalidation rule's id (e.g. `01-veto-too-high`), for attribution
+        /// in the returned list and logs. The retire fact itself is plan-scoped
+        /// (keyed by [`PLAN_SCOPE`](crate::facts::PLAN_SCOPE)), not by this id — one
+        /// invalidation retires the whole plan.
+        rule_id: String,
+    },
 }
