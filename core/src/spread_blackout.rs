@@ -269,6 +269,54 @@ pub fn is_spread_hour(instrument: &str, now: chrono::DateTime<chrono::Utc>) -> b
     }
 }
 
+/// The longest bar on which a spread hour still *dominates* the candle, so the
+/// rubbish-candle **suppression** (declining an entry/signal/cross that lands on
+/// a spread-hour bar) should apply. A learned spread hour is a single UTC hour;
+/// on a bar this length or shorter that one hour is most/all of the bar, so its
+/// OHLC really is a liquidity-vacuum blowout. On a longer bar (H4, D) the spread
+/// hour is a minority slice — the other 3 (or 23) hours of genuine trading
+/// dilute it back to real data — so the suppression must NOT fire there.
+///
+/// We only trade 15m / 1h / 4h / D, so this is exactly "suppress on 15m + 1h,
+/// allow on 4h + D". `3600` = one hour: `<=` keeps H1, drops H4.
+const SPREAD_HOUR_SUPPRESSION_MAX_BAR_SECONDS: i64 = 60 * 60;
+
+/// Whether spread-hour rubbish-candle **suppression** should apply for a bar of
+/// `granularity` landing on a spread hour: `is_spread_hour` AND the bar is short
+/// enough that the spread hour dominates it (see
+/// [`SPREAD_HOUR_SUPPRESSION_MAX_BAR_SECONDS`]).
+///
+/// This is the single seam the engine's suppression sites (entry/signal, retest
+/// stamp, intrabar veto/cross, reversal-close detection) call, so the
+/// granularity policy lives in one place and replay == live. It deliberately
+/// does **not** gate the *stop-widen* / pending-order-lifecycle consumers of
+/// `is_spread_hour` — those protect an open position's stop through the actual
+/// spike and are correct on any bar size.
+pub fn suppress_on_spread_hour(
+    instrument: &str,
+    now: chrono::DateTime<chrono::Utc>,
+    granularity: crate::broker::Granularity,
+) -> bool {
+    suppress_on_spread_hour_bar_seconds(instrument, now, granularity.seconds())
+}
+
+/// [`suppress_on_spread_hour`] keyed on a raw **bar length in seconds** instead
+/// of a [`Granularity`] enum. For consumers that don't carry the plan's
+/// granularity but do have the candle spacing to hand — the fill simulator
+/// derives `bar_seconds` from consecutive candle times so its spread-hour fill
+/// skip matches the engine's suppression decision (replay == live) without
+/// threading `Granularity` through every simulator signature. A non-positive
+/// `bar_seconds` (a degenerate/one-candle window) fails safe to "suppress"
+/// (treated as a short bar) so we never *newly* allow a fill we can't size.
+pub fn suppress_on_spread_hour_bar_seconds(
+    instrument: &str,
+    now: chrono::DateTime<chrono::Utc>,
+    bar_seconds: i64,
+) -> bool {
+    let short_bar = bar_seconds <= 0 || bar_seconds <= SPREAD_HOUR_SUPPRESSION_MAX_BAR_SECONDS;
+    short_bar && is_spread_hour(instrument, now)
+}
+
 /// Is `mask` active at `now`, honouring the [`SPREAD_HOUR_LEAD_MINUTES`]
 /// look-ahead? The mask-only twin of [`spread_hour_widen_for`] (which returns
 /// the widen size); this returns just the boolean membership so `is_spread_hour`
@@ -704,6 +752,48 @@ mod tests {
         assert!(!is_spread_hour(
             "DEFINITELY NOT A REAL MARKET ZZZ",
             ts("2026-03-12T10:00:00Z")
+        ));
+    }
+
+    #[test]
+    fn suppression_only_applies_to_short_bars() {
+        use crate::broker::Granularity;
+        // 21:00Z on an unknown instrument is a spread hour (NY-close fallback),
+        // so `is_spread_hour` is true independent of the bar size.
+        let inst = "DEFINITELY NOT A REAL MARKET ZZZ";
+        let t = ts("2026-03-12T21:00:00Z");
+        assert!(
+            is_spread_hour(inst, t),
+            "premise: 21:00Z EDT is a spread hour"
+        );
+        // 15m + 1h are dominated by the 1h spread hour → suppress.
+        assert!(suppress_on_spread_hour(inst, t, Granularity::M15));
+        assert!(suppress_on_spread_hour(inst, t, Granularity::H1));
+        // H4 + D dilute it → do NOT suppress even though it IS a spread hour.
+        assert!(!suppress_on_spread_hour(inst, t, Granularity::H4));
+        assert!(!suppress_on_spread_hour(inst, t, Granularity::D1));
+        // A clean hour is never suppressed at any size.
+        let clean = ts("2026-03-12T10:00:00Z");
+        assert!(!suppress_on_spread_hour(inst, clean, Granularity::M15));
+        assert!(!suppress_on_spread_hour(inst, clean, Granularity::H4));
+    }
+
+    #[test]
+    fn suppression_bar_seconds_matches_the_granularity_seam() {
+        let inst = "DEFINITELY NOT A REAL MARKET ZZZ";
+        let t = ts("2026-03-12T21:00:00Z");
+        // 1h and below suppress; above 1h does not.
+        assert!(suppress_on_spread_hour_bar_seconds(inst, t, 900)); // 15m
+        assert!(suppress_on_spread_hour_bar_seconds(inst, t, 3600)); // 1h
+        assert!(!suppress_on_spread_hour_bar_seconds(inst, t, 14400)); // 4h
+        assert!(!suppress_on_spread_hour_bar_seconds(inst, t, 86400)); // 1d
+        // A degenerate/unknown spacing (0) fails safe to "short bar" → suppress.
+        assert!(suppress_on_spread_hour_bar_seconds(inst, t, 0));
+        // …but only when it actually IS a spread hour — a clean hour never suppresses.
+        assert!(!suppress_on_spread_hour_bar_seconds(
+            inst,
+            ts("2026-03-12T10:00:00Z"),
+            0
         ));
     }
 

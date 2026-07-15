@@ -411,6 +411,20 @@ struct Fill<'a> {
 /// can fill on is the **next** one, so we search from `candles[1..]`. A Market
 /// entry is the exception: it fills at the fire bar's close (the shell price).
 ///
+/// The bar length in seconds inferred from the smallest positive gap between
+/// consecutive candle open-times in `candles`. Weekend/session gaps are larger
+/// multiples of the true bar length, so the **minimum** positive delta is the
+/// bar size (H1 = 3600, H4 = 14400, …). Returns `0` for a window with fewer
+/// than two distinct times — callers treat that as "unknown, fail safe".
+fn bar_seconds_of(candles: &[BidAskCandle]) -> i64 {
+    candles
+        .windows(2)
+        .map(|w| w[1].time.timestamp() - w[0].time.timestamp())
+        .filter(|d| *d > 0)
+        .min()
+        .unwrap_or(0)
+}
+
 /// Returns `None` when the pending order never fills within the window (the
 /// caller maps that to `NeverFilled`).
 fn find_fill<'a>(
@@ -484,11 +498,19 @@ fn find_fill<'a>(
             // would (1) break the engine's own `pending_stop_does_not_fill_*`
             // tests and (2) make `resolve()` report the order FILLED on the spike
             // bar, so the lifecycle would never see it resting to cancel it.
+            // Bar length inferred from consecutive candle times, so the spread-
+            // hour fill skip is gated on bar size exactly as the engine's entry
+            // suppression is (only 15m/1h are dominated by a 1h spread hour; H4+
+            // fill normally). Derived here rather than threaded as `Granularity`
+            // to avoid churning every simulator signature. `0` (a one-candle
+            // window) fails safe to "short bar" in the helper → still skips.
+            let bar_seconds = bar_seconds_of(candles);
             let i = fill_window.iter().position(|c| {
                 book_reaches(c, entry_book, trigger_price, entry_approach)
-                    && !trade_control_core::spread_blackout::is_spread_hour(
+                    && !trade_control_core::spread_blackout::suppress_on_spread_hour_bar_seconds(
                         &intent.instrument,
                         c.time,
+                        bar_seconds,
                     )
             })?;
             // `i` indexes `fill_window` (a prefix of `after_fire`), so the fill
