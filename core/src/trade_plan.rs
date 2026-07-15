@@ -130,19 +130,31 @@ pub struct TradePlan {
     /// overrides the arm-time default ([`DEFAULT_CROSS_BUFFER_PCT`]).
     #[serde(default)]
     pub cross_buffer_pct: f64,
-    /// Per-bar decay step (in **ATR multiples**) for the retest's
-    /// closeness-to-neckline tolerance. The retest cross loosens as bars pass
-    /// since the break-and-close: the first bar after the break must actually
-    /// *reach* the neckline (tolerance 0), and each subsequent bar adds
-    /// `retest_atr_step × ATR` of **near-side** slack, so a wick that comes
-    /// *within* the tolerance of the line (without reaching it) still stamps the
-    /// retest. With `N` = bars since break-and-close (first = 1) and `ATR` the
-    /// Wilder ATR at the current bar, the tolerance is `(N-1) × retest_atr_step ×
-    /// ATR`. The rationale (operator): a retest right after the break should be
-    /// tight, but the further price drifts in time the less its exact distance to
-    /// the neckline matters.
+    /// Per-bar step for the retest's closeness-to-neckline tolerance — the retest
+    /// zone is a near-side band that **fattens over time, at a rate set by the
+    /// neckline's slope**. The first bar after the break must actually *reach* the
+    /// neckline (tolerance 0); each subsequent bar adds slack, so a wick that
+    /// comes *within* the tolerance of the line (without reaching it) still stamps
+    /// the retest. With `N` = bars since break-and-close (first = 1) the tolerance
+    /// is:
     ///
-    /// Only the retest rule uses this; every other intrabar cross keeps
+    /// ```text
+    /// tolerance(N) = (N-1) × retest_atr_step × |neckline slope, price per bar|
+    /// ```
+    ///
+    /// (Equivalently `(N-1) × retest_atr_step × ATR × (|slope|/ATR)` — the ATR, a
+    /// volatility proxy, cancels; it's still computed as the calibration unit and
+    /// guards a fail-soft degrade-to-0 when the window is too short to warm it.)
+    /// A **horizontal neckline has slope 0 ⇒ tolerance 0 forever** (retest it to
+    /// the exact line — flat necklines are precise price levels). A steeper
+    /// neckline fattens the band faster. Rationale (operator): the reason a retest
+    /// lands further from the line as bars pass is the *line moving away*, and how
+    /// fast it moves is its slope; combined with volatility (the ATR term the
+    /// step was calibrated in) that's `slope × vol` — the classic drift+diffusion
+    /// cone. Stricter than a textbook ATR-band (which keeps a band even on a flat
+    /// line) — deliberate, so horizontals stay exact.
+    ///
+    /// Only the retest rule uses this; every other cross keeps
     /// [`Self::cross_buffer_pct`] (which tightens, not loosens). Signed as part of
     /// the whole-body HMAC, so it's fixed at arm time; `tv-arm --retest-atr-step`
     /// overrides the default. `#[serde(default = …)]` gives plans signed before

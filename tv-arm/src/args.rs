@@ -342,13 +342,15 @@ pub struct Args {
     #[arg(long)]
     pub breakeven_pct: Option<f64>,
 
-    /// Per-bar decay step (in ATR multiples) for the retest's
-    /// closeness-to-neckline tolerance (default 0.075). The first bar after the
-    /// break-and-close must reach the neckline; each subsequent bar loosens the
-    /// retest by `step × ATR` of near-side slack (so a wick within the tolerance
-    /// still stamps the retest). Higher = more permissive faster; `0` freezes the
-    /// retest at "must reach the line" for the whole window. Bakes onto the
-    /// signed plan's `retest_atr_step`.
+    /// Per-bar step for the retest's closeness-to-neckline tolerance (default
+    /// 0.075). The retest zone fattens over time, **scaled by the neckline's
+    /// slope**: the first bar after the break-and-close must reach the neckline,
+    /// and each subsequent bar widens the near-side band by `step × |neckline
+    /// slope per bar|` (so a wick within the tolerance still stamps). A horizontal
+    /// neckline (slope 0) never widens — must reach the exact line; a steeper
+    /// neckline fattens faster. Higher = more permissive faster; `0` freezes the
+    /// retest at "must reach the line" for the whole window. Bakes onto the signed
+    /// plan's `retest_atr_step`.
     #[arg(long)]
     pub retest_atr_step: Option<f64>,
 

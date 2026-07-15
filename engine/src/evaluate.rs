@@ -1359,11 +1359,13 @@ fn stamp_retest(
     let Some(rule) = plan.rules.iter().find(|r| is_retest(r)) else {
         return;
     };
-    // Time-decaying closeness tolerance: the first bar after the break must
-    // reach the neckline; each later bar loosens by `retest_atr_step × ATR` of
-    // near-side slack (see `TradePlan::retest_atr_step`). `N` counts bars in the
-    // window strictly after the break, up to & including this one (first = 1).
-    let tol = retest_tolerance(plan, break_at, candle, window);
+    // Time-widening closeness tolerance, scaled by the neckline's slope: the
+    // first bar after the break must reach the neckline; each later bar fattens
+    // the band by `retest_atr_step × |neckline slope per bar|` (see
+    // `retest_tolerance`). A horizontal neckline (slope 0) never widens. `N`
+    // counts bars in the window strictly after the break, up to & including this
+    // one (first = 1).
+    let tol = retest_tolerance(plan, rule, break_at, candle, window);
     // Spread-hour "rubbish candle": a retest cross landing on a learned spread
     // hour is a liquidity-vacuum wick, not a genuine retest — don't stamp it.
     // `record_last_close` at the tail still runs, so a genuine retest on the
@@ -1417,28 +1419,48 @@ fn stamp_retest(
 
 /// The retest's near-side closeness tolerance for this bar, in **price units**.
 ///
-/// `(N - 1) × plan.retest_atr_step × ATR`, where `N` is the number of bars in
-/// `window` strictly after `break_at` up to & including `candle` (first bar
-/// after the break = 1, so its tolerance is 0 — it must reach the line). ATR is
-/// the Wilder ATR at this bar over `window`.
+/// The retest zone is a band around the neckline that **fattens over time, at a
+/// rate set by the neckline's steepness**:
 ///
-/// **Degrades to 0.0 (strict "must reach the line") if the ATR can't be
-/// computed** rather than panicking. The expectation is that by the time a plan
-/// is stamping retests it is in `Phase::AwaitEntry`, well past the detector's
-/// warmup, so `window` spans more than `atr_length_for(granularity)` bars and
-/// `wilder_atr` is `Some`. But that is NOT guaranteed: `detector_window_for`
-/// (in `trade-control-cron`) only reaches back to the earliest trendline anchor
-/// (or the Pine lookback), so a trendline-only / M-W plan with recent anchors
-/// can present a window shorter than the ATR length. A `None` here used to
-/// `.expect()`-panic, which unwound the whole shared `tc-scheduler` thread and
-/// silently froze EVERY plan's cron tick (staging incident 2026-07-14 04:32Z).
-/// A too-short window must degrade, not crash: 0.0 tolerance is the same
-/// conservative "must reach the line" rule already used for the first post-break
-/// bar (`bars_since_break <= 1`) and the `tol <= 0.0` strict-evaluator path, so
-/// the retest simply requires the wick to reach the neckline until the window
-/// warms. We `warn!` so a genuinely mis-sized window is still visible.
+/// ```text
+/// tolerance(N) = (N - 1) × retest_atr_step × ATR × slope_factor
+/// slope_factor = |neckline slope, price per bar| / ATR
+///              ⇒ tolerance(N) = (N - 1) × retest_atr_step × |slope_per_bar|
+/// ```
+///
+/// where `N` is the number of bars in `window` strictly after `break_at` up to &
+/// including `candle` (first bar after the break = 1, so its tolerance is 0 — it
+/// must reach the line). The ATR (a volatility proxy) **cancels out**: the band's
+/// per-bar fattening is driven purely by how fast the neckline drifts away from
+/// price. Rationale (operator): the reason a retest lands further from the line
+/// as bars pass is the *line moving*, and how fast it moves is the slope. A
+/// **flat (horizontal) neckline has slope 0 ⇒ tolerance 0 forever** — a
+/// horizontal must be retested to the exact line, no widening. A steep neckline
+/// fattens the band quickly. This is stricter than the textbook ATR-band (which
+/// keeps a volatility band even on a flat line) — a deliberate choice: horizontal
+/// necklines are exact price levels and should be retested precisely.
+///
+/// `slope_per_bar` is the neckline's price change per **bar-index** step (TV's
+/// ordinal x-axis, matching [`line_price_at`]), computed by [`neckline_slope`]
+/// from the retest rule's trendline anchors. `0.0` when the rule isn't a
+/// trendline (a horizontal retest) or the slope can't be resolved.
+///
+/// The ATR is still computed (it's the unit the `retest_atr_step` was calibrated
+/// in, and `slope/ATR × ATR` needs it present to be dimensionally the
+/// operator's step), but a `None` ATR **degrades to 0.0 (strict "must reach the
+/// line")** rather than panicking. The expectation is that by the time a plan is
+/// stamping retests it is in `Phase::AwaitEntry`, well past the detector's
+/// warmup, so `window` spans more than `atr_length_for(granularity)` bars. But
+/// that is NOT guaranteed: `detector_window_for` (in `trade-control-cron`) only
+/// reaches back to the earliest trendline anchor (or the Pine lookback), so a
+/// trendline-only / M-W plan with recent anchors can present a window shorter
+/// than the ATR length. A `None` here used to `.expect()`-panic, which unwound
+/// the whole shared `tc-scheduler` thread and silently froze EVERY plan's cron
+/// tick (staging incident 2026-07-14 04:32Z). A too-short window must degrade,
+/// not crash. We `warn!` so a genuinely mis-sized window is still visible.
 fn retest_tolerance(
     plan: &TradePlan,
+    retest_rule: &ConditionRule,
     break_at: DateTime<Utc>,
     candle: &Candle,
     window: &[Candle],
@@ -1450,7 +1472,9 @@ fn retest_tolerance(
     if bars_since_break <= 1 {
         return 0.0;
     }
-    let Some(atr) = wilder_atr(window, atr_length_for(plan.granularity)) else {
+    // ATR must still be warm (it's the calibration unit and guards the degrade
+    // path), even though it algebraically cancels against `slope_factor`.
+    if wilder_atr(window, atr_length_for(plan.granularity)).is_none() {
         tracing::warn!(
             instrument = %plan.instrument,
             window_len = window.len(),
@@ -1459,8 +1483,37 @@ fn retest_tolerance(
              (strict must-reach-the-line retest) until the detector window warms",
         );
         return 0.0;
+    }
+    // The band fattens per bar by `retest_atr_step × |neckline slope per bar|`.
+    // A horizontal neckline (slope 0) never widens — must reach the exact line.
+    let slope = neckline_slope(retest_rule, window).abs();
+    (bars_since_break as f64 - 1.0) * plan.retest_atr_step * slope
+}
+
+/// The retest neckline's slope in **price per bar-index step** — the price
+/// change from one traded bar to the next along the trendline. Measured in the
+/// engine's ordinal bar-index space (matching [`line_price_at`]), so a session
+/// gap doesn't inflate it. `0.0` for a non-trendline retest (a horizontal level),
+/// a degenerate line (both anchors on the same bar), or when an anchor's
+/// bar-index can't be resolved against `window`.
+fn neckline_slope(retest_rule: &ConditionRule, window: &[Candle]) -> f64 {
+    let Trigger::TrendlineCross {
+        a, b, bar_seconds, ..
+    } = &retest_rule.trigger
+    else {
+        return 0.0;
     };
-    (bars_since_break as f64 - 1.0) * plan.retest_atr_step * atr
+    let (Some(ia), Some(ib)) = (
+        bar_index_at(a.at_epoch, window, *bar_seconds),
+        bar_index_at(b.at_epoch, window, *bar_seconds),
+    ) else {
+        return 0.0;
+    };
+    let span = ib - ia;
+    if span == 0.0 {
+        return 0.0;
+    }
+    (b.price - a.price) / span
 }
 
 /// A retest cross, loosened by a near-side `tol` (price units). Identical to
@@ -3971,6 +4024,29 @@ mod tests {
         }
     }
 
+    /// An **angled** retest trendline (Down / long retest) over `window` built by
+    /// `warm_atr_window(24, first)`: anchor `a` at bar index 0 (`first`, price
+    /// 1.2000), anchor `b` at bar index 24 (`first + 24·3600`, price `1.2000 +
+    /// 24·slope`), so the slope is exactly `slope` price per bar-index step. Used
+    /// to test the slope-scaled retest tolerance (a horizontal line has slope 0
+    /// and never widens; only an angled neckline does).
+    fn retest_trendline_down(first: i64, slope: f64) -> Trigger {
+        Trigger::TrendlineCross {
+            a: LinePoint {
+                at_epoch: first,
+                price: 1.2000,
+            },
+            b: LinePoint {
+                at_epoch: first + 24 * 3600,
+                price: 1.2000 + 24.0 * slope,
+            },
+            extend_forward: true,
+            bar_seconds: 3600,
+            dir: CrossDir::Down,
+            bar: BarEvent::Intrabar,
+        }
+    }
+
     /// Bar 1 after the break has zero tolerance: a near-miss that doesn't reach
     /// the line does NOT stamp; a bar that reaches it does.
     #[test]
@@ -4031,21 +4107,24 @@ mod tests {
         );
     }
 
-    /// A later bar accepts a near-miss within its grown tolerance. At N=11 with
-    /// ATR 0.010 and step 0.075 the tolerance is (11-1)*0.075*0.010 = 0.0075, so
-    /// a low that stops 0.005 short of the line (within 0.0075) stamps — where
-    /// the same low on bar 1 would not.
+    /// A later bar accepts a near-miss within its grown tolerance — on an
+    /// **angled** neckline (a horizontal one never widens). At N=11 the tolerance
+    /// is `10 × step × |slope|`; a low that stops just short of the resolved line
+    /// (within tolerance) stamps, where the same low on bar 1 would not. Level and
+    /// tolerance are resolved from the helpers so the geometry stays honest.
     #[test]
     fn retest_later_bar_accepts_a_near_miss_within_tolerance() {
         let first = ts("2026-06-01T00:00:00Z").timestamp();
         let break_epoch = first + 24 * 3600;
+        // Angled descending neckline (slope 0.002/bar → a usable tolerance).
+        let retest = rule(
+            "04-prep-retest",
+            retest_trendline_down(first, 0.002),
+            FireMode::Once,
+            Action::Prep,
+        );
         let p = plan(vec![
-            rule(
-                "04-prep-retest",
-                retest_line_down(),
-                FireMode::Once,
-                Action::Prep,
-            ),
+            retest.clone(),
             rule(
                 "05-enter",
                 Trigger::MwEveryBar,
@@ -4056,54 +4135,83 @@ mod tests {
         let mut prior = seed_at(Phase::AwaitEntry, "2026-06-01T23:00:00Z");
         prior.break_close_at = Some(DateTime::from_timestamp(break_epoch, 0).unwrap());
 
-        // Window = warm bars + ten intervening near-miss bars (each stays above
-        // the line so none stamps) so the *eleventh* post-break bar is N=11.
+        // Warm bars + ten intervening bars whose lows stay well above the rising
+        // neckline (so none stamps) → the *eleventh* post-break bar is N=11.
         let mut window = warm_atr_window(24, first);
         for k in 1..=10 {
             let t = break_epoch + k * 3600;
-            let ct = DateTime::from_timestamp(t, 0).unwrap();
-            // Above the line (low 1.2050) — never a retest itself.
             window.push(Candle {
-                time: ct,
-                o: 1.2100,
-                h: 1.2150,
-                l: 1.2050,
-                c: 1.2100,
+                time: DateTime::from_timestamp(t, 0).unwrap(),
+                o: 1.30,
+                h: 1.31,
+                l: 1.29,
+                c: 1.30,
             });
         }
         let n11 = break_epoch + 11 * 3600;
         let n11t = DateTime::from_timestamp(n11, 0).unwrap();
-        // Near-miss 0.005 short of the line: low 1.2050? no — 1.2000+0.005 = 1.2050
-        // is exactly the boundary; use 1.2005 (0.0005 short, well within 0.0075).
+        // Resolve the neckline level + tolerance the engine will use at N=11.
+        let probe = Candle {
+            time: n11t,
+            o: 0.0,
+            h: 0.0,
+            l: 0.0,
+            c: 0.0,
+        };
+        let mut probe_window = window.clone();
+        probe_window.push(probe);
+        let level = match &retest.trigger {
+            Trigger::TrendlineCross {
+                a,
+                b,
+                extend_forward,
+                bar_seconds,
+                ..
+            } => line_price_at(a, b, &probe, *extend_forward, *bar_seconds, &probe_window).unwrap(),
+            _ => unreachable!(),
+        };
+        let tol = retest_tolerance(
+            &p,
+            &retest,
+            prior.break_close_at.unwrap(),
+            &probe,
+            &probe_window,
+        );
+        assert!(
+            tol > 0.0,
+            "N=11 on an angled neckline has a non-zero tolerance"
+        );
+        // Low that stops within tolerance of the line (half the tolerance short).
         let near = Candle {
             time: n11t,
-            o: 1.2100,
-            h: 1.2150,
-            l: 1.2005,
-            c: 1.2100,
+            o: level + 0.02,
+            h: level + 0.03,
+            l: level + tol * 0.5,
+            c: level + 0.02,
         };
         window.push(near);
         let eval = run_window(&p, &prior, &[near], &window);
         assert_eq!(
             eval.new_state.retest_seen_at,
             Some(n11t),
-            "at N=11 the tolerance is 0.0075; a low 0.0005 short of the line stamps"
+            "a low within tolerance of the angled neckline stamps at N=11"
         );
     }
 
-    /// Beyond the grown tolerance still rejects: at N=11 (tol 0.0075) a low that
-    /// stops 0.010 short of the line does NOT stamp.
+    /// Beyond the grown tolerance still rejects (angled neckline): a low that
+    /// stops well beyond the tolerance short of the line does NOT stamp.
     #[test]
     fn retest_beyond_tolerance_still_rejects() {
         let first = ts("2026-06-01T00:00:00Z").timestamp();
         let break_epoch = first + 24 * 3600;
+        let retest = rule(
+            "04-prep-retest",
+            retest_trendline_down(first, 0.002),
+            FireMode::Once,
+            Action::Prep,
+        );
         let p = plan(vec![
-            rule(
-                "04-prep-retest",
-                retest_line_down(),
-                FireMode::Once,
-                Action::Prep,
-            ),
+            retest.clone(),
             rule(
                 "05-enter",
                 Trigger::MwEveryBar,
@@ -4117,48 +4225,78 @@ mod tests {
         let mut window = warm_atr_window(24, first);
         for k in 1..=10 {
             let t = break_epoch + k * 3600;
-            let ct = DateTime::from_timestamp(t, 0).unwrap();
             window.push(Candle {
-                time: ct,
-                o: 1.2100,
-                h: 1.2150,
-                l: 1.2050,
-                c: 1.2100,
+                time: DateTime::from_timestamp(t, 0).unwrap(),
+                o: 1.30,
+                h: 1.31,
+                l: 1.29,
+                c: 1.30,
             });
         }
         let n11 = break_epoch + 11 * 3600;
         let n11t = DateTime::from_timestamp(n11, 0).unwrap();
-        // 0.010 short of the line (low 1.2100) — beyond the 0.0075 tolerance.
+        let probe = Candle {
+            time: n11t,
+            o: 0.0,
+            h: 0.0,
+            l: 0.0,
+            c: 0.0,
+        };
+        let mut probe_window = window.clone();
+        probe_window.push(probe);
+        let level = match &retest.trigger {
+            Trigger::TrendlineCross {
+                a,
+                b,
+                extend_forward,
+                bar_seconds,
+                ..
+            } => line_price_at(a, b, &probe, *extend_forward, *bar_seconds, &probe_window).unwrap(),
+            _ => unreachable!(),
+        };
+        let tol = retest_tolerance(
+            &p,
+            &retest,
+            prior.break_close_at.unwrap(),
+            &probe,
+            &probe_window,
+        );
+        // Low well beyond the tolerance (3× the tolerance short of the line).
         let far = Candle {
             time: n11t,
-            o: 1.2120,
-            h: 1.2150,
-            l: 1.2100,
-            c: 1.2120,
+            o: level + tol * 3.0 + 0.02,
+            h: level + tol * 3.0 + 0.03,
+            l: level + tol * 3.0,
+            c: level + tol * 3.0 + 0.02,
         };
         window.push(far);
         let eval = run_window(&p, &prior, &[far], &window);
         assert!(
             eval.new_state.retest_seen_at.is_none(),
-            "at N=11 a low 0.010 short of the line is beyond the 0.0075 tolerance"
+            "a low beyond the tolerance short of the angled neckline does not stamp"
         );
     }
 
-    /// The tolerance helper: N=1 → 0; grows linearly at step×ATR per bar.
+    /// The tolerance helper on an **angled** neckline: N=1 → 0; then the band
+    /// fattens linearly at `step × |slope per bar|` per bar. The ATR cancels —
+    /// only the slope drives the width.
     #[test]
-    fn retest_tolerance_grows_linearly() {
+    fn retest_tolerance_grows_linearly_with_slope() {
         let first = ts("2026-06-01T00:00:00Z").timestamp();
         let break_epoch = first + 24 * 3600;
         let break_at = DateTime::from_timestamp(break_epoch, 0).unwrap();
-        let mut p = plan(vec![rule(
+        // Angled neckline: slope 0.0005 price per bar-index step.
+        let slope = 0.0005;
+        let retest = rule(
             "04-prep-retest",
-            retest_line_down(),
+            retest_trendline_down(first, slope),
             FireMode::Once,
             Action::Prep,
-        )]);
+        );
+        let mut p = plan(vec![retest.clone()]);
         p.retest_atr_step = 0.075;
 
-        // Window: 24 warm bars (ATR 0.010) + bars at N=1..3 after the break.
+        // Window: 24 warm bars (ATR 0.010, though it cancels) + N=1..3 post-break.
         let mut window = warm_atr_window(24, first);
         for k in 1..=3 {
             let t = break_epoch + k * 3600;
@@ -4171,51 +4309,80 @@ mod tests {
             });
         }
         let at = |k: i64| DateTime::from_timestamp(break_epoch + k * 3600, 0).unwrap();
-        let tol1 = retest_tolerance(
-            &p,
-            break_at,
-            &Candle {
-                time: at(1),
-                o: 0.0,
-                h: 0.0,
-                l: 0.0,
-                c: 0.0,
-            },
-            &window,
-        );
-        let tol2 = retest_tolerance(
-            &p,
-            break_at,
-            &Candle {
-                time: at(2),
-                o: 0.0,
-                h: 0.0,
-                l: 0.0,
-                c: 0.0,
-            },
-            &window,
-        );
-        let tol3 = retest_tolerance(
-            &p,
-            break_at,
-            &Candle {
-                time: at(3),
-                o: 0.0,
-                h: 0.0,
-                l: 0.0,
-                c: 0.0,
-            },
-            &window,
+        let bar = |k: i64| Candle {
+            time: at(k),
+            o: 0.0,
+            h: 0.0,
+            l: 0.0,
+            c: 0.0,
+        };
+        let tol1 = retest_tolerance(&p, &retest, break_at, &bar(1), &window);
+        let tol2 = retest_tolerance(&p, &retest, break_at, &bar(2), &window);
+        let tol3 = retest_tolerance(&p, &retest, break_at, &bar(3), &window);
+        // The slope the engine resolves in bar-index space (the anchor may land
+        // between bars, so measure it via the same helper rather than assuming
+        // exactly `slope`). It must be non-zero (angled) and close to `slope`.
+        let s = neckline_slope(&retest, &window).abs();
+        assert!(s > 0.0, "angled neckline has a non-zero slope");
+        assert!(
+            (s - slope).abs() < slope * 0.1,
+            "resolved slope {s} ≈ intended {slope}"
         );
         assert!(tol1.abs() < 1e-12, "N=1 tolerance is 0, got {tol1}");
         assert!(
-            (tol2 - 0.00075).abs() < 1e-9,
-            "N=2 → 1*0.075*0.010, got {tol2}"
+            (tol2 - 1.0 * 0.075 * s).abs() < 1e-12,
+            "N=2 → 1*step*slope, got {tol2}"
         );
         assert!(
-            (tol3 - 0.0015).abs() < 1e-9,
-            "N=3 → 2*0.075*0.010, got {tol3}"
+            (tol3 - 2.0 * 0.075 * s).abs() < 1e-12,
+            "N=3 → 2*step*slope, got {tol3}"
         );
+        assert!(tol3 > tol2, "the band fattens with N on an angled neckline");
+    }
+
+    /// A **horizontal** neckline (slope 0) never widens — tolerance stays 0.0 at
+    /// every N (strict must-reach-the-line forever). This is the operator's rule:
+    /// a flat neckline is an exact price level, retest it precisely.
+    #[test]
+    fn retest_tolerance_horizontal_neckline_stays_zero() {
+        let first = ts("2026-06-01T00:00:00Z").timestamp();
+        let break_epoch = first + 24 * 3600;
+        let break_at = DateTime::from_timestamp(break_epoch, 0).unwrap();
+        // `retest_line_down()` is a HorizontalCross → slope 0.
+        let retest = rule(
+            "04-prep-retest",
+            retest_line_down(),
+            FireMode::Once,
+            Action::Prep,
+        );
+        let mut p = plan(vec![retest.clone()]);
+        p.retest_atr_step = 0.075;
+        let mut window = warm_atr_window(24, first);
+        for k in 1..=3 {
+            let t = break_epoch + k * 3600;
+            window.push(Candle {
+                time: DateTime::from_timestamp(t, 0).unwrap(),
+                o: 1.2100,
+                h: 1.2150,
+                l: 1.2050,
+                c: 1.2100,
+            });
+        }
+        let at = |k: i64| DateTime::from_timestamp(break_epoch + k * 3600, 0).unwrap();
+        for k in 1..=3 {
+            let candle = Candle {
+                time: at(k),
+                o: 0.0,
+                h: 0.0,
+                l: 0.0,
+                c: 0.0,
+            };
+            let tol = retest_tolerance(&p, &retest, break_at, &candle, &window);
+            assert!(
+                tol.abs() < 1e-12,
+                "horizontal neckline never widens (N={k}), got {tol}"
+            );
+        }
     }
 
     /// A retest window shorter than `atr_length_for(granularity)` (so
@@ -4250,15 +4417,16 @@ mod tests {
             l: 0.0,
             c: 0.0,
         };
-        let mut p = plan(vec![rule(
+        let retest = rule(
             "04-prep-retest",
             retest_line_down(),
             FireMode::Once,
             Action::Prep,
-        )]);
+        );
+        let mut p = plan(vec![retest.clone()]);
         p.retest_atr_step = 0.075;
         // Must return 0.0 (strict must-reach), not panic.
-        let tol = retest_tolerance(&p, break_at, &candle, &window);
+        let tol = retest_tolerance(&p, &retest, break_at, &candle, &window);
         assert!(tol.abs() < 1e-12, "short window → 0.0 tolerance, got {tol}");
     }
 

@@ -353,13 +353,23 @@ settled far-side bar. `fire_rule` picks the mode by `rule.intent.action`
 (`OnCloseRefs { settled: action != Enter }`); the `Intrabar` arm is unchanged
 (reads the wick). See `[[break_close_edge_detector_misses_already_above]]`.
 
-**Retest closeness decays over time (2026-07-03).** The `04-prep-retest` cross
-(only the retest, not other intrabar consumers) carries a **near-side tolerance
-that grows with bars since the break-and-close**: `tolerance(N) = (N-1) ×
-plan.retest_atr_step × ATR`, where `N` counts bars after `break_close_at` (first
-= 1 → tolerance 0, must reach the line) and `ATR` is the Wilder ATR over the
-detector window. A wick that comes *within* the tolerance of the line stamps the
-retest even without reaching it. Lives in `stamp_retest` → `retest_tolerance` +
+**Retest zone fattens over time, SCALED BY THE NECKLINE'S SLOPE (2026-07-15).**
+The `04-prep-retest` cross (only the retest, not other intrabar consumers)
+carries a **near-side tolerance that grows with bars since the break-and-close,
+at a rate set by the neckline's slope**: `tolerance(N) = (N-1) ×
+plan.retest_atr_step × |neckline slope, price per bar|`, where `N` counts bars
+after `break_close_at` (first = 1 → tolerance 0, must reach the line). The slope
+is measured in the engine's **bar-index** space (`neckline_slope` → `bar_index_at`,
+matching `line_price_at`, so a session gap doesn't inflate it). A **horizontal
+neckline has slope 0 ⇒ tolerance 0 forever** — a flat neckline is an exact price
+level and must be retested precisely; a steeper neckline fattens the band faster.
+This is the slope-scaled form of the earlier ATR-only rule (`(N-1) × step × ATR`,
+2026-07-03): algebraically it's `(N-1) × step × ATR × (|slope|/ATR)` so the ATR (a
+volatility proxy) **cancels** — but the ATR is still computed as the calibration
+unit and guards the degrade path below. Stricter than a textbook ATR-band (which
+keeps a band even on a flat line): deliberate, so horizontals stay exact. A wick
+that comes *within* the tolerance of the line stamps the retest even without
+reaching it. Lives in `stamp_retest` → `retest_tolerance` + `neckline_slope` +
 `retest_crossed` (`engine/src/evaluate.rs`); the signed field is
 `TradePlan.retest_atr_step` (default `DEFAULT_RETEST_ATR_STEP = 0.075`, tv-arm
 `--retest-atr-step`). If the ATR can't be computed (window shorter than
