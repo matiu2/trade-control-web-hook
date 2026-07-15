@@ -324,17 +324,52 @@ closed back above.) The directional `buffer` (`cross_buffer_pct`) still applies 
 the cross-side wick so a one-tick graze doesn't trip it. See
 `[[intrabar_cross_reads_wick_not_close]]`.
 
-**`BarEvent::OnClose` is unchanged** — `03-prep-break-and-close` still requires a
-genuine close through the line (open one side, **close** the other). Only the
-intrabar arm moved.
+**`BarEvent::OnClose` now reads the ORIGIN side, not the prior close (2026-07-15).**
+An OnClose cross used to be an **edge detector** (`prev_close < far_edge &&
+close >= far_edge`) — it fired only on the bar that made the below→above (or
+above→below) *transition*. That lost a genuine break-and-close whenever the
+transition bar was suppressed (a spread-hour rubbish candle) or the plan armed
+already-past the line: the next clean bar had a `prev` already on the far side,
+so `prev < far_edge` was false and it never stamped. Stranded EUR/GBP & GBP/USD
+setups in `AwaitBreakAndClose` forever.
 
-**Retest closeness decays over time (2026-07-03).** The `04-prep-retest` cross
-(only the retest, not other intrabar consumers) carries a **near-side tolerance
-that grows with bars since the break-and-close**: `tolerance(N) = (N-1) ×
-plan.retest_atr_step × ATR`, where `N` counts bars after `break_close_at` (first
-= 1 → tolerance 0, must reach the line) and `ATR` is the Wilder ATR over the
-detector window. A wick that comes *within* the tolerance of the line stamps the
-retest even without reaching it. Lives in `stamp_retest` → `retest_tolerance` +
+The rule is now **origin-side / settled-close** for the latching consumers: the
+**origin** (the open of the first bar the rule ever saw — the arm-time bar in
+practice, stored once in `PlanState.origin_open`) fixes which side the plan
+started on, and **any bar that CLOSES on the far side of the line from the
+origin fires**, whether or not the transition happened on that bar. Operator's
+model: "we know which side we started on; the first bar that *closes* across is
+the break." Robust to a suppressed/skipped transition bar. The "must reach the
+far *zone* edge" half is retained, so the NAS100 "zone of the line" fix stands
+(a close that only dips into the buffer zone is not a break). Applies to **all
+latching OnClose rules**: `03-prep-break-and-close`, `04-prep-retest` (when
+OnClose), the `too-high`/`too-low` invalidation caps, M/W abort, drawn lines.
+
+**Exception — entry OnClose crosses keep EDGE semantics.** The strategy-v2 stop
+/ Quasimodo-limit `05-enter`/`09-enter-qm` OnClose crosses (`HorizontalCross …
+on_close` with `action: enter`) still fire once **per transition**, reading the
+prior close — a multi-shot entry cross must not re-place an order on every
+settled far-side bar. `fire_rule` picks the mode by `rule.intent.action`
+(`OnCloseRefs { settled: action != Enter }`); the `Intrabar` arm is unchanged
+(reads the wick). See `[[break_close_edge_detector_misses_already_above]]`.
+
+**Retest zone fattens over time, SCALED BY THE NECKLINE'S SLOPE (2026-07-15).**
+The `04-prep-retest` cross (only the retest, not other intrabar consumers)
+carries a **near-side tolerance that grows with bars since the break-and-close,
+at a rate set by the neckline's slope**: `tolerance(N) = (N-1) ×
+plan.retest_atr_step × |neckline slope, price per bar|`, where `N` counts bars
+after `break_close_at` (first = 1 → tolerance 0, must reach the line). The slope
+is measured in the engine's **bar-index** space (`neckline_slope` → `bar_index_at`,
+matching `line_price_at`, so a session gap doesn't inflate it). A **horizontal
+neckline has slope 0 ⇒ tolerance 0 forever** — a flat neckline is an exact price
+level and must be retested precisely; a steeper neckline fattens the band faster.
+This is the slope-scaled form of the earlier ATR-only rule (`(N-1) × step × ATR`,
+2026-07-03): algebraically it's `(N-1) × step × ATR × (|slope|/ATR)` so the ATR (a
+volatility proxy) **cancels** — but the ATR is still computed as the calibration
+unit and guards the degrade path below. Stricter than a textbook ATR-band (which
+keeps a band even on a flat line): deliberate, so horizontals stay exact. A wick
+that comes *within* the tolerance of the line stamps the retest even without
+reaching it. Lives in `stamp_retest` → `retest_tolerance` + `neckline_slope` +
 `retest_crossed` (`engine/src/evaluate.rs`); the signed field is
 `TradePlan.retest_atr_step` (default `DEFAULT_RETEST_ATR_STEP = 0.075`, tv-arm
 `--retest-atr-step`). If the ATR can't be computed (window shorter than

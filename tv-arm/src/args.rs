@@ -342,15 +342,30 @@ pub struct Args {
     #[arg(long)]
     pub breakeven_pct: Option<f64>,
 
-    /// Per-bar decay step (in ATR multiples) for the retest's
-    /// closeness-to-neckline tolerance (default 0.075). The first bar after the
-    /// break-and-close must reach the neckline; each subsequent bar loosens the
-    /// retest by `step × ATR` of near-side slack (so a wick within the tolerance
-    /// still stamps the retest). Higher = more permissive faster; `0` freezes the
-    /// retest at "must reach the line" for the whole window. Bakes onto the
-    /// signed plan's `retest_atr_step`.
+    /// Per-bar step for the retest's closeness-to-neckline tolerance (default
+    /// 0.075). The retest zone fattens over time, **scaled by the neckline's
+    /// slope**: the first bar after the break-and-close must reach the neckline,
+    /// and each subsequent bar widens the near-side band by `step × |neckline
+    /// slope per bar|` (so a wick within the tolerance still stamps). A horizontal
+    /// neckline (slope 0) never widens — must reach the exact line; a steeper
+    /// neckline fattens faster. Higher = more permissive faster; `0` freezes the
+    /// retest at "must reach the line" for the whole window. Bakes onto the signed
+    /// plan's `retest_atr_step`.
     #[arg(long)]
     pub retest_atr_step: Option<f64>,
+
+    /// Cross-depth buffer, as a **percent of the crossed level's price** (default
+    /// 0.02 = 0.02%). Widens each line into a zone `[level ± (pct/100)·level]` so
+    /// a graze doesn't count: an intrabar directional cross must pierce `pct%`
+    /// past the line, and an `OnClose` break must **close** past the far zone
+    /// edge. Lower = more sensitive (a smaller move counts as a break); `0`
+    /// restores the bare wick/close-touch behaviour. Bakes onto the signed plan's
+    /// `cross_buffer_pct`. Raise it to reject noisy one-tick breaks; lower it when
+    /// a genuine break closed only just past the line and the default buffer ate
+    /// it (e.g. EUR/GBP 2026-07-15, close 0.7p above a neckline the 1.7p buffer
+    /// rejected).
+    #[arg(long)]
+    pub cross_buffer_pct: Option<f64>,
 
     /// Number of trailing candles the entry SL-spread floor averages the bid-ask
     /// spread over (default 5). The floor requires `sl_distance ≥ 10 × spread`;

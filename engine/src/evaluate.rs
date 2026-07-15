@@ -152,6 +152,10 @@ pub fn seed_plan_state(
     state.watermark = Some(newest.time);
     for rule in &plan.rules {
         record_last_close(&rule.rule_id, &rule.trigger, newest, &mut state);
+        // Seed the origin side from the newest back-window bar's open — the arm
+        // bar, in practice. An `OnClose` directional cross then fires when a
+        // later bar's close settles on the *opposite* side of the line. Set once.
+        record_origin_open(&rule.rule_id, &rule.trigger, newest, &mut state);
     }
     state
 }
@@ -1355,11 +1359,13 @@ fn stamp_retest(
     let Some(rule) = plan.rules.iter().find(|r| is_retest(r)) else {
         return;
     };
-    // Time-decaying closeness tolerance: the first bar after the break must
-    // reach the neckline; each later bar loosens by `retest_atr_step × ATR` of
-    // near-side slack (see `TradePlan::retest_atr_step`). `N` counts bars in the
-    // window strictly after the break, up to & including this one (first = 1).
-    let tol = retest_tolerance(plan, break_at, candle, window);
+    // Time-widening closeness tolerance, scaled by the neckline's slope: the
+    // first bar after the break must reach the neckline; each later bar fattens
+    // the band by `retest_atr_step × |neckline slope per bar|` (see
+    // `retest_tolerance`). A horizontal neckline (slope 0) never widens. `N`
+    // counts bars in the window strictly after the break, up to & including this
+    // one (first = 1).
+    let tol = retest_tolerance(plan, rule, break_at, candle, window);
     // Spread-hour "rubbish candle": a retest cross landing on a learned spread
     // hour is a liquidity-vacuum wick, not a genuine retest — don't stamp it.
     // `record_last_close` at the tail still runs, so a genuine retest on the
@@ -1375,12 +1381,21 @@ fn stamp_retest(
     // time. Without this latch a later re-cross would re-stamp `retest_seen_at`
     // and re-emit the prep fire every bar (the break-and-close analogue of the
     // strategy-v2 starvation bug).
+    // Record + read the OnClose refs for this rule (used by an OnClose retest;
+    // the default Intrabar retest ignores them). The retest is a latching prep,
+    // so it uses SETTLED/origin semantics like the break-and-close.
+    record_origin_open(&rule.rule_id, &rule.trigger, candle, state);
+    let refs = OnCloseRefs {
+        origin: state.origin_open.get(&rule.rule_id).copied(),
+        prev_close: state.last_close.get(&rule.rule_id).copied(),
+        settled: true,
+    };
     if !spread_hour
         && state.retest_seen_at.is_none()
         && retest_crossed(
             &rule.trigger,
             candle,
-            state.last_close.get(&rule.rule_id).copied(),
+            refs,
             window,
             plan.cross_buffer_pct,
             tol,
@@ -1404,28 +1419,48 @@ fn stamp_retest(
 
 /// The retest's near-side closeness tolerance for this bar, in **price units**.
 ///
-/// `(N - 1) × plan.retest_atr_step × ATR`, where `N` is the number of bars in
-/// `window` strictly after `break_at` up to & including `candle` (first bar
-/// after the break = 1, so its tolerance is 0 — it must reach the line). ATR is
-/// the Wilder ATR at this bar over `window`.
+/// The retest zone is a band around the neckline that **fattens over time, at a
+/// rate set by the neckline's steepness**:
 ///
-/// **Degrades to 0.0 (strict "must reach the line") if the ATR can't be
-/// computed** rather than panicking. The expectation is that by the time a plan
-/// is stamping retests it is in `Phase::AwaitEntry`, well past the detector's
-/// warmup, so `window` spans more than `atr_length_for(granularity)` bars and
-/// `wilder_atr` is `Some`. But that is NOT guaranteed: `detector_window_for`
-/// (in `trade-control-cron`) only reaches back to the earliest trendline anchor
-/// (or the Pine lookback), so a trendline-only / M-W plan with recent anchors
-/// can present a window shorter than the ATR length. A `None` here used to
-/// `.expect()`-panic, which unwound the whole shared `tc-scheduler` thread and
-/// silently froze EVERY plan's cron tick (staging incident 2026-07-14 04:32Z).
-/// A too-short window must degrade, not crash: 0.0 tolerance is the same
-/// conservative "must reach the line" rule already used for the first post-break
-/// bar (`bars_since_break <= 1`) and the `tol <= 0.0` strict-evaluator path, so
-/// the retest simply requires the wick to reach the neckline until the window
-/// warms. We `warn!` so a genuinely mis-sized window is still visible.
+/// ```text
+/// tolerance(N) = (N - 1) × retest_atr_step × ATR × slope_factor
+/// slope_factor = |neckline slope, price per bar| / ATR
+///              ⇒ tolerance(N) = (N - 1) × retest_atr_step × |slope_per_bar|
+/// ```
+///
+/// where `N` is the number of bars in `window` strictly after `break_at` up to &
+/// including `candle` (first bar after the break = 1, so its tolerance is 0 — it
+/// must reach the line). The ATR (a volatility proxy) **cancels out**: the band's
+/// per-bar fattening is driven purely by how fast the neckline drifts away from
+/// price. Rationale (operator): the reason a retest lands further from the line
+/// as bars pass is the *line moving*, and how fast it moves is the slope. A
+/// **flat (horizontal) neckline has slope 0 ⇒ tolerance 0 forever** — a
+/// horizontal must be retested to the exact line, no widening. A steep neckline
+/// fattens the band quickly. This is stricter than the textbook ATR-band (which
+/// keeps a volatility band even on a flat line) — a deliberate choice: horizontal
+/// necklines are exact price levels and should be retested precisely.
+///
+/// `slope_per_bar` is the neckline's price change per **bar-index** step (TV's
+/// ordinal x-axis, matching [`line_price_at`]), computed by [`neckline_slope`]
+/// from the retest rule's trendline anchors. `0.0` when the rule isn't a
+/// trendline (a horizontal retest) or the slope can't be resolved.
+///
+/// The ATR is still computed (it's the unit the `retest_atr_step` was calibrated
+/// in, and `slope/ATR × ATR` needs it present to be dimensionally the
+/// operator's step), but a `None` ATR **degrades to 0.0 (strict "must reach the
+/// line")** rather than panicking. The expectation is that by the time a plan is
+/// stamping retests it is in `Phase::AwaitEntry`, well past the detector's
+/// warmup, so `window` spans more than `atr_length_for(granularity)` bars. But
+/// that is NOT guaranteed: `detector_window_for` (in `trade-control-cron`) only
+/// reaches back to the earliest trendline anchor (or the Pine lookback), so a
+/// trendline-only / M-W plan with recent anchors can present a window shorter
+/// than the ATR length. A `None` here used to `.expect()`-panic, which unwound
+/// the whole shared `tc-scheduler` thread and silently froze EVERY plan's cron
+/// tick (staging incident 2026-07-14 04:32Z). A too-short window must degrade,
+/// not crash. We `warn!` so a genuinely mis-sized window is still visible.
 fn retest_tolerance(
     plan: &TradePlan,
+    retest_rule: &ConditionRule,
     break_at: DateTime<Utc>,
     candle: &Candle,
     window: &[Candle],
@@ -1437,7 +1472,9 @@ fn retest_tolerance(
     if bars_since_break <= 1 {
         return 0.0;
     }
-    let Some(atr) = wilder_atr(window, atr_length_for(plan.granularity)) else {
+    // ATR must still be warm (it's the calibration unit and guards the degrade
+    // path), even though it algebraically cancels against `slope_factor`.
+    if wilder_atr(window, atr_length_for(plan.granularity)).is_none() {
         tracing::warn!(
             instrument = %plan.instrument,
             window_len = window.len(),
@@ -1446,8 +1483,37 @@ fn retest_tolerance(
              (strict must-reach-the-line retest) until the detector window warms",
         );
         return 0.0;
+    }
+    // The band fattens per bar by `retest_atr_step × |neckline slope per bar|`.
+    // A horizontal neckline (slope 0) never widens — must reach the exact line.
+    let slope = neckline_slope(retest_rule, window).abs();
+    (bars_since_break as f64 - 1.0) * plan.retest_atr_step * slope
+}
+
+/// The retest neckline's slope in **price per bar-index step** — the price
+/// change from one traded bar to the next along the trendline. Measured in the
+/// engine's ordinal bar-index space (matching [`line_price_at`]), so a session
+/// gap doesn't inflate it. `0.0` for a non-trendline retest (a horizontal level),
+/// a degenerate line (both anchors on the same bar), or when an anchor's
+/// bar-index can't be resolved against `window`.
+fn neckline_slope(retest_rule: &ConditionRule, window: &[Candle]) -> f64 {
+    let Trigger::TrendlineCross {
+        a, b, bar_seconds, ..
+    } = &retest_rule.trigger
+    else {
+        return 0.0;
     };
-    (bars_since_break as f64 - 1.0) * plan.retest_atr_step * atr
+    let (Some(ia), Some(ib)) = (
+        bar_index_at(a.at_epoch, window, *bar_seconds),
+        bar_index_at(b.at_epoch, window, *bar_seconds),
+    ) else {
+        return 0.0;
+    };
+    let span = ib - ia;
+    if span == 0.0 {
+        return 0.0;
+    }
+    (b.price - a.price) / span
 }
 
 /// A retest cross, loosened by a near-side `tol` (price units). Identical to
@@ -1459,7 +1525,7 @@ fn retest_tolerance(
 fn retest_crossed(
     trigger: &Trigger,
     candle: &Candle,
-    prev_close: Option<f64>,
+    refs: OnCloseRefs,
     window: &[Candle],
     buffer_pct: f64,
     tol: f64,
@@ -1467,7 +1533,7 @@ fn retest_crossed(
     // With no slack, defer to the shared evaluator (single source of truth for
     // the strict cross, buffer, and OnClose/Either arms).
     if tol <= 0.0 {
-        return eval_trigger(trigger, candle, prev_close, window, buffer_pct);
+        return eval_trigger(trigger, candle, refs, window, buffer_pct);
     }
     // Resolve the crossed level. Only trendline / horizontal / price-value
     // crosses have a level; anything else falls back to the strict evaluator.
@@ -1488,7 +1554,7 @@ fn retest_crossed(
             };
             (level, *dir, *bar)
         }
-        _ => return eval_trigger(trigger, candle, prev_close, window, buffer_pct),
+        _ => return eval_trigger(trigger, candle, refs, window, buffer_pct),
     };
     // The closeness tolerance only loosens the *intrabar directional* arm; an
     // OnClose or Either retest keeps its exact semantics.
@@ -1501,7 +1567,7 @@ fn retest_crossed(
             CrossDir::Up => candle.h >= level - tol,
             CrossDir::Either => candle.l <= level + tol && candle.h >= level - tol,
         },
-        BarEvent::OnClose => level_crossed(level, dir, bar, candle, prev_close, buffer_pct),
+        BarEvent::OnClose => level_crossed(level, dir, bar, candle, refs, buffer_pct),
     }
 }
 
@@ -1684,12 +1750,27 @@ fn fire_rule(
     buffer_pct: f64,
     granularity: Granularity,
 ) -> bool {
-    let prev_close = state.last_close.get(&rule.rule_id).copied();
-    let hit = eval_trigger(&rule.trigger, candle, prev_close, window, buffer_pct);
-    // Persist last_close BEFORE the spread-hour gate: a spread-hour bar still
-    // seeds `last_close` so a genuine OnClose cross on the next clean bar is
-    // measured against it — the suppression gates the FIRE decision, not the
-    // bookkeeping (desyncing `last_close` would break the next bar's cross).
+    // Record the origin side BEFORE evaluating, so the very first bar a rule
+    // sees can itself fire if it opened one side of the line and closed the
+    // other (the operator's "the first bar that closes across is the break" —
+    // the seed bar is not special). `or_insert` keeps it set-once thereafter.
+    record_origin_open(&rule.rule_id, &rule.trigger, candle, state);
+    // Entry OnClose crosses use EDGE semantics (fire once per transition — a
+    // multi-shot enter must not re-place every settled-past bar); every other
+    // OnClose rule (break-and-close prep, invalidation/abort vetos, drawn lines)
+    // uses SETTLED/origin semantics (a settled close on the far side is the
+    // event, robust to a suppressed transition bar). See `OnCloseRefs`.
+    let refs = OnCloseRefs {
+        origin: state.origin_open.get(&rule.rule_id).copied(),
+        prev_close: state.last_close.get(&rule.rule_id).copied(),
+        settled: rule.intent.action != Action::Enter,
+    };
+    let hit = eval_trigger(&rule.trigger, candle, refs, window, buffer_pct);
+    // Persist last_close BEFORE the spread-hour gate: an entry OnClose cross's
+    // edge detection reads it, and a spread-hour bar must still seed it so the
+    // next clean bar's cross is measured correctly. The suppression gates the
+    // FIRE decision, not the bookkeeping (desyncing `last_close` would break the
+    // next bar's edge cross).
     record_last_close(&rule.rule_id, &rule.trigger, candle, state);
     // Spread-hour "rubbish candle": an **intrabar (wick-read)** level cross
     // (retest, invalidation veto, M/W trigger) that lands on a learned spread
@@ -1735,6 +1816,22 @@ fn record_last_close(rule_id: &str, trigger: &Trigger, candle: &Candle, state: &
     }
 }
 
+/// Record this candle's **open** as the rule's `origin_open` — the side of the
+/// line the plan started on — iff the rule is an `OnClose` cross and no origin
+/// has been recorded yet. Set exactly once (the first bar the rule evaluates,
+/// which in practice is the arm-time / replay-start bar) and never overwritten,
+/// so a later suppressed or already-past bar can't move the reference. An
+/// `OnClose` directional cross fires when a bar's close settles on the opposite
+/// side of the line from this origin (see [`level_crossed`]).
+fn record_origin_open(rule_id: &str, trigger: &Trigger, candle: &Candle, state: &mut PlanState) {
+    if trigger_uses_close(trigger) {
+        state
+            .origin_open
+            .entry(rule_id.to_string())
+            .or_insert(candle.o);
+    }
+}
+
 /// Whether a trigger's evaluation reads the prior close (so `last_close` must
 /// be tracked for it).
 fn trigger_uses_close(trigger: &Trigger) -> bool {
@@ -1753,23 +1850,24 @@ fn trigger_uses_close(trigger: &Trigger) -> bool {
     )
 }
 
-/// Pure trigger evaluation against a single candle. `prev_close` is the rule's
-/// last processed close (for `OnClose` crosses); `None` on the seed bar, which
-/// never fires an `OnClose` cross. `window` is the ascending bar series used to
-/// resolve a `TrendlineCross`'s level in bar-index space (ignored by every
-/// other trigger); pass the plan's `detector_window` (or `new_candles` when no
-/// trendline rule is present).
-pub fn eval_trigger(
+/// Pure trigger evaluation against a single candle. `refs` carries the `OnClose`
+/// cross references + mode (see [`OnCloseRefs`]): settled/origin for latching
+/// preps & vetos, edge/prev-close for entry crosses. Ignored by intrabar / time
+/// / heartbeat triggers. `window` is the ascending bar series used to resolve a
+/// `TrendlineCross`'s level in bar-index space (ignored by every other trigger);
+/// pass the plan's `detector_window` (or `new_candles` when no trendline rule is
+/// present).
+fn eval_trigger(
     trigger: &Trigger,
     candle: &Candle,
-    prev_close: Option<f64>,
+    refs: OnCloseRefs,
     window: &[Candle],
     buffer_pct: f64,
 ) -> bool {
     match trigger {
         Trigger::HorizontalCross { level, dir, bar }
         | Trigger::PriceValueCross { level, dir, bar } => {
-            level_crossed(*level, *dir, *bar, candle, prev_close, buffer_pct)
+            level_crossed(*level, *dir, *bar, candle, refs, buffer_pct)
         }
         Trigger::TrendlineCross {
             a,
@@ -1783,7 +1881,7 @@ pub fn eval_trigger(
             else {
                 return false;
             };
-            level_crossed(level, *dir, *bar, candle, prev_close, buffer_pct)
+            level_crossed(level, *dir, *bar, candle, refs, buffer_pct)
         }
         Trigger::TimeReached { at_epoch } => candle.time.timestamp() >= *at_epoch,
         // The M/W heartbeat fires on every closed bar — the wrapper feeds only
@@ -1798,6 +1896,27 @@ pub fn eval_trigger(
     }
 }
 
+/// References an `OnClose` cross reads, plus which semantics to apply. The
+/// `Intrabar` arm ignores all of it (it reads the wick). Two modes:
+///
+/// - **`settled`** (latching preps + vetos): fire on any bar whose close settles
+///   on the far side of the line from `origin` (the side the plan started on) —
+///   the operator's "a settled close across the line IS the break", robust to a
+///   suppressed transition bar. Reads `origin`.
+/// - **edge** (`settled == false`; entry crosses): fire only on the bar that
+///   *transitions* the level (prior close on the near side → this close past the
+///   far edge). A multi-shot entry cross re-evaluates every bar and must not
+///   re-fire on every settled far-side bar. Reads `prev_close`.
+#[derive(Debug, Clone, Copy)]
+struct OnCloseRefs {
+    /// The origin open (settled mode) — set once, the arm-time side of the line.
+    origin: Option<f64>,
+    /// The prior processed close (edge mode) — the immediate predecessor bar.
+    prev_close: Option<f64>,
+    /// `true` ⇒ settled/origin semantics; `false` ⇒ edge/transition semantics.
+    settled: bool,
+}
+
 /// Did `candle` cross `level` in direction `dir` under the bar-event mode?
 ///
 /// `buffer_pct` is a cross-depth buffer as a percent of `level`'s price. It
@@ -1807,22 +1926,25 @@ pub fn eval_trigger(
 /// - *Intrabar* directional cross — the wick must pierce at least `buffer` past
 ///   the line (below for `Down`, above for `Up`); `Either` ignores it (a bare
 ///   straddle is already an unambiguous touch).
-/// - *OnClose* directional cross — the close must land past the *far* zone edge,
-///   and the prior close must not have already been past it. This is the
-///   break-and-close "zone of the line" (2026-07-05): a candle that dips into
-///   the zone and closes just on the near side no longer poisons the prior-close
-///   comparison so the next candle's genuine close-through registers. `Either`
-///   fires on a close past *either* zone edge.
+/// - *OnClose* directional cross — a **settled close on the far side** of the
+///   line from the plan's `origin` side (the open of the first bar the rule saw;
+///   the arm-time bar in practice). The close must land past the *far* zone edge
+///   (`Up`: origin below, close ≥ `level + buffer`; `Down`: origin above, close ≤
+///   `level - buffer`; `Either`: origin on one side, close past the opposite
+///   edge). This is **not** an edge/transition detector: it does not require the
+///   crossing to occur on this exact bar, so a break survives a suppressed
+///   transition bar (spread hour) or an already-past arm. The "must reach the
+///   *far* edge" half is the "zone of the line" fix (NAS100 short 2026-07-02): a
+///   close that only dips into the zone short of the far edge is not a break.
 ///
-/// `0.0` reproduces the bare line (no zone): the OnClose arm collapses to the
-/// old strict `prev`/`close`-vs-raw-line comparison, so existing plans with no
-/// `cross_buffer_pct` are byte-identical.
+/// `0.0` reproduces the bare line (no zone): the OnClose arm becomes "origin one
+/// side of `level`, close on/past the other side of `level`".
 fn level_crossed(
     level: f64,
     dir: CrossDir,
     bar: BarEvent,
     candle: &Candle,
-    prev_close: Option<f64>,
+    refs: OnCloseRefs,
     buffer_pct: f64,
 ) -> bool {
     // The depth the wick must reach past the line. `level` is positive (a price)
@@ -1854,31 +1976,62 @@ fn level_crossed(
                 CrossDir::Down => candle.l <= level - buffer,
             }
         }
-        // OnClose: a cross relative to the prior processed close, measured
-        // against the buffered *zone* edges (see the fn doc). The seed bar (no
-        // prev_close) never fires. `upper`/`lower` collapse to `level` when the
-        // buffer is 0.0, reproducing the old strict raw-line comparison.
+        // OnClose: a **settled close on the far side** of the line from the
+        // plan's origin, measured against the buffered *zone* edges (see the fn
+        // doc). `upper`/`lower` collapse to `level` when the buffer is 0.0.
         //
-        // For a directional cross we require that the prior close was **not
-        // already past the far edge** (so the crossing bar is the one that first
-        // closes through), and that this close lands past that far edge. Using
-        // the zone edge for the prior-close guard is the fix for the
-        // "zone of the line" bug (NAS100 short 2026-07-02): a bar that closes
-        // just inside the zone on the near side must not pre-arm the guard and
-        // block the next bar's genuine close-through.
+        // The reference is the **origin side** — which side of the line the
+        // plan's *first* bar opened on (`origin`, set once; the arm-time bar in
+        // practice) — NOT the prior bar's close. The operator's model of a
+        // break-and-close: "we know which side we started on; the first bar that
+        // *closes* on the other side is the break." This is deliberately not an
+        // edge detector: it does not require the crossing *transition* to happen
+        // on this exact bar, so a break is still caught when the true transition
+        // bar was suppressed (spread hour) or the plan armed already-past the
+        // line and the first clean bar merely opened-and-closed on the far side.
+        // These rules all latch (`state.fired`), so a persistent far-side close
+        // stamps exactly once.
+        //
+        //   Up   ⇒ origin below the line (`origin < level`), close ≥ upper edge
+        //   Down ⇒ origin above the line (`origin > level`), close ≤ lower edge
+        //   Either ⇒ either of the above (origin on one side, close past the
+        //            opposite far edge)
+        //
+        // The "must reach the *far* edge" half preserves the "zone of the line"
+        // fix (NAS100 short 2026-07-02): a close that only dips into the buffer
+        // zone (short of the far edge) is not a break. No origin recorded yet
+        // (the seed bar hasn't run) ⇒ never fires.
         BarEvent::OnClose => {
-            let Some(prev) = prev_close else {
-                return false;
-            };
-            // Inclusivity mirrors the old raw-line rule (`prev < edge && c >=
-            // edge`): the prior close is "not yet past" when strictly on the
-            // near side of the far edge, and this close counts as past when it
-            // reaches the far edge. With buffer 0.0 (`upper == lower == level`)
-            // this is byte-identical to the pre-zone comparison.
             let upper = level + buffer;
             let lower = level - buffer;
-            let up = prev < upper && candle.c >= upper;
-            let down = prev > lower && candle.c <= lower;
+            let (up, down) = if refs.settled {
+                // Settled / origin mode (latching preps + vetos: break-and-close,
+                // too-high/too-low invalidation, M/W abort, drawn lines). Fires
+                // on any bar that CLOSES on the far side of the line from the
+                // origin, whether or not the transition happened on this bar.
+                let Some(origin) = refs.origin else {
+                    return false;
+                };
+                (
+                    origin < level && candle.c >= upper,
+                    origin > level && candle.c <= lower,
+                )
+            } else {
+                // Edge / transition mode (entry crosses — the strategy-v2 stop /
+                // Quasimodo-limit OnClose enters). A multi-shot enter re-evaluates
+                // every bar and must fire only on the bar that *transitions* the
+                // level (prior close on the near side, this close past the far
+                // edge), not on every settled far-side bar afterwards — else it
+                // would re-place an order every bar. `None` prev (seed) never
+                // fires.
+                let Some(prev) = refs.prev_close else {
+                    return false;
+                };
+                (
+                    prev < upper && candle.c >= upper,
+                    prev > lower && candle.c <= lower,
+                )
+            };
             match dir {
                 CrossDir::Up => up,
                 CrossDir::Down => down,
@@ -2125,11 +2278,32 @@ mod tests {
     /// `eval_trigger` with an empty bar window — for level/time/mw triggers that
     /// don't read it. Trendline tests call `eval_trigger` directly with a real
     /// window (bar-index interpolation needs it).
-    fn et(trigger: &Trigger, candle: &Candle, prev_close: Option<f64>) -> bool {
-        // No cross buffer in the unit-level cross tests — they assert the raw
-        // wick/close geometry. The buffer's own behaviour is covered by
-        // `intrabar_cross_buffer_*` tests that call `eval_trigger` directly.
-        eval_trigger(trigger, candle, prev_close, &[], 0.0)
+    fn et(trigger: &Trigger, candle: &Candle, origin: Option<f64>) -> bool {
+        // The 3rd arg is the rule's **origin open** for an OnClose cross (the
+        // side of the line the plan started on) — these tests assert the
+        // SETTLED/origin semantics (break-and-close & vetos). Ignored by
+        // intrabar/time/mw triggers. No cross buffer here — the raw geometry.
+        eval_trigger(trigger, candle, settled_origin(origin), &[], 0.0)
+    }
+
+    /// Settled/origin `OnCloseRefs` for the unit cross tests (break-and-close &
+    /// veto semantics): the given value is the origin open; no prev-close.
+    fn settled_origin(origin: Option<f64>) -> OnCloseRefs {
+        OnCloseRefs {
+            origin,
+            prev_close: None,
+            settled: true,
+        }
+    }
+
+    /// Edge `OnCloseRefs` for the entry-cross tests: the given value is the prior
+    /// processed close; no origin.
+    fn edge_prev(prev_close: Option<f64>) -> OnCloseRefs {
+        OnCloseRefs {
+            origin: None,
+            prev_close,
+            settled: false,
+        }
     }
 
     /// A minimal intent carrying just the action the evaluator reads; the rest
@@ -2304,19 +2478,21 @@ mod tests {
     // ===== eval_trigger: level crosses =====
 
     #[test]
-    fn horizontal_on_close_fires_when_close_crosses_prior_close() {
+    fn horizontal_on_close_fires_when_close_settles_on_far_side() {
         let t = Trigger::HorizontalCross {
             level: 1.2000,
             dir: CrossDir::Up,
             bar: BarEvent::OnClose,
         };
-        // prior close below, this close at/above → fires.
+        // origin below the line (`et`'s 3rd arg is the origin open now), this
+        // close at/above → fires.
         assert!(et(
             &t,
             &candle("2026-06-16T12:00:00Z", 1.1, 1.21, 1.1, 1.2005),
             Some(1.1990)
         ));
-        // prior close already above → no cross.
+        // origin ABOVE the line → an Up break is impossible (you can't break up
+        // through a line you started above), regardless of this close.
         assert!(!et(
             &t,
             &candle("2026-06-16T12:00:00Z", 1.21, 1.22, 1.2, 1.2105),
@@ -2324,19 +2500,74 @@ mod tests {
         ));
     }
 
+    /// The operator's model, and the whole point of the origin-side rewrite: a
+    /// bar whose *open* was above the line (no below→above transition on this
+    /// bar) still fires the Up break-and-close, because the ORIGIN (the first
+    /// bar the plan saw) was below the line. This is the spread-hour case: the
+    /// true transition bar was suppressed/skipped, then the next clean bar
+    /// opened+closed above — the old edge detector lost the break here.
     #[test]
-    fn on_close_cross_does_not_fire_on_seed_bar() {
+    fn on_close_fires_when_bar_opened_and_closed_above_origin_below() {
         let t = Trigger::HorizontalCross {
             level: 1.2000,
             dir: CrossDir::Up,
             bar: BarEvent::OnClose,
         };
-        // No prior close (seed) → never fires even if this close is above.
+        // origin 1.1950 (below the line). This bar opens 1.2020 AND closes
+        // 1.2030 — both above the line, no transition on the bar itself.
+        assert!(
+            et(
+                &t,
+                &candle("2026-06-16T12:00:00Z", 1.2020, 1.2040, 1.2010, 1.2030),
+                Some(1.1950)
+            ),
+            "a settled close above the line fires the break when the origin was below, \
+             even with no below→above transition on this bar"
+        );
+    }
+
+    #[test]
+    fn on_close_cross_does_not_fire_before_origin_recorded() {
+        let t = Trigger::HorizontalCross {
+            level: 1.2000,
+            dir: CrossDir::Up,
+            bar: BarEvent::OnClose,
+        };
+        // No origin recorded yet (None) → never fires even if this close is
+        // above. (In the live path the origin is recorded before evaluation, so
+        // this guards only the truly-uninitialised case.)
         assert!(!et(
             &t,
             &candle("2026-06-16T12:00:00Z", 1.1, 1.3, 1.1, 1.2500),
             None
         ));
+    }
+
+    /// The OTHER mode: an **entry** OnClose cross uses EDGE semantics — it fires
+    /// only on the bar that transitions the level (prior close on the near side →
+    /// this close past the far edge), NOT on every settled far-side bar. This is
+    /// what keeps a multi-shot entry cross from re-placing an order every bar.
+    #[test]
+    fn on_close_entry_cross_edge_fires_on_transition_only() {
+        let up = Trigger::HorizontalCross {
+            level: 1.2000,
+            dir: CrossDir::Up,
+            bar: BarEvent::OnClose,
+        };
+        let above = candle("2026-06-16T12:00:00Z", 1.2010, 1.2050, 1.2005, 1.2030);
+        // Transition bar: prev close below → this close above → fires.
+        assert!(
+            eval_trigger(&up, &above, edge_prev(Some(1.1990)), &[], 0.0),
+            "edge fires when the prior close was below and this close is above"
+        );
+        // Already-above bar: prev close already above → NO fire (the whole point
+        // of edge mode for a multi-shot entry).
+        assert!(
+            !eval_trigger(&up, &above, edge_prev(Some(1.2010)), &[], 0.0),
+            "edge does NOT re-fire when the prior close was already above"
+        );
+        // Seed (no prev close) → never fires.
+        assert!(!eval_trigger(&up, &above, edge_prev(None), &[], 0.0));
     }
 
     #[test]
@@ -2425,16 +2656,16 @@ mod tests {
         let real = candle("2026-06-16T12:00:00Z", 1.2010, 1.2010, 1.1980, 1.2005);
 
         // No buffer (0.0) → both fire (bare wick touch).
-        assert!(eval_trigger(&t, &graze, None, &[], 0.0));
-        assert!(eval_trigger(&t, &real, None, &[], 0.0));
+        assert!(eval_trigger(&t, &graze, settled_origin(None), &[], 0.0));
+        assert!(eval_trigger(&t, &real, settled_origin(None), &[], 0.0));
 
         // 0.1% buffer → the graze is rejected, the real cross still fires.
         assert!(
-            !eval_trigger(&t, &graze, None, &[], 0.1),
+            !eval_trigger(&t, &graze, settled_origin(None), &[], 0.1),
             "a 5-pip graze (< 0.0012 buffer) must not count as a cross"
         );
         assert!(
-            eval_trigger(&t, &real, None, &[], 0.1),
+            eval_trigger(&t, &real, settled_origin(None), &[], 0.1),
             "a 20-pip dip (> 0.0012 buffer) is a real cross"
         );
     }
@@ -2450,8 +2681,8 @@ mod tests {
         // Opened below; buffer = 0.0012 → need high ≥ 1.2012.
         let graze = candle("2026-06-16T12:00:00Z", 1.1990, 1.2005, 1.1990, 1.1995);
         let real = candle("2026-06-16T12:00:00Z", 1.1990, 1.2020, 1.1990, 1.1995);
-        assert!(!eval_trigger(&t, &graze, None, &[], 0.1));
-        assert!(eval_trigger(&t, &real, None, &[], 0.1));
+        assert!(!eval_trigger(&t, &graze, settled_origin(None), &[], 0.1));
+        assert!(eval_trigger(&t, &real, settled_origin(None), &[], 0.1));
     }
 
     /// The intrabar buffer applies only to directional crosses, not `Either`
@@ -2467,13 +2698,13 @@ mod tests {
             bar: BarEvent::Intrabar,
         };
         assert!(
-            eval_trigger(&either, &graze, None, &[], 0.1),
+            eval_trigger(&either, &graze, settled_origin(None), &[], 0.1),
             "Either fires on any straddle regardless of the buffer"
         );
     }
 
-    /// OnClose with a 0.0 buffer is the old raw-line comparison exactly: a close
-    /// past the line fires, and the prior-close guard uses the bare line.
+    /// OnClose with a 0.0 buffer collapses the zone to the bare line: origin one
+    /// side, close on/past the other side of `level`, no buffer margin.
     #[test]
     fn on_close_zero_buffer_is_raw_line() {
         let down = Trigger::HorizontalCross {
@@ -2481,9 +2712,15 @@ mod tests {
             dir: CrossDir::Down,
             bar: BarEvent::OnClose,
         };
-        // prev above, close just below the raw line, no buffer → fires.
+        // origin above, close just below the raw line, no buffer → fires.
         let closed_below = candle("2026-06-16T12:00:00Z", 1.2010, 1.2010, 1.1995, 1.1999);
-        assert!(eval_trigger(&down, &closed_below, Some(1.2010), &[], 0.0));
+        assert!(eval_trigger(
+            &down,
+            &closed_below,
+            settled_origin(Some(1.2010)),
+            &[],
+            0.0
+        ));
     }
 
     /// The core "zone of the line" fix (NAS100 short 2026-07-02): a candle that
@@ -2497,21 +2734,22 @@ mod tests {
             dir: CrossDir::Down,
             bar: BarEvent::OnClose,
         };
-        // Bar 1: dips into the zone, closes at 1.2001 — inside the zone, on the
-        // near (upper) side of the lower edge. With the raw-line rule this close
-        // (< 1.2000? no, 1.2001 > level) would not have crossed anyway, but the
-        // point is it does not fire and does not consume the break.
+        // Origin 1.2030 (above the line). Bar 1: dips into the zone, closes at
+        // 1.2001 — inside the zone, above the lower edge. Under the origin rule
+        // (`c <= lower`) this is short of the far edge, so it does NOT fire — the
+        // "must reach the far edge" half that preserves the zone fix.
         let near_dip = candle("2026-06-16T12:00:00Z", 1.2030, 1.2030, 1.1990, 1.2001);
         assert!(
-            !eval_trigger(&down, &near_dip, Some(1.2030), &[], 0.1),
+            !eval_trigger(&down, &near_dip, settled_origin(Some(1.2030)), &[], 0.1),
             "a close inside the zone (near side) is not yet a break"
         );
-        // Bar 2: opens inside the zone, closes well below the lower edge — the
-        // genuine break. prev_close (1.2001) is still above the lower edge
-        // (1.1988), so the guard admits it.
+        // Bar 2 (same origin above the line): closes well below the lower edge —
+        // the genuine break past the far zone edge → fires. Under the OLD edge
+        // detector the near dip's close would have poisoned the prior-close guard
+        // and blocked this; under origin-side there's nothing to poison.
         let breakthrough = candle("2026-06-16T13:00:00Z", 1.2001, 1.2005, 1.1950, 1.1955);
         assert!(
-            eval_trigger(&down, &breakthrough, Some(1.2001), &[], 0.1),
+            eval_trigger(&down, &breakthrough, settled_origin(Some(1.2030)), &[], 0.1),
             "a close below the lower zone edge after a near-side dip fires the break"
         );
     }
@@ -2528,10 +2766,22 @@ mod tests {
         // Zone [1.1988, 1.2012]; close 1.1995 is inside the zone (above the
         // lower edge) → not a break yet.
         let into_zone = candle("2026-06-16T12:00:00Z", 1.2030, 1.2030, 1.1990, 1.1995);
-        assert!(!eval_trigger(&down, &into_zone, Some(1.2030), &[], 0.1));
+        assert!(!eval_trigger(
+            &down,
+            &into_zone,
+            settled_origin(Some(1.2030)),
+            &[],
+            0.1
+        ));
         // Same bar but closing past the lower edge → fires.
         let through = candle("2026-06-16T12:00:00Z", 1.2030, 1.2030, 1.1980, 1.1985);
-        assert!(eval_trigger(&down, &through, Some(1.2030), &[], 0.1));
+        assert!(eval_trigger(
+            &down,
+            &through,
+            settled_origin(Some(1.2030)),
+            &[],
+            0.1
+        ));
     }
 
     #[test]
@@ -2599,7 +2849,7 @@ mod tests {
             l: 1.4,
             c: 1.55,
         };
-        assert!(eval_trigger(&t, &c, None, &win, 0.0));
+        assert!(eval_trigger(&t, &c, settled_origin(None), &win, 0.0));
     }
 
     /// The core of the bug: a session gap must NOT slide the line. Bars are
@@ -2638,12 +2888,12 @@ mod tests {
         // one straddling only ~1.04 (the wall-clock level) does NOT.
         let at_index_level = candle("2026-06-16T14:00:00Z", 1.45, 1.55, 1.45, 1.52);
         assert!(
-            eval_trigger(&t, &at_index_level, None, &win, 0.0),
+            eval_trigger(&t, &at_index_level, settled_origin(None), &win, 0.0),
             "bar-index level at bar 1 is 1.50 → straddle fires"
         );
         let at_wallclock_level = candle("2026-06-16T14:00:00Z", 1.0, 1.08, 1.0, 1.05);
         assert!(
-            !eval_trigger(&t, &at_wallclock_level, None, &win, 0.0),
+            !eval_trigger(&t, &at_wallclock_level, settled_origin(None), &win, 0.0),
             "the old wall-clock level (~1.04) must NOT be where the line sits"
         );
         let _ = day1b;
@@ -2677,11 +2927,11 @@ mod tests {
             c: 1.0,
         };
         assert!(
-            !eval_trigger(&mk(false), &c, None, &win, 0.0),
+            !eval_trigger(&mk(false), &c, settled_origin(None), &win, 0.0),
             "no eval past anchor when not extended"
         );
         assert!(
-            eval_trigger(&mk(true), &c, None, &win, 0.0),
+            eval_trigger(&mk(true), &c, settled_origin(None), &win, 0.0),
             "extended → still evaluates"
         );
     }
@@ -3774,6 +4024,29 @@ mod tests {
         }
     }
 
+    /// An **angled** retest trendline (Down / long retest) over `window` built by
+    /// `warm_atr_window(24, first)`: anchor `a` at bar index 0 (`first`, price
+    /// 1.2000), anchor `b` at bar index 24 (`first + 24·3600`, price `1.2000 +
+    /// 24·slope`), so the slope is exactly `slope` price per bar-index step. Used
+    /// to test the slope-scaled retest tolerance (a horizontal line has slope 0
+    /// and never widens; only an angled neckline does).
+    fn retest_trendline_down(first: i64, slope: f64) -> Trigger {
+        Trigger::TrendlineCross {
+            a: LinePoint {
+                at_epoch: first,
+                price: 1.2000,
+            },
+            b: LinePoint {
+                at_epoch: first + 24 * 3600,
+                price: 1.2000 + 24.0 * slope,
+            },
+            extend_forward: true,
+            bar_seconds: 3600,
+            dir: CrossDir::Down,
+            bar: BarEvent::Intrabar,
+        }
+    }
+
     /// Bar 1 after the break has zero tolerance: a near-miss that doesn't reach
     /// the line does NOT stamp; a bar that reaches it does.
     #[test]
@@ -3834,21 +4107,24 @@ mod tests {
         );
     }
 
-    /// A later bar accepts a near-miss within its grown tolerance. At N=11 with
-    /// ATR 0.010 and step 0.075 the tolerance is (11-1)*0.075*0.010 = 0.0075, so
-    /// a low that stops 0.005 short of the line (within 0.0075) stamps — where
-    /// the same low on bar 1 would not.
+    /// A later bar accepts a near-miss within its grown tolerance — on an
+    /// **angled** neckline (a horizontal one never widens). At N=11 the tolerance
+    /// is `10 × step × |slope|`; a low that stops just short of the resolved line
+    /// (within tolerance) stamps, where the same low on bar 1 would not. Level and
+    /// tolerance are resolved from the helpers so the geometry stays honest.
     #[test]
     fn retest_later_bar_accepts_a_near_miss_within_tolerance() {
         let first = ts("2026-06-01T00:00:00Z").timestamp();
         let break_epoch = first + 24 * 3600;
+        // Angled descending neckline (slope 0.002/bar → a usable tolerance).
+        let retest = rule(
+            "04-prep-retest",
+            retest_trendline_down(first, 0.002),
+            FireMode::Once,
+            Action::Prep,
+        );
         let p = plan(vec![
-            rule(
-                "04-prep-retest",
-                retest_line_down(),
-                FireMode::Once,
-                Action::Prep,
-            ),
+            retest.clone(),
             rule(
                 "05-enter",
                 Trigger::MwEveryBar,
@@ -3859,54 +4135,83 @@ mod tests {
         let mut prior = seed_at(Phase::AwaitEntry, "2026-06-01T23:00:00Z");
         prior.break_close_at = Some(DateTime::from_timestamp(break_epoch, 0).unwrap());
 
-        // Window = warm bars + ten intervening near-miss bars (each stays above
-        // the line so none stamps) so the *eleventh* post-break bar is N=11.
+        // Warm bars + ten intervening bars whose lows stay well above the rising
+        // neckline (so none stamps) → the *eleventh* post-break bar is N=11.
         let mut window = warm_atr_window(24, first);
         for k in 1..=10 {
             let t = break_epoch + k * 3600;
-            let ct = DateTime::from_timestamp(t, 0).unwrap();
-            // Above the line (low 1.2050) — never a retest itself.
             window.push(Candle {
-                time: ct,
-                o: 1.2100,
-                h: 1.2150,
-                l: 1.2050,
-                c: 1.2100,
+                time: DateTime::from_timestamp(t, 0).unwrap(),
+                o: 1.30,
+                h: 1.31,
+                l: 1.29,
+                c: 1.30,
             });
         }
         let n11 = break_epoch + 11 * 3600;
         let n11t = DateTime::from_timestamp(n11, 0).unwrap();
-        // Near-miss 0.005 short of the line: low 1.2050? no — 1.2000+0.005 = 1.2050
-        // is exactly the boundary; use 1.2005 (0.0005 short, well within 0.0075).
+        // Resolve the neckline level + tolerance the engine will use at N=11.
+        let probe = Candle {
+            time: n11t,
+            o: 0.0,
+            h: 0.0,
+            l: 0.0,
+            c: 0.0,
+        };
+        let mut probe_window = window.clone();
+        probe_window.push(probe);
+        let level = match &retest.trigger {
+            Trigger::TrendlineCross {
+                a,
+                b,
+                extend_forward,
+                bar_seconds,
+                ..
+            } => line_price_at(a, b, &probe, *extend_forward, *bar_seconds, &probe_window).unwrap(),
+            _ => unreachable!(),
+        };
+        let tol = retest_tolerance(
+            &p,
+            &retest,
+            prior.break_close_at.unwrap(),
+            &probe,
+            &probe_window,
+        );
+        assert!(
+            tol > 0.0,
+            "N=11 on an angled neckline has a non-zero tolerance"
+        );
+        // Low that stops within tolerance of the line (half the tolerance short).
         let near = Candle {
             time: n11t,
-            o: 1.2100,
-            h: 1.2150,
-            l: 1.2005,
-            c: 1.2100,
+            o: level + 0.02,
+            h: level + 0.03,
+            l: level + tol * 0.5,
+            c: level + 0.02,
         };
         window.push(near);
         let eval = run_window(&p, &prior, &[near], &window);
         assert_eq!(
             eval.new_state.retest_seen_at,
             Some(n11t),
-            "at N=11 the tolerance is 0.0075; a low 0.0005 short of the line stamps"
+            "a low within tolerance of the angled neckline stamps at N=11"
         );
     }
 
-    /// Beyond the grown tolerance still rejects: at N=11 (tol 0.0075) a low that
-    /// stops 0.010 short of the line does NOT stamp.
+    /// Beyond the grown tolerance still rejects (angled neckline): a low that
+    /// stops well beyond the tolerance short of the line does NOT stamp.
     #[test]
     fn retest_beyond_tolerance_still_rejects() {
         let first = ts("2026-06-01T00:00:00Z").timestamp();
         let break_epoch = first + 24 * 3600;
+        let retest = rule(
+            "04-prep-retest",
+            retest_trendline_down(first, 0.002),
+            FireMode::Once,
+            Action::Prep,
+        );
         let p = plan(vec![
-            rule(
-                "04-prep-retest",
-                retest_line_down(),
-                FireMode::Once,
-                Action::Prep,
-            ),
+            retest.clone(),
             rule(
                 "05-enter",
                 Trigger::MwEveryBar,
@@ -3920,48 +4225,78 @@ mod tests {
         let mut window = warm_atr_window(24, first);
         for k in 1..=10 {
             let t = break_epoch + k * 3600;
-            let ct = DateTime::from_timestamp(t, 0).unwrap();
             window.push(Candle {
-                time: ct,
-                o: 1.2100,
-                h: 1.2150,
-                l: 1.2050,
-                c: 1.2100,
+                time: DateTime::from_timestamp(t, 0).unwrap(),
+                o: 1.30,
+                h: 1.31,
+                l: 1.29,
+                c: 1.30,
             });
         }
         let n11 = break_epoch + 11 * 3600;
         let n11t = DateTime::from_timestamp(n11, 0).unwrap();
-        // 0.010 short of the line (low 1.2100) — beyond the 0.0075 tolerance.
+        let probe = Candle {
+            time: n11t,
+            o: 0.0,
+            h: 0.0,
+            l: 0.0,
+            c: 0.0,
+        };
+        let mut probe_window = window.clone();
+        probe_window.push(probe);
+        let level = match &retest.trigger {
+            Trigger::TrendlineCross {
+                a,
+                b,
+                extend_forward,
+                bar_seconds,
+                ..
+            } => line_price_at(a, b, &probe, *extend_forward, *bar_seconds, &probe_window).unwrap(),
+            _ => unreachable!(),
+        };
+        let tol = retest_tolerance(
+            &p,
+            &retest,
+            prior.break_close_at.unwrap(),
+            &probe,
+            &probe_window,
+        );
+        // Low well beyond the tolerance (3× the tolerance short of the line).
         let far = Candle {
             time: n11t,
-            o: 1.2120,
-            h: 1.2150,
-            l: 1.2100,
-            c: 1.2120,
+            o: level + tol * 3.0 + 0.02,
+            h: level + tol * 3.0 + 0.03,
+            l: level + tol * 3.0,
+            c: level + tol * 3.0 + 0.02,
         };
         window.push(far);
         let eval = run_window(&p, &prior, &[far], &window);
         assert!(
             eval.new_state.retest_seen_at.is_none(),
-            "at N=11 a low 0.010 short of the line is beyond the 0.0075 tolerance"
+            "a low beyond the tolerance short of the angled neckline does not stamp"
         );
     }
 
-    /// The tolerance helper: N=1 → 0; grows linearly at step×ATR per bar.
+    /// The tolerance helper on an **angled** neckline: N=1 → 0; then the band
+    /// fattens linearly at `step × |slope per bar|` per bar. The ATR cancels —
+    /// only the slope drives the width.
     #[test]
-    fn retest_tolerance_grows_linearly() {
+    fn retest_tolerance_grows_linearly_with_slope() {
         let first = ts("2026-06-01T00:00:00Z").timestamp();
         let break_epoch = first + 24 * 3600;
         let break_at = DateTime::from_timestamp(break_epoch, 0).unwrap();
-        let mut p = plan(vec![rule(
+        // Angled neckline: slope 0.0005 price per bar-index step.
+        let slope = 0.0005;
+        let retest = rule(
             "04-prep-retest",
-            retest_line_down(),
+            retest_trendline_down(first, slope),
             FireMode::Once,
             Action::Prep,
-        )]);
+        );
+        let mut p = plan(vec![retest.clone()]);
         p.retest_atr_step = 0.075;
 
-        // Window: 24 warm bars (ATR 0.010) + bars at N=1..3 after the break.
+        // Window: 24 warm bars (ATR 0.010, though it cancels) + N=1..3 post-break.
         let mut window = warm_atr_window(24, first);
         for k in 1..=3 {
             let t = break_epoch + k * 3600;
@@ -3974,51 +4309,80 @@ mod tests {
             });
         }
         let at = |k: i64| DateTime::from_timestamp(break_epoch + k * 3600, 0).unwrap();
-        let tol1 = retest_tolerance(
-            &p,
-            break_at,
-            &Candle {
-                time: at(1),
-                o: 0.0,
-                h: 0.0,
-                l: 0.0,
-                c: 0.0,
-            },
-            &window,
-        );
-        let tol2 = retest_tolerance(
-            &p,
-            break_at,
-            &Candle {
-                time: at(2),
-                o: 0.0,
-                h: 0.0,
-                l: 0.0,
-                c: 0.0,
-            },
-            &window,
-        );
-        let tol3 = retest_tolerance(
-            &p,
-            break_at,
-            &Candle {
-                time: at(3),
-                o: 0.0,
-                h: 0.0,
-                l: 0.0,
-                c: 0.0,
-            },
-            &window,
+        let bar = |k: i64| Candle {
+            time: at(k),
+            o: 0.0,
+            h: 0.0,
+            l: 0.0,
+            c: 0.0,
+        };
+        let tol1 = retest_tolerance(&p, &retest, break_at, &bar(1), &window);
+        let tol2 = retest_tolerance(&p, &retest, break_at, &bar(2), &window);
+        let tol3 = retest_tolerance(&p, &retest, break_at, &bar(3), &window);
+        // The slope the engine resolves in bar-index space (the anchor may land
+        // between bars, so measure it via the same helper rather than assuming
+        // exactly `slope`). It must be non-zero (angled) and close to `slope`.
+        let s = neckline_slope(&retest, &window).abs();
+        assert!(s > 0.0, "angled neckline has a non-zero slope");
+        assert!(
+            (s - slope).abs() < slope * 0.1,
+            "resolved slope {s} ≈ intended {slope}"
         );
         assert!(tol1.abs() < 1e-12, "N=1 tolerance is 0, got {tol1}");
         assert!(
-            (tol2 - 0.00075).abs() < 1e-9,
-            "N=2 → 1*0.075*0.010, got {tol2}"
+            (tol2 - 1.0 * 0.075 * s).abs() < 1e-12,
+            "N=2 → 1*step*slope, got {tol2}"
         );
         assert!(
-            (tol3 - 0.0015).abs() < 1e-9,
-            "N=3 → 2*0.075*0.010, got {tol3}"
+            (tol3 - 2.0 * 0.075 * s).abs() < 1e-12,
+            "N=3 → 2*step*slope, got {tol3}"
         );
+        assert!(tol3 > tol2, "the band fattens with N on an angled neckline");
+    }
+
+    /// A **horizontal** neckline (slope 0) never widens — tolerance stays 0.0 at
+    /// every N (strict must-reach-the-line forever). This is the operator's rule:
+    /// a flat neckline is an exact price level, retest it precisely.
+    #[test]
+    fn retest_tolerance_horizontal_neckline_stays_zero() {
+        let first = ts("2026-06-01T00:00:00Z").timestamp();
+        let break_epoch = first + 24 * 3600;
+        let break_at = DateTime::from_timestamp(break_epoch, 0).unwrap();
+        // `retest_line_down()` is a HorizontalCross → slope 0.
+        let retest = rule(
+            "04-prep-retest",
+            retest_line_down(),
+            FireMode::Once,
+            Action::Prep,
+        );
+        let mut p = plan(vec![retest.clone()]);
+        p.retest_atr_step = 0.075;
+        let mut window = warm_atr_window(24, first);
+        for k in 1..=3 {
+            let t = break_epoch + k * 3600;
+            window.push(Candle {
+                time: DateTime::from_timestamp(t, 0).unwrap(),
+                o: 1.2100,
+                h: 1.2150,
+                l: 1.2050,
+                c: 1.2100,
+            });
+        }
+        let at = |k: i64| DateTime::from_timestamp(break_epoch + k * 3600, 0).unwrap();
+        for k in 1..=3 {
+            let candle = Candle {
+                time: at(k),
+                o: 0.0,
+                h: 0.0,
+                l: 0.0,
+                c: 0.0,
+            };
+            let tol = retest_tolerance(&p, &retest, break_at, &candle, &window);
+            assert!(
+                tol.abs() < 1e-12,
+                "horizontal neckline never widens (N={k}), got {tol}"
+            );
+        }
     }
 
     /// A retest window shorter than `atr_length_for(granularity)` (so
@@ -4053,15 +4417,16 @@ mod tests {
             l: 0.0,
             c: 0.0,
         };
-        let mut p = plan(vec![rule(
+        let retest = rule(
             "04-prep-retest",
             retest_line_down(),
             FireMode::Once,
             Action::Prep,
-        )]);
+        );
+        let mut p = plan(vec![retest.clone()]);
         p.retest_atr_step = 0.075;
         // Must return 0.0 (strict must-reach), not panic.
-        let tol = retest_tolerance(&p, break_at, &candle, &window);
+        let tol = retest_tolerance(&p, &retest, break_at, &candle, &window);
         assert!(tol.abs() < 1e-12, "short window → 0.0 tolerance, got {tol}");
     }
 
@@ -4415,6 +4780,99 @@ mod tests {
                 .copied(),
             Some(1.1950),
             "record_last_close runs as always"
+        );
+    }
+
+    /// The regression this whole change exists for (EUR/GBP / GBP/USD, 2026-07).
+    /// An **inverse-H&S long** whose break-and-close closes UP through the
+    /// neckline. The bar that made the clean below→above transition was lost
+    /// (suppressed as a spread-hour rubbish candle, or simply skipped), and the
+    /// NEXT bar opened *and* closed above the neckline — no below→above
+    /// transition on that bar itself. The old prior-close edge detector saw a
+    /// `prev` already above and never stamped, stranding the plan in
+    /// `AwaitBreakAndClose` forever. The origin-side rule fixes it: the origin
+    /// (the plan's first bar, opened below the neckline) is the reference, so the
+    /// settled close above the line fires.
+    #[test]
+    fn on_close_break_fires_when_transition_bar_was_skipped() {
+        // Up-break neckline flat at 1.2000.
+        let neckline = |dir, bar| Trigger::TrendlineCross {
+            a: LinePoint {
+                at_epoch: ts("2026-06-16T00:00:00Z").timestamp(),
+                price: 1.2000,
+            },
+            b: LinePoint {
+                at_epoch: ts("2026-06-16T01:00:00Z").timestamp(),
+                price: 1.2000,
+            },
+            extend_forward: true,
+            bar_seconds: 3600,
+            dir,
+            bar,
+        };
+        let p = plan(vec![
+            rule(
+                "03-prep-break-and-close",
+                neckline(CrossDir::Up, BarEvent::OnClose),
+                FireMode::Once,
+                Action::Prep,
+            ),
+            rule(
+                "04-prep-retest",
+                neckline(CrossDir::Down, BarEvent::Intrabar),
+                FireMode::Once,
+                Action::Prep,
+            ),
+            rule(
+                "05-enter",
+                Trigger::MwEveryBar,
+                FireMode::Once,
+                Action::Enter,
+            ),
+        ]);
+        let prior = seed_at(Phase::AwaitBreakAndClose, "2026-06-16T09:00:00Z");
+        // Tick 1: the plan's first processed bar OPENS BELOW the neckline
+        // (1.1980) — this fixes the origin side as "below". It closes back below
+        // (1.1985), so no break yet, but the origin is now recorded.
+        let c1 = candle("2026-06-16T10:00:00Z", 1.1980, 1.1995, 1.1975, 1.1985);
+        let eval1 = run(&p, &prior, &[c1]);
+        assert!(
+            eval1.fired.is_empty(),
+            "opened+closed below → no up-break yet"
+        );
+        assert_eq!(
+            eval1
+                .new_state
+                .origin_open
+                .get("03-prep-break-and-close")
+                .copied(),
+            Some(1.1980),
+            "origin fixed from the first bar's open (below the neckline)"
+        );
+        // Tick 2: this bar OPENS ABOVE (1.2020) and CLOSES ABOVE (1.2030) — no
+        // below→above transition on the bar. The old edge detector's `prev`
+        // (c1's close 1.1985) would satisfy `prev < upper`, but imagine the true
+        // transition bar between them was suppressed; the point is origin-side
+        // does not depend on the prior close at all. Fires off the origin below.
+        let c2 = candle("2026-06-16T11:00:00Z", 1.2020, 1.2040, 1.2015, 1.2030);
+        let eval2 = run(&p, &eval1.new_state, &[c2]);
+        assert_eq!(
+            eval2.fired.len(),
+            1,
+            "settled close above fires the break off the below origin (got {:?})",
+            eval2.fired
+        );
+        assert_eq!(eval2.fired[0].rule_id, "03-prep-break-and-close");
+        assert_eq!(eval2.new_state.phase, Phase::AwaitEntry);
+        // And the origin never moved despite two more bars.
+        assert_eq!(
+            eval2
+                .new_state
+                .origin_open
+                .get("03-prep-break-and-close")
+                .copied(),
+            Some(1.1980),
+            "origin is set-once, never overwritten"
         );
     }
 

@@ -111,32 +111,50 @@ pub struct TradePlan {
     #[serde(default)]
     pub shadow: bool,
     /// Cross-depth buffer, as a **percent of the crossed level's price**, that
-    /// an *intrabar* directional cross must pierce past the line before it
-    /// counts. Guards against a one-tick graze tripping a retest / invalidation:
-    /// a `Down` cross needs `low <= level - (pct/100)*level`, an `Up` cross needs
-    /// `high >= level + (pct/100)*level`. `Either` keeps a bare straddle, and
-    /// `OnClose` (break-and-close) is unaffected — its close must already be on
-    /// the far side. `0.0` (the default) reproduces the pre-buffer behaviour, so
+    /// widens each line into a zone `[level ± (pct/100)·level]` a cross must clear.
+    /// Guards against a one-tick graze tripping a cross:
+    /// - an *intrabar* directional cross must pierce `pct%` past the line: a `Down`
+    ///   cross needs `low <= level - buffer`, an `Up` cross `high >= level +
+    ///   buffer`; `Either` keeps a bare straddle;
+    /// - an *`OnClose`* directional cross (break-and-close, invalidation caps)
+    ///   must **close** past the *far zone edge* (`Up`: `close >= level + buffer`;
+    ///   `Down`: `close <= level - buffer`). A close that only dips into the zone
+    ///   short of the far edge is not a break — this is the "zone of the line" fix
+    ///   (NAS100 short 2026-07-02).
+    ///
+    /// `0.0` (the default) reproduces the bare wick/close-touch behaviour, so
     /// plans signed before this field deserialize unchanged.
     ///
     /// Plan-level (uniform across the plan's crosses) and signed as part of the
-    /// whole-body HMAC, so it's fixed at arm time. A future `tv-arm` flag can
-    /// override the arm-time default.
+    /// whole-body HMAC, so it's fixed at arm time. `tv-arm --cross-buffer-pct`
+    /// overrides the arm-time default ([`DEFAULT_CROSS_BUFFER_PCT`]).
     #[serde(default)]
     pub cross_buffer_pct: f64,
-    /// Per-bar decay step (in **ATR multiples**) for the retest's
-    /// closeness-to-neckline tolerance. The retest cross loosens as bars pass
-    /// since the break-and-close: the first bar after the break must actually
-    /// *reach* the neckline (tolerance 0), and each subsequent bar adds
-    /// `retest_atr_step × ATR` of **near-side** slack, so a wick that comes
-    /// *within* the tolerance of the line (without reaching it) still stamps the
-    /// retest. With `N` = bars since break-and-close (first = 1) and `ATR` the
-    /// Wilder ATR at the current bar, the tolerance is `(N-1) × retest_atr_step ×
-    /// ATR`. The rationale (operator): a retest right after the break should be
-    /// tight, but the further price drifts in time the less its exact distance to
-    /// the neckline matters.
+    /// Per-bar step for the retest's closeness-to-neckline tolerance — the retest
+    /// zone is a near-side band that **fattens over time, at a rate set by the
+    /// neckline's slope**. The first bar after the break must actually *reach* the
+    /// neckline (tolerance 0); each subsequent bar adds slack, so a wick that
+    /// comes *within* the tolerance of the line (without reaching it) still stamps
+    /// the retest. With `N` = bars since break-and-close (first = 1) the tolerance
+    /// is:
     ///
-    /// Only the retest rule uses this; every other intrabar cross keeps
+    /// ```text
+    /// tolerance(N) = (N-1) × retest_atr_step × |neckline slope, price per bar|
+    /// ```
+    ///
+    /// (Equivalently `(N-1) × retest_atr_step × ATR × (|slope|/ATR)` — the ATR, a
+    /// volatility proxy, cancels; it's still computed as the calibration unit and
+    /// guards a fail-soft degrade-to-0 when the window is too short to warm it.)
+    /// A **horizontal neckline has slope 0 ⇒ tolerance 0 forever** (retest it to
+    /// the exact line — flat necklines are precise price levels). A steeper
+    /// neckline fattens the band faster. Rationale (operator): the reason a retest
+    /// lands further from the line as bars pass is the *line moving away*, and how
+    /// fast it moves is its slope; combined with volatility (the ATR term the
+    /// step was calibrated in) that's `slope × vol` — the classic drift+diffusion
+    /// cone. Stricter than a textbook ATR-band (which keeps a band even on a flat
+    /// line) — deliberate, so horizontals stay exact.
+    ///
+    /// Only the retest rule uses this; every other cross keeps
     /// [`Self::cross_buffer_pct`] (which tightens, not loosens). Signed as part of
     /// the whole-body HMAC, so it's fixed at arm time; `tv-arm --retest-atr-step`
     /// overrides the default. `#[serde(default = …)]` gives plans signed before
