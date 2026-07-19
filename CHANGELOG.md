@@ -1,5 +1,50 @@
 # Changelog
 
+## v96 — 2026-07-19 — reversal-close is EXIT-ONLY (veto-on-reversal → dormant no-op)
+
+**Why.** Two reasons, one change. (1) Operator's rule: a reversal candle
+(golden reversal during news, or off an S/R band) should **close the existing
+trade and nothing else** — it's a reason to *exit*, not to *stay out*. Once
+flat, a fresh signal may re-enter. Blocking future entries is already the job
+of the independent invalidation caps (`too-high`/`too-low`) and the 80%-to-TP
+`pcl-exhausted` abort, which fire on their own and (correctly) don't close the
+position. (2) The old entry-blocking behaviour was a **replay↔live
+divergence** (the last confirmed 3.3 bug): the live worker wrote a `reversal`
+veto in `run_close`, but the offline replay never invokes `run_close` for a
+`Close` fire (its dispatch loop handles only Enter/Pause/Resume/Prep, dropping
+Close through `_ => {}`). So a later multi-shot enter passed offline but
+rejected live — replay over-reported entries. Removing the write from *both*
+halves closes the divergence at the root: nobody writes it, replay == live.
+
+**What changed (behaviour).** A gate-passed reversal-close now flattens the
+open position and writes **no** veto.
+- `core/src/dispatch/close.rs`: deleted the `if intent.veto_on_reversal
+  { write_reversal_veto(..) }` block and the `write_reversal_veto` /
+  `reversal_veto_plan` helpers. `run_close`'s `now` param is retained for
+  dispatch-signature parity (now `_now`).
+- `cli/src/trade_patterns.rs`: `build_trade_from_spec` passes `false`
+  unconditionally for the enter-builder's `check_reversal_veto` at both the
+  BCR (`05-enter`) and QM (`09-enter-qm`) call sites — the enter no longer
+  lists `reversal` in its `vetos`.
+
+**Not breaking (wire).** `Intent.veto_on_reversal`, `TradeSpec.veto_on_reversal`,
+`tv-arm --veto-on-reversal`, and `REVERSAL_VETO_NAME` (= `"reversal"`) all still
+parse / round-trip / exist as **dormant no-ops** so in-flight alerts and legacy
+`clear-veto reversal` still work. A future cleanup can delete the field.
+
+**Tests.** New `core` test
+`reversal_exit_only_tests::gate_passed_close_with_veto_on_reversal_writes_no_veto`
+(a gate-passing in-band reversal-close with `veto_on_reversal: true` leaves the
+store's veto set empty). `cli` test
+`build_trade_from_spec_close_sets_veto_on_reversal_when_armed` inverted →
+`..._is_exit_only_enter_never_checks_it` (armed close still carries the dormant
+flag on the wire, but the paired enter carries no `reversal` veto). 867 core +
+267 cli lib tests + 22 replay-bin tests green.
+
+**Follow-up.** Full removal of the `veto_on_reversal` field from the wire +
+validation is deferred (Neuter over Full-removal chosen for a small,
+reversible diff). Docs: CLAUDE.md + README updated to exit-only.
+
 ## v95 — 2026-07-19 — TradeNation H4/M5 now WORK (aggregating fetch, verified live)
 
 **Why.** TN H4/M5 plans were dead live (v92 made the failure loud instead of

@@ -1180,10 +1180,12 @@ fn assemble_trade(
         spec.blackout_close,
         &spec.broker,
         &spec.account,
-        // The enter must check the `reversal` veto only when a
-        // reversal-close that writes it actually exists for this setup —
-        // i.e. the flag is armed AND there are sr bands to reverse off.
-        spec.veto_on_reversal && !spec.sr_reversal_ranges.is_empty(),
+        // EXIT-ONLY (2026-07-19): a reversal-close is exit-only and never
+        // writes a `reversal` veto, so the enter never checks one. Future
+        // entries are gated by the independent invalidation caps
+        // (too-high/too-low) and the 80%-to-TP pcl-exhausted abort — not by
+        // the reversal-close. `veto_on_reversal` is a dormant no-op.
+        false,
         &spec.entry_level_vetos,
         spec.recover_entry,
         false, // BCR leg → 05-enter
@@ -1247,7 +1249,9 @@ fn assemble_trade(
             spec.blackout_close,
             &spec.broker,
             &spec.account,
-            spec.veto_on_reversal && !spec.sr_reversal_ranges.is_empty(),
+            // EXIT-ONLY (2026-07-19): see the BCR leg above — the enter
+            // never checks a `reversal` veto; the reversal-close is exit-only.
+            false,
             &spec.entry_level_vetos,
             // Wrong-side recovery keyed to the QM order type: a Stop recovers to
             // a Limit (price ran through the trigger → wait for the pullback);
@@ -3557,28 +3561,33 @@ mod tests {
     }
 
     #[test]
-    fn build_trade_from_spec_close_sets_veto_on_reversal_when_armed() {
-        // veto_on_reversal rides the 07 (S/R) half — it needs the price band.
+    fn build_trade_from_spec_veto_on_reversal_is_exit_only_enter_never_checks_it() {
+        // EXIT-ONLY (2026-07-19): even when `veto_on_reversal` is armed with
+        // sr bands, the reversal-close is exit-only. It flattens the position
+        // and the worker writes NO `reversal` veto, so the paired enter must
+        // NOT list `reversal` in its vetos — a reversal candle never blocks a
+        // future entry. (The close still carries the dormant flag on the wire;
+        // the worker ignores it. Future entries are gated by the independent
+        // too-high/too-low and 80%-to-TP caps.)
         let now = ts("2026-05-20T00:00:00Z");
         let mut spec = sample_spec(TradePattern::Hs, ts("2026-05-25T00:00:00Z"));
         spec.sr_reversal_ranges = vec![[1.0950, 1.0970]];
         spec.veto_on_reversal = true;
         let trade = build_trade_from_spec(spec, now, BuildStrictness::Strict).unwrap();
         let close = reversal_close_by_basename(&trade, "07-close-on-sr-reversal").unwrap();
+        // The dormant flag still rides the 07 (S/R) half on the wire.
         assert!(close.veto_on_reversal);
-        // The paired half: the enter MUST list `reversal` in its vetos, or
-        // the veto the worker writes would never gate the entry.
+        // But the enter never checks a `reversal` veto — exit-only.
         let enter = &trade.alerts[5].intent;
         assert!(
-            enter.vetos.iter().any(|v| v == "reversal"),
-            "enter must check the reversal veto when armed, got {:?}",
+            !enter.vetos.iter().any(|v| v == "reversal"),
+            "exit-only: enter must NOT check a reversal veto, got {:?}",
             enter.vetos
         );
-        // Still a valid intent (close + price window present).
         close
             .validate()
             .expect("veto_on_reversal close intent valid");
-        enter.validate().expect("enter with reversal veto valid");
+        enter.validate().expect("enter valid without reversal veto");
     }
 
     #[test]
