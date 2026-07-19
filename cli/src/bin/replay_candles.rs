@@ -171,6 +171,18 @@ async fn main() -> Result<()> {
     // count the real pre-`start` candles, and if short, widen the look-back and
     // retry — hopping the gap — until we have enough or hit a back-off cap.
     let bar_secs = gran.engine().seconds();
+    // Floor the warmup at the SHARED detector-lookback depth (the same
+    // `detector_lookback_bars` the live worker's `pine_lookback_since` uses), so
+    // the replay's detector window can never be shallower than live's — the two
+    // ATR-warmup depths are one number, and a low `--warmup-bars` can't silently
+    // re-introduce the golden-starvation divergence. The default (200) already
+    // clears every ATR length; this only bites when an operator lowers it.
+    let warmup_bars = {
+        use trade_control_core::signals::{DetectorConfig, detector_lookback_bars};
+        let cfg = DetectorConfig::pine_defaults(gran.engine());
+        args.warmup_bars
+            .max(detector_lookback_bars(&cfg, gran.engine()))
+    };
     let candles = pull_with_warmup(
         args.source,
         &symbol,
@@ -179,7 +191,7 @@ async fn main() -> Result<()> {
         start,
         pull_end,
         bar_secs,
-        args.warmup_bars,
+        warmup_bars,
         args.cache_dir.clone(),
     )
     .await?;

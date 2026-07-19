@@ -681,13 +681,20 @@ async fn detector_window_for(
     Ok(merged)
 }
 
-/// The fetch start a `PinePattern` entry needs: `min_lookback_bars` of history
-/// behind the earliest fresh candle. `None` when the plan has no Pine entry.
+/// The fetch start a `PinePattern` entry needs: [`detector_lookback_bars`] of
+/// history behind the earliest fresh candle. `None` when the plan has no Pine
+/// entry.
+///
+/// The depth comes from the SHARED `detector_lookback_bars` (not the bare
+/// `min_lookback_bars`) so the live window warms the ATR — a `min_lookback`-only
+/// window (~12 bars) is shorter than the ATR length (24 on H1, 96 on M15), so
+/// `wilder_atr` returned `None` and every golden was silently forced false,
+/// declining `needs_golden` enters live that the replay (200-bar warmup) took.
+/// The replay's warmup floor calls the same fn, so the two can't drift.
 fn pine_lookback_since(
     plan: &trade_control_core::trade_plan::TradePlan,
     earliest_fresh: DateTime<Utc>,
 ) -> Option<DateTime<Utc>> {
-    use trade_control_core::signals::{DetectorConfig, min_lookback_bars};
     use trade_control_core::trade_plan::Trigger;
 
     let has_pine = plan.rules.iter().any(|r| {
@@ -696,9 +703,18 @@ fn pine_lookback_since(
     if !has_pine {
         return None;
     }
-    let cfg = DetectorConfig::pine_defaults(plan.granularity);
-    let lookback = min_lookback_bars(&cfg) as i64;
+    let lookback = pine_lookback_bars(plan.granularity) as i64;
     Some(earliest_fresh - chrono::Duration::seconds(plan.granularity.seconds() * lookback))
+}
+
+/// Bars of history a Pine detector needs behind the earliest fresh candle — the
+/// SHARED [`detector_lookback_bars`] (`max(min_lookback, atr_length)`), so the
+/// live window warms the ATR. Pulled out as a pure `Granularity → usize` so the
+/// ATR-starvation regression is testable without building a whole `TradePlan`.
+fn pine_lookback_bars(granularity: Granularity) -> usize {
+    use trade_control_core::signals::{DetectorConfig, detector_lookback_bars};
+    let cfg = DetectorConfig::pine_defaults(granularity);
+    detector_lookback_bars(&cfg, granularity)
 }
 
 /// The fetch start the plan's trendlines need: the earliest anchor epoch across
@@ -969,5 +985,47 @@ mod tests {
         // min of the pair is still picked.
         let triggers = [trendline(800, 200)];
         assert_eq!(earliest_trendline_anchor_epoch(triggers.iter()), Some(200));
+    }
+
+    // ===== detector window warms the ATR (the golden-starvation fix) =====
+
+    use trade_control_core::signals::atr_length_for;
+
+    /// The live Pine detector window must reach back at least the ATR length so
+    /// `wilder_atr` is warm and golden isn't silently forced false. Before the
+    /// fix this used `min_lookback_bars` (~12) — shorter than H1's ATR length
+    /// (24) — so every golden was declined live while the replay (200-bar
+    /// warmup) took the trade. Assert the shared depth now covers the ATR.
+    #[test]
+    fn pine_lookback_covers_the_atr_length_on_every_granularity() {
+        for g in [
+            Granularity::M1,
+            Granularity::M5,
+            Granularity::M15,
+            Granularity::H1,
+            Granularity::H4,
+            Granularity::D1,
+        ] {
+            assert!(
+                pine_lookback_bars(g) >= atr_length_for(g),
+                "{g:?}: detector window {} must cover ATR length {}",
+                pine_lookback_bars(g),
+                atr_length_for(g)
+            );
+        }
+    }
+
+    /// The `since` timestamp reaches back the full ATR-covering window. On H1
+    /// that's ≥ 24 hours behind the earliest fresh bar (was ~12h before the fix).
+    #[test]
+    fn pine_lookback_since_reaches_back_the_atr_window() {
+        let earliest_fresh = ts("2026-06-17T20:00:00Z");
+        let bars = pine_lookback_bars(Granularity::H1) as i64;
+        // Reconstruct what pine_lookback_since computes for a Pine plan.
+        let since = earliest_fresh - chrono::Duration::seconds(3600 * bars);
+        assert!(
+            since <= ts("2026-06-16T20:00:00Z"),
+            "H1 window {since} must reach ≥24h back to warm the ATR"
+        );
     }
 }

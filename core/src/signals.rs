@@ -55,6 +55,8 @@ pub use state_machine::{
     DetectorConfig, LatchedSignal, first_confirmed_signal_at, latched_signal_at,
 };
 
+// `detector_lookback_bars` is defined below (shared by live + replay).
+
 /// The default detector config the H&S chart study ships with (`confirm_bars =
 /// 2`, `sl_lookback = 5`, `similarity_pct = 20`, all five patterns on). Matches
 /// the `input.*` defaults in `candle-signals-v2.pine`.
@@ -70,4 +72,71 @@ pub fn min_lookback_bars(cfg: &DetectorConfig) -> usize {
     // 3 bars of pattern depth (double-tweezer) + the SL lookback ahead of the
     // signal + the confirm window after it, with a little slack.
     3 + cfg.sl_lookback + cfg.confirm_bars + 2
+}
+
+/// Bars of history the detector needs behind a candidate signal bar to produce a
+/// **correct golden verdict** — the single source of truth for the detector
+/// back-window depth, called by BOTH the live worker (`pine_lookback_since`) and
+/// the offline replay warmup floor so the two can never drift by caller.
+///
+/// The golden flag is `body_size >= ATR` ([`detect::Detected::is_golden`]), and
+/// [`wilder_atr`] returns `None` — silently forcing `golden = false` — when the
+/// window is shorter than [`atr_length_for`] (24 bars on H1, 96 on M15). So a
+/// window sized only by [`min_lookback_bars`] (~12) is enough to *detect the
+/// pattern* but too short to *warm the ATR*, and every `needs_golden` enter is
+/// wrongly declined "needs golden but signal is not golden". Taking the max of
+/// the two requirements fixes that: the pattern state machine and the ATR are
+/// both satisfied. The `+2` slack mirrors `min_lookback_bars`' own slack (the
+/// leading edge of the fetched window is the least reliable bar).
+pub fn detector_lookback_bars(cfg: &DetectorConfig, granularity: Granularity) -> usize {
+    min_lookback_bars(cfg).max(atr_length_for(granularity) + 2)
+}
+
+#[cfg(test)]
+mod lookback_tests {
+    use super::*;
+
+    /// On H1 the ATR length (24) dominates the ~12-bar pattern lookback, so the
+    /// detector window must reach back at least `atr_length + slack` — otherwise
+    /// `wilder_atr` returns `None` and every golden is forced false (the live
+    /// ATR-starvation bug).
+    #[test]
+    fn h1_window_reaches_the_atr_length() {
+        let cfg = DetectorConfig::pine_defaults(Granularity::H1);
+        let bars = detector_lookback_bars(&cfg, Granularity::H1);
+        assert!(
+            bars >= atr_length_for(Granularity::H1),
+            "H1 detector window {bars} must cover the ATR length {}",
+            atr_length_for(Granularity::H1)
+        );
+        // And it must dominate the pattern-only lookback that caused the bug.
+        assert!(bars > min_lookback_bars(&cfg));
+    }
+
+    /// M15's ATR length (96) is far larger than the pattern lookback, so the
+    /// gap the bug exploited is widest here.
+    #[test]
+    fn m15_window_reaches_the_atr_length() {
+        let cfg = DetectorConfig::pine_defaults(Granularity::M15);
+        let bars = detector_lookback_bars(&cfg, Granularity::M15);
+        assert!(bars >= atr_length_for(Granularity::M15));
+        assert!(bars > min_lookback_bars(&cfg));
+    }
+
+    /// The shared depth is never *shorter* than the pattern lookback on any
+    /// granularity — it only ever widens the window, never narrows it.
+    #[test]
+    fn never_shorter_than_min_lookback() {
+        for g in [
+            Granularity::M1,
+            Granularity::M5,
+            Granularity::M15,
+            Granularity::H1,
+            Granularity::H4,
+            Granularity::D1,
+        ] {
+            let cfg = DetectorConfig::pine_defaults(g);
+            assert!(detector_lookback_bars(&cfg, g) >= min_lookback_bars(&cfg));
+        }
+    }
 }
