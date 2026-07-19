@@ -76,6 +76,40 @@ within_the_risk_cap_is_accepted, rejects_at_the_open_positions_cap,
 under_the_open_positions_cap_is_accepted}` in `replay_broker`. cli suite
 267 + 98 + 22 pass; clippy + fmt clean.
 
+## v94 — 2026-07-19 — first-confirmed scan floor is depth-independent (replay≠live fix)
+
+**Why.** A `needs_confirmed` (QM) enter with no break-and-close and no
+`tv-arm --start` has `confirmed_floor = None`, and `first_confirmed_signal_at`
+then scanned the **whole** detector window for the first confirmed signal. But
+the window depth **varies by caller**: a trendline-anchored plan fetches back to
+an old neckline on live *and* replay, while a `--warmup-bars` replay is always
+deep (~200) and the live worker's non-anchored window is shallow
+(`detector_lookback_bars`). So the unbounded `None` scan latched an **ancient
+warmup-era** confirmed signal in a deep window but a recent one in a shallow
+window — a "3.3" replay≠live divergence: replay entered (or entered with a
+different ancient signal's geometry → different entry/SL/TP) where live never
+fired. The old code comment even asserted "the detector back-window is already
+bounded on the live path" — false.
+
+**What changed.** New shared `core::signals::confirmed_scan_floor(window, as_of,
+cfg, granularity, explicit)` — the single source of truth for the scan's lower
+bound. An explicit floor (break-and-close / replay_start) still wins; when it's
+`None` the floor is derived from the SHARED `detector_lookback_bars` depth behind
+the as-of bar (the recent setup window), **independent of how deep the fetch
+reached**. `saturating_sub` floors to bar 0 on a short window (no panic; whole
+short window in scope, byte-identical to before). Both consumers now call it: the
+fire path (`engine::eval_pine_entry`) and the replay's "would-have-entered"
+report annotation (`confirmed_signal_ready`), so decision and annotation can't
+drift either. Extends the existing `detector_lookback_bars` seam (the v90
+ATR-window fix) rather than forking a parallel window-depth path.
+
+**Tests.** `confirmed_scan_floor_{scopes_a_deep_window_to_the_recent_lookback,
+prefers_an_explicit_floor, saturates_to_bar_zero_on_a_short_window,
+empty_window_is_none}` (core, pure); `confirmed_enter_fires_in_a_deep_window_via_
+the_derived_scan_floor` (engine, end-to-end — a setup deep in a 40-bar-padded
+window still fires the recent signal). All existing `confirmed_enter_*` tests
+unchanged. core 874 / engine 160 / cli 267+94+22 pass; clippy + fmt clean.
+
 ## v91 — 2026-07-15 — deprecate cross_buffer_pct in favour of cross_buffer_atr
 
 **Why.** The percent-of-price cross buffer (`cross_buffer_pct`) is

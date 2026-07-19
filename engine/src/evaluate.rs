@@ -713,12 +713,17 @@ fn evaluate_one_entry(
         return;
     }
 
-    // The setup floor for a first-confirmed enter: the confirmed signal must
-    // print at/after the *later* of the break-and-close time and the replay-start
-    // cursor. This scopes "first confirmed" to the setup forming now, not an
-    // ancient warmup-era signal (the DE30 24979 case). Both are `None` on a live
-    // QM enter with no break — then the whole window is in scope (the detector
-    // back-window is already bounded on the live path).
+    // The explicit setup floor for a first-confirmed enter: the confirmed signal
+    // must print at/after the *later* of the break-and-close time and the
+    // replay-start cursor. This scopes "first confirmed" to the setup forming now,
+    // not an ancient warmup-era signal (the DE30 24979 case). Both are `None` on a
+    // QM enter with no break — in which case `eval_pine_entry` derives a fallback
+    // floor from the SHARED `detector_lookback_bars` depth (bug ①). It is NOT
+    // safe to fall through to "whole window in scope": the fetch-window depth
+    // varies by caller (a trendline-anchored plan reaches back to an old neckline
+    // on live *and* replay; a `--warmup-bars` replay is always deep), so an
+    // unbounded scan latches an ancient signal in a deep window but a recent one
+    // in a shallow window — the exact replay≠live split.
     let confirmed_floor = [
         state.break_close_at,
         plan.replay_start
@@ -902,15 +907,29 @@ fn eval_pine_entry(
     // golden-only enters keep the latch (`false`): they want "the newest signal
     // right now", and golden-only enters were never confirmation-blocked.
     // `confirmed_floor` scopes the first-confirmed scan to the setup (past the
-    // break/replay-start), so a warmup-era signal can't claim it.
+    // break/replay-start), so a warmup-era signal can't claim it. When the engine
+    // has no explicit floor (a QM enter with no break-and-close / no
+    // `tv-arm --start`), fall back to the SHARED `detector_lookback_bars` depth
+    // behind this bar — NOT the whole window, whose depth varies by caller
+    // (trendline fetch vs `--warmup-bars`) and would otherwise let replay latch an
+    // ancient signal live never reaches (bug ①). One source of truth so the scan
+    // can't drift live-vs-replay.
     let sig = if confirmed_first {
+        let window_times: Vec<_> = detector_window.iter().map(|c| c.time).collect();
+        let scan_floor = trade_control_core::signals::confirmed_scan_floor(
+            &window_times,
+            idx,
+            cfg,
+            cfg.granularity,
+            confirmed_floor,
+        );
         first_confirmed_signal_at(
             detector_window,
             idx,
             cfg,
             dir,
             pattern,
-            confirmed_floor,
+            scan_floor,
             confirmed_after,
         )
     } else {
@@ -5379,6 +5398,72 @@ mod tests {
             (sig.signal_low - 110.0).abs() < 1e-9,
             "lo {}",
             sig.signal_low
+        );
+    }
+
+    #[test]
+    fn confirmed_enter_fires_in_a_deep_window_via_the_derived_scan_floor() {
+        // bug ①: a `needs_confirmed` (QM) enter with no break-and-close and no
+        // `tv-arm --start` has `confirmed_floor = None`. In a DEEP detector window
+        // (a `--warmup-bars` replay, or a trendline-anchored fetch) the old
+        // unbounded scan would consider the whole ancient tail. The derived floor
+        // (`detector_lookback_bars` behind the as-of bar) scopes it to the recent
+        // setup instead — so the enter still fires on the recent confirmed signal,
+        // exactly as it would in the live worker's shallower window. Here we prove
+        // the setup near the END of a deep window fires (bar index >> the pattern
+        // depth); the floor derivation is what keeps `None` from mis-scoping.
+        let mut rule = pine_enter_rule(None, Direction::Short, false);
+        rule.intent.needs_confirmed = true;
+        rule.intent.entry = Some(trade_control_core::intent::EntrySpec::Limit {
+            from: trade_control_core::intent::PriceAnchor::SignalLow,
+            offset_pips: 0.0,
+            offset_atr_pct: None,
+            at: None,
+            recover_entry: None,
+        });
+        rule.intent.take_profit = Some(trade_control_core::intent::TakeProfit::Anchored(
+            trade_control_core::intent::PriceRef::Absolute { absolute: 90.0 },
+        ));
+        let p = plan(vec![rule]);
+
+        // Prepend 40 flat filler bars (no pattern prints) so the two-engulfer
+        // setup sits deep in the window — well past `detector_lookback_bars` from
+        // bar 0, but the confirmation bar is the as-of bar so the setup is inside
+        // the derived recent floor.
+        let setup = two_short_engulfers_window();
+        let first_setup = setup[0].time;
+        let mut window: Vec<Candle> = (0..40)
+            .map(|i| {
+                let t = first_setup - chrono::Duration::hours(40 - i);
+                // Flat doji-ish bars: tiny range, no engulfer/pinbar/tweezer.
+                candle_at(t, 115.0, 115.1, 114.9, 115.0)
+            })
+            .collect();
+        window.extend(setup.iter().copied());
+
+        let confirm_idx = window.len() - 1; // the two-engulfer confirmation bar
+        let prior = seed_at(Phase::AwaitEntry, "2026-06-16T11:00:00Z");
+        let eval = run_window(&p, &prior, &window[confirm_idx..], &window);
+
+        assert_eq!(
+            eval.fired.len(),
+            1,
+            "the confirmed enter still fires in a deep window (got {:?})",
+            eval.fired
+        );
+        let sig = eval.fired[0]
+            .signal
+            .expect("a PinePattern fire carries latched geometry");
+        // The RECENT setup's geometry (high 117.5 / low 110), not a filler-era or
+        // ancient value — and its signal bar is inside the derived recent floor.
+        assert!(
+            (sig.signal_high - 117.5).abs() < 1e-9,
+            "hi {}",
+            sig.signal_high
+        );
+        assert!(
+            sig.signal_bar_time >= setup[0].time,
+            "the fired signal is the recent setup, not an ancient warmup signal"
         );
     }
 
