@@ -1,5 +1,52 @@
 # Changelog
 
+## v100 — 2026-07-20 — replay sim broker holds placed order levels (PR-1, dissolves divergence #4)
+
+**Why.** The offline `ReplayBroker` answered two questions about the same order —
+"is this prior attempt still open?" (retry-gate `resolve`) and "what was the P&L?"
+(ledger `realize`) — by **re-deriving the SL-vs-spread floor from different spread
+statistics** (single fire-bar sample vs trailing mean). A wick landing between the
+two floored stops could flip a multi-shot re-entry's gate-state without changing
+reported P&L (replay↔live divergence #4). Live has ONE broker-placed stop.
+
+**What changed (replay tooling only — no worker/wire behaviour change).** The sim
+broker now behaves like a real broker: a placed order carries its **concrete
+floored levels**, captured verbatim from the `EntryRequest` `run_enter` hands
+`place_entry` (`run_enter` floors the stop *before* building the request, so these
+are the final placed levels). Every later fill/exit question walks price vs those
+stored levels on the real bid/ask book — no mid, no trailing spread, no per-path
+floor re-derivation. Both `resolve` and `realize` read the ONE stored stop, so
+they can't disagree.
+
+- **engine**: extracted `simulate_fill_resolved` / `widened_stop_at_resolved` /
+  `breakeven_armed_at_resolved` — the pure fill/exit/widen physics over a bracket
+  the caller already resolved+floored. The `_windowed` / floor-front variants stay
+  for the unchanged live-mirroring callers; `apply_entry_spread_floor` stays.
+- **ReplayBroker**: `PlacedAttempt` gains `placed: Option<PlacedLevels>`; `resolve`
+  + `realize` walk it via `simulate_fill_resolved`; the restore path refreshes
+  stored levels from the re-drive request (the restore re-floors at the restore
+  bar). `record_order` drops `entry_spread_price`.
+- **report**: display lines (placed / break-even / System-2 widen) read
+  `fire.placed_bracket` (read back from the broker) via the `_resolved` variants,
+  so they annotate the same floored stop the ledger scored. Retired
+  `Fire.entry_spread_price`, `LedgerGeometry.entry_spread_price`, and the driver's
+  `entry_spread_for`.
+
+**Breaking.** Internal to the `replay-candles` bin: `replay::run` /
+`ReplayBroker::record_order` signatures changed; `Fire.entry_spread_price` gone.
+No worker/wire/signed-body/basename change.
+
+**Config.** None.
+
+**Tests.** New `resolve_and_realize_agree_on_the_stored_placed_stop` (a short
+placed with a floored 1.1030 stop; a 1.1025 wick past the signed 1.1020 stops
+neither `resolve` nor `realize`). Shadow-parity + fixture round-trip unchanged.
+Workspace green (48 bins), clippy clean.
+
+**Follow-up (PR-2).** Sub-bar zoom-in for a candle whose range covers both SL and
+TP — today the sim pessimistically assumes the stop was hit; PR-2 fetches finer
+candles to determine which level hit first.
+
 ## v99 — 2026-07-20 — H&S direction comes from the fib; invalidation must be within its range
 
 **Why.** A `tv-arm` H&S/iH&S arm read the **trade direction off the
