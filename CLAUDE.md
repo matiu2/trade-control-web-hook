@@ -136,14 +136,14 @@ feature); otherwise it stands up locally like the others until Oracle lands.
 
 ## Things the README doesn't shout
 
-### Vocabulary: TRADE vs ENTRY, and EXIT vs VETO/INVALIDATE (read this first)
+### Vocabulary: TRADE vs ENTRY, and CLOSE vs VETO/INVALIDATE (read this first)
 
 The surface names (`Action::Close`, `Action::Veto`, `Action::Invalidate`,
-`veto_on_reversal`, `07-close-on-sr-reversal`) blur genuinely different
-concepts. Most reversal/veto debugging confusion is a **scope** confusion.
-Two independent axes disambiguate everything:
+`veto_on_reversal`) blur genuinely different concepts. Most reversal/veto
+debugging confusion is a **scope** confusion. Two independent axes
+disambiguate everything:
 
-- **Does it touch the OPEN POSITION?** (flatten now, yes/no)
+- **Does it touch the OPEN POSITION?** (close it now, yes/no)
 - **Does it stop FUTURE ENTRIES?** (block re-entry, yes/no)
 
 First the nouns:
@@ -152,49 +152,53 @@ First the nouns:
   may place **multiple entries** over its window (multi-shot,
   `max_retries > 0`): place → fill → stop-out → a fresh signal bar →
   place again.
-- **Entry** — one placement/position within a trade. Closing an entry
-  does **not** end the trade.
+- **Entry** / **position** — one placement within a trade. Closing a
+  position does **not** end the trade.
 
 Now the three scoped actions, by the two axes:
 
 | concept | open position? | future entries? | scope | mechanism |
 |---|---|---|---|---|
-| **EXIT** | **flattens it** | **left open** | one entry | reversal-close (`Action::Close`, `07-/06-close-on-…`) |
+| **CLOSE** | **closes it** | **left open** | one position | reversal-close (`Action::Close`, `06-/07-close-on-…`) |
 | **VETO / INVALIDATE** | **left alone** | **blocked** | trade | `Action::Veto`/`Invalidate` at `StopNextEntry` → `Phase::Done` |
-| **CLOSE-VETO** (rare) | **flattens it** | **blocked** | trade | `Action::Veto` at `ClosePositions` — only on true thesis-death |
+| **CLOSE-VETO** (rare) | **closes it** | **blocked** | trade | `Action::Veto` at `ClosePositions` — only on true thesis-death |
 
-- **EXIT** — flatten **one entry**, but **do not** block future entries;
-  the **trade lives** and may re-enter. This is the reversal-close
-  (`Action::Close` with a price/news window). Fires **only** during a
-  news window or off an S/R band, golden-gated by default, and is
-  **exit-only** (2026-07-19): never blocks a future entry, never sets
-  `Phase::Done`. `veto_on_reversal` is a dormant no-op (section below).
-  *"This entry is wrong, get out — but the setup may still work."*
+- **CLOSE** — close **one open position**, but **do not** block future
+  entries; the **trade lives** and may re-enter. This is the
+  reversal-close (`Action::Close` with a price/news window,
+  `06-close-on-reversal` / `07-close-on-sr-reversal`; internal
+  `RuleKind::PerPositionClose`). Fires **only** during a news window or
+  off an S/R band, golden-gated by default, and is **non-terminal** — it
+  never blocks a future entry, never sets `Phase::Done`. "Close" is the
+  right word: it closes the existing position. `veto_on_reversal` on this
+  path is a dormant no-op (section below). *"This position is wrong, close
+  it — but the setup may still work, re-enter if it re-triggers."*
 - **VETO / INVALIDATE** — stop **all further entries**, but **do not
   touch an open position**. This is the invalidation family:
   `too-high`/`too-low` caps and the 80%-to-TP `pcl-exhausted` abort (a
   **wick** past 80%-to-TP is enough). They're `Action::Veto` at the
   default `StopNextEntry` level, which sets `Phase::Done` in the shared
   `evaluate_plan` and retires the plan — **but an already-open position
-  is left to run to its own SL/TP.** They just stop *new* entries. (`veto`
-  blocks only entries that opt in by listing the name in `vetos:`;
-  `invalidate` is instrument-wide — every enter blocked.) *"The thesis is
-  dead — no more attempts, but I'm not force-closing what's open."*
+  is left to run to its own SL/TP.** They just stop *new* entries.
+  (`veto` blocks only entries that opt in by listing the name in
+  `vetos:`; `invalidate` is instrument-wide — every enter blocked.)
+  *"The thesis is dead — no more attempts, but I'm not force-closing
+  what's open."*
 - **CLOSE-VETO** — the one case that does both: `Action::Veto` at
-  `VetoLevel::ClosePositions` flattens the open position **and** blocks
+  `VetoLevel::ClosePositions` closes the open position **and** blocks
   entries. Reserved for genuine thesis-invalidation — see
   `[[veto_close_only_when_thesis_invalidated]]`. `too-high`/`too-low`
   are **not** this; they're `StopNextEntry`.
 
-So: **EXIT** is per-entry, non-terminal, position-flattening. **VETO/
-INVALIDATE** is per-trade, terminal, position-**preserving**. The word
-"close" in the exit path is historical (`Action::Close` also doubles as
-the operator emergency-flatten); an exit is **not** a veto. If you ask
+So: **CLOSE** is per-position, non-terminal, position-closing. **VETO/
+INVALIDATE** is per-trade, terminal, position-**preserving**. If you ask
 "does this reversal-close stop re-entry?" the answer is **no**; if you
-ask "does a `too-high` veto flatten my open position?" the answer is
-also **no** — it just stops the next entry. (A future rename may make
-`07-close-on-sr-reversal` → `07-exit-…`; the wire `Action::Close` stays
-because it doubles as emergency-close.)
+ask "does a `too-high` veto close my open position?" the answer is also
+**no** — it just stops the next entry. Note `Action::Close` also doubles
+as the operator emergency-flatten, so the basenames keep the word
+"close" (it's correct); the internal engine kind was renamed
+`PerTradeExit` → `PerPositionClose` (2026-07-19) to match — "close",
+scoped per-position not per-trade.
 
 ### "retry" / `max_retries` does NOT mean retrying failed placements
 

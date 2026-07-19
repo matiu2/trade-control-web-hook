@@ -27,10 +27,16 @@ pub enum RuleKind {
     /// armed in **every** phase — a setup can be invalidated before it ever
     /// breaks-and-closes (price runs up away from a short and the H&S is void).
     SetupInvalidation,
-    /// 06-close-on-reversal / 07-close-on-sr-reversal. A per-*trade* exit: it
-    /// flattens an open position but is **non-terminal** (the plan lives on), and
-    /// it needs a position to act on so it is armed from `AwaitEntry` onward only.
-    PerTradeExit,
+    /// 06-close-on-reversal / 07-close-on-sr-reversal. A per-*position* close:
+    /// it **closes the open position** but is **non-terminal** (the plan lives
+    /// on and may re-enter), and it needs a position to act on so it is armed
+    /// from `AwaitEntry` onward only. This is a CLOSE (flatten one position),
+    /// **not** a VETO/INVALIDATE (which stops future entries but leaves an open
+    /// position running) — see the vocabulary glossary in CLAUDE.md. Renamed
+    /// from `PerTradeExit` (2026-07-19): "close" is the right word (it closes
+    /// the existing position) and the scope is per-*position*, not per-trade.
+    #[serde(alias = "per_trade_exit")]
+    PerPositionClose,
     /// pause / resume / news-start / news-end. Sets the worker's blackout /
     /// news-window state on a wall-clock fire. Always-armed, non-terminal —
     /// never touches the trade's spine.
@@ -72,7 +78,7 @@ impl From<&AlertBasename> for RuleKind {
             | AlertBasename::VetoMwAbort
             | AlertBasename::VetoMwOvershoot => RuleKind::SetupInvalidation,
             AlertBasename::CloseOnReversal | AlertBasename::CloseOnSrReversal => {
-                RuleKind::PerTradeExit
+                RuleKind::PerPositionClose
             }
             AlertBasename::PauseStart(_)
             | AlertBasename::PauseResume(_)
@@ -108,14 +114,14 @@ mod tests {
     }
 
     #[test]
-    fn close_guards_are_per_trade_exit() {
+    fn close_guards_are_per_position_close() {
         assert_eq!(
             RuleKind::from(&AlertBasename::CloseOnReversal),
-            RuleKind::PerTradeExit
+            RuleKind::PerPositionClose
         );
         assert_eq!(
             RuleKind::from(&AlertBasename::CloseOnSrReversal),
-            RuleKind::PerTradeExit
+            RuleKind::PerPositionClose
         );
     }
 
