@@ -45,6 +45,14 @@
 //! (a pending order can't fill on the bar that fired it), same-bar fill-and-stop
 //! (the fill bar is in the exit search, pessimistic on SL/TP ties), per-bar
 //! bid/ask book selection, and bar-expiry (`expiry_bars` bounds the fill window).
+//!
+//! **Sub-bar zoom (PR-2).** The "pessimistic on SL/TP ties" default above is
+//! *refined* by [`simulate_fill_resolved_zoom`]: a caller that supplies a
+//! [`SubBars`] provider (a pre-fetched finer-granularity series) disambiguates an
+//! exit bar whose range straddles BOTH levels by replaying its finer sub-candles
+//! to see which was hit first. The pessimistic stop remains the floor — it's what
+//! a caller with no finer data ([`NoZoom`]) still gets, and where even the finest
+//! grain we hold is itself ambiguous.
 
 use trade_control_core::broker::BidAskCandle;
 use trade_control_core::intent::{
@@ -241,6 +249,44 @@ pub fn simulate_fill_windowed(
     simulate_fill_resolved(&resolved, intent, shell, pip_size, candles)
 }
 
+/// A source of **finer-granularity** bid/ask candles the exit sim can zoom into
+/// when a single bar's range straddles BOTH the stop-loss and the take-profit —
+/// the one case the coarse bar can't order (did price hit SL or TP first?).
+///
+/// The offline replay pre-fetches a finer series (e.g. M1 under an H1 plan) once
+/// and implements this; the pure sim stays sync and simply *consults* the
+/// pre-fetched data — no async fetch is threaded through the engine. When no
+/// finer data is available for the ambiguous bar (`sub_bars` returns an empty
+/// slice), the sim keeps the pessimistic-stop assumption, so a caller with no
+/// provider ([`NoZoom`]) is byte-identical to the pre-zoom behaviour.
+pub trait SubBars {
+    /// Finer bid/ask candles whose open-time falls in the half-open window
+    /// `[start, end)` — the sub-bars of one coarse parent bar `[start, end)`,
+    /// ascending. Empty ⇒ no finer data for this window (fall back to pessimism).
+    fn sub_bars(
+        &self,
+        start: chrono::DateTime<chrono::Utc>,
+        end: chrono::DateTime<chrono::Utc>,
+    ) -> Vec<BidAskCandle>;
+}
+
+/// The no-op [`SubBars`] provider: never returns finer candles, so the exit sim
+/// keeps the pessimistic-stop assumption on an ambiguous bar. This is what every
+/// caller that doesn't pre-fetch a finer series uses (all `engine` unit tests,
+/// the fixture re-sim, the pre-zoom `simulate_fill*` entry points), which is why
+/// their outcomes are unchanged by the zoom machinery.
+pub struct NoZoom;
+
+impl SubBars for NoZoom {
+    fn sub_bars(
+        &self,
+        _start: chrono::DateTime<chrono::Utc>,
+        _end: chrono::DateTime<chrono::Utc>,
+    ) -> Vec<BidAskCandle> {
+        Vec::new()
+    }
+}
+
 /// The pure fill/exit physics over a bracket the caller has ALREADY resolved +
 /// floored — the "orders are state" entry point. This is the body
 /// [`simulate_fill_windowed`] runs after `resolve_effective_bracket`; extracting
@@ -254,12 +300,38 @@ pub fn simulate_fill_windowed(
 /// keys the pending-order trigger + the spread-hour rubbish-candle skip off them)
 /// and for the System-2 widen's per-instrument spread-hour gate — but the SL/TP
 /// **levels** come from `resolved`, never re-floored.
+///
+/// On an ambiguous exit bar (range straddles both SL and TP) this keeps the
+/// pessimistic-stop assumption. A caller with a finer series should use
+/// [`simulate_fill_resolved_zoom`] to disambiguate instead.
 pub fn simulate_fill_resolved(
     resolved: &Resolved,
     intent: &Intent,
     shell: &Shell,
     pip_size: f64,
     candles: &[BidAskCandle],
+) -> SimOutcome {
+    simulate_fill_resolved_zoom(resolved, intent, shell, pip_size, candles, &NoZoom)
+}
+
+/// [`simulate_fill_resolved`] with a [`SubBars`] provider: on an exit bar whose
+/// range straddles BOTH SL and TP, it replays that bar's finer sub-candles (in
+/// order) to decide which level was touched first, instead of pessimistically
+/// assuming the stop. A sub-bar that is *itself* still ambiguous, or no finer
+/// data at all, degrades to the pessimistic stop — the finest grain we hold is
+/// the floor, zoom only ever REDUCES the ambiguity.
+///
+/// Break-even and the System-2 widen are computed at the **parent-bar** grain
+/// (both latch off a bar's CLOSE, so they can only change the effective stop on
+/// the NEXT parent bar, never mid-bar); the sub-bars are tested against the
+/// parent bar's already-resolved `effective_stop` / `take_profit`.
+pub fn simulate_fill_resolved_zoom(
+    resolved: &Resolved,
+    intent: &Intent,
+    shell: &Shell,
+    pip_size: f64,
+    candles: &[BidAskCandle],
+    sub_bars: &dyn SubBars,
 ) -> SimOutcome {
     let dir = resolved.direction;
 
@@ -301,6 +373,11 @@ pub fn simulate_fill_resolved(
         trade_control_core::spread_blackout::elevated_threshold_pips(&intent.instrument);
     let widen = widened_stop_at_resolved(resolved, intent, shell, pip_size, candles, widen_trigger);
 
+    // The parent-bar length, to bound each bar's sub-window `[c.time, c.time +
+    // bar_len)` when we zoom. Inferred from the exit-window spacing (the smallest
+    // positive gap between consecutive bars) so a session gap between two bars
+    // doesn't inflate it; zero when `rest` has < 2 bars (⇒ no zoom, pessimistic).
+    let bar_len = infer_bar_len(rest);
     let mut active_stop = resolved.stop_loss;
     for c in rest {
         // The stop the live broker holds on THIS bar: the widened stop while the
@@ -316,7 +393,8 @@ pub fn simulate_fill_resolved(
         let hit_sl = book_reaches(c, exit_book, effective_stop, stop_approach(dir));
         let hit_tp = book_reaches(c, exit_book, resolved.take_profit, tp_approach(dir));
         match (hit_sl, hit_tp) {
-            (true, _) => {
+            // Only the STOP touched — unambiguous, exit at the stop.
+            (true, false) => {
                 return SimOutcome::StoppedOut {
                     fill_at,
                     entry_price,
@@ -324,6 +402,7 @@ pub fn simulate_fill_resolved(
                     exit_price: effective_stop,
                 };
             }
+            // Only the TARGET touched — unambiguous, exit at the target.
             (false, true) => {
                 return SimOutcome::TookProfit {
                     fill_at,
@@ -331,6 +410,23 @@ pub fn simulate_fill_resolved(
                     exit_at: c.time,
                     exit_price: resolved.take_profit,
                 };
+            }
+            // BOTH touched in one bar — the coarse bar can't order them. Zoom into
+            // this bar's finer sub-candles to see which level was hit first;
+            // pessimistic stop only if the finer data can't resolve it either.
+            (true, true) => {
+                return zoom_ambiguous_bar(
+                    c,
+                    bar_len,
+                    sub_bars,
+                    exit_book,
+                    effective_stop,
+                    resolved.take_profit,
+                    stop_approach(dir),
+                    tp_approach(dir),
+                    fill_at,
+                    entry_price,
+                );
             }
             (false, false) => {}
         }
@@ -349,6 +445,78 @@ pub fn simulate_fill_resolved(
         fill_at,
         entry_price,
     }
+}
+
+/// The modal bar length of an ascending candle slice — the smallest strictly
+/// positive gap between consecutive open-times. Used to bound a bar's sub-window
+/// `[c.time, c.time + bar_len)` for the zoom. A session gap (weekend / close)
+/// yields a *larger* gap on one pair, so taking the **min** positive gap gives
+/// the true bar cadence rather than the gap width. `Duration::zero()` when the
+/// slice has fewer than two bars (⇒ the zoom window is empty ⇒ no sub-bars ⇒
+/// pessimistic stop, the safe fallback).
+fn infer_bar_len(candles: &[BidAskCandle]) -> chrono::Duration {
+    candles
+        .windows(2)
+        .map(|w| w[1].time - w[0].time)
+        .filter(|d| *d > chrono::Duration::zero())
+        .min()
+        .unwrap_or_else(chrono::Duration::zero)
+}
+
+/// Resolve an exit bar whose range straddles BOTH the stop and the target by
+/// replaying its finer sub-candles in order. The first sub-bar that touches the
+/// stop → [`SimOutcome::StoppedOut`]; the first that touches the target →
+/// [`SimOutcome::TookProfit`]. A sub-bar that itself straddles both (still
+/// ambiguous at the finest grain we hold) → the pessimistic stop, as does an
+/// empty sub-window ([`NoZoom`] / no finer data / a zero `bar_len`). The exit is
+/// stamped at the PARENT bar's open-time (`c.time`) either way — the sub-bars
+/// only decide *which* level, not a finer timestamp, keeping the exit bar aligned
+/// with the coarse series the rest of the report walks.
+#[allow(clippy::too_many_arguments)]
+fn zoom_ambiguous_bar(
+    c: &BidAskCandle,
+    bar_len: chrono::Duration,
+    sub_bars: &dyn SubBars,
+    exit_book: Book,
+    effective_stop: f64,
+    take_profit: f64,
+    stop_approach: Approach,
+    tp_approach: Approach,
+    fill_at: chrono::DateTime<chrono::Utc>,
+    entry_price: f64,
+) -> SimOutcome {
+    let stopped = SimOutcome::StoppedOut {
+        fill_at,
+        entry_price,
+        exit_at: c.time,
+        exit_price: effective_stop,
+    };
+    let took_profit = SimOutcome::TookProfit {
+        fill_at,
+        entry_price,
+        exit_at: c.time,
+        exit_price: take_profit,
+    };
+    // Empty/zero window ⇒ no finer data ⇒ keep the pessimistic stop.
+    if bar_len <= chrono::Duration::zero() {
+        return stopped;
+    }
+    for sub in sub_bars.sub_bars(c.time, c.time + bar_len) {
+        let sub_sl = book_reaches(&sub, exit_book, effective_stop, stop_approach);
+        let sub_tp = book_reaches(&sub, exit_book, take_profit, tp_approach);
+        match (sub_sl, sub_tp) {
+            (true, false) => return stopped,
+            (false, true) => return took_profit,
+            // A sub-bar straddling both is ambiguous at the finest grain we have:
+            // stay pessimistic (this sub-bar is the first to touch EITHER level, so
+            // no later sub-bar can pre-empt it — return now).
+            (true, true) => return stopped,
+            (false, false) => {}
+        }
+    }
+    // No sub-bar touched either level (finer data didn't cover the move) — keep
+    // the pessimistic stop rather than silently reporting the position still open.
+    stopped
 }
 
 // The old `spread_blackout_reject` proxy was removed: the replay driver now seeds
@@ -2951,5 +3119,162 @@ mod tests {
             sweep_reason(&intent, &shell, 0.0001, &path, &[]),
             Some((SweepReason::SlBreached, ts("2026-06-17T12:00:00Z")))
         );
+    }
+
+    // --- sub-bar zoom on an ambiguous SL/TP bar (PR-2) ---------------------
+    //
+    // A long stop entry (trigger 1.1050, SL 1.1000, TP 1.1150). We fill on bar 1
+    // and then hand bar 2 a range that straddles BOTH the SL and the TP — the
+    // coarse bar can't tell which was hit first. `simulate_fill` (no zoom) keeps
+    // the pessimistic stop; `simulate_fill_resolved_zoom` with a finer series
+    // decides by whichever sub-bar touches a level first.
+
+    /// A fixed set of sub-bars keyed to the ambiguous parent bar's window — the
+    /// offline replay's pre-fetched finer series, but hand-built for the test.
+    struct FakeSubBars(Vec<BidAskCandle>);
+
+    impl SubBars for FakeSubBars {
+        fn sub_bars(&self, start: DateTime<Utc>, end: DateTime<Utc>) -> Vec<BidAskCandle> {
+            self.0
+                .iter()
+                .filter(|c| c.time >= start && c.time < end)
+                .cloned()
+                .collect()
+        }
+    }
+
+    /// A long stop intent with the offset entry (trigger 1.1050), resolved SL
+    /// 1.1000 / TP 1.1150, and the fill path up to (but excluding) the ambiguous
+    /// exit bar — shared by the zoom tests below.
+    fn ambiguous_long_setup() -> (Intent, Shell) {
+        let mut intent = long_stop_intent();
+        intent.entry = Some(EntrySpec::Stop {
+            from: PriceAnchor::Close,
+            offset_pips: 10.0, // trigger 1.1050
+            offset_atr_pct: None,
+            at: None,
+            recover_entry: None,
+        });
+        (intent, trigger_shell())
+    }
+
+    /// The coarse exit path: fire bar, a fill bar reaching 1.1050, then the
+    /// AMBIGUOUS bar whose range spans 1.0990..1.1160 (touches SL 1.1000 AND TP
+    /// 1.1150). Hourly bars, so the inferred bar length is 1h and the zoom window
+    /// for the ambiguous bar is [13:00, 14:00).
+    fn ambiguous_exit_path() -> [BidAskCandle; 3] {
+        [
+            fire_bar(),
+            candle("2026-06-17T12:00:00Z", 1.1042, 1.1055, 1.1041, 1.1052), // fills @1.1050
+            candle("2026-06-17T13:00:00Z", 1.1050, 1.1160, 1.0990, 1.1100), // BOTH SL & TP
+        ]
+    }
+
+    #[test]
+    fn ambiguous_bar_without_zoom_is_pessimistic_stop() {
+        let (intent, shell) = ambiguous_long_setup();
+        let path = ambiguous_exit_path();
+        // No provider → the plain entry point → pessimistic stop.
+        match simulate_fill(&intent, &shell, 0.0001, &path) {
+            SimOutcome::StoppedOut { exit_price, .. } => {
+                assert!(
+                    (exit_price - 1.1000).abs() < 1e-9,
+                    "SL 1.1000, got {exit_price}"
+                );
+            }
+            other => panic!("no-zoom must pessimistically stop, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn zoom_picks_take_profit_when_a_sub_bar_hits_tp_first() {
+        let (intent, shell) = ambiguous_long_setup();
+        let path = ambiguous_exit_path();
+        let resolved = Resolved::from_intent(&intent, &shell, 0.0001, 0.0).expect("resolves");
+        // Finer sub-bars inside [13:00, 14:00): the FIRST touches only the TP
+        // (high 1.1155 ≥ 1.1150, low stays above the SL); a later one would hit
+        // the SL, but TP already resolved the exit.
+        let subs = FakeSubBars(vec![
+            candle("2026-06-17T13:00:00Z", 1.1052, 1.1155, 1.1051, 1.1150), // TP first
+            candle("2026-06-17T13:30:00Z", 1.1150, 1.1151, 1.0990, 1.0995), // SL later
+        ]);
+        match simulate_fill_resolved_zoom(&resolved, &intent, &shell, 0.0001, &path, &subs) {
+            SimOutcome::TookProfit {
+                exit_price,
+                exit_at,
+                ..
+            } => {
+                assert!(
+                    (exit_price - 1.1150).abs() < 1e-9,
+                    "TP 1.1150, got {exit_price}"
+                );
+                // Exit stamped at the PARENT bar's open time, not the sub-bar's.
+                assert_eq!(exit_at, ts("2026-06-17T13:00:00Z"));
+            }
+            other => panic!("zoom must take profit (TP sub-bar first), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn zoom_picks_stop_when_a_sub_bar_hits_sl_first() {
+        let (intent, shell) = ambiguous_long_setup();
+        let path = ambiguous_exit_path();
+        let resolved = Resolved::from_intent(&intent, &shell, 0.0001, 0.0).expect("resolves");
+        // Mirror: the FIRST sub-bar touches only the SL; TP only later.
+        let subs = FakeSubBars(vec![
+            candle("2026-06-17T13:00:00Z", 1.1050, 1.1051, 1.0990, 1.0995), // SL first
+            candle("2026-06-17T13:30:00Z", 1.0995, 1.1155, 1.0994, 1.1150), // TP later
+        ]);
+        match simulate_fill_resolved_zoom(&resolved, &intent, &shell, 0.0001, &path, &subs) {
+            SimOutcome::StoppedOut { exit_price, .. } => {
+                assert!(
+                    (exit_price - 1.1000).abs() < 1e-9,
+                    "SL 1.1000, got {exit_price}"
+                );
+            }
+            other => panic!("zoom must stop (SL sub-bar first), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn zoom_falls_back_to_stop_when_a_sub_bar_is_itself_ambiguous() {
+        let (intent, shell) = ambiguous_long_setup();
+        let path = ambiguous_exit_path();
+        let resolved = Resolved::from_intent(&intent, &shell, 0.0001, 0.0).expect("resolves");
+        // The FIRST (and only) sub-bar still straddles both levels — the finest
+        // grain we have can't order them, so we stay pessimistic.
+        let subs = FakeSubBars(vec![candle(
+            "2026-06-17T13:00:00Z",
+            1.1050,
+            1.1160,
+            1.0990,
+            1.1100,
+        )]);
+        match simulate_fill_resolved_zoom(&resolved, &intent, &shell, 0.0001, &path, &subs) {
+            SimOutcome::StoppedOut { exit_price, .. } => {
+                assert!((exit_price - 1.1000).abs() < 1e-9);
+            }
+            other => panic!("ambiguous sub-bar must stay pessimistic stop, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn zoom_falls_back_to_stop_when_no_sub_bars_cover_the_window() {
+        let (intent, shell) = ambiguous_long_setup();
+        let path = ambiguous_exit_path();
+        let resolved = Resolved::from_intent(&intent, &shell, 0.0001, 0.0).expect("resolves");
+        // A provider whose sub-bars fall OUTSIDE [13:00, 14:00) → empty for this
+        // window → pessimistic stop (the finer feed didn't cover the move).
+        let subs = FakeSubBars(vec![candle(
+            "2026-06-17T15:00:00Z",
+            1.1150,
+            1.1155,
+            1.1149,
+            1.1150,
+        )]);
+        match simulate_fill_resolved_zoom(&resolved, &intent, &shell, 0.0001, &path, &subs) {
+            SimOutcome::StoppedOut { .. } => {}
+            other => panic!("no covering sub-bars must stay pessimistic stop, got {other:?}"),
+        }
     }
 }

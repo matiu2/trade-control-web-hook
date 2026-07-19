@@ -220,6 +220,48 @@ async fn main() -> Result<()> {
     // still reads the same `blackout_windows` for its annotations.
     let blackout_windows = market_hours::resolve_blackout_windows(args.source, &symbol).await;
 
+    // Sub-bar zoom (PR-2): pull a FINER-granularity bid/ask series over the SAME
+    // span as the coarse window, so the fill sim can disambiguate an exit bar that
+    // straddles both SL and TP (which level hit first?) instead of pessimistically
+    // assuming the stop. Fail-soft in every direction: no finer granularity (plan
+    // already M1), a broker that can't serve the finer grain, or a pull error all
+    // leave `finer_candles` empty → the sim keeps the pessimistic stop, unchanged
+    // from before this pull existed. Spans the coarse window's actual extent
+    // (`[first bar, pull_end]`) so every coarse bar has finer coverage.
+    let finer_candles: Vec<EngineCandle> = match granularity::finer(gran.engine()) {
+        Some(finer_gran) => {
+            let finer_from = candles.first().map(|c| c.time).unwrap_or(start);
+            match candles::pull(
+                args.source,
+                &symbol,
+                finer_gran,
+                finer_from,
+                pull_end,
+                args.cache_dir.clone(),
+            )
+            .await
+            {
+                Ok(cs) => {
+                    tracing::info!(
+                        finer = granularity::engine_label(finer_gran.engine()),
+                        bars = cs.len(),
+                        "sub-bar zoom: pulled finer series for ambiguous SL/TP bars"
+                    );
+                    cs
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        finer = granularity::engine_label(finer_gran.engine()),
+                        "sub-bar zoom: finer pull failed — falling back to pessimistic stop on ambiguous bars"
+                    );
+                    Vec::new()
+                }
+            }
+        }
+        None => Vec::new(), // plan already at the finest grain — nothing to zoom into
+    };
+
     // Keep the state TTL past the window so nothing expires mid-replay.
     let expires_at = end + Duration::days(365);
     let replay = replay::run(
@@ -230,6 +272,7 @@ async fn main() -> Result<()> {
         expires_at,
         mark_cfg,
         &blackout_windows,
+        &finer_candles,
     )
     .await;
 
@@ -474,7 +517,21 @@ async fn run_frozen(
     // before the in-loop seed existed). The spread-blackout gate still self-seeds
     // per-bar on `is_ny_close_edge` inside `run`, so an NY-close-edge fixture bar
     // is still gated deterministically off the frozen candle's own spread.
-    replay::run(plan, candles, gran, live_start, expires_at, mark_cfg, &[]).await
+    //
+    // No finer series either — a frozen fixture only has its saved coarse candles,
+    // so the sub-bar zoom (PR-2) is inactive and an ambiguous SL/TP bar keeps the
+    // pessimistic stop, exactly as the fixture's saved `expected.json` was computed.
+    replay::run(
+        plan,
+        candles,
+        gran,
+        live_start,
+        expires_at,
+        mark_cfg,
+        &[],
+        &[],
+    )
+    .await
 }
 
 /// Build a readable diff error when a fixture's computed outcome diverges from

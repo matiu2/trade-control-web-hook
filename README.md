@@ -1534,6 +1534,17 @@ independent); the dollar figure shows what the sequence would have made
 compounding — a losing streak shrinks the per-trade stake, a winning one grows
 it.
 
+**Sub-bar zoom on an ambiguous exit bar.** When a single coarse candle's range
+sweeps BOTH the stop and the target, the sim can't tell which was hit first from
+that bar alone. Rather than always scoring it a loss (the old pessimistic-stop
+assumption), the replay pulls a **finer-granularity series** (M1 under an H1
+plan, M15 under H4, H1 under D1) and replays that bar's sub-candles to see which
+level a finer bar touched first — so a TP the coarse bar hid is scored as a TP.
+The pessimistic stop is still the *floor*: it's what you get when the finer feed
+can't be served (e.g. a broker/granularity combo with no sub-bars), doesn't cover
+the move, or is itself still ambiguous at the finest grain. This only refines the
+tie-break — an unambiguous bar is unaffected. See CHANGELOG "replay sub-bar zoom".
+
 **Seeing the engine's silent state changes (`--verbose` / `--all-events`).**
 The normal report lists only *fires* — intents the engine emits. But the engine
 also advances state per bar that fires nothing: the spine phase

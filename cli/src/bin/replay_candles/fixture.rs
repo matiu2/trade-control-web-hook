@@ -347,6 +347,10 @@ mod tests {
                 // empty (gate fails open, unchanged). Spread-blackout still
                 // self-seeds per-bar inside `run` off the frozen candle spread.
                 &[],
+                // No finer series for a frozen fixture (only its saved coarse
+                // candles), so the sub-bar zoom is inactive → pessimistic stop on
+                // an ambiguous SL/TP bar, exactly as the saved outcome expects.
+                &[],
             )
             .await;
             // Fixtures are saved from `--simulate` runs (the default), so the
