@@ -78,26 +78,22 @@ Trading:
   - **Ad-hoc filter** (AND-composed): `allow_close: <Rhai script>` —
     symmetric with `allow_entry` but bound to the shell-anchor scope
     only (no resolved SL/TP geometry to read).
-  - **Veto-on-reversal hook** (experimental, default off): `veto_on_reversal:
-    true` on a price-windowed reversal-close. When the close gate passes,
-    the worker *also* writes a `reversal` veto for this `trade_id`, so a
-    *later* `enter` for the same setup is blocked by the entry-side veto
-    gate. The motivating case: a reversal off support/resistance that lands
-    **before** the entry fires — today the close is a no-op (no position
-    yet) and the entry goes in anyway, even though the reversal was a strong
-    "this trade won't work" signal. The veto is StopNextEntry-style: it only
-    blocks future entries, never force-closes beyond the close this intent
-    already performs. Written on every gate-pass (idempotent, TTL = life of
-    the alert window). Requires a price window (`inside_window` ∋ `price` +
-    `sr_bands`, or the deprecated `require_price_in_ranges`) and a
-    `trade_id`; rejected at validate time otherwise. Since the 2026-07-09
-    split this flag rides the price-windowed **`07-close-on-sr-reversal`**
-    (the S/R half owns the band); the news-only `06-close-on-reversal` never
-    carries it. The worker only checks veto names an `enter` lists in its own
-    `vetos`, so when this hook is armed the CLI/tv-arm pipeline **also adds
-    `reversal` to the matching `05-enter`'s `vetos`** — both halves move
-    together. Arming the close flag by hand without the enter half writes a
-    veto nothing reads.
+  - **Veto-on-reversal hook** (experimental, **exit-only since 2026-07-19,
+    dormant no-op**): `veto_on_reversal: true` on a price-windowed
+    reversal-close. A reversal-close is **exit-only** — when its gate passes
+    it flattens the open position and does **nothing else**. This flag no
+    longer writes a `reversal` veto and no longer blocks a future `enter`.
+    A reversal candle is a reason to *exit*, not to *stay out*: once flat,
+    a fresh signal may re-enter. Future entries are gated by the independent
+    invalidation caps (`too-high`/`too-low`) and the 80%-to-TP
+    `pcl-exhausted` abort, which fire on their own and don't close the
+    position. The flag still parses and round-trips (dormant) so in-flight
+    alerts don't break; the worker ignores it. (It previously wrote a
+    trade-scoped `reversal` veto on every gate-pass and the CLI added
+    `reversal` to the paired `05-enter` — that entry block was removed
+    because it (a) contradicted the exit-only intent and (b) was a
+    replay↔live divergence: the offline replay never ran the close path, so
+    it never wrote the veto.)
   - **Deprecated form** (still accepted for in-flight alerts):
     `require_news_window: true` and/or `require_price_in_ranges: [[lo, hi], ...]`.
     Mixing the old and new forms on one intent is a validation error —
@@ -246,7 +242,7 @@ Basename ordering matters — `tv-arm` maps drawings to alerts by prefix.
 | `04-prep-retest` | `prep` | Trendline crossing (intrabar retest of the neckline) | Skippable with `--skip-retest`. **Uses the same neckline drawing** as `03-prep-break-and-close` (opposite direction, intrabar) — you draw the neckline once. A separately-drawn `retest`/`neckline-retest`/`retrace` trendline is **ignored** (`tv-arm` logs and skips it): the retest *is* the neckline, and honouring a stale drawn line could arm a cross that never fires (USD/ZAR iH&S, 2026-07). Fires **intrabar on the wick**, not the close, and (as of 2026-07-03) not the open either: the bar's **high and low just have to straddle the neckline** — sit on opposite sides — with the directional wick reaching at/through the line (long retest = the low dips at/below the descending neckline). Open- and close-agnostic: a tap-and-bounce that opens *and* closes on the same side still counts — see CHANGELOG "intrabar cross is a pure straddle". **The retest zone fattens over time, scaled by the neckline's slope:** the first bar after the break-and-close must actually reach the neckline, and each subsequent bar widens the near-side band by `retest_atr_step × |neckline slope per bar|` (default step **0.075**, `tv-arm --retest-atr-step`), so a wick that comes *within* the growing tolerance of the line stamps the retest even without reaching it. A **horizontal neckline has zero slope → the band never widens** (retest it to the exact line — flat necklines are precise price levels); a **steeper neckline fattens the band faster**, because the reason a retest drifts from the line as bars pass is the line *moving away*, and how fast it moves is its slope (combined with volatility — the ATR the step is calibrated in cancels algebraically but still guards a fail-soft when the window is too short to warm it). See CHANGELOG "slope-scaled retest tolerance". The wick must also clear the cross buffer (`cross_buffer_atr·ATR`, plus a deprecated `cross_buffer_pct` term if set — see the break-and-close row) so a one-tick graze doesn't trip it. |
 | `05-enter` | `enter` | Pine `Candle Signals` golden candle | The actual trade. Gated on the preps above + opposing-direction veto absent. |
 | `09-enter-qm` | `enter` | Pine `Candle Signals` (same detector as `05-enter`) | **`tv-arm --strategy-v2` only.** The Quasimodo entry, armed alongside `05-enter`: no preps, **golden AND confirmed gated by default** — it threads `needs_golden` like every other enter (golden on by default; `--skip-golden` clears it for a confirmed-only gate), plus `needs_confirmed: true` intrinsically. (An earlier build hardcoded `needs_golden: false` here, which silently stripped golden from `--strategy-v2` and fired `09-enter-qm` on a confirmed-but-small non-golden candle — ESPIX_EUR 2026-07-07, whipsawed at SL. Golden is now required by default; pass `--skip-golden` to recover the confirmed-only behaviour.) It reads the **first signal to confirm** at/after the break-and-close, carrying *that* signal's own base as the entry level, rather than the single most-recent latch (which a fresher print overwrites — the DE30_EUR 2026-07-07 miss; see "First-confirmed entry" and CHANGELOG). Under multi-shot (`max_retries > 0`) it **advances to the next confirmed signal** after each entry: once a confirmed signal is taken, the engine stamps a re-entry watermark (`PlanState.last_confirmed_enter_at`) and the confirmed-first scan skips past it, so a place → fill → stop-out → re-enter cycle takes each *subsequent* confirmed signal, not the first one forever (UK100_GBP 2026-07-07: entry #1 → SL, then re-entry on the next confirmed short → TP; before v79 it entered once and never re-entered). Its entry order type is set by **`--qm-entry <market\|stop\|limit>`** (default **`limit`**, independent of the BCR leg's `--entry-*`): `limit` (the default) rests a limit at the signal level with a `recover_entry: stop` fallback (catches the continuation when price has already crossed it); `stop` is a stop at signal_low − the ATR buffer (`offset_atr_pct: 0.5`; see "ATR buffer") with a `recover_entry: limit` fallback; `market` enters on the confirmation bar. So `--strategy-v2` alone gives **BCR stop + QM limit on one setup**; pass `--qm-entry stop`/`market` to override the QM leg only. Shares the trade's `trade_id` + `max_retries` with `05-enter`; first of the two to fire cancels the other's resting order (worker retry gate). See "Dual entry — `--strategy-v2`" below. |
-| `07-close-on-sr-reversal` | `close` | Pine `Candle Signals` opposing reversal | Emitted when `support`/`resistance` lines are drawn. Carries `inside_window: [price]` + `sr_bands: [[lo, hi], ...]`. **Armed independent of any news window** — a golden opposing reversal candle whose close sits in a band flattens the trade at close, in all trade types. Defaults `needs_golden: true`. With `tv-arm --veto-on-reversal` (experimental) it also carries `veto_on_reversal: true` (this half owns the band). |
+| `07-close-on-sr-reversal` | `close` | Pine `Candle Signals` opposing reversal | Emitted when `support`/`resistance` lines are drawn. Carries `inside_window: [price]` + `sr_bands: [[lo, hi], ...]`. **Armed independent of any news window** — a golden opposing reversal candle whose close sits in a band flattens the trade at close, in all trade types. **Exit-only** — it flattens the position and nothing more. Defaults `needs_golden: true`. `tv-arm --veto-on-reversal` still stamps `veto_on_reversal: true` on this half but it's a **dormant no-op since 2026-07-19** (the worker no longer writes a `reversal` veto and no enter checks one). |
 | `06-close-on-reversal` | `close` | Pine `Candle Signals` opposing reversal | The **news-window** safety flatten — emitted when news-pairs are drawn (`--close-on-news`). Carries `inside_window: [news]` only, never a price band. Defaults `needs_golden: true`. |
 | `08-prep-expire-<step>` | `prep-expire` | Vertical line crossing chart time | Emitted once per chart-drawn `<prep>-expiry` line (`break-and-close-expiry`, `retest-expiry`). When crossed, blocks any further `<step>` prep on the trade — so a setup whose prep lands too late never enters. Drawing-bound. `<step>` is the canonical prep name and may contain hyphens. |
 
@@ -1282,9 +1278,10 @@ export TRADE_CONTROL_ENDPOINT=https://trade-control.<account>.workers.dev
 ./target/release/trade-control clear-veto EUR_USD news-window \
   --trade-id eurusd-hs-1 \
   --key-file ~/.config/trade-control/key.hex
-# The experimental veto-on-reversal hook writes its veto under the fixed
-# name `reversal`. If a reversal-close vetoed a setup you still want to take,
-# clear it the same way (the name is always `reversal`):
+# The veto-on-reversal hook is EXIT-ONLY since 2026-07-19 — the worker no
+# longer writes a `reversal` veto, so there's normally nothing to clear. This
+# still works to clear a legacy `reversal` veto written by an older worker
+# before the change (the name is always `reversal`):
 ./target/release/trade-control clear-veto EUR_USD reversal \
   --trade-id eurusd-hs-1 \
   --key-file ~/.config/trade-control/key.hex
@@ -2728,7 +2725,7 @@ cargo run -p tv-arm -- \
   --account-id reversals \            # defaults per broker: tradenation → reversals, oanda → m-and-w
   --risk-pct 0.5 \                    # % of NAV (or --risk-amount <home-ccy>)
   --reversal-band-pct 0.1 \           # half-width % around support/resistance lines (default 0.1)
-  --veto-on-reversal \                # experimental: a reversal off a band before entry also vetoes the upcoming trade (default off)
+  --veto-on-reversal \                # experimental, DORMANT no-op since 2026-07-19: reversal-close is exit-only, never blocks a future entry (flag still parses; default off)
   --quasimodo \                       # alias: --skip-break-and-close --skip-retest --require-confirmation (drop both H&S preps, gate on a confirmed candle)
   --strategy-v2 \                     # arm BOTH a stop entry AND a Quasimodo confirmed entry on one setup; first to fire cancels the other (see below). Conflicts with --quasimodo/--entry-{market,stop,limit}/--skip-*; needs --max-retries > 0
   --qm-entry stop \                   # strategy-v2 only: QM leg (09-enter-qm) order type <market|stop|limit>, default LIMIT. limit (default) rests at the level, recovers to a stop when wrong-side; stop → override to a pullback stop. BCR leg always a stop. Requires --strategy-v2

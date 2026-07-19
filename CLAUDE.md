@@ -252,52 +252,54 @@ non-Ok outcome." If you're still seeing surprising 409s post-fix,
 look at the *latest* recorded outcome via `trade-control status` to
 see what the prior successful fulfilment actually was.
 
-### `veto_on_reversal`: a rejected enter may be a self-inflicted reversal veto
+### `veto_on_reversal`: EXIT-ONLY — a reversal-close never blocks a future entry
 
-Added 2026-06 (worker v13). The reversal-close (`close` with a price
-window) can carry an opt-in `veto_on_reversal: true`. When that
-close's gate passes, the worker *also* writes a veto under the fixed
-name **`reversal`**, scoped to the intent's `trade_id`. A later
-`enter` for the same setup then gets rejected by the ordinary
-`is_vetoed` gate — **not** by replay-dedup and **not** by the retry
-gate.
+**Changed 2026-07-19 (exit-only).** A reversal-close (`close` with a
+price window) is now **exit-only**: when its gate passes it flattens
+the open position and does **nothing else**. The `veto_on_reversal`
+flag is retained on the wire as a **dormant no-op** — the worker no
+longer writes a `reversal` veto, and the paired `05-enter` no longer
+lists `reversal` in its `vetos`. A reversal candle is a reason to
+*exit*, not a reason to *stay out*: once flat, a fresh signal may
+re-enter. Blocking future entries is the job of the **independent**
+invalidation caps (`too-high`/`too-low`) and the 80%-to-TP
+`pcl-exhausted` abort — which fire on their own and (correctly) don't
+close the position.
 
-The debugging trap: an `enter` is rejected (`rejected: veto-active
-(reversal)` in the logs / `412`), the prep gates all look satisfied,
-and no prior `enter` succeeded — so neither the seen-id check nor the
-retry gate explains it. The answer is a `reversal` veto written by an
-*earlier reversal-close fire in the same window*, exactly the
-pre-entry case the flag exists for. This is **working as designed**
-when the flag is on. Confirm via `trade-control status` (the
-`reversal` veto shows under the trade_id) and, if you want the trade
-anyway, clear it with `trade-control clear-veto <instr> reversal
---trade-id <tid>`.
+**Why the change.** The old behavior (below) was a replay↔live
+divergence: the live worker wrote the `reversal` veto in `run_close`,
+but the offline replay never invokes `run_close` for a `Close` fire
+(its dispatch loop handles only Enter/Pause/Resume/Prep, dropping
+Close through `_ => {}`). So a later multi-shot enter passed offline
+but rejected live. Removing the write from *both* halves closes the
+divergence at the root — nobody writes it, so replay == live — and
+matches the operator's exit-only intent.
+
+**What used to happen (removed).** Added 2026-06 (worker v13): a
+gate-passed reversal-close also wrote a trade-scoped `reversal` veto,
+and the `05-enter` listed `reversal` in its `vetos`, so a later enter
+for the same setup was rejected by `is_vetoed`. If you're reading an
+old worker log where an `enter` was rejected with `rejected:
+veto-active (reversal)`, that's the old blocking behavior; it no
+longer happens post-2026-07-19.
 
 Key facts a refactorer must preserve:
-- **It takes two halves.** The worker only checks veto names the
-  `enter` lists in its `vetos`. So the close writing the `reversal`
-  veto does nothing on its own — the matching `05-enter` must also
-  carry `reversal` in `vetos`. `build_trade_from_spec` adds both
-  together (gated on `veto_on_reversal && !sr_reversal_ranges.is_empty()`).
-  If you hand-craft a close with `veto_on_reversal: true` but no
-  matching enter half, you write a veto nothing reads.
-- The veto name is the fixed string `reversal`
-  (`trade_control_core::intent::REVERSAL_VETO_NAME` — single source of
-  truth shared by the worker write side and the CLI enter-builder).
-  `status` / `clear-veto` key on it.
-- It's written on **every** gate-pass, not only pre-entry — so
-  post-entry it harmlessly blocks a re-entry for the rest of the
-  window. Don't "optimise" this into a flat-only write without
-  re-reading the multi-shot interaction (a winning-then-reversing
-  trade's close would then permit a fresh entry the operator may not
-  want).
-- It is **StopNextEntry-only** — it must never escalate to closing a
-  position. The close the intent already performs is the only
-  position action. (See the `veto_close_only_when_thesis_invalidated`
-  rule.)
-- Default OFF, experimental. The decision logic is the pure
-  `reversal_veto_plan()` helper (KV-free, unit-tested); the KV write
-  is a thin wrapper.
+- **The enter never checks a `reversal` veto.** `build_trade_from_spec`
+  passes `false` for the enter-builder's `check_reversal_veto` at both
+  the BCR (`05-enter`) and QM (`09-enter-qm`) call sites, unconditionally.
+  Don't reinstate `veto_on_reversal && !sr_reversal_ranges.is_empty()`
+  there — that reintroduces the entry block.
+- **`run_close` writes no veto.** The `if verified.intent.veto_on_reversal
+  { write_reversal_veto(..) }` block and the `write_reversal_veto` /
+  `reversal_veto_plan` helpers were deleted. Don't re-add a KV write on
+  the close path.
+- The fixed name `reversal` (`trade_control_core::intent::REVERSAL_VETO_NAME`)
+  is still defined for `status` / `clear-veto` compatibility with any
+  legacy veto already sitting in a store, but nothing writes it anymore.
+- The flag/field (`Intent.veto_on_reversal`, `TradeSpec.veto_on_reversal`,
+  `tv-arm --veto-on-reversal`) still parse and round-trip as dormant
+  no-ops. A future cleanup can delete the field from the wire; until
+  then it's harmless.
 
 ### Intrabar crosses fire on any straddle (high and low opposite sides), not the close
 
