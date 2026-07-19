@@ -1916,17 +1916,17 @@ pair per event, then drops any pair whose window has already elapsed. The
   chart* and picks each role by its nearest-to-`--start` drawing, walking in the
   role's natural direction — neckline/retest = nearest *before* start,
   trade-expiry = nearest *after*, M/W path = the one whose shoulders bracket
-  start. The invalidation pick is special: because *which* invalidation wins sets
-  the trade direction (`too-high` cap → short, `too-low` floor → long), it keys
-  on **closeness to the neckline first**, anchor-time distance only as the
-  tiebreak. A genuine cap/floor for this setup hugs the neckline; a line far from
-  it is a leftover from a larger pattern — and it can be anchored *nearer* the
-  cursor than the real one, so time can't be primary (USD/ZAR iH&S 2026-07-06: a
-  stale `too-high` anchored nearer start would otherwise have armed a short
-  instead of the correct `too-low` long). A **side-of-neckline filter** runs
-  first: a `too-low` floor must sit *below* the neckline and a `too-high` cap
-  *above* it, dropping a stale line on the geometrically-wrong side before the
-  closeness pick. When a chart carries *both* a stray
+  start. The invalidation pick is special: even though the trade **direction now
+  comes from the fib, not the invalidation label** (see below), the *right*
+  invalidation line still has to be baked as the veto level, so the pick keys on
+  **closeness to the neckline first**, anchor-time distance only as the tiebreak.
+  A genuine cap/floor for this setup hugs the neckline; a line far from it is a
+  leftover from a larger pattern — and it can be anchored *nearer* the cursor than
+  the real one, so time can't be primary (USD/ZAR iH&S 2026-07-06). A
+  **side-of-neckline filter** runs first: a `too-low` floor must sit *below* the
+  neckline and a `too-high` cap *above* it, dropping a stale line on the
+  geometrically-wrong side before the closeness pick. When a chart carries *both*
+  a stray
   M/W path and an H&S neckline, the arm defers to whichever is anchored nearer
   `--start` (path neckline `C` vs the drawn neckline) — so a leftover path from
   an earlier setup can't hijack an H&S arm into M/W. The calendar news/blackout
@@ -2697,10 +2697,10 @@ What you draw on the chart:
 
 | Drawing | Label | Carries |
 |---|---|---|
-| Horizontal line | `too-high` or `too-low` | Invalidation veto trigger (right-shoulder price). Direction-sensitive: `too-high` for short H&S, `too-low` for long IH&S. |
+| Horizontal line | `too-high` or `too-low` | Invalidation veto trigger (right-shoulder price). **Must sit inside the fib's head↔neckline range** — a line outside it is treated as a stale leftover from a *different* trade and the arm is rejected. The label no longer sets the trade direction (the fib does — see below); its own price is what's baked as the veto level. |
 | Trendline | (any in `BREAK_LABELS`) | Break-and-close prep level. Skip with `--skip-break-and-close`. |
 | Trendline | (any in `RETEST_LABELS`) | Retest prep level. Skip with `--skip-retest`. |
-| Fib retracement | (label optional) | Drives both TP (`2 × neckline − head`) and the `pcl-exhausted` veto price (`midpoint + 0.8 × (TP − midpoint)`). Draw spanning **head → neckline**. |
+| Fib retracement | (label optional) | **Sets the trade direction** (its 0-reading is the head: head above neckline → short H&S, head below → long IH&S) *and* drives TP (`2 × neckline − head`) and the `pcl-exhausted` veto price (`midpoint + 0.8 × (TP − midpoint)`). Draw spanning **head → neckline**, clicking the head (0-reading) first. |
 | Vertical line | `trade-expiry` | `not_after` for every alert in the bundle. |
 | Vertical line | `<prep>-expiry` (`break-and-close-expiry`, `retest-expiry`; aliases `neckline-expiry` / `retrace-expiry`) | Cutoff for that prep: emits an `08-prep-expire-<step>` alert that blocks the prep once crossed, so a setup whose prep lands too late never enters. **tv-arm errors** if the line is in the future but its prep trend line is missing (the setup could never enter); **warns** if the line is in the past (re-arm later). |
 | ~~Vertical line pair~~ `news-start`/`news-end`, `blackout-start`/`blackout-end` (aliases `pause`/`resume`) | **No longer classified (2026-07).** News and blackout windows are resolved from the forex-factory calendar over `[cursor, trade-expiry]` and pushed into the plan directly (see "News/blackout windows come from the calendar" below). Any such vertical lines left on the chart are **ignored** — no `build-news`/`build-pause` bundle, no arming. The *presence of any live news window still adds `news` to the `06-close-on-reversal` alert's `inside_window`*, but that window now comes from the calendar, not a drawn pair. A window whose `end_time ≤ cursor` is dropped silently (nothing left to act on). |

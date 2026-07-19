@@ -48,6 +48,65 @@ pub fn pcl_exhausted_price_from_fib(prices: &[f64], direction: Direction) -> f64
     midpoint + 0.8 * (tp - midpoint)
 }
 
+/// Direction implied by the fib's *own* geometry, read from its ordered
+/// anchors — the authoritative source of trade direction.
+///
+/// The operator draws the fib spanning **head → neckline**, clicking the
+/// head (the fib's `0` reading) first. So `prices[0]` is the head and
+/// `prices[1]` the neckline:
+///
+/// - head **above** neckline (`prices[0] > prices[1]`) → the pattern points
+///   down → **short** (a classic H&S: head is the peak).
+/// - head **below** neckline → **long** (inverse H&S: head is the trough).
+///
+/// This replaces reading direction off the `too-high`/`too-low` invalidation
+/// label, which could be a stale line from a different trade and silently flip
+/// the trade direction. Returns `None` when fewer than two prices are supplied
+/// or the two anchors are equal (a degenerate flat fib carries no direction).
+pub fn direction_from_fib(prices: &[f64]) -> Option<Direction> {
+    let head = *prices.first()?;
+    let neckline = *prices.get(1)?;
+    if !head.is_finite() || !neckline.is_finite() {
+        return None;
+    }
+    if head > neckline {
+        Some(Direction::Short)
+    } else if head < neckline {
+        Some(Direction::Long)
+    } else {
+        None
+    }
+}
+
+/// The inclusive price range spanned by the fib's two anchors,
+/// `[min, max]` — the head↔neckline band. An invalidation horizontal for
+/// *this* setup must sit inside this band (see [`price_within_fib_range`]);
+/// a line outside it belongs to a different, larger pattern.
+///
+/// Returns `None` when fewer than two finite prices are supplied.
+pub fn fib_range(prices: &[f64]) -> Option<(f64, f64)> {
+    let a = *prices.first()?;
+    let b = *prices.get(1)?;
+    if !a.is_finite() || !b.is_finite() {
+        return None;
+    }
+    Some((a.min(b), a.max(b)))
+}
+
+/// Is `price` inside the fib's head↔neckline band (inclusive)?
+///
+/// Used to reject an invalidation horizontal left over from a *different*
+/// trade: a genuine `too-high`/`too-low` cap/floor for this setup lies
+/// between the head and the neckline, so a line outside that band is stale.
+/// Returns `false` when the fib range can't be computed or `price` is
+/// non-finite.
+pub fn price_within_fib_range(price: f64, fib_prices: &[f64]) -> bool {
+    match fib_range(fib_prices) {
+        Some((lo, hi)) => price.is_finite() && price >= lo && price <= hi,
+        None => false,
+    }
+}
+
 /// Single horizontal-line price (the only point's price).
 ///
 /// Returns `f64::NAN` when the slice is empty.
@@ -156,5 +215,49 @@ mod tests {
     fn pcl_insufficient_input_is_nan() {
         assert!(pcl_exhausted_price_from_fib(&[], Direction::Long).is_nan());
         assert!(pcl_exhausted_price_from_fib(&[1.0], Direction::Long).is_nan());
+    }
+
+    #[test]
+    fn direction_from_fib_head_above_neckline_is_short() {
+        // H&S: operator clicks the head (peak, 0-reading) first at 1.20,
+        // then the neckline at 1.10. Head above neckline → short.
+        assert_eq!(direction_from_fib(&[1.20, 1.10]), Some(Direction::Short));
+    }
+
+    #[test]
+    fn direction_from_fib_head_below_neckline_is_long() {
+        // iH&S: head (trough, 0-reading) at 1.00, neckline at 1.10.
+        // Head below neckline → long.
+        assert_eq!(direction_from_fib(&[1.00, 1.10]), Some(Direction::Long));
+    }
+
+    #[test]
+    fn direction_from_fib_flat_or_short_is_none() {
+        assert_eq!(direction_from_fib(&[1.10, 1.10]), None);
+        assert_eq!(direction_from_fib(&[1.10]), None);
+        assert_eq!(direction_from_fib(&[]), None);
+        assert_eq!(direction_from_fib(&[f64::NAN, 1.10]), None);
+    }
+
+    #[test]
+    fn fib_range_is_min_max_order_independent() {
+        assert_eq!(fib_range(&[1.20, 1.10]), Some((1.10, 1.20)));
+        assert_eq!(fib_range(&[1.00, 1.10]), Some((1.00, 1.10)));
+        assert_eq!(fib_range(&[1.10]), None);
+        assert_eq!(fib_range(&[f64::NAN, 1.10]), None);
+    }
+
+    #[test]
+    fn price_within_fib_range_inclusive() {
+        // Fib spans 1.10..1.20. A too-high cap for this setup sits inside.
+        assert!(price_within_fib_range(1.15, &[1.20, 1.10]));
+        assert!(price_within_fib_range(1.10, &[1.20, 1.10])); // inclusive edge
+        assert!(price_within_fib_range(1.20, &[1.20, 1.10])); // inclusive edge
+        // A stale line from a different trade sits outside → rejected.
+        assert!(!price_within_fib_range(1.25, &[1.20, 1.10]));
+        assert!(!price_within_fib_range(1.05, &[1.20, 1.10]));
+        // Degenerate inputs are rejected, not accepted.
+        assert!(!price_within_fib_range(1.15, &[1.20]));
+        assert!(!price_within_fib_range(f64::NAN, &[1.20, 1.10]));
     }
 }

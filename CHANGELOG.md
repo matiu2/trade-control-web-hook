@@ -1,5 +1,42 @@
 # Changelog
 
+## v99 — 2026-07-20 — H&S direction comes from the fib; invalidation must be within its range
+
+**Why.** A `tv-arm` H&S/iH&S arm read the **trade direction off the
+`too-high`/`too-low` invalidation label**. When a stale invalidation from a
+*different* trade got picked, that silently flipped the direction — the operator
+armed a short where the setup was a long (and vice-versa).
+
+**What changed (behaviour: tv-arm arm-time only).**
+- **Rule 1 — direction from the fib.** The fib is drawn head→neckline with the
+  0-reading (head) clicked first, so its *ordered* anchors say the direction:
+  head above neckline → short (H&S), head below → long (iH&S). `resolve_hs_trade`
+  now derives `Direction` from `geometry::direction_from_fib(fib.prices())`, not
+  from `Direction::from_invalidation_label`. A degenerate flat fib (equal
+  anchors) errors rather than guessing.
+- **Rule 2 — invalidation within the fib range.** The picked `too-low`/`too-high`
+  horizontal must sit inside the fib's head↔neckline band
+  (`geometry::price_within_fib_range`). A line outside it is a stale leftover
+  from a larger/different pattern and the arm is **rejected** with a clear
+  operator message, instead of baking a poison veto level.
+
+**Breaking.** None on the wire. The invalidation *label* is now advisory for
+direction (the baked veto still uses the line's price and the fib-derived
+direction). `Direction::from_invalidation_label` is retained but no longer called
+by the arm path.
+
+**Tests.** New `geometry` unit tests (`direction_from_fib_*`, `fib_range_*`,
+`price_within_fib_range_inclusive`) and `pipeline` resolver tests
+(`hs_direction_comes_from_fib_not_invalidation_label`,
+`hs_inverse_direction_comes_from_fib`,
+`hs_stale_invalidation_outside_fib_range_is_rejected`,
+`hs_flat_fib_has_no_direction_and_errors`).
+
+**Follow-up.** The `--start` invalidation picker still uses closeness-to-neckline
++ side-of-neckline to choose *which* line to bake; with rule 2 in place an
+out-of-range pick now also fails fast. A later cleanup can delete
+`from_invalidation_label` and the `veto_on_reversal` dormant field together.
+
 ## v98 — 2026-07-20 — replay↔live gate parity: seed the two blackout gates offline
 
 **Why.** The last two residual replay↔live divergences (#2 + #3 in the parity

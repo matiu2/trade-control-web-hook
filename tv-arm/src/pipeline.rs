@@ -590,10 +590,13 @@ impl From<color_eyre::eyre::Error> for ResolveError {
 }
 
 /// H&S / IH&S path: validate the constellation of drawings, read
-/// direction from the invalidation label, TP from the fib, expiry from
-/// the vertical line, and build the spec. This is the pre-M/W flow,
-/// unchanged in behaviour — just lifted into a resolver so `run` can
-/// dispatch on pattern.
+/// direction from the **fib** (its ordered head→neckline anchors — the
+/// 0-reading is the head), TP from the fib, expiry from the vertical
+/// line, and build the spec. The `too-low`/`too-high` invalidation
+/// horizontal is validated to sit **inside the fib's range** (a line
+/// outside it is a stale leftover from a different trade) but no longer
+/// determines direction — that was the source of a wrong-direction bug
+/// when a stale invalidation from another setup got picked.
 fn resolve_hs_trade(
     args: &Args,
     roles: &Roles,
@@ -611,14 +614,39 @@ fn resolve_hs_trade(
     if let Err(msg) = check_prep_expiries(roles, Utc::now()) {
         return Err(ResolveError::Reject(msg));
     }
-    let inv_label = roles.invalidation_label.clone().unwrap_or_default();
-    let direction = Direction::from_invalidation_label(&inv_label)
-        .ok_or_else(|| eyre!("invalid invalidation label {inv_label:?}"))?;
     let tp_fib = roles
         .tp_fib
         .as_ref()
         .ok_or_else(|| eyre!("missing tp_fib (already checked by check_required)"))?;
-    let tp = tp_price_from_fib(&tp_fib.prices(), direction);
+    let fib_prices = tp_fib.prices();
+    // Rule 1: the FIB gives us the trade direction. The operator draws the
+    // fib spanning head→neckline (0-reading at the head), so the ordered
+    // anchors say short (head above neckline) or long (head below). We no
+    // longer read direction off the `too-high`/`too-low` invalidation label,
+    // which could be a stale line from a *different* trade and silently flip
+    // the direction (the bug this fixes).
+    let direction = crate::geometry::direction_from_fib(&fib_prices).ok_or_else(|| {
+        eyre!(
+            "cannot read trade direction from the fib — its two anchors are equal or missing \
+             (draw the fib head→neckline, clicking the head first)"
+        )
+    })?;
+    // Rule 2: the invalidation (`too-low`/`too-high`) horizontal must sit
+    // inside the fib's head↔neckline range. A line outside that band belongs
+    // to a different, larger pattern — reject it rather than bake a poison
+    // level / mismatched setup.
+    if let Some(inv) = roles.invalidation.as_ref() {
+        let inv_price = horizontal_price(&inv.prices());
+        if !crate::geometry::price_within_fib_range(inv_price, &fib_prices) {
+            let (lo, hi) = crate::geometry::fib_range(&fib_prices).unwrap_or((f64::NAN, f64::NAN));
+            return Err(ResolveError::Reject(format!(
+                "invalidation line at {inv_price} is outside the fib range [{lo}, {hi}] — it \
+                 looks like a stale `too-high`/`too-low` from a different trade; redraw or \
+                 remove it"
+            )));
+        }
+    }
+    let tp = tp_price_from_fib(&fib_prices, direction);
     // Continuous at-entry level vetos (Bug #12): the pcl-exhausted (`too-low`)
     // and invalidation (`too-high`) levels, baked onto the enter so the worker
     // rejects an entry already past either — independent of the cross-guard.
@@ -2502,6 +2530,141 @@ mod tests {
         let mut argv = vec!["tv-arm"];
         argv.extend_from_slice(extra);
         Args::try_parse_from(argv).expect("parse mw args")
+    }
+
+    /// A two-point drawing (fib or trend line): `[head/near, neckline/far]`
+    /// in draw order, so `points[0]` is the fib's 0-reading (head).
+    fn two_point(id: &str, label: &str, a: f64, b: f64) -> Drawing {
+        Drawing {
+            id: id.to_string(),
+            points: vec![Point { time: 10, price: a }, Point { time: 20, price: b }],
+            properties: Properties {
+                text: (!label.is_empty()).then(|| label.to_string()),
+                ..Default::default()
+            },
+        }
+    }
+
+    /// A single-anchor horizontal line at `price` with `label`.
+    fn hline(id: &str, label: &str, price: f64) -> Drawing {
+        Drawing {
+            id: id.to_string(),
+            points: vec![Point { time: 15, price }],
+            properties: Properties {
+                text: Some(label.to_string()),
+                ..Default::default()
+            },
+        }
+    }
+
+    /// A complete H&S `Roles`: fib (head→neckline), neckline trend line,
+    /// invalidation horizontal, and a future trade-expiry.
+    fn hs_roles(fib: Drawing, inv: Drawing) -> Roles {
+        Roles {
+            invalidation: Some(inv.clone()),
+            invalidation_label: inv.properties.text.clone(),
+            break_and_close: Some(two_point("neck", "neckline", 1.10, 1.10)),
+            retest: Some(two_point("neck", "neckline", 1.10, 1.10)),
+            tp_fib: Some(fib),
+            trade_expiry: Some(vline("exp", now().timestamp() + 86_400)),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn hs_direction_comes_from_fib_not_invalidation_label() {
+        // Rule 1: the fib is authoritative. Head at 1.20 (0-reading, clicked
+        // first) sits ABOVE neckline 1.10 → this is a SHORT (H&S), regardless
+        // of the invalidation *label*. The invalidation sits inside the fib
+        // range so it passes rule 2.
+        let fib = two_point("fib", "", 1.20, 1.10);
+        let inv = hline("inv", "too-high", 1.18);
+        let roles = hs_roles(fib, inv);
+        let args = mw_args(&[]);
+        let (dir, spec) = resolve_hs_trade(
+            &args,
+            &roles,
+            "EUR_USD",
+            "ms-oanda-1",
+            Broker::Oanda,
+            0.0001,
+            0.0001,
+        )
+        .expect("valid HS resolves");
+        assert_eq!(dir, Direction::Short);
+        assert_eq!(spec.pattern, cli::TradePattern::Hs);
+    }
+
+    #[test]
+    fn hs_inverse_direction_comes_from_fib() {
+        // Mirror: head 1.00 BELOW neckline 1.10 → LONG (iH&S). too-low floor
+        // at 1.05 sits inside the fib range.
+        let fib = two_point("fib", "", 1.00, 1.10);
+        let inv = hline("inv", "too-low", 1.05);
+        let roles = hs_roles(fib, inv);
+        let args = mw_args(&[]);
+        let (dir, _) = resolve_hs_trade(
+            &args,
+            &roles,
+            "EUR_USD",
+            "ms-oanda-1",
+            Broker::Oanda,
+            0.0001,
+            0.0001,
+        )
+        .expect("valid iH&S resolves");
+        assert_eq!(dir, Direction::Long);
+    }
+
+    #[test]
+    fn hs_stale_invalidation_outside_fib_range_is_rejected() {
+        // The bug: a `too-low` left over from a DIFFERENT trade at 0.95 sits
+        // well outside this setup's fib range [1.10, 1.20]. Rule 2 rejects it
+        // rather than baking a poison level / mismatched setup.
+        let fib = two_point("fib", "", 1.20, 1.10);
+        let inv = hline("inv", "too-low", 0.95);
+        let roles = hs_roles(fib, inv);
+        let args = mw_args(&[]);
+        match resolve_hs_trade(
+            &args,
+            &roles,
+            "EUR_USD",
+            "ms-oanda-1",
+            Broker::Oanda,
+            0.0001,
+            0.0001,
+        ) {
+            Err(ResolveError::Reject(msg)) => {
+                assert!(msg.contains("outside the fib range"), "msg = {msg}");
+            }
+            other => panic!("expected Reject, got {:?}", other.map(|_| ())),
+        }
+    }
+
+    #[test]
+    fn hs_flat_fib_has_no_direction_and_errors() {
+        // A degenerate flat fib (both anchors equal) carries no direction.
+        let fib = two_point("fib", "", 1.10, 1.10);
+        let inv = hline("inv", "too-high", 1.10);
+        let roles = hs_roles(fib, inv);
+        let args = mw_args(&[]);
+        match resolve_hs_trade(
+            &args,
+            &roles,
+            "EUR_USD",
+            "ms-oanda-1",
+            Broker::Oanda,
+            0.0001,
+            0.0001,
+        ) {
+            Err(ResolveError::Fatal(e)) => {
+                assert!(
+                    format!("{e}").contains("direction from the fib"),
+                    "err = {e}"
+                );
+            }
+            other => panic!("expected Fatal, got {:?}", other.map(|_| ())),
+        }
     }
 
     fn mw_roles(p: Drawing) -> Roles {
