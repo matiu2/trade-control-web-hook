@@ -96,6 +96,15 @@ pub struct Properties {
     /// visibility/logging; sizing is decided by the worker, not this.
     #[serde(default)]
     pub qty: Option<f64>,
+    /// Fib-retracement `reverse` flag. TradingView's fib levels count
+    /// **up from the 0-reading**, and `reverse` chooses which anchor that
+    /// 0-reading sits at: with `reverse == false` the 0-level is
+    /// `points[1]` and the 1-level `points[0]`; `reverse == true` swaps
+    /// them. This is the authoritative source of *which end is the head*
+    /// — the raw `points` order alone does **not** tell us (see
+    /// [`Drawing::fib_head_neckline`]). Absent on every non-fib drawing.
+    #[serde(default)]
+    pub reverse: Option<bool>,
 }
 
 /// A drawing stub from `draw list`. Carries just enough info to
@@ -162,6 +171,34 @@ impl Drawing {
     /// geometry helpers in [`crate::geometry`].
     pub fn prices(&self) -> Vec<f64> {
         self.points.iter().map(|p| p.price).collect()
+    }
+
+    /// Resolve a fib retracement's `(head, neckline)` prices from its two
+    /// anchors and the `reverse` flag — the **authoritative** reading of
+    /// which end is the head (the `0` level the operator sees on the chart).
+    ///
+    /// TradingView's fib levels count up from the `0`-reading: `price(coeff)
+    /// = base + coeff × (other − base)`. The `head` is that `0`-reading base;
+    /// the `neckline` is the `1`-level (`coeff == 1`), i.e. the *other*
+    /// anchor. Empirically (AUD/CAD 2026-07, and TradingView's own level
+    /// math) the base is **`points[1]` when `reverse == false`** and
+    /// `points[0]` when `reverse == true`. The raw point *order* alone is
+    /// not reliable — an operator who drew the fib "neckline-first" still
+    /// gets a `0`-level at `points[1]`, so trusting `points[0]` as the head
+    /// silently flipped the trade direction (the bug this fixes).
+    ///
+    /// Returns `None` unless there are exactly two finite anchor prices.
+    pub fn fib_head_neckline(&self) -> Option<(f64, f64)> {
+        let p0 = self.points.first()?.price;
+        let p1 = self.points.get(1)?.price;
+        if !p0.is_finite() || !p1.is_finite() {
+            return None;
+        }
+        // reverse == false → head (0-level) at points[1]; true → at points[0].
+        Some(match self.properties.reverse.unwrap_or(false) {
+            false => (p1, p0),
+            true => (p0, p1),
+        })
     }
 
     /// Earliest anchor time across all the drawing's points (the start
@@ -496,5 +533,81 @@ mod tests {
         assert_eq!(d.points.len(), 2);
         assert_eq!(d.label(), "");
         assert_eq!(d.prices(), vec![1.20, 1.10]);
+    }
+
+    #[test]
+    fn fib_head_neckline_reverse_false_reads_points_1_as_head() {
+        // Real AUD/CAD 2026-07 fib (w59aSo): points[0]=0.98367 (neckline),
+        // points[1]=0.98861 (head/0-reading), reverse=false. TradingView's
+        // level math puts the 0-level at points[1] here — the chart labels
+        // 0=0.98861. The head must therefore be 0.98861 (a SHORT), NOT
+        // points[0] as the raw order would suggest.
+        let json = r#"{
+            "id": "w59aSo",
+            "points": [
+                {"time": 1783404000, "price": 0.98367},
+                {"time": 1783386000, "price": 0.98861}
+            ],
+            "properties": {"reverse": false}
+        }"#;
+        let d: Drawing = serde_json::from_str(json).unwrap();
+        let (head, neckline) = d.fib_head_neckline().expect("two finite anchors");
+        assert!((head - 0.98861).abs() < 1e-9, "head = {head}");
+        assert!((neckline - 0.98367).abs() < 1e-9, "neckline = {neckline}");
+        assert!(head > neckline, "head above neckline → short");
+    }
+
+    #[test]
+    fn fib_head_neckline_reverse_true_swaps_to_points_0() {
+        // reverse=true → the 0-level sits at points[0] instead.
+        let json = r#"{
+            "id": "r",
+            "points": [
+                {"time": 10, "price": 1.20},
+                {"time": 20, "price": 1.10}
+            ],
+            "properties": {"reverse": true}
+        }"#;
+        let d: Drawing = serde_json::from_str(json).unwrap();
+        let (head, neckline) = d.fib_head_neckline().unwrap();
+        assert!((head - 1.20).abs() < 1e-9);
+        assert!((neckline - 1.10).abs() < 1e-9);
+    }
+
+    #[test]
+    fn fib_head_neckline_missing_reverse_defaults_false() {
+        // A fib whose readback omitted `reverse` defaults to false (0-level
+        // at points[1]) — the common case.
+        let json = r#"{
+            "id": "d",
+            "points": [
+                {"time": 10, "price": 1.10},
+                {"time": 20, "price": 1.20}
+            ],
+            "properties": {"text": ""}
+        }"#;
+        let d: Drawing = serde_json::from_str(json).unwrap();
+        assert_eq!(d.properties.reverse, None);
+        let (head, neckline) = d.fib_head_neckline().unwrap();
+        assert!((head - 1.20).abs() < 1e-9, "default false → head=points[1]");
+        assert!((neckline - 1.10).abs() < 1e-9);
+    }
+
+    #[test]
+    fn fib_head_neckline_needs_two_finite_anchors() {
+        let one = r#"{"id":"o","points":[{"time":1,"price":1.0}]}"#;
+        assert!(
+            serde_json::from_str::<Drawing>(one)
+                .unwrap()
+                .fib_head_neckline()
+                .is_none()
+        );
+        let nan = r#"{"id":"n","points":[{"time":1,"price":null},{"time":2,"price":1.1}]}"#;
+        assert!(
+            serde_json::from_str::<Drawing>(nan)
+                .unwrap()
+                .fib_head_neckline()
+                .is_none()
+        );
     }
 }

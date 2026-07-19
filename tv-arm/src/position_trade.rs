@@ -118,6 +118,7 @@ mod tests {
                     stop_level: Some(stop_level),
                     profit_level: Some(profit_level),
                     qty: Some(0.01),
+                    ..Default::default()
                 },
             },
         }
