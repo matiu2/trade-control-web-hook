@@ -20,7 +20,7 @@ use trade_control_core::broker::{
     EntryRequest, Granularity, LookupError, OpenPosition, PendingOrder, Quote,
 };
 use trade_control_core::incoming::Verified;
-use trade_control_core::intent::{Direction, Intent, Resolved, ResolvedEntry, Shell};
+use trade_control_core::intent::{Direction, Intent, Resolved, ResolvedEntry, RiskBudget, Shell};
 use trade_control_core::spread_blackout::{elevated_threshold_pips, is_spread_hour};
 use trade_control_engine::{
     BidAskCandle as EngineCandle, SimOutcome, apply_entry_spread_floor, simulate_fill,
@@ -637,10 +637,45 @@ impl ReplayBroker {
 impl Broker for ReplayBroker {
     async fn place_entry(
         &self,
-        _max_risk_pct: f64,
-        _max_open_positions: u32,
+        max_risk_pct: f64,
+        max_open_positions: u32,
         req: &EntryRequest<'_>,
     ) -> Result<String, EntryError> {
+        // Enforce the two account caps the real broker enforces AND the replay
+        // can faithfully reproduce offline — so a live reject-at-cap is not
+        // silently taken as a fill (bug ③). Both mirror the real
+        // `broker_oanda::place_entry` decision exactly.
+        //
+        // 1. Percent risk-cap: a pure comparison, no equity needed — identical
+        //    to the pre-equity `RiskBudget::Percent` check the real broker runs.
+        //    `Amount` / `Units` need live equity to derive a percent, which the
+        //    offline replay doesn't have, so those stay unchecked (conservative:
+        //    replay never rejects where it can't know the equity — it can only
+        //    ever be rosier-or-equal, never reject a trade live would take).
+        if let RiskBudget::Percent(pct) = req.risk
+            && pct > max_risk_pct
+        {
+            return Err(EntryError::RiskCapExceeded {
+                requested: pct,
+                cap: max_risk_pct,
+            });
+        }
+        // 2. Open-positions cap: count attempts open as-of the fire bar (the same
+        //    `resolve`-derived count `list_open_positions` reports) and reject at
+        //    the cap, mirroring the real broker's `open_position_count >= cap`.
+        //    In a single-plan replay this is that instrument's open count — the
+        //    best offline proxy for the account-wide count, and conservative (it
+        //    can only reject, never over-fill).
+        let open_now = self
+            .placed
+            .borrow()
+            .iter()
+            .filter(|a| matches!(self.resolve(a), AttemptState::OpenPosition { .. }))
+            .count();
+        if open_now as u32 >= max_open_positions {
+            return Err(EntryError::OpenPositionsCapExceeded);
+        }
+
         // The real dispatch (`run_enter`) calls this to "place" the order. The
         // replay loop armed the geometry out-of-band (intent + shell + the order
         // id to return) because `EntryRequest` lacks what the offline
@@ -1041,6 +1076,120 @@ mod tests {
             matches!(late, AttemptState::ClosedLossOrBreakeven { .. }),
             "SL hit by bar 2 → closed, got {late:?}"
         );
+    }
+
+    // --- bug ③: place_entry enforces the caps the real broker enforces ---
+    //
+    // Before this, `place_entry` underscore-ignored `max_risk_pct` /
+    // `max_open_positions` and always accepted full size — so replay took an
+    // entry the live broker would reject-at-cap. These pin the two caps the
+    // replay can faithfully reproduce offline (Percent risk-cap; open-positions
+    // count as-of), mirroring `broker_oanda::place_entry`.
+
+    /// An `EntryRequest` for a plain stop entry at the given risk budget.
+    fn entry_req(risk: RiskBudget) -> EntryRequest<'static> {
+        EntryRequest {
+            instrument: "EUR/USD",
+            direction: Direction::Short,
+            entry: ResolvedEntry::Stop {
+                trigger_price: 1.1000,
+            },
+            stop_loss: 1.1020,
+            take_profit: 1.0950,
+            risk,
+            dry_run: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn place_entry_rejects_a_percent_over_the_risk_cap() {
+        let b = ReplayBroker::new(vec![candle(0, 1.1010)], 0.0001);
+        b.arm_placement(
+            "o1".into(),
+            short_enter_intent(),
+            Shell::from_candle(&candle(0, 1.1010).mid()),
+        );
+        // Request 2% against a 1% cap → the same RiskCapExceeded the real broker
+        // returns from its pre-equity Percent check.
+        let err = b
+            .place_entry(1.0, 3, &entry_req(RiskBudget::Percent(2.0)))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, EntryError::RiskCapExceeded { .. }),
+            "2% over a 1% cap must reject, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn place_entry_within_the_risk_cap_is_accepted() {
+        let b = ReplayBroker::new(vec![candle(0, 1.1010)], 0.0001);
+        b.arm_placement(
+            "o1".into(),
+            short_enter_intent(),
+            Shell::from_candle(&candle(0, 1.1010).mid()),
+        );
+        let ok = b
+            .place_entry(1.0, 3, &entry_req(RiskBudget::Percent(1.0)))
+            .await;
+        assert_eq!(ok.unwrap(), "o1", "1% at a 1% cap is allowed (not >)");
+    }
+
+    #[tokio::test]
+    async fn place_entry_rejects_at_the_open_positions_cap() {
+        // One position already open as-of the fire bar; cap = 1 → the next
+        // place_entry must reject, exactly as the real broker's
+        // `open_position_count >= max_open_positions`.
+        let fire = candle(0, 1.1010); // above the short-stop trigger, no fill on fire bar
+        let fill = candle(3600, 1.1000); // bid reaches the 1.1000 sell-stop → open
+        let b = ReplayBroker::new(vec![fire, fill], 0.0001);
+        // Attempt #1: recorded + resolves OpenPosition as-of bar 1.
+        b.record_attempt(
+            "o1".into(),
+            short_enter_intent(),
+            Shell::from_candle(&fire.mid()),
+        );
+        b.set_as_of(Utc.timestamp_opt(3600, 0).unwrap());
+        // Sanity: exactly one open now.
+        assert_eq!(b.list_open_positions("").await.unwrap().len(), 1);
+
+        // Attempt #2 with cap = 1 → rejected at the cap.
+        b.arm_placement(
+            "o2".into(),
+            short_enter_intent(),
+            Shell::from_candle(&fill.mid()),
+        );
+        let err = b
+            .place_entry(1.0, 1, &entry_req(RiskBudget::Percent(1.0)))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, EntryError::OpenPositionsCapExceeded),
+            "one open + cap 1 must reject the next, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn place_entry_under_the_open_positions_cap_is_accepted() {
+        // One open, cap = 3 → the next place is allowed.
+        let fire = candle(0, 1.1010);
+        let fill = candle(3600, 1.1000);
+        let b = ReplayBroker::new(vec![fire, fill], 0.0001);
+        b.record_attempt(
+            "o1".into(),
+            short_enter_intent(),
+            Shell::from_candle(&fire.mid()),
+        );
+        b.set_as_of(Utc.timestamp_opt(3600, 0).unwrap());
+        b.arm_placement(
+            "o2".into(),
+            short_enter_intent(),
+            Shell::from_candle(&fill.mid()),
+        );
+        let ok = b
+            .place_entry(1.0, 3, &entry_req(RiskBudget::Percent(1.0)))
+            .await;
+        assert_eq!(ok.unwrap(), "o2", "one open under a cap of 3 is allowed");
     }
 
     // --- PR 3: list_pending_orders fidelity (shared pending-lifecycle) ---
