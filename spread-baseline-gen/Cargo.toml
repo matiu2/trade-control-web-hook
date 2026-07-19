@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-broker-tradenation = { git = "https://github.com/matiu2/tradenation-api.git", tag = "broker-tradenation-v0.11.0", version = "0.10.0" }
+broker-tradenation = { git = "https://github.com/matiu2/tradenation-api.git", tag = "broker-tradenation-v0.12.0", version = "0.10.0" }
 broker-tradenation-adapter = { version = "0.1.0", path = "../broker-tradenation-adapter" }
 chrono = { version = "0.4.45", features = ["serde"] }
 chrono-tz = "0.10.4"
@@ -18,4 +18,4 @@ tracing = "0.1.44"
 tracing-error = "0.2.1"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 trade-control-core = { version = "0.1.0", path = "../core" }
-tradenation-api = { git = "https://github.com/matiu2/tradenation-api.git", tag = "broker-tradenation-v0.11.0", version = "0.3.0" }
+tradenation-api = { git = "https://github.com/matiu2/tradenation-api.git", tag = "broker-tradenation-v0.12.0", version = "0.4.0" }

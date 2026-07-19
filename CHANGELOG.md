@@ -1,5 +1,40 @@
 # Changelog
 
+## v95 — 2026-07-19 — TradeNation H4/M5 now WORK (aggregating fetch, verified live)
+
+**Why.** TN H4/M5 plans were dead live (v92 made the failure loud instead of
+silent). TN's raw OHLCV endpoint has no H4/M5 — they must be aggregated from a
+native base (H4 = 4×H1, M5 = 5×M1). `tradenation-api` v0.4.0 adds that
+aggregation as a first-class product (`aggregation::get_candles_range_aggregated`),
+so the adapter can now serve H4/M5 live.
+
+**What changed.**
+- Bumped `tradenation-api` `0.3.0` → `0.4.0` (tag `broker-tradenation-v0.11.0` →
+  `broker-tradenation-v0.12.0`) across the 6 workspace members that pin it.
+  `broker-tradenation` (0.10.0) and `tradenation-instrument-cache` (0.2.0)
+  unchanged — no breaking changes beyond the new aggregation module.
+- `broker-tradenation-adapter`: both candle call sites (`get_candles` and the
+  `get_bidask_candles` Mid/Bid/Ask fetches) swapped from
+  `ohlcv::get_candles_range` to `aggregation::get_candles_range_aggregated` — a
+  drop-in with the same signature that passes native TFs straight through and
+  builds H4/M5 by rolling up the native base on **00/04/08/12/16/20 UTC** buckets
+  (matches OANDA + TradingView; incomplete leading/trailing buckets dropped).
+- `TN_SERVES_H4` / `TN_SERVES_M5` flipped to `true` — H4/M5 now pass the
+  fetch guard instead of being rejected `UnsupportedGranularity`.
+
+**Verified LIVE** (not just unit tests): fetched H4 EUR/USD through the actual
+adapter on the `reversals` demo account — 38 H4 bars, **0 off the H4 grid**,
+strictly ascending; the bid/ask path (SL-spread-floor) likewise 15 bars on-grid,
+`ask ≥ bid` every bar. So TN H4 now matches what replay already did.
+
+**Tests.** `h4_m5_map_to_the_right_timeframe_and_are_served` (adapter). Full
+workspace builds; cli 267+98+22, cron 17, adapter 28 pass; clippy + fmt clean.
+
+**Follow-up.** Re-arm the TN H4 setups deleted 2026-07-19
+(`NOTE-bricked-tn-h4-plans-to-rearm.md`): ihs-aud-cad (long), hs-eur-jpy (short),
+hs-gbp-jpy (short), m-usd-jpy (short) — they can trade now. D1 already worked
+(TN-native).
+
 ## v92 — 2026-07-19 — TN H4/M5 no longer silently bricks a plan (replay≠live fix)
 
 **Why.** A TradeNation plan on a non-native timeframe (H4/M5) was **permanently,

@@ -238,7 +238,11 @@ impl Broker for TradeNationAdapter {
                 CandleError::Transient
             })?;
 
-        let raw = tradenation_api::ohlcv::get_candles_range(
+        // `get_candles_range_aggregated` is the drop-in for `get_candles_range`
+        // that serves non-native TFs (H4/M5) by fetching the native base (H1/M1)
+        // and rolling it up on 00/04/08/12/16/20 UTC buckets (`tradenation-api`
+        // v0.4.0). Native TFs pass straight through unchanged.
+        let raw = tradenation_api::aggregation::get_candles_range_aggregated(
             self.0.client(),
             market.market_id,
             cm_gran,
@@ -318,8 +322,10 @@ impl Broker for TradeNationAdapter {
         let mut by_ts: std::collections::HashMap<DateTime<Utc>, BidAskCandle> =
             std::collections::HashMap::new();
         for (count, end) in chunk_windows(granularity, since, now) {
+            // Aggregating fetch: H4/M5 built from the native base per PriceType,
+            // each side rolled up on the same UTC buckets (see `get_candles`).
             let fetch = |price: PriceType| {
-                tradenation_api::ohlcv::get_candles_range(
+                tradenation_api::aggregation::get_candles_range_aggregated(
                     self.0.client(),
                     market.market_id,
                     cm_gran,
@@ -553,28 +559,23 @@ fn to_upstream_entry(e: &ResolvedEntry) -> broker_tradenation::ResolvedEntry {
     }
 }
 
-/// Whether `tradenation-api`'s `ohlcv::get_candles_range` serves this TF as a
-/// **direct native fetch**. TN's raw OHLCV endpoint only ever serves
-/// minute / quarter(15m) / hour / day — H4 and M5 have **no endpoint and never
-/// will** (confirmed 2026-07-19: `granularity_to_path` is hardcoded to those 4;
-/// there is no coming `tradenation-api` change — the H4 aggregation lives in
-/// `candle-cache`, not the crate). So these two stay `false` **permanently**.
+/// Whether `tradenation-api` serves this TF (natively OR by aggregation).
 ///
-/// Making H4/M5 *work* is NOT a flag flip — it needs the adapter to AGGREGATE:
-/// fetch the native base (H1 for H4, M1 for M5) and roll it up with
-/// `candle_cache::aggregation::CandleAggregator` (verified: correct
-/// 00/04/08/12/16/20 UTC bucket alignment, all three PriceTypes). Until that
-/// aggregation path is built, a request for H4/M5 is rejected loudly
-/// (`UnsupportedGranularity`) rather than silently bricking (bug ②). See
-/// `TODO-tn-h4-switch.md` for the implementation plan.
-const TN_SERVES_H4: bool = false;
-const TN_SERVES_M5: bool = false;
+/// As of `tradenation-api` v0.4.0 the adapter fetches candles through
+/// `aggregation::get_candles_range_aggregated`, which serves H4/M5 by fetching
+/// the native base (H1/M1) and rolling it up on 00/04/08/12/16/20 UTC buckets
+/// (matches OANDA + TradingView). So H4 and M5 are now **served** — these are
+/// `true`. TN's raw endpoint still has no H4/M5 path of its own, but the adapter
+/// no longer calls it directly for candles. A TF that the aggregator genuinely
+/// cannot build would still be rejected (`UnsupportedGranularity`); today every
+/// engine `Granularity` is covered (min/15m/hour/day native; H4=4×H1, M5=5×M1).
+const TN_SERVES_H4: bool = true;
+const TN_SERVES_M5: bool = true;
 
-/// Engine [`Granularity`] → `candle_model::Granularity` + whether TN serves it as
-/// a **direct native fetch** via the raw `ohlcv::get_candles_range`. Baseline
-/// native TFs are minute / quarter(15m) / hour / day; H4/M5 are
-/// [`TN_SERVES_H4`]/[`TN_SERVES_M5`] = `false` (no native endpoint — they require
-/// adapter-side aggregation, see there). Pure.
+/// Engine [`Granularity`] → `candle_model::Granularity` + whether
+/// `tradenation-api` serves it (native or aggregated). Native TFs are
+/// minute / quarter(15m) / hour / day; H4/M5 are served by aggregation
+/// ([`TN_SERVES_H4`]/[`TN_SERVES_M5`] = `true`, see there). Pure.
 fn to_cm_granularity(g: Granularity) -> (CmGranularity, bool) {
     match g {
         Granularity::M1 => (CmGranularity::OneMinute, true),
@@ -986,20 +987,21 @@ mod candle_fetch_tests {
     }
 
     #[test]
-    fn h4_m5_map_to_the_right_timeframe_but_are_not_native() {
-        // H4/M5 map to the correct `candle_model` timeframe, but their `native`
-        // flag is `false`: TN's raw endpoint has no H4/M5, so a direct fetch is
-        // rejected. Making them work needs adapter-side aggregation (fetch H1/M1
-        // + roll up via candle-cache), not a flag flip — see `TN_SERVES_H4`.
+    fn h4_m5_map_to_the_right_timeframe_and_are_served() {
+        // H4/M5 map to the correct `candle_model` timeframe and are now SERVED
+        // (`true`): as of tradenation-api v0.4.0 the adapter fetches through
+        // `get_candles_range_aggregated`, which builds H4=4×H1 / M5=5×M1 on
+        // 00/04/08/12/16/20 UTC buckets. So they pass the fetch guard rather than
+        // being rejected. See `TN_SERVES_H4`.
         let (h4_cm, h4_native) = to_cm_granularity(Granularity::H4);
         assert_eq!(h4_cm, CmGranularity::FourHours);
         assert_eq!(h4_native, TN_SERVES_H4);
-        assert!(!h4_native, "H4 has no native TN endpoint");
+        assert!(h4_native, "H4 is served via aggregation");
 
         let (m5_cm, m5_native) = to_cm_granularity(Granularity::M5);
         assert_eq!(m5_cm, CmGranularity::FiveMinutes);
         assert_eq!(m5_native, TN_SERVES_M5);
-        assert!(!m5_native, "M5 has no native TN endpoint");
+        assert!(m5_native, "M5 is served via aggregation");
     }
 
     #[test]
