@@ -603,9 +603,9 @@ pub async fn run_enter<B: Broker, S: StateStore>(
                 if spread_blackout::spread_blackout_decision(true, spread_pips, threshold) {
                     // Name the instrument's baked normal/spike so the
                     // operator can judge whether the block is right. Baked
-                    // figures come from the spread-sampler baseline; absent
-                    // for an uncatalogued instrument (then we only have the
-                    // flat threshold to show).
+                    // figures come from the candle-derived baseline table;
+                    // absent for an uncatalogued instrument (then we only have
+                    // the flat threshold to show).
                     let normal = match spread_blackout::baked_baseline(&resolved.instrument) {
                         Some((low, high, median)) => format!(
                             "{} normal spread ~{median:.1}p (seen {low:.1}–{high:.1}p)",

@@ -834,18 +834,18 @@ pub struct SpreadWiden {
 /// the original (tighter) level and diverge from the live worker.
 ///
 /// **The per-instrument spread-hour gate (2026-07-05).** The live cron widens
-/// at each instrument's *own* learned spread hours (baked from the sampler
-/// data), not one global NY-close hour — Gold overnight, EUR/USD at 21:00,
-/// indices at their own — via
-/// [`trade_control_core::spread_blackout::spread_hour_widen_pips`]. This replay
-/// mirrors that: a bar qualifies when `spread_hour_widen_pips(instrument,
-/// c.time)` is `Some` (in/leading into a learned spread hour → widen by the
-/// baked p90), OR — for an **un-sampled** instrument with no learned hours — the
-/// bar is at the legacy NY-close edge
+/// at each instrument's *own* learned spread hours (from the candle-derived
+/// baseline table), not one global NY-close hour — Gold overnight, EUR/USD at
+/// 21:00, indices at their own — via
+/// [`trade_control_core::spread_blackout::spread_hour_widen_instant`]. This
+/// replay mirrors that: a bar qualifies when `spread_hour_widen_instant(
+/// instrument, c.time, bar_seconds)` is `Some` (in/leading into a learned
+/// spread hour → widen by the baked p90), OR — for an **uncatalogued**
+/// instrument with no learned hours — the bar is at the legacy NY-close edge
 /// ([`trade_control_core::ny_clock::is_ny_close_edge`], 21:00 UTC EDT / 22:00
 /// EST) AND its live spread reaches `widen_trigger_pips`. The pre-2026-07-05
 /// behaviour (global NY-close gate + `clamp_widen`) survives verbatim on the
-/// fallback path so un-sampled assets don't regress.
+/// fallback path so uncatalogued assets don't regress.
 ///
 /// **The trigger / widen size.** For a baked spread-hour bar the widen is
 /// [`trade_control_core::blackout_widen::spread_hour_widen_size`] — baked p90
@@ -905,11 +905,11 @@ pub fn widened_stop_at(
             return None;
         }
         // Per-instrument spread-hour gate — mirror the live cron's System 2
-        // (`widen_open_stops_for_spread_hours`). `spread_hour_widen_pips`
+        // (`widen_open_stops_for_spread_hours`). `spread_hour_widen_instant`
         // returns `Some(baked_p90)` iff this bar's instrument is in (or leading
         // into) one of its learned spread hours; `None` means either "not a
-        // spread hour now" or "un-sampled instrument", disambiguated by the
-        // legacy `is_ny_close_edge` fallback (so un-sampled assets keep the old
+        // spread hour now" or "uncatalogued instrument", disambiguated by the
+        // legacy `is_ny_close_edge` fallback (so uncatalogued assets keep the old
         // NY-close-only behaviour). Before 2026-07-05 this was a single global
         // `is_ny_close_edge` gate for ALL instruments — see
         // `[[strategy_changes_in_both_replayer_and_worker]]`; the worker + this
