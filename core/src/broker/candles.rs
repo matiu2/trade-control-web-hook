@@ -150,10 +150,18 @@ impl Granularity {
 pub enum CandleError {
     /// Network / 5xx / decode / other transient broker failure.
     Transient,
-    /// The requested window is degenerate (`since >= now`) or the broker
-    /// rejected the range. Distinct from `Transient` so the engine logs it as
-    /// a logic bug rather than a flaky feed.
+    /// The requested window is degenerate (`since >= now`). A legitimate no-op:
+    /// the caller may treat it as "no new candles" and widen on the next tick.
+    /// Distinct from `Transient` so the engine logs it as a logic bug rather
+    /// than a flaky feed.
     BadRange,
+    /// The broker does not serve this granularity at all (structural, not
+    /// transient, and never self-heals). Distinct from `BadRange` because a
+    /// caller must NOT treat it as an empty-window no-op — doing so silently
+    /// bricks the plan (empty seed → `watermark: None` → re-seed forever, never
+    /// arms). The caller must surface this loudly. E.g. TradeNation does not
+    /// serve H4/M5 natively via the raw range endpoint.
+    UnsupportedGranularity,
 }
 
 impl core::fmt::Display for CandleError {
@@ -161,6 +169,7 @@ impl core::fmt::Display for CandleError {
         match self {
             Self::Transient => f.write_str("broker candle fetch failed (transient)"),
             Self::BadRange => f.write_str("candle fetch range is degenerate or rejected"),
+            Self::UnsupportedGranularity => f.write_str("broker does not serve this granularity"),
         }
     }
 }

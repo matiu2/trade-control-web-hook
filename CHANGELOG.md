@@ -1,5 +1,47 @@
 # Changelog
 
+## v92 — 2026-07-19 — TN H4/M5 no longer silently bricks a plan (replay≠live fix)
+
+**Why.** A TradeNation plan on a non-native timeframe (H4/M5) was **permanently,
+silently dead live** while replaying fine — a "3.3" divergence (same code, but
+replay's candle path aggregates H4=H1×4 / M5=M1×5, so replay traded a plan the
+live worker could never tick). 3 plans bricked this week (AUD_CAD, EUR/JPY,
+GBP/JPY — all TN H4).
+
+**Root cause.** `TradeNationBroker::get_candles` / `get_bidask_candles` returned
+`CandleError::BadRange` for **two** conditions — a degenerate window
+(`since >= now`, a legitimate no-op) **and** a structurally-unsupported TF (H4/M5,
+permanent). `fetch_candles` (`trade-control-cron`) mapped **both** to
+`Ok(Vec::new())`. For the seed fetch that meant an empty seed → `watermark: None`
+→ `tick_one` re-seeds every tick forever → the plan never processes a bar, never
+arms, fires nothing — and presents on `plan list` as "registered but never
+ticked", with no error surfaced.
+
+**What changed.** New `CandleError::UnsupportedGranularity` (structural, never
+self-heals), distinct from `BadRange` (degenerate window). The two TN `!native`
+sites now return it; the `since >= now` sites keep `BadRange`. `fetch_candles`'s
+error disposition (extracted to a pure, unit-tested `disposition` fn) maps
+`BadRange → Ok(empty)` (unchanged) but `UnsupportedGranularity → Err`, which
+`run_engine_tick` logs + skips (fail-soft, visible in journalctl) — a loud,
+recurring error instead of a silent stall. OANDA is unaffected (serves all six
+TFs; only ever emits `BadRange` for degenerate windows).
+
+**Breaking.** `CandleError` gains a variant. The only exhaustive match on it
+(`disposition`) is updated; producers only construct variants. No API signature
+change.
+
+**Tests.** `disposition_{bad_range_is_an_empty_no_op, unsupported_granularity_is_
+a_loud_error_not_empty, transient_is_an_error, ok_passes_candles_through}` in
+`trade-control-cron`. Existing `non_native_granularities_are_flagged` (TN adapter)
+still pins H4/M5 as non-native. Full workspace builds; core 866 / adapter 28 /
+cron 17 pass.
+
+**Follow-up.** (1) A registration-time reject (refuse a TN H4/M5 plan before
+persisting) is nicer UX but needs broker resolution plumbed into the
+`StateStore`-generic `core::handle_register` — separate PR. (2) The 3
+already-bricked plans won't self-heal (their `watermark: None` rows persist);
+after deploy, purge + re-arm on a native TF, or leave them now-erroring-loudly.
+
 ## v91 — 2026-07-15 — deprecate cross_buffer_pct in favour of cross_buffer_atr
 
 **Why.** The percent-of-price cross buffer (`cross_buffer_pct`) is
