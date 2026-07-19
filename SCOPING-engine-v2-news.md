@@ -81,15 +81,40 @@ Sketch (subject to a build-time review like the earlier slices):
   `PlaceOrder` it's latest-bar-gated (don't chase a stale close). NON-terminal:
   the plan stays live for multi-shot re-entry (v1: a reversal-close guard flattens
   but keeps `AwaitEntry`).
-- **`veto_on_reversal`** (experimental, v1): a price-window reversal-close can
-  ALSO write a `reversal` veto to block a *later* entry. Port only if wanted;
-  it's off by default.
+- **EXIT-ONLY — writes NO veto (v96, `a9e9b2c`, 2026-07-19).** The reversal-close
+  flattens the open position and does **not** write a `reversal` veto. The
+  operator's rule: *a reversal candle is a reason to EXIT, not to STAY OUT* — once
+  flat, a fresh signal may re-enter. Blocking future entries is the **separate**
+  job of the too-high/too-low invalidation caps (v2 `Invalidate`, already built)
+  and the 80%-to-TP pcl-exhausted abort — those fire on their own and don't close
+  the position. So the v2 reversal-close is a pure exit: `Effect::ClosePosition`
+  and nothing else. **Do NOT port a `reversal`-veto write** — `veto_on_reversal`
+  is now a dormant no-op in v1 (the field/flag still parse & round-trip for
+  back-compat, but write nothing; full removal deferred).
+  - *Why it was removed:* it was the last confirmed **replay↔live divergence** —
+    the live worker wrote the veto in `run_close`, but the offline replay never
+    calls `run_close` (its loop handles only Enter/Pause/Resume/Prep), so a later
+    multi-shot enter passed offline but rejected live. In v2 this class of bug
+    **can't exist by construction**: replay and live run the identical pure rule
+    and differ only in the Broker/Storage impls. Reinforces the v2 design.
 
 Watch-points for that slice:
 - The **reversal detector** is the real work — engine-v2 has no Pine detector yet.
   It exists twice in v1 (Pine + `core/src/signals/`); reuse the `core` copy.
 - **OR not AND** for the news/price close gates (the load-bearing fix above).
+- **Exit-only** (see above) — no veto write; that's the invalidation caps' job.
 - The close effect needs the **async Broker** threaded into the driver's execute
   step — the same boundary the `PlaceOrder` executor slice will introduce. May
   be worth doing the executor slice (place-order execution) first so the close
   effect lands on an established broker-execute path.
+
+## Keep this in sync — the v1 news code is moving
+
+The live v1 news/close code gets bug-fixed as the demo runs; a design mapped one
+week can be stale the next. Before building the reversal-close slice, **re-check
+`git log --since` on** `core/src/dispatch/close.rs`, `core/src/pause_gate.rs`,
+`engine/src/evaluate.rs`, `core/src/signals/`, `core/src/intent.rs`. Known moves
+so far: v96 exit-only (above); the OnClose-origin-side / cross-buffer-atr /
+slope-scaled-retest engine tuning (System-agnostic). `pause_gate.rs` (System 1)
+has NOT changed since the pause slice shipped, so the built pause behaviour is
+still a faithful port.
