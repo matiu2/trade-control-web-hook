@@ -1,5 +1,115 @@
 # Changelog
 
+## v92 — 2026-07-19 — TN H4/M5 no longer silently bricks a plan (replay≠live fix)
+
+**Why.** A TradeNation plan on a non-native timeframe (H4/M5) was **permanently,
+silently dead live** while replaying fine — a "3.3" divergence (same code, but
+replay's candle path aggregates H4=H1×4 / M5=M1×5, so replay traded a plan the
+live worker could never tick). 3 plans bricked this week (AUD_CAD, EUR/JPY,
+GBP/JPY — all TN H4).
+
+**Root cause.** `TradeNationBroker::get_candles` / `get_bidask_candles` returned
+`CandleError::BadRange` for **two** conditions — a degenerate window
+(`since >= now`, a legitimate no-op) **and** a structurally-unsupported TF (H4/M5,
+permanent). `fetch_candles` (`trade-control-cron`) mapped **both** to
+`Ok(Vec::new())`. For the seed fetch that meant an empty seed → `watermark: None`
+→ `tick_one` re-seeds every tick forever → the plan never processes a bar, never
+arms, fires nothing — and presents on `plan list` as "registered but never
+ticked", with no error surfaced.
+
+**What changed.** New `CandleError::UnsupportedGranularity` (structural, never
+self-heals), distinct from `BadRange` (degenerate window). The two TN `!native`
+sites now return it; the `since >= now` sites keep `BadRange`. `fetch_candles`'s
+error disposition (extracted to a pure, unit-tested `disposition` fn) maps
+`BadRange → Ok(empty)` (unchanged) but `UnsupportedGranularity → Err`, which
+`run_engine_tick` logs + skips (fail-soft, visible in journalctl) — a loud,
+recurring error instead of a silent stall. OANDA is unaffected (serves all six
+TFs; only ever emits `BadRange` for degenerate windows).
+
+**Breaking.** `CandleError` gains a variant. The only exhaustive match on it
+(`disposition`) is updated; producers only construct variants. No API signature
+change.
+
+**Tests.** `disposition_{bad_range_is_an_empty_no_op, unsupported_granularity_is_
+a_loud_error_not_empty, transient_is_an_error, ok_passes_candles_through}` in
+`trade-control-cron`. Existing `non_native_granularities_are_flagged` (TN adapter)
+still pins H4/M5 as non-native. Full workspace builds; core 866 / adapter 28 /
+cron 17 pass.
+
+**Follow-up.** (1) A registration-time reject (refuse a TN H4/M5 plan before
+persisting) is nicer UX but needs broker resolution plumbed into the
+`StateStore`-generic `core::handle_register` — separate PR. (2) The 3
+already-bricked plans won't self-heal (their `watermark: None` rows persist);
+after deploy, purge + re-arm on a native TF, or leave them now-erroring-loudly.
+
+## v93 — 2026-07-19 — replay honours the position/risk caps (replay≠live fix)
+
+**Why.** `ReplayBroker::place_entry` underscore-ignored `max_risk_pct` and
+`max_open_positions` and always accepted the order at full size — so the offline
+replay took an entry the **live** broker would reject-at-cap. A "3.3" divergence
+(same shared `run_enter`, but the swapped broker didn't enforce what the real one
+does), making replay rosier than live whenever an account is at its position cap
+or an intent requests risk over the cap.
+
+**What changed.** `place_entry` now enforces the two caps the replay can
+reproduce faithfully offline, each mirroring `broker_oanda::place_entry` exactly:
+- **Percent risk-cap** — `RiskBudget::Percent(pct) && pct > max_risk_pct` →
+  `RiskCapExceeded`. A pure comparison, no equity needed (identical to the real
+  broker's cheap pre-equity check). `Amount`/`Units` need live equity to derive a
+  percent, which the offline replay doesn't have, so they stay unchecked —
+  conservative (replay only ever rejects where it can be certain; never rejects a
+  trade live would take).
+- **Open-positions cap** — count attempts that `resolve` to `OpenPosition` as-of
+  the fire bar (the same ledger `list_open_positions` reports) and reject at
+  `>= max_open_positions` → `OpenPositionsCapExceeded`. In a single-plan replay
+  this is that instrument's open count — the best offline proxy for the real
+  account-wide count, and conservative (can only reject, never over-fill).
+
+The caps flow through unchanged: `run_enter` already passes the resolved
+`max_risk_pct` / `max_open_positions` into `place_entry`; the replay's
+`DispatchConfig` already sets them (1.0% / 3). A cap rejection surfaces as
+`ActionResult::Failed(outcome)` → the report renders a skip-with-reason (not a
+fill), matching the live worker.
+
+**Tests.** `place_entry_{rejects_a_percent_over_the_risk_cap,
+within_the_risk_cap_is_accepted, rejects_at_the_open_positions_cap,
+under_the_open_positions_cap_is_accepted}` in `replay_broker`. cli suite
+267 + 98 + 22 pass; clippy + fmt clean.
+
+## v94 — 2026-07-19 — first-confirmed scan floor is depth-independent (replay≠live fix)
+
+**Why.** A `needs_confirmed` (QM) enter with no break-and-close and no
+`tv-arm --start` has `confirmed_floor = None`, and `first_confirmed_signal_at`
+then scanned the **whole** detector window for the first confirmed signal. But
+the window depth **varies by caller**: a trendline-anchored plan fetches back to
+an old neckline on live *and* replay, while a `--warmup-bars` replay is always
+deep (~200) and the live worker's non-anchored window is shallow
+(`detector_lookback_bars`). So the unbounded `None` scan latched an **ancient
+warmup-era** confirmed signal in a deep window but a recent one in a shallow
+window — a "3.3" replay≠live divergence: replay entered (or entered with a
+different ancient signal's geometry → different entry/SL/TP) where live never
+fired. The old code comment even asserted "the detector back-window is already
+bounded on the live path" — false.
+
+**What changed.** New shared `core::signals::confirmed_scan_floor(window, as_of,
+cfg, granularity, explicit)` — the single source of truth for the scan's lower
+bound. An explicit floor (break-and-close / replay_start) still wins; when it's
+`None` the floor is derived from the SHARED `detector_lookback_bars` depth behind
+the as-of bar (the recent setup window), **independent of how deep the fetch
+reached**. `saturating_sub` floors to bar 0 on a short window (no panic; whole
+short window in scope, byte-identical to before). Both consumers now call it: the
+fire path (`engine::eval_pine_entry`) and the replay's "would-have-entered"
+report annotation (`confirmed_signal_ready`), so decision and annotation can't
+drift either. Extends the existing `detector_lookback_bars` seam (the v90
+ATR-window fix) rather than forking a parallel window-depth path.
+
+**Tests.** `confirmed_scan_floor_{scopes_a_deep_window_to_the_recent_lookback,
+prefers_an_explicit_floor, saturates_to_bar_zero_on_a_short_window,
+empty_window_is_none}` (core, pure); `confirmed_enter_fires_in_a_deep_window_via_
+the_derived_scan_floor` (engine, end-to-end — a setup deep in a 40-bar-padded
+window still fires the recent signal). All existing `confirmed_enter_*` tests
+unchanged. core 874 / engine 160 / cli 267+94+22 pass; clippy + fmt clean.
+
 ## v91 — 2026-07-15 — deprecate cross_buffer_pct in favour of cross_buffer_atr
 
 **Why.** The percent-of-price cross buffer (`cross_buffer_pct`) is

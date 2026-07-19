@@ -613,7 +613,7 @@ fn detect_mark(
 /// not the fire path.
 fn confirmed_signal_ready(plan: &TradePlan, state: &PlanState, mid: &[Candle], i: usize) -> bool {
     let cfg = DetectorConfig::pine_defaults(plan.granularity);
-    let confirmed_floor = [
+    let explicit = [
         state.break_close_at,
         plan.replay_start
             .and_then(|s| chrono::DateTime::from_timestamp(s, 0)),
@@ -621,6 +621,17 @@ fn confirmed_signal_ready(plan: &TradePlan, state: &PlanState, mid: &[Candle], i
     .into_iter()
     .flatten()
     .max();
+    // Same derived scan floor the fire path uses (`eval_pine_entry`), via the
+    // shared `confirmed_scan_floor` seam — so this "would have entered" annotation
+    // can't disagree with the real decision (bug ①).
+    let window_times: Vec<_> = mid.iter().map(|c| c.time).collect();
+    let confirmed_floor = trade_control_core::signals::confirmed_scan_floor(
+        &window_times,
+        i,
+        &cfg,
+        plan.granularity,
+        explicit,
+    );
     first_confirmed_signal_at(mid, i, &cfg, plan.direction, None, confirmed_floor, None).is_some()
 }
 

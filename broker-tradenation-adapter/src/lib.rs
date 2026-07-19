@@ -224,7 +224,9 @@ impl Broker for TradeNationAdapter {
             tracing::error!(
                 "tn get_candles({instrument}): granularity {granularity:?} not TN-native"
             );
-            return Err(CandleError::BadRange);
+            // Structural, not a degenerate window — the engine must surface this
+            // loudly, never treat it as an empty no-op (bug ②: silent brick).
+            return Err(CandleError::UnsupportedGranularity);
         }
         let count = candle_count_for_window(granularity, since, now);
 
@@ -288,7 +290,8 @@ impl Broker for TradeNationAdapter {
             tracing::error!(
                 "tn get_bidask_candles({instrument}): granularity {granularity:?} not TN-native"
             );
-            return Err(CandleError::BadRange);
+            // Structural, not a degenerate window — see `get_candles` above.
+            return Err(CandleError::UnsupportedGranularity);
         }
         let market = tradenation_api::resolve_market(self.0.client(), self.0.session(), instrument)
             .await
