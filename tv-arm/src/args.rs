@@ -500,13 +500,17 @@ pub struct Args {
     #[arg(long, default_value_t = 0.1)]
     pub reversal_band_pct: f64,
 
-    /// **Experimental, default OFF.** Make a reversal off a chart-drawn
-    /// `support` / `resistance` band *also* veto the upcoming entry, not
-    /// just close an open position. When set, the emitted
-    /// `06-close-on-reversal` intent carries `veto_on_reversal: true`, so
-    /// a reversal that lands before the entry fires blocks the trade
-    /// entirely (the worker writes a `reversal` veto for the trade_id).
-    /// Only takes effect when support/resistance bands are present.
+    /// **Experimental, DORMANT NO-OP since 2026-07-19.** The reversal-close
+    /// is exit-only: a reversal off a chart-drawn `support` / `resistance`
+    /// band closes the open position and nothing more — it never blocks a
+    /// future entry. This flag still stamps `veto_on_reversal: true` on the
+    /// emitted `07-close-on-sr-reversal` intent, but the worker ignores it
+    /// (no `reversal` veto is written and no enter checks one). Future entries
+    /// are gated by the independent `too-high`/`too-low` invalidation caps and
+    /// the 80%-to-TP `pcl-exhausted` abort — see the EXIT vs VETO/INVALIDATE
+    /// glossary in CLAUDE.md. Kept for wire/round-trip compatibility; default
+    /// OFF. Only takes effect (as a no-op) when support/resistance bands are
+    /// present.
     #[arg(long)]
     pub veto_on_reversal: bool,
 

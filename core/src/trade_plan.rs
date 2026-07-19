@@ -661,4 +661,24 @@ bar: on_close
             "kind must survive a round-trip"
         );
     }
+
+    /// Backward-compat: a plan signed before the 2026-07-19 rename carries
+    /// `kind: "per_trade_exit"`. The renamed `PerPositionClose` variant keeps a
+    /// `#[serde(alias = "per_trade_exit")]` so those old plans still parse to
+    /// the correct kind rather than falling back to `Unspecified`.
+    #[test]
+    fn legacy_per_trade_exit_kind_still_parses() {
+        let json = r#"{"rule_id":"06-close-on-reversal",
+            "trigger":{"type":"horizontal_cross","level":1.2,"dir":"up","bar":"on_close"},
+            "fire_mode":"once",
+            "intent":{"v":1,"action":"close","instrument":"EUR_USD","id":"close-1",
+                "not_after":"2026-05-13T20:00:00Z"},
+            "kind":"per_trade_exit"}"#;
+        let rule: ConditionRule = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            rule.kind,
+            RuleKind::PerPositionClose,
+            "legacy per_trade_exit must alias to PerPositionClose"
+        );
+    }
 }
