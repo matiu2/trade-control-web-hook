@@ -215,10 +215,10 @@ impl Broker for TradeNationAdapter {
         }
         // TN's chart OHLCV is count-back-from-`end_time`, not a true range,
         // so fetch enough candles to cover the window then trim to `> since`
-        // with `filter_new_candles`. Whether the linked `tradenation-api` serves
-        // this TF is the `native` flag from `to_cm_granularity` — gated on
-        // `TN_SERVES_H4`/`TN_SERVES_M5` (H4/M5 land once the aggregating
-        // `tradenation-api` tag is bumped in). A non-served TF is rejected loudly.
+        // with `filter_new_candles`. `native` from `to_cm_granularity` is whether
+        // TN's raw endpoint serves this TF directly (min/quarter/hour/day). H4/M5
+        // have no native endpoint (they need adapter-side aggregation, not yet
+        // built) so they're rejected loudly here.
         let (cm_gran, native) = to_cm_granularity(granularity);
         if !native {
             tracing::error!(
@@ -553,34 +553,28 @@ fn to_upstream_entry(e: &ResolvedEntry) -> broker_tradenation::ResolvedEntry {
     }
 }
 
-/// Whether `tradenation-api`'s `ohlcv::get_candles_range` serves H4/M5.
+/// Whether `tradenation-api`'s `ohlcv::get_candles_range` serves this TF as a
+/// **direct native fetch**. TN's raw OHLCV endpoint only ever serves
+/// minute / quarter(15m) / hour / day — H4 and M5 have **no endpoint and never
+/// will** (confirmed 2026-07-19: `granularity_to_path` is hardcoded to those 4;
+/// there is no coming `tradenation-api` change — the H4 aggregation lives in
+/// `candle-cache`, not the crate). So these two stay `false` **permanently**.
 ///
-/// ⚠️ **SINGLE SWITCH POINT — flip in lockstep with the dep bump.** These are
-/// `false` while the *currently linked* `tradenation-api` tag
-/// (`broker-tradenation-v0.11.0`) serves only minute/quarter/hour/day — H4 and
-/// M5 have no endpoint, so a request for them is rejected. Do **not** flip a
-/// const before the dep bump lands: the adapter would then pass H4 through to an
-/// API that still rejects it — the same brick, one layer down (see
-/// `CandleError::UnsupportedGranularity` / bug ②).
-///
-/// Switch-over, when the new tag that serves H4 (and M5) as a first-class product
-/// — aggregation done *inside* `tradenation-api` — is landed (see
-/// `TODO-tn-h4-switch.md`): bump the tag in `broker-tradenation-adapter/Cargo.toml`
-/// (both the `broker-tradenation` and `tradenation-api` git deps), flip the
-/// matching const here to `true`, then update the `h4_m5_switch_is_off_until_the_dep_bump`
-/// test (it asserts these are `false`).
-///
-/// Ideally the new `tradenation-api` makes `granularity_to_path` — or a
-/// `supports_granularity(g) -> bool` — **public**, so this adapter can *delegate*
-/// the native check instead of mirroring it, and these consts can be deleted.
-/// Flag that to whoever owns the crate.
+/// Making H4/M5 *work* is NOT a flag flip — it needs the adapter to AGGREGATE:
+/// fetch the native base (H1 for H4, M1 for M5) and roll it up with
+/// `candle_cache::aggregation::CandleAggregator` (verified: correct
+/// 00/04/08/12/16/20 UTC bucket alignment, all three PriceTypes). Until that
+/// aggregation path is built, a request for H4/M5 is rejected loudly
+/// (`UnsupportedGranularity`) rather than silently bricking (bug ②). See
+/// `TODO-tn-h4-switch.md` for the implementation plan.
 const TN_SERVES_H4: bool = false;
 const TN_SERVES_M5: bool = false;
 
-/// Engine [`Granularity`] → `candle_model::Granularity` + whether TN serves it
-/// natively via the raw `ohlcv::get_candles_range`. TN's baseline native
-/// timeframes are minute / quarter(15m) / hour / day; H4 and M5 are gated on
-/// [`TN_SERVES_H4`] / [`TN_SERVES_M5`] (see there for the switch-over). Pure.
+/// Engine [`Granularity`] → `candle_model::Granularity` + whether TN serves it as
+/// a **direct native fetch** via the raw `ohlcv::get_candles_range`. Baseline
+/// native TFs are minute / quarter(15m) / hour / day; H4/M5 are
+/// [`TN_SERVES_H4`]/[`TN_SERVES_M5`] = `false` (no native endpoint — they require
+/// adapter-side aggregation, see there). Pure.
 fn to_cm_granularity(g: Granularity) -> (CmGranularity, bool) {
     match g {
         Granularity::M1 => (CmGranularity::OneMinute, true),
@@ -992,34 +986,20 @@ mod candle_fetch_tests {
     }
 
     #[test]
-    fn h4_m5_native_flag_tracks_the_dep_switch() {
-        // H4/M5 map to the right timeframe unconditionally; their `native` flag
-        // follows the single switch consts (flipped in lockstep with the
-        // `tradenation-api` dep bump — see `TN_SERVES_H4`). Keying the test on the
-        // const (not a hard `false`) means it stays correct across the flip and
-        // documents that the mapping is exactly what gates the fetch.
+    fn h4_m5_map_to_the_right_timeframe_but_are_not_native() {
+        // H4/M5 map to the correct `candle_model` timeframe, but their `native`
+        // flag is `false`: TN's raw endpoint has no H4/M5, so a direct fetch is
+        // rejected. Making them work needs adapter-side aggregation (fetch H1/M1
+        // + roll up via candle-cache), not a flag flip — see `TN_SERVES_H4`.
         let (h4_cm, h4_native) = to_cm_granularity(Granularity::H4);
         assert_eq!(h4_cm, CmGranularity::FourHours);
         assert_eq!(h4_native, TN_SERVES_H4);
+        assert!(!h4_native, "H4 has no native TN endpoint");
 
         let (m5_cm, m5_native) = to_cm_granularity(Granularity::M5);
         assert_eq!(m5_cm, CmGranularity::FiveMinutes);
         assert_eq!(m5_native, TN_SERVES_M5);
-    }
-
-    /// Guards the ordering constraint: while the linked `tradenation-api` tag
-    /// still serves only minute/quarter/hour/day, the H4/M5 switch consts MUST be
-    /// `false` — flipping them before the dep bump re-bricks (the adapter would
-    /// pass H4 through to an API that rejects it). This test fails loudly if
-    /// someone flips a const without bumping the dep; delete/invert it as part of
-    /// the switch-over once the H4-serving tag is linked.
-    #[test]
-    fn h4_m5_switch_is_off_until_the_dep_bump() {
-        assert!(
-            !TN_SERVES_H4 && !TN_SERVES_M5,
-            "TN_SERVES_H4/M5 must stay false until the tradenation-api tag that \
-             serves H4/M5 is linked — see TODO-tn-h4-switch.md"
-        );
+        assert!(!m5_native, "M5 has no native TN endpoint");
     }
 
     #[test]
