@@ -1709,8 +1709,8 @@ mod tests {
         );
         // The reversal-close flattens the open short but must NOT retire the
         // plan — this is a multi-shot plan (max_retries: 5), so the spine stays
-        // alive to re-enter. (A reversal-close is a per-trade exit, never a setup
-        // invalidation.)
+        // alive to re-enter. (A reversal-close is a per-position close, never a
+        // setup invalidation.)
         assert!(
             !r.done,
             "a reversal-close flattens but never retires the plan (retries continue)"

@@ -2243,10 +2243,11 @@ fn legacy_kind(rule: &ConditionRule) -> RuleKind {
     }
     match rule.intent.action {
         // A veto/invalidate is a terminal setup-invalidation; a Close is the
-        // non-terminal per-trade exit. This is the exact pre-refactor split
+        // non-terminal per-position close (flatten one position, plan lives on).
+        // This is the exact pre-refactor split
         // (`guard_is_terminal` = action != Close within the guard set).
         Action::Veto | Action::Invalidate => RuleKind::SetupInvalidation,
-        Action::Close => RuleKind::PerTradeExit,
+        Action::Close => RuleKind::PerPositionClose,
         Action::Pause | Action::Resume | Action::NewsStart | Action::NewsEnd => RuleKind::Control,
         Action::Enter => RuleKind::Enter,
         // Prep / PrepExpire / other — not spine-classified by the old engine.
@@ -2255,18 +2256,18 @@ fn legacy_kind(rule: &ConditionRule) -> RuleKind {
 }
 
 /// A guard is the always-armed half of the machine (distinct from the prep spine
-/// and the entry): a setup-invalidation veto or the per-trade Close exit.
+/// and the entry): a setup-invalidation veto or the per-position reversal-close.
 fn is_guard(rule: &ConditionRule) -> bool {
     matches!(
         resolved_kind(rule),
-        RuleKind::SetupInvalidation | RuleKind::PerTradeExit
+        RuleKind::SetupInvalidation | RuleKind::PerPositionClose
     )
 }
 
 /// Whether firing this guard retires the whole plan. A **setup invalidation**
 /// (`too-high`/`too-low`, the M/W cancel/abort/overshoot vetos, `trade-expiry`)
-/// means the setup is dead → terminal. A **per-trade Close** (`06-close-on-
-/// reversal`) flattens an open position but the plan lives on (multi-shot
+/// means the setup is dead → terminal. A **per-position close** (`06-close-on-
+/// reversal`) closes an open position but the plan lives on (multi-shot
 /// re-entry). See the long note at the fire site and the
 /// `reversal_close_spine_retire_recurring` memory.
 fn guard_is_terminal(rule: &ConditionRule) -> bool {
@@ -2302,15 +2303,15 @@ fn is_retest(rule: &ConditionRule) -> bool {
 ///   phase. Arming them `AwaitEntry`-only silently dropped a pre-break
 ///   invalidation (BUG-replay-skips-pre-pause-bars, AUD/NZD H&S short
 ///   2026-07-07).
-/// - **Per-trade `Close` guards** (`PerTradeExit`, `06-close-on-reversal`) need a
-///   position to act on, so they stay armed from `AwaitEntry` onward. Before
-///   entry there is nothing to close.
+/// - **Per-position `Close` guards** (`PerPositionClose`, `06-close-on-reversal`)
+///   need a position to act on, so they stay armed from `AwaitEntry` onward.
+///   Before entry there is nothing to close.
 fn armed_in_rule(rule: &ConditionRule, phase: Phase) -> bool {
     if guard_is_terminal(rule) {
         // Setup invalidation — valid to fire in any phase, pre-break included.
         return true;
     }
-    // Per-trade Close guard — needs an entry to have happened.
+    // Per-position Close guard — needs an entry to have happened.
     matches!(phase, Phase::AwaitEntry)
 }
 
@@ -5949,7 +5950,7 @@ mod tests {
     fn guard_semantics_truth_table() {
         // (role rule_id, action, stamped kind, is_guard, is_terminal, armed pre-break).
         // Every current tv-arm guard: the invalidation/cancel vetos, the
-        // trade-expiry invalidate, and the one per-trade Close.
+        // trade-expiry invalidate, and the one per-position Close.
         let cases: &[(&str, Action, RuleKind, bool, bool, bool)] = &[
             // Setup invalidations — terminal, armed in every phase (incl. pre-break).
             (
@@ -6000,11 +6001,11 @@ mod tests {
                 true,
                 true,
             ),
-            // Per-trade exit — NON-terminal, needs a position (AwaitEntry only).
+            // Per-position close — NON-terminal, needs a position (AwaitEntry only).
             (
                 "06-close-on-reversal",
                 Action::Close,
-                RuleKind::PerTradeExit,
+                RuleKind::PerPositionClose,
                 true,
                 false,
                 false,
@@ -6057,7 +6058,7 @@ mod tests {
                     "{rule_id}/{label}: every guard is armed in AwaitEntry"
                 );
                 // A terminal setup-invalidation is armed in *every* phase, so its
-                // Done arming equals its pre-break arming (true); the per-trade
+                // Done arming equals its pre-break arming (true); the per-position
                 // Close guard is armed in neither (false). Either way, Done ==
                 // pre-break.
                 assert_eq!(
@@ -6078,7 +6079,7 @@ mod tests {
     /// the two paths genuinely diverge.)
     #[test]
     fn stamped_kind_overrides_legacy_derivation() {
-        // rule_id/Action say "per-trade Close" (legacy → PerTradeExit,
+        // rule_id/Action say "per-position Close" (legacy → PerPositionClose,
         // non-terminal), but the stamp says SetupInvalidation (terminal).
         let mut r = rule(
             "06-close-on-reversal",
@@ -6089,8 +6090,8 @@ mod tests {
             FireMode::Once,
             Action::Close,
         );
-        // Unspecified twin → legacy path → PerTradeExit (non-terminal, AwaitEntry-only).
-        assert_eq!(resolved_kind(&r), RuleKind::PerTradeExit);
+        // Unspecified twin → legacy path → PerPositionClose (non-terminal, AwaitEntry-only).
+        assert_eq!(resolved_kind(&r), RuleKind::PerPositionClose);
         assert!(!guard_is_terminal(&r));
         assert!(!armed_in_rule(&r, Phase::AwaitBreakAndClose));
 
@@ -6257,7 +6258,7 @@ mod tests {
         // A SHORT trade's `06-close-on-reversal` is a PinePattern{Long} close. A
         // bullish reversal candle whose close (1.18) sits inside the SR band must
         // FIRE the close (dispatched to flatten any open position) but must NOT
-        // retire the plan — a reversal-close is a per-trade exit, not a setup
+        // retire the plan — a reversal-close is a per-position close, not a setup
         // invalidation, so the multi-shot spine stays alive to re-enter.
         let p = plan(vec![close_on_reversal_rule(
             Direction::Long,
@@ -6362,7 +6363,7 @@ mod tests {
         // EUR/CHF 2026-07-06 (ihs-eur-chf-29ebb72b) provenance: a price-windowed
         // `06-close-on-reversal` fired on a reversal candle in the SR band and
         // archived the whole plan before the (multi-shot) trade could enter. A
-        // reversal-close is a per-trade exit, not a setup invalidation — it must
+        // reversal-close is a per-position close, not a setup invalidation — it must
         // dispatch (flatten any open position) but NEVER retire the spine, so the
         // pending / multi-shot enter keeps its window.
         let p = plan(vec![close_on_reversal_rule(

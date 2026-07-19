@@ -1,5 +1,40 @@
 # Changelog
 
+## v97 — 2026-07-19 — terminology: reversal-close is a per-POSITION CLOSE (not "exit")
+
+**Why.** Settling the vocabulary after v96. The reversal-close **closes an open
+position** — "close" is the right word (operator's call); "exit" was a false
+start. What genuinely needed disambiguating is the *other* direction: things
+named "veto"/"invalidate" that stop future entries but do **not** touch an open
+position, vs the rare `ClosePositions` veto that does both. Three concepts on
+two axes (touches the open position? / stops future entries?):
+
+- **CLOSE** — closes one position, leaves future entries open, trade lives.
+  Reversal-close (`Action::Close`, `06-/07-close-on-reversal`). Non-terminal.
+- **VETO / INVALIDATE** — stops all future entries (`Phase::Done`) but **leaves
+  an open position to run to its own SL/TP**. `too-high`/`too-low` caps + the
+  80%-to-TP `pcl-exhausted` abort, at `StopNextEntry`.
+- **CLOSE-VETO** — the rare both: `VetoLevel::ClosePositions`, true thesis-death.
+
+**What changed (naming only, no behaviour/wire change to basenames).**
+- Internal engine kind `RuleKind::PerTradeExit` → `RuleKind::PerPositionClose`
+  (`conventions/src/roles.rs`, `engine/src/evaluate.rs`). "Close" not "exit",
+  scoped per-*position* not per-*trade*. **Backward-compat:**
+  `#[serde(alias = "per_trade_exit")]` so a plan signed before the rename still
+  deserializes (new test `legacy_per_trade_exit_kind_still_parses`).
+- Alert basenames **unchanged** — `06-close-on-reversal` /
+  `07-close-on-sr-reversal` stay (they already say "close", which is correct).
+  The wire `Action::Close` stays (also = operator emergency-flatten).
+- CLAUDE.md glossary reframed around **CLOSE** (was "EXIT").
+- `tv-arm --veto-on-reversal` help text corrected: it was describing the
+  pre-v96 entry-blocking behaviour (now a dormant no-op) and named the wrong
+  basename; now says exit-only/dormant and points at the glossary.
+
+**Tests.** `close_guards_are_per_position_close` (renamed),
+`legacy_per_trade_exit_kind_still_parses` (new alias guard),
+`stamped_kind_overrides_legacy_derivation` (updated). 38 conventions + 867 core
++ 160 engine lib tests green; workspace builds; clippy clean.
+
 ## v96 — 2026-07-19 — reversal-close is EXIT-ONLY (veto-on-reversal → dormant no-op)
 
 **Why.** Two reasons, one change. (1) Operator's rule: a reversal candle
