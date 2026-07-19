@@ -27,6 +27,11 @@ pub struct WorkItem {
     /// The IANA tz id for this asset's schedule, or `None` for `none`/unknown.
     /// `None` ⇒ the asset has no spread hour and is skipped for profiling.
     pub spread_schedule_tz: Option<String>,
+    /// The asset's pip size (from instrument-lookup). Used to convert each
+    /// minute's dimensionless `spread_frac` into the pips magnitude the live
+    /// reject-gate baseline wants. `0.0` when unavailable ⇒ the profile emits
+    /// 0.0 pips and the gate falls back to its flat cutoff.
+    pub pip_size: f64,
 }
 
 /// Ordering rank for a class — lower runs first. FX/metals/24h-indices are what
@@ -74,6 +79,7 @@ pub fn work_items(assets: &[Asset], brokers: &[Broker], include_stocks: bool) ->
                 display_name: asset.display_name.clone(),
                 spread_schedule: asset.spread_schedule.clone(),
                 spread_schedule_tz: asset.spread_schedule_tz(),
+                pip_size: asset.pip_size,
             });
         }
     }

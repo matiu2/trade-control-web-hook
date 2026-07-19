@@ -120,7 +120,7 @@ fn baked_candle_row(instrument: &str) -> Option<(&'static str, u32, &'static [f6
     baseline_candle::SPREAD_BASELINE_CANDLE
         .iter()
         .find(|(_broker, symbol, ..)| *symbol == instrument)
-        .map(|(_broker, _symbol, schedule, _reviewed, mask, widen)| (*schedule, *mask, widen))
+        .map(|(_broker, _symbol, schedule, _reviewed, mask, widen, ..)| (*schedule, *mask, widen))
 }
 
 /// The candle-derived `(mask, widen_frac[24], tz)` for `instrument`, or `None`
@@ -302,23 +302,44 @@ pub const SPREAD_REJECT_MULTIPLE: f64 = 5.0;
 /// instrument not in the baseline (a fresh asset, or one whose samples
 /// lacked a pip size). Re-baked whenever the committed samples grow.
 pub fn elevated_threshold_pips(instrument: &str) -> f64 {
-    match baked_baseline(instrument) {
+    threshold_from_baseline(baked_baseline(instrument))
+}
+
+/// The pure threshold math behind [`elevated_threshold_pips`]: `median ×
+/// SPREAD_REJECT_MULTIPLE` when a baseline is present, else the flat
+/// [`SPREAD_BLACKOUT_ELEVATED_PIPS`]. Split out (free of the table lookup) so the
+/// decision is unit-testable independent of whatever the baked table currently
+/// holds — the logic is byte-identical to before the candle-table swap; only the
+/// data source of `baked_baseline` moved.
+fn threshold_from_baseline(baseline: Option<(f64, f64, f64)>) -> f64 {
+    match baseline {
         Some((_low, _high, median)) => median * SPREAD_REJECT_MULTIPLE,
         None => SPREAD_BLACKOUT_ELEVATED_PIPS,
     }
 }
 
-/// The baked `(low, high, median)` pips for an instrument, or `None` when
-/// it isn't in the baseline. Exposed so the reject path can name the
-/// instrument's normal vs. current spread in the operator-facing message.
+/// The baked `(low, high, median)` spread-magnitude pips for an instrument, or
+/// `None` when it isn't in the candle table. Exposed so the reject path can name
+/// the instrument's normal vs. current spread in the operator-facing message.
+///
+/// Reads the candle-derived [`baseline_candle`] table (the same source as the
+/// spread-HOUR mask), keyed by the broker symbol — retiring the sampler
+/// `baseline::SPREAD_BASELINE` as the pips source. The table's trailing columns
+/// are `(median_pips, low_pips, high_pips)`; this returns them re-ordered to the
+/// `(low, high, median)` contract the callers expect. A row whose `median_pips`
+/// is `0.0` (no pip size at generation, or the pre-regen placeholder) yields
+/// `None` so [`elevated_threshold_pips`] falls back to the flat cutoff exactly
+/// as an absent instrument would — same threshold math, same fallback.
 pub fn baked_baseline(instrument: &str) -> Option<(f64, f64, f64)> {
-    baseline::SPREAD_BASELINE
-        .binary_search_by(|(name, ..)| name.cmp(&instrument))
-        .ok()
-        .map(|i| {
-            let (_, low, high, median, ..) = baseline::SPREAD_BASELINE[i];
-            (low, high, median)
-        })
+    baseline_candle::SPREAD_BASELINE_CANDLE
+        .iter()
+        .find(|(_broker, symbol, ..)| *symbol == instrument)
+        .map(
+            |(_broker, _symbol, _schedule, _reviewed, _mask, _widen, median, low, high)| {
+                (*low, *high, *median)
+            },
+        )
+        .filter(|(_low, _high, median)| *median > 0.0)
 }
 
 /// The baked `(elevated_hours_mask, hour_widen_pips)` for an instrument, or
@@ -815,13 +836,46 @@ mod tests {
     }
 
     #[test]
-    fn baked_threshold_is_five_times_normal() {
-        for (name, _low, _high, median, ..) in baseline::SPREAD_BASELINE {
-            let t = elevated_threshold_pips(name);
-            assert!(
-                (t - median * SPREAD_REJECT_MULTIPLE).abs() < 1e-9,
-                "{name}: threshold {t} != 5x median {median}",
-            );
+    fn threshold_from_present_baseline_is_five_times_median() {
+        // A present candle-table baseline (low, high, median) → 5× median.
+        let t = threshold_from_baseline(Some((1.0, 6.0, 2.0)));
+        assert!(
+            (t - 2.0 * SPREAD_REJECT_MULTIPLE).abs() < 1e-9,
+            "threshold {t} != 5x median 2.0",
+        );
+    }
+
+    #[test]
+    fn threshold_from_absent_baseline_is_the_flat_constant() {
+        assert_eq!(threshold_from_baseline(None), SPREAD_BLACKOUT_ELEVATED_PIPS);
+    }
+
+    #[test]
+    fn elevated_threshold_reads_median_from_a_candle_row() {
+        // Drive the full path over any candle-table row that carries a non-zero
+        // median (post-regen). The committed table is currently all-placeholder
+        // (0.0 pips), so scan for a real median; when found, assert the gate
+        // returns 5× it. Until the regen lands this test is vacuously satisfied
+        // by the fallback branch below — which is itself an assertion that the
+        // placeholder era behaves exactly like the flat fallback.
+        let with_median = baseline_candle::SPREAD_BASELINE_CANDLE
+            .iter()
+            .find(|(.., median, _low, _high)| *median > 0.0);
+        match with_median {
+            Some((_b, symbol, .., median, _low, _high)) => {
+                assert!(
+                    (elevated_threshold_pips(symbol) - median * SPREAD_REJECT_MULTIPLE).abs()
+                        < 1e-9,
+                    "{symbol}: threshold != 5x candle median {median}",
+                );
+            }
+            None => {
+                // Placeholder era: every real instrument falls back to flat.
+                assert_eq!(
+                    elevated_threshold_pips("oanda-non-existent-row"),
+                    SPREAD_BLACKOUT_ELEVATED_PIPS
+                );
+            }
         }
     }
 

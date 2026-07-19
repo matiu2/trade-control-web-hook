@@ -131,6 +131,18 @@ pub struct SpreadProfile {
     pub review: ReviewStatus,
     /// Number of usable bars that contributed.
     pub n_bars: usize,
+    /// Whole-window spread MAGNITUDE baseline in **pips**: a low percentile
+    /// (p10) over every usable minute's `spread_pips`. Matches what the retired
+    /// sampler baked (`build.rs` low/high/median pips). `0.0` when no pip size
+    /// was available or the window was empty — the gate then falls back to its
+    /// flat elevated cutoff for this instrument.
+    pub baseline_low_pips: f64,
+    /// Whole-window spread magnitude baseline in pips: a high percentile (p90).
+    pub baseline_high_pips: f64,
+    /// Whole-window spread magnitude baseline in pips: the median (p50). This is
+    /// the reject-threshold source: the live gate rejects an entry whose live
+    /// spread exceeds `median × SPREAD_REJECT_MULTIPLE`.
+    pub baseline_median_pips: f64,
 }
 
 impl SpreadProfile {
@@ -147,6 +159,9 @@ impl SpreadProfile {
             hour_ratio: [0.0; 24],
             review: ReviewStatus::InsufficientData,
             n_bars,
+            baseline_low_pips: 0.0,
+            baseline_high_pips: 0.0,
+            baseline_median_pips: 0.0,
         }
     }
 
@@ -227,7 +242,10 @@ pub fn profile_for_instrument(bars: &[Bar]) -> SpreadProfile {
         hour_ratio[h] = Some(p90 / vol);
     }
 
-    apply_gates(hour_ratio, hour_p90, vol, n)
+    // The H1 close-based path is a legacy/report path and does not derive the
+    // pips baseline (only the minute path threads pip_size); pass 0.0 so the
+    // gate falls back to its flat cutoff for any instrument profiled this way.
+    apply_gates(hour_ratio, hour_p90, vol, n, 0.0, 0.0, 0.0)
 }
 
 /// One minute bar reduced to what the minute-aware computation needs: the
@@ -289,8 +307,15 @@ pub const MIN_HOUR_MINUTES: usize = 20;
 /// each UTC hour) — the SAME scale as the H1 path, so the med3/peak-frac
 /// thresholds are unchanged and comparable.
 ///
+/// `pip_size` converts each minute's dimensionless `spread_frac` into the pips
+/// magnitude the live reject-gate wants: `spread_pips = spread_frac × mid_close
+/// / pip_size`. The whole-window p10/p50/p90 of that series become the profile's
+/// `baseline_low/median/high_pips`. A `pip_size <= 0` (unavailable) yields 0.0
+/// pips baselines, and the gate falls back to its flat cutoff for the
+/// instrument.
+///
 /// Bars must be in timestamp order. Same empty-profile guards as the H1 path.
-pub fn profile_from_minutes(bars: &[MinuteBar]) -> SpreadProfile {
+pub fn profile_from_minutes(bars: &[MinuteBar], pip_size: f64) -> SpreadProfile {
     let n = bars.len();
     // Minute bars are ~60× denser; require the equivalent of MIN_INSTRUMENT_BARS
     // *hours* of coverage so a thin sample still can't compute a mask.
@@ -345,8 +370,44 @@ pub fn profile_from_minutes(bars: &[MinuteBar]) -> SpreadProfile {
         hour_p90[h] = percentile(&by_hour[h], WIDEN_PERCENTILE);
     }
 
+    // Whole-window spread MAGNITUDE baseline in pips (p10/p50/p90 over every
+    // usable minute's spread_pips). Only meaningful with a real pip size; a
+    // non-positive pip_size leaves the baselines at 0.0 (gate falls back to flat).
+    let (low_pips, median_pips, high_pips) = baseline_pips(bars, pip_size);
+
     let flag_ratio: [Option<f64>; 24] = std::array::from_fn(|h| hour_flag[h].map(|m| m / vol));
-    apply_gates(flag_ratio, hour_p90, vol, n)
+    apply_gates(
+        flag_ratio,
+        hour_p90,
+        vol,
+        n,
+        low_pips,
+        median_pips,
+        high_pips,
+    )
+}
+
+/// The whole-window spread magnitude baseline in pips as `(low, median, high)` =
+/// `(p10, p50, p90)` over every minute's `spread_pips = spread_frac × mid_close
+/// / pip_size`. Returns `(0.0, 0.0, 0.0)` when `pip_size <= 0` (no conversion
+/// possible) so the gate falls back to its flat cutoff for the instrument.
+fn baseline_pips(bars: &[MinuteBar], pip_size: f64) -> (f64, f64, f64) {
+    if !(pip_size.is_finite() && pip_size > 0.0) {
+        return (0.0, 0.0, 0.0);
+    }
+    let pips: Vec<f64> = bars
+        .iter()
+        .map(|b| b.spread_frac * b.mid_close / pip_size)
+        .filter(|p| p.is_finite())
+        .collect();
+    if pips.is_empty() {
+        return (0.0, 0.0, 0.0);
+    }
+    (
+        percentile(&pips, 0.10),
+        percentile(&pips, 0.50),
+        percentile(&pips, 0.90),
+    )
 }
 
 /// Shared med3 + peak-fraction gate over per-hour flag ratios and widen p90s.
@@ -355,11 +416,15 @@ pub fn profile_from_minutes(bars: &[MinuteBar]) -> SpreadProfile {
 ///
 /// `flag_ratio[h]` = the hour's flag statistic ÷ vol (`None` = under-sampled).
 /// `hour_p90[h]` = the hour's p90 spread-frac (the baked widen when elevated).
+#[allow(clippy::too_many_arguments)]
 fn apply_gates(
     flag_ratio: [Option<f64>; 24],
     hour_p90: [f64; 24],
     vol: f64,
     n_bars: usize,
+    baseline_low_pips: f64,
+    baseline_median_pips: f64,
+    baseline_high_pips: f64,
 ) -> SpreadProfile {
     let ratios: Vec<f64> = flag_ratio.iter().filter_map(|r| *r).collect();
     if ratios.len() < 12 {
@@ -395,6 +460,9 @@ fn apply_gates(
         hour_ratio: ratio_flat,
         review: ReviewStatus::Reviewed,
         n_bars,
+        baseline_low_pips,
+        baseline_high_pips,
+        baseline_median_pips,
     }
 }
 
@@ -618,7 +686,7 @@ mod tests {
             (21, _) => Some(0.0010),       // full-hour spike
             _ => None,
         });
-        let p = profile_from_minutes(&bars);
+        let p = profile_from_minutes(&bars, 0.0);
         assert_eq!(
             p.elevated_vec(),
             vec![21],
@@ -630,7 +698,7 @@ mod tests {
     #[test]
     fn minute_full_hour_spike_flags_and_widen_is_p90_sized() {
         let bars = minute_days(5, 0.0001, |h, _m| (h == 21).then_some(0.0010));
-        let p = profile_from_minutes(&bars);
+        let p = profile_from_minutes(&bars, 0.0);
         assert_eq!(p.elevated_vec(), vec![21]);
         // Widen for hour 21 is its p90 minute spread-frac ≈ the spike size.
         assert!(
@@ -644,7 +712,7 @@ mod tests {
     #[test]
     fn minute_flat_flags_nothing() {
         let bars = minute_days(5, 0.0001, |_h, _m| None);
-        let p = profile_from_minutes(&bars);
+        let p = profile_from_minutes(&bars, 0.0);
         assert_eq!(p.elevated_vec(), Vec::<u8>::new());
     }
 
@@ -654,7 +722,7 @@ mod tests {
         let bars = minute_days(1, 0.0001, |_h, _m| None);
         // Truncate to a single hour's worth.
         let bars = &bars[..60];
-        let p = profile_from_minutes(bars);
+        let p = profile_from_minutes(bars, 0.0);
         assert_eq!(p.review, ReviewStatus::InsufficientData);
         assert_eq!(p.elevated_hours, 0);
     }
@@ -671,7 +739,7 @@ mod tests {
             (20, 53..=59) => Some(0.0015), // 7-min bleed
             _ => None,
         });
-        let p = profile_from_minutes(&bars);
+        let p = profile_from_minutes(&bars, 0.0);
         assert_eq!(
             p.elevated_vec(),
             vec![21],
@@ -700,7 +768,7 @@ mod tests {
                 }
             }
         }
-        let p = profile_from_minutes(&bars);
+        let p = profile_from_minutes(&bars, 0.0);
         assert_eq!(
             p.elevated_vec(),
             vec![17],
@@ -715,12 +783,41 @@ mod tests {
         // A spike that fills HALF the hour (30 min) still moves the median over
         // 3× — it's a real (if shorter) spread hour, not a boundary artifact.
         let bars = minute_days(5, 0.0001, |h, m| ((h == 21) && m >= 30).then_some(0.0012));
-        let p = profile_from_minutes(&bars);
+        let p = profile_from_minutes(&bars, 0.0);
         // Median of hour 21 = midpoint of 30 calm + 30 spike ≈ boundary; with a
         // 12× spike the median sits at the spike side → flags.
         assert!(
             p.elevated_vec().contains(&21),
             "a half-hour-plus spike should still flag (median crosses 3×)"
         );
+    }
+
+    #[test]
+    fn baseline_median_pips_from_known_spread_and_pip_size() {
+        // Every minute has the SAME spread fraction, mid ~1.0, pip_size 0.0001,
+        // so spread_pips = frac * mid / pip_size is constant → the whole-window
+        // median equals that value. frac 0.0002, mid ≈ 1.0 → 0.0002/0.0001 = 2p.
+        let bars = minute_days(5, 0.0002, |_h, _m| None);
+        let p = profile_from_minutes(&bars, 0.0001);
+        // mid wobbles ±0.0002 around 1.0, so pips ≈ 2.0 with tiny spread.
+        assert!(
+            (p.baseline_median_pips - 2.0).abs() < 0.01,
+            "median pips ≈ 2.0, got {}",
+            p.baseline_median_pips
+        );
+        // low <= median <= high, all populated.
+        assert!(p.baseline_low_pips <= p.baseline_median_pips);
+        assert!(p.baseline_median_pips <= p.baseline_high_pips);
+    }
+
+    #[test]
+    fn baseline_pips_zero_when_pip_size_unavailable() {
+        // pip_size 0.0 (unknown) → all three pips baselines are 0.0 so the gate
+        // falls back to its flat cutoff for this instrument.
+        let bars = minute_days(5, 0.0002, |_h, _m| None);
+        let p = profile_from_minutes(&bars, 0.0);
+        assert_eq!(p.baseline_low_pips, 0.0);
+        assert_eq!(p.baseline_median_pips, 0.0);
+        assert_eq!(p.baseline_high_pips, 0.0);
     }
 }
