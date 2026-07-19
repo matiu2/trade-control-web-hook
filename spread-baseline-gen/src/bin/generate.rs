@@ -235,7 +235,10 @@ async fn profile_one(
     if bars.is_empty() {
         return Ok(None);
     }
-    let profile = profile_from_minutes(&bars);
+    // Convert the dimensionless minute spreads to a pips magnitude baseline with
+    // the asset's pip size (0.0 when instrument-lookup has none → 0.0 pips, gate
+    // falls back to its flat cutoff for this instrument).
+    let profile = profile_from_minutes(&bars, item.pip_size);
     Ok(Some(BaselineRow {
         broker: item.broker,
         symbol: item.symbol.clone(),

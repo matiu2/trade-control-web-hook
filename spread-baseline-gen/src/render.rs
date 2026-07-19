@@ -5,12 +5,16 @@
 //! eventual gate-swap (a later stage) is a data-source change, not a schema
 //! change. Row tuple:
 //!
-//! `(broker, symbol, elevated_hours_mask, hour_widen_frac[24])`
+//! `(broker, symbol, schedule, reviewed, elevated_hours_mask, hour_widen_frac[24],
+//!   baseline_median_pips, baseline_low_pips, baseline_high_pips)`
 //!
 //! sorted by `(broker, symbol)` so the gate can binary-search. The widen is a
 //! **spread fraction** (`spread/mid`), not pips — a scale-free unit that works
-//! for FX, metals, and indices alike. (The current sampler table bakes pips;
-//! the gate-swap stage translates the System-2 widen consumer to fractions.)
+//! for FX, metals, and indices alike. The three trailing `*_pips` columns are
+//! the whole-window spread MAGNITUDE baseline in pips (median/low/high), the
+//! reject-threshold source the live gate reads (`median × SPREAD_REJECT_MULTIPLE`);
+//! `median` is placed first as the primary field. They are appended at the END
+//! so existing column positions stay stable.
 
 use crate::BaselineRow;
 
@@ -48,7 +52,8 @@ pub fn render_table(rows: &[BaselineRow]) -> String {
     s.push_str("// Candle-derived, per-broker spread-hour masks (med3 + peak-frac).\n");
     s.push_str(
         "// (broker, symbol, schedule, reviewed, elevated_hours_mask, \
-         hour_widen_frac[24]), sorted by (broker, symbol).\n",
+         hour_widen_frac[24],\n// baseline_median_pips, baseline_low_pips, \
+         baseline_high_pips), sorted by (broker, symbol).\n",
     );
     s.push_str(
         "// `schedule` is the spread-schedule FK name whose LOCAL wall-clock \
@@ -63,7 +68,8 @@ pub fn render_table(rows: &[BaselineRow]) -> String {
     );
     s.push_str("#[allow(clippy::type_complexity)]\n");
     s.push_str(
-        "pub static SPREAD_BASELINE_CANDLE: &[(&str, &str, &str, bool, u32, [f64; 24])] = &[\n",
+        "pub static SPREAD_BASELINE_CANDLE: &[(&str, &str, &str, bool, u32, [f64; 24], \
+         f64, f64, f64)] = &[\n",
     );
     for r in &sorted {
         let sym = escape(&r.symbol);
@@ -76,8 +82,12 @@ pub fn render_table(rows: &[BaselineRow]) -> String {
             .map(|f| format!("{f:?}"))
             .collect::<Vec<_>>()
             .join(", ");
+        let median_pips = r.profile.baseline_median_pips;
+        let low_pips = r.profile.baseline_low_pips;
+        let high_pips = r.profile.baseline_high_pips;
         s.push_str(&format!(
-            "    (\"{}\", \"{sym}\", \"{sched}\", {reviewed}, {}, [{widen}]),\n",
+            "    (\"{}\", \"{sym}\", \"{sched}\", {reviewed}, {}, [{widen}], \
+             {median_pips:?}, {low_pips:?}, {high_pips:?}),\n",
             r.broker.as_str(),
             r.profile.elevated_hours,
         ));
@@ -129,6 +139,30 @@ mod tests {
             out.contains("\"EUR_USD\", \"ny\", true,"),
             "schedule + reviewed columns render"
         );
+    }
+
+    #[test]
+    fn renders_baseline_pips_columns_at_the_end() {
+        let mut profile = SpreadProfile::empty(1000);
+        profile.review = ReviewStatus::Reviewed;
+        profile.baseline_median_pips = 2.5;
+        profile.baseline_low_pips = 1.0;
+        profile.baseline_high_pips = 6.0;
+        let rows = vec![BaselineRow {
+            broker: Broker::Oanda,
+            symbol: "EUR_USD".to_string(),
+            display_name: "EUR_USD".to_string(),
+            spread_schedule: "ny".to_string(),
+            profile,
+        }];
+        let out = render_table(&rows);
+        // The three pips columns render (median, low, high) after the widen array.
+        assert!(
+            out.contains("], 2.5, 1.0, 6.0),"),
+            "median/low/high pips must trail the widen array, got:\n{out}"
+        );
+        // The type signature grew three f64 columns.
+        assert!(out.contains("[f64; 24], f64, f64, f64)"));
     }
 
     #[test]
