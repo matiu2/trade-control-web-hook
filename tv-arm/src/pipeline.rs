@@ -34,7 +34,7 @@ use trade_control_core::sig::KEY_LEN;
 
 use crate::args::Args;
 use crate::args::PositionEntry;
-use crate::geometry::{horizontal_price, pcl_exhausted_price_from_fib, tp_price_from_fib};
+use crate::geometry::{horizontal_price, pcl_exhausted_price};
 use crate::instrument_resolution::ResolvedInstrument;
 use crate::mw_geometry;
 use crate::news_marker::{NewsMarker, news_marker_lines};
@@ -590,13 +590,15 @@ impl From<color_eyre::eyre::Error> for ResolveError {
 }
 
 /// H&S / IH&S path: validate the constellation of drawings, read
-/// direction from the **fib** (its ordered head→neckline anchors — the
-/// 0-reading is the head), TP from the fib, expiry from the vertical
-/// line, and build the spec. The `too-low`/`too-high` invalidation
-/// horizontal is validated to sit **inside the fib's range** (a line
-/// outside it is a stale leftover from a different trade) but no longer
-/// determines direction — that was the source of a wrong-direction bug
-/// when a stale invalidation from another setup got picked.
+/// direction from the **fib** (its head↔neckline, where the head is the
+/// `0`-reading resolved via TradingView's `reverse` flag — *not* raw point
+/// order), TP from the fib, expiry from the vertical line, and build the
+/// spec. The `too-low`/`too-high` invalidation horizontal is validated to
+/// sit **inside the fib's range** (a line outside it is a stale leftover
+/// from a different trade) but no longer determines direction — that was
+/// the source of a wrong-direction bug when a stale invalidation from
+/// another setup got picked. Reading direction off raw point order was a
+/// *second* wrong-direction bug (AUD/CAD 2026-07: head at `points[1]`).
 fn resolve_hs_trade(
     args: &Args,
     roles: &Roles,
@@ -618,27 +620,31 @@ fn resolve_hs_trade(
         .tp_fib
         .as_ref()
         .ok_or_else(|| eyre!("missing tp_fib (already checked by check_required)"))?;
-    let fib_prices = tp_fib.prices();
-    // Rule 1: the FIB gives us the trade direction. The operator draws the
-    // fib spanning head→neckline (0-reading at the head), so the ordered
-    // anchors say short (head above neckline) or long (head below). We no
-    // longer read direction off the `too-high`/`too-low` invalidation label,
-    // which could be a stale line from a *different* trade and silently flip
-    // the direction (the bug this fixes).
-    let direction = crate::geometry::direction_from_fib(&fib_prices).ok_or_else(|| {
-        eyre!(
-            "cannot read trade direction from the fib — its two anchors are equal or missing \
-             (draw the fib head→neckline, clicking the head first)"
-        )
+    // Rule 1: the FIB gives us the trade direction. Resolve which end is the
+    // head (the fib's `0`-reading) via TradingView's `reverse` flag — NOT the
+    // raw point order, which is unreliable (AUD/CAD 2026-07 had its head at
+    // `points[1]`, so point-order armed a long instead of the correct short).
+    // Head above neckline → short (H&S); below → long (iH&S). We no longer read
+    // direction off the `too-high`/`too-low` invalidation label either, which
+    // could be a stale line from a *different* trade and silently flip it.
+    let (head, neckline) = tp_fib.fib_head_neckline().ok_or_else(|| {
+        eyre!("cannot read the fib's two anchors (need two finite prices to set direction)")
     })?;
+    let direction =
+        crate::geometry::direction_from_head_neckline(head, neckline).ok_or_else(|| {
+            eyre!(
+                "cannot read trade direction from the fib — its head and neckline are equal \
+                 (draw the fib spanning head→neckline)"
+            )
+        })?;
     // Rule 2: the invalidation (`too-low`/`too-high`) horizontal must sit
     // inside the fib's head↔neckline range. A line outside that band belongs
     // to a different, larger pattern — reject it rather than bake a poison
     // level / mismatched setup.
     if let Some(inv) = roles.invalidation.as_ref() {
         let inv_price = horizontal_price(&inv.prices());
-        if !crate::geometry::price_within_fib_range(inv_price, &fib_prices) {
-            let (lo, hi) = crate::geometry::fib_range(&fib_prices).unwrap_or((f64::NAN, f64::NAN));
+        if !crate::geometry::price_within_fib_range(inv_price, head, neckline) {
+            let (lo, hi) = (head.min(neckline), head.max(neckline));
             return Err(ResolveError::Reject(format!(
                 "invalidation line at {inv_price} is outside the fib range [{lo}, {hi}] — it \
                  looks like a stale `too-high`/`too-low` from a different trade; redraw or \
@@ -646,7 +652,7 @@ fn resolve_hs_trade(
             )));
         }
     }
-    let tp = tp_price_from_fib(&fib_prices, direction);
+    let tp = crate::geometry::tp_price(head, neckline);
     // Continuous at-entry level vetos (Bug #12): the pcl-exhausted (`too-low`)
     // and invalidation (`too-high`) levels, baked onto the enter so the worker
     // rejects an entry already past either — independent of the cross-guard.
@@ -1303,9 +1309,14 @@ fn hs_entry_level_vetos(
     use trade_control_core::intent::{EntryLevelVeto, VetoSide};
     let mut out = Vec::new();
 
-    // pcl-exhausted (the "ran most of the way to TP" gate).
+    // pcl-exhausted (the "ran most of the way to TP" gate). Resolve head/
+    // neckline via the fib's `reverse` flag (not point order) so the level
+    // lands on the correct side even when the operator drew it neckline-first.
     if let Some(fib) = roles.tp_fib.as_ref() {
-        let level = pcl_exhausted_price_from_fib(&fib.prices(), direction);
+        let level = fib
+            .fib_head_neckline()
+            .map(|(head, neckline)| pcl_exhausted_price(head, neckline))
+            .unwrap_or(f64::NAN);
         if level.is_finite() {
             let (name, past) = match direction {
                 Direction::Short => ("too-low", VetoSide::Below),
@@ -2532,14 +2543,41 @@ mod tests {
         Args::try_parse_from(argv).expect("parse mw args")
     }
 
-    /// A two-point drawing (fib or trend line): `[head/near, neckline/far]`
-    /// in draw order, so `points[0]` is the fib's 0-reading (head).
+    /// A two-point drawing (e.g. a neckline trend line): two anchors in draw
+    /// order. For a *fib* use [`fib`] instead — the head↔neckline mapping is
+    /// `reverse`-dependent, not raw order.
     fn two_point(id: &str, label: &str, a: f64, b: f64) -> Drawing {
         Drawing {
             id: id.to_string(),
             points: vec![Point { time: 10, price: a }, Point { time: 20, price: b }],
             properties: Properties {
                 text: (!label.is_empty()).then(|| label.to_string()),
+                ..Default::default()
+            },
+        }
+    }
+
+    /// A fib retracement whose `(head, neckline)` resolve as given, built to
+    /// match real TradingView readback: with `reverse: false` the `0`-reading
+    /// (head) sits at `points[1]` and the `1`-level (neckline) at `points[0]`.
+    /// This deliberately mirrors the AUD/CAD 2026-07 shape where the head is
+    /// `points[1]` — the exact case that broke the point-order rule.
+    fn fib(id: &str, head: f64, neckline: f64) -> Drawing {
+        Drawing {
+            id: id.to_string(),
+            // points[0] = neckline (1-level), points[1] = head (0-level).
+            points: vec![
+                Point {
+                    time: 20,
+                    price: neckline,
+                },
+                Point {
+                    time: 10,
+                    price: head,
+                },
+            ],
+            properties: Properties {
+                reverse: Some(false),
                 ..Default::default()
             },
         }
@@ -2577,7 +2615,7 @@ mod tests {
         // first) sits ABOVE neckline 1.10 → this is a SHORT (H&S), regardless
         // of the invalidation *label*. The invalidation sits inside the fib
         // range so it passes rule 2.
-        let fib = two_point("fib", "", 1.20, 1.10);
+        let fib = fib("fib", 1.20, 1.10);
         let inv = hline("inv", "too-high", 1.18);
         let roles = hs_roles(fib, inv);
         let args = mw_args(&[]);
@@ -2599,7 +2637,7 @@ mod tests {
     fn hs_inverse_direction_comes_from_fib() {
         // Mirror: head 1.00 BELOW neckline 1.10 → LONG (iH&S). too-low floor
         // at 1.05 sits inside the fib range.
-        let fib = two_point("fib", "", 1.00, 1.10);
+        let fib = fib("fib", 1.00, 1.10);
         let inv = hline("inv", "too-low", 1.05);
         let roles = hs_roles(fib, inv);
         let args = mw_args(&[]);
@@ -2621,7 +2659,7 @@ mod tests {
         // The bug: a `too-low` left over from a DIFFERENT trade at 0.95 sits
         // well outside this setup's fib range [1.10, 1.20]. Rule 2 rejects it
         // rather than baking a poison level / mismatched setup.
-        let fib = two_point("fib", "", 1.20, 1.10);
+        let fib = fib("fib", 1.20, 1.10);
         let inv = hline("inv", "too-low", 0.95);
         let roles = hs_roles(fib, inv);
         let args = mw_args(&[]);
@@ -2644,7 +2682,7 @@ mod tests {
     #[test]
     fn hs_flat_fib_has_no_direction_and_errors() {
         // A degenerate flat fib (both anchors equal) carries no direction.
-        let fib = two_point("fib", "", 1.10, 1.10);
+        let fib = fib("fib", 1.10, 1.10);
         let inv = hline("inv", "too-high", 1.10);
         let roles = hs_roles(fib, inv);
         let args = mw_args(&[]);
@@ -3046,8 +3084,8 @@ mod tests {
         //   too-high = invalidation,  side Above  (entry above the shoulder)
         use trade_control_core::intent::VetoSide;
         let mut roles = Roles {
-            // fib: head → neckline (2 prices).
-            tp_fib: Some(path_n("fib", &[1.1000, 1.0900])),
+            // fib: head 1.1000 above neckline 1.0900 (short).
+            tp_fib: Some(fib("fib", 1.1000, 1.0900)),
             // invalidation horizontal (1 price).
             invalidation: Some(path_n("inv", &[1.1050])),
             ..Default::default()
@@ -3076,7 +3114,7 @@ mod tests {
         // too-low/Below.
         use trade_control_core::intent::VetoSide;
         let roles = Roles {
-            tp_fib: Some(path_n("fib", &[1.0900, 1.1000])), // head below neckline (long)
+            tp_fib: Some(fib("fib", 1.0900, 1.1000)), // head 1.0900 below neckline 1.1000 (long)
             invalidation: Some(path_n("inv", &[1.0850])),
             ..Default::default()
         };

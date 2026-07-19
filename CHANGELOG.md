@@ -1,5 +1,44 @@
 # Changelog
 
+## v102 — 2026-07-20 — H&S fib direction reads the `reverse` flag, not point order
+
+**Why.** v99 moved H&S trade direction onto the fib (good — it fixed the
+stale-invalidation flip), but read it from the fib's raw anchor *order*
+(`points[0]` = head). That order is **not** reliable: on AUD/CAD 1H
+(`--start 2026-07-08T14:00+10`, `w59aSo`) the operator's fib came back with
+`points[0] = 0.98367` (the **neckline**) and `points[1] = 0.98861` (the
+**head**), `reverse: false`. TradingView's level math puts the `0`-reading at
+`points[1]` here — the chart labels `0 (0.98861)` — so the point-order rule
+armed a **long** where the setup was a textbook **short**.
+
+**What changed (behaviour: tv-arm arm-time only).**
+- **`Drawing::fib_head_neckline()`** (new, `trading-view`) resolves `(head,
+  neckline)` from the two anchors **and the `reverse` flag**: with `reverse ==
+  false` the `0`-level (head) is `points[1]`, the `1`-level (neckline)
+  `points[0]`; `reverse == true` swaps them. Verified against TradingView's own
+  level formula (`price(c) = base + c·(other − base)`) and the on-chart labels.
+- **`Properties.reverse: Option<bool>`** added to the drawing parse.
+- **Geometry helpers now take an explicit `(head, neckline)`** instead of a
+  price slice + `Direction`: `tp_price`, `pcl_exhausted_price`,
+  `direction_from_head_neckline`, `price_within_fib_range`. The old min/max-by-
+  direction `anchors()` helper and the `*_from_fib(prices, direction)` fns are
+  gone. Callers (`resolve_hs_trade`, `hs_entry_level_vetos`,
+  `invalidation_or_pcl_trigger`) resolve the pair once via `fib_head_neckline()`.
+
+**Breaking.** None on the wire. Internal geometry fn signatures changed
+(tv-arm-private).
+
+**Tests.** `trading-view`: `fib_head_neckline_*` (incl. the real AUD/CAD
+`points[1]`-is-head case, `reverse:true` swap, missing-`reverse` default).
+`tv-arm`: geometry helpers retargeted to `(head, neckline)`; the pipeline
+resolver + entry-level-veto fixtures rebuilt with a `fib(head, neckline)` helper
+that mirrors real readback (head at `points[1]`, `reverse:false`). **Verified
+end-to-end** against the live chart: the failing command now arms `direction=
+short`, `TP=0.97873`, `too-high=0.98589 (Above)`, `too-low=0.98021 (Below)`.
+
+**Follow-up.** `Direction::from_invalidation_label` remains dead (retained for
+wire/status compatibility, as in v99).
+
 ## v101 — 2026-07-20 — replay sub-bar zoom for ambiguous SL/TP bars (PR-2)
 
 **Why.** When a single coarse candle's range straddles BOTH the stop-loss and the

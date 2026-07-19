@@ -952,6 +952,7 @@ mod tests {
                 stop_level: Some(stop_level),
                 profit_level: Some(profit_level),
                 qty: Some(0.01),
+                ..Default::default()
             },
         }
     }
@@ -1962,6 +1963,7 @@ mod tests {
                 stop_level: Some(50.0),
                 profit_level: None,
                 qty: None,
+                ..Default::default()
             },
         };
         let (stubs, mcp) = fixture(vec![(stub("h", "short_position"), half)]);

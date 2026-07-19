@@ -29,7 +29,7 @@ use trade_control_core::trade_plan::{
     BarEvent, ConditionRule, CrossDir, FireMode, LinePoint, TradePlan, Trigger,
 };
 
-use crate::geometry::pcl_exhausted_price_from_fib;
+use crate::geometry::pcl_exhausted_price;
 use crate::mw_geometry::{abort_level, cancel_level, highest_shoulder, overshoot_level};
 use crate::roles::Roles;
 use trading_view::drawings::Drawing;
@@ -360,8 +360,10 @@ fn invalidation_or_pcl_trigger(
         // **wick-through** (`Intrabar`, `Either`): any straddle aborts — if the
         // move ran ~80% to TP without us, a wick alone is reason enough.
         let fib = roles.tp_fib.as_ref()?;
+        // Resolve head/neckline via the fib's `reverse` flag (not point order).
+        let (head, neckline) = fib.fib_head_neckline()?;
         Some(Trigger::PriceValueCross {
-            level: pcl_exhausted_price_from_fib(&fib.prices(), direction),
+            level: pcl_exhausted_price(head, neckline),
             dir: CrossDir::Either,
             bar: BarEvent::Intrabar,
         })
