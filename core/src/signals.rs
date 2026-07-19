@@ -92,6 +92,41 @@ pub fn detector_lookback_bars(cfg: &DetectorConfig, granularity: Granularity) ->
     min_lookback_bars(cfg).max(atr_length_for(granularity) + 2)
 }
 
+/// The inclusive lower bound for the "first confirmed signal" scan
+/// ([`first_confirmed_signal_at`]'s `not_before`), given the detector window and
+/// the as-of bar index — the single source of truth shared by the live worker
+/// and the offline replay so the scan can never drift by caller (bug ①).
+///
+/// `explicit` is the setup floor the engine already has (the later of the
+/// break-and-close time and the `tv-arm --start` replay cursor); when present it
+/// always wins. When it is `None`, the scan must NOT fall through to "consider
+/// the whole window" — the window depth **legitimately varies by caller** (a
+/// trendline-anchored plan fetches back to an old neckline on *both* live and
+/// replay; a `--warmup-bars` replay is always deep). An unbounded `None` scan
+/// then latches an ancient warmup-era confirmed signal in a deep window but a
+/// recent one in a shallow window — the exact replay≠live split. So the fallback
+/// floor is derived from the SHARED [`detector_lookback_bars`] depth behind the
+/// as-of bar: the recent setup window, independent of how far back the *fetch*
+/// reached. `saturating_sub` floors to bar 0 for an early as-of (short window ⇒
+/// whole window in scope, no panic).
+pub fn confirmed_scan_floor(
+    window: &[chrono::DateTime<chrono::Utc>],
+    as_of: usize,
+    cfg: &DetectorConfig,
+    granularity: Granularity,
+    explicit: Option<chrono::DateTime<chrono::Utc>>,
+) -> Option<chrono::DateTime<chrono::Utc>> {
+    if explicit.is_some() {
+        return explicit;
+    }
+    if window.is_empty() {
+        return None;
+    }
+    let as_of = as_of.min(window.len() - 1);
+    let back = detector_lookback_bars(cfg, granularity);
+    Some(window[as_of.saturating_sub(back)])
+}
+
 #[cfg(test)]
 mod lookback_tests {
     use super::*;
@@ -121,6 +156,70 @@ mod lookback_tests {
         let bars = detector_lookback_bars(&cfg, Granularity::M15);
         assert!(bars >= atr_length_for(Granularity::M15));
         assert!(bars > min_lookback_bars(&cfg));
+    }
+
+    /// bug ①: with no explicit floor, a DEEP window must scope the scan to the
+    /// recent `detector_lookback_bars`, NOT to the whole (ancient) tail — so live
+    /// and replay pick the same signal regardless of fetch depth.
+    #[test]
+    fn confirmed_scan_floor_scopes_a_deep_window_to_the_recent_lookback() {
+        use chrono::{TimeZone, Utc};
+        let g = Granularity::H1;
+        let cfg = DetectorConfig::pine_defaults(g);
+        // 200-bar deep window (a --warmup-bars replay), hourly.
+        let window: Vec<_> = (0..200)
+            .map(|i| Utc.timestamp_opt(i * 3600, 0).unwrap())
+            .collect();
+        let as_of = 199;
+        let floor = confirmed_scan_floor(&window, as_of, &cfg, g, None)
+            .expect("a non-empty window yields a floor");
+        // The floor is exactly detector_lookback_bars behind the as-of bar — not
+        // bar 0. An ancient signal earlier than that cannot claim the winner slot.
+        let back = detector_lookback_bars(&cfg, g);
+        assert_eq!(floor, window[as_of - back]);
+        assert!(floor > window[0], "must not be the ancient window start");
+    }
+
+    /// An explicit floor (break-and-close / replay_start) always wins over the
+    /// derived fallback.
+    #[test]
+    fn confirmed_scan_floor_prefers_an_explicit_floor() {
+        use chrono::{TimeZone, Utc};
+        let g = Granularity::H1;
+        let cfg = DetectorConfig::pine_defaults(g);
+        let window: Vec<_> = (0..50)
+            .map(|i| Utc.timestamp_opt(i * 3600, 0).unwrap())
+            .collect();
+        let explicit = Utc.timestamp_opt(40 * 3600, 0).unwrap();
+        assert_eq!(
+            confirmed_scan_floor(&window, 49, &cfg, g, Some(explicit)),
+            Some(explicit)
+        );
+    }
+
+    /// A window shallower than `detector_lookback_bars` (an early as-of) floors to
+    /// bar 0 — the whole (short) window is in scope, no panic.
+    #[test]
+    fn confirmed_scan_floor_saturates_to_bar_zero_on_a_short_window() {
+        use chrono::{TimeZone, Utc};
+        let g = Granularity::H1;
+        let cfg = DetectorConfig::pine_defaults(g);
+        let window: Vec<_> = (0..5)
+            .map(|i| Utc.timestamp_opt(i * 3600, 0).unwrap())
+            .collect();
+        // as_of 4, lookback ~26 > window len → saturating_sub floors to bar 0.
+        assert_eq!(
+            confirmed_scan_floor(&window, 4, &cfg, g, None),
+            Some(window[0])
+        );
+    }
+
+    /// An empty window yields no floor (defensive; the engine won't scan it).
+    #[test]
+    fn confirmed_scan_floor_empty_window_is_none() {
+        let g = Granularity::H1;
+        let cfg = DetectorConfig::pine_defaults(g);
+        assert_eq!(confirmed_scan_floor(&[], 0, &cfg, g, None), None);
     }
 
     /// The shared depth is never *shorter* than the pattern lookback on any
