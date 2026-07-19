@@ -16,35 +16,81 @@ anything spread-hour related._
   **DST-invariant** — FX + gold sit at **local hour 17 (5pm New York)** all year,
   and the gate resolves that to 21:00 UTC in summer / 22:00 UTC in winter
   automatically. No seasonal re-bake.
-- **The generator already IS the "pull hourly, then zoom in" workflow** the user
-  prefers: it pulls **M1** (minute) candles, buckets each minute's spread by its
-  schedule-local hour, and flags an hour on its p75 minute-ratio. There is no
-  competing "H1 cron sampler" generating masks — the old sampler is retired.
-- **The cron that IS running** (`blackout_apply_loop` in
-  `worker/src/scheduler.rs`) does **live protection** using the baked mask
-  (widen open stops, cancel resting orders, block new entries during the spread
-  hour). It does **not** generate or decide masks. Stopping it would remove the
-  live spread-hour protection — see "Can we stop the cron?" below.
+- **The hour-mask generator already IS the "pull hourly, then zoom in" workflow**
+  you prefer: it pulls **M1** (minute) candles, buckets each minute's spread by
+  its schedule-local hour, and flags an hour on its p75 minute-ratio. On-demand,
+  not scheduled.
+- **The `spread-sampler-cron` OS crontab is RETIRED (2026-07-19).** It fed only
+  the per-instrument spread-*magnitude* reject threshold now (the hour timing
+  moved to the zoom-in generator), and it had been broken since 2026-07-15 by
+  the `instrument-lookup 0.4.0` bump. Its 4 crontab lines are commented out; the
+  baked `spread_baseline.rs` snapshot stays so the reject threshold keeps
+  working. See §0 below.
+- **The loop that IS running** (`blackout_apply_loop` in
+  `worker/src/scheduler.rs`, an internal tokio task — NOT an OS cron) does
+  **live protection** using the baked mask (widen open stops, cancel resting
+  orders, block new entries during the spread hour). It does **not** generate or
+  decide masks. Stopping it would remove the live spread-hour protection — see
+  "Can we stop the loop?" below.
 
 ## Which "cron" is which — the disambiguation that matters
 
-There are two things people call "the spread-hour cron". They are completely
-different, and only one is a candidate for stopping.
+There are THREE things people call "the spread cron". They are different; only
+some are candidates for stopping.
 
-### 1. Mask GENERATION — already on-demand, no cron
+### 0. The spread-SAMPLER OS crontab — RETIRED 2026-07-19
 
-The mask is produced by `spread-baseline-gen` (in the
+`spread-sampler-cron` (a separate repo, `~/projects/trading-libraries/spread-sampler-cron`)
+was a **real OS `crontab -e` job** (hourly all day + every 10 min across the
+06:30–08:30 Brisbane spread hour). Each tick read TradeNation's live bid/ask
+**spread magnitude** per instrument, appended a sweep to `samples/*.yaml`, and
+git-committed+pushed. `core/build.rs` reads those samples at **compile time** and
+bakes `spread_baseline.rs` (via `OUT_DIR`).
+
+What it fed (and still feeds, from the frozen snapshot):
+- **`baked_baseline` → `elevated_threshold_pips`** — the per-instrument
+  spread-MAGNITUDE reject threshold ("is the live spread abnormally wide right
+  now", System 1). **This is the ONLY thing still tied to the sampler.**
+- The sampler *also* baked a per-hour spread-HOUR *timing* mask
+  (`baked_spread_hours`), but that role is **superseded** by the candle-derived
+  DST-aware mask (§1 below); only the magnitude threshold remains.
+
+**Retired because:** (a) the spread-hour timing already moved to the on-demand
+zoom-in generator (§1), so the sampler was down to one job; (b) the
+`instrument-lookup 0.4.0` bump (spread-schedule feature) silently **broke** the
+sampler's hourly rebuild on 2026-07-15 — it pins `instrument-lookup ^0.3.0`, the
+path-dep now resolves to 0.4.0, so `cargo build` fails and the cron errored every
+hour for days (samples frozen at `2026-07-15T00:01Z`). Rather than unbreak a tool
+we're retiring, the 4 crontab lines were commented out (with a dated note;
+`crontab -e`). The **baked `spread_baseline.rs` stays** (Jul-15 snapshot, 1187
+rows), so `elevated_threshold_pips` keeps working from the last-good data — a
+frozen threshold table is fine (spreads' *normal* magnitude drifts slowly).
+
+**Follow-up (not yet done):** migrate `elevated_threshold_pips` onto the candle
+generator's per-instrument spread data (it already computes per-hour p90
+`spread/mid` fractions), then delete `spread-sampler-cron` and the
+`core/build.rs` sample-baking entirely → ONE spread pipeline. Until then, the
+threshold table is a static snapshot; re-bake it by hand only if a new
+instrument needs a calibrated reject threshold (run the sampler once manually
+after bumping its `instrument-lookup` dep to 0.4).
+
+### 1. Mask GENERATION (spread-HOUR timing) — already on-demand, no cron
+
+The DST-aware hour mask is produced by `spread-baseline-gen` (in the
 `trade-control-spread-mask` worktree / crate). You run it by hand, it writes
 `spread_baseline_candle.rs`, you commit + rebuild. **This is the "pull hourly,
-zoom in" method** the user wants — it already is the workflow, and it is *not*
-scheduled. See "The canonical mask-refresh workflow" below.
+zoom in" method** — it already is the workflow, and it is *not* scheduled. See
+"The canonical mask-refresh workflow" below.
 
-There is no runtime job that samples spreads and rewrites the mask. (An older
-"sampler" approach that recorded live spreads into KV and over-flagged whole
-overnight blocks — the "12pm Brisbane rubbish" bug — was **retired** in favour
-of the candle-derived table.)
+There is no runtime job that samples spreads and rewrites the hour mask. (An
+even older "sampler-into-KV" approach that over-flagged whole overnight blocks —
+the "12pm Brisbane rubbish" bug — was retired in favour of the candle-derived
+table; and the OS-crontab spread-sampler in §0 above is now retired too.)
 
-### 2. Mask APPLICATION — the live protection cron (`blackout_apply_loop`)
+### 2. Mask APPLICATION — the live protection loop (`blackout_apply_loop`)
+
+(This is an internal tokio loop inside each `trade-control-worker-*` service, NOT
+an OS crontab entry — `crontab -l` / systemd timers won't show it.)
 
 `worker/src/scheduler.rs::blackout_apply_loop` wakes every `upkeep_interval`
 (~900s) and, using the **already-baked** mask:
@@ -148,11 +194,14 @@ the user described — the generator does the zoom for you.
   FX/gold (its session boundary is hours earlier); it governs only European
   index rows.
 
-## Can we stop the cron?
+## Can we stop the loop / cron?
 
-**The mask-generation "cron" — there is nothing to stop.** Masks are already
+**The spread-SAMPLER OS crontab — already stopped (retired 2026-07-19, §0).**
+The frozen `spread_baseline.rs` keeps `elevated_threshold_pips` alive.
+
+**The hour-mask-generation "cron" — there was never one to stop.** Masks are
 refreshed on demand by the zoom-in generator above. If the mental model was "a
-job keeps regenerating the mask on a schedule," that job does not exist.
+job keeps regenerating the hour mask on a schedule," that job does not exist.
 
 **The live-protection cron (`blackout_apply_loop`) — stopping it is a real
 trade-off, not a cleanup.** It is what actually protects live positions during
@@ -183,6 +232,12 @@ tightly. But the current cost is already ~nil when idle.
 - `core/src/spread_baseline_candle.rs` — the **baked mask table** (6-tuple:
   `broker, symbol, schedule, reviewed, mask_local, widen[24]`). `@generated`.
 - `core/src/ny_clock.rs` — hand-rolled 5pm-NY DST fallback (`is_ny_close_edge`).
+- `core/build.rs` — compile-time bake of `spread_baseline.rs` (the reject-
+  threshold table) from `spread-sampler-cron/samples/`. Fail-soft: missing
+  samples → empty table → flat fallback.
+- `spread-sampler-cron/` (separate repo) — the RETIRED OS-crontab spread-
+  magnitude sampler; `scripts/sample.sh` + `samples/*.yaml`. Crontab lines
+  commented out 2026-07-19. Pins `instrument-lookup ^0.3.0` (broken vs 0.4.0).
 - `worker/src/scheduler.rs` — `blackout_apply_loop` (live application cron),
   `sweep_loop`, the market-hours refresh.
 - `trade-control-cron/src/blackout_apply.rs` — System 1/2 application;
