@@ -22,7 +22,7 @@ use trade_control_core::broker::{
 use trade_control_core::incoming::Verified;
 use trade_control_core::intent::{Direction, Intent, Resolved, ResolvedEntry, RiskBudget, Shell};
 use trade_control_core::spread_blackout::{elevated_threshold_pips, is_spread_hour};
-use trade_control_engine::{BidAskCandle as EngineCandle, SimOutcome, simulate_fill_resolved};
+use trade_control_engine::{BidAskCandle as EngineCandle, SimOutcome, simulate_fill_resolved_zoom};
 
 use super::report::{CloseFire, FillKind};
 
@@ -210,6 +210,27 @@ struct ArmedPlacement {
     shell: Shell,
 }
 
+/// A pre-fetched **finer-granularity** bid/ask series the fill sim zooms into
+/// when a coarse exit bar straddles both SL and TP (PR-2 sub-bar zoom). The
+/// replay driver pulls this once (e.g. M1 under an H1 plan) over the same span
+/// and hands it in; the broker filters it to the ambiguous bar's window through
+/// its [`trade_control_engine::SubBars`] impl. Empty ⇒ no zoom (every fill/exit
+/// question degrades to the pessimistic-stop assumption, unchanged from PR-1).
+struct FinerSeries {
+    /// Ascending finer bid/ask candles spanning the same window as `candles`.
+    candles: Vec<EngineCandle>,
+}
+
+impl trade_control_engine::SubBars for FinerSeries {
+    fn sub_bars(&self, start: DateTime<Utc>, end: DateTime<Utc>) -> Vec<EngineCandle> {
+        self.candles
+            .iter()
+            .filter(|c| c.time >= start && c.time < end)
+            .cloned()
+            .collect()
+    }
+}
+
 /// Offline broker that resolves prior-attempt state from the candle window.
 pub struct ReplayBroker {
     /// The full pulled bid/ask candle window (warm-up + live), ascending. Each
@@ -225,6 +246,11 @@ pub struct ReplayBroker {
     /// The placement the loop armed for the next `run_enter` (its intent, shell,
     /// and the order id `place_entry` should return). Consumed by `place_entry`.
     armed: RefCell<Option<ArmedPlacement>>,
+    /// The pre-fetched finer series for sub-bar zoom (PR-2), or [`NoZoom`] when
+    /// the driver didn't supply one. Every fill/exit path passes this to
+    /// `simulate_fill_resolved_zoom`, so an ambiguous SL/TP bar is disambiguated
+    /// by finer candles when available and pessimistic-stopped otherwise.
+    finer: Option<FinerSeries>,
 }
 
 impl ReplayBroker {
@@ -236,6 +262,29 @@ impl ReplayBroker {
             as_of: RefCell::new(last),
             placed: RefCell::new(Vec::new()),
             armed: RefCell::new(None),
+            finer: None,
+        }
+    }
+
+    /// Attach a pre-fetched finer-granularity bid/ask series for the sub-bar zoom
+    /// (PR-2). The driver pulls this once over the same span as the coarse window
+    /// and calls this before the replay loop; from then on an exit bar that
+    /// straddles both SL and TP is disambiguated by the finer candles instead of
+    /// pessimistically assuming the stop. Empty / not called ⇒ pessimistic stop,
+    /// exactly as PR-1.
+    pub fn with_sub_bars(mut self, finer: Vec<EngineCandle>) -> Self {
+        self.finer = Some(FinerSeries { candles: finer });
+        self
+    }
+
+    /// The [`SubBars`](trade_control_engine::SubBars) provider the sim consults on
+    /// an ambiguous bar: the attached finer series, or [`NoZoom`] when none was
+    /// supplied. Borrowing the field as a trait object keeps every fill/exit call
+    /// site uniform (`simulate_fill_resolved_zoom(.., self.zoom())`).
+    fn zoom(&self) -> &dyn trade_control_engine::SubBars {
+        match &self.finer {
+            Some(f) => f,
+            None => &trade_control_engine::NoZoom,
         }
     }
 
@@ -477,7 +526,14 @@ impl ReplayBroker {
         let window_end = geo.forward.last().map(|c| c.time).unwrap_or(shell.time);
         let fire_at = shell.time;
 
-        let raw = simulate_fill_resolved(&resolved, intent, shell, pip_size, &geo.forward);
+        let raw = simulate_fill_resolved_zoom(
+            &resolved,
+            intent,
+            shell,
+            pip_size,
+            &geo.forward,
+            self.zoom(),
+        );
         let (fill_at, until, entry_price, exit_price, kind) =
             match apply_reversal_close(&raw, closes) {
                 Some(rc) => (
@@ -645,12 +701,13 @@ impl ReplayBroker {
             // Unresolvable intent → no order went on; the slot is free.
             return AttemptState::Cancelled;
         };
-        match simulate_fill_resolved(
+        match simulate_fill_resolved_zoom(
             &resolved,
             &attempt.intent,
             &attempt.shell,
             self.pip_size,
             &forward,
+            self.zoom(),
         ) {
             SimOutcome::StoppedOut { .. } => {
                 AttemptState::ClosedLossOrBreakeven { realized_pl: -1.0 }

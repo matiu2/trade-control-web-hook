@@ -1,5 +1,62 @@
 # Changelog
 
+## v101 — 2026-07-20 — replay sub-bar zoom for ambiguous SL/TP bars (PR-2)
+
+**Why.** When a single coarse candle's range straddles BOTH the stop-loss and the
+take-profit, the offline fill sim can't tell which was hit first, so it
+pessimistically assumed the **stop** (`(true, _) => StoppedOut`). That biases the
+replay's realized R downward on any trade whose exit bar happens to sweep both
+levels — a TP that a real broker would have paid can be scored as a loss. This is
+the last documented v1 optimism/pessimism the sim carried (the PR-1 note's
+"pessimistic-stop until then").
+
+**What changed (replay tooling only — no worker/wire behaviour change).** On an
+ambiguous exit bar, the sim now **zooms in**: it replays a pre-fetched
+finer-granularity bid/ask series for that bar's window and lets whichever level a
+sub-bar touches first decide the outcome. The pessimistic stop remains the *floor*
+— for a caller with no finer data, and where even the finest grain we hold is
+itself ambiguous.
+
+- **engine** (`simulator.rs`): new `SubBars` trait (a finer-candle provider) +
+  `NoZoom` (no-op). `simulate_fill_resolved` now delegates to a new
+  `simulate_fill_resolved_zoom(.., &dyn SubBars)`; the exit loop's `(true, true)`
+  arm calls `zoom_ambiguous_bar`, which replays the parent bar's sub-candles (in
+  `[c.time, c.time + inferred_bar_len)`) and returns the first level touched, else
+  the pessimistic stop. The exit is stamped at the **parent** bar's open-time
+  (the sub-bars pick the level, not a finer timestamp). Break-even / System-2
+  widen stay parent-bar-grained (both latch off a bar's CLOSE, so they can only
+  move the stop on the NEXT parent bar). `simulate_fill_resolved` is unchanged for
+  callers — it's `_zoom` with `NoZoom`.
+- **ReplayBroker**: gains an optional finer series (`with_sub_bars`) it exposes as
+  a `SubBars` impl; `resolve` + `realize` now call `simulate_fill_resolved_zoom`
+  with it, so both the retry-gate state and the P&L ledger disambiguate identically
+  (they already share the stored placed bracket from PR-1). No provider ⇒ `NoZoom`.
+- **driver** (`replay_candles.rs`): pulls a finer bid/ask series over the same span
+  via the existing `candles::pull`, chosen by `granularity::finer` (M5/M15/H1 → M1,
+  H4 → M15, D1 → H1, M1 → none). Fail-soft: no finer grain, an unserved grain, or a
+  pull error all leave it empty → pessimistic stop, unchanged. `replay::run` gains a
+  `finer_candles: &[EngineCandle]` param, threaded to the broker.
+
+**Behaviour preservation.** `NoZoom` is byte-identical to the pre-zoom path, so all
+`engine` unit tests, the fixture re-sim (`all_fixtures_match_expected`), and the
+report test helper — none of which supply a finer series — are unchanged. The zoom
+only ever *reduces* ambiguity; it never flips an unambiguous bar.
+
+**Config.** No new plan/wire fields. The finer granularity is derived, not
+operator-set.
+
+**Tests.** engine: `ambiguous_bar_without_zoom_is_pessimistic_stop`,
+`zoom_picks_take_profit_when_a_sub_bar_hits_tp_first`,
+`zoom_picks_stop_when_a_sub_bar_hits_sl_first`,
+`zoom_falls_back_to_stop_when_a_sub_bar_is_itself_ambiguous`,
+`zoom_falls_back_to_stop_when_no_sub_bars_cover_the_window`; granularity:
+`finer_maps_each_granularity_to_a_practical_sub_grain`.
+
+**Follow-up.** The finest grain we pull still has ambiguous bars (a 1-min bar can
+span both levels); zoom reduces but can't eliminate the tie, so the pessimistic
+stop is still the documented floor. A future refinement could recurse to an even
+finer feed, but M1 is where the data (and the pull cost) bottoms out for now.
+
 ## v100 — 2026-07-20 — replay sim broker holds placed order levels (PR-1, dissolves divergence #4)
 
 **Why.** The offline `ReplayBroker` answered two questions about the same order —

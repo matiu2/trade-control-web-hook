@@ -51,6 +51,33 @@ pub fn parse(raw: &str) -> Result<ReplayGranularity> {
     Ok(ReplayGranularity { cm, engine })
 }
 
+/// The **finer** granularity the sub-bar zoom (PR-2) pulls to disambiguate an
+/// exit bar that straddles both SL and TP. `None` when the plan is already at the
+/// finest bar we pull (`M1`) — nothing finer to zoom into. Otherwise a coarser
+/// plan maps to a granularity that gives a useful number of sub-bars WITHOUT an
+/// enormous pull, and that every broker feed can actually serve:
+///
+/// - `M5`/`M15`/`H1` → `M1` (5/15/60 sub-bars; M1 is universally served).
+/// - `H4` → `M15` (16 sub-bars; M1 over 4h × a long window is far too many bars,
+///   and TradeNation serves 15m natively but not M5 via the raw endpoint).
+/// - `D1` → `H1` (24 sub-bars; M1 over a day is 1440 bars/bar — impractical —
+///   and H1 is universally served).
+///
+/// The zoom is fail-soft: if the finer pull errors or returns nothing, the broker
+/// simply has no finer series and the sim keeps the pessimistic stop, so a broker
+/// that can't serve the chosen finer granularity degrades cleanly.
+pub fn finer(g: EngineGranularity) -> Option<ReplayGranularity> {
+    let raw = match g {
+        EngineGranularity::M1 => return None,
+        EngineGranularity::M5 | EngineGranularity::M15 | EngineGranularity::H1 => "1m",
+        EngineGranularity::H4 => "15m",
+        EngineGranularity::D1 => "1h",
+    };
+    // `parse` only fails on an unsupported string; every arm above is supported,
+    // so this never errors — but map to `None` rather than unwrap to stay total.
+    parse(raw).ok()
+}
+
 /// Map an engine `Granularity` (e.g. from a loaded `plan.granularity`) to its
 /// friendly string, for the mismatch error message.
 pub fn engine_label(g: EngineGranularity) -> &'static str {
@@ -87,5 +114,26 @@ mod tests {
     fn engine_label_round_trips() {
         let g = parse("1h").unwrap();
         assert_eq!(engine_label(g.engine()), "1h");
+    }
+
+    #[test]
+    fn finer_maps_each_granularity_to_a_practical_sub_grain() {
+        assert_eq!(finer(EngineGranularity::M1), None); // already finest
+        assert_eq!(
+            finer(EngineGranularity::M5).map(|g| g.engine()),
+            Some(EngineGranularity::M1)
+        );
+        assert_eq!(
+            finer(EngineGranularity::H1).map(|g| g.engine()),
+            Some(EngineGranularity::M1)
+        );
+        assert_eq!(
+            finer(EngineGranularity::H4).map(|g| g.engine()),
+            Some(EngineGranularity::M15)
+        );
+        assert_eq!(
+            finer(EngineGranularity::D1).map(|g| g.engine()),
+            Some(EngineGranularity::H1)
+        );
     }
 }
