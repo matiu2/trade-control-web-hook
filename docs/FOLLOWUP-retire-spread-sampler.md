@@ -1,17 +1,30 @@
 # Follow-up: fully retire spread-sampler-cron
 
-**Status:** OS crontab STOPPED 2026-07-19 (4 lines commented out). This is the
-plan to delete the tool entirely. Not urgent — the frozen snapshot works.
+**Status:** OS crontab STOPPED 2026-07-19. **Code consumption DELETED 2026-07-19
+(v91, commit 78bd280).** `spread-sampler-cron` no longer feeds anything — the
+only remaining step is deleting the repo itself (optional cleanup).
 
-## Current state
+## Current state (post-v91)
 
-`spread-sampler-cron` is retired at the schedule level but not deleted. Its only
-remaining consumer is `elevated_threshold_pips` (System 1's per-instrument
-spread-MAGNITUDE reject threshold), which reads `baked_baseline` from
-`core/src/…/spread_baseline.rs`, baked at compile time by `core/build.rs` from
-`../../spread-sampler-cron/samples/*.yaml`. That table is now a **static
-snapshot** frozen at `2026-07-15T00:01Z` (1187 rows). Spreads' *normal*
-magnitude drifts slowly, so a static snapshot is acceptable indefinitely.
+`elevated_threshold_pips` (System 1's per-instrument spread-MAGNITUDE reject
+threshold) now reads `baked_baseline` from the **candle table**
+(`SPREAD_BASELINE_CANDLE`, columns `baseline_(median,low,high)_pips`), produced
+by the on-demand zoom-in generator `spread-baseline-gen`. Gate math unchanged
+(`median × SPREAD_REJECT_MULTIPLE`, flat fallback). Real pips regenerated
+(OANDA+TN, 160 rows) — e.g. TN EUR/USD 0.5p, OANDA gold 64p.
+
+**Deleted in v91:** `core/build.rs` (the sampler YAML bake), the
+`mod baseline { include!(OUT_DIR/spread_baseline.rs) }`, `baked_spread_hours`,
+the dead `spread_hour_widen_pips`, and the `[build-dependencies]`. Net −201
+lines. There is now **ONE spread pipeline** (the candle generator).
+
+`spread-sampler-cron` (the sibling repo) and its commented-out crontab lines are
+now fully DEAD — nothing reads their output. They can be deleted at leisure; left
+in place only as historical reference.
+
+## ~~Migration~~ — DONE in v91
+
+(The plan below is complete. Retained for history.)
 
 ## Why it was stopped, not just fixed
 
