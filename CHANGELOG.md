@@ -42,6 +42,40 @@ persisting) is nicer UX but needs broker resolution plumbed into the
 already-bricked plans won't self-heal (their `watermark: None` rows persist);
 after deploy, purge + re-arm on a native TF, or leave them now-erroring-loudly.
 
+## v93 — 2026-07-19 — replay honours the position/risk caps (replay≠live fix)
+
+**Why.** `ReplayBroker::place_entry` underscore-ignored `max_risk_pct` and
+`max_open_positions` and always accepted the order at full size — so the offline
+replay took an entry the **live** broker would reject-at-cap. A "3.3" divergence
+(same shared `run_enter`, but the swapped broker didn't enforce what the real one
+does), making replay rosier than live whenever an account is at its position cap
+or an intent requests risk over the cap.
+
+**What changed.** `place_entry` now enforces the two caps the replay can
+reproduce faithfully offline, each mirroring `broker_oanda::place_entry` exactly:
+- **Percent risk-cap** — `RiskBudget::Percent(pct) && pct > max_risk_pct` →
+  `RiskCapExceeded`. A pure comparison, no equity needed (identical to the real
+  broker's cheap pre-equity check). `Amount`/`Units` need live equity to derive a
+  percent, which the offline replay doesn't have, so they stay unchecked —
+  conservative (replay only ever rejects where it can be certain; never rejects a
+  trade live would take).
+- **Open-positions cap** — count attempts that `resolve` to `OpenPosition` as-of
+  the fire bar (the same ledger `list_open_positions` reports) and reject at
+  `>= max_open_positions` → `OpenPositionsCapExceeded`. In a single-plan replay
+  this is that instrument's open count — the best offline proxy for the real
+  account-wide count, and conservative (can only reject, never over-fill).
+
+The caps flow through unchanged: `run_enter` already passes the resolved
+`max_risk_pct` / `max_open_positions` into `place_entry`; the replay's
+`DispatchConfig` already sets them (1.0% / 3). A cap rejection surfaces as
+`ActionResult::Failed(outcome)` → the report renders a skip-with-reason (not a
+fill), matching the live worker.
+
+**Tests.** `place_entry_{rejects_a_percent_over_the_risk_cap,
+within_the_risk_cap_is_accepted, rejects_at_the_open_positions_cap,
+under_the_open_positions_cap_is_accepted}` in `replay_broker`. cli suite
+267 + 98 + 22 pass; clippy + fmt clean.
+
 ## v91 — 2026-07-15 — deprecate cross_buffer_pct in favour of cross_buffer_atr
 
 **Why.** The percent-of-price cross buffer (`cross_buffer_pct`) is
