@@ -8,11 +8,10 @@
 //! fill.
 
 use chrono::{DateTime, Duration, Utc};
-use trade_control_core::broker::Broker;
 use trade_control_core::dispatch::{self, ActionResult};
 use trade_control_core::dispatch_config::DispatchConfig;
 use trade_control_core::incoming::Verified;
-use trade_control_core::intent::{Action, Intent as TcIntent, Shell};
+use trade_control_core::intent::{Action, Shell};
 use trade_control_core::pause_gate;
 use trade_control_core::state::{MemStateStore, StateStore};
 use trade_control_engine::BidAskCandle as EngineCandle;
@@ -68,14 +67,13 @@ pub struct Fire {
     /// standalone simulated fill. The faithful model: a new entry cancels any
     /// resting sibling/prior order on the same setup.
     pub superseded: bool,
-    /// The MEAN bid-ask spread over the trailing `spread_window` bars at the
-    /// fire bar, fetched through the SAME `Broker::get_bidask_candles` provider
-    /// (on the `ReplayBroker`) that `run_enter`'s gate used to place the stop.
-    /// The report's displayed bracket + simulated exit + System-2 baseline all
-    /// floor off THIS, so they match the gate's placed stop instead of the
-    /// single fire-bar spread. `None` when unavailable (falls back to the fire
-    /// bar's own close spread — the pre-window behaviour).
-    pub entry_spread_price: Option<f64>,
+    /// The concrete bracket the broker placed this enter's order at — the stored
+    /// floored stop/TP/entry, read back from the `ReplayBroker` after placement.
+    /// The report's DISPLAY lines (placed-line SL, break-even arming, System-2
+    /// widen) annotate THIS, so they show the same floored stop the ledger scored
+    /// — no re-derivation off a trailing spread. `None` for a non-enter, a
+    /// rejected/superseded enter, or an unresolved intent.
+    pub placed_bracket: Option<trade_control_core::intent::Resolved>,
     /// The broker-ledger realized outcome for this enter (PR 4b-2): the fill /
     /// exit / floored bracket the `ReplayBroker`'s position ledger computed for
     /// the placed order, so the report reads it instead of re-simulating the fill
@@ -515,24 +513,16 @@ pub async fn run(
 
             // The fill simulator walks candles at/after the firing bar.
             let forward = candles[i..].to_vec();
-            // Capture the entry-spread window through the SAME provider the gate
-            // used (`ReplayBroker::get_bidask_candles`, bounded at the fire bar),
-            // so the report's bracket/exit floor off the identical statistic the
-            // gate placed the stop with. Only meaningful for an enter.
-            let entry_spread_price = if fired.intent.action == Action::Enter {
-                entry_spread_for(&replay_broker, &fired.intent, granularity, now).await
-            } else {
-                None
-            };
-            // Attach the position-ledger geometry to the placed order so the
-            // broker owns its fill/exit outcome (PR 4b-2). The dispatch's
-            // `place_entry` already recorded a geometry-less attempt under this
-            // order id; `record_order` upgrades it in place with the forward path
-            // + entry-spread the report used to walk. The report then reads
-            // `broker.realized_outcome(order_id, closes)` instead of re-simulating.
-            // The shell must be the SAME one the dispatch armed — rebuild it the
-            // identical way (signal-folded for an H&S Pine fire, plain otherwise).
-            if let EnterGateOutcome::Placed {
+            // Attach the forward-path geometry to the placed order so the broker
+            // owns its fill/exit outcome (PR 4b-2). The dispatch's `place_entry`
+            // already recorded the attempt under this order id — WITH the concrete
+            // placed levels it captured from the `EntryRequest` — so `record_order`
+            // just upgrades it in place with the forward path. The report then
+            // reads `broker.realized_outcome(order_id, closes)`, which walks the
+            // stored placed stop (no trailing-spread re-derivation). The shell must
+            // be the SAME one the dispatch armed — rebuild it the identical way
+            // (signal-folded for an H&S Pine fire, plain otherwise).
+            let placed_bracket = if let EnterGateOutcome::Placed {
                 order_id: Some(order_id),
             } = &gate_outcome
             {
@@ -545,15 +535,19 @@ pub async fn run(
                     fired.intent.clone(),
                     shell,
                     forward.clone(),
-                    entry_spread_price,
                 );
-            }
+                // Read back the concrete placed bracket so the report's display
+                // lines annotate the same floored stop the broker rests on.
+                replay_broker.placed_bracket(order_id)
+            } else {
+                None
+            };
             fires.push(Fire {
                 fired,
                 forward,
                 gate_outcome,
                 superseded: false,
-                entry_spread_price,
+                placed_bracket,
                 realized: None,
             });
         }
@@ -716,31 +710,6 @@ fn not_taken_reason(
     // retest … or requires confirmation …" — the two enters are alternatives,
     // not a single enter needing both. Single-enter plans collapse to one leg.
     enter_preconditions_reason(plan, state, bar)
-}
-
-/// The mean bid-ask spread over the trailing `spread_window` bars at the fire
-/// bar, read through the SAME `Broker::get_bidask_candles` provider the gate
-/// used — so the report's displayed/simulated floor matches the gate's placed
-/// stop. Mirrors the gate's count-back window (`window + 2` bars of slack) and
-/// reduces with the shared `trailing_spread_mean`. `None` when unavailable (the
-/// report then falls back to the fire bar's own close spread).
-async fn entry_spread_for(
-    broker: &ReplayBroker,
-    intent: &TcIntent,
-    granularity: Granularity,
-    now: DateTime<Utc>,
-) -> Option<f64> {
-    let window = intent
-        .spread_window
-        .unwrap_or(trade_control_core::intent::DEFAULT_SPREAD_WINDOW)
-        .max(1);
-    let lookback_bars = (window as i64) + 2;
-    let since = now - Duration::seconds(granularity.seconds() * lookback_bars);
-    let candles = broker
-        .get_bidask_candles(&intent.instrument, granularity, since, now)
-        .await
-        .ok()?;
-    trade_control_core::broker::trailing_spread_mean(&candles, window).map(|(mean, _)| mean)
 }
 
 /// The pip size every resolution in the replay uses — the plan's baked value.
@@ -953,7 +922,7 @@ async fn inject_control_ticks(
                 forward: forward.to_vec(),
                 gate_outcome: EnterGateOutcome::NotAnEnter,
                 superseded: false,
-                entry_spread_price: None,
+                placed_bracket: None,
                 // A control tick (pause/resume/news) is not an enter — no order,
                 // no ledger outcome.
                 realized: None,

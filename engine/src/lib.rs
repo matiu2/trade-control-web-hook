@@ -65,7 +65,8 @@ pub use evaluate::{
 mod simulator;
 pub use simulator::{
     EntryFloor, SimOutcome, SpreadWiden, apply_entry_spread_floor, breakeven_armed_at,
-    direction_of, simulate_fill, simulate_fill_windowed, sweep_reason, widened_stop_at,
+    breakeven_armed_at_resolved, direction_of, simulate_fill, simulate_fill_resolved,
+    simulate_fill_windowed, sweep_reason, widened_stop_at, widened_stop_at_resolved,
 };
 pub use trade_control_core::sweep_gate::SweepReason;
 
