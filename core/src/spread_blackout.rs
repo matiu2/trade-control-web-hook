@@ -545,6 +545,20 @@ pub const SPREAD_BLACKOUT_RECOVERED_PIPS: f64 = 4.0;
 /// The cron crate re-exports both.
 pub const SAFETY_FORCE_RESTORE_SECONDS: u64 = 12 * 60 * 60;
 
+/// The coarse legacy NY-close-edge **window marker** TTL (~3h). This is the
+/// global "the NY-close spread window is open" flag the entry gate reads
+/// (`dispatch::enter`'s spread-blackout gate), NOT a per-trade cancel-record — so
+/// it is deliberately decoupled from both split backstop concerns (the per-record
+/// block-length [`spread_block_ttl_seconds`] and the safety
+/// [`SAFETY_FORCE_RESTORE_SECONDS`] ceiling). Kept at its historical 3h so the
+/// legacy `is_ny_close_edge` entry-gating behaviour is unchanged.
+///
+/// Lives in `core` (same rationale as [`SAFETY_FORCE_RESTORE_SECONDS`]) so the
+/// offline replay opens the window marker with the IDENTICAL TTL the live cron's
+/// `apply_if_ny_close_edge` uses, without the replay depending on
+/// `trade-control-cron`. The cron crate re-exports it.
+pub const NY_CLOSE_WINDOW_MARKER_TTL_SECONDS: u64 = 3 * 60 * 60;
+
 /// Grace tail added to a block's own length when sizing a cancel-record's TTL,
 /// so the record comfortably outlives the block-lift restore (which fires the
 /// tick the block ends). One extra hour: enough slack for the OFF-side pass to

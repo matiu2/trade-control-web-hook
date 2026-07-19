@@ -1,5 +1,60 @@
 # Changelog
 
+## v98 — 2026-07-20 — replay↔live gate parity: seed the two blackout gates offline
+
+**Why.** The last two residual replay↔live divergences (#2 + #3 in the parity
+audit). `run_enter`'s **market-hours** and **spread-blackout** reject gates were
+inert offline: the replay never seeded the state-store windows they read, so
+both failed open and the decision was re-derived by weaker proxies in the
+simulator (`spread_blackout_reject`, `sweep_reason`'s market-blackout branch).
+Net effect: LIVE = *entry rejected, order never placed*; REPLAY = *placed then
+swept/annotated* — a divergence that mis-scores multi-shot slot accounting and
+cancel-and-replace correlation (both depend on "was an order actually placed?").
+
+**What changed (behaviour: replay only; + one latent LIVE fix).**
+- **Seed both gates offline** so `run_enter`'s OWN gates fire, using the SAME
+  primitives the worker uses (no replay-only re-derivation):
+  - *Market-hours*: the driver resolves the windows (already, via the shared TN
+    `market_info` + `windows_from_session`) and now seeds them into the store
+    *before* the tick loop (`set_blackout_windows`), so `get_blackout_windows`
+    rejects offline exactly as live.
+  - *Spread-blackout*: the driver opens the window marker per NY-close-edge bar
+    with the SAME `is_ny_close_edge` gate + shared 3h TTL the live cron's
+    `apply_if_ny_close_edge` uses, so `run_enter` samples `ReplayBroker::
+    get_quote` and rejects a trough-spread entry for real.
+- **Removed the now-dead spread proxy**: `spread_blackout_reject` +
+  `SimOutcome::SpreadBlackout` + `BracketReject::SpreadBlackout` + the
+  `FillKind`/`FillOutcome::SpreadBlackout` rendering variants. A spread-blackout
+  rejection now renders through the unified `rejected_reason` (`GateBlocked`)
+  path. **Kept** `sweep_reason`'s market-blackout branch — it models the
+  *resting-order sweep* (an order placed OUTSIDE the blackout that a LATER window
+  catches resting), a distinct live mechanism the entry gate doesn't cover.
+- **Latent LIVE bug fixed**: the cancel→RESTORE re-drive
+  (`run_enter(.., restore=true)`) bypassed the retry gate but NOT the two blackout
+  reject gates. Once the window is seeded, a restore landing while the ~3h window
+  is open was `rejected: spread-blackout` and the order silently DROPPED — never
+  re-placed. This fires in LIVE too (shared code). Fix: `restore=true` now
+  bypasses both blackout reject gates (same discipline as the retry-gate bypass);
+  the SL-vs-spread hard floor still applies.
+
+**Breaking.** `replay::run` gains a `blackout_windows: &[NoEntryWindow]` param
+(internal to the replay bin). `NY_CLOSE_WINDOW_MARKER_TTL_SECONDS` moved from
+`trade-control-cron` to `core::spread_blackout` (cron re-exports it). No wire /
+signed-body / basename change.
+
+**Config.** None.
+
+**Tests.** New: `enter_inside_market_hours_blackout_is_rejected_by_the_seeded_gate`,
+`enter_inside_spread_blackout_is_rejected_by_the_seeded_gate` (assert the seeded
+gate rejects, not a proxy). The multishot cancel→restore replay test now also
+guards the restore-bypass (it fails without it, since the window is seeded).
+Removed the three engine `simulate_fill` spread-blackout tests (the gate no
+longer lives there); kept one reframed as an SL-floor control. Workspace green
+(48 bins), clippy clean.
+
+**Follow-up.** Divergence #4 (retry-gate `resolve` single-sample SL floor vs
+`realize` windowed-mean) remains — a corner case, unchanged here.
+
 ## v97 — 2026-07-19 — terminology: reversal-close is a per-POSITION CLOSE (not "exit")
 
 **Why.** Settling the vocabulary after v96. The reversal-close **closes an open

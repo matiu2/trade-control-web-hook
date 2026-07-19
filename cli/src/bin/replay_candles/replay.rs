@@ -14,7 +14,7 @@ use trade_control_core::dispatch_config::DispatchConfig;
 use trade_control_core::incoming::Verified;
 use trade_control_core::intent::{Action, Intent as TcIntent, Shell};
 use trade_control_core::pause_gate;
-use trade_control_core::state::MemStateStore;
+use trade_control_core::state::{MemStateStore, StateStore};
 use trade_control_engine::BidAskCandle as EngineCandle;
 use trade_control_engine::{
     Candle, FiredIntent, Granularity, PlanState, TradePlan, Trigger, enter_preconditions_reason,
@@ -166,6 +166,7 @@ const SEED_BARS: usize = 10;
 /// retired by a stale veto-level touch that happened earlier (which would
 /// otherwise end the plan before the entry it exists to protect). The warm-up
 /// bars are pulled by the caller (`--warmup-bars`).
+#[allow(clippy::too_many_arguments)]
 pub async fn run(
     plan: &TradePlan,
     candles: &[EngineCandle],
@@ -173,6 +174,11 @@ pub async fn run(
     live_start: DateTime<Utc>,
     expires_at: DateTime<Utc>,
     mark_cfg: DetectorMarkConfig,
+    // The instrument's market-hours no-entry windows, resolved by the driver from
+    // the SAME TN `market_info` source the live worker's `blackout_hours` cron
+    // uses (empty for OANDA / on any miss). Seeded into `store` below so
+    // `run_enter`'s OWN market-hours reject gate fires offline exactly as live.
+    blackout_windows: &[trade_control_core::intent::NoEntryWindow],
 ) -> Replay {
     // The engine evaluates on MID (matching the live worker, whose
     // `Broker::get_candles` is contractually mid); the bid/ask books are only
@@ -230,6 +236,31 @@ pub async fn run(
     // `super::lifecycle`; the broker + store are the ones above.
     let lifecycle_cfg = super::lifecycle::ReplayConfigProvider::new(plan.pip_size);
 
+    // Seed the market-hours no-entry windows into the store ONCE, so `run_enter`'s
+    // own reject gate (`store.get_blackout_windows(&resolved.instrument)`,
+    // `dispatch/enter.rs`) fires offline instead of the decision being re-derived
+    // post-hoc. Keyed on `plan.instrument` — the string every fired enter intent
+    // carries (`resolved.instrument == intent.instrument`), which is what the gate
+    // looks up. Live writes these daily via the `blackout_hours` cron with a ~26h
+    // missed-tick TTL; the replay's virtual clock is bar-pinned and can span days
+    // of warm-up + live bars, so we seed a TTL that comfortably outlives the whole
+    // window (the store clock never advances past the last bar). Empty windows
+    // (OANDA / a resolve miss) ⇒ the gate fails open, exactly as before this seed.
+    if !blackout_windows.is_empty() {
+        let seed_now = candles[0].time;
+        // Cover warm-up prefix through the last live bar, plus slack — the windows
+        // are minute-of-day recurring, so a long TTL just keeps them queryable for
+        // every bar's tick; it is NOT a per-day expiry.
+        let span_seconds = (expires_at - seed_now).num_seconds().max(0) as u64;
+        let ttl = span_seconds + 24 * 60 * 60;
+        if let Err(e) = store
+            .set_blackout_windows(&plan.instrument, blackout_windows, seed_now, ttl)
+            .await
+        {
+            tracing::error!(instrument = %plan.instrument, error = %e, "seed market-hours blackout windows failed");
+        }
+    }
+
     // The detector window grows with each tick: Pine / trendline triggers need
     // the full back-window of closed candles, not just the single new bar.
     for i in seed_end..candles.len() {
@@ -267,6 +298,26 @@ pub async fn run(
         // aren't judged "expired" against real wall-clock — the same
         // wall-clock-vs-cursor trap that drops blackout state in replay.
         store.set_clock(now);
+
+        // Open the System-1 spread-blackout window marker on an NY-close-edge bar,
+        // exactly as the live cron's `apply_if_ny_close_edge` does — SAME
+        // `is_ny_close_edge` gate, SAME shared 3h TTL constant. This is what makes
+        // `run_enter`'s OWN spread-blackout gate fire offline: once the marker is
+        // set the gate samples `ReplayBroker::get_quote` (which synthesizes the
+        // fire-bar / spread-hour-elevated spread) and rejects for real — instead of
+        // the decision being re-derived by the `spread_blackout_reject` proxy. Off
+        // the edge the marker isn't written; the store clock is bar-pinned so a
+        // marker opened on a prior edge bar naturally lapses after its 3h TTL.
+        if trade_control_core::ny_clock::is_ny_close_edge(now)
+            && let Err(e) = store
+                .set_spread_blackout_window(
+                    now,
+                    trade_control_core::spread_blackout::NY_CLOSE_WINDOW_MARKER_TTL_SECONDS,
+                )
+                .await
+        {
+            tracing::error!(error = %e, "seed spread-blackout window failed");
+        }
 
         tracing::debug!(
             bar = %candles[i].time,
@@ -985,6 +1036,7 @@ mod tests {
             all_live(),
             expires,
             no_marks(),
+            &[],
         )
         .await;
 
@@ -1020,6 +1072,7 @@ mod tests {
             all_live(),
             all_live(),
             no_marks(),
+            &[],
         )
         .await;
         assert!(replay.fires.is_empty());
@@ -1044,6 +1097,7 @@ mod tests {
             all_live(),
             expires(),
             no_marks(),
+            &[],
         )
         .await;
         assert!(
@@ -1069,6 +1123,7 @@ mod tests {
             all_live(),
             expires(),
             no_marks(),
+            &[],
         )
         .await;
         assert!(!replay.done);
@@ -1156,6 +1211,7 @@ mod tests {
             all_live(),
             expires(),
             no_marks(),
+            &[],
         )
         .await;
 
@@ -1190,6 +1246,214 @@ mod tests {
         );
     }
 
+    /// A single-shot LONG stop-enter that crosses `level` up (OnClose) — no
+    /// pause/veto rules, so the only thing standing between it and a placement is
+    /// the entry-gate stack in `run_enter`. Used by the two blackout-gate parity
+    /// tests below. `instrument` matters: the spread-blackout threshold + the
+    /// market-blackout key both read it.
+    fn plain_enter_plan(instrument: &str, level: f64) -> TradePlan {
+        serde_json::from_str(&format!(
+            r#"{{
+                "trade_id": "gate-t",
+                "instrument": "{instrument}",
+                "direction": "long",
+                "granularity": "h1",
+                "pip_size": 0.0001,
+                "rules": [
+                    {{
+                        "rule_id": "05-enter",
+                        "trigger": {{ "type": "horizontal_cross", "level": {level}, "dir": "up", "bar": "on_close" }},
+                        "fire_mode": "once",
+                        "intent": {{
+                            "v": 1, "id": "gate-t-enter", "not_after": "2099-01-01T00:00:00Z",
+                            "action": "enter", "instrument": "{instrument}", "direction": "long",
+                            "entry": {{ "type": "stop", "from": "close", "offset_pips": 0.0, "at": {} }},
+                            "stop_loss": {{ "absolute": {} }},
+                            "take_profit": {{ "absolute": {} }},
+                            "broker": "tradenation", "trade_id": "gate-t", "max_retries": 0,
+                            "pip_size": 0.0001
+                        }}
+                    }}
+                ]
+            }}"#,
+            level + 0.0050,
+            level - 0.0050,
+            level + 0.0200,
+        ))
+        .expect("parse plain-enter plan")
+    }
+
+    /// An `ohlc_at` candle carrying an explicit `spread_price` (ask−bid) on the
+    /// close books — the spread `ReplayBroker::get_quote` samples for the
+    /// spread-blackout gate. Mid OHLC is symmetric around the books.
+    fn ohlc_at_spread(
+        rfc3339: &str,
+        o: f64,
+        h: f64,
+        l: f64,
+        c: f64,
+        spread_price: f64,
+    ) -> EngineCandle {
+        let half = spread_price / 2.0;
+        let time: DateTime<Utc> = rfc3339.parse().expect("valid rfc3339");
+        EngineCandle {
+            time,
+            o,
+            h,
+            l,
+            c,
+            bid_o: o - half,
+            bid_h: h - half,
+            bid_l: l - half,
+            bid_c: c - half,
+            ask_o: o + half,
+            ask_h: h + half,
+            ask_l: l + half,
+            ask_c: c + half,
+        }
+    }
+
+    /// Parity #2: the replay seeds the market-hours no-entry windows into the
+    /// store, so `run_enter`'s OWN reject gate (`get_blackout_windows`) fires
+    /// offline — a brand-new entry firing inside the daily close→open gap is
+    /// rejected, exactly as the live worker 423s it, instead of being placed and
+    /// re-derived post-hoc. Enter fires on the 20:00Z bar (its tick `now` is
+    /// 21:00Z = minute-of-day 1260), which sits inside the 20:00–22:00Z window.
+    #[tokio::test]
+    async fn enter_inside_market_hours_blackout_is_rejected_by_the_seeded_gate() {
+        // 10 warm-up bars below 1.1050, then a bar closing above it (the OnClose
+        // up-cross) at 20:00Z. The window (1200..1320 = 20:00..22:00Z UTC min) is
+        // seeded so the gate rejects on the 20:00Z bar (now = 21:00Z, min 1260).
+        let mut candles: Vec<EngineCandle> = (10..20)
+            .map(|h| {
+                ohlc_at(
+                    &format!("2026-03-11T{h:02}:00:00Z"),
+                    1.1040,
+                    1.1042,
+                    1.1038,
+                    1.1040,
+                )
+            })
+            .collect();
+        // The firing bar: opens 20:00Z, closes above 1.1050 → 05-enter fires.
+        candles.push(ohlc_at(
+            "2026-03-12T20:00:00Z",
+            1.1045,
+            1.1060,
+            1.1043,
+            1.1055,
+        ));
+        // A follow bar so the loop has a live bar after the fire.
+        candles.push(ohlc_at(
+            "2026-03-12T21:00:00Z",
+            1.1055,
+            1.1065,
+            1.1050,
+            1.1060,
+        ));
+
+        let windows = [trade_control_core::intent::NoEntryWindow {
+            open_min: 20 * 60,  // 20:00Z
+            close_min: 22 * 60, // 22:00Z
+        }];
+        let live_at: DateTime<Utc> = "2026-03-12T20:00:00Z".parse().unwrap();
+        let expires_at: DateTime<Utc> = "2026-03-14T00:00:00Z".parse().unwrap();
+
+        let r = run(
+            &plain_enter_plan("EUR/USD", 1.1050),
+            &candles,
+            Granularity::H1,
+            live_at,
+            expires_at,
+            no_marks(),
+            &windows,
+        )
+        .await;
+
+        let enter = r
+            .fires
+            .iter()
+            .find(|f| f.fired.rule_id == "05-enter")
+            .expect("enter fired");
+        let reason = enter
+            .rejected_reason()
+            .expect("enter must be gate-REJECTED, not placed");
+        assert!(
+            reason.contains("market-blackout"),
+            "expected a market-blackout rejection from run_enter's seeded gate, got {reason:?}"
+        );
+    }
+
+    /// Parity #3: the replay seeds the spread-blackout window marker on each
+    /// NY-close-edge bar (SAME `is_ny_close_edge` gate + shared 3h TTL the live
+    /// cron uses), so `run_enter`'s OWN System-1 gate samples the fire-bar spread
+    /// via `ReplayBroker::get_quote` and rejects a trough-spread entry — instead
+    /// of the old off-book `spread_blackout_reject` proxy. Enter fires on the
+    /// 20:00Z bar (tick `now` 21:00Z = the EDT NY-close edge) carrying a wide
+    /// 30-pip spread; EUR/USD's flat 8-pip threshold is exceeded → reject.
+    #[tokio::test]
+    async fn enter_inside_spread_blackout_is_rejected_by_the_seeded_gate() {
+        // 2026-03-12 is EDT (past the 2nd Sunday of March), so 21:00Z is the
+        // NY-close edge. The firing bar opens 20:00Z; its tick now = 21:00Z opens
+        // the window marker, and get_quote samples the 20:00Z bar's 30-pip book.
+        let mut candles: Vec<EngineCandle> = (10..20)
+            .map(|h| {
+                ohlc_at_spread(
+                    &format!("2026-03-11T{h:02}:00:00Z"),
+                    1.1040,
+                    1.1042,
+                    1.1038,
+                    1.1040,
+                    0.0002, // tight 2-pip warm-up spread
+                )
+            })
+            .collect();
+        // Firing bar at 20:00Z with a WIDE 30-pip close spread (0.0030).
+        candles.push(ohlc_at_spread(
+            "2026-03-12T20:00:00Z",
+            1.1045,
+            1.1060,
+            1.1043,
+            1.1055,
+            0.0030,
+        ));
+        candles.push(ohlc_at_spread(
+            "2026-03-12T21:00:00Z",
+            1.1055,
+            1.1065,
+            1.1050,
+            1.1060,
+            0.0002,
+        ));
+        let live_at: DateTime<Utc> = "2026-03-12T20:00:00Z".parse().unwrap();
+        let expires_at: DateTime<Utc> = "2026-03-14T00:00:00Z".parse().unwrap();
+
+        // No market-hours windows — this isolates the spread-blackout gate.
+        let r = run(
+            &plain_enter_plan("EUR/USD", 1.1050),
+            &candles,
+            Granularity::H1,
+            live_at,
+            expires_at,
+            no_marks(),
+            &[],
+        )
+        .await;
+
+        let enter = r
+            .fires
+            .iter()
+            .find(|f| f.fired.rule_id == "05-enter")
+            .expect("enter fired");
+        let reason = enter
+            .rejected_reason()
+            .expect("enter must be gate-REJECTED, not placed");
+        assert!(
+            reason.contains("spread-blackout"),
+            "expected a spread-blackout rejection from run_enter's seeded gate, got {reason:?}"
+        );
+    }
+
     #[tokio::test]
     async fn sub_bar_pause_epoch_opens_via_virtual_tick_and_suppresses_enter() {
         // PR2 parity: the pause epoch is at 10.5h — BETWEEN the bar-10 close
@@ -1216,6 +1480,7 @@ mod tests {
             all_live(),
             expires(),
             no_marks(),
+            &[],
         )
         .await;
 
@@ -1318,6 +1583,7 @@ mod tests {
             all_live(),
             expires(),
             no_marks(),
+            &[],
         )
         .await;
 
@@ -1415,6 +1681,7 @@ mod tests {
             live_at,
             expires(),
             no_marks(),
+            &[],
         )
         .await;
         assert_eq!(
@@ -1556,6 +1823,7 @@ mod tests {
             all_live(),
             expires(),
             no_marks(),
+            &[],
         )
         .await;
 
@@ -1693,6 +1961,7 @@ mod tests {
             all_live(),
             expires(),
             no_marks(),
+            &[],
         )
         .await;
 
@@ -1803,6 +2072,7 @@ mod tests {
             live,
             expires(),
             cfg,
+            &[],
         )
         .await;
 
@@ -1841,6 +2111,7 @@ mod tests {
             live,
             expires(),
             against,
+            &[],
         )
         .await;
         assert!(marks(&r).is_empty(), "against-dir hides the bullish golden");
@@ -1856,6 +2127,7 @@ mod tests {
             live,
             expires(),
             off,
+            &[],
         )
         .await;
         assert!(marks(&r_off).is_empty(), "none disables marking");
@@ -1911,7 +2183,7 @@ mod tests {
         let cfg =
             DetectorMarkConfig::new(DirectionFilter::With, GoldenFilter::Golden, Direction::Long);
         let plan = golden_enter_resolve_fails_plan();
-        let r = run(&plan, &candles, Granularity::H1, live, expires(), cfg).await;
+        let r = run(&plan, &candles, Granularity::H1, live, expires(), cfg, &[]).await;
 
         // The golden fired the detector but the enter declined — nothing fired.
         assert!(
@@ -2016,6 +2288,7 @@ mod tests {
             live,
             expires(),
             golden_only,
+            &[],
         )
         .await;
 
@@ -2023,7 +2296,7 @@ mod tests {
         // nothing). Under a `both` golden filter it's marked and NOT golden.
         let both =
             DetectorMarkConfig::new(DirectionFilter::With, GoldenFilter::Both, Direction::Long);
-        let r_both = run(&plan, &candles, Granularity::H1, live, expires(), both).await;
+        let r_both = run(&plan, &candles, Granularity::H1, live, expires(), both, &[]).await;
         let marked: Vec<&super::super::verbose::DetectedMark> = r_both
             .traces
             .iter()
@@ -2114,7 +2387,7 @@ mod tests {
         let plan = break_and_close_pending_plan();
         let cfg =
             DetectorMarkConfig::new(DirectionFilter::With, GoldenFilter::Golden, Direction::Long);
-        let r = run(&plan, &candles, Granularity::H1, live, expires(), cfg).await;
+        let r = run(&plan, &candles, Granularity::H1, live, expires(), cfg, &[]).await;
 
         // The enter never fires: break-and-close never crossed 9.99, so the
         // spine stays AwaitBreakAndClose and the enter is never considered.
@@ -2160,7 +2433,7 @@ mod tests {
         let plan = golden_enter_resolve_fails_plan();
         let cfg =
             DetectorMarkConfig::new(DirectionFilter::With, GoldenFilter::Golden, Direction::Long);
-        let r = run(&plan, &candles, Granularity::H1, live, expires(), cfg).await;
+        let r = run(&plan, &candles, Granularity::H1, live, expires(), cfg, &[]).await;
 
         let marked_bar = r
             .traces
@@ -2339,6 +2612,7 @@ mod tests {
             live_at,
             expires_at,
             no_marks(),
+            &[],
         )
         .await;
 
@@ -2448,6 +2722,7 @@ mod tests {
             live_at,
             expires_at,
             no_marks(),
+            &[],
         )
         .await;
 
@@ -2522,6 +2797,16 @@ mod tests {
     ///      re-floored SL differs from the original. `reactivate_matching_cancelled`
     ///      matches on instrument + direction + entry trigger (stable), not the
     ///      re-floored SL/TP.
+    ///   3. **Blackout-gate bypass on restore** (added with the replay-gate-parity
+    ///      work). Once the replay seeds the spread-blackout window marker offline
+    ///      (so `run_enter`'s own System-1 gate fires — see the two
+    ///      `..._rejected_by_the_seeded_gate` tests), a restore re-drive that lands
+    ///      while that window (or the market-hours window) is still open was
+    ///      `rejected: spread-blackout` and the order DROPPED — never re-placed. A
+    ///      restore is a re-placement of an already-vetted cancelled order, so it now
+    ///      bypasses BOTH blackout reject gates (like the retry gate). This guards
+    ///      that fix: without it, this test's restore lands on the open-window bar
+    ///      and produces no fill.
     ///
     /// Asserts on BOTH `enter.realized` (the ledger) AND the rendered report text /
     /// `Net R` / `TP:/SL:`, so the split-brain (report re-simulating a phantom fill
@@ -2598,6 +2883,7 @@ mod tests {
             live_at,
             expires_at,
             no_marks(),
+            &[],
         )
         .await;
 
@@ -2786,6 +3072,7 @@ mod tests {
             live_at,
             expires_at,
             no_marks(),
+            &[],
         )
         .await;
 
