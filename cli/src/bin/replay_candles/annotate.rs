@@ -197,7 +197,6 @@ fn outcome_label(kind: FillKind) -> &'static str {
         FillKind::ClosedOnReversal => "reversal",
         FillKind::NeverFilled => "no-fill",
         FillKind::Declined => "declined",
-        FillKind::SpreadBlackout => "spread",
         FillKind::GateBlocked => "gate-blocked",
     }
 }
@@ -234,7 +233,6 @@ mod tests {
         assert_eq!(outcome_label(FillKind::NeverFilled), "no-fill");
         assert_eq!(outcome_label(FillKind::Declined), "declined");
         assert_eq!(outcome_label(FillKind::ClosedOnReversal), "reversal");
-        assert_eq!(outcome_label(FillKind::SpreadBlackout), "spread");
         assert_eq!(outcome_label(FillKind::GateBlocked), "gate-blocked");
     }
 

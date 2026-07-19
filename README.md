@@ -1711,6 +1711,11 @@ windows from the *same* TradeNation `market_info` the live `blackout_hours` cron
 uses (`resolve_market` + `get_market_info`) and feeds the Brisbane session ranges
 through the identical shared deriver (`core::windows_from_session`) — so the
 replay reconstructs the exact UTC windows the worker would have written to KV.
+Since v98 these same windows are ALSO seeded into the replay's state store so
+`run_enter`'s market-hours **entry-reject** gate fires offline (see *Replay
+enforces the two blackout REJECT gates* below) — `sweep_reason`'s branch here is
+the distinct *resting-order sweep* (an order placed outside the blackout that a
+later window catches resting), not the entry gate.
 TradingView's charted-exchange hours would diverge from the broker's CFD session,
 so they are deliberately *not* used. It's **fail-soft**: any login / resolve /
 broker miss logs a `WARN` and passes empty windows (the order then shows the plain
@@ -1804,23 +1809,36 @@ wall-clock and vanish (the same wall-clock-vs-cursor trap as the tv-arm prune).
 Without a blackout (or with `--skip-calendar-bars`) the same enter fills — that
 with/without pair is the A/B the journal needs to price what the news rule cost.
 
-**Replay enforces the spread-blackout reject (System 1), not just the fill.**
-The live worker rejects a new entry that fires during the post-NY-close
-liquidity trough when the instrument's spread is elevated (see *Spread-blackout
-window* above). The replay now mirrors it: `simulate_fill` computes the **fire
-bar**'s spread from the recorded bid/ask book (`(ask_c − bid_c) / pip_size`) and
-calls the *same* `trade_control_core::spread_blackout` decision + per-instrument
-threshold the worker uses. On a reject it returns the new
-`SimOutcome::SpreadBlackout { spread_pips, threshold_pips }`, shown in the report
-as `spread: REJECTED — spread 30.0p > 8.0p threshold inside the NY-close-edge
-window (no order placed; live worker 423s)` and not tallied as a win. A
-mid-only feed (`bid == ask`) has zero spread → never blacks out (we don't
-fabricate a spread the data doesn't carry). **Modelling note:** the live gate
-only samples when the KV `spread-blackout:window` marker is set (the daily cron
-writes it at the NY-close edge); the replay has no KV, so it approximates the
-marker with `core::ny_clock::is_ny_close_edge(fire_bar.time)` — exactly the
-close-edge hour, where the live window can persist a little longer until the
-recovery watcher clears it.
+**Replay enforces the two blackout REJECT gates through `run_enter` itself
+(v98).** The live worker rejects a new entry that fires (a) inside the
+instrument's daily market-hours close→open gap, or (b) during the post-NY-close
+liquidity trough when the spread is elevated (see *Spread-blackout window*
+above). The replay no longer *re-derives* these decisions with a proxy — it
+**seeds the state-store windows `run_enter`'s own gates read**, so the offline
+entry decision is the live gate itself:
+
+- *Market-hours*: the driver resolves the no-entry windows (shared TN
+  `market_info` + `core::windows_from_session`) and seeds them into the store
+  before the tick loop, so `run_enter`'s `get_blackout_windows` reject fires
+  offline. A blacked-out enter is `rejected: market-blackout` (no order placed),
+  rendered as `BLOCKED — rejected: market-blackout → NO FILL / 0R`.
+- *Spread-blackout*: the driver opens the window marker on each NY-close-edge bar
+  using the SAME `core::ny_clock::is_ny_close_edge` gate + the shared 3h TTL
+  (`core::spread_blackout::NY_CLOSE_WINDOW_MARKER_TTL_SECONDS`) the live cron's
+  `apply_if_ny_close_edge` uses. `run_enter` then samples `ReplayBroker::
+  get_quote` (which synthesises the fire-bar / spread-hour-elevated spread) and
+  rejects `rejected: spread-blackout` for real. A mid-only feed (`bid == ask`)
+  has zero spread → never blacks out.
+
+The old off-book `spread_blackout_reject` proxy and the `SimOutcome::
+SpreadBlackout` outcome were removed — the decision lives in one place
+(`run_enter`) for both live and replay. (The `sweep_reason` **market-hours**
+branch stays: it models the separate *resting-order sweep* — an order placed
+outside the blackout that a later window catches resting.) **Restore caveat:** a
+cancel→restore re-drive (`run_enter(.., restore=true)`) bypasses both blackout
+reject gates — a restore re-places an already-vetted cancelled order, so it must
+not be re-blocked by a still-open window (this also fixed a latent live bug where
+restores landing inside the ~3h window were silently dropped).
 
 **Spread-hour "rubbish candle": entries, signal detection, and level crosses are
 suppressed.** During a learned **spread hour** for an instrument (its baked

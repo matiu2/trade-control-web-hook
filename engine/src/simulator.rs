@@ -88,25 +88,6 @@ pub enum SimOutcome {
     /// Carries the veto name (`too-low` / `too-high`). `simulate_fill`
     /// short-circuits here before any fill, mirroring `run_enter`'s gate.
     Declined { name: String },
-    /// The worker's spread-blackout gate (System 1) would have rejected the
-    /// entry: the **fire bar**'s `ask − bid` spread (in pips) exceeds the
-    /// instrument's elevated threshold while the NY-close-edge blackout
-    /// window is open. No order placed — the live worker 423s here.
-    /// `simulate_fill` short-circuits before any fill, mirroring `run_enter`.
-    ///
-    /// **Modelling note (the offline `window_open` stand-in):** the live
-    /// gate only samples the spread when the KV `spread-blackout:window`
-    /// marker is set, which the daily cron writes at the NY-close edge
-    /// (`src/cron/blackout_apply.rs`). The replay has no KV, so it
-    /// approximates the marker with
-    /// [`trade_control_core::ny_clock::is_ny_close_edge`] on the fire bar's
-    /// open time. This is an *approximation*: the real window can persist
-    /// past the close hour until the recovery watcher clears it, whereas the
-    /// offline stand-in is exactly the close-edge hour. See [`simulate_fill`].
-    SpreadBlackout {
-        spread_pips: f64,
-        threshold_pips: f64,
-    },
 }
 
 /// Simulate one fired enter `intent` (with its triggering `candle` folded into a
@@ -149,11 +130,6 @@ enum BracketReject {
     Unresolved(String),
     /// The entry was already past a baked at-entry level veto (Bug #12).
     LevelVeto(String),
-    /// System-1 spread-blackout rejected the brand-new entry.
-    SpreadBlackout {
-        spread_pips: f64,
-        threshold_pips: f64,
-    },
     /// The SL-vs-spread floor widened the stop below `min_r` → declined.
     FloorRejected,
 }
@@ -201,19 +177,13 @@ fn resolve_effective_bracket(
         return Err(BracketReject::LevelVeto(elv.name.clone()));
     }
 
-    // Spread-blackout (System 1) — the worker rejects a brand-new entry that
-    // fires during the post-NY-close liquidity trough when the live spread is
-    // elevated. Mirrored here off the recorded fire-bar book.
-    if let Some(SimOutcome::SpreadBlackout {
-        spread_pips,
-        threshold_pips,
-    }) = spread_blackout_reject(intent, shell, pip_size, candles)
-    {
-        return Err(BracketReject::SpreadBlackout {
-            spread_pips,
-            threshold_pips,
-        });
-    }
+    // (The System-1 spread-blackout rejection is NO LONGER re-derived here. The
+    // replay driver now seeds the store's spread-blackout window marker on each
+    // NY-close-edge bar, so `run_enter`'s OWN gate rejects a trough-spread entry
+    // pre-placement — before any order is recorded — exactly as live. A rejected
+    // enter never reaches this bracket resolver, so the old off-book proxy
+    // (`spread_blackout_reject`) was dead and was removed. See the replay driver's
+    // `set_spread_blackout_window` seed.)
 
     // SL-vs-spread floor SALVAGE (mirror of `run_enter`'s widen-then-reject): a
     // stop closer than `10 × spread` to entry is widened to `10 × spread` and R
@@ -262,15 +232,6 @@ pub fn simulate_fill_windowed(
             Ok(r) => r,
             Err(BracketReject::Unresolved(err)) => return SimOutcome::Unresolved(err),
             Err(BracketReject::LevelVeto(name)) => return SimOutcome::Declined { name },
-            Err(BracketReject::SpreadBlackout {
-                spread_pips,
-                threshold_pips,
-            }) => {
-                return SimOutcome::SpreadBlackout {
-                    spread_pips,
-                    threshold_pips,
-                };
-            }
             Err(BracketReject::FloorRejected) => {
                 return SimOutcome::Declined {
                     name: "sl-widen-below-min-r".to_string(),
@@ -376,49 +337,13 @@ pub fn simulate_fill_windowed(
     }
 }
 
-/// The replay's spread-blackout gate: `Some(SimOutcome::SpreadBlackout { .. })`
-/// when the worker's System-1 gate would reject this enter, `None` otherwise.
-///
-/// The fire bar is `candles[0]` (the bar the enter fired on — the same bar the
-/// `shell` was folded from). Its `ask_c − bid_c` over `pip_size` is the spread
-/// the live worker would have sampled from a broker quote. A mid-only feed has
-/// `bid_c == ask_c` → zero spread → never blacks out (correct: we don't fabricate
-/// a spread the data doesn't carry). `window_open` is the NY-close-edge stand-in
-/// keyed on the fire bar's open time. Decision + threshold come from
-/// `core::spread_blackout`, shared with the worker.
-fn spread_blackout_reject(
-    intent: &Intent,
-    shell: &Shell,
-    pip_size: f64,
-    candles: &[BidAskCandle],
-) -> Option<SimOutcome> {
-    if pip_size <= 0.0 {
-        return None;
-    }
-    // The fire bar carries the spread the worker would have quoted. Prefer the
-    // recorded `candles[0]` (the literal fire bar); fall back to the shell's
-    // own time for the window check if the path is empty.
-    let fire = candles.first()?;
-    let spread_pips = (fire.ask_c - fire.bid_c) / pip_size;
-    // Defensive: an exactly-mid bar (bid == ask) yields zero, a malformed book
-    // (ask < bid) a negative, and a NaN book a non-finite — none is a blackout.
-    // Only a finite positive spread can be sampled.
-    if !spread_pips.is_finite() || spread_pips <= 0.0 {
-        return None;
-    }
-    let window_open = trade_control_core::ny_clock::is_ny_close_edge(shell.time);
-    let threshold_pips =
-        trade_control_core::spread_blackout::elevated_threshold_pips(&intent.instrument);
-    trade_control_core::spread_blackout::spread_blackout_decision(
-        window_open,
-        spread_pips,
-        threshold_pips,
-    )
-    .then_some(SimOutcome::SpreadBlackout {
-        spread_pips,
-        threshold_pips,
-    })
-}
+// The old `spread_blackout_reject` proxy was removed: the replay driver now seeds
+// the store's spread-blackout window marker per NY-close-edge bar, so
+// `run_enter`'s OWN System-1 gate rejects a trough-spread entry pre-placement
+// (via `ReplayBroker::get_quote`) — the offline decision is the live gate itself,
+// not an off-book re-derivation. `core::spread_blackout::{spread_blackout_decision,
+// elevated_threshold_pips}` remain the shared decision, now called only from
+// `run_enter`.
 
 /// A located fill: when/where the entry order filled, and the candle slice from
 /// the fill bar onward (the post-fill SL/TP/break-even search window). Shared by
@@ -1751,72 +1676,27 @@ mod tests {
         i
     }
 
-    #[test]
-    fn elevated_spread_inside_ny_close_edge_is_blacked_out() {
-        // EUR_USD isn't in the baked baseline (keyed by the TN name "EUR/USD"),
-        // so the flat 8-pip fallback applies. A fire bar with a 30-pip spread
-        // (0.0030 at pip 0.0001) inside the NY-close-edge window → the worker's
-        // System-1 gate would 423, and the replay now mirrors it.
-        let intent = resolvable_long_stop();
-        // Shell time IS the fire bar time — both at the close edge.
-        let shell = Shell::from_candle(&spread_fire_bar(EDGE_TS, 1.1040, 0.0030).mid());
-        let path = [spread_fire_bar(EDGE_TS, 1.1040, 0.0030)];
-
-        match simulate_fill(&intent, &shell, 0.0001, &path) {
-            SimOutcome::SpreadBlackout {
-                spread_pips,
-                threshold_pips,
-            } => {
-                assert!(
-                    (spread_pips - 30.0).abs() < 1e-6,
-                    "30p spread, got {spread_pips}"
-                );
-                assert!(
-                    (threshold_pips - 8.0).abs() < 1e-9,
-                    "flat 8p fallback threshold, got {threshold_pips}"
-                );
-            }
-            other => panic!("expected SpreadBlackout, got {other:?}"),
-        }
-    }
+    // NOTE: the System-1 spread-blackout gate is NO LONGER re-derived in
+    // `simulate_fill` — the replay driver seeds the store window marker so
+    // `run_enter`'s own gate rejects a trough-spread enter pre-placement. The old
+    // `elevated_spread_inside_ny_close_edge_is_blacked_out` / `normal_spread_
+    // inside_window_fills` tests (which asserted the removed `SimOutcome::
+    // SpreadBlackout`) were deleted; blackout rejection is now covered where the
+    // gate lives (`core::dispatch::enter` + the replay driver). This surviving
+    // control keeps exercising the SL-vs-spread floor for a wide fire-bar spread.
 
     #[test]
-    fn normal_spread_inside_window_fills() {
-        // Control: same NY-close-edge window, but a tight 2-pip spread is below
-        // the 8-pip threshold → not blacked out. The order then resolves and
-        // (with no fill bar after the fire bar) reports NeverFilled — i.e. the
-        // blackout gate let it through.
-        let intent = resolvable_long_stop();
-        let shell = Shell::from_candle(&spread_fire_bar(EDGE_TS, 1.1040, 0.0002).mid());
-        let path = [spread_fire_bar(EDGE_TS, 1.1040, 0.0002)];
-        assert_eq!(
-            simulate_fill(&intent, &shell, 0.0001, &path),
-            SimOutcome::NeverFilled,
-            "a tight spread inside the window must pass the blackout gate"
-        );
-    }
-
-    #[test]
-    fn elevated_spread_outside_window_does_not_black_out() {
-        // Control: the SAME wide 30-pip spread, but the fire bar is NOT at the
-        // NY-close edge → window closed → no spread-BLACKOUT (the worker wouldn't
-        // even sample). The spread is still wide enough to trip the SL-vs-spread
-        // floor though: this long stop's SL is 50 pips, so `10 × 30 = 300` pips
-        // >> 50 → the floor is violated, the widen pushes the stop to `10 × 30 =
-        // 300` pips, and R collapses to 100/300 ≈ 0.33 < 1 → Declined via the
-        // widen mirror (NOT a blackout). The point of this control is that the
-        // outcome is *not* `SpreadBlackout`; the SL-widen decline is the correct
-        // fall-through for a wide spread that's outside the blackout window.
+    fn wide_fire_bar_spread_trips_the_sl_floor_decline() {
+        // A wide 30-pip fire-bar spread (0.0030 at pip 0.0001): this long stop's
+        // SL is 50 pips, so `10 × 30 = 300` pips >> 50 → the SL-vs-spread floor is
+        // violated, the widen pushes the stop to 300 pips, and R collapses to
+        // 100/300 ≈ 0.33 < 1 → Declined via the widen mirror. (Blackout is no
+        // longer a `simulate_fill` concern; this is purely the SL-floor path.)
         let intent = resolvable_long_stop();
         let shell = Shell::from_candle(&spread_fire_bar(NON_EDGE_TS, 1.1040, 0.0030).mid());
         let path = [spread_fire_bar(NON_EDGE_TS, 1.1040, 0.0030)];
-        let out = simulate_fill(&intent, &shell, 0.0001, &path);
-        assert!(
-            !matches!(out, SimOutcome::SpreadBlackout { .. }),
-            "a wide spread outside the close-edge window must not black out, got {out:?}"
-        );
         assert_eq!(
-            out,
+            simulate_fill(&intent, &shell, 0.0001, &path),
             SimOutcome::Declined {
                 name: "sl-widen-below-min-r".to_string(),
             },

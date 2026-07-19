@@ -528,107 +528,120 @@ pub async fn run_enter<B: Broker, S: StateStore>(
     // windows (24h / unparseable / not-yet-refreshed), must never block a
     // legitimate entry — `get_blackout_windows` returns an empty Vec in
     // those cases and `is_inside_any` is then always `false`.
-    match store.get_blackout_windows(&resolved.instrument).await {
-        Err(err) => {
-            tracing::error!(
-                "market-blackout: windows read failed for {} (id={}): {err} — failing open (allowing entry)",
-                resolved.instrument,
-                verified.intent.id
-            );
-        }
-        Ok(windows) => {
-            let now_min = now_utc_minute_of_day(now);
-            if is_inside_any(now_min, &windows) {
-                tracing::info!(
-                    "entry rejected: market-blackout instrument={} now_utc_min={now_min} windows={windows:?} (id={})",
-                    resolved.instrument,
-                    verified.intent.id
-                );
-                return ActionResult::Rejected {
-                    status: 423,
-                    body: "entry blocked: market-hours blackout".to_string(),
-                    outcome: "rejected: market-blackout".into(),
-                };
-            }
-        }
-    }
-
-    // System 1 of the spread blackout: reject a brand-new entry that
-    // fires during the post-NY-close liquidity trough when the live
-    // spread on THIS instrument is elevated. Runs here — after every
-    // gate (retry/cooldown/prep/veto/allow_entry) and `Resolved::from_intent`,
-    // immediately before the broker order. The pure decision lives in
-    // `spread_blackout::spread_blackout_decision`; this is the thin
-    // KV-read + quote-sample wrapper around it.
     //
-    // REJECT, NOT a delay: we do not persist anything, do not schedule a
-    // re-fire, and do not touch KV here. The next legitimate signal bar
-    // re-triggers the alert and re-runs this check — by then the spread
-    // may have recovered and the same entry passes. Stateless + idempotent.
-    //
-    // SEEN-ID: returning `ActionResult::Rejected` is a `Skip` in
-    // `seen_decision` (no `mark_seen`), so this reject does NOT poison the
-    // intent id — the next fire is allowed through. See CLAUDE.md
-    // "Replay protection scope". Do NOT add any KV write on this path.
-    match store.get_spread_blackout_window().await {
-        // Fail open on a transient KV read error — a blackout-window read
-        // hiccup must never block a legitimate entry.
-        Err(err) => {
-            tracing::error!(
-                "spread-blackout: window read failed (id={}): {err} — failing open (allowing entry)",
-                verified.intent.id
-            );
-        }
-        // Window closed — the overwhelmingly common path. Fall through
-        // WITHOUT a broker round-trip (no `get_quote` call).
-        Ok(None) => {}
-        // Window open — sample the live spread for this instrument and
-        // decide. A fine-spread instrument/day is not blacked out.
-        Ok(Some(_window)) => match broker.get_quote(&resolved.instrument).await {
-            // Fail open on a quote error at decision time: a transient
-            // broker quote hiccup must not strand a real entry. (A
-            // fail-closed variant is recorded in the sub-plan open
-            // questions; flip this branch to reject if demo shows the
-            // trough also degrades the quote endpoint.)
+    // RESTORE BYPASS: a `restore` re-drive re-places an order the lifecycle
+    // already cancelled for a spread hour — it is NOT a fresh entry, so it must
+    // skip the two blackout REJECT gates (this market-hours one and the
+    // spread-blackout one below), same discipline as the retry-gate bypass above.
+    // Otherwise a restore that lands while the daily blackout window is open (or
+    // while the ~3h NY-close spread window is open) would be rejected and the
+    // order silently DROPPED (`restore_one_order` cleans up on any non-Ok), never
+    // re-placed even on the next clean bar — a live-money bug for
+    // blackout-cancelled resting orders. The lifecycle's own `is_spread_hour` /
+    // `off_now` timing already governs WHEN a restore may run.
+    if !restore {
+        match store.get_blackout_windows(&resolved.instrument).await {
             Err(err) => {
                 tracing::error!(
-                    "spread-blackout: get_quote failed for {} (id={}): {err:?} — failing open (allowing entry)",
+                    "market-blackout: windows read failed for {} (id={}): {err} — failing open (allowing entry)",
                     resolved.instrument,
                     verified.intent.id
                 );
             }
-            Ok(quote) => {
-                let spread_pips = quote.spread() / pip_size;
-                let threshold = spread_blackout::elevated_threshold_pips(&resolved.instrument);
-                if spread_blackout::spread_blackout_decision(true, spread_pips, threshold) {
-                    // Name the instrument's baked normal/spike so the
-                    // operator can judge whether the block is right. Baked
-                    // figures come from the candle-derived baseline table;
-                    // absent for an uncatalogued instrument (then we only have
-                    // the flat threshold to show).
-                    let normal = match spread_blackout::baked_baseline(&resolved.instrument) {
-                        Some((low, high, median)) => format!(
-                            "{} normal spread ~{median:.1}p (seen {low:.1}–{high:.1}p)",
-                            resolved.instrument
-                        ),
-                        None => format!("{} (no baseline)", resolved.instrument),
-                    };
-                    let message = format!(
-                        "entry blocked: spread blackout — {normal}, current spread {spread_pips:.1}p > {threshold:.1}p; preventing entry for safety"
-                    );
+            Ok(windows) => {
+                let now_min = now_utc_minute_of_day(now);
+                if is_inside_any(now_min, &windows) {
                     tracing::info!(
-                        "entry rejected: spread-blackout instrument={} spread={spread_pips:.1}p > {threshold:.1}p (id={})",
+                        "entry rejected: market-blackout instrument={} now_utc_min={now_min} windows={windows:?} (id={})",
                         resolved.instrument,
                         verified.intent.id
                     );
                     return ActionResult::Rejected {
                         status: 423,
-                        body: message,
-                        outcome: "rejected: spread-blackout".into(),
+                        body: "entry blocked: market-hours blackout".to_string(),
+                        outcome: "rejected: market-blackout".into(),
                     };
                 }
             }
-        },
+        }
+
+        // System 1 of the spread blackout: reject a brand-new entry that
+        // fires during the post-NY-close liquidity trough when the live
+        // spread on THIS instrument is elevated. Runs here — after every
+        // gate (retry/cooldown/prep/veto/allow_entry) and `Resolved::from_intent`,
+        // immediately before the broker order. The pure decision lives in
+        // `spread_blackout::spread_blackout_decision`; this is the thin
+        // KV-read + quote-sample wrapper around it.
+        //
+        // REJECT, NOT a delay: we do not persist anything, do not schedule a
+        // re-fire, and do not touch KV here. The next legitimate signal bar
+        // re-triggers the alert and re-runs this check — by then the spread
+        // may have recovered and the same entry passes. Stateless + idempotent.
+        //
+        // SEEN-ID: returning `ActionResult::Rejected` is a `Skip` in
+        // `seen_decision` (no `mark_seen`), so this reject does NOT poison the
+        // intent id — the next fire is allowed through. See CLAUDE.md
+        // "Replay protection scope". Do NOT add any KV write on this path.
+        match store.get_spread_blackout_window().await {
+            // Fail open on a transient KV read error — a blackout-window read
+            // hiccup must never block a legitimate entry.
+            Err(err) => {
+                tracing::error!(
+                    "spread-blackout: window read failed (id={}): {err} — failing open (allowing entry)",
+                    verified.intent.id
+                );
+            }
+            // Window closed — the overwhelmingly common path. Fall through
+            // WITHOUT a broker round-trip (no `get_quote` call).
+            Ok(None) => {}
+            // Window open — sample the live spread for this instrument and
+            // decide. A fine-spread instrument/day is not blacked out.
+            Ok(Some(_window)) => match broker.get_quote(&resolved.instrument).await {
+                // Fail open on a quote error at decision time: a transient
+                // broker quote hiccup must not strand a real entry. (A
+                // fail-closed variant is recorded in the sub-plan open
+                // questions; flip this branch to reject if demo shows the
+                // trough also degrades the quote endpoint.)
+                Err(err) => {
+                    tracing::error!(
+                        "spread-blackout: get_quote failed for {} (id={}): {err:?} — failing open (allowing entry)",
+                        resolved.instrument,
+                        verified.intent.id
+                    );
+                }
+                Ok(quote) => {
+                    let spread_pips = quote.spread() / pip_size;
+                    let threshold = spread_blackout::elevated_threshold_pips(&resolved.instrument);
+                    if spread_blackout::spread_blackout_decision(true, spread_pips, threshold) {
+                        // Name the instrument's baked normal/spike so the
+                        // operator can judge whether the block is right. Baked
+                        // figures come from the candle-derived baseline table;
+                        // absent for an uncatalogued instrument (then we only have
+                        // the flat threshold to show).
+                        let normal = match spread_blackout::baked_baseline(&resolved.instrument) {
+                            Some((low, high, median)) => format!(
+                                "{} normal spread ~{median:.1}p (seen {low:.1}–{high:.1}p)",
+                                resolved.instrument
+                            ),
+                            None => format!("{} (no baseline)", resolved.instrument),
+                        };
+                        let message = format!(
+                            "entry blocked: spread blackout — {normal}, current spread {spread_pips:.1}p > {threshold:.1}p; preventing entry for safety"
+                        );
+                        tracing::info!(
+                            "entry rejected: spread-blackout instrument={} spread={spread_pips:.1}p > {threshold:.1}p (id={})",
+                            resolved.instrument,
+                            verified.intent.id
+                        );
+                        return ActionResult::Rejected {
+                            status: 423,
+                            body: message,
+                            outcome: "rejected: spread-blackout".into(),
+                        };
+                    }
+                }
+            },
+        }
     }
 
     // SL-vs-spread floor (hard limit, every entry): the stop-loss distance must

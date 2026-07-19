@@ -204,19 +204,34 @@ async fn main() -> Result<()> {
         plan.direction,
     );
 
-    // Keep the state TTL past the window so nothing expires mid-replay.
-    let expires_at = end + Duration::days(365);
-    let replay = replay::run(&plan, &candles, gran.engine(), start, expires_at, mark_cfg).await;
-
-    // Market-hours no-entry windows (for the blackout sweep reason). Resolved
-    // from the same TradeNation `market_info` source the live worker's
-    // `blackout_hours` cron uses; OANDA stays empty (coming soon). Fail-soft —
-    // any miss logs a WARN and yields no windows. See `market_hours`.
+    // Market-hours no-entry windows. Resolved from the same TradeNation
+    // `market_info` source the live worker's `blackout_hours` cron uses; OANDA
+    // stays empty (coming soon). Fail-soft — any miss logs a WARN and yields no
+    // windows. See `market_hours`.
     //
     // Pass the *resolved* broker symbol (`symbol`, e.g. TradeNation's `AUD/NZD`
     // MarketName), not the raw plan string — `resolve_market` matches the
     // catalog name exactly, so a slash-less/OANDA-form `raw_instrument` misses.
+    //
+    // Resolved BEFORE `replay::run` (was after) so the driver can seed them into
+    // the run's state-store: `run_enter`'s OWN market-hours reject gate
+    // (`store.get_blackout_windows`) then fires offline exactly as live, instead
+    // of the decision being re-derived post-hoc by `sweep_reason`. The report
+    // still reads the same `blackout_windows` for its annotations.
     let blackout_windows = market_hours::resolve_blackout_windows(args.source, &symbol).await;
+
+    // Keep the state TTL past the window so nothing expires mid-replay.
+    let expires_at = end + Duration::days(365);
+    let replay = replay::run(
+        &plan,
+        &candles,
+        gran.engine(),
+        start,
+        expires_at,
+        mark_cfg,
+        &blackout_windows,
+    )
+    .await;
 
     // Recompute the news-sentiment verdict for the replay window (same algorithm
     // tv-news / tv-arm use), as of the plan's armed_at or the window start.
@@ -454,7 +469,12 @@ async fn run_frozen(
     mark_cfg: DetectorMarkConfig,
 ) -> replay::Replay {
     let expires_at = candles.last().map(|c| c.time).unwrap_or_else(Utc::now) + Duration::days(365);
-    replay::run(plan, candles, gran, live_start, expires_at, mark_cfg).await
+    // Frozen fixtures replay offline (no network), so no live-resolved market-hours
+    // windows — pass empty (the market-hours gate then fails open, unchanged from
+    // before the in-loop seed existed). The spread-blackout gate still self-seeds
+    // per-bar on `is_ny_close_edge` inside `run`, so an NY-close-edge fixture bar
+    // is still gated deterministically off the frozen candle's own spread.
+    replay::run(plan, candles, gran, live_start, expires_at, mark_cfg, &[]).await
 }
 
 /// Build a readable diff error when a fixture's computed outcome diverges from
