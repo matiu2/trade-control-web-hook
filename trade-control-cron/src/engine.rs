@@ -621,10 +621,31 @@ async fn fetch_candles(
         BrokerHandle::Oanda(b) => b.get_candles(instrument, granularity, since, now).await,
         BrokerHandle::TradeNation(b) => b.get_candles(instrument, granularity, since, now).await,
     };
+    disposition(result)
+}
+
+/// Pure error-disposition for a candle fetch, split out so the three-way
+/// mapping is unit-testable without a live broker session.
+///
+/// The load-bearing distinction (bug ②, TN H4/M5 permanent brick): a
+/// `BadRange` is a *degenerate window* (`since >= now`) — a legitimate no-op
+/// the next tick widens past, so it maps to an empty vec. An
+/// `UnsupportedGranularity` is *structural* (the broker doesn't serve this TF
+/// at all, e.g. TradeNation H4/M5) and NEVER self-heals; mapping it to empty
+/// silently bricks the plan (empty seed → `watermark: None` → re-seed forever,
+/// never arms). So it must surface as a hard `Err` that `run_engine_tick`
+/// logs + skips (fail-soft, visible in journalctl) instead of a silent stall.
+fn disposition(result: Result<Vec<Candle>, CandleError>) -> Result<Vec<Candle>, String> {
     match result {
         Ok(c) => Ok(c),
         // A degenerate window is a no-op, not a failure — the next tick widens.
         Err(CandleError::BadRange) => Ok(Vec::new()),
+        // Structural: never self-heals. Loud error, not a silent empty seed.
+        Err(CandleError::UnsupportedGranularity) => Err(
+            "candle fetch: broker does not serve this granularity (plan cannot tick — \
+             re-arm on a broker-native timeframe)"
+                .into(),
+        ),
         Err(CandleError::Transient) => Err("candle fetch failed (transient)".into()),
     }
 }
@@ -931,6 +952,38 @@ mod tests {
             seed_since(Granularity::M15, now),
             ts("2026-06-17T17:30:00Z")
         );
+    }
+
+    // ===== candle-fetch disposition (bug ②: TN H4/M5 permanent brick) =====
+
+    #[test]
+    fn disposition_bad_range_is_an_empty_no_op() {
+        // A degenerate window (`since >= now`) is a legitimate no-op the next
+        // tick widens past — it maps to an empty vec, not an error.
+        assert_eq!(disposition(Err(CandleError::BadRange)), Ok(Vec::new()));
+    }
+
+    #[test]
+    fn disposition_unsupported_granularity_is_a_loud_error_not_empty() {
+        // The bug: a structural "broker doesn't serve this TF" (TN H4/M5) must
+        // NOT map to an empty vec — that silently bricks the plan (empty seed →
+        // watermark None → re-seed forever). It must be a hard Err so the tick
+        // is logged + skipped, visible in journalctl.
+        let d = disposition(Err(CandleError::UnsupportedGranularity));
+        assert!(
+            d.is_err(),
+            "unsupported granularity must be an Err, got {d:?}"
+        );
+    }
+
+    #[test]
+    fn disposition_transient_is_an_error() {
+        assert!(disposition(Err(CandleError::Transient)).is_err());
+    }
+
+    #[test]
+    fn disposition_ok_passes_candles_through() {
+        assert_eq!(disposition(Ok(Vec::new())), Ok(Vec::new()));
     }
 
     #[test]
