@@ -31,20 +31,14 @@ use chrono::{DateTime, Duration, Utc};
 use trade_control_core::blackout_widen::{clamp_widen, spread_hour_widen_size, widened_stop};
 use trade_control_core::broker::{AmendError, Broker, OpenPosition};
 use trade_control_core::ny_clock::is_ny_close_edge;
-use trade_control_core::spread_blackout::{spread_hour_widen_frac, widen_frac_to_pips};
+use trade_control_core::spread_blackout::{
+    NY_CLOSE_WINDOW_MARKER_TTL_SECONDS, spread_hour_widen_frac, widen_frac_to_pips,
+};
 use trade_control_core::state::{EntryAttempt, RememberedStop, SpreadBlackoutRecord, StateStore};
 
 use crate::broker_handle::BrokerHandle;
 use crate::constants::spread_block_ttl_seconds;
 use crate::seam::CronEnv;
-
-/// The coarse legacy NY-close-edge **window marker** TTL (~3h). This is the
-/// global "the NY-close spread window is open" flag the entry gate reads
-/// (`dispatch::enter`), NOT a per-trade cancel-record — so it is deliberately
-/// decoupled from both split backstop concerns (the per-record block-length TTL
-/// and the safety force-restore ceiling). Kept at its historical 3h so the
-/// legacy `is_ny_close_edge` entry-gating behaviour is unchanged.
-const NY_CLOSE_WINDOW_MARKER_TTL_SECONDS: u64 = 3 * 60 * 60;
 
 /// Open the global spread-blackout **window marker** (System 1, the
 /// entry-reject window the entry gate reads) iff `now` is the NY-close edge. The

@@ -113,10 +113,6 @@ pub enum FillOutcome {
     Declined {
         name: String,
     },
-    SpreadBlackout {
-        spread_pips: f64,
-        threshold_pips: f64,
-    },
 }
 
 impl From<&SimOutcome> for FillOutcome {
@@ -156,13 +152,6 @@ impl From<&SimOutcome> for FillOutcome {
                 reason: reason.clone(),
             },
             SimOutcome::Declined { name } => FillOutcome::Declined { name: name.clone() },
-            SimOutcome::SpreadBlackout {
-                spread_pips,
-                threshold_pips,
-            } => FillOutcome::SpreadBlackout {
-                spread_pips: *spread_pips,
-                threshold_pips: *threshold_pips,
-            },
         }
     }
 }
@@ -354,6 +343,10 @@ mod tests {
                 inputs.meta.start,
                 expires_at,
                 mark_cfg,
+                // Frozen fixtures have no live-resolved market-hours windows —
+                // empty (gate fails open, unchanged). Spread-blackout still
+                // self-seeds per-bar inside `run` off the frozen candle spread.
+                &[],
             )
             .await;
             // Fixtures are saved from `--simulate` runs (the default), so the
@@ -430,16 +423,6 @@ mod tests {
                 SimOutcome::Unresolved("bad geometry".into()),
                 FillOutcome::Unresolved {
                     reason: "bad geometry".into(),
-                },
-            ),
-            (
-                SimOutcome::SpreadBlackout {
-                    spread_pips: 30.0,
-                    threshold_pips: 8.0,
-                },
-                FillOutcome::SpreadBlackout {
-                    spread_pips: 30.0,
-                    threshold_pips: 8.0,
                 },
             ),
         ];

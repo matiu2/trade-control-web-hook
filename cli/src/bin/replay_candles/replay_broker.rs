@@ -126,10 +126,9 @@ fn apply_reversal_close(outcome: &SimOutcome, closes: &[CloseFire]) -> Option<Re
             ..
         } => (*fill_at, *entry_price, Some(*exit_at)),
         // No open position to close.
-        SimOutcome::NeverFilled
-        | SimOutcome::Declined { .. }
-        | SimOutcome::SpreadBlackout { .. }
-        | SimOutcome::Unresolved(_) => return None,
+        SimOutcome::NeverFilled | SimOutcome::Declined { .. } | SimOutcome::Unresolved(_) => {
+            return None;
+        }
     };
     closes
         .iter()
@@ -501,13 +500,6 @@ impl ReplayBroker {
                     SimOutcome::Declined { .. } => {
                         (fire_at, window_end, placed_level, None, FillKind::Declined)
                     }
-                    SimOutcome::SpreadBlackout { .. } => (
-                        fire_at,
-                        window_end,
-                        placed_level,
-                        None,
-                        FillKind::SpreadBlackout,
-                    ),
                     // `Unresolved` has nothing to draw — the report returned `None`
                     // from its `Unresolved => return None` arm, so the ledger does too.
                     SimOutcome::Unresolved(_) => return None,
@@ -596,11 +588,11 @@ impl ReplayBroker {
             // here too — these v2 plans don't set `expiry_bars`, and the gate's
             // cap/window bound the re-entry count regardless.)
             SimOutcome::NeverFilled => AttemptState::Pending,
-            // Declined / spread-blackout / unresolved — no order ever went on;
-            // the slot is free.
-            SimOutcome::Declined { .. }
-            | SimOutcome::SpreadBlackout { .. }
-            | SimOutcome::Unresolved(_) => AttemptState::Cancelled,
+            // Declined / unresolved — no order ever went on; the slot is free.
+            // (Spread-blackout is no longer a `simulate_fill` outcome — the enter
+            // is rejected pre-placement by `run_enter`'s seeded gate, so a
+            // blacked-out enter never reaches `resolve` as a placed attempt.)
+            SimOutcome::Declined { .. } | SimOutcome::Unresolved(_) => AttemptState::Cancelled,
         }
     }
 

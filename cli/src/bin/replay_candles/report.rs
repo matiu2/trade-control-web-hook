@@ -114,19 +114,19 @@ pub enum FillKind {
     NeverFilled,
     /// An entry the worker declined to place (entry past a gate level). Not taken.
     Declined,
-    /// An entry the worker's spread-blackout gate would have rejected (fire-bar
-    /// spread above threshold inside the NY-close-edge window). Not taken.
-    SpreadBlackout,
     /// An entry the worker's pre-broker gate would have rejected — the
-    /// `allow_entry` script returned false/errored, or the candle-quality
+    /// `allow_entry` script returned false/errored, the candle-quality
     /// requirement (`needs_golden` / `needs_confirmed`) the signal-folded shell
-    /// didn't meet. Not taken (the live worker 412s before placing the order).
+    /// didn't meet, or a market-hours / spread-blackout gate rejected the entry.
+    /// Not taken (the live worker 4xx's before placing the order). The specific
+    /// reason string is carried on the fire's `rejected_reason` and rendered by
+    /// the `rejected_reason` branch in `entry_events`.
     GateBlocked,
 }
 
 impl FillKind {
     /// Was this position actually taken (an order filled)? `false` for the
-    /// not-taken kinds (`NeverFilled` / `Declined` / `SpreadBlackout`), which
+    /// not-taken kinds (`NeverFilled` / `Declined` / `GateBlocked`), which
     /// only have an *intended* bracket, anchored at the fire bar.
     pub fn is_taken(self) -> bool {
         matches!(
@@ -839,11 +839,6 @@ fn render_fire(
             note: format!("{ev} fill: DECLINED — entry past a gate level (no order placed)"),
             close: Some(candle.c),
         }),
-        FillKind::SpreadBlackout => events.push(EntryEvent {
-            at: candle.time,
-            note: format!("{ev} fill: SPREAD BLACKOUT — entry rejected on fire-bar spread"),
-            close: Some(candle.c),
-        }),
         // A gate rejection is handled by the `rejected_reason` branch above; if
         // the ledger ever surfaces it here, render it plainly.
         FillKind::GateBlocked => events.push(EntryEvent {
@@ -1122,7 +1117,6 @@ mod tests {
         assert!(FillKind::ClosedOnReversal.is_taken());
         assert!(!FillKind::NeverFilled.is_taken());
         assert!(!FillKind::Declined.is_taken());
-        assert!(!FillKind::SpreadBlackout.is_taken());
         // BUG-replay-golden-gate-not-enforced: a gate-blocked enter is not
         // taken, so it contributes 0R to the entry-style net-R comparison.
         assert!(!FillKind::GateBlocked.is_taken());
