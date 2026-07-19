@@ -1,13 +1,17 @@
-//! Format the replay outcome: each fire, and — for enters — the simulated fill.
+//! Format the replay outcome: each fire, and — for enters — the fill the broker
+//! ledger computed.
 //!
-//! The shell-from-fire reconstruction mirrors the worker's `dispatch_fired`
-//! (an H&S Pine fire folds its latched signal onto the shell; everything else
-//! gets the plain candle shell), so `simulate_fill` resolves entry/SL/TP against
-//! the same levels the live dispatch would have.
+//! The report is pure formatting now: a placed enter's fill/exit outcome comes
+//! from the `ReplayBroker` ledger (`fire.realized`), walked against the order's
+//! STORED placed bracket (`fire.placed_bracket`) — the same floored stop the
+//! retry-gate `resolve` uses, so report and ledger can't disagree. The
+//! shell-from-fire reconstruction still mirrors the worker's `dispatch_fired`
+//! (an H&S Pine fire folds its latched signal; everything else gets the plain
+//! candle shell) for the display lines that resolve the signed SL for annotation.
 //!
 //! ## Reversal-close post-pass
 //!
-//! `simulate_fill` is pure and per-enter: it knows only the bracket (entry / SL
+//! The fill sim is pure and per-enter: it knows only the bracket (entry / SL
 //! / TP) and the forward candle path. The `06-close-on-reversal` close is a
 //! *separate* fire (a `PinePattern` guard the engine now fires when a confirming
 //! opposite-direction reversal candle prints inside the SR band). So the report
@@ -25,8 +29,8 @@ use trade_control_core::intent::{
 use trade_control_core::plan_sentiment::PlanSentiment;
 use trade_control_core::spread_blackout::elevated_threshold_pips;
 use trade_control_engine::{
-    BidAskCandle as EngineCandle, EntryFloor, SweepReason, TradePlan, apply_entry_spread_floor,
-    breakeven_armed_at, sweep_reason, widened_stop_at,
+    BidAskCandle as EngineCandle, SweepReason, TradePlan, breakeven_armed_at_resolved,
+    sweep_reason, widened_stop_at_resolved,
 };
 
 use super::brisbane::bne;
@@ -597,38 +601,31 @@ fn render_fire(
         None => Shell::from_candle(candle),
     };
 
-    // The "placed" event carries the resolved bracket (direction, entry, SL,
-    // TP) — the journaling record of what order went on. The spread-floor widen
-    // is applied so the shown SL is the protected stop, not the signed level.
-    // The fill's R is scored off the ledger's floored stop (`resolve_fire_any`
-    // below), not this preview — this block only formats the placed line.
-    let placed_note = match Resolved::from_intent(
-        intent,
-        &shell,
-        plan.pip_size,
-        replay_report_tick(intent, plan),
-    ) {
-        Ok(mut resolved) => {
-            let signed_sl = resolved.stop_loss;
-            let floor = apply_entry_spread_floor(
-                &mut resolved,
+    // The "placed" event carries the bracket the broker actually rested on — the
+    // stored placed levels (`fire.placed_bracket`), the SAME floored stop the
+    // ledger scores the fill's R off. When the floor moved the stop off the signed
+    // level, note it (comparing the stored placed SL to a fresh signed resolve).
+    let placed_note = match &fire.placed_bracket {
+        Some(resolved) => {
+            let mut note = format!("{ev} placed — {}", describe_order(resolved, plan.pip_size));
+            // Recover the signed (un-floored) SL for the annotation by resolving
+            // the intent afresh; if it differs from the placed stop, the floor
+            // moved it. (Display only — the placed stop is authoritative.)
+            if let Ok(signed) = Resolved::from_intent(
+                intent,
+                &shell,
                 plan.pip_size,
-                &fire.forward,
-                fire.entry_spread_price,
-            );
-            let mut note = format!("{ev} placed — {}", describe_order(&resolved, plan.pip_size));
-            // When the floor moved the stop, note the spread that sized it.
-            if let EntryFloor::Applied { spread_pips } = floor
-                && (resolved.stop_loss - signed_sl).abs() > f64::EPSILON
+                replay_report_tick(intent, plan),
+            ) && (resolved.stop_loss - signed.stop_loss).abs() > f64::EPSILON
             {
                 note.push_str(&format!(
-                    " [SL floored to 10× spread ({spread_pips:.1}p @ entry bar); signed SL was {}]",
-                    fmt_price(signed_sl, plan.pip_size),
+                    " [SL floored to 10× spread; signed SL was {}]",
+                    fmt_price(signed.stop_loss, plan.pip_size),
                 ));
             }
             note
         }
-        Err(err) => format!("{ev} placed — order UNRESOLVED: {err:?}"),
+        None => format!("{ev} placed — order UNRESOLVED"),
     };
     let mut events: Vec<EntryEvent> = vec![EntryEvent {
         at: candle.time,
@@ -666,15 +663,16 @@ fn render_fire(
         return events;
     }
 
+    // The bracket the broker placed this order at — all the display lines below
+    // annotate THIS (the stored floored stop), so they match the ledger's scored
+    // outcome. `None` only if the intent didn't resolve (nothing was placed).
+    let Some(placed) = fire.placed_bracket.as_ref() else {
+        return events;
+    };
+
     // Break-even arming: the bar whose close runs past 50%-to-TP. The live cron
     // (`breakeven_watch`) amends the broker SL to entry here.
-    if let Some(armed_at) = breakeven_armed_at(
-        intent,
-        &shell,
-        plan.pip_size,
-        &fire.forward,
-        fire.entry_spread_price,
-    ) {
+    if let Some(armed_at) = breakeven_armed_at_resolved(placed, intent, &shell, &fire.forward) {
         events.push(EntryEvent {
             at: armed_at,
             note: format!("{ev} SL→break-even (a candle closed past 50%-to-TP)"),
@@ -686,19 +684,19 @@ fn render_fire(
     // price (`blackout_apply`), transiently — the recovery watcher
     // (`blackout_watch`) restores the original once the spread recovers (≤4p) or
     // the 3h backstop fires. We surface BOTH so the journal shows the shield
-    // snapping back, not a permanent risk change. `simulate_fill` now ALSO applies
-    // this same widen (via the shared `widened_stop_at`) when scoring the exit — so
-    // a spread-hour spike that clears the widened stop no longer books a false
-    // stop-out. These journal lines and the scored outcome read the same
-    // reconstruction, so they can't disagree.
+    // snapping back, not a permanent risk change. `simulate_fill_resolved` ALSO
+    // applies this same widen (via `widened_stop_at_resolved`) when scoring the
+    // exit — so a spread-hour spike that clears the widened stop no longer books a
+    // false stop-out. These journal lines and the scored outcome read the same
+    // reconstruction off the SAME placed bracket, so they can't disagree.
     let widen_trigger = elevated_threshold_pips(&intent.instrument);
-    if let Some(widen) = widened_stop_at(
+    if let Some(widen) = widened_stop_at_resolved(
+        placed,
         intent,
         &shell,
         plan.pip_size,
         &fire.forward,
         widen_trigger,
-        fire.entry_spread_price,
     ) {
         events.push(EntryEvent {
             at: widen.at,
@@ -1185,33 +1183,28 @@ mod tests {
             // that strips `golden` off the reconstructed shell.
             signal: None,
         };
-        // Mirror the replay loop: a placed enter gets its outcome from the broker
-        // ledger, which the report then reads (PR 4b-2). A rejected/other gate
-        // outcome leaves `realized: None` — the report renders it from gate state.
-        let realized = if matches!(gate_outcome, EnterGateOutcome::Placed { .. }) {
+        // Mirror the replay loop: a placed enter gets its bracket + outcome from
+        // the broker ledger, which the report then reads (PR 4b-2). A rejected/
+        // other gate outcome leaves both `None` — rendered from gate state.
+        let (placed_bracket, realized) = if matches!(gate_outcome, EnterGateOutcome::Placed { .. })
+        {
             let broker =
                 crate::replay_candles::replay_broker::ReplayBroker::new(forward.clone(), 0.0001);
             let shell = Shell::from_candle(&fired.candle);
-            broker.record_order(
-                "e1".into(),
-                fired.intent.clone(),
-                shell,
-                forward.clone(),
-                None,
-            );
-            broker.realized_outcome("e1", &[])
+            broker.record_order("e1".into(), fired.intent.clone(), shell, forward.clone());
+            (
+                broker.placed_bracket("e1"),
+                broker.realized_outcome("e1", &[]),
+            )
         } else {
-            None
+            (None, None)
         };
         Fire {
             fired,
             forward,
             gate_outcome,
             superseded: false,
-            // No windowed spread in the fixture → the floor falls back to the
-            // fire bar's own close spread, the pre-window behaviour these tests
-            // were written against.
-            entry_spread_price: None,
+            placed_bracket,
             realized,
         }
     }

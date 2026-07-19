@@ -238,10 +238,33 @@ pub fn simulate_fill_windowed(
                 };
             }
         };
+    simulate_fill_resolved(&resolved, intent, shell, pip_size, candles)
+}
+
+/// The pure fill/exit physics over a bracket the caller has ALREADY resolved +
+/// floored — the "orders are state" entry point. This is the body
+/// [`simulate_fill_windowed`] runs after `resolve_effective_bracket`; extracting
+/// it lets the `ReplayBroker` walk its **stored placed levels** (the stop the
+/// broker actually rests on) without re-resolving the intent or re-deriving the
+/// SL-vs-spread floor off a trailing spread — which is what made the retry-gate
+/// `resolve` and the ledger `realize` disagree (replay↔live divergence #4). One
+/// bracket in, one outcome out; no spread scalar, no floor.
+///
+/// `intent` + `shell` are still needed for the entry-side fill test (`find_fill`
+/// keys the pending-order trigger + the spread-hour rubbish-candle skip off them)
+/// and for the System-2 widen's per-instrument spread-hour gate — but the SL/TP
+/// **levels** come from `resolved`, never re-floored.
+pub fn simulate_fill_resolved(
+    resolved: &Resolved,
+    intent: &Intent,
+    shell: &Shell,
+    pip_size: f64,
+    candles: &[BidAskCandle],
+) -> SimOutcome {
     let dir = resolved.direction;
 
     // Phase 1 — find the fill (shared with `breakeven_armed_at`).
-    let Some(fill) = find_fill(&resolved, intent, shell, dir, candles) else {
+    let Some(fill) = find_fill(resolved, intent, shell, dir, candles) else {
         return SimOutcome::NeverFilled;
     };
     let (fill_at, entry_price, rest) = (fill.fill_at, fill.entry_price, fill.rest);
@@ -268,24 +291,15 @@ pub fn simulate_fill_windowed(
 
     // System-2 spread-hour widen (replay==live): during a learned spread hour the
     // live cron amends the broker stop *away* from price, transiently, then the
-    // recovery watcher restores it. The SHARED reconstruction `widened_stop_at`
-    // computes that same widen from the same floored bracket + candle path this
-    // sim resolved, so the exit is scored against the stop the LIVE broker would
-    // actually hold — not the un-widened level (BUG-spread-hour-widen-no-subhour-
-    // lead.md: the widen was previously journal-only, so a spread-hour spike stopped
-    // the position out at the original stop even though live it was widened clear).
+    // recovery watcher restores it. The SHARED reconstruction computes that same
+    // widen from the SAME placed bracket + candle path, measured relative to
+    // `resolved.stop_loss` (the stored placed stop), so the exit is scored against
+    // the stop the LIVE broker would actually hold — not the un-widened level.
     // The widen governs bars in `[effective_from, restored_at)`; outside it the
     // break-even-managed `active_stop` applies.
     let widen_trigger =
         trade_control_core::spread_blackout::elevated_threshold_pips(&intent.instrument);
-    let widen = widened_stop_at(
-        intent,
-        shell,
-        pip_size,
-        candles,
-        widen_trigger,
-        entry_spread_price,
-    );
+    let widen = widened_stop_at_resolved(resolved, intent, shell, pip_size, candles, widen_trigger);
 
     let mut active_stop = resolved.stop_loss;
     for c in rest {
@@ -509,7 +523,6 @@ pub fn breakeven_armed_at(
     candles: &[BidAskCandle],
     entry_spread_price: Option<f64>,
 ) -> Option<chrono::DateTime<chrono::Utc>> {
-    let be = intent.breakeven?;
     // Resolve the effective (floored) bracket through the SAME shared pipeline the
     // fill sim uses. Any rejection (unresolved / level-veto / spread-blackout /
     // floor-below-min-r) means the worker never placed the entry, so break-even
@@ -518,8 +531,22 @@ pub fn breakeven_armed_at(
     // "stopped out before arming" and suppressing the SL→break-even line.
     let resolved =
         resolve_effective_bracket(intent, shell, pip_size, candles, entry_spread_price).ok()?;
+    breakeven_armed_at_resolved(&resolved, intent, shell, candles)
+}
+
+/// [`breakeven_armed_at`] over a bracket the caller has ALREADY resolved + floored
+/// — the "orders are state" display path, where the report reads the broker's
+/// stored placed bracket so its SL→break-even line arms off the SAME floored stop
+/// the ledger scored (no trailing-spread re-derivation).
+pub fn breakeven_armed_at_resolved(
+    resolved: &Resolved,
+    intent: &Intent,
+    shell: &Shell,
+    candles: &[BidAskCandle],
+) -> Option<chrono::DateTime<chrono::Utc>> {
+    let be = intent.breakeven?;
     let dir = resolved.direction;
-    let fill = find_fill(&resolved, intent, shell, dir, candles)?;
+    let fill = find_fill(resolved, intent, shell, dir, candles)?;
 
     let exit_book = book_for(Leg::Exit, dir);
     let level = be.arms_at(fill.entry_price, resolved.take_profit);
@@ -807,8 +834,37 @@ pub fn widened_stop_at(
     {
         return None;
     }
+    widened_stop_at_resolved(
+        &resolved,
+        intent,
+        shell,
+        pip_size,
+        candles,
+        widen_trigger_pips,
+    )
+}
+
+/// [`widened_stop_at`] over a bracket that has ALREADY been resolved + floored by
+/// the caller — the "orders are state" path, where the `ReplayBroker` holds the
+/// placed stop (the level the broker actually rests on) and there is nothing to
+/// re-floor. The System-2 widen is measured **relative to `resolved.stop_loss`**
+/// (the placed stop), so feeding the stored bracket here reconstructs the exact
+/// widen the live broker holds off that same placed level. The floor-front
+/// (`Resolved::from_intent` + `apply_entry_spread_floor`) version above is kept
+/// for the report's display path, which resolves from the intent.
+pub fn widened_stop_at_resolved(
+    resolved: &Resolved,
+    intent: &Intent,
+    shell: &Shell,
+    pip_size: f64,
+    candles: &[BidAskCandle],
+    widen_trigger_pips: f64,
+) -> Option<SpreadWiden> {
+    if !pip_size.is_finite() || pip_size <= 0.0 {
+        return None;
+    }
     let dir = resolved.direction;
-    let fill = find_fill(&resolved, intent, shell, dir, candles)?;
+    let fill = find_fill(resolved, intent, shell, dir, candles)?;
     let exit_book = book_for(Leg::Exit, dir);
     let original_stop = resolved.stop_loss;
 

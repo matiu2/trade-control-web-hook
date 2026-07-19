@@ -1,68 +1,65 @@
-# TODO — replay↔live gate parity (#2 market-hours + #3 spread-blackout)
+# TODO — ReplayBroker: orders are state (PR-1 of 2)
 
-**Goal:** make `run_enter`'s OWN market-hours and spread-blackout gates fire
-offline in the replay, by seeding the state-store windows they read — so the
-offline entry decision == the live worker's, and the replay-only proxy
-re-derivations can be deleted. (Parity-map memory residual #2 + #3.)
+**Goal (operator's model):** the simulation broker holds resting orders with
+CONCRETE levels and tests price vs those levels directly on the real bid/ask
+book — no mid, no trailing spread, no per-path re-derivation of the SL-vs-spread
+floor. Dissolves replay↔live divergence #4 at the root: the floored stop is
+computed ONCE at placement (as live does, baking it into `EntryRequest`), the
+broker remembers it, and every later question reads that one level.
 
-**Principle (user directive):** maximize shared code between replay and live.
-Reuse the SAME `is_ny_close_edge`, `set_spread_blackout_window`, TTL constant,
-and `windows_from_session` the worker uses — no replay-only re-implementation.
+**PR-1 = "orders are state"** (this branch). **PR-2 = sub-bar zoom-in** for a
+candle covering both SL and TP (separate branch; keep pessimistic-stop until
+then).
 
-## Shared-code prep
-- [x] Promote `NY_CLOSE_WINDOW_MARKER_TTL_SECONDS` (3h) from
-      `trade-control-cron/src/blackout_apply.rs` → `core::spread_blackout`
-      (mirrors `SAFETY_FORCE_RESTORE_SECONDS`'s "lives in core so replay
-      matches live" precedent). Cron re-exports it.
+## The root fact
+`run_enter` floors `resolved.stop_loss` (10× windowed-mean spread) BEFORE
+building `EntryRequest`, so `place_entry` receives the FINAL floored
+`req.stop_loss` / `req.take_profit` / `req.entry`. Live's broker places exactly
+that. The ReplayBroker currently DISCARDS `req.*` (`record_attempt` stores only
+intent/shell) and re-derives the floor in THREE places off `entry_spread_price`
+(the trailing spread) — `resolve`, `realize`, and `report::resolve_fire_any` —
+which is exactly why #4 exists (`resolve` single-sample vs `realize` windowed).
 
-## #2 — market-hours gate offline
-- [x] Resolve `blackout_windows` in `replay_candles.rs` BEFORE `replay::run`
-      (currently resolved after, only for the report). Pass into `run`.
-- [x] In `replay::run`, seed once before the tick loop:
-      `store.set_blackout_windows(instrument, &windows, now, ttl)`.
-- [x] `run_enter`'s `get_blackout_windows` gate now rejects offline →
-      `EnterGateOutcome::Rejected { "rejected: market-blackout" }`, no order
-      placed, `realized` None. Report renders via existing `rejected_reason`.
+## Steps
+- [x] `PlacedAttempt`: added `placed: Option<PlacedLevels>` (entry/stop_loss/
+      take_profit) — the concrete resting-order levels.
+- [x] `place_entry`: captures `req.{entry,stop_loss,take_profit}` onto the
+      attempt (armed path). The reactivate/re-drive path refreshes stored levels
+      from the re-drive `req` (restore re-floors at the restore bar).
+- [x] `resolve`: walks the STORED levels via `simulate_fill_resolved` (new engine
+      seam) — no floor re-derivation. Unresolvable intent → free slot.
+- [x] `realize` / `realized_outcome`: walks the stored levels; retired
+      `LedgerGeometry.entry_spread_price`. Break-even + reversal-close stay.
+- [x] report: display lines (`placed`, break-even, System-2 widen) read
+      `fire.placed_bracket` (read back from the broker) via `breakeven_armed_at_
+      resolved` / `widened_stop_at_resolved`. The taken-path R already read
+      `fire.realized` (ledger). Retired `Fire.entry_spread_price`.
+- [x] System-2 widen now measured off the STORED stop (`widened_stop_at_resolved`).
+- [x] Kept the ambiguous-bar pessimistic-stop — PR-2 replaces it with zoom-in.
 
-## #3 — spread-blackout gate offline
-- [x] In the tick loop, before `dispatch_enter`, seed the window per-bar via the
-      SHARED gate: `is_ny_close_edge(now)` →
-      `store.set_spread_blackout_window(now, NY_CLOSE_WINDOW_MARKER_TTL_SECONDS)`.
-      `run_enter`'s gate then samples `ReplayBroker::get_quote` and rejects.
+Engine seam: extracted `simulate_fill_resolved` / `widened_stop_at_resolved` /
+`breakeven_armed_at_resolved` (take a pre-resolved bracket, no floor front);
+the `_windowed` / floor-front variants stay for the (unchanged) live-mirroring
+callers. `apply_entry_spread_floor` stays in `engine` (the resolved-front
+variants + the `None`-placed fallback still call it).
 
-## Remove now-dead proxies (user chose "remove")
-CORRECTION mid-task: only the SPREAD-blackout re-derivation was truly dead. The
-market-hours `sweep_reason` blackout branch models the RESTING-ORDER SWEEP
-(`sweep.rs::market_blackout_act`) — an order placed OUTSIDE the blackout that a
-LATER blackout window catches resting. That's a DISTINCT live mechanism the
-seeded entry-gate does NOT cover, so it STAYS.
-- [x] `engine/src/simulator.rs`: delete `spread_blackout_reject` +
-      `BracketReject::SpreadBlackout` + `SimOutcome::SpreadBlackout`.
-      (spread-blackout entry gate now fires offline via the seed.)
-- [~] `sweep_reason`: KEEP the `market_blackout_due` branch + `blackout_windows`
-      param — it's the resting-order-sweep model, NOT the entry gate. Not dead.
-- [x] `FillKind::SpreadBlackout` + `FillOutcome::SpreadBlackout`: removed the now
-      unconstructable rendering/serialization variants across
-      report/annotate/fixture/replay_broker. (Only 1 saved fixture; doesn't use
-      it.) A spread-blackout rejection now renders via the `rejected_reason`
-      (`GateBlocked`) path.
-
-## Latent LIVE bug surfaced + fixed (restore vs the reject gates)
-Seeding the spread-blackout window exposed that the cancel→RESTORE re-drive
-(`run_enter(.., restore=true)`) bypasses the retry gate but NOT the two blackout
-reject gates — so a restore landing while the ~3h window is open was
-`rejected: spread-blackout` and the order DROPPED, never re-placed. Fires in LIVE
-too (shared code).
-- [x] `core/dispatch/enter.rs`: wrap BOTH blackout reject gates (market-hours +
-      spread-blackout) in `if !restore { … }`, same discipline as the existing
-      retry-gate bypass. SL-vs-spread floor (a hard per-entry limit) stays.
-      Guarded by the existing multishot cancel→restore replay test (fails without
-      the bypass now that the window is seeded).
+## Watch
+- The report↔ledger "bit-for-bit" shadow-parity gate: BOTH must move to stored
+  levels together or they diverge.
+- `entry_spread_price` retirement ripples: `Fire`, `record_order`,
+  `LedgerGeometry`, driver (`replay.rs`), and the report. Grep before deleting.
+- `apply_entry_spread_floor` / `simulate_fill_windowed` stay in `engine` (still
+  used by the LIVE-mirroring bracket-display + break-even annotator?) — check
+  callers before removing anything from `engine`.
+- SL-floor is LIVE placement behaviour: do NOT stop flooring at placement —
+  `run_enter` still floors before `EntryRequest`. We only stop RE-deriving it
+  downstream. The stored stop IS the floored stop.
 
 ## Verify
-- [x] New tests: `enter_inside_market_hours_blackout_is_rejected_by_the_seeded_gate`
-      + `enter_inside_spread_blackout_is_rejected_by_the_seeded_gate` (gate, not
-      sweep/proxy). Multishot restore test guards the restore-bypass.
-- [x] `cargo test` workspace single-threaded (48 bins green), clippy clean, fmt.
-- [ ] Commit + push; merge staging + main; tag; bump parent gitlink;
-      redeploy staging; remove worktree.
+- [x] New test `resolve_and_realize_agree_on_the_stored_placed_stop`: a short
+      placed with a floored 1.1030 stop; a 1.1025 wick (past the signed 1.1020)
+      stops NEITHER `resolve` nor `realize` — both honour the stored stop, so the
+      #4 corner can't flip re-entry state. Shadow-parity + fixture tests still green.
+- [x] `cargo test` workspace single-threaded (48 bins), clippy clean, fmt.
+- [ ] Commit + push; merge staging + main; tag; bump parent gitlink; redeploy
+      staging; remove worktree. (Then PR-2: zoom-in.)
