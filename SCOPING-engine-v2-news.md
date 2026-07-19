@@ -81,28 +81,44 @@ Sketch (subject to a build-time review like the earlier slices):
   `PlaceOrder` it's latest-bar-gated (don't chase a stale close). NON-terminal:
   the plan stays live for multi-shot re-entry (v1: a reversal-close guard flattens
   but keeps `AwaitEntry`).
-- **EXIT-ONLY — writes NO veto (v96, `a9e9b2c`, 2026-07-19).** The reversal-close
-  flattens the open position and does **not** write a `reversal` veto. The
-  operator's rule: *a reversal candle is a reason to EXIT, not to STAY OUT* — once
-  flat, a fresh signal may re-enter. Blocking future entries is the **separate**
-  job of the too-high/too-low invalidation caps (v2 `Invalidate`, already built)
-  and the 80%-to-TP pcl-exhausted abort — those fire on their own and don't close
-  the position. So the v2 reversal-close is a pure exit: `Effect::ClosePosition`
-  and nothing else. **Do NOT port a `reversal`-veto write** — `veto_on_reversal`
-  is now a dormant no-op in v1 (the field/flag still parse & round-trip for
-  back-compat, but write nothing; full removal deferred).
-  - *Why it was removed:* it was the last confirmed **replay↔live divergence** —
-    the live worker wrote the veto in `run_close`, but the offline replay never
-    calls `run_close` (its loop handles only Enter/Pause/Resume/Prep), so a later
-    multi-shot enter passed offline but rejected live. In v2 this class of bug
-    **can't exist by construction**: replay and live run the identical pure rule
-    and differ only in the Broker/Storage impls. Reinforces the v2 design.
+
+### Vocabulary — CLOSE vs VETO/INVALIDATE (per the CLAUDE.md glossary, v97)
+
+The reversal-close is a per-**POSITION CLOSE** — *not* an "exit" (a false start;
+settled by v97 `052a9fb`, `RuleKind::PerTradeExit` → `PerPositionClose`) and *not*
+a veto. Two axes disambiguate the whole family (does it touch the open position ×
+does it stop future entries):
+
+| glossary concept | open position | future entries | v2 rule/effect |
+|---|---|---|---|
+| **CLOSE** (reversal-close) | **flatten one** | **left open** | *pending* `PerPositionClose` → `Effect::ClosePosition` |
+| **VETO / INVALIDATE** (too-high/too-low, 80%-to-TP pcl-exhausted) | **leave alone** | **block all** | `InvalidateHigh`/`InvalidateLow` → `Effect::Invalidate` (**built**, already StopNextEntry-only) |
+| **CLOSE-VETO** (rare, true thesis-death) | **flatten** | **block** | not built |
+
+So the v2 reversal-close **flattens one position and does nothing else** — it does
+NOT block future entries; the trade lives and may re-enter. Blocking future
+entries is the *separate* job of the invalidation caps (already built as v2
+`Invalidate`), which conversely leave an open position running to its own SL/TP.
+My v2 `Invalidate` already documents itself as StopNextEntry-only / never-closes —
+so it matches the glossary's VETO/INVALIDATE row by construction.
+
+- **Writes NO veto (v96, `a9e9b2c`, 2026-07-19).** A gate-passed reversal-close
+  writes no `reversal` veto. **Do NOT port a `reversal`-veto write** —
+  `veto_on_reversal` is a dormant no-op in v1 (field/flag still parse & round-trip
+  for back-compat; full removal deferred).
+  - *Why removed:* it was the last confirmed **replay↔live divergence** — the live
+    worker wrote the veto in `run_close`, which the offline replay never calls, so
+    a later multi-shot enter passed offline but rejected live. In v2 this class of
+    bug **can't exist by construction**: replay and live run the identical pure
+    rule, differing only in the Broker/Storage impls. Reinforces the v2 design.
 
 Watch-points for that slice:
 - The **reversal detector** is the real work — engine-v2 has no Pine detector yet.
   It exists twice in v1 (Pine + `core/src/signals/`); reuse the `core` copy.
 - **OR not AND** for the news/price close gates (the load-bearing fix above).
-- **Exit-only** (see above) — no veto write; that's the invalidation caps' job.
+- **Close-only** (see the vocabulary table) — flattens one position, writes no
+  veto; blocking future entries is the invalidation caps' job. Name it
+  `PerPositionClose`, not "exit".
 - The close effect needs the **async Broker** threaded into the driver's execute
   step — the same boundary the `PlaceOrder` executor slice will introduce. May
   be worth doing the executor slice (place-order execution) first so the close
@@ -113,8 +129,11 @@ Watch-points for that slice:
 The live v1 news/close code gets bug-fixed as the demo runs; a design mapped one
 week can be stale the next. Before building the reversal-close slice, **re-check
 `git log --since` on** `core/src/dispatch/close.rs`, `core/src/pause_gate.rs`,
-`engine/src/evaluate.rs`, `core/src/signals/`, `core/src/intent.rs`. Known moves
-so far: v96 exit-only (above); the OnClose-origin-side / cross-buffer-atr /
-slope-scaled-retest engine tuning (System-agnostic). `pause_gate.rs` (System 1)
-has NOT changed since the pause slice shipped, so the built pause behaviour is
+`engine/src/evaluate.rs`, `core/src/signals/`, `core/src/intent.rs`,
+`conventions/src/roles.rs`. Known moves so far: v96 close-writes-no-veto + v97
+terminology (`PerTradeExit` → `PerPositionClose`, "close" not "exit"; see the
+CLAUDE.md CLOSE vs VETO/INVALIDATE glossary); the OnClose-origin-side /
+cross-buffer-atr / slope-scaled-retest engine tuning (System-agnostic).
+`pause_gate.rs` (System 1) has NOT changed since the pause slice shipped, so the
+built pause behaviour is
 still a faithful port.
