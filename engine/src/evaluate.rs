@@ -752,6 +752,10 @@ fn evaluate_one_entry(
                 rule.intent.needs_confirmed,
                 confirmed_floor,
                 state.last_confirmed_enter_at,
+                // Plain (non-confirmed) enters are print-only: fire on the bar a
+                // signal occurs, not on a later bar it retroactively confirms.
+                // A `needs_confirmed` enter opts INTO confirmation-firing.
+                !rule.intent.needs_confirmed,
             ) {
                 Some(sig) => Some(sig),
                 None => return,
@@ -891,6 +895,7 @@ fn eval_pine_entry(
     confirmed_first: bool,
     confirmed_floor: Option<chrono::DateTime<chrono::Utc>>,
     confirmed_after: Option<chrono::DateTime<chrono::Utc>>,
+    print_only: bool,
 ) -> Option<LatchedSignal> {
     let Some(idx) = detector_window.iter().position(|c| c.time == candle.time) else {
         tracing::debug!(
@@ -985,6 +990,25 @@ fn eval_pine_entry(
         );
         return None;
     }
+    // Print-only gate (plain enters — no --strategy-v2 / no --quasimodo).
+    // `latched_signal_at` reports `fires` on TWO bar kinds: the bar a signal
+    // PRINTS, and the bar an earlier pending signal retroactively VALIDATES
+    // (`just_valid`). A plain enter must fire only on an actual occurrence —
+    // the print — so a signal that merely *confirmed* here (its own print bar
+    // is earlier: `signal_bar_time != candle.time`) is declined. Confirmation
+    // semantics belong to the `needs_confirmed` (strategy-v2 / quasimodo)
+    // path via `first_confirmed_signal_at`; the reversal-close GUARD passes
+    // `print_only == false` because it legitimately reacts to a reversal
+    // printing OR validating now (see `eval_pine_guard`). AU200_AUD 2026-07-20.
+    if print_only && !confirmed_first && sig.signal_bar_time != candle.time {
+        tracing::debug!(
+            bar = %candle.time,
+            signal_bar = %sig.signal_bar_time,
+            "pine-enter: plain enter — signal validated here but printed on an \
+             earlier bar; print-only path declines (not an occurrence)"
+        );
+        return None;
+    }
     Some(sig)
 }
 
@@ -1053,6 +1077,9 @@ fn eval_pine_guard(
         false,
         None,
         None,
+        // `print_only: false` — the reversal-close guard wants "a reversal
+        // printed OR validated *now*", not print-only (see the doc above).
+        false,
     )?;
 
     // Contextual window gate — the pure mirror of the worker's
@@ -5399,6 +5426,58 @@ mod tests {
             (sig.signal_low - 110.0).abs() < 1e-9,
             "lo {}",
             sig.signal_low
+        );
+    }
+
+    #[test]
+    fn plain_enter_does_not_fire_on_a_retroactive_confirmation_bar() {
+        // AU200_AUD 2026-07-20 staging replay: a PLAIN enter (no --strategy-v2 /
+        // no --quasimodo → `needs_confirmed == false`) must fire ONLY on the bar a
+        // signal actually PRINTS, never on a later bar where an earlier pending
+        // signal retroactively VALIDATES. In `two_short_engulfers_window`, short
+        // #1 prints on bar 1 and confirms on bar 3 (bar 3 prints nothing). At bar 3
+        // the plain enter must decline — that's a confirmation, not an occurrence.
+        let rule = pine_enter_rule(None, Direction::Short, false);
+        assert!(
+            !rule.intent.needs_confirmed,
+            "this is the plain (non-confirmed) enter"
+        );
+        let p = plan(vec![rule]);
+        let window = two_short_engulfers_window();
+        // Tick that processes ONLY bar 3 (the confirmation bar).
+        let prior = seed_at(Phase::AwaitEntry, "2026-06-16T11:00:00Z");
+        let eval = run_window(&p, &prior, &window[3..], &window);
+        assert!(
+            eval.fired.is_empty(),
+            "plain enter must NOT fire on a retroactive-confirmation bar (got {:?})",
+            eval.fired
+        );
+    }
+
+    #[test]
+    fn plain_enter_fires_on_the_bar_the_signal_prints() {
+        // The other half of the print-only rule: a plain enter DOES fire on the
+        // bar a signal prints. Bar 2 of `two_short_engulfers_window` prints short
+        // #2 (high 112 / low 104); the plain enter fires there off that print.
+        let rule = pine_enter_rule(None, Direction::Short, false);
+        let p = plan(vec![rule]);
+        let window = two_short_engulfers_window();
+        // Tick that processes ONLY bar 2 (short #2 prints here).
+        let prior = seed_at(Phase::AwaitEntry, "2026-06-16T10:00:00Z");
+        let eval = run_window(&p, &prior, &window[2..3], &window);
+        assert_eq!(
+            eval.fired.len(),
+            1,
+            "plain enter fires on the print bar (got {:?})",
+            eval.fired
+        );
+        let sig = eval.fired[0]
+            .signal
+            .expect("a PinePattern fire carries latched geometry");
+        assert_eq!(
+            sig.signal_bar_time,
+            ts("2026-06-16T11:00:00Z"),
+            "fired off the signal that printed on this bar, not an earlier one"
         );
     }
 

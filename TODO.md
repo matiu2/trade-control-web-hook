@@ -1,50 +1,49 @@
-# PR-2: sub-bar zoom-in for ambiguous SL/TP bars
+# TODO — plain-mode enter must fire only on a signal PRINT, not on retroactive confirmation
 
-## Goal
-When a single candle's range covers **both** SL and TP, the sim today
-pessimistically assumes the STOP (`(true, _) => StoppedOut` in
-`engine/src/simulator.rs::simulate_fill_resolved`). PR-2 replaces that, on the
-ambiguous bar only, with a **sub-bar zoom-in**: replay finer-granularity candles
-for that bar's window and let the first level actually touched decide the outcome.
-Falls back to today's pessimistic stop when no finer data is available
-(behaviour-preserving for every current caller + fixture).
+## Bug (staging replay, AU200_AUD 2026-07-20 M15)
 
-## Design
-- **Data source**: the driver pre-fetches a finer-granularity bid/ask window
-  (once) via the same `candles::pull` path it already uses, over the same span,
-  and hands it to the `ReplayBroker`. No live fetch inside the pure sync sim.
-- **Engine seam**: `simulate_fill_resolved` stays pure/sync. A new `SubBars`
-  provider (trait) is consulted ONLY on the ambiguous `(true,true)` bar. `NoZoom`
-  (default) → pessimistic stop. The current public `simulate_fill_resolved`
-  delegates with `NoZoom` so all callers are unchanged.
-- **Zoom rule**: replay the finer bars in `[bar.time, bar.time + bar_len)` in
-  order; first that hits SL → StoppedOut, first that hits TP → TookProfit; a
-  finer bar itself still ambiguous → pessimistic stop (finest grain we have).
-  BE / widen effective-stop is computed once for the parent bar and used for all
-  its sub-bars (BE arms on a CLOSE, so it can only change the NEXT parent bar).
+`tv-arm-staging --start=... --replay` (plain rules — no `--strategy-v2`, no
+`--quasimodo`) entered off a signal that only *confirmed* on a later bar, not
+one that actually *printed* there. Operator: "if we're not using strategy-v2
+or quasimodo, we shouldn't accept confirmed signals — only signals when they
+actually occur."
 
-## Steps
-- [x] engine: `SubBars` trait + `NoZoom`; `simulate_fill_resolved_zoom` variant;
-      zoom-aware exit loop (`zoom_ambiguous_bar` + `infer_bar_len`);
-      `simulate_fill_resolved` delegates with `NoZoom`.
-- [x] engine: 5 unit tests (no-zoom pessimistic; zoom TP-first; zoom SL-first;
-      sub-bar-ambiguous → stop; no-covering-sub-bars → stop).
-- [x] ReplayBroker: `with_sub_bars` + `FinerSeries` (impl `SubBars`); `resolve` /
-      `realize` call `_zoom` with `self.zoom()`.
-- [x] driver: `granularity::finer`; pull finer series over the coarse span;
-      thread `finer_candles` into `replay::run` → broker. Fail-soft everywhere.
-- [x] all `run()` call sites (+fixture) get the extra `&[]` arg.
-- [x] cargo test workspace single-threaded — all green incl. all_fixtures_match;
-      clippy clean; fmt clean.
-- [x] CHANGELOG v101; README replay-sim note.
-- [ ] memory update; commit/push/merge staging+main/tag v101/parent-bump/redeploy.
+## Root cause
 
-## Watch
-- Keep `simulate_fill_resolved` sync & pure — the zoom provider is pre-fetched
-  data, not an async fetch threaded through the engine.
-- All 16 `ReplayBroker::new` call sites must keep compiling → make zoom additive
-  (`new` = no zoom; a `with_sub_bars` builder for the driver only).
-- Fixtures re-simulate via `simulate_fill` (no zoom) → outcomes unchanged.
-- The finest grain we can pull still has ambiguous bars (a 1-min bar can span
-  both). Zoom REDUCES ambiguity, never eliminates it → pessimistic stop remains
-  the floor. Log/annotate when we fall back so it's not silently pessimistic.
+`core/src/signals/state_machine.rs::latched_signal_at` (the plain-mode path,
+`needs_confirmed == false`) sets `fires = true` on TWO bar kinds:
+1. a fresh signal PRINTS this bar  ← correct for plain mode
+2. an earlier pending signal *just validated/confirmed* this bar (`just_valid`)
+   ← confirmation semantics leaking into the plain path
+
+Path #2 belongs only to `--strategy-v2`/`--quasimodo` (`needs_confirmed`),
+which route through `first_confirmed_signal_at`, not `latched_signal_at`.
+
+`latched_signal_at` is ALSO consumed by the close/guard path
+(`eval_pine_guard` → `eval_pine_entry`), which legitimately reacts to a
+reversal *confirming*. So the fix must NOT change `latched_signal_at` — scope
+it to the plain ENTER only.
+
+## Fix (DONE — code + tests green)
+
+- [x] `eval_pine_entry` gained `print_only: bool`. When
+      `print_only && !confirmed_first && sig.signal_bar_time != candle.time`
+      → decline (a validated-here-but-printed-earlier signal is not an
+      occurrence).
+- [x] Enter call site passes `!rule.intent.needs_confirmed` (plain = print-only;
+      confirmed enters opt INTO confirmation-firing).
+- [x] Guard call site (`eval_pine_guard`) passes `false` — reversal-close still
+      reacts to a reversal printing OR validating now (unchanged).
+- [x] Tests: `plain_enter_does_not_fire_on_a_retroactive_confirmation_bar`
+      (bar 3 of `two_short_engulfers_window` → no fire) +
+      `plain_enter_fires_on_the_bar_the_signal_prints` (bar 2 → fires off the
+      print). Both green.
+- [x] engine 165 pass, core 879 pass; clippy clean; fmt clean.
+
+## Remaining
+
+- [ ] CHANGELOG + memory note.
+- [ ] Commit/push staging + cherry-pick main + tag + parent-bump.
+- [ ] Rebuild replay-candles / tv-arm CLIs IF the market-hours WIP that
+      currently breaks the replay-candles binary has landed (else note blocked —
+      the engine fix is in the shared crate regardless).
