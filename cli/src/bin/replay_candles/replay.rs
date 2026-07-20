@@ -172,11 +172,6 @@ pub async fn run(
     live_start: DateTime<Utc>,
     expires_at: DateTime<Utc>,
     mark_cfg: DetectorMarkConfig,
-    // The instrument's market-hours no-entry windows, resolved by the driver from
-    // the SAME TN `market_info` source the live worker's `blackout_hours` cron
-    // uses (empty for OANDA / on any miss). Seeded into `store` below so
-    // `run_enter`'s OWN market-hours reject gate fires offline exactly as live.
-    blackout_windows: &[trade_control_core::intent::NoEntryWindow],
     // A pre-fetched FINER-granularity bid/ask series (e.g. M1 under an H1 plan),
     // spanning the same window, for the sub-bar zoom (PR-2): when an exit bar
     // straddles both SL and TP, the sim replays these finer candles for that bar
@@ -242,30 +237,11 @@ pub async fn run(
     // `super::lifecycle`; the broker + store are the ones above.
     let lifecycle_cfg = super::lifecycle::ReplayConfigProvider::new(plan.pip_size);
 
-    // Seed the market-hours no-entry windows into the store ONCE, so `run_enter`'s
-    // own reject gate (`store.get_blackout_windows(&resolved.instrument)`,
-    // `dispatch/enter.rs`) fires offline instead of the decision being re-derived
-    // post-hoc. Keyed on `plan.instrument` — the string every fired enter intent
-    // carries (`resolved.instrument == intent.instrument`), which is what the gate
-    // looks up. Live writes these daily via the `blackout_hours` cron with a ~26h
-    // missed-tick TTL; the replay's virtual clock is bar-pinned and can span days
-    // of warm-up + live bars, so we seed a TTL that comfortably outlives the whole
-    // window (the store clock never advances past the last bar). Empty windows
-    // (OANDA / a resolve miss) ⇒ the gate fails open, exactly as before this seed.
-    if !blackout_windows.is_empty() {
-        let seed_now = candles[0].time;
-        // Cover warm-up prefix through the last live bar, plus slack — the windows
-        // are minute-of-day recurring, so a long TTL just keeps them queryable for
-        // every bar's tick; it is NOT a per-day expiry.
-        let span_seconds = (expires_at - seed_now).num_seconds().max(0) as u64;
-        let ttl = span_seconds + 24 * 60 * 60;
-        if let Err(e) = store
-            .set_blackout_windows(&plan.instrument, blackout_windows, seed_now, ttl)
-            .await
-        {
-            tracing::error!(instrument = %plan.instrument, error = %e, "seed market-hours blackout windows failed");
-        }
-    }
+    // The market-hours reject gate in `run_enter` now reads the baked,
+    // weekday-aware mask keyed on the instrument (`intent::market_hours_blocked`),
+    // NOT a KV window — so there is nothing to seed here. The offline gate and the
+    // live gate consult the same baked table, so a market-hours reject fires
+    // offline exactly as live with no `market_info` fetch and no store seed.
 
     // The detector window grows with each tick: Pine / trendline triggers need
     // the full back-window of closed candles, not just the single new bar.
@@ -1014,7 +990,6 @@ mod tests {
             expires,
             no_marks(),
             &[],
-            &[],
         )
         .await;
 
@@ -1051,7 +1026,6 @@ mod tests {
             all_live(),
             no_marks(),
             &[],
-            &[],
         )
         .await;
         assert!(replay.fires.is_empty());
@@ -1076,7 +1050,6 @@ mod tests {
             all_live(),
             expires(),
             no_marks(),
-            &[],
             &[],
         )
         .await;
@@ -1103,7 +1076,6 @@ mod tests {
             all_live(),
             expires(),
             no_marks(),
-            &[],
             &[],
         )
         .await;
@@ -1193,7 +1165,6 @@ mod tests {
             expires(),
             no_marks(),
             &[],
-            &[],
         )
         .await;
 
@@ -1214,7 +1185,6 @@ mod tests {
             &r,
             true,
             false,
-            &[],
             None,
             &no_marks(),
         );
@@ -1296,20 +1266,21 @@ mod tests {
     }
 
     /// Parity #2: the replay seeds the market-hours no-entry windows into the
-    /// store, so `run_enter`'s OWN reject gate (`get_blackout_windows`) fires
-    /// offline — a brand-new entry firing inside the daily close→open gap is
-    /// rejected, exactly as the live worker 423s it, instead of being placed and
-    /// re-derived post-hoc. Enter fires on the 20:00Z bar (its tick `now` is
-    /// 21:00Z = minute-of-day 1260), which sits inside the 20:00–22:00Z window.
+    /// `run_enter`'s OWN reject gate now reads the BAKED weekday-aware mask
+    /// (`intent::market_hours_blocked`) — no KV seed. A brand-new entry firing
+    /// inside the universal weekend halt (EUR/USD is weekend-only in the baked
+    /// table) is rejected, exactly as the live worker 423s it. The enter fires on
+    /// a FRIDAY-night bar (2026-03-13 21:00Z, inside the Fri-21:00Z→Sun-22:00Z
+    /// halt); its tick `now` (the following bar's open, 22:00Z Fri) is still in
+    /// the halt, so the gate rejects.
     #[tokio::test]
-    async fn enter_inside_market_hours_blackout_is_rejected_by_the_seeded_gate() {
-        // 10 warm-up bars below 1.1050, then a bar closing above it (the OnClose
-        // up-cross) at 20:00Z. The window (1200..1320 = 20:00..22:00Z UTC min) is
-        // seeded so the gate rejects on the 20:00Z bar (now = 21:00Z, min 1260).
+    async fn enter_inside_market_hours_blackout_is_rejected_by_the_baked_gate() {
+        // 10 warm-up bars below 1.1050 on the Friday, then a bar closing above it
+        // (the OnClose up-cross) at 21:00Z Friday — inside the weekend halt.
         let mut candles: Vec<EngineCandle> = (10..20)
             .map(|h| {
                 ohlc_at(
-                    &format!("2026-03-11T{h:02}:00:00Z"),
+                    &format!("2026-03-13T{h:02}:00:00Z"),
                     1.1040,
                     1.1042,
                     1.1038,
@@ -1317,29 +1288,27 @@ mod tests {
                 )
             })
             .collect();
-        // The firing bar: opens 20:00Z, closes above 1.1050 → 05-enter fires.
+        // The firing bar: opens 21:00Z Friday, closes above 1.1050 → 05-enter
+        // fires. 2026-03-13 is a Friday; 21:00Z is the start of the weekend halt.
         candles.push(ohlc_at(
-            "2026-03-12T20:00:00Z",
+            "2026-03-13T21:00:00Z",
             1.1045,
             1.1060,
             1.1043,
             1.1055,
         ));
-        // A follow bar so the loop has a live bar after the fire.
+        // A follow bar (22:00Z Friday, still inside the halt) so the loop has a
+        // live bar after the fire and the enter's tick `now` stays blacked out.
         candles.push(ohlc_at(
-            "2026-03-12T21:00:00Z",
+            "2026-03-13T22:00:00Z",
             1.1055,
             1.1065,
             1.1050,
             1.1060,
         ));
 
-        let windows = [trade_control_core::intent::NoEntryWindow {
-            open_min: 20 * 60,  // 20:00Z
-            close_min: 22 * 60, // 22:00Z
-        }];
-        let live_at: DateTime<Utc> = "2026-03-12T20:00:00Z".parse().unwrap();
-        let expires_at: DateTime<Utc> = "2026-03-14T00:00:00Z".parse().unwrap();
+        let live_at: DateTime<Utc> = "2026-03-13T21:00:00Z".parse().unwrap();
+        let expires_at: DateTime<Utc> = "2026-03-15T00:00:00Z".parse().unwrap();
 
         let r = run(
             &plain_enter_plan("EUR/USD", 1.1050),
@@ -1348,7 +1317,6 @@ mod tests {
             live_at,
             expires_at,
             no_marks(),
-            &windows,
             &[],
         )
         .await;
@@ -1363,7 +1331,7 @@ mod tests {
             .expect("enter must be gate-REJECTED, not placed");
         assert!(
             reason.contains("market-blackout"),
-            "expected a market-blackout rejection from run_enter's seeded gate, got {reason:?}"
+            "expected a market-blackout rejection from run_enter's baked gate, got {reason:?}"
         );
     }
 
@@ -1420,7 +1388,6 @@ mod tests {
             expires_at,
             no_marks(),
             &[],
-            &[],
         )
         .await;
 
@@ -1464,7 +1431,6 @@ mod tests {
             all_live(),
             expires(),
             no_marks(),
-            &[],
             &[],
         )
         .await;
@@ -1569,7 +1535,6 @@ mod tests {
             expires(),
             no_marks(),
             &[],
-            &[],
         )
         .await;
 
@@ -1587,7 +1552,6 @@ mod tests {
             &r,
             true,
             false,
-            &[],
             None,
             &no_marks(),
         );
@@ -1667,7 +1631,6 @@ mod tests {
             live_at,
             expires(),
             no_marks(),
-            &[],
             &[],
         )
         .await;
@@ -1811,7 +1774,6 @@ mod tests {
             expires(),
             no_marks(),
             &[],
-            &[],
         )
         .await;
 
@@ -1847,15 +1809,8 @@ mod tests {
         // The report must reflect this: the superseded stop shows SUPERSEDED (no
         // fabricated fill), and exactly one trade is tallied (the limit's TP) —
         // not two overlapping positions.
-        let report = crate::report::render(
-            &two_enter_v2_plan(),
-            &r,
-            true,
-            false,
-            &[],
-            None,
-            &no_marks(),
-        );
+        let report =
+            crate::report::render(&two_enter_v2_plan(), &r, true, false, None, &no_marks());
         assert!(
             report.contains("SUPERSEDED"),
             "report must show the cancelled stop as SUPERSEDED:\n{report}"
@@ -1950,7 +1905,6 @@ mod tests {
             expires(),
             no_marks(),
             &[],
-            &[],
         )
         .await;
 
@@ -1975,7 +1929,7 @@ mod tests {
         );
 
         // The replay report shows the short CLOSED ON REVERSAL, not held open.
-        let report = crate::report::render(&plan, &r, true, false, &[], None, &no_marks());
+        let report = crate::report::render(&plan, &r, true, false, None, &no_marks());
         assert!(
             report.contains("CLOSED ON REVERSAL"),
             "the open short must close on the reversal candle:\n{report}"
@@ -2062,7 +2016,6 @@ mod tests {
             expires(),
             cfg,
             &[],
-            &[],
         )
         .await;
 
@@ -2075,8 +2028,7 @@ mod tests {
         assert_eq!(m[0].direction, Direction::Long, "bullish → Long");
 
         // And the always-on summary counts it.
-        let report =
-            crate::report::render(&never_firing_long_plan(), &r, true, false, &[], None, &cfg);
+        let report = crate::report::render(&never_firing_long_plan(), &r, true, false, None, &cfg);
         assert!(
             report.contains("1 golden"),
             "summary reports the golden mark:\n{report}"
@@ -2102,7 +2054,6 @@ mod tests {
             expires(),
             against,
             &[],
-            &[],
         )
         .await;
         assert!(marks(&r).is_empty(), "against-dir hides the bullish golden");
@@ -2119,19 +2070,11 @@ mod tests {
             expires(),
             off,
             &[],
-            &[],
         )
         .await;
         assert!(marks(&r_off).is_empty(), "none disables marking");
-        let report = crate::report::render(
-            &never_firing_long_plan(),
-            &r_off,
-            true,
-            false,
-            &[],
-            None,
-            &off,
-        );
+        let report =
+            crate::report::render(&never_firing_long_plan(), &r_off, true, false, None, &off);
         assert!(
             !report.contains("Candle detector"),
             "summary omitted when off:\n{report}"
@@ -2175,17 +2118,7 @@ mod tests {
         let cfg =
             DetectorMarkConfig::new(DirectionFilter::With, GoldenFilter::Golden, Direction::Long);
         let plan = golden_enter_resolve_fails_plan();
-        let r = run(
-            &plan,
-            &candles,
-            Granularity::H1,
-            live,
-            expires(),
-            cfg,
-            &[],
-            &[],
-        )
-        .await;
+        let r = run(&plan, &candles, Granularity::H1, live, expires(), cfg, &[]).await;
 
         // The golden fired the detector but the enter declined — nothing fired.
         assert!(
@@ -2208,12 +2141,12 @@ mod tests {
 
         // The always-on report surfaces it (no --verbose needed), and --verbose
         // shows the ✗ line right under the ◆ GOLDEN mark on the same bar.
-        let plain = crate::report::render(&plan, &r, true, false, &[], None, &cfg);
+        let plain = crate::report::render(&plan, &r, true, false, None, &cfg);
         assert!(
             plain.contains("Entry declines:"),
             "always-on decline rollup present:\n{plain}"
         );
-        let verbose = crate::report::render(&plan, &r, true, true, &[], None, &cfg);
+        let verbose = crate::report::render(&plan, &r, true, true, None, &cfg);
         assert!(
             verbose.contains("◆ GOLDEN") && verbose.contains("✗ not entered:"),
             "verbose joins the golden mark and the decline on the bar:\n{verbose}"
@@ -2291,7 +2224,6 @@ mod tests {
             expires(),
             golden_only,
             &[],
-            &[],
         )
         .await;
 
@@ -2299,17 +2231,7 @@ mod tests {
         // nothing). Under a `both` golden filter it's marked and NOT golden.
         let both =
             DetectorMarkConfig::new(DirectionFilter::With, GoldenFilter::Both, Direction::Long);
-        let r_both = run(
-            &plan,
-            &candles,
-            Granularity::H1,
-            live,
-            expires(),
-            both,
-            &[],
-            &[],
-        )
-        .await;
+        let r_both = run(&plan, &candles, Granularity::H1, live, expires(), both, &[]).await;
         let marked: Vec<&super::super::verbose::DetectedMark> = r_both
             .traces
             .iter()
@@ -2331,7 +2253,7 @@ mod tests {
             "not-golden decline suppressed from traces under golden-only"
         );
         // …and from the always-on rollup + verbose bar lines.
-        let report = crate::report::render(&plan, &r, true, true, &[], None, &golden_only);
+        let report = crate::report::render(&plan, &r, true, true, None, &golden_only);
         assert!(
             !report.contains("needs golden but signal is not golden"),
             "not-golden decline absent from the report under golden-only:\n{report}"
@@ -2400,17 +2322,7 @@ mod tests {
         let plan = break_and_close_pending_plan();
         let cfg =
             DetectorMarkConfig::new(DirectionFilter::With, GoldenFilter::Golden, Direction::Long);
-        let r = run(
-            &plan,
-            &candles,
-            Granularity::H1,
-            live,
-            expires(),
-            cfg,
-            &[],
-            &[],
-        )
-        .await;
+        let r = run(&plan, &candles, Granularity::H1, live, expires(), cfg, &[]).await;
 
         // The enter never fires: break-and-close never crossed 9.99, so the
         // spine stays AwaitBreakAndClose and the enter is never considered.
@@ -2441,7 +2353,7 @@ mod tests {
         );
 
         // And it renders under --verbose right beneath the ◆ mark.
-        let verbose = crate::report::render(&plan, &r, true, true, &[], None, &cfg);
+        let verbose = crate::report::render(&plan, &r, true, true, None, &cfg);
         assert!(
             verbose.contains("◆ GOLDEN") && verbose.contains("✗ not taken:"),
             "verbose joins the golden mark and the not-taken reason:\n{verbose}"
@@ -2456,17 +2368,7 @@ mod tests {
         let plan = golden_enter_resolve_fails_plan();
         let cfg =
             DetectorMarkConfig::new(DirectionFilter::With, GoldenFilter::Golden, Direction::Long);
-        let r = run(
-            &plan,
-            &candles,
-            Granularity::H1,
-            live,
-            expires(),
-            cfg,
-            &[],
-            &[],
-        )
-        .await;
+        let r = run(&plan, &candles, Granularity::H1, live, expires(), cfg, &[]).await;
 
         let marked_bar = r
             .traces
@@ -2646,7 +2548,6 @@ mod tests {
             expires_at,
             no_marks(),
             &[],
-            &[],
         )
         .await;
 
@@ -2688,7 +2589,6 @@ mod tests {
             &r,
             true,
             false,
-            &[],
             None,
             &no_marks(),
         );
@@ -2756,7 +2656,6 @@ mod tests {
             live_at,
             expires_at,
             no_marks(),
-            &[],
             &[],
         )
         .await;
@@ -2919,7 +2818,6 @@ mod tests {
             expires_at,
             no_marks(),
             &[],
-            &[],
         )
         .await;
 
@@ -2957,7 +2855,6 @@ mod tests {
             &r,
             true,
             false,
-            &[],
             None,
             &no_marks(),
         );
@@ -3109,7 +3006,6 @@ mod tests {
             expires_at,
             no_marks(),
             &[],
-            &[],
         )
         .await;
 
@@ -3147,7 +3043,6 @@ mod tests {
             &r,
             true,
             false,
-            &[],
             None,
             &no_marks(),
         );

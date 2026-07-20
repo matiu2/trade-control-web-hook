@@ -61,8 +61,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use trade_control_cron::{
-    apply_if_ny_close_edge, breakeven_watch, refresh_market_hours_if_due, run_engine_tick,
-    sweep_pending_orders, watch_recovery, widen_open_stops_for_spread_hours,
+    apply_if_ny_close_edge, breakeven_watch, run_engine_tick, sweep_pending_orders, watch_recovery,
+    widen_open_stops_for_spread_hours,
 };
 
 use crate::SchedulerConfig;
@@ -94,7 +94,6 @@ pub fn run_scheduler(state: Arc<AppState>, intervals: SchedulerConfig) {
     let cron = NativeCronEnv::new(state.clone());
     let engine_period = intervals.engine_interval();
     let breakeven_period = intervals.upkeep_interval();
-    let blackout_hours_period = intervals.daily_tick_interval();
     // The spread-recovery watcher runs at the frequent upkeep cadence; the
     // NY-close apply also ticks at upkeep cadence and self-gates internally on
     // `is_ny_close_edge`, mirroring the wasm worker's `now.minute() < 15` wake.
@@ -126,7 +125,6 @@ pub fn run_scheduler(state: Arc<AppState>, intervals: SchedulerConfig) {
                 tokio::join!(
                     engine_tick_loop(state.clone(), cron.clone(), engine_period),
                     breakeven_loop(state.clone(), cron.clone(), breakeven_period),
-                    blackout_hours_loop(state.clone(), cron.clone(), blackout_hours_period),
                     blackout_watch_loop(state.clone(), cron.clone(), blackout_watch_period),
                     blackout_apply_loop(state.clone(), cron.clone(), blackout_apply_period),
                     sweep_loop(state.clone(), cron.clone(), sweep_period),
@@ -227,27 +225,6 @@ async fn breakeven_loop(state: Arc<AppState>, cron: NativeCronEnv, period: Durat
         interval.tick().await;
         let now = chrono::Utc::now();
         breakeven_watch(&state.store, &cron, now).await;
-    }
-}
-
-/// The daily market-hours blackout refresh: ticks at the daily cadence and
-/// **self-gates on the 06:00 UTC hour** inside
-/// [`refresh_market_hours_if_due`] — most ticks no-op. The interval is just the
-/// wake cadence (mirroring the wasm worker's `now.minute() < 15` wake), so a tick
-/// faster than once an hour costs nothing but the hour check. Fail-open per
-/// instrument; single re-arming interval.
-async fn blackout_hours_loop(state: Arc<AppState>, cron: NativeCronEnv, period: Duration) {
-    let mut interval = skip_interval(period);
-
-    tracing::info!(
-        "scheduler: market-hours blackout refresh wake every {}s (self-gates on 06:00 UTC)",
-        period.as_secs()
-    );
-
-    loop {
-        interval.tick().await;
-        let now = chrono::Utc::now();
-        refresh_market_hours_if_due(&state.store, &cron, now).await;
     }
 }
 

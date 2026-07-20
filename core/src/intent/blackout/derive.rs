@@ -53,6 +53,28 @@ impl Default for Buffers {
 /// minute-of-day back to UTC.
 const BRISBANE_OFFSET_MIN: u32 = 10 * 60;
 
+/// TEMPORARY FIX (2026-07-20): only treat a session gap as a real close→open
+/// blackout when it is at least this long. The broker's `market_info` session
+/// string is a day-of-week-BLIND typical-day clock (e.g. EUR/USD reports
+/// `"00:00 - 22:00 & 22:05 - 23:59"` — a **5-minute** daily housekeeping gap),
+/// so the old "any non-zero gap" rule inflated a meaningless blip into a
+/// multi-hour DAILY no-entry window that (via the day-blind gate) rejected
+/// legitimate mid-week FX entries. Empirically (the `tn_gap_scan` probe) the
+/// only REAL trading gaps in the H1 price data are weekends (~49h) — there are
+/// no genuine sub-24h daily closes for the instruments we trade.
+///
+/// **Important consequence of the current data model:** `windows_from_session`
+/// derives windows from a *minute-of-day* clock string, so every gap it can see
+/// is strictly `< 24h` (it wraps within a single day). A weekend gap is never
+/// even visible here — the broker doesn't report it. Therefore a `>= 24h`
+/// threshold means this function now emits **no windows at all** for a
+/// day-blind session string. That is deliberate for now: it disables the
+/// phantom daily blackout across the board (FX, gold, and — until the
+/// candle-based rebuild — any real daily-gap index too), which is strictly
+/// safer than blocking good trades. The real close detection moves to the
+/// observed-gap (candle-derived) table, mirroring the spread-hour mask.
+const MIN_REAL_GAP_MINUTES: u32 = 24 * 60;
+
 /// Parse a Brisbane session clock string into a **UTC minute-of-day**.
 ///
 /// Accepts the `tradenation-api` display form `"HH:MM"` optionally suffixed
@@ -119,8 +141,13 @@ pub fn windows_from_session(ranges: &[(String, String)], buffers: Buffers) -> Ve
         let next_open = utc[(i + 1) % n].open;
         // Gap width (closed duration), wrapping midnight.
         let gap = (next_open + MINUTES_PER_DAY - close) % MINUTES_PER_DAY;
-        // A zero-width gap (ranges abut exactly) is not a close→open gap.
-        if gap == 0 {
+        // TEMPORARY FIX: only a gap >= MIN_REAL_GAP_MINUTES (24h) counts as a
+        // real close→open blackout. This drops the broker's phantom daily
+        // housekeeping gaps (a zero-width abutting gap was already excluded by
+        // the same test). See MIN_REAL_GAP_MINUTES — with today's minute-of-day
+        // model this means no window is emitted, which safely disables the
+        // day-blind blackout until the candle-derived table lands.
+        if gap < MIN_REAL_GAP_MINUTES {
             continue;
         }
         let open_min = (close + MINUTES_PER_DAY - buffers.before_close) % MINUTES_PER_DAY;
@@ -198,6 +225,24 @@ mod tests {
     use super::super::is_inside_window;
     use super::*;
 
+    /// The `>= 24h` temp-fix threshold makes `windows_from_session` unable to
+    /// emit a window from any day-blind minute-of-day session (every such gap is
+    /// `< 24h`). The real close→open protection now belongs to the candle-derived
+    /// table; `merge_windows` is still tested directly below so its ring maths
+    /// stays covered even though the deriver no longer feeds it.
+    #[test]
+    fn merge_windows_still_merges_overlapping_windows_on_the_ring() {
+        // Two overlapping windows on the ring collapse to one contiguous block.
+        let a = NoEntryWindow::new(19 * 60, 23 * 60); // 19:00–23:00
+        let b = NoEntryWindow::new(22 * 60, 60); // 22:00–01:00 (wraps)
+        let merged = merge_windows(vec![a, b]);
+        assert_eq!(merged.len(), 1, "overlapping windows merge: {merged:?}");
+        let w = merged[0];
+        assert!(is_inside_window(19 * 60, &w), "start blocked");
+        assert!(is_inside_window(0, &w), "wrap-past-midnight blocked");
+        assert!(!is_inside_window(2 * 60, &w), "after the block allowed");
+    }
+
     fn r(open: &str, close: &str) -> (String, String) {
         (open.to_string(), close.to_string())
     }
@@ -249,72 +294,50 @@ mod tests {
         assert!(windows_from_session(&ranges, Buffers::default()).is_empty());
     }
 
-    /// Wall Street 30: London "00:00 - 22:00 & 23:00 - 23:59" → Brisbane the
-    /// crate gives (winter/GMT example) roughly open/close pairs; we model the
-    /// two ranges directly in Brisbane to assert the gap+buffer+merge maths.
-    ///
-    /// Brisbane ranges (GMT season, +10h): 10:00→08:00(+1d) and 09:00→09:59.
-    /// The closed gaps are 08:00→09:00 (1h) and 09:59→10:00 (1m). With 3h/1h
-    /// buffers the two buffered windows overlap and must MERGE into one.
+    /// TEMPORARY FIX (>= 24h threshold): a sub-24h daily maintenance gap no
+    /// longer produces a window. Wall Street 30's London
+    /// `"00:00 - 22:00 & 23:00 - 23:59"` → Brisbane 10:00→08:00(+1d) and
+    /// 09:00→09:59 has two closed gaps of 1h and 1m — both far below 24h, so
+    /// under the new rule NO window is emitted. (Before the fix these buffered
+    /// into one merged window.) This is the intended neutralisation: the real
+    /// daily-gap detection moves to the candle-derived table.
     #[test]
-    fn wall_street_two_gaps_merge_into_one() {
+    fn sub_24h_daily_gaps_emit_no_window_under_temp_fix() {
         let ranges = [r("10:00", "08:00 (+1d)"), r("09:00", "09:59")];
         let windows = windows_from_session(&ranges, Buffers::default());
-        // The two near-adjacent gaps' buffered windows overlap → one window.
-        assert_eq!(
-            windows.len(),
-            1,
-            "overlapping windows must merge: {windows:?}"
+        assert!(
+            windows.is_empty(),
+            "sub-24h daily gaps are dropped by the >=24h temp fix: {windows:?}"
         );
-
-        // Convert the Brisbane anchors to the UTC minutes the window uses.
-        // Brisbane 08:00 close → UTC 22:00; minus 3h buffer → UTC 19:00 open.
-        // Brisbane 10:00 open  → UTC 00:00; plus 1h buffer  → UTC 01:00 close,
-        // but the second gap (09:59→10:00) pushes the merged close to
-        // UTC 00:00+1h = 01:00 as well. Assert the merged window blocks the
-        // whole closed span and reopens after the buffer.
-        let w = windows[0];
-        // 19:00 UTC (3h before the 22:00 close) is blocked.
-        assert!(is_inside_window(19 * 60, &w), "3h-before-close blocked");
-        // 23:00 UTC (mid gap) blocked.
-        assert!(is_inside_window(23 * 60, &w), "mid-gap blocked");
-        // 00:30 UTC (just after reopen, inside +1h buffer) blocked.
-        assert!(is_inside_window(30, &w), "inside after-open buffer blocked");
-        // 18:00 UTC (before the buffer) allowed.
-        assert!(!is_inside_window(18 * 60, &w), "before buffer allowed");
-        // 12:00 UTC (well inside the trading session) allowed.
-        assert!(!is_inside_window(12 * 60, &w), "mid-session allowed");
     }
 
-    /// A clean single overnight close→open gap (no maintenance gap), the
-    /// rolling-future shape. London index closes ~22:00, reopens ~23:00 — but
-    /// model a wider, unambiguous gap in Brisbane to test one window end-to-end.
+    /// TEMPORARY FIX: a clean 4h overnight gap (the rolling-future shape the
+    /// feature was originally built for) is ALSO dropped now — it is < 24h.
+    /// Before the fix this produced one 17:00→01:00 UTC window (the exact shape
+    /// that spuriously blocked the EUR/USD mid-week entry). Documented so the
+    /// candle-based rebuild knows this legitimate daily-gap case is currently
+    /// unprotected and must be restored by the observed-gap table.
     #[test]
-    fn single_overnight_gap_one_buffered_window() {
+    fn sub_24h_overnight_gap_emits_no_window_under_temp_fix() {
         // Brisbane: trades 10:00 → 06:00(+1d), closed 06:00 → 10:00 (4h gap).
         let ranges = [r("10:00", "06:00 (+1d)")];
         let windows = windows_from_session(&ranges, Buffers::default());
-        assert_eq!(windows.len(), 1, "{windows:?}");
-        let w = windows[0];
-        // Brisbane close 06:00 → UTC 20:00; − 3h → 17:00 open.
-        // Brisbane open 10:00 → UTC 00:00; + 1h → 01:00 close.
-        assert_eq!(w.open_min, 17 * 60);
-        assert_eq!(w.close_min, 60);
-        assert!(w.wraps_midnight());
-        assert!(is_inside_window(17 * 60, &w));
-        assert!(is_inside_window(0, &w)); // midnight UTC, mid-gap
-        assert!(!is_inside_window(60, &w)); // 01:00 UTC, reopened
-        assert!(!is_inside_window(16 * 60 + 59, &w)); // before buffer
+        assert!(
+            windows.is_empty(),
+            "a <24h overnight gap is dropped by the temp fix: {windows:?}"
+        );
     }
 
     #[test]
-    fn two_distant_gaps_stay_separate() {
-        // Two trading sessions with SHORT gaps far apart so the 3h/1h buffers
-        // can't bridge them. Brisbane: 00:00→11:00 and 12:00→23:00. Gaps are
-        // 11:00→12:00 (1h) and 23:00→00:00 (1h), ~12h apart → TWO windows.
+    fn sub_24h_distant_gaps_emit_no_window_under_temp_fix() {
+        // Two short (1h) gaps far apart. Both < 24h → no windows under the temp
+        // fix (before: two separate windows).
         let ranges = [r("00:00", "11:00"), r("12:00", "23:00")];
         let windows = windows_from_session(&ranges, Buffers::default());
-        assert_eq!(windows.len(), 2, "distant gaps stay separate: {windows:?}");
+        assert!(
+            windows.is_empty(),
+            "sub-24h gaps produce nothing under the temp fix: {windows:?}"
+        );
     }
 
     #[test]

@@ -139,9 +139,16 @@ pub fn is_inside_any(now_min: u32, windows: &[NoEntryWindow]) -> bool {
     windows.iter().any(|w| is_inside_window(now_min, w))
 }
 
+mod baked;
 mod derive;
+mod week_mask;
 
+// The legacy session-string deriver is kept until Step C retires its last
+// consumer (cron / replay). `windows_from_session` + the minute-of-day
+// `NoEntryWindow` path above are superseded by the weekday-aware `baked` table.
+pub use baked::{baked_market_hours, market_hours_blocked};
 pub use derive::{Buffers, windows_from_session};
+pub use week_mask::{MINUTES_PER_WEEK, WeekMask};
 
 #[cfg(test)]
 mod tests {

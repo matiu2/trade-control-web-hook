@@ -123,8 +123,9 @@ Trading:
   control actions this needs a live TradeNation broker (its `market_info` call
   isn't on the generic `Broker` trait), so it dispatches through the broker path;
   it still records `seen` and is fully idempotent. **TradeNation only** — a
-  non-TN intent is rejected `400`. These hours feed the upcoming market-hours
-  entry blackout.
+  non-TN intent is rejected `400`. (The market-hours entry blackout no longer
+  consumes these — it reads a baked candle-derived table; see *Market-hours
+  blackout* below.)
 - `plan-list` — read-only: list the registered server-side `TradePlan`s, each
   with a compact summary of its current `PlanState` (phase, watermark, fired
   rules, shadow flag). The `ACCOUNT` column reflects the plan's KV scope
@@ -1710,31 +1711,39 @@ names the sweep reason when there is one:
 When no sweep condition is reached it keeps the original wording, `fill: NEVER
 FILLED (pending order untriggered in window)`. The decision is the pure
 `sweep_reason` helper (engine), which reuses the shared `core::sweep_gate`
-predicates (`breach_detected` / `bar_expiry_due` / `market_blackout_due`) the
-live worker's sweep uses — so worker and replay can't drift. Like
+predicates (`breach_detected` / `bar_expiry_due` / `market_blackout_due_symbol`)
+the live worker's sweep uses — so worker and replay can't drift. Like
 `breakeven_armed_at` it does **not** change `SimOutcome`, so saved fixtures are
 untouched.
 
-The **market-hours blackout** branch is fully wired: `sweep_reason` takes the
-instrument's no-entry windows and matches the live worker's `market_blackout_due`,
-and the offline **window source** is connected. `replay-candles` resolves the
-windows from the *same* TradeNation `market_info` the live `blackout_hours` cron
-uses (`resolve_market` + `get_market_info`) and feeds the Brisbane session ranges
-through the identical shared deriver (`core::windows_from_session`) — so the
-replay reconstructs the exact UTC windows the worker would have written to KV.
-Since v98 these same windows are ALSO seeded into the replay's state store so
-`run_enter`'s market-hours **entry-reject** gate fires offline (see *Replay
-enforces the two blackout REJECT gates* below) — `sweep_reason`'s branch here is
-the distinct *resting-order sweep* (an order placed outside the blackout that a
-later window catches resting), not the entry gate.
-TradingView's charted-exchange hours would diverge from the broker's CFD session,
-so they are deliberately *not* used. It's **fail-soft**: any login / resolve /
-broker miss logs a `WARN` and passes empty windows (the order then shows the plain
-"untriggered" wording rather than a fabricated blackout). `--test-mode` fixture
-replays stay fully offline (no market-hours network call). OANDA-sourced replays
-stay empty — the worker's `blackout_hours` cron skips OANDA (no `market_info`
-equivalent); OANDA venue hours are coming soon. See
-`cli/src/bin/replay_candles/market_hours.rs`.
+The **market-hours blackout** branch reads a **baked, weekday-aware** mask —
+there is no `market_info` fetch, no daily cron, and no KV window anymore. A
+committed table (`core/src/market_hours_baked.rs`, generated offline by the
+`market-hours-gen` crate) records, per `(venue, instrument)`, whether the
+instrument has a genuine **mid-week daily close** and at what UTC hours; the
+universal **weekend** halt (Fri 21:00Z → Sun 22:00Z) is applied to every
+instrument. `core::intent::market_hours_blocked(symbol, now)` turns a row into a
+per-instrument `WeekMask` (`[bool; 7×1440]`) and indexes it by the instant's
+`(weekday, minute-of-day)` — so a Friday-night or a real daily-close bar is
+blocked, but a mid-week bar at the **same clock time** is not (the bug the old
+day-blind minute-of-day window caused). Both the replay's `run_enter`
+entry-reject gate and `sweep_reason`'s resting-order sweep call the SAME
+predicate keyed on the instrument, so the offline decision matches the live
+worker exactly with **zero network calls** — the replay works identically for
+OANDA- and TradeNation-sourced windows. An instrument not in the baked catalog
+fails open (no blackout). To regenerate the table:
+
+```sh
+OANDA_TOKEN=... cargo run -p market-hours-gen --release -- \
+  --out ../core/src/market_hours_baked.rs
+```
+
+The generator measures ATR-relative close→open price gaps (a gap "needs
+attention" when the reopen jump ≥ 1 ATR — roughly one candle's height, the size
+a stop is set at), and turns a daily-close block ON only when an instrument's
+**mid-week** (Mon–Thu) attention fraction clears 20% with ≥30 samples. Friday
+attention-gaps are the weekend gap, already covered by the universal weekend
+rule, so they don't count toward the daily-close decision.
 
 **Spread-widen (`exit: SL widened` line).** System 2 of the spread-blackout
 defence widens the broker stop *away* from price when the live spread blows out
@@ -1824,15 +1833,15 @@ with/without pair is the A/B the journal needs to price what the news rule cost.
 (v98).** The live worker rejects a new entry that fires (a) inside the
 instrument's daily market-hours close→open gap, or (b) during the post-NY-close
 liquidity trough when the spread is elevated (see *Spread-blackout window*
-above). The replay no longer *re-derives* these decisions with a proxy — it
-**seeds the state-store windows `run_enter`'s own gates read**, so the offline
-entry decision is the live gate itself:
+above). The replay no longer *re-derives* these decisions with a proxy — the
+offline entry decision is the live gate itself:
 
-- *Market-hours*: the driver resolves the no-entry windows (shared TN
-  `market_info` + `core::windows_from_session`) and seeds them into the store
-  before the tick loop, so `run_enter`'s `get_blackout_windows` reject fires
-  offline. A blacked-out enter is `rejected: market-blackout` (no order placed),
-  rendered as `BLOCKED — rejected: market-blackout → NO FILL / 0R`.
+- *Market-hours*: `run_enter`'s gate reads the **baked weekday-aware mask** keyed
+  on the instrument (`core::intent::market_hours_blocked`), the SAME table the
+  live worker consults — so no store seed, no `market_info` fetch, and identical
+  behaviour for OANDA- and TradeNation-sourced replays. A blacked-out enter is
+  `rejected: market-blackout` (no order placed), rendered as `BLOCKED —
+  rejected: market-blackout → NO FILL / 0R`.
 - *Spread-blackout*: the driver opens the window marker on each NY-close-edge bar
   using the SAME `core::ny_clock::is_ny_close_edge` gate + the shared 3h TTL
   (`core::spread_blackout::NY_CLOSE_WINDOW_MARKER_TTL_SECONDS`) the live cron's

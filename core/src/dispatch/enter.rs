@@ -8,12 +8,11 @@ use crate::dispatch_config::DispatchConfig;
 use crate::incoming;
 use crate::intent::{
     MW_CANCEL_VETO_NAME, MwAnchors, MwUpdate, ResolveError, Resolved, effective_mw_params,
-    is_inside_any, plan_mw_update,
+    plan_mw_update,
 };
 use crate::recover_entry;
 use crate::spread_blackout;
 use crate::state::{StateStore, veto_ttl_seconds};
-use crate::sweep_gate::now_utc_minute_of_day;
 
 /// Render a raw price for an operator-facing message: fixed generous precision
 /// (enough for 5dp FX and finer) with trailing zeros trimmed, so an index level
@@ -524,10 +523,13 @@ pub async fn run_enter<B: Broker, S: StateStore>(
     // intent id; the in-hours refire is allowed through. See CLAUDE.md
     // "Replay protection scope". Do NOT add any KV write on this path.
     //
-    // FAIL OPEN: a KV read hiccup, or an instrument with no derived
-    // windows (24h / unparseable / not-yet-refreshed), must never block a
-    // legitimate entry — `get_blackout_windows` returns an empty Vec in
-    // those cases and `is_inside_any` is then always `false`.
+    // FAIL OPEN: an instrument not in the baked market-hours table (an
+    // uncatalogued symbol) must never block a legitimate entry —
+    // `market_hours_blocked` returns `false` for an unknown symbol. There is no
+    // KV read and no daily refresh anymore: the mask is candle-derived and baked
+    // (`intent::market_hours_blocked`), weekday-aware, so it blocks a real
+    // Friday-night / mid-week-daily-close bar without touching a same-clock-time
+    // mid-week bar. See the `market-hours-blackout-weekly-gap-bug` memory.
     //
     // RESTORE BYPASS: a `restore` re-drive re-places an order the lifecycle
     // already cancelled for a spread hour — it is NOT a fresh entry, so it must
@@ -540,29 +542,17 @@ pub async fn run_enter<B: Broker, S: StateStore>(
     // blackout-cancelled resting orders. The lifecycle's own `is_spread_hour` /
     // `off_now` timing already governs WHEN a restore may run.
     if !restore {
-        match store.get_blackout_windows(&resolved.instrument).await {
-            Err(err) => {
-                tracing::error!(
-                    "market-blackout: windows read failed for {} (id={}): {err} — failing open (allowing entry)",
-                    resolved.instrument,
-                    verified.intent.id
-                );
-            }
-            Ok(windows) => {
-                let now_min = now_utc_minute_of_day(now);
-                if is_inside_any(now_min, &windows) {
-                    tracing::info!(
-                        "entry rejected: market-blackout instrument={} now_utc_min={now_min} windows={windows:?} (id={})",
-                        resolved.instrument,
-                        verified.intent.id
-                    );
-                    return ActionResult::Rejected {
-                        status: 423,
-                        body: "entry blocked: market-hours blackout".to_string(),
-                        outcome: "rejected: market-blackout".into(),
-                    };
-                }
-            }
+        if crate::intent::market_hours_blocked(&resolved.instrument, now) {
+            tracing::info!(
+                "entry rejected: market-blackout instrument={} now={now} (id={})",
+                resolved.instrument,
+                verified.intent.id
+            );
+            return ActionResult::Rejected {
+                status: 423,
+                body: "entry blocked: market-hours blackout".to_string(),
+                outcome: "rejected: market-blackout".into(),
+            };
         }
 
         // System 1 of the spread blackout: reject a brand-new entry that

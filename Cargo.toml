@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["broker-oanda", "broker-tradenation-adapter", "cli", "conventions", "core", "engine", "engine-v2", "news-sentiment-tv", "spread-baseline-gen", "trade-control-cron", "trade-control-types-v2", "trading-view", "tv-arm", "tv-news", "worker"]
+members = ["broker-oanda", "broker-tradenation-adapter", "cli", "conventions", "core", "engine", "engine-v2", "market-hours-gen", "news-sentiment-tv", "spread-baseline-gen", "trade-control-cron", "trade-control-types-v2", "trading-view", "tv-arm", "tv-news", "worker"]
 
 # `tradenation-api` is consumed as a git dep by workspace members (`worker`,
 # `cli`, `tv-arm`, …); its `ohlcv` module exposes `candle_model::Granularity` /
