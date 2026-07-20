@@ -139,16 +139,15 @@ pub fn is_inside_any(now_min: u32, windows: &[NoEntryWindow]) -> bool {
     windows.iter().any(|w| is_inside_window(now_min, w))
 }
 
+mod baked;
 mod derive;
-// Step A of the market-hours rebuild (TODO-market-hours-rebuild.md): the
-// weekday-aware mask lands first, its consumers (baked table → reject gate /
-// sweep) land in steps B/C. `allow(dead_code)` until then — this is
-// finished, tested API waiting to be wired, not stale code.
-#[allow(dead_code)]
 mod week_mask;
 
+// The legacy session-string deriver is kept until Step C retires its last
+// consumer (cron / replay). `windows_from_session` + the minute-of-day
+// `NoEntryWindow` path above are superseded by the weekday-aware `baked` table.
+pub use baked::{baked_market_hours, market_hours_blocked};
 pub use derive::{Buffers, windows_from_session};
-#[allow(unused_imports)]
 pub use week_mask::{MINUTES_PER_WEEK, WeekMask};
 
 #[cfg(test)]

@@ -45,7 +45,6 @@ mod replay_candles {
     pub mod granularity;
     pub mod instrument;
     pub mod lifecycle;
-    pub mod market_hours;
     pub mod replay;
     pub mod replay_broker;
     pub mod report;
@@ -68,8 +67,7 @@ use tracing_subscriber::{EnvFilter, fmt};
 use replay_candles::fixture::{self, FixtureMeta, ReplayOutcome};
 use replay_candles::tv::TvDefaults;
 use replay_candles::{
-    annotate, brisbane, candles, granularity, instrument, market_hours, replay, report, sentiment,
-    tv,
+    annotate, brisbane, candles, granularity, instrument, replay, report, sentiment, tv,
 };
 use trade_control_cli::replay_args::{CandleSource, DetectorMarkConfig, ReplayArgs as Args};
 use trade_control_engine::{BidAskCandle as EngineCandle, Granularity, TradePlan, Trigger};
@@ -204,21 +202,10 @@ async fn main() -> Result<()> {
         plan.direction,
     );
 
-    // Market-hours no-entry windows. Resolved from the same TradeNation
-    // `market_info` source the live worker's `blackout_hours` cron uses; OANDA
-    // stays empty (coming soon). Fail-soft — any miss logs a WARN and yields no
-    // windows. See `market_hours`.
-    //
-    // Pass the *resolved* broker symbol (`symbol`, e.g. TradeNation's `AUD/NZD`
-    // MarketName), not the raw plan string — `resolve_market` matches the
-    // catalog name exactly, so a slash-less/OANDA-form `raw_instrument` misses.
-    //
-    // Resolved BEFORE `replay::run` (was after) so the driver can seed them into
-    // the run's state-store: `run_enter`'s OWN market-hours reject gate
-    // (`store.get_blackout_windows`) then fires offline exactly as live, instead
-    // of the decision being re-derived post-hoc by `sweep_reason`. The report
-    // still reads the same `blackout_windows` for its annotations.
-    let blackout_windows = market_hours::resolve_blackout_windows(args.source, &symbol).await;
+    // Market-hours blackout is no longer resolved here: `run_enter`'s reject gate
+    // and `sweep_reason` both read the baked, weekday-aware mask keyed on the
+    // instrument (`core::intent::market_hours_blocked`), so there is no
+    // `market_info` fetch and no store seed in the replay path anymore.
 
     // Sub-bar zoom (PR-2): pull a FINER-granularity bid/ask series over the SAME
     // span as the coarse window, so the fill sim can disambiguate an exit bar that
@@ -271,7 +258,6 @@ async fn main() -> Result<()> {
         start,
         expires_at,
         mark_cfg,
-        &blackout_windows,
         &finer_candles,
     )
     .await;
@@ -288,7 +274,6 @@ async fn main() -> Result<()> {
             &replay,
             simulate,
             args.verbose,
-            &blackout_windows,
             replay_sentiment.as_ref(),
             &mark_cfg,
         )
@@ -472,9 +457,9 @@ async fn run_test_mode(args: &Args) -> Result<()> {
     )
     .await;
 
-    // A saved-fixture replay has no live instrument to resolve hours for, so the
-    // blackout sweep reason isn't reconstructed here (empty windows). Fixtures
-    // froze their verdict before this feature, so this keeps them byte-stable.
+    // Market-hours blackout is read from the baked mask keyed on the instrument
+    // (`core::intent::market_hours_blocked`) inside `sweep_reason`, so nothing to
+    // pass here. Fixtures keep their saved verdict.
     print!(
         "{}",
         report::render(
@@ -482,7 +467,6 @@ async fn run_test_mode(args: &Args) -> Result<()> {
             &replay,
             args.simulate,
             args.verbose,
-            &[],
             None,
             &mark_cfg,
         )
@@ -512,26 +496,15 @@ async fn run_frozen(
     mark_cfg: DetectorMarkConfig,
 ) -> replay::Replay {
     let expires_at = candles.last().map(|c| c.time).unwrap_or_else(Utc::now) + Duration::days(365);
-    // Frozen fixtures replay offline (no network), so no live-resolved market-hours
-    // windows — pass empty (the market-hours gate then fails open, unchanged from
-    // before the in-loop seed existed). The spread-blackout gate still self-seeds
-    // per-bar on `is_ny_close_edge` inside `run`, so an NY-close-edge fixture bar
-    // is still gated deterministically off the frozen candle's own spread.
+    // The market-hours gate reads the baked mask keyed on the instrument, so a
+    // frozen fixture is gated deterministically with no network. The
+    // spread-blackout gate still self-seeds per-bar on `is_ny_close_edge` inside
+    // `run` off the frozen candle's own spread.
     //
-    // No finer series either — a frozen fixture only has its saved coarse candles,
-    // so the sub-bar zoom (PR-2) is inactive and an ambiguous SL/TP bar keeps the
+    // No finer series — a frozen fixture only has its saved coarse candles, so the
+    // sub-bar zoom (PR-2) is inactive and an ambiguous SL/TP bar keeps the
     // pessimistic stop, exactly as the fixture's saved `expected.json` was computed.
-    replay::run(
-        plan,
-        candles,
-        gran,
-        live_start,
-        expires_at,
-        mark_cfg,
-        &[],
-        &[],
-    )
-    .await
+    replay::run(plan, candles, gran, live_start, expires_at, mark_cfg, &[]).await
 }
 
 /// Build a readable diff error when a fixture's computed outcome diverges from

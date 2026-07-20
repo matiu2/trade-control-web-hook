@@ -23,9 +23,7 @@
 //! is what flattens the broker position live.
 
 use chrono::{DateTime, Utc};
-use trade_control_core::intent::{
-    Action, Direction, Intent, NoEntryWindow, Resolved, ResolvedEntry, Shell,
-};
+use trade_control_core::intent::{Action, Direction, Intent, Resolved, ResolvedEntry, Shell};
 use trade_control_core::plan_sentiment::PlanSentiment;
 use trade_control_core::spread_blackout::elevated_threshold_pips;
 use trade_control_engine::{
@@ -265,7 +263,6 @@ pub fn render(
     replay: &Replay,
     simulate: bool,
     verbose: bool,
-    blackout_windows: &[NoEntryWindow],
     sentiment: Option<&PlanSentiment>,
     mark_cfg: &DetectorMarkConfig,
 ) -> String {
@@ -310,14 +307,7 @@ pub fn render(
         } else {
             None
         };
-        events.extend(render_fire(
-            plan,
-            fire,
-            this_entry,
-            simulate,
-            blackout_windows,
-            &mut tally,
-        ));
+        events.extend(render_fire(plan, fire, this_entry, simulate, &mut tally));
     }
 
     // Stable sort by time: same-bar events keep their emission order (placed
@@ -558,7 +548,6 @@ fn render_fire(
     fire: &Fire,
     entry_no: Option<u32>,
     simulate: bool,
-    blackout_windows: &[NoEntryWindow],
     tally: &mut Tally,
 ) -> Vec<EntryEvent> {
     let intent = &fire.fired.intent;
@@ -852,13 +841,7 @@ fn render_fire(
         // tally move. `NeverFilled` carries a sweep reason; the others describe
         // the gate/quality decline.
         FillKind::NeverFilled => {
-            let swept = sweep_reason(
-                intent,
-                &shell,
-                plan.pip_size,
-                &fire.forward,
-                blackout_windows,
-            );
+            let swept = sweep_reason(intent, &shell, plan.pip_size, &fire.forward);
             events.push(EntryEvent {
                 at: candle.time,
                 note: format!("{ev} {}", describe_never_filled(swept)),
@@ -1359,15 +1342,7 @@ mod tests {
             warnings: Vec::new(),
             traces: Vec::new(),
         };
-        let out = render(
-            &plan_for(0.0001),
-            &replay,
-            true,
-            false,
-            &[],
-            None,
-            &no_marks(),
-        );
+        let out = render(&plan_for(0.0001), &replay, true, false, None, &no_marks());
 
         // Top-level event lines, each naming entry #1 — no "bars (entry
         // timeline):" sub-heading, no OHLC dump, no leading-indent nested

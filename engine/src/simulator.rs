@@ -59,7 +59,7 @@ use trade_control_core::intent::{
     Direction, Intent, Resolved, ResolvedEntry, Shell, SlWiden, widen_sl_to_spread_floor,
 };
 use trade_control_core::sweep_gate::{
-    SweepReason, bar_expiry_due, breach_detected, market_blackout_due,
+    SweepReason, bar_expiry_due, breach_detected, market_blackout_due_symbol,
 };
 
 /// What the simulator decided happened to one fired enter over the candle path.
@@ -753,15 +753,13 @@ pub fn breakeven_armed_at_resolved(
 /// `core::resolve_cancel_at` the worker uses (off the Pine-shipped forward
 /// bar-close menu on the shell).
 ///
-/// `blackout_windows` are the instrument's market-hours no-entry windows. Live
-/// they're written to KV daily by the `blackout_hours` cron from TradeNation
-/// `market_info`; the offline replay fetches the *same* `market_info` at startup
-/// and resolves them through the *same* `core::windows_from_session` deriver, so
-/// a blackout-driven sweep here matches the live worker's. Pass an **empty**
-/// slice when no windows are available (TradeNation unreachable, an OANDA-sourced
-/// replay, a 24h market, or an unparseable session) — the blackout branch then
-/// never fires, exactly the worker's fail-open, and the order falls through to
-/// the SL-breach check / plain "never triggered" verdict.
+/// The market-hours blackout is now read from the **baked, weekday-aware**
+/// table keyed on `intent.instrument` (`core::sweep_gate::market_blackout_due_symbol`),
+/// the same predicate the live worker's reject gate uses — so a blackout-driven
+/// sweep here matches production with no `market_info` fetch and no window
+/// plumbing. An instrument not in the baked catalog fails open (no fabricated
+/// blackout), exactly the worker's behaviour, and the order falls through to the
+/// SL-breach check / plain "never triggered" verdict.
 ///
 /// Returns `None` when no sweep condition is reached within the candle path, or
 /// when the order would never rest (a Market entry / an unresolved intent — the
@@ -775,7 +773,6 @@ pub fn sweep_reason(
     shell: &Shell,
     pip_size: f64,
     candles: &[BidAskCandle],
-    blackout_windows: &[trade_control_core::intent::NoEntryWindow],
 ) -> Option<(SweepReason, chrono::DateTime<chrono::Utc>)> {
     let resolved =
         Resolved::from_intent(intent, shell, pip_size, replay_tick(intent, pip_size)).ok()?;
@@ -816,9 +813,10 @@ pub fn sweep_reason(
         // instrument's daily close→open gap. Runs BEFORE SL-breach to match the
         // worker's `sweep_one` ordering — across a closed session a price-based
         // check would read a stale quote, so the closed market itself is the
-        // trigger. Empty `blackout_windows` ⇒ `market_blackout_due` is false ⇒
-        // fail-open (no fabricated blackout), same as the worker's reject gate.
-        if market_blackout_due(blackout_windows, c.time) {
+        // trigger. Reads the baked weekday-aware mask keyed on the instrument
+        // (same predicate as the worker's reject gate); an uncatalogued symbol
+        // fails open (no fabricated blackout).
+        if market_blackout_due_symbol(&intent.instrument, c.time) {
             return Some((SweepReason::Blackout, c.time));
         }
         // SL-breach uses the bar's mid close as the "current price" the live
@@ -2973,7 +2971,7 @@ mod tests {
             SimOutcome::NeverFilled
         );
         assert_eq!(
-            sweep_reason(&intent, &shell, 0.0001, &path, &[]),
+            sweep_reason(&intent, &shell, 0.0001, &path),
             Some((SweepReason::SlBreached, ts("2026-06-17T12:00:00Z")))
         );
     }
@@ -3007,7 +3005,7 @@ mod tests {
             SimOutcome::NeverFilled
         );
         assert_eq!(
-            sweep_reason(&intent, &shell, 0.0001, &path, &[]),
+            sweep_reason(&intent, &shell, 0.0001, &path),
             Some((SweepReason::BarExpiry, ts("2026-06-17T12:00:00Z")))
         );
     }
@@ -3035,7 +3033,7 @@ mod tests {
             candle("2026-06-17T12:00:00Z", 1.1010, 1.1012, 1.0990, 1.0995), // past window + SL
         ];
         assert_eq!(
-            sweep_reason(&intent, &shell, 0.0001, &path, &[]),
+            sweep_reason(&intent, &shell, 0.0001, &path),
             Some((SweepReason::Expired, ts("2026-06-17T12:00:00Z")))
         );
     }
@@ -3066,7 +3064,7 @@ mod tests {
             simulate_fill(&intent, &shell, 0.0001, &path),
             SimOutcome::NeverFilled
         );
-        assert_eq!(sweep_reason(&intent, &shell, 0.0001, &path, &[]), None);
+        assert_eq!(sweep_reason(&intent, &shell, 0.0001, &path), None);
     }
 
     /// A Market entry never rests, so a (degenerate) Market `NeverFilled` is not
@@ -3076,20 +3074,18 @@ mod tests {
         let mut intent = long_stop_intent();
         intent.entry = Some(EntrySpec::Market);
         let shell = trigger_shell();
-        assert_eq!(
-            sweep_reason(&intent, &shell, 0.0001, &[fire_bar()], &[]),
-            None
-        );
+        assert_eq!(sweep_reason(&intent, &shell, 0.0001, &[fire_bar()]), None);
     }
 
     /// A never-triggered stop-entry whose resting bars fall inside a market-hours
     /// blackout window → swept as `Blackout`. Blackout takes priority over a
     /// same-bar SL-breach (worker `sweep_one` branch order: blackout before the
-    /// stale-price SL check). An empty window slice never fires this branch.
+    /// stale-price SL check). Blackout is now read from the baked weekday-aware
+    /// mask keyed on the instrument (`EUR_USD`, weekend-only). A Friday-night bar
+    /// sits inside the universal weekend halt and must win over SL-breach; a
+    /// mid-week bar (no daily-close for EUR_USD) falls through to SL-breach.
     #[test]
     fn sweep_reason_reports_market_blackout() {
-        use trade_control_core::intent::NoEntryWindow;
-
         let mut intent = long_stop_intent();
         intent.entry = Some(EntrySpec::Stop {
             from: PriceAnchor::Close,
@@ -3099,24 +3095,34 @@ mod tests {
             recover_entry: None,
         });
         intent.expiry_bars = None;
+        assert_eq!(
+            intent.instrument, "EUR_USD",
+            "baked weekend-only instrument"
+        );
         let shell = trigger_shell();
 
-        // The 12:00Z bar both closes past the SL AND sits inside the blackout
-        // window (UTC minute 720 = 12:00). Blackout must win over SL-breach.
-        let path = [
+        // 2026-06-19 is a FRIDAY. The 22:00Z bar both closes past the SL AND
+        // sits inside the weekend halt (Fri 21:00Z → Sun 22:00Z). Blackout must
+        // win over SL-breach.
+        let fri_path = [
             fire_bar(),
-            candle("2026-06-17T11:00:00Z", 1.1041, 1.1045, 1.1038, 1.1043), // in-window, no breach
-            candle("2026-06-17T12:00:00Z", 1.1010, 1.1012, 1.0990, 1.0995), // blackout + past SL
+            candle("2026-06-19T20:00:00Z", 1.1041, 1.1045, 1.1038, 1.1043), // Fri pre-halt, no breach
+            candle("2026-06-19T22:00:00Z", 1.1010, 1.1012, 1.0990, 1.0995), // Fri in-halt + past SL
         ];
-        // 11:55–12:05 UTC blackout (minutes 715..=725) catches the 12:00 bar.
-        let windows = [NoEntryWindow::new(715, 725)];
         assert_eq!(
-            sweep_reason(&intent, &shell, 0.0001, &path, &windows),
-            Some((SweepReason::Blackout, ts("2026-06-17T12:00:00Z")))
+            sweep_reason(&intent, &shell, 0.0001, &fri_path),
+            Some((SweepReason::Blackout, ts("2026-06-19T22:00:00Z")))
         );
-        // Same path with no windows → falls through to SL-breach (not blackout).
+
+        // 2026-06-17 is a WEDNESDAY — EUR_USD has no mid-week daily close, so
+        // the same past-SL bar falls through to SL-breach, not blackout.
+        let wed_path = [
+            fire_bar(),
+            candle("2026-06-17T11:00:00Z", 1.1041, 1.1045, 1.1038, 1.1043),
+            candle("2026-06-17T12:00:00Z", 1.1010, 1.1012, 1.0990, 1.0995),
+        ];
         assert_eq!(
-            sweep_reason(&intent, &shell, 0.0001, &path, &[]),
+            sweep_reason(&intent, &shell, 0.0001, &wed_path),
             Some((SweepReason::SlBreached, ts("2026-06-17T12:00:00Z")))
         );
     }

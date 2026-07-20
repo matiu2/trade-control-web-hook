@@ -23,7 +23,7 @@
 
 use chrono::{DateTime, Timelike, Utc};
 
-use crate::intent::{Direction, NoEntryWindow, is_inside_any};
+use crate::intent::{Direction, NoEntryWindow, is_inside_any, market_hours_blocked};
 
 /// Why the live cron sweep would have cancelled a still-resting entry order.
 ///
@@ -84,6 +84,17 @@ pub fn bar_expiry_due(cancel_at: Option<DateTime<Utc>>, now: DateTime<Utc>) -> b
 pub fn market_blackout_due(windows: &[NoEntryWindow], now: DateTime<Utc>) -> bool {
     let now_min = now_utc_minute_of_day(now);
     is_inside_any(now_min, windows)
+}
+
+/// Weekday-aware market-hours-blackout predicate, keyed on the broker-native
+/// `symbol` (the successor to [`market_blackout_due`]). True iff `now` falls in
+/// the instrument's baked [`WeekMask`](crate::intent::WeekMask) — the universal
+/// weekend halt plus any per-instrument mid-week daily close. Fail-open for an
+/// uncatalogued symbol (returns `false`), matching the reject gate. This is what
+/// both the worker sweep and the replay call now that the window deriver is
+/// retired; no KV read, no daily refresh, no timezone math.
+pub fn market_blackout_due_symbol(symbol: &str, now: DateTime<Utc>) -> bool {
+    market_hours_blocked(symbol, now)
 }
 
 #[cfg(test)]

@@ -12,42 +12,60 @@ samples). Mirrors the spread-hour baked table (`core/src/spread_blackout.rs`
   day-blind minute-of-day `NoEntryWindow` for market-hours. Gate indexes by
   `(weekday, minute)` on `now: DateTime<Utc>`.
 - Weekend rule: always-on, ALL instruments (Fri-close → Mon-open span).
-- Daily-close rule: 20% threshold, ATR24, jump≥1×ATR, ≥30 samples.
-  - TN(9): SouthAfrica40, AZNLSE, ES35, EU50, DE40UK100, US500US2000diff, CH20,
-    FR40, US30USTEC.
-  - OANDA(8): USDTRY, TRYJPY, EURTRY, UK10YB, NL25EUR, FR40, CH20, ESPIXEUR.
+- Daily-close rule: 20% threshold, ATR24, jump≥1×ATR, ≥30 samples — **counting
+  only MID-WEEK (Mon–Thu) attention gaps**, because a Friday attention-gap IS the
+  weekend gap and is already covered by the universal weekend rule. Counting
+  midweek-only is what separates "this cash index has a real overnight daily
+  close" from "this FX pair just gaps over the weekend". Derived from the scan
+  JSON `events[].weekday` — reproducible, not hand-picked.
+  - Resulting DAILY-CLOSE instruments (midweek frac ≥20%, ≥30 samples):
+    - TN(7): SOUTHAFRICA40 (15h), AZNLSE (15/16h), ES35 (15/16h), EU50 (19/20h),
+      DE40UK100 (19/20h), US500US2000ROLLINGFUTUREDIFF (19/20h), CH20 (19/20h).
+    - OANDA(6): USDTRY (14/15h), TRYJPY (14/15h), EURTRY (14/15h), UK10YB (16/17h),
+      NL25EUR (19/20h), FR40 (19/20h).
+  - Daily block placed as `[peak_close_hour .. peak_close_hour+2h]` UTC (the two
+    dominant close hours seen), applied every day (weekend days harmless — already
+    weekend-blocked). No pre-close buffer for now; the reopen gap is what we're
+    protecting the resting order from, and the block spans the close hour itself.
 
 ## Build order (ordered commits, keep each < ~600 lines)
 
-- [ ] **A. Weekly bitmap model + weekday-aware gate (core).**
-  - New `WeekMask` type (`[bool; 7*1440]` or bitset) in `core/src/intent/blackout/`.
-  - `is_blocked_at(now: DateTime<Utc>) -> bool` indexing `(weekday*1440 + minute)`.
-  - Constructors: `block_span(from_weekday, from_min, to_weekday, to_min)` for the
-    weekend; `block_daily(minute_range)` (all 7 days) for daily closes.
-  - Keep the old `NoEntryWindow` + `is_inside_any` for now (temp fix holds); the
-    new gate is additive until C rewires.
-- [ ] **B. Generator + baked table.**
-  - Promote `cli/examples/{tn,oanda}_gap_atr.rs` into a `market-hours-gen` tool
-    that emits a Rust `MARKET_HOURS[(venue,symbol) -> WeekMask-spec]` table.
-  - `core` gets `baked_market_hours(venue, instrument) -> Option<WeekMask>` scan,
-    mirroring `baked_candle_row`.
-- [ ] **C. Rewire consumers, retire deriver.**
-  - `run_enter` gate (`core/src/dispatch/enter.rs`): consult baked table + weekend
-    rule via `is_blocked_at(now)` instead of `get_blackout_windows` +
-    `is_inside_any(now_utc_minute_of_day)`.
-  - Sweep (`core/src/sweep_gate.rs::market_blackout_due`): same.
-  - Cron (`trade-control-cron/src/blackout_hours.rs`) + replay
-    (`cli/src/bin/replay_candles/market_hours.rs`): stop calling
-    `windows_from_session`/`market_info`; the baked table needs no daily refresh.
-  - Delete `windows_from_session` + the `NoEntryWindow` KV get/set path once
-    nothing reads it (or leave the KV trait methods as dead for a follow-up).
-- [ ] **D. Tests + replay parity.**
-  - Weekday gate unit tests (weekend wrap Fri→Mon; daily block on the right hour;
-    NOT blocked mid-week for a weekend-only instrument = the EUR/USD bug case).
-  - Extend `enter_inside_market_hours_blackout_is_rejected` for weekday cases.
-  - Generator output test.
+- [x] **A. Weekly bitmap model + weekday-aware gate (core).** (commit 77aa437)
+  - `WeekMask` (`[bool; 7*1440]`) in `core/src/intent/blackout/week_mask.rs`.
+  - `is_blocked_at(now)`, `block_span`, `block_daily`. 7 unit tests.
+- [x] **B. Generator + baked table.**
+  - New `market-hours-gen` crate (workspace member), mirroring
+    `spread-baseline-gen`: `lib/universe/fetch/compute/render` + `bin/generate`.
+  - Self-fetches H1 candles (OANDA + TN), measures ATR-gaps, splits weekend vs
+    **mid-week** attention (the refinement — Friday gaps ARE the weekend rule),
+    emits `core/src/market_hours_baked.rs` (245 rows, 13 daily-close instruments).
+  - `core::intent::blackout::baked` gets `baked_market_hours(symbol) -> Option<WeekMask>`
+    (weekend always + daily overlay) and `market_hours_blocked(symbol, now)`.
+- [x] **C. Rewire consumers, retire deriver.**
+  - `run_enter` gate (`enter.rs`): `market_hours_blocked(&resolved.instrument, now)`
+    replaces the `get_blackout_windows` + `is_inside_any` KV path.
+  - Sweep/replay (`sweep_gate::market_blackout_due_symbol`, `simulator::sweep_reason`):
+    keyed on `intent.instrument`; `blackout_windows` param dropped everywhere.
+  - Replay driver: no more `market_info` fetch / KV seed (deleted
+    `replay_candles/market_hours.rs`).
+  - Cron: deleted `trade-control-cron/src/blackout_hours.rs` + retired the
+    `blackout_hours_loop` from the worker scheduler (no daily refresh needed).
+  - Left the `NoEntryWindow` + `windows_from_session` + KV `get/set_blackout_windows`
+    trait methods in place as dead-for-now (harmless; a follow-up can delete).
+- [x] **D. Tests + replay parity.**
+  - Weekday gate unit tests in `baked.rs` (weekend Fri→Sun; NOT mid-week = the
+    EUR/USD bug case; uncatalogued falls open).
+  - Rewrote `enter_inside_market_hours_blackout_is_rejected_by_the_baked_gate`
+    (Friday-night fire) and `sweep_reason_reports_market_blackout` (weekend vs
+    mid-week) for the baked gate.
+  - Generator: `compute`/`render`/`universe` unit tests (9).
+
+## DONE — all steps complete. `market-hours-gen` regenerable:
+`OANDA_TOKEN=... cargo run -p market-hours-gen --release -- --out ../core/src/market_hours_baked.rs`
 
 ## Notes
-- Probes/data in scratchpad: `tn_gap_atr.json`, `oanda_gap_atr.json`.
-- Venue dimension matters: only CH20+FR40 overlap; a TN-only table misses
-  USDTRY (80% daily gap) etc.
+- Probes/data in scratchpad: `tn_gap_atr.json`, `oanda_gap_atr.json` (superseded
+  by the self-fetching generator, kept as validation reference).
+- Venue dimension matters: the midweek split put FR40-TN (18.9%) below and
+  CH20-OANDA (19.2%) below the 20% line, while their cross-venue twins cleared —
+  a TN-only table would have missed USDTRY (59% midweek) etc.
