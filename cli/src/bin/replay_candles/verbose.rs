@@ -181,10 +181,20 @@ impl BarTrace {
             && !self.confirmed_while_suppressed
     }
 
-    /// Render this trace as one indented block under a `bar …` header. Returns
-    /// the empty string for a quiet bar (so the caller can `push_str` blindly).
-    pub fn render(&self) -> String {
-        if self.is_quiet() {
+    /// Render this trace as one indented block under a `bar …` header, with the
+    /// replay report's **rich per-fire notes** for this bar (`placed` / `BLOCKED`
+    /// / `FILLED` / exit / `pause` / `news-start` …) injected in place of the bare
+    /// `→ fired <rule>` lines. `notes` comes from the same event stream the second
+    /// section prints, bucketed by bar time (see `report::render`). When `notes`
+    /// is empty the output is identical to the bare-fire form, so a
+    /// `--simulate`-off run — or a bar that only carries a forward fill note —
+    /// reads exactly as before. Returns the empty string for a quiet bar with no
+    /// notes (so the caller can `push_str` blindly).
+    ///
+    /// A bar with injected notes but no other state change is **not quiet**: the
+    /// notes are the whole point, so it renders.
+    pub fn render_with_notes(&self, notes: &[String]) -> String {
+        if self.is_quiet() && notes.is_empty() {
             return String::new();
         }
         let mut out = format!("  bar {} phase={:?}\n", bne(self.bar), self.phase);
@@ -235,8 +245,20 @@ impl BarTrace {
         if let Some(reason) = &self.not_taken {
             out.push_str(&format!("    ✗ not taken: {reason}\n"));
         }
-        for rule in &self.fired_rules {
-            out.push_str(&format!("    → fired {rule}\n"));
+        // Fire lines: prefer the report's rich per-fire notes for this bar
+        // (`entry #1 placed — order …`, `… BLOCKED — rejected: market-blackout …`,
+        // `NEWS START — watching for reversal candles …`). They're the same lines
+        // the second section prints, so the trace no longer needs the operator to
+        // cross-reference. When no notes were injected (e.g. `--simulate` off),
+        // fall back to the bare rule ids so the trace is never emptier than before.
+        if notes.is_empty() {
+            for rule in &self.fired_rules {
+                out.push_str(&format!("    → fired {rule}\n"));
+            }
+        } else {
+            for note in notes {
+                out.push_str(&format!("    → {note}\n"));
+            }
         }
         out
     }
@@ -271,7 +293,7 @@ mod tests {
             false,
         );
         assert!(t.is_quiet());
-        assert_eq!(t.render(), "");
+        assert_eq!(t.render_with_notes(&[]), "");
     }
 
     #[test]
@@ -293,7 +315,7 @@ mod tests {
         );
         assert!(t.retest_stamped);
         assert!(!t.is_quiet());
-        assert!(t.render().contains("retest stamped"));
+        assert!(t.render_with_notes(&[]).contains("retest stamped"));
 
         // Already-set on the prior bar → not re-reported.
         let t2 = BarTrace::diff(
@@ -332,7 +354,7 @@ mod tests {
         );
         assert!(t.break_close_stamped);
         assert_eq!(t.phase_from, Some(Phase::AwaitBreakAndClose));
-        let r = t.render();
+        let r = t.render_with_notes(&[]);
         assert!(r.contains("break-and-close stamped"));
         assert!(r.contains("AwaitBreakAndClose→AwaitEntry"));
     }
@@ -354,7 +376,7 @@ mod tests {
             None,
             false,
         );
-        let r = t.render();
+        let r = t.render_with_notes(&[]);
         assert!(r.contains("→ fired 05-enter"));
         assert!(r.contains("AwaitEntry→Done"));
     }
@@ -375,7 +397,71 @@ mod tests {
             false,
         );
         assert!(!t.is_quiet());
-        assert!(t.render().contains("→ fired 01-veto-too-low"));
+        assert!(t.render_with_notes(&[]).contains("→ fired 01-veto-too-low"));
+    }
+
+    /// Injected rich notes REPLACE the bare `→ fired <rule>` lines: the trace
+    /// shows the report's own "entry #1 placed …" / "… BLOCKED …" wording, so an
+    /// operator no longer has to cross-reference the second section.
+    #[test]
+    fn injected_notes_replace_bare_fire_lines() {
+        let s = state(Phase::AwaitEntry);
+        let t = BarTrace::diff(
+            at(3),
+            &s,
+            &s,
+            vec!["09-enter-qm".into()],
+            None,
+            Vec::new(),
+            None,
+            false,
+            None,
+            false,
+        );
+        let notes = vec![
+            "entry #1 placed — order UNRESOLVED".to_string(),
+            "entry #1 BLOCKED — rejected: market-blackout → NO FILL / 0R".to_string(),
+        ];
+        let r = t.render_with_notes(&notes);
+        // The rich notes are shown…
+        assert!(r.contains("→ entry #1 placed — order UNRESOLVED"), "{r}");
+        assert!(
+            r.contains("→ entry #1 BLOCKED — rejected: market-blackout"),
+            "{r}"
+        );
+        // …and the bare `→ fired 09-enter-qm` line is NOT (replaced, not appended).
+        assert!(
+            !r.contains("→ fired 09-enter-qm"),
+            "bare fire line suppressed: {r}"
+        );
+    }
+
+    /// A bar that only carries injected notes (no phase move / stamp / mark) is
+    /// NOT quiet — the notes are the whole point (e.g. a forward bar where a fill
+    /// landed).
+    #[test]
+    fn a_note_only_bar_is_not_quiet_and_renders() {
+        let s = state(Phase::AwaitEntry);
+        let t = BarTrace::diff(
+            at(5),
+            &s,
+            &s,
+            Vec::new(),
+            None,
+            Vec::new(),
+            None,
+            false,
+            None,
+            false,
+        );
+        // Quiet with no notes…
+        assert!(t.is_quiet());
+        assert_eq!(t.render_with_notes(&[]), "");
+        // …but a single injected note makes it render.
+        let notes = vec!["entry #1 FILLED @ 1.14282".to_string()];
+        let r = t.render_with_notes(&notes);
+        assert!(!r.is_empty());
+        assert!(r.contains("→ entry #1 FILLED @ 1.14282"), "{r}");
     }
 
     /// A golden mark on a bar where nothing else happened is NOT quiet and
@@ -404,7 +490,7 @@ mod tests {
             false,
         );
         assert!(!t.is_quiet());
-        let r = t.render();
+        let r = t.render_with_notes(&[]);
         assert!(r.contains("◆ GOLDEN"), "golden mark rendered: {r}");
         assert!(r.contains("Long"), "direction shown: {r}");
     }
@@ -432,7 +518,7 @@ mod tests {
             None,
             false,
         );
-        let r = t.render();
+        let r = t.render_with_notes(&[]);
         assert!(r.contains("◆ signal"), "non-golden mark: {r}");
         assert!(!r.contains("GOLDEN"), "not tagged golden: {r}");
     }
@@ -463,7 +549,7 @@ mod tests {
             false,
         );
         assert!(!t.is_quiet());
-        let r = t.render();
+        let r = t.render_with_notes(&[]);
         assert!(r.contains("◆ GOLDEN"), "golden still marked: {r}");
         assert!(
             r.contains("⌀ spread-hour"),
@@ -502,7 +588,7 @@ mod tests {
             !t.is_quiet(),
             "a confirmation-while-suppressed bar is noteworthy"
         );
-        let r = t.render();
+        let r = t.render_with_notes(&[]);
         assert!(
             r.contains("signal confirmed, not entering"),
             "confirmed-but-suppressed wording: {r}"
@@ -533,6 +619,6 @@ mod tests {
             false,
         );
         assert!(t.is_quiet(), "spread hour alone is not noteworthy");
-        assert_eq!(t.render(), "");
+        assert_eq!(t.render_with_notes(&[]), "");
     }
 }

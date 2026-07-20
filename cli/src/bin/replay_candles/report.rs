@@ -285,10 +285,6 @@ pub fn render(
         out.push_str(&render_sentiment(s));
     }
 
-    if verbose {
-        out.push_str(&render_trace(replay));
-    }
-
     let mut tally = Tally::new();
     // A monotonic id for each ENTER fire, so the journal can refer to an entry
     // (and its later widen/restore/break-even events) by a stable "#N" label
@@ -299,6 +295,13 @@ pub fn render(
     // entries interleaved by when they actually happened). The tally is booked
     // in fire order inside `render_fire` (so the compounding sequence is
     // correct); the events only carry the resulting text.
+    //
+    // Built BEFORE the `--verbose` trace so the trace can reuse these same rich
+    // per-event notes (the "placed / BLOCKED / FILLED / news-start …" lines)
+    // instead of its own bare `→ fired <rule>` labels. `render_fire` is called
+    // exactly once per fire — it also books the tally as a side effect — so we
+    // must not call it again from the trace; the trace consults the finished
+    // notes map instead.
     let mut events: Vec<EntryEvent> = Vec::new();
     for fire in &replay.fires {
         let this_entry = if fire.fired.intent.action == Action::Enter {
@@ -320,6 +323,20 @@ pub fn render(
     // Stable sort by time: same-bar events keep their emission order (placed
     // before fill before widen on a shared bar).
     events.sort_by_key(|e| e.at);
+
+    if verbose {
+        // Bucket the rich event notes by bar time so the trace renders them in
+        // place of its bare fire lines. Order within a bar is preserved (events
+        // are already time-sorted). A bar's forward-path events (FILLED / exit /
+        // widen) land here too, so the trace shows what happened on each bar.
+        let mut notes_by_bar: std::collections::HashMap<DateTime<Utc>, Vec<String>> =
+            std::collections::HashMap::new();
+        for e in &events {
+            notes_by_bar.entry(e.at).or_default().push(e.note.clone());
+        }
+        out.push_str(&render_trace(replay, &notes_by_bar));
+    }
+
     for e in &events {
         out.push_str(&format!("{}  {}", bne(e.at), e.note));
         if let Some(close) = e.close {
@@ -503,11 +520,23 @@ fn render_entry_declines(replay: &Replay) -> String {
 /// in order. Quiet bars are omitted. Returns a short note when no bar was
 /// noteworthy (e.g. a window that only ever seeded), so `--verbose` is never
 /// silently empty.
-fn render_trace(replay: &Replay) -> String {
+fn render_trace(
+    replay: &Replay,
+    notes_by_bar: &std::collections::HashMap<DateTime<Utc>, Vec<String>>,
+) -> String {
     let mut out = String::from("\nBar-by-bar engine trace (--verbose):\n");
     let mut any = false;
     for trace in &replay.traces {
-        let block = trace.render();
+        // The rich per-fire notes for this bar (placed / BLOCKED / FILLED / exit
+        // / pause / news-start …), pulled from the same event stream the second
+        // section prints. When present they replace the trace's bare
+        // `→ fired <rule>` lines; when absent (e.g. `--simulate` off, or a
+        // forward bar with a fill note only) the trace falls back to the rule ids.
+        let notes = notes_by_bar
+            .get(&trace.bar)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        let block = trace.render_with_notes(notes);
         if !block.is_empty() {
             out.push_str(&block);
             any = true;
@@ -586,10 +615,7 @@ fn render_fire(
     if intent.action != Action::Enter {
         return vec![EntryEvent {
             at: candle.time,
-            note: format!(
-                "{:?} ({}) — no fill simulated",
-                intent.action, fire.fired.rule_id
-            ),
+            note: describe_control_action(intent.action, &fire.fired.rule_id),
             close: Some(candle.c),
         }];
     }
@@ -652,6 +678,13 @@ fn render_fire(
     if let Some(reason) = fire.rejected_reason() {
         let detail = if reason.starts_with("rejected: paused") {
             format!("{ev} SUPPRESSED — trade paused by news blackout [{reason}] → NO FILL / 0R")
+        } else if reason.contains("market-blackout") {
+            // Distinct from the news `paused` branch above: this is the
+            // market-HOURS / spread-blackout window (session closed, or the
+            // post-NY-close liquidity trough), NOT a news event.
+            format!(
+                "{ev} BLOCKED — {reason} (market-hours / spread window, not news) → NO FILL / 0R"
+            )
         } else {
             format!("{ev} BLOCKED — {reason} → NO FILL / 0R")
         };
@@ -995,6 +1028,43 @@ fn describe_never_filled(swept: Option<(SweepReason, DateTime<Utc>)>) -> String 
             bne(at)
         ),
         None => "fill: NEVER FILLED (pending order untriggered in window)".to_string(),
+    }
+}
+
+/// One-line note for a fired *control* action (anything that isn't an enter and
+/// isn't handled by the `Close` / `Prep` branches above): pause/resume, the
+/// news-window open/close, and the veto/invalidate family. These never place or
+/// fill an order — they mutate the plan's gate state — so the note describes
+/// what the state change *means* for entries and for reversal-close eligibility,
+/// which is what an operator reading the journal wants.
+///
+/// The pause/news wording mirrors the operator's mental model of the news
+/// machinery:
+/// - **pause** opens the pre-release blackout — new entries are held off in the
+///   run-up to the event.
+/// - **resume** clears it once the run-up has passed.
+/// - **news-start** opens the post-release news window (fired at the exact event
+///   minute) — while it's open a reversal candle can close the position.
+/// - **news-end** closes that window — a reversal now needs support/resistance
+///   (the S/R-gated close), not the news gate.
+///
+/// `Veto`/`Invalidate` keep the neutral "no fill simulated" wording (their
+/// meaning is the rule id, e.g. `01-veto-too-low`).
+fn describe_control_action(action: Action, rule_id: &str) -> String {
+    match action {
+        Action::Pause => {
+            format!("PAUSE entries ({rule_id}) — upcoming-news blackout: new entries held off")
+        }
+        Action::Resume => {
+            format!("RESUME entries ({rule_id}) — news run-up over: entries allowed again")
+        }
+        Action::NewsStart => format!(
+            "NEWS START ({rule_id}) — news is releasing now: watching for reversal candles to close the position"
+        ),
+        Action::NewsEnd => format!(
+            "NEWS END ({rule_id}) — news window closed: reversals now need support/resistance to close"
+        ),
+        other => format!("{other:?} ({rule_id}) — no fill simulated"),
     }
 }
 
@@ -1423,6 +1493,32 @@ mod tests {
             describe_order(&limit, 0.0001),
             "order: LONG limit @ 1.10400  SL 1.10000  TP 1.11500"
         );
+    }
+
+    /// The control-action wording spells out what the pause/news fires mean for
+    /// entries and reversal-close eligibility — the news machinery the operator
+    /// asked to surface.
+    #[test]
+    fn control_action_wording_describes_pause_and_news() {
+        let pause = describe_control_action(Action::Pause, "01-pause-a-b");
+        assert!(pause.contains("PAUSE entries"), "{pause}");
+        assert!(pause.contains("upcoming-news blackout"), "{pause}");
+
+        let resume = describe_control_action(Action::Resume, "01-resume-a-b");
+        assert!(resume.contains("RESUME entries"), "{resume}");
+
+        let ns = describe_control_action(Action::NewsStart, "news-start-a");
+        assert!(ns.contains("NEWS START"), "{ns}");
+        assert!(ns.contains("watching for reversal candles"), "{ns}");
+
+        let ne = describe_control_action(Action::NewsEnd, "news-end-a");
+        assert!(ne.contains("NEWS END"), "{ne}");
+        assert!(ne.contains("support/resistance"), "{ne}");
+
+        // A veto/invalidate keeps the neutral wording (its meaning is its id).
+        let veto = describe_control_action(Action::Veto, "01-veto-too-low");
+        assert!(veto.contains("no fill simulated"), "{veto}");
+        assert!(veto.contains("01-veto-too-low"), "{veto}");
     }
 
     #[test]
