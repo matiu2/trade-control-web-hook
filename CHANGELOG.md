@@ -1,5 +1,36 @@
 # Changelog
 
+## v103 — 2026-07-20 — invalidation picker filters by the fib range (works with no neckline)
+
+**Why.** EUR/USD 1H arm with `--skip-break-and-close`: a stale `too-low` @
+1.15251 (from another trade) out-timed the operator's real `too-high` @ 1.14451
+and got picked, so rule 2 rejected the whole arm (`invalidation line at 1.15251
+is outside the fib range [1.14202, 1.14737]`). Root cause: the `--start`
+invalidation picker's stale-line filters were **neckline-based**, and with no
+neckline trend line drawn (`--skip-break-and-close`) `neckline_ref` was `None`,
+so the picker fell through to *nearest-anchor-time* and grabbed the stale line.
+
+**What changed (behaviour: tv-arm arm-time, `--start` only).**
+- **New primary filter `filter_invalidation_by_fib_range`** (`tv-arm/src/roles.rs`):
+  drops any invalidation horizontal **outside the fib's head↔neckline band**
+  before the neckline-side filter and the time tiebreak. The fib is the same
+  authoritative reference that decides direction (v102) and rule 2 — and it's
+  present even when no neckline is drawn, which is exactly the case the old
+  logic couldn't cover. Skipped if it would empty the candidate set (never
+  strands a setup).
+- `classify` now resolves `tp_fib` **before** the invalidation and threads the
+  fib's `(head, neckline)` (via `Drawing::fib_head_neckline`) into
+  `pick_slot_with_label`. The neckline-side filter stays as a complementary
+  second filter when a neckline *is* drawn.
+
+**Breaking.** None. `pick_slot_with_label` gained a `fib_range` param
+(tv-arm-private).
+
+**Tests.** `nearest_to_invalidation_fib_range_drops_stale_without_neckline`
+reproduces the EUR/USD case (no neckline; stale out-of-range line nearer in
+time; real in-range cap wins). **Verified end-to-end**: the failing arm now
+builds `direction=short`, `too-high=1.14451` (the operator's line), `TP=1.13668`.
+
 ## v102 — 2026-07-20 — H&S fib direction reads the `reverse` flag, not point order
 
 **Why.** v99 moved H&S trade direction onto the fib (good — it fixed the
