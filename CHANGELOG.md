@@ -30,14 +30,26 @@ to react to a reversal validating now — so the fix could not touch
   reversal-close is unchanged; it still fires when a reversal prints OR validates
   now.
 
+**Behaviour split (operator's rule).**
+- **No `--strategy-v2` and no `--quasimodo`** → `needs_confirmed == false` →
+  every confirmed signal is REJECTED; the enter fires only when the signal
+  actually occurs (prints).
+- **`--strategy-v2` after a break-and-close** (the QM leg `09-enter-qm`,
+  `needs_confirmed == true`) / **`--quasimodo`** → the confirmed candle is
+  ACCEPTED (fires via `first_confirmed_signal_at`). In strategy-v2 the
+  `05-enter` STOP leg stays plain/print-only; only the QM leg is
+  confirmation-gated — the two legs are OR alternatives.
+
 **Breaking.** None on the wire. `eval_pine_entry` (engine-private) gained one
 bool param.
 
 **Tests.** `plain_enter_does_not_fire_on_a_retroactive_confirmation_bar`
 (bar 3 of `two_short_engulfers_window`, where short #1 validates but nothing
-prints → no fire) and `plain_enter_fires_on_the_bar_the_signal_prints`
+prints → no fire), `plain_enter_fires_on_the_bar_the_signal_prints`
 (bar 2, where short #2 prints → fires off that print, `signal_bar_time ==` the
-bar). Full engine suite (165) + core (879) green.
+bar), and `confirmed_enter_still_fires_on_the_confirmation_bar_after_print_only`
+(same bar 3, but `needs_confirmed` → still fires — pins the v2/QM half of the
+split). Full engine suite (166) + core (879) green.
 
 **Follow-up.** `needs_confirmed` (strategy-v2 / QM) enters unchanged. Offline
 replay reads the same engine, so replay==live automatically; the `replay-candles`

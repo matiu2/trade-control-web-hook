@@ -5455,6 +5455,51 @@ mod tests {
     }
 
     #[test]
+    fn confirmed_enter_still_fires_on_the_confirmation_bar_after_print_only() {
+        // The mirror of `plain_enter_does_not_fire_on_a_retroactive_confirmation_bar`:
+        // a `needs_confirmed` enter (the --strategy-v2 QM leg / --quasimodo) MUST
+        // still fire on the confirmation bar — the print-only gate applies only to
+        // the plain path (`print_only == !needs_confirmed`, and the gate is also
+        // `!confirmed_first`). Same window/bar as the plain test, only the flag
+        // differs, so this pins the exact behaviour split the operator asked for:
+        // "with --strategy-v2 after a break-and-close, a confirmed candle is
+        // accepted; without --strategy-v2/--quasimodo every confirmed signal is
+        // rejected."
+        let mut rule = pine_enter_rule(None, Direction::Short, false);
+        rule.intent.needs_confirmed = true;
+        // A confirmed short enters as a LIMIT at the signal base (price has already
+        // pushed below by the confirmation bar; a stop would be wrong-side).
+        rule.intent.entry = Some(trade_control_core::intent::EntrySpec::Limit {
+            from: trade_control_core::intent::PriceAnchor::SignalLow,
+            offset_pips: 0.0,
+            offset_atr_pct: None,
+            at: None,
+            recover_entry: None,
+        });
+        rule.intent.take_profit = Some(trade_control_core::intent::TakeProfit::Anchored(
+            trade_control_core::intent::PriceRef::Absolute { absolute: 90.0 },
+        ));
+        let p = plan(vec![rule]);
+        let window = two_short_engulfers_window();
+        let prior = seed_at(Phase::AwaitEntry, "2026-06-16T11:00:00Z");
+        // Same bar 3 the plain enter declined — the confirmed enter fires here.
+        let eval = run_window(&p, &prior, &window[3..], &window);
+        assert_eq!(
+            eval.fired.len(),
+            1,
+            "a needs_confirmed enter fires on the confirmation bar (got {:?})",
+            eval.fired
+        );
+        assert!(
+            eval.fired[0]
+                .signal
+                .expect("PinePattern fire carries geometry")
+                .signal_confirmed,
+            "it rode the confirmed signal"
+        );
+    }
+
+    #[test]
     fn plain_enter_fires_on_the_bar_the_signal_prints() {
         // The other half of the print-only rule: a plain enter DOES fire on the
         // bar a signal prints. Bar 2 of `two_short_engulfers_window` prints short
