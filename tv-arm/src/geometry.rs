@@ -24,21 +24,28 @@ pub fn tp_price(head: f64, neckline: f64) -> f64 {
     2.0 * neckline - head
 }
 
-/// Return the pcl-exhausted veto price: 80% of the way from the fib's
-/// midpoint toward the take-profit, for an already-resolved
-/// `(head, neckline)`.
+/// Return the pcl-exhausted veto price: 80% of the way from the **neckline**
+/// toward the take-profit, for an already-resolved `(head, neckline)`.
 ///
-/// Beyond this level the projected move is essentially complete and the
-/// R:R for a fresh entry no longer justifies opening the trade. The price
-/// sits *between* the neckline and the TP. Returns `f64::NAN` if either
-/// input is non-finite.
+/// On the operator's fib — drawn `head(0) → neckline(1)`, so the `2.0`
+/// extension lands on TP by the reflection `TP = 2·neckline − head` — this
+/// is exactly the **fib `1.8` level**. Beyond it the projected move is
+/// essentially complete and the R:R for a fresh entry no longer justifies
+/// opening the trade. The price sits *between* the neckline and the TP.
+///
+/// This anchors on the **neckline**, not the head↔neckline midpoint. It
+/// deliberately matches the M/W `overshoot_level` (`mw_geometry.rs`), which
+/// is already `neckline + 0.8·(TP − neckline)` (≡ its `180% of top→neckline`
+/// leg) — so H&S and M/W now abort at the same fraction of the projected
+/// move. (Was `midpoint + 0.8·(TP − midpoint)` ≈ fib `1.7`, ~one fib notch
+/// shallower, until 2026-07-20.) Returns `f64::NAN` if either input is
+/// non-finite.
 pub fn pcl_exhausted_price(head: f64, neckline: f64) -> f64 {
     if !head.is_finite() || !neckline.is_finite() {
         return f64::NAN;
     }
-    let midpoint = (head + neckline) / 2.0;
     let tp = 2.0 * neckline - head;
-    midpoint + 0.8 * (tp - midpoint)
+    neckline + 0.8 * (tp - neckline)
 }
 
 /// Direction implied by an already-resolved fib `(head, neckline)` — the
@@ -113,10 +120,10 @@ mod tests {
     //
     // Setup: bearish H&S, head at 1.20, neckline at 1.10.
     // Expected: TP = 2 × 1.10 − 1.20 = 1.00.
-    // pcl-exhausted = midpoint + 0.8 × (TP − midpoint)
-    //               = 1.15 + 0.8 × (1.00 − 1.15)
-    //               = 1.15 − 0.12
-    //               = 1.03.
+    // pcl-exhausted = neckline + 0.8 × (TP − neckline)   (fib 1.8)
+    //               = 1.10 + 0.8 × (1.00 − 1.10)
+    //               = 1.10 − 0.08
+    //               = 1.02.
     #[test]
     fn tp_short() {
         // head = 1.20, neckline = 1.10.
@@ -131,13 +138,28 @@ mod tests {
 
     #[test]
     fn pcl_short() {
-        assert!((pcl_exhausted_price(1.20, 1.10) - 1.03).abs() < 1e-9);
+        // fib 1.8 = neckline + 0.8 × (TP − neckline) = 1.10 + 0.8 × (1.00 − 1.10) = 1.02.
+        assert!((pcl_exhausted_price(1.20, 1.10) - 1.02).abs() < 1e-9);
     }
 
     #[test]
     fn pcl_long_mirrors_short() {
-        // Mirror: head = 1.00, neckline = 1.10, pcl = 1.17.
-        assert!((pcl_exhausted_price(1.00, 1.10) - 1.17).abs() < 1e-9);
+        // Mirror: head = 1.00, neckline = 1.10, TP = 1.20, pcl = 1.18.
+        assert!((pcl_exhausted_price(1.00, 1.10) - 1.18).abs() < 1e-9);
+    }
+
+    #[test]
+    fn pcl_equals_neckline_plus_80pct_of_neckline_to_tp() {
+        // The pcl-exhausted level anchors on the NECKLINE (fib 1.8), matching
+        // the M/W overshoot level — not the head↔neckline midpoint.
+        let (head, neckline) = (8848.0996, 8813.5);
+        let tp = 2.0 * neckline - head;
+        let expected = neckline + 0.8 * (tp - neckline); // 8785.82
+        assert!((pcl_exhausted_price(head, neckline) - expected).abs() < 1e-6);
+        // And it is deeper (closer to TP) than the old midpoint formula.
+        let old_midpoint = (head + neckline) / 2.0;
+        let old = old_midpoint + 0.8 * (tp - old_midpoint); // 8789.28
+        assert!(pcl_exhausted_price(head, neckline) < old);
     }
 
     #[test]

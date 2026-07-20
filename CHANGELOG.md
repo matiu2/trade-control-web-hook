@@ -1,5 +1,39 @@
 # Changelog
 
+## v107 — 2026-07-20 — pcl-exhausted level deepened to the fib 1.8 (neckline-anchored, matches M/W)
+
+**Why.** The H&S `pcl-exhausted` / `too-low` invalidation fired ~one fib notch
+too shallow. It was computed as `midpoint + 0.8·(TP − midpoint)` where
+`midpoint = (head + neckline)/2` — i.e. 80% of the *head↔neckline-midpoint→TP*
+span (≈ the fib **1.7** level). The operator reads the abort off the chart at the
+fib **1.8** level (on a fib drawn `head(0) → neckline(1)`, where the `2.0`
+extension lands on TP by the reflection `TP = 2·neckline − head`). On the
+AU200_AUD 2026-07-20 replay the old level was 8789.28; the operator's 1.8 line is
+**8785.82**.
+
+**What changed (behaviour: H&S pcl-exhausted / too-low veto level only).**
+- `pcl_exhausted_price` (`tv-arm/src/geometry.rs`) now anchors on the
+  **neckline**, not the head↔neckline midpoint:
+  `neckline + 0.8·(TP − neckline)` = the fib **1.8** level. Deeper (closer to TP)
+  than before, so the setup survives a little further into the projected move
+  before a *late* entry is blocked.
+- This makes H&S **consistent with M/W**: `mw_geometry::overshoot_level` is
+  already `neckline + 0.8·(TP − neckline)` (≡ its `180% of top→neckline` leg), so
+  both patterns now abort at the same fraction of the projected move. No new
+  parameter — `head`, `neckline`, `TP` were all already passed to `tv-arm`.
+
+**Breaking.** None on the wire (same veto name/shape/level-kind
+`stop-next-entry`; still position-preserving). Only the numeric level moves
+deeper. Any already-armed plan keeps its baked level; re-arm to pick up the new
+one.
+
+**Tests.** `pcl_short` (1.02) / `pcl_long_mirrors_short` (1.18) updated to the
+neckline formula; new `pcl_equals_neckline_plus_80pct_of_neckline_to_tp` pins the
+identity + that it's deeper than the old midpoint value; the Bug #12 baked
+entry-level-veto test (`hs_entry_level_vetos_short_sides_and_skips_missing`)
+updated 1.0830 → 1.0820. Full `tv-arm` suite (241) green; cli pcl-shape test
+still green.
+
 ## v106 — 2026-07-20 — cap the replay warm-up back-off (no more 15k-candle pulls)
 
 **Why.** A `replay-candles` / `tv-arm --replay` with `--start` on a **Monday**
