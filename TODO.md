@@ -61,8 +61,9 @@ it to the plain ENTER only.
       (trade-control / tv-arm / tv-news / replay-candles, -staging + -dev)
       rebuilt with the fix + reinstalled; fix string verified in both replay
       binaries. Worker NOT touched (operator: "don't worry about the server").
-- [ ] final: confirm the AU200_AUD 2026-07-20 replay no longer enters off the
-      10:15 confirmation bar (unit tests already prove it; confirming end-to-end).
+- [x] final: confirmed end-to-end. AU200_AUD 2026-07-20 replay now enters at
+      11:15 (bar where a golden FloatingEngulfer PRINTS), NOT at 10:45 off a
+      confirmation. The 10:15 bar stamps break-and-close but fires no entry. ✓
 
 ## Side-fix (v106) — replay warm-up back-off cap
 
@@ -73,4 +74,7 @@ a Monday → naive 200-bar window lands in the weekend → AU200 returns 1 candl
       (`cli/src/bin/replay_candles.rs`); ATR floor (200 bars) intact.
 - [x] Tests: caps-gap-poisoned-jump + cap-doesn't-shrink-healthy; suite 107 green.
 - [x] CHANGELOG v106.
-- [ ] commit/push staging + main + parent-bump + rebuild CLIs (staging done).
+- [x] committed/pushed staging (c3ebc74, tag v106) + main (e2bf469) +
+      parent-bump (c3ebc74); staging + dev CLIs rebuilt with the cap.
+- [x] verified live: warm-up pull dropped 15,647 → 581 candles (attempt 0
+      warmup=2 weekend, attempt 1 bounded 4× hop → warmup=546, target cleared).
