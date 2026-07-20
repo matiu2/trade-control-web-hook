@@ -1,5 +1,49 @@
 # Changelog
 
+## v105 — 2026-07-20 — plain enters fire on a signal PRINT, not on retroactive confirmation
+
+**Why.** A staging replay (`tv-arm-staging --start=… --replay`, AU200_AUD M15
+2026-07-20) with **plain** rules — no `--strategy-v2`, no `--quasimodo` — entered
+off a candle signal that only **confirmed** on a later bar, not one that actually
+**printed** there. Operator's rule: when we're not on strategy-v2 / quasimodo we
+should accept a signal only *when it occurs*, never a retroactive confirmation.
+
+**Root cause.** `latched_signal_at`
+(`core/src/signals/state_machine.rs`) — the plain-mode signal path — reports
+`fires = true` on **two** bar kinds: (1) the bar a signal PRINTS, and (2) the bar
+an earlier *pending* signal retroactively VALIDATES (`just_valid`). Path (2) is
+confirmation semantics; it belongs only to the `needs_confirmed`
+(strategy-v2 / quasimodo) enter, which reads `first_confirmed_signal_at`. It was
+leaking into the plain enter. `latched_signal_at` is ALSO consumed by the
+reversal-close **guard** (`eval_pine_guard → eval_pine_entry`), which *does* want
+to react to a reversal validating now — so the fix could not touch
+`latched_signal_at` itself.
+
+**What changed (behaviour: engine, plain PinePattern enters only).**
+- `eval_pine_entry` (`engine/src/evaluate.rs`) gained a `print_only: bool`. When
+  `print_only && !confirmed_first && sig.signal_bar_time != candle.time` the
+  enter **declines** — a signal that validated on this bar but printed on an
+  earlier one is not an occurrence.
+- The **enter** call site passes `print_only = !needs_confirmed` — plain enters
+  are print-only; a `needs_confirmed` enter opts INTO firing on confirmation.
+- The **guard** (`eval_pine_guard`) call site passes `print_only = false` — the
+  reversal-close is unchanged; it still fires when a reversal prints OR validates
+  now.
+
+**Breaking.** None on the wire. `eval_pine_entry` (engine-private) gained one
+bool param.
+
+**Tests.** `plain_enter_does_not_fire_on_a_retroactive_confirmation_bar`
+(bar 3 of `two_short_engulfers_window`, where short #1 validates but nothing
+prints → no fire) and `plain_enter_fires_on_the_bar_the_signal_prints`
+(bar 2, where short #2 prints → fires off that print, `signal_bar_time ==` the
+bar). Full engine suite (165) + core (879) green.
+
+**Follow-up.** `needs_confirmed` (strategy-v2 / QM) enters unchanged. Offline
+replay reads the same engine, so replay==live automatically; the `replay-candles`
+binary itself is currently unbuildable due to unrelated market-hours WIP, so its
+suffixed CLI is not rebuilt this pass.
+
 ## v104 — 2026-07-20 — fib-range invalidation filter runs in ALL modes (not just `--start`)
 
 **Why.** v103's fib-range filter was guarded to `SlotPref::NearestTo` (`--start`)
