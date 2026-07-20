@@ -1,5 +1,30 @@
 # Changelog
 
+## v104 — 2026-07-20 — fib-range invalidation filter runs in ALL modes (not just `--start`)
+
+**Why.** v103's fib-range filter was guarded to `SlotPref::NearestTo` (`--start`)
+only. But the EUR/USD incident happened under **`--register-plan`**
+(`SlotPref::LatestWins`) — the filter never ran, so the stale `too-low` @ 1.15251
+was still picked (it was the *latest* line) and rule 2 rejected the arm exactly
+as before. The v103 "fix" didn't cover the live arming path.
+
+**What changed (behaviour: tv-arm arm-time, all modes).**
+- `filter_invalidation_by_fib_range` (`tv-arm/src/roles.rs`) **dropped its
+  `NearestTo`-only guard**. The check is purely geometric ("is the invalidation
+  inside the fib's head↔neckline band?"), which is valid regardless of how the
+  arm was launched — a stale line is stale in `--register-plan`, replay, and
+  `--start` alike. (The neckline-*side* filter stays `--start`-only; only the
+  fib-range filter broadened.)
+
+**Breaking.** None. The `pref` param was removed from
+`filter_invalidation_by_fib_range` (tv-arm-private).
+
+**Tests.** `latest_wins_invalidation_fib_range_drops_stale_without_neckline`
+reproduces the actual `--register-plan` incident (LatestWins; stale line is the
+newest, would win without the filter). **Verified end-to-end** against the live
+chart under `--plan-out` (WindowAware) and confirmed via debug log that
+`BXlYoP` @ 1.15251 is dropped and `too-high` @ 1.14451 is baked.
+
 ## v103 — 2026-07-20 — invalidation picker filters by the fib range (works with no neckline)
 
 **Why.** EUR/USD 1H arm with `--skip-break-and-close`: a stale `too-low` @
