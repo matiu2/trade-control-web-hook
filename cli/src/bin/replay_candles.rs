@@ -312,11 +312,21 @@ async fn main() -> Result<()> {
 }
 
 /// Max look-back back-off attempts before we give up widening the warm-up pull.
-/// Each attempt doubles the span, so 6 attempts reaches 2⁵ = 32× the initial
-/// wall-clock estimate — enough to hop a weekend gap several times over even on
-/// a sparse instrument. Beyond this we replay with whatever warm-up we got and
-/// let the report be honest about the shallow ATR rather than loop forever.
+/// Each attempt grows the span by up to [`MAX_BACKOFF_SPAN_MUL`]× (the density
+/// extrapolation, capped), so 6 attempts reach several thousand × the initial
+/// wall-clock estimate — enough to hop a weekend gap many times over even on a
+/// sparse instrument. Beyond this we replay with whatever warm-up we got and let
+/// the report be honest about the shallow ATR rather than loop forever.
 const MAX_WARMUP_BACKOFF_ATTEMPTS: u32 = 6;
+
+/// Cap on how much a single warm-up back-off may widen the look-back span,
+/// as a multiple of the current span. Guards against a density estimate poisoned
+/// by a gap-dominated first attempt (a `--start` on a Monday sees only the
+/// weekend's ~0 candles) from leaping back a year-plus and pulling tens of
+/// thousands of candles in one shot. A bounded step re-measures against real
+/// trading days next round; convergence still fits within
+/// [`MAX_WARMUP_BACKOFF_ATTEMPTS`].
+const MAX_BACKOFF_SPAN_MUL: i64 = 4;
 
 /// Pull the warm-up prefix + live window, sizing the prefix by a **count of real
 /// candles** (`want_warmup`) rather than wall-clock time. Starts from the naive
@@ -420,6 +430,17 @@ fn next_pull_from(
     // A safety margin (25%) so a gap that recurs (a second weekend) doesn't leave
     // us one bar short and force another round-trip.
     let extra_secs = extra_secs + extra_secs / 4;
+    // Cap the per-attempt jump. When the first attempt lands almost entirely in a
+    // market-closed span (a `--start` on a Monday: Sat+Sun return ~0 candles), the
+    // density sample is a size-1 (or tiny) outlier — 1 candle over ~2 days — and
+    // the extrapolation above would leap back a *year-plus* to find `want` bars,
+    // pulling tens of thousands of candles in one shot (AU200 `--start` Mon:
+    // 15,612 warmup candles). Clamp each back-off to at most `MAX_BACKOFF_SPAN_MUL`
+    // × the current span so a poisoned density estimate can't overshoot: the pull
+    // widens a bounded amount, re-measures against real trading days on the next
+    // attempt, and converges in 1–2 more rounds (within MAX_WARMUP_BACKOFF_ATTEMPTS)
+    // instead of one catastrophic leap.
+    let extra_secs = extra_secs.min(span_secs.saturating_mul(MAX_BACKOFF_SPAN_MUL));
     pull_from - Duration::seconds(extra_secs.max(bar_secs))
 }
 
@@ -940,6 +961,49 @@ mod tests {
             "zero-density falls back to doubling +margin"
         );
         assert!(next < pull_from, "always reaches further back");
+    }
+
+    /// The poisoned-density case that pulled 15k candles: a `--start` on a Monday
+    /// makes the first attempt's span land almost entirely in the weekend, so it
+    /// returns just 1 real candle. The raw extrapolation (1 candle / 200-bar span,
+    /// shortfall 95) would leap back ~19,000 bars (~200 days); the cap clamps the
+    /// jump to MAX_BACKOFF_SPAN_MUL × the current span so it never overshoots.
+    #[test]
+    fn next_pull_from_caps_a_gap_poisoned_density_jump() {
+        let start = Utc.with_ymd_and_hms(2026, 7, 20, 0, 0, 0).unwrap();
+        let pull_from = start - Duration::seconds(M15 * 200); // naive 200-bar span
+        // have = 1 (weekend returned a single candle), want 96 → shortfall 95.
+        let next = next_pull_from(start, pull_from, 1, 96, M15);
+        let extra = (pull_from - next).num_seconds();
+        let span = (start - pull_from).num_seconds();
+        assert_eq!(
+            extra,
+            span * MAX_BACKOFF_SPAN_MUL,
+            "a size-1 density sample is capped at {MAX_BACKOFF_SPAN_MUL}× the span, \
+             not extrapolated to ~200 days"
+        );
+        // Sanity: the uncapped extrapolation really would have been enormous.
+        let uncapped = (span as f64 / 1.0 * 95.0) as i64;
+        assert!(
+            uncapped > span * MAX_BACKOFF_SPAN_MUL * 10,
+            "the cap materially bounds the jump (uncapped {uncapped}s ≫ cap)"
+        );
+    }
+
+    /// A healthy density extrapolation below the cap is left untouched — the cap
+    /// only clamps outliers, it doesn't shorten normal back-offs.
+    #[test]
+    fn next_pull_from_cap_does_not_shrink_a_healthy_jump() {
+        let start = Utc.with_ymd_and_hms(2026, 7, 6, 1, 30, 0).unwrap();
+        // 48/96 over a 48-bar span → extra = 60 bars (< 4× the 48-bar span = 192).
+        let pull_from = start - Duration::seconds(M15 * 48);
+        let next = next_pull_from(start, pull_from, 48, 96, M15);
+        let extra = (pull_from - next).num_seconds();
+        assert_eq!(
+            extra,
+            M15 * 60,
+            "healthy extrapolation unchanged by the cap"
+        );
     }
 
     /// Never returns a `pull_from` at or after the existing one (monotonic
