@@ -1,80 +1,46 @@
-# TODO — plain-mode enter must fire only on a signal PRINT, not on retroactive confirmation
+# TODO — pcl-exhausted / too-low level = fib 1.8 (neckline-anchored)
 
-## Bug (staging replay, AU200_AUD 2026-07-20 M15)
+## Request
 
-`tv-arm-staging --start=... --replay` (plain rules — no `--strategy-v2`, no
-`--quasimodo`) entered off a signal that only *confirmed* on a later bar, not
-one that actually *printed* there. Operator: "if we're not using strategy-v2
-or quasimodo, we shouldn't accept confirmed signals — only signals when they
-actually occur."
+Operator reads the pcl-exhausted abort off the chart at the fib **1.8** level
+(fib drawn `head(0) → neckline(1)`, so `2.0` = TP). The code fired ~one notch
+too shallow. Make the `too-low` / pcl-exhausted level = the fib 1.8 = 8785.8 on
+the AU200_AUD 2026-07-20 setup, WITHOUT adding a new tv-arm param.
 
 ## Root cause
 
-`core/src/signals/state_machine.rs::latched_signal_at` (the plain-mode path,
-`needs_confirmed == false`) sets `fires = true` on TWO bar kinds:
-1. a fresh signal PRINTS this bar  ← correct for plain mode
-2. an earlier pending signal *just validated/confirmed* this bar (`just_valid`)
-   ← confirmation semantics leaking into the plain path
-
-Path #2 belongs only to `--strategy-v2`/`--quasimodo` (`needs_confirmed`),
-which route through `first_confirmed_signal_at`, not `latched_signal_at`.
-
-`latched_signal_at` is ALSO consumed by the close/guard path
-(`eval_pine_guard` → `eval_pine_entry`), which legitimately reacts to a
-reversal *confirming*. So the fix must NOT change `latched_signal_at` — scope
-it to the plain ENTER only.
+`pcl_exhausted_price` (`tv-arm/src/geometry.rs`) used
+`midpoint + 0.8·(TP − midpoint)` with `midpoint = (head+neckline)/2` ≈ fib 1.7
+(8789.28). The neckline is ALWAYS exactly the fib 0.5 (forced by
+`TP = 2·neckline − head`), so no extra input is needed — head/neckline/TP fully
+pin the fib.
 
 ## Fix (DONE — code + tests green)
 
-- [x] `eval_pine_entry` gained `print_only: bool`. When
-      `print_only && !confirmed_first && sig.signal_bar_time != candle.time`
-      → decline (a validated-here-but-printed-earlier signal is not an
-      occurrence).
-- [x] Enter call site passes `!rule.intent.needs_confirmed` (plain = print-only;
-      confirmed enters opt INTO confirmation-firing).
-- [x] Guard call site (`eval_pine_guard`) passes `false` — reversal-close still
-      reacts to a reversal printing OR validating now (unchanged).
-- [x] Tests: `plain_enter_does_not_fire_on_a_retroactive_confirmation_bar`
-      (bar 3 of `two_short_engulfers_window` → no fire) +
-      `plain_enter_fires_on_the_bar_the_signal_prints` (bar 2 → fires off the
-      print). Both green.
-- [x] engine 165 pass, core 879 pass; clippy clean; fmt clean.
+- [x] `pcl_exhausted_price` → `neckline + 0.8·(TP − neckline)` = fib 1.8.
+      Anchors on the neckline, deeper (closer to TP) than before.
+- [x] This matches M/W `overshoot_level` exactly (already
+      `neckline + 0.8·(TP − neckline)` ≡ `180% of top→neckline`). H&S + M/W now
+      abort at the same fraction — consistency, no new param.
+- [x] Tests: `pcl_short` 1.03→1.02, `pcl_long_mirrors_short` 1.17→1.18, new
+      `pcl_equals_neckline_plus_80pct_of_neckline_to_tp` (identity + deeper);
+      pipeline `hs_entry_level_vetos_short_...` baked veto 1.0830→1.0820.
+- [x] tv-arm 241 pass, core 879, engine 166; clippy clean; fmt clean.
 
-## Operator clarification (both satisfied by the fix)
+## Docs / memory
 
-1. `--strategy-v2` after a break-and-close + a confirmed candle → ACCEPT.
-   → the QM leg `09-enter-qm` (`needs_confirmed`) fires via
-   `first_confirmed_signal_at`; `print_only == false` there. Pinned by
-   `confirmed_enter_still_fires_on_the_confirmation_bar_after_print_only`.
-2. No `--quasimodo` and no `--strategy-v2` → REJECT every confirmed signal.
-   → plain enter `needs_confirmed == false` → `print_only`. Pinned by
-   `plain_enter_does_not_fire_on_a_retroactive_confirmation_bar`.
+- [x] README two exact-formula spots updated (`neckline + 0.8·(TP−neckline)` = fib 1.8).
+- [x] CHANGELOG v107.
+- [x] memory `pcl_exhausted_is_fib_18_neckline_anchored.md` + MEMORY.md pointer.
 
-## Done
+## Verify (end-to-end)
 
-- [x] CHANGELOG v105 (incl. the behaviour split) + memory
-      `plain_enter_print_only_not_confirmation.md`.
-- [x] staging: fix `feb6b65` (tag v105) + test `1185ad7`, pushed.
-- [x] main: cherry-picked `4e3e551` + `9e0d768`, pushed.
-- [x] parent submodule pointer advanced to `1185ad7`, pushed.
-- [x] replay-candles now builds (market-hours WIP landed); suffixed CLIs
-      (trade-control / tv-arm / tv-news / replay-candles, -staging + -dev)
-      rebuilt with the fix + reinstalled; fix string verified in both replay
-      binaries. Worker NOT touched (operator: "don't worry about the server").
-- [x] final: confirmed end-to-end. AU200_AUD 2026-07-20 replay now enters at
-      11:15 (bar where a golden FloatingEngulfer PRINTS), NOT at 10:45 off a
-      confirmation. The 10:15 bar stamps break-and-close but fires no entry. ✓
+- [x] Fresh plan bakes too-low = **8785.81** (was 8789.27). ✓ (= operator's 8785.8)
+- [ ] Replay: 11:30 bar (OANDA low 8789.0) no longer trips too-low (now 8785.81);
+      report where the trade goes. ← in progress (replay107c.txt)
 
-## Side-fix (v106) — replay warm-up back-off cap
+## Ship
 
-Operator noticed the replay pulled 15k warm-up candles. Root cause: `--start` on
-a Monday → naive 200-bar window lands in the weekend → AU200 returns 1 candle →
-`next_pull_from` extrapolated off a size-1 sample and leapt ~17 months back.
-- [x] Cap each back-off at `MAX_BACKOFF_SPAN_MUL` (4) × current span
-      (`cli/src/bin/replay_candles.rs`); ATR floor (200 bars) intact.
-- [x] Tests: caps-gap-poisoned-jump + cap-doesn't-shrink-healthy; suite 107 green.
-- [x] CHANGELOG v106.
-- [x] committed/pushed staging (c3ebc74, tag v106) + main (e2bf469) +
-      parent-bump (c3ebc74); staging + dev CLIs rebuilt with the cap.
-- [x] verified live: warm-up pull dropped 15,647 → 581 candles (attempt 0
-      warmup=2 weekend, attempt 1 bounded 4× hop → warmup=546, target cleared).
+- [ ] commit + push staging (tag v107) + parent bump.
+- [ ] cherry-pick to main.
+- [ ] rebuild suffixed CLIs (-staging + -dev) via deploy (CLI-only; NOT the worker).

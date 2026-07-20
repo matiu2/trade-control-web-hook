@@ -3092,11 +3092,12 @@ mod tests {
         };
         let vetos = hs_entry_level_vetos(&roles, Direction::Short);
         let by = |n: &str| vetos.iter().find(|v| v.name == n).expect("present");
-        // pcl: midpoint 1.0950, tp = 2×1.0900 − 1.1000 = 1.0800,
-        //   level = 1.0950 + 0.8×(1.0800 − 1.0950) = 1.0830.
+        // pcl = fib 1.8 = neckline + 0.8×(TP − neckline).
+        //   tp = 2×1.0900 − 1.1000 = 1.0800,
+        //   level = 1.0900 + 0.8×(1.0800 − 1.0900) = 1.0820.
         let low = by("too-low");
         assert_eq!(low.past, VetoSide::Below);
-        assert!((low.level - 1.0830).abs() < 1e-9, "{}", low.level);
+        assert!((low.level - 1.0820).abs() < 1e-9, "{}", low.level);
         let high = by("too-high");
         assert_eq!(high.past, VetoSide::Above);
         assert!((high.level - 1.1050).abs() < 1e-9);
