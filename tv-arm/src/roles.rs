@@ -812,13 +812,13 @@ fn pick_slot_with_label(
     if cands.is_empty() {
         return None;
     }
-    // Fib-range filter (— `--start` only), the PRIMARY stale-line filter. The
+    // Fib-range filter — the PRIMARY stale-line filter, run in EVERY mode. The
     // invalidation for *this* setup sits inside the fib's head↔neckline band; a
     // line outside it belongs to a different, larger pattern. This is the same
     // authoritative reference the fib gives direction + rule 2 from, and unlike
     // the neckline-side filter below it works even with no neckline trend line
     // drawn (`--skip-break-and-close`). Skipped when it would empty the set.
-    let cands = filter_invalidation_by_fib_range(cands, pref, fib_range, role);
+    let cands = filter_invalidation_by_fib_range(cands, fib_range, role);
     // Side-of-neckline filter (— `--start` only). Keep each candidate only if
     // its price is on the geometrically-correct side of the neckline for its own
     // label. Applied before splitting labels off, since the side depends on the
@@ -874,21 +874,23 @@ fn pick_slot_with_label(
 }
 
 /// Drop invalidation candidates that fall **outside the fib's head↔neckline
-/// band** (`--start` only) — the primary stale-line filter. The genuine
-/// `too-high`/`too-low` for this setup sits inside the fib range (it's what
-/// `resolve_hs_trade`'s rule 2 later re-checks); a line outside it is a
-/// leftover from a different trade. Returns the filtered set, or the original
-/// set unchanged when the filter doesn't apply (not `--start`, no fib range) or
-/// would drop everything (so we never strand the setup). Each dropped line is
-/// logged at debug. Runs *before* the neckline-side filter and works even when
-/// no neckline trend line is drawn.
+/// band** — the primary stale-line filter, run in **every** mode
+/// (`--register-plan`, replay, `--start`). The genuine `too-high`/`too-low` for
+/// this setup sits inside the fib range (it's what `resolve_hs_trade`'s rule 2
+/// later re-checks); a line outside it is a leftover from a different trade.
+/// Returns the filtered set, or the original set unchanged when there's no fib
+/// range, or would drop everything (so we never strand the setup). Each dropped
+/// line is logged at debug. Runs *before* the neckline-side filter and works
+/// even when no neckline trend line is drawn (`--skip-break-and-close`).
 fn filter_invalidation_by_fib_range(
     cands: Vec<(Drawing, String)>,
-    pref: SlotPref,
     fib_range: Option<(f64, f64)>,
     role: &str,
 ) -> Vec<(Drawing, String)> {
-    let (SlotPref::NearestTo { .. }, Some((head, neckline))) = (pref, fib_range) else {
+    // Purely geometric — runs in EVERY mode (`--register-plan` / replay /
+    // `--start`), unlike the neckline-side filter. A stale invalidation is stale
+    // regardless of how the arm was launched.
+    let Some((head, neckline)) = fib_range else {
         return cands;
     };
     let inside = |d: &Drawing| -> bool {
@@ -1627,6 +1629,44 @@ mod tests {
             roles.invalidation.as_ref().unwrap().id,
             "real",
             "the in-fib-range cap wins; the out-of-range stale line is dropped"
+        );
+        assert_eq!(roles.invalidation_label.as_deref(), Some("too-high"));
+    }
+
+    /// The **live `--register-plan` path** (`SlotPref::LatestWins`), which is
+    /// how the EUR/USD 2026-07-20 incident actually happened — the operator did
+    /// NOT pass `--start`. The fib-range filter must run here too (it is
+    /// mode-independent): the stale `too-low` @ 1.15251 (the *latest* line,
+    /// which LatestWins would otherwise pick) is dropped for being outside the
+    /// fib range, so the real `too-high` @ 1.14451 wins. Before the filter was
+    /// broadened past `--start`, this armed the stale line and rule 2 rejected
+    /// the whole arm.
+    #[test]
+    fn latest_wins_invalidation_fib_range_drops_stale_without_neckline() {
+        let (stubs, mcp) = fixture(vec![
+            (
+                stub("fib", "fib_retracement"),
+                fib_drawing("fib", 450, 1.14737, 1.14202),
+            ),
+            // Real cap INSIDE the fib range, older anchor (t=450).
+            (
+                stub("real", "horizontal_line"),
+                drawing("real", "too-high", vec![(450, 1.14451)]),
+            ),
+            // Stale line OUTSIDE the fib range, NEWEST anchor (t=590) — under
+            // LatestWins it would win without the fib-range filter.
+            (
+                stub("stale", "horizontal_line"),
+                drawing("stale", "too-low", vec![(590, 1.15251)]),
+            ),
+        ]);
+        // LatestWins + a wide window so both lines survive the visible-window
+        // filter; the fib-range filter is the only thing that separates them.
+        let roles = classify(&mcp, &stubs, ANY_RANGE, SlotPref::LatestWins).expect("classify ok");
+        assert_eq!(
+            roles.invalidation.as_ref().unwrap().id,
+            "real",
+            "fib-range filter runs under --register-plan too; stale latest line dropped"
         );
         assert_eq!(roles.invalidation_label.as_deref(), Some("too-high"));
     }
