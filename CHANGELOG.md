@@ -1,5 +1,30 @@
 # Changelog
 
+## v106 — 2026-07-20 — cap the replay warm-up back-off (no more 15k-candle pulls)
+
+**Why.** A `replay-candles` / `tv-arm --replay` with `--start` on a **Monday**
+pulled ~15,000 warm-up candles. The warm-up pull wants 200 real candles before
+`start` to charge the ATR; the naive window (`200 bars × 15m ≈ 2 days`) lands on
+Sat+Sun, and an instrument that's closed on the weekend (AU200 / ASX) returns
+only **1** real candle there. `next_pull_from` then extrapolated density off that
+size-1 sample (1 candle / 2 days) and leapt back **~17 months** to find 200 bars
+— one catastrophic pull instead of a bounded hop over the gap.
+
+**What changed (behaviour: replay warm-up pull only).**
+- `next_pull_from` (`cli/src/bin/replay_candles.rs`) now **caps each back-off** at
+  `MAX_BACKOFF_SPAN_MUL` (= 4) × the current span. A density estimate poisoned by
+  a gap-dominated first attempt can no longer overshoot; the pull widens a bounded
+  amount, re-measures against real trading days next round, and converges within
+  the existing `MAX_WARMUP_BACKOFF_ATTEMPTS` (6). The healthy-density path and the
+  `have == 0` doubling path are unchanged (both sit below the cap).
+
+**Breaking.** None. Pure internal arithmetic; the ATR floor (200 bars) is intact.
+
+**Tests.** `next_pull_from_caps_a_gap_poisoned_density_jump` (size-1 weekend
+sample clamped to 4× span, not ~200 days) and
+`next_pull_from_cap_does_not_shrink_a_healthy_jump` (a below-cap extrapolation is
+untouched). Full `replay-candles` suite (107) green.
+
 ## v105 — 2026-07-20 — plain enters fire on a signal PRINT, not on retroactive confirmation
 
 **Why.** A staging replay (`tv-arm-staging --start=… --replay`, AU200_AUD M15
