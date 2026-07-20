@@ -317,12 +317,24 @@ pub fn classify<F: DrawingFetcher>(
         .map(|d| crate::geometry::line_mean_price(&d.prices()))
         .filter(|p| p.is_finite());
 
+    // Resolve the TP fib BEFORE the invalidation: the fib is the authoritative
+    // geometric reference (it decides trade direction and the valid
+    // head↔neckline band). The invalidation for *this* setup is the horizontal
+    // that falls **inside** that band, so we hand the fib range to the picker to
+    // drop stale `too-high`/`too-low` lines from other trades — even when no
+    // neckline trend line is drawn (`--skip-break-and-close`), where the old
+    // neckline-only reference gave `None` and the picker fell back to
+    // nearest-anchor-time and grabbed the wrong line.
+    let tp_fib = pick_slot(tp_fibs, "tp_fib", visible_range, slot_pref);
+    let fib_range = tp_fib.as_ref().and_then(|d| d.fib_head_neckline());
+
     if let Some((d, lbl)) = pick_slot_with_label(
         invalidations,
         "invalidation",
         visible_range,
         slot_pref,
         neckline_ref,
+        fib_range,
     ) {
         roles.invalidation = Some(d);
         roles.invalidation_label = Some(lbl);
@@ -334,7 +346,7 @@ pub fn classify<F: DrawingFetcher>(
     // never-firing cross; see the ignore arm there for the USD/ZAR regression).
     roles.retest = break_and_close.clone();
     roles.break_and_close = break_and_close;
-    roles.tp_fib = pick_slot(tp_fibs, "tp_fib", visible_range, slot_pref);
+    roles.tp_fib = tp_fib;
     roles.trade_expiry = pick_trade_expiry(trade_expiries, visible_range, slot_pref);
 
     // Blackout / news windows are populated later, in the pipeline, from the
@@ -770,28 +782,43 @@ fn pick_window_aware(cands: Vec<Drawing>, role: &str, (from, to): (i64, i64)) ->
 /// (currently just `invalidation`). Selects the drawing under `pref`, then
 /// returns it with its label.
 ///
-/// `neckline_ref` is the resolved neckline's mean price (or `None` if no
-/// neckline is on the chart). Under `--start` it drives a **side-of-neckline
-/// filter** that runs *before* the nearest-to-start tiebreak: a valid `too-low`
-/// floor sits **below** the neckline and a valid `too-high` cap **above** it, so
-/// any candidate on the wrong side is a stale line left over from a different
-/// trade (e.g. an old `too-low` still drawn up near a prior head) and is
-/// dropped. This is what stops the picker grabbing a stale invalidation purely
-/// because its anchor *time* happened to sit nearer the cursor than the real
-/// one's (AUD/JPY IH&S 2026-06-29: a stale `too-low` at 112.993 out-timed the
-/// real floor at 111.288 and blocked every entry via the baked entry-level
-/// veto). If the filter would drop everything (no neckline, or all candidates on
-/// the wrong side) it's skipped so we never select nothing.
+/// Under `--start`, two geometric filters run *before* the nearest-to-start
+/// tiebreak, both skipped if they'd empty the set:
+///
+/// 1. **Fib-range filter** (primary — `fib_range` is the fib's
+///    `(head, neckline)`). The genuine invalidation for this setup sits inside
+///    the fib's head↔neckline band; a line outside it is a leftover from a
+///    different trade. This is the same authoritative reference the fib gives
+///    direction from, and it works even when **no neckline trend line is
+///    drawn** (`--skip-break-and-close`) — the case that broke the old
+///    neckline-only logic: with `neckline_ref == None` the picker fell through
+///    to nearest-anchor-time and grabbed a stale line (EUR/USD 2026-07-20: a
+///    `too-low` at 1.15251 out-timed the real `too-high` at 1.14451 and armed
+///    an out-of-range invalidation).
+/// 2. **Side-of-neckline filter** (`neckline_ref` is the neckline trend line's
+///    mean price, or `None`). A valid `too-low` floor sits **below** the
+///    neckline, a `too-high` cap **above**; a candidate on the wrong side is
+///    stale (AUD/JPY IH&S 2026-06-29: a stale `too-low` at 112.993 out-timed
+///    the real floor at 111.288 and blocked every entry). Complements the fib
+///    filter when a neckline *is* drawn.
 fn pick_slot_with_label(
     cands: Vec<(Drawing, String)>,
     role: &str,
     window: (i64, i64),
     pref: SlotPref,
     neckline_ref: Option<f64>,
+    fib_range: Option<(f64, f64)>,
 ) -> Option<(Drawing, String)> {
     if cands.is_empty() {
         return None;
     }
+    // Fib-range filter (— `--start` only), the PRIMARY stale-line filter. The
+    // invalidation for *this* setup sits inside the fib's head↔neckline band; a
+    // line outside it belongs to a different, larger pattern. This is the same
+    // authoritative reference the fib gives direction + rule 2 from, and unlike
+    // the neckline-side filter below it works even with no neckline trend line
+    // drawn (`--skip-break-and-close`). Skipped when it would empty the set.
+    let cands = filter_invalidation_by_fib_range(cands, pref, fib_range, role);
     // Side-of-neckline filter (— `--start` only). Keep each candidate only if
     // its price is on the geometrically-correct side of the neckline for its own
     // label. Applied before splitting labels off, since the side depends on the
@@ -844,6 +871,51 @@ fn pick_slot_with_label(
     };
     let lbl = labels.get(&chosen.id).cloned().unwrap_or_default();
     Some((chosen, lbl))
+}
+
+/// Drop invalidation candidates that fall **outside the fib's head↔neckline
+/// band** (`--start` only) — the primary stale-line filter. The genuine
+/// `too-high`/`too-low` for this setup sits inside the fib range (it's what
+/// `resolve_hs_trade`'s rule 2 later re-checks); a line outside it is a
+/// leftover from a different trade. Returns the filtered set, or the original
+/// set unchanged when the filter doesn't apply (not `--start`, no fib range) or
+/// would drop everything (so we never strand the setup). Each dropped line is
+/// logged at debug. Runs *before* the neckline-side filter and works even when
+/// no neckline trend line is drawn.
+fn filter_invalidation_by_fib_range(
+    cands: Vec<(Drawing, String)>,
+    pref: SlotPref,
+    fib_range: Option<(f64, f64)>,
+    role: &str,
+) -> Vec<(Drawing, String)> {
+    let (SlotPref::NearestTo { .. }, Some((head, neckline))) = (pref, fib_range) else {
+        return cands;
+    };
+    let inside = |d: &Drawing| -> bool {
+        let price = crate::geometry::horizontal_price(&d.prices());
+        // Can't judge a non-finite price → keep (never drop on missing data).
+        !price.is_finite() || crate::geometry::price_within_fib_range(price, head, neckline)
+    };
+    let (kept, dropped): (Vec<_>, Vec<_>) = cands.into_iter().partition(|(d, _)| inside(d));
+    if kept.is_empty() {
+        debug!(
+            role,
+            "fib-range filter would drop every invalidation; keeping all"
+        );
+        return dropped;
+    }
+    for (d, lbl) in &dropped {
+        debug!(
+            role,
+            id = %d.id,
+            label = %lbl,
+            price = crate::geometry::horizontal_price(&d.prices()),
+            fib_head = head,
+            fib_neckline = neckline,
+            "invalidation dropped — outside the fib range (stale line from another trade?)"
+        );
+    }
+    kept
 }
 
 /// Drop invalidation candidates on the geometrically-wrong side of the neckline
@@ -933,6 +1005,29 @@ mod tests {
                 .collect(),
             properties: Properties {
                 text: Some(label.to_string()),
+                ..Default::default()
+            },
+        }
+    }
+
+    /// A fib retracement resolving to `(head, neckline)`, built like real
+    /// TradingView readback: `reverse:false` → `points[1]` is the head
+    /// (0-level), `points[0]` the neckline (1-level). `t` anchors both points.
+    fn fib_drawing(id: &str, t: i64, head: f64, neckline: f64) -> Drawing {
+        Drawing {
+            id: id.to_string(),
+            points: vec![
+                Point {
+                    time: t + 5,
+                    price: neckline,
+                },
+                Point {
+                    time: t,
+                    price: head,
+                },
+            ],
+            properties: Properties {
+                reverse: Some(false),
                 ..Default::default()
             },
         }
@@ -1492,6 +1587,47 @@ mod tests {
         let roles = classify(&mcp, &stubs, ANY_RANGE, SlotPref::NearestTo { start: 600 })
             .expect("classify ok");
         assert_eq!(roles.invalidation.as_ref().unwrap().id, "real");
+        assert_eq!(roles.invalidation_label.as_deref(), Some("too-high"));
+    }
+
+    /// EUR/USD 2026-07-20: with **no neckline drawn** (`--skip-break-and-close`)
+    /// the neckline-side filter is inert (`neckline_ref == None`), so a stale
+    /// invalidation anchored nearer `start` used to win on time and arm an
+    /// out-of-range invalidation (the picker chose `too-low` @ 1.15251 over the
+    /// real `too-high` @ 1.14451, then rule 2 rejected the whole arm). The
+    /// **fib-range filter** now drops the stale line using the fib itself as the
+    /// reference: fib head 1.14737 / neckline 1.14202, so 1.15251 is out and
+    /// 1.14451 is in — the real cap wins even without a neckline.
+    #[test]
+    fn nearest_to_invalidation_fib_range_drops_stale_without_neckline() {
+        let (stubs, mcp) = fixture(vec![
+            // Fib head 1.14737 above neckline 1.14202 → short; range brackets
+            // the real cap only.
+            (
+                stub("fib", "fib_retracement"),
+                fib_drawing("fib", 450, 1.14737, 1.14202),
+            ),
+            // Stale `too-low` from another trade, ABOVE the fib range, anchored
+            // NEARER start (t=590) so it would win on time.
+            (
+                stub("stale", "horizontal_line"),
+                drawing("stale", "too-low", vec![(590, 1.15251)]),
+            ),
+            // Real `too-high` cap INSIDE the fib range, anchored further (t=450).
+            (
+                stub("real", "horizontal_line"),
+                drawing("real", "too-high", vec![(450, 1.14451)]),
+            ),
+        ]);
+        // No neckline trend line → neckline-side filter inert; fib-range filter
+        // must carry it. start=600: by time `stale` (Δ10) beats `real` (Δ150).
+        let roles = classify(&mcp, &stubs, ANY_RANGE, SlotPref::NearestTo { start: 600 })
+            .expect("classify ok");
+        assert_eq!(
+            roles.invalidation.as_ref().unwrap().id,
+            "real",
+            "the in-fib-range cap wins; the out-of-range stale line is dropped"
+        );
         assert_eq!(roles.invalidation_label.as_deref(), Some("too-high"));
     }
 
