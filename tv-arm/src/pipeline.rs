@@ -125,10 +125,28 @@ pub fn run(args: Args) -> Result<i32> {
     let chart_range = mcp.get_range().wrap_err("read TV visible range")?;
     let visible = chart_range.visible_range;
     let view = (visible.from, visible.to);
+    // Fetch every drawing once, up front: both the note-derived `--start`
+    // fallback below and role classification consume this same list.
+    let drawings = mcp.list_drawings().wrap_err("list TV drawings")?;
     // `--start` (journaling): treat this timestamp as "live now" and find the
     // setup's drawings by searching the whole chart, ignoring the visible
     // window. Absent: the visible window scopes discovery as before.
-    let start = parse_start(&args)?;
+    //
+    // `--replay` with no explicit `--start`: fall back to a chart Note saying
+    // `start` — its first anchor's time becomes the journaling cursor. Lets an
+    // operator mark live-now with a note instead of typing an RFC3339 stamp.
+    let start = match (parse_start(&args)?, args.replay) {
+        (Some(s), _) => Some(s),
+        (None, true) => crate::start_note::resolve_start_from_note(&mcp, &drawings)
+            .wrap_err("resolve --replay start from chart Note")?
+            .inspect(|s| {
+                info!(
+                    start = s,
+                    "--replay with no --start: using chart Note `start` anchor as the cursor"
+                );
+            }),
+        (None, false) => None,
+    };
     if let Some(s) = start {
         info!(
             start = s,
@@ -156,7 +174,6 @@ pub fn run(args: Args) -> Result<i32> {
     } else {
         SlotPref::WindowAware(view)
     };
-    let drawings = mcp.list_drawings().wrap_err("list TV drawings")?;
     let mut roles = classify(&mcp, &drawings, view, slot_pref)?;
 
     // Resolve blackout/news windows straight from the economic calendar at real

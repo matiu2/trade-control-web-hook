@@ -569,6 +569,12 @@ pub struct Args {
     /// `tv-arm --replay --annotate false --warmup-bars 400`. Use `--` to end
     /// tv-arm's own flags first if a passthrough flag collides with one of
     /// tv-arm's: `tv-arm --start … -- --start 2026-07-01T00:00`.
+    ///
+    /// When `--replay` is set and `--start` is **absent**, tv-arm looks for a
+    /// single TradingView **Note** (`text_note`) whose text is exactly `start`
+    /// and uses its first anchor's time as the `--start` cursor — so you can
+    /// mark live-now on the chart instead of typing an RFC3339 timestamp. An
+    /// explicit `--start` always wins; two notes saying `start` is an error.
     #[arg(long)]
     pub replay: bool,
 
