@@ -120,9 +120,14 @@ Watch-points for that slice:
   veto; blocking future entries is the invalidation caps' job. Name it
   `PerPositionClose`, not "exit".
 - The close effect needs the **async Broker** threaded into the driver's execute
-  step — the same boundary the `PlaceOrder` executor slice will introduce. May
-  be worth doing the executor slice (place-order execution) first so the close
-  effect lands on an established broker-execute path.
+  step — the same boundary the `PlaceOrder` executor slice introduced. **That
+  executor slice is now DONE** (`engine-v2/src/executor.rs`, commit `c3521a2`):
+  `Execution<B: EntryBroker, S: EntryStore>::drive_bar` is the async layer above
+  the effects — it calls the sync `tick_once`, then executes `PlaceOrder` against
+  the broker. So `Effect::ClosePosition` now has an established place to land: add
+  a `ClosePosition` arm to the effect-walk loop that awaits `broker.close_positions`
+  (a new `EntryBroker`/`Broker` method or a sibling seam), latest-bar-gated,
+  NON-terminal. The reversal detector remains the real work of that slice.
 
 ## Keep this in sync — the v1 news code is moving
 
