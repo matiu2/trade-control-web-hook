@@ -1273,6 +1273,7 @@ mod tests {
             shadow: false,
             cross_buffer_pct: 0.0,
             cross_buffer_atr: 0.0,
+            bcr_require_golden: false,
             retest_atr_step: trade_control_core::trade_plan::DEFAULT_RETEST_ATR_STEP,
             replay_start: None,
             armed_at: None,

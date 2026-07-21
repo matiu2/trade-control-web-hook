@@ -170,6 +170,31 @@ pub struct TradePlan {
     /// by `tv-arm --cross-buffer-atr` ([`DEFAULT_CROSS_BUFFER_ATR`]).
     #[serde(default)]
     pub cross_buffer_atr: f64,
+    /// Require the **break-and-close** (`03-prep-break-and-close`) and **retest**
+    /// (`04-prep-retest`) candles to be *golden* — the crossing bar's full range
+    /// (`high − low`) must be at least the Wilder ATR (`atr_length_for(granularity)`)
+    /// over the detector window at that bar. A weak, indecisive bar that merely
+    /// grazes/closes past the neckline no longer stamps the break or retest; only
+    /// a bar with real range does.
+    ///
+    /// This is **not** the Pine signal-candle `golden` flag (`needs_golden`) —
+    /// that reads a detector-computed flag that only exists on a printed reversal
+    /// signal bar, and a trendline-cross bar has none. This gate measures the
+    /// crossing bar's range vs ATR directly. Same "range ≥ ATR" definition as the
+    /// single-candle case in the signal detector's `is_golden`, applied to the
+    /// break/retest bar instead of a signal bar.
+    ///
+    /// If the ATR can't be computed (detector window shorter than the ATR length),
+    /// the gate **fails closed** — the bar is treated as *not* golden and the
+    /// break/retest does not stamp — and `warn!`s, matching the conservative
+    /// `needs_golden` posture (a golden that can't be verified is rejected).
+    ///
+    /// `false` (the default) reproduces the current behaviour exactly, so plans
+    /// signed before this field deserialize unchanged. Plan-level and signed as
+    /// part of the whole-body HMAC (fixed at arm time); `tv-arm
+    /// --bcr-require-golden` turns it on.
+    #[serde(default)]
+    pub bcr_require_golden: bool,
     /// Per-bar step for the retest's closeness-to-neckline tolerance — the retest
     /// zone is a near-side band that **fattens over time, at a rate set by the
     /// neckline's slope**. The first bar after the break must actually *reach* the
@@ -563,6 +588,30 @@ bar: on_close
         assert_eq!(plan.cross_buffer_atr, 0.15);
         let back: TradePlan = serde_json::from_str(&serde_json::to_string(&plan).unwrap()).unwrap();
         assert_eq!(back.cross_buffer_atr, 0.15, "must survive a round-trip");
+    }
+
+    /// `bcr_require_golden` defaults to false (off) when absent, so plans signed
+    /// before it existed deserialize unchanged (break/retest gate off).
+    #[test]
+    fn missing_bcr_require_golden_defaults_to_false() {
+        let json = r#"{"trade_id":"t-1","instrument":"EUR_USD","direction":"short",
+            "granularity":"h1","pip_size":0.0001,"rules":[]}"#;
+        let plan: TradePlan = serde_json::from_str(json).unwrap();
+        assert!(
+            !plan.bcr_require_golden,
+            "absent bcr_require_golden must default to false (gate off)"
+        );
+    }
+
+    /// The `bcr_require_golden` flag survives a JSON round-trip when set.
+    #[test]
+    fn bcr_require_golden_round_trips() {
+        let json = r#"{"trade_id":"t-1","instrument":"EUR_USD","direction":"short",
+            "granularity":"h1","pip_size":0.0001,"rules":[],"bcr_require_golden":true}"#;
+        let plan: TradePlan = serde_json::from_str(json).unwrap();
+        assert!(plan.bcr_require_golden);
+        let back: TradePlan = serde_json::from_str(&serde_json::to_string(&plan).unwrap()).unwrap();
+        assert!(back.bcr_require_golden, "must survive a round-trip");
     }
 
     /// A plan with no `replay_start` deserializes to `None`, and re-serializing
