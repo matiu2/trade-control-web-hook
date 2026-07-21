@@ -22,8 +22,10 @@ and retest.
 - [x] README (03 + 04 rows) + CHANGELOG v108.
 - [x] clippy + fmt green; core/engine/tv-arm tests pass.
 
-## Remaining before merge
+## Ship
 
-- [ ] commit + push branch
-- [ ] merge to staging, advance parent submodule pointer, tag v108
+- [x] commit + push branch
+- [x] merge to staging + main
+- [ ] advance parent submodule pointer, tag v108
+- [ ] deploy dev + staging
 - [ ] memory note
