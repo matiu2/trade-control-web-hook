@@ -48,6 +48,7 @@ pub use trade_control_core::trade_plan::{BarEvent, CrossDir, LinePoint};
 mod cross;
 mod driver;
 mod effect;
+mod executor;
 mod facts;
 mod late_entry;
 mod rule;
@@ -67,6 +68,10 @@ pub use trade_control_types_v2::{
 
 pub use driver::tick_once;
 pub use effect::Effect;
+pub use executor::{
+    DriveReport, EntryBroker, EntryOutcomeKind, EntryStore, Execution, PlaceError, PlacedOrder,
+    PlacementReport,
+};
 pub use facts::{FactValue, Facts};
 pub use late_entry::{LateEntry, LateEntryOrder, resolve as resolve_late_entry};
 pub use rule::Rule;
