@@ -375,6 +375,17 @@ pub struct Args {
     #[arg(long)]
     pub cross_buffer_atr: Option<f64>,
 
+    /// Require the break-and-close (`03`) and retest (`04`) candles to be
+    /// **golden** — the crossing bar's full range (`high − low`) must be at
+    /// least the Wilder ATR at that bar. A weak, indecisive bar that merely
+    /// grazes/closes past the neckline no longer stamps the break or retest;
+    /// only a bar with real range does. Off by default (any qualifying cross
+    /// stamps). This is *not* the signal-candle `--skip-golden` gate — that
+    /// governs the enter's Pine signal bar; this governs the break/retest
+    /// trendline-cross bars. Bakes onto the signed plan's `bcr_require_golden`.
+    #[arg(long)]
+    pub bcr_require_golden: bool,
+
     /// Number of trailing candles the entry SL-spread floor averages the bid-ask
     /// spread over (default 5). The floor requires `sl_distance ≥ 10 × spread`;
     /// sizing that off a single spiky entry bar can widen the stop too far, so

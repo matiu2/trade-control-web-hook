@@ -432,6 +432,7 @@ pub fn run(args: Args) -> Result<i32> {
                 .unwrap_or(trade_control_core::trade_plan::DEFAULT_CROSS_BUFFER_PCT),
             args.cross_buffer_atr
                 .unwrap_or(trade_control_core::trade_plan::DEFAULT_CROSS_BUFFER_ATR),
+            args.bcr_require_golden,
             armed_sentiment,
         )?;
     }
@@ -2058,6 +2059,7 @@ fn register_trade_plan(
     retest_atr_step: f64,
     cross_buffer_pct: f64,
     cross_buffer_atr: f64,
+    bcr_require_golden: bool,
     armed_sentiment: Option<trade_control_core::plan_sentiment::PlanSentiment>,
 ) -> Result<()> {
     use cli::TradePattern;
@@ -2086,6 +2088,7 @@ fn register_trade_plan(
         retest_atr_step,
         cross_buffer_pct,
         cross_buffer_atr,
+        bcr_require_golden,
         armed_at,
         armed_sentiment,
     );
@@ -2915,6 +2918,7 @@ mod tests {
             trade_control_core::trade_plan::DEFAULT_RETEST_ATR_STEP,
             trade_control_core::trade_plan::DEFAULT_CROSS_BUFFER_PCT,
             trade_control_core::trade_plan::DEFAULT_CROSS_BUFFER_ATR,
+            args.bcr_require_golden,
             chrono::Utc::now(),
             None,
         )
@@ -2950,6 +2954,28 @@ mod tests {
             }
         }
         assert!(saw_enter, "expected at least one ENTER rule in the plan");
+    }
+
+    #[test]
+    fn bcr_require_golden_flag_bakes_onto_emitted_plan() {
+        // `--bcr-require-golden` flips the plan-level `bcr_require_golden` to
+        // true on the emitted plan; default (absent) is false. This is the
+        // break/retest candle-quality gate — distinct from `--skip-golden`,
+        // which governs the enter's Pine signal bar (`needs_golden`).
+        let default = emitted_plan_with(&["--skip-break-and-close", "--skip-retest"]);
+        assert!(
+            !default.bcr_require_golden,
+            "bcr_require_golden defaults to false (off)"
+        );
+        let on = emitted_plan_with(&[
+            "--skip-break-and-close",
+            "--skip-retest",
+            "--bcr-require-golden",
+        ]);
+        assert!(
+            on.bcr_require_golden,
+            "--bcr-require-golden must set bcr_require_golden: true on the plan"
+        );
     }
 
     #[test]

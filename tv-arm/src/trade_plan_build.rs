@@ -104,6 +104,7 @@ pub fn build_trade_plan(
     retest_atr_step: f64,
     cross_buffer_pct: f64,
     cross_buffer_atr: f64,
+    bcr_require_golden: bool,
     armed_at: chrono::DateTime<chrono::Utc>,
     armed_sentiment: Option<trade_control_core::plan_sentiment::PlanSentiment>,
 ) -> TradePlan {
@@ -122,6 +123,7 @@ pub fn build_trade_plan(
         shadow,
         cross_buffer_pct,
         cross_buffer_atr,
+        bcr_require_golden,
         retest_atr_step,
         replay_start,
         armed_at: Some(armed_at),
@@ -676,6 +678,7 @@ mod tests {
             trade_control_core::trade_plan::DEFAULT_RETEST_ATR_STEP,
             trade_control_core::trade_plan::DEFAULT_CROSS_BUFFER_PCT,
             trade_control_core::trade_plan::DEFAULT_CROSS_BUFFER_ATR,
+            false, // bcr_require_golden
             chrono::Utc::now(),
             None,
         );
@@ -777,6 +780,7 @@ mod tests {
             trade_control_core::trade_plan::DEFAULT_RETEST_ATR_STEP,
             trade_control_core::trade_plan::DEFAULT_CROSS_BUFFER_PCT,
             trade_control_core::trade_plan::DEFAULT_CROSS_BUFFER_ATR,
+            false, // bcr_require_golden
             chrono::Utc::now(),
             None,
         );
@@ -828,6 +832,7 @@ mod tests {
             trade_control_core::trade_plan::DEFAULT_RETEST_ATR_STEP,
             trade_control_core::trade_plan::DEFAULT_CROSS_BUFFER_PCT,
             trade_control_core::trade_plan::DEFAULT_CROSS_BUFFER_ATR,
+            false, // bcr_require_golden
             chrono::Utc::now(),
             None,
         );
@@ -898,6 +903,7 @@ mod tests {
             trade_control_core::trade_plan::DEFAULT_RETEST_ATR_STEP,
             trade_control_core::trade_plan::DEFAULT_CROSS_BUFFER_PCT,
             trade_control_core::trade_plan::DEFAULT_CROSS_BUFFER_ATR,
+            false, // bcr_require_golden
             chrono::Utc::now(),
             None,
         );
@@ -949,6 +955,7 @@ mod tests {
             trade_control_core::trade_plan::DEFAULT_RETEST_ATR_STEP,
             trade_control_core::trade_plan::DEFAULT_CROSS_BUFFER_PCT,
             trade_control_core::trade_plan::DEFAULT_CROSS_BUFFER_ATR,
+            false, // bcr_require_golden
             chrono::Utc::now(),
             None,
         );
@@ -973,6 +980,7 @@ mod tests {
             trade_control_core::trade_plan::DEFAULT_RETEST_ATR_STEP,
             trade_control_core::trade_plan::DEFAULT_CROSS_BUFFER_PCT,
             trade_control_core::trade_plan::DEFAULT_CROSS_BUFFER_ATR,
+            false, // bcr_require_golden
             chrono::Utc::now(),
             None,
         );
@@ -996,6 +1004,7 @@ mod tests {
             0.2,
             trade_control_core::trade_plan::DEFAULT_CROSS_BUFFER_PCT,
             trade_control_core::trade_plan::DEFAULT_CROSS_BUFFER_ATR,
+            false, // bcr_require_golden
             chrono::Utc::now(),
             None,
         );
@@ -1018,6 +1027,7 @@ mod tests {
             trade_control_core::trade_plan::DEFAULT_RETEST_ATR_STEP,
             trade_control_core::trade_plan::DEFAULT_CROSS_BUFFER_PCT,
             trade_control_core::trade_plan::DEFAULT_CROSS_BUFFER_ATR,
+            false, // bcr_require_golden
             chrono::Utc::now(),
             None,
         );
@@ -1045,6 +1055,7 @@ mod tests {
             trade_control_core::trade_plan::DEFAULT_RETEST_ATR_STEP,
             0.0,
             trade_control_core::trade_plan::DEFAULT_CROSS_BUFFER_ATR,
+            false, // bcr_require_golden
             chrono::Utc::now(),
             None,
         );
@@ -1067,6 +1078,7 @@ mod tests {
             trade_control_core::trade_plan::DEFAULT_RETEST_ATR_STEP,
             trade_control_core::trade_plan::DEFAULT_CROSS_BUFFER_PCT,
             trade_control_core::trade_plan::DEFAULT_CROSS_BUFFER_ATR,
+            false, // bcr_require_golden
             chrono::Utc::now(),
             None,
         );
@@ -1097,6 +1109,7 @@ mod tests {
             trade_control_core::trade_plan::DEFAULT_RETEST_ATR_STEP,
             trade_control_core::trade_plan::DEFAULT_CROSS_BUFFER_PCT,
             0.15,
+            false, // bcr_require_golden
             chrono::Utc::now(),
             None,
         );
@@ -1119,6 +1132,7 @@ mod tests {
             trade_control_core::trade_plan::DEFAULT_RETEST_ATR_STEP,
             trade_control_core::trade_plan::DEFAULT_CROSS_BUFFER_PCT,
             trade_control_core::trade_plan::DEFAULT_CROSS_BUFFER_ATR,
+            false, // bcr_require_golden
             chrono::Utc::now(),
             None,
         );
@@ -1190,6 +1204,7 @@ mod tests {
             trade_control_core::trade_plan::DEFAULT_RETEST_ATR_STEP,
             trade_control_core::trade_plan::DEFAULT_CROSS_BUFFER_PCT,
             trade_control_core::trade_plan::DEFAULT_CROSS_BUFFER_ATR,
+            false, // bcr_require_golden
             chrono::Utc::now(),
             None,
         );

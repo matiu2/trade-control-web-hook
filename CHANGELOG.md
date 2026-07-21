@@ -1,5 +1,54 @@
 # Changelog
 
+## v108 — 2026-07-22 — `--bcr-require-golden`: break/retest candle must be golden (range ≥ ATR)
+
+**Why.** Operator request: require the **break-and-close** (`03`) and **retest**
+(`04`) candles to be *decisive* — not just cross the neckline but do so on a bar
+with real range — so a weak, indecisive bar that grazes/closes past the line
+doesn't advance the setup. Same intuition as the enter's golden gate, applied one
+step earlier.
+
+**What changed (behaviour: opt-in; off by default → byte-identical).**
+- New plan-level flag `TradePlan.bcr_require_golden` (`#[serde(default)]` → false,
+  signed as part of the whole-body HMAC). `tv-arm --bcr-require-golden` bakes it on.
+- When set, the engine gates both the break-and-close and retest **stamp** on the
+  crossing bar being *golden* — its full range (`high − low`) at least the Wilder
+  ATR (`atr_length_for(granularity)`) over the detector window at that bar. A
+  non-golden crossing bar does not stamp (break stays `AwaitBreakAndClose`, retest
+  stays unseen). New `engine::evaluate::bar_is_golden`.
+
+**Not `needs_golden`.** This is a *new* check, not a reuse of the signal-candle
+gate. `needs_golden` reads a Pine-detector `golden` flag that only exists on a
+printed reversal signal bar; a trendline-cross bar has none. `bar_is_golden`
+measures the crossing bar's range vs ATR directly — same "range ≥ ATR" definition
+the detector's `is_golden` uses for a plain single candle, applied to the
+break/retest bar. `--skip-golden` (enter) and `--bcr-require-golden` (break/retest)
+are independent.
+
+**Fail-closed.** If the ATR can't be computed (window shorter than the ATR
+length), `bar_is_golden` returns false (bar treated as not-golden) and `warn!`s —
+matching the conservative `needs_golden` posture. This is deliberately *stricter*
+than the fail-*soft* cross-buffer / retest-tolerance paths, which degrade to 0 on
+a short window; a golden that can't be verified is rejected, not waved through.
+
+**Replay == live.** The gate lives in the shared `engine::evaluate` path, so the
+offline replay applies it identically to the live worker with no extra wiring.
+
+**Config.** `--bcr-require-golden` (bool flag, off by default). Bakes onto the
+signed plan's `bcr_require_golden`.
+
+**Tests.** `bar_is_golden_compares_range_to_window_atr`,
+`bar_is_golden_fails_closed_on_short_window`, `bcr_require_golden_gates_the_retest`,
+`bcr_require_golden_gates_the_break_and_close` (each asserts golden stamps,
+non-golden with the *same cross* does not, and flag-off is unchanged) in `engine`;
+`bcr_require_golden_flag_bakes_onto_emitted_plan` in `tv-arm`;
+`missing_bcr_require_golden_defaults_to_false` + `bcr_require_golden_round_trips`
+in `core`.
+
+**Follow-up.** Metric is full range (`h − l`) ≥ ATR; a stricter body-only
+(`|c − o|`) or directional-move variant could be a future `--bcr-golden-metric`
+if the range measure proves too lenient (a big-wick doji passes today).
+
 ## v107 — 2026-07-20 — pcl-exhausted level deepened to the fib 1.8 (neckline-anchored, matches M/W)
 
 **Why.** The H&S `pcl-exhausted` / `too-low` invalidation fired ~one fib notch
