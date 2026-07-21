@@ -195,7 +195,29 @@ pub fn evaluate_plan(
         // window) without touching the trade's spine. Non-terminal — they fire,
         // latch, and the machine carries on. A window can land in any phase, so
         // these are evaluated every bar regardless of `state.phase`.
-        evaluate_controls(plan, &mut state, candle, detector_window, now, &mut fired);
+        //
+        // Fire them against a **per-candle** clock, not the batch-wide `now`.
+        // When the worker processes several freshly-closed bars in one tick (a
+        // cron gap, or the first tick after a plan arms and catches up on days
+        // of history), a single `now` far past every bar would fire every
+        // control window on the *earliest* bar of the batch — blacking out
+        // entries whose bar closed hours before the window's real epoch. The
+        // offline replay never had this bug because it ticks one bar at a time
+        // with a per-candle virtual clock (`candle.time + bar`), so a batch-wide
+        // `now` here was a live-vs-replay divergence: same window, different bar.
+        // Using this candle's close (clamped to the real `now` so we never fire
+        // a window ahead of wall-clock) makes each bar in a batch fire exactly
+        // the windows whose epoch it actually crossed — identical to processing
+        // the bars one tick at a time.
+        let control_now = control_clock_for(candle, plan.granularity, now);
+        evaluate_controls(
+            plan,
+            &mut state,
+            candle,
+            detector_window,
+            control_now,
+            &mut fired,
+        );
 
         // Always-armed guards next: a terminal veto can end the plan on any
         // bar, regardless of spine phase.
@@ -394,6 +416,28 @@ fn trendline_anchor_warnings(plan: &TradePlan, window: &[Candle]) -> Vec<String>
 /// `state.fired` (`FireMode::Once`), and the plan continues. Distinct from a
 /// guard (which ends the spine) and from the prep spine. Armed in every phase
 /// so a window that opens before break-and-close still fires.
+/// The wall-clock instant to judge this candle's control rules against.
+///
+/// A control `TimeReached { at_epoch }` opens/closes its window the instant
+/// wall-clock passes the epoch. When a bar has closed, the earliest wall-clock
+/// at which the worker could observe it is its **close** (`bar open + one bar`);
+/// that is the correct per-candle clock, so a batch of freshly-closed bars fires
+/// each window on the bar during which its epoch was crossed — not all of them
+/// on the first bar of the batch (the batch-wide-`now` bug).
+///
+/// Clamped to the real `now` so we never fire a window ahead of wall-clock: if
+/// the candle's nominal close is somehow in the future relative to the tick
+/// (it shouldn't be — only *closed* bars reach here), the real `now` wins and
+/// the window waits, matching a live 5s tick that hasn't reached the epoch yet.
+fn control_clock_for(
+    candle: &Candle,
+    granularity: Granularity,
+    now: DateTime<Utc>,
+) -> DateTime<Utc> {
+    let close = candle.time + chrono::Duration::seconds(granularity.seconds());
+    close.min(now)
+}
+
 fn evaluate_controls(
     plan: &TradePlan,
     state: &mut PlanState,
@@ -4711,6 +4755,56 @@ mod tests {
         let c3 = candle("2026-06-16T17:00:00Z", 1.0, 1.0, 1.0, 1.0);
         let e3 = run_at(&p, &e2.new_state, &[c3], "2026-06-16T17:00:00Z");
         assert!(e3.fired.is_empty(), "latched controls must not refire");
+    }
+
+    #[test]
+    fn batch_of_bars_fires_pause_on_the_crossing_bar_not_the_first() {
+        // Regression: news-blackout mis-anchored live vs replay
+        // (BUG-replay-news-blackout-misanchored-live-vs-replay). When the
+        // worker processes several freshly-closed bars in one tick (a fresh
+        // plan catching up on history, or a cron gap), it passes ONE wall-clock
+        // `now` — far past every bar — to `evaluate_plan`. The old code judged
+        // every control rule against that single `now`, so a pause whose epoch
+        // sits partway through the batch fired on the FIRST bar of the batch,
+        // blacking out entries whose bar closed hours before the window's real
+        // epoch. The replay never had this (it ticks one bar at a time with a
+        // per-candle virtual clock), so live and replay blocked different bars.
+        //
+        // With the per-candle control clock, each bar fires exactly the windows
+        // whose epoch its close crossed — identical to tick-by-tick processing.
+        let pause_at = ts("2026-06-16T15:00:00Z").timestamp();
+        let p = plan(vec![rule(
+            "pause-start-news1",
+            Trigger::TimeReached { at_epoch: pause_at },
+            FireMode::Once,
+            Action::Pause,
+        )]);
+        let prior = seed_at(Phase::AwaitEntry, "2026-06-16T11:00:00Z");
+        // Four H1 bars closing 13:00, 14:00, 15:00, 16:00. The pause epoch is
+        // 15:00 → it belongs to the 14:00 bar (closes 15:00 >= 15:00), NOT the
+        // 12:00/13:00 bars whose closes (13:00/14:00) are before the epoch.
+        let batch = [
+            candle("2026-06-16T12:00:00Z", 1.0, 1.0, 1.0, 1.0),
+            candle("2026-06-16T13:00:00Z", 1.0, 1.0, 1.0, 1.0),
+            candle("2026-06-16T14:00:00Z", 1.0, 1.0, 1.0, 1.0),
+            candle("2026-06-16T15:00:00Z", 1.0, 1.0, 1.0, 1.0),
+        ];
+        // A single `now` well past the whole batch — the catch-up tick.
+        let eval = run_at(&p, &prior, &batch, "2026-06-16T18:00:00Z");
+        let pause_fires: Vec<&FiredIntent> = eval
+            .fired
+            .iter()
+            .filter(|f| f.rule_id == "pause-start-news1")
+            .collect();
+        assert_eq!(pause_fires.len(), 1, "pause fires exactly once (latched)");
+        // The crossing bar is the 14:00 bar (its close, 15:00, first reaches the
+        // epoch) — NOT the 12:00 bar it wrongly attributed to under batch-`now`.
+        assert_eq!(
+            pause_fires[0].candle.time,
+            ts("2026-06-16T14:00:00Z"),
+            "pause must anchor to the bar whose close crosses its epoch, not the \
+             first bar of the batch"
+        );
     }
 
     #[test]
