@@ -36,6 +36,7 @@ mod replay;
 mod roles;
 mod sentiment;
 mod spread;
+mod start_note;
 mod timeframe;
 mod trade_plan_build;
 

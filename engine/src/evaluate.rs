@@ -195,7 +195,29 @@ pub fn evaluate_plan(
         // window) without touching the trade's spine. Non-terminal — they fire,
         // latch, and the machine carries on. A window can land in any phase, so
         // these are evaluated every bar regardless of `state.phase`.
-        evaluate_controls(plan, &mut state, candle, detector_window, now, &mut fired);
+        //
+        // Fire them against a **per-candle** clock, not the batch-wide `now`.
+        // When the worker processes several freshly-closed bars in one tick (a
+        // cron gap, or the first tick after a plan arms and catches up on days
+        // of history), a single `now` far past every bar would fire every
+        // control window on the *earliest* bar of the batch — blacking out
+        // entries whose bar closed hours before the window's real epoch. The
+        // offline replay never had this bug because it ticks one bar at a time
+        // with a per-candle virtual clock (`candle.time + bar`), so a batch-wide
+        // `now` here was a live-vs-replay divergence: same window, different bar.
+        // Using this candle's close (clamped to the real `now` so we never fire
+        // a window ahead of wall-clock) makes each bar in a batch fire exactly
+        // the windows whose epoch it actually crossed — identical to processing
+        // the bars one tick at a time.
+        let control_now = control_clock_for(candle, plan.granularity, now);
+        evaluate_controls(
+            plan,
+            &mut state,
+            candle,
+            detector_window,
+            control_now,
+            &mut fired,
+        );
 
         // Always-armed guards next: a terminal veto can end the plan on any
         // bar, regardless of spine phase.
@@ -394,6 +416,28 @@ fn trendline_anchor_warnings(plan: &TradePlan, window: &[Candle]) -> Vec<String>
 /// `state.fired` (`FireMode::Once`), and the plan continues. Distinct from a
 /// guard (which ends the spine) and from the prep spine. Armed in every phase
 /// so a window that opens before break-and-close still fires.
+/// The wall-clock instant to judge this candle's control rules against.
+///
+/// A control `TimeReached { at_epoch }` opens/closes its window the instant
+/// wall-clock passes the epoch. When a bar has closed, the earliest wall-clock
+/// at which the worker could observe it is its **close** (`bar open + one bar`);
+/// that is the correct per-candle clock, so a batch of freshly-closed bars fires
+/// each window on the bar during which its epoch was crossed — not all of them
+/// on the first bar of the batch (the batch-wide-`now` bug).
+///
+/// Clamped to the real `now` so we never fire a window ahead of wall-clock: if
+/// the candle's nominal close is somehow in the future relative to the tick
+/// (it shouldn't be — only *closed* bars reach here), the real `now` wins and
+/// the window waits, matching a live 5s tick that hasn't reached the epoch yet.
+fn control_clock_for(
+    candle: &Candle,
+    granularity: Granularity,
+    now: DateTime<Utc>,
+) -> DateTime<Utc> {
+    let close = candle.time + chrono::Duration::seconds(granularity.seconds());
+    close.min(now)
+}
+
 fn evaluate_controls(
     plan: &TradePlan,
     state: &mut PlanState,
@@ -594,6 +638,13 @@ fn evaluate_break_and_close(
     // break window and starving the stop enter forever (replay trade 071). Honour
     // the latch explicitly: once fired, never re-stamp.
     if state.fired.contains(&rule.rule_id) {
+        return;
+    }
+    // Golden gate (opt-in): the breaking bar must have real range (h−l ≥ ATR),
+    // else a weak bar that merely closes past the neckline doesn't count as a
+    // break-and-close. Off by default → this is a no-op. Fail-closed on a short
+    // window (see `bar_is_golden`).
+    if plan.bcr_require_golden && !bar_is_golden(candle, window, plan.granularity) {
         return;
     }
     if fire_rule(
@@ -1436,7 +1487,12 @@ fn stamp_retest(
         prev_close: state.last_close.get(&rule.rule_id).copied(),
         settled: true,
     };
-    if !spread_hour
+    // Golden gate (opt-in): the retest bar must have real range (h−l ≥ ATR),
+    // mirroring the break-and-close gate. Off by default → no-op. Evaluated
+    // before `retest_crossed` so a non-golden bar never stamps the retest.
+    let golden_ok = !plan.bcr_require_golden || bar_is_golden(candle, window, plan.granularity);
+    if golden_ok
+        && !spread_hour
         && state.retest_seen_at.is_none()
         && retest_crossed(
             &rule.trigger,
@@ -2006,6 +2062,33 @@ fn resolve_cross_buffer(plan: &TradePlan, window: &[Candle]) -> CrossBuffer {
     }
 }
 
+/// Is `candle` **golden** for the break-and-close / retest gate — its full range
+/// (`high − low`) at least the Wilder ATR (`atr_length_for(granularity)`) over
+/// `window`?
+///
+/// Same "range ≥ ATR" definition the Pine signal detector's `is_golden` uses for
+/// a plain single candle, applied here to a *trendline-cross* bar (which carries
+/// no detector-computed `golden` flag). Gates the break/retest stamp when
+/// [`TradePlan::bcr_require_golden`] is set, so a weak, indecisive bar that only
+/// grazes/closes past the neckline doesn't stamp — only a bar with real range.
+///
+/// **Fails closed**: if the ATR can't be computed (window shorter than the ATR
+/// length) the bar is treated as *not* golden and `warn!`s. A golden that can't
+/// be verified is rejected — matching the conservative `needs_golden` posture,
+/// and (unlike the fail-*soft* cross buffer / retest tolerance) never loosening
+/// the gate on a short window.
+fn bar_is_golden(candle: &Candle, window: &[Candle], granularity: Granularity) -> bool {
+    let Some(atr) = wilder_atr(window, atr_length_for(granularity)) else {
+        tracing::warn!(
+            atr_length = atr_length_for(granularity),
+            window = window.len(),
+            "bcr-require-golden: ATR unavailable (window too short) — treating bar as NOT golden"
+        );
+        return false;
+    };
+    (candle.h - candle.l) >= atr
+}
+
 /// Did `candle` cross `level` in direction `dir` under the bar-event mode?
 ///
 /// `buffer` is a cross-depth buffer ([`CrossBuffer`]: a percent-of-`level` term
@@ -2522,6 +2605,7 @@ mod tests {
             shadow: false,
             cross_buffer_pct: 0.0,
             cross_buffer_atr: 0.0,
+            bcr_require_golden: false,
             retest_atr_step: trade_control_core::trade_plan::DEFAULT_RETEST_ATR_STEP,
             replay_start: None,
             armed_at: None,
@@ -4613,6 +4697,161 @@ mod tests {
         assert!(tol.abs() < 1e-12, "short window → 0.0 tolerance, got {tol}");
     }
 
+    // ===== --bcr-require-golden: break/retest candle must be golden (range ≥ ATR) =====
+
+    /// `bar_is_golden` unit: a bar whose range meets/exceeds the window ATR is
+    /// golden; a smaller-range bar is not. `warm_atr_window` gives ATR = 0.010.
+    #[test]
+    fn bar_is_golden_compares_range_to_window_atr() {
+        let first = ts("2026-06-01T00:00:00Z").timestamp();
+        let window = warm_atr_window(30, first); // ATR = 0.010
+        let big = candle("2026-06-02T06:00:00Z", 1.2100, 1.2160, 1.2050, 1.2100); // range 0.0110
+        let exact = candle("2026-06-02T06:00:00Z", 1.2100, 1.2150, 1.2050, 1.2100); // range 0.0100
+        let small = candle("2026-06-02T06:00:00Z", 1.2100, 1.2130, 1.2070, 1.2100); // range 0.0060
+        assert!(bar_is_golden(&big, &window, Granularity::H1), "range > ATR");
+        assert!(
+            bar_is_golden(&exact, &window, Granularity::H1),
+            "range == ATR is golden (>=)"
+        );
+        assert!(
+            !bar_is_golden(&small, &window, Granularity::H1),
+            "range < ATR is not golden"
+        );
+    }
+
+    /// Fail-closed: with a window too short to warm the ATR, `bar_is_golden` is
+    /// false regardless of the bar's range (a golden that can't be verified is
+    /// rejected — the conservative `needs_golden` posture).
+    #[test]
+    fn bar_is_golden_fails_closed_on_short_window() {
+        let first = ts("2026-06-01T00:00:00Z").timestamp();
+        let window = warm_atr_window(3, first); // < atr_length_for(H1)=24 → ATR None
+        let huge = candle("2026-06-01T03:00:00Z", 1.2100, 1.5000, 1.0000, 1.2100);
+        assert!(
+            !bar_is_golden(&huge, &window, Granularity::H1),
+            "ATR unavailable → not golden, even for a huge-range bar"
+        );
+    }
+
+    /// Build a plan + prior seeded past the break, with a horizontal Down retest
+    /// line at 1.2000 and `bcr_require_golden` set. Warm window (ATR 0.010) plus
+    /// the caller's retest bar. Returns whether the retest stamped.
+    fn retest_golden_stamps(retest_bar: Candle, require_golden: bool) -> bool {
+        let first = ts("2026-06-01T00:00:00Z").timestamp();
+        let mut p = plan(vec![
+            rule(
+                "04-prep-retest",
+                retest_line_down(), // horizontal Down @ 1.2000, intrabar
+                FireMode::Once,
+                Action::Prep,
+            ),
+            rule(
+                "05-enter",
+                Trigger::MwEveryBar,
+                FireMode::Once,
+                Action::Enter,
+            ),
+        ]);
+        p.bcr_require_golden = require_golden;
+        // Break stamped one bar before the retest bar so the retest is in-window.
+        let break_at = retest_bar.time - chrono::Duration::hours(1);
+        let mut prior = seed_at(Phase::AwaitEntry, "2026-06-01T00:00:00Z");
+        prior.break_close_at = Some(break_at);
+        let mut window = warm_atr_window(30, first);
+        window.push(retest_bar.clone());
+        run_window(&p, &prior, &[retest_bar], &window)
+            .new_state
+            .retest_seen_at
+            .is_some()
+    }
+
+    /// The retest gate: a golden retest bar (range ≥ ATR) that wicks to the line
+    /// stamps; an otherwise-identical non-golden bar (same low, smaller range)
+    /// does NOT stamp when `--bcr-require-golden` is on.
+    #[test]
+    fn bcr_require_golden_gates_the_retest() {
+        // Golden: opens above, wicks to 1.2000 (crosses the Down retest line),
+        // range 0.0110 ≥ ATR 0.010.
+        let golden = candle("2026-06-02T06:00:00Z", 1.2100, 1.2110, 1.2000, 1.2100);
+        // Non-golden: same low (1.2000, same cross), but range only 0.0080 < ATR.
+        let weak = candle("2026-06-02T06:00:00Z", 1.2050, 1.2080, 1.2000, 1.2050);
+        assert!(
+            retest_golden_stamps(golden.clone(), true),
+            "a golden retest bar stamps under --bcr-require-golden"
+        );
+        assert!(
+            !retest_golden_stamps(weak.clone(), true),
+            "a non-golden retest bar (same cross, smaller range) is rejected"
+        );
+        // Flag off: the weak bar's cross stamps as before (no regression).
+        assert!(
+            retest_golden_stamps(weak, false),
+            "with the flag off, the weak bar's cross stamps unchanged"
+        );
+    }
+
+    /// Build an H&S plan (horizontal OnClose Down break @ 1.2000) seeded in
+    /// `AwaitBreakAndClose`, prior close above the line so an OnClose down-break
+    /// is armed, warm window (ATR 0.010), and drive one break bar. Returns
+    /// whether the break stamped (phase advanced to AwaitEntry).
+    fn break_golden_stamps(break_bar: Candle, require_golden: bool) -> bool {
+        let first = ts("2026-06-01T00:00:00Z").timestamp();
+        let mut p = plan(vec![
+            rule(
+                "03-prep-break-and-close",
+                Trigger::HorizontalCross {
+                    level: 1.2000,
+                    dir: CrossDir::Down,
+                    bar: BarEvent::OnClose,
+                },
+                FireMode::Once,
+                Action::Prep,
+            ),
+            rule(
+                "05-enter",
+                Trigger::MwEveryBar,
+                FireMode::Once,
+                Action::Enter,
+            ),
+        ]);
+        p.bcr_require_golden = require_golden;
+        let mut prior = seed_at(Phase::AwaitBreakAndClose, "2026-06-01T00:00:00Z");
+        // Origin above the line so a settled close below is a down-break.
+        prior
+            .origin_open
+            .insert("03-prep-break-and-close".into(), 1.2100);
+        let mut window = warm_atr_window(30, first);
+        window.push(break_bar.clone());
+        run_window(&p, &prior, &[break_bar], &window)
+            .new_state
+            .phase
+            == Phase::AwaitEntry
+    }
+
+    /// The break-and-close gate: a golden break bar (range ≥ ATR) closing below
+    /// the neckline stamps; an otherwise-identical non-golden bar (same close,
+    /// smaller range) does NOT stamp when `--bcr-require-golden` is on.
+    #[test]
+    fn bcr_require_golden_gates_the_break_and_close() {
+        // Golden: closes at 1.1950 (below 1.2000), range 0.0110 ≥ ATR 0.010.
+        let golden = candle("2026-06-02T06:00:00Z", 1.2050, 1.2060, 1.1950, 1.1950);
+        // Non-golden: same 1.1950 close (same break), range only 0.0080 < ATR.
+        let weak = candle("2026-06-02T06:00:00Z", 1.1960, 1.1980, 1.1950, 1.1950);
+        assert!(
+            break_golden_stamps(golden.clone(), true),
+            "a golden break bar advances the spine under --bcr-require-golden"
+        );
+        assert!(
+            !break_golden_stamps(weak.clone(), true),
+            "a non-golden break bar (same close, smaller range) does not advance"
+        );
+        // Flag off: the weak break stamps as before (no regression).
+        assert!(
+            break_golden_stamps(weak, false),
+            "with the flag off, the weak break advances unchanged"
+        );
+    }
+
     // ===== guards =====
 
     #[test]
@@ -4711,6 +4950,56 @@ mod tests {
         let c3 = candle("2026-06-16T17:00:00Z", 1.0, 1.0, 1.0, 1.0);
         let e3 = run_at(&p, &e2.new_state, &[c3], "2026-06-16T17:00:00Z");
         assert!(e3.fired.is_empty(), "latched controls must not refire");
+    }
+
+    #[test]
+    fn batch_of_bars_fires_pause_on_the_crossing_bar_not_the_first() {
+        // Regression: news-blackout mis-anchored live vs replay
+        // (BUG-replay-news-blackout-misanchored-live-vs-replay). When the
+        // worker processes several freshly-closed bars in one tick (a fresh
+        // plan catching up on history, or a cron gap), it passes ONE wall-clock
+        // `now` — far past every bar — to `evaluate_plan`. The old code judged
+        // every control rule against that single `now`, so a pause whose epoch
+        // sits partway through the batch fired on the FIRST bar of the batch,
+        // blacking out entries whose bar closed hours before the window's real
+        // epoch. The replay never had this (it ticks one bar at a time with a
+        // per-candle virtual clock), so live and replay blocked different bars.
+        //
+        // With the per-candle control clock, each bar fires exactly the windows
+        // whose epoch its close crossed — identical to tick-by-tick processing.
+        let pause_at = ts("2026-06-16T15:00:00Z").timestamp();
+        let p = plan(vec![rule(
+            "pause-start-news1",
+            Trigger::TimeReached { at_epoch: pause_at },
+            FireMode::Once,
+            Action::Pause,
+        )]);
+        let prior = seed_at(Phase::AwaitEntry, "2026-06-16T11:00:00Z");
+        // Four H1 bars closing 13:00, 14:00, 15:00, 16:00. The pause epoch is
+        // 15:00 → it belongs to the 14:00 bar (closes 15:00 >= 15:00), NOT the
+        // 12:00/13:00 bars whose closes (13:00/14:00) are before the epoch.
+        let batch = [
+            candle("2026-06-16T12:00:00Z", 1.0, 1.0, 1.0, 1.0),
+            candle("2026-06-16T13:00:00Z", 1.0, 1.0, 1.0, 1.0),
+            candle("2026-06-16T14:00:00Z", 1.0, 1.0, 1.0, 1.0),
+            candle("2026-06-16T15:00:00Z", 1.0, 1.0, 1.0, 1.0),
+        ];
+        // A single `now` well past the whole batch — the catch-up tick.
+        let eval = run_at(&p, &prior, &batch, "2026-06-16T18:00:00Z");
+        let pause_fires: Vec<&FiredIntent> = eval
+            .fired
+            .iter()
+            .filter(|f| f.rule_id == "pause-start-news1")
+            .collect();
+        assert_eq!(pause_fires.len(), 1, "pause fires exactly once (latched)");
+        // The crossing bar is the 14:00 bar (its close, 15:00, first reaches the
+        // epoch) — NOT the 12:00 bar it wrongly attributed to under batch-`now`.
+        assert_eq!(
+            pause_fires[0].candle.time,
+            ts("2026-06-16T14:00:00Z"),
+            "pause must anchor to the bar whose close crosses its epoch, not the \
+             first bar of the batch"
+        );
     }
 
     #[test]

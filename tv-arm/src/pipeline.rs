@@ -125,10 +125,28 @@ pub fn run(args: Args) -> Result<i32> {
     let chart_range = mcp.get_range().wrap_err("read TV visible range")?;
     let visible = chart_range.visible_range;
     let view = (visible.from, visible.to);
+    // Fetch every drawing once, up front: both the note-derived `--start`
+    // fallback below and role classification consume this same list.
+    let drawings = mcp.list_drawings().wrap_err("list TV drawings")?;
     // `--start` (journaling): treat this timestamp as "live now" and find the
     // setup's drawings by searching the whole chart, ignoring the visible
     // window. Absent: the visible window scopes discovery as before.
-    let start = parse_start(&args)?;
+    //
+    // `--replay` with no explicit `--start`: fall back to a chart Note saying
+    // `start` — its first anchor's time becomes the journaling cursor. Lets an
+    // operator mark live-now with a note instead of typing an RFC3339 stamp.
+    let start = match (parse_start(&args)?, args.replay) {
+        (Some(s), _) => Some(s),
+        (None, true) => crate::start_note::resolve_start_from_note(&mcp, &drawings)
+            .wrap_err("resolve --replay start from chart Note")?
+            .inspect(|s| {
+                info!(
+                    start = s,
+                    "--replay with no --start: using chart Note `start` anchor as the cursor"
+                );
+            }),
+        (None, false) => None,
+    };
     if let Some(s) = start {
         info!(
             start = s,
@@ -156,7 +174,6 @@ pub fn run(args: Args) -> Result<i32> {
     } else {
         SlotPref::WindowAware(view)
     };
-    let drawings = mcp.list_drawings().wrap_err("list TV drawings")?;
     let mut roles = classify(&mcp, &drawings, view, slot_pref)?;
 
     // Resolve blackout/news windows straight from the economic calendar at real
@@ -415,6 +432,7 @@ pub fn run(args: Args) -> Result<i32> {
                 .unwrap_or(trade_control_core::trade_plan::DEFAULT_CROSS_BUFFER_PCT),
             args.cross_buffer_atr
                 .unwrap_or(trade_control_core::trade_plan::DEFAULT_CROSS_BUFFER_ATR),
+            args.bcr_require_golden,
             armed_sentiment,
         )?;
     }
@@ -2041,6 +2059,7 @@ fn register_trade_plan(
     retest_atr_step: f64,
     cross_buffer_pct: f64,
     cross_buffer_atr: f64,
+    bcr_require_golden: bool,
     armed_sentiment: Option<trade_control_core::plan_sentiment::PlanSentiment>,
 ) -> Result<()> {
     use cli::TradePattern;
@@ -2069,6 +2088,7 @@ fn register_trade_plan(
         retest_atr_step,
         cross_buffer_pct,
         cross_buffer_atr,
+        bcr_require_golden,
         armed_at,
         armed_sentiment,
     );
@@ -2898,6 +2918,7 @@ mod tests {
             trade_control_core::trade_plan::DEFAULT_RETEST_ATR_STEP,
             trade_control_core::trade_plan::DEFAULT_CROSS_BUFFER_PCT,
             trade_control_core::trade_plan::DEFAULT_CROSS_BUFFER_ATR,
+            args.bcr_require_golden,
             chrono::Utc::now(),
             None,
         )
@@ -2933,6 +2954,28 @@ mod tests {
             }
         }
         assert!(saw_enter, "expected at least one ENTER rule in the plan");
+    }
+
+    #[test]
+    fn bcr_require_golden_flag_bakes_onto_emitted_plan() {
+        // `--bcr-require-golden` flips the plan-level `bcr_require_golden` to
+        // true on the emitted plan; default (absent) is false. This is the
+        // break/retest candle-quality gate — distinct from `--skip-golden`,
+        // which governs the enter's Pine signal bar (`needs_golden`).
+        let default = emitted_plan_with(&["--skip-break-and-close", "--skip-retest"]);
+        assert!(
+            !default.bcr_require_golden,
+            "bcr_require_golden defaults to false (off)"
+        );
+        let on = emitted_plan_with(&[
+            "--skip-break-and-close",
+            "--skip-retest",
+            "--bcr-require-golden",
+        ]);
+        assert!(
+            on.bcr_require_golden,
+            "--bcr-require-golden must set bcr_require_golden: true on the plan"
+        );
     }
 
     #[test]

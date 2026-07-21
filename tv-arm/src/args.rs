@@ -375,6 +375,17 @@ pub struct Args {
     #[arg(long)]
     pub cross_buffer_atr: Option<f64>,
 
+    /// Require the break-and-close (`03`) and retest (`04`) candles to be
+    /// **golden** — the crossing bar's full range (`high − low`) must be at
+    /// least the Wilder ATR at that bar. A weak, indecisive bar that merely
+    /// grazes/closes past the neckline no longer stamps the break or retest;
+    /// only a bar with real range does. Off by default (any qualifying cross
+    /// stamps). This is *not* the signal-candle `--skip-golden` gate — that
+    /// governs the enter's Pine signal bar; this governs the break/retest
+    /// trendline-cross bars. Bakes onto the signed plan's `bcr_require_golden`.
+    #[arg(long)]
+    pub bcr_require_golden: bool,
+
     /// Number of trailing candles the entry SL-spread floor averages the bid-ask
     /// spread over (default 5). The floor requires `sl_distance ≥ 10 × spread`;
     /// sizing that off a single spiky entry bar can widen the stop too far, so
@@ -569,6 +580,12 @@ pub struct Args {
     /// `tv-arm --replay --annotate false --warmup-bars 400`. Use `--` to end
     /// tv-arm's own flags first if a passthrough flag collides with one of
     /// tv-arm's: `tv-arm --start … -- --start 2026-07-01T00:00`.
+    ///
+    /// When `--replay` is set and `--start` is **absent**, tv-arm looks for a
+    /// single TradingView **Note** (`text_note`) whose text is exactly `start`
+    /// and uses its first anchor's time as the `--start` cursor — so you can
+    /// mark live-now on the chart instead of typing an RFC3339 timestamp. An
+    /// explicit `--start` always wins; two notes saying `start` is an error.
     #[arg(long)]
     pub replay: bool,
 
