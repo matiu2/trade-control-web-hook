@@ -22,7 +22,7 @@ path = "src/bin/broker_check.rs"
 [dependencies]
 axum = { version = "0.8.9", default-features = false, features = ["http1", "tokio", "json", "query"] }
 broker-oanda = { version = "0.1.0", path = "../broker-oanda" }
-broker-tradenation = { git = "https://github.com/matiu2/tradenation-api.git", tag = "broker-tradenation-v0.12.0", version = "0.10.0" }
+broker-tradenation = { git = "https://github.com/matiu2/tradenation-api.git", tag = "broker-tradenation-v0.13.0", version = "0.10.0" }
 broker-tradenation-adapter = { version = "0.1.0", path = "../broker-tradenation-adapter" }
 chrono = { version = "0.4.45", features = ["serde"] }
 clap = { version = "4.6.1", features = ["derive"] }
@@ -39,7 +39,7 @@ tracing-error = "0.2.1"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 trade-control-core = { version = "0.1.0", path = "../core" }
 trade-control-cron = { version = "0.1.0", path = "../trade-control-cron" }
-tradenation-api = { git = "https://github.com/matiu2/tradenation-api.git", tag = "broker-tradenation-v0.12.0", version = "0.4.0" }
+tradenation-api = { git = "https://github.com/matiu2/tradenation-api.git", tag = "broker-tradenation-v0.13.0", version = "0.4.1" }
 
 [dev-dependencies]
 tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros"] }
