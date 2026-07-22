@@ -44,11 +44,13 @@
 use crate::broker::Granularity;
 
 mod atr;
+mod band_anchor;
 mod detect;
 mod metrics;
 mod state_machine;
 
 pub use atr::{atr_length_for, wilder_atr};
+pub use band_anchor::band_anchor;
 pub use detect::{DetectFlags, Detected, SignalGeometry, detect_at};
 pub use metrics::CandleMetrics;
 pub use state_machine::{

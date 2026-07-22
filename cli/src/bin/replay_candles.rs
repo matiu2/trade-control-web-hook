@@ -501,6 +501,12 @@ async fn run_test_mode(args: &Args) -> Result<()> {
         }
         tracing::info!("fixture matches expected.json");
     }
+
+    if args.rebless {
+        let computed = ReplayOutcome::compute(&inputs.plan, &replay, args.simulate);
+        fixture::save_expected(&dir, &computed)?;
+        tracing::info!(dir = %dir.display(), "re-blessed expected.json from frozen inputs");
+    }
     Ok(())
 }
 
@@ -922,6 +928,7 @@ mod tests {
             test_mode: false,
             fixture: None,
             check: false,
+            rebless: false,
             fixtures_dir: None,
         }
     }

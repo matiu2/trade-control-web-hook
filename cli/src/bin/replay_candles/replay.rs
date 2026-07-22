@@ -1861,7 +1861,9 @@ mod tests {
         // Short stop entry at 1.180 (absolute), SL 1.300 (above), TP 0.950
         // (below) — a wide bracket so neither is touched before the reversal.
         // The enter fires on an OnClose down-cross of 1.190; the close-on-
-        // reversal is a Long PinePattern gated on price ∈ [1.15, 1.20].
+        // reversal is a Long PinePattern gated on the reversal candle's band
+        // anchor ∈ [1.05, 1.10] — the bullish pinbar's wick-50% rejection point
+        // (see the test), not its close.
         serde_json::from_str(
             r#"{
                 "trade_id": "wheat-rev",
@@ -1890,7 +1892,7 @@ mod tests {
                         "intent": {
                             "v": 1, "id": "wheat-rev-close", "not_after": "2099-01-01T00:00:00Z",
                             "action": "close", "instrument": "WHEAT_USD",
-                            "inside_window": ["price"], "sr_bands": [[1.150, 1.200]],
+                            "inside_window": ["price"], "sr_bands": [[1.050, 1.100]],
                             "broker": "oanda", "trade_id": "wheat-rev"
                         }
                     }
@@ -1921,8 +1923,10 @@ mod tests {
         // bar 14: BULLISH pinbar. range 1.00..1.20 = 0.20; body 1.16..1.18 (top
         // quartile: top_25 = 1.20 - 0.05 = 1.15 → body_bottom 1.16 ≥ 1.15);
         // lower wick = 1.16 - 1.00 = 0.16 ≥ 0.10; low 1.00 < prior low 1.175;
-        // close 1.18 > open 1.16 → bullish. close 1.18 ∈ [1.15, 1.20]. low 1.00
-        // stays above TP 0.95, high 1.20 below SL 1.30 → neither bracket hit.
+        // close 1.18 > open 1.16 → bullish. Band anchor = wick-50% =
+        // 1.16 - (1.16-1.00)/2 = 1.08 ∈ [1.05, 1.10] → the reversal is "off the
+        // level" and closes the short. low 1.00 stays above TP 0.95, high 1.20
+        // below SL 1.30 → neither bracket hit.
         candles.push(ohlc(14 * 3600, 1.16, 1.20, 1.00, 1.18));
         // bar 15+: drift, so without the close the short would just stay open.
         candles.push(ohlc(15 * 3600, 1.18, 1.19, 1.17, 1.18));

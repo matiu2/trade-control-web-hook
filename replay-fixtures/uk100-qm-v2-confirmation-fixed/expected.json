@@ -1,0 +1,92 @@
+{
+  "fires": [
+    {
+      "rule_id": "09-enter-qm",
+      "action": "enter",
+      "candle_time": "2026-07-14T13:00:00Z",
+      "candle_close": 10535.6,
+      "fill": {
+        "kind": "stopped_out",
+        "fill_at": "2026-07-14T19:00:00Z",
+        "entry_price": 10484.1,
+        "exit_at": "2026-07-15T07:00:00Z",
+        "exit_price": 10447.8
+      }
+    },
+    {
+      "rule_id": "07-close-on-sr-reversal",
+      "action": "close",
+      "candle_time": "2026-07-14T15:00:00Z",
+      "candle_close": 10502.2
+    },
+    {
+      "rule_id": "09-enter-qm",
+      "action": "enter",
+      "candle_time": "2026-07-14T15:00:00Z",
+      "candle_close": 10502.2,
+      "fill": {
+        "kind": "stopped_out",
+        "fill_at": "2026-07-15T13:00:00Z",
+        "entry_price": 10544.3,
+        "exit_at": "2026-07-15T16:00:00Z",
+        "exit_price": 10488.5
+      }
+    },
+    {
+      "rule_id": "01-pause-1784152800-1784181600",
+      "action": "pause",
+      "candle_time": "2026-07-15T20:00:00Z",
+      "candle_close": 10484.3
+    },
+    {
+      "rule_id": "02-resume-1784152800-1784181600",
+      "action": "resume",
+      "candle_time": "2026-07-16T05:00:00Z",
+      "candle_close": 10471.3
+    },
+    {
+      "rule_id": "01-news-start-1784181600-1784185200",
+      "action": "news-start",
+      "candle_time": "2026-07-16T05:00:00Z",
+      "candle_close": 10471.3
+    },
+    {
+      "rule_id": "06-close-on-reversal",
+      "action": "close",
+      "candle_time": "2026-07-16T05:00:00Z",
+      "candle_close": 10471.3
+    },
+    {
+      "rule_id": "02-news-end-1784181600-1784185200",
+      "action": "news-end",
+      "candle_time": "2026-07-16T06:00:00Z",
+      "candle_close": 10466.8
+    },
+    {
+      "rule_id": "09-enter-qm",
+      "action": "enter",
+      "candle_time": "2026-07-16T08:00:00Z",
+      "candle_close": 10478.3,
+      "fill": {
+        "kind": "filled_open",
+        "fill_at": "2026-07-16T09:00:00Z",
+        "entry_price": 10477.3
+      }
+    },
+    {
+      "rule_id": "09-enter-qm",
+      "action": "enter",
+      "candle_time": "2026-07-16T16:00:00Z",
+      "candle_close": 10581.0
+    },
+    {
+      "rule_id": "02-veto-trade-expiry",
+      "action": "veto",
+      "candle_time": "2026-07-17T03:00:00Z",
+      "candle_close": 10520.0
+    }
+  ],
+  "done": true,
+  "final_phase": "done",
+  "warnings": []
+}

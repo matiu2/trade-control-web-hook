@@ -87,35 +87,37 @@ pub async fn run_close<B: Broker, S: StateStore>(
     } else {
         GateOutcome::NotSet
     };
-    // Price window. Old form: `require_price_in_ranges: Some(ranges)`.
-    // New form: `inside_window` contains `Price` (with bands in
-    // `sr_bands`). Validation guarantees `sr_bands` is non-empty
-    // exactly when `inside_window` lists Price.
-    let price_ranges: Option<&[[f64; 2]]> = match verified.intent.require_price_in_ranges.as_deref()
-    {
-        Some(ranges) => Some(ranges),
-        None if verified
-            .intent
-            .inside_window
-            .contains(&crate::intent::EventWindow::Price) =>
-        {
-            Some(verified.intent.sr_bands.as_slice())
-        }
-        None => None,
-    };
-    let price_outcome = match price_ranges {
-        Some(ranges) => match broker.get_current_price(&verified.intent.instrument).await {
+    // Price window. Two forms with two price sources:
+    //
+    // - **New `sr_bands` form** (`inside_window` contains `Price`): tests the
+    //   reversal candle's pattern-aware **band anchor** off the shell
+    //   (`Shell::band_anchor` — open for engulfers, wick-50% for pinbars), NOT a
+    //   live broker price. This keys the "off an S/R level" test on where the
+    //   candle *rejected*, matching the engine's `close_windows_pass` exactly so
+    //   replay == live. A candle that merely closed-into the band (continuation)
+    //   no longer trips it (UK 100 2026-07-17). The cron engine builds this
+    //   shell via `Shell::from_candle_and_signal`, so `signal_kind` + `open` are
+    //   present.
+    // - **Deprecated `require_price_in_ranges` form**: predates `sr_bands` and
+    //   the pattern anchor; keeps its original live-price semantics. Nothing new
+    //   emits it, so it's left untouched.
+    //
+    // Validation guarantees `sr_bands` is non-empty exactly when `inside_window`
+    // lists Price, and that the two forms are mutually exclusive.
+    let price_outcome = if let Some(ranges) = verified.intent.require_price_in_ranges.as_deref() {
+        // Deprecated form → live broker price.
+        match broker.get_current_price(&verified.intent.instrument).await {
             Ok(price) => match price_band_hit(price, ranges) {
                 Some([lo, hi]) => {
                     tracing::info!(
-                        "close price-range gate passed: {} price={price} in [{lo}, {hi}]",
+                        "close price-range gate passed (legacy): {} price={price} in [{lo}, {hi}]",
                         verified.intent.instrument
                     );
                     GateOutcome::Passed
                 }
                 None => {
                     tracing::info!(
-                        "close price-range gate failed: {} price={price} outside all bands {ranges:?}",
+                        "close price-range gate failed (legacy): {} price={price} outside all bands {ranges:?}",
                         verified.intent.instrument
                     );
                     GateOutcome::Failed("price-out-of-range")
@@ -132,8 +134,45 @@ pub async fn run_close<B: Broker, S: StateStore>(
                     outcome: "rejected: price-fetch-failed".into(),
                 };
             }
-        },
-        None => GateOutcome::NotSet,
+        }
+    } else if verified
+        .intent
+        .inside_window
+        .contains(&crate::intent::EventWindow::Price)
+    {
+        // New form → pattern-aware band anchor off the shell.
+        let ranges = verified.intent.sr_bands.as_slice();
+        match verified.shell.band_anchor() {
+            Some(anchor) => match price_band_hit(anchor, ranges) {
+                Some([lo, hi]) => {
+                    tracing::info!(
+                        "close price-range gate passed: {} anchor={anchor} in [{lo}, {hi}]",
+                        verified.intent.instrument
+                    );
+                    GateOutcome::Passed
+                }
+                None => {
+                    tracing::info!(
+                        "close price-range gate failed: {} anchor={anchor} outside all bands {ranges:?}",
+                        verified.intent.instrument
+                    );
+                    GateOutcome::Failed("price-out-of-range")
+                }
+            },
+            // A Price-windowed close whose shell can't yield an anchor (no
+            // signal_kind / no open) can't be evaluated for "off an S/R level".
+            // Fail the gate closed — never flatten a position on an
+            // un-anchorable band test.
+            None => {
+                tracing::warn!(
+                    "close price-range gate: {} shell has no band anchor (signal_kind/open missing) — failing closed",
+                    verified.intent.instrument
+                );
+                GateOutcome::Failed("no-band-anchor")
+            }
+        }
+    } else {
+        GateOutcome::NotSet
     };
     // Contextual gate (OR-composed).
     if let GateDecision::Reject { reason_code } = evaluate_close_gates(news_outcome, price_outcome)
@@ -496,15 +535,20 @@ mod reversal_exit_only_tests {
         ",
         )
         .expect("close intent parses");
-        // A plain shell (no needs_golden / needs_confirmed set on the
-        // intent) so the candle-quality gate is a no-op and the close
-        // reaches the (removed) veto-write site.
+        // A reversal-candle shell (no needs_golden / needs_confirmed set on
+        // the intent, so the candle-quality gate is a no-op). The price window
+        // now tests the pattern-aware band anchor off this shell: a bearish
+        // regular engulfer anchors on its OPEN (1.0960), which sits inside the
+        // band [1.0950, 1.0970], so the price gate passes and the close reaches
+        // the (removed) veto-write site.
         let shell: Shell = serde_yaml::from_str(
             "
-            close: 1.0960
+            open: 1.0960
+            close: 1.0952
             high: 1.0965
-            low: 1.0955
+            low: 1.0950
             time: \"2026-05-13T12:00:00Z\"
+            signal_kind: 3
         ",
         )
         .expect("shell parses");
@@ -538,6 +582,36 @@ mod reversal_exit_only_tests {
         assert!(
             !vetoed,
             "reversal-close must NOT write a `reversal` veto (exit-only)"
+        );
+    }
+
+    /// The UK 100 2026-07-17 shape: a bearish engulfer whose CLOSE lands inside
+    /// the band but whose OPEN is above it — price fell *into* the level
+    /// (continuation), not bounced *off* it. The pattern-aware anchor (= open
+    /// for an engulfer) is out of band, so the price gate fails and the position
+    /// is NOT flattened. Under the old close-in-band rule this wrongly closed.
+    #[test]
+    fn engulfer_that_closed_into_band_but_opened_above_does_not_close() {
+        let store = MemStateStore::default();
+        let mut verified = armed_close();
+        // Open 1.0980 (above band top 1.0970), close 1.0960 (in band).
+        verified.shell = serde_yaml::from_str(
+            "
+            open: 1.0980
+            close: 1.0960
+            high: 1.0982
+            low: 1.0958
+            time: \"2026-05-13T12:00:00Z\"
+            signal_kind: 3
+        ",
+        )
+        .expect("shell parses");
+
+        let result = pollster::block_on(run_close(&InBandBroker, &store, &verified, now()));
+        assert!(
+            matches!(result, ActionResult::Rejected { .. }),
+            "an engulfer that opened above the band (continuation) must NOT close, got {}",
+            result.describe()
         );
     }
 }
