@@ -116,6 +116,7 @@ mod tests {
             signal_range: Some(0.0036),
             signal_start_time: Some(ts("2026-05-26T09:00:00Z")),
             signal_kind: None,
+            band_anchor: None,
             golden: None,
             atr: None,
             signal_confirmed,

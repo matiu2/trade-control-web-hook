@@ -587,6 +587,7 @@ mod dispatcher_outcome_tests {
                 signal_range: None,
                 signal_start_time: None,
                 signal_kind: None,
+                band_anchor: None,
                 golden: None,
                 atr: None,
                 signal_confirmed: None,

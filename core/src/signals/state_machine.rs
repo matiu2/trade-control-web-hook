@@ -96,6 +96,11 @@ pub struct LatchedSignal {
     pub signal_bar_time: DateTime<Utc>,
     pub golden: bool,
     pub signal_confirmed: bool,
+    /// The reversal-close **band anchor** for this signal (engulfer = first
+    /// covered bar's open; pinbar / tweezer = print-bar wick-50%). Carried from
+    /// the detector so the `07-close-on-sr-reversal` S/R-band test reads the same
+    /// value in the engine and the worker. See [`crate::signals::band_anchor`].
+    pub band_anchor: f64,
     /// ATR at the as-of bar (the value Pine latches as `atr`).
     pub atr: Option<f64>,
     /// Highest high over `sl_lookback` bars strictly preceding the signal bar.
@@ -121,6 +126,8 @@ struct Tracked {
     range: f64,
     kind: SignalKind,
     start_time: DateTime<Utc>,
+    /// Reversal-close band anchor for this signal (from the detector).
+    band_anchor: f64,
     /// ATR at the signal's print bar (the value the latch carried at print).
     atr: Option<f64>,
     /// Bar index the signal printed on.
@@ -150,6 +157,7 @@ struct Latch {
     low: f64,
     range: f64,
     start_time: DateTime<Utc>,
+    band_anchor: f64,
     golden: bool,
     confirmed: bool,
     atr: Option<f64>,
@@ -207,6 +215,7 @@ pub fn latched_signal_at(
                 range: d.geometry.range,
                 kind: d.geometry.kind,
                 start_time: d.geometry.start_time,
+                band_anchor: d.geometry.band_anchor,
                 atr,
                 signal_bar: bar,
                 state: SigState::Pending,
@@ -220,6 +229,7 @@ pub fn latched_signal_at(
                 low: d.geometry.low,
                 range: d.geometry.range,
                 start_time: d.geometry.start_time,
+                band_anchor: d.geometry.band_anchor,
                 golden,
                 confirmed: false,
                 atr,
@@ -249,6 +259,7 @@ pub fn latched_signal_at(
         signal_bar_time: candles[signal_bar].time,
         golden: latch.golden,
         signal_confirmed: latch.confirmed,
+        band_anchor: latch.band_anchor,
         atr: latch.atr,
         recent_high,
         recent_low,
@@ -438,6 +449,7 @@ pub fn first_confirmed_signal_at(
                 range: d.geometry.range,
                 kind: d.geometry.kind,
                 start_time: d.geometry.start_time,
+                band_anchor: d.geometry.band_anchor,
                 atr,
                 signal_bar: bar,
                 state: SigState::Pending,
@@ -464,6 +476,7 @@ pub fn first_confirmed_signal_at(
         signal_bar_time: candles[t.signal_bar].time,
         golden: t.golden,
         signal_confirmed: true,
+        band_anchor: t.band_anchor,
         atr: t.atr,
         recent_high,
         recent_low,
@@ -658,6 +671,7 @@ mod tests {
             range: 1.0,
             kind,
             start_time: ts("2026-01-01T00:00:00Z"),
+            band_anchor: 0.0,
             atr: Some(0.5),
             signal_bar: 0,
             state: SigState::Valid,

@@ -1,5 +1,44 @@
 # Changelog
 
+## v112 — 2026-07-22 — Engulfer band anchor is the first covered bar's open; anchor computed in the detector
+
+**Why.** v111 anchored an engulfer on the **print bar's** open. But a
+regular/floating engulfer spans two bars, and the point that sat *at the level*
+before the engulf is the **first** bar (`N-1`), not the print bar (`N`, which
+already closed beyond the first's extreme). Operator: the first bar's open is the
+correct origin. (Pinbars/tweezers are unchanged — they key off the print bar's
+wick-50%.)
+
+**What changed (behaviour).**
+- `SignalKind::RegularEngulfer` / `FloatingEngulfer` now anchor on the **open of
+  the pattern's first covered bar** (`N-1`, falling back to the print bar at the
+  start of history). Pinbar / tweezer / double-tweezer unchanged (print-bar
+  wick-50%).
+- The anchor is a function of two bars for engulfers, so it is now **computed
+  once in the detector** (`core/src/signals/detect.rs::build`, where both bars
+  are in scope) and carried as a scalar: `SignalGeometry.band_anchor` →
+  `LatchedSignal.band_anchor` → `Shell.band_anchor`. The engine
+  (`close_windows_pass`) and worker (`run_close` → `Shell::band_anchor()`) both
+  read that stored value — no recompute, no `LatchedSignal`/OHLC juggling at the
+  gate. Replaces the v111 heuristic where the worker derived the signal direction
+  from the shell's body colour and recomputed from OHLC.
+
+**Breaking.** `trade_control_core::signals::band_anchor` signature changed to
+`band_anchor(kind, dir, origin: &Candle, print: &Candle) -> f64` (was six scalar
+args). New field `Shell.band_anchor: Option<f64>` (signed body, `#[serde(default,
+skip_serializing_if = "Option::is_none")]` → backward-compatible on the wire) and
+`LatchedSignal.band_anchor: f64` / `SignalGeometry.band_anchor: f64`.
+
+**Config.** None.
+
+**Tests.** `band_anchor` unit tests rewritten for origin-vs-print
+(`engulfer_anchors_on_first_bar_open`, `tweezer_and_double_key_off_print_wick_not_origin_open`);
+`from_candle_and_signal_folds_pattern_geometry` asserts the anchor folds onto the
+shell; worker + engine close-reversal test bands moved to the first-bar-open
+anchor (the `bullish_pinbar_window` FloatingEngulfer now anchors at 1.10, not
+1.16). UK 100 fixture unchanged (its SR-close was already suppressed by v111 and
+stays suppressed; `--check` green).
+
 ## v111 — 2026-07-22 — S/R reversal-close tests a pattern-aware band anchor, not the close
 
 **Why.** `07-close-on-sr-reversal` closes an open position when a golden opposing
