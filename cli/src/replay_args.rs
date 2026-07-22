@@ -269,6 +269,13 @@ pub struct ReplayArgs {
     #[arg(long, value_name = "NAME")]
     pub save: Option<String>,
 
+    /// A free-text note stored in the saved fixture's `meta.json` describing what
+    /// the fixture is meant to model — the scenario, the bug it pins, why the
+    /// verdict is what it is. Read it later if the golden ever breaks. Only used
+    /// alongside `--save`; ignored otherwise.
+    #[arg(long, value_name = "TEXT", requires = "save")]
+    pub message: Option<String>,
+
     /// Replay a saved fixture **offline**: load plan + candles + meta from
     /// `<fixtures-dir>/<--fixture>/` instead of pulling from the broker (no
     /// network, no env vars, no TradingView). Requires `--fixture`.

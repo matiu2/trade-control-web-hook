@@ -47,6 +47,12 @@ pub struct FixtureMeta {
     pub start: DateTime<Utc>,
     /// Window end (UTC), as resolved at save time (the plan's trade-expiry etc).
     pub end: DateTime<Utc>,
+    /// Free-text note from `--message` at save time: what this fixture is meant
+    /// to model, so a future reader knows the intent if the golden ever breaks.
+    /// Journalling only — never read back into the replay. Omitted from the JSON
+    /// (and older fixtures load fine) when no message was given.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
 }
 
 /// The golden snapshot of a replay: every fire's decision plus its simulated
@@ -377,6 +383,7 @@ mod tests {
             source: CandleSource::TradeNation,
             start: Utc.with_ymd_and_hms(2026, 6, 18, 11, 0, 0).unwrap(),
             end: Utc.with_ymd_and_hms(2026, 6, 18, 23, 0, 0).unwrap(),
+            message: None,
         }
     }
 
@@ -495,5 +502,44 @@ mod tests {
         assert_eq!(loaded_expected, expected);
 
         fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A `--message` note survives a `save` → `load` round-trip in the meta.
+    #[test]
+    fn meta_message_round_trips() {
+        let meta = FixtureMeta {
+            message: Some("pins the UK100 fall-into-support reversal-close (v112)".into()),
+            ..sample_meta()
+        };
+        let json = serde_json::to_string_pretty(&meta).unwrap();
+        let back: FixtureMeta = serde_json::from_str(&json).unwrap();
+        assert_eq!(meta, back);
+        assert_eq!(
+            back.message.as_deref(),
+            Some("pins the UK100 fall-into-support reversal-close (v112)")
+        );
+    }
+
+    /// No message → the key is omitted from the JSON, so fixtures saved before
+    /// this field existed still deserialize (serde `default`).
+    #[test]
+    fn meta_without_message_omits_key_and_loads() {
+        let meta = sample_meta();
+        assert!(meta.message.is_none());
+        let json = serde_json::to_string(&meta).unwrap();
+        assert!(
+            !json.contains("message"),
+            "no-message meta must omit the key: {json}"
+        );
+        // A pre-field fixture (no `message` key at all) still loads.
+        let legacy = r#"{
+            "instrument": "EUR_USD",
+            "granularity": "h1",
+            "source": "tradenation",
+            "start": "2026-06-18T11:00:00Z",
+            "end": "2026-06-18T23:00:00Z"
+        }"#;
+        let loaded: FixtureMeta = serde_json::from_str(legacy).unwrap();
+        assert!(loaded.message.is_none());
     }
 }

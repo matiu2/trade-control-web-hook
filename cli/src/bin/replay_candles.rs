@@ -301,6 +301,7 @@ async fn main() -> Result<()> {
             source: args.source,
             start,
             end,
+            message: args.message.clone(),
         };
         let expected = ReplayOutcome::compute(&plan, &replay, simulate);
         let dir = fixtures_dir(&args).join(name);
@@ -925,6 +926,7 @@ mod tests {
             cache_dir: None,
             print_completions: false,
             save: None,
+            message: None,
             test_mode: false,
             fixture: None,
             check: false,
