@@ -52,7 +52,7 @@ pub use atr::{atr_length_for, wilder_atr};
 pub use detect::{DetectFlags, Detected, SignalGeometry, detect_at};
 pub use metrics::CandleMetrics;
 pub use state_machine::{
-    DetectorConfig, LatchedSignal, first_confirmed_signal_at, latched_signal_at,
+    DetectorConfig, LatchedSignal, SignalCriteria, first_confirmed_signal_at, latched_signal_at,
 };
 
 // `detector_lookback_bars` is defined below (shared by live + replay).

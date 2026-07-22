@@ -359,6 +359,7 @@ pub async fn run(
             detected.is_some(),
             &fired_rules,
             &decline_reasons,
+            &mid,
         );
         // Gated on bar size like the engine's entry suppression: only 15m/1h are
         // dominated by a 1h spread hour, so on H4+ the "signal confirmed, not
@@ -674,17 +675,14 @@ fn confirmed_signal_ready(plan: &TradePlan, state: &PlanState, mid: &[Candle], i
             r.intent.action == trade_control_core::intent::Action::Enter && r.intent.needs_confirmed
         })
         .is_some_and(|r| r.intent.needs_golden);
-    first_confirmed_signal_at(
-        mid,
-        i,
-        &cfg,
-        plan.direction,
-        None,
-        want_golden,
-        confirmed_floor,
-        None,
-    )
-    .is_some()
+    let crit = trade_control_core::signals::SignalCriteria {
+        dir: plan.direction,
+        kind: None,
+        require_golden: want_golden,
+        not_before: confirmed_floor,
+        after: None,
+    };
+    first_confirmed_signal_at(mid, i, &cfg, &crit).is_some()
 }
 
 /// Why a *marked* signal on this bar wasn't taken as an entry — the
@@ -706,6 +704,7 @@ fn not_taken_reason(
     marked: bool,
     fired_rules: &[String],
     decline_reasons: &[String],
+    mid: &[Candle],
 ) -> Option<String> {
     // Only annotate a marked-but-unexplained bar: a fire or an existing decline
     // already tells the story.
@@ -716,7 +715,14 @@ fn not_taken_reason(
     // "or" (any leg firing enters). For strategy-v2 this reads e.g. "requires
     // retest … or requires confirmation …" — the two enters are alternatives,
     // not a single enter needing both. Single-enter plans collapse to one leg.
-    enter_preconditions_reason(plan, state, bar)
+    //
+    // Pass the mid detector window so the `NeedsConfirmation` block is TRUTHFUL:
+    // it runs the same confirmed-first scan the fire path uses and only reports
+    // "requires confirmation" when no confirmed signal is actually in scope on
+    // this bar — not merely because the enter is `needs_confirmed` (the UK 100
+    // v109 red herring, where the real cause was a non-golden signal shadowing
+    // the golden one).
+    enter_preconditions_reason(plan, state, bar, Some(mid))
 }
 
 /// The pip size every resolution in the replay uses — the plan's baked value.

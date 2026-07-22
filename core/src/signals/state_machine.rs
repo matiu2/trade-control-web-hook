@@ -256,6 +256,78 @@ pub fn latched_signal_at(
     })
 }
 
+/// The selection predicate for [`first_confirmed_signal_at`] — the set of
+/// filters a confirmed signal must satisfy to *claim the winner slot*.
+///
+/// # Why this is one struct, not N positional args
+///
+/// The scan latches the **first** confirmed signal that passes the filters and
+/// never revisits the choice (`first_confirmed_bar` is set once). Historically
+/// the filters were separate positional arguments the caller assembled by hand,
+/// and the recurring bug was a caller **forgetting one**: each of `want_dir`
+/// (DE30 2026-07-07), `not_before` (warmup-era signal, bug ①), `after` (QM
+/// multi-shot re-consumed its own signal), and `require_golden` (UK 100 v109,
+/// a non-golden signal shadowed a later golden one) was added *after* a
+/// production miss where the winner slot admitted a signal the enter would never
+/// take. Folding them into one value the enter builds **once** from its own
+/// intent ([`Self::from_enter`]) makes "did I pass every filter" into "did I
+/// build the criteria from the rule" — a single typed call the type system
+/// enforces, so a *future* filter is added in exactly two places
+/// ([`Self::from_enter`] + [`Self::admits`]) instead of hunted across call sites.
+///
+/// Each field mirrors an enter-intent gate; see [`Self::admits`] for the exact
+/// per-field rule and [`first_confirmed_signal_at`] for the tracking that feeds
+/// it. The state machine still **replays every** printed signal (confirmation /
+/// invalidation history must be complete regardless of these filters); the
+/// criteria only decide which validation may *claim the winner slot*.
+#[derive(Debug, Clone, Copy)]
+pub struct SignalCriteria {
+    /// The plan's trade direction. A confirmed signal in the opposite direction
+    /// must not claim the slot (the detector prints both ways; an opposite
+    /// signal often confirms first — DE30 2026-07-07's long pinbar).
+    pub dir: Direction,
+    /// The pattern kind the enter pins, or `None` for "any kind". Prod enters
+    /// pass `None` (the enter takes any confirmed pattern in its direction); kept
+    /// for parity with the Pine detector's per-pattern alerts and the guard.
+    pub kind: Option<SignalKind>,
+    /// When the enter demands golden (`intent.needs_golden`), only a golden
+    /// confirmed signal may win. A non-golden signal is still *tracked* (it can
+    /// golden-protect / invalidate others), it just can't claim the slot —
+    /// otherwise it shadows a later golden one the enter would take (UK 100 v109).
+    pub require_golden: bool,
+    /// The **inclusive** setup floor: only a signal whose print time is
+    /// `>= not_before` may win. Scopes "first confirmed" to the setup forming
+    /// now, not an ancient warmup-era signal. `None` = no lower bound.
+    pub not_before: Option<DateTime<Utc>>,
+    /// The **exclusive** re-entry watermark: a signal whose print time is
+    /// `<= after` cannot win. How a multi-shot QM enter skips the confirmed
+    /// signal it already consumed and advances to the next. `None` = no
+    /// watermark (first confirmed in scope wins — the single-shot / first-entry
+    /// case). Composes with `not_before`: a winner needs `>= not_before` **and**
+    /// `> after`.
+    pub after: Option<DateTime<Utc>>,
+}
+
+impl SignalCriteria {
+    /// Whether a tracked signal may **claim the winner slot**, given its print
+    /// time (`candles[t.signal_bar].time`). Pure — the single predicate every
+    /// filter funnels through, so adding a filter means adding one clause here.
+    /// `require_confirmed` is **not** a field: the scan only ever offers already-
+    /// confirmed (freshly-`Valid`) signals to this check, so confirmation is the
+    /// caller's gate, not a claim filter (see [`first_confirmed_signal_at`]).
+    fn admits(&self, t: &Tracked, print_time: DateTime<Utc>) -> bool {
+        // direction (and kind, when pinned)
+        let matches = t.direction == self.dir && self.kind.is_none_or(|k| t.kind == k);
+        // at/after the inclusive setup floor
+        let in_scope = self.not_before.is_none_or(|floor| print_time >= floor);
+        // strictly after the exclusive re-entry watermark
+        let after_watermark = self.after.is_none_or(|w| print_time > w);
+        // golden, when the enter demands it (non-golden is tracked, not claimable)
+        let golden_ok = !self.require_golden || t.golden;
+        matches && in_scope && after_watermark && golden_ok
+    }
+}
+
 /// Like [`latched_signal_at`], but returns the **first signal to confirm**
 /// rather than the single most-recent latch — the per-signal ("first one wins")
 /// entry the operator's rule describes.
@@ -279,24 +351,16 @@ pub fn latched_signal_at(
 /// latch (`state.fired`) blocks the later signals' confirmations once this one
 /// has fired the enter.
 ///
-/// **The direction/kind filter is essential**, not cosmetic: the detector prints
-/// signals in *both* directions, and an opposite-direction signal often confirms
-/// *first* (DE30_EUR 2026-07-07: a long pinbar confirmed before the short we
-/// want). Without the filter this returned that long, the caller's post-hoc
-/// direction check declined it, and the confirmed short was never considered —
-/// re-introducing the very miss this function exists to fix. The filter mirrors
-/// the caller's `dir`/`pattern` gate (`eval_pine_entry`) so "first confirmed"
-/// means "first confirmed signal the enter would actually take".
-///
-/// `not_before` bounds *which signals count as the setup's*: only a signal
-/// whose print time is `>= not_before` may win. This is essential — the detector
-/// window carries a long warmup tail (hundreds of bars back), and without the
-/// bound the "first confirmed short" is some ancient warmup-era signal, not the
-/// one forming at the setup. The engine passes the setup floor (the later of the
-/// break-and-close time and the replay-start cursor); `None` = no lower bound
-/// (consider the whole window). The state machine still *replays* from bar 0
-/// (confirmation/invalidation history must be complete) — the bound only filters
-/// which validations may *claim the winner slot*.
+/// **The selection filters are essential**, not cosmetic — see [`SignalCriteria`]
+/// for each (direction, kind, golden, setup floor, re-entry watermark) and the
+/// production miss that motivated it. In short: the detector prints signals in
+/// both directions and across a long warmup tail, so an unfiltered "first
+/// confirmed" routinely picks a signal the enter would never take. The criteria
+/// mirror the caller's own enter gates so "first confirmed" means "first
+/// confirmed signal the enter would actually take". The state machine still
+/// **replays every** printed signal (confirmation/invalidation history must be
+/// complete); the criteria only decide which validation may *claim the winner
+/// slot* via [`SignalCriteria::admits`].
 ///
 /// `fires` is set on the bar the returned signal **just** validated (so the
 /// engine's `sig.fires` gate triggers the entry exactly at confirmation). A
@@ -304,44 +368,11 @@ pub fn latched_signal_at(
 /// re-evaluation after the confirm bar sees the confirmed signal), but with
 /// `fires = false` on those later bars — the enter fires once, on the
 /// confirmation bar.
-///
-/// `after` is the **exclusive** re-entry watermark: a signal whose print time is
-/// `<= after` cannot win. Where `not_before` is the inclusive setup floor (which
-/// signals belong to *this* setup), `after` is how a multi-shot QM enter skips
-/// the confirmed signal it *already consumed* and advances to the next one. The
-/// engine passes `state.last_confirmed_enter_at` here; `None` = no re-entry
-/// watermark (the first confirmed signal in scope wins, the single-shot / first-
-/// entry case). Both bounds compose: a winner must satisfy `>= not_before` **and**
-/// `> after`.
-///
-/// `want_golden` gates the winner slot the same way `want_dir`/`want_kind` do:
-/// when the enter demands a golden signal (`intent.needs_golden`), a **non-golden**
-/// confirmed signal must not *claim* the slot — it is still tracked (a non-golden
-/// signal participates in the golden-protect invalidation of others), but only a
-/// golden confirmed signal wins. This is essential, not cosmetic: "first confirmed
-/// wins" latches the earliest validating signal forever (`first_confirmed_bar` is
-/// set once). Without the golden filter, an early non-golden confirmation
-/// permanently shadows a later golden one the enter actually wants, and the
-/// caller's non-golden `pine_entry_dispatchable` decline never advances the
-/// re-entry watermark (a decline isn't a fire) — so the enter is stuck forever
-/// on a signal it will always reject. Caught on UK 100 iH&S `--quasimodo`
-/// 2026-07-14: a non-golden Long confirmed at 05:00Z and shadowed the golden Long
-/// that confirmed at 13:00Z. `false` = no golden requirement (the guard/close and
-/// `--skip-golden` enters); mirrors the caller's own `needs_golden` gate so
-/// "first confirmed" means "first confirmed signal the enter would actually take".
-// Each argument is a distinct scan filter (dir / kind / golden / floor / watermark)
-// that the caller sets independently — folding them into a struct would obscure the
-// call sites more than it helps, so allow the arity like `update_tracked` does.
-#[allow(clippy::too_many_arguments)]
 pub fn first_confirmed_signal_at(
     candles: &[Candle],
     as_of: usize,
     cfg: &DetectorConfig,
-    want_dir: Direction,
-    want_kind: Option<SignalKind>,
-    want_golden: bool,
-    not_before: Option<DateTime<Utc>>,
-    after: Option<DateTime<Utc>>,
+    crit: &SignalCriteria,
 ) -> Option<LatchedSignal> {
     if as_of >= candles.len() {
         return None;
@@ -380,30 +411,15 @@ pub fn first_confirmed_signal_at(
         // first winner.
         if first_confirmed_bar.is_none() {
             for (i, t) in tracked.iter().enumerate() {
+                // Only a signal that *just* transitioned PENDING→VALID this bar is
+                // a candidate — confirmation is the scan's own gate, so `admits`
+                // never sees an unconfirmed signal. The claim filters (direction,
+                // kind, setup floor, re-entry watermark, golden) all live in
+                // `SignalCriteria::admits` — one predicate, so a future filter is
+                // added there, not re-derived at every call site.
                 let freshly_valid =
                     t.state == SigState::Valid && !was_valid.get(i).copied().unwrap_or(false);
-                // Only the plan's direction (and kind, when the enter pins one)
-                // counts — an opposite-direction signal confirming first must not
-                // claim the slot (see the doc-comment: the DE30 long-pinbar case).
-                let matches = t.direction == want_dir && want_kind.is_none_or(|k| t.kind == k);
-                // ...and only a signal at/after the setup floor — a warmup-era
-                // signal must not claim the slot (the print time is the signal
-                // bar's candle time).
-                let in_scope = not_before.is_none_or(|floor| candles[t.signal_bar].time >= floor);
-                // ...and only a signal strictly *after* the re-entry watermark:
-                // a multi-shot QM enter that already fired on an earlier
-                // confirmed signal must advance to the next one, not re-take the
-                // consumed signal forever.
-                let after_watermark = after.is_none_or(|w| candles[t.signal_bar].time > w);
-                // ...and, when the enter demands golden, only a golden signal may
-                // CLAIM the slot. A non-golden signal is still tracked above (it can
-                // invalidate / protect others), it just can't win — otherwise an
-                // early non-golden confirmation latches `first_confirmed_bar` and
-                // permanently shadows a later golden one the enter actually takes
-                // (UK 100 --quasimodo 2026-07-14). Mirrors the `want_dir`/`want_kind`
-                // filter: tracked-but-not-claimable.
-                let golden_ok = !want_golden || t.golden;
-                if freshly_valid && matches && in_scope && after_watermark && golden_ok {
+                if freshly_valid && crit.admits(t, candles[t.signal_bar].time) {
                     first_confirmed_bar = Some(t.signal_bar);
                     confirmed_on = Some(bar);
                     break;
@@ -604,6 +620,168 @@ mod tests {
         c
     }
 
+    /// Test shim for [`first_confirmed_signal_at`] preserving the pre-refactor
+    /// positional filter order (dir / kind / golden / not_before / after) so the
+    /// scan tests read the same — it just folds them into a `SignalCriteria`.
+    fn fc(
+        candles: &[Candle],
+        as_of: usize,
+        cfg: &DetectorConfig,
+        dir: Direction,
+        kind: Option<SignalKind>,
+        require_golden: bool,
+        not_before: Option<DateTime<Utc>>,
+        after: Option<DateTime<Utc>>,
+    ) -> Option<LatchedSignal> {
+        first_confirmed_signal_at(
+            candles,
+            as_of,
+            cfg,
+            &SignalCriteria {
+                dir,
+                kind,
+                require_golden,
+                not_before,
+                after,
+            },
+        )
+    }
+
+    /// A minimal `Tracked` for exercising `SignalCriteria::admits` in isolation
+    /// (only the fields `admits` reads matter — direction, kind, golden; the rest
+    /// are inert placeholders). `signal_bar`/geometry are unused by `admits`.
+    fn tracked(dir: Direction, kind: SignalKind, golden: bool) -> Tracked {
+        Tracked {
+            direction: dir,
+            high: 1.0,
+            low: 0.0,
+            range: 1.0,
+            kind,
+            start_time: ts("2026-01-01T00:00:00Z"),
+            atr: Some(0.5),
+            signal_bar: 0,
+            state: SigState::Valid,
+            golden,
+            broke: true,
+        }
+    }
+
+    /// The wide-open criteria (no filters engaged) — the baseline every
+    /// per-filter test tightens one field of.
+    fn any_long() -> SignalCriteria {
+        SignalCriteria {
+            dir: Direction::Long,
+            kind: None,
+            require_golden: false,
+            not_before: None,
+            after: None,
+        }
+    }
+
+    #[test]
+    fn admits_open_criteria_takes_any_matching_direction() {
+        let t = tracked(Direction::Long, SignalKind::Pinbar, false);
+        assert!(any_long().admits(&t, ts("2026-06-16T10:00:00Z")));
+    }
+
+    #[test]
+    fn admits_filters_by_direction() {
+        // opposite-direction signal never claims the slot (DE30 long-pinbar case)
+        let short = tracked(Direction::Short, SignalKind::Pinbar, true);
+        assert!(!any_long().admits(&short, ts("2026-06-16T10:00:00Z")));
+    }
+
+    #[test]
+    fn admits_filters_by_kind_when_pinned() {
+        let crit = SignalCriteria {
+            kind: Some(SignalKind::Pinbar),
+            ..any_long()
+        };
+        let pinbar = tracked(Direction::Long, SignalKind::Pinbar, false);
+        let engulfer = tracked(Direction::Long, SignalKind::FloatingEngulfer, false);
+        assert!(crit.admits(&pinbar, ts("2026-06-16T10:00:00Z")));
+        assert!(
+            !crit.admits(&engulfer, ts("2026-06-16T10:00:00Z")),
+            "a pinned kind excludes other kinds"
+        );
+    }
+
+    #[test]
+    fn admits_requires_golden_only_when_asked() {
+        let non_golden = tracked(Direction::Long, SignalKind::Pinbar, false);
+        // default: golden not required → a non-golden signal is admitted
+        assert!(any_long().admits(&non_golden, ts("2026-06-16T10:00:00Z")));
+        // require_golden: a non-golden signal can't claim the slot (UK 100 v109)
+        let gated = SignalCriteria {
+            require_golden: true,
+            ..any_long()
+        };
+        assert!(!gated.admits(&non_golden, ts("2026-06-16T10:00:00Z")));
+        let golden = tracked(Direction::Long, SignalKind::Pinbar, true);
+        assert!(gated.admits(&golden, ts("2026-06-16T10:00:00Z")));
+    }
+
+    #[test]
+    fn admits_setup_floor_is_inclusive() {
+        let floor = ts("2026-06-16T10:00:00Z");
+        let crit = SignalCriteria {
+            not_before: Some(floor),
+            ..any_long()
+        };
+        let t = tracked(Direction::Long, SignalKind::Pinbar, false);
+        assert!(
+            !crit.admits(&t, floor - chrono::Duration::hours(1)),
+            "before floor excluded"
+        );
+        assert!(
+            crit.admits(&t, floor),
+            "exactly at floor is admitted (inclusive)"
+        );
+        assert!(
+            crit.admits(&t, floor + chrono::Duration::hours(1)),
+            "after floor admitted"
+        );
+    }
+
+    #[test]
+    fn admits_reentry_watermark_is_exclusive() {
+        let mark = ts("2026-06-16T10:00:00Z");
+        let crit = SignalCriteria {
+            after: Some(mark),
+            ..any_long()
+        };
+        let t = tracked(Direction::Long, SignalKind::Pinbar, false);
+        assert!(
+            !crit.admits(&t, mark),
+            "exactly at the watermark is excluded (exclusive)"
+        );
+        assert!(
+            !crit.admits(&t, mark - chrono::Duration::hours(1)),
+            "before the watermark excluded"
+        );
+        assert!(
+            crit.admits(&t, mark + chrono::Duration::hours(1)),
+            "strictly after admitted"
+        );
+    }
+
+    #[test]
+    fn admits_composes_floor_and_watermark() {
+        // a winner must satisfy >= not_before AND > after
+        let floor = ts("2026-06-16T09:00:00Z");
+        let mark = ts("2026-06-16T11:00:00Z");
+        let crit = SignalCriteria {
+            not_before: Some(floor),
+            after: Some(mark),
+            ..any_long()
+        };
+        let t = tracked(Direction::Long, SignalKind::Pinbar, false);
+        // in [floor, mark] but not > mark → excluded by the watermark
+        assert!(!crit.admits(&t, ts("2026-06-16T10:00:00Z")));
+        // > mark (and >= floor) → admitted
+        assert!(crit.admits(&t, ts("2026-06-16T12:00:00Z")));
+    }
+
     /// A bullish pinbar on bar 1, then a bar that pushes above its high within
     /// the window → the latched signal confirms.
     fn bullish_pinbar_window() -> Vec<Candle> {
@@ -768,7 +946,7 @@ mod tests {
         // (110) is the base the entry anchors to — with fires=true on the
         // confirmation bar.
         let candles = two_short_engulfers_first_confirms();
-        let f = first_confirmed_signal_at(
+        let f = fc(
             &candles,
             3,
             &cfg(),
@@ -795,7 +973,7 @@ mod tests {
         let candles = two_short_engulfers_first_confirms();
         // bar 2: bar 1 not yet resolved (bars_elapsed = 1) → nothing confirmed.
         assert!(
-            first_confirmed_signal_at(
+            fc(
                 &candles,
                 2,
                 &cfg(),
@@ -809,7 +987,7 @@ mod tests {
             "no confirmation before the window closes"
         );
         // bar 3: confirmed, fires.
-        let at3 = first_confirmed_signal_at(
+        let at3 = fc(
             &candles,
             3,
             &cfg(),
@@ -832,7 +1010,7 @@ mod tests {
         // declining, missing the confirmed short entirely).
         let candles = two_short_engulfers_first_confirms();
         assert!(
-            first_confirmed_signal_at(
+            fc(
                 &candles,
                 3,
                 &cfg(),
@@ -907,7 +1085,7 @@ mod tests {
         // Baseline (want_golden = false): the non-golden early Long wins and
         // permanently shadows the golden one. It printed at 07-14 03:00Z and is
         // NOT golden — exactly the signal the golden-requiring enter can't take.
-        let no_gate = first_confirmed_signal_at(
+        let no_gate = fc(
             &candles,
             as_of,
             &c,
@@ -932,9 +1110,8 @@ mod tests {
         // The fix (want_golden = true): the non-golden 03:00Z signal is skipped;
         // the golden 11:00Z Long claims the slot and fires on its 13:00Z
         // confirmation bar with its own geometry (high 10484.1 / low 10448.0).
-        let gated =
-            first_confirmed_signal_at(&candles, as_of, &c, Direction::Long, None, true, None, None)
-                .expect("the golden long is found once non-golden signals can't claim the slot");
+        let gated = fc(&candles, as_of, &c, Direction::Long, None, true, None, None)
+            .expect("the golden long is found once non-golden signals can't claim the slot");
         assert!(gated.golden, "the winner is golden");
         assert!(gated.signal_confirmed, "and confirmed");
         assert!(gated.fires, "fires on its 13:00Z confirmation bar");
@@ -961,7 +1138,7 @@ mod tests {
         let candles = two_short_engulfers_first_confirms();
         let floor = candles[2].time; // strictly after the bar-1 signal print
         assert!(
-            first_confirmed_signal_at(
+            fc(
                 &candles,
                 3,
                 &cfg(),
@@ -977,7 +1154,7 @@ mod tests {
         // A floor at the signal's own print bar still admits it (>= is inclusive).
         let floor_incl = candles[1].time;
         assert!(
-            first_confirmed_signal_at(
+            fc(
                 &candles,
                 3,
                 &cfg(),
@@ -1032,7 +1209,7 @@ mod tests {
 
         // No watermark: A wins on its confirmation bar (bar 3), fires there, and
         // never fires again (frozen — the exact multi-shot bug).
-        let a = first_confirmed_signal_at(
+        let a = fc(
             &candles,
             3,
             &cfg(),
@@ -1056,7 +1233,7 @@ mod tests {
         let a_watermark = a.signal_bar_time;
         // Frozen: at bar 6, still A, no longer firing — this is what starves the
         // re-entry without the watermark.
-        let frozen = first_confirmed_signal_at(
+        let frozen = fc(
             &candles,
             6,
             &cfg(),
@@ -1077,7 +1254,7 @@ mod tests {
         // signal confirms (bar 3) → None; on the next signal's confirmation bar
         // (bar 6) → the next short wins and fires.
         assert!(
-            first_confirmed_signal_at(
+            fc(
                 &candles,
                 3,
                 &cfg(),
@@ -1090,7 +1267,7 @@ mod tests {
             .is_none(),
             "A is excluded by the watermark and no later short has confirmed yet"
         );
-        let next = first_confirmed_signal_at(
+        let next = fc(
             &candles,
             6,
             &cfg(),

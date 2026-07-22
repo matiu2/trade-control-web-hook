@@ -1,5 +1,45 @@
 # Changelog
 
+## v110 — 2026-07-22 — SignalCriteria: fold the confirmed-first selection filters into one value
+
+**Why.** The confirmed-first scan (`first_confirmed_signal_at`) picks the *first*
+confirmed signal that passes a set of filters and never revisits the choice. The
+filters had accreted one-per-incident as separate positional args
+(`want_dir`/`not_before`/`after`/`want_golden` — DE30, bug ①, QM multi-shot, UK
+100 v109), and every one of those bugs was a caller **forgetting to pass a
+filter**. Eight positional args, six of them predicates, is a standing invitation
+to drop one. Root-cause the *class*, not the fourth instance. (See
+`SCOPING-entry-logic-simplification.md` for the "is it worth it" analysis — the
+bug cluster is signal *selection*, not the two entry systems, and not the phase
+FSM.)
+
+**What changed (behaviour: identical).**
+- New `trade_control_core::signals::SignalCriteria { dir, kind, require_golden,
+  not_before, after }` with `from_enter`-style construction and one `admits(t,
+  print_time)` predicate — the single place a filter maps in, and the single
+  place the winner-slot claim is decided. `first_confirmed_signal_at` now takes
+  `&SignalCriteria` (arity 8 → 4); the inline 5-clause predicate is gone.
+- `engine::evaluate::eval_pine_entry` and the replay's `confirmed_signal_ready`
+  build the criteria from the enter's own intent, so a filter can't be dropped at
+  a call site — adding a future filter is two edits (`admits` + the struct),
+  enforced by the type system.
+- The `NeedsConfirmation` "not taken" reason is now **truthful**: given a detector
+  window, `enter_preconditions_by_leg` runs the real confirmed-first scan (shared
+  `confirmed_setup_floor` + `leg_has_confirmed_signal`) and only reports "requires
+  confirmation" when nothing has actually confirmed in scope — instead of the
+  static label that made v109 confusing to read. Pure engine callers pass `None`
+  and keep the historical label (back-compat).
+
+**Breaking (internal API).** `first_confirmed_signal_at(&SignalCriteria)`;
+`enter_preconditions_by_leg`/`enter_preconditions_reason` gain an
+`Option<&[Candle]>` detector-window arg. No wire/serde change.
+
+**Tests.** 7 per-filter `admits` unit tests (each predicate true/false in
+isolation) + `needs_confirmation_reason_is_truthful_with_a_detector_window` (block
+dropped once a signal confirms, static label preserved with no window). All 2092
+workspace tests pass. Verified behaviour-identical end-to-end: the real UK 100
+`--quasimodo` plan replays to the same Net R +1.47, entering at 23:00 as before.
+
 ## v109 — 2026-07-22 — confirmed-first scan skips a non-golden signal when the enter needs golden
 
 **Why.** A `--quasimodo` (confirmation-gated, golden-gated) enter could be stuck
