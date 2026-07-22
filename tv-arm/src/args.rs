@@ -309,11 +309,12 @@ pub struct Args {
     ///
     /// This is NOT `--quasimodo` (which runs the QM setup *instead of* the
     /// stop entry) — strategy-v2 runs both. Conflicts with `--quasimodo`,
-    /// `--entry-market`, `--skip-break-and-close`, and `--skip-retest`;
+    /// `--entry-market`, `--skip-break-and-close`, `--skip-retest`, and the
+    /// `--skip-bcr` / `--skip-all` aliases that expand to them;
     /// `--max-retries 0` is rejected at validation.
     #[arg(
         long,
-        conflicts_with_all = ["quasimodo", "entry_market", "entry_stop", "entry_limit", "skip_break_and_close", "skip_retest"]
+        conflicts_with_all = ["quasimodo", "entry_market", "entry_stop", "entry_limit", "skip_break_and_close", "skip_retest", "skip_bcr", "skip_all"]
     )]
     pub strategy_v2: bool,
 
@@ -404,6 +405,20 @@ pub struct Args {
     /// Drop the retest prep from the bundle.
     #[arg(long)]
     pub skip_retest: bool,
+
+    /// **Convenience alias.** Drop both H&S preps — expands to
+    /// `--skip-break-and-close --skip-retest`. It only ORs the targets on
+    /// (never clears them), so combining it with the underlying flags is
+    /// harmless. Expanded by `apply_aliases`.
+    #[arg(long)]
+    pub skip_bcr: bool,
+
+    /// **Convenience alias.** Drop both H&S preps *and* the calendar step —
+    /// expands to `--skip-bcr --skip-calendar-bars` (i.e.
+    /// `--skip-break-and-close --skip-retest --skip-calendar-bars`). Only ORs
+    /// the targets on. Expanded by `apply_aliases`.
+    #[arg(long)]
+    pub skip_all: bool,
 
     /// Drop the golden-signal-candle requirement on entry. By default
     /// a golden signal candle is required (`needs_golden: true` on the
@@ -604,10 +619,23 @@ pub struct Args {
 impl Args {
     /// Expand convenience aliases into the concrete flags the pipeline
     /// reads. `--quasimodo` is shorthand for `--skip-break-and-close
-    /// --skip-retest --require-confirmation`; it only ORs the targets on
-    /// (never clears them), so combining it with the underlying flags is
-    /// harmless. Call once after `parse`, before the pipeline runs.
+    /// --skip-retest --require-confirmation`; `--skip-bcr` for
+    /// `--skip-break-and-close --skip-retest`; `--skip-all` for `--skip-bcr
+    /// --skip-calendar-bars`. All only OR the targets on (never clear them),
+    /// so combining them with the underlying flags is harmless. Call once
+    /// after `parse`, before the pipeline runs.
     pub fn apply_aliases(mut self) -> Self {
+        // --skip-all is the broadest alias; expand it into --skip-bcr +
+        // --skip-calendar-bars first so the --skip-bcr expansion below covers
+        // both.
+        if self.skip_all {
+            self.skip_bcr = true;
+            self.skip_calendar_bars = true;
+        }
+        if self.skip_bcr {
+            self.skip_break_and_close = true;
+            self.skip_retest = true;
+        }
         if self.quasimodo {
             self.skip_break_and_close = true;
             self.skip_retest = true;
@@ -887,6 +915,43 @@ mod tests {
     }
 
     #[test]
+    fn skip_bcr_expands_to_both_preps() {
+        // Bare --skip-bcr is off until apply_aliases runs.
+        let parsed = Args::try_parse_from(["tv-arm", "--skip-bcr"]).expect("parse");
+        assert!(parsed.skip_bcr);
+        assert!(!parsed.skip_break_and_close);
+        assert!(!parsed.skip_retest);
+
+        // After expansion both concrete prep flags are on; unrelated ones
+        // stay off.
+        let args = parsed.apply_aliases();
+        assert!(args.skip_break_and_close);
+        assert!(args.skip_retest);
+        assert!(!args.skip_calendar_bars);
+        assert!(!args.require_confirmation);
+    }
+
+    #[test]
+    fn skip_all_expands_to_bcr_plus_calendar_bars() {
+        let parsed = Args::try_parse_from(["tv-arm", "--skip-all"]).expect("parse");
+        assert!(parsed.skip_all);
+        assert!(!parsed.skip_bcr);
+        assert!(!parsed.skip_break_and_close);
+        assert!(!parsed.skip_retest);
+        assert!(!parsed.skip_calendar_bars);
+
+        // --skip-all chains through --skip-bcr into the concrete prep flags,
+        // and also flips the calendar step off.
+        let args = parsed.apply_aliases();
+        assert!(args.skip_bcr);
+        assert!(args.skip_break_and_close);
+        assert!(args.skip_retest);
+        assert!(args.skip_calendar_bars);
+        // Still doesn't touch the confirmation gate.
+        assert!(!args.require_confirmation);
+    }
+
+    #[test]
     fn strategy_v2_parses_and_defaults_off() {
         let args = Args::try_parse_from(["tv-arm"]).expect("parse");
         assert!(!args.strategy_v2);
@@ -903,6 +968,8 @@ mod tests {
             "--entry-market",
             "--skip-break-and-close",
             "--skip-retest",
+            "--skip-bcr",
+            "--skip-all",
         ] {
             let res = Args::try_parse_from(["tv-arm", "--strategy-v2", conflicting]);
             assert!(
