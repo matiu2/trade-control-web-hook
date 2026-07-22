@@ -801,6 +801,10 @@ fn evaluate_one_entry(
                 *pattern,
                 *dir,
                 rule.intent.needs_confirmed,
+                // The enter's golden requirement also gates the confirmed-first
+                // winner slot, so a non-golden confirmation can't shadow the
+                // golden one the enter would take (UK 100 --quasimodo 2026-07-14).
+                rule.intent.needs_golden,
                 confirmed_floor,
                 state.last_confirmed_enter_at,
                 // Plain (non-confirmed) enters are print-only: fire on the bar a
@@ -944,6 +948,12 @@ fn eval_pine_entry(
     pattern: Option<SignalKind>,
     dir: Direction,
     confirmed_first: bool,
+    // When the enter demands golden (`intent.needs_golden`), the confirmed-first
+    // scan must not let a NON-golden signal claim the winner slot and shadow a
+    // later golden one forever (UK 100 --quasimodo 2026-07-14). Threaded straight
+    // into `first_confirmed_signal_at`'s `want_golden`. Ignored on the
+    // `latched_signal_at` path (guard / golden-only enters keep their own gate).
+    needs_golden: bool,
     confirmed_floor: Option<chrono::DateTime<chrono::Utc>>,
     confirmed_after: Option<chrono::DateTime<chrono::Utc>>,
     print_only: bool,
@@ -985,6 +995,7 @@ fn eval_pine_entry(
             cfg,
             dir,
             pattern,
+            needs_golden,
             scan_floor,
             confirmed_after,
         )
@@ -1125,6 +1136,9 @@ fn eval_pine_guard(
         cfg,
         pattern,
         dir,
+        false,
+        // `needs_golden`: unused on the guard's `latched_signal_at` path
+        // (`confirmed_first: false`), so it never reaches `first_confirmed_signal_at`.
         false,
         None,
         None,
