@@ -14,12 +14,6 @@
       }
     },
     {
-      "rule_id": "07-close-on-sr-reversal",
-      "action": "close",
-      "candle_time": "2026-07-14T15:00:00Z",
-      "candle_close": 10502.2
-    },
-    {
       "rule_id": "09-enter-qm",
       "action": "enter",
       "candle_time": "2026-07-14T15:00:00Z",
@@ -47,12 +41,6 @@
     {
       "rule_id": "01-news-start-1784181600-1784185200",
       "action": "news-start",
-      "candle_time": "2026-07-16T05:00:00Z",
-      "candle_close": 10471.3
-    },
-    {
-      "rule_id": "06-close-on-reversal",
-      "action": "close",
       "candle_time": "2026-07-16T05:00:00Z",
       "candle_close": 10471.3
     },

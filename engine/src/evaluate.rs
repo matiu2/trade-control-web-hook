@@ -538,6 +538,23 @@ fn evaluate_guards(
     detector_cfg: &DetectorConfig,
     fired: &mut Vec<FiredIntent>,
 ) {
+    // A terminal invalidation (`too-high`/`too-low`, `trade-expiry`, M/W abort)
+    // retires the plan — but a **non-terminal per-position close** that fires on
+    // the SAME bar must still be dispatched first. Live has no collision here:
+    // the invalidation veto and the reversal-close arrive as two independent
+    // alerts, so a `stop-next-entry` veto (which never touches the open position)
+    // and the separate `run_close → close_positions` both take effect on the bar.
+    // The old code did `state.phase = Done; return` the instant a terminal guard
+    // fired, abandoning the loop before a later-ordered `07-close-on-sr-reversal`
+    // was reached, so the position rode to SL instead of flattening at the
+    // reversal — a replay↔live divergence (USD/ZAR M15 2026-07-20: too-low @
+    // 16.44519 and the golden long reversal-close both fired on the 11:30Z bar;
+    // live flattens ~BE, replay reported −1R). We now scan the WHOLE rule set for
+    // the bar so every guard fires independently (as its own alert would), then
+    // apply the Done transition after the loop. `phase` is left untouched during
+    // the scan so a per-position close stays `armed_in_rule` (AwaitEntry-only).
+    // See `[[reversal_close_spine_retire_recurring]]` and the 3.3 parity map.
+    let mut terminal_fired = false;
     for rule in &plan.rules {
         if !is_guard(rule) || state.fired.contains(&rule.rule_id) {
             continue;
@@ -606,11 +623,17 @@ fn evaluate_guards(
         // retries: place → fill → close-on-reversal → re-enter is the whole point
         // of multi-shot.)
         if guard_is_terminal(rule) {
-            state.phase = Phase::Done;
-            return;
+            // Record the retirement but DON'T short-circuit: a same-bar
+            // non-terminal per-position close (later in the rule set) must still
+            // dispatch. Keep `phase` unchanged so that close stays armed; apply
+            // Done once the whole bar's guards have fired.
+            terminal_fired = true;
         }
         // Non-terminal guard fired (a reversal-close): keep scanning later rules
         // this bar, but it has latched so it won't re-fire.
+    }
+    if terminal_fired {
+        state.phase = Phase::Done;
     }
 }
 
@@ -1149,6 +1172,37 @@ fn eval_pine_guard(
     // short 2026-07-08 back to break-even (the 11:00 BNE golden bullish pinbar off
     // 1.14032 closed in-band but no news window was open). This matches live.
     if !close_windows_pass(intent, candle, &sig, open_news_windows) {
+        return None;
+    }
+    // Candle-quality gate (mirror of `allow_close_gate::candle_quality` on the
+    // worker side): a `needs_golden` reversal-close must fire on a GOLDEN reversal
+    // only. This has to be applied HERE — before the guard latches — not merely at
+    // the downstream dispatch. The engine records a fired guard in `state.fired`
+    // and never re-evaluates it; if a non-golden reversal is allowed to latch, the
+    // rule is dead for the rest of the window and a later GENUINELY golden reversal
+    // never gets a turn. Live doesn't have that failure: the close alert re-fires
+    // each bar and `run_close` applies `needs_golden` per fire, and a rejected
+    // (needs-golden-unmet) close is a 412 that does NOT poison the intent id
+    // (`[[replay_live_33_bug_taxonomy]]`, seen.rs), so the next bar's golden fire
+    // still lands. Gating the latch here restores that per-bar semantics offline.
+    // USD/ZAR M15 2026-07-20: a non-golden long pinbar at 11:00Z (band-anchor
+    // in-band but golden=false) used to latch the close and shadow the real golden
+    // reversal at 11:30Z, so replay rode the short to SL (−1R) while live closes at
+    // the 11:30 reversal (~BE). `needs_confirmed` is mirrored too for symmetry with
+    // the shell gate, though the reversal-close builder does not set it today.
+    if intent.needs_golden && !sig.golden {
+        tracing::debug!(
+            bar = %candle.time,
+            "pine-close: needs_golden but reversal is not golden — decline (guard \
+             does not latch, so a later golden reversal can still fire)"
+        );
+        return None;
+    }
+    if intent.needs_confirmed && !sig.signal_confirmed {
+        tracing::debug!(
+            bar = %candle.time,
+            "pine-close: needs_confirmed but reversal not confirmed — decline (no latch)"
+        );
         return None;
     }
     Some(sig)
@@ -6747,6 +6801,17 @@ mod tests {
         }
     }
 
+    /// Like [`close_on_reversal_rule`] but with `needs_golden: true` — the real
+    /// `07-close-on-sr-reversal` shape tv-arm emits. The candle-quality gate now
+    /// applies inside the guard (before the latch), so a non-golden reversal must
+    /// NOT fire or latch, leaving a later golden reversal free to fire.
+    fn golden_close_on_reversal_rule(dir: Direction, band: Option<[f64; 2]>) -> ConditionRule {
+        let mut r = close_on_reversal_rule(dir, band);
+        r.rule_id = "07-close-on-sr-reversal".into();
+        r.intent.needs_golden = true;
+        r
+    }
+
     /// A news-windowed `06-close-on-reversal` guard: `inside_window: ["news"]`,
     /// no price band. This is the real shape `build_trade` emits for the safety
     /// flatten; it only fires while a news window is open and is non-terminal
@@ -6834,6 +6899,160 @@ mod tests {
             "a reversal-close flattens but never retires the plan (retries continue)"
         );
         assert_eq!(eval.new_state.phase, Phase::AwaitEntry);
+    }
+
+    #[test]
+    fn same_bar_terminal_veto_does_not_shadow_a_per_position_close() {
+        // Replay↔live parity (USD/ZAR M15 2026-07-20). A terminal `too-low`
+        // invalidation veto and a non-terminal `07-close-on-sr-reversal` both
+        // trigger on the SAME reversal bar. The veto is FIRST in `plan.rules`
+        // (lower index) — exactly the collision that used to make the guard loop
+        // `state.phase = Done; return` before the close was reached, riding the
+        // position to SL. Live has no collision: the two alerts arrive
+        // independently, so the `stop-next-entry` veto blocks future entries while
+        // the separate `run_close` flattens the open position. Both effects must
+        // land on the bar. Assert BOTH fired and the plan then retires.
+        //
+        // Geometry reuses `bullish_pinbar_window` (the golden long reversal on the
+        // 11:00Z bar, low 1.00, band anchor 1.10 ∈ [1.05, 1.15]). The too-low
+        // level 1.05 sits above the pinbar's low, so the wick pierces it intrabar.
+        let too_low = rule(
+            "01-veto-too-low",
+            Trigger::PriceValueCross {
+                level: 1.05,
+                dir: CrossDir::Either,
+                bar: BarEvent::Intrabar,
+            },
+            FireMode::Once,
+            Action::Veto,
+        );
+        let close = close_on_reversal_rule(Direction::Long, Some([1.05, 1.15]));
+        // Veto BEFORE close in the rule list — reproduces the shadowing order.
+        let p = plan(vec![too_low, close]);
+        let window = bullish_pinbar_window();
+        let prior = seed_at(Phase::AwaitEntry, "2026-06-16T10:00:00Z");
+        let eval = run_window(&p, &prior, &window[3..], &window);
+
+        let ids: Vec<&str> = eval.fired.iter().map(|f| f.rule_id.as_str()).collect();
+        assert!(
+            ids.contains(&"07-close-on-sr-reversal") || ids.contains(&"06-close-on-reversal"),
+            "the per-position close must still fire on the same bar as the terminal veto, got {ids:?}"
+        );
+        assert!(
+            ids.contains(&"01-veto-too-low"),
+            "the terminal veto also fires, got {ids:?}"
+        );
+        // The close dispatches to flatten (its own `run_close` does the exit);
+        // the terminal veto then retires the plan.
+        assert!(eval.done, "the terminal veto still retires the plan");
+        assert_eq!(eval.new_state.phase, Phase::Done);
+    }
+
+    /// A warm H1 window (≥ ATR-length = 24 flat bars) ending in a bullish pinbar
+    /// on the LAST bar whose range is `pin_range`. Flat context bars have range
+    /// 0.02, so the Wilder ATR ≈ 0.02 and warms fully. A `pin_range` of 0.20 is
+    /// golden (≫ ATR); 0.006 is non-golden (< ATR). The pinbar's body sits in the
+    /// top quartile with a long lower wick that undercuts the prior bar's low, so
+    /// it detects as a bullish reversal; its band anchor lands near 1.10.
+    fn warm_bullish_pinbar_window(pin_range: f64) -> Vec<Candle> {
+        let mut bars = Vec::new();
+        // 30 flat context bars around 1.10, range 0.02 each → ATR ≈ 0.02.
+        for i in 0..30u32 {
+            let h = 9 + i / 24; // roll the hour/day so timestamps stay valid
+            let hh = 9 + (i % 15);
+            let t = format!("2026-06-{:02}T{:02}:00:00Z", 16 + h, hh);
+            bars.push(candle(&t, 1.10, 1.11, 1.09, 1.10));
+        }
+        // Reversal pinbar on the last bar: low = 1.10 - pin_range (undercuts the
+        // 1.09 context low only for large ranges; for the small non-golden range
+        // we still need low < prior low, so drop the prior bar's low to 1.10).
+        let low = 1.10 - pin_range;
+        // Make the immediately-prior bar's low = 1.10 so the pinbar's low always
+        // strictly undercuts it regardless of pin_range.
+        *bars.last_mut().unwrap() = candle("2026-06-17T08:00:00Z", 1.10, 1.11, 1.10, 1.105);
+        // body in the top quartile: top ~1.10, so body_bottom ≥ top_25.
+        let top = low + pin_range;
+        let body_bottom = low + pin_range * 0.80;
+        let body_top = low + pin_range * 0.95;
+        bars.push(candle(
+            "2026-06-17T09:00:00Z",
+            body_bottom,
+            top,
+            low,
+            body_top,
+        ));
+        bars
+    }
+
+    #[test]
+    fn golden_close_fires_on_a_golden_in_band_reversal() {
+        // Sanity: on a WARM window (ATR computes) a GOLDEN in-band reversal fires
+        // the `needs_golden` close — the new candle-quality guard clause is a
+        // no-op for a genuine golden reversal.
+        // pin_range 0.20 → low 0.90, pinbar lower-wick-50% anchor ≈ 0.98, so the
+        // band must contain 0.98.
+        let window = warm_bullish_pinbar_window(0.20);
+        let p = plan(vec![golden_close_on_reversal_rule(
+            Direction::Long,
+            Some([0.95, 1.00]),
+        )]);
+        let last_ctx = window.len() - 1;
+        let prior = seed_at(Phase::AwaitEntry, "2026-06-17T08:00:00Z");
+        let eval = run_window(&p, &prior, &window[last_ctx..], &window);
+        let ids: Vec<&str> = eval.fired.iter().map(|f| f.rule_id.as_str()).collect();
+        assert!(
+            ids.contains(&"07-close-on-sr-reversal"),
+            "a golden in-band reversal fires the needs_golden close, got {ids:?}"
+        );
+        let sig = eval.fired[0].signal.expect("close carries geometry");
+        assert!(sig.golden, "the fired reversal is golden");
+    }
+
+    #[test]
+    fn golden_close_does_not_latch_on_a_non_golden_reversal() {
+        // The regression that bit USD/ZAR M15 2026-07-20. On a WARM window a
+        // `needs_golden` close must NOT fire or LATCH on a NON-golden in-band
+        // reversal — otherwise the engine records it in `state.fired` and a later
+        // genuinely-golden reversal never gets a turn (the 11:00Z non-golden pinbar
+        // shadowed the 11:30Z golden one). The reversal here has range 0.006 ≪ ATR
+        // ≈ 0.02 → golden=false; the same detector shape otherwise.
+        // pin_range 0.006 → anchor ≈ 1.0964, in [1.00, 1.11].
+        let window = warm_bullish_pinbar_window(0.006);
+        let last_ctx = window.len() - 1;
+        let prior = seed_at(Phase::AwaitEntry, "2026-06-17T08:00:00Z");
+
+        // Non-vacuity guard: the SAME window+band with `needs_golden=false` DOES
+        // fire the close — so the decline below is caused by the golden gate, not
+        // by "no signal detected" or "out of band".
+        let ungated = plan(vec![close_on_reversal_rule(
+            Direction::Long,
+            Some([1.00, 1.11]),
+        )]);
+        let eval_ungated = run_window(&ungated, &prior, &window[last_ctx..], &window);
+        assert!(
+            eval_ungated
+                .fired
+                .iter()
+                .any(|f| f.rule_id == "06-close-on-reversal"),
+            "sanity: the reversal IS detected and in-band (ungated close fires)"
+        );
+
+        let p = plan(vec![golden_close_on_reversal_rule(
+            Direction::Long,
+            Some([1.00, 1.11]),
+        )]);
+        let eval = run_window(&p, &prior, &window[last_ctx..], &window);
+        let ids: Vec<&str> = eval.fired.iter().map(|f| f.rule_id.as_str()).collect();
+        assert!(
+            !ids.contains(&"07-close-on-sr-reversal"),
+            "a NON-golden reversal must not fire the needs_golden close, got {ids:?}"
+        );
+        // Crucially the rule did not latch — it can still fire on a later golden bar.
+        assert!(
+            !eval.new_state.fired.contains("07-close-on-sr-reversal"),
+            "the guard must not latch on a non-golden reversal (else it shadows a \
+             later golden one)"
+        );
     }
 
     #[test]
