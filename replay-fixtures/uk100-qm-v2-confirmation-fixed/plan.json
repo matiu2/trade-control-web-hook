@@ -1,0 +1,426 @@
+{
+  "trade_id": "ihs-uk-100-f51f2b53",
+  "instrument": "UK 100",
+  "direction": "long",
+  "granularity": "h1",
+  "pip_size": 1.0,
+  "rules": [
+    {
+      "rule_id": "01-veto-too-low",
+      "trigger": {
+        "type": "horizontal_cross",
+        "level": 10420.395423778971,
+        "dir": "down",
+        "bar": "on_close"
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "ihs-uk-100-f51f2b53-too-low",
+        "not_after": "2026-07-17T03:30:00Z",
+        "action": "veto",
+        "instrument": "UK 100",
+        "broker": "tradenation",
+        "account": "reversals",
+        "name": "too-low",
+        "ttl_hours": 1,
+        "level": "close-positions",
+        "trade_id": "ihs-uk-100-f51f2b53"
+      },
+      "kind": "setup_invalidation"
+    },
+    {
+      "rule_id": "01-veto-too-high",
+      "trigger": {
+        "type": "price_value_cross",
+        "level": 10631.084434064487,
+        "dir": "either",
+        "bar": "intrabar"
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "ihs-uk-100-f51f2b53-too-high",
+        "not_after": "2026-07-17T03:30:00Z",
+        "action": "veto",
+        "instrument": "UK 100",
+        "broker": "tradenation",
+        "account": "reversals",
+        "name": "too-high",
+        "ttl_hours": 1,
+        "level": "stop-next-entry",
+        "trade_id": "ihs-uk-100-f51f2b53"
+      },
+      "kind": "setup_invalidation"
+    },
+    {
+      "rule_id": "02-veto-trade-expiry",
+      "trigger": {
+        "type": "time_reached",
+        "at_epoch": 1784257200
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "ihs-uk-100-f51f2b53-trade-expiry",
+        "not_before": "2026-07-17T03:00:00Z",
+        "not_after": "2026-07-17T03:30:00Z",
+        "action": "veto",
+        "instrument": "UK 100",
+        "broker": "tradenation",
+        "account": "reversals",
+        "name": "trade-expiry",
+        "ttl_hours": 1,
+        "level": "close-positions",
+        "trade_id": "ihs-uk-100-f51f2b53"
+      },
+      "kind": "setup_invalidation"
+    },
+    {
+      "rule_id": "03-prep-break-and-close",
+      "trigger": {
+        "type": "trendline_cross",
+        "a": {
+          "at_epoch": 1783576800,
+          "price": 10528.0
+        },
+        "b": {
+          "at_epoch": 1783706400,
+          "price": 10545.7
+        },
+        "extend_forward": true,
+        "bar_seconds": 3600,
+        "dir": "up",
+        "bar": "on_close"
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "ihs-uk-100-f51f2b53-break-and-close",
+        "not_after": "2026-07-17T03:00:00Z",
+        "action": "prep",
+        "instrument": "UK 100",
+        "broker": "tradenation",
+        "account": "reversals",
+        "step": "break-and-close",
+        "ttl_hours": 876000,
+        "clears": [
+          "retest"
+        ],
+        "trade_id": "ihs-uk-100-f51f2b53"
+      },
+      "kind": "prep_break_and_close"
+    },
+    {
+      "rule_id": "04-prep-retest",
+      "trigger": {
+        "type": "trendline_cross",
+        "a": {
+          "at_epoch": 1783576800,
+          "price": 10528.0
+        },
+        "b": {
+          "at_epoch": 1783706400,
+          "price": 10545.7
+        },
+        "extend_forward": true,
+        "bar_seconds": 3600,
+        "dir": "down",
+        "bar": "intrabar"
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "ihs-uk-100-f51f2b53-retest",
+        "not_after": "2026-07-17T03:00:00Z",
+        "action": "prep",
+        "instrument": "UK 100",
+        "broker": "tradenation",
+        "account": "reversals",
+        "step": "retest",
+        "ttl_hours": 876000,
+        "trade_id": "ihs-uk-100-f51f2b53"
+      },
+      "kind": "prep_retest"
+    },
+    {
+      "rule_id": "05-enter",
+      "trigger": {
+        "type": "pine_pattern",
+        "dir": "long"
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "ihs-uk-100-f51f2b53-enter",
+        "not_after": "2026-07-18T02:36:22.319817488Z",
+        "action": "enter",
+        "instrument": "UK 100",
+        "direction": "long",
+        "entry": {
+          "type": "stop",
+          "from": "signal_high",
+          "offset_pips": 0.0,
+          "offset_atr_pct": 0.5
+        },
+        "stop_loss": {
+          "from": "signal_low",
+          "offset_pips": 0.0,
+          "offset_atr_pct": 0.5
+        },
+        "take_profit": {
+          "absolute": 10656.73826
+        },
+        "broker": "tradenation",
+        "account": "reversals",
+        "requires_preps": [
+          "break-and-close",
+          "retest"
+        ],
+        "vetos": [
+          "too-low",
+          "too-high",
+          "trade-expiry"
+        ],
+        "entry_level_vetos": [
+          {
+            "name": "too-high",
+            "level": 10631.084434064487,
+            "past": "Above"
+          },
+          {
+            "name": "too-low",
+            "level": 10420.395423778971,
+            "past": "Below"
+          }
+        ],
+        "breakeven": {
+          "threshold": 0.5
+        },
+        "trade_id": "ihs-uk-100-f51f2b53",
+        "max_retries": 5,
+        "needs_golden": true,
+        "pip_size": 1.0,
+        "tick_size": 0.1
+      },
+      "kind": "enter"
+    },
+    {
+      "rule_id": "09-enter-qm",
+      "trigger": {
+        "type": "pine_pattern",
+        "dir": "long"
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "ihs-uk-100-f51f2b53-enter-qm",
+        "not_after": "2026-07-18T02:36:22.319817488Z",
+        "action": "enter",
+        "instrument": "UK 100",
+        "direction": "long",
+        "entry": {
+          "type": "limit",
+          "from": "signal_high",
+          "offset_pips": 0.0,
+          "recover_entry": {
+            "action": "stop"
+          }
+        },
+        "stop_loss": {
+          "from": "signal_low",
+          "offset_pips": 0.0,
+          "offset_atr_pct": 0.5
+        },
+        "take_profit": {
+          "absolute": 10656.73826
+        },
+        "broker": "tradenation",
+        "account": "reversals",
+        "vetos": [
+          "too-low",
+          "too-high",
+          "trade-expiry"
+        ],
+        "entry_level_vetos": [
+          {
+            "name": "too-high",
+            "level": 10631.084434064487,
+            "past": "Above"
+          },
+          {
+            "name": "too-low",
+            "level": 10420.395423778971,
+            "past": "Below"
+          }
+        ],
+        "breakeven": {
+          "threshold": 0.5
+        },
+        "trade_id": "ihs-uk-100-f51f2b53",
+        "max_retries": 5,
+        "needs_golden": true,
+        "needs_confirmed": true,
+        "pip_size": 1.0,
+        "tick_size": 0.1
+      },
+      "kind": "enter"
+    },
+    {
+      "rule_id": "07-close-on-sr-reversal",
+      "trigger": {
+        "type": "pine_pattern",
+        "dir": "short"
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "ihs-uk-100-f51f2b53-close-on-sr-reversal",
+        "not_after": "2026-07-17T03:00:00Z",
+        "action": "close",
+        "instrument": "UK 100",
+        "broker": "tradenation",
+        "account": "reversals",
+        "trade_id": "ihs-uk-100-f51f2b53",
+        "needs_golden": true,
+        "inside_window": [
+          "price"
+        ],
+        "sr_bands": [
+          [
+            10594.9944,
+            10616.2056
+          ],
+          [
+            10514.7747,
+            10535.8253
+          ]
+        ],
+        "reason": "support/resistance reversal"
+      },
+      "kind": "per_position_close"
+    },
+    {
+      "rule_id": "06-close-on-reversal",
+      "trigger": {
+        "type": "pine_pattern",
+        "dir": "short"
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "ihs-uk-100-f51f2b53-close-on-reversal",
+        "not_after": "2026-07-17T03:00:00Z",
+        "action": "close",
+        "instrument": "UK 100",
+        "broker": "tradenation",
+        "account": "reversals",
+        "trade_id": "ihs-uk-100-f51f2b53",
+        "needs_golden": true,
+        "inside_window": [
+          "news"
+        ],
+        "reason": "news-window reversal"
+      },
+      "kind": "per_position_close"
+    },
+    {
+      "rule_id": "01-pause-1784152800-1784181600",
+      "trigger": {
+        "type": "time_reached",
+        "at_epoch": 1784152800
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "ihs-uk-100-f51f2b53-pause-1784152800-1784181600",
+        "not_after": "2026-07-16T06:00:00Z",
+        "action": "pause",
+        "instrument": "UK 100",
+        "broker": "tradenation",
+        "account": "reversals",
+        "trade_id": "ihs-uk-100-f51f2b53",
+        "blackout_id": "1784152800-1784181600",
+        "reason": "news:UK 100-2026-07-15T22:00:00+00:00"
+      },
+      "kind": "control"
+    },
+    {
+      "rule_id": "02-resume-1784152800-1784181600",
+      "trigger": {
+        "type": "time_reached",
+        "at_epoch": 1784181600
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "ihs-uk-100-f51f2b53-resume-1784152800-1784181600",
+        "not_after": "2026-07-16T06:30:00Z",
+        "action": "resume",
+        "instrument": "UK 100",
+        "broker": "tradenation",
+        "account": "reversals",
+        "trade_id": "ihs-uk-100-f51f2b53",
+        "blackout_id": "1784152800-1784181600",
+        "reason": "news:UK 100-2026-07-15T22:00:00+00:00"
+      },
+      "kind": "control"
+    },
+    {
+      "rule_id": "01-news-start-1784181600-1784185200",
+      "trigger": {
+        "type": "time_reached",
+        "at_epoch": 1784181600
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "ihs-uk-100-f51f2b53-news-start-1784181600-1784185200",
+        "not_after": "2026-07-16T07:00:00Z",
+        "action": "news-start",
+        "instrument": "UK 100",
+        "broker": "tradenation",
+        "account": "reversals",
+        "trade_id": "ihs-uk-100-f51f2b53",
+        "news_id": "1784181600-1784185200",
+        "reason": "news:UK 100-2026-07-16T06:00:00+00:00"
+      },
+      "kind": "control"
+    },
+    {
+      "rule_id": "02-news-end-1784181600-1784185200",
+      "trigger": {
+        "type": "time_reached",
+        "at_epoch": 1784185200
+      },
+      "fire_mode": "once",
+      "intent": {
+        "v": 1,
+        "id": "ihs-uk-100-f51f2b53-news-end-1784181600-1784185200",
+        "not_after": "2026-07-16T07:30:00Z",
+        "action": "news-end",
+        "instrument": "UK 100",
+        "broker": "tradenation",
+        "account": "reversals",
+        "trade_id": "ihs-uk-100-f51f2b53",
+        "news_id": "1784181600-1784185200",
+        "reason": "news:UK 100-2026-07-16T06:00:00+00:00"
+      },
+      "kind": "control"
+    }
+  ],
+  "shadow": false,
+  "cross_buffer_pct": 0.0,
+  "cross_buffer_atr": 0.0,
+  "bcr_require_golden": false,
+  "retest_atr_step": 0.075,
+  "replay_start": 1783940400,
+  "armed_at": "2026-07-13T11:00:00Z",
+  "armed_sentiment": {
+    "period_start": "2026-07-10T11:00:00Z",
+    "period_end": "2026-07-13T11:00:00Z",
+    "overall_direction": "neutral",
+    "confidence": "low",
+    "currencies": []
+  }
+}

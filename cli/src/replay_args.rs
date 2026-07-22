@@ -285,6 +285,13 @@ pub struct ReplayArgs {
     #[arg(long)]
     pub check: bool,
 
+    /// Under `--test-mode`, recompute the outcome from the frozen plan + candles
+    /// and **overwrite** the fixture's `expected.json` with it. Use to re-bless a
+    /// fixture after an intended behaviour change (the new golden). Mutually
+    /// exclusive with `--check` (one verifies, the other rewrites).
+    #[arg(long, conflicts_with = "check")]
+    pub rebless: bool,
+
     /// Directory holding the saved fixtures. Defaults to `replay-fixtures` at the
     /// repo root (relative to the cli crate's manifest).
     #[arg(long)]

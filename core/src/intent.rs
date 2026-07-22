@@ -1985,6 +1985,37 @@ impl Shell {
         }
     }
 
+    /// The reversal-close **band anchor** for this shell's reversal candle —
+    /// the price the `07-close-on-sr-reversal` S/R-band test should key on
+    /// (open for engulfers, wick-50% for wick-rejection patterns). See
+    /// [`crate::signals::band_anchor`] for the per-pattern rule and the
+    /// replay==live rationale.
+    ///
+    /// Returns `None` when the shell can't produce it: no `signal_kind` (a
+    /// plain candle / control shell) or no `open` (a pre-`open` Pine chart).
+    ///
+    /// The signal direction is derived from the reversal candle's **body
+    /// colour**: a `Short` (bearish) reversal candle closes below its open, a
+    /// `Long` (bullish) one closes above. This is exact for a reversal candle —
+    /// the detector's short patterns all require a bearish body (engulfer
+    /// `is_bearish`; pinbar/tweezer body in the lower quartile), so body colour
+    /// agrees with the `LatchedSignal::direction` the engine passes to
+    /// [`crate::signals::band_anchor`] directly. A doji (`close == open`) only
+    /// matters for wick patterns and is treated as `Short` (upper-wick); the
+    /// midpoint math is symmetric enough that the tie-break is immaterial.
+    pub fn band_anchor(&self) -> Option<f64> {
+        let kind = self.signal_kind?;
+        let open = self.open?;
+        let signal_dir = if self.close > open {
+            Direction::Long
+        } else {
+            Direction::Short
+        };
+        Some(crate::signals::band_anchor(
+            kind, signal_dir, open, self.high, self.low, self.close,
+        ))
+    }
+
     /// Return the Pine-filled forward bar-close timestamp for `n` (1..=5),
     /// or `None` if `n` is out of range or the slot wasn't populated (e.g.
     /// `na` on a non-time-based chart, or a control/drawing shell that

@@ -254,6 +254,13 @@ pub fn load_expected(dir: &Path) -> Result<ReplayOutcome> {
     read_json(&dir.join(EXPECTED_FILE))
 }
 
+/// Overwrite only a fixture's `expected.json` with a freshly-computed outcome,
+/// leaving the frozen plan / candles / meta untouched. Used to **re-bless** a
+/// fixture after an intended behaviour change (`--test-mode --rebless`).
+pub fn save_expected(dir: &Path, expected: &ReplayOutcome) -> Result<()> {
+    write_json(&dir.join(EXPECTED_FILE), expected)
+}
+
 fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
     let json = serde_json::to_string_pretty(value)
         .wrap_err_with(|| format!("serialize {}", path.display()))?;

@@ -1148,7 +1148,7 @@ fn eval_pine_guard(
     // worker's OR gate would have closed it. That divergence rode the EUR_USD
     // short 2026-07-08 back to break-even (the 11:00 BNE golden bullish pinbar off
     // 1.14032 closed in-band but no news window was open). This matches live.
-    if !close_windows_pass(intent, candle, open_news_windows) {
+    if !close_windows_pass(intent, candle, &sig, open_news_windows) {
         return None;
     }
     Some(sig)
@@ -1158,10 +1158,19 @@ fn eval_pine_guard(
 /// `evaluate_close_gates`. Returns `true` when the close may fire: no window was
 /// configured, or at least one configured window passed. Returns `false` only
 /// when every configured window failed (news set but none open **and** price set
-/// but the candle's close is out of every band).
+/// but the reversal candle's **band anchor** is out of every band).
+///
+/// The price window tests the pattern-aware **band anchor** (the reversal
+/// candle's open for an engulfer, the wick-50% for a pinbar/tweezer) rather than
+/// the bare close — a candle that merely *fell into* the zone (close-in-band but
+/// opened above it) is continuation, not an off-the-level reversal. The worker's
+/// `run_close` tests the same anchor off the shell (`Shell::band_anchor`), so the
+/// two can't drift. See [`trade_control_core::signals::band_anchor`] and the
+/// UK 100 2026-07-17 case.
 fn close_windows_pass(
     intent: &trade_control_core::intent::Intent,
     candle: &Candle,
+    sig: &LatchedSignal,
     open_news_windows: &std::collections::BTreeSet<String>,
 ) -> bool {
     let wants_news = intent
@@ -1175,9 +1184,17 @@ fn close_windows_pass(
     // passes iff at least one news window is currently open.
     let news_passed = wants_news && !open_news_windows.is_empty();
     // Price window (pure half of `run_close`'s contextual window): the reversal
-    // candle's close is the proxy for the broker's live price. Passes iff that
-    // close sits inside one of the signed `sr_bands`.
-    let price_passed = wants_price && price_in_any_band(candle.c, &intent.sr_bands).is_some();
+    // candle's pattern-aware band anchor must sit inside one of the signed
+    // `sr_bands`. Mirrors `Shell::band_anchor` on the worker side.
+    let anchor = trade_control_core::signals::band_anchor(
+        sig.kind,
+        sig.direction,
+        candle.o,
+        candle.h,
+        candle.l,
+        candle.c,
+    );
+    let price_passed = wants_price && price_in_any_band(anchor, &intent.sr_bands).is_some();
 
     let any_set = wants_news || wants_price;
     let any_passed = news_passed || price_passed;
@@ -1187,6 +1204,7 @@ fn close_windows_pass(
         tracing::debug!(
             bar = %candle.time,
             close = candle.c,
+            anchor,
             news_passed,
             price_passed,
             any_set,
@@ -1196,6 +1214,7 @@ fn close_windows_pass(
         tracing::debug!(
             bar = %candle.time,
             close = candle.c,
+            anchor,
             wants_news,
             wants_price,
             bands = ?intent.sr_bands,
@@ -6796,6 +6815,10 @@ mod tests {
         // FIRE the close (dispatched to flatten any open position) but must NOT
         // retire the plan — a reversal-close is a per-position close, not a setup
         // invalidation, so the multi-shot spine stays alive to re-enter.
+        // The reversal candle (o=1.16 h=1.20 l=1.00 c=1.18) is detected as a
+        // bullish FloatingEngulfer, so its band anchor is the OPEN (1.16) — the
+        // point where price sat at/into the level before engulfing back up. The
+        // band contains 1.16.
         let p = plan(vec![close_on_reversal_rule(
             Direction::Long,
             Some([1.15, 1.20]),
@@ -6837,6 +6860,30 @@ mod tests {
             "a reversal outside every band must not fire the close"
         );
         assert!(!eval.done, "an out-of-band close must not retire the plan");
+        assert_eq!(eval.new_state.phase, Phase::AwaitEntry);
+    }
+
+    #[test]
+    fn close_on_reversal_declines_when_only_the_close_is_in_band_not_the_anchor() {
+        // The UK 100 2026-07-17 shape, in engine form (mirror direction). The
+        // bullish FloatingEngulfer's CLOSE (1.18) sits inside a band placed at
+        // [1.17, 1.19], but its pattern-aware anchor (the OPEN, 1.16) does NOT —
+        // the engulf carried price *through* the band to close inside it, rather
+        // than the open sitting *at* the level. That's the same
+        // anchor-out/close-in geometry as the UK 100 bearish case. The close
+        // must decline; under the old close-in-band rule it wrongly fired.
+        let p = plan(vec![close_on_reversal_rule(
+            Direction::Long,
+            Some([1.17, 1.19]),
+        )]);
+        let window = bullish_pinbar_window();
+        let prior = seed_at(Phase::AwaitEntry, "2026-06-16T10:00:00Z");
+        let eval = run_window(&p, &prior, &window[3..], &window);
+        assert!(
+            eval.fired.is_empty(),
+            "close-in-band but anchor-out-of-band must NOT fire (continuation, not reversal)"
+        );
+        assert!(!eval.done, "a declined close must not retire the plan");
         assert_eq!(eval.new_state.phase, Phase::AwaitEntry);
     }
 
@@ -7027,6 +7074,8 @@ mod tests {
         // With OR-composition the price gate alone fires it (news not open, price
         // in-band → any_passed). Non-terminal: the flatten dispatches, the spine
         // stays in AwaitEntry.
+        // Band contains the FloatingEngulfer's open anchor (1.16) — see
+        // `close_on_reversal_fires_on_a_long_reversal_in_the_band`.
         let p = plan(vec![news_and_price_close_on_reversal_rule(
             Direction::Long,
             [1.15, 1.20],

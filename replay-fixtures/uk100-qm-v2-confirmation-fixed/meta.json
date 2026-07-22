@@ -1,0 +1,7 @@
+{
+  "instrument": "UK 100",
+  "granularity": "h1",
+  "source": "tradenation",
+  "start": "2026-07-13T11:00:00Z",
+  "end": "2026-07-17T03:00:00Z"
+}

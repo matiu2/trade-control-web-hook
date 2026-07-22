@@ -1,5 +1,54 @@
 # Changelog
 
+## v111 — 2026-07-22 — S/R reversal-close tests a pattern-aware band anchor, not the close
+
+**Why.** `07-close-on-sr-reversal` closes an open position when a golden opposing
+reversal candle prints **off a drawn S/R level** — the candle's price must sit
+inside one of the intent's `sr_bands`. It used to test the candle's **close**,
+which fires on a bar that merely *fell into* the zone (continuation) rather than
+*bounced out of* it (the intended reversal). UK 100 long, 2026-07-17T01:00:00Z: a
+bearish engulfer `o=10551.7 h=10559.7 l=10532.1 c=10532.9` opened ~16 pts above
+the band `[10514.77, 10535.83]` (drawn line ~10525.3) and closed inside it — a
+continuation bar the close-in-band test wrongly flagged as an off-the-level
+reversal and flattened the trade at +1.47R instead of letting it run to expiry.
+
+**What changed (behaviour).** The band test now keys on the **pattern band
+anchor** — the part of the candle that is the rejection point for its pattern:
+
+- **Regular/floating engulfer** → the candle **open** (opened at/into the level,
+  engulfed back out).
+- **Pinbar / tweezer / double-tweezer** → the **wick-50%** midpoint (`Short`:
+  `body_top + (high-body_top)/2`; `Long`: `body_bot - (body_bot-low)/2`).
+
+One shared pure fn `trade_control_core::signals::band_anchor(kind, dir, o,h,l,c)`
+(`core/src/signals/band_anchor.rs`) is called by **both** the engine/replay
+(`close_windows_pass`, with the candle + `LatchedSignal`) and the live worker
+(`run_close` → `Shell::band_anchor()`, reading `signal_kind`+OHLC off the shell
+the cron engine builds), so replay == live. The worker no longer fetches
+`get_current_price` for the new `sr_bands` form; the deprecated
+`require_price_in_ranges` form keeps its live-price semantics (nothing emits it).
+
+**Breaking.** `close_windows_pass` gained a `sig: &LatchedSignal` parameter
+(internal to `engine`). `Shell::band_anchor(&self) -> Option<f64>` added. No wire
+/ signed-body change — no new fields; the shell already carries `signal_kind` and
+`open`.
+
+**Config.** None.
+
+**Tests.** `band_anchor` unit tests (engulfer=open, short/long pinbar=wick-50%,
+tweezer/double follow pinbar); worker `engulfer_that_closed_into_band_but_opened_above_does_not_close`;
+engine `close_on_reversal_declines_when_only_the_close_is_in_band_not_the_anchor`;
+updated the existing engine + replay close-reversal tests' bands to the anchor
+point; the UK 100 fixture (`uk100-qm-v2-confirmation-fixed`) re-blessed — its
+erroneous 07-17 SR-close is gone, Net R +1.47 → +0.00. New `replay-candles
+--test-mode --fixture <name> --rebless` recomputes+overwrites a fixture's
+`expected.json` (mutually exclusive with `--check`).
+
+**Follow-up.** `reversal_band_pct` default (0.1%) width is orthogonal to *which
+point* is tested and unchanged; a separate look at ±10.5 pt band width on indices
+is worth doing. The engulfer anchor is the raw candle open (no gap-to-prior-close
+clamp) — revisit if a gapping engulfer ever anchors wrong.
+
 ## v110 — 2026-07-22 — SignalCriteria: fold the confirmed-first selection filters into one value
 
 **Why.** The confirmed-first scan (`first_confirmed_signal_at`) picks the *first*
