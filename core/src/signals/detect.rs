@@ -40,6 +40,14 @@ pub struct SignalGeometry {
     /// `signal_start_time`): bar `N` for a pinbar, `N-1` for tweezer / regular /
     /// floating, `N-2` for a double-tweezer.
     pub start_time: DateTime<Utc>,
+    /// The reversal-close **band anchor** — the price the
+    /// `07-close-on-sr-reversal` S/R-band test keys on for this signal. An
+    /// engulfer anchors on the **open of its first covered bar** (`N-1`); a
+    /// pinbar / tweezer on the print bar's **wick-50%**. Computed here because
+    /// the engulfer anchor needs the first bar, which only the detector has in
+    /// scope; carried onward on the shell so replay == live. See
+    /// [`crate::signals::band_anchor`].
+    pub band_anchor: f64,
 }
 
 /// A pattern that printed on a bar, with the size used for the golden test.
@@ -367,6 +375,19 @@ fn build(
         cur.time
     };
 
+    // Band anchor origin: for a regular/floating engulfer the anchor is the
+    // FIRST bar's open (`N-1`), so the origin is `prev` (falling back to `cur` at
+    // the start of history). Pinbars key off the print bar's wick, so origin ==
+    // print; tweezers ignore the origin (wick pattern) — pass `cur` for both.
+    let origin = if (kind == SignalKind::RegularEngulfer || kind == SignalKind::FloatingEngulfer)
+        && let Some(p) = prev
+    {
+        p
+    } else {
+        cur
+    };
+    let band_anchor = crate::signals::band_anchor(kind, dir, origin, cur);
+
     Detected {
         direction: dir,
         geometry: SignalGeometry {
@@ -375,6 +396,7 @@ fn build(
             range: high - low,
             kind,
             start_time,
+            band_anchor,
         },
         size,
     }

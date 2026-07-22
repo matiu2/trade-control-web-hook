@@ -150,6 +150,7 @@ fn fixture_shell() -> Shell {
         signal_range: Some(0.0036),
         signal_start_time: Some("2026-05-26T09:00:00Z".parse().unwrap_or_default()),
         signal_kind: Some(SignalKind::Pinbar),
+        band_anchor: None,
         golden: Some(true),
         atr: Some(0.0012),
         signal_confirmed: Some(true),

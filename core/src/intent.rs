@@ -95,6 +95,15 @@ pub struct Shell {
         with = "signal_kind_serde"
     )]
     pub signal_kind: Option<SignalKind>,
+    /// The reversal-close **band anchor** for this signal — the price the
+    /// `07-close-on-sr-reversal` S/R-band test keys on (engulfer = open of the
+    /// pattern's first covered bar; pinbar / tweezer = print-bar wick-50%).
+    /// Computed in the detector (the engulfer anchor needs the first bar, which
+    /// only the detector has in scope) and folded on by
+    /// [`Self::from_candle_and_signal`]; the worker reads it in `run_close`.
+    /// `None` on plain-candle / control shells that carry no signal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub band_anchor: Option<f64>,
     /// True iff the latched signal is "golden" by the indicator's
     /// definition (close near the extreme, etc.). Pine emits 1/0 as a
     /// number — see `bool_one_zero_serde`.
@@ -1910,6 +1919,7 @@ impl Shell {
             signal_range: None,
             signal_start_time: None,
             signal_kind: None,
+            band_anchor: None,
             golden: None,
             atr: None,
             signal_confirmed: None,
@@ -1946,6 +1956,7 @@ impl Shell {
         shell.signal_range = Some(sig.signal_range);
         shell.signal_start_time = Some(sig.signal_start_time);
         shell.signal_kind = Some(sig.kind);
+        shell.band_anchor = Some(sig.band_anchor);
         shell.golden = Some(sig.golden);
         shell.signal_confirmed = Some(sig.signal_confirmed);
         shell.atr = sig.atr;
@@ -1986,34 +1997,17 @@ impl Shell {
     }
 
     /// The reversal-close **band anchor** for this shell's reversal candle —
-    /// the price the `07-close-on-sr-reversal` S/R-band test should key on
-    /// (open for engulfers, wick-50% for wick-rejection patterns). See
+    /// the price the `07-close-on-sr-reversal` S/R-band test keys on (engulfer =
+    /// open of the pattern's first covered bar; pinbar / tweezer = print-bar
+    /// wick-50%). Computed in the detector and folded on by
+    /// [`Self::from_candle_and_signal`]; the worker reads it in `run_close`. See
     /// [`crate::signals::band_anchor`] for the per-pattern rule and the
     /// replay==live rationale.
     ///
-    /// Returns `None` when the shell can't produce it: no `signal_kind` (a
-    /// plain candle / control shell) or no `open` (a pre-`open` Pine chart).
-    ///
-    /// The signal direction is derived from the reversal candle's **body
-    /// colour**: a `Short` (bearish) reversal candle closes below its open, a
-    /// `Long` (bullish) one closes above. This is exact for a reversal candle —
-    /// the detector's short patterns all require a bearish body (engulfer
-    /// `is_bearish`; pinbar/tweezer body in the lower quartile), so body colour
-    /// agrees with the `LatchedSignal::direction` the engine passes to
-    /// [`crate::signals::band_anchor`] directly. A doji (`close == open`) only
-    /// matters for wick patterns and is treated as `Short` (upper-wick); the
-    /// midpoint math is symmetric enough that the tie-break is immaterial.
+    /// Returns `None` on a plain-candle / control shell that carries no signal
+    /// (nothing to anchor).
     pub fn band_anchor(&self) -> Option<f64> {
-        let kind = self.signal_kind?;
-        let open = self.open?;
-        let signal_dir = if self.close > open {
-            Direction::Long
-        } else {
-            Direction::Short
-        };
-        Some(crate::signals::band_anchor(
-            kind, signal_dir, open, self.high, self.low, self.close,
-        ))
+        self.band_anchor
     }
 
     /// Return the Pine-filled forward bar-close timestamp for `n` (1..=5),
@@ -2148,6 +2142,7 @@ mod tests {
             signal_range: None,
             signal_start_time: None,
             signal_kind: None,
+            band_anchor: None,
             golden: None,
             atr: None,
             signal_confirmed: None,
@@ -2261,6 +2256,9 @@ mod tests {
             signal_bar_time: candle.time,
             golden: true,
             signal_confirmed: true,
+            // Short pinbar wick-50% on this candle: body_top 1.1200 +
+            // (high 1.3000 - 1.1200)/2 = 1.2100.
+            band_anchor: 1.2100,
             atr: Some(0.05),
             recent_high: Some(1.2500),
             recent_low: Some(1.0500),
@@ -2270,6 +2268,9 @@ mod tests {
         // OHLC still from the candle.
         assert_eq!(s.close, 1.1150);
         assert_eq!(s.open, Some(1.1200));
+        // The band anchor is folded straight from the signal.
+        assert_eq!(s.band_anchor, Some(1.2100));
+        assert_eq!(s.band_anchor(), Some(1.2100));
         // Pattern geometry folded on — the H&S enter anchors entry/SL to these.
         assert_eq!(s.signal_high, Some(1.3000));
         assert_eq!(s.signal_low, Some(1.1000));

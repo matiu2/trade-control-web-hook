@@ -1184,16 +1184,11 @@ fn close_windows_pass(
     // passes iff at least one news window is currently open.
     let news_passed = wants_news && !open_news_windows.is_empty();
     // Price window (pure half of `run_close`'s contextual window): the reversal
-    // candle's pattern-aware band anchor must sit inside one of the signed
-    // `sr_bands`. Mirrors `Shell::band_anchor` on the worker side.
-    let anchor = trade_control_core::signals::band_anchor(
-        sig.kind,
-        sig.direction,
-        candle.o,
-        candle.h,
-        candle.l,
-        candle.c,
-    );
+    // signal's pattern-aware band anchor (computed in the detector, carried on
+    // the latched signal — engulfer = first bar's open, pinbar = print wick-50%)
+    // must sit inside one of the signed `sr_bands`. Mirrors `Shell::band_anchor`
+    // on the worker side (both read the same detector-computed value).
+    let anchor = sig.band_anchor;
     let price_passed = wants_price && price_in_any_band(anchor, &intent.sr_bands).is_some();
 
     let any_set = wants_news || wants_price;
@@ -6816,12 +6811,12 @@ mod tests {
         // retire the plan — a reversal-close is a per-position close, not a setup
         // invalidation, so the multi-shot spine stays alive to re-enter.
         // The reversal candle (o=1.16 h=1.20 l=1.00 c=1.18) is detected as a
-        // bullish FloatingEngulfer, so its band anchor is the OPEN (1.16) — the
-        // point where price sat at/into the level before engulfing back up. The
-        // band contains 1.16.
+        // bullish FloatingEngulfer, so its band anchor is the open of the
+        // pattern's FIRST covered bar (N-1, o=1.10) — where the pair sat at the
+        // level before engulfing back up. The band contains 1.10.
         let p = plan(vec![close_on_reversal_rule(
             Direction::Long,
-            Some([1.15, 1.20]),
+            Some([1.05, 1.15]),
         )]);
         let window = bullish_pinbar_window();
         let prior = seed_at(Phase::AwaitEntry, "2026-06-16T10:00:00Z");
@@ -6867,11 +6862,11 @@ mod tests {
     fn close_on_reversal_declines_when_only_the_close_is_in_band_not_the_anchor() {
         // The UK 100 2026-07-17 shape, in engine form (mirror direction). The
         // bullish FloatingEngulfer's CLOSE (1.18) sits inside a band placed at
-        // [1.17, 1.19], but its pattern-aware anchor (the OPEN, 1.16) does NOT —
-        // the engulf carried price *through* the band to close inside it, rather
-        // than the open sitting *at* the level. That's the same
-        // anchor-out/close-in geometry as the UK 100 bearish case. The close
-        // must decline; under the old close-in-band rule it wrongly fired.
+        // [1.17, 1.19], but its band anchor (the first covered bar's open, 1.10)
+        // does NOT — the engulf carried price up through the band to close inside
+        // it, rather than the pair originating at the level. Same
+        // anchor-out/close-in geometry as the UK 100 bearish case. The close must
+        // decline; under the old close-in-band rule it wrongly fired.
         let p = plan(vec![close_on_reversal_rule(
             Direction::Long,
             Some([1.17, 1.19]),
@@ -6949,9 +6944,10 @@ mod tests {
         // reversal-close is a per-position close, not a setup invalidation — it must
         // dispatch (flatten any open position) but NEVER retire the spine, so the
         // pending / multi-shot enter keeps its window.
+        // Band contains the FloatingEngulfer's anchor (first covered bar's open, 1.10).
         let p = plan(vec![close_on_reversal_rule(
             Direction::Long,
-            Some([1.15, 1.20]),
+            Some([1.05, 1.15]),
         )]);
         let window = bullish_pinbar_window();
         let prior = seed_at(Phase::AwaitEntry, "2026-06-16T10:00:00Z");
@@ -7074,11 +7070,11 @@ mod tests {
         // With OR-composition the price gate alone fires it (news not open, price
         // in-band → any_passed). Non-terminal: the flatten dispatches, the spine
         // stays in AwaitEntry.
-        // Band contains the FloatingEngulfer's open anchor (1.16) — see
-        // `close_on_reversal_fires_on_a_long_reversal_in_the_band`.
+        // Band contains the FloatingEngulfer's anchor — the first covered bar's
+        // open (1.10) — see `close_on_reversal_fires_on_a_long_reversal_in_the_band`.
         let p = plan(vec![news_and_price_close_on_reversal_rule(
             Direction::Long,
-            [1.15, 1.20],
+            [1.05, 1.15],
         )]);
         let window = bullish_pinbar_window();
         let prior = seed_at(Phase::AwaitEntry, "2026-06-16T10:00:00Z");
@@ -7158,9 +7154,10 @@ mod tests {
         // re-enter. (The plan retires only via an invalidation veto / trade-expiry
         // / the enter window closing.) This is the operator's rule: "close any
         // open trades, but don't stop the retries."
+        // Band contains the FloatingEngulfer's anchor (first covered bar's open, 1.10).
         let p = plan(vec![close_on_reversal_rule(
             Direction::Long,
-            Some([1.15, 1.20]),
+            Some([1.05, 1.15]),
         )]);
         let window = bullish_pinbar_window();
         let prior = seed_at(Phase::AwaitEntry, "2026-06-16T10:00:00Z");

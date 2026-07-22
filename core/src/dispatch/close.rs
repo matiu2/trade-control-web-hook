@@ -535,12 +535,11 @@ mod reversal_exit_only_tests {
         ",
         )
         .expect("close intent parses");
-        // A reversal-candle shell (no needs_golden / needs_confirmed set on
-        // the intent, so the candle-quality gate is a no-op). The price window
-        // now tests the pattern-aware band anchor off this shell: a bearish
-        // regular engulfer anchors on its OPEN (1.0960), which sits inside the
-        // band [1.0950, 1.0970], so the price gate passes and the close reaches
-        // the (removed) veto-write site.
+        // A reversal-candle shell (no needs_golden / needs_confirmed set on the
+        // intent, so the candle-quality gate is a no-op). The price window tests
+        // the shell's `band_anchor` (computed in the detector, carried on the
+        // wire): 1.0960 sits inside the band [1.0950, 1.0970], so the price gate
+        // passes and the close reaches the (removed) veto-write site.
         let shell: Shell = serde_yaml::from_str(
             "
             open: 1.0960
@@ -549,6 +548,7 @@ mod reversal_exit_only_tests {
             low: 1.0950
             time: \"2026-05-13T12:00:00Z\"
             signal_kind: 3
+            band_anchor: 1.0960
         ",
         )
         .expect("shell parses");
@@ -586,15 +586,16 @@ mod reversal_exit_only_tests {
     }
 
     /// The UK 100 2026-07-17 shape: a bearish engulfer whose CLOSE lands inside
-    /// the band but whose OPEN is above it — price fell *into* the level
-    /// (continuation), not bounced *off* it. The pattern-aware anchor (= open
-    /// for an engulfer) is out of band, so the price gate fails and the position
-    /// is NOT flattened. Under the old close-in-band rule this wrongly closed.
+    /// the band but whose band anchor (its first bar's open, 1.0980) is above it
+    /// — price fell *into* the level (continuation), not bounced *off* it. The
+    /// anchor is out of band, so the price gate fails and the position is NOT
+    /// flattened. Under the old close-in-band rule this wrongly closed.
     #[test]
     fn engulfer_that_closed_into_band_but_opened_above_does_not_close() {
         let store = MemStateStore::default();
         let mut verified = armed_close();
-        // Open 1.0980 (above band top 1.0970), close 1.0960 (in band).
+        // band_anchor 1.0980 (the engulfer's first-bar open) is above band top
+        // 1.0970; the close 1.0960 is inside the band but is not what's tested.
         verified.shell = serde_yaml::from_str(
             "
             open: 1.0980
@@ -603,6 +604,7 @@ mod reversal_exit_only_tests {
             low: 1.0958
             time: \"2026-05-13T12:00:00Z\"
             signal_kind: 3
+            band_anchor: 1.0980
         ",
         )
         .expect("shell parses");
@@ -610,7 +612,7 @@ mod reversal_exit_only_tests {
         let result = pollster::block_on(run_close(&InBandBroker, &store, &verified, now()));
         assert!(
             matches!(result, ActionResult::Rejected { .. }),
-            "an engulfer that opened above the band (continuation) must NOT close, got {}",
+            "an engulfer whose anchor is above the band (continuation) must NOT close, got {}",
             result.describe()
         );
     }
