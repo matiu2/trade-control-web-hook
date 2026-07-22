@@ -661,7 +661,30 @@ fn confirmed_signal_ready(plan: &TradePlan, state: &PlanState, mid: &[Candle], i
         plan.granularity,
         explicit,
     );
-    first_confirmed_signal_at(mid, i, &cfg, plan.direction, None, confirmed_floor, None).is_some()
+    // Mirror the enter's golden requirement into the confirmed-first scan (the
+    // fire path passes `intent.needs_golden`), so this "would have entered"
+    // annotation can't disagree with the real decision by counting a non-golden
+    // confirmation the enter would never take. Read it off a confirmed enter rule
+    // (they share the plan-level requirement); default to gating on golden when a
+    // confirmed enter exists, matching production.
+    let want_golden = plan
+        .rules
+        .iter()
+        .find(|r| {
+            r.intent.action == trade_control_core::intent::Action::Enter && r.intent.needs_confirmed
+        })
+        .is_some_and(|r| r.intent.needs_golden);
+    first_confirmed_signal_at(
+        mid,
+        i,
+        &cfg,
+        plan.direction,
+        None,
+        want_golden,
+        confirmed_floor,
+        None,
+    )
+    .is_some()
 }
 
 /// Why a *marked* signal on this bar wasn't taken as an entry — the

@@ -1,5 +1,51 @@
 # Changelog
 
+## v109 — 2026-07-22 — confirmed-first scan skips a non-golden signal when the enter needs golden
+
+**Why.** A `--quasimodo` (confirmation-gated, golden-gated) enter could be stuck
+forever: on UK 100 iH&S 2026-07-14 every one of 9 golden Long signals was
+rejected and the setup never entered, even though the operator could see the
+21:00 (11:00Z) golden signal confirm two bars later. Root cause: the
+"first confirmed signal wins" scan (`first_confirmed_signal_at`) latches the
+*earliest* validating signal in scope and never advances (`first_confirmed_bar`
+is set once). An **early non-golden** Long confirmed at 05:00Z and permanently
+**shadowed** the golden Long confirming at 13:00Z. The enter needs golden, so its
+`pine_entry_dispatchable` pre-flight declined the non-golden winner — but a
+decline isn't a fire, so the re-entry watermark never moved and the scan re-picked
+the same non-golden signal forever. (The trace's "requires confirmation" line was
+a red herring — `enter_preconditions_by_leg` prints that static label for any
+un-fired `needs_confirmed` leg; it doesn't check whether a confirmed signal
+actually exists.)
+
+**What changed (behaviour).** `first_confirmed_signal_at` gains a `want_golden:
+bool` filter on the **winner-slot claim**, exactly mirroring the existing
+`want_dir`/`want_kind` filters. A non-golden signal is still *tracked* (it can
+invalidate / golden-protect others) — it just can't *claim the slot* when the
+enter demands golden, so the scan advances to the first confirmed **golden**
+signal. Threaded from `intent.needs_golden`:
+- `engine::evaluate::eval_pine_entry` gains a `needs_golden` param, passed to the
+  scan on the `confirmed_first` path (unused on the guard's `latched_signal_at`
+  path).
+- The enter call passes `rule.intent.needs_golden`; the reversal-close guard
+  passes `false`.
+- The replay's `confirmed_signal_ready` "would-have-entered" annotation reads
+  `needs_golden` off a confirmed enter rule so it can't disagree with the fire
+  path.
+
+**Breaking (internal API).** `first_confirmed_signal_at` and
+`eval_pine_entry` each gain one `bool` parameter. No wire/serde change.
+
+**Tests.** New `non_golden_confirmation_does_not_shadow_a_later_golden` in
+`core/src/signals/state_machine.rs` uses the **real** UK 100 H1 candles from the
+incident: asserts the baseline (`want_golden=false`) picks the 03:00Z non-golden
+Long, and the fix (`want_golden=true`) picks the 11:00Z golden Long, confirmed +
+firing on its 13:00Z bar with its own geometry. All 2084 workspace tests pass.
+
+**Follow-up.** `enter_preconditions_by_leg`'s `NeedsConfirmation` reason is still a
+static per-leg label, not the true "no confirmed golden signal yet" cause — a
+cosmetic report improvement could make the `not-taken:` line say why more
+precisely. Not done here (behaviour-neutral).
+
 ## v108 — 2026-07-22 — `--bcr-require-golden`: break/retest candle must be golden (range ≥ ATR)
 
 **Why.** Operator request: require the **break-and-close** (`03`) and **retest**

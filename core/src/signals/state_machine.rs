@@ -313,12 +313,33 @@ pub fn latched_signal_at(
 /// watermark (the first confirmed signal in scope wins, the single-shot / first-
 /// entry case). Both bounds compose: a winner must satisfy `>= not_before` **and**
 /// `> after`.
+///
+/// `want_golden` gates the winner slot the same way `want_dir`/`want_kind` do:
+/// when the enter demands a golden signal (`intent.needs_golden`), a **non-golden**
+/// confirmed signal must not *claim* the slot — it is still tracked (a non-golden
+/// signal participates in the golden-protect invalidation of others), but only a
+/// golden confirmed signal wins. This is essential, not cosmetic: "first confirmed
+/// wins" latches the earliest validating signal forever (`first_confirmed_bar` is
+/// set once). Without the golden filter, an early non-golden confirmation
+/// permanently shadows a later golden one the enter actually wants, and the
+/// caller's non-golden `pine_entry_dispatchable` decline never advances the
+/// re-entry watermark (a decline isn't a fire) — so the enter is stuck forever
+/// on a signal it will always reject. Caught on UK 100 iH&S `--quasimodo`
+/// 2026-07-14: a non-golden Long confirmed at 05:00Z and shadowed the golden Long
+/// that confirmed at 13:00Z. `false` = no golden requirement (the guard/close and
+/// `--skip-golden` enters); mirrors the caller's own `needs_golden` gate so
+/// "first confirmed" means "first confirmed signal the enter would actually take".
+// Each argument is a distinct scan filter (dir / kind / golden / floor / watermark)
+// that the caller sets independently — folding them into a struct would obscure the
+// call sites more than it helps, so allow the arity like `update_tracked` does.
+#[allow(clippy::too_many_arguments)]
 pub fn first_confirmed_signal_at(
     candles: &[Candle],
     as_of: usize,
     cfg: &DetectorConfig,
     want_dir: Direction,
     want_kind: Option<SignalKind>,
+    want_golden: bool,
     not_before: Option<DateTime<Utc>>,
     after: Option<DateTime<Utc>>,
 ) -> Option<LatchedSignal> {
@@ -374,7 +395,15 @@ pub fn first_confirmed_signal_at(
                 // confirmed signal must advance to the next one, not re-take the
                 // consumed signal forever.
                 let after_watermark = after.is_none_or(|w| candles[t.signal_bar].time > w);
-                if freshly_valid && matches && in_scope && after_watermark {
+                // ...and, when the enter demands golden, only a golden signal may
+                // CLAIM the slot. A non-golden signal is still tracked above (it can
+                // invalidate / protect others), it just can't win — otherwise an
+                // early non-golden confirmation latches `first_confirmed_bar` and
+                // permanently shadows a later golden one the enter actually takes
+                // (UK 100 --quasimodo 2026-07-14). Mirrors the `want_dir`/`want_kind`
+                // filter: tracked-but-not-claimable.
+                let golden_ok = !want_golden || t.golden;
+                if freshly_valid && matches && in_scope && after_watermark && golden_ok {
                     first_confirmed_bar = Some(t.signal_bar);
                     confirmed_on = Some(bar);
                     break;
@@ -739,8 +768,17 @@ mod tests {
         // (110) is the base the entry anchors to — with fires=true on the
         // confirmation bar.
         let candles = two_short_engulfers_first_confirms();
-        let f = first_confirmed_signal_at(&candles, 3, &cfg(), Direction::Short, None, None, None)
-            .expect("first-confirmed");
+        let f = first_confirmed_signal_at(
+            &candles,
+            3,
+            &cfg(),
+            Direction::Short,
+            None,
+            false,
+            None,
+            None,
+        )
+        .expect("first-confirmed");
         assert_eq!(f.direction, Direction::Short);
         assert!(f.signal_confirmed, "first signal is confirmed");
         assert!(f.fires, "fires on the confirmation bar");
@@ -757,14 +795,31 @@ mod tests {
         let candles = two_short_engulfers_first_confirms();
         // bar 2: bar 1 not yet resolved (bars_elapsed = 1) → nothing confirmed.
         assert!(
-            first_confirmed_signal_at(&candles, 2, &cfg(), Direction::Short, None, None, None)
-                .is_none(),
+            first_confirmed_signal_at(
+                &candles,
+                2,
+                &cfg(),
+                Direction::Short,
+                None,
+                false,
+                None,
+                None
+            )
+            .is_none(),
             "no confirmation before the window closes"
         );
         // bar 3: confirmed, fires.
-        let at3 =
-            first_confirmed_signal_at(&candles, 3, &cfg(), Direction::Short, None, None, None)
-                .expect("confirmed at 3");
+        let at3 = first_confirmed_signal_at(
+            &candles,
+            3,
+            &cfg(),
+            Direction::Short,
+            None,
+            false,
+            None,
+            None,
+        )
+        .expect("confirmed at 3");
         assert!(at3.fires, "fires on confirmation bar");
     }
 
@@ -777,9 +832,122 @@ mod tests {
         // declining, missing the confirmed short entirely).
         let candles = two_short_engulfers_first_confirms();
         assert!(
-            first_confirmed_signal_at(&candles, 3, &cfg(), Direction::Long, None, None, None)
-                .is_none(),
+            first_confirmed_signal_at(
+                &candles,
+                3,
+                &cfg(),
+                Direction::Long,
+                None,
+                false,
+                None,
+                None
+            )
+            .is_none(),
             "no confirmed LONG in a short-only window"
+        );
+    }
+
+    /// Real UK 100 H1 candles, 2026-07-13T13:00Z .. 2026-07-14T13:00Z (mid),
+    /// the `--quasimodo` iH&S window where every golden Long was rejected. A
+    /// **non-golden** Long confirms early (07-14 03:00Z prints, validates 05:00Z,
+    /// size ≈24 < ATR) and — under "first confirmed wins" — permanently shadows
+    /// the **golden** Long (07-14 11:00Z prints, validates 13:00Z, size 36.1).
+    /// The regression: a `want_golden` scan must skip the non-golden signal and
+    /// return the golden one confirming at 13:00Z.
+    fn uk100_quasimodo_golden_shadow() -> Vec<Candle> {
+        vec![
+            // ATR warmup tail (H1 ATR length 24) so the golden test is honest.
+            k("2026-07-12T23:00:00Z", 10509.5, 10509.9, 10502.1, 10508.9),
+            k("2026-07-13T00:00:00Z", 10508.2, 10520.0, 10494.7, 10496.8),
+            k("2026-07-13T01:00:00Z", 10497.2, 10498.4, 10479.8, 10485.7),
+            k("2026-07-13T02:00:00Z", 10485.7, 10493.0, 10478.7, 10478.8),
+            k("2026-07-13T03:00:00Z", 10478.9, 10479.7, 10467.5, 10472.2),
+            k("2026-07-13T04:00:00Z", 10472.3, 10477.5, 10463.0, 10464.0),
+            k("2026-07-13T05:00:00Z", 10463.5, 10478.8, 10450.8, 10474.0),
+            k("2026-07-13T06:00:00Z", 10473.8, 10501.8, 10466.5, 10495.5),
+            k("2026-07-13T07:00:00Z", 10496.0, 10533.5, 10477.3, 10486.5),
+            k("2026-07-13T08:00:00Z", 10486.8, 10515.8, 10474.5, 10515.8),
+            k("2026-07-13T09:00:00Z", 10516.0, 10518.8, 10489.5, 10496.0),
+            k("2026-07-13T10:00:00Z", 10496.3, 10497.3, 10469.2, 10480.4),
+            k("2026-07-13T11:00:00Z", 10480.7, 10500.4, 10473.3, 10475.7),
+            k("2026-07-13T12:00:00Z", 10476.0, 10491.9, 10463.9, 10490.9),
+            k("2026-07-13T13:00:00Z", 10491.2, 10521.5, 10474.8, 10516.1),
+            k("2026-07-13T14:00:00Z", 10516.3, 10517.5, 10468.0, 10504.7),
+            k("2026-07-13T15:00:00Z", 10505.0, 10506.0, 10485.6, 10494.2),
+            k("2026-07-13T16:00:00Z", 10494.0, 10502.2, 10470.4, 10488.8),
+            k("2026-07-13T17:00:00Z", 10489.3, 10506.9, 10488.8, 10497.5),
+            k("2026-07-13T18:00:00Z", 10497.8, 10502.2, 10487.9, 10497.1),
+            k("2026-07-13T19:00:00Z", 10497.6, 10502.4, 10488.9, 10501.4),
+            k("2026-07-13T20:00:00Z", 10498.5, 10501.4, 10490.8, 10492.7),
+            k("2026-07-13T22:00:00Z", 10496.9, 10500.4, 10489.7, 10490.7),
+            k("2026-07-13T23:00:00Z", 10490.6, 10492.4, 10480.8, 10491.7),
+            k("2026-07-14T00:00:00Z", 10498.5, 10500.7, 10427.8, 10444.4),
+            k("2026-07-14T01:00:00Z", 10444.3, 10469.5, 10431.2, 10438.1),
+            k("2026-07-14T02:00:00Z", 10438.2, 10462.1, 10437.5, 10450.1),
+            k("2026-07-14T03:00:00Z", 10450.3, 10459.7, 10435.4, 10459.2),
+            k("2026-07-14T04:00:00Z", 10459.4, 10481.7, 10451.9, 10478.5),
+            k("2026-07-14T05:00:00Z", 10478.7, 10501.2, 10476.8, 10492.3),
+            k("2026-07-14T06:00:00Z", 10492.5, 10507.9, 10465.3, 10467.3),
+            k("2026-07-14T07:00:00Z", 10468.3, 10496.2, 10425.7, 10447.4),
+            k("2026-07-14T08:00:00Z", 10447.6, 10462.2, 10424.2, 10425.4),
+            k("2026-07-14T09:00:00Z", 10425.7, 10460.1, 10422.2, 10454.9),
+            k("2026-07-14T10:00:00Z", 10455.1, 10464.2, 10448.7, 10457.7),
+            k("2026-07-14T11:00:00Z", 10458.0, 10484.1, 10448.0, 10475.9),
+            k("2026-07-14T12:00:00Z", 10476.1, 10515.0, 10451.5, 10495.8),
+            k("2026-07-14T13:00:00Z", 10496.1, 10544.3, 10488.7, 10535.6),
+        ]
+    }
+
+    #[test]
+    fn non_golden_confirmation_does_not_shadow_a_later_golden() {
+        let candles = uk100_quasimodo_golden_shadow();
+        let c = DetectorConfig::pine_defaults(Granularity::H1);
+        let as_of = candles.len() - 1; // 07-14 13:00Z, the golden confirmation bar
+
+        // Baseline (want_golden = false): the non-golden early Long wins and
+        // permanently shadows the golden one. It printed at 07-14 03:00Z and is
+        // NOT golden — exactly the signal the golden-requiring enter can't take.
+        let no_gate = first_confirmed_signal_at(
+            &candles,
+            as_of,
+            &c,
+            Direction::Long,
+            None,
+            false,
+            None,
+            None,
+        )
+        .expect("some confirmed long without the golden gate");
+        assert!(
+            !no_gate.golden,
+            "baseline: the early non-golden Long claims the slot (golden={})",
+            no_gate.golden
+        );
+        assert_eq!(
+            no_gate.signal_bar_time,
+            ts("2026-07-14T03:00:00Z"),
+            "baseline winner is the 03:00Z non-golden signal"
+        );
+
+        // The fix (want_golden = true): the non-golden 03:00Z signal is skipped;
+        // the golden 11:00Z Long claims the slot and fires on its 13:00Z
+        // confirmation bar with its own geometry (high 10484.1 / low 10448.0).
+        let gated =
+            first_confirmed_signal_at(&candles, as_of, &c, Direction::Long, None, true, None, None)
+                .expect("the golden long is found once non-golden signals can't claim the slot");
+        assert!(gated.golden, "the winner is golden");
+        assert!(gated.signal_confirmed, "and confirmed");
+        assert!(gated.fires, "fires on its 13:00Z confirmation bar");
+        assert_eq!(
+            gated.signal_bar_time,
+            ts("2026-07-14T11:00:00Z"),
+            "the golden winner printed at 11:00Z"
+        );
+        assert!(
+            (gated.signal_high - 10484.1).abs() < 1e-6 && (gated.signal_low - 10448.0).abs() < 1e-6,
+            "carries the 11:00Z signal's own geometry: hi {} lo {}",
+            gated.signal_high,
+            gated.signal_low
         );
     }
 
@@ -799,6 +967,7 @@ mod tests {
                 &cfg(),
                 Direction::Short,
                 None,
+                false,
                 Some(floor),
                 None
             )
@@ -814,6 +983,7 @@ mod tests {
                 &cfg(),
                 Direction::Short,
                 None,
+                false,
                 Some(floor_incl),
                 None,
             )
@@ -862,8 +1032,17 @@ mod tests {
 
         // No watermark: A wins on its confirmation bar (bar 3), fires there, and
         // never fires again (frozen — the exact multi-shot bug).
-        let a = first_confirmed_signal_at(&candles, 3, &cfg(), Direction::Short, None, None, None)
-            .expect("A confirmed at bar 3");
+        let a = first_confirmed_signal_at(
+            &candles,
+            3,
+            &cfg(),
+            Direction::Short,
+            None,
+            false,
+            None,
+            None,
+        )
+        .expect("A confirmed at bar 3");
         assert!(a.fires, "A fires on its confirmation bar");
         assert!(
             (a.signal_high - 117.5).abs() < 1e-9,
@@ -877,9 +1056,17 @@ mod tests {
         let a_watermark = a.signal_bar_time;
         // Frozen: at bar 6, still A, no longer firing — this is what starves the
         // re-entry without the watermark.
-        let frozen =
-            first_confirmed_signal_at(&candles, 6, &cfg(), Direction::Short, None, None, None)
-                .expect("still A at bar 6");
+        let frozen = first_confirmed_signal_at(
+            &candles,
+            6,
+            &cfg(),
+            Direction::Short,
+            None,
+            false,
+            None,
+            None,
+        )
+        .expect("still A at bar 6");
         assert!((frozen.signal_high - 117.5).abs() < 1e-9);
         assert!(
             !frozen.fires,
@@ -896,6 +1083,7 @@ mod tests {
                 &cfg(),
                 Direction::Short,
                 None,
+                false,
                 None,
                 Some(a_watermark)
             )
@@ -908,6 +1096,7 @@ mod tests {
             &cfg(),
             Direction::Short,
             None,
+            false,
             None,
             Some(a_watermark),
         )
