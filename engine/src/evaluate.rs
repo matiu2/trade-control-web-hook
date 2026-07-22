@@ -764,25 +764,10 @@ fn evaluate_one_entry(
         return;
     }
 
-    // The explicit setup floor for a first-confirmed enter: the confirmed signal
-    // must print at/after the *later* of the break-and-close time and the
-    // replay-start cursor. This scopes "first confirmed" to the setup forming now,
-    // not an ancient warmup-era signal (the DE30 24979 case). Both are `None` on a
-    // QM enter with no break — in which case `eval_pine_entry` derives a fallback
-    // floor from the SHARED `detector_lookback_bars` depth (bug ①). It is NOT
-    // safe to fall through to "whole window in scope": the fetch-window depth
-    // varies by caller (a trendline-anchored plan reaches back to an old neckline
-    // on live *and* replay; a `--warmup-bars` replay is always deep), so an
-    // unbounded scan latches an ancient signal in a deep window but a recent one
-    // in a shallow window — the exact replay≠live split.
-    let confirmed_floor = [
-        state.break_close_at,
-        plan.replay_start
-            .and_then(|s| chrono::DateTime::from_timestamp(s, 0)),
-    ]
-    .into_iter()
-    .flatten()
-    .max();
+    // The explicit setup floor for a first-confirmed enter (see
+    // `confirmed_setup_floor`) — shared with the truthful `NeedsConfirmation`
+    // precondition check so the two can't disagree on which signals are in scope.
+    let confirmed_floor = confirmed_setup_floor(plan, state);
 
     // A `PinePattern` enter is decided by the stateful candle detector over the
     // back-window, not by a per-candle level cross. It also produces the latched
@@ -989,16 +974,18 @@ fn eval_pine_entry(
             cfg.granularity,
             confirmed_floor,
         );
-        first_confirmed_signal_at(
-            detector_window,
-            idx,
-            cfg,
+        // One value carries every winner-slot filter (direction / kind / golden /
+        // setup floor / re-entry watermark) built from this enter's own gates, so
+        // no filter can be dropped at the call site — the recurring "forgot a
+        // filter" bug class (DE30 / bug ① / QM multi-shot / UK 100 v109).
+        let crit = trade_control_core::signals::SignalCriteria {
             dir,
-            pattern,
-            needs_golden,
-            scan_floor,
-            confirmed_after,
-        )
+            kind: pattern,
+            require_golden: needs_golden,
+            not_before: scan_floor,
+            after: confirmed_after,
+        };
+        first_confirmed_signal_at(detector_window, idx, cfg, &crit)
     } else {
         latched_signal_at(detector_window, idx, cfg)
     };
@@ -1706,6 +1693,66 @@ fn retest_satisfied(plan: &TradePlan, state: &PlanState, entry_time: DateTime<Ut
     }
 }
 
+/// The explicit setup floor for a first-confirmed enter: a confirmed signal must
+/// print at/after the *later* of the break-and-close time and the replay-start
+/// cursor. Scopes "first confirmed" to the setup forming now, not an ancient
+/// warmup-era signal (the DE30 24979 case). `None` on a QM enter with no break —
+/// in which case the caller derives a fallback floor from the shared
+/// `detector_lookback_bars` depth (bug ①). Shared by the fire path
+/// ([`evaluate_one_entry`]) and the truthful `NeedsConfirmation` precondition
+/// check ([`leg_has_confirmed_signal`]) so the two can't disagree.
+fn confirmed_setup_floor(plan: &TradePlan, state: &PlanState) -> Option<DateTime<Utc>> {
+    [
+        state.break_close_at,
+        plan.replay_start
+            .and_then(|s| chrono::DateTime::from_timestamp(s, 0)),
+    ]
+    .into_iter()
+    .flatten()
+    .max()
+}
+
+/// Does this enter `rule` have a confirmed signal in scope on `bar`, per the
+/// SAME confirmed-first scan the fire path runs? Used to make the
+/// `NeedsConfirmation` precondition truthful: it's only outstanding when the scan
+/// genuinely finds nothing, not merely because the enter *is* `needs_confirmed`.
+/// Mirrors the criteria construction in [`eval_pine_entry`] (direction, golden,
+/// setup floor via [`confirmed_setup_floor`] + the shared `confirmed_scan_floor`
+/// fallback, and the re-entry watermark) so it can't drift from the real
+/// decision. Returns `false` (block stands) when the bar isn't in the window or
+/// the rule isn't a `PinePattern` enter.
+fn leg_has_confirmed_signal(
+    plan: &TradePlan,
+    state: &PlanState,
+    rule: &ConditionRule,
+    bar: DateTime<Utc>,
+    detector_window: &[Candle],
+) -> bool {
+    let Trigger::PinePattern { pattern, dir } = &rule.trigger else {
+        return false;
+    };
+    let Some(idx) = detector_window.iter().position(|c| c.time == bar) else {
+        return false;
+    };
+    let cfg = DetectorConfig::pine_defaults(plan.granularity);
+    let window_times: Vec<_> = detector_window.iter().map(|c| c.time).collect();
+    let scan_floor = trade_control_core::signals::confirmed_scan_floor(
+        &window_times,
+        idx,
+        &cfg,
+        plan.granularity,
+        confirmed_setup_floor(plan, state),
+    );
+    let crit = trade_control_core::signals::SignalCriteria {
+        dir: *dir,
+        kind: *pattern,
+        require_golden: rule.intent.needs_golden,
+        not_before: scan_floor,
+        after: state.last_confirmed_enter_at,
+    };
+    first_confirmed_signal_at(detector_window, idx, &cfg, &crit).is_some()
+}
+
 /// Why a `PinePattern` enter did **not** fire on a bar where its signal was
 /// otherwise present (golden, right direction) — the *precondition* gates that
 /// silently return before the enter can fire, and which produce **no**
@@ -1764,7 +1811,7 @@ pub fn enter_preconditions_unmet(
     // single-enter plan; multi-enter callers should prefer
     // `enter_preconditions_reason`, which respects the OR-across-legs structure.
     let mut blocks = Vec::new();
-    for leg in enter_preconditions_by_leg(plan, state, bar) {
+    for leg in enter_preconditions_by_leg(plan, state, bar, None) {
         for b in leg {
             if !blocks.contains(&b) {
                 blocks.push(b);
@@ -1789,6 +1836,7 @@ pub fn enter_preconditions_by_leg(
     plan: &TradePlan,
     state: &PlanState,
     bar: DateTime<Utc>,
+    detector_window: Option<&[Candle]>,
 ) -> Vec<Vec<EnterBlock>> {
     let mut legs = Vec::new();
     for rule in plan
@@ -1803,7 +1851,18 @@ pub fn enter_preconditions_by_leg(
         if state.phase == Phase::AwaitBreakAndClose && has_break_and_close(plan) {
             leg.push(EnterBlock::NeedsBreakAndClose);
         }
-        if rule.intent.needs_confirmed {
+        // Confirmation: only a *truthful* block. When a detector window is
+        // available, run the SAME confirmed-first scan the fire path uses and only
+        // report `NeedsConfirmation` if it finds no confirmed signal in scope for
+        // this leg — so the replay's "not taken" line stops printing "requires
+        // confirmation" on a bar where a signal has, in fact, confirmed (the UK
+        // 100 v109 red herring). With no window (the pure engine callers / tests)
+        // fall back to the static label, preserving the historical shape.
+        if rule.intent.needs_confirmed
+            && detector_window
+                .map(|w| !leg_has_confirmed_signal(plan, state, rule, bar, w))
+                .unwrap_or(true)
+        {
             leg.push(EnterBlock::NeedsConfirmation);
         }
         let requires_retest = if is_multi_enter(plan) {
@@ -1833,8 +1892,9 @@ pub fn enter_preconditions_reason(
     plan: &TradePlan,
     state: &PlanState,
     bar: DateTime<Utc>,
+    detector_window: Option<&[Candle]>,
 ) -> Option<String> {
-    let legs = enter_preconditions_by_leg(plan, state, bar);
+    let legs = enter_preconditions_by_leg(plan, state, bar, detector_window);
     if legs.is_empty() {
         return None;
     }
@@ -3551,12 +3611,14 @@ mod tests {
         state.break_close_at = Some(ts("2026-06-30T10:00:00Z"));
         // retest_seen_at still None → stop leg's retest gate shut.
 
-        let legs = enter_preconditions_by_leg(&p, &state, ts("2026-06-30T12:00:00Z"));
+        // No detector window here → the confirmation block falls back to its
+        // static label (the historical shape these assertions pin).
+        let legs = enter_preconditions_by_leg(&p, &state, ts("2026-06-30T12:00:00Z"), None);
         assert_eq!(legs.len(), 2, "one group per blocked enter leg: {legs:?}");
         assert!(legs.iter().any(|l| l == &[EnterBlock::NeedsRetest]));
         assert!(legs.iter().any(|l| l == &[EnterBlock::NeedsConfirmation]));
 
-        let reason = enter_preconditions_reason(&p, &state, ts("2026-06-30T12:00:00Z"))
+        let reason = enter_preconditions_reason(&p, &state, ts("2026-06-30T12:00:00Z"), None)
             .expect("both legs blocked");
         assert!(
             reason.contains(" or "),
@@ -3599,7 +3661,7 @@ mod tests {
         let mut state = PlanState::seed(Phase::AwaitEntry, ts("2099-01-01T00:00:00Z"));
         state.break_close_at = Some(ts("2026-06-30T10:00:00Z"));
 
-        let reason = enter_preconditions_reason(&p, &state, ts("2026-06-30T12:00:00Z"))
+        let reason = enter_preconditions_reason(&p, &state, ts("2026-06-30T12:00:00Z"), None)
             .expect("gates outstanding");
         assert!(reason.contains(" and "), "one leg, AND-joined: {reason:?}");
         assert!(
@@ -5729,6 +5791,53 @@ mod tests {
             (sig.signal_low - 110.0).abs() < 1e-9,
             "lo {}",
             sig.signal_low
+        );
+    }
+
+    #[test]
+    fn needs_confirmation_reason_is_truthful_with_a_detector_window() {
+        // The v109 red herring: `enter_preconditions` used to print "requires
+        // confirmation" for ANY un-fired `needs_confirmed` leg, even on a bar
+        // where a signal had in fact confirmed. With a detector window it now runs
+        // the real confirmed-first scan and only reports the block when nothing
+        // has confirmed.
+        let mut rule = pine_enter_rule(None, Direction::Short, false);
+        rule.intent.needs_confirmed = true;
+        let p = plan(vec![rule]);
+        let window = two_short_engulfers_window();
+        // Stay in AwaitEntry so the confirmation gate is the only thing outstanding.
+        let state = seed_at(Phase::AwaitEntry, "2026-06-16T11:00:00Z");
+
+        // Bar 2 (2026-06-16T11:00:00Z): short #1 has NOT confirmed yet
+        // (bars_elapsed = 1). Even WITH the window, the block stands — truthfully.
+        let legs_bar2 =
+            enter_preconditions_by_leg(&p, &state, ts("2026-06-16T11:00:00Z"), Some(&window));
+        assert!(
+            legs_bar2
+                .iter()
+                .any(|l| l.contains(&EnterBlock::NeedsConfirmation)),
+            "no confirmed signal yet at bar 2 → block stands: {legs_bar2:?}"
+        );
+
+        // Bar 3 (2026-06-16T12:00:00Z): short #1 confirms here. With the window the
+        // block is DROPPED (a confirmed signal exists) — no more red herring.
+        let legs_bar3 =
+            enter_preconditions_by_leg(&p, &state, ts("2026-06-16T12:00:00Z"), Some(&window));
+        assert!(
+            !legs_bar3
+                .iter()
+                .any(|l| l.contains(&EnterBlock::NeedsConfirmation)),
+            "a signal confirmed at bar 3 → confirmation block dropped: {legs_bar3:?}"
+        );
+
+        // Back-compat: with NO window (pure engine callers) the historical static
+        // label is preserved regardless of confirmation state.
+        let legs_none = enter_preconditions_by_leg(&p, &state, ts("2026-06-16T12:00:00Z"), None);
+        assert!(
+            legs_none
+                .iter()
+                .any(|l| l.contains(&EnterBlock::NeedsConfirmation)),
+            "no window → static label preserved: {legs_none:?}"
         );
     }
 
