@@ -1794,6 +1794,18 @@ replay-candles --plan plan.json --instrument gbp/aud \
   --start 2026-06-19T00:00 --end 2026-06-19T15:00 --save gbpaud-expiry-2026-06-19
 ```
 
+Pair `--save` with `--message "<note>"` to record **what the fixture is meant to
+model** — the scenario, the bug it pins, why the verdict is what it is. The note
+lands in the fixture's `meta.json` (`message` field) and is journalling-only —
+it's never read back into the replay, just there for a future reader if the
+golden ever breaks:
+
+```sh
+replay-candles --plan plan.json --instrument gbp/aud \
+  --start 2026-06-19T00:00 --end 2026-06-19T15:00 --save gbpaud-expiry-2026-06-19 \
+  --message "trade-expiry veto retires the plan before the 13:00 re-entry bar (v98)"
+```
+
 **Re-running a fixture offline.** `--test-mode --fixture <name>` loads the
 frozen plan + candles + meta and replays them with **no network, no env vars,
 no TradingView** — the candles come from `candles.json`, the granularity/window
