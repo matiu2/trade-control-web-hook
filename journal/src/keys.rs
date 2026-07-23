@@ -4,6 +4,7 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use crate::app::App;
+use crate::screen::Screen;
 
 /// A resolved intent from a key press.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -28,6 +29,10 @@ pub enum Action {
     PopupScroll(i32),
     PopupHome,
     PopupEnd,
+    /// Scroll the Replay report by N lines (negative = up).
+    ReplayScroll(i32),
+    ReplayHome,
+    ReplayEnd,
     None,
 }
 
@@ -68,6 +73,31 @@ pub fn map_key(app: &App, key: KeyEvent) -> Action {
         };
     }
 
+    // The Replay screen scrolls its (long) report: arrows + vim + page/home/end,
+    // the same bindings as the detail popup. The vim scroll keys (j/k/u/d/g/G)
+    // and arrows override their list-navigation meanings here (there's no list to
+    // move), so delete on this screen is `x` only (not `d`, which pages down).
+    // `←` back, `→`/`n` deeper, `r`/`l`/`i`/`x`/`q` keep working.
+    if app.screen == Screen::Replay {
+        const PAGE: i32 = 20;
+        return match key.code {
+            KeyCode::Up | KeyCode::Char('k') => Action::ReplayScroll(-1),
+            KeyCode::Down | KeyCode::Char('j') => Action::ReplayScroll(1),
+            KeyCode::PageUp | KeyCode::Char('u') => Action::ReplayScroll(-PAGE),
+            KeyCode::PageDown | KeyCode::Char(' ') => Action::ReplayScroll(PAGE),
+            KeyCode::Home | KeyCode::Char('g') => Action::ReplayHome,
+            KeyCode::End | KeyCode::Char('G') => Action::ReplayEnd,
+            KeyCode::Right | KeyCode::Enter | KeyCode::Char('n') => Action::Deeper,
+            KeyCode::Left => Action::Shallower,
+            KeyCode::Char('l') => Action::LoadTv,
+            KeyCode::Char('r') => Action::Replay,
+            KeyCode::Char('i') => Action::TogglePopup,
+            KeyCode::Char('x') => Action::RequestDelete,
+            KeyCode::Char('q') | KeyCode::Esc => Action::Quit,
+            _ => Action::None,
+        };
+    }
+
     match key.code {
         KeyCode::Char('q') | KeyCode::Esc => Action::Quit,
         KeyCode::Up | KeyCode::Char('k') => Action::SelectPrev,
@@ -101,6 +131,9 @@ pub fn apply(app: &mut App, action: Action) {
         Action::PopupScroll(delta) => app.scroll_popup(delta),
         Action::PopupHome => app.scroll_popup_home(),
         Action::PopupEnd => app.scroll_popup_end(),
+        Action::ReplayScroll(delta) => app.scroll_replay(delta),
+        Action::ReplayHome => app.scroll_replay_home(),
+        Action::ReplayEnd => app.scroll_replay_end(),
         Action::None => {}
     }
 }

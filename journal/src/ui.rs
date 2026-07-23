@@ -66,6 +66,7 @@ fn render_body(f: &mut Frame, app: &App, area: Rect) {
 fn render_footer(f: &mut Frame, app: &App, area: Rect) {
     let hints = match app.screen {
         Screen::List => "↑↓ move  →/n open  q quit",
+        Screen::Replay => "↑↓/jk scroll  ←/→ nav  r replay  l load-TV  i detail  x delete  q quit",
         Screen::Compare => "← back  l load-TV  r replay  s record  i detail  d/x delete  q quit",
         _ => "← back  →/n deeper  l load-TV  r replay  s record  i detail  d/x delete  q quit",
     };
@@ -267,5 +268,40 @@ mod tests {
             text.contains("Live (recorded)"),
             "side-by-side kept:\n{text}"
         );
+    }
+
+    #[test]
+    fn replay_screen_scrolls() {
+        let rows = parse_plan_list(LIST).unwrap();
+        let mut app = App::from_rows(rows);
+        app.select_to("hs-aud-cad-a07622da");
+        app.seed_current(PlanData {
+            detail: parse_plan_export(EXPORT).ok(),
+            export_json: Some(EXPORT.to_string()),
+            timeline_json: Some(TIMELINE.to_string()),
+            replay_report: Some(REPLAY.to_string()),
+            tv_loaded: true,
+            max_depth: 2,
+        });
+        app.set_screen(Screen::Replay);
+
+        // A short viewport so the 10-line report overflows and scroll matters.
+        let render = |app: &App| {
+            let mut term = Terminal::new(TestBackend::new(120, 8)).unwrap();
+            term.draw(|f| super::render(f, app)).unwrap();
+            term.backend()
+                .buffer()
+                .content()
+                .iter()
+                .map(|c| c.symbol())
+                .collect::<String>()
+        };
+
+        let top = render(&app);
+        assert!(top.contains("Replay report"), "titled:\n{top}");
+        // Scrolling to the end changes what's visible.
+        app.scroll_replay_end();
+        let bottom = render(&app);
+        assert_ne!(top, bottom, "scrolling should change the visible text");
     }
 }

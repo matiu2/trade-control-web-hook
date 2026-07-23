@@ -81,6 +81,8 @@ pub struct App {
     pub tick: u64,
     /// Vertical scroll offset (in lines) of the `i` detail popup.
     pub popup_scroll: u16,
+    /// Vertical scroll offset (in lines) of the Replay-screen report body.
+    pub replay_scroll: u16,
     /// The journal DB connection, opened lazily on the first `s` record and
     /// cached for the session (see [`App::record_db`]).
     record_db: Option<rusqlite::Connection>,
@@ -108,6 +110,7 @@ impl App {
             in_flight: HashSet::new(),
             tick: 0,
             popup_scroll: 0,
+            replay_scroll: 0,
             record_db: None,
         })
     }
@@ -459,6 +462,8 @@ impl App {
         if let Some(d) = self.data.get_mut(&trade_id) {
             d.replay_report = None;
         }
+        // A fresh report starts at the top.
+        self.replay_scroll = 0;
         self.start_replay(&trade_id);
     }
 
@@ -532,6 +537,24 @@ impl App {
     pub fn scroll_popup_end(&mut self) {
         self.popup_scroll = u16::MAX;
     }
+
+    /// Scroll the Replay report by `delta` lines (negative = up), clamped at 0.
+    /// The bottom is bounded by the render (won't scroll past the content).
+    pub fn scroll_replay(&mut self, delta: i32) {
+        let next = self.replay_scroll as i32 + delta;
+        self.replay_scroll = next.max(0) as u16;
+    }
+
+    /// Jump the Replay report to the top.
+    pub fn scroll_replay_home(&mut self) {
+        self.replay_scroll = 0;
+    }
+
+    /// Jump the Replay report to the bottom; the renderer pins it to the last
+    /// page (same convention as the popup End).
+    pub fn scroll_replay_end(&mut self) {
+        self.replay_scroll = u16::MAX;
+    }
 }
 
 /// Fetch + parse the plan list.
@@ -560,6 +583,7 @@ impl App {
             in_flight: HashSet::new(),
             tick: 0,
             popup_scroll: 0,
+            replay_scroll: 0,
             record_db: None,
         }
     }
