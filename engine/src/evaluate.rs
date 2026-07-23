@@ -243,7 +243,18 @@ pub fn evaluate_plan(
             break;
         }
 
-        // Sequential spine.
+        // Sequential spine. Frozen once a `StopNextEntry` invalidation has
+        // latched `entries_blocked`: no new entries, and the break/retest prep
+        // spine stops advancing (an entry-blocked setup won't place anything, so
+        // stamping further preps is pointless). The always-armed guards above
+        // still ran — in particular the per-position reversal-close, which must
+        // keep watching the open position. `Phase` is left where it was
+        // (`AwaitEntry`/`AwaitBreakAndClose`) so the plan is not retired; it ends
+        // the normal way (a terminal veto, `trade-expiry`, or `not_after`).
+        if state.entries_blocked {
+            state.watermark = Some(candle.time);
+            continue;
+        }
         match state.phase {
             Phase::AwaitBreakAndClose => {
                 evaluate_break_and_close(plan, &mut state, candle, detector_window, &mut fired);
@@ -568,7 +579,7 @@ fn evaluate_guards(
         if !is_guard(rule) || state.fired.contains(&rule.rule_id) {
             continue;
         }
-        if !armed_in_rule(rule, state.phase) {
+        if !armed_in_rule(rule, state.phase, state.entries_blocked) {
             continue;
         }
         // A `PinePattern` guard (the close-on-reversal close) is decided by the
@@ -619,24 +630,36 @@ fn evaluate_guards(
         };
         push_fire_signal(rule, candle, signal, fired);
         state.fired.insert(rule.rule_id.clone());
-        // Terminate decision. A cancel / invalidate veto (`too-high` / `too-low`
-        // invalidation, `trade-expiry`) is terminal — its trigger means the
-        // *setup* is dead, so the plan retires. A `06-close-on-reversal` is
-        // **never** terminal: it is a per-*trade* exit ("flatten any open
-        // position on a confirming reversal"), not a setup invalidation. The
-        // flatten is dispatched independently (`run_close` → `close_positions`,
-        // a no-op when flat), and the spine stays in `AwaitEntry` so a multi-shot
-        // plan can still re-enter on the next signal bar. The plan retires the
-        // normal way — a terminal invalidation veto, `trade-expiry`, or the
-        // enter's `not_after` window closing. (Closing a trade must not stop the
-        // retries: place → fill → close-on-reversal → re-enter is the whole point
-        // of multi-shot.)
+        // Terminate decision, split three ways:
+        //
+        // 1. A **terminal** setup-invalidation (`too-high` = `ClosePositions`,
+        //    `trade-expiry` / M/W abort = `CancelPending`) means the *setup* is
+        //    dead → the plan retires (`Phase::Done`).
+        // 2. A **`StopNextEntry`** setup-invalidation (`too-low` / pcl-exhausted)
+        //    is **entry-blocking only** (operator's rule): it must NOT retire the
+        //    plan, NOT touch the open position, and NOT stop monitoring. It
+        //    latches `entries_blocked` so new entries + the break/retest spine
+        //    freeze, while the per-position reversal-close stays armed to flatten
+        //    the open trade off a golden reversal near TP. The plan retires the
+        //    normal way (a terminal veto, `trade-expiry`, or the enter's
+        //    `not_after`). (XAU_XAG H1 2026-07-21: `too-low` used to retire the
+        //    plan at 19:00 and kill the close that would have fired at 22:00.)
+        // 3. A `06-/07-close-on-reversal` is **never** terminal: a per-position
+        //    exit. It flattens independently (`run_close → close_positions`, a
+        //    no-op when flat) and the spine lives on so a multi-shot plan can
+        //    re-enter. (Closing must not stop retries: place → fill → close →
+        //    re-enter is the whole point of multi-shot.)
+        //
+        // For (1) and (2) DON'T short-circuit: a same-bar non-terminal
+        // per-position close (later in the rule set) must still dispatch. Keep
+        // `phase` unchanged so that close stays armed; apply the Done / block
+        // latch once the whole bar's guards have fired.
         if guard_is_terminal(rule) {
-            // Record the retirement but DON'T short-circuit: a same-bar
-            // non-terminal per-position close (later in the rule set) must still
-            // dispatch. Keep `phase` unchanged so that close stays armed; apply
-            // Done once the whole bar's guards have fired.
-            terminal_fired = true;
+            if veto_retires_plan(rule) {
+                terminal_fired = true;
+            } else {
+                state.entries_blocked = true;
+            }
         }
         // Non-terminal guard fired (a reversal-close): keep scanning later rules
         // this bar, but it has latched so it won't re-fire.
@@ -2563,6 +2586,40 @@ fn guard_is_terminal(rule: &ConditionRule) -> bool {
     matches!(resolved_kind(rule), RuleKind::SetupInvalidation)
 }
 
+/// Whether a fired **setup-invalidation** guard should *retire the whole plan*
+/// (`Phase::Done`), as opposed to merely blocking future entries.
+///
+/// The split is by the veto's [`VetoLevel`](trade_control_core::intent::VetoLevel):
+///
+/// - **`StopNextEntry`** (e.g. `too-low` / pcl-exhausted — "price already ran
+///   most of the way to TP, don't open a *late* entry") is **entry-blocking
+///   only**. It must NOT retire the plan: an already-open position keeps running
+///   to its own SL/TP, and its monitoring stays live — in particular the
+///   per-position reversal-close (`07-close-on-sr-reversal`) must still be able
+///   to flatten it off a golden reversal near the TP-resistance band. Retiring
+///   the plan here (the historical behaviour) archived + cleared it and killed
+///   that close (XAU_XAG H1 2026-07-21: `too-low` at 19:00 killed the close that
+///   would have fired at 22:00). The engine instead latches
+///   [`PlanState::entries_blocked`](trade_control_core::plan_state::PlanState::entries_blocked)
+///   — new entries and the break/retest spine freeze, the close guard stays
+///   armed, and the plan retires the normal way (a `CancelPending`/
+///   `ClosePositions` veto, `trade-expiry`, or the enter's `not_after`).
+/// - **`CancelPending`** (`trade-expiry`, the M/W cancel/abort/overshoot vetos)
+///   and **`ClosePositions`** (`too-high` — price ran back past the shoulder,
+///   thesis dead) genuinely end the setup → terminal, retire the plan.
+///
+/// Only a [`RuleKind::SetupInvalidation`] guard reaches this; a per-position
+/// close is never terminal (its own caller handles it). A veto with no explicit
+/// level defaults to `StopNextEntry` (`VetoLevel::default()`), matching the
+/// worker's `dispatch_action`.
+fn veto_retires_plan(rule: &ConditionRule) -> bool {
+    use trade_control_core::intent::VetoLevel;
+    !matches!(
+        rule.intent.level.unwrap_or_default(),
+        VetoLevel::StopNextEntry
+    )
+}
+
 /// A control rule sets the worker's blackout / news-window KV state on a
 /// wall-clock `TimeReached` fire (pause/resume open and close a blackout;
 /// news-start/news-end open and close a news window). Always-armed but
@@ -2594,14 +2651,22 @@ fn is_retest(rule: &ConditionRule) -> bool {
 ///   2026-07-07).
 /// - **Per-position `Close` guards** (`PerPositionClose`, `06-close-on-reversal`)
 ///   need a position to act on, so they stay armed from `AwaitEntry` onward.
-///   Before entry there is nothing to close.
-fn armed_in_rule(rule: &ConditionRule, phase: Phase) -> bool {
+///   Before entry there is nothing to close. They **also** stay armed once
+///   `entries_blocked` is set — a `StopNextEntry` invalidation freezes new
+///   entries but leaves the open position running, and the reversal-close must
+///   keep watching it (XAU_XAG H1 2026-07-21). `entries_blocked` is only ever
+///   set from `AwaitEntry` (an entry can only be blocked after the spine reached
+///   the entry phase), so this widens the close's arming, never the terminal
+///   invalidation's.
+fn armed_in_rule(rule: &ConditionRule, phase: Phase, entries_blocked: bool) -> bool {
     if guard_is_terminal(rule) {
         // Setup invalidation — valid to fire in any phase, pre-break included.
         return true;
     }
-    // Per-position Close guard — needs an entry to have happened.
-    matches!(phase, Phase::AwaitEntry)
+    // Per-position Close guard — needs an entry to have happened (AwaitEntry),
+    // and stays armed through an entries-blocked freeze so it can still flatten
+    // the open position.
+    matches!(phase, Phase::AwaitEntry) || entries_blocked
 }
 
 #[cfg(test)]
@@ -2729,6 +2794,19 @@ mod tests {
             intent: intent(action),
             kind: RuleKind::Unspecified,
         }
+    }
+
+    /// A **terminal** veto rule — one whose `VetoLevel` is `ClosePositions` (the
+    /// real `too-high` invalidation) or `CancelPending` (`trade-expiry` / M/W
+    /// abort). These retire the plan (`Phase::Done`). Distinct from a bare
+    /// `rule(.., Action::Veto)` whose `level` is `None` → defaults to
+    /// `StopNextEntry`, which (post-XAU_XAG-2026-07-21) is **entry-blocking
+    /// only** and does NOT retire the plan. Tests that mean "this veto ends the
+    /// setup" must use this helper so the level matches production.
+    fn terminal_veto_rule(rule_id: &str, trigger: Trigger, fire_mode: FireMode) -> ConditionRule {
+        let mut r = rule(rule_id, trigger, fire_mode, Action::Veto);
+        r.intent.level = Some(trade_control_core::intent::VetoLevel::ClosePositions);
+        r
     }
 
     /// A complete short H&S `PinePattern` enter rule with signal-anchored
@@ -5045,11 +5123,10 @@ mod tests {
                 FireMode::EveryBar,
                 Action::Enter,
             ),
-            rule(
+            terminal_veto_rule(
                 "02-veto-trade-expiry",
                 Trigger::TimeReached { at_epoch: expiry },
                 FireMode::Once,
-                Action::Veto,
             ),
         ]);
         let prior = seed_at(Phase::AwaitEntry, "2026-06-16T13:00:00Z");
@@ -6530,7 +6607,7 @@ mod tests {
         // resolve-failed enter still fires — the plan wasn't abandoned. Tick 1's
         // pinbar can't resolve (stays AwaitEntry); tick 2 crosses the veto level
         // and the guard fires + finishes the plan.
-        let veto = rule(
+        let veto = terminal_veto_rule(
             "01-veto-too-high",
             Trigger::HorizontalCross {
                 level: 1.40,
@@ -6538,7 +6615,6 @@ mod tests {
                 bar: BarEvent::Intrabar,
             },
             FireMode::Once,
-            Action::Veto,
         );
         let p = plan(vec![pine_enter_rule_unresolvable_tp(), veto]);
         let window = bearish_pinbar_window();
@@ -6600,7 +6676,7 @@ mod tests {
                 FireMode::Once,
                 Action::Prep,
             ),
-            rule(
+            terminal_veto_rule(
                 "01-veto-too-high",
                 Trigger::HorizontalCross {
                     level: 1.22001,
@@ -6608,7 +6684,6 @@ mod tests {
                     bar: BarEvent::OnClose,
                 },
                 FireMode::Once,
-                Action::Veto,
             ),
         ]);
         let prior = seed_at(Phase::AwaitBreakAndClose, "2026-06-16T09:00:00Z");
@@ -6644,30 +6719,28 @@ mod tests {
         // act on, so it stays armed `AwaitEntry`-onward and must NOT fire while the
         // spine is still `AwaitBreakAndClose`. Widening the arming for invalidation
         // vetos must not drag the Close guard along with it.
-        assert!(!armed_in_rule(
-            &rule(
-                "06-close-on-reversal",
-                Trigger::PinePattern {
-                    pattern: None,
-                    dir: Direction::Long,
-                },
-                FireMode::Once,
-                Action::Close,
-            ),
-            Phase::AwaitBreakAndClose,
-        ));
-        assert!(armed_in_rule(
-            &rule(
-                "06-close-on-reversal",
-                Trigger::PinePattern {
-                    pattern: None,
-                    dir: Direction::Long,
-                },
-                FireMode::Once,
-                Action::Close,
-            ),
-            Phase::AwaitEntry,
-        ));
+        let close = rule(
+            "06-close-on-reversal",
+            Trigger::PinePattern {
+                pattern: None,
+                dir: Direction::Long,
+            },
+            FireMode::Once,
+            Action::Close,
+        );
+        assert!(!armed_in_rule(&close, Phase::AwaitBreakAndClose, false));
+        assert!(armed_in_rule(&close, Phase::AwaitEntry, false));
+        // A `StopNextEntry` invalidation freezes entries but leaves the open
+        // position running — the reversal-close stays armed even though the spine
+        // is not in AwaitEntry (it holds at whatever phase the block latched from,
+        // always AwaitEntry in practice). So `entries_blocked` arms it regardless.
+        assert!(
+            armed_in_rule(&close, Phase::AwaitEntry, true),
+            "reversal-close stays armed while entries are blocked"
+        );
+        // ...but the block must not resurrect it before there was ever a position
+        // (pre-break), the guard is still position-scoped.
+        assert!(!armed_in_rule(&close, Phase::AwaitBreakAndClose, false));
     }
 
     /// Guard-semantics truth table — one row per guard role tv-arm actually
@@ -6789,15 +6862,16 @@ mod tests {
                     want_terminal,
                     "{rule_id}/{label}: guard_is_terminal"
                 );
-                // Pre-break phase arms exactly the terminal setup-invalidations.
+                // Pre-break phase (no entries-block) arms exactly the terminal
+                // setup-invalidations.
                 assert_eq!(
-                    armed_in_rule(r, Phase::AwaitBreakAndClose),
+                    armed_in_rule(r, Phase::AwaitBreakAndClose, false),
                     want_armed_pre_break,
                     "{rule_id}/{label}: armed_in_rule(AwaitBreakAndClose)"
                 );
                 // Every guard is armed once we reach AwaitEntry.
                 assert!(
-                    armed_in_rule(r, Phase::AwaitEntry),
+                    armed_in_rule(r, Phase::AwaitEntry, false),
                     "{rule_id}/{label}: every guard is armed in AwaitEntry"
                 );
                 // A terminal setup-invalidation is armed in *every* phase, so its
@@ -6805,7 +6879,7 @@ mod tests {
                 // Close guard is armed in neither (false). Either way, Done ==
                 // pre-break.
                 assert_eq!(
-                    armed_in_rule(r, Phase::Done),
+                    armed_in_rule(r, Phase::Done, false),
                     want_armed_pre_break,
                     "{rule_id}/{label}: armed_in_rule(Done) matches the all-phases terminal rule"
                 );
@@ -6836,14 +6910,14 @@ mod tests {
         // Unspecified twin → legacy path → PerPositionClose (non-terminal, AwaitEntry-only).
         assert_eq!(resolved_kind(&r), RuleKind::PerPositionClose);
         assert!(!guard_is_terminal(&r));
-        assert!(!armed_in_rule(&r, Phase::AwaitBreakAndClose));
+        assert!(!armed_in_rule(&r, Phase::AwaitBreakAndClose, false));
 
         // Stamp it as a setup invalidation → the engine follows the stamp.
         r.kind = RuleKind::SetupInvalidation;
         assert_eq!(resolved_kind(&r), RuleKind::SetupInvalidation);
         assert!(guard_is_terminal(&r), "stamped kind must make it terminal");
         assert!(
-            armed_in_rule(&r, Phase::AwaitBreakAndClose),
+            armed_in_rule(&r, Phase::AwaitBreakAndClose, false),
             "stamped setup-invalidation arms pre-break, overriding the Close-action legacy read"
         );
     }
@@ -7041,16 +7115,20 @@ mod tests {
     }
 
     #[test]
-    fn same_bar_terminal_veto_does_not_shadow_a_per_position_close() {
-        // Replay↔live parity (USD/ZAR M15 2026-07-20). A terminal `too-low`
-        // invalidation veto and a non-terminal `07-close-on-sr-reversal` both
-        // trigger on the SAME reversal bar. The veto is FIRST in `plan.rules`
-        // (lower index) — exactly the collision that used to make the guard loop
-        // `state.phase = Done; return` before the close was reached, riding the
-        // position to SL. Live has no collision: the two alerts arrive
-        // independently, so the `stop-next-entry` veto blocks future entries while
-        // the separate `run_close` flattens the open position. Both effects must
-        // land on the bar. Assert BOTH fired and the plan then retires.
+    fn same_bar_stop_next_entry_veto_does_not_shadow_a_per_position_close() {
+        // Replay↔live parity (USD/ZAR M15 2026-07-20 + XAU_XAG H1 2026-07-21). A
+        // `too-low` (StopNextEntry / pcl-exhausted) veto and a non-terminal
+        // `07-close-on-sr-reversal` both trigger on the SAME reversal bar. The
+        // veto is FIRST in `plan.rules` (lower index) — the collision that used to
+        // make the guard loop `state.phase = Done; return` before the close was
+        // reached. Live has no collision: the `stop-next-entry` veto blocks future
+        // entries while the separate `run_close` flattens the open position.
+        //
+        // Post-XAU_XAG fix: a `too-low` is `StopNextEntry` → entry-blocking ONLY.
+        // It must NOT retire the plan (that would kill the close-guard on the still
+        // open position on LATER bars). So this bar: BOTH fire, the close
+        // dispatches the flatten, and the plan stays armed (`entries_blocked` set,
+        // phase still AwaitEntry) so the guard keeps watching.
         //
         // Geometry reuses `bullish_pinbar_window` (the golden long reversal on the
         // 11:00Z bar, low 1.00, band anchor 1.10 ∈ [1.05, 1.15]). The too-low
@@ -7065,6 +7143,11 @@ mod tests {
             FireMode::Once,
             Action::Veto,
         );
+        // A bare Action::Veto with level None defaults to StopNextEntry.
+        assert_eq!(
+            too_low.intent.level.unwrap_or_default(),
+            trade_control_core::intent::VetoLevel::StopNextEntry,
+        );
         let close = close_on_reversal_rule(Direction::Long, Some([1.05, 1.15]));
         // Veto BEFORE close in the rule list — reproduces the shadowing order.
         let p = plan(vec![too_low, close]);
@@ -7075,16 +7158,23 @@ mod tests {
         let ids: Vec<&str> = eval.fired.iter().map(|f| f.rule_id.as_str()).collect();
         assert!(
             ids.contains(&"07-close-on-sr-reversal") || ids.contains(&"06-close-on-reversal"),
-            "the per-position close must still fire on the same bar as the terminal veto, got {ids:?}"
+            "the per-position close must still fire on the same bar as the veto, got {ids:?}"
         );
         assert!(
             ids.contains(&"01-veto-too-low"),
-            "the terminal veto also fires, got {ids:?}"
+            "the stop-next-entry veto also fires, got {ids:?}"
         );
-        // The close dispatches to flatten (its own `run_close` does the exit);
-        // the terminal veto then retires the plan.
-        assert!(eval.done, "the terminal veto still retires the plan");
-        assert_eq!(eval.new_state.phase, Phase::Done);
+        // A StopNextEntry veto blocks entries but does NOT retire the plan — the
+        // close guard must stay alive for later bars.
+        assert!(
+            !eval.done,
+            "a StopNextEntry veto must not retire the plan (keeps the close alive)"
+        );
+        assert_eq!(eval.new_state.phase, Phase::AwaitEntry);
+        assert!(
+            eval.new_state.entries_blocked,
+            "the StopNextEntry veto latched entries_blocked"
+        );
     }
 
     /// A warm H1 window (≥ ATR-length = 24 flat bars) ending in a bullish pinbar
@@ -7145,6 +7235,65 @@ mod tests {
         );
         let sig = eval.fired[0].signal.expect("close carries geometry");
         assert!(sig.golden, "the fired reversal is golden");
+    }
+
+    #[test]
+    fn reversal_close_still_fires_on_a_later_bar_after_a_stop_next_entry_veto() {
+        // THE XAU_XAG 2026-07-21 REGRESSION, end-to-end across two ticks. A
+        // `too-low` (StopNextEntry) veto fires on an EARLIER bar, then a golden
+        // in-band opposing reversal prints on a LATER bar. The per-position
+        // `07-close-on-sr-reversal` MUST still fire and flatten the open position.
+        // Before the fix, the too-low set `Phase::Done` on tick 1 and the plan was
+        // archived/cleared, so the tick-2 close never fired and the trade rode to
+        // break-even/SL.
+        let window = warm_bullish_pinbar_window(0.20); // golden reversal on last bar (low 0.90)
+        let too_low = rule(
+            "01-veto-too-low",
+            // The bar just before the pinbar is 1.10/1.11/1.10/1.105 (see
+            // `warm_bullish_pinbar_window`). A level of 1.105 straddles it
+            // (high 1.11 ≥ 1.105 ≥ low 1.10) so the veto fires intrabar on tick 1.
+            // StopNextEntry by default (level None).
+            Trigger::PriceValueCross {
+                level: 1.105,
+                dir: CrossDir::Either,
+                bar: BarEvent::Intrabar,
+            },
+            FireMode::Once,
+            Action::Veto,
+        );
+        let close = golden_close_on_reversal_rule(Direction::Long, Some([0.95, 1.00]));
+        let p = plan(vec![too_low, close]);
+        let last = window.len() - 1;
+        let ctx = window.len() - 2; // the flat context bar just before the pinbar
+
+        // Tick 1: a flat context bar. It crosses the too-low level → the veto
+        // fires, latches `entries_blocked`, but the plan stays armed (NOT Done).
+        let prior = seed_at(Phase::AwaitEntry, "2026-06-17T07:00:00Z");
+        let eval1 = run_window(&p, &prior, &window[ctx..=ctx], &window[..=ctx]);
+        let ids1: Vec<&str> = eval1.fired.iter().map(|f| f.rule_id.as_str()).collect();
+        assert!(
+            ids1.contains(&"01-veto-too-low"),
+            "the too-low veto fires on tick 1, got {ids1:?}"
+        );
+        assert!(!eval1.done, "a StopNextEntry veto must not retire the plan");
+        assert!(
+            eval1.new_state.entries_blocked,
+            "the veto latched entries_blocked"
+        );
+        assert_eq!(eval1.new_state.phase, Phase::AwaitEntry, "plan stays armed");
+
+        // Tick 2: the golden in-band reversal pinbar. The close MUST fire even
+        // though entries are blocked — the whole point of the fix.
+        let eval2 = run_window(&p, &eval1.new_state, &window[last..], &window);
+        let ids2: Vec<&str> = eval2.fired.iter().map(|f| f.rule_id.as_str()).collect();
+        assert!(
+            ids2.contains(&"07-close-on-sr-reversal"),
+            "the reversal-close still fires a tick after the StopNextEntry veto, got {ids2:?}"
+        );
+        assert!(
+            !eval2.done,
+            "the close is non-terminal — the plan keeps living"
+        );
     }
 
     #[test]
@@ -7638,11 +7787,10 @@ mod tests {
     fn noteworthy_when_plan_finished() {
         // A trade-expiry guard fires and finishes the plan → noteworthy.
         let expiry = ts("2026-06-16T15:00:00Z").timestamp();
-        let p = plan(vec![rule(
+        let p = plan(vec![terminal_veto_rule(
             "02-veto-trade-expiry",
             Trigger::TimeReached { at_epoch: expiry },
             FireMode::Once,
-            Action::Veto,
         )]);
         let prior = seed_at(Phase::AwaitEntry, "2026-06-16T13:00:00Z");
         let c = candle("2026-06-16T16:00:00Z", 1.0, 1.0, 1.0, 1.0);

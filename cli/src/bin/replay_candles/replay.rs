@@ -1697,6 +1697,7 @@ mod tests {
                         "id": "expiry-intent",
                         "not_after": "2099-01-01T00:00:00Z",
                         "action": "veto",
+                        "level": "cancel-pending",
                         "instrument": "EUR_USD"
                     }}
                 }}]

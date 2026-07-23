@@ -132,6 +132,21 @@ pub struct PlanState {
     /// entries on USD/CHF 2026-06-26: the close fired 9h after `news-end`).
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     pub open_news_windows: BTreeSet<String>,
+    /// A `StopNextEntry`-level invalidation veto (e.g. `too-low` /
+    /// pcl-exhausted) has fired: **no new entries may be placed**, and the
+    /// break-and-close / retest spine is frozen — but the plan is **not**
+    /// retired. This is the operator's rule that such a veto is entry-blocking
+    /// ONLY: it must not touch an already-open position, and must not stop the
+    /// trade's monitoring. In particular the per-position reversal-close
+    /// (`07-close-on-sr-reversal`) stays armed so a golden reversal off the
+    /// TP-resistance band can still flatten the open trade for a partial win
+    /// (XAU_XAG H1 2026-07-21: `too-low` at 19:00 used to retire the plan and
+    /// kill the close that would have fired at 22:00). Higher-level vetos
+    /// (`CancelPending`/`ClosePositions`), `trade-expiry`, and the M/W aborts
+    /// are still terminal — they set [`Phase::Done`], not this latch. `false`
+    /// on any plan that never saw a StopNextEntry invalidation.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub entries_blocked: bool,
     /// Safety TTL — like [`MwState::expires_at`](crate::state::MwState), this
     /// just ages an orphaned row out; the authoritative end of a plan is its
     /// dispatch, a terminal veto, or the KV TTL on the plan itself.
@@ -177,6 +192,7 @@ impl PlanState {
             || self.last_confirmed_enter_at != prior.last_confirmed_enter_at
             || self.mw != prior.mw
             || self.open_news_windows != prior.open_news_windows
+            || self.entries_blocked != prior.entries_blocked
     }
 
     /// A fresh, never-ticked state for `phase`. The first engine tick seeds the
@@ -194,6 +210,7 @@ impl PlanState {
             last_confirmed_enter_at: None,
             mw: None,
             open_news_windows: BTreeSet::new(),
+            entries_blocked: false,
             expires_at,
         }
     }
@@ -367,5 +384,20 @@ mod tests {
         let mut rt = prior.clone();
         rt.retest_seen_at = Some(ts("2026-06-16T12:00:00Z"));
         assert!(rt.advanced_vs(&prior), "retest_seen_at stamp is an advance");
+    }
+
+    #[test]
+    fn entries_blocked_defaults_false_and_is_an_advance() {
+        let prior = prior_state();
+        assert!(
+            !prior.entries_blocked,
+            "a fresh state has no StopNextEntry veto latched"
+        );
+        let mut blocked = prior.clone();
+        blocked.entries_blocked = true;
+        assert!(
+            blocked.advanced_vs(&prior),
+            "latching entries_blocked is a meaningful state advance"
+        );
     }
 }

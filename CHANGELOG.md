@@ -1,5 +1,66 @@
 # Changelog
 
+## v115 — 2026-07-23 — StopNextEntry veto is entry-blocking only; it no longer retires the plan or kills the open-position reversal-close
+
+**Why.** A `too-low` (pcl-exhausted) veto fires when price has run ~80% to TP —
+which is exactly where the auto TP-resistance band sits. On XAU_XAG H1
+2026-07-21 (short entered 12:00 @ 70.146, TP 68.324) the `too-low` fired at
+19:00 and **retired the whole plan** (`Phase::Done` → cron archives + clears it).
+That killed the per-position `07-close-on-sr-reversal` guard, so a golden
+reversal off resistance at 22:00 (close 68.852, in the drawn S/R band) never
+fired — the trade rode to its break-even stop two days later instead of closing
+for a partial win. Operator's rule: a `too-low` veto must ONLY block future
+entries; it must not touch the open position, and must not stop the trade's
+monitoring.
+
+**Root cause.** The engine classified **all** `Action::Veto`/`Invalidate` guards
+as terminal (`Phase::Done`), regardless of `VetoLevel`. But the levels already
+encode the distinction (`cli/src/trade_patterns.rs`): `too-low`/pcl-exhausted =
+`StopNextEntry` (entry-block only, never touch a position), `too-high` =
+`ClosePositions` (thesis dead), `trade-expiry` / M-W abort = `CancelPending`.
+Retiring the plan on a `StopNextEntry` veto conflated "stop new entries" with
+"end the trade + its monitoring". Affects live + replay (the cron engine fires
+the reversal-close; it is not a standalone alert). Generalizes the v113 same-bar
+fix to the later-bar case.
+
+**What changed (behaviour).**
+- New `PlanState.entries_blocked: bool`. A `StopNextEntry`-level setup
+  invalidation now latches `entries_blocked` **instead of** `Phase::Done`. The
+  spine freezes (no new entries, no further break/retest stamps) but the plan is
+  NOT retired — the per-position reversal-close stays armed and can flatten the
+  open position off a golden reversal near TP. The plan retires the normal way (a
+  `CancelPending`/`ClosePositions` veto, `trade-expiry`, or the enter's
+  `not_after`).
+- `too-high` (`ClosePositions`) and `trade-expiry` / M-W aborts (`CancelPending`)
+  are **unchanged** — still terminal, still retire the plan.
+- Live: cron `persist_plan_state` keys off `eval.done` (stays false) → the plan
+  is persisted with `entries_blocked` set, not cleared; `handle_veto` still
+  writes the KV veto flag so `run_enter`'s `is_vetoed` blocks entries as before.
+  Replay: the driver's `if eval.done { break }` stays false → it keeps
+  evaluating, so the later reversal-close fire is produced.
+
+**Breaking.** None — `entries_blocked` is a serde-default `bool` on `PlanState`
+(old rows deserialize to `false`); the two new engine fns are private.
+
+**Config.** None. (Relies on the `VetoLevel` tv-arm already bakes: `too-low` =
+`stop-next-entry`, `too-high` = `close-positions`, `trade-expiry` =
+`close-positions`.)
+
+**Tests.** `plan_state::entries_blocked_defaults_false_and_is_an_advance`;
+engine `same_bar_stop_next_entry_veto_does_not_shadow_a_per_position_close`
+(renamed from the v113 test — now asserts NOT done + `entries_blocked`) and
+`reversal_close_still_fires_on_a_later_bar_after_a_stop_next_entry_veto`
+(two-tick end-to-end), both verified fail-without-fix. Five engine tests that
+meant "terminal veto" updated to a new `terminal_veto_rule` helper
+(`ClosePositions` level). Replay `expiry_plan` + gbpaud-expiry fixture given the
+explicit `close-positions` level tv-arm bakes on trade-expiry today. Live repro
+confirmed. (The `uk100-qm-v2-confirmation-fixed` fixture failure is pre-existing
+on clean HEAD, unrelated.)
+
+**Follow-up.** Re-bless / retire the stale `uk100-qm-v2-confirmation-fixed`
+fixture separately (its veto levels are inverted vs production and it already
+diverges pre-change).
+
 ## v114 — 2026-07-23 — Prep-free QM enter no longer floored past a pre-break golden (strategy-v2 confirmed-first)
 
 **Why.** On XAU_XAG H1 2026-07-21 a `--strategy-v2 --qm-entry=market` plan

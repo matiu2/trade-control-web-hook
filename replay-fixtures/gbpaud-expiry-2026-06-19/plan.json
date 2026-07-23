@@ -18,7 +18,8 @@
         "not_after": "2099-01-01T00:00:00Z",
         "action": "veto",
         "instrument": "GBP_AUD",
-        "broker": "oanda"
+        "broker": "oanda",
+        "level": "close-positions"
       }
     }
   ],
