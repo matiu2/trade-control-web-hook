@@ -51,8 +51,11 @@ WORKER_BIN_DIR="$HOME/.local/bin"
 # TradingView + the broker via candle-cache, not the worker), so the suffixed
 # copy is purely a convenience name — but installing per-env keeps it alongside
 # the other dev/staging tools.
-CLI_PACKAGES=(trade-control-cli tv-arm tv-news)
-CLI_BINARIES=(trade-control tv-arm tv-news replay-candles)
+# `journal` is the plan-journalling TUI. It never posts to the worker directly
+# — it drives the suffixed `trade-control-<env>` / `replay-candles-<env>` CLIs —
+# so it bakes only `BAKED_ENV_SUFFIX` (build.rs), no webhook.
+CLI_PACKAGES=(trade-control-cli tv-arm tv-news journal)
+CLI_BINARIES=(trade-control tv-arm tv-news replay-candles journal)
 
 # roll_native_worker <env-name> <suffix>
 #
