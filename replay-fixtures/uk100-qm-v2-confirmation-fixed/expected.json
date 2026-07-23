@@ -14,12 +14,6 @@
       }
     },
     {
-      "rule_id": "07-close-on-sr-reversal",
-      "action": "close",
-      "candle_time": "2026-07-14T15:00:00Z",
-      "candle_close": 10502.2
-    },
-    {
       "rule_id": "09-enter-qm",
       "action": "enter",
       "candle_time": "2026-07-14T15:00:00Z",
@@ -51,12 +45,6 @@
       "candle_close": 10471.3
     },
     {
-      "rule_id": "06-close-on-reversal",
-      "action": "close",
-      "candle_time": "2026-07-16T05:00:00Z",
-      "candle_close": 10471.3
-    },
-    {
       "rule_id": "02-news-end-1784181600-1784185200",
       "action": "news-end",
       "candle_time": "2026-07-16T06:00:00Z",
@@ -68,9 +56,11 @@
       "candle_time": "2026-07-16T08:00:00Z",
       "candle_close": 10478.3,
       "fill": {
-        "kind": "filled_open",
+        "kind": "stopped_out",
         "fill_at": "2026-07-16T09:00:00Z",
-        "entry_price": 10477.3
+        "entry_price": 10477.3,
+        "exit_at": "2026-07-20T18:00:00Z",
+        "exit_price": 10477.3
       }
     },
     {
@@ -80,13 +70,94 @@
       "candle_close": 10581.0
     },
     {
-      "rule_id": "02-veto-trade-expiry",
-      "action": "veto",
-      "candle_time": "2026-07-17T03:00:00Z",
-      "candle_close": 10520.0
+      "rule_id": "03-prep-break-and-close",
+      "action": "prep",
+      "candle_time": "2026-07-17T07:00:00Z",
+      "candle_close": 10609.8
+    },
+    {
+      "rule_id": "04-prep-retest",
+      "action": "prep",
+      "candle_time": "2026-07-17T08:00:00Z",
+      "candle_close": 10559.9
+    },
+    {
+      "rule_id": "07-close-on-sr-reversal",
+      "action": "close",
+      "candle_time": "2026-07-20T16:00:00Z",
+      "candle_close": 10498.0
+    },
+    {
+      "rule_id": "01-pause-1784584800-1784613600",
+      "action": "pause",
+      "candle_time": "2026-07-20T20:00:00Z",
+      "candle_close": 10461.4
+    },
+    {
+      "rule_id": "05-enter",
+      "action": "enter",
+      "candle_time": "2026-07-21T00:00:00Z",
+      "candle_close": 10462.5,
+      "suppressed_by": [
+        "1784584800-1784613600(news:UK 100-2026-07-20T22:00:00+00:00)"
+      ]
+    },
+    {
+      "rule_id": "02-resume-1784584800-1784613600",
+      "action": "resume",
+      "candle_time": "2026-07-21T05:00:00Z",
+      "candle_close": 10480.0
+    },
+    {
+      "rule_id": "01-news-start-1784613600-1784617200",
+      "action": "news-start",
+      "candle_time": "2026-07-21T05:00:00Z",
+      "candle_close": 10480.0
+    },
+    {
+      "rule_id": "02-news-end-1784613600-1784617200",
+      "action": "news-end",
+      "candle_time": "2026-07-21T06:00:00Z",
+      "candle_close": 10488.7
+    },
+    {
+      "rule_id": "05-enter",
+      "action": "enter",
+      "candle_time": "2026-07-21T08:00:00Z",
+      "candle_close": 10533.2,
+      "fill": {
+        "kind": "stopped_out",
+        "fill_at": "2026-07-21T09:00:00Z",
+        "entry_price": 10538.0,
+        "exit_at": "2026-07-21T13:00:00Z",
+        "exit_price": 10508.2
+      }
+    },
+    {
+      "rule_id": "05-enter",
+      "action": "enter",
+      "candle_time": "2026-07-21T12:00:00Z",
+      "candle_close": 10545.4
+    },
+    {
+      "rule_id": "05-enter",
+      "action": "enter",
+      "candle_time": "2026-07-21T14:00:00Z",
+      "candle_close": 10564.5,
+      "fill": {
+        "kind": "filled_open",
+        "fill_at": "2026-07-21T15:00:00Z",
+        "entry_price": 10574.7
+      }
+    },
+    {
+      "rule_id": "05-enter",
+      "action": "enter",
+      "candle_time": "2026-07-21T15:00:00Z",
+      "candle_close": 10598.1
     }
   ],
-  "done": true,
-  "final_phase": "done",
+  "done": false,
+  "final_phase": "await_entry",
   "warnings": []
 }

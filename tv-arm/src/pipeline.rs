@@ -1240,7 +1240,17 @@ fn build_trade_spec(
             needs_golden: !args.skip_golden,
             needs_confirmed: args.require_confirmation,
             close_on_news: !roles.news_pairs.is_empty(),
-            sr_reversal_ranges: build_sr_ranges(roles, args.reversal_band_pct),
+            // Chart-drawn S/R bands, plus (default-on) a one-sided band pinned
+            // to the take-profit so a reversal near TP flattens for a partial win
+            // rather than round-tripping to the stop. `07-close-on-sr-reversal`
+            // OR-fires across every band. H&S only — see `tp_resistance_band`.
+            sr_reversal_ranges: {
+                let mut bands = build_sr_ranges(roles, args.reversal_band_pct);
+                if !args.skip_tp_resistance {
+                    bands.push(tp_resistance_band(tp, direction, args.tp_resistance_pct));
+                }
+                bands
+            },
             veto_on_reversal: args.veto_on_reversal,
             needs_confirmed_close: false,
             // Populated from the chart's `<prep>-expiry` vertical lines —
@@ -1382,6 +1392,24 @@ fn build_sr_ranges(roles: &Roles, band_pct: f64) -> Vec<[f64; 2]> {
         .filter_map(|d| d.points.first().map(|p| p.price))
         .map(|price| [round5(price * (1.0 - pct)), round5(price * (1.0 + pct))])
         .collect()
+}
+
+/// One-sided S/R band pinned so its **far edge is the take-profit**, sitting on
+/// the approach side (toward entry). A golden reversal candle whose band-anchor
+/// lands inside it fires `07-close-on-sr-reversal`, closing the position for a
+/// partial win instead of round-tripping to the stop. H&S / iH&S only — the M/W
+/// path recomputes TP live and gets no auto band.
+///
+/// `pct` is a percent of the TP price (e.g. `0.1` = 0.1% wide). Returns
+/// `[lo, hi]` with `lo <= hi` as required by the `sr_bands` validator.
+fn tp_resistance_band(tp: f64, direction: Direction, pct: f64) -> [f64; 2] {
+    let width = (pct / 100.0) * tp;
+    match direction {
+        // Long: price rises into TP from below, so the band hangs just under it.
+        Direction::Long => [round5(tp - width), round5(tp)],
+        // Short: price falls into TP from above, so the band sits just over it.
+        Direction::Short => [round5(tp), round5(tp + width)],
+    }
 }
 
 fn round5(v: f64) -> f64 {
@@ -2723,6 +2751,98 @@ mod tests {
             }
             other => panic!("expected Fatal, got {:?}", other.map(|_| ())),
         }
+    }
+
+    #[test]
+    fn tp_resistance_band_long_far_edge_is_tp() {
+        // Long: band hangs just UNDER the TP (approach from below).
+        let tp = 1.20;
+        let [lo, hi] = tp_resistance_band(tp, Direction::Long, 0.1);
+        assert_eq!(hi, round5(tp), "far edge is the TP");
+        assert_eq!(lo, round5(tp - (0.1 / 100.0) * tp));
+        assert!(lo < hi, "lo < hi for a valid band");
+    }
+
+    #[test]
+    fn tp_resistance_band_short_far_edge_is_tp() {
+        // Short: band sits just OVER the TP (approach from above).
+        let tp = 1.00;
+        let [lo, hi] = tp_resistance_band(tp, Direction::Short, 0.1);
+        assert_eq!(lo, round5(tp), "far edge is the TP");
+        assert_eq!(hi, round5(tp + (0.1 / 100.0) * tp));
+        assert!(lo < hi, "lo < hi for a valid band");
+    }
+
+    #[test]
+    fn hs_default_adds_tp_resistance_band() {
+        // Short H&S: head 1.20 above neckline 1.10 → TP = 2·1.10 − 1.20 = 1.00.
+        // No drawn S/R lines, default flags → exactly one auto band whose far
+        // (lower, for a short) edge is the TP.
+        let roles = hs_roles(fib("fib", 1.20, 1.10), hline("inv", "too-high", 1.15));
+        let args = mw_args(&[]);
+        let (_dir, spec) = resolve_hs_trade(
+            &args,
+            &roles,
+            "EUR_USD",
+            "ms-oanda-1",
+            Broker::Oanda,
+            0.0001,
+            0.0001,
+        )
+        .expect("valid H&S resolves");
+        assert_eq!(
+            spec.sr_reversal_ranges.len(),
+            1,
+            "one auto band, no drawn S/R"
+        );
+        let [lo, _hi] = spec.sr_reversal_ranges[0];
+        assert_eq!(lo, round5(spec.tp_price), "short far edge (lo) == TP");
+    }
+
+    #[test]
+    fn hs_skip_tp_resistance_leaves_no_band() {
+        // Same setup, but --skip-tp-resistance and no drawn S/R → no bands, so
+        // no 07-close-on-sr-reversal alert gets emitted downstream.
+        let roles = hs_roles(fib("fib", 1.20, 1.10), hline("inv", "too-high", 1.15));
+        let args = mw_args(&["--skip-tp-resistance"]);
+        let (_dir, spec) = resolve_hs_trade(
+            &args,
+            &roles,
+            "EUR_USD",
+            "ms-oanda-1",
+            Broker::Oanda,
+            0.0001,
+            0.0001,
+        )
+        .expect("valid H&S resolves");
+        assert!(
+            spec.sr_reversal_ranges.is_empty(),
+            "no drawn S/R and band skipped"
+        );
+    }
+
+    #[test]
+    fn hs_drawn_sr_plus_auto_band() {
+        // A drawn support/resistance line contributes its own band; the auto TP
+        // band is appended alongside it → two bands total.
+        let mut roles = hs_roles(fib("fib", 1.20, 1.10), hline("inv", "too-high", 1.15));
+        roles.sr_levels = vec![hline("sr", "support", 1.05)];
+        let args = mw_args(&[]);
+        let (_dir, spec) = resolve_hs_trade(
+            &args,
+            &roles,
+            "EUR_USD",
+            "ms-oanda-1",
+            Broker::Oanda,
+            0.0001,
+            0.0001,
+        )
+        .expect("valid H&S resolves");
+        assert_eq!(
+            spec.sr_reversal_ranges.len(),
+            2,
+            "drawn band + auto TP band"
+        );
     }
 
     fn mw_roles(p: Drawing) -> Roles {
