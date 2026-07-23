@@ -76,6 +76,9 @@ pub struct App {
     pub tick: u64,
     /// Vertical scroll offset (in lines) of the `i` detail popup.
     pub popup_scroll: u16,
+    /// The journal DB connection, opened lazily on the first `s` record and
+    /// cached for the session (see [`App::record_db`]).
+    record_db: Option<rusqlite::Connection>,
 }
 
 /// Braille spinner frames for the "loading…" indicator.
@@ -100,6 +103,7 @@ impl App {
             in_flight: HashSet::new(),
             tick: 0,
             popup_scroll: 0,
+            record_db: None,
         })
     }
 
@@ -361,6 +365,57 @@ impl App {
         );
     }
 
+    /// Record the current plan's outcome to the journal DB (the `s` key). Only
+    /// meaningful once both outcomes are loaded, so it requires the replay
+    /// report (which implies the timeline/detail were fetched first). The
+    /// real-life and replay outcomes are stored in separate columns.
+    pub fn record_current(&mut self) {
+        let Some(trade_id) = self.current_plan().map(|p| p.trade_id.clone()) else {
+            return;
+        };
+        let Some(data) = self.data.get(&trade_id) else {
+            self.status = Status::error("open the plan first (→) before recording");
+            return;
+        };
+        let (Some(detail), Some(timeline), Some(replay)) = (
+            data.detail.as_ref(),
+            data.timeline_json.as_deref(),
+            data.replay_report.as_deref(),
+        ) else {
+            self.status =
+                Status::error("run the replay (→ to Replay) before recording — need both outcomes");
+            return;
+        };
+        let now = chrono::Utc::now().to_rfc3339();
+        let rec = crate::record::TradeRecord::from_plan(detail, timeline, replay, now);
+        match self.record_db() {
+            Ok(conn) => match crate::record::upsert(conn, &rec) {
+                Ok(_) => {
+                    self.status = Status::info(format!(
+                        "recorded {trade_id} — live: {} / replay net R: {}",
+                        rec.live_outcome,
+                        rec.replay_net_r.as_deref().unwrap_or("n/a"),
+                    ))
+                }
+                Err(e) => self.status = Status::error(format!("record: {e}")),
+            },
+            Err(e) => self.status = Status::error(format!("open journal db: {e}")),
+        }
+    }
+
+    /// The journal DB connection, opened + migrated lazily on first record and
+    /// cached for the session.
+    fn record_db(&mut self) -> Result<&rusqlite::Connection> {
+        if self.record_db.is_none() {
+            let path = crate::record::db_path();
+            self.record_db = Some(crate::record::open_db(&path)?);
+        }
+        // Safe: just ensured Some above.
+        self.record_db
+            .as_ref()
+            .ok_or_else(|| color_eyre::eyre::eyre!("journal db unavailable"))
+    }
+
     /// Request a replay re-run (the `r` key), bypassing the cache.
     pub fn rerun_replay(&mut self) {
         let Some(trade_id) = self.current_plan().map(|p| p.trade_id.clone()) else {
@@ -470,6 +525,7 @@ impl App {
             in_flight: HashSet::new(),
             tick: 0,
             popup_scroll: 0,
+            record_db: None,
         }
     }
 
@@ -506,6 +562,23 @@ impl App {
     /// Read the in-flight set size (test helper).
     pub fn in_flight_len(&self) -> usize {
         self.in_flight.len()
+    }
+
+    /// Point the journal DB at a fresh in-memory database (test helper) so
+    /// `record_current` writes there instead of `~/.config`.
+    pub fn use_in_memory_db(&mut self) {
+        let conn = rusqlite::Connection::open_in_memory().expect("in-memory db");
+        crate::record::migrate_for_test(&conn);
+        self.record_db = Some(conn);
+    }
+
+    /// Count rows in the journal DB (test helper). Panics if no DB is set.
+    pub fn recorded_count(&self) -> i64 {
+        self.record_db
+            .as_ref()
+            .expect("db set")
+            .query_row("SELECT COUNT(*) FROM trades", [], |r| r.get(0))
+            .expect("count")
     }
 }
 
@@ -572,5 +645,49 @@ mod tests {
     fn drain_noop_when_empty() {
         let mut app = App::from_rows(vec![row("t1")]);
         assert!(!app.drain_jobs());
+    }
+
+    const EXPORT: &str = include_str!("../tests/fixtures/plan_export.json");
+    const TIMELINE: &str = include_str!("../tests/fixtures/plan_timeline.json");
+    const REPLAY: &str = include_str!("../tests/fixtures/replay_report.txt");
+
+    /// Recording before the replay ran is rejected (need both outcomes), and no
+    /// row is written.
+    #[test]
+    fn record_requires_replay_report() {
+        let mut app = App::from_rows(vec![row("hs-aud-cad-a07622da")]);
+        app.use_in_memory_db();
+        app.seed_current(PlanData {
+            detail: parse_plan_export(EXPORT).ok(),
+            export_json: Some(EXPORT.to_string()),
+            timeline_json: Some(TIMELINE.to_string()),
+            replay_report: None, // replay not run yet
+            max_depth: 1,
+        });
+        app.record_current();
+        assert!(app.status.is_error, "no-replay record should error");
+        assert_eq!(app.recorded_count(), 0, "nothing written");
+    }
+
+    /// With both outcomes loaded, `s` writes exactly one row.
+    #[test]
+    fn record_writes_a_row_when_both_outcomes_present() {
+        let mut app = App::from_rows(vec![row("hs-aud-cad-a07622da")]);
+        app.use_in_memory_db();
+        app.seed_current(PlanData {
+            detail: parse_plan_export(EXPORT).ok(),
+            export_json: Some(EXPORT.to_string()),
+            timeline_json: Some(TIMELINE.to_string()),
+            replay_report: Some(REPLAY.to_string()),
+            max_depth: 3,
+        });
+        app.record_current();
+        assert!(!app.status.is_error, "record ok: {}", app.status.text);
+        assert!(app.status.text.contains("recorded"), "{}", app.status.text);
+        assert_eq!(app.recorded_count(), 1);
+
+        // Recording again upserts — still one row.
+        app.record_current();
+        assert_eq!(app.recorded_count(), 1, "re-record upserts, no duplicate");
     }
 }
