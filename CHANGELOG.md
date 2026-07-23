@@ -1,5 +1,55 @@
 # Changelog
 
+## v114 — 2026-07-23 — Prep-free QM enter no longer floored past a pre-break golden (strategy-v2 confirmed-first)
+
+**Why.** On XAU_XAG H1 2026-07-21 a `--strategy-v2 --qm-entry=market` plan
+skipped a golden short that printed at 10:00 and confirmed at ~13:00. The QM
+(Quasimodo) leg should have entered at market on that confirmation with good R;
+instead every later golden bar reported "requires confirmation (no confirmed
+signal yet)" and the plan only entered at 18:00 on a later, worse signal at
+R=0.557 (< the 1.0 floor → rejected). The 10:00 entry the operator wanted was
+silently lost.
+
+**Root cause (engine, shared by worker + replay).** `confirmed_setup_floor`
+scoped the confirmed-first signal scan to `max(break_close_at, replay_start)`
+**plan-global** — it never looked at *which* enter leg was being evaluated. Once
+the break-and-close prep stamped (12:00), every leg's scan floor jumped to
+12:00. The strategy-v2 QM leg is deliberately **prep-free** (`requires_preps ==
+[]`, skips break-and-close *and* retest), yet it inherited that floor, and
+`SignalCriteria::admits` (`print_time >= not_before`) then excluded the 10:00
+signal (printed before the break) from ever claiming the first-confirmed winner
+slot. The BCR stop leg legitimately wants the break floor; the QM leg must not.
+
+**What changed (behaviour).**
+- `confirmed_setup_floor` is now **per-leg**: it takes the enter `rule` and only
+  folds `break_close_at` in when that rule lists `break-and-close` in
+  `requires_preps` (new `PREP_STEP_BREAK_AND_CLOSE` const, mirroring
+  `PREP_STEP_RETEST`). The prep-free QM leg drops the break floor and falls back
+  to the shared `detector_lookback_bars` window (bug ①), which reaches the
+  pre-break confirmed signal. `replay_start` still floors unconditionally (a
+  journaling boundary, not a prep).
+- Both call sites change identically — the fire path (`evaluate_one_entry`) and
+  the truthful `NeedsConfirmation` precondition (`leg_has_confirmed_signal`) — so
+  the offline replay's "not taken" line stays consistent with what actually
+  fires.
+- The break-gated BCR / single-enter H&S stop leg is **byte-identical**: it lists
+  `break-and-close`, so it still inherits `break_close_at` exactly as before.
+
+**Breaking.** None — `confirmed_setup_floor` is a private engine fn; all callers
+are in-crate.
+
+**Config.** None.
+
+**Tests.** `prep_free_qm_enter_ignores_break_close_floor_for_a_pre_break_golden`
+(the fire path fires on the 10:00 signal despite the 11:00 break stamp),
+`break_gated_enter_still_honours_break_close_floor` (a `break-and-close`-listing
+leg is still floored past the pre-break signal — no fire),
+`needs_confirmation_reason_truthful_for_prep_free_leg_with_pre_break_signal` (the
+"not taken" surface drops `NeedsConfirmation` for the prep-free leg once the
+pre-break signal confirms). All three fail on the pre-fix plan-global floor.
+
+**Follow-up.** None outstanding.
+
 ## v113 — 2026-07-22 — Reversal-close guard golden-gates before it latches; terminal veto no longer shadows a same-bar close (replay↔live parity)
 
 **Why.** Two replay-only bugs let a `07-close-on-sr-reversal` be skipped on the
