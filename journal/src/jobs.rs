@@ -84,20 +84,19 @@ pub fn spawn_replay(tx: Sender<JobResult>, trade_id: String, export_json: String
     });
 }
 
-/// Spawn the TradingView **load** job — navigate the live chart to this plan
-/// (symbol + timeframe + scroll-to-anchor + zoom-out). Navigation only; no
-/// drawing. `instrument`/`granularity` come from the plan row; `anchor_utc` is
-/// the plan's `armed_at`.
+/// Spawn the TradingView **load** job — set the live chart's symbol + timeframe
+/// for this plan. The operator scrolls/zooms to the setup manually; no
+/// scroll-to-anchor, no range, no drawing. `instrument`/`granularity` come from
+/// the plan row; `broker` from the fetched detail (drives the exchange prefix).
 pub fn spawn_load_tv(
     tx: Sender<JobResult>,
     trade_id: String,
     instrument: String,
     broker: String,
     granularity: String,
-    anchor_utc: String,
 ) {
     spawn(tx, trade_id, JobKind::LoadTv, move || {
-        crate::tv::load_chart(&instrument, &broker, &granularity, &anchor_utc)?;
+        crate::tv::load_chart(&instrument, &broker, &granularity)?;
         Ok(JobOutcome::LoadTv)
     });
 }

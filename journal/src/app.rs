@@ -294,7 +294,7 @@ impl App {
                     .unwrap_or(false);
                 if is_open {
                     // Auto-load TradingView the first time we reach a deep screen
-                    // (the detail with the anchor time only exists now).
+                    // (the detail, carrying the broker, only exists now).
                     if self.screen.depth() >= Screen::Timeline.depth() {
                         self.start_load_tv(&trade_id);
                     }
@@ -320,10 +320,10 @@ impl App {
 
     // -- actions -----------------------------------------------------------
 
-    /// Load the current plan into TradingView (the `l` key) — navigate the live
-    /// chart to this setup (symbol + timeframe + scroll-to-anchor + zoom-out),
-    /// as a background job so the ~few-second navigation doesn't freeze the UI.
-    /// Also auto-fired once when the Timeline screen is first reached.
+    /// Load the current plan into TradingView (the `l` key) — set the live
+    /// chart's symbol + timeframe for this setup (the operator scrolls/zooms to
+    /// it manually), as a background job so the navigation doesn't freeze the
+    /// UI. Also auto-fired once when the Timeline screen is first reached.
     pub fn load_tv(&mut self) {
         let Some(trade_id) = self.current_plan().map(|p| p.trade_id.clone()) else {
             return;
@@ -331,26 +331,25 @@ impl App {
         self.start_load_tv(&trade_id);
     }
 
-    /// Spawn the TradingView-load job for `trade_id` if the plan detail (which
-    /// carries the anchor time) is loaded. If it isn't yet, kick the timeline
-    /// job; `apply_job` re-tries the load when the detail lands.
+    /// Spawn the TradingView-load job for `trade_id` once the plan detail is
+    /// loaded — the detail carries the `broker`, which fixes the chart's
+    /// exchange prefix. If the detail isn't loaded yet, kick the timeline job;
+    /// `apply_job` re-tries the load when the detail lands.
     fn start_load_tv(&mut self, trade_id: &str) {
-        // Instrument + granularity come from the list row; anchor from detail.
+        // Instrument + granularity come from the list row; broker from detail.
         let Some(row) = self.plans.iter().find(|p| p.trade_id == trade_id) else {
             return;
         };
         let instrument = row.instrument.clone();
         let granularity = row.granularity.clone();
-        // Anchor + broker both come from the fetched detail.
-        let detail = self.data.get(trade_id).and_then(|d| d.detail.as_ref());
-        let anchor = detail.and_then(|d| d.armed_at.clone());
-        let broker = detail.map(|d| d.broker.clone()).unwrap_or_default();
-        let Some(anchor) = anchor else {
-            // Detail (with armed_at + broker) not loaded yet — fetch it; the
-            // Timeline completion will fire the load.
+        // Broker comes from the fetched detail (drives the exchange prefix).
+        let Some(detail) = self.data.get(trade_id).and_then(|d| d.detail.as_ref()) else {
+            // Detail (with the broker) not loaded yet — fetch it; the Timeline
+            // completion will fire the load.
             self.start_timeline(trade_id);
             return;
         };
+        let broker = detail.broker.clone();
         if !self.mark_in_flight(trade_id, JobKind::LoadTv) {
             return;
         }
@@ -361,7 +360,6 @@ impl App {
             instrument,
             broker,
             granularity,
-            anchor,
         );
     }
 

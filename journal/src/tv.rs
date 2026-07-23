@@ -1,67 +1,43 @@
 //! Loading a plan into the live TradingView chart via the Node-side
-//! `tradingview-mcp-jackson` CLI. "Load" = navigate the chart: set the symbol,
-//! set the timeframe, scroll to the setup's anchor time, then zoom out ~3× so
-//! the whole setup is visible. It does **not** draw anything — the replay
+//! `tradingview-mcp-jackson` CLI. "Load" = set the chart's symbol and timeframe
+//! **only** — the operator scrolls/zooms to the setup manually. It does **not**
+//! scroll to the anchor, set a visible range, or draw anything — the replay
 //! `--annotate` path (on the Replay screen) owns drawing.
 //!
 //! Each step shells `node <root>/src/cli/index.js <cmd> …`. TradingView needs a
-//! beat to catch up between commands, so we sleep ~1s between them (calibrated
-//! interactively — without it the symbol/timeframe change races the scroll).
-//!
-//! Times are passed to `scroll`/`range` as **unix timestamps**, not date
-//! strings: the Node side parses a bare date in the box's local TZ, but plan
-//! times are UTC RFC3339 — a unix ts is unambiguous.
+//! beat to catch up between commands, so we sleep ~1s between the symbol and
+//! timeframe commands (calibrated interactively — without it the symbol change
+//! races the timeframe change).
 
 use std::path::PathBuf;
 use std::process::Command;
 use std::thread::sleep;
 use std::time::Duration;
 
-use chrono::DateTime;
 use color_eyre::eyre::{Result, eyre};
 
 /// The Node tv-mcp checkout. Matches `trading_view::mcp::DEFAULT_TV_MCP_ROOT`
 /// and the hard-coded path in `replay-candles`. One-user tool, fine hard-coded.
 const TV_MCP_ROOT: &str = "/home/matiu/Downloads/tradingview-mcp-jackson";
 
-/// Bars either side of the anchor to show — `scroll` centres ±25 bars; we widen
-/// to ±75 (~3× zoom-out) so the whole setup is in view.
-const HALF_WINDOW_BARS: i64 = 75;
-
 /// Pause between tv-mcp commands so TradingView can catch up.
 const STEP_PAUSE: Duration = Duration::from_millis(1000);
 
-/// Load a plan onto the live chart: symbol → timeframe → scroll(anchor) →
-/// zoom-out. `instrument` is the plan's raw id (OANDA/TradeNation form),
-/// `broker` its broker (`oanda`/`tradenation`) — which fixes the TradingView
-/// *exchange prefix* so the right broker's chart loads — `granularity` its
-/// `h1`/`m15`/… string, `anchor_utc` the RFC3339 time to centre on
-/// (the plan's `armed_at`).
-pub fn load_chart(
-    instrument: &str,
-    broker: &str,
-    granularity: &str,
-    anchor_utc: &str,
-) -> Result<()> {
+/// Load a plan onto the live chart: set the symbol and timeframe **only**. The
+/// operator scrolls/zooms to the setup manually — we deliberately do **not**
+/// scroll to the anchor or set a visible range. `instrument` is the plan's raw
+/// id (OANDA/TradeNation form), `broker` its broker (`oanda`/`tradenation`) —
+/// which fixes the TradingView *exchange prefix* so the right broker's chart
+/// loads — `granularity` its `h1`/`m15`/… string.
+pub fn load_chart(instrument: &str, broker: &str, granularity: &str) -> Result<()> {
     let symbol = tv_symbol(instrument, broker)?;
     let resolution = tv_resolution(granularity)?;
-    let anchor_ts = to_unix(anchor_utc)?;
-    let secs_per_bar = resolution_secs(&resolution);
-    let half = HALF_WINDOW_BARS * secs_per_bar;
 
-    // 1. symbol, 2. timeframe — each needs a beat before the next.
+    // 1. symbol, 2. timeframe — the symbol change needs a beat before the
+    //    timeframe change or the two race.
     tv(&["symbol", &symbol])?;
     sleep(STEP_PAUSE);
     tv(&["timeframe", &resolution])?;
-    sleep(STEP_PAUSE);
-    // 3. scroll centres on the anchor AND loads the surrounding bars, so the
-    //    following range call has bars to snap against.
-    tv(&["scroll", &anchor_ts.to_string()])?;
-    sleep(STEP_PAUSE);
-    // 4. widen the visible window ~3× around the anchor.
-    let from = (anchor_ts - half).to_string();
-    let to = (anchor_ts + half).to_string();
-    tv(&["range", "--from", &from, "--to", &to])?;
     Ok(())
 }
 
@@ -136,23 +112,6 @@ fn tv_resolution(granularity: &str) -> Result<String> {
     Ok(res.to_string())
 }
 
-/// Seconds per bar for a TradingView resolution string — mirrors the Node
-/// `scrollToDate` mapping so our window matches its bar maths.
-fn resolution_secs(resolution: &str) -> i64 {
-    match resolution {
-        "1D" => 86_400,
-        "1W" => 604_800,
-        mins => mins.parse::<i64>().map(|m| m * 60).unwrap_or(60),
-    }
-}
-
-/// Parse an RFC3339 UTC instant to a unix timestamp (seconds).
-fn to_unix(rfc3339: &str) -> Result<i64> {
-    DateTime::parse_from_rfc3339(rfc3339)
-        .map(|dt| dt.timestamp())
-        .map_err(|e| eyre!("parse anchor time `{rfc3339}`: {e}"))
-}
-
 /// The tv-mcp CLI entrypoint.
 fn cli_path() -> PathBuf {
     PathBuf::from(TV_MCP_ROOT).join("src/cli/index.js")
@@ -189,21 +148,6 @@ mod tests {
         assert_eq!(tv_resolution("h4").unwrap(), "240");
         assert_eq!(tv_resolution("d").unwrap(), "1D");
         assert!(tv_resolution("nonsense").is_err());
-    }
-
-    #[test]
-    fn resolution_secs_match_node() {
-        assert_eq!(resolution_secs("15"), 900);
-        assert_eq!(resolution_secs("60"), 3600);
-        assert_eq!(resolution_secs("240"), 14_400);
-        assert_eq!(resolution_secs("1D"), 86_400);
-    }
-
-    #[test]
-    fn parses_utc_to_unix() {
-        // 2026-07-23T00:00:00Z = 1784764800.
-        assert_eq!(to_unix("2026-07-23T00:00:00Z").unwrap(), 1_784_764_800);
-        assert!(to_unix("not-a-date").is_err());
     }
 
     #[test]
