@@ -73,6 +73,11 @@ pub fn load_chart(
 fn tv_symbol(instrument: &str, broker: &str) -> Result<String> {
     use instrument_lookup::{Broker, by_broker_symbol};
     // Resolve the bare TV symbol, trying both broker views of the raw id.
+    // Some catalog entries (many FX crosses, e.g. AUD/SGD) carry an OANDA/TN
+    // symbol but a blank `tradingview` field, so `symbol_for(TradingView)`
+    // returns None. TradingView symbols are just the raw id with separators
+    // stripped, so fall back to that rather than failing: `AUD_SGD` → `AUDSGD`,
+    // `AUD/SGD` → `AUDSGD`. Keeps any unknown FX instrument loadable.
     let bare = [Broker::Oanda, Broker::TradeNation]
         .into_iter()
         .find_map(|b| {
@@ -82,7 +87,7 @@ fn tv_symbol(instrument: &str, broker: &str) -> Result<String> {
                 .and_then(|asset| asset.symbol_for(Broker::TradingView))
                 .map(str::to_string)
         })
-        .ok_or_else(|| eyre!("no TradingView symbol for instrument `{instrument}`"))?;
+        .unwrap_or_else(|| strip_separators(instrument));
 
     match tv_exchange(broker) {
         Some(exchange) => Ok(format!("{exchange}:{bare}")),
@@ -90,6 +95,17 @@ fn tv_symbol(instrument: &str, broker: &str) -> Result<String> {
         // exchange), preserving prior behaviour rather than failing.
         None => Ok(bare),
     }
+}
+
+/// Turn a raw broker instrument id into a bare TradingView symbol by dropping
+/// the separators brokers use but TradingView doesn't: `AUD_SGD` (OANDA form)
+/// and `AUD/SGD` (TradeNation form) both → `AUDSGD`. Used as the last-resort
+/// fallback when instrument-lookup has no TradingView symbol for the asset.
+fn strip_separators(instrument: &str) -> String {
+    instrument
+        .chars()
+        .filter(|c| !matches!(c, '_' | '/' | ' '))
+        .collect()
 }
 
 /// The TradingView exchange prefix for a plan broker. `None` for an
@@ -201,6 +217,22 @@ mod tests {
         assert_eq!(tv_symbol("GBP/USD", "oanda").unwrap(), "OANDA:GBPUSD");
         // Unknown broker → bare symbol (TV's default exchange), no failure.
         assert_eq!(tv_symbol("GBP/USD", "").unwrap(), "GBPUSD");
+    }
+
+    #[test]
+    fn resolves_symbol_when_catalog_lacks_tv_field() {
+        // AUD/SGD is in instrument-lookup with an OANDA symbol but a blank
+        // `tradingview` field, so `symbol_for(TradingView)` is None. The
+        // fallback strips the OANDA underscore → OANDA:AUDSGD (not AUD_SGD).
+        assert_eq!(tv_symbol("AUD_SGD", "oanda").unwrap(), "OANDA:AUDSGD");
+    }
+
+    #[test]
+    fn strips_broker_separators() {
+        assert_eq!(strip_separators("AUD_SGD"), "AUDSGD");
+        assert_eq!(strip_separators("AUD/SGD"), "AUDSGD");
+        assert_eq!(strip_separators("Spot Gold"), "SpotGold");
+        assert_eq!(strip_separators("EURUSD"), "EURUSD");
     }
 
     #[test]
