@@ -3,5 +3,6 @@
   "granularity": "h1",
   "source": "tradenation",
   "start": "2026-07-13T11:00:00Z",
-  "end": "2026-07-22T04:00:00Z"
+  "end": "2026-07-22T04:00:00Z",
+  "rebless_note": "v113 (2026-07-22): reblessed after the golden-gate fix. The prior golden recorded two needs_golden=True reversal-closes firing on NON-golden reversals (07-close-on-sr-reversal @ 2026-07-14T15:00Z, FloatingEngulfer golden=false; and the 06 news-close), which the live worker's run_close rejects (NeedsGoldenUnmet/412). eval_pine_guard now applies the candle-quality gate before the guard latches, so those non-live-faithful closes are correctly declined. Net R unchanged (+0.00); this fixture pins QM-v2 confirmation entry sequencing, not the closes."
 }

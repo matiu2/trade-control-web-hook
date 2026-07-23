@@ -1,5 +1,61 @@
 # Changelog
 
+## v113 — 2026-07-22 — Reversal-close guard golden-gates before it latches; terminal veto no longer shadows a same-bar close (replay↔live parity)
+
+**Why.** Two replay-only bugs let a `07-close-on-sr-reversal` be skipped on the
+bar it should fire, so an offline replay rode a short to its stop-loss (−1R)
+where the live worker would have flattened at the reversal (~break-even). Caught
+on USD/ZAR M15 2026-07-20: a golden bullish pinbar off support at 11:30Z (band
+anchor 16.44645 ∈ SR band [16.41969, 16.45256]) never closed the short.
+
+**Root causes (both replay-engine-only — the live worker was already correct).**
+
+1. **The guard latched before applying `needs_golden`.** `eval_pine_guard`
+   (`engine/src/evaluate.rs`) fired/latched the reversal-close on the *first*
+   in-band opposing reversal regardless of golden, recording it in
+   `state.fired` and never re-evaluating. A **non-golden** long pinbar at 11:00Z
+   (in-band anchor, golden=false) latched the one-shot guard and shadowed the
+   genuinely-golden reversal at 11:30Z. Live has no such latch: the close alert
+   re-fires each bar and `run_close` applies `needs_golden` per fire; a
+   needs-golden-unmet close is a 412 that does **not** poison the intent id
+   (`seen.rs`), so the next bar's golden fire still lands.
+2. **A terminal veto short-circuited a same-bar close.** `evaluate_guards`
+   iterates `plan.rules` in order and did `state.phase = Done; return` the
+   instant a terminal invalidation fired — abandoning the loop before a
+   later-ordered non-terminal per-position close was reached. On the 11:30Z bar
+   the terminal `too-low` (`stop-next-entry`, rule index 1) fired *and* the
+   golden reversal-close (index 4) should have. Live has no collision: the two
+   alerts arrive independently; the `stop-next-entry` veto blocks future entries
+   while `run_close` flattens the position — both effects land.
+
+**What changed (behaviour).**
+- `eval_pine_guard` now applies the candle-quality gate (`needs_golden` /
+  `needs_confirmed`, mirroring `allow_close_gate::candle_quality`) **before** the
+  guard fires or latches. A non-golden reversal declines *and does not latch*, so
+  a later golden reversal can still fire.
+- `evaluate_guards` records a pending `terminal_fired` flag instead of an early
+  `return`; it finishes scanning the bar's guards (so a same-bar per-position
+  close still dispatches) and applies `Phase::Done` after the loop. `phase` is
+  untouched during the scan so the close stays armed (AwaitEntry-only).
+- Net on the repro: USD/ZAR replay flips −1.00R → **+0.36R** (closed on reversal
+  at 21:30 BNE), matching what the live worker would have done.
+
+**Breaking.** None. Signed wire format unchanged; single-shot / non-golden-close
+plans byte-identical.
+
+**Config.** None.
+
+**Tests.** `same_bar_terminal_veto_does_not_shadow_a_per_position_close`
+(both fire same bar → close dispatches, then Done),
+`golden_close_fires_on_a_golden_in_band_reversal`,
+`golden_close_does_not_latch_on_a_non_golden_reversal` (with a non-vacuity
+guard proving the reversal is detected & in-band). All verified to fail without
+their respective fix. Full engine suite green (176 lib + 3 integration).
+
+**Follow-up.** None outstanding; the live worker needed no change (verified
+`veto.rs`: a `stop-next-entry` veto never touches the open position; `run_close`
+has no rule-id latch).
+
 ## v112 — 2026-07-22 — Engulfer band anchor is the first covered bar's open; anchor computed in the detector
 
 **Why.** v111 anchored an engulfer on the **print bar's** open. But a
