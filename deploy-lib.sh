@@ -134,7 +134,7 @@ deploy_env() {
     pkg_args+=(-p "$pkg")
   done
   # `TRADE_CONTROL_ENV_SUFFIX` is baked into tv-arm (build.rs → BAKED_ENV_SUFFIX)
-  # so `tv-arm-<suffix> --replay` shells out to the matching
+  # so `tv-arm-<suffix> ... replay` shells out to the matching
   # `replay-candles-<suffix>` binary (same environment).
   TRADE_CONTROL_WEBHOOK="$webhook" \
   TRADE_CONTROL_ENV_SUFFIX="$suffix" \

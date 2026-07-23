@@ -381,14 +381,14 @@ The day-to-day loop, end to end:
      spread-recovery watcher (see below), **and** runs the
      server-side trade-plan engine (`run_engine_tick`, see below).
    - **Server-side engine** (experimental, dev only) — on each `*/15`
-     tick the engine enumerates every registered `TradePlan` (see
-     `--register-plan`), fetches the broker candles closed since each
+     tick the engine enumerates every registered `TradePlan` (see the
+     `register` subcommand), fetches the broker candles closed since each
      plan's watermark, runs the per-trade FSM evaluator, and dispatches
      any fired intents through the *same* `run_enter` / `run_close` /
      veto handlers the webhook uses — unless the plan is registered with
-     `--shadow`, in which case it evaluates and advances state but only
+     `register --shadow`, in which case it evaluates and advances state but only
      *logs* its would-be fires (the safe way to run beside the live TV
-     alerts; a live plan would double-fire — see `--register-plan`). It
+     alerts; a live plan would double-fire — see the `register` subcommand). It
      runs **in parallel** with the TV alerts until proven on demo; the
      `*/15` cadence stays for now. A plan's first tick *seeds*
      its watermark without firing, so conditions already true at register
@@ -1925,9 +1925,9 @@ it fetches the week's forex-factory events and adds one blackout pair + one news
 pair per event, then drops any pair whose window has already elapsed. The
 "as-of" time it prunes against depends on the run mode:
 
-- **`--register-plan` (live arm):** wall-clock now — a genuinely stale event is
+- **`register` (live arm):** wall-clock now — a genuinely stale event is
   still dropped before it reaches the live worker.
-- **`--plan-out` (offline / replay build):** the chart's **replay cursor** —
+- **`plan-out` / `replay` (offline build):** the chart's **replay cursor** —
   `bars_range.to`, the last *loaded* bar, **not** the visible-window right edge
   (on a rewound chart the visible window still extends past the last bar into
   empty future space, so `visible_range.to` overshoots the cursor and would
@@ -2792,45 +2792,64 @@ cargo run -p tv-arm -- \
   --require-confirmation \            # require a confirmed signal candle on entry (independent of golden). Also flips the recover-entry default to `limit` (see below)
   --recover-entry limit \             # H&S/iH&S: how to recover a stop entry gone wrong-side during confirmation — market | limit | abort. Omit to default off --require-confirmation (limit) else drop
   --blackout-close close \            # market-hours blackout: also flatten an open position if caught in the close→open gap (default: cancel = cancel the resting order only)
-  --register-plan \                   # arm the trade: register one signed TradePlan with the server-side engine
-  --shadow \                          # register observe-only: engine evaluates + logs, but never places orders (safe dry watch)
-  --replay                            # after arming, chain into replay-candles on the just-built plan (see below). Tokens AFTER --replay pass through to replay-candles
+  register --shadow                   # SUBCOMMAND: arm the trade (register one signed TradePlan with the server-side engine); --shadow = observe-only (engine evaluates + logs, never places orders)
 ```
 
-Run `tv-arm --help` for the full flag surface — it has diverged from the
-deprecated Python script.
+The terminal action is a **subcommand**, not a flag. The three verbs are
+**mutually exclusive** — pick exactly one, and it goes at the **end** of the
+line (all the build-shaping flags above come first):
 
-#### `--replay`: arm then immediately replay the plan
+| subcommand | what it does | was |
+|---|---|---|
+| *(none)* | build + sign the bundle to disk and stop | *(no flag)* |
+| `register` | arm the trade with the server-side engine | `--register-plan` |
+| `plan-out <FILE>` | write the built plan JSON to `<FILE>` and stop | `--plan-out <FILE>` |
+| `replay [ARGS…]` | chain into `replay-candles` on the built plan | `--replay [ARGS…]` |
 
-`--replay` chains straight from arming into the offline
-[`replay-candles`](#candle-replay-replay-candles--golden-fixtures) report on the
-plan `tv-arm` just built — no second command, no copying the plan path. It:
+`register` carries `--replace [<id>]` (re-arm; `--update` is a deprecated alias)
+and `--shadow` (observe-only). `plan-out` takes a required `<FILE>` positional.
+`replay` collects trailing passthrough tokens for `replay-candles`.
 
-1. writes the plan JSON (to `--plan-out <path>` if given, else a temp file), then
+Because they're exclusive you can no longer arm *and* replay (or arm *and*
+write JSON) in one invocation — arm with `register`, then run `tv-arm … replay`
+or `replay-candles` separately.
+
+Run `tv-arm --help` for the full flag surface (and `tv-arm <subcommand> --help`
+for each verb's own options) — it has diverged from the deprecated Python
+script.
+
+#### `replay`: build the plan and immediately replay it
+
+The `replay` subcommand builds the plan (it does **not** arm it) and chains
+straight into the offline
+[`replay-candles`](#candle-replay-replay-candles--golden-fixtures) report — no
+second command, no copying the plan path. It:
+
+1. writes the plan JSON to a temp file, then
 2. shells out to the **environment-matched** `replay-candles-<env>` binary
-   (`tv-arm-staging --replay` → `replay-candles-staging`), with sensible
+   (`tv-arm-staging … replay` → `replay-candles-staging`), with sensible
    defaults: `--verbose --annotate true --source <resolved-broker>`.
 
-Any tokens **after** `--replay` pass through to `replay-candles` verbatim and
+Any trailing tokens after `replay` pass through to `replay-candles` verbatim and
 **override** the defaults (clap's last-value-wins), validated against the shared
 `ReplayArgs` clap definition before the shell-out so a bad flag fails with
 `replay-candles`' own error:
 
 ```sh
-# arm + replay with defaults (verbose, annotate the chart, source = the plan's broker)
-tv-arm --replay
+# build + replay with defaults (verbose, annotate the chart, source = the plan's broker)
+tv-arm replay
 
 # override: don't annotate, widen the warm-up, mark both golden and non-golden
-tv-arm --replay --annotate false --warmup-bars 400 --candle-detector-golden both
+tv-arm replay --annotate false --warmup-bars 400 --candle-detector-golden both
 
-# if a passthrough flag collides with one of tv-arm's own, end tv-arm's flags with `--`
-tv-arm --start 2026-07-01T00:00 --replay -- --start 2026-07-01T00:00
+# if a passthrough flag collides with one of tv-arm's own, put tv-arm's flags
+# BEFORE the subcommand and end them with `--` after it
+tv-arm --start 2026-07-01T00:00 replay -- --start 2026-07-01T00:00
 ```
 
-The replay is a **post-arm convenience** — the plan is already armed by the time
-it runs; a replay failure is surfaced as an error but doesn't un-arm the plan.
-`--replay` needs neither `--plan-out` nor `--register-plan`: on its own it builds
-the plan, writes it to a temp file, and replays it.
+`replay` never touches the worker — it builds the plan, writes it to a temp
+file, and replays it. To both arm *and* replay a setup, run `tv-arm … register`
+first, then `tv-arm … replay` (or point `replay-candles` at the armed plan).
 
 ### Dual entry — `--strategy-v2` (stop + Quasimodo)
 
@@ -2883,14 +2902,14 @@ requires `--max-retries > 0` (it defaults to 5; `--max-retries 0` is
 rejected). It conflicts with `--quasimodo`, `--entry-market`,
 `--skip-break-and-close`, and `--skip-retest`.
 
-### Server-side engine registration (`--register-plan`)
+### Server-side engine registration (`register`)
 
 Trades are armed **server-side**: the worker evaluates every trigger itself on
-its cron tick — there are no paid TradingView alerts. `--register-plan` folds
-the **whole trade** — every condition (re-expressed as an engine `Trigger`),
-plus the embedded enter/close/veto/prep intents — into one signed `TradePlan`
-and POSTs it directly to the worker (action `register`). The plan rides the
-same whole-body HMAC as every other intent (carried in the intent's
+its cron tick — there are no paid TradingView alerts. The `register` subcommand
+folds the **whole trade** — every condition (re-expressed as an engine
+`Trigger`), plus the embedded enter/close/veto/prep intents — into one signed
+`TradePlan` and POSTs it directly to the worker (action `register`). The plan
+rides the same whole-body HMAC as every other intent (carried in the intent's
 `trade_plan` field), so it can't be tampered.
 
 > **The legacy TradingView-alert path has been retired.** `tv-arm` used to also
@@ -2898,25 +2917,24 @@ same whole-body HMAC as every other intent (carried in the intent's
 > alert at the webhook (`--create-alerts`). That whole path — the flag, the
 > tv-mcp template, the `alert_spec` / `create_alerts` / `post_outcome` modules —
 > is gone. The signed bundle is still written to disk as a build artifact, but
-> arming is now solely `--register-plan`.
+> arming is now solely the `register` subcommand.
 
 A failed register is a hard error, but the signed bundle is already on disk by
 the time the POST happens, so the trade is never lost. The plan's destination
-is the baked-at-build-time webhook, so `tv-arm-staging --register-plan`
+is the baked-at-build-time webhook, so `tv-arm-staging … register`
 registers against the staging worker with no extra flag. The chart timeframe
 must map to an engine granularity (`1`/`5`/`15`/`60`/`240`/`D`), else the
 register is rejected.
 
-> **`--plan-out` is the offline sibling.** `tv-arm --plan-out <file>` *without*
-> `--register-plan` builds the plan and writes its JSON to disk but never POSTs
-> to the worker — used to replay / inspect a historical setup. Because such a
-> setup is usually already in the past, the build relaxes its time-sensitive
-> checks (`trade_expiry` already elapsed, an in-window news event) from hard
-> errors to **warnings** in this offline mode, so the JSON still gets written.
-> Any path that actually arms the worker (`--register-plan`, and the
-> `build-trade --from-file` signing path) stays strict and rejects an expired
-> `trade_expiry`. The strictness toggle is `BuildStrictness` in
-> `cli/src/trade_patterns.rs`.
+> **`plan-out` is the offline sibling.** `tv-arm … plan-out <file>` builds the
+> plan and writes its JSON to disk but never POSTs to the worker — used to
+> replay / inspect a historical setup. Because such a setup is usually already
+> in the past, the build relaxes its time-sensitive checks (`trade_expiry`
+> already elapsed, an in-window news event) from hard errors to **warnings** in
+> this offline mode, so the JSON still gets written. Any path that actually arms
+> the worker (the `register` subcommand, and the `build-trade --from-file`
+> signing path) stays strict and rejects an expired `trade_expiry`. The
+> strictness toggle is `BuildStrictness` in `cli/src/trade_patterns.rs`.
 
 The worker validates the registered plan and **persists** it to KV (key
 `plan:{scope}:{trade_id}`, **no TTL** — like an archived plan) for the
@@ -2934,7 +2952,7 @@ triggers and vetos.
 > **Shadow mode for watching a new plan.** A live (non-shadow) plan dispatches
 > its fired intents through the *same* `run_enter` / `run_close` handlers the
 > webhook uses — it places **real broker orders**. To watch a new or changed
-> plan's decisions without trading, register with **`--shadow`**: the engine
+> plan's decisions without trading, register with **`register --shadow`**: the engine
 > evaluates the plan and advances its `PlanState` identically to a live plan,
 > but logs each would-be fire as a `cron engine SHADOW would-fire:` line instead
 > of touching the broker (no order, no seen-id mark). Scrape those lines from
@@ -2951,7 +2969,7 @@ forex-factory economic calendar. Each becomes a `TimeReached` rule carrying the
 matching `pause` / `resume` / `news-start` / `news-end` intent and firing at the
 window edge; the engine fires them **non-terminally** (they set the blackout /
 news-window KV state without ending the trade's spine) and the cron dispatches
-them through the same handlers the webhook uses. In `--shadow` they're logged,
+them through the same handlers the webhook uses. In `register --shadow` they're logged,
 not applied, like every other fire. The intent format is unchanged, so the
 worker/engine still enforce these exactly as before. The folding lives in
 `append_control_rules` (`tv-arm/src/trade_plan_build.rs`); the non-terminal
@@ -2992,7 +3010,7 @@ a single line whose label space-joins them (`USD-3-star-22:00 EUR-2-star-22:30`)
 TradingView renders one drawing per bar cell. The lines **never affect the signed plan**
 — it's purely a debugging / replay aid — and a tv-mcp draw failure warns and continues
 (unlike `tv-news`, which hard-errors) so a flaky draw never blocks a live
-`--register-plan`. This is narrower than running `tv-news` standalone, which draws a
+`register`. This is narrower than running `tv-news` standalone, which draws a
 looser Medium+ / visible-window set; these markers are only what tv-arm actually arms.
 `--skip-calendar-bars` opts out of the whole calendar step — no windows armed **and**
 no markers drawn. The pure line-grouping helper is `news_marker_lines`
@@ -3005,22 +3023,22 @@ engine state is `core/src/plan_state.rs`; the FSM evaluator is
 `engine/src/evaluate.rs`; the candle-pattern detector port is
 `core/src/signals.rs`.
 
-#### Re-arming an existing setup (`--replace`)
+#### Re-arming an existing setup (`register --replace`)
 
 `tv-arm` mints a **fresh random `trade_id` every run**, so the engine treats
 each re-arm as a brand-new plan — and the *old* plan keeps ticking in KV until
 its TTL lapses. When you move annotations on the chart and re-run, pass
-`--replace` (only meaningful alongside `--register-plan`) so the prior plan is
-deleted from the engine first:
+`--replace` (a `register`-subcommand flag) so the prior plan is deleted from the
+engine first:
 
 ```sh
 # Auto-resolve by instrument: deletes the one existing plan on this instrument,
 # then registers the fresh one. Hard-errors if more than one plan is registered
 # for the instrument (re-run with the explicit id from `plan list`).
-tv-arm-staging --register-plan --replace ...
+tv-arm-staging ... register --replace
 
 # Explicit: delete exactly this prior trade_id, then register fresh.
-tv-arm-staging --register-plan --replace hs-eurusd-a3f9c1d2 ...
+tv-arm-staging ... register --replace hs-eurusd-a3f9c1d2
 ```
 
 `--replace` reconciles the server-side engine plan: it POSTs `plan-list` to find
@@ -3376,7 +3394,7 @@ in `maybe_update_mw_state` (`src/lib.rs`). Baked params are the seed.
 cargo run -p tv-arm -- \
   --broker oanda \
   --allow-50-pct-m-trades \           # opt in to a 40–50% neckline retrace
-  --register-plan
+  register                            # SUBCOMMAND (last): arm the trade
 # (draw the 3-anchor path + a trade-expiry vertical on the chart first)
 ```
 

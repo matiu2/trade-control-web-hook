@@ -135,7 +135,7 @@ pub fn run(args: Args) -> Result<i32> {
     // `--replay` with no explicit `--start`: fall back to a chart Note saying
     // `start` — its first anchor's time becomes the journaling cursor. Lets an
     // operator mark live-now with a note instead of typing an RFC3339 stamp.
-    let start = match (parse_start(&args)?, args.replay) {
+    let start = match (parse_start(&args)?, args.replay()) {
         (Some(s), _) => Some(s),
         (None, true) => crate::start_note::resolve_start_from_note(&mcp, &drawings)
             .wrap_err("resolve --replay start from chart Note")?
@@ -163,13 +163,14 @@ pub fn run(args: Args) -> Result<i32> {
     let cursor_unix = start.unwrap_or(chart_range.bars_range.to);
     // Single-slot role selection follows the run mode (same signal as
     // `BuildStrictness` below): `--start` searches the whole chart
-    // (nearest-to-start); else live arming (`--register-plan`, king when both
-    // flags are set) trusts the newest drawing; an offline / replay build
-    // (`--plan-out` alone) prefers the drawing belonging to the on-screen
-    // window, so a rewound replay doesn't grab a recent, live-dated drawing.
+    // (nearest-to-start); else live arming (the `register` subcommand) trusts
+    // the newest drawing; an offline / replay build (the `plan-out` / `replay`
+    // subcommands, or no subcommand) prefers the drawing belonging to the
+    // on-screen window, so a rewound replay doesn't grab a recent, live-dated
+    // drawing.
     let slot_pref = if let Some(s) = start {
         SlotPref::NearestTo { start: s }
-    } else if args.register_plan {
+    } else if args.register_plan() {
         SlotPref::LatestWins
     } else {
         SlotPref::WindowAware(view)
@@ -312,7 +313,7 @@ pub fn run(args: Args) -> Result<i32> {
     // already-elapsed trade_expiry (or in-window news) is expected. Relax the
     // time-sensitive checks to warnings so the JSON still gets written; any
     // path that actually arms the worker (`--register-plan`) stays strict.
-    let strictness = if args.register_plan {
+    let strictness = if args.register_plan() {
         cli::BuildStrictness::Strict
     } else {
         cli::BuildStrictness::Lenient
@@ -322,13 +323,14 @@ pub fn run(args: Args) -> Result<i32> {
     let trade_id = built_trade.trade_id.clone();
     cli::write_trade(&built_trade, &key, &out_dir).wrap_err("write trade bundle")?;
 
-    // `--replay` needs the plan JSON on disk to hand to `replay-candles`. When
-    // the operator gave `--plan-out`, use that; for a bare `--replay` synthesise
-    // a temp path so the register block below writes the plan there and the
-    // replay can read it back. This is the ONLY thing that turns the register
-    // block on for a bare `--replay` (no `--register-plan`, no `--plan-out`).
-    let effective_plan_out: Option<PathBuf> = match (&args.plan_out, args.replay) {
-        (Some(p), _) => Some(p.clone()),
+    // The `plan-out` subcommand names the JSON destination; the `replay`
+    // subcommand synthesises a temp path so the register block below writes the
+    // plan there and the replay can read it back. (`register`, `plan-out`, and
+    // `replay` are mutually-exclusive subcommands, so at most one arm applies.)
+    // For a bare invocation (no subcommand) this stays `None` and only the
+    // signed bundle is written to disk.
+    let effective_plan_out: Option<PathBuf> = match (args.plan_out(), args.replay()) {
+        (Some(p), _) => Some(p.to_path_buf()),
         (None, true) => Some(crate::replay::plan_path(None, &trade_id)),
         (None, false) => None,
     };
@@ -371,22 +373,23 @@ pub fn run(args: Args) -> Result<i32> {
     //    `pause_bundles` / `news_bundles` above. The old drawn-line-era
     //    supplemental `built_calendar` path was retired in PR1b.
 
-    // 8b. (--register-plan) Fold the whole trade — main alert conditions PLUS
-    //     the pause/news/calendar control bars built above — into ONE signed
+    // 8b. (`register`) Fold the whole trade — main alert conditions PLUS the
+    //     pause/news/calendar control bars built above — into ONE signed
     //     TradePlan and register it with the worker's server-side engine. This
     //     is now the *only* way a trade is armed (the legacy TV-alert POST path
     //     was retired once the engine became the sole producer). A failed
     //     register is a hard error, but the signed bundle is already on disk.
-    // `--plan-out` alone builds the plan and writes the JSON without touching
-    // the worker; `--register-plan` additionally POSTs it. Run the block for
-    // either so `--plan-out` is no longer a silent no-op on its own.
-    if args.register_plan || effective_plan_out.is_some() {
-        // 8a. (--replace) Re-arm: delete the prior plan for this instrument before
-        //     registering the fresh one, so the old plan stops ticking and the
-        //     new one starts with clean engine state. No-op when --replace absent.
-        //     Only meaningful when actually registering.
-        if args.register_plan
-            && let Some(replace_target) = args.replace.as_deref()
+    // The `plan-out` / `replay` subcommands build the plan and write the JSON
+    // without touching the worker; only `register` additionally POSTs it. Run
+    // the block whenever we have a JSON destination (plan-out/replay) or are
+    // arming, so `plan-out` is no longer a silent no-op on its own.
+    if args.register_plan() || effective_plan_out.is_some() {
+        // 8a. (`register --replace`) Re-arm: delete the prior plan for this
+        //     instrument before registering the fresh one, so the old plan stops
+        //     ticking and the new one starts with clean engine state. No-op when
+        //     --replace absent. Only meaningful when actually registering.
+        if args.register_plan()
+            && let Some(replace_target) = args.replace()
         {
             replace_existing_plan(replace_target, &built_trade.instrument, &key, now)?;
         }
@@ -422,9 +425,9 @@ pub fn run(args: Args) -> Result<i32> {
             &key,
             &account,
             now,
-            args.shadow,
+            args.shadow(),
             effective_plan_out.as_deref(),
-            args.register_plan,
+            args.register_plan(),
             start,
             args.retest_atr_step
                 .unwrap_or(trade_control_core::trade_plan::DEFAULT_RETEST_ATR_STEP),
@@ -440,20 +443,19 @@ pub fn run(args: Args) -> Result<i32> {
     // The TradingView-alert creation path (build payloads → POST via tv-mcp) was
     // retired once the server-side cron engine became the sole producer. Arming a
     // trade is now: build + sign the bundle to disk (above) and register it as a
-    // `TradePlan` with the worker (step 8b, gated on `--register-plan`).
-    info!(trade_id = %trade_id, "signed bundle on disk; arm via --register-plan");
+    // `TradePlan` with the worker (step 8b, gated on the `register` subcommand).
+    info!(trade_id = %trade_id, "signed bundle on disk; arm via the `register` subcommand");
 
-    // 9. (--replay) Chain into `replay-candles` on the plan we just wrote. The
-    //    register block above wrote the JSON to `effective_plan_out` (the
-    //    operator's `--plan-out`, or a temp path for a bare `--replay`). The
-    //    replay is a post-arm convenience: a failure here surfaces as an error
-    //    but the plan is already armed.
-    if args.replay {
+    // 9. (`replay`) Chain into `replay-candles` on the plan we just wrote. The
+    //    register block above wrote the JSON to `effective_plan_out` (a temp
+    //    path for the `replay` subcommand). The replay is a post-build
+    //    convenience: a failure here surfaces as an error.
+    if args.replay() {
         crate::replay::run_replay(
             effective_plan_out.as_deref(),
             &trade_id,
             broker,
-            &args.replay_args,
+            args.replay_args(),
         )
         .wrap_err("replay after arm (--replay)")?;
     }
@@ -1593,7 +1595,7 @@ fn pick_prune_as_of(args: &Args, now: DateTime<Utc>, cursor_unix: i64, start: Op
             source: "start-flag",
         };
     }
-    if args.register_plan {
+    if args.register_plan() {
         return AsOf {
             at: now,
             source: "wallclock",
@@ -2426,7 +2428,7 @@ mod tests {
         let cursor = "2026-05-28T21:00:00Z".parse::<DateTime<Utc>>().unwrap();
 
         let as_of = pick_prune_as_of(
-            &mw_args(&["--plan-out", "/tmp/x.json"]),
+            &mw_args(&["plan-out", "/tmp/x.json"]),
             now,
             cursor.timestamp(),
             None,
@@ -2456,12 +2458,7 @@ mod tests {
         let now = now();
         let cursor = "2026-05-28T21:00:00Z".parse::<DateTime<Utc>>().unwrap();
 
-        let as_of = pick_prune_as_of(
-            &mw_args(&["--register-plan"]),
-            now,
-            cursor.timestamp(),
-            None,
-        );
+        let as_of = pick_prune_as_of(&mw_args(&["register"]), now, cursor.timestamp(), None);
 
         assert_eq!(as_of.at, now);
         assert_eq!(as_of.source, "wallclock");
@@ -2475,7 +2472,7 @@ mod tests {
         let cursor_unix = now.timestamp() + 7200; // cursor 2h ahead of now
 
         let as_of = pick_prune_as_of(
-            &mw_args(&["--plan-out", "/tmp/x.json"]),
+            &mw_args(&["plan-out", "/tmp/x.json"]),
             now,
             cursor_unix,
             None,
@@ -2491,12 +2488,7 @@ mod tests {
         let forced = "2026-05-28T21:00:00Z".parse::<DateTime<Utc>>().unwrap();
 
         let as_of = pick_prune_as_of(
-            &mw_args(&[
-                "--plan-out",
-                "/tmp/x.json",
-                "--as-of",
-                "2026-05-28T21:00:00Z",
-            ]),
+            &mw_args(&["--as-of", "2026-05-28T21:00:00Z", "plan-out", "/tmp/x.json"]),
             now,
             now.timestamp(),
             None,
@@ -2513,7 +2505,7 @@ mod tests {
         let cursor = "2026-05-28T21:00:00Z".parse::<DateTime<Utc>>().unwrap();
 
         let as_of = pick_prune_as_of(
-            &mw_args(&["--plan-out", "/tmp/x.json", "--as-of", "not-a-date"]),
+            &mw_args(&["--as-of", "not-a-date", "plan-out", "/tmp/x.json"]),
             now,
             cursor.timestamp(),
             None,
