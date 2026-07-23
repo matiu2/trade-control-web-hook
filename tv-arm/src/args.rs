@@ -526,6 +526,24 @@ pub struct Args {
     #[arg(long, default_value_t = 0.1)]
     pub reversal_band_pct: f64,
 
+    /// Width of the automatic take-profit resistance band, as a percent
+    /// of the take-profit price. Default 0.1 (= 0.1% of TP). The band's
+    /// **far edge is pinned to the take-profit** and it sits on the
+    /// approach side (just below TP for a long, just above for a short),
+    /// so a golden reversal candle printing as price nears TP closes the
+    /// position for a partial win instead of round-tripping to the stop.
+    /// H&S / iH&S only — the M/W path recomputes TP live and gets no auto
+    /// band. Ignored when `--skip-tp-resistance` is set.
+    #[arg(long, default_value_t = 0.1)]
+    pub tp_resistance_pct: f64,
+
+    /// Do not add the automatic take-profit resistance band. By default
+    /// (H&S / iH&S) every trade gets a one-sided S/R band pinned to the
+    /// take-profit (see `--tp-resistance-pct`); pass this to arm without
+    /// it and rely only on any chart-drawn `support` / `resistance` lines.
+    #[arg(long)]
+    pub skip_tp_resistance: bool,
+
     /// **Experimental, DORMANT NO-OP since 2026-07-19.** The reversal-close
     /// is exit-only: a reversal off a chart-drawn `support` / `resistance`
     /// band closes the open position and nothing more — it never blocks a
@@ -757,11 +775,26 @@ mod tests {
         assert!(!args.broker_dry_run);
         assert!(!args.skip_calendar_bars);
         assert_eq!(args.reversal_band_pct, 0.1);
+        // Auto TP-resistance band: on by default, 0.1% wide.
+        assert_eq!(args.tp_resistance_pct, 0.1);
+        assert!(!args.skip_tp_resistance);
         // Re-arm flag is opt-in.
         assert!(args.replace.is_none());
         // --replay is opt-in with no passthrough by default.
         assert!(!args.replay);
         assert!(args.replay_args.is_empty());
+    }
+
+    #[test]
+    fn tp_resistance_flags_parse() {
+        let args = Args::try_parse_from(["tv-arm", "--tp-resistance-pct", "0.25"])
+            .expect("parse --tp-resistance-pct");
+        assert_eq!(args.tp_resistance_pct, 0.25);
+        assert!(!args.skip_tp_resistance);
+
+        let args =
+            Args::try_parse_from(["tv-arm", "--skip-tp-resistance"]).expect("parse --skip flag");
+        assert!(args.skip_tp_resistance);
     }
 
     #[test]
