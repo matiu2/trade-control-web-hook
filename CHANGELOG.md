@@ -1,5 +1,45 @@
 # Changelog
 
+## v116 — 2026-07-24 — Auto TP-resistance band is now the same width as a drawn S/R line (was half)
+
+**Why.** The automatic take-profit resistance band tv-arm bakes on every H&S /
+iH&S trade was **half the width** of a hand-drawn `support`/`resistance` line for
+the same `pct`. A drawn line is a full `±pct` band (`2·pct` total) centred on the
+line; the auto TP band was one-sided (`[TP, TP+pct]` short / `[TP−pct, TP]` long)
+= only `1·pct` total. Both `reversal_band_pct` and `tp_resistance_pct` default to
+`0.1`, so a drawn band was 0.2% wide but the auto TP band only 0.1% — it caught
+fewer near-TP reversals than an equivalent drawn line. Spotted on XAU_XAG H1
+2026-07-21: with the operator's drawn S/R line removed, only the tight auto band
+remained and a golden reversal that turned short of TP was missed.
+
+**What changed (behaviour).** `tp_resistance_band` (`tv-arm/src/pipeline.rs`) now
+places the band's **centre** one `pct` step onto the approach side of TP
+(`TP·(1+pct)` for a short, `TP·(1-pct)` for a long) and builds the normal `±pct`
+band around it. Result: the band's **far edge still lands on TP** (a clean run to
+TP is unaffected; the band never extends *past* TP into profit territory), but it
+now reaches a **full drawn-band width** up the approach side — twice the old
+one-sided reach. For a short with TP 68.324 and the default 0.1%, the band goes
+from `[68.324, 68.392]` to `[68.324, 68.461]`.
+
+**Breaking.** None to the wire format. But note the **`--tp-resistance-pct` number
+now maps to twice the reach** it did before (it's a `±pct` radius now, not a
+one-sided reach) — a given value produces a 2× wider band. Retune per-trade
+overrides accordingly.
+
+**Config.** `--tp-resistance-pct` default unchanged (`0.1`). Catching a reversal
+that turns *further* short of TP (e.g. the XAU_XAG one at ~0.25% above TP) is a
+separate lever — raise `--tp-resistance-pct`.
+
+**Tests.** `tp_resistance_band_{long,short}_far_edge_is_tp` updated (far edge
+still TP, new near edge asserted); new `tp_resistance_band_matches_a_drawn_sr_line_width`
+(width == a drawn `build_sr_ranges` band, ~2× the old one-sided).
+`hs_default_adds_tp_resistance_band` unchanged (edge still == TP). tv-arm 263
+green.
+
+**Follow-up.** Consider whether the default width should be wider out of the box,
+and whether tv-arm should detect a structural swing-low/high near TP rather than
+pinning to the raw TP price (it currently does not).
+
 ## v115 — 2026-07-23 — StopNextEntry veto is entry-blocking only; it no longer retires the plan or kills the open-position reversal-close
 
 **Why.** A `too-low` (pcl-exhausted) veto fires when price has run ~80% to TP —

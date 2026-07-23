@@ -1396,22 +1396,38 @@ fn build_sr_ranges(roles: &Roles, band_pct: f64) -> Vec<[f64; 2]> {
         .collect()
 }
 
-/// One-sided S/R band pinned so its **far edge is the take-profit**, sitting on
-/// the approach side (toward entry). A golden reversal candle whose band-anchor
-/// lands inside it fires `07-close-on-sr-reversal`, closing the position for a
-/// partial win instead of round-tripping to the stop. H&S / iH&S only — the M/W
-/// path recomputes TP live and gets no auto band.
+/// S/R band pinned so its **far edge is the take-profit**, sitting on the
+/// approach side (toward entry). A golden reversal candle whose band-anchor lands
+/// inside it fires `07-close-on-sr-reversal`, closing the position for a partial
+/// win instead of round-tripping to the stop. H&S / iH&S only — the M/W path
+/// recomputes TP live and gets no auto band.
 ///
-/// `pct` is a percent of the TP price (e.g. `0.1` = 0.1% wide). Returns
-/// `[lo, hi]` with `lo <= hi` as required by the `sr_bands` validator.
+/// **Width matches a drawn S/R line** ([`build_sr_ranges`]). A drawn line is a
+/// full `±pct` band (`2·pct` total) centred on the line; this band is the same
+/// total width, but placed so its far edge is TP: the "line" (centre) sits one
+/// `pct` step onto the approach side (`TP·(1+pct)` for a short, `TP·(1-pct)` for
+/// a long) and the normal `±pct` band around it lands the near edge exactly on
+/// TP. So the band never extends *past* TP (a clean run to TP is unaffected) yet
+/// reaches a full drawn-band width up the approach side — twice the old
+/// one-sided `[TP, TP+pct]`, which was accidentally half a drawn line's width.
+/// Catching a reversal that turns further short of TP is a separate lever
+/// (`--tp-resistance-pct`).
+///
+/// `pct` is a percent of the TP price (e.g. `0.1` = 0.1%). Returns `[lo, hi]`
+/// with `lo <= hi` as required by the `sr_bands` validator.
 fn tp_resistance_band(tp: f64, direction: Direction, pct: f64) -> [f64; 2] {
-    let width = (pct / 100.0) * tp;
-    match direction {
-        // Long: price rises into TP from below, so the band hangs just under it.
-        Direction::Long => [round5(tp - width), round5(tp)],
-        // Short: price falls into TP from above, so the band sits just over it.
-        Direction::Short => [round5(tp), round5(tp + width)],
-    }
+    let pct = pct / 100.0;
+    // The S/R "line" (band centre) is one pct step onto the approach side of TP,
+    // so the ±pct band's far edge lands back on TP.
+    let center = match direction {
+        // Long: price rises into TP from below → approach side (and the band) is
+        // below TP, top edge = TP.
+        Direction::Long => tp * (1.0 - pct),
+        // Short: price falls into TP from above → approach side (and the band) is
+        // above TP, bottom edge = TP.
+        Direction::Short => tp * (1.0 + pct),
+    };
+    [round5(center * (1.0 - pct)), round5(center * (1.0 + pct))]
 }
 
 fn round5(v: f64) -> f64 {
@@ -2747,22 +2763,72 @@ mod tests {
 
     #[test]
     fn tp_resistance_band_long_far_edge_is_tp() {
-        // Long: band hangs just UNDER the TP (approach from below).
+        // Long: band hangs UNDER the TP (approach from below), TOP edge = TP.
+        // Centre one pct step below TP → the +pct edge lands back on TP.
         let tp = 1.20;
+        let pct = 0.1 / 100.0;
+        let center = tp * (1.0 - pct);
         let [lo, hi] = tp_resistance_band(tp, Direction::Long, 0.1);
-        assert_eq!(hi, round5(tp), "far edge is the TP");
-        assert_eq!(lo, round5(tp - (0.1 / 100.0) * tp));
+        assert_eq!(hi, round5(center * (1.0 + pct)), "far (top) edge is the TP");
+        assert_eq!(hi, round5(tp), "top edge lands exactly on TP");
+        assert_eq!(
+            lo,
+            round5(center * (1.0 - pct)),
+            "near edge is 2·pct below TP"
+        );
         assert!(lo < hi, "lo < hi for a valid band");
     }
 
     #[test]
     fn tp_resistance_band_short_far_edge_is_tp() {
-        // Short: band sits just OVER the TP (approach from above).
+        // Short: band sits OVER the TP (approach from above), BOTTOM edge = TP.
+        // Centre one pct step above TP → the −pct edge lands back on TP.
         let tp = 1.00;
+        let pct = 0.1 / 100.0;
+        let center = tp * (1.0 + pct);
         let [lo, hi] = tp_resistance_band(tp, Direction::Short, 0.1);
-        assert_eq!(lo, round5(tp), "far edge is the TP");
-        assert_eq!(hi, round5(tp + (0.1 / 100.0) * tp));
+        assert_eq!(
+            lo,
+            round5(center * (1.0 - pct)),
+            "far (bottom) edge is the TP"
+        );
+        assert_eq!(lo, round5(tp), "bottom edge lands exactly on TP");
+        assert_eq!(
+            hi,
+            round5(center * (1.0 + pct)),
+            "near edge is 2·pct above TP"
+        );
         assert!(lo < hi, "lo < hi for a valid band");
+    }
+
+    #[test]
+    fn tp_resistance_band_matches_a_drawn_sr_line_width() {
+        // The operator's requirement: the auto TP band must be the SAME total
+        // width as a drawn S/R line for the same pct — not the old half-width.
+        // A drawn line at price P → [P·(1−pct), P·(1+pct)]; its width is what the
+        // TP band must match. Compare at the TP band's own centre.
+        for (dir, tp) in [(Direction::Short, 1.00), (Direction::Long, 1.20)] {
+            let [lo, hi] = tp_resistance_band(tp, dir, 0.1);
+            let tp_width = hi - lo;
+            // A drawn band centred at this TP band's centre (the S/R "line").
+            let pct = 0.1 / 100.0;
+            let center = match dir {
+                Direction::Short => tp * (1.0 + pct),
+                Direction::Long => tp * (1.0 - pct),
+            };
+            let drawn = [round5(center * (1.0 - pct)), round5(center * (1.0 + pct))];
+            let drawn_width = drawn[1] - drawn[0];
+            assert!(
+                (tp_width - drawn_width).abs() < 1e-9,
+                "{dir:?}: TP band width {tp_width} must equal a drawn S/R band width {drawn_width}"
+            );
+            // And it must be ~twice the old one-sided width (pct·tp), the bug.
+            let old_one_sided = pct * tp;
+            assert!(
+                tp_width > old_one_sided * 1.9,
+                "{dir:?}: new width {tp_width} must be ~2× the old one-sided {old_one_sided}"
+            );
+        }
     }
 
     #[test]
