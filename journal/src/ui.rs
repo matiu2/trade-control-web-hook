@@ -160,6 +160,7 @@ mod tests {
             export_json: Some(EXPORT.to_string()),
             timeline_json: Some(TIMELINE.to_string()),
             replay_report: None,
+            tv_loaded: true,
             max_depth: 1,
         });
         app.set_screen(Screen::Timeline);
@@ -183,6 +184,7 @@ mod tests {
             export_json: Some(EXPORT.to_string()),
             timeline_json: Some(TIMELINE.to_string()),
             replay_report: None,
+            tv_loaded: true,
             max_depth: 1,
         });
         app.set_screen(Screen::Timeline);
@@ -228,6 +230,7 @@ mod tests {
             export_json: Some(EXPORT.to_string()),
             timeline_json: Some(TIMELINE.to_string()),
             replay_report: Some(REPLAY.to_string()),
+            tv_loaded: true,
             max_depth: 3,
         });
         app.set_screen(Screen::Compare);

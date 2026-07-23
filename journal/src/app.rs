@@ -43,8 +43,13 @@ pub struct PlanData {
     pub timeline_json: Option<String>,
     /// Raw `plan export` JSON — the detail popup's full dump.
     pub export_json: Option<String>,
-    /// The replay report (from `replay-candles`), filled on the Replay push.
+    /// The replay report (from `tv-arm --start … replay`), filled on the Replay
+    /// push.
     pub replay_report: Option<String>,
+    /// True once the TradingView chart has been loaded to this plan. The replay
+    /// re-arms from the live chart, so it must wait for this — otherwise tv-arm
+    /// reads whatever chart is up (possibly the prior plan or mid-load).
+    pub tv_loaded: bool,
     /// Deepest screen ever reached for this plan (delete guard reads this).
     pub max_depth: u8,
 }
@@ -223,9 +228,13 @@ impl App {
         jobs::spawn_timeline(self.job_tx.clone(), trade_id.to_string());
     }
 
-    /// Spawn the replay job unless cached or running. Needs the plan export; if
-    /// it isn't cached yet, the timeline job will fetch it — so we require it
-    /// here and let a not-yet-loaded plan spawn the timeline first.
+    /// Spawn the replay job unless cached or running. Replay re-arms from the
+    /// live TradingView chart (`tv-arm --start <armed_at> replay`), so it needs
+    /// the plan's `armed_at` (from the detail) as the `--start` cursor AND the
+    /// chart loaded to this plan. The detail is fetched by the timeline job; if
+    /// it isn't cached yet, kick that and let the retry (on re-enter) run the
+    /// replay once it lands. The TV-load auto-fires on the Timeline screen, so by
+    /// Replay/Compare the chart is already this plan's.
     fn start_replay(&mut self, trade_id: &str) {
         let cached = self
             .data
@@ -235,26 +244,35 @@ impl App {
         if cached {
             return;
         }
-        let Some(export) = self.data.get(trade_id).and_then(|d| d.export_json.clone()) else {
-            // No export yet — ensure the timeline job runs to fetch it; the
-            // replay is retried when we re-enter/refresh once it's cached.
-            self.start_timeline(trade_id);
-            return;
-        };
-        if !self.mark_in_flight(trade_id, JobKind::Replay) {
-            return;
-        }
-        // The replay's candle feed must be the plan's broker, or instrument
-        // resolution fails (an OANDA-only ratio like XAU/XAG isn't on
-        // TradeNation, which the CLI defaults to). Derive `--source` from the
-        // detail's broker; `None` when unknown leaves the CLI default.
-        let source = self
+        let armed_at = self
             .data
             .get(trade_id)
             .and_then(|d| d.detail.as_ref())
-            .and_then(|d| replay_source_for(&d.broker));
+            .and_then(|d| d.armed_at.clone());
+        let Some(armed_at) = armed_at else {
+            // Detail (with armed_at) not loaded yet — fetch it; the replay is
+            // retried when we re-enter/refresh once it's cached.
+            self.start_timeline(trade_id);
+            return;
+        };
+        // Replay re-arms from the live chart, so the chart must be loaded to this
+        // plan first. If it isn't, kick the load and defer — the LoadTv
+        // completion (apply_job) re-triggers the replay once the chart is up.
+        let tv_loaded = self
+            .data
+            .get(trade_id)
+            .map(|d| d.tv_loaded)
+            .unwrap_or(false);
+        if !tv_loaded {
+            self.start_load_tv(trade_id);
+            self.status = Status::info(format!("{trade_id}: loading chart before replay…"));
+            return;
+        }
+        if !self.mark_in_flight(trade_id, JobKind::Replay) {
+            return;
+        }
         self.status = Status::info(format!("{trade_id}: running replay…"));
-        jobs::spawn_replay(self.job_tx.clone(), trade_id.to_string(), export, source);
+        jobs::spawn_replay(self.job_tx.clone(), trade_id.to_string(), armed_at);
     }
 
     /// Add a job to the in-flight set. Returns `false` if it was already there
@@ -319,7 +337,17 @@ impl App {
                 self.status = Status::info(format!("{trade_id}: replay done"));
             }
             JobOutcome::LoadTv => {
+                self.data.entry(trade_id.clone()).or_default().tv_loaded = true;
                 self.status = Status::info(format!("{trade_id}: loaded in TradingView"));
+                // Replay re-arms from the now-loaded chart. If we're waiting on
+                // Replay/Compare for this plan, kick it now that the chart is up.
+                let is_open = self
+                    .current_plan()
+                    .map(|p| p.trade_id == trade_id)
+                    .unwrap_or(false);
+                if is_open && matches!(self.screen, Screen::Replay | Screen::Compare) {
+                    self.start_replay(&trade_id);
+                }
             }
             JobOutcome::Failed(msg) => {
                 self.status = Status::error(format!("{trade_id} {}: {msg}", kind.verb()));
@@ -512,17 +540,6 @@ fn fetch_plans() -> Result<Vec<PlanRow>> {
     parse_plan_list(&yaml)
 }
 
-/// Map a plan broker (`oanda` / `tradenation`) to the `replay-candles --source`
-/// value. `None` for an unknown/blank broker — the caller then omits `--source`
-/// and the CLI keeps its own default.
-fn replay_source_for(broker: &str) -> Option<String> {
-    match broker.to_ascii_lowercase().as_str() {
-        "oanda" => Some("oanda".to_string()),
-        "tradenation" => Some("tradenation".to_string()),
-        _ => None,
-    }
-}
-
 #[cfg(test)]
 impl App {
     /// Build an app from already-parsed rows, without touching the network —
@@ -665,20 +682,6 @@ mod tests {
         assert!(!app.drain_jobs());
     }
 
-    #[test]
-    fn replay_source_maps_broker() {
-        // The replay feed must match the plan's broker (XAU/XAG is OANDA-only).
-        assert_eq!(replay_source_for("oanda").as_deref(), Some("oanda"));
-        assert_eq!(replay_source_for("OANDA").as_deref(), Some("oanda"));
-        assert_eq!(
-            replay_source_for("tradenation").as_deref(),
-            Some("tradenation")
-        );
-        // Unknown/blank broker → no --source (CLI keeps its default).
-        assert_eq!(replay_source_for(""), None);
-        assert_eq!(replay_source_for("mystery"), None);
-    }
-
     const EXPORT: &str = include_str!("../tests/fixtures/plan_export.json");
     const TIMELINE: &str = include_str!("../tests/fixtures/plan_timeline.json");
     const REPLAY: &str = include_str!("../tests/fixtures/replay_report.txt");
@@ -694,6 +697,7 @@ mod tests {
             export_json: Some(EXPORT.to_string()),
             timeline_json: Some(TIMELINE.to_string()),
             replay_report: None, // replay not run yet
+            tv_loaded: true,
             max_depth: 1,
         });
         app.record_current();
@@ -711,6 +715,7 @@ mod tests {
             export_json: Some(EXPORT.to_string()),
             timeline_json: Some(TIMELINE.to_string()),
             replay_report: Some(REPLAY.to_string()),
+            tv_loaded: true,
             max_depth: 3,
         });
         app.record_current();
@@ -721,5 +726,42 @@ mod tests {
         // Recording again upserts — still one row.
         app.record_current();
         assert_eq!(app.recorded_count(), 1, "re-record upserts, no duplicate");
+    }
+
+    /// Replay must not fire until the chart is loaded (it re-arms from the live
+    /// chart). With the detail present but `tv_loaded` false, start_replay
+    /// defers — it kicks the TV-load instead of marking a Replay job in-flight.
+    #[test]
+    fn replay_waits_for_tv_load() {
+        let mut app = App::from_rows(vec![row("hs-aud-cad-a07622da")]);
+        app.select_to("hs-aud-cad-a07622da");
+        app.seed_current(PlanData {
+            detail: parse_plan_export(EXPORT).ok(),
+            export_json: Some(EXPORT.to_string()),
+            timeline_json: Some(TIMELINE.to_string()),
+            replay_report: None,
+            tv_loaded: false, // chart not loaded yet
+            max_depth: 2,
+        });
+        app.set_screen(Screen::Replay);
+        app.start_replay("hs-aud-cad-a07622da");
+        // No Replay job in-flight — it deferred behind the chart load.
+        assert!(
+            !app.in_flight
+                .contains(&("hs-aud-cad-a07622da".into(), JobKind::Replay)),
+            "replay must wait for the chart, not fire immediately"
+        );
+        // Once the chart loads, a subsequent start_replay proceeds (marks Replay
+        // in-flight, since armed_at is present and tv_loaded is now true).
+        app.data
+            .get_mut("hs-aud-cad-a07622da")
+            .expect("data")
+            .tv_loaded = true;
+        app.start_replay("hs-aud-cad-a07622da");
+        assert!(
+            app.in_flight
+                .contains(&("hs-aud-cad-a07622da".into(), JobKind::Replay)),
+            "with the chart loaded, replay fires"
+        );
     }
 }

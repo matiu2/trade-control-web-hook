@@ -89,23 +89,26 @@ pub fn plan_delete(trade_id: &str) -> Result<String> {
     run_trade_control(&["plan", "delete", trade_id])
 }
 
-/// Run `replay-candles-<env> --plan <file>`. When `annotate` is set, also draw
-/// the simulated positions onto the live TradingView chart via tv-mcp. `source`
-/// selects the candle feed's broker (`oanda` / `tradenation`) — it MUST match
-/// the plan's broker or instrument resolution fails (e.g. an OANDA-only ratio
-/// like XAU/XAG isn't listed on TradeNation). `None` leaves the CLI default
-/// (`tradenation`). Returns the replay report (stdout); stderr is appended on
-/// failure.
-pub fn replay(plan_file: &std::path::Path, annotate: bool, source: Option<&str>) -> Result<String> {
-    let program = bin("replay-candles");
+/// Replay the setup by re-arming it from the **live TradingView chart** and
+/// chaining into `replay-candles`, via `tv-arm-<env> --start <armed_at> replay`.
+///
+/// The journal has already loaded the plan's chart (symbol + timeframe, right
+/// broker), so tv-arm reads the instrument, timeframe, and **broker from the
+/// chart's own exchange** — no `--instrument`/`--source` to pass, and no
+/// instrument-resolution failure for OANDA-only assets (e.g. the XAU/XAG ratio
+/// that isn't listed on TradeNation). `--start <armed_at>` is the "live now"
+/// cursor: tv-arm walks the whole chart to find the pattern's roles
+/// (neckline / invalidation / expiry) relative to it.
+///
+/// `armed_at` is the plan's RFC3339 UTC arm time. The `replay` subcommand
+/// defaults to `--verbose --annotate true --source <chart-broker>`; we take
+/// those defaults (annotate draws the sim onto the chart, which is fine — the
+/// chart is the focus). Returns the replay report (stdout); stderr is appended
+/// on failure.
+pub fn replay_via_tv_arm(armed_at: &str) -> Result<String> {
+    let program = bin("tv-arm");
     let mut cmd = Command::new(&program);
-    cmd.arg("--plan").arg(plan_file);
-    if let Some(source) = source {
-        cmd.arg("--source").arg(source);
-    }
-    if annotate {
-        cmd.arg("--annotate").arg("true");
-    }
+    cmd.arg("--start").arg(armed_at).arg("replay");
     let out = cmd
         .output()
         .map_err(|e| eyre!("failed to launch `{program}`: {e}"))?;
@@ -113,8 +116,7 @@ pub fn replay(plan_file: &std::path::Path, annotate: bool, source: Option<&str>)
     if !out.status.success() {
         let stderr = String::from_utf8_lossy(&out.stderr);
         return Err(eyre!(
-            "`{program} --plan {}` failed ({}): {}\n{stdout}",
-            plan_file.display(),
+            "`{program} --start {armed_at} replay` failed ({}): {}\n{stdout}",
             out.status,
             stderr.trim()
         ));

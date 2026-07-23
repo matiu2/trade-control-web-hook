@@ -74,20 +74,14 @@ pub fn spawn_timeline(tx: Sender<JobResult>, trade_id: String) {
     });
 }
 
-/// Spawn the replay job. `export_json` is the already-fetched plan body (written
-/// to a temp file here so the worker thread does no shared-state reads).
-/// `source` is the plan's broker as a `replay-candles --source` value
-/// (`oanda`/`tradenation`) — it must match the plan's broker or instrument
-/// resolution fails (an OANDA-only ratio like XAU/XAG isn't on TradeNation).
-pub fn spawn_replay(
-    tx: Sender<JobResult>,
-    trade_id: String,
-    export_json: String,
-    source: Option<String>,
-) {
-    spawn(tx, trade_id.clone(), JobKind::Replay, move || {
-        let path = write_plan(&trade_id, "replay", &export_json)?;
-        let report = cli::replay(&path, false, source.as_deref())?;
+/// Spawn the replay job. Re-arms the setup from the **live TradingView chart**
+/// (already loaded by the TV-load job) via `tv-arm --start <armed_at> replay`,
+/// so the instrument + broker come from the chart — no plan file, no `--source`,
+/// and no resolution failure for OANDA-only assets. `armed_at` is the plan's
+/// RFC3339 UTC arm time, used as the `--start` cursor.
+pub fn spawn_replay(tx: Sender<JobResult>, trade_id: String, armed_at: String) {
+    spawn(tx, trade_id, JobKind::Replay, move || {
+        let report = cli::replay_via_tv_arm(&armed_at)?;
         Ok(JobOutcome::Replay(report))
     });
 }
@@ -107,17 +101,6 @@ pub fn spawn_load_tv(
         crate::tv::load_chart(&instrument, &broker, &granularity)?;
         Ok(JobOutcome::LoadTv)
     });
-}
-
-/// Write a plan body to a per-purpose temp file for `replay-candles --plan`.
-fn write_plan(
-    trade_id: &str,
-    purpose: &str,
-    export_json: &str,
-) -> color_eyre::Result<std::path::PathBuf> {
-    let path = std::env::temp_dir().join(format!("journal-{purpose}-{trade_id}.json"));
-    std::fs::write(&path, export_json)?;
-    Ok(path)
 }
 
 /// Run `work` on a new thread, mapping its `Result` into a `JobResult` and
