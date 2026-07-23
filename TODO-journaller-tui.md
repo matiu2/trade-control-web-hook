@@ -1,5 +1,30 @@
 # TODO — `journal` TUI (trade-journalling operator tool)
 
+## STATUS 2026-07-23 — v1 SHIPPED, verified live on staging
+Commits `042fdd7` (scaffold), `3912950` (TUI), `f6612b8` (fired-rule fix).
+Installed as `journal-staging` / `journal-dev`. All screens proven end-to-end
+in a real terminal (tmux) against the live staging worker: List → Timeline
+(info bar: `AUD/CAD · h1 · short │ normal (break+close+retest) (BCR stop) │
+outcome`) → Replay (full `replay-candles` report) → Compare (replay ‖ live
+side-by-side). Delete guard blocks unopened plans; confirm modal, `i` detail
+popup, and `←`-unwind all work. 13 tests (incl. 2 TestBackend render tests).
+
+**Remaining / v2:**
+- **Compare diff** — currently side-by-side only; compute + highlight the
+  replay↔live divergences (the stated bug-hunting goal).
+- **TV auto-load on Timeline push** — wired via `load_tv` (`l` key, replay
+  `--annotate`) but NOT yet auto-fired on the Timeline push; `run_screen_effect`
+  has a TODO marker. Decide: auto-annotate is slow (pulls candles), so maybe
+  keep it on the explicit `l` key rather than auto.
+- **Deploy** — installed manually (bake + copy); `deploy-staging.sh` now lists
+  `journal` so the next full deploy installs it too (but that also rolls the
+  worker — fine when deploying anyway).
+- Async replay (spawn + channel) if the synchronous run's freeze annoys.
+- Parent submodule pointer bump after this lands on `main`.
+
+---
+
+
 A Ratatui terminal app to walk old `trade-control-staging` plans, load them
 into TradingView, replay them, and delete once journalled. Keyboard-first,
 left→right screen-stack flow.
