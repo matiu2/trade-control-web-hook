@@ -15,6 +15,7 @@ mod keys;
 mod plan;
 mod screen;
 mod timeline;
+mod tv;
 mod ui;
 
 use std::io::{Stdout, stdout};

@@ -185,7 +185,13 @@ impl App {
             return;
         };
         match screen {
-            Screen::Timeline => self.start_timeline(&trade_id),
+            Screen::Timeline => {
+                self.start_timeline(&trade_id);
+                // Auto-load TradingView on reaching the first deep screen. If the
+                // detail is already cached this fires immediately; otherwise the
+                // timeline job's completion (apply_job) fires it once loaded.
+                self.start_load_tv(&trade_id);
+            }
             Screen::Replay => self.start_replay(&trade_id),
             Screen::Compare => {
                 // Compare needs both; each is a no-op if already cached/running.
@@ -273,15 +279,23 @@ impl App {
                 entry.detail = detail;
                 entry.timeline_json = Some(timeline_json);
                 self.status = Status::info(format!("{trade_id}: timeline loaded"));
-                // A replay may have been requested before the export existed;
-                // if we're on/at Replay or Compare, kick it now.
-                if matches!(self.screen, Screen::Replay | Screen::Compare)
-                    && self
-                        .current_plan()
-                        .map(|p| p.trade_id == trade_id)
-                        .unwrap_or(false)
-                {
-                    self.start_replay(&trade_id);
+                // These only matter while this plan is the open one on a deep
+                // screen — not for a background prefetch.
+                let is_open = self
+                    .current_plan()
+                    .map(|p| p.trade_id == trade_id)
+                    .unwrap_or(false);
+                if is_open {
+                    // Auto-load TradingView the first time we reach a deep screen
+                    // (the detail with the anchor time only exists now).
+                    if self.screen.depth() >= Screen::Timeline.depth() {
+                        self.start_load_tv(&trade_id);
+                    }
+                    // A replay may have been requested before the export existed;
+                    // if we're on/at Replay or Compare, kick it now.
+                    if matches!(self.screen, Screen::Replay | Screen::Compare) {
+                        self.start_replay(&trade_id);
+                    }
                 }
             }
             JobOutcome::Replay(report) => {
@@ -289,7 +303,7 @@ impl App {
                 self.status = Status::info(format!("{trade_id}: replay done"));
             }
             JobOutcome::LoadTv => {
-                self.status = Status::info(format!("{trade_id}: drawn on TradingView"));
+                self.status = Status::info(format!("{trade_id}: loaded in TradingView"));
             }
             JobOutcome::Failed(msg) => {
                 self.status = Status::error(format!("{trade_id} {}: {msg}", kind.verb()));
@@ -299,24 +313,49 @@ impl App {
 
     // -- actions -----------------------------------------------------------
 
-    /// Load the current plan into TradingView by replaying with `--annotate`
-    /// (draws the simulated positions on the live chart via tv-mcp) — as a
-    /// background job so the ~seconds-long draw doesn't freeze the UI.
+    /// Load the current plan into TradingView (the `l` key) — navigate the live
+    /// chart to this setup (symbol + timeframe + scroll-to-anchor + zoom-out),
+    /// as a background job so the ~few-second navigation doesn't freeze the UI.
+    /// Also auto-fired once when the Timeline screen is first reached.
     pub fn load_tv(&mut self) {
         let Some(trade_id) = self.current_plan().map(|p| p.trade_id.clone()) else {
             return;
         };
-        let Some(export) = self.data.get(&trade_id).and_then(|d| d.export_json.clone()) else {
-            // Not loaded yet — fetch the plan first; the operator can re-press l.
-            self.start_timeline(&trade_id);
-            self.status = Status::info(format!("{trade_id}: loading plan, press l again"));
+        self.start_load_tv(&trade_id);
+    }
+
+    /// Spawn the TradingView-load job for `trade_id` if the plan detail (which
+    /// carries the anchor time) is loaded. If it isn't yet, kick the timeline
+    /// job; `apply_job` re-tries the load when the detail lands.
+    fn start_load_tv(&mut self, trade_id: &str) {
+        // Instrument + granularity come from the list row; anchor from detail.
+        let Some(row) = self.plans.iter().find(|p| p.trade_id == trade_id) else {
             return;
         };
-        if !self.mark_in_flight(&trade_id, JobKind::LoadTv) {
+        let instrument = row.instrument.clone();
+        let granularity = row.granularity.clone();
+        let anchor = self
+            .data
+            .get(trade_id)
+            .and_then(|d| d.detail.as_ref())
+            .and_then(|d| d.armed_at.clone());
+        let Some(anchor) = anchor else {
+            // Detail (with armed_at) not loaded yet — fetch it; the Timeline
+            // completion will fire the load.
+            self.start_timeline(trade_id);
+            return;
+        };
+        if !self.mark_in_flight(trade_id, JobKind::LoadTv) {
             return;
         }
-        self.status = Status::info(format!("{trade_id}: drawing on TradingView…"));
-        jobs::spawn_load_tv(self.job_tx.clone(), trade_id, export);
+        self.status = Status::info(format!("{trade_id}: loading TradingView…"));
+        jobs::spawn_load_tv(
+            self.job_tx.clone(),
+            trade_id.to_string(),
+            instrument,
+            granularity,
+            anchor,
+        );
     }
 
     /// Request a replay re-run (the `r` key), bypassing the cache.

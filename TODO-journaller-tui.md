@@ -33,11 +33,22 @@ popup, and `←`-unwind all work. 13 tests (incl. 2 TestBackend render tests).
   tests (`drain_applies_timeline…`, `drain_surfaces_failure…`, noop). Delete
   stays synchronous (fast + deliberately blocking).
 
+**Done (v2):**
+- **TV load** — SHIPPED. `journal/src/tv.rs` drives tv-mcp to *navigate* the
+  live chart (symbol via instrument-lookup → timeframe → scroll-to-armed_at →
+  zoom out ~3×). Navigation only, no drawing. Auto-fires on the first `→`
+  (Timeline screen) and re-fireable with `l`; runs as a background job (footer:
+  "loading TradingView…" spinner). Commands shell `node <tv-mcp>/src/cli/…`
+  with 1s sleeps between (calibrated interactively — TV needs a beat). Times are
+  passed as **unix timestamps** (not date strings — the Node side parses bare
+  dates in local TZ). Verified live: AUD/CHF plan → symbol OANDA:AUDCHF, tf 60,
+  scrolled + zoomed. 4 tv unit tests.
+  - **Known caveat**: near the live data edge the ±75-bar zoom window is
+    clamped/loosened by TV (a plan armed a few days ago with data through *now*
+    shows a wider span). Historical/archived plans (the journalling norm) centre
+    cleanly. Not worth tightening unless it annoys.
+
 **Remaining / v2:**
-- **TV auto-load on Timeline push** — wired via `load_tv` (`l` key, replay
-  `--annotate`, now async) but NOT yet auto-fired on the Timeline push. Decide:
-  auto-annotate is slow (pulls candles), so maybe keep it on the explicit `l`
-  key rather than auto.
 - **Deploy** — installed manually (bake + copy); `deploy-staging.sh` now lists
   `journal` so the next full deploy installs it too (but that also rolls the
   worker — fine when deploying anyway).
