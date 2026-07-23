@@ -1,7 +1,7 @@
 //! Shared clap definitions for the `replay-candles` binary.
 //!
 //! These live in the `cli` **library** (not the binary) so a second
-//! consumer — `tv-arm --replay` — can build and validate a replay
+//! consumer — `tv-arm ... replay` — can build and validate a replay
 //! invocation against the *same* clap struct the standalone binary
 //! parses. One source of truth for the flags, their defaults, help
 //! text, and validation; no arg drift between `replay-candles` and the
@@ -38,7 +38,7 @@ pub enum CandleSource {
 
 impl CandleSource {
     /// The lower-case wire form — the value `--source` accepts and the
-    /// string `tv-arm --replay` passes through when it derives the source
+    /// string `tv-arm ... replay` passes through when it derives the source
     /// from the resolved broker.
     pub fn as_str(self) -> &'static str {
         match self {
@@ -145,12 +145,12 @@ impl DetectorMarkConfig {
 }
 
 /// `replay-candles` command-line arguments. Shared between the standalone
-/// binary and `tv-arm --replay`.
+/// binary and `tv-arm ... replay`.
 #[derive(Parser, Debug)]
 #[command(name = "replay-candles")]
 #[command(about = "Replay a candle window through the engine's decision logic, offline")]
 pub struct ReplayArgs {
-    /// Path to the TradePlan JSON written by `tv-arm --plan-out`. Required for a
+    /// Path to the TradePlan JSON written by `tv-arm ... plan-out`. Required for a
     /// live replay; omitted (and ignored) under `--test-mode`, where the plan
     /// comes from the saved fixture.
     #[arg(long)]

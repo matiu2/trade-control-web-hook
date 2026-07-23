@@ -11,7 +11,7 @@
 
 use std::path::PathBuf;
 
-use clap::{Parser, ValueEnum};
+use clap::{Parser, Subcommand, ValueEnum};
 
 /// CLI broker selection. Mirrors `conventions::Broker` but kept
 /// crate-local so the value-enum can be used in `clap` derive
@@ -142,71 +142,15 @@ pub struct Args {
     #[arg(long)]
     pub broker_dry_run: bool,
 
-    /// Register the trade as ONE signed `TradePlan` with the worker's
-    /// server-side engine (POSTed directly to the baked webhook). This is
-    /// how a trade is armed: the `*/15` cron then evaluates the plan against
-    /// fresh candles and dispatches its fires. (The legacy path — POST a
-    /// signed alert bundle to TradingView and let TV fire the alerts — has
-    /// been retired.)
-    #[arg(long)]
-    pub register_plan: bool,
-
-    /// Re-arm an existing setup: before registering the fresh plan, delete the
-    /// prior registered plan for this instrument from the server-side engine
-    /// (clears its `plan:` + `plan-state:` KV so the new plan starts clean and
-    /// the old one stops ticking). Use after moving annotations on the chart
-    /// and re-running. Only meaningful with `--register-plan`.
+    /// The action to take once the `TradePlan` is built. When omitted, tv-arm
+    /// builds + signs the bundle to disk and stops (no worker POST, no replay).
+    /// The three verbs are **mutually exclusive** — pick one:
     ///
-    /// This is a **replace**, not an in-place patch: the new plan gets a fresh
-    /// `trade_id` and a blank engine state (phase, vetos, seen-ids,
-    /// entry-attempts, news/blackout windows are all keyed by trade_id, so none
-    /// carry over). Safe as a clean re-arm *before* entry; once a plan has a
-    /// live resting order or open position, replacing it can strand that
-    /// order/position — the new plan can't see it (`--replace` reconciles only
-    /// KV, never the broker).
-    ///
-    /// - **`--replace`** (no value): auto-resolves the target by instrument —
-    ///   if exactly one plan is registered for this instrument it's deleted; if
-    ///   none, it's a no-op; if more than one, it's a hard error (pass the id).
-    /// - **`--replace <trade-id>`**: deletes exactly that plan, no matter how
-    ///   many are registered. The trade_id comes from `trade-control plan list`.
-    ///
-    /// Leaves TradingView alerts untouched — this reconciles only the engine
-    /// plan. (tv-arm mints a fresh random trade_id each run, so without
-    /// `--replace` a re-arm leaves the old plan ticking until its TTL.)
-    ///
-    /// `--update` is a deprecated alias for `--replace` (same behaviour).
-    ///
-    /// `--replace` is **not** a boolean: its value (when given) is a trade_id,
-    /// so `--replace=true` / `--replace=false` are rejected with a hint to use
-    /// bare `--replace`. Otherwise `=true` would be silently taken as
-    /// "delete the plan whose id is `true`" — a no-such-plan worker 400.
-    #[arg(
-        long,
-        visible_alias = "update",
-        num_args = 0..=1,
-        default_missing_value = "",
-        value_parser = parse_replace_target
-    )]
-    pub replace: Option<String>,
-
-    /// Register the plan in **observe-only (shadow) mode**: the server-side
-    /// engine evaluates it and advances its state exactly as a live plan, but
-    /// never dispatches its fires to the broker — each would-be fire is logged
-    /// instead. The safe way to watch a new plan's decisions on demo without
-    /// placing real orders. Only meaningful with `--register-plan`. Default: live.
-    #[arg(long)]
-    pub shadow: bool,
-
-    /// Write the built `TradePlan` as pretty JSON to this path. Lets the offline
-    /// `replay-candles` harness load the exact plan the engine would receive and
-    /// replay a candle window through it.
-    ///
-    /// Builds the plan on its own — you do **not** need `--register-plan`. Used
-    /// alone, it writes the JSON and stops (no worker POST). Combined with
-    /// `--register-plan`, it also registers the plan with the worker.
-    #[arg(long)]
-    pub plan_out: Option<PathBuf>,
+    /// - **`register`** — arm the trade with the worker's server-side engine.
+    /// - **`plan-out <FILE>`** — write the built plan JSON to `<FILE>` and stop.
+    /// - **`replay [ARGS…]`** — chain into `replay-candles` on the built plan.
+    #[command(subcommand)]
+    pub command: Option<Command>,
 
     /// Opt in to multi-shot entries: if the broker rejects the order
     /// (e.g. spread too wide), the worker will retry on subsequent
@@ -600,38 +544,116 @@ pub struct Args {
     /// `~/Downloads/tradingview-mcp-jackson` path.
     #[arg(long)]
     pub tv_mcp_root: Option<PathBuf>,
+}
 
-    /// After arming, chain straight into `replay-candles` on the freshly-built
-    /// plan. The plan JSON is written (to `--plan-out` if given, else a temp
-    /// file) and `replay-candles-<env>` is invoked with sensible defaults
-    /// (`--verbose --annotate true --source <resolved-broker>`). tv-arm picks
-    /// the suffixed binary matching its own environment (`tv-arm-staging` →
-    /// `replay-candles-staging`).
-    ///
-    /// Any tokens after `--replay` are passed through to `replay-candles`
-    /// verbatim and **override** the defaults, e.g.
-    /// `tv-arm --replay --annotate false --warmup-bars 400`. Use `--` to end
-    /// tv-arm's own flags first if a passthrough flag collides with one of
-    /// tv-arm's: `tv-arm --start … -- --start 2026-07-01T00:00`.
-    ///
-    /// When `--replay` is set and `--start` is **absent**, tv-arm looks for a
-    /// single TradingView **Note** (`text_note`) whose text is exactly `start`
-    /// and uses its first anchor's time as the `--start` cursor — so you can
-    /// mark live-now on the chart instead of typing an RFC3339 timestamp. An
-    /// explicit `--start` always wins; two notes saying `start` is an error.
-    #[arg(long)]
-    pub replay: bool,
+/// The terminal action a `tv-arm` invocation performs on the plan it builds.
+/// These are the three former options (`--register-plan`, `--plan-out`,
+/// `--replay`) promoted to **strictly-exclusive** subcommands — you can no
+/// longer arm *and* replay (or arm *and* write JSON) in one invocation. When
+/// no subcommand is given, tv-arm builds + signs the bundle to disk and stops.
+#[derive(Debug, Subcommand)]
+pub enum Command {
+    /// Arm the trade: register it as ONE signed `TradePlan` with the worker's
+    /// server-side engine (POSTed directly to the baked webhook). The `*/15`
+    /// cron then evaluates the plan against fresh candles and dispatches its
+    /// fires. (The legacy path — POST a signed alert bundle to TradingView and
+    /// let TV fire the alerts — has been retired.)
+    Register {
+        /// Re-arm an existing setup: before registering the fresh plan, delete
+        /// the prior registered plan for this instrument from the server-side
+        /// engine (clears its `plan:` + `plan-state:` KV so the new plan starts
+        /// clean and the old one stops ticking). Use after moving annotations
+        /// on the chart and re-running.
+        ///
+        /// This is a **replace**, not an in-place patch: the new plan gets a
+        /// fresh `trade_id` and a blank engine state (phase, vetos, seen-ids,
+        /// entry-attempts, news/blackout windows are all keyed by trade_id, so
+        /// none carry over). Safe as a clean re-arm *before* entry; once a plan
+        /// has a live resting order or open position, replacing it can strand
+        /// that order/position — the new plan can't see it (`--replace`
+        /// reconciles only KV, never the broker).
+        ///
+        /// - **`--replace`** (no value): auto-resolves the target by instrument
+        ///   — if exactly one plan is registered for this instrument it's
+        ///   deleted; if none, it's a no-op; if more than one, it's a hard error
+        ///   (pass the id).
+        /// - **`--replace <trade-id>`**: deletes exactly that plan, no matter
+        ///   how many are registered. The trade_id comes from `trade-control
+        ///   plan list`.
+        ///
+        /// Leaves TradingView alerts untouched — this reconciles only the engine
+        /// plan. (tv-arm mints a fresh random trade_id each run, so without
+        /// `--replace` a re-arm leaves the old plan ticking until its TTL.)
+        ///
+        /// `--update` is a deprecated alias for `--replace` (same behaviour).
+        ///
+        /// `--replace` is **not** a boolean: its value (when given) is a
+        /// trade_id, so `--replace=true` / `--replace=false` are rejected with a
+        /// hint to use bare `--replace`. Otherwise `=true` would be silently
+        /// taken as "delete the plan whose id is `true`" — a no-such-plan worker
+        /// 400.
+        #[arg(
+            long,
+            visible_alias = "update",
+            num_args = 0..=1,
+            default_missing_value = "",
+            value_parser = parse_replace_target
+        )]
+        replace: Option<String>,
 
-    /// Passthrough arguments for `replay-candles`, collected after `--replay`.
-    /// Parsed against the shared `ReplayArgs` clap definition before the
-    /// shell-out, so a bad flag is caught with `replay-candles`' own error.
-    /// Only meaningful with `--replay`.
-    #[arg(
-        trailing_var_arg = true,
-        allow_hyphen_values = true,
-        value_name = "REPLAY_ARGS"
-    )]
-    pub replay_args: Vec<String>,
+        /// Register the plan in **observe-only (shadow) mode**: the server-side
+        /// engine evaluates it and advances its state exactly as a live plan,
+        /// but never dispatches its fires to the broker — each would-be fire is
+        /// logged instead. The safe way to watch a new plan's decisions on demo
+        /// without placing real orders. Default: live.
+        #[arg(long)]
+        shadow: bool,
+    },
+
+    /// Write the built `TradePlan` as pretty JSON to `<FILE>` and stop (no
+    /// worker POST). Lets the offline `replay-candles` harness load the exact
+    /// plan the engine would receive and replay a candle window through it.
+    PlanOut {
+        /// Destination path for the pretty-printed plan JSON.
+        #[arg(value_name = "FILE")]
+        file: PathBuf,
+    },
+
+    /// Chain straight into `replay-candles` on the freshly-built plan. The plan
+    /// JSON is written to a temp file and `replay-candles-<env>` is invoked with
+    /// sensible defaults (`--verbose --annotate true --source <resolved-broker>`).
+    /// tv-arm picks the suffixed binary matching its own environment
+    /// (`tv-arm-staging` → `replay-candles-staging`).
+    ///
+    /// Any trailing tokens are passed through to `replay-candles` verbatim and
+    /// **override** the defaults, e.g. `tv-arm replay --annotate false
+    /// --warmup-bars 400`. Use `--` to end tv-arm's own flags first if a
+    /// passthrough flag collides with one of tv-arm's:
+    /// `tv-arm --start … replay -- --start 2026-07-01T00:00`.
+    ///
+    /// When `--start` is **absent**, tv-arm looks for a single TradingView
+    /// **Note** (`text_note`) whose text is exactly `start` and uses its first
+    /// anchor's time as the `--start` cursor — so you can mark live-now on the
+    /// chart instead of typing an RFC3339 timestamp. An explicit `--start`
+    /// always wins; two notes saying `start` is an error.
+    Replay {
+        /// Passthrough arguments for `replay-candles`, collected verbatim.
+        /// Parsed against the shared `ReplayArgs` clap definition before the
+        /// shell-out, so a bad flag is caught with `replay-candles`' own error.
+        #[arg(
+            trailing_var_arg = true,
+            allow_hyphen_values = true,
+            value_name = "REPLAY_ARGS"
+        )]
+        args: Vec<String>,
+    },
+}
+
+impl Command {
+    /// True when this is the `register` verb (arm the worker).
+    pub fn is_register(&self) -> bool {
+        matches!(self, Command::Register { .. })
+    }
 }
 
 impl Args {
@@ -660,6 +682,55 @@ impl Args {
             self.require_confirmation = true;
         }
         self
+    }
+
+    /// True when the `register` subcommand was given — the plan is armed with
+    /// the worker's server-side engine. Derived from [`Args::command`] so the
+    /// pipeline reads a single boolean like it did off the old
+    /// `--register-plan` flag.
+    pub fn register_plan(&self) -> bool {
+        matches!(self.command, Some(Command::Register { .. }))
+    }
+
+    /// The `plan-out <FILE>` destination when that subcommand was given, else
+    /// `None`. Was the old `--plan-out` option.
+    pub fn plan_out(&self) -> Option<&std::path::Path> {
+        match &self.command {
+            Some(Command::PlanOut { file }) => Some(file.as_path()),
+            _ => None,
+        }
+    }
+
+    /// True when the `replay` subcommand was given — chain into
+    /// `replay-candles` on the built plan. Was the old `--replay` flag.
+    pub fn replay(&self) -> bool {
+        matches!(self.command, Some(Command::Replay { .. }))
+    }
+
+    /// Passthrough tokens for `replay-candles`, collected after the `replay`
+    /// subcommand. Empty (and irrelevant) for any other subcommand. Was the old
+    /// trailing `--replay [REPLAY_ARGS…]`.
+    pub fn replay_args(&self) -> &[String] {
+        match &self.command {
+            Some(Command::Replay { args }) => args,
+            _ => &[],
+        }
+    }
+
+    /// The `register --replace [<id>]` target when arming with a re-arm, else
+    /// `None`. Bare `--replace` yields `Some("")` (auto-resolve by instrument);
+    /// `--replace <id>` yields `Some(id)`. Only ever `Some` under `register`.
+    pub fn replace(&self) -> Option<&str> {
+        match &self.command {
+            Some(Command::Register { replace, .. }) => replace.as_deref(),
+            _ => None,
+        }
+    }
+
+    /// True when arming in observe-only shadow mode (`register --shadow`).
+    /// Was the old `--shadow` flag; only meaningful under `register`.
+    pub fn shadow(&self) -> bool {
+        matches!(self.command, Some(Command::Register { shadow: true, .. }))
     }
 
     /// Validate flag combinations clap can't express. Call after
@@ -778,11 +849,58 @@ mod tests {
         // Auto TP-resistance band: on by default, 0.1% wide.
         assert_eq!(args.tp_resistance_pct, 0.1);
         assert!(!args.skip_tp_resistance);
-        // Re-arm flag is opt-in.
-        assert!(args.replace.is_none());
-        // --replay is opt-in with no passthrough by default.
-        assert!(!args.replay);
-        assert!(args.replay_args.is_empty());
+        // No subcommand by default → build+sign to disk only.
+        assert!(args.command.is_none());
+        assert!(!args.register_plan());
+        assert!(args.plan_out().is_none());
+        // Re-arm target is None without the `register --replace` subcommand.
+        assert!(args.replace().is_none());
+        // replay is opt-in with no passthrough by default.
+        assert!(!args.replay());
+        assert!(args.replay_args().is_empty());
+    }
+
+    #[test]
+    fn subcommands_are_mutually_exclusive_and_map_to_accessors() {
+        // `register` → arm only.
+        let a = Args::try_parse_from(["tv-arm", "register"]).expect("parse register");
+        assert!(a.register_plan());
+        assert!(!a.replay());
+        assert!(a.plan_out().is_none());
+
+        // `plan-out FILE` → write JSON only.
+        let a =
+            Args::try_parse_from(["tv-arm", "plan-out", "/tmp/plan.json"]).expect("parse plan-out");
+        assert!(!a.register_plan());
+        assert!(!a.replay());
+        assert_eq!(a.plan_out(), Some(std::path::Path::new("/tmp/plan.json")));
+
+        // `replay` → replay only.
+        let a = Args::try_parse_from(["tv-arm", "replay"]).expect("parse replay");
+        assert!(a.replay());
+        assert!(!a.register_plan());
+        assert!(a.plan_out().is_none());
+
+        // Two subcommands in one invocation is a parse error (exclusive).
+        let res = Args::try_parse_from(["tv-arm", "register", "plan-out", "/tmp/p.json"]);
+        assert!(res.is_err(), "two subcommands must not parse: {res:?}");
+    }
+
+    #[test]
+    fn plan_out_requires_a_file_positional() {
+        // `plan-out` with no FILE is a parse error.
+        let res = Args::try_parse_from(["tv-arm", "plan-out"]);
+        assert!(res.is_err(), "plan-out needs a FILE: {res:?}");
+    }
+
+    #[test]
+    fn shadow_lives_under_register() {
+        let a = Args::try_parse_from(["tv-arm", "register", "--shadow"]).expect("parse");
+        assert!(a.register_plan());
+        assert!(a.shadow());
+        // Default register is live, not shadow.
+        let a = Args::try_parse_from(["tv-arm", "register"]).expect("parse");
+        assert!(!a.shadow());
     }
 
     #[test]
@@ -798,82 +916,83 @@ mod tests {
     }
 
     #[test]
-    fn replay_flag_collects_passthrough_args() {
-        // Bare --replay: on, no passthrough.
-        let args = Args::try_parse_from(["tv-arm", "--replay"]).expect("bare --replay");
-        assert!(args.replay);
-        assert!(args.replay_args.is_empty());
+    fn replay_subcommand_collects_passthrough_args() {
+        // Bare `replay`: on, no passthrough.
+        let args = Args::try_parse_from(["tv-arm", "replay"]).expect("bare replay");
+        assert!(args.replay());
+        assert!(args.replay_args().is_empty());
 
-        // Tokens after --replay are collected verbatim for replay-candles,
+        // Tokens after `replay` are collected verbatim for replay-candles,
         // including hyphenated flags (trailing_var_arg + allow_hyphen_values).
         let args = Args::try_parse_from([
             "tv-arm",
-            "--replay",
+            "replay",
             "--annotate",
             "false",
             "--warmup-bars",
             "400",
         ])
-        .expect("--replay with passthrough");
-        assert!(args.replay);
+        .expect("replay with passthrough");
+        assert!(args.replay());
         assert_eq!(
-            args.replay_args,
-            vec!["--annotate", "false", "--warmup-bars", "400"]
+            args.replay_args(),
+            ["--annotate", "false", "--warmup-bars", "400"]
         );
     }
 
     #[test]
-    fn replay_passthrough_does_not_swallow_tv_arm_flags_before_replay() {
-        // tv-arm's own flags placed BEFORE --replay still bind to tv-arm; only
-        // tokens AFTER --replay become passthrough.
+    fn replay_passthrough_does_not_swallow_tv_arm_flags_before_the_subcommand() {
+        // tv-arm's own flags placed BEFORE the `replay` subcommand still bind to
+        // tv-arm; only tokens AFTER it become passthrough.
         let args = Args::try_parse_from([
             "tv-arm",
             "--skip-calendar-bars",
-            "--replay",
+            "replay",
             "--source",
             "oanda",
         ])
         .expect("mixed parse");
         assert!(args.skip_calendar_bars);
-        assert!(args.replay);
-        assert_eq!(args.replay_args, vec!["--source", "oanda"]);
+        assert!(args.replay());
+        assert_eq!(args.replay_args(), ["--source", "oanda"]);
     }
 
     #[test]
-    fn replace_flag_parses_bare_and_with_a_target() {
+    fn register_replace_parses_bare_and_with_a_target() {
         // Bare `--replace` → empty string (auto-resolve by instrument).
-        let args = Args::try_parse_from(["tv-arm", "--replace"]).expect("parse bare");
-        assert_eq!(args.replace.as_deref(), Some(""));
+        let args = Args::try_parse_from(["tv-arm", "register", "--replace"]).expect("parse bare");
+        assert_eq!(args.replace(), Some(""));
         // `--replace <id>` → the explicit target.
-        let args =
-            Args::try_parse_from(["tv-arm", "--replace", "hs-eurusd-aaaa"]).expect("parse target");
-        assert_eq!(args.replace.as_deref(), Some("hs-eurusd-aaaa"));
+        let args = Args::try_parse_from(["tv-arm", "register", "--replace", "hs-eurusd-aaaa"])
+            .expect("parse target");
+        assert_eq!(args.replace(), Some("hs-eurusd-aaaa"));
     }
 
     #[test]
-    fn replace_rejects_boolean_looking_values() {
+    fn register_replace_rejects_boolean_looking_values() {
         // `--replace=true` used to be silently taken as trade_id "true" and
         // 400'd at the worker. It must now be a parse error, case-insensitively,
         // for both `true` and `false`.
         for v in ["true", "false", "TRUE", "False"] {
-            let res = Args::try_parse_from(["tv-arm", &format!("--replace={v}")]);
+            let res = Args::try_parse_from(["tv-arm", "register", &format!("--replace={v}")]);
             assert!(res.is_err(), "--replace={v} must be rejected");
         }
         // A real trade_id that merely contains those substrings still parses.
-        let args = Args::try_parse_from(["tv-arm", "--replace", "hs-truest-aaaa"])
+        let args = Args::try_parse_from(["tv-arm", "register", "--replace", "hs-truest-aaaa"])
             .expect("real id parses");
-        assert_eq!(args.replace.as_deref(), Some("hs-truest-aaaa"));
+        assert_eq!(args.replace(), Some("hs-truest-aaaa"));
     }
 
     #[test]
-    fn update_is_a_deprecated_alias_for_replace() {
+    fn register_update_is_a_deprecated_alias_for_replace() {
         // The old `--update` name still parses into the same `replace` field so
         // existing scripts / muscle memory keep working.
-        let args = Args::try_parse_from(["tv-arm", "--update"]).expect("parse bare alias");
-        assert_eq!(args.replace.as_deref(), Some(""));
         let args =
-            Args::try_parse_from(["tv-arm", "--update", "hs-eurusd-bbbb"]).expect("parse alias id");
-        assert_eq!(args.replace.as_deref(), Some("hs-eurusd-bbbb"));
+            Args::try_parse_from(["tv-arm", "register", "--update"]).expect("parse bare alias");
+        assert_eq!(args.replace(), Some(""));
+        let args = Args::try_parse_from(["tv-arm", "register", "--update", "hs-eurusd-bbbb"])
+            .expect("parse alias id");
+        assert_eq!(args.replace(), Some("hs-eurusd-bbbb"));
     }
 
     #[test]

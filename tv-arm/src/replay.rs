@@ -1,11 +1,11 @@
-//! `tv-arm --replay`: chain straight into `replay-candles` on the plan we
-//! just built.
+//! `tv-arm ... replay`: chain straight into `replay-candles` on the plan we
+//! just built (the `replay` subcommand; it builds the plan but does NOT arm it).
 //!
-//! The plan JSON is already on disk (written by `register_trade_plan` to
-//! `--plan-out`, or to a temp path we synthesise for a bare `--replay`). This
-//! module assembles the `replay-candles` invocation — sensible defaults
+//! The plan JSON is already on disk (written by `register_trade_plan` to a temp
+//! path we synthesise for the `replay` subcommand). This module assembles the
+//! `replay-candles` invocation — sensible defaults
 //! (`--verbose --annotate true --source <broker>`) plus any passthrough tokens
-//! the operator put after `--replay`, which override the defaults — validates
+//! the operator put after `replay`, which override the defaults — validates
 //! it against the SHARED [`ReplayArgs`] clap definition, then shells out to the
 //! environment-matched `replay-candles-<suffix>` binary.
 //!
@@ -49,9 +49,10 @@ fn source_for(broker: Broker) -> CandleSource {
     }
 }
 
-/// Resolve the plan path to replay against. Prefer the operator's `--plan-out`
-/// (so the JSON they asked for is what gets replayed); otherwise a temp path
-/// derived from the trade id, which `register_trade_plan` also wrote to.
+/// Resolve the plan path to replay against. When an explicit destination is
+/// given, replay that JSON; otherwise a temp path derived from the trade id,
+/// which `register_trade_plan` also wrote to. The `replay` subcommand always
+/// passes `None` here (it never names a file), so it replays the temp path.
 pub fn plan_path(plan_out: Option<&Path>, trade_id: &str) -> PathBuf {
     match plan_out {
         Some(p) => p.to_path_buf(),
