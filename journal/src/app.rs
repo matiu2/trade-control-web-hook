@@ -83,6 +83,10 @@ pub struct App {
     pub popup_scroll: u16,
     /// Vertical scroll offset (in lines) of the Replay-screen report body.
     pub replay_scroll: u16,
+    /// Set by the refresh key (Ctrl-L): the event loop clears the terminal on
+    /// the next frame to repaint from scratch (recovers from any residual screen
+    /// corruption, e.g. a stray escape or a resize).
+    pub needs_clear: bool,
     /// The journal DB connection, opened lazily on the first `s` record and
     /// cached for the session (see [`App::record_db`]).
     record_db: Option<rusqlite::Connection>,
@@ -111,6 +115,7 @@ impl App {
             tick: 0,
             popup_scroll: 0,
             replay_scroll: 0,
+            needs_clear: false,
             record_db: None,
         })
     }
@@ -555,6 +560,14 @@ impl App {
     pub fn scroll_replay_end(&mut self) {
         self.replay_scroll = u16::MAX;
     }
+
+    /// Request a full-screen repaint on the next frame (the Ctrl-L refresh key).
+    /// The event loop clears the terminal before drawing, recovering from any
+    /// residual corruption (a stray escape from a subprocess, a resize artifact).
+    pub fn request_redraw(&mut self) {
+        self.needs_clear = true;
+        self.status = Status::info("refreshed");
+    }
 }
 
 /// Fetch + parse the plan list.
@@ -584,6 +597,7 @@ impl App {
             tick: 0,
             popup_scroll: 0,
             replay_scroll: 0,
+            needs_clear: false,
             record_db: None,
         }
     }

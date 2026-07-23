@@ -103,18 +103,28 @@ pub fn plan_delete(trade_id: &str) -> Result<String> {
 /// `armed_at` is the plan's RFC3339 UTC arm time. The `replay` subcommand
 /// defaults to `--verbose --annotate true --source <chart-broker>`; we take
 /// those defaults (annotate draws the sim onto the chart, which is fine — the
-/// chart is the focus). Returns the replay report (stdout); stderr is appended
-/// on failure.
+/// chart is the focus). Returns the replay report (stdout) with **ANSI escape
+/// sequences stripped** — `--verbose` colours its tracing, and raw `\x1b[…m`
+/// codes embedded in the text corrupt the ratatui render (they're drawn as
+/// literal glyphs, not interpreted as colour). Stripping at the source keeps
+/// both the report view and the divergence parser on clean text. Stderr is
+/// appended on failure.
 pub fn replay_via_tv_arm(armed_at: &str) -> Result<String> {
     let program = bin("tv-arm");
     let mut cmd = Command::new(&program);
     cmd.arg("--start").arg(armed_at).arg("replay");
+    // tv-arm logs its pipeline at INFO on **stdout** (mixed into the report we
+    // capture); quiet it to warn so the report body dominates. Honour an
+    // operator's own RUST_LOG if they set one. (ANSI is stripped regardless.)
+    if std::env::var_os("RUST_LOG").is_none() {
+        cmd.env("RUST_LOG", "warn");
+    }
     let out = cmd
         .output()
         .map_err(|e| eyre!("failed to launch `{program}`: {e}"))?;
-    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    let stdout = strip_ansi(&String::from_utf8_lossy(&out.stdout));
     if !out.status.success() {
-        let stderr = String::from_utf8_lossy(&out.stderr);
+        let stderr = strip_ansi(&String::from_utf8_lossy(&out.stderr));
         return Err(eyre!(
             "`{program} --start {armed_at} replay` failed ({}): {}\n{stdout}",
             out.status,
@@ -124,9 +134,47 @@ pub fn replay_via_tv_arm(armed_at: &str) -> Result<String> {
     Ok(stdout)
 }
 
+/// Remove ANSI escape sequences (`ESC [ … <final>`, and lone `ESC …`) from `s`.
+/// Handles the CSI sequences tracing emits for colour (`\x1b[32m`, `\x1b[0m`,
+/// …); a bare `ESC` not starting a CSI is dropped with its next byte. Keeps all
+/// other characters, so the report's text and layout survive intact.
+fn strip_ansi(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c != '\u{1b}' {
+            out.push(c);
+            continue;
+        }
+        // ESC. A CSI sequence is `ESC [ <params/intermediates> <final 0x40..0x7e>`.
+        // A lone ESC (or ESC + a non-CSI byte) just drops the pair.
+        if let Some('[') = chars.next() {
+            // Consume until the final byte in 0x40..=0x7e (e.g. 'm', 'K', 'H').
+            for f in chars.by_ref() {
+                if ('\u{40}'..='\u{7e}').contains(&f) {
+                    break;
+                }
+            }
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn strips_ansi_colour_codes() {
+        // `--verbose` tracing colours its output; the raw codes corrupt the TUI.
+        let raw = "\u{1b}[32m INFO\u{1b}[0m replay: 4 fires\u{1b}[1;31mSL\u{1b}[0m";
+        assert_eq!(strip_ansi(raw), " INFO replay: 4 firesSL");
+        // Plain text is untouched, including newlines and the report's box glyphs.
+        let plain = "Plan foo (X, H1) — 4 fire(s)\n│ Live │ Replay │\n";
+        assert_eq!(strip_ansi(plain), plain);
+        // A lone ESC (not a CSI) is dropped with its follower, not left dangling.
+        assert_eq!(strip_ansi("a\u{1b}Zb"), "ab");
+    }
 
     #[test]
     fn bin_uses_suffix_when_present() {

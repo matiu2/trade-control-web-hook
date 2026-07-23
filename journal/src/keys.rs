@@ -33,6 +33,8 @@ pub enum Action {
     ReplayScroll(i32),
     ReplayHome,
     ReplayEnd,
+    /// Force a full-screen repaint (Ctrl-L) — clears any residual corruption.
+    Redraw,
     None,
 }
 
@@ -41,6 +43,11 @@ pub fn map_key(app: &App, key: KeyEvent) -> Action {
     // Ctrl-C always quits.
     if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
         return Action::Quit;
+    }
+    // Ctrl-L always forces a full repaint (recovers from residual corruption),
+    // on any screen or modal.
+    if key.code == KeyCode::Char('l') && key.modifiers.contains(KeyModifiers::CONTROL) {
+        return Action::Redraw;
     }
 
     // A pending confirm modal only listens for y/n/esc.
@@ -134,6 +141,7 @@ pub fn apply(app: &mut App, action: Action) {
         Action::ReplayScroll(delta) => app.scroll_replay(delta),
         Action::ReplayHome => app.scroll_replay_home(),
         Action::ReplayEnd => app.scroll_replay_end(),
+        Action::Redraw => app.request_redraw(),
         Action::None => {}
     }
 }

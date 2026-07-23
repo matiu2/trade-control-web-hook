@@ -67,6 +67,12 @@ fn main() -> Result<()> {
 fn run(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<()> {
     let mut app = App::new()?;
     while !app.should_quit {
+        // A refresh (Ctrl-L) clears the back buffer so the next draw repaints
+        // every cell — recovers from any residual corruption on the screen.
+        if app.needs_clear {
+            terminal.clear()?;
+            app.needs_clear = false;
+        }
         terminal.draw(|f| ui::render(f, &app))?;
         // A short poll keeps the spinner animating and lets finished jobs land
         // promptly even when the operator isn't pressing keys.

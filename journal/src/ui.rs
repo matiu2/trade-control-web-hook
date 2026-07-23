@@ -66,7 +66,9 @@ fn render_body(f: &mut Frame, app: &App, area: Rect) {
 fn render_footer(f: &mut Frame, app: &App, area: Rect) {
     let hints = match app.screen {
         Screen::List => "↑↓ move  →/n open  q quit",
-        Screen::Replay => "↑↓/jk scroll  ←/→ nav  r replay  l load-TV  i detail  x delete  q quit",
+        Screen::Replay => {
+            "↑↓/jk scroll  ←/→ nav  r replay  ^L refresh  l load-TV  i detail  x delete  q quit"
+        }
         Screen::Compare => "← back  l load-TV  r replay  s record  i detail  d/x delete  q quit",
         _ => "← back  →/n deeper  l load-TV  r replay  s record  i detail  d/x delete  q quit",
     };
