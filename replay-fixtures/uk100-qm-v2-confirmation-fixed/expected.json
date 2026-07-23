@@ -82,6 +82,12 @@
       "candle_close": 10559.9
     },
     {
+      "rule_id": "07-close-on-sr-reversal",
+      "action": "close",
+      "candle_time": "2026-07-20T16:00:00Z",
+      "candle_close": 10498.0
+    },
+    {
       "rule_id": "01-pause-1784584800-1784613600",
       "action": "pause",
       "candle_time": "2026-07-20T20:00:00Z",
