@@ -460,6 +460,7 @@ mod tests {
             phase: Some("await_entry".into()),
             shadow: false,
             archived_at: None,
+            watermark: None,
         }
     }
 

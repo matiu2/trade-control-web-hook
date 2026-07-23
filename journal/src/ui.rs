@@ -139,7 +139,13 @@ mod tests {
         term.draw(|f| super::render(f, &app)).unwrap();
         let text = buffer_text(&term);
         assert!(text.contains("Plans"));
-        assert!(text.contains("ihs-gbp-usd-c0451533"));
+        // Oldest last-event first: the oldest-watermark plan is at the top and
+        // therefore on-screen; a top-of-fixture (newest) plan sorts to the
+        // bottom, off a 40-row screen.
+        assert!(
+            text.contains("hs-aud-chf-648e83cd"),
+            "oldest plan should be at the top:\n{text}"
+        );
     }
 
     #[test]

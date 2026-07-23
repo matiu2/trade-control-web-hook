@@ -25,8 +25,18 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
             let marker = if visited(&p.trade_id) { "· " } else { "  " };
             let phase = p.phase.as_deref().unwrap_or("-");
             let archived = if p.is_archived() { "  ARCHIVED" } else { "" };
+            // Last-event time (Brisbane, compact) — the list's sort key, shown
+            // so the oldest-first ordering is visible.
+            let last_event = p
+                .last_event()
+                .map(short_bne)
+                .unwrap_or_else(|| "  —".to_string());
             let line = Line::from(vec![
                 Span::styled(marker, Style::default().fg(Color::DarkGray)),
+                Span::styled(
+                    format!("{last_event:11} "),
+                    Style::default().fg(Color::DarkGray),
+                ),
                 Span::raw(format!("{:32} ", p.trade_id)),
                 Span::styled(
                     format!("{:16} ", p.instrument),
@@ -43,7 +53,7 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
         })
         .collect();
 
-    let title = format!("Plans ({})", app.plans.len());
+    let title = format!("Plans ({}) — oldest event first", app.plans.len());
     let list = List::new(items)
         .block(crate::ui::titled_block(&title))
         .highlight_style(
@@ -58,4 +68,19 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
         state.select(Some(app.selected));
     }
     f.render_stateful_widget(list, area, &mut state);
+}
+
+/// A compact Brisbane `MM-DD HH:MM` for the last-event column. Echoes the raw
+/// string (truncated) if it isn't a parseable RFC3339 instant.
+fn short_bne(raw: &str) -> String {
+    use chrono::{DateTime, FixedOffset};
+    let brisbane = FixedOffset::east_opt(10 * 3600)
+        .unwrap_or_else(|| FixedOffset::east_opt(0).expect("UTC is a valid fixed offset"));
+    match DateTime::parse_from_rfc3339(raw) {
+        Ok(dt) => dt
+            .with_timezone(&brisbane)
+            .format("%m-%d %H:%M")
+            .to_string(),
+        Err(_) => raw.chars().take(11).collect(),
+    }
 }

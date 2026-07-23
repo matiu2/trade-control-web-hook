@@ -29,6 +29,11 @@ pub struct PlanRow {
     pub shadow: bool,
     #[serde(default)]
     pub archived_at: Option<String>,
+    /// The engine's last processed bar time (RFC3339 UTC) — the plan's "last
+    /// event". Absent for a plan that has never ticked. Used to order the list
+    /// oldest-event-first so journalling works through the backlog in order.
+    #[serde(default)]
+    pub watermark: Option<String>,
 }
 
 impl PlanRow {
@@ -37,16 +42,40 @@ impl PlanRow {
     pub fn is_archived(&self) -> bool {
         self.archived_at.is_some()
     }
+
+    /// The plan's last-event timestamp for ordering — the engine `watermark`.
+    /// A plan that never ticked has none.
+    pub fn last_event(&self) -> Option<&str> {
+        self.watermark.as_deref()
+    }
 }
 
-/// Parse the `plan list --yaml` output (a YAML sequence) into rows.
+/// Parse the `plan list --yaml` output (a YAML sequence) into rows, ordered
+/// **oldest last-event first** so the journalling backlog is worked in order.
+/// Plans that never ticked (no `watermark`) sort last — they're not part of the
+/// "what happened longest ago" queue.
 pub fn parse_plan_list(yaml: &str) -> Result<Vec<PlanRow>> {
     // Empty / "no registered plans" bodies parse to an empty list.
     let trimmed = yaml.trim();
     if trimmed.is_empty() || trimmed.starts_with("no registered plans") {
         return Ok(Vec::new());
     }
-    serde_yaml::from_str(yaml).map_err(|e| eyre!("parse plan list YAML: {e}"))
+    let mut rows: Vec<PlanRow> =
+        serde_yaml::from_str(yaml).map_err(|e| eyre!("parse plan list YAML: {e}"))?;
+    sort_oldest_event_first(&mut rows);
+    Ok(rows)
+}
+
+/// Sort rows ascending by last-event timestamp; watermark-less plans go last.
+/// RFC3339 UTC strings sort lexicographically in time order, so a string
+/// compare is correct without parsing.
+fn sort_oldest_event_first(rows: &mut [PlanRow]) {
+    rows.sort_by(|a, b| match (a.last_event(), b.last_event()) {
+        (Some(x), Some(y)) => x.cmp(y),
+        (Some(_), None) => std::cmp::Ordering::Less, // has event → before the none
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (None, None) => a.trade_id.cmp(&b.trade_id), // stable tiebreak
+    });
 }
 
 /// How the trade enters — classified from which enter rules the plan carries.
@@ -197,11 +226,38 @@ mod tests {
     fn parses_plan_list_rows() {
         let rows = parse_plan_list(LIST).expect("parse");
         assert!(!rows.is_empty());
-        let first = &rows[0];
-        assert_eq!(first.trade_id, "ihs-gbp-usd-c0451533");
-        assert_eq!(first.instrument, "GBP/USD");
-        assert_eq!(first.granularity, "m15");
-        assert!(!first.is_archived());
+        // The fixture contains this plan; find it (order is now watermark-sorted,
+        // not file order).
+        let gbp = rows
+            .iter()
+            .find(|r| r.trade_id == "ihs-gbp-usd-c0451533")
+            .expect("gbp/usd plan present");
+        assert_eq!(gbp.instrument, "GBP/USD");
+        assert_eq!(gbp.granularity, "m15");
+        assert!(!gbp.is_archived());
+    }
+
+    #[test]
+    fn list_is_ordered_oldest_event_first() {
+        let rows = parse_plan_list(LIST).expect("parse");
+        // Watermarks appear in non-decreasing order; watermark-less plans last.
+        let mut seen_none = false;
+        let mut prev: Option<&str> = None;
+        for r in &rows {
+            match r.last_event() {
+                Some(ts) => {
+                    assert!(
+                        !seen_none,
+                        "a plan with an event follows a watermark-less one"
+                    );
+                    if let Some(p) = prev {
+                        assert!(p <= ts, "watermarks must ascend: {p} then {ts}");
+                    }
+                    prev = Some(ts);
+                }
+                None => seen_none = true,
+            }
+        }
     }
 
     #[test]
