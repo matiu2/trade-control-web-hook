@@ -1,0 +1,10 @@
+Plan hs-aud-cad-a07622da (AUD_CAD, H1) — 4 fire(s) over the window
+Candle detector (With / Golden): 0 bar(s) marked — 0 golden, 0 non-golden
+News sentiment (2026-07-21 19:12:10 +10:00 → 2026-07-22 19:12:10 +10:00): neutral, confidence low
+  (no released events in the lookback window)
+2026-07-23 13:00:00 +10:00  PAUSE entries (01-pause-1784741400-1784770200) — upcoming-news blackout: new entries held off  (close=52173.4)
+2026-07-23 13:00:00 +10:00  RESUME entries (02-resume-1784741400-1784770200) — news run-up over: entries allowed again  (close=52173.4)
+2026-07-23 13:00:00 +10:00  NEWS START (01-news-start-1784770200-1784773800) — news is releasing now: watching for reversal candles to close the position  (close=52173.4)
+2026-07-23 13:00:00 +10:00  NEWS END (02-news-end-1784770200-1784773800) — news window closed: reversals now need support/resistance to close  (close=52173.4)
+
+Done: false  |  final phase: AwaitBreakAndClose  |  fires: 4  |  TP: 0  SL: 0  |  Net R: +0.00  |  $100k acct (1%/trade): $100000 (+0)

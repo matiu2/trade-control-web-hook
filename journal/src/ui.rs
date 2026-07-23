@@ -107,6 +107,7 @@ mod tests {
     const LIST: &str = include_str!("../tests/fixtures/plan_list.yaml");
     const EXPORT: &str = include_str!("../tests/fixtures/plan_export.json");
     const TIMELINE: &str = include_str!("../tests/fixtures/plan_timeline.json");
+    const REPLAY: &str = include_str!("../tests/fixtures/replay_report.txt");
 
     /// Flatten a rendered buffer to a string so we can assert on visible text.
     fn buffer_text(term: &Terminal<TestBackend>) -> String {
@@ -150,5 +151,57 @@ mod tests {
         // Info bar shows the entry mode; body shows the timeline frame.
         assert!(text.contains("normal"), "info bar should show entry mode");
         assert!(text.contains("Timeline"));
+    }
+
+    #[test]
+    fn compare_screen_shows_divergence_diff() {
+        // The Compare screen's headline is the replay-vs-live divergence diff.
+        // The AUD_CAD fixtures diverge purely on timing: live fires
+        // pause/resume/news-start/news-end across 03:30–12:30, the replay fires
+        // all four at 13:00 → 4 matched rule ids, 4 timing divergences.
+        let rows = parse_plan_list(LIST).unwrap();
+        let mut app = App::from_rows(rows);
+        app.select_to("hs-aud-cad-a07622da");
+        app.seed_current(PlanData {
+            detail: parse_plan_export(EXPORT).ok(),
+            export_json: Some(EXPORT.to_string()),
+            timeline_json: Some(TIMELINE.to_string()),
+            replay_report: Some(REPLAY.to_string()),
+            max_depth: 3,
+        });
+        app.set_screen(Screen::Compare);
+
+        let mut term = Terminal::new(TestBackend::new(200, 44)).unwrap();
+        term.draw(|f| super::render(f, &app)).unwrap();
+        let text = buffer_text(&term);
+
+        // Summary band: 4 matched, 0 one-sided, 4 timing divergences.
+        assert!(text.contains("4 matched"), "summary matched count:\n{text}");
+        assert!(text.contains("0 live-only"), "no under-fire:\n{text}");
+        assert!(text.contains("0 replay-only"), "no over-fire:\n{text}");
+        assert!(
+            text.contains("4 timing"),
+            "timing divergence count:\n{text}"
+        );
+        // Detail lists the timing divergences with both bars.
+        assert!(text.contains("timing"), "detail shows timing rows:\n{text}");
+        assert!(
+            text.contains("live 2026-07-23 03:30") || text.contains("03:30"),
+            "detail shows the live pause bar:\n{text}"
+        );
+        assert!(
+            text.contains("13:00"),
+            "detail shows the replay bar:\n{text}"
+        );
+        // The diff is the headline — it is NOT the clean "no divergence" line.
+        assert!(
+            !text.contains("no divergence"),
+            "the AUD_CAD fixtures DO diverge on timing:\n{text}"
+        );
+        // The raw side-by-side is still present below the diff.
+        assert!(
+            text.contains("Live (recorded)"),
+            "side-by-side kept:\n{text}"
+        );
     }
 }

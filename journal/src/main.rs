@@ -9,6 +9,7 @@
 
 mod app;
 mod cli;
+mod divergence;
 mod keys;
 mod plan;
 mod screen;

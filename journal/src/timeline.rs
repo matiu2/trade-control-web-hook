@@ -28,7 +28,7 @@ fn bne(dt: DateTime<Utc>) -> String {
 }
 
 /// Parse an RFC3339 timestamp to Brisbane, or echo the raw string on failure.
-fn ts_to_bne(raw: &str) -> String {
+pub(crate) fn ts_to_bne(raw: &str) -> String {
     DateTime::parse_from_rfc3339(raw)
         .map(|dt| bne(dt.with_timezone(&Utc)))
         .unwrap_or_else(|_| raw.to_string())

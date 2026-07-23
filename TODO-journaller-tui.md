@@ -9,9 +9,20 @@ outcome`) → Replay (full `replay-candles` report) → Compare (replay ‖ live
 side-by-side). Delete guard blocks unopened plans; confirm modal, `i` detail
 popup, and `←`-unwind all work. 13 tests (incl. 2 TestBackend render tests).
 
+**Done (v2):**
+- **Compare diff** — SHIPPED. `journal/src/divergence.rs` extracts fire facts
+  keyed by `rule_id` from both sides (live = `ticks[].eval.fired[]`; replay =
+  the `<ts>  <LABEL> (<rule_id>) — …` report lines), normalises both timestamps
+  to `YYYY-MM-DD HH:MM` Brisbane, and `diff()` classifies match / live-only /
+  replay-only / timing. The Compare screen leads with a coloured divergence
+  summary band + a detail list over the raw side-by-side. Also parses the
+  replay summary line (`Done` / final phase / fires / TP / SL / Net R) for a
+  coarse outcome sanity-check. Verified live on staging against AUD_CAD:
+  **4 matched rule ids, 4 timing divergences** (live fires pause/resume/news
+  spread across 03:30–12:30, replay fires all four at 13:00). 9 divergence unit
+  tests + 1 Compare TestBackend render test.
+
 **Remaining / v2:**
-- **Compare diff** — currently side-by-side only; compute + highlight the
-  replay↔live divergences (the stated bug-hunting goal).
 - **TV auto-load on Timeline push** — wired via `load_tv` (`l` key, replay
   `--annotate`) but NOT yet auto-fired on the Timeline push; `run_screen_effect`
   has a TODO marker. Decide: auto-annotate is slow (pulls candles), so maybe
