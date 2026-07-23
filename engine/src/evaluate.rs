@@ -87,6 +87,15 @@ const ROLE_RETEST: &str = "prep-retest";
 /// enter still respects it.
 const PREP_STEP_RETEST: &str = "retest";
 
+/// The prep-step name an enter intent lists in `requires_preps` for the
+/// break-and-close gate. Same convention as [`PREP_STEP_RETEST`]: the bare step
+/// name the CLI emits in `requires_preps`, distinct from `ROLE_BREAK_AND_CLOSE`
+/// (which matches the prep *rule_id*). Used to decide per-enter whether the
+/// break-and-close time scopes that enter's confirmed-first scan floor, so the
+/// prep-free strategy-v2 QM enter (empty `requires_preps`) is NOT floored past a
+/// pre-break golden that confirms after the break (XAU_XAG 2026-07-21).
+const PREP_STEP_BREAK_AND_CLOSE: &str = "break-and-close";
+
 /// Count the `Action::Enter` rules in a plan. Single-enter plans (the H&S
 /// stop entry or the M/W heartbeat) have one; a strategy-v2 plan has two (the
 /// stop entry plus the Quasimodo limit). The engine evaluates *every* enter
@@ -790,7 +799,7 @@ fn evaluate_one_entry(
     // The explicit setup floor for a first-confirmed enter (see
     // `confirmed_setup_floor`) — shared with the truthful `NeedsConfirmation`
     // precondition check so the two can't disagree on which signals are in scope.
-    let confirmed_floor = confirmed_setup_floor(plan, state);
+    let confirmed_floor = confirmed_setup_floor(plan, state, rule);
 
     // A `PinePattern` enter is decided by the stateful candle detector over the
     // back-window, not by a per-candle level cross. It also produces the latched
@@ -1764,14 +1773,42 @@ fn retest_satisfied(plan: &TradePlan, state: &PlanState, entry_time: DateTime<Ut
 /// The explicit setup floor for a first-confirmed enter: a confirmed signal must
 /// print at/after the *later* of the break-and-close time and the replay-start
 /// cursor. Scopes "first confirmed" to the setup forming now, not an ancient
-/// warmup-era signal (the DE30 24979 case). `None` on a QM enter with no break —
-/// in which case the caller derives a fallback floor from the shared
-/// `detector_lookback_bars` depth (bug ①). Shared by the fire path
-/// ([`evaluate_one_entry`]) and the truthful `NeedsConfirmation` precondition
-/// check ([`leg_has_confirmed_signal`]) so the two can't disagree.
-fn confirmed_setup_floor(plan: &TradePlan, state: &PlanState) -> Option<DateTime<Utc>> {
+/// warmup-era signal (the DE30 24979 case).
+///
+/// **Per-leg on `break_close_at`.** The break-and-close time only floors an enter
+/// that *requires* the break — an enter whose `requires_preps` lists
+/// `break-and-close` (the strategy-v2 BCR stop leg, and every single-enter H&S
+/// stop, which lists it too). The prep-free QM leg (empty `requires_preps`) is
+/// deliberately free of the break gate, so it must NOT inherit the break floor:
+/// a golden that prints *before* the break but confirms *after* it is a valid QM
+/// entry the operator wants taken. Folding `break_close_at` in unconditionally
+/// (the plan-global bug) excluded it via `SignalCriteria::admits`
+/// (`print_time >= not_before`), stranding the QM leg on a later, worse signal
+/// (XAU_XAG 2026-07-21: 10:00 golden confirmed ~13:00, floor jumped to the 12:00
+/// break, QM only entered at 18:00 at R=0.557). `replay_start` always floors
+/// (it's a journaling boundary, not a prep). `None` when neither applies — the
+/// caller then derives a fallback floor from the shared `detector_lookback_bars`
+/// depth (bug ①). Shared by the fire path ([`evaluate_one_entry`]) and the
+/// truthful `NeedsConfirmation` precondition check ([`leg_has_confirmed_signal`])
+/// so the two can't disagree.
+fn confirmed_setup_floor(
+    plan: &TradePlan,
+    state: &PlanState,
+    rule: &ConditionRule,
+) -> Option<DateTime<Utc>> {
+    // Only an enter that requires the break-and-close prep is scoped by it.
+    let requires_break = rule
+        .intent
+        .requires_preps
+        .iter()
+        .any(|p| p == PREP_STEP_BREAK_AND_CLOSE);
+    let break_floor = if requires_break {
+        state.break_close_at
+    } else {
+        None
+    };
     [
-        state.break_close_at,
+        break_floor,
         plan.replay_start
             .and_then(|s| chrono::DateTime::from_timestamp(s, 0)),
     ]
@@ -1809,7 +1846,7 @@ fn leg_has_confirmed_signal(
         idx,
         &cfg,
         plan.granularity,
-        confirmed_setup_floor(plan, state),
+        confirmed_setup_floor(plan, state, rule),
     );
     let crit = trade_control_core::signals::SignalCriteria {
         dir: *dir,
@@ -6069,6 +6106,108 @@ mod tests {
         assert!(
             sig.signal_bar_time >= setup[0].time,
             "the fired signal is the recent setup, not an ancient warmup signal"
+        );
+    }
+
+    /// A confirmed-first QM enter whose `EntrySpec::Limit` anchors at SignalLow,
+    /// with TP well below so the bracket clears the ≥1R floor. Shared by the two
+    /// break-floor tests below.
+    fn confirmed_qm_limit_rule(requires_preps: &[&str]) -> ConditionRule {
+        let mut rule = pine_enter_rule(None, Direction::Short, false);
+        rule.rule_id = "09-enter-qm".into();
+        rule.intent.needs_confirmed = true;
+        rule.intent.requires_preps = requires_preps.iter().map(|s| s.to_string()).collect();
+        rule.intent.entry = Some(trade_control_core::intent::EntrySpec::Limit {
+            from: trade_control_core::intent::PriceAnchor::SignalLow,
+            offset_pips: 0.0,
+            offset_atr_pct: None,
+            at: None,
+            recover_entry: None,
+        });
+        rule.intent.take_profit = Some(trade_control_core::intent::TakeProfit::Anchored(
+            trade_control_core::intent::PriceRef::Absolute { absolute: 90.0 },
+        ));
+        rule
+    }
+
+    #[test]
+    fn prep_free_qm_enter_ignores_break_close_floor_for_a_pre_break_golden() {
+        // XAU_XAG 2026-07-21: a golden short printed at 10:00 and confirmed at
+        // 12:00. break-and-close stamped at 11:00 (between print and confirm). The
+        // QM leg is PREP-FREE (`requires_preps == []`), so the break-and-close time
+        // must NOT floor its confirmed-first scan — the 10:00 signal is a valid QM
+        // entry even though it printed before the break. The plan-global bug set
+        // the floor to 11:00 and `SignalCriteria::admits` (`print_time >=
+        // not_before`) then excluded the 10:00 signal, stranding the QM leg. This
+        // proves the prep-free leg still fires the pre-break confirmed signal.
+        let p = plan(vec![confirmed_qm_limit_rule(&[])]);
+        let window = two_short_engulfers_window(); // signal #1: print 10:00, confirm 12:00
+        let mut prior = seed_at(Phase::AwaitEntry, "2026-06-16T11:00:00Z");
+        // break-and-close stamped AFTER the signal printed but BEFORE it confirms.
+        prior.break_close_at = Some(ts("2026-06-16T11:00:00Z"));
+
+        // Confirmation bar (12:00) is the only new candle this tick.
+        let eval = run_window(&p, &prior, &window[3..], &window);
+        assert_eq!(
+            eval.fired.len(),
+            1,
+            "the prep-free QM enter fires on the pre-break golden's confirmation \
+             bar despite break_close_at at 11:00 (got {:?})",
+            eval.fired
+        );
+        let sig = eval.fired[0]
+            .signal
+            .expect("a PinePattern fire carries latched geometry");
+        assert_eq!(
+            sig.signal_bar_time,
+            ts("2026-06-16T10:00:00Z"),
+            "it rode the 10:00 signal — the one the break floor wrongly excluded"
+        );
+        assert!(sig.signal_confirmed, "rode the confirmed signal");
+    }
+
+    #[test]
+    fn break_gated_enter_still_honours_break_close_floor() {
+        // The other half of the per-leg rule: an enter that DOES require
+        // break-and-close (the BCR stop leg, or any single-enter H&S stop) must
+        // still be floored by `break_close_at`. Same window + 11:00 break stamp,
+        // but this leg lists `break-and-close` in `requires_preps`, so the 10:00
+        // pre-break signal is (correctly) out of scope and the enter does NOT fire
+        // on it — the break floor is preserved for the leg that asked for it.
+        let p = plan(vec![confirmed_qm_limit_rule(&["break-and-close"])]);
+        let window = two_short_engulfers_window();
+        let mut prior = seed_at(Phase::AwaitEntry, "2026-06-16T11:00:00Z");
+        prior.break_close_at = Some(ts("2026-06-16T11:00:00Z"));
+
+        let eval = run_window(&p, &prior, &window[3..], &window);
+        assert!(
+            eval.fired.is_empty(),
+            "a break-gated enter is floored past the pre-break signal — no fire \
+             on the 10:00 signal that printed before the 11:00 break (got {:?})",
+            eval.fired
+        );
+    }
+
+    #[test]
+    fn needs_confirmation_reason_truthful_for_prep_free_leg_with_pre_break_signal() {
+        // The "not taken" surface must agree with the fire path: on the 12:00
+        // confirmation bar the prep-free QM leg HAS a confirmed signal in scope
+        // (the 10:00 one), so `NeedsConfirmation` must NOT be reported. Before the
+        // per-leg floor fix `leg_has_confirmed_signal` used the same plan-global
+        // floor and wrongly still reported "requires confirmation".
+        let p = plan(vec![confirmed_qm_limit_rule(&[])]);
+        let window = two_short_engulfers_window();
+        let mut state = seed_at(Phase::AwaitEntry, "2026-06-16T11:00:00Z");
+        state.break_close_at = Some(ts("2026-06-16T11:00:00Z"));
+
+        let legs =
+            enter_preconditions_by_leg(&p, &state, ts("2026-06-16T12:00:00Z"), Some(&window));
+        assert!(
+            !legs
+                .iter()
+                .any(|l| l.contains(&EnterBlock::NeedsConfirmation)),
+            "the pre-break signal confirmed at 12:00 → prep-free leg's confirmation \
+             block must be dropped: {legs:?}"
         );
     }
 
