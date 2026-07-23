@@ -1,0 +1,1528 @@
+{
+  "records": [
+    {
+      "ts": "2026-07-22T09:12:11.316625796+00:00",
+      "request_id": "37401fcddfbc7969",
+      "method": "POST",
+      "path": "/",
+      "headers": [],
+      "body": "close: 0\nhigh: 0\nlow: 0\ntime: \"2026-07-22T09:12:10.392142272+00:00\"\nv: 1\nid: register-hs-aud-cad-a07622da-2026-07-22T091210-392142\nnot_after: \"2026-07-22T09:17:10.392142272Z\"\naction: register\ninstrument: AUD_CAD\nbroker: oanda\naccount: m-and-w\ntrade_id: hs-aud-cad-a07622da\ntrade_plan: {\"trade_id\":\"hs-aud-cad-a07622da\",\"instrument\":\"AUD_CAD\",\"direction\":\"short\",\"granularity\":\"h1\",\"pip_size\":0.0001,\"rules\":[{\"rule_id\":\"01-veto-too-high\",\"trigger\":{\"type\":\"horizontal_cross\",\"level\":0.9886150577279796,\"dir\":\"up\",\"bar\":\"on_close\"},\"fire_mode\":\"once\",\"intent\":{\"v\":1,\"id\":\"hs-aud-cad-a07622da-too-high\",\"not_after\":\"2026-07-24T06:30:00Z\",\"action\":\"veto\",\"instrument\":\"AUD_CAD\",\"broker\":\"oanda\",\"account\":\"m-and-w\",\"name\":\"too-high\",\"ttl_hours\":46,\"level\":\"close-positions\",\"trade_id\":\"hs-aud-cad-a07622da\"},\"kind\":\"setup_invalidation\"},{\"rule_id\":\"01-veto-too-low\",\"trigger\":{\"type\":\"price_value_cross\",\"level\":0.9829555618582333,\"dir\":\"either\",\"bar\":\"intrabar\"},\"fire_mode\":\"once\",\"intent\":{\"v\":1,\"id\":\"hs-aud-cad-a07622da-too-low\",\"not_after\":\"2026-07-24T06:30:00Z\",\"action\":\"veto\",\"instrument\":\"AUD_CAD\",\"broker\":\"oanda\",\"account\":\"m-and-w\",\"name\":\"too-low\",\"ttl_hours\":46,\"level\":\"stop-next-entry\",\"trade_id\":\"hs-aud-cad-a07622da\"},\"kind\":\"setup_invalidation\"},{\"rule_id\":\"02-veto-trade-expiry\",\"trigger\":{\"type\":\"time_reached\",\"at_epoch\":1784872800},\"fire_mode\":\"once\",\"intent\":{\"v\":1,\"id\":\"hs-aud-cad-a07622da-trade-expiry\",\"not_before\":\"2026-07-24T06:00:00Z\",\"not_after\":\"2026-07-24T06:30:00Z\",\"action\":\"veto\",\"instrument\":\"AUD_CAD\",\"broker\":\"oanda\",\"account\":\"m-and-w\",\"name\":\"trade-expiry\",\"ttl_hours\":46,\"level\":\"close-positions\",\"trade_id\":\"hs-aud-cad-a07622da\"},\"kind\":\"setup_invalidation\"},{\"rule_id\":\"03-prep-break-and-close\",\"trigger\":{\"type\":\"trendline_cross\",\"a\":{\"at_epoch\":1784588400,\"price\":0.98478},\"b\":{\"at_epoch\":1784707200,\"price\":0.98574},\"extend_forward\":true,\"bar_seconds\":3600,\"dir\":\"down\",\"bar\":\"on_close\"},\"fire_mode\":\"once\",\"intent\":{\"v\":1,\"id\":\"hs-aud-cad-a07622da-break-and-close\",\"not_after\":\"2026-07-24T06:00:00Z\",\"action\":\"prep\",\"instrument\":\"AUD_CAD\",\"broker\":\"oanda\",\"account\":\"m-and-w\",\"step\":\"break-and-close\",\"ttl_hours\":876000,\"clears\":[\"retest\"],\"trade_id\":\"hs-aud-cad-a07622da\"},\"kind\":\"prep_break_and_close\"},{\"rule_id\":\"04-prep-retest\",\"trigger\":{\"type\":\"trendline_cross\",\"a\":{\"at_epoch\":1784588400,\"price\":0.98478},\"b\":{\"at_epoch\":1784707200,\"price\":0.98574},\"extend_forward\":true,\"bar_seconds\":3600,\"dir\":\"up\",\"bar\":\"intrabar\"},\"fire_mode\":\"once\",\"intent\":{\"v\":1,\"id\":\"hs-aud-cad-a07622da-retest\",\"not_after\":\"2026-07-24T06:00:00Z\",\"action\":\"prep\",\"instrument\":\"AUD_CAD\",\"broker\":\"oanda\",\"account\":\"m-and-w\",\"step\":\"retest\",\"ttl_hours\":876000,\"trade_id\":\"hs-aud-cad-a07622da\"},\"kind\":\"prep_retest\"},{\"rule_id\":\"05-enter\",\"trigger\":{\"type\":\"pine_pattern\",\"dir\":\"short\"},\"fire_mode\":\"once\",\"intent\":{\"v\":1,\"id\":\"hs-aud-cad-a07622da-enter\",\"not_after\":\"2026-07-23T21:02:25.392142272Z\",\"action\":\"enter\",\"instrument\":\"AUD_CAD\",\"direction\":\"short\",\"entry\":{\"type\":\"stop\",\"from\":\"signal_low\",\"offset_pips\":0.0,\"offset_atr_pct\":0.5},\"stop_loss\":{\"from\":\"signal_high\",\"offset_pips\":0.0,\"offset_atr_pct\":0.5},\"take_profit\":{\"absolute\":0.9823},\"broker\":\"oanda\",\"account\":\"m-and-w\",\"requires_preps\":[\"break-and-close\",\"retest\"],\"vetos\":[\"too-high\",\"too-low\",\"trade-expiry\"],\"entry_level_vetos\":[{\"name\":\"too-low\",\"level\":0.9829555618582333,\"past\":\"Below\"},{\"name\":\"too-high\",\"level\":0.9886150577279796,\"past\":\"Above\"}],\"breakeven\":{\"threshold\":0.5},\"trade_id\":\"hs-aud-cad-a07622da\",\"max_retries\":5,\"needs_golden\":true,\"pip_size\":0.0001,\"tick_size\":0.00001},\"kind\":\"enter\"},{\"rule_id\":\"07-close-on-sr-reversal\",\"trigger\":{\"type\":\"pine_pattern\",\"dir\":\"long\"},\"fire_mode\":\"once\",\"intent\":{\"v\":1,\"id\":\"hs-aud-cad-a07622da-close-on-sr-reversal\",\"not_after\":\"2026-07-24T06:00:00Z\",\"action\":\"close\",\"instrument\":\"AUD_CAD\",\"broker\":\"oanda\",\"account\":\"m-and-w\",\"trade_id\":\"hs-aud-cad-a07622da\",\"needs_golden\":true,\"inside_window\":[\"price\"],\"sr_bands\":[[0.98331,0.98527]],\"reason\":\"support/resistance reversal\"},\"kind\":\"per_position_close\"},{\"rule_id\":\"06-close-on-reversal\",\"trigger\":{\"type\":\"pine_pattern\",\"dir\":\"long\"},\"fire_mode\":\"once\",\"intent\":{\"v\":1,\"id\":\"hs-aud-cad-a07622da-close-on-reversal\",\"not_after\":\"2026-07-24T06:00:00Z\",\"action\":\"close\",\"instrument\":\"AUD_CAD\",\"broker\":\"oanda\",\"account\":\"m-and-w\",\"trade_id\":\"hs-aud-cad-a07622da\",\"needs_golden\":true,\"inside_window\":[\"news\"],\"reason\":\"news-window reversal\"},\"kind\":\"per_position_close\"},{\"rule_id\":\"01-pause-1784741400-1784770200\",\"trigger\":{\"type\":\"time_reached\",\"at_epoch\":1784741400},\"fire_mode\":\"once\",\"intent\":{\"v\":1,\"id\":\"hs-aud-cad-a07622da-pause-1784741400-1784770200\",\"not_after\":\"2026-07-23T01:30:00Z\",\"action\":\"pause\",\"instrument\":\"AUD_CAD\",\"broker\":\"oanda\",\"account\":\"m-and-w\",\"trade_id\":\"hs-aud-cad-a07622da\",\"blackout_id\":\"1784741400-1784770200\",\"reason\":\"news:AUD_CAD-2026-07-22T17:30:00+00:00\"},\"kind\":\"control\"},{\"rule_id\":\"02-resume-1784741400-1784770200\",\"trigger\":{\"type\":\"time_reached\",\"at_epoch\":1784770200},\"fire_mode\":\"once\",\"intent\":{\"v\":1,\"id\":\"hs-aud-cad-a07622da-resume-1784741400-1784770200\",\"not_after\":\"2026-07-23T02:00:00Z\",\"action\":\"resume\",\"instrument\":\"AUD_CAD\",\"broker\":\"oanda\",\"account\":\"m-and-w\",\"trade_id\":\"hs-aud-cad-a07622da\",\"blackout_id\":\"1784741400-1784770200\",\"reason\":\"news:AUD_CAD-2026-07-22T17:30:00+00:00\"},\"kind\":\"control\"},{\"rule_id\":\"01-news-start-1784770200-1784773800\",\"trigger\":{\"type\":\"time_reached\",\"at_epoch\":1784770200},\"fire_mode\":\"once\",\"intent\":{\"v\":1,\"id\":\"hs-aud-cad-a07622da-news-start-1784770200-1784773800\",\"not_after\":\"2026-07-23T02:30:00Z\",\"action\":\"news-start\",\"instrument\":\"AUD_CAD\",\"broker\":\"oanda\",\"account\":\"m-and-w\",\"trade_id\":\"hs-aud-cad-a07622da\",\"news_id\":\"1784770200-1784773800\",\"reason\":\"news:AUD_CAD-2026-07-23T01:30:00+00:00\"},\"kind\":\"control\"},{\"rule_id\":\"02-news-end-1784770200-1784773800\",\"trigger\":{\"type\":\"time_reached\",\"at_epoch\":1784773800},\"fire_mode\":\"once\",\"intent\":{\"v\":1,\"id\":\"hs-aud-cad-a07622da-news-end-1784770200-1784773800\",\"not_after\":\"2026-07-23T03:00:00Z\",\"action\":\"news-end\",\"instrument\":\"AUD_CAD\",\"broker\":\"oanda\",\"account\":\"m-and-w\",\"trade_id\":\"hs-aud-cad-a07622da\",\"news_id\":\"1784770200-1784773800\",\"reason\":\"news:AUD_CAD-2026-07-23T01:30:00+00:00\"},\"kind\":\"control\"}],\"shadow\":false,\"cross_buffer_pct\":0.0,\"cross_buffer_atr\":0.0,\"bcr_require_golden\":false,\"retest_atr_step\":0.075,\"armed_at\":\"2026-07-22T09:12:10.392142272Z\",\"armed_sentiment\":{\"period_start\":\"2026-07-21T09:12:10.392142272Z\",\"period_end\":\"2026-07-22T09:12:10.392142272Z\",\"overall_direction\":\"neutral\",\"confidence\":\"low\",\"currencies\":[]}}\nsig: \"v1-sig./zwBmAOvXC8t/A66ONXBRbLGhyQ/Y2EjT5Yv9RL18XM=\"\n",
+      "intent_id": "register-hs-aud-cad-a07622da-2026-07-22T091210-392142",
+      "trade_id": "hs-aud-cad-a07622da",
+      "status": 200,
+      "outcome": "ok",
+      "logs": []
+    },
+    {
+      "ts": "2026-07-23T04:19:24.197043241+00:00",
+      "request_id": "b884dd9f8fdf1430",
+      "method": "POST",
+      "path": "/",
+      "headers": [],
+      "body": "close: 0\nhigh: 0\nlow: 0\ntime: \"2026-07-23T04:19:24.196380834+00:00\"\nv: 1\nid: plan-show-hs-aud-cad-a07622da-2026-07-23T041924-1650\nnot_after: \"2026-07-23T04:24:24.196380834Z\"\naction: plan-show\ninstrument: ALL\nbroker: oanda\ntrade_id: hs-aud-cad-a07622da\nsig: \"v1-sig.S2JRl0o7mplpAj5DQPbOiUuzjp7SjUmZY9dEnF6RDTU=\"\n",
+      "intent_id": "plan-show-hs-aud-cad-a07622da-2026-07-23T041924-1650",
+      "trade_id": "hs-aud-cad-a07622da",
+      "status": 200,
+      "outcome": "- account: m-and-w\n  plan:\n    trade_id: hs-aud-cad-a07622da\n    instrument: AUD_CAD\n    direction: short\n    granularity: h1\n    pip_size: 0.0001\n    rules:\n    - rule_id: 01-veto-too-high\n      trigger:\n        type: horizontal_cross\n        level: 0.9886150577279796\n        dir: up\n        bar: on_close\n      fire_mode: once\n      intent:\n        v: 1\n        id: hs-aud-cad-a07622da-too-high\n        not_after: 2026-07-24T06:30:00Z\n        action: veto\n        instrument: AUD_CAD\n        broker: oanda\n        account: m-and-w\n        name: too-high\n        ttl_hours: 46\n        level: close-positions\n        trade_id: hs-aud-cad-a07622da\n      kind: setup_invalidation\n    - rule_id: 01-veto-too-low\n      trigger:\n        type: price_value_cross\n        level: 0.9829555618582332\n        dir: either\n        bar: intrabar\n      fire_mode: once\n      intent:\n        v: 1\n        id: hs-aud-cad-a07622da-too-low\n        not_after: 2026-07-24T06:30:00Z\n        action: veto\n        instrument: AUD_CAD\n        broker: oanda\n        account: m-and-w\n        name: too-low\n        ttl_hours: 46\n        level: stop-next-entry\n        trade_id: hs-aud-cad-a07622da\n      kind: setup_invalidation\n    - rule_id: 02-veto-trade-expiry\n      trigger:\n        type: time_reached\n        at_epoch: 1784872800\n      fire_mode: once\n      intent:\n        v: 1\n        id: hs-aud-cad-a07622da-trade-expiry\n        not_before: 2026-07-24T06:00:00Z\n        not_after: 2026-07-24T06:30:00Z\n        action: veto\n        instrument: AUD_CAD\n        broker: oanda\n        account: m-and-w\n        name: trade-expiry\n        ttl_hours: 46\n        level: close-positions\n        trade_id: hs-aud-cad-a07622da\n      kind: setup_invalidation\n    - rule_id: 03-prep-break-and-close\n      trigger:\n        type: trendline_cross\n        a:\n          at_epoch: 1784588400\n          price: 0.98478\n        b:\n          at_epoch: 1784707200\n          price: 0.98574\n        extend_forward: true\n        bar_seconds: 3600\n        dir: down\n        bar: on_close\n      fire_mode: once\n      intent:\n        v: 1\n        id: hs-aud-cad-a07622da-break-and-close\n        not_after: 2026-07-24T06:00:00Z\n        action: prep\n        instrument: AUD_CAD\n        broker: oanda\n        account: m-and-w\n        step: break-and-close\n        ttl_hours: 876000\n        clears:\n        - retest\n        trade_id: hs-aud-cad-a07622da\n      kind: prep_break_and_close\n    - rule_id: 04-prep-retest\n      trigger:\n        type: trendline_cross\n        a:\n          at_epoch: 1784588400\n          price: 0.98478\n        b:\n          at_epoch: 1784707200\n          price: 0.98574\n        extend_forward: true\n        bar_seconds: 3600\n        dir: up\n        bar: intrabar\n      fire_mode: once\n      intent:\n        v: 1\n        id: hs-aud-cad-a07622da-retest\n        not_after: 2026-07-24T06:00:00Z\n        action: prep\n        instrument: AUD_CAD\n        broker: oanda\n        account: m-and-w\n        step: retest\n        ttl_hours: 876000\n        trade_id: hs-aud-cad-a07622da\n      kind: prep_retest\n    - rule_id: 05-enter\n      trigger:\n        type: pine_pattern\n        dir: short\n      fire_mode: once\n      intent:\n        v: 1\n        id: hs-aud-cad-a07622da-enter\n        not_after: 2026-07-23T21:02:25.392142272Z\n        action: enter\n        instrument: AUD_CAD\n        direction: short\n        entry:\n          type: stop\n          from: signal_low\n          offset_pips: 0.0\n          offset_atr_pct: 0.5\n        stop_loss:\n          from: signal_high\n          offset_pips: 0.0\n          offset_atr_pct: 0.5\n        take_profit:\n          absolute: 0.9823\n        broker: oanda\n        account: m-and-w\n        requires_preps:\n        - break-and-close\n        - retest\n        vetos:\n        - too-high\n        - too-low\n        - trade-expiry\n        entry_level_vetos:\n        - name: too-low\n          level: 0.9829555618582332\n          past: Below\n        - name: too-high\n          level: 0.9886150577279796\n          past: Above\n        breakeven:\n          threshold: 0.5\n        trade_id: hs-aud-cad-a07622da\n        max_retries: 5\n        needs_golden: true\n        pip_size: 0.0001\n        tick_size: 0.00001\n      kind: enter\n    - rule_id: 07-close-on-sr-reversal\n      trigger:\n        type: pine_pattern\n        dir: long\n      fire_mode: once\n      intent:\n        v: 1\n        id: hs-aud-cad-a07622da-close-on-sr-reversal\n        not_after: 2026-07-24T06:00:00Z\n        action: close\n        instrument: AUD_CAD\n        broker: oanda\n        account: m-and-w\n        trade_id: hs-aud-cad-a07622da\n        needs_golden: true\n        inside_window:\n        - price\n        sr_bands:\n        - - 0.98331\n          - 0.98527\n        reason: support/resistance reversal\n      kind: per_position_close\n    - rule_id: 06-close-on-reversal\n      trigger:\n        type: pine_pattern\n        dir: long\n      fire_mode: once\n      intent:\n        v: 1\n        id: hs-aud-cad-a07622da-close-on-reversal\n        not_after: 2026-07-24T06:00:00Z\n        action: close\n        instrument: AUD_CAD\n        broker: oanda\n        account: m-and-w\n        trade_id: hs-aud-cad-a07622da\n        needs_golden: true\n        inside_window:\n        - news\n        reason: news-window reversal\n      kind: per_position_close\n    - rule_id: 01-pause-1784741400-1784770200\n      trigger:\n        type: time_reached\n        at_epoch: 1784741400\n      fire_mode: once\n      intent:\n        v: 1\n        id: hs-aud-cad-a07622da-pause-1784741400-1784770200\n        not_after: 2026-07-23T01:30:00Z\n        action: pause\n        instrument: AUD_CAD\n        broker: oanda\n        account: m-and-w\n        trade_id: hs-aud-cad-a07622da\n        blackout_id: 1784741400-1784770200\n        reason: news:AUD_CAD-2026-07-22T17:30:00+00:00\n      kind: control\n    - rule_id: 02-resume-1784741400-1784770200\n      trigger:\n        type: time_reached\n        at_epoch: 1784770200\n      fire_mode: once\n      intent:\n        v: 1\n        id: hs-aud-cad-a07622da-resume-1784741400-1784770200\n        not_after: 2026-07-23T02:00:00Z\n        action: resume\n        instrument: AUD_CAD\n        broker: oanda\n        account: m-and-w\n        trade_id: hs-aud-cad-a07622da\n        blackout_id: 1784741400-1784770200\n        reason: news:AUD_CAD-2026-07-22T17:30:00+00:00\n      kind: control\n    - rule_id: 01-news-start-1784770200-1784773800\n      trigger:\n        type: time_reached\n        at_epoch: 1784770200\n      fire_mode: once\n      intent:\n        v: 1\n        id: hs-aud-cad-a07622da-news-start-1784770200-1784773800\n        not_after: 2026-07-23T02:30:00Z\n        action: news-start\n        instrument: AUD_CAD\n        broker: oanda\n        account: m-and-w\n        trade_id: hs-aud-cad-a07622da\n        news_id: 1784770200-1784773800\n        reason: news:AUD_CAD-2026-07-23T01:30:00+00:00\n      kind: control\n    - rule_id: 02-news-end-1784770200-1784773800\n      trigger:\n        type: time_reached\n        at_epoch: 1784773800\n      fire_mode: once\n      intent:\n        v: 1\n        id: hs-aud-cad-a07622da-news-end-1784770200-1784773800\n        not_after: 2026-07-23T03:00:00Z\n        action: news-end\n        instrument: AUD_CAD\n        broker: oanda\n        account: m-and-w\n        trade_id: hs-aud-cad-a07622da\n        news_id: 1784770200-1784773800\n        reason: news:AUD_CAD-2026-07-23T01:30:00+00:00\n      kind: control\n    shadow: false\n    cross_buffer_pct: 0.0\n    cross_buffer_atr: 0.0\n    bcr_require_golden: false\n    retest_atr_step: 0.075\n    armed_at: 2026-07-22T09:12:10.392142272Z\n    armed_sentiment:\n      period_start: 2026-07-21T09:12:10.392142272Z\n      period_end: 2026-07-22T09:12:10.392142272Z\n      overall_direction: neutral\n      confidence: low\n      currencies: []\n  state:\n    watermark: 2026-07-23T03:00:00Z\n    phase: await_break_and_close\n    fired:\n    - 01-news-start-1784770200-1784773800\n    - 01-pause-1784741400-1784770200\n    - 02-news-end-1784770200-1784773800\n    - 02-resume-1784741400-1784770200\n    last_close:\n      01-veto-too-high: 0.987\n      03-prep-break-and-close: 0.987\n    origin_open:\n      01-veto-too-high: 0.98574\n      03-prep-break-and-close: 0.98574\n    expires_at: 2026-07-24T03:59:58.925685311Z\n",
+      "logs": []
+    },
+    {
+      "ts": "2026-07-23T04:19:24.210917033+00:00",
+      "request_id": "15c0acd366ba6d25",
+      "method": "POST",
+      "path": "/",
+      "headers": [],
+      "body": "close: 0\nhigh: 0\nlow: 0\ntime: \"2026-07-23T04:19:24.210011592+00:00\"\nv: 1\nid: plan-timeline-hs-aud-cad-a07622da-2026-07-23T041924-da34\nnot_after: \"2026-07-23T04:24:24.210011592Z\"\naction: plan-timeline\ninstrument: ALL\nbroker: oanda\ntrade_id: hs-aud-cad-a07622da\nsig: \"v1-sig.oRrCvDIQXUIcw+NNKpQ2ZEBp3Dty8tAzwzIuNrTk5oE=\"\n",
+      "intent_id": "plan-timeline-hs-aud-cad-a07622da-2026-07-23T041924-da34",
+      "trade_id": "hs-aud-cad-a07622da",
+      "status": 200,
+      "outcome": "records:\n- ts: 2026-07-22T09:12:11.316625796+00:00\n  request_id: 37401fcddfbc7969\n  method: POST\n  path: /\n  headers: []\n  body: |\n    close: 0\n    high: 0\n    low: 0\n    time: \"2026-07-22T09:12:10.392142272+00:00\"\n    v: 1\n    id: register-hs-aud-cad-a07622da-2026-07-22T091210-392142\n    not_after: \"2026-07-22T09:17:10.392142272Z\"\n    action: register\n    instrument: AUD_CAD\n    broker: oanda\n    account: m-and-w\n    trade_id: hs-aud-cad-a07622da\n    trade_plan: {\"trade_id\":\"hs-aud-cad-a07622da\",\"instrument\":\"AUD_CAD\",\"direction\":\"short\",\"granularity\":\"h1\",\"pip_size\":0.0001,\"rules\":[{\"rule_id\":\"01-veto-too-high\",\"trigger\":{\"type\":\"horizontal_cross\",\"level\":0.9886150577279796,\"dir\":\"up\",\"bar\":\"on_close\"},\"fire_mode\":\"once\",\"intent\":{\"v\":1,\"id\":\"hs-aud-cad-a07622da-too-high\",\"not_after\":\"2026-07-24T06:30:00Z\",\"action\":\"veto\",\"instrument\":\"AUD_CAD\",\"broker\":\"oanda\",\"account\":\"m-and-w\",\"name\":\"too-high\",\"ttl_hours\":46,\"level\":\"close-positions\",\"trade_id\":\"hs-aud-cad-a07622da\"},\"kind\":\"setup_invalidation\"},{\"rule_id\":\"01-veto-too-low\",\"trigger\":{\"type\":\"price_value_cross\",\"level\":0.9829555618582333,\"dir\":\"either\",\"bar\":\"intrabar\"},\"fire_mode\":\"once\",\"intent\":{\"v\":1,\"id\":\"hs-aud-cad-a07622da-too-low\",\"not_after\":\"2026-07-24T06:30:00Z\",\"action\":\"veto\",\"instrument\":\"AUD_CAD\",\"broker\":\"oanda\",\"account\":\"m-and-w\",\"name\":\"too-low\",\"ttl_hours\":46,\"level\":\"stop-next-entry\",\"trade_id\":\"hs-aud-cad-a07622da\"},\"kind\":\"setup_invalidation\"},{\"rule_id\":\"02-veto-trade-expiry\",\"trigger\":{\"type\":\"time_reached\",\"at_epoch\":1784872800},\"fire_mode\":\"once\",\"intent\":{\"v\":1,\"id\":\"hs-aud-cad-a07622da-trade-expiry\",\"not_before\":\"2026-07-24T06:00:00Z\",\"not_after\":\"2026-07-24T06:30:00Z\",\"action\":\"veto\",\"instrument\":\"AUD_CAD\",\"broker\":\"oanda\",\"account\":\"m-and-w\",\"name\":\"trade-expiry\",\"ttl_hours\":46,\"level\":\"close-positions\",\"trade_id\":\"hs-aud-cad-a07622da\"},\"kind\":\"setup_invalidation\"},{\"rule_id\":\"03-prep-break-and-close\",\"trigger\":{\"type\":\"trendline_cross\",\"a\":{\"at_epoch\":1784588400,\"price\":0.98478},\"b\":{\"at_epoch\":1784707200,\"price\":0.98574},\"extend_forward\":true,\"bar_seconds\":3600,\"dir\":\"down\",\"bar\":\"on_close\"},\"fire_mode\":\"once\",\"intent\":{\"v\":1,\"id\":\"hs-aud-cad-a07622da-break-and-close\",\"not_after\":\"2026-07-24T06:00:00Z\",\"action\":\"prep\",\"instrument\":\"AUD_CAD\",\"broker\":\"oanda\",\"account\":\"m-and-w\",\"step\":\"break-and-close\",\"ttl_hours\":876000,\"clears\":[\"retest\"],\"trade_id\":\"hs-aud-cad-a07622da\"},\"kind\":\"prep_break_and_close\"},{\"rule_id\":\"04-prep-retest\",\"trigger\":{\"type\":\"trendline_cross\",\"a\":{\"at_epoch\":1784588400,\"price\":0.98478},\"b\":{\"at_epoch\":1784707200,\"price\":0.98574},\"extend_forward\":true,\"bar_seconds\":3600,\"dir\":\"up\",\"bar\":\"intrabar\"},\"fire_mode\":\"once\",\"intent\":{\"v\":1,\"id\":\"hs-aud-cad-a07622da-retest\",\"not_after\":\"2026-07-24T06:00:00Z\",\"action\":\"prep\",\"instrument\":\"AUD_CAD\",\"broker\":\"oanda\",\"account\":\"m-and-w\",\"step\":\"retest\",\"ttl_hours\":876000,\"trade_id\":\"hs-aud-cad-a07622da\"},\"kind\":\"prep_retest\"},{\"rule_id\":\"05-enter\",\"trigger\":{\"type\":\"pine_pattern\",\"dir\":\"short\"},\"fire_mode\":\"once\",\"intent\":{\"v\":1,\"id\":\"hs-aud-cad-a07622da-enter\",\"not_after\":\"2026-07-23T21:02:25.392142272Z\",\"action\":\"enter\",\"instrument\":\"AUD_CAD\",\"direction\":\"short\",\"entry\":{\"type\":\"stop\",\"from\":\"signal_low\",\"offset_pips\":0.0,\"offset_atr_pct\":0.5},\"stop_loss\":{\"from\":\"signal_high\",\"offset_pips\":0.0,\"offset_atr_pct\":0.5},\"take_profit\":{\"absolute\":0.9823},\"broker\":\"oanda\",\"account\":\"m-and-w\",\"requires_preps\":[\"break-and-close\",\"retest\"],\"vetos\":[\"too-high\",\"too-low\",\"trade-expiry\"],\"entry_level_vetos\":[{\"name\":\"too-low\",\"level\":0.9829555618582333,\"past\":\"Below\"},{\"name\":\"too-high\",\"level\":0.9886150577279796,\"past\":\"Above\"}],\"breakeven\":{\"threshold\":0.5},\"trade_id\":\"hs-aud-cad-a07622da\",\"max_retries\":5,\"needs_golden\":true,\"pip_size\":0.0001,\"tick_size\":0.00001},\"kind\":\"enter\"},{\"rule_id\":\"07-close-on-sr-reversal\",\"trigger\":{\"type\":\"pine_pattern\",\"dir\":\"long\"},\"fire_mode\":\"once\",\"intent\":{\"v\":1,\"id\":\"hs-aud-cad-a07622da-close-on-sr-reversal\",\"not_after\":\"2026-07-24T06:00:00Z\",\"action\":\"close\",\"instrument\":\"AUD_CAD\",\"broker\":\"oanda\",\"account\":\"m-and-w\",\"trade_id\":\"hs-aud-cad-a07622da\",\"needs_golden\":true,\"inside_window\":[\"price\"],\"sr_bands\":[[0.98331,0.98527]],\"reason\":\"support/resistance reversal\"},\"kind\":\"per_position_close\"},{\"rule_id\":\"06-close-on-reversal\",\"trigger\":{\"type\":\"pine_pattern\",\"dir\":\"long\"},\"fire_mode\":\"once\",\"intent\":{\"v\":1,\"id\":\"hs-aud-cad-a07622da-close-on-reversal\",\"not_after\":\"2026-07-24T06:00:00Z\",\"action\":\"close\",\"instrument\":\"AUD_CAD\",\"broker\":\"oanda\",\"account\":\"m-and-w\",\"trade_id\":\"hs-aud-cad-a07622da\",\"needs_golden\":true,\"inside_window\":[\"news\"],\"reason\":\"news-window reversal\"},\"kind\":\"per_position_close\"},{\"rule_id\":\"01-pause-1784741400-1784770200\",\"trigger\":{\"type\":\"time_reached\",\"at_epoch\":1784741400},\"fire_mode\":\"once\",\"intent\":{\"v\":1,\"id\":\"hs-aud-cad-a07622da-pause-1784741400-1784770200\",\"not_after\":\"2026-07-23T01:30:00Z\",\"action\":\"pause\",\"instrument\":\"AUD_CAD\",\"broker\":\"oanda\",\"account\":\"m-and-w\",\"trade_id\":\"hs-aud-cad-a07622da\",\"blackout_id\":\"1784741400-1784770200\",\"reason\":\"news:AUD_CAD-2026-07-22T17:30:00+00:00\"},\"kind\":\"control\"},{\"rule_id\":\"02-resume-1784741400-1784770200\",\"trigger\":{\"type\":\"time_reached\",\"at_epoch\":1784770200},\"fire_mode\":\"once\",\"intent\":{\"v\":1,\"id\":\"hs-aud-cad-a07622da-resume-1784741400-1784770200\",\"not_after\":\"2026-07-23T02:00:00Z\",\"action\":\"resume\",\"instrument\":\"AUD_CAD\",\"broker\":\"oanda\",\"account\":\"m-and-w\",\"trade_id\":\"hs-aud-cad-a07622da\",\"blackout_id\":\"1784741400-1784770200\",\"reason\":\"news:AUD_CAD-2026-07-22T17:30:00+00:00\"},\"kind\":\"control\"},{\"rule_id\":\"01-news-start-1784770200-1784773800\",\"trigger\":{\"type\":\"time_reached\",\"at_epoch\":1784770200},\"fire_mode\":\"once\",\"intent\":{\"v\":1,\"id\":\"hs-aud-cad-a07622da-news-start-1784770200-1784773800\",\"not_after\":\"2026-07-23T02:30:00Z\",\"action\":\"news-start\",\"instrument\":\"AUD_CAD\",\"broker\":\"oanda\",\"account\":\"m-and-w\",\"trade_id\":\"hs-aud-cad-a07622da\",\"news_id\":\"1784770200-1784773800\",\"reason\":\"news:AUD_CAD-2026-07-23T01:30:00+00:00\"},\"kind\":\"control\"},{\"rule_id\":\"02-news-end-1784770200-1784773800\",\"trigger\":{\"type\":\"time_reached\",\"at_epoch\":1784773800},\"fire_mode\":\"once\",\"intent\":{\"v\":1,\"id\":\"hs-aud-cad-a07622da-news-end-1784770200-1784773800\",\"not_after\":\"2026-07-23T03:00:00Z\",\"action\":\"news-end\",\"instrument\":\"AUD_CAD\",\"broker\":\"oanda\",\"account\":\"m-and-w\",\"trade_id\":\"hs-aud-cad-a07622da\",\"news_id\":\"1784770200-1784773800\",\"reason\":\"news:AUD_CAD-2026-07-23T01:30:00+00:00\"},\"kind\":\"control\"}],\"shadow\":false,\"cross_buffer_pct\":0.0,\"cross_buffer_atr\":0.0,\"bcr_require_golden\":false,\"retest_atr_step\":0.075,\"armed_at\":\"2026-07-22T09:12:10.392142272Z\",\"armed_sentiment\":{\"period_start\":\"2026-07-21T09:12:10.392142272Z\",\"period_end\":\"2026-07-22T09:12:10.392142272Z\",\"overall_direction\":\"neutral\",\"confidence\":\"low\",\"currencies\":[]}}\n    sig: \"v1-sig./zwBmAOvXC8t/A66ONXBRbLGhyQ/Y2EjT5Yv9RL18XM=\"\n  intent_id: register-hs-aud-cad-a07622da-2026-07-22T091210-392142\n  trade_id: hs-aud-cad-a07622da\n  status: 200\n  outcome: ok\n  logs: []\n- ts: 2026-07-23T04:19:24.197043241+00:00\n  request_id: b884dd9f8fdf1430\n  method: POST\n  path: /\n  headers: []\n  body: |\n    close: 0\n    high: 0\n    low: 0\n    time: \"2026-07-23T04:19:24.196380834+00:00\"\n    v: 1\n    id: plan-show-hs-aud-cad-a07622da-2026-07-23T041924-1650\n    not_after: \"2026-07-23T04:24:24.196380834Z\"\n    action: plan-show\n    instrument: ALL\n    broker: oanda\n    trade_id: hs-aud-cad-a07622da\n    sig: \"v1-sig.S2JRl0o7mplpAj5DQPbOiUuzjp7SjUmZY9dEnF6RDTU=\"\n  intent_id: plan-show-hs-aud-cad-a07622da-2026-07-23T041924-1650\n  trade_id: hs-aud-cad-a07622da\n  status: 200\n  outcome: |\n    - account: m-and-w\n      plan:\n        trade_id: hs-aud-cad-a07622da\n        instrument: AUD_CAD\n        direction: short\n        granularity: h1\n        pip_size: 0.0001\n        rules:\n        - rule_id: 01-veto-too-high\n          trigger:\n            type: horizontal_cross\n            level: 0.9886150577279796\n            dir: up\n            bar: on_close\n          fire_mode: once\n          intent:\n            v: 1\n            id: hs-aud-cad-a07622da-too-high\n            not_after: 2026-07-24T06:30:00Z\n            action: veto\n            instrument: AUD_CAD\n            broker: oanda\n            account: m-and-w\n            name: too-high\n            ttl_hours: 46\n            level: close-positions\n            trade_id: hs-aud-cad-a07622da\n          kind: setup_invalidation\n        - rule_id: 01-veto-too-low\n          trigger:\n            type: price_value_cross\n            level: 0.9829555618582332\n            dir: either\n            bar: intrabar\n          fire_mode: once\n          intent:\n            v: 1\n            id: hs-aud-cad-a07622da-too-low\n            not_after: 2026-07-24T06:30:00Z\n            action: veto\n            instrument: AUD_CAD\n            broker: oanda\n            account: m-and-w\n            name: too-low\n            ttl_hours: 46\n            level: stop-next-entry\n            trade_id: hs-aud-cad-a07622da\n          kind: setup_invalidation\n        - rule_id: 02-veto-trade-expiry\n          trigger:\n            type: time_reached\n            at_epoch: 1784872800\n          fire_mode: once\n          intent:\n            v: 1\n            id: hs-aud-cad-a07622da-trade-expiry\n            not_before: 2026-07-24T06:00:00Z\n            not_after: 2026-07-24T06:30:00Z\n            action: veto\n            instrument: AUD_CAD\n            broker: oanda\n            account: m-and-w\n            name: trade-expiry\n            ttl_hours: 46\n            level: close-positions\n            trade_id: hs-aud-cad-a07622da\n          kind: setup_invalidation\n        - rule_id: 03-prep-break-and-close\n          trigger:\n            type: trendline_cross\n            a:\n              at_epoch: 1784588400\n              price: 0.98478\n            b:\n              at_epoch: 1784707200\n              price: 0.98574\n            extend_forward: true\n            bar_seconds: 3600\n            dir: down\n            bar: on_close\n          fire_mode: once\n          intent:\n            v: 1\n            id: hs-aud-cad-a07622da-break-and-close\n            not_after: 2026-07-24T06:00:00Z\n            action: prep\n            instrument: AUD_CAD\n            broker: oanda\n            account: m-and-w\n            step: break-and-close\n            ttl_hours: 876000\n            clears:\n            - retest\n            trade_id: hs-aud-cad-a07622da\n          kind: prep_break_and_close\n        - rule_id: 04-prep-retest\n          trigger:\n            type: trendline_cross\n            a:\n              at_epoch: 1784588400\n              price: 0.98478\n            b:\n              at_epoch: 1784707200\n              price: 0.98574\n            extend_forward: true\n            bar_seconds: 3600\n            dir: up\n            bar: intrabar\n          fire_mode: once\n          intent:\n            v: 1\n            id: hs-aud-cad-a07622da-retest\n            not_after: 2026-07-24T06:00:00Z\n            action: prep\n            instrument: AUD_CAD\n            broker: oanda\n            account: m-and-w\n            step: retest\n            ttl_hours: 876000\n            trade_id: hs-aud-cad-a07622da\n          kind: prep_retest\n        - rule_id: 05-enter\n          trigger:\n            type: pine_pattern\n            dir: short\n          fire_mode: once\n          intent:\n            v: 1\n            id: hs-aud-cad-a07622da-enter\n            not_after: 2026-07-23T21:02:25.392142272Z\n            action: enter\n            instrument: AUD_CAD\n            direction: short\n            entry:\n              type: stop\n              from: signal_low\n              offset_pips: 0.0\n              offset_atr_pct: 0.5\n            stop_loss:\n              from: signal_high\n              offset_pips: 0.0\n              offset_atr_pct: 0.5\n            take_profit:\n              absolute: 0.9823\n            broker: oanda\n            account: m-and-w\n            requires_preps:\n            - break-and-close\n            - retest\n            vetos:\n            - too-high\n            - too-low\n            - trade-expiry\n            entry_level_vetos:\n            - name: too-low\n              level: 0.9829555618582332\n              past: Below\n            - name: too-high\n              level: 0.9886150577279796\n              past: Above\n            breakeven:\n              threshold: 0.5\n            trade_id: hs-aud-cad-a07622da\n            max_retries: 5\n            needs_golden: true\n            pip_size: 0.0001\n            tick_size: 0.00001\n          kind: enter\n        - rule_id: 07-close-on-sr-reversal\n          trigger:\n            type: pine_pattern\n            dir: long\n          fire_mode: once\n          intent:\n            v: 1\n            id: hs-aud-cad-a07622da-close-on-sr-reversal\n            not_after: 2026-07-24T06:00:00Z\n            action: close\n            instrument: AUD_CAD\n            broker: oanda\n            account: m-and-w\n            trade_id: hs-aud-cad-a07622da\n            needs_golden: true\n            inside_window:\n            - price\n            sr_bands:\n            - - 0.98331\n              - 0.98527\n            reason: support/resistance reversal\n          kind: per_position_close\n        - rule_id: 06-close-on-reversal\n          trigger:\n            type: pine_pattern\n            dir: long\n          fire_mode: once\n          intent:\n            v: 1\n            id: hs-aud-cad-a07622da-close-on-reversal\n            not_after: 2026-07-24T06:00:00Z\n            action: close\n            instrument: AUD_CAD\n            broker: oanda\n            account: m-and-w\n            trade_id: hs-aud-cad-a07622da\n            needs_golden: true\n            inside_window:\n            - news\n            reason: news-window reversal\n          kind: per_position_close\n        - rule_id: 01-pause-1784741400-1784770200\n          trigger:\n            type: time_reached\n            at_epoch: 1784741400\n          fire_mode: once\n          intent:\n            v: 1\n            id: hs-aud-cad-a07622da-pause-1784741400-1784770200\n            not_after: 2026-07-23T01:30:00Z\n            action: pause\n            instrument: AUD_CAD\n            broker: oanda\n            account: m-and-w\n            trade_id: hs-aud-cad-a07622da\n            blackout_id: 1784741400-1784770200\n            reason: news:AUD_CAD-2026-07-22T17:30:00+00:00\n          kind: control\n        - rule_id: 02-resume-1784741400-1784770200\n          trigger:\n            type: time_reached\n            at_epoch: 1784770200\n          fire_mode: once\n          intent:\n            v: 1\n            id: hs-aud-cad-a07622da-resume-1784741400-1784770200\n            not_after: 2026-07-23T02:00:00Z\n            action: resume\n            instrument: AUD_CAD\n            broker: oanda\n            account: m-and-w\n            trade_id: hs-aud-cad-a07622da\n            blackout_id: 1784741400-1784770200\n            reason: news:AUD_CAD-2026-07-22T17:30:00+00:00\n          kind: control\n        - rule_id: 01-news-start-1784770200-1784773800\n          trigger:\n            type: time_reached\n            at_epoch: 1784770200\n          fire_mode: once\n          intent:\n            v: 1\n            id: hs-aud-cad-a07622da-news-start-1784770200-1784773800\n            not_after: 2026-07-23T02:30:00Z\n            action: news-start\n            instrument: AUD_CAD\n            broker: oanda\n            account: m-and-w\n            trade_id: hs-aud-cad-a07622da\n            news_id: 1784770200-1784773800\n            reason: news:AUD_CAD-2026-07-23T01:30:00+00:00\n          kind: control\n        - rule_id: 02-news-end-1784770200-1784773800\n          trigger:\n            type: time_reached\n            at_epoch: 1784773800\n          fire_mode: once\n          intent:\n            v: 1\n            id: hs-aud-cad-a07622da-news-end-1784770200-1784773800\n            not_after: 2026-07-23T03:00:00Z\n            action: news-end\n            instrument: AUD_CAD\n            broker: oanda\n            account: m-and-w\n            trade_id: hs-aud-cad-a07622da\n            news_id: 1784770200-1784773800\n            reason: news:AUD_CAD-2026-07-23T01:30:00+00:00\n          kind: control\n        shadow: false\n        cross_buffer_pct: 0.0\n        cross_buffer_atr: 0.0\n        bcr_require_golden: false\n        retest_atr_step: 0.075\n        armed_at: 2026-07-22T09:12:10.392142272Z\n        armed_sentiment:\n          period_start: 2026-07-21T09:12:10.392142272Z\n          period_end: 2026-07-22T09:12:10.392142272Z\n          overall_direction: neutral\n          confidence: low\n          currencies: []\n      state:\n        watermark: 2026-07-23T03:00:00Z\n        phase: await_break_and_close\n        fired:\n        - 01-news-start-1784770200-1784773800\n        - 01-pause-1784741400-1784770200\n        - 02-news-end-1784770200-1784773800\n        - 02-resume-1784741400-1784770200\n        last_close:\n          01-veto-too-high: 0.987\n          03-prep-break-and-close: 0.987\n        origin_open:\n          01-veto-too-high: 0.98574\n          03-prep-break-and-close: 0.98574\n        expires_at: 2026-07-24T03:59:58.925685311Z\n  logs: []\nticks:\n- schema_version: 1\n  tick_ts: 2026-07-22T17:30:16.763174606Z\n  correlation_id: hs-aud-cad-a07622da\n  account: m-and-w\n  request_id: hs-aud-cad-a07622da@2026-07-22T17:30:16.763174606+00:00\n  plan:\n    trade_id: hs-aud-cad-a07622da\n    instrument: AUD_CAD\n    direction: short\n    granularity: h1\n    pip_size: 0.0001\n    rules:\n    - rule_id: 01-veto-too-high\n      trigger:\n        type: horizontal_cross\n        level: 0.9886150577279796\n        dir: up\n        bar: on_close\n      fire_mode: once\n      intent:\n        v: 1\n        id: hs-aud-cad-a07622da-too-high\n        not_after: 2026-07-24T06:30:00Z\n        action: veto\n        instrument: AUD_CAD\n        broker: oanda\n        account: m-and-w\n        name: too-high\n        ttl_hours: 46\n        level: close-positions\n        trade_id: hs-aud-cad-a07622da\n      kind: setup_invalidation\n    - rule_id: 01-veto-too-low\n      trigger:\n        type: price_value_cross\n        level: 0.9829555618582332\n        dir: either\n        bar: intrabar\n      fire_mode: once\n      intent:\n        v: 1\n        id: hs-aud-cad-a07622da-too-low\n        not_after: 2026-07-24T06:30:00Z\n        action: veto\n        instrument: AUD_CAD\n        broker: oanda\n        account: m-and-w\n        name: too-low\n        ttl_hours: 46\n        level: stop-next-entry\n        trade_id: hs-aud-cad-a07622da\n      kind: setup_invalidation\n    - rule_id: 02-veto-trade-expiry\n      trigger:\n        type: time_reached\n        at_epoch: 1784872800\n      fire_mode: once\n      intent:\n        v: 1\n        id: hs-aud-cad-a07622da-trade-expiry\n        not_before: 2026-07-24T06:00:00Z\n        not_after: 2026-07-24T06:30:00Z\n        action: veto\n        instrument: AUD_CAD\n        broker: oanda\n        account: m-and-w\n        name: trade-expiry\n        ttl_hours: 46\n        level: close-positions\n        trade_id: hs-aud-cad-a07622da\n      kind: setup_invalidation\n    - rule_id: 03-prep-break-and-close\n      trigger:\n        type: trendline_cross\n        a:\n          at_epoch: 1784588400\n          price: 0.98478\n        b:\n          at_epoch: 1784707200\n          price: 0.98574\n        extend_forward: true\n        bar_seconds: 3600\n        dir: down\n        bar: on_close\n      fire_mode: once\n      intent:\n        v: 1\n        id: hs-aud-cad-a07622da-break-and-close\n        not_after: 2026-07-24T06:00:00Z\n        action: prep\n        instrument: AUD_CAD\n        broker: oanda\n        account: m-and-w\n        step: break-and-close\n        ttl_hours: 876000\n        clears:\n        - retest\n        trade_id: hs-aud-cad-a07622da\n      kind: prep_break_and_close\n    - rule_id: 04-prep-retest\n      trigger:\n        type: trendline_cross\n        a:\n          at_epoch: 1784588400\n          price: 0.98478\n        b:\n          at_epoch: 1784707200\n          price: 0.98574\n        extend_forward: true\n        bar_seconds: 3600\n        dir: up\n        bar: intrabar\n      fire_mode: once\n      intent:\n        v: 1\n        id: hs-aud-cad-a07622da-retest\n        not_after: 2026-07-24T06:00:00Z\n        action: prep\n        instrument: AUD_CAD\n        broker: oanda\n        account: m-and-w\n        step: retest\n        ttl_hours: 876000\n        trade_id: hs-aud-cad-a07622da\n      kind: prep_retest\n    - rule_id: 05-enter\n      trigger:\n        type: pine_pattern\n        dir: short\n      fire_mode: once\n      intent:\n        v: 1\n        id: hs-aud-cad-a07622da-enter\n        not_after: 2026-07-23T21:02:25.392142272Z\n        action: enter\n        instrument: AUD_CAD\n        direction: short\n        entry:\n          type: stop\n          from: signal_low\n          offset_pips: 0.0\n          offset_atr_pct: 0.5\n        stop_loss:\n          from: signal_high\n          offset_pips: 0.0\n          offset_atr_pct: 0.5\n        take_profit:\n          absolute: 0.9823\n        broker: oanda\n        account: m-and-w\n        requires_preps:\n        - break-and-close\n        - retest\n        vetos:\n        - too-high\n        - too-low\n        - trade-expiry\n        entry_level_vetos:\n        - name: too-low\n          level: 0.9829555618582332\n          past: Below\n        - name: too-high\n          level: 0.9886150577279796\n          past: Above\n        breakeven:\n          threshold: 0.5\n        trade_id: hs-aud-cad-a07622da\n        max_retries: 5\n        needs_golden: true\n        pip_size: 0.0001\n        tick_size: 0.00001\n      kind: enter\n    - rule_id: 07-close-on-sr-reversal\n      trigger:\n        type: pine_pattern\n        dir: long\n      fire_mode: once\n      intent:\n        v: 1\n        id: hs-aud-cad-a07622da-close-on-sr-reversal\n        not_after: 2026-07-24T06:00:00Z\n        action: close\n        instrument: AUD_CAD\n        broker: oanda\n        account: m-and-w\n        trade_id: hs-aud-cad-a07622da\n        needs_golden: true\n        inside_window:\n        - price\n        sr_bands:\n        - - 0.98331\n          - 0.98527\n        reason: support/resistance reversal\n      kind: per_position_close\n    - rule_id: 06-close-on-reversal\n      trigger:\n        type: pine_pattern\n        dir: long\n      fire_mode: once\n      intent:\n        v: 1\n        id: hs-aud-cad-a07622da-close-on-reversal\n        not_after: 2026-07-24T06:00:00Z\n        action: close\n        instrument: AUD_CAD\n        broker: oanda\n        account: m-and-w\n        trade_id: hs-aud-cad-a07622da\n        needs_golden: true\n        inside_window:\n        - news\n        reason: news-window reversal\n      kind: per_position_close\n    - rule_id: 01-pause-1784741400-1784770200\n      trigger:\n        type: time_reached\n        at_epoch: 1784741400\n      fire_mode: once\n      intent:\n        v: 1\n        id: hs-aud-cad-a07622da-pause-1784741400-1784770200\n        not_after: 2026-07-23T01:30:00Z\n        action: pause\n        instrument: AUD_CAD\n        broker: oanda\n        account: m-and-w\n        trade_id: hs-aud-cad-a07622da\n        blackout_id: 1784741400-1784770200\n        reason: news:AUD_CAD-2026-07-22T17:30:00+00:00\n      kind: control\n    - rule_id: 02-resume-1784741400-1784770200\n      trigger:\n        type: time_reached\n        at_epoch: 1784770200\n      fire_mode: once\n      intent:\n        v: 1\n        id: hs-aud-cad-a07622da-resume-1784741400-1784770200\n        not_after: 2026-07-23T02:00:00Z\n        action: resume\n        instrument: AUD_CAD\n        broker: oanda\n        account: m-and-w\n        trade_id: hs-aud-cad-a07622da\n        blackout_id: 1784741400-1784770200\n        reason: news:AUD_CAD-2026-07-22T17:30:00+00:00\n      kind: control\n    - rule_id: 01-news-start-1784770200-1784773800\n      trigger:\n        type: time_reached\n        at_epoch: 1784770200\n      fire_mode: once\n      intent:\n        v: 1\n        id: hs-aud-cad-a07622da-news-start-1784770200-1784773800\n        not_after: 2026-07-23T02:30:00Z\n        action: news-start\n        instrument: AUD_CAD\n        broker: oanda\n        account: m-and-w\n        trade_id: hs-aud-cad-a07622da\n        news_id: 1784770200-1784773800\n        reason: news:AUD_CAD-2026-07-23T01:30:00+00:00\n      kind: control\n    - rule_id: 02-news-end-1784770200-1784773800\n      trigger:\n        type: time_reached\n        at_epoch: 1784773800\n      fire_mode: once\n      intent:\n        v: 1\n        id: hs-aud-cad-a07622da-news-end-1784770200-1784773800\n        not_after: 2026-07-23T03:00:00Z\n        action: news-end\n        instrument: AUD_CAD\n        broker: oanda\n        account: m-and-w\n        trade_id: hs-aud-cad-a07622da\n        news_id: 1784770200-1784773800\n        reason: news:AUD_CAD-2026-07-23T01:30:00+00:00\n      kind: control\n    shadow: false\n    cross_buffer_pct: 0.0\n    cross_buffer_atr: 0.0\n    bcr_require_golden: false\n    retest_atr_step: 0.075\n    armed_at: 2026-07-22T09:12:10.392142272Z\n    armed_sentiment:\n      period_start: 2026-07-21T09:12:10.392142272Z\n      period_end: 2026-07-22T09:12:10.392142272Z\n      overall_direction: neutral\n      confidence: low\n      currencies: []\n  prior_state:\n    watermark: 2026-07-22T16:00:00Z\n    phase: await_break_and_close\n    last_close:\n      01-veto-too-high: 0.98585\n      03-prep-break-and-close: 0.98585\n    origin_open:\n      01-veto-too-high: 0.98574\n      03-prep-break-and-close: 0.98574\n    expires_at: 2026-07-23T16:59:50.320424127Z\n  new_candles: []\n  detector_window: []\n  now: 2026-07-22T17:30:16.763174606Z\n  expires_at: 2026-07-23T17:30:16.763174606Z\n  eval:\n    fired:\n    - rule_id: 01-pause-1784741400-1784770200\n      intent:\n        v: 1\n        id: hs-aud-cad-a07622da-pause-1784741400-1784770200\n        not_after: 2026-07-23T01:30:00Z\n        action: pause\n        instrument: AUD_CAD\n        broker: oanda\n        account: m-and-w\n        trade_id: hs-aud-cad-a07622da\n        blackout_id: 1784741400-1784770200\n        reason: news:AUD_CAD-2026-07-22T17:30:00+00:00\n      candle:\n        time: 2026-07-22T16:00:00Z\n        o: 0.0\n        h: 0.0\n        l: 0.0\n        c: 0.0\n      signal: null\n    new_state:\n      watermark: 2026-07-22T16:00:00Z\n      phase: await_break_and_close\n      fired:\n      - 01-pause-1784741400-1784770200\n      last_close:\n        01-veto-too-high: 0.98585\n        03-prep-break-and-close: 0.98585\n      origin_open:\n        01-veto-too-high: 0.98574\n        03-prep-break-and-close: 0.98574\n      expires_at: 2026-07-23T17:30:16.763174606Z\n    done: false\n  shadow: false\n  dispatch_outcomes:\n  - rule_id: 01-pause-1784741400-1784770200\n    intent_id: hs-aud-cad-a07622da-pause-1784741400-1784770200\n    outcome: Ok(pause-set)\n    seq: 0\n  kv:\n    key: plan-state:m-and-w:hs-aud-cad-a07622da\n    before:\n      watermark: 2026-07-22T16:00:00Z\n      phase: await_break_and_close\n      last_close:\n        01-veto-too-high: 0.98585\n        03-prep-break-and-close: 0.98585\n      origin_open:\n        01-veto-too-high: 0.98574\n        03-prep-break-and-close: 0.98574\n      expires_at: 2026-07-23T16:59:50.320424127Z\n    after:\n      watermark: 2026-07-22T16:00:00Z\n      phase: await_break_and_close\n      fired:\n      - 01-pause-1784741400-1784770200\n      last_close:\n        01-veto-too-high: 0.98585\n        03-prep-break-and-close: 0.98585\n      origin_open:\n        01-veto-too-high: 0.98574\n        03-prep-break-and-close: 0.98574\n      expires_at: 2026-07-23T17:30:16.763174606Z\n    cleared_plan: false\n    success: true\n    error: null\n- schema_version: 1\n  tick_ts: 2026-07-23T01:30:02.428056208Z\n  correlation_id: hs-aud-cad-a07622da\n  account: m-and-w\n  request_id: hs-aud-cad-a07622da@2026-07-23T01:30:02.428056208+00:00\n  plan:\n    trade_id: hs-aud-cad-a07622da\n    instrument: AUD_CAD\n    direction: short\n    granularity: h1\n    pip_size: 0.0001\n    rules:\n    - rule_id: 01-veto-too-high\n      trigger:\n        type: horizontal_cross\n        level: 0.9886150577279796\n        dir: up\n        bar: on_close\n      fire_mode: once\n      intent:\n        v: 1\n        id: hs-aud-cad-a07622da-too-high\n        not_after: 2026-07-24T06:30:00Z\n        action: veto\n        instrument: AUD_CAD\n        broker: oanda\n        account: m-and-w\n        name: too-high\n        ttl_hours: 46\n        level: close-positions\n        trade_id: hs-aud-cad-a07622da\n      kind: setup_invalidation\n    - rule_id: 01-veto-too-low\n      trigger:\n        type: price_value_cross\n        level: 0.9829555618582332\n        dir: either\n        bar: intrabar\n      fire_mode: once\n      intent:\n        v: 1\n        id: hs-aud-cad-a07622da-too-low\n        not_after: 2026-07-24T06:30:00Z\n        action: veto\n        instrument: AUD_CAD\n        broker: oanda\n        account: m-and-w\n        name: too-low\n        ttl_hours: 46\n        level: stop-next-entry\n        trade_id: hs-aud-cad-a07622da\n      kind: setup_invalidation\n    - rule_id: 02-veto-trade-expiry\n      trigger:\n        type: time_reached\n        at_epoch: 1784872800\n      fire_mode: once\n      intent:\n        v: 1\n        id: hs-aud-cad-a07622da-trade-expiry\n        not_before: 2026-07-24T06:00:00Z\n        not_after: 2026-07-24T06:30:00Z\n        action: veto\n        instrument: AUD_CAD\n        broker: oanda\n        account: m-and-w\n        name: trade-expiry\n        ttl_hours: 46\n        level: close-positions\n        trade_id: hs-aud-cad-a07622da\n      kind: setup_invalidation\n    - rule_id: 03-prep-break-and-close\n      trigger:\n        type: trendline_cross\n        a:\n          at_epoch: 1784588400\n          price: 0.98478\n        b:\n          at_epoch: 1784707200\n          price: 0.98574\n        extend_forward: true\n        bar_seconds: 3600\n        dir: down\n        bar: on_close\n      fire_mode: once\n      intent:\n        v: 1\n        id: hs-aud-cad-a07622da-break-and-close\n        not_after: 2026-07-24T06:00:00Z\n        action: prep\n        instrument: AUD_CAD\n        broker: oanda\n        account: m-and-w\n        step: break-and-close\n        ttl_hours: 876000\n        clears:\n        - retest\n        trade_id: hs-aud-cad-a07622da\n      kind: prep_break_and_close\n    - rule_id: 04-prep-retest\n      trigger:\n        type: trendline_cross\n        a:\n          at_epoch: 1784588400\n          price: 0.98478\n        b:\n          at_epoch: 1784707200\n          price: 0.98574\n        extend_forward: true\n        bar_seconds: 3600\n        dir: up\n        bar: intrabar\n      fire_mode: once\n      intent:\n        v: 1\n        id: hs-aud-cad-a07622da-retest\n        not_after: 2026-07-24T06:00:00Z\n        action: prep\n        instrument: AUD_CAD\n        broker: oanda\n        account: m-and-w\n        step: retest\n        ttl_hours: 876000\n        trade_id: hs-aud-cad-a07622da\n      kind: prep_retest\n    - rule_id: 05-enter\n      trigger:\n        type: pine_pattern\n        dir: short\n      fire_mode: once\n      intent:\n        v: 1\n        id: hs-aud-cad-a07622da-enter\n        not_after: 2026-07-23T21:02:25.392142272Z\n        action: enter\n        instrument: AUD_CAD\n        direction: short\n        entry:\n          type: stop\n          from: signal_low\n          offset_pips: 0.0\n          offset_atr_pct: 0.5\n        stop_loss:\n          from: signal_high\n          offset_pips: 0.0\n          offset_atr_pct: 0.5\n        take_profit:\n          absolute: 0.9823\n        broker: oanda\n        account: m-and-w\n        requires_preps:\n        - break-and-close\n        - retest\n        vetos:\n        - too-high\n        - too-low\n        - trade-expiry\n        entry_level_vetos:\n        - name: too-low\n          level: 0.9829555618582332\n          past: Below\n        - name: too-high\n          level: 0.9886150577279796\n          past: Above\n        breakeven:\n          threshold: 0.5\n        trade_id: hs-aud-cad-a07622da\n        max_retries: 5\n        needs_golden: true\n        pip_size: 0.0001\n        tick_size: 0.00001\n      kind: enter\n    - rule_id: 07-close-on-sr-reversal\n      trigger:\n        type: pine_pattern\n        dir: long\n      fire_mode: once\n      intent:\n        v: 1\n        id: hs-aud-cad-a07622da-close-on-sr-reversal\n        not_after: 2026-07-24T06:00:00Z\n        action: close\n        instrument: AUD_CAD\n        broker: oanda\n        account: m-and-w\n        trade_id: hs-aud-cad-a07622da\n        needs_golden: true\n        inside_window:\n        - price\n        sr_bands:\n        - - 0.98331\n          - 0.98527\n        reason: support/resistance reversal\n      kind: per_position_close\n    - rule_id: 06-close-on-reversal\n      trigger:\n        type: pine_pattern\n        dir: long\n      fire_mode: once\n      intent:\n        v: 1\n        id: hs-aud-cad-a07622da-close-on-reversal\n        not_after: 2026-07-24T06:00:00Z\n        action: close\n        instrument: AUD_CAD\n        broker: oanda\n        account: m-and-w\n        trade_id: hs-aud-cad-a07622da\n        needs_golden: true\n        inside_window:\n        - news\n        reason: news-window reversal\n      kind: per_position_close\n    - rule_id: 01-pause-1784741400-1784770200\n      trigger:\n        type: time_reached\n        at_epoch: 1784741400\n      fire_mode: once\n      intent:\n        v: 1\n        id: hs-aud-cad-a07622da-pause-1784741400-1784770200\n        not_after: 2026-07-23T01:30:00Z\n        action: pause\n        instrument: AUD_CAD\n        broker: oanda\n        account: m-and-w\n        trade_id: hs-aud-cad-a07622da\n        blackout_id: 1784741400-1784770200\n        reason: news:AUD_CAD-2026-07-22T17:30:00+00:00\n      kind: control\n    - rule_id: 02-resume-1784741400-1784770200\n      trigger:\n        type: time_reached\n        at_epoch: 1784770200\n      fire_mode: once\n      intent:\n        v: 1\n        id: hs-aud-cad-a07622da-resume-1784741400-1784770200\n        not_after: 2026-07-23T02:00:00Z\n        action: resume\n        instrument: AUD_CAD\n        broker: oanda\n        account: m-and-w\n        trade_id: hs-aud-cad-a07622da\n        blackout_id: 1784741400-1784770200\n        reason: news:AUD_CAD-2026-07-22T17:30:00+00:00\n      kind: control\n    - rule_id: 01-news-start-1784770200-1784773800\n      trigger:\n        type: time_reached\n        at_epoch: 1784770200\n      fire_mode: once\n      intent:\n        v: 1\n        id: hs-aud-cad-a07622da-news-start-1784770200-1784773800\n        not_after: 2026-07-23T02:30:00Z\n        action: news-start\n        instrument: AUD_CAD\n        broker: oanda\n        account: m-and-w\n        trade_id: hs-aud-cad-a07622da\n        news_id: 1784770200-1784773800\n        reason: news:AUD_CAD-2026-07-23T01:30:00+00:00\n      kind: control\n    - rule_id: 02-news-end-1784770200-1784773800\n      trigger:\n        type: time_reached\n        at_epoch: 1784773800\n      fire_mode: once\n      intent:\n        v: 1\n        id: hs-aud-cad-a07622da-news-end-1784770200-1784773800\n        not_after: 2026-07-23T03:00:00Z\n        action: news-end\n        instrument: AUD_CAD\n        broker: oanda\n        account: m-and-w\n        trade_id: hs-aud-cad-a07622da\n        news_id: 1784770200-1784773800\n        reason: news:AUD_CAD-2026-07-23T01:30:00+00:00\n      kind: control\n    shadow: false\n    cross_buffer_pct: 0.0\n    cross_buffer_atr: 0.0\n    bcr_require_golden: false\n    retest_atr_step: 0.075\n    armed_at: 2026-07-22T09:12:10.392142272Z\n    armed_sentiment:\n      period_start: 2026-07-21T09:12:10.392142272Z\n      period_end: 2026-07-22T09:12:10.392142272Z\n      overall_direction: neutral\n      confidence: low\n      currencies: []\n  prior_state:\n    watermark: 2026-07-23T00:00:00Z\n    phase: await_break_and_close\n    fired:\n    - 01-pause-1784741400-1784770200\n    last_close:\n      01-veto-too-high: 0.98466\n      03-prep-break-and-close: 0.98466\n    origin_open:\n      01-veto-too-high: 0.98574\n      03-prep-break-and-close: 0.98574\n    expires_at: 2026-07-24T00:59:53.845586708Z\n  new_candles: []\n  detector_window: []\n  now: 2026-07-23T01:30:02.428056208Z\n  expires_at: 2026-07-24T01:30:02.428056208Z\n  eval:\n    fired:\n    - rule_id: 02-resume-1784741400-1784770200\n      intent:\n        v: 1\n        id: hs-aud-cad-a07622da-resume-1784741400-1784770200\n        not_after: 2026-07-23T02:00:00Z\n        action: resume\n        instrument: AUD_CAD\n        broker: oanda\n        account: m-and-w\n        trade_id: hs-aud-cad-a07622da\n        blackout_id: 1784741400-1784770200\n        reason: news:AUD_CAD-2026-07-22T17:30:00+00:00\n      candle:\n        time: 2026-07-23T00:00:00Z\n        o: 0.0\n        h: 0.0\n        l: 0.0\n        c: 0.0\n      signal: null\n    - rule_id: 01-news-start-1784770200-1784773800\n      intent:\n        v: 1\n        id: hs-aud-cad-a07622da-news-start-1784770200-1784773800\n        not_after: 2026-07-23T02:30:00Z\n        action: news-start\n        instrument: AUD_CAD\n        broker: oanda\n        account: m-and-w\n        trade_id: hs-aud-cad-a07622da\n        news_id: 1784770200-1784773800\n        reason: news:AUD_CAD-2026-07-23T01:30:00+00:00\n      candle:\n        time: 2026-07-23T00:00:00Z\n        o: 0.0\n        h: 0.0\n        l: 0.0\n        c: 0.0\n      signal: null\n    new_state:\n      watermark: 2026-07-23T00:00:00Z\n      phase: await_break_and_close\n      fired:\n      - 01-news-start-1784770200-1784773800\n      - 01-pause-1784741400-1784770200\n      - 02-resume-1784741400-1784770200\n      last_close:\n        01-veto-too-high: 0.98466\n        03-prep-break-and-close: 0.98466\n      origin_open:\n        01-veto-too-high: 0.98574\n        03-prep-break-and-close: 0.98574\n      open_news_windows:\n      - 1784770200-1784773800\n      expires_at: 2026-07-24T01:30:02.428056208Z\n    done: false\n  shadow: false\n  dispatch_outcomes:\n  - rule_id: 02-resume-1784741400-1784770200\n    intent_id: hs-aud-cad-a07622da-resume-1784741400-1784770200\n    outcome: Ok(pause-cleared)\n    seq: 0\n  - rule_id: 01-news-start-1784770200-1784773800\n    intent_id: hs-aud-cad-a07622da-news-start-1784770200-1784773800\n    outcome: Ok(news-window-open)\n    seq: 1\n  kv:\n    key: plan-state:m-and-w:hs-aud-cad-a07622da\n    before:\n      watermark: 2026-07-23T00:00:00Z\n      phase: await_break_and_close\n      fired:\n      - 01-pause-1784741400-1784770200\n      last_close:\n        01-veto-too-high: 0.98466\n        03-prep-break-and-close: 0.98466\n      origin_open:\n        01-veto-too-high: 0.98574\n        03-prep-break-and-close: 0.98574\n      expires_at: 2026-07-24T00:59:53.845586708Z\n    after:\n      watermark: 2026-07-23T00:00:00Z\n      phase: await_break_and_close\n      fired:\n      - 01-news-start-1784770200-1784773800\n      - 01-pause-1784741400-1784770200\n      - 02-resume-1784741400-1784770200\n      last_close:\n        01-veto-too-high: 0.98466\n        03-prep-break-and-close: 0.98466\n      origin_open:\n        01-veto-too-high: 0.98574\n        03-prep-break-and-close: 0.98574\n      open_news_windows:\n      - 1784770200-1784773800\n      expires_at: 2026-07-24T01:30:02.428056208Z\n    cleared_plan: false\n    success: true\n    error: null\n- schema_version: 1\n  tick_ts: 2026-07-23T02:30:11.760553287Z\n  correlation_id: hs-aud-cad-a07622da\n  account: m-and-w\n  request_id: hs-aud-cad-a07622da@2026-07-23T02:30:11.760553287+00:00\n  plan:\n    trade_id: hs-aud-cad-a07622da\n    instrument: AUD_CAD\n    direction: short\n    granularity: h1\n    pip_size: 0.0001\n    rules:\n    - rule_id: 01-veto-too-high\n      trigger:\n        type: horizontal_cross\n        level: 0.9886150577279796\n        dir: up\n        bar: on_close\n      fire_mode: once\n      intent:\n        v: 1\n        id: hs-aud-cad-a07622da-too-high\n        not_after: 2026-07-24T06:30:00Z\n        action: veto\n        instrument: AUD_CAD\n        broker: oanda\n        account: m-and-w\n        name: too-high\n        ttl_hours: 46\n        level: close-positions\n        trade_id: hs-aud-cad-a07622da\n      kind: setup_invalidation\n    - rule_id: 01-veto-too-low\n      trigger:\n        type: price_value_cross\n        level: 0.9829555618582332\n        dir: either\n        bar: intrabar\n      fire_mode: once\n      intent:\n        v: 1\n        id: hs-aud-cad-a07622da-too-low\n        not_after: 2026-07-24T06:30:00Z\n        action: veto\n        instrument: AUD_CAD\n        broker: oanda\n        account: m-and-w\n        name: too-low\n        ttl_hours: 46\n        level: stop-next-entry\n        trade_id: hs-aud-cad-a07622da\n      kind: setup_invalidation\n    - rule_id: 02-veto-trade-expiry\n      trigger:\n        type: time_reached\n        at_epoch: 1784872800\n      fire_mode: once\n      intent:\n        v: 1\n        id: hs-aud-cad-a07622da-trade-expiry\n        not_before: 2026-07-24T06:00:00Z\n        not_after: 2026-07-24T06:30:00Z\n        action: veto\n        instrument: AUD_CAD\n        broker: oanda\n        account: m-and-w\n        name: trade-expiry\n        ttl_hours: 46\n        level: close-positions\n        trade_id: hs-aud-cad-a07622da\n      kind: setup_invalidation\n    - rule_id: 03-prep-break-and-close\n      trigger:\n        type: trendline_cross\n        a:\n          at_epoch: 1784588400\n          price: 0.98478\n        b:\n          at_epoch: 1784707200\n          price: 0.98574\n        extend_forward: true\n        bar_seconds: 3600\n        dir: down\n        bar: on_close\n      fire_mode: once\n      intent:\n        v: 1\n        id: hs-aud-cad-a07622da-break-and-close\n        not_after: 2026-07-24T06:00:00Z\n        action: prep\n        instrument: AUD_CAD\n        broker: oanda\n        account: m-and-w\n        step: break-and-close\n        ttl_hours: 876000\n        clears:\n        - retest\n        trade_id: hs-aud-cad-a07622da\n      kind: prep_break_and_close\n    - rule_id: 04-prep-retest\n      trigger:\n        type: trendline_cross\n        a:\n          at_epoch: 1784588400\n          price: 0.98478\n        b:\n          at_epoch: 1784707200\n          price: 0.98574\n        extend_forward: true\n        bar_seconds: 3600\n        dir: up\n        bar: intrabar\n      fire_mode: once\n      intent:\n        v: 1\n        id: hs-aud-cad-a07622da-retest\n        not_after: 2026-07-24T06:00:00Z\n        action: prep\n        instrument: AUD_CAD\n        broker: oanda\n        account: m-and-w\n        step: retest\n        ttl_hours: 876000\n        trade_id: hs-aud-cad-a07622da\n      kind: prep_retest\n    - rule_id: 05-enter\n      trigger:\n        type: pine_pattern\n        dir: short\n      fire_mode: once\n      intent:\n        v: 1\n        id: hs-aud-cad-a07622da-enter\n        not_after: 2026-07-23T21:02:25.392142272Z\n        action: enter\n        instrument: AUD_CAD\n        direction: short\n        entry:\n          type: stop\n          from: signal_low\n          offset_pips: 0.0\n          offset_atr_pct: 0.5\n        stop_loss:\n          from: signal_high\n          offset_pips: 0.0\n          offset_atr_pct: 0.5\n        take_profit:\n          absolute: 0.9823\n        broker: oanda\n        account: m-and-w\n        requires_preps:\n        - break-and-close\n        - retest\n        vetos:\n        - too-high\n        - too-low\n        - trade-expiry\n        entry_level_vetos:\n        - name: too-low\n          level: 0.9829555618582332\n          past: Below\n        - name: too-high\n          level: 0.9886150577279796\n          past: Above\n        breakeven:\n          threshold: 0.5\n        trade_id: hs-aud-cad-a07622da\n        max_retries: 5\n        needs_golden: true\n        pip_size: 0.0001\n        tick_size: 0.00001\n      kind: enter\n    - rule_id: 07-close-on-sr-reversal\n      trigger:\n        type: pine_pattern\n        dir: long\n      fire_mode: once\n      intent:\n        v: 1\n        id: hs-aud-cad-a07622da-close-on-sr-reversal\n        not_after: 2026-07-24T06:00:00Z\n        action: close\n        instrument: AUD_CAD\n        broker: oanda\n        account: m-and-w\n        trade_id: hs-aud-cad-a07622da\n        needs_golden: true\n        inside_window:\n        - price\n        sr_bands:\n        - - 0.98331\n          - 0.98527\n        reason: support/resistance reversal\n      kind: per_position_close\n    - rule_id: 06-close-on-reversal\n      trigger:\n        type: pine_pattern\n        dir: long\n      fire_mode: once\n      intent:\n        v: 1\n        id: hs-aud-cad-a07622da-close-on-reversal\n        not_after: 2026-07-24T06:00:00Z\n        action: close\n        instrument: AUD_CAD\n        broker: oanda\n        account: m-and-w\n        trade_id: hs-aud-cad-a07622da\n        needs_golden: true\n        inside_window:\n        - news\n        reason: news-window reversal\n      kind: per_position_close\n    - rule_id: 01-pause-1784741400-1784770200\n      trigger:\n        type: time_reached\n        at_epoch: 1784741400\n      fire_mode: once\n      intent:\n        v: 1\n        id: hs-aud-cad-a07622da-pause-1784741400-1784770200\n        not_after: 2026-07-23T01:30:00Z\n        action: pause\n        instrument: AUD_CAD\n        broker: oanda\n        account: m-and-w\n        trade_id: hs-aud-cad-a07622da\n        blackout_id: 1784741400-1784770200\n        reason: news:AUD_CAD-2026-07-22T17:30:00+00:00\n      kind: control\n    - rule_id: 02-resume-1784741400-1784770200\n      trigger:\n        type: time_reached\n        at_epoch: 1784770200\n      fire_mode: once\n      intent:\n        v: 1\n        id: hs-aud-cad-a07622da-resume-1784741400-1784770200\n        not_after: 2026-07-23T02:00:00Z\n        action: resume\n        instrument: AUD_CAD\n        broker: oanda\n        account: m-and-w\n        trade_id: hs-aud-cad-a07622da\n        blackout_id: 1784741400-1784770200\n        reason: news:AUD_CAD-2026-07-22T17:30:00+00:00\n      kind: control\n    - rule_id: 01-news-start-1784770200-1784773800\n      trigger:\n        type: time_reached\n        at_epoch: 1784770200\n      fire_mode: once\n      intent:\n        v: 1\n        id: hs-aud-cad-a07622da-news-start-1784770200-1784773800\n        not_after: 2026-07-23T02:30:00Z\n        action: news-start\n        instrument: AUD_CAD\n        broker: oanda\n        account: m-and-w\n        trade_id: hs-aud-cad-a07622da\n        news_id: 1784770200-1784773800\n        reason: news:AUD_CAD-2026-07-23T01:30:00+00:00\n      kind: control\n    - rule_id: 02-news-end-1784770200-1784773800\n      trigger:\n        type: time_reached\n        at_epoch: 1784773800\n      fire_mode: once\n      intent:\n        v: 1\n        id: hs-aud-cad-a07622da-news-end-1784770200-1784773800\n        not_after: 2026-07-23T03:00:00Z\n        action: news-end\n        instrument: AUD_CAD\n        broker: oanda\n        account: m-and-w\n        trade_id: hs-aud-cad-a07622da\n        news_id: 1784770200-1784773800\n        reason: news:AUD_CAD-2026-07-23T01:30:00+00:00\n      kind: control\n    shadow: false\n    cross_buffer_pct: 0.0\n    cross_buffer_atr: 0.0\n    bcr_require_golden: false\n    retest_atr_step: 0.075\n    armed_at: 2026-07-22T09:12:10.392142272Z\n    armed_sentiment:\n      period_start: 2026-07-21T09:12:10.392142272Z\n      period_end: 2026-07-22T09:12:10.392142272Z\n      overall_direction: neutral\n      confidence: low\n      currencies: []\n  prior_state:\n    watermark: 2026-07-23T01:00:00Z\n    phase: await_break_and_close\n    fired:\n    - 01-news-start-1784770200-1784773800\n    - 01-pause-1784741400-1784770200\n    - 02-resume-1784741400-1784770200\n    last_close:\n      01-veto-too-high: 0.98662\n      03-prep-break-and-close: 0.98662\n    origin_open:\n      01-veto-too-high: 0.98574\n      03-prep-break-and-close: 0.98574\n    open_news_windows:\n    - 1784770200-1784773800\n    expires_at: 2026-07-24T01:59:59.150640161Z\n  new_candles: []\n  detector_window: []\n  now: 2026-07-23T02:30:11.760553287Z\n  expires_at: 2026-07-24T02:30:11.760553287Z\n  eval:\n    fired:\n    - rule_id: 02-news-end-1784770200-1784773800\n      intent:\n        v: 1\n        id: hs-aud-cad-a07622da-news-end-1784770200-1784773800\n        not_after: 2026-07-23T03:00:00Z\n        action: news-end\n        instrument: AUD_CAD\n        broker: oanda\n        account: m-and-w\n        trade_id: hs-aud-cad-a07622da\n        news_id: 1784770200-1784773800\n        reason: news:AUD_CAD-2026-07-23T01:30:00+00:00\n      candle:\n        time: 2026-07-23T01:00:00Z\n        o: 0.0\n        h: 0.0\n        l: 0.0\n        c: 0.0\n      signal: null\n    new_state:\n      watermark: 2026-07-23T01:00:00Z\n      phase: await_break_and_close\n      fired:\n      - 01-news-start-1784770200-1784773800\n      - 01-pause-1784741400-1784770200\n      - 02-news-end-1784770200-1784773800\n      - 02-resume-1784741400-1784770200\n      last_close:\n        01-veto-too-high: 0.98662\n        03-prep-break-and-close: 0.98662\n      origin_open:\n        01-veto-too-high: 0.98574\n        03-prep-break-and-close: 0.98574\n      expires_at: 2026-07-24T02:30:11.760553287Z\n    done: false\n  shadow: false\n  dispatch_outcomes:\n  - rule_id: 02-news-end-1784770200-1784773800\n    intent_id: hs-aud-cad-a07622da-news-end-1784770200-1784773800\n    outcome: Ok(news-window-closed)\n    seq: 0\n  kv:\n    key: plan-state:m-and-w:hs-aud-cad-a07622da\n    before:\n      watermark: 2026-07-23T01:00:00Z\n      phase: await_break_and_close\n      fired:\n      - 01-news-start-1784770200-1784773800\n      - 01-pause-1784741400-1784770200\n      - 02-resume-1784741400-1784770200\n      last_close:\n        01-veto-too-high: 0.98662\n        03-prep-break-and-close: 0.98662\n      origin_open:\n        01-veto-too-high: 0.98574\n        03-prep-break-and-close: 0.98574\n      open_news_windows:\n      - 1784770200-1784773800\n      expires_at: 2026-07-24T01:59:59.150640161Z\n    after:\n      watermark: 2026-07-23T01:00:00Z\n      phase: await_break_and_close\n      fired:\n      - 01-news-start-1784770200-1784773800\n      - 01-pause-1784741400-1784770200\n      - 02-news-end-1784770200-1784773800\n      - 02-resume-1784741400-1784770200\n      last_close:\n        01-veto-too-high: 0.98662\n        03-prep-break-and-close: 0.98662\n      origin_open:\n        01-veto-too-high: 0.98574\n        03-prep-break-and-close: 0.98574\n      expires_at: 2026-07-24T02:30:11.760553287Z\n    cleared_plan: false\n    success: true\n    error: null\n",
+      "logs": []
+    }
+  ],
+  "ticks": [
+    {
+      "schema_version": 1,
+      "tick_ts": "2026-07-22T17:30:16.763174606Z",
+      "correlation_id": "hs-aud-cad-a07622da",
+      "account": "m-and-w",
+      "request_id": "hs-aud-cad-a07622da@2026-07-22T17:30:16.763174606+00:00",
+      "plan": {
+        "trade_id": "hs-aud-cad-a07622da",
+        "instrument": "AUD_CAD",
+        "direction": "short",
+        "granularity": "h1",
+        "pip_size": 0.0001,
+        "rules": [
+          {
+            "rule_id": "01-veto-too-high",
+            "trigger": {
+              "type": "horizontal_cross",
+              "level": 0.9886150577279796,
+              "dir": "up",
+              "bar": "on_close"
+            },
+            "fire_mode": "once",
+            "intent": {
+              "v": 1,
+              "id": "hs-aud-cad-a07622da-too-high",
+              "not_after": "2026-07-24T06:30:00Z",
+              "action": "veto",
+              "instrument": "AUD_CAD",
+              "broker": "oanda",
+              "account": "m-and-w",
+              "name": "too-high",
+              "ttl_hours": 46,
+              "level": "close-positions",
+              "trade_id": "hs-aud-cad-a07622da"
+            },
+            "kind": "setup_invalidation"
+          },
+          {
+            "rule_id": "01-veto-too-low",
+            "trigger": {
+              "type": "price_value_cross",
+              "level": 0.9829555618582332,
+              "dir": "either",
+              "bar": "intrabar"
+            },
+            "fire_mode": "once",
+            "intent": {
+              "v": 1,
+              "id": "hs-aud-cad-a07622da-too-low",
+              "not_after": "2026-07-24T06:30:00Z",
+              "action": "veto",
+              "instrument": "AUD_CAD",
+              "broker": "oanda",
+              "account": "m-and-w",
+              "name": "too-low",
+              "ttl_hours": 46,
+              "level": "stop-next-entry",
+              "trade_id": "hs-aud-cad-a07622da"
+            },
+            "kind": "setup_invalidation"
+          },
+          {
+            "rule_id": "02-veto-trade-expiry",
+            "trigger": {
+              "type": "time_reached",
+              "at_epoch": 1784872800
+            },
+            "fire_mode": "once",
+            "intent": {
+              "v": 1,
+              "id": "hs-aud-cad-a07622da-trade-expiry",
+              "not_before": "2026-07-24T06:00:00Z",
+              "not_after": "2026-07-24T06:30:00Z",
+              "action": "veto",
+              "instrument": "AUD_CAD",
+              "broker": "oanda",
+              "account": "m-and-w",
+              "name": "trade-expiry",
+              "ttl_hours": 46,
+              "level": "close-positions",
+              "trade_id": "hs-aud-cad-a07622da"
+            },
+            "kind": "setup_invalidation"
+          },
+          {
+            "rule_id": "03-prep-break-and-close",
+            "trigger": {
+              "type": "trendline_cross",
+              "a": {
+                "at_epoch": 1784588400,
+                "price": 0.98478
+              },
+              "b": {
+                "at_epoch": 1784707200,
+                "price": 0.98574
+              },
+              "extend_forward": true,
+              "bar_seconds": 3600,
+              "dir": "down",
+              "bar": "on_close"
+            },
+            "fire_mode": "once",
+            "intent": {
+              "v": 1,
+              "id": "hs-aud-cad-a07622da-break-and-close",
+              "not_after": "2026-07-24T06:00:00Z",
+              "action": "prep",
+              "instrument": "AUD_CAD",
+              "broker": "oanda",
+              "account": "m-and-w",
+              "step": "break-and-close",
+              "ttl_hours": 876000,
+              "clears": [
+                "retest"
+              ],
+              "trade_id": "hs-aud-cad-a07622da"
+            },
+            "kind": "prep_break_and_close"
+          },
+          {
+            "rule_id": "04-prep-retest",
+            "trigger": {
+              "type": "trendline_cross",
+              "a": {
+                "at_epoch": 1784588400,
+                "price": 0.98478
+              },
+              "b": {
+                "at_epoch": 1784707200,
+                "price": 0.98574
+              },
+              "extend_forward": true,
+              "bar_seconds": 3600,
+              "dir": "up",
+              "bar": "intrabar"
+            },
+            "fire_mode": "once",
+            "intent": {
+              "v": 1,
+              "id": "hs-aud-cad-a07622da-retest",
+              "not_after": "2026-07-24T06:00:00Z",
+              "action": "prep",
+              "instrument": "AUD_CAD",
+              "broker": "oanda",
+              "account": "m-and-w",
+              "step": "retest",
+              "ttl_hours": 876000,
+              "trade_id": "hs-aud-cad-a07622da"
+            },
+            "kind": "prep_retest"
+          },
+          {
+            "rule_id": "05-enter",
+            "trigger": {
+              "type": "pine_pattern",
+              "dir": "short"
+            },
+            "fire_mode": "once",
+            "intent": {
+              "v": 1,
+              "id": "hs-aud-cad-a07622da-enter",
+              "not_after": "2026-07-23T21:02:25.392142272Z",
+              "action": "enter",
+              "instrument": "AUD_CAD",
+              "direction": "short",
+              "entry": {
+                "type": "stop",
+                "from": "signal_low",
+                "offset_pips": 0.0,
+                "offset_atr_pct": 0.5
+              },
+              "stop_loss": {
+                "from": "signal_high",
+                "offset_pips": 0.0,
+                "offset_atr_pct": 0.5
+              },
+              "take_profit": {
+                "absolute": 0.9823
+              },
+              "broker": "oanda",
+              "account": "m-and-w",
+              "requires_preps": [
+                "break-and-close",
+                "retest"
+              ],
+              "vetos": [
+                "too-high",
+                "too-low",
+                "trade-expiry"
+              ],
+              "entry_level_vetos": [
+                {
+                  "name": "too-low",
+                  "level": 0.9829555618582332,
+                  "past": "Below"
+                },
+                {
+                  "name": "too-high",
+                  "level": 0.9886150577279796,
+                  "past": "Above"
+                }
+              ],
+              "breakeven": {
+                "threshold": 0.5
+              },
+              "trade_id": "hs-aud-cad-a07622da",
+              "max_retries": 5,
+              "needs_golden": true,
+              "pip_size": 0.0001,
+              "tick_size": 0.00001
+            },
+            "kind": "enter"
+          },
+          {
+            "rule_id": "07-close-on-sr-reversal",
+            "trigger": {
+              "type": "pine_pattern",
+              "dir": "long"
+            },
+            "fire_mode": "once",
+            "intent": {
+              "v": 1,
+              "id": "hs-aud-cad-a07622da-close-on-sr-reversal",
+              "not_after": "2026-07-24T06:00:00Z",
+              "action": "close",
+              "instrument": "AUD_CAD",
+              "broker": "oanda",
+              "account": "m-and-w",
+              "trade_id": "hs-aud-cad-a07622da",
+              "needs_golden": true,
+              "inside_window": [
+                "price"
+              ],
+              "sr_bands": [
+                [
+                  0.98331,
+                  0.98527
+                ]
+              ],
+              "reason": "support/resistance reversal"
+            },
+            "kind": "per_position_close"
+          },
+          {
+            "rule_id": "06-close-on-reversal",
+            "trigger": {
+              "type": "pine_pattern",
+              "dir": "long"
+            },
+            "fire_mode": "once",
+            "intent": {
+              "v": 1,
+              "id": "hs-aud-cad-a07622da-close-on-reversal",
+              "not_after": "2026-07-24T06:00:00Z",
+              "action": "close",
+              "instrument": "AUD_CAD",
+              "broker": "oanda",
+              "account": "m-and-w",
+              "trade_id": "hs-aud-cad-a07622da",
+              "needs_golden": true,
+              "inside_window": [
+                "news"
+              ],
+              "reason": "news-window reversal"
+            },
+            "kind": "per_position_close"
+          },
+          {
+            "rule_id": "01-pause-1784741400-1784770200",
+            "trigger": {
+              "type": "time_reached",
+              "at_epoch": 1784741400
+            },
+            "fire_mode": "once",
+            "intent": {
+              "v": 1,
+              "id": "hs-aud-cad-a07622da-pause-1784741400-1784770200",
+              "not_after": "2026-07-23T01:30:00Z",
+              "action": "pause",
+              "instrument": "AUD_CAD",
+              "broker": "oanda",
+              "account": "m-and-w",
+              "trade_id": "hs-aud-cad-a07622da",
+              "blackout_id": "1784741400-1784770200",
+              "reason": "news:AUD_CAD-2026-07-22T17:30:00+00:00"
+            },
+            "kind": "control"
+          },
+          {
+            "rule_id": "02-resume-1784741400-1784770200",
+            "trigger": {
+              "type": "time_reached",
+              "at_epoch": 1784770200
+            },
+            "fire_mode": "once",
+            "intent": {
+              "v": 1,
+              "id": "hs-aud-cad-a07622da-resume-1784741400-1784770200",
+              "not_after": "2026-07-23T02:00:00Z",
+              "action": "resume",
+              "instrument": "AUD_CAD",
+              "broker": "oanda",
+              "account": "m-and-w",
+              "trade_id": "hs-aud-cad-a07622da",
+              "blackout_id": "1784741400-1784770200",
+              "reason": "news:AUD_CAD-2026-07-22T17:30:00+00:00"
+            },
+            "kind": "control"
+          },
+          {
+            "rule_id": "01-news-start-1784770200-1784773800",
+            "trigger": {
+              "type": "time_reached",
+              "at_epoch": 1784770200
+            },
+            "fire_mode": "once",
+            "intent": {
+              "v": 1,
+              "id": "hs-aud-cad-a07622da-news-start-1784770200-1784773800",
+              "not_after": "2026-07-23T02:30:00Z",
+              "action": "news-start",
+              "instrument": "AUD_CAD",
+              "broker": "oanda",
+              "account": "m-and-w",
+              "trade_id": "hs-aud-cad-a07622da",
+              "news_id": "1784770200-1784773800",
+              "reason": "news:AUD_CAD-2026-07-23T01:30:00+00:00"
+            },
+            "kind": "control"
+          },
+          {
+            "rule_id": "02-news-end-1784770200-1784773800",
+            "trigger": {
+              "type": "time_reached",
+              "at_epoch": 1784773800
+            },
+            "fire_mode": "once",
+            "intent": {
+              "v": 1,
+              "id": "hs-aud-cad-a07622da-news-end-1784770200-1784773800",
+              "not_after": "2026-07-23T03:00:00Z",
+              "action": "news-end",
+              "instrument": "AUD_CAD",
+              "broker": "oanda",
+              "account": "m-and-w",
+              "trade_id": "hs-aud-cad-a07622da",
+              "news_id": "1784770200-1784773800",
+              "reason": "news:AUD_CAD-2026-07-23T01:30:00+00:00"
+            },
+            "kind": "control"
+          }
+        ],
+        "shadow": false,
+        "cross_buffer_pct": 0.0,
+        "cross_buffer_atr": 0.0,
+        "bcr_require_golden": false,
+        "retest_atr_step": 0.075,
+        "armed_at": "2026-07-22T09:12:10.392142272Z",
+        "armed_sentiment": {
+          "period_start": "2026-07-21T09:12:10.392142272Z",
+          "period_end": "2026-07-22T09:12:10.392142272Z",
+          "overall_direction": "neutral",
+          "confidence": "low",
+          "currencies": []
+        }
+      },
+      "prior_state": {
+        "watermark": "2026-07-22T16:00:00Z",
+        "phase": "await_break_and_close",
+        "last_close": {
+          "01-veto-too-high": 0.98585,
+          "03-prep-break-and-close": 0.98585
+        },
+        "origin_open": {
+          "01-veto-too-high": 0.98574,
+          "03-prep-break-and-close": 0.98574
+        },
+        "expires_at": "2026-07-23T16:59:50.320424127Z"
+      },
+      "new_candles": [],
+      "detector_window": [],
+      "now": "2026-07-22T17:30:16.763174606Z",
+      "expires_at": "2026-07-23T17:30:16.763174606Z",
+      "eval": {
+        "fired": [
+          {
+            "rule_id": "01-pause-1784741400-1784770200",
+            "intent": {
+              "v": 1,
+              "id": "hs-aud-cad-a07622da-pause-1784741400-1784770200",
+              "not_after": "2026-07-23T01:30:00Z",
+              "action": "pause",
+              "instrument": "AUD_CAD",
+              "broker": "oanda",
+              "account": "m-and-w",
+              "trade_id": "hs-aud-cad-a07622da",
+              "blackout_id": "1784741400-1784770200",
+              "reason": "news:AUD_CAD-2026-07-22T17:30:00+00:00"
+            },
+            "candle": {
+              "time": "2026-07-22T16:00:00Z",
+              "o": 0.0,
+              "h": 0.0,
+              "l": 0.0,
+              "c": 0.0
+            },
+            "signal": null
+          }
+        ],
+        "new_state": {
+          "watermark": "2026-07-22T16:00:00Z",
+          "phase": "await_break_and_close",
+          "fired": [
+            "01-pause-1784741400-1784770200"
+          ],
+          "last_close": {
+            "01-veto-too-high": 0.98585,
+            "03-prep-break-and-close": 0.98585
+          },
+          "origin_open": {
+            "01-veto-too-high": 0.98574,
+            "03-prep-break-and-close": 0.98574
+          },
+          "expires_at": "2026-07-23T17:30:16.763174606Z"
+        },
+        "done": false
+      },
+      "shadow": false,
+      "dispatch_outcomes": [
+        {
+          "rule_id": "01-pause-1784741400-1784770200",
+          "intent_id": "hs-aud-cad-a07622da-pause-1784741400-1784770200",
+          "outcome": "Ok(pause-set)",
+          "seq": 0
+        }
+      ],
+      "kv": {
+        "key": "plan-state:m-and-w:hs-aud-cad-a07622da",
+        "before": {
+          "watermark": "2026-07-22T16:00:00Z",
+          "phase": "await_break_and_close",
+          "last_close": {
+            "01-veto-too-high": 0.98585,
+            "03-prep-break-and-close": 0.98585
+          },
+          "origin_open": {
+            "01-veto-too-high": 0.98574,
+            "03-prep-break-and-close": 0.98574
+          },
+          "expires_at": "2026-07-23T16:59:50.320424127Z"
+        },
+        "after": {
+          "watermark": "2026-07-22T16:00:00Z",
+          "phase": "await_break_and_close",
+          "fired": [
+            "01-pause-1784741400-1784770200"
+          ],
+          "last_close": {
+            "01-veto-too-high": 0.98585,
+            "03-prep-break-and-close": 0.98585
+          },
+          "origin_open": {
+            "01-veto-too-high": 0.98574,
+            "03-prep-break-and-close": 0.98574
+          },
+          "expires_at": "2026-07-23T17:30:16.763174606Z"
+        },
+        "cleared_plan": false,
+        "success": true,
+        "error": null
+      }
+    },
+    {
+      "schema_version": 1,
+      "tick_ts": "2026-07-23T01:30:02.428056208Z",
+      "correlation_id": "hs-aud-cad-a07622da",
+      "account": "m-and-w",
+      "request_id": "hs-aud-cad-a07622da@2026-07-23T01:30:02.428056208+00:00",
+      "plan": {
+        "trade_id": "hs-aud-cad-a07622da",
+        "instrument": "AUD_CAD",
+        "direction": "short",
+        "granularity": "h1",
+        "pip_size": 0.0001,
+        "rules": [
+          {
+            "rule_id": "01-veto-too-high",
+            "trigger": {
+              "type": "horizontal_cross",
+              "level": 0.9886150577279796,
+              "dir": "up",
+              "bar": "on_close"
+            },
+            "fire_mode": "once",
+            "intent": {
+              "v": 1,
+              "id": "hs-aud-cad-a07622da-too-high",
+              "not_after": "2026-07-24T06:30:00Z",
+              "action": "veto",
+              "instrument": "AUD_CAD",
+              "broker": "oanda",
+              "account": "m-and-w",
+              "name": "too-high",
+              "ttl_hours": 46,
+              "level": "close-positions",
+              "trade_id": "hs-aud-cad-a07622da"
+            },
+            "kind": "setup_invalidation"
+          },
+          {
+            "rule_id": "01-veto-too-low",
+            "trigger": {
+              "type": "price_value_cross",
+              "level": 0.9829555618582332,
+              "dir": "either",
+              "bar": "intrabar"
+            },
+            "fire_mode": "once",
+            "intent": {
+              "v": 1,
+              "id": "hs-aud-cad-a07622da-too-low",
+              "not_after": "2026-07-24T06:30:00Z",
+              "action": "veto",
+              "instrument": "AUD_CAD",
+              "broker": "oanda",
+              "account": "m-and-w",
+              "name": "too-low",
+              "ttl_hours": 46,
+              "level": "stop-next-entry",
+              "trade_id": "hs-aud-cad-a07622da"
+            },
+            "kind": "setup_invalidation"
+          },
+          {
+            "rule_id": "02-veto-trade-expiry",
+            "trigger": {
+              "type": "time_reached",
+              "at_epoch": 1784872800
+            },
+            "fire_mode": "once",
+            "intent": {
+              "v": 1,
+              "id": "hs-aud-cad-a07622da-trade-expiry",
+              "not_before": "2026-07-24T06:00:00Z",
+              "not_after": "2026-07-24T06:30:00Z",
+              "action": "veto",
+              "instrument": "AUD_CAD",
+              "broker": "oanda",
+              "account": "m-and-w",
+              "name": "trade-expiry",
+              "ttl_hours": 46,
+              "level": "close-positions",
+              "trade_id": "hs-aud-cad-a07622da"
+            },
+            "kind": "setup_invalidation"
+          },
+          {
+            "rule_id": "03-prep-break-and-close",
+            "trigger": {
+              "type": "trendline_cross",
+              "a": {
+                "at_epoch": 1784588400,
+                "price": 0.98478
+              },
+              "b": {
+                "at_epoch": 1784707200,
+                "price": 0.98574
+              },
+              "extend_forward": true,
+              "bar_seconds": 3600,
+              "dir": "down",
+              "bar": "on_close"
+            },
+            "fire_mode": "once",
+            "intent": {
+              "v": 1,
+              "id": "hs-aud-cad-a07622da-break-and-close",
+              "not_after": "2026-07-24T06:00:00Z",
+              "action": "prep",
+              "instrument": "AUD_CAD",
+              "broker": "oanda",
+              "account": "m-and-w",
+              "step": "break-and-close",
+              "ttl_hours": 876000,
+              "clears": [
+                "retest"
+              ],
+              "trade_id": "hs-aud-cad-a07622da"
+            },
+            "kind": "prep_break_and_close"
+          },
+          {
+            "rule_id": "04-prep-retest",
+            "trigger": {
+              "type": "trendline_cross",
+              "a": {
+                "at_epoch": 1784588400,
+                "price": 0.98478
+              },
+              "b": {
+                "at_epoch": 1784707200,
+                "price": 0.98574
+              },
+              "extend_forward": true,
+              "bar_seconds": 3600,
+              "dir": "up",
+              "bar": "intrabar"
+            },
+            "fire_mode": "once",
+            "intent": {
+              "v": 1,
+              "id": "hs-aud-cad-a07622da-retest",
+              "not_after": "2026-07-24T06:00:00Z",
+              "action": "prep",
+              "instrument": "AUD_CAD",
+              "broker": "oanda",
+              "account": "m-and-w",
+              "step": "retest",
+              "ttl_hours": 876000,
+              "trade_id": "hs-aud-cad-a07622da"
+            },
+            "kind": "prep_retest"
+          },
+          {
+            "rule_id": "05-enter",
+            "trigger": {
+              "type": "pine_pattern",
+              "dir": "short"
+            },
+            "fire_mode": "once",
+            "intent": {
+              "v": 1,
+              "id": "hs-aud-cad-a07622da-enter",
+              "not_after": "2026-07-23T21:02:25.392142272Z",
+              "action": "enter",
+              "instrument": "AUD_CAD",
+              "direction": "short",
+              "entry": {
+                "type": "stop",
+                "from": "signal_low",
+                "offset_pips": 0.0,
+                "offset_atr_pct": 0.5
+              },
+              "stop_loss": {
+                "from": "signal_high",
+                "offset_pips": 0.0,
+                "offset_atr_pct": 0.5
+              },
+              "take_profit": {
+                "absolute": 0.9823
+              },
+              "broker": "oanda",
+              "account": "m-and-w",
+              "requires_preps": [
+                "break-and-close",
+                "retest"
+              ],
+              "vetos": [
+                "too-high",
+                "too-low",
+                "trade-expiry"
+              ],
+              "entry_level_vetos": [
+                {
+                  "name": "too-low",
+                  "level": 0.9829555618582332,
+                  "past": "Below"
+                },
+                {
+                  "name": "too-high",
+                  "level": 0.9886150577279796,
+                  "past": "Above"
+                }
+              ],
+              "breakeven": {
+                "threshold": 0.5
+              },
+              "trade_id": "hs-aud-cad-a07622da",
+              "max_retries": 5,
+              "needs_golden": true,
+              "pip_size": 0.0001,
+              "tick_size": 0.00001
+            },
+            "kind": "enter"
+          },
+          {
+            "rule_id": "07-close-on-sr-reversal",
+            "trigger": {
+              "type": "pine_pattern",
+              "dir": "long"
+            },
+            "fire_mode": "once",
+            "intent": {
+              "v": 1,
+              "id": "hs-aud-cad-a07622da-close-on-sr-reversal",
+              "not_after": "2026-07-24T06:00:00Z",
+              "action": "close",
+              "instrument": "AUD_CAD",
+              "broker": "oanda",
+              "account": "m-and-w",
+              "trade_id": "hs-aud-cad-a07622da",
+              "needs_golden": true,
+              "inside_window": [
+                "price"
+              ],
+              "sr_bands": [
+                [
+                  0.98331,
+                  0.98527
+                ]
+              ],
+              "reason": "support/resistance reversal"
+            },
+            "kind": "per_position_close"
+          },
+          {
+            "rule_id": "06-close-on-reversal",
+            "trigger": {
+              "type": "pine_pattern",
+              "dir": "long"
+            },
+            "fire_mode": "once",
+            "intent": {
+              "v": 1,
+              "id": "hs-aud-cad-a07622da-close-on-reversal",
+              "not_after": "2026-07-24T06:00:00Z",
+              "action": "close",
+              "instrument": "AUD_CAD",
+              "broker": "oanda",
+              "account": "m-and-w",
+              "trade_id": "hs-aud-cad-a07622da",
+              "needs_golden": true,
+              "inside_window": [
+                "news"
+              ],
+              "reason": "news-window reversal"
+            },
+            "kind": "per_position_close"
+          },
+          {
+            "rule_id": "01-pause-1784741400-1784770200",
+            "trigger": {
+              "type": "time_reached",
+              "at_epoch": 1784741400
+            },
+            "fire_mode": "once",
+            "intent": {
+              "v": 1,
+              "id": "hs-aud-cad-a07622da-pause-1784741400-1784770200",
+              "not_after": "2026-07-23T01:30:00Z",
+              "action": "pause",
+              "instrument": "AUD_CAD",
+              "broker": "oanda",
+              "account": "m-and-w",
+              "trade_id": "hs-aud-cad-a07622da",
+              "blackout_id": "1784741400-1784770200",
+              "reason": "news:AUD_CAD-2026-07-22T17:30:00+00:00"
+            },
+            "kind": "control"
+          },
+          {
+            "rule_id": "02-resume-1784741400-1784770200",
+            "trigger": {
+              "type": "time_reached",
+              "at_epoch": 1784770200
+            },
+            "fire_mode": "once",
+            "intent": {
+              "v": 1,
+              "id": "hs-aud-cad-a07622da-resume-1784741400-1784770200",
+              "not_after": "2026-07-23T02:00:00Z",
+              "action": "resume",
+              "instrument": "AUD_CAD",
+              "broker": "oanda",
+              "account": "m-and-w",
+              "trade_id": "hs-aud-cad-a07622da",
+              "blackout_id": "1784741400-1784770200",
+              "reason": "news:AUD_CAD-2026-07-22T17:30:00+00:00"
+            },
+            "kind": "control"
+          },
+          {
+            "rule_id": "01-news-start-1784770200-1784773800",
+            "trigger": {
+              "type": "time_reached",
+              "at_epoch": 1784770200
+            },
+            "fire_mode": "once",
+            "intent": {
+              "v": 1,
+              "id": "hs-aud-cad-a07622da-news-start-1784770200-1784773800",
+              "not_after": "2026-07-23T02:30:00Z",
+              "action": "news-start",
+              "instrument": "AUD_CAD",
+              "broker": "oanda",
+              "account": "m-and-w",
+              "trade_id": "hs-aud-cad-a07622da",
+              "news_id": "1784770200-1784773800",
+              "reason": "news:AUD_CAD-2026-07-23T01:30:00+00:00"
+            },
+            "kind": "control"
+          },
+          {
+            "rule_id": "02-news-end-1784770200-1784773800",
+            "trigger": {
+              "type": "time_reached",
+              "at_epoch": 1784773800
+            },
+            "fire_mode": "once",
+            "intent": {
+              "v": 1,
+              "id": "hs-aud-cad-a07622da-news-end-1784770200-1784773800",
+              "not_after": "2026-07-23T03:00:00Z",
+              "action": "news-end",
+              "instrument": "AUD_CAD",
+              "broker": "oanda",
+              "account": "m-and-w",
+              "trade_id": "hs-aud-cad-a07622da",
+              "news_id": "1784770200-1784773800",
+              "reason": "news:AUD_CAD-2026-07-23T01:30:00+00:00"
+            },
+            "kind": "control"
+          }
+        ],
+        "shadow": false,
+        "cross_buffer_pct": 0.0,
+        "cross_buffer_atr": 0.0,
+        "bcr_require_golden": false,
+        "retest_atr_step": 0.075,
+        "armed_at": "2026-07-22T09:12:10.392142272Z",
+        "armed_sentiment": {
+          "period_start": "2026-07-21T09:12:10.392142272Z",
+          "period_end": "2026-07-22T09:12:10.392142272Z",
+          "overall_direction": "neutral",
+          "confidence": "low",
+          "currencies": []
+        }
+      },
+      "prior_state": {
+        "watermark": "2026-07-23T00:00:00Z",
+        "phase": "await_break_and_close",
+        "fired": [
+          "01-pause-1784741400-1784770200"
+        ],
+        "last_close": {
+          "01-veto-too-high": 0.98466,
+          "03-prep-break-and-close": 0.98466
+        },
+        "origin_open": {
+          "01-veto-too-high": 0.98574,
+          "03-prep-break-and-close": 0.98574
+        },
+        "expires_at": "2026-07-24T00:59:53.845586708Z"
+      },
+      "new_candles": [],
+      "detector_window": [],
+      "now": "2026-07-23T01:30:02.428056208Z",
+      "expires_at": "2026-07-24T01:30:02.428056208Z",
+      "eval": {
+        "fired": [
+          {
+            "rule_id": "02-resume-1784741400-1784770200",
+            "intent": {
+              "v": 1,
+              "id": "hs-aud-cad-a07622da-resume-1784741400-1784770200",
+              "not_after": "2026-07-23T02:00:00Z",
+              "action": "resume",
+              "instrument": "AUD_CAD",
+              "broker": "oanda",
+              "account": "m-and-w",
+              "trade_id": "hs-aud-cad-a07622da",
+              "blackout_id": "1784741400-1784770200",
+              "reason": "news:AUD_CAD-2026-07-22T17:30:00+00:00"
+            },
+            "candle": {
+              "time": "2026-07-23T00:00:00Z",
+              "o": 0.0,
+              "h": 0.0,
+              "l": 0.0,
+              "c": 0.0
+            },
+            "signal": null
+          },
+          {
+            "rule_id": "01-news-start-1784770200-1784773800",
+            "intent": {
+              "v": 1,
+              "id": "hs-aud-cad-a07622da-news-start-1784770200-1784773800",
+              "not_after": "2026-07-23T02:30:00Z",
+              "action": "news-start",
+              "instrument": "AUD_CAD",
+              "broker": "oanda",
+              "account": "m-and-w",
+              "trade_id": "hs-aud-cad-a07622da",
+              "news_id": "1784770200-1784773800",
+              "reason": "news:AUD_CAD-2026-07-23T01:30:00+00:00"
+            },
+            "candle": {
+              "time": "2026-07-23T00:00:00Z",
+              "o": 0.0,
+              "h": 0.0,
+              "l": 0.0,
+              "c": 0.0
+            },
+            "signal": null
+          }
+        ],
+        "new_state": {
+          "watermark": "2026-07-23T00:00:00Z",
+          "phase": "await_break_and_close",
+          "fired": [
+            "01-news-start-1784770200-1784773800",
+            "01-pause-1784741400-1784770200",
+            "02-resume-1784741400-1784770200"
+          ],
+          "last_close": {
+            "01-veto-too-high": 0.98466,
+            "03-prep-break-and-close": 0.98466
+          },
+          "origin_open": {
+            "01-veto-too-high": 0.98574,
+            "03-prep-break-and-close": 0.98574
+          },
+          "open_news_windows": [
+            "1784770200-1784773800"
+          ],
+          "expires_at": "2026-07-24T01:30:02.428056208Z"
+        },
+        "done": false
+      },
+      "shadow": false,
+      "dispatch_outcomes": [
+        {
+          "rule_id": "02-resume-1784741400-1784770200",
+          "intent_id": "hs-aud-cad-a07622da-resume-1784741400-1784770200",
+          "outcome": "Ok(pause-cleared)",
+          "seq": 0
+        },
+        {
+          "rule_id": "01-news-start-1784770200-1784773800",
+          "intent_id": "hs-aud-cad-a07622da-news-start-1784770200-1784773800",
+          "outcome": "Ok(news-window-open)",
+          "seq": 1
+        }
+      ],
+      "kv": {
+        "key": "plan-state:m-and-w:hs-aud-cad-a07622da",
+        "before": {
+          "watermark": "2026-07-23T00:00:00Z",
+          "phase": "await_break_and_close",
+          "fired": [
+            "01-pause-1784741400-1784770200"
+          ],
+          "last_close": {
+            "01-veto-too-high": 0.98466,
+            "03-prep-break-and-close": 0.98466
+          },
+          "origin_open": {
+            "01-veto-too-high": 0.98574,
+            "03-prep-break-and-close": 0.98574
+          },
+          "expires_at": "2026-07-24T00:59:53.845586708Z"
+        },
+        "after": {
+          "watermark": "2026-07-23T00:00:00Z",
+          "phase": "await_break_and_close",
+          "fired": [
+            "01-news-start-1784770200-1784773800",
+            "01-pause-1784741400-1784770200",
+            "02-resume-1784741400-1784770200"
+          ],
+          "last_close": {
+            "01-veto-too-high": 0.98466,
+            "03-prep-break-and-close": 0.98466
+          },
+          "origin_open": {
+            "01-veto-too-high": 0.98574,
+            "03-prep-break-and-close": 0.98574
+          },
+          "open_news_windows": [
+            "1784770200-1784773800"
+          ],
+          "expires_at": "2026-07-24T01:30:02.428056208Z"
+        },
+        "cleared_plan": false,
+        "success": true,
+        "error": null
+      }
+    },
+    {
+      "schema_version": 1,
+      "tick_ts": "2026-07-23T02:30:11.760553287Z",
+      "correlation_id": "hs-aud-cad-a07622da",
+      "account": "m-and-w",
+      "request_id": "hs-aud-cad-a07622da@2026-07-23T02:30:11.760553287+00:00",
+      "plan": {
+        "trade_id": "hs-aud-cad-a07622da",
+        "instrument": "AUD_CAD",
+        "direction": "short",
+        "granularity": "h1",
+        "pip_size": 0.0001,
+        "rules": [
+          {
+            "rule_id": "01-veto-too-high",
+            "trigger": {
+              "type": "horizontal_cross",
+              "level": 0.9886150577279796,
+              "dir": "up",
+              "bar": "on_close"
+            },
+            "fire_mode": "once",
+            "intent": {
+              "v": 1,
+              "id": "hs-aud-cad-a07622da-too-high",
+              "not_after": "2026-07-24T06:30:00Z",
+              "action": "veto",
+              "instrument": "AUD_CAD",
+              "broker": "oanda",
+              "account": "m-and-w",
+              "name": "too-high",
+              "ttl_hours": 46,
+              "level": "close-positions",
+              "trade_id": "hs-aud-cad-a07622da"
+            },
+            "kind": "setup_invalidation"
+          },
+          {
+            "rule_id": "01-veto-too-low",
+            "trigger": {
+              "type": "price_value_cross",
+              "level": 0.9829555618582332,
+              "dir": "either",
+              "bar": "intrabar"
+            },
+            "fire_mode": "once",
+            "intent": {
+              "v": 1,
+              "id": "hs-aud-cad-a07622da-too-low",
+              "not_after": "2026-07-24T06:30:00Z",
+              "action": "veto",
+              "instrument": "AUD_CAD",
+              "broker": "oanda",
+              "account": "m-and-w",
+              "name": "too-low",
+              "ttl_hours": 46,
+              "level": "stop-next-entry",
+              "trade_id": "hs-aud-cad-a07622da"
+            },
+            "kind": "setup_invalidation"
+          },
+          {
+            "rule_id": "02-veto-trade-expiry",
+            "trigger": {
+              "type": "time_reached",
+              "at_epoch": 1784872800
+            },
+            "fire_mode": "once",
+            "intent": {
+              "v": 1,
+              "id": "hs-aud-cad-a07622da-trade-expiry",
+              "not_before": "2026-07-24T06:00:00Z",
+              "not_after": "2026-07-24T06:30:00Z",
+              "action": "veto",
+              "instrument": "AUD_CAD",
+              "broker": "oanda",
+              "account": "m-and-w",
+              "name": "trade-expiry",
+              "ttl_hours": 46,
+              "level": "close-positions",
+              "trade_id": "hs-aud-cad-a07622da"
+            },
+            "kind": "setup_invalidation"
+          },
+          {
+            "rule_id": "03-prep-break-and-close",
+            "trigger": {
+              "type": "trendline_cross",
+              "a": {
+                "at_epoch": 1784588400,
+                "price": 0.98478
+              },
+              "b": {
+                "at_epoch": 1784707200,
+                "price": 0.98574
+              },
+              "extend_forward": true,
+              "bar_seconds": 3600,
+              "dir": "down",
+              "bar": "on_close"
+            },
+            "fire_mode": "once",
+            "intent": {
+              "v": 1,
+              "id": "hs-aud-cad-a07622da-break-and-close",
+              "not_after": "2026-07-24T06:00:00Z",
+              "action": "prep",
+              "instrument": "AUD_CAD",
+              "broker": "oanda",
+              "account": "m-and-w",
+              "step": "break-and-close",
+              "ttl_hours": 876000,
+              "clears": [
+                "retest"
+              ],
+              "trade_id": "hs-aud-cad-a07622da"
+            },
+            "kind": "prep_break_and_close"
+          },
+          {
+            "rule_id": "04-prep-retest",
+            "trigger": {
+              "type": "trendline_cross",
+              "a": {
+                "at_epoch": 1784588400,
+                "price": 0.98478
+              },
+              "b": {
+                "at_epoch": 1784707200,
+                "price": 0.98574
+              },
+              "extend_forward": true,
+              "bar_seconds": 3600,
+              "dir": "up",
+              "bar": "intrabar"
+            },
+            "fire_mode": "once",
+            "intent": {
+              "v": 1,
+              "id": "hs-aud-cad-a07622da-retest",
+              "not_after": "2026-07-24T06:00:00Z",
+              "action": "prep",
+              "instrument": "AUD_CAD",
+              "broker": "oanda",
+              "account": "m-and-w",
+              "step": "retest",
+              "ttl_hours": 876000,
+              "trade_id": "hs-aud-cad-a07622da"
+            },
+            "kind": "prep_retest"
+          },
+          {
+            "rule_id": "05-enter",
+            "trigger": {
+              "type": "pine_pattern",
+              "dir": "short"
+            },
+            "fire_mode": "once",
+            "intent": {
+              "v": 1,
+              "id": "hs-aud-cad-a07622da-enter",
+              "not_after": "2026-07-23T21:02:25.392142272Z",
+              "action": "enter",
+              "instrument": "AUD_CAD",
+              "direction": "short",
+              "entry": {
+                "type": "stop",
+                "from": "signal_low",
+                "offset_pips": 0.0,
+                "offset_atr_pct": 0.5
+              },
+              "stop_loss": {
+                "from": "signal_high",
+                "offset_pips": 0.0,
+                "offset_atr_pct": 0.5
+              },
+              "take_profit": {
+                "absolute": 0.9823
+              },
+              "broker": "oanda",
+              "account": "m-and-w",
+              "requires_preps": [
+                "break-and-close",
+                "retest"
+              ],
+              "vetos": [
+                "too-high",
+                "too-low",
+                "trade-expiry"
+              ],
+              "entry_level_vetos": [
+                {
+                  "name": "too-low",
+                  "level": 0.9829555618582332,
+                  "past": "Below"
+                },
+                {
+                  "name": "too-high",
+                  "level": 0.9886150577279796,
+                  "past": "Above"
+                }
+              ],
+              "breakeven": {
+                "threshold": 0.5
+              },
+              "trade_id": "hs-aud-cad-a07622da",
+              "max_retries": 5,
+              "needs_golden": true,
+              "pip_size": 0.0001,
+              "tick_size": 0.00001
+            },
+            "kind": "enter"
+          },
+          {
+            "rule_id": "07-close-on-sr-reversal",
+            "trigger": {
+              "type": "pine_pattern",
+              "dir": "long"
+            },
+            "fire_mode": "once",
+            "intent": {
+              "v": 1,
+              "id": "hs-aud-cad-a07622da-close-on-sr-reversal",
+              "not_after": "2026-07-24T06:00:00Z",
+              "action": "close",
+              "instrument": "AUD_CAD",
+              "broker": "oanda",
+              "account": "m-and-w",
+              "trade_id": "hs-aud-cad-a07622da",
+              "needs_golden": true,
+              "inside_window": [
+                "price"
+              ],
+              "sr_bands": [
+                [
+                  0.98331,
+                  0.98527
+                ]
+              ],
+              "reason": "support/resistance reversal"
+            },
+            "kind": "per_position_close"
+          },
+          {
+            "rule_id": "06-close-on-reversal",
+            "trigger": {
+              "type": "pine_pattern",
+              "dir": "long"
+            },
+            "fire_mode": "once",
+            "intent": {
+              "v": 1,
+              "id": "hs-aud-cad-a07622da-close-on-reversal",
+              "not_after": "2026-07-24T06:00:00Z",
+              "action": "close",
+              "instrument": "AUD_CAD",
+              "broker": "oanda",
+              "account": "m-and-w",
+              "trade_id": "hs-aud-cad-a07622da",
+              "needs_golden": true,
+              "inside_window": [
+                "news"
+              ],
+              "reason": "news-window reversal"
+            },
+            "kind": "per_position_close"
+          },
+          {
+            "rule_id": "01-pause-1784741400-1784770200",
+            "trigger": {
+              "type": "time_reached",
+              "at_epoch": 1784741400
+            },
+            "fire_mode": "once",
+            "intent": {
+              "v": 1,
+              "id": "hs-aud-cad-a07622da-pause-1784741400-1784770200",
+              "not_after": "2026-07-23T01:30:00Z",
+              "action": "pause",
+              "instrument": "AUD_CAD",
+              "broker": "oanda",
+              "account": "m-and-w",
+              "trade_id": "hs-aud-cad-a07622da",
+              "blackout_id": "1784741400-1784770200",
+              "reason": "news:AUD_CAD-2026-07-22T17:30:00+00:00"
+            },
+            "kind": "control"
+          },
+          {
+            "rule_id": "02-resume-1784741400-1784770200",
+            "trigger": {
+              "type": "time_reached",
+              "at_epoch": 1784770200
+            },
+            "fire_mode": "once",
+            "intent": {
+              "v": 1,
+              "id": "hs-aud-cad-a07622da-resume-1784741400-1784770200",
+              "not_after": "2026-07-23T02:00:00Z",
+              "action": "resume",
+              "instrument": "AUD_CAD",
+              "broker": "oanda",
+              "account": "m-and-w",
+              "trade_id": "hs-aud-cad-a07622da",
+              "blackout_id": "1784741400-1784770200",
+              "reason": "news:AUD_CAD-2026-07-22T17:30:00+00:00"
+            },
+            "kind": "control"
+          },
+          {
+            "rule_id": "01-news-start-1784770200-1784773800",
+            "trigger": {
+              "type": "time_reached",
+              "at_epoch": 1784770200
+            },
+            "fire_mode": "once",
+            "intent": {
+              "v": 1,
+              "id": "hs-aud-cad-a07622da-news-start-1784770200-1784773800",
+              "not_after": "2026-07-23T02:30:00Z",
+              "action": "news-start",
+              "instrument": "AUD_CAD",
+              "broker": "oanda",
+              "account": "m-and-w",
+              "trade_id": "hs-aud-cad-a07622da",
+              "news_id": "1784770200-1784773800",
+              "reason": "news:AUD_CAD-2026-07-23T01:30:00+00:00"
+            },
+            "kind": "control"
+          },
+          {
+            "rule_id": "02-news-end-1784770200-1784773800",
+            "trigger": {
+              "type": "time_reached",
+              "at_epoch": 1784773800
+            },
+            "fire_mode": "once",
+            "intent": {
+              "v": 1,
+              "id": "hs-aud-cad-a07622da-news-end-1784770200-1784773800",
+              "not_after": "2026-07-23T03:00:00Z",
+              "action": "news-end",
+              "instrument": "AUD_CAD",
+              "broker": "oanda",
+              "account": "m-and-w",
+              "trade_id": "hs-aud-cad-a07622da",
+              "news_id": "1784770200-1784773800",
+              "reason": "news:AUD_CAD-2026-07-23T01:30:00+00:00"
+            },
+            "kind": "control"
+          }
+        ],
+        "shadow": false,
+        "cross_buffer_pct": 0.0,
+        "cross_buffer_atr": 0.0,
+        "bcr_require_golden": false,
+        "retest_atr_step": 0.075,
+        "armed_at": "2026-07-22T09:12:10.392142272Z",
+        "armed_sentiment": {
+          "period_start": "2026-07-21T09:12:10.392142272Z",
+          "period_end": "2026-07-22T09:12:10.392142272Z",
+          "overall_direction": "neutral",
+          "confidence": "low",
+          "currencies": []
+        }
+      },
+      "prior_state": {
+        "watermark": "2026-07-23T01:00:00Z",
+        "phase": "await_break_and_close",
+        "fired": [
+          "01-news-start-1784770200-1784773800",
+          "01-pause-1784741400-1784770200",
+          "02-resume-1784741400-1784770200"
+        ],
+        "last_close": {
+          "01-veto-too-high": 0.98662,
+          "03-prep-break-and-close": 0.98662
+        },
+        "origin_open": {
+          "01-veto-too-high": 0.98574,
+          "03-prep-break-and-close": 0.98574
+        },
+        "open_news_windows": [
+          "1784770200-1784773800"
+        ],
+        "expires_at": "2026-07-24T01:59:59.150640161Z"
+      },
+      "new_candles": [],
+      "detector_window": [],
+      "now": "2026-07-23T02:30:11.760553287Z",
+      "expires_at": "2026-07-24T02:30:11.760553287Z",
+      "eval": {
+        "fired": [
+          {
+            "rule_id": "02-news-end-1784770200-1784773800",
+            "intent": {
+              "v": 1,
+              "id": "hs-aud-cad-a07622da-news-end-1784770200-1784773800",
+              "not_after": "2026-07-23T03:00:00Z",
+              "action": "news-end",
+              "instrument": "AUD_CAD",
+              "broker": "oanda",
+              "account": "m-and-w",
+              "trade_id": "hs-aud-cad-a07622da",
+              "news_id": "1784770200-1784773800",
+              "reason": "news:AUD_CAD-2026-07-23T01:30:00+00:00"
+            },
+            "candle": {
+              "time": "2026-07-23T01:00:00Z",
+              "o": 0.0,
+              "h": 0.0,
+              "l": 0.0,
+              "c": 0.0
+            },
+            "signal": null
+          }
+        ],
+        "new_state": {
+          "watermark": "2026-07-23T01:00:00Z",
+          "phase": "await_break_and_close",
+          "fired": [
+            "01-news-start-1784770200-1784773800",
+            "01-pause-1784741400-1784770200",
+            "02-news-end-1784770200-1784773800",
+            "02-resume-1784741400-1784770200"
+          ],
+          "last_close": {
+            "01-veto-too-high": 0.98662,
+            "03-prep-break-and-close": 0.98662
+          },
+          "origin_open": {
+            "01-veto-too-high": 0.98574,
+            "03-prep-break-and-close": 0.98574
+          },
+          "expires_at": "2026-07-24T02:30:11.760553287Z"
+        },
+        "done": false
+      },
+      "shadow": false,
+      "dispatch_outcomes": [
+        {
+          "rule_id": "02-news-end-1784770200-1784773800",
+          "intent_id": "hs-aud-cad-a07622da-news-end-1784770200-1784773800",
+          "outcome": "Ok(news-window-closed)",
+          "seq": 0
+        }
+      ],
+      "kv": {
+        "key": "plan-state:m-and-w:hs-aud-cad-a07622da",
+        "before": {
+          "watermark": "2026-07-23T01:00:00Z",
+          "phase": "await_break_and_close",
+          "fired": [
+            "01-news-start-1784770200-1784773800",
+            "01-pause-1784741400-1784770200",
+            "02-resume-1784741400-1784770200"
+          ],
+          "last_close": {
+            "01-veto-too-high": 0.98662,
+            "03-prep-break-and-close": 0.98662
+          },
+          "origin_open": {
+            "01-veto-too-high": 0.98574,
+            "03-prep-break-and-close": 0.98574
+          },
+          "open_news_windows": [
+            "1784770200-1784773800"
+          ],
+          "expires_at": "2026-07-24T01:59:59.150640161Z"
+        },
+        "after": {
+          "watermark": "2026-07-23T01:00:00Z",
+          "phase": "await_break_and_close",
+          "fired": [
+            "01-news-start-1784770200-1784773800",
+            "01-pause-1784741400-1784770200",
+            "02-news-end-1784770200-1784773800",
+            "02-resume-1784741400-1784770200"
+          ],
+          "last_close": {
+            "01-veto-too-high": 0.98662,
+            "03-prep-break-and-close": 0.98662
+          },
+          "origin_open": {
+            "01-veto-too-high": 0.98574,
+            "03-prep-break-and-close": 0.98574
+          },
+          "expires_at": "2026-07-24T02:30:11.760553287Z"
+        },
+        "cleared_plan": false,
+        "success": true,
+        "error": null
+      }
+    }
+  ]
+}

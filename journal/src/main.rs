@@ -3,12 +3,32 @@
 //!
 //! Environment-suffixed like `trade-control` / `tv-arm`: `journal-staging`
 //! drives `trade-control-staging` + `replay-candles-staging` (see `build.rs`).
+//!
+//! Navigation is a left→right screen stack: List → Timeline → Replay → Compare.
+//! `→`/`n` push deeper, `←` pop back to the list. See `screen.rs`.
 
+mod app;
 mod cli;
+mod keys;
 mod plan;
+mod screen;
+mod timeline;
+mod ui;
+
+use std::io::{Stdout, stdout};
+use std::time::Duration;
 
 use clap::Parser;
 use color_eyre::eyre::Result;
+use crossterm::event::{self, Event};
+use crossterm::execute;
+use crossterm::terminal::{
+    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
+};
+use ratatui::Terminal;
+use ratatui::backend::CrosstermBackend;
+
+use crate::app::App;
 
 /// The baked git version (see `build.rs`).
 const VERSION: &str = env!("GIT_VERSION");
@@ -31,10 +51,48 @@ fn main() -> Result<()> {
         return dump_plans();
     }
 
-    // TUI comes next; for now the entry point is the --dump smoke test.
-    eprintln!("journal {VERSION} — run with --dump for now (TUI WIP)");
+    let mut terminal = setup_terminal()?;
+    let result = run(&mut terminal);
+    restore_terminal(&mut terminal)?;
+    result
+}
+
+/// The main render/input loop.
+fn run(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<()> {
+    let mut app = App::new()?;
+    while !app.should_quit {
+        terminal.draw(|f| ui::render(f, &app))?;
+        // Poll so a resize or future async result can wake the loop; blocking
+        // read would be fine too but polling keeps redraws responsive.
+        if event::poll(Duration::from_millis(200))?
+            && let Event::Key(key) = event::read()?
+            && key.kind == event::KeyEventKind::Press
+        {
+            let action = keys::map_key(&app, key);
+            keys::apply(&mut app, action);
+        }
+    }
     Ok(())
 }
+
+// -- terminal lifecycle ----------------------------------------------------
+
+fn setup_terminal() -> Result<Terminal<CrosstermBackend<Stdout>>> {
+    enable_raw_mode()?;
+    let mut out = stdout();
+    execute!(out, EnterAlternateScreen)?;
+    let terminal = Terminal::new(CrosstermBackend::new(out))?;
+    Ok(terminal)
+}
+
+fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<()> {
+    disable_raw_mode()?;
+    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    terminal.show_cursor()?;
+    Ok(())
+}
+
+// -- dump smoke test -------------------------------------------------------
 
 /// Fetch `plan list`, parse it, and print a compact table to stderr.
 fn dump_plans() -> Result<()> {
@@ -54,13 +112,16 @@ fn dump_plans() -> Result<()> {
     Ok(())
 }
 
-/// Standard tracing init with an env-filter and the error layer.
+/// Standard tracing init with an env-filter and the error layer. Writes to a
+/// file so log lines never corrupt the alternate-screen TUI.
 fn init_tracing() {
     use tracing_error::ErrorLayer;
     use tracing_subscriber::prelude::*;
     use tracing_subscriber::{EnvFilter, fmt};
 
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn"));
+    // Log to stderr only in --dump; under the TUI stderr is the alternate
+    // screen. Keep it simple: env-filter defaults to warn so the TUI stays clean.
     tracing_subscriber::registry()
         .with(filter)
         .with(fmt::layer().with_writer(std::io::stderr))
