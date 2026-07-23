@@ -76,11 +76,26 @@ pub fn parse_events(json: &str) -> Vec<Event> {
                 .and_then(|f| f.as_array());
             if let Some(fired) = fired {
                 for rule in fired {
-                    let rule_id = rule.as_str().unwrap_or("?");
+                    // `eval.fired` entries are objects carrying `rule_id` (and the
+                    // full fired intent); older shapes were bare strings, so
+                    // handle both.
+                    let rule_id = rule
+                        .get("rule_id")
+                        .and_then(|x| x.as_str())
+                        .or_else(|| rule.as_str())
+                        .unwrap_or("?");
+                    let action = rule
+                        .get("intent")
+                        .and_then(|i| i.get("action"))
+                        .and_then(|a| a.as_str());
+                    let text = match action {
+                        Some(a) => format!("fired {rule_id} ({a})"),
+                        None => format!("fired {rule_id}"),
+                    };
                     events.push(Event {
                         ts: ts_to_bne(ts),
                         marker: '•',
-                        text: format!("fired {rule_id}"),
+                        text,
                     });
                 }
             }
@@ -178,6 +193,24 @@ mod tests {
         // 2026-07-22T09:12:11Z → Brisbane +10 → 19:12.
         let out = ts_to_bne("2026-07-22T09:12:11.316625796+00:00");
         assert_eq!(out, "2026-07-22 19:12");
+    }
+
+    #[test]
+    fn fired_rules_show_id_not_placeholder() {
+        // `eval.fired` entries are objects with `rule_id`; the parser must read
+        // that, not fall through to `?`.
+        let events = parse_events(TIMELINE);
+        let fires: Vec<&Event> = events.iter().filter(|e| e.marker == '•').collect();
+        assert!(!fires.is_empty(), "fixture has fired rules");
+        assert!(
+            fires.iter().all(|e| !e.text.contains('?')),
+            "every fire should resolve a rule_id, got: {:?}",
+            fires.iter().map(|e| &e.text).collect::<Vec<_>>()
+        );
+        assert!(
+            fires.iter().any(|e| e.text.contains("pause")),
+            "the pause fire should surface its action"
+        );
     }
 
     #[test]
