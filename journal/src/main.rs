@@ -13,6 +13,7 @@ mod divergence;
 mod jobs;
 mod keys;
 mod plan;
+mod record;
 mod screen;
 mod timeline;
 mod tv;
