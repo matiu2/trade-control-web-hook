@@ -76,10 +76,18 @@ pub fn spawn_timeline(tx: Sender<JobResult>, trade_id: String) {
 
 /// Spawn the replay job. `export_json` is the already-fetched plan body (written
 /// to a temp file here so the worker thread does no shared-state reads).
-pub fn spawn_replay(tx: Sender<JobResult>, trade_id: String, export_json: String) {
+/// `source` is the plan's broker as a `replay-candles --source` value
+/// (`oanda`/`tradenation`) — it must match the plan's broker or instrument
+/// resolution fails (an OANDA-only ratio like XAU/XAG isn't on TradeNation).
+pub fn spawn_replay(
+    tx: Sender<JobResult>,
+    trade_id: String,
+    export_json: String,
+    source: Option<String>,
+) {
     spawn(tx, trade_id.clone(), JobKind::Replay, move || {
         let path = write_plan(&trade_id, "replay", &export_json)?;
-        let report = cli::replay(&path, false)?;
+        let report = cli::replay(&path, false, source.as_deref())?;
         Ok(JobOutcome::Replay(report))
     });
 }

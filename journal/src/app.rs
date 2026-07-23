@@ -244,8 +244,17 @@ impl App {
         if !self.mark_in_flight(trade_id, JobKind::Replay) {
             return;
         }
+        // The replay's candle feed must be the plan's broker, or instrument
+        // resolution fails (an OANDA-only ratio like XAU/XAG isn't on
+        // TradeNation, which the CLI defaults to). Derive `--source` from the
+        // detail's broker; `None` when unknown leaves the CLI default.
+        let source = self
+            .data
+            .get(trade_id)
+            .and_then(|d| d.detail.as_ref())
+            .and_then(|d| replay_source_for(&d.broker));
         self.status = Status::info(format!("{trade_id}: running replay…"));
-        jobs::spawn_replay(self.job_tx.clone(), trade_id.to_string(), export);
+        jobs::spawn_replay(self.job_tx.clone(), trade_id.to_string(), export, source);
     }
 
     /// Add a job to the in-flight set. Returns `false` if it was already there
@@ -503,6 +512,17 @@ fn fetch_plans() -> Result<Vec<PlanRow>> {
     parse_plan_list(&yaml)
 }
 
+/// Map a plan broker (`oanda` / `tradenation`) to the `replay-candles --source`
+/// value. `None` for an unknown/blank broker — the caller then omits `--source`
+/// and the CLI keeps its own default.
+fn replay_source_for(broker: &str) -> Option<String> {
+    match broker.to_ascii_lowercase().as_str() {
+        "oanda" => Some("oanda".to_string()),
+        "tradenation" => Some("tradenation".to_string()),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 impl App {
     /// Build an app from already-parsed rows, without touching the network —
@@ -643,6 +663,20 @@ mod tests {
     fn drain_noop_when_empty() {
         let mut app = App::from_rows(vec![row("t1")]);
         assert!(!app.drain_jobs());
+    }
+
+    #[test]
+    fn replay_source_maps_broker() {
+        // The replay feed must match the plan's broker (XAU/XAG is OANDA-only).
+        assert_eq!(replay_source_for("oanda").as_deref(), Some("oanda"));
+        assert_eq!(replay_source_for("OANDA").as_deref(), Some("oanda"));
+        assert_eq!(
+            replay_source_for("tradenation").as_deref(),
+            Some("tradenation")
+        );
+        // Unknown/blank broker → no --source (CLI keeps its default).
+        assert_eq!(replay_source_for(""), None);
+        assert_eq!(replay_source_for("mystery"), None);
     }
 
     const EXPORT: &str = include_str!("../tests/fixtures/plan_export.json");

@@ -90,12 +90,19 @@ pub fn plan_delete(trade_id: &str) -> Result<String> {
 }
 
 /// Run `replay-candles-<env> --plan <file>`. When `annotate` is set, also draw
-/// the simulated positions onto the live TradingView chart via tv-mcp. Returns
-/// the replay report (stdout); stderr is appended on failure.
-pub fn replay(plan_file: &std::path::Path, annotate: bool) -> Result<String> {
+/// the simulated positions onto the live TradingView chart via tv-mcp. `source`
+/// selects the candle feed's broker (`oanda` / `tradenation`) — it MUST match
+/// the plan's broker or instrument resolution fails (e.g. an OANDA-only ratio
+/// like XAU/XAG isn't listed on TradeNation). `None` leaves the CLI default
+/// (`tradenation`). Returns the replay report (stdout); stderr is appended on
+/// failure.
+pub fn replay(plan_file: &std::path::Path, annotate: bool, source: Option<&str>) -> Result<String> {
     let program = bin("replay-candles");
     let mut cmd = Command::new(&program);
     cmd.arg("--plan").arg(plan_file);
+    if let Some(source) = source {
+        cmd.arg("--source").arg(source);
+    }
     if annotate {
         cmd.arg("--annotate").arg("true");
     }
