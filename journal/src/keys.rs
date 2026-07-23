@@ -21,6 +21,10 @@ pub enum Action {
     RequestDelete,
     ConfirmYes,
     ConfirmNo,
+    /// Scroll the detail popup by N lines (negative = up).
+    PopupScroll(i32),
+    PopupHome,
+    PopupEnd,
     None,
 }
 
@@ -40,13 +44,23 @@ pub fn map_key(app: &App, key: KeyEvent) -> Action {
         };
     }
 
-    // The detail popup: any of i/esc/q closes it; other keys pass through so
-    // navigation still works with it open would be surprising — keep it modal.
+    // The detail popup is modal and scrollable: i/esc/q close it; arrows + vim
+    // keys + page/home/end scroll it. One page ≈ 20 lines (the render clamps the
+    // bottom, so an over-scroll just pins to the last page).
     if app.show_popup {
+        const PAGE: i32 = 20;
         return match key.code {
             KeyCode::Char('i') | KeyCode::Char('I') | KeyCode::Esc | KeyCode::Char('q') => {
                 Action::TogglePopup
             }
+            KeyCode::Up | KeyCode::Char('k') => Action::PopupScroll(-1),
+            KeyCode::Down | KeyCode::Char('j') => Action::PopupScroll(1),
+            KeyCode::PageUp | KeyCode::Char('u') => Action::PopupScroll(-PAGE),
+            KeyCode::PageDown | KeyCode::Char('d') | KeyCode::Char(' ') => {
+                Action::PopupScroll(PAGE)
+            }
+            KeyCode::Home | KeyCode::Char('g') => Action::PopupHome,
+            KeyCode::End | KeyCode::Char('G') => Action::PopupEnd,
             _ => Action::None,
         };
     }
@@ -79,6 +93,9 @@ pub fn apply(app: &mut App, action: Action) {
         Action::RequestDelete => app.request_delete(),
         Action::ConfirmYes => app.resolve_confirm(true),
         Action::ConfirmNo => app.resolve_confirm(false),
+        Action::PopupScroll(delta) => app.scroll_popup(delta),
+        Action::PopupHome => app.scroll_popup_home(),
+        Action::PopupEnd => app.scroll_popup_end(),
         Action::None => {}
     }
 }

@@ -92,11 +92,12 @@ pub fn spawn_load_tv(
     tx: Sender<JobResult>,
     trade_id: String,
     instrument: String,
+    broker: String,
     granularity: String,
     anchor_utc: String,
 ) {
     spawn(tx, trade_id, JobKind::LoadTv, move || {
-        crate::tv::load_chart(&instrument, &granularity, &anchor_utc)?;
+        crate::tv::load_chart(&instrument, &broker, &granularity, &anchor_utc)?;
         Ok(JobOutcome::LoadTv)
     });
 }

@@ -5,11 +5,14 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 
 use crate::app::App;
 
-/// The `i` popup: the full `plan export` JSON for the open plan.
+/// The `i` popup: the full `plan export` JSON for the open plan, scrollable with
+/// arrows / vim keys / page / home / end. Wrapping is off so line counts are
+/// exact and the End clamp is correct; horizontal overflow is rare in the
+/// structured JSON.
 pub fn render_detail(f: &mut Frame, app: &App) {
     let area = centered(80, 80, f.area());
     let dump = app
@@ -18,16 +21,33 @@ pub fn render_detail(f: &mut Frame, app: &App) {
         .map(pretty_json)
         .unwrap_or_else(|| "(no plan detail loaded)".to_string());
 
+    // Clamp the scroll so End (u16::MAX) pins to the last page and you can't
+    // scroll into empty space. Inner height excludes the two border rows.
+    let total_lines = dump.lines().count() as u16;
+    let inner_height = area.height.saturating_sub(2);
+    let max_scroll = total_lines.saturating_sub(inner_height);
+    let scroll = app.popup_scroll.min(max_scroll);
+
+    let position = if max_scroll == 0 {
+        String::new()
+    } else {
+        format!(
+            " [{}/{}] ",
+            scroll.saturating_add(1),
+            max_scroll.saturating_add(1)
+        )
+    };
+    let title = format!(" Plan detail{position}— ↑↓/jk pgup/pgdn g/G, i/esc close ");
     let block = Block::default()
         .borders(Borders::ALL)
-        .title(" Plan detail (i / esc to close) ")
+        .title(title)
         .border_style(Style::default().fg(Color::Magenta));
 
     f.render_widget(Clear, area);
     f.render_widget(
         Paragraph::new(Text::raw(dump))
             .block(block)
-            .wrap(Wrap { trim: false }),
+            .scroll((scroll, 0)),
         area,
     );
 }

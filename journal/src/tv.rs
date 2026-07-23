@@ -33,10 +33,17 @@ const STEP_PAUSE: Duration = Duration::from_millis(1000);
 
 /// Load a plan onto the live chart: symbol → timeframe → scroll(anchor) →
 /// zoom-out. `instrument` is the plan's raw id (OANDA/TradeNation form),
-/// `granularity` its `h1`/`m15`/… string, `anchor_utc` the RFC3339 time to
-/// centre on (the plan's `armed_at`).
-pub fn load_chart(instrument: &str, granularity: &str, anchor_utc: &str) -> Result<()> {
-    let symbol = tv_symbol(instrument)?;
+/// `broker` its broker (`oanda`/`tradenation`) — which fixes the TradingView
+/// *exchange prefix* so the right broker's chart loads — `granularity` its
+/// `h1`/`m15`/… string, `anchor_utc` the RFC3339 time to centre on
+/// (the plan's `armed_at`).
+pub fn load_chart(
+    instrument: &str,
+    broker: &str,
+    granularity: &str,
+    anchor_utc: &str,
+) -> Result<()> {
+    let symbol = tv_symbol(instrument, broker)?;
     let resolution = tv_resolution(granularity)?;
     let anchor_ts = to_unix(anchor_utc)?;
     let secs_per_bar = resolution_secs(&resolution);
@@ -58,18 +65,41 @@ pub fn load_chart(instrument: &str, granularity: &str, anchor_utc: &str) -> Resu
     Ok(())
 }
 
-/// Resolve a plan instrument id to its TradingView symbol via instrument-lookup.
-/// Tries OANDA then TradeNation broker views (plans carry either form).
-fn tv_symbol(instrument: &str) -> Result<String> {
+/// Resolve a plan instrument id to a **fully-qualified** TradingView symbol
+/// (`EXCHANGE:SYMBOL`, e.g. `TRADENATION:AUDCHF`). instrument-lookup returns the
+/// bare symbol (`AUDCHF`); without the exchange prefix TradingView picks its own
+/// default exchange (OANDA for FX), which loaded the *wrong broker's* chart for
+/// a TradeNation plan. So we prepend the exchange for the plan's actual broker.
+fn tv_symbol(instrument: &str, broker: &str) -> Result<String> {
     use instrument_lookup::{Broker, by_broker_symbol};
-    for broker in [Broker::Oanda, Broker::TradeNation] {
-        if let Ok(Some(asset)) = by_broker_symbol(broker, instrument)
-            && let Some(sym) = asset.symbol_for(Broker::TradingView)
-        {
-            return Ok(sym.to_string());
-        }
+    // Resolve the bare TV symbol, trying both broker views of the raw id.
+    let bare = [Broker::Oanda, Broker::TradeNation]
+        .into_iter()
+        .find_map(|b| {
+            by_broker_symbol(b, instrument)
+                .ok()
+                .flatten()
+                .and_then(|asset| asset.symbol_for(Broker::TradingView))
+                .map(str::to_string)
+        })
+        .ok_or_else(|| eyre!("no TradingView symbol for instrument `{instrument}`"))?;
+
+    match tv_exchange(broker) {
+        Some(exchange) => Ok(format!("{exchange}:{bare}")),
+        // Unknown/blank broker: fall back to the bare symbol (TV's default
+        // exchange), preserving prior behaviour rather than failing.
+        None => Ok(bare),
     }
-    Err(eyre!("no TradingView symbol for instrument `{instrument}`"))
+}
+
+/// The TradingView exchange prefix for a plan broker. `None` for an
+/// unknown/blank broker (caller falls back to a bare symbol).
+fn tv_exchange(broker: &str) -> Option<&'static str> {
+    match broker.to_ascii_lowercase().as_str() {
+        "tradenation" => Some("TRADENATION"),
+        "oanda" => Some("OANDA"),
+        _ => None,
+    }
 }
 
 /// Map a plan granularity (`m1`/`m15`/`h1`/`h4`/`d`) to a TradingView
@@ -161,10 +191,22 @@ mod tests {
     }
 
     #[test]
-    fn resolves_known_tv_symbol() {
-        // GBP/USD (TradeNation form) → GBPUSD on TradingView.
-        assert_eq!(tv_symbol("GBP/USD").unwrap(), "GBPUSD");
-        // AUD_CAD (OANDA form) resolves too.
-        assert!(tv_symbol("AUD_CAD").is_ok());
+    fn resolves_symbol_with_broker_exchange_prefix() {
+        // A TradeNation plan → TRADENATION: prefix (the bug that loaded OANDA).
+        assert_eq!(
+            tv_symbol("AUD/CHF", "tradenation").unwrap(),
+            "TRADENATION:AUDCHF"
+        );
+        // An OANDA plan → OANDA: prefix.
+        assert_eq!(tv_symbol("GBP/USD", "oanda").unwrap(), "OANDA:GBPUSD");
+        // Unknown broker → bare symbol (TV's default exchange), no failure.
+        assert_eq!(tv_symbol("GBP/USD", "").unwrap(), "GBPUSD");
+    }
+
+    #[test]
+    fn exchange_prefix_map() {
+        assert_eq!(tv_exchange("tradenation"), Some("TRADENATION"));
+        assert_eq!(tv_exchange("OANDA"), Some("OANDA"));
+        assert_eq!(tv_exchange("mystery"), None);
     }
 }

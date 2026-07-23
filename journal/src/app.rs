@@ -74,6 +74,8 @@ pub struct App {
     in_flight: HashSet<(String, JobKind)>,
     /// Monotonic tick, bumped each event-loop pass, to animate the spinner.
     pub tick: u64,
+    /// Vertical scroll offset (in lines) of the `i` detail popup.
+    pub popup_scroll: u16,
 }
 
 /// Braille spinner frames for the "loading…" indicator.
@@ -97,6 +99,7 @@ impl App {
             job_rx,
             in_flight: HashSet::new(),
             tick: 0,
+            popup_scroll: 0,
         })
     }
 
@@ -334,14 +337,13 @@ impl App {
         };
         let instrument = row.instrument.clone();
         let granularity = row.granularity.clone();
-        let anchor = self
-            .data
-            .get(trade_id)
-            .and_then(|d| d.detail.as_ref())
-            .and_then(|d| d.armed_at.clone());
+        // Anchor + broker both come from the fetched detail.
+        let detail = self.data.get(trade_id).and_then(|d| d.detail.as_ref());
+        let anchor = detail.and_then(|d| d.armed_at.clone());
+        let broker = detail.map(|d| d.broker.clone()).unwrap_or_default();
         let Some(anchor) = anchor else {
-            // Detail (with armed_at) not loaded yet — fetch it; the Timeline
-            // completion will fire the load.
+            // Detail (with armed_at + broker) not loaded yet — fetch it; the
+            // Timeline completion will fire the load.
             self.start_timeline(trade_id);
             return;
         };
@@ -353,6 +355,7 @@ impl App {
             self.job_tx.clone(),
             trade_id.to_string(),
             instrument,
+            broker,
             granularity,
             anchor,
         );
@@ -417,6 +420,27 @@ impl App {
 
     pub fn toggle_popup(&mut self) {
         self.show_popup = !self.show_popup;
+        // Always start a freshly-opened popup at the top.
+        self.popup_scroll = 0;
+    }
+
+    /// Scroll the detail popup by `delta` lines (negative = up), clamped at 0.
+    /// The bottom is bounded by the render (it won't scroll past the content).
+    pub fn scroll_popup(&mut self, delta: i32) {
+        let next = self.popup_scroll as i32 + delta;
+        self.popup_scroll = next.max(0) as u16;
+    }
+
+    /// Jump the popup to the top.
+    pub fn scroll_popup_home(&mut self) {
+        self.popup_scroll = 0;
+    }
+
+    /// Jump the popup near the bottom. The exact clamp happens at render time
+    /// (it knows the content height); `u16::MAX` here just means "as far down as
+    /// it goes", and the renderer pins it to the last page.
+    pub fn scroll_popup_end(&mut self) {
+        self.popup_scroll = u16::MAX;
     }
 }
 
@@ -445,6 +469,7 @@ impl App {
             job_rx,
             in_flight: HashSet::new(),
             tick: 0,
+            popup_scroll: 0,
         }
     }
 

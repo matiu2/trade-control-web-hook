@@ -28,6 +28,15 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
     ];
 
     if let Some(detail) = data.and_then(|d| d.detail.as_ref()) {
+        // Broker — the one that loads the right TradingView exchange. Shown so a
+        // TradeNation vs OANDA plan is obvious at a glance.
+        if !detail.broker.is_empty() {
+            spans.push(Span::raw(" · "));
+            spans.push(Span::styled(
+                detail.broker.clone(),
+                Style::default().fg(Color::LightMagenta),
+            ));
+        }
         spans.push(Span::raw(" · "));
         spans.push(Span::styled(
             detail.direction.clone(),

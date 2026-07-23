@@ -143,6 +143,11 @@ pub struct PlanDetail {
     /// Order type per enter leg, in rule order. One entry for normal/QM, two
     /// for strategy-v2 (BCR leg then QM leg).
     pub order_types: Vec<(String, OrderType)>,
+    /// The plan's broker (`oanda` / `tradenation`), read from the rule intents
+    /// (there is no reliable top-level `broker` field). Drives the TradingView
+    /// exchange prefix so the *right* broker's chart is loaded, and is shown in
+    /// the info bar. Empty if no rule carried one.
+    pub broker: String,
 }
 
 /// Parse the single-line `plan export` JSON into the info-bar facts.
@@ -201,6 +206,23 @@ pub fn parse_plan_export(json: &str) -> Result<PlanDetail> {
         (false, false) => EntryMode::Unknown,
     };
 
+    // Broker: prefer a top-level field, else the first rule intent that carries
+    // one (all rules share the plan's broker).
+    let broker = v
+        .get("broker")
+        .and_then(|x| x.as_str())
+        .map(str::to_string)
+        .filter(|b| !b.is_empty())
+        .or_else(|| {
+            rules.iter().find_map(|r| {
+                r.get("intent")
+                    .and_then(|i| i.get("broker"))
+                    .and_then(|b| b.as_str())
+                    .map(str::to_string)
+            })
+        })
+        .unwrap_or_default();
+
     Ok(PlanDetail {
         trade_id,
         instrument: s("instrument"),
@@ -212,6 +234,7 @@ pub fn parse_plan_export(json: &str) -> Result<PlanDetail> {
             .map(str::to_string),
         entry_mode,
         order_types,
+        broker,
     })
 }
 
@@ -277,5 +300,7 @@ mod tests {
         assert_eq!(d.entry_mode, EntryMode::Normal);
         assert_eq!(d.order_types, vec![("BCR".to_string(), OrderType::Stop)]);
         assert!(d.armed_at.is_some());
+        // Broker comes from the rule intents (this fixture is an OANDA plan).
+        assert_eq!(d.broker, "oanda");
     }
 }

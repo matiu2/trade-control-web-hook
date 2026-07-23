@@ -166,9 +166,51 @@ mod tests {
         let mut term = Terminal::new(TestBackend::new(160, 40)).unwrap();
         term.draw(|f| super::render(f, &app)).unwrap();
         let text = buffer_text(&term);
-        // Info bar shows the entry mode; body shows the timeline frame.
+        // Info bar shows entry mode + broker; body shows the timeline frame.
         assert!(text.contains("normal"), "info bar should show entry mode");
+        assert!(text.contains("oanda"), "info bar should show the broker");
         assert!(text.contains("Timeline"));
+    }
+
+    #[test]
+    fn detail_popup_scrolls() {
+        let rows = parse_plan_list(LIST).unwrap();
+        let mut app = App::from_rows(rows);
+        app.select_to("hs-aud-cad-a07622da");
+        app.seed_current(PlanData {
+            detail: parse_plan_export(EXPORT).ok(),
+            export_json: Some(EXPORT.to_string()),
+            timeline_json: Some(TIMELINE.to_string()),
+            replay_report: None,
+            max_depth: 1,
+        });
+        app.set_screen(Screen::Timeline);
+        app.toggle_popup(); // open the detail popup
+
+        // A small viewport so the JSON overflows and scrolling is meaningful.
+        let render = |app: &App| {
+            let mut term = Terminal::new(TestBackend::new(120, 20)).unwrap();
+            term.draw(|f| super::render(f, app)).unwrap();
+            term.backend()
+                .buffer()
+                .content()
+                .iter()
+                .map(|c| c.symbol())
+                .collect::<String>()
+        };
+
+        let top = render(&app);
+        assert!(top.contains("Plan detail"), "popup titled:\n{top}");
+        // At the top, the first JSON keys are visible.
+        assert!(
+            top.contains("trade_id") || top.contains('{'),
+            "top of dump:\n{top}"
+        );
+
+        // Scroll to the end; the top-of-file content should no longer show.
+        app.scroll_popup_end();
+        let bottom = render(&app);
+        assert_ne!(top, bottom, "scrolling should change the visible text");
     }
 
     #[test]
