@@ -2,11 +2,13 @@
 //! (what to fetch on a screen push, the delete guard) here so `main.rs` is a
 //! thin render/input loop.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::sync::mpsc::{Receiver, Sender, channel};
 
 use color_eyre::eyre::Result;
 
 use crate::cli;
+use crate::jobs::{self, JobKind, JobOutcome, JobResult};
 use crate::plan::{PlanDetail, PlanRow, parse_plan_export, parse_plan_list};
 use crate::screen::Screen;
 
@@ -64,12 +66,24 @@ pub struct App {
     pub show_popup: bool,
     pub confirm: Option<Confirm>,
     pub should_quit: bool,
+    /// Sender handed to background job threads; results arrive on `job_rx`.
+    job_tx: Sender<JobResult>,
+    /// Receiver drained each tick by [`App::drain_jobs`].
+    job_rx: Receiver<JobResult>,
+    /// Jobs currently running, so we show "loading…" and never double-spawn.
+    in_flight: HashSet<(String, JobKind)>,
+    /// Monotonic tick, bumped each event-loop pass, to animate the spinner.
+    pub tick: u64,
 }
+
+/// Braille spinner frames for the "loading…" indicator.
+const SPINNER: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 
 impl App {
     /// Build the app, fetching the initial plan list.
     pub fn new() -> Result<Self> {
         let plans = fetch_plans()?;
+        let (job_tx, job_rx) = channel();
         Ok(Self {
             plans,
             selected: 0,
@@ -79,7 +93,32 @@ impl App {
             show_popup: false,
             confirm: None,
             should_quit: false,
+            job_tx,
+            job_rx,
+            in_flight: HashSet::new(),
+            tick: 0,
         })
+    }
+
+    /// True while any background job for the current plan is running — the UI
+    /// reads this to show a spinner / "loading…" line.
+    pub fn is_current_loading(&self, kind: JobKind) -> bool {
+        self.current_plan()
+            .map(|p| self.in_flight.contains(&(p.trade_id.clone(), kind)))
+            .unwrap_or(false)
+    }
+
+    /// True if any job at all is in flight for the current plan.
+    pub fn current_busy(&self) -> Option<JobKind> {
+        let trade_id = self.current_plan()?.trade_id.clone();
+        [JobKind::Timeline, JobKind::Replay, JobKind::LoadTv]
+            .into_iter()
+            .find(|k| self.in_flight.contains(&(trade_id.clone(), *k)))
+    }
+
+    /// The current spinner glyph (advances with `tick`).
+    pub fn spinner(&self) -> char {
+        SPINNER[(self.tick as usize) % SPINNER.len()]
     }
 
     /// The currently-highlighted plan (list) or the open plan (deeper screens).
@@ -108,8 +147,9 @@ impl App {
 
     // -- screen stack ------------------------------------------------------
 
-    /// Push one screen deeper, running that screen's side-effect the first time
-    /// it's reached for this plan (timeline+detail+TV load, replay run).
+    /// Push one screen deeper, kicking off that screen's fetch (as a background
+    /// job) the first time it's reached for this plan. Returns immediately — the
+    /// job posts its result to `drain_jobs` when done.
     pub fn push_deeper(&mut self) {
         let Some(next) = self.screen.deeper() else {
             return;
@@ -120,9 +160,7 @@ impl App {
         }
         self.screen = next;
         self.record_depth(next.depth());
-        if let Err(e) = self.run_screen_effect(next) {
-            self.status = Status::error(format!("{next:?}: {e}"));
-        }
+        self.start_screen_jobs(next);
     }
 
     /// Pop one screen shallower. From the list this is a no-op.
@@ -140,125 +178,145 @@ impl App {
         }
     }
 
-    /// Fetch whatever a freshly-entered screen needs, caching it per plan.
-    fn run_screen_effect(&mut self, screen: Screen) -> Result<()> {
+    /// Kick off (as background jobs) whatever a freshly-entered screen needs,
+    /// skipping anything already cached or already in flight.
+    fn start_screen_jobs(&mut self, screen: Screen) {
         let Some(trade_id) = self.current_plan().map(|p| p.trade_id.clone()) else {
-            return Ok(());
+            return;
         };
         match screen {
-            Screen::Timeline => {
-                self.ensure_detail_and_timeline(&trade_id)?;
-                // TV auto-load happens here via the replay annotate path in a
-                // later slice; for now just note readiness.
-                self.status = Status::info(format!("{trade_id}: timeline loaded"));
-            }
-            Screen::Replay => {
-                self.ensure_replay(&trade_id)?;
-            }
+            Screen::Timeline => self.start_timeline(&trade_id),
+            Screen::Replay => self.start_replay(&trade_id),
             Screen::Compare => {
-                // Compare reuses timeline + replay already fetched; v2 adds diff.
-                self.ensure_detail_and_timeline(&trade_id)?;
-                self.ensure_replay(&trade_id)?;
+                // Compare needs both; each is a no-op if already cached/running.
+                self.start_timeline(&trade_id);
+                self.start_replay(&trade_id);
             }
             Screen::List => {}
         }
-        Ok(())
     }
 
-    /// Fetch `plan export` (→ detail + popup dump) and `plan timeline` once.
-    fn ensure_detail_and_timeline(&mut self, trade_id: &str) -> Result<()> {
-        let need_export = self
+    /// Spawn the timeline-load job (export + timeline) unless cached or running.
+    fn start_timeline(&mut self, trade_id: &str) {
+        let cached = self
             .data
             .get(trade_id)
-            .map(|d| d.export_json.is_none())
-            .unwrap_or(true);
-        if need_export {
-            let export = cli::plan_export_json(trade_id)?;
-            let detail = parse_plan_export(&export).ok();
-            let entry = self.data.entry(trade_id.to_string()).or_default();
-            entry.export_json = Some(export);
-            entry.detail = detail;
+            .map(|d| d.timeline_json.is_some() && d.export_json.is_some())
+            .unwrap_or(false);
+        if cached || !self.mark_in_flight(trade_id, JobKind::Timeline) {
+            return;
         }
-        let need_timeline = self
-            .data
-            .get(trade_id)
-            .map(|d| d.timeline_json.is_none())
-            .unwrap_or(true);
-        if need_timeline {
-            let tl = cli::plan_timeline_json(trade_id)?;
-            self.data
-                .entry(trade_id.to_string())
-                .or_default()
-                .timeline_json = Some(tl);
-        }
-        Ok(())
+        self.status = Status::info(format!("{trade_id}: loading timeline…"));
+        jobs::spawn_timeline(self.job_tx.clone(), trade_id.to_string());
     }
 
-    /// Run the replay once and cache its report.
-    fn ensure_replay(&mut self, trade_id: &str) -> Result<()> {
-        let need = self
+    /// Spawn the replay job unless cached or running. Needs the plan export; if
+    /// it isn't cached yet, the timeline job will fetch it — so we require it
+    /// here and let a not-yet-loaded plan spawn the timeline first.
+    fn start_replay(&mut self, trade_id: &str) {
+        let cached = self
             .data
             .get(trade_id)
-            .map(|d| d.replay_report.is_none())
-            .unwrap_or(true);
-        if !need {
-            return Ok(());
+            .map(|d| d.replay_report.is_some())
+            .unwrap_or(false);
+        if cached {
+            return;
         }
-        // Replay needs the plan JSON on disk; write the export to a temp file.
-        let export = match self.data.get(trade_id).and_then(|d| d.export_json.clone()) {
-            Some(e) => e,
-            None => {
-                let e = cli::plan_export_json(trade_id)?;
-                self.data
-                    .entry(trade_id.to_string())
-                    .or_default()
-                    .export_json = Some(e.clone());
-                e
-            }
+        let Some(export) = self.data.get(trade_id).and_then(|d| d.export_json.clone()) else {
+            // No export yet — ensure the timeline job runs to fetch it; the
+            // replay is retried when we re-enter/refresh once it's cached.
+            self.start_timeline(trade_id);
+            return;
         };
-        let path = std::env::temp_dir().join(format!("journal-replay-{trade_id}.json"));
-        std::fs::write(&path, export)?;
+        if !self.mark_in_flight(trade_id, JobKind::Replay) {
+            return;
+        }
         self.status = Status::info(format!("{trade_id}: running replay…"));
-        let report = cli::replay(&path, false)?;
-        self.data
-            .entry(trade_id.to_string())
-            .or_default()
-            .replay_report = Some(report);
-        self.status = Status::info(format!("{trade_id}: replay done"));
-        Ok(())
+        jobs::spawn_replay(self.job_tx.clone(), trade_id.to_string(), export);
+    }
+
+    /// Add a job to the in-flight set. Returns `false` if it was already there
+    /// (so the caller skips a duplicate spawn).
+    fn mark_in_flight(&mut self, trade_id: &str, kind: JobKind) -> bool {
+        self.in_flight.insert((trade_id.to_string(), kind))
+    }
+
+    /// Drain any finished background jobs and apply their results to the cache.
+    /// Called once per event-loop tick (see `main.rs`). Returns true if any job
+    /// completed (so the loop knows a redraw is worthwhile).
+    pub fn drain_jobs(&mut self) -> bool {
+        let mut any = false;
+        while let Ok(result) = self.job_rx.try_recv() {
+            any = true;
+            self.in_flight
+                .remove(&(result.trade_id.clone(), result.kind));
+            self.apply_job(result);
+        }
+        any
+    }
+
+    /// Apply one finished job's outcome to the plan's cached data + status.
+    fn apply_job(&mut self, result: JobResult) {
+        let JobResult {
+            trade_id,
+            kind,
+            outcome,
+        } = result;
+        match outcome {
+            JobOutcome::Timeline {
+                export_json,
+                timeline_json,
+            } => {
+                let detail = parse_plan_export(&export_json).ok();
+                let entry = self.data.entry(trade_id.clone()).or_default();
+                entry.export_json = Some(export_json);
+                entry.detail = detail;
+                entry.timeline_json = Some(timeline_json);
+                self.status = Status::info(format!("{trade_id}: timeline loaded"));
+                // A replay may have been requested before the export existed;
+                // if we're on/at Replay or Compare, kick it now.
+                if matches!(self.screen, Screen::Replay | Screen::Compare)
+                    && self
+                        .current_plan()
+                        .map(|p| p.trade_id == trade_id)
+                        .unwrap_or(false)
+                {
+                    self.start_replay(&trade_id);
+                }
+            }
+            JobOutcome::Replay(report) => {
+                self.data.entry(trade_id.clone()).or_default().replay_report = Some(report);
+                self.status = Status::info(format!("{trade_id}: replay done"));
+            }
+            JobOutcome::LoadTv => {
+                self.status = Status::info(format!("{trade_id}: drawn on TradingView"));
+            }
+            JobOutcome::Failed(msg) => {
+                self.status = Status::error(format!("{trade_id} {}: {msg}", kind.verb()));
+            }
+        }
     }
 
     // -- actions -----------------------------------------------------------
 
-    /// Load the current plan into TradingView by replaying with `--annotate`,
-    /// which draws the simulated positions onto the live chart via tv-mcp.
+    /// Load the current plan into TradingView by replaying with `--annotate`
+    /// (draws the simulated positions on the live chart via tv-mcp) — as a
+    /// background job so the ~seconds-long draw doesn't freeze the UI.
     pub fn load_tv(&mut self) {
         let Some(trade_id) = self.current_plan().map(|p| p.trade_id.clone()) else {
             return;
         };
-        if let Err(e) = self.annotate_tv(&trade_id) {
-            self.status = Status::error(format!("TV load: {e}"));
-        } else {
-            self.status = Status::info(format!("{trade_id}: drawn on TradingView"));
-        }
-    }
-
-    fn annotate_tv(&mut self, trade_id: &str) -> Result<()> {
-        let export = match self.data.get(trade_id).and_then(|d| d.export_json.clone()) {
-            Some(e) => e,
-            None => {
-                let e = cli::plan_export_json(trade_id)?;
-                self.data
-                    .entry(trade_id.to_string())
-                    .or_default()
-                    .export_json = Some(e.clone());
-                e
-            }
+        let Some(export) = self.data.get(&trade_id).and_then(|d| d.export_json.clone()) else {
+            // Not loaded yet — fetch the plan first; the operator can re-press l.
+            self.start_timeline(&trade_id);
+            self.status = Status::info(format!("{trade_id}: loading plan, press l again"));
+            return;
         };
-        let path = std::env::temp_dir().join(format!("journal-tv-{trade_id}.json"));
-        std::fs::write(&path, export)?;
-        cli::replay(&path, true)?;
-        Ok(())
+        if !self.mark_in_flight(&trade_id, JobKind::LoadTv) {
+            return;
+        }
+        self.status = Status::info(format!("{trade_id}: drawing on TradingView…"));
+        jobs::spawn_load_tv(self.job_tx.clone(), trade_id, export);
     }
 
     /// Request a replay re-run (the `r` key), bypassing the cache.
@@ -269,9 +327,7 @@ impl App {
         if let Some(d) = self.data.get_mut(&trade_id) {
             d.replay_report = None;
         }
-        if let Err(e) = self.ensure_replay(&trade_id) {
-            self.status = Status::error(format!("replay: {e}"));
-        }
+        self.start_replay(&trade_id);
     }
 
     /// Ask to delete the current plan. Guarded: only allowed once the plan has
@@ -336,6 +392,7 @@ impl App {
     /// Build an app from already-parsed rows, without touching the network —
     /// for render tests against fixtures.
     pub fn from_rows(plans: Vec<PlanRow>) -> Self {
+        let (job_tx, job_rx) = channel();
         Self {
             plans,
             selected: 0,
@@ -345,6 +402,10 @@ impl App {
             show_popup: false,
             confirm: None,
             should_quit: false,
+            job_tx,
+            job_rx,
+            in_flight: HashSet::new(),
+            tick: 0,
         }
     }
 
@@ -366,5 +427,85 @@ impl App {
         if let Some(i) = self.plans.iter().position(|p| p.trade_id == trade_id) {
             self.selected = i;
         }
+    }
+
+    /// Post a job result as if a background thread finished it (test helper).
+    pub fn inject_job(&mut self, result: JobResult) {
+        self.job_tx.send(result).ok();
+    }
+
+    /// Mark a job in-flight without spawning a thread (test helper).
+    pub fn mark_in_flight_test(&mut self, trade_id: &str, kind: JobKind) {
+        self.in_flight.insert((trade_id.to_string(), kind));
+    }
+
+    /// Read the in-flight set size (test helper).
+    pub fn in_flight_len(&self) -> usize {
+        self.in_flight.len()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::jobs::JobOutcome;
+    use crate::plan::PlanRow;
+
+    fn row(trade_id: &str) -> PlanRow {
+        PlanRow {
+            trade_id: trade_id.to_string(),
+            account: "acct".into(),
+            instrument: "AUD_CAD".into(),
+            granularity: "h1".into(),
+            phase: Some("await_entry".into()),
+            shadow: false,
+            archived_at: None,
+        }
+    }
+
+    #[test]
+    fn drain_applies_timeline_and_clears_in_flight() {
+        let mut app = App::from_rows(vec![row("t1")]);
+        app.mark_in_flight_test("t1", JobKind::Timeline);
+        assert_eq!(app.in_flight_len(), 1);
+
+        app.inject_job(JobResult {
+            trade_id: "t1".into(),
+            kind: JobKind::Timeline,
+            outcome: JobOutcome::Timeline {
+                export_json: r#"{"trade_id":"t1","instrument":"AUD_CAD","direction":"short","granularity":"h1","rules":[{"rule_id":"05-enter","intent":{"entry":{"type":"stop"}}}]}"#.into(),
+                timeline_json: r#"{"records":[],"ticks":[]}"#.into(),
+            },
+        });
+
+        let changed = app.drain_jobs();
+        assert!(changed, "drain reports a completed job");
+        // In-flight cleared, data cached, entry-mode classified.
+        assert_eq!(app.in_flight_len(), 0);
+        let data = app.data.get("t1").expect("cached");
+        assert!(data.timeline_json.is_some());
+        assert!(data.export_json.is_some());
+        assert!(data.detail.is_some(), "export parsed into detail");
+    }
+
+    #[test]
+    fn drain_surfaces_failure_in_status() {
+        let mut app = App::from_rows(vec![row("t1")]);
+        app.mark_in_flight_test("t1", JobKind::Replay);
+        app.inject_job(JobResult {
+            trade_id: "t1".into(),
+            kind: JobKind::Replay,
+            outcome: JobOutcome::Failed("boom".into()),
+        });
+        app.drain_jobs();
+        assert!(app.status.is_error);
+        assert!(app.status.text.contains("boom"));
+        assert_eq!(app.in_flight_len(), 0, "failed job also clears in-flight");
+    }
+
+    #[test]
+    fn drain_noop_when_empty() {
+        let mut app = App::from_rows(vec![row("t1")]);
+        assert!(!app.drain_jobs());
     }
 }

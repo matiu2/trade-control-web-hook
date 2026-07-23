@@ -10,6 +10,7 @@
 mod app;
 mod cli;
 mod divergence;
+mod jobs;
 mod keys;
 mod plan;
 mod screen;
@@ -58,20 +59,26 @@ fn main() -> Result<()> {
     result
 }
 
-/// The main render/input loop.
+/// The main render/input loop. Background jobs (replay, timeline) run on their
+/// own threads and post results to `app.drain_jobs`; the short poll timeout is
+/// the redraw tick that animates the "loading…" spinner and picks up results.
 fn run(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<()> {
     let mut app = App::new()?;
     while !app.should_quit {
         terminal.draw(|f| ui::render(f, &app))?;
-        // Poll so a resize or future async result can wake the loop; blocking
-        // read would be fine too but polling keeps redraws responsive.
-        if event::poll(Duration::from_millis(200))?
+        // A short poll keeps the spinner animating and lets finished jobs land
+        // promptly even when the operator isn't pressing keys.
+        if event::poll(Duration::from_millis(120))?
             && let Event::Key(key) = event::read()?
             && key.kind == event::KeyEventKind::Press
         {
             let action = keys::map_key(&app, key);
             keys::apply(&mut app, action);
         }
+        // Apply any background results (no-op when nothing finished).
+        app.drain_jobs();
+        // Advance the spinner clock every pass.
+        app.tick = app.tick.wrapping_add(1);
     }
     Ok(())
 }

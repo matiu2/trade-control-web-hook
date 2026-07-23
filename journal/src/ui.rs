@@ -11,7 +11,7 @@ mod timeline;
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
-use ratatui::text::Line;
+use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 
 use crate::app::App;
@@ -81,10 +81,22 @@ fn render_footer(f: &mut Frame, app: &App, area: Rect) {
         Paragraph::new(Line::from(hints)).style(Style::default().fg(Color::DarkGray)),
         chunks[0],
     );
-    f.render_widget(
-        Paragraph::new(Line::from(app.status.text.clone())).style(status_style),
-        chunks[1],
-    );
+    // While a background job runs for the open plan, prefix the status with an
+    // animated spinner so it's obviously live, not frozen.
+    let status_line = match app.current_busy() {
+        Some(kind) => Line::from(vec![
+            Span::styled(
+                format!("{} ", app.spinner()),
+                Style::default().fg(Color::Yellow),
+            ),
+            Span::styled(
+                format!("{}…", kind.verb()),
+                Style::default().fg(Color::Yellow),
+            ),
+        ]),
+        None => Line::from(Span::styled(app.status.text.clone(), status_style)),
+    };
+    f.render_widget(Paragraph::new(status_line), chunks[1]);
 }
 
 /// A small helper: a bordered block with a title, used by several screens.

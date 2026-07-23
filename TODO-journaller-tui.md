@@ -22,16 +22,25 @@ popup, and `←`-unwind all work. 13 tests (incl. 2 TestBackend render tests).
   spread across 03:30–12:30, replay fires all four at 13:00). 9 divergence unit
   tests + 1 Compare TestBackend render test.
 
+**Done (v2):**
+- **Async loading** — SHIPPED. `journal/src/jobs.rs`: slow shell-outs (replay,
+  timeline+export, TV annotate) run on a `std::thread` and post a `JobResult`
+  over an mpsc channel; the event loop drains it each tick. `App` tracks an
+  `in_flight` set (never double-spawns, drives the spinner) and a `tick` counter
+  animates a braille spinner in the footer + Replay screen. The UI stays fully
+  responsive during a ~25s replay — verified live: navigated screens mid-replay,
+  the spinner kept animating, and the report landed on completion. 3 job unit
+  tests (`drain_applies_timeline…`, `drain_surfaces_failure…`, noop). Delete
+  stays synchronous (fast + deliberately blocking).
+
 **Remaining / v2:**
 - **TV auto-load on Timeline push** — wired via `load_tv` (`l` key, replay
-  `--annotate`) but NOT yet auto-fired on the Timeline push; `run_screen_effect`
-  has a TODO marker. Decide: auto-annotate is slow (pulls candles), so maybe
-  keep it on the explicit `l` key rather than auto.
+  `--annotate`, now async) but NOT yet auto-fired on the Timeline push. Decide:
+  auto-annotate is slow (pulls candles), so maybe keep it on the explicit `l`
+  key rather than auto.
 - **Deploy** — installed manually (bake + copy); `deploy-staging.sh` now lists
   `journal` so the next full deploy installs it too (but that also rolls the
   worker — fine when deploying anyway).
-- Async replay (spawn + channel) if the synchronous run's freeze annoys.
-- Parent submodule pointer bump after this lands on `main`.
 
 ---
 
