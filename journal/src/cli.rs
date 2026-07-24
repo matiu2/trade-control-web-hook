@@ -109,10 +109,21 @@ pub fn plan_delete(trade_id: &str) -> Result<String> {
 /// literal glyphs, not interpreted as colour). Stripping at the source keeps
 /// both the report view and the divergence parser on clean text. Stderr is
 /// appended on failure.
-pub fn replay_via_tv_arm(armed_at: &str) -> Result<String> {
+/// `skip_flags` are tv-arm's own prep-skip flags (`--skip-break-and-close`,
+/// `--skip-retest`) that must match how the ORIGINAL plan was armed. tv-arm
+/// re-arms from the chart and defaults to the FULL break-and-close-then-retest,
+/// so a plan armed with `--skip-bcr` would otherwise re-arm WITH the preps and
+/// stall in `AwaitBreakAndClose` — a replay↔original divergence. The journal
+/// reads the stored plan's preps and forwards the matching skips. These are
+/// tv-arm flags, so they go **before** the `replay` subcommand.
+pub fn replay_via_tv_arm(armed_at: &str, skip_flags: &[&str]) -> Result<String> {
     let program = bin("tv-arm");
     let mut cmd = Command::new(&program);
-    cmd.arg("--start").arg(armed_at).arg("replay");
+    cmd.arg("--start").arg(armed_at);
+    for flag in skip_flags {
+        cmd.arg(flag);
+    }
+    cmd.arg("replay");
     // tv-arm logs its pipeline at INFO on **stdout** (mixed into the report we
     // capture); quiet it to warn so the report body dominates. Honour an
     // operator's own RUST_LOG if they set one. (ANSI is stripped regardless.)
