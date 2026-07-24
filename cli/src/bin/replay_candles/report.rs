@@ -112,6 +112,11 @@ pub enum FillKind {
     /// Filled, then flattened by a `06-close-on-reversal` fire (a confirming
     /// opposite-direction reversal candle inside the SR band) before SL/TP.
     ClosedOnReversal,
+    /// Filled, then flattened by the trade-expiry `close-positions` veto at
+    /// wall-clock expiry (the live worker's ClosePositions veto flattens any
+    /// still-open position at market when the plan expires). Booked at the
+    /// expiry candle's close.
+    ClosedAtExpiry,
     /// A pending order that never triggered within the window. Not taken.
     NeverFilled,
     /// An entry the worker declined to place (entry past a gate level). Not taken.
@@ -133,7 +138,11 @@ impl FillKind {
     pub fn is_taken(self) -> bool {
         matches!(
             self,
-            Self::Open | Self::StoppedOut | Self::TookProfit | Self::ClosedOnReversal
+            Self::Open
+                | Self::StoppedOut
+                | Self::TookProfit
+                | Self::ClosedOnReversal
+                | Self::ClosedAtExpiry
         )
     }
 }
@@ -351,6 +360,9 @@ pub fn render(
         if tally.reversal_closes > 0 {
             out.push_str(&format!("  REV: {}", tally.reversal_closes));
         }
+        if tally.expiry_closes > 0 {
+            out.push_str(&format!("  EXP: {}", tally.expiry_closes));
+        }
         out.push_str(&tally.summary_line());
     }
     out.push('\n');
@@ -402,6 +414,7 @@ struct Tally {
     wins: usize,
     losses: usize,
     reversal_closes: usize,
+    expiry_closes: usize,
     net_r: f64,
     account: f64,
 }
@@ -412,6 +425,7 @@ impl Tally {
             wins: 0,
             losses: 0,
             reversal_closes: 0,
+            expiry_closes: 0,
             net_r: 0.0,
             account: START_ACCOUNT,
         }
@@ -786,6 +800,23 @@ fn render_fire(
                 at: result.until,
                 note: format!(
                     "{ev} CLOSED ON REVERSAL → {}{r}",
+                    fmt_price(exit_price, plan.pip_size)
+                ),
+                close: bar_close(&fire.forward, result.until),
+            });
+        }
+        FillKind::ClosedAtExpiry => {
+            events.push(EntryEvent {
+                at: result.fill_at,
+                note: format!("{ev} FILLED @ {}", fmt_price(entry_price, plan.pip_size)),
+                close: bar_close(&fire.forward, result.fill_at),
+            });
+            tally.expiry_closes += 1;
+            let r = book_r(tally, ledger_stop, entry_price, exit_price);
+            events.push(EntryEvent {
+                at: result.until,
+                note: format!(
+                    "{ev} CLOSED AT EXPIRY → {}{r}",
                     fmt_price(exit_price, plan.pip_size)
                 ),
                 close: bar_close(&fire.forward, result.until),

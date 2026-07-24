@@ -376,6 +376,67 @@ mod tests {
         }
     }
 
+    /// S5 regression guard: the stateful broker books reversal- and expiry-close
+    /// P&L from the held ledger, instead of the old no-op `close_positions` that
+    /// left a reversal/expiry-closed position at 0R. The golden `expected.json`
+    /// snapshot is computed via the independent `simulate_fill` path (no
+    /// reversal/expiry awareness), so it CANNOT capture this — hence a separate
+    /// assertion on the rendered REPORT TEXT, which reads `fire.realized` from the
+    /// broker's held ledger. The `uk-100-…-close-on-reversal` fixture exercises
+    /// both a reversal-close and a trade-expiry flatten on OPEN positions.
+    #[tokio::test]
+    async fn stateful_broker_books_reversal_and_expiry_closes_in_the_report() {
+        let dir = super::fixtures_root().join("uk-100-news-blackout-rentry-close-on-reversal");
+        if !dir.is_dir() {
+            eprintln!("uk-100 reversal/expiry fixture missing — skipping");
+            return;
+        }
+        let inputs = load(&dir).expect("load uk-100 fixture");
+        let expires_at = inputs
+            .candles
+            .last()
+            .map(|c| c.time)
+            .unwrap_or_else(Utc::now)
+            + chrono::Duration::days(365);
+        let mark_cfg = DetectorMarkConfig::new(
+            DirectionFilter::None,
+            GoldenFilter::None,
+            inputs.plan.direction,
+        );
+        let replay = super::super::replay::run(
+            &inputs.plan,
+            &inputs.candles,
+            inputs.meta.granularity,
+            inputs.meta.start,
+            expires_at,
+            mark_cfg,
+            &[],
+        )
+        .await;
+        let report =
+            super::super::report::render(&inputs.plan, &replay, true, false, None, &mark_cfg);
+        // A reversal-close must book R off the held ledger (not sit at 0R / "still
+        // open"). Before S5 `close_positions` was a no-op and this line read
+        // "still open at window end".
+        assert!(
+            report.contains("CLOSED ON REVERSAL"),
+            "reversal-close must be booked from the held ledger:\n{report}"
+        );
+        // The trade-expiry ClosePositions veto must FLATTEN the open position at
+        // the expiry candle's close — the operator's original ask. Before S5 the
+        // veto left the position open at 0R ("no fill simulated" with nothing
+        // closed).
+        assert!(
+            report.contains("CLOSED AT EXPIRY"),
+            "expiry veto must flatten the open position from the held ledger:\n{report}"
+        );
+        // Both book a signed R into the tally summary (EXP marker present).
+        assert!(
+            report.contains("EXP: 1"),
+            "expiry-close tally must count the flatten:\n{report}"
+        );
+    }
+
     fn sample_meta() -> FixtureMeta {
         FixtureMeta {
             instrument: "EUR_USD".into(),

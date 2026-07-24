@@ -636,21 +636,20 @@ pub async fn run(
         }
     }
 
-    // PR 4b-2: the report reads each placed enter's outcome from the broker
-    // ledger. The reversal-close set is plan-wide (a `06-close-on-reversal` can
-    // flatten a position that filled bars earlier), so it's only known now that
-    // every fire is collected. Build it, then ask the broker to realize each
-    // placed order against it and stash the outcome on the fire. A superseded
-    // order (its resting order cancelled by a later entry) is skipped — the
-    // report renders it as cancelled, not a fill, exactly as before.
-    let closes = super::report::collect_close_fires_from(&fires);
+    // S5b: the report reads each placed enter's outcome from the broker's HELD
+    // ledger (the single source of truth) — `held_realized_outcome`. The held
+    // model already applied fills, SL/TP, reversal-closes, and the expiry flatten
+    // AT their real bars during the loop, so there's no post-loop reversal pass
+    // to build: a reversal/expiry close is already recorded in `closed`. A
+    // superseded order (its resting order cancelled by a later entry) is skipped —
+    // the report renders it as cancelled, not a fill.
     for fire in fires.iter_mut() {
         if fire.superseded {
             continue;
         }
         let order_id = fire.order_id().map(str::to_owned);
         if let Some(order_id) = order_id {
-            fire.realized = replay_broker.realized_outcome(&order_id, &closes);
+            fire.realized = replay_broker.held_realized_outcome(&order_id);
         }
     }
 

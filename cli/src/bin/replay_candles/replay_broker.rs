@@ -630,6 +630,62 @@ impl ReplayBroker {
         self.realize(attempt, geo, closes)
     }
 
+    /// S5b: the realized outcome READ FROM THE HELD LEDGER — the single source of
+    /// truth. Replaces the re-sim `realized_outcome` as the report's P&L source.
+    /// A closed trade maps to its exit kind (StoppedOut / TookProfit /
+    /// ClosedOnReversal / ClosedAtExpiry); a still-open position → `Open` (no exit
+    /// yet); a cancelled-or-absent order → `None` (no fill, exactly as the re-sim
+    /// returned for a cancelled/unresolved order). The window-end anchor for an
+    /// open position is the last pulled candle.
+    pub fn held_realized_outcome(&self, order_id: &str) -> Option<RealizedOutcome> {
+        // Advance to the window end so a position that closes on the last bars is
+        // reflected. The loop already advanced per bar; this is a final settle.
+        if let Some(last) = self.candles.last().map(|c| c.time) {
+            self.advance(last);
+        }
+        if let Some(t) = self.closed.borrow().iter().find(|t| t.order_id == order_id) {
+            let kind = match t.reason {
+                ExitReason::StoppedOut => FillKind::StoppedOut,
+                ExitReason::TookProfit => FillKind::TookProfit,
+                ExitReason::Reversal => FillKind::ClosedOnReversal,
+                ExitReason::Expiry => FillKind::ClosedAtExpiry,
+            };
+            return Some(RealizedOutcome {
+                direction: t.direction,
+                fill_at: t.fill_at,
+                until: t.exit_at,
+                entry_price: t.entry_price,
+                stop_loss: t.stop_loss,
+                take_profit: t.take_profit,
+                exit_price: Some(t.exit_price),
+                kind,
+            });
+        }
+        if let Some(p) = self.open.borrow().iter().find(|p| p.order_id == order_id) {
+            let window_end = self.candles.last().map(|c| c.time).unwrap_or(p.fill_at);
+            return Some(RealizedOutcome {
+                direction: p.direction,
+                fill_at: p.fill_at,
+                until: window_end,
+                entry_price: p.entry_price,
+                stop_loss: p
+                    .placed
+                    .as_ref()
+                    .map(|pl| pl.stop_loss)
+                    .unwrap_or(p.entry_price),
+                take_profit: p
+                    .placed
+                    .as_ref()
+                    .map(|pl| pl.take_profit)
+                    .unwrap_or(p.entry_price),
+                exit_price: None,
+                kind: FillKind::Open,
+            });
+        }
+        // Cancelled or never-placed — no fill (the report renders a 0R no-fill).
+        None
+    }
+
     /// Compute a ledger order's realized outcome by walking its STORED placed
     /// bracket (via [`resolved_for_sim`]) forward with [`simulate_fill_resolved`],
     /// then the reversal-close post-pass — and map to a [`RealizedOutcome`]. The
