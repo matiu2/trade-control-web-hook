@@ -413,6 +413,17 @@ impl ReplayBroker {
         shell: Shell,
         placed: Option<PlacedLevels>,
     ) {
+        // Held model (S1+): the same placement as a resting order the per-bar
+        // `advance()` steps to open/closed. Coexists with the `placed` re-sim
+        // list during migration (S3 asserts they agree); the re-sim list is
+        // deleted at S8.
+        self.resting.borrow_mut().push(HeldOrder {
+            order_id: order_id.clone(),
+            intent: intent.clone(),
+            shell: shell.clone(),
+            placed: placed.clone(),
+            cancelled: false,
+        });
         self.placed.borrow_mut().push(PlacedAttempt {
             order_id,
             intent,
@@ -828,6 +839,185 @@ impl ReplayBroker {
             // above. Kept for match exhaustiveness → the slot is free.
             SimOutcome::Declined { .. } | SimOutcome::Unresolved(_) => AttemptState::Cancelled,
         }
+    }
+
+    /// The prefix a held order/position is simulated against as of the current
+    /// bar: the candles at/after its fire (`shell`) bar, up to and including
+    /// `as_of`. Index 0 is the fire bar — the sim's `find_fill` excludes it (a
+    /// resting order isn't live until its fire bar closes), so `advance()` gets
+    /// the fire-bar skip (and the spread-hour fill skip, sub-bar zoom, break-even,
+    /// System-2 widen) for free from `simulate_fill_resolved_zoom`.
+    fn prefix_from_fire(&self, shell: &Shell) -> Vec<BidAskCandle> {
+        self.window_to_as_of()
+            .into_iter()
+            .filter(|c| c.time >= shell.time)
+            .collect()
+    }
+
+    /// Simulate one held order/position against the prefix up to `as_of` and read
+    /// off its state *by this bar* — the same `simulate_fill_resolved_zoom` the
+    /// re-sim `resolve` uses, so `advance()` reproduces every fill/exit invariant
+    /// baked into the engine. Returns `None` when the intent can't resolve (slot
+    /// free) — the caller drops the order.
+    fn step_outcome(
+        &self,
+        intent: &Intent,
+        shell: &Shell,
+        placed: &Option<PlacedLevels>,
+    ) -> Option<(Resolved, SimOutcome)> {
+        let prefix = self.prefix_from_fire(shell);
+        // Build a throwaway attempt so `resolved_for_sim` (which reads
+        // `attempt.placed` / `attempt.intent` / `attempt.shell`) applies the SAME
+        // stored-levels-or-floor logic the re-sim path uses. No ledger/cancel
+        // fields matter here — only the three the resolver reads.
+        let probe = PlacedAttempt {
+            order_id: String::new(),
+            intent: intent.clone(),
+            shell: shell.clone(),
+            placed: placed.clone(),
+            cancelled: false,
+            ledger: None,
+        };
+        let resolved = self.resolved_for_sim(&probe, &prefix)?;
+        let outcome = simulate_fill_resolved_zoom(
+            &resolved,
+            intent,
+            shell,
+            self.pip_size,
+            &prefix,
+            self.zoom(),
+        );
+        Some((resolved, outcome))
+    }
+
+    /// Advance the held state to `as_of` (call once per bar, AFTER `set_as_of`,
+    /// BEFORE engine dispatch). This is the single-source-of-truth step that
+    /// replaces the re-simulate-on-query model: it promotes resting→open on a
+    /// fill and open→closed on an SL/TP touch, by this bar, so `list_open_positions`
+    /// / `lookup_attempt_state` can READ held state instead of re-deriving it, and
+    /// `close_positions` (reversal / expiry, dispatched by the engine on this bar)
+    /// has a real position to flatten. Reuses `simulate_fill_resolved_zoom`, so
+    /// every fill/exit invariant (fire-bar skip, spread-hour skip, sub-bar zoom,
+    /// break-even, System-2 widen) is preserved — no reimplemented fill engine.
+    pub fn advance(&self) {
+        // 1. Resting → open (or straight to closed if it filled AND exited by now).
+        //    A cancelled resting order fills nothing; leave it for the lifecycle.
+        let resting_now = self.resting.borrow().clone();
+        for order in resting_now {
+            if order.cancelled {
+                continue;
+            }
+            let Some((resolved, outcome)) =
+                self.step_outcome(&order.intent, &order.shell, &order.placed)
+            else {
+                // Unresolvable → the slot is free; drop the resting order.
+                self.remove_resting(&order.order_id);
+                continue;
+            };
+            match outcome {
+                SimOutcome::NeverFilled => { /* still resting */ }
+                SimOutcome::FilledOpen {
+                    fill_at,
+                    entry_price,
+                } => {
+                    self.remove_resting(&order.order_id);
+                    self.open.borrow_mut().push(HeldPosition {
+                        order_id: order.order_id.clone(),
+                        intent: order.intent.clone(),
+                        shell: order.shell.clone(),
+                        placed: order.placed.clone(),
+                        direction: resolved.direction,
+                        entry_price,
+                        fill_at,
+                    });
+                }
+                SimOutcome::StoppedOut {
+                    fill_at,
+                    entry_price,
+                    exit_at,
+                    exit_price,
+                }
+                | SimOutcome::TookProfit {
+                    fill_at,
+                    entry_price,
+                    exit_at,
+                    exit_price,
+                } => {
+                    // Filled AND exited within the prefix — record the closed trade
+                    // directly (it never rests as "open" past this bar).
+                    let reason = if matches!(outcome, SimOutcome::TookProfit { .. }) {
+                        ExitReason::TookProfit
+                    } else {
+                        ExitReason::StoppedOut
+                    };
+                    self.remove_resting(&order.order_id);
+                    self.closed.borrow_mut().push(ClosedTrade {
+                        order_id: order.order_id.clone(),
+                        direction: resolved.direction,
+                        entry_price,
+                        stop_loss: resolved.stop_loss,
+                        take_profit: resolved.take_profit,
+                        fill_at,
+                        exit_at,
+                        exit_price,
+                        reason,
+                    });
+                }
+                SimOutcome::Declined { .. } | SimOutcome::Unresolved(_) => {
+                    self.remove_resting(&order.order_id);
+                }
+            }
+        }
+
+        // 2. Open → closed on an SL/TP touch by this bar. (Reversal / expiry
+        //    closes are applied by the engine via `close_positions`, not here.)
+        let open_now = self.open.borrow().clone();
+        for pos in open_now {
+            let Some((resolved, outcome)) =
+                self.step_outcome(&pos.intent, &pos.shell, &pos.placed)
+            else {
+                continue;
+            };
+            if let SimOutcome::StoppedOut {
+                exit_at,
+                exit_price,
+                ..
+            }
+            | SimOutcome::TookProfit {
+                exit_at,
+                exit_price,
+                ..
+            } = outcome
+            {
+                let reason = if matches!(outcome, SimOutcome::TookProfit { .. }) {
+                    ExitReason::TookProfit
+                } else {
+                    ExitReason::StoppedOut
+                };
+                self.remove_open(&pos.order_id);
+                self.closed.borrow_mut().push(ClosedTrade {
+                    order_id: pos.order_id.clone(),
+                    direction: pos.direction,
+                    entry_price: pos.entry_price,
+                    stop_loss: resolved.stop_loss,
+                    take_profit: resolved.take_profit,
+                    fill_at: pos.fill_at,
+                    exit_at,
+                    exit_price,
+                    reason,
+                });
+            }
+        }
+    }
+
+    /// Remove a resting order by id (filled, cancelled-and-dropped, or unresolvable).
+    fn remove_resting(&self, order_id: &str) {
+        self.resting.borrow_mut().retain(|o| o.order_id != order_id);
+    }
+
+    /// Remove an open position by id (closed by bracket, reversal, or expiry).
+    fn remove_open(&self, order_id: &str) {
+        self.open.borrow_mut().retain(|p| p.order_id != order_id);
     }
 
     /// Build the [`PendingOrder`] a live broker would report for a still-resting
