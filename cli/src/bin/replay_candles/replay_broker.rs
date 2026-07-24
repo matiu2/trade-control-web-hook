@@ -102,6 +102,83 @@ struct ReversalClose {
     exit_price: f64,
 }
 
+// ---------------------------------------------------------------------------
+// Stateful held model (S1) — the broker HOLDS position state and mutates it as
+// bars advance, instead of re-simulating each placed order's price path on every
+// query. This is the single source of truth the engine queries exactly like the
+// live worker queries the real broker: `close_positions` actually removes a held
+// position (no longer a no-op stub), so reversal- and expiry-closes flatten a
+// position at the bar the engine dispatches them — killing the two-brain bug
+// class (a same-bar fill+reversal, a reversal-closed slot wrongly reported open).
+//
+// Each held record stores the CONCRETE placed levels (the floored stop verbatim)
+// so every fill/exit test walks the same bracket the retry-gate saw — preserving
+// "orders are state" / replay↔live divergence #4 in the held model.
+// ---------------------------------------------------------------------------
+
+/// A resting order the broker holds: placed by `place_entry`, not yet triggered.
+/// Carries everything a later bar needs to test the trigger touch and, on fill,
+/// promote it to a [`HeldPosition`] against the same stored levels.
+#[derive(Clone)]
+struct HeldOrder {
+    order_id: String,
+    intent: Intent,
+    shell: Shell,
+    /// The floored levels captured from the `EntryRequest` (as [`PlacedLevels`]),
+    /// or `None` for the direct-record/legacy path (floored from the intent).
+    placed: Option<PlacedLevels>,
+    /// Set when the spread-hour lifecycle cancels this resting order (supersede /
+    /// cancel-and-replace). A cancelled resting order fills nothing and appears in
+    /// neither the open nor the pending list; a restore re-activates it.
+    cancelled: bool,
+}
+
+/// A filled position the broker holds: promoted from a [`HeldOrder`] when a bar
+/// triggered its entry, not yet closed. Removed (→ [`ClosedTrade`]) on an SL/TP
+/// touch, a reversal-close, or an expiry flatten.
+#[derive(Clone)]
+struct HeldPosition {
+    order_id: String,
+    intent: Intent,
+    shell: Shell,
+    /// The bracket the position rests on — the floored stop, take-profit, and the
+    /// entry the fill landed at. Never re-derived (divergence #4).
+    placed: Option<PlacedLevels>,
+    direction: Direction,
+    entry_price: f64,
+    fill_at: DateTime<Utc>,
+}
+
+/// Why a held position left the book — drives the report's exit label and R sign.
+#[derive(Clone, Copy, PartialEq)]
+enum ExitReason {
+    /// Stop-loss touched (or SL→break-even scratch when `exit_price ≈ entry`).
+    StoppedOut,
+    /// Take-profit touched.
+    TookProfit,
+    /// A gate-passing reversal-close (`06-/07-close-on-…`) flattened it.
+    Reversal,
+    /// The trade-expiry `close-positions` veto flattened it at wall-clock expiry.
+    Expiry,
+}
+
+/// A closed position in the broker's P&L ledger — the terminal record the report
+/// reads instead of a post-loop re-simulation pass. Entry/exit/reason are enough
+/// to reconstruct R against the stored floored stop.
+#[derive(Clone)]
+struct ClosedTrade {
+    order_id: String,
+    direction: Direction,
+    entry_price: f64,
+    /// The floored stop the position rested on — R is `realized_r(entry, stop, exit)`.
+    stop_loss: f64,
+    take_profit: f64,
+    fill_at: DateTime<Utc>,
+    exit_at: DateTime<Utc>,
+    exit_price: f64,
+    reason: ExitReason,
+}
+
 /// Exact equality of two resolved entries — same variant, same price. Used to
 /// match a lifecycle re-drive `EntryRequest` back to the cancelled attempt it
 /// restores; both sides resolve from the SAME intent+shell, so the f64s are
@@ -251,6 +328,18 @@ pub struct ReplayBroker {
     /// `simulate_fill_resolved_zoom`, so an ambiguous SL/TP bar is disambiguated
     /// by finer candles when available and pessimistic-stopped otherwise.
     finer: Option<FinerSeries>,
+
+    // --- Stateful held model (S1). Mutated by `advance()` per bar and by
+    // `place_entry`/`close_positions`; read by `list_open_positions` /
+    // `lookup_attempt_state` / `list_pending_orders` and the P&L readout. During
+    // the migration these coexist with the `placed` re-sim path (S3 asserts they
+    // agree); the re-sim path is deleted at S8.
+    /// Resting orders placed but not yet triggered.
+    resting: RefCell<Vec<HeldOrder>>,
+    /// Filled positions not yet closed.
+    open: RefCell<Vec<HeldPosition>>,
+    /// The P&L ledger — closed positions in exit order.
+    closed: RefCell<Vec<ClosedTrade>>,
 }
 
 impl ReplayBroker {
@@ -263,6 +352,9 @@ impl ReplayBroker {
             placed: RefCell::new(Vec::new()),
             armed: RefCell::new(None),
             finer: None,
+            resting: RefCell::new(Vec::new()),
+            open: RefCell::new(Vec::new()),
+            closed: RefCell::new(Vec::new()),
         }
     }
 

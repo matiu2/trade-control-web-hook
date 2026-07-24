@@ -62,8 +62,24 @@ intended #2 fix. Verified consistent with operator rule.)
 
 ## Staging (each stage compiles + its tests pass before the next)
 
-- [ ] **S0. Baseline captured** (DONE): fixtures copied to scratchpad, golden
-      test green.
+## PROGRESS CHECKPOINT (durable — resume here after any context loss)
+- ✅ S0 baseline: fixtures copied to `scratchpad/fixtures-baseline/`; golden test
+     `all_fixtures_match_expected` was GREEN before changes.
+- ✅ S1 DONE (commit after S0): held types `HeldOrder`/`HeldPosition`/
+     `ClosedTrade`/`ExitReason` + `resting`/`open`/`closed` RefCell fields added &
+     init'd in `new()`. Compiles green (only expected never-read warnings).
+- 40-invariant catalog lives in the task transcript / my notes; the executable
+     net is: 6 `shadow_parity_*` tests + `resolve_and_realize_agree_on_the_stored_placed_stop`
+     + `open_then_closed_as_the_asof_bar_advances` + the golden fixture test.
+- HARD RULE from operator: **do NOT run `--rebless`.** If any fixture test fails,
+     STOP and show the operator the failure + proposed expected.json diff for
+     manual sign-off. Never auto-bless.
+- Files in play: `cli/src/bin/replay_candles/replay_broker.rs` (core),
+     `replay.rs` (loop), `report.rs` (P&L readout).
+- Worktree: `../trade-control-web-hook-expiry-close`, branch `replay-stateful-broker`.
+
+### Stage list
+- [x] **S0. Baseline captured**: fixtures copied to scratchpad, golden test green.
 - [ ] **S1. Types + held state.** Add `HeldOrder`/`HeldPosition`/`ClosedTrade`,
       the three `RefCell<Vec<..>>` fields. No behavior change yet; old paths stay.
 - [ ] **S2. `advance(candle)`** implementing fill + bracket-exit against held
