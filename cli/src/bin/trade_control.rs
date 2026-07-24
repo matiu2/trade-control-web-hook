@@ -22,21 +22,17 @@ use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use clap_complete::{Shell, generate};
 use color_eyre::eyre::{Context, Result, eyre};
 use trade_control_cli::{
-    AdoptBody, BuildStrictness, KEY_LEN, TradePattern, add_account, adopt_trade,
-    build_clear_prep_intent, build_clear_veto_intent, build_market_info_intent,
-    build_plan_delete_intent, build_plan_list_intent, build_plan_purge_intent,
-    build_plan_show_intent, build_plan_timeline_intent, build_prep_intent,
-    build_purge_older_than_intent, build_register_intent, build_status_intent,
-    build_trade_from_spec, build_trade_interactive, build_unlock_intent, build_veto_intent,
-    delete_account, delete_secret, fill_missing_fields, generate_key_hex, list_accounts,
-    load_cache, load_spec_from_file, pick_pattern_interactive, pick_template_interactive,
-    prompt_save_as_template, put_secret, record_account_use, record_prep_use, record_veto_use,
-    require_local_tn_account, secret_binding_for, test_account, validate_instrument, wrap_signed,
-    wrap_signed_template, write_trade,
+    AdoptBody, BuildStrictness, KEY_LEN, TradePattern, adopt_trade, build_clear_prep_intent,
+    build_clear_veto_intent, build_market_info_intent, build_plan_delete_intent,
+    build_plan_list_intent, build_plan_purge_intent, build_plan_show_intent,
+    build_plan_timeline_intent, build_prep_intent, build_purge_older_than_intent,
+    build_register_intent, build_status_intent, build_trade_from_spec, build_trade_interactive,
+    build_unlock_intent, build_veto_intent, fill_missing_fields, generate_key_hex, load_cache,
+    load_spec_from_file, pick_pattern_interactive, pick_template_interactive,
+    prompt_save_as_template, record_account_use, record_prep_use, record_veto_use,
+    validate_instrument, wrap_signed, wrap_signed_template, write_trade,
 };
-use trade_control_core::account::{
-    AccountKind, AccountMetadata, Credentials, TradeNationCreds, TradeNationKind,
-};
+use trade_control_core::account::{AccountKind, TradeNationKind};
 use trade_control_core::incoming::signed_pairs_from_text;
 use trade_control_core::intent::Intent;
 use trade_control_core::intent::{BrokerKind, Direction, VetoLevel};
@@ -93,10 +89,10 @@ enum Cmd {
     /// with a `# verified` marker on success. Exit code is non-zero
     /// on signature mismatch.
     Verify(VerifyArgs),
-    /// Manage first-class accounts on the deployed worker. Talks to the
-    /// `/admin/accounts*` routes; auth is `--admin-key-file` (distinct
-    /// from `--key-file` used by intent endpoints). `account add` also
-    /// wraps `wrangler secret put` for the credential half.
+    /// Account management. `list`/`add`/`delete`/`test` have MOVED to the
+    /// `trade-control-accounts` binary (which talks straight to Postgres —
+    /// the native worker never ported the old `/admin/accounts*` routes);
+    /// they now error with a pointer. `account names` still works locally.
     #[command(subcommand)]
     Account(AccountCmd),
     /// Adopt an externally-opened broker position into worker
@@ -2066,43 +2062,20 @@ fn run_account_names() -> Result<()> {
 
 fn run_account(sub: AccountCmd) -> Result<()> {
     match sub {
-        AccountCmd::List(args) => run_account_list(args),
-        AccountCmd::Add(args) => run_account_add(args),
-        AccountCmd::Delete(args) => run_account_delete(args),
-        AccountCmd::Test(args) => run_account_test(args),
-        AccountCmd::Names => run_account_names(),
-    }
-}
-
-fn run_account_list(args: AccountEndpointArgs) -> Result<()> {
-    let admin_key = load_admin_key(&args.admin_key_file)?;
-    let body = list_accounts(&args.endpoint, &admin_key)?;
-    // Side-effect: warm the sign-flow auto-complete cache with every
-    // canonical name the worker reports. Best-effort — if the response
-    // isn't the expected shape we silently skip the cache update and
-    // still print the body.
-    cache_account_names_from_list(&body);
-    print!("{body}");
-    if !body.ends_with('\n') {
-        println!();
-    }
-    Ok(())
-}
-
-/// Parse the YAML body returned by `GET /admin/accounts` and record
-/// every `name:` we find in the operator's local history. Failures are
-/// swallowed — auto-complete is a convenience, not a correctness gate.
-fn cache_account_names_from_list(body: &str) {
-    let Ok(value) = serde_yaml::from_str::<serde_yaml::Value>(body) else {
-        return;
-    };
-    let Some(seq) = value.as_sequence() else {
-        return;
-    };
-    for entry in seq {
-        if let Some(name) = entry.get("name").and_then(|n| n.as_str()) {
-            record_account_use(name);
+        // The worker-backed subcommands talked to the Cloudflare
+        // `/admin/accounts*` routes, which the native (Postgres) worker
+        // never ported — it serves only `POST /` + `GET /health`. Account
+        // metadata now lives in Postgres and is managed straight through
+        // `trade-control-accounts`, so these fail fast with a pointer
+        // rather than a bare 404 from the worker.
+        AccountCmd::List(_) | AccountCmd::Add(_) | AccountCmd::Delete(_) | AccountCmd::Test(_) => {
+            Err(eyre!(
+                "This functionality has moved to trade-control-accounts"
+            ))
         }
+        // `Names` is local-only (reads the operator history + the TN enc
+        // store), so it keeps working.
+        AccountCmd::Names => run_account_names(),
     }
 }
 
@@ -2126,173 +2099,6 @@ fn run_adopt_trade(args: AdoptTradeArgs) -> Result<()> {
     if !resp.ends_with('\n') {
         println!();
     }
-    Ok(())
-}
-
-fn run_account_test(args: AccountTestArgs) -> Result<()> {
-    let admin_key = load_admin_key(&args.common.admin_key_file)?;
-    let body = test_account(&args.common.endpoint, &admin_key, &args.name)?;
-    // `test_account` errored out if the worker rejected — a successful
-    // return means the name resolves. Cache it so the next `sign`
-    // offers it as an auto-complete option.
-    record_account_use(&args.name);
-    print!("{body}");
-    if !body.ends_with('\n') {
-        println!();
-    }
-    Ok(())
-}
-
-fn run_account_delete(args: AccountDeleteArgs) -> Result<()> {
-    let admin_key = load_admin_key(&args.common.admin_key_file)?;
-    if args.purge_secret {
-        // Compute the binding name before contacting the worker — if
-        // the broker arg is missing we want to fail fast rather than
-        // after the metadata is already gone.
-        let broker: BrokerKind = args
-            .broker
-            .ok_or_else(|| eyre!("--purge-secret requires --broker"))?
-            .into();
-        let binding = secret_binding_for(broker, &args.name);
-        let body = delete_account(&args.common.endpoint, &admin_key, &args.name)?;
-        print!("{body}");
-        if !body.ends_with('\n') {
-            println!();
-        }
-        eprintln!("purging credential secret {binding}…");
-        delete_secret(&binding, &args.common.worker_name)?;
-    } else {
-        let body = delete_account(&args.common.endpoint, &admin_key, &args.name)?;
-        print!("{body}");
-        if !body.ends_with('\n') {
-            println!();
-        }
-    }
-    Ok(())
-}
-
-fn run_account_add(args: AccountAddArgs) -> Result<()> {
-    use dialoguer::{Input, Password, theme::ColorfulTheme};
-
-    let admin_key = load_admin_key(&args.common.admin_key_file)?;
-    let broker: BrokerKind = args.broker.into();
-    let kind: AccountKind = args.kind.into();
-    let theme = ColorfulTheme::default();
-
-    // Enforce the intended order: create the broker account first
-    // (`tradenation account create <name>`), then register it here.
-    // Catches drift before we upload metadata to the worker — and lets
-    // us pull credentials from the local store instead of re-prompting.
-    if broker == BrokerKind::TradeNation {
-        require_local_tn_account(&args.name)?;
-    }
-
-    // Caps — only attach if either field was supplied; otherwise default
-    // skip-serialise keeps the wire form minimal.
-    let caps = trade_control_core::account::AccountCaps {
-        max_risk_pct: args.max_risk_pct,
-        max_open_positions: args.max_open_positions,
-    };
-
-    // OANDA: capture the sub-account id (lives on metadata, not as a
-    // secret — there's no per-account OANDA token, just one shared
-    // worker-wide `OANDA_API_KEY` that covers every sub-account).
-    // TradeNation: skipped; the account is identified by login creds.
-    let oanda_account_id = match broker {
-        BrokerKind::Oanda => {
-            let id = match args.account_id {
-                Some(id) => id,
-                None => Input::with_theme(&theme)
-                    .with_prompt("OANDA sub-account id (e.g. 101-011-XXXXXXXX-003)")
-                    .interact_text()
-                    .map_err(|e| eyre!("read account id: {e}"))?,
-            };
-            Some(id)
-        }
-        BrokerKind::TradeNation => None,
-    };
-
-    let metadata = AccountMetadata {
-        name: args.name.clone(),
-        broker,
-        kind,
-        caps,
-        oanda_account_id,
-    };
-
-    // Build credentials *first* so we fail before touching the worker
-    // if the operator aborts at the prompt. The credential half is the
-    // expensive thing to redo. OANDA accounts skip this entirely —
-    // they reuse the shared worker-wide `OANDA_API_KEY` and don't
-    // need a per-account secret.
-    let tn_creds = if args.no_secret || broker != BrokerKind::TradeNation {
-        None
-    } else {
-        // Default path: pull both username and password from the local
-        // TN store. Removes a class of "operator re-typed the password
-        // wrong" bugs that silently uploaded bad creds to Cloudflare.
-        // `--username` is an explicit override — operator wants to
-        // register a different identity than what's stored locally.
-        let (username, password) = match args.username {
-            Some(u) => {
-                let password = Password::with_theme(&theme)
-                    .with_prompt("TradeNation password")
-                    .interact()
-                    .map_err(|e| eyre!("read password: {e}"))?;
-                (u, password)
-            }
-            None => {
-                let acct = tradenation_api::accounts::get_account(&args.name)
-                    .map_err(|e| eyre!("reading local TN store for '{}': {e}", args.name))?;
-                eprintln!(
-                    "using local TN store credentials for '{}' (username={})",
-                    args.name, acct.username,
-                );
-                (acct.username, acct.password)
-            }
-        };
-        Some(Credentials::TradeNation(TradeNationCreds {
-            kind: args.kind.into(),
-            username,
-            password,
-        }))
-    };
-
-    // Write metadata first. If this fails (e.g. already-exists) we
-    // haven't touched secrets — the operator can re-run.
-    let add_body = add_account(&args.common.endpoint, &admin_key, &metadata)?;
-    // Cache the name for sign-flow auto-complete now that the worker
-    // has accepted it.
-    record_account_use(&args.name);
-    print!("{add_body}");
-    if !add_body.ends_with('\n') {
-        println!();
-    }
-
-    // Then push the credential to Secret Store (TradeNation only).
-    // The two-step shape is deliberate — a failure here leaves the
-    // operator with a metadata entry pointing at a missing secret,
-    // which `account test` will surface. They can then re-run with
-    // `--no-secret` skipped to retry the secret-put alone.
-    match (broker, tn_creds) {
-        (BrokerKind::TradeNation, Some(creds)) => {
-            let binding = secret_binding_for(broker, &args.name);
-            eprintln!("uploading credential secret {binding} via wrangler…");
-            put_secret(&binding, &args.common.worker_name, &creds)?;
-        }
-        (BrokerKind::TradeNation, None) => {
-            eprintln!(
-                "skipped credential secret (use `wrangler secret put {}` to set it)",
-                secret_binding_for(broker, &args.name)
-            );
-        }
-        (BrokerKind::Oanda, _) => {
-            eprintln!(
-                "oanda accounts share the worker-wide OANDA_API_KEY — no per-account secret needed"
-            );
-        }
-    }
-
     Ok(())
 }
 
