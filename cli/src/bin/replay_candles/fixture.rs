@@ -21,13 +21,12 @@
 use std::fs;
 use std::path::Path;
 
+use super::fill_sim::{SimOutcome, simulate_fill};
 use chrono::{DateTime, Utc};
 use color_eyre::eyre::{Context, Result};
 use serde::{Deserialize, Serialize};
 use trade_control_core::intent::{Action, Shell};
-use trade_control_engine::{
-    BidAskCandle as EngineCandle, Granularity, SimOutcome, TradePlan, simulate_fill,
-};
+use trade_control_engine::{BidAskCandle as EngineCandle, Granularity, TradePlan};
 
 use super::replay::{Fire, Replay};
 use trade_control_cli::replay_args::CandleSource;

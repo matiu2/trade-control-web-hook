@@ -22,14 +22,12 @@
 //! since the worker's real `run_close` (which the offline replay doesn't run)
 //! is what flattens the broker position live.
 
+use super::fill_sim::{breakeven_armed_at_resolved, sweep_reason, widened_stop_at_resolved};
 use chrono::{DateTime, Utc};
 use trade_control_core::intent::{Action, Direction, Intent, Resolved, ResolvedEntry, Shell};
 use trade_control_core::plan_sentiment::PlanSentiment;
 use trade_control_core::spread_blackout::elevated_threshold_pips;
-use trade_control_engine::{
-    BidAskCandle as EngineCandle, SweepReason, TradePlan, breakeven_armed_at_resolved,
-    sweep_reason, widened_stop_at_resolved,
-};
+use trade_control_engine::{BidAskCandle as EngineCandle, SweepReason, TradePlan};
 
 use super::brisbane::bne;
 use super::replay::{Fire, Replay};

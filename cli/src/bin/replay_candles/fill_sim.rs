@@ -681,10 +681,11 @@ fn find_fill<'a>(
 /// drift from the simulated outcome. `entry_spread_price` is the same trailing
 /// mean the report feeds `simulate_fill_windowed`.
 ///
-/// Pure and side-effect-free; the report calls it independently of
-/// [`simulate_fill`] so the `SimOutcome` enum (and every saved fixture) is
-/// untouched.
-pub fn breakeven_armed_at(
+/// Pure and side-effect-free. The bare (intent-resolving) form is now exercised
+/// only by this module's tests — production uses the `_resolved` variant — so it
+/// is `#[cfg(test)]`.
+#[cfg(test)]
+fn breakeven_armed_at(
     intent: &Intent,
     shell: &Shell,
     pip_size: f64,
@@ -976,8 +977,11 @@ pub struct SpreadWiden {
 ///
 /// Pure and side-effect-free. Returns `None` when the enter has no fill, exits
 /// before any qualifying spread bar, or no NY-close-edge bar's spread reaches
-/// the trigger.
-pub fn widened_stop_at(
+/// the trigger. The bare (intent-resolving) form is exercised only by this
+/// module's tests — production uses the `_resolved` variant — so it is
+/// `#[cfg(test)]`.
+#[cfg(test)]
+fn widened_stop_at(
     intent: &Intent,
     shell: &Shell,
     pip_size: f64,
@@ -1238,12 +1242,6 @@ fn book_reaches(c: &BidAskCandle, book: Book, level: f64, approach: Approach) ->
         Approach::FromBelow => hi >= level,
         Approach::FromAbove => lo <= level,
     }
-}
-
-/// The resolved trade direction — a small public helper so callers can label a
-/// fill's side without re-resolving the intent.
-pub fn direction_of(resolved: &Resolved) -> Direction {
-    resolved.direction
 }
 
 #[cfg(test)]

@@ -14,6 +14,7 @@
 
 use std::cell::RefCell;
 
+use super::fill_sim::{SimOutcome, simulate_fill_resolved_zoom};
 use chrono::{DateTime, Utc};
 use trade_control_core::broker::{
     AmendError, AttemptState, BidAskCandle, Broker, CancelError, Candle, CandleError, EntryError,
@@ -22,7 +23,7 @@ use trade_control_core::broker::{
 use trade_control_core::incoming::Verified;
 use trade_control_core::intent::{Direction, Intent, Resolved, ResolvedEntry, RiskBudget, Shell};
 use trade_control_core::spread_blackout::{elevated_threshold_pips, is_spread_hour};
-use trade_control_engine::{BidAskCandle as EngineCandle, SimOutcome, simulate_fill_resolved_zoom};
+use trade_control_engine::BidAskCandle as EngineCandle;
 
 use super::report::FillKind;
 
@@ -209,14 +210,14 @@ struct ArmedPlacement {
 /// when a coarse exit bar straddles both SL and TP (PR-2 sub-bar zoom). The
 /// replay driver pulls this once (e.g. M1 under an H1 plan) over the same span
 /// and hands it in; the broker filters it to the ambiguous bar's window through
-/// its [`trade_control_engine::SubBars`] impl. Empty ⇒ no zoom (every fill/exit
+/// its [`super::fill_sim::SubBars`] impl. Empty ⇒ no zoom (every fill/exit
 /// question degrades to the pessimistic-stop assumption, unchanged from PR-1).
 struct FinerSeries {
     /// Ascending finer bid/ask candles spanning the same window as `candles`.
     candles: Vec<EngineCandle>,
 }
 
-impl trade_control_engine::SubBars for FinerSeries {
+impl super::fill_sim::SubBars for FinerSeries {
     fn sub_bars(&self, start: DateTime<Utc>, end: DateTime<Utc>) -> Vec<EngineCandle> {
         self.candles
             .iter()
@@ -299,14 +300,14 @@ impl ReplayBroker {
         self
     }
 
-    /// The [`SubBars`](trade_control_engine::SubBars) provider the sim consults on
+    /// The [`SubBars`](super::fill_sim::SubBars) provider the sim consults on
     /// an ambiguous bar: the attached finer series, or [`NoZoom`] when none was
     /// supplied. Borrowing the field as a trait object keeps every fill/exit call
     /// site uniform (`simulate_fill_resolved_zoom(.., self.zoom())`).
-    fn zoom(&self) -> &dyn trade_control_engine::SubBars {
+    fn zoom(&self) -> &dyn super::fill_sim::SubBars {
         match &self.finer {
             Some(f) => f,
-            None => &trade_control_engine::NoZoom,
+            None => &super::fill_sim::NoZoom,
         }
     }
 
@@ -644,7 +645,7 @@ impl ReplayBroker {
             None => {
                 // Legacy/test path: no captured request → floor from the intent as
                 // the pre-"orders-are-state" code did (fire-bar spread).
-                trade_control_engine::apply_entry_spread_floor(
+                super::fill_sim::apply_entry_spread_floor(
                     &mut resolved,
                     self.pip_size,
                     forward,

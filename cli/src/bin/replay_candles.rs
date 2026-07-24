@@ -41,6 +41,7 @@ mod replay_candles {
     pub mod annotate;
     pub mod brisbane;
     pub mod candles;
+    pub mod fill_sim;
     pub mod fixture;
     pub mod granularity;
     pub mod instrument;
