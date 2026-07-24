@@ -9,7 +9,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
 use crate::app::App;
-use crate::plan::PlanDetail;
+use crate::plan::{EntryMode, PlanDetail};
 use crate::timeline::{derive_entry_ts, derive_outcome};
 
 pub fn render(f: &mut Frame, app: &App, area: Rect) {
@@ -66,7 +66,10 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
 }
 
 /// Format the entry mode + per-leg order types, e.g.
-/// `strategy-v2 (BCR stop + QM limit)`.
+/// `strategy-v2 (BCR stop + QM limit)`. When a BCR-family plan is missing a prep
+/// gate (`--skip-bcr` et al) the skip is flagged, e.g.
+/// `normal [skip-bcr] (BCR stop)` — so a "normal" enter that skipped
+/// break-and-close-then-retest isn't mislabelled as the full setup.
 fn entry_mode_str(detail: &PlanDetail) -> String {
     let legs = detail
         .order_types
@@ -74,10 +77,22 @@ fn entry_mode_str(detail: &PlanDetail) -> String {
         .map(|(leg, ot)| format!("{leg} {}", ot.label()))
         .collect::<Vec<_>>()
         .join(" + ");
-    if legs.is_empty() {
-        detail.entry_mode.label().to_string()
+    // The skip flag only applies to families that carry a BCR leg.
+    let has_bcr_leg = matches!(detail.entry_mode, EntryMode::Normal | EntryMode::StrategyV2);
+    let skip = if has_bcr_leg {
+        detail
+            .bcr_preps
+            .skip_slug()
+            .map(|s| format!(" [{s}]"))
+            .unwrap_or_default()
     } else {
-        format!("{} ({legs})", detail.entry_mode.label())
+        String::new()
+    };
+    let base = detail.entry_mode.label();
+    if legs.is_empty() {
+        format!("{base}{skip}")
+    } else {
+        format!("{base}{skip} ({legs})")
     }
 }
 
