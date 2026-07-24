@@ -282,11 +282,28 @@ confirmed_bar = barstate.isconfirmed
 valid_pair = confirmed_bar and has_pair_data and valid_candle[1] and highs_close and lows_close
 valid_triple = confirmed_bar and has_triple_data and valid_candle[1] and valid_candle[2] and triple_highs_close and triple_lows_close
 
-bullish_double_tweezer = detect_double_tweezers and valid_triple and curr_bullish_pinbar_tweezer and prev_bullish_pinbar and prev2_bullish_pinbar
-bearish_double_tweezer = detect_double_tweezers and valid_triple and curr_bearish_pinbar_tweezer and prev_bearish_pinbar and prev2_bearish_pinbar
+// ===== Pivot requirement for twin pinbars ====================================
+// A twin pinbar (tweezer/double-tweezer) must be a pivot, just like a single
+// pinbar (which requires low < low[1] / high > high[1]). The candle *before*
+// the whole pattern must sit outside the pattern's shared extreme: higher for
+// a bullish twin (rejection lows), lower for a bearish twin (rejection highs).
+// Pair spans bars N & N-1, so the bar before the pattern is N-2 (index [2]);
+// the trio spans N..N-2, so the bar before it is N-3 (index [3]).
+pair_low   = math.min(low, prev_low)
+pair_high  = math.max(high, prev_high)
+triple_low  = math.min(low, prev_low, low[2])
+triple_high = math.max(high, prev_high, high[2])
 
-bullish_tweezer = detect_tweezers and valid_pair and curr_bullish_pinbar_tweezer and prev_bullish_pinbar and not bullish_double_tweezer
-bearish_tweezer = detect_tweezers and valid_pair and curr_bearish_pinbar_tweezer and prev_bearish_pinbar and not bearish_double_tweezer
+bull_pair_pivot   = valid_candle[2] and pair_low  < low[2]
+bear_pair_pivot   = valid_candle[2] and pair_high > high[2]
+bull_triple_pivot = valid_candle[3] and triple_low  < low[3]
+bear_triple_pivot = valid_candle[3] and triple_high > high[3]
+
+bullish_double_tweezer = detect_double_tweezers and valid_triple and bull_triple_pivot and curr_bullish_pinbar_tweezer and prev_bullish_pinbar and prev2_bullish_pinbar
+bearish_double_tweezer = detect_double_tweezers and valid_triple and bear_triple_pivot and curr_bearish_pinbar_tweezer and prev_bearish_pinbar and prev2_bearish_pinbar
+
+bullish_tweezer = detect_tweezers and valid_pair and bull_pair_pivot and curr_bullish_pinbar_tweezer and prev_bullish_pinbar and not bullish_double_tweezer
+bearish_tweezer = detect_tweezers and valid_pair and bear_pair_pivot and curr_bearish_pinbar_tweezer and prev_bearish_pinbar and not bearish_double_tweezer
 
 // ===== Regular Engulfer Detection ============================================
 bullish_regular = detect_regular_engulfers and valid_inputs and prev_is_bearish and curr_is_bullish and open <= prev_close and close > prev_high and close_in_top_25
