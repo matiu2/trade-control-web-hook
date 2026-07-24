@@ -33,7 +33,24 @@
   deleted re-sim code. Confirmed post-rewrite the ONLY simulate_fill* callers are
   cli/src/bin/replay_candles/fixture.rs:185 + replay_broker.rs:706 (live worker
   calls NONE). So the S11 move is valid.
-- IN PROGRESS S11 (agent a2ee16f4099ab8889 scoping): move replay-only fill-walker
+- ✅ S11 DONE + COMMITTED: git mv engine/src/simulator.rs →
+  cli/src/bin/replay_candles/fill_sim.rs (WHOLE module — the worker links only
+  evaluate.rs, so the entire simulator was replay-only, not just the fill-walker).
+  Removed mod simulator + re-exports from engine/src/lib.rs. Replay imports from
+  super::fill_sim. Dropped dead direction_of; #[cfg(test)] on test-only
+  breakeven_armed_at/widened_stop_at. Engine tests 910→150, replay 103→153.
+  Worker+engine+workspace green, replay clippy clean, EUR/USD fix intact.
+
+## 🎉 REWRITE COMPLETE — S1–S11 all done. FINAL STEP: MERGE.
+Remaining: merge branch replay-stateful-broker → this repo's `main`, then bump the
+PARENT gitlink (trading-libraries) per CLAUDE.md submodule note:
+  cd trade-control-web-hook && git checkout main && git merge replay-stateful-broker
+  cd /home/matiu/projects/trading-libraries && git add trade-control-web-hook &&
+    git commit -m "bump trade-control-web-hook: stateful ReplayBroker" && git push
+Also consider merging main→staging + redeploy per the branch-is-env workflow.
+
+### (historical) S11 scoping (agent a2ee16f4099ab8889):
+- move replay-only fill-walker
   (simulate_fill, _windowed, _resolved, _resolved_zoom, SimOutcome, SubBars/NoZoom,
   find_fill, zoom_ambiguous_bar + private helpers) OUT of engine/src/simulator.rs
   into cli/src/bin/replay_candles/. KEEP shared primitives (resolve_effective_bracket,
