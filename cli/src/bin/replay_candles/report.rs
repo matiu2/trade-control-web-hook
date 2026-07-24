@@ -43,17 +43,6 @@ fn replay_report_tick(intent: &Intent, plan: &TradePlan) -> f64 {
     intent.tick_size.unwrap_or(plan.pip_size)
 }
 
-/// A fired `06-close-on-reversal` close, reduced to what the fill resolution
-/// needs: the bar it fired on and the price the position flattens at. The
-/// worker's `run_close` flattens at market when the reversal candle prints, so
-/// the bar's **close** is the faithful exit-price proxy (the engine fires the
-/// close on that bar's close, and the worker dispatches it that tick).
-#[derive(Debug, Clone, Copy)]
-pub struct CloseFire {
-    pub at: DateTime<Utc>,
-    pub price: f64,
-}
-
 /// Whether the worker's `allow_close` gate would let this close flatten the
 /// position. The live worker runs the shared
 /// [`trade_control_core::allow_close_gate::evaluate`] on every `run_close`; a
@@ -71,29 +60,6 @@ fn close_gate_passes(fire: &Fire) -> bool {
         trade_control_core::allow_close_gate::evaluate(intent, &shell),
         trade_control_core::allow_close_gate::AllowCloseOutcome::Proceed
     )
-}
-
-/// Every `Action::Close` fire in the replay **whose `allow_close` gate passes**,
-/// in fire order, reduced to [`CloseFire`]s. The fill resolution consults these
-/// to exit an open position on a reversal candle — the engine now fires the
-/// close (a `PinePattern` guard), but the pure per-enter `simulate_fill` only
-/// knows SL/TP, so the replay must apply the close itself. A close the
-/// `allow_close` gate would block is dropped here so the position stays open
-/// (matching the live worker); the blocked close still renders its own
-/// `BLOCKED` line via [`render_fire`].
-/// Collect the gate-passing `Action::Close` reversal fires over a fire slice —
-/// so the replay loop can build the reversal-close set (to hand to
-/// `broker.realized_outcome`) before the `Replay` value is assembled.
-pub fn collect_close_fires_from(fires: &[Fire]) -> Vec<CloseFire> {
-    fires
-        .iter()
-        .filter(|f| f.fired.intent.action == Action::Close)
-        .filter(|f| close_gate_passes(f))
-        .map(|f| CloseFire {
-            at: f.fired.candle.time,
-            price: f.fired.candle.c,
-        })
-        .collect()
 }
 
 /// How a position resolved, for annotation purposes. The first three are
@@ -1268,17 +1234,18 @@ mod tests {
             signal: None,
         };
         // Mirror the replay loop: a placed enter gets its bracket + outcome from
-        // the broker ledger, which the report then reads (PR 4b-2). A rejected/
-        // other gate outcome leaves both `None` — rendered from gate state.
+        // the broker's HELD ledger, which the report then reads. A rejected/other
+        // gate outcome leaves both `None` — rendered from gate state.
         let (placed_bracket, realized) = if matches!(gate_outcome, EnterGateOutcome::Placed { .. })
         {
             let broker =
                 crate::replay_candles::replay_broker::ReplayBroker::new(forward.clone(), 0.0001);
             let shell = Shell::from_candle(&fired.candle);
-            broker.record_order("e1".into(), fired.intent.clone(), shell, forward.clone());
+            broker.record_attempt("e1".into(), fired.intent.clone(), shell, None);
+            // held_realized_outcome advances the held state to the window end.
             (
                 broker.placed_bracket("e1"),
-                broker.realized_outcome("e1", &[]),
+                broker.held_realized_outcome("e1"),
             )
         } else {
             (None, None)

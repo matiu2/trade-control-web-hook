@@ -318,15 +318,11 @@ pub async fn run(
         // THEN the cron evaluates). Bound at the current bar's OPEN time
         // (`candles[i].time`), NOT `now` (the bar close = next bar's open), so the
         // fill test doesn't peek at the next bar's opening price and fill an order a
-        // bar early. This matches the re-sim's dispatch-time lookups, which bound at
-        // the firing bar's open. `set_as_of` to the same instant so the shadow-parity
-        // `resolve` compares like-for-like; the lifecycle's `set_as_of(now)` below
-        // restores the bar-close clock.
+        // bar early. `set_as_of` to the same instant so held reads bound there; the
+        // lifecycle's `set_as_of(now)` below restores the bar-close clock.
         let bar_open = candles[i].time;
         replay_broker.set_as_of(bar_open);
         replay_broker.advance(bar_open);
-        #[cfg(debug_assertions)]
-        replay_broker.debug_assert_held_matches_resim();
 
         // Snapshot the pre-tick state so `--verbose` can report exactly what the
         // engine changed this bar — phase moves and the break-and-close / retest
@@ -558,33 +554,17 @@ pub async fn run(
                 mark_superseded(&mut fires, &replay_broker);
             }
 
-            // The fill simulator walks candles at/after the firing bar.
+            // The forward candles at/after the firing bar (kept on the Fire for the
+            // report's forward-path lines). The held broker owns the fill/exit
+            // outcome via `advance()`/`held_realized_outcome` — no forward-geometry
+            // ledger to attach (S8: the old `record_order` ledger path is gone).
             let forward = candles[i..].to_vec();
-            // Attach the forward-path geometry to the placed order so the broker
-            // owns its fill/exit outcome (PR 4b-2). The dispatch's `place_entry`
-            // already recorded the attempt under this order id — WITH the concrete
-            // placed levels it captured from the `EntryRequest` — so `record_order`
-            // just upgrades it in place with the forward path. The report then
-            // reads `broker.realized_outcome(order_id, closes)`, which walks the
-            // stored placed stop (no trailing-spread re-derivation). The shell must
-            // be the SAME one the dispatch armed — rebuild it the identical way
-            // (signal-folded for an H&S Pine fire, plain otherwise).
+            // Read back the concrete placed bracket so the report's display lines
+            // annotate the same floored stop the broker rests on.
             let placed_bracket = if let EnterGateOutcome::Placed {
                 order_id: Some(order_id),
             } = &gate_outcome
             {
-                let shell = match &fired.signal {
-                    Some(sig) => Shell::from_candle_and_signal(&fired.candle, sig),
-                    None => Shell::from_candle(&fired.candle),
-                };
-                replay_broker.record_order(
-                    order_id.clone(),
-                    fired.intent.clone(),
-                    shell,
-                    forward.clone(),
-                );
-                // Read back the concrete placed bracket so the report's display
-                // lines annotate the same floored stop the broker rests on.
                 replay_broker.placed_bracket(order_id)
             } else {
                 None
