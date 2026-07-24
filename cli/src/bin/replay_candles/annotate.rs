@@ -195,6 +195,7 @@ fn outcome_label(kind: FillKind) -> &'static str {
         FillKind::StoppedOut => "SL",
         FillKind::TookProfit => "TP",
         FillKind::ClosedOnReversal => "reversal",
+        FillKind::ClosedAtExpiry => "expiry",
         FillKind::NeverFilled => "no-fill",
         FillKind::Declined => "declined",
         FillKind::GateBlocked => "gate-blocked",

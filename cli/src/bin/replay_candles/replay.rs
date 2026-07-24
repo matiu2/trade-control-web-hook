@@ -24,9 +24,10 @@ use trade_control_core::signals::{
     DetectFlags, DetectorConfig, atr_length_for, detect_at, first_confirmed_signal_at, wilder_atr,
 };
 
-use super::replay_broker::{RealizedOutcome, ReplayBroker};
+use super::replay_broker::{ExitReason, RealizedOutcome, ReplayBroker};
 use super::verbose::{BarTrace, DetectedMark};
 use trade_control_cli::replay_args::DetectorMarkConfig;
+use trade_control_core::broker::Broker;
 
 /// The entry decision the **real** dispatch (`trade_control_core::dispatch::run_enter`)
 /// reached for one fired `enter`, carried on the [`Fire`] so the report reads it
@@ -311,6 +312,18 @@ pub async fn run(
             "tick: evaluating live bar"
         );
 
+        // Advance the broker's held state to THIS bar before the engine tick, so a
+        // fill/exit that happened by now is reflected before the engine can dispatch
+        // a close against an open position (the live order: broker observes the bar,
+        // THEN the cron evaluates). Bound at the current bar's OPEN time
+        // (`candles[i].time`), NOT `now` (the bar close = next bar's open), so the
+        // fill test doesn't peek at the next bar's opening price and fill an order a
+        // bar early. `set_as_of` to the same instant so held reads bound there; the
+        // lifecycle's `set_as_of(now)` below restores the bar-close clock.
+        let bar_open = candles[i].time;
+        replay_broker.set_as_of(bar_open);
+        replay_broker.advance(bar_open);
+
         // Snapshot the pre-tick state so `--verbose` can report exactly what the
         // engine changed this bar — phase moves and the break-and-close / retest
         // stamps are silent in the fire report (retest never even fires an
@@ -463,6 +476,51 @@ pub async fn run(
                         );
                     }
                 }
+                // A reversal-close: flatten the open position at market (the bar's
+                // close), exactly as the live worker's `run_close` does — but ONLY
+                // if the shared `allow_close` gate passes (golden/confirmed +
+                // script). The engine already applied the S/R-band / news-window
+                // gate before firing this close (`close_windows_pass`), so a fired
+                // Close means the window passed; the `allow_close` candle-quality
+                // gate is the remaining check. A blocked gate leaves the position
+                // OPEN (matches live). S5: this replaces the old post-loop
+                // `apply_reversal_close` pass with a real broker flatten at the bar
+                // the engine dispatches the close.
+                Action::Close => {
+                    let shell = match &fired.signal {
+                        Some(sig) => Shell::from_candle_and_signal(&fired.candle, sig),
+                        None => Shell::from_candle(&fired.candle),
+                    };
+                    let gate =
+                        trade_control_core::allow_close_gate::evaluate(&fired.intent, &shell);
+                    if matches!(
+                        gate,
+                        trade_control_core::allow_close_gate::AllowCloseOutcome::Proceed
+                    ) {
+                        replay_broker.set_close_reason(ExitReason::Reversal);
+                        replay_broker
+                            .close_positions(&fired.intent.instrument)
+                            .await;
+                    }
+                }
+                // The trade-expiry veto at `ClosePositions` level flattens any open
+                // position at wall-clock expiry AND blocks entries (the entry block
+                // is the plan going `Done`, handled by the engine). Here we do the
+                // broker-side flatten the live ClosePositions veto performs via
+                // `broker.close_positions`. A non-ClosePositions veto (StopNextEntry,
+                // e.g. too-low) leaves the open position alone — no flatten.
+                Action::Veto | Action::Invalidate
+                    if fired.intent.level
+                        == Some(trade_control_core::intent::VetoLevel::ClosePositions) =>
+                {
+                    replay_broker.set_close_reason(ExitReason::Expiry);
+                    replay_broker
+                        .cancel_pending_for_instrument(&fired.intent.instrument)
+                        .await;
+                    replay_broker
+                        .close_positions(&fired.intent.instrument)
+                        .await;
+                }
                 _ => {}
             }
 
@@ -496,33 +554,17 @@ pub async fn run(
                 mark_superseded(&mut fires, &replay_broker);
             }
 
-            // The fill simulator walks candles at/after the firing bar.
+            // The forward candles at/after the firing bar (kept on the Fire for the
+            // report's forward-path lines). The held broker owns the fill/exit
+            // outcome via `advance()`/`held_realized_outcome` — no forward-geometry
+            // ledger to attach (S8: the old `record_order` ledger path is gone).
             let forward = candles[i..].to_vec();
-            // Attach the forward-path geometry to the placed order so the broker
-            // owns its fill/exit outcome (PR 4b-2). The dispatch's `place_entry`
-            // already recorded the attempt under this order id — WITH the concrete
-            // placed levels it captured from the `EntryRequest` — so `record_order`
-            // just upgrades it in place with the forward path. The report then
-            // reads `broker.realized_outcome(order_id, closes)`, which walks the
-            // stored placed stop (no trailing-spread re-derivation). The shell must
-            // be the SAME one the dispatch armed — rebuild it the identical way
-            // (signal-folded for an H&S Pine fire, plain otherwise).
+            // Read back the concrete placed bracket so the report's display lines
+            // annotate the same floored stop the broker rests on.
             let placed_bracket = if let EnterGateOutcome::Placed {
                 order_id: Some(order_id),
             } = &gate_outcome
             {
-                let shell = match &fired.signal {
-                    Some(sig) => Shell::from_candle_and_signal(&fired.candle, sig),
-                    None => Shell::from_candle(&fired.candle),
-                };
-                replay_broker.record_order(
-                    order_id.clone(),
-                    fired.intent.clone(),
-                    shell,
-                    forward.clone(),
-                );
-                // Read back the concrete placed bracket so the report's display
-                // lines annotate the same floored stop the broker rests on.
                 replay_broker.placed_bracket(order_id)
             } else {
                 None
@@ -574,21 +616,20 @@ pub async fn run(
         }
     }
 
-    // PR 4b-2: the report reads each placed enter's outcome from the broker
-    // ledger. The reversal-close set is plan-wide (a `06-close-on-reversal` can
-    // flatten a position that filled bars earlier), so it's only known now that
-    // every fire is collected. Build it, then ask the broker to realize each
-    // placed order against it and stash the outcome on the fire. A superseded
-    // order (its resting order cancelled by a later entry) is skipped — the
-    // report renders it as cancelled, not a fill, exactly as before.
-    let closes = super::report::collect_close_fires_from(&fires);
+    // S5b: the report reads each placed enter's outcome from the broker's HELD
+    // ledger (the single source of truth) — `held_realized_outcome`. The held
+    // model already applied fills, SL/TP, reversal-closes, and the expiry flatten
+    // AT their real bars during the loop, so there's no post-loop reversal pass
+    // to build: a reversal/expiry close is already recorded in `closed`. A
+    // superseded order (its resting order cancelled by a later entry) is skipped —
+    // the report renders it as cancelled, not a fill.
     for fire in fires.iter_mut() {
         if fire.superseded {
             continue;
         }
         let order_id = fire.order_id().map(str::to_owned);
         if let Some(order_id) = order_id {
-            fire.realized = replay_broker.realized_outcome(&order_id, &closes);
+            fire.realized = replay_broker.held_realized_outcome(&order_id);
         }
     }
 

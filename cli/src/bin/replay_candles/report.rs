@@ -22,14 +22,12 @@
 //! since the worker's real `run_close` (which the offline replay doesn't run)
 //! is what flattens the broker position live.
 
+use super::fill_sim::{breakeven_armed_at_resolved, sweep_reason, widened_stop_at_resolved};
 use chrono::{DateTime, Utc};
 use trade_control_core::intent::{Action, Direction, Intent, Resolved, ResolvedEntry, Shell};
 use trade_control_core::plan_sentiment::PlanSentiment;
 use trade_control_core::spread_blackout::elevated_threshold_pips;
-use trade_control_engine::{
-    BidAskCandle as EngineCandle, SweepReason, TradePlan, breakeven_armed_at_resolved,
-    sweep_reason, widened_stop_at_resolved,
-};
+use trade_control_engine::{BidAskCandle as EngineCandle, SweepReason, TradePlan};
 
 use super::brisbane::bne;
 use super::replay::{Fire, Replay};
@@ -41,17 +39,6 @@ use trade_control_cli::replay_args::DetectorMarkConfig;
 /// match what the worker would place. See `simulator::replay_tick`.
 fn replay_report_tick(intent: &Intent, plan: &TradePlan) -> f64 {
     intent.tick_size.unwrap_or(plan.pip_size)
-}
-
-/// A fired `06-close-on-reversal` close, reduced to what the fill resolution
-/// needs: the bar it fired on and the price the position flattens at. The
-/// worker's `run_close` flattens at market when the reversal candle prints, so
-/// the bar's **close** is the faithful exit-price proxy (the engine fires the
-/// close on that bar's close, and the worker dispatches it that tick).
-#[derive(Debug, Clone, Copy)]
-pub struct CloseFire {
-    pub at: DateTime<Utc>,
-    pub price: f64,
 }
 
 /// Whether the worker's `allow_close` gate would let this close flatten the
@@ -73,29 +60,6 @@ fn close_gate_passes(fire: &Fire) -> bool {
     )
 }
 
-/// Every `Action::Close` fire in the replay **whose `allow_close` gate passes**,
-/// in fire order, reduced to [`CloseFire`]s. The fill resolution consults these
-/// to exit an open position on a reversal candle — the engine now fires the
-/// close (a `PinePattern` guard), but the pure per-enter `simulate_fill` only
-/// knows SL/TP, so the replay must apply the close itself. A close the
-/// `allow_close` gate would block is dropped here so the position stays open
-/// (matching the live worker); the blocked close still renders its own
-/// `BLOCKED` line via [`render_fire`].
-/// Collect the gate-passing `Action::Close` reversal fires over a fire slice —
-/// so the replay loop can build the reversal-close set (to hand to
-/// `broker.realized_outcome`) before the `Replay` value is assembled.
-pub fn collect_close_fires_from(fires: &[Fire]) -> Vec<CloseFire> {
-    fires
-        .iter()
-        .filter(|f| f.fired.intent.action == Action::Close)
-        .filter(|f| close_gate_passes(f))
-        .map(|f| CloseFire {
-            at: f.fired.candle.time,
-            price: f.fired.candle.c,
-        })
-        .collect()
-}
-
 /// How a position resolved, for annotation purposes. The first three are
 /// *taken* (filled) outcomes; the last two are *not-taken* — an order that
 /// the price path never filled, or an entry the worker declined to place.
@@ -112,9 +76,21 @@ pub enum FillKind {
     /// Filled, then flattened by a `06-close-on-reversal` fire (a confirming
     /// opposite-direction reversal candle inside the SR band) before SL/TP.
     ClosedOnReversal,
+    /// Filled, then flattened by the trade-expiry `close-positions` veto at
+    /// wall-clock expiry (the live worker's ClosePositions veto flattens any
+    /// still-open position at market when the plan expires). Booked at the
+    /// expiry candle's close.
+    ClosedAtExpiry,
     /// A pending order that never triggered within the window. Not taken.
     NeverFilled,
-    /// An entry the worker declined to place (entry past a gate level). Not taken.
+    /// An entry the worker declined to place (entry past a baked at-entry level
+    /// veto, Bug #12). Not taken. Retained for the report render path + the
+    /// fixture `FillOutcome` mirror. In the stateful-broker model a decline is a
+    /// pre-broker `run_enter` rejection surfaced via `rejected_reason` →
+    /// `GateBlocked`, so `held_realized_outcome` no longer constructs this kind
+    /// (an order past a level never becomes a held resting order); the variant
+    /// stays so the render arm + `is_taken` classification remain total.
+    #[allow(dead_code)]
     Declined,
     /// An entry the worker's pre-broker gate would have rejected — the
     /// `allow_entry` script returned false/errored, the candle-quality
@@ -133,7 +109,11 @@ impl FillKind {
     pub fn is_taken(self) -> bool {
         matches!(
             self,
-            Self::Open | Self::StoppedOut | Self::TookProfit | Self::ClosedOnReversal
+            Self::Open
+                | Self::StoppedOut
+                | Self::TookProfit
+                | Self::ClosedOnReversal
+                | Self::ClosedAtExpiry
         )
     }
 }
@@ -351,6 +331,9 @@ pub fn render(
         if tally.reversal_closes > 0 {
             out.push_str(&format!("  REV: {}", tally.reversal_closes));
         }
+        if tally.expiry_closes > 0 {
+            out.push_str(&format!("  EXP: {}", tally.expiry_closes));
+        }
         out.push_str(&tally.summary_line());
     }
     out.push('\n');
@@ -402,6 +385,7 @@ struct Tally {
     wins: usize,
     losses: usize,
     reversal_closes: usize,
+    expiry_closes: usize,
     net_r: f64,
     account: f64,
 }
@@ -412,6 +396,7 @@ impl Tally {
             wins: 0,
             losses: 0,
             reversal_closes: 0,
+            expiry_closes: 0,
             net_r: 0.0,
             account: START_ACCOUNT,
         }
@@ -786,6 +771,23 @@ fn render_fire(
                 at: result.until,
                 note: format!(
                     "{ev} CLOSED ON REVERSAL → {}{r}",
+                    fmt_price(exit_price, plan.pip_size)
+                ),
+                close: bar_close(&fire.forward, result.until),
+            });
+        }
+        FillKind::ClosedAtExpiry => {
+            events.push(EntryEvent {
+                at: result.fill_at,
+                note: format!("{ev} FILLED @ {}", fmt_price(entry_price, plan.pip_size)),
+                close: bar_close(&fire.forward, result.fill_at),
+            });
+            tally.expiry_closes += 1;
+            let r = book_r(tally, ledger_stop, entry_price, exit_price);
+            events.push(EntryEvent {
+                at: result.until,
+                note: format!(
+                    "{ev} CLOSED AT EXPIRY → {}{r}",
                     fmt_price(exit_price, plan.pip_size)
                 ),
                 close: bar_close(&fire.forward, result.until),
@@ -1237,17 +1239,18 @@ mod tests {
             signal: None,
         };
         // Mirror the replay loop: a placed enter gets its bracket + outcome from
-        // the broker ledger, which the report then reads (PR 4b-2). A rejected/
-        // other gate outcome leaves both `None` — rendered from gate state.
+        // the broker's HELD ledger, which the report then reads. A rejected/other
+        // gate outcome leaves both `None` — rendered from gate state.
         let (placed_bracket, realized) = if matches!(gate_outcome, EnterGateOutcome::Placed { .. })
         {
             let broker =
                 crate::replay_candles::replay_broker::ReplayBroker::new(forward.clone(), 0.0001);
             let shell = Shell::from_candle(&fired.candle);
-            broker.record_order("e1".into(), fired.intent.clone(), shell, forward.clone());
+            broker.record_attempt("e1".into(), fired.intent.clone(), shell, None);
+            // held_realized_outcome advances the held state to the window end.
             (
                 broker.placed_bracket("e1"),
-                broker.realized_outcome("e1", &[]),
+                broker.held_realized_outcome("e1"),
             )
         } else {
             (None, None)

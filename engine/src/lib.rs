@@ -64,13 +64,12 @@ pub use evaluate::{
     evaluate_controls_only, evaluate_plan, initial_phase, seed_plan_state,
 };
 
-mod simulator;
-pub use simulator::{
-    EntryFloor, NoZoom, SimOutcome, SpreadWiden, SubBars, apply_entry_spread_floor,
-    breakeven_armed_at, breakeven_armed_at_resolved, direction_of, simulate_fill,
-    simulate_fill_resolved, simulate_fill_resolved_zoom, simulate_fill_windowed, sweep_reason,
-    widened_stop_at, widened_stop_at_resolved,
-};
+// The fill *simulator* (fill-walker, break-even/spread-widen reconstruction,
+// SL-vs-spread floor, sweep-reason) is REPLAY-ONLY — the live worker links only
+// `evaluate.rs` from this engine, never the simulator. So it lives in the replay
+// tool now (`cli/src/bin/replay_candles/fill_sim.rs`), not in this shared engine.
+// `SweepReason` is a core type the replay's sweep_reason returns; re-export it
+// here for any consumer that named it via the engine (harmless if unused).
 pub use trade_control_core::sweep_gate::SweepReason;
 
 #[cfg(test)]

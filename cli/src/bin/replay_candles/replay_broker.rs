@@ -14,6 +14,7 @@
 
 use std::cell::RefCell;
 
+use super::fill_sim::{SimOutcome, simulate_fill_resolved_zoom};
 use chrono::{DateTime, Utc};
 use trade_control_core::broker::{
     AmendError, AttemptState, BidAskCandle, Broker, CancelError, Candle, CandleError, EntryError,
@@ -22,9 +23,9 @@ use trade_control_core::broker::{
 use trade_control_core::incoming::Verified;
 use trade_control_core::intent::{Direction, Intent, Resolved, ResolvedEntry, RiskBudget, Shell};
 use trade_control_core::spread_blackout::{elevated_threshold_pips, is_spread_hour};
-use trade_control_engine::{BidAskCandle as EngineCandle, SimOutcome, simulate_fill_resolved_zoom};
+use trade_control_engine::BidAskCandle as EngineCandle;
 
-use super::report::{CloseFire, FillKind};
+use super::report::FillKind;
 
 /// One placed attempt the gate may later ask about, with the geometry needed to
 /// re-simulate it. `order_id` is what [`Broker::place_entry`] handed back (the
@@ -50,18 +51,6 @@ struct PlacedAttempt {
     /// cancelled attempt resolves to [`AttemptState::Cancelled`] regardless of
     /// the price path.
     cancelled: bool,
-    /// The position-ledger geometry (PR 4b-1): the forward candle path and the
-    /// entry-spread statistic this order's *realized* outcome is simulated
-    /// against. Present only when the attempt was recorded through
-    /// [`ReplayBroker::record_order`] (the ledger path); the plain
-    /// retry-gate `record_attempt` leaves it `None` and only the `as_of`-bounded
-    /// [`ReplayBroker::resolve`] answers apply. Kept separate so the retry-gate
-    /// state answers (`lookup_attempt_state` etc., which bound at `as_of`) are
-    /// untouched by the ledger, which walks the FULL forward path like the report.
-    //
-    // Consumed by the report (4b-2): the loop attaches geometry via `record_order`
-    // and the report reads `realized_outcome` instead of re-simulating the fill.
-    ledger: Option<LedgerGeometry>,
 }
 
 /// The CONCRETE order levels the broker placed an attempt at — the floored stop,
@@ -72,34 +61,87 @@ struct PlacedAttempt {
 /// floored `stop_loss` before building the request, so `stop_loss` here is the
 /// final placed level.)
 #[derive(Clone)]
-struct PlacedLevels {
+pub(crate) struct PlacedLevels {
     entry: ResolvedEntry,
     stop_loss: f64,
     take_profit: f64,
 }
 
-/// The per-order geometry the position ledger advances a realized outcome
-/// against — the forward bid/ask path from the fire bar (the fill sim input and
-/// the `until` window-end anchor). The SL/TP/entry LEVELS no longer live here;
-/// they're the order's stored [`PlacedLevels`], so the ledger walks the same
-/// placed stop the retry-gate `resolve` does (no trailing-spread re-derivation —
-/// replay↔live divergence #4). The reversal-close fires are **not** stored here —
-/// they're a plan-wide fire-set passed to [`ReplayBroker::realized_outcome`].
+// ---------------------------------------------------------------------------
+// Stateful held model (S1) — the broker HOLDS position state and mutates it as
+// bars advance, instead of re-simulating each placed order's price path on every
+// query. This is the single source of truth the engine queries exactly like the
+// live worker queries the real broker: `close_positions` actually removes a held
+// position (no longer a no-op stub), so reversal- and expiry-closes flatten a
+// position at the bar the engine dispatches them — killing the two-brain bug
+// class (a same-bar fill+reversal, a reversal-closed slot wrongly reported open).
+//
+// Each held record stores the CONCRETE placed levels (the floored stop verbatim)
+// so every fill/exit test walks the same bracket the retry-gate saw — preserving
+// "orders are state" / replay↔live divergence #4 in the held model.
+// ---------------------------------------------------------------------------
+
+/// A resting order the broker holds: placed by `place_entry`, not yet triggered.
+/// Carries everything a later bar needs to test the trigger touch and, on fill,
+/// promote it to a [`HeldPosition`] against the same stored levels.
 #[derive(Clone)]
-struct LedgerGeometry {
-    /// Bid/ask candles at/after the fire bar (ascending) — the fill sim input
-    /// and the `until` window-end anchor (`forward.last()`).
-    forward: Vec<EngineCandle>,
+struct HeldOrder {
+    order_id: String,
+    intent: Intent,
+    shell: Shell,
+    /// The floored levels captured from the `EntryRequest` (as [`PlacedLevels`]),
+    /// or `None` for the direct-record/legacy path (floored from the intent).
+    placed: Option<PlacedLevels>,
+    /// Set when the spread-hour lifecycle cancels this resting order (supersede /
+    /// cancel-and-replace). A cancelled resting order fills nothing and appears in
+    /// neither the open nor the pending list; a restore re-activates it.
+    cancelled: bool,
 }
 
-/// A reversal-close that flattened an open ledger position before its SL/TP —
-/// the [`apply_reversal_close`] verdict, carrying the fill it applies to and the
-/// close bar/price. Mirrors `report.rs`'s private `ReplayOutcome::ClosedOnReversal`.
-struct ReversalClose {
-    fill_at: DateTime<Utc>,
+/// A filled position the broker holds: promoted from a [`HeldOrder`] when a bar
+/// triggered its entry, not yet closed. Removed (→ [`ClosedTrade`]) on an SL/TP
+/// touch, a reversal-close, or an expiry flatten.
+#[derive(Clone)]
+struct HeldPosition {
+    order_id: String,
+    intent: Intent,
+    shell: Shell,
+    /// The bracket the position rests on — the floored stop, take-profit, and the
+    /// entry the fill landed at. Never re-derived (divergence #4).
+    placed: Option<PlacedLevels>,
+    direction: Direction,
     entry_price: f64,
+    fill_at: DateTime<Utc>,
+}
+
+/// Why a held position left the book — drives the report's exit label and R sign.
+#[derive(Clone, Copy, PartialEq)]
+pub enum ExitReason {
+    /// Stop-loss touched (or SL→break-even scratch when `exit_price ≈ entry`).
+    StoppedOut,
+    /// Take-profit touched.
+    TookProfit,
+    /// A gate-passing reversal-close (`06-/07-close-on-…`) flattened it.
+    Reversal,
+    /// The trade-expiry `close-positions` veto flattened it at wall-clock expiry.
+    Expiry,
+}
+
+/// A closed position in the broker's P&L ledger — the terminal record the report
+/// reads instead of a post-loop re-simulation pass. Entry/exit/reason are enough
+/// to reconstruct R against the stored floored stop.
+#[derive(Clone)]
+struct ClosedTrade {
+    order_id: String,
+    direction: Direction,
+    entry_price: f64,
+    /// The floored stop the position rested on — R is `realized_r(entry, stop, exit)`.
+    stop_loss: f64,
+    take_profit: f64,
+    fill_at: DateTime<Utc>,
     exit_at: DateTime<Utc>,
     exit_price: f64,
+    reason: ExitReason,
 }
 
 /// Exact equality of two resolved entries — same variant, same price. Used to
@@ -116,52 +158,6 @@ fn entries_match(a: &ResolvedEntry, b: &ResolvedEntry) -> bool {
         ) => x == y,
         _ => false,
     }
-}
-
-/// Whether a `06-close-on-reversal` fire flattens this outcome's open position
-/// before its own SL/TP — a **verbatim** lift of `report.rs::apply_reversal_close`
-/// so the ledger's reversal handling matches the report bit-for-bit. A close bar
-/// after the fill (and strictly before any SL/TP exit) closes the position; the
-/// earliest such close wins. `None` ⇒ no reversal applies (untaken outcomes, or a
-/// close that lands outside the open window).
-fn apply_reversal_close(outcome: &SimOutcome, closes: &[CloseFire]) -> Option<ReversalClose> {
-    let (fill_at, entry_price, exit_limit) = match outcome {
-        SimOutcome::FilledOpen {
-            fill_at,
-            entry_price,
-        } => (*fill_at, *entry_price, None),
-        SimOutcome::StoppedOut {
-            fill_at,
-            entry_price,
-            exit_at,
-            ..
-        }
-        | SimOutcome::TookProfit {
-            fill_at,
-            entry_price,
-            exit_at,
-            ..
-        } => (*fill_at, *entry_price, Some(*exit_at)),
-        // No open position to close.
-        SimOutcome::NeverFilled | SimOutcome::Declined { .. } | SimOutcome::Unresolved(_) => {
-            return None;
-        }
-    };
-    closes
-        .iter()
-        .filter(|c| c.at > fill_at)
-        .filter(|c| match exit_limit {
-            // Only a reversal strictly before the SL/TP bar pre-empts it.
-            Some(exit_at) => c.at < exit_at,
-            None => true,
-        })
-        .min_by_key(|c| c.at)
-        .map(|c| ReversalClose {
-            fill_at,
-            entry_price,
-            exit_at: c.at,
-            exit_price: c.price,
-        })
 }
 
 /// A placed order's *realized* outcome, driven from the position ledger — the
@@ -214,14 +210,14 @@ struct ArmedPlacement {
 /// when a coarse exit bar straddles both SL and TP (PR-2 sub-bar zoom). The
 /// replay driver pulls this once (e.g. M1 under an H1 plan) over the same span
 /// and hands it in; the broker filters it to the ambiguous bar's window through
-/// its [`trade_control_engine::SubBars`] impl. Empty ⇒ no zoom (every fill/exit
+/// its [`super::fill_sim::SubBars`] impl. Empty ⇒ no zoom (every fill/exit
 /// question degrades to the pessimistic-stop assumption, unchanged from PR-1).
 struct FinerSeries {
     /// Ascending finer bid/ask candles spanning the same window as `candles`.
     candles: Vec<EngineCandle>,
 }
 
-impl trade_control_engine::SubBars for FinerSeries {
+impl super::fill_sim::SubBars for FinerSeries {
     fn sub_bars(&self, start: DateTime<Utc>, end: DateTime<Utc>) -> Vec<EngineCandle> {
         self.candles
             .iter()
@@ -251,6 +247,22 @@ pub struct ReplayBroker {
     /// `simulate_fill_resolved_zoom`, so an ambiguous SL/TP bar is disambiguated
     /// by finer candles when available and pessimistic-stopped otherwise.
     finer: Option<FinerSeries>,
+
+    // --- Stateful held model (S1). Mutated by `advance()` per bar and by
+    // `place_entry`/`close_positions`; read by `list_open_positions` /
+    // `lookup_attempt_state` / `list_pending_orders` and the P&L readout. During
+    // the migration these coexist with the `placed` re-sim path (S3 asserts they
+    // agree); the re-sim path is deleted at S8.
+    /// Resting orders placed but not yet triggered.
+    resting: RefCell<Vec<HeldOrder>>,
+    /// Filled positions not yet closed.
+    open: RefCell<Vec<HeldPosition>>,
+    /// The P&L ledger — closed positions in exit order.
+    closed: RefCell<Vec<ClosedTrade>>,
+    /// The reason the NEXT `close_positions` call records (Reversal by default;
+    /// the loop sets Expiry before dispatching the trade-expiry veto). Set via
+    /// `set_close_reason` right before the engine dispatches a close.
+    close_reason: RefCell<ExitReason>,
 }
 
 impl ReplayBroker {
@@ -263,7 +275,18 @@ impl ReplayBroker {
             placed: RefCell::new(Vec::new()),
             armed: RefCell::new(None),
             finer: None,
+            resting: RefCell::new(Vec::new()),
+            open: RefCell::new(Vec::new()),
+            closed: RefCell::new(Vec::new()),
+            close_reason: RefCell::new(ExitReason::Reversal),
         }
+    }
+
+    /// Set the reason the next `close_positions` records. The loop calls this
+    /// right before the engine dispatches a close: `Reversal` for a
+    /// reversal-close fire, `Expiry` for the trade-expiry ClosePositions veto.
+    pub fn set_close_reason(&self, reason: ExitReason) {
+        *self.close_reason.borrow_mut() = reason;
     }
 
     /// Attach a pre-fetched finer-granularity bid/ask series for the sub-bar zoom
@@ -277,14 +300,14 @@ impl ReplayBroker {
         self
     }
 
-    /// The [`SubBars`](trade_control_engine::SubBars) provider the sim consults on
+    /// The [`SubBars`](super::fill_sim::SubBars) provider the sim consults on
     /// an ambiguous bar: the attached finer series, or [`NoZoom`] when none was
     /// supplied. Borrowing the field as a trait object keeps every fill/exit call
     /// site uniform (`simulate_fill_resolved_zoom(.., self.zoom())`).
-    fn zoom(&self) -> &dyn trade_control_engine::SubBars {
+    fn zoom(&self) -> &dyn super::fill_sim::SubBars {
         match &self.finer {
             Some(f) => f,
-            None => &trade_control_engine::NoZoom,
+            None => &super::fill_sim::NoZoom,
         }
     }
 
@@ -314,55 +337,31 @@ impl ReplayBroker {
     /// levels `place_entry` captured from the `EntryRequest` — the floored stop
     /// the broker rests on (`None` only on the direct-record test path, which
     /// falls back to resolving from the intent).
-    fn record_attempt(
+    pub(crate) fn record_attempt(
         &self,
         order_id: String,
         intent: Intent,
         shell: Shell,
         placed: Option<PlacedLevels>,
     ) {
+        // Register a placement: a held resting order the per-bar `advance()` steps
+        // to open/closed, plus the retry-gate `PlacedAttempt` record. `placed` are
+        // the concrete floored levels captured from the `EntryRequest` (`None` on
+        // the direct-record test path → resolved from the intent).
+        self.resting.borrow_mut().push(HeldOrder {
+            order_id: order_id.clone(),
+            intent: intent.clone(),
+            shell: shell.clone(),
+            placed: placed.clone(),
+            cancelled: false,
+        });
         self.placed.borrow_mut().push(PlacedAttempt {
             order_id,
             intent,
             shell,
             placed,
             cancelled: false,
-            ledger: None,
         });
-    }
-
-    /// Attach the forward-path geometry to a placed order so a later
-    /// [`ReplayBroker::realized_outcome`] can advance it. `forward` is the fire
-    /// bar onward — the fill-sim input. The SL/TP levels come from the order's
-    /// stored [`PlacedLevels`], not from here (no trailing spread). The
-    /// reversal-close fires are a plan-wide set passed to `realized_outcome`.
-    ///
-    /// If an attempt with this `order_id` already exists (the usual path: the
-    /// dispatch's `place_entry` recorded it first, WITH its placed levels), its
-    /// ledger is **upgraded** in place — so there's exactly one attempt per order
-    /// and its placed levels are preserved. Otherwise a fresh attempt is pushed
-    /// with `placed: None` (the direct-record unit-test path, which resolves the
-    /// bracket from the intent).
-    pub fn record_order(
-        &self,
-        order_id: String,
-        intent: Intent,
-        shell: Shell,
-        forward: Vec<EngineCandle>,
-    ) {
-        let geometry = LedgerGeometry { forward };
-        let mut placed = self.placed.borrow_mut();
-        match placed.iter_mut().find(|a| a.order_id == order_id) {
-            Some(existing) => existing.ledger = Some(geometry),
-            None => placed.push(PlacedAttempt {
-                order_id,
-                intent,
-                shell,
-                placed: None,
-                cancelled: false,
-                ledger: Some(geometry),
-            }),
-        }
     }
 
     /// The armed [`Verified`] (intent + firing shell) the broker holds for a
@@ -446,7 +445,26 @@ impl ReplayBroker {
             instrument = %matched.intent.instrument,
             "ReplayBroker: re-activated a spread-hour-cancelled resting order (lifecycle restore)"
         );
-        Some(matched.order_id.clone())
+        let restored_id = matched.order_id.clone();
+        let restored_levels = PlacedLevels {
+            entry: req.entry.clone(),
+            stop_loss: req.stop_loss,
+            take_profit: req.take_profit,
+        };
+        drop(placed);
+        // Mirror the restore onto the held resting order: un-cancel it and refresh
+        // its levels to the re-floored request, so `advance()` resumes stepping it
+        // (the spread-hour fill skip still blocks a rubbish-bar fill).
+        if let Some(o) = self
+            .resting
+            .borrow_mut()
+            .iter_mut()
+            .find(|o| o.order_id == restored_id)
+        {
+            o.cancelled = false;
+            o.placed = Some(restored_levels);
+        }
+        Some(restored_id)
     }
 
     /// The concrete bracket a placed order rests on — its stored [`PlacedLevels`]
@@ -463,144 +481,110 @@ impl ReplayBroker {
         self.resolved_for_sim(attempt, &[])
     }
 
-    /// The realized outcome of a ledger-tracked order — the broker-owned
-    /// equivalent of `report.rs::resolve_fire_any`'s taken/closed verdict for the
-    /// same enter. Advances the order's forward path through the SAME engine
-    /// physics the report used, in the SAME per-bar precedence:
-    ///
-    ///   fill → strategy-side/simulator SL/TP → reversal-close → break-even
-    ///
-    /// (break-even is folded into `simulate_fill_windowed`, and the SL floor into
-    /// `apply_entry_spread_floor` — so this driver just calls them in report order).
-    /// `closes` is the plan-wide `06-close-on-reversal` fire-set (collected after
-    /// the loop by the report); a reversal in it that lands while the position is
-    /// open flattens it before its SL/TP.
-    ///
-    /// Returns `None` when the order was **cancelled** (no fill, no outcome — the
-    /// lifecycle-cancel case later stages exercise), wasn't recorded with ledger
-    /// geometry (a plain retry-gate attempt), or its bracket can't resolve
-    /// (`Unresolved` — nothing to draw, exactly as the report returned `None`).
-    pub fn realized_outcome(
-        &self,
-        order_id: &str,
-        closes: &[CloseFire],
-    ) -> Option<RealizedOutcome> {
-        let placed = self.placed.borrow();
-        let attempt = placed.iter().find(|a| a.order_id == order_id)?;
-        // A cancelled order never fills — no realized outcome (the whole point of
-        // the ledger: a spread-hour cancel flows into "no fill" here).
-        if attempt.cancelled {
-            return None;
+    /// S5b: the realized outcome READ FROM THE HELD LEDGER — the single source of
+    /// truth. Replaces the re-sim `realized_outcome` as the report's P&L source.
+    /// A closed trade maps to its exit kind (StoppedOut / TookProfit /
+    /// ClosedOnReversal / ClosedAtExpiry); a still-open position → `Open` (no exit
+    /// yet); a cancelled-or-absent order → `None` (no fill, exactly as the re-sim
+    /// returned for a cancelled/unresolved order). The window-end anchor for an
+    /// open position is the last pulled candle.
+    pub fn held_realized_outcome(&self, order_id: &str) -> Option<RealizedOutcome> {
+        // Advance to the window end so a position that closes on the last bars is
+        // reflected. The loop already advanced per bar; this is a final settle.
+        if let Some(last) = self.candles.last().map(|c| c.time) {
+            self.advance(last);
         }
-        let geo = attempt.ledger.as_ref()?;
-        self.realize(attempt, geo, closes)
+        if let Some(t) = self.closed.borrow().iter().find(|t| t.order_id == order_id) {
+            let kind = match t.reason {
+                ExitReason::StoppedOut => FillKind::StoppedOut,
+                ExitReason::TookProfit => FillKind::TookProfit,
+                ExitReason::Reversal => FillKind::ClosedOnReversal,
+                ExitReason::Expiry => FillKind::ClosedAtExpiry,
+            };
+            return Some(RealizedOutcome {
+                direction: t.direction,
+                fill_at: t.fill_at,
+                until: t.exit_at,
+                entry_price: t.entry_price,
+                stop_loss: t.stop_loss,
+                take_profit: t.take_profit,
+                exit_price: Some(t.exit_price),
+                kind,
+            });
+        }
+        if let Some(p) = self.open.borrow().iter().find(|p| p.order_id == order_id) {
+            let window_end = self.candles.last().map(|c| c.time).unwrap_or(p.fill_at);
+            return Some(RealizedOutcome {
+                direction: p.direction,
+                fill_at: p.fill_at,
+                until: window_end,
+                entry_price: p.entry_price,
+                stop_loss: p
+                    .placed
+                    .as_ref()
+                    .map(|pl| pl.stop_loss)
+                    .unwrap_or(p.entry_price),
+                take_profit: p
+                    .placed
+                    .as_ref()
+                    .map(|pl| pl.take_profit)
+                    .unwrap_or(p.entry_price),
+                exit_price: None,
+                kind: FillKind::Open,
+            });
+        }
+        // Still resting at window end. An UNCANCELLED resting order is a genuine
+        // NeverFilled (the trigger was never reached) — distinct from a cancelled
+        // one (spread-hour cancel / superseded), which is a true no-fill (`None`).
+        // The report renders NeverFilled with its intended (unfilled) bracket
+        // anchored at the fire bar; a `None` becomes the "order cancelled" no-fill.
+        if let Some(o) = self
+            .resting
+            .borrow()
+            .iter()
+            .find(|o| o.order_id == order_id)
+        {
+            if o.cancelled {
+                return None;
+            }
+            // Resolve the intended bracket for the not-taken box (fire-bar anchored).
+            let probe = self.resolved_for_sim_probe(&o.intent, &o.shell, &o.placed);
+            let window_end = self.candles.last().map(|c| c.time).unwrap_or(o.shell.time);
+            if let Some(resolved) = probe {
+                return Some(RealizedOutcome {
+                    direction: resolved.direction,
+                    fill_at: o.shell.time,
+                    until: window_end,
+                    entry_price: resolved.entry.reference_price(),
+                    stop_loss: resolved.stop_loss,
+                    take_profit: resolved.take_profit,
+                    exit_price: None,
+                    kind: FillKind::NeverFilled,
+                });
+            }
+        }
+        // Cancelled or never-placed — no fill (the report renders a 0R no-fill).
+        None
     }
 
-    /// Compute a ledger order's realized outcome by walking its STORED placed
-    /// bracket (via [`resolved_for_sim`]) forward with [`simulate_fill_resolved`],
-    /// then the reversal-close post-pass — and map to a [`RealizedOutcome`]. The
-    /// levels come from the order's [`PlacedLevels`], the SAME ones the retry-gate
-    /// `resolve` and the report walk, so all three agree (no trailing-spread
-    /// re-derivation — replay↔live divergence #4).
-    ///
-    /// `None` when the intent can't resolve — the report drew nothing there too.
-    fn realize(
+    /// Resolve a held order/position's bracket for a not-taken outcome box, off its
+    /// intent+shell+placed levels (the same stored-levels-or-floor logic
+    /// `step_outcome` uses). A thin wrapper so `held_realized_outcome` can anchor a
+    /// `NeverFilled` box without an `advance` step.
+    fn resolved_for_sim_probe(
         &self,
-        attempt: &PlacedAttempt,
-        geo: &LedgerGeometry,
-        closes: &[CloseFire],
-    ) -> Option<RealizedOutcome> {
-        let pip_size = self.pip_size;
-        let intent = &attempt.intent;
-        let shell = &attempt.shell;
-        // The placed bracket the position rests on — the stored floored levels,
-        // not a fresh floor. `None` ⇒ the intent couldn't resolve (the report's
-        // `.ok()?` drew nothing).
-        let resolved = self.resolved_for_sim(attempt, &geo.forward)?;
-        let direction = resolved.direction;
-        let stop_loss = resolved.stop_loss;
-        let take_profit = resolved.take_profit;
-        let placed_level = resolved.entry.reference_price();
-        // The not-taken / open box runs to the last forward bar; a closed trade
-        // overrides `until` with its exit bar below.
-        let window_end = geo.forward.last().map(|c| c.time).unwrap_or(shell.time);
-        let fire_at = shell.time;
-
-        let raw = simulate_fill_resolved_zoom(
-            &resolved,
-            intent,
-            shell,
-            pip_size,
-            &geo.forward,
-            self.zoom(),
-        );
-        let (fill_at, until, entry_price, exit_price, kind) =
-            match apply_reversal_close(&raw, closes) {
-                Some(rc) => (
-                    rc.fill_at,
-                    rc.exit_at,
-                    rc.entry_price,
-                    Some(rc.exit_price),
-                    FillKind::ClosedOnReversal,
-                ),
-                None => match &raw {
-                    SimOutcome::FilledOpen {
-                        fill_at,
-                        entry_price,
-                    } => (*fill_at, window_end, *entry_price, None, FillKind::Open),
-                    // `exit_price` carries the ACTUAL exit — the break-even price when
-                    // SL→BE moved the stop to entry, else the floored SL — so the
-                    // report's R (`realized_r(entry, stop_loss, exit_price)`) matches
-                    // the sim without re-deriving break-even off stale geometry.
-                    SimOutcome::StoppedOut {
-                        fill_at,
-                        entry_price,
-                        exit_at,
-                        exit_price,
-                    } => (
-                        *fill_at,
-                        *exit_at,
-                        *entry_price,
-                        Some(*exit_price),
-                        FillKind::StoppedOut,
-                    ),
-                    SimOutcome::TookProfit {
-                        fill_at,
-                        entry_price,
-                        exit_at,
-                        exit_price,
-                    } => (
-                        *fill_at,
-                        *exit_at,
-                        *entry_price,
-                        Some(*exit_price),
-                        FillKind::TookProfit,
-                    ),
-                    SimOutcome::NeverFilled => (
-                        fire_at,
-                        window_end,
-                        placed_level,
-                        None,
-                        FillKind::NeverFilled,
-                    ),
-                    SimOutcome::Declined { .. } => {
-                        (fire_at, window_end, placed_level, None, FillKind::Declined)
-                    }
-                    // `Unresolved` has nothing to draw — the report returned `None`
-                    // from its `Unresolved => return None` arm, so the ledger does too.
-                    SimOutcome::Unresolved(_) => return None,
-                },
-            };
-        Some(RealizedOutcome {
-            direction,
-            fill_at,
-            until,
-            entry_price,
-            stop_loss,
-            take_profit,
-            exit_price,
-            kind,
-        })
+        intent: &Intent,
+        shell: &Shell,
+        placed: &Option<PlacedLevels>,
+    ) -> Option<Resolved> {
+        let probe = PlacedAttempt {
+            order_id: String::new(),
+            intent: intent.clone(),
+            shell: shell.clone(),
+            placed: placed.clone(),
+            cancelled: false,
+        };
+        self.resolved_for_sim(&probe, &[])
     }
 
     /// The order ids the gate has cancelled so far (the cancel-and-replace
@@ -613,17 +597,6 @@ impl ReplayBroker {
             .iter()
             .filter(|a| a.cancelled)
             .map(|a| a.order_id.clone())
-            .collect()
-    }
-
-    /// Candles up to and including the `as_of` bar — the slice a prior attempt
-    /// is simulated against. Bounding here is what makes re-entry time-accurate.
-    fn window_to_as_of(&self) -> Vec<BidAskCandle> {
-        let as_of = *self.as_of.borrow();
-        self.candles
-            .iter()
-            .filter(|c| c.time <= as_of)
-            .cloned()
             .collect()
     }
 
@@ -672,7 +645,7 @@ impl ReplayBroker {
             None => {
                 // Legacy/test path: no captured request → floor from the intent as
                 // the pre-"orders-are-state" code did (fire-bar spread).
-                trade_control_engine::apply_entry_spread_floor(
+                super::fill_sim::apply_entry_spread_floor(
                     &mut resolved,
                     self.pip_size,
                     forward,
@@ -683,83 +656,262 @@ impl ReplayBroker {
         Some(resolved)
     }
 
-    /// Resolve a placed attempt's current state from its price path up to
-    /// `as_of`. The attempt's own candles are those at/after its shell time
-    /// (the bar it fired on) within the bounded window.
-    fn resolve(&self, attempt: &PlacedAttempt) -> AttemptState {
-        if attempt.cancelled {
-            return AttemptState::Cancelled;
-        }
-        let window = self.window_to_as_of();
-        // Forward path = candles from the firing bar onward (the sim walks these
-        // to find the fill, then the SL/TP touch — against the STORED levels).
-        let forward: Vec<BidAskCandle> = window
-            .into_iter()
-            .filter(|c| c.time >= attempt.shell.time)
-            .collect();
-        let Some(resolved) = self.resolved_for_sim(attempt, &forward) else {
-            // Unresolvable intent → no order went on; the slot is free.
-            return AttemptState::Cancelled;
+    /// The prefix a held order/position is simulated against as of the current
+    /// bar: the candles at/after its fire (`shell`) bar, up to and including
+    /// `as_of`. Index 0 is the fire bar — the sim's `find_fill` excludes it (a
+    /// resting order isn't live until its fire bar closes), so `advance()` gets
+    /// the fire-bar skip (and the spread-hour fill skip, sub-bar zoom, break-even,
+    /// System-2 widen) for free from `simulate_fill_resolved_zoom`.
+    fn prefix_from_fire(&self, shell: &Shell, up_to: DateTime<Utc>) -> Vec<BidAskCandle> {
+        // Bound at `up_to` (the current bar's OPEN time), inclusive — NOT the
+        // shared `as_of`, which the loop sets to the bar CLOSE (`now`). Because
+        // candle timestamps are bar-open times and a bar's close equals the NEXT
+        // bar's open, using the close as the bound would pull the next bar's open
+        // price into the fill test and fill an order a bar early (the divergence
+        // the cancel-and-replace test exposed: a stop filled at bar N's advance
+        // off bar N+1's open before the bar-N cancel could land). The re-sim
+        // `resolve` avoids this because every dispatch-time lookup bounds at the
+        // firing bar's OPEN (`fired.candle.time`); `advance` matches that.
+        self.candles
+            .iter()
+            .filter(|c| c.time >= shell.time && c.time <= up_to)
+            .cloned()
+            .collect()
+    }
+
+    /// Simulate one held order/position against the prefix up to `as_of` and read
+    /// off its state *by this bar* — the same `simulate_fill_resolved_zoom` the
+    /// re-sim `resolve` uses, so `advance()` reproduces every fill/exit invariant
+    /// baked into the engine. Returns `None` when the intent can't resolve (slot
+    /// free) — the caller drops the order.
+    fn step_outcome(
+        &self,
+        intent: &Intent,
+        shell: &Shell,
+        placed: &Option<PlacedLevels>,
+        up_to: DateTime<Utc>,
+    ) -> Option<(Resolved, SimOutcome)> {
+        let prefix = self.prefix_from_fire(shell, up_to);
+        // Build a throwaway attempt so `resolved_for_sim` (which reads
+        // `attempt.placed` / `attempt.intent` / `attempt.shell`) applies the SAME
+        // stored-levels-or-floor logic the re-sim path uses. No ledger/cancel
+        // fields matter here — only the three the resolver reads.
+        let probe = PlacedAttempt {
+            order_id: String::new(),
+            intent: intent.clone(),
+            shell: shell.clone(),
+            placed: placed.clone(),
+            cancelled: false,
         };
-        match simulate_fill_resolved_zoom(
+        let resolved = self.resolved_for_sim(&probe, &prefix)?;
+        let outcome = simulate_fill_resolved_zoom(
             &resolved,
-            &attempt.intent,
-            &attempt.shell,
+            intent,
+            shell,
             self.pip_size,
-            &forward,
+            &prefix,
             self.zoom(),
-        ) {
-            SimOutcome::StoppedOut { .. } => {
-                AttemptState::ClosedLossOrBreakeven { realized_pl: -1.0 }
+        );
+        Some((resolved, outcome))
+    }
+
+    /// Advance the held state to `as_of` (call once per bar, AFTER `set_as_of`,
+    /// BEFORE engine dispatch). This is the single-source-of-truth step that
+    /// replaces the re-simulate-on-query model: it promotes resting→open on a
+    /// fill and open→closed on an SL/TP touch, by this bar, so `list_open_positions`
+    /// / `lookup_attempt_state` can READ held state instead of re-deriving it, and
+    /// `close_positions` (reversal / expiry, dispatched by the engine on this bar)
+    /// has a real position to flatten. Reuses `simulate_fill_resolved_zoom`, so
+    /// every fill/exit invariant (fire-bar skip, spread-hour skip, sub-bar zoom,
+    /// break-even, System-2 widen) is preserved — no reimplemented fill engine.
+    pub fn advance(&self, up_to: DateTime<Utc>) {
+        // 1. Resting → open (or straight to closed if it filled AND exited by now).
+        //    A cancelled resting order fills nothing; leave it for the lifecycle.
+        let resting_now = self.resting.borrow().clone();
+        for order in resting_now {
+            if order.cancelled {
+                continue;
             }
-            SimOutcome::TookProfit { .. } => AttemptState::ClosedWin { realized_pl: 1.0 },
-            SimOutcome::FilledOpen { .. } => AttemptState::OpenPosition {
-                broker_trade_id: format!("{}-pos", attempt.order_id),
-            },
-            // Not filled by the asking bar = a still-**resting** order, exactly
-            // what the real broker reports as `Pending`. This is load-bearing
-            // for strategy-v2: a sibling enter (QM limit vs break-and-close stop)
-            // firing on a later bar must see the prior resting order as `Pending`
-            // so the gate **cancels and replaces** it (cancel-and-replace), and
-            // so a still-resting order can't go on to fill alongside the new one.
-            // Returning `Cancelled` here (the old behaviour) silently let both
-            // orders rest+fill → overlapping positions (Bug 1 + Bug 2). A
-            // genuinely cancelled order is caught above by `attempt.cancelled`.
-            // (`expiry_bars`-driven expiry is folded into the fill window, so an
-            // expired order resolves to `NeverFilled`/`Pending` here too — these
-            // v2 plans don't set `expiry_bars`, and the gate's cap/window bound
-            // the re-entry count regardless.)
-            SimOutcome::NeverFilled => AttemptState::Pending,
-            // `simulate_fill_resolved` walks an already-resolved bracket, so it
-            // never returns `Declined` (the SL-floor reject) or `Unresolved` (the
-            // resolve failure) — those are handled by the `resolved_for_sim` guard
-            // above. Kept for match exhaustiveness → the slot is free.
-            SimOutcome::Declined { .. } | SimOutcome::Unresolved(_) => AttemptState::Cancelled,
+            let Some((resolved, outcome)) =
+                self.step_outcome(&order.intent, &order.shell, &order.placed, up_to)
+            else {
+                // Unresolvable → the slot is free; drop the resting order.
+                self.remove_resting(&order.order_id);
+                continue;
+            };
+            match outcome {
+                SimOutcome::NeverFilled => { /* still resting */ }
+                SimOutcome::FilledOpen {
+                    fill_at,
+                    entry_price,
+                } => {
+                    self.remove_resting(&order.order_id);
+                    self.open.borrow_mut().push(HeldPosition {
+                        order_id: order.order_id.clone(),
+                        intent: order.intent.clone(),
+                        shell: order.shell.clone(),
+                        placed: order.placed.clone(),
+                        direction: resolved.direction,
+                        entry_price,
+                        fill_at,
+                    });
+                }
+                SimOutcome::StoppedOut {
+                    fill_at,
+                    entry_price,
+                    exit_at,
+                    exit_price,
+                }
+                | SimOutcome::TookProfit {
+                    fill_at,
+                    entry_price,
+                    exit_at,
+                    exit_price,
+                } => {
+                    // Filled AND exited within the prefix — record the closed trade
+                    // directly (it never rests as "open" past this bar).
+                    let reason = if matches!(outcome, SimOutcome::TookProfit { .. }) {
+                        ExitReason::TookProfit
+                    } else {
+                        ExitReason::StoppedOut
+                    };
+                    self.remove_resting(&order.order_id);
+                    self.closed.borrow_mut().push(ClosedTrade {
+                        order_id: order.order_id.clone(),
+                        direction: resolved.direction,
+                        entry_price,
+                        stop_loss: resolved.stop_loss,
+                        take_profit: resolved.take_profit,
+                        fill_at,
+                        exit_at,
+                        exit_price,
+                        reason,
+                    });
+                }
+                SimOutcome::Declined { .. } | SimOutcome::Unresolved(_) => {
+                    self.remove_resting(&order.order_id);
+                }
+            }
+        }
+
+        // 2. Open → closed on an SL/TP touch by this bar. (Reversal / expiry
+        //    closes are applied by the engine via `close_positions`, not here.)
+        let open_now = self.open.borrow().clone();
+        for pos in open_now {
+            let Some((resolved, outcome)) =
+                self.step_outcome(&pos.intent, &pos.shell, &pos.placed, up_to)
+            else {
+                continue;
+            };
+            if let SimOutcome::StoppedOut {
+                exit_at,
+                exit_price,
+                ..
+            }
+            | SimOutcome::TookProfit {
+                exit_at,
+                exit_price,
+                ..
+            } = outcome
+            {
+                let reason = if matches!(outcome, SimOutcome::TookProfit { .. }) {
+                    ExitReason::TookProfit
+                } else {
+                    ExitReason::StoppedOut
+                };
+                self.remove_open(&pos.order_id);
+                self.closed.borrow_mut().push(ClosedTrade {
+                    order_id: pos.order_id.clone(),
+                    direction: pos.direction,
+                    entry_price: pos.entry_price,
+                    stop_loss: resolved.stop_loss,
+                    take_profit: resolved.take_profit,
+                    fill_at: pos.fill_at,
+                    exit_at,
+                    exit_price,
+                    reason,
+                });
+            }
         }
     }
 
-    /// Build the [`PendingOrder`] a live broker would report for a still-resting
-    /// attempt. `trigger`/`is_stop` come from resolving the intent's entry
-    /// against its shell; a Market entry (which never rests) or a resolution
-    /// failure falls back to the shell close as the trigger and `is_stop=true`.
-    /// The lifecycle's cancel decision keys off `instrument` + `order_id`, so
-    /// `trigger`/`stake` are informational — but resolve them accurately when we
-    /// can so a report renders the right level.
-    fn pending_from_attempt(&self, a: &PlacedAttempt) -> PendingOrder {
+    /// The held-model `AttemptState` for an order id — the S4 read that replaces
+    /// the re-sim `resolve` for the retry-gate. Mirrors `resolve`'s exact mapping:
+    /// a resting order (uncancelled) → `Pending`; an open position → `OpenPosition`
+    /// with the `{order_id}-pos` trade id; a closed trade → `ClosedWin` /
+    /// `ClosedLossOrBreakeven` with the ±1.0 sentinel `realized_pl` the gate keys
+    /// on; a cancelled or absent order → `Cancelled`. An id we never placed →
+    /// `Unknown` (fail-safe). The categories are shadow-parity asserted vs
+    /// `resolve` bar-by-bar through S3–S7.
+    fn held_attempt_state(&self, order_id: &str) -> AttemptState {
+        // Advance the held state to the current `as_of` first, so an isolated
+        // caller (a unit test that sets `as_of` and reads, without the loop's
+        // per-bar advance) sees the same progression the loop produces. In the
+        // loop this is a no-op-or-forward: `advance` only ever promotes on a
+        // genuine transition by `as_of`, never backward. Bounds at `as_of`, which
+        // the caller set to the bar it's asking about.
+        self.advance(*self.as_of.borrow());
+        if let Some(o) = self
+            .resting
+            .borrow()
+            .iter()
+            .find(|o| o.order_id == order_id)
+        {
+            return if o.cancelled {
+                AttemptState::Cancelled
+            } else {
+                AttemptState::Pending
+            };
+        }
+        if self.open.borrow().iter().any(|p| p.order_id == order_id) {
+            return AttemptState::OpenPosition {
+                broker_trade_id: format!("{order_id}-pos"),
+            };
+        }
+        if let Some(t) = self.closed.borrow().iter().find(|t| t.order_id == order_id) {
+            return match t.reason {
+                ExitReason::TookProfit => AttemptState::ClosedWin { realized_pl: 1.0 },
+                // StoppedOut / Reversal / Expiry → loss-or-breakeven (re-sim maps
+                // any non-TP close to ClosedLossOrBreakeven with -1.0).
+                _ => AttemptState::ClosedLossOrBreakeven { realized_pl: -1.0 },
+            };
+        }
+        // Never placed (or dropped as unresolvable) — the gate only asks about ids
+        // it placed, so an unknown id is fail-safe `Unknown`; a dropped one reads
+        // as `Cancelled` via the resting/open/closed miss above is impossible
+        // (it's simply absent), so treat absent as `Unknown` to match the re-sim's
+        // `None => Unknown` arm in `lookup_attempt_state`.
+        AttemptState::Unknown
+    }
+
+    /// Remove a resting order by id (filled, cancelled-and-dropped, or unresolvable).
+    fn remove_resting(&self, order_id: &str) {
+        self.resting.borrow_mut().retain(|o| o.order_id != order_id);
+    }
+
+    /// Remove an open position by id (closed by bracket, reversal, or expiry).
+    fn remove_open(&self, order_id: &str) {
+        self.open.borrow_mut().retain(|p| p.order_id != order_id);
+    }
+
+    /// The held-order variant of [`pending_from_attempt`] (S7): same trigger/
+    /// direction resolution, off a `HeldOrder`'s intent+shell. Keeps the
+    /// `list_pending_orders` reconstruction reading held state.
+    fn pending_from_held(&self, o: &HeldOrder) -> PendingOrder {
         use trade_control_core::intent::{Direction, Resolved, ResolvedEntry};
-        let direction = a.intent.direction.unwrap_or(Direction::Long);
+        let direction = o.intent.direction.unwrap_or(Direction::Long);
         let (trigger, is_stop) =
-            match Resolved::from_intent(&a.intent, &a.shell, self.pip_size, self.pip_size) {
+            match Resolved::from_intent(&o.intent, &o.shell, self.pip_size, self.pip_size) {
                 Ok(r) => match r.entry {
                     ResolvedEntry::Stop { trigger_price } => (trigger_price, true),
                     ResolvedEntry::Limit { trigger_price } => (trigger_price, false),
                     ResolvedEntry::Market { reference_price } => (reference_price, true),
                 },
-                Err(_) => (a.shell.close, true),
+                Err(_) => (o.shell.close, true),
             };
         PendingOrder {
-            order_id: a.order_id.clone(),
-            instrument: a.intent.instrument.clone(),
+            order_id: o.order_id.clone(),
+            instrument: o.intent.instrument.clone(),
             direction,
             trigger,
             is_stop,
@@ -794,18 +946,15 @@ impl Broker for ReplayBroker {
                 cap: max_risk_pct,
             });
         }
-        // 2. Open-positions cap: count attempts open as-of the fire bar (the same
-        //    `resolve`-derived count `list_open_positions` reports) and reject at
-        //    the cap, mirroring the real broker's `open_position_count >= cap`.
-        //    In a single-plan replay this is that instrument's open count — the
-        //    best offline proxy for the account-wide count, and conservative (it
-        //    can only reject, never over-fill).
-        let open_now = self
-            .placed
-            .borrow()
-            .iter()
-            .filter(|a| matches!(self.resolve(a), AttemptState::OpenPosition { .. }))
-            .count();
+        // 2. Open-positions cap: count HELD open positions as-of the fire bar (S6 —
+        //    the same held state `list_open_positions` reports) and reject at the
+        //    cap, mirroring the real broker's `open_position_count >= cap`. In a
+        //    single-plan replay this is that instrument's open count — the best
+        //    offline proxy for the account-wide count, and conservative (it can
+        //    only reject, never over-fill). Advance to the current `as_of` first so
+        //    a fill/close that happened by this bar is reflected.
+        self.advance(*self.as_of.borrow());
+        let open_now = self.open.borrow().len();
         if open_now as u32 >= max_open_positions {
             return Err(EntryError::OpenPositionsCapExceeded);
         }
@@ -858,12 +1007,76 @@ impl Broker for ReplayBroker {
         }
     }
 
-    async fn close_positions(&self, _instrument: &str) -> bool {
-        false
+    async fn close_positions(&self, instrument: &str) -> bool {
+        // S5: actually flatten held open positions for this instrument at the
+        // current bar's close — the live worker's `run_close` / ClosePositions
+        // veto flattens at market when the engine dispatches the close, so the
+        // bar's close is the faithful exit price. The loop sets the reason
+        // (Reversal by default; Expiry for the trade-expiry veto) via
+        // `set_close_reason` right before the engine dispatches this close.
+        // Returns true iff at least one position was closed (mirrors the real
+        // broker's "did I close anything").
+        let Some(bar) = self.candle_at_as_of() else {
+            return false;
+        };
+        let exit_at = bar.time;
+        let exit_price = (bar.bid_c + bar.ask_c) / 2.0;
+        let reason = *self.close_reason.borrow();
+        let inst_key = instrument.to_lowercase();
+
+        let mut to_close = Vec::new();
+        self.open.borrow_mut().retain(|p| {
+            if p.intent.instrument.to_lowercase() == inst_key {
+                to_close.push(p.clone());
+                false // remove from open
+            } else {
+                true
+            }
+        });
+        if to_close.is_empty() {
+            return false;
+        }
+        let mut closed = self.closed.borrow_mut();
+        for p in to_close {
+            closed.push(ClosedTrade {
+                order_id: p.order_id,
+                direction: p.direction,
+                entry_price: p.entry_price,
+                // Resolve the stored floored stop for R scoring; fall back to the
+                // entry (0-risk → 0R) if the intent can't resolve (shouldn't happen
+                // for an order that filled).
+                stop_loss: p
+                    .placed
+                    .as_ref()
+                    .map(|pl| pl.stop_loss)
+                    .unwrap_or(p.entry_price),
+                take_profit: p
+                    .placed
+                    .as_ref()
+                    .map(|pl| pl.take_profit)
+                    .unwrap_or(p.entry_price),
+                fill_at: p.fill_at,
+                exit_at,
+                exit_price,
+                reason,
+            });
+        }
+        true
     }
 
-    async fn cancel_pending_for_instrument(&self, _instrument: &str) -> usize {
-        0
+    async fn cancel_pending_for_instrument(&self, instrument: &str) -> usize {
+        // Cancel all held resting orders for this instrument (the ClosePositions
+        // veto and reversal path also cancel pending orders live). Returns the
+        // count cancelled, mirroring the real broker.
+        let inst_key = instrument.to_lowercase();
+        let mut n = 0;
+        for o in self.resting.borrow_mut().iter_mut() {
+            if !o.cancelled && o.intent.instrument.to_lowercase() == inst_key {
+                o.cancelled = true;
+                n += 1;
+            }
+        }
+        n
     }
 
     async fn lookup_attempt_state(
@@ -872,14 +1085,14 @@ impl Broker for ReplayBroker {
         broker_order_id: &str,
         _broker_trade_id: Option<&str>,
     ) -> Result<AttemptState, LookupError> {
-        let placed = self.placed.borrow();
-        match placed.iter().find(|a| a.order_id == broker_order_id) {
-            Some(a) => Ok(self.resolve(a)),
-            // The gate only asks about ids we placed; an unknown id means the
-            // attempt was never recorded — treat as Unknown (fail-safe in the
-            // gate, though this shouldn't happen in the replay's closed loop).
-            None => Ok(AttemptState::Unknown),
-        }
+        // S4: READ held state (advanced by the loop's per-bar `advance(bar_open)`)
+        // instead of re-simulating. The held snapshot is current as-of the current
+        // bar's open — the same instant the dispatch-time gate lookups bound at
+        // (`fired.candle.time`). Categories mirror the re-sim's `resolve` exactly
+        // (shadow-parity asserted through S3–S7). `close_positions` (S5) removes a
+        // reversal/expiry-closed position from `open`, so this read then frees the
+        // slot for re-entry — the fix that unblocks the EUR/USD case.
+        Ok(self.held_attempt_state(broker_order_id))
     }
 
     async fn cancel_order(
@@ -894,6 +1107,22 @@ impl Broker for ReplayBroker {
             .find(|a| a.order_id == broker_order_id)
         {
             a.cancelled = true;
+        }
+        // Mirror onto the held resting order: a cancelled resting order fills
+        // nothing (advance() skips `cancelled`) and appears in neither the open
+        // nor the pending list — matching the re-sim's `Cancelled`. A restore
+        // re-activates it (`reactivate_matching_cancelled`). If the order has
+        // ALREADY been promoted to `open` by an earlier `advance()`, the cancel is
+        // a no-op on it — which is correct: you can't cancel-pending a filled
+        // order (the retry gate only cancels one it observed `Pending`, so this
+        // path is reached only while it's still resting).
+        if let Some(o) = self
+            .resting
+            .borrow_mut()
+            .iter_mut()
+            .find(|o| o.order_id == broker_order_id)
+        {
+            o.cancelled = true;
         }
         Ok(())
     }
@@ -953,26 +1182,24 @@ impl Broker for ReplayBroker {
         &self,
         _account_id: &str,
     ) -> Result<Vec<OpenPosition>, LookupError> {
-        // The Bug #11 backstop: report a synthetic open position for any placed
-        // attempt that resolves to OpenPosition by the asking bar, keyed back to
-        // its order id so the gate's correlation matches.
-        let placed = self.placed.borrow();
-        let positions = placed
+        // The Bug #11 backstop: report an open position for every HELD open
+        // position (S4), keyed back to its order id so the gate's correlation
+        // matches. Reads held state instead of re-simulating — so once
+        // `close_positions` (S5) removes a reversal/expiry-closed position, the
+        // backstop no longer reports it and re-entry is freed (the EUR/USD fix).
+        self.advance(*self.as_of.borrow());
+        let positions = self
+            .open
+            .borrow()
             .iter()
-            .filter_map(|a| match self.resolve(a) {
-                AttemptState::OpenPosition { broker_trade_id } => Some(OpenPosition {
-                    instrument: a.intent.instrument.clone(),
-                    direction: a
-                        .intent
-                        .direction
-                        .unwrap_or(trade_control_core::intent::Direction::Long),
-                    stop_loss: None,
-                    take_profit: None,
-                    position_id: broker_trade_id,
-                    order_id: a.order_id.clone(),
-                    stake: 1.0,
-                }),
-                _ => None,
+            .map(|p| OpenPosition {
+                instrument: p.intent.instrument.clone(),
+                direction: p.direction,
+                stop_loss: None,
+                take_profit: None,
+                position_id: format!("{}-pos", p.order_id),
+                order_id: p.order_id.clone(),
+                stake: 1.0,
             })
             .collect();
         Ok(positions)
@@ -991,19 +1218,19 @@ impl Broker for ReplayBroker {
         &self,
         _account_id: &str,
     ) -> Result<Vec<PendingOrder>, LookupError> {
-        // Report a synthetic resting order for every placed attempt that
-        // `resolve`s to `Pending` at `as_of` — i.e. an order that has been
-        // "placed" but not yet filled/cancelled by the asking bar. This is what
-        // the shared `pending_order_lifecycle` (core) lists to decide what to
-        // cancel through a spread hour; a mock that always returned `[]` (the
-        // pre-PR-3 stub) would make the lifecycle a no-op offline, so replay
-        // could never reproduce the live cancel/restore. Mirrors
-        // `list_open_positions`' reconstruction from `placed`.
-        let placed = self.placed.borrow();
-        let pendings = placed
+        // S7: report a resting order for every HELD resting order that is not
+        // cancelled and not yet filled by `as_of`. This is what the shared
+        // `pending_order_lifecycle` (core) lists to decide what to cancel through a
+        // spread hour; a mock that always returned `[]` would make the lifecycle a
+        // no-op offline, so replay could never reproduce the live cancel/restore.
+        // Reads held state (advanced to `as_of`) instead of re-simulating.
+        self.advance(*self.as_of.borrow());
+        let pendings = self
+            .resting
+            .borrow()
             .iter()
-            .filter(|a| matches!(self.resolve(a), AttemptState::Pending))
-            .map(|a| self.pending_from_attempt(a))
+            .filter(|o| !o.cancelled)
+            .map(|o| self.pending_from_held(o))
             .collect();
         Ok(pendings)
     }
@@ -1394,329 +1621,6 @@ mod tests {
         assert!(
             b.list_pending_orders("").await.unwrap().is_empty(),
             "a cancelled order is never resting"
-        );
-    }
-
-    // --- PR 4b-1: position-ledger shadow parity ------------------------------
-    //
-    // The ledger's `realized_outcome(order_id)` must reproduce the report's
-    // current `resolve_fire_any` outcome BIT-FOR-BIT (same fill_at, entry_price,
-    // until, SL/TP, and equivalent kind) before 4b-2 switches the report over to
-    // it. These build representative fires (fill→TP, fill→SL, never-fill,
-    // fill→reversal-close) and assert the two agree — the 4b-1 gate.
-
-    use super::super::replay::{EnterGateOutcome, Fire};
-    use super::super::report::resolve_fire_any;
-    use trade_control_engine::{FiredIntent, Granularity, TradePlan};
-
-    /// A long stop-entry enter anchored to absolute levels (no signal geometry
-    /// needed): buys through the 1.1000 stop, SL 1.0950, TP 1.1100. Built from
-    /// YAML like the report tests, so the `Intent` literal stays out of the way.
-    fn long_stop_enter() -> Intent {
-        serde_yaml::from_str(
-            "
-            v: 1
-            id: t-enter
-            trade_id: t
-            not_after: \"2026-06-30T00:00:00Z\"
-            action: enter
-            instrument: EUR_USD
-            direction: long
-            entry: { type: stop, from: close, offset_pips: 0.0, at: 1.1000 }
-            stop_loss: { absolute: 1.0950 }
-            take_profit: { absolute: 1.1100 }
-            risk_pct: 1.0
-        ",
-        )
-        .expect("valid long enter intent")
-    }
-
-    /// A minimal H1 plan for EUR_USD at 0.0001 pip — only the fields
-    /// `resolve_fire_any` / the ledger read matter (pip_size, tick fallback).
-    fn ledger_plan() -> TradePlan {
-        TradePlan {
-            trade_id: "t".into(),
-            instrument: "EUR_USD".into(),
-            direction: Direction::Long,
-            granularity: Granularity::H1,
-            pip_size: 0.0001,
-            rules: Vec::new(),
-            shadow: false,
-            cross_buffer_pct: 0.0,
-            cross_buffer_atr: 0.0,
-            bcr_require_golden: false,
-            retest_atr_step: trade_control_core::trade_plan::DEFAULT_RETEST_ATR_STEP,
-            replay_start: None,
-            armed_at: None,
-            armed_sentiment: None,
-        }
-    }
-
-    /// Build an enter `Fire` (as `run_enter` would have placed it) over `forward`,
-    /// with the given placed order id. The signal is `None` (a stop enter carries
-    /// no latched Pine signal), so the shell is the plain candle shell — exactly
-    /// the branch both `resolve_fire_any` and the ledger take.
-    fn placed_enter_fire(intent: Intent, forward: Vec<BidAskCandle>, order_id: &str) -> Fire {
-        let fire_candle = forward.first().expect("non-empty forward").mid();
-        Fire {
-            fired: FiredIntent {
-                rule_id: "05-enter".into(),
-                intent,
-                candle: fire_candle,
-                signal: None,
-            },
-            forward,
-            gate_outcome: EnterGateOutcome::Placed {
-                order_id: Some(order_id.to_string()),
-            },
-            superseded: false,
-            // Set by `assert_shadow_parity` after recording (read back from the
-            // broker), so the direct-record test path mirrors the driver.
-            placed_bracket: None,
-            realized: None,
-        }
-    }
-
-    /// Drive a fire through the broker ledger exactly as the replay loop does
-    /// (record its geometry, realize it against the close-fire set, stash the
-    /// outcome on the fire), then assert the report's `resolve_fire_any` reads
-    /// that outcome back faithfully — every load-bearing field. This is the 4b-2
-    /// wiring guarantee: the report is pure formatting of the broker's ledger.
-    fn assert_shadow_parity(mut fire: Fire, closes: &[CloseFire], order_id: &str) {
-        let plan = ledger_plan();
-        let broker = ReplayBroker::new(fire.forward.clone(), plan.pip_size);
-        let shell = Shell::from_candle(&fire.fired.candle);
-        broker.record_order(
-            order_id.into(),
-            fire.fired.intent.clone(),
-            shell,
-            fire.forward.clone(),
-        );
-        // The loop reads back the placed bracket + stashes the broker's realized
-        // outcome on the fire; the report reads both (never re-simulating).
-        fire.placed_bracket = broker.placed_bracket(order_id);
-        let realized = broker
-            .realized_outcome(order_id, closes)
-            .expect("ledger realizes this order");
-        fire.realized = Some(realized.clone());
-
-        let got = resolve_fire_any(&plan, &fire).expect("report resolves this enter");
-
-        assert_eq!(got.kind, realized.kind, "kind must match the broker");
-        assert_eq!(got.direction, realized.direction, "direction");
-        assert_eq!(got.fill_at, realized.fill_at, "fill_at");
-        assert_eq!(got.until, realized.until, "until (box right edge)");
-        assert!(
-            (got.entry_price - realized.entry_price).abs() < 1e-12,
-            "entry_price {} vs {}",
-            got.entry_price,
-            realized.entry_price
-        );
-        assert!(
-            (got.stop_loss - realized.stop_loss).abs() < 1e-12,
-            "stop_loss {} vs {}",
-            got.stop_loss,
-            realized.stop_loss
-        );
-        assert!(
-            (got.take_profit - realized.take_profit).abs() < 1e-12,
-            "take_profit {} vs {}",
-            got.take_profit,
-            realized.take_profit
-        );
-    }
-
-    #[test]
-    fn shadow_parity_fill_then_take_profit() {
-        // Fire below the 1.1000 stop, rise through it (fill on the ask), then on
-        // to the 1.1100 TP (exit on the bid).
-        let forward = vec![
-            candle(0, 1.0980),
-            candle(3600, 1.1010), // ask reaches the 1.1000 buy-stop → fill
-            candle(7200, 1.1110), // bid reaches the 1.1100 TP → exit
-        ];
-        let fire = placed_enter_fire(long_stop_enter(), forward, "o-tp");
-        assert_shadow_parity(fire, &[], "o-tp");
-    }
-
-    #[test]
-    fn shadow_parity_fill_then_stop_loss() {
-        // Fill on bar 1, then drop through the 1.0950 SL on bar 2.
-        let forward = vec![
-            candle(0, 1.0980),
-            candle(3600, 1.1010), // fill
-            candle(7200, 1.0949), // bid through the 1.0950 SL → stopped
-        ];
-        let fire = placed_enter_fire(long_stop_enter(), forward, "o-sl");
-        assert_shadow_parity(fire, &[], "o-sl");
-    }
-
-    #[test]
-    fn shadow_parity_never_filled() {
-        // Price never reaches the 1.1000 stop — a resting order that never fills.
-        let forward = vec![
-            candle(0, 1.0980),
-            candle(3600, 1.0985),
-            candle(7200, 1.0990),
-        ];
-        let fire = placed_enter_fire(long_stop_enter(), forward, "o-nf");
-        assert_shadow_parity(fire, &[], "o-nf");
-    }
-
-    #[test]
-    fn shadow_parity_fill_then_reversal_close() {
-        // Fill on bar 1, then a reversal-close fires on bar 2 (before any SL/TP),
-        // flattening the position at the close bar's price. Both sides must apply
-        // the reversal-close post-pass identically.
-        let forward = vec![
-            candle(0, 1.0980),
-            candle(3600, 1.1010),  // fill
-            candle(7200, 1.1020),  // still open (no SL/TP touch)
-            candle(10800, 1.1030), // still open
-        ];
-        let fire = placed_enter_fire(long_stop_enter(), forward, "o-rev");
-        // A reversal-close at bar 2 (3600 after fill), price 1.1015.
-        let closes = vec![CloseFire {
-            at: Utc.timestamp_opt(7200, 0).unwrap(),
-            price: 1.1015,
-        }];
-        assert_shadow_parity(fire, &closes, "o-rev");
-    }
-
-    #[test]
-    fn shadow_parity_still_open_at_window_end() {
-        // Fill on bar 1, never exits within the window → Open, box runs to the
-        // last forward bar. Exercises the `until = window_end` branch.
-        let forward = vec![
-            candle(0, 1.0980),
-            candle(3600, 1.1010), // fill
-            candle(7200, 1.1020),
-        ];
-        let fire = placed_enter_fire(long_stop_enter(), forward, "o-open");
-        assert_shadow_parity(fire, &[], "o-open");
-    }
-
-    /// Divergence #4, dissolved: the retry-gate `resolve` and the ledger both walk
-    /// the SAME stored placed stop, so a wick landing BETWEEN the signed SL and the
-    /// (wider) placed SL can no longer flip one path's verdict from the other's.
-    ///
-    /// The short's signed SL is 1.1020; we place it (via the real `place_entry`
-    /// path) with a FLOORED stop of 1.1030 in the `EntryRequest` — exactly what
-    /// `run_enter` hands the broker after the SL-spread floor widens it. A later
-    /// bar's ask wicks to 1.1025 — past the signed 1.1020 but short of the placed
-    /// 1.1030. With the placed stop honoured, the position is NOT stopped: both
-    /// `resolve` (→ OpenPosition) and `realized_outcome` (→ Open, no exit) agree.
-    /// (Pre-"orders-are-state", `resolve` floored off the fire-bar spread and the
-    /// ledger off a trailing mean, so a 1.1025 wick could stop one but not the
-    /// other — the #4 corner.)
-    #[tokio::test]
-    async fn resolve_and_realize_agree_on_the_stored_placed_stop() {
-        // Explicit books: a short fills when the BID falls to 1.1000, exits (SL)
-        // when the ASK rises to the stop. Bar 2's ask peaks at 1.1025.
-        let ba = |epoch: i64, bid: f64, ask: f64, bid_h: f64, ask_h: f64| BidAskCandle {
-            time: Utc.timestamp_opt(epoch, 0).unwrap(),
-            o: (bid + ask) / 2.0,
-            h: (bid_h + ask_h) / 2.0,
-            l: (bid + ask) / 2.0 - 0.001,
-            c: (bid + ask) / 2.0,
-            bid_o: bid,
-            bid_h,
-            bid_l: bid - 0.001,
-            bid_c: bid,
-            ask_o: ask,
-            ask_h,
-            ask_l: ask - 0.001,
-            ask_c: ask,
-        };
-        let forward = vec![
-            ba(0, 1.1010, 1.1012, 1.1012, 1.1014), // fire bar (short enter fires)
-            ba(3600, 1.0998, 1.1000, 1.1002, 1.1004), // bid 1.0998 ≤ 1.1000 → fill
-            ba(7200, 1.1021, 1.1023, 1.1023, 1.1025), // ask peaks 1.1025 (past signed 1.1020)
-            ba(10800, 1.1000, 1.1002, 1.1004, 1.1006), // still open, no exit
-        ];
-        let b = ReplayBroker::new(forward.clone(), 0.0001);
-        let shell = Shell::from_candle(&forward[0].mid());
-        b.arm_placement("o4".into(), short_enter_intent(), shell);
-        // Place with the FLOORED stop (1.1030), as `run_enter` would after the
-        // SL-spread floor — wider than the signed 1.1020.
-        let req = EntryRequest {
-            instrument: "EUR/USD",
-            direction: Direction::Short,
-            entry: ResolvedEntry::Stop {
-                trigger_price: 1.1000,
-            },
-            stop_loss: 1.1030,
-            take_profit: 1.0950,
-            risk: RiskBudget::Percent(1.0),
-            dry_run: false,
-        };
-        let order_id = b.place_entry(1.0, 3, &req).await.expect("placed");
-        // The driver attaches the forward path after placement (the ledger input);
-        // this upgrades the existing attempt in place, preserving its placed levels.
-        b.record_order(
-            order_id.clone(),
-            short_enter_intent(),
-            Shell::from_candle(&forward[0].mid()),
-            forward.clone(),
-        );
-
-        // Retry-gate state: as of the wick bar, the position is OPEN (the 1.1025
-        // ask never reached the placed 1.1030 stop) — NOT closed-at-loss.
-        b.set_as_of(Utc.timestamp_opt(7200, 0).unwrap());
-        let states = b.placed.borrow();
-        let attempt = states.iter().find(|a| a.order_id == order_id).unwrap();
-        assert!(
-            matches!(b.resolve(attempt), AttemptState::OpenPosition { .. }),
-            "resolve must see the position OPEN against the placed 1.1030 stop, \
-             not stopped by the 1.1025 wick past the signed 1.1020"
-        );
-        drop(states);
-
-        // Ledger: the realized outcome is Open (no exit) — the SAME verdict, off
-        // the SAME placed stop. (No reversal-close fires.)
-        let realized = b
-            .realized_outcome(&order_id, &[])
-            .expect("ledger realizes the placed order");
-        assert_eq!(
-            realized.kind,
-            FillKind::Open,
-            "ledger must agree: open, not stopped — got {:?}",
-            realized.kind
-        );
-        assert!(
-            (realized.stop_loss - 1.1030).abs() < 1e-12,
-            "the scored stop is the placed 1.1030, not the signed 1.1020 — got {}",
-            realized.stop_loss
-        );
-    }
-
-    #[tokio::test]
-    async fn realized_outcome_is_none_for_a_cancelled_order() {
-        // A cancelled ledger order has no realized outcome — the lifecycle-cancel
-        // case later stages drive into a "no fill". (The forward path would
-        // otherwise fill-and-TP, so this proves the cancel overrides the physics.)
-        let forward = vec![
-            candle(0, 1.0980),
-            candle(3600, 1.1010),
-            candle(7200, 1.1110),
-        ];
-        let fire = placed_enter_fire(long_stop_enter(), forward.clone(), "o-cancel");
-        let broker = ReplayBroker::new(forward.clone(), 0.0001);
-        let shell = Shell::from_candle(&fire.fired.candle);
-        broker.record_order("o-cancel".into(), fire.fired.intent.clone(), shell, forward);
-        // Sanity: it realizes to a taken outcome before the cancel.
-        assert!(
-            broker
-                .realized_outcome("o-cancel", &[])
-                .unwrap()
-                .kind
-                .is_taken()
-        );
-        // After cancel: no realized outcome.
-        broker.cancel_order("", "o-cancel").await.unwrap();
-        assert!(
-            broker.realized_outcome("o-cancel", &[]).is_none(),
-            "a cancelled order has no realized outcome"
         );
     }
 }
