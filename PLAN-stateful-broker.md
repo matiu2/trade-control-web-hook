@@ -110,7 +110,30 @@ lookups. Loop sets `set_as_of(bar_open)` for advance+assert, then the existing
 `set_as_of(now)` at ~L555 restores the bar-close clock for the lifecycle.
 This proves `advance()` reproduces the sim EXACTLY as persisted state.
 
-### NEXT: S4 — switch reads to held state
+### ✅ S4 DONE + COMMITTED — retry-gate reads use held state
+lookup_attempt_state + list_open_positions read held resting/open/closed (advance
+to current as_of first so isolated callers see the progression). held_attempt_state
+mirrors resolve's mapping incl {id}-pos + ±1.0 sentinels. All green.
+
+### ✅ S5a DONE + COMMITTED — close_positions really flattens
+close_positions removes matching held open→closed at bar close, tagged
+Reversal/Expiry (loop set_close_reason before dispatch). cancel_pending_for_instrument
+cancels held resting. Loop dispatch gained: Action::Close arm (gated by shared
+allow_close_gate::evaluate) + ClosePositions-veto arm (trade-expiry flatten).
+Shadow-parity relaxed to SKIP reversal/expiry-closed orders (re-sim can't model
+them — held model now MORE correct). Report P&L STILL reads old post-loop
+realized_outcome pass, so fixtures unchanged, all 109 green.
+
+### NEXT: S5b — switch report P&L to read held `closed` ledger
+Replace the post-loop `realized_outcome` pass (replay.rs ~L590) so the report
+reads held `closed` (+ `open` for still-open). THIS surfaces the EUR/USD fix
+(entry #2 books reversal R, #3/#4/#5 unblock) AND CHANGES FIXTURES. Need a way to
+render an Expiry close (FillKind has ClosedOnReversal but no ClosedAtExpiry).
+Agent a42340084ef3f0028 mapping report P&L consumption. After S5b: run fixtures,
+DO NOT rebless — collect all changed fixtures, give operator plain-English
+one-liners for sign-off.
+
+### (old) S4 note — switch reads to held state
 `list_open_positions` + `lookup_attempt_state` read held `open`/`resting`/`closed`
 instead of re-sim `resolve`. Must keep shadow-parity assert green AND all
 fixtures. The open-positions CAP count (place_entry, ~L1172) also currently uses
