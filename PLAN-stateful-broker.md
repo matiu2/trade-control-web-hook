@@ -28,9 +28,20 @@
   order at window end. Declined kept #[allow(dead_code)] (declines flow via
   rejected_reason→GateBlocked now). record_attempt made pub(crate). 0 clippy
   warnings, 103 tests green. EUR/USD fix intact (REV +0.55R, EXP +0.80R).
-- NEXT: S9 (final full verification — run all fixtures + a broader replay if
-  possible; golden fixtures independent so no rebless). Then S11 (move
-  simulate_fill* out of engine). Then merge to this repo main + bump parent gitlink.
+- ✅ S9 DONE: full workspace green — engine 910 tests, core 200, CLI all targets,
+  tv-arm 265, etc. 0 failures. Workspace clippy clean. Nothing depends on the
+  deleted re-sim code. Confirmed post-rewrite the ONLY simulate_fill* callers are
+  cli/src/bin/replay_candles/fixture.rs:185 + replay_broker.rs:706 (live worker
+  calls NONE). So the S11 move is valid.
+- IN PROGRESS S11 (agent a2ee16f4099ab8889 scoping): move replay-only fill-walker
+  (simulate_fill, _windowed, _resolved, _resolved_zoom, SimOutcome, SubBars/NoZoom,
+  find_fill, zoom_ambiguous_bar + private helpers) OUT of engine/src/simulator.rs
+  into cli/src/bin/replay_candles/. KEEP shared primitives (resolve_effective_bracket,
+  breakeven, spread-hour suppression, floor) in engine — live worker uses them.
+  Watch for circular deps (STAY calling MOVE) — agent checking. Then merge to
+  this repo main + bump parent gitlink.
+- NEXT after S11: merge replay-stateful-broker → main (this repo), then parent
+  gitlink bump per CLAUDE.md submodule note.
 
 ### (historical) S8 mapping notes:
 - (agent ab42b245b0c2606f5 mapped the dead set): delete re-sim
