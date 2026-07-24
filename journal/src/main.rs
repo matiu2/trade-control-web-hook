@@ -9,6 +9,8 @@
 
 mod app;
 mod cli;
+mod clipboard;
+mod content;
 mod divergence;
 mod jobs;
 mod keys;

@@ -568,6 +568,20 @@ impl App {
         self.needs_clear = true;
         self.status = Status::info("refreshed");
     }
+
+    /// Copy the **full** content of the current view (the whole list / timeline /
+    /// replay / compare, or the detail popup if open — not just the visible
+    /// part) to the system clipboard (the `c` key).
+    pub fn copy_current(&mut self) {
+        let text = crate::content::current(self);
+        let lines = text.lines().count();
+        match crate::clipboard::copy(&text) {
+            Ok(tool) => {
+                self.status = Status::info(format!("copied {lines} line(s) to clipboard ({tool})"))
+            }
+            Err(e) => self.status = Status::error(format!("copy: {e}")),
+        }
+    }
 }
 
 /// Fetch + parse the plan list.

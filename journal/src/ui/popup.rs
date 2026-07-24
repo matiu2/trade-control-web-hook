@@ -37,7 +37,7 @@ pub fn render_detail(f: &mut Frame, app: &App) {
             max_scroll.saturating_add(1)
         )
     };
-    let title = format!(" Plan detail{position}— ↑↓/jk pgup/pgdn g/G, i/esc close ");
+    let title = format!(" Plan detail{position}— ↑↓/jk pgup/pgdn g/G, c copy, i/esc close ");
     let block = Block::default()
         .borders(Borders::ALL)
         .title(title)

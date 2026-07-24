@@ -35,6 +35,8 @@ pub enum Action {
     ReplayEnd,
     /// Force a full-screen repaint (Ctrl-L) — clears any residual corruption.
     Redraw,
+    /// Copy the full content of the current view to the clipboard (the `c` key).
+    Copy,
     None,
 }
 
@@ -76,6 +78,7 @@ pub fn map_key(app: &App, key: KeyEvent) -> Action {
             }
             KeyCode::Home | KeyCode::Char('g') => Action::PopupHome,
             KeyCode::End | KeyCode::Char('G') => Action::PopupEnd,
+            KeyCode::Char('c') => Action::Copy,
             _ => Action::None,
         };
     }
@@ -98,6 +101,7 @@ pub fn map_key(app: &App, key: KeyEvent) -> Action {
             KeyCode::Left => Action::Shallower,
             KeyCode::Char('l') => Action::LoadTv,
             KeyCode::Char('r') => Action::Replay,
+            KeyCode::Char('c') => Action::Copy,
             KeyCode::Char('i') => Action::TogglePopup,
             KeyCode::Char('x') => Action::RequestDelete,
             KeyCode::Char('q') | KeyCode::Esc => Action::Quit,
@@ -114,6 +118,7 @@ pub fn map_key(app: &App, key: KeyEvent) -> Action {
         KeyCode::Char('l') => Action::LoadTv,
         KeyCode::Char('r') => Action::Replay,
         KeyCode::Char('s') | KeyCode::Char('S') => Action::Record,
+        KeyCode::Char('c') => Action::Copy,
         KeyCode::Char('i') => Action::TogglePopup,
         KeyCode::Char('d') | KeyCode::Char('x') => Action::RequestDelete,
         _ => Action::None,
@@ -142,6 +147,7 @@ pub fn apply(app: &mut App, action: Action) {
         Action::ReplayHome => app.scroll_replay_home(),
         Action::ReplayEnd => app.scroll_replay_end(),
         Action::Redraw => app.request_redraw(),
+        Action::Copy => app.copy_current(),
         Action::None => {}
     }
 }
