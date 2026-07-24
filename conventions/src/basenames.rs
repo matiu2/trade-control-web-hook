@@ -48,6 +48,12 @@ pub enum AlertBasename {
     PrepBreakAndClose,
     /// `04-prep-retest` — neckline retest prep.
     PrepRetest,
+    /// `04b-prep-pullback` — pullback prep: price retraced ≥ N×ATR from its
+    /// running body-extreme since arm time. An **alternative** to the retest
+    /// (an `[retest, pullback]` either/or enter group); binds to no drawing (the
+    /// anchor is the baked arm-time mid open). Same `04` prep family as the
+    /// retest, suffixed `b` so it sorts right after it.
+    PrepPullback,
     /// `NN-prep-expire-<step>` — prep-expiry vertical line. When this
     /// fires, the worker blocks any further `prep` for `<step>` on the
     /// trade, so the entry's `requires_preps` gate for that step can
@@ -97,6 +103,7 @@ impl AlertBasename {
             Self::VetoMwOvershoot => Cow::Borrowed("01-veto-mw-overshoot"),
             Self::PrepBreakAndClose => Cow::Borrowed("03-prep-break-and-close"),
             Self::PrepRetest => Cow::Borrowed("04-prep-retest"),
+            Self::PrepPullback => Cow::Borrowed("04b-prep-pullback"),
             Self::PrepExpire(step) => Cow::Owned(format!("08-prep-expire-{step}")),
             Self::Enter => Cow::Borrowed("05-enter"),
             Self::EnterQm => Cow::Borrowed("09-enter-qm"),
@@ -125,6 +132,7 @@ impl AlertBasename {
             "01-veto-mw-overshoot" => Some(Self::VetoMwOvershoot),
             "03-prep-break-and-close" => Some(Self::PrepBreakAndClose),
             "04-prep-retest" => Some(Self::PrepRetest),
+            "04b-prep-pullback" => Some(Self::PrepPullback),
             "05-enter" => Some(Self::Enter),
             "09-enter-qm" => Some(Self::EnterQm),
             "06-close-on-reversal" => Some(Self::CloseOnReversal),
@@ -160,7 +168,7 @@ impl AlertBasename {
 mod tests {
     use super::*;
 
-    fn variants() -> [AlertBasename; 18] {
+    fn variants() -> [AlertBasename; 19] {
         [
             AlertBasename::VetoTooHigh,
             AlertBasename::VetoTooLow,
@@ -170,6 +178,7 @@ mod tests {
             AlertBasename::VetoMwOvershoot,
             AlertBasename::PrepBreakAndClose,
             AlertBasename::PrepRetest,
+            AlertBasename::PrepPullback,
             AlertBasename::PrepExpire("break-and-close".into()),
             AlertBasename::PrepExpire("retest".into()),
             AlertBasename::Enter,

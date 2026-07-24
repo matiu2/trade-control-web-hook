@@ -57,6 +57,27 @@ pub async fn read_spread_pips(broker: Broker, instrument: &str, pip_size: f64) -
     Ok(spread_pips)
 }
 
+/// Read the live broker **mid** price for `instrument` — `(bid + ask) / 2` at
+/// arm time. Used as the pullback prep's arm-time anchor (`--pull-back`): the
+/// price the plan started from, baked onto the signed plan so the engine measures
+/// the retrace from the same reference in replay and live. Reuses the same
+/// bid/ask read as [`read_spread_pips`]; hard-errors on a stale/degenerate quote
+/// (a bad anchor would silently mis-fire every pullback).
+pub async fn read_mid(broker: Broker, instrument: &str) -> Result<f64> {
+    let (bid, ask) = match broker {
+        Broker::Oanda => read_oanda_bid_ask(instrument).await?,
+        Broker::TradeNation => read_tradenation_bid_ask(instrument).await?,
+    };
+    // Reuse the spread validation to reject non-finite / inverted quotes.
+    spread_from_bid_ask(bid, ask)?;
+    let mid = (bid + ask) / 2.0;
+    info!(
+        broker = broker.as_str(),
+        instrument, bid, ask, mid, "live broker mid read (pullback anchor)",
+    );
+    Ok(mid)
+}
+
 /// Validate a bid/ask pair and return the spread in price units. A
 /// non-finite, zero, or inverted (`ask <= bid`) quote is a hard error —
 /// it usually means the market is closed or the feed is stale, and a

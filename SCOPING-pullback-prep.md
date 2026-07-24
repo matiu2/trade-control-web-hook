@@ -222,10 +222,21 @@ selection filters (`[[signal_criteria_refactor]]`).
    `stamp_pullback`, `pullback_seen_at`, `retest_satisfied`-style
    `pullback_satisfied`. Engine tests (fires after N×ATR retrace; respects
    `(break_close_at, entry]`; fail-closed on ATR-starved window).
-3. **PR-C — build-trade + tv-arm flag.** `AlertBasename::PrepPullback`,
-   `RuleKind`, `build_pullback_alert`, trade_plan_build arm, `--pull-back`
-   flag, `KNOWN_PREP_NAMES`, `skip_preps`. End-to-end: `tv-arm … --pull-back`
-   emits an enter whose `requires_preps = [break-and-close, [retest, pullback]]`.
+3. **PR-C — build-trade + tv-arm flag. ✅ DONE.** `AlertBasename::PrepPullback`
+   (`04b-prep-pullback`) + round-trip, `RuleKind::PrepPullback`,
+   `build_pullback_alert` (cli), the either/or group assembly in
+   `build_enter_alert` (via `PrepReq::from_alternatives`), the
+   `trigger_for` → `Trigger::PullbackFromArm` arm (anchor baked via a new
+   `PullbackArm` threaded through `build_trade_plan`), the `--pull-back` clap flag
+   (bare = 1.0, `=1.5` overrides), `TradeSpec.pull_back`, and the arm-time live-mid
+   anchor read (`spread::read_mid` + `read_mid_blocking`). End-to-end verified:
+   `tv-arm … --pull-back` emits `04b-prep-pullback` and an enter with
+   `requires_preps = [break-and-close, [retest, pullback]]`;
+   `--pull-back --skip-retest` collapses to `[break-and-close, pullback]`; no flag
+   ⇒ byte-identical legacy `[break-and-close, retest]`. Full suite green;
+   clippy/fmt clean on touched files. **Note:** `KNOWN_PREP_NAMES` intentionally
+   NOT extended — it validates operator-typed `skip_preps`, and `pullback` isn't a
+   skip target in the current flag design (a follow-up could add `--skip-pullback`).
 4. **PR-D (optional/later) — confirmed-as-prep unification.**
 
 Replay parity checked with an existing fixture through each PR (the

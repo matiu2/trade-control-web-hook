@@ -870,6 +870,15 @@ fn read_spread_blocking(
         .map_err(ResolveError::Fatal)
 }
 
+/// Blocking live **mid** read — the pullback prep's arm-time anchor. Same
+/// runtime-bridge shape as [`read_spread_blocking`]; hard-errors on a
+/// stale/degenerate quote so a bad anchor can't silently mis-fire the pullback.
+fn read_mid_blocking(broker: Broker, instrument: &str) -> Result<f64> {
+    let runtime =
+        tokio::runtime::Runtime::new().context("starting tokio runtime for live mid read")?;
+    runtime.block_on(crate::spread::read_mid(broker, instrument))
+}
+
 /// The static M/W geometry baked into the signed enter intent — a
 /// complete mirror of `cli::MwSpec`. `pip_size` is the canonical catalog
 /// value (or the `--pip-size` override); `spread_pips` the arm-time
@@ -948,6 +957,9 @@ fn build_mw_trade_spec(
         // vetos; the bar-count menu is an H&S feature.
         expiry_bars: None,
         skip_preps: Vec::new(),
+        // Pullback is an H&S retest alternative; the M/W path has its own
+        // geometry (cancel/abort/overshoot) and no retest, so no pullback.
+        pull_back: None,
         entry_offset_pips: None,
         sl_offset_pips: None,
         // Both offset forms None → the shared builder applies the ATR-pct
@@ -1219,6 +1231,7 @@ fn build_trade_spec(
             },
             expiry_bars: args.expiry_bars,
             skip_preps,
+            pull_back: args.pull_back,
             entry_offset_pips: None,
             sl_offset_pips: None,
             // Both offset forms None → the shared builder applies the ATR-pct
@@ -1383,6 +1396,13 @@ fn broker_to_kind(b: Broker) -> cli::BrokerKind {
     match b {
         Broker::Oanda => cli::BrokerKind::Oanda,
         Broker::TradeNation => cli::BrokerKind::TradeNation,
+    }
+}
+
+fn kind_to_broker(k: cli::BrokerKind) -> Broker {
+    match k {
+        cli::BrokerKind::Oanda => Broker::Oanda,
+        cli::BrokerKind::TradeNation => Broker::TradeNation,
     }
 }
 
@@ -2121,6 +2141,23 @@ fn register_trade_plan(
     // time — so a replayed arming reads back the historical moment. Otherwise
     // use the real `now`.
     let armed_at = effective_arm_time(replay_start, now);
+    // Pullback prep (--pull-back): capture the arm-time anchor (live mid) and the
+    // ATR multiple so `build_trade_plan` can bake them onto the trigger. Read only
+    // when a pullback is armed. A live-mid read failure is fatal — a bad/guessed
+    // anchor would silently mis-fire every pullback (same discipline as the M/W
+    // arm-time spread read).
+    let pullback_arm = match built_trade.spec.pull_back {
+        Some(atr_mult) => {
+            let broker = built_trade.spec.broker;
+            let anchor_open = read_mid_blocking(kind_to_broker(broker), &built_trade.instrument)
+                .wrap_err("read live mid for --pull-back anchor")?;
+            Some(crate::trade_plan_build::PullbackArm {
+                anchor_open,
+                atr_mult,
+            })
+        }
+        None => None,
+    };
     let mut plan = build_trade_plan(
         &built_trade.trade_id,
         &built_trade.instrument,
@@ -2137,6 +2174,7 @@ fn register_trade_plan(
         bcr_require_golden,
         armed_at,
         armed_sentiment,
+        pullback_arm,
     );
     // Unwrap the tv-arm bundle wrappers to the cli `BuiltPause`/`BuiltNews` the
     // appender reads (each carries the signed intents + window times).
@@ -3099,6 +3137,7 @@ mod tests {
             args.bcr_require_golden,
             chrono::Utc::now(),
             None,
+            None, // pullback_arm
         )
     }
 
