@@ -299,6 +299,18 @@ pub struct Args {
     #[arg(long)]
     pub retest_atr_step: Option<f64>,
 
+    /// Accept a **pullback** as an alternative to the retest: price retraces
+    /// ≥ N×ATR from its running body-extreme since arm time (in the entry
+    /// direction), independent of any neckline. Bare `--pull-back` uses 1.0 ATR;
+    /// `--pull-back=1.5` overrides the multiple. When set, the enter's retest
+    /// slot becomes an either/or group — `[retest, pullback]` (or just
+    /// `pullback` if combined with `--skip-retest`). Does NOT imply
+    /// `--skip-retest`; both preps are emitted and OR'd unless a skip drops one.
+    /// The arm-time candle's mid open is baked onto the pullback trigger as its
+    /// anchor. Absent = no pullback prep.
+    #[arg(long, num_args = 0..=1, default_missing_value = "1.0")]
+    pub pull_back: Option<f64>,
+
     /// **DEPRECATED** (2026-07-15) — use `--cross-buffer-atr` instead. Cross-depth
     /// buffer as a **percent of the crossed level's price**. Volatility-blind: the
     /// same 0.02% is ~1.7p on EUR/GBP but a very different pip count on Gold or an

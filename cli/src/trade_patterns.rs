@@ -366,6 +366,15 @@ pub struct TradeSpec {
     /// out its preps). Unknown names are rejected.
     #[serde(default)]
     pub skip_preps: Vec<String>,
+    /// Optional **pullback** prep as an alternative to the retest: `Some(mult)`
+    /// arms it at `mult × ATR` retrace (from `tv-arm --pull-back` / `--pull-back=
+    /// 1.5`; bare = 1.0). When set, a `04b-prep-pullback` alert is emitted and the
+    /// enter's retest slot becomes an either/or group (`[retest, pullback]`, or
+    /// just `pullback` if `retest` is skipped). Does NOT imply skipping the
+    /// retest. `None` = no pullback prep (today's behaviour). The arm-time anchor
+    /// (mid open) is captured by `tv-arm` and baked onto the trigger, not here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pull_back: Option<f64>,
     /// **Deprecated** — prefer `entry_offset_atr_pct`. Entry stop-trigger
     /// offset in pips from the geometry anchor. When set, opts this enter back
     /// into the legacy pip buffer; mutually exclusive with
@@ -1024,6 +1033,7 @@ fn build_pattern(
         needs_confirmed_close: false,
         prep_expiries: Vec::new(),
         skip_preps: Vec::new(),
+        pull_back: None,
         entry_offset_pips: Some(entry_offset_pips),
         sl_offset_pips: Some(sl_offset_pips),
         // Interactive path is pip-based — the ATR-pct overrides stay unset.
@@ -1142,6 +1152,18 @@ fn assemble_trade(
             &spec.account,
         ));
     }
+    // Pullback prep (alternative to the retest). Emitted when `--pull-back` is
+    // set; the enter's retest slot then becomes an `[retest, pullback]` either/or
+    // group (or just `pullback` if the retest is skipped) — see `build_enter_alert`.
+    if spec.pull_back.is_some() {
+        alerts.push(build_pullback_alert(
+            &spec.instrument,
+            &trade_id,
+            spec.trade_expiry,
+            &spec.broker,
+            &spec.account,
+        ));
+    }
     // One prep-expire alert per chart-drawn `<prep>-expiry` line. When
     // its vertical line is crossed, the worker blocks further preps for
     // that step, so a setup whose prep lands too late never enters.
@@ -1175,6 +1197,7 @@ fn assemble_trade(
         spec.needs_golden,
         spec.needs_confirmed,
         &spec.skip_preps,
+        spec.pull_back.is_some(),
         spec.pip_size,
         spec.tick_size,
         spec.blackout_close,
@@ -1244,6 +1267,7 @@ fn assemble_trade(
             spec.needs_golden, // needs_golden: default true, --skip-golden clears
             true,              // QM is always confirmed-candle gated
             &qm_skip_preps,
+            false, // QM leg is prep-free (skips both preps) — no pullback either
             spec.pip_size,
             spec.tick_size,
             spec.blackout_close,
@@ -1976,6 +2000,38 @@ fn build_retest_alert(
     }
 }
 
+/// Build the `04b-prep-pullback` alert — the pullback prep (an alternative to
+/// the retest). Mirrors [`build_retest_alert`]: a `Prep` action with
+/// `step = "pullback"` and no TTL (it lives for the life of the trade and only
+/// has to happen once). The server-side trigger geometry (the ATR multiple + the
+/// baked arm-time anchor) is attached by `tv-arm`'s `trigger_for`, not here — the
+/// intent only carries the prep step name the enter's gate reads.
+fn build_pullback_alert(
+    instrument: &str,
+    trade_id: &str,
+    trade_expiry: DateTime<Utc>,
+    broker: &BrokerKind,
+    account: &str,
+) -> BuiltAlert {
+    let id = format!("{trade_id}-pullback");
+    let mut intent = skeleton(
+        Action::Prep,
+        instrument,
+        id,
+        trade_expiry,
+        *broker,
+        account,
+        trade_id,
+    );
+    intent.step = Some("pullback".into());
+    intent.ttl_hours = trade_control_core::tunable::Tunable::Static(PREP_NO_EXPIRY_HOURS);
+    BuiltAlert {
+        basename: AlertBasename::PrepPullback.as_str().into_owned(),
+        purpose: "prep: pullback (≥N×ATR body retrace since arm; gates entry)".into(),
+        intent,
+    }
+}
+
 /// Build a `prep-expire` alert for `step`. Drawing-bound on the chart
 /// to a `<step>-expiry` vertical line; when crossed, the worker blocks
 /// any further `prep` for that step on the trade, so a setup whose prep
@@ -2034,6 +2090,7 @@ fn build_enter_alert(
     needs_golden: bool,
     needs_confirmed: bool,
     skip_preps: &[String],
+    pull_back: bool,
     pip_size: Option<f64>,
     tick_size: Option<f64>,
     blackout_close: BlackoutCloseAction,
@@ -2169,11 +2226,28 @@ fn build_enter_alert(
     // Market-hours blackout close policy — what the sweep does with this
     // order if it's caught resting in the close→open gap.
     intent.blackout_close = blackout_close;
-    intent.requires_preps = ["break-and-close", "retest"]
-        .into_iter()
-        .filter(|step| !skip_preps.iter().any(|s| s == step))
-        .map(String::from)
-        .collect();
+    // Prep gate. Slot 1 is the break-and-close (unless skipped). Slot 2 is the
+    // retest/pullback milestone: retest (unless skipped) and pullback (when
+    // armed) are either/or ALTERNATIVES — `PrepReq::from_alternatives` collapses
+    // to a bare `All` for a single survivor (so `[break-and-close, retest]` stays
+    // byte-identical to the historical wire form) or an `Any` group for both.
+    use trade_control_core::intent::PrepReq;
+    let skipped = |step: &str| skip_preps.iter().any(|s| s == step);
+    let mut requires_preps: Vec<PrepReq> = Vec::new();
+    if !skipped("break-and-close") {
+        requires_preps.push(PrepReq::All("break-and-close".to_string()));
+    }
+    let mut milestone_alts: Vec<&str> = Vec::new();
+    if !skipped("retest") {
+        milestone_alts.push("retest");
+    }
+    if pull_back && !skipped("pullback") {
+        milestone_alts.push("pullback");
+    }
+    if let Some(slot) = PrepReq::from_alternatives(milestone_alts) {
+        requires_preps.push(slot);
+    }
+    intent.requires_preps = requires_preps;
     intent.vetos = vec![
         geometry.invalidation_veto_name.into(),
         geometry.pcl_exhausted_veto_name.into(),
@@ -2502,6 +2576,15 @@ fn ttl_hours_until(now: DateTime<Utc>, until: DateTime<Utc>) -> u32 {
 mod tests {
     use super::*;
 
+    /// A flat list of `PrepReq::All` slots — the shape a legacy
+    /// `requires_preps: [a, b]` gate deserialises to. Keeps the assertions terse.
+    fn all_preps(steps: &[&str]) -> Vec<trade_control_core::intent::PrepReq> {
+        steps
+            .iter()
+            .map(|s| trade_control_core::intent::PrepReq::All(s.to_string()))
+            .collect()
+    }
+
     fn ts(s: &str) -> DateTime<Utc> {
         s.parse().unwrap()
     }
@@ -2632,6 +2715,7 @@ mod tests {
                 false,
                 false,
                 &[],
+                false, // pull_back
                 None,
                 None,
                 BlackoutCloseAction::default(),
@@ -2669,6 +2753,7 @@ mod tests {
                 needs_confirmed_close: false,
                 prep_expiries: Vec::new(),
                 skip_preps: Vec::new(),
+                pull_back: None,
                 entry_offset_pips: Some(1.0),
                 sl_offset_pips: Some(1.0),
                 entry_offset_atr_pct: None,
@@ -2725,6 +2810,7 @@ mod tests {
             false,
             false,
             &[],
+            false, // pull_back
             None,
             None,
             BlackoutCloseAction::default(),
@@ -2772,7 +2858,7 @@ mod tests {
         }
         assert_eq!(
             alert.intent.requires_preps,
-            vec!["break-and-close".to_string(), "retest".to_string()]
+            all_preps(&["break-and-close", "retest"])
         );
         assert_eq!(
             alert.intent.vetos,
@@ -2822,6 +2908,7 @@ mod tests {
                 false,
                 true, // confirmed-candle gated
                 &["break-and-close".to_string(), "retest".to_string()],
+                false, // pull_back
                 None,
                 None,
                 BlackoutCloseAction::default(),
@@ -2915,6 +3002,7 @@ mod tests {
             false,
             false,
             &[],
+            false, // pull_back
             None,
             None,
             BlackoutCloseAction::default(),
@@ -2956,6 +3044,7 @@ mod tests {
             false,
             false,
             &[],
+            false, // pull_back
             None,
             None,
             BlackoutCloseAction::default(),
@@ -3036,6 +3125,7 @@ mod tests {
             false,
             false,
             &[],
+            false, // pull_back
             None,
             None,
             BlackoutCloseAction::default(),
@@ -3160,6 +3250,7 @@ mod tests {
             needs_confirmed_close: false,
             prep_expiries: Vec::new(),
             skip_preps: Vec::new(),
+            pull_back: None,
             entry_offset_pips: None,
             sl_offset_pips: None,
             entry_offset_atr_pct: None,
@@ -3215,7 +3306,7 @@ mod tests {
         assert!(matches!(stop.intent.entry, Some(EntrySpec::Stop { .. })));
         assert_eq!(
             stop.intent.requires_preps,
-            vec!["break-and-close".to_string(), "retest".to_string()]
+            all_preps(&["break-and-close", "retest"])
         );
         // QM: Stop entry at signal_low − ATR-pct buffer with limit recovery
         // (identical order shape to standalone --quasimodo), no preps,
@@ -3410,6 +3501,78 @@ mod tests {
         // The spec is round-tripped onto the BuiltTrade so write_trade
         // can persist it next to the alerts.
         assert_eq!(trade.spec.pattern, TradePattern::Hs);
+    }
+
+    #[test]
+    fn pull_back_adds_pullback_alert_and_either_or_group() {
+        // --pull-back: a 04b-prep-pullback alert is emitted and the enter's
+        // retest slot becomes an either/or group `[retest, pullback]`.
+        let now = ts("2026-05-20T00:00:00Z");
+        let mut spec = sample_spec(TradePattern::Hs, ts("2026-05-25T00:00:00Z"));
+        spec.pull_back = Some(1.0);
+        let trade = build_trade_from_spec(spec, now, BuildStrictness::Strict).unwrap();
+        let basenames: Vec<&str> = trade.alerts.iter().map(|a| a.basename.as_str()).collect();
+        assert!(
+            basenames.contains(&"04b-prep-pullback"),
+            "pullback alert emitted: {basenames:?}"
+        );
+        let enter = trade
+            .alerts
+            .iter()
+            .find(|a| a.basename == "05-enter")
+            .unwrap();
+        assert_eq!(
+            enter.intent.requires_preps,
+            vec![
+                trade_control_core::intent::PrepReq::All("break-and-close".to_string()),
+                trade_control_core::intent::PrepReq::Any(vec![
+                    "retest".to_string(),
+                    "pullback".to_string(),
+                ]),
+            ]
+        );
+    }
+
+    #[test]
+    fn pull_back_with_skip_retest_collapses_to_pullback_only() {
+        // --pull-back --skip-retest: the milestone slot has a single survivor,
+        // so `from_alternatives` collapses it to a bare `All(pullback)`.
+        let now = ts("2026-05-20T00:00:00Z");
+        let mut spec = sample_spec(TradePattern::Hs, ts("2026-05-25T00:00:00Z"));
+        spec.pull_back = Some(1.5);
+        spec.skip_preps = vec!["retest".to_string()];
+        let trade = build_trade_from_spec(spec, now, BuildStrictness::Strict).unwrap();
+        let basenames: Vec<&str> = trade.alerts.iter().map(|a| a.basename.as_str()).collect();
+        assert!(basenames.contains(&"04b-prep-pullback"));
+        assert!(!basenames.contains(&"04-prep-retest"));
+        let enter = trade
+            .alerts
+            .iter()
+            .find(|a| a.basename == "05-enter")
+            .unwrap();
+        assert_eq!(
+            enter.intent.requires_preps,
+            all_preps(&["break-and-close", "pullback"])
+        );
+    }
+
+    #[test]
+    fn no_pull_back_flag_keeps_the_legacy_flat_gate() {
+        // Without --pull-back the wire form is byte-identical to before PR-C.
+        let now = ts("2026-05-20T00:00:00Z");
+        let spec = sample_spec(TradePattern::Hs, ts("2026-05-25T00:00:00Z"));
+        let trade = build_trade_from_spec(spec, now, BuildStrictness::Strict).unwrap();
+        let basenames: Vec<&str> = trade.alerts.iter().map(|a| a.basename.as_str()).collect();
+        assert!(!basenames.contains(&"04b-prep-pullback"));
+        let enter = trade
+            .alerts
+            .iter()
+            .find(|a| a.basename == "05-enter")
+            .unwrap();
+        assert_eq!(
+            enter.intent.requires_preps,
+            all_preps(&["break-and-close", "retest"])
+        );
     }
 
     /// The first reversal-close alert (index 6, after the 6-alert base bundle).
@@ -4572,7 +4735,7 @@ tp_price: 1.05
         assert!(!basenames.contains(&"03-prep-break-and-close"));
         assert!(basenames.contains(&"04-prep-retest"));
         let enter = trade.alerts.last().unwrap();
-        assert_eq!(enter.intent.requires_preps, vec!["retest".to_string()]);
+        assert_eq!(enter.intent.requires_preps, all_preps(&["retest"]));
     }
 
     #[test]

@@ -996,7 +996,10 @@ mod tests {
         let intent: Intent = serde_yaml::from_value(template).unwrap();
         assert_eq!(
             intent.requires_preps,
-            vec!["break-and-close".to_string(), "retest".to_string()]
+            vec![
+                trade_control_core::intent::PrepReq::All("break-and-close".to_string()),
+                trade_control_core::intent::PrepReq::All("retest".to_string()),
+            ]
         );
         assert_eq!(intent.vetos, vec!["news-window".to_string()]);
     }

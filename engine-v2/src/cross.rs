@@ -73,6 +73,11 @@ pub fn eval_trigger(
         // path special-cases it); returning `false` keeps this total. No
         // break-and-close rule carries it.
         Trigger::PinePattern { .. } => false,
+        // The pullback (PR-B, v1-only for now) is stateful and not a per-candle
+        // cross — v2 has not yet ported it. It never reaches this per-candle cross
+        // evaluator; returning `false` keeps the match total until the v2 port
+        // lands (see SCOPING-pullback-prep.md).
+        Trigger::PullbackFromArm { .. } => false,
     }
 }
 

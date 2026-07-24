@@ -34,6 +34,16 @@ use crate::mw_geometry::{abort_level, cancel_level, highest_shoulder, overshoot_
 use crate::roles::Roles;
 use trading_view::drawings::Drawing;
 
+/// Arm-time inputs for the pullback prep, captured by the pipeline and threaded
+/// into the plan build. `anchor_open` is the live mid at arm time (baked onto the
+/// `Trigger::PullbackFromArm` so the engine never rediscovers it); `atr_mult` is
+/// the `--pull-back` multiple. `None` when no pullback is armed.
+#[derive(Debug, Clone, Copy)]
+pub struct PullbackArm {
+    pub anchor_open: f64,
+    pub atr_mult: f64,
+}
+
 /// Map a TradingView chart-resolution string (`"1"`, `"15"`, `"60"`, `"240"`,
 /// `"D"`, …) to the engine's [`Granularity`]. The engine only fetches the
 /// closed set of timeframes trades arm on, so an unsupported resolution
@@ -107,10 +117,11 @@ pub fn build_trade_plan(
     bcr_require_golden: bool,
     armed_at: chrono::DateTime<chrono::Utc>,
     armed_sentiment: Option<trade_control_core::plan_sentiment::PlanSentiment>,
+    pullback_arm: Option<PullbackArm>,
 ) -> TradePlan {
     let rules = alerts
         .iter()
-        .filter_map(|alert| build_rule(alert, direction, roles, granularity, is_mw))
+        .filter_map(|alert| build_rule(alert, direction, roles, granularity, is_mw, pullback_arm))
         .collect();
 
     TradePlan {
@@ -225,9 +236,17 @@ fn build_rule(
     roles: &Roles,
     granularity: Granularity,
     is_mw: bool,
+    pullback_arm: Option<PullbackArm>,
 ) -> Option<ConditionRule> {
     let basename = AlertBasename::parse(&alert.basename)?;
-    let trigger = trigger_for(&basename, direction, roles, granularity, is_mw)?;
+    let trigger = trigger_for(
+        &basename,
+        direction,
+        roles,
+        granularity,
+        is_mw,
+        pullback_arm,
+    )?;
     let fire_mode = fire_mode_for(&trigger);
     let kind = RuleKind::from(&basename);
     Some(ConditionRule {
@@ -248,6 +267,7 @@ fn trigger_for(
     roles: &Roles,
     granularity: Granularity,
     is_mw: bool,
+    pullback_arm: Option<PullbackArm>,
 ) -> Option<Trigger> {
     match basename {
         AlertBasename::VetoTooHigh | AlertBasename::VetoTooLow => {
@@ -287,6 +307,14 @@ fn trigger_for(
             BarEvent::Intrabar,
             granularity,
         ),
+        // Pullback: ≥N×ATR body retrace since arm time. No drawing — the anchor
+        // (arm-time mid open) and the ATR multiple are the arm-time `PullbackArm`,
+        // baked onto the trigger. Skipped (no rule) if the arm didn't request it.
+        AlertBasename::PrepPullback => pullback_arm.map(|pb| Trigger::PullbackFromArm {
+            anchor_open: pb.anchor_open,
+            atr_mult: pb.atr_mult,
+            dir: to_core_direction(direction),
+        }),
         // Enter: H&S binds to the direction's candle pattern; M/W to the
         // per-bar geometry heartbeat. The strategy-v2 Quasimodo enter
         // (`EnterQm`) is H&S-only and decided by the *same* candle detector as
@@ -681,6 +709,7 @@ mod tests {
             false, // bcr_require_golden
             chrono::Utc::now(),
             None,
+            None, // pullback_arm
         );
 
         assert!(!plan.shadow, "default build is live, not shadow");
@@ -743,6 +772,70 @@ mod tests {
         assert_eq!(enter.fire_mode, FireMode::Once);
     }
 
+    #[test]
+    fn pullback_alert_builds_pullback_from_arm_trigger_with_baked_anchor() {
+        // A 04b-prep-pullback alert + a PullbackArm ⇒ a PullbackFromArm trigger
+        // carrying the baked anchor mid + ATR multiple + trade direction.
+        let alerts = vec![alert("04b-prep-pullback", Action::Prep)];
+        let roles = Roles::default();
+        let plan = build_trade_plan(
+            "eurusd-hs-pb",
+            "EUR_USD",
+            &alerts,
+            ConvDirection::Short,
+            &roles,
+            Granularity::H1,
+            false,
+            false,
+            None,
+            trade_control_core::trade_plan::DEFAULT_RETEST_ATR_STEP,
+            trade_control_core::trade_plan::DEFAULT_CROSS_BUFFER_PCT,
+            trade_control_core::trade_plan::DEFAULT_CROSS_BUFFER_ATR,
+            false,
+            chrono::Utc::now(),
+            None,
+            Some(PullbackArm {
+                anchor_open: 1.2345,
+                atr_mult: 1.5,
+            }),
+        );
+        assert_eq!(plan.rules.len(), 1);
+        assert!(matches!(
+            plan.rules[0].trigger,
+            Trigger::PullbackFromArm {
+                anchor_open,
+                atr_mult,
+                dir: Direction::Short,
+            } if (anchor_open - 1.2345).abs() < 1e-9 && (atr_mult - 1.5).abs() < 1e-9
+        ));
+    }
+
+    #[test]
+    fn pullback_alert_without_arm_yields_no_rule() {
+        // The alert is present but no PullbackArm was captured (nothing armed) —
+        // the rule is skipped (same Ok(None) semantics as a missing role).
+        let alerts = vec![alert("04b-prep-pullback", Action::Prep)];
+        let plan = build_trade_plan(
+            "eurusd-hs-pb",
+            "EUR_USD",
+            &alerts,
+            ConvDirection::Short,
+            &Roles::default(),
+            Granularity::H1,
+            false,
+            false,
+            None,
+            trade_control_core::trade_plan::DEFAULT_RETEST_ATR_STEP,
+            trade_control_core::trade_plan::DEFAULT_CROSS_BUFFER_PCT,
+            trade_control_core::trade_plan::DEFAULT_CROSS_BUFFER_ATR,
+            false,
+            chrono::Utc::now(),
+            None,
+            None, // no pullback arm
+        );
+        assert_eq!(plan.rules.len(), 0);
+    }
+
     /// The long-side (IH&S) invalidation floor is a **drawn line** (named
     /// `01-veto-too-low`), so it is **close-confirmed** (`OnClose`) — a bar must
     /// open above and *close* below the floor to invalidate; an intrabar wick
@@ -783,6 +876,7 @@ mod tests {
             false, // bcr_require_golden
             chrono::Utc::now(),
             None,
+            None, // pullback_arm
         );
 
         let by_id = |id: &str| plan.rules.iter().find(|r| r.rule_id == id).unwrap();
@@ -835,6 +929,7 @@ mod tests {
             false, // bcr_require_golden
             chrono::Utc::now(),
             None,
+            None, // pullback_arm
         );
 
         // This is exactly what `register_trade_plan` writes for `--plan-out`.
@@ -906,6 +1001,7 @@ mod tests {
             false, // bcr_require_golden
             chrono::Utc::now(),
             None,
+            None, // pullback_arm
         );
         let by_id = |id: &str| plan.rules.iter().find(|r| r.rule_id == id).unwrap();
 
@@ -958,6 +1054,7 @@ mod tests {
             false, // bcr_require_golden
             chrono::Utc::now(),
             None,
+            None, // pullback_arm
         );
         assert!(plan.rules.is_empty());
     }
@@ -983,6 +1080,7 @@ mod tests {
             false, // bcr_require_golden
             chrono::Utc::now(),
             None,
+            None, // pullback_arm
         );
         assert!(plan.shadow, "shadow=true must reach the built plan");
     }
@@ -1007,6 +1105,7 @@ mod tests {
             false, // bcr_require_golden
             chrono::Utc::now(),
             None,
+            None, // pullback_arm
         );
         assert!(
             (custom.retest_atr_step - 0.2).abs() < 1e-9,
@@ -1030,6 +1129,7 @@ mod tests {
             false, // bcr_require_golden
             chrono::Utc::now(),
             None,
+            None, // pullback_arm
         );
         assert!(
             (defaulted.retest_atr_step - 0.075).abs() < 1e-9,
@@ -1058,6 +1158,7 @@ mod tests {
             false, // bcr_require_golden
             chrono::Utc::now(),
             None,
+            None, // pullback_arm
         );
         assert!(
             custom.cross_buffer_pct.abs() < 1e-9,
@@ -1081,6 +1182,7 @@ mod tests {
             false, // bcr_require_golden
             chrono::Utc::now(),
             None,
+            None, // pullback_arm
         );
         assert!(
             (defaulted.cross_buffer_pct - trade_control_core::trade_plan::DEFAULT_CROSS_BUFFER_PCT)
@@ -1112,6 +1214,7 @@ mod tests {
             false, // bcr_require_golden
             chrono::Utc::now(),
             None,
+            None, // pullback_arm
         );
         assert!(
             (custom.cross_buffer_atr - 0.15).abs() < 1e-9,
@@ -1135,6 +1238,7 @@ mod tests {
             false, // bcr_require_golden
             chrono::Utc::now(),
             None,
+            None, // pullback_arm
         );
         assert!(
             defaulted.cross_buffer_atr.abs() < 1e-9,
@@ -1207,6 +1311,7 @@ mod tests {
             false, // bcr_require_golden
             chrono::Utc::now(),
             None,
+            None, // pullback_arm
         );
         assert_eq!(plan.rules.len(), 1, "just the enter before appending");
 

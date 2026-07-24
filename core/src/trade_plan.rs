@@ -363,6 +363,25 @@ pub enum Trigger {
         pattern: Option<crate::intent::SignalKind>,
         dir: Direction,
     },
+    /// The **pullback** prep (`04-prep-pullback`): price has retraced
+    /// ≥ `atr_mult × ATR` from its running body-extreme since **arm time**, in the
+    /// entry direction. Unlike the retest ([`Self::TrendlineCross`]) this binds to
+    /// no drawing and no break — it anchors to `anchor_open`, the mid open of the
+    /// candle live when `tv-arm` signed the plan, baked here so the engine never
+    /// rediscovers it. The running extreme and the retrace test are pure geometry
+    /// (see the engine's `pullback` module); `atr_mult` defaults to 1.0
+    /// (`tv-arm --pull-back`, override `--pull-back=1.5`).
+    PullbackFromArm {
+        /// Mid open of the arm-time candle, baked by `tv-arm`. Seeds the running
+        /// body-extreme so a monotonic decline still measures its retrace from
+        /// the arm-time reference.
+        anchor_open: f64,
+        /// Retrace threshold as a multiple of ATR. `1.0` = one ATR.
+        atr_mult: f64,
+        /// Trade direction — decides which body-extreme (high for long, low for
+        /// short) and which way the retrace is measured.
+        dir: Direction,
+    },
 }
 
 /// One endpoint of a [`Trigger::TrendlineCross`] — a (time, price) anchor.

@@ -46,6 +46,11 @@ pub enum RuleKind {
     PrepBreakAndClose,
     /// 04-prep-retest. The neckline retest spine prep, gating the entry.
     PrepRetest,
+    /// 04b-prep-pullback. The pullback spine prep (≥N×ATR body retrace since arm
+    /// time) — an alternative to the retest, gating the entry. The engine also
+    /// recognises it by its `Trigger::PullbackFromArm`; this kind keeps the
+    /// classification uniform with the other preps.
+    PrepPullback,
     /// 08-prep-expire-<step>. Blocks a further `prep` for its step past a
     /// cutoff. Not evaluated by the engine spine (worker-side gate); kept as its
     /// own class so it is unambiguously neither a guard, a control, nor a prep
@@ -86,6 +91,7 @@ impl From<&AlertBasename> for RuleKind {
             | AlertBasename::NewsEnd(_) => RuleKind::Control,
             AlertBasename::PrepBreakAndClose => RuleKind::PrepBreakAndClose,
             AlertBasename::PrepRetest => RuleKind::PrepRetest,
+            AlertBasename::PrepPullback => RuleKind::PrepPullback,
             AlertBasename::PrepExpire(_) => RuleKind::PrepExpire,
             AlertBasename::Enter | AlertBasename::EnterQm => RuleKind::Enter,
         }

@@ -61,7 +61,7 @@
 use chrono::{DateTime, Utc};
 
 use trade_control_core::broker::{Candle, Granularity};
-use trade_control_core::intent::{Action, Direction, SignalKind};
+use trade_control_core::intent::{Action, Direction, PrepReqSliceExt, SignalKind};
 use trade_control_core::plan_eval::{EntryDecline, FiredIntent, PlanEval};
 use trade_control_core::plan_state::{Phase, PlanState};
 use trade_control_core::signals::{
@@ -95,6 +95,12 @@ const PREP_STEP_RETEST: &str = "retest";
 /// prep-free strategy-v2 QM enter (empty `requires_preps`) is NOT floored past a
 /// pre-break golden that confirms after the break (XAU_XAG 2026-07-21).
 const PREP_STEP_BREAK_AND_CLOSE: &str = "break-and-close";
+
+/// The prep-step name an enter intent lists in `requires_preps` for the
+/// **pullback** gate (an alternative to `retest`). Same convention as
+/// [`PREP_STEP_RETEST`]. A pullback rule is recognised by its trigger
+/// ([`is_pullback`]); this is the bare step name the enter carries.
+const PREP_STEP_PULLBACK: &str = "pullback";
 
 /// Count the `Action::Enter` rules in a plan. Single-enter plans (the H&S
 /// stop entry or the M/W heartbeat) have one; a strategy-v2 plan has two (the
@@ -282,9 +288,12 @@ pub fn evaluate_plan(
                 if is_multi_enter(plan) {
                     evaluate_break_and_close(plan, &mut state, candle, detector_window, &mut fired);
                 }
-                // Stamp the retest lookback before testing entry, so a retest
-                // and entry that land on the same bar are both seen.
+                // Stamp the retest + pullback lookbacks before testing entry, so
+                // a prep milestone and the entry that land on the same bar are
+                // both seen. (Pullback is an alternative to the retest — either
+                // can satisfy an `[retest, pullback]` enter group.)
                 stamp_retest(plan, &mut state, candle, detector_window, &mut fired);
+                stamp_pullback(plan, &mut state, candle, detector_window, &mut fired);
                 evaluate_entry(
                     plan,
                     &mut state,
@@ -929,15 +938,9 @@ fn evaluate_one_entry(
     //   enters always do, so the plan-global check is the byte-identical
     //   baseline here. (The two agree in production; only the multi-enter case
     //   needs the per-rule split.)
-    let requires_retest = if is_multi_enter(plan) {
-        rule.intent
-            .requires_preps
-            .iter()
-            .any(|p| p == PREP_STEP_RETEST)
-    } else {
-        plan.rules.iter().any(is_retest)
-    };
-    if requires_retest && !retest_satisfied(plan, state, candle.time) {
+    // Retest/pullback milestone gate — either alternative satisfies an
+    // `[retest, pullback]` enter group. See `enter_prep_milestones_satisfied`.
+    if !enter_prep_milestones_satisfied(plan, state, rule, candle.time) {
         return;
     }
     push_fire_signal(rule, candle, signal, fired);
@@ -1810,6 +1813,139 @@ fn retest_satisfied(plan: &TradePlan, state: &PlanState, entry_time: DateTime<Ut
     }
 }
 
+/// Stamp `pullback_seen_at` if this candle's body has retraced ≥ N×ATR from the
+/// running body-extreme since arm time — the **pullback** prep, an alternative to
+/// the retest. Anchors to `plan.armed_at` + the trigger's baked `anchor_open`;
+/// independent of any break/neckline. Mirrors [`stamp_retest`]: latches once,
+/// suppresses on a spread-hour rubbish candle, and emits the prep fire so the
+/// worker's store-backed enter gate sees it.
+///
+/// No-op if the plan carries no pullback rule, `armed_at` is absent (a legacy
+/// plan that never armed a pullback), or the ATR window is cold (fail-closed:
+/// `warn!` and don't stamp — never panic, cf. the retest-tolerance incident).
+fn stamp_pullback(
+    plan: &TradePlan,
+    state: &mut PlanState,
+    candle: &Candle,
+    window: &[Candle],
+    fired: &mut Vec<FiredIntent>,
+) {
+    if state.pullback_seen_at.is_some() {
+        return; // latched — a milestone the trade passes once.
+    }
+    let Some(rule) = plan.rules.iter().find(|r| is_pullback(r)) else {
+        return;
+    };
+    let Trigger::PullbackFromArm {
+        anchor_open,
+        atr_mult,
+        dir,
+    } = rule.trigger
+    else {
+        return;
+    };
+    let Some(armed_at) = plan.armed_at else {
+        // A pullback rule with no arm-time anchor can't be evaluated. Warn (this
+        // is a build-side wiring bug, not a runtime data condition) and skip.
+        tracing::warn!(
+            instrument = %plan.instrument,
+            "pullback: plan has a PullbackFromArm rule but no armed_at — skipping",
+        );
+        return;
+    };
+    // A pullback can only count once the break (if any) has landed — same window
+    // discipline as the retest. Before the break, don't stamp.
+    let Some(break_at) = effective_break_at(plan, state, window) else {
+        return;
+    };
+    if candle.time <= break_at {
+        return;
+    }
+    // Spread-hour rubbish candle: a body printed in a liquidity vacuum isn't a
+    // real pullback. Gated on bar size like the retest (only 15m/1h bars are
+    // dominated by the spread hour).
+    if trade_control_core::spread_blackout::suppress_on_spread_hour(
+        &plan.instrument,
+        candle.time,
+        plan.granularity,
+    ) {
+        return;
+    }
+    // ATR is the retrace unit. Fail-closed on a cold window: warn and don't stamp
+    // (the pullback simply can't fire yet), never panic.
+    let Some(atr) = wilder_atr(window, atr_length_for(plan.granularity)) else {
+        tracing::warn!(
+            instrument = %plan.instrument,
+            window_len = window.len(),
+            atr_length = atr_length_for(plan.granularity),
+            "pullback: window too short to warm the ATR — not stamping until it warms",
+        );
+        return;
+    };
+    if crate::pullback::triggered(anchor_open, window, armed_at, atr, atr_mult, dir, candle) {
+        state.pullback_seen_at = Some(candle.time);
+        // Emit the prep fire so it seeds the store the enter's prep gate reads —
+        // exactly as `stamp_retest` does for the retest.
+        push_fire(rule, candle, fired);
+    }
+}
+
+/// Is a pullback seen within `(break_close_at, entry]`? Mirrors
+/// [`retest_satisfied`] exactly (same window discipline), reading
+/// `pullback_seen_at` instead of `retest_seen_at`.
+fn pullback_satisfied(plan: &TradePlan, state: &PlanState, entry_time: DateTime<Utc>) -> bool {
+    match (state.break_close_at, state.pullback_seen_at) {
+        (Some(break_at), Some(seen)) => seen > break_at && seen <= entry_time,
+        (None, Some(seen)) => !has_break_and_close(plan) && seen <= entry_time,
+        _ => false,
+    }
+}
+
+/// The retest/pullback prep-milestone gate for one enter `rule` at `entry_time`.
+/// Returns `true` when the enter may fire w.r.t. these milestones — i.e. the
+/// milestone it requires is satisfied, or it requires none.
+///
+/// The retest and pullback are **either/or alternatives** (an `[retest,
+/// pullback]` enter group): if the enter requires *either*, the gate passes when
+/// *either* is satisfied. Requiring both names (unusual) needs both satisfied.
+///
+/// Which milestones this enter requires:
+/// - **Multi-enter (strategy-v2):** read strictly this enter's `requires_preps`
+///   (the stop leg lists a milestone; the QM leg lists none and is free).
+/// - **Single-enter:** preserve the historical plan-global rule — a retest /
+///   pullback *rule* existing in the plan gates the lone enter. (Synthetic test
+///   intents don't populate `requires_preps`; production single enters always
+///   do, so the two agree in production.)
+fn enter_prep_milestones_satisfied(
+    plan: &TradePlan,
+    state: &PlanState,
+    rule: &ConditionRule,
+    entry_time: DateTime<Utc>,
+) -> bool {
+    let (requires_retest, requires_pullback) = if is_multi_enter(plan) {
+        (
+            rule.intent.requires_preps.requires_step(PREP_STEP_RETEST),
+            rule.intent.requires_preps.requires_step(PREP_STEP_PULLBACK),
+        )
+    } else {
+        (
+            plan.rules.iter().any(is_retest),
+            plan.rules.iter().any(is_pullback),
+        )
+    };
+    match (requires_retest, requires_pullback) {
+        // No milestone required → nothing to gate.
+        (false, false) => true,
+        // Either/or group: satisfied when EITHER milestone landed.
+        (true, true) => {
+            retest_satisfied(plan, state, entry_time) || pullback_satisfied(plan, state, entry_time)
+        }
+        // Only one required → just that one.
+        (true, false) => retest_satisfied(plan, state, entry_time),
+        (false, true) => pullback_satisfied(plan, state, entry_time),
+    }
+}
+
 /// The explicit setup floor for a first-confirmed enter: a confirmed signal must
 /// print at/after the *later* of the break-and-close time and the replay-start
 /// cursor. Scopes "first confirmed" to the setup forming now, not an ancient
@@ -1840,8 +1976,7 @@ fn confirmed_setup_floor(
     let requires_break = rule
         .intent
         .requires_preps
-        .iter()
-        .any(|p| p == PREP_STEP_BREAK_AND_CLOSE);
+        .requires_step(PREP_STEP_BREAK_AND_CLOSE);
     let break_floor = if requires_break {
         state.break_close_at
     } else {
@@ -1916,8 +2051,9 @@ pub enum EnterBlock {
     /// (the detector's confirmed-first scan found nothing), so the trigger never
     /// fires.
     NeedsConfirmation,
-    /// In `AwaitEntry`, but this enter requires a retest and none has been
-    /// stamped in `(break_close_at, bar]` yet.
+    /// In `AwaitEntry`, but this enter requires a retest and/or pullback
+    /// milestone and neither alternative has been stamped in
+    /// `(break_close_at, bar]` yet.
     NeedsRetest,
 }
 
@@ -1927,7 +2063,7 @@ impl EnterBlock {
         match self {
             Self::NeedsBreakAndClose => "requires break-and-close (prep not satisfied yet)",
             Self::NeedsConfirmation => "requires confirmation (no confirmed signal yet)",
-            Self::NeedsRetest => "requires retest (neckline retest not stamped yet)",
+            Self::NeedsRetest => "requires retest/pullback (no milestone stamped yet)",
         }
     }
 }
@@ -2010,15 +2146,10 @@ pub fn enter_preconditions_by_leg(
         {
             leg.push(EnterBlock::NeedsConfirmation);
         }
-        let requires_retest = if is_multi_enter(plan) {
-            rule.intent
-                .requires_preps
-                .iter()
-                .any(|p| p == PREP_STEP_RETEST)
-        } else {
-            plan.rules.iter().any(is_retest)
-        };
-        if requires_retest && !retest_satisfied(plan, state, bar) {
+        // Retest/pullback milestone precondition — mirrors the fire-path gate
+        // (`enter_prep_milestones_satisfied`): an `[retest, pullback]` group is
+        // unmet only when NEITHER alternative is stamped.
+        if !enter_prep_milestones_satisfied(plan, state, rule, bar) {
             leg.push(EnterBlock::NeedsRetest);
         }
         if !leg.is_empty() {
@@ -2329,6 +2460,10 @@ fn eval_trigger(
         // never reaches `eval_trigger` (only `Action::Enter` rules carry it, and
         // the entry path special-cases it). Returning `false` keeps this total.
         Trigger::PinePattern { .. } => false,
+        // Like `PinePattern`, the pullback is not a per-candle predicate — it is
+        // stateful (running body-extreme since arm time + ATR) and is handled in
+        // [`stamp_pullback`] off `detector_window`, never here. Total-match guard.
+        Trigger::PullbackFromArm { .. } => false,
     }
 }
 
@@ -2766,6 +2901,15 @@ fn is_break_and_close(rule: &ConditionRule) -> bool {
 
 fn is_retest(rule: &ConditionRule) -> bool {
     matches!(resolved_kind(rule), RuleKind::PrepRetest)
+}
+
+/// A pullback prep rule. Identified by its **trigger** rather than a `RuleKind`:
+/// `Trigger::PullbackFromArm` is unambiguous and self-describing (unlike a
+/// trendline, which the break-and-close and retest share), so the engine needs
+/// no `conventions` basename/kind wiring to recognise it. The prep-step name in
+/// `requires_preps` is [`PREP_STEP_PULLBACK`].
+fn is_pullback(rule: &ConditionRule) -> bool {
+    matches!(rule.trigger, Trigger::PullbackFromArm { .. })
 }
 
 /// When a guard is armed within the spine. Kept permissive for Stage D — the
@@ -4191,6 +4335,174 @@ mod tests {
         );
     }
 
+    // ===== pullback prep (alternative to retest) =====
+
+    /// A `PullbackFromArm` rule for a short (running LOW extreme; fires when a
+    /// body rises ≥ `atr_mult`×ATR above it). `anchor_open` seeds the extreme.
+    fn pullback_rule(rule_id: &str, anchor_open: f64, atr_mult: f64) -> ConditionRule {
+        rule(
+            rule_id,
+            Trigger::PullbackFromArm {
+                anchor_open,
+                atr_mult,
+                dir: Direction::Short,
+            },
+            FireMode::Once,
+            Action::Prep,
+        )
+    }
+
+    /// A skip-break short plan whose only prep is a pullback, plus a lone enter.
+    /// Single-enter path ⇒ the plan-global `is_pullback` gates the enter.
+    fn skip_break_pullback_plan(anchor_open: f64, atr_mult: f64) -> TradePlan {
+        let mut p = plan(vec![
+            pullback_rule("04-prep-pullback", anchor_open, atr_mult),
+            rule(
+                "05-enter",
+                Trigger::MwEveryBar,
+                FireMode::Once,
+                Action::Enter,
+            ),
+        ]);
+        // Pullback anchors to arm time — every pullback plan carries `armed_at`.
+        p.armed_at = Some(ts("2026-06-16T00:00:00Z"));
+        p
+    }
+
+    /// A warm, flat H1 window of `n` bars from `start`, each a tiny-bodied candle
+    /// at `price` (range `atr_seed` so Wilder ATR warms to a known ~`atr_seed`).
+    /// The bodies sit exactly at `price` so they neither raise nor lower the
+    /// running body-extreme — later test bars drive the geometry explicitly.
+    fn warm_flat_window(start: &str, n: usize, price: f64, atr_seed: f64) -> Vec<Candle> {
+        let base = ts(start);
+        (0..n)
+            .map(|i| {
+                let t = base + chrono::Duration::hours(i as i64);
+                // Body at `price`; symmetric wicks give a stable true range.
+                Candle {
+                    time: t,
+                    o: price,
+                    h: price + atr_seed / 2.0,
+                    l: price - atr_seed / 2.0,
+                    c: price,
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn pullback_stamps_and_enters_when_body_retraces_one_atr() {
+        // Short plan, anchor 1.2000, ATR ≈ 0.0010 from the flat seed window.
+        // A late bar whose BODY rises ≥ 1×ATR above the running low stamps the
+        // pullback and, the gate now open, fires the lone enter the same bar.
+        let p = skip_break_pullback_plan(1.2000, 1.0);
+        assert_eq!(initial_phase(&p), Phase::AwaitEntry);
+        let prior = seed_at(Phase::AwaitEntry, "2026-06-16T00:00:00Z");
+
+        // 24 warm bars at the anchor (ATR ≈ 0.0010), then a bar whose body closes
+        // 0.0015 above → ≥ 1×ATR retrace up (short pullback).
+        let mut candles = warm_flat_window("2026-06-16T00:00:00Z", 24, 1.2000, 0.0010);
+        candles.push(candle(
+            "2026-06-17T00:00:00Z",
+            1.2000,
+            1.2020,
+            1.1999,
+            1.2015, // body high 1.2015 = 0.0015 above the 1.2000 running low
+        ));
+        let eval = run(&p, &prior, &candles);
+        let fired: Vec<&str> = eval.fired.iter().map(|f| f.rule_id.as_str()).collect();
+        assert!(
+            fired.contains(&"04-prep-pullback"),
+            "pullback prep fires on the ≥1-ATR body retrace: {fired:?}"
+        );
+        assert!(
+            fired.contains(&"05-enter"),
+            "enter fires once the pullback is seen: {fired:?}"
+        );
+        assert_eq!(
+            eval.new_state.pullback_seen_at,
+            Some(ts("2026-06-17T00:00:00Z"))
+        );
+    }
+
+    #[test]
+    fn pullback_does_not_fire_on_shallow_retrace() {
+        // Same setup but the final body only rises 0.0004 (< 1×ATR ≈ 0.0010).
+        let p = skip_break_pullback_plan(1.2000, 1.0);
+        let prior = seed_at(Phase::AwaitEntry, "2026-06-16T00:00:00Z");
+        let mut candles = warm_flat_window("2026-06-16T00:00:00Z", 24, 1.2000, 0.0010);
+        candles.push(candle(
+            "2026-06-17T00:00:00Z",
+            1.2000,
+            1.2006,
+            1.1999,
+            1.2004, // body high only 0.0004 above the running low
+        ));
+        let eval = run(&p, &prior, &candles);
+        let fired: Vec<&str> = eval.fired.iter().map(|f| f.rule_id.as_str()).collect();
+        assert!(
+            !fired.contains(&"04-prep-pullback") && !fired.contains(&"05-enter"),
+            "shallow retrace must not stamp the pullback or fire: {fired:?}"
+        );
+        assert_eq!(eval.new_state.pullback_seen_at, None);
+    }
+
+    #[test]
+    fn pullback_wick_does_not_count_only_body() {
+        // The final bar WICKS 0.0030 above (h=1.2030) but its body high (max o,c)
+        // is only 0.0003 above the running low — a wick-through with a held body
+        // must not stamp (bodies-not-wicks rule).
+        let p = skip_break_pullback_plan(1.2000, 1.0);
+        let prior = seed_at(Phase::AwaitEntry, "2026-06-16T00:00:00Z");
+        let mut candles = warm_flat_window("2026-06-16T00:00:00Z", 24, 1.2000, 0.0010);
+        candles.push(candle(
+            "2026-06-17T00:00:00Z",
+            1.2000,
+            1.2030,
+            1.1999,
+            1.2003, // wick to 1.2030, body high 1.2003
+        ));
+        let eval = run(&p, &prior, &candles);
+        assert_eq!(
+            eval.new_state.pullback_seen_at, None,
+            "a wick above without a body must not stamp the pullback"
+        );
+    }
+
+    #[test]
+    fn pullback_missing_armed_at_does_not_stamp() {
+        // A PullbackFromArm rule with no armed_at can't be evaluated — it must
+        // skip (warn), never panic, never stamp.
+        let mut p = skip_break_pullback_plan(1.2000, 1.0);
+        p.armed_at = None;
+        let prior = seed_at(Phase::AwaitEntry, "2026-06-16T00:00:00Z");
+        let mut candles = warm_flat_window("2026-06-16T00:00:00Z", 24, 1.2000, 0.0010);
+        candles.push(candle(
+            "2026-06-17T00:00:00Z",
+            1.2000,
+            1.2020,
+            1.1999,
+            1.2015,
+        ));
+        let eval = run(&p, &prior, &candles);
+        assert_eq!(eval.new_state.pullback_seen_at, None);
+    }
+
+    #[test]
+    fn pullback_cold_atr_window_does_not_stamp_no_panic() {
+        // Only 3 bars — far short of the H1 ATR length (24). The stamp must
+        // degrade (no stamp) and NOT panic (cf. retest-tolerance incident).
+        let p = skip_break_pullback_plan(1.2000, 1.0);
+        let prior = seed_at(Phase::AwaitEntry, "2026-06-16T00:00:00Z");
+        let candles = vec![
+            candle("2026-06-16T00:00:00Z", 1.2000, 1.2005, 1.1995, 1.2000),
+            candle("2026-06-16T01:00:00Z", 1.2000, 1.2005, 1.1995, 1.2000),
+            candle("2026-06-16T02:00:00Z", 1.2000, 1.2050, 1.1999, 1.2040),
+        ];
+        let eval = run(&p, &prior, &candles);
+        assert_eq!(eval.new_state.pullback_seen_at, None);
+    }
+
     // ===== strategy-v2: two enters in one plan =====
 
     /// An enter rule with explicit `requires_preps` + `max_retries`, using the
@@ -4200,7 +4512,10 @@ mod tests {
     /// so a fire keeps the plan alive (the worker retry gate is the real cap).
     fn enter_rule(rule_id: &str, preps: &[&str], max_retries: u32) -> ConditionRule {
         let mut intent = intent(Action::Enter);
-        intent.requires_preps = preps.iter().map(|s| s.to_string()).collect();
+        intent.requires_preps = preps
+            .iter()
+            .map(|s| trade_control_core::intent::PrepReq::All(s.to_string()))
+            .collect();
         intent.max_retries = Tunable::Static(max_retries);
         intent.direction = Some(Direction::Short);
         ConditionRule {
@@ -6548,7 +6863,10 @@ mod tests {
         let mut rule = pine_enter_rule(None, Direction::Short, false);
         rule.rule_id = "09-enter-qm".into();
         rule.intent.needs_confirmed = true;
-        rule.intent.requires_preps = requires_preps.iter().map(|s| s.to_string()).collect();
+        rule.intent.requires_preps = requires_preps
+            .iter()
+            .map(|s| trade_control_core::intent::PrepReq::All(s.to_string()))
+            .collect();
         rule.intent.entry = Some(trade_control_core::intent::EntrySpec::Limit {
             from: trade_control_core::intent::PriceAnchor::SignalLow,
             offset_pips: 0.0,
