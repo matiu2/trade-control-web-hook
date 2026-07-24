@@ -124,7 +124,31 @@ Shadow-parity relaxed to SKIP reversal/expiry-closed orders (re-sim can't model
 them — held model now MORE correct). Report P&L STILL reads old post-loop
 realized_outcome pass, so fixtures unchanged, all 109 green.
 
-### NEXT: S5b — switch report P&L to read held `closed` ledger
+### ✅ S5b DONE + COMMITTED — report P&L reads held ledger; EUR/USD FIX LIVE
+held_realized_outcome reads held closed/open as the report's P&L source (loop
+calls it, replacing the realized_outcome re-sim pass). Added FillKind::ClosedAtExpiry
++ render arm + tally.expiry_closes + EXP: marker + annotate label. VERIFIED on
+uk-100 fixture: reversal-close books +0.55R ("CLOSED ON REVERSAL"), expiry-close
+books +0.80R ("CLOSED AT EXPIRY") — the operator's original ask. Regression test
+`stateful_broker_books_reversal_and_expiry_closes_in_the_report` locks it (golden
+snapshot CAN'T — it uses the reversal/expiry-blind simulate_fill path in fixture.rs).
+110 tests + clippy green. THE TWO-BRAIN BUG CLASS IS DEAD: both position-state
+(backstop) and P&L now flow from the one held ledger.
+
+### NEXT: S6–S8 cleanup + S9 verify + S11 simulator move
+- S6: open-positions CAP count (place_entry ~L1224) still uses re-sim `resolve` —
+  switch to counting held `open`. (Also risk-cap E1 unchanged, fine.)
+- S7: spread-hour lifecycle already works via held mirrors (cancel/reactivate);
+  confirm list_pending_orders reads held `resting` (may still be re-sim — check).
+- S8: DELETE dead re-sim: old `realize`, `realized_outcome`, `apply_reversal_close`,
+  `resolve`, `window_to_as_of`, and RETIRE the shadow-parity assert +
+  `debug_assert_held_matches_resim` + `held_class`. Rewrite the 6 shadow_parity_*
+  tests + realized_outcome parity tests to assert held-state directly.
+- S9: full green; golden fixtures already independent (don't move). NO rebless
+  needed unless a snapshot moves — if so, show operator plain-English diffs.
+- S11: move simulate_fill* out of engine into replay broker (see above).
+
+### (old) S5b plan — switch report P&L to read held `closed` ledger
 Replace the post-loop `realized_outcome` pass (replay.rs ~L590) so the report
 reads held `closed` (+ `open` for still-open). THIS surfaces the EUR/USD fix
 (entry #2 books reversal R, #3/#4/#5 unblock) AND CHANGES FIXTURES. Need a way to
