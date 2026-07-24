@@ -98,6 +98,15 @@ pub struct PlanState {
     /// `(break_close_at, entry]`?". `None` until a retest is seen.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retest_seen_at: Option<DateTime<Utc>>,
+    /// Open-time of the most recent candle whose body retraced ≥ N×ATR from the
+    /// running body-extreme since arm time — the **pullback** prep milestone (an
+    /// alternative to the retest). Stamped every tick while in
+    /// [`Phase::AwaitEntry`], mirroring [`Self::retest_seen_at`], so the entry
+    /// gate can ask "is `pullback_seen_at` within `(break_close_at, entry]`?".
+    /// `None` until a pullback is seen (and always `None` for plans with no
+    /// pullback prep). See the engine's `pullback` module + `stamp_pullback`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pullback_seen_at: Option<DateTime<Utc>>,
     /// Print-time of the signal the **last** `needs_confirmed` (QM) enter fired
     /// on. The confirmed-first entry scan
     /// ([`first_confirmed_signal_at`](crate::signals::first_confirmed_signal_at))
@@ -207,6 +216,7 @@ impl PlanState {
             origin_open: BTreeMap::new(),
             break_close_at: None,
             retest_seen_at: None,
+            pullback_seen_at: None,
             last_confirmed_enter_at: None,
             mw: None,
             open_news_windows: BTreeSet::new(),
