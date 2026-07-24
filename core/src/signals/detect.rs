@@ -4,8 +4,12 @@
 //!
 //! Each detector is phrased over [`CandleMetrics`] for bar `N` (the bar being
 //! evaluated) and, where the pattern spans more than one bar, `N-1` and `N-2`.
-//! [`detect_at`] runs all five against a candle slice for the given as-of index
-//! and returns the highest-priority [`Detected`] (or `None`).
+//! Twin pinbars (tweezer / double-tweezer) also read the bar *before* the whole
+//! pattern (`N-2` for a pair, `N-3` for a trio) for their pivot check — the
+//! pattern's shared extreme must clear that bar, just like a single pinbar
+//! clears `low[1]`/`high[1]`. [`detect_at`] runs all five against a candle slice
+//! for the given as-of index and returns the highest-priority [`Detected`] (or
+//! `None`).
 //!
 //! **Confirmed-bar note.** Pine gates tweezer / double-tweezer on
 //! `barstate.isconfirmed` so they only print on a closed bar. The engine feeds
@@ -127,11 +131,28 @@ pub fn detect_at(candles: &[Candle], i: usize, flags: &DetectFlags) -> Option<De
     }
     let prev = i.checked_sub(1).and_then(|j| candles.get(j));
     let prev2 = i.checked_sub(2).and_then(|j| candles.get(j));
+    // Bar before the double-tweezer trio (N-3), needed for its pivot check.
+    let prev3 = i.checked_sub(3).and_then(|j| candles.get(j));
     let pm = prev.map(CandleMetrics::of);
     let pm2 = prev2.map(CandleMetrics::of);
+    let pm3 = prev3.map(CandleMetrics::of);
 
-    let bull = dir_flags(Direction::Long, &m, pm.as_ref(), pm2.as_ref(), flags);
-    let bear = dir_flags(Direction::Short, &m, pm.as_ref(), pm2.as_ref(), flags);
+    let bull = dir_flags(
+        Direction::Long,
+        &m,
+        pm.as_ref(),
+        pm2.as_ref(),
+        pm3.as_ref(),
+        flags,
+    );
+    let bear = dir_flags(
+        Direction::Short,
+        &m,
+        pm.as_ref(),
+        pm2.as_ref(),
+        pm3.as_ref(),
+        flags,
+    );
 
     if bull.any() {
         return Some(build(
@@ -166,10 +187,11 @@ fn dir_flags(
     m: &CandleMetrics,
     pm: Option<&CandleMetrics>,
     pm2: Option<&CandleMetrics>,
+    pm3: Option<&CandleMetrics>,
     flags: &DetectFlags,
 ) -> DirFlags {
     let pinbar = flags.pinbars && pinbar(dir, m, pm);
-    let (double_tweezer, tweezer) = tweezers(dir, m, pm, pm2, flags);
+    let (double_tweezer, tweezer) = tweezers(dir, m, pm, pm2, pm3, flags);
     let regular = flags.regular_engulfers && regular_engulfer(dir, m, pm);
     let floating = flags.floating_engulfers && floating_engulfer(dir, m, pm);
     DirFlags {
@@ -224,6 +246,23 @@ fn pinbar_tweezer_leg(dir: Direction, m: &CandleMetrics) -> bool {
     }
 }
 
+/// Pivot test for a twin pinbar: the bar *before* the whole pattern must sit
+/// outside the pattern's shared extreme, mirroring the single pinbar's
+/// `low < low[1]` / `high > high[1]`. `pattern_extreme` is the pattern's shared
+/// low (bullish) or high (bearish); `before` is the metrics of the bar just
+/// before the pattern (N-2 for a pair, N-3 for a trio). Returns false if that
+/// bar is missing or invalid — Pine's `low[2]`/`low[3]` would be `na` there.
+fn twin_pivot(dir: Direction, pattern_extreme: f64, before: Option<&CandleMetrics>) -> bool {
+    let Some(before) = before else { return false };
+    if !before.valid_candle {
+        return false;
+    }
+    match dir {
+        Direction::Long => pattern_extreme < before.low,
+        Direction::Short => pattern_extreme > before.high,
+    }
+}
+
 /// `(double_tweezer, tweezer)` for the direction. Double-tweezer shadows plain
 /// tweezer (Pine `and not bullish_double_tweezer`).
 fn tweezers(
@@ -231,6 +270,7 @@ fn tweezers(
     m: &CandleMetrics,
     pm: Option<&CandleMetrics>,
     pm2: Option<&CandleMetrics>,
+    pm3: Option<&CandleMetrics>,
     flags: &DetectFlags,
 ) -> (bool, bool) {
     let Some(pm) = pm else {
@@ -248,6 +288,14 @@ fn tweezers(
     let lows_close = has_pair && (m.low - pm.low).abs() <= pair_thresh;
     let valid_pair = has_pair && pm.valid_candle && highs_close && lows_close;
 
+    // Pivot: the pair's shared extreme must clear the bar before it (N-2 = pm2),
+    // just like a single pinbar clears low[1]/high[1].
+    let pair_extreme = match dir {
+        Direction::Long => m.low.min(pm.low),
+        Direction::Short => m.high.max(pm.high),
+    };
+    let pair_pivot = twin_pivot(dir, pair_extreme, pm2);
+
     // Triple similarity (N, N-1, N-2) for the double tweezer.
     let double = match pm2 {
         Some(pm2) => {
@@ -263,12 +311,24 @@ fn tweezers(
                 && (pm.low - pm2.low).abs() <= triple_thresh;
             let valid_triple =
                 has_triple && pm.valid_candle && pm2.valid_candle && triple_highs && triple_lows;
-            flags.double_tweezers && valid_triple && cur_leg && prev_leg && prev2_leg
+            // Pivot: the trio's shared extreme must clear the bar before it
+            // (N-3 = pm3).
+            let triple_extreme = match dir {
+                Direction::Long => m.low.min(pm.low).min(pm2.low),
+                Direction::Short => m.high.max(pm.high).max(pm2.high),
+            };
+            let triple_pivot = twin_pivot(dir, triple_extreme, pm3);
+            flags.double_tweezers
+                && valid_triple
+                && triple_pivot
+                && cur_leg
+                && prev_leg
+                && prev2_leg
         }
         None => false,
     };
 
-    let tweezer = flags.tweezers && valid_pair && cur_leg && prev_leg && !double;
+    let tweezer = flags.tweezers && valid_pair && pair_pivot && cur_leg && prev_leg && !double;
     (double, tweezer)
 }
 
@@ -478,6 +538,63 @@ mod tests {
         assert!((d.geometry.high - 1.205).abs() < 1e-12, "span high");
         assert!((d.geometry.low - 0.99).abs() < 1e-12, "span low");
         assert_eq!(d.geometry.start_time, ts("2026-06-16T10:00:00Z"));
+    }
+
+    #[test]
+    fn bullish_tweezer_rejected_when_not_a_pivot() {
+        // Two pinbar-ish bars with equal lows (1.00) so neither passes the
+        // standalone pinbar's `low < low[1]` — only the tweezer path can fire.
+        // The bar before the pair (N-2) has a low BELOW the pair's shared low,
+        // so the pair is not a pivot low → no signal at all.
+        let n1 = k("2026-06-16T10:00:00Z", 1.15, 1.20, 1.00, 1.17);
+        let n = k("2026-06-16T11:00:00Z", 1.16, 1.205, 1.00, 1.18);
+
+        // pivot low 1.05 > pair low 1.00 → pivot passes → tweezer.
+        let pivot = k("2026-06-16T09:00:00Z", 1.10, 1.12, 1.05, 1.06);
+        let d = detect_at(&[pivot, n1, n], 2, &flags()).expect("tweezer");
+        assert_eq!(d.geometry.kind, SignalKind::Tweezer);
+
+        // pivot low 0.95 < pair low 1.00 → not a pivot → rejected.
+        let low_pivot = k("2026-06-16T09:00:00Z", 1.10, 1.12, 0.95, 1.06);
+        assert!(detect_at(&[low_pivot, n1, n], 2, &flags()).is_none());
+    }
+
+    #[test]
+    fn bearish_tweezer_requires_pivot_high() {
+        // Two near-identical bearish pinbar-ish bars (upper wick ≥ 0.35*range,
+        // body low) with equal highs so no standalone pinbar (`high > high[1]`)
+        // fires — the tweezer path is the only one. range 1.00..1.20 = 0.20;
+        // body ≤ 1.05 (bottom quartile), upper wick = 1.20 - 1.05 = 0.15 ≥ 0.07.
+        let n1 = k("2026-06-16T10:00:00Z", 1.02, 1.20, 1.00, 1.01);
+        let n = k("2026-06-16T11:00:00Z", 1.03, 1.20, 1.005, 1.005);
+
+        // pivot high 1.10 < pair high 1.20 → pivot passes.
+        let pivot = k("2026-06-16T09:00:00Z", 1.05, 1.10, 1.00, 1.06);
+        let d = detect_at(&[pivot, n1, n], 2, &flags()).expect("bearish tweezer");
+        assert_eq!(d.direction, Direction::Short);
+        assert_eq!(d.geometry.kind, SignalKind::Tweezer);
+
+        // Raise the pivot bar's high above the pair → not a pivot → rejected.
+        let tall_pivot = k("2026-06-16T09:00:00Z", 1.05, 1.30, 1.00, 1.06);
+        assert!(detect_at(&[tall_pivot, n1, n], 2, &flags()).is_none());
+    }
+
+    #[test]
+    fn double_tweezer_requires_pivot() {
+        // Three near-identical bullish pinbar-ish bars with equal lows (1.00) so
+        // no standalone pinbar can fire; only the double-tweezer path is live.
+        let n2 = k("2026-06-16T09:00:00Z", 1.15, 1.20, 1.00, 1.17);
+        let n1 = k("2026-06-16T10:00:00Z", 1.16, 1.205, 1.00, 1.18);
+        let n = k("2026-06-16T11:00:00Z", 1.15, 1.20, 1.00, 1.17);
+
+        // pivot low 1.05 > trio low 1.00 → pivot passes.
+        let pivot = k("2026-06-16T08:00:00Z", 1.10, 1.12, 1.05, 1.06);
+        let d = detect_at(&[pivot, n2, n1, n], 3, &flags()).expect("double tweezer");
+        assert_eq!(d.geometry.kind, SignalKind::DoubleTweezer);
+
+        // Drop the pivot bar's low below the trio → not a pivot → rejected.
+        let low_pivot = k("2026-06-16T08:00:00Z", 1.10, 1.12, 0.90, 1.06);
+        assert!(detect_at(&[low_pivot, n2, n1, n], 3, &flags()).is_none());
     }
 
     #[test]
