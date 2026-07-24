@@ -85,7 +85,7 @@ impl TradeRecord {
             broker: detail.broker.clone(),
             direction: detail.direction.clone(),
             granularity: detail.granularity.clone(),
-            entry_mode: entry_mode_key(detail.entry_mode).to_string(),
+            entry_mode: entry_mode_key(detail),
             order_type: detail
                 .order_types
                 .first()
@@ -107,13 +107,21 @@ impl TradeRecord {
 }
 
 /// A short, stable key for an entry mode (the DB query dimension). Distinct from
-/// `EntryMode::label` (which is human prose with parentheses).
-fn entry_mode_key(mode: EntryMode) -> &'static str {
-    match mode {
+/// `EntryMode::label` (which is human prose with parentheses). A BCR-family plan
+/// missing a prep gate is suffixed with the skip (`normal+skip-bcr`), so
+/// skip-BCR trades are queryable apart from true break-and-close-then-retest
+/// ones.
+fn entry_mode_key(detail: &PlanDetail) -> String {
+    let base = match detail.entry_mode {
         EntryMode::Normal => "normal",
         EntryMode::Quasimodo => "quasimodo",
         EntryMode::StrategyV2 => "strategy-v2",
         EntryMode::Unknown => "unknown",
+    };
+    let has_bcr_leg = matches!(detail.entry_mode, EntryMode::Normal | EntryMode::StrategyV2);
+    match has_bcr_leg.then(|| detail.bcr_preps.skip_slug()).flatten() {
+        Some(skip) => format!("{base}+{skip}"),
+        None => base.to_string(),
     }
 }
 
@@ -255,7 +263,7 @@ pub fn upsert(conn: &Connection, rec: &TradeRecord) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::plan::parse_plan_export;
+    use crate::plan::{BcrPreps, OrderType, parse_plan_export};
 
     const EXPORT: &str = include_str!("../tests/fixtures/plan_export.json");
     const TIMELINE: &str = include_str!("../tests/fixtures/plan_timeline.json");
@@ -360,12 +368,72 @@ mod tests {
         assert_eq!(net_r.as_deref(), Some("+1.25"), "the row was updated");
     }
 
+    /// Build a minimal `PlanDetail` for the key tests.
+    fn detail_with(mode: EntryMode, preps: BcrPreps) -> PlanDetail {
+        PlanDetail {
+            trade_id: "t".into(),
+            instrument: "EUR/USD".into(),
+            direction: "short".into(),
+            granularity: "h1".into(),
+            armed_at: None,
+            entry_mode: mode,
+            order_types: vec![("BCR".into(), OrderType::Stop)],
+            bcr_preps: preps,
+            broker: "tradenation".into(),
+        }
+    }
+
     #[test]
     fn entry_mode_keys_are_stable_slugs() {
-        assert_eq!(entry_mode_key(EntryMode::Normal), "normal");
-        assert_eq!(entry_mode_key(EntryMode::Quasimodo), "quasimodo");
-        assert_eq!(entry_mode_key(EntryMode::StrategyV2), "strategy-v2");
-        assert_eq!(entry_mode_key(EntryMode::Unknown), "unknown");
+        let full = BcrPreps {
+            break_and_close: true,
+            retest: true,
+        };
+        // Full preps → the plain family slug.
+        assert_eq!(
+            entry_mode_key(&detail_with(EntryMode::Normal, full)),
+            "normal"
+        );
+        assert_eq!(
+            entry_mode_key(&detail_with(EntryMode::StrategyV2, full)),
+            "strategy-v2"
+        );
+        // QM / Unknown carry no BCR leg, so preps never annotate them.
+        let none = BcrPreps {
+            break_and_close: false,
+            retest: false,
+        };
+        assert_eq!(
+            entry_mode_key(&detail_with(EntryMode::Quasimodo, none)),
+            "quasimodo"
+        );
+        assert_eq!(
+            entry_mode_key(&detail_with(EntryMode::Unknown, none)),
+            "unknown"
+        );
+    }
+
+    #[test]
+    fn skip_bcr_is_reflected_in_the_entry_mode_key() {
+        // A "normal" enter with NO preps is skip-BCR — queryable apart from the
+        // full break-and-close-then-retest.
+        let none = BcrPreps {
+            break_and_close: false,
+            retest: false,
+        };
+        assert_eq!(
+            entry_mode_key(&detail_with(EntryMode::Normal, none)),
+            "normal+skip-bcr"
+        );
+        // Half-skips are distinguished too.
+        let no_retest = BcrPreps {
+            break_and_close: true,
+            retest: false,
+        };
+        assert_eq!(
+            entry_mode_key(&detail_with(EntryMode::Normal, no_retest)),
+            "normal+skip-retest"
+        );
     }
 
     #[test]

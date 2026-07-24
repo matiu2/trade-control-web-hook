@@ -102,6 +102,35 @@ impl EntryMode {
     }
 }
 
+/// Which of the BCR (break-and-close-then-retest) prep gates a plan carries.
+/// A "normal" `05-enter` is only a *true* break-and-close-then-retest entry when
+/// **both** preps are present; `--skip-bcr` (and its `--skip-break-and-close` /
+/// `--skip-retest` halves) omit them so the enter fires directly on the pine
+/// pattern. This is derived from the presence of the `03-prep-break-and-close`
+/// and `04-prep-retest` rules — the plan's `preps` list isn't reliably present.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BcrPreps {
+    /// `03-prep-break-and-close` is present.
+    pub break_and_close: bool,
+    /// `04-prep-retest` is present.
+    pub retest: bool,
+}
+
+impl BcrPreps {
+    /// A short slug describing what's skipped, for the entry-mode label / DB key.
+    /// `None` when the full set is present (nothing to annotate) — so
+    /// `skip_slug().is_none()` also reads as "this is the full
+    /// break-and-close-then-retest".
+    pub fn skip_slug(&self) -> Option<&'static str> {
+        match (self.break_and_close, self.retest) {
+            (true, true) => None,
+            (false, false) => Some("skip-bcr"),
+            (true, false) => Some("skip-retest"),
+            (false, true) => Some("skip-break-and-close"),
+        }
+    }
+}
+
 /// The order type of one enter leg, from the intent's `entry.type`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OrderType {
@@ -143,6 +172,10 @@ pub struct PlanDetail {
     /// Order type per enter leg, in rule order. One entry for normal/QM, two
     /// for strategy-v2 (BCR leg then QM leg).
     pub order_types: Vec<(String, OrderType)>,
+    /// Which BCR preps (`03-prep-break-and-close` / `04-prep-retest`) the plan
+    /// carries. Only meaningful when a BCR enter (`05-enter`) is present; a
+    /// missing prep means that gate was skipped (`--skip-bcr` et al).
+    pub bcr_preps: BcrPreps,
     /// The plan's broker (`oanda` / `tradenation`), read from the rule intents
     /// (there is no reliable top-level `broker` field). Drives the TradingView
     /// exchange prefix so the *right* broker's chart is loaded, and is shown in
@@ -172,11 +205,22 @@ pub fn parse_plan_export(json: &str) -> Result<PlanDetail> {
         .ok_or_else(|| eyre!("plan export has no rules array"))?;
 
     // The enter rules by rule_id. `05-enter` = BCR/normal, `09-enter-qm` = QM.
+    // The prep gates `03-prep-break-and-close` / `04-prep-retest` are what make a
+    // BCR enter a *true* break-and-close-then-retest; their absence = skip-BCR.
     let mut has_bcr = false;
     let mut has_qm = false;
+    let mut bcr_preps = BcrPreps {
+        break_and_close: false,
+        retest: false,
+    };
     let mut order_types: Vec<(String, OrderType)> = Vec::new();
     for rule in rules {
         let rule_id = rule.get("rule_id").and_then(|x| x.as_str()).unwrap_or("");
+        match rule_id {
+            "03-prep-break-and-close" => bcr_preps.break_and_close = true,
+            "04-prep-retest" => bcr_preps.retest = true,
+            _ => {}
+        }
         let is_bcr = rule_id == "05-enter";
         let is_qm = rule_id == "09-enter-qm";
         if !(is_bcr || is_qm) {
@@ -234,6 +278,7 @@ pub fn parse_plan_export(json: &str) -> Result<PlanDetail> {
             .map(str::to_string),
         entry_mode,
         order_types,
+        bcr_preps,
         broker,
     })
 }
@@ -296,11 +341,59 @@ mod tests {
         assert_eq!(d.instrument, "AUD_CAD");
         assert_eq!(d.direction, "short");
         assert_eq!(d.granularity, "h1");
-        // This fixture has only `05-enter` → normal, a stop entry.
+        // `05-enter` → normal, a stop entry.
         assert_eq!(d.entry_mode, EntryMode::Normal);
         assert_eq!(d.order_types, vec![("BCR".to_string(), OrderType::Stop)]);
         assert!(d.armed_at.is_some());
+        // This fixture carries BOTH preps → a true break-and-close-then-retest
+        // (nothing skipped).
+        assert_eq!(
+            d.bcr_preps.skip_slug(),
+            None,
+            "fixture has 03-prep + 04-prep"
+        );
         // Broker comes from the rule intents (this fixture is an OANDA plan).
         assert_eq!(d.broker, "oanda");
+    }
+
+    /// A "normal" `05-enter` with NO prep rules is skip-BCR — the case the
+    /// EUR/USD plan hit (chart labelled skip-bcr, plan had no preps).
+    #[test]
+    fn detects_skip_bcr_when_preps_absent() {
+        // Minimal plan: an `05-enter` and the invalidation vetos, but no
+        // `03-prep-break-and-close` / `04-prep-retest`.
+        let json = r#"{
+            "trade_id": "hs-eur-usd-e4c1cbfd",
+            "instrument": "EUR/USD",
+            "direction": "short",
+            "granularity": "h1",
+            "armed_at": "2026-07-20T07:47:22Z",
+            "rules": [
+                {"rule_id": "01-veto-too-high", "intent": {"broker": "tradenation"}},
+                {"rule_id": "05-enter", "intent": {"broker": "tradenation", "entry": {"type": "stop"}}}
+            ]
+        }"#;
+        let d = parse_plan_export(json).expect("parse");
+        // Still the Normal family (it has a BCR leg)…
+        assert_eq!(d.entry_mode, EntryMode::Normal);
+        // …but the preps are absent → skip-BCR.
+        assert_eq!(d.bcr_preps.skip_slug(), Some("skip-bcr"));
+    }
+
+    /// Missing just one prep is a half-skip, distinguished from full skip-BCR.
+    #[test]
+    fn detects_half_skip_when_one_prep_present() {
+        let json = r#"{
+            "trade_id": "t",
+            "instrument": "EUR/USD",
+            "direction": "short",
+            "granularity": "h1",
+            "rules": [
+                {"rule_id": "03-prep-break-and-close", "intent": {"broker": "tradenation"}},
+                {"rule_id": "05-enter", "intent": {"broker": "tradenation", "entry": {"type": "stop"}}}
+            ]
+        }"#;
+        let d = parse_plan_export(json).expect("parse");
+        assert_eq!(d.bcr_preps.skip_slug(), Some("skip-retest"));
     }
 }
