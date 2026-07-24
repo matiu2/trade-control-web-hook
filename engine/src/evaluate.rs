@@ -61,7 +61,7 @@
 use chrono::{DateTime, Utc};
 
 use trade_control_core::broker::{Candle, Granularity};
-use trade_control_core::intent::{Action, Direction, SignalKind};
+use trade_control_core::intent::{Action, Direction, PrepReqSliceExt, SignalKind};
 use trade_control_core::plan_eval::{EntryDecline, FiredIntent, PlanEval};
 use trade_control_core::plan_state::{Phase, PlanState};
 use trade_control_core::signals::{
@@ -930,10 +930,7 @@ fn evaluate_one_entry(
     //   baseline here. (The two agree in production; only the multi-enter case
     //   needs the per-rule split.)
     let requires_retest = if is_multi_enter(plan) {
-        rule.intent
-            .requires_preps
-            .iter()
-            .any(|p| p == PREP_STEP_RETEST)
+        rule.intent.requires_preps.requires_step(PREP_STEP_RETEST)
     } else {
         plan.rules.iter().any(is_retest)
     };
@@ -1840,8 +1837,7 @@ fn confirmed_setup_floor(
     let requires_break = rule
         .intent
         .requires_preps
-        .iter()
-        .any(|p| p == PREP_STEP_BREAK_AND_CLOSE);
+        .requires_step(PREP_STEP_BREAK_AND_CLOSE);
     let break_floor = if requires_break {
         state.break_close_at
     } else {
@@ -2011,10 +2007,7 @@ pub fn enter_preconditions_by_leg(
             leg.push(EnterBlock::NeedsConfirmation);
         }
         let requires_retest = if is_multi_enter(plan) {
-            rule.intent
-                .requires_preps
-                .iter()
-                .any(|p| p == PREP_STEP_RETEST)
+            rule.intent.requires_preps.requires_step(PREP_STEP_RETEST)
         } else {
             plan.rules.iter().any(is_retest)
         };
@@ -4200,7 +4193,10 @@ mod tests {
     /// so a fire keeps the plan alive (the worker retry gate is the real cap).
     fn enter_rule(rule_id: &str, preps: &[&str], max_retries: u32) -> ConditionRule {
         let mut intent = intent(Action::Enter);
-        intent.requires_preps = preps.iter().map(|s| s.to_string()).collect();
+        intent.requires_preps = preps
+            .iter()
+            .map(|s| trade_control_core::intent::PrepReq::All(s.to_string()))
+            .collect();
         intent.max_retries = Tunable::Static(max_retries);
         intent.direction = Some(Direction::Short);
         ConditionRule {
@@ -6548,7 +6544,10 @@ mod tests {
         let mut rule = pine_enter_rule(None, Direction::Short, false);
         rule.rule_id = "09-enter-qm".into();
         rule.intent.needs_confirmed = true;
-        rule.intent.requires_preps = requires_preps.iter().map(|s| s.to_string()).collect();
+        rule.intent.requires_preps = requires_preps
+            .iter()
+            .map(|s| trade_control_core::intent::PrepReq::All(s.to_string()))
+            .collect();
         rule.intent.entry = Some(trade_control_core::intent::EntrySpec::Limit {
             from: trade_control_core::intent::PriceAnchor::SignalLow,
             offset_pips: 0.0,

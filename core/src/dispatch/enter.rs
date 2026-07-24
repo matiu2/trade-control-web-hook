@@ -189,54 +189,69 @@ pub async fn run_enter<B: Broker, S: StateStore>(
         }
     }
 
-    // Prep gate — every name in `requires_preps` must be currently set,
-    // and the stored `set_at` timestamps must be strictly increasing in
-    // list order.
+    // Prep gate — every slot in `requires_preps` must be satisfied, and the
+    // satisfying preps' `set_at` timestamps must be strictly increasing in slot
+    // order.
+    //
+    // A slot is a `PrepReq`: `All(step)` requires that one prep; `Any(alts)` is
+    // satisfied by whichever listed alternative is set (either/or — e.g. a retest
+    // OR a pullback). For an `Any` slot we take the **earliest** alternative whose
+    // `set_at` is strictly after the previous slot's, keeping the ordered chain as
+    // permissive as possible. A single-member group behaves exactly like `All`, so
+    // the legacy flat `[break-and-close, retest]` list is byte-for-byte the same
+    // decision it was before this generalisation.
     let mut prev_ts: Option<chrono::DateTime<chrono::Utc>> = None;
-    for step in &verified.intent.requires_preps {
-        match store
-            .get_prep(
-                verified.intent.account.as_deref(),
-                &verified.intent.instrument,
-                step,
-            )
-            .await
-        {
-            Ok(Some(set_at)) => {
-                if let Some(prev) = prev_ts
-                    && set_at <= prev
-                {
-                    tracing::info!(
-                        "entry rejected: prep {} not after previous (id={})",
-                        step,
-                        verified.intent.id
-                    );
+    for slot in &verified.intent.requires_preps {
+        let alts = slot.alternatives();
+        // Look up each alternative's prep `set_at` once, in wire order, then let
+        // the pure `resolve_slot` decide the ordered-OR outcome. A store error on
+        // any lookup is fail-closed (reject), same as before.
+        let mut alt_set_ats = Vec::with_capacity(alts.len());
+        for step in alts {
+            match store
+                .get_prep(
+                    verified.intent.account.as_deref(),
+                    &verified.intent.instrument,
+                    step,
+                )
+                .await
+            {
+                Ok(set_at) => alt_set_ats.push(set_at),
+                Err(err) => {
+                    tracing::error!("KV get_prep: {err}");
                     return ActionResult::Rejected {
-                        status: 412,
-                        body: "prep order violated".to_string(),
-                        outcome: format!("rejected: prep-order-violated ({step})"),
+                        status: 500,
+                        body: "state error".to_string(),
+                        outcome: "rejected: state-error".into(),
                     };
                 }
-                prev_ts = Some(set_at);
             }
-            Ok(None) => {
+        }
+        // Label for diagnostics: the single prep name for an `All` slot, or the
+        // pipe-joined alternatives for an `Any` group (e.g. `retest|pullback`).
+        let label = alts.join("|");
+        match crate::intent::resolve_slot(&alt_set_ats, prev_ts) {
+            crate::intent::SlotOutcome::Satisfied(set_at) => prev_ts = Some(set_at),
+            crate::intent::SlotOutcome::OutOfOrder => {
                 tracing::info!(
-                    "entry rejected: missing prep {} (id={})",
-                    step,
+                    "entry rejected: prep {label} not after previous (id={})",
+                    verified.intent.id
+                );
+                return ActionResult::Rejected {
+                    status: 412,
+                    body: "prep order violated".to_string(),
+                    outcome: format!("rejected: prep-order-violated ({label})"),
+                };
+            }
+            crate::intent::SlotOutcome::Missing => {
+                tracing::info!(
+                    "entry rejected: missing prep {label} (id={})",
                     verified.intent.id
                 );
                 return ActionResult::Rejected {
                     status: 412,
                     body: "missing prep".to_string(),
-                    outcome: format!("rejected: missing-prep ({step})"),
-                };
-            }
-            Err(err) => {
-                tracing::error!("KV get_prep: {err}");
-                return ActionResult::Rejected {
-                    status: 500,
-                    body: "state error".to_string(),
-                    outcome: "rejected: state-error".into(),
+                    outcome: format!("rejected: missing-prep ({label})"),
                 };
             }
         }

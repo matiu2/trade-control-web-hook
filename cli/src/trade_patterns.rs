@@ -2169,10 +2169,14 @@ fn build_enter_alert(
     // Market-hours blackout close policy — what the sweep does with this
     // order if it's caught resting in the close→open gap.
     intent.blackout_close = blackout_close;
+    // PR-A: still emits the flat `[break-and-close, retest]` gate, but each slot
+    // is now a `PrepReq::All` (a bare-string wire form). The either/or grouping
+    // with `pullback` is introduced in PR-C; here every surviving prep is its own
+    // required slot, byte-identical to the historical flat list.
     intent.requires_preps = ["break-and-close", "retest"]
         .into_iter()
         .filter(|step| !skip_preps.iter().any(|s| s == step))
-        .map(String::from)
+        .map(|step| trade_control_core::intent::PrepReq::All(step.to_string()))
         .collect();
     intent.vetos = vec![
         geometry.invalidation_veto_name.into(),
@@ -2502,6 +2506,15 @@ fn ttl_hours_until(now: DateTime<Utc>, until: DateTime<Utc>) -> u32 {
 mod tests {
     use super::*;
 
+    /// A flat list of `PrepReq::All` slots — the shape a legacy
+    /// `requires_preps: [a, b]` gate deserialises to. Keeps the assertions terse.
+    fn all_preps(steps: &[&str]) -> Vec<trade_control_core::intent::PrepReq> {
+        steps
+            .iter()
+            .map(|s| trade_control_core::intent::PrepReq::All(s.to_string()))
+            .collect()
+    }
+
     fn ts(s: &str) -> DateTime<Utc> {
         s.parse().unwrap()
     }
@@ -2772,7 +2785,7 @@ mod tests {
         }
         assert_eq!(
             alert.intent.requires_preps,
-            vec!["break-and-close".to_string(), "retest".to_string()]
+            all_preps(&["break-and-close", "retest"])
         );
         assert_eq!(
             alert.intent.vetos,
@@ -3215,7 +3228,7 @@ mod tests {
         assert!(matches!(stop.intent.entry, Some(EntrySpec::Stop { .. })));
         assert_eq!(
             stop.intent.requires_preps,
-            vec!["break-and-close".to_string(), "retest".to_string()]
+            all_preps(&["break-and-close", "retest"])
         );
         // QM: Stop entry at signal_low − ATR-pct buffer with limit recovery
         // (identical order shape to standalone --quasimodo), no preps,
@@ -4572,7 +4585,7 @@ tp_price: 1.05
         assert!(!basenames.contains(&"03-prep-break-and-close"));
         assert!(basenames.contains(&"04-prep-retest"));
         let enter = trade.alerts.last().unwrap();
-        assert_eq!(enter.intent.requires_preps, vec!["retest".to_string()]);
+        assert_eq!(enter.intent.requires_preps, all_preps(&["retest"]));
     }
 
     #[test]

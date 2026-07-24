@@ -11,6 +11,7 @@ mod entry_level_veto;
 mod expiry;
 mod mw_resolution;
 mod mw_state;
+mod prep_req;
 mod resolution;
 mod sl_spread_floor;
 
@@ -27,6 +28,7 @@ pub use entry_level_veto::{EntryLevelVeto, VetoSide};
 pub use expiry::{ExpiryError, MAX_EXPIRY_BARS, resolve_cancel_at};
 pub use mw_resolution::mw_static_prices;
 pub use mw_state::{MwAnchors, MwUpdate, effective_mw_params, plan_mw_update};
+pub use prep_req::{PrepReq, PrepReqSliceExt, SlotOutcome, resolve_slot};
 #[cfg(feature = "cli")]
 pub use resolution::MIN_R_FLOOR;
 pub use resolution::{ResolveError, Resolved, ResolvedEntry, ResolvedRecoverEntry, RiskBudget};
@@ -498,12 +500,19 @@ pub struct Intent {
     /// side effects are one-shot at fire time, re-fire to repeat them.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub level: Option<VetoLevel>,
-    /// Optional gate on `enter`. Ordered list of named preps that must
-    /// be active for this instrument; each prep's `set_at` timestamp
-    /// must be strictly greater than the previous prep's. Absent /
-    /// empty means no prep gate.
+    /// Optional gate on `enter`. Ordered list of prep requirements that must
+    /// be active for this instrument; each satisfying prep's `set_at` timestamp
+    /// must be strictly greater than the previous slot's. Absent / empty means
+    /// no prep gate.
+    ///
+    /// Each slot is a [`PrepReq`]: a bare string is a single required prep
+    /// (`break-and-close`); a nested list is an either/or group where any one
+    /// alternative satisfies the slot (`[retest, pullback]`). `#[serde(untagged)]`
+    /// on [`PrepReq`] keeps the legacy flat `[break-and-close, retest]` wire form
+    /// parsing + re-serialising byte-identically (each string ⇒ [`PrepReq::All`]),
+    /// so intents signed before either/or groups existed are unaffected.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub requires_preps: Vec<String>,
+    pub requires_preps: Vec<PrepReq>,
     /// Optional gate on `enter`. Entry is rejected if any of these named
     /// vetos are active for this instrument. Absent / empty means no
     /// veto gate.
@@ -2953,11 +2962,45 @@ mod tests {
             vetos: [news-window]
         ";
         let intent: Intent = serde_yaml::from_str(yaml).unwrap();
+        // Legacy flat form: each bare string parses as `PrepReq::All`.
         assert_eq!(
             intent.requires_preps,
-            vec!["break-and-close".to_string(), "retest".to_string()]
+            vec![
+                PrepReq::All("break-and-close".to_string()),
+                PrepReq::All("retest".to_string()),
+            ]
         );
         assert_eq!(intent.vetos, vec!["news-window".to_string()]);
+    }
+
+    #[test]
+    fn enter_intent_parses_either_or_prep_group() {
+        // The new vec-of-vecs form: a nested list is an either/or `PrepReq::Any`.
+        let yaml = "
+            v: 1
+            id: abc
+            not_after: \"2026-05-13T20:00:00Z\"
+            action: enter
+            instrument: EUR_USD
+            direction: short
+            entry: { type: market }
+            stop_loss: { from: high, offset_pips: 2 }
+            take_profit: { from: close, offset_r: 2.0 }
+            risk_pct: 0.5
+            requires_preps: [break-and-close, [retest, pullback]]
+        ";
+        let intent: Intent = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(
+            intent.requires_preps,
+            vec![
+                PrepReq::All("break-and-close".to_string()),
+                PrepReq::Any(vec!["retest".to_string(), "pullback".to_string()]),
+            ]
+        );
+        // Round-trips: an untagged `Any` re-serialises to a nested list, so a
+        // re-parse yields the same structure.
+        let back: Intent = serde_yaml::from_str(&serde_yaml::to_string(&intent).unwrap()).unwrap();
+        assert_eq!(back.requires_preps, intent.requires_preps);
     }
 
     #[test]
