@@ -24,9 +24,10 @@ use trade_control_core::signals::{
     DetectFlags, DetectorConfig, atr_length_for, detect_at, first_confirmed_signal_at, wilder_atr,
 };
 
-use super::replay_broker::{RealizedOutcome, ReplayBroker};
+use super::replay_broker::{ExitReason, RealizedOutcome, ReplayBroker};
 use super::verbose::{BarTrace, DetectedMark};
 use trade_control_cli::replay_args::DetectorMarkConfig;
+use trade_control_core::broker::Broker;
 
 /// The entry decision the **real** dispatch (`trade_control_core::dispatch::run_enter`)
 /// reached for one fired `enter`, carried on the [`Fire`] so the report reads it
@@ -478,6 +479,51 @@ pub async fn run(
                             "handle_prep rejected in replay"
                         );
                     }
+                }
+                // A reversal-close: flatten the open position at market (the bar's
+                // close), exactly as the live worker's `run_close` does — but ONLY
+                // if the shared `allow_close` gate passes (golden/confirmed +
+                // script). The engine already applied the S/R-band / news-window
+                // gate before firing this close (`close_windows_pass`), so a fired
+                // Close means the window passed; the `allow_close` candle-quality
+                // gate is the remaining check. A blocked gate leaves the position
+                // OPEN (matches live). S5: this replaces the old post-loop
+                // `apply_reversal_close` pass with a real broker flatten at the bar
+                // the engine dispatches the close.
+                Action::Close => {
+                    let shell = match &fired.signal {
+                        Some(sig) => Shell::from_candle_and_signal(&fired.candle, sig),
+                        None => Shell::from_candle(&fired.candle),
+                    };
+                    let gate =
+                        trade_control_core::allow_close_gate::evaluate(&fired.intent, &shell);
+                    if matches!(
+                        gate,
+                        trade_control_core::allow_close_gate::AllowCloseOutcome::Proceed
+                    ) {
+                        replay_broker.set_close_reason(ExitReason::Reversal);
+                        replay_broker
+                            .close_positions(&fired.intent.instrument)
+                            .await;
+                    }
+                }
+                // The trade-expiry veto at `ClosePositions` level flattens any open
+                // position at wall-clock expiry AND blocks entries (the entry block
+                // is the plan going `Done`, handled by the engine). Here we do the
+                // broker-side flatten the live ClosePositions veto performs via
+                // `broker.close_positions`. A non-ClosePositions veto (StopNextEntry,
+                // e.g. too-low) leaves the open position alone — no flatten.
+                Action::Veto | Action::Invalidate
+                    if fired.intent.level
+                        == Some(trade_control_core::intent::VetoLevel::ClosePositions) =>
+                {
+                    replay_broker.set_close_reason(ExitReason::Expiry);
+                    replay_broker
+                        .cancel_pending_for_instrument(&fired.intent.instrument)
+                        .await;
+                    replay_broker
+                        .close_positions(&fired.intent.instrument)
+                        .await;
                 }
                 _ => {}
             }

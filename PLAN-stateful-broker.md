@@ -149,6 +149,21 @@ position from `open`).
 - [ ] **S10. clippy + fmt; full `cargo test`; run the EUR/USD replay; confirm
       entry #2 books its reversal exit and re-entries fire.**
 
+## S11 (FOLLOW-UP, after S9 green re-bless) — relocate replay-only simulator out of shared engine
+Operator insight (2026-07-24): the fill *simulator* is shared engine code but is
+EFFECTIVELY REPLAY-ONLY — verified that the only real callers of `simulate_fill`,
+`simulate_fill_windowed`, `simulate_fill_resolved`, `simulate_fill_resolved_zoom`
+are `replay_candles/*` (broker/report/fixture). The live worker's
+`trade-control-cron/src/breakeven_watch.rs` only MENTIONS `simulate_fill` in a
+doc comment; it does NOT call it (it shares `breakeven_armed_at` instead). So the
+fill-walker should move OUT of `engine/src/simulator.rs` into the replay broker.
+CAVEAT: it must keep calling the GENUINELY-shared engine primitives it relies on
+(`Resolved::from_intent`, SL-vs-spread floor, break-even arming, spread-hour
+suppression, tick-snapping) — those stay in the engine (live uses them). Move
+ONLY the 4 fill-walker fns + sub-bar zoom. Do it as a PURE relocation after S9's
+green re-blessed baseline, its own commit, fixtures prove behavior-preserving.
+Deferred to avoid two tangled structural changes with no green baseline between.
+
 ## Invariant catalog = the regression net
 The 40-item checklist (scratchpad, from the audit) maps each preserved behavior
 to where it moves in `advance()`/reads. I tick each as it's relocated. The 6

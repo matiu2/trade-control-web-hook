@@ -151,7 +151,7 @@ struct HeldPosition {
 
 /// Why a held position left the book — drives the report's exit label and R sign.
 #[derive(Clone, Copy, PartialEq)]
-enum ExitReason {
+pub enum ExitReason {
     /// Stop-loss touched (or SL→break-even scratch when `exit_price ≈ entry`).
     StoppedOut,
     /// Take-profit touched.
@@ -340,6 +340,10 @@ pub struct ReplayBroker {
     open: RefCell<Vec<HeldPosition>>,
     /// The P&L ledger — closed positions in exit order.
     closed: RefCell<Vec<ClosedTrade>>,
+    /// The reason the NEXT `close_positions` call records (Reversal by default;
+    /// the loop sets Expiry before dispatching the trade-expiry veto). Set via
+    /// `set_close_reason` right before the engine dispatches a close.
+    close_reason: RefCell<ExitReason>,
 }
 
 impl ReplayBroker {
@@ -355,7 +359,15 @@ impl ReplayBroker {
             resting: RefCell::new(Vec::new()),
             open: RefCell::new(Vec::new()),
             closed: RefCell::new(Vec::new()),
+            close_reason: RefCell::new(ExitReason::Reversal),
         }
+    }
+
+    /// Set the reason the next `close_positions` records. The loop calls this
+    /// right before the engine dispatches a close: `Reversal` for a
+    /// reversal-close fire, `Expiry` for the trade-expiry ClosePositions veto.
+    pub fn set_close_reason(&self, reason: ExitReason) {
+        *self.close_reason.borrow_mut() = reason;
     }
 
     /// Attach a pre-fetched finer-granularity bid/ask series for the sub-bar zoom
@@ -1082,6 +1094,19 @@ impl ReplayBroker {
     pub fn debug_assert_held_matches_resim(&self) {
         let placed = self.placed.borrow().clone();
         for a in &placed {
+            // S5: an order the held model closed by a REVERSAL or EXPIRY flatten is
+            // EXPECTED to diverge from the re-sim — the re-sim `resolve` never
+            // modelled reversal/expiry closes (it only knows fill + SL/TP), so it
+            // still reports such a position `open` (or SL/TP-closed on a later bar).
+            // This is the whole point of the rewrite: the held model is now MORE
+            // correct. Skip these from the parity check; fill + bracket exits (the
+            // only thing the re-sim models) must still match exactly.
+            if self.closed.borrow().iter().any(|t| {
+                t.order_id == a.order_id
+                    && matches!(t.reason, ExitReason::Reversal | ExitReason::Expiry)
+            }) {
+                continue;
+            }
             let resim = match self.resolve(a) {
                 AttemptState::Pending => "pending",
                 AttemptState::OpenPosition { .. } => "open",
@@ -1279,12 +1304,76 @@ impl Broker for ReplayBroker {
         }
     }
 
-    async fn close_positions(&self, _instrument: &str) -> bool {
-        false
+    async fn close_positions(&self, instrument: &str) -> bool {
+        // S5: actually flatten held open positions for this instrument at the
+        // current bar's close — the live worker's `run_close` / ClosePositions
+        // veto flattens at market when the engine dispatches the close, so the
+        // bar's close is the faithful exit price. The loop sets the reason
+        // (Reversal by default; Expiry for the trade-expiry veto) via
+        // `set_close_reason` right before the engine dispatches this close.
+        // Returns true iff at least one position was closed (mirrors the real
+        // broker's "did I close anything").
+        let Some(bar) = self.candle_at_as_of() else {
+            return false;
+        };
+        let exit_at = bar.time;
+        let exit_price = (bar.bid_c + bar.ask_c) / 2.0;
+        let reason = *self.close_reason.borrow();
+        let inst_key = instrument.to_lowercase();
+
+        let mut to_close = Vec::new();
+        self.open.borrow_mut().retain(|p| {
+            if p.intent.instrument.to_lowercase() == inst_key {
+                to_close.push(p.clone());
+                false // remove from open
+            } else {
+                true
+            }
+        });
+        if to_close.is_empty() {
+            return false;
+        }
+        let mut closed = self.closed.borrow_mut();
+        for p in to_close {
+            closed.push(ClosedTrade {
+                order_id: p.order_id,
+                direction: p.direction,
+                entry_price: p.entry_price,
+                // Resolve the stored floored stop for R scoring; fall back to the
+                // entry (0-risk → 0R) if the intent can't resolve (shouldn't happen
+                // for an order that filled).
+                stop_loss: p
+                    .placed
+                    .as_ref()
+                    .map(|pl| pl.stop_loss)
+                    .unwrap_or(p.entry_price),
+                take_profit: p
+                    .placed
+                    .as_ref()
+                    .map(|pl| pl.take_profit)
+                    .unwrap_or(p.entry_price),
+                fill_at: p.fill_at,
+                exit_at,
+                exit_price,
+                reason,
+            });
+        }
+        true
     }
 
-    async fn cancel_pending_for_instrument(&self, _instrument: &str) -> usize {
-        0
+    async fn cancel_pending_for_instrument(&self, instrument: &str) -> usize {
+        // Cancel all held resting orders for this instrument (the ClosePositions
+        // veto and reversal path also cancel pending orders live). Returns the
+        // count cancelled, mirroring the real broker.
+        let inst_key = instrument.to_lowercase();
+        let mut n = 0;
+        for o in self.resting.borrow_mut().iter_mut() {
+            if !o.cancelled && o.intent.instrument.to_lowercase() == inst_key {
+                o.cancelled = true;
+                n += 1;
+            }
+        }
+        n
     }
 
     async fn lookup_attempt_state(
