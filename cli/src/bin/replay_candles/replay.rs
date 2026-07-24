@@ -311,6 +311,22 @@ pub async fn run(
             "tick: evaluating live bar"
         );
 
+        // Advance the broker's held state to THIS bar before the engine tick, so a
+        // fill/exit that happened by now is reflected before the engine can dispatch
+        // a close against an open position (the live order: broker observes the bar,
+        // THEN the cron evaluates). Bound at the current bar's OPEN time
+        // (`candles[i].time`), NOT `now` (the bar close = next bar's open), so the
+        // fill test doesn't peek at the next bar's opening price and fill an order a
+        // bar early. This matches the re-sim's dispatch-time lookups, which bound at
+        // the firing bar's open. `set_as_of` to the same instant so the shadow-parity
+        // `resolve` compares like-for-like; the lifecycle's `set_as_of(now)` below
+        // restores the bar-close clock.
+        let bar_open = candles[i].time;
+        replay_broker.set_as_of(bar_open);
+        replay_broker.advance(bar_open);
+        #[cfg(debug_assertions)]
+        replay_broker.debug_assert_held_matches_resim();
+
         // Snapshot the pre-tick state so `--verbose` can report exactly what the
         // engine changed this bar — phase moves and the break-and-close / retest
         // stamps are silent in the fire report (retest never even fires an

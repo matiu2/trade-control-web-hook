@@ -549,7 +549,26 @@ impl ReplayBroker {
             instrument = %matched.intent.instrument,
             "ReplayBroker: re-activated a spread-hour-cancelled resting order (lifecycle restore)"
         );
-        Some(matched.order_id.clone())
+        let restored_id = matched.order_id.clone();
+        let restored_levels = PlacedLevels {
+            entry: req.entry.clone(),
+            stop_loss: req.stop_loss,
+            take_profit: req.take_profit,
+        };
+        drop(placed);
+        // Mirror the restore onto the held resting order: un-cancel it and refresh
+        // its levels to the re-floored request, so `advance()` resumes stepping it
+        // (the spread-hour fill skip still blocks a rubbish-bar fill).
+        if let Some(o) = self
+            .resting
+            .borrow_mut()
+            .iter_mut()
+            .find(|o| o.order_id == restored_id)
+        {
+            o.cancelled = false;
+            o.placed = Some(restored_levels);
+        }
+        Some(restored_id)
     }
 
     /// The concrete bracket a placed order rests on — its stored [`PlacedLevels`]
@@ -847,10 +866,20 @@ impl ReplayBroker {
     /// resting order isn't live until its fire bar closes), so `advance()` gets
     /// the fire-bar skip (and the spread-hour fill skip, sub-bar zoom, break-even,
     /// System-2 widen) for free from `simulate_fill_resolved_zoom`.
-    fn prefix_from_fire(&self, shell: &Shell) -> Vec<BidAskCandle> {
-        self.window_to_as_of()
-            .into_iter()
-            .filter(|c| c.time >= shell.time)
+    fn prefix_from_fire(&self, shell: &Shell, up_to: DateTime<Utc>) -> Vec<BidAskCandle> {
+        // Bound at `up_to` (the current bar's OPEN time), inclusive — NOT the
+        // shared `as_of`, which the loop sets to the bar CLOSE (`now`). Because
+        // candle timestamps are bar-open times and a bar's close equals the NEXT
+        // bar's open, using the close as the bound would pull the next bar's open
+        // price into the fill test and fill an order a bar early (the divergence
+        // the cancel-and-replace test exposed: a stop filled at bar N's advance
+        // off bar N+1's open before the bar-N cancel could land). The re-sim
+        // `resolve` avoids this because every dispatch-time lookup bounds at the
+        // firing bar's OPEN (`fired.candle.time`); `advance` matches that.
+        self.candles
+            .iter()
+            .filter(|c| c.time >= shell.time && c.time <= up_to)
+            .cloned()
             .collect()
     }
 
@@ -864,8 +893,9 @@ impl ReplayBroker {
         intent: &Intent,
         shell: &Shell,
         placed: &Option<PlacedLevels>,
+        up_to: DateTime<Utc>,
     ) -> Option<(Resolved, SimOutcome)> {
-        let prefix = self.prefix_from_fire(shell);
+        let prefix = self.prefix_from_fire(shell, up_to);
         // Build a throwaway attempt so `resolved_for_sim` (which reads
         // `attempt.placed` / `attempt.intent` / `attempt.shell`) applies the SAME
         // stored-levels-or-floor logic the re-sim path uses. No ledger/cancel
@@ -899,7 +929,7 @@ impl ReplayBroker {
     /// has a real position to flatten. Reuses `simulate_fill_resolved_zoom`, so
     /// every fill/exit invariant (fire-bar skip, spread-hour skip, sub-bar zoom,
     /// break-even, System-2 widen) is preserved — no reimplemented fill engine.
-    pub fn advance(&self) {
+    pub fn advance(&self, up_to: DateTime<Utc>) {
         // 1. Resting → open (or straight to closed if it filled AND exited by now).
         //    A cancelled resting order fills nothing; leave it for the lifecycle.
         let resting_now = self.resting.borrow().clone();
@@ -908,7 +938,7 @@ impl ReplayBroker {
                 continue;
             }
             let Some((resolved, outcome)) =
-                self.step_outcome(&order.intent, &order.shell, &order.placed)
+                self.step_outcome(&order.intent, &order.shell, &order.placed, up_to)
             else {
                 // Unresolvable → the slot is free; drop the resting order.
                 self.remove_resting(&order.order_id);
@@ -974,7 +1004,7 @@ impl ReplayBroker {
         let open_now = self.open.borrow().clone();
         for pos in open_now {
             let Some((resolved, outcome)) =
-                self.step_outcome(&pos.intent, &pos.shell, &pos.placed)
+                self.step_outcome(&pos.intent, &pos.shell, &pos.placed, up_to)
             else {
                 continue;
             };
@@ -1007,6 +1037,66 @@ impl ReplayBroker {
                     reason,
                 });
             }
+        }
+    }
+
+    /// The held-model classification of an order id at the current `as_of`, in the
+    /// same categories the re-sim `resolve` produces — for the S3 shadow-parity
+    /// check. A cancelled resting order and an absent one both mean "slot free".
+    #[cfg(debug_assertions)]
+    fn held_class(&self, order_id: &str) -> &'static str {
+        if self
+            .resting
+            .borrow()
+            .iter()
+            .any(|o| o.order_id == order_id && o.cancelled)
+        {
+            return "cancelled-or-absent";
+        }
+        if self.resting.borrow().iter().any(|o| o.order_id == order_id) {
+            return "pending";
+        }
+        if self.open.borrow().iter().any(|p| p.order_id == order_id) {
+            return "open";
+        }
+        if let Some(t) = self.closed.borrow().iter().find(|t| t.order_id == order_id) {
+            return match t.reason {
+                ExitReason::TookProfit => "closed-win",
+                // StoppedOut / Reversal / Expiry all book against the stop → a
+                // loss-or-breakeven category in the re-sim's coarse mapping.
+                _ => "closed-loss",
+            };
+        }
+        "cancelled-or-absent"
+    }
+
+    /// Migration safety net (S3): assert the held model agrees, bar by bar, with
+    /// the proven re-sim `resolve` for every placed order. Debug/tests only. Panics
+    /// on the first divergence so a wrong `advance()` step surfaces immediately
+    /// instead of drifting a fixture at S9. Removed with the re-sim path at S8.
+    ///
+    /// Pre-S5 the held model applies only fill + bracket exits (no reversal/expiry
+    /// close yet), exactly what the re-sim models, so the two must match. A
+    /// cancelled order is `cancelled-or-absent` on both sides.
+    #[cfg(debug_assertions)]
+    pub fn debug_assert_held_matches_resim(&self) {
+        let placed = self.placed.borrow().clone();
+        for a in &placed {
+            let resim = match self.resolve(a) {
+                AttemptState::Pending => "pending",
+                AttemptState::OpenPosition { .. } => "open",
+                AttemptState::ClosedWin { .. } => "closed-win",
+                AttemptState::ClosedLossOrBreakeven { .. } => "closed-loss",
+                AttemptState::Cancelled | AttemptState::Unknown => "cancelled-or-absent",
+            };
+            let held = self.held_class(&a.order_id);
+            debug_assert_eq!(
+                resim,
+                held,
+                "held/re-sim divergence for order {}: re-sim={resim} held={held} (as_of={})",
+                a.order_id,
+                *self.as_of.borrow()
+            );
         }
     }
 
@@ -1176,6 +1266,22 @@ impl Broker for ReplayBroker {
             .find(|a| a.order_id == broker_order_id)
         {
             a.cancelled = true;
+        }
+        // Mirror onto the held resting order: a cancelled resting order fills
+        // nothing (advance() skips `cancelled`) and appears in neither the open
+        // nor the pending list — matching the re-sim's `Cancelled`. A restore
+        // re-activates it (`reactivate_matching_cancelled`). If the order has
+        // ALREADY been promoted to `open` by an earlier `advance()`, the cancel is
+        // a no-op on it — which is correct: you can't cancel-pending a filled
+        // order (the retry gate only cancels one it observed `Pending`, so this
+        // path is reached only while it's still resting).
+        if let Some(o) = self
+            .resting
+            .borrow_mut()
+            .iter_mut()
+            .find(|o| o.order_id == broker_order_id)
+        {
+            o.cancelled = true;
         }
         Ok(())
     }
