@@ -146,6 +146,10 @@ pub fn initial_phase(plan: &TradePlan) -> Phase {
 /// rule's `last_close` from that candle, so the *next* tick can detect a cross
 /// against it. `fired` stays empty; the phase is [`initial_phase`].
 ///
+/// It does **not** seed `origin_open`: the origin (the side the plan starts on)
+/// is fixed from the first *live* bar during [`evaluate_plan`], not from the
+/// last warm-up bar — see the note in the body.
+///
 /// `candles` need not be sorted; the newest by `time` wins. An empty slice
 /// yields an unwatermarked seed (the next tick will itself seed once candles
 /// arrive).
@@ -161,10 +165,19 @@ pub fn seed_plan_state(
     state.watermark = Some(newest.time);
     for rule in &plan.rules {
         record_last_close(&rule.rule_id, &rule.trigger, newest, &mut state);
-        // Seed the origin side from the newest back-window bar's open — the arm
-        // bar, in practice. An `OnClose` directional cross then fires when a
-        // later bar's close settles on the *opposite* side of the line. Set once.
-        record_origin_open(&rule.rule_id, &rule.trigger, newest, &mut state);
+        // NOTE: `origin_open` is deliberately NOT seeded here. The origin is the
+        // side of the line the plan *starts* on — which is the first **live**
+        // bar (the cursor / arm bar), not the newest **warm-up** bar (the bar
+        // immediately before it). Seeding it from `newest` was an off-by-one:
+        // it anchored the origin to the last warm-up bar, whose open can sit on
+        // the opposite side of the line from where the setup actually begins.
+        // A whip-saw warm-up bar (one that gapped open across the line then
+        // reversed) would then wrongly record the plan as "already broken",
+        // and an `OnClose` break-and-close would never fire. Instead we let
+        // `fire_rule` / `stamp_retest` record the origin from the first live
+        // bar via `record_origin_open` (set-once) — matching the documented
+        // "the seed bar is not special" intent at `fire_rule`. See
+        // BUG-break-close-origin-seeded-from-warmup-bar.md.
     }
     state
 }
@@ -5741,6 +5754,81 @@ mod tests {
         );
         // A break-and-close plan seeds into AwaitBreakAndClose.
         assert_eq!(st.phase, Phase::AwaitBreakAndClose);
+    }
+
+    #[test]
+    fn seed_does_not_anchor_origin_to_the_warmup_bar() {
+        // Regression: XAU_USD iH&S 2026-07-20 (ihs-xau-usd-2c1a9f2f). The last
+        // warm-up bar (07-20 22:00 Bris) gapped OPEN at its high, ABOVE the
+        // descending neckline (open 4025.325 vs line ~4025.18), then collapsed.
+        // Seeding origin from that warm-up bar's open wrongly recorded the plan
+        // as "already broken above", so the break-and-close never fired — the
+        // real live trade (a winner) was missed. The origin must instead come
+        // from the first LIVE bar, which opened well below the line.
+        //
+        // Flat neckline at 1.2000 (slope 0 keeps the arithmetic obvious).
+        let p = plan(vec![rule(
+            "03-prep-break-and-close",
+            Trigger::TrendlineCross {
+                a: LinePoint {
+                    at_epoch: ts("2026-06-16T10:00:00Z").timestamp(),
+                    price: 1.2000,
+                },
+                b: LinePoint {
+                    at_epoch: ts("2026-06-16T20:00:00Z").timestamp(),
+                    price: 1.2000,
+                },
+                extend_forward: true,
+                bar_seconds: 3600,
+                dir: CrossDir::Up,
+                bar: BarEvent::OnClose,
+            },
+            FireMode::Once,
+            Action::Prep,
+        )]);
+        // Warm-up bar: OPENS ABOVE the line (1.2050) — the whip-saw open — then
+        // closes back below. This is the bar the old code anchored origin to.
+        let warmup = [candle(
+            "2026-06-16T11:00:00Z",
+            1.2050,
+            1.2055,
+            1.1990,
+            1.1995,
+        )];
+        let st = seed_plan_state(&p, &warmup, ts("2026-06-30T00:00:00Z"));
+        // The fix: seeding records NO origin — it's left for the first live bar.
+        assert!(
+            st.origin_open.get("03-prep-break-and-close").is_none(),
+            "seed must not anchor origin to the warm-up bar"
+        );
+        // First LIVE bar opens BELOW (1.1980) and closes below — fixes origin
+        // "below", no break yet.
+        let c1 = candle("2026-06-16T12:00:00Z", 1.1980, 1.1998, 1.1975, 1.1990);
+        let eval1 = run(&p, &st, &[c1]);
+        assert!(
+            eval1.fired.is_empty(),
+            "opened+closed below → no up-break yet"
+        );
+        assert_eq!(
+            eval1
+                .new_state
+                .origin_open
+                .get("03-prep-break-and-close")
+                .copied(),
+            Some(1.1980),
+            "origin fixed from the first LIVE bar's open (below), not the warm-up bar"
+        );
+        // Next bar CLOSES ABOVE the line → settled close on the far side of the
+        // below origin → the break fires (the trade the live worker missed).
+        let c2 = candle("2026-06-16T13:00:00Z", 1.1985, 1.2030, 1.1980, 1.2020);
+        let eval2 = run(&p, &eval1.new_state, &[c2]);
+        assert_eq!(
+            eval2.fired.len(),
+            1,
+            "settled close above must fire the break"
+        );
+        assert_eq!(eval2.fired[0].rule_id, "03-prep-break-and-close");
+        assert_eq!(eval2.new_state.phase, Phase::AwaitEntry);
     }
 
     #[test]
