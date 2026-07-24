@@ -77,6 +77,27 @@ intended #2 fix. Verified consistent with operator rule.)
 - Files in play: `cli/src/bin/replay_candles/replay_broker.rs` (core),
      `replay.rs` (loop), `report.rs` (P&L readout).
 - Worktree: `../trade-control-web-hook-expiry-close`, branch `replay-stateful-broker`.
+- ✅ S2 committed (advance() + record_attempt pushes HeldOrder). Currently at
+     clean S2 (S3 attempt was reverted — see below).
+
+### S3 IN PROGRESS — shadow-parity assert caught a REAL divergence (good!)
+First S3 attempt added: cancel_order/reactivate mirrors onto held `resting`, and
+a `debug_assert_held_matches_resim` shadow check in the loop. It FAILED on 3
+tests — the net working. Divergences found:
+  1. cancelled resting order: re-sim=Cancelled, held=pending → FIXED by mirroring
+     the `cancelled` flag in cancel_order + reactivate_matching_cancelled onto the
+     held resting order. (Reverted with the rest; must redo.)
+  2. cancel-and-replace (`a_new_enter_cancels_a_resting_sibling_order_no_overlap`):
+     re-sim=Cancelled (absolute — cancel flag overrides price path), held=open
+     (the stop FILLED before/around the cancel). THE CRUX: re-sim treats a cancel
+     as retroactively absolute ("this order never counted"), but in reality you
+     CANNOT cancel-pending an order that already filled. Need the seed/live loop
+     ordering (agent abb2fab155ecdf4d5 analyzing) to know if cancel genuinely
+     precedes fill in as_of terms. Likely resolution: the shadow assert is too
+     strict — held model is the MORE correct one here; relax the assert to tolerate
+     the known-benign cancel-vs-fill difference, OR (if held is wrong) fix advance.
+Reverted the whole S3 attempt to clean S2 to redo it cleanly with the ordering
+facts in hand. Debug prints all removed.
 
 ### Stage list
 - [x] **S0. Baseline captured**: fixtures copied to scratchpad, golden test green.
