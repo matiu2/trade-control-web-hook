@@ -20,7 +20,20 @@
   list_pending_orders reads held `resting` (uncancelled) via pending_from_held.
   ALL production reads now flow from held state. re-sim resolve/realize survive
   ONLY for the shadow-parity assert + parity tests (delete in S8). 110 green.
-- IN PROGRESS S8 (agent ab42b245b0c2606f5 mapping the dead set): delete re-sim
+- ✅ S8 DONE + COMMITTED: re-sim brain fully deleted (resolve, realize,
+  realized_outcome, apply_reversal_close, window_to_as_of, ReversalClose,
+  LedgerGeometry, PlacedAttempt.ledger, record_order, shadow-parity assert,
+  held_class, pending_from_attempt, collect_close_fires_from, CloseFire + 7 dead
+  parity tests). held_realized_outcome returns NeverFilled for uncancelled resting
+  order at window end. Declined kept #[allow(dead_code)] (declines flow via
+  rejected_reason→GateBlocked now). record_attempt made pub(crate). 0 clippy
+  warnings, 103 tests green. EUR/USD fix intact (REV +0.55R, EXP +0.80R).
+- NEXT: S9 (final full verification — run all fixtures + a broader replay if
+  possible; golden fixtures independent so no rebless). Then S11 (move
+  simulate_fill* out of engine). Then merge to this repo main + bump parent gitlink.
+
+### (historical) S8 mapping notes:
+- (agent ab42b245b0c2606f5 mapped the dead set): delete re-sim
   `resolve`, `realize`, `realized_outcome` (NOT held_realized_outcome),
   `apply_reversal_close`, `window_to_as_of`, maybe ReversalClose/LedgerGeometry/
   record_order/CloseFire/collect_close_fires_from if now unused; retire
